@@ -31,7 +31,8 @@
 //! `UNIMPLEMENTED`（#2442・#2241）になるため対象外。
 //!
 //! # 実機前提テストとしての分離
-//! `-- --ignored` 指定時のみ実行する（ci.md「実機前提テスト」）。未指定は案内を出して成功する。実行と結果の記録は人間担当（#3685）。
+//! `-- --ignored` 指定時のみ実行する（ci.md「実機前提テスト」）。未指定は案内を出して成功する。CI では `platform-ci` の ubuntu が委譲スコープで実行する（#4104。containerd は
+//! ランナーイメージの `containerd.io` の既定導入物を使い、取得も sudo もしない）。ランナー以外の実機での記録は人間担当（#3685）。
 //!
 //! ```text
 //! cargo build -p fandhe-container-supervisor -p fandhe-container-plugin-cri
@@ -161,7 +162,9 @@ mod linux {
     }
 
     /// 私設 containerd の設定（v3 形式）。CRI・NRI・task monitor・tracing を無効にし、システムの containerd と何も共有しない。
-    fn containerd_config(dir: &Path) -> String {
+    /// 私設 containerd の設定。非 root の containerd は grpc・ttrpc・debug の各 socket を設定の uid / gid へ chown する
+    /// （既定は 0:0 で、非 root では EPERM になり listen 前に終了する）ため、実行ユーザーの uid / gid を明示する。
+    fn containerd_config(dir: &Path, uid: u32, gid: u32) -> String {
         let d = dir.display();
         format!(
             "version = 3\nroot = \"{d}/root\"\nstate = \"{d}/state\"\ntemp = \"{d}/tmp\"\n\
@@ -170,7 +173,9 @@ mod linux {
              \"io.containerd.monitor.task.v1.cgroups\", \"io.containerd.internal.v1.tracing\", \
              \"io.containerd.tracing.processor.v1.otlp\", \
              \"io.containerd.podsandbox.controller.v1.podsandbox\"]\n\
-             [grpc]\n  address = \"{d}/c.sock\"\n[ttrpc]\n  address = \"{d}/t.sock\"\n[debug]\n  address = \"{d}/d.sock\"\n"
+             [grpc]\n  address = \"{d}/c.sock\"\n  uid = {uid}\n  gid = {gid}\n\
+             [ttrpc]\n  address = \"{d}/t.sock\"\n  uid = {uid}\n  gid = {gid}\n\
+             [debug]\n  address = \"{d}/d.sock\"\n  uid = {uid}\n  gid = {gid}\n"
         )
     }
 
@@ -226,17 +231,66 @@ mod linux {
             .map_err(|e| format!("chmod {}: {e}", dest.display()))
     }
 
-    /// 最小 rootfs と user namespace を含む spec（root.path は絶対パス）を書く。
+    /// `--runtime` に渡す試験専用ラッパー（shell script）を `<bin>/wrap/` に作る（CRI-5・REPAIR-12・#4104）。
+    ///
+    /// core の `prepare_rootfs_verified` は `rootfs/proc` が既存ディレクトリであることを bind の適用前に要求し、自動作成しない。
+    /// containerd は bundle と空の `rootfs` を shim の起動前に作り、shim を bundle を cwd として exec する。ラッパーは
+    /// 本番 shim へ `exec` する前に cwd の `rootfs/proc` を同期的に作るため、`proc` が Create・Start より先に存在することが
+    /// 時刻やスレッドの都合に依らず保証される（監視スレッドを使う方式は、スケジューラの遅延で順序が崩れうる）。
+    /// `exec` 後のプロセスは本番 shim そのもの（`<bin>/SHIM_NAME`）で、再実行する daemon も実体の `current_exe` を使う。
+    /// cwd に `rootfs` が無い場合は何もせず、後続の Create が `proc` 欠如で失敗するため、前提が崩れても偽の成功にはならない。
+    /// `proc` は bind で供給できない（`/proc` 宛ては拒否）ため、`write_spec` の mounts[] には含めない。
+    fn install_proc_wrapper(bin: &Path, real_shim: &Path) -> Result<PathBuf, String> {
+        let wrap_dir = bin.join("wrap");
+        std::fs::create_dir(&wrap_dir).map_err(|e| format!("mkdir wrap: {e}"))?;
+        let wrapper = wrap_dir.join(SHIM_NAME);
+        let script = format!(
+            "#!/bin/sh\nif [ -d ./rootfs ]; then mkdir -p ./rootfs/proc || exit 1; fi\nexec '{}' \"$@\"\n",
+            real_shim.display()
+        );
+        std::fs::write(&wrapper, script).map_err(|e| format!("write wrapper: {e}"))?;
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("chmod wrapper: {e}"))?;
+        Ok(wrapper)
+    }
+
+    /// 最小 rootfs と user namespace を含む spec を書く（CRI-5・#4104）。
+    ///
+    /// containerd は bundle（`<state>/.../<id>`）を Create の直前に自分で作り、`<bundle>/rootfs` を空で用意する。shim（core）は
+    /// rootfs が bundle 配下であることを要求する（`rootfs must be inside the bundle`）ため、`root.path` は bundle 相対の `rootfs` にし、
+    /// 中身は `mounts[]` の bind（読み取り専用）で試験が用意したディレクトリから供給する（`docs/api/bind-mounts.md`）。
     fn write_spec(dir: &Path) -> Result<PathBuf, String> {
         let rootfs = dir.join("rootfs");
-        let ld =
-            minimal_rootfs::install_binary_at(&rootfs, "probe", &["proc", "dev", "tmp", "etc"])?;
+        let ld = minimal_rootfs::install_binary_at(
+            &rootfs,
+            "bin/probe",
+            &["bin", "proc", "dev", "tmp", "etc"],
+        )?;
+        // proc・dev・tmp・etc は core が供給するため bind しない。それ以外の最上位ディレクトリ（bin・lib64・usr 等）を bind する。
+        let mut names: Vec<String> = std::fs::read_dir(&rootfs)
+            .map_err(|e| format!("read rootfs: {e}"))?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| !["proc", "dev", "tmp", "etc", "sys"].contains(&n.as_str()))
+            .collect();
+        names.sort();
+        let mounts: Vec<String> = names
+            .iter()
+            .map(|n| {
+                format!(
+                    r#"{{"destination":"/{n}","type":"bind","source":"{}","options":["rbind","ro"]}}"#,
+                    rootfs.join(n).display()
+                )
+            })
+            .collect();
         let spec = format!(
-            r#"{{"ociVersion":"1.2.0","root":{{"path":"{}","readonly":false}},"hostname":"fandhe-shim",
-"process":{{"user":{{"uid":0,"gid":0}},"args":["/probe","--container-probe"],
-"env":["PATH=/","TERM=dumb","LD_LIBRARY_PATH={ld}"],"cwd":"/"}},
+            r#"{{"ociVersion":"1.2.0","root":{{"path":"rootfs","readonly":false}},"hostname":"fandhe-shim",
+"process":{{"user":{{"uid":0,"gid":0}},"args":["/bin/probe","--container-probe"],
+"env":["PATH=/bin","TERM=dumb","LD_LIBRARY_PATH={ld}"],"cwd":"/"}},
+"mounts":[{}],
 "linux":{{"namespaces":[{{"type":"pid"}},{{"type":"mount"}},{{"type":"uts"}},{{"type":"ipc"}},{{"type":"user"}}]}}}}"#,
-            rootfs.display()
+            mounts.join(",")
         );
         let path = dir.join("spec.json");
         std::fs::write(&path, spec).map_err(|e| format!("write spec: {e}"))?;
@@ -369,6 +423,9 @@ mod linux {
         let uid = std::fs::metadata("/proc/self")
             .map(|m| m.uid())
             .unwrap_or(0);
+        let gid = std::fs::metadata("/proc/self")
+            .map(|m| m.gid())
+            .unwrap_or(0);
         if uid == 0 {
             precondition_failed("must run as a non-root user (rootful start is UNIMPLEMENTED)");
         }
@@ -397,11 +454,13 @@ mod linux {
         let shim = bin.join(SHIM_NAME);
         install_exe(&shim_src, &shim)?;
         install_exe(&sup_src, &bin.join(SUPERVISOR_NAME))?;
+        let wrapper = install_proc_wrapper(&bin, &shim)?;
         let spec = write_spec(&dir)?;
         let id = format!("shimreal{}", std::process::id());
         let id_b = format!("shimrealb{}", std::process::id());
         let cfg_path = dir.join("config.toml");
-        std::fs::write(&cfg_path, containerd_config(&dir)).map_err(|e| format!("config: {e}"))?;
+        std::fs::write(&cfg_path, containerd_config(&dir, uid, gid))
+            .map_err(|e| format!("config: {e}"))?;
         for sub in ["root", "state", "tmp"] {
             std::fs::create_dir(dir.join(sub)).map_err(|e| format!("mkdir {sub}: {e}"))?;
         }
@@ -452,7 +511,7 @@ mod linux {
             })
         };
 
-        let shim_s = shim.to_string_lossy().into_owned();
+        let shim_s = wrapper.to_string_lossy().into_owned();
         let spec_s = spec.to_string_lossy().into_owned();
         let outcome = (|| -> Result<(), String> {
             if !wait_until(Duration::from_secs(30), || {
@@ -515,7 +574,7 @@ mod linux {
             check_clean(&dir, &id, &ctr_out)?;
 
             // シナリオ B: Kill の all=true。
-            ctr_out(&[
+            let run_b = ctr_out(&[
                 "run",
                 "-d",
                 "--null-io",
@@ -524,7 +583,8 @@ mod linux {
                 "--config",
                 &spec_s,
                 &id_b,
-            ])?;
+            ]);
+            run_b?;
             if !wait_until(Duration::from_secs(30), || {
                 task_row(&id_b).is_some_and(|(_, s)| s == "RUNNING")
             }) {

@@ -83,8 +83,15 @@ impl MicrovmBackend for UnimplementedBackend {
         Err(MicrovmError::new(MicrovmErrorCode::Unimplemented, FAKE_MSG))
     }
 
-    fn stop(&mut self, _vm: u32, _deadline: Duration) -> Result<&'static str, MicrovmError> {
-        Ok("requested")
+    fn stop(
+        &mut self,
+        _vm: u32,
+        _deadline: Duration,
+    ) -> Result<fandhe_container_plugin_microvm::adapter::StopOutcome, MicrovmError> {
+        Ok(fandhe_container_plugin_microvm::adapter::StopOutcome {
+            reason: "requested",
+            ioevent: None,
+        })
     }
 
     fn exit_watch(&self, vm: &u32) -> u32 {

@@ -712,6 +712,43 @@ mod control_ffi {
         fn sendmsg(fd: i32, msg: *const Msghdr, flags: i32) -> isize;
         // SAFETY（宣言そのものの妥当性）: `ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags)`。同上。
         fn recvmsg(fd: i32, msg: *mut Msghdr, flags: i32) -> isize;
+        // SAFETY（宣言そのものの妥当性）: `int poll(struct pollfd *fds, nfds_t nfds, int timeout)`（`nfds_t` は Linux の
+        // glibc / musl の LP64 で `unsigned long` = u64）。stream-exec の要求元の消滅の検知（#4166）だけに使う。
+        fn poll(fds: *mut Pollfd, nfds: u64, timeout: i32) -> i32;
+    }
+
+    /// `struct pollfd`（8 バイト。`fd`・`events`・`revents` の順）。
+    #[repr(C)]
+    pub(super) struct Pollfd {
+        pub(super) fd: i32,
+        pub(super) events: i16,
+        pub(super) revents: i16,
+    }
+
+    /// include/uapi/asm-generic/poll.h の値（x86_64・aarch64 で共通）。
+    pub(super) const POLLIN: i16 = 0x0001;
+    pub(super) const POLLERR: i16 = 0x0008;
+    pub(super) const POLLHUP: i16 = 0x0010;
+    pub(super) const POLLNVAL: i16 = 0x0020;
+    pub(super) const POLLRDHUP: i16 = 0x2000;
+
+    /// `fd` を `poll(timeout = 0)` で 1 回だけ見て、立っている `revents` を返す（待たない）。`EINTR` は `Interrupted`。
+    pub(super) fn poll_revents_now(
+        fd: std::os::fd::BorrowedFd<'_>,
+        events: i16,
+    ) -> io::Result<i16> {
+        use std::os::fd::AsRawFd as _;
+        let mut pfd = Pollfd {
+            fd: fd.as_raw_fd(),
+            events,
+            revents: 0,
+        };
+        // SAFETY: `pfd` は `#[repr(C)]` の 8 バイト 1 要素で、この関数のスタック上にあり呼び出しの間有効かつ排他的。
+        // `nfds` は 1、`timeout` は 0 でブロックしない。`fd` は借用で開いている。カーネルは `revents` にだけ書く。
+        // 本モジュールは LP64 の x86_64 / aarch64 でのみコンパイルされ、`nfds_t` は u64。
+        let rc = unsafe { poll(&raw mut pfd, 1, 0) };
+        check(i64::from(rc))?;
+        Ok(pfd.revents)
     }
 
     /// `struct iovec`（LP64 で 16 バイト）。
@@ -1140,6 +1177,17 @@ mod control_ffi {
             assert!(align_of::<ControlBuf>() >= align_of::<libc::cmsghdr>());
             assert!(offset_of!(ControlFds, hdr) == 0);
             assert!(offset_of!(ControlFds, fds) == size_of::<libc::cmsghdr>());
+            // poll（#4166）。
+            assert!(size_of::<Pollfd>() == size_of::<libc::pollfd>());
+            assert!(align_of::<Pollfd>() == align_of::<libc::pollfd>());
+            assert!(offset_of!(Pollfd, fd) == offset_of!(libc::pollfd, fd));
+            assert!(offset_of!(Pollfd, events) == offset_of!(libc::pollfd, events));
+            assert!(offset_of!(Pollfd, revents) == offset_of!(libc::pollfd, revents));
+            assert!(POLLIN == libc::POLLIN);
+            assert!(POLLERR == libc::POLLERR);
+            assert!(POLLHUP == libc::POLLHUP);
+            assert!(POLLNVAL == libc::POLLNVAL);
+            assert!(POLLRDHUP == libc::POLLRDHUP);
         };
 
         // `sendmsg`・`recvmsg`。自前は `Msghdr` を指すため、ポインタ先の型を別々に書く（`Msghdr` の同一性は上の構造体の
@@ -1158,6 +1206,10 @@ mod control_ffi {
             *mut libc::msghdr,
             libc::c_int,
         ) -> libc::ssize_t = libc::recvmsg;
+        // `poll`。自前は `Pollfd` を指すため、ポインタ先の型を別々に書く（`nfds_t` は LP64 で `unsigned long`）。
+        const _: unsafe extern "C" fn(*mut Pollfd, u64, libc::c_int) -> libc::c_int = poll;
+        const _: unsafe extern "C" fn(*mut libc::pollfd, libc::nfds_t, libc::c_int) -> libc::c_int =
+            libc::poll;
     }
 }
 
@@ -1199,6 +1251,19 @@ mod control_ffi {
         _sock: std::os::fd::BorrowedFd<'_>,
         _buf: &mut [u8],
     ) -> io::Result<super::Received> {
+        Err(unsupported_control())
+    }
+
+    pub(super) const POLLIN: i16 = 0x0001;
+    pub(super) const POLLERR: i16 = 0x0008;
+    pub(super) const POLLHUP: i16 = 0x0010;
+    pub(super) const POLLNVAL: i16 = 0x0020;
+    pub(super) const POLLRDHUP: i16 = 0x2000;
+
+    pub(super) fn poll_revents_now(
+        _fd: std::os::fd::BorrowedFd<'_>,
+        _events: i16,
+    ) -> io::Result<i16> {
         Err(unsupported_control())
     }
 }
@@ -1244,6 +1309,29 @@ pub(crate) fn send_with_fds(
 /// 検証し、想定外なら `fds` を drop して閉じる。LP64 の x86_64 / aarch64 以外は `Unsupported`。
 pub(crate) fn recv_with_fds(sock: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<Received> {
     control_ffi::recv_with_fds(sock, buf)
+}
+
+/// [`poll_revents_now`] で見る `revents` のうち、相手の消滅・fd の異常を表すビットの集合
+/// （`POLLHUP | POLLERR | POLLRDHUP | POLLNVAL`。`POLLIN` は含まない）。
+pub(crate) const POLL_GONE_MASK: i16 =
+    control_ffi::POLLHUP | control_ffi::POLLERR | control_ffi::POLLRDHUP | control_ffi::POLLNVAL;
+
+/// `POLLIN`（読めるデータがある）。
+pub(crate) const POLL_IN: i16 = control_ffi::POLLIN;
+
+/// `POLLRDHUP`（ストリームの相手が書き込み側を閉じた。要求しないと返らない）。
+pub(crate) const POLL_RDHUP: i16 = control_ffi::POLLRDHUP;
+
+/// `POLLHUP`（常に返る。試験が個別のビットを確かめるために使う）。
+#[cfg(test)]
+pub(crate) const POLL_HUP: i16 = control_ffi::POLLHUP;
+
+/// `fd` を `poll(2)` の `timeout = 0` で 1 回だけ見て、立っている `revents` を返す（待たない・読まない・消費しない）。
+/// stream-exec の helper が要求元（plugin-cri）の channel の消滅を検知する（`requester_gone`。#4166・SUP-6・REPAIR-5）。
+/// `events` には `POLLRDHUP` を含めること（要求しないと返らない）。失敗（`EINTR` 等）は `Err` で、呼び出し側が
+/// 「取り消さない」に倒す。LP64 の x86_64 / aarch64 以外は `Unsupported`。
+pub(crate) fn poll_revents_now(fd: BorrowedFd<'_>, events: i16) -> io::Result<i16> {
+    control_ffi::poll_revents_now(fd, events)
 }
 
 /// UNIX ドメインソケットへ non-blocking で 1 回だけ接続を試みる（制御チャネルのクライアント。#2058・REPAIR-5）。
@@ -2083,5 +2171,39 @@ mod tests {
         // /proc フォールバックも、範囲外なら何も閉じない。
         close_fds_from_proc(u32::try_from(fd).unwrap() + 10_000).unwrap();
         assert!(fd_is_open(fd));
+    }
+
+    /// SUP-6・REPAIR-5・#4166: `poll(timeout=0)` の 5 定数の具体値と、socketpair の相手の状態ごとの `revents`。
+    #[cfg(any(
+        all(target_arch = "x86_64", target_pointer_width = "64"),
+        all(target_arch = "aarch64", target_pointer_width = "64")
+    ))]
+    #[test]
+    fn sup6_4166_poll_revents_follow_the_peer_state() {
+        use std::os::fd::AsFd as _;
+        use std::os::unix::net::UnixStream;
+        assert_eq!(POLL_IN, 0x1);
+        assert_eq!(POLL_HUP, 0x10);
+        assert_eq!(POLL_RDHUP, 0x2000);
+        assert_eq!(POLL_GONE_MASK, 0x2038);
+        let events = POLL_IN | POLL_RDHUP;
+
+        // 相手が開いている: 何も立たない。
+        let (a, b) = UnixStream::pair().expect("pair");
+        assert_eq!(poll_revents_now(a.as_fd(), events).unwrap(), 0);
+        // 相手が 1 バイト書いただけ: POLLIN だけで、消滅ではない。
+        std::io::Write::write_all(&mut &b, b"x").expect("write");
+        let r = poll_revents_now(a.as_fd(), events).unwrap();
+        assert_eq!(r, POLL_IN);
+        assert_eq!(r & POLL_GONE_MASK, 0);
+        // 相手が書き込み側を閉じた: POLLRDHUP。
+        b.shutdown(std::net::Shutdown::Write).expect("shutdown");
+        let r = poll_revents_now(a.as_fd(), events).unwrap();
+        assert_ne!(r & POLL_RDHUP, 0, "{r:#x}");
+        // 相手を閉じた: POLLHUP。
+        let (c, d) = UnixStream::pair().expect("pair");
+        drop(d);
+        let r = poll_revents_now(c.as_fd(), events).unwrap();
+        assert_ne!(r & POLL_HUP, 0, "{r:#x}");
     }
 }

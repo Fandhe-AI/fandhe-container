@@ -39,6 +39,9 @@
 //! （0600・追記。開く時に 1 MiB 以上なら `daemon.log.1` へ回す）へ向ける。
 //! 非 Linux は記録先を持たない（plugin-cri の main と同じ。#2430）。
 //!
+//! `-publish-binary` は検証して [`ServeContext`] に保持し（#4154）、[`super::publish`] が TaskCreate・TaskStart・TaskDelete・TaskExit を送る（#4155・#4156）。
+//! 呼び出し形・送る種別は `docs/design/shim-v2-production-binary.md` の「イベントの publish」を参照。
+//!
 //! 計測（REPAIR-4）: `start` / `delete` / デーモンの ttrpc は、結果と所要時間を置き場所の `ops.log`
 //! （0600・JSON Lines・1 MiB で `ops.log.1` へ回す）へ追記する。stdout / stderr は汚さない。
 //!
@@ -48,8 +51,6 @@
 //!   ロック保持下で自分が bind した socket と lock を片付ける（取れなければ固定語彙を `daemon.log` へ出して残す）
 //! - delete での実行層のコンテナの後始末は注入口 [`run_with_hooks`] の前段で plugin-cri が行う（入口の `-id`・`-bundle` の検証と
 //!   状態ルートの記録の照合は #4151、残ったコンテナの停止・回収と終了状態の応答は #4152。この module 自体は実行層に触れない）
-//! - `-publish-binary` は検証して [`ServeContext`] に保持する（#4154）が、イベントの publish（送信）は未実装（#4155・#4156）。
-//!   呼び出し形・送る種別は `docs/design/shim-v2-production-binary.md` の「イベントの publish」を参照
 //! - stdin の options・デーモンのログ（`<bundle>/log`）・grouping
 //! - Windows。`run` は `UNIMPLEMENTED`
 

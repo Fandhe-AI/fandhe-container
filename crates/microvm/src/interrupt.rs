@@ -93,10 +93,77 @@ pub struct InterruptAckReport {
     pub resample: LineResample,
 }
 
+/// ioeventfd の「無視」と「解除失敗」の VM ごとの累計（観測専用。#4161・MVM-1・REPAIR-3・REPAIR-4）。
+///
+/// `MicroVm::assemble` 1 回につき 1 つで、通知スレッド（`IoEventPoller`）と全 `IoEventFd`
+/// が `Arc` で共有する。停止の報告（`StopReport::ioevent`）と plugin-microvm の stop の結果行
+/// （`op=plugin.microvm.stop` の `ignored=` / `unbind_failed=`）へ渡す。値は判断材料で、受理や停止の合否には使わない。
+/// 各計数は `u64` の加算で、実用上あふれない。
+///
+/// - `ignored`: 通知スレッドが受理判定（`complete_ioevent`）に回して `Ok(None)`（DRIVER_OK 前・FAILED・ready でないキュー等）で
+///   捨てた回数。複数回の kick が 1 回にまとまったものは 1 件。`take() == 0` の起床は数えない。MMIO exit 経路で捨てたものは対象外。
+///   `op=microvm.ioevent` の経路に対応する。
+/// - `unbind_failed`: `IoEventFd` の drop での `KVM_IOEVENTFD` 解除の失敗。`op=kvm.ioeventfd.deassign` の行と同じ事象
+///   （そちらはプロセス全体の件数、本型は VM ごと）。
+#[derive(Debug, Default)]
+pub struct IoEventTally {
+    ignored: std::sync::atomic::AtomicU64,
+    unbind_failed: std::sync::atomic::AtomicU64,
+}
+
+/// [`IoEventTally`] のある時点の写し（REPAIR-4: 構造を持つ型で返す）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct IoEventCounts {
+    /// 受理条件を満たさず無視した通知の回数。
+    pub ignored: u64,
+    /// ioeventfd の解除に失敗した回数。
+    pub unbind_failed: u64,
+}
+
+impl IoEventCounts {
+    /// 計数から写しを作る（`non_exhaustive` のため crate 外の試験・adapter が値を組むための入口）。
+    pub const fn new(ignored: u64, unbind_failed: u64) -> Self {
+        Self {
+            ignored,
+            unbind_failed,
+        }
+    }
+}
+
+impl IoEventTally {
+    /// 受理条件を満たさず捨てた通知 1 回分を数える。
+    pub fn record_ignored(&self) {
+        // u64 の加算は実用上あふれない。観測専用なので順序は Relaxed で足りる。
+        self.ignored
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// ioeventfd の解除失敗 1 回分を数える。
+    pub fn record_unbind_failed(&self) {
+        self.unbind_failed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 現在の計数の写しを返す。
+    pub fn snapshot(&self) -> IoEventCounts {
+        use std::sync::atomic::Ordering::Relaxed;
+        IoEventCounts {
+            ignored: self.ignored.load(Relaxed),
+            unbind_failed: self.unbind_failed.load(Relaxed),
+        }
+    }
+}
+
 /// `InterruptACK` の後処理の結果の累計（観測専用。#4014・#3863・MVM-5）。
 ///
 /// 呼び出し元は macOS の `hvf::mmio` のハンドラだけで、デバイス 1 台につき 1 つを全 vCPU が `Arc` で共有する。
-/// `DeviceReset` の resample は数えない（ACK の計数と揃える）。値は判断材料で、合否には使わない（判断は #3988）。
+/// `DeviceReset`（Status=0）の後の resample は、`acks` 等には混ぜず別カウンタ `resets` に数える（#4170）。
+/// 実 Linux ゲストは virtio ドライバの probe・remove のたびに Status=0 を書くため、リセット経由で線が下がる頻度は
+/// ACK 経由とは別の level 化の判断材料になる（費用は `Relaxed` の加算 1 回）。内訳は持たない: リセット直後は
+/// `interrupt_status == 0` で `Reasserted` にならず、`Deasserted`（level 線）か `NotApplicable`（edge 線）かは
+/// 線の注入方式で決まり実行時に変わらないため、回数 1 つで足りる。数えるのは route の後処理が成功したときだけ
+/// （route の無いデバイスと失敗時は数えない）。値は判断材料で、合否には使わない（判断は #3988）。
 /// 各計数は `u64` の加算で、実用上あふれない。
 #[derive(Debug, Default)]
 pub struct InterruptAckTally {
@@ -104,6 +171,7 @@ pub struct InterruptAckTally {
     deasserted: std::sync::atomic::AtomicU64,
     reasserted: std::sync::atomic::AtomicU64,
     not_applicable: std::sync::atomic::AtomicU64,
+    resets: std::sync::atomic::AtomicU64,
 }
 
 /// [`InterruptAckTally`] のある時点の写し（REPAIR-4: 構造を持つ型で返す）。
@@ -118,6 +186,9 @@ pub struct InterruptAckCounts {
     pub reasserted: u64,
     /// 線が edge 扱いで何もしなかった回数（[`LineResample::NotApplicable`]）。
     pub not_applicable: u64,
+    /// `DeviceReset`（Status=0）の後に resample を行った回数（#4170）。`acks` 等には含めない。
+    /// 線が level なら deassert、edge なら何もしなかった回数に等しい。
+    pub resets: u64,
 }
 
 impl InterruptAckTally {
@@ -137,6 +208,11 @@ impl InterruptAckTally {
         }
     }
 
+    /// `DeviceReset` の後処理 1 回分を数える（#4170）。`acks` 等の既存の計数は変えない。
+    pub fn record_reset(&self) {
+        Self::bump(&self.resets);
+    }
+
     /// 現在の計数の写しを返す。
     pub fn snapshot(&self) -> InterruptAckCounts {
         use std::sync::atomic::Ordering::Relaxed;
@@ -145,6 +221,7 @@ impl InterruptAckTally {
             deasserted: self.deasserted.load(Relaxed),
             reasserted: self.reasserted.load(Relaxed),
             not_applicable: self.not_applicable.load(Relaxed),
+            resets: self.resets.load(Relaxed),
         }
     }
 }
@@ -717,6 +794,17 @@ mod tests {
         .unwrap()
     }
 
+    /// MVM-1・REPAIR-4・#4161: 無視 2 回・解除失敗 1 回の写しが具体値で (2, 1) になり、既定は (0, 0)。
+    #[test]
+    fn mvm1_4161_ioevent_tally_snapshot_counts() {
+        let tally = IoEventTally::default();
+        assert_eq!(tally.snapshot(), IoEventCounts::new(0, 0));
+        tally.record_ignored();
+        tally.record_ignored();
+        tally.record_unbind_failed();
+        assert_eq!(tally.snapshot(), IoEventCounts::new(2, 1));
+    }
+
     /// ACK の後処理の結果が種別ごとに数えられ、写しが具体値になる（#4014・MVM-5）。
     #[test]
     fn mvm5_4014_ack_tally_counts_each_resample_kind() {
@@ -738,6 +826,47 @@ mod tests {
         assert_eq!(c.deasserted, 2);
         assert_eq!(c.reasserted, 1);
         assert_eq!(c.not_applicable, 1);
+        assert_eq!(c.resets, 0);
+    }
+
+    /// DeviceReset 後の resample は `resets` にだけ数えられ、ACK の計数と混ざらない（#4170・MVM-5・MVM-1）。
+    #[test]
+    fn mvm5_4170_ack_tally_counts_device_reset_resample_separately() {
+        let gic = RecordingGic::default();
+        let line = SpiLine::new(gic.clone(), 48, IrqTrigger::LevelHigh);
+        let mut t = block_transport();
+        let tally = InterruptAckTally::default();
+        for _ in 0..2 {
+            t.raise_interrupt(InterruptReason::UsedBuffer);
+            line.trigger().unwrap();
+            let out = t.write(reg::STATUS, &0u32.to_le_bytes());
+            assert_eq!(out, MmioWriteOutcome::DeviceReset);
+            let r = complete_interrupt_ack(&t, &line).unwrap();
+            assert_eq!(r.remaining, 0);
+            assert_eq!(r.resample, LineResample::Deasserted);
+            tally.record_reset();
+        }
+        let c = tally.snapshot();
+        assert_eq!(
+            (
+                c.resets,
+                c.acks,
+                c.deasserted,
+                c.reasserted,
+                c.not_applicable
+            ),
+            (2, 0, 0, 0, 0)
+        );
+        assert_eq!(
+            gic.calls(),
+            vec![(48, true), (48, false), (48, true), (48, false)]
+        );
+        tally.record(&InterruptAckReport {
+            remaining: 0,
+            resample: LineResample::Deasserted,
+        });
+        let c = tally.snapshot();
+        assert_eq!((c.acks, c.deasserted, c.resets), (1, 1, 2));
     }
 
     /// MVM-5・MVM-1（#3863）: assert → ACK → deassert の呼び出し列が `(intid, level)` で具体値になる。

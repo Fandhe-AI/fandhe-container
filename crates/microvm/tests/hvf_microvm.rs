@@ -16,6 +16,9 @@
 
 #[path = "support/arm64_image.rs"]
 mod arm64_image;
+/// 記述子のワイヤー配置の正本（`tests/support/virtqueue_driver.rs`。複製しない・#4113）。
+#[path = "support/virtqueue_driver.rs"]
+mod virtqueue_driver;
 
 use arm64_image::{BOOT_CHECK_CODE, image_with_code};
 use fandhe_container_microvm::arm64_layout::{
@@ -441,10 +444,11 @@ fn block_read_image(kernel_gpa: u64, head: u16) -> Vec<u8> {
     };
     let desc = |img: &mut Vec<u8>, i: usize, addr: usize, len: u32, flags: u16, next: u16| {
         let at = Q_DESC + i * 16;
-        put(img, at, &(kernel_gpa + addr as u64).to_le_bytes());
-        put(img, at + 8, &len.to_le_bytes());
-        put(img, at + 12, &flags.to_le_bytes());
-        put(img, at + 14, &next.to_le_bytes());
+        put(
+            img,
+            at,
+            &virtqueue_driver::desc_bytes(kernel_gpa + addr as u64, len, flags, next),
+        );
     };
     desc(&mut img, 0, Q_HDR, 16, 1, 1); // NEXT
     desc(&mut img, 1, Q_DATA, 512, 1 | 2, 2); // NEXT | WRITE

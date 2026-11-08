@@ -27,7 +27,7 @@
 //!
 //! 未実装（REPAIR-3）: 非 Linux（macOS は既定の状態ルートが未決定で #2431、`start`・`kill`・`stop` も `Unimplemented`）は Shutdown だけの
 //! `EmptyTaskService` を登録する。exec の起動役（`TaskExecLauncher`）の本番実装は無く exec は `UNIMPLEMENTED`。
-//! `-publish-binary` のイベント publish も未実装。非 Linux の delete は
+//! `-publish-binary` による TaskCreate・TaskStart・TaskDelete・TaskExit の publish は実装済み（#4155・#4156）。非 Linux の delete は
 //! 引数の検証だけで、記録の照合はしない（既定の状態ルートが未決定で #2431）。
 
 use std::path::{Path, PathBuf};
@@ -178,11 +178,17 @@ pub(crate) fn registry_in(
         runtime = runtime.with_create_audit_sink(sink);
     }
     let adapter = RuntimeAdapter::new(Arc::new(runtime));
-    let v2 =
+    // イベント 4 種の送り先（`-publish-binary` が無ければ `None`。cri 側が `disabled` を記録する。CRI-5・#4155・#4156）。
+    let publisher = fandhe_container_cri::shim_v2::publish::exec_publisher_for(&ctx);
+    let mut v2 =
         TaskService::new(TaskApiVersion::V2, adapter.clone()).with_shutdown(ctx.shutdown().clone());
-    let v3 = TaskService::new(TaskApiVersion::V3, adapter)
+    let mut v3 = TaskService::new(TaskApiVersion::V3, adapter)
         .with_shutdown(ctx.shutdown().clone())
         .with_shared_created(&v2);
+    if let Some(p) = publisher {
+        v2 = v2.with_event_publisher(Arc::clone(&p));
+        v3 = v3.with_event_publisher(p);
+    }
     let mut reg = ServiceRegistry::new();
     for svc in [Arc::new(v2), Arc::new(v3)] {
         reg.register(svc)

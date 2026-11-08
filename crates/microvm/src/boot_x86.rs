@@ -151,7 +151,7 @@ const SETUP_HEADER_MIN_END: usize = OFF_INIT_SIZE + 4;
 const OFF_E820_ENTRIES: usize = 0x1E8;
 const OFF_E820_TABLE: usize = 0x2D0;
 const E820_ENTRY_SIZE: usize = 20;
-const E820_MAX: usize = 128;
+pub(crate) const E820_MAX: usize = 128;
 
 const BOOT_FLAG: u16 = 0xAA55;
 /// "HdrS" のリトルエンディアン。
@@ -165,7 +165,7 @@ const LOADER_TYPE_UNDEFINED: u8 = 0xFF;
 /// 64-bit エントリのカーネル先頭からのオフセット。
 const ENTRY_64_OFFSET: u64 = 0x200;
 const E820_RAM: u32 = 1;
-/// e820 の予約（type 2）。MP テーブルの範囲に使う。
+/// e820 の予約（type 2）。MP テーブルの範囲と、IOAPIC・LAPIC・virtio-mmio の窓・KVM 内部領域（#4106）に使う。
 const E820_RESERVED: u32 = 2;
 const INITRD_ALIGN: u64 = 4096;
 const MAX_KERNEL_ALIGNMENT: u64 = 1 << 30;
@@ -473,6 +473,17 @@ pub struct E820Entry {
     pub kind: u32,
 }
 
+/// e820 に type 2（予約）として載せる領域（#4106・MVM-1）。RAM でない GPA（IOAPIC・LAPIC・virtio-mmio の窓・KVM 内部領域）を
+/// ゲストが RAM として使わないよう伝える。種別を呼び出し側に任せない newtype（REPAIR-2）。`microvm::e820_reservations` が
+/// `system_regions` の RAM 以外の領域から 1 対 1 で作る。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct E820Reservation {
+    /// 先頭アドレス。
+    pub addr: u64,
+    /// 長さ（0 は [`plan_boot`] が拒否する）。
+    pub size: u64,
+}
+
 /// ロード先の計画（純粋な計算の結果。書き込みはこれがすべて通ってから行う）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BootPlan {
@@ -490,11 +501,15 @@ pub struct BootPlan {
 ///
 /// 先頭の領域は GPA 0 から始まること。カーネル・initrd・boot_params は先頭の領域（low RAM）の中に置き、
 /// e820 は領域の一覧から機械的に作る（先頭の領域は従来の 3 本、2 番目以降は RAM 1 本ずつ）ので、KVM に登録した memslot と一致する。
+///
+/// `reserved` は RAM 以外の領域（#4106）で、1 本ずつ type 2 として加え、全体を addr の昇順に並べる。size 0・終端の溢れ・
+/// RAM / MP テーブルの予約 / 予約どうしとの重なり・合計が `E820_MAX` 超は `InvalidArgument`（fail-closed。SEC-1）。
 pub fn plan_boot(
     header: &SetupHeader,
     payload_len: u64,
     initrd_len: Option<u64>,
     ram: &[GuestMemoryRegion],
+    reserved: &[E820Reservation],
 ) -> Result<BootPlan, MicrovmError> {
     let (first, rest) = ram
         .split_first()
@@ -619,12 +634,49 @@ pub fn plan_boot(
             kind: E820_RAM,
         });
     }
+    for r in reserved {
+        if r.size == 0 || r.addr.checked_add(r.size).is_none() {
+            return Err(invalid("e820 reservation is empty or overflows"));
+        }
+        e820.push(E820Entry {
+            addr: r.addr,
+            size: r.size,
+            kind: E820_RESERVED,
+        });
+    }
+    if e820.len() > E820_MAX {
+        return Err(invalid("too many e820 entries"));
+    }
+    e820.sort_by_key(|e| e.addr);
+    // 昇順に並べたので、隣り合う組だけ見れば全体の非重複が言える（終端の溢れは上で除外済み）。
+    let overlaps = e820
+        .windows(2)
+        .any(|w| w[0].addr.saturating_add(w[0].size) > w[1].addr);
+    if overlaps {
+        return Err(invalid("e820 entries overlap"));
+    }
     Ok(BootPlan {
         load_addr,
         kernel_end,
         initrd,
         e820,
     })
+}
+
+/// `plan_boot` だけを呼ぶ他モジュールの試験用の setup header（`header_bytes` は `plan_boot` が使わないので空）。
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+pub(crate) fn header_for_plan_tests() -> SetupHeader {
+    SetupHeader {
+        version: 0x020F,
+        payload_offset: 0x1000,
+        initrd_addr_max: 0x3FF_FFFF,
+        kernel_alignment: 0x20_0000,
+        relocatable: true,
+        cmdline_size: 2047,
+        pref_address: 0x100_0000,
+        init_size: 0x40_0000,
+        header_bytes: Vec::new(),
+    }
 }
 
 /// boot_params（zero page）。名前つきのオフセットと型つきの setter だけで組み立てる。
@@ -699,6 +751,7 @@ pub fn load_linux<B: GuestMemoryBacking>(
     kernel: &[u8],
     initrd: Option<&[u8]>,
     cmdline: &KernelCmdline,
+    reserved: &[E820Reservation],
 ) -> Result<LoadedKernel, MicrovmError> {
     if mem.base() != GuestAddress::new(0) {
         return Err(invalid("guest memory must start at GPA 0"));
@@ -722,6 +775,7 @@ pub fn load_linux<B: GuestMemoryBacking>(
         payload_len,
         initrd.map(|i| i.len() as u64),
         &mem.regions(),
+        reserved,
     )?;
 
     let cmd_bytes = cmdline.as_str().as_bytes();
@@ -1246,7 +1300,7 @@ mod tests {
     fn mvm1_884_loads_bzimage_at_protocol_offsets() {
         let img = Img::default().build();
         let mut m = mem(64 * MIB);
-        let l = load_linux(&mut m, &img, None, &cmd("console=ttyS0")).unwrap();
+        let l = load_linux(&mut m, &img, None, &cmd("console=ttyS0"), &[]).unwrap();
         assert_eq!(l.kernel_addr, GuestAddress::new(0x100_0000));
         assert_eq!(l.entry, GuestAddress::new(0x100_0200));
         assert_eq!(l.boot_params, GuestAddress::new(0x7000));
@@ -1284,7 +1338,7 @@ mod tests {
         let data = vec![0xA5u8; 0x1801];
         let img = Img::default().build();
         let mut m = mem(64 * MIB);
-        let l = load_linux(&mut m, &img, Some(&data), &cmd("console=ttyS0")).unwrap();
+        let l = load_linux(&mut m, &img, Some(&data), &cmd("console=ttyS0"), &[]).unwrap();
         assert!(l.kernel_addr.raw() >= MP_TABLE_END);
         let (ird, _) = l.initrd.unwrap();
         assert!(ird.raw() >= MP_TABLE_END);
@@ -1318,7 +1372,7 @@ mod tests {
     fn mvm1_3697_plan_e820_includes_high_region() {
         let h = SetupHeader::parse(&Img::default().build()).unwrap();
         let ram = [region(0, 0xd000_0000), region(0x1_0000_0000, 0x7000_0000)];
-        let p = plan_boot(&h, 0x1000, None, &ram).unwrap();
+        let p = plan_boot(&h, 0x1000, None, &ram, &[]).unwrap();
         assert_eq!(
             p.e820,
             vec![
@@ -1344,7 +1398,7 @@ mod tests {
                 },
             ]
         );
-        let e = plan_boot(&h, 0x1000, None, &[region(0x1000, 64 * MIB)]).unwrap_err();
+        let e = plan_boot(&h, 0x1000, None, &[region(0x1000, 64 * MIB)], &[]).unwrap_err();
         assert_eq!(e.message(), "guest memory must start at GPA 0");
     }
 
@@ -1359,7 +1413,14 @@ mod tests {
             ),
         ])
         .unwrap();
-        load_linux(&mut m, &Img::default().build(), None, &cmd("console=ttyS0")).unwrap();
+        load_linux(
+            &mut m,
+            &Img::default().build(),
+            None,
+            &cmd("console=ttyS0"),
+            &[],
+        )
+        .unwrap();
         let zp = read(&m, ZERO_PAGE_ADDR, ZERO_PAGE_SIZE);
         assert_eq!(zp[OFF_E820_ENTRIES], 4);
         let base = OFF_E820_TABLE + 3 * E820_ENTRY_SIZE;
@@ -1368,11 +1429,104 @@ mod tests {
         assert_eq!(&zp[base + 16..base + 20], &1u32.to_le_bytes());
     }
 
+    fn resv(addr: u64, size: u64) -> E820Reservation {
+        E820Reservation { addr, size }
+    }
+
+    /// 最大構成相当の hole 内の予約（virtio 2 台・IOAPIC・LAPIC・identity map・TSS）。
+    fn hole_reservations() -> Vec<E820Reservation> {
+        vec![
+            resv(0xd000_0000, 0x1000),
+            resv(0xd000_1000, 0x1000),
+            resv(0xfec0_0000, 0x1000),
+            resv(0xfee0_0000, 0x1000),
+            resv(0xfffb_c000, 0x1000),
+            resv(0xfffb_d000, 0x3000),
+        ]
+    }
+
+    /// MVM-1・#4106: 予約は逆順で渡しても addr の昇順に並び、type 2 で RAM の間に入る（全体を具体値で照合）。
+    #[test]
+    fn mvm1_4106_plan_e820_sorts_reservations() {
+        let h = SetupHeader::parse(&Img::default().build()).unwrap();
+        let ram = [region(0, 0xd000_0000), region(0x1_0000_0000, 0x7000_0000)];
+        let mut r = hole_reservations();
+        r.reverse();
+        let p = plan_boot(&h, 0x1000, None, &ram, &r).unwrap();
+        let e = |addr, size, kind| E820Entry { addr, size, kind };
+        assert_eq!(
+            p.e820,
+            vec![
+                e(0, 0x9_FC00, 1),
+                e(0x9_FC00, 0x400, 2),
+                e(0x10_0000, 0xd000_0000 - 0x10_0000, 1),
+                e(0xd000_0000, 0x1000, 2),
+                e(0xd000_1000, 0x1000, 2),
+                e(0xfec0_0000, 0x1000, 2),
+                e(0xfee0_0000, 0x1000, 2),
+                e(0xfffb_c000, 0x1000, 2),
+                e(0xfffb_d000, 0x3000, 2),
+                e(0x1_0000_0000, 0x7000_0000, 1),
+            ]
+        );
+    }
+
+    /// MVM-1・#4106・SEC-1: RAM・MP テーブル・予約どうしと 1 バイトでも重なる、size 0、溢れは `InvalidArgument`。隣接は通る。
+    #[test]
+    fn mvm1_4106_plan_rejects_bad_reservations() {
+        let h = SetupHeader::parse(&Img::default().build()).unwrap();
+        let ram = [region(0, 0xd000_0000), region(0x1_0000_0000, 0x7000_0000)];
+        let bad: Vec<Vec<E820Reservation>> = vec![
+            vec![resv(0xcfff_ffff, 2)],
+            vec![resv(0xffff_ffff, 2)],
+            vec![resv(0xffff_f000, 0x1_0000_1000)],
+            vec![resv(0x9_FC00, 0x10)],
+            vec![resv(0xd000_0000, 0x2000), resv(0xd000_1fff, 0x10)],
+            vec![resv(0xd000_0000, 0)],
+            vec![resv(u64::MAX, 2)],
+        ];
+        for r in bad {
+            let e = plan_boot(&h, 0x1000, None, &ram, &r).unwrap_err();
+            assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+        }
+        // RAM の終端にちょうど隣接するだけなら通る。
+        let p = plan_boot(&h, 0x1000, None, &ram, &[resv(0xd000_0000, 0x1000)]).unwrap();
+        assert_eq!(p.e820.len(), 5);
+        // 件数が E820_MAX を超える。
+        let many: Vec<E820Reservation> = (0..E820_MAX as u64)
+            .map(|i| resv(0xd000_0000 + i * 0x1000, 0x1000))
+            .collect();
+        let e = plan_boot(&h, 0x1000, None, &ram, &many).unwrap_err();
+        assert_eq!(e.message(), "too many e820 entries");
+    }
+
+    /// MVM-1・#4106: load_linux は予約つきの e820 を zero page に書く（件数と 1 本の予約の addr・size・type=2）。
+    #[test]
+    fn mvm1_4106_load_linux_writes_reserved_entries() {
+        let mut m = GuestMemory::from_regions(vec![
+            (GuestAddress::new(0), HeapBacking::new(64 * MIB).unwrap()),
+            (
+                GuestAddress::new(0x1_0000_0000),
+                HeapBacking::new(MIB).unwrap(),
+            ),
+        ])
+        .unwrap();
+        let r = hole_reservations();
+        load_linux(&mut m, &Img::default().build(), None, &cmd(""), &r).unwrap();
+        let zp = read(&m, ZERO_PAGE_ADDR, ZERO_PAGE_SIZE);
+        assert_eq!(zp[OFF_E820_ENTRIES], 10);
+        // 並びは RAM(0)・MP(1)・himem(2)・予約 6 本(3..9)・高位 RAM(9) なので、IOAPIC は 5 番目。
+        let base = OFF_E820_TABLE + 5 * E820_ENTRY_SIZE;
+        assert_eq!(&zp[base..base + 8], &0xfec0_0000u64.to_le_bytes());
+        assert_eq!(&zp[base + 8..base + 16], &0x1000u64.to_le_bytes());
+        assert_eq!(&zp[base + 16..base + 20], &2u32.to_le_bytes());
+    }
+
     /// MVM-1・#3888: plan_boot の e820 は RAM・予約（MP テーブル）・RAM の具体値。
     #[test]
     fn mvm1_3888_plan_e820_values() {
         let h = SetupHeader::parse(&Img::default().build()).unwrap();
-        let p = plan_boot(&h, 0x1000, None, &[region(0, 64 * MIB)]).unwrap();
+        let p = plan_boot(&h, 0x1000, None, &[region(0, 64 * MIB)], &[]).unwrap();
         assert_eq!(
             p.e820,
             vec![
@@ -1406,7 +1560,7 @@ mod tests {
         }
         .build();
         let mut m = mem(64 * MIB);
-        let l = load_linux(&mut m, &img, Some(&data), &cmd("")).unwrap();
+        let l = load_linux(&mut m, &img, Some(&data), &cmd(""), &[]).unwrap();
         assert_eq!(l.initrd, Some((GuestAddress::new(0x3FF_E000), 0x1801)));
         assert_eq!(
             m.read_u32_le(GuestAddress::new(0x7000 + 0x218)).unwrap(),
@@ -1424,7 +1578,7 @@ mod tests {
         }
         .build();
         let mut m = mem(64 * MIB);
-        let l = load_linux(&mut m, &img, Some(&data), &cmd("")).unwrap();
+        let l = load_linux(&mut m, &img, Some(&data), &cmd(""), &[]).unwrap();
         assert_eq!(l.initrd, Some((GuestAddress::new(0x1FF_E000), 0x1801)));
         assert_eq!(
             m.read_u32_le(GuestAddress::new(0x7000 + 0x218)).unwrap(),
@@ -1434,14 +1588,14 @@ mod tests {
         // 空の initrd と、カーネルの確保域に食い込む initrd。
         let mut m = mem(64 * MIB);
         assert_eq!(
-            load_linux(&mut m, &img, Some(&[]), &cmd(""))
+            load_linux(&mut m, &img, Some(&[]), &cmd(""), &[])
                 .unwrap_err()
                 .code(),
             MicrovmErrorCode::InvalidArgument
         );
         let big = vec![1u8; 0x1FF_0000];
         expect_err(
-            load_linux(&mut m, &img, Some(&big), &cmd("")),
+            load_linux(&mut m, &img, Some(&big), &cmd(""), &[]),
             MicrovmErrorCode::ResourceExhausted,
             "initrd does not fit in guest memory",
         );
@@ -1492,7 +1646,7 @@ mod tests {
         let expect = "console=ttyS0 virtio_mmio.device=0x1000@0xd0000000:5 virtio_mmio.device=0x1000@0xd0001000:6";
         assert_eq!(c.as_str(), expect);
         let mut m = mem(64 * MIB);
-        let l = load_linux(&mut m, &Img::default().build(), None, &c).unwrap();
+        let l = load_linux(&mut m, &Img::default().build(), None, &c, &[]).unwrap();
         let mut want = expect.as_bytes().to_vec();
         want.push(0);
         assert_eq!(read(&m, 0x2_0000, want.len()), want);
@@ -1574,7 +1728,7 @@ mod tests {
         }
         .build();
         let mut m = mem(64 * MIB);
-        let l = load_linux(&mut m, &img, None, &cmd("")).unwrap();
+        let l = load_linux(&mut m, &img, None, &cmd(""), &[]).unwrap();
         assert_eq!(l.kernel_addr, GuestAddress::new(0x200_0000));
         assert_eq!(l.entry, GuestAddress::new(0x200_0200));
         let img = Img {
@@ -1584,7 +1738,7 @@ mod tests {
         }
         .build();
         expect_err(
-            load_linux(&mut m, &img, None, &cmd("")),
+            load_linux(&mut m, &img, None, &cmd(""), &[]),
             MicrovmErrorCode::InvalidArgument,
             "kernel cannot be placed (alignment or preferred address)",
         );
@@ -1598,7 +1752,7 @@ mod tests {
         }
         .build();
         let mut m = mem(64 * MIB);
-        let l = load_linux(&mut m, &img, None, &cmd("")).unwrap();
+        let l = load_linux(&mut m, &img, None, &cmd(""), &[]).unwrap();
         assert_eq!(l.kernel_addr, GuestAddress::new(0x20_0000));
         assert_eq!(l.entry, GuestAddress::new(0x20_0200));
         let img = Img {
@@ -1607,7 +1761,7 @@ mod tests {
             ..Img::default()
         }
         .build();
-        let l = load_linux(&mut m, &img, None, &cmd("")).unwrap();
+        let l = load_linux(&mut m, &img, None, &cmd(""), &[]).unwrap();
         assert_eq!(l.kernel_addr, GuestAddress::new(0x10_0000));
         let img = Img {
             pref: 0,
@@ -1616,7 +1770,9 @@ mod tests {
         }
         .build();
         assert_eq!(
-            load_linux(&mut m, &img, None, &cmd("")).unwrap_err().code(),
+            load_linux(&mut m, &img, None, &cmd(""), &[])
+                .unwrap_err()
+                .code(),
             MicrovmErrorCode::InvalidArgument
         );
     }
@@ -1633,13 +1789,13 @@ mod tests {
         .build();
         let mut m = mem(8 * MIB);
         expect_err(
-            load_linux(&mut m, &img, None, &cmd("")),
+            load_linux(&mut m, &img, None, &cmd(""), &[]),
             MicrovmErrorCode::ResourceExhausted,
             "kernel does not fit in guest memory",
         );
         // 窓がちょうど収まる RAM（20 MiB）では、再配置先の 2 MiB を使わず pref_address に置かれる。
         let mut m = mem(20 * MIB);
-        let l = load_linux(&mut m, &img, None, &cmd("")).unwrap();
+        let l = load_linux(&mut m, &img, None, &cmd(""), &[]).unwrap();
         assert_eq!(l.kernel_addr, GuestAddress::new(16 * MIB));
         // pref_address が無い relocatable は従来どおり 2 MiB。
         let img = Img {
@@ -1648,7 +1804,7 @@ mod tests {
             ..Img::default()
         }
         .build();
-        let l = load_linux(&mut mem(8 * MIB), &img, None, &cmd("")).unwrap();
+        let l = load_linux(&mut mem(8 * MIB), &img, None, &cmd(""), &[]).unwrap();
         assert_eq!(l.kernel_addr, GuestAddress::new(0x20_0000));
         let img = Img {
             relocatable: 0,
@@ -1657,7 +1813,7 @@ mod tests {
         }
         .build();
         assert_eq!(
-            load_linux(&mut mem(8 * MIB), &img, None, &cmd(""))
+            load_linux(&mut mem(8 * MIB), &img, None, &cmd(""), &[])
                 .unwrap_err()
                 .code(),
             MicrovmErrorCode::ResourceExhausted
@@ -1677,14 +1833,14 @@ mod tests {
         let initrd = vec![0xAB; (48 * MIB) as usize];
         let mut m = mem(64 * MIB);
         assert_eq!(
-            load_linux(&mut m, &img, Some(&initrd), &cmd(""))
+            load_linux(&mut m, &img, Some(&initrd), &cmd(""), &[])
                 .unwrap_err()
                 .code(),
             MicrovmErrorCode::ResourceExhausted
         );
         // 窓の上に収まる 40 MiB の initrd は 24 MiB に置かれ、窓と重ならない。
         let initrd = vec![0xAB; (40 * MIB) as usize];
-        let l = load_linux(&mut m, &img, Some(&initrd), &cmd("")).unwrap();
+        let l = load_linux(&mut m, &img, Some(&initrd), &cmd(""), &[]).unwrap();
         assert_eq!(l.initrd.unwrap().0, GuestAddress::new(24 * MIB));
     }
 
@@ -1696,7 +1852,7 @@ mod tests {
         let setup = (usize::from(Img::default().setup_sects) + 1) * 512;
         img.truncate(setup + 1);
         let mut m = mem(64 * MIB);
-        let e = load_linux(&mut m, &img, None, &cmd("")).unwrap_err();
+        let e = load_linux(&mut m, &img, None, &cmd(""), &[]).unwrap_err();
         assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
     }
 
@@ -1704,7 +1860,7 @@ mod tests {
     fn mvm1_884_rejects_invalid_images() {
         let inv = MicrovmErrorCode::InvalidArgument;
         let mut m = mem(64 * MIB);
-        let mut try_img = |img: &[u8]| load_linux(&mut m, img, None, &cmd(""));
+        let mut try_img = |img: &[u8]| load_linux(&mut m, img, None, &cmd(""), &[]);
         let mut elf = Img::default().build();
         elf[..4].copy_from_slice(b"\x7fELF");
         expect_err(
@@ -1813,12 +1969,12 @@ mod tests {
         }
         .build();
         expect_err(
-            load_linux(&mut mem(16 * MIB), &fixed, None, &cmd("")),
+            load_linux(&mut mem(16 * MIB), &fixed, None, &cmd(""), &[]),
             MicrovmErrorCode::ResourceExhausted,
             "kernel does not fit in guest memory",
         );
         expect_err(
-            load_linux(&mut mem(MIB), &img, None, &cmd("")),
+            load_linux(&mut mem(MIB), &img, None, &cmd(""), &[]),
             MicrovmErrorCode::InvalidArgument,
             "guest memory is too small for a kernel",
         );
@@ -1828,7 +1984,7 @@ mod tests {
         )
         .unwrap();
         expect_err(
-            load_linux(&mut off, &img, None, &cmd("")),
+            load_linux(&mut off, &img, None, &cmd(""), &[]),
             MicrovmErrorCode::InvalidArgument,
             "guest memory must start at GPA 0",
         );
@@ -1859,7 +2015,7 @@ mod tests {
         }
         .build();
         assert_eq!(
-            load_linux(&mut mem(64 * MIB), &ok, None, &c)
+            load_linux(&mut mem(64 * MIB), &ok, None, &c, &[])
                 .unwrap()
                 .cmdline_len,
             100
@@ -1870,7 +2026,7 @@ mod tests {
         }
         .build();
         expect_err(
-            load_linux(&mut mem(64 * MIB), &ng, None, &c),
+            load_linux(&mut mem(64 * MIB), &ng, None, &c, &[]),
             inv,
             "kernel command line exceeds the kernel's limit",
         );

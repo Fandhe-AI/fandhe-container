@@ -758,24 +758,119 @@ fn repair5_4152_slow_generation_check_shrinks_cleanup_budget() {
     );
 }
 
-/// REPAIR-5・REPAIR-4・#4152: core の中の状態の読み取りが後始末の期限の半分を使い切ったら、記録を削除せず `Timeout`（記録は残る）。
+/// REPAIR-5・REPAIR-4・#4152・#4239: core の中の状態の読み取りが後始末の期限（300ms）を使い切ったら、core が記録を消す直前の期限確認で
+/// `Timeout` にし、記録は残る（再試行できる）。期限は `GuardedCore` が絶対期限として core へ渡している。
 #[test]
 fn repair5_4152_slow_read_inside_core_keeps_record_instead_of_deleting() {
-    let (_g, fast, slow, generation) = slow_setup("r-slow3", Duration::from_millis(200));
+    let (_g, fast, slow, generation) = slow_setup("r-slow3", Duration::from_millis(350));
     let rt = GuardedCore::new(slow, Duration::from_millis(300), |p, c| {
         core_runtime_for(p)
             .with_delete_deadline(c)
             .with_container_log_lock_wait(c)
             .with_cleanup_warning_sink(Arc::new(|_| {}))
     });
-    // 世代確認で 200ms、残り 800ms → 後始末 300ms・削除の締め切りは 150ms。core の `get` の 200ms で過ぎる。
+    // 世代確認で 350ms、残り 1650ms → 後始末 300ms。core の最初の `get` の 350ms で期限を過ぎる。
     let e = rt
         .delete(
             &DeleteRequest::new(cid("abc")),
             &generation,
-            std::time::Instant::now() + Duration::from_millis(1000),
+            std::time::Instant::now() + Duration::from_millis(2000),
         )
-        .expect_err("floor passed");
+        .expect_err("deadline passed");
     assert_eq!(e.code(), ErrorCode::Timeout);
     assert!(fast.get(&GetStateRequest::new(cid("abc"))).is_ok());
+    // 記録が残っているので、期限に余裕のある再試行は成功する（再実行が成り立つ）。
+    let again = GuardedCore::new(Arc::clone(&fast), Duration::from_secs(1), |p, _| {
+        core_runtime_for(p)
+    });
+    again
+        .delete(
+            &DeleteRequest::new(cid("abc")),
+            &generation,
+            std::time::Instant::now() + Duration::from_secs(3),
+        )
+        .expect("retry succeeds");
+    assert!(fast.get(&GetStateRequest::new(cid("abc"))).is_err());
+}
+
+/// 呼ばれた `delete` / `delete_until` を数える `StateStore`。
+struct CountDelete {
+    inner: Arc<dyn StateStore>,
+    plain: Arc<Mutex<u32>>,
+    until: Arc<Mutex<Vec<std::time::Instant>>>,
+}
+
+impl StateStore for CountDelete {
+    fn create(
+        &self,
+        r: &fandhe_container_core::traits::CreateStateRequest,
+    ) -> Result<fandhe_container_core::traits::StateRecord, TraitError> {
+        self.inner.create(r)
+    }
+    fn update(
+        &self,
+        r: &UpdateStateRequest,
+    ) -> Result<fandhe_container_core::traits::StateRecord, TraitError> {
+        self.inner.update(r)
+    }
+    fn get(
+        &self,
+        r: &GetStateRequest,
+    ) -> Result<fandhe_container_core::traits::StateRecord, TraitError> {
+        self.inner.get(r)
+    }
+    fn list(
+        &self,
+        r: &fandhe_container_core::traits::ListStateRequest,
+    ) -> Result<fandhe_container_core::traits::StateList, TraitError> {
+        self.inner.list(r)
+    }
+    fn delete(
+        &self,
+        r: &DeleteStateRequest,
+    ) -> Result<fandhe_container_core::traits::DeleteStateResponse, TraitError> {
+        *self.plain.lock().unwrap() += 1;
+        self.inner.delete(r)
+    }
+    fn delete_until(
+        &self,
+        r: &DeleteStateRequest,
+        deadline: std::time::Instant,
+    ) -> Result<fandhe_container_core::traits::DeleteStateResponse, TraitError> {
+        self.until.lock().unwrap().push(deadline);
+        self.inner.delete(r)
+    }
+    fn host_state_root(&self) -> Option<&Path> {
+        self.inner.host_state_root()
+    }
+}
+
+/// REPAIR-5・#4152・#4239: 固定つきの store は core の絶対期限を落とさず `delete_until` で中の store へ渡す（`delete` へ縮退しない）。
+/// 渡る期限は呼び出し時点から後始末の予算（ここでは 300ms）以内。
+#[test]
+fn repair5_4152_pinned_store_forwards_deadline_to_delete_until() {
+    let (_g, fast, _slow, generation) = slow_setup("r-fwd", Duration::ZERO);
+    let (plain, until) = (Arc::new(Mutex::new(0)), Arc::new(Mutex::new(Vec::new())));
+    let counting: Arc<dyn StateStore> = Arc::new(CountDelete {
+        inner: fast,
+        plain: Arc::clone(&plain),
+        until: Arc::clone(&until),
+    });
+    let rt = GuardedCore::new(counting, Duration::from_millis(300), |p, c| {
+        core_runtime_for(p)
+            .with_delete_deadline(c)
+            .with_cleanup_warning_sink(Arc::new(|_| {}))
+    });
+    let t0 = std::time::Instant::now();
+    rt.delete(
+        &DeleteRequest::new(cid("abc")),
+        &generation,
+        t0 + Duration::from_secs(5),
+    )
+    .expect("delete");
+    assert_eq!(*plain.lock().unwrap(), 0);
+    let seen = until.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1);
+    assert!(seen[0] <= t0 + Duration::from_millis(300) + Duration::from_millis(50));
+    assert!(seen[0] > t0);
 }

@@ -185,7 +185,6 @@ pub(crate) struct GuardedCore {
     default_cleanup: Duration,
     store: Arc<dyn StateStore>,
     pin: Arc<Mutex<Option<Generation>>>,
-    delete_floor: Arc<Mutex<Option<Instant>>>,
 }
 
 impl GuardedCore {
@@ -199,11 +198,9 @@ impl GuardedCore {
         + 'static,
     ) -> Self {
         let pin = Arc::new(Mutex::new(None));
-        let delete_floor = Arc::new(Mutex::new(None));
         let pinned: Arc<dyn StateStore> = Arc::new(PinnedStore {
             inner: Arc::clone(&store),
             pin: Arc::clone(&pin),
-            delete_floor: Arc::clone(&delete_floor),
         });
         Self {
             build: Box::new(build),
@@ -211,7 +208,6 @@ impl GuardedCore {
             default_cleanup,
             store,
             pin,
-            delete_floor,
         }
     }
 
@@ -243,8 +239,6 @@ fn changed() -> TraitError {
 struct PinnedStore {
     inner: Arc<dyn StateStore>,
     pin: Arc<Mutex<Option<Generation>>>,
-    /// 記録の削除を始めてよい最後の時刻（core の後始末の期限の途中）。過ぎていれば削除せず `Timeout`（記録を残す。REPAIR-5）。
-    delete_floor: Arc<Mutex<Option<Instant>>>,
 }
 
 impl StateStore for PinnedStore {
@@ -273,16 +267,17 @@ impl StateStore for PinnedStore {
     }
 
     fn delete(&self, req: &DeleteStateRequest) -> Result<DeleteStateResponse, TraitError> {
-        // 状態の読み取りの待ちで期限の半分を使い切った後に記録を消すと、後始末が全て飛んで外側の期限が先に切れ、
-        // 次回は `AlreadyReclaimed` で残りを回収できない。記録を残して失敗にする（REPAIR-5・REPAIR-4・#4152）。
-        let floor = self.delete_floor.lock().ok().and_then(|g| *g);
-        if floor.is_some_and(|f| Instant::now() > f) {
-            return Err(TraitError::new(
-                ErrorCode::Timeout,
-                "shim delete deadline exhausted before the record was removed",
-            ));
-        }
         self.inner.delete(req)
+    }
+
+    /// 期限を落とさず中の store へ渡す（既定の実装は `delete` へ委譲して期限を捨てる。ロック待ちと、ロックを取った後・記録を消す前の
+    /// 確認は core の `FileStateStore` が行う。REPAIR-5・#4239）。
+    fn delete_until(
+        &self,
+        req: &DeleteStateRequest,
+        deadline: Instant,
+    ) -> Result<DeleteStateResponse, TraitError> {
+        self.inner.delete_until(req, deadline)
     }
 
     fn host_state_root(&self) -> Option<&std::path::Path> {
@@ -330,10 +325,11 @@ impl ReclaimRuntime for GuardedCore {
             ));
         }
         self.set_pin(generation);
-        if let Ok(mut f) = self.delete_floor.lock() {
-            *f = Some(Instant::now() + cleanup / 2);
-        }
-        let core = (self.build)(Arc::clone(&self.pinned), cleanup);
+        // 後始末の期限（残りの 2/3 以下）を絶対期限として core へ渡す。状態ロックの待ち・記録を消す直前・rootfs の木の削除が
+        // この期限を見て、足りなければ記録を残して `Timeout`、木の削除が止まれば `Kept { Timeout }` を返す。外側の段の期限までに
+        // 応答と警告を組み立てる余裕（残りの 1/3）を残す（REPAIR-5・REPAIR-4・#4152・#4239）。
+        let core = (self.build)(Arc::clone(&self.pinned), cleanup)
+            .with_core_delete_deadline(Instant::now() + cleanup);
         fandhe_container_core::traits::ContainerRuntime::delete(&core, req)
     }
 }

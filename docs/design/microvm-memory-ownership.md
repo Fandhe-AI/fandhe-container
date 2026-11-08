@@ -113,7 +113,7 @@ backing と登録の所有先は `crates/microvm/src/hvf/memory.rs`（安全な 
 - 登録: 領域 i を slot i の別の memslot で登録する（`register_ram_regions`）。`KVM_CHECK_EXTENSION(KVM_CAP_NR_MEMSLOTS)`（`VmFd::max_user_memslots`。x86_64 は 32764）を mmap の前に照会し、足りなければ `ResourceExhausted`、照会できない・0 以下なら `FailedPrecondition`（fail-closed）。途中で失敗したときは登録済みの領域が drop され、slot の削除と munmap が済む（削除に失敗した領域は従来どおり漏らす）。aarch64 の RAM は hole が無いため 1 領域のまま同じ経路を通る。macOS（HVF）は 1 領域のまま
 - e820 との一致: 先頭の領域（GPA 0 から）が従来の 3 本（RAM・MP テーブルの予約・RAM）、2 番目以降が RAM 1 本ずつ。カーネル・initrd・boot_params・SIPI のページは先頭の領域の中にだけ置く。`check_loaded_within` と SIPI の範囲検査は総バイト数ではなく先頭の領域の長さで行い、hole を挟んでも SEC-1 の検査を緩めない
 - 挙動の変化: x86_64 で 3.25 GiB（`VIRTIO_MMIO_BASE`）を超える `mem_size` が受理されるようになった（以前は拒否）
-- 範囲外（REPAIR-3）: hugepage・`KVM_MEM_READONLY` / `KVM_MEM_LOG_DIRTY_PAGES`（必要になった時点で別に扱う）。ゲストの物理アドレス幅（CPUID leaf 0x8000_0008）と最上位 GPA（最大 0x4_3000_0000）の照合。e820 での IOAPIC / LAPIC / MMIO hole の予約表記。実カーネルを 4 GiB 超の RAM で起動し `/proc/meminfo` で確かめる通し試験。macOS（HVF）の複数領域は対象外（#4023 の判断。本書末尾の記録）
+- 範囲外（REPAIR-3）: hugepage・`KVM_MEM_READONLY` / `KVM_MEM_LOG_DIRTY_PAGES`（必要になった時点で別に扱う）。ゲストの物理アドレス幅と最上位 GPA の照合・e820 の予約表記は #4106 で実装済み（本書末尾の記録）。実カーネルを 4 GiB 超の RAM で起動し `/proc/meminfo` で確かめる通し試験。macOS（HVF）の複数領域は対象外（#4023 の判断。本書末尾の記録）
 - 試験: KVM を使わない部分は既定のテスト集合の `mvm1_3697_*`。実 KVM は `crates/microvm/tests/kvm_device.rs` の `kvm_device_assemble_microvm_high_memory`（実機前提。`docs/verification/real-machine-tests.md`）
 
 ## #4024 での `Send` の導入記録（MVM-5・MVM-1・SEC-1）
@@ -135,3 +135,18 @@ backing と登録の所有先は `crates/microvm/src/hvf/memory.rs`（安全な 
 - 再評価条件: (1) RAM の中に MMIO の穴が要るとき、(2) 読み取り専用の領域が要るとき
 - 再評価時の土台: OS 非依存の `GuestMemory::from_regions`（#3697）と `sys/hvf.rs` の `GuestMapping::protect` は既にある。足りないのは HVF 側で複数の対応付けを登録する配線と、保護の変更を呼ぶ経路
 - #3908 との対応: 未実装事項のうち「複数領域・`hv_vm_protect`」は本記録で閉じる。残り（`ExitHandlers` への受け渡し・QueueNotify の配線・期限切れ後の回収は #4032 で実装済み〔実機未確認 #4034〕等）は #3908 の分解表の各 issue が担う
+
+## #4106 での物理アドレス幅の照合と e820 の予約表記の記録（MVM-1・REPAIR-3・SEC-1）
+
+Agent が記録した判断（オーナー承認待ちの位置づけは冒頭と同じ）。
+
+- 照合（x86_64 KVM のみ）: `MicroVm::assemble` は `create_vm` の前に `KVM_GET_SUPPORTED_CPUID` を取得し、`CpuidTable::physical_address_bits()`（leaf 0x8000_0008・subleaf 0 の EAX\[7:0\]）と最上位 GPA の終端を `check_physical_address_width` で照合する。収まらなければ `FailedPrecondition`（構成ではなくホストの能力に依存する失敗。`KVM_CAP_IOEVENTFD` 欠如と同じ扱い）。VM fd・memslot・mmap は 1 つも作られない
+- 最上位 GPA: `system_regions` の出力（occupied と reserved の両方）の `end` の最大値。RAM の最後の領域だけで決めないので、将来 4 GiB 超にデバイスの窓を置いても自動で対象に入る。最大構成（16 GiB）では 0x4_3000_0000 で、34 bit は拒否・35 bit は通る
+- fail-closed: leaf が無い・値が 0・52（x86-64 のアーキテクチャ上限）超は `FailedPrecondition`。SDM の「leaf が無ければ 36 bit とみなす」フォールバックは使わない。シフトは `checked_shl`。message に幅・アドレスは載せない（ERR-1）
+- ベースの表で 1 回照合すれば足りる: `for_vcpu` は leaf 1・0xB・0x1F しか書き換えず、leaf 0x8000_0008 はゲストが見る値と同じ（`mvm1_4106_for_vcpu_keeps_address_width_leaf` で固定）
+- e820 の予約表記（載せる）: `system_regions` の RAM 以外の領域（使用中の virtio-mmio の窓・IOAPIC・LAPIC・identity map・TSS）を 1 対 1 で type 2 として載せる（`e820_reservations` → `plan_boot` の `E820Reservation`）。領域の一覧と e820 の出どころが 1 つなので一致が機械的に保たれる。`plan_boot` は addr の昇順に整列し、size 0・溢れ・RAM / MP テーブルの予約 / 予約どうしの重なり・合計が `E820_MAX`（128）超を `InvalidArgument` で拒否する（最悪でも約 16 件。const assert で固定）
+- 却下案: (1) hole 全体 `[0xd000_0000, 4 GiB)` を 1 本の reserved にする案。32 bit の範囲に未使用の隙間が無くなり、カーネルが PCI の隙間を探す処理に影響しうることと、「領域の一覧と一致」の単一の出どころから外れることが理由（カーネル側の挙動は `arch/x86/kernel/e820.c` の原文を未確認のため、影響は推測にとどまる）。(2) 36 bit フォールバック（上記）
+- 一次情報の確認状況: Intel SDM の leaf 0x8000_0008 の EAX\[7:0\] が MAXPHYADDR である点を前提にした。Linux の `arch/x86/kvm/cpuid.c`・`arch/x86/kernel/cpu/common.c` と EAX\[23:16\]（AMD の GuestPhysAddrSize）の扱いは今回原文で確認していない（未確認）。EAX\[23:16\] は未考慮（EAX\[7:0\] のみ参照）
+- 範囲外（REPAIR-3）: aarch64 の IPA サイズ（`KVM_CAP_ARM_VM_IPA_SIZE`）の照合、macOS（HVF。単一領域で e820 が無い）、SIPI ページの e820 予約、実カーネルでの e820 の予約と 4 GiB 超の RAM の `/proc/iomem`・`/proc/meminfo` での通し確認（実機前提。`tests/kernel_boot.rs` の `--ignored`。追跡 issue は確認時点で見つからず、要起票）
+- 再評価条件: 4 GiB 超にデバイスの窓を置くとき、PCI を導入するとき、ゲストが予約の範囲で不具合を示したとき
+- 試験: 既定のテスト集合の `mvm1_4106_*`（cpuid_x86・boot_x86・microvm の各 tests）

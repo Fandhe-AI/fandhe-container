@@ -2097,10 +2097,48 @@ fn poll_error(e: SysError) -> MicrovmError {
 ///
 /// `events` は `shared` より前に宣言して先に落とす（この clone が最後の参照にならず、ioeventfd の解除が irqfd・メモリより前になる順を
 /// `BoundDevice` に任せる）。
-struct IoEventPoller<S: IoEventTarget, E: IoEventSource> {
+///
+/// 異常 revents（`POLLERR` / `POLLHUP` / `POLLNVAL`）は初回で `Finish(Failed(Internal))` にして全スレッドを止める（#4101・REPAIR-5）。
+/// eventfd では一時的な異常ではなく（`POLLERR` はカウンタの飽和）、fd を待ちから外すと kick が黙って捨てられるため縮退は採らない。
+/// 打ち切るので `poll` が即時に戻り続ける空回りも起きない。`POLLIN` と同時でも異常を優先する。
+struct IoEventPoller<S: IoEventTarget, E: IoEventSource, W: IoEventWaiter = SysIoEventWaiter> {
     events: Vec<(DeviceId, u16, Arc<E>)>,
-    ready: Vec<bool>,
+    ready: Vec<sys::PollReadiness>,
     shared: Arc<Mutex<S>>,
+    waiter: W,
+}
+
+/// 通知スレッドの `poll(2)` の継ぎ目。本番は [`sys::poll_readable`] へ委ねる [`SysIoEventWaiter`]、試験は結果を注入する。
+trait IoEventWaiter: Send + 'static {
+    /// `fds` を最大 `timeout` 待ち、`out[i]` に結果を書いて `Idle` 以外の件数を返す（契約は [`sys::poll_readable`]）。
+    fn wait(
+        &mut self,
+        fds: &[BorrowedFd<'_>],
+        timeout: Duration,
+        out: &mut [sys::PollReadiness],
+    ) -> Result<usize, sys::SysError>;
+}
+
+/// 本番の [`IoEventWaiter`]。
+struct SysIoEventWaiter;
+
+impl IoEventWaiter for SysIoEventWaiter {
+    fn wait(
+        &mut self,
+        fds: &[BorrowedFd<'_>],
+        timeout: Duration,
+        out: &mut [sys::PollReadiness],
+    ) -> Result<usize, sys::SysError> {
+        sys::poll_readable(fds, timeout, out)
+    }
+}
+
+/// 異常 revents の構造化ログ 1 行（`op` / `code` は既存の ioeventfd の失敗と揃える。REPAIR-4）。
+fn ioevent_abnormal_log_line(device: u32, queue: u16, revents: i16) -> String {
+    format!(
+        "level=error op=microvm.ioevent outcome=error code={} reason=abnormal_revents device={device} queue={queue} revents={revents:#06x}",
+        MicrovmErrorCode::Internal.as_str()
+    )
 }
 
 /// 通知スレッドが待つ eventfd（継ぎ目）。本番は [`IoEventFd`]、試験は KVM なしで作れる [`crate::irq::EventFd`]。
@@ -2130,20 +2168,32 @@ impl IoEventSource for crate::irq::EventFd {
     }
 }
 
-impl<S: IoEventTarget, E: IoEventSource> IoEventPoller<S, E> {
-    /// `events` を検証して作る（0 件・`poll` の上限 [`sys::MAX_POLL_FDS`] 超過は `InvalidArgument`）。
+impl<S: IoEventTarget, E: IoEventSource> IoEventPoller<S, E, SysIoEventWaiter> {
+    /// 本番の `poll(2)` で待つ poller を作る（検証は [`Self::with_waiter`]）。
     fn new(
         shared: Arc<Mutex<S>>,
         events: Vec<(DeviceId, u16, Arc<E>)>,
     ) -> Result<Self, MicrovmError> {
+        Self::with_waiter(shared, events, SysIoEventWaiter)
+    }
+}
+
+impl<S: IoEventTarget, E: IoEventSource, W: IoEventWaiter> IoEventPoller<S, E, W> {
+    /// `events` を検証して作る（0 件・`poll` の上限 [`sys::MAX_POLL_FDS`] 超過は `InvalidArgument`）。
+    fn with_waiter(
+        shared: Arc<Mutex<S>>,
+        events: Vec<(DeviceId, u16, Arc<E>)>,
+        waiter: W,
+    ) -> Result<Self, MicrovmError> {
         if events.is_empty() || events.len() > sys::MAX_POLL_FDS {
             return Err(invalid("ioevent count out of range"));
         }
-        let ready = vec![false; events.len()];
+        let ready = vec![sys::PollReadiness::Idle; events.len()];
         Ok(Self {
             events,
             ready,
             shared,
+            waiter,
         })
     }
 
@@ -2156,21 +2206,31 @@ impl<S: IoEventTarget, E: IoEventSource> IoEventPoller<S, E> {
     }
 }
 
-impl<S: IoEventTarget, E: IoEventSource> VcpuLoopBody for IoEventPoller<S, E> {
+impl<S: IoEventTarget, E: IoEventSource, W: IoEventWaiter> VcpuLoopBody for IoEventPoller<S, E, W> {
     fn step(&mut self, _slice: Duration, stop: &StopSignal) -> LoopStep {
         // 停止要求は `vcpu_loop` が次の周回の先頭で `Requested` として扱う。
         if stop.is_requested() {
             return LoopStep::Continue;
         }
         let fds: Vec<BorrowedFd<'_>> = self.events.iter().map(|(_, _, e)| e.fd()).collect();
-        match sys::poll_readable(&fds, IOEVENT_WAIT_SLICE, &mut self.ready) {
+        match self.waiter.wait(&fds, IOEVENT_WAIT_SLICE, &mut self.ready) {
             Ok(0) => return LoopStep::Continue,
             Ok(_) => {}
             Err(e) => return Self::fail(&poll_error(e)),
         }
         drop(fds);
+        // 異常 revents は `take` の前に見て打ち切る（#4101）。1 行だけ出し、`fail` の汎用行とは重ねない。
+        for ((id, queue, _), r) in self.events.iter().zip(&self.ready) {
+            if let sys::PollReadiness::Abnormal { revents } = *r {
+                log_line(format_args!(
+                    "{}",
+                    ioevent_abnormal_log_line(id.index(), *queue, revents)
+                ));
+                return LoopStep::Finish(StopReason::Failed(MicrovmErrorCode::Internal));
+            }
+        }
         for (i, (id, queue, event)) in self.events.iter().enumerate() {
-            if !self.ready.get(i).copied().unwrap_or(false) {
+            if self.ready.get(i) != Some(&sys::PollReadiness::Readable) {
                 continue;
             }
             match event.take() {
@@ -5598,6 +5658,143 @@ mod ioevent_tests {
         assert_eq!(report.origin_vcpu, None);
         assert_eq!(shared.lock().unwrap().calls, vec![(d[0], 0)]);
         assert_eq!(Arc::strong_count(&shared), 1);
+    }
+
+    /// 毎回同じ結果を返し、呼び出し回数と渡された timeout を記録する注入用の waiter（#4101）。
+    struct ScriptedWaiter {
+        result: Vec<sys::PollReadiness>,
+        calls: Arc<Mutex<Vec<Duration>>>,
+    }
+
+    impl IoEventWaiter for ScriptedWaiter {
+        fn wait(
+            &mut self,
+            _fds: &[BorrowedFd<'_>],
+            timeout: Duration,
+            out: &mut [sys::PollReadiness],
+        ) -> Result<usize, sys::SysError> {
+            self.calls.lock().unwrap().push(timeout);
+            out.copy_from_slice(&self.result);
+            Ok(self
+                .result
+                .iter()
+                .filter(|r| **r != sys::PollReadiness::Idle)
+                .count())
+        }
+    }
+
+    type ScriptedPoller = (
+        IoEventPoller<RecTarget, EventFd, ScriptedWaiter>,
+        Arc<Mutex<RecTarget>>,
+        Arc<Mutex<Vec<Duration>>>,
+    );
+
+    fn scripted(result: Vec<sys::PollReadiness>) -> ScriptedPoller {
+        let d = ids(1);
+        let events: Events = result
+            .iter()
+            .map(|_| (d[0], 0, Arc::new(EventFd::new().unwrap())))
+            .collect();
+        let shared = Arc::new(Mutex::new(RecTarget::default()));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let waiter = ScriptedWaiter {
+            result,
+            calls: Arc::clone(&calls),
+        };
+        let poller = IoEventPoller::with_waiter(Arc::clone(&shared), events, waiter).unwrap();
+        (poller, shared, calls)
+    }
+
+    /// MVM-1・REPAIR-5・#4101: 異常 revents が返り続けても、1 回の待ち（`IOEVENT_WAIT_SLICE`）で `Finish(Failed(Internal))` になり、
+    /// 空回りしない（waiter は 1 回しか呼ばれず、`take` も `complete_ioevent` も走らない）。
+    #[test]
+    fn mvm1_4101_abnormal_revents_finish_after_one_wait() {
+        for revents in [
+            sys::consts::POLLERR,
+            sys::consts::POLLHUP,
+            sys::consts::POLLNVAL,
+            sys::consts::POLLERR | sys::consts::POLLIN,
+        ] {
+            let (mut poller, shared, calls) =
+                scripted(vec![sys::PollReadiness::Abnormal { revents }]);
+            let stop = StopSignal::new();
+            let step = poller.step(Duration::from_millis(1), &stop);
+            assert!(
+                matches!(
+                    step,
+                    LoopStep::Finish(StopReason::Failed(MicrovmErrorCode::Internal))
+                ),
+                "{revents:#x}"
+            );
+            assert_eq!(*calls.lock().unwrap(), vec![IOEVENT_WAIT_SLICE]);
+            assert!(shared.lock().unwrap().calls.is_empty());
+        }
+    }
+
+    /// MVM-1・REPAIR-5・#4101: `Readable` と `Abnormal` が同じ周回に混ざっても、処理の前に打ち切る。
+    #[test]
+    fn mvm1_4101_mixed_readable_and_abnormal_finishes_before_dispatch() {
+        let (mut poller, shared, calls) = scripted(vec![
+            sys::PollReadiness::Readable,
+            sys::PollReadiness::Abnormal {
+                revents: sys::consts::POLLERR,
+            },
+        ]);
+        let stop = StopSignal::new();
+        let step = poller.step(Duration::from_millis(1), &stop);
+        assert!(matches!(
+            step,
+            LoopStep::Finish(StopReason::Failed(MicrovmErrorCode::Internal))
+        ));
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert!(shared.lock().unwrap().calls.is_empty());
+    }
+
+    /// MVM-1・REPAIR-5・#4101: 回帰確認。`Readable` は従来どおり `complete_ioevent` を 1 回呼んで続行する。
+    #[test]
+    fn mvm1_4101_readable_still_dispatches() {
+        let (mut poller, shared, _calls) = scripted(vec![sys::PollReadiness::Readable]);
+        poller.events[0].2.signal().unwrap();
+        let stop = StopSignal::new();
+        let step = poller.step(Duration::from_millis(1), &stop);
+        assert!(matches!(step, LoopStep::Continue));
+        assert_eq!(shared.lock().unwrap().calls.len(), 1);
+    }
+
+    /// MVM-1・REPAIR-5・#4101: `spawn_loops` 経由で、異常 revents は全スレッドを止め、きっかけは vCPU 以外で `Internal` と報告される。
+    #[test]
+    fn mvm1_4101_abnormal_revents_stop_all() {
+        let (poller, shared, _calls) = scripted(vec![sys::PollReadiness::Abnormal {
+            revents: sys::consts::POLLERR,
+        }]);
+        let running = spawn_loops(
+            vec![Idle(Arc::new(AtomicUsize::new(0)))],
+            vec![AuxThread {
+                name: "microvm-ioevent",
+                body: Box::new(poller),
+            }],
+            Instant::now(),
+            SerialConsole::new(),
+        )
+        .unwrap();
+        let state = running.exit_watch().wait(Duration::from_secs(5)).unwrap();
+        assert!(matches!(state, VcpuExitState::Exited(_)), "{state:?}");
+        let report = running.stop(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            report.reason,
+            StopReason::Failed(MicrovmErrorCode::Internal)
+        );
+        assert_eq!(report.origin_vcpu, None);
+        assert_eq!(Arc::strong_count(&shared), 1);
+    }
+
+    /// MVM-1・REPAIR-4・#4101: 異常のログ行は既存の `op=microvm.ioevent` / `code=INTERNAL` に揃う。
+    #[test]
+    fn mvm1_4101_abnormal_log_line_is_stable() {
+        assert_eq!(
+            ioevent_abnormal_log_line(0, 1, 8),
+            "level=error op=microvm.ioevent outcome=error code=INTERNAL reason=abnormal_revents device=0 queue=1 revents=0x0008"
+        );
     }
 
     /// REPAIR-5・#3698: poller の対象数は 1..=`MAX_POLL_FDS`、範囲外は `InvalidArgument`。

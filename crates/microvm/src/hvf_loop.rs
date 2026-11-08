@@ -39,6 +39,7 @@ use std::time::{Duration, Instant};
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::esr::{EsrClass, SysRegDirection, WfxKind, decode_esr, instruction_length};
 use crate::hvf_abi::{HvRunStats, HvVcpuExit, HvVcpuExitException};
+use crate::hvf_lifecycle::{deferred_reclaim_line, take_thread_reclaim};
 use crate::stop::StopReason;
 use crate::sysreg_os_lock::classify_os_lock_write;
 
@@ -716,6 +717,7 @@ impl<K: VcpuKick> fmt::Debug for LoopHandle<K> {
 /// から戻ること（`stop` が `Ok` で戻った時点で vCPU が破棄済みである根拠）。`create_deadline` は 0 超 [`VCPU_STOP_DEADLINE_MAX`]
 /// 以下（`InvalidArgument`）。期限切れは停止フラグを立ててスレッドを切り離し `DeadlineExceeded` を返す（遅れて `ready` しても
 /// ループ先頭の検査で即 `Requested` になり、ゲストは走らない）。
+/// `body` が戻った後、このスレッドで遅延回収が起きていれば `op=hvf.deferred_reclaim` の行を出す（#4146）。
 pub fn spawn_loop<K, F>(
     name: &str,
     create_deadline: Duration,
@@ -753,6 +755,8 @@ where
         .spawn(move || {
             let name = thread_name;
             let started = Instant::now();
+            // 新しいスレッドの記録は空のはずだが、念のため空にしてから本体を回す（#4146）。
+            let _ = take_thread_reclaim();
             let (reason, stats) = body(start);
             let elapsed = started.elapsed();
             let (level, outcome, code) = outcome_fields(reason);
@@ -765,6 +769,11 @@ where
                 stats.errors,
                 elapsed.as_micros()
             ));
+            // 期限切れで切り離されたこのスレッドが最後の保持者として回収した場合だけ、記録が埋まる。`body` の closure 内の drop
+            // （`vm_run` を含む）がすべて終わった後に読むので、`hv_vm_destroy` の結果も含む（#4146）。
+            if let Some(line) = deferred_reclaim_line(&name, take_thread_reclaim()) {
+                log_line(format_args!("{line}"));
+            }
             // 報告が最後の動作。受け手が去っていても失敗するだけ。
             let _ = report_tx.send(VcpuStopReport {
                 reason,

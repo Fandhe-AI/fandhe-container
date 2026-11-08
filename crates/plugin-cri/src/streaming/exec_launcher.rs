@@ -21,6 +21,12 @@
 //! helper は専用スレッドが有限の期限（`REAP_BUDGET`）まで `try_wait` して回収し、期限後は Child を保持一覧へ移して（落とさない）、その数が上限に達したら新しい exec を `RESOURCE_EXHAUSTED` にする。kill は呼び出しスレッドをブロックしない。
 //! [`SupervisorExecLauncher::shutdown_all`] は plugin-cri の停止時に追跡中の全 helper を kill する。停止後の `launch` は拒否し、登録の競合で漏れた helper も直ちに止める。
 //!
+//! 要求元の異常終了（#4166・SUP-6・SEC-1・REPAIR-5）: plugin-cri が kill される間もなく異常終了（SIGKILL 等）しても、helper は
+//! fd 0 の channel の切断（`POLLHUP`・`POLLRDHUP`）を exec の間に見て、コマンドを止めて回収してから 2 秒程度で終わる
+//! （`supervisor` の `stream_exec::channel::requester_gone`）。この検知が成り立つ **要求元側の契約**: `watch_result` が結果を
+//! 受けるまで（exec を続けたい間は）channel の自分の側を閉じず、`shutdown` もせず、端を他のプロセスへ渡さない
+//! （子プロセスへ継承させない。渡すと plugin-cri が死んでも端が閉じず、従来の期限と `hold_grace` で終わる）。
+//!
 //! # 未実装・簡易実装・残余（REPAIR-3）
 //! - tty: 受け側（`PtyMaster` の検証と resize の転送）は実装・試験済みだが、helper が `--tty` を受けず supervisor の
 //!   `ExecStdio` に pty が無いため、本番の spawner は能力 `tty = false` で、tty の要求は launcher でも断る（後続 issue。

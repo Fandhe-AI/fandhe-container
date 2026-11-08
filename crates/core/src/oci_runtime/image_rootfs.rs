@@ -325,6 +325,15 @@ fn refuse() -> TraitError {
     )
 }
 
+/// 絶対期限で木の削除を止めた（REPAIR-5・#4239）。木は残る。
+#[cfg(target_os = "linux")]
+fn deadline_exceeded() -> TraitError {
+    TraitError::new(
+        ErrorCode::Timeout,
+        "image rootfs removal hit its deadline; the tree was kept",
+    )
+}
+
 #[cfg(target_os = "linux")]
 fn remove_failed() -> TraitError {
     TraitError::new(ErrorCode::Internal, "failed to remove rootfs")
@@ -710,12 +719,27 @@ pub(super) fn remove_recorded_rootfs(
 /// 記録の `ownership` が `SubordinateIds`（subuid 所有の inode を含む）なのに `privilege` が
 /// `HostEffectiveIds` のときは、ホストの ID では消せないので木に触れず `FailedPrecondition` で拒否する
 /// （部分削除で印だけ消える順序依存を避ける）。ホスト所有の記録は、権限に依らず従来どおりホストの ID で消す。
+#[cfg(all(test, target_os = "linux"))]
 pub(super) fn remove_recorded_rootfs_with(
     bundle: &Path,
     rec: &ImageRootfsRecord,
     privilege: &ImageRootfsPrivilege,
 ) -> Result<RecordedRootfsRemoval, TraitError> {
-    imp::remove_recorded(bundle, rec, privilege)
+    imp::remove_recorded(bundle, rec, privilege, None)
+}
+
+/// [`remove_recorded_rootfs`] の権限指定つきに、絶対期限を足したもの（REPAIR-5・OCI-7・CRI-5・#4239）。
+///
+/// 木の走査はエントリごとに `deadline` を確かめ、過ぎていれば [`ErrorCode::Timeout`] で止まる（木は残り、
+/// 最上位の所有トークンの印は最後に消すため次の回収が木を見分けられる）。`None` は期限なし（従来どおり）。userns の子で消す経路（`SubordinateIds`）も、子が同じ期限で走査を止め、親の待ちの
+/// 上限も残り時間で頭打ちにする。呼び出し元は `oci_runtime::delete`（`DeleteOptions::with_deadline`）。
+pub(super) fn remove_recorded_rootfs_until(
+    bundle: &Path,
+    rec: &ImageRootfsRecord,
+    privilege: &ImageRootfsPrivilege,
+    deadline: Option<std::time::Instant>,
+) -> Result<RecordedRootfsRemoval, TraitError> {
+    imp::remove_recorded(bundle, rec, privilege, deadline)
 }
 
 #[cfg(target_os = "linux")]
@@ -729,11 +753,13 @@ mod imp {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
 
     use super::{
         CLEANUP_MAX_DEPTH, CLEANUP_MAX_ENTRIES, ImageRootfsRecord, MARKER_MAX_BYTES,
         ORPHAN_SCAN_MAX_PAGES, ORPHAN_SCAN_PAGE_SIZE, OrphanReap, RecordedRootfsRemoval,
-        STAGING_PREFIX, StagingReclamation, UnverifiedReason, invalid, refuse, remove_failed,
+        STAGING_PREFIX, StagingReclamation, UnverifiedReason, deadline_exceeded, invalid, refuse,
+        remove_failed,
     };
     use super::{
         HOST_PRIVILEGE, ImageRootfsPrivilege, USERNS_FINALIZE_BUDGET, USERNS_REMOVE_BUDGET,
@@ -951,7 +977,8 @@ mod imp {
     /// [`spawn_in_userns`] の失敗（どの段で失敗したかを区別する。呼び出し側が自分の文言・語彙へ写す）。
     ///
     /// `Inputs` / `Plan` / `MultiThreaded` / `ForkOther` は fork の前（子は作られず、木に触れていない）。
-    /// `Timeout` / `WaitOther` は fork の後（子が木に触れた可能性がある）。
+    /// `Timeout` / `WaitOther` は通常 fork の後（子が木に触れた可能性がある）。ただし絶対期限が fork の前に
+    /// 過ぎていた場合の `Timeout` は子を作らない。
     #[derive(Debug)]
     enum UsernsSpawnError {
         /// 写像の入力（subuid / subgid の解決）の失敗。
@@ -981,6 +1008,32 @@ mod imp {
         work_budget: std::time::Duration,
         child: impl FnOnce() -> i32,
     ) -> Result<i32, UsernsSpawnError> {
+        spawn_in_userns_until(source, work_budget, None, child)
+    }
+
+    /// 親の待ちの上限（写像の書き込みの最大 3 × `helper_timeout` + 5 秒 + `work_budget`）を、絶対期限
+    /// `deadline` の残り時間で頭打ちにする純関数（`None` は従来の上限のまま。REPAIR-5・#4239）。
+    fn userns_wait_budget(
+        helper_timeout: std::time::Duration,
+        work_budget: std::time::Duration,
+        deadline: Option<Instant>,
+        now: Instant,
+    ) -> std::time::Duration {
+        let full = helper_timeout * 3 + std::time::Duration::from_secs(5) + work_budget;
+        deadline.map_or(full, |d| full.min(d.saturating_duration_since(now)))
+    }
+
+    /// [`spawn_in_userns`] に絶対期限を足したもの。fork の前に期限が過ぎていれば子を作らず `Timeout`、
+    /// 過ぎていなければ待ち全体（セットアップを含む）を残り時間で頭打ちにする（#4239）。
+    fn spawn_in_userns_until(
+        source: &SubordinateIdSource,
+        work_budget: std::time::Duration,
+        deadline: Option<Instant>,
+        child: impl FnOnce() -> i32,
+    ) -> Result<i32, UsernsSpawnError> {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return Err(UsernsSpawnError::Timeout);
+        }
         let (euid, egid) = (sys::effective_uid(), sys::effective_gid());
         let inputs = source
             .removal_inputs(euid, egid)
@@ -1011,7 +1064,7 @@ mod imp {
             SysError::MultiThreaded => UsernsSpawnError::MultiThreaded,
             _ => UsernsSpawnError::ForkOther,
         })?;
-        let budget = helper_timeout * 3 + std::time::Duration::from_secs(5) + work_budget;
+        let budget = userns_wait_budget(helper_timeout, work_budget, deadline, Instant::now());
         match wait_forked_child(pid, budget) {
             Ok(ChildExit::Exited(code)) => Ok(code),
             Err(e) if e.code == ErrorCode::Timeout => Err(UsernsSpawnError::Timeout),
@@ -1611,7 +1664,7 @@ mod imp {
         let ImageRootfsPrivilege::SubordinateIds(source) = privilege else {
             return Reap::Unverified(UnverifiedReason::LockError);
         };
-        match userns_run(source, cur, cname, identity, Owner::Unchecked, true) {
+        match userns_run(source, cur, cname, identity, Owner::Unchecked, true, None) {
             Ok(UsernsOutcome::Removed) => Reap::Reclaimed,
             Ok(UsernsOutcome::NotPresent) => Reap::Gone,
             Ok(UsernsOutcome::Alive) => Reap::Alive,
@@ -2128,11 +2181,27 @@ mod imp {
         identity: (u64, u64),
         owner: Owner<'_>,
     ) -> Result<RecordedRootfsRemoval, TraitError> {
+        remove_tree_priv_until(privilege, parent, name, identity, owner, None)
+    }
+
+    /// [`remove_tree_priv`] に絶対期限を足したもの（`None` は期限なし。#4239）。
+    fn remove_tree_priv_until(
+        privilege: &ImageRootfsPrivilege,
+        parent: BorrowedFd<'_>,
+        name: &CString,
+        identity: (u64, u64),
+        owner: Owner<'_>,
+        deadline: Option<Instant>,
+    ) -> Result<RecordedRootfsRemoval, TraitError> {
+        // 子の fork・木への書き込みの前に確かめる（過ぎていれば何もしない。#4239）。
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return Err(deadline_exceeded());
+        }
         match privilege {
             ImageRootfsPrivilege::SubordinateIds(source) => {
-                remove_tree_in_userns(source, parent, name, identity, owner)
+                remove_tree_in_userns(source, parent, name, identity, owner, deadline)
             }
-            _ => remove_tree_at(parent, name, identity, owner),
+            _ => remove_tree_at_until(parent, name, identity, owner, deadline),
         }
     }
 
@@ -2145,6 +2214,8 @@ mod imp {
     const CHILD_ALIVE: i32 = 14;
     const CHILD_LOCK_ERROR: i32 = 15;
     const CHILD_IDENTITY: i32 = 16;
+    /// 絶対期限で木の走査を止めた（#4239）。
+    const CHILD_TIMEOUT: i32 = 17;
 
     /// userns の子の結果（`lock_in_child` のときだけ `Alive` / `LockError` / `Identity` が出る）。
     enum UsernsOutcome {
@@ -2171,8 +2242,9 @@ mod imp {
         name: &CString,
         identity: (u64, u64),
         owner: Owner<'_>,
+        deadline: Option<Instant>,
     ) -> Result<RecordedRootfsRemoval, TraitError> {
-        match userns_run(source, parent, name, identity, owner, false)? {
+        match userns_run(source, parent, name, identity, owner, false, deadline)? {
             UsernsOutcome::Removed => Ok(RecordedRootfsRemoval::Removed),
             UsernsOutcome::NotPresent => Ok(RecordedRootfsRemoval::NotPresent),
             _ => Err(remove_failed()),
@@ -2242,6 +2314,7 @@ mod imp {
             Ok(RecordedRootfsRemoval::Removed) => CHILD_REMOVED,
             Ok(RecordedRootfsRemoval::NotPresent) => CHILD_NOT_PRESENT,
             Err(e) if e.code() == ErrorCode::FailedPrecondition => CHILD_REFUSED,
+            Err(e) if e.code() == ErrorCode::Timeout => CHILD_TIMEOUT,
             Err(_) => CHILD_FAILED,
         }
     }
@@ -2277,6 +2350,7 @@ mod imp {
             CHILD_LOCK_ERROR if lock_in_child => Ok(UsernsOutcome::LockError),
             CHILD_IDENTITY if lock_in_child => Ok(UsernsOutcome::Identity),
             CHILD_REFUSED => Err(refuse()),
+            CHILD_TIMEOUT => Err(deadline_exceeded()),
             _ => Err(remove_failed()),
         }
     }
@@ -2290,8 +2364,11 @@ mod imp {
         identity: (u64, u64),
         owner: Owner<'_>,
         lock_in_child: bool,
+        deadline: Option<Instant>,
     ) -> Result<UsernsOutcome, TraitError> {
-        let code = spawn_in_userns(source, USERNS_REMOVE_BUDGET, || {
+        // 親の待ち全体（写像ヘルパー等のセットアップを含む）も絶対期限で頭打ちにし、子の走査も同じ期限で
+        // 止まる（#4239）。
+        let code = spawn_in_userns_until(source, USERNS_REMOVE_BUDGET, deadline, || {
             // ロックは子の終了（`_exit`）まで保持する。
             let _locked;
             if lock_in_child {
@@ -2300,7 +2377,9 @@ mod imp {
                     Err(f) => return f.code(),
                 }
             }
-            remove_exit_code(remove_tree_at(parent, name, identity, owner))
+            remove_exit_code(remove_tree_at_until(
+                parent, name, identity, owner, deadline,
+            ))
         })
         .map_err(removal_spawn_error)?;
         removal_outcome(code, lock_in_child)
@@ -2344,6 +2423,22 @@ mod imp {
         identity: (u64, u64),
         owner: Owner<'_>,
     ) -> Result<RecordedRootfsRemoval, TraitError> {
+        remove_tree_at_until(parent, name, identity, owner, None)
+    }
+
+    /// [`remove_tree_at`] に絶対期限を足したもの。木の走査はエントリごとに期限を確かめ、過ぎたら
+    /// [`ErrorCode::Timeout`] で止まる（REPAIR-5・#4239）。
+    fn remove_tree_at_until(
+        parent: BorrowedFd<'_>,
+        name: &CString,
+        identity: (u64, u64),
+        owner: Owner<'_>,
+        deadline: Option<Instant>,
+    ) -> Result<RecordedRootfsRemoval, TraitError> {
+        // 所有トークン照合の一時的な chmod など、木に手を入れる前に確かめる（#4239）。
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return Err(deadline_exceeded());
+        }
         let root = match sys::open_dir_path_nofollow(Some(parent), name) {
             Ok(fd) => fd,
             Err(SysError::Os(n)) if n == sys::ENOENT => {
@@ -2386,7 +2481,7 @@ mod imp {
             }
         }
         let mut seen = 0usize;
-        remove_children(root.as_fd(), root_dev, root_mnt, 0, &mut seen)?;
+        remove_children(root.as_fd(), root_dev, root_mnt, 0, &mut seen, deadline)?;
         match sys::remove_dir_at(parent, name) {
             Ok(()) => Ok(RecordedRootfsRemoval::Removed),
             Err(SysError::Os(n)) if n == sys::ENOENT => Ok(RecordedRootfsRemoval::Removed),
@@ -2398,6 +2493,7 @@ mod imp {
         bundle: &Path,
         rec: &ImageRootfsRecord,
         privilege: &ImageRootfsPrivilege,
+        deadline: Option<Instant>,
     ) -> Result<RecordedRootfsRemoval, TraitError> {
         // 記録が subuid 所有を示すのに権限が無ければ、ホストの ID では消せないので木に触れず拒否する。
         // ホスト所有の記録は、権限に依らずホストの ID で消す（不要な userns を作らない）。
@@ -2426,12 +2522,13 @@ mod imp {
         while let Some(part) = parts.next() {
             let name = cstr(part)?;
             if parts.peek().is_none() {
-                return remove_tree_priv(
+                return remove_tree_priv_until(
                     effective,
                     cur.as_fd(),
                     &name,
                     rec.identity(),
                     Owner::Token(rec.token()),
+                    deadline,
                 );
             }
             cur = match open_dir(cur.as_fd(), &name) {
@@ -2465,6 +2562,7 @@ mod imp {
         root_mnt: u64,
         depth: usize,
         seen: &mut usize,
+        deadline: Option<Instant>,
     ) -> Result<(), TraitError> {
         if depth > CLEANUP_MAX_DEPTH {
             return Err(remove_failed());
@@ -2488,13 +2586,29 @@ mod imp {
             if *seen > CLEANUP_MAX_ENTRIES {
                 return Err(remove_failed());
             }
+            // 期限を過ぎたらここで止める。木と最上位の印は残り、再実行で続きから消せる（REPAIR-5・#4239）。
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                return Err(deadline_exceeded());
+            }
             if depth == 0 && entry.file_name() == OsStr::new(super::OWNER_TOKEN_FILE) {
                 marker_deferred = true;
                 continue;
             }
-            remove_entry(dir, &entry.file_name(), root_dev, root_mnt, depth, seen)?;
+            remove_entry(
+                dir,
+                &entry.file_name(),
+                root_dev,
+                root_mnt,
+                depth,
+                seen,
+                deadline,
+            )?;
         }
         if marker_deferred {
+            // 印は最後に消す。ここで期限が過ぎていれば印を残す（次の回収が木を見分けられる。#4239）。
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                return Err(deadline_exceeded());
+            }
             remove_entry(
                 dir,
                 OsStr::new(super::OWNER_TOKEN_FILE),
@@ -2502,6 +2616,7 @@ mod imp {
                 root_mnt,
                 depth,
                 seen,
+                deadline,
             )?;
         }
         Ok(())
@@ -2515,6 +2630,7 @@ mod imp {
         root_mnt: u64,
         depth: usize,
         seen: &mut usize,
+        deadline: Option<Instant>,
     ) -> Result<(), TraitError> {
         let name = cstr(file_name)?;
         let child = match sys::open_path_nofollow_at(dir, &name) {
@@ -2529,7 +2645,7 @@ mod imp {
             .map(|(_, _, d, _)| d)
             .map_err(|_| remove_failed())?;
         if is_child_dir {
-            remove_children(child.as_fd(), root_dev, root_mnt, depth + 1, seen)?;
+            remove_children(child.as_fd(), root_dev, root_mnt, depth + 1, seen, deadline)?;
             sys::remove_dir_at(dir, &name).map_err(|_| remove_failed())?;
         } else {
             sys::remove_file_at(dir, &name).map_err(|_| remove_failed())?;
@@ -2704,6 +2820,51 @@ mod imp {
                     Some(err(ErrorCode::Internal, "failed to remove rootfs"))
                 );
             }
+        }
+
+        /// REPAIR-5・OCI-7（#4239）: 親の待ちの上限は、期限なしなら従来の `3 × helper + 5 秒 + work`、
+        /// 期限ありなら残り時間で頭打ち（残りが長ければ従来の上限、過ぎていれば 0）。
+        #[test]
+        fn repair5_4239_userns_wait_budget_is_capped_by_deadline() {
+            use std::time::Duration;
+            let now = Instant::now();
+            let helper = Duration::from_secs(10);
+            let work = Duration::from_secs(120);
+            assert_eq!(
+                userns_wait_budget(helper, work, None, now),
+                Duration::from_secs(155)
+            );
+            assert_eq!(
+                userns_wait_budget(helper, work, Some(now + Duration::from_secs(2)), now),
+                Duration::from_secs(2)
+            );
+            assert_eq!(
+                userns_wait_budget(helper, work, Some(now + Duration::from_secs(900)), now),
+                Duration::from_secs(155)
+            );
+            assert_eq!(
+                userns_wait_budget(helper, work, Some(now), now + Duration::from_secs(1)),
+                Duration::ZERO
+            );
+        }
+
+        /// REPAIR-5（#4239）: 期限が過ぎていれば、fork の前に `Timeout`（子は作らない）。
+        #[test]
+        fn repair5_4239_spawn_in_userns_expired_deadline_does_not_fork() {
+            let ran = std::cell::Cell::new(false);
+            let source = SubordinateIdSource::with_id_files(
+                None,
+                Path::new("/nonexistent/subuid"),
+                Path::new("/nonexistent/subgid"),
+            )
+            .expect("source");
+            let r =
+                spawn_in_userns_until(&source, USERNS_REMOVE_BUDGET, Some(Instant::now()), || {
+                    ran.set(true);
+                    0
+                });
+            assert!(matches!(r, Err(UsernsSpawnError::Timeout)), "{r:?}");
+            assert!(!ran.get());
         }
 
         #[test]
@@ -2905,6 +3066,7 @@ mod imp {
         _bundle: &Path,
         _rec: &ImageRootfsRecord,
         _privilege: &ImageRootfsPrivilege,
+        _deadline: Option<std::time::Instant>,
     ) -> Result<RecordedRootfsRemoval, TraitError> {
         Err(TraitError::new(
             ErrorCode::Unimplemented,
@@ -3199,6 +3361,30 @@ mod tests {
         // 正しい記録では消せる。
         assert_eq!(
             remove_recorded_rootfs(&b, &rec).expect("remove"),
+            RecordedRootfsRemoval::Removed
+        );
+        assert!(!root.exists());
+    }
+
+    /// REPAIR-5・OCI-7（#4239）: 期限が過ぎていると木の走査はエントリごとに `Timeout` で止まり、木と最上位の
+    /// 印は残る。期限を延ばして（`None`）再実行すると続きから消せる。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repair5_4239_remove_recorded_rootfs_stops_at_deadline_and_resumes() {
+        let (_scratch, b) = tmp("rec-deadline");
+        let rec = published_record(&b, "rootfs");
+        let root = b.join("rootfs");
+        std::fs::create_dir(root.join("d")).expect("dir");
+        std::fs::write(root.join("d").join("f"), b"x").expect("file");
+        let past = std::time::Instant::now();
+        let e = remove_recorded_rootfs_until(&b, &rec, &HOST_PRIVILEGE, Some(past))
+            .expect_err("deadline");
+        assert_eq!(e.code(), ErrorCode::Timeout);
+        assert!(root.join("d").join("f").is_file());
+        assert!(root.join(super::OWNER_TOKEN_FILE).is_file());
+        let far = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        assert_eq!(
+            remove_recorded_rootfs_until(&b, &rec, &HOST_PRIVILEGE, Some(far)).expect("resume"),
             RecordedRootfsRemoval::Removed
         );
         assert!(!root.exists());

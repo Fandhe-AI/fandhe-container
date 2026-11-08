@@ -184,6 +184,22 @@ pub trait StateStore: Send + Sync {
     /// のを防ぐ）で、削除にも revision の照合を要求する。対応: OCI-5・CRI-7・ERR-2。
     fn delete(&self, req: &DeleteStateRequest) -> Result<DeleteStateResponse, TraitError>;
 
+    /// [`StateStore::delete`] に、呼び出し元の絶対期限を渡すもの（REPAIR-5・CRI-5・OCI-6・#4239）。
+    ///
+    /// 期限までに状態ロックを取れない、またはロックを取った後（記録を消す前）に期限が過ぎていた場合は、
+    /// 記録を残して [`ErrorCode::Timeout`] を返す実装が望ましい（外側の待ちが先に切れたあとに記録だけが
+    /// 消え、再実行が `NotFound` になって残骸を観測できなくなるのを防ぐ）。
+    /// 既定の実装は期限を見ずに [`StateStore::delete`] へ委譲する（既存の実装の挙動を変えない。期限を
+    /// 尊重するのは `FileStateStore` など個別に上書きした実装だけ）。呼び出し元は `oci_runtime::delete`。
+    fn delete_until(
+        &self,
+        req: &DeleteStateRequest,
+        deadline: std::time::Instant,
+    ) -> Result<DeleteStateResponse, TraitError> {
+        let _ = deadline;
+        self.delete(req)
+    }
+
     /// ストアがホストのファイルシステム上に持つ状態ルート（bind mount の元として公開してはならない場所）。
     ///
     /// 既定は `None`（ホスト上の場所を示せない実装）。`mounts[]` の bind mount を持つ start は、状態ルートを

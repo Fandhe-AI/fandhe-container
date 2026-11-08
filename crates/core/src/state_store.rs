@@ -497,7 +497,11 @@ impl FileStateStore {
     }
 
     fn lock(&self) -> Result<StoreGuard<'_>, TraitError> {
-        let deadline = Instant::now() + STATE_LOCK_TIMEOUT;
+        self.lock_until(Instant::now() + STATE_LOCK_TIMEOUT)
+    }
+
+    /// 絶対期限 `deadline` までロックを待つ（呼び出し元の期限を渡すための入口。#4239）。
+    fn lock_until(&self, deadline: Instant) -> Result<StoreGuard<'_>, TraitError> {
         // プロセス内ミューテックスも有限時間で打ち切る（REPAIR-5）。毒化は状態がファイル側に
         // あるため無視して続行する。
         let process = loop {
@@ -1122,6 +1126,41 @@ impl StateStore for FileStateStore {
     /// （回復は管理操作 [`FileStateStore::purge_corrupted`]）。
     fn delete(&self, req: &DeleteStateRequest) -> Result<DeleteStateResponse, TraitError> {
         let _guard = self.lock()?;
+        self.delete_locked(req, None, || {})
+    }
+
+    /// 期限つきの削除。ロックの待ちを `deadline`（既定の上限 [`STATE_LOCK_TIMEOUT`] のうち早い方）で
+    /// 打ち切り、ロックを取った後・記録を消す前にも期限を確かめる。過ぎていれば記録は残して
+    /// [`ErrorCode::Timeout`] を返す（REPAIR-5・CRI-5・OCI-6・#4239）。
+    fn delete_until(
+        &self,
+        req: &DeleteStateRequest,
+        deadline: Instant,
+    ) -> Result<DeleteStateResponse, TraitError> {
+        let _guard = self.lock_until(deadline.min(Instant::now() + STATE_LOCK_TIMEOUT))?;
+        if Instant::now() >= deadline {
+            return Err(err(
+                ErrorCode::Timeout,
+                "deadline passed before the state record was removed; the record was kept",
+            ));
+        }
+        self.delete_locked(req, Some(deadline), || {})
+    }
+}
+
+impl FileStateStore {
+    /// ロックを保持した状態での削除の本体（`delete`・`delete_until` が共有する）。
+    ///
+    /// `deadline` が `Some` のときは、レコードの読み取りと revision の照合のあと、破壊的な
+    /// `remove_record` の直前にも期限を確かめ、過ぎていれば記録を残して `Timeout` を返す
+    /// （入口で 1 回だけ確かめない。REPAIR-5・#4239）。`before_commit` は照合の後・期限確認の前に呼ばれる
+    /// 試験用の差し込み点（本番は空）。
+    fn delete_locked(
+        &self,
+        req: &DeleteStateRequest,
+        deadline: Option<Instant>,
+        before_commit: impl FnOnce(),
+    ) -> Result<DeleteStateResponse, TraitError> {
         let existing = self
             .read_record(req.id())?
             .ok_or_else(|| err(ErrorCode::NotFound, "container state not found"))?;
@@ -1129,6 +1168,13 @@ impl StateStore for FileStateStore {
             return Err(err(
                 ErrorCode::FailedPrecondition,
                 "state revision does not match",
+            ));
+        }
+        before_commit();
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return Err(err(
+                ErrorCode::Timeout,
+                "deadline passed before the state record was removed; the record was kept",
             ));
         }
         // delete は停止済み（Stopped か pid なしの Created）だけが到達する契約（oci_runtime の check_deletable）。
@@ -5307,6 +5353,104 @@ mod tests {
         let r = store.get(&GetStateRequest::new(cid("a")));
         assert_eq!(code(r), "TIMEOUT");
         assert!(started.elapsed() < STATE_LOCK_TIMEOUT + Duration::from_secs(5));
+    }
+
+    /// REPAIR-5・CRI-5・OCI-6（#4239）: ロックの取得が遅い（他が保持している）ときの `delete_until` は、
+    /// 呼び出し元の絶対期限（既定の 5 秒より短い 300 ms）で `Timeout` になり、記録は残る。
+    #[test]
+    fn repair5_4239_delete_until_lock_wait_honors_caller_deadline() {
+        let t = TmpDir::new("until-lock");
+        let store = t.open();
+        let rec = create(&store, "a");
+        let req = DeleteStateRequest::new(cid("a"), rec.revision());
+        let held = store.process_lock.lock().unwrap();
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(300);
+        let e = store.delete_until(&req, deadline).unwrap_err();
+        let elapsed = started.elapsed();
+        assert_eq!(e.code(), ErrorCode::Timeout);
+        assert_eq!(e.message(), "timed out waiting for the state lock");
+        assert!(elapsed >= Duration::from_millis(300), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+        drop(held);
+        assert_eq!(
+            store
+                .get(&GetStateRequest::new(cid("a")))
+                .unwrap()
+                .revision(),
+            rec.revision()
+        );
+    }
+
+    /// REPAIR-5・CRI-5・OCI-6（#4239）: ロックを取れても（空いている）、記録を消す前に期限が過ぎて
+    /// いれば記録を消さず `Timeout`。期限内なら従来どおり消える。
+    #[test]
+    fn repair5_4239_delete_until_rechecks_deadline_after_lock() {
+        let t = TmpDir::new("until-after-lock");
+        let store = t.open();
+        let rec = create(&store, "a");
+        let req = DeleteStateRequest::new(cid("a"), rec.revision());
+        let e = store.delete_until(&req, Instant::now()).unwrap_err();
+        assert_eq!(e.code(), ErrorCode::Timeout);
+        assert_eq!(
+            e.message(),
+            "deadline passed before the state record was removed; the record was kept"
+        );
+        assert!(t.path().join("a").join("state.json").is_file());
+        assert_eq!(
+            store
+                .get(&GetStateRequest::new(cid("a")))
+                .unwrap()
+                .revision(),
+            rec.revision()
+        );
+        store
+            .delete_until(&req, Instant::now() + Duration::from_secs(30))
+            .unwrap();
+        assert!(!t.path().join("a").exists());
+    }
+
+    /// REPAIR-5・CRI-5・OCI-6（#4239）: 入口の確認とロック取得の後、レコードの読み取り・照合が遅くて期限が
+    /// 過ぎた場合も、破壊的な削除の直前の確認で記録を消さず `Timeout`（遅い読み取りの偽物は `before_commit`）。
+    #[test]
+    fn repair5_4239_delete_locked_rechecks_deadline_before_removing() {
+        let t = TmpDir::new("until-before-commit");
+        let store = t.open();
+        let rec = create(&store, "a");
+        let req = DeleteStateRequest::new(cid("a"), rec.revision());
+        let _guard = store.lock().unwrap();
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let e = store
+            .delete_locked(&req, Some(deadline), || {
+                std::thread::sleep(Duration::from_millis(300));
+            })
+            .unwrap_err();
+        assert_eq!(e.code(), ErrorCode::Timeout);
+        assert_eq!(
+            e.message(),
+            "deadline passed before the state record was removed; the record was kept"
+        );
+        assert!(t.path().join("a").join("state.json").is_file());
+        // 期限内に終わる遅さなら消える。
+        let far = Instant::now() + Duration::from_secs(30);
+        store.delete_locked(&req, Some(far), || {}).unwrap();
+        assert!(!t.path().join("a").exists());
+    }
+
+    /// REPAIR-5・OCI-6（#4239）: 期限なしの `delete` と同じ検査（revision 不一致・不在）を `delete_until` も返す。
+    #[test]
+    fn oci6_4239_delete_until_keeps_delete_contract() {
+        let t = TmpDir::new("until-contract");
+        let store = t.open();
+        let rec = create(&store, "a");
+        let far = Instant::now() + Duration::from_secs(30);
+        let stale = DeleteStateRequest::new(
+            cid("a"),
+            StateRevision::from_raw(rec.revision().value() + 100),
+        );
+        assert_eq!(code(store.delete_until(&stale, far)), "FAILED_PRECONDITION");
+        let missing = DeleteStateRequest::new(cid("zz"), rec.revision());
+        assert_eq!(code(store.delete_until(&missing, far)), "NOT_FOUND");
     }
 
     /// REPAIR-5・TASK-157.9: `@lock` を別の記述子（別プロセスの保持相当）が持つ間、書き込みは期限で

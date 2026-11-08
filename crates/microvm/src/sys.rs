@@ -1268,14 +1268,16 @@ pub(crate) const MAX_POLL_TIMEOUT: std::time::Duration = std::time::Duration::fr
 
 /// `fds` のどれかが読めるようになるか `timeout` が尽きるまで待つ（`poll(2)`。#3698・MVM-1・REPAIR-5）。
 ///
-/// 呼び出し元は ioeventfd の通知スレッド（`microvm::IoEventPoller`）。`ready[i]` に `fds[i]` が読める（`POLLIN`）か
-/// 異常（`POLLERR` / `POLLHUP` / `POLLNVAL`）なら `true` を書き、`true` の件数を返す。`ready` は先に全て `false` に戻す。
+/// 呼び出し元は ioeventfd の通知スレッド（`microvm::IoEventPoller`）。`ready[i]` に `fds[i]` の結果（[`PollReadiness`]）を書き、
+/// `Idle` 以外の件数を返す。読める（`POLLIN` のみ）は `Readable`、異常（`POLLERR` / `POLLHUP` / `POLLNVAL`）は `POLLIN` が
+/// 同時に立っていても `Abnormal`（#4101・REPAIR-5。異常を読める扱いにすると `take` が 0 を返して即時に戻り続け空回りする）。
+/// `ready` は先に全て `Idle` に戻す。
 /// `fds` と `ready` の長さが違う・`MAX_POLL_FDS` 超過は `Os(EINVAL)`。`timeout` は ms に切り上げ [`MAX_POLL_TIMEOUT`] で頭打ち
 /// （無期限・負値は渡さない）。`EINTR` は 0 件の成功として返す（呼び出し側が次の周回で再度待つ）。
 pub(crate) fn poll_readable(
     fds: &[BorrowedFd<'_>],
     timeout: std::time::Duration,
-    ready: &mut [bool],
+    ready: &mut [PollReadiness],
 ) -> Result<usize, SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
@@ -1283,7 +1285,7 @@ pub(crate) fn poll_readable(
     if fds.len() != ready.len() || fds.len() > MAX_POLL_FDS {
         return Err(SysError::Os(22));
     }
-    ready.fill(false);
+    ready.fill(PollReadiness::Idle);
     let mut pfds = [PollFd {
         fd: -1,
         events: 0,
@@ -1311,15 +1313,37 @@ pub(crate) fn poll_readable(
             e => Err(e),
         };
     }
-    let mask = consts::POLLIN | consts::POLLERR | consts::POLLHUP | consts::POLLNVAL;
     let mut n = 0;
-    for (flag, p) in ready.iter_mut().zip(&pfds) {
-        if p.revents & mask != 0 {
-            *flag = true;
+    for (slot, p) in ready.iter_mut().zip(&pfds) {
+        *slot = classify_revents(p.revents);
+        if *slot != PollReadiness::Idle {
             n += 1;
         }
     }
     Ok(n)
+}
+
+/// [`poll_readable`] が fd ごとに返す結果（#4101・MVM-1・REPAIR-5）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PollReadiness {
+    /// 何も起きていない。
+    Idle,
+    /// `POLLIN` だけが立った（読んで処理する）。
+    Readable,
+    /// `POLLERR` / `POLLHUP` / `POLLNVAL` のどれかが立った（`POLLIN` の有無によらない）。`revents` はカーネルが返した値。
+    Abnormal { revents: i16 },
+}
+
+/// `poll(2)` の `revents` を分類する。異常ビットは `POLLIN` より優先する。
+pub(crate) fn classify_revents(revents: i16) -> PollReadiness {
+    let abnormal = consts::POLLERR | consts::POLLHUP | consts::POLLNVAL;
+    if revents & abnormal != 0 {
+        PollReadiness::Abnormal { revents }
+    } else if revents & consts::POLLIN != 0 {
+        PollReadiness::Readable
+    } else {
+        PollReadiness::Idle
+    }
 }
 
 /// `KVM_CHECK_EXTENSION` に渡せる `KVM_CAP_*` の番号（#3679・P3-6）。フィールドは `sys` の外から見えず、
@@ -2903,30 +2927,69 @@ mod tests {
         let a = std::fs::File::from(eventfd_new().unwrap());
         let b = std::fs::File::from(eventfd_new().unwrap());
         let fds = [a.as_fd(), b.as_fd()];
-        let mut ready = [true, true];
+        let mut ready = [PollReadiness::Readable; 2];
         // 未発火: 0 件。期限（20 ms）で戻り、全て false に戻される。
         let t0 = Instant::now();
         assert_eq!(
             poll_readable(&fds, Duration::from_millis(20), &mut ready),
             Ok(0)
         );
-        assert_eq!(ready, [false, false]);
+        assert_eq!(ready, [PollReadiness::Idle; 2]);
         assert!(t0.elapsed() < Duration::from_secs(1), "{:?}", t0.elapsed());
         // b だけ発火。
         (&b).write_all(&1u64.to_ne_bytes()).unwrap();
         assert_eq!(poll_readable(&fds, Duration::ZERO, &mut ready), Ok(1));
-        assert_eq!(ready, [false, true]);
+        assert_eq!(ready, [PollReadiness::Idle, PollReadiness::Readable]);
         // 長さの不一致と上限超過。
-        let mut one = [false];
+        let mut one = [PollReadiness::Idle];
         assert_eq!(
             poll_readable(&fds, Duration::ZERO, &mut one),
             Err(SysError::Os(22))
         );
         let many = vec![a.as_fd(); MAX_POLL_FDS + 1];
-        let mut flags = vec![false; MAX_POLL_FDS + 1];
+        let mut flags = vec![PollReadiness::Idle; MAX_POLL_FDS + 1];
         assert_eq!(
             poll_readable(&many, Duration::ZERO, &mut flags),
             Err(SysError::Os(22))
+        );
+    }
+
+    /// MVM-1・REPAIR-5・#4101: 異常ビットは `POLLIN` と同時でも `Abnormal`、`POLLIN` だけが `Readable`。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn mvm1_4101_classify_revents_prefers_abnormal() {
+        use consts::{POLLERR, POLLHUP, POLLIN, POLLNVAL};
+        assert_eq!(classify_revents(0), PollReadiness::Idle);
+        assert_eq!(classify_revents(POLLIN), PollReadiness::Readable);
+        for bit in [POLLERR, POLLHUP, POLLNVAL] {
+            assert_eq!(
+                classify_revents(bit),
+                PollReadiness::Abnormal { revents: bit }
+            );
+            assert_eq!(
+                classify_revents(bit | POLLIN),
+                PollReadiness::Abnormal {
+                    revents: bit | POLLIN
+                }
+            );
+        }
+    }
+
+    /// MVM-1・REPAIR-5・#4101: 実カーネルで、書き込み端が閉じたパイプの読み出し端は `Abnormal`（POLLHUP）になる。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn mvm1_4101_poll_readable_classifies_hup_as_abnormal() {
+        use std::os::fd::AsFd as _;
+        use std::time::Duration;
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(writer);
+        let fds = [reader.as_fd()];
+        let mut ready = [PollReadiness::Idle];
+        assert_eq!(poll_readable(&fds, Duration::ZERO, &mut ready), Ok(1));
+        assert!(
+            matches!(ready[0], PollReadiness::Abnormal { revents } if revents & consts::POLLHUP != 0),
+            "{:?}",
+            ready[0]
         );
     }
 

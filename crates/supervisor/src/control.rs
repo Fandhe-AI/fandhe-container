@@ -49,8 +49,8 @@
 //! AttachRequest（kind 9）は固定長の 1 往復で、`Response(Ok)` と同じ `sendmsg` に fd を最大 3 本添えて返し、接続は
 //! 保持しない。非 tty の `stdin_once` では元の端そのものを渡し（所有の移転。受け手が唯一の書き込み端を持つので、
 //! 受け手が閉じるとコンテナの stdin が EOF になる）、送れなかったときは同じ世代にだけ戻す。tty の `stdin_once` は
-//! master を複製して渡し、閉じない。クライアント入口は [`AttachIoSource`]（本番は [`production_attach_io_source`] の
-//! [`ControlAttach`]）。古い supervisor は kind 9 を `Malformed` で断り、クライアントは `Unavailable` を返す
+//! master を複製して渡し、閉じない。クライアント入口は `AttachIoSource`（本番は `production_attach_io_source` の
+//! `ControlAttach`）。古い supervisor は kind 9 を `Malformed` で断り、クライアントは `Unavailable` を返す
 //! （別の手段へ切り替えない）。結線は plugin-cri の C9（#4077）。設計は `docs/design/cri-streaming-server.md`。
 //!
 //! # 寿命

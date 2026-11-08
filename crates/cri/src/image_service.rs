@@ -54,6 +54,9 @@ pub const MAX_REFS_PER_IMAGE: usize = 64;
 pub const MAX_FILTER_BYTES: usize = MAX_IMAGE_FIELD_BYTES;
 /// 同時に実行できる `PullImage` 数の既定上限（超過は `RESOURCE_EXHAUSTED`。blocking プールの枯渇防止）。
 pub const DEFAULT_MAX_CONCURRENT_PULLS: usize = 4;
+
+/// 同時 `RemoveImage` 数の既定上限（blocking プールの枯渇防止。共有 OCI ロックを最大 5 秒待つため。REPAIR-5）。
+pub const DEFAULT_MAX_CONCURRENT_REMOVES: usize = 4;
 /// `username` の最大バイト数。
 const MAX_USERNAME_BYTES: usize = 256;
 
@@ -319,6 +322,24 @@ pub trait ImageStore: Send + Sync {
     fn remove(&self, _reference: &str) -> Result<RemoveOutcome, ImageStoreError> {
         Err(ImageStoreError::ReadOnly)
     }
+
+    /// `reference` を外し、当たらなければ `canonical`（短縮名の正規化形）で外す（`RemoveImage`。#4177・CRI-4）。
+    ///
+    /// 永続在庫は 2 回の試行を 1 回の排他区間で行うよう上書きする（1 回目の `Absent` と 2 回目の間に
+    /// `PullImage` が割り込み、新規 pull したイメージを消す窓を作らない）。既定実装は [`Self::remove`] を順に呼ぶ。
+    fn remove_resolving(
+        &self,
+        reference: &str,
+        canonical: Option<&str>,
+    ) -> Result<RemoveOutcome, ImageStoreError> {
+        match self.remove(reference)? {
+            RemoveOutcome::Absent => match canonical {
+                Some(c) if c != reference => self.remove(c),
+                _ => Ok(RemoveOutcome::Absent),
+            },
+            outcome => Ok(outcome),
+        }
+    }
 }
 
 /// [`ImageStore::remove`] の結果（真偽値にせず、将来の拡張に備える。#4177）。
@@ -486,6 +507,8 @@ pub struct CriImageService {
     puller: Option<Arc<dyn ImagePuller>>,
     pulls_in_flight: Arc<AtomicUsize>,
     max_concurrent_pulls: usize,
+    removes_in_flight: Arc<AtomicUsize>,
+    max_concurrent_removes: usize,
 }
 
 impl CriImageService {
@@ -518,7 +541,15 @@ impl CriImageService {
             puller: None,
             pulls_in_flight: Arc::new(AtomicUsize::new(0)),
             max_concurrent_pulls: DEFAULT_MAX_CONCURRENT_PULLS,
+            removes_in_flight: Arc::new(AtomicUsize::new(0)),
+            max_concurrent_removes: DEFAULT_MAX_CONCURRENT_REMOVES,
         }
+    }
+
+    /// 同時 `RemoveImage` 数の上限を変える（0 は全拒否になるため 1 に切り上げる）。
+    pub fn with_max_concurrent_removes(mut self, max: usize) -> Self {
+        self.max_concurrent_removes = max.max(1);
+        self
     }
 
     /// `PullImage` の取り込み実装を注入する（未設定の間は `PullImage` が `Unimplemented`。TASK-61.3）。
@@ -633,13 +664,16 @@ impl CriImageService {
             return Err(CriError::invalid_argument("image reference is too long"));
         }
         // Removed / Absent のどちらも成功（冪等）。Absent のときだけ正規化した参照で再度試す。
+        // spawn 前に有限の枠を取る。枠は worker が完了まで保持し、RPC の取り消しでは解放されない（REPAIR-5）。
+        let slot = PullSlot::acquire(&self.removes_in_flight, self.max_concurrent_removes)
+            .ok_or_else(|| CriError::resource_exhausted("too many concurrent image removals"))?;
         let store = Arc::clone(&self.store);
         let joined = tokio::task::spawn_blocking(move || {
-            resolve_with_canonical(&reference, |r| match store.remove(r)? {
-                RemoveOutcome::Removed { id } => Ok(Some(id)),
-                _ => Ok(None),
-            })
-            .map_err(|_: ImageStoreError| CriError::internal("image store failure"))
+            let _slot = slot;
+            let canonical = canonical_reference(&reference);
+            store
+                .remove_resolving(&reference, canonical.as_deref())
+                .map_err(|_: ImageStoreError| CriError::internal("image store failure"))
         })
         .await;
         joined.map_err(|_| CriError::internal("image remove task failed"))??;
@@ -1219,6 +1253,63 @@ mod tests {
         }
         assert_eq!(NoWrite.remove("x"), Err(ImageStoreError::ReadOnly));
     }
+    /// REPAIR-5・CRI-2・#4177: 同時 `RemoveImage` の枠を使い切ると `ResourceExhausted`。RPC を取り消しても worker の完了まで枠は戻らない。
+    #[test]
+    fn repair5_remove_image_slots_held_until_worker_finishes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        struct Gate(Arc<AtomicBool>);
+        impl ImageStore for Gate {
+            fn list(&self) -> Result<Vec<ImageRecord>, ImageStoreError> {
+                Ok(vec![])
+            }
+            fn get(&self, _: &str) -> Result<Option<ImageRecord>, ImageStoreError> {
+                Ok(None)
+            }
+            fn remove(&self, _: &str) -> Result<RemoveOutcome, ImageStoreError> {
+                let end = Instant::now() + Duration::from_secs(5);
+                while !self.0.load(Ordering::SeqCst) && Instant::now() < end {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok(RemoveOutcome::Absent)
+            }
+        }
+        let release = Arc::new(AtomicBool::new(false));
+        let svc = CriImageService::with_store(Arc::new(Gate(Arc::clone(&release))))
+            .with_max_concurrent_removes(1);
+        let req = || {
+            Request::new(v1::RemoveImageRequest {
+                image: Some(v1::ImageSpec {
+                    image: "a".into(),
+                    ..Default::default()
+                }),
+            })
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            // 1 件目は期限で取り消す（worker は残る）。
+            let first = tokio::time::timeout(Duration::from_millis(100), svc.remove_image(req()));
+            assert!(first.await.is_err(), "first must still be running");
+            let second = svc.remove_image(req()).await.expect_err("slot held");
+            assert_eq!(second.code(), tonic::Code::ResourceExhausted);
+            release.store(true, Ordering::SeqCst);
+            // worker 完了後は枠が戻る。
+            let mut ok = false;
+            for _ in 0..200 {
+                if svc.remove_image(req()).await.is_ok() {
+                    ok = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(ok, "slot must be released after the worker finishes");
+        });
+    }
+
     /// REPAIR-5・CRI-2・#4177: `RemoveImage` の store 操作がブロックしても current_thread ランタイムの他タスクは進む。
     #[test]
     fn repair5_remove_image_does_not_block_current_thread_runtime() {

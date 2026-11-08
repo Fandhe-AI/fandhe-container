@@ -143,7 +143,15 @@ impl ImageStore for PersistentImageStore {
     }
 
     fn remove(&self, reference: &str) -> Result<RemoveOutcome, ImageStoreError> {
-        self.remove_with(reference, PRODUCTION_OPS)
+        self.remove_with(reference, None, PRODUCTION_OPS)
+    }
+
+    fn remove_resolving(
+        &self,
+        reference: &str,
+        canonical: Option<&str>,
+    ) -> Result<RemoveOutcome, ImageStoreError> {
+        self.remove_with(reference, canonical, PRODUCTION_OPS)
     }
 }
 
@@ -180,10 +188,18 @@ impl PersistentImageStore {
     fn remove_with(
         &self,
         reference: &str,
+        canonical: Option<&str>,
         ops: WriteOps,
     ) -> Result<RemoveOutcome, ImageStoreError> {
+        // 1 回目の Absent と 2 回目（正規化形）を同じ排他区間で行う（PullImage の割り込みで新規 pull を消さない）。
         self.commit_with(ops, |mem| {
-            Ok(match mem.remove(reference)? {
+            let mut outcome = mem.remove(reference)?;
+            if let (RemoveOutcome::Absent, Some(c)) = (&outcome, canonical)
+                && c != reference
+            {
+                outcome = mem.remove(c)?;
+            }
+            Ok(match outcome {
                 outcome @ RemoveOutcome::Removed { .. } => Change::Write(outcome),
                 outcome => Change::Keep(outcome),
             })
@@ -856,6 +872,7 @@ mod tests {
         s.upsert(rec("sha256:bbb", "t:b")).expect("b");
         let r = s.remove_with(
             "t:a",
+            None,
             WriteOps {
                 rename: |_, _| Err(std::io::Error::other("injected")),
                 ..PRODUCTION_OPS
@@ -874,6 +891,27 @@ mod tests {
         assert_eq!(again.list().expect("list").len(), 2);
     }
 
+    /// CRI-2・OCI-7・#4177: 短縮名の削除は 1 回の排他区間で解決する。正規化形に当たれば消し、どちらにも当たらなければ他の記録を残す。
+    #[test]
+    fn cri2_oci7_remove_resolving_uses_canonical_in_one_commit() {
+        let dir = scratch("rm-resolving");
+        let s = PersistentImageStore::open(&dir).expect("open");
+        s.upsert(rec("sha256:aaa", "docker.io/library/busybox:1.36"))
+            .expect("a");
+        assert_eq!(
+            s.remove_resolving("nomatch", Some("docker.io/library/other:1")),
+            Ok(RemoveOutcome::Absent)
+        );
+        assert_eq!(s.list().expect("list").len(), 1);
+        assert_eq!(
+            s.remove_resolving("busybox:1.36", Some("docker.io/library/busybox:1.36")),
+            Ok(RemoveOutcome::Removed {
+                id: "sha256:aaa".to_owned()
+            })
+        );
+        assert!(s.list().expect("list").is_empty());
+    }
+
     /// CRI-2・OCI-7: rename 後のディレクトリ fsync の失敗では、メモリ表示が新しい内容へ揃い、再起動後と一致する。
     #[test]
     fn cri2_oci7_remove_post_publish_failure_resyncs_view() {
@@ -883,6 +921,7 @@ mod tests {
         s.upsert(rec("sha256:bbb", "t:b")).expect("b");
         let r = s.remove_with(
             "t:a",
+            None,
             WriteOps {
                 sync: |_| Err(std::io::Error::other("injected")),
                 ..PRODUCTION_OPS

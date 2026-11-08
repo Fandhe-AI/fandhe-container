@@ -621,6 +621,7 @@ impl CriRuntimeService {
                     stop_signal: data.stop_signal,
                     applied_user: data.applied_user,
                     resolved_image: data.resolved_image,
+                    exit_observe_pending: false,
                 },
             ));
             self.record_load(Code::Ok, one);

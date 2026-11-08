@@ -181,6 +181,11 @@ pub(super) struct ContainerRecord {
     /// 置き場所はプロセス内メモリのレジストリで、寿命は `applied_user`・`stop_signal` と同じ（annotations にも
     /// `StateStore` にも書かない。記録ストア注入時はコンテナ記録へも書く。再起動後は R7 #2936 の `readopt_containers` が記録から復元する）。報告の無い経路（スタブ・外部 bundle）は `None`。
     pub(super) resolved_image: Option<ResolvedImage>,
+    /// `ContainerStatus` の観測（#4174・#4173 の E1）が `RuntimeAdapter::state` を呼び出し中。
+    ///
+    /// メモリ専用で、記録ファイル（v1）へは書かない。同じコンテナの実行層の読み取りを同時に 1 本までにし、
+    /// 期限切れで切り離した worker の累積を running の記録数で抑える（REPAIR-5）。
+    pub(super) exit_observe_pending: bool,
 }
 
 /// 新しい記録の `stop_signal` の初期値（config の値。`RUNTIME_DEFAULT` は `SIGTERM`）。
@@ -225,6 +230,18 @@ pub(super) fn finished_at_for_exit(
         _ => fallback_nanos,
     };
     candidate.max(record.started_at_nanos.max(record.created_at_nanos))
+}
+
+/// 実行層の停止済みの報告を記録へ反映する単一の代入点（CRI-1・CRI-2・#4056・#4174）。
+///
+/// StopContainer の確定（`commit_in_flight`）・永続化する記録への投影（`container_bytes`）・ContainerStatus の
+/// 自然終了の観測が同じ値を得るために呼ぶ。`fallback_nanos` は `exited_at_nanos` が未記録のときの確定時刻。
+pub(super) fn apply_exit(record: &mut ContainerRecord, exit: &ExitReport, fallback_nanos: i64) {
+    let finished_at = finished_at_for_exit(record, exit, fallback_nanos);
+    record.state = ContainerState::Exited;
+    record.finished_at_nanos = finished_at;
+    record.exit_code = exit.code;
+    record.termination = exit.termination;
 }
 
 /// 実行層が報告した終了コードから `ContainerStatus.reason` を導く（CRI-2）。

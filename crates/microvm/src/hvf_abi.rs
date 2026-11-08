@@ -118,6 +118,8 @@ pub enum HvOp {
     GicGetIntid,
     /// `hv_gic_get_distributor_reg`（macOS 15 以降。任意のシンボル。#3960・MVM-5）。
     GicGetDistributorReg,
+    /// `hv_vm_config_get_default_ipa_size`（macOS 13 以降。`dlsym` で解決。#4227・MVM-5）。
+    VmConfigGetDefaultIpaSize,
 }
 
 impl HvOp {
@@ -148,6 +150,7 @@ impl HvOp {
             HvOp::GicGetSpiInterruptRange => "hv_gic_get_spi_interrupt_range",
             HvOp::GicGetIntid => "hv_gic_get_intid",
             HvOp::GicGetDistributorReg => "hv_gic_get_distributor_reg",
+            HvOp::VmConfigGetDefaultIpaSize => "hv_vm_config_get_default_ipa_size",
         }
     }
 }
@@ -472,6 +475,8 @@ pub fn check_map_range(addr: u64, ipa: u64, size: u64, page_size: u64) -> Result
 ///
 /// macOS 27.2・Apple M4 Max の実機の既定は 36 ビット、最大は 40 ビットだった（#3997。他の機種・版は未確認）。`config = NULL` の
 /// VM でこの上限の直前のページは map でき、直後のページは `HV_BAD_ARGUMENT` だった。広げるには VM の作成時に IPA 幅を指定する変更が要る。
+/// この定数は FFI 引数の天井として残す。実行時の既定幅（`hv_vm_config_get_default_ipa_size`）との照合は `assemble` が
+/// `crate::gpa_width` で行う（#4227）。
 pub const HVF_DEFAULT_IPA_LIMIT: u64 = 1 << 36;
 
 /// ゲスト RAM を `[ipa, ipa + size)` に置けるか、IPA の上限に対して検査する（`hv_vm_map` の前に通す）。

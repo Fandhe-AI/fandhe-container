@@ -255,6 +255,9 @@ pub(crate) mod consts {
     pub const KVM_ARM_PREFERRED_TARGET: u64 = super::ior(super::KVMIO, 0xAF, 32);
     /// `KVM_CAP_ARM_PSCI_0_2`（v6.12 `linux/kvm.h`。#3896）。`libc` に対応物が無く、具体値の試験で固定する（#3664）。
     pub const KVM_CAP_ARM_PSCI_0_2: super::KvmCap = super::KvmCap(102);
+    /// `KVM_CAP_ARM_VM_IPA_SIZE`（v6.12 `linux/kvm.h` で 165。応答はホストの IPA 上限ビット数。#4227）。
+    /// `libc` に対応物が無く、具体値の試験で固定する（#3664）。
+    pub const KVM_CAP_ARM_VM_IPA_SIZE: super::KvmCap = super::KvmCap(165);
     /// `KVM_ARM_VCPU_PSCI_0_2`（v6.12 `asm/kvm.h`）。features の**ビット番号**でマスクではない（`1 << 値` で立てる）。
     pub const KVM_ARM_VCPU_PSCI_0_2: u32 = 2;
     /// `KVM_ARM_VCPU_POWER_OFF`（v6.12 `asm/kvm.h`。#3899）。features の**ビット番号**。立てた vCPU は `KVM_RUN` が
@@ -386,6 +389,7 @@ const _: () = {
     assert!(consts::KVM_ARM_VCPU_INIT == 0x4020_AEAE);
     assert!(consts::KVM_ARM_PREFERRED_TARGET == 0x8020_AEAF);
     assert!(consts::KVM_CAP_ARM_PSCI_0_2.0 == 102);
+    assert!(consts::KVM_CAP_ARM_VM_IPA_SIZE.0 == 165);
     assert!(consts::KVM_MEM_LOG_DIRTY_PAGES == 1);
     assert!(consts::KVM_MEM_READONLY == 2);
     assert!(consts::KVM_CAP_READONLY_MEM.0 == 81);
@@ -3168,6 +3172,7 @@ mod tests {
     #[test]
     fn mvm1_3896_psci_0_2_constants_and_features() {
         assert_eq!(consts::KVM_CAP_ARM_PSCI_0_2.0, 102);
+        assert_eq!(consts::KVM_CAP_ARM_VM_IPA_SIZE.0, 165);
         assert_eq!(consts::KVM_ARM_VCPU_PSCI_0_2, 2);
         let init = with_psci_0_2(KvmVcpuInit {
             target: 5,

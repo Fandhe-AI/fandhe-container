@@ -46,6 +46,11 @@
 //! 不透明なポインタで NULL を渡す。`hv_*` と `HvVcpuExitRaw`（Hypervisor.framework の構造体）は `libc` に
 //! 対応物が無く、レイアウトは `hvf_abi` の const assert で固定する。
 //!
+//! # 既定の IPA 幅（#4227・MVM-1・MVM-5）
+//! `hv_vm_config_get_default_ipa_size`（macOS 13.0 以降。<https://developer.apple.com/documentation/hypervisor/hv_vm_config_get_default_ipa_size(_:)>）
+//! を GIC と同じ `dlsym` で解決する（[`default_ipa_bits`]。見つからなければ `Unimplemented`）。`hv_vm_create(NULL)` の VM が
+//! 使う幅で、`HvfMicroVm::assemble` が最上位 GPA と照合する。`unsafe` はこのファイルの transmute と呼び出しの 2 か所。
+//!
 //! # GICv3 の契約（TASK-192.3・#3789・MVM-5・MVM-4）
 //! - `hv_gic_*` は macOS 15.0 で入った。Rust の既定の deployment target（11.0）で `extern` に直接宣言すると、
 //!   macOS 14 では dyld がシンボルを解決できずプロセスが起動しない。そこで **どの `extern` ブロックにも宣言せず**、
@@ -973,6 +978,45 @@ fn gic_symbol_missing() -> MicrovmError {
         MicrovmErrorCode::Unimplemented,
         "hypervisor GIC symbol is not available",
     )
+}
+
+// ---- 既定の IPA 幅（#4227・MVM-1・MVM-5）。`hv_vm_config_get_default_ipa_size` は macOS 13.0 で入った ----
+
+type VmConfigGetDefaultIpaSizeFn = unsafe extern "C" fn(*mut u32) -> c_int;
+
+fn ipa_symbol_missing() -> MicrovmError {
+    MicrovmError::new(
+        MicrovmErrorCode::Unimplemented,
+        "hypervisor IPA size symbol is not available",
+    )
+}
+
+static DEFAULT_IPA_FN: OnceLock<Result<VmConfigGetDefaultIpaSizeFn, MicrovmError>> =
+    OnceLock::new();
+
+/// `hv_vm_create(NULL)` で作る VM の既定の IPA 幅（ビット数）を `hv_vm_config_get_default_ipa_size` で得る。
+///
+/// 呼び出し元は `HvfMicroVm::assemble`（VM 作成前に最上位 GPA と照合する。`crate::gpa_width::hvf_ipa_bits`）。
+/// Rust の既定の deployment target（11.0）より新しい関数のため、`extern` に直接宣言せず GIC と同じく `dlsym` で
+/// 実行時に解決する（古い macOS で dyld がプロセスを起動できなくなるのを避ける）。見つからなければ `Unimplemented`
+/// （fail-closed。既定幅を決め打ちで代用しない）。解決結果は `OnceLock` でプロセスごとに 1 回だけ作る。
+pub(crate) fn default_ipa_bits() -> Result<u32, MicrovmError> {
+    let f = DEFAULT_IPA_FN
+        .get_or_init(|| {
+            let p = lookup(c"hv_vm_config_get_default_ipa_size").ok_or_else(ipa_symbol_missing)?;
+            // SAFETY: `p` は NULL でない `dlsym` の戻り値。型は Apple の文書のシグネチャ
+            // （`hv_return_t hv_vm_config_get_default_ipa_size(uint32_t *ipa_bit_length)`）に一致させた `extern "C"` の
+            // 関数ポインタ（データポインタと同じ幅）。image は unload されず `dlclose` もしない（`resolve!` と同じ論拠）。
+            Ok(unsafe { std::mem::transmute::<*mut c_void, VmConfigGetDefaultIpaSizeFn>(p) })
+        })
+        .as_ref()
+        .map_err(Clone::clone)?;
+    let mut bits = 0u32;
+    // SAFETY: `f` は上で解決した関数（Hypervisor.framework は unload されない）。出力先はローカル変数 `bits` だけで、
+    // 呼び出しの間生きている。関数は config を取らず、VM 状態を変えない。
+    let rc = unsafe { f(&mut bits) };
+    classify_hv_return(HvOp::VmConfigGetDefaultIpaSize, rc)?;
+    Ok(bits)
 }
 
 /// `kern.osproductversion` を読んで分解する。応答は上限つきのスタックバッファで受け、切り詰めは拒否する。

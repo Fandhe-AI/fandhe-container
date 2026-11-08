@@ -383,7 +383,11 @@ fn serve(socket: &std::path::Path) -> ExitCode {
         .await;
         let report = streaming_stop.finish().await;
         // 件数と経過だけの 1 行。終了行の書き出しの待ちより前に出し、まとめて flush させる（REPAIR-4）。
-        let _ = telemetry::stderr_sink().submit(report.line());
+        // bind 失敗など serve が失敗し、開いたセッションも無かった経路（サーバーが一度も稼働していない）では出さない。
+        // 起動失敗時の stderr は `error: ` の行で始まる契約を保つ（#4164）。
+        if r.is_ok() || report.open_at_stop > 0 {
+            let _ = telemetry::stderr_sink().submit(report.line());
+        }
         stats.abort();
         r
     });

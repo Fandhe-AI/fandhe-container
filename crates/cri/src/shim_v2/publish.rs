@@ -1,13 +1,13 @@
 //! shim v2 のイベント publish（TaskExit）。期限つきの子プロセスで containerd の `publish` を呼ぶ（CRI-5・TASK-62.6・REPAIR-3・REPAIR-5・#4155）。
 //!
 //! containerd（特に CRI）はコンテナの終了を `/tasks/exit` の TaskExit で知る。shim は `-publish-binary`
-//! （検証済みの [`PublishBinary`]。#4154）を子として起動し、stdin へ `google.protobuf.Any` を渡す。
+//! （検証済みの `PublishBinary`。#4154）を子として起動し、stdin へ `google.protobuf.Any` を渡す。
 //! 呼び出し元は [`super::task_service::TaskService`] の終了 watcher（`Start` 成功後に起こす）で、
 //! 差し込み口は [`exec_publisher_for`]（plugin-cri の `registry_in` が呼ぶ）。
 //!
 //! 契約:
 //! - 呼び出し形: `<publish-binary> --address <address> publish --namespace <namespace> --topic /tasks/exit`。
-//!   値は検証済みの [`PublishBinary`]・[`ShimIdentifier`]・`-address` からだけ組み立て、シェルを経由しない。
+//!   値は検証済みの `PublishBinary`・`ShimIdentifier`・`-address` からだけ組み立て、シェルを経由しない。
 //!   子は `env_clear()`・cwd `/`・stdout / stderr は null（`daemon.log` の fd を渡さない）。
 //! - stdin: `Any` の protobuf 符号化そのもの（長さ接頭辞・改行なし）。`type_url` は `containerd.events.TaskExit`。
 //! - [`EventPublisher::publish`] は有界時間で戻る（キューへ入れるだけ）。子の起動・待ち・回収は worker スレッド 1 本が直列に行い、
@@ -203,6 +203,10 @@ impl PublishFailure {
 pub trait PublishLog: Send + Sync {
     /// 失敗を 1 件記録する。有界時間で戻ること。
     fn record(&self, failure: &PublishFailure);
+
+    /// publish 1 件の結果（成功・失敗）と経過時間を記録する（REPAIR-4・#4155）。既定は何もしない。
+    /// 失敗の詳細は [`PublishLog::record`] が別に出す。topic と経過ミリ秒だけを持ち、秘匿情報を含めない。
+    fn record_outcome(&self, _topic: &'static str, _ok: bool, _elapsed: Duration) {}
 }
 
 /// デーモンの stderr へ JSON 1 行を出す本番の出力先。
@@ -214,6 +218,17 @@ impl PublishLog for StderrPublishLog {
         use std::io::Write;
         // stderr が閉じていても panic しない（eprintln! は書き込み失敗で panic する）。
         let _ = writeln!(std::io::stderr(), "{}", failure.to_json_line());
+    }
+
+    fn record_outcome(&self, topic: &'static str, ok: bool, elapsed: Duration) {
+        use std::io::Write;
+        let line = serde_json::json!({
+            "event": "task_event_publish",
+            "topic": topic,
+            "ok": ok,
+            "elapsed_ms": u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+        });
+        let _ = writeln!(std::io::stderr(), "{line}");
     }
 }
 
@@ -403,9 +418,12 @@ mod unix {
         log: &dyn PublishLog,
     ) {
         while let Ok(event) = rx.recv() {
-            if let Err(failure) = run_bounded(target, config, &event) {
-                log.record(&failure);
+            let started = Instant::now();
+            let result = run_bounded(target, config, &event);
+            if let Err(failure) = &result {
+                log.record(failure);
             }
+            log.record_outcome(event.topic(), result.is_ok(), started.elapsed());
         }
     }
 

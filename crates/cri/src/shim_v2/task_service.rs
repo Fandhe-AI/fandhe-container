@@ -82,9 +82,10 @@
 //! 期限（REPAIR-5）: Wait は上記の期限を持つ。他のメソッドは `ContainerRuntime` の契約で実装側が期限を持ち、
 //! shim は追加の期限を設けない。socket の権限・peer UID の照合は #803（TASK-62.7）の範囲。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -120,6 +121,8 @@ const FIELD_OPTIONS: u64 = 10;
 const UNKNOWN_EXIT_STATUS: u32 = 255;
 /// 同時に動かす終了 watcher の上限（`CREATED_MAX` と同じ。REPAIR-5）。
 const MAX_EXIT_WATCHERS: usize = CREATED_MAX;
+/// 終了 watcher の作成世代の採番（プロセス内で単調増加）。
+static NEXT_WATCH_GENERATION: AtomicU64 = AtomicU64::new(1);
 /// 照会の失敗が続いたときに watcher が諦めるまでの連続回数。
 const EXIT_WATCH_MAX_ERRORS: u32 = 3;
 /// 記録しておく作成済み ID の上限。Delete で除去するが、除去されない経路でも無制限に増やさない（REPAIR-5）。
@@ -145,8 +148,9 @@ pub struct TaskService {
     created: Arc<Mutex<BTreeSet<String>>>,
     /// TaskExit の送り先。無ければ終了 watcher を起こさない（#4155・CRI-5）。
     event_publisher: Option<Arc<dyn EventPublisher>>,
-    /// 稼働中の終了 watcher の ID。v2 と v3 で共有し、同じ ID の watcher を重複させず、数を [`MAX_EXIT_WATCHERS`] で抑える。
-    exit_watchers: Arc<Mutex<BTreeSet<String>>>,
+    /// 稼働中の終了 watcher の ID。v2 と v3 で共有し、同じ ID の watcher を重複させず、数を `MAX_EXIT_WATCHERS` で抑える。
+    /// 値は作成世代のトークン。Delete が登録を外し、世代が違う watcher は publish しない（#4155）。
+    exit_watchers: Arc<Mutex<BTreeMap<String, u64>>>,
 }
 
 impl std::fmt::Debug for TaskService {
@@ -169,7 +173,7 @@ impl TaskService {
             shutdown: None,
             created: Arc::new(Mutex::new(BTreeSet::new())),
             event_publisher: None,
-            exit_watchers: Arc::new(Mutex::new(BTreeSet::new())),
+            exit_watchers: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -179,7 +183,7 @@ impl TaskService {
     /// watcher は `RuntimeAdapter::wait_exit` を期限つきで繰り返す。plugin-cri の `CoreLifecycleRuntime` は呼び出しごとに
     /// supervisor の終了通知を購読し（枠はコンテナごとに 8、超えたら照会へ縮退）、containerd の Wait RPC と並んでも壊れない。
     /// 待ち 1 回は [`WaitConfig`] の期限で有界だが、watcher の寿命全体は有界でない（コンテナが動く間は続く）。
-    /// 数は [`MAX_EXIT_WATCHERS`] が上限。Wait・State・Delete の経路からは publish しない（重複排除の仕組みが要るため）。
+    /// 数は `MAX_EXIT_WATCHERS` が上限。Wait・State・Delete の経路からは publish しない（重複排除の仕組みが要るため）。
     ///
     /// 残余: Wait の直後 1 照会間隔以内に Delete する利用者（`ctr` 型）は、watcher の観測より先に削除が走ると取り逃しうる
     /// （CRI の流れは `/tasks/exit` を受けてから Delete するので起きない）。restart による一時的な Stopped は対象外。
@@ -597,9 +601,10 @@ impl TaskService {
         let Some(publisher) = &self.event_publisher else {
             return;
         };
+        let generation = NEXT_WATCH_GENERATION.fetch_add(1, Ordering::Relaxed);
         {
             let mut set = self.exit_watchers.lock().unwrap_or_else(|p| p.into_inner());
-            if set.contains(id) {
+            if set.contains_key(id) {
                 return;
             }
             if set.len() >= MAX_EXIT_WATCHERS {
@@ -607,7 +612,7 @@ impl TaskService {
                 publisher.report(PublishFailure::new(PublishStage::WatchLimit, None));
                 return;
             }
-            set.insert(id.to_owned());
+            set.insert(id.to_owned(), generation);
         }
         let ctx = ExitWatch {
             adapter: self.adapter.clone(),
@@ -616,26 +621,22 @@ impl TaskService {
             shutdown: self.shutdown.clone(),
             id: id.to_owned(),
             start_pid,
+            generation,
+            watchers: Arc::clone(&self.exit_watchers),
         };
         let watchers = Arc::clone(&self.exit_watchers);
         let spawned = std::thread::Builder::new()
             .name("shim-exit-watch".into())
-            .spawn({
-                let watchers = Arc::clone(&watchers);
-                move || {
-                    let id = ctx.id.clone();
-                    ctx.run();
-                    watchers
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .remove(&id);
-                }
+            .spawn(move || {
+                ctx.run();
+                ctx.unregister();
             });
         if spawned.is_err() {
-            watchers
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .remove(id);
+            let mut set = watchers.lock().unwrap_or_else(|p| p.into_inner());
+            if set.get(id) == Some(&generation) {
+                set.remove(id);
+            }
+            drop(set);
             publisher.report(PublishFailure::new(PublishStage::WatchSpawn, None));
         }
     }
@@ -667,6 +668,11 @@ impl TaskService {
         self.adapter.remove(&req.id, false).map_err(gone)?;
         created.remove(&req.id);
         drop(created);
+        // 旧コンテナの終了 watcher を取り消す。同じ ID の再作成・再 Start で新しい世代が登録でき、旧世代は publish しない（#4155）。
+        self.exit_watchers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&req.id);
         // 削除成功後に旧コンテナの exec 登録を除去する（同じ ID の再作成で引き継がない。CRI-5）。
         if let Some(container) = &container {
             self.execs
@@ -826,9 +832,29 @@ struct ExitWatch {
     shutdown: Option<ShutdownSignal>,
     id: String,
     start_pid: u32,
+    /// この watcher の作成世代。登録表の値と一致する間だけ有効（Delete で外れる）。
+    generation: u64,
+    watchers: Arc<Mutex<BTreeMap<String, u64>>>,
 }
 
 impl ExitWatch {
+    /// 登録表の世代が自分のものか。Delete・再作成で外れていれば false。
+    fn is_current(&self) -> bool {
+        self.watchers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&self.id)
+            == Some(&self.generation)
+    }
+
+    /// 自分の世代の登録だけを外す（新しい世代の登録は消さない）。
+    fn unregister(&self) {
+        let mut set = self.watchers.lock().unwrap_or_else(|p| p.into_inner());
+        if set.get(&self.id) == Some(&self.generation) {
+            set.remove(&self.id);
+        }
+    }
+
     /// 終了を観測して TaskExit を 1 回だけ publish する。`Timeout` は周回を続け、`NotFound`（観測前の削除）と取り消しは黙って終わる。
     /// その他の失敗は照会間隔だけ待って再試行し、連続 [`EXIT_WATCH_MAX_ERRORS`] 回で `watch` を 1 件記録して諦める。
     fn run(&self) {
@@ -836,6 +862,7 @@ impl ExitWatch {
             self.shutdown
                 .as_ref()
                 .is_some_and(ShutdownSignal::is_requested)
+                || !self.is_current()
         };
         let mut errors = 0;
         loop {
@@ -874,6 +901,10 @@ impl ExitWatch {
 
     /// 停止済みの状態から TaskExit を組み立てて送る。pid が Start 時と食い違えば作り直しとみなして送らない。
     fn publish_exit(&self, st: &RuntimeContainerStatus) {
+        // 取り消された世代（Delete 後の旧コンテナ）の終了は送らない。
+        if !self.is_current() {
+            return;
+        }
         if let Some(p) = st.pid
             && self.start_pid != 0
             && p != self.start_pid
@@ -3415,6 +3446,8 @@ mod tests {
             shutdown: None,
             id: "c1".into(),
             start_pid: 4242,
+            generation: 7,
+            watchers: Arc::new(Mutex::new(BTreeMap::from([("c1".to_owned(), 7)]))),
         };
         let mut st = RuntimeContainerStatus::from(&ContainerStatus::stopped(
             RtId::new("c1").unwrap(),
@@ -3434,6 +3467,39 @@ mod tests {
         assert_eq!((e.pid, e.exit_status, e.exited_at.clone()), (4242, 0, None));
     }
 
+    /// CRI-5・#4155: Delete 後に同じ ID で Create・Start し直すと、旧 watcher は取り消されて旧 pid を publish せず、
+    /// 新しい watcher が登録される（世代違いの終了は送らない）。
+    #[test]
+    fn cri5_4155_recreate_after_delete_replaces_watcher() {
+        let fake = Fake {
+            create_pid: Some(111),
+            ..Fake::default()
+        };
+        let (s, f, cap) = svc_pub(fake);
+        s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
+        s.handle("Start", &start_req("c1")).unwrap();
+        let old = *s.exit_watchers.lock().unwrap().get("c1").unwrap();
+        // 旧コンテナを停止させずに削除する（force なしで通る状態にするため停止にしてから）。
+        stopped_with_time(&f, "c1", Some(0), 1_700_000_000_000_000_000);
+        s.handle("Delete", &delete_req("c1", "")).unwrap();
+        assert!(s.exit_watchers.lock().unwrap().get("c1").is_none());
+        f.preset.lock().unwrap().remove("c1");
+        s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
+        s.handle("Start", &start_req("c1")).unwrap();
+        let new = *s.exit_watchers.lock().unwrap().get("c1").unwrap();
+        assert_ne!(old, new);
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        // 旧世代の watcher の終了後も新しい登録は残る。
+        assert_eq!(*s.exit_watchers.lock().unwrap().get("c1").unwrap(), new);
+        assert!(
+            cap.events
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|e| matches!(e, Ev::Exit(x) if x.exit_status == 0)),
+        );
+    }
+
     /// REPAIR-5・#4155: watcher の数の上限を超えたら起こさず、`watch_limit` を 1 件記録する（Start の応答は変えない）。
     #[test]
     fn repair5_4155_watcher_limit() {
@@ -3441,7 +3507,7 @@ mod tests {
         {
             let mut set = s.exit_watchers.lock().unwrap();
             for i in 0..MAX_EXIT_WATCHERS {
-                set.insert(format!("w{i}"));
+                set.insert(format!("w{i}"), 0);
             }
         }
         s.spawn_exit_watcher("extra", 1);

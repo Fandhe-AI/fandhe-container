@@ -234,8 +234,8 @@ pub(super) fn finished_at_for_exit(
 
 /// 実行層の停止済みの報告を記録へ反映する単一の代入点（CRI-1・CRI-2・#4056・#4174）。
 ///
-/// StopContainer の確定（`commit_in_flight`）・永続化する記録への投影（`container_bytes`）・ContainerStatus の
-/// 自然終了の観測が同じ値を得るために呼ぶ。`fallback_nanos` は `exited_at_nanos` が未記録のときの確定時刻。
+/// StopContainer の確定（`commit_in_flight`）・ContainerStatus の自然終了の観測が呼ぶ。永続化する記録への投影
+/// （`container_bytes`）は代入せず、同じ finished_at を得るため `finished_at_for_exit` を直接呼ぶ。`fallback_nanos` は `exited_at_nanos` が未記録のときの確定時刻。
 pub(super) fn apply_exit(record: &mut ContainerRecord, exit: &ExitReport, fallback_nanos: i64) {
     let finished_at = finished_at_for_exit(record, exit, fallback_nanos);
     record.state = ContainerState::Exited;

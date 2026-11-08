@@ -4120,8 +4120,6 @@ mod tests {
                 Ev::Start(_) => "start",
                 Ev::Exit(_) => "exit",
                 Ev::Delete(_) => "delete",
-                #[allow(unreachable_patterns)]
-                _ => "other",
             })
             .collect();
         assert_eq!(kinds, ["create", "start", "exit", "delete"], "{evs:?}");

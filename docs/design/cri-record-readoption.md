@@ -135,7 +135,7 @@ CORE-10 への当てはめ（CORE-10 の目標 0.136 秒、Linux の Docker 0.29
 
 | CRI 記録 | core | 再採用後 |
 | -------- | ---- | -------- |
-| 確定（Created/Running/Exited） | Present | core の status へ写す（Running→running、Stopped→exited、Created→created）。終了コードは記録の値、無ければ不明（reason 空） |
+| 確定（Created/Running/Exited） | Present | core の status へ写す（Running→running、Stopped→exited、Created→created）。終了コードは記録の値、無ければ不明（reason 空）。#4173 で改める（記録が Exited でなく core が Stopped なら core の値。実装は E3。実装までは現行どおり） |
 | 確定 | Absent | exited＋unknown 扱い（記録は保持。Remove で解放。bundle の release は Remove 時） |
 | `in_flight=create` | Absent | create は完了していない。記録を削除し、自分が作った bundle（`.cri/bundles/<id>`）を release |
 | `in_flight=create` | Present | `CONTAINER_UNKNOWN` で保持し `runtime_owned=true` に復元する（Remove が core の delete 経由で回収。再 Start は拒否） |
@@ -162,7 +162,7 @@ CORE-10 への当てはめ（CORE-10 の目標 0.136 秒、Linux の Docker 0.29
   - 登録する記録はどれも `in_flight=false`。確定・`in_flight=start` / `stop` は Present で core の lifecycle を写し（Created→created・Running→running・Stopped→exited・Creating / Unknown→unknown）`runtime_owned=true`、Absent で exited（終了コード・時刻は記録の値で、core の値では上書きしない。無ければ不明）＋`runtime_owned=false`。`in_flight=create` は Present で unknown＋`runtime_owned=true`（再 Start は親 sandbox が NotReady のため拒否）、Absent は **登録しない**（`stale_create`。ファイルも bundle も触らず、ID を `ContainerReadoption::stale_create_ids` で R8 #2937 へ渡す）。`in_flight=remove` は Present / Absent とも unknown（Remove の続き待ち）。Undetermined はすべて `CONTAINER_UNKNOWN`＋`runtime_owned=true`
   - 判断: `in_flight=remove` × Absent を `runtime_owned=true` にする。偽だと kubelet の再試行が `drop_container` によるメモリ上の除去だけになり、記録ファイルと bundle が残って「再試行で完了」が成り立たない。真なら `delete` の `NOT_FOUND` を許容して bundle の release → 記録の削除 → commit まで進める（試験で固定）。`in_flight=start` / `stop` × Absent は上の表に行が無く、R5 が write-ahead を書かないため v1 では生じないが、復号器は受理するので確定 × Absent と同じに扱う
   - 親 sandbox が registry に無い記録は壊れた記録（`parentless`）として数え、登録も照会も削除もしない。`(pod_sandbox_id, name, attempt)` が重複する記録は、`stale_create` を除いた後で ID の小さい方だけ登録し残りは `duplicate_metadata`。CRI 記録の無い core のコンテナは構造上照会されない。保持量は復号した config 分に `resolved_log_path` の長さと `identity_retained_extra`（`attach_prepared` と共通の式）を足して数え直す。件数・保持量の上限超過（`FAILED_PRECONDITION`）と全体の期限切れ（`DEADLINE_EXCEEDED`）は起動失敗で registry は空のまま。計測は `cri.record_store_load` を登録 1 件・`stale_create` 1 件ごとに成功、復号失敗・重複は `INVALID_ARGUMENT`、親なし・読めない記録は `DATA_LOSS` で出し、`ContainerReadoption::summary_line`（`kind=container`）が固定語彙の 1 行を返す（stderr への出力は R9）
-  - 残余: (1) 確定 × Absent の記録（`runtime_owned=false`）は、RemoveContainer / RemovePodSandbox の連鎖が `drop_container` でメモリを除くだけで **記録ファイルと bundle が残る**（安全側。R5 の連鎖削除の段落の「`runtime_owned` でない配下はファイルを持たない」は、再採用した Absent の記録では成り立たない）。release と記録の削除は R8 #2937 の範囲。(2) `stale_create` の記録の削除と bundle の release、孤児 bundle の回収も R8。(3) 写像先が exited のときに core の `exit_code` や終了時刻を使う案は、設計の「終了コードは記録の値」に従って採らなかった（要すれば後続で判断）
+  - 残余: (1) 確定 × Absent の記録（`runtime_owned=false`）は、RemoveContainer / RemovePodSandbox の連鎖が `drop_container` でメモリを除くだけで **記録ファイルと bundle が残る**（安全側。R5 の連鎖削除の段落の「`runtime_owned` でない配下はファイルを持たない」は、再採用した Absent の記録では成り立たない）。release と記録の削除は R8 #2937 の範囲。(2) `stale_create` の記録の削除と bundle の release、孤児 bundle の回収も R8。(3) 写像先が exited のときに core の `exit_code` や終了時刻を使う案は、設計の「終了コードは記録の値」に従って採らなかった（要すれば後続で判断 → #4173 で core の値を使う採用に改めた。実装は E3）
 - R8 の実装（#2937。R7 の残余 (1)(2) への対応。OCI-7・CRI-1・SEC-1・REPAIR-3/4/5）:
   - `stale_create`: `CriRuntimeService::release_stale_creates`（cri）が `readopt_containers` の直後に 1 回、`stale_create_ids` の各 ID を core へ再照会し、`NOT_FOUND` だけのときに `BundleProvider::release` → `RecordStore::remove` の順で消す（所有の証明である記録は最後）。Present・Undetermined は何もしない。解放・削除の失敗と期限切れは件数（`StaleCreateRelease`。固定語彙の `summary_line`）に数えるだけで起動を止めない（記録が残るので次回起動で再び拾われ、release は不在を成功とするため冪等）。registry には触れない
   - 確定 × Absent（`runtime_owned=false`）の Remove: 実行層接続時にこの組が生じるのは再採用だけ（Create の巻き戻しは記録を消すか `runtime_owned=true` にする）。`RemoveContainer` は `runtime_remove_one` の `call_core=false` で core の `delete` を呼ばず、bundle の解放 → 記録ファイルの削除 → 確定だけを行う。`RemovePodSandbox` は配下の全コンテナを 1 件ずつ処理し、件ごとに `call_core` を決める。失敗は exited・`in_flight=false` で保持し再試行で完了する
@@ -258,6 +258,107 @@ CORE-10 への当てはめ（CORE-10 の目標 0.136 秒、Linux の Docker 0.29
 - fork した子へのハンドラの継承（#3300）: 登録したハンドラは exec しない fork の子へ引き継がれる。exec した子は `execve` で `SIG_DFL` に戻る（試験で固定）。exec しない fork は core の `fork_single_threaded*` だけで、複数スレッドのプロセスでは拒否されるため、ランタイム等のスレッドができた後は到達しない。残る窓はハンドラ登録後から最初のスレッドまでの起動段だけで、そこの子は各段の予算と SIGKILL で回収される。core の fork 原語で `SIG_DFL` に戻す案は launcher・PID 1 の経路に及ぶため採らない。単体試験は libtest のプロセスに停止シグナルのハンドラを入れない（`install_shutdown_signals` を呼ばない）
 - 残余（REPAIR-3）: 起動段の途中では段の予算まで待つ。relay の fork より前に届いたシグナルは既定動作で即終了する（SIGKILL と同じく再採用が扱う）。libc との機械照合は plugin-cri に dev-dependency の `libc` が無いため未導入（依存の追加は承認事項）。running のコンテナを残した実機での SIGTERM 再起動の確認は R13 #2942（人間担当）
 
+## 自然終了の取り込み（#4173・CRI-1・CRI-2・SUP-4・REPAIR-4・REPAIR-5）
+
+本節は設計の決定であり、実装は E1〜E3（下記の表）で行う。実装済みを装わない（REPAIR-3）。
+
+### 現状と課題
+
+- `crates/cri/src/runtime_service.rs` の `container_status_impl` と `list_containers_impl` は registry のメモリ上の記録を返すだけで、実行層を読まない。`CONTAINER_EXITED` と終了コードが記録に入るのは、`StopContainer` が実行層の停止済みの報告を取り込む経路（`runtime_stop_one` → `InFlightGuard::commit` → `commit_in_flight` の Stop 分岐）だけである
+- PID 1 が自分で終わったコンテナは、supervisor が `state.json` を `Stopped` に書いても CRI の記録は running のまま残る。kubelet の generic PLEG は一覧の状態の差で終了を検知し、続けて `ContainerStatus` を読んで再起動方針を回すので、自然終了に気づけない（#4140）
+- CRI の start は supervisor に `--restart` を渡さない（既定の `no`）。CRI のコンテナでは `Stopped` が終端になる
+
+### 案の比較と採用
+
+| 評価の軸 | A: 照会時に実行層を読む（採用） | B: supervisor の kind 8 `ExitWatch` を購読する（却下） |
+| -------- | ------------------------------- | ------------------------------------------------------ |
+| 待ちの上限 | 1 件 1 秒・List 全体 1 秒（暫定） | 購読は 1 回 60 秒（`MAX_EXIT_WATCH_HOLD`）で張り直しが要る |
+| 常駐の仕組み | 無し（CORE-1 と整合） | running ごとの購読を最大 `MAX_CONTAINERS`（4096）本張り続ける |
+| supervisor 不在・再起動後 | 読み取りの結果は変わらない | `NoSupervisor`・`PidChanged`・`Transient`・再採用後は成り立たず、A へ退避が要る |
+| 記録 pid | 使わない | kind 8 の要求に記録 pid が要り、先に `state.json` を読む（A を含む） |
+| 購読枠 | 使わない | supervisor 1 つにつき 8（`DEFAULT_MAX_EXIT_WATCHERS`）。shim v2 の Wait と取り合う |
+| 依存の境界 | 既存の `RuntimeAdapter::state` のみ | 注入トレイトが増え、通知側が registry を非同期に更新するので Stop・Remove との競合が増える |
+
+採用は A。B は A の読み取りを必ず含み、退避の経路が要るので A に上乗せする仕組みにしかならない。B の利点（検知の遅れが短い・照会ごとの `@lock` が無い）は再評価の条件に残す（下記）。
+
+却下した他の案:
+
+- C: List で `StateStore::list` を 1 回呼ぶ。`ContainerRuntime` の契約変更になる（PLUG-1・PLUG-4）。状態ルートを CLI と共有しており CLI のコンテナまで読み、破損した 1 件で一覧全体が `Err` になる
+- D: 記録 pid の生存を `kill(0)`・`pidfd_open` で調べる。PID は再利用されうる（SEC-1）。記録 pid からシグナル先やパスを作らない方針（#2776）に反する
+- E: 観測で得た終了を記録ファイルへも `put` する。読み取りの RPC に fsync が入り、並行する Remove の後に遅れた `put` が所有者の無い記録を作り直す（R5 が put → commit の順序で避けた競合と同じ）。RPC ごとの `put` の件数の計測表も変わる。取り込みは registry のメモリだけにし、再起動後は core を正とする（E3）。#4174 の「記録へ取り込む」はメモリ上の registry の記録を指す
+
+### 出どころ（実行層の欄名）
+
+新しい変換は作らず、既存の `finished_at_for_exit`・`exit_reason`（`crates/cri/src/runtime_service/container.rs`）を使う。書き手は supervisor（`crates/supervisor/src/run.rs` の init の回収で `ExitTime::now()` を取り `stopped_at` を書く）。
+
+| CRI の欄 | `state.json`（`StateDto`） | core（`ContainerStatus`） | cri（`RuntimeContainerStatus`） | 取り込み |
+| -------- | ------------------------- | ------------------------- | ------------------------------- | -------- |
+| state | `status` = `"stopped"` | `ContainerState::Stopped` | `lifecycle` = `RuntimeLifecycle::Stopped` | `ContainerState::Exited` |
+| `finished_at` | `exitedAtNanos` | `exited_at()`（`ExitTime`） | `exited_at_nanos` | `finished_at_for_exit`（下限は `started_at`・`created_at`。欄が無ければ観測を確定した時刻） |
+| `exit_code` | `exitCode` | `exit_code()` | `exit_code` | 記録の `exit_code`（None なら proto は 0） |
+| `reason` | `terminationReason` = `"oomKilled"` | `termination_reason()`（`TerminationReason::OomKilled`） | `termination` | `exit_reason`（`OOMKilled` → 0 は `Completed` → 非 0 は `Error` → None は空） |
+
+値の取り込みは `commit_in_flight` の Stop 分岐と同じ代入を共通の関数に切り出して使い、どちらの経路が先でも値が同じになるようにする。
+
+### ContainerStatus の手順（E1）
+
+1. 空の ID は `INVALID_ARGUMENT`。registry をロックし、未知の ID は `NOT_FOUND`（現行どおり）
+2. 実行層が注入済みで、記録が `Running` かつ `!in_flight` かつ観測中の印が無いときだけ読む。印はメモリのみで v1 の記録形式には書かない（仮称 `exit_observe_pending`）。Created・Exited・Unknown とスタブ経路は読まない（Unknown は Stop・Remove の再試行に委ねる現行の fail-closed を保つ）。読むときは印を立ててロックを放す
+3. registry の `Mutex` を持たずに `RuntimeAdapter::state` を呼ぶ（ロック順序は registry の Mutex ＞ `@lock`。両方を同時に持たない）。`in_flight` は立てない。立てると照会中の StopContainer が `FAILED_PRECONDITION` になり、kubelet の kill が失敗する（#2032 で避けた事象）
+4. 実行は `run_bounded`（tokio の worker を塞がない）。期限は `CONTAINER_EXIT_OBSERVE_TIMEOUT` = 1 秒（暫定。E1 の実測で見直す。根拠: 通常の `get` は数 ms で、`STATE_LOCK_TIMEOUT`（5 秒）より短くして最悪の待ちを約 1 秒に抑える）。`call_with_deadline` は呼び出しスレッドを塞ぐので使わない
+5. `Stopped` のときだけ遷移する。完了時に registry をロックし直し、記録があり `Running` かつ `!in_flight` のときだけ上の表の代入を適用する（比較交換）。すでに Exited なら何もせず、同じ終了を 2 回取り込んでも値は変わらない。`Running`・`NOT_FOUND`・Created・Unknown・エラー・期限切れは変化なしとし、読み取りの RPC で `Unknown` に倒さない。印は worker が完了時に必ず外す。印があるので同じコンテナの読み取りは同時に 1 本までで、切り離したスレッドの数は running の数で抑えられる
+6. 応答は、ロックし直した時点の記録の `to_status`。期限切れや失敗でも記録の値（running）で成功にする
+7. 計測は 1 回ごとに `CriOpRecorder` へ新しい `CriOpKind` の `cri.container_exit_observe` を 1 件（成功は OK、失敗は実行層のコード、期限切れは `DEADLINE_EXCEEDED`）。ID・パス・実行層の文言は載せず、PLEG の頻度で stderr を埋めないよう 1 件ごとの stderr 行は出さない
+
+### ListContainers の手順（E2）
+
+- PLEG は一覧の状態の差で終了を検知するので、List でも読まないと kubelet は自然終了に気づかない
+- 順序: フィルタを検証する → ロック下で候補を選ぶ → ロックを放す → 1 本の切り離した worker が候補を順に読む → ロックし直して上の比較交換で取り込む → 状態を含むフィルタを評価する → 要約する → ソートする
+- 候補は ContainerStatus と同じ条件で、状態以外のフィルタ（id・`pod_sandbox_id`・`label_selector`）に合うものだけ。状態のフィルタが `CONTAINER_CREATED`・`CONTAINER_UNKNOWN` のときは読まない。並びは最後に観測した時刻（メモリのみ）が古い順、次に `(created_at, id)`
+- 上限（暫定。E2 の実測で見直す）: `LIST_EXIT_OBSERVE_MAX` = 64 件、全体 `LIST_EXIT_OBSERVE_BUDGET` = 1 秒、1 件ごとは `min(1 秒, 全体の残り)`。予算が尽きたら残りの印を外して終える。先行する List の worker が残っていればその List では読まない。根拠: `@lock` の間隔 2ms × 64 で約 128ms 以上。maxPods が 110 程度なら数回の relist で running すべてに届く
+- 読めなかった候補は記録の値のまま返り、他のコンテナに影響しない。上限か予算で読まなかった候補があれば、`cri.container_exit_observe` に `RESOURCE_EXHAUSTED` を 1 件だけ記録する（ID は載せない）
+
+### supervisor が居ない場合（両案に共通の残余）
+
+孤児になった後や supervisor の異常終了の後は `state.json` を `Stopped` に書く主体が居ない。PID 1 が終わっても `running` のままで、A でも B（`NoSupervisor`）でも観測できない。記録 pid を調べる案（D）は採らない。記録の値（running）を返し、回復は re-adopt（#513・#514、SUP-8）と `docs/design/exec-without-supervisor.md` の判断に委ねる。
+
+### 再採用との関係（E3）
+
+- A は購読を持たないので再採用の後に張り直すものは無く、再採用した Running の記録は次の照会で同じ経路により観測される
+- 決定: 再採用で、記録が Exited でなく core が Present で Stopped のとき、上の表の代入で core の `exitCode`・`terminationReason`・`exitedAtNanos` を使う。記録がすでに Exited なら記録の値のまま。Absent の規則（記録の値で、core の値で上書きしない）は変えない
+- 型の変更: `CorePresence::Present` に `RuntimeContainerStatus`（または終了の 3 欄）を運ばせる。`probe_core_presence` を共有する R8 の `release_stale_creates` と孤児 bundle の回収は lifecycle だけを見るので挙動は変わらない
+- 案 E で記録ファイルへ書かないので、E3 は自然終了の値を再起動後に失わないために必須である。R7 の残余 (3) はこの決定で改める
+
+### kubelet の一次情報
+
+kubernetes v1.37.1（commit `d2b770f4c94636a992534a8d3156b6b2d8e82ac3`）で確認した。
+
+- `pkg/kubelet/kubelet.go` の `genericPlegRelistPeriod` は 1 秒
+- `pkg/kubelet/pleg/generic.go` の `relist` は `g.runtime.GetPods(ctx, true)` を呼ぶ
+- `pkg/kubelet/kuberuntime/kuberuntime_container.go` の `getKubeletContainers` 経由で `runtimeService.ListContainers` を呼ぶ
+- `pkg/kubelet/kuberuntime/kuberuntime_manager.go` の `GetPodStatus` 経由で `ContainerStatus` を呼ぶ
+- `pkg/kubelet/apis/config/v1beta1/defaults.go` の `RuntimeRequestTimeout` の既定は 2 分
+
+### 実装単位
+
+| 記号 | issue | 内容 | 依存 |
+| ---- | ----- | ---- | ---- |
+| E1 | #4174 | `ContainerStatus` の観測。取り込みの共通関数の切り出し、`CriOpKind` の追加、`runtime_service.rs` のモジュール doc の「読み取り専用」の更新 | #4173 |
+| E2 | #4175 | `ListContainers` の観測。`crates/plugin-cri/tests/cri_attach_real.rs` の「終了コードは StopContainer の後に読む」前提の記述の更新（照合は弱めない） | E1 |
+| E3 | 未起票 | 再採用で core の終了の値を使う（`CorePresence` の型変更・照合表の更新・試験）。追跡 issue の起票は main が行う | E1 |
+
+固定する試験の観点:
+
+- E1: 偽の実行層で終了コード 3 → `CONTAINER_EXITED`・3・`finished_at` が非 0・`Error`。失敗・期限切れのときは running を返し recorder に失敗 1 件。印による重複読み取りの抑止。観測中の Stop・Remove との競合と 2 回の取り込みで値が不変
+- E2: EXITED と RUNNING のフィルタでの件数。64 を超える候補で実行層の呼び出しが 64 回以下。一部の失敗が他に影響しない
+- E3: 記録が Running で core が Stopped（終了コード 7）→ exited・7・その時刻。記録が Exited で core が Stopped → 記録の値のまま
+
+### 残余と再評価の条件
+
+- 暫定値（1 秒・64 件・1 秒）は E1・E2 の実測で見直す
+- 案 B の再評価: A の実測で List の所要や `@lock` の競合が問題になったとき、または `GetContainerEvents`（Evented PLEG。現状 `UNIMPLEMENTED`）を実装するとき
+- 観測のログに ID を載せず、記録 pid を調べない（下の「セキュリティ上の要点」）
+
 ## セキュリティ上の要点
 
 - 記録のパスは状態ルート配下の固定位置とサービス採番の ID だけから作り、記録内のパス文字列を信頼しない
@@ -266,3 +367,4 @@ CORE-10 への当てはめ（CORE-10 の目標 0.136 秒、Linux の Docker 0.29
 - 記録は再起動時に untrusted として厳密に復号し、`config_limits` を再適用する
 - 再採用した保持役の pid から namespace のパスを作らず、シグナルも送らない（#2776）
 - `envs` を記録に書かない。エラー文言・ログに ID・パス・config の値を載せない（REPAIR-4）
+- 自然終了の取り込み（#4173）の観測のログ（`cri.container_exit_observe`）に ID・パス・実行層の文言を載せない。記録 pid の生存を調べず、シグナルも送らない

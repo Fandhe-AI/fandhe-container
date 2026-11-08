@@ -85,4 +85,3 @@ publish = false
 # workspace の lint 設定を継承する（ルート Cargo.toml の [workspace.lints]。#1138）。
 [lints]
 workspace = true
-# #4231 で dispatch_exit と hvf::mmio の振り分けを試験できる継ぎ目に分け、queue_stopped の経路の試験を追加（依存は増やさない。unsafe なし）。

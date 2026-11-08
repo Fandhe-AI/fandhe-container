@@ -7,7 +7,7 @@
 //!
 //! # 範囲外（REPAIR-3）
 //! hugepage の opt-in は持たない（THP を使うかはホストの方針しだい。判断は docs/design/microvm-memory-ownership.md の #4159 の節）。
-//! memslot のフラグ（`KVM_MEM_READONLY`・`KVM_MEM_LOG_DIRTY_PAGES`）の型は #4157、登録への結線は #4158 で、このモジュールは扱わない。
+//! memslot のフラグは `GuestRam::register_with_flags`（`crate::microvm`。Linux）で指定できる（#4158）。
 //!
 //! # 複数領域（#3697・MVM-1）
 //! 領域は昇順・非重複で最大 [`MAX_GUEST_MEMORY_REGIONS`] 個（`from_regions`）。MMIO hole の前後など、領域の間の隙間（hole）と、

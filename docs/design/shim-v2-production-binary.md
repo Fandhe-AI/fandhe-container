@@ -87,10 +87,23 @@ A の共通モジュールの候補は `crates/plugin-cri/src/exec_helper.rs`（
 | メソッド | 対応 |
 | -------- | ---- |
 | `pid()` | `None`。helper がコマンドの pid を返さないため State の pid は 0。返すには `Started` の拡張が要り後続候補 |
-| `status()` | `Result` を受けるまで `Running`。`Exited(n)` / `Signaled(s)` / `NotStarted` は `map_outcome` の写像で `Exited { code }`。`Started` 後の `Failed(code)`（期限切れ・到達不能）は `Exited { code: None }`（State は 255）。exec 子 cgroup の回収でプロセスは既に無く、fail-closed の観点で「実行中」とは報告しない |
+| `status()` | `Result` を受けるまで `Running`。`Exited(n)` / `Signaled(s)` / `NotStarted` は `map_outcome` の写像で `Exited { code }`。`Started` 後の `Failed(code)` は消滅の証明にならないため一律には `Exited` にしない。消滅を確認できた種別だけ `Exited { code: None }`（State は 255）にし、確認できない種別はエラーとして保持する（下表） |
 | `signal(sig)` | SIGKILL のときだけ受け、`HelperGuard::kill` で helper を SIGKILL する。helper の制御チャネルが閉じると supervisor の `exec_guard` が通知済みの exec 子 cgroup を `cgroup.kill` で回収する。届くのは exec 子 cgroup だけで init には届かない。SIGKILL 以外は `UNIMPLEMENTED`（"exec signal is not supported"）で拒否し、黙って SIGKILL へ読み替えない（REPAIR-3）。終了済みは `NOT_FOUND` |
 | `wait_exit` | 監視スレッドの結果を `Mutex` + `Condvar` で受けるイベント駆動。取り消しは 10 ms 以下の刻みで確認し、期限で `Timeout`、取り消しで `Unavailable`（REPAIR-5） |
 | drop | 契約どおり停止は要求しない。helper の持ち主は launcher の追跡一覧に残り、shim の停止時に全 helper を kill する（配線は #4149） |
+
+`Started` 後の `Failed(code)` の扱い（fail-closed。`TaskExecProcess::status` の「照会失敗は `Err`」の契約に合わせる）:
+
+| 種別 | プロセスの消滅 | `status()` |
+| ---- | -------------- | ---------- |
+| 期限切れで exec 子 cgroup を `cgroup.kill` し、回収を確認できた | 確認できる | `Exited { code: None }` |
+| supervisor へ到達できず、`ExecGuardPool` の回収が `ReclaimOutcome` の成功だった | 確認できる | `Exited { code: None }` |
+| exec 子 cgroup の cleanup 失敗（supervisor の `exec.rs` がエラーとして返し helper が `Failed` に変換したもの） | 確認できない | `Err`（エラーを保持） |
+| `ExecGuardPool` の切断後の回収が `ReclaimOutcome::Failed` | 確認できない | `Err`（エラーを保持） |
+| 上記のどちらか判別できない `Failed` | 確認できない | `Err`（エラーを保持） |
+
+- 消滅を確認できない失敗は `Exited` に変換しない。保持したエラーにより Wait は失敗し、Delete による登録除去も拒否する（生存プロセスが残ったまま終了済みとして除去できてしまうのを防ぐ）。再照会で消滅が確認できたときだけ `Exited` へ遷移し、除去を許す
+- 判別の根拠を持たない間は安全側（確認できない）に倒す。helper の `Failed` が回収の成否を区別して運ぶ拡張は #4149 以降の実装で確かめる（未検証）
 
 - `exec_id` とプロセスの対応は cri の `ExecRegistry` だけが持つ。launcher は上限と停止のための helper の追跡だけを持ち、exec_id の表は持たない（二重管理をしない）。永続化せず、shim の再起動で exec の記録は失われる
 - 残余: shim が SIGKILL された場合、helper は exec の期限（最長 1 時間）まで残る。PDEATHSIG を使わない設計で #3761 と同じ

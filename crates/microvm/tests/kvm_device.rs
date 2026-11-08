@@ -485,6 +485,39 @@ fn kvm_device_block_queue_interrupt() {
     );
 }
 
+/// MVM-1・#4157: 公開 API `VmFd::check_memslot_flags` が本番の `KVM_CHECK_EXTENSION`（VM fd）を通して判定する。
+/// `NONE`・`LOG_DIRTY_PAGES` は照会なしで常に受理され、`READONLY` は `KVM_CAP_READONLY_MEM` の答えと一致する
+/// （非対応なら `FailedPrecondition`。x86_64 の KVM は対応するため受理を要求する）。未知のビットは型で作れない。
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_check_memslot_flags() {
+    use fandhe_container_microvm::memslot_flags::MemslotFlags;
+
+    let dev = open_kvm();
+    let vm = dev.create_vm().unwrap();
+    vm.check_memslot_flags(MemslotFlags::NONE).unwrap();
+    vm.check_memslot_flags(MemslotFlags::LOG_DIRTY_PAGES)
+        .unwrap();
+    let ro = vm.check_memslot_flags(MemslotFlags::READONLY);
+    let both = vm.check_memslot_flags(MemslotFlags::READONLY.union(MemslotFlags::LOG_DIRTY_PAGES));
+    match ro {
+        Ok(()) => assert!(
+            both.is_ok(),
+            "READONLY accepted but READONLY|LOG_DIRTY rejected"
+        ),
+        Err(e) => {
+            assert_eq!(e.code(), MicrovmErrorCode::FailedPrecondition);
+            assert_eq!(
+                both.unwrap_err().code(),
+                MicrovmErrorCode::FailedPrecondition
+            );
+            #[cfg(target_arch = "x86_64")]
+            panic!("x86_64 KVM must support KVM_CAP_READONLY_MEM: {e:?}");
+        }
+    }
+    assert!(MemslotFlags::try_from_raw(1 << 2).is_err());
+}
+
 /// MVM-1・TASK-75.1: mmap したゲスト RAM を memslot に登録でき、読み書きが往復し、範囲の重なる登録は拒否される。
 #[test]
 #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]

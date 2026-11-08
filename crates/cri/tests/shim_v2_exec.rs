@@ -483,3 +483,180 @@ fn cri5_3681_wait_exec_timeout_nano_over_uds() {
     drop(s);
     drop(handle);
 }
+/// 状態を外から差し替え・削除できる偽ランタイム。`None` の ID は state が NOT_FOUND になる。
+struct Mutable(Arc<Mutex<std::collections::HashMap<String, Option<ContainerStatus>>>>);
+
+impl ContainerRuntime for Mutable {
+    fn create(&self, r: &CreateRequest) -> Result<ContainerStatus, TraitError> {
+        let st = ContainerStatus::created(r.id().clone(), None);
+        self.0
+            .lock()
+            .unwrap()
+            .insert(r.id().as_str().to_owned(), Some(st.clone()));
+        Ok(st)
+    }
+    fn start(&self, r: &RtStart) -> Result<ContainerStatus, TraitError> {
+        let st = ContainerStatus::running(r.id().clone(), NonZeroU32::new(777));
+        self.0
+            .lock()
+            .unwrap()
+            .insert(r.id().as_str().to_owned(), Some(st.clone()));
+        Ok(st)
+    }
+    fn kill(&self, _: &KillRequest) -> Result<ContainerStatus, TraitError> {
+        Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+    }
+    fn stop(&self, _: &StopRequest) -> Result<ContainerStatus, TraitError> {
+        Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+    }
+    fn delete(&self, r: &DeleteRequest) -> Result<DeleteResponse, TraitError> {
+        self.0.lock().unwrap().remove(r.id().as_str());
+        Ok(DeleteResponse::new())
+    }
+    fn state(&self, r: &StateRequest) -> Result<ContainerStatus, TraitError> {
+        match self.0.lock().unwrap().get(r.id().as_str()) {
+            Some(Some(st)) => Ok(st.clone()),
+            _ => Err(TraitError::new(ErrorCode::NotFound, "gone")),
+        }
+    }
+}
+
+/// CRI-5・CRI-1・REPAIR-12・#4058: 実行層から外で消えたコンテナの exec 登録は NOT_FOUND の照会で回収され、
+/// v2 と v3 が登録簿を共有し、どちらの Delete でも両方から消える（UDS 越し）。
+#[test]
+fn cri5_4058_exec_registry_reclaim_and_v2_v3_share_over_uds() {
+    let root = test_root::test_root("ttrpc", "exec-reclaim");
+    let path = root.join("s.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let launcher = Launcher::new();
+    let table = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let v2 = TaskService::new(
+        TaskApiVersion::V2,
+        RuntimeAdapter::from_runtime(Mutable(table.clone())),
+    )
+    .with_exec_launcher(launcher.clone());
+    let v3 = TaskService::new(
+        TaskApiVersion::V3,
+        RuntimeAdapter::from_runtime(Mutable(table.clone())),
+    )
+    .with_exec_launcher(launcher.clone())
+    .with_shared_created(&v2);
+    let mut reg = ServiceRegistry::new();
+    reg.register(Arc::new(v2)).unwrap();
+    reg.register(Arc::new(v3)).unwrap();
+    let handle = TtrpcServer::new(reg, ServerConfig::default())
+        .serve(listener)
+        .unwrap();
+    let mut s = UnixStream::connect(&path).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let (v2n, v3n) = ("containerd.task.v2.Task", "containerd.task.v3.Task");
+    let mut sid = 1u32;
+    let mut next = || {
+        let v = sid;
+        sid += 2;
+        v
+    };
+    let create = || {
+        CreateTaskRequest {
+            id: "c1".into(),
+            bundle: "/run/bundle".into(),
+            ..Default::default()
+        }
+        .encode_to_vec()
+    };
+    let start = || {
+        StartRequest {
+            id: "c1".into(),
+            exec_id: String::new(),
+        }
+        .encode_to_vec()
+    };
+    let state_e1 = || {
+        WireState {
+            id: "c1".into(),
+            exec_id: "e1".into(),
+        }
+        .encode_to_vec()
+    };
+    let spec = r#"{"cwd":"/","args":["a"]}"#;
+
+    assert!(
+        call_svc(&mut s, next(), v2n, "Create", create())
+            .status
+            .is_none()
+    );
+    assert!(
+        call_svc(&mut s, next(), v2n, "Start", start())
+            .status
+            .is_none()
+    );
+    assert!(
+        call_svc(&mut s, next(), v2n, "Exec", exec_req(spec))
+            .status
+            .is_none()
+    );
+
+    // v2 で登録した exec が v3 から見える（TaskStatus::CREATED = 1）。
+    let r = call_svc(&mut s, next(), v3n, "State", state_e1());
+    assert!(r.status.is_none());
+    assert_eq!(StateResponse::decode(&r.payload[..]).unwrap().status, 1);
+    // 同じ exec_id の再登録は ALREADY_EXISTS（6）。
+    let r = call_svc(&mut s, next(), v3n, "Exec", exec_req(spec));
+    assert_eq!(r.status.unwrap().code, 6);
+
+    // 実行層から外で消す。照会は NOT_FOUND（5）で、登録も回収される。
+    table.lock().unwrap().insert("c1".into(), None);
+    // v3 の Delete が NOT_FOUND を観測して登録を除去する。
+    let del_gone = WireDelete {
+        id: "c1".into(),
+        exec_id: String::new(),
+    }
+    .encode_to_vec();
+    let r = call_svc(&mut s, next(), v3n, "Delete", del_gone);
+    assert_eq!(r.status.unwrap().code, 5);
+    // v3 で回収された登録は v2 からも消えている。
+    let r = call_svc(&mut s, next(), v2n, "State", state_e1());
+    assert_eq!(r.status.unwrap().code, 5);
+    // 作り直すと、同じ exec_id を再び登録できる（回収済みの証拠）。
+    assert!(
+        call_svc(&mut s, next(), v2n, "Create", create())
+            .status
+            .is_none()
+    );
+    assert!(
+        call_svc(&mut s, next(), v2n, "Start", start())
+            .status
+            .is_none()
+    );
+    let r = call_svc(&mut s, next(), v2n, "State", state_e1());
+    assert_eq!(r.status.unwrap().code, 5);
+    assert!(
+        call_svc(&mut s, next(), v2n, "Exec", exec_req(spec))
+            .status
+            .is_none()
+    );
+
+    // 停止させ、v3 の Delete で v2 側からも exec が消える。
+    table.lock().unwrap().insert(
+        "c1".into(),
+        Some(ContainerStatus::stopped(
+            ContainerId::new("c1").unwrap(),
+            Some(0),
+        )),
+    );
+    let del = WireDelete {
+        id: "c1".into(),
+        exec_id: String::new(),
+    }
+    .encode_to_vec();
+    assert!(
+        call_svc(&mut s, next(), v3n, "Delete", del)
+            .status
+            .is_none()
+    );
+    let r = call_svc(&mut s, next(), v2n, "State", state_e1());
+    assert_eq!(r.status.unwrap().code, 5);
+
+    drop(s);
+    drop(handle);
+}

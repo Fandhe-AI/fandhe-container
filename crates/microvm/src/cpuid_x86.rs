@@ -10,11 +10,13 @@
 //!   自分の LAPIC を見失う）。書き換えるのは leaf 1 の EBX\[31:24\] と、leaf 0xB・0x1F の全 subleaf の EDX（x2APIC ID）だけ。
 //! - leaf 1 の ECX bit 31（hypervisor present）を立てる。ゲストが仮想化環境と判断して paravirt を使えるようにする。
 //!   ホストの機能は新たに露出しない（機能ビットは KVM の supported の範囲を超えない）。
-//! - 上記以外の leaf は触らない。
+//! - 上記以外の leaf は触らない。leaf 0x8000_0008（物理アドレス幅）も書き換えず、[`CpuidTable::physical_address_bits`] で
+//!   ゲストが見る幅を読み、登録する最上位 GPA の照合に使う（#4106・MVM-1。照合は `microvm::check_physical_address_width`）。
 //!
 //! # 範囲外（REPAIR-3）
 //! トポロジーの leaf（leaf 4 EAX\[31:26\]・leaf 1 EBX\[23:16\]・leaf 0xB の EAX / EBX / ECX の段数・0x8000_001E）の整合、
 //! KVM 署名の leaf 0x4000_000x（KVM が返した値のまま渡す）、機能ビットの絞り込みは未実装。
+//! leaf 0x8000_0008 は EAX\[7:0\] だけを参照する。EAX\[23:16\]（AMD の GuestPhysAddrSize）は未考慮（#4106）。
 //!
 //! 一次情報は Intel SDM の CPUID の章と、カーネルの `Documentation/virt/kvm/api.rst`
 //! （`KVM_GET_SUPPORTED_CPUID`・`KVM_SET_CPUID2`）。rust-vmm・Firecracker のコードは参照しない（MVM-4）。
@@ -29,6 +31,10 @@ const LEAF_VENDOR: u32 = 0;
 const LEAF_FEATURES: u32 = 1;
 const LEAF_TOPOLOGY_V1: u32 = 0xB;
 const LEAF_TOPOLOGY_V2: u32 = 0x1F;
+/// leaf 0x8000_0008（アドレス幅。EAX\[7:0\] が MAXPHYADDR）。
+const LEAF_ADDR_SIZES: u32 = 0x8000_0008;
+/// 物理アドレス幅として受け入れる上限（x86-64 のアーキテクチャ上限 52 bit）。超える値は壊れた入力として拒否する。
+const MAX_PHYS_ADDR_BITS: u8 = 52;
 /// leaf 1 ECX bit 31（hypervisor present）。
 const HYPERVISOR_BIT: u32 = 1 << 31;
 
@@ -92,6 +98,23 @@ impl CpuidTable {
         Some([
             b[0], b[1], b[2], b[3], d[0], d[1], d[2], d[3], c[0], c[1], c[2], c[3],
         ])
+    }
+
+    /// ゲストが見る物理アドレス幅（leaf 0x8000_0008・subleaf 0 の EAX\[7:0\]。ビット数）を返す。#4106・MVM-1。
+    ///
+    /// leaf が無い・値が 0・`MAX_PHYS_ADDR_BITS`（52）超は `FailedPrecondition`（fail-closed）。SDM の「leaf が無ければ
+    /// 36 bit とみなす」フォールバックは使わない。`microvm::MicroVm::assemble` が VM 資源を作る前に最上位 GPA と照合する。
+    pub fn physical_address_bits(&self) -> Result<u8, MicrovmError> {
+        let bits = self
+            .get(LEAF_ADDR_SIZES, 0)
+            .map(|e| (e.eax & 0xFF) as u8)
+            .filter(|b| (1..=MAX_PHYS_ADDR_BITS).contains(b));
+        bits.ok_or_else(|| {
+            MicrovmError::new(
+                MicrovmErrorCode::FailedPrecondition,
+                "CPUID physical address width is missing or out of range",
+            )
+        })
     }
 
     /// vCPU `apic_id` 用に調整した複製を返す（方針はモジュール doc）。
@@ -198,6 +221,51 @@ mod tests {
         for f in [0u32, 7, 0x4000_0000] {
             assert_eq!(t.get(f, 0), base.get(f, 0));
         }
+    }
+
+    fn with_addr_sizes(eax: u32) -> CpuidTable {
+        let mut v = sample().entries().to_vec();
+        v.push(e(0x8000_0008, 0, eax, 0, 0, 0));
+        CpuidTable::new(v).unwrap()
+    }
+
+    /// MVM-1・#4106: EAX[7:0] だけを読む（上位ビットは無視）。
+    #[test]
+    fn mvm1_4106_physical_address_bits_values() {
+        assert_eq!(with_addr_sizes(39).physical_address_bits().unwrap(), 39);
+        assert_eq!(with_addr_sizes(34).physical_address_bits().unwrap(), 34);
+        assert_eq!(with_addr_sizes(52).physical_address_bits().unwrap(), 52);
+        assert_eq!(
+            with_addr_sizes(0x0030_2E2F)
+                .physical_address_bits()
+                .unwrap(),
+            0x2F
+        );
+    }
+
+    /// MVM-1・#4106: leaf 欠如・0・53 以上は fail-closed。
+    #[test]
+    fn mvm1_4106_physical_address_bits_rejects_bad_values() {
+        for t in [
+            sample(),
+            with_addr_sizes(0),
+            with_addr_sizes(53),
+            with_addr_sizes(255),
+        ] {
+            assert_eq!(
+                t.physical_address_bits().unwrap_err().code(),
+                MicrovmErrorCode::FailedPrecondition
+            );
+        }
+    }
+
+    /// MVM-1・#4106: `for_vcpu` は leaf 0x8000_0008 を書き換えない（ベースの表の照合がゲストの見る値と一致する根拠）。
+    #[test]
+    fn mvm1_4106_for_vcpu_keeps_address_width_leaf() {
+        let base = with_addr_sizes(39);
+        let t = base.for_vcpu(3).unwrap();
+        assert_eq!(t.get(0x8000_0008, 0), base.get(0x8000_0008, 0));
+        assert_eq!(t.physical_address_bits().unwrap(), 39);
     }
 
     #[test]

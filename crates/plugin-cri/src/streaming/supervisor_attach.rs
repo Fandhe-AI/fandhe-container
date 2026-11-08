@@ -15,8 +15,8 @@
 //! 4. 入力は専用 std スレッドと socketpair で橋渡しする（`AsyncFd` を使わない理由: `O_NONBLOCK` は open file description 単位で、
 //!    dup した fd に立てると supervisor 側の同じ記述にも効き、pty master を blocking で読む捕捉のリーダーが `EAGAIN` で壊れる）。
 //!    pty master は書き込みと `TIOCSWINSZ` 専用で読まない（読むと捕捉から出力を奪う。出力は必ず tap から受ける）
-//! 5. tap は std の `UnixStream` を非ブロッキングにして tokio へ載せる（supervisor の書き手とは別の記述）。EOF かエラーで
-//!    `exited` の合図を立てる
+//! 5. tap は std の `UnixStream` を非ブロッキングにして tokio へ載せる（supervisor の書き手とは別の記述）。EOF かエラーは
+//!    そのストリームの終端で、開いている tap がすべて終端したときだけ `exited` の合図を立てる（片側だけの EOF で終えない）
 //! 6. `exited` は tap の EOF と専用スレッドの kind 8（`ExitNotifier`）の購読から作る。`Transient`（ExitWatch の枠が満杯）や
 //!    `NoSupervisor` のときは状態ストアの照会（1 秒刻み）へ退避する。D6 の「ポーリングはしない」は主経路の話で、この照会は退避経路
 //!
@@ -30,7 +30,7 @@
 //!   RPC 時に断られる。stdin・tty・resize の経路は偽の `AttachIoSource` を使う単体試験からしか届かない。`read_only` の解除・
 //!   bundle の `tty/stdin` 拒否の解除・RPC 時の整合検査は #4078（C10）、実機の通し確認は #4079（C11）
 //! - `AttachSession.stdin` の「バッファしない」に対し、socketpair のバッファ分だけ先行する（`exec_launcher` と同じ逸脱）
-//! - コンテナが stdin を読まず pipe / pty が満杯でも、入力スレッドは `poll(POLLOUT)` を 10 ms 刻みで待つだけで、セッションの
+//! - コンテナが stdin を読まず pipe / pty が満杯でも、入力スレッドは待たない `poll(POLLOUT)` と書き込みを全書き手共通の排他の中で行い、10 ms 刻みで再確認するだけで、セッションの
 //!   drop（取り消し）で抜ける（`write` で無期限に止まらない）。書き込みは詰まらない大きさに絞る（fifo は 512 バイト、
 //!   pty・socket は 1 バイト）ため、大きな貼り付けは遅い。生きたセッションが読まれない stdin を待ち続ける間は枠を占有する
 //! - `stdin_once` のとき `obtain` が戻った後に future が drop されると、`AttachIo` の drop で唯一の書き込み端が閉じ、コンテナは
@@ -160,11 +160,27 @@ impl Future for ExitedFuture {
     }
 }
 
-/// tap の読み口。EOF かエラーで `exited` の合図を立てる（D2）。
+/// tap の読み口。EOF かエラーはこのストリームの終端として数え、開いている tap が 0 になったときだけ `exited` の合図を
+/// 立てる（D2。stdout だけ閉じても残りの stderr を切らない。コンテナの終了は監視側の購読でも確かめる）。
 struct TapReader {
     inner: tokio::net::UnixStream,
     signal: ExitSignal,
+    /// 開いている tap の数（全 `TapReader` で共有）。
+    open_taps: Arc<AtomicUsize>,
+    /// この tap の終端を数え済みか。
+    ended: bool,
     _life: Arc<SessionLife>,
+}
+
+impl TapReader {
+    fn end(&mut self) {
+        if !self.ended {
+            self.ended = true;
+            if self.open_taps.fetch_sub(1, Ordering::SeqCst) == 1 {
+                self.signal.fire();
+            }
+        }
+    }
 }
 
 impl AsyncRead for TapReader {
@@ -178,8 +194,8 @@ impl AsyncRead for TapReader {
         let had_room = buf.remaining() > 0;
         let polled = Pin::new(&mut this.inner).poll_read(cx, buf);
         match &polled {
-            Poll::Ready(Ok(())) if had_room && buf.filled().len() == before => this.signal.fire(),
-            Poll::Ready(Err(_)) => this.signal.fire(),
+            Poll::Ready(Ok(())) if had_room && buf.filled().len() == before => this.end(),
+            Poll::Ready(Err(_)) => this.end(),
             _ => {}
         }
         polled
@@ -383,10 +399,20 @@ fn watch_exit(
     }
 }
 
-/// `file` へ全部書く（REPAIR-5）。書く前に毎回 `poll(POLLOUT)` を 10 ms 刻みで待ち、取り消しを見る。
-/// 記述のフラグ（`O_NONBLOCK`）は変えない（supervisor 側と共有の open file description のため）。
-/// 書ける合図の後だけ blocking の `write` を呼ぶので、コンテナが読まず pipe / pty が満杯でも、
-/// セッションの drop（取り消し）で抜けてスレッド・fd・枠を返せる。1 回の書き込みは、満杯でも詰まらない大きさに
+/// 全 attach 入力スレッドの書き込みを調停する排他（REPAIR-5・CRI-6・#4077）。
+///
+/// 同じコンテナへの複数 attach は同じ open file description（stdin の pipe・pty master）へ並行して書く。
+/// `poll(POLLOUT)` の Ready から `write` までの間に別セッションが空きを使い切ると、blocking の `write` が無期限に
+/// 止まり、取り消しも見えなくなる。そこで「待たない poll → 書き込み」を 1 つの排他の中で行い、
+/// この plugin 内の書き手同士では空きを奪い合わない。保持中に待つ処理はない（poll は待たず、書き込みは空きが確かめられた
+/// 大きさに絞る）ので、排他の保持は有限で短い。待ちと取り消しの確認は排他の外で行う。
+/// 残余: plugin 外の書き手（supervisor 自身など）が同じ記述へ書く場合は調停できない。
+static WRITE_ARBITER: Mutex<()> = Mutex::new(());
+
+/// `file` へ全部書く（REPAIR-5）。書く前に毎回 `poll(POLLOUT)` を待たずに確かめ、書けなければ排他の外で
+/// 10 ms 待って取り消しを見る。記述のフラグ（`O_NONBLOCK`）は変えない（supervisor 側と共有の open file description
+/// のため）。書ける確認から書き込みまでは [`WRITE_ARBITER`] で調停するので、コンテナが読まず pipe / pty が満杯でも、
+/// セッションの drop（取り消し）で抜けてスレッド・fd・枠を返せる。1 回の書き込みは、確認した空きに収まる大きさに
 /// 絞る（`slice`: fifo は `PIPE_BUF` 以下、pty・socket は 1 バイト）。
 fn write_all_retry(file: &mut File, mut data: &[u8], slice: usize, cancel: &AtomicBool) -> bool {
     use crate::sys::{WritePoll, poll_writable};
@@ -395,18 +421,28 @@ fn write_all_retry(file: &mut File, mut data: &[u8], slice: usize, cancel: &Atom
         if cancel.load(Ordering::SeqCst) {
             return false;
         }
-        match poll_writable(file.as_fd(), 10) {
-            Ok(WritePoll::Ready) => {}
-            Ok(WritePoll::NotReady) => continue,
-            Ok(WritePoll::Closed) | Err(_) => return false,
+        {
+            let _turn = WRITE_ARBITER.lock().unwrap_or_else(PoisonError::into_inner);
+            match poll_writable(file.as_fd(), 0) {
+                Ok(WritePoll::Ready) => {
+                    let part = data.get(..slice.min(data.len())).unwrap_or_default();
+                    match file.write(part) {
+                        Ok(0) => return false,
+                        Ok(n) => {
+                            data = data.get(n..).unwrap_or_default();
+                            continue;
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(_) => return false,
+                    }
+                }
+                Ok(WritePoll::NotReady) => {}
+                Ok(WritePoll::Closed) | Err(_) => return false,
+            }
         }
-        let part = data.get(..slice.min(data.len())).unwrap_or_default();
-        match file.write(part) {
-            Ok(0) => return false,
-            Ok(n) => data = data.get(n..).unwrap_or_default(),
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(_) => return false,
+        if sleep_cancellable(TICK, cancel) {
+            return false;
         }
     }
     true
@@ -598,10 +634,15 @@ impl AttachBackend for SupervisorAttachBackend {
                     }))
                 }
             };
+            let open_taps = Arc::new(AtomicUsize::new(
+                usize::from(stdout.is_some()) + usize::from(stderr.is_some()),
+            ));
             let tap = |s: StdUnixStream| -> Result<Box<dyn AsyncRead + Send + Unpin>, CriError> {
                 Ok(Box::new(TapReader {
                     inner: to_tokio(s)?,
                     signal: signal.clone(),
+                    open_taps: Arc::clone(&open_taps),
+                    ended: false,
                     _life: Arc::clone(&life),
                 }))
             };

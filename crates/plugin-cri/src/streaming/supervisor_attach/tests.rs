@@ -599,6 +599,91 @@ async fn cri6_repair5_4077_stalled_stdin_write_is_reclaimed_on_drop() {
     drop(r);
 }
 
+/// stdout だけが閉じても `exited` は完了せず、残りの stderr も読める。両方閉じて初めて完了する（CRI-6・#4077）。
+#[tokio::test]
+async fn cri6_4077_one_sided_tap_eof_does_not_complete_exited() {
+    let fx = Fixture::new("onesided");
+    let (out_ours, out_theirs) = sock_pair();
+    let (err_ours, mut err_theirs) = sock_pair();
+    let taps = Mutex::new(Some((out_ours, err_ours)));
+    let source = FakeSource::new(Box::new(move |_| {
+        let (o, e) = taps.lock().expect("lock").take().expect("once");
+        Ok(AttachIo {
+            input: None,
+            stdout: Some(o),
+            stderr: Some(e),
+        })
+    }));
+    let b = fx.backend(source, idle_notifier(Arc::new(AtomicBool::new(false))));
+    let mut session = within(b.attach(target(false, true, true, false)))
+        .await
+        .expect("attach");
+    let mut stdout = session.stdout.take().expect("stdout");
+    let mut stderr = session.stderr.take().expect("stderr");
+    drop(out_theirs);
+    assert!(within(read_some(&mut *stdout)).await.is_empty());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), &mut session.exited)
+            .await
+            .is_err(),
+        "exited completed on a one-sided EOF"
+    );
+    std::io::Write::write_all(&mut err_theirs, b"late-err").expect("write");
+    assert_eq!(within(read_some(&mut *stderr)).await, b"late-err");
+    drop(err_theirs);
+    assert!(within(read_some(&mut *stderr)).await.is_empty());
+    within(&mut session.exited).await;
+}
+
+/// 同じ pipe へ並行する複数セッションの書き込みが、調停の下でバイトを失わず完了する（REPAIR-5）。
+#[tokio::test]
+async fn cri6_repair5_4077_concurrent_writers_to_one_pipe_all_complete() {
+    let fx = Fixture::new("arbiter");
+    let (mut r, w) = std::io::pipe().expect("pipe");
+    let w = Arc::new(Mutex::new(w));
+    let source = FakeSource::new(Box::new(move |_| {
+        let dup = w.lock().expect("lock").try_clone().expect("dup");
+        Ok(AttachIo {
+            input: Some(AttachInput::Pipe(OwnedFd::from(dup))),
+            stdout: Some(sock_pair().0),
+            stderr: None,
+        })
+    }));
+    let b = fx.backend(source, idle_notifier(Arc::new(AtomicBool::new(false))));
+    let mut sessions = Vec::new();
+    for _ in 0..3 {
+        sessions.push(
+            within(b.attach(target(true, true, false, false)))
+                .await
+                .expect("attach"),
+        );
+    }
+    let total = 3 * 20_000;
+    let reader = tokio::task::spawn_blocking(move || {
+        let mut got = 0usize;
+        let mut buf = [0u8; 8192];
+        while got < total {
+            let n = r.read(&mut buf).expect("read");
+            assert!(n > 0, "unexpected EOF");
+            got += n;
+        }
+        got
+    });
+    let mut joins = Vec::new();
+    for s in &mut sessions {
+        let mut stdin = s.stdin.take().expect("stdin");
+        joins.push(tokio::spawn(async move {
+            let data = vec![b'y'; 20_000];
+            write_all(&mut *stdin, &data).await;
+            stdin
+        }));
+    }
+    for j in joins {
+        within(j).await.expect("join");
+    }
+    assert_eq!(within(reader).await.expect("join"), total);
+}
+
 #[tokio::test]
 async fn cri6_4077_tap_is_relayed_and_eof_completes_exited() {
     let fx = Fixture::new("tap");

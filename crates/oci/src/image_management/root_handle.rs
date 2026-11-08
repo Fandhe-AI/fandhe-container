@@ -40,6 +40,7 @@
 //! - fetcher（`RegistryClient::fetch_blob`）の書き込み先も fd 起点である（#2765）。`PullSession::open_staged_blob`
 //!   が pull ディレクトリの fd から `<hex>.part` を開いた `StagedBlobWriter` を返し、パスは受け取らない。
 //!   検証後の読み取りも `PullSession::open_verified_staged_blob` が fd 起点で開いたハンドルを渡し、パスで返す API は無い（#2893）。
+//!   リース済みの既存 blob の読み取りも `PullSession::open_leased_blob` が `blobs/sha256` を root の fd から開き直して渡す（#4179）。
 
 mod staging;
 

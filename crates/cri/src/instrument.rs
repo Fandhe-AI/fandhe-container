@@ -58,6 +58,9 @@ pub enum CriOpKind {
     ListContainers,
     /// `RuntimeService.ContainerStatus` 1 回（読み取り専用の状態照会。CRI-1・TASK-58.3）。
     ContainerStatus,
+    /// `ContainerStatus` の観測で実行層の状態を 1 回読む（成功 OK・失敗は実行層のコード・期限切れは DEADLINE_EXCEEDED。
+    /// ID・パス・実行層の文言は載せない。CRI-1・CRI-2・REPAIR-4・REPAIR-5・#4174）。
+    ContainerExitObserve,
     /// `RuntimeService.Status` 1 回（待ちのない準備状態の報告。CRI-1・CRI-2・#2830）。
     Status,
     /// `RuntimeService.Version` 1 回（定数の応答。CRI-1・#2896）。
@@ -121,6 +124,7 @@ impl CriOpKind {
             CriOpKind::RemoveContainer => "cri.remove_container",
             CriOpKind::ListContainers => "cri.list_containers",
             CriOpKind::ContainerStatus => "cri.container_status",
+            CriOpKind::ContainerExitObserve => "cri.container_exit_observe",
             CriOpKind::Status => "cri.status",
             CriOpKind::Version => "cri.version",
             CriOpKind::UpdateRuntimeConfig => "cri.update_runtime_config",
@@ -452,7 +456,8 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    const ALL_KINDS: [CriOpKind; 31] = [
+    const ALL_KINDS: [CriOpKind; 32] = [
+        CriOpKind::ContainerExitObserve,
         CriOpKind::RunPodSandbox,
         CriOpKind::StopPodSandbox,
         CriOpKind::RemovePodSandbox,

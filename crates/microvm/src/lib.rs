@@ -98,7 +98,7 @@
 //! - `run_once` の期限切れ後の cancel 漏れの是正（#3845）
 //!
 //! 未実装（正は各ファイルの「未実装」節。実装済みを装わない。REPAIR-3）:
-//! - virtio-block の QueueNotify の配線は #4028 で済み。virtio-net の QueueNotify の配線は #4029、ホスト側の到着による受信（受信ポーラー）は #4030 で済み。TIMEOUT 後のゲスト RAM の回収は #4032 で実装済み（vCPU スレッドの終了時。実機未確認 #4034）
+//! - virtio-block の QueueNotify の配線は #4028 で済み。virtio-net の QueueNotify の配線は #4029、ホスト側の到着による受信（受信ポーラー）は #4030 で済み。TIMEOUT 後のゲスト RAM の回収は #4032 で実装済み（vCPU スレッドの終了時。成功は `op=hvf.deferred_reclaim` の行で出る・#4146。実機確認は #4034）
 //! - big-endian ゲスト
 
 #![deny(unsafe_code)]

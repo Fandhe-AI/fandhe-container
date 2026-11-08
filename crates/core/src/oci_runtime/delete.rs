@@ -484,6 +484,9 @@ fn delete_inner(
         // 別の委譲スコープでの `NotPresent` は「cgroup 無し」の確認にならないので、不一致のときは
         // 記録のスコープを検証つきで直接開く経路へ渡す（#2060 案 B）。Removed / NotPresent はどちらも
         // 記録されたスコープ・instance で「cgroup が無い」状態に到達したので次へ進む。失敗はレコードを残して返す。
+        // 状態の再確認（ロック待ちを伴う読み取り）のあとの、cgroup の破壊的な削除の直前にも確かめる。
+        // 入口の確認だけでは、読み取りの間に過ぎた期限を見落とす（REPAIR-5・#4239）。
+        ensure_before_deadline(options.deadline, "cgroup removal")?;
         let removal = if scope_matches {
             cgroups.remove_with_recorder(req.id(), placement.instance(), recorder)?
         } else {
@@ -1216,6 +1219,63 @@ mod tests {
         assert_eq!(err.code(), ErrorCode::Timeout);
         assert!(remover.calls().is_empty());
         assert!(mem.has("c1"));
+    }
+
+    /// `get` の n 回目の呼び出しの後に眠る遅い読み取りの偽物（`MemStateStore` を包む。#4239）。
+    struct SlowGetStore<'a> {
+        inner: &'a MemStateStore,
+        sleep_after_get: u32,
+        delay: std::time::Duration,
+        gets: Mutex<u32>,
+    }
+
+    impl StateStore for SlowGetStore<'_> {
+        fn create(&self, req: &CreateStateRequest) -> Result<StateRecord, TraitError> {
+            self.inner.create(req)
+        }
+        fn update(&self, req: &UpdateStateRequest) -> Result<StateRecord, TraitError> {
+            self.inner.update(req)
+        }
+        fn get(&self, req: &GetStateRequest) -> Result<StateRecord, TraitError> {
+            let r = self.inner.get(req);
+            let nth = {
+                let mut g = self.gets.lock().unwrap_or_else(|e| e.into_inner());
+                *g += 1;
+                *g
+            };
+            if nth == self.sleep_after_get {
+                std::thread::sleep(self.delay);
+            }
+            r
+        }
+        fn list(&self, req: &ListStateRequest) -> Result<StateList, TraitError> {
+            self.inner.list(req)
+        }
+        fn delete(&self, req: &DeleteStateRequest) -> Result<DeleteStateResponse, TraitError> {
+            self.inner.delete(req)
+        }
+    }
+
+    /// REPAIR-5・OCI-6・CRI-5（#4239）: 最初の `get` が遅く（状態ロック待ちの再現）、cgroup の削除の直前に
+    /// 期限が過ぎていれば、cgroup に触れず記録も残して `Timeout`。2 回目の `get` が遅い場合も同じ。
+    #[test]
+    fn repair5_4239_deadline_passing_during_reads_does_not_remove_cgroup() {
+        for sleep_after_get in [1, 2] {
+            let mem =
+                MemStateStore::with_scope(ContainerStatus::stopped(cid("c1"), Some(0)), SCOPE);
+            let store = SlowGetStore {
+                inner: &mem,
+                sleep_after_get,
+                delay: std::time::Duration::from_millis(300),
+                gets: Mutex::new(0),
+            };
+            let remover = RecordingRemover::returning(Ok(CgroupRemoval::Removed));
+            let deadline = Instant::now() + std::time::Duration::from_millis(100);
+            let err = run_with_deadline(&store, &remover, Some(deadline)).expect_err("timeout");
+            assert_eq!(err.code(), ErrorCode::Timeout, "get #{sleep_after_get}");
+            assert!(remover.calls().is_empty(), "get #{sleep_after_get}");
+            assert!(mem.has("c1"));
+        }
     }
 
     /// REPAIR-5・CRI-5・OCI-6（#4239）: cgroup の削除に時間がかかって、コミット前に期限が過ぎた場合は、

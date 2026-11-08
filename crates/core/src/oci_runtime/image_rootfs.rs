@@ -977,7 +977,8 @@ mod imp {
     /// [`spawn_in_userns`] の失敗（どの段で失敗したかを区別する。呼び出し側が自分の文言・語彙へ写す）。
     ///
     /// `Inputs` / `Plan` / `MultiThreaded` / `ForkOther` は fork の前（子は作られず、木に触れていない）。
-    /// `Timeout` / `WaitOther` は fork の後（子が木に触れた可能性がある）。
+    /// `Timeout` / `WaitOther` は通常 fork の後（子が木に触れた可能性がある）。ただし絶対期限が fork の前に
+    /// 過ぎていた場合の `Timeout` は子を作らない。
     #[derive(Debug)]
     enum UsernsSpawnError {
         /// 写像の入力（subuid / subgid の解決）の失敗。
@@ -1007,6 +1008,32 @@ mod imp {
         work_budget: std::time::Duration,
         child: impl FnOnce() -> i32,
     ) -> Result<i32, UsernsSpawnError> {
+        spawn_in_userns_until(source, work_budget, None, child)
+    }
+
+    /// 親の待ちの上限（写像の書き込みの最大 3 × `helper_timeout` + 5 秒 + `work_budget`）を、絶対期限
+    /// `deadline` の残り時間で頭打ちにする純関数（`None` は従来の上限のまま。REPAIR-5・#4239）。
+    fn userns_wait_budget(
+        helper_timeout: std::time::Duration,
+        work_budget: std::time::Duration,
+        deadline: Option<Instant>,
+        now: Instant,
+    ) -> std::time::Duration {
+        let full = helper_timeout * 3 + std::time::Duration::from_secs(5) + work_budget;
+        deadline.map_or(full, |d| full.min(d.saturating_duration_since(now)))
+    }
+
+    /// [`spawn_in_userns`] に絶対期限を足したもの。fork の前に期限が過ぎていれば子を作らず `Timeout`、
+    /// 過ぎていなければ待ち全体（セットアップを含む）を残り時間で頭打ちにする（#4239）。
+    fn spawn_in_userns_until(
+        source: &SubordinateIdSource,
+        work_budget: std::time::Duration,
+        deadline: Option<Instant>,
+        child: impl FnOnce() -> i32,
+    ) -> Result<i32, UsernsSpawnError> {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return Err(UsernsSpawnError::Timeout);
+        }
         let (euid, egid) = (sys::effective_uid(), sys::effective_gid());
         let inputs = source
             .removal_inputs(euid, egid)
@@ -1037,7 +1064,7 @@ mod imp {
             SysError::MultiThreaded => UsernsSpawnError::MultiThreaded,
             _ => UsernsSpawnError::ForkOther,
         })?;
-        let budget = helper_timeout * 3 + std::time::Duration::from_secs(5) + work_budget;
+        let budget = userns_wait_budget(helper_timeout, work_budget, deadline, Instant::now());
         match wait_forked_child(pid, budget) {
             Ok(ChildExit::Exited(code)) => Ok(code),
             Err(e) if e.code == ErrorCode::Timeout => Err(UsernsSpawnError::Timeout),
@@ -2166,6 +2193,10 @@ mod imp {
         owner: Owner<'_>,
         deadline: Option<Instant>,
     ) -> Result<RecordedRootfsRemoval, TraitError> {
+        // 子の fork・木への書き込みの前に確かめる（過ぎていれば何もしない。#4239）。
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return Err(deadline_exceeded());
+        }
         match privilege {
             ImageRootfsPrivilege::SubordinateIds(source) => {
                 remove_tree_in_userns(source, parent, name, identity, owner, deadline)
@@ -2335,11 +2366,9 @@ mod imp {
         lock_in_child: bool,
         deadline: Option<Instant>,
     ) -> Result<UsernsOutcome, TraitError> {
-        // 親の待ちの上限も残り時間で頭打ちにする（子の走査も同じ期限で止まる。#4239）。
-        let work_budget = deadline.map_or(USERNS_REMOVE_BUDGET, |d| {
-            USERNS_REMOVE_BUDGET.min(d.saturating_duration_since(Instant::now()))
-        });
-        let code = spawn_in_userns(source, work_budget, || {
+        // 親の待ち全体（写像ヘルパー等のセットアップを含む）も絶対期限で頭打ちにし、子の走査も同じ期限で
+        // 止まる（#4239）。
+        let code = spawn_in_userns_until(source, USERNS_REMOVE_BUDGET, deadline, || {
             // ロックは子の終了（`_exit`）まで保持する。
             let _locked;
             if lock_in_child {
@@ -2406,6 +2435,10 @@ mod imp {
         owner: Owner<'_>,
         deadline: Option<Instant>,
     ) -> Result<RecordedRootfsRemoval, TraitError> {
+        // 所有トークン照合の一時的な chmod など、木に手を入れる前に確かめる（#4239）。
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return Err(deadline_exceeded());
+        }
         let root = match sys::open_dir_path_nofollow(Some(parent), name) {
             Ok(fd) => fd,
             Err(SysError::Os(n)) if n == sys::ENOENT => {
@@ -2572,6 +2605,10 @@ mod imp {
             )?;
         }
         if marker_deferred {
+            // 印は最後に消す。ここで期限が過ぎていれば印を残す（次の回収が木を見分けられる。#4239）。
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                return Err(deadline_exceeded());
+            }
             remove_entry(
                 dir,
                 OsStr::new(super::OWNER_TOKEN_FILE),
@@ -2783,6 +2820,51 @@ mod imp {
                     Some(err(ErrorCode::Internal, "failed to remove rootfs"))
                 );
             }
+        }
+
+        /// REPAIR-5・OCI-7（#4239）: 親の待ちの上限は、期限なしなら従来の `3 × helper + 5 秒 + work`、
+        /// 期限ありなら残り時間で頭打ち（残りが長ければ従来の上限、過ぎていれば 0）。
+        #[test]
+        fn repair5_4239_userns_wait_budget_is_capped_by_deadline() {
+            use std::time::Duration;
+            let now = Instant::now();
+            let helper = Duration::from_secs(10);
+            let work = Duration::from_secs(120);
+            assert_eq!(
+                userns_wait_budget(helper, work, None, now),
+                Duration::from_secs(155)
+            );
+            assert_eq!(
+                userns_wait_budget(helper, work, Some(now + Duration::from_secs(2)), now),
+                Duration::from_secs(2)
+            );
+            assert_eq!(
+                userns_wait_budget(helper, work, Some(now + Duration::from_secs(900)), now),
+                Duration::from_secs(155)
+            );
+            assert_eq!(
+                userns_wait_budget(helper, work, Some(now), now + Duration::from_secs(1)),
+                Duration::ZERO
+            );
+        }
+
+        /// REPAIR-5（#4239）: 期限が過ぎていれば、fork の前に `Timeout`（子は作らない）。
+        #[test]
+        fn repair5_4239_spawn_in_userns_expired_deadline_does_not_fork() {
+            let ran = std::cell::Cell::new(false);
+            let source = SubordinateIdSource::with_id_files(
+                None,
+                Path::new("/nonexistent/subuid"),
+                Path::new("/nonexistent/subgid"),
+            )
+            .expect("source");
+            let r =
+                spawn_in_userns_until(&source, USERNS_REMOVE_BUDGET, Some(Instant::now()), || {
+                    ran.set(true);
+                    0
+                });
+            assert!(matches!(r, Err(UsernsSpawnError::Timeout)), "{r:?}");
+            assert!(!ran.get());
         }
 
         #[test]

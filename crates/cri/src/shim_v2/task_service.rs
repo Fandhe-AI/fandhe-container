@@ -745,7 +745,9 @@ impl TaskService {
             pid: resp.pid,
             exit_status: resp.exit_status,
             exited_at: resp.exited_at.clone(),
-            id: req.id.clone(),
+            // runc shim v2 の `Delete` は init の TaskDelete に `ID` を設定しない（省略 = init。containerd v2.1.4
+            // `cmd/containerd-shim-runc-v2/task/service.go`・`api/events/task.proto`。#4222）。TaskExit だけが `p.ID()` を持つ。
+            id: String::new(),
         }));
         Ok(resp.encode_to_vec())
     }
@@ -3517,7 +3519,7 @@ mod tests {
                     pid: resp.pid,
                     exit_status: 3,
                     exited_at: resp.exited_at.clone(),
-                    id: "c1".into(),
+                    id: String::new(),
                 })
             );
             assert_eq!(resp.exit_status, 3);

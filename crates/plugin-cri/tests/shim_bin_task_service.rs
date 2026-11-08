@@ -55,7 +55,14 @@ impl Scratch {
     }
 }
 
-fn run(sc: &Scratch, id: &str, action: &str, extra: &[&str]) -> std::process::Output {
+/// `-publish-binary` を差し替えられる `run`（#4222。既定は bin 自身で、検査を通すだけの値）。
+fn run_with_publish(
+    sc: &Scratch,
+    id: &str,
+    action: &str,
+    extra: &[&str],
+    publish_binary: &str,
+) -> std::process::Output {
     let mut cmd = Command::new(BIN);
     cmd.args([
         "-namespace",
@@ -63,7 +70,7 @@ fn run(sc: &Scratch, id: &str, action: &str, extra: &[&str]) -> std::process::Ou
         "-address",
         "/run/containerd/containerd.sock",
         "-publish-binary",
-        BIN,
+        publish_binary,
         "-id",
         id,
     ])
@@ -78,7 +85,11 @@ fn run(sc: &Scratch, id: &str, action: &str, extra: &[&str]) -> std::process::Ou
 }
 
 fn start(sc: &Scratch, id: &str) -> PathBuf {
-    let out = run(sc, id, "start", &[]);
+    start_with_publish(sc, id, BIN)
+}
+
+fn start_with_publish(sc: &Scratch, id: &str, publish_binary: &str) -> PathBuf {
+    let out = run_with_publish(sc, id, "start", &[], publish_binary);
     assert!(out.status.success(), "{out:?}");
     let addr = String::from_utf8(out.stdout).expect("utf8 address");
     PathBuf::from(addr.strip_prefix("unix://").expect("unix:// address"))
@@ -253,4 +264,75 @@ fn shutdown_and_wait(sock: &std::path::Path, id: &str) {
         std::thread::sleep(Duration::from_millis(50));
     }
     assert!(!sock.exists(), "socket must be removed after shutdown");
+}
+
+/// CRI-5・TASK-62.6・REPAIR-5・#4222: bin の Shutdown の後、キューに残った TaskDelete が排出されて publish バイナリへ届く。
+/// 偽の publish バイナリは `/tasks/create` だけ 1 秒眠るため、Delete と Shutdown の時点で TaskDelete は未送信のキューにある。
+/// 排出が無ければ、デーモンは応答の猶予の後に終わり、TaskDelete の子は一度も起動しない。
+/// `daemon.log` に排出の 1 行（`complete`・捨てた件数 0）が残る。
+#[test]
+fn cri5_4222_bin_shutdown_drains_queued_task_delete() {
+    let sc = Scratch::new("dr");
+    let id = format!("dr{}", std::process::id());
+    let out = sc.guard.join("calls");
+    std::fs::create_dir(&out).expect("calls dir");
+    let body = format!(
+        "#!/bin/sh\ncase \"$*\" in *tasks/create*) /bin/sleep 1;; esac\nn=$(( $(/bin/ls \"{o}\" | /usr/bin/wc -l) ))\nd=\"{o}/call$n\"\n/bin/mkdir \"$d\"\nprintf '%s\\n' \"$@\" > \"$d/argv\"\n/bin/cat > \"$d/stdin\"\n",
+        o = out.display()
+    );
+    let script = sc.guard.join("fake-publish");
+    // ETXTBSY を避けるため、書き込みと chmod は子プロセスで行う。
+    let st = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(r#"printf '%s' "$1" > "$2" && chmod 755 "$2""#)
+        .arg("sh")
+        .arg(&body)
+        .arg(&script)
+        .status()
+        .expect("run sh");
+    assert!(st.success());
+    let script = script.to_str().expect("utf8 script").to_owned();
+
+    let sock = start_with_publish(&sc, &id, &script);
+    let bundle = make_bundle(&sc);
+    let bundle = bundle.to_str().expect("utf8 bundle");
+    ok(
+        call_method(&sock, SERVICES[0], "Create", &create_request(&id, bundle)),
+        "Create",
+    );
+    ok(
+        call_method(&sock, SERVICES[0], "Delete", &id_request(&id)),
+        "Delete",
+    );
+    shutdown_and_wait(&sock, &id);
+
+    // 排出の 1 行（排出の完了の後に書かれる）を待ち、その時点で TaskDelete が届いていること。
+    let log = sc.sock_dir().join("daemon.log");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut text = String::new();
+    while Instant::now() < deadline {
+        text = std::fs::read_to_string(&log).unwrap_or_default();
+        if text.contains("task_event_publish_drain") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains(r#""event":"task_event_publish_drain""#))
+        .collect();
+    assert_eq!(lines.len(), 1, "{text}");
+    assert!(lines[0].contains(r#""outcome":"complete""#), "{}", lines[0]);
+    assert!(lines[0].contains(r#""dropped":0"#), "{}", lines[0]);
+    let topics: Vec<String> = std::fs::read_dir(&out)
+        .expect("calls")
+        .map(|e| {
+            let argv = std::fs::read_to_string(e.expect("entry").path().join("argv"))
+                .expect("argv of a completed call");
+            argv.lines().last().unwrap_or_default().to_owned()
+        })
+        .collect();
+    let mut sorted = topics.clone();
+    sorted.sort();
+    assert_eq!(sorted, ["/tasks/create", "/tasks/delete"], "{topics:?}");
 }

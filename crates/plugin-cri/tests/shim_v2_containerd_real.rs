@@ -231,17 +231,43 @@ mod linux {
             .map_err(|e| format!("chmod {}: {e}", dest.display()))
     }
 
-    /// 最小 rootfs と user namespace を含む spec（root.path は絶対パス）を書く。
+    /// 最小 rootfs と user namespace を含む spec を書く（CRI-5・#4104）。
+    ///
+    /// containerd は bundle（`<state>/.../<id>`）を Create の直前に自分で作り、`<bundle>/rootfs` を空で用意する。shim（core）は
+    /// rootfs が bundle 配下であることを要求する（`rootfs must be inside the bundle`）ため、`root.path` は bundle 相対の `rootfs` にし、
+    /// 中身は `mounts[]` の bind（読み取り専用）で試験が用意したディレクトリから供給する（`docs/api/bind-mounts.md`）。
     fn write_spec(dir: &Path) -> Result<PathBuf, String> {
         let rootfs = dir.join("rootfs");
-        let ld =
-            minimal_rootfs::install_binary_at(&rootfs, "probe", &["proc", "dev", "tmp", "etc"])?;
+        let ld = minimal_rootfs::install_binary_at(
+            &rootfs,
+            "bin/probe",
+            &["bin", "proc", "dev", "tmp", "etc"],
+        )?;
+        // proc・dev・tmp・etc は core が供給するため bind しない。それ以外の最上位ディレクトリ（bin・lib64・usr 等）を bind する。
+        let mut names: Vec<String> = std::fs::read_dir(&rootfs)
+            .map_err(|e| format!("read rootfs: {e}"))?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| !["proc", "dev", "tmp", "etc", "sys"].contains(&n.as_str()))
+            .collect();
+        names.sort();
+        let mounts: Vec<String> = names
+            .iter()
+            .map(|n| {
+                format!(
+                    r#"{{"destination":"/{n}","type":"bind","source":"{}","options":["rbind","ro"]}}"#,
+                    rootfs.join(n).display()
+                )
+            })
+            .collect();
         let spec = format!(
-            r#"{{"ociVersion":"1.2.0","root":{{"path":"{}","readonly":false}},"hostname":"fandhe-shim",
-"process":{{"user":{{"uid":0,"gid":0}},"args":["/probe","--container-probe"],
-"env":["PATH=/","TERM=dumb","LD_LIBRARY_PATH={ld}"],"cwd":"/"}},
+            r#"{{"ociVersion":"1.2.0","root":{{"path":"rootfs","readonly":false}},"hostname":"fandhe-shim",
+"process":{{"user":{{"uid":0,"gid":0}},"args":["/bin/probe","--container-probe"],
+"env":["PATH=/bin","TERM=dumb","LD_LIBRARY_PATH={ld}"],"cwd":"/"}},
+"mounts":[{}],
 "linux":{{"namespaces":[{{"type":"pid"}},{{"type":"mount"}},{{"type":"uts"}},{{"type":"ipc"}},{{"type":"user"}}]}}}}"#,
-            rootfs.display()
+            mounts.join(",")
         );
         let path = dir.join("spec.json");
         std::fs::write(&path, spec).map_err(|e| format!("write spec: {e}"))?;

@@ -81,6 +81,11 @@
 //! （DRIVER_OK `0x0F`・FAILED 0 件・QUEUE_READY=1 の回数 2）・net 0 台の負の対照（組み立て済みの net 0 件・観測値すべて 0）・
 //! block+net の窓の区別（block は QUEUE_READY 1 回・net は 2 回）の 3 件を足す。カーネルには `CONFIG_NET`・`CONFIG_NETDEVICES`・
 //! `CONFIG_VIRTIO_NET` も要る。実機の記録は #3781（Agent は実カーネルで未確認）。
+//! 交渉結果の観測（#4234・MVM-1・MVM-5）: 観測器は `DRIVER_FEATURES`（sel 0・1）への書き込みから、FEATURES_OK（`0x0B`）を書いた
+//! 時点のドライバの features を組み立てる。DRIVER_OK `0x0F` を照合する各試験は、上位ページがちょうど `0x1`（VERSION_1 のみ）・
+//! ビット 40（`VIRTIO_F_RING_RESET`。`docs/design/microvm-virtio-ring-reset.md`）が 0・下位ページが提示集合の部分集合であることを
+//! 照合し、結果行へ `features_ok=0x0b driver_features=0x... ring_reset=0` を出す。実カーネルでの確認は Agent は未実施で、
+//! 実機での実行と記録は #3781（人間担当）。macOS の `hvf_kernel_boot.rs` は MMIO の値の観測口が無く対象外。
 //! aarch64 の net-tx・net-rx（#3966・MVM-1・REPAIR-12）: 専用 initrd（`MICROVM_TEST_INITRD_ARCH=aarch64 MICROVM_TEST_INITRD_VARIANT=net-tx|net-rx`。
 //! 環境変数 `FANDHE_CONTAINER_MICROVM_NET_TX_INITRD`・`_NET_RX_INITRD`）で TX・RX の中身を照合する。TX は backend が受けた
 //! フレームに `NET_TX_FRAME` と完全一致するものがあること、RX は積んだ `NET_RX_FRAME` がちょうど 1 件配送されゲストが完全一致で
@@ -138,6 +143,15 @@ struct WindowStats {
     status_writes: u64,
     /// QUEUE_READY へ値 1 を書いた回数。
     queue_ready_one: u64,
+    /// FEATURES_OK を含み DRIVER_OK を含まない最初の STATUS 書き込みの値（Linux は `0x0B`。#4234）。
+    features_ok_first: Option<u32>,
+    /// 上記の条件の STATUS 書き込みの件数。
+    features_ok_writes: u64,
+    /// 最初の FEATURES_OK 書き込みの時点でドライバが書いていた features（`lo | hi << 32`）。
+    /// 下位・上位のどちらかのページが未書き込みなら `None`（#4234・MVM-1・MVM-5）。
+    driver_features: Option<u64>,
+    /// `DRIVER_FEATURES` を sel 0・1 以外のときに書いた件数（トランスポートの `InvalidSelector` に対応。診断用）。
+    driver_features_bad_sel: u64,
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -150,6 +164,17 @@ struct Window {
     failed_writes: AtomicU64,
     status_writes: AtomicU64,
     queue_ready_one: AtomicU64,
+    /// 最後に `DRIVER_FEATURES_SEL` へ書かれた値（#4234）。
+    driver_features_sel: AtomicU64,
+    /// 作業中の下位・上位ページ（`NO_VALUE` = 未書き込み。Status=0 でトランスポートの reset に合わせて戻す）。
+    driver_features_lo: AtomicU64,
+    driver_features_hi: AtomicU64,
+    driver_features_bad_sel: AtomicU64,
+    features_ok_first: AtomicU64,
+    features_ok_writes: AtomicU64,
+    /// FEATURES_OK 時点のスナップショットが保存済みか（値が `u64::MAX` でも番兵と衝突しないよう別に持つ）。
+    features_snapshot_valid: AtomicU64,
+    features_snapshot: AtomicU64,
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -159,6 +184,12 @@ const NO_VALUE: u64 = u64::MAX;
 const STATUS_DRIVER_OK: u32 = 4;
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 const STATUS_FAILED: u32 = 128;
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const STATUS_FEATURES_OK: u32 = 8;
+/// `VIRTIO_F_RING_RESET`（virtio 1.2 のビット 40）。`virtio_ring_reset.rs` の同名定数の双子で、lib に公開定数を
+/// 足すと「対応済み」に見えるため試験側に置く（REPAIR-3。#4234・#4169・MVM-1・MVM-5）。
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const VIRTIO_F_RING_RESET_BIT: u32 = 40;
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 /// virtio-net に見せる固定の locally administered なダミー MAC。
 const NET_MAC: [u8; 6] = [0x02, 0xfc, 0x00, 0x00, 0x38, 0x65];
@@ -193,6 +224,9 @@ impl VirtioWindowObserver {
         };
         for w in &obs.windows {
             w.driver_ok_first.store(NO_VALUE, Ordering::Relaxed);
+            w.features_ok_first.store(NO_VALUE, Ordering::Relaxed);
+            w.driver_features_lo.store(NO_VALUE, Ordering::Relaxed);
+            w.driver_features_hi.store(NO_VALUE, Ordering::Relaxed);
         }
         obs
     }
@@ -212,6 +246,11 @@ impl VirtioWindowObserver {
             failed_writes: w.failed_writes.load(Ordering::Relaxed),
             status_writes: w.status_writes.load(Ordering::Relaxed),
             queue_ready_one: w.queue_ready_one.load(Ordering::Relaxed),
+            features_ok_first: u32::try_from(w.features_ok_first.load(Ordering::Relaxed)).ok(),
+            features_ok_writes: w.features_ok_writes.load(Ordering::Relaxed),
+            driver_features: (w.features_snapshot_valid.load(Ordering::Relaxed) == 1)
+                .then(|| w.features_snapshot.load(Ordering::Relaxed)),
+            driver_features_bad_sel: w.driver_features_bad_sel.load(Ordering::Relaxed),
         }
     }
 }
@@ -248,6 +287,31 @@ impl RunObserver for VirtioWindowObserver {
             }
             if off == reg::STATUS {
                 w.status_writes.fetch_add(1, Ordering::Relaxed);
+                if value == 0 {
+                    // トランスポートの reset に合わせる。FEATURES_OK 時点のスナップショットは消さない。
+                    w.driver_features_sel.store(0, Ordering::Relaxed);
+                    w.driver_features_lo.store(NO_VALUE, Ordering::Relaxed);
+                    w.driver_features_hi.store(NO_VALUE, Ordering::Relaxed);
+                }
+                if value & STATUS_FEATURES_OK != 0 && value & STATUS_DRIVER_OK == 0 {
+                    w.features_ok_writes.fetch_add(1, Ordering::Relaxed);
+                    let _ = w.features_ok_first.compare_exchange(
+                        NO_VALUE,
+                        u64::from(value),
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    );
+                    let lo = w.driver_features_lo.load(Ordering::Relaxed);
+                    let hi = w.driver_features_hi.load(Ordering::Relaxed);
+                    if let (Ok(lo), Ok(hi)) = (u32::try_from(lo), u32::try_from(hi))
+                        && w.features_snapshot_valid
+                            .compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed)
+                            .is_ok()
+                    {
+                        w.features_snapshot
+                            .store(assemble_driver_features(lo, hi), Ordering::Relaxed);
+                    }
+                }
                 if value & STATUS_FAILED != 0 {
                     w.failed_writes.fetch_add(1, Ordering::Relaxed);
                 }
@@ -261,6 +325,21 @@ impl RunObserver for VirtioWindowObserver {
                 }
             } else if off == reg::QUEUE_READY && value == 1 {
                 w.queue_ready_one.fetch_add(1, Ordering::Relaxed);
+            } else if off == reg::DRIVER_FEATURES_SEL {
+                w.driver_features_sel
+                    .store(u64::from(value), Ordering::Relaxed);
+            } else if off == reg::DRIVER_FEATURES {
+                match w.driver_features_sel.load(Ordering::Relaxed) {
+                    0 => w
+                        .driver_features_lo
+                        .store(u64::from(value), Ordering::Relaxed),
+                    1 => w
+                        .driver_features_hi
+                        .store(u64::from(value), Ordering::Relaxed),
+                    _ => {
+                        w.driver_features_bad_sel.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
             }
         }
     }
@@ -269,6 +348,76 @@ impl RunObserver for VirtioWindowObserver {
         true
     }
 }
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+/// ドライバが書いた下位・上位ページから features を組む（virtio-mmio の `DRIVER_FEATURES` は 32 ビットずつ。#4234）。
+fn assemble_driver_features(lo: u32, hi: u32) -> u64 {
+    u64::from(lo) | (u64::from(hi) << 32)
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+/// features のビット `bit` を 0 / 1 で返す（範囲外は 0。panic しない）。
+fn feature_bit(features: u64, bit: u32) -> u8 {
+    u8::from(features.checked_shr(bit).is_some_and(|v| v & 1 == 1))
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+/// 結果行に付ける交渉結果の固定書式（`prefix` は block+net の両方を出す場合の `block_` 等。#4234）。
+fn features_result_fields(prefix: &str, s: &WindowStats) -> String {
+    let ok = s
+        .features_ok_first
+        .map_or_else(|| "none".to_string(), |v| format!("0x{v:02x}"));
+    match s.driver_features {
+        Some(f) => format!(
+            "{prefix}features_ok={ok} {prefix}driver_features=0x{f:016x} {prefix}ring_reset={}",
+            feature_bit(f, VIRTIO_F_RING_RESET_BIT)
+        ),
+        None => {
+            format!("{prefix}features_ok={ok} {prefix}driver_features=none {prefix}ring_reset=none")
+        }
+    }
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+/// 実ゲストの交渉結果を照合する（#4234・MVM-1・MVM-5）。FEATURES_OK は 1 回・値 `0x0B`、ドライバの features の
+/// 上位ページはちょうど `0x1`（VERSION_1 のみ。デバイスの上位の提示はこれだけで、部分集合でない要求は拒否される）、
+/// ビット 40（RING_RESET）は 0、下位ページは提示集合 `offered_low` の部分集合であること。
+fn assert_features_negotiated(s: &WindowStats, offered_low: u64, label: &str, diag: &str) {
+    assert_eq!(
+        s.features_ok_first,
+        Some(0x0B),
+        "{label} FEATURES_OK: {diag}"
+    );
+    assert_eq!(
+        s.features_ok_writes, 1,
+        "{label} FEATURES_OK writes: {diag}"
+    );
+    assert_eq!(s.driver_features_bad_sel, 0, "{label} bad sel: {diag}");
+    let Some(f) = s.driver_features else {
+        panic!("{label} driver features not observed: {diag}");
+    };
+    assert_eq!(
+        feature_bit(f, VIRTIO_F_RING_RESET_BIT),
+        0,
+        "{label} RING_RESET: {diag}"
+    );
+    assert_eq!(f >> 32, 1, "{label} upper page: {diag}");
+    assert_eq!(
+        f & 0xffff_ffff & !offered_low,
+        0,
+        "{label} lower page: {diag}"
+    );
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+/// virtio-block が提示しうる下位ページ（読み取り専用の有無を問わず）。
+const BLOCK_OFFERED_LOW: u64 = fandhe_container_microvm::virtio_block::VIRTIO_BLK_F_SIZE_MAX
+    | fandhe_container_microvm::virtio_block::VIRTIO_BLK_F_SEG_MAX
+    | fandhe_container_microvm::virtio_block::VIRTIO_BLK_F_RO
+    | fandhe_container_microvm::virtio_block::VIRTIO_BLK_F_FLUSH;
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+/// virtio-net が提示する下位ページ。
+const NET_OFFERED_LOW: u64 = fandhe_container_microvm::virtio_net::VIRTIO_NET_F_MAC;
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn synthetic_mmio_write(vcpu_id: u32, addr: u64, value: u32) -> RunRecord {
@@ -308,6 +457,10 @@ fn mvm1_3865_observer_counts_status_and_queue_ready() {
         failed_writes: 0,
         status_writes: 0,
         queue_ready_one: 0,
+        features_ok_first: None,
+        features_ok_writes: 0,
+        driver_features: None,
+        driver_features_bad_sel: 0,
     };
     assert_eq!(obs.stats(VirtioDeviceKind::Block), zero);
     assert_eq!(obs.stats(VirtioDeviceKind::Net), zero);
@@ -324,6 +477,10 @@ fn mvm1_3865_observer_counts_status_and_queue_ready() {
             failed_writes: 1,
             status_writes: 6,
             queue_ready_one: 1,
+            features_ok_first: Some(0x0B),
+            features_ok_writes: 1,
+            driver_features: None,
+            driver_features_bad_sel: 0,
         }
     );
     // net の窓は取り違えない。
@@ -333,6 +490,108 @@ fn mvm1_3865_observer_counts_status_and_queue_ready() {
     assert_eq!(obs.stats(VirtioDeviceKind::Net).queue_ready_one, 2);
     assert_eq!(obs.stats(VirtioDeviceKind::Block).queue_ready_one, 1);
     assert_eq!(obs.ap_exits.load(Ordering::Relaxed), 1);
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+/// #4234・MVM-1・MVM-5: FEATURES_OK 時点の driver features をページ順に依らず組み立てる。
+#[test]
+fn mvm1_4234_observer_assembles_driver_features_at_features_ok() {
+    let obs = VirtioWindowObserver::new();
+    let (blk, net) = (0xd000_0000u64, 0xd000_1000u64);
+    obs.bind(VirtioDeviceKind::Block, blk, 0x1000);
+    obs.bind(VirtioDeviceKind::Net, net, 0x1000);
+    let w = |base: u64, off: u64, v: u32| obs.record(&synthetic_mmio_write(0, base + off, v));
+    // block: Linux の順序（上位ページを先に書く）。
+    w(blk, reg::STATUS, 0);
+    w(blk, reg::STATUS, 1);
+    w(blk, reg::STATUS, 3);
+    w(blk, reg::DRIVER_FEATURES_SEL, 1);
+    w(blk, reg::DRIVER_FEATURES, 0x1);
+    w(blk, reg::DRIVER_FEATURES_SEL, 0);
+    w(blk, reg::DRIVER_FEATURES, 0x0000_0206);
+    w(blk, reg::STATUS, 0x0B);
+    w(blk, reg::STATUS, 0x0F);
+    let b = obs.stats(VirtioDeviceKind::Block);
+    assert_eq!(b.driver_features, Some(0x0000_0001_0000_0206));
+    assert_eq!(b.features_ok_first, Some(0x0B));
+    assert_eq!(b.features_ok_writes, 1);
+    assert_eq!(b.driver_ok_first, Some(0x0F));
+    assert_features_negotiated(&b, BLOCK_OFFERED_LOW, "block", "unit");
+    // net: 下位ページを先に書く逆順でも同じ組み立てになり、block の書き込みは混ざらない。
+    assert_eq!(obs.stats(VirtioDeviceKind::Net).driver_features, None);
+    w(net, reg::DRIVER_FEATURES_SEL, 0);
+    w(net, reg::DRIVER_FEATURES, 0x20);
+    w(net, reg::DRIVER_FEATURES_SEL, 1);
+    w(net, reg::DRIVER_FEATURES, 0x1);
+    w(net, reg::STATUS, 0x0B);
+    let n = obs.stats(VirtioDeviceKind::Net);
+    assert_eq!(n.driver_features, Some(0x0000_0001_0000_0020));
+    assert_features_negotiated(&n, NET_OFFERED_LOW, "net", "unit");
+    // reset してもスナップショットは残り、2 回目の FEATURES_OK でも上書きしない（件数だけ増える）。
+    w(net, reg::STATUS, 0);
+    w(net, reg::DRIVER_FEATURES_SEL, 1);
+    w(net, reg::DRIVER_FEATURES, 0x101);
+    w(net, reg::DRIVER_FEATURES_SEL, 0);
+    w(net, reg::DRIVER_FEATURES, 0);
+    w(net, reg::STATUS, 0x0B);
+    let n = obs.stats(VirtioDeviceKind::Net);
+    assert_eq!(n.driver_features, Some(0x0000_0001_0000_0020));
+    assert_eq!(n.features_ok_writes, 2);
+    // sel=2 はページに入らず数えるだけ。
+    w(blk, reg::DRIVER_FEATURES_SEL, 2);
+    w(blk, reg::DRIVER_FEATURES, 0xffff_ffff);
+    let b = obs.stats(VirtioDeviceKind::Block);
+    assert_eq!(b.driver_features_bad_sel, 1);
+    assert_eq!(b.driver_features, Some(0x0000_0001_0000_0206));
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+/// #4234: 片方のページしか書かずに FEATURES_OK を書いた窓は features を組まない。
+#[test]
+fn mvm1_4234_single_page_does_not_assemble_features() {
+    let obs = VirtioWindowObserver::new();
+    let blk = 0xd000_0000u64;
+    obs.bind(VirtioDeviceKind::Block, blk, 0x1000);
+    obs.record(&synthetic_mmio_write(0, blk + reg::DRIVER_FEATURES_SEL, 1));
+    obs.record(&synthetic_mmio_write(0, blk + reg::DRIVER_FEATURES, 1));
+    obs.record(&synthetic_mmio_write(0, blk + reg::STATUS, 0x0B));
+    let b = obs.stats(VirtioDeviceKind::Block);
+    assert_eq!(b.driver_features, None);
+    assert_eq!(b.features_ok_first, Some(0x0B));
+    assert_eq!(
+        features_result_fields("", &b),
+        "features_ok=0x0b driver_features=none ring_reset=none"
+    );
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+/// #4234: ビット 40 の判定と結果行の書式（陽性対照つき）。
+#[test]
+fn mvm1_4234_ring_reset_bit_and_result_fields() {
+    let f = assemble_driver_features(0x20, 0x1);
+    assert_eq!(f, 0x0000_0001_0000_0020);
+    assert_eq!(feature_bit(f, 40), 0);
+    // 陽性対照: 上位ページのビット 8 がビット 40。
+    assert_eq!(feature_bit(assemble_driver_features(0x20, 0x101), 40), 1);
+    assert_eq!(feature_bit(f, 64), 0);
+    let s = WindowStats {
+        driver_ok_first: Some(0x0F),
+        failed_writes: 0,
+        status_writes: 5,
+        queue_ready_one: 1,
+        features_ok_first: Some(0x0B),
+        features_ok_writes: 1,
+        driver_features: Some(f),
+        driver_features_bad_sel: 0,
+    };
+    assert_eq!(
+        features_result_fields("", &s),
+        "features_ok=0x0b driver_features=0x0000000100000020 ring_reset=0"
+    );
+    assert_eq!(
+        features_result_fields("net_", &s),
+        "net_features_ok=0x0b net_driver_features=0x0000000100000020 net_ring_reset=0"
+    );
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -589,10 +848,11 @@ mod x86 {
         MEMINFO_FAILED_MARKER, MEMINFO_OK_MARKER, SMP_ONLINE_LINE, parse_mem_total_kb, read_bounded,
     };
     use super::{
-        BLOCK_MISMATCH_MARKER, BLOCK_OK_MARKER, BLOCK_SENTINEL, CountingNetBackend, MARKER,
-        NET_MAC, NET_RX_FAILED_MARKER, NET_RX_FRAME, NET_RX_OK_MARKER, NET_TX_FAILED_MARKER,
-        NET_TX_FRAME, NET_TX_OK_MARKER, VirtioWindowObserver, count_lines_ending_with,
-        count_marker_lines, escape_tail, guest_boot, hex_prefix,
+        BLOCK_MISMATCH_MARKER, BLOCK_OFFERED_LOW, BLOCK_OK_MARKER, BLOCK_SENTINEL,
+        CountingNetBackend, MARKER, NET_MAC, NET_OFFERED_LOW, NET_RX_FAILED_MARKER, NET_RX_FRAME,
+        NET_RX_OK_MARKER, NET_TX_FAILED_MARKER, NET_TX_FRAME, NET_TX_OK_MARKER,
+        VirtioWindowObserver, assert_features_negotiated, count_lines_ending_with,
+        count_marker_lines, escape_tail, features_result_fields, guest_boot, hex_prefix,
     };
     use fandhe_container_microvm::device::{KvmDevice, RunObserver};
     use fandhe_container_microvm::error::{MicrovmError, MicrovmErrorCode};
@@ -1129,13 +1389,15 @@ mod x86 {
         let diag = o.diag(&extra);
         assert_boot_ok(&o, 1, &diag);
         assert_eq!(s.driver_ok_first, Some(0x0F), "block DRIVER_OK: {diag}");
+        assert_features_negotiated(&s, BLOCK_OFFERED_LOW, "block", &diag);
         assert_eq!(s.failed_writes, 0, "block FAILED writes: {diag}");
         assert_eq!(s.queue_ready_one, 1, "block QUEUE_READY=1 count: {diag}");
         assert!(reads >= 1, "block read_at count: {diag}");
         assert!(off0 >= 1, "block offset-0 reads: {diag}");
         eprintln!(
-            "kernel_boot: ok case=virtio_block driver_ok=0x0f queue_ready=1 reads={reads} offset0_reads={off0} elapsed_ms={}",
-            o.elapsed.as_millis()
+            "kernel_boot: ok case=virtio_block driver_ok=0x0f queue_ready=1 reads={reads} offset0_reads={off0} elapsed_ms={} {fields}",
+            o.elapsed.as_millis(),
+            fields = features_result_fields("", &s)
         );
     }
 
@@ -1172,6 +1434,7 @@ mod x86 {
             "default init marker must not appear with the block-read initrd: {diag}"
         );
         assert_eq!(s.driver_ok_first, Some(0x0F), "block DRIVER_OK: {diag}");
+        assert_features_negotiated(&s, BLOCK_OFFERED_LOW, "block", &diag);
         assert_eq!(s.failed_writes, 0, "block FAILED writes: {diag}");
         assert_eq!(s.queue_ready_one, 1, "block QUEUE_READY=1 count: {diag}");
         // init の read が backend まで届いた回数は照合しない（パーティション走査で sector 0 が page cache に載り
@@ -1179,8 +1442,9 @@ mod x86 {
         assert!(reads >= 1, "block read_at count: {diag}");
         assert!(off0 >= 1, "block offset-0 reads: {diag}");
         eprintln!(
-            "kernel_boot: ok case={case} marker={expect:?} reads={reads} offset0_reads={off0} elapsed_ms={}",
-            o.elapsed.as_millis()
+            "kernel_boot: ok case={case} marker={expect:?} reads={reads} offset0_reads={off0} elapsed_ms={} {fields}",
+            o.elapsed.as_millis(),
+            fields = features_result_fields("", &s)
         );
     }
 
@@ -1237,11 +1501,13 @@ mod x86 {
         let diag = o.diag(&extra);
         assert_boot_ok(&o, 1, &diag);
         assert_eq!(s.driver_ok_first, Some(0x0F), "net DRIVER_OK: {diag}");
+        assert_features_negotiated(&s, NET_OFFERED_LOW, "net", &diag);
         assert_eq!(s.failed_writes, 0, "net FAILED writes: {diag}");
         assert_eq!(s.queue_ready_one, 2, "net QUEUE_READY=1 count: {diag}");
         eprintln!(
-            "kernel_boot: ok case=virtio_net driver_ok=0x0f queue_ready=2 elapsed_ms={}",
-            o.elapsed.as_millis()
+            "kernel_boot: ok case=virtio_net driver_ok=0x0f queue_ready=2 elapsed_ms={} {fields}",
+            o.elapsed.as_millis(),
+            fields = features_result_fields("", &s)
         );
     }
 
@@ -1293,6 +1559,7 @@ mod x86 {
             "default init marker must not appear with the net-tx initrd: {diag}"
         );
         assert_eq!(s.driver_ok_first, Some(0x0F), "net DRIVER_OK: {diag}");
+        assert_features_negotiated(&s, NET_OFFERED_LOW, "net", &diag);
         assert_eq!(s.failed_writes, 0, "net FAILED writes: {diag}");
         assert_eq!(s.queue_ready_one, 2, "net QUEUE_READY=1 count: {diag}");
         assert!(
@@ -1300,9 +1567,10 @@ mod x86 {
             "backend received no frame equal to NET_TX_FRAME: {diag}"
         );
         eprintln!(
-            "kernel_boot: ok case=virtio_net_tx frames={} matched={matched} elapsed_ms={}",
+            "kernel_boot: ok case=virtio_net_tx frames={} matched={matched} elapsed_ms={} {fields}",
             frames.len(),
-            o.elapsed.as_millis()
+            o.elapsed.as_millis(),
+            fields = features_result_fields("", &s)
         );
     }
 
@@ -1370,12 +1638,14 @@ mod x86 {
             "default init marker must not appear with the net-rx initrd: {diag}"
         );
         assert_eq!(s.driver_ok_first, Some(0x0F), "net DRIVER_OK: {diag}");
+        assert_features_negotiated(&s, NET_OFFERED_LOW, "net", &diag);
         assert_eq!(s.failed_writes, 0, "net FAILED writes: {diag}");
         assert_eq!(s.queue_ready_one, 2, "net QUEUE_READY=1 count: {diag}");
         assert_eq!(delivered, 1, "frames delivered to the guest: {diag}");
         eprintln!(
-            "kernel_boot: ok case=virtio_net_rx delivered={delivered} elapsed_ms={}",
-            o.elapsed.as_millis()
+            "kernel_boot: ok case=virtio_net_rx delivered={delivered} elapsed_ms={} {fields}",
+            o.elapsed.as_millis(),
+            fields = features_result_fields("", &s)
         );
     }
 
@@ -1418,13 +1688,15 @@ mod x86 {
             "default init marker must not appear with the net-rx initrd: {diag}"
         );
         assert_eq!(s.driver_ok_first, Some(0x0F), "net DRIVER_OK: {diag}");
+        assert_features_negotiated(&s, NET_OFFERED_LOW, "net", &diag);
         assert_eq!(s.failed_writes, 0, "net FAILED writes: {diag}");
         assert_eq!(s.queue_ready_one, 2, "net QUEUE_READY=1 count: {diag}");
         assert!(recv_calls >= 1, "rx poller never ran: {diag}");
         assert_eq!(delivered, 0, "no frame must be delivered: {diag}");
         eprintln!(
-            "kernel_boot: ok case=virtio_net_rx_no_frame elapsed_ms={}",
-            o.elapsed.as_millis()
+            "kernel_boot: ok case=virtio_net_rx_no_frame elapsed_ms={} {fields}",
+            o.elapsed.as_millis(),
+            fields = features_result_fields("", &s)
         );
     }
 
@@ -1512,10 +1784,11 @@ mod arm64 {
         smp_disabling_param,
     };
     use super::{
-        BLOCK_MISMATCH_MARKER, BLOCK_OK_MARKER, BLOCK_SENTINEL, CountingNetBackend, MARKER,
-        NET_MAC, NET_RX_FAILED_MARKER, NET_RX_FRAME, NET_RX_OK_MARKER, NET_TX_FAILED_MARKER,
-        NET_TX_FRAME, NET_TX_OK_MARKER, VirtioWindowObserver, count_lines_ending_with,
-        count_marker_lines, escape_tail, guest_boot, hex_prefix,
+        BLOCK_MISMATCH_MARKER, BLOCK_OFFERED_LOW, BLOCK_OK_MARKER, BLOCK_SENTINEL,
+        CountingNetBackend, MARKER, NET_MAC, NET_OFFERED_LOW, NET_RX_FAILED_MARKER, NET_RX_FRAME,
+        NET_RX_OK_MARKER, NET_TX_FAILED_MARKER, NET_TX_FRAME, NET_TX_OK_MARKER,
+        VirtioWindowObserver, assert_features_negotiated, count_lines_ending_with,
+        count_marker_lines, escape_tail, features_result_fields, guest_boot, hex_prefix,
     };
     use fandhe_container_microvm::arm64_layout::ARM64_SERIAL_BASE;
     use fandhe_container_microvm::boot_arm64::Arm64ImageHeader;
@@ -2028,12 +2301,14 @@ mod arm64 {
         assert_default_boot_ok(&o, boot_timeout, &diag);
         assert_eq!(o.net_slots, 1, "assembled net devices: {diag}");
         assert_eq!(s.driver_ok_first, Some(0x0F), "net DRIVER_OK: {diag}");
+        assert_features_negotiated(&s, NET_OFFERED_LOW, "net", &diag);
         assert_eq!(s.failed_writes, 0, "net FAILED writes: {diag}");
         assert_eq!(s.queue_ready_one, 2, "net QUEUE_READY=1 count: {diag}");
         eprintln!(
-            "kernel_boot: ok arch=aarch64 case=virtio_net driver_ok=0x0f queue_ready=2 elapsed_ms={} exits={}",
+            "kernel_boot: ok arch=aarch64 case=virtio_net driver_ok=0x0f queue_ready=2 elapsed_ms={} exits={} {fields}",
             o.elapsed.as_millis(),
-            o.exits
+            o.exits,
+            fields = features_result_fields("", &s)
         );
     }
 
@@ -2053,6 +2328,8 @@ mod arm64 {
         assert_eq!(s.driver_ok_first, None, "net DRIVER_OK: {diag}");
         assert_eq!(s.failed_writes, 0, "net FAILED writes: {diag}");
         assert_eq!(s.status_writes, 0, "net STATUS writes: {diag}");
+        assert_eq!(s.features_ok_writes, 0, "net FEATURES_OK writes: {diag}");
+        assert_eq!(s.driver_features, None, "net driver features: {diag}");
         assert_eq!(s.queue_ready_one, 0, "net QUEUE_READY=1 count: {diag}");
     }
 
@@ -2084,15 +2361,19 @@ mod arm64 {
         assert_eq!(o.block_slots, 1, "assembled block devices: {diag}");
         assert_eq!(o.net_slots, 1, "assembled net devices: {diag}");
         assert_eq!(b.driver_ok_first, Some(0x0F), "block DRIVER_OK: {diag}");
+        assert_features_negotiated(&b, BLOCK_OFFERED_LOW, "block", &diag);
         assert_eq!(b.failed_writes, 0, "block FAILED writes: {diag}");
         assert_eq!(b.queue_ready_one, 1, "block QUEUE_READY=1 count: {diag}");
         assert_eq!(n.driver_ok_first, Some(0x0F), "net DRIVER_OK: {diag}");
+        assert_features_negotiated(&n, NET_OFFERED_LOW, "net", &diag);
         assert_eq!(n.failed_writes, 0, "net FAILED writes: {diag}");
         assert_eq!(n.queue_ready_one, 2, "net QUEUE_READY=1 count: {diag}");
         eprintln!(
-            "kernel_boot: ok arch=aarch64 case=virtio_block_and_net block_queue_ready=1 net_queue_ready=2 elapsed_ms={} exits={}",
+            "kernel_boot: ok arch=aarch64 case=virtio_block_and_net block_queue_ready=1 net_queue_ready=2 elapsed_ms={} exits={} {bf} {nf}",
             o.elapsed.as_millis(),
-            o.exits
+            o.exits,
+            bf = features_result_fields("block_", &b),
+            nf = features_result_fields("net_", &n)
         );
     }
 
@@ -2201,6 +2482,7 @@ mod arm64 {
         );
         assert_eq!(o.net_slots, 1, "assembled net devices: {diag}");
         assert_eq!(s.driver_ok_first, Some(0x0F), "net DRIVER_OK: {diag}");
+        assert_features_negotiated(&s, NET_OFFERED_LOW, "net", &diag);
         assert_eq!(s.failed_writes, 0, "net FAILED writes: {diag}");
         assert_eq!(s.queue_ready_one, 2, "net QUEUE_READY=1 count: {diag}");
         assert!(
@@ -2208,10 +2490,11 @@ mod arm64 {
             "backend received no frame equal to NET_TX_FRAME: {diag}"
         );
         eprintln!(
-            "kernel_boot: ok arch=aarch64 case=virtio_net_tx matched={matched} total_frames={} elapsed_ms={} exits={}",
+            "kernel_boot: ok arch=aarch64 case=virtio_net_tx matched={matched} total_frames={} elapsed_ms={} exits={} {fields}",
             frames.len(),
             o.elapsed.as_millis(),
-            o.exits
+            o.exits,
+            fields = features_result_fields("", &s)
         );
     }
 
@@ -2280,13 +2563,15 @@ mod arm64 {
         );
         assert_eq!(o.net_slots, 1, "assembled net devices: {diag}");
         assert_eq!(s.driver_ok_first, Some(0x0F), "net DRIVER_OK: {diag}");
+        assert_features_negotiated(&s, NET_OFFERED_LOW, "net", &diag);
         assert_eq!(s.failed_writes, 0, "net FAILED writes: {diag}");
         assert_eq!(s.queue_ready_one, 2, "net QUEUE_READY=1 count: {diag}");
         assert_eq!(delivered, 1, "exactly one frame must be delivered: {diag}");
         eprintln!(
-            "kernel_boot: ok arch=aarch64 case=virtio_net_rx delivered={delivered} elapsed_ms={} exits={}",
+            "kernel_boot: ok arch=aarch64 case=virtio_net_rx delivered={delivered} elapsed_ms={} exits={} {fields}",
             o.elapsed.as_millis(),
-            o.exits
+            o.exits,
+            fields = features_result_fields("", &s)
         );
     }
 
@@ -2325,14 +2610,16 @@ mod arm64 {
         );
         assert_eq!(o.net_slots, 1, "assembled net devices: {diag}");
         assert_eq!(s.driver_ok_first, Some(0x0F), "net DRIVER_OK: {diag}");
+        assert_features_negotiated(&s, NET_OFFERED_LOW, "net", &diag);
         assert_eq!(s.failed_writes, 0, "net FAILED writes: {diag}");
         assert_eq!(s.queue_ready_one, 2, "net QUEUE_READY=1 count: {diag}");
         assert!(recv_calls >= 1, "rx poller never ran: {diag}");
         assert_eq!(delivered, 0, "no frame must be delivered: {diag}");
         eprintln!(
-            "kernel_boot: ok arch=aarch64 case=virtio_net_rx_no_frame elapsed_ms={} exits={}",
+            "kernel_boot: ok arch=aarch64 case=virtio_net_rx_no_frame elapsed_ms={} exits={} {fields}",
             o.elapsed.as_millis(),
-            o.exits
+            o.exits,
+            fields = features_result_fields("", &s)
         );
     }
 

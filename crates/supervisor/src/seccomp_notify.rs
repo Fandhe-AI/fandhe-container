@@ -234,37 +234,78 @@ impl Counters {
     }
 }
 
+/// seccomp 通知の集計行（構造化ログ）の `event` の閉じた語彙（SEC-4・SUP-6・REPAIR-4・#4233）。
+///
+/// 行の出口は 2 つある。exec 経路は [`report_lines`] の行を core の `emit_diagnostic_line_to` で helper の fd 2 へ出し、
+/// start 経路は `emit_report` が共有の stderr sink へ出す。読み手の `fandhe-container-plugin-cri` の
+/// `streaming::exec_launcher::diagnostics` は、fd 2 の行の `event` を [`Self::from_token`] で引き直し、失敗の欄を
+/// 持たない語彙内の行として出さずに数える（unparsed と区別するため）。生成側の語彙をこの型 1 つに寄せ、文字列の
+/// 二重管理によるずれを防ぐ。start 経路のハブだけが出す `seccomp_notify_join_timeout` は fd 2 に来ないため含めない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeccompReportEvent {
+    /// 抑止（トークンバケット超過）した件数。
+    Suppressed,
+    /// 期限切れ直後に届いた通知の件数。
+    Late,
+    /// 監査へ記録できなかった件数。
+    Unrecorded,
+    /// 応答前に対象が消えた件数。
+    TargetGone,
+    /// 対象の pid を解決できなかった件数。
+    PidUnresolved,
+    /// 応答に失敗した件数。
+    RespondFailed,
+    /// 待ちに失敗した件数。
+    WaitFailed,
+    /// 受信に失敗した件数。
+    ReceiveFailed,
+}
+
+impl SeccompReportEvent {
+    /// 全語彙（出力の順序もこの並び）。
+    pub const ALL: [Self; 8] = [
+        Self::Suppressed,
+        Self::Late,
+        Self::Unrecorded,
+        Self::TargetGone,
+        Self::PidUnresolved,
+        Self::RespondFailed,
+        Self::WaitFailed,
+        Self::ReceiveFailed,
+    ];
+
+    /// 構造化ログの `event` の値（固定の静的文字列）。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Suppressed => "seccomp_audit_suppressed",
+            Self::Late => "seccomp_audit_late",
+            Self::Unrecorded => "seccomp_audit_unrecorded",
+            Self::TargetGone => "seccomp_audit_target_gone",
+            Self::PidUnresolved => "seccomp_audit_pid_unresolved",
+            Self::RespondFailed => "seccomp_audit_respond_failed",
+            Self::WaitFailed => "seccomp_audit_wait_failed",
+            Self::ReceiveFailed => "seccomp_audit_receive_failed",
+        }
+    }
+
+    /// 受信した `event` の値を閉じた語彙で引き直す。語彙外は `None`。
+    pub fn from_token(token: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|e| e.as_str() == token)
+    }
+}
+
 /// 構造化ログの固定語彙と値の組。入力由来の値は含めない。
-fn report_events(now: CounterSnapshot, prev: CounterSnapshot) -> Vec<(&'static str, u64)> {
+fn report_events(now: CounterSnapshot, prev: CounterSnapshot) -> Vec<(SeccompReportEvent, u64)> {
+    use SeccompReportEvent as E;
     [
-        ("seccomp_audit_suppressed", now.suppressed, prev.suppressed),
-        ("seccomp_audit_late", now.late, prev.late),
-        ("seccomp_audit_unrecorded", now.unrecorded, prev.unrecorded),
-        (
-            "seccomp_audit_target_gone",
-            now.target_gone,
-            prev.target_gone,
-        ),
-        (
-            "seccomp_audit_pid_unresolved",
-            now.pid_unresolved,
-            prev.pid_unresolved,
-        ),
-        (
-            "seccomp_audit_respond_failed",
-            now.respond_failed,
-            prev.respond_failed,
-        ),
-        (
-            "seccomp_audit_wait_failed",
-            now.wait_failed,
-            prev.wait_failed,
-        ),
-        (
-            "seccomp_audit_receive_failed",
-            now.receive_failed,
-            prev.receive_failed,
-        ),
+        (E::Suppressed, now.suppressed, prev.suppressed),
+        (E::Late, now.late, prev.late),
+        (E::Unrecorded, now.unrecorded, prev.unrecorded),
+        (E::TargetGone, now.target_gone, prev.target_gone),
+        (E::PidUnresolved, now.pid_unresolved, prev.pid_unresolved),
+        (E::RespondFailed, now.respond_failed, prev.respond_failed),
+        (E::WaitFailed, now.wait_failed, prev.wait_failed),
+        (E::ReceiveFailed, now.receive_failed, prev.receive_failed),
     ]
     .into_iter()
     .filter_map(|(event, n, p)| n.checked_sub(p).filter(|d| *d > 0).map(|d| (event, d)))
@@ -272,8 +313,11 @@ fn report_events(now: CounterSnapshot, prev: CounterSnapshot) -> Vec<(&'static s
 }
 
 /// 構造化ログ 1 行（改行なし）。語彙 `event` は固定で、`count` は数値のみ。
-fn report_line(event: &str, count: u64) -> String {
-    format!("{{\"component\":\"supervisor\",\"event\":\"{event}\",\"count\":{count}}}")
+fn report_line(event: SeccompReportEvent, count: u64) -> String {
+    format!(
+        "{{\"component\":\"supervisor\",\"event\":\"{}\",\"count\":{count}}}",
+        event.as_str()
+    )
 }
 
 /// 集計の構造化ログの行（改行なし。固定語彙と数値のみ）。単一スレッドを保つ exec の親は、共有の出力口（専用スレッドを
@@ -285,9 +329,9 @@ pub fn report_lines(counts: CounterSnapshot) -> Vec<String> {
         .collect()
 }
 
-fn emit_report(events: &[(&'static str, u64)]) {
+fn emit_report(events: &[(SeccompReportEvent, u64)]) {
     for (event, count) in events {
-        let line = format!("{}\n", report_line(event, *count));
+        let line = format!("{}\n", report_line(*event, *count));
         // 満杯・書き込み失敗でも処理は止めない（ログの欠落は許す。REPAIR-5）。
         let _ = crate::stderr_sink::stderr().emit(line.into_bytes());
     }
@@ -1544,6 +1588,53 @@ mod tests {
         assert_eq!((snap.wait_failed, snap.receive_failed), (0, 0));
     }
 
+    /// 語彙は閉じており、往復し、語彙外は引けない（#4233）。
+    #[test]
+    fn sup6_4233_seccomp_report_event_vocabulary_is_exact() {
+        let names: Vec<&str> = SeccompReportEvent::ALL.iter().map(|e| e.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "seccomp_audit_suppressed",
+                "seccomp_audit_late",
+                "seccomp_audit_unrecorded",
+                "seccomp_audit_target_gone",
+                "seccomp_audit_pid_unresolved",
+                "seccomp_audit_respond_failed",
+                "seccomp_audit_wait_failed",
+                "seccomp_audit_receive_failed",
+            ]
+        );
+        for e in SeccompReportEvent::ALL {
+            assert_eq!(SeccompReportEvent::from_token(e.as_str()), Some(e));
+        }
+        for bad in ["seccomp_audit_bogus", "seccomp_notify_join_timeout", ""] {
+            assert_eq!(SeccompReportEvent::from_token(bad), None);
+        }
+        let all = CounterSnapshot {
+            suppressed: 1,
+            late: 1,
+            unrecorded: 1,
+            target_gone: 1,
+            pid_unresolved: 1,
+            respond_failed: 1,
+            wait_failed: 1,
+            receive_failed: 1,
+            ..CounterSnapshot::default()
+        };
+        let lines = report_lines(all);
+        assert_eq!(lines.len(), 8);
+        for (line, e) in lines.iter().zip(SeccompReportEvent::ALL) {
+            assert_eq!(
+                *line,
+                format!(
+                    "{{\"component\":\"supervisor\",\"event\":\"{}\",\"count\":1}}",
+                    e.as_str()
+                )
+            );
+        }
+    }
+
     /// 構造化ログの語彙は固定で、増分のあるものだけを出す。
     #[test]
     fn sec4_2025_report_events_are_fixed_vocabulary_deltas() {
@@ -1558,7 +1649,10 @@ mod tests {
         };
         assert_eq!(
             report_events(now, prev),
-            vec![("seccomp_audit_suppressed", 3), ("seccomp_audit_late", 1)]
+            vec![
+                (SeccompReportEvent::Suppressed, 3),
+                (SeccompReportEvent::Late, 1)
+            ]
         );
         assert!(report_events(now, now).is_empty());
     }

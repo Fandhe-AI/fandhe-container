@@ -97,7 +97,8 @@ use super::exec::{
 };
 use super::message::{RpcStatus, count_top_level_field};
 use super::publish::{
-    EventGuard, EventPublisher, PublishFailure, PublishStage, TaskEvent, TaskExit,
+    EventGuard, EventPublisher, PublishFailure, PublishStage, TaskCreate, TaskDelete, TaskEvent,
+    TaskExit, TaskIo, TaskStart,
 };
 use super::service::shutdown_gate_failure;
 use super::service::{CallContext, TaskApiVersion, TtrpcService, unimplemented_status};
@@ -148,7 +149,7 @@ pub struct TaskService {
     ///
     /// v2 と v3 を同じ shim に登録するときは [`TaskService::with_shared_created`] で共有する。
     created: Arc<Mutex<BTreeSet<String>>>,
-    /// TaskExit の送り先。無ければ終了 watcher を起こさない（#4155・CRI-5）。
+    /// イベント 4 種の送り先。無ければ Create・Start・Delete は送らず、終了 watcher も起こさない（#4155・#4156・CRI-5）。
     event_publisher: Option<Arc<dyn EventPublisher>>,
     /// 稼働中の終了 watcher の ID。v2 と v3 で共有し、同じ ID の watcher を重複させず、数を `MAX_EXIT_WATCHERS` で抑える。
     /// 値は作成世代のトークン。Delete が登録を外し、世代が違う watcher は publish しない（#4155）。
@@ -179,7 +180,7 @@ impl TaskService {
         }
     }
 
-    /// TaskExit の送り先を差し込む。差し込むと、init の `Start` 成功ごとに終了 watcher を 1 本起こし、
+    /// イベントの送り先を差し込む。差し込むと、Create・Start・Delete の成功ごとにイベントを投入し、init の `Start` 成功ごとに終了 watcher を 1 本起こし、
     /// 終了を観測したら 1 回だけ publish する（#4155・CRI-5・REPAIR-5）。Start・Wait・State・Delete の応答は変えない。
     ///
     /// watcher は `RuntimeAdapter::wait_exit` を期限つきで繰り返す。plugin-cri の `CoreLifecycleRuntime` は呼び出しごとに
@@ -580,10 +581,25 @@ impl TaskService {
                 .purge_container(container)
                 .map_err(|e| to_status(&e))?;
         }
-        Ok(CreateTaskResponse {
-            pid: status.pid.unwrap_or(0),
+        let pid = status.pid.unwrap_or(0);
+        // #4156: 成功する直前（ゲート保持中）に投入する。失敗した RPC では出さない。
+        self.emit(TaskEvent::Create(TaskCreate {
+            container_id: req.id.clone(),
+            bundle: req.bundle.clone(),
+            rootfs: Vec::new(),
+            io: Some(TaskIo::default()),
+            checkpoint: String::new(),
+            pid,
+        }));
+        Ok(CreateTaskResponse { pid }.encode_to_vec())
+    }
+
+    /// Create・Start・Delete の成功イベントを投入する（#4156）。publisher が無ければ何もしない。
+    /// 世代の guard は使わない（完了済みの RPC の事実の記録で、投入順はコンテナのゲートが決める）。
+    fn emit(&self, event: TaskEvent) {
+        if let Some(publisher) = &self.event_publisher {
+            publisher.publish(event);
         }
-        .encode_to_vec())
     }
 
     fn start(&self, payload: &[u8]) -> Result<Vec<u8>, RpcStatus> {
@@ -600,11 +616,14 @@ impl TaskService {
             None => None,
         };
         let status = self.adapter.start(&req.id).map_err(|e| to_status(&e))?;
-        self.spawn_exit_watcher(&req.id, status.pid.unwrap_or(0));
-        Ok(StartResponse {
-            pid: status.pid.unwrap_or(0),
-        }
-        .encode_to_vec())
+        let pid = status.pid.unwrap_or(0);
+        // TaskStart を TaskExit より先に投入する（速く終わるコンテナでも順序を保つ。#4156）。
+        self.emit(TaskEvent::Start(TaskStart {
+            container_id: req.id.clone(),
+            pid,
+        }));
+        self.spawn_exit_watcher(&req.id, pid);
+        Ok(StartResponse { pid }.encode_to_vec())
     }
 
     /// 同じ ID の終了 watcher を取り消す。取り消しの印（`revoked`）を先に立ててから登録表から外す。
@@ -709,12 +728,19 @@ impl TaskService {
                 .purge_container(container)
                 .map_err(|e| to_status(&e))?;
         }
-        Ok(DeleteResponse {
+        let resp = DeleteResponse {
             pid: before.pid.unwrap_or(0),
             exit_status: exit_status_of(&before),
             exited_at: exited_at_of(&before),
-        }
-        .encode_to_vec())
+        };
+        self.emit(TaskEvent::Delete(TaskDelete {
+            container_id: req.id.clone(),
+            pid: resp.pid,
+            exit_status: resp.exit_status,
+            exited_at: resp.exited_at.clone(),
+            id: req.id.clone(),
+        }));
+        Ok(resp.encode_to_vec())
     }
 
     /// `Delete(exec_id)`: 未起動または終了済みの exec の登録を除去する（#3681・CRI-5）。
@@ -3420,6 +3446,120 @@ mod tests {
         (s, f, cap)
     }
 
+    // ---- Create・Start・Delete のイベント（#4156・CRI-5・REPAIR-5） ----
+
+    /// CRI-5・#4156: V2 / V3 の両方で、Create → Start → 停止 → Delete が TaskCreate・TaskStart・TaskExit・TaskDelete を
+    /// この順に具体値で投入し、Delete の値は `DeleteResponse` と一致する。
+    #[test]
+    fn cri5_4156_create_start_delete_publish_events_in_order() {
+        for v in [TaskApiVersion::V2, TaskApiVersion::V3] {
+            let fake = Fake {
+                create_pid: Some(4242),
+                ..Fake::default()
+            };
+            let (s, f) = svc(v, fake);
+            let cap = Arc::new(CapturePublisher::default());
+            let s = fast_wait(s, 100).with_event_publisher(cap.clone());
+            let created = s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
+            assert_eq!(CreateTaskResponse::decode(&created[..]).unwrap().pid, 4242);
+            s.handle("Start", &start_req("c1")).unwrap();
+            stopped_with_time(&f, "c1", Some(3), 1_700_000_000_000_000_005);
+            assert!(wait_until(std::time::Duration::from_secs(10), || {
+                cap.events.lock().unwrap().len() >= 3
+            }));
+            let out = s.handle("Delete", &delete_req("c1", "")).unwrap();
+            let resp = DeleteResponse::decode(&out[..]).unwrap();
+            let evs = cap.events.lock().unwrap().clone();
+            assert_eq!(evs.len(), 4, "{v:?}: {evs:?}");
+            assert_eq!(
+                evs[0],
+                Ev::Create(TaskCreate {
+                    container_id: "c1".into(),
+                    bundle: abs("/b"),
+                    rootfs: Vec::new(),
+                    io: Some(TaskIo::default()),
+                    checkpoint: String::new(),
+                    pid: 4242,
+                })
+            );
+            assert_eq!(
+                evs[1],
+                Ev::Start(TaskStart {
+                    container_id: "c1".into(),
+                    pid: 4242
+                })
+            );
+            assert!(matches!(&evs[2], Ev::Exit(_)));
+            assert_eq!(
+                evs[3],
+                Ev::Delete(TaskDelete {
+                    container_id: "c1".into(),
+                    pid: resp.pid,
+                    exit_status: 3,
+                    exited_at: resp.exited_at.clone(),
+                    id: "c1".into(),
+                })
+            );
+            assert_eq!(resp.exit_status, 3);
+            assert!(resp.exited_at.is_some());
+            assert!(cap.failures.lock().unwrap().is_empty());
+        }
+    }
+
+    /// CRI-5・#4156: 失敗した Create・Start・Delete はイベントを出さない。
+    #[test]
+    fn cri5_4156_failed_rpcs_publish_nothing() {
+        let (s, _f, cap) = svc_pub(Fake::default());
+        // Create の拒否（相対 bundle・terminal・stdio）。
+        assert!(s.handle("Create", &create_req("c1", "rel/b")).is_err());
+        let term = CreateTaskRequest {
+            id: "c1".into(),
+            bundle: abs("/b"),
+            terminal: true,
+            ..Default::default()
+        }
+        .encode_to_vec();
+        assert!(s.handle("Create", &term).is_err());
+        let io = CreateTaskRequest {
+            id: "c1".into(),
+            bundle: abs("/b"),
+            stdout: "/x".into(),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        assert!(s.handle("Create", &io).is_err());
+        // 存在しない ID の Start・Delete。
+        assert!(s.handle("Start", &start_req("nope")).is_err());
+        assert!(s.handle("Delete", &delete_req("nope", "")).is_err());
+        assert!(cap.events.lock().unwrap().is_empty());
+        // 実行中のコンテナの Delete は拒否され、増えるのは Create・Start の 2 件だけ。
+        s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
+        s.handle("Start", &start_req("c1")).unwrap();
+        assert!(s.handle("Delete", &delete_req("c1", "")).is_err());
+        let evs = cap.events.lock().unwrap().clone();
+        assert!(
+            matches!(evs.as_slice(), [Ev::Create(_), Ev::Start(_)]),
+            "{evs:?}"
+        );
+    }
+
+    /// CRI-5・#4156: exec の経路（Exec・Start(exec_id)・Delete(exec_id)）はイベントを出さない。
+    #[test]
+    fn cri5_4156_exec_paths_publish_nothing() {
+        let (s, _f, _l) = svc_exec(TaskApiVersion::V2);
+        let cap = Arc::new(CapturePublisher::default());
+        let s = fast_wait(s, 100).with_event_publisher(cap.clone());
+        running_container(&s, "c1");
+        s.handle("Exec", &exec_req("c1", "e1", SPEC)).unwrap();
+        s.handle("Start", &start_exec_req("c1", "e1")).unwrap();
+        let _ = s.handle("Delete", &delete_req("c1", "e1"));
+        let evs = cap.events.lock().unwrap().clone();
+        assert!(
+            matches!(evs.as_slice(), [Ev::Create(_), Ev::Start(_)]),
+            "{evs:?}"
+        );
+    }
+
     /// CRI-5・#4155: Start 成功後の watcher が終了を観測し、TaskExit を具体値で 1 回だけ送る。
     /// 同じ ID の watcher は重複しない。
     #[test]
@@ -3434,26 +3574,43 @@ mod tests {
         s.spawn_exit_watcher("c1", 4242);
         assert_eq!(s.exit_watchers.lock().unwrap().len(), 1);
         std::thread::sleep(std::time::Duration::from_millis(250));
-        assert!(cap.events.lock().unwrap().is_empty(), "running: no event");
+        let head = vec![
+            Ev::Create(TaskCreate {
+                container_id: "c1".into(),
+                bundle: abs("/b"),
+                rootfs: Vec::new(),
+                io: Some(TaskIo::default()),
+                checkpoint: String::new(),
+                pid: 4242,
+            }),
+            Ev::Start(TaskStart {
+                container_id: "c1".into(),
+                pid: 4242,
+            }),
+        ];
+        assert_eq!(
+            *cap.events.lock().unwrap(),
+            head,
+            "running: Create and Start only"
+        );
         stopped_with_time(&f, "c1", Some(3), 1_700_000_000_000_000_005);
         assert!(wait_until(std::time::Duration::from_secs(10), || {
-            !cap.events.lock().unwrap().is_empty()
+            cap.events.lock().unwrap().len() > 2
         }));
         std::thread::sleep(std::time::Duration::from_millis(300));
         let got = cap.events.lock().unwrap().clone();
-        assert_eq!(
-            got,
-            vec![Ev::Exit(TaskExit {
-                container_id: "c1".into(),
-                id: "c1".into(),
-                pid: 4242,
-                exit_status: 3,
-                exited_at: Some(Timestamp {
-                    seconds: 1_700_000_000,
-                    nanos: 5
-                }),
-            })]
-        );
+        let mut want = head;
+        want.push(Ev::Exit(TaskExit {
+            container_id: "c1".into(),
+            id: "c1".into(),
+            pid: 4242,
+            exit_status: 3,
+            exited_at: Some(Timestamp {
+                seconds: 1_700_000_000,
+                nanos: 5,
+            }),
+        }));
+        assert_eq!(got, want);
         assert!(cap.failures.lock().unwrap().is_empty());
         assert!(wait_until(std::time::Duration::from_secs(5), || {
             s.exit_watchers.lock().unwrap().values().all(|e| e.done)
@@ -3470,7 +3627,12 @@ mod tests {
         assert!(wait_until(std::time::Duration::from_secs(5), || {
             s.exit_watchers.lock().unwrap().values().all(|e| e.done)
         }));
-        assert!(cap.events.lock().unwrap().is_empty());
+        // Exit は出ない（Create・Start だけ。#4156）。
+        let got = cap.events.lock().unwrap().clone();
+        assert!(
+            matches!(got.as_slice(), [Ev::Create(_), Ev::Start(_)]),
+            "{got:?}"
+        );
         assert!(cap.failures.lock().unwrap().is_empty());
     }
 
@@ -3516,7 +3678,7 @@ mod tests {
         ));
         st.pid = Some(9999);
         watch.publish_exit(&st);
-        assert!(cap.events.lock().unwrap().is_empty());
+        assert!(cap.events.lock().unwrap().is_empty()); // watch を直接呼ぶのでサービスのイベントは無い
         let fails = cap.failures.lock().unwrap().clone();
         assert_eq!(fails.len(), 1);
         assert_eq!(fails[0].stage, Stage::InstanceMismatch);
@@ -3524,7 +3686,9 @@ mod tests {
         watch.publish_exit(&st);
         let evs = cap.events.lock().unwrap().clone();
         assert_eq!(evs.len(), 1);
-        let Ev::Exit(e) = &evs[0];
+        let Ev::Exit(e) = &evs[0] else {
+            panic!("{evs:?}")
+        };
         assert_eq!((e.pid, e.exit_status, e.exited_at.clone()), (4242, 0, None));
     }
 
@@ -3594,13 +3758,23 @@ mod tests {
                 .generation,
             new
         );
+        let evs = cap.events.lock().unwrap().clone();
         assert!(
-            cap.events
-                .lock()
-                .unwrap()
-                .iter()
-                .all(|e| matches!(e, Ev::Exit(x) if x.exit_status == 0)),
+            evs.iter()
+                .all(|e| !matches!(e, Ev::Exit(x) if x.exit_status != 0)),
+            "{evs:?}"
         );
+        // Create・Start・Delete・Create・Start の並び（Exit は旧世代の取り消しで揺れるため除く。#4156）。
+        let kinds: Vec<&str> = evs
+            .iter()
+            .filter_map(|e| match e {
+                Ev::Create(_) => Some("create"),
+                Ev::Start(_) => Some("start"),
+                Ev::Delete(_) => Some("delete"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(kinds, ["create", "start", "delete", "create", "start"]);
     }
 
     /// CRI-5・#4155: 確認後・キュー投入後に Delete・再作成されても、投入時に渡した述語が旧世代を無効と返す。
@@ -3722,7 +3896,7 @@ mod tests {
     }
 
     /// REPAIR-5・CRI-5・#4155: publish バイナリが非 0 終了・期限超過でも、Start・State・Wait・Delete の応答は
-    /// publisher 無しと同じバイト列で、ログの失敗はちょうど 1 件。
+    /// publisher 無しと同じバイト列で、ログの失敗は 4 件（create・start・exit・delete の順。#4156）。
     #[cfg(unix)]
     #[test]
     fn repair5_4155_rpc_responses_unchanged_when_publish_fails() {
@@ -3781,9 +3955,10 @@ mod tests {
             let (with_pub, f1) = svc(TaskApiVersion::V2, Fake::default());
             let with_pub = fast_wait(with_pub, 100).with_event_publisher(publisher);
             let mut a = run(&with_pub, &f1);
-            // watcher が終了を観測して publish が失敗してから残りを呼ぶ。
-            assert!(wait_until(std::time::Duration::from_secs(10), || {
-                !log.0.lock().unwrap().is_empty()
+            // Create・Start・Exit の 3 件の publish が失敗してから残りを呼ぶ（先に Delete すると
+            // 世代 guard が Exit を捨てて件数が揺れる。#4156）。
+            assert!(wait_until(std::time::Duration::from_secs(20), || {
+                log.0.lock().unwrap().len() >= 3
             }));
             a.extend(tail(&with_pub));
 
@@ -3793,10 +3968,23 @@ mod tests {
             b.extend(tail(&plain));
 
             assert_eq!(a, b, "{name}");
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(wait_until(std::time::Duration::from_secs(20), || {
+                log.0.lock().unwrap().len() >= 4
+            }));
             let got = log.0.lock().unwrap().clone();
-            assert_eq!(got.len(), 1, "{name}: {got:?}");
-            assert_eq!(got[0].stage, deadline_stage, "{name}");
+            assert_eq!(got.len(), 4, "{name}: {got:?}");
+            let topics: Vec<_> = got.iter().map(|f| f.topic).collect();
+            assert_eq!(
+                topics,
+                [
+                    Some("/tasks/create"),
+                    Some("/tasks/start"),
+                    Some("/tasks/exit"),
+                    Some("/tasks/delete")
+                ],
+                "{name}"
+            );
+            assert!(got.iter().all(|f| f.stage == deadline_stage), "{name}");
         }
     }
 }

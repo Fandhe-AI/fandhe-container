@@ -1,6 +1,7 @@
-//! shim v2 のイベント publish（TaskExit）。期限つきの子プロセスで containerd の `publish` を呼ぶ（CRI-5・TASK-62.6・REPAIR-3・REPAIR-5・#4155）。
+//! shim v2 のイベント publish（TaskCreate・TaskStart・TaskDelete・TaskExit の 4 種）。期限つきの子プロセスで containerd の `publish` を呼ぶ（CRI-5・TASK-62.6・REPAIR-3・REPAIR-5・#4155）。
 //!
-//! containerd（特に CRI）はコンテナの終了を `/tasks/exit` の TaskExit で知る。shim は `-publish-binary`
+//! containerd（特に CRI）はコンテナの終了を `/tasks/exit` の TaskExit で知る。Create・Start・Delete の成功も
+//! `/tasks/create`・`/tasks/start`・`/tasks/delete` で送る（#4156。init だけで、exec の経路は送らない）。shim は `-publish-binary`
 //! （検証済みの `PublishBinary`。#4154）を子として起動し、stdin へ `google.protobuf.Any` を渡す。
 //! 呼び出し元は [`super::task_service::TaskService`] の終了 watcher（`Start` 成功後に起こす）で、
 //! 差し込み口は `exec_publisher_for`（plugin-cri の `registry_in` が呼ぶ）。
@@ -16,7 +17,11 @@
 //!   ログは段名・errno・終了コード・シグナル・topic だけを持ち、argv・アドレス・namespace・コンテナ ID・環境変数・イベントの本文は出さない（REPAIR-4）。
 //!
 //! 範囲外（REPAIR-3。未実装を装わない）と残余:
-//! - TaskExit 以外の種別（TaskCreate・TaskStart・TaskDelete）は #4156。[`TaskEvent`] へ種別を足して再利用する。
+//! - 送らない種別: TaskExecAdded・TaskExecStarted・TaskPaused・TaskResumed・TaskCheckpointed・TaskOOM（対応する RPC・仕組みが無い）。
+//! - Create・Start・Delete は RPC が成功する直前に 1 回だけ [`EventPublisher::publish`] で投入する（世代の guard は使わない。完了済みの事実の記録で、
+//!   ゲート保持中の投入順が FIFO の worker で保たれる）。符号化後 [`MAX_EVENT_LEN`] を超える TaskCreate（bundle が約 3.6 KiB 超）は送れず、
+//!   `encode` の失敗が 1 件記録される（RPC の応答は変えない）。上限を上げるのは stdin 書き込みの非ブロッキング化と同時に再評価する。
+//! - shim の Shutdown でキューに残った未送信のイベントは捨てうる（worker は切り離されたスレッド。排出は未実装）。
 //! - `Child::kill` は直接の子だけを止める。publish バイナリの孫は止めない（containerd の `publish` は fork しない）。
 //!   プロセスグループごとの kill は `sys` の新規 unsafe が要るため採らない。
 //! - D 状態で kill が効かない子は猶予の後に放置する（shim の終了までゾンビが残りうる）。
@@ -33,6 +38,18 @@ use crate::error::CriError;
 
 /// TaskExit の type URL（接頭辞なし。containerd の `typeurl` の形）。
 pub const TASK_EXIT_TYPE_URL: &str = "containerd.events.TaskExit";
+/// TaskCreate の type URL。
+pub const TASK_CREATE_TYPE_URL: &str = "containerd.events.TaskCreate";
+/// TaskStart の type URL。
+pub const TASK_START_TYPE_URL: &str = "containerd.events.TaskStart";
+/// TaskDelete の type URL。
+pub const TASK_DELETE_TYPE_URL: &str = "containerd.events.TaskDelete";
+/// TaskCreate の topic。
+pub const TASK_CREATE_TOPIC: &str = "/tasks/create";
+/// TaskStart の topic。
+pub const TASK_START_TOPIC: &str = "/tasks/start";
+/// TaskDelete の topic。
+pub const TASK_DELETE_TOPIC: &str = "/tasks/delete";
 /// TaskExit の topic。
 pub const TASK_EXIT_TOPIC: &str = "/tasks/exit";
 /// 符号化後の `Any` の上限。pipe の容量（`PIPE_BUF` 以上）に収め、stdin への書き込みがブロックしないようにする。
@@ -60,10 +77,87 @@ pub struct TaskExit {
     pub exited_at: Option<Timestamp>,
 }
 
-/// publish するイベント。種別は #4156 が足す。
+/// TaskCreate・TaskDelete が載せる `containerd.events.TaskIO`（`api/events/task.proto`）。
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct TaskIo {
+    /// stdin（常に空）。
+    #[prost(string, tag = "1")]
+    pub stdin: String,
+    /// stdout（常に空）。
+    #[prost(string, tag = "2")]
+    pub stdout: String,
+    /// stderr（常に空）。
+    #[prost(string, tag = "3")]
+    pub stderr: String,
+    /// pty の要否。
+    #[prost(bool, tag = "4")]
+    pub terminal: bool,
+}
+
+/// `containerd.events.TaskCreate`（番号 1〜6）。
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct TaskCreate {
+    /// コンテナ ID。
+    #[prost(string, tag = "1")]
+    pub container_id: String,
+    /// OCI bundle のパス。
+    #[prost(string, tag = "2")]
+    pub bundle: String,
+    /// rootfs の mount（Create が非空を拒否するため常に空）。
+    #[prost(message, repeated, tag = "3")]
+    pub rootfs: Vec<super::task_api::Mount>,
+    /// IO（runc は常に非 nil で送る）。
+    #[prost(message, optional, tag = "4")]
+    pub io: Option<TaskIo>,
+    /// checkpoint（常に空）。
+    #[prost(string, tag = "5")]
+    pub checkpoint: String,
+    /// init の pid。
+    #[prost(uint32, tag = "6")]
+    pub pid: u32,
+}
+
+/// `containerd.events.TaskStart`（番号 1〜2）。
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct TaskStart {
+    /// コンテナ ID。
+    #[prost(string, tag = "1")]
+    pub container_id: String,
+    /// init の pid。
+    #[prost(uint32, tag = "2")]
+    pub pid: u32,
+}
+
+/// `containerd.events.TaskDelete`（番号 1〜5）。
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct TaskDelete {
+    /// コンテナ ID。
+    #[prost(string, tag = "1")]
+    pub container_id: String,
+    /// 削除前の pid（無ければ 0）。
+    #[prost(uint32, tag = "2")]
+    pub pid: u32,
+    /// 終了コード（`DeleteResponse` と同じ値）。
+    #[prost(uint32, tag = "3")]
+    pub exit_status: u32,
+    /// 終了時刻（未記録は未設定）。
+    #[prost(message, optional, tag = "4")]
+    pub exited_at: Option<Timestamp>,
+    /// プロセス ID（init は `container_id` と同じ。runc shim の `p.ID()` に揃える）。
+    #[prost(string, tag = "5")]
+    pub id: String,
+}
+
+/// publish するイベント（#4155・#4156）。
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum TaskEvent {
+    /// コンテナの作成成功（`/tasks/create`）。
+    Create(TaskCreate),
+    /// init の起動成功（`/tasks/start`）。
+    Start(TaskStart),
+    /// コンテナの削除成功（`/tasks/delete`）。
+    Delete(TaskDelete),
     /// コンテナ init の終了（`/tasks/exit`）。
     Exit(TaskExit),
 }
@@ -72,6 +166,9 @@ impl TaskEvent {
     /// イベントの topic（固定語彙）。
     pub fn topic(&self) -> &'static str {
         match self {
+            Self::Create(_) => TASK_CREATE_TOPIC,
+            Self::Start(_) => TASK_START_TOPIC,
+            Self::Delete(_) => TASK_DELETE_TOPIC,
             Self::Exit(_) => TASK_EXIT_TOPIC,
         }
     }
@@ -79,6 +176,9 @@ impl TaskEvent {
     /// stdin へ渡す `Any` の符号化。上限（[`MAX_EVENT_LEN`]）を超えたら失敗する。
     pub fn encode_any(&self) -> Result<Vec<u8>, PublishFailure> {
         let (type_url, value) = match self {
+            Self::Create(e) => (TASK_CREATE_TYPE_URL, e.encode_to_vec()),
+            Self::Start(e) => (TASK_START_TYPE_URL, e.encode_to_vec()),
+            Self::Delete(e) => (TASK_DELETE_TYPE_URL, e.encode_to_vec()),
             Self::Exit(e) => (TASK_EXIT_TYPE_URL, e.encode_to_vec()),
         };
         let bytes = Any {
@@ -567,7 +667,10 @@ pub(crate) mod testkit {
 
     #[cfg(unix)]
     use super::PublishLog;
-    use super::{EventPublisher, PublishFailure, TaskEvent};
+    use super::{
+        EventPublisher, PublishFailure, TaskCreate, TaskDelete, TaskEvent, TaskIo, TaskStart,
+    };
+    use crate::shim_v2::task_api::Timestamp;
 
     /// 捕捉用の出力先。
     #[cfg(unix)]
@@ -639,6 +742,34 @@ pub(crate) mod testkit {
         )
     }
 
+    /// Create・Start・Delete の見本（#4156）。
+    pub(crate) fn three_events() -> [TaskEvent; 3] {
+        [
+            TaskEvent::Create(TaskCreate {
+                container_id: "c1".into(),
+                bundle: "/run/b".into(),
+                rootfs: Vec::new(),
+                io: Some(TaskIo::default()),
+                checkpoint: String::new(),
+                pid: 4242,
+            }),
+            TaskEvent::Start(TaskStart {
+                container_id: "c1".into(),
+                pid: 4242,
+            }),
+            TaskEvent::Delete(TaskDelete {
+                container_id: "c1".into(),
+                pid: 4242,
+                exit_status: 3,
+                exited_at: Some(Timestamp {
+                    seconds: 1_700_000_000,
+                    nanos: 5,
+                }),
+                id: "c1".into(),
+            }),
+        ]
+    }
+
     /// 条件が真になるまで期限つきで待つ。
     pub(crate) fn wait_until(limit: Duration, mut cond: impl FnMut() -> bool) -> bool {
         let until = Instant::now() + limit;
@@ -656,6 +787,7 @@ pub(crate) mod testkit {
 
 #[cfg(test)]
 mod tests {
+    use super::testkit::three_events;
     use super::*;
 
     /// CRI-5・#4155: TaskExit を符号化した `Any` は具体値で往復し、type URL と topic は固定語彙。
@@ -690,6 +822,52 @@ mod tests {
         );
         // 番号 1..=5 の wire 形式（container_id = 1 の長さ付き文字列が先頭）。
         assert_eq!(&any.value[..4], &[0x0a, 0x02, b'c', b'1']);
+    }
+
+    /// CRI-5・#4156: TaskCreate・TaskStart・TaskDelete の `Any` は具体値で往復し、type URL と topic は固定語彙。
+    #[test]
+    fn cri5_4156_task_create_start_delete_encode_as_any() {
+        let [c, s, d] = three_events();
+        for (ev, topic, url) in [
+            (&c, "/tasks/create", "containerd.events.TaskCreate"),
+            (&s, "/tasks/start", "containerd.events.TaskStart"),
+            (&d, "/tasks/delete", "containerd.events.TaskDelete"),
+        ] {
+            assert_eq!(ev.topic(), topic);
+            let any = Any::decode(ev.encode_any().unwrap().as_slice()).unwrap();
+            assert_eq!(any.type_url, url);
+        }
+        let any = Any::decode(c.encode_any().unwrap().as_slice()).unwrap();
+        // container_id = 1、bundle = 2、io = 4（空メッセージ）、pid = 6。
+        assert_eq!(
+            any.value,
+            [
+                &[0x0a, 0x02, b'c', b'1', 0x12, 0x06][..],
+                b"/run/b",
+                &[0x22, 0x00, 0x30, 0x92, 0x21][..]
+            ]
+            .concat()
+        );
+        let any = Any::decode(s.encode_any().unwrap().as_slice()).unwrap();
+        assert_eq!(any.value, [0x0a, 0x02, b'c', b'1', 0x10, 0x92, 0x21]);
+        let any = Any::decode(d.encode_any().unwrap().as_slice()).unwrap();
+        let TaskEvent::Delete(want) = &d else {
+            unreachable!()
+        };
+        assert_eq!(&TaskDelete::decode(any.value.as_slice()).unwrap(), want);
+    }
+
+    /// REPAIR-5・#4156: 上限を超える TaskCreate（長い bundle）は `encode` で失敗し、topic つきで記録される。
+    #[test]
+    fn repair5_4156_oversized_task_create_is_rejected() {
+        let ev = TaskEvent::Create(TaskCreate {
+            container_id: "c1".into(),
+            bundle: "b".repeat(MAX_EVENT_LEN),
+            ..Default::default()
+        });
+        let err = ev.encode_any().unwrap_err();
+        assert_eq!(err.stage, PublishStage::Encode);
+        assert_eq!(err.topic, Some("/tasks/create"));
     }
 
     /// REPAIR-5: 上限を超えるイベントは `encode` で失敗する。
@@ -812,6 +990,65 @@ mod unix_tests {
             })
         );
         assert!(log.0.lock().unwrap().is_empty());
+    }
+
+    /// CRI-5・#4156: 3 種それぞれで、偽の publish バイナリが argv の topic と stdin の `Any` を具体値で受け取る。
+    #[test]
+    fn cri5_4156_publish_passes_argv_and_stdin_for_each_topic() {
+        for (i, ev) in three_events().into_iter().enumerate() {
+            let dir = test_root::test_root("pub", &format!("t4156-{i}"));
+            let bin = make_script(&dir, "fake", &recorder_body(&dir));
+            let log = Arc::new(CaptureLog::default());
+            let p = publisher(&bin, Duration::from_secs(5), log.clone());
+            let topic = ev.topic();
+            p.publish(ev.clone());
+            assert!(wait_until(Duration::from_secs(10), || dir
+                .join("stdin")
+                .exists()));
+            let argv = std::fs::read_to_string(dir.join("argv")).unwrap();
+            assert_eq!(
+                argv.lines().collect::<Vec<_>>(),
+                [
+                    "--address",
+                    ADDR,
+                    "publish",
+                    "--namespace",
+                    "default",
+                    "--topic",
+                    topic
+                ]
+            );
+            let bytes = std::fs::read(dir.join("stdin")).unwrap();
+            assert_eq!(bytes, ev.encode_any().unwrap());
+            assert!(log.0.lock().unwrap().is_empty());
+        }
+    }
+
+    /// REPAIR-5・REPAIR-4・#4156: 3 種それぞれの非 0 終了は topic つきの失敗がちょうど 1 件で、秘匿値はログに出ない。
+    #[test]
+    fn repair5_4156_nonzero_exit_logs_one_failure_per_topic() {
+        for (i, ev) in three_events().into_iter().enumerate() {
+            let dir = test_root::test_root("pub", &format!("f4156-{i}"));
+            let bin = make_script(&dir, "fake", &failing_body());
+            let log = Arc::new(CaptureLog::default());
+            let p = publisher(&bin, Duration::from_secs(5), log.clone());
+            let topic = ev.topic();
+            p.publish(ev);
+            assert!(wait_until(Duration::from_secs(10), || !log
+                .0
+                .lock()
+                .unwrap()
+                .is_empty()));
+            std::thread::sleep(Duration::from_millis(100));
+            let got = log.0.lock().unwrap().clone();
+            assert_eq!(got.len(), 1, "{got:?}");
+            assert_eq!(got[0].stage, PublishStage::ExitStatus);
+            assert_eq!(got[0].topic, Some(topic));
+            let line = got[0].to_json_line();
+            for secret in [ADDR, "default", "c1", "/run/b", "secret-addr-4155"] {
+                assert!(!line.contains(secret), "{line}");
+            }
+        }
     }
 
     /// CRI-5・#4155: キューに積んだ後に取り消された世代のイベントは、worker が送信直前の再確認で捨てる。

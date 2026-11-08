@@ -231,46 +231,27 @@ mod linux {
             .map_err(|e| format!("chmod {}: {e}", dest.display()))
     }
 
-    /// containerd が Create の直前に作る `<bundle>/rootfs` へ `proc` を供給する監視を始める（CRI-5・#4104）。
+    /// `--runtime` に渡す試験専用ラッパー（shell script）を `<bin>/wrap/` に作る（CRI-5・REPAIR-12・#4104）。
     ///
     /// core の `prepare_rootfs_verified` は `rootfs/proc` が既存ディレクトリであることを bind の適用前に要求し、自動作成しない。
-    /// containerd は bundle と空の rootfs を shim の起動前に作る（bundle を先に作っておくことはできない）ため、`ctr run` の前に
-    /// 起動した監視スレッドが `<state>/io.containerd.runtime.v2.task/<namespace>/<id>/rootfs` の出現を待ち、直ちに `proc` を作る。
-    /// shim の起動と Create の RPC はこの後なので、`proc` が先に存在する。上限内に作れなければ `false` を返し、試験は失敗する。
+    /// containerd は bundle と空の `rootfs` を shim の起動前に作り、shim を bundle を cwd として exec する。ラッパーは
+    /// 本番 shim へ `exec` する前に cwd の `rootfs/proc` を同期的に作るため、`proc` が Create・Start より先に存在することが
+    /// 時刻やスレッドの都合に依らず保証される（監視スレッドを使う方式は、スケジューラの遅延で順序が崩れうる）。
+    /// `exec` 後のプロセスは本番 shim そのもの（`<bin>/SHIM_NAME`）で、再実行する daemon も実体の `current_exe` を使う。
+    /// cwd に `rootfs` が無い場合は何もせず、後続の Create が `proc` 欠如で失敗するため、前提が崩れても偽の成功にはならない。
     /// `proc` は bind で供給できない（`/proc` 宛ては拒否）ため、`write_spec` の mounts[] には含めない。
-    ///
-    /// 監視スレッドが走り出して最初の確認を終えるまで（armed の合図を有限時間で）待ってから返す。呼び出し側は戻った後に `ctr` を
-    /// 起動するため、スレッドの起動遅延やスケジューラの都合で「監視がまだ始まっていないうちに Create・Start が進む」ことは無い。
-    /// 残る窓は、containerd が bundle を作ってから shim の起動・ttrpc 接続を経て Create に至るまでの間に、1 ms 周期で動く
-    /// 専用スレッドが一度も動けないことだけである。
-    fn provision_proc(dir: &Path, id: &str) -> std::thread::JoinHandle<bool> {
-        let rootfs = dir
-            .join("state/io.containerd.runtime.v2.task")
-            .join(NAMESPACE)
-            .join(id)
-            .join("rootfs");
-        let (armed_tx, armed_rx) = std::sync::mpsc::channel::<()>();
-        let handle = std::thread::spawn(move || {
-            let until = Instant::now() + Duration::from_secs(60);
-            let mut armed = false;
-            while Instant::now() < until {
-                if !armed {
-                    armed = true;
-                    let _ = armed_tx.send(());
-                }
-                if rootfs.is_dir() {
-                    return match std::fs::create_dir(rootfs.join("proc")) {
-                        Ok(()) => true,
-                        Err(e) => e.kind() == std::io::ErrorKind::AlreadyExists,
-                    };
-                }
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            false
-        });
-        // 監視ループに入った合図を待つ（上限 10 秒。届かなければ以降の join が false を返して試験は失敗する）。
-        let _ = armed_rx.recv_timeout(Duration::from_secs(10));
-        handle
+    fn install_proc_wrapper(bin: &Path, real_shim: &Path) -> Result<PathBuf, String> {
+        let wrap_dir = bin.join("wrap");
+        std::fs::create_dir(&wrap_dir).map_err(|e| format!("mkdir wrap: {e}"))?;
+        let wrapper = wrap_dir.join(SHIM_NAME);
+        let script = format!(
+            "#!/bin/sh\nif [ -d ./rootfs ]; then mkdir -p ./rootfs/proc || exit 1; fi\nexec '{}' \"$@\"\n",
+            real_shim.display()
+        );
+        std::fs::write(&wrapper, script).map_err(|e| format!("write wrapper: {e}"))?;
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("chmod wrapper: {e}"))?;
+        Ok(wrapper)
     }
 
     /// 最小 rootfs と user namespace を含む spec を書く（CRI-5・#4104）。
@@ -473,6 +454,7 @@ mod linux {
         let shim = bin.join(SHIM_NAME);
         install_exe(&shim_src, &shim)?;
         install_exe(&sup_src, &bin.join(SUPERVISOR_NAME))?;
+        let wrapper = install_proc_wrapper(&bin, &shim)?;
         let spec = write_spec(&dir)?;
         let id = format!("shimreal{}", std::process::id());
         let id_b = format!("shimrealb{}", std::process::id());
@@ -529,7 +511,7 @@ mod linux {
             })
         };
 
-        let shim_s = shim.to_string_lossy().into_owned();
+        let shim_s = wrapper.to_string_lossy().into_owned();
         let spec_s = spec.to_string_lossy().into_owned();
         let outcome = (|| -> Result<(), String> {
             if !wait_until(Duration::from_secs(30), || {
@@ -542,7 +524,6 @@ mod linux {
             // シナリオ A: Create → Start → State → Kill → Wait → Delete → Shutdown。
             //   --runtime に絶対パスを渡すと containerd は PATH を探さずこの shim を exec する。
             //   --config を使うと位置引数は id だけになる。--null-io は stdio の FIFO を作らない。
-            let prov_a = provision_proc(&dir, &id);
             let mut run_cmd = ctr_cmd(&[
                 "run",
                 "--rm",
@@ -563,10 +544,6 @@ mod linux {
                 .map_err(|e| format!("spawn ctr run: {e}"))?;
             if let Ok(mut c) = CHILDREN.lock() {
                 c.push(run_child.id());
-            }
-            if !prov_a.join().unwrap_or(false) {
-                let _ = reap::reap(&mut run_child, Duration::from_secs(10));
-                return Err("could not provision rootfs/proc in the containerd bundle".into());
             }
             let mut running: Option<u32> = None;
             if !wait_until(Duration::from_secs(60), || match task_row(&id) {
@@ -597,7 +574,6 @@ mod linux {
             check_clean(&dir, &id, &ctr_out)?;
 
             // シナリオ B: Kill の all=true。
-            let prov_b = provision_proc(&dir, &id_b);
             let run_b = ctr_out(&[
                 "run",
                 "-d",
@@ -608,9 +584,6 @@ mod linux {
                 &spec_s,
                 &id_b,
             ]);
-            if !prov_b.join().unwrap_or(false) {
-                return Err("could not provision rootfs/proc in the containerd bundle (B)".into());
-            }
             run_b?;
             if !wait_until(Duration::from_secs(30), || {
                 task_row(&id_b).is_some_and(|(_, s)| s == "RUNNING")

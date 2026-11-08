@@ -89,7 +89,8 @@ use fandhe_container_core::traits::{
     ContainerStatus, CreateNetnsRequest, CreateNetworkRequest, CreateRequest, DeleteNetworkRequest,
     DeleteNetworkResponse, DeleteRequest, DeleteResponse, DetachRequest, DetachResponse, ErrorCode,
     GetStateRequest, KillRequest, NetnsStatus, NetworkPlugin, NetworkStatus, PortMapping,
-    PublishPortRequest, StartRequest, StateRequest, StateStore, StopRequest, TraitError,
+    PublishPortRequest, StartRequest, StateRecord, StateRequest, StateStore, StopRequest,
+    TraitError,
 };
 use fandhe_container_cri::adapter::{
     BundleProvider, BundleRequest, PreparedBundle, RuntimeAdapter,
@@ -1538,7 +1539,9 @@ impl ContainerRuntime for CoreLifecycleRuntime {
             }
             None => oci_runtime::create(&*self.store, &self.recorder, req),
         };
-        created.map(|r| r.status().clone()).map_err(to_trait_error)
+        created
+            .map(|r| status_with_instance(&r))
+            .map_err(to_trait_error)
     }
 
     #[cfg(target_os = "linux")]
@@ -1644,7 +1647,20 @@ impl ContainerRuntime for CoreLifecycleRuntime {
     fn state(&self, req: &StateRequest) -> Result<ContainerStatus, TraitError> {
         self.store
             .get(&GetStateRequest::new(req.id().clone()))
-            .map(|r| r.status().clone())
+            .map(|r| status_with_instance(&r))
+    }
+}
+
+/// 記録の status にインスタンス識別子を付けて返す（CRI-5・SEC-1・CORE-1・#4220）。
+///
+/// 識別子は状態ストアが create で割り当てて記録の別欄に持つ（`ContainerRuntime::state` の境界でだけ
+/// `ContainerStatus` に載せる）。記録に無い旧い状態は付けない（`None`）。cri の shim v2 が exec 登録簿の
+/// 照合に使う。
+fn status_with_instance(record: &StateRecord) -> ContainerStatus {
+    let status = record.status().clone();
+    match record.instance() {
+        Some(i) => status.with_instance(i),
+        None => status,
     }
 }
 

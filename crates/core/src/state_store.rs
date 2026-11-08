@@ -109,11 +109,11 @@ use crate::launch_isolation::{
 use crate::oci_runtime::MountDestination;
 use crate::rlimits::{Rlimit, RlimitKind, Rlimits};
 use crate::traits::{
-    Annotations, CgroupPlacement, CgroupScope, ContainerId, ContainerState, ContainerStatus,
-    CreateStateRequest, DeleteStateRequest, DeleteStateResponse, ErrorCode, ExitTime, ExplicitStop,
-    GetStateRequest, HealthStatus, ImageRootfsOwnership, ImageRootfsRecord, ListStateRequest,
-    StateList, StateListCursor, StateRecord, StateRevision, StateStore, SupervisionState,
-    TerminationReason, TraitError, UpdateStateRequest,
+    Annotations, CgroupPlacement, CgroupScope, ContainerId, ContainerInstance, ContainerState,
+    ContainerStatus, CreateStateRequest, DeleteStateRequest, DeleteStateResponse, ErrorCode,
+    ExitTime, ExplicitStop, GetStateRequest, HealthStatus, ImageRootfsOwnership, ImageRootfsRecord,
+    ListStateRequest, StateList, StateListCursor, StateRecord, StateRevision, StateStore,
+    SupervisionState, TerminationReason, TraitError, UpdateStateRequest,
 };
 
 /// 各コンテナの状態ファイル名（OCI-5）。
@@ -958,6 +958,8 @@ impl StateStore for FileStateStore {
             StateRecord::new(req.status().clone(), req.bundle().to_path_buf(), revision)?;
         // instance はこの create で割り当てた revision（トレイト契約 8。再利用されないため cgroup 名も
         // 削除・再作成をまたいで重ならない。TASK-30.3・OCI-6）。
+        // インスタンス識別子も同じ revision（トレイト契約 16。CRI-5・SEC-1・#4220）。
+        record = record.with_instance(ContainerInstance::from_raw(revision.value()));
         if let Some(scope) = req.cgroup_scope() {
             record = record.with_cgroup(CgroupPlacement::new(scope.clone(), revision));
         }
@@ -1010,6 +1012,10 @@ impl StateStore for FileStateStore {
             existing.bundle().to_path_buf(),
             revision,
         )?;
+        // インスタンス識別子は変えずに引き継ぐ（トレイト契約 16。要求の status の値は StateRecord::new が捨てる）。
+        if let Some(i) = existing.instance() {
+            record = record.with_instance(i);
+        }
         // cgroup の配置は引き継ぐ（トレイト契約 8。落とすと delete が cgroup を削除しなくなる。
         // TASK-30.3・OCI-6）。配置が無く追記の指定があれば、追記直前の revision を instance として記録する
         // （start 時の追記。TASK-32・#1314。(Some, Some) は上で拒否済み）。
@@ -1743,6 +1749,10 @@ struct StateDto {
     cgroup_scope: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cgroup_instance: Option<u64>,
+    /// インスタンス識別子（契約 16。CRI-5・SEC-1・#4220）。create で割り当てた revision。キー欠落（導入前の版が
+    /// 書いたファイル）は `None` で後から埋めず、`revision` を超える値は破損。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    instance: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     supervisor_pid: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2221,6 +2231,7 @@ impl StateDto {
             exited_at_nanos: status.exited_at().map(ExitTime::as_unix_nanos),
             cgroup_scope: record.cgroup().map(|c| c.scope().as_str().to_owned()),
             cgroup_instance: record.cgroup().map(|c| c.instance().value()),
+            instance: record.instance().map(ContainerInstance::value),
             supervisor_pid: record.supervisor_pid().map(NonZeroU32::get),
             health: record.health().map(|h| h.as_str().to_owned()),
             restart_count: record.restart_count(),
@@ -2322,6 +2333,12 @@ impl StateDto {
             }
             _ => return Err(corrupted()),
         };
+        // 識別子は create で割り当てた revision 以下のはず（超えるものは破損。契約 16）。
+        let instance = match self.instance {
+            Some(i) if i <= self.revision => Some(ContainerInstance::from_raw(i)),
+            Some(_) => return Err(corrupted()),
+            None => None,
+        };
         let supervisor_pid = match self.supervisor_pid {
             Some(p) => Some(NonZeroU32::new(p).ok_or_else(corrupted)?),
             None => None,
@@ -2399,6 +2416,10 @@ impl StateDto {
             record.with_explicit_stop(ExplicitStop::Recorded)
         } else {
             record
+        };
+        let record = match instance {
+            Some(i) => record.with_instance(i),
+            None => record,
         };
         Ok(match cgroup {
             Some(c) => record.with_cgroup(c),
@@ -3267,6 +3288,101 @@ mod tests {
                 .map(|c| (c.scope().as_str(), c.instance().value())),
             Some(("/", 10))
         );
+    }
+
+    /// OCI-5・CRI-5・SEC-1・#4220（契約 16）: create はインスタンス識別子に割り当てた revision を記録する。
+    #[test]
+    fn oci5_4220_create_assigns_instance_equal_to_revision() {
+        let t = TmpDir::new("inst-create");
+        let store = t.open();
+        let rec = create(&store, "a");
+        assert_eq!(
+            rec.instance().map(ContainerInstance::value),
+            Some(rec.revision().value())
+        );
+        let v = read_json(&t, "a");
+        assert_eq!(v["instance"].as_u64(), Some(rec.revision().value()));
+        let got = store.get(&GetStateRequest::new(cid("a"))).unwrap();
+        assert_eq!(got, rec);
+        assert_eq!(got.status().instance(), None);
+    }
+
+    /// 契約 16: update は識別子を引き継ぎ、要求の status に付いた値は無視する（revision は進む）。
+    #[test]
+    fn oci5_4220_update_inherits_instance() {
+        let t = TmpDir::new("inst-update");
+        let store = t.open();
+        let rec = create(&store, "a");
+        let inst = rec.instance().unwrap();
+        let forged = ContainerStatus::running(cid("a"), None)
+            .with_instance(ContainerInstance::from_raw(inst.value() + 100));
+        let updated = store
+            .update(&UpdateStateRequest::new(forged, rec.revision()))
+            .unwrap();
+        assert_eq!(updated.instance(), Some(inst));
+        assert!(updated.revision().value() > rec.revision().value());
+        assert_eq!(updated.status().instance(), None);
+        let got = store.get(&GetStateRequest::new(cid("a"))).unwrap();
+        assert_eq!(got.instance(), Some(inst));
+    }
+
+    /// 契約 16: 削除して同じ ID で作り直すと識別子が変わる（新しい revision と一致）。
+    #[test]
+    fn oci5_4220_recreate_changes_instance() {
+        let t = TmpDir::new("inst-recreate");
+        let store = t.open();
+        let first = create(&store, "a");
+        store
+            .delete(&DeleteStateRequest::new(cid("a"), first.revision()))
+            .unwrap();
+        let second = create(&store, "a");
+        assert_ne!(first.instance(), second.instance());
+        assert_eq!(
+            second.instance().map(ContainerInstance::value),
+            Some(second.revision().value())
+        );
+    }
+
+    /// 契約 16: キーの無い旧い記録は `None` で読み、update の後も埋めない。
+    #[test]
+    fn oci5_4220_legacy_state_without_instance_reads_none() {
+        let t = TmpDir::new("inst-legacy");
+        let store = t.open();
+        let rec = create(&store, "a");
+        let body = format!(
+            r#"{{"ociVersion":"1.2.0","id":"a","status":"created","bundle":"/b","revision":{}}}"#,
+            rec.revision().value()
+        );
+        fs::write(t.path().join("a").join("state.json"), body).unwrap();
+        let got = store.get(&GetStateRequest::new(cid("a"))).unwrap();
+        assert_eq!(got.instance(), None);
+        let updated = store
+            .update(&UpdateStateRequest::new(
+                ContainerStatus::running(cid("a"), None),
+                got.revision(),
+            ))
+            .unwrap();
+        assert_eq!(updated.instance(), None);
+        assert!(read_json(&t, "a").get("instance").is_none());
+    }
+
+    /// 契約 16: `instance` が `revision` を超える記録は破損（`Internal`）。境界の等値は健全。
+    #[test]
+    fn oci5_4220_instance_above_revision_is_corrupt() {
+        let t = TmpDir::new("inst-corrupt");
+        let store = t.open();
+        create(&store, "a");
+        let path = t.path().join("a").join("state.json");
+        let body = |i: u64| {
+            format!(
+                r#"{{"ociVersion":"1.2.0","id":"a","status":"created","bundle":"/b","revision":10,"instance":{i}}}"#
+            )
+        };
+        fs::write(&path, body(11)).unwrap();
+        assert_eq!(code(store.get(&GetStateRequest::new(cid("a")))), "INTERNAL");
+        fs::write(&path, body(10)).unwrap();
+        let got = store.get(&GetStateRequest::new(cid("a"))).unwrap();
+        assert_eq!(got.instance().map(ContainerInstance::value), Some(10));
     }
 
     fn sup(pid: u32, health: Option<HealthStatus>, count: u32) -> SupervisionState {

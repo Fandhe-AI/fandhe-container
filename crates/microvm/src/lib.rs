@@ -128,6 +128,8 @@ pub mod interrupt;
 pub mod irq;
 pub mod lapic_x86;
 #[cfg(target_os = "linux")]
+pub mod memslot_flags;
+#[cfg(target_os = "linux")]
 pub mod microvm;
 pub mod mmio_abort;
 pub mod mptable_x86;

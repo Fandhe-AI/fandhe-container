@@ -835,7 +835,7 @@ mod linux {
             }
             if t0.elapsed() >= Duration::from_secs(15) {
                 crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
-                let _ = requester.wait();
+                crate::reap::reap_or_report(&mut requester, crate::reap::reap_within());
                 panic!("the helper did not exit within 15s after the requester was killed");
             }
             std::thread::sleep(Duration::from_millis(5));

@@ -657,7 +657,17 @@ async fn production_binary_exec_real() {
             helper_timeout_ms >= 60_000,
             "the helper timeout {helper_timeout_ms} ms must be far above the 2s budget"
         );
-        let cmds = live_pids_with_argv(&long_argv);
+        // started の出力は sh が sleep へ exec する前に出るため、期待 argv のプロセスが現れるまで有限の期限で待つ（REPAIR-12）。
+        let cmds = {
+            let wait_start = Instant::now();
+            loop {
+                let found = live_pids_with_argv(&long_argv);
+                if !found.is_empty() || wait_start.elapsed() >= Duration::from_secs(10) {
+                    break found;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
         assert_eq!(cmds.len(), 1, "exactly one live long exec command: {cmds:?}");
         let (cmd_pid, cmd_start) = cmds[0];
 

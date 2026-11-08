@@ -531,11 +531,22 @@ fn task_59_4_cri_layer_never_spawns_host_processes() {
         // デーモンとして再実行するだけで、コンテナのプロセスは起動しない。他のファイルへ広げない。
         // 許すのは `Command::new(exe)`（exe は current_exe）と `CommandExt` の import だけで、ファイル単位では除外しない。
         let is_bootstrap = file.ends_with("shim_v2/bootstrap.rs");
+        // 2つ目の例外: shim v2 のイベント publish（#4155・CRI-5）。検証済みの `-publish-binary`（containerd の
+        // 実行ファイル）を期限つきの子として起動するだけで、コンテナのプロセスは起動しない。許すのは本番の起動 1 行・
+        // その import と、試験の偽バイナリ作成（`/bin/sh`）の行だけで、ファイル単位では除外しない。
+        let is_publish = file.ends_with("shim_v2/publish.rs");
         let text = std::fs::read_to_string(&file).expect("read source");
         for line in text.lines().filter(|l| !l.trim_start().starts_with("//")) {
             if is_bootstrap
                 && (line.contains("Command::new(exe)")
                     || line.trim() == "use std::os::unix::process::CommandExt;")
+            {
+                continue;
+            }
+            if is_publish
+                && (line.contains("Command::new(target.binary())")
+                    || line.trim() == "use std::process::{Command, Stdio};"
+                    || line.contains(r#"std::process::Command::new("/bin/sh")"#))
             {
                 continue;
             }

@@ -5,85 +5,25 @@
 //! routes が解放されていることを具体値で照合する。KVM・Hypervisor.framework は不要。
 #![cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use fandhe_container_microvm::error::MicrovmError;
 use fandhe_container_microvm::guest_memory::{GuestAddress, GuestMemory, HeapBacking};
 use fandhe_container_microvm::guest_memory_slot::GuestMemorySlot;
 use fandhe_container_microvm::hvf_smp::VmShutdown;
-use fandhe_container_microvm::interrupt::{InterruptLine, NetQueueNotifyRoute, NetRxPollRoute};
+use fandhe_container_microvm::interrupt::{NetQueueNotifyRoute, NetRxPollRoute};
 use fandhe_container_microvm::net_rx_poll::spawn_net_rx_poller;
 use fandhe_container_microvm::stop::StopReason;
-use fandhe_container_microvm::virtio_mmio::{MmioWriteOutcome, VirtioMmioTransport, reg};
+use fandhe_container_microvm::virtio_mmio::VirtioMmioTransport;
 use fandhe_container_microvm::virtio_net::{MemoryNetBackend, VirtioNet};
 
 type T = VirtioMmioTransport<VirtioNet<MemoryNetBackend>>;
-type Mem = GuestMemory<HeapBacking>;
 
-const MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
-const RX_DESC: u64 = 0x1000;
-const RX_AVAIL: u64 = 0x2000;
-const RX_USED: u64 = 0x3000;
-const TX_DESC: u64 = 0x4000;
-const TX_AVAIL: u64 = 0x5000;
-const TX_USED: u64 = 0x6000;
-const RX_BUF: u64 = 0x11000;
-
-#[derive(Clone, Default)]
-struct CountLine(Arc<AtomicU32>);
-
-impl InterruptLine for CountLine {
-    fn trigger(&self) -> Result<(), MicrovmError> {
-        self.0.fetch_add(1, Ordering::SeqCst);
-        Ok(())
-    }
-}
-
-fn ga(a: u64) -> GuestAddress {
-    GuestAddress::new(a)
-}
-
-fn wr(t: &mut T, off: u64, v: u32) -> MmioWriteOutcome {
-    t.write(off, &v.to_le_bytes())
-}
-
-fn init(t: &mut T) {
-    wr(t, reg::STATUS, 1);
-    wr(t, reg::STATUS, 3);
-    let mut b = [0u8; 4];
-    wr(t, reg::DEVICE_FEATURES_SEL, 0);
-    t.read(reg::DEVICE_FEATURES, &mut b);
-    wr(t, reg::DRIVER_FEATURES_SEL, 0);
-    wr(t, reg::DRIVER_FEATURES, u32::from_le_bytes(b));
-    wr(t, reg::DRIVER_FEATURES_SEL, 1);
-    wr(t, reg::DRIVER_FEATURES, 1);
-    assert_eq!(wr(t, reg::STATUS, 11), MmioWriteOutcome::FeaturesAccepted);
-    for (q, d, a, u) in [
-        (0, RX_DESC, RX_AVAIL, RX_USED),
-        (1, TX_DESC, TX_AVAIL, TX_USED),
-    ] {
-        wr(t, reg::QUEUE_SEL, q);
-        wr(t, reg::QUEUE_NUM, 16);
-        wr(t, reg::QUEUE_DESC_LOW, d as u32);
-        wr(t, reg::QUEUE_DRIVER_LOW, a as u32);
-        wr(t, reg::QUEUE_DEVICE_LOW, u as u32);
-        wr(t, reg::QUEUE_READY, 1);
-    }
-    assert_eq!(wr(t, reg::STATUS, 15), MmioWriteOutcome::DeviceActivated);
-}
-
-/// receiveq の 0 番へ 2048 バイトの書き込み用バッファを積む。
-fn submit_rx(m: &mut Mem) {
-    let at = RX_DESC;
-    m.write_at(ga(at), &RX_BUF.to_le_bytes()).unwrap();
-    m.write_u32_le(ga(at + 8), 2048).unwrap();
-    m.write_u16_le(ga(at + 12), 2).unwrap();
-    m.write_u16_le(ga(at + 14), 0).unwrap();
-    m.write_u16_le(ga(RX_AVAIL + 4), 0).unwrap();
-    m.write_u16_le(ga(RX_AVAIL + 2), 1).unwrap();
-}
+/// virtqueue の試験補助の正本（`tests/support/virtqueue_driver.rs`。複製しない・#4113）。
+#[path = "support/virtqueue_driver.rs"]
+mod virtqueue_driver;
+use virtqueue_driver::net::{MAC, RX_BUF, RX_USED, init, submit_rx};
+use virtqueue_driver::{CountLine, ga};
 
 struct Fixture {
     transport: Arc<Mutex<T>>,
@@ -143,10 +83,10 @@ fn mvm5_4030_arrival_completes_and_raises_interrupt_without_kick() {
     let frame: Vec<u8> = (0..60u32).map(|i| (i % 241) as u8).collect();
     push(&f, &frame);
     let end = Instant::now() + Duration::from_secs(5);
-    while f.line.0.load(Ordering::SeqCst) == 0 && Instant::now() < end {
+    while f.line.count() == 0 && Instant::now() < end {
         std::thread::sleep(Duration::from_millis(2));
     }
-    assert_eq!(f.line.0.load(Ordering::SeqCst), 1);
+    assert_eq!(f.line.count(), 1);
     assert_eq!(inbound_len(&f), 0);
     let (idx, len) = f
         .slot
@@ -185,7 +125,7 @@ fn mvm5_4030_not_active_device_keeps_frame_and_poller_runs() {
     push(&f, &[1u8; 60]);
     std::thread::sleep(Duration::from_millis(60));
     assert_eq!(inbound_len(&f), 1);
-    assert_eq!(f.line.0.load(Ordering::SeqCst), 0);
+    assert_eq!(f.line.count(), 0);
     assert!(!h.is_finished());
     assert_eq!(
         h.stop(Duration::from_secs(2)).unwrap(),

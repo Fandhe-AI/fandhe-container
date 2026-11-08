@@ -21,7 +21,8 @@ CRI の `Exec`・`Attach`・`PortForward` は、RPC 自体ではデータを流�
 
 - 既定は `127.0.0.1:0`（loopback、OS が空きポートを選ぶ）。外部への公開は `StreamingConfig::allow_external` を明示したときだけで、`0.0.0.0`・`::` も外部として扱う。違反は起動時に `INVALID_ARGUMENT`（fail-closed）
 - 発行 URL の host は `StreamingConfig::advertise_addr`（IP）を使い、ポートは実際の待ち受けポートにする。未指定なら bind したアドレスを使う。`0.0.0.0`・`::` で bind するときは kubelet から到達できない URL になるため広告アドレスを必須とし、無ければ（または広告アドレスが未指定アドレス・マルチキャストなら）起動時に `INVALID_ARGUMENT`（fail-closed）
-- 外部へ公開するときは TLS も認証も無い。URL を知ることが唯一の認可なので、前段のネットワーク制御で守ること
+- 外部へ公開するときは TLS も認証も無い。URL を知ることが唯一の認可なので、前段のネットワーク制御（ファイアウォール・リバースプロキシ等）で守ること
+- plugin-cri の CLI は `--streaming-bind <ADDR>`・`--streaming-allow-external`・`--streaming-advertise <IP>` を `StreamingConfig` の `bind`・`allow_external`・`advertise_addr` へ 1:1 で写す（#4110・CRI-6・REPAIR-3）。`allow_external` は bind アドレスから推測せず別の明示フラグにする。cri の `validate()` に通し、さらに「opt-in だけ・広告だけが立つ指定」（非 loopback の bind なしの `--streaming-allow-external`、`--streaming-allow-external` なしの `--streaming-advertise`）も拒む。違反は起動前に `error: INVALID_ARGUMENT: invalid --streaming-* argument`（終了コード 2、値は含めない）。非 loopback で実際に待ち受けたときだけ、起動時に警告 1 行（`cri_streaming_external_exposure`、固定文言、アドレスなし）を stderr へ出す
 - UDS での待ち受けは扱わない。kubelet は返された `http://` の URL へ接続するため、UDS の URL を kubelet が使える根拠の一次情報が無い（未確認・後続）
 
 ## トークン
@@ -230,9 +231,80 @@ helper を supervisor の bin に置く理由は、exec の領域（healthcheck 
 - **tty は本番で fail-closed**: helper に `--tty` が無く、supervisor の `ExecStdio` に pty が無い。`ExecStreamHandler::without_tty` で RPC 時に `INVALID_ARGUMENT`（「exec with tty is not supported」）とし、launcher も二重に断る。受け側（`PtyMaster::from_received` による検証・resize の `TIOCSWINSZ` 転送・pty と tokio の橋渡し）は偽の helper で試験済みで、supervisor 側の結線（後続 issue）が入れば能力フラグ `HelperCapabilities.tty` を true にするだけで有効にできる。`WindowSize` の 0 行・0 列はそのまま渡す
 - **stdio の fd 種別（SUP-6・SEC-1）**: helper は受け取った stdin・stdout・stderr が AF_UNIX の socket か FIFO のときだけ受け、通常ファイル・ディレクトリ・文字デバイス（tty・pty・`/dev/null` を含む）・ブロックデバイスは exec も kind 7 の通知もせず `InvalidArgument`（`require_stdio_kinds`）。ホストの端末 fd をコンテナのコマンドへ渡して境界を越えさせないため
 - 期限: helper の `--timeout-ms` は supervisor の上限 `MAX_EXEC_HOLD_SECS`（1 時間）なので、exec のセッションは最長 1 時間で止まる（kubelet の idle 4 時間より短い。#4116 の確認事項）。`Started` までは 25 秒（cri の `launch_timeout` 30 秒より短い）、stdio の受け渡しは 5 秒、kill 後の回収は 10 秒（`REAP_BUDGET`）で、回収できなければ保持一覧（上限 8）に入れる
-- 停止: `stop_streaming_on` の `on_stop` が `shutdown_all` を呼び、追跡中の helper を kill する。plugin-cri が SIGKILL された場合は helper が期限まで残る（PDEATHSIG を使わない設計の残余）
+- 停止: ドレインの期限（シグナルから 5 秒）で `stop_streaming_on` の `on_stop` が `shutdown_all` を呼び、追跡中の helper を kill する（「停止時のセッションの扱い」）。plugin-cri が SIGKILL された場合は helper が期限まで残る（PDEATHSIG を使わない設計の残余）。検知の方式は下の「要求元の異常終了の検知」で選定済み（実装は #4166、実機の照合は #4167。実装までは残余のまま）
 - helper の fd 1・2 は `/dev/null` で、診断 JSON 行は捨てる（結果は `Result` frame の固定語彙で返る。REPAIR-4 の観測は後続）
 - 終了コード: `Exited(n)`→n、`Signaled(s)`→128+s、`NotStarted`→子の終了状態、`Failed(code)`→コード別の固定英文の `CriError`
+
+#### 要求元の異常終了の検知（#4165・#4112・SUP-6・SEC-1・REPAIR-5）
+
+plugin-cri が helper を kill せずに異常終了（SIGKILL 等）すると、単一スレッドの helper は exec の間 fd 0（plugin-cri との channel）を見ていないため、helper とコンテナ内のコマンドは exec の期限（`--timeout-ms`。上限 `MAX_EXEC_HOLD_SECS` 3600 秒）まで、kind 7 のガードは期限 + `hold_grace`（30 秒）まで残る。本節は検知の方式を選定する（設計のみ。実装は #4166、実機の照合は #4167）。
+
+**前提（origin/main で確認した事実）**:
+
+- exec の間 helper が止まっている待ちのループは core ではなく supervisor にある。`crates/supervisor/src/exec.rs` の `respond_and_collect` が `ExecResponder::serve`（`seccomp_notify.rs`。反復ごとに `stop()` と期限を見て `SERVE_STEP` 20 ms の `wait`）を回し、続く `collect_worker_result` が core の `ContainerChild::wait_timeout`（期限 + `WORKER_GRACE` 7 秒）で待つ。core が出すのは `wait_timeout`・`wait_for_exit`・`kill_and_reap` だけで、取り消し口は core の API を変えずに supervisor 側で作れる
+- 後始末は `run_in_worker_with` の cleanup（exec 子 cgroup の `cgroup.kill` と削除。`CHILD_CGROUP_CLEANUP_TIMEOUT` 5 秒）が既に通る。worker とコマンドは PDEATHSIG（SIGKILL）を持つ。helper の制御チャネルの接続が閉じると supervisor の `exec_guard` が通知済みの exec 子 cgroup を回収する
+- plugin-cri は channel の自分の側を `watch_result` の専用スレッドが `Result` を受けるまで持ち、`shutdown` しない。受信失敗・セッションの drop・`shutdown_all` では helper を SIGKILL する。よって「channel が閉じた」ことは「要求元はもう exec を必要としていない」ことと等価である。channel はパスの無い socketpair（CLOEXEC）で、第三者は接続も切断もできない
+- helper の送信は `MSG_NOSIGNAL` で、相手が消えていれば `Result` の送信は SIGPIPE なしに直ちに失敗する
+
+**5 案（A・B・C1・C2・D）の比較**:
+
+| 案 | 内容 | 長所 | 短所 | 判断 |
+| -- | ---- | ---- | ---- | ---- |
+| A | fd 0 を `poll`（タイムアウト 0）し、`POLLHUP`・`POLLERR`・`POLLRDHUP`・`POLLNVAL` を要求元の消滅とする | プロセスの死とセッションの破棄（channel の drop）を同じ事象で拾う。pid を扱わず再利用の窓が無い。非ブロッキングの 1 回の syscall で単一スレッドのまま。第三者が起こせない | supervisor の sys に `poll` の FFI 宣言と `libc_abi` の照合が要る（事前承認の範囲の sys ラッパー）。plugin-cri の end が他のプロセスへ漏れると検知できない | 検知の信号として採用 |
+| B | 要求元の pid（`SO_PEERCRED`・`getppid`）を `pidfd_open` して終了を見る | channel の end の漏れに影響されない | 死から `pidfd_open` までに pid が再利用されうる。supervisor の sys に `pidfd_open` の宣言が要る。プロセスが生きたまま channel を捨てた場合を拾えない。「記録した pid から handle を導かない」方針（`exec-without-supervisor.md`）とずれる | 却下（A と同じ事象を競合と宣言を増やして拾うだけ。再評価条件に残す） |
+| C1（core に取り消しトークン） | `ContainerChild::wait_timeout` 等に取り消しを足す | 汎用 | 実際のループは supervisor にあり、検知後は `kill_and_reap` へ切り替えれば待たずに済む。core の公開 API が増え healthcheck・CLI exec に波及する | 却下（core は変えない。PLUG-4・REPAIR-1） |
+| C2（supervisor の serve ループに取り消し口） | `respond_and_collect` の `stop` を「worker の終了または取り消し」にし、取り消しなら `kill_and_reap` へ進む | 20 ms 刻みのループが既に `stop()` を呼ぶ。単一スレッドのまま。core は不変。他の呼び出し元は `None` で挙動不変 | `ExecLaunchIo` に任意項目が 1 つ増え、構築箇所 6 つの追従が要る | 取り消し口として採用（A の信号を受ける） |
+| D | helper が `PR_SET_PDEATHSIG` を使う | 単純 | PDEATHSIG は親を fork した「スレッド」の終了で発火し、plugin-cri は多スレッド（tokio の blocking pool は idle で終わる）なので正常なセッションを誤って止める。子側の設定は `pre_exec`（sys 外の unsafe）が要る | 却下（誤検知が避けられない。`helper.rs` のモジュール doc の既存の却下理由と同じ） |
+
+補足の却下: (1) core の `poll` ラッパーを公開して supervisor が使う案は、core の公開 API を増やし、crate ごとの sys に置いて共有下位 crate を作らない前例（`fdinfo-mnt-id-parsing.md`）に反する。(2) channel を非ブロッキングにして 1 バイト読む案は、データを消費し、O_NONBLOCK がオープンファイル記述で共有されて以後の送信の期限処理に影響する。
+
+**採用: A（信号）+ supervisor 側の C2（取り消し口）**:
+
+- 判定 `requester_gone`: fd 0 を `poll(timeout = 0)` し、`POLLHUP | POLLERR | POLLRDHUP | POLLNVAL` のいずれかで真。`POLLIN` だけ（想定外のデータ）は消滅とせず読みもしない。`poll` の失敗（`EINTR` 等）はその回は偽にし、既存の上限に任せる
+- 契約（要求元側）: plugin-cri はセッションを続けたい間、channel の自分の側を閉じず `shutdown` もしない（現状の `watch_result` が満たす）。この end を他のプロセスへ渡さない（CLOEXEC を保つ）。#4166 で `exec_launcher.rs` の doc にも書く
+- 取り消し口: `ExecLaunchIo` に取り消し判定の任意項目を足す（名前と型は #4166）。`ServeEnd::Lost` の後の待ちも `wait_for_exit` を短い刻みに分けて取り消しを見る。helper 以外（healthcheck・CLI exec 等）は `None`
+- 検知後の順序:
+  1. serve ループの `stop` が真 → `ServeEnd::Stopped`（取り消しの印つき）
+  2. `collect_worker_result` を待たずに worker を `kill_and_reap`（上限 5 秒）。コマンドには PDEATHSIG が届く（多層防御）
+  3. listener の保持を既存の順序どおり解放する
+  4. `run_in_worker_with` の cleanup が exec 子 cgroup を `cgroup.kill` し、空になるのを待って削除する（上限 5 秒）。ここでコマンドと子孫が残らないことを保証する
+  5. 結果は wire の `Failed(Unavailable)`（語彙を増やさず `Timeout` を流用しない）。監査の結果の記録と fd 2 の診断行で、期限切れと区別できる形にする
+  6. `send_result` は相手が消えていて直ちに失敗し、終了コード 1
+  7. helper の終了で制御チャネルの接続が閉じ、`exec_guard` が同じ cgroup をもう一度回収する（冪等。4 が失敗した場合の歯止めで、上限は既存の期限 + `hold_grace`）
+- 適用範囲は `Started` を送った後の exec の通し。それ以前の待ちには既存の短い期限がある（kind 6 は 5 秒、kind 7 の ack は 10 秒）。worker が listener を渡す前に止まった窓は取り消しを見ず、既存の全体期限で終わる残余とする
+- plugin-cri の本番 launcher（#3761・#4120）の経路: plugin-cri 側の変更は不要。plugin-cri の再起動をまたいで残った helper も、旧プロセスの死で channel が閉じるので同じ経路で止まる
+- 他 OS: `stream_exec`・`exec` は Linux のみで、macOS・Windows に影響しない
+
+**目標値（試験の合否に使う）**:
+
+- 検知は `SERVE_STEP` 20 ms ごと。通知 1 件の処理中は最大 `MAX_RESPONSE_DEADLINE` 5 秒遅れうる
+- **合否の値（通知処理のない通常ケース）: 要求元の消滅（SIGKILL、または偽の要求元が channel を閉じる）から helper の終了まで 2 秒以内**。この 2 秒は、消滅の時点で helper が通知の処理中でなく、worker・cgroup の後始末も遅れない場面の条件である。#4166 の単体試験と #4167 の実機前提試験はこの値で照合する。exec の期限は 60 秒以上にし、従来の上限（期限 + `hold_grace`）と区別する。通常は数十〜数百 ms の見込みで、2 秒は CI の揺れの余裕
+- 遅延ケースの最大予算（REPAIR-5）: 通知処理中に消滅した場合は検知が最大 5 秒遅れる（2 秒の条件は適用しない。最大予算 5 秒 + 通常ケースの 2 秒）。worker の回収・cgroup の後始末が遅い場合や回収に失敗する場合の全体の最大予算は、判定 20 ms + 通知処理 5 秒 + worker の回収 5 秒 + cgroup の後始末 5 秒 ≒ 15 秒で、期限 + `hold_grace` より十分短い。回収できない helper は保持一覧（上限 8）へ入れる。試験は通常ケースを 2 秒で照合し、遅延・回収失敗の場面を試験する場合は 15 秒を上限として別に照合する
+
+**期限と `hold_grace` を弱めない保証**:
+
+- 取り消しは早く終わらせる短絡だけで、既存の期限の判定（serve の `deadline`、期限 + `WORKER_GRACE`、`--timeout-ms` の検証と `MAX_EXEC_HOLD_SECS`、kind 7 のガードの期限 + `hold_grace`）と定数は変えない
+- 判定は非ブロッキングで待ちを足さない。判定の失敗は「取り消さない」に倒れ、従来の上限で終わる。取り消し口の既定は `None`
+- 照合: 既存の期限・`hold_grace` の試験（`exec_timeout.rs`・`control_exec_handover.rs`・`control_exec_guard_relaunch.rs`・`exec_guard` の単体試験）を弱めずに通す。加えて #4166 で「判定が常に偽・常に失敗でも期限で従来どおり終わる」試験を足す
+
+**セキュリティ（SEC-1）**: 第三者は取り消しを起こせない（パスの無い socketpair）。取り消しは「早く止める」だけで権限・分離は広がらない。検知後もコマンドと子孫は `cgroup.kill` で回収し、失敗しても `exec_guard` が既存の上限で回収する。新しい `unsafe` は supervisor の sys の `poll` ラッパーだけで、事前承認の範囲（`// SAFETY:`・`libc_abi` の照合・security-auditor 観点のレビューと PR 本文への記録が条件。#4166 の作業）。
+
+**実装者が決める事項（#4166。決定済み）**:
+
+- 取り消し判定の型は `crates/supervisor/src/exec.rs` の `ExecCancelHook<'a> = dyn Fn() -> bool + 'a`、`ExecLaunchIo` の項目名は `cancel: Option<&ExecCancelHook>`（既定の `None`）。core は変えない
+- 判定の実体は `stream_exec::channel::requester_gone`（fd 0 の channel への `poll(timeout = 0)`。`POLLIN` だけは消滅としない・読まない。判定の失敗と非対応ターゲットは偽）
+- `Lost` の後の刻みは `CANCEL_POLL_STEP` = 100 ms（`wait_for_exit` で待ち、kill しない）
+- 取り消しの結果は `Unavailable`（固定メッセージ `exec cancelled: the requester went away; the exec worker was killed`）で、`Timeout` を流用しない。worker の終了を先に見て、終了済みの本当の結果を取り消しで上書きしない
+- 監査レコードは足さない（`audit_worker_result` は分離違反だけを記録する SEC-4 の設計で、取り消しは違反ではないため）。期限切れとの区別は `Unavailable` / `Timeout` のコードとメッセージ、および helper が fd 2 に出す固定語彙の診断行（`{"code":"unavailable","message":"stream-exec requester went away; exec cancelled"}`）で行う
+
+**再評価条件**: plugin-cri が channel の end を他のプロセスへ渡すようになったとき（B を足す）、Linux 以外へ同じ helper を広げるとき（AF_UNIX の `POLLHUP` の意味を確かめ直す）、`SERVE_STEP` を変えるとき。
+
+**後続の作業単位**:
+
+| issue | 内容 |
+| ----- | ---- |
+| #4166 | (a) supervisor の `sys/linux.rs` に `poll` の安全なラッパーと `libc_abi` の照合、具体値の単体試験 (b) `ExecLaunchIo` に取り消し判定の任意項目を足し、構築箇所 6 つ（cli の `commands/exec.rs` を含む）は `None` (c) `respond_and_collect` の `stop` と `Lost` の後の待ちに取り消しを足し、取り消しなら `kill_and_reap` → 既存の cleanup (d) helper の `serve` が fd 0 の判定を渡し、`Failed(Unavailable)` と区別できる診断・監査を出す (e) plugin-cri の `exec_launcher.rs` の doc に channel を閉じない契約を書く (f) 試験: channel を閉じて 2 秒以内に終わる・exec のプロセスが残らない・開いたまま長い期限で待つ間は止まらない・判定が失敗しても期限で終わる・既存の期限と `hold_grace` の試験が通る (g) `helper.rs` のモジュール doc の残余の更新。clippy は `--all-targets` と `--lib --bins`、`cargo check --workspace --all-targets` |
+| #4167 | `stream_exec_real.rs` に要求元役を SIGKILL する場面、`cri_exec_real.rs` に plugin-cri を SIGKILL する場面を足し、2 秒以内とプロセスの不在を照合（期限は 60 秒以上）。成功行の変更に合わせ `ci.yml`・`real-machine-tests.md`・`AGENTS.md` を同じ PR で整合し、本書の「停止」の残余・「残るもの」の Exec の残余・期限の一覧の「未実装」を更新 |
 
 ### Attach（SUP-4・SUP-7・REPAIR-3・REPAIR-5）
 
@@ -364,7 +436,7 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 - NODE か POD かは、cri が RPC の時点で sandbox の記録（保存済みの `config` の `namespace_options.network`）から決め、発行時の要求に保存して dialer へ渡す。#3755 で `PortForwardDialer` の引数に対象の型（例: `PortForwardTarget { pod_sandbox_id, network: Node | Pod }`）を足す。URL やヘッダから組み立て直さず、plugin-cri に記録の解析を複製しない（REPAIR-1）
 - hostNetwork の Pod の port-forward はホストの loopback 上の任意のサービスへ届く。これは hostNetwork の性質で、認可は単回トークンの URL と kubelet / apiserver 側が担う
 - 実装（#3755）: `runtime_service::port_forward_network` が `namespace_options.network` がちょうど `NODE` のときだけ `Node` とし、未指定・POD・CONTAINER・TARGET・未知の値は `Pod`（fail-closed。`wants_pod_network` は CONTAINER・TARGET を「POD でない」と扱うので流用しない）。`port_forward_impl` の順序は 結線 → 入力検証 → sandbox の照合（`NOT_FOUND`）→ POD の拒否（`UNIMPLEMENTED "port-forward for pod network is not implemented"`。トークン枠を消費しない）→ 発行。dialer は port 0・期限 0 を `INVALID_ARGUMENT`、期限切れを `TIMEOUT`、その他を `UNAVAILABLE` の固定文で返し、成功後に `peer_addr` が loopback であることを確かめる。`PortForwardDialer::supports_pod_network`（既定は偽）を真にした dialer を注入すると結線情報の POD 対応が立ち、RPC 時の拒否が外れる（#3766 が使う）
-- 残余: URL 発行後に sandbox が消えても dialer は記録を照合しない（トークン TTL 60 秒とセッションの idle の期限で有界）。停止時は Upgrade 後のセッションと blocking の dial（最長 10 秒）をランタイムの `shutdown_timeout`（1 秒）が打ち切り、待ちは増えない
+- 残余: URL 発行後に sandbox が消えても dialer は記録を照合しない（トークン TTL 60 秒とセッションの idle の期限で有界）。停止時の Upgrade 後のセッションはドレインの期限の後に強制クローズする（「停止時のセッションの扱い」）。実行中の blocking の dial（最長 10 秒）は abort できず、ランタイムの `shutdown_timeout`（1 秒）が打ち切り、待ちは増えない
 
 **POD（#3766）**: #2877（pod の namespace 保持役）が入るまで `UNIMPLEMENTED` とする。URL の発行前に断るのが望ましく、#3753 の結線情報で扱う。dialer 側でも `CriError::unimplemented` を返す（多層防御）。候補は、単一スレッドの helper が保持役の fd で pod の userns・netns へ入って connect し接続済みの fd を SCM_RIGHTS で返す案と、保持役に connect を頼む案（保持役の攻撃面が広がるので劣後）で、最終判断は #3766 に置く。
 
@@ -388,7 +460,8 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 | follow のポーリング / 上限 | 200 ms / 24 時間 |
 | attach の follow スレッドの書き込みの刻み（取り消しの確認） | 200 ms |
 | PortForward の dial / 対の揃い / 書き込みの stall | 10 秒 / 30 秒 / 30 秒 |
-| `StreamingServer` の SIGTERM での停止 | 受信の検知（100 ms 周期）で待ち受けを閉じ、待ちを足さない。受け付け済みの接続はランタイム停止の 1 秒で打ち切る。全体の上限 13.7 秒は不変（#3754） |
+| `StreamingServer` の SIGTERM での停止 | 受信の検知（100 ms 周期）で待ち受けを閉じる（待ちなし。#3754）。受け付け済みのセッションはシグナルから 5 秒（`STREAMING_DRAIN_WAIT`）ドレインし、期限で exec を止めて 1 秒（`STREAMING_CLOSE_WAIT`）待ち、残りを強制クローズする。gRPC の猶予 10 秒以内に収まり、全体の上限 13.7 秒は不変（#4164。暫定値で #4116 の対象） |
+| 要求元の切断の検知（helper の serve の刻み）/ 検知から helper の終了まで | 20 ms / 合否値 2 秒（通知処理のない通常ケース。遅延・回収失敗ケースは検知最大 5 秒・回収込み 約 15 秒。期限と `hold_grace` は不変）。#4165。未実装（#4166） |
 
 ### 実装単位と兄弟 issue の対応
 
@@ -408,6 +481,9 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 | #3764 | docs の更新 | 実装済み（冒頭の表と「残るもの」） |
 | #3765 | 完全版 attach（A1 を本命として設計と分解） | 設計済み。子 issue は「完全版 Attach の設計（#3765）」を参照 |
 | #3766 | POD の port-forward の設計と分解 | — |
+| #4165 | 要求元の異常終了の検知方式の選定 | 設計済み（Exec 節の「要求元の異常終了の検知」） |
+| #4166 | 検知の実装（sys の `poll`・`ExecLaunchIo` の取り消し口・helper） | 未実装 |
+| #4167 | 検知の実機前提試験 | 未実装 |
 
 ### 未確認・オーナー確認事項
 
@@ -432,12 +508,13 @@ CRI の `ExecSync`（現状 `UNIMPLEMENTED`）も本設計の helper を再利�
 - Exec の相対 argv[0]（PATH 解決）: #2439 の判断待ち。RPC 時に `INVALID_ARGUMENT`
 - Exec の実機前提試験: #3762。完全版 Attach の実機前提試験は #4079（`production_binary_attach_real`）で実装済み
 - Exec の残余: plugin-cri の異常終了時の helper の早期停止（#4112）（`PtyMaster` の fd 検証は #4100 で解消）
+- Attach の残余: 入力の書き込みは全セッション共通の排他（`WRITE_ARBITER`）で調停する。plugin 外の書き手が空きを使い切ると保持者は `write` で止まり、その間は全セッション・全コンテナの入力が進まない。他のセッションの排他の待ちは取り消しで抜け、スレッド・fd・枠を返す（#4134・CRI-6・REPAIR-5）
 - 暫定値・設計の確認事項（exec の全体上限・同時セッション数・`::1`・終了コード・観測名など）: 上の「未確認・オーナー確認事項」と #4116（オーナー判断）
 - rootful: plugin-cri の start が uid 0 を `UNIMPLEMENTED` にするため、rootful のコンテナは無く 3 RPC とも使えない（uid 0 の拒否は #2442、rootful を許すかは #2241 の判断待ち）
 - 非 Linux: Exec は未結線の `UNIMPLEMENTED`。コンテナの start 自体も未実装（macOS の状態ルートは #2431）
 - `ExecSync`: `UNIMPLEMENTED` のまま。追跡 issue 未起票
-- 外部公開の opt-in を plugin-cri の CLI へ出すこと（現状は loopback 固定。REPAIR-3。#4110）
-- `ConnectionObserver` の telemetry への接続（現状は `NoopObserver`。REPAIR-4）と、Upgrade 後のセッションの停止時のドレイン方針の再評価（REPAIR-5）: どちらも #4111
+- 外部公開の TLS・認証（無い。opt-in の口は #4110 で plugin-cri の CLI に出した。前段の守りが前提）
+- Upgrade 後のセッションの停止時のドレイン方針の再評価（REPAIR-5）: #4111。`ConnectionObserver` の telemetry への接続（REPAIR-4）は #4163 で実装済み（下の「plugin-cri での起動と停止」）
 - ポートの到達性など深い意味検証
 - WebSocket（`v5.channel.k8s.io` 等）: kubelet / apiserver 側で WebSocket を SPDY に変換する仕組みの一次情報は #678 で未確認のまま。必要になった時点で別途判断する
 - kubelet / crictl の実クライアントでの照合（人間担当の #3730・#3777・#3779。本番の backend と plugin-cri の結線は済みで実施待ち。プロセス内の偽 backend と crictl 相当の SPDY クライアントによる疎通は `crates/cri/tests/streaming.rs`〔#683・TASK-63.5・CRI-6〕で済み。実 crictl は WebSocket が既定の版がありうるため、照合時に既定を一次情報で確かめる）
@@ -445,10 +522,50 @@ CRI の `ExecSync`（現状 `UNIMPLEMENTED`）も本設計の helper を再利�
 ## plugin-cri での起動と停止（#3754）
 
 - 置き場は plugin-cri の `streaming`（`production_streaming_config`・`production_stream_dispatcher`・`bind_production_streaming`・`stop_streaming_on`）。`main.rs` が runtime の構築直後、UDS の bind より前に呼ぶ
-- 設定は `StreamingConfig::default()`（`127.0.0.1:0`・外部公開なし・TTL 60 秒）。外部公開の口は plugin-cri から出さない。TLS・認証は無く、URL のトークンが唯一の認可
+- 設定は `StreamingConfig::default()`（`127.0.0.1:0`・外部公開なし・TTL 60 秒）。外部公開は `--streaming-*` を明示したときだけ（`production_streaming_config_with`。#4110）。TLS・認証は無く、URL のトークンが唯一の認可
 - dispatcher は Attach（Linux は対話可能な完全版、非 Linux は `AttachHandler::read_only()`。`ProductionAttach` で宣言する。#3763・#4078）・PortForward（NODE の `NodeLoopbackDialer`。#3755）・Exec（Linux で `exec_stream_launcher` があるとき。`without_tty`・`absolute_command_only`。#3761）を結線して注入する（`production_stream_dispatcher(attach: ProductionAttach, exec, recorder)`。`PortForwardHandler::new` の失敗を `INTERNAL` に写すため `Result`）。非 Linux の Exec は未結線で「not wired」の `UNIMPLEMENTED`。兄弟 issue は `with_*` を足す（`wiring` は bind 時に取られるため bind より前）
+- 接続の観測（#4163・CRI-6・REPAIR-4）: `bind_production_streaming` は `ConnectionObserver` を受け取り `bind_with_observer` へ渡す。本番は `streaming::connection_observer::TelemetryConnectionObserver`（共有 `OpRecorder` と `stderr_sink()`。作れなければ起動しない）。件数は共有記録器の `cri.streaming.connection`（受理の成功・HTTP 失敗）・`cri.streaming.connection_deadline`・`cri.streaming.connection_rejected`・`cri.streaming.accept_failed` で、既存の 60 秒周期の `op_stats` 行に出る（正の件数）。異常の構造化行 `{"event":"cri_streaming_connection","op":…,"outcome":"error","reason":…,"count":…}` の reason は固定語彙 `max_connections`・`deadline_exceeded`・`accept_failed` の 3 種で、理由ごとの累計が 2 のべき乗に達した時だけ出す（接続の洪水で、監査行と共用の stderr sink を埋めないため。HTTP 失敗は件数のみ）。`observe` は I/O をせず `try_send` のみでブロックしない。トークン・コンテナ ID・入出力・パス・相手アドレスは出さない（イベント型が文字列を持たない）
 - bind の失敗は fail-closed（`error: UNAVAILABLE: failed to start the streaming server`、設定検証の失敗は `INTERNAL`）。縮退すると「未結線」と区別できないため。UDS より先に判定するので socket を残さない
-- 停止は SIGTERM・SIGINT の検知と同時に TCP の待ち受けを閉じ、待ちを足さない。受け付け済みで Upgrade しない接続は既存の `RUNTIME_SHUTDOWN_WAIT`（1 秒）が打ち切り、`SHUTDOWN_TOTAL_BOUND`（13.7 秒）は変わらない
+- 停止は SIGTERM・SIGINT の検知と同時に TCP の待ち受けを閉じる（shutdown future は待たない）。その後のセッションの扱いは次節。`SHUTDOWN_TOTAL_BOUND`（13.7 秒）は変わらない
+
+## 停止時のセッションの扱い（#4164・CRI-6・REPAIR-5）
+
+### 判断材料
+
+- kubelet の期限はストリーム作成 30 秒・idle 4 時間（`SessionLimits::default()`）で、停止の予算よりずっと長い。「自然に終わるまで待つ」は採れない
+- 本体の停止の上限は `SHUTDOWN_TOTAL_BOUND` 13.7 秒（検知 100 ms + gRPC の猶予 10 秒 + 強制回収 2 秒 + 書き出し 3 × 200 ms + ランタイム 1 秒）で、`shutdown.rs` の試験が固定している。本件はこの値を変えない
+- 変更前は、シグナルで exec の helper を即座に kill し（停止間際に終わるはずだった応答も欠ける）、Upgrade 後の Attach・PortForward のセッションは追跡も期限も記録も無いまま、gRPC の猶予の後にランタイムの停止が切っていた
+- 受け入れた各セッションのタスクは handler が捨てハンドルで `tokio::spawn` しており、停止の経路だけでは強制クローズも件数の把握もできなかった。このため cri に `ConnectionPermit::spawn_session`（タスクの寿命 = 枠の寿命を型で結ぶ）と `StreamingSessions`（件数・`close_all`・`wait_idle_until`）を足し、3 つの handler の起動をそれに置き換えた（挙動は変えない）。Upgrade 前の接続のタスクも同じ追跡簿に登録する
+
+### 方針
+
+期限つきでドレインし、期限を過ぎたら exec を止めてから強制的に閉じる。基準はシグナルの受信時刻 T の絶対時刻で、シグナル受信時に shutdown future が別タスクとして起動し、`serve_with_audit` の戻り（RPC が残ると gRPC の猶予 10 秒を使う）を待たずに期限どおり進む。`StreamingStop::finish` はその結果を受け取る。shutdown future 自体は待ちを持たない（TCP の待ち受けを閉じる契約〔#3226〕を遅らせないため）。
+
+| 段 | 時刻 | 内容 |
+| -- | ---- | ---- |
+| 1 | T | 待ち受けを閉じ、開いていた件数 `open_at_stop` を記録 |
+| 2 | T..T+5 秒（`STREAMING_DRAIN_WAIT`） | セッションが自分で終わるのを待つ。全部閉じたら早く抜ける |
+| 3 | T+5 秒 | `on_stop`（`shutdown_all`。helper を kill し、以後の launch を拒否）。exec は終了を観測して Status を送り閉じる |
+| 4 | 〜T+6 秒（`STREAMING_CLOSE_WAIT`） | exec が閉じるのを待つ。全部閉じたら早く抜ける |
+| 5 | T+6 秒 | 残りを abort する（強制クローズ）。破棄で枠が返るのを最大 100 ms 確かめる |
+| 6 | 最後 | 構造化ログを 1 行出す（`event=cri_streaming_stop`。`open_at_stop`・`drained`・`exceeded`・`forced`・`remaining`・`elapsed_ms`。期限を超えたか残ったときは `warn`） |
+
+- 順序の理由: exec のプロセスを先に止めてから接続を閉じる。クライアントに「切れた」と見えた後もコマンドが動き続ける窓をなくし、終了コード（Status）をできるだけ届けるため。強制クローズでも `ExecSession` の drop が helper を kill する（二重の経路）
+- 上限の不変性: 5 秒 + 1 秒 = 6 秒 ≤ `PLUGIN_SHUTDOWN_GRACE` 10 秒。期限は T からの絶対時刻なので、serve が期限より後に戻ったときは待たずに段 3 へ進み、停止全体は serve の戻りと 6 秒 + 100 ms の大きい方で終わる。13.7 秒は変わらない（`repair5_4164_stop_waits_fit_within_grpc_grace_and_total_bound` で固定）
+- シグナルが記録されないまま `finish` したとき（serve が先にエラーで戻った）、`finish` を呼ばず drop したときも、待たずに `on_stop` と強制クローズを行う
+- 暫定値: 5 秒は cri の `SessionLimits` の `drain_timeout`（終了後の流し切りの予算）と同じ、1 秒は `RUNTIME_SHUTDOWN_WAIT` と同じ。どちらも暫定値で、オーナー確認は #4116 の対象。承認は得ていない
+
+### 残余
+
+- シグナルの受信からドレインの期限までは、受け付け済みで launch 前の exec が launch できる。期限の `shutdown_all` で止まり、停止直前に始めた exec と同じ扱いになる
+- abort されたセッションは `record_session` や observer の記録を通らない。件数は停止の 1 行に出る
+- plugin-cri が SIGKILL された場合は、従来どおり helper が期限まで残る（#4112）
+- 実行中の blocking の dial は abort できず、ランタイムの `shutdown_timeout` が打ち切る
+
+### 試験
+
+- cri `tests/streaming_server.rs`: 3 セッションのうち自然に終わる 1 件の応答が欠けず、残り 2 件が `close_all` で閉じる（`cri6_repair5_4164_drain_keeps_natural_response_and_force_closes_rest`）、強制クローズ後の接続の即時 abort、Upgrade 前の接続の強制クローズ
+- plugin-cri `streaming.rs`: 3 件を開いたままの停止が期限内に終わり全件閉じること、`on_stop` が 1 回で強制クローズより前に呼ばれること、期限内に終わった応答が欠けないこと、`finish` を呼ばなくても期限どおりに `on_stop` と強制クローズが行われること、期限後の `finish` が待たないこと、ログ行の形
 
 ## 依存
 

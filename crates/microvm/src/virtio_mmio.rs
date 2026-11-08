@@ -11,6 +11,8 @@
 //!   アドレスとしての検証と descriptor の走査は `crate::guest_memory`・`crate::virtqueue` が担う
 //!   （docs/design/microvm-memory-ownership.md）
 //! - legacy（Version = 1）・packed virtqueue・共有メモリ領域レジスタは非対応（未知のレジスタとして無視する）
+//! - `VIRTIO_F_RING_RESET`（ビット 40）によるキュー個別の reset・再有効化と `QueueReset`（0x0c0）は非対応。
+//!   提示せず、要求は拒否し、レジスタは未知として無視する（判断は docs/design/microvm-virtio-ring-reset.md・#4169）
 //!
 //! # 準拠先
 //! OASIS "Virtual I/O Device (VIRTIO) Version 1.2" の 4.2.2（MMIO レジスタ配置）・2.1（Device Status）・
@@ -309,6 +311,7 @@ pub enum MmioWriteOutcome {
     InterruptAcknowledged,
     /// ready だったキューが QueueReady=0 で停止された（動作開始後も受理する）。デバイス側の停止は
     /// トランスポートが [`VirtioDevice::queue_stopped`] で済ませており、呼び出し元は観測にだけ使う（#4031）。
+    /// 止めたキューは動作開始後の `QueueReady=1` では再開しない（RING_RESET 非対応）。復帰は Status=0 の reset から。
     QueueStopped(u16),
     /// FEATURES_OK が立った（negotiation 成功）。
     FeaturesAccepted,
@@ -356,6 +359,7 @@ pub trait VirtioDevice {
     /// 処理状態（リング・保留中のフレーム等）を手放す。Linux・macOS の MMIO 経路が同じ口を通るため、
     /// 呼び出し側（`dispatch_exit`・`handle_data_abort`）は何もしなくてよい。Status=0 の reset では
     /// 呼ばれず、`reset` が全キューを止める。必須メソッドにして実装漏れをコンパイルで検出する。
+    /// 止めたキューは動作開始後の `QueueReady=1` では再開しない（RING_RESET 非対応）。復帰は Status=0 の reset から。
     fn queue_stopped(&mut self, index: u16);
     /// Status へ 0 が書かれたとき呼ばれる。
     fn reset(&mut self);

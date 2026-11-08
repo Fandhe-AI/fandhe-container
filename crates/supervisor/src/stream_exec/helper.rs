@@ -35,8 +35,13 @@
 //!
 //! - tty（pty の割り当てと `PtyMaster` の送信）は後続 issue（#3761 では本番で fail-closed）で、本 helper は `--tty` を受けない。
 //! - 受け取る stdio の fd は socket か FIFO に限る（`require_stdio_kinds`。#3761・SEC-1）。plugin-cri 側の結線は #3761 で実装済み。
-//! - helper は単一スレッドのため fd 0 を見張れない。plugin-cri が helper を kill せずに異常終了した場合や channel だけを
-//!   閉じた場合は、exec の期限（`--timeout-ms`）が来て worker が止まり helper が終わるまで動く（上限は期限 + `hold_grace`）。
+//! - 要求元（plugin-cri）の異常終了の検知（#4166・SUP-6・SEC-1・REPAIR-5）: exec の間、supervisor の serve ループの刻みごとに
+//!   fd 0 を `poll(timeout = 0)` で見て（[`channel::requester_gone`]。読まない・消費しない）、`POLLHUP`・`POLLERR`・
+//!   `POLLRDHUP`・`POLLNVAL` なら exec を取り消す（コマンドの停止と exec 子 cgroup の回収の後に `Unavailable` で終わる。
+//!   fd 2 に診断行を 1 行出す）。通常は要求元の消滅から 2 秒以内に終わる。取り消しは短絡に限り、判定の失敗・検知できない場合は
+//!   従来どおり exec の期限（`--timeout-ms`）で終わる（上限は期限 + `hold_grace`）。残る窓: listener の受け渡し前（既存の短い
+//!   期限に任せる）・seccomp の通知の処理中（記録の期限つきで最大 5 秒遅れる）・要求元が自分の channel の端を他プロセスへ
+//!   漏らした場合（端が閉じず検知できない）。
 //! - launch 時 env の読み込み（`launch_env_for`）は I/O が止まり得るが、単一スレッドを保つため期限つきの作業スレッドで
 //!   包まない（healthcheck helper・CLI exec と同じ残余）。
 //! - env は受け付けない（CRI は env を渡さず、基底は `config.json` の `process.env` と launch 時 env だけ。SEC-1）。
@@ -451,6 +456,16 @@ pub fn serve(channel: &UnixStream, args: &StreamExecArgs, deps: &Deps<'_>) -> St
         )
         .map_err(|e| TraitError::new(e.code(), "failed to report the exec start to the caller"))
     };
+    // 要求元（plugin-cri）の消滅の検知（#4166）。fd 0 の channel を読まずに `poll(timeout = 0)` で見て、消滅なら exec を
+    // 取り消す（短絡に限り、期限と `hold_grace` は弱めない）。取り消したかは診断行のために覚える。
+    let cancelled = std::cell::Cell::new(false);
+    let cancel = || {
+        let gone = channel::requester_gone(channel);
+        if gone {
+            cancelled.set(true);
+        }
+        gone
+    };
     let io = ExecLaunchIo {
         launch_env: &launch_env,
         stdio: ExecStdio {
@@ -459,6 +474,7 @@ pub fn serve(channel: &UnixStream, args: &StreamExecArgs, deps: &Deps<'_>) -> St
             stderr: fds.stderr.as_ref().map(AsFd::as_fd),
         },
         on_created: Some(&on_created),
+        cancel: Some(&cancel),
     };
     let result = (deps.run)(
         &record,
@@ -468,6 +484,13 @@ pub fn serve(channel: &UnixStream, args: &StreamExecArgs, deps: &Deps<'_>) -> St
         sink.as_ref(),
         io,
     );
+    if cancelled.get() {
+        // 期限切れ（`timeout`）との区別のための固定語彙の診断行（fd 2。結果は相手不在で送れない）。
+        diagnose(
+            "unavailable",
+            "stream-exec requester went away; exec cancelled",
+        );
+    }
     outcome_from_result(result)
 }
 

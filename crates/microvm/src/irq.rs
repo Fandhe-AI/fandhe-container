@@ -19,17 +19,19 @@
 //! （[`deassign_failures`]）と構造化ログ 1 行（`op=kvm.irqfd.deassign` / `op=kvm.ioeventfd.deassign`。`level=error`・
 //! `released=false`）で観測できる（#3679・REPAIR-4）。その場合、カーネルは eventfd の file を VM の破棄まで保持するだけで、
 //! VM fd を close すれば解放される。ただし登録が残った組は、同じ VM で次の ASSIGN が `EBUSY` / `EEXIST` で失敗しうる。
-//! 件数の `fandhe-container-plugin-microvm` のメトリクスへの露出は未実装（REPAIR-3）。
+//! VM ごとの解除失敗の件数は `IoEventTally`（`IoEventFd::with_tally`）が数え、`StopReport::ioevent` と
+//! `fandhe-container-plugin-microvm` の stop の結果行（`unbind_failed=`）へ出る（#4161）。irqfd の件数の露出は未実装（REPAIR-3）。
 
 #![cfg(target_os = "linux")]
 
 use std::fs::File;
 use std::io::{self, Read as _, Write as _};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 use crate::error::{MicrovmError, MicrovmErrorCode};
-use crate::interrupt::{InterruptLine, IoEventAddress, IoEventSpec};
+use crate::interrupt::{InterruptLine, IoEventAddress, IoEventSpec, IoEventTally};
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use crate::interrupt::{IrqLevel, LevelInterruptLine};
 use crate::sys::{self, SysError};
@@ -307,11 +309,24 @@ pub struct IoEventFd {
     vm: OwnedFd,
     event: EventFd,
     spec: IoEventSpec,
+    /// 解除失敗を VM ごとに数える先（#4161）。無ければ全体の static だけを更新する。
+    tally: Option<Arc<IoEventTally>>,
 }
 
 impl IoEventFd {
     pub(crate) fn registered(vm: OwnedFd, event: EventFd, spec: IoEventSpec) -> Self {
-        Self { vm, event, spec }
+        Self {
+            vm,
+            event,
+            spec,
+            tally: None,
+        }
+    }
+
+    /// drop での解除失敗を `tally` にも数える（`MicroVm` の組み立てが VM ごとの 1 つを渡す。#4161・REPAIR-4）。
+    pub(crate) fn with_tally(mut self, tally: Arc<IoEventTally>) -> Self {
+        self.tally = Some(tally);
+        self
     }
 
     /// 監視条件。
@@ -353,6 +368,9 @@ impl Drop for IoEventFd {
         ) {
             IOEVENTFD_DEASSIGN_ERRNO.store(os_error_of(&e).unwrap_or(0), Ordering::Relaxed);
             IOEVENTFD_DEASSIGN_COUNT.fetch_add(1, Ordering::Relaxed);
+            if let Some(t) = &self.tally {
+                t.record_unbind_failed();
+            }
             crate::hvf_loop::log_line(format_args!(
                 "{}",
                 ioeventfd_deassign_log_line(addr, pio, self.spec.len(), self.spec.datamatch(), &e)
@@ -426,10 +444,16 @@ mod tests {
         let before = deassign_failures().ioeventfd.count;
         let null = OwnedFd::from(File::open("/dev/null").unwrap());
         let spec = IoEventSpec::virtio_mmio_queue_notify(0x2000, 0).unwrap();
-        drop(IoEventFd::registered(null, EventFd::new().unwrap(), spec));
+        let tally = Arc::new(IoEventTally::default());
+        drop(
+            IoEventFd::registered(null, EventFd::new().unwrap(), spec)
+                .with_tally(Arc::clone(&tally)),
+        );
         let after = deassign_failures().ioeventfd;
         assert_eq!(after.count, before + 1);
         assert_eq!(after.last_os_error, 25);
+        // #4161: VM ごとの件数にも載る（具体値）。
+        assert_eq!(tally.snapshot(), crate::interrupt::IoEventCounts::new(0, 1));
     }
 
     /// REPAIR-4・#3679: ログ行は数値と固定語彙のみ（完全一致）。

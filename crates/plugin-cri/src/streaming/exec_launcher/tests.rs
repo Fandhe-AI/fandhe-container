@@ -24,12 +24,15 @@ const PID: u32 = 4242;
 const WAIT: Duration = Duration::from_secs(5);
 
 type Script = Arc<dyn Fn(StdUnixStream, StdioMask) + Send + Sync>;
+/// helper の fd 2 の helper 側の端を受けて演じる役（#4171）。
+type DiagScript = Arc<dyn Fn(StdUnixStream) + Send + Sync>;
 
 /// 偽の helper の起動口。`Child` は `/bin/sleep 60`（stdin に channel の helper 側の端を持たせる）で、channel の相手は
 /// `script` が演じる。
 struct FakeSpawner {
     tty: bool,
     script: Script,
+    diag: Option<DiagScript>,
     pids: Arc<Mutex<Vec<u32>>>,
 }
 
@@ -46,9 +49,16 @@ impl HelperSpawner for FakeSpawner {
         let script = Arc::clone(&self.script);
         let mask = args.stdio();
         std::thread::spawn(move || script(script_end, mask));
+        let diagnostics = self.diag.as_ref().map(|d| {
+            let (plugin_diag, helper_diag) = StdUnixStream::pair().expect("diag pair");
+            let d = Arc::clone(d);
+            std::thread::spawn(move || d(helper_diag));
+            plugin_diag
+        });
         Ok(SpawnedHelper {
             child,
             channel: plugin_end,
+            diagnostics,
         })
     }
 
@@ -104,10 +114,20 @@ impl Fixture {
         tty: bool,
         script: Script,
     ) -> (SupervisorExecLauncher, Arc<Mutex<Vec<u32>>>) {
+        self.launcher_with_diag(tty, script, None)
+    }
+
+    fn launcher_with_diag(
+        &self,
+        tty: bool,
+        script: Script,
+        diag: Option<DiagScript>,
+    ) -> (SupervisorExecLauncher, Arc<Mutex<Vec<u32>>>) {
         let pids = Arc::new(Mutex::new(Vec::new()));
         let spawner = FakeSpawner {
             tty,
             script,
+            diag,
             pids: Arc::clone(&pids),
         };
         let l = SupervisorExecLauncher::new(
@@ -542,6 +562,7 @@ fn repair5_3761_launch_cancel_kills_registered_helper_and_rejects_late_register(
         Arc::new(HelperGuard {
             child: Mutex::new(Some(child)),
             shared: Arc::clone(shared),
+            diag_stop: Arc::new(AtomicBool::new(false)),
             _slot: slot,
         })
     };
@@ -560,4 +581,208 @@ fn repair5_3761_launch_cancel_kills_registered_helper_and_rejects_late_register(
     );
     let late = mk(&shared);
     assert!(!cancel.register(&late), "late register must be refused");
+}
+// ---- fd 2 の診断の転送（#4171・CRI-6・SUP-6・SEC-1・REPAIR-4・REPAIR-5） ----
+
+/// 捕捉用の書き出し先。
+struct Collect(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Collect {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("lock").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn collecting_sink() -> (LineSink, Arc<Mutex<Vec<u8>>>) {
+    let buf = Arc::new(Mutex::new(Vec::new()));
+    let sink = LineSink::spawn(Box::new(Collect(Arc::clone(&buf))), 256);
+    (sink, buf)
+}
+
+fn collected_lines(sink: &LineSink, buf: &Arc<Mutex<Vec<u8>>>) -> Vec<String> {
+    sink.wait_idle(WAIT);
+    let bytes = buf.lock().expect("lock").clone();
+    String::from_utf8(bytes)
+        .expect("utf8")
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// started を返してすぐ結果を返す helper 役（診断は別の diag スクリプトが書く）。
+fn quick_script() -> Script {
+    Arc::new(|end, mask| {
+        let _ = recv_stdio_handover(&end, mask, deadline()).expect("handover");
+        send_started(&end, deadline()).expect("started");
+        std::thread::sleep(Duration::from_millis(300));
+        let _ = send_result(&end, &StreamExecOutcome::Exited(0), deadline());
+    })
+}
+
+/// 1 helper が上限を超える出力（各 4 KiB の行 1000 本）を出しても止まらず、転送行は上限以下で、切り捨ての件数が具体値で出る。
+#[tokio::test]
+async fn repair5_4171_flood_is_bounded_and_counted() {
+    let fx = Fixture::new("flood");
+    let (sink, buf) = collecting_sink();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let done_tx = Mutex::new(done_tx);
+    let diag: DiagScript = Arc::new(move |mut end| {
+        let mut out = Vec::new();
+        for _ in 0..40 {
+            out.extend_from_slice(b"stage=setsid errno=13\n");
+        }
+        let mut big = vec![b'a'; 4095];
+        big.push(b'\n');
+        for _ in 0..1000 {
+            out.extend_from_slice(&big);
+        }
+        end.write_all(&out).expect("flood");
+        drop(end);
+        done_tx.lock().expect("lock").send(()).expect("done");
+    });
+    let (launcher, _pids) = fx.launcher_with_diag(false, quick_script(), Some(diag));
+    let launcher = launcher.with_diagnostic_sink(sink.clone());
+    let mut session = launcher
+        .launch(req("run1", false, true, false, false))
+        .await
+        .expect("launch");
+    done_rx
+        .recv_timeout(WAIT)
+        .expect("the flooding writer must not block");
+    let code = tokio::time::timeout(WAIT, &mut session.exit)
+        .await
+        .expect("exit timed out")
+        .expect("exit");
+    assert_eq!(code, 0);
+    assert_eq!(launcher.wait_diagnostics_idle(WAIT), 0);
+    let lines = collected_lines(&sink, &buf);
+    let forwarded = lines
+        .iter()
+        .filter(|l| l.contains("\"event\":\"cri_exec_helper_diagnostic\""))
+        .count();
+    assert_eq!(forwarded, 32);
+    let summaries: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.contains("cri_exec_helper_diagnostics"))
+        .collect();
+    assert_eq!(summaries.len(), 1);
+    let expected_bytes = 8 * 22 + 1000 * 4096;
+    assert_eq!(
+        summaries[0],
+        &format!(
+            "{{\"event\":\"cri_exec_helper_diagnostics\",\"outcome\":\"error\",\"end\":\"eof\",\"forwarded\":32,\"ignored\":0,\"unparsed\":0,\"dropped_lines\":1008,\"dropped_bytes\":{expected_bytes}}}"
+        )
+    );
+}
+
+/// 段名と errno を持つ行は 1 件のログ行になり、値が一致する。要約行は出ない。
+#[tokio::test]
+async fn cri6_4171_stage_and_errno_line_is_logged_once() {
+    let fx = Fixture::new("oneline");
+    let (sink, buf) = collecting_sink();
+    let diag: DiagScript = Arc::new(|mut end| {
+        end.write_all(b"stage=open_entrypoint errno=13\n")
+            .expect("w");
+    });
+    let (launcher, _pids) = fx.launcher_with_diag(false, quick_script(), Some(diag));
+    let launcher = launcher.with_diagnostic_sink(sink.clone());
+    let mut session = launcher
+        .launch(req("run1", false, true, false, false))
+        .await
+        .expect("launch");
+    let _ = tokio::time::timeout(WAIT, &mut session.exit).await;
+    assert_eq!(launcher.wait_diagnostics_idle(WAIT), 0);
+    assert_eq!(
+        collected_lines(&sink, &buf),
+        ["{\"event\":\"cri_exec_helper_diagnostic\",\"stage\":\"open_entrypoint\",\"errno\":13}"]
+    );
+}
+
+/// argv・コンテナ ID・トークンに見える文字列は、診断行へ混ざってもログに出ない（件数だけ数える）。
+#[tokio::test]
+async fn sec1_4171_argv_container_id_and_token_are_not_logged() {
+    let fx = Fixture::new("secret");
+    let (sink, buf) = collecting_sink();
+    let diag: DiagScript = Arc::new(|mut end| {
+        end.write_all(b"argv=/bin/argv-marker-4171 run1 tok_AbCdEf0123456789\n")
+            .expect("w");
+        end.write_all(b"stage=setsid errno=13 container=run1 token=tok_AbCdEf0123456789\n")
+            .expect("w");
+        end.write_all(
+            b"{\"code\":\"INTERNAL\",\"message\":\"run1 /bin/argv-marker-4171 tok_AbCdEf0123456789\"}\n",
+        )
+        .expect("w");
+    });
+    let (launcher, _pids) = fx.launcher_with_diag(false, quick_script(), Some(diag));
+    let launcher = launcher.with_diagnostic_sink(sink.clone());
+    let mut launch = req("run1", false, true, false, false);
+    launch.cmd = vec!["/bin/argv-marker-4171".to_string()];
+    let mut session = launcher.launch(launch).await.expect("launch");
+    let _ = tokio::time::timeout(WAIT, &mut session.exit).await;
+    assert_eq!(launcher.wait_diagnostics_idle(WAIT), 0);
+    let lines = collected_lines(&sink, &buf);
+    let all = lines.join("\n");
+    for needle in ["argv-marker-4171", "run1", "tok_AbCdEf0123456789"] {
+        assert!(!all.contains(needle), "{needle} leaked: {all}");
+    }
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert_eq!(
+        lines.first().map(String::as_str),
+        Some("{\"event\":\"cri_exec_helper_diagnostic\",\"code\":\"INTERNAL\"}")
+    );
+    assert_eq!(
+        lines.get(1).map(String::as_str),
+        Some(
+            "{\"event\":\"cri_exec_helper_diagnostics\",\"outcome\":\"error\",\"end\":\"eof\",\"forwarded\":1,\"ignored\":0,\"unparsed\":2,\"dropped_lines\":0,\"dropped_bytes\":0}"
+        )
+    );
+}
+
+/// helper が終了せず fd 2 を持ち続けても、`shutdown_all` は待たず、読み手は停止フラグで上限時間内に終わる。
+#[tokio::test]
+async fn repair5_4171_shutdown_all_is_bounded_when_stderr_is_held() {
+    let fx = Fixture::new("held");
+    let (sink, _buf) = collecting_sink();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let release_rx = Mutex::new(release_rx);
+    let diag: DiagScript = Arc::new(move |mut end| {
+        end.write_all(b"stage=setsid errno=13\n").expect("w");
+        let _ = release_rx.lock().expect("lock").recv();
+        drop(end);
+    });
+    let hold: Script = Arc::new(|end, mask| {
+        let _ = recv_stdio_handover(&end, mask, deadline()).expect("handover");
+        send_started(&end, deadline()).expect("started");
+        std::thread::sleep(Duration::from_secs(30));
+    });
+    let (launcher, pids) = fx.launcher_with_diag(false, hold, Some(diag));
+    let launcher = launcher.with_diagnostic_sink(sink.clone());
+    let _session = launcher
+        .launch(req("run1", false, true, false, false))
+        .await
+        .expect("launch");
+    let t0 = Instant::now();
+    launcher.shutdown_all();
+    assert!(
+        t0.elapsed() < Duration::from_millis(200),
+        "shutdown_all must not wait: {:?}",
+        t0.elapsed()
+    );
+    assert_eq!(
+        launcher.wait_diagnostics_idle(diagnostics::DIAG_JOIN_BUDGET),
+        0
+    );
+    assert!(
+        t0.elapsed() < diagnostics::DIAG_JOIN_BUDGET + Duration::from_millis(500),
+        "diagnostic readers must stop in time: {:?}",
+        t0.elapsed()
+    );
+    release_tx.send(()).expect("release");
+    for pid in pids.lock().expect("lock").iter() {
+        assert!(gone(*pid), "helper {pid}");
+    }
 }

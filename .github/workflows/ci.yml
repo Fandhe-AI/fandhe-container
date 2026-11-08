@@ -2567,6 +2567,117 @@ jobs:
             --forbid 'PRECONDITION FAILED' --forbid 'start_recover_real: cleanup failed' \
             --summary
 
+      # shim_v2_kill_all_real（`crates/plugin-cri/tests/shim_v2_kill_all_real.rs`。CRI-5・CORE-4・REPAIR-5・REPAIR-12・#4055）:
+      # 配布する shim の Kill(all=true) が実 cgroup で init 以外（pidns の外から cgroup へ移したホストのプロセスを含む）も
+      # 止めることを、all=false の対照つきで照合する。containerd・pull は使わない。新しいジョブ・check-run・sudo・permissions は
+      # 追加しない。委譲スコープで包むのは、本番の rootless の start が委譲 cgroup と user manager を要するため。
+      # 置き場所: pull が無く短いので container_grpc の前に置く（末尾は ubuntu のジョブ上限 35 分〔#3505〕が watchdog より先に効きうる）。
+      # 代償: 後続の pull 系の開始が少し遅れる。期限は 試験の watchdog 300 秒 < 補助 540 秒 < ステップ 10 分。
+      - name: shim_v2_kill_all_real のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          cargo build -p fandhe-container-supervisor --bin fandhe-container-supervisor
+          json="${RUNNER_TEMP}/skar-build.json"
+          cargo test -p fandhe-container-plugin-cri --test shim_v2_kill_all_real --no-run \
+            --message-format=json > "${json}"
+          sel='select(.profile.test == true and .target.name == "shim_v2_kill_all_real") | .executable'
+          bins="$(jq -r "${sel}" "${json}" | grep -v '^null$' | sort -u)"
+          if [ -z "${bins}" ] || [ "$(printf '%s\n' "${bins}" | wc -l)" -ne 1 ]; then
+            echo "::error::shim_v2_kill_all_real test binary not uniquely identified" >&2
+            exit 1
+          fi
+          echo "SKAR_BIN=${bins}" >> "$GITHUB_ENV"
+
+      - name: shim_v2_kill_all_real の実行（実機前提テスト・--ignored・委譲スコープ。CRI-5・CORE-4・REPAIR-12・#4055）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/shim_v2_kill_all_real.log"
+          USER="$(id -un)" \
+            scripts/run-in-user-scope.sh --name shim_kill_all_real --deadline 540 --log "${log}" -- \
+              "${SKAR_BIN}" --ignored
+          scripts/check-success-lines.sh --name shim_v2_kill_all_real \
+            --src crates/plugin-cri/tests/shim_v2_kill_all_real.rs --log "${log}" \
+            --select '^shim_v2_kill_all_real: (Kill all=|kill_recorded_container_cgroup returned)' --min 3 \
+            --forbid 'shim_v2_kill_all_real: ignored' --forbid 'FAILED' \
+            --forbid 'PRECONDITION FAILED' --forbid 'WATCHDOG EXPIRED' --summary
+
+      # shim_v2_containerd_real（`crates/plugin-cri/tests/shim_v2_containerd_real.rs`。CRI-5・CRI-7・PLUG-1・SUP-1・CORE-3・
+      # REPAIR-5・REPAIR-12・TASK-62.6・#3684・#4104）: 配布する shim（containerd-shim-fandhe-container-v2）を本物の containerd
+      # （`ctr run --runtime`）に exec させ、Create → Start → State → Kill → Wait → Delete → Shutdown と Kill all=true を通す。
+      # - containerd の出所: ランナーイメージの `containerd.io`（/usr/bin/containerd・/usr/bin/ctr。apt の既定導入物）を使う。
+      #   取得（ダウンロード）も sudo も行わないので、版と checksum の固定の対象は無い。版はイメージの更新で動くため、毎回
+      #   Step Summary に記録し、2 未満や不在は fail-closed で落とす。試験自身も実体と全祖先が root 所有・group/other 書き込み不可を検査する。
+      # - 委譲スコープで包む理由: rootless の start が委譲 cgroup と user manager を要し、shim は containerd の環境と cgroup を継ぐため。
+      # - 期限の層: 試験の watchdog 300 秒 < 補助 540 秒（= timeout-minutes 10 × 60 - 60）< ステップ 10 分。新しいジョブ・check-run・
+      #   sudo・permissions は追加しない。
+      # - 置き場所: ジョブ末尾に近いとジョブ上限（35 分・#3505）が watchdog より先に効くため、Docker Hub の確認ステップの前に置く。
+      - name: shim_v2_containerd_real のビルド（前提確認とバイナリの特定。CRI-5・TASK-62.6・#4104）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          # containerd 2.0 以上と ctr がイメージに在り、root 所有で group/other 書き込み不可であることを sudo なしで確かめる。
+          for t in containerd ctr; do
+            p="/usr/bin/${t}"
+            [ -x "${p}" ] || { echo "::error::precondition missing: ${t} is not installed at /usr/bin" >&2; exit 1; }
+            real="$(readlink -f "${p}")"
+            d="${real}"
+            while :; do
+              read -r u m < <(stat -c '%u %a' "${d}")
+              if [ "${u}" != 0 ] || [ $(( 8#${m} & 8#022 )) -ne 0 ]; then
+                echo "::error::precondition missing: ${t} or an ancestor is not root-owned or is writable" >&2
+                exit 1
+              fi
+              [ "${d}" = / ] && break
+              d="$(dirname "${d}")"
+            done
+          done
+          cver="$(/usr/bin/containerd --version)"
+          ver="$(printf '%s\n' "${cver}" | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
+          major="$(printf '%s\n' "${ver#v}" | cut -d. -f1)"
+          if [ -z "${major}" ] || [ "${major}" -lt 2 ]; then
+            echo "::error::precondition missing: containerd 2.0 or newer is required" >&2
+            exit 1
+          fi
+          {
+            echo "### shim_v2_containerd_real のツール"
+            echo '```text'
+            echo "${cver}"
+            /usr/bin/ctr --version
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          cargo build -p fandhe-container-supervisor --bin fandhe-container-supervisor
+          cargo build -p fandhe-container-plugin-cri --bin containerd-shim-fandhe-container-v2
+          json="${RUNNER_TEMP}/shim-v2-containerd-real-build.json"
+          cargo test -p fandhe-container-plugin-cri --test shim_v2_containerd_real \
+            --no-run --message-format=json > "${json}"
+          sel='select(.profile.test == true and .target.name == "shim_v2_containerd_real") | .executable'
+          bins="$(jq -r "${sel}" "${json}" | grep -v '^null$' | sort -u)"
+          if [ -z "${bins}" ] || [ "$(printf '%s\n' "${bins}" | wc -l)" -ne 1 ]; then
+            echo "::error::shim_v2_containerd_real test binary not uniquely identified" >&2
+            exit 1
+          fi
+          echo "SVCR_BIN=${bins}" >> "$GITHUB_ENV"
+
+      - name: shim_v2_containerd_real の実行（実機前提テスト・--ignored・委譲スコープ。CRI-5・CRI-7・PLUG-1・TASK-62.6・#4104）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/shim_v2_containerd_real.log"
+          USER="$(id -un)" \
+            scripts/run-in-user-scope.sh --name shim_v2_containerd_real --deadline 540 --log "${log}" -- \
+              "${SVCR_BIN}" --ignored
+          scripts/check-success-lines.sh --name shim_v2_containerd_real \
+            --src crates/plugin-cri/tests/shim_v2_containerd_real.rs \
+            --log "${log}" --select '^shim_v2_containerd_real: containerd (drove|killed) ' --min 2 \
+            --forbid 'PRECONDITION FAILED' --forbid 'shim_v2_containerd_real: FAILED' \
+            --forbid 'WATCHDOG EXPIRED' --forbid 'containerd scenario ignored' --summary
+
       # production_binary_full_lifecycle_real（`crates/plugin-cri/tests/container_grpc.rs`。libtest の
       # `#[ignore]`。CRI-2・CRI-3・PLUG-1・#2592・#2818）: plugin-cri の本番バイナリ越しに、
       # 実レジストリ（docker.io/library/busybox:1.36）からの PullImage →

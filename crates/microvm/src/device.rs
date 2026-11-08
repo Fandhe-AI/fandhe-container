@@ -52,7 +52,7 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 #[cfg(target_arch = "aarch64")]
@@ -70,7 +70,9 @@ use crate::interrupt::{InterruptLine, IoEventSpec};
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use crate::irq::IrqLevelLine;
 use crate::irq::{self, EventFd, IoEventFd, IrqFd};
-use crate::memslot_flags::{MemslotCapabilityQuery, MemslotFlags, check_memslot_flags_supported};
+use crate::memslot_flags::{
+    MemslotCapabilityQuery, MemslotFlags, MemslotRegistrar, check_memslot_flags_supported,
+};
 use crate::sys::{self, SysError};
 
 /// 本番で開くデバイスパス（固定リテラル。外部入力は届かない）。
@@ -1082,6 +1084,10 @@ impl VcpuFd {
 pub(crate) struct StopSignal {
     requested: Mutex<bool>,
     cv: Condvar,
+    /// 停止要求で鳴らす wake 用 eventfd（`poll(2)` で待つ補助スレッドを即時に起こす。#4160・MVM-1・CORE-7・REPAIR-5）。
+    /// 所有は待ち手側（`Weak`）で、`StopSignal` が fd を延命しない（「`stop` が `Ok` で戻れば fd は解放済み」の契約を保つ）。
+    /// 件数は呼び出し元のスレッド数（vCPU + 補助スレッド）で決まり、無制限には増えない。
+    wakers: Mutex<Vec<Weak<crate::irq::EventFd>>>,
 }
 
 impl StopSignal {
@@ -1090,9 +1096,38 @@ impl StopSignal {
     }
 
     /// 停止を要求して待ち手をすべて起こす。何度呼んでもよい。
+    ///
+    /// フラグを立てて condvar を通知した**後に** wake 用 eventfd を鳴らす。待ち手は登録後に必ずフラグを確かめてから `poll` に入るので、
+    /// 登録前の要求はフラグで、登録後の要求は eventfd で捕まり、取りこぼさない。鳴らせなくても後詰めの待ち上限（`IOEVENT_IDLE_WAIT`）で
+    /// 停止は有限時間で取り込まれるため、失敗は構造化ログ 1 行にとどめる（REPAIR-4・REPAIR-5）。
     pub(crate) fn request(&self) {
         *self.requested.lock().unwrap_or_else(|p| p.into_inner()) = true;
         self.cv.notify_all();
+        let live: Vec<_> = self
+            .wakers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect();
+        for w in live {
+            if let Err(e) = w.signal() {
+                use std::io::Write as _;
+                drop(writeln!(
+                    std::io::stderr(),
+                    "level=error op=microvm.stop_wake outcome=error code={}",
+                    e.code().as_str()
+                ));
+            }
+        }
+    }
+
+    /// 停止要求で鳴らす wake 用 eventfd を登録する。待ち手のスレッドを起こす**前**に呼ぶ（#4160）。
+    pub(crate) fn add_waker(&self, waker: Weak<crate::irq::EventFd>) {
+        self.wakers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(waker);
     }
 
     pub(crate) fn is_requested(&self) -> bool {
@@ -1568,6 +1603,19 @@ impl MemslotCapabilityQuery for VmFd {
     }
 }
 
+impl MemslotRegistrar for VmFd {
+    fn set_user_memory_region(
+        &self,
+        slot: u32,
+        flags: u32,
+        gpa: u64,
+        size: u64,
+        userspace_addr: u64,
+    ) -> Result<(), SysError> {
+        sys::set_user_memory_region(self.fd.as_fd(), slot, flags, gpa, size, userspace_addr)
+    }
+}
+
 impl VmFd {
     /// 拡張 `cap` に対応しているかを確かめ、非対応なら `FailedPrecondition`。
     fn require_extension(&self, cap: sys::KvmCap, what: &'static str) -> Result<(), MicrovmError> {
@@ -1595,7 +1643,7 @@ impl VmFd {
     /// memslot のフラグがこの VM で使えるかを登録の前に確かめる（#4157・MVM-1・#4105）。
     ///
     /// `READONLY` を含むときだけ VM fd に `KVM_CAP_READONLY_MEM` を照会する（x86 は VM ごとに答えが変わりうるため
-    /// `/dev/kvm` でなく VM fd）。非対応は `FailedPrecondition`。登録 API への結線は #4158 で行う（未結線）。
+    /// `/dev/kvm` でなく VM fd）。非対応は `FailedPrecondition`。`GuestRam::register_with_flags` が登録の前に同じ判定を通す（#4158）。
     pub fn check_memslot_flags(&self, flags: MemslotFlags) -> Result<(), MicrovmError> {
         check_memslot_flags_supported(flags, self)
     }

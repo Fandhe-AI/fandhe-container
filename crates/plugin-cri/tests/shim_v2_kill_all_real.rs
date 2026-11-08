@@ -489,8 +489,12 @@ mod linux {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
                 // 縮退（STOPPED だけの確認）にはしない。共通祖先の cgroup.procs への書き込み権が環境の前提。
+                let src = proc_cgroup(child.id()).unwrap_or_else(|| "<unknown>".into());
                 return Err(format!(
-                    "{PRECOND_PREFIX}cannot move a host process into the container cgroup (write access to cgroup.procs of the common ancestor is required)"
+                    "{PRECOND_PREFIX}cannot move a host process from cgroup {src} into {}: {e}; \
+                     write access to cgroup.procs of their common ancestor is required (both must sit under the \
+                     delegated user@.service subtree; run the test inside `systemd-run --user --scope -p Delegate=yes`)",
+                    scene.leaf
                 ));
             }
             Err(e) => return Err(format!("move sleeper into the container cgroup: {e}")),

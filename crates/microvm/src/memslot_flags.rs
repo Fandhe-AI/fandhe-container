@@ -4,7 +4,7 @@
 //! `MemslotCapabilityQuery`、その判定の純関数 `check_memslot_flags_supported` を提供する。
 //! 呼び出し文脈: [`crate::device::VmFd::check_memslot_flags`] が VM fd を継ぎ目として渡す。
 //! 結線（#4158）: `register_memslot_checked` が「対応の照会 → 登録 ioctl」を行い、`GuestRam::register_with_flags`（Linux）が呼ぶ。
-//! 未実装（REPAIR-3）: hugepage は #4159、dirty log の取得（`KVM_GET_DIRTY_LOG`）は範囲外。
+//! 未実装（REPAIR-3）: dirty log の取得（`KVM_GET_DIRTY_LOG`）は範囲外。hugepage は採らない判断を記録済み（#4159。docs/design/microvm-memory-ownership.md）。
 //!
 //! 一次情報（Linux v6.12）: `KVM_MEM_READONLY` は `Documentation/virt/kvm/api.rst` のとおり `KVM_CAP_READONLY_MEM` が許すときだけ
 //! 設定できる。`KVM_MEM_LOG_DIRTY_PAGES` は cap の照会を要さない（`check_memory_region_flags` の既定の有効フラグ）。

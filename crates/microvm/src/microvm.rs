@@ -88,7 +88,7 @@
 //!
 //! # ゲストメモリ（TASK-75.1）
 //! TASK-75（microVM の起動フロー）の起点。`crate::guest_memory` のアクセス型 [`GuestMemory`] に、実機の backing を
-//! 与える。[`GuestRam::new`] が匿名 mmap（私有・ゼロ埋め・`MAP_NORESERVE`・`MADV_DONTFORK`・`MADV_DONTDUMP`）でゲスト RAM を確保し、
+//! 与える。[`GuestRam::new`] が匿名 mmap（私有・ゼロ埋め・`MAP_NORESERVE`・`MADV_DONTFORK`・`MADV_DONTDUMP`。`MADV_HUGEPAGE` は付けず、THP を使うかはホストの方針しだい）でゲスト RAM を確保し、
 //! [`GuestRam::register`] が `KVM_SET_USER_MEMORY_REGION` で VM の memslot に登録して
 //! `GuestMemory<RegisteredGuestRam>` を返す。`unsafe` は `crate::sys` に閉じ、本モジュールは入力の検証・errno の
 //! 分類・寿命の管理だけを持つ。所有先の判断は docs/design/microvm-memory-ownership.md。
@@ -100,7 +100,7 @@
 //! memslot のフラグ（`KVM_MEM_READONLY` / `KVM_MEM_LOG_DIRTY_PAGES`）は [`GuestRam::register_with_flags`] で領域ごとに指定できる（#4158）。
 //!
 //! # 範囲外（REPAIR-3）
-//! hugepage（#4159）・dirty log の取得（`KVM_GET_DIRTY_LOG`）・aarch64 の IPA サイズ（`KVM_CAP_ARM_VM_IPA_SIZE`）の照合は未実装
+//! hugepage の opt-in（採らない判断を記録済み。docs/design/microvm-memory-ownership.md の #4159 の節）・dirty log の取得（`KVM_GET_DIRTY_LOG`）・aarch64 の IPA サイズ（`KVM_CAP_ARM_VM_IPA_SIZE`）の照合は未実装
 //! （複数領域と `KVM_CAP_NR_MEMSLOTS` の照会は #3697、x86_64 の物理アドレス幅〔CPUID leaf 0x8000_0008〕と最上位 GPA の照合・
 //! e820 の予約表記は #4106 で実装済み。下記）。
 //!

@@ -90,7 +90,7 @@ backing（匿名 mmap・`KVM_SET_USER_MEMORY_REGION` 登録・munmap と Drop �
 - 寿命: `RegisteredGuestRam` は VM fd を dup して持つ（`'vm` の借用を持たない。後続の VM 構成体 #697 が自己参照にならないため）。drop は slot を削除してから munmap し、削除に失敗したら mapping を漏らす（fail-closed）
 - 読み書き: 参照を作らず、範囲検査つきのバイト単位 volatile のみ。例外として virtqueue の共有 index（`avail.idx` の読み・`used.idx` の書き）だけは、2 バイト整列した u16 の単一命令 volatile（`read_u16_le_aligned` / `write_u16_le_aligned`。tear を避ける。#3862・MVM-1・MVM-5・REPAIR-3）。「単一命令」は言語仕様の保証ではなく x86_64・aarch64 の lowering に依る（`READ_ONCE` と同じ前提）。ring の要素・記述子・u32 以上には適用しない（要素は idx の前後の fence で順序づけられ、記述子は 1 回コピーして検査する）。`AtomicU16` は混在サイズのアクセスと参照の生成を招くため採らない。順序は引き続き fence と実機のバリアに頼る。性能（ブロック I/O のバッチ化）は後続の課題
 - 置き換えなかったもの: #882 の自己診断用 `GuestPage` / `RegisteredPage` と `probe_*` は残している（置き換えは任意の後続作業）
-- 範囲外: 複数領域・`KVM_CAP_NR_MEMSLOTS` の照会（どちらも #3697 で実装済み。本書末尾の記録）・hugepage（#4159。`KVM_MEM_READONLY` / `KVM_MEM_LOG_DIRTY_PAGES` は #4158 で `GuestRam::register_with_flags` に結線済み）
+- 範囲外: 複数領域・`KVM_CAP_NR_MEMSLOTS` の照会（どちらも #3697 で実装済み。本書末尾の記録）・hugepage（#4159 で採らない判断を記録。本書末尾。`KVM_MEM_READONLY` / `KVM_MEM_LOG_DIRTY_PAGES` は #4158 で `GuestRam::register_with_flags` に結線済み）
 
 ## TASK-192.4（#3787）での macOS の実装記録
 
@@ -113,7 +113,7 @@ backing と登録の所有先は `crates/microvm/src/hvf/memory.rs`（安全な 
 - 登録: 領域 i を slot i の別の memslot で登録する（`register_ram_regions`）。`KVM_CHECK_EXTENSION(KVM_CAP_NR_MEMSLOTS)`（`VmFd::max_user_memslots`。x86_64 は 32764）を mmap の前に照会し、足りなければ `ResourceExhausted`、照会できない・0 以下なら `FailedPrecondition`（fail-closed）。途中で失敗したときは登録済みの領域が drop され、slot の削除と munmap が済む（削除に失敗した領域は従来どおり漏らす）。aarch64 の RAM は hole が無いため 1 領域のまま同じ経路を通る。macOS（HVF）は 1 領域のまま
 - e820 との一致: 先頭の領域（GPA 0 から）が従来の 3 本（RAM・MP テーブルの予約・RAM）、2 番目以降が RAM 1 本ずつ。カーネル・initrd・boot_params・SIPI のページは先頭の領域の中にだけ置く。`check_loaded_within` と SIPI の範囲検査は総バイト数ではなく先頭の領域の長さで行い、hole を挟んでも SEC-1 の検査を緩めない
 - 挙動の変化: x86_64 で 3.25 GiB（`VIRTIO_MMIO_BASE`）を超える `mem_size` が受理されるようになった（以前は拒否）
-- 範囲外（REPAIR-3）: hugepage（#4159。`KVM_MEM_READONLY` / `KVM_MEM_LOG_DIRTY_PAGES` は #4158 で結線済み）。ゲストの物理アドレス幅と最上位 GPA の照合・e820 の予約表記は #4106 で実装済み（本書末尾の記録）。実カーネルを 4 GiB 超の RAM で起動し `/proc/meminfo` で確かめる通し試験。macOS（HVF）の複数領域は対象外（#4023 の判断。本書末尾の記録）
+- 範囲外（REPAIR-3）: hugepage（#4159 で採らない判断を記録。本書末尾。`KVM_MEM_READONLY` / `KVM_MEM_LOG_DIRTY_PAGES` は #4158 で結線済み）。ゲストの物理アドレス幅と最上位 GPA の照合・e820 の予約表記は #4106 で実装済み（本書末尾の記録）。実カーネルを 4 GiB 超の RAM で起動し `/proc/meminfo` で確かめる通し試験。macOS（HVF）の複数領域は対象外（#4023 の判断。本書末尾の記録）
 - 試験: KVM を使わない部分は既定のテスト集合の `mvm1_3697_*`。実 KVM は `crates/microvm/tests/kvm_device.rs` の `kvm_device_assemble_microvm_high_memory`（実機前提。`docs/verification/real-machine-tests.md`）
 
 ## #4024 での `Send` の導入記録（MVM-5・MVM-1・SEC-1）
@@ -150,3 +150,35 @@ Agent が記録した判断（オーナー承認待ちの位置づけは冒頭�
 - 範囲外（REPAIR-3）: aarch64 の IPA サイズ（`KVM_CAP_ARM_VM_IPA_SIZE`）の照合、macOS（HVF。単一領域で e820 が無い）、SIPI ページの e820 予約、実カーネルでの e820 の予約と 4 GiB 超の RAM の `/proc/iomem`・`/proc/meminfo` での通し確認（実機前提。`tests/kernel_boot.rs` の `--ignored`。追跡 issue: #4194）
 - 再評価条件: 4 GiB 超にデバイスの窓を置くとき、PCI を導入するとき、ゲストが予約の範囲で不具合を示したとき
 - 試験: 既定のテスト集合の `mvm1_4106_*`（cpuid_x86・boot_x86・microvm の各 tests）
+
+## #4159 でのゲスト RAM の hugepage 確保の判断記録（MVM-1・CORE-7・REPAIR-3）
+
+Agent が記録した判断（オーナー承認待ちの位置づけは冒頭と同じ）。TASK-75.1 と #3697 で「範囲外」として先送りした hugepage に結論を出す（#4105 の分解の 3/3）。
+
+- 現状: `GuestRamMap::map` は `MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE` で確保し、`MADV_DONTFORK`・`MADV_DONTDUMP` を付ける。`MADV_HUGEPAGE`・`MADV_NOHUGEPAGE` は付けない。したがって THP を使うかはホストの方針（`/sys/kernel/mm/transparent_hugepage/enabled` の `never` / `madvise` / `always`）しだいで、`always` なら助言なしでも THP になりうる（「hugepage を使わない」とは言えない）。macOS（HVF）は `MAP_ANON | MAP_PRIVATE` で Linux の THP と無関係のため対象外
+- 決定: 今回は opt-in を入れない。コード・依存・`sys` は変えない。モジュール doc を本記録に合わせるのみ
+- 比較した案:
+
+  | 案 | 判断 | 理由 |
+  | ---- | ---- | ---- |
+  | (A) THP の `madvise(MADV_HUGEPAGE)` の opt-in（既定は無効） | 採らない（今回） | 下記「理由」の 1〜5 |
+  | (B) `MAP_HUGETLB` の opt-in | 採らない（実装しない） | 事前確保 pool が要り、rootless ではホスト設定を変えられない。下記の設計項目が未決 |
+  | (C) THP を既定で有効にする | 却下 | 既定の挙動が変わり、CORE-7・MVM-1 の常駐メモリの方針（疎に使う）に逆行する |
+  | (D) 先送りし再評価条件を置く | 採用 | 理由が解消したときに再評価できる |
+
+- 理由（A を採らない）:
+  1. 手続き上の制約: `MADV_HUGEPAGE` は libc に対応物があるため、#4157 の `KVM_MEM_*` のような「対応物なし」の例外が使えず、`sys` に足す PR で `libc` との機械照合を同時に足す必要がある。`crates/microvm` には libc の dev-dependency が無く、crate ごとのオーナー承認待ち（`ffi-libc-check.md`「適用状況」・#3664・#3290）。依存の追加はユーザー承認制のため、本 issue では満たせない
+  2. CORE-7: THP は fault 単位が 2 MiB で、`MAP_NORESERVE` で疎に使う前提と逆に RSS が膨らむ方向に働く
+  3. 効果が保証されない: ホストの THP 方針・断片化・khugepaged に左右され、試験で効果を固定できない。`madvise` が成功しても THP になる保証は無い
+  4. memslot との相互作用: KVM が大きいページで写像するには GPA と HVA の 2 MiB 境界の整列が一致している必要があるが、`mmap` は `PAGE_SIZE` の整列しか保証しない。過大に確保して整列し直す設計と、長さが 2 MiB の倍数でないときの端数の扱いが別に要る。#4158 の `KVM_MEM_LOG_DIRTY_PAGES` を使う間は大きいページが分割・抑止される
+  5. 効果（TLB miss の削減）を示す実測もベンチも無い
+- `MAP_HUGETLB` を入れる場合に要る設計項目（実装しない。列挙のみ）: (1) pool のサイズと要求サイズの整合（`mem_size` と各領域の長さが hugepage サイズの倍数か。#3697 の low 領域の端 `0xd000_0000` と 4 GiB の境界も対象）、(2) 確保失敗の扱い（mmap 時の失敗と fault 時の SIGBUS のそれぞれで、fail-closed か通常ページへの縮退か）、(3) `MAP_NORESERVE` との関係、(4) rootless での可否、(5) hugetlb cgroup での計上と CORE-4 の cgroup v2 との関係、(6) 複数 memslot（#3697）での領域ごとの選択、(7) 解放と `munmap` の長さの制約
+- 再評価条件:
+  1. ゲストのワークロードで TLB miss（EPT・stage-2 の page walk）による性能劣化が実測で示されたとき（ベンチと閾値を添える）
+  2. 常駐メモリの実測で、ホストの THP 方針（`always`）による RSS の膨張が問題になり、`MADV_NOHUGEPAGE` での抑止が要るとき
+  3. `crates/microvm` への libc の dev-dependency が承認され、`MADV_*` を機械照合できるようになったとき
+  4. `MAP_HUGETLB` を前提とする運用要件（事前確保 pool のあるホストでの rootful 運用等）が出たとき
+- 再評価時の土台: `GuestRamMap::map` の madvise の並び（`sys.rs`）に足す。`memslot_flags` の `MemslotCapabilityQuery` と同じ形の偽の継ぎ目で、未指定では呼ばず指定したときに呼ぶことを照合する。失敗時の扱いは `MADV_DONTFORK` と同じ fail-closed か、効果が保証されない助言として記録して続けるかを決める
+- 一次情報の確認状況: 本記録の作成時に Linux v6.12 の原文（`transhuge.rst`・`hugetlbpage.rst`・`mm/madvise.c`・`arch/x86/kvm/x86.c` の `disallow_lpage` 周辺・`arch/x86/kvm/mmu/`・`arch/arm64/kvm/mmu.c`）は確認していない（未確認）。上記の THP の `always` の挙動、`madvise` の戻り値（THP 無効ビルドと `never` の差）、整列が食い違う slot で large page が無効になること、dirty log 中の分割、`MAP_HUGETLB` の pool・SIGBUS・cgroup 計上は一般知識に基づく記述で、再評価時に原文で確かめる。`MADV_DONTFORK` / `MADV_DONTDUMP` と THP・hugetlb の併用の制約も未確認
+- 対応: hugepage の項目は本記録で閉じる。memslot のフラグは #4157（型）と #4158（登録への結線）が担う
+- `MAP_HUGETLB` の別 issue: 現時点では不要と判断（再評価条件 4 が出たら起票）。この判断はオーナーの確認待ち

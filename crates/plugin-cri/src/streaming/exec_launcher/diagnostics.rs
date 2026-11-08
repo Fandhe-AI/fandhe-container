@@ -14,7 +14,8 @@
 //! 実現した。副次効果として core は読み手が遅くても待たずに捨てる。
 //!
 //! # 上限（定数）
-//! 1 行 [`DIAG_MAX_LINE_BYTES`]（改行を含む）・解析対象 [`DIAG_MAX_LINES`] 行・総 [`DIAG_MAX_TOTAL_BYTES`]。超えた分は読み捨て
+//! 1 行 [`DIAG_MAX_LINE_BYTES`]（改行を含む）・解析対象 [`DIAG_MAX_LINES`] 行・総 [`DIAG_MAX_TOTAL_BYTES`]。
+//! 超えた分は読み捨て
 //! （読むのはやめない。やめると socket の送信側が埋まり helper の同期書き込みが止まるため）、捨てた行数・バイト数を数える。
 //! メモリは固定長（行バッファ 1 つ + 読み取り chunk）で入力量に比例しない。
 //!
@@ -22,7 +23,8 @@
 //! 出力へ写すのは、閉じた語彙（core の `ExecChildStep`・`IsolationStage`・`ErrorCode`・errno 名の表など）で引き直した
 //! `&'static str` と整数だけ。helper 由来のバイト列は出力へ写さない（ログ注入・argv・トークン・コンテナ ID・入出力の
 //! 漏えいは構造上起きない）。解釈できない行は内容を出さず件数だけ数える。失敗の欄（stage・errno・code）を持たない
-//! 語彙内の行（毎回の exec で出る `entrypoint_mode` など）は出さずに件数だけ数える。supervisor の seccomp の集計行（`component=supervisor`・`event`・`count`）も後者で、`event` は
+//! 語彙内の行（毎回の exec で出る `entrypoint_mode` など）は出さずに件数だけ数える。
+//! supervisor の seccomp の集計行（`component=supervisor`・`event`・`count`）も後者で、`event` は
 //! supervisor の公開語彙（`SeccompReportEvent`）で引き直し、他の欄の混入・欠落があれば解釈できない行にする（#4233）。
 //!
 //! # 停止（REPAIR-5）

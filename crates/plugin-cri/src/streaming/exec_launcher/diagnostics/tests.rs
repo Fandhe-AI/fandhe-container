@@ -227,6 +227,7 @@ fn repair4_4171_helper_diagnose_lowercase_codes_are_forwarded() {
         Classified::Unparsed
     ));
 }
+
 /// 生成側（supervisor）の実関数が作る seccomp の集計行は ignored に数え、要約行を出さない（#4233）。
 #[test]
 fn cri6_4233_seccomp_report_line_is_ignored() {

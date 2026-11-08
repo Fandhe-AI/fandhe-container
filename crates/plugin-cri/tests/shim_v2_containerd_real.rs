@@ -31,7 +31,8 @@
 //! `UNIMPLEMENTED`（#2442・#2241）になるため対象外。
 //!
 //! # 実機前提テストとしての分離
-//! `-- --ignored` 指定時のみ実行する（ci.md「実機前提テスト」）。未指定は案内を出して成功する。実行と結果の記録は人間担当（#3685）。
+//! `-- --ignored` 指定時のみ実行する（ci.md「実機前提テスト」）。未指定は案内を出して成功する。CI では `platform-ci` の ubuntu が委譲スコープで実行する（#4104。containerd は
+//! ランナーイメージの `containerd.io` の既定導入物を使い、取得も sudo もしない）。ランナー以外の実機での記録は人間担当（#3685）。
 //!
 //! ```text
 //! cargo build -p fandhe-container-supervisor -p fandhe-container-plugin-cri
@@ -161,7 +162,9 @@ mod linux {
     }
 
     /// 私設 containerd の設定（v3 形式）。CRI・NRI・task monitor・tracing を無効にし、システムの containerd と何も共有しない。
-    fn containerd_config(dir: &Path) -> String {
+    /// 私設 containerd の設定。非 root の containerd は grpc・ttrpc・debug の各 socket を設定の uid / gid へ chown する
+    /// （既定は 0:0 で、非 root では EPERM になり listen 前に終了する）ため、実行ユーザーの uid / gid を明示する。
+    fn containerd_config(dir: &Path, uid: u32, gid: u32) -> String {
         let d = dir.display();
         format!(
             "version = 3\nroot = \"{d}/root\"\nstate = \"{d}/state\"\ntemp = \"{d}/tmp\"\n\
@@ -170,7 +173,9 @@ mod linux {
              \"io.containerd.monitor.task.v1.cgroups\", \"io.containerd.internal.v1.tracing\", \
              \"io.containerd.tracing.processor.v1.otlp\", \
              \"io.containerd.podsandbox.controller.v1.podsandbox\"]\n\
-             [grpc]\n  address = \"{d}/c.sock\"\n[ttrpc]\n  address = \"{d}/t.sock\"\n[debug]\n  address = \"{d}/d.sock\"\n"
+             [grpc]\n  address = \"{d}/c.sock\"\n  uid = {uid}\n  gid = {gid}\n\
+             [ttrpc]\n  address = \"{d}/t.sock\"\n  uid = {uid}\n  gid = {gid}\n\
+             [debug]\n  address = \"{d}/d.sock\"\n  uid = {uid}\n  gid = {gid}\n"
         )
     }
 
@@ -369,6 +374,9 @@ mod linux {
         let uid = std::fs::metadata("/proc/self")
             .map(|m| m.uid())
             .unwrap_or(0);
+        let gid = std::fs::metadata("/proc/self")
+            .map(|m| m.gid())
+            .unwrap_or(0);
         if uid == 0 {
             precondition_failed("must run as a non-root user (rootful start is UNIMPLEMENTED)");
         }
@@ -401,7 +409,8 @@ mod linux {
         let id = format!("shimreal{}", std::process::id());
         let id_b = format!("shimrealb{}", std::process::id());
         let cfg_path = dir.join("config.toml");
-        std::fs::write(&cfg_path, containerd_config(&dir)).map_err(|e| format!("config: {e}"))?;
+        std::fs::write(&cfg_path, containerd_config(&dir, uid, gid))
+            .map_err(|e| format!("config: {e}"))?;
         for sub in ["root", "state", "tmp"] {
             std::fs::create_dir(dir.join(sub)).map_err(|e| format!("mkdir {sub}: {e}"))?;
         }

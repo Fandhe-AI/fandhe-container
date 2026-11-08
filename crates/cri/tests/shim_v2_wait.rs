@@ -14,14 +14,14 @@ use std::time::{Duration, Instant};
 
 use fandhe_container_core::traits::{
     ContainerRuntime, ContainerStatus, CreateRequest, DeleteRequest as RtDelete,
-    DeleteResponse as RtDeleteResponse, ErrorCode, KillRequest, StartRequest as RtStart,
+    DeleteResponse as RtDeleteResponse, ErrorCode, ExitTime, KillRequest, StartRequest as RtStart,
     StateRequest, StopRequest, TraitError, WaitExitRequest,
 };
 use fandhe_container_cri::adapter::RuntimeAdapter;
 use fandhe_container_cri::shim_v2::{
     CreateTaskRequest, DeleteRequest, FrameHeader, HEADER_LEN, MessageType, ServerConfig,
-    ServiceRegistry, StartRequest, TaskApiVersion, TaskService, TtrpcRequest, TtrpcResponse,
-    TtrpcServer, WaitConfig, WaitRequest, WaitResponse,
+    ServiceRegistry, StartRequest, TaskApiVersion, TaskService, Timestamp, TtrpcRequest,
+    TtrpcResponse, TtrpcServer, WaitConfig, WaitRequest, WaitResponse,
 };
 use prost::Message;
 
@@ -30,6 +30,8 @@ use prost::Message;
 struct Fake {
     containers: Mutex<HashMap<String, ContainerStatus>>,
     stopped_code: Mutex<Option<i32>>,
+    /// Stopped の応答に載せる core の終了検知時刻（UNIX ナノ秒。None は未記録。CRI-5・#4056）。
+    exited_at: Mutex<Option<i64>>,
 }
 
 struct Shared(Arc<Fake>);
@@ -79,7 +81,10 @@ impl ContainerRuntime for Shared {
             .cloned()
             .ok_or_else(|| TraitError::new(ErrorCode::NotFound, "none"))?;
         match *self.0.stopped_code.lock().unwrap() {
-            Some(c) => Ok(ContainerStatus::stopped(r.id().clone(), Some(c))),
+            Some(c) => {
+                let at = (*self.0.exited_at.lock().unwrap()).and_then(ExitTime::from_unix_nanos);
+                Ok(ContainerStatus::stopped_at(r.id().clone(), Some(c), at))
+            }
             None => Ok(cur),
         }
     }
@@ -193,7 +198,13 @@ impl ContainerRuntime for EventRt {
         let mut g = m.lock().unwrap();
         loop {
             if let Some(code) = *g {
-                return Ok(ContainerStatus::stopped(req.id().clone(), Some(code)));
+                let at =
+                    (*self.inner.0.exited_at.lock().unwrap()).and_then(ExitTime::from_unix_nanos);
+                return Ok(ContainerStatus::stopped_at(
+                    req.id().clone(),
+                    Some(code),
+                    at,
+                ));
             }
             if req.is_cancelled() {
                 return Err(TraitError::new(ErrorCode::Unavailable, "wait cancelled"));
@@ -428,4 +439,60 @@ fn repair5_shutdown_cancels_event_driven_wait() {
     let st = r.status.unwrap();
     assert_eq!((st.code, st.message.as_str()), (14, "wait cancelled"));
     assert!(t0.elapsed() < Duration::from_secs(2));
+}
+
+/// CRI-5・#4056: core の ExitTime が Wait の `exited_at` として ttrpc 越しに返る（照会経路）。
+#[test]
+fn cri5_4056_wait_over_uds_returns_exited_at() {
+    let (fake, path, handle, _root) = start_service("wait-at", cfg(10_000));
+    let mut s = connect(&path);
+    create_and_start(&mut s, 1);
+    *fake.exited_at.lock().unwrap() = Some(1_700_000_000_000_000_005);
+    *fake.stopped_code.lock().unwrap() = Some(42);
+    let r = call(&mut s, 5, "Wait", wait_req("c1"));
+    assert!(r.status.is_none());
+    let w = WaitResponse::decode(&r.payload[..]).unwrap();
+    assert_eq!(
+        (w.exit_status, w.exited_at),
+        (
+            42,
+            Some(Timestamp {
+                seconds: 1_700_000_000,
+                nanos: 5
+            })
+        )
+    );
+    drop(s);
+    drop(handle);
+}
+
+/// CRI-5・#4056: イベント駆動の `wait_exit` 経路でも `exited_at` が具体値で返る。
+#[test]
+fn cri5_4056_event_driven_wait_returns_exited_at() {
+    let (gate, (fake, path, handle, _root)) = start_event("wait-ev-at", cfg_poll(60_000, 10_000));
+    let mut s = connect(&path);
+    create_and_start(&mut s, 1);
+    *fake.exited_at.lock().unwrap() = Some(1_700_000_000_000_000_005);
+    send(&mut s, 5, "Wait", wait_req("c1"), 0);
+    std::thread::sleep(Duration::from_millis(100));
+    {
+        let (m, cv) = &*gate;
+        *m.lock().unwrap() = Some(9);
+        cv.notify_all();
+    }
+    let r = read_response(&mut s);
+    assert!(r.status.is_none());
+    let w = WaitResponse::decode(&r.payload[..]).unwrap();
+    assert_eq!(
+        (w.exit_status, w.exited_at),
+        (
+            9,
+            Some(Timestamp {
+                seconds: 1_700_000_000,
+                nanos: 5
+            })
+        )
+    );
+    drop(s);
+    drop(handle);
 }

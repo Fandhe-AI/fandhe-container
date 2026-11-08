@@ -230,9 +230,74 @@ helper を supervisor の bin に置く理由は、exec の領域（healthcheck 
 - **tty は本番で fail-closed**: helper に `--tty` が無く、supervisor の `ExecStdio` に pty が無い。`ExecStreamHandler::without_tty` で RPC 時に `INVALID_ARGUMENT`（「exec with tty is not supported」）とし、launcher も二重に断る。受け側（`PtyMaster::from_received` による検証・resize の `TIOCSWINSZ` 転送・pty と tokio の橋渡し）は偽の helper で試験済みで、supervisor 側の結線（後続 issue）が入れば能力フラグ `HelperCapabilities.tty` を true にするだけで有効にできる。`WindowSize` の 0 行・0 列はそのまま渡す
 - **stdio の fd 種別（SUP-6・SEC-1）**: helper は受け取った stdin・stdout・stderr が AF_UNIX の socket か FIFO のときだけ受け、通常ファイル・ディレクトリ・文字デバイス（tty・pty・`/dev/null` を含む）・ブロックデバイスは exec も kind 7 の通知もせず `InvalidArgument`（`require_stdio_kinds`）。ホストの端末 fd をコンテナのコマンドへ渡して境界を越えさせないため
 - 期限: helper の `--timeout-ms` は supervisor の上限 `MAX_EXEC_HOLD_SECS`（1 時間）なので、exec のセッションは最長 1 時間で止まる（kubelet の idle 4 時間より短い。#4116 の確認事項）。`Started` までは 25 秒（cri の `launch_timeout` 30 秒より短い）、stdio の受け渡しは 5 秒、kill 後の回収は 10 秒（`REAP_BUDGET`）で、回収できなければ保持一覧（上限 8）に入れる
-- 停止: `stop_streaming_on` の `on_stop` が `shutdown_all` を呼び、追跡中の helper を kill する。plugin-cri が SIGKILL された場合は helper が期限まで残る（PDEATHSIG を使わない設計の残余）
+- 停止: `stop_streaming_on` の `on_stop` が `shutdown_all` を呼び、追跡中の helper を kill する。plugin-cri が SIGKILL された場合は helper が期限まで残る（PDEATHSIG を使わない設計の残余）。検知の方式は下の「要求元の異常終了の検知」で選定済み（実装は #4166、実機の照合は #4167。実装までは残余のまま）
 - helper の fd 1・2 は `/dev/null` で、診断 JSON 行は捨てる（結果は `Result` frame の固定語彙で返る。REPAIR-4 の観測は後続）
 - 終了コード: `Exited(n)`→n、`Signaled(s)`→128+s、`NotStarted`→子の終了状態、`Failed(code)`→コード別の固定英文の `CriError`
+
+#### 要求元の異常終了の検知（#4165・#4112・SUP-6・SEC-1・REPAIR-5）
+
+plugin-cri が helper を kill せずに異常終了（SIGKILL 等）すると、単一スレッドの helper は exec の間 fd 0（plugin-cri との channel）を見ていないため、helper とコンテナ内のコマンドは exec の期限（`--timeout-ms`。上限 `MAX_EXEC_HOLD_SECS` 3600 秒）まで、kind 7 のガードは期限 + `hold_grace`（30 秒）まで残る。本節は検知の方式を選定する（設計のみ。実装は #4166、実機の照合は #4167）。
+
+**前提（origin/main で確認した事実）**:
+
+- exec の間 helper が止まっている待ちのループは core ではなく supervisor にある。`crates/supervisor/src/exec.rs` の `respond_and_collect` が `ExecResponder::serve`（`seccomp_notify.rs`。反復ごとに `stop()` と期限を見て `SERVE_STEP` 20 ms の `wait`）を回し、続く `collect_worker_result` が core の `ContainerChild::wait_timeout`（期限 + `WORKER_GRACE` 7 秒）で待つ。core が出すのは `wait_timeout`・`wait_for_exit`・`kill_and_reap` だけで、取り消し口は core の API を変えずに supervisor 側で作れる
+- 後始末は `run_in_worker_with` の cleanup（exec 子 cgroup の `cgroup.kill` と削除。`CHILD_CGROUP_CLEANUP_TIMEOUT` 5 秒）が既に通る。worker とコマンドは PDEATHSIG（SIGKILL）を持つ。helper の制御チャネルの接続が閉じると supervisor の `exec_guard` が通知済みの exec 子 cgroup を回収する
+- plugin-cri は channel の自分の側を `watch_result` の専用スレッドが `Result` を受けるまで持ち、`shutdown` しない。受信失敗・セッションの drop・`shutdown_all` では helper を SIGKILL する。よって「channel が閉じた」ことは「要求元はもう exec を必要としていない」ことと等価である。channel はパスの無い socketpair（CLOEXEC）で、第三者は接続も切断もできない
+- helper の送信は `MSG_NOSIGNAL` で、相手が消えていれば `Result` の送信は SIGPIPE なしに直ちに失敗する
+
+**4 案の比較**:
+
+| 案 | 内容 | 長所 | 短所 | 判断 |
+| -- | ---- | ---- | ---- | ---- |
+| A | fd 0 を `poll`（タイムアウト 0）し、`POLLHUP`・`POLLERR`・`POLLRDHUP`・`POLLNVAL` を要求元の消滅とする | プロセスの死とセッションの破棄（channel の drop）を同じ事象で拾う。pid を扱わず再利用の窓が無い。非ブロッキングの 1 回の syscall で単一スレッドのまま。第三者が起こせない | supervisor の sys に `poll` の FFI 宣言と `libc_abi` の照合が要る（事前承認の範囲の sys ラッパー）。plugin-cri の end が他のプロセスへ漏れると検知できない | 検知の信号として採用 |
+| B | 要求元の pid（`SO_PEERCRED`・`getppid`）を `pidfd_open` して終了を見る | channel の end の漏れに影響されない | 死から `pidfd_open` までに pid が再利用されうる。supervisor の sys に `pidfd_open` の宣言が要る。プロセスが生きたまま channel を捨てた場合を拾えない。「記録した pid から handle を導かない」方針（`exec-without-supervisor.md`）とずれる | 却下（A と同じ事象を競合と宣言を増やして拾うだけ。再評価条件に残す） |
+| C（core に取り消しトークン） | `ContainerChild::wait_timeout` 等に取り消しを足す | 汎用 | 実際のループは supervisor にあり、検知後は `kill_and_reap` へ切り替えれば待たずに済む。core の公開 API が増え healthcheck・CLI exec に波及する | 却下（core は変えない。PLUG-4・REPAIR-1） |
+| C（supervisor の serve ループに取り消し口） | `respond_and_collect` の `stop` を「worker の終了または取り消し」にし、取り消しなら `kill_and_reap` へ進む | 20 ms 刻みのループが既に `stop()` を呼ぶ。単一スレッドのまま。core は不変。他の呼び出し元は `None` で挙動不変 | `ExecLaunchIo` に任意項目が 1 つ増え、構築箇所 6 つの追従が要る | 取り消し口として採用（A の信号を受ける） |
+| D | helper が `PR_SET_PDEATHSIG` を使う | 単純 | PDEATHSIG は親を fork した「スレッド」の終了で発火し、plugin-cri は多スレッド（tokio の blocking pool は idle で終わる）なので正常なセッションを誤って止める。子側の設定は `pre_exec`（sys 外の unsafe）が要る | 却下（誤検知が避けられない。`helper.rs` のモジュール doc の既存の却下理由と同じ） |
+
+補足の却下: (1) core の `poll` ラッパーを公開して supervisor が使う案は、core の公開 API を増やし、crate ごとの sys に置いて共有下位 crate を作らない前例（`fdinfo-mnt-id-parsing.md`）に反する。(2) channel を非ブロッキングにして 1 バイト読む案は、データを消費し、O_NONBLOCK がオープンファイル記述で共有されて以後の送信の期限処理に影響する。
+
+**採用: A（信号）+ supervisor 側の C（取り消し口）**:
+
+- 判定 `requester_gone`: fd 0 を `poll(timeout = 0)` し、`POLLHUP | POLLERR | POLLRDHUP | POLLNVAL` のいずれかで真。`POLLIN` だけ（想定外のデータ）は消滅とせず読みもしない。`poll` の失敗（`EINTR` 等）はその回は偽にし、既存の上限に任せる
+- 契約（要求元側）: plugin-cri はセッションを続けたい間、channel の自分の側を閉じず `shutdown` もしない（現状の `watch_result` が満たす）。この end を他のプロセスへ渡さない（CLOEXEC を保つ）。#4166 で `exec_launcher.rs` の doc にも書く
+- 取り消し口: `ExecLaunchIo` に取り消し判定の任意項目を足す（名前と型は #4166）。`ServeEnd::Lost` の後の待ちも `wait_for_exit` を短い刻みに分けて取り消しを見る。helper 以外（healthcheck・CLI exec 等）は `None`
+- 検知後の順序:
+  1. serve ループの `stop` が真 → `ServeEnd::Stopped`（取り消しの印つき）
+  2. `collect_worker_result` を待たずに worker を `kill_and_reap`（上限 5 秒）。コマンドには PDEATHSIG が届く（多層防御）
+  3. listener の保持を既存の順序どおり解放する
+  4. `run_in_worker_with` の cleanup が exec 子 cgroup を `cgroup.kill` し、空になるのを待って削除する（上限 5 秒）。ここでコマンドと子孫が残らないことを保証する
+  5. 結果は wire の `Failed(Unavailable)`（語彙を増やさず `Timeout` を流用しない）。監査の結果の記録と fd 2 の診断行で、期限切れと区別できる形にする
+  6. `send_result` は相手が消えていて直ちに失敗し、終了コード 1
+  7. helper の終了で制御チャネルの接続が閉じ、`exec_guard` が同じ cgroup をもう一度回収する（冪等。4 が失敗した場合の歯止めで、上限は既存の期限 + `hold_grace`）
+- 適用範囲は `Started` を送った後の exec の通し。それ以前の待ちには既存の短い期限がある（kind 6 は 5 秒、kind 7 の ack は 10 秒）。worker が listener を渡す前に止まった窓は取り消しを見ず、既存の全体期限で終わる残余とする
+- plugin-cri の本番 launcher（#3761・#4120）の経路: plugin-cri 側の変更は不要。plugin-cri の再起動をまたいで残った helper も、旧プロセスの死で channel が閉じるので同じ経路で止まる
+- 他 OS: `stream_exec`・`exec` は Linux のみで、macOS・Windows に影響しない
+
+**目標値（試験の合否に使う）**:
+
+- 検知は `SERVE_STEP` 20 ms ごと。通知 1 件の処理中は最大 `MAX_RESPONSE_DEADLINE` 5 秒遅れうる
+- **合否の値: 要求元の消滅（SIGKILL、または偽の要求元が channel を閉じる）から helper の終了まで 2 秒以内**。#4166 の単体試験と #4167 の実機前提試験はこの値で照合する。exec の期限は 60 秒以上にし、従来の上限（期限 + `hold_grace`）と区別する。通常は数十〜数百 ms の見込みで、2 秒は CI の揺れの余裕
+- 理論上の上限は判定 20 ms + 通知処理 5 秒 + worker の回収 5 秒 + cgroup の後始末 5 秒 ≒ 15 秒で、期限 + `hold_grace` より十分短い。試験は 15 秒ではなく 2 秒で照合する
+
+**期限と `hold_grace` を弱めない保証**:
+
+- 取り消しは早く終わらせる短絡だけで、既存の期限の判定（serve の `deadline`、期限 + `WORKER_GRACE`、`--timeout-ms` の検証と `MAX_EXEC_HOLD_SECS`、kind 7 のガードの期限 + `hold_grace`）と定数は変えない
+- 判定は非ブロッキングで待ちを足さない。判定の失敗は「取り消さない」に倒れ、従来の上限で終わる。取り消し口の既定は `None`
+- 照合: 既存の期限・`hold_grace` の試験（`exec_timeout.rs`・`control_exec_handover.rs`・`control_exec_guard_relaunch.rs`・`exec_guard` の単体試験）を弱めずに通す。加えて #4166 で「判定が常に偽・常に失敗でも期限で従来どおり終わる」試験を足す
+
+**セキュリティ（SEC-1）**: 第三者は取り消しを起こせない（パスの無い socketpair）。取り消しは「早く止める」だけで権限・分離は広がらない。検知後もコマンドと子孫は `cgroup.kill` で回収し、失敗しても `exec_guard` が既存の上限で回収する。新しい `unsafe` は supervisor の sys の `poll` ラッパーだけで、事前承認の範囲（`// SAFETY:`・`libc_abi` の照合・security-auditor 観点のレビューと PR 本文への記録が条件。#4166 の作業）。
+
+**実装者が決める事項（#4166）**: `ExecLaunchIo` の項目名と型、取り消しの監査・診断の語彙、`Lost` の後の刻みの値（例 100 ms）。
+
+**再評価条件**: plugin-cri が channel の end を他のプロセスへ渡すようになったとき（B を足す）、Linux 以外へ同じ helper を広げるとき（AF_UNIX の `POLLHUP` の意味を確かめ直す）、`SERVE_STEP` を変えるとき。
+
+**後続の作業単位**:
+
+| issue | 内容 |
+| ----- | ---- |
+| #4166 | (a) supervisor の `sys/linux.rs` に `poll` の安全なラッパーと `libc_abi` の照合、具体値の単体試験 (b) `ExecLaunchIo` に取り消し判定の任意項目を足し、構築箇所 6 つ（cli の `commands/exec.rs` を含む）は `None` (c) `respond_and_collect` の `stop` と `Lost` の後の待ちに取り消しを足し、取り消しなら `kill_and_reap` → 既存の cleanup (d) helper の `serve` が fd 0 の判定を渡し、`Failed(Unavailable)` と区別できる診断・監査を出す (e) plugin-cri の `exec_launcher.rs` の doc に channel を閉じない契約を書く (f) 試験: channel を閉じて 2 秒以内に終わる・exec のプロセスが残らない・開いたまま長い期限で待つ間は止まらない・判定が失敗しても期限で終わる・既存の期限と `hold_grace` の試験が通る (g) `helper.rs` のモジュール doc の残余の更新。clippy は `--all-targets` と `--lib --bins`、`cargo check --workspace --all-targets` |
+| #4167 | `stream_exec_real.rs` に要求元役を SIGKILL する場面、`cri_exec_real.rs` に plugin-cri を SIGKILL する場面を足し、2 秒以内とプロセスの不在を照合（期限は 60 秒以上）。成功行の変更に合わせ `ci.yml`・`real-machine-tests.md`・`AGENTS.md` を同じ PR で整合し、本書の「停止」の残余・「残るもの」の Exec の残余・期限の一覧の「未実装」を更新 |
 
 ### Attach（SUP-4・SUP-7・REPAIR-3・REPAIR-5）
 
@@ -389,6 +454,7 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 | attach の follow スレッドの書き込みの刻み（取り消しの確認） | 200 ms |
 | PortForward の dial / 対の揃い / 書き込みの stall | 10 秒 / 30 秒 / 30 秒 |
 | `StreamingServer` の SIGTERM での停止 | 受信の検知（100 ms 周期）で待ち受けを閉じ、待ちを足さない。受け付け済みの接続はランタイム停止の 1 秒で打ち切る。全体の上限 13.7 秒は不変（#3754） |
+| 要求元の切断の検知（helper の serve の刻み）/ 検知から helper の終了まで | 20 ms / 合否値 2 秒（理論上の上限 約 15 秒。期限と `hold_grace` は不変）。#4165。未実装（#4166） |
 
 ### 実装単位と兄弟 issue の対応
 
@@ -408,6 +474,9 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 | #3764 | docs の更新 | 実装済み（冒頭の表と「残るもの」） |
 | #3765 | 完全版 attach（A1 を本命として設計と分解） | 設計済み。子 issue は「完全版 Attach の設計（#3765）」を参照 |
 | #3766 | POD の port-forward の設計と分解 | — |
+| #4165 | 要求元の異常終了の検知方式の選定 | 設計済み（Exec 節の「要求元の異常終了の検知」） |
+| #4166 | 検知の実装（sys の `poll`・`ExecLaunchIo` の取り消し口・helper） | 未実装 |
+| #4167 | 検知の実機前提試験 | 未実装 |
 
 ### 未確認・オーナー確認事項
 

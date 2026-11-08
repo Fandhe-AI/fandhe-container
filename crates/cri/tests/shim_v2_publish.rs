@@ -173,11 +173,12 @@ fn count_calls(out: &std::path::Path) -> usize {
 #[test]
 fn cri5_4155_events_reach_fake_publish_binary_in_order() {
     let dir = test_root::test_root("pubit", "once");
-    // 呼び出しごとに連番のディレクトリへ argv と stdin を記録する。
+    // 呼び出しごとに連番のディレクトリへ argv と stdin を記録する。連番は `$(( ))` で数値化する
+    // （macOS の BSD `wc -l` は先頭へ空白を足し、そのまま連結すると `call       0` になって照合できない。#4218）。
     let out = dir.join("out");
     std::fs::create_dir(&out).unwrap();
     let body = format!(
-        "#!/bin/sh\nn=$(/bin/ls \"{o}\" | /usr/bin/wc -l)\nd=\"{o}/call$n\"\n/bin/mkdir \"$d\"\nprintf '%s\\n' \"$@\" > \"$d/argv\"\n/bin/cat > \"$d/stdin.tmp\"\n/bin/mv \"$d/stdin.tmp\" \"$d/stdin\"\n",
+        "#!/bin/sh\nn=$(( $(/bin/ls \"{o}\" | /usr/bin/wc -l) ))\nd=\"{o}/call$n\"\n/bin/mkdir \"$d\"\nprintf '%s\\n' \"$@\" > \"$d/argv\"\n/bin/cat > \"$d/stdin.tmp\"\n/bin/mv \"$d/stdin.tmp\" \"$d/stdin\"\n",
         o = out.display()
     );
     let bin = make_script(&dir, &body);

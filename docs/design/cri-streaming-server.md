@@ -311,7 +311,7 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 **D6. resize・終了・複数の attach**
 
 - resize: plugin-cri が持つ master の複製へ core の安全なラッパー（#3758）で `TIOCSWINSZ` を発行する。supervisor との往復は無い。初期の寸法は既定値のままで、kubelet の最初の resize で決まる
-- 終了: tap の EOF と既存の kind 8 の `ExitWatch` から `exited` を作る。ポーリングはしない
+- 終了: tap の EOF と既存の kind 8 の `ExitWatch` から `exited` を作る。ポーリングはしない（主経路の話。実装〔#4077〕は ExitWatch の枠の上限 8 により `Transient`〔`Busy`〕になりうるため、`Transient` と `NoSupervisor` のときだけ状態ストアの照会〔1 秒刻み〕へ退避する逸脱を持つ）
 - 複数の attach: 同時に attach してよい（containerd と同じ）。stdin は各セッションの複製から並行して書かれ、混ざりうる。出力は各セッションが自分の tap を持つ
 
 **D7. RPC 時の整合検査（cri）**
@@ -351,7 +351,7 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 | C6 | #4075 | supervisor: kind 9 `AttachRequest` と fd 応答（実装済み: `control::protocol` の `AttachRequestFrame`・`control::server` の `handle_attach`・クライアント入口 `AttachIoSource` / `ControlAttach`。結線は C9） | C4・C5・#3759 |
 | C7 | #4073 | core: `StartRequest` の `StdinMode`（実装済み。`StartRequest::with_stdin` / `stdin`、既定 `Closed`。値の参照は C4・C8） | なし |
 | C8 | #4076 | cri: 記録への保存と StartContainer での運搬（実装済み: 記録の config〔永続記録 v1 のまま〕から `start_stdin_mode` で導き、`RuntimeAdapter::start_with_options` が `StartRequest::with_stdin` に載せる。plugin-cri の `supervised.rs` が `StartOptions::with_stdin` で argv `--stdin <open\|once>` へ写す。`bundle/spec.rs` の `tty/stdin` の拒否は C10 まで残すため、本番の CreateContainer はまだ通らない） | C7・C4 |
-| C9 | #4077 | plugin-cri: 完全版 `AttachBackend` | C6・C8・#3763・#3754・#3761 |
+| C9 | #4077 | plugin-cri: 完全版 `AttachBackend`（実装済み: Linux の `streaming::supervisor_attach::SupervisorAttachBackend`。状態確認 → kind 9 の `AttachIoSource::obtain` → `validate_attach_io` で形を再照合 → 入力は専用スレッド＋socketpair、tap は tokio 化、resize は `PtyMaster::resize`、`exited` は tap の EOF と kind 8 の購読。`CriPluginBackends::supervisor_attach_backend` が組み `main.rs` が Linux で使う。`production_stream_dispatcher` は `read_only` のままで、stdin・tty・resize は偽の source を使う単体試験からしか届かない） | C6・C8・#3763・#3754・#3761 |
 | C10 | #4078 | cri: 拒否の解除と整合検査 | C3・C9 |
 | C11 | #4079 | 実機前提試験・手順・CI の追記 | C10 |
 
@@ -426,7 +426,7 @@ CRI の `ExecSync`（現状 `UNIMPLEMENTED`）も本設計の helper を再利�
 
 実装済みは Exec の本番 launcher（#3761。Linux のみ）、読み取り専用の Attach（#3763）、NODE の PortForward（#3755）。未実装の組は次のとおり（REPAIR-3）。
 
-- 完全な Attach（stdin・stdin_once・tty・resize）: #3765（設計のみ・closed）の子 issue で追う。個別の状態は「完全版 Attach の設計（#3765）」の子 issue 表を正とする
+- 完全な Attach（stdin・stdin_once・tty・resize）: plugin-cri の backend は実装済み（#4077）だが本番の dispatcher は `read_only` のまま（解除と bundle の拒否の解除は #4078、実機は #4079）。#3765（設計のみ・closed）の子 issue で追う。個別の状態は「完全版 Attach の設計（#3765）」の子 issue 表を正とする
 - POD ネットワークの PortForward: 設計と分解は #3766、前提は保持役 provider の #2877。RPC 時と dialer の両方で `UNIMPLEMENTED`
 - Exec の tty（supervisor 側の pty 結線と helper の `--tty`。受け側は実装・試験済み）: 追跡 issue 未起票（親 #3726 の残り）。本番は RPC 時に `INVALID_ARGUMENT`
 - Exec の相対 argv[0]（PATH 解決）: #2439 の判断待ち。RPC 時に `INVALID_ARGUMENT`

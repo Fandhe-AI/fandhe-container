@@ -3,6 +3,8 @@
 //! 呼び出し元: `streaming::production_stream_dispatcher` が `AttachHandler::read_only` に包んで `with_attach` する。
 //! セッション（cri の `attach::run_session`）が接続時に [`LogFollowAttachBackend::attach`] を呼ぶ。
 //!
+//! 本番の結線は非 Linux のみ。Linux は `supervisor_attach`（捕捉の tap。#4077・D2）に置き換えた（本ファイルは非 Linux と既存の試験が使う）。
+//!
 //! # 方式（段階 1。設計は `docs/design/cri-streaming-server.md`「Attach > 段階 1」）
 //! supervisor の回転ログ（`<state_root>/@container-logs`。CRI のコンテナも `TeeLogSink` で書く）を、セッションごとの専用スレッドが
 //! `read_container_log_with_hooks` で `tail 0` から follow する。出力（`stdout ` / `stderr ` のタグつきレコード）は

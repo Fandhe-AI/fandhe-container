@@ -258,8 +258,24 @@ fn serve(socket: &std::path::Path) -> ExitCode {
     };
     // ストリーミングサーバー（loopback）を UDS の bind より前に起動する。失敗は fail-closed で起動しない（#3754・CRI-6）。
     // 縮退して動くと「未結線」と区別できないため。UDS より先に判定し、失敗で socket を残さない。
-    // Attach の読み取り専用 backend（回転ログの follow。#3763）。作れなければ起動しない（fail-closed）。
-    let attach_backend = match backends.log_attach_backend() {
+    // Attach の backend。Linux は完全版（kind 9 の fd と tap。#4077）、非 Linux は読み取り専用（回転ログの follow。#3763）。
+    // 作れなければ起動しない（fail-closed）。
+    #[cfg(target_os = "linux")]
+    let attach_backend: std::sync::Arc<
+        dyn fandhe_container_cri::streaming::attach::AttachBackend,
+    > = match backends.supervisor_attach_backend() {
+        Ok(b) => b,
+        Err(_) => {
+            return fail(
+                PluginErrorCode::Internal,
+                "failed to prepare the attach backend",
+            );
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
+    let attach_backend: std::sync::Arc<
+        dyn fandhe_container_cri::streaming::attach::AttachBackend,
+    > = match backends.log_attach_backend() {
         Ok(b) => b,
         Err(_) => {
             return fail(

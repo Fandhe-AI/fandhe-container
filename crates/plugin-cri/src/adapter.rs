@@ -294,6 +294,32 @@ impl CriPluginBackends {
         ))
     }
 
+    /// 本番の完全版 `AttachBackend`（supervisor の kind 9 で fd と tap を受ける。CRI-6・SEC-1・SUP-4・#4077）を作る。
+    ///
+    /// 状態ルートは `production()` の固定位置で、要求の入力から受けない。注入で組んだとき（状態ルートが無い）と、終了購読の口を
+    /// 作れないストアは `FAILED_PRECONDITION`（縮退しない）。
+    #[cfg(target_os = "linux")]
+    pub fn supervisor_attach_backend(
+        &self,
+    ) -> Result<Arc<crate::streaming::supervisor_attach::SupervisorAttachBackend>, CriError> {
+        if self.state_root.is_none() {
+            return Err(CriError::failed_precondition(
+                "state root is not configured",
+            ));
+        }
+        let io_source =
+            fandhe_container_supervisor::control::production_attach_io_source(&*self.state);
+        let notifier = fandhe_container_supervisor::control::production_exit_notifier(&*self.state)
+            .ok_or_else(|| CriError::failed_precondition("exit notifier is not available"))?;
+        Ok(Arc::new(
+            crate::streaming::supervisor_attach::SupervisorAttachBackend::new(
+                Arc::clone(&self.state),
+                io_source,
+                notifier,
+            ),
+        ))
+    }
+
     /// ストリーミング（Exec のセッション・stdio の読み書き）の計装先。`runtime_service` と同じ共有記録器へ `cri.*` で記録する
     /// （統計出力に届く。REPAIR-4・CRI-6）。
     pub fn streaming_op_recorder(&self) -> Arc<dyn CriOpRecorder> {

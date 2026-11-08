@@ -5,8 +5,9 @@
 //! 停止は [`stop_streaming_on`] で包んだ shutdown future が担い、SIGTERM・SIGINT（#3226）の受信と同時に TCP の待ち受けを閉じる。
 //!
 //! # 現状（REPAIR-3）
-//! 結線済みは Attach（読み取り専用。[`log_attach::LogFollowAttachBackend`]。回転ログの follow で、stdin・tty は
-//! `INVALID_ARGUMENT`。完全版は #3765 の設計。#3763）と、PortForward の NODE ネットワーク（hostNetwork）の pod
+//! 結線済みは Attach（読み取り専用。Linux は完全版の backend〔`supervisor_attach::SupervisorAttachBackend`。kind 9 の tap と
+//! fd の受け取り。#4077〕を載せるが、`production_stream_dispatcher` は `AttachHandler::read_only` のままで stdin・tty は
+//! RPC 時に断る。`read_only` の解除は #4078。非 Linux は [`log_attach::LogFollowAttachBackend`]〔回転ログの follow。#3763〕）と、PortForward の NODE ネットワーク（hostNetwork）の pod
 //! （#3755。[`NodeLoopbackDialer`]）。POD ネットワークの pod は RPC 時（cri）と dialer の両方で `UNIMPLEMENTED` で、
 //! 保持役（#2877）と helper 方式（#3766）まで続く。Exec は Linux で結線済み（`exec_launcher::SupervisorExecLauncher`。
 //! supervisor の `stream-exec` helper 経由。stdin・stdout・stderr のみで、tty と相対 `argv[0]` は RPC 時に `INVALID_ARGUMENT`。#3761）で、
@@ -27,6 +28,8 @@
 //! `rt.shutdown_timeout` が打ち切るため、`shutdown::SHUTDOWN_TOTAL_BOUND` は変わらない。
 //! Attach のセッションはランタイムの停止でタスクごと drop され、読み口の drop が取り消しの旗を立てて follow スレッドは
 //! 1 ポーリング（200 ms）以内に抜ける。スレッドは detached でプロセスの停止を待たせない。
+//! 完全版の Attach（Linux。#4077）は、セッションの部品の drop で監視スレッドが 10 ms 以内に抜け、入力スレッドは socket の EOF か
+//! 書き込みの失敗で抜ける（コンテナが stdin を読まないと止まるが、同時数 64 に数えられ有界）。待ちは足さない。
 //! PortForward の Upgrade 後のセッションと実行中の blocking の dial（最長 `dial_timeout` 10 秒）も、プロセス終了時の
 //! `rt.shutdown_timeout` が打ち切るため待ちは増えず、`SHUTDOWN_TOTAL_BOUND` は変わらない（#3755 で再評価）。
 //! Exec のセッションは長寿命になりうるため、停止時に `exec_launcher` が追跡中の helper を kill する（`stop_streaming_on` の `on_stop`。
@@ -37,6 +40,9 @@ pub mod log_attach;
 
 #[cfg(target_os = "linux")]
 pub mod exec_launcher;
+
+#[cfg(target_os = "linux")]
+pub mod supervisor_attach;
 
 use std::future::Future;
 use std::sync::Arc;
@@ -196,6 +202,23 @@ mod tests {
         assert_eq!(c.token_ttl, Duration::from_secs(60));
         assert_eq!(c.max_in_flight, 1000);
         assert_eq!(c.max_connections, 64);
+    }
+
+    /// 完全版の backend を渡しても読み取り専用の印は変わらない（`read_only` の解除は #4078 の範囲。#4077）。
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn cri6_4077_supervisor_attach_backend_keeps_read_only_wiring() {
+        let backend: Arc<dyn AttachBackend> =
+            Arc::new(supervisor_attach::tests::backend_for_wiring());
+        let server = bind_production_streaming(
+            production_streaming_config(),
+            backend,
+            None,
+            noop_recorder(),
+        )
+        .await
+        .expect("bind");
+        assert!(!server.issuer().wiring().attach_interactive());
     }
 
     #[tokio::test]

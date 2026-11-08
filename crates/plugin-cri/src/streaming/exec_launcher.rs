@@ -25,7 +25,8 @@
 //! - tty: 受け側（`PtyMaster` の検証と resize の転送）は実装・試験済みだが、helper が `--tty` を受けず supervisor の
 //!   `ExecStdio` に pty が無いため、本番の spawner は能力 `tty = false` で、tty の要求は launcher でも断る（後続 issue。
 //!   cri 側は RPC 時に `ExecStreamHandler::without_tty` で断る）。tty のときは stdio の fd を送らない（mask 0。暫定）。
-//! - helper の fd 1・2 は `/dev/null`。診断 JSON 行は捨てる（結果は `Result` frame の固定語彙で返る）。
+//! - helper の fd 1 は `/dev/null`。fd 2 は AF_UNIX の socketpair で受け、上限つきで固定語彙の構造化ログへ転送する
+//!   （[`diagnostics`]。上限・転送の規則・停止・残余は同モジュールの doc。#4171・REPAIR-4・REPAIR-5）。
 //! - セッションは最長 `MAX_EXEC_HOLD_SECS`（1 時間）で helper が止める（kubelet の idle 4 時間より短い）。
 //! - 同時セッション 64・回収できない helper の保持 8 は暫定値（#4116 のオーナー確認待ち）。
 //! - plugin-cri が SIGKILL された場合、helper は期限まで残る（PDEATHSIG を使わない設計。helper の doc を参照）。
@@ -40,7 +41,7 @@ use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::{Child, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
@@ -61,6 +62,11 @@ use fandhe_container_supervisor::stream_exec::channel::{
 use fandhe_container_supervisor::stream_exec::helper::{StreamExecArgs, stream_exec_command};
 use fandhe_container_supervisor::stream_exec::wire::{ChildStatus, StdioMask, StreamExecOutcome};
 use tokio::io::{AsyncRead, AsyncWrite};
+
+use crate::telemetry::LineSink;
+
+pub mod diagnostics;
+use diagnostics::DiagTracker;
 
 /// 同時に走らせる exec セッションの上限（`StreamingConfig::max_connections` の既定と同じ。暫定。#4116）。
 pub const MAX_EXEC_SESSIONS: usize = 64;
@@ -92,6 +98,8 @@ pub struct SpawnedHelper {
     pub child: Child,
     /// plugin 側の channel の端。
     pub channel: StdUnixStream,
+    /// helper の fd 2（診断の受け口）の plugin 側の端。`None` なら読み手を起動しない（#4171）。
+    pub diagnostics: Option<StdUnixStream>,
 }
 
 /// helper が対応する機能（本番の spawner は `tty = false`。後続 issue で true にする）。
@@ -132,17 +140,23 @@ impl HelperSpawner for ProductionHelperSpawner {
         }
         let (plugin_end, helper_end) = StdUnixStream::pair()
             .map_err(|_| CriError::unavailable("exec channel setup failed"))?;
+        // fd 2 は AF_UNIX の socketpair（core の診断出力は socket にしか書かないため pipe にしない。#4171）。
+        let (diag_end, helper_err) = StdUnixStream::pair()
+            .map_err(|_| CriError::unavailable("exec channel setup failed"))?;
         let mut command = stream_exec_command(&supervisor, args);
         command
             .stdin(Stdio::from(OwnedFd::from(helper_end)))
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let child = command
-            .spawn()
-            .map_err(|_| CriError::unavailable("failed to start the exec helper"))?;
+            .stderr(Stdio::from(OwnedFd::from(helper_err)));
+        let spawned = command.spawn();
+        // 親に残る helper 側の端を閉じる（EOF を観測できるように）。
+        drop(command);
+        let child =
+            spawned.map_err(|_| CriError::unavailable("failed to start the exec helper"))?;
         Ok(SpawnedHelper {
             child,
             channel: plugin_end,
+            diagnostics: Some(diag_end),
         })
     }
 
@@ -167,6 +181,8 @@ struct Shared {
     /// 回収スレッドを作れなかった kill 済み helper。Child を落とさず終了確認まで保持する。
     stuck: Mutex<Vec<Child>>,
     live: Mutex<Live>,
+    /// fd 2 の読み手の追跡（終了時に上限つきで待つ。#4171）。
+    diag: Arc<DiagTracker>,
 }
 
 /// 起動 future のキャンセル状態。future の drop で取消を立て、起動済みの helper を直ちに止める（REPAIR-5）。
@@ -262,6 +278,8 @@ impl Shared {
 struct HelperGuard {
     child: Mutex<Option<Child>>,
     shared: Arc<Shared>,
+    /// fd 2 の読み手への停止の印。`kill` の先頭で立てる（#4171）。
+    diag_stop: Arc<AtomicBool>,
     _slot: Slot,
 }
 
@@ -269,6 +287,8 @@ impl HelperGuard {
     /// SIGKILL を送って回収する。呼び出しスレッドをブロックしない（tokio の実行時の上で呼ばれうる）。
     /// 直ちに回収できなければ、専用スレッドが `wait` する（Child を落とさず zombie を作らない）。
     fn kill(&self) {
+        // 読み手は EOF に頼らず止める（fork した worker が書き込み端を継承しうるため。#4171）。
+        self.diag_stop.store(true, Ordering::SeqCst);
         let taken = self
             .child
             .lock()
@@ -485,6 +505,8 @@ pub struct SupervisorExecLauncher {
     store: Arc<dyn StateStore>,
     spawner: Arc<dyn HelperSpawner>,
     shared: Arc<Shared>,
+    /// helper の fd 2 の診断の転送先（既定は共有の stderr sink。#4171）。
+    diag_sink: LineSink,
 }
 
 impl SupervisorExecLauncher {
@@ -499,7 +521,20 @@ impl SupervisorExecLauncher {
             store,
             spawner,
             shared: Arc::new(Shared::default()),
+            diag_sink: crate::telemetry::stderr_sink().clone(),
         }
+    }
+
+    /// 診断の転送先を差し替える（試験用）。
+    #[must_use]
+    pub fn with_diagnostic_sink(mut self, sink: LineSink) -> Self {
+        self.diag_sink = sink;
+        self
+    }
+
+    /// fd 2 の読み手が全て終わるまで最大 `timeout` 待ち、残った数を返す（終了時に上限つきで呼ぶ。REPAIR-5・#4171）。
+    pub fn wait_diagnostics_idle(&self, timeout: Duration) -> usize {
+        self.shared.diag.wait_idle(timeout)
     }
 
     /// 本番の spawner で作る。
@@ -626,12 +661,35 @@ impl SupervisorExecLauncher {
             }
         }
 
-        let SpawnedHelper { child, channel } = self.spawner.spawn(&args)?;
+        let SpawnedHelper {
+            child,
+            channel,
+            diagnostics,
+        } = self.spawner.spawn(&args)?;
+        let diag_stop = Arc::new(AtomicBool::new(false));
         let guard = Arc::new(HelperGuard {
             child: Mutex::new(Some(child)),
             shared: Arc::clone(&self.shared),
+            diag_stop: Arc::clone(&diag_stop),
             _slot: slot,
         });
+        // 起動直後の失敗の診断も拾うため、登録より前に読み手を起動する。作れなくても exec は失敗にしない（観測は最善努力）。
+        if let Some(sock) = diagnostics {
+            let reader_deadline = Instant::now() + STARTED_BUDGET + SESSION_TIMEOUT + RESULT_GRACE;
+            if diagnostics::spawn_reader(
+                sock,
+                diag_stop,
+                reader_deadline,
+                self.diag_sink.clone(),
+                &self.shared.diag,
+            )
+            .is_err()
+            {
+                let _ = self
+                    .diag_sink
+                    .submit(diagnostics::reader_unavailable_line());
+            }
+        }
         if !cancel.register(&guard) {
             // spawn の間に取消された。`guard` の drop で helper を止める。
             return Err(cancelled());
@@ -789,6 +847,7 @@ impl ExecStreamLauncher for SupervisorExecLauncher {
                 store: Arc::clone(&self.store),
                 spawner: Arc::clone(&self.spawner),
                 shared: Arc::clone(&self.shared),
+                diag_sink: self.diag_sink.clone(),
             };
             let req2 = req.clone();
             // future が drop（`launch_timeout` の期限切れ・切断）されたら、blocking 側へ取消を伝えて起動済みの helper を止める。

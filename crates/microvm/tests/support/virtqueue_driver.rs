@@ -89,19 +89,46 @@ impl InterruptLine for CountLine {
 }
 
 /// virtio-block（queue 0）のゲスト側の配置と手順。
-#[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
 pub mod block {
     use super::*;
     use fandhe_container_microvm::virtio_block::{MemoryBlockBackend, VirtioBlock};
 
+    #[allow(
+        dead_code,
+        reason = "virtio-block を使わない取り込み元の試験では参照されない"
+    )]
     pub const DESC: u64 = 0x1000;
+    #[allow(
+        dead_code,
+        reason = "virtio-block を使わない取り込み元の試験では参照されない"
+    )]
     pub const AVAIL: u64 = 0x2000;
+    #[allow(
+        dead_code,
+        reason = "virtio-block を使わない取り込み元の試験では参照されない"
+    )]
     pub const USED: u64 = 0x3000;
+    #[allow(
+        dead_code,
+        reason = "virtio-block を使わない取り込み元の試験では参照されない"
+    )]
     pub const HDR: u64 = 0x10000;
+    #[allow(
+        dead_code,
+        reason = "virtio-block を使わない取り込み元の試験では参照されない"
+    )]
     pub const DATA: u64 = 0x11000;
+    #[allow(
+        dead_code,
+        reason = "virtio-block を使わない取り込み元の試験では参照されない"
+    )]
     pub const STATUS: u64 = 0x12000;
 
     /// MMIO レジスタ経由でデバイスを activate する（提示された feature をそのまま受け、queue 0 を設定する）。
+    #[allow(
+        dead_code,
+        reason = "virtio-block を使わない取り込み元の試験では参照されない"
+    )]
     pub fn init(t: &mut VirtioMmioTransport<VirtioBlock<MemoryBlockBackend>>) {
         wr(t, reg::STATUS, 1);
         wr(t, reg::STATUS, 3);
@@ -125,11 +152,19 @@ pub mod block {
         assert_eq!(wr(t, reg::STATUS, 15), MmioWriteOutcome::DeviceActivated);
     }
 
+    #[allow(
+        dead_code,
+        reason = "virtio-block を使わない取り込み元の試験では参照されない"
+    )]
     pub fn desc(m: &mut Mem, i: u64, addr: u64, len: u32, flags: u16, next: u16) {
         write_desc(m, DESC, i, addr, len, flags, next);
     }
 
     /// head=0 の [header R][data][status W] を avail の `slot` に積む。
+    #[allow(
+        dead_code,
+        reason = "virtio-block を使わない取り込み元の試験では参照されない"
+    )]
     pub fn submit(m: &mut Mem, slot: u16, ty: u32, sector: u64, len: u32, data_flags: u16) {
         m.write_u32_le(ga(HDR), ty).unwrap();
         m.write_at(ga(HDR + 8), &sector.to_le_bytes()).unwrap();
@@ -144,22 +179,61 @@ pub mod block {
 }
 
 /// virtio-net（queue 0 = receiveq・queue 1 = transmitq）のゲスト側の配置と手順。
-#[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
 pub mod net {
     use super::*;
     use fandhe_container_microvm::virtio_net::{MemoryNetBackend, VirtioNet};
 
+    #[allow(
+        dead_code,
+        reason = "virtio-net を使わない取り込み元の試験では参照されない"
+    )]
     pub const MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+    #[allow(
+        dead_code,
+        reason = "virtio-net を使わない取り込み元の試験では参照されない"
+    )]
     pub const RX_DESC: u64 = 0x1000;
+    #[allow(
+        dead_code,
+        reason = "virtio-net を使わない取り込み元の試験では参照されない"
+    )]
     pub const RX_AVAIL: u64 = 0x2000;
+    #[allow(
+        dead_code,
+        reason = "virtio-net を使わない取り込み元の試験では参照されない"
+    )]
     pub const RX_USED: u64 = 0x3000;
+    #[allow(
+        dead_code,
+        reason = "virtio-net を使わない取り込み元の試験では参照されない"
+    )]
     pub const TX_DESC: u64 = 0x4000;
+    #[allow(
+        dead_code,
+        reason = "virtio-net を使わない取り込み元の試験では参照されない"
+    )]
     pub const TX_AVAIL: u64 = 0x5000;
+    #[allow(
+        dead_code,
+        reason = "virtio-net を使わない取り込み元の試験では参照されない"
+    )]
     pub const TX_USED: u64 = 0x6000;
+    #[allow(
+        dead_code,
+        reason = "virtio-net を使わない取り込み元の試験では参照されない"
+    )]
     pub const TX_BUF: u64 = 0x10000;
+    #[allow(
+        dead_code,
+        reason = "virtio-net を使わない取り込み元の試験では参照されない"
+    )]
     pub const RX_BUF: u64 = 0x11000;
 
     /// MMIO レジスタ経由でデバイスを activate する（VIRTIO_NET_F_MAC を受け、2 キューを設定する）。
+    #[allow(
+        dead_code,
+        reason = "virtio-net を使わない取り込み元の試験では参照されない"
+    )]
     pub fn init(t: &mut VirtioMmioTransport<VirtioNet<MemoryNetBackend>>) {
         wr(t, reg::STATUS, 1);
         wr(t, reg::STATUS, 3);
@@ -190,6 +264,10 @@ pub mod net {
     }
 
     /// `base` の記述子テーブルの `i` 番を書く（next = 0）。
+    #[allow(
+        dead_code,
+        reason = "virtio-net を使わない取り込み元の試験では参照されない"
+    )]
     pub fn desc(m: &mut Mem, base: u64, i: u64, addr: u64, len: u32, flags: u16) {
         write_desc(m, base, i, addr, len, flags, 0);
     }
@@ -197,6 +275,10 @@ pub mod net {
     pub use super::publish;
 
     /// transmitq の `slot` へ（ヘッダ 12 バイト + 64 バイトのフレーム）を積み、フレームを返す。
+    #[allow(
+        dead_code,
+        reason = "virtio-net を使わない取り込み元の試験では参照されない"
+    )]
     pub fn submit_tx(m: &mut Mem, slot: u16) -> Vec<u8> {
         let frame: Vec<u8> = (0..64u32)
             .map(|i| ((i + u32::from(slot)) % 251) as u8)
@@ -211,6 +293,10 @@ pub mod net {
     }
 
     /// receiveq の 0 番へ 2048 バイトの書き込み用バッファを積む。
+    #[allow(
+        dead_code,
+        reason = "virtio-net を使わない取り込み元の試験では参照されない"
+    )]
     pub fn submit_rx(m: &mut Mem) {
         desc(m, RX_DESC, 0, RX_BUF, 2048, 2);
         publish(m, RX_AVAIL, 0);

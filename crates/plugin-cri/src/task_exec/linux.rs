@@ -7,8 +7,9 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
+use fandhe_container_core::exec::{ExecCgroupName, ExecCgroupPresence, exec_child_cgroup_presence};
 use fandhe_container_core::traits::{
-    ContainerId, ContainerState, ErrorCode, GetStateRequest, Signal, StateStore,
+    CgroupPlacement, ContainerId, ContainerState, ErrorCode, GetStateRequest, Signal, StateStore,
 };
 use fandhe_container_cri::error::CriError;
 use fandhe_container_cri::shim_v2::{
@@ -42,22 +43,67 @@ pub enum ExtinctionOutcome {
     Unknown,
 }
 
+/// 消滅を確かめる exec の材料（launch の時点で固定する。#4221）。
+///
+/// `placement` は launch が読んだ状態記録の cgroup 配置。helper は同じ記録を読み pid の一致を確かめてから exec 子 cgroup を作る
+/// ため、同じ世代の配置になる。確認の時点で記録を読み直すと restart で別の世代の経路を見て誤って「不在」と判定しうるので、
+/// ここへ固定する。`cgroup` は helper が `Started` で通知した exec 子 cgroup の名前（検証済み）。
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ExecExtinctionTarget {
+    /// exec の対象コンテナ。
+    pub container: ContainerId,
+    /// 起動時点の記録の cgroup 配置（記録に無ければ `None`。確認の材料が無いので `Unknown` になる）。
+    pub placement: Option<CgroupPlacement>,
+    /// helper が通知した exec 子 cgroup の名前。
+    pub cgroup: ExecCgroupName,
+}
+
 /// kill・期限切れ・失敗の後に exec の消滅を確かめる差し込み口（CRI-5・SEC-1・REPAIR-3）。
 ///
 /// `Confirmed` のときだけハンドルは `Exited` へ進む。それ以外は未確認のまま `Err` を保つ（fail-closed）。
 pub trait ExecExtinctionProbe: Send + Sync + 'static {
-    /// `container` の exec の消滅を確かめる。有界でブロッキングしてよい。
-    fn confirm(&self, container: &ContainerId) -> ExtinctionOutcome;
+    /// `target` の exec の消滅を確かめる。有界でブロッキングしてよい。
+    fn confirm(&self, target: &ExecExtinctionTarget) -> ExtinctionOutcome;
 }
 
-/// 本番の probe。常に `Unknown`（REPAIR-3）。supervisor 側の wire 拡張（`Started` へ exec 子 cgroup の名前を載せる等）が
-/// 入るまでの暫定で、plugin-cri からは `ExecGuardPool` の回収結果を観測できない。
+/// 本番の probe（#4221・CRI-5・SEC-1・REPAIR-3）。exec 子 cgroup のディレクトリが **無いこと** を読み取り専用で確かめる。
+///
+/// cgroup v2 のディレクトリはプロセスが残る間 `rmdir` できない。回収する supervisor の `ExecGuardPool`（helper の切断時）と
+/// helper 自身（正常終了・期限切れ）はどちらも `cgroup.kill` → 空の待ち → `rmdir` の順に進むため、通知された名前のディレクトリの
+/// 不在は、そこにいたプロセス全体の消滅の証拠になる。**kill も rmdir も書かない**: 名前は helper の pid と連番で作られ、
+/// helper の回収後に別の helper が同じ名前を作りうるため、ここで kill すると別の exec を止めかねない。読むだけなら再利用で
+/// 起きるのは「まだある」と見える安全側の誤りだけで、`Unknown` のまま purge で回収される。
+///
+/// 判定の写像: 子が無い・コンテナ cgroup 自体が無い（親は子を持ったまま消えない）→ `Confirmed`、子がある・照合に失敗した・
+/// cgroup ルートを開けない・記録に配置が無い → `Unknown`。
 #[derive(Debug, Default, Clone, Copy)]
-pub struct UnconfirmedExtinctionProbe;
+pub struct CgroupExtinctionProbe;
 
-impl ExecExtinctionProbe for UnconfirmedExtinctionProbe {
-    fn confirm(&self, _container: &ContainerId) -> ExtinctionOutcome {
-        ExtinctionOutcome::Unknown
+impl CgroupExtinctionProbe {
+    /// core の読み取り専用の確認結果を消滅確認の結果へ写す（`Err` と将来の未知の値は `Unknown`。fail-closed）。
+    pub(crate) fn map_presence(
+        presence: Result<ExecCgroupPresence, fandhe_container_core::exec::ExecError>,
+    ) -> ExtinctionOutcome {
+        match presence {
+            Ok(ExecCgroupPresence::Absent | ExecCgroupPresence::ContainerCgroupAbsent) => {
+                ExtinctionOutcome::Confirmed
+            }
+            _ => ExtinctionOutcome::Unknown,
+        }
+    }
+}
+
+impl ExecExtinctionProbe for CgroupExtinctionProbe {
+    fn confirm(&self, target: &ExecExtinctionTarget) -> ExtinctionOutcome {
+        let Some(placement) = target.placement.as_ref() else {
+            return ExtinctionOutcome::Unknown;
+        };
+        Self::map_presence(exec_child_cgroup_presence(
+            &target.container,
+            placement,
+            &target.cgroup,
+        ))
     }
 }
 
@@ -72,7 +118,13 @@ pub struct ExecBudgets {
     pub session: Duration,
     /// `Result` を待つ余裕（session に足す）。
     pub result_grace: Duration,
+    /// 未確認になってから、Wait が消滅の確認を待つ猶予（supervisor の exec 子 cgroup の回収の上限に余裕を足した値。#4221）。
+    /// 過ぎても確認できなければ従来どおり `UNAVAILABLE` を返す。
+    pub extinction_grace: Duration,
 }
+
+/// 未確認になってから Wait が消滅の確認を待つ既定の猶予（supervisor の `REAP_BUDGET` と同じ 10 秒）。
+const EXTINCTION_GRACE: Duration = Duration::from_secs(10);
 
 impl Default for ExecBudgets {
     fn default() -> Self {
@@ -81,6 +133,7 @@ impl Default for ExecBudgets {
             started: STARTED_BUDGET,
             session: SESSION_TIMEOUT,
             result_grace: RESULT_GRACE,
+            extinction_grace: EXTINCTION_GRACE,
         }
     }
 }
@@ -88,7 +141,20 @@ impl Default for ExecBudgets {
 enum Phase {
     Running,
     Exited(Option<i32>),
-    Unconfirmed(CriError),
+    /// 消滅を確認できていない。`since` は遷移した時刻（Wait の確認の猶予の起点。#4221）。
+    Unconfirmed {
+        error: CriError,
+        since: Instant,
+    },
+}
+
+impl Phase {
+    fn unconfirmed(error: CriError) -> Self {
+        Self::Unconfirmed {
+            error,
+            since: Instant::now(),
+        }
+    }
 }
 
 struct Inner {
@@ -174,7 +240,7 @@ impl ShimExecLauncher {
             state_root,
             store,
             Arc::new(ProductionHelperSpawner),
-            Arc::new(UnconfirmedExtinctionProbe),
+            Arc::new(CgroupExtinctionProbe),
         )
     }
 
@@ -209,8 +275,13 @@ impl ShimExecLauncher {
         Ok(())
     }
 
-    /// helper へ空の stdio を渡し `Started` まで進める。
-    fn handshake(&self, channel: &std::os::unix::net::UnixStream) -> Result<(), CriError> {
+    /// helper へ空の stdio を渡し `Started` まで進め、helper が通知した exec 子 cgroup の名前を返す（wire v2・#4221）。
+    ///
+    /// 旧い helper（v1）とは version の不一致で `Started` に至らず、ここで `Err`（exec は始まらず、登録も probe も作らない。fail-closed）。
+    fn handshake(
+        &self,
+        channel: &std::os::unix::net::UnixStream,
+    ) -> Result<ExecCgroupName, CriError> {
         send_stdio_handover(
             channel,
             &StdioSend {
@@ -222,7 +293,7 @@ impl ShimExecLauncher {
         )
         .map_err(|e| channel_error(&e))?;
         match recv_from_helper(channel, Instant::now() + self.budgets.started) {
-            Ok(HelperMessage::Started) => Ok(()),
+            Ok(HelperMessage::Started(name)) => Ok(name),
             Ok(HelperMessage::Result(outcome)) => Err(match map_outcome(outcome) {
                 Err(e) => e,
                 Ok(_) => CriError::internal("exec ended before it started"),
@@ -256,6 +327,7 @@ impl TaskExecLauncher for ShimExecLauncher {
                     CriError::unavailable("container state is unavailable")
                 }
             })?;
+        let placement = record.cgroup().cloned();
         let status = record.status();
         let pid: NonZeroU32 = match (status.state(), status.pid()) {
             (ContainerState::Running, Some(pid)) => pid,
@@ -318,7 +390,7 @@ impl TaskExecLauncher for ShimExecLauncher {
             guard.kill();
             e
         };
-        self.handshake(&channel).map_err(fail)?;
+        let cgroup = self.handshake(&channel).map_err(fail)?;
 
         let watch_channel = channel
             .try_clone()
@@ -350,7 +422,12 @@ impl TaskExecLauncher for ShimExecLauncher {
             guard: Arc::downgrade(&guard),
             tracker: Arc::clone(&self.tracker),
             probe: Arc::clone(&self.probe),
-            container: container.clone(),
+            target: ExecExtinctionTarget {
+                container: container.clone(),
+                placement,
+                cgroup,
+            },
+            extinction_grace: self.budgets.extinction_grace,
         }))
     }
 }
@@ -365,15 +442,15 @@ fn watch_result(
 ) {
     let next = match recv_from_helper(channel, deadline) {
         Ok(HelperMessage::Result(StreamExecOutcome::Failed(code))) => {
-            Phase::Unconfirmed(cri_error(code))
+            Phase::unconfirmed(cri_error(code))
         }
         Ok(HelperMessage::Result(outcome)) => match map_outcome(outcome) {
             Ok(code) => Phase::Exited(Some(code)),
-            Err(e) => Phase::Unconfirmed(e),
+            Err(e) => Phase::unconfirmed(e),
         },
         Ok(_) | Err(_) => {
             guard.kill();
-            Phase::Unconfirmed(CriError::unavailable(UNCONFIRMED))
+            Phase::unconfirmed(CriError::unavailable(UNCONFIRMED))
         }
     };
     inner.settle_if_running(next);
@@ -386,7 +463,41 @@ struct ShimExecProcess {
     guard: Weak<HelperGuard>,
     tracker: Arc<Mutex<Tracker>>,
     probe: Arc<dyn ExecExtinctionProbe>,
-    container: ContainerId,
+    /// 消滅確認の材料（launch の時点で固定。#4221）。
+    target: ExecExtinctionTarget,
+    extinction_grace: Duration,
+}
+
+impl ShimExecProcess {
+    /// 未確認のとき probe を 1 回照会し、`Confirmed` なら `Exited(None)` へ進める。lock の外で probe を呼ぶ。
+    fn try_confirm(&self) {
+        if self.probe.confirm(&self.target) == ExtinctionOutcome::Confirmed {
+            let mut p = self.inner.lock();
+            if matches!(*p, Phase::Unconfirmed { .. }) {
+                *p = Phase::Exited(None);
+            }
+            drop(p);
+            self.inner.changed.notify_all();
+        }
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        match &*self.inner.lock() {
+            Phase::Running => Snapshot::Running,
+            Phase::Exited(code) => Snapshot::Exited(*code),
+            Phase::Unconfirmed { error, since } => Snapshot::Unconfirmed {
+                error: error.clone(),
+                since: *since,
+            },
+        }
+    }
+}
+
+/// `Phase` の写し（lock を持ち越さずに判定するため）。
+enum Snapshot {
+    Running,
+    Exited(Option<i32>),
+    Unconfirmed { error: CriError, since: Instant },
 }
 
 impl TaskExecProcess for ShimExecProcess {
@@ -395,25 +506,17 @@ impl TaskExecProcess for ShimExecProcess {
     }
 
     fn status(&self) -> Result<ExecProcessStatus, CriError> {
-        let err = {
-            let p = self.inner.lock();
-            match &*p {
-                Phase::Running => return Ok(ExecProcessStatus::Running),
-                Phase::Exited(code) => return Ok(ExecProcessStatus::Exited { code: *code }),
-                Phase::Unconfirmed(e) => e.clone(),
-            }
+        let err = match self.snapshot() {
+            Snapshot::Running => return Ok(ExecProcessStatus::Running),
+            Snapshot::Exited(code) => return Ok(ExecProcessStatus::Exited { code }),
+            Snapshot::Unconfirmed { error, .. } => error,
         };
         // lock の外で probe を呼ぶ。確認できたときだけ終了へ進める。
-        if self.probe.confirm(&self.container) == ExtinctionOutcome::Confirmed {
-            let mut p = self.inner.lock();
-            if matches!(*p, Phase::Unconfirmed(_)) {
-                *p = Phase::Exited(None);
-            }
-            drop(p);
-            self.inner.changed.notify_all();
-            return Ok(ExecProcessStatus::Exited { code: None });
+        self.try_confirm();
+        match self.snapshot() {
+            Snapshot::Exited(code) => Ok(ExecProcessStatus::Exited { code }),
+            _ => Err(err),
         }
-        Err(err)
     }
 
     fn signal(&self, signal: Signal) -> Result<(), CriError> {
@@ -429,31 +532,49 @@ impl TaskExecProcess for ShimExecProcess {
             untrack(&self.tracker, &g);
         }
         self.inner
-            .settle_if_running(Phase::Unconfirmed(CriError::unavailable(UNCONFIRMED)));
+            .settle_if_running(Phase::unconfirmed(CriError::unavailable(UNCONFIRMED)));
         Ok(())
     }
 
     fn wait_exit(
         &self,
         timeout: Duration,
-        _poll_interval: Duration,
+        poll_interval: Duration,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<Option<i32>, CriError> {
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or_else(|| CriError::internal("wait deadline overflow"))?;
+        // 未確認の間の probe の照会の刻み（`WAIT_SLICE` を下限にし、過度に叩かない）。
+        let probe_slice = poll_interval.max(WAIT_SLICE);
         loop {
             if cancelled() {
                 return Err(CriError::unavailable("wait cancelled"));
             }
-            if let ExecProcessStatus::Exited { code } = self.status()? {
-                return Ok(code);
-            }
+            let unconfirmed = match self.snapshot() {
+                Snapshot::Exited(code) => return Ok(code),
+                Snapshot::Running => false,
+                Snapshot::Unconfirmed { error, since } => {
+                    // kill・期限切れの直後は supervisor の回収が終わる前のことがあるため、猶予の間だけ刻みごとに確かめる。
+                    self.try_confirm();
+                    if let Snapshot::Exited(code) = self.snapshot() {
+                        return Ok(code);
+                    }
+                    if since.elapsed() >= self.extinction_grace {
+                        return Err(error);
+                    }
+                    true
+                }
+            };
             let now = Instant::now();
             if now >= deadline {
                 return Err(CriError::timeout("wait exceeded its deadline"));
             }
-            let slice = WAIT_SLICE.min(deadline - now);
+            let slice = if unconfirmed { probe_slice } else { WAIT_SLICE }.min(deadline - now);
+            if unconfirmed {
+                std::thread::sleep(slice);
+                continue;
+            }
             let p = self.inner.lock();
             if matches!(*p, Phase::Running) {
                 // 通知か刻みのどちらか早い方で起きる。

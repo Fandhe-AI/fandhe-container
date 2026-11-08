@@ -10,7 +10,7 @@
 //! | オフセット | 長さ | 内容 |
 //! | --- | --- | --- |
 //! | 0 | 4 | magic `FCSX`（制御チャネルの `FCSC` と別。取り違えを検出する） |
-//! | 4 | 1 | version `u8` = 1 |
+//! | 4 | 1 | version `u8` = 2（#4221 で `Started` に exec 子 cgroup の名前を載せるため 1 から上げた。旧い相手とは混在させない） |
 //! | 5 | 1 | kind `u8` |
 //! | 6 | 2 | payload_len `u16`（big-endian） |
 //!
@@ -22,11 +22,17 @@
 //! | kind | frame | 向き | payload | 全長 | 添える fd |
 //! | --- | --- | --- | --- | --- | --- |
 //! | 1 | `StdioHandover` | plugin-cri → helper | mask `u8` | 9 | mask の popcount 本ちょうど（0〜3） |
-//! | 2 | `Started` | helper → plugin-cri | なし | 8 | 0 |
+//! | 2 | `Started` | helper → plugin-cri | 65 バイト（exec 子 cgroup の名前） | 73 | 0 |
 //! | 3 | `PtyMaster` | helper → plugin-cri | なし | 8 | 1（文字デバイス） |
 //! | 4 | `Result` | helper → plugin-cri | 5 バイト | 13 | 0 |
 //!
 //! mask: bit0 = stdin、bit1 = stdout、bit2 = stderr。bit3〜7 は 0 でなければ拒否。fd の並びはビット昇順。
+//!
+//! # `Started` の payload（65 バイト。#4221）
+//!
+//! `[name_len: u8][name: 64 バイト（NUL で埋める）]`。名前は helper が作った exec 子 cgroup の名前（`exec-<pid>-<連番>`）で、
+//! plugin-cri が kill・期限切れの後に「その cgroup が無いこと」を読み取り専用で確かめる材料になる（CRI-5・SEC-1）。
+//! `name_len` が 0 か 64 超・埋めに 0 でないバイトがある・`ExecCgroupName::new` が拒否する名前は frame 全体を拒否する。
 //!
 //! # `Result` の payload（5 バイト）
 //!
@@ -42,19 +48,23 @@
 //! step: 0 = なし、1〜16 = `ExecChildStep`。1〜15 は宣言順（`ControllingTty` を除く）、後から足した `ControllingTty`（#3758）は既存番号を動かさないため末尾の 16。code: 1〜10 = `ErrorCode` を宣言順に 1 から。
 //! 番号は `ALL` の添字からではなく明示の `match` で固定し、core の並び替えで動かさない。未知の番号は frame 全体を拒否する。
 
-use fandhe_container_core::exec::ExecChildStep;
+use fandhe_container_core::exec::{ExecCgroupName, ExecChildStep};
 use fandhe_container_core::traits::ErrorCode;
 
 /// 先頭の識別子（制御チャネルの `FCSC` と別）。
 pub const MAGIC: [u8; 4] = *b"FCSX";
 /// 語彙の版。
-pub const VERSION: u8 = 1;
+pub const VERSION: u8 = 2;
 /// ヘッダの長さ。
 pub const HEADER_LEN: usize = 8;
-/// payload の上限（`Result` の 5 バイトに余裕を足した値）。これを超えるヘッダは payload を読まずに拒否する。
-pub const MAX_PAYLOAD: u16 = 8;
+/// payload の上限（`Started` の 65 バイト）。これを超えるヘッダは payload を読まずに拒否する。
+pub const MAX_PAYLOAD: u16 = (1 + CGROUP_NAME_FIELD_LEN) as u16;
 /// frame 全体の上限（受信バッファを固定長配列にするため）。
 pub const MAX_FRAME_LEN: usize = HEADER_LEN + MAX_PAYLOAD as usize;
+/// `Started` の名前欄の長さ（core の `ExecCgroupName::MAX_LEN`）。
+pub const CGROUP_NAME_FIELD_LEN: usize = ExecCgroupName::MAX_LEN;
+/// `Started` の payload 長（長さ 1 バイト + 名前欄）。
+pub const STARTED_PAYLOAD_LEN: usize = 1 + CGROUP_NAME_FIELD_LEN;
 /// `Result` の payload 長。
 pub const RESULT_PAYLOAD_LEN: usize = 5;
 
@@ -81,6 +91,8 @@ pub enum WireError {
     UnknownStep,
     /// code の番号が未知。
     UnknownCode,
+    /// `Started` の名前欄が不正（長さ 0・上限超・埋めが 0 でない・名前の検証に失敗）。
+    InvalidCgroupName,
 }
 
 /// 符号化の失敗（core に値が増えて番号表に無いとき。既知の値へ黙って置き換えない）。
@@ -90,6 +102,8 @@ pub enum EncodeError {
     UnmappedCode,
     /// `ExecChildStep` の番号が未割り当て。
     UnmappedStep,
+    /// exec 子 cgroup の名前が名前欄に収まらない（黙って切り詰めない）。
+    CgroupNameTooLong,
 }
 
 /// frame の種別。
@@ -129,7 +143,8 @@ impl Kind {
     pub fn payload_len(self) -> u16 {
         match self {
             Self::StdioHandover => 1,
-            Self::Started | Self::PtyMaster => 0,
+            Self::PtyMaster => 0,
+            Self::Started => STARTED_PAYLOAD_LEN as u16,
             Self::Result => 5,
         }
     }
@@ -218,6 +233,71 @@ impl StdioMask {
     }
 }
 
+/// `Started` が運ぶ exec 子 cgroup の名前（固定長 64 バイト + 長さ。壊れた値は作れない）。
+///
+/// `ExecCgroupName`（`String` を持ち `Copy` でない）の代わりに `Frame`・`EncodedFrame` の `Copy` を保つための型。
+/// 作れるのは [`Self::from_name`]（検証済みの名前）と復号だけで、復号は `ExecCgroupName::new` を通った値だけを受ける。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WireCgroupName {
+    len: u8,
+    bytes: [u8; CGROUP_NAME_FIELD_LEN],
+}
+
+impl WireCgroupName {
+    /// 検証済みの名前から作る。名前欄（64 バイト）に収まらなければ `CgroupNameTooLong`（切り詰めない）。
+    pub fn from_name(name: &ExecCgroupName) -> Result<Self, EncodeError> {
+        let src = name.as_str().as_bytes();
+        let len = u8::try_from(src.len()).map_err(|_| EncodeError::CgroupNameTooLong)?;
+        let mut bytes = [0u8; CGROUP_NAME_FIELD_LEN];
+        let dst = bytes
+            .get_mut(..src.len())
+            .ok_or(EncodeError::CgroupNameTooLong)?;
+        dst.copy_from_slice(src);
+        Ok(Self { len, bytes })
+    }
+
+    /// 名前の文字列（検証済みの ASCII。異常時は空文字）。
+    pub fn as_str(&self) -> &str {
+        self.bytes
+            .get(..usize::from(self.len))
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .unwrap_or("")
+    }
+
+    /// `ExecCgroupName` へ戻す（検証を通す）。
+    pub fn to_name(&self) -> Result<ExecCgroupName, WireError> {
+        ExecCgroupName::new(self.as_str()).map_err(|_| WireError::InvalidCgroupName)
+    }
+
+    fn encode_payload(&self) -> [u8; STARTED_PAYLOAD_LEN] {
+        let mut out = [0u8; STARTED_PAYLOAD_LEN];
+        for (dst, src) in out
+            .iter_mut()
+            .zip(std::iter::once(&self.len).chain(self.bytes.iter()))
+        {
+            *dst = *src;
+        }
+        out
+    }
+
+    fn decode_payload(p: &[u8; STARTED_PAYLOAD_LEN]) -> Result<Self, WireError> {
+        let (len, rest) = p.split_first().ok_or(WireError::LengthMismatch)?;
+        let bytes =
+            <[u8; CGROUP_NAME_FIELD_LEN]>::try_from(rest).map_err(|_| WireError::LengthMismatch)?;
+        let n = usize::from(*len);
+        if n == 0 || n > CGROUP_NAME_FIELD_LEN {
+            return Err(WireError::InvalidCgroupName);
+        }
+        // 埋めの部分は 0 でなければならない。
+        if bytes.get(n..).is_none_or(|pad| pad.iter().any(|b| *b != 0)) {
+            return Err(WireError::InvalidCgroupName);
+        }
+        let me = Self { len: *len, bytes };
+        me.to_name()?;
+        Ok(me)
+    }
+}
+
 /// シグナル番号（1〜64）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExitSignal(u8);
@@ -268,8 +348,8 @@ pub enum StreamExecOutcome {
 pub enum Frame {
     /// stdio の受け渡し（mask の fd を伴う）。
     StdioHandover(StdioMask),
-    /// exec の開始。
-    Started,
+    /// exec の開始（exec 子 cgroup の名前を運ぶ。#4221）。
+    Started(WireCgroupName),
     /// pty master（fd 1 本を伴う）。
     PtyMaster,
     /// 終了の結果。
@@ -321,7 +401,7 @@ impl Frame {
     pub fn kind(&self) -> Kind {
         match self {
             Self::StdioHandover(_) => Kind::StdioHandover,
-            Self::Started => Kind::Started,
+            Self::Started(_) => Kind::Started,
             Self::PtyMaster => Kind::PtyMaster,
             Self::Result(_) => Kind::Result,
         }
@@ -331,7 +411,7 @@ impl Frame {
     pub fn encode(&self) -> Result<EncodedFrame, EncodeError> {
         Ok(match self {
             Self::StdioHandover(mask) => build(Kind::StdioHandover, &[mask.bits()]),
-            Self::Started => build(Kind::Started, &[]),
+            Self::Started(name) => build(Kind::Started, &name.encode_payload()),
             Self::PtyMaster => build(Kind::PtyMaster, &[]),
             Self::Result(outcome) => build(Kind::Result, &encode_outcome(outcome)?),
         })
@@ -350,7 +430,11 @@ impl Frame {
                     .map(Self::StdioHandover)
                     .ok_or(WireError::ReservedMaskBits)
             }
-            Kind::Started => Ok(Self::Started),
+            Kind::Started => {
+                let arr = <&[u8; STARTED_PAYLOAD_LEN]>::try_from(payload)
+                    .map_err(|_| WireError::LengthMismatch)?;
+                WireCgroupName::decode_payload(arr).map(Self::Started)
+            }
             Kind::PtyMaster => Ok(Self::PtyMaster),
             Kind::Result => {
                 let arr = <&[u8; RESULT_PAYLOAD_LEN]>::try_from(payload)
@@ -516,7 +600,7 @@ mod tests {
 
     fn hdr(kind: u8, len: u16) -> [u8; 8] {
         let l = len.to_be_bytes();
-        [b'F', b'C', b'S', b'X', 1, kind, l[0], l[1]]
+        [b'F', b'C', b'S', b'X', 2, kind, l[0], l[1]]
     }
 
     fn roundtrip(frame: Frame) -> Vec<u8> {
@@ -540,19 +624,106 @@ mod tests {
         }
         assert_eq!(
             roundtrip(Frame::StdioHandover(StdioMask::new(0b101).unwrap())),
-            vec![0x46, 0x43, 0x53, 0x58, 1, 1, 0, 1, 0x05]
+            vec![0x46, 0x43, 0x53, 0x58, 2, 1, 0, 1, 0x05]
         );
+    }
+
+    fn started(name: &str) -> Frame {
+        let n = ExecCgroupName::new(name).unwrap();
+        Frame::Started(WireCgroupName::from_name(&n).unwrap())
     }
 
     #[test]
     fn sup6_simple_frames_concrete_bytes() {
         assert_eq!(
-            roundtrip(Frame::Started),
-            vec![0x46, 0x43, 0x53, 0x58, 1, 2, 0, 0]
+            roundtrip(Frame::PtyMaster),
+            vec![0x46, 0x43, 0x53, 0x58, 2, 3, 0, 0]
+        );
+    }
+
+    /// SUP-6・CRI-5・REPAIR-2・#4221: `Started` は名前を固定長 65 バイトで運び、往復で値が一致する。
+    #[test]
+    fn sup6_4221_started_roundtrip_concrete_bytes() {
+        let bytes = roundtrip(started("exec-4242-0"));
+        assert_eq!(bytes.len(), 73);
+        assert_eq!(
+            bytes.get(..8),
+            Some(&[0x46, 0x43, 0x53, 0x58, 2, 2, 0, 65][..])
+        );
+        assert_eq!(bytes.get(8), Some(&11u8));
+        assert_eq!(bytes.get(9..20), Some(&b"exec-4242-0"[..]));
+        assert!(bytes.get(20..).unwrap().iter().all(|b| *b == 0));
+        // 実際に作られる名前と、名前欄ちょうどの 64 バイトの名前。
+        roundtrip(Frame::Started(
+            WireCgroupName::from_name(&ExecCgroupName::unique()).unwrap(),
+        ));
+        let max = format!("exec-{}", "1".repeat(ExecCgroupName::MAX_LEN - 5));
+        let f = started(&max);
+        let bytes = roundtrip(f);
+        assert_eq!(bytes.get(8), Some(&64u8));
+        let Frame::Started(w) = f else { panic!() };
+        assert_eq!(w.to_name().unwrap().as_str(), max);
+    }
+
+    /// REPAIR-2・#4221: 名前欄に収まらない名前は符号化で拒否する（黙って切り詰めない。`ExecCgroupName::new` が長さ上限で拒否するため
+    /// 65 バイト以上の名前はそもそも作れず、`MAX_LEN` が欄の大きさと一致することを固定する）。
+    #[test]
+    fn repair2_4221_started_name_field_matches_core_limit() {
+        assert_eq!(CGROUP_NAME_FIELD_LEN, 64);
+        assert_eq!(MAX_PAYLOAD, 65);
+        assert_eq!(MAX_FRAME_LEN, 73);
+        let long = format!("exec-{}", "1".repeat(ExecCgroupName::MAX_LEN));
+        assert!(ExecCgroupName::new(&long).is_err());
+    }
+
+    /// SUP-6・REPAIR-2・#4221: 旧い version 1 のヘッダは `BadVersion`（旧い相手の `Started` を確認済みとして扱わない）。
+    #[test]
+    fn sup6_4221_v1_header_is_rejected() {
+        let mut v1 = hdr(2, 65);
+        v1[4] = 1;
+        assert_eq!(parse_header(&v1), Err(WireError::BadVersion));
+        let mut v1_old_started = hdr(2, 0);
+        v1_old_started[4] = 1;
+        assert_eq!(parse_header(&v1_old_started), Err(WireError::BadVersion));
+    }
+
+    /// REPAIR-2・SEC-1・#4221: `Started` の名前欄の不正は frame 全体を拒否する。
+    #[test]
+    fn repair2_4221_started_payload_rejections() {
+        let mk = |len: u8, name: &[u8]| {
+            let mut p = [0u8; STARTED_PAYLOAD_LEN];
+            p[0] = len;
+            p[1..1 + name.len()].copy_from_slice(name);
+            p
+        };
+        let d = |p: [u8; STARTED_PAYLOAD_LEN]| Frame::decode(Kind::Started, &p);
+        assert!(d(mk(11, b"exec-4242-0")).is_ok());
+        assert_eq!(d(mk(0, b"")), Err(WireError::InvalidCgroupName));
+        assert_eq!(d(mk(65, &[b'a'; 64])), Err(WireError::InvalidCgroupName));
+        // 埋めに 0 でないバイト。
+        let mut pad = mk(11, b"exec-4242-0");
+        pad[40] = b'x';
+        assert_eq!(d(pad), Err(WireError::InvalidCgroupName));
+        for bad in [
+            &b"exec-A"[..],
+            b"exec-1/2",
+            b"exec-..",
+            b"fc-c1@7",
+            b"exec-",
+        ] {
+            assert_eq!(
+                d(mk(u8::try_from(bad.len()).unwrap(), bad)),
+                Err(WireError::InvalidCgroupName),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            Frame::decode(Kind::Started, &[1u8; 64]),
+            Err(WireError::LengthMismatch)
         );
         assert_eq!(
-            roundtrip(Frame::PtyMaster),
-            vec![0x46, 0x43, 0x53, 0x58, 1, 3, 0, 0]
+            Frame::decode(Kind::Started, &[]),
+            Err(WireError::LengthMismatch)
         );
     }
 
@@ -589,12 +760,12 @@ mod tests {
 
     #[test]
     fn sup6_header_rejections() {
-        let mut bad = hdr(2, 0);
+        let mut bad = hdr(2, 65);
         bad[0] = b'X';
         assert_eq!(parse_header(&bad), Err(WireError::BadMagic));
-        let mut v2 = hdr(2, 0);
-        v2[4] = 2;
-        assert_eq!(parse_header(&v2), Err(WireError::BadVersion));
+        let mut v3 = hdr(2, 65);
+        v3[4] = 3;
+        assert_eq!(parse_header(&v3), Err(WireError::BadVersion));
         for k in [0u8, 5, 255] {
             assert_eq!(parse_header(&hdr(k, 0)), Err(WireError::UnknownKind));
         }
@@ -602,7 +773,9 @@ mod tests {
             parse_header(&hdr(2, 0xFFFF)),
             Err(WireError::PayloadTooLarge)
         );
+        assert_eq!(parse_header(&hdr(2, 66)), Err(WireError::PayloadTooLarge));
         assert_eq!(parse_header(&hdr(2, 1)), Err(WireError::LengthMismatch));
+        assert_eq!(parse_header(&hdr(2, 0)), Err(WireError::LengthMismatch));
         assert_eq!(parse_header(&hdr(1, 0)), Err(WireError::LengthMismatch));
         assert_eq!(parse_header(&hdr(4, 4)), Err(WireError::LengthMismatch));
     }
@@ -612,10 +785,6 @@ mod tests {
         assert_eq!(
             Frame::decode(Kind::StdioHandover, &[0b1000]),
             Err(WireError::ReservedMaskBits)
-        );
-        assert_eq!(
-            Frame::decode(Kind::Started, &[1]),
-            Err(WireError::LengthMismatch)
         );
         let r = |p: [u8; 5]| Frame::decode(Kind::Result, &p);
         assert_eq!(r([0, 1, 0, 0, 0]), Err(WireError::UnknownOutcome));

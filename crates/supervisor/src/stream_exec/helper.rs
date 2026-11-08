@@ -23,7 +23,7 @@
 //! pid が `--expect-pid` と一致。不一致は exec も監査もしない）→ launch 時 env の読み込み → 監査 sink の構築（作れなければ
 //! exec も pidfd の要求もしない。SEC-4）→ kind 6 で pidfd の複製を受ける（孤児は `Unavailable`。記録 pid からの
 //! `pidfd_open` へは縮退しない。SEC-1）→ `StdioHandover` の受信（mask は `--stdio` と一致が必要）→ exec の通し
-//! （`on_created` で kind 7 の通知と ack の後に `Started` を送る）→ `Result` の送信。以降の失敗はすべて `Result` frame で返す。
+//! （`on_created` で kind 7 の通知と ack の後に、exec 子 cgroup の名前を載せた `Started` を送る。wire v2・#4221）→ `Result` の送信。以降の失敗はすべて `Result` frame で返す。
 //!
 //! # 接続断・期限（REPAIR-5）
 //!
@@ -452,6 +452,7 @@ pub fn serve(channel: &UnixStream, args: &StreamExecArgs, deps: &Deps<'_>) -> St
         handover.notify_created(name, total_deadline)?;
         channel::send_started(
             channel,
+            name,
             started_send_deadline(Instant::now(), total_deadline),
         )
         .map_err(|e| TraitError::new(e.code(), "failed to report the exec start to the caller"))
@@ -620,7 +621,8 @@ mod tests {
         let expired = Instant::now();
         std::thread::sleep(Duration::from_millis(5));
         let deadline = started_send_deadline(Instant::now(), expired);
-        let err = channel::send_started(&a, deadline).unwrap_err();
+        let err = channel::send_started(&a, &ExecCgroupName::new("exec-4242-0").unwrap(), deadline)
+            .unwrap_err();
         assert_eq!(err.code(), ErrorCode::Timeout);
         b.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
         let mut buf = [0u8; 1];

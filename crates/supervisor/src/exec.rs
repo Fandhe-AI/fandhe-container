@@ -919,6 +919,7 @@ pub fn run_command(
     let result = run_owning_child_cgroup(
         deadline,
         exec_responder(record, audit),
+        None,
         || create_child_cgroup(record, &name),
         || cleanup_child_cgroup(record, &name),
         |proof, child, sender| {
@@ -1092,6 +1093,7 @@ pub fn run_command_with_pidfd_env(
             launch_env,
             stdio: ExecStdio::NONE,
             on_created: None,
+            cancel: None,
         },
     )
 }
@@ -1124,6 +1126,7 @@ pub fn run_command_with_pidfd_output(
             launch_env,
             stdio: ExecStdio::combined(output),
             on_created: None,
+            cancel: None,
         },
     )
 }
@@ -1164,6 +1167,10 @@ impl<'a> ExecStdio<'a> {
 /// exec 子 cgroup の作成通知のフック型（[`ExecLaunchIo::on_created`]）。
 pub type ExecCreatedHook<'a> = dyn Fn(&ExecCgroupName) -> Result<(), TraitError> + 'a;
 
+/// 要求元の取り消し判定のフック型（[`ExecLaunchIo::cancel`]）。真を返したら「要求元はもう exec を必要としていない」
+/// （要求元の異常終了。#4166・SUP-6）。非ブロッキングで速く返ること（刻みごとに呼ばれる）。
+pub type ExecCancelHook<'a> = dyn Fn() -> bool + 'a;
+
 /// exec の入出力・env・作成通知の束（引数の数を抑えるための要求型。SUP-4・SUP-6・#2441）。
 pub struct ExecLaunchIo<'a> {
     /// launch 時の起動オプションの env 上書き（`KEY=VALUE`。契約は [`run_command_with_pidfd_env`]）。
@@ -1174,6 +1181,12 @@ pub struct ExecLaunchIo<'a> {
     /// `Err` を返したら worker を fork せず、作成した cgroup を消してその構造化エラーで失敗する（fail-closed。
     /// 回収役へ名前を渡せない exec を走らせない。SUP-6・REPAIR-5・#2626）。
     pub on_created: Option<&'a ExecCreatedHook<'a>>,
+    /// 要求元の取り消し判定（stream-exec の helper が要求元の channel の消滅を渡す。#4166・SUP-6・SEC-1・REPAIR-5）。
+    /// 真を返したら、コマンドを止めて回収し（exec 子 cgroup の `cgroup.kill` を含む）、`Unavailable` の
+    /// 固定メッセージで早く終わる。**短絡に限り、exec の期限・`WORKER_GRACE` は弱めない**（`None`・偽のままなら従来どおり
+    /// 期限で終わる）。`None` なら従来の経路をそのまま通る（helper 以外の呼び出し元の既定）。適用は listener を受け取って
+    /// 応答者を回した後の段で、受け渡し前の窓は既存の短い期限に任せる。
+    pub cancel: Option<&'a ExecCancelHook<'a>>,
 }
 
 /// [`run_command_with_pidfd_output`] に、exec 子 cgroup の **作成成功の通知** `on_created` を足した入口
@@ -1208,6 +1221,7 @@ fn run_command_with_pidfd_inner(
         launch_env,
         stdio,
         on_created,
+        cancel,
     } = io;
     let deadline = Deadline::after(timeout);
     running_pid(record).map_err(AuditedRejection::not_applicable)?;
@@ -1216,6 +1230,7 @@ fn run_command_with_pidfd_inner(
     let result = run_owning_child_cgroup(
         deadline,
         exec_responder(record, audit),
+        cancel,
         || {
             let created = create_child_cgroup(record, &name)?;
             // 排他作成に成功した（所有を確定した）直後にだけ通知する。通知に失敗したら、所有している cgroup を
@@ -1263,6 +1278,7 @@ pub fn run_command_in(
     let result = run_owning_child_cgroup(
         deadline,
         exec_responder(record, audit),
+        None,
         || {
             ExecChildCgroup::create_in_path_for_test(expected_cgroup_path, &name)
                 .map(Some)
@@ -1464,6 +1480,7 @@ fn run_in_worker_with(
     grace: Duration,
     cleanup: impl FnOnce() -> Result<(), TraitError>,
     listener: ListenerPolicy<'_>,
+    cancel: Option<&ExecCancelHook<'_>>,
     work: impl FnOnce(&ExecWorkerProof, Option<ExecListenerSender>) -> Result<ExecOutcome, WorkerError>,
 ) -> Result<ExecOutcome, WorkerFailure> {
     // fork 前に期限を確かめる（切れていれば worker を作らない。fork 後の早期 return で worker を残さないため）。
@@ -1515,9 +1532,15 @@ fn run_in_worker_with(
         Some(receiver) => match receiver.receive(&child, deadline.at) {
             // 受け取った listener は worker の回収が済むまで保持し、その間は応答者が通知に応答する（先に閉じると、
             // worker の拒否された syscall が `ENOSYS` になる）。
-            ListenerReceipt::Received(received) => {
-                respond_and_collect(&listener, received, &child, &mut reader, deadline, grace)
-            }
+            ListenerReceipt::Received(received) => respond_and_collect(
+                &listener,
+                received,
+                &child,
+                &mut reader,
+                deadline,
+                grace,
+                cancel,
+            ),
             ListenerReceipt::SenderClosed => reject_unacknowledged_exit(collect_worker_result(
                 &child,
                 &mut reader,
@@ -1633,7 +1656,10 @@ fn respond_and_collect(
     reader: &mut std::io::PipeReader,
     deadline: Deadline,
     grace: Duration,
+    cancel: Option<&ExecCancelHook<'_>>,
 ) -> Result<ExecOutcome, WorkerFailure> {
+    // 要求元の取り消しを観測したか（worker が生きている間にだけ立てる。#4166）。
+    let cancelled = std::cell::Cell::new(false);
     // 試験専用の `None` を持たない構成では、`Respond` の分岐が必ず audit を決める（#2640）。
     #[cfg(feature = "exec-test-support")]
     let mut audit = ExecSeccompAudit::NOT_APPLICABLE;
@@ -1643,7 +1669,19 @@ fn respond_and_collect(
     match policy {
         ListenerPolicy::Respond(responder) => {
             let source = ListenerSource(received);
-            let report = responder.serve(&source, deadline.at, &mut || worker_finished(child));
+            let report = responder.serve(&source, deadline.at, &mut || {
+                // worker の終了を先に見る（同じ刻みで終わった本当の結果を取り消しで上書きしない）。
+                if worker_finished(child) {
+                    return true;
+                }
+                match cancel {
+                    Some(c) if c() => {
+                        cancelled.set(true);
+                        true
+                    }
+                    _ => false,
+                }
+            });
             // 集計の構造化ログ（固定語彙と数値のみ）。待たない出口で出す（共有の出力口は専用スレッドを作り、
             // 以後の監査記録〔`FileAuditSink` の主経路は `Threads: 1` を要する〕を壊すため使えない）。
             for line in report_lines(report.counts) {
@@ -1670,13 +1708,74 @@ fn respond_and_collect(
         #[cfg(feature = "exec-test-support")]
         ListenerPolicy::None => drop(received),
     }
-    let collected = collect_worker_result(child, reader, deadline, grace);
+    let collected = if cancelled.get() {
+        // 取り消し: コマンドには worker の死亡シグナルが届く。回収の結果（`Signaled(9)` の `Internal`）ではなく取り消しを返す。
+        cancelled_failure(
+            child
+                .kill_and_reap(LISTENER_REAP_TIMEOUT)
+                .map_err(from_exec_error),
+        )
+    } else if let Some(cancel) = cancel {
+        collect_worker_result_cancellable(child, reader, deadline, grace, cancel)
+    } else {
+        collect_worker_result(child, reader, deadline, grace)
+    };
     drop(held);
     collected.map(|mut outcome| {
         outcome.seccomp_listener = ExecListenerHandover::Verified;
         outcome.seccomp_audit = audit;
         outcome
     })
+}
+
+/// 要求元の取り消しで worker を止めて回収した結果（`Unavailable`。#4166・SUP-6）。`Timeout` を流用せず、期限切れと
+/// 区別できる固定メッセージにする。回収に失敗していれば既存の "cleanup also failed" の形で添える。違反ではないので
+/// 監査の対象にしない（SEC-4）。
+fn cancelled_failure(reaped: Result<ChildExit, TraitError>) -> Result<ExecOutcome, WorkerFailure> {
+    Err(listener_failure(
+        TraitError::new(
+            ErrorCode::Unavailable,
+            "exec cancelled: the requester went away; the exec worker was killed",
+        ),
+        reaped,
+    ))
+}
+
+/// 取り消しを見ながら worker の終了を待つ刻み。`serve` が戻った後（`Lost`・`Closed` 等）の終了待ちで、要求元の消滅を
+/// この間隔で確かめる（#4166）。
+const CANCEL_POLL_STEP: Duration = Duration::from_millis(100);
+
+/// [`collect_worker_result`] の取り消し対応版（`cancel` が `Some` のときだけ使う）。`CANCEL_POLL_STEP` 刻みで終了を待ち、
+/// 取り消しを観測したら worker を止めて回収し `Unavailable`、`deadline + grace` に達したら従来と同一の `Timeout` で終わる
+/// （期限・猶予は弱めない）。
+fn collect_worker_result_cancellable(
+    child: &fandhe_container_core::exec::ContainerChild,
+    reader: &mut std::io::PipeReader,
+    deadline: Deadline,
+    grace: Duration,
+    cancel: &ExecCancelHook<'_>,
+) -> Result<ExecOutcome, WorkerFailure> {
+    let wait_until = deadline.at.checked_add(grace).unwrap_or(deadline.at);
+    loop {
+        let left = wait_until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            // 期限切れ: 従来の経路へ（待たずに SIGKILL して回収し、同一の Timeout を返す）。
+            return collect_worker_result(child, reader, deadline, grace);
+        }
+        match child.wait_for_exit(left.min(CANCEL_POLL_STEP)) {
+            Ok(None) => {
+                if cancel() {
+                    return cancelled_failure(
+                        child
+                            .kill_and_reap(LISTENER_REAP_TIMEOUT)
+                            .map_err(from_exec_error),
+                    );
+                }
+            }
+            // 終了した（回収済みの終了状態は後の復号経路が受け取る）か、観測に失敗した（回収側に委ねる）。
+            _ => return collect_worker_result(child, reader, deadline, grace),
+        }
+    }
 }
 
 /// worker の終了を待って（期限切れなら `SIGKILL` して回収し）、worker が pipe へ書いた結果 1 行を復号する。
@@ -1736,6 +1835,7 @@ fn collect_worker_result(
 fn run_owning_child_cgroup(
     deadline: Deadline,
     responder: ExecResponder<'_>,
+    cancel: Option<&ExecCancelHook<'_>>,
     create: impl FnOnce() -> Result<Option<ExecChildCgroup>, TraitError>,
     remove: impl Fn() -> Result<(), TraitError>,
     work: impl FnOnce(
@@ -1755,6 +1855,7 @@ fn run_owning_child_cgroup(
             if owned { remove() } else { Ok(()) }
         },
         ListenerPolicy::Respond(responder),
+        cancel,
         |proof, sender| match sender {
             Some(sender) => work(proof, child.as_ref(), sender),
             // `Respond` では必ず `Some`。無ければ fail-closed（listener 無しで進まない）。
@@ -1858,6 +1959,7 @@ pub fn run_in_worker_for_test(
         grace,
         cleanup,
         ListenerPolicy::None,
+        None,
         |_, _| work().map_err(WorkerError::from),
     )
     .map_err(|f| f.error)
@@ -1900,6 +2002,43 @@ pub fn run_in_worker_with_listener_for_test(
             None,
             NotifyConfig::default(),
         )),
+        None,
+        |_, sender| {
+            let sender = sender.ok_or_else(|| {
+                TraitError::new(ErrorCode::Internal, "the listener channel was not provided")
+            })?;
+            work(sender)?;
+            decode_worker_result(
+                b"ok command - - - exited 0 15 1 23 3 120 cleared 4 sealed_copy - 4321\n",
+            )
+            .map_err(|f| WorkerError::from(f.error))
+        },
+    )
+    .map_err(|f| f.error)
+}
+
+/// 結合試験専用の入口: [`run_in_worker_with_listener_for_test`] に、要求元の取り消し判定 `cancel` を渡せる版
+/// （SUP-6・SEC-1・REPAIR-5・#4166。`tests/exec_requester_cancel.rs`）。`cancel` が真になると、本番と同じく worker を
+/// 止めて回収し、`Unavailable` で終わる。`cancel` が偽のままなら従来の期限・`grace` で終わる。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub fn run_in_worker_with_listener_cancel_for_test(
+    timeout: Duration,
+    grace: Duration,
+    cleanup: impl FnOnce() -> Result<(), TraitError>,
+    cancel: &ExecCancelHook<'_>,
+    work: impl FnOnce(ExecListenerSender) -> Result<(), TraitError>,
+) -> Result<ExecOutcome, TraitError> {
+    run_in_worker_with(
+        Deadline::after(timeout),
+        grace,
+        cleanup,
+        ListenerPolicy::Respond(ExecResponder::new(
+            &DiscardSink,
+            None,
+            NotifyConfig::default(),
+        )),
+        Some(cancel),
         |_, sender| {
             let sender = sender.ok_or_else(|| {
                 TraitError::new(ErrorCode::Internal, "the listener channel was not provided")
@@ -1953,6 +2092,7 @@ pub fn run_in_worker_with_user_notif_for_test(
         grace,
         cleanup,
         policy,
+        None,
         |_, sender| {
             let sender = sender.ok_or_else(|| {
                 TraitError::new(ErrorCode::Internal, "the listener channel was not provided")
@@ -2027,6 +2167,7 @@ pub fn run_in_worker_audited_for_test(
         WORKER_GRACE,
         || Ok(()),
         ListenerPolicy::None,
+        None,
         |_, _| work().map_err(from_exec_error_staged),
     );
     audit_worker_result(result, container, audit)
@@ -2047,6 +2188,7 @@ pub fn run_in_worker_trait_audited_for_test(
         WORKER_GRACE,
         || Ok(()),
         ListenerPolicy::None,
+        None,
         |_, _| work().map_err(|e| e.0),
     );
     audit_worker_result(result, container, audit)
@@ -3609,6 +3751,7 @@ mod tests {
             Duration::from_secs(1),
             || panic!("cleanup must not run when no worker was forked"),
             ListenerPolicy::None,
+            None,
             |_, _| panic!("work must not run when the deadline has expired"),
         )
         .unwrap_err()
@@ -3627,6 +3770,7 @@ mod tests {
         let err = run_owning_child_cgroup(
             Deadline::after(Duration::from_secs(5)),
             ExecResponder::new(&NoRecordSink, None, NotifyConfig::default()),
+            None,
             || Err(TraitError::new(ErrorCode::AlreadyExists, "exists")),
             || panic!("cleanup must not run for a cgroup we did not create"),
             |_, _, _| panic!("worker must not run"),

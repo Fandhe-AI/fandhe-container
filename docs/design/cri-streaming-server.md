@@ -15,7 +15,7 @@ CRI の `Exec`・`Attach`・`PortForward` は、RPC 自体ではデータを流�
 | Attach の SPDY/3.1・remotecommand・Upgrade 後のセッション | 実装済み（fake backend での結合試験）。本番の backend は読み取り専用〔`LogFollowAttachBackend`。回転ログの follow〕で結線済み。非 Linux ではこの読み取り専用が本番で、stdin・tty は RPC 時と接続時に `INVALID_ARGUMENT`。Linux の本番は完全版（#4077・#4078）。backend が無ければ Attach は結線済みと答えず、RPC は `UNIMPLEMENTED`） | #681（TASK-63.3）・#3763 |
 | PortForward | `PortForwardHandler` は実装済み。NODE の dialer で結線済み。POD は RPC 時と dialer の両方で `UNIMPLEMENTED` | #682（TASK-63.4）・#3755 |
 | plugin-cri からのサーバー起動と `with_streaming` での注入 | 実装済み（loopback で起動し `StreamDispatcher` で注入。結線済みは PortForward〔NODE のみ。#3755〕・Attach〔読み取り専用。#3763〕・Exec〔Linux のみ。#3761〕。非 Linux の Exec は「not wired」の `UNIMPLEMENTED`） | #3754 |
-| 本番 backend（Exec の helper・Attach・PortForward の dialer） | PortForward の NODE の dialer は実装済み（#3755）。Exec の stream-exec helper は実装済み（#3760）、plugin-cri 側の本番 launcher と結線も実装済み（#3761。tty は本番で fail-closed）。Attach は段階 1（読み取り専用）が実装済み（#3763）で、完全版も Linux で実装済み（#4077・#4078。実機の確認は #4079）。POD の PortForward は未実装。設計は「本番 backend の設計」の節 | #3753〜#3766 |
+| 本番 backend（Exec の helper・Attach・PortForward の dialer） | PortForward の NODE の dialer は実装済み（#3755）。Exec の stream-exec helper は実装済み（#3760）、plugin-cri 側の本番 launcher と結線も実装済み（#3761。tty は本番で fail-closed）。Attach は段階 1（読み取り専用）が実装済み（#3763）で、完全版も Linux で実装済み（#4077・#4078）で、実機前提試験 `production_binary_attach_real` も済み（#4079。往復・EOF・resize を照合。platform-ci の ubuntu）。POD の PortForward は未実装。設計は「本番 backend の設計」の節 | #3753〜#3766 |
 
 ## バインドの方針
 
@@ -145,7 +145,7 @@ core の `ContainerRuntime` に exec は無く、shim v2 の `TaskExecLauncher` 
 
 ## 本番 backend の設計（#3752）
 
-2026-11-03 に main が決めた要点（Attach は段階方式、Exec は制御チャネルの exec 要求と fd 渡しで孤児時に縮退しない、PortForward は NODE を先に入れ POD は #2877 の後、依存は plugin-cri から supervisor への一方向で cri に実装を入れない）を詳しくした設計記録である。後続の兄弟 issue（#3753〜#3766。親 #3726・TASK-63・MS-7）はこの記録を正として実装する。オーナーの確認が要る点は末尾の「未確認・オーナー確認事項」にまとめ、それ以外は確定扱いとする。**本節は設計記録であり、実装の状況は冒頭の表と各小節の「実装」の記述を正とする。Exec（#3761）・Attach（#3763 の読み取り専用と、Linux の完全版 #4077・#4078。実機の確認は #4079）・NODE の PortForward（#3755）は実装済みで、Exec の tty・POD の PortForward は未実装である（REPAIR-3）**。
+2026-11-03 に main が決めた要点（Attach は段階方式、Exec は制御チャネルの exec 要求と fd 渡しで孤児時に縮退しない、PortForward は NODE を先に入れ POD は #2877 の後、依存は plugin-cri から supervisor への一方向で cri に実装を入れない）を詳しくした設計記録である。後続の兄弟 issue（#3753〜#3766。親 #3726・TASK-63・MS-7）はこの記録を正として実装する。オーナーの確認が要る点は末尾の「未確認・オーナー確認事項」にまとめ、それ以外は確定扱いとする。**本節は設計記録であり、実装の状況は冒頭の表と各小節の「実装」の記述を正とする。Exec（#3761）・Attach（#3763 の読み取り専用と、Linux の完全版 #4077・#4078。実機前提試験は #4079 で実装済み）・NODE の PortForward（#3755）は実装済みで、Exec の tty・POD の PortForward は未実装である（REPAIR-3）**。
 
 対象ビヘイビア: CRI-6・PLUG-1・SUP-4・SUP-6・SEC-1・REPAIR-2・REPAIR-3・REPAIR-5（関連: CORE-1・CORE-5・SUP-3・SUP-5・SUP-7・NET-3）。
 
@@ -353,7 +353,7 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 | C8 | #4076 | cri: 記録への保存と StartContainer での運搬（実装済み: 記録の config〔永続記録 v1 のまま〕から `start_stdin_mode` で導き、`RuntimeAdapter::start_with_options` が `StartRequest::with_stdin` に載せる。plugin-cri の `supervised.rs` が `StartOptions::with_stdin` で argv `--stdin <open\|once>` へ写す。`bundle/spec.rs` の `tty/stdin` の拒否は C8 の時点では C10 まで残していたが、#4078 で解除済み） | C7・C4 |
 | C9 | #4077 | plugin-cri: 完全版 `AttachBackend`（実装済み: Linux の `streaming::supervisor_attach::SupervisorAttachBackend`。状態確認 → kind 9 の `AttachIoSource::obtain` → `validate_attach_io` で形を再照合 → 入力は専用スレッド＋socketpair、tap は tokio 化、resize は `PtyMaster::resize`、`exited` は tap の EOF と kind 8 の購読。`CriPluginBackends::supervisor_attach_backend` が組み `main.rs` が Linux で使う。C10 の前の状態の記述。現在は #4078 で `ProductionAttach::interactive` により `read_only` を外し、Linux の本番で届く） | C6・C8・#3763・#3754・#3761 |
 | C10 | #4078 | cri: 拒否の解除と整合検査（実装済み: `bundle/spec.rs` の拒否を外し tty を `process.terminal` へ写す。`attach_impl` が URL の発行前に記録から 1 回のロックで状態・`config.tty`・`config.stdin` を読み、未知 ID は `NOT_FOUND`、running でない・tty の不一致〔どちらの向きも〕・stdin 未開への stdin 要求は `FAILED_PRECONDITION`〔固定文 `MSG_ATTACH_*`〕。stdin は `start_stdin_mode` でなく `config.stdin` を直接見る〔tty のコンテナでは常に `Closed` で、supervisor は tty に master を渡すため、stdin なしの tty コンテナへの入力の注入を断れるのはここだけ〕。plugin-cri の `ProductionAttach::interactive` で `read_only` を外す。containerd との差は設計の既定のままで D10-1 はオーナー確認事項） | C3・C9 |
-| C11 | #4079 | 実機前提試験・手順・CI の追記 | C10 |
+| C11 | #4079 | 実機前提試験・手順・CI の追記 | C10。実装済み: `crates/plugin-cri/tests/cri_attach_real.rs` の `production_binary_attach_real`（非 tty・stdin_once の往復と EOF、tty の往復と resize の `stty size`、tty 不一致の拒否）。platform-ci の ubuntu に 2 ステップ。実 crictl・kubectl での確認は人間担当（#3730 の子） |
 
 ### PortForward（NET-3・SEC-1）
 
@@ -426,11 +426,11 @@ CRI の `ExecSync`（現状 `UNIMPLEMENTED`）も本設計の helper を再利�
 
 実装済みは Exec の本番 launcher（#3761。Linux のみ）、読み取り専用の Attach（#3763）、NODE の PortForward（#3755）。未実装の組は次のとおり（REPAIR-3）。
 
-- 完全な Attach（stdin・stdin_once・tty・resize）: 実装済み（#4077・#4078。dispatcher の `read_only` と bundle の拒否は解除済み）。残るのは実機前提試験・手順・CI（#4079）。#3765（設計のみ・closed）の子 issue で追う。個別の状態は「完全版 Attach の設計（#3765）」の子 issue 表を正とする
+- 完全な Attach（stdin・stdin_once・tty・resize）: 実装済み（#4077・#4078。dispatcher の `read_only` と bundle の拒否は解除済み）。実機前提試験・手順・CI も済み（#4079）。残るのは実 crictl・kubectl での確認（人間担当）。#3765（設計のみ・closed）の子 issue で追う。個別の状態は「完全版 Attach の設計（#3765）」の子 issue 表を正とする
 - POD ネットワークの PortForward: 設計と分解は #3766、前提は保持役 provider の #2877。RPC 時と dialer の両方で `UNIMPLEMENTED`
 - Exec の tty（supervisor 側の pty 結線と helper の `--tty`。受け側は実装・試験済み）: 追跡 issue 未起票（親 #3726 の残り）。本番は RPC 時に `INVALID_ARGUMENT`
 - Exec の相対 argv[0]（PATH 解決）: #2439 の判断待ち。RPC 時に `INVALID_ARGUMENT`
-- Exec の実機前提試験: #3762。完全版 Attach の実機前提試験は上の子 issue（#4079）で扱う
+- Exec の実機前提試験: #3762。完全版 Attach の実機前提試験は #4079（`production_binary_attach_real`）で実装済み
 - Exec の残余: plugin-cri の異常終了時の helper の早期停止（#4112）、`PtyMaster` の fd 検証（#4100）
 - 暫定値・設計の確認事項（exec の全体上限・同時セッション数・`::1`・終了コード・観測名など）: 上の「未確認・オーナー確認事項」と #4116（オーナー判断）
 - rootful: plugin-cri の start が uid 0 を `UNIMPLEMENTED` にするため、rootful のコンテナは無く 3 RPC とも使えない（uid 0 の拒否は #2442、rootful を許すかは #2241 の判断待ち）

@@ -48,7 +48,7 @@
 //!   ロック保持下で自分が bind した socket と lock を片付ける（取れなければ固定語彙を `daemon.log` へ出して残す）
 //! - delete での実行層のコンテナの後始末（containerd が shim の死後に呼ぶ `delete` action は、まだ実行層に触れない。#3684・#4152）。
 //!   入口の `-id`・`-bundle` の検証と状態ルートの記録の照合は、注入口 [`run_with_hooks`] の前段で plugin-cri が行う（#4151。副作用なし）
-//! - `-publish-binary` は検証して [`ServeContext`] に保持する（#4154）が、イベントの publish（送信）は未実装（#4155・#4156）。
+//! - `-publish-binary` は検証して [`ServeContext`] に保持する（#4154）。TaskExit の publish は [`super::publish`]（#4155）、他の種別は未実装（#4156）。
 //!   呼び出し形・送る種別は `docs/design/shim-v2-production-binary.md` の「イベントの publish」を参照
 //! - stdin の options・デーモンのログ（`<bundle>/log`）・grouping
 //! - Windows。`run` は `UNIMPLEMENTED`

@@ -373,6 +373,8 @@ fn serve(
             vec![recorder, oci_recorder],
             telemetry::OP_STATS_EXPORT_INTERVAL,
         ));
+        #[cfg(target_os = "linux")]
+        let exec_launcher_stop = std::sync::Arc::clone(&exec_launcher);
         // shutdown future は待ち受けを閉じて停止処理を別タスクで起動するだけで待たない。ドレイン・exec の停止・強制クローズは
         // serve の戻りと無関係に、シグナルの受信時刻からの期限で進む（#4164・REPAIR-5）。`finish` は結果を受け取る。
         let (streaming_shutdown, streaming_stop) = streaming::stop_streaming_on(
@@ -380,7 +382,7 @@ fn serve(
             streaming::PRODUCTION_STOP_LIMITS,
             move || {
                 #[cfg(target_os = "linux")]
-                exec_launcher.shutdown_all();
+                exec_launcher_stop.shutdown_all();
             },
             shutdown::wait_for_signal(),
         );
@@ -394,6 +396,10 @@ fn serve(
         )
         .await;
         let report = streaming_stop.finish().await;
+        // helper の fd 2 の読み手は停止フラグで数十 ms で終わる。終了時に上限つきで待ち、最後の診断を出し切る（#4171）。
+        #[cfg(target_os = "linux")]
+        let _ = exec_launcher
+            .wait_diagnostics_idle(streaming::exec_launcher::diagnostics::DIAG_JOIN_BUDGET);
         // 件数と経過だけの 1 行。終了行の書き出しの待ちより前に出し、まとめて flush させる（REPAIR-4）。
         // bind 失敗など serve が失敗し、開いたセッションも無かった経路（サーバーが一度も稼働していない）では出さない。
         // 起動失敗時の stderr は `error: ` の行で始まる契約を保つ（#4164）。

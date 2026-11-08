@@ -886,16 +886,27 @@ mod linux {
         }) {
             return Err(format!("shim daemon or supervisor for {id} still alive"));
         }
-        let socks = match std::fs::read_dir(dir.join("s")) {
-            Ok(rd) => rd
-                .flatten()
-                .filter(|e| e.file_type().is_ok_and(|t| t.is_socket()))
-                .count(),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
-            Err(e) => return Err(format!("read socket dir: {e}")),
+        // Shutdown の応答は socket の削除より先に返る（デーモンは応答を流し切り、サーバーを止めてから socket を消す）。
+        // デーモンの消滅を待っても削除と観測の間に窓が残りうるため、socket の消滅も期限つきで待つ（REPAIR-5）。
+        let count_socks = || -> Result<usize, String> {
+            match std::fs::read_dir(dir.join("s")) {
+                Ok(rd) => Ok(rd
+                    .flatten()
+                    .filter(|e| e.file_type().is_ok_and(|t| t.is_socket()))
+                    .count()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+                Err(e) => Err(format!("read socket dir: {e}")),
+            }
         };
+        let mut socks = count_socks()?;
         if socks != 0 {
-            return Err(format!("{socks} shim socket(s) remain"));
+            wait_until(Duration::from_secs(15), || {
+                socks = count_socks().unwrap_or(usize::MAX);
+                socks == 0
+            });
+        }
+        if socks != 0 {
+            return Err(format!("{socks} shim socket(s) remain for {id}"));
         }
         for p in state_dirs(namespace, Some(id))? {
             if p.symlink_metadata().is_ok() {

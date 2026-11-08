@@ -486,7 +486,7 @@ pub fn production_delete(
         // 成否にかかわらず（Err でも）行う（REPAIR-4・REPAIR-5・#4152）。
         flush_delete_warnings(
             crate::telemetry::stderr_sink(),
-            &mut std::io::stderr(),
+            Box::new(std::io::stderr()),
             deadline,
         );
         result
@@ -498,19 +498,33 @@ pub fn production_delete(
     }
 }
 
-/// delete の警告行（`CoreLifecycleRuntime` の後始末の警告）が `sink` から書き出されるのを、共有期限 `deadline` の残りまで待つ。
+/// delete の警告行（`CoreLifecycleRuntime` の後始末の警告）が `sink` から書き出されるのを、共有期限 `deadline` までに待つ。
 ///
 /// delete は応答の後すぐプロセスを終了し、`LineSink` の専用 thread のキューを待たないため、待たないと Kept として残した資源の警告が
 /// 失われる（REPAIR-4）。期限内に書き出せなかった・キューへ積めず捨てた行があるときは、`fallback`（本番は stderr へ直接）に固定語彙の
-/// 1 行（`shim_delete_warnings_unflushed`）を出して欠落を残す。書き出せたかを返す（REPAIR-5・#4152）。
+/// 1 行（`shim_delete_warnings_unflushed`）を出して欠落を残す。書き出せたかを返す（#4152）。
+///
+/// どの待ちも `deadline` を超えない（REPAIR-5）。stderr の受け手が止まると `fallback` の書き込み自体が（専用 writer の内部ロックの
+/// 待ちも含めて）戻らないため、書き込みは使い捨ての別 thread で行い、期限つきで結果を待つ（戻らなければ thread ごと捨てる。
+/// プロセスは応答の後に終了する）。この方式にしたのは、期限切れのときだけ直接書かない案では欠落の事実が残らず、応答の後へ回す案は
+/// `bootstrap`（cri crate）の応答の出力契約を変えるため。`sink` の待ちには期限の末尾の一部（`FALLBACK_RESERVE` まで）を残し、
+/// 待ちが期限いっぱいまで使われて `fallback` の分が無くなるのを避ける。
+///
+/// stdout の `DeleteResponse` の書き出し（`bootstrap`）は数十バイトで pipe の容量（64 KiB）に収まるため、受け手が読まなくても
+/// ブロックしない（受け手が閉じていれば `EPIPE` で即失敗）。
 #[cfg(target_os = "linux")]
 pub(crate) fn flush_delete_warnings(
     sink: &crate::telemetry::LineSink,
-    fallback: &mut dyn std::io::Write,
+    fallback: Box<dyn std::io::Write + Send>,
     deadline: std::time::Instant,
 ) -> bool {
-    let left = deadline.saturating_duration_since(std::time::Instant::now());
-    let drained = sink.flush(left);
+    use std::time::{Duration, Instant};
+
+    /// `fallback` の書き込みに残す最大の待ち。
+    const FALLBACK_RESERVE: Duration = Duration::from_millis(200);
+    let left = deadline.saturating_duration_since(Instant::now());
+    let reserve = (left / 4).min(FALLBACK_RESERVE);
+    let drained = sink.flush(left.saturating_sub(reserve));
     let dropped = sink.dropped();
     if drained && dropped == 0 {
         return true;
@@ -518,9 +532,17 @@ pub(crate) fn flush_delete_warnings(
     let line = format!(
         "{{\"level\":\"warn\",\"event\":\"shim_delete_warnings_unflushed\",\"drained\":{drained},\"dropped\":{dropped},\"message\":\"delete cleanup warnings may be lost\"}}\n"
     );
-    let _ = fallback
-        .write_all(line.as_bytes())
-        .and_then(|()| fallback.flush());
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let mut w = fallback;
+    let spawned = std::thread::Builder::new()
+        .name("cri-shim-delete-warn".into())
+        .spawn(move || {
+            let _ = w.write_all(line.as_bytes()).and_then(|()| w.flush());
+            let _ = tx.send(());
+        });
+    if spawned.is_ok() {
+        let _ = rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+    }
     false
 }
 

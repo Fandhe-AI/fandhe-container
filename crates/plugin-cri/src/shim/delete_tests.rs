@@ -409,14 +409,14 @@ fn repair4_4152_delete_warnings_are_written_before_return() {
     for i in 0..3 {
         assert!(sink.submit(format!("{{\"level\":\"warn\",\"n\":{i}}}")));
     }
-    let mut fallback = Vec::new();
+    let fallback = SlowBuf(Default::default(), std::time::Duration::ZERO);
     let ok = flush_delete_warnings(
         &sink,
-        &mut fallback,
+        Box::new(fallback.clone()),
         std::time::Instant::now() + std::time::Duration::from_secs(5),
     );
     assert!(ok);
-    assert_eq!(fallback, b"");
+    assert_eq!(*fallback.0.lock().unwrap(), b"");
     assert_eq!(
         String::from_utf8(out.0.lock().unwrap().clone()).unwrap(),
         "{\"level\":\"warn\",\"n\":0}\n{\"level\":\"warn\",\"n\":1}\n{\"level\":\"warn\",\"n\":2}\n"
@@ -429,17 +429,53 @@ fn repair4_4152_delete_warnings_unflushed_leaves_fixed_line_within_deadline() {
     let out = SlowBuf(Default::default(), std::time::Duration::from_millis(600));
     let sink = crate::telemetry::LineSink::spawn(Box::new(out), 8);
     assert!(sink.submit("{\"level\":\"warn\"}".to_owned()));
-    let mut fallback = Vec::new();
+    let fallback = SlowBuf(Default::default(), std::time::Duration::ZERO);
     let t0 = std::time::Instant::now();
     let ok = flush_delete_warnings(
         &sink,
-        &mut fallback,
+        Box::new(fallback.clone()),
         t0 + std::time::Duration::from_millis(100),
     );
     assert!(!ok);
     assert!(t0.elapsed() < std::time::Duration::from_millis(500));
     assert_eq!(
-        String::from_utf8(fallback).unwrap(),
+        String::from_utf8(fallback.0.lock().unwrap().clone()).unwrap(),
         "{\"level\":\"warn\",\"event\":\"shim_delete_warnings_unflushed\",\"drained\":false,\"dropped\":0,\"message\":\"delete cleanup warnings may be lost\"}\n"
+    );
+}
+
+/// 受け手が読まず書き込みが戻らない出力先（詰まった stderr の偽物）。`release` が送られるまで書き込みで止まる。
+struct Stuck(std::sync::mpsc::Receiver<()>);
+
+impl std::io::Write for Stuck {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        let _ = self.0.recv();
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// REPAIR-5・REPAIR-4・#4152: sink の writer も fallback も詰まっている（stderr の受け手が止まった）とき、共有期限を超えず
+/// 戻る（応答を返せる）。書き出せていないので false。
+#[test]
+fn repair5_4152_delete_warnings_return_within_deadline_when_stderr_is_stuck() {
+    let (_keep_sink, rx_sink) = std::sync::mpsc::channel::<()>();
+    let (_keep_fb, rx_fb) = std::sync::mpsc::channel::<()>();
+    let sink = crate::telemetry::LineSink::spawn(Box::new(Stuck(rx_sink)), 8);
+    assert!(sink.submit("{\"level\":\"warn\"}".to_owned()));
+    let t0 = std::time::Instant::now();
+    let ok = flush_delete_warnings(
+        &sink,
+        Box::new(Stuck(rx_fb)),
+        t0 + std::time::Duration::from_millis(300),
+    );
+    let took = t0.elapsed();
+    assert!(!ok);
+    assert!(
+        took >= std::time::Duration::from_millis(250)
+            && took < std::time::Duration::from_millis(600),
+        "took {took:?}"
     );
 }

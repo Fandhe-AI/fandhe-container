@@ -68,6 +68,8 @@ containerd は shim が死んだ後や start が失敗した後に `-id <id> -bu
 - stderr: `CoreLifecycleRuntime::delete` の後始末の警告行は stderr に出うる。containerd は delete の成功時の stderr を warn として記録するだけで stdout の protobuf は汚れない（`binary.go`）。「成功時は stderr へ何も書かない」は start の制約。
 - 生の kill をしない: 状態記録の pid へ生のシグナルは送らない（PID 再利用。SEC-1・CORE-1）。supervisor に届かない Running の記録は停止の失敗を構造化エラーのまま返す。
 - 回収が触れるのは照合済みの id の記録だけ。`-bundle` は照合にだけ使い、削除の対象やパスの組み立てに使わない。
+- 絶対期限の共有（REPAIR-5）: 期限は bootstrap の `delete_recorded` が開始時刻から数える `Instant`（`SHIM_DELETE_DEADLINE`）で、`before_delete` の第 2 引数として前段へ渡す。照合の読み取り（状態ロックの待ちが最大 5 秒）は作業スレッドで走らせ残り時間で打ち切り、各段の待ちは「段の予算と残り時間の短い方」、`run_delete` の socket の lock 待ち（既定 10 秒）は残り時間で短縮し、`ops.log` の計測の記録の待ち（既定 2 秒）は期限 + 0.5 秒で打ち切る。
+- 世代の保持（SEC-1・CORE-1）: 照合した記録の世代（bundle と revision）を stop と delete に渡し、本番の窓口 `GuardedCore` が副作用の直前に記録を読み直して一致を確かめる（不一致は `FAILED_PRECONDITION`。再作成された別のコンテナには触れない）。stop の後は停止後の記録から世代を取り直して delete に使う。検証と core の読み出しの間の極小の窓は残る。要求に期待 revision を持たせる core の変更で閉じられるが、`StopRequest`・`DeleteRequest` の全実装に及ぶため別 issue とする。
 - 残余: Creating の記録と、supervisor が不在の Running の記録は回収できない（fail-closed）。`exited_at` が未設定のときの containerd の挙動の実機確認は #3685。
 
 ## `exited_at` が未設定のときの containerd の扱い（#3682 の依頼）

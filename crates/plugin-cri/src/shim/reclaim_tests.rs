@@ -16,7 +16,9 @@ use fandhe_container_core::traits::{
 use fandhe_container_cri::error::CriErrorCode;
 
 use super::delete_tests::{cid, make_bundle, parse, seed, snapshot};
-use super::reclaim::{ReclaimBudget, ReclaimRuntime, SHIM_DELETE_DEADLINE};
+use super::reclaim::{
+    Generation, GuardedCore, ReclaimBudget, ReclaimRuntime, SHIM_DELETE_DEADLINE,
+};
 use super::*;
 use crate::test_root;
 
@@ -67,11 +69,29 @@ impl Fake {
     }
 }
 
+impl Fake {
+    fn check_generation(
+        &self,
+        id: &ContainerId,
+        generation: &Generation,
+    ) -> Result<fandhe_container_core::traits::StateRecord, TraitError> {
+        let rec = self.store.get(&GetStateRequest::new(id.clone()))?;
+        if Generation::of(&rec) != *generation {
+            return Err(TraitError::new(ErrorCode::FailedPrecondition, "changed"));
+        }
+        Ok(rec)
+    }
+}
+
 impl ReclaimRuntime for Fake {
-    fn stop(&self, req: &StopRequest) -> Result<ContainerStatus, TraitError> {
+    fn stop(
+        &self,
+        req: &StopRequest,
+        generation: &Generation,
+    ) -> Result<(ContainerStatus, Generation), TraitError> {
         self.log("stop", req.id());
         self.gate(self.inject_stop)?;
-        let rec = self.store.get(&GetStateRequest::new(req.id().clone()))?;
+        let rec = self.check_generation(req.id(), generation)?;
         let stopped = ContainerStatus::stopped_at(
             req.id().clone(),
             Some(137),
@@ -82,13 +102,18 @@ impl ReclaimRuntime for Fake {
         if matches!(self.inject_stop, Some(Inject::HangAfter)) {
             self.wait_release();
         }
-        Ok(stopped)
+        let after = self.store.get(&GetStateRequest::new(req.id().clone()))?;
+        Ok((stopped, Generation::of(&after)))
     }
 
-    fn delete(&self, req: &DeleteRequest) -> Result<DeleteResponse, TraitError> {
+    fn delete(
+        &self,
+        req: &DeleteRequest,
+        generation: &Generation,
+    ) -> Result<DeleteResponse, TraitError> {
         self.log("delete", req.id());
         self.gate(self.inject_delete)?;
-        let rec = self.store.get(&GetStateRequest::new(req.id().clone()))?;
+        let rec = self.check_generation(req.id(), generation)?;
         self.store
             .delete(&DeleteStateRequest::new(req.id().clone(), rec.revision()))?;
         if matches!(self.inject_delete, Some(Inject::HangAfter)) {
@@ -133,6 +158,7 @@ fn run(
             })
         },
         budget,
+        std::time::Instant::now() + SHIM_DELETE_DEADLINE,
     );
     let calls = calls.lock().unwrap().clone();
     let made = *made.lock().unwrap();
@@ -429,14 +455,17 @@ fn cri5_4152_real_core_runtime_reclaims_created_without_pid() {
         &inv,
         &base,
         |store| {
-            Arc::new(
-                core_runtime_for(Arc::new(store))
+            let store: Arc<dyn StateStore> = Arc::new(store);
+            Arc::new(GuardedCore {
+                core: core_runtime_for(Arc::clone(&store))
                     .with_delete_deadline(budget.remove)
                     .with_container_log_lock_wait(budget.remove)
                     .with_cleanup_warning_sink(Arc::new(|_| {})),
-            )
+                store,
+            })
         },
         &budget,
+        std::time::Instant::now() + SHIM_DELETE_DEADLINE,
     )
     .unwrap()
     .expect("reclaimed");
@@ -448,6 +477,78 @@ fn cri5_4152_real_core_runtime_reclaims_created_without_pid() {
         &base,
         |_| unreachable!("no runtime for a reclaimed container"),
         &budget,
+        std::time::Instant::now() + SHIM_DELETE_DEADLINE,
     );
     assert!(again.unwrap().is_none());
+}
+
+/// 本番の窓口で `Generation` を使う補助: 記録を別の bundle で作り直す（世代が変わる）。
+fn recreate_with_other_bundle(base: &Path, inv: &ShimInvocation, id: &str, other: &Path) {
+    let root = entry(base, inv, id).parent().unwrap().to_path_buf();
+    let state_root = fandhe_container_core::state_store::StateRoot::from_override(root).unwrap();
+    let store = FileStateStore::open(state_root).unwrap();
+    let rec = store.get(&GetStateRequest::new(cid(id))).unwrap();
+    store
+        .delete(&DeleteStateRequest::new(cid(id), rec.revision()))
+        .unwrap();
+    store
+        .create(
+            &fandhe_container_core::traits::CreateStateRequest::new(
+                ContainerStatus::created(cid(id), None),
+                other.to_path_buf(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+}
+
+/// SEC-1・CORE-1・#4152: 照合の後に同じ id が別の bundle で再作成されたとき、旧世代の stop・delete は新しい記録に触れず
+/// `FAILED_PRECONDITION` で拒否し、新しい記録はそのまま残る。
+#[test]
+fn sec1_4152_stale_generation_does_not_touch_recreated_container() {
+    let guard = test_root::test_root("shim", "r-gen");
+    let base = guard.join("state");
+    let bundle = make_bundle(&guard, "abc");
+    seed(&base, ContainerStatus::created(cid("abc"), None), &bundle);
+    let inv = parse("abc", Some(bundle.to_str().unwrap())).unwrap();
+    let (_, store, matched) = delete_preflight_store_in(&inv, &base).unwrap();
+    let DeleteRecordMatch::Recorded(rec) = matched else {
+        panic!("expected recorded");
+    };
+    let stale = Generation::of(&rec);
+    let store: Arc<dyn StateStore> = Arc::new(store.expect("store"));
+    let other = guard.join("other-bundle");
+    std::fs::create_dir_all(&other).unwrap();
+    recreate_with_other_bundle(&base, &inv, "abc", &other);
+    let rt = GuardedCore {
+        core: core_runtime_for(Arc::clone(&store)),
+        store: Arc::clone(&store),
+    };
+    let stop = StopRequest::new(cid("abc"), Duration::ZERO).unwrap();
+    let e = rt.stop(&stop, &stale).expect_err("stale stop");
+    assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+    let e = rt
+        .delete(&DeleteRequest::new(cid("abc")), &stale)
+        .expect_err("stale delete");
+    assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+    let now = store.get(&GetStateRequest::new(cid("abc"))).unwrap();
+    assert_eq!(now.bundle(), other.as_path());
+}
+
+/// REPAIR-5・#4152: 全体の絶対期限が尽きていれば、段を始める前に `DEADLINE_EXCEEDED` で終わり、実行層を作らない。
+#[test]
+fn repair5_4152_exhausted_deadline_fails_before_any_stage() {
+    let guard = test_root::test_root("shim", "r-dl");
+    let base = guard.join("state");
+    let bundle = make_bundle(&guard, "abc");
+    seed(&base, ContainerStatus::created(cid("abc"), None), &bundle);
+    let inv = parse("abc", Some(bundle.to_str().unwrap())).unwrap();
+    let r = delete_in(
+        &inv,
+        &base,
+        |_| unreachable!("no runtime after the deadline"),
+        &ReclaimBudget::PRODUCTION,
+        std::time::Instant::now(),
+    );
+    assert_eq!(r.unwrap_err().code(), CriErrorCode::Timeout);
 }

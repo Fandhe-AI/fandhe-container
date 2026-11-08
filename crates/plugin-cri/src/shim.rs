@@ -247,7 +247,7 @@ fn has_dot_segment(p: &Path) -> bool {
 
 /// delete の `-id`・`-bundle` を検証する（副作用は `lstat` だけ。全 OS 共通。CRI-5・SEC-1・#4151）。
 ///
-/// 呼び出し元は [`production_delete_preflight`]。`-id` は core の `ContainerId` に通す（`parse_args` の identifier 規則より緩い
+/// 呼び出し元は [`production_delete`]（delete action の前段）。`-id` は core の `ContainerId` に通す（`parse_args` の identifier 規則より緩い
 /// ので多層防御）。`-bundle` は containerd v2.1.4 の `core/runtime/v2/bundle.go` が `<state>/<namespace>/<id>` で組むため、
 /// 絶対パスで、`.`・`..` を含まず、末尾の要素が id と一致し、末尾の要素が実在するディレクトリ（symlink でない）であることを求める。
 /// 親の namespace との一致は見ない（記録の bundle との照合の方が強く、state の配置が変わったときに正当な呼び出しを拒否する危険を増やすだけ）。
@@ -420,11 +420,18 @@ pub(crate) fn delete_in(
         fandhe_container_core::state_store::FileStateStore,
     ) -> std::sync::Arc<dyn reclaim::ReclaimRuntime>,
     budget: &reclaim::ReclaimBudget,
+    deadline: std::time::Instant,
 ) -> Result<Option<ShimDeleteExit>, CriError> {
-    let (target, store, matched) = delete_preflight_store_in(inv, base)?;
+    // 照合の読み取りは状態ロックを最大 5 秒待ちうるため、作業スレッドで走らせ、全体の絶対期限で待ちを打ち切る（REPAIR-5・D6）。
+    let limit = reclaim::remaining(deadline, "preflight")?;
+    let (inv_owned, base_owned) = (inv.clone(), base.to_path_buf());
+    let (target, store, matched) = reclaim::run_stage(limit, "preflight", move || {
+        delete_preflight_store_in(&inv_owned, &base_owned)
+    })?;
     match (matched, store) {
         (DeleteRecordMatch::Recorded(rec), Some(store)) => {
-            reclaim::reclaim_recorded(make_runtime(store), &target, &rec, budget).map(Some)
+            reclaim::reclaim_recorded(make_runtime(store), &target, &rec, budget, deadline)
+                .map(Some)
         }
         (DeleteRecordMatch::Recorded(_), None) => {
             Err(CriError::internal("cannot open the state store"))
@@ -436,10 +443,14 @@ pub(crate) fn delete_in(
 /// bootstrap の delete の前段（`run_cli_with_hooks` の `before_delete`）として渡す本番の実装（CRI-5・SEC-1・#4151・#4152）。
 ///
 /// Linux は既定の状態ルート（`StateRoot::resolve(None)`。外部入力から受けない）で、引数の検証・記録の照合の後、記録のあるコンテナだけを
-/// 停止して回収し、終了状態を返す（`Some`）。記録なし・回収済みは `None`（固定の応答）。各段は [`reclaim::ReclaimBudget::PRODUCTION`]
-/// の期限で有界（containerd の cleanup の 5 秒より短い。`docs/design/shim-v2-production-binary.md` D6）。非 Linux は引数の検証だけで
+/// 停止して回収し、終了状態を返す（`Some`）。記録なし・回収済みは `None`（固定の応答）。`deadline` は bootstrap が数える delete 全体の
+/// 絶対期限で、照合・各段（上限は `ReclaimBudget::PRODUCTION`）・socket 掃除・計測の待ちが共有する（containerd の cleanup の 5 秒より短い。
+/// `docs/design/shim-v2-production-binary.md` D6）。非 Linux は引数の検証だけで
 /// `None` を返す（既定の状態ルートが未決定で #2431。REPAIR-3）。
-pub fn production_delete(inv: &ShimInvocation) -> Result<Option<ShimDeleteExit>, CriError> {
+pub fn production_delete(
+    inv: &ShimInvocation,
+    deadline: std::time::Instant,
+) -> Result<Option<ShimDeleteExit>, CriError> {
     #[cfg(target_os = "linux")]
     {
         let base = fandhe_container_core::state_store::StateRoot::resolve(None)
@@ -449,17 +460,21 @@ pub fn production_delete(inv: &ShimInvocation) -> Result<Option<ShimDeleteExit>,
             inv,
             base.path(),
             |store| {
-                std::sync::Arc::new(
-                    core_runtime_for(std::sync::Arc::new(store))
+                let store: std::sync::Arc<dyn StateStore> = std::sync::Arc::new(store);
+                std::sync::Arc::new(reclaim::GuardedCore {
+                    core: core_runtime_for(std::sync::Arc::clone(&store))
                         .with_delete_deadline(budget.remove)
                         .with_container_log_lock_wait(budget.remove),
-                )
+                    store,
+                })
             },
             &budget,
+            deadline,
         )
     }
     #[cfg(not(target_os = "linux"))]
     {
+        let _ = deadline;
         validate_delete_invocation(inv).map(|_| None)
     }
 }

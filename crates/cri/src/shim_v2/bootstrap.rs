@@ -71,6 +71,11 @@ pub const READY_LINE: &str = "fandhe-container-shim-ready\n";
 /// start が準備完了を待つ上限（REPAIR-5）。
 pub const START_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// delete action 全体の絶対期限の長さ（REPAIR-5・CRI-5・#4152）。containerd は shim の delete を 5 秒
+/// （`io.containerd.timeout.shim.cleanup`）で kill するため、プロセスの起動と応答の書き出しの余裕を引いた値にする。
+/// `delete_recorded` が開始時刻から数え、前段（`before_delete`）と `run_delete` の socket・lock の待ちが同じ期限を共有する。
+pub const SHIM_DELETE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(4);
+
 /// namespace / id の最大長（containerd の identifier 規則）。
 const IDENTIFIER_MAX_LEN: usize = 76;
 /// address の最大バイト数。
@@ -473,12 +478,13 @@ pub fn run_with_context<F>(inv: ShimInvocation, make_registry: F) -> Result<Vec<
 where
     F: FnOnce(ServeContext) -> Result<ServiceRegistry, CriError>,
 {
-    run_with_hooks(inv, make_registry, |_| Ok(None))
+    run_with_hooks(inv, make_registry, |_, _| Ok(None))
 }
 
 /// [`run_with_context`] に、delete action の前段 `before_delete` を足した版（CRI-5・TASK-62.6・#4151）。
 ///
-/// `before_delete` は `delete` のときだけ、socket・lock に触れる前（`run_delete` の前）に 1 回呼ばれる。
+/// `before_delete` は `delete` のときだけ、socket・lock に触れる前（`run_delete` の前）に 1 回呼ばれる。第 2 引数は delete 全体の
+/// 絶対期限（[`SHIM_DELETE_DEADLINE`] を開始時刻から数えた `Instant`。REPAIR-5）で、前段の待ちはこれを超えない。
 /// `Err` なら実行層の後始末にも socket の掃除にも進まず、そのエラーを返す（`ops.log` の `ShimV2Delete` には失敗として残る。REPAIR-4）。
 /// plugin-cri が `-id`・`-bundle` の検証、状態ルートの記録の照合、残ったコンテナの停止・回収を差し込む（cri から plugin-cri への依存は
 /// `tests/dependency_direction.rs` が禁じるため、注入口にした。PLUG-1）。戻り値の `Some(exit)` は回収した終了状態で、
@@ -492,7 +498,7 @@ pub fn run_with_hooks<F, D>(
 ) -> Result<Vec<u8>, CriError>
 where
     F: FnOnce(ServeContext) -> Result<ServiceRegistry, CriError>,
-    D: FnOnce(&ShimInvocation) -> Result<Option<ShimDeleteExit>, CriError>,
+    D: FnOnce(&ShimInvocation, std::time::Instant) -> Result<Option<ShimDeleteExit>, CriError>,
 {
     match inv.action {
         ShimAction::Version => Ok(version_text()),
@@ -521,7 +527,7 @@ pub fn run_with_hooks<F, D>(
 ) -> Result<Vec<u8>, CriError>
 where
     F: FnOnce(ServeContext) -> Result<ServiceRegistry, CriError>,
-    D: FnOnce(&ShimInvocation) -> Result<Option<ShimDeleteExit>, CriError>,
+    D: FnOnce(&ShimInvocation, std::time::Instant) -> Result<Option<ShimDeleteExit>, CriError>,
 {
     match inv.action {
         ShimAction::Version => Ok(version_text()),
@@ -541,14 +547,14 @@ pub fn run_cli_with_context<F>(make_registry: F) -> std::process::ExitCode
 where
     F: FnOnce(ServeContext) -> Result<ServiceRegistry, CriError>,
 {
-    run_cli_with_hooks(make_registry, |_| Ok(None))
+    run_cli_with_hooks(make_registry, |_, _| Ok(None))
 }
 
 /// [`run_cli_with_context`] に delete の前段（[`run_with_hooks`]）を足した版（CRI-5・TASK-62.6・#4151）。
 pub fn run_cli_with_hooks<F, D>(make_registry: F, before_delete: D) -> std::process::ExitCode
 where
     F: FnOnce(ServeContext) -> Result<ServiceRegistry, CriError>,
-    D: FnOnce(&ShimInvocation) -> Result<Option<ShimDeleteExit>, CriError>,
+    D: FnOnce(&ShimInvocation, std::time::Instant) -> Result<Option<ShimDeleteExit>, CriError>,
 {
     use std::io::Write;
     let result = parse_args(std::env::args_os().skip(1))
@@ -621,6 +627,8 @@ mod unix_impl {
     const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
     /// ロックの再試行間隔。
     const LOCK_RETRY: Duration = Duration::from_millis(20);
+    /// delete の計測の記録に、全体期限の後に許す余裕（containerd の 5 秒までに収める）。
+    const DELETE_RECORD_GRACE: Duration = Duration::from_millis(500);
     /// 計測ログの回転サイズ。
     const OPS_LOG_MAX_BYTES: u64 = 1024 * 1024;
     /// 計測ログのロックを待つ上限（REPAIR-5）。
@@ -874,10 +882,18 @@ mod unix_impl {
     /// `<socket 名>.lock` を `flock` で取る。期限（`LOCK_TIMEOUT`）内に取れなければ `TIMEOUT`。
     /// 取得後にパスの `(dev, ino)` が開いた fd と一致することを確かめ、delete が消した lock を掴んだ場合は取り直す。
     fn acquire_lock(dir: &Path, inv: &ShimInvocation) -> Result<IdLock, CriError> {
+        acquire_lock_until(dir, inv, Instant::now() + LOCK_TIMEOUT)
+    }
+
+    /// [`acquire_lock`] の待ちの絶対期限を引数で受ける版（delete の全体期限を超えて待たない。REPAIR-5）。
+    fn acquire_lock_until(
+        dir: &Path,
+        inv: &ShimInvocation,
+        deadline: Instant,
+    ) -> Result<IdLock, CriError> {
         let name =
             socket_file_name(inv).ok_or_else(|| CriError::invalid_argument("missing identity"))?;
         let path = dir.join(format!("{name}.lock"));
-        let deadline = Instant::now() + LOCK_TIMEOUT;
         loop {
             let file = OpenOptions::new()
                 .read(true)
@@ -913,6 +929,12 @@ mod unix_impl {
         }
     }
 
+    /// 試験用: id の lock を取って返す（解放は戻り値の drop）。
+    #[cfg(test)]
+    pub fn hold_id_lock_for_test(dir: &Path, inv: &ShimInvocation) -> impl Sized {
+        acquire_lock(dir, inv).expect("lock")
+    }
+
     /// `(dev, ino)`。自分が作ったパスの同一性確認に使う。
     fn ident_of(p: &Path) -> Option<(u64, u64)> {
         fs::symlink_metadata(p).ok().map(|m| (m.dev(), m.ino()))
@@ -922,6 +944,8 @@ mod unix_impl {
     /// 行の語彙は固定で、パス・id・要求の中身は書かない。
     pub struct OpLogRecorder {
         path: PathBuf,
+        /// ロック待ちの絶対上限（`None` は `OPS_LOG_LOCK_TIMEOUT` だけ）。delete の全体期限が使う。
+        lock_until: Option<Instant>,
     }
 
     impl OpLogRecorder {
@@ -929,6 +953,7 @@ mod unix_impl {
         pub fn new(dir: &Path) -> Self {
             Self {
                 path: dir.join(OPS_LOG_NAME),
+                lock_until: None,
             }
         }
 
@@ -972,7 +997,10 @@ mod unix_impl {
             if !meta.is_file() || meta.uid() != crate::sys::effective_uid() {
                 return Err(std::io::Error::other("unsafe ops log lock"));
             }
-            let deadline = Instant::now() + OPS_LOG_LOCK_TIMEOUT;
+            let mut deadline = Instant::now() + OPS_LOG_LOCK_TIMEOUT;
+            if let Some(until) = self.lock_until {
+                deadline = deadline.min(until);
+            }
             loop {
                 match file.try_lock() {
                     Ok(()) => return Ok(file),
@@ -1006,12 +1034,25 @@ mod unix_impl {
 
     /// 操作の結果と所要時間を記録する。
     fn record<T>(dir: &Path, kind: CriOpKind, r: &Result<T, CriError>, started: Instant) {
+        record_until(dir, kind, r, started, None);
+    }
+
+    /// [`record`] に、`ops.log` のロック待ちの絶対上限を足した版（delete の全体期限用。REPAIR-5）。
+    fn record_until<T>(
+        dir: &Path,
+        kind: CriOpKind,
+        r: &Result<T, CriError>,
+        started: Instant,
+        until: Option<Instant>,
+    ) {
         let code = match r {
             Ok(_) => tonic::Code::Ok,
             Err(e) => e.code().grpc_code(),
         };
         let sample = CriOpSample::new(kind, code, started.elapsed());
-        OpLogRecorder::new(dir).record_cri_op(&sample);
+        let mut rec = OpLogRecorder::new(dir);
+        rec.lock_until = until;
+        rec.record_cri_op(&sample);
     }
 
     /// `start` を計測つきで実行する。
@@ -1032,11 +1073,19 @@ mod unix_impl {
         before_delete: D,
     ) -> Result<Vec<u8>, CriError>
     where
-        D: FnOnce(&ShimInvocation) -> Result<Option<super::ShimDeleteExit>, CriError>,
+        D: FnOnce(&ShimInvocation, Instant) -> Result<Option<super::ShimDeleteExit>, CriError>,
     {
         let started = Instant::now();
-        let r = before_delete(inv).and_then(|exit| run_delete(inv, dir, exit));
-        record(dir, CriOpKind::ShimV2Delete, &r, started);
+        let deadline = started + super::SHIM_DELETE_DEADLINE;
+        let r = before_delete(inv, deadline).and_then(|exit| run_delete(inv, dir, exit, deadline));
+        // 計測の記録の待ちも containerd の 5 秒までに収める（期限 + 余裕を上限にする）。
+        record_until(
+            dir,
+            CriOpKind::ShimV2Delete,
+            &r,
+            started,
+            Some(deadline + DELETE_RECORD_GRACE),
+        );
         r
     }
 
@@ -1216,6 +1265,7 @@ mod unix_impl {
         inv: &ShimInvocation,
         dir: &Path,
         exit: Option<super::ShimDeleteExit>,
+        deadline: Instant,
     ) -> Result<Vec<u8>, CriError> {
         let encode = |exit: &Option<super::ShimDeleteExit>| match exit {
             Some(e) => super::encode_delete_response_for(e),
@@ -1230,7 +1280,8 @@ mod unix_impl {
             Err(_) => return Err(internal("cannot stat socket dir")),
         }
         let path = socket_path(dir, inv)?;
-        let lock = acquire_lock(dir, inv)?;
+        // lock の待ちは既定の上限と delete の全体期限の早い方（REPAIR-5）。
+        let lock = acquire_lock_until(dir, inv, deadline.min(Instant::now() + LOCK_TIMEOUT))?;
         match fs::symlink_metadata(&path) {
             Ok(m) if m.file_type().is_socket() => {
                 if m.uid() != crate::sys::effective_uid() {
@@ -2233,7 +2284,7 @@ mod tests {
         drop(UnixListener::bind(&sock).unwrap());
         assert!(sock.exists());
 
-        let e = unix_impl::delete_recorded(&inv, &dir, |_| {
+        let e = unix_impl::delete_recorded(&inv, &dir, |_, _| {
             Err(CriError::invalid_argument("rejected by the front stage"))
         })
         .unwrap_err();
@@ -2246,9 +2297,42 @@ mod tests {
         let log = std::fs::read_to_string(dir.join("ops.log")).unwrap();
         assert!(log.contains("cri.shim_v2.delete"), "{log}");
 
-        let ok = unix_impl::delete_recorded(&inv, &dir, |_| Ok(None)).unwrap();
+        let ok = unix_impl::delete_recorded(&inv, &dir, |_, _| Ok(None)).unwrap();
         // 応答は終了時刻を含むため、先頭の exit_status(137) だけを具体値で照合する。
         assert_eq!(ok.get(..3), Some(&[0x10, 0x89, 0x01][..]));
         assert!(!sock.exists(), "socket is removed on the normal path");
+    }
+
+    /// REPAIR-5・CRI-5・#4152: 他者が id の lock を持っていても、`run_delete` の待ちは delete 全体の絶対期限で打ち切られ、
+    /// 既定の 10 秒（`LOCK_TIMEOUT`）を待たずに `TIMEOUT` になる。
+    #[cfg(unix)]
+    #[test]
+    fn repair5_4152_run_delete_lock_wait_follows_overall_deadline() {
+        let t = Tmp::new("dl");
+        let dir = t.0.join("s");
+        unix_impl::prepare_socket_dir(&dir).unwrap();
+        let inv = parse_args(args(&[
+            "-namespace",
+            "default",
+            "-address",
+            "/run/c.sock",
+            "-id",
+            "abc",
+            "-bundle",
+            "/tmp/x/abc",
+            "delete",
+        ]))
+        .unwrap();
+        let _held = unix_impl::hold_id_lock_for_test(&dir, &inv);
+        let started = std::time::Instant::now();
+        let e = unix_impl::run_delete(
+            &inv,
+            &dir,
+            None,
+            started + std::time::Duration::from_millis(200),
+        )
+        .unwrap_err();
+        assert_eq!(e.code(), CriErrorCode::Timeout);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 }

@@ -46,7 +46,7 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::net::TcpListener;
-use tokio::task::JoinHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 
 use crate::error::CriError;
 use crate::runtime::v1;
@@ -735,6 +735,8 @@ pub trait StreamHandler: Send + Sync + 'static {
     /// `permit` は同時接続数（`max_connections`）の枠を表す。101 応答で `Upgraded` へ IO を渡すと
     /// サーバー側の接続タスクは終わるため、Upgrade 後の IO を使うタスクは `permit` を move して
     /// IO の寿命まで保持すること（落とすとその時点で枠が返り、上限の契約が破れる。CRI-6・REPAIR-5）。
+    /// Upgrade 後の IO を扱うタスクは [`ConnectionPermit::spawn_session`] で起動すること。`tokio::spawn` で
+    /// 起動したタスクは、停止時の強制クローズ（[`StreamingSessions::close_all`]）と残件数の対象外になる（#4164）。
     fn handle(
         &self,
         request: StreamRequest,
@@ -940,6 +942,100 @@ impl Drop for ConnectionGuard {
     }
 }
 
+/// 接続・セッションのタスクの追跡簿（停止時の強制クローズと残件数の把握のため。CRI-6・REPAIR-5・#4164）。
+///
+/// 呼び出し元: `accept_loop`（Upgrade 前の接続タスク）と [`ConnectionPermit::spawn_session`]（Upgrade 後の
+/// セッション）が登録し、[`StreamingSessions`] が停止時に読む。件数は `conns`（枠の数）で数え、Upgrade 前の
+/// 接続も含む。追跡簿は終了済みを登録のたびに除くため、件数は同時接続数の上限の高々 2 倍で有界。
+struct SessionRegistry {
+    conns: Arc<AtomicUsize>,
+    /// （強制クローズ済みか, 追跡中のタスク）。
+    handles: Mutex<(bool, Vec<AbortHandle>)>,
+}
+
+impl SessionRegistry {
+    fn new(conns: Arc<AtomicUsize>) -> Self {
+        Self {
+            conns,
+            handles: Mutex::new((false, Vec::new())),
+        }
+    }
+
+    /// タスクを登録する。強制クローズの後の登録は直ちに abort する（取りこぼしを作らない）。
+    fn track(&self, handle: AbortHandle) {
+        let mut guard = self
+            .handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.0 {
+            handle.abort();
+            return;
+        }
+        guard.1.retain(|h| !h.is_finished());
+        guard.1.push(handle);
+    }
+
+    fn close_all(&self) {
+        let handles = {
+            let mut guard = self
+                .handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.0 = true;
+            std::mem::take(&mut guard.1)
+        };
+        for handle in handles {
+            handle.abort();
+        }
+    }
+}
+
+/// 開いている接続・セッションの停止時の口（CRI-6・REPAIR-5・#4164）。
+///
+/// [`StreamingServer::sessions`] で得る。呼び出し元は `fandhe-container-plugin-cri` の停止の経路
+/// （待ち受けを閉じた後に件数を数えて待ち、期限で [`Self::close_all`]）。
+#[derive(Clone)]
+pub struct StreamingSessions {
+    registry: Arc<SessionRegistry>,
+}
+
+impl fmt::Debug for StreamingSessions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StreamingSessions")
+            .field("open", &self.open())
+            .finish()
+    }
+}
+
+impl StreamingSessions {
+    /// 同時接続数の枠を持つ件数（Upgrade 前の接続と Upgrade 後のセッションの合計）。
+    pub fn open(&self) -> usize {
+        self.registry.conns.load(Ordering::Acquire)
+    }
+
+    /// 追跡中の全タスクを abort する。以後に登録されるタスクも直ちに abort される。
+    ///
+    /// abort は次にタスクが poll される時点で future を drop する（IO が閉じ、枠が返る）。
+    pub fn close_all(&self) {
+        self.registry.close_all();
+    }
+
+    /// 件数が 0 になるか `deadline` に達するまで待ち、その時点の件数を返す（10 ms 周期）。
+    pub async fn wait_idle_until(&self, deadline: Instant) -> usize {
+        loop {
+            let open = self.open();
+            if open == 0 {
+                return 0;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return open;
+            }
+            tokio::time::sleep((deadline - now).min(Duration::from_millis(10))).await;
+        }
+    }
+}
+
 /// 同時接続数の枠の保持票（複製可。最後の複製が落ちたときに枠が返る）。
 ///
 /// サーバーは接続の future が終わるまで 1 つ持ち、[`StreamHandler::handle`] にも 1 つ渡す。
@@ -947,6 +1043,23 @@ impl Drop for ConnectionGuard {
 #[derive(Clone)]
 pub struct ConnectionPermit {
     _guard: Arc<ConnectionGuard>,
+    registry: Arc<SessionRegistry>,
+}
+
+impl ConnectionPermit {
+    /// Upgrade 後のセッションのタスクを起動する。permit はタスクの寿命まで保持され、タスクは
+    /// [`StreamingSessions::close_all`] の対象になる（枠の寿命とタスクの寿命を型で結ぶ。#4164）。
+    pub fn spawn_session<F>(self, fut: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let registry = Arc::clone(&self.registry);
+        let task = tokio::spawn(async move {
+            let _permit = self;
+            fut.await;
+        });
+        registry.track(task.abort_handle());
+    }
 }
 
 impl fmt::Debug for ConnectionPermit {
@@ -1008,6 +1121,7 @@ pub struct StreamingServer {
     local_addr: SocketAddr,
     issuer: Arc<StreamingUrlIssuer>,
     accept_task: JoinHandle<()>,
+    registry: Arc<SessionRegistry>,
 }
 
 impl fmt::Debug for StreamingServer {
@@ -1057,13 +1171,21 @@ impl StreamingServer {
             wiring: handler.wiring(),
         });
         let conns = Arc::new(AtomicUsize::new(0));
+        let registry = Arc::new(SessionRegistry::new(Arc::clone(&conns)));
         let accept_task = tokio::spawn(accept_loop(
-            listener, config, cache, handler, conns, observer,
+            listener,
+            config,
+            cache,
+            handler,
+            conns,
+            observer,
+            Arc::clone(&registry),
         ));
         Ok(Self {
             local_addr,
             issuer,
             accept_task,
+            registry,
         })
     }
 
@@ -1077,7 +1199,14 @@ impl StreamingServer {
         Arc::clone(&self.issuer)
     }
 
-    /// 待ち受けを止める。
+    /// 開いている接続・セッションの停止時の口。待ち受けを閉じた後の待ちと強制クローズに使う（#4164）。
+    pub fn sessions(&self) -> StreamingSessions {
+        StreamingSessions {
+            registry: Arc::clone(&self.registry),
+        }
+    }
+
+    /// 待ち受けを止める。受け付け済みの接続・セッションは切らない（切るのは [`StreamingSessions::close_all`]）。
     pub fn shutdown(self) {
         drop(self);
     }
@@ -1096,6 +1225,7 @@ async fn accept_loop(
     handler: Arc<dyn StreamHandler>,
     conns: Arc<AtomicUsize>,
     observer: Arc<dyn ConnectionObserver>,
+    registry: Arc<SessionRegistry>,
 ) {
     loop {
         let stream = match listener.accept().await {
@@ -1116,10 +1246,12 @@ async fn accept_loop(
         let handler = Arc::clone(&handler);
         let observer = Arc::clone(&observer);
         let header_read_timeout = config.header_read_timeout;
-        tokio::spawn(async move {
+        let task_registry = Arc::clone(&registry);
+        let task = tokio::spawn(async move {
             let started = Instant::now();
             let permit = ConnectionPermit {
                 _guard: Arc::new(guard),
+                registry: task_registry,
             };
             let service_permit = permit.clone();
             let service = service_fn(move |request| {
@@ -1153,6 +1285,8 @@ async fn accept_loop(
             // permit はここまで保持する。Upgrade 後の IO を持つタスクが複製を持つ間は枠が返らない。
             drop(permit);
         });
+        // Upgrade 前の接続も強制クローズの対象にする（ヘッダ読み取りの期限まで残さない。#4164）。
+        registry.track(task.abort_handle());
     }
 }
 

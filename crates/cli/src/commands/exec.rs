@@ -171,6 +171,7 @@ mod linux {
                 launch_env: ctx.launch_env,
                 stdio: ExecStdio::NONE,
                 on_created: Some(ctx.on_created),
+                cancel: None,
             },
         )
         .map(|AuditedOutcome { outcome, .. }| outcome.exit)

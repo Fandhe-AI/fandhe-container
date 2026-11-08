@@ -321,6 +321,29 @@ pub fn recv_from_helper(
     }
 }
 
+/// `poll` の `revents`（失敗なら `Err`）から、要求元の消滅を判定する純関数（[`requester_gone`] の本体）。
+/// `POLLIN` だけは消滅としない。`poll` の失敗は「消滅と言えない」ので偽（取り消さない側。REPAIR-5）。
+fn gone_from(revents: io::Result<i16>) -> bool {
+    matches!(revents, Ok(r) if r & sys::POLL_GONE_MASK != 0)
+}
+
+/// 要求元（plugin-cri）が channel を閉じた・異常終了した（接続が切れた）かを、読まずに 1 回だけ確かめる
+/// （`poll(timeout = 0)` で `POLLHUP`・`POLLERR`・`POLLRDHUP`・`POLLNVAL`。データ・fd は消費しない。#4166・SUP-6・REPAIR-5）。
+///
+/// helper が exec の間に呼ぶ取り消し判定の実体で、真なら exec のコマンドを止めて回収してから終わる
+/// （`docs/design/cri-streaming-server.md`「要求元の異常終了の検知」の方式 A）。判定に失敗した（`EINTR` 等）・非対応の
+/// ターゲットは偽（取り消さない）で、従来の期限と `hold_grace` で終わる。
+///
+/// 要求元側の契約: 続けたい間は channel を閉じず、`shutdown` もせず、自分の端を他プロセスへ渡さない
+/// （渡すと要求元が死んでも相手が端を持ち続け、検知できない。その場合は従来の上限で終わる）。
+/// 再評価条件: 要求元が channel を意図して半閉じする設計に変わるとき（誤検知になる）。
+pub fn requester_gone(channel: &UnixStream) -> bool {
+    gone_from(sys::poll_revents_now(
+        channel.as_fd(),
+        sys::POLL_IN | sys::POLL_RDHUP,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs::File;
@@ -654,5 +677,36 @@ mod tests {
             ErrorCode::Internal
         );
         let _ = File::open("/dev/null").unwrap().as_raw_fd();
+    }
+
+    /// SUP-6・REPAIR-5・#4166: 要求元の消滅の判定（開いている・データだけ・半閉じ・閉じた・判定の失敗）。
+    #[cfg(any(
+        all(target_arch = "x86_64", target_pointer_width = "64"),
+        all(target_arch = "aarch64", target_pointer_width = "64")
+    ))]
+    #[test]
+    fn sup6_4166_requester_gone_follows_the_peer_state() {
+        let (helper, plugin) = pair();
+        assert!(!requester_gone(&helper), "open peer");
+        std::io::Write::write_all(&mut &plugin, b"x").unwrap();
+        assert!(!requester_gone(&helper), "data only is not gone");
+        plugin.shutdown(std::net::Shutdown::Write).unwrap();
+        assert!(requester_gone(&helper), "half-closed peer");
+        let (helper, plugin) = pair();
+        drop(plugin);
+        assert!(requester_gone(&helper), "closed peer");
+    }
+
+    /// SUP-6・REPAIR-5・#4166: revents の各ビットと判定の失敗の写し。
+    #[test]
+    fn sup6_4166_gone_from_maps_bits_and_errors() {
+        assert!(!gone_from(Ok(0)));
+        assert!(!gone_from(Ok(sys::POLL_IN)));
+        for bit in [0x8, 0x10, 0x20, 0x2000] {
+            assert!(gone_from(Ok(bit)), "{bit:#x}");
+        }
+        assert!(gone_from(Ok(sys::POLL_IN | 0x10)));
+        assert!(!gone_from(Err(io::ErrorKind::Interrupted.into())));
+        assert!(!gone_from(Err(io::ErrorKind::Unsupported.into())));
     }
 }

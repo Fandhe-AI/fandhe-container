@@ -167,6 +167,12 @@ struct Scenario {
     source_unavailable: bool,
     notify_fails: bool,
     exit: ExecExit,
+    /// 真なら偽の実行役が `io.cancel` を 10 ms 刻みでこの長さの間見続ける（`serve` の取り消し判定の配線の照合。#4166）。
+    /// 真になれば `Unavailable` の拒否で終わり、最後まで偽なら `exit` で終わる。`None` は見ない。
+    watch_cancel: Option<Duration>,
+    /// `Some` なら、`serve` の開始直後からこの時間の後に plugin 側の channel の端を別スレッドで閉じる
+    /// （要求元の消滅の模擬。戻り値の端は別の socketpair のダミーになる）。
+    close_plugin_after: Option<Duration>,
 }
 
 impl Default for Scenario {
@@ -176,6 +182,8 @@ impl Default for Scenario {
             source_unavailable: false,
             notify_fails: false,
             exit: ExecExit::Command(ChildExit::Exited(3)),
+            watch_cancel: None,
+            close_plugin_after: None,
         }
     }
 }
@@ -230,6 +238,19 @@ fn drive(
                 return Err(AuditedRejection::not_applicable(e));
             }
         }
+        if let Some(span) = sc.watch_cancel {
+            let begin = Instant::now();
+            let cancel = io.cancel.expect("serve must pass the cancel hook (#4166)");
+            while begin.elapsed() < span {
+                if cancel() {
+                    return Err(AuditedRejection::not_applicable(TraitError::new(
+                        ErrorCode::Unavailable,
+                        "exec cancelled",
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
         counts.event("run-done");
         Ok(sc.exit)
     };
@@ -240,7 +261,20 @@ fn drive(
         launch_env: &launch_env,
         run: &run,
     };
+    let (plugin, closer) = match sc.close_plugin_after {
+        Some(after) => {
+            let closer = std::thread::spawn(move || {
+                std::thread::sleep(after);
+                drop(plugin);
+            });
+            (UnixStream::pair().expect("dummy pair").0, Some(closer))
+        }
+        None => (plugin, None),
+    };
     let outcome = serve(&helper, args, &deps);
+    if let Some(closer) = closer {
+        closer.join().expect("closer thread");
+    }
     (outcome, counts, plugin)
 }
 
@@ -552,4 +586,51 @@ fn sec1_3760_real_bin_requires_a_socket_on_fd0() {
         err,
         "{\"code\":\"invalid-argument\",\"message\":\"stream-exec requires a socket on fd 0\"}\n"
     );
+}
+
+/// SUP-6・SEC-1・REPAIR-5（#4166）: 要求元（plugin 側の channel の端）が消えたら、`serve` が渡した取り消し判定が真になり、
+/// 実行役が `Unavailable` で終わる。消滅（端を閉じた時刻）から `serve` の戻りまで 2 秒以内。
+#[test]
+fn sup6_4166_serve_passes_a_cancel_hook_that_fires_when_the_requester_closes() {
+    let base = Tmp::new("cancel");
+    let store = open(&base);
+    seed(&base, &store, "run1", Some(PID));
+    let none = StdioSend::default();
+    let args = args_for(&base, "run1", PID, 0);
+    let sc = Scenario {
+        // 実行役は最長 10 秒見続ける。端は 200 ms 後に閉じる。
+        watch_cancel: Some(Duration::from_secs(10)),
+        close_plugin_after: Some(Duration::from_millis(200)),
+        ..Scenario::default()
+    };
+    let begin = Instant::now();
+    let (out, counts, _p) = drive(&store, &args, &none, &sc);
+    let elapsed = begin.elapsed();
+    assert_eq!(out, StreamExecOutcome::Failed(ErrorCode::Unavailable));
+    assert!(
+        elapsed >= Duration::from_millis(200) && elapsed < Duration::from_millis(2_200),
+        "took {elapsed:?}"
+    );
+    assert_eq!(counts.run.load(Ordering::SeqCst), 1);
+}
+
+/// SUP-6・REPAIR-5（#4166）: 要求元が開いたまま（データが届いただけの状態を含む）なら、取り消し判定は一度も真にならず、
+/// 実行役は本来の終了（`Exited(3)`）まで走る（誤検知しない）。
+#[test]
+fn sup6_4166_open_requester_never_fires_the_cancel_hook() {
+    let base = Tmp::new("nocancel");
+    let store = open(&base);
+    seed(&base, &store, "run1", Some(PID));
+    let none = StdioSend::default();
+    let args = args_for(&base, "run1", PID, 0);
+    let sc = Scenario {
+        watch_cancel: Some(Duration::from_millis(1_500)),
+        ..Scenario::default()
+    };
+    let begin = Instant::now();
+    let (out, counts, plugin) = drive(&store, &args, &none, &sc);
+    assert!(begin.elapsed() >= Duration::from_millis(1_500));
+    assert_eq!(out, StreamExecOutcome::Exited(3));
+    assert_eq!(counts.run.load(Ordering::SeqCst), 1);
+    drop(plugin);
 }

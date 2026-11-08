@@ -67,7 +67,7 @@
 //! # ioeventfd と通知スレッド（#3698・MVM-1・REPAIR-5）
 //! `assemble` は各 virtio デバイスのキュー（block はキュー 0、net は受信 0・送信 1。数はトランスポートのキュー数から列挙）の
 //! `QueueNotify`（`mmio_base + 0x50` への 4 バイトの書き込み。値 = キュー番号）を ioeventfd に結ぶ。ゲストの kick では VM exit が起きず、
-//! `start` が起動する専用スレッド `microvm-ioevent`（`IoEventPoller`）が eventfd を [`IOEVENT_WAIT_SLICE`] を上限に `poll(2)` で待って
+//! `start` が起動する専用スレッド `microvm-ioevent`（`IoEventPoller`）が eventfd と停止用の wake eventfd を [`IOEVENT_IDLE_WAIT`] を後詰めの上限に `poll(2)` で待って
 //! 処理する（結ぶ側と待つ側は同じ変更で入れる。待つ側が無いと virtio の処理が止まる）。datamatch つきの登録なので、キュー番号以外の値・
 //! 4 バイト以外の幅の書き込みは従来どおり MMIO exit で dispatcher に届き、そのままでよい（「直す」対象ではない）。受理条件
 //! （DRIVER_OK 前・FAILED など）は MMIO 経路と共有の `VirtioMmioTransport::accept_queue_notify`。`KVM_CAP_IOEVENTFD` が無いホストでは
@@ -88,7 +88,7 @@
 //!
 //! # ゲストメモリ（TASK-75.1）
 //! TASK-75（microVM の起動フロー）の起点。`crate::guest_memory` のアクセス型 [`GuestMemory`] に、実機の backing を
-//! 与える。[`GuestRam::new`] が匿名 mmap（私有・ゼロ埋め・`MAP_NORESERVE`・`MADV_DONTFORK`・`MADV_DONTDUMP`）でゲスト RAM を確保し、
+//! 与える。[`GuestRam::new`] が匿名 mmap（私有・ゼロ埋め・`MAP_NORESERVE`・`MADV_DONTFORK`・`MADV_DONTDUMP`。`MADV_HUGEPAGE` は付けず、THP を使うかはホストの方針しだい）でゲスト RAM を確保し、
 //! [`GuestRam::register`] が `KVM_SET_USER_MEMORY_REGION` で VM の memslot に登録して
 //! `GuestMemory<RegisteredGuestRam>` を返す。`unsafe` は `crate::sys` に閉じ、本モジュールは入力の検証・errno の
 //! 分類・寿命の管理だけを持つ。所有先の判断は docs/design/microvm-memory-ownership.md。
@@ -97,8 +97,10 @@
 //! 後続の VM 構成体（TASK-75.2・#697）と plugin-microvm（TASK-117）が、非信頼の VM 構成（サイズ・GPA）から呼ぶ。
 //! そのため size・GPA は ioctl の前にすべて検証し、slot は `u16` で受ける（KVM は上位 16 bit を address space id に使う）。
 //!
+//! memslot のフラグ（`KVM_MEM_READONLY` / `KVM_MEM_LOG_DIRTY_PAGES`）は [`GuestRam::register_with_flags`] で領域ごとに指定できる（#4158）。
+//!
 //! # 範囲外（REPAIR-3）
-//! hugepage・`KVM_MEM_READONLY` / `KVM_MEM_LOG_DIRTY_PAGES`・aarch64 の IPA サイズ（`KVM_CAP_ARM_VM_IPA_SIZE`）の照合は未実装
+//! hugepage の opt-in（採らない判断を記録済み。docs/design/microvm-memory-ownership.md の #4159 の節）・dirty log の取得（`KVM_GET_DIRTY_LOG`）・aarch64 の IPA サイズ（`KVM_CAP_ARM_VM_IPA_SIZE`）の照合は未実装
 //! （複数領域と `KVM_CAP_NR_MEMSLOTS` の照会は #3697、x86_64 の物理アドレス幅〔CPUID leaf 0x8000_0008〕と最上位 GPA の照合・
 //! e820 の予約表記は #4106 で実装済み。下記）。
 //!
@@ -118,7 +120,7 @@
 #![cfg(target_os = "linux")]
 
 use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
-use std::sync::{Arc, Condvar, Mutex, PoisonError, mpsc};
+use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -149,12 +151,13 @@ use crate::exit::VcpuExit;
 use crate::guest_memory::{
     GuestAddress, GuestMemory, GuestMemoryBacking, GuestMemoryRegion, MAX_GUEST_MEMORY_REGIONS,
 };
-use crate::interrupt::IoEventSpec;
 use crate::interrupt::{
     InterruptLine, IrqTrigger, LevelInterruptLine, complete_block_notify, complete_net_notify,
     poll_net_rx,
 };
-use crate::irq::{IoEventFd, IrqFd};
+use crate::interrupt::{IoEventCounts, IoEventSpec, IoEventTally};
+use crate::irq::{EventFd, IoEventFd, IrqFd};
+use crate::memslot_flags::{MemslotFlags, RegisterMemslotError, register_memslot_checked};
 #[cfg(target_arch = "x86_64")]
 use crate::mptable_x86::{IsaIrqRoute, MpTableConfig, build_mp_table, write_mp_table};
 use crate::net_rx_poll::{NetRxPollReport, check_net_rx_poll_interval, poll_failure};
@@ -398,7 +401,7 @@ impl GuestRam {
         Ok(GuestRam { map })
     }
 
-    /// `vm` の memslot `slot` に、ゲスト物理アドレス `base` から登録する。
+    /// `vm` の memslot `slot` に、ゲスト物理アドレス `base` から登録する（フラグなし）。
     ///
     /// `base` は `max(4096, ホストのページサイズ)` 境界で、`base + size` が桁あふれしないこと。登録に失敗したときは mapping を解放して返す
     /// （未登録なので解放してよい）。範囲が重なる既存の slot があれば `AlreadyExists`。
@@ -408,16 +411,33 @@ impl GuestRam {
         slot: u16,
         base: GuestAddress,
     ) -> Result<GuestMemory<RegisteredGuestRam>, MicrovmError> {
-        let registered = self.register_backing(vm, slot, base)?;
+        self.register_with_flags(vm, slot, base, MemslotFlags::NONE)
+    }
+
+    /// [`GuestRam::register`] に memslot のフラグを指定する（#4158・MVM-1）。1 つの `GuestRam` が 1 つの memslot なので領域ごとの指定になる。
+    ///
+    /// `READONLY` は `KVM_CAP_READONLY_MEM` を VM fd へ照会し、非対応なら ioctl を呼ばず `FailedPrecondition`。
+    /// 読み取り専用になるのはゲスト側の書き込み（MMIO exit になる）だけで、ホストの mapping は書き込み可能のまま
+    /// （[`GuestMemory`] のホストからの書き込みは従来どおり通る）。ホストのメモリ保護ではない。
+    /// `LOG_DIRTY_PAGES` は追跡を有効にするだけで、dirty bitmap の取得（`KVM_GET_DIRTY_LOG`）は未実装（REPAIR-3）。
+    pub fn register_with_flags(
+        self,
+        vm: &VmFd,
+        slot: u16,
+        base: GuestAddress,
+        flags: MemslotFlags,
+    ) -> Result<GuestMemory<RegisteredGuestRam>, MicrovmError> {
+        let registered = self.register_backing(vm, slot, base, flags)?;
         GuestMemory::new(base, registered)
     }
 
-    /// [`GuestRam::register`] の本体。KVM に登録して backing だけを返す（複数領域の組み立て用。#3697）。
+    /// [`GuestRam::register_with_flags`] の本体。KVM に登録して backing だけを返す（複数領域の組み立て用。#3697）。
     pub(crate) fn register_backing(
         self,
         vm: &VmFd,
         slot: u16,
         base: GuestAddress,
+        flags: MemslotFlags,
     ) -> Result<RegisteredGuestRam, MicrovmError> {
         if !base.raw().is_multiple_of(ram_align()?) {
             return Err(invalid(
@@ -433,8 +453,18 @@ impl GuestRam {
                 SysError::Os(e.raw_os_error().unwrap_or(0)),
             )
         })?;
-        sys::register_guest_ram(vm_fd.as_fd(), u32::from(slot), base.raw(), &self.map)
-            .map_err(|e| classify_ram_error(RamStage::Register, e))?;
+        register_memslot_checked(
+            vm,
+            u32::from(slot),
+            flags,
+            base.raw(),
+            size,
+            self.map.user_addr(),
+        )
+        .map_err(|e| match e {
+            RegisterMemslotError::Capability(e) => e,
+            RegisterMemslotError::Ioctl(e) => classify_ram_error(RamStage::Register, e),
+        })?;
         Ok(RegisteredGuestRam {
             vm: vm_fd,
             slot,
@@ -662,7 +692,8 @@ pub fn register_ram_regions(
     let mut registered = Vec::with_capacity(regions.len());
     for (i, r) in regions.iter().enumerate() {
         let slot = u16::try_from(i).map_err(|_| invalid("too many guest memory regions"))?;
-        let backing = GuestRam::new(r.len)?.register_backing(vm, slot, r.base)?;
+        let backing =
+            GuestRam::new(r.len)?.register_backing(vm, slot, r.base, MemslotFlags::NONE)?;
         registered.push((r.base, backing));
     }
     GuestMemory::from_regions(registered)
@@ -1034,9 +1065,11 @@ fn register_queue_ioeventfd(
     vm: &VmFd,
     slot: &DeviceSlot,
     queue: u16,
+    tally: &Arc<IoEventTally>,
 ) -> Result<Arc<IoEventFd>, MicrovmError> {
     let spec = IoEventSpec::virtio_mmio_queue_notify(slot.mmio_base, queue)?;
-    vm.register_ioeventfd(spec).map(Arc::new)
+    vm.register_ioeventfd(spec)
+        .map(|e| Arc::new(e.with_tally(Arc::clone(tally))))
 }
 
 /// 登録済みのデバイス 1 台（トランスポート・識別子・配置・キューごとの通知器・割り込み線）。
@@ -1326,6 +1359,9 @@ pub struct MicroVm<B: BlockBackend, N: NetBackend> {
     /// aarch64 のゲスト物理配置（`load_kernel` が FDT を組むのに使う。#3696）。
     #[cfg(target_arch = "aarch64")]
     layout: Arm64Layout,
+    /// ioeventfd の無視・解除失敗の VM ごとの件数（#4161）。資源を持たない（`Arc` の共有先は各 `IoEventFd` と通知スレッド）ので
+    /// drop の順序に影響しない。末尾に置く。
+    ioevent_tally: Arc<IoEventTally>,
 }
 
 impl<B: BlockBackend, N: NetBackend> std::fmt::Debug for MicroVm<B, N> {
@@ -1427,13 +1463,14 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
             len: serial_region.size,
             line: Some(serial_line),
         };
+        let ioevent_tally = Arc::new(IoEventTally::default());
         let devices = DeviceBus::new_with_notifiers(
             &slots,
             config.block,
             config.net,
             serial,
             |s| vm.register_irqfd(s.gsi),
-            |s, q| register_queue_ioeventfd(&vm, s, q),
+            |s, q| register_queue_ioeventfd(&vm, s, q, &ioevent_tally),
         )?;
         Ok(MicroVm {
             vcpus,
@@ -1442,6 +1479,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
             memory,
             vm,
             layout,
+            ioevent_tally,
         })
     }
 
@@ -1482,13 +1520,14 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
             Some(Arc::new(vm.register_irq_line(crate::uart::COM1_IRQ)?));
         #[cfg(not(target_arch = "x86_64"))]
         let com1_line: Option<Arc<dyn LevelInterruptLine>> = None;
+        let ioevent_tally = Arc::new(IoEventTally::default());
         let devices = DeviceBus::new_with_notifiers(
             &slots,
             config.block,
             config.net,
             SerialAttach::Com1Pio { line: com1_line },
             |s| vm.register_irqfd(s.gsi),
-            |s, q| register_queue_ioeventfd(&vm, s, q),
+            |s, q| register_queue_ioeventfd(&vm, s, q, &ioevent_tally),
         )?;
         let mut vcpus = Vec::with_capacity(config.vcpu_count as usize);
         #[cfg(target_arch = "x86_64")]
@@ -1512,6 +1551,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
             devices,
             memory,
             vm,
+            ioevent_tally,
         })
     }
 
@@ -1874,12 +1914,15 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
 pub const VCPU_POLL_INTERVAL: Duration = Duration::from_millis(100);
 // 受信ポーラーの周期（`NET_RX_POLL_INTERVAL`。#3742）と範囲は OS 非依存の `net_rx_poll` へ移した（#4030）。公開パスは再公開で保つ。
 pub use crate::net_rx_poll::NET_RX_POLL_INTERVAL;
-/// ioeventfd の通知スレッド（`IoEventPoller`）が 1 回の `poll(2)` で待つ上限（#3698・MVM-1・REPAIR-5）。値は暫定。
+/// ioeventfd の通知スレッド（`IoEventPoller`）が 1 回の `poll(2)` で待つ上限（#3698・#4160・MVM-1・CORE-7・REPAIR-5）。
 ///
-/// 通知は eventfd が発火した時点で `poll` が戻るので、この値は通知の遅延ではなく**停止要求の取り込みの遅延の上限**を決める
-/// （`StopSignal` を eventfd にしていないため、停止は各周回の先頭と `poll` の戻りで確かめる）。[`NET_RX_POLL_INTERVAL`] と同じ桁。
-/// アイドル時の起床は毎秒 100 回になる（CORE-7 の実測で問題になったら、停止要求で鳴る wake 用 eventfd へ置き換える。REPAIR-3）。
-pub const IOEVENT_WAIT_SLICE: Duration = Duration::from_millis(10);
+/// 通知も停止要求も eventfd（停止は wake 用 eventfd。`StopSignal::add_waker`）で `poll` が即時に戻るので、この値は通知や停止の
+/// 遅延ではなく、**wake が万一効かなかったときの後詰めの上限**である。アイドル時の起床は毎秒 1 回以下になる
+/// （10 ms 周期だった頃は毎秒約 100 回。判断と実測は `docs/design/microvm-ioevent-wake.md`）。
+/// `sys::poll_readable` の上限（60 s）以下で、[`RunningMicroVm`] の drop の待ち上限（5 s）より十分短い。
+pub const IOEVENT_IDLE_WAIT: Duration = Duration::from_secs(1);
+const _: () = assert!(IOEVENT_IDLE_WAIT.as_millis() < DROP_STOP_WAIT.as_millis());
+const _: () = assert!(IOEVENT_IDLE_WAIT.as_secs() <= 60);
 /// [`RunningMicroVm::stop`] の期限の上限（異常な値で実質無期限になるのを防ぐ。REPAIR-5）。
 pub const STOP_DEADLINE_MAX: Duration = Duration::from_secs(60);
 /// [`RunningMicroVm`] が `stop` を経ずに drop されたときに、vCPU スレッドの終了を待つ上限。
@@ -1901,6 +1944,9 @@ pub struct StopReport {
     pub vcpu_count: u32,
     /// 終了のきっかけになった vCPU の番号（`Requested` なら `None`）。`None` で理由が `Requested` 以外なら、vCPU 以外（virtio-net の受信ポーラー。#3742）がきっかけ。
     pub origin_vcpu: Option<u32>,
+    /// ioeventfd の無視・解除失敗の件数（VM ごと。観測専用。#4161・MVM-1・REPAIR-4）。報告は最後のスレッドが共有部（全 `IoEventFd` の
+    /// 解除）を落とした後に確定するので、解除失敗も含む最終値。
+    pub ioevent: IoEventCounts,
 }
 
 /// 1 回の `run_once` の結果の分類（純粋関数 [`classify_run`] の戻り値）。
@@ -1963,6 +2009,11 @@ trait VcpuLoopBody: Send + 'static {
     /// 補助スレッド（vCPU 番号なし）の終了ログの `op=`（固定語彙。#3698）。vCPU は使わない。
     fn aux_op(&self) -> &'static str {
         "microvm.aux_loop"
+    }
+    /// 停止要求で鳴らしてほしい wake 用 eventfd（`poll(2)` で待つ body だけが返す。#4160）。`spawn_loops_gated` がスレッド起動前に
+    /// `StopSignal::add_waker` へ登録する。所有は body 側で、`Weak` を返す。
+    fn stop_waker(&self) -> Option<Weak<EventFd>> {
+        None
     }
 }
 
@@ -2164,8 +2215,8 @@ fn poll_error(e: SysError) -> MicrovmError {
 /// - `StopAggregate` の参加者にして、停止・panic・drop・spawn 失敗の後始末と「`stop` が `Ok` で戻れば解放済み」の契約を vCPU と共有する。
 ///
 /// # 契約
-/// 1 歩ごとに、停止要求を確かめ、**共有部の lock を持たずに** [`IOEVENT_WAIT_SLICE`] を上限に `poll` し（停止要求の取り込みの遅延は
-/// この値が上限）、発火した eventfd を `consume` して（N 回の kick は 1 回に合算される。処理は 1 回でキューの未処理分を全部進める）、
+/// 1 歩ごとに、停止要求を確かめ、**共有部の lock を持たずに** events と wake 用 eventfd を `poll` し（停止要求は wake 用 eventfd で即時に届く。
+/// 後詰めの待ち上限は [`IOEVENT_IDLE_WAIT`]。#4160）、発火した eventfd を `consume` して（N 回の kick は 1 回に合算される。処理は 1 回でキューの未処理分を全部進める）、
 /// 共有部の lock → トランスポートの lock の順（vCPU の `dispatch_exit` と同じ）で [`IoEventTarget::complete_ioevent`] を呼ぶ。
 /// ゲストの値でテーブルを引かない: 発火元は登録時に固定した `(DeviceId, queue)`。受理条件（DRIVER_OK 前・FAILED など）は
 /// MMIO 経路と共有の `accept_queue_notify` で、満たさない通知は読み捨てる。リング破損・lock の poison・`poll` の失敗は
@@ -2182,6 +2233,10 @@ struct IoEventPoller<S: IoEventTarget, E: IoEventSource, W: IoEventWaiter = SysI
     ready: Vec<sys::PollReadiness>,
     shared: Arc<Mutex<S>>,
     waiter: W,
+    /// 受理条件を満たさず無視した通知の件数の記録先（#4161）。
+    tally: Arc<IoEventTally>,
+    /// 停止要求で鳴る wake 用 eventfd（`poll` の末尾の slot。#4160）。`StopSignal` には `Weak` で渡す。
+    wake: Arc<EventFd>,
 }
 
 /// 通知スレッドの `poll(2)` の継ぎ目。本番は [`sys::poll_readable`] へ委ねる [`SysIoEventWaiter`]、試験は結果を注入する。
@@ -2213,6 +2268,14 @@ impl IoEventWaiter for SysIoEventWaiter {
 fn ioevent_abnormal_log_line(device: u32, queue: u16, revents: i16) -> String {
     format!(
         "level=error op=microvm.ioevent outcome=error code={} reason=abnormal_revents device={device} queue={queue} revents={revents:#06x}",
+        MicrovmErrorCode::Internal.as_str()
+    )
+}
+
+/// wake 用 eventfd の異常 revents の構造化ログ 1 行（#4160）。
+fn ioevent_wake_abnormal_log_line(revents: i16) -> String {
+    format!(
+        "level=error op=microvm.ioevent outcome=error code={} reason=abnormal_revents target=wake revents={revents:#06x}",
         MicrovmErrorCode::Internal.as_str()
     )
 }
@@ -2249,27 +2312,32 @@ impl<S: IoEventTarget, E: IoEventSource> IoEventPoller<S, E, SysIoEventWaiter> {
     fn new(
         shared: Arc<Mutex<S>>,
         events: Vec<(DeviceId, u16, Arc<E>)>,
+        tally: Arc<IoEventTally>,
     ) -> Result<Self, MicrovmError> {
-        Self::with_waiter(shared, events, SysIoEventWaiter)
+        Self::with_waiter(shared, events, SysIoEventWaiter, tally)
     }
 }
 
 impl<S: IoEventTarget, E: IoEventSource, W: IoEventWaiter> IoEventPoller<S, E, W> {
-    /// `events` を検証して作る（0 件・`poll` の上限 [`sys::MAX_POLL_FDS`] 超過は `InvalidArgument`）。
+    /// `events` を検証して作る（0 件・wake 用の 1 本を足して `poll` の上限 [`sys::MAX_POLL_FDS`] 超過は `InvalidArgument`）。
     fn with_waiter(
         shared: Arc<Mutex<S>>,
         events: Vec<(DeviceId, u16, Arc<E>)>,
         waiter: W,
+        tally: Arc<IoEventTally>,
     ) -> Result<Self, MicrovmError> {
-        if events.is_empty() || events.len() > sys::MAX_POLL_FDS {
+        // wake 用の slot が 1 つ増えるので、events は `MAX_POLL_FDS - 1` 件まで。
+        if events.is_empty() || events.len() + 1 > sys::MAX_POLL_FDS {
             return Err(invalid("ioevent count out of range"));
         }
-        let ready = vec![sys::PollReadiness::Idle; events.len()];
+        let ready = vec![sys::PollReadiness::Idle; events.len() + 1];
         Ok(Self {
             events,
             ready,
             shared,
             waiter,
+            tally,
+            wake: Arc::new(EventFd::new()?),
         })
     }
 
@@ -2288,8 +2356,9 @@ impl<S: IoEventTarget, E: IoEventSource, W: IoEventWaiter> VcpuLoopBody for IoEv
         if stop.is_requested() {
             return LoopStep::Continue;
         }
-        let fds: Vec<BorrowedFd<'_>> = self.events.iter().map(|(_, _, e)| e.fd()).collect();
-        match self.waiter.wait(&fds, IOEVENT_WAIT_SLICE, &mut self.ready) {
+        let mut fds: Vec<BorrowedFd<'_>> = self.events.iter().map(|(_, _, e)| e.fd()).collect();
+        fds.push(self.wake.as_fd());
+        match self.waiter.wait(&fds, IOEVENT_IDLE_WAIT, &mut self.ready) {
             Ok(0) => return LoopStep::Continue,
             Ok(_) => {}
             Err(e) => return Self::fail(&poll_error(e)),
@@ -2304,6 +2373,20 @@ impl<S: IoEventTarget, E: IoEventSource, W: IoEventWaiter> VcpuLoopBody for IoEv
                 ));
                 return LoopStep::Finish(StopReason::Failed(MicrovmErrorCode::Internal));
             }
+        }
+        // wake slot は events の後ろ。異常は events と同じく fail-closed、可読なら読み捨てて残りを処理する
+        // （停止要求そのものは次の周回の先頭の `is_requested` で取り込む）。
+        match self.ready.get(self.events.len()) {
+            Some(sys::PollReadiness::Abnormal { revents }) => {
+                log_line(format_args!("{}", ioevent_wake_abnormal_log_line(*revents)));
+                return LoopStep::Finish(StopReason::Failed(MicrovmErrorCode::Internal));
+            }
+            Some(sys::PollReadiness::Readable) => {
+                if let Err(e) = self.wake.consume() {
+                    return Self::fail(&e);
+                }
+            }
+            _ => {}
         }
         for (i, (id, queue, event)) in self.events.iter().enumerate() {
             if self.ready.get(i) != Some(&sys::PollReadiness::Readable) {
@@ -2324,7 +2407,8 @@ impl<S: IoEventTarget, E: IoEventSource, W: IoEventWaiter> VcpuLoopBody for IoEv
                         return Self::fail(e);
                     }
                 }
-                Ok(None) => {}
+                // 受理条件を満たさず捨てた通知（DRIVER_OK 前・FAILED・ready でないキュー等）。受理判定 1 回を 1 件と数える（#4161）。
+                Ok(None) => self.tally.record_ignored(),
                 Err(e) => return Self::fail(&e),
             }
         }
@@ -2337,6 +2421,10 @@ impl<S: IoEventTarget, E: IoEventSource, W: IoEventWaiter> VcpuLoopBody for IoEv
 
     fn aux_op(&self) -> &'static str {
         "microvm.ioevent_loop"
+    }
+
+    fn stop_waker(&self) -> Option<Weak<EventFd>> {
+        Some(Arc::downgrade(&self.wake))
     }
 }
 
@@ -2351,6 +2439,10 @@ impl VcpuLoopBody for Box<dyn VcpuLoopBody> {
 
     fn aux_op(&self) -> &'static str {
         (**self).aux_op()
+    }
+
+    fn stop_waker(&self) -> Option<Weak<EventFd>> {
+        (**self).stop_waker()
     }
 }
 
@@ -2391,6 +2483,8 @@ struct StopAggregate {
     stop: Arc<StopSignal>,
     started: Instant,
     vcpu_count: u32,
+    /// ioeventfd の件数。報告の確定時（全 body の drop 後。`AggState` の mutex 経由で他スレッドの加算が見える）に写しを取る（#4161）。
+    ioevent: Arc<IoEventTally>,
 }
 
 fn add_stats(a: &mut RunStats, b: &RunStats) {
@@ -2476,6 +2570,7 @@ impl StopAggregate {
             elapsed,
             vcpu_count: self.vcpu_count,
             origin_vcpu,
+            ioevent: self.ioevent.snapshot(),
         };
         self.exit.complete(report);
         // 受け手（RunningMicroVm）が既に無ければ送信は失敗するが、解放は済んでいるので捨てる。
@@ -2663,17 +2758,30 @@ impl Drop for GateRelease {
 type VcpuJob = Box<dyn FnOnce() + Send + 'static>;
 
 /// 各 `body` を専用スレッド（`microvm-vcpu-<index>`）で駆動して [`RunningMicroVm`] を返す。
+#[cfg(test)]
 fn spawn_loops<T: VcpuLoopBody>(
     bodies: Vec<T>,
     aux: Vec<AuxThread>,
     started: Instant,
     serial: SerialConsole,
 ) -> Result<RunningMicroVm, MicrovmError> {
+    spawn_loops_observed(bodies, aux, started, serial, Arc::default())
+}
+
+/// [`spawn_loops_gated`] を本番のゲート待ち上限と実スレッド生成で呼ぶ本番の入口。`ioevent` は VM ごとの件数（`start_inner` が渡す。#4161）。
+fn spawn_loops_observed<T: VcpuLoopBody>(
+    bodies: Vec<T>,
+    aux: Vec<AuxThread>,
+    started: Instant,
+    serial: SerialConsole,
+    ioevent: Arc<IoEventTally>,
+) -> Result<RunningMicroVm, MicrovmError> {
     spawn_loops_gated(
         bodies,
         aux,
         started,
         serial,
+        ioevent,
         START_GATE_WAIT,
         |name, job| thread::Builder::new().name(name).spawn(job),
     )
@@ -2691,7 +2799,15 @@ where
     T: VcpuLoopBody,
     S: FnMut(String, VcpuJob) -> std::io::Result<JoinHandle<()>>,
 {
-    spawn_loops_gated(bodies, Vec::new(), started, serial, START_GATE_WAIT, spawn)
+    spawn_loops_gated(
+        bodies,
+        Vec::new(),
+        started,
+        serial,
+        Arc::default(),
+        START_GATE_WAIT,
+        spawn,
+    )
 }
 
 /// [`spawn_loops_with`] の補助スレッドつき版（受信ポーラーの試験用）。
@@ -2707,7 +2823,15 @@ where
     T: VcpuLoopBody,
     S: FnMut(String, VcpuJob) -> std::io::Result<JoinHandle<()>>,
 {
-    spawn_loops_gated(bodies, aux, started, serial, START_GATE_WAIT, spawn)
+    spawn_loops_gated(
+        bodies,
+        aux,
+        started,
+        serial,
+        Arc::default(),
+        START_GATE_WAIT,
+        spawn,
+    )
 }
 
 /// [`spawn_loops`] の本体。`spawn` はスレッド生成（試験でだけ失敗を注入する）。`gate_wait` は起動ゲートの待ち上限。
@@ -2722,6 +2846,7 @@ fn spawn_loops_gated<T, S>(
     aux: Vec<AuxThread>,
     started: Instant,
     serial: SerialConsole,
+    ioevent: Arc<IoEventTally>,
     gate_wait: Duration,
     mut spawn: S,
 ) -> Result<RunningMicroVm, MicrovmError>
@@ -2745,6 +2870,7 @@ where
         stop: Arc::clone(&stop),
         started,
         vcpu_count: count,
+        ioevent: Arc::clone(&ioevent),
     });
     let gate = Arc::new(StartGate::new(gate_wait));
     let mut release = GateRelease {
@@ -2761,6 +2887,11 @@ where
     let aux_entries = aux.into_iter().map(|a| (a.name.to_string(), None, a.body));
     for (name, index, body) in vcpu_entries.chain(aux_entries) {
         let thread_gate = Arc::clone(&gate);
+        // wake 用 eventfd はスレッド起動の前に登録する。登録前に来た停止要求は `vcpu_loop` 先頭のフラグ確認で、
+        // 登録後に来た要求は `request` が鳴らす eventfd で捕まる（取りこぼさない。#4160）。
+        if let Some(w) = body.stop_waker() {
+            stop.add_waker(w);
+        }
         let guard = VcpuThreadGuard::new(Arc::clone(&agg), index);
         // panic の unwind でも計上を残す。`body` は `vcpu_loop` のフレームが所有するため、unwind では
         // `body` の drop がこの guard の drop より先に走り、「解放後に計上」の順序が正常・panic の両経路で成り立つ。
@@ -2805,6 +2936,7 @@ where
         done_rx: rx,
         handles,
         serial,
+        ioevent,
     })
 }
 
@@ -2827,9 +2959,15 @@ pub struct RunningMicroVm {
     done_rx: mpsc::Receiver<StopReport>,
     handles: Vec<JoinHandle<()>>,
     serial: SerialConsole,
+    ioevent: Arc<IoEventTally>,
 }
 
 impl RunningMicroVm {
+    /// ioeventfd の無視・解除失敗の現在の件数（実行中の写し。#4161）。最終値（解除失敗を含む）は [`StopReport::ioevent`] を正とする。
+    pub fn ioevent_counts(&self) -> IoEventCounts {
+        self.ioevent.snapshot()
+    }
+
     /// COM1 の UART の出力を取り出すハンドル（clone）。
     ///
     /// vCPU スレッドが `MicroVm` を drop した後も clone がバッファを保持する。[`RunningMicroVm::stop`] は自身を
@@ -3150,6 +3288,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
             vgic,
             memory,
             vm,
+            ioevent_tally,
             ..
         } = self;
         let has_net = !devices.net.is_empty();
@@ -3183,14 +3322,15 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
             });
         }
         if !ioevents.is_empty() {
-            let poller = IoEventPoller::new(Arc::clone(&shared), ioevents)?;
+            let poller =
+                IoEventPoller::new(Arc::clone(&shared), ioevents, Arc::clone(&ioevent_tally))?;
             aux.push(AuxThread {
                 name: "microvm-ioevent",
                 body: Box::new(poller),
             });
         }
         drop(shared);
-        spawn_loops(workers, aux, started, serial)
+        spawn_loops_observed(workers, aux, started, serial, ioevent_tally)
     }
 }
 
@@ -3681,6 +3821,7 @@ mod lifecycle_tests {
             elapsed: Duration::from_millis(1),
             vcpu_count: 1,
             origin_vcpu: None,
+            ioevent: IoEventCounts::default(),
         };
         cell.complete(report);
         cell.mark_abnormal_if_running();
@@ -4021,6 +4162,7 @@ mod lifecycle_tests {
             Vec::new(),
             Instant::now(),
             SerialConsole::new(),
+            Arc::default(),
             Duration::from_millis(100),
             |name: String, job: VcpuJob| {
                 if name == "microvm-vcpu-1" {
@@ -5712,7 +5854,8 @@ mod ioevent_tests {
     type Events = Vec<(DeviceId, u16, Arc<EventFd>)>;
 
     fn start(shared: &Arc<Mutex<RecTarget>>, events: &Events) -> RunningMicroVm {
-        let poller = IoEventPoller::new(Arc::clone(shared), events.clone()).unwrap();
+        let poller =
+            IoEventPoller::new(Arc::clone(shared), events.clone(), Arc::default()).unwrap();
         spawn_loops(
             vec![Idle(Arc::new(AtomicUsize::new(0)))],
             vec![AuxThread {
@@ -5723,6 +5866,80 @@ mod ioevent_tests {
             SerialConsole::new(),
         )
         .unwrap()
+    }
+
+    /// 偽の ioeventfd 層。`fail_unbind` なら drop で解除失敗を VM ごとの件数へ数える（本番の `IoEventFd::drop` の失敗を模す）。
+    struct UnbindFailing {
+        ev: EventFd,
+        fail_unbind: bool,
+        tally: Arc<IoEventTally>,
+    }
+
+    impl IoEventSource for UnbindFailing {
+        fn fd(&self) -> BorrowedFd<'_> {
+            self.ev.as_fd()
+        }
+        fn take(&self) -> Result<u64, MicrovmError> {
+            self.ev.consume()
+        }
+    }
+
+    impl Drop for UnbindFailing {
+        fn drop(&mut self) {
+            if self.fail_unbind {
+                self.tally.record_unbind_failed();
+            }
+        }
+    }
+
+    /// MVM-1・REPAIR-4・#4161: 無視 2 件・解除失敗 1 件が `StopReport::ioevent` に (2, 1) で届く。
+    #[test]
+    fn mvm1_4161_ioevent_counts_reach_stop_report() {
+        let d = ids(1);
+        let tally = Arc::new(IoEventTally::default());
+        let mk = |fail_unbind| {
+            Arc::new(UnbindFailing {
+                ev: EventFd::new().unwrap(),
+                fail_unbind,
+                tally: Arc::clone(&tally),
+            })
+        };
+        let events = vec![(d[0], 0, mk(false)), (d[0], 1, mk(true))];
+        let (a, b) = (Arc::clone(&events[0].2), Arc::clone(&events[1].2));
+        let shared = Arc::new(Mutex::new(RecTarget::default()));
+        let poller = IoEventPoller::new(Arc::clone(&shared), events, Arc::clone(&tally)).unwrap();
+        let running = spawn_loops_observed(
+            vec![Idle(Arc::new(AtomicUsize::new(0)))],
+            vec![AuxThread {
+                name: "microvm-ioevent",
+                body: Box::new(poller),
+            }],
+            Instant::now(),
+            SerialConsole::new(),
+            Arc::clone(&tally),
+        )
+        .unwrap();
+        a.ev.signal().unwrap();
+        b.ev.signal().unwrap();
+        drop((a, b));
+        assert!(wait_for(Duration::from_secs(5), || running
+            .ioevent_counts()
+            .ignored
+            == 2));
+        let report = running.stop(Duration::from_secs(5)).unwrap();
+        assert_eq!(report.ioevent, IoEventCounts::new(2, 1));
+        assert_eq!(shared.lock().unwrap().calls.len(), 2);
+    }
+
+    /// MVM-1・REPAIR-4・#4161: signal せずに起こされた（`take() == 0`）場合は無視として数えない。
+    #[test]
+    fn mvm1_4161_zero_take_wakeup_is_not_counted() {
+        let (mut poller, shared, _calls) = scripted(vec![sys::PollReadiness::Readable]);
+        let tally = Arc::clone(&poller.tally);
+        let stop = StopSignal::new();
+        let _ = poller.step(Duration::from_millis(1), &stop);
+        assert!(shared.lock().unwrap().calls.is_empty());
+        assert_eq!(tally.snapshot(), IoEventCounts::default());
     }
 
     /// MVM-1・REPAIR-5・#3698: 発火した eventfd の `(id, queue)` だけで 1 回呼ばれる（3 回の kick は 1 回に合算）。何も来なければ呼ばれない。
@@ -5778,9 +5995,10 @@ mod ioevent_tests {
         assert!(shared.lock().unwrap().calls.is_empty());
     }
 
-    /// MVM-1・REPAIR-5・#3698: 何も来なくても、停止要求から [`IOEVENT_WAIT_SLICE`] の数倍以内に止まる。
+    /// MVM-1・REPAIR-5・#3698・#4160: 何も来なくても、停止要求は wake 用 eventfd で届き、後詰めの待ち（[`IOEVENT_IDLE_WAIT`]）の
+    /// 半分も待たずに止まる（10 ms 周期の頃の「数倍以内」ではなく、wake の経路でしか満たせない上限）。
     #[test]
-    fn mvm1_3698_poller_stops_within_a_few_slices() {
+    fn mvm1_3698_poller_stops_without_waiting_idle_timeout() {
         let d = ids(1);
         let events: Events = vec![(d[0], 0, Arc::new(EventFd::new().unwrap()))];
         let shared = Arc::new(Mutex::new(RecTarget::default()));
@@ -5788,9 +6006,156 @@ mod ioevent_tests {
         std::thread::sleep(Duration::from_millis(50));
         let t0 = Instant::now();
         let report = running.stop(Duration::from_millis(500)).unwrap();
-        assert!(t0.elapsed() < IOEVENT_WAIT_SLICE * 20, "{:?}", t0.elapsed());
+        assert!(t0.elapsed() < IOEVENT_IDLE_WAIT / 2, "{:?}", t0.elapsed());
         assert_eq!(report.reason, StopReason::Requested);
         assert_eq!(Arc::strong_count(&shared), 1);
+    }
+
+    /// MVM-1・CORE-7・REPAIR-5・#4160: アイドル時の `poll` の待ちは `IOEVENT_IDLE_WAIT`（1 s）で、fd は events + wake の 1 本。
+    #[test]
+    fn mvm1_4160_idle_wait_is_long_and_includes_wake_fd() {
+        assert_eq!(IOEVENT_IDLE_WAIT, Duration::from_secs(1));
+        let (mut poller, _shared, calls) = scripted(vec![sys::PollReadiness::Idle; 3]);
+        let fd_counts = Arc::clone(&poller.waiter.fd_counts);
+        let stop = StopSignal::new();
+        assert!(matches!(
+            poller.step(Duration::from_millis(1), &stop),
+            LoopStep::Continue
+        ));
+        assert_eq!(*calls.lock().unwrap(), vec![IOEVENT_IDLE_WAIT]);
+        assert_eq!(*fd_counts.lock().unwrap(), vec![4]);
+    }
+
+    /// MVM-1・REPAIR-5・#4160: 実 `poll` で待っている `step` は、`StopSignal::request` の wake で即時に `Continue` で戻り、通知は dispatch しない。
+    #[test]
+    fn mvm1_4160_request_wakes_step_immediately() {
+        let d = ids(1);
+        let events: Events = vec![(d[0], 0, Arc::new(EventFd::new().unwrap()))];
+        let shared = Arc::new(Mutex::new(RecTarget::default()));
+        let mut poller = IoEventPoller::new(Arc::clone(&shared), events, Arc::default()).unwrap();
+        let stop = Arc::new(StopSignal::new());
+        stop.add_waker(poller.stop_waker().unwrap());
+        let (tx, rx) = mpsc::channel();
+        let stop2 = Arc::clone(&stop);
+        let h = std::thread::spawn(move || {
+            let t0 = Instant::now();
+            // 戻った直後の停止確認はせず、1 歩だけ実 poll で待つ。
+            let step = poller.step(Duration::from_millis(1), &stop2);
+            tx.send((t0.elapsed(), matches!(step, LoopStep::Continue)))
+                .unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        stop.request();
+        let (elapsed, is_continue) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        h.join().unwrap();
+        assert!(is_continue);
+        assert!(elapsed < IOEVENT_IDLE_WAIT / 2, "{elapsed:?}");
+        assert!(shared.lock().unwrap().calls.is_empty());
+    }
+
+    /// MVM-1・REPAIR-5・#4160: `spawn_loops`（`Box<dyn VcpuLoopBody>` 越し）でも wake が登録され、`stop` が後詰めの待ちを待たずに終わる。
+    /// 戻った時点で wake 用 eventfd も解放済み（`StopSignal` は `Weak` しか持たない）。
+    #[test]
+    fn mvm1_4160_spawn_loops_registers_wake_and_releases_it() {
+        let d = ids(1);
+        let events: Events = vec![(d[0], 0, Arc::new(EventFd::new().unwrap()))];
+        let shared = Arc::new(Mutex::new(RecTarget::default()));
+        let poller = IoEventPoller::new(Arc::clone(&shared), events, Arc::default()).unwrap();
+        let wake = poller.stop_waker().unwrap();
+        let running = spawn_loops(
+            vec![Idle(Arc::new(AtomicUsize::new(0)))],
+            vec![AuxThread {
+                name: "microvm-ioevent",
+                body: Box::new(poller),
+            }],
+            Instant::now(),
+            SerialConsole::new(),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        let t0 = Instant::now();
+        let report = running.stop(Duration::from_secs(2)).unwrap();
+        assert!(t0.elapsed() < IOEVENT_IDLE_WAIT / 2, "{:?}", t0.elapsed());
+        assert_eq!(report.reason, StopReason::Requested);
+        assert!(wake.upgrade().is_none());
+        assert_eq!(Arc::strong_count(&shared), 1);
+    }
+
+    /// MVM-1・REPAIR-5・#4160: wake slot の異常 revents も fail-closed で `Finish(Failed(Internal))`。通知は dispatch しない。
+    #[test]
+    fn mvm1_4160_wake_slot_abnormal_revents_finish() {
+        let (mut poller, shared, calls) = scripted(vec![sys::PollReadiness::Readable]);
+        poller.waiter.wake_result = sys::PollReadiness::Abnormal {
+            revents: sys::consts::POLLERR,
+        };
+        poller.events[0].2.signal().unwrap();
+        let stop = StopSignal::new();
+        let step = poller.step(Duration::from_millis(1), &stop);
+        assert!(matches!(
+            step,
+            LoopStep::Finish(StopReason::Failed(MicrovmErrorCode::Internal))
+        ));
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert!(shared.lock().unwrap().calls.is_empty());
+    }
+
+    /// MVM-1・REPAIR-4・#4160: wake slot の異常のログ行は既存の `op=microvm.ioevent` / `code=INTERNAL` に揃い、`target=wake` で区別する。
+    #[test]
+    fn mvm1_4160_wake_abnormal_log_line_is_stable() {
+        assert_eq!(
+            ioevent_wake_abnormal_log_line(8),
+            "level=error op=microvm.ioevent outcome=error code=INTERNAL reason=abnormal_revents target=wake revents=0x0008"
+        );
+    }
+
+    /// 名前が `name` のスレッドの自発的コンテキストスイッチ数（`/proc/self/task/<tid>/status`）。無ければ `None`。
+    fn voluntary_switches(name: &str) -> Option<u64> {
+        for ent in std::fs::read_dir("/proc/self/task").ok()?.flatten() {
+            let dir = ent.path();
+            // 列挙後に無関係なスレッドが終了すると comm が ENOENT になる。対象特定前の失敗は次の tid へ進める。
+            let Ok(comm) = std::fs::read_to_string(dir.join("comm")) else {
+                continue;
+            };
+            if comm.trim_end() != name {
+                continue;
+            }
+            let status = std::fs::read_to_string(dir.join("status")).ok()?;
+            return status
+                .lines()
+                .find_map(|l| l.strip_prefix("voluntary_ctxt_switches:"))
+                .and_then(|v| v.trim().parse().ok());
+        }
+        None
+    }
+
+    /// MVM-1・CORE-7・REPAIR-12・#4160: アイドル時の通知スレッドの起床回数。500 ms で 3 回以下（10 ms 周期なら約 50 回）。
+    /// `/proc` が読めない環境は skip せず失敗にする（fail-closed）。
+    #[test]
+    fn mvm1_4160_idle_poller_wakes_rarely() {
+        let d = ids(1);
+        let events: Events = vec![(d[0], 0, Arc::new(EventFd::new().unwrap()))];
+        let shared = Arc::new(Mutex::new(RecTarget::default()));
+        let poller = IoEventPoller::new(Arc::clone(&shared), events, Arc::default()).unwrap();
+        // comm は 15 文字まで。他の試験のスレッドと名前が衝突しない固有名にする。
+        let running = spawn_loops(
+            vec![Idle(Arc::new(AtomicUsize::new(0)))],
+            vec![AuxThread {
+                name: "mvm4160-idle",
+                body: Box::new(poller),
+            }],
+            Instant::now(),
+            SerialConsole::new(),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let before =
+            voluntary_switches("mvm4160-idle").expect("/proc thread status must be readable");
+        std::thread::sleep(Duration::from_millis(500));
+        let after =
+            voluntary_switches("mvm4160-idle").expect("/proc thread status must be readable");
+        eprintln!("mvm4160 idle wakeups in 500ms: {}", after - before);
+        running.stop(Duration::from_secs(2)).unwrap();
+        assert!(after - before <= 3, "{} wakeups", after - before);
     }
 
     /// MVM-1・REPAIR-5・#3698: 対象の失敗は fail-closed で全スレッドを止め、きっかけは vCPU 以外として報告される。
@@ -5819,20 +6184,30 @@ mod ioevent_tests {
     /// 毎回同じ結果を返し、呼び出し回数と渡された timeout を記録する注入用の waiter（#4101）。
     struct ScriptedWaiter {
         result: Vec<sys::PollReadiness>,
+        wake_result: sys::PollReadiness,
         calls: Arc<Mutex<Vec<Duration>>>,
+        fd_counts: Arc<Mutex<Vec<usize>>>,
     }
 
     impl IoEventWaiter for ScriptedWaiter {
         fn wait(
             &mut self,
-            _fds: &[BorrowedFd<'_>],
+            fds: &[BorrowedFd<'_>],
             timeout: Duration,
             out: &mut [sys::PollReadiness],
         ) -> Result<usize, sys::SysError> {
             self.calls.lock().unwrap().push(timeout);
-            out.copy_from_slice(&self.result);
-            Ok(self
-                .result
+            self.fd_counts.lock().unwrap().push(fds.len());
+            // 末尾は wake 用 slot。`result` は events 分で、足りない分は `Idle`（`wake_result` があればそれ）。
+            let n = out.len();
+            for (i, o) in out.iter_mut().enumerate() {
+                *o = if i + 1 == n {
+                    self.wake_result
+                } else {
+                    self.result[i]
+                };
+            }
+            Ok(out
                 .iter()
                 .filter(|r| **r != sys::PollReadiness::Idle)
                 .count())
@@ -5855,13 +6230,17 @@ mod ioevent_tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let waiter = ScriptedWaiter {
             result,
+            wake_result: sys::PollReadiness::Idle,
             calls: Arc::clone(&calls),
+            fd_counts: Arc::new(Mutex::new(Vec::new())),
         };
-        let poller = IoEventPoller::with_waiter(Arc::clone(&shared), events, waiter).unwrap();
+        let poller =
+            IoEventPoller::with_waiter(Arc::clone(&shared), events, waiter, Arc::default())
+                .unwrap();
         (poller, shared, calls)
     }
 
-    /// MVM-1・REPAIR-5・#4101: 異常 revents が返り続けても、1 回の待ち（`IOEVENT_WAIT_SLICE`）で `Finish(Failed(Internal))` になり、
+    /// MVM-1・REPAIR-5・#4101: 異常 revents が返り続けても、1 回の待ち（`IOEVENT_IDLE_WAIT`）で `Finish(Failed(Internal))` になり、
     /// 空回りしない（waiter は 1 回しか呼ばれず、`take` も `complete_ioevent` も走らない）。
     #[test]
     fn mvm1_4101_abnormal_revents_finish_after_one_wait() {
@@ -5882,7 +6261,7 @@ mod ioevent_tests {
                 ),
                 "{revents:#x}"
             );
-            assert_eq!(*calls.lock().unwrap(), vec![IOEVENT_WAIT_SLICE]);
+            assert_eq!(*calls.lock().unwrap(), vec![IOEVENT_IDLE_WAIT]);
             assert!(shared.lock().unwrap().calls.is_empty());
         }
     }
@@ -5953,7 +6332,7 @@ mod ioevent_tests {
         );
     }
 
-    /// REPAIR-5・#3698: poller の対象数は 1..=`MAX_POLL_FDS`、範囲外は `InvalidArgument`。
+    /// REPAIR-5・#3698・#4160: poller の対象数は 1..=`MAX_POLL_FDS - 1`（wake 用の 1 本を含めて上限）、範囲外は `InvalidArgument`。
     #[test]
     fn mvm1_3698_poller_event_count_is_validated() {
         let d = ids(1);
@@ -5963,16 +6342,24 @@ mod ioevent_tests {
                 .map(|_| (d[0], 0, Arc::new(EventFd::new().unwrap())))
                 .collect()
         };
-        for bad in [0, sys::MAX_POLL_FDS + 1] {
-            let e = IoEventPoller::new(Arc::clone(&shared), mk(bad))
+        // wake 用の 1 本を足すので、events の上限は `MAX_POLL_FDS - 1`（#4160）。
+        for bad in [0, sys::MAX_POLL_FDS] {
+            let e = IoEventPoller::new(Arc::clone(&shared), mk(bad), Arc::default())
                 .err()
                 .unwrap();
             assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument, "{bad}");
         }
-        assert!(IoEventPoller::new(Arc::clone(&shared), mk(1)).is_ok());
-        assert!(IoEventPoller::new(Arc::clone(&shared), mk(sys::MAX_POLL_FDS)).is_ok());
+        assert!(IoEventPoller::new(Arc::clone(&shared), mk(1), Arc::default()).is_ok());
+        assert!(
+            IoEventPoller::new(
+                Arc::clone(&shared),
+                mk(sys::MAX_POLL_FDS - 1),
+                Arc::default()
+            )
+            .is_ok()
+        );
         // 全構成の上限（8 台 × 最大 2 キュー）は poll の上限に収まる。
-        const _: () = assert!(MAX_VIRTIO_DEVICES * 2 <= sys::MAX_POLL_FDS);
+        const _: () = assert!(MAX_VIRTIO_DEVICES * 2 < sys::MAX_POLL_FDS);
     }
 }
 

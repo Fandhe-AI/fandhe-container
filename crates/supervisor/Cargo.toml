@@ -318,3 +318,11 @@ harness = false
 name = "stream_exec_real"
 path = "tests/stream_exec_real.rs"
 harness = false
+
+# 要求元（plugin-cri）の異常終了を stream-exec の helper が検知して exec の worker を回収し早く終わることの結合試験
+# （SUP-6・SEC-1・REPAIR-5・#4166）。fork は単一スレッドの呼び出し元を要求するため harness = false。root・実コンテナ
+# 不要で、既定のテスト集合で実行する（依存は不変。exec-test-support は自己参照の dev-dependency で有効になる）。
+[[test]]
+name = "exec_requester_cancel"
+path = "tests/exec_requester_cancel.rs"
+harness = false

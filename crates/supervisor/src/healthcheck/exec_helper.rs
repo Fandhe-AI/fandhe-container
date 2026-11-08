@@ -395,6 +395,7 @@ fn execute(args: &HealthExecArgs) -> HealthExecLine {
             launch_env: &launch_env,
             stdio: crate::exec::ExecStdio::combined(stdout.as_fd()),
             on_created: Some(&notify),
+            cancel: None,
         },
     );
     line_from_result(result)

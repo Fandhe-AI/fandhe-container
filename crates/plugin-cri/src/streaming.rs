@@ -72,8 +72,8 @@ pub fn production_streaming_config() -> StreamingConfig {
 /// 本番の Attach の backend と、それが対話（stdin・tty・resize）できるかの宣言（#4078）。
 ///
 /// backend と読み取り専用の印の取り違え（対話できない backend を対話として宣言する等）を型で表せなくするため、
-/// 構築口を backend の型で絞る。`main.rs` が Linux では [`ProductionAttach::interactive`]、非 Linux では
-/// [`ProductionAttach::read_only`] で作る。
+/// 構築口を backend の型で絞る。`main.rs` が Linux では `ProductionAttach::interactive`、非 Linux では
+/// `ProductionAttach::read_only` で作る。
 pub struct ProductionAttach {
     backend: Arc<dyn AttachBackend>,
     interactive: bool,

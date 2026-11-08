@@ -53,7 +53,7 @@
 //!   在庫は `production()`（unix）では永続の `PersistentImageStore`（`<state_root>/.cri/images` の oci の ImageStore の
 //!   root 直下へ記録を保存し、起動時に読み戻す。再起動後も同じ ID・タグ・digest・サイズを返す。#4176・
 //!   `crate::image_inventory`）。注入（`new`・`with_recorder`）と非 unix は cri の `InMemoryImageStore`（プロセス内だけ）。
-//!   oci の在庫との突き合わせ・`RemoveImage` は #4177、PullImage の取り消しの窓は #4178（REPAIR-3）。
+//!   `RemoveImage` は #4177 で在庫の記録を外す実装済み（blob・rootfs は残し #471 系で回収）、oci の在庫との突き合わせは追跡 issue 未起票、PullImage の取り消しの窓は #4178（REPAIR-3）。
 //!   展開の所有者写像は既定の `Keep` + `Strip` のまま
 //!   （#2241・#2315・#482 が前提）。展開・pull・起動時の回収の計装（`OciOpRecorder`）は `CoreOciRecorder` で
 //!   oci 専用の `OpRecorder`（[`CriPluginBackends::oci_op_recorder`]）へ `oci.*` の名前で記録する（REPAIR-4・#2900）。

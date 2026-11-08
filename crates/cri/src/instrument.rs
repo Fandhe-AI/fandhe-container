@@ -14,7 +14,7 @@
 //!
 //! - core の `OpRecorder` との接続: 本番経路は plugin-cri の `CoreCriRecorder` を注入済み（TASK-108）。
 //!   記録先を注入しないコンストラクタの既定は [`NoopCriOpRecorder`] で、何も出力されない
-//! - `RunPodSandbox`・`StopPodSandbox`・`RemovePodSandbox`・`PodSandboxStatus`・`ListPodSandbox`・`CreateContainer`・`StartContainer`・`StopContainer`・`RemoveContainer`・`ListContainers`・`ContainerStatus`・`Status`・`Version`・`UpdateRuntimeConfig`・`ListImages`・`ImageStatus`・`PullImage`・`RecordStoreLoad` 以外の RPC の種別は、RPC の実装（TASK-58.4 以降・TASK-61.3 以降）と一緒に [`CriOpKind`] へ追加する
+//! - `RunPodSandbox`・`StopPodSandbox`・`RemovePodSandbox`・`PodSandboxStatus`・`ListPodSandbox`・`CreateContainer`・`StartContainer`・`StopContainer`・`RemoveContainer`・`ListContainers`・`ContainerStatus`・`Status`・`Version`・`UpdateRuntimeConfig`・`ListImages`・`ImageStatus`・`PullImage`・`RemoveImage`・`RecordStoreLoad` 以外の RPC の種別は、RPC の実装（TASK-58.4 以降・TASK-61.3 以降）と一緒に [`CriOpKind`] へ追加する
 //!
 //! # 機微情報
 //!
@@ -73,6 +73,8 @@ pub enum CriOpKind {
     ImageStatus,
     /// `ImageService.PullImage` 1 回（レジストリからのイメージ取り込み。CRI-4・OCI-1・TASK-61.3）。
     PullImage,
+    /// `ImageService.RemoveImage` 1 回（在庫の記録を外す。CRI-1・CRI-2・#4177）。
+    RemoveImage,
     /// 起動時の記録の再採用の 1 件（記録ストアからの読み込みと復号。CRI-2・REPAIR-4・#2935）。
     RecordStoreLoad,
     /// shim v2 の ttrpc 要求の dispatch 1 回（サービス呼び出しの結果。CRI-5・TASK-62.1・MS-7・REPAIR-4）。
@@ -131,6 +133,7 @@ impl CriOpKind {
             CriOpKind::ListImages => "cri.list_images",
             CriOpKind::ImageStatus => "cri.image_status",
             CriOpKind::PullImage => "cri.pull_image",
+            CriOpKind::RemoveImage => "cri.remove_image",
             CriOpKind::RecordStoreLoad => "cri.record_store_load",
             CriOpKind::ShimV2Dispatch => "cri.shim_v2.dispatch",
             CriOpKind::ShimV2Frame => "cri.shim_v2.frame",
@@ -456,7 +459,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    const ALL_KINDS: [CriOpKind; 32] = [
+    const ALL_KINDS: [CriOpKind; 33] = [
         CriOpKind::ContainerExitObserve,
         CriOpKind::RunPodSandbox,
         CriOpKind::StopPodSandbox,
@@ -475,6 +478,7 @@ mod tests {
         CriOpKind::ListImages,
         CriOpKind::ImageStatus,
         CriOpKind::PullImage,
+        CriOpKind::RemoveImage,
         CriOpKind::RecordStoreLoad,
         CriOpKind::ShimV2Start,
         CriOpKind::ShimV2Delete,
@@ -581,6 +585,7 @@ mod tests {
         assert_eq!(CriOpKind::ListImages.as_str(), "cri.list_images");
         assert_eq!(CriOpKind::ImageStatus.as_str(), "cri.image_status");
         assert_eq!(CriOpKind::PullImage.as_str(), "cri.pull_image");
+        assert_eq!(CriOpKind::RemoveImage.as_str(), "cri.remove_image");
     }
 
     /// REPAIR-4: 操作名は core の `OpName::new` と同じ規則に収まる（cri は core に依存できないため

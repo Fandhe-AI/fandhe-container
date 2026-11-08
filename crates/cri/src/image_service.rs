@@ -5,7 +5,8 @@
 //!
 //! # 未実装範囲（REPAIR-3）
 //!
-//! - 実装済みなのは `ListImages`・`ImageStatus`・`PullImage`（TASK-61.3）。`RemoveImage`・`StreamImages`・
+//! - 実装済みなのは `ListImages`・`ImageStatus`・`PullImage`（TASK-61.3）・`RemoveImage`（#4177。在庫の記録を
+//!   外すだけで、blob・展開済み rootfs は消さない。回収は #471 系）。`StreamImages`・
 //!   `ImageFsInfo` は `Unimplemented` を返す。`PullImage` は [`ImagePuller`] を注入されたときだけ動き、
 //!   未設定なら従来どおり `Unimplemented`。取り込み手順と限界は [`crate::image_pull`] を参照。RPC が期限切れ・
 //!   取り消しで破棄されたときは番人が旗を立て、worker は次の確認点で止まる（#2967・REPAIR-5）
@@ -309,6 +310,39 @@ pub trait ImageStore: Send + Sync {
     fn upsert(&self, _record: ImageRecord) -> Result<(), ImageStoreError> {
         Err(ImageStoreError::ReadOnly)
     }
+
+    /// 参照（[`Self::get`] と同じ解決規則）に当たる 1 件を、全タグ・全 digest ごと在庫から外す（`RemoveImage`。#4177・CRI-1・CRI-2）。
+    ///
+    /// 解決と削除は store 自身の排他の下で行う（照会と削除の間に割り込ませない）。blob・展開済み rootfs は消さない
+    /// （回収は #471 系）。該当が無ければ [`RemoveOutcome::Absent`]（冪等）。有界時間で戻ること（REPAIR-5）。
+    /// 既定実装は書き込み非対応で [`ImageStoreError::ReadOnly`] を返す。
+    fn remove(&self, _reference: &str) -> Result<RemoveOutcome, ImageStoreError> {
+        Err(ImageStoreError::ReadOnly)
+    }
+}
+
+/// [`ImageStore::remove`] の結果（真偽値にせず、将来の拡張に備える。#4177）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RemoveOutcome {
+    /// 記録を外した（外した記録の ID）。
+    Removed {
+        /// 外したイメージ ID。
+        id: String,
+    },
+    /// 該当する記録が無かった（`RemoveImage` では冪等の成功に写す）。
+    Absent,
+}
+
+/// 参照を 1 件の ID に解決する（id 完全一致を優先し、なければ ID 昇順で最初の一致。`get` と `remove` が共有）。
+fn resolve_id(images: &BTreeMap<String, ImageRecord>, reference: &str) -> Option<String> {
+    if images.contains_key(reference) {
+        return Some(reference.to_owned());
+    }
+    images
+        .values()
+        .find(|r| r.matches(reference))
+        .map(|r| r.id.clone())
 }
 
 /// プロセス内メモリの実装（試験・注入用。本番の永続実装は plugin-cri の `PersistentImageStore`。#4176）。
@@ -352,10 +386,18 @@ impl ImageStore for InMemoryImageStore {
 
     fn get(&self, reference: &str) -> Result<Option<ImageRecord>, ImageStoreError> {
         let images = self.images.lock().map_err(|_| ImageStoreError::Poisoned)?;
-        if let Some(exact) = images.get(reference) {
-            return Ok(Some(exact.clone()));
-        }
-        Ok(images.values().find(|r| r.matches(reference)).cloned())
+        Ok(resolve_id(&images, reference).and_then(|id| images.get(&id).cloned()))
+    }
+
+    fn remove(&self, reference: &str) -> Result<RemoveOutcome, ImageStoreError> {
+        let mut images = self.images.lock().map_err(|_| ImageStoreError::Poisoned)?;
+        Ok(match resolve_id(&images, reference) {
+            Some(id) => {
+                images.remove(&id);
+                RemoveOutcome::Removed { id }
+            }
+            None => RemoveOutcome::Absent,
+        })
     }
 
     fn upsert(&self, record: ImageRecord) -> Result<(), ImageStoreError> {
@@ -372,6 +414,21 @@ impl ImageStore for InMemoryImageStore {
         }
         images.insert(merged.id.clone(), merged);
         Ok(())
+    }
+}
+
+/// 参照で `f` を呼び、当たらなければ短縮名を PullImage と同じ規則で正規化して再度呼ぶ（CRI-4。`status` と `remove` が共有）。
+fn resolve_with_canonical<T>(
+    reference: &str,
+    f: impl Fn(&str) -> Result<Option<T>, ImageStoreError>,
+) -> Result<Option<T>, ImageStoreError> {
+    let first = f(reference)?;
+    if first.is_some() {
+        return Ok(first);
+    }
+    match canonical_reference(reference) {
+        Some(canonical) if canonical != reference => f(&canonical),
+        _ => Ok(None),
     }
 }
 
@@ -540,19 +597,35 @@ impl CriImageService {
         if reference.len() > MAX_FILTER_BYTES {
             return Err(CriError::invalid_argument("image reference is too long"));
         }
-        let store_err = |_| CriError::internal("image store failure");
-        let mut record = self.store.get(&reference).map_err(store_err)?;
-        if record.is_none()
-            && let Some(canonical) = canonical_reference(&reference)
-            && canonical != reference
-        {
-            // 短縮名（`alpine`・`alpine:3`）は PullImage と同じ規則で正規化して再照会する（CRI-4）。
-            record = self.store.get(&canonical).map_err(store_err)?;
-        }
+        let record = resolve_with_canonical(&reference, |r| self.store.get(r))
+            .map_err(|_| CriError::internal("image store failure"))?;
         Ok(v1::ImageStatusResponse {
             image: record.map(|r| r.to_proto()),
             info: Default::default(),
         })
+    }
+
+    /// `RemoveImage` の本体（#4177・CRI-1・CRI-2）。参照検証 → 記録ごと外す。既に無ければ成功（冪等）。
+    ///
+    /// blob・展開済み rootfs は消さない（proto は資源の回収を非同期でよいとする。回収は #471 系）。
+    /// 文言に参照を含めない。
+    fn remove(&self, request: v1::RemoveImageRequest) -> Result<v1::RemoveImageResponse, CriError> {
+        let reference = request.image.map(|spec| spec.image).unwrap_or_default();
+        if reference.is_empty() {
+            return Err(CriError::invalid_argument(
+                "image reference must not be empty",
+            ));
+        }
+        if reference.len() > MAX_FILTER_BYTES {
+            return Err(CriError::invalid_argument("image reference is too long"));
+        }
+        // Removed / Absent のどちらも成功（冪等）。Absent のときだけ正規化した参照で再度試す。
+        resolve_with_canonical(&reference, |r| match self.store.remove(r)? {
+            RemoveOutcome::Removed { id } => Ok(Some(id)),
+            _ => Ok(None),
+        })
+        .map_err(|_: ImageStoreError| CriError::internal("image store failure"))?;
+        Ok(v1::RemoveImageResponse {})
     }
 
     /// `ListImages` の本体。フィルタ検証 → ストア読み取り → 絞り込み。
@@ -641,14 +714,18 @@ impl ImageService for CriImageService {
         result.map(Response::new)
     }
 
-    // 以降は順次実装する（REPAIR-3）。
-
+    /// 参照（id・タグ・digest）のイメージを記録ごと在庫から外す。既に無ければ成功（冪等。CRI-1・CRI-2・#4177）。
     async fn remove_image(
         &self,
-        _request: Request<v1::RemoveImageRequest>,
+        request: Request<v1::RemoveImageRequest>,
     ) -> Result<Response<v1::RemoveImageResponse>, Status> {
-        Err(CriError::unimplemented("remove_image").into())
+        let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::RemoveImage);
+        let result = self.remove(request.into_inner()).map_err(Status::from);
+        timer.finish_with(&result);
+        result.map(Response::new)
     }
+
+    // 以降は順次実装する（REPAIR-3）。
 
     async fn image_fs_info(
         &self,
@@ -1082,5 +1159,43 @@ mod tests {
         assert!(r.matches("sha256:abc123"));
         assert!(r.matches("docker.io/library/a:1"));
         assert!(!r.matches("abc"));
+    }
+
+    /// CRI-1・#4177: remove は id・タグ・digest で記録ごと外し、無ければ Absent。既定実装は ReadOnly。
+    #[test]
+    fn cri1_remove_resolves_like_get_and_drops_whole_record() {
+        let store = InMemoryImageStore::new();
+        let r = ImageRecord::new(
+            "sha256:aa",
+            vec!["t1".into(), "t2".into()],
+            vec!["r@sha256:aa".into()],
+            1,
+        )
+        .expect("record");
+        store.insert(r).expect("insert");
+        store
+            .insert(ImageRecord::new("sha256:bb", vec!["t3".into()], vec![], 1).expect("record"))
+            .expect("insert");
+        assert_eq!(
+            store.remove("t2"),
+            Ok(RemoveOutcome::Removed {
+                id: "sha256:aa".into()
+            })
+        );
+        assert_eq!(store.get("t1"), Ok(None));
+        assert_eq!(store.get("r@sha256:aa"), Ok(None));
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.remove("t2"), Ok(RemoveOutcome::Absent));
+
+        struct NoWrite;
+        impl ImageStore for NoWrite {
+            fn list(&self) -> Result<Vec<ImageRecord>, ImageStoreError> {
+                Ok(vec![])
+            }
+            fn get(&self, _: &str) -> Result<Option<ImageRecord>, ImageStoreError> {
+                Ok(None)
+            }
+        }
+        assert_eq!(NoWrite.remove("x"), Err(ImageStoreError::ReadOnly));
     }
 }

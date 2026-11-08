@@ -30,7 +30,7 @@
 | コンテナ記録（CRI 層の項目一式・`image_ref`・`image_id`） | 決定し実装単位へ |
 | 保持役の pid と素性 | 記録の形を決定。再採用の可否は要確認事項 1 |
 | ネットワーク資源（`network_owned`・`pod_netns`） | フラグの永続は決定。再起動後の `tear_down` は #1870 の後 |
-| plugin-cri の在庫の永続化 | #4176 で配線済み（`PersistentImageStore`）。残りは RemoveImage と再起動後の一貫性が #4177、取り消しの窓が #4178。記録の `image_ref`・`image_id` は create 時のスナップショットとして独立に永続化するため依存しない |
+| plugin-cri の在庫の永続化 | #4176 で配線済み（`PersistentImageStore`）。RemoveImage と再起動後の一貫性は #4177 で実装済み、取り消しの窓が #4178。記録の `image_ref`・`image_id` は create 時のスナップショットとして独立に永続化するため依存しない |
 
 ## 置き場所
 

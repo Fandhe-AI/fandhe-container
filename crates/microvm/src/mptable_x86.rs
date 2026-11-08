@@ -27,10 +27,12 @@ use crate::guest_memory::{GuestAddress, GuestMemory, GuestMemoryBacking};
 pub const IOAPIC_MMIO_BASE: u64 = 0xfec0_0000;
 /// LAPIC の MMIO の窓の先頭（既定の物理アドレス）。
 pub const LAPIC_MMIO_BASE: u64 = 0xfee0_0000;
-/// KVM の in-kernel IOAPIC のピン数。
+/// KVM の in-kernel IOAPIC のピン数。Linux v6.12 の `arch/x86/include/uapi/asm/kvm.h` の `KVM_IOAPIC_NUM_PINS`（24）と同じ値。
+/// libc に KVM の uapi 定数が無く本 crate に libc の照合も未導入のため、照合は出典の記載と const 評価に限る（#4162・MVM-1）。
 pub const IOAPIC_PINS: u8 = 24;
 /// ISA bus の IRQ 数。
 pub const ISA_IRQS: u8 = 16;
+const _: () = assert!(ISA_IRQS <= IOAPIC_PINS);
 
 const FLOATING_LEN: usize = 16;
 const HEADER_LEN: usize = 44;

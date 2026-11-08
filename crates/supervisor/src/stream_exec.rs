@@ -6,7 +6,7 @@
 //! 新しい種別は足さない）を参照。
 //!
 //! - plugin-cri → helper: `StdioHandover`（要求された stdio の fd を `SCM_RIGHTS` で最大 3 本）
-//! - helper → plugin-cri: `Started`・`PtyMaster`（tty のときだけ fd 1 本）・`Result`（終了の結果）
+//! - helper → plugin-cri: `Started`（exec 子 cgroup の名前を運ぶ。wire v2・#4221）・`PtyMaster`（tty のときだけ fd 1 本）・`Result`（終了の結果）
 //!
 //! 構成:
 //! - [`wire`]: 固定長・big-endian の frame の型と codec（純粋関数。語彙の正は同モジュールの doc）

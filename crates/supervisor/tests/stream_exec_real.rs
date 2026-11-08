@@ -576,7 +576,7 @@ mod linux {
         let mut started = false;
         let outcome = loop {
             match recv_from_helper(&sp.plugin, Instant::now() + timeout()) {
-                Ok(HelperMessage::Started) => started = true,
+                Ok(HelperMessage::Started(_)) => started = true,
                 Ok(HelperMessage::Result(o)) => break o,
                 Ok(HelperMessage::PtyMaster(_)) => panic!("unexpected PtyMaster without a tty"),
                 Err(e) => panic!("channel failed before the result: {e:?}"),
@@ -788,7 +788,7 @@ mod linux {
             HelperStderr::Piped,
         );
         let first = recv_from_helper(&sp.plugin, Instant::now() + timeout()).expect("started");
-        assert!(matches!(first, HelperMessage::Started), "{first:?}");
+        assert!(matches!(first, HelperMessage::Started(_)), "{first:?}");
         let ready = hostdata.join(REQUESTER_READY_FILE);
         assert!(
             eventually(|| std::fs::read_to_string(&ready).is_ok_and(|s| s == READY_CONTENT)),
@@ -923,7 +923,7 @@ mod linux {
         // disconnect: Started の後に helper を SIGKILL すると、ガードが exec 子 cgroup を回収してコマンドが止まる。
         let mut sp = spawn_exec(ctx, "beat", None, 60_000, HelperStderr::Inherit);
         let first = recv_from_helper(&sp.plugin, Instant::now() + timeout()).expect("started");
-        assert!(matches!(first, HelperMessage::Started), "{first:?}");
+        assert!(matches!(first, HelperMessage::Started(_)), "{first:?}");
         let beat = hostdata.join(HEARTBEAT_FILE);
         assert!(
             eventually(|| std::fs::metadata(&beat).is_ok_and(|m| m.len() > 0)),

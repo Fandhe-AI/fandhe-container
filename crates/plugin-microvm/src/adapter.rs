@@ -29,6 +29,10 @@
 //! unix では `/` から要素ごとに `openat(O_NOFOLLOW)` で辿り、祖先の symlink も拒否する（SEC-1。#3748）。
 //! 同時 VM 数は backend ごとの [`MicrovmBackend::VM_LIMIT`]（既定は [`MAX_VMS`]）で抑える。停止は [`STOP_DEADLINE`]（RPC 期限より短い。REPAIR-5）。
 //!
+//! stop の結果行（`op=plugin.microvm.stop`）は、backend が ioeventfd の件数を持つとき末尾に ` ignored=N unbind_failed=M` を足す（#4161・MVM-1・REPAIR-4。
+//! `ignored` は `op=microvm.ioevent` の経路で受理条件を満たさず捨てた通知、`unbind_failed` は `op=kvm.ioeventfd.deassign` と同じ解除失敗の VM ごとの件数。
+//! 数値と固定キーのみ。件数を持たない backend〔HVF 等〕・start・エラーは従来の行。UDS の応答は変えない。終了時の一括停止〔`stop_all`〕の行への合算と
+//! MMIO exit 経路で捨てた通知の件数は未実装）。
 //! # 注意・残余（REPAIR-3）
 //! - plugin プロセスは SIGUSR2 を使わない（microvm の `run_once` がプロセス全体の handler を入れる）。
 //! - stop が `TIMEOUT` の後、vCPU スレッドが自力で終わるまで資源（ゲスト RAM・fd）が残る。backend から終了を観測できないため、
@@ -60,6 +64,7 @@ use fandhe_container_microvm::boot_x86::{
     CMDLINE_CAPACITY, MAX_INITRD_BYTES, MAX_KERNEL_IMAGE_BYTES,
 };
 use fandhe_container_microvm::error::{MicrovmError, MicrovmErrorCode};
+use fandhe_container_microvm::interrupt::IoEventCounts;
 use fandhe_container_plugin::{PluginError, PluginErrorCode, UDS_RPC_TIMEOUT_DEFAULT};
 
 use crate::frame_loop::RequestHandler;
@@ -172,6 +177,19 @@ pub enum DetachedState {
     Released,
 }
 
+/// [`MicrovmBackend::stop`] の成功時の結果（#4161・MVM-1・REPAIR-4）。
+///
+/// `reason` は UDS の応答 `["stopped", <reason>]` に載る固定名。`ioevent` は stop の結果行（`op=plugin.microvm.stop`）の
+/// `ignored=` / `unbind_failed=` に出す件数で、件数を持たない backend（ioeventfd を使わない HVF 等）は `None`
+/// （0 と偽らない）。件数は観測専用で、応答や成否には影響しない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StopOutcome {
+    /// 停止理由の固定名。
+    pub reason: &'static str,
+    /// ioeventfd の無視・解除失敗の件数。持たない backend は `None`。
+    pub ioevent: Option<IoEventCounts>,
+}
+
 /// microVM 本体への委譲境界。3 OS でビルドでき、KVM なしの試験で差し替えられる。
 pub trait MicrovmBackend {
     /// 同時に動かせる VM 数の上限（切り離し中の VM を含む）。上限は OS ではなく backend の性質で、既定は Linux（KVM）の
@@ -187,9 +205,8 @@ pub trait MicrovmBackend {
     type ExitWatch;
     /// 起動する。失敗時は資源が解放済みであること（microvm 側の保証）。
     fn start(&mut self, spec: BootSpec) -> Result<Self::Running, MicrovmError>;
-    /// `deadline` 以内に停止し、理由の固定名を返す。`vm` は成否に関わらず消費される。
-    fn stop(&mut self, vm: Self::Running, deadline: Duration)
-    -> Result<&'static str, MicrovmError>;
+    /// `deadline` 以内に停止し、理由の固定名と（持つ backend は）ioeventfd の件数を返す。`vm` は成否に関わらず消費される。
+    fn stop(&mut self, vm: Self::Running, deadline: Duration) -> Result<StopOutcome, MicrovmError>;
     /// 終了観測ハンドルを取る。`stop` が `vm` を消費するため、**`stop` に渡す前**に取ること。
     fn exit_watch(&self, vm: &Self::Running) -> Self::ExitWatch;
     /// 終了を待たずに照会する（ブロックしない契約。RPC 期限を消費しない）。未知の状態は `Pending` に倒す（fail-closed）。
@@ -244,12 +261,11 @@ impl MicrovmBackend for KvmBackend {
         vm.start(&loaded)
     }
 
-    fn stop(
-        &mut self,
-        vm: Self::Running,
-        deadline: Duration,
-    ) -> Result<&'static str, MicrovmError> {
-        vm.stop(deadline).map(|r| r.reason.as_str())
+    fn stop(&mut self, vm: Self::Running, deadline: Duration) -> Result<StopOutcome, MicrovmError> {
+        vm.stop(deadline).map(|r| StopOutcome {
+            reason: r.reason.as_str(),
+            ioevent: Some(r.ioevent),
+        })
     }
 
     fn exit_watch(&self, vm: &Self::Running) -> Self::ExitWatch {
@@ -312,12 +328,11 @@ impl MicrovmBackend for HvfBackend {
         HvfMicroVm::assemble(config)?.start()
     }
 
-    fn stop(
-        &mut self,
-        vm: Self::Running,
-        deadline: Duration,
-    ) -> Result<&'static str, MicrovmError> {
-        vm.stop(deadline).map(|r| r.reason.as_str())
+    fn stop(&mut self, vm: Self::Running, deadline: Duration) -> Result<StopOutcome, MicrovmError> {
+        vm.stop(deadline).map(|r| StopOutcome {
+            reason: r.reason.as_str(),
+            ioevent: None,
+        })
     }
 
     fn exit_watch(&self, _vm: &Self::Running) -> Self::ExitWatch {
@@ -355,7 +370,7 @@ impl MicrovmBackend for UnsupportedBackend {
         &mut self,
         vm: Self::Running,
         _deadline: Duration,
-    ) -> Result<&'static str, MicrovmError> {
+    ) -> Result<StopOutcome, MicrovmError> {
         match vm {}
     }
 
@@ -829,39 +844,71 @@ impl<B: MicrovmBackend> MicrovmRuntimeAdapter<B> {
         Ok(vec![REPLY_RUNNING.to_string()])
     }
 
-    fn do_stop(&mut self, body: &[String]) -> Result<Vec<String>, PluginError> {
+    /// 停止して応答と、結果行に出す ioeventfd の件数（成功かつ backend が持つときだけ `Some`）を返す。
+    fn do_stop(
+        &mut self,
+        body: &[String],
+    ) -> (Result<Vec<String>, PluginError>, Option<IoEventCounts>) {
         let [_, id] = body else {
-            return Err(invalid(MSG_MALFORMED));
+            return (Err(invalid(MSG_MALFORMED)), None);
         };
-        validate_id(id)?;
-        let vm = self
-            .vms
-            .remove(id.as_str())
-            .ok_or_else(|| perr(PluginErrorCode::NotFound, MSG_NOT_FOUND))?;
+        if let Err(e) = validate_id(id) {
+            return (Err(e), None);
+        }
+        let Some(vm) = self.vms.remove(id.as_str()) else {
+            return (Err(perr(PluginErrorCode::NotFound, MSG_NOT_FOUND)), None);
+        };
         let watch = self.backend.exit_watch(&vm);
-        let reason = match self.backend.stop(vm, STOP_DEADLINE) {
-            Ok(r) => r,
+        match self.backend.stop(vm, STOP_DEADLINE) {
+            Ok(o) => (
+                Ok(vec![REPLY_STOPPED.to_string(), o.reason.to_string()]),
+                o.ioevent,
+            ),
             Err(e) => {
                 self.note_stop_error(&e, watch);
-                return Err(to_plugin_error(&e));
+                (Err(to_plugin_error(&e)), None)
             }
-        };
-        Ok(vec![REPLY_STOPPED.to_string(), reason.to_string()])
+        }
     }
 
-    /// 構造化ログ 1 行（id・パス・cmdline は載せない。REPAIR-4）。書き込み失敗は無視する。
-    fn log(op: &str, started: Instant, vms: usize, result: &Result<Vec<String>, PluginError>) {
-        use std::io::Write;
-        let elapsed_us = started.elapsed().as_micros();
-        let line = match result {
-            Ok(_) => format!(
-                "level=info op=plugin.microvm.{op} outcome=ok elapsed_us={elapsed_us} vms={vms}"
-            ),
+    /// 結果行 1 行を組む（id・パス・cmdline は載せない。REPAIR-4）。
+    ///
+    /// 成功で `ioevent` が `Some` のときだけ、末尾に ` ignored=N unbind_failed=M`（数値と固定キーのみ。0 件でも出す）を足す。
+    /// `None`（件数を持たない backend・start・エラー）は従来の行と同一。`ignored` は `op=microvm.ioevent` の経路、
+    /// `unbind_failed` は `op=kvm.ioeventfd.deassign` の件数と同じ事象の VM ごとの値（個々の失敗はそちらの行に出る）。
+    fn result_line(
+        op: &str,
+        elapsed_us: u128,
+        vms: usize,
+        result: &Result<Vec<String>, PluginError>,
+        ioevent: Option<IoEventCounts>,
+    ) -> String {
+        match result {
+            Ok(_) => {
+                let counts = ioevent
+                    .map(|c| format!(" ignored={} unbind_failed={}", c.ignored, c.unbind_failed))
+                    .unwrap_or_default();
+                format!(
+                    "level=info op=plugin.microvm.{op} outcome=ok elapsed_us={elapsed_us} vms={vms}{counts}"
+                )
+            }
             Err(e) => format!(
                 "level=error op=plugin.microvm.{op} outcome=error code={} elapsed_us={elapsed_us} vms={vms}",
                 e.code().as_str()
             ),
-        };
+        }
+    }
+
+    /// 構造化ログ 1 行を stderr へ書く（[`Self::result_line`]）。書き込み失敗は無視する。
+    fn log(
+        op: &str,
+        started: Instant,
+        vms: usize,
+        result: &Result<Vec<String>, PluginError>,
+        ioevent: Option<IoEventCounts>,
+    ) {
+        use std::io::Write;
+        let line = Self::result_line(op, started.elapsed().as_micros(), vms, result, ioevent);
         let _ = writeln!(std::io::stderr(), "{line}");
     }
 }
@@ -874,13 +921,13 @@ impl<B: MicrovmBackend> RequestHandler for MicrovmRuntimeAdapter<B> {
             Some(OP_START) => {
                 let started = Instant::now();
                 let r = self.do_start(body);
-                Self::log("start", started, self.vms.len(), &r);
+                Self::log("start", started, self.vms.len(), &r, None);
                 r
             }
             Some(OP_STOP) => {
                 let started = Instant::now();
-                let r = self.do_stop(body);
-                Self::log("stop", started, self.vms.len(), &r);
+                let (r, ioevent) = self.do_stop(body);
+                Self::log("stop", started, self.vms.len(), &r, ioevent);
                 r
             }
             _ => Err(perr(PluginErrorCode::Unimplemented, MSG_UNIMPLEMENTED)),
@@ -1043,6 +1090,8 @@ mod tests {
         start_err: Option<MicrovmErrorCode>,
         stop_err: Option<MicrovmErrorCode>,
         reason: &'static str,
+        /// stop が返す ioeventfd の件数（#4161）。
+        ioevent: Option<IoEventCounts>,
     }
 
     impl MicrovmBackend for FakeBackend {
@@ -1065,13 +1114,16 @@ mod tests {
                 DetachedState::Pending
             }
         }
-        fn stop(&mut self, _vm: u32, _d: Duration) -> Result<&'static str, MicrovmError> {
+        fn stop(&mut self, _vm: u32, _d: Duration) -> Result<StopOutcome, MicrovmError> {
             match self.stop_err {
                 Some(c) => Err(MicrovmError::new(c, "fake")),
-                None => Ok(if self.reason.is_empty() {
-                    "requested"
-                } else {
-                    self.reason
+                None => Ok(StopOutcome {
+                    reason: if self.reason.is_empty() {
+                        "requested"
+                    } else {
+                        self.reason
+                    },
+                    ioevent: self.ioevent,
                 }),
             }
         }
@@ -1163,6 +1215,55 @@ mod tests {
             a.handle(&s(&["stop", "vm1"])).expect("stop"),
             s(&["stopped", "guest_shutdown"])
         );
+    }
+
+    /// MVM-1・REPAIR-4・#4161: stop の結果行は件数があれば `ignored=` / `unbind_failed=` を足し、無ければ従来と同一。値は数値のみ。
+    #[test]
+    fn mvm1_4161_stop_result_line_carries_ioevent_counts() {
+        type A = MicrovmRuntimeAdapter<FakeBackend>;
+        let ok: Result<Vec<String>, PluginError> = Ok(s(&["stopped", "requested"]));
+        assert_eq!(
+            A::result_line("stop", 7, 0, &ok, Some(IoEventCounts::new(2, 1))),
+            "level=info op=plugin.microvm.stop outcome=ok elapsed_us=7 vms=0 ignored=2 unbind_failed=1"
+        );
+        assert_eq!(
+            A::result_line("stop", 7, 0, &ok, Some(IoEventCounts::new(0, 0))),
+            "level=info op=plugin.microvm.stop outcome=ok elapsed_us=7 vms=0 ignored=0 unbind_failed=0"
+        );
+        assert_eq!(
+            A::result_line("stop", 7, 0, &ok, None),
+            "level=info op=plugin.microvm.stop outcome=ok elapsed_us=7 vms=0"
+        );
+        let err: Result<Vec<String>, PluginError> =
+            Err(perr(PluginErrorCode::NotFound, MSG_NOT_FOUND));
+        let line = A::result_line("stop", 7, 0, &err, Some(IoEventCounts::new(2, 1)));
+        assert!(line.starts_with("level=error op=plugin.microvm.stop outcome=error code="));
+        assert!(!line.contains("ignored="));
+    }
+
+    /// MVM-1・REPAIR-4・#4161: backend の件数が `do_stop` から結果行へ渡り、UDS の応答は変わらない。id・パスは行に出ない。
+    #[test]
+    fn mvm1_4161_do_stop_passes_backend_counts() {
+        let t = Tmp::new("ioevent");
+        let k = t.file("kernel-secret-name", b"KERNEL");
+        let mut a = adapter();
+        a.backend.ioevent = Some(IoEventCounts::new(2, 1));
+        a.handle(&start_req("vm-secret-id", &k)).expect("start");
+        let (r, counts) = a.do_stop(&s(&["stop", "vm-secret-id"]));
+        assert_eq!(r.expect("stop"), s(&["stopped", "requested"]));
+        assert_eq!(counts, Some(IoEventCounts::new(2, 1)));
+        let line = MicrovmRuntimeAdapter::<FakeBackend>::result_line(
+            "stop",
+            1,
+            0,
+            &Ok(Vec::new()),
+            counts,
+        );
+        assert!(!line.contains("vm-secret-id") && !line.contains("kernel-secret-name"));
+        // エラー（未登録 id）は件数なし。
+        let (r, counts) = a.do_stop(&s(&["stop", "vm-secret-id"]));
+        assert!(r.is_err());
+        assert_eq!(counts, None);
     }
 
     /// 重複 id は ALREADY_EXISTS（backend は呼ばれない）、上限超過は RESOURCE_EXHAUSTED。
@@ -1699,7 +1800,7 @@ mod tests {
         fn start(&mut self, spec: BootSpec) -> Result<u32, MicrovmError> {
             self.0.start(spec)
         }
-        fn stop(&mut self, vm: u32, d: Duration) -> Result<&'static str, MicrovmError> {
+        fn stop(&mut self, vm: u32, d: Duration) -> Result<StopOutcome, MicrovmError> {
             self.0.stop(vm, d)
         }
         fn exit_watch(&self, vm: &u32) -> u32 {

@@ -70,6 +70,7 @@
 # #3698 で ioeventfd を所有型にして assemble へ結線し、eventfd を待つ通知スレッドと sys の poll を追加（依存は増やさない。unsafe は src/sys.rs のみ）。
 # #4101 で ioeventfd の poll の異常 revents（POLLERR / POLLHUP / POLLNVAL）を POLLIN と区別し、fail-closed で止める（依存は増やさない。unsafe の追加なし）。
 # #4157 で memslot_flags（memslot のフラグの型と KVM_CAP_READONLY_MEM の照会）を追加（依存は増やさない。unsafe の追加なし）。
+# #4161 で ioeventfd の無視・解除失敗の VM ごとの件数（IoEventTally / IoEventCounts）を StopReport へ出す（依存は増やさない。unsafe の追加なし）。
 # #4158 で memslot のフラグを GuestRam の登録へ結線（依存は増やさない。unsafe の追加なし）。
 # #4113 で tests/support/virtqueue_driver.rs（virtqueue の試験補助の正本）を追加し、試験の複製を寄せる（依存は増やさない。unsafe なし）。
 [package]

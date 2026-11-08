@@ -420,7 +420,15 @@ mod tap_tests {
     }
 
     fn timed(s: &UnixStream) {
-        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        match s.set_read_timeout(Some(Duration::from_secs(10))) {
+            Ok(()) => {}
+            // macOS (XNU) の `sosetopt` は、送受信の両方向が閉じた socket への
+            // setsockopt に EINVAL (22) を返す。その状態の read は待たずに
+            // バッファのデータか EOF を返すため期限は不要で、無視してよい。
+            // 他 OS と他のエラーは従来どおり panic させる (#4144)。
+            Err(e) if cfg!(target_os = "macos") && e.raw_os_error() == Some(22) => {}
+            Err(e) => panic!("set_read_timeout: {e}"),
+        }
     }
 
     fn read_n(s: &mut UnixStream, n: usize) -> Vec<u8> {
@@ -517,8 +525,17 @@ mod tap_tests {
         let mut w = w.unwrap();
         let mut got: Vec<u8> = Vec::new();
         let mut expect: Vec<u8> = Vec::new();
-        for i in 0..64u32 {
-            let mut chunk = vec![b'a' + (i % 26) as u8; 16 * 1024 - 1];
+        // macOS の UNIX stream の socketpair は既定のバッファが約 8 KB
+        // (`net.local.stream.sendspace` / `recvspace`)。tap は 1 チャンクを非ブロッキングで
+        // 書き切れない購読者を Overflow で切る契約のため、16 KB のチャンクでは読み続ける
+        // 購読者も溢れうる。macOS ではチャンクを 2 KB にし、合計 1 MB の書き込み量は保つ (#4144)。
+        let chunk_len: usize = if cfg!(target_os = "macos") {
+            2 * 1024
+        } else {
+            16 * 1024
+        };
+        for i in 0..(1024 * 1024 / chunk_len) {
+            let mut chunk = vec![b'a' + (i % 26) as u8; chunk_len - 1];
             chunk.push(b'\n');
             w.write_all(&chunk).unwrap();
             expect.extend_from_slice(&chunk);

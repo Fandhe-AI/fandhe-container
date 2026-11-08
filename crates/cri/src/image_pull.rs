@@ -17,7 +17,7 @@
 //!    fd 起点で開いたハンドル。リース済みの既存 blob は `open_leased_blob` が検査済み root の fd 起点で開いたハンドル。#2893・#4179）、同じハンドルで信頼条件と
 //!    digest を確かめ、同じハンドルから上限つきで読んで `rootfs.diff_ids` を解析（`read_verified_config_file`）
 //! 8. 各 layer を `VerifiedLayerBlob`（検証済みハンドル。どちらも fd 起点のハンドルから `from_file`）で開き直し、セッションのステージングの `unpack/` 配下の
-//!    `rootfs/` へ `extract_image_layers_bounded` で展開しながら diff_id を突合（期限と取り消しをエントリ単位で確認。#2967・#2323・OCI-1・OCI-2）
+//!    `rootfs/`（`unpack/` 以下はすべて pull ディレクトリの fd 起点で作る。#4180）へ `extract_image_layers_bounded_in` で展開しながら diff_id を突合（期限と取り消しをエントリ単位で確認。#2967・#2323・OCI-1・OCI-2）
 //! 9. 展開に成功したときだけ、組んだエントリ（`rootfs/` と展開設定の記録 `unpack-record`）を 1 回の `rename` で
 //!    `<cache_dir>/rootfs/sha256/<config-hex>/` へ公開する（記録の無い rootfs が残らない）。公開済みで、
 //!    記録（config・展開設定）と layer の表現が今回と一致するときだけ 8 を省く。layer の表現（圧縮 blob の digest・
@@ -45,10 +45,10 @@
 //!   レジストリ・リクエスト由来の文字列をパス要素に使わない（パストラバーサル対策）
 //! - 失敗経路は必ず `PullSession::abort` を通してリースとステージングを片づける。本モジュールは `staging/<id>` を
 //!   自分では消さない（消すのは `abort` / `publish` / 回収 GC だけ。永続化済みのリースだけが残る孤児リースを
-//!   作らないため）。消してよいのは自分の作業領域 `unpack/` の子だけ（oci の `remove_extracted_tree`）
+//!   作らないため）。消してよいのは自分の作業領域 `unpack/` だけ（oci の `PullSession::remove_unpack_dir`。pull ディレクトリの fd 起点。#4180）
 //! - 作りかけの rootfs を公開しない。展開はステージングの中だけで行い、diff_id の不一致・上限超過・未対応の
 //!   mediaType などで失敗したらステージングごと消す（先行レイヤーの展開物も残らない）。展開後に中断した root が
-//!   持つ 0555 等のディレクトリは、oci の `remove_extracted_tree` が権限を戻して消す
+//!   持つ 0555 等のディレクトリは、oci の `remove_unpack_dir` が権限を戻して消す
 //! - 公開済み rootfs は読み取り専用の元として扱い、コンテナの rootfs として直接書き換えない。create 経路
 //!   （`crate::bundle::ImageRootfsSource`。#2433）は、この rootfs に触れず、検証済み blob から bundle の `rootfs/` へ
 //!   再展開する（複製の一形態。overlay の下位層は未実装）。公開先が信頼できない状態（symlink・他人所有など）なら
@@ -145,12 +145,12 @@ use fandhe_container_oci::config::{ImageRootFs, MAX_CONFIG_BYTES, parse_image_co
 use fandhe_container_oci::error::{OciError, OciErrorCode};
 use fandhe_container_oci::image_management::{
     BlobReuse, IMAGE_STORE_BLOB_DIR, ImageStore, ManifestComposition, PullPublishRequest,
-    PullSession, StagedBlobWriter, TagKey,
+    PullSession, StagedBlobWriter, TagKey, UnpackDir,
 };
 use fandhe_container_oci::instrument::{NoopOciOpRecorder, OciOpRecorder};
 use fandhe_container_oci::layer::extract::{
-    ExtractBudget, ExtractLimits, ExtractOptions, OwnershipPolicy, extract_image_layers_bounded,
-    image_layers_from, remove_extracted_tree,
+    ExtractBudget, ExtractLimits, ExtractOptions, OwnershipPolicy, extract_image_layers_bounded_in,
+    image_layers_from,
 };
 use fandhe_container_oci::layer::{
     BlobFileFacts, BlobTrustViolation, DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES, VerifiedLayerBlob,
@@ -704,24 +704,28 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
         let layers = image_layers_from(&manifest.layers, &refs, rootfs_cfg)
             .map_err(|e| PullError::from_extract(&e))?;
         // ステージングの中でエントリ（`rootfs/` と記録）を組み立て、1 回の rename で公開する。
-        // 展開先の作業領域はセッションのステージング配下（パス起点。fd 起点化は #2893 の対象外）。
-        // パス起点の副作用へ進む前に、`staging/<id>` が保持している fd と同じ実体であることを確かめる
-        // （取得中の差し替えで、おとり配下へ展開・rename しないため。OCI-7・SEC-1・#2893）。
+        // 展開先の作業領域（`unpack/`・`entry/`・`rootfs/`）は pull ディレクトリの fd 起点で作り、展開・記録・公開元の
+        // rename・後始末も同じ fd 起点で行う（`staging/<id>` が差し替えられてもおとりへ届かない。OCI-7・SEC-1・#4180）。
+        // 差し替えは次の照合で検出して fail-closed にする（無駄な展開を避けるため作成の前にも確かめる。#2893）。
         session
             .check_staging_dir_current()
             .map_err(|e| PullError::from_store(&e))?;
-        let unpack_dir = session.staging_dir().join(UNPACK_SUBDIR);
-        create_private_dir(&unpack_dir)?;
-        let staged_entry = unpack_dir.join("entry");
-        create_private_dir(&staged_entry)?;
-        let root = staged_entry.join(ROOTFS_SUBDIR);
-        create_private_dir(&root)?;
+        let unpack_dir = session
+            .create_unpack_dir()
+            .map_err(|e| PullError::from_store(&e))?;
+        let staged_entry = unpack_dir
+            .create_subdir("entry")
+            .map_err(|_| staging_dir_error())?;
+        let root = staged_entry
+            .create_subdir(ROOTFS_SUBDIR)
+            .map_err(|_| staging_dir_error())?;
+        let extract_root = root.extract_root().map_err(|e| PullError::from_store(&e))?;
         budget.check()?;
         // 期限は pull 全体の残り時間を同じ絶対時刻で渡し、取り消しの旗と合わせてエントリ単位で確かめる（#2967）。
-        extract_image_layers_bounded(
+        extract_image_layers_bounded_in(
             self.recorder.as_ref(),
             &layers,
-            &root,
+            &extract_root,
             self.config.max_uncompressed_layer_bytes,
             self.config.extract_limits,
             &self.config.extract_options,
@@ -735,12 +739,25 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
             }
         })?;
         budget.check()?;
+        // 展開の間に `staging/<id>` が差し替えられていたら、記録も公開もせず拒否する（fd 起点の操作は検査済みの実体にだけ
+        // 届くため、おとりへは書かれていない。差し替えを成功に見せない検出器。OCI-7・SEC-1・#4180）。
+        session
+            .check_staging_dir_current()
+            .map_err(|e| PullError::from_store(&e))?;
         if verify_only {
             return Ok(());
         }
-        write_unpack_record(&staged_entry.join(RECORD_FILE), &record)?;
+        write_unpack_record(&staged_entry, &record)?;
         // 原子的に公開する。並行する pull が先に公開していて信頼できるなら、その展開設定が同じときだけ成功とする。
-        if fs::rename(&staged_entry, &entry_path).is_err() {
+        // 公開元は `unpack/` の fd 起点の `renameat`（宛先ディレクトリは `O_NOFOLLOW` で開く。#4180）。
+        if unpack_dir
+            .rename_child_into(
+                "entry",
+                &rootfs_dir.path,
+                digest_hex(&manifest.config.digest),
+            )
+            .is_err()
+        {
             if inspect_published_rootfs(&entry_path, rootfs_dir.owner, root_owner).unwrap_or(false)
             {
                 check_unpack_record(&entry_path.join(RECORD_FILE), &record, rootfs_dir.owner)?;
@@ -1127,10 +1144,8 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
         // 展開の作業領域は `staging/<id>` を消さずに自分の子だけ消す（`staging/<id>` を消してよいのは
         // `abort` / `publish` / 回収 GC だけ。永続化済みのリースだけが残る孤児リースを作らないため）。
         // 検証だけの経路や失敗経路に残る展開物は 0555 等を含むため、oci の削除で消す。
-        let unpack_dir = session.staging_dir().join(UNPACK_SUBDIR);
-        if fs::symlink_metadata(&unpack_dir).is_ok() {
-            let _ = remove_extracted_tree(&unpack_dir);
-        }
+        // pull ディレクトリの fd 起点で消す（差し替えられた `staging/<id>` の外を消さない。#4180）。
+        let _ = session.remove_unpack_dir();
         let composition = match prepared.and_then(|c| budget.check().map(|()| c)) {
             Ok(c) => c,
             Err(e) => {
@@ -1562,23 +1577,31 @@ fn check_unpack_record(
     }
 }
 
-/// 記録を 0600 で `path`（ステージングのエントリ内）へ書く。公開は親ごとの rename で行うため、単体の rename はしない。
+/// 記録を 0600 で `entry`（ステージングのエントリ。`unpack/entry`）直下の [`RECORD_FILE`] へ書く。公開は親ごとの rename で
+/// 行うため、単体の rename はしない。`entry` の fd 起点で作る（#4180）。
 ///
 /// 失敗したら作ったファイルを消して何も残さない（#2796・OCI-1・REPAIR-5。ENOSPC 等の途中失敗で不完全な記録を
 /// 残さない関数単体の契約）。現行の呼び出し元ではステージングごと片付けるため公開先には届かないが、再利用に備えて保証する。
-/// 消す対象はこの関数が `create_new` で作ったファイルだけで、`remove_file` は最終要素の symlink を辿らない。
-fn write_unpack_record(path: &Path, record: &UnpackRecord) -> Result<(), PullError> {
+/// 消す対象はこの関数が排他作成したファイルだけで、`unlink` は最終要素の symlink を辿らない。
+fn write_unpack_record(entry: &UnpackDir, record: &UnpackRecord) -> Result<(), PullError> {
     use std::io::Write as _;
-    write_unpack_record_with(path, record, &|f, r| {
-        f.write_all(r.settings.as_bytes())?;
-        f.write_all(r.layers.as_bytes())?;
-        f.sync_all()
-    })
+    write_unpack_record_with(
+        &|| entry.create_new_file(RECORD_FILE),
+        &|| entry.unlink(RECORD_FILE),
+        record,
+        &|f, r| {
+            f.write_all(r.settings.as_bytes())?;
+            f.write_all(r.layers.as_bytes())?;
+            f.sync_all()
+        },
+    )
 }
 
-/// [`write_unpack_record`] の本体。本文の書き込み（`write_body`）を差し替えられる（失敗の注入用）。
+/// [`write_unpack_record`] の本体。ファイルの作成（`create`）・失敗時の削除（`remove`）・本文の書き込み（`write_body`）を
+/// 差し替えられる（失敗の注入用）。
 fn write_unpack_record_with(
-    path: &Path,
+    create: &dyn Fn() -> std::io::Result<fs::File>,
+    remove: &dyn Fn() -> std::io::Result<()>,
     record: &UnpackRecord,
     write_body: &dyn Fn(&mut fs::File, &UnpackRecord) -> std::io::Result<()>,
 ) -> Result<(), PullError> {
@@ -1595,21 +1618,22 @@ fn write_unpack_record_with(
             "image rootfs unpack record exceeds the size limit",
         ));
     }
-    let mut opts = fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        opts.mode(0o600);
-    }
-    let mut f = opts.open(path).map_err(|_| fail())?;
+    let mut f = create().map_err(|_| fail())?;
     if write_body(&mut f, record).is_err() {
         // Windows は開いたファイルを消せないため、先にハンドルを閉じる。後始末の失敗は元のエラーを隠さない。
         drop(f);
-        let _ = fs::remove_file(path);
+        let _ = remove();
         return Err(fail());
     }
     Ok(())
+}
+
+/// 展開の作業領域のディレクトリを作れなかったときの固定のエラー（`create_private_dir` と同じ文言）。
+fn staging_dir_error() -> PullError {
+    PullError::new(
+        OciErrorCode::FailedPrecondition,
+        "failed to create the image rootfs staging directory",
+    )
 }
 
 /// 非再帰で 0700 のディレクトリを作る（既存は拒否。展開の root は空であることが前提）。
@@ -1841,9 +1865,6 @@ fn verify_private_dir(dir: &Path, owner: u32) -> Result<(), PullError> {
 /// 一時名の衝突回避用カウンタ（Unix の所有者検査だけが使う）。
 #[cfg(unix)]
 static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// 展開の作業領域の名前（`staging/<id>/unpack`。中に `entry/{rootfs,unpack-record}`）。
-const UNPACK_SUBDIR: &str = "unpack";
 
 /// `AuthConfig` を oci の資格情報へ変換する（CRI-4・OCI-3）。
 ///
@@ -2164,7 +2185,7 @@ mod tests {
             settings: "s".repeat(MAX_RECORD_BYTES as usize),
             layers: "l".to_owned(),
         };
-        let err = write_unpack_record(&path, &record).expect_err("oversized");
+        let err = write_record_at(&path, &record).expect_err("oversized");
         assert_eq!(
             err,
             PullError::new(
@@ -2244,6 +2265,39 @@ mod tests {
         fresh_dir("fandhe-cri-record", tag)
     }
 
+    /// `write_unpack_record_with` をパス起点の作成・削除で呼ぶ試験用の口（本番は `UnpackDir` の fd 起点。#4180）。
+    fn write_record_at_with(
+        path: &Path,
+        record: &UnpackRecord,
+        write_body: &dyn Fn(&mut fs::File, &UnpackRecord) -> std::io::Result<()>,
+    ) -> Result<(), PullError> {
+        write_unpack_record_with(
+            &|| {
+                let mut opts = fs::OpenOptions::new();
+                opts.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt as _;
+                    opts.mode(0o600);
+                }
+                opts.open(path)
+            },
+            &|| fs::remove_file(path),
+            record,
+            write_body,
+        )
+    }
+
+    /// 本番の本文（settings → layers → `sync_all`）で書く試験用の口。
+    fn write_record_at(path: &Path, record: &UnpackRecord) -> Result<(), PullError> {
+        use std::io::Write as _;
+        write_record_at_with(path, record, &|f, r| {
+            f.write_all(r.settings.as_bytes())?;
+            f.write_all(r.layers.as_bytes())?;
+            f.sync_all()
+        })
+    }
+
     /// OCI-1・REPAIR-5・#2796: 本文の書き込みが途中で失敗（ENOSPC 相当）したら作ったファイルを消す。
     #[test]
     fn oci1_repair5_write_unpack_record_removes_partial_file_on_write_failure() {
@@ -2254,7 +2308,7 @@ mod tests {
             settings: "settings".to_owned(),
             layers: "layers".to_owned(),
         };
-        let err = write_unpack_record_with(&path, &record, &|f, r| {
+        let err = write_record_at_with(&path, &record, &|f, r| {
             f.write_all(&r.settings.as_bytes()[..3])?;
             Err(std::io::Error::from(std::io::ErrorKind::StorageFull))
         })
@@ -2280,7 +2334,7 @@ mod tests {
             settings: "settings".to_owned(),
             layers: "layers".to_owned(),
         };
-        let err = write_unpack_record_with(&path, &record, &|f, r| {
+        let err = write_record_at_with(&path, &record, &|f, r| {
             f.write_all(r.settings.as_bytes())?;
             f.write_all(r.layers.as_bytes())?;
             Err(std::io::Error::from(std::io::ErrorKind::Other))
@@ -2300,7 +2354,7 @@ mod tests {
             settings: "settings".to_owned(),
             layers: "layers".to_owned(),
         };
-        write_unpack_record(&path, &record).expect("write");
+        write_record_at(&path, &record).expect("write");
         assert_eq!(fs::read(&path).expect("read"), b"settingslayers");
         #[cfg(unix)]
         {

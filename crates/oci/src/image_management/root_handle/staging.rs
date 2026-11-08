@@ -31,8 +31,15 @@
 //!
 //! 検証後の読み取りも、`PullSession::open_verified_staged_blob` が `PullDir::open_nofollow` で開いたハンドルを
 //! 渡す。パスは返さず、パスで辿った pull ディレクトリの照合も要らない。
+//!
+//! # 展開先 `unpack/` の fd 起点（#4180）
+//!
+//! 展開先 `unpack/`（とその下の `entry/`・`rootfs/`）の作成は `PullDir::create_unpack_dir`（`mkdirat` → `O_NOFOLLOW`
+//! で開く）が行い、開いた `UnpackDir` が子ディレクトリの作成・`unpack-record` の排他作成・公開先への `renameat`・
+//! 展開器へ渡す根（`layer::ExtractRoot`）を fd 起点で担う。後始末は `PullDir::remove_child_tree`。`staging/<id>` が
+//! 検査後に別のディレクトリ（おとり）へ差し替えられても、これらは検査済みの実体にだけ届く。
 
-pub(crate) use imp::{PullDir, StagingDir};
+pub(crate) use imp::{PullDir, StagingDir, UnpackDir};
 
 #[cfg(all(
     target_os = "linux",
@@ -302,12 +309,92 @@ mod imp {
                 .map_err(|e| io::Error::other(e.message().to_owned()))
         }
 
+        /// 直下の `name` を 0700 で作る（既存なら `AlreadyExists`。`unpack/` の作成口。#4180）。
+        fn mkdir_private(&self, name: &str) -> io::Result<()> {
+            at::mkdirat_name(self.0.as_fd(), OsStr::new(name), 0o700)
+        }
+
+        /// 展開先の作業領域 `name`（`unpack/`）を 0700 で新規に作って開く（既存は拒否。開けなければ作った空ディレクトリを消す。#4180）。
+        pub(crate) fn create_unpack_dir(&self, name: &str) -> io::Result<UnpackDir> {
+            self.mkdir_private(name)?;
+            open_dir_in(&self.0, OsStr::new(name))
+                .map(UnpackDir)
+                .inspect_err(|_| {
+                    let _ = at::unlinkat_name(self.0.as_fd(), OsStr::new(name), true);
+                })
+        }
+
         /// `p`（パスで辿った pull ディレクトリ）が、この fd と同じ実体か（dev / ino の照合。OCI-7・SEC-1・#2893）。
         pub(crate) fn matches_path(&self, p: &Path) -> bool {
             let Ok(mine) = self.dir_meta() else {
                 return false;
             };
             std::fs::metadata(p).is_ok_and(|m| (m.dev(), m.ino()) == (mine.dev(), mine.ino()))
+        }
+    }
+
+    /// 開いた展開先のディレクトリ（`unpack/` とその下の `entry/`・`rootfs/`。#4180）。
+    #[derive(Debug)]
+    pub(crate) struct UnpackDir(OwnedFd);
+
+    impl UnpackDir {
+        /// 直下に 0700 のディレクトリを新規に作って開く（既存は拒否）。
+        pub(crate) fn create_subdir(&self, name: &str) -> io::Result<UnpackDir> {
+            at::mkdirat_name(self.0.as_fd(), OsStr::new(name), 0o700)?;
+            open_dir_in(&self.0, OsStr::new(name))
+                .map(UnpackDir)
+                .inspect_err(|_| {
+                    let _ = at::unlinkat_name(self.0.as_fd(), OsStr::new(name), true);
+                })
+        }
+
+        /// 直下に 0600 で排他作成して書き込みで開く（既存なら `AlreadyExists`。symlink は辿らない）。
+        pub(crate) fn create_new_file(&self, name: &str) -> io::Result<File> {
+            open_in(
+                &self.0,
+                OsStr::new(name),
+                O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW,
+                0o600,
+            )
+            .map(File::from)
+        }
+
+        /// 直下の名前を unlink する（ディレクトリは消さない）。
+        pub(crate) fn unlink(&self, name: &str) -> io::Result<()> {
+            at::unlinkat_name(self.0.as_fd(), OsStr::new(name), false)
+        }
+
+        /// 直下の `name` を `dest_dir` 直下の `dest_name` へ移す（公開）。`dest_dir` は `O_NOFOLLOW` で開き、
+        /// 宛先が空でない既存ディレクトリなら失敗する。
+        pub(crate) fn rename_child_into(
+            &self,
+            name: &str,
+            dest_dir: &Path,
+            dest_name: &str,
+        ) -> io::Result<()> {
+            use std::os::unix::ffi::OsStrExt as _;
+            let c = std::ffi::CString::new(dest_dir.as_os_str().as_bytes())
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid path"))?;
+            let dest = at::openat2(
+                None,
+                &c,
+                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC,
+                0,
+                0,
+            )?;
+            at::renameat_names(
+                self.0.as_fd(),
+                OsStr::new(name),
+                dest.as_fd(),
+                OsStr::new(dest_name),
+            )
+        }
+
+        /// 展開器へ渡す根（この fd の複製。`layer::extract_image_layers_bounded_in`）。
+        pub(crate) fn extract_root(&self) -> io::Result<crate::layer::extract::ExtractRoot> {
+            Ok(crate::layer::extract::ExtractRoot::from_fd(
+                self.0.try_clone()?,
+            ))
         }
     }
 }
@@ -545,9 +632,63 @@ mod imp {
             }
         }
 
+        /// 展開先の作業領域 `name`（`unpack/`）を 0700 で新規に作る（既存は拒否。パス起点。#4180）。
+        pub(crate) fn create_unpack_dir(&self, name: &str) -> io::Result<UnpackDir> {
+            let p = self.0.join(name);
+            make_dir(&p)?;
+            Ok(UnpackDir(p))
+        }
+
         /// パス起点の実装は同じパスを辿るため常に真（差し替えは入口の再検査だけで検出する）。
         pub(crate) fn matches_path(&self, _p: &Path) -> bool {
             true
+        }
+    }
+
+    /// 展開先のディレクトリのパス（パス起点。差し替えは入口の再検査だけで検出する。#4180）。
+    #[derive(Debug)]
+    pub(crate) struct UnpackDir(PathBuf);
+
+    impl UnpackDir {
+        /// 直下に 0700 のディレクトリを新規に作る（既存は拒否）。
+        pub(crate) fn create_subdir(&self, name: &str) -> io::Result<UnpackDir> {
+            let p = self.0.join(name);
+            make_dir(&p)?;
+            Ok(UnpackDir(p))
+        }
+
+        /// 直下に 0600 で排他作成して書き込みで開く（既存なら `AlreadyExists`）。
+        pub(crate) fn create_new_file(&self, name: &str) -> io::Result<File> {
+            let mut opts = OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            opts.open(self.0.join(name))
+        }
+
+        /// 直下の名前を unlink する。
+        pub(crate) fn unlink(&self, name: &str) -> io::Result<()> {
+            fs::remove_file(self.0.join(name))
+        }
+
+        /// 直下の `name` を `dest_dir` 直下の `dest_name` へ移す（公開）。
+        pub(crate) fn rename_child_into(
+            &self,
+            name: &str,
+            dest_dir: &Path,
+            dest_name: &str,
+        ) -> io::Result<()> {
+            fs::rename(self.0.join(name), dest_dir.join(dest_name))
+        }
+
+        /// 展開器へ渡す根（パス）。
+        pub(crate) fn extract_root(&self) -> io::Result<crate::layer::extract::ExtractRoot> {
+            Ok(crate::layer::extract::ExtractRoot::from_path(
+                self.0.clone(),
+            ))
         }
     }
 }

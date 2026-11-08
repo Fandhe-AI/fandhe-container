@@ -214,6 +214,7 @@ use tar::{Archive, EntryType};
 pub use super::idmap::{IdMap, IdRange};
 use sha2::{Digest as _, Sha256};
 
+pub use super::anchored::ExtractRoot;
 use super::anchored::{
     AnchorHooks, AnchoredRoot, map_at_err, path_changed, remove_path_tree, remove_path_tree_checked,
 };
@@ -743,7 +744,7 @@ pub fn extract_layers_bounded<R: Read + Seek>(
     extract_stack_bounded(
         recorder,
         layers.into_iter().map(Rewind::new),
-        root,
+        RootRef::Path(root),
         limits,
         host_lstat,
         SpecialSetup::from_options(options),
@@ -990,6 +991,79 @@ pub fn extract_image_layers_bounded(
     options: &ExtractOptions,
     budget: &ExtractBudget<'_>,
 ) -> Result<Vec<ExtractedLayer>, OciError> {
+    extract_image_layers_at(
+        recorder,
+        layers,
+        RootRef::Path(root),
+        max_uncompressed_bytes,
+        limits,
+        options,
+        budget,
+    )
+}
+
+/// `extract_image_layers_bounded` の、展開の根を開いたディレクトリ fd（[`ExtractRoot`]）で受ける版（#4180・OCI-7・SEC-1）。
+///
+/// cri の pull が `staging/<id>/unpack/entry/rootfs` を pull ディレクトリの fd 起点で作って渡す。根をパスで開き直さない
+/// ため、展開の途中で `staging/<id>` が別のディレクトリへ差し替えられても、変更操作も親ディレクトリの確認も渡された
+/// 実体にだけ届き、おとりには届かない。Linux の x86_64 / aarch64 では確認用に `/proc/self/fd/<fd>` を使い、使えなければ
+/// `Unimplemented`（パス起点へ縮退しない。`layer::anchored` の「展開の根を fd で受ける入口」）。他のホストは
+/// [`ExtractRoot`] のパスをそのまま使い、`extract_image_layers_bounded` と同じ挙動になる。
+/// そのほかの契約（`Err` のとき `root` を呼び出し側が破棄する・期限と取り消し）は `extract_image_layers_bounded` と同じ。
+pub fn extract_image_layers_bounded_in(
+    recorder: &dyn OciOpRecorder,
+    layers: &[ImageLayer<'_>],
+    root: &ExtractRoot,
+    max_uncompressed_bytes: u64,
+    limits: ExtractLimits,
+    options: &ExtractOptions,
+    budget: &ExtractBudget<'_>,
+) -> Result<Vec<ExtractedLayer>, OciError> {
+    extract_image_layers_at(
+        recorder,
+        layers,
+        RootRef::Handle(root),
+        max_uncompressed_bytes,
+        limits,
+        options,
+        budget,
+    )
+}
+
+/// 展開の根の渡され方（パス、または開いた fd。#4180）。
+#[derive(Clone, Copy)]
+enum RootRef<'a> {
+    Path(&'a Path),
+    Handle(&'a ExtractRoot),
+}
+
+impl RootRef<'_> {
+    /// 変更操作の起点を作る（パスなら開く。fd ならその複製を使い開き直さない）。
+    fn open_anchor(&self, hooks: AnchorHooks) -> Result<AnchoredRoot, OciError> {
+        match self {
+            Self::Path(p) => AnchoredRoot::open(p, hooks),
+            Self::Handle(h) => h.open_anchor(hooks),
+        }
+    }
+
+    /// 親ディレクトリの確認（`lstat`）に使うパス。fd のときは `/proc/self/fd/<fd>`。
+    fn probe_path(&self) -> Result<PathBuf, OciError> {
+        match self {
+            Self::Path(p) => Ok(p.to_path_buf()),
+            Self::Handle(h) => h.probe_path(),
+        }
+    }
+}
+
+fn extract_image_layers_at(
+    recorder: &dyn OciOpRecorder,
+    layers: &[ImageLayer<'_>],
+    root: RootRef<'_>,
+    max_uncompressed_bytes: u64,
+    limits: ExtractLimits,
+    options: &ExtractOptions,
+    budget: &ExtractBudget<'_>,
+) -> Result<Vec<ExtractedLayer>, OciError> {
     let setup = SpecialSetup::from_options(options);
     budget.check()?;
     // レイヤー 0 のイメージ（manifest の layers と diff_ids がともに空）は正常な入力。展開物は空の rootfs になる。
@@ -1015,9 +1089,12 @@ pub fn extract_image_layers_bounded(
 ///
 /// `ChownMapped` では空の rootfs でも root 自身を写像先へ `chown` する（`extract_stack` の `chown_root` と同じ）。
 /// 省くと root が 0700 の実行ユーザー所有のまま公開され、期待所有者の照合が常に食い違う（SEC-5・OCI-1）。
-fn extract_zero_layers(root: &Path, setup: &SpecialSetup) -> Result<Vec<ExtractedLayer>, OciError> {
+fn extract_zero_layers(
+    root: RootRef<'_>,
+    setup: &SpecialSetup,
+) -> Result<Vec<ExtractedLayer>, OciError> {
     let own = setup.owner_ctx()?;
-    let anchor = AnchoredRoot::open(root, setup.anchor)?;
+    let anchor = root.open_anchor(setup.anchor)?;
     check_root_empty(&anchor)?;
     if let Some(o) = &own {
         let ids = o.resolve((Some(0), Some(0)))?;
@@ -3301,7 +3378,7 @@ fn extract_stack<S: LayerSource>(
     extract_stack_bounded(
         recorder,
         layers,
-        root,
+        RootRef::Path(root),
         limits,
         lstat,
         setup,
@@ -3313,12 +3390,14 @@ fn extract_stack<S: LayerSource>(
 fn extract_stack_bounded<'a, S: LayerSource>(
     recorder: &dyn OciOpRecorder,
     layers: impl IntoIterator<Item = S>,
-    root: &'a Path,
+    root: RootRef<'_>,
     limits: ExtractLimits,
     lstat: Lstat,
     setup: SpecialSetup,
     stop: ExtractBudget<'a>,
 ) -> Result<Vec<ExtractedLayer>, OciError> {
+    // 親ディレクトリの確認に使うパス（fd の根では `/proc/self/fd/<fd>`。変更操作には使わない）。
+    let probe_root = root.probe_path()?;
     let mut x: Option<Extractor<'_>> = None;
     let mut input_used = 0u64;
     let mut out = Vec::new();
@@ -3337,10 +3416,10 @@ fn extract_stack_bounded<'a, S: LayerSource>(
             if x.is_none() {
                 // 選択肢の不正な組み合わせ・非 Linux の `chown` は、`root` に触れる前に拒否する。
                 let own = setup.owner_ctx()?;
-                let anchor = AnchoredRoot::open(root, setup.anchor)?;
+                let anchor = root.open_anchor(setup.anchor)?;
                 check_root_empty(&anchor)?;
                 x = Some(Extractor {
-                    root,
+                    root: &probe_root,
                     limits,
                     entries: 0,
                     bytes: 0,
@@ -6836,9 +6915,11 @@ mod tests {
         fn sec5_zero_layer_image_chowns_root() {
             let sb = Sandbox::new();
             take_calls();
-            let r =
-                extract_zero_layers(&sb.root, &chown_setup(SpecialBitsPolicy::Strip, rec_fns()))
-                    .unwrap();
+            let r = extract_zero_layers(
+                RootRef::Path(&sb.root),
+                &chown_setup(SpecialBitsPolicy::Strip, rec_fns()),
+            )
+            .unwrap();
             assert!(r.is_empty());
             let calls = take_calls();
             assert_eq!(calls.len(), 1);
@@ -7339,13 +7420,19 @@ mod tests {
             let sb = Sandbox::new();
             take_calls();
             let setup = ns_setup(SpecialBitsPolicy::Strip, rec_fns(), probe_ok);
-            assert!(extract_zero_layers(&sb.root, &setup).unwrap().is_empty());
+            assert!(
+                extract_zero_layers(RootRef::Path(&sb.root), &setup)
+                    .unwrap()
+                    .is_empty()
+            );
             let calls = take_calls();
             assert_eq!(calls.len(), 1);
             assert_eq!((calls[0].uid, calls[0].gid), (0, 0));
             let bad = ns_setup(SpecialBitsPolicy::Strip, rec_fns(), probe_initial_ns);
             assert_eq!(
-                extract_zero_layers(&sb.root, &bad).unwrap_err().code(),
+                extract_zero_layers(RootRef::Path(&sb.root), &bad)
+                    .unwrap_err()
+                    .code(),
                 OciErrorCode::FailedPrecondition
             );
             assert!(take_calls().is_empty());

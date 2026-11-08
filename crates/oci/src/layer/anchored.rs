@@ -30,7 +30,13 @@
 //! Linux 限定で `UnsupportedHost` に落ちるため、SEC-5 の TOCTOU は Linux 固有）。Linux の x86_64 / aarch64 以外は
 //! 定数と syscall 番号を確かめていないため、`open` が `Unimplemented` で拒否する。
 //!
-//! 展開と `remove_extracted_tree` を fd 起点にしない理由（#2598）: macOS・Windows の本番経路は cli の
+//! 展開の根を fd で受ける入口（#4180）: パスを受ける `extract_image_layers_bounded` とは別に、開いた fd を
+//! [`ExtractRoot`] で受ける `extract_image_layers_bounded_in` がある。cri の pull が `staging/<id>/unpack/entry/rootfs` を
+//! pull ディレクトリの fd 起点で作って渡す。この場合、変更操作は渡された fd を起点にし（`AnchoredRoot` を開き直さない）、
+//! 親ディレクトリの確認（`lstat`）は `/proc/self/fd/<fd>` 配下のパスで行う（開く時に dev / ino が fd と一致することを
+//! 確かめ、一致しない・`/proc` が無いときはパス起点へ縮退せず `Unimplemented`）。これにより確認も変更も同じ実体を見る。
+//!
+//! 展開と `remove_extracted_tree` を（パスを受ける入口で）fd 起点にしない理由（#2598）: macOS・Windows の本番経路は cli の
 //! `non_linux_failure` が先に fail-closed にし、ホストでの展開に届かない（実行はゲストの Linux 側）。macOS の
 //! `openat` 系・Windows のハンドル起点操作には新しい FFI 宣言と libc 照合・オーナー判断が要る。Linux の他
 //! アーキテクチャでは展開が `Unimplemented` のため展開物が存在せず、`remove_extracted_tree` は空の木を消すだけ
@@ -117,6 +123,61 @@ mod imp {
         match e.raw_os_error() {
             Some(at::ELOOP | at::EXDEV | at::ENOTDIR | at::EAGAIN) => path_changed(),
             _ => map_fs_err(e),
+        }
+    }
+
+    /// 開いたディレクトリ fd を展開の根として渡すための値（#4180。`extract_image_layers_bounded_in`）。
+    ///
+    /// 作れるのは crate 内（`image_management::UnpackDir::extract_root`）だけ。
+    #[derive(Debug)]
+    pub struct ExtractRoot {
+        fd: OwnedFd,
+    }
+
+    impl ExtractRoot {
+        pub(crate) fn from_fd(fd: OwnedFd) -> Self {
+            Self { fd }
+        }
+
+        /// 渡された fd を複製して `AnchoredRoot` にする（`root` を開き直さない）。ディレクトリでなければ拒否する。
+        pub(in crate::layer) fn open_anchor(
+            &self,
+            hooks: AnchorHooks,
+        ) -> Result<AnchoredRoot, OciError> {
+            let file = File::from(self.fd.try_clone().map_err(|e| map_fs_err(&e))?);
+            let meta = file.metadata().map_err(|e| map_fs_err(&e))?;
+            if !meta.is_dir() {
+                return Err(err(
+                    OciErrorCode::InvalidArgument,
+                    "extraction root is not a directory",
+                ));
+            }
+            Ok(AnchoredRoot {
+                root: file,
+                #[cfg(test)]
+                path: self.probe_path().unwrap_or_default(),
+                hooks,
+            })
+        }
+
+        /// 親ディレクトリの確認（`lstat`）に使うパス（`/proc/self/fd/<fd>`）。fd と同じ実体であることを確かめ、
+        /// 確かめられなければ `Unimplemented`（パス起点へ縮退しない）。
+        pub(in crate::layer) fn probe_path(&self) -> Result<PathBuf, OciError> {
+            use std::os::unix::fs::MetadataExt as _;
+            let unavailable = || {
+                err(
+                    OciErrorCode::Unimplemented,
+                    "extraction through a directory fd needs /proc/self/fd",
+                )
+            };
+            let own = File::from(self.fd.try_clone().map_err(|e| map_fs_err(&e))?)
+                .metadata()
+                .map_err(|e| map_fs_err(&e))?;
+            let p = PathBuf::from(format!("/proc/self/fd/{}", self.fd.as_raw_fd()));
+            match fs::metadata(&p) {
+                Ok(m) if (m.dev(), m.ino()) == (own.dev(), own.ino()) => Ok(p),
+                _ => Err(unavailable()),
+            }
         }
     }
 
@@ -594,6 +655,29 @@ mod imp {
         map_fs_err(e)
     }
 
+    /// 展開の根として渡すパス（パス起点のホスト。#4180。`extract_image_layers_bounded_in`）。
+    #[derive(Debug)]
+    pub struct ExtractRoot {
+        path: PathBuf,
+    }
+
+    impl ExtractRoot {
+        pub(crate) fn from_path(path: PathBuf) -> Self {
+            Self { path }
+        }
+
+        pub(in crate::layer) fn open_anchor(
+            &self,
+            hooks: AnchorHooks,
+        ) -> Result<AnchoredRoot, OciError> {
+            AnchoredRoot::open(&self.path, hooks)
+        }
+
+        pub(in crate::layer) fn probe_path(&self) -> Result<PathBuf, OciError> {
+            Ok(self.path.clone())
+        }
+    }
+
     /// パス起点の実装（macOS・Windows・Linux の他アーキテクチャ。モジュール冒頭「他の OS・アーキテクチャ」）。
     pub(in crate::layer) struct AnchoredRoot {
         root: PathBuf,
@@ -793,6 +877,7 @@ mod imp {
     }
 }
 
+pub use imp::ExtractRoot;
 #[cfg(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")

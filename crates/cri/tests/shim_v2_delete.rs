@@ -13,14 +13,14 @@ use std::time::Duration;
 
 use fandhe_container_core::traits::{
     ContainerRuntime, ContainerStatus, CreateRequest, DeleteRequest as RtDelete,
-    DeleteResponse as RtDeleteResponse, ErrorCode, KillRequest, StartRequest as RtStart,
+    DeleteResponse as RtDeleteResponse, ErrorCode, ExitTime, KillRequest, StartRequest as RtStart,
     StateRequest, StopRequest, TraitError,
 };
 use fandhe_container_cri::adapter::RuntimeAdapter;
 use fandhe_container_cri::shim_v2::{
     CreateTaskRequest, DeleteRequest, DeleteResponse, FrameHeader, HEADER_LEN, MessageType,
-    ServerConfig, ServiceRegistry, StartRequest, TaskApiVersion, TaskService, TtrpcRequest,
-    TtrpcResponse, TtrpcServer,
+    ServerConfig, ServiceRegistry, StartRequest, TaskApiVersion, TaskService, Timestamp,
+    TtrpcRequest, TtrpcResponse, TtrpcServer,
 };
 use prost::Message;
 
@@ -29,6 +29,8 @@ use prost::Message;
 struct Fake {
     containers: Mutex<HashMap<String, ContainerStatus>>,
     stopped_code: Mutex<Option<i32>>,
+    /// Stopped の応答に載せる core の終了検知時刻（UNIX ナノ秒。None は未記録。CRI-5・#4056）。
+    exited_at: Mutex<Option<i64>>,
 }
 
 struct Shared(Arc<Fake>);
@@ -78,7 +80,10 @@ impl ContainerRuntime for Shared {
             .cloned()
             .ok_or_else(|| TraitError::new(ErrorCode::NotFound, "none"))?;
         match *self.0.stopped_code.lock().unwrap() {
-            Some(c) => Ok(ContainerStatus::stopped(r.id().clone(), Some(c))),
+            Some(c) => {
+                let at = (*self.0.exited_at.lock().unwrap()).and_then(ExitTime::from_unix_nanos);
+                Ok(ContainerStatus::stopped_at(r.id().clone(), Some(c), at))
+            }
             None => Ok(cur),
         }
     }
@@ -112,9 +117,27 @@ fn del(id: &str, exec_id: &str) -> Vec<u8> {
 }
 
 /// CRI-5・ERR-3: 実行中は 9、停止後は成功して exit_status が返り、再度は NOT_FOUND（5）。
+/// 終了時刻が未記録なら `exited_at` は None のまま（捏造しない。REPAIR-3）。
 #[test]
 fn cri5_delete_over_uds() {
-    let root = test_root::test_root("ttrpc", "delete");
+    delete_flow("delete", None, None);
+}
+
+/// CRI-5・#4056: core の ExitTime（1_700_000_000_000_000_005 ns）が ttrpc 越しの `exited_at` として返る。
+#[test]
+fn cri5_4056_delete_over_uds_returns_exited_at() {
+    delete_flow(
+        "delete-at",
+        Some(1_700_000_000_000_000_005),
+        Some(Timestamp {
+            seconds: 1_700_000_000,
+            nanos: 5,
+        }),
+    );
+}
+
+fn delete_flow(tag: &str, exited_at: Option<i64>, expect: Option<Timestamp>) {
+    let root = test_root::test_root("ttrpc", tag);
     let path = root.join("s.sock");
     let listener = UnixListener::bind(&path).unwrap();
     let fake = Arc::new(Fake::default());
@@ -151,11 +174,12 @@ fn cri5_delete_over_uds() {
     let r = call(&mut s, 7, "Delete", del("c1", "e"));
     assert_eq!(r.status.unwrap().code, 12);
 
+    *fake.exited_at.lock().unwrap() = exited_at;
     *fake.stopped_code.lock().unwrap() = Some(3);
     let r = call(&mut s, 9, "Delete", del("c1", ""));
     assert!(r.status.is_none());
     let d = DeleteResponse::decode(&r.payload[..]).unwrap();
-    assert_eq!((d.pid, d.exit_status, d.exited_at), (0, 3, None));
+    assert_eq!((d.pid, d.exit_status, d.exited_at), (0, 3, expect));
 
     let r = call(&mut s, 11, "Delete", del("c1", ""));
     assert_eq!(r.status.unwrap().code, 5);

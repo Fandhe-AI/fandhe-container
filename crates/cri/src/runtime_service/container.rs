@@ -204,6 +204,27 @@ const REASON_OOM_KILLED: &str = "OOMKilled";
 pub(super) struct ExitReport {
     pub(super) code: Option<i32>,
     pub(super) termination: Option<RuntimeTerminationReason>,
+    /// core が記録した終了検知時刻（`ExitTime` の UNIX ナノ秒）。未記録は `None`（値を捏造しない。REPAIR-3）。
+    pub(super) exited_at_nanos: Option<i64>,
+}
+
+/// `finished_at` として記録する時刻を決める（CRI-1・CRI-2・CRI-5・#4056）。
+///
+/// `RuntimeService` の Start / Stop / 巻き戻しが、メモリの記録と永続化する記録の両方で同じ値を得るために
+/// 呼ぶ単一の算出点。shim v2 の `exited_at`（core の `ExitTime`）と kubelet から見える値を揃える。
+/// 実行層が終了時刻を報告していれば（正の値）それを使い、未記録（`None`・0 以下）のときは CRI が停止を
+/// 確定した時刻 `fallback_nanos` を使う（`ExitTime` を名乗らない。0 にもしない）。壁時計の後退等で
+/// `started_at` / `created_at` より前になる場合は、その大きい方を下限にして丸める（上限の丸めはしない）。
+pub(super) fn finished_at_for_exit(
+    record: &ContainerRecord,
+    exit: &ExitReport,
+    fallback_nanos: i64,
+) -> i64 {
+    let candidate = match exit.exited_at_nanos {
+        Some(n) if n > 0 => n,
+        _ => fallback_nanos,
+    };
+    candidate.max(record.started_at_nanos.max(record.created_at_nanos))
 }
 
 /// 実行層が報告した終了コードから `ContainerStatus.reason` を導く（CRI-2）。

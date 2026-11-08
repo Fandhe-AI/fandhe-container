@@ -1,7 +1,7 @@
 //! memslot のフラグ（`KVM_SET_USER_MEMORY_REGION` の `flags`）を型で表し、`KVM_CHECK_EXTENSION` で対応を判定する（#4157・MVM-1・#4105）。
 //!
 //! 役割: 未知のビットを持つ値を作れない [`MemslotFlags`] と、カーネルの対応を照会する継ぎ目
-//! [`MemslotCapabilityQuery`]、その判定の純関数 [`check_memslot_flags_supported`] を提供する。
+//! `MemslotCapabilityQuery`、その判定の純関数 `check_memslot_flags_supported` を提供する。
 //! 呼び出し文脈: [`crate::device::VmFd::check_memslot_flags`] が VM fd を継ぎ目として渡す。
 //! 未実装（REPAIR-3）: 登録 API（`set_user_memory_region` は `flags: 0` 固定のまま）への結線は #4158、hugepage は #4159。
 //!

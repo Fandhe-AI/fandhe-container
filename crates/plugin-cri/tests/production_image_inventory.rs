@@ -4,11 +4,15 @@
 //! `production()` は環境の状態ルート（rootless は `$XDG_RUNTIME_DIR/fandhe-container`）を使うため、試験バイナリ自身を
 //! 子プロセスとして 2 回（pull 段・再起動後の確認段）起動し、同じ一時の `XDG_RUNTIME_DIR` を渡す。
 //! pull はレジストリへ出ない固定の puller で行い、在庫の永続化と共有の配線だけを見る。root では既定の状態ルートが
-//! 実機のパスになるため走らせない（root の確認は実機前提の別試験）。unix 限定。
-#![cfg(unix)]
+//! 実機のパスになるため非 root を前提として明示検証し、満たさなければ失敗させる（skip で成功扱いにしない）。
+//! 子の実行は期限つきで回収する（REPAIR-5）。`production()` の状態ルートは Linux 以外では `Unimplemented` のため
+//! Linux 限定（永続ストア自体の Unix 共通の検証は oci 側）。
+#![cfg(target_os = "linux")]
 
 #[path = "../../net/tests/support/exclusive_dir.rs"]
 mod exclusive_dir;
+#[path = "../../core/tests/support/reap.rs"]
+mod reap;
 
 use std::path::Path;
 use std::process::Command;
@@ -110,12 +114,12 @@ async fn child_phase() {
 }
 
 fn run_child(xdg: &Path, phase: &str) {
-    let out = Command::new(std::env::current_exe().expect("exe"))
-        .args(["--exact", CHILD_TEST, "--nocapture", "--test-threads=1"])
+    let mut cmd = Command::new(std::env::current_exe().expect("exe"));
+    cmd.args(["--exact", CHILD_TEST, "--nocapture", "--test-threads=1"])
         .env("XDG_RUNTIME_DIR", xdg)
-        .env(ENV_PHASE, phase)
-        .output()
-        .expect("spawn child");
+        .env(ENV_PHASE, phase);
+    let out = reap::output_within(&mut cmd, std::time::Duration::from_secs(120))
+        .unwrap_or_else(|e| panic!("phase {phase} child: {e}"));
     assert!(
         out.status.success(),
         "phase {phase} failed: {}{}",
@@ -135,10 +139,10 @@ fn cri1_cri2_oci7_production_inventory_survives_restart() {
     if std::env::var_os(ENV_PHASE).is_some() {
         return;
     }
-    if is_root() {
-        eprintln!("running as root: the default state root is a host path; not exercised");
-        return;
-    }
+    assert!(
+        !is_root(),
+        "PRECONDITION FAILED: must run as non-root (the default state root would be a host path)"
+    );
     let base = std::env::temp_dir().canonicalize().expect("temp dir");
     let xdg = exclusive_dir::create_in(&base, "fc-cri-prodinv").expect("mkdir");
     run_child(&xdg, "pull");

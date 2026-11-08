@@ -8,6 +8,8 @@
 //!
 //! 組み立て（Linux）: 既定の状態ルート（`StateRoot::resolve(None)`。外部入力から受けない）の下を containerd の address・namespace ごとに分けた（`scoped_root`。状態ルートの兄弟に置く） `FileStateStore` の上に
 //! `CoreLifecycleRuntime` を作り、`RuntimeAdapter` で包んで `TaskService`（v2・v3。`with_shared_created` で共有）を登録する。
+//! exec（#4149）: `ShimExecLauncher`（#4148）を同じ状態ストアから作って v2・v3 へ `with_exec_launcher` で差す。停止時は登録簿の drop で
+//! 追跡中の helper を kill する（`StopHelpersOnDrop`）。
 //! デーモンの監査の記録先（`ServeContext::audit_sink`）を `with_create_audit_sink` に渡し、create の `mounts[].destination` の拒否を
 //! peer UID の拒否と同じ `@audit.log` へ残す（SEC-4）。
 //!
@@ -26,7 +28,7 @@
 //! `docs/design/shim-v2-production-binary.md` D5・D6。
 //!
 //! 未実装（REPAIR-3）: 非 Linux（macOS は既定の状態ルートが未決定で #2431、`start`・`kill`・`stop` も `Unimplemented`）は Shutdown だけの
-//! `EmptyTaskService` を登録する。exec の起動役（`TaskExecLauncher`）の本番実装は無く exec は `UNIMPLEMENTED`。
+//! `EmptyTaskService` を登録する（exec も `UNIMPLEMENTED`）。
 //! `-publish-binary` による TaskCreate・TaskStart・TaskDelete・TaskExit の publish は実装済み（#4155・#4156）。非 Linux の delete は
 //! 引数の検証だけで、記録の照合はしない（既定の状態ルートが未決定で #2431）。
 
@@ -156,23 +158,77 @@ fn core_runtime_for(state: std::sync::Arc<dyn StateStore>) -> crate::adapter::Co
     )
 }
 
+/// shim の停止時に追跡中の exec helper を止める `TaskExecLauncher` の包み（CRI-5・REPAIR-5・#4149）。
+///
+/// `launch` は中の [`ShimExecLauncher`] へ委ねるだけで、`Drop` で `shutdown_all` を呼ぶ。cri の bootstrap に停止の注入口を足さずに済ませる
+/// ための置き場所で、`run_serve` の終わりに `TtrpcServer` が drop され、接続スレッドの join の後に登録簿・`TaskService`（v2・v3）が
+/// drop されると最後の参照が落ちて止まる（Shutdown RPC でも socket 消失でも同じ）。
+/// 残余: サーバー停止の期限切れで接続スレッドが残る場合と shim の SIGKILL では走らず、helper は exec の期限（最長 1 時間）まで残る
+/// （`docs/design/shim-v2-production-binary.md`「#4149 の実装記録」）。
+#[cfg(target_os = "linux")]
+struct StopHelpersOnDrop(std::sync::Arc<crate::task_exec::ShimExecLauncher>);
+
+#[cfg(target_os = "linux")]
+impl fandhe_container_cri::shim_v2::exec::TaskExecLauncher for StopHelpersOnDrop {
+    fn launch(
+        &self,
+        container: &ContainerId,
+        exec_id: &fandhe_container_cri::shim_v2::exec::ExecId,
+        spec: &fandhe_container_cri::shim_v2::exec::ExecProcessSpec,
+    ) -> Result<std::sync::Arc<dyn fandhe_container_cri::shim_v2::exec::TaskExecProcess>, CriError>
+    {
+        self.0.launch(container, exec_id, spec)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for StopHelpersOnDrop {
+    fn drop(&mut self) {
+        self.0.shutdown_all();
+    }
+}
+
 /// 状態ルートを引数で受ける内側の関数（試験が一時ディレクトリの状態ルートで呼ぶ）。
 #[cfg(target_os = "linux")]
 pub(crate) fn registry_in(
     root: fandhe_container_core::state_store::StateRoot,
     ctx: ServeContext,
 ) -> Result<ServiceRegistry, CriError> {
+    registry_parts_in(root, ctx).map(|(reg, _)| reg)
+}
+
+/// [`registry_in`] の本体。登録簿と exec の起動役（停止の観測用）を返す（#4149）。
+///
+/// exec の起動役は scoped root と同じ状態ストア・同じパスから作り、v2・v3 で 1 つを共有する（同時数の枠と追跡一覧が shim で 1 つ）。
+#[cfg(target_os = "linux")]
+pub(crate) fn registry_parts_in(
+    root: fandhe_container_core::state_store::StateRoot,
+    ctx: ServeContext,
+) -> Result<
+    (
+        ServiceRegistry,
+        std::sync::Arc<crate::task_exec::ShimExecLauncher>,
+    ),
+    CriError,
+> {
     use std::sync::Arc;
 
     use fandhe_container_core::state_store::FileStateStore;
     use fandhe_container_core::traits::StateStore;
     use fandhe_container_cri::adapter::RuntimeAdapter;
+    use fandhe_container_cri::shim_v2::exec::TaskExecLauncher;
     use fandhe_container_cri::shim_v2::{TaskApiVersion, TaskService};
 
+    let state_root = root.path().to_path_buf();
     let state: Arc<dyn StateStore> = Arc::new(
         FileStateStore::open(root)
             .map_err(|_| CriError::internal("cannot open the state store"))?,
     );
+    let launcher = Arc::new(crate::task_exec::ShimExecLauncher::production(
+        state_root,
+        Arc::clone(&state),
+    ));
+    let exec: Arc<dyn TaskExecLauncher> = Arc::new(StopHelpersOnDrop(Arc::clone(&launcher)));
     let mut runtime = core_runtime_for(state);
     if let Some(sink) = ctx.audit_sink() {
         runtime = runtime.with_create_audit_sink(sink);
@@ -180,10 +236,12 @@ pub(crate) fn registry_in(
     let adapter = RuntimeAdapter::new(Arc::new(runtime));
     // イベント 4 種の送り先（`-publish-binary` が無ければ `None`。cri 側が `disabled` を記録する。CRI-5・#4155・#4156）。
     let publisher = fandhe_container_cri::shim_v2::publish::exec_publisher_for(&ctx);
-    let mut v2 =
-        TaskService::new(TaskApiVersion::V2, adapter.clone()).with_shutdown(ctx.shutdown().clone());
+    let mut v2 = TaskService::new(TaskApiVersion::V2, adapter.clone())
+        .with_shutdown(ctx.shutdown().clone())
+        .with_exec_launcher(Arc::clone(&exec));
     let mut v3 = TaskService::new(TaskApiVersion::V3, adapter)
         .with_shutdown(ctx.shutdown().clone())
+        .with_exec_launcher(exec)
         .with_shared_created(&v2);
     if let Some(p) = publisher {
         v2 = v2.with_event_publisher(Arc::clone(&p));
@@ -194,7 +252,7 @@ pub(crate) fn registry_in(
         reg.register(svc)
             .map_err(|_| CriError::internal("cannot register task service"))?;
     }
-    Ok(reg)
+    Ok((reg, launcher))
 }
 
 /// delete action の入口で検証済みの対象（CRI-5・SEC-1・#4151）。
@@ -685,6 +743,86 @@ mod tests {
         let reg = registry_in(root, ctx).expect("registry");
         let resp = reg.dispatch(&request(SERVICES[0], "State", id_payload("nope")));
         assert_eq!(resp.status.expect("status").code, NOT_FOUND);
+    }
+
+    /// `ExecProcessRequest { id = 1; exec_id = 2; spec = 7 }` を手で組む（prost を依存に足さない）。
+    fn exec_payload(id: &str, exec_id: &str) -> Vec<u8> {
+        let spec = br#"{"cwd":"/","args":["/bin/true"]}"#;
+        let url = fandhe_container_cri::shim_v2::exec::PROCESS_TYPE_URL.as_bytes();
+        let mut any = vec![0x0a, url.len() as u8];
+        any.extend_from_slice(url);
+        any.extend_from_slice(&[0x12, spec.len() as u8]);
+        any.extend_from_slice(spec);
+        let mut b = vec![0x0a, id.len() as u8];
+        b.extend_from_slice(id.as_bytes());
+        b.extend_from_slice(&[0x12, exec_id.len() as u8]);
+        b.extend_from_slice(exec_id.as_bytes());
+        b.extend_from_slice(&[0x3a, any.len() as u8]);
+        b.extend_from_slice(&any);
+        b
+    }
+
+    /// CRI-5・CRI-1・#4149: 登録簿の v2・v3 に exec の起動役が差さっており、存在しない id への Exec は `NOT_FOUND`(5)
+    /// （起動役が無ければ `UNIMPLEMENTED`=12）。
+    #[test]
+    fn cri5_4149_registry_exec_reaches_launcher() {
+        let guard = test_root::test_root("shim", "exec-wired");
+        let (reg, _signal) = registry(&guard.join("state"));
+        for svc in SERVICES {
+            let resp = reg.dispatch(&request(svc, "Exec", exec_payload("nope", "e1")));
+            assert_eq!(resp.status.expect("status").code, NOT_FOUND, "{svc}");
+        }
+    }
+
+    /// REPAIR-5・CRI-5・#4149: 登録簿を drop すると起動役が停止し、以後の launch は `UNAVAILABLE` "exec launcher is stopped"、
+    /// 追跡中の helper は 0 件。drop 前は停止していない（存在しない id は `NOT_FOUND`）。
+    #[test]
+    fn repair5_4149_registry_drop_stops_exec_helpers() {
+        use fandhe_container_core::traits::ContainerId;
+        use fandhe_container_cri::shim_v2::exec::{ExecId, TaskExecLauncher, parse_process_spec};
+        use fandhe_container_cri::shim_v2::task_api::Any;
+
+        let guard = test_root::test_root("shim", "exec-drop");
+        let root = StateRoot::resolve(Some(guard.join("state"))).expect("state root");
+        let (reg, launcher) =
+            registry_parts_in(root, ServeContext::new(ShutdownSignal::new(), None))
+                .expect("registry");
+        let spec = parse_process_spec(&Any {
+            type_url: fandhe_container_cri::shim_v2::exec::PROCESS_TYPE_URL.into(),
+            value: br#"{"cwd":"/","args":["/bin/true"]}"#.to_vec(),
+        })
+        .expect("spec");
+        let cid = ContainerId::new("nope").expect("id");
+        let eid = ExecId::new("e1").expect("exec id");
+        let before = launcher.launch(&cid, &eid, &spec).err().expect("error");
+        assert_eq!(before.message(), "container not found");
+        drop(reg);
+        let after = launcher.launch(&cid, &eid, &spec).err().expect("error");
+        assert_eq!(after.message(), "exec launcher is stopped");
+        assert_eq!(launcher.tracked_helpers(), 0);
+    }
+}
+
+/// 非 Linux は Shutdown だけの `EmptyTaskService` のまま（exec も `UNIMPLEMENTED`。CRI-5・REPAIR-3・#4149）。
+#[cfg(all(test, not(target_os = "linux")))]
+mod non_linux_tests {
+    use super::*;
+    use fandhe_container_cri::shim_v2::{ShutdownSignal, TtrpcRequest};
+
+    #[test]
+    fn cri5_4149_non_linux_registry_stays_empty() {
+        let reg = empty_registry(ServeContext::new(ShutdownSignal::new(), None)).expect("registry");
+        for svc in ["containerd.task.v2.Task", "containerd.task.v3.Task"] {
+            for method in ["State", "Exec"] {
+                let resp = reg.dispatch(&TtrpcRequest {
+                    service: svc.into(),
+                    method: method.into(),
+                    payload: vec![0x0a, 4, b'n', b'o', b'p', b'e'],
+                    ..Default::default()
+                });
+                assert_eq!(resp.status.expect("status").code, 12, "{svc} {method}");
+            }
+        }
     }
 }
 

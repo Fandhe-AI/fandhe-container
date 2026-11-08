@@ -1,11 +1,13 @@
 //! 制御チャネルの Attach 用 fd の受け渡し（AttachRequest。kind 9）の結合試験
-//! （SUP-4・SUP-7・REPAIR-2・REPAIR-5・SEC-1・CRI-6・#4075）。
+//! （SUP-4・SUP-7・REPAIR-2・REPAIR-5・REPAIR-12・SEC-1・CRI-6・#4075・#4138）。
 //!
 //! 実際の UDS の上で、`ControlAttach`（クライアント入口）→ `ControlServer` → `SignalSlot` の入出力と
 //! `CaptureHub` の tap を通し、`SCM_RIGHTS` で入力の fd と出力の tap の端が届くことを具体値で照合する。
 //! root・実コンテナは不要で既定のテスト集合で動く。コンテナの代わりに、stdin の pipe の読み取り側と出力の pipe の
 //! 書き込み側を試験が握る模擬の起動ハンドルを使う。拒否の応答が fd を持たないことは、サーバの `respond`
-//! （`write_all`。fd を添える口を持たない）による構造的な保証で、ここでは理由コードとクライアントの写像を照合する。
+//! （`write_all`。fd を添える口を持たない）による構造的な保証に加え、生の UDS と `sys` の `recvmsg` で、拒否では
+//! `SCM_RIGHTS` が 0 本・`MSG_CTRUNC` なし、成功では mask の本数が届くことも照合する（#4138・REPAIR-12）。
+//! 理由コードとクライアントの写像も照合する。
 
 #![cfg(target_os = "linux")]
 
@@ -21,6 +23,7 @@ use fandhe_container_core::oci_runtime::{
     ContainerOutput, ContainerStdin, LaunchedProcess, ProcessExit,
 };
 use fandhe_container_core::traits::{ContainerId, ErrorCode, TraitError};
+use fandhe_container_supervisor::control::client::recv_response_raw_for_test;
 use fandhe_container_supervisor::control::listener::{ControlListener, effective_uid};
 use fandhe_container_supervisor::control::observe::ControlObserver;
 use fandhe_container_supervisor::control::protocol::{
@@ -546,4 +549,174 @@ fn repair3_4075_unavailable_source_is_unimplemented() {
         )
         .unwrap_err();
     assert_eq!(e.code(), ErrorCode::Unimplemented);
+}
+
+fn attach_frame(pid: u32, stdin: bool, stdout: bool, stderr: bool, tty: bool) -> Vec<u8> {
+    AttachRequestFrame::new(
+        NonZeroU32::new(pid).unwrap(),
+        AttachMask::new(stdin, stdout, stderr).unwrap(),
+        tty,
+        SignalDeadline::from_now(Duration::from_secs(3)).unwrap(),
+    )
+    .unwrap()
+    .encode()
+    .to_vec()
+}
+
+/// 生の接続で `frame` を送り、応答を `recvmsg`（`sys::recv_with_fds`）で受けて、理由コード・受け取った fd・
+/// 制御データの切り詰め（`MSG_CTRUNC`）を返す。`ControlAttach` を通さないので fd を黙って捨てない。
+fn raw_exchange_with_fds(
+    rig: &Rig,
+    frame: &[u8],
+) -> (ControlReason, Vec<std::os::fd::OwnedFd>, bool) {
+    let path = rig.root.0.join(rig.id.as_str()).join("supervisor.sock");
+    let mut s = UnixStream::connect(path).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut hello = [0u8; HEADER_LEN];
+    s.read_exact(&mut hello).unwrap();
+    assert_eq!(hello, encode_hello());
+    s.write_all(frame).unwrap();
+    let raw = recv_response_raw_for_test(&s, Instant::now() + Duration::from_secs(5)).unwrap();
+    let mut resp = raw.bytes;
+    if resp.len() < RESPONSE_LEN {
+        let mut rest = vec![0u8; RESPONSE_LEN - resp.len()];
+        s.read_exact(&mut rest).unwrap();
+        resp.extend_from_slice(&rest);
+    }
+    let expected_head: [u8; HEADER_LEN] = [b'F', b'C', b'S', b'C', 1, 3, 0, 1];
+    assert_eq!(resp.get(..HEADER_LEN), Some(&expected_head[..]));
+    let reason = ControlReason::from_u8(*resp.last().unwrap()).unwrap();
+    (reason, raw.fds, raw.truncated)
+}
+
+fn link_of(fd: &impl std::os::fd::AsRawFd) -> String {
+    std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+        .unwrap()
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// SUP-4・SEC-1・REPAIR-12・#4138（D9）: 拒否の応答は `SCM_RIGHTS` の fd を 0 本しか持たず、`MSG_CTRUNC` も立たない。
+/// 受信側の制御バッファは fd 4 本分（`ATTACH_MAX_FDS` 以上）なので、0 本かつ切り詰めなしは「実際に添えられていない」
+/// ことを意味する（バッファが小さくて見落としたのではない）。
+#[test]
+fn sup4_sec1_repair12_4138_rejections_carry_no_scm_rights() {
+    let none = |reason| (reason, 0usize, false);
+    let observe = |rig: &Rig, frame: &[u8]| {
+        let (reason, fds, truncated) = raw_exchange_with_fds(rig, frame);
+        (reason, fds.len(), truncated)
+    };
+
+    // StdinNotOpen / TtyMismatch / PidMismatch
+    let rig = Rig::start(Setup {
+        tag: "rj-a",
+        stdin: None,
+        tty: false,
+        hub: true,
+        has_stdin: true,
+    });
+    assert_eq!(
+        observe(&rig, &attach_frame(PID, true, true, false, false)),
+        none(ControlReason::StdinNotOpen)
+    );
+    assert_eq!(
+        observe(&rig, &attach_frame(PID, false, true, false, true)),
+        none(ControlReason::TtyMismatch)
+    );
+    assert_eq!(
+        observe(&rig, &attach_frame(PID + 1, false, true, false, false)),
+        none(ControlReason::PidMismatch)
+    );
+    // Malformed（残りが 5 秒を超える期限）
+    let long = AttachRequestFrame::new(
+        NonZeroU32::new(PID).unwrap(),
+        AttachMask::new(false, true, false).unwrap(),
+        false,
+        SignalDeadline::from_now(Duration::from_secs(8)).unwrap(),
+    )
+    .unwrap()
+    .encode();
+    assert_eq!(observe(&rig, &long), none(ControlReason::Malformed));
+
+    // StdinClosed（1 回目は成功で fd 1 本。2 回目が拒否）
+    let once = Rig::start(Setup {
+        tag: "rj-b",
+        stdin: Some(StdinOption::Once),
+        tty: false,
+        hub: true,
+        has_stdin: true,
+    });
+    let frame = attach_frame(PID, true, false, false, false);
+    assert_eq!(observe(&once, &frame), (ControlReason::Ok, 1, false));
+    assert_eq!(observe(&once, &frame), none(ControlReason::StdinClosed));
+
+    // NoHandle
+    let no_hub = Rig::start(Setup {
+        tag: "rj-c",
+        stdin: Some(StdinOption::Open),
+        tty: false,
+        hub: false,
+        has_stdin: true,
+    });
+    assert_eq!(
+        observe(&no_hub, &attach_frame(PID, false, true, false, false)),
+        none(ControlReason::NoHandle)
+    );
+}
+
+/// SUP-4・SEC-1・REPAIR-12・#4138（対照）: 成功の応答では、同じ受信経路で mask に対応する本数の fd が届き、
+/// `MSG_CTRUNC` は立たない（上の 0 本の照合が受信経路の見落としでないことを示す）。
+#[test]
+fn sup4_sec1_repair12_4138_ok_carries_fds_matching_mask() {
+    let rig = Rig::start(Setup {
+        tag: "ok-a",
+        stdin: Some(StdinOption::Open),
+        tty: false,
+        hub: true,
+        has_stdin: true,
+    });
+    let (reason, fds, truncated) =
+        raw_exchange_with_fds(&rig, &attach_frame(PID, true, true, true, false));
+    assert_eq!(
+        (reason, fds.len(), truncated),
+        (ControlReason::Ok, 3, false)
+    );
+    // 並びは 入力（pipe）→ stdout の tap → stderr の tap（socket）。
+    assert!(
+        link_of(&fds[0]).starts_with("pipe:["),
+        "{}",
+        link_of(&fds[0])
+    );
+    assert!(link_of(&fds[1]).starts_with("socket:["));
+    assert!(link_of(&fds[2]).starts_with("socket:["));
+    drop(fds);
+
+    let (reason, fds, truncated) =
+        raw_exchange_with_fds(&rig, &attach_frame(PID, false, true, false, false));
+    assert_eq!(
+        (reason, fds.len(), truncated),
+        (ControlReason::Ok, 1, false)
+    );
+    assert!(link_of(&fds[0]).starts_with("socket:["));
+    drop(fds);
+
+    let tty = Rig::start(Setup {
+        tag: "ok-b",
+        stdin: Some(StdinOption::Open),
+        tty: true,
+        hub: true,
+        has_stdin: false,
+    });
+    let (reason, fds, truncated) =
+        raw_exchange_with_fds(&tty, &attach_frame(PID, true, true, false, true));
+    assert_eq!(
+        (reason, fds.len(), truncated),
+        (ControlReason::Ok, 2, false)
+    );
+    let master = link_of(&fds[0]);
+    assert!(
+        master == "/dev/ptmx" || master == "/dev/pts/ptmx",
+        "{master}"
+    );
+    assert!(link_of(&fds[1]).starts_with("socket:["));
 }

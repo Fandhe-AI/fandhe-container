@@ -232,8 +232,19 @@ helper を supervisor の bin に置く理由は、exec の領域（healthcheck 
 - **stdio の fd 種別（SUP-6・SEC-1）**: helper は受け取った stdin・stdout・stderr が AF_UNIX の socket か FIFO のときだけ受け、通常ファイル・ディレクトリ・文字デバイス（tty・pty・`/dev/null` を含む）・ブロックデバイスは exec も kind 7 の通知もせず `InvalidArgument`（`require_stdio_kinds`）。ホストの端末 fd をコンテナのコマンドへ渡して境界を越えさせないため
 - 期限: helper の `--timeout-ms` は supervisor の上限 `MAX_EXEC_HOLD_SECS`（1 時間）なので、exec のセッションは最長 1 時間で止まる（kubelet の idle 4 時間より短い。#4116 の確認事項）。`Started` までは 25 秒（cri の `launch_timeout` 30 秒より短い）、stdio の受け渡しは 5 秒、kill 後の回収は 10 秒（`REAP_BUDGET`）で、回収できなければ保持一覧（上限 8）に入れる
 - 停止: ドレインの期限（シグナルから 5 秒）で `stop_streaming_on` の `on_stop` が `shutdown_all` を呼び、追跡中の helper を kill する（「停止時のセッションの扱い」）。plugin-cri が SIGKILL された場合も、helper が fd 0 の切断を検知して通常 2 秒以内に終わる（下の「要求元の異常終了の検知」。実装は #4166、実機の照合は #4167 の `stream_exec_real` の `requester_killed` と `production_binary_exec_real` の段 4）。残る窓は listener の受け渡し前・通知処理中の最大 5 秒の遅れ・channel の端の漏れ
-- helper の fd 1・2 は `/dev/null` で、診断 JSON 行は捨てる（結果は `Result` frame の固定語彙で返る。REPAIR-4 の観測は後続）
+- helper の fd 1 は `/dev/null`。fd 2 は AF_UNIX の socketpair で受け、固定語彙の構造化ログへ転送する（下の「helper の fd 2 の診断の転送」。#4171）。結果は `Result` frame の固定語彙で返る
 - 終了コード: `Exited(n)`→n、`Signaled(s)`→128+s、`NotStarted`→子の終了状態、`Failed(code)`→コード別の固定英文の `CriError`
+
+#### helper の fd 2 の診断の転送（#4171・#4172・CRI-6・SUP-6・SEC-1・REPAIR-4・REPAIR-5）
+
+- **転送先**: plugin-cri の構造化ログ（`telemetry::LineSink` の共有 stderr sink。`SupervisorExecLauncher::with_diagnostic_sink` で試験用に差し替えられる）。行は `{"event":"cri_exec_helper_diagnostic",…}` と、要約の `{"event":"cri_exec_helper_diagnostics","outcome":"error",…}`。読み手を作れないときは `"reason":"reader_unavailable"` の 1 行を出す（exec は失敗にしない。観測は最善努力）
+- **pipe ではなく socketpair**: core の `emit_diagnostic_line_to` は AF_UNIX の socket にしか書かない（#1697）。helper 側の端は起動後に親で閉じ、helper の終了で読み手が EOF を観測できるようにする
+- **上限**（`exec_launcher/diagnostics.rs` の定数と一致）: 1 行 512 バイト（`DIAG_MAX_LINE_BYTES`。改行を含む）、解析対象 32 行（`DIAG_MAX_LINES`）、総 8 KiB（`DIAG_MAX_TOTAL_BYTES`）、1 行あたりの要素数 12（`MAX_PAIRS`）。超えた分は読み捨てる（読むのをやめると helper の同期書き込みが止まるため）。メモリは入力量に比例しない
+- **捨てた行の数え方**: 要約行の `forwarded`（転送した行）・`ignored`（語彙内だが失敗の欄が無い行。例 `entrypoint_mode`）・`unparsed`（解釈できない行。改行の無い末尾の断片を含む）・`dropped_lines` / `dropped_bytes`（上限を超えた分）。要約行は unparsed か dropped があるとき、または終わりが `deadline`・`read_error` のときだけ出す。終わりの語彙は `eof`・`stopped`・`deadline`・`read_error`
+- **出さない項目**: 出力は閉じた語彙で引き直した `&'static str` と整数だけ。argv・トークン・コンテナ ID・パス・入出力の内容・`message` の値・helper の自由文は写さない（SEC-1）
+- **停止**: 読み手は 100 ms 刻み（`DIAG_POLL`）で停止フラグと絶対期限を確かめる。helper の kill・セッションの drop・`shutdown_all` が停止フラグを立て、停止後は 50 ms（`DIAG_STOP_DRAIN`）だけ残りを読む。EOF には頼らない（fork した worker が書き込み端を継承しうるため）。終了時の待ちは 500 ms（`DIAG_JOIN_BUDGET`）。絶対期限は `Started` の予算 25 秒 + セッション 3600 秒 + 結果の余裕 30 秒
+- **試験**: 単体試験（`diagnostics/tests.rs`・`exec_launcher/tests.rs` の偽 helper）、`exec_helper_diag_real.rs`（実の子プロセスの結線）、`exec_helper_failure_diag.rs`（#4172。自分自身を `stream-exec` helper として再実行し、supervisor の bin と同じ入口で動く実 helper のコードで場面 A・B を照合する。既定の集合で動く）。A は fd 0 が socket でない helper で、ログは `{"event":"cri_exec_helper_diagnostic","code":"INVALID_ARGUMENT"}` の 1 行。B は存在しない pid のコンテナを本番の `SupervisorExecLauncher` で exec し、supervisor 不在で `UNAVAILABLE`（`exec helper is unavailable`）・転送行 0 件。両場面で、既知のコンテナ ID・argv・トークン風の値・状態ルートの名前がログの全バイト列に現れないことを照合する
+- **残余（REPAIR-3）**: 段名と errno を fd 2 へ出す生成側が supervisor・core に無い。helper が fd 2 に書くのは「fd 0 が socket でない」「要求元の消滅で取り消した」の 2 行（`code` と `message`）だけで、状態の不一致・kind 6 の失敗・stdio の受け取りの失敗・`require_stdio_kinds` の拒否は `Failed(code)` の `Result` frame だけで返り、errno は運ばれない（`TraitError`・`ChannelError` が errno を持たないため）。生成側を足すには、制御クライアントへの errno の受け渡し・helper の起動前の段の語彙・転送側の分類語彙（core の `ExecChildStep`・`IsolationStage` のみ受ける）の拡張が要り、後続 issue で扱う。`require_stdio_kinds`・mask の不一致の場面は稼働中の supervisor が前提のため、生成側が入った後に実機前提の試験（`stream_exec_real.rs`・`cri_exec_real.rs` の系統）で照合する。seccomp の集計行は unparsed として数える。fd 1 は `/dev/null` のまま
 
 #### 要求元の異常終了の検知（#4165・#4112・SUP-6・SEC-1・REPAIR-5）
 
@@ -461,6 +472,7 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 | attach の follow スレッドの書き込みの刻み（取り消しの確認） | 200 ms |
 | PortForward の dial / 対の揃い / 書き込みの stall | 10 秒 / 30 秒 / 30 秒 |
 | `StreamingServer` の SIGTERM での停止 | 受信の検知（100 ms 周期）で待ち受けを閉じる（待ちなし。#3754）。受け付け済みのセッションはシグナルから 5 秒（`STREAMING_DRAIN_WAIT`）ドレインし、期限で exec を止めて 1 秒（`STREAMING_CLOSE_WAIT`）待ち、残りを強制クローズする。gRPC の猶予 10 秒以内に収まり、全体の上限 13.7 秒は不変（#4164。暫定値で #4116 の対象） |
+| helper の fd 2 の読み手（#4171） | 読み取りの刻み 100 ms / 停止後の drain 50 ms / 終了時の待ち 500 ms / 絶対期限 25 秒 + 3600 秒 + 30 秒 |
 | 要求元の切断の検知（helper の serve の刻み）/ 検知から helper の終了まで | 20 ms / 合否値 2 秒（通知処理のない通常ケース。遅延・回収失敗ケースは検知最大 5 秒・回収込み 約 15 秒。期限と `hold_grace` は不変）。#4165。実装済み（#4166）。実機前提試験は `stream_exec_real` の `requester_killed` と `production_binary_exec_real` の段 4（#4167） |
 
 ### 実装単位と兄弟 issue の対応
@@ -508,6 +520,7 @@ CRI の `ExecSync`（現状 `UNIMPLEMENTED`）も本設計の helper を再利�
 - Exec の相対 argv[0]（PATH 解決）: #2439 の判断待ち。RPC 時に `INVALID_ARGUMENT`
 - Exec の実機前提試験: #3762。完全版 Attach の実機前提試験は #4079（`production_binary_attach_real`）で実装済み
 - Exec の残余: plugin-cri の異常終了時の helper の早期停止は #4112（#4166・#4167）で解消。残る窓は listener の受け渡し前・通知処理中の最大 5 秒の遅れ・channel の端の漏れだけ（`PtyMaster` の fd 検証は #4100 で解消）
+- Exec の残余（診断）: helper の fd 2 へ段名と errno を出す生成側が無い（supervisor・core・転送側の分類語彙。#4172 で現状を試験に固定済み。生成側は後続 issue）
 - Attach の残余: 入力の書き込みは全セッション共通の排他（`WRITE_ARBITER`）で調停する。plugin 外の書き手が空きを使い切ると保持者は `write` で止まり、その間は全セッション・全コンテナの入力が進まない。他のセッションの排他の待ちは取り消しで抜け、スレッド・fd・枠を返す（#4134・CRI-6・REPAIR-5）
 - 暫定値・設計の確認事項（exec の全体上限・同時セッション数・`::1`・終了コード・観測名など）: 上の「未確認・オーナー確認事項」と #4116（オーナー判断）
 - rootful: plugin-cri の start が uid 0 を `UNIMPLEMENTED` にするため、rootful のコンテナは無く 3 RPC とも使えない（uid 0 の拒否は #2442、rootful を許すかは #2241 の判断待ち）

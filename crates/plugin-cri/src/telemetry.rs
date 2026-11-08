@@ -19,7 +19,8 @@
 //! 操作統計は記録器ごとのブロックで出す。本番は共有記録器と oci 専用記録器の 2 つで、1 周期に `op_stats_meta` 行が 2 行出る（共有・oci の順。#2900）。
 //!
 //! # 未実装（REPAIR-3）
-//! - 操作統計の出力先は stderr のみ。メトリクス公開口への接続は #1869 の core 側 proxy の責務
+//! - 操作統計の出力先は stderr のみ。stderr 以外の公開口の方式は `docs/design/cri-op-stats-export.md`（#4228・CRI-6・REPAIR-4）で
+//!   決めた（原子的に置き換えるスナップショットファイルを opt-in で出す案。オーナー承認は未取得）。実装は同書 6 章の作業単位（未起票）
 //! - 監査の永続化経路は Linux 限定（`ControlAuditRelay` が Linux 限定、非 Linux の `FileAuditSink` は #2430 の
 //!   判断待ち）。非 Linux では `PeerAuditForwarder` を渡さず、拒否は stderr にだけ残る
 

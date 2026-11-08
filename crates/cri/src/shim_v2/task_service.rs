@@ -49,7 +49,7 @@
 //! - State: 未起動（Created / Starting）は CREATED・pid 0、実行中は RUNNING・pid、終了済みは STOPPED・pid・終了コード
 //!   （不明・負値は 255）。応答の `id` は exec ID（runc と同じ。`exec_id` 欄は空）。
 //! - Kill: 未起動は `FAILED_PRECONDITION`（"process not created"）、終了済みは `NOT_FOUND`（"process already finished"）、
-//!   実行中は `TaskExecProcess::signal` の結果をそのまま返す。`exec_id` と `all = true` の組は `UNIMPLEMENTED` のまま
+//!   実行中は `TaskExecProcess::signal` の結果をそのまま返す。`status()` が `Err` でも SIGKILL のときは `signal` へ進む（消滅未確認の exec への再 kill。#4148）。`exec_id` と `all = true` の組は `UNIMPLEMENTED` のまま
 //!   （runc の exec は `all` を無視するが、containerd v2.1.4 の `core/runtime/v2/process.go` は `all` を shim へ送らない。
 //!   未対応の欄を黙って無視しない〔REPAIR-3〕ため拒否を保つ。別のクライアントで必要になれば条件を外すだけで戻せる）。
 //! - Wait: containerd の CRI は `Wait` を `Start` より前に呼ぶ（ExecSync）ため、未起動は `Started` になるまで待ち、続けて終了を待つ。
@@ -317,15 +317,22 @@ impl TaskService {
                 "process not created",
             )));
         };
-        match process.status().map_err(|e| to_status(&e))? {
-            ExecProcessStatus::Exited { .. } => Err(RpcStatus::from_code(
+        match process.status() {
+            Ok(ExecProcessStatus::Exited { .. }) => Err(RpcStatus::from_code(
                 CriErrorCode::NotFound,
                 "process already finished",
             )),
-            ExecProcessStatus::Running => {
+            Ok(ExecProcessStatus::Running) => {
                 process.signal(signal).map_err(|e| to_status(&e))?;
                 Ok(Vec::new())
             }
+            // 状態を確定できなくても SIGKILL だけは届ける（kill 済みで消滅未確認の exec への再 kill を拒まない。
+            // 起動役が自分で判断する。#4148・CRI-5）。SIGKILL 以外は fail-closed で状態のエラーを返す。
+            Err(_) if signal == Signal::SIGKILL => {
+                process.signal(signal).map_err(|e| to_status(&e))?;
+                Ok(Vec::new())
+            }
+            Err(e) => Err(to_status(&e)),
         }
     }
 
@@ -2726,6 +2733,19 @@ mod tests {
         );
         s.handle("Delete", &delete_req("c1", "e0")).unwrap();
         s.handle("Exec", &exec_req("c1", "e0", SPEC)).unwrap();
+    }
+
+    /// CRI-5・REPAIR-5（#4148）: status() が失敗でも SIGKILL は届き、他のシグナルは状態のエラーを返して送らない。
+    #[test]
+    fn cri5_4148_kill_exec_status_failure_only_sigkill_passes() {
+        let (s, _, l) = started(TaskApiVersion::V2);
+        *l.last().status_fails.lock().unwrap() = true;
+        let (code, msg) = err_code(s.handle("Kill", &kill_req("c1", 15, false, "e1")));
+        assert_eq!((code, msg.as_str()), (UNAVAILABLE, "status failed"));
+        assert!(l.last().signals.lock().unwrap().is_empty());
+        let out = s.handle("Kill", &kill_req("c1", 9, false, "e1")).unwrap();
+        assert!(out.is_empty());
+        assert_eq!(*l.last().signals.lock().unwrap(), vec![9]);
     }
 
     /// REPAIR-5・fail-closed: status() の失敗は写像して返し、登録は残る。

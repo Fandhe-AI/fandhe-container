@@ -117,6 +117,8 @@ struct FakeProcess {
     waits: Mutex<Vec<Option<ProcessExit>>>,
     /// 次の `terminate` が返すエラー(一度だけ。#3360)。
     terminate_err: Mutex<Option<TraitError>>,
+    /// `take_stdin` が返す書き込み端(転送の照合用。#4074)。
+    stdin: Mutex<Option<fandhe_container_core::oci_runtime::ContainerStdin>>,
 }
 
 impl FakeProcess {
@@ -125,6 +127,7 @@ impl FakeProcess {
             ev: Arc::clone(ev),
             waits: Mutex::new(waits),
             terminate_err: Mutex::new(None),
+            stdin: Mutex::new(None),
         })
     }
 
@@ -158,6 +161,9 @@ impl LaunchedProcess for FakeProcess {
     fn signal(&self, signal: Signal, _d: Instant) -> Result<(), TraitError> {
         push(&self.ev, format!("container signal {}", signal.as_u8()));
         Ok(())
+    }
+    fn take_stdin(&self) -> Option<fandhe_container_core::oci_runtime::ContainerStdin> {
+        self.stdin.lock().unwrap().take()
     }
 }
 
@@ -560,6 +566,32 @@ fn net9_drop_without_wait_tears_down_helpers() {
             "remove run_dir"
         ]
     );
+}
+
+/// SUP-7・CRI-6・#4074: `PastaGuardedProcess` は stdin の書き込み端を内側から 1 回だけ転送する(転送漏れは stdin が黙って閉じる)。
+#[test]
+fn cri6_4074_guarded_process_forwards_take_stdin() {
+    use std::io::{Read, Write};
+    let ev: Events = Arc::default();
+    let backend = FakeBackend::new(&ev);
+    let (w, _b) = wiring(&backend);
+    attach(&w).expect("attach");
+    let (mut reader, writer) = std::io::pipe().expect("pipe");
+    let inner = FakeProcess::new(&ev, vec![]);
+    *inner.stdin.lock().unwrap() =
+        Some(fandhe_container_core::oci_runtime::ContainerStdin::from_pipe_writer_for_test(writer));
+    let guarded = PastaGuardedProcess::new(
+        inner,
+        lock(&w.slot).take().expect("attachment"),
+        w.logger.clone(),
+    );
+    let mut stdin = guarded.take_stdin().expect("forwarded stdin");
+    assert!(guarded.take_stdin().is_none());
+    stdin.write_all(b"in").expect("write");
+    drop(stdin);
+    let mut got = String::new();
+    reader.read_to_string(&mut got).expect("read");
+    assert_eq!(got, "in");
 }
 
 /// 内側の launcher への転送(転送漏れは降格・監査の欠落になる)。

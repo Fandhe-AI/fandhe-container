@@ -1686,6 +1686,12 @@ impl LaunchedProcess for PastaGuardedProcess {
         self.inner.take_seccomp_listener()
     }
 
+    /// init の stdin の書き込み端を内側へ転送する（転送しないと包み直した後に取り出せず、stdin が黙って閉じる。
+    /// SUP-7・CRI-6・#4074）。
+    fn take_stdin(&self) -> Option<fandhe_container_core::oci_runtime::ContainerStdin> {
+        self.inner.take_stdin()
+    }
+
     /// init の pty の master を内側へ転送する（転送しないと包み直した後に取り出せない。CRI-6・#4070）。
     fn take_pty_master(&self) -> Option<fandhe_container_core::exec::PtyMaster> {
         self.inner.take_pty_master()

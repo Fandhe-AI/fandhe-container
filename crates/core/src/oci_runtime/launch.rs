@@ -753,6 +753,16 @@ impl ContainerStdin {
         Self { writer }
     }
 
+    /// 試験専用: 任意の pipe の書き込み端から作る(supervisor の試験が偽の `LaunchedProcess::take_stdin` を作る入口。
+    /// SUP-7・CRI-6・#4074)。本番の構築は launcher の spawn だけ(`new` は crate 内)で、この入口は `exec-test-support`
+    /// feature の下にだけ存在する。
+    #[cfg(feature = "exec-test-support")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn from_pipe_writer_for_test(writer: std::io::PipeWriter) -> Self {
+        Self { writer }
+    }
+
     /// 書き込み端の複製(close-on-exec)。複数の保持者(例: SCM_RIGHTS で渡す側)へ分けるときに使う。
     pub fn try_clone(&self) -> std::io::Result<Self> {
         Ok(Self {

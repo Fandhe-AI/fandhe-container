@@ -11,6 +11,11 @@
 //! - exec のプロセスの `/proc/<pid>/status` の `CapEff`・`CapPrm`・`CapBnd`・`Seccomp` が、コンテナの init を超えないこと（SEC-1）。
 //!   `CapEff` は OCI 既定（`0xa80425fb`）と一致し、`Seccomp` は 2（filter）
 //!
+//! - 要求元の異常終了（段 4。SUP-6・SEC-1・REPAIR-5・#4167）: 終わらない exec（`sleep 617`）を SPDY で開いたまま plugin-cri を SIGKILL
+//!   すると、helper（`--timeout-ms` は 60 秒以上）が fd 0 の切断を検知して 2 秒以内に終わり、exec のコマンドが `/proc` に残らない。
+//!   helper は plugin-cri の子から探し、開始時刻つきで消滅を判定する（plugin-cri の死後は init 等へ再親付けされるため）。
+//!   段 4 の後は再起動した plugin-cri が記録を再採用して後始末する（本物の状態ルートに記録を残さないため）。
+//!
 //! ハーネス（TempDir・ChildGuard・接続待ち・pull の失敗行）は `container_grpc.rs` の段 C と同じものを最小化して複製した
 //! （試験 crate 間でモジュールを共有できないため）。`container_grpc.rs` は変更しない（波及の最小化。REPAIR-1）。
 //!
@@ -301,6 +306,151 @@ async fn exec_once(c: &mut RuntimeServiceClient<Channel>, id: &str, cmd: &[&str]
     }
 }
 
+// ---- /proc の走査（段 4。外部入力なので失敗は「不一致」へ倒す） ----
+
+/// `/proc/<pid>/stat` の (状態, 開始時刻)。comm に `)` が入りうるため最後の `)` 以降を読む。
+fn proc_state_and_start(pid: u32) -> Option<(char, u64)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = stat.get(stat.rfind(')')? + 1..)?;
+    let mut fields = rest.split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    // rest の先頭は 3 番目のフィールド（state）。開始時刻は 22 番目なので state の後 19 個目。
+    let start = fields.nth(18)?.parse::<u64>().ok()?;
+    Some((state, start))
+}
+
+/// 記録した (pid, 開始時刻) のプロセスが消えている（stat が無い・ゾンビ・死亡・開始時刻が違う＝pid の再利用）か。
+fn is_gone(pid: u32, starttime: u64) -> bool {
+    match proc_state_and_start(pid) {
+        None => true,
+        Some((state, start)) => state == 'Z' || state == 'X' || start != starttime,
+    }
+}
+
+/// `/proc/<pid>/cmdline` の引数列（NUL 区切り）。
+fn cmdline_args(pid: u32) -> Option<Vec<String>> {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    Some(
+        raw.split(|b| *b == 0)
+            .filter(|a| !a.is_empty())
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect(),
+    )
+}
+
+/// cmdline が `argv` に完全一致し、ゾンビ・死亡でない生きたプロセスの (pid, 開始時刻)。
+fn live_pids_with_argv(argv: &[&str]) -> Vec<(u32, u64)> {
+    let mut found = Vec::new();
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return found;
+    };
+    for e in dir.flatten() {
+        let Some(pid) = e.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
+            continue;
+        };
+        if cmdline_args(pid).is_some_and(|a| a == argv)
+            && let Some((state, start)) = proc_state_and_start(pid)
+            && state != 'Z'
+            && state != 'X'
+        {
+            found.push((pid, start));
+        }
+    }
+    found
+}
+
+/// `parent` の子のうち、第 1 引数が `stream-exec` のもの（helper）の (pid, 開始時刻, `--timeout-ms`)。
+fn stream_exec_helpers_of(parent: u32) -> Vec<(u32, u64, u64)> {
+    let mut found = Vec::new();
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{parent}/task")) else {
+        return found;
+    };
+    for t in tasks.flatten() {
+        let Ok(children) = std::fs::read_to_string(t.path().join("children")) else {
+            continue;
+        };
+        for pid in children
+            .split_whitespace()
+            .filter_map(|v| v.parse::<u32>().ok())
+        {
+            let Some(args) = cmdline_args(pid) else {
+                continue;
+            };
+            if args.get(1).map(String::as_str) != Some("stream-exec") {
+                continue;
+            }
+            let timeout_ms = args
+                .iter()
+                .position(|a| a == "--timeout-ms")
+                .and_then(|i| args.get(i + 1))
+                .and_then(|v| v.parse::<u64>().ok());
+            if let (Some((_, start)), Some(timeout_ms)) = (proc_state_and_start(pid), timeout_ms) {
+                found.push((pid, start, timeout_ms));
+            }
+        }
+    }
+    found
+}
+
+/// 終わらない exec を開き、`marker` の出力（コマンドの起動の合図）を読んだ接続をそのまま返す（段 4）。
+///
+/// 接続は呼び出し側が plugin-cri を殺すまで閉じない。先に閉じると `ExecSession` の drop が通常の経路で helper を止めてしまい、
+/// 要求元の消滅の検知を照合したことにならないため。
+async fn exec_open_until_marker(
+    c: &mut RuntimeServiceClient<Channel>,
+    id: &str,
+    cmd: &[&str],
+    marker: &'static [u8],
+) -> Spdy {
+    let url = call_with_deadline(
+        c.exec(cri::ExecRequest {
+            container_id: id.into(),
+            cmd: cmd.iter().map(|s| s.to_string()).collect(),
+            tty: false,
+            stdin: false,
+            stdout: true,
+            stderr: true,
+        }),
+        RPC_DEADLINE,
+    )
+    .await
+    .expect("exec rpc")
+    .into_inner()
+    .url;
+    assert!(url.starts_with("http://127.0.0.1:"), "url: {url}");
+    let (authority, path) = split_url(&url);
+    let addr: SocketAddr = authority.parse().expect("authority");
+    let join = tokio::task::spawn_blocking(move || {
+        let mut s = Spdy::connect(addr, &path, &EXEC_VERSIONS, "v4.channel.k8s.io");
+        s.tcp
+            .set_read_timeout(Some(SPDY_READ_TIMEOUT))
+            .expect("read timeout");
+        let _error = s.create_stream(&[("streamtype", "error")]);
+        let stdout = s.create_stream(&[("streamtype", "stdout")]);
+        let _stderr = s.create_stream(&[("streamtype", "stderr")]);
+        let got = s.read_at_least(stdout, marker.len());
+        assert_eq!(got, marker, "the long exec must report that it started");
+        s
+    });
+    tokio::time::timeout(Duration::from_secs(90), join)
+        .await
+        .expect("exec open deadline")
+        .expect("join")
+}
+
+/// plugin を SIGKILL して期限つきで回収する（試験自身の子。REPAIR-5）。
+fn kill_and_reap(guard: &mut ChildGuard) {
+    let _ = guard.0.kill();
+    let start = Instant::now();
+    while start.elapsed() < REAP_GRACE {
+        if matches!(guard.0.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("plugin binary was not reaped within {REAP_GRACE:?} after SIGKILL");
+}
+
 fn status_str<'a>(j: &'a mini_json::Json, key: &str) -> &'a str {
     j.get(key)
         .and_then(mini_json::Json::as_str)
@@ -488,6 +638,80 @@ async fn production_binary_exec_real() {
         assert_eq!(exec_st.get("Seccomp").map(String::as_str), Some("2"));
         assert_eq!(hex_field(&exec_st, "CapInh"), 0);
         assert_eq!(hex_field(&exec_st, "CapAmb"), 0);
+
+        // 4. 要求元の異常終了（SUP-6・SEC-1・REPAIR-5・#4167）: 終わらない exec を開いたまま plugin-cri を SIGKILL すると、
+        //    helper が 2 秒以内に終わり、exec のコマンドが残らない。helper の期限は 60 秒以上で、期限や hold_grace では説明できない。
+        const LONG_ARG: &str = "617";
+        let long_argv = ["/bin/sleep", LONG_ARG];
+        let spdy = exec_open_until_marker(
+            &mut c,
+            &id,
+            &["/bin/sh", "-c", "echo started; exec /bin/sleep 617"],
+            b"started\n",
+        )
+        .await;
+        let helpers = stream_exec_helpers_of(guard.0.id());
+        assert_eq!(helpers.len(), 1, "exactly one helper under plugin-cri: {helpers:?}");
+        let (helper_pid, helper_start, helper_timeout_ms) = helpers[0];
+        assert!(
+            helper_timeout_ms >= 60_000,
+            "the helper timeout {helper_timeout_ms} ms must be far above the 2s budget"
+        );
+        let cmds = live_pids_with_argv(&long_argv);
+        assert_eq!(cmds.len(), 1, "exactly one live long exec command: {cmds:?}");
+        let (cmd_pid, cmd_start) = cmds[0];
+
+        let t0 = Instant::now();
+        kill_and_reap(&mut guard);
+        let elapsed = loop {
+            if is_gone(helper_pid, helper_start) {
+                break t0.elapsed();
+            }
+            assert!(
+                t0.elapsed() < Duration::from_secs(15),
+                "the helper did not exit within 15s after plugin-cri was killed"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert!(
+            elapsed <= Duration::from_secs(2),
+            "the helper took {elapsed:?} to exit after plugin-cri was killed (budget 2s)"
+        );
+        // helper は cgroup の回収を終えてから終わるため、終了の直後に確かめる。
+        assert!(
+            is_gone(cmd_pid, cmd_start),
+            "the exec command (pid {cmd_pid}) must be gone once the helper has exited"
+        );
+        assert_eq!(
+            live_pids_with_argv(&long_argv),
+            Vec::<(u32, u64)>::new(),
+            "no long exec command may remain"
+        );
+        // libtest のキャプチャを迂回して情報行を出す（`^test ... ` の形にしない）。
+        {
+            use std::io::Write as _;
+            let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+                .map(|s| s.trim().to_string())
+                .unwrap_or_else(|_| "unknown".to_string());
+            let _ = writeln!(
+                std::io::stderr(),
+                "production_binary_exec_real: info plugin_kill_elapsed_ms={} budget_ms=2000 helper_timeout_ms={helper_timeout_ms} kernel={kernel}",
+                elapsed.as_millis()
+            );
+        }
+        // kill の後は pump せず、接続は drop するだけにする。
+        drop((spdy, c, images, ch));
+
+        // plugin-cri を再起動して記録を再採用させ、同じ状態ルートの後始末をそこで行う
+        // （本物の状態ルートに記録を残さない。残った場合は docs/setup/cri-record-recovery.md の手順で回収する）。
+        let sock2 = dir.0.join("b.sock");
+        let mut guard = spawn_server_inherit_env(&plugin_bin, &sock2);
+        let config2 = GrpcClientConfig::new()
+            .with_request_timeout(Duration::from_secs(600))
+            .expect("request timeout");
+        let ch = connect_when_ready_with(&sock2, &mut guard, config2).await;
+        let mut c = RuntimeServiceClient::new(ch.clone());
+        let images = ImageServiceClient::new(ch.clone());
 
         // 後始末。
         call_with_deadline(

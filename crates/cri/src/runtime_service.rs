@@ -71,7 +71,11 @@
 //! 解放する（running の強制削除。プロセスの強制終了と、実待機の上限・REPAIR-5 のタイムアウトは TASK-59 で
 //! 追加する。REPAIR-3）。
 //!
-//! **ListContainers/ContainerStatus の扱い（CRI-1・ERR-3・TASK-58.3・#435）**: 読み取り専用。
+//! **ListContainers/ContainerStatus の扱い（CRI-1・ERR-3・TASK-58.3・#435）**: `ListContainers` は読み取り専用
+//! （自然終了の観測は #4175 の E2 まで行わない）。`ContainerStatus` は実行層接続時に running の記録について
+//! `RuntimeAdapter::state` を期限つき（`CONTAINER_EXIT_OBSERVE_TIMEOUT` 1 秒・暫定）で 1 回読み、停止済みなら
+//! `StopContainer` と同じ代入（`apply_exit`）で exited・終了コード・finished_at を取り込む（#4174・#4173 の E1。
+//! 失敗・期限切れは記録の値で成功し `cri.container_exit_observe` に 1 件記録。記録ファイルへは書かない）。
 //! `ContainerStatus` は空 ID を `INVALID_ARGUMENT`、未知 ID（Remove 済みを含む）を `NOT_FOUND` にする。
 //! `ListContainers` は一致なし・未知 ID・`CONTAINER_UNKNOWN` を空の一覧とし、未知の state 値と過大な
 //! `label_selector` だけを `INVALID_ARGUMENT` にする。並びは `(created_at, id)` の昇順。labels・annotations は
@@ -152,7 +156,7 @@ use crate::streaming::{
 use config_limits::BoundedConfig;
 use container::{
     ContainerRecord, ContainerState, ExitReport, ValidatedContainerFilter, ValidatedCreate,
-    finished_at_for_exit, initial_stop_signal, validate_create_request,
+    apply_exit, finished_at_for_exit, initial_stop_signal, validate_create_request,
 };
 use record::{ContainerRecordData, SandboxRecordData};
 use runtime_config::parse_pod_cidrs;
@@ -334,6 +338,8 @@ pub struct CriRuntimeService {
     runtime: Option<RuntimeBinding>,
     /// 実行層の応答待ちの上限（REPAIR-5）。
     runtime_timeout: Duration,
+    /// `ContainerStatus` の観測で実行層の状態を 1 回読む待ちの上限（#4174。既定は [`CONTAINER_EXIT_OBSERVE_TIMEOUT`]）。
+    exit_observe_timeout: Duration,
     /// pod の netns を作って結線する注入点（#2675・CRI-2・NET-1）。`None` のときは従来どおり何も呼ばない。
     pod_network: Option<Arc<dyn PodNetworkProvider>>,
     /// `UpdateRuntimeConfig` で最後に受け入れた pod CIDR（#2896）。レジストリとは別のロックで、保持は一瞬。
@@ -381,6 +387,12 @@ struct RuntimeBinding {
 ///
 /// AGENTS.md「推奨タイムアウト値」の新規応答待ちの既定（5〜10 秒）に合わせて 10 秒とする。
 const DEFAULT_RUNTIME_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// `ContainerStatus` の観測（自然終了の取り込み）で実行層の状態を 1 回読む待ちの上限（暫定値。#4174・#4173 の E1）。
+///
+/// kubelet の PLEG が頻繁に呼ぶ RPC のため、`StopContainer` の期限や記録の `@lock` 待ち（5 秒）より短くする。
+/// 期限切れでも RPC は記録の値（running）で成功する。根拠と見直しの条件は `docs/design/cri-record-readoption.md`。
+const CONTAINER_EXIT_OBSERVE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// `reserve_container` の戻り値（登録したコンテナの識別子と、bundle 供給元へ渡す設定）。
 struct ReservedContainer {
@@ -535,10 +547,7 @@ impl InFlightGuard {
                     record.started_at_nanos = at_nanos;
                 }
                 InFlightKind::Stop => {
-                    record.state = ContainerState::Exited;
-                    record.finished_at_nanos = finished_at_for_exit(&record, &self.exit, at_nanos);
-                    record.exit_code = self.exit.code;
-                    record.termination = self.exit.termination;
+                    apply_exit(&mut record, &self.exit, at_nanos);
                 }
                 InFlightKind::Create | InFlightKind::Remove => {}
             }
@@ -1253,6 +1262,57 @@ const SANDBOX_UNPERSIST_FAILED: &str = "sandbox record could not be removed";
 /// 記録の書き込み中の並行操作を拒否する固定文言。
 const SANDBOX_RECORD_BUSY: &str = "sandbox record update is in progress";
 
+/// `ContainerStatus` の観測（#4174）の worker が所有する番人。
+///
+/// 観測中の印（`exit_observe_pending`）の解除と、停止済みの報告の取り込み（比較交換）を担う。worker が所有するのは、
+/// RPC の future がクライアント切断で破棄されても印が漏れず、worker が期限後に遅れて完了しても取り込めるようにするため。
+/// worker の起動失敗・panic でクロージャごと破棄された場合は `Drop` が印だけを外す。
+struct ExitObserveMark {
+    registry: Arc<Mutex<SandboxRegistry>>,
+    id: String,
+    done: bool,
+}
+
+impl ExitObserveMark {
+    /// 実行層の応答を記録へ反映して印を外す。`Running` かつ `in_flight` でない記録に、停止済みの報告があったときだけ
+    /// `apply_exit` で exited へ遷移させる（StopContainer の確定・Remove が先に走っていれば何も変えない）。
+    fn finish(mut self, result: &Result<RuntimeContainerStatus, CriError>) {
+        self.done = true;
+        let Ok(mut registry) = self.registry.lock() else {
+            return;
+        };
+        let Some(record) = registry.containers.get_mut(&self.id) else {
+            return;
+        };
+        record.exit_observe_pending = false;
+        if let Ok(status) = result
+            && status.lifecycle == RuntimeLifecycle::Stopped
+            && record.state == ContainerState::Running
+            && !record.in_flight
+        {
+            let exit = ExitReport {
+                code: status.exit_code,
+                termination: status.termination,
+                exited_at_nanos: status.exited_at_nanos,
+            };
+            apply_exit(record, &exit, now_nanos().unwrap_or(0));
+        }
+    }
+}
+
+impl Drop for ExitObserveMark {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        if let Ok(mut registry) = self.registry.lock()
+            && let Some(record) = registry.containers.get_mut(&self.id)
+        {
+            record.exit_observe_pending = false;
+        }
+    }
+}
+
 /// 実行層の呼び出しを専用スレッドで走らせ、結果を `timeout` まで待つ（REPAIR-5）。
 ///
 /// 期限を過ぎたら `DEADLINE_EXCEEDED` を返すが、worker はここからは打ち切れない（`CreateContainer` は
@@ -1455,11 +1515,8 @@ fn commit_in_flight(
     if kind == InFlightKind::Stop {
         // 実行層が停止済みと報告した。core の ExitTime を優先し、未記録は確定時刻を使う（下限は started_at・
         // created_at。永続化側の container_bytes と同じ関数。CRI-1・CRI-2・CRI-5・#4056）。
-        record.state = ContainerState::Exited;
-        record.finished_at_nanos = finished_at_for_exit(record, &exit, at_nanos);
         // 実行層が返した終了コード（137 等）を保持する。不明（None）は None のままで reason は空になる。
-        record.exit_code = exit.code;
-        record.termination = exit.termination;
+        apply_exit(record, &exit, at_nanos);
     }
     if kind == InFlightKind::Start {
         record.state = ContainerState::Running;
@@ -1749,6 +1806,7 @@ impl CriRuntimeService {
             recorder,
             runtime: None,
             runtime_timeout: DEFAULT_RUNTIME_TIMEOUT,
+            exit_observe_timeout: CONTAINER_EXIT_OBSERVE_TIMEOUT,
             pod_network: None,
             pod_cidrs: Mutex::new(None),
             record_store: None,
@@ -1888,6 +1946,12 @@ impl CriRuntimeService {
     /// 実行層の応答待ちの上限を指定する（既定 10 秒。REPAIR-5）。超過した RPC は `DEADLINE_EXCEEDED`。
     pub fn with_runtime_timeout(mut self, timeout: Duration) -> Self {
         self.runtime_timeout = timeout;
+        self
+    }
+
+    /// `ContainerStatus` の観測の待ちの上限を指定する（既定 1 秒より長くはできない。試験で短縮する用。#4174・REPAIR-5）。
+    pub fn with_exit_observe_timeout(mut self, timeout: Duration) -> Self {
+        self.exit_observe_timeout = timeout.min(CONTAINER_EXIT_OBSERVE_TIMEOUT);
         self
     }
 
@@ -2956,6 +3020,7 @@ impl CriRuntimeService {
                 stop_signal,
                 applied_user: None,
                 resolved_image: None,
+                exit_observe_pending: false,
             },
         );
         registry.container_keys.insert(key);
@@ -3706,7 +3771,11 @@ impl CriRuntimeService {
         drop_container_in(&self.registry, container_id, include_in_flight)
     }
 
-    /// `ContainerStatus` の本体。読み取り専用（CRI-1・ERR-3・TASK-58.3・#435）。
+    /// `ContainerStatus` の本体（CRI-1・CRI-2・ERR-3・TASK-58.3・#435・#4174）。
+    ///
+    /// 実行層接続時に記録が running なら、実行層の状態を期限つきで 1 回読み、停止済みなら exited として取り込んで
+    /// から返す（自然終了の取り込み。案 A。`docs/design/cri-record-readoption.md`）。読み取りの失敗・期限切れでは
+    /// 記録の値で成功し、記録は変えない。それ以外（created・exited・unknown・スタブ経路）は読まない。
     ///
     /// Create の実行層呼び出し中（`in_flight` の仮登録）も created として見える。実行層にはまだ
     /// 存在しない可能性があり、`ListContainers` も同様（仕様。Remove は `FAILED_PRECONDITION`）。
@@ -3714,13 +3783,14 @@ impl CriRuntimeService {
     /// 空 ID は `INVALID_ARGUMENT`、未知 ID（Remove 済みを含む）は `NOT_FOUND`（文言に入力 ID を含めない）。
     /// `verbose` でも `info` は方針として空（内部のパス・構成を出さない。#2901・`docs/design/cri-config-acceptance.md`）。
     /// `envs` 等は応答に含めない。
-    fn container_status_impl(
+    async fn container_status_impl(
         &self,
         req: v1::ContainerStatusRequest,
     ) -> Result<v1::ContainerStatusResponse, CriError> {
         if req.container_id.is_empty() {
             return Err(CriError::invalid_argument("container_id is required"));
         }
+        self.observe_container_exit(&req.container_id).await?;
         let status = {
             let registry = self
                 .registry
@@ -3736,6 +3806,59 @@ impl CriRuntimeService {
             status: Some(status),
             info: HashMap::new(),
         })
+    }
+
+    /// running の記録について実行層の状態を期限つきで 1 回読み、停止済みなら記録へ取り込む（#4174・E1）。
+    ///
+    /// 読む条件は「実行層が注入済み・記録が running・`in_flight` でない・他の観測が走っていない」。`in_flight` は
+    /// 立てない（観測中の StopContainer を `FAILED_PRECONDITION` にしない）。registry のロックは実行層を呼ぶ前に外す。
+    /// 取り込みは worker が所有する [`ExitObserveMark`] が比較交換で行う。読み取りの失敗・期限切れは
+    /// `cri.container_exit_observe` に 1 件記録するだけで `Ok` を返し、記録の値で応答させる。未知 ID は `NOT_FOUND`。
+    /// ID・パス・実行層の文言は記録しない（REPAIR-4）。`ListContainers`（E2・#4175）からも呼べる形にしてある。
+    async fn observe_container_exit(&self, container_id: &str) -> Result<(), CriError> {
+        let mark = {
+            let mut registry = self
+                .registry
+                .lock()
+                .map_err(|_| CriError::internal("sandbox registry is unavailable"))?;
+            let record = registry
+                .containers
+                .get_mut(container_id)
+                .ok_or_else(|| CriError::not_found("container not found"))?;
+            if self.runtime.is_none()
+                || record.state != ContainerState::Running
+                || record.in_flight
+                || !record.runtime_owned
+                || record.exit_observe_pending
+            {
+                return Ok(());
+            }
+            record.exit_observe_pending = true;
+            ExitObserveMark {
+                registry: Arc::clone(&self.registry),
+                id: container_id.to_owned(),
+                done: false,
+            }
+        };
+        let Some(binding) = &self.runtime else {
+            return Ok(());
+        };
+        let adapter = binding.adapter.clone();
+        let id = container_id.to_owned();
+        let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::ContainerExitObserve);
+        let outcome = run_bounded(self.exit_observe_timeout, move || {
+            let result = adapter.state(&id);
+            let brief = result.as_ref().map(|_| ()).map_err(Clone::clone);
+            mark.finish(&result);
+            brief
+        })
+        .await;
+        let observed: Result<(), Status> = match outcome {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) | Err(e) => Err(Status::from(e)),
+        };
+        timer.finish_with(&observed);
+        Ok(())
     }
 
     /// `Exec` の本体。検証 → 存在照合 → URL 発行（CRI-6・TASK-63.1。注入が無ければ `UNIMPLEMENTED`）。
@@ -4309,7 +4432,8 @@ impl RuntimeService for CriRuntimeService {
     ) -> Result<Response<Self::StreamContainersStream>, Status> {
         Err(CriError::unimplemented("stream_containers").into())
     }
-    /// コンテナの状態を返す（読み取り専用。CRI-1・TASK-58.3・#435）。
+    /// コンテナの状態を返す。実行層接続時は running の記録について実行層の状態を期限つきで 1 回読み、停止済みなら
+    /// exited として取り込む（CRI-1・TASK-58.3・#435・#4174）。
     async fn container_status(
         &self,
         request: Request<v1::ContainerStatusRequest>,
@@ -4317,6 +4441,7 @@ impl RuntimeService for CriRuntimeService {
         let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::ContainerStatus);
         let result = self
             .container_status_impl(request.into_inner())
+            .await
             .map_err(Status::from);
         timer.finish_with(&result);
         result.map(Response::new)

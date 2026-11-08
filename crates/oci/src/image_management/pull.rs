@@ -37,7 +37,7 @@
 //! fd 起点（`root_handle::StagingDir` / `PullDir` / `BlobDir`）で行い、入口の再検査の後に root が差し替え
 //! られてもおとりへ書き込み・削除が届かない。fetcher の書き込み先も [`StagedBlobWriter`] が同じ fd 起点で開く
 //! （#2765）。検証後の読み取りも [`PullSession::open_verified_staged_blob`] が同じ fd 起点で開いたハンドルを渡し
-//! （#2893）、パスは返さない。根拠は `docs/design/image-store-root-trust.md` の論点 3。
+//! （#2893）、リース済み blob も [`PullSession::open_leased_blob`] が root の fd 起点で開く（#4179）。パスは返さない。根拠は `docs/design/image-store-root-trust.md` の論点 3。
 //!
 //! 公開する blob の信頼条件（OCI-1・SEC。oci の `layer.rs` の `check_blob_trust` と同じ条件。公開入口は
 //! 所有者の照合が必須で、本モジュールは判定の本体を `blob_trust_violation` 経由で使う）: 通常ファイル・
@@ -53,9 +53,9 @@
 //! 指紋が一致するときだけ受け入れ、それ以外は検証済みのステージングで置き換える。
 //!
 //! 未実装（実装済みを装わない。REPAIR-3）:
-//! - リース済みの既存 blob（`LeasedBlob::path`）の cri での読み取りと、展開先 `unpack/` の作成はパス起点のまま
-//!   （#2893 の対象外）。Windows の `PullDir` もパス起点で、[`PullSession::open_verified_staged_blob`] は
-//!   `Unimplemented`（#2428 の判断待ち）。
+//! - 展開先 `unpack/` の作成はパス起点のまま
+//!   （#4180）。Windows の `PullDir` もパス起点で、[`PullSession::open_verified_staged_blob`]・
+//!   [`PullSession::open_leased_blob`] は `Unimplemented`（#2428・#4181）。
 //! - `PullSession` に `Drop` は実装しない（ロック待ちの Timeout・panic 中の毒化があり、ロックを取る
 //!   `Drop` は危険なため）。publish も abort もせずに drop すると、リースとステージングが残る
 //!   （余分に残す側）。呼び出し側は失敗経路で [`PullSession::abort`] を呼ぶ契約である。
@@ -155,7 +155,8 @@ impl LeasedBlob {
         &self.digest
     }
 
-    /// `<root>/blobs/sha256/<hex>`。開くときは symlink を辿らず、digest を検証してから使う。
+    /// `<root>/blobs/sha256/<hex>`。照合（`lease_existing_blob` の内部）用で、開く用途には使わない。
+    /// 読み取りは [`PullSession::open_leased_blob`]（root の fd 起点。#4179）。
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -786,6 +787,55 @@ impl PullSession<'_> {
         #[cfg(not(unix))]
         {
             let _ = (hex, entry);
+            Err(err(
+                OciErrorCode::Unimplemented,
+                "symlink-safe blob open is not supported on this platform",
+            ))
+        }
+    }
+
+    /// [`PullSession::lease_existing_blob`] でリース済みの既存 blob（`blobs/sha256/<hex>`）を、検査済み root の fd 起点で
+    /// 開いて返す（OCI-7・SEC-1・CRI-3・#4179）。
+    ///
+    /// cri の再利用判定・config の読み取り・layer の検証の入力用（読み取り専用）。パス文字列を `open` へ渡さず、
+    /// 呼ぶたびに root の fd から `blobs/sha256` を開き直してから blob を `openat2`（`NO_SYMLINKS`・`O_NOFOLLOW`）で開くため、
+    /// リース後に `blobs` や `blobs/sha256` が symlink（おとり）へ差し替えられても辿らない。呼ぶたびに独立したハンドルを返す。
+    /// 返したハンドルは未検証で、信頼条件・digest・サイズの確認は呼び出し側が同じハンドルで行う（OCI-1）。
+    ///
+    /// このセッションでリースした digest に限る（それ以外は `FailedPrecondition`。全 OS 共通）。
+    /// 途中要素の symlink・非ディレクトリは `FailedPrecondition`、root 配下の別マウントも拒否する。
+    ///
+    /// `cfg` ごとの扱い:
+    /// - Linux x86_64 / aarch64: 検査済み root の fd 起点の `openat2`。
+    /// - その他の unix（macOS 等）: `BlobDir` がパス起点（最終要素のみ symlink を辿らない）。入口の再検査に頼る。
+    /// - 非 unix（Windows。#4181）: `Unimplemented` で拒否し、パス起点へ縮退しない。
+    pub fn open_leased_blob(&self, digest: &Digest) -> Result<File, OciError> {
+        let hex = hex_of(digest)?;
+        if !self.leased.contains(digest) {
+            return Err(err(
+                OciErrorCode::FailedPrecondition,
+                "blob is not leased by this pull",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            let Some(bd) = self.store.handle().open_blob_dir()? else {
+                return Err(err(OciErrorCode::NotFound, "cached blob not found"));
+            };
+            bd.open_nofollow(hex).map_err(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => {
+                    err(OciErrorCode::NotFound, "cached blob not found")
+                }
+                std::io::ErrorKind::InvalidInput => err(
+                    OciErrorCode::FailedPrecondition,
+                    "cached blob is not a regular file",
+                ),
+                _ => io_err(&e, "failed to open cached blob"),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = hex;
             Err(err(
                 OciErrorCode::Unimplemented,
                 "symlink-safe blob open is not supported on this platform",

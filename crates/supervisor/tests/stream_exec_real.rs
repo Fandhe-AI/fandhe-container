@@ -12,6 +12,10 @@
 //! - `stdin`: 渡した stdin のバイト列（`se-stdin-payload\n`）がコマンドの stdout に戻る。
 //! - `disconnect`（接続断での停止。REPAIR-5）: `Started` の後に helper を SIGKILL すると、supervisor のガードが exec 子 cgroup
 //!   を回収し、コマンドの心拍ファイルが増えなくなる。`Result` は届かず channel は EOF（`Closed`）になる。
+//! - `requester_killed`（要求元の異常終了。SUP-6・SEC-1・REPAIR-5・#4167）: 終わらないコマンド（`ready-sleep`）を exec の期限 120 秒で
+//!   実行し、要求元（channel の端を持つ偽の `/bin/sleep`）を SIGKILL してから helper が終わるまでを測る。2 秒以内（設計 doc の目標値）・
+//!   終了コード 1（`Result` を送る相手が居ない）・fd 2 の診断行・コマンドが `/proc` に残らないことを具体値で照合する。
+//!   期限（120 秒）や `hold_grace` による終了と区別するため、期限を大きく取る。
 //! - `orphan`: supervisor（制御サーバー）が居ない状態では pidfd を受けられず `Failed(Unavailable)`。記録 pid からの縮退はしない。
 //!
 //! # 必要環境
@@ -183,6 +187,10 @@ mod linux {
     const READY_CONTENT: &str = "READY";
     /// `beat` コマンドが追記する心拍ファイル名。
     const HEARTBEAT_FILE: &str = "se-heartbeat";
+    /// `ready-sleep` コマンドが起動を知らせるファイル名（`requester_killed` 用）。
+    const REQUESTER_READY_FILE: &str = "se-requester-ready";
+    /// 要求元の消滅から helper の終了までの合格の上限（`docs/design/cri-streaming-server.md` の目標値。通知処理のない通常ケース）。
+    const REQUESTER_KILL_BUDGET: Duration = Duration::from_secs(2);
     /// pid1 とコマンドの寿命の上限（取り残し防止。REPAIR-5）。
     const PROBE_LIFETIME: Duration = Duration::from_secs(60);
 
@@ -252,6 +260,19 @@ mod linux {
                         let _ = f.write_all(b".");
                     }
                     std::thread::sleep(Duration::from_millis(50));
+                }
+                std::process::exit(8);
+            }
+            Some("ready-sleep") => {
+                // 終わらないコマンド（要求元の消滅の照合用）。最初に 1 回だけ READY を書き、あとは静かに待つ。
+                // 書き続けない理由: 目標の 2 秒は「消滅の時点で seccomp の通知を処理中でない」ことが条件のため。
+                let path = format!("{DATA_DEST}/{REQUESTER_READY_FILE}");
+                if std::fs::write(&path, READY_CONTENT).is_err() {
+                    std::process::exit(9);
+                }
+                let deadline = Instant::now() + PROBE_LIFETIME;
+                while Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(100));
                 }
                 std::process::exit(8);
             }
@@ -464,6 +485,15 @@ mod linux {
         plugin: UnixStream,
         stdout: File,
         stderr: File,
+        /// helper 自身の fd 2（診断行）。`HelperStderr::Piped` のときだけ取り込む。
+        helper_stderr: Option<File>,
+    }
+
+    /// helper 自身の fd 2 の扱い。
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum HelperStderr {
+        Inherit,
+        Piped,
     }
 
     /// 1 回の exec の結果。
@@ -483,7 +513,13 @@ mod linux {
     }
 
     /// helper を起動し、stdio の fd を渡す（`stdin` が `Some` なら、そのバイト列を書いて閉じた pipe の読み端を渡す）。
-    fn spawn_exec(ctx: &Ctx, mode: &str, stdin: Option<&[u8]>, timeout_ms: u64) -> Spawned {
+    fn spawn_exec(
+        ctx: &Ctx,
+        mode: &str,
+        stdin: Option<&[u8]>,
+        timeout_ms: u64,
+        helper_stderr: HelperStderr,
+    ) -> Spawned {
         let (stdout_r, stdout_w) = std::io::pipe().expect("stdout pipe");
         let (stderr_r, stderr_w) = std::io::pipe().expect("stderr pipe");
         let stdin_r = stdin.map(|data| {
@@ -508,8 +544,12 @@ mod linux {
         command
             .stdin(Stdio::from(OwnedFd::from(helper_end)))
             .stdout(Stdio::null())
-            .stderr(Stdio::inherit());
-        let child = command.spawn().expect("spawn the stream-exec helper");
+            .stderr(match helper_stderr {
+                HelperStderr::Inherit => Stdio::inherit(),
+                HelperStderr::Piped => Stdio::piped(),
+            });
+        let mut child = command.spawn().expect("spawn the stream-exec helper");
+        let helper_stderr = child.stderr.take().map(|e| File::from(OwnedFd::from(e)));
         send_stdio_handover(
             &plugin,
             &StdioSend {
@@ -527,6 +567,7 @@ mod linux {
             plugin,
             stdout: File::from(OwnedFd::from(stdout_r)),
             stderr: File::from(OwnedFd::from(stderr_r)),
+            helper_stderr,
         }
     }
 
@@ -660,6 +701,56 @@ mod linux {
         );
     }
 
+    /// `/proc/<pid>/stat` の (状態, 開始時刻)。comm に `)` が入りうるため最後の `)` 以降を読む。外部入力なので失敗は `None`。
+    fn proc_state_and_start(pid: u32) -> Option<(char, u64)> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let rest = stat.get(stat.rfind(')')? + 1..)?;
+        let mut fields = rest.split_whitespace();
+        let state = fields.next()?.chars().next()?;
+        // rest の先頭は 3 番目のフィールド（state）。開始時刻は 22 番目なので state の後 19 個目。
+        let start = fields.nth(18)?.parse::<u64>().ok()?;
+        Some((state, start))
+    }
+
+    /// cmdline（NUL 区切り）が `argv` に完全一致し、ゾンビ・死亡でない生きたプロセスの (pid, 開始時刻)。
+    fn live_pids_with_argv(argv: &[&str]) -> Vec<(u32, u64)> {
+        let mut want = Vec::new();
+        for a in argv {
+            want.extend_from_slice(a.as_bytes());
+            want.push(0);
+        }
+        let mut found = Vec::new();
+        let Ok(dir) = std::fs::read_dir("/proc") else {
+            return found;
+        };
+        for e in dir.flatten() {
+            let Some(pid) = e.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
+                continue;
+            };
+            let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+                continue;
+            };
+            if cmdline != want {
+                continue;
+            }
+            if let Some((state, start)) = proc_state_and_start(pid)
+                && state != 'Z'
+                && state != 'X'
+            {
+                found.push((pid, start));
+            }
+        }
+        found
+    }
+
+    /// 記録した (pid, 開始時刻) のプロセスが消えている（stat が無い・ゾンビ・死亡・開始時刻が違う＝pid の再利用）か。
+    fn is_gone(pid: u32, starttime: u64) -> bool {
+        match proc_state_and_start(pid) {
+            None => true,
+            Some((state, start)) => state == 'Z' || state == 'X' || start != starttime,
+        }
+    }
+
     /// 試験プロセス（child subreaper）へ再親付けされた pid1 以外の子（孤児化した exec worker・コマンド）を回収する。
     ///
     /// 本番では helper の孤児は plugin-cri 側（subreaper ではない）の外で init が回収するが、本試験は plugin-cri 役と
@@ -685,9 +776,118 @@ mod linux {
         }
     }
 
+    /// requester_killed: 要求元（channel の端を持つ偽のプロセス）を SIGKILL すると、helper が 2 秒以内に終わり
+    /// コマンドも残らない（SUP-6・SEC-1・REPAIR-5・#4167）。exec の期限は 120 秒で、期限・`hold_grace` による終了とは区別される。
+    fn requester_killed(ctx: &Ctx, hostdata: &Path) {
+        const HELPER_TIMEOUT_MS: u64 = 120_000;
+        let sp = spawn_exec(
+            ctx,
+            "ready-sleep",
+            None,
+            HELPER_TIMEOUT_MS,
+            HelperStderr::Piped,
+        );
+        let first = recv_from_helper(&sp.plugin, Instant::now() + timeout()).expect("started");
+        assert!(matches!(first, HelperMessage::Started), "{first:?}");
+        let ready = hostdata.join(REQUESTER_READY_FILE);
+        assert!(
+            eventually(|| std::fs::read_to_string(&ready).is_ok_and(|s| s == READY_CONTENT)),
+            "the ready-sleep command must have started"
+        );
+        // 偽の要求元は channel の端の複製を stdin に持つ。試験側の端を drop した後は、これが最後の端になる。
+        // 試験側に端が 1 本でも残ると POLLHUP が立たず、期限（120 秒）の経路に落ちて検知を照合できない。
+        let mut requester = {
+            let held = sp.plugin.try_clone().expect("clone the channel end");
+            let mut c = std::process::Command::new("/bin/sleep");
+            c.arg("120")
+                .stdin(Stdio::from(OwnedFd::from(held)))
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            c.spawn().expect("spawn the fake requester")
+        };
+        let Spawned {
+            mut child,
+            plugin,
+            helper_stderr,
+            ..
+        } = sp;
+        drop(plugin);
+        // 誤検知しないこと: 要求元が生きている間は helper もコマンドも動き続ける。
+        std::thread::sleep(Duration::from_millis(1000));
+        assert!(
+            child.try_wait().expect("poll helper").is_none(),
+            "the helper must keep running while the requester is alive"
+        );
+        let argv = ["/probe", "--se-cmd", "ready-sleep"];
+        let cmds = live_pids_with_argv(&argv);
+        assert_eq!(
+            cmds.len(),
+            1,
+            "exactly one live ready-sleep command: {cmds:?}"
+        );
+        let (cmd_pid, cmd_start) = cmds[0];
+
+        let t0 = Instant::now();
+        requester.kill().expect("kill the requester");
+        let (elapsed, status) = loop {
+            if let Some(status) = child.try_wait().expect("poll helper") {
+                break (t0.elapsed(), status);
+            }
+            if t0.elapsed() >= Duration::from_secs(15) {
+                crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
+                crate::reap::reap_or_report(&mut requester, crate::reap::reap_within());
+                panic!("the helper did not exit within 15s after the requester was killed");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        crate::reap::reap_or_report(&mut requester, crate::reap::reap_within());
+        assert!(
+            elapsed <= REQUESTER_KILL_BUDGET,
+            "the helper took {elapsed:?} to exit after the requester was killed (budget {REQUESTER_KILL_BUDGET:?})"
+        );
+        assert_eq!(
+            status.code(),
+            Some(1),
+            "the helper exits 1 when the requester is gone"
+        );
+        // 診断行（期限切れの経路と区別する）。
+        let diag = read_to_end_bounded(
+            helper_stderr.expect("helper stderr was piped"),
+            Instant::now() + timeout(),
+        );
+        let diag = String::from_utf8_lossy(&diag);
+        assert!(
+            diag.contains(
+                r#"{"code":"unavailable","message":"stream-exec requester went away; exec cancelled"}"#
+            ),
+            "the cancel diagnostic line is missing: {diag}"
+        );
+        // helper は cgroup の回収を終えてから終わるため、終了の直後に 1 回だけ厳密に確かめる。
+        assert!(
+            is_gone(cmd_pid, cmd_start),
+            "the exec command (pid {cmd_pid}) must be gone once the helper has exited"
+        );
+        assert_eq!(
+            live_pids_with_argv(&argv),
+            Vec::<(u32, u64)>::new(),
+            "no ready-sleep command may remain"
+        );
+        let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|_| "unknown".to_string());
+        println!(
+            "stream_exec_real: info requester_kill_elapsed_ms={} budget_ms={} helper_timeout_ms={HELPER_TIMEOUT_MS} kernel={kernel}",
+            elapsed.as_millis(),
+            REQUESTER_KILL_BUDGET.as_millis()
+        );
+        println!(
+            "stream_exec_real: scenario=requester_killed helper exited within 2s after the requester was killed and no exec process remained"
+        );
+    }
+
     fn scenarios(ctx: &Ctx, hostdata: &Path, server: ControlServer, listener: ControlListener) {
         // echo: stdout と stderr が別々の fd で返る。
-        let sp = spawn_exec(ctx, "echo", None, 20_000);
+        let sp = spawn_exec(ctx, "echo", None, 20_000, HelperStderr::Inherit);
         let f = finish(sp);
         assert!(f.started, "Started must precede the result");
         assert_eq!(f.outcome, StreamExecOutcome::Exited(0));
@@ -696,20 +896,32 @@ mod linux {
         println!("stream_exec_real: scenario=echo exit 0 with separate stdout and stderr");
 
         // exit3: 終了コード 3。
-        let f = finish(spawn_exec(ctx, "exit3", None, 20_000));
+        let f = finish(spawn_exec(
+            ctx,
+            "exit3",
+            None,
+            20_000,
+            HelperStderr::Inherit,
+        ));
         assert!(f.started);
         assert_eq!(f.outcome, StreamExecOutcome::Exited(3));
         assert_eq!(f.stdout, Vec::<u8>::new());
         println!("stream_exec_real: scenario=exit3 exit code 3");
 
         // stdin: 渡したバイト列がコマンドの stdout に戻る。
-        let f = finish(spawn_exec(ctx, "cat", Some(b"se-stdin-payload\n"), 20_000));
+        let f = finish(spawn_exec(
+            ctx,
+            "cat",
+            Some(b"se-stdin-payload\n"),
+            20_000,
+            HelperStderr::Inherit,
+        ));
         assert_eq!(f.outcome, StreamExecOutcome::Exited(0));
         assert_eq!(f.stdout, b"se-stdin-payload\n".to_vec());
         println!("stream_exec_real: scenario=stdin payload echoed back");
 
         // disconnect: Started の後に helper を SIGKILL すると、ガードが exec 子 cgroup を回収してコマンドが止まる。
-        let mut sp = spawn_exec(ctx, "beat", None, 60_000);
+        let mut sp = spawn_exec(ctx, "beat", None, 60_000, HelperStderr::Inherit);
         let first = recv_from_helper(&sp.plugin, Instant::now() + timeout()).expect("started");
         assert!(matches!(first, HelperMessage::Started), "{first:?}");
         let beat = hostdata.join(HEARTBEAT_FILE);
@@ -735,10 +947,12 @@ mod linux {
             "stream_exec_real: scenario=disconnect command stopped after the helper was killed"
         );
 
+        requester_killed(ctx, hostdata);
+
         // orphan: supervisor が居ない（制御サーバーも listener も無い）なら pidfd を受けられず、縮退せず失敗する。
         drop(server);
         drop(listener);
-        let f = finish(spawn_exec(ctx, "echo", None, 20_000));
+        let f = finish(spawn_exec(ctx, "echo", None, 20_000, HelperStderr::Inherit));
         assert!(
             !f.started,
             "the command must not start without a supervisor"

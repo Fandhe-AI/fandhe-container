@@ -62,3 +62,61 @@ fn oci7_reuse_leases_and_staged_blob_is_invisible() {
     assert!(staged_refs.leases.is_empty());
     assert!(!staged_refs.is_referenced());
 }
+/// OCI-7・SEC-1・CRI-3・#4179: `open_leased_blob` はリースした digest だけを開き、リースしていない digest は
+/// 全 OS で `FailedPrecondition`。unix ではリース済み blob の内容が読め、非 unix では `Unimplemented`（パス起点へ縮退しない）。
+#[test]
+fn oci7_open_leased_blob_requires_lease_and_reads_content() {
+    let root =
+        Root(std::env::temp_dir().join(format!("fc-oci-leased-open-{}", std::process::id())));
+    let _ = fs::remove_dir_all(&root.0);
+    let blobs = root.0.join("blobs").join("sha256");
+    fs::create_dir_all(&blobs).expect("mkdir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&root.0, fs::Permissions::from_mode(0o700)).expect("chmod");
+    }
+    let cached = d(1);
+    fs::write(
+        blobs.join(cached.as_str().trim_start_matches("sha256:")),
+        b"abc",
+    )
+    .expect("write");
+
+    let store = ImageStore::open(&root.0).expect("open");
+    let mut session = store
+        .begin_pull(PullId::generate().expect("id"))
+        .expect("begin");
+
+    let not_leased = session
+        .open_leased_blob(&cached)
+        .expect_err("not leased yet");
+    assert_eq!(
+        not_leased.code(),
+        fandhe_container_oci::error::OciErrorCode::FailedPrecondition
+    );
+    assert_eq!(not_leased.message(), "blob is not leased by this pull");
+
+    let reuse = session.lease_existing_blob(&cached).expect("lease");
+    assert!(matches!(reuse, BlobReuse::Leased(_)));
+
+    #[cfg(unix)]
+    {
+        use std::io::Read as _;
+        let mut body = Vec::new();
+        session
+            .open_leased_blob(&cached)
+            .expect("open leased")
+            .read_to_end(&mut body)
+            .expect("read");
+        assert_eq!(body, b"abc");
+    }
+    #[cfg(not(unix))]
+    {
+        let e = session.open_leased_blob(&cached).expect_err("unsupported");
+        assert_eq!(
+            e.code(),
+            fandhe_container_oci::error::OciErrorCode::Unimplemented
+        );
+    }
+}

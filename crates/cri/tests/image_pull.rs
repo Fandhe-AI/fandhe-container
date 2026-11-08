@@ -217,6 +217,9 @@ struct FakeClient {
     /// 指定すると `(キャッシュの staging ディレクトリ, symlink の向き先)`。取得中（writer を開いた後・commit の前）に
     /// pull ディレクトリの `<hex>` へこの向き先への symlink を置く（fetcher の外からの差し替えの模擬。#2765）。
     staged_symlink_target: Option<(PathBuf, PathBuf)>,
+    /// 指定すると `(キャッシュの blobs/sha256, おとりのディレクトリ)`。取得中に `blobs/sha256` を別名へ移し、同名で
+    /// おとりへの symlink を置く（リース済み blob の途中要素の差し替えの模擬。#4179）。
+    swap_blob_dir_on_fetch: Option<(PathBuf, PathBuf)>,
     /// 指定すると、最初の取得だけ本文の一部を書いてから PermissionDenied を返す（部分書きの後の再認証・再試行の模擬）。
     partial_then_denied: AtomicUsize,
     /// 指定すると、最初の blob 取得でこの旗を立てる（取得中に RPC が取り消された模擬。#2967）。
@@ -239,6 +242,7 @@ impl FakeClient {
             deny_blob_fetches: AtomicUsize::new(0),
             auth_calls: AtomicUsize::new(0),
             staged_symlink_target: None,
+            swap_blob_dir_on_fetch: None,
             partial_then_denied: AtomicUsize::new(0),
             cancel_on_fetch: None,
         }
@@ -337,6 +341,13 @@ impl RegistryPullClient for FakeClient {
                 std::os::unix::fs::symlink(target, entry.path().join(hex))
                     .map_err(|_| OciError::new(OciErrorCode::Internal, "symlink"))?;
             }
+        }
+        if let Some((blob_dir, decoy)) = &self.swap_blob_dir_on_fetch {
+            let moved = blob_dir.with_file_name("sha256-moved");
+            fs::rename(blob_dir, &moved)
+                .map_err(|_| OciError::new(OciErrorCode::Internal, "swap rename"))?;
+            std::os::unix::fs::symlink(decoy, blob_dir)
+                .map_err(|_| OciError::new(OciErrorCode::Internal, "swap symlink"))?;
         }
         write(dest, &body)
     }
@@ -2103,4 +2114,57 @@ async fn cri3_repair5_dropped_pull_rpc_cancels_worker_and_releases_slot() {
         }
     }
     result.expect("slot released").expect("second pull ok");
+}
+
+/// OCI-7・SEC-1・CRI-3（#4179）: 2 回目の pull で config と layer1 をリース済みの既存 blob として再利用した後、
+/// layer2 の取得中に `blobs/sha256` がおとりへの symlink に差し替わっても、config の読み取りは検査済み root の fd 起点で
+/// 開き直して拒否される（おとりの config は読まれない。旧実装はパスを辿っておとりを読み `DataLoss` になっていた）。
+/// おとり・移動先の本物の blob は無傷で、ステージングは空に戻る。macOS はパス起点のため Linux だけで照合する。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[test]
+fn oci7_sec1_pull_rejects_leased_config_after_blob_dir_swapped_to_symlink() {
+    use std::os::unix::fs::MetadataExt as _;
+    let dir = TempDir::new("leasedswap");
+    let first = Arc::new(FakeClient::new(two_layer_manifest()));
+    OciImagePuller::new(first.clone(), config(&dir))
+        .pull(&req("alpine:3.20"))
+        .expect("first");
+    assert_eq!(first.blob_fetches.load(Ordering::SeqCst), 3);
+    fs::remove_file(blob_path(&dir, SHA_LAYER2)).expect("remove layer2");
+
+    // おとり: config は同じ長さで内容だけ違う（旧実装なら digest 不一致の `DataLoss` で区別できる）。
+    let decoy = dir.0.join("decoy-blobs");
+    fs::create_dir(&decoy).expect("decoy dir");
+    let mut decoy_cfg = blob_body(SHA_CONFIG);
+    let last = decoy_cfg.len() - 1;
+    decoy_cfg[last] ^= 0x01;
+    fs::write(decoy.join(SHA_CONFIG), &decoy_cfg).expect("decoy config");
+    let decoy_ino = fs::metadata(decoy.join(SHA_CONFIG)).expect("stat").ino();
+
+    let mut second = FakeClient::new(two_layer_manifest());
+    second.swap_blob_dir_on_fetch = Some((
+        dir.0.join("cache").join("blobs").join("sha256"),
+        decoy.clone(),
+    ));
+    let second = Arc::new(second);
+    let err = OciImagePuller::new(second.clone(), config(&dir))
+        .pull(&req("alpine:3.20"))
+        .expect_err("rejected");
+    assert_eq!(err.code(), OciErrorCode::FailedPrecondition);
+    assert_eq!(err.message(), "image cache precondition failed");
+    assert_eq!(second.blob_fetches.load(Ordering::SeqCst), 1);
+    assert_eq!(fs::read(decoy.join(SHA_CONFIG)).expect("decoy"), decoy_cfg);
+    assert_eq!(
+        fs::metadata(decoy.join(SHA_CONFIG)).expect("stat").ino(),
+        decoy_ino
+    );
+    let moved = dir.0.join("cache").join("blobs").join("sha256-moved");
+    assert_eq!(
+        fs::read(moved.join(SHA_CONFIG)).expect("real config"),
+        blob_body(SHA_CONFIG)
+    );
+    assert!(staging_is_empty(&dir));
 }

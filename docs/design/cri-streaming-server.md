@@ -289,7 +289,13 @@ plugin-cri が helper を kill せずに異常終了（SIGKILL 等）すると�
 
 **セキュリティ（SEC-1）**: 第三者は取り消しを起こせない（パスの無い socketpair）。取り消しは「早く止める」だけで権限・分離は広がらない。検知後もコマンドと子孫は `cgroup.kill` で回収し、失敗しても `exec_guard` が既存の上限で回収する。新しい `unsafe` は supervisor の sys の `poll` ラッパーだけで、事前承認の範囲（`// SAFETY:`・`libc_abi` の照合・security-auditor 観点のレビューと PR 本文への記録が条件。#4166 の作業）。
 
-**実装者が決める事項（#4166）**: `ExecLaunchIo` の項目名と型、取り消しの監査・診断の語彙、`Lost` の後の刻みの値（例 100 ms）。
+**実装者が決める事項（#4166。決定済み）**:
+
+- 取り消し判定の型は `crates/supervisor/src/exec.rs` の `ExecCancelHook<'a> = dyn Fn() -> bool + 'a`、`ExecLaunchIo` の項目名は `cancel: Option<&ExecCancelHook>`（既定の `None`）。core は変えない
+- 判定の実体は `stream_exec::channel::requester_gone`（fd 0 の channel への `poll(timeout = 0)`。`POLLIN` だけは消滅としない・読まない。判定の失敗と非対応ターゲットは偽）
+- `Lost` の後の刻みは `CANCEL_POLL_STEP` = 100 ms（`wait_for_exit` で待ち、kill しない）
+- 取り消しの結果は `Unavailable`（固定メッセージ `exec cancelled: the requester went away; the exec worker was killed`）で、`Timeout` を流用しない。worker の終了を先に見て、終了済みの本当の結果を取り消しで上書きしない
+- 監査レコードは足さない（`audit_worker_result` は分離違反だけを記録する SEC-4 の設計で、取り消しは違反ではないため）。期限切れとの区別は `Unavailable` / `Timeout` のコードとメッセージ、および helper が fd 2 に出す固定語彙の診断行（`{"code":"unavailable","message":"stream-exec requester went away; exec cancelled"}`）で行う
 
 **再評価条件**: plugin-cri が channel の end を他のプロセスへ渡すようになったとき（B を足す）、Linux 以外へ同じ helper を広げるとき（AF_UNIX の `POLLHUP` の意味を確かめ直す）、`SERVE_STEP` を変えるとき。
 

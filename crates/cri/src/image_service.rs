@@ -616,7 +616,13 @@ impl CriImageService {
     ///
     /// blob・展開済み rootfs は消さない（proto は資源の回収を非同期でよいとする。回収は #471 系）。
     /// 文言に参照を含めない。
-    fn remove(&self, request: v1::RemoveImageRequest) -> Result<v1::RemoveImageResponse, CriError> {
+    ///
+    /// 本番の在庫の `remove` は `oci.lock()` の待機・記録の読み直し・fsync を行うため、`PullImage` と同じく
+    /// `spawn_blocking` で実行し、current_thread ランタイムの他 RPC を止めない（REPAIR-5）。
+    async fn remove(
+        &self,
+        request: v1::RemoveImageRequest,
+    ) -> Result<v1::RemoveImageResponse, CriError> {
         let reference = request.image.map(|spec| spec.image).unwrap_or_default();
         if reference.is_empty() {
             return Err(CriError::invalid_argument(
@@ -627,11 +633,16 @@ impl CriImageService {
             return Err(CriError::invalid_argument("image reference is too long"));
         }
         // Removed / Absent のどちらも成功（冪等）。Absent のときだけ正規化した参照で再度試す。
-        resolve_with_canonical(&reference, |r| match self.store.remove(r)? {
-            RemoveOutcome::Removed { id } => Ok(Some(id)),
-            _ => Ok(None),
+        let store = Arc::clone(&self.store);
+        let joined = tokio::task::spawn_blocking(move || {
+            resolve_with_canonical(&reference, |r| match store.remove(r)? {
+                RemoveOutcome::Removed { id } => Ok(Some(id)),
+                _ => Ok(None),
+            })
+            .map_err(|_: ImageStoreError| CriError::internal("image store failure"))
         })
-        .map_err(|_: ImageStoreError| CriError::internal("image store failure"))?;
+        .await;
+        joined.map_err(|_| CriError::internal("image remove task failed"))??;
         Ok(v1::RemoveImageResponse {})
     }
 
@@ -727,7 +738,10 @@ impl ImageService for CriImageService {
         request: Request<v1::RemoveImageRequest>,
     ) -> Result<Response<v1::RemoveImageResponse>, Status> {
         let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::RemoveImage);
-        let result = self.remove(request.into_inner()).map_err(Status::from);
+        let result = self
+            .remove(request.into_inner())
+            .await
+            .map_err(Status::from);
         timer.finish_with(&result);
         result.map(Response::new)
     }
@@ -1204,5 +1218,55 @@ mod tests {
             }
         }
         assert_eq!(NoWrite.remove("x"), Err(ImageStoreError::ReadOnly));
+    }
+    /// REPAIR-5・CRI-2・#4177: `RemoveImage` の store 操作がブロックしても current_thread ランタイムの他タスクは進む。
+    #[test]
+    fn repair5_remove_image_does_not_block_current_thread_runtime() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        struct SlowRemove(Arc<AtomicBool>);
+        impl ImageStore for SlowRemove {
+            fn list(&self) -> Result<Vec<ImageRecord>, ImageStoreError> {
+                Ok(vec![])
+            }
+            fn get(&self, _: &str) -> Result<Option<ImageRecord>, ImageStoreError> {
+                Ok(None)
+            }
+            fn remove(&self, _: &str) -> Result<RemoveOutcome, ImageStoreError> {
+                // 別タスクが旗を立てるまで待つ。ランタイムのスレッドで走ると旗が立たず期限で失敗する。
+                let end = Instant::now() + Duration::from_secs(5);
+                while !self.0.load(Ordering::SeqCst) {
+                    if Instant::now() >= end {
+                        return Err(ImageStoreError::ReadOnly);
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok(RemoveOutcome::Absent)
+            }
+        }
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let svc = CriImageService::with_store(Arc::new(SlowRemove(Arc::clone(&flag))));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime");
+        let (resp, ticked) = rt.block_on(async {
+            let remove = svc.remove_image(Request::new(v1::RemoveImageRequest {
+                image: Some(v1::ImageSpec {
+                    image: "a".into(),
+                    ..Default::default()
+                }),
+            }));
+            let ticker = async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                flag.store(true, Ordering::SeqCst);
+                "ticked"
+            };
+            tokio::join!(remove, ticker)
+        });
+        assert_eq!(ticked, "ticked");
+        assert!(resp.is_ok(), "remove must succeed once released: {resp:?}");
     }
 }

@@ -259,7 +259,11 @@ fn remove(svc: &CriImageService, reference: Option<&str>) -> Result<(), Code> {
             ..Default::default()
         }),
     };
-    block_on(ImageService::remove_image(svc, Request::new(request)))
+    // RemoveImage は spawn_blocking を使うため、ノーオップ waker の block_on ではなく tokio のランタイムで待つ。
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    rt.block_on(ImageService::remove_image(svc, Request::new(request)))
         .map(|_| ())
         .map_err(|s| s.code())
 }

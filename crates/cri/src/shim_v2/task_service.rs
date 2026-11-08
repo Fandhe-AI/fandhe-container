@@ -587,6 +587,14 @@ impl TaskService {
         if !req.exec_id.is_empty() {
             return self.start_exec(&req);
         }
+        // 実行層の Start から終了 watcher の登録までを、Create・Delete と同じコンテナ単位のゲートで排他する。
+        // ゲート無しだと、旧 Start が中断中に旧コンテナの Delete・同 ID の再作成が済み、旧 pid の watcher が
+        // 再作成後に登録されて新コンテナの TaskExit が `instance_mismatch` で捨てられる（CRI-5・#4155）。
+        let container = ContainerId::new(&req.id).ok();
+        let _gate = match &container {
+            Some(c) => Some(self.execs.lock_container(c).map_err(|e| to_status(&e))?),
+            None => None,
+        };
         let status = self.adapter.start(&req.id).map_err(|e| to_status(&e))?;
         self.spawn_exit_watcher(&req.id, status.pid.unwrap_or(0));
         Ok(StartResponse {
@@ -3465,6 +3473,28 @@ mod tests {
         assert_eq!(evs.len(), 1);
         let Ev::Exit(e) = &evs[0];
         assert_eq!((e.pid, e.exit_status, e.exited_at.clone()), (4242, 0, None));
+    }
+
+    /// CRI-5・#4155: init の Start はコンテナ単位のゲートを取り、Delete・再作成の最中は watcher を登録しない。
+    #[test]
+    fn cri5_4155_start_waits_for_container_gate() {
+        let fake = Fake {
+            create_pid: Some(111),
+            ..Fake::default()
+        };
+        let (s, _f, _cap) = svc_pub(fake);
+        s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
+        let c1 = ContainerId::new("c1").unwrap();
+        let gate = s.execs.lock_container(&c1).unwrap();
+        std::thread::scope(|scope| {
+            let h = scope.spawn(|| s.handle("Start", &start_req("c1")).unwrap());
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            assert!(!h.is_finished(), "Start must wait for the container gate");
+            assert!(s.exit_watchers.lock().unwrap().is_empty());
+            drop(gate);
+            h.join().unwrap();
+        });
+        assert_eq!(s.exit_watchers.lock().unwrap().len(), 1);
     }
 
     /// CRI-5・#4155: Delete 後に同じ ID で Create・Start し直すと、旧 watcher は取り消されて旧 pid を publish せず、

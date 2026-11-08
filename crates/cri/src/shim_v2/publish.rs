@@ -178,6 +178,7 @@ impl PublishFailure {
         }
     }
 
+    #[cfg(unix)]
     fn with_errno(mut self, e: &std::io::Error) -> Self {
         self.errno = e.raw_os_error();
         self
@@ -527,16 +528,21 @@ mod unix {
 /// 試験の共有部品（偽の publish バイナリ・捕捉用の出力先）。
 #[cfg(test)]
 pub(crate) mod testkit {
+    #[cfg(unix)]
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
-    use super::{EventPublisher, PublishFailure, PublishLog, TaskEvent};
+    #[cfg(unix)]
+    use super::PublishLog;
+    use super::{EventPublisher, PublishFailure, TaskEvent};
 
     /// 捕捉用の出力先。
+    #[cfg(unix)]
     #[derive(Default)]
     pub(crate) struct CaptureLog(pub(crate) Mutex<Vec<PublishFailure>>);
 
+    #[cfg(unix)]
     impl PublishLog for CaptureLog {
         fn record(&self, failure: &PublishFailure) {
             self.0.lock().unwrap().push(failure.clone());
@@ -562,6 +568,7 @@ pub(crate) mod testkit {
     /// 偽の publish バイナリ（`/bin/sh` スクリプト、0755）を `dir/name` に作る。
     ///
     /// ETXTBSY を避けるため、書き込みと chmod は子プロセスで行い、試験プロセスは書き込み用 fd を持たない。
+    #[cfg(unix)]
     pub(crate) fn make_script(dir: &Path, name: &str, body: &str) -> PathBuf {
         let path = dir.join(name);
         let st = std::process::Command::new("/bin/sh")
@@ -577,6 +584,7 @@ pub(crate) mod testkit {
     }
 
     /// 引数を行ごとに argv ファイルへ、stdin を stdin ファイルへ書く記録型。
+    #[cfg(unix)]
     pub(crate) fn recorder_body(out: &Path) -> String {
         let d = out.display();
         format!(
@@ -585,11 +593,13 @@ pub(crate) mod testkit {
     }
 
     /// stdin を読み切って終了コード 7 で終わる型。
+    #[cfg(unix)]
     pub(crate) fn failing_body() -> String {
         "#!/bin/sh\n/bin/cat > /dev/null\nexit 7\n".to_owned()
     }
 
     /// pid を書いて 30 秒眠る型。
+    #[cfg(unix)]
     pub(crate) fn sleeping_body(out: &Path) -> String {
         format!(
             "#!/bin/sh\necho $$ > \"{d}/pid\"\nexec /bin/sleep 30\n",

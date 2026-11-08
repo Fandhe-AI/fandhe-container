@@ -71,6 +71,7 @@
 # #4101 で ioeventfd の poll の異常 revents（POLLERR / POLLHUP / POLLNVAL）を POLLIN と区別し、fail-closed で止める（依存は増やさない。unsafe の追加なし）。
 # #4157 で memslot_flags（memslot のフラグの型と KVM_CAP_READONLY_MEM の照会）を追加（依存は増やさない。unsafe の追加なし）。
 # #4158 で memslot のフラグを GuestRam の登録へ結線（依存は増やさない。unsafe の追加なし）。
+# #4168 で tests/queue_stopped_dispatch.rs（dispatcher 越しの QueueReady=0 / reset の受け入れ試験）を追加（依存は増やさない。unsafe なし）。
 [package]
 name = "fandhe-container-microvm"
 edition.workspace = true

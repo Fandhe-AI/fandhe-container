@@ -99,6 +99,13 @@
 //!     `update` は渡された status をそのまま保存し、ストアは補完も引き継ぎもしない（契約 14 と違い、書き手が
 //!     status の一部として渡す）。`Stopped` のまま更新する書き手は既存の status を複製して保つ。
 //!     plugin 実装も同じく往復させる
+//! 16. [`StateRecord::instance`]（インスタンス識別子。CRI-5・SEC-1・CORE-1・#4220）は、`create` がその create で
+//!     割り当てた revision を記録する（要求からは指定できない。revision は再利用されないため、同じ ID の削除と
+//!     再作成で必ず変わる）。`update` は既存の値をそのまま引き継ぎ、要求の status に付いた値は無視する
+//!     （書き手が偽造も消去もできない）。記録の無い旧い状態は `None` として読み、後から埋めない（途中で
+//!     `None` から `Some` に変わると稼働中の exec 登録を拒否してしまうため）。`instance` が `revision` を
+//!     超える記録は破損。記録の中の [`StateRecord::status`] は instance を持たない。plugin 実装も同じく往復
+//!     させる義務があるが、現時点で plugin 越しのワイヤー符号化は未結線（REPAIR-3）
 //!
 //! メソッドは同期（`&self`、`async fn` を使わない）にし、ジェネリクスも持たない。
 //! `ContainerRuntime`（TASK-4.1）と同じく dyn 互換（object safety）を保つ。
@@ -112,7 +119,7 @@
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
-use super::container_runtime::ContainerStatus;
+use super::container_runtime::{ContainerInstance, ContainerStatus};
 use super::types::{ContainerId, ErrorCode, TraitError};
 use crate::launch_isolation::LaunchIsolationRecord;
 use crate::rlimits::Rlimits;
@@ -671,6 +678,8 @@ pub struct StateRecord {
     image_rootfs: Option<ImageRootfsRecord>,
     /// 明示 stop の記録（契約 14。SUP-9・SUP-3・SUP-8・#2440）。`Stopped` のときだけ有効。
     explicit_stop: ExplicitStop,
+    /// インスタンス識別子（契約 16。CRI-5・SEC-1・#4220）。ストアが create で割り当てる。
+    instance: Option<ContainerInstance>,
 }
 
 /// 利用者の明示 stop を記録したか（契約 14。SUP-9・SUP-3・SUP-8・#2440）。
@@ -719,7 +728,8 @@ impl StateRecord {
             ));
         }
         Ok(Self {
-            status,
+            // status 側の instance は持たせない（記録の欄だけが正。書いて読み戻した値の等値を保つ）。
+            status: status.without_instance(),
             bundle,
             revision,
             cgroup: None,
@@ -731,7 +741,20 @@ impl StateRecord {
             launch_isolation: None,
             image_rootfs: None,
             explicit_stop: ExplicitStop::NotRecorded,
+            instance: None,
         })
+    }
+
+    /// インスタンス識別子を設定する（契約 16）。ストア実装が create・update・読み込みで使う。
+    #[must_use]
+    pub fn with_instance(mut self, instance: ContainerInstance) -> Self {
+        self.instance = Some(instance);
+        self
+    }
+
+    /// インスタンス識別子を返す（契約 16）。`None` は記録の無い旧い状態。
+    pub fn instance(&self) -> Option<ContainerInstance> {
+        self.instance
     }
 
     /// 明示 stop の記録を設定する（[`Self::explicit_stop`]）。ストア実装が update・読み込みで使う。
@@ -1415,6 +1438,8 @@ mod tests {
             let revision = self.allocate_revision()?;
             let mut record =
                 StateRecord::new(req.status().clone(), req.bundle().to_path_buf(), revision)?;
+            // 契約 16: インスタンス識別子もこの create で割り当てた revision。
+            record = record.with_instance(ContainerInstance::from_raw(revision.value()));
             // 契約 8: instance はこの create で割り当てた revision。
             if let Some(scope) = req.cgroup_scope() {
                 record = record.with_cgroup(CgroupPlacement::new(scope.clone(), revision));
@@ -1463,6 +1488,10 @@ mod tests {
             let bundle = current.bundle().to_path_buf();
             let next_revision = self.allocate_revision()?;
             let mut updated = StateRecord::new(req.status().clone(), bundle, next_revision)?;
+            // 契約 16: インスタンス識別子は引き継ぐ。
+            if let Some(i) = current.instance() {
+                updated = updated.with_instance(i);
+            }
             // 契約 8: 配置は引き継ぐ。追記の指定があれば、無いときに限り直前の revision を instance に記録する。
             match (current.cgroup(), req.cgroup_scope()) {
                 // (Some, Some) は上で FailedPrecondition にしている。

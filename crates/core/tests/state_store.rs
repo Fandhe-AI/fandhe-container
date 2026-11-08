@@ -248,7 +248,7 @@ mod linux {
         // 0. create 前は <id>/ が存在しない。
         assert_gone(root, id);
 
-        // 1. create 直後: created・pid / exitCode なし・revision 0（FileStateStore の初回採番）。
+        // 1. create 直後: created・pid / exitCode なし・revision 0（FileStateStore の初回採番）・instance 0（create で割り当てた revision。契約 16）。
         let created = create(dyn_store, &rec, &bundle.create_request(id)).expect("create");
         assert_eq!(created.revision().value(), 0);
         assert_eq!(
@@ -259,6 +259,7 @@ mod linux {
                 "status": "created",
                 "bundle": bundle_str,
                 "revision": 0,
+                "instance": 0,
                 "restartCount": 0
             })
         );
@@ -280,6 +281,7 @@ mod linux {
             "pid": 101,
             "bundle": bundle_str,
             "revision": 2,
+            "instance": 0,
             "restartCount": 0
         });
         assert_eq!(read_state_json(root, id), running_json);
@@ -321,6 +323,7 @@ mod linux {
                 "status": "stopped",
                 "bundle": bundle_str,
                 "revision": 3,
+                "instance": 0,
                 "restartCount": 0,
                 "exitCode": 137
             })
@@ -362,6 +365,7 @@ mod linux {
                 "status": "created",
                 "bundle": bundle_str,
                 "revision": 4,
+                "instance": 4,
                 "restartCount": 0
             })
         );

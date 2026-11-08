@@ -35,7 +35,7 @@
 //! - `upsert` は `CriImageService::pull` の await の後に実行器のスレッドで同期的に呼ばれ、oci のロック待ち
 //!   （既定 5 秒）と fsync の間ほかの RPC を止めうる。plugin は `@instance.lock` で 1 インスタンスに限られ、競合は
 //!   同じプロセスの pull の publish 中の短い時間だけなので許容する（blocking worker へ移すかは #4178）
-//! - oci の在庫との突き合わせ（manifest が消えた記録を落とす）は未実装で、追跡 issue は未起票（#4177 の範囲外）。
+//! - oci の在庫との突き合わせ（manifest が消えた記録を落とす）は未実装で、#4264 で追跡（#4177 の範囲外）。
 //!   PullImage の取り消しの窓で
 //!   メモリと永続側が食い違う場合は、次の `upsert` か再起動で永続側に揃う（#4178）
 

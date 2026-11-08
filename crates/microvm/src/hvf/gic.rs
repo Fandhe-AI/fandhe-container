@@ -60,11 +60,10 @@
 use std::sync::{Arc, RwLock};
 
 use crate::hvf_smp::VmShutdown;
-use crate::hvf_wake::{WfiWakeSet, WfiWaker};
 
 use crate::arm64_layout::{Arm64Layout, GicGeometry, check_spi_intid, check_virtual_timer_intid};
 use crate::error::{MicrovmError, MicrovmErrorCode};
-use crate::hvf_abi::{GicDistributorReg, HvGicIntid};
+use crate::hvf_abi::{GicDistributorReg, HVF_MAX_VCPUS, HvGicIntid};
 use crate::hvf_lifecycle::TeardownMark;
 use crate::interrupt::{InterruptLine, IrqLevel, IrqTrigger, LevelInterruptLine, LineResample};
 use crate::spi::{SpiLevelLine, SpiLine, SpiSink};
@@ -132,9 +131,16 @@ impl HvfGic {
 
     /// `vm` に GIC を作り、[`VmWithGic`] を返す。`vm` は消費する（順序の強制は doc の「順序の契約」）。
     ///
-    /// 検証（[`Self::probe`]）が失敗すると `vm` はここで drop される。
+    /// 検証（[`Self::probe`]・`vcpus` が `HVF_MAX_VCPUS` 以下であること）が失敗すると `vm` はここで drop される（資源を作る前に `InvalidArgument`）。
     pub fn create(vm: HvVm, layout: &Arm64Layout) -> Result<VmWithGic, MicrovmError> {
         let gic = Self::probe(layout)?;
+        // vCPU 数の上限（HVF_MAX_VCPUS）。以前は WFI の通知口の束の作成が担っていた検査で、GIC を作る前に拒否する。
+        if layout.vcpus > HVF_MAX_VCPUS {
+            return Err(MicrovmError::new(
+                MicrovmErrorCode::InvalidArgument,
+                "too many vcpus for the hvf backend",
+            ));
+        }
         let api = GicApi::get()?;
         let mut config = api.config_create()?;
         config.set_distributor_base(layout.gic_dist.base.raw())?;
@@ -144,7 +150,6 @@ impl HvfGic {
             gic,
             vm: Arc::new(vm),
             alive: Arc::new(RwLock::new(true)),
-            wake: WfiWakeSet::new(layout.vcpus)?,
             shutdown: Arc::new(VmShutdown::new()),
             teardown: TeardownMark::new(),
         })
@@ -159,8 +164,6 @@ pub struct VmWithGic {
     vm: Arc<HvVm>,
     /// 生存フラグ。[`GicSpiLine`] と共有し、`Drop` で false にする。
     alive: Arc<RwLock<bool>>,
-    /// vCPU ごとの WFI の待ちを起こす通知口の束。SPI の sink と vCPU スレッドが共有する（#3887・#3948）。
-    wake: WfiWakeSet,
     /// VM 全体の終了通知（SYSTEM_OFF・失敗・BSP の終了で全 vCPU を止める。MVM-5・MVM-1・REPAIR-5）。
     shutdown: Arc<VmShutdown>,
     /// teardown の開始印（TASK-192.16・#3798）。立った後の vCPU 作成を拒否する。
@@ -195,16 +198,6 @@ impl VmWithGic {
     /// `Arc<HvVm>`（`HvfGuestRam::register_shared` 用。crate の外へは公開しない。#3797）。
     pub(crate) fn shared_vm(&self) -> &Arc<HvVm> {
         &self.vm
-    }
-
-    /// vCPU `index` 専用の WFI の待ち手（#3887・#3948）。（#4039 で `TimerHandler` を消したため `hvf::vcpu` は結ばない。整理は #4040・#4042）。範囲外は `InvalidArgument`。
-    pub fn wfi_waker_for_vcpu(&self, index: u32) -> Result<WfiWaker, MicrovmError> {
-        self.wake.handle(index)
-    }
-
-    /// 全 vCPU の通知口の束の clone。停止要求の kick と VM の終了通知では #4040 から使わない（製品の呼び出し元なし。削除は #4042）。
-    pub fn wake_set(&self) -> WfiWakeSet {
-        self.wake.clone()
     }
 
     /// SPI `intid` の `GICD_IROUTER<intid>` の生値を読む（実機の観測用。#3960・MVM-5）。

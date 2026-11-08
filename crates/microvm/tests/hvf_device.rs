@@ -1999,7 +1999,7 @@ fn hvf_device_vtimer_wakes_wfi() {
         "guest did not stay in wfi: {:?}",
         report.stats
     );
-    // 停止要求が WFI の待ちを起こす(#3887)。所要には vCPU の破棄とスレッドの終了を含む。超えるなら切り分けて緩める。
+    // 停止要求の kick（`hv_vcpus_exit`）が `hv_vcpu_run` の中の WFI を解く(#4040)。所要には vCPU の破棄とスレッドの終了を含む。超えるなら切り分けて緩める。
     eprintln!(
         "hvf_device: vtimer: stop_elapsed_us={}",
         stop_elapsed.as_micros()

@@ -89,7 +89,7 @@
 //!
 //! 実装済み:
 //! - VM・ゲスト RAM・vCPU・GICv3 の実行時解決（`sys/hvf.rs`・`hvf::memory`・`hvf::gic`。#3783・#3786・#3787・#3789・#3792・#3795）
-//! - vCPU 専用スレッドと実行ループ・exit の分類（`hvf_loop`・`hvf::vcpu`。#3791）と、MMIO・HVC（PSCI）・WFI / vtimer の処理
+//! - vCPU 専用スレッドと実行ループ・exit の分類（`hvf_loop`・`hvf::vcpu`。#3791）と、MMIO・HVC（PSCI）の処理（WFI / vtimer の exit は fail-closed。#4039）
 //!   （`hvf::mmio`・`hvf::hvc`。#3793・#3794・#3883）
 //! - microVM 構成体と start / stop・停止時の資源の解放順序（`hvf::microvm`・`hvf_lifecycle`。#3797・#3798・#3882）
 //! - UART の SPI 割り込みと入力（#3892・#3893）
@@ -123,7 +123,6 @@ pub mod hvf_abi;
 pub mod hvf_lifecycle;
 pub mod hvf_loop;
 pub mod hvf_smp;
-pub mod hvf_wake;
 pub mod interrupt;
 #[cfg(target_os = "linux")]
 pub mod irq;

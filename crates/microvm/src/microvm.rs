@@ -26,7 +26,9 @@
 //! 呼び出し元は `fandhe-container-plugin-microvm`（TASK-117）。構成は非信頼の入力として、ioctl の前に上限を検証する。
 //!
 //! KVM 内部領域（#3732）: identity map（[`IDENTITY_MAP_ADDR`]）と TSS（[`TSS_ADDR`]）は vCPU の作成前に置き、RAM・MMIO の窓と
-//! 重ならないことを `plan_layout` が検証する。AP の起動コードの e820 への予約領域としての記載は範囲外（REPAIR-3。e820 は RAM と MP テーブルの予約〔#3888〕）。
+//! 重ならないことを `plan_layout` が検証する。AP の起動コードの e820 への予約領域としての記載は範囲外（REPAIR-3）。
+//! e820 は RAM・MP テーブルの予約（#3888）に加え、virtio-mmio の窓・IOAPIC・LAPIC・identity map・TSS を `system_regions` から
+//! 1 対 1 で type 2 として載せる（#4106。`e820_reservations`）。
 //!
 //! 範囲外（REPAIR-3）: MSR / FPU の設定（CPUID は #3733 で vCPU ごとに設定済み。実カーネルの起動完走に必要。#886 以降の追跡事項）・一時停止（pause）・
 //! 複数 vCPU の exit 処理は 1 つの Mutex で直列にする簡易実装で、デバイス単位の並行は範囲外。
@@ -96,14 +98,17 @@
 //! そのため size・GPA は ioctl の前にすべて検証し、slot は `u16` で受ける（KVM は上位 16 bit を address space id に使う）。
 //!
 //! # 範囲外（REPAIR-3）
-//! hugepage・`KVM_MEM_READONLY` / `KVM_MEM_LOG_DIRTY_PAGES`・ゲストの物理アドレス幅（CPUID leaf 0x8000_0008）と最上位 GPA の照合・
-//! e820 での IOAPIC / LAPIC / MMIO hole の予約表記は未実装（複数領域と `KVM_CAP_NR_MEMSLOTS` の照会は #3697 で実装済み。下記）。
+//! hugepage・`KVM_MEM_READONLY` / `KVM_MEM_LOG_DIRTY_PAGES`・aarch64 の IPA サイズ（`KVM_CAP_ARM_VM_IPA_SIZE`）の照合は未実装
+//! （複数領域と `KVM_CAP_NR_MEMSLOTS` の照会は #3697、x86_64 の物理アドレス幅〔CPUID leaf 0x8000_0008〕と最上位 GPA の照合・
+//! e820 の予約表記は #4106 で実装済み。下記）。
 //!
 //! # 複数領域（#3697・MVM-1）
 //! x86_64 は RAM を MMIO hole `[X86_LOW_RAM_LIMIT, 4 GiB)` の前後に分け、領域ごとに別の memslot（slot = 領域の index）で登録する
 //! （`plan_ram_regions_x86`・[`register_ram_regions`]）。slot の上限は登録の前に `KVM_CAP_NR_MEMSLOTS` で確かめ、足りなければ
 //! `ResourceExhausted`。aarch64 の RAM は hole が無いので 1 領域のまま同じ経路を通る。macOS（HVF）は 1 領域。
-//! e820 は登録した領域の一覧から作る（`boot_x86::plan_boot`）。判断記録は docs/design/microvm-memory-ownership.md。
+//! e820 は登録した領域の一覧から作る（`boot_x86::plan_boot`）。x86_64 の `assemble` は `create_vm` の前に、vCPU に渡す CPUID の
+//! 物理アドレス幅と最上位 GPA（`system_regions` の最大の終端）を照合し、収まらなければ `FailedPrecondition`（#4106）。
+//! 判断記録は docs/design/microvm-memory-ownership.md。
 //!
 //! # 寿命
 //! [`RegisteredGuestRam`] は VM fd を dup して持つ（`'vm` の借用を持たないので、VM 構成体が VM fd と一緒に保持できる）。
@@ -128,8 +133,8 @@ use crate::boot_arm64::load_arm64;
 pub use crate::boot_x86::LoadedKernel;
 #[cfg(target_arch = "x86_64")]
 use crate::boot_x86::{
-    BootCpuState, KernelCmdline, MP_TABLE_START, VirtioMmioParam, X86FpuState, boot_msrs,
-    load_linux, write_boot_tables,
+    BootCpuState, E820Reservation, KernelCmdline, MP_TABLE_START, VirtioMmioParam, X86FpuState,
+    boot_msrs, load_linux, write_boot_tables,
 };
 #[cfg(target_arch = "aarch64")]
 use crate::device::Arm64VcpuPower;
@@ -864,6 +869,60 @@ fn system_regions(
     Ok((reserved, occupied))
 }
 
+/// `system_regions` の出力（occupied と reserved の両方）の最上位 GPA の終端（排他）。空なら `None`。
+/// RAM の最後の領域だけで決めないのは、将来 4 GiB 超にデバイスの窓を置いても自動で照合対象に入るため（#4106・MVM-1）。
+#[cfg(target_arch = "x86_64")]
+fn max_region_end(reserved: &[Region], occupied: &[Region]) -> Option<u64> {
+    reserved
+        .iter()
+        .chain(occupied.iter())
+        .map(|(_, r)| r.end)
+        .max()
+}
+
+/// 最上位 GPA の終端 `top_end`（排他）がゲストの物理アドレス幅 `bits`（CPUID leaf 0x8000_0008 の EAX\[7:0\]）で
+/// 表せる範囲 `[0, 2^bits)` に収まるか確かめる（KVM 不要の純粋関数。#4106・MVM-1）。
+///
+/// `assemble_inner` が VM 資源を作る前に呼ぶ。超過は `FailedPrecondition`（構成ではなくホストの能力に依存する失敗で、
+/// `KVM_CAP_IOEVENTFD` 欠如と同じ扱い）。シフトは `checked_shl` で、64 bit 以上は表せないものとして拒否する（fail-closed）。
+/// エラーの message に幅・アドレスは載せない（ERR-1）。
+#[cfg(target_arch = "x86_64")]
+fn check_physical_address_width(bits: u8, top_end: u64) -> Result<(), MicrovmError> {
+    match 1u64.checked_shl(u32::from(bits)) {
+        Some(limit) if top_end <= limit => Ok(()),
+        _ => Err(MicrovmError::new(
+            MicrovmErrorCode::FailedPrecondition,
+            "guest physical address space exceeds the CPUID physical address width",
+        )),
+    }
+}
+
+/// e820 に載せる予約: `system_regions` の RAM 以外の領域（virtio-mmio の窓・IOAPIC・LAPIC・identity map・TSS）を
+/// 1 対 1 で並べる（addr の昇順。#4106・MVM-1）。領域の一覧と e820 の出どころを 1 つにして、両者が食い違わないようにする。
+#[cfg(target_arch = "x86_64")]
+fn e820_reservations(
+    ram: &[GuestMemoryRegion],
+    slots: &[DeviceSlot],
+) -> Result<Vec<E820Reservation>, MicrovmError> {
+    let (reserved, occupied) = system_regions(ram, slots)?;
+    let mut out: Vec<E820Reservation> = reserved
+        .iter()
+        .chain(occupied.iter())
+        .filter(|(kind, _)| *kind != RegionKind::GuestMemory)
+        .map(|(_, r)| E820Reservation {
+            addr: r.start,
+            size: r.end - r.start,
+        })
+        .collect();
+    out.sort_by_key(|r| r.addr);
+    Ok(out)
+}
+
+// e820 の最悪件数（RAM の領域 + MP テーブルの予約 + 低位 RAM の分割 1 + 予約 virtio 最大台数 + IOAPIC・LAPIC・identity map・TSS）。
+#[cfg(target_arch = "x86_64")]
+const _: () =
+    assert!(MAX_GUEST_MEMORY_REGIONS + 2 + MAX_VIRTIO_DEVICES + 4 <= crate::boot_x86::E820_MAX);
+
 /// MP テーブルの IOAPIC の ID（LAPIC ID `0..MAX_VCPUS` と衝突しない値）。
 #[cfg(target_arch = "x86_64")]
 const MP_IOAPIC_ID: u8 = MAX_VCPUS as u8;
@@ -1392,6 +1451,16 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
             config.net.len(),
         )?;
         let ram = plan_ram_regions_x86(config.mem_size)?;
+        // CPUID は最初の KVM_RUN と KVM_SET_SREGS より前に vCPU ごとに設定する（APIC ID = vCPU id。#3733）。
+        // 物理アドレス幅の照合（#4106・MVM-1）を VM 資源の作成前に行うため、ここで取得する。
+        let cpuid = kvm.supported_cpuid()?;
+        #[cfg(target_arch = "x86_64")]
+        {
+            let (reserved, occupied) = system_regions(&ram, &slots)?;
+            let top_end = max_region_end(&reserved, &occupied)
+                .ok_or_else(|| MicrovmError::new(MicrovmErrorCode::Internal, "no guest regions"))?;
+            check_physical_address_width(cpuid.physical_address_bits()?, top_end)?;
+        }
         let vm = kvm.create_vm()?;
         vm.create_irqchip()?;
         // KVM 内部領域（identity map・TSS）は vCPU の作成前に置く。位置の重なりは plan_layout で検証済み（#3732）。
@@ -1415,8 +1484,6 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
             |s| vm.register_irqfd(s.gsi),
             |s, q| register_queue_ioeventfd(&vm, s, q),
         )?;
-        // CPUID は最初の KVM_RUN と KVM_SET_SREGS より前に vCPU ごとに設定する（APIC ID = vCPU id。#3733）。
-        let cpuid = kvm.supported_cpuid()?;
         let mut vcpus = Vec::with_capacity(config.vcpu_count as usize);
         #[cfg(target_arch = "x86_64")]
         for plan in plan_vcpus(config.vcpu_count)? {
@@ -1564,7 +1631,10 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
                 MicrovmError::new(MicrovmErrorCode::InvalidArgument, "too many vCPUs")
             })?;
             let table = build_mp_table(&mp_table_config(vcpu_count, &routes), MP_TABLE_START)?;
-            let loaded = load_linux(&mut self.memory, kernel, initrd, &cmdline)?;
+            // e820 の予約（#4106）は登録済みの RAM と配置済みの窓から作る（system_regions と同じ出どころ）。
+            let slots: Vec<DeviceSlot> = self.devices.infos().iter().map(|i| i.slot).collect();
+            let reserved = e820_reservations(&self.memory.regions(), &slots)?;
+            let loaded = load_linux(&mut self.memory, kernel, initrd, &cmdline, &reserved)?;
             write_mp_table(&mut self.memory, &table)?;
             Ok(loaded)
         }
@@ -4326,6 +4396,86 @@ mod assemble_tests {
             base: GuestAddress::new(base),
             len,
         }
+    }
+
+    /// MVM-1・#4106: 幅の境界（ちょうど収まる・1 つ超える・64 bit 以上は拒否）。
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn mvm1_4106_check_physical_address_width_boundary() {
+        assert!(check_physical_address_width(34, 0x4_0000_0000).is_ok());
+        let e = check_physical_address_width(34, 0x4_0000_0001).unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::FailedPrecondition);
+        assert!(check_physical_address_width(52, 1u64 << 52).is_ok());
+        assert!(check_physical_address_width(64, 1).is_err());
+    }
+
+    /// MVM-1・#4106: 最大構成（16 GiB）の最上位 GPA は 0x4_3000_0000 で、34 bit では拒否・35 bit では通る。
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn mvm1_4106_max_config_top_gpa_vs_width() {
+        const G: u64 = 1 << 30;
+        let ram = plan_ram_regions_x86(16 * G).unwrap();
+        let slots = layout_slots(2, 1).unwrap();
+        let (reserved, occupied) = system_regions(&ram, &slots).unwrap();
+        let top = max_region_end(&reserved, &occupied).unwrap();
+        assert_eq!(top, 0x4_3000_0000);
+        assert_eq!(
+            check_physical_address_width(34, top).unwrap_err().code(),
+            MicrovmErrorCode::FailedPrecondition
+        );
+        assert!(check_physical_address_width(35, top).is_ok());
+        // 小さい構成では最上位は LAPIC・TSS 側（4 GiB 未満）で、32 bit に収まる。
+        let ram = plan_ram_regions_x86(1 << 30).unwrap();
+        let (reserved, occupied) = system_regions(&ram, &slots).unwrap();
+        assert_eq!(
+            max_region_end(&reserved, &occupied),
+            Some(0xfffb_0000 + 0x1_0000)
+        );
+    }
+
+    /// MVM-1・#4106: e820 の予約は RAM 以外の領域と 1 対 1（具体値、addr 昇順）。
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn mvm1_4106_e820_reservations_values() {
+        let ram = plan_ram_regions_x86(5 << 30).unwrap();
+        let slots = layout_slots(2, 1).unwrap();
+        let r = e820_reservations(&ram, &slots).unwrap();
+        let v = |addr, size| E820Reservation { addr, size };
+        assert_eq!(
+            r,
+            vec![
+                v(0xd000_0000, 0x1000),
+                v(0xd000_1000, 0x1000),
+                v(0xd000_2000, 0x1000),
+                v(0xfec0_0000, 0x1000),
+                v(0xfee0_0000, 0x1000),
+                v(0xfffb_c000, 0x1000),
+                v(0xfffb_d000, 0x3000),
+            ]
+        );
+    }
+
+    /// MVM-1・#4106: `system_regions` の RAM 以外の各領域が、`plan_boot` の e820 に type 2 として完全一致で 1 回ずつ現れる。
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn mvm1_4106_system_regions_match_plan_boot_e820() {
+        const G: u64 = 1 << 30;
+        let ram = plan_ram_regions_x86(5 * G).unwrap();
+        let slots = layout_slots(2, 1).unwrap();
+        let reserved = e820_reservations(&ram, &slots).unwrap();
+        let (res, occ) = system_regions(&ram, &slots).unwrap();
+        let header = crate::boot_x86::header_for_plan_tests();
+        let plan = crate::boot_x86::plan_boot(&header, 0x1000, None, &ram, &reserved).unwrap();
+        for (kind, r) in res.iter().chain(occ.iter()) {
+            let n = plan
+                .e820
+                .iter()
+                .filter(|e| e.addr == r.start && e.size == r.end - r.start && e.kind == 2)
+                .count();
+            let expected = usize::from(*kind != RegionKind::GuestMemory);
+            assert_eq!(n, expected);
+        }
+        assert_eq!(plan.e820.len(), 3 + (ram.len() - 1) + reserved.len());
     }
 
     /// MVM-1・#3697: x86_64 の RAM は MMIO hole の前後の領域に分かれ、各領域は hole と重ならない（具体値）。

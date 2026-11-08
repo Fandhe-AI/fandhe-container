@@ -238,15 +238,26 @@ mod linux {
     /// 起動した監視スレッドが `<state>/io.containerd.runtime.v2.task/<namespace>/<id>/rootfs` の出現を待ち、直ちに `proc` を作る。
     /// shim の起動と Create の RPC はこの後なので、`proc` が先に存在する。上限内に作れなければ `false` を返し、試験は失敗する。
     /// `proc` は bind で供給できない（`/proc` 宛ては拒否）ため、`write_spec` の mounts[] には含めない。
+    ///
+    /// 監視スレッドが走り出して最初の確認を終えるまで（armed の合図を有限時間で）待ってから返す。呼び出し側は戻った後に `ctr` を
+    /// 起動するため、スレッドの起動遅延やスケジューラの都合で「監視がまだ始まっていないうちに Create・Start が進む」ことは無い。
+    /// 残る窓は、containerd が bundle を作ってから shim の起動・ttrpc 接続を経て Create に至るまでの間に、1 ms 周期で動く
+    /// 専用スレッドが一度も動けないことだけである。
     fn provision_proc(dir: &Path, id: &str) -> std::thread::JoinHandle<bool> {
         let rootfs = dir
             .join("state/io.containerd.runtime.v2.task")
             .join(NAMESPACE)
             .join(id)
             .join("rootfs");
-        std::thread::spawn(move || {
+        let (armed_tx, armed_rx) = std::sync::mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
             let until = Instant::now() + Duration::from_secs(60);
+            let mut armed = false;
             while Instant::now() < until {
+                if !armed {
+                    armed = true;
+                    let _ = armed_tx.send(());
+                }
                 if rootfs.is_dir() {
                     return match std::fs::create_dir(rootfs.join("proc")) {
                         Ok(()) => true,
@@ -256,7 +267,10 @@ mod linux {
                 std::thread::sleep(Duration::from_millis(1));
             }
             false
-        })
+        });
+        // 監視ループに入った合図を待つ（上限 10 秒。届かなければ以降の join が false を返して試験は失敗する）。
+        let _ = armed_rx.recv_timeout(Duration::from_secs(10));
+        handle
     }
 
     /// 最小 rootfs と user namespace を含む spec を書く（CRI-5・#4104）。

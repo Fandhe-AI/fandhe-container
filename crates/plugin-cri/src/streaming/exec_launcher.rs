@@ -687,10 +687,11 @@ impl SupervisorExecLauncher {
         }
         let pty = if req.tty {
             match recv_from_helper(&channel, started_deadline) {
-                Ok(HelperMessage::PtyMaster(fd)) => Some(
-                    PtyMaster::from_received(fd)
-                        .map_err(|_| CriError::internal("exec pty is invalid"))?,
-                ),
+                // 検証は受信側（`recv_from_helper`）が済ませる。受信の失敗で戻ると channel を drop し再利用しない（#4100）。
+                Ok(HelperMessage::PtyMaster(master)) => Some(master),
+                Err(ChannelError::NotPtyMaster) => {
+                    return Err(CriError::internal("exec pty is invalid"));
+                }
                 Ok(_) => return Err(CriError::internal("exec failed")),
                 Err(e) => return Err(channel_error(&e)),
             }

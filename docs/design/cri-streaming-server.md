@@ -200,7 +200,7 @@ helper を supervisor の bin に置く理由は、exec の領域（healthcheck 
 **stdio と pty**:
 
 - stdin / stdout / stderr を別々に付け替える処理は core（#3757）が持ち、`ExecLaunchIo` を拡張する。要求されない stdio は `/dev/null` のまま。既存の healthcheck の挙動は変えない
-- pty は worker（コンテナの mount namespace に参加した後）が、コンテナの devpts（`/dev/ptmx` は `pts/ptmx` への symlink。[dev-default-mounts.md](dev-default-mounts.md)）で開く。runc と同じくコンテナ内で `ttyname` が成り立つ。slave は `setsid` と `TIOCSCTTY` で controlling terminal にして fd 0〜2 に付ける。master は core の既存の worker から親への SCM_RIGHTS で helper へ返し、helper が channel の `PtyMaster` で plugin-cri へ返す。受け側は master が文字デバイスであることを fstat で確かめる。開く位置は、Landlock と seccomp の再適用の **後** に `ExecReady::allocate_pty` で、照合済みの `/` の fd から `dev` → `pts` → `ptmx` を 1 要素ずつ symlink 非追従で辿って開く（#3758 で確定。コマンドと同じ権利で開き、launch より広げない。暗黙の `/dev/pts` に `READ|WRITE|IOCTL_DEV` が付くため通る想定で、実コンテナでの確認は #3762。通らなければ再適用の前へ移す判断をオーナーに仰ぐ）。slave は `ChildStdio::from_pty_slave` が fd 0〜2 に付け、子が `setsid` の直後に `TIOCSCTTY` を発行する。master は worker がコマンドの fork の前に `spawn_exec_worker_with_listener_and_pty` の口で親へ送って閉じる（コマンドは master を持たない）。ホストの devpts で代わりに割り当てる方式は採らない
+- pty は worker（コンテナの mount namespace に参加した後）が、コンテナの devpts（`/dev/ptmx` は `pts/ptmx` への symlink。[dev-default-mounts.md](dev-default-mounts.md)）で開く。runc と同じくコンテナ内で `ttyname` が成り立つ。slave は `setsid` と `TIOCSCTTY` で controlling terminal にして fd 0〜2 に付ける。master は core の既存の worker から親への SCM_RIGHTS で helper へ返し、helper が channel の `PtyMaster` で plugin-cri へ返す。受け側（`stream_exec::channel::recv_from_helper`）は core の `PtyMaster::from_received`（文字デバイス 5:2 かつ `TIOCGPTN` の成功）で検証し、不一致は fd を閉じて `NotPtyMaster`（`InvalidArgument`）で拒否する（#4100）。受信に失敗した channel からは再び受信しない（最後の失敗通知の送信だけ許す）。開く位置は、Landlock と seccomp の再適用の **後** に `ExecReady::allocate_pty` で、照合済みの `/` の fd から `dev` → `pts` → `ptmx` を 1 要素ずつ symlink 非追従で辿って開く（#3758 で確定。コマンドと同じ権利で開き、launch より広げない。暗黙の `/dev/pts` に `READ|WRITE|IOCTL_DEV` が付くため通る想定で、実コンテナでの確認は #3762。通らなければ再適用の前へ移す判断をオーナーに仰ぐ）。slave は `ChildStdio::from_pty_slave` が fd 0〜2 に付け、子が `setsid` の直後に `TIOCSCTTY` を発行する。master は worker がコマンドの fork の前に `spawn_exec_worker_with_listener_and_pty` の口で親へ送って閉じる（コマンドは master を持たない）。ホストの devpts で代わりに割り当てる方式は採らない
 - resize は、plugin-cri が持つ master へ `TIOCSWINSZ` を発行する（core の安全なラッパー。supervisor への往復なし）
 
 **SEC-1**:
@@ -431,7 +431,7 @@ CRI の `ExecSync`（現状 `UNIMPLEMENTED`）も本設計の helper を再利�
 - Exec の tty（supervisor 側の pty 結線と helper の `--tty`。受け側は実装・試験済み）: 追跡 issue 未起票（親 #3726 の残り）。本番は RPC 時に `INVALID_ARGUMENT`
 - Exec の相対 argv[0]（PATH 解決）: #2439 の判断待ち。RPC 時に `INVALID_ARGUMENT`
 - Exec の実機前提試験: #3762。完全版 Attach の実機前提試験は #4079（`production_binary_attach_real`）で実装済み
-- Exec の残余: plugin-cri の異常終了時の helper の早期停止（#4112）、`PtyMaster` の fd 検証（#4100）
+- Exec の残余: plugin-cri の異常終了時の helper の早期停止（#4112）（`PtyMaster` の fd 検証は #4100 で解消）
 - 暫定値・設計の確認事項（exec の全体上限・同時セッション数・`::1`・終了コード・観測名など）: 上の「未確認・オーナー確認事項」と #4116（オーナー判断）
 - rootful: plugin-cri の start が uid 0 を `UNIMPLEMENTED` にするため、rootful のコンテナは無く 3 RPC とも使えない（uid 0 の拒否は #2442、rootful を許すかは #2241 の判断待ち）
 - 非 Linux: Exec は未結線の `UNIMPLEMENTED`。コンテナの start 自体も未実装（macOS の状態ルートは #2431）

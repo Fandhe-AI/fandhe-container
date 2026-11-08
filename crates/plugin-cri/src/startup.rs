@@ -128,9 +128,21 @@ fn streaming_is_consistent(o: &StreamingOptions) -> bool {
     if o.advertise.is_some() && !o.allow_external {
         return false;
     }
+    streaming_config_is_valid(o)
+}
+
+/// cri の `StreamingConfig::validate()` に通す（unix のみ。`streaming` モジュールが unix 限定のため）。
+#[cfg(unix)]
+fn streaming_config_is_valid(o: &StreamingOptions) -> bool {
     crate::streaming::production_streaming_config_with(o)
         .validate()
         .is_ok()
+}
+
+/// 非 unix では `serve` 自体が動かない（`streaming` モジュールが無い）ため、上の整合検査だけで受理する。
+#[cfg(not(unix))]
+fn streaming_config_is_valid(_o: &StreamingOptions) -> bool {
+    true
 }
 
 /// 引数（`argv[0]` を除く）を解析する。
@@ -395,6 +407,7 @@ mod tests {
     }
 
     /// CRI-6・#4110: ストリーミング引数なしは loopback の既定のまま。
+    #[cfg(unix)]
     #[test]
     fn cri6_4110_serve_without_streaming_flags_is_loopback_default() {
         let o = streaming_of(&["--socket", "/run/x/s.sock"]);

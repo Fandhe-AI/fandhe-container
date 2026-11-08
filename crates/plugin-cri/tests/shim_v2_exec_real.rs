@@ -98,10 +98,28 @@ mod linux {
     /// OCI 既定の capability 集合（14 個）のビット列。`self_check` が core の定義と突き合わせる。
     const OCI_DEFAULT_MASK: u64 = 0x0000_0000_a804_25fb;
     const EXEC_ID: &str = "e1";
-    /// exec の spec（env 空・cwd `/`・user なし・stdio なし。初版の受け入れの範囲。`docs/design/shim-v2-production-binary.md`）。
-    const EXEC_SPEC: &str = r#"{"cwd":"/","args":["/probe","--exec-probe"]}"#;
-    /// exec のコマンドの cmdline（argv を NUL で区切って末尾も NUL）。
-    const EXEC_CMDLINE: &[u8] = b"/probe\0--exec-probe\0";
+    /// exec の起動形（spec の JSON と、コマンドの cmdline〔argv を NUL で区切って末尾も NUL〕）。`write_bundle` が決める。
+    /// exec の spec は env 空・cwd `/`・user なし・stdio なしのまま（初版の受け入れの範囲。`docs/design/shim-v2-production-binary.md`）で、
+    /// 最小 rootfs に `ld.so.cache` が無く exec は init の `LD_LIBRARY_PATH` を引き継がないため、動的ローダを直接起動して
+    /// `--library-path` で複製したライブラリの置き場を渡す（`/probe` が libc を解決できず起動しない事態を避ける）。
+    static EXEC_INVOCATION: std::sync::OnceLock<(String, Vec<u8>)> = std::sync::OnceLock::new();
+    fn exec_spec() -> &'static str {
+        EXEC_INVOCATION.get().map(|v| v.0.as_str()).unwrap_or("")
+    }
+    fn exec_cmdline() -> &'static [u8] {
+        EXEC_INVOCATION.get().map(|v| v.1.as_slice()).unwrap_or(b"")
+    }
+    /// argv から exec の起動形を作る。
+    fn exec_invocation(argv: &[&str]) -> (String, Vec<u8>) {
+        let args: Vec<String> = argv.iter().map(|a| format!("{a:?}")).collect();
+        let spec = format!(r#"{{"cwd":"/","args":[{}]}}"#, args.join(","));
+        let mut cmd = Vec::new();
+        for a in argv {
+            cmd.extend_from_slice(a.as_bytes());
+            cmd.push(0);
+        }
+        (spec, cmd)
+    }
     /// 解放の合図。rootfs 直下に作ると exec のコマンドが終了コード 0 で終わる。
     const RELEASE_NAME: &str = "release";
     const NS_ALL: [&str; 8] = ["cgroup", "ipc", "mnt", "net", "pid", "time", "user", "uts"];
@@ -426,6 +444,19 @@ mod linux {
         let rootfs = bundle.join("rootfs");
         let ld =
             minimal_rootfs::install_binary_at(&rootfs, "probe", &["proc", "dev", "tmp", "etc"])?;
+        let interp = {
+            let exe = std::fs::canonicalize(
+                std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?,
+            )
+            .map_err(|e| format!("canonicalize exe: {e}"))?;
+            let bytes = std::fs::read(&exe).map_err(|e| format!("read exe: {e}"))?;
+            minimal_rootfs::loader_deps::elf_interp(&bytes)
+        };
+        let argv: Vec<&str> = match interp.as_deref() {
+            Some(i) => vec![i, "--library-path", &ld, "/probe", "--exec-probe"],
+            None => vec!["/probe", "--exec-probe"],
+        };
+        let _ = EXEC_INVOCATION.set(exec_invocation(&argv));
         let spec = format!(
             r#"{{"ociVersion":"1.2.0","root":{{"path":"{}","readonly":false}},"hostname":"fandhe-shim",
 "process":{{"user":{{"uid":0,"gid":0}},"args":["/probe","--container-probe"],
@@ -467,7 +498,7 @@ mod linux {
     }
 
     /// exec のコマンドの pid を、`leaf` 直下の `exec-*` 子 cgroup から cmdline で特定する（ちょうど 1 つ）。
-    /// 子 cgroup には fork 直後の worker なども居うるため、cmdline が `EXEC_CMDLINE` と完全一致するものに絞る。
+    /// 子 cgroup には fork 直後の worker なども居うるため、cmdline が `exec_cmdline()` と完全一致するものに絞る。
     fn find_exec_pid(leaf: &str) -> Result<(u32, String), String> {
         let mut found: Vec<(u32, String)> = Vec::new();
         wait_until(STEP, || {
@@ -478,7 +509,7 @@ mod linux {
                         .into_iter()
                         .filter(|pid| {
                             std::fs::read(format!("/proc/{pid}/cmdline"))
-                                .is_ok_and(|c| c == EXEC_CMDLINE)
+                                .is_ok_and(|c| c == exec_cmdline())
                         })
                         .map(|pid| (pid, dir.clone()))
                         .collect::<Vec<_>>()
@@ -531,7 +562,7 @@ mod linux {
         }
 
         // exec を通す（env 空・cwd `/`・user なし・stdio なし）。
-        rpc(&sock, "Exec", &exec_request(id, EXEC_ID, EXEC_SPEC))?;
+        rpc(&sock, "Exec", &exec_request(id, EXEC_ID, exec_spec()))?;
         rpc(&sock, "Start", &exec_id_request(id, EXEC_ID))?;
         let st = wait_exec_state(&sock, id, STATUS_RUNNING)?;
         if st.pid != 0 {
@@ -745,7 +776,7 @@ mod linux {
             (b"", false),
         ];
         for (c, want) in cmd_cases {
-            if (c == EXEC_CMDLINE) != want {
+            if (c == exec_invocation(&["/probe", "--exec-probe"]).1.as_slice()) != want {
                 return Err(format!("self-check cmdline {c:?}: want {want}"));
             }
         }

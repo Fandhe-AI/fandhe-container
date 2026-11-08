@@ -42,7 +42,16 @@ impl Scratch {
     }
 }
 
+/// containerd の bundle の形（`<state>/<namespace>/<id>`）に合わせた実在のディレクトリを作って返す（#4151。delete は
+/// 末尾の要素が id と一致する実在のディレクトリの `-bundle` を要求する）。
+fn bundle_for(sc: &Scratch, id: &str) -> String {
+    let b = sc.root.join("b").join("default").join(id);
+    std::fs::create_dir_all(&b).unwrap();
+    b.to_str().unwrap().to_owned()
+}
+
 fn run(sc: &Scratch, id: &str, action: &str) -> Output {
+    let bundle = bundle_for(sc, id);
     let mut cmd = Command::new(BIN);
     cmd.args([
         "-namespace",
@@ -55,7 +64,7 @@ fn run(sc: &Scratch, id: &str, action: &str) -> Output {
         id,
     ])
     .args(if action == "delete" {
-        vec!["-bundle", "/tmp/b"]
+        vec!["-bundle", bundle.as_str()]
     } else {
         vec![]
     })
@@ -175,6 +184,7 @@ fn plug12_872_trailing_slash_symlink_override_is_rejected() {
     let mut dir = link.into_os_string();
     dir.push("/");
     for action in ["start", "delete"] {
+        let bundle = bundle_for(&sc, "tl");
         let mut cmd = Command::new(BIN);
         cmd.args([
             "-namespace",
@@ -185,7 +195,7 @@ fn plug12_872_trailing_slash_symlink_override_is_rejected() {
             "tl",
         ])
         .args(if action == "delete" {
-            vec!["-bundle", "/tmp/b"]
+            vec!["-bundle", bundle.as_str()]
         } else {
             vec![]
         })
@@ -226,6 +236,7 @@ fn repair4_872_concurrent_ops_log_keeps_every_line() {
 
 /// 上書き先 `dir` で `action` を実行する（祖先検査の試験用）。
 fn run_in(sc: &Scratch, dir: &std::path::Path, id: &str, action: &str) -> Output {
+    let bundle = bundle_for(sc, id);
     let mut cmd = Command::new(BIN);
     cmd.args([
         "-namespace",
@@ -236,7 +247,7 @@ fn run_in(sc: &Scratch, dir: &std::path::Path, id: &str, action: &str) -> Output
         id,
     ])
     .args(if action == "delete" {
-        vec!["-bundle", "/tmp/b"]
+        vec!["-bundle", bundle.as_str()]
     } else {
         vec![]
     })

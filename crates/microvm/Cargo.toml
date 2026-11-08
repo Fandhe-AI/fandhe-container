@@ -68,6 +68,7 @@
 # #3679 で irqfd / ioeventfd の解除失敗の観測・sys の事後監査の P3（KvmCap・MADV_DONTDUMP 等）を直す（依存は増やさない。unsafe は src/sys.rs のみ）。
 # #3698 で ioeventfd を所有型にして assemble へ結線し、eventfd を待つ通知スレッドと sys の poll を追加（依存は増やさない。unsafe は src/sys.rs のみ）。
 # #4101 で ioeventfd の poll の異常 revents（POLLERR / POLLHUP / POLLNVAL）を POLLIN と区別し、fail-closed で止める（依存は増やさない。unsafe の追加なし）。
+# #4157 で memslot_flags（memslot のフラグの型と KVM_CAP_READONLY_MEM の照会）を追加（依存は増やさない。unsafe の追加なし）。
 [package]
 name = "fandhe-container-microvm"
 edition.workspace = true

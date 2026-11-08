@@ -70,6 +70,7 @@ use crate::interrupt::{InterruptLine, IoEventSpec};
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use crate::irq::IrqLevelLine;
 use crate::irq::{self, EventFd, IoEventFd, IrqFd};
+use crate::memslot_flags::{MemslotCapabilityQuery, MemslotFlags, check_memslot_flags_supported};
 use crate::sys::{self, SysError};
 
 /// 本番で開くデバイスパス（固定リテラル。外部入力は届かない）。
@@ -1560,6 +1561,13 @@ fn classify_vm_setup_error(stage: VmSetupStage, e: SysError) -> MicrovmError {
     }
 }
 
+impl MemslotCapabilityQuery for VmFd {
+    fn check_extension(&self, cap: sys::KvmCap) -> Result<i32, MicrovmError> {
+        sys::kvm_check_extension(self.fd.as_fd(), cap)
+            .map_err(|e| classify_irq_error(IrqStage::CheckExtension, e))
+    }
+}
+
 impl VmFd {
     /// 拡張 `cap` に対応しているかを確かめ、非対応なら `FailedPrecondition`。
     fn require_extension(&self, cap: sys::KvmCap, what: &'static str) -> Result<(), MicrovmError> {
@@ -1582,6 +1590,14 @@ impl VmFd {
         let n = sys::kvm_check_extension(self.fd.as_fd(), sys::consts::KVM_CAP_NR_MEMSLOTS)
             .map_err(|e| classify_irq_error(IrqStage::CheckExtension, e))?;
         classify_memslot_count(n)
+    }
+
+    /// memslot のフラグがこの VM で使えるかを登録の前に確かめる（#4157・MVM-1・#4105）。
+    ///
+    /// `READONLY` を含むときだけ VM fd に `KVM_CAP_READONLY_MEM` を照会する（x86 は VM ごとに答えが変わりうるため
+    /// `/dev/kvm` でなく VM fd）。非対応は `FailedPrecondition`。登録 API への結線は #4158 で行う（未結線）。
+    pub fn check_memslot_flags(&self, flags: MemslotFlags) -> Result<(), MicrovmError> {
+        check_memslot_flags_supported(flags, self)
     }
 
     /// in-kernel irqchip（PIC・IOAPIC・LAPIC）を作る（TASK-74.2.3・MVM-1。x86_64 のみ）。

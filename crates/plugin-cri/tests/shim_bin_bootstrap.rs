@@ -54,6 +54,14 @@ impl Scratch {
     }
 }
 
+/// containerd の bundle の形（`<state>/<namespace>/<id>`）に合わせた実在のディレクトリを作って返す（#4151。delete は
+/// 末尾の要素が id と一致する実在のディレクトリの `-bundle` を要求する）。
+fn bundle_for(sc: &Scratch, id: &str) -> String {
+    let b = sc.root.join("b").join("default").join(id);
+    std::fs::create_dir_all(&b).unwrap();
+    b.to_str().unwrap().to_owned()
+}
+
 /// 期限つきで子を回収して出力を得る。
 fn run(sc: &Scratch, id: &str, action: &str, extra: &[&str]) -> Output {
     let mut cmd = Command::new(BIN);
@@ -136,7 +144,7 @@ fn cri5_872_start_prints_address_and_serves_ttrpc() {
     }
     // 同じフラグでもう一度 start すると、生きている socket を再利用して同じアドレスを返す。
     assert_eq!(start_ok(&sc, "c1"), addr);
-    let del = run(&sc, "c1", "delete", &["-bundle", "/tmp/b"]);
+    let del = run(&sc, "c1", "delete", &["-bundle", &bundle_for(&sc, "c1")]);
     assert!(del.status.success());
 }
 
@@ -148,7 +156,7 @@ fn cri5_872_delete_cleans_up_and_daemon_exits() {
     let addr = start_ok(&sc, &id);
     let sock = sock_of(&addr);
     assert!(sock.exists());
-    let del = run(&sc, &id, "delete", &["-bundle", "/tmp/b"]);
+    let del = run(&sc, &id, "delete", &["-bundle", &bundle_for(&sc, &id)]);
     assert!(del.status.success(), "{:?}", del);
     let r = decode_delete_response(&del.stdout).expect("DeleteResponse must decode");
     assert_eq!((r.pid, r.exit_status), (0, 137));
@@ -156,7 +164,7 @@ fn cri5_872_delete_cleans_up_and_daemon_exits() {
     assert!(!sock.exists());
     // 冪等
     assert!(
-        run(&sc, &id, "delete", &["-bundle", "/tmp/b"])
+        run(&sc, &id, "delete", &["-bundle", &bundle_for(&sc, &id)])
             .status
             .success()
     );
@@ -203,7 +211,7 @@ fn cri5_873_shutdown_rpc_ends_daemon() {
     let again = start_ok(&sc, &id);
     assert_eq!(again, addr);
     assert!(
-        run(&sc, &id, "delete", &["-bundle", "/tmp/b"])
+        run(&sc, &id, "delete", &["-bundle", &bundle_for(&sc, &id)])
             .status
             .success()
     );
@@ -217,9 +225,14 @@ fn cri5_872_start_replaces_stale_socket() {
     let addr = start_ok(&sc, "stale");
     let sock = sock_of(&addr);
     assert!(
-        run(&sc, "stale", "delete", &["-bundle", "/tmp/b"])
-            .status
-            .success()
+        run(
+            &sc,
+            "stale",
+            "delete",
+            &["-bundle", &bundle_for(&sc, "stale")]
+        )
+        .status
+        .success()
     );
     drop(UnixListener::bind(&sock).unwrap());
     assert!(sock.exists());
@@ -227,9 +240,14 @@ fn cri5_872_start_replaces_stale_socket() {
     let r = call(&sock, "containerd.task.v2.Task");
     assert_eq!(r.status.unwrap().0, UNIMPL);
     assert!(
-        run(&sc, "stale", "delete", &["-bundle", "/tmp/b"])
-            .status
-            .success()
+        run(
+            &sc,
+            "stale",
+            "delete",
+            &["-bundle", &bundle_for(&sc, "stale")]
+        )
+        .status
+        .success()
     );
 }
 
@@ -256,7 +274,7 @@ fn cri5_872_start_rejects_unsafe_paths() {
     let addr = start_ok(&sc, "x");
     let sock = sock_of(&addr);
     assert!(
-        run(&sc, "x", "delete", &["-bundle", "/tmp/b"])
+        run(&sc, "x", "delete", &["-bundle", &bundle_for(&sc, "x")])
             .status
             .success()
     );
@@ -378,7 +396,7 @@ fn plug12_3663_audit_helper_does_not_hold_listener() {
         std::fs::read_link(format!("/proc/{daemon}/fd/0")).unwrap(),
         Path::new("/dev/null")
     );
-    let del = run(&sc, &id, "delete", &["-bundle", "/tmp/b"]);
+    let del = run(&sc, &id, "delete", &["-bundle", &bundle_for(&sc, &id)]);
     assert!(del.status.success(), "{del:?}");
 }
 
@@ -449,6 +467,39 @@ fn sec4_3663_non_linux_starts_without_audit_sink() {
     assert!(addr.starts_with("unix://"), "{addr}");
     let log = sc.sock_dir().join("daemon.log");
     assert_eq!(std::fs::metadata(&log).unwrap().mode() & 0o777, 0o600);
-    let del = shim(&["-bundle", "/tmp/b"], "delete");
+    let del = shim(&["-bundle", &bundle_for(&sc, "noaudit")], "delete");
     assert!(del.status.success(), "{del:?}");
+}
+/// CRI-5・SEC-1・REPAIR-4・#4151: delete は不正な `-bundle`・`-id` を `INVALID_ARGUMENT` の構造化エラー（stderr の JSON 1 行・
+/// 終了コード 1・stdout 空）で拒否し、状態ルートも socket も作らない。
+#[test]
+fn cri5_4151_bin_delete_rejects_invalid_bundle_and_id() {
+    let sc = Scratch::new();
+    let real = bundle_for(&sc, "abc");
+    let file = sc.root.join("b/default/file");
+    std::fs::write(&file, b"x").unwrap();
+    let sym = sc.root.join("b/default/sym");
+    std::os::unix::fs::symlink(&real, &sym).unwrap();
+    let wrong = bundle_for(&sc, "other");
+    let long_id = "a".repeat(77);
+    let rows: Vec<(&str, String)> = vec![
+        ("abc", "rel/abc".to_string()),
+        ("abc", format!("{}/missing/abc", sc.root.display())),
+        ("file", file.display().to_string()),
+        ("sym", sym.display().to_string()),
+        ("abc", wrong),
+        ("a/b", real.clone()),
+        (long_id.as_str(), real.clone()),
+    ];
+    for (id, bundle) in rows {
+        let out = run(&sc, id, "delete", &["-bundle", &bundle]);
+        assert_eq!(out.status.code(), Some(1), "{id} {bundle}: {out:?}");
+        assert_failed(&out, "INVALID_ARGUMENT");
+    }
+    // 状態ルートも socket ディレクトリも作られていない。
+    let names: Vec<_> = std::fs::read_dir(&sc.root)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, vec!["b".to_string()], "{names:?}");
 }

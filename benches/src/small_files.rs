@@ -137,17 +137,25 @@ impl std::fmt::Display for SmallFilesError {
 
 impl std::error::Error for SmallFilesError {}
 
-/// `fandhe_container_io` のエラーを、パスを含まない構造化エラーへ写す。
-fn from_io(err: &IoError) -> SmallFilesError {
+/// `fandhe_container_io` のエラーを、操作名つきでパスを含まない構造化エラーへ写す（REPAIR-4・IO-6・#4114）。
+///
+/// `op` は呼び出し元が与える固定の英語ラベルで、message を `<op> failed (<IoErrorCode>)` にして
+/// どの操作の失敗かを切り分けられるようにする。パス・OS 由来の文字列・引用符・バックスラッシュは
+/// 含めない（`SmallFilesError` の契約。`Display` が JSON を手で書くため）。`IoError` 自体の message は
+/// パスを含みうるため載せない。`code` は `Timeout` なら `timeout`、それ以外は `io-error`。
+fn from_io(op: &'static str, err: &IoError) -> SmallFilesError {
     let code = if err.code() == IoErrorCode::Timeout {
         "timeout"
     } else {
         "io-error"
     };
-    SmallFilesError::new(
-        code,
-        format!("io operation failed ({})", err.code().as_str()),
-    )
+    SmallFilesError::new(code, format!("{op} failed ({})", err.code().as_str()))
+}
+
+/// 試行ごとの作業ディレクトリ上の `GuestFileCreator` を作る。server-api 経路と wire 経路の
+/// 計測区間の外から共通で呼ばれる。
+fn new_guest_file_creator(root: &Path) -> Result<GuestFileCreator, SmallFilesError> {
+    GuestFileCreator::new(root.to_path_buf()).map_err(|e| from_io("create guest file creator", &e))
 }
 
 /// ファイルシステム操作の失敗を、操作名つきの構造化エラーへ写す（REPAIR-4・IO-6・#4049）。
@@ -445,13 +453,19 @@ fn build_write_batch(file_size: u64) -> Result<fandhe_container_io::Batch, Small
     let len = usize::try_from(file_size)
         .map_err(|_| SmallFilesError::args("file size is out of range"))?;
     let body = vec![b'f'; len];
-    let limit = InFlightLimit::new(1).map_err(|e| from_io(&e))?;
+    let limit = InFlightLimit::new(1).map_err(|e| from_io("create in-flight limit", &e))?;
     let mut queue = SendQueue::new(limit);
-    let req = queue.register(FrameKind::Write).map_err(|e| from_io(&e))?;
+    let req = queue
+        .register(FrameKind::Write)
+        .map_err(|e| from_io("register write request", &e))?;
     let frame = encode_request(FrameKind::Write, WireRequestId::from(req.id()), &body)
-        .map_err(|e| from_io(&e))?;
-    let mut buffer = BatchBuffer::new(BatchConfig::new(1).map_err(|e| from_io(&e))?);
-    match buffer.push(frame).map_err(|e| from_io(&e))? {
+        .map_err(|e| from_io("encode write frame", &e))?;
+    let mut buffer =
+        BatchBuffer::new(BatchConfig::new(1).map_err(|e| from_io("create batch config", &e))?);
+    match buffer
+        .push(frame)
+        .map_err(|e| from_io("push write frame", &e))?
+    {
         PushOutcome::Ready(batch) => Ok(batch),
         _ => Err(SmallFilesError::new(
             "write-failed",
@@ -466,7 +480,7 @@ fn flush_timeout(deadline: Instant) -> Result<IoTimeout, SmallFilesError> {
     if remaining.is_zero() {
         return Err(SmallFilesError::new("timeout", "deadline exceeded"));
     }
-    IoTimeout::new(remaining.min(MAX_IO_TIMEOUT)).map_err(|e| from_io(&e))
+    IoTimeout::new(remaining.min(MAX_IO_TIMEOUT)).map_err(|e| from_io("create flush timeout", &e))
 }
 
 /// 1 試行（計測区間）を `plan.route` の経路で実行して所要時間を返す。`trial_root` は存在する
@@ -499,7 +513,7 @@ fn run_trial_server_api(
     check_environment(plan)?;
     // 区間の外: Batch の組み立てと creator の構築。
     let batch = build_write_batch(plan.file_size)?;
-    let creator = GuestFileCreator::new(trial_root.to_path_buf()).map_err(|e| from_io(&e))?;
+    let creator = new_guest_file_creator(trial_root)?;
     let deadline = trial_deadline.min(overall_deadline);
 
     let start = Instant::now();
@@ -509,8 +523,10 @@ fn run_trial_server_api(
         }
         let mut sink = creator
             .create_file(&guest_path(plan.layout, i))
-            .map_err(|e| from_io(&e))?;
-        let report = sink.write_batch(&batch).map_err(|e| from_io(&e))?;
+            .map_err(|e| from_io("create guest file", &e))?;
+        let report = sink
+            .write_batch(&batch)
+            .map_err(|e| from_io("write batch", &e))?;
         if report.frames_written != 1 || report.bytes_written != plan.file_size {
             return Err(SmallFilesError::new(
                 "write-failed",
@@ -521,7 +537,7 @@ fn run_trial_server_api(
         let flush_here = (i + 1) % plan.batch_size == 0 || i + 1 == plan.count;
         if flush_here {
             let mut sink = sink.with_flush_timeout(flush_timeout(deadline)?);
-            sink.persist().map_err(|e| from_io(&e))?;
+            sink.persist().map_err(|e| from_io("persist file", &e))?;
         }
     }
     Ok(start.elapsed())
@@ -974,6 +990,32 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn repair4_io6_from_io_names_the_operation() {
+        let e = IoError::new(IoErrorCode::Timeout, "/tmp/secret/x");
+        let m = from_io("persist file", &e);
+        assert_eq!(m.code, "timeout");
+        assert_eq!(m.message, "persist file failed (TIMEOUT)");
+        let e = IoError::new(IoErrorCode::InvalidArgument, "/tmp/secret/x");
+        let m = from_io("create in-flight limit", &e);
+        assert_eq!(m.code, "io-error");
+        assert_eq!(
+            m.to_string(),
+            "{\"error\":{\"code\":\"io-error\",\"message\":\"create in-flight limit failed (INVALID_ARGUMENT)\"}}"
+        );
+    }
+
+    #[test]
+    fn repair4_io6_guest_file_creator_failure_names_the_operation() {
+        let missing = std::env::temp_dir().join(format!("fsf-nocreator-{}", std::process::id()));
+        let err = new_guest_file_creator(&missing).err().expect("must fail");
+        assert_eq!(err.code, "io-error");
+        assert_eq!(
+            err.message,
+            "create guest file creator failed (INVALID_ARGUMENT)"
+        );
+    }
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| (*s).to_string()).collect()

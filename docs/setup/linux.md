@@ -76,7 +76,8 @@ install -m 0755 target/release/fandhe-container-supervisor ~/.local/libexec/fand
 
 - 対応は rootless だけである。uid 0 の shim（rootful の containerd と、rootlesskit 配下で euid が 0 になる構成）では Create は通るが Start が `UNIMPLEMENTED` になる（#2442・#2241 の判断待ち）
 - 動く構成は、非 root で直接起動した containerd 2.x を、委譲 scope（`systemd-run --user --scope -p Delegate=yes`）の中で動かす構成である。shim は containerd の環境（`XDG_RUNTIME_DIR`・user manager）と cgroup を継ぐ。実機での通しは `crates/plugin-cri/tests/shim_v2_containerd_real.rs`（手順は [real-machine-tests.md](../verification/real-machine-tests.md)。CI の platform-ci〔ubuntu〕で実行（#4104）。ランナー以外の実機での記録は #3685）
-- 未実装（REPAIR-3）: exec、`delete` action での実行層の後始末、`-publish-binary` によるイベントの publish。macOS・Windows では Shutdown だけを処理する縮退（[shim-v2-production-binary.md](../design/shim-v2-production-binary.md)）
+- exec（`Exec`・`Start(exec_id)`）は rootless で supervisor の stream-exec helper 経由で動く（#4149）。ただし env・cwd（`/` 以外）・user・stdio の FIFO・terminal は `UNIMPLEMENTED` のため、containerd の CRI が作る stdio つきの exec はまだ通らない（REPAIR-3）
+- 未実装（REPAIR-3）: `delete` action での実行層の後始末、`-publish-binary` によるイベントの publish。macOS・Windows では Shutdown だけを処理する縮退（[shim-v2-production-binary.md](../design/shim-v2-production-binary.md)）
 
 ## rootless の範囲写像（subuid / subgid）
 

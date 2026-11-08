@@ -5,6 +5,8 @@
 //! 実行層まで届くことを具体値で照合する。以前の bin は `EmptyTaskService`（Shutdown 以外は `UNIMPLEMENTED`=12）だけを
 //! 登録していたため、`NOT_FOUND`(5) や `CREATED` が返ること自体が配線の証拠になる。Linux 限定・root 不要・supervisor 不要
 //! （Start は呼ばない。実コンテナの通しは実機前提の `shim_v2_containerd_real`）で、既定のテスト集合に入る。
+//! exec の起動役の配線（#4149）も照合する（存在しないコンテナへの Exec が `NOT_FOUND`、Created への Exec が `FAILED_PRECONDITION`。
+//! 起動役が無ければ `UNIMPLEMENTED`=12）。
 //! ttrpc の手組みは `support/shim_wire.rs`（prost を plugin-cri の依存に足さない）。
 
 #![cfg(target_os = "linux")]
@@ -14,8 +16,8 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use shim_wire::{
-    Resp, call_method, create_request, decode_delete_response, decode_state_response, id_request,
-    kill_request, shutdown_request,
+    Resp, call_method, create_request, decode_delete_response, decode_state_response,
+    exec_id_request, exec_request, id_request, kill_request, shutdown_request,
 };
 
 #[path = "../../core/tests/support/reap.rs"]
@@ -27,6 +29,8 @@ mod test_root;
 
 const BIN: &str = env!("CARGO_BIN_EXE_containerd-shim-fandhe-container-v2");
 const NOT_FOUND: i32 = 5;
+const FAILED_PRECONDITION: i32 = 9;
+const MIN_SPEC: &str = r#"{"cwd":"/","args":["/bin/true"]}"#;
 const STATUS_CREATED: u32 = 1;
 const SERVICES: [&str; 2] = ["containerd.task.v2.Task", "containerd.task.v3.Task"];
 /// 子の実行・待ちの期限（REPAIR-5）。
@@ -168,6 +172,70 @@ fn cri5_3684_bin_create_state_delete_shutdown() {
             code(call_method(&sock, svc, "State", &id_request(&id)), "State"),
             NOT_FOUND,
             "{svc} after delete"
+        );
+    }
+    shutdown_and_wait(&sock, &id);
+}
+
+/// CRI-5・CRI-1・#4149: bin の v2・v3 に exec の起動役が配線され、存在しないコンテナへの Exec・Start(exec_id)・State(exec_id) が
+/// `NOT_FOUND`(5) になる（起動役が無ければ Exec は `UNIMPLEMENTED`=12）。
+#[test]
+fn cri5_4149_bin_exec_reaches_launcher() {
+    let sc = Scratch::new("ex");
+    let id = format!("ex{}", std::process::id());
+    let sock = start(&sc, &id);
+    for svc in SERVICES {
+        assert_eq!(
+            code(
+                call_method(&sock, svc, "Exec", &exec_request("nope", "e1", MIN_SPEC)),
+                "Exec"
+            ),
+            NOT_FOUND,
+            "{svc} Exec"
+        );
+        assert_eq!(
+            code(
+                call_method(&sock, svc, "Start", &exec_id_request("nope", "e1")),
+                "Start"
+            ),
+            NOT_FOUND,
+            "{svc} Start"
+        );
+        assert_eq!(
+            code(
+                call_method(&sock, svc, "State", &exec_id_request("nope", "e1")),
+                "State"
+            ),
+            NOT_FOUND,
+            "{svc} State"
+        );
+    }
+    shutdown_and_wait(&sock, &id);
+}
+
+/// CRI-5・CRI-1・#4149: Created のコンテナへの Exec は `FAILED_PRECONDITION`(9) "container is not running"。
+#[test]
+fn cri5_4149_bin_exec_on_created_container_is_failed_precondition() {
+    let sc = Scratch::new("ec");
+    let id = format!("ec{}", std::process::id());
+    let sock = start(&sc, &id);
+    let bundle = make_bundle(&sc);
+    let bundle = bundle.to_str().expect("utf8 bundle");
+    for svc in SERVICES {
+        ok(
+            call_method(&sock, svc, "Create", &create_request(&id, bundle)),
+            "Create",
+        );
+        let r = call_method(&sock, svc, "Exec", &exec_request(&id, "e1", MIN_SPEC))
+            .unwrap_or_else(|e| panic!("Exec: {e}"));
+        assert_eq!(
+            r.status,
+            Some((FAILED_PRECONDITION, "container is not running".to_owned())),
+            "{svc}"
+        );
+        ok(
+            call_method(&sock, svc, "Delete", &id_request(&id)),
+            "Delete",
         );
     }
     shutdown_and_wait(&sock, &id);

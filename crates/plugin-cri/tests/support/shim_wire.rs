@@ -72,6 +72,30 @@ pub fn id_request(id: &str) -> Vec<u8> {
     b
 }
 
+/// `{ string id = 1; string exec_id = 2; }`（exec_id つきの State・Start・Delete・Wait の要求。#4149）。
+#[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
+pub fn exec_id_request(id: &str, exec_id: &str) -> Vec<u8> {
+    let mut b = id_request(id);
+    put_len(&mut b, 2, exec_id.as_bytes());
+    b
+}
+
+/// `ExecProcessRequest { id = 1; exec_id = 2; spec = 7 }`。spec は `Any { type_url = 1; value = 2 }` で、値は
+/// OCI runtime-spec の `Process` の JSON（型 URL は cri の `PROCESS_TYPE_URL` と同じ。#4149）。
+#[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
+pub fn exec_request(id: &str, exec_id: &str, spec_json: &str) -> Vec<u8> {
+    let mut any = Vec::new();
+    put_len(
+        &mut any,
+        1,
+        fandhe_container_cri::shim_v2::exec::PROCESS_TYPE_URL.as_bytes(),
+    );
+    put_len(&mut any, 2, spec_json.as_bytes());
+    let mut b = exec_id_request(id, exec_id);
+    put_len(&mut b, 7, &any);
+    b
+}
+
 /// `KillRequest { id = 1; exec_id = 2; signal = 3; all = 4 }`。
 #[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
 pub fn kill_request(id: &str, signal: u32, all: bool) -> Vec<u8> {

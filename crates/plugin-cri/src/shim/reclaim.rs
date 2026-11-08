@@ -40,7 +40,7 @@ use super::DeleteTarget;
 #[cfg(test)]
 pub(crate) use fandhe_container_cri::shim_v2::bootstrap::SHIM_DELETE_DEADLINE;
 
-/// 照合した記録の世代（bundle と revision。SEC-1・CORE-1・#4152）。
+/// 照合した記録の世代（bundle・revision・cgroup の instance。SEC-1・CORE-1・#4152）。
 ///
 /// 照合後に並行する回収が旧記録を消し、同じ id が別の bundle で再作成されたとき、id だけを渡した stop・delete が新しいコンテナに
 /// 触れないよう、副作用の直前に記録を読み直して一致を確かめる（不一致は `FAILED_PRECONDITION`。次の delete が照合からやり直す）。
@@ -48,6 +48,9 @@ pub(crate) use fandhe_container_cri::shim_v2::bootstrap::SHIM_DELETE_DEADLINE;
 pub(crate) struct Generation {
     bundle: PathBuf,
     revision: StateRevision,
+    /// cgroup 配置の instance（create で割り当てた revision。ストア全体で再利用されず、同一コンテナの更新では変わらない）。
+    /// 配置が未記録（`None`）の世代は instance で固定できない（revision の下限と bundle だけで見る。残余）。
+    instance: Option<StateRevision>,
 }
 
 impl Generation {
@@ -55,7 +58,16 @@ impl Generation {
         Self {
             bundle: rec.bundle().to_path_buf(),
             revision: rec.revision(),
+            instance: rec.cgroup().map(|c| c.instance()),
         }
+    }
+
+    /// `rec` が同じコンテナの記録か（bundle が同じで、固定の instance があれば一致する。revision は見ない）。
+    fn same_container(&self, rec: &StateRecord) -> bool {
+        self.bundle == rec.bundle()
+            && self
+                .instance
+                .is_none_or(|i| rec.cgroup().map(|c| c.instance()) == Some(i))
     }
 }
 
@@ -92,13 +104,14 @@ impl ReclaimBudget {
 /// 回収が使う実行層の窓口（stop と delete だけ）。本番は [`GuardedCore`]、試験は偽の実装。
 ///
 /// 実装は副作用の前に、記録が `generation` と一致することを確かめる（不一致は `FailedPrecondition`）。
-/// `stop` は停止後の記録の世代を添えて返し、続く `delete` がそれを使う（停止で revision が進むため）。
+/// `stop` は停止後の記録の世代を添えて返し、続く `delete` がそれを使う（停止で revision が進むため）。停止の後に記録が
+/// 消えていたときは世代が `None` で、取得済みの終了状態だけを返す（削除は不要。CRI-5）。
 pub(crate) trait ReclaimRuntime: Send + Sync + 'static {
     fn stop(
         &self,
         req: &StopRequest,
         generation: &Generation,
-    ) -> Result<(ContainerStatus, Generation), TraitError>;
+    ) -> Result<(ContainerStatus, Option<Generation>), TraitError>;
     fn delete(
         &self,
         req: &DeleteRequest,
@@ -145,7 +158,7 @@ impl GuardedCore {
         let rec = self.store.get(&GetStateRequest::new(id.clone()))?;
         // bundle だけでなく revision も厳密に照合する。revision は再利用されず（同じ id・同じ bundle で再作成されても
         // 値が変わる）、旧世代の stop・delete が再作成後の記録を受け入れない（SEC-1・CORE-1・#4152）。
-        if rec.bundle() != expected.bundle || rec.revision() != expected.revision {
+        if !expected.same_container(&rec) || rec.revision() != expected.revision {
             return Err(changed());
         }
         Ok(rec)
@@ -181,7 +194,7 @@ impl StateStore for PinnedStore {
         // （supervisor の `Stopped` 記録・core 自身の update）で進んだ値は許す（stop が Stopped の記録を待つため、完全一致にはできない。
         // 照合直後の再作成は `current` の完全一致が入口で拒む。残余: 入口の後に同じ bundle で再作成される窓）。
         match pinned {
-            Some(p) if p.bundle != rec.bundle() || rec.revision() < p.revision => Err(changed()),
+            Some(p) if !p.same_container(&rec) || rec.revision() < p.revision => Err(changed()),
             _ => Ok(rec),
         }
     }
@@ -204,16 +217,20 @@ impl ReclaimRuntime for GuardedCore {
         &self,
         req: &StopRequest,
         generation: &Generation,
-    ) -> Result<(ContainerStatus, Generation), TraitError> {
+    ) -> Result<(ContainerStatus, Option<Generation>), TraitError> {
         self.current(req.id(), generation)?;
         self.set_pin(generation);
         let status = fandhe_container_core::traits::ContainerRuntime::stop(&self.core, req)?;
-        let after = self.store.get(&GetStateRequest::new(req.id().clone()))?;
-        if after.bundle() != generation.bundle || after.status().state() != ContainerState::Stopped
-        {
+        let after = match self.store.get(&GetStateRequest::new(req.id().clone())) {
+            Ok(after) => after,
+            // 停止は成功し、その後に並行する回収が記録を消した。取得済みの終了状態を捨てない（CRI-5）。
+            Err(e) if e.code() == ErrorCode::NotFound => return Ok((status, None)),
+            Err(e) => return Err(e),
+        };
+        if !generation.same_container(&after) || after.status().state() != ContainerState::Stopped {
             return Err(changed());
         }
-        Ok((status, Generation::of(&after)))
+        Ok((status, Some(Generation::of(&after))))
     }
 
     fn delete(
@@ -264,14 +281,15 @@ where
     }
 }
 
-/// 記録のあるコンテナを止めて回収し、containerd へ返す終了状態を返す（上の表のとおり）。
+/// 記録のあるコンテナを止めて回収し、containerd へ返す終了状態を返す（上の表のとおり）。停止の前に記録が消えていたとき
+/// （終了状態が得られない）は `None`（固定の冪等な応答）。
 pub(crate) fn reclaim_recorded(
     rt: Arc<dyn ReclaimRuntime>,
     target: &DeleteTarget,
     rec: &StateRecord,
     budget: &ReclaimBudget,
     deadline: Instant,
-) -> Result<ShimDeleteExit, CriError> {
+) -> Result<Option<ShimDeleteExit>, CriError> {
     let generation = Generation::of(rec);
     let id = target.id().clone();
     let before = rec.status();
@@ -296,17 +314,25 @@ pub(crate) fn reclaim_recorded(
                 .with_signal(Signal::SIGKILL);
             match rt.stop(&req, &generation) {
                 Ok(v) => Ok(Some(v)),
-                // 並行する回収が先に消した。目的は達している（remove 段と同じく冪等）。
+                // 停止の前に並行する回収が消した。終了状態は何も得られていないので、固定の冪等な応答にする
+                // （停止前の状態から終了コードを作らない）。
                 Err(e) if e.code() == ErrorCode::NotFound => Ok(None),
                 Err(e) => Err(CriError::from(&e)),
             }
         })?;
         match stopped {
             Some(v) => v,
-            None => return Ok(ShimDeleteExit::from_core_status(before_pid, before)),
+            None => return Ok(None),
         }
     } else {
-        (before.clone(), generation)
+        (before.clone(), Some(generation))
+    };
+    // 停止の後に記録が消えていた: 削除は済んでいる。取得済みの終了状態を応答に載せる。
+    let Some(generation) = generation else {
+        return Ok(Some(ShimDeleteExit::from_core_status(
+            before_pid,
+            &final_status,
+        )));
     };
     let limit = budget.remove.min(remaining(deadline, "remove")?);
     run_stage(limit, "remove", move || {
@@ -317,5 +343,8 @@ pub(crate) fn reclaim_recorded(
             Err(e) => Err(CriError::from(&e)),
         }
     })?;
-    Ok(ShimDeleteExit::from_core_status(before_pid, &final_status))
+    Ok(Some(ShimDeleteExit::from_core_status(
+        before_pid,
+        &final_status,
+    )))
 }

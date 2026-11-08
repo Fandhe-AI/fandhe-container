@@ -88,7 +88,7 @@ impl ReclaimRuntime for Fake {
         &self,
         req: &StopRequest,
         generation: &Generation,
-    ) -> Result<(ContainerStatus, Generation), TraitError> {
+    ) -> Result<(ContainerStatus, Option<Generation>), TraitError> {
         self.log("stop", req.id());
         self.gate(self.inject_stop)?;
         let rec = self.check_generation(req.id(), generation)?;
@@ -103,7 +103,7 @@ impl ReclaimRuntime for Fake {
             self.wait_release();
         }
         let after = self.store.get(&GetStateRequest::new(req.id().clone()))?;
-        Ok((stopped, Generation::of(&after)))
+        Ok((stopped, Some(Generation::of(&after))))
     }
 
     fn delete(
@@ -243,8 +243,14 @@ fn cri5_4152_not_recorded_and_reclaimed_touch_nothing() {
 #[test]
 fn cri5_4152_stage_deadline_then_resume() {
     // (停止の注入, 削除の注入, 最初の実行の呼び出し, 再実行の呼び出し, 再実行が回収を返すか)
-    #[allow(clippy::type_complexity)]
-    let rows: Vec<(Option<Inject>, Option<Inject>, Vec<&str>, Vec<&str>, bool)> = vec![
+    type StageRow<'a> = (
+        Option<Inject>,
+        Option<Inject>,
+        Vec<&'a str>,
+        Vec<&'a str>,
+        bool,
+    );
+    let rows: Vec<StageRow> = vec![
         (
             Some(Inject::HangBefore),
             None,

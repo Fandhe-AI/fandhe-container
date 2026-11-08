@@ -431,7 +431,6 @@ pub(crate) fn delete_in(
     match (matched, store) {
         (DeleteRecordMatch::Recorded(rec), Some(store)) => {
             reclaim::reclaim_recorded(make_runtime(store), &target, &rec, budget, deadline)
-                .map(Some)
         }
         (DeleteRecordMatch::Recorded(_), None) => {
             Err(CriError::internal("cannot open the state store"))

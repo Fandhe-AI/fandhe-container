@@ -34,17 +34,18 @@
 //! # 移していない操作（実装済みを装わない。REPAIR-3）
 //!
 //! `pull` / `pull_recovery` の staging・公開・回収は `staging` 子モジュールの `StagingDir` / `PullDir` と
-//! `BlobDir` 経由で fd 起点へ移した（#2694）。移していないのは次の 1 つである。根拠と追跡 issue は
+//! `BlobDir` 経由で fd 起点へ移した（#2694）。移していないのは Windows の `PullDir`（パス起点。#4181）だけである。根拠と追跡 issue は
 //! `docs/design/image-store-root-trust.md` の論点 3 を参照。
 //!
 //! - fetcher（`RegistryClient::fetch_blob`）の書き込み先も fd 起点である（#2765）。`PullSession::open_staged_blob`
 //!   が pull ディレクトリの fd から `<hex>.part` を開いた `StagedBlobWriter` を返し、パスは受け取らない。
 //!   検証後の読み取りも `PullSession::open_verified_staged_blob` が fd 起点で開いたハンドルを渡し、パスで返す API は無い（#2893）。
 //!   リース済みの既存 blob の読み取りも `PullSession::open_leased_blob` が `blobs/sha256` を root の fd から開き直して渡す（#4179）。
+//!   展開先 `unpack/` の作成・展開・記録・公開元・後始末も `PullDir` の fd 起点（`create_unpack_dir`・`UnpackDir`）で行う（#4180）。
 
 mod staging;
 
-pub(crate) use staging::{PullDir, StagingDir};
+pub(crate) use staging::{PullDir, StagingDir, UnpackDir};
 
 use std::path::{Path, PathBuf};
 

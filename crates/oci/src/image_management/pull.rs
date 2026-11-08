@@ -37,7 +37,8 @@
 //! fd 起点（`root_handle::StagingDir` / `PullDir` / `BlobDir`）で行い、入口の再検査の後に root が差し替え
 //! られてもおとりへ書き込み・削除が届かない。fetcher の書き込み先も [`StagedBlobWriter`] が同じ fd 起点で開く
 //! （#2765）。検証後の読み取りも [`PullSession::open_verified_staged_blob`] が同じ fd 起点で開いたハンドルを渡し
-//! （#2893）、リース済み blob も [`PullSession::open_leased_blob`] が root の fd 起点で開く（#4179）。パスは返さない。根拠は `docs/design/image-store-root-trust.md` の論点 3。
+//! （#2893）、リース済み blob も [`PullSession::open_leased_blob`] が root の fd 起点で開く（#4179）。展開先 `unpack/` の作成・展開・記録・公開元・後始末も
+//! [`PullSession::create_unpack_dir`] / [`UnpackDir`] / [`PullSession::remove_unpack_dir`] が同じ fd 起点で行う（#4180）。パスは返さない。根拠は `docs/design/image-store-root-trust.md` の論点 3。
 //!
 //! 公開する blob の信頼条件（OCI-1・SEC。oci の `layer.rs` の `check_blob_trust` と同じ条件。公開入口は
 //! 所有者の照合が必須で、本モジュールは判定の本体を `blob_trust_violation` 経由で使う）: 通常ファイル・
@@ -53,8 +54,7 @@
 //! 指紋が一致するときだけ受け入れ、それ以外は検証済みのステージングで置き換える。
 //!
 //! 未実装（実装済みを装わない。REPAIR-3）:
-//! - 展開先 `unpack/` の作成はパス起点のまま
-//!   （#4180）。Windows の `PullDir` もパス起点で、[`PullSession::open_verified_staged_blob`]・
+//! - Windows の `PullDir` はパス起点で、[`PullSession::open_verified_staged_blob`]・
 //!   [`PullSession::open_leased_blob`] は `Unimplemented`（#2428・#4181）。
 //! - `PullSession` に `Drop` は実装しない（ロック待ちの Timeout・panic 中の毒化があり、ロックを取る
 //!   `Drop` は危険なため）。publish も abort もせずに drop すると、リースとステージングが残る
@@ -74,7 +74,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::root_handle::{BlobDir, PullDir, RootHandle};
+use super::root_handle::{self, BlobDir, PullDir, RootHandle};
 use super::tag::ImageTagChange;
 use super::usage::blob_path;
 use super::{ImageStore, MAX_COMPOSITION_LAYERS, ManifestComposition, PullId, TagKey};
@@ -159,6 +159,59 @@ impl LeasedBlob {
     /// 読み取りは [`PullSession::open_leased_blob`]（root の fd 起点。#4179）。
     pub fn path(&self) -> &Path {
         &self.path
+    }
+}
+
+/// 展開先の作業領域の名前（`staging/<id>/unpack`）。
+const UNPACK_DIR_NAME: &str = "unpack";
+
+/// 開いた展開先のディレクトリ（`staging/<id>/unpack` とその下。OCI-7・SEC-1・CRI-3・#4180）。
+///
+/// 作れるのは [`PullSession::create_unpack_dir`]（と [`UnpackDir::create_subdir`]）だけ。作成・記録の排他作成・
+/// 公開元の `rename`・展開器へ渡す根は、開いた fd 起点（Linux x86_64 / aarch64。それ以外はパス起点）で行い、
+/// 名前は呼び出し側の固定の定数だけを受ける（1 コンポーネントを `sys::at` が再検証する）。
+#[derive(Debug)]
+pub struct UnpackDir {
+    inner: root_handle::UnpackDir,
+}
+
+impl UnpackDir {
+    /// 直下に 0700 のディレクトリを新規に作って開く（既存は拒否）。
+    pub fn create_subdir(&self, name: &str) -> std::io::Result<UnpackDir> {
+        self.inner
+            .create_subdir(name)
+            .map(|inner| UnpackDir { inner })
+    }
+
+    /// 直下に 0600 で排他作成して書き込みで開く（既存なら `AlreadyExists`。symlink は辿らない）。
+    pub fn create_new_file(&self, name: &str) -> std::io::Result<File> {
+        self.inner.create_new_file(name)
+    }
+
+    /// 直下のファイルを unlink する（ディレクトリは消さない）。
+    pub fn unlink(&self, name: &str) -> std::io::Result<()> {
+        self.inner.unlink(name)
+    }
+
+    /// 直下の `name` を `dest_dir` 直下の `dest_name` へ移す（公開）。`dest_dir` は `O_NOFOLLOW` で開き、
+    /// 宛先が空でない既存ディレクトリなら失敗する（原子的な `renameat`）。
+    pub fn rename_child_into(
+        &self,
+        name: &str,
+        dest_dir: &Path,
+        dest_name: &str,
+    ) -> std::io::Result<()> {
+        self.inner.rename_child_into(name, dest_dir, dest_name)
+    }
+
+    /// 展開器（`layer::extract::extract_image_layers_bounded_in`）へ渡す根。
+    pub fn extract_root(&self) -> Result<crate::layer::extract::ExtractRoot, OciError> {
+        self.inner.extract_root().map_err(|_| {
+            err(
+                OciErrorCode::Internal,
+                "failed to prepare the extraction root",
+            )
+        })
     }
 }
 
@@ -553,7 +606,8 @@ impl PullSession<'_> {
     }
 
     /// `staging_dir()` のパスが、`begin_pull` で保持している pull ディレクトリの fd と同じ実体であることを確かめる
-    /// （OCI-7・SEC-1・#2893）。cri がパス起点の副作用（`unpack/` の作成・展開・`rename`）へ進む前に呼ぶ。
+    /// （OCI-7・SEC-1・#2893・#4180）。`unpack/` を含む fd 起点の操作はこの照合に依らずおとりへ届かないため、
+    /// これは差し替えを検出して fail-closed にする検出器である（cri が展開の前と、記録・公開の前に呼ぶ）。
     /// 違えば（`staging/<id>` が差し替えられている）`Internal`（`image store root changed after open`）で拒否する。
     /// パス起点の実装（Linux x86_64 / aarch64 以外）は常に通る。
     pub fn check_staging_dir_current(&self) -> Result<(), OciError> {
@@ -565,6 +619,37 @@ impl PullSession<'_> {
                 "image store root changed after open",
             ))
         }
+    }
+
+    /// 展開先の作業領域 `staging/<id>/unpack` を 0700 で新規に作って開く（既存は拒否。OCI-7・SEC-1・CRI-3・#4180）。
+    ///
+    /// cri の `ensure_rootfs` が呼ぶ。pull ディレクトリの fd からの `mkdirat` で作り、`O_NOFOLLOW` で開いた
+    /// [`UnpackDir`] を返す。`staging/<id>` が検査後に差し替えられても、検査済みの実体の中に作る（おとりへ届かない）。
+    /// Linux x86_64 / aarch64 以外はパス起点。
+    pub fn create_unpack_dir(&self) -> Result<UnpackDir, OciError> {
+        self.pull_dir
+            .create_unpack_dir(UNPACK_DIR_NAME)
+            .map(|inner| UnpackDir { inner })
+            .map_err(|_| {
+                err(
+                    OciErrorCode::FailedPrecondition,
+                    "failed to create the unpack directory",
+                )
+            })
+    }
+
+    /// 展開先の作業領域 `unpack/` を symlink を辿らず木ごと消す（無ければ成功。0555・0000 のディレクトリも消す。#4180）。
+    ///
+    /// `staging/<id>` 自身は消さない（消してよいのは `abort` / `publish` / 回収 GC だけ）。pull ディレクトリの fd 起点。
+    pub fn remove_unpack_dir(&self) -> Result<(), OciError> {
+        self.pull_dir
+            .remove_child_tree(std::ffi::OsStr::new(UNPACK_DIR_NAME))
+            .map_err(|_| {
+                err(
+                    OciErrorCode::Internal,
+                    "failed to remove the unpack directory",
+                )
+            })
     }
 
     fn note_blob(&mut self, digest: &Digest) -> Result<(), OciError> {

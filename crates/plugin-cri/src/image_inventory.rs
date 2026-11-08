@@ -29,11 +29,12 @@
 //!
 //! - 記録ファイルの読み書きはパス起点（oci の `RootHandle` は公開されない）。`lock()` が root を再検査し、root と
 //!   祖先は所有者専用という前提で守る。読み取りは fstat の dev / ino を lstat と照合して差し替えを検出する
-//! - `upsert` は `CriImageService::pull` の await の後に実行器のスレッドで同期的に呼ばれ、oci のロック待ち
-//!   （既定 5 秒）と fsync の間ほかの RPC を止めうる。plugin は `@instance.lock` で 1 インスタンスに限られ、競合は
-//!   同じプロセスの pull の publish 中の短い時間だけなので許容する（blocking worker へ移すかは #4178）
-//! - oci の在庫との突き合わせ（manifest が消えた記録を落とす）・`RemoveImage` は #4177。PullImage の取り消しの窓で
-//!   メモリと永続側が食い違う場合は、次の `upsert` か再起動で永続側に揃う（#4178）
+//! - `upsert` は `CriImageService::pull` の blocking worker の中で呼ばれる（#4178）。RPC の future が publish の後に
+//!   破棄されても worker は登録まで進むため、取り消しの窓（publish と upsert の間）は稼働中に開かない。
+//!   oci のロック待ち（既定 5 秒）と fsync は実行器のスレッドを止めない
+//! - プロセスが publish の後、upsert の完了前に死ぬと、oci の在庫にだけ載る。`open` は oci の在庫を読まないため
+//!   再起動では揃わず、同じ参照の次の `PullImage` で揃う（oci の在庫との突き合わせは #4177）
+//! - oci の在庫との突き合わせ（manifest が消えた記録を落とす）・`RemoveImage` は #4177
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read as _, Write as _};
@@ -395,6 +396,139 @@ mod tests {
             .expect("status")
             .into_inner();
         assert_eq!(status.image.expect("image").id, id_a());
+    }
+
+    fn multi_arch_pull(index: &str, tag: &str, repo: &str) -> PulledImage {
+        // 補助（プラットフォーム）digest は全桁 0 で、辞書順では top-level（index）より前に来る。
+        PulledImage {
+            id: id_a(),
+            repo_tags: vec![format!("{repo}:{tag}")],
+            repo_digests: vec![
+                format!("{repo}@sha256:{}", index.repeat(64)),
+                format!("{repo}@sha256:{}", "0".repeat(64)),
+            ],
+            size: 4096,
+        }
+    }
+
+    /// OCI-1・CRI-2・#4178: multi-arch の統合後も、top-level 区間が先、補助区間が後の並びが書いて読み直しても変わらない。
+    /// 補助 digest が辞書順で top-level より前になる fixture で、全体を 1 本に並べ直す誤りを検出する。
+    #[tokio::test]
+    async fn cri2_oci1_multi_arch_digest_order_survives_reopen() {
+        let dir = scratch("order");
+        let a = Arc::new(PersistentImageStore::open(&dir).expect("open a"));
+        for (index, repo) in [
+            ("f", "docker.io/library/busybox"),
+            ("e", "registry.example/mirror/busybox"),
+        ] {
+            let svc = CriImageService::with_store(a.clone())
+                .with_puller(Arc::new(FixedPuller(multi_arch_pull(index, "1.36", repo))));
+            svc.pull_image(pull_request()).await.expect("pull");
+        }
+        let list = |store: Arc<PersistentImageStore>| async move {
+            CriImageService::with_store(store)
+                .list_images(Request::new(v1::ListImagesRequest::default()))
+                .await
+                .expect("list")
+                .into_inner()
+                .images
+        };
+        let before = list(a.clone()).await;
+        drop(a);
+        let b = Arc::new(PersistentImageStore::open(&dir).expect("open b"));
+        let after = list(b.clone()).await;
+        assert_eq!(after, before);
+        let h = |c: &str, repo: &str| format!("{repo}@sha256:{}", c.repeat(64));
+        let (d, m) = (
+            "docker.io/library/busybox",
+            "registry.example/mirror/busybox",
+        );
+        let expected = vec![h("f", d), h("e", m), h("0", d), h("0", m)];
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].repo_digests, expected);
+        assert_eq!(
+            after[0].repo_tags,
+            vec![
+                "docker.io/library/busybox:1.36".to_owned(),
+                "registry.example/mirror/busybox:1.36".to_owned()
+            ]
+        );
+        let got = b
+            .get("docker.io/library/busybox:1.36")
+            .expect("get")
+            .expect("present");
+        assert_eq!(got.top_level_digests().to_vec(), vec![h("f", d), h("e", m)]);
+        assert_eq!(got.auxiliary_digests().to_vec(), vec![h("0", d), h("0", m)]);
+        assert_eq!(got.repo_digests()[0], h("f", d));
+    }
+
+    /// 窓への注入用: publish 済みの合図を出し、解放まで待ってから成功を返す puller。
+    struct PublishThenWait {
+        published: std::sync::Mutex<std::sync::mpsc::Sender<()>>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl ImagePuller for PublishThenWait {
+        fn pull(&self, _request: &PullRequest) -> Result<PulledImage, PullError> {
+            let _ = self.published.lock().expect("lock").send(());
+            let _ = self
+                .release
+                .lock()
+                .expect("lock")
+                .recv_timeout(std::time::Duration::from_secs(10));
+            Ok(multi_arch_pull("f", "1.36", "docker.io/library/busybox"))
+        }
+    }
+
+    /// CRI-2・OCI-7・REPAIR-5・#4178: publish と upsert の間で RPC が取り消されても、取り消し後の ListImages が
+    /// 永続在庫を別に開いた service の ListImages と一致し、空でない（稼働中に不一致が残らない）。
+    #[tokio::test]
+    async fn cri2_oci7_pull_cancelled_between_publish_and_upsert_matches_persistent_store() {
+        let dir = scratch("window");
+        let (published_tx, published_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let store = Arc::new(PersistentImageStore::open(&dir).expect("open"));
+        let svc = Arc::new(CriImageService::with_store(store).with_puller(Arc::new(
+            PublishThenWait {
+                published: std::sync::Mutex::new(published_tx),
+                release: std::sync::Mutex::new(release_rx),
+            },
+        )));
+        let first = {
+            let svc = svc.clone();
+            tokio::spawn(async move { svc.pull_image(pull_request()).await })
+        };
+        tokio::task::spawn_blocking(move || {
+            published_rx.recv_timeout(std::time::Duration::from_secs(10))
+        })
+        .await
+        .expect("join")
+        .expect("publish reached");
+        first.abort();
+        let _ = first.await;
+        release_tx.send(()).expect("release");
+        let list = |s: Arc<CriImageService>| async move {
+            s.list_images(Request::new(v1::ListImagesRequest::default()))
+                .await
+                .expect("list")
+                .into_inner()
+                .images
+        };
+        // worker の登録の完了まで有界に待つ。
+        let mut live = Vec::new();
+        for _ in 0..200 {
+            live = list(svc.clone()).await;
+            if !live.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].id, id_a());
+        let reopened = Arc::new(CriImageService::with_store(Arc::new(
+            PersistentImageStore::open(&dir).expect("reopen"),
+        )));
+        assert_eq!(list(reopened).await, live);
     }
 
     /// CRI-2: 空の root は空の一覧。開いただけではファイルを作らず、最初の upsert 後は 0600 の通常ファイル。

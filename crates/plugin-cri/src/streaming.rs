@@ -14,6 +14,8 @@
 //! 非 Linux は「exec streaming is not wired」の `UNIMPLEMENTED`。`wiring` は bind 時に 1 回だけ取られるため、
 //! ハンドラは必ず bind より前に足す（[`bind_production_streaming`] が順序を固定する）。
 //!
+//! 接続の受理・拒否・期限切れは `connection_observer::TelemetryConnectionObserver` が telemetry へ出す（#4163・REPAIR-4）。
+//!
 //! # 安全側の既定
 //! 待ち受けは `127.0.0.1:0`・外部公開なし・トークンは単回使用で TTL 60 秒（`StreamingConfig::default()`）。
 //! 外部公開は起動引数 `--streaming-bind` / `--streaming-allow-external` / `--streaming-advertise` を明示したときだけ開く
@@ -38,6 +40,7 @@
 //! helper の期限は最長 1 時間）。ドレイン待ちは足さない。
 //! 設計は `docs/design/cri-streaming-server.md`。
 
+pub mod connection_observer;
 pub mod log_attach;
 
 #[cfg(target_os = "linux")]
@@ -63,7 +66,9 @@ use fandhe_container_cri::streaming::exec::{
     ExecStreamConfig, ExecStreamHandler, ExecStreamLauncher,
 };
 use fandhe_container_cri::streaming::port_forward::{PortForwardConfig, PortForwardHandler};
-use fandhe_container_cri::streaming::{StreamDispatcher, StreamingConfig, StreamingServer};
+use fandhe_container_cri::streaming::{
+    ConnectionObserver, StreamDispatcher, StreamingConfig, StreamingServer,
+};
 use fandhe_container_plugin::{PluginError, PluginErrorCode};
 
 /// 起動失敗時の固定文言（アドレス・OS のエラーは含めない。REPAIR-4）。
@@ -177,15 +182,17 @@ pub fn production_stream_dispatcher(
 
 /// dispatcher を組んでから `StreamingServer` を起動する。`tokio` の実行時の中で呼ぶ。
 ///
+/// `observer` は接続の受理・拒否・期限切れの観測口（本番は [`connection_observer::TelemetryConnectionObserver`]。#4163・REPAIR-4）。
 /// `exec` が `None`（非 Linux）なら Exec は未結線で `UNIMPLEMENTED` のまま。失敗は `Unavailable`（bind・アドレス取得）と `Internal`（設定検証。本番の既定では起きない）の固定文言に写す。
 pub async fn bind_production_streaming(
     config: StreamingConfig,
     attach: ProductionAttach,
     exec: Option<Arc<dyn ExecStreamLauncher>>,
     recorder: Arc<dyn CriOpRecorder>,
+    observer: Arc<dyn ConnectionObserver>,
 ) -> Result<StreamingServer, PluginError> {
     let dispatcher = production_stream_dispatcher(attach, exec, recorder)?;
-    StreamingServer::bind_with_handler(config, Arc::new(dispatcher))
+    StreamingServer::bind_with_observer(config, Arc::new(dispatcher), observer)
         .await
         .map_err(|e| {
             let code = match e.code() {
@@ -243,6 +250,11 @@ mod tests {
         Arc::new(fandhe_container_cri::instrument::NoopCriOpRecorder)
     }
 
+    /// 何も観測しない口（観測を要さない既存試験用）。
+    fn noop_observer() -> Arc<dyn ConnectionObserver> {
+        Arc::new(fandhe_container_cri::streaming::NoopObserver)
+    }
+
     /// 読み取り専用の本番構成（非 Linux の本番と同じ。ログは読まれない）。
     fn fake_attach() -> ProductionAttach {
         ProductionAttach::read_only(Arc::new(
@@ -291,10 +303,15 @@ mod tests {
             advertise: Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7))),
         };
         let config = production_streaming_config_with(&opts);
-        let server =
-            bind_production_streaming(config.clone(), fake_attach(), None, noop_recorder())
-                .await
-                .expect("bind");
+        let server = bind_production_streaming(
+            config.clone(),
+            fake_attach(),
+            None,
+            noop_recorder(),
+            noop_observer(),
+        )
+        .await
+        .expect("bind");
         let addr = server.local_addr();
         assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         assert_ne!(addr.port(), 0);
@@ -338,6 +355,7 @@ mod tests {
             ProductionAttach::interactive(backend),
             None,
             noop_recorder(),
+            noop_observer(),
         )
         .await
         .expect("bind");
@@ -351,6 +369,7 @@ mod tests {
             fake_attach(),
             None,
             noop_recorder(),
+            noop_observer(),
         )
         .await
         .expect("bind");
@@ -380,6 +399,7 @@ mod tests {
             fake_attach(),
             None,
             noop_recorder(),
+            noop_observer(),
         )
         .await
         .expect("bind");
@@ -423,6 +443,7 @@ mod tests {
             fake_attach(),
             None,
             noop_recorder(),
+            noop_observer(),
         )
         .await
         .expect("bind");
@@ -497,6 +518,7 @@ mod tests {
             fake_attach(),
             None,
             noop_recorder(),
+            noop_observer(),
         )
         .await
         .expect("bind");
@@ -522,6 +544,7 @@ mod tests {
             fake_attach(),
             None,
             noop_recorder(),
+            noop_observer(),
         )
         .await
         .expect("bind");
@@ -561,6 +584,7 @@ mod tests {
             fake_attach(),
             None,
             noop_recorder(),
+            noop_observer(),
         )
         .await
         .expect_err("busy port");
@@ -572,6 +596,7 @@ mod tests {
             fake_attach(),
             None,
             noop_recorder(),
+            noop_observer(),
         )
         .await
         .expect_err("external without opt-in");
@@ -590,6 +615,7 @@ mod tests {
             ProductionAttach::interactive(backend),
             None,
             noop_recorder(),
+            noop_observer(),
         )
         .await
         .expect("bind");
@@ -679,6 +705,7 @@ mod tests {
             fake_attach(),
             None,
             noop_recorder(),
+            noop_observer(),
         )
         .await
         .expect("bind");
@@ -794,6 +821,7 @@ mod tests {
             fake_attach(),
             Some(launcher),
             noop_recorder(),
+            noop_observer(),
         )
         .await
         .expect("bind");
@@ -867,5 +895,191 @@ mod tests {
         assert_eq!(e.message(), "exec command must be an absolute path");
         let e = exec("/bin/true", false, "nope").await.expect_err("missing");
         assert_eq!(e.code(), Code::NotFound);
+    }
+
+    // ---- #4163: 接続イベントの telemetry への結線 ----
+
+    use std::io::{Read as _, Write as _};
+    use std::sync::Mutex;
+
+    use connection_observer::TelemetryConnectionObserver;
+    use connection_observer::tests::Collect;
+    use fandhe_container_core::observability::{OpName, OpRecorder};
+
+    use crate::telemetry::{LineSink, export_op_stats_to};
+
+    fn op_total(rec: &OpRecorder, name: &str) -> u64 {
+        rec.snapshot_op(&OpName::new(name).expect("name"))
+            .map_or(0, |s| s.success() + s.failure())
+    }
+
+    /// 要求を 1 本送り、応答を（期限つきで）読み切る。接続の失敗・切断は空文字列。
+    async fn http_get(addr: SocketAddr, path: &str) -> String {
+        let req = format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        tokio::task::spawn_blocking(move || {
+            let mut s = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2))
+                .expect("connect");
+            s.set_read_timeout(Some(Duration::from_secs(3)))
+                .expect("timeout");
+            let _ = s.write_all(req.as_bytes());
+            let mut out = Vec::new();
+            let _ = s.read_to_end(&mut out);
+            String::from_utf8_lossy(&out).into_owned()
+        })
+        .await
+        .expect("join")
+    }
+
+    async fn wait_until(mut ok: impl FnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !ok() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "condition not met in 5s"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// 本番の bind 経由で接続が観測され、出力にトークン・コンテナ ID・入力の内容・パスが含まれない（CRI-6・REPAIR-4・#4163）。
+    #[tokio::test]
+    async fn cri6_repair4_4163_no_token_or_ids_in_output() {
+        let rec = Arc::new(OpRecorder::new());
+        let out = Collect::default();
+        let sink = LineSink::spawn(Box::new(out.clone()), 64);
+        let obs = Arc::new(
+            TelemetryConnectionObserver::new(Arc::clone(&rec), sink.clone()).expect("obs"),
+        );
+        let server = bind_production_streaming(
+            production_streaming_config(),
+            fake_attach(),
+            None,
+            noop_recorder(),
+            obs,
+        )
+        .await
+        .expect("bind");
+        let url = server
+            .issuer()
+            .issue(fandhe_container_cri::streaming::StreamRequest::Attach(
+                cri::AttachRequest {
+                    container_id: "c4163-secret-container".into(),
+                    stdout: true,
+                    ..Default::default()
+                },
+            ))
+            .expect("issue");
+        let path = url
+            .strip_prefix(server.issuer().base_url())
+            .expect("prefix")
+            .to_string();
+        let token = path.rsplit('/').next().expect("token").to_string();
+        assert!(token.len() >= 32, "token={token}");
+        let _ = http_get(server.local_addr(), &path).await;
+        let _ = http_get(
+            server.local_addr(),
+            &format!("/attach/{token}x?payload-4163"),
+        )
+        .await;
+        wait_until(|| op_total(&rec, "cri.streaming.connection") >= 2).await;
+        export_op_stats_to(&rec, &sink);
+        sink.wait_idle(Duration::from_secs(2));
+        let all = format!(
+            "{}
+{:?}",
+            out.lines().join(
+                "
+"
+            ),
+            rec.snapshot()
+        );
+        for secret in [
+            token.as_str(),
+            "c4163-secret-container",
+            "payload-4163",
+            path.as_str(),
+        ] {
+            assert!(!all.contains(secret), "leaked {secret}");
+        }
+        assert!(all.contains("cri.streaming.connection"), "{all}");
+    }
+
+    /// 本番の bind で上限超過の拒否が件数と固定語彙の行で観測される（CRI-6・REPAIR-4・#4163）。
+    #[tokio::test]
+    async fn cri6_repair4_4163_production_bind_observes_rejection() {
+        let rec = Arc::new(OpRecorder::new());
+        let out = Collect::default();
+        let sink = LineSink::spawn(Box::new(out.clone()), 64);
+        let obs = Arc::new(TelemetryConnectionObserver::new(Arc::clone(&rec), sink).expect("obs"));
+        let server = bind_production_streaming(
+            production_streaming_config()
+                .with_max_connections(1)
+                .with_header_read_timeout(Duration::from_secs(2)),
+            fake_attach(),
+            None,
+            noop_recorder(),
+            obs,
+        )
+        .await
+        .expect("bind");
+        let addr = server.local_addr();
+        let _held = connect(addr).await.expect("hold the only slot");
+        wait_until(|| true).await;
+        let _second = connect(addr)
+            .await
+            .expect("tcp connect succeeds then is closed");
+        wait_until(|| op_total(&rec, "cri.streaming.connection_rejected") == 1).await;
+        wait_until(|| out.lines().len() == 1).await;
+        assert_eq!(
+            out.lines(),
+            vec![
+                "{\"event\":\"cri_streaming_connection\",\"op\":\"cri.streaming.connection_rejected\",\"outcome\":\"error\",\"reason\":\"max_connections\",\"count\":1}"
+                    .to_string()
+            ]
+        );
+    }
+
+    /// 出力先が止まっていても accept・応答は待たされない（REPAIR-5・#4163）。
+    #[tokio::test]
+    async fn repair5_4163_stalled_sink_does_not_delay_accept() {
+        struct Stall(Mutex<std::sync::mpsc::Receiver<()>>);
+        impl std::io::Write for Stall {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                let _ = self.0.lock().expect("lock").recv();
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let (gate, rx) = std::sync::mpsc::channel::<()>();
+        let sink = LineSink::spawn(Box::new(Stall(Mutex::new(rx))), 1);
+        let rec = Arc::new(OpRecorder::new());
+        let obs = Arc::new(TelemetryConnectionObserver::new(Arc::clone(&rec), sink).expect("obs"));
+        let server = bind_production_streaming(
+            production_streaming_config()
+                .with_max_connections(1)
+                .with_header_read_timeout(Duration::from_secs(2)),
+            fake_attach(),
+            None,
+            noop_recorder(),
+            obs,
+        )
+        .await
+        .expect("bind");
+        let addr = server.local_addr();
+        let held = connect(addr).await.expect("hold");
+        // 拒否を 8 回起こす（行は 1, 2, 4, 8 の 4 本で、止まった書き込み口に積まれる）。
+        for _ in 0..8 {
+            let _ = connect(addr).await.expect("connect");
+        }
+        wait_until(|| op_total(&rec, "cri.streaming.connection_rejected") == 8).await;
+        drop(held);
+        // 枠が空いた後の要求が、止まった sink に関係なく期限内に応答される。
+        let resp = tokio::time::timeout(Duration::from_secs(5), http_get(addr, "/exec/none"))
+            .await
+            .expect("response within deadline");
+        assert!(resp.starts_with("HTTP/1.1 404"), "{resp}");
+        drop(gate);
     }
 }

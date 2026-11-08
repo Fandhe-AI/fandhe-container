@@ -20,7 +20,7 @@
 //!
 //! delete action の前段（#4151・CRI-5・SEC-1・REPAIR-3・REPAIR-4）: [`production_delete_preflight`] を bootstrap の注入口
 //! （`run_cli_with_hooks`）へ渡し、`-id`・`-bundle` の検証（[`validate_delete_invocation`]）と、serve が使う状態ルートの記録との照合
-//! （[`delete_preflight_in`]・[`match_delete_record`]）を行う。照合は読み取りだけで、状態ルートの作成・書き込み・シグナル・
+//! （`delete_preflight_in`・[`match_delete_record`]）を行う。照合は読み取りだけで、状態ルートの作成・書き込み・シグナル・
 //! プロセス起動をしない。結果は [`DeleteRecordMatch`]（記録なし・記録あり・回収済み）で、停止・回収（#4152）が受け取って使う。
 //! 本 PR の bin は結果を捨てる（検証と照合の失敗だけが delete を止める）。判断は `docs/design/shim-v2-production-binary.md` D5。
 //!

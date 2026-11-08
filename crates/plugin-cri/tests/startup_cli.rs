@@ -93,6 +93,7 @@ fn relative_socket_exits_two_without_echoing_path() {
 }
 
 /// CRI-6・REPAIR-3・#4110: 不正な `--streaming-*` は終了コード 2・固定文言・値の非エコーで、socket を作らない。
+#[cfg(unix)]
 #[test]
 fn invalid_streaming_args_exit_two_without_echoing_value() {
     for (extra, secret) in [

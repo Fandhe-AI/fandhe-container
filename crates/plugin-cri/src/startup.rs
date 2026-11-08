@@ -33,7 +33,7 @@ pub const MSG_SOCKET_DEFAULT_UNDEFINED: &str =
 /// ストリーミングサーバーの待ち受けに関する起動引数（#4110・CRI-6・REPAIR-3）。
 ///
 /// 既定（全未指定）は `StreamingConfig::default()`（`127.0.0.1:0`・外部公開なし）と同じ。`main.rs` が
-/// [`crate::streaming::production_streaming_config_with`] で `StreamingConfig` へ写す。
+/// `production_streaming_config_with` で `StreamingConfig` へ写す。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct StreamingOptions {
@@ -406,6 +406,16 @@ mod tests {
         s.parse().expect("ip")
     }
 
+    /// OS ごとに絶対パスとして成立する socket パス（Windows はドライブ指定が要る）。
+    #[cfg(unix)]
+    const SOCK: &str = "/a/s";
+    #[cfg(windows)]
+    const SOCK: &str = "C:\\a\\s";
+    #[cfg(unix)]
+    const SOCK_EQ: &str = "--socket=/a/s";
+    #[cfg(windows)]
+    const SOCK_EQ: &str = "--socket=C:\\a\\s";
+
     /// CRI-6・#4110: ストリーミング引数なしは loopback の既定のまま。
     #[cfg(unix)]
     #[test]
@@ -429,7 +439,7 @@ mod tests {
         assert_eq!(
             streaming_of(&[
                 "--socket",
-                "/a/s",
+                SOCK,
                 "--streaming-bind",
                 "0.0.0.0:10010",
                 "--streaming-allow-external",
@@ -442,13 +452,13 @@ mod tests {
             streaming_of(&[
                 "--streaming-advertise=192.0.2.7",
                 "--streaming-allow-external",
-                "--socket=/a/s",
+                SOCK_EQ,
                 "--streaming-bind=0.0.0.0:10010",
             ]),
             want
         );
         let v6 = streaming_of(&[
-            "--socket=/a/s",
+            SOCK_EQ,
             "--streaming-bind=[::]:0",
             "--streaming-allow-external",
             "--streaming-advertise=2001:db8::1",
@@ -460,15 +470,18 @@ mod tests {
     /// CRI-6・#4110: loopback のポート固定は opt-in なしで受ける（allow_external は立たない）。
     #[test]
     fn cri6_4110_loopback_bind_without_opt_in_is_accepted() {
-        let o = streaming_of(&["--socket=/a/s", "--streaming-bind=127.0.0.1:9000"]);
+        let o = streaming_of(&[SOCK_EQ, "--streaming-bind=127.0.0.1:9000"]);
         assert_eq!(o.bind, Some("127.0.0.1:9000".parse().expect("addr")));
         assert!(!o.allow_external);
     }
 
     /// CRI-6・#4110・REPAIR-4: 不正な指定は固定文言で、値を含めない。
+    ///
+    /// `StreamingConfig::validate()` による拒否は unix のみ（非 unix は検査を省く）のため unix 限定。
+    #[cfg(unix)]
     #[test]
     fn cri6_4110_invalid_streaming_values_are_rejected_without_echo() {
-        let s = ["--socket", "/a/s"];
+        let s = ["--socket", SOCK];
         let cases: Vec<Vec<&str>> = vec![
             vec!["--streaming-bind"],
             vec!["--streaming-bind="],
@@ -522,7 +535,7 @@ mod tests {
         }
         // 具体的な外部アドレスは広告なしでも受ける（URL はその IP になる）。
         let o = streaming_of(&[
-            "--socket=/a/s",
+            SOCK_EQ,
             "--streaming-bind=192.0.2.1:0",
             "--streaming-allow-external",
         ]);
@@ -536,7 +549,7 @@ mod tests {
             &["--streaming-bind=127.0.0.1:9000"][..],
             &["--streaming-allow-external"],
             &["--help", "--streaming-allow-external"],
-            &["--socket=/a/s", "--help", "--streaming-bind=127.0.0.1:1"],
+            &[SOCK_EQ, "--help", "--streaming-bind=127.0.0.1:1"],
         ] {
             assert_eq!(
                 msg(p(a)),

@@ -95,7 +95,7 @@ pub struct InterruptAckReport {
 
 /// ioeventfd の「無視」と「解除失敗」の VM ごとの累計（観測専用。#4161・MVM-1・REPAIR-3・REPAIR-4）。
 ///
-/// `MicroVm::assemble` 1 回につき 1 つで、通知スレッド（`IoEventPoller`）と全 [`IoEventFd`](crate::irq::IoEventFd)
+/// `MicroVm::assemble` 1 回につき 1 つで、通知スレッド（`IoEventPoller`）と全 `IoEventFd`
 /// が `Arc` で共有する。停止の報告（`StopReport::ioevent`）と plugin-microvm の stop の結果行
 /// （`op=plugin.microvm.stop` の `ignored=` / `unbind_failed=`）へ渡す。値は判断材料で、受理や停止の合否には使わない。
 /// 各計数は `u64` の加算で、実用上あふれない。

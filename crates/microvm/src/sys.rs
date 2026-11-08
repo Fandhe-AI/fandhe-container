@@ -1753,10 +1753,30 @@ pub(crate) struct RegisteredPage<'vm> {
     page: Option<GuestPage>,
 }
 
+/// `KVM_SET_USER_MEMORY_REGION` に渡す構造体を組む純関数（flags の値を単体試験で照合するため分離。#4158・MVM-1）。
 #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
-fn set_user_memory_region(
+fn memory_region(
+    slot: u32,
+    flags: u32,
+    gpa: u64,
+    size: u64,
+    userspace_addr: u64,
+) -> KvmUserspaceMemoryRegion {
+    KvmUserspaceMemoryRegion {
+        slot,
+        flags,
+        guest_phys_addr: gpa,
+        memory_size: size,
+        userspace_addr,
+    }
+}
+
+/// `flags` は呼び出し側（`crate::memslot_flags`）が既知ビットと対応の確認を済ませた値。削除（`size = 0`）は 0 を渡す。
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+pub(crate) fn set_user_memory_region(
     vm: BorrowedFd<'_>,
     slot: u32,
+    flags: u32,
     gpa: u64,
     size: u64,
     userspace_addr: u64,
@@ -1764,14 +1784,8 @@ fn set_user_memory_region(
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
     }
-    let region = KvmUserspaceMemoryRegion {
-        slot,
-        flags: 0,
-        guest_phys_addr: gpa,
-        memory_size: size,
-        userspace_addr,
-    };
-    // SAFETY: `vm` は借用中の生存 fd。`region` は `repr(C)` で 32 バイト（const assert 済み・ioctl 番号の
+    let region = memory_region(slot, flags, gpa, size, userspace_addr);
+    // SAFETY: `vm` は借用中の生存 fd（`flags` の値は 32 バイトの読み取りという不変条件に影響しない）。`region` は `repr(C)` で 32 バイト（const assert 済み・ioctl 番号の
     // サイズ符号と一致）のローカルの借用で、カーネルはこの 32 バイトを読むだけで書かず、呼び出しは同期で完了して
     // 戻り後にポインタを保持しない。`userspace_addr` の指す領域の寿命は `RegisteredPage` と `RegisteredGuestRam`（`crate::microvm`）が維持する。
     let r = unsafe {
@@ -1795,6 +1809,7 @@ pub(crate) fn register_single_page<'vm>(
     match set_user_memory_region(
         vm,
         slot,
+        0,
         gpa,
         GUEST_PAGE_SIZE as u64,
         page.ptr.as_ptr() as usize as u64,
@@ -1811,7 +1826,7 @@ pub(crate) fn register_single_page<'vm>(
 impl Drop for RegisteredPage<'_> {
     fn drop(&mut self) {
         // `memory_size = 0` の再登録で slot を削除する（gpa・userspace_addr は無視される）。
-        let removed = set_user_memory_region(self.vm, self.slot, 0, 0, 0).is_ok();
+        let removed = set_user_memory_region(self.vm, self.slot, 0, 0, 0, 0).is_ok();
         if let Some(page) = self.page.take() {
             if removed {
                 drop(page);
@@ -1845,6 +1860,11 @@ unsafe impl Send for GuestRamMap {}
 unsafe impl Sync for GuestRamMap {}
 
 impl GuestRamMap {
+    /// mapping の先頭アドレス（`KVM_SET_USER_MEMORY_REGION` の `userspace_addr`）。ポインタは外へ渡さず数値だけを返す。
+    pub(crate) fn user_addr(&self) -> u64 {
+        self.ptr.as_ptr() as usize as u64
+    }
+
     /// `len` バイトのゼロ埋めの私有メモリを確保する。`len` は呼び出し側が検証済み（非 0・ページ倍数・上限内）。
     pub(crate) fn map(len: usize) -> Result<GuestRamMap, SysError> {
         if !consts::SUPPORTED {
@@ -1967,27 +1987,9 @@ impl Drop for GuestRamMap {
     }
 }
 
-/// `ram` を `slot` / `gpa` の memslot として VM に登録する（`KVM_SET_USER_MEMORY_REGION`。flags は 0）。
-///
-/// 呼び出し側（`crate::microvm`）は、登録が成功している間 `ram` を drop せず、slot を削除してから解放する。
-pub(crate) fn register_guest_ram(
-    vm: BorrowedFd<'_>,
-    slot: u32,
-    gpa: u64,
-    ram: &GuestRamMap,
-) -> Result<(), SysError> {
-    set_user_memory_region(
-        vm,
-        slot,
-        gpa,
-        ram.len as u64,
-        ram.ptr.as_ptr() as usize as u64,
-    )
-}
-
 /// `slot` の memslot を削除する（`memory_size = 0` の再登録）。
 pub(crate) fn unregister_guest_ram(vm: BorrowedFd<'_>, slot: u32) -> Result<(), SysError> {
-    set_user_memory_region(vm, slot, 0, 0, 0)
+    set_user_memory_region(vm, slot, 0, 0, 0, 0)
 }
 
 /// `KVM_ARM_PREFERRED_TARGET`（VM fd）で推奨 target を得る（aarch64 のみ）。
@@ -3124,6 +3126,19 @@ mod tests {
         assert!(!present(&needle));
     }
 
+    /// MVM-1・#4158: 登録に渡る構造体の `flags` は指定値（0・1・2・3）のまま、他のフィールドも具体値どおり。
+    #[test]
+    fn mvm1_4158_memory_region_carries_flags() {
+        for flags in 0..=3u32 {
+            let r = memory_region(7, flags, 0x1000, 0x2000, 0x7000_0000);
+            assert_eq!(r.slot, 7);
+            assert_eq!(r.flags, flags);
+            assert_eq!(r.guest_phys_addr, 0x1000);
+            assert_eq!(r.memory_size, 0x2000);
+            assert_eq!(r.userspace_addr, 0x7000_0000);
+        }
+    }
+
     /// MVM-1・TASK-75.1: KVM でない fd への登録は ENOTTY で、mapping は呼び出し側に残る。
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
@@ -3131,10 +3146,12 @@ mod tests {
         use std::os::fd::AsFd as _;
         let f = dev_null();
         let m = GuestRamMap::map(4096).unwrap();
-        assert_eq!(
-            register_guest_ram(f.as_fd(), 0, 0, &m),
-            Err(SysError::Os(25))
-        );
+        for flags in [0u32, 2] {
+            assert_eq!(
+                set_user_memory_region(f.as_fd(), 0, flags, 0, m.len() as u64, m.user_addr()),
+                Err(SysError::Os(25))
+            );
+        }
         assert_eq!(unregister_guest_ram(f.as_fd(), 0), Err(SysError::Os(25)));
     }
 

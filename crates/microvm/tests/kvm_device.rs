@@ -520,8 +520,9 @@ fn kvm_device_check_memslot_flags() {
 
 /// MVM-1・#4158: `register_with_flags` で `LOG_DIRTY_PAGES`・`READONLY` つきの memslot を登録でき、ホストからの読み書きは往復する。
 /// `READONLY` はゲスト側の書き込みだけを止めるため、ホストの `write_at` は通る。非対応の kernel では `FailedPrecondition`
-/// （x86_64 の KVM は対応するため受理を要求する）。`READONLY | LOG_DIRTY_PAGES` の同時指定は、カーネルが EINVAL で
-/// 拒否しうるため `InvalidArgument` も許容する（受理か拒否かを具体的に確かめ、組み合わせの禁止を示す文言は付けない）。
+/// （x86_64 の KVM は対応するため受理を要求する）。`READONLY | LOG_DIRTY_PAGES` の同時指定は、Linux v6.12 の
+/// `check_memory_region_flags` が cap と同じ述語で両ビットを有効にするため `READONLY` 単独と同じ結果を要求し、
+/// `InvalidArgument` は許さない（#4226。実機の記録は #3781）。
 #[test]
 #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
 fn kvm_device_register_guest_memory_with_flags() {
@@ -539,6 +540,7 @@ fn kvm_device_register_guest_memory_with_flags() {
         (3, both, 0x3000_0000),
     ];
     let mut live = Vec::new();
+    let mut readonly_accepted: Option<bool> = None;
     for (slot, flags, base) in cases {
         let r = GuestRam::new(1 << 20).unwrap().register_with_flags(
             &vm,
@@ -555,6 +557,9 @@ fn kvm_device_register_guest_memory_with_flags() {
                     0x0607_0809
                 );
                 live.push(mem);
+                if flags == MemslotFlags::READONLY {
+                    readonly_accepted = Some(true);
+                }
             }
             Err(e) => {
                 assert!(
@@ -562,19 +567,20 @@ fn kvm_device_register_guest_memory_with_flags() {
                     "flags {:?} rejected: {e:?}",
                     flags
                 );
-                let allowed = if flags == both {
-                    matches!(
-                        e.code(),
-                        MicrovmErrorCode::FailedPrecondition | MicrovmErrorCode::InvalidArgument
-                    )
-                } else {
-                    e.code() == MicrovmErrorCode::FailedPrecondition
-                };
-                assert!(allowed, "unexpected error: {e:?}");
-                #[cfg(target_arch = "x86_64")]
+                assert_eq!(
+                    e.code(),
+                    MicrovmErrorCode::FailedPrecondition,
+                    "unexpected error: {e:?}"
+                );
                 if flags == MemslotFlags::READONLY {
-                    panic!("x86_64 KVM must accept READONLY memslots: {e:?}");
+                    readonly_accepted = Some(false);
                 }
+                assert!(
+                    flags != both || readonly_accepted == Some(false),
+                    "READONLY accepted but READONLY|LOG_DIRTY_PAGES rejected: {e:?}"
+                );
+                #[cfg(target_arch = "x86_64")]
+                panic!("x86_64 KVM must accept {flags:?} memslots: {e:?}");
             }
         }
     }

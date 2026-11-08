@@ -21,7 +21,11 @@
 //! - Create・Start・Delete は RPC が成功する直前に 1 回だけ [`EventPublisher::publish`] で投入する（世代の guard は使わない。完了済みの事実の記録で、
 //!   ゲート保持中の投入順が FIFO の worker で保たれる）。符号化後 [`MAX_EVENT_LEN`]（8192）を超えるイベントは子を起動せず、
 //!   `encode` の失敗が 1 件記録される（RPC の応答は変えない）。stdin は socketpair の片端で、親は非ブロッキングに期限内で書き、書き終えたら EOF を送る（#4223）。
-//! - shim の Shutdown でキューに残った未送信のイベントは捨てうる（worker は切り離されたスレッド。排出は未実装）。
+//! - shim の Shutdown でキューに残った未送信のイベントは、[`PublisherDrains::drain_all`] が排出する（#4222）。呼ぶのは `bootstrap` の
+//!   `run_serve` で、Shutdown の応答を流し切り・サーバーを止め・ID ロックと socket を片付けた後（runc shim と同じ順序）。
+//!   キューへ新しい投入を止め、worker が残りを送り切るのを [`PublishConfig::drain_timeout`]（既定 3 秒）まで待つ。超えたら実行中の子を
+//!   kill して回収し（最悪 `drain_timeout + REAP_GRACE` と数刻み）、残りは送らずに件数を `daemon.log` へ 1 行（[`PublishDrain`]）出す。
+//!   排出の後の投入（終了 watcher の遅れた TaskExit 等）は `enqueue` として記録して捨てる。
 //! - `Child::kill` は直接の子だけを止める。publish バイナリの孫は止めない（containerd の `publish` は fork しない）。
 //!   プロセスグループごとの kill は `sys` の新規 unsafe が要るため採らない。
 //! - D 状態で kill が効かない子は猶予の後に放置する（shim の終了までゾンビが残りうる）。
@@ -57,7 +61,9 @@ pub const TASK_EXIT_TOPIC: &str = "/tasks/exit";
 /// stdin は期限内の非ブロッキング書き込みのため pipe 容量には依存しない（#4223）。導出: 最大の TaskCreate は
 /// `container_id` 255 バイト・`bundle` 4096 バイト（`BUNDLE_MAX_LEN`）・`pid` で約 4.4 KiB に収まり、その約 1.9 倍の余裕を取る。
 pub const MAX_EVENT_LEN: usize = 8192;
-/// 設定に許す最大の期限。
+/// 排出の既定の期限（暫定値。実 containerd での実測は #3685。containerd の Shutdown 呼び出しの期限 3 秒に合わせる）。
+const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
+/// 設定に許す最大の期限（publish 1 件・排出のどちらにも使う）。
 const MAX_PUBLISH_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// `containerd.events.TaskExit`（`api/events/task.proto` の番号 1〜5）。
@@ -146,7 +152,7 @@ pub struct TaskDelete {
     /// 終了時刻（未記録は未設定）。
     #[prost(message, optional, tag = "4")]
     pub exited_at: Option<Timestamp>,
-    /// プロセス ID（init は `container_id` と同じ。runc shim の `p.ID()` に揃える）。
+    /// exec の ID。init の削除では runc shim v2 と同じく空（省略は init を指す。`api/events/task.proto`。#4222）。
     #[prost(string, tag = "5")]
     pub id: String,
 }
@@ -311,6 +317,39 @@ pub trait PublishLog: Send + Sync {
     /// publish 1 件の結果（成功・失敗）と経過時間を記録する（REPAIR-4・#4155）。既定は何もしない。
     /// 失敗の詳細は [`PublishLog::record`] が別に出す。topic と経過ミリ秒だけを持ち、秘匿情報を含めない。
     fn record_outcome(&self, _topic: &'static str, _ok: bool, _elapsed: Duration) {}
+
+    /// Shutdown 時の排出 1 回の結果を記録する（REPAIR-4・#4222）。既定は何もしない。
+    fn record_drain(&self, _drain: &PublishDrain) {}
+}
+
+/// Shutdown 時の排出 1 回の結果。件数・真偽・経過時間だけを持つ（秘匿情報を持てない型。REPAIR-4・#4222）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublishDrain {
+    /// 排出の開始時にキューと実行中に残っていた件数。
+    pub queued: usize,
+    /// 送れずに捨てた件数（期限切れで kill した実行中の 1 件を含む）。
+    pub dropped: usize,
+    /// 期限（[`PublishConfig::drain_timeout`]）を超えて打ち切ったか。
+    pub deadline_hit: bool,
+    /// worker スレッドが終了したか（false は D 状態の子などで回収できなかった）。
+    pub worker_finished: bool,
+    /// 排出に要した時間。
+    pub elapsed: Duration,
+}
+
+impl PublishDrain {
+    /// 1 行の JSON（固定語彙。topic・argv・アドレス・ID・本文は含めない）。
+    pub fn to_json_line(&self) -> String {
+        serde_json::json!({
+            "event": "task_event_publish_drain",
+            "outcome": if self.deadline_hit { "deadline" } else { "complete" },
+            "queued": self.queued,
+            "dropped": self.dropped,
+            "worker_finished": self.worker_finished,
+            "elapsed_ms": u64::try_from(self.elapsed.as_millis()).unwrap_or(u64::MAX),
+        })
+        .to_string()
+    }
 }
 
 /// デーモンの stderr へ JSON 1 行を出す本番の出力先。
@@ -334,6 +373,11 @@ impl PublishLog for StderrPublishLog {
         });
         let _ = writeln!(std::io::stderr(), "{line}");
     }
+
+    fn record_drain(&self, drain: &PublishDrain) {
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), "{}", drain.to_json_line());
+    }
 }
 
 /// イベントがまだ有効（取り消されていない世代）かを返す述語。worker スレッドから呼ばれる。
@@ -356,12 +400,52 @@ pub trait EventPublisher: Send + Sync {
 
     /// publish 以外の失敗（watcher の起動失敗・上限・食い違い）を記録する。
     fn report(&self, failure: PublishFailure);
+
+    /// Shutdown 時にキューの未送信を有界時間で排出し、以降の投入を止める（#4222）。
+    /// キューを持たない実装・worker を起こしていない実装・2 回目以降は `None`。
+    fn drain(&self) -> Option<PublishDrain> {
+        None
+    }
+}
+
+/// 作られた [`EventPublisher`] の登録口。`ServeContext` が持ち、`exec_publisher_for_with` が自動で登録し、
+/// `bootstrap` の `run_serve` が Shutdown の片付けの後に [`PublisherDrains::drain_all`] を呼ぶ（#4222）。
+///
+/// 登録は publisher の `Arc` を 1 つ余分に持つだけで、publisher の寿命は変えない（停止は `drain` で明示する。
+/// 終了 watcher のスレッドが `Arc` を持ち続けるため、`Drop` 任せでは止まらない）。
+#[derive(Clone, Default)]
+pub struct PublisherDrains {
+    inner: std::sync::Arc<std::sync::Mutex<Vec<std::sync::Arc<dyn EventPublisher>>>>,
+}
+
+impl std::fmt::Debug for PublisherDrains {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PublisherDrains").finish_non_exhaustive()
+    }
+}
+
+impl PublisherDrains {
+    /// publisher を登録する（`exec_publisher_for_with` から）。
+    #[cfg(unix)]
+    pub(crate) fn register(&self, publisher: std::sync::Arc<dyn EventPublisher>) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(publisher);
+    }
+
+    /// 登録済みの publisher を順に排出し、結果を返す。各 publisher の排出は有界（[`PublishConfig::drain_timeout`]）。
+    pub fn drain_all(&self) -> Vec<PublishDrain> {
+        let list: Vec<_> = self.inner.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        list.iter().filter_map(|p| p.drain()).collect()
+    }
 }
 
 /// 子プロセスの期限。壊れた値（ゼロ・60 秒超）は [`PublishConfig::new`] で拒否する（REPAIR-2）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PublishConfig {
     timeout: Duration,
+    drain_timeout: Duration,
 }
 
 impl PublishConfig {
@@ -372,7 +456,26 @@ impl PublishConfig {
                 "publish timeout must be in 1ns..=60s",
             ));
         }
-        Ok(Self { timeout })
+        Ok(Self {
+            timeout,
+            drain_timeout: DEFAULT_DRAIN_TIMEOUT,
+        })
+    }
+
+    /// Shutdown 時の排出の期限を差し替える。ゼロまたは 60 秒超は `InvalidArgument`（#4222）。
+    pub fn with_drain_timeout(mut self, drain_timeout: Duration) -> Result<Self, CriError> {
+        if drain_timeout.is_zero() || drain_timeout > MAX_PUBLISH_TIMEOUT {
+            return Err(CriError::invalid_argument(
+                "publish drain timeout must be in 1ns..=60s",
+            ));
+        }
+        self.drain_timeout = drain_timeout;
+        Ok(self)
+    }
+
+    /// Shutdown 時の排出の期限。超えたら実行中の子を kill して残りを捨てる。
+    pub fn drain_timeout(&self) -> Duration {
+        self.drain_timeout
     }
 
     /// 子 1 件の期限。
@@ -382,10 +485,11 @@ impl PublishConfig {
 }
 
 impl Default for PublishConfig {
-    /// 期限 5 秒（暫定値。実 containerd での実測は #3685）。
+    /// 期限 5 秒・排出の期限 3 秒（どちらも暫定値。実 containerd での実測は #3685）。
     fn default() -> Self {
         Self {
             timeout: Duration::from_secs(5),
+            drain_timeout: DEFAULT_DRAIN_TIMEOUT,
         }
     }
 }
@@ -403,13 +507,15 @@ mod unix {
     use std::os::unix::process::ExitStatusExt;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
     use std::sync::{Arc, Mutex};
+    use std::thread::JoinHandle;
     use std::time::{Duration, Instant};
 
     use super::{
-        EventGuard, EventPublisher, PublishConfig, PublishFailure, PublishLog, PublishStage,
-        StderrPublishLog, TaskEvent,
+        EventGuard, EventPublisher, PublishConfig, PublishDrain, PublishFailure, PublishLog,
+        PublishStage, StderrPublishLog, TaskEvent,
     };
     use crate::shim_v2::bootstrap::{PublishBinary, ServeContext, ShimIdentifier};
 
@@ -460,12 +566,33 @@ mod unix {
         }
     }
 
-    /// 子プロセスで publish する本番の送り先。worker スレッドは最初の publish のときに遅延して起こす。
+    /// worker と排出が共有する計数と中止の旗（#4222）。
+    #[derive(Default)]
+    struct Shared {
+        /// 投入済みで未完了の件数（キュー + 実行中）。完了・世代取り消しで捨てた件だけ減らし、中止で捨てた件は残す（= 捨てた件数）。
+        pending: AtomicUsize,
+        /// 排出の期限切れで立てる。worker は実行中の子を kill して回収し、残りを取り出さずに終わる。
+        abort: AtomicBool,
+    }
+
+    /// worker の状態。`Closed` は排出の後（新しい投入を受けず、worker も起こし直さない）。
+    enum State {
+        Idle,
+        Running {
+            tx: SyncSender<Queued>,
+            handle: JoinHandle<()>,
+        },
+        Closed,
+    }
+
+    /// 子プロセスで publish する本番の送り先。worker スレッドは最初の publish のときに遅延して起こし、
+    /// Shutdown では [`EventPublisher::drain`] が有界時間で止める（#4222）。
     pub struct ExecEventPublisher {
         target: Arc<PublishTarget>,
         config: PublishConfig,
         log: Arc<dyn PublishLog>,
-        tx: Mutex<Option<SyncSender<Queued>>>,
+        state: Mutex<State>,
+        shared: Arc<Shared>,
     }
 
     impl std::fmt::Debug for ExecEventPublisher {
@@ -483,33 +610,24 @@ mod unix {
                 target: Arc::new(target),
                 config,
                 log,
-                tx: Mutex::new(None),
+                state: Mutex::new(State::Idle),
+                shared: Arc::new(Shared::default()),
             }
         }
 
-        fn sender(&self, topic: &'static str) -> Option<SyncSender<Queued>> {
-            let mut guard = self.tx.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(tx) = guard.as_ref() {
-                return Some(tx.clone());
-            }
+        /// worker を起こす（状態ロックの下で呼ぶ）。
+        fn spawn_worker(&self) -> Result<State, std::io::Error> {
             let (tx, rx) = sync_channel(QUEUE_CAP);
-            let (target, config, log) =
-                (Arc::clone(&self.target), self.config, Arc::clone(&self.log));
-            let spawned = std::thread::Builder::new()
+            let (target, config, log, shared) = (
+                Arc::clone(&self.target),
+                self.config,
+                Arc::clone(&self.log),
+                Arc::clone(&self.shared),
+            );
+            let handle = std::thread::Builder::new()
                 .name("shim-event-publish".into())
-                .spawn(move || worker(&rx, &target, config, log.as_ref()));
-            match spawned {
-                Ok(_) => {
-                    *guard = Some(tx.clone());
-                    Some(tx)
-                }
-                Err(e) => {
-                    self.log.record(
-                        &PublishFailure::new(PublishStage::WorkerSpawn, Some(topic)).with_errno(&e),
-                    );
-                    None
-                }
-            }
+                .spawn(move || worker(&rx, &target, config, log.as_ref(), &shared))?;
+            Ok(State::Running { tx, handle })
         }
     }
 
@@ -527,58 +645,163 @@ mod unix {
         fn report(&self, failure: PublishFailure) {
             self.log.record(&failure);
         }
+
+        fn drain(&self) -> Option<PublishDrain> {
+            let started = Instant::now();
+            let prev = {
+                let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                std::mem::replace(&mut *st, State::Closed)
+            };
+            let State::Running { tx, handle } = prev else {
+                return None;
+            };
+            let queued = self.shared.pending.load(Ordering::SeqCst);
+            // 送り側を閉じる。worker は残りを送り切って recv の失敗で終わる。
+            drop(tx);
+            let mut deadline_hit = false;
+            if !wait_finished(&handle, self.config.drain_timeout()) {
+                deadline_hit = true;
+                self.shared.abort.store(true, Ordering::SeqCst);
+                // 実行中の子の kill と回収（REAP_GRACE）と数刻みを待つ。
+                wait_finished(&handle, REAP_GRACE + WAIT_SLICE * 20);
+            }
+            let worker_finished = handle.is_finished();
+            if worker_finished {
+                let _ = handle.join();
+            }
+            let drain = PublishDrain {
+                queued,
+                dropped: self.shared.pending.load(Ordering::SeqCst),
+                deadline_hit,
+                worker_finished,
+                elapsed: started.elapsed(),
+            };
+            self.log.record_drain(&drain);
+            Some(drain)
+        }
+    }
+
+    /// `limit` までスレッドの終了を待つ。終わったか。
+    fn wait_finished(handle: &JoinHandle<()>, limit: Duration) -> bool {
+        let until = Instant::now() + limit;
+        loop {
+            if handle.is_finished() {
+                return true;
+            }
+            let now = Instant::now();
+            if now >= until {
+                return false;
+            }
+            std::thread::sleep(WAIT_SLICE.min(until - now));
+        }
     }
 
     impl ExecEventPublisher {
         fn enqueue(&self, event: TaskEvent, guard: Option<EventGuard>) {
             let topic = event.topic();
-            let Some(tx) = self.sender(topic) else {
-                return;
-            };
-            match tx.try_send((event, guard)) {
-                Ok(()) => {}
-                Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
-                    self.log
-                        .record(&PublishFailure::new(PublishStage::Enqueue, Some(topic)));
+            // ログは状態ロックを手放してから出す（ロック下では非ブロッキングの try_send だけ）。
+            let failure = {
+                let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                let mut spawn_failure = None;
+                if matches!(*st, State::Idle) {
+                    match self.spawn_worker() {
+                        Ok(running) => *st = running,
+                        Err(e) => {
+                            spawn_failure = Some(
+                                PublishFailure::new(PublishStage::WorkerSpawn, Some(topic))
+                                    .with_errno(&e),
+                            );
+                        }
+                    }
                 }
+                match (&*st, spawn_failure) {
+                    (_, Some(f)) => Some(f),
+                    (State::Running { tx, .. }, None) => {
+                        self.shared.pending.fetch_add(1, Ordering::SeqCst);
+                        match tx.try_send((event, guard)) {
+                            Ok(()) => None,
+                            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
+                                self.shared.pending.fetch_sub(1, Ordering::SeqCst);
+                                Some(PublishFailure::new(PublishStage::Enqueue, Some(topic)))
+                            }
+                        }
+                    }
+                    // 排出の後は受けない（worker を起こし直さない）。
+                    _ => Some(PublishFailure::new(PublishStage::Enqueue, Some(topic))),
+                }
+            };
+            if let Some(f) = failure {
+                self.log.record(&f);
             }
         }
     }
 
-    /// キューを直列に処理する。送り側（publisher）が落ちたら終わる。
+    /// 子 1 件の結果。`Aborted` は排出の期限切れで kill した（失敗ではなく捨てた件として数える）。
+    enum RunOutcome {
+        Done(Result<(), PublishFailure>),
+        Aborted,
+    }
+
+    /// キューを直列に処理する。送り側が閉じられて空になるか、排出が中止を立てたら終わる。
     fn worker(
         rx: &Receiver<Queued>,
         target: &PublishTarget,
         config: PublishConfig,
         log: &dyn PublishLog,
+        shared: &Shared,
     ) {
         while let Ok((event, guard)) = rx.recv() {
+            if shared.abort.load(Ordering::SeqCst) {
+                // 取り出した 1 件は捨てる（pending に残す）。残りは取り出さない。
+                break;
+            }
             // キューで待つ間に Delete された世代のイベントは送らない（CRI-5・#4155）。
             if guard.as_ref().is_some_and(|g| !g()) {
+                shared.pending.fetch_sub(1, Ordering::SeqCst);
                 continue;
             }
             let started = Instant::now();
-            let result = run_bounded(target, config, &event);
-            if let Err(failure) = &result {
-                log.record(failure);
+            match run_bounded(target, config, &event, shared) {
+                RunOutcome::Aborted => break,
+                RunOutcome::Done(result) => {
+                    if let Err(failure) = &result {
+                        log.record(failure);
+                    }
+                    log.record_outcome(event.topic(), result.is_ok(), started.elapsed());
+                    shared.pending.fetch_sub(1, Ordering::SeqCst);
+                }
             }
-            log.record_outcome(event.topic(), result.is_ok(), started.elapsed());
         }
     }
 
-    /// 子を 1 件、期限つきで実行する。失敗は最初に起きた段 1 件だけ返す。
+    /// 子を 1 件、期限つきで実行する。失敗は最初に起きた段 1 件だけ返す。排出の中止では kill して回収し `Aborted`。
     fn run_bounded(
         target: &PublishTarget,
         config: PublishConfig,
         event: &TaskEvent,
-    ) -> Result<(), PublishFailure> {
+        shared: &Shared,
+    ) -> RunOutcome {
+        match run_bounded_inner(target, config, event, shared) {
+            Ok(()) => RunOutcome::Done(Ok(())),
+            Err(None) => RunOutcome::Aborted,
+            Err(Some(f)) => RunOutcome::Done(Err(f)),
+        }
+    }
+
+    /// `Err(None)` は中止。
+    fn run_bounded_inner(
+        target: &PublishTarget,
+        config: PublishConfig,
+        event: &TaskEvent,
+        shared: &Shared,
+    ) -> Result<(), Option<PublishFailure>> {
         let topic = event.topic();
         let fail = |stage| PublishFailure::new(stage, Some(topic));
-        let payload = event.encode_any()?;
+        let payload = event.encode_any().map_err(Some)?;
         // stdin は AF_UNIX の stream socket。親側を非ブロッキングにして期限ループの中で書くため、
         // 子が読まなくても worker は期限で必ず戻る（pipe 容量に依存しない。#4223・REPAIR-5）。
         let (mut parent_end, child_end) =
-            UnixStream::pair().map_err(|e| fail(PublishStage::Spawn).with_errno(&e))?;
+            UnixStream::pair().map_err(|e| Some(fail(PublishStage::Spawn).with_errno(&e)))?;
         // Command は一時値のまま spawn し、親が持つ子側の端の複製を spawn 直後に閉じる（EOF・EPIPE の検出に必要）。
         let mut child = Command::new(target.binary())
             .args(target.args(topic))
@@ -588,7 +811,7 @@ mod unix {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|e| fail(PublishStage::Spawn).with_errno(&e))?;
+            .map_err(|e| Some(fail(PublishStage::Spawn).with_errno(&e)))?;
         let deadline = Instant::now() + config.timeout();
         // 最初の失敗だけを覚え、回収は必ず続ける。
         let mut first: Option<PublishFailure> = None;
@@ -617,11 +840,11 @@ mod unix {
             match child.try_wait() {
                 Ok(Some(status)) => {
                     if let Some(f) = first {
-                        return Err(f);
+                        return Err(Some(f));
                     }
                     if writing && !rest.is_empty() {
                         // 子が stdin を読み切る前に終わった。
-                        return Err(fail(PublishStage::WriteStdin));
+                        return Err(Some(fail(PublishStage::WriteStdin)));
                     }
                     if status.success() {
                         return Ok(());
@@ -629,14 +852,21 @@ mod unix {
                     let mut f = fail(PublishStage::ExitStatus);
                     f.exit_code = status.code();
                     f.signal = status.signal();
-                    return Err(f);
+                    return Err(Some(f));
                 }
                 Ok(None) => {}
                 Err(e) => {
                     let _ = child.kill();
                     let _ = child.try_wait();
-                    return Err(first.unwrap_or_else(|| fail(PublishStage::Wait).with_errno(&e)));
+                    return Err(Some(
+                        first.unwrap_or_else(|| fail(PublishStage::Wait).with_errno(&e)),
+                    ));
                 }
+            }
+            if shared.abort.load(Ordering::SeqCst) {
+                let _ = child.kill();
+                let _ = reap(&mut child);
+                return Err(None);
             }
             let now = Instant::now();
             if now >= deadline {
@@ -646,7 +876,7 @@ mod unix {
                 if f.stage == PublishStage::Deadline {
                     f.reaped = Some(reaped);
                 }
-                return Err(f);
+                return Err(Some(f));
             }
             std::thread::sleep(WAIT_SLICE.min(deadline - now));
         }
@@ -696,7 +926,13 @@ mod unix {
         log: Arc<dyn PublishLog>,
     ) -> Option<Arc<dyn EventPublisher>> {
         match PublishTarget::from_context(ctx) {
-            Some(target) => Some(Arc::new(ExecEventPublisher::new(target, config, log))),
+            Some(target) => {
+                let publisher: Arc<dyn EventPublisher> =
+                    Arc::new(ExecEventPublisher::new(target, config, log));
+                // Shutdown の排出（#4222）のため、`run_serve` が持つ登録口へ載せる。
+                ctx.publisher_drains().register(Arc::clone(&publisher));
+                Some(publisher)
+            }
             None => {
                 log.record(&PublishFailure::new(PublishStage::Disabled, None));
                 None
@@ -713,22 +949,29 @@ pub(crate) mod testkit {
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
-    #[cfg(unix)]
-    use super::PublishLog;
     use super::{
         EventPublisher, PublishFailure, TaskCreate, TaskDelete, TaskEvent, TaskIo, TaskStart,
     };
+    #[cfg(unix)]
+    use super::{PublishDrain, PublishLog};
     use crate::shim_v2::task_api::Timestamp;
 
     /// 捕捉用の出力先。
     #[cfg(unix)]
     #[derive(Default)]
-    pub(crate) struct CaptureLog(pub(crate) Mutex<Vec<PublishFailure>>);
+    pub(crate) struct CaptureLog(
+        pub(crate) Mutex<Vec<PublishFailure>>,
+        pub(crate) Mutex<Vec<PublishDrain>>,
+    );
 
     #[cfg(unix)]
     impl PublishLog for CaptureLog {
         fn record(&self, failure: &PublishFailure) {
             self.0.lock().unwrap().push(failure.clone());
+        }
+
+        fn record_drain(&self, drain: &PublishDrain) {
+            self.1.lock().unwrap().push(*drain);
         }
     }
 
@@ -813,7 +1056,7 @@ pub(crate) mod testkit {
                     seconds: 1_700_000_000,
                     nanos: 5,
                 }),
-                id: "c1".into(),
+                id: String::new(),
             }),
         ]
     }
@@ -942,6 +1185,43 @@ mod tests {
             Duration::from_secs(60)
         );
         assert_eq!(PublishConfig::default().timeout(), Duration::from_secs(5));
+    }
+
+    /// REPAIR-2・#4222: 排出の期限の境界（ゼロと 60 秒超は拒否、60 秒ちょうどは受理）。既定は 3 秒。
+    #[test]
+    fn repair2_4222_drain_timeout_bounds() {
+        let base = PublishConfig::default();
+        assert_eq!(base.drain_timeout(), Duration::from_secs(3));
+        assert!(base.with_drain_timeout(Duration::ZERO).is_err());
+        assert!(base.with_drain_timeout(Duration::from_secs(61)).is_err());
+        assert_eq!(
+            base.with_drain_timeout(Duration::from_secs(60))
+                .unwrap()
+                .drain_timeout(),
+            Duration::from_secs(60)
+        );
+    }
+
+    /// REPAIR-4・#4222: 排出のログ行は固定語彙だけを持つ。
+    #[test]
+    fn repair4_4222_drain_json_line_is_fixed_vocabulary() {
+        let d = PublishDrain {
+            queued: 2,
+            dropped: 1,
+            deadline_hit: true,
+            worker_finished: true,
+            elapsed: Duration::from_millis(1234),
+        };
+        assert_eq!(
+            d.to_json_line(),
+            r#"{"dropped":1,"elapsed_ms":1234,"event":"task_event_publish_drain","outcome":"deadline","queued":2,"worker_finished":true}"#
+        );
+        let ok = PublishDrain {
+            deadline_hit: false,
+            dropped: 0,
+            ..d
+        };
+        assert!(ok.to_json_line().contains(r#""outcome":"complete""#));
     }
 
     /// REPAIR-4: 失敗のログ行は固定語彙だけを持つ。
@@ -1228,6 +1508,61 @@ mod unix_tests {
                 "child {pid} must be reaped"
             );
         }
+    }
+
+    /// REPAIR-5・#4222: 一度も publish していなければ排出は `None`（ログも出ない）。
+    #[test]
+    fn repair5_4222_drain_without_worker_is_none() {
+        let dir = test_root::test_root("pub", "drain-none");
+        let bin = make_script(&dir, "fake", &failing_body());
+        let log = Arc::new(CaptureLog::default());
+        let p = publisher(&bin, Duration::from_secs(5), log.clone());
+        assert!(p.drain().is_none());
+        assert!(log.1.lock().unwrap().is_empty());
+        assert!(log.0.lock().unwrap().is_empty());
+    }
+
+    /// REPAIR-5・#4222: 排出の後の投入は `enqueue` がちょうど 1 件で、子は起動しない。2 回目の排出は `None`。
+    #[test]
+    fn repair5_4222_publish_after_drain_records_enqueue() {
+        let dir = test_root::test_root("pub", "drain-after");
+        let bin = make_script(&dir, "fake", &recorder_body(&dir));
+        let log = Arc::new(CaptureLog::default());
+        let p = publisher(&bin, Duration::from_secs(5), log.clone());
+        p.publish(sample());
+        let d = p.drain().expect("worker was started");
+        assert!(!d.deadline_hit && d.worker_finished, "{d:?}");
+        assert_eq!(d.dropped, 0);
+        assert!(dir.join("stdin").exists(), "queued event must be sent");
+        std::fs::remove_file(dir.join("stdin")).unwrap();
+        p.publish(sample());
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!dir.join("stdin").exists());
+        let got = log.0.lock().unwrap().clone();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].stage, PublishStage::Enqueue);
+        assert!(p.drain().is_none());
+        assert_eq!(log.1.lock().unwrap().len(), 1);
+    }
+
+    /// CRI-5・#4222: `PublisherDrains` は `exec_publisher_for_with` が作った publisher を排出する。
+    #[test]
+    fn cri5_4222_registered_publisher_is_drained_via_context() {
+        let dir = test_root::test_root("pub", "drain-ctx");
+        let bin = make_script(&dir, "fake", &recorder_body(&dir));
+        let log = Arc::new(CaptureLog::default());
+        let ctx = ServeContext::new(ShutdownSignal::new(), None)
+            .with_origin(
+                Some(ShimIdentifier::parse("default").unwrap()),
+                Some(ADDR.into()),
+            )
+            .with_publish_binary(Some(PublishBinary::verify(&bin).unwrap()));
+        let p = exec_publisher_for_with(&ctx, PublishConfig::default(), log.clone()).unwrap();
+        p.publish(sample());
+        let drains = ctx.publisher_drains().drain_all();
+        assert_eq!(drains.len(), 1);
+        assert_eq!(drains[0].dropped, 0);
+        assert!(dir.join("stdin").exists());
     }
 
     /// CRI-5・#4155: `-publish-binary` が無ければ `None` と `disabled` が 1 件。3 つ揃えば `Some`。

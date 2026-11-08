@@ -4,7 +4,6 @@
 //! 偽なのは実行層（`ContainerRuntime`）と publish バイナリ（`/bin/sh` の記録スクリプト）だけ。Start の後に終了を
 //! 観測した watcher が、偽バイナリへ argv と `Any`（TaskExit）を渡し、イベントがちょうど 1 件であることを具体値で確かめる。
 //! Delete 後に同じ ID で作り直した場合に、旧世代が旧 pid のイベントを送らないことも確かめる。
-//! Wait の直後の Delete（ctr 型）やキュー投入後の Delete でも、TaskExit が TaskDelete より先にちょうど 1 件届くことも確かめる（#4224）。
 #![cfg(unix)]
 
 #[path = "../../oci/tests/support/test_root.rs"]
@@ -23,12 +22,12 @@ use fandhe_container_core::traits::{
 use fandhe_container_cri::adapter::RuntimeAdapter;
 use fandhe_container_cri::shim_v2::bootstrap::{PublishBinary, ServeContext, ShimIdentifier};
 use fandhe_container_cri::shim_v2::publish::{
-    PublishConfig, PublishFailure, PublishLog, TaskCreate, TaskDelete, TaskExit, TaskIo, TaskStart,
-    exec_publisher_for_with,
+    PublishConfig, PublishDrain, PublishFailure, PublishLog, TaskCreate, TaskDelete, TaskExit,
+    TaskIo, TaskStart, exec_publisher_for_with,
 };
 use fandhe_container_cri::shim_v2::{
-    Any, CreateTaskRequest, DeleteRequest, ShutdownSignal, StartRequest, TaskApiVersion,
-    TaskService, Timestamp, TtrpcService, WaitConfig,
+    Any, CreateTaskRequest, DeleteRequest, ShutdownRequest, ShutdownSignal, StartRequest,
+    TaskApiVersion, TaskService, Timestamp, TtrpcService, WaitConfig,
 };
 use prost::Message;
 
@@ -90,11 +89,15 @@ impl ContainerRuntime for Shared {
 }
 
 #[derive(Default)]
-struct CaptureLog(Mutex<Vec<PublishFailure>>);
+struct CaptureLog(Mutex<Vec<PublishFailure>>, Mutex<Vec<PublishDrain>>);
 
 impl PublishLog for CaptureLog {
     fn record(&self, failure: &PublishFailure) {
         self.0.lock().unwrap().push(failure.clone());
+    }
+
+    fn record_drain(&self, drain: &PublishDrain) {
+        self.1.lock().unwrap().push(*drain);
     }
 }
 
@@ -144,15 +147,9 @@ fn start_req(id: &str) -> Vec<u8> {
 /// 偽バイナリの `n` 回目の呼び出し（`call<n>`）の完了を待ち、argv の topic と `Any` を返す。
 fn wait_call(out: &std::path::Path, n: usize) -> (String, Any) {
     let dir = out.join(format!("call{n}"));
-    let ok = wait_until(Duration::from_secs(10), || dir.join("stdin").exists());
-    assert!(
-        ok,
-        "call{n} missing: {:?}",
-        std::fs::read_dir(out)
-            .unwrap()
-            .map(|e| e.unwrap().file_name())
-            .collect::<Vec<_>>()
-    );
+    assert!(wait_until(Duration::from_secs(10), || dir
+        .join("stdin")
+        .exists()));
     let argv = std::fs::read_to_string(dir.join("argv")).unwrap();
     let lines: Vec<&str> = argv.lines().collect();
     assert_eq!(
@@ -290,7 +287,7 @@ fn cri5_4155_events_reach_fake_publish_binary_in_order() {
                 seconds: 1_700_000_000,
                 nanos: 5
             }),
-            id: "c1".into(),
+            id: String::new(),
         }
     );
     assert_eq!(resp.exit_status, 3);
@@ -311,6 +308,162 @@ fn cri5_4155_events_reach_fake_publish_binary_in_order() {
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(count_calls(&out), 7);
     assert!(log.0.lock().unwrap().is_empty());
+}
+
+/// 排出の試験の共通の組み立て。偽バイナリは呼び出しごとに連番のディレクトリを作る（`first_sleep` が true なら 1 回目だけ 0.3 秒眠る。
+/// `hang` が true なら pid を書いて 30 秒眠る）。返すのは (service, ctx, 記録先ディレクトリ, ログ, 偽バイナリが見る out)。
+fn drain_setup(
+    name: &str,
+    first_sleep: bool,
+    hang: bool,
+    drain_timeout: Duration,
+) -> (
+    TaskService,
+    ServeContext,
+    ShutdownSignal,
+    test_root::TestRoot,
+    std::path::PathBuf,
+    Arc<CaptureLog>,
+) {
+    let dir = test_root::test_root("pubit", name);
+    let out = dir.join("out");
+    std::fs::create_dir(&out).unwrap();
+    let tail = if hang {
+        "echo $$ > \"$d/pid\"\nexec /bin/sleep 30\n".to_owned()
+    } else {
+        format!(
+            "{}printf '%s\\n' \"$@\" > \"$d/argv\"\n/bin/cat > \"$d/stdin.tmp\"\n/bin/mv \"$d/stdin.tmp\" \"$d/stdin\"\n",
+            if first_sleep {
+                "if [ \"$n\" = 0 ]; then /bin/sleep 0.3; fi\n"
+            } else {
+                ""
+            }
+        )
+    };
+    let body = format!(
+        "#!/bin/sh\nn=$(( $(/bin/ls \"{o}\" | /usr/bin/wc -l) ))\nd=\"{o}/call$n\"\n/bin/mkdir \"$d\"\n{tail}",
+        o = out.display()
+    );
+    let bin = make_script(&dir, &body);
+    let log = Arc::new(CaptureLog::default());
+    let signal = ShutdownSignal::new();
+    let ctx = ServeContext::new(signal.clone(), None)
+        .with_origin(
+            Some(ShimIdentifier::parse("default").unwrap()),
+            Some("/run/containerd/containerd.sock".into()),
+        )
+        .with_publish_binary(Some(PublishBinary::verify(&bin).unwrap()));
+    let publisher = exec_publisher_for_with(
+        &ctx,
+        PublishConfig::new(Duration::from_secs(5))
+            .unwrap()
+            .with_drain_timeout(drain_timeout)
+            .unwrap(),
+        log.clone(),
+    )
+    .expect("publisher");
+    let svc = TaskService::new(
+        TaskApiVersion::V2,
+        RuntimeAdapter::from_runtime(Shared(Arc::new(Fake::default()))),
+    )
+    .with_shutdown(signal.clone())
+    .with_event_publisher(publisher);
+    (svc, ctx, signal, dir, out, log)
+}
+
+/// Create → Delete の後に Shutdown を呼ぶ（最後の TaskDelete がキューに残る場面）。
+fn create_delete_shutdown(svc: &TaskService, dir: &std::path::Path, signal: &ShutdownSignal) {
+    let bundle = dir.join("bundle");
+    std::fs::create_dir(&bundle).unwrap();
+    let bundle = bundle.to_str().unwrap().to_owned();
+    svc.handle("Create", &create_req("c1", &bundle)).unwrap();
+    svc.handle(
+        "Delete",
+        &DeleteRequest {
+            id: "c1".into(),
+            exec_id: String::new(),
+        }
+        .encode_to_vec(),
+    )
+    .unwrap();
+    svc.handle(
+        "Shutdown",
+        &ShutdownRequest {
+            id: "c1".into(),
+            now: false,
+        }
+        .encode_to_vec(),
+    )
+    .unwrap();
+    assert!(signal.is_requested());
+}
+
+/// REPAIR-5・CRI-5・#4222: Shutdown の後の排出が、キューに残った TaskDelete を送り切ってから戻る。
+/// 先行の TaskCreate が 0.3 秒眠るため、排出が無ければ TaskDelete は排出の呼び出しの時点で未送信。
+/// TaskDelete の `id` は init では空（runc shim v2 と同じ）。
+#[test]
+fn repair5_4222_shutdown_drains_queued_task_delete() {
+    let (svc, ctx, signal, dir, out, log) =
+        drain_setup("drain-ok", true, false, Duration::from_secs(5));
+    create_delete_shutdown(&svc, &dir, &signal);
+    let drains = ctx.publisher_drains().drain_all();
+    // wait_until を使わず、排出が戻った時点で 2 件とも届いていること。
+    assert_eq!(count_calls(&out), 2);
+    let any = Any::decode(std::fs::read(out.join("call1/stdin")).unwrap().as_slice()).unwrap();
+    assert_eq!(any.type_url, "containerd.events.TaskDelete");
+    assert_eq!(
+        TaskDelete::decode(any.value.as_slice()).unwrap(),
+        TaskDelete {
+            container_id: "c1".into(),
+            pid: 0,
+            exit_status: 0,
+            exited_at: None,
+            id: String::new(),
+        }
+    );
+    assert_eq!(drains.len(), 1);
+    assert!(drains[0].queued >= 1, "{:?}", drains[0]);
+    assert_eq!(drains[0].dropped, 0);
+    assert!(!drains[0].deadline_hit && drains[0].worker_finished);
+    assert_eq!(log.1.lock().unwrap().len(), 1);
+    assert!(log.0.lock().unwrap().is_empty());
+}
+
+/// REPAIR-5・REPAIR-4・#4222: 子が止まったまま排出の期限を超えたら、実行中の子を kill して回収し、
+/// 捨てた件数（実行中 1 + キュー 1）をログの 1 行に出す。期限を大きく超えて戻らない。
+#[test]
+fn repair5_4222_drain_deadline_drops_and_logs_exact_count() {
+    let (svc, ctx, signal, dir, out, _log) =
+        drain_setup("drain-deadline", false, true, Duration::from_millis(300));
+    create_delete_shutdown(&svc, &dir, &signal);
+    // 1 件目（TaskCreate）が子の起動で止まるのを待つ。
+    assert!(wait_until(Duration::from_secs(10), || out
+        .join("call0/pid")
+        .exists()));
+    let started = Instant::now();
+    let drains = ctx.publisher_drains().drain_all();
+    let took = started.elapsed();
+    assert!(took < Duration::from_millis(2000), "{took:?}");
+    assert_eq!(drains.len(), 1);
+    let d = drains[0];
+    assert!(d.deadline_hit, "{d:?}");
+    assert!(d.worker_finished, "{d:?}");
+    assert_eq!((d.queued, d.dropped), (2, 2), "{d:?}");
+    let line = d.to_json_line();
+    assert!(line.contains(r#""dropped":2"#), "{line}");
+    assert!(line.contains(r#""outcome":"deadline""#), "{line}");
+    for secret in ["/run/containerd", "default", "c1", "bundle"] {
+        assert!(!line.contains(secret), "{line}");
+    }
+    assert_eq!(count_calls(&out), 1, "queued event must not start a child");
+    #[cfg(target_os = "linux")]
+    {
+        let pid = std::fs::read_to_string(out.join("call0/pid")).unwrap();
+        assert!(
+            !std::path::Path::new(&format!("/proc/{}", pid.trim())).exists(),
+            "child must be reaped"
+        );
+    }
 }
 
 /// 偽 publish バイナリ（`slow` の分だけ遅い）を通す本番の組み立てを作る。照会間隔は `poll`。

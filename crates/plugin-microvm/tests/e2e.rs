@@ -154,6 +154,8 @@ mod mock_core {
         pub stop_err: Option<MicrovmErrorCode>,
         /// 終了を観測済みにした VM の id（後から vCPU スレッドが終わった模擬。#3745）。
         pub exited: std::collections::BTreeSet<u32>,
+        /// 設定すると成功した stop がこの ioeventfd 件数を返す（結果行の `ignored=` / `unbind_failed=` の経路。#4161）。
+        pub stop_ioevent: Option<fandhe_container_microvm::interrupt::IoEventCounts>,
     }
 
     /// 起動・停止の引数を記録する偽バックエンド（adapter の `#[cfg(test)]` 版は非公開のため独自に持つ）。
@@ -189,7 +191,7 @@ mod mock_core {
                 Some(code) => Err(MicrovmError::new(code, "fake stop")),
                 None => Ok(fandhe_container_plugin_microvm::adapter::StopOutcome {
                     reason: "requested",
-                    ioevent: None,
+                    ioevent: r.stop_ioevent,
                 }),
             }
         }
@@ -480,6 +482,81 @@ fn task117_4_plug1_mvm1_ping_start_stop_roundtrip_via_uds() {
             failed: 0,
             remaining: 0
         }
+    );
+}
+
+/// 子プロセスで走らせる側を示す環境変数（stderr の構造化ログを観測するため自身を再起動する。#4161）。
+const IOEVENT_CHILD_ENV: &str = "FANDHE_E2E_IOEVENT_CHILD";
+
+/// MVM-1・REPAIR-4・#4161: backend が返した ioeventfd 件数 (2, 1) が、実際の要求処理（UDS の stop）を通って
+/// 停止の結果行へ ` ignored=2 unbind_failed=1` として出る。UDS 応答は従来どおり `stopped requested` のまま。
+///
+/// 結果行は adapter がプロセスの stderr へ書くため、同一プロセス内では観測できない。そこでこの試験は自身を
+/// 子プロセス（`--exact --nocapture`）として再実行し、親が子の stderr を期限つきで集めて照合する。
+#[test]
+fn mvm1_repair4_4161_stop_log_carries_ioevent_counts_via_uds() {
+    use fandhe_container_microvm::interrupt::IoEventCounts;
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+
+    if std::env::var_os(IOEVENT_CHILD_ENV).is_some() {
+        // 子: 偽 backend が (2, 1) を返す構成で start → stop を通す。
+        let mut e = mock_core::E2e::start();
+        e.record.lock().expect("lock").stop_ioevent = Some(IoEventCounts::new(2, 1));
+        let kernel = e.dir.file("k.bin", KERNEL);
+        let start = s(&["start", "vm1", &kernel, "", "", "1", "64"]);
+        assert_eq!(expect_ok(call(&mut e.stream, 1, start), 1), s(&["running"]));
+        assert_eq!(
+            expect_ok(call(&mut e.stream, 2, s(&["stop", "vm1"])), 2),
+            s(&["stopped", "requested"])
+        );
+        let _ = e.finish();
+        return;
+    }
+
+    let exe = std::env::current_exe().expect("current_exe");
+    let mut child = Command::new(exe)
+        .args([
+            "--exact",
+            "mvm1_repair4_4161_stop_log_carries_ioevent_counts_via_uds",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(IOEVENT_CHILD_ENV, "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn child");
+    let begin = Instant::now();
+    let status = loop {
+        if let Some(st) = child.try_wait().expect("try_wait") {
+            break st;
+        }
+        if begin.elapsed() > Duration::from_secs(60) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("child did not finish within deadline");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let mut err = String::new();
+    if let Some(mut se) = child.stderr.take() {
+        let _ = se.read_to_string(&mut err);
+    }
+    assert!(status.success(), "child failed: {status:?}\n{err}");
+    let stop_line = err
+        .lines()
+        .find(|l| l.contains("op=plugin.microvm.stop"))
+        .unwrap_or_else(|| panic!("no stop log line in child stderr:\n{err}"));
+    assert!(
+        stop_line.starts_with("level=info op=plugin.microvm.stop outcome=ok elapsed_us="),
+        "{stop_line}"
+    );
+    assert!(
+        stop_line.ends_with(" vms=0 ignored=2 unbind_failed=1"),
+        "{stop_line}"
     );
 }
 

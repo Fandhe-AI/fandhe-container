@@ -201,11 +201,24 @@
 # 全体は 120 + コード 604 + データ 405 = 1129 バイト。命令の並びは serial-echo の分岐の各 `bytes` 行のコメントを正とする。
 # llvm-mc（aarch64-linux-gnu）で組み、llvm-objdump の逆アセンブルと一致を確認済み。実カーネルでの確認は Agent は未実施（#3988・人間担当）。
 #
+# variant `meminfo`（#4107・MVM-1・REPAIR-12。x86_64 専用）: 4 GiB 超の RAM でゲストが高位領域を使えているかを
+# `/proc/meminfo` の MemTotal から照合するための版。syslog(CONSOLE_OFF) で printk を止め（`/proc/meminfo` の行の途中へ
+# 割り込ませない）、/proc を mount して `/proc/meminfo` を 1 回 read（4096 バイト。meminfo は約 1.5 KB で MemTotal は先頭行）し、
+# 読めた分をそのまま fd 1 へ書いてから、前後に改行を付けた ok メッセージ（失敗は failed メッセージ）を書いて reboot する。
+# 数値の解析はゲスト側ではせず、ホスト側（tests/support/guest_boot.rs の parse_mem_total_kb）が行う。
+# 機械語（x86_64。全体は 120 + コード 194 + データ 101 = 415 バイト。GNU as で組んだ逆アセンブルと一致することを確認済み。
+# 初版。表のオフセットはコード先頭から）:
+#    0: syslog(6,0,0) ; 16: mkdir("/proc",0555)（戻り値は見ない）; 35: mount("proc","/proc","proc",0,0)（同）
+#   65: open("/proc/meminfo",O_RDONLY) ; js fail ; 86: sub rsp,4096 ; read(fd,rsp,4096) ; jle fail
+#  112: write(1,rsp,n) ; 130: lea rsi,okmsg ; edx=36 ; jmp write ; 144: fail: lea rsi,failmsg ; edx=40
+#  156: write: write(1,rsi,edx) ; 168: reboot の末尾（既定の版と同じ並び）; 190: pause ; jmp 190
+#  194: データ: "/proc\0"(6) "proc\0"(5) "/proc/meminfo\0"(14) 成功メッセージ(前後の改行込み 36) 失敗メッセージ(同 40)
+#
 # 使い方:
-#   build-microvm-test-initrd.sh [--variant default|block-read|net-tx|net-rx|serial-echo] [--arch x86_64|aarch64] [--output-dir <dir>] [--compress none|gzip] [--pack-timeout S]
+#   build-microvm-test-initrd.sh [--variant default|block-read|net-tx|net-rx|serial-echo|meminfo] [--arch x86_64|aarch64] [--output-dir <dir>] [--compress none|gzip] [--pack-timeout S]
 #   各引数は同名の環境変数（MICROVM_TEST_INITRD_VARIANT・MICROVM_TEST_INITRD_ARCH・MICROVM_TEST_INITRD_OUTPUT_DIR・MICROVM_TEST_INITRD_COMPRESS）でも渡せる。CLI が優先。
-#   --variant       default（既定。固定文字列を書いて reboot するだけの版）・block-read・net-tx・net-rx（上記。block-read は aarch64 も #3947、net-tx・net-rx の aarch64 版は #3966）・serial-echo（aarch64 専用。#3987）
-#   --arch          x86_64（既定）または aarch64（#3895。別名は受けない。aarch64 は全 variant。出力先の既定は target/microvm-test-initrd/aarch64-block-read 等）
+#   --variant       default（既定。固定文字列を書いて reboot するだけの版）・block-read・net-tx・net-rx（上記。block-read は aarch64 も #3947、net-tx・net-rx の aarch64 版は #3966）・serial-echo（aarch64 専用。#3987）・meminfo（x86_64 専用。#4107）
+#   --arch          x86_64（既定）または aarch64（#3895。別名は受けない。aarch64 は meminfo を除く全 variant。出力先の既定は target/microvm-test-initrd/aarch64-block-read 等）
 #   --output-dir    既定: <repo>/target/microvm-test-initrd/<arch>（block-read は x86_64-block-read、net-tx は x86_64-net-tx、net-rx は x86_64-net-rx、serial-echo は aarch64-serial-echo）（存在しない新規ディレクトリのみ。既存は拒否）
 #   --compress      none（既定。initrd.cpio）または gzip（initrd.cpio.gz。カーネルは CONFIG_RD_GZIP=y が要る）
 #   --pack-timeout  gzip の上限秒（既定 60。1〜600。REPAIR-5）
@@ -222,7 +235,7 @@ set -euo pipefail
 
 usage() {
     cat >&2 <<'USAGE'
-usage: build-microvm-test-initrd.sh [--variant default|block-read|net-tx|net-rx|serial-echo] [--arch x86_64|aarch64] [--output-dir <dir>] [--compress none|gzip] [--pack-timeout S]
+usage: build-microvm-test-initrd.sh [--variant default|block-read|net-tx|net-rx|serial-echo|meminfo] [--arch x86_64|aarch64] [--output-dir <dir>] [--compress none|gzip] [--pack-timeout S]
 USAGE
 }
 
@@ -272,6 +285,11 @@ serial_ok_message="fandhe-microvm-test: serial echo ok v1"
 serial_rx_timeout_message="fandhe-microvm-test: serial rx timeout v1"
 serial_failed_message="fandhe-microvm-test: serial echo failed v1"
 serial_rx_rounds=4
+# meminfo の文字列定数（正本。crates/microvm/tests/support/guest_boot.rs の単体テストが行頭の名前で抜き出して照合する。
+# 長さ 36・40（前後の改行込み）と path 13 は機械語の mov edx・データ配置へ固定されているため、変えるときはコードも直す）
+meminfo_path="/proc/meminfo"
+meminfo_ok_message="fandhe-microvm-test: meminfo ok v1"
+meminfo_failed_message="fandhe-microvm-test: meminfo failed v1"
 
 need_value() {
     [ "$1" -ge 2 ] || { err_code bad-argument "$2 requires a value"; usage; exit 2; }
@@ -294,12 +312,16 @@ case "$arch" in
     *) err_code bad-argument "--arch must be x86_64 or aarch64"; usage; exit 2 ;;
 esac
 case "$variant" in
-    default | block-read | net-tx | net-rx | serial-echo) ;;
-    *) err_code bad-argument "--variant must be default, block-read, net-tx, net-rx or serial-echo"; usage; exit 2 ;;
+    default | block-read | net-tx | net-rx | serial-echo | meminfo) ;;
+    *) err_code bad-argument "--variant must be default, block-read, net-tx, net-rx, serial-echo or meminfo"; usage; exit 2 ;;
 esac
 # serial-echo は aarch64 だけ（x86 の push_input は kvm_device.rs 側が見る。#3987）
 if [ "$variant" = "serial-echo" ] && [ "$arch" != "aarch64" ]; then
     err_code bad-argument "--variant serial-echo is only available with --arch aarch64"; usage; exit 2
+fi
+# meminfo は x86_64 だけ（aarch64 の RAM 配置は MMIO hole をまたがない。#4107）
+if [ "$variant" = "meminfo" ] && [ "$arch" != "x86_64" ]; then
+    err_code bad-argument "--variant meminfo is only available with --arch x86_64"; usage; exit 2
 fi
 case "$compress" in
     none | gzip) ;;
@@ -336,7 +358,7 @@ esac
 # --- 出力先の検査 ---
 if [ -z "$output_dir" ]; then
     case "$variant" in
-        block-read | net-tx | net-rx | serial-echo) output_dir="$root/target/microvm-test-initrd/${arch}-${variant}" ;;
+        block-read | net-tx | net-rx | serial-echo | meminfo) output_dir="$root/target/microvm-test-initrd/${arch}-${variant}" ;;
         *) output_dir="$root/target/microvm-test-initrd/$arch" ;;
     esac
 fi
@@ -998,6 +1020,69 @@ elif [ "$variant" = "net-tx" ]; then
         printf '%s\n' "$net_tx_ok_message"
         printf '%s\n' "$net_tx_failed_message"
     } >"$elf_file"
+elif [ "$variant" = "meminfo" ]; then
+    # 機械語に固定された長さ・サイズを文字列定数と突き合わせる（fail-closed。x86_64 だけ。引数の検査で aarch64 は拒否済み）
+    expected_size=415
+    if [ "$((${#meminfo_ok_message} + 2))" -ne 36 ] || [ "$((${#meminfo_failed_message} + 2))" -ne 40 ] ||
+        [ "${#meminfo_path}" -ne 13 ]; then
+        err_code internal-error "meminfo string lengths do not match the encoded instructions"
+        exit 1
+    fi
+    total_size=$expected_size
+    {
+        emit_elf_headers "$total_size"
+        # コード 194 バイト（先頭コメントの表と同じ並び。GNU as で組んだ逆アセンブルと一致を確認済み。#4107）
+        bytes b8; le 103 4                                 # mov eax, 103 (syslog)
+        bytes bf; le 6 4                                   # mov edi, 6 (SYSLOG_ACTION_CONSOLE_OFF)
+        bytes 31 f6                                        # xor esi, esi
+        bytes 31 d2                                        # xor edx, edx
+        bytes 0f 05                                        # syscall
+        bytes b8; le 83 4                                  # mov eax, 83 (mkdir)
+        bytes 48 8d 3d; le 166 4                           # lea rdi, [rip+0xa6] -> "/proc"
+        bytes be; le $((8#555)) 4                          # mov esi, 0555
+        bytes 0f 05                                        # syscall（戻り値は見ない）
+        bytes b8; le 165 4                                 # mov eax, 165 (mount)
+        bytes 48 8d 3d; le 153 4                           # lea rdi, [rip+0x99] -> "proc"（source）
+        bytes 48 8d 35; le 140 4                           # lea rsi, [rip+0x8c] -> "/proc"（target）
+        bytes 48 89 fa                                     # mov rdx, rdi（fstype）
+        bytes 45 31 d2                                     # xor r10d, r10d
+        bytes 45 31 c0                                     # xor r8d, r8d
+        bytes 0f 05                                        # syscall（戻り値は見ない）
+        bytes b8; le 2 4                                   # mov eax, 2 (open)
+        bytes 48 8d 3d; le 128 4                           # lea rdi, [rip+0x80] -> "/proc/meminfo"
+        bytes 31 f6                                        # xor esi, esi (O_RDONLY)
+        bytes 0f 05                                        # syscall
+        bytes 48 85 c0                                     # test rax, rax
+        bytes 78 3a                                        # js fail
+        bytes 48 81 ec; le 4096 4                          # sub rsp, 4096
+        bytes 89 c7                                        # mov edi, eax
+        bytes 31 c0                                        # xor eax, eax (read)
+        bytes 48 89 e6                                     # mov rsi, rsp
+        bytes ba; le 4096 4                                # mov edx, 4096
+        bytes 0f 05                                        # syscall
+        bytes 48 85 c0                                     # test rax, rax
+        bytes 7e 20                                        # jle fail
+        bytes 48 89 c2                                     # mov rdx, rax
+        bytes b8; le 1 4                                   # mov eax, 1 (write)
+        bytes bf; le 1 4                                   # mov edi, 1
+        bytes 48 89 e6                                     # mov rsi, rsp
+        bytes 0f 05                                        # syscall
+        bytes 48 8d 35; le 82 4                            # lea rsi, [rip+0x52] -> ok message
+        bytes ba; le 36 4                                  # mov edx, 36
+        bytes eb 0c                                        # jmp write
+        bytes 48 8d 35; le 104 4                           # fail: lea rsi, [rip+0x68] -> failed message
+        bytes ba; le 40 4                                  # mov edx, 40
+        bytes b8; le 1 4                                   # write: mov eax, 1
+        bytes bf; le 1 4                                   # mov edi, 1
+        bytes 0f 05                                        # syscall
+        emit_reboot_tail
+        # データ: "/proc\0" "proc\0" "/proc/meminfo\0" 成功メッセージ（前後に改行）失敗メッセージ（前後に改行）
+        printf '/proc\0'
+        printf 'proc\0'
+        printf '%s\0' "$meminfo_path"
+        printf '\n%s\n' "$meminfo_ok_message"
+        printf '\n%s\n' "$meminfo_failed_message"
+    } >"$elf_file"
 elif [ "$variant" = "block-read" ]; then
     # 機械語に固定された長さ・サイズを文字列定数と突き合わせる（fail-closed）
     if [ "$arch" = "aarch64" ]; then expected_size=489; else expected_size=448; fi
@@ -1244,6 +1329,11 @@ cp "$final_file" "$output_dir/$final_name" 2>/dev/null || { err_code output-fail
             printf 'message_failed=%s\n' "$net_rx_failed_message"
             printf 'recv_timeout_secs=5\n'
             printf 'recv_attempts=16\n'
+            ;;
+        meminfo)
+            printf 'message_ok=%s\n' "$meminfo_ok_message"
+            printf 'message_failed=%s\n' "$meminfo_failed_message"
+            printf 'read_bytes=4096\n'
             ;;
         serial-echo)
             printf 'message_tx=%s\n' "$serial_tx_line"

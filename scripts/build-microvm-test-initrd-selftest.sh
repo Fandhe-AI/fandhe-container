@@ -140,6 +140,9 @@ case "$(uname -s)" in
         newout
         run "$target" --variant serial-echo --arch aarch64 --output-dir "$out"
         check "win serial-echo refused" "2 unsupported-os" "$rc $(errcode)"
+        newout
+        run "$target" --variant meminfo --output-dir "$out"
+        check "win meminfo refused" "2 unsupported-os" "$rc $(errcode)"
         echo "pass=$pass fail=$fail"
         [ "$fail" -eq 0 ]
         exit $?
@@ -847,6 +850,77 @@ newout
 run env MICROVM_TEST_INITRD_VARIANT=serial-echo "$target" --output-dir "$out"
 check "31 env variant with default arch refused" "2 bad-argument" "$rc $(errcode)"
 if [ ! -e "$out" ]; then ok "31 refused env run creates no output"; else ng "31 refused env run created output"; fi
+
+# --- 32: variant meminfo（x86_64 専用。#4107） ---
+# 初版。meminfo を新設したため golden をここで登録した。コードは GNU as 2.46 で組んだ逆アセンブルとバイト列が一致することを確認済み。
+golden_meminfo_init_sha="c15b476cd6d81aee280162fc0f8726e773ff74f44434767afaf11e36475ba097"
+golden_meminfo_initrd_sha="3f64c265bbf9d824fc58d06ec5a1284545fc899a5a7a4d003927a97662e77e70"
+golden_meminfo_code="b867000000bf0600000031f631d20f05b853000000488d3da6000000be6d0100000f05b8a5000000488d3d99000000488d358c0000004889fa4531d24531c00f05b802000000488d3d8000000031f60f054885c0783a4881ec0010000089c731c04889e6ba001000000f054885c07e204889c2b801000000bf010000004889e60f05488d3552000000ba24000000eb0c488d3568000000ba28000000b801000000bf010000000f05b8a9000000bfaddee1febe69191228ba674523010f05f390ebfc"
+newout
+run env MICROVM_TEST_INITRD_VARIANT=meminfo "$target" --output-dir "$out"
+check "32 exit code" 0 "$rc"
+check "32 stdout is the initrd path" "$out/initrd.cpio" "$(cat "$sb/o.out")"
+cpio32="$out/initrd.cpio"
+check "32 entries" "init 000081ed 00000000 00000000 415
+TRAILER!!! 00000000 00000000 00000000 0" "$(list_newc "$cpio32")"
+init32="$sb/init-meminfo.bin"
+tail -c +$((110 + 5 + 1 + 1)) "$cpio32" | head -c 415 >"$init32"
+check "32 init size" 415 "$(wc -c <"$init32" | tr -d ' ')"
+check "32 magic class data" "7f454c460201" "$(hexat "$init32" 0 6)"
+check "32 e_machine" 62 "$(leat "$init32" 18 2)"
+check "32 e_entry" $((0x400078)) "$(leat "$init32" 24 8)"
+check "32 p_flags R+X" 5 "$(leat "$init32" 68 4)"
+check "32 p_filesz" 415 "$(leat "$init32" 96 8)"
+check "32 p_memsz" 415 "$(leat "$init32" 104 8)"
+check "32 code (194 bytes)" "$golden_meminfo_code" "$(hexat "$init32" 120 194)"
+check "32 paths (NUL-terminated, 25 bytes)" "2f70726f630070726f63002f70726f632f6d656d696e666f00" "$(hexat "$init32" 314 25)"
+check "32 ok message first byte" "0a" "$(hexat "$init32" 339 1)"
+check "32 ok message text" "fandhe-microvm-test: meminfo ok v1" "$(tail -c +341 "$init32" | head -c 34)"
+check "32 ok message last byte" "0a" "$(hexat "$init32" 374 1)"
+check "32 failed message first byte" "0a" "$(hexat "$init32" 375 1)"
+check "32 failed message text" "fandhe-microvm-test: meminfo failed v1" "$(tail -c +377 "$init32" | head -c 38)"
+check "32 failed message last byte" "0a" "$(hexat "$init32" 414 1)"
+check "32 init sha256" "$golden_meminfo_init_sha" "$(sha_of "$init32")"
+check "32 initrd sha256" "$golden_meminfo_initrd_sha" "$(sha_of "$cpio32")"
+check "32 build-info" "init_sha256=$golden_meminfo_init_sha
+init_bytes=415
+initrd_file=initrd.cpio
+initrd_sha256=$golden_meminfo_initrd_sha
+compress=none
+arch=x86_64
+format=newc
+variant=meminfo
+message_ok=fandhe-microvm-test: meminfo ok v1
+message_failed=fandhe-microvm-test: meminfo failed v1
+read_bytes=4096" "$(grep -v '^host=' "$out/build-info.txt")"
+
+# --- 33: 決定性と gzip ---
+newout
+run "$target" --variant meminfo --output-dir "$out"
+if cmp -s "$out/initrd.cpio" "$cpio32"; then ok "33 second run is byte-identical"; else ng "33 second run differs"; fi
+if command -v gzip >/dev/null 2>&1; then
+    newout
+    run "$target" --variant meminfo --output-dir "$out" --compress gzip
+    check "33 gzip exit code" 0 "$rc"
+    if gzip -dc "$out/initrd.cpio.gz" | cmp -s - "$cpio32"; then ok "33 gunzip equals the plain archive"; else ng "33 gunzip differs"; fi
+else
+    echo "skip: gzip is not available (case 33 gzip)"
+fi
+
+# --- 34: meminfo の選択（環境変数・CLI の優先・aarch64 との組の拒否・Windows の拒否） ---
+newout
+run env MICROVM_TEST_INITRD_VARIANT=meminfo "$target" --output-dir "$out"
+if cmp -s "$out/initrd.cpio" "$cpio32"; then ok "34 env variant selects meminfo"; else ng "34 env selection ignored"; fi
+newout
+run env MICROVM_TEST_INITRD_VARIANT=bogus "$target" --variant meminfo --output-dir "$out"
+if cmp -s "$out/initrd.cpio" "$cpio32"; then ok "34 CLI variant wins over env"; else ng "34 CLI variant did not win"; fi
+newout
+run "$target" --variant meminfo --arch aarch64 --output-dir "$out"
+check "34 aarch64 refused" "2 bad-argument" "$rc $(errcode)"
+if [ ! -e "$out" ]; then ok "34 refused run creates no output"; else ng "34 refused run created output"; fi
+newout
+run env MICROVM_TEST_INITRD_UNAME_S=MINGW64_NT-10.0 "$target" --variant meminfo --output-dir "$out"
+check "34 windows host refused" "2 unsupported-os" "$rc $(errcode)"
 
 echo "pass=$pass fail=$fail"
 [ "$fail" -eq 0 ]

@@ -250,7 +250,7 @@ impl StartReport {
 ///
 /// 値は plugin-cri が CRI の `stdin` / `stdin_once` から決めて argv に載せる（C8 #4076）。supervisor は `Open` と `Once` の
 /// どちらでも init の fd 0 を pipe にし、書き込み端を世代ごとに保持する。両者の差（`Once` は 1 回目の attach の切断で
-/// 閉じる）は attach の入口（C6 #4075）が `stdin_once` の所有の移転で扱う。
+/// 閉じる）は attach の入口（kind 9 のサーバ。C6 #4075 で実装済み）が `stdin_once` の所有の移転で扱う。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StdinOption {
     /// stdin を開き、attach が繰り返し接続できる。

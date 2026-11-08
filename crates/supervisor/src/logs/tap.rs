@@ -3,8 +3,8 @@
 //! 完全版 Attach（親 #3765。`docs/design/cri-streaming-server.md`）の出力は、ログの follow では届かない
 //! LF なしのプロンプトを含む生のバイト列でなければならない（決定 D2）。そこで、捕捉リーダー
 //! （[`super::LogCapture`] の `pump`）が sink へ書いた直後に、同じチャンクを購読者ごとの非ブロッキング
-//! socketpair へ複製する。購読 API は [`crate::log_pipeline::CaptureHub::subscribe_output`] で、C6（#4075）が
-//! 制御チャネルの kind 9 と SCM_RIGHTS で返す。
+//! socketpair へ複製する。購読 API は [`crate::log_pipeline::CaptureHub::subscribe_output`] で、制御チャネルの kind 9
+//! （C6 #4075。実装済み）が SCM_RIGHTS で返す。
 //!
 //! # 契約
 //! - sink が常に優先: 同じチャンクの `append` と `flush` が戻るまで tap へは書かない。
@@ -23,7 +23,8 @@
 //!   壊さない）。
 //!
 //! # 未実装（REPAIR-3）
-//! 制御チャネルの kind 9 `AttachRequest` と fd の受け渡しは C6（#4075）、plugin-cri の結線は C9（#4077）。
+//! 制御チャネルの kind 9 `AttachRequest` と fd の受け渡しは実装済み（`control::server`・C6 #4075）。
+//! plugin-cri の結線は C9（#4077）。
 
 use super::StreamKind;
 
@@ -110,7 +111,7 @@ mod imp {
         DisconnectReason, MAX_TAP_SUBSCRIBERS, StreamKind, TapReporter, TapStats, TapStreams,
     };
 
-    /// 購読者側の端（C6 が SCM_RIGHTS で plugin-cri へ渡す）。ブロッキングのまま渡す。drop で閉じる。
+    /// 購読者側の端（kind 9 のサーバが SCM_RIGHTS で plugin-cri へ渡す。#4075）。ブロッキングのまま渡す。drop で閉じる。
     #[derive(Debug)]
     pub struct TapSubscription {
         stdout: Option<UnixStream>,

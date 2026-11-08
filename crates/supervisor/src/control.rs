@@ -12,7 +12,7 @@
 //!
 //! | モジュール | 役割 |
 //! | ---------- | ---- |
-//! | `protocol` | 固定長 frame（Hello・SignalRequest・StopRequest・CancelRestartRequest・ExecHandoverRequest・Response）と理由コード。全 OS |
+//! | `protocol` | 固定長 frame（Hello・SignalRequest・StopRequest・CancelRestartRequest・ExecHandoverRequest・ExitWatchRequest・AttachRequest・Response）と理由コード。全 OS |
 //! | `target` | 起動ハンドルの包み（`ControlledProcess`）と共有状態（`SignalSlot`。exec 用に起動時 pidfd の複製も保持する）。全 OS |
 //! | `listener` | 置き場所の検証・bind・削除（Linux） |
 //! | `server` | accept ループ・接続元の検証・期限（Linux） |
@@ -42,6 +42,16 @@
 //! 試験は差し替え）。通知が使えない（supervisor 不在・古い版・非 Linux）ときは [`ExitWatchOutcome::NoSupervisor`] を返し、
 //! 呼び出し側は照会へ退避する。新しいスレッドは作らない（サーバは接続の複製をスロットに預け、クライアントは 10ms 刻みの
 //! 読み取りで取り消しと期限を見る）。
+//!
+//! # Attach 用 fd の受け渡し（SUP-4・SUP-7・REPAIR-2・SEC-1・CRI-6・#4075）
+//!
+//! plugin-cri の Attach が、init の stdin の書き込み端（tty では pty master の複製）と出力の tap の端を受け取る口。
+//! AttachRequest（kind 9）は固定長の 1 往復で、`Response(Ok)` と同じ `sendmsg` に fd を最大 3 本添えて返し、接続は
+//! 保持しない。非 tty の `stdin_once` では元の端そのものを渡し（所有の移転。受け手が唯一の書き込み端を持つので、
+//! 受け手が閉じるとコンテナの stdin が EOF になる）、送れなかったときは同じ世代にだけ戻す。tty の `stdin_once` は
+//! master を複製して渡し、閉じない。クライアント入口は [`AttachIoSource`]（本番は [`production_attach_io_source`] の
+//! [`ControlAttach`]）。古い supervisor は kind 9 を `Malformed` で断り、クライアントは `Unavailable` を返す
+//! （別の手段へ切り替えない）。結線は plugin-cri の C9（#4077）。設計は `docs/design/cri-streaming-server.md`。
 //!
 //! # 寿命
 //!
@@ -82,9 +92,9 @@ pub mod observe;
 #[cfg(target_os = "linux")]
 pub mod server;
 
-#[cfg(target_os = "linux")]
-pub use client::ControlExecHandover;
 pub use client::{CancelOutcome, ControlExitWatcher, ControlRestartCanceller, ControlSignaler};
+#[cfg(target_os = "linux")]
+pub use client::{ControlAttach, ControlExecHandover};
 #[cfg(target_os = "linux")]
 pub use exec_guard::{
     ExecCgroupReclaimer, ExecGuardLimits, ExecGuardPool, ReclaimOutcome, StoreExecReclaimer,
@@ -325,6 +335,116 @@ pub fn production_exec_pidfd_source(
     }
 }
 
+/// [`AttachIoSource::obtain`] の要求（SUP-4・SUP-7・CRI-6・#4075）。受け取りたい fd の指定と、想定する入出力の構成。
+/// tty と stderr の併用は `InvalidArgument`（tty は stdout と stderr が混ざる）。
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttachIoRequest {
+    /// 入力（stdin の書き込み端。tty では pty master の複製）を受け取る。
+    pub stdin: bool,
+    /// stdout の tap を受け取る。
+    pub stdout: bool,
+    /// stderr の tap を受け取る（tty とは併用できない）。
+    pub stderr: bool,
+    /// 想定する構成が pty か（コンテナの構成と合わなければ `FailedPrecondition`）。
+    pub tty: bool,
+}
+
+/// Attach の入力 fd（検証済み。SEC-1）。
+#[cfg(target_os = "linux")]
+pub enum AttachInput {
+    /// 非 tty の stdin の書き込み端（pipe。`stdin_once` では唯一の書き込み端 = 所有の移転を受けたもの）。
+    Pipe(std::os::fd::OwnedFd),
+    /// tty の pty master の複製（`5:2` と `TIOCGPTN` を確認済み）。書き込みと `TIOCSWINSZ` 専用で、読むと
+    /// ログの捕捉から出力を奪うので読まない（出力は tap の端で受ける）。
+    Pty(fandhe_container_core::exec::PtyMaster),
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Debug for AttachInput {
+    /// fd の番号や内容は出さない。
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Pipe(_) => "AttachInput::Pipe",
+            Self::Pty(_) => "AttachInput::Pty",
+        })
+    }
+}
+
+/// [`AttachIoSource::obtain`] の結果: 入力の fd と出力の tap の端。要求しなかったものは `None`。drop で閉じる。
+#[cfg(target_os = "linux")]
+pub struct AttachIo {
+    /// 入力（stdin の書き込み端、または tty の master の複製）。
+    pub input: Option<AttachInput>,
+    /// stdout の tap の端（ブロッキング）。
+    pub stdout: Option<std::os::unix::net::UnixStream>,
+    /// stderr の tap の端（ブロッキング。tty では常に `None`）。
+    pub stderr: Option<std::os::unix::net::UnixStream>,
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Debug for AttachIo {
+    /// 有無だけを出す（fd の番号や内容は出さない）。
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AttachIo")
+            .field("input", &self.input)
+            .field("stdout", &self.stdout.is_some())
+            .field("stderr", &self.stderr.is_some())
+            .finish()
+    }
+}
+
+/// 稼働中コンテナの Attach 用の入力 fd と出力の tap を取得する注入点（plugin-cri の Attach 用。
+/// SUP-4・SUP-7・REPAIR-2・SEC-1・CRI-6・#4075）。Linux のみ。
+///
+/// 本番は [`ControlAttach`]（supervisor の制御チャネルの AttachRequest）、plugin-cri の試験は差し替える。
+/// 結線は plugin-cri の C9（#4077）。
+#[cfg(target_os = "linux")]
+pub trait AttachIoSource: Send + Sync {
+    /// `deadline`（実際の期限は 5 秒以内に抑えられる）までに、`pid`（記録上の pid1）の入出力を受け取る。
+    /// supervisor に届かない・古い版（`Unavailable`）・pid 不一致・tty の不一致・`stdin_once` の消費済みなどは
+    /// 構造化エラーで、fd は渡らない（受け取った fd は閉じる）。
+    fn obtain(
+        &self,
+        id: &fandhe_container_core::traits::ContainerId,
+        pid: std::num::NonZeroU32,
+        request: AttachIoRequest,
+        deadline: std::time::Instant,
+    ) -> Result<AttachIo, fandhe_container_core::traits::TraitError>;
+}
+
+/// 状態ルートを公開しないストア用の fail-closed の取得元。常に `Unimplemented` で失敗する（REPAIR-3）。
+#[cfg(target_os = "linux")]
+pub struct UnavailableAttachIoSource;
+
+#[cfg(target_os = "linux")]
+impl AttachIoSource for UnavailableAttachIoSource {
+    fn obtain(
+        &self,
+        _id: &fandhe_container_core::traits::ContainerId,
+        _pid: std::num::NonZeroU32,
+        _request: AttachIoRequest,
+        _deadline: std::time::Instant,
+    ) -> Result<AttachIo, fandhe_container_core::traits::TraitError> {
+        Err(fandhe_container_core::traits::TraitError::new(
+            fandhe_container_core::traits::ErrorCode::Unimplemented,
+            "attach io source is not available yet",
+        ))
+    }
+}
+
+/// 本番の Attach 用 fd 取得元。[`production_exec_pidfd_source`] と同じ到達先の規則で、`host_state_root()` の無い
+/// ストアには fail-closed の実装を返す（縮退しない。SEC-1・CORE-1）。
+#[cfg(target_os = "linux")]
+pub fn production_attach_io_source(
+    store: &dyn fandhe_container_core::traits::StateStore,
+) -> std::sync::Arc<dyn AttachIoSource> {
+    match store.host_state_root() {
+        Some(root) => std::sync::Arc::new(ControlAttach::new(root.to_path_buf())),
+        None => std::sync::Arc::new(UnavailableAttachIoSource),
+    }
+}
+
 /// 構造化ログを stderr に 1 行出す（値は固定語彙だけ。入力値・uid・パス・errno は載せない。REPAIR-4）。
 ///
 /// 待たない出力経路（`stderr_sink`）へ渡すだけで、キューが満杯なら捨てる（REPAIR-5）。
@@ -452,7 +572,10 @@ mod install {
                 return (running, failed_handle(e));
             }
         };
-        let slot = SignalSlot::with_stop_intent(stop.clone()).with_stdin_option(stdin);
+        // kind 9 の tap の購読先（捕捉ハブ）もスロットへ渡す。サーバの引数に通すより変更が小さい（#4075）。
+        let slot = SignalSlot::with_stop_intent(stop.clone())
+            .with_stdin_option(stdin)
+            .with_output_capture(running.logs.clone());
         let Running {
             process,
             relauncher,

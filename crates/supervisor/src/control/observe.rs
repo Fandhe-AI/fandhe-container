@@ -25,6 +25,9 @@ const OP_NAME: &str = "control_signal";
 /// 終了購読（ExitWatchRequest）の計測に使う操作名。signal 配送の集計と分ける（#3683・REPAIR-4）。
 const EXIT_WATCH_OP_NAME: &str = "control_exit_watch";
 
+/// Attach 要求（ExecHandover 同様 fd を返す 1 往復）の計測に使う操作名（#4075・REPAIR-4）。
+const ATTACH_OP_NAME: &str = "control_attach";
+
 /// 監査の記録先と計測の集計器を束ねた観測の口。サーバが共有で持つ。
 pub struct ControlObserver {
     audit: Option<Arc<dyn AuditSink>>,
@@ -99,6 +102,11 @@ impl ControlObserver {
     /// 購読の受理までで、購読の保持時間は含まない。
     pub fn record_exit_watch(&self, success: bool, elapsed: Duration) {
         self.record_op(EXIT_WATCH_OP_NAME, success, elapsed);
+    }
+
+    /// Attach 要求（kind 9）1 件の結果とレイテンシを集計する（#4075・REPAIR-4）。
+    pub fn record_attach(&self, success: bool, elapsed: Duration) {
+        self.record_op(ATTACH_OP_NAME, success, elapsed);
     }
 
     fn record_op(&self, op: &'static str, success: bool, elapsed: Duration) {

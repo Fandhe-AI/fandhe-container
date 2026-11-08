@@ -62,6 +62,7 @@ use fandhe_container_core::traits::{ErrorCode, Signal, TraitError};
 
 use super::protocol::{ControlReason, RequestKind};
 
+use crate::log_pipeline::CaptureHub;
 use crate::restart::{LateOrphan, Relauncher};
 use crate::run::{ExplicitStopRecord, StopToken};
 use crate::start_contract::StdinOption;
@@ -111,19 +112,16 @@ pub enum PidfdDup {}
 ///
 /// [`SlotState::Active`] の中にだけ置く（pidfd の複製と同じ形）。`Exited`・`Empty` への遷移と、再 launch の
 /// `register`（新しい世代による上書き）で必ず drop されるので、古い世代の fd が新しい世代に残らない・終了済みの
-/// コンテナの stdin を保持し続けない、が型の上で保証される。取り出しは [`SignalSlot::with_generation_io`]（C6 #4075 の
-/// attach の入口が使う）。Linux 以外は pty も stdin の pipe も無く、値を持たない型にする。
+/// コンテナの stdin を保持し続けない、が型の上で保証される。取り出しは [`SignalSlot::take_attach_input`]（kind 9 `AttachRequest` の
+/// サーバ側。C6 #4075）。Linux 以外は pty も stdin の pipe も無く、値を持たない型にする。
 #[cfg(target_os = "linux")]
 #[derive(Default)]
-// 理由: 読み手は C6 #4075 の attach の入口（`with_generation_io` 経由）。本 issue では保持と破棄の契約だけを実装し、
-// 試験が読む。
-#[allow(dead_code)]
 pub(crate) struct GenerationIo {
     /// 非 tty で `--stdin` を指定したときの init の stdin の書き込み端。
     pub(crate) stdin: Option<ContainerStdin>,
     /// tty のときの pty の master の複製（捕捉用の読み取り側とは別の fd。close-on-exec）。
     pub(crate) master: Option<PtyMaster>,
-    /// `stdin_once` の stdin を attach が既に消費したか（世代ごとに初期化する。C6 #4075 が書き、本 issue は書かない）。
+    /// `stdin_once` の stdin を attach が既に消費したか（世代ごとに初期化する。[`SignalSlot::take_attach_input`] が書く）。
     pub(crate) stdin_consumed: bool,
 }
 
@@ -159,6 +157,132 @@ struct SlotInner {
     exit_watchers: Vec<ExitWatcher>,
     /// コンテナ単位の `--stdin` の指定（世代をまたいで保つ。`with_stdin_option`。#4074）。
     stdin_option: Option<StdinOption>,
+    /// コンテナ単位の出力の捕捉ハブ（kind 9 の tap の購読先。`with_output_capture`。#4075）。
+    output: Option<Arc<CaptureHub>>,
+}
+
+/// Attach の入力として取り出した fd の持ち主（#4075）。送信に成功したら drop する（= 所有の移転）。
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub(crate) enum TakenInput {
+    /// 複製（`--stdin open` の書き込み端・tty の master）。スロットは元を持ち続ける。
+    Dup(std::os::fd::OwnedFd),
+    /// `stdin_once` の元の端（スロットからは外してある）。送れなかったら [`SignalSlot::restore_stdin_once`] で戻す。
+    Once(ContainerStdin),
+}
+
+#[cfg(target_os = "linux")]
+impl std::os::fd::AsFd for TakenInput {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        match self {
+            Self::Dup(fd) => fd.as_fd(),
+            Self::Once(stdin) => stdin.as_fd(),
+        }
+    }
+}
+
+/// [`SignalSlot::take_attach_input`] の結果（#4075）。
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub(crate) struct AttachTaken {
+    /// 取り出した時点の世代（`stdin_once` の巻き戻しが同じ世代にだけ効くように持ち回る）。
+    pub(crate) generation: u64,
+    /// 入力の fd。要求が入力を求めなかったときは `None`。
+    pub(crate) input: Option<TakenInput>,
+}
+
+/// [`SignalSlot::take_attach_input`] / [`SignalSlot::check_attach`] の本体（ロックを持った状態で呼ぶ）。
+#[cfg(target_os = "linux")]
+fn attach_locked(
+    inner: &mut SlotInner,
+    pid: NonZeroU32,
+    tty: bool,
+    wants_stdin: bool,
+    commit: bool,
+) -> Result<AttachTaken, ControlReason> {
+    let stdin_option = inner.stdin_option;
+    let (generation, io) = match &mut inner.state {
+        SlotState::Empty => return Err(ControlReason::NoHandle),
+        SlotState::Exited { pid: held, .. } => {
+            return Err(if *held == pid {
+                ControlReason::ContainerExited
+            } else {
+                ControlReason::PidMismatch
+            });
+        }
+        SlotState::Active {
+            generation,
+            pid: held,
+            io,
+            ..
+        } => {
+            if *held != pid {
+                return Err(ControlReason::PidMismatch);
+            }
+            (*generation, io)
+        }
+    };
+    let none = |generation| AttachTaken {
+        generation,
+        input: None,
+    };
+    if tty {
+        if io.master.is_none() {
+            return Err(if io.stdin.is_some() {
+                ControlReason::TtyMismatch
+            } else {
+                ControlReason::NoHandle
+            });
+        }
+    } else if io.master.is_some() {
+        return Err(ControlReason::TtyMismatch);
+    }
+    if !wants_stdin {
+        return Ok(none(generation));
+    }
+    if tty {
+        if !commit {
+            return Ok(none(generation));
+        }
+        let Some(master) = io.master.as_ref() else {
+            return Err(ControlReason::NoHandle);
+        };
+        let dup = master
+            .as_fd()
+            .try_clone_to_owned()
+            .map_err(|_| ControlReason::Internal)?;
+        return Ok(AttachTaken {
+            generation,
+            input: Some(TakenInput::Dup(dup)),
+        });
+    }
+    match stdin_option {
+        None => return Err(ControlReason::StdinNotOpen),
+        Some(StdinOption::Once) if io.stdin_consumed => return Err(ControlReason::StdinClosed),
+        Some(_) => {}
+    }
+    if io.stdin.is_none() {
+        return Err(ControlReason::NoHandle);
+    }
+    if !commit {
+        return Ok(none(generation));
+    }
+    let input = match stdin_option {
+        Some(StdinOption::Once) => {
+            let stdin = io.stdin.take().ok_or(ControlReason::NoHandle)?;
+            io.stdin_consumed = true;
+            TakenInput::Once(stdin)
+        }
+        _ => {
+            let stdin = io.stdin.as_ref().ok_or(ControlReason::NoHandle)?;
+            let dup = stdin.try_clone().map_err(|_| ControlReason::Internal)?;
+            TakenInput::Dup(dup.into_owned_fd())
+        }
+    };
+    Ok(AttachTaken {
+        generation,
+        input: Some(input),
+    })
 }
 
 /// サーバと監視スレッドが共有する、起動ハンドルの有無・世代の状態。
@@ -189,6 +313,7 @@ impl SignalSlot {
             stop_intent,
             exit_watchers: Vec::new(),
             stdin_option: None,
+            output: None,
         })))
     }
 
@@ -200,8 +325,25 @@ impl SignalSlot {
         self
     }
 
-    /// 設定された `--stdin` の指定。C6 #4075 の attach の入口が使う（それまでは試験だけ）。
-    #[allow(dead_code)]
+    /// コンテナの出力の捕捉ハブを設定する（`install_with_exec_reclaimer` が `Running.logs` から渡す。#4075）。
+    /// kind 9 の tap の購読先で、世代交代をまたいで保たれる（ハブ側が世代ごとの捕捉を持つ）。ハンドラはロックの下で
+    /// `Arc` を複製するだけで、購読はロックの外で行う（スロットのロックの下でハブのロックを取らない）。サーバの
+    /// 引数に通さないのは、`spawn*` 系 4 つと `PausableInner` の全てを変えることになり、スロットはもともと
+    /// pause / resume をまたいで共有されているため。
+    #[must_use]
+    pub fn with_output_capture(self, hub: Option<Arc<CaptureHub>>) -> Self {
+        self.lock().output = hub;
+        self
+    }
+
+    /// 設定された出力の捕捉ハブ（`Arc` の複製）。
+    #[cfg(target_os = "linux")]
+    pub(crate) fn output_capture(&self) -> Option<Arc<CaptureHub>> {
+        self.lock().output.clone()
+    }
+
+    /// 設定された `--stdin` の指定（試験用）。
+    #[cfg(test)]
     pub(crate) fn stdin_option(&self) -> Option<StdinOption> {
         self.lock().stdin_option
     }
@@ -209,9 +351,9 @@ impl SignalSlot {
     /// `Active` で記録 pid が `pid` と一致するときだけ、現世代の入出力へ `f` を適用する（スロットのロックの下。
     /// `f` では待たない・I/O をしないこと）。それ以外は既存の呼び出しと同じ理由コードで断る（`Empty`: `NoHandle`、
     /// `Exited`: pid 一致なら `ContainerExited`・不一致なら `PidMismatch`、`Active` で pid 不一致: `PidMismatch`）。
-    /// 世代交代後の古い入出力は `Active` の入れ替えで落ちており、渡らない。C6 #4075 の attach の入口が使う。
-    #[cfg(target_os = "linux")]
-    #[allow(dead_code)]
+    /// 世代交代後の古い入出力は `Active` の入れ替えで落ちており、渡らない（試験用。本番の取り出しは
+    /// [`Self::take_attach_input`]）。
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn with_generation_io<R>(
         &self,
         pid: NonZeroU32,
@@ -231,6 +373,58 @@ impl SignalSlot {
                 }
                 Ok(f(io))
             }
+        }
+    }
+
+    /// Attach の事前の照合（何も取り出さない）。[`Self::take_attach_input`] と同じ判定を `commit = false` で行う。
+    #[cfg(target_os = "linux")]
+    pub(crate) fn check_attach(
+        &self,
+        pid: NonZeroU32,
+        tty: bool,
+        wants_stdin: bool,
+    ) -> Result<(), ControlReason> {
+        let mut inner = self.lock();
+        attach_locked(&mut inner, pid, tty, wants_stdin, false).map(|_| ())
+    }
+
+    /// Attach の入力 fd を、スロットのロックの下で取り出す（kind 9。SUP-4・SUP-7・SEC-1・#4075）。
+    ///
+    /// 判定（`Active` で pid 一致・入出力の構成との照合）は [`ControlReason`] で断る。
+    /// - 要求 `tty` が偽でコンテナが pty: `TtyMismatch`。真でコンテナに master が無い: stdin の端があれば
+    ///   `TtyMismatch`、無ければ `NoHandle`（master の複製に失敗した tty のコンテナと `--stdin` の無い非 tty は
+    ///   区別できず、どちらも拒否する安全側。tty の正式な照合は cri の D7〔C10〕が担う）。
+    /// - 非 tty で入力を求める: `--stdin` が無ければ `StdinNotOpen`、`Once` で消費済みなら `StdinClosed`、
+    ///   端が無ければ `NoHandle`。
+    ///
+    /// 取り出し: tty は master の複製（消費済みにしない。D5: tty の `stdin_once` は閉じない）、非 tty の `Open` は
+    /// 書き込み端の複製、`Once` は元の端そのもの（`stdin_consumed = true`。受け手が唯一の書き込み端を持つ）。
+    /// 複製は `fcntl(F_DUPFD_CLOEXEC)` だけで待たず、ロックの下の契約（待たない・I/O をしない）の範囲に収まる。
+    #[cfg(target_os = "linux")]
+    pub(crate) fn take_attach_input(
+        &self,
+        pid: NonZeroU32,
+        tty: bool,
+        wants_stdin: bool,
+    ) -> Result<AttachTaken, ControlReason> {
+        let mut inner = self.lock();
+        attach_locked(&mut inner, pid, tty, wants_stdin, true)
+    }
+
+    /// 送れなかった `stdin_once` の端をスロットへ戻し、消費済みを取り消す。同じ世代がまだ `Active` で `stdin` が空の
+    /// ときだけ戻る（世代が変わっていたり `Exited` なら drop が正しい）。戻さないと、失敗した attach がコンテナの
+    /// stdin を閉じてしまう（#4075）。
+    #[cfg(target_os = "linux")]
+    pub(crate) fn restore_stdin_once(&self, generation: u64, stdin: ContainerStdin) {
+        let mut inner = self.lock();
+        if let SlotState::Active {
+            generation: g, io, ..
+        } = &mut inner.state
+            && *g == generation
+            && io.stdin.is_none()
+        {
+            io.stdin = Some(stdin);
+            io.stdin_consumed = false;
         }
     }
 
@@ -1839,5 +2033,171 @@ mod tests {
         let _cp2 = ControlledProcess::new(Box::new(fake2), slot.clone());
         assert_eq!(slot.stdin_option(), Some(StdinOption::Once));
         assert_eq!(SignalSlot::new().stdin_option(), None);
+    }
+
+    /// 取り出した入力の端へ書いたバイト列が、読み取り側へ届く（具体値）。
+    #[cfg(target_os = "linux")]
+    fn write_via(input: &TakenInput, bytes: &[u8]) {
+        use std::io::Write;
+        let fd = std::os::fd::AsFd::as_fd(input)
+            .try_clone_to_owned()
+            .unwrap();
+        let mut f = std::fs::File::from(fd);
+        f.write_all(bytes).unwrap();
+    }
+
+    /// SUP-4・SUP-7・SEC-1・#4075: `--stdin open` は毎回複製を返し、スロットは元の端を持ち続ける。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sup4_sup7_4075_attach_open_returns_dup_each_time() {
+        let slot = SignalSlot::new().with_stdin_option(Some(StdinOption::Open));
+        let (g, mut r, _) = gen_fake(100);
+        let _cp = ControlledProcess::new(Box::new(g), slot.clone());
+        for text in [&b"a"[..], b"b"] {
+            let taken = slot.take_attach_input(pid(100), false, true).unwrap();
+            let input = taken.input.unwrap();
+            assert!(matches!(input, TakenInput::Dup(_)));
+            write_via(&input, text);
+            drop(input);
+            assert_eq!(read_some(&mut r), text);
+        }
+        slot.with_generation_io(pid(100), |io| {
+            assert!(io.stdin.is_some());
+            assert!(!io.stdin_consumed);
+        })
+        .unwrap();
+    }
+
+    /// SUP-4・SUP-7・SEC-1・#4075: `--stdin once` は 1 回目で元の端を渡し、2 回目は `StdinClosed`。
+    /// 受け手が端を閉じるとコンテナ側が EOF になる（スロットは端を持たない）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sup4_sup7_4075_attach_once_moves_ownership() {
+        let slot = SignalSlot::new().with_stdin_option(Some(StdinOption::Once));
+        let (g, mut r, _) = gen_fake(100);
+        let _cp = ControlledProcess::new(Box::new(g), slot.clone());
+        let taken = slot.take_attach_input(pid(100), false, true).unwrap();
+        let input = taken.input.unwrap();
+        assert!(matches!(input, TakenInput::Once(_)));
+        slot.with_generation_io(pid(100), |io| {
+            assert!(io.stdin.is_none());
+            assert!(io.stdin_consumed);
+        })
+        .unwrap();
+        write_via(&input, b"x");
+        assert_eq!(read_some(&mut r), b"x");
+        assert_eq!(
+            slot.take_attach_input(pid(100), false, true).unwrap_err(),
+            ControlReason::StdinClosed
+        );
+        assert_eq!(
+            slot.check_attach(pid(100), false, true).unwrap_err(),
+            ControlReason::StdinClosed
+        );
+        // 受け手が閉じると唯一の書き込み端が無くなり、読み取り側は EOF。
+        drop(input);
+        assert_eq!(read_some(&mut r), b"");
+    }
+
+    /// SUP-4・SUP-7・#4075: `--stdin` が無ければ入力は `StdinNotOpen`。出力だけの要求は通る。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sup4_sup7_4075_attach_without_stdin_option() {
+        let slot = SignalSlot::new();
+        let (g, _r, _) = gen_fake(100);
+        let _cp = ControlledProcess::new(Box::new(g), slot.clone());
+        assert_eq!(
+            slot.take_attach_input(pid(100), false, true).unwrap_err(),
+            ControlReason::StdinNotOpen
+        );
+        let taken = slot.take_attach_input(pid(100), false, false).unwrap();
+        assert!(taken.input.is_none());
+    }
+
+    /// SUP-4・SEC-1・#4075: 状態と pid の照合（`Empty`・pid 不一致・`Exited`）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sup4_sec1_4075_attach_state_checks() {
+        let slot = SignalSlot::new().with_stdin_option(Some(StdinOption::Open));
+        assert_eq!(
+            slot.check_attach(pid(100), false, true).unwrap_err(),
+            ControlReason::NoHandle
+        );
+        let (g, _r, exited) = gen_fake(100);
+        let cp = ControlledProcess::new(Box::new(g), slot.clone());
+        assert_eq!(
+            slot.check_attach(pid(101), false, true).unwrap_err(),
+            ControlReason::PidMismatch
+        );
+        exited.store(true, Ordering::SeqCst);
+        let _ = cp.wait(Duration::from_millis(1));
+        assert_eq!(
+            slot.take_attach_input(pid(100), false, true).unwrap_err(),
+            ControlReason::ContainerExited
+        );
+    }
+
+    /// SUP-4・SEC-1・#4075: 要求の tty と構成の不一致。非 tty のコンテナへ tty 要求は `TtyMismatch`（stdin があるため）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sup4_sec1_4075_attach_tty_mismatch() {
+        let slot = SignalSlot::new().with_stdin_option(Some(StdinOption::Open));
+        let (g, _r, _) = gen_fake(100);
+        let _cp = ControlledProcess::new(Box::new(g), slot.clone());
+        assert_eq!(
+            slot.check_attach(pid(100), true, true).unwrap_err(),
+            ControlReason::TtyMismatch
+        );
+    }
+
+    /// SUP-4・SUP-7・#4075: `restore_stdin_once` は同じ世代でだけ端を戻し、消費済みを取り消す。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sup4_sup7_4075_restore_stdin_once_same_generation_only() {
+        let slot = SignalSlot::new().with_stdin_option(Some(StdinOption::Once));
+        let (g, mut r, _) = gen_fake(100);
+        let _cp = ControlledProcess::new(Box::new(g), slot.clone());
+        let taken = slot.take_attach_input(pid(100), false, true).unwrap();
+        let Some(TakenInput::Once(stdin)) = taken.input else {
+            panic!("expected Once");
+        };
+        slot.restore_stdin_once(taken.generation, stdin);
+        slot.with_generation_io(pid(100), |io| {
+            assert!(io.stdin.is_some());
+            assert!(!io.stdin_consumed);
+        })
+        .unwrap();
+        // 戻した後は再び取り出せる。
+        let again = slot.take_attach_input(pid(100), false, true).unwrap();
+        let Some(TakenInput::Once(stdin)) = again.input else {
+            panic!("expected Once");
+        };
+        // 世代が変わった後は戻らない（drop で閉じる = コンテナ側の旧世代の端は EOF）。
+        let (g2, _r2, _) = gen_fake(200);
+        let _cp2 = ControlledProcess::new(Box::new(g2), slot.clone());
+        slot.restore_stdin_once(again.generation, stdin);
+        slot.with_generation_io(pid(200), |io| {
+            assert!(io.stdin.is_some());
+            assert!(!io.stdin_consumed);
+        })
+        .unwrap();
+        assert_eq!(read_some(&mut r), b"");
+    }
+
+    /// SUP-7・CRI-6・#4075: 再 launch すると `stdin_consumed` が世代ごとに初期化される。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sup7_cri6_4075_stdin_consumed_resets_per_generation() {
+        let slot = SignalSlot::new().with_stdin_option(Some(StdinOption::Once));
+        let (g1, _r1, _) = gen_fake(100);
+        let _cp1 = ControlledProcess::new(Box::new(g1), slot.clone());
+        slot.take_attach_input(pid(100), false, true).unwrap();
+        assert_eq!(
+            slot.check_attach(pid(100), false, true).unwrap_err(),
+            ControlReason::StdinClosed
+        );
+        let (g2, _r2, _) = gen_fake(200);
+        let _cp2 = ControlledProcess::new(Box::new(g2), slot.clone());
+        slot.check_attach(pid(200), false, true).unwrap();
     }
 }

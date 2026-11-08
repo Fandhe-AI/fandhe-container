@@ -273,6 +273,8 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 - kind 9 の `AttachRequest` を足す。固定長で、payload は期待する pid（u32）・要求のマスク（stdin・stdout・stderr）・tty の期待値・予算（ms）の 4 つに限り、64 バイト以内に収める。既存 frame と同じく big-endian で、壊れた値を表現できない型にする（REPAIR-2）。`VERSION` は上げない。古い supervisor は未知の kind を `Malformed` で拒否するので安全に失敗し、plugin-cri は `UNAVAILABLE` 相当として扱い縮退しない
 - 応答は 1 回だけ: `Response(Ok)` と、マスクに対応する fd を SCM_RIGHTS で最大 3 本。非 tty は stdin の書き込み端・stdout の tap・stderr の tap、tty は master の複製・stdout の tap。送信は #3759 の複数 fd 送信を使う。拒否のときは fd を添えない
 - `ControlReason` に `StdinNotOpen`（作成時に stdin を開いていない）・`TtyMismatch`・`StdinClosed`（`stdin_once` で消費済み）を足す。値の割り当ては子 issue で確定する
+- （C6〔#4075〕で実装済み）payload は pid（u32）・mask（u8。bit0 = stdin・bit1 = stdout・bit2 = stderr）・tty（u8）・期限（u64）の 14 バイトで、全長 22 バイト。**予算（ms）は絶対期限（`CLOCK_MONOTONIC` の ns）に替えた**: 既存の frame はすべて絶対期限を載せており、相対値にすると受信の遅れの分だけ送信期限が延びて protocol.rs 冒頭の REPAIR-5 の根拠に反するため。サーバは残りが `ATTACH_ROUND_TRIP_BUDGET`（5 秒）を超える要求を `Malformed` で断り、クライアントは接続・Hello・要求・応答のすべてを呼び出し側の期限と 5 秒の早い方で打ち切る。tty = 1 と stderr の併用は `Malformed`。fd の並びは「入力 → stdout の tap → stderr の tap」のうち mask で指定したものだけ。`ControlReason` は `StdinNotOpen` = 15・`TtyMismatch` = 16・`StdinClosed` = 17。クライアントは `Malformed`・`TooLarge`・`UnsupportedVersion` を `Unavailable`（"the supervisor does not support attach"）として扱い、fd を受け取らない。受け取る側の境界（本数・`truncated`・種別。stdin は FIFO か socket、tap は socket、master は`PtyMaster::from_received`）は `ControlAttach` が検証し、1 つでも違えば全 fd を閉じて `Internal` を返す
+- サーバの手順: 事前の照合（何も取り出さない）→ tap の購読（ロックの外。ハブは `SignalSlot::with_output_capture` で渡す）→ 確定（ロックの下で再照合して取り出す）→ 期限の確認 → 送信。tty の判定は、要求 tty が偽で master がある → `TtyMismatch`、真で master が無い → stdin の端があれば `TtyMismatch`・無ければ `NoHandle`。master の複製に失敗した tty のコンテナと `--stdin` の無い非 tty は区別できず、どちらも拒否する安全側で、tty の正式な照合は D7（C10）が担う
 - 単一スレッド制約との関係: 要求は accept ループの中で 1 往復で終わり接続を保持しない（exec のガードとは違う）。このため `PausableServer::pause` に新しい参加者が増えず、supervisor にセッション用のスレッドも残らない。supervisor が持つのは世代ごとの fd だけである。このため [restart-relaunch-single-thread.md](restart-relaunch-single-thread.md) の表に行は足さない。常駐 listener（A2）を採らない理由は比較表のとおり
 
 **D2. 出力は捕捉からの tap（A1 の「ログの follow」を改める）**
@@ -302,6 +304,7 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 
 - 非 tty で `stdin_once` のとき、最初に stdin を要求した attach へ複製ではなく元の書き込み端を渡し、supervisor は自分の端を閉じる（所有の移転）。セッションの stdin が終端になると plugin-cri が drop し、コンテナは EOF を受ける。その後の stdin の要求は `StdinClosed` で断る
 - tty の `stdin_once` は閉じない。containerd の `container_io.go` の `Attach` は `StdinOnce && !Tty` のときだけ stdin を閉じ、コードの上のコメントは tty も閉じると読めるが挙動はコードに従っているため、本設計もコードに従う
+- （C6〔#4075〕で実装済み）`Once` の元の端は、送信に成功したら supervisor が drop する。**送れなかったときは、同じ世代がまだ `Active` で`stdin` が空のときだけ端をスロットへ戻し、消費済みを取り消す**（戻さないと失敗した attach がコンテナの stdin を閉じてしまう）。fd がカーネルに受理された後の失敗は戻さない（端は相手にある）。残る問題: `sendmsg` が成功した直後にクライアントが期限切れで接続を閉じると、`Once` の端は渡った後にカーネルが閉じ、コンテナは EOF を受ける。絶対期限とクライアントの余裕で窓を小さくするが、なくせない
 - `stdin_once` でないときは毎回複製を渡し、supervisor が自分の端を持ち続けるのでセッションが終わってもコンテナは EOF を受けない。再 launch で世代が変わると新しい pipe を作り、消費済みの状態も初期化する
 
 **D6. resize・終了・複数の attach**
@@ -344,7 +347,7 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 | C3 | #4071 | core: slave を `/dev/console` へ bind（実装済み。割り当てと bind は bind の特権要件から pivot 後・ステージ列の前。D3 の補足） | C2 |
 | C4 | #4074 | supervisor: stdin 端・master の保持、tty 捕捉、`--stdin`（実装済み: `attach_io::AttachIoProcess`・`SlotState::Active` の `GenerationIo`・`SignalSlot::with_stdin_option` / `with_generation_io`・argv `--stdin <open\|once>`。kind 9 は C6） | C1・C2 |
 | C5 | #4072 | supervisor: 捕捉からの出力の tap（実装済み。sink 優先・背圧なし・溢れたら切断・購読者数の上限 8 は初期案。購読 API は `CaptureHub::subscribe_output`、kind 9 での受け渡しは C6） | なし |
-| C6 | #4075 | supervisor: kind 9 `AttachRequest` と fd 応答 | C4・C5・#3759 |
+| C6 | #4075 | supervisor: kind 9 `AttachRequest` と fd 応答（実装済み: `control::protocol` の `AttachRequestFrame`・`control::server` の `handle_attach`・クライアント入口 `AttachIoSource` / `ControlAttach`。結線は C9） | C4・C5・#3759 |
 | C7 | #4073 | core: `StartRequest` の `StdinMode`（実装済み。`StartRequest::with_stdin` / `stdin`、既定 `Closed`。値の参照は C4・C8） | なし |
 | C8 | #4076 | cri: 記録への保存と StartContainer での運搬 | C7・C4 |
 | C9 | #4077 | plugin-cri: 完全版 `AttachBackend` | C6・C8・#3763・#3754・#3761 |

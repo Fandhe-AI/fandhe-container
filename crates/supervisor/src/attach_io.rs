@@ -20,7 +20,7 @@
 //! - tty（`take_pty_master` が `Some`）: 元の master を [`PtyOutputReader`] に包んで `ContainerOutput.stdout` の 1 本として返し
 //!   （`stderr` は `None`。tty は stdout と stderr が混ざる）、`as_fd().try_clone_to_owned()`（`F_DUPFD_CLOEXEC`）の複製を
 //!   `PtyMaster::from_received` で検証し直して `take_pty_master` で返す。複製できなければログの捕捉を優先し、attach の口だけを
-//!   閉じる（C6 は `NoHandle`）。core の stdout / stderr の pipe は取り出して閉じる（init が pty の slave で fd 1 / 2 を置き換えた後で、
+//!   閉じる（kind 9 は `NoHandle`。#4075）。core の stdout / stderr の pipe は取り出して閉じる（init が pty の slave で fd 1 / 2 を置き換えた後で、
 //!   `launch` は master を受け取ってから戻るため、書き込み端は誰にも残らない。core の `attach_launch_pty` を参照）
 //! - 非 tty: `take_output` は内側へ転送し、`take_stdin` は構築時に取り出して保持した書き込み端を 1 回だけ返す
 //! - fail-closed（D8。要求より弱いコンテナを動かさない）: 端末を期待したのに master が届かない、stdin を期待した非 tty で書き込み端が
@@ -133,7 +133,7 @@ impl AttachIoProcess {
         let dup = match dup {
             Ok(m) => Some(m),
             Err(()) => {
-                // ログの捕捉を優先し、attach の口だけを閉じる（C6 は `NoHandle` を返す）。
+                // ログの捕捉を優先し、attach の口だけを閉じる（kind 9 は `NoHandle` を返す。#4075）。
                 crate::control::log_control_event("pty_master_dup_failed", Some("clone_failed"));
                 None
             }

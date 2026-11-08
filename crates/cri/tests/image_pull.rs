@@ -220,6 +220,9 @@ struct FakeClient {
     /// 指定すると `(キャッシュの blobs/sha256, おとりのディレクトリ)`。取得中に `blobs/sha256` を別名へ移し、同名で
     /// おとりへの symlink を置く（リース済み blob の途中要素の差し替えの模擬。#4179）。
     swap_blob_dir_on_fetch: Option<(PathBuf, PathBuf)>,
+    /// 指定すると `(キャッシュの staging ディレクトリ, おとりのディレクトリ)`。layer2 の取得中に pull ディレクトリ
+    /// （staging 直下の唯一のエントリ）を別名へ移し、同名でおとりへの symlink を置く（展開前の差し替えの模擬。#4180）。
+    swap_pull_dir_on_fetch: Option<(PathBuf, PathBuf)>,
     /// 指定すると、最初の取得だけ本文の一部を書いてから PermissionDenied を返す（部分書きの後の再認証・再試行の模擬）。
     partial_then_denied: AtomicUsize,
     /// 指定すると、最初の blob 取得でこの旗を立てる（取得中に RPC が取り消された模擬。#2967）。
@@ -243,6 +246,7 @@ impl FakeClient {
             auth_calls: AtomicUsize::new(0),
             staged_symlink_target: None,
             swap_blob_dir_on_fetch: None,
+            swap_pull_dir_on_fetch: None,
             partial_then_denied: AtomicUsize::new(0),
             cancel_on_fetch: None,
         }
@@ -348,6 +352,19 @@ impl RegistryPullClient for FakeClient {
                 .map_err(|_| OciError::new(OciErrorCode::Internal, "swap rename"))?;
             std::os::unix::fs::symlink(decoy, blob_dir)
                 .map_err(|_| OciError::new(OciErrorCode::Internal, "swap symlink"))?;
+        }
+        if let Some((staging, decoy)) = &self.swap_pull_dir_on_fetch
+            && hex == SHA_LAYER2
+        {
+            for entry in fs::read_dir(staging).expect("staging").flatten() {
+                let path = entry.path();
+                let mut moved = path.clone().into_os_string();
+                moved.push("-moved");
+                fs::rename(&path, &moved)
+                    .map_err(|_| OciError::new(OciErrorCode::Internal, "swap rename"))?;
+                std::os::unix::fs::symlink(decoy, &path)
+                    .map_err(|_| OciError::new(OciErrorCode::Internal, "swap symlink"))?;
+            }
         }
         write(dest, &body)
     }
@@ -2167,4 +2184,39 @@ fn oci7_sec1_pull_rejects_leased_config_after_blob_dir_swapped_to_symlink() {
         blob_body(SHA_CONFIG)
     );
     assert!(staging_is_empty(&dir));
+}
+
+/// OCI-7・SEC-1・CRI-3（#4180）: layer2 の取得中に pull ディレクトリ（`staging/<id>`）がおとりへの symlink に差し替わっても、
+/// `unpack/` の作成・展開は pull ディレクトリの fd 起点で検査済みの実体へ向かい、おとりには何も書かれない。差し替えは
+/// 展開の前の照合（`check_staging_dir_current`）で固定のエラーとして拒否され、pull は失敗する。
+///
+/// この試験は事前の照合があるため、旧実装（パス起点）でも通る。fd 起点であること自体の識別力は oci の
+/// `oci7_sec1_unpack_dir_after_pull_dir_swap_extracts_into_verified_dir` が担う。Linux x86_64 / aarch64 だけで照合する。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[test]
+fn oci7_sec1_pull_rejects_swapped_pull_dir_and_decoy_stays_empty() {
+    let dir = TempDir::new("pulldirswap");
+    let decoy = dir.0.join("decoy-staging");
+    fs::create_dir(&decoy).expect("decoy dir");
+    let mut client = FakeClient::new(two_layer_manifest());
+    client.swap_pull_dir_on_fetch = Some((dir.0.join("cache").join("staging"), decoy.clone()));
+    let client = Arc::new(client);
+    let err = OciImagePuller::new(client.clone(), config(&dir))
+        .pull(&req("alpine:3.20"))
+        .expect_err("rejected");
+    assert_eq!(err.code(), OciErrorCode::Internal);
+    assert_eq!(err.message(), "image store operation failed");
+    assert_eq!(client.blob_fetches.load(Ordering::SeqCst), 3);
+    // おとりには展開物も `unpack/` も作られていない。
+    assert_eq!(fs::read_dir(&decoy).expect("decoy").count(), 0);
+    // 公開先 `rootfs/sha256` に何も公開されていない。
+    let published = dir.0.join("cache").join("rootfs").join("sha256");
+    assert!(
+        fs::read_dir(&published)
+            .map(|mut it| it.next().is_none())
+            .unwrap_or(true)
+    );
 }

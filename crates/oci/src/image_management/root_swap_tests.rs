@@ -846,3 +846,141 @@ fn oci7_sec1_leased_blob_entry_swapped_to_symlink_is_rejected() {
     let _ = fs::remove_dir_all(&root);
     let _ = fs::remove_dir_all(&outside);
 }
+/// 1 エントリ（`hello.txt` = `payload`）の非圧縮 tar blob を `dir` に書き、検証済みハンドルと diff_id を返す。
+fn one_file_layer(dir: &Path, payload: &[u8]) -> (crate::layer::VerifiedLayerBlob, Digest) {
+    use std::os::unix::fs::MetadataExt as _;
+    let mut b = tar::Builder::new(Vec::new());
+    let mut h = tar::Header::new_gnu();
+    h.set_size(payload.len() as u64);
+    h.set_mode(0o644);
+    h.set_entry_type(tar::EntryType::Regular);
+    h.set_cksum();
+    b.append_data(&mut h, "hello.txt", payload).expect("append");
+    let bytes = b.into_inner().expect("tar");
+    let digest = sha_of(&bytes);
+    let path = dir.join("layer.tar");
+    fs::write(&path, &bytes).expect("write layer");
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod layer");
+    }
+    let meta = fs::metadata(&path).expect("meta");
+    let blob = crate::layer::VerifiedLayerBlob::from_file(
+        fs::File::open(&path).expect("open layer"),
+        &digest,
+        meta.len(),
+        meta.uid(),
+    )
+    .expect("verified layer");
+    (blob, digest)
+}
+
+/// OCI-7・SEC-1・CRI-3・#4180: `unpack/` の作成・展開・後始末は pull ディレクトリの fd 起点で行う。展開の前に
+/// `staging/p1` を別名へ移して同名のおとり（空）を置いても、展開物は移動先（検査済みの実体）の
+/// `unpack/entry/rootfs/` にだけ書かれ、おとりは空のまま。`check_staging_dir_current` は差し替えを `Internal` で
+/// 検出し、`remove_unpack_dir` も検査済みの実体の `unpack/` だけを消す（パス起点の実装ならおとりへ書く）。
+#[test]
+fn oci7_sec1_unpack_dir_after_pull_dir_swap_extracts_into_verified_dir() {
+    use crate::layer::extract::{
+        ExtractBudget, ExtractLimits, ExtractOptions, ImageLayer, extract_image_layers_bounded_in,
+    };
+    let root = temp_root("unpack-swap");
+    let store = open_store(&root);
+    let s = store.begin_pull(pid("p1")).expect("begin");
+    let staging = root.join("staging");
+    let (blob, diff_id) = one_file_layer(&root, b"payload-bytes");
+
+    // 差し替え: 保持している fd の実体は `p1-moved`、パスの `p1` はおとり。
+    fs::rename(staging.join("p1"), staging.join("p1-moved")).expect("move pull dir");
+    fs::create_dir(staging.join("p1")).expect("decoy");
+
+    let unpack = s.create_unpack_dir().expect("unpack");
+    let entry = unpack.create_subdir("entry").expect("entry");
+    let rootfs = entry.create_subdir("rootfs").expect("rootfs");
+    let extract_root = rootfs.extract_root().expect("extract root");
+    let media_type = "application/vnd.oci.image.layer.v1.tar";
+    extract_image_layers_bounded_in(
+        &crate::instrument::NoopOciOpRecorder,
+        &[ImageLayer::new(&blob, media_type, &diff_id)],
+        &extract_root,
+        1 << 20,
+        ExtractLimits::default(),
+        &ExtractOptions::new(),
+        &ExtractBudget::new(),
+    )
+    .expect("extract");
+
+    // おとりは空のまま、実体（移動先）に展開物がある。
+    assert_eq!(names(&staging.join("p1")), Vec::<String>::new());
+    let moved_rootfs = staging
+        .join("p1-moved")
+        .join("unpack")
+        .join("entry")
+        .join("rootfs");
+    assert_eq!(
+        fs::read(moved_rootfs.join("hello.txt")).expect("extracted"),
+        b"payload-bytes"
+    );
+
+    let e = s.check_staging_dir_current().unwrap_err();
+    assert_eq!(e.code(), OciErrorCode::Internal);
+    assert_eq!(e.message(), "image store root changed after open");
+
+    // 2 回目の作成は既存として拒否される。
+    let again = s.create_unpack_dir().unwrap_err();
+    assert_eq!(again.code(), OciErrorCode::FailedPrecondition);
+    assert_eq!(again.message(), "failed to create the unpack directory");
+
+    // 後始末も実体の `unpack/` だけを消し、おとりに触れない。
+    s.remove_unpack_dir().expect("remove");
+    assert!(!staging.join("p1-moved").join("unpack").exists());
+    assert_eq!(names(&staging.join("p1")), Vec::<String>::new());
+    drop(s);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// OCI-7・SEC-1・#4180: レイヤー 0 のイメージ（空の rootfs）も fd の根で受けられ、公開（`rename_child_into`）が
+/// 宛先ディレクトリへ届く。
+#[test]
+fn oci7_sec1_unpack_dir_zero_layers_and_publish_rename() {
+    use crate::layer::extract::{
+        ExtractBudget, ExtractLimits, ExtractOptions, extract_image_layers_bounded_in,
+    };
+    let root = temp_root("unpack-zero");
+    let store = open_store(&root);
+    let s = store.begin_pull(pid("p1")).expect("begin");
+    let unpack = s.create_unpack_dir().expect("unpack");
+    let entry = unpack.create_subdir("entry").expect("entry");
+    let rootfs = entry.create_subdir("rootfs").expect("rootfs");
+    let extract_root = rootfs.extract_root().expect("extract root");
+    assert!(
+        extract_image_layers_bounded_in(
+            &crate::instrument::NoopOciOpRecorder,
+            &[],
+            &extract_root,
+            1 << 20,
+            ExtractLimits::default(),
+            &ExtractOptions::new(),
+            &ExtractBudget::new(),
+        )
+        .expect("zero layers")
+        .is_empty()
+    );
+    let dest = root.join("dest");
+    fs::create_dir(&dest).expect("dest");
+    unpack
+        .rename_child_into("entry", &dest, "abc")
+        .expect("publish");
+    assert!(dest.join("abc").join("rootfs").is_dir());
+    assert!(
+        !root
+            .join("staging")
+            .join("p1")
+            .join("unpack")
+            .join("entry")
+            .exists()
+    );
+    s.remove_unpack_dir().expect("remove");
+    drop(s);
+    let _ = fs::remove_dir_all(&root);
+}

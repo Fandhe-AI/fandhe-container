@@ -46,7 +46,7 @@ use std::os::fd::{AsFd as _, OwnedFd};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::process::{Child, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
@@ -144,31 +144,37 @@ impl HelperSpawner for ProductionHelperSpawner {
                 "supervisor executable is not installed",
             ));
         }
-        let (plugin_end, helper_end) = StdUnixStream::pair()
-            .map_err(|_| CriError::unavailable("exec channel setup failed"))?;
-        // fd 2 は AF_UNIX の socketpair（core の診断出力は socket にしか書かないため pipe にしない。#4171）。
-        let (diag_end, helper_err) = StdUnixStream::pair()
-            .map_err(|_| CriError::unavailable("exec channel setup failed"))?;
-        let mut command = stream_exec_command(&supervisor, args);
-        command
-            .stdin(Stdio::from(OwnedFd::from(helper_end)))
-            .stdout(Stdio::null())
-            .stderr(Stdio::from(OwnedFd::from(helper_err)));
-        let spawned = command.spawn();
-        // 親に残る helper 側の端を閉じる（EOF を観測できるように）。
-        drop(command);
-        let child =
-            spawned.map_err(|_| CriError::unavailable("failed to start the exec helper"))?;
-        Ok(SpawnedHelper {
-            child,
-            channel: plugin_end,
-            diagnostics: Some(diag_end),
-        })
+        spawn_helper_command(stream_exec_command(&supervisor, args))
     }
 
     fn capabilities(&self) -> HelperCapabilities {
         HelperCapabilities { tty: false }
     }
+}
+
+/// helper の `Command` に fd 0（channel の socketpair）と fd 2（診断の socketpair）を結線して起動する。
+///
+/// 本番の spawner と結合試験（`tests/exec_helper_diag_real.rs`。#4171）が共有する。fd 2 は AF_UNIX の socketpair
+/// （core の診断出力は socket にしか書かないため pipe にしない）で、親に残る helper 側の端は起動後に閉じる
+/// （helper の終了で読み手が EOF を観測できるようにするため。CRI-6・SUP-6・REPAIR-5）。
+pub fn spawn_helper_command(mut command: Command) -> Result<SpawnedHelper, CriError> {
+    let (plugin_end, helper_end) =
+        StdUnixStream::pair().map_err(|_| CriError::unavailable("exec channel setup failed"))?;
+    let (diag_end, helper_err) =
+        StdUnixStream::pair().map_err(|_| CriError::unavailable("exec channel setup failed"))?;
+    command
+        .stdin(Stdio::from(OwnedFd::from(helper_end)))
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(OwnedFd::from(helper_err)));
+    let spawned = command.spawn();
+    // 親に残る helper 側の端（`Command` が保持する fd）を閉じる。
+    drop(command);
+    let child = spawned.map_err(|_| CriError::unavailable("failed to start the exec helper"))?;
+    Ok(SpawnedHelper {
+        child,
+        channel: plugin_end,
+        diagnostics: Some(diag_end),
+    })
 }
 
 /// 追跡中の helper の一覧と停止状態。停止の印と登録を同じ lock で扱い、停止後の登録を漏らさない（REPAIR-5）。

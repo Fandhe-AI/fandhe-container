@@ -31,7 +31,11 @@
 //!
 //! # 残余（REPAIR-3）
 //! - 現状、`stage=… errno=N` の形（本ファイルが受け入れる文法）を fd 2 へ出す生成側は supervisor・core には無い。
-//!   子の段の失敗は `Result` frame の `NotStarted` で返る。生成側の追加は #4172 側の確認に委ねる。
+//!   子の段の失敗は `Result` frame の `NotStarted` で返る。#4172 で確認した結果、helper が fd 2 へ書くのは
+//!   「fd 0 が socket でない」「要求元の消滅で取り消した」の 2 行（`code` と `message` だけ）で、状態の不一致・kind 6 の
+//!   失敗・stdio の受け取りの失敗は `Failed(code)` の `Result` frame だけで返り、errno はどこにも運ばれない。この現状を
+//!   `tests/exec_helper_failure_diag.rs` が実 helper のコードで具体値に固定している（生成側が入ったら期待値を直す）。
+//!   生成側の追加（制御クライアントへの errno の受け渡し・helper の段の語彙・本ファイルの分類語彙の拡張）は後続 issue で扱う。
 //! - seccomp の集計行（`event` つき）は語彙を公開していないため、解釈できない行（unparsed）として数える。
 //! - 停止後の drain 上限を超えて残った診断は失う（要約の `end` は `stopped`）。
 

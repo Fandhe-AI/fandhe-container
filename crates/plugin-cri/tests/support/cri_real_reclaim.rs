@@ -147,11 +147,17 @@ pub struct ReclaimReport {
     pub reclaimed_sandboxes: Vec<String>,
     pub left_containers: Vec<String>,
     pub left_sandboxes: Vec<String>,
+    /// 最後の一覧取得が失敗し、残存の有無を確認できなかった理由（`list_containers: <code>` 等）。
+    pub unverified: Vec<String>,
+    /// 回収対象のトークン（未確認の報告に載せる）。
+    pub token: String,
 }
 
 impl ReclaimReport {
     pub fn is_clean(&self) -> bool {
-        self.left_containers.is_empty() && self.left_sandboxes.is_empty()
+        self.left_containers.is_empty()
+            && self.left_sandboxes.is_empty()
+            && self.unverified.is_empty()
     }
 }
 
@@ -159,6 +165,15 @@ impl ReclaimReport {
 pub fn left_line(test: &str, r: &ReclaimReport) -> Option<String> {
     if r.is_clean() {
         return None;
+    }
+    if !r.unverified.is_empty() {
+        return Some(format!(
+            "{test}: cleanup could not verify cri records token={} reasons={} sandboxes={} containers={}; see docs/setup/cri-record-recovery.md",
+            r.token,
+            r.unverified.join(","),
+            r.left_sandboxes.join(","),
+            r.left_containers.join(",")
+        ));
     }
     Some(format!(
         "{test}: cleanup left cri records sandboxes={} containers={}; see docs/setup/cri-record-recovery.md",
@@ -177,12 +192,13 @@ fn push_unique(v: &mut Vec<String>, id: String) {
     }
 }
 
-/// 自分のトークンのラベルで絞った一覧（失敗は空として扱う）。
+/// 自分のトークンのラベルで絞った一覧。失敗した一覧は空にして理由を 3 つ目に返す（残存なしとは見なさない）。
 async fn list_by_label(
     c: &mut RuntimeServiceClient<Channel>,
     token: &str,
     end: Instant,
-) -> (Vec<String>, Vec<String>) {
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let mut errors = Vec::new();
     let selector = labels(token);
     let containers = call_with_deadline(
         c.list_containers(cri::ListContainersRequest {
@@ -201,7 +217,10 @@ async fn list_by_label(
             .map(|x| x.id)
             .collect()
     })
-    .unwrap_or_default();
+    .unwrap_or_else(|e| {
+        errors.push(format!("list_containers: {}", e.code().as_str()));
+        Vec::new()
+    });
     let sandboxes = call_with_deadline(
         c.list_pod_sandbox(cri::ListPodSandboxRequest {
             filter: Some(cri::PodSandboxFilter {
@@ -213,8 +232,11 @@ async fn list_by_label(
     )
     .await
     .map(|r| r.into_inner().items.into_iter().map(|x| x.id).collect())
-    .unwrap_or_default();
-    (containers, sandboxes)
+    .unwrap_or_else(|e| {
+        errors.push(format!("list_pod_sandbox: {}", e.code().as_str()));
+        Vec::new()
+    });
+    (containers, sandboxes, errors)
 }
 
 /// 台帳の ID と自分のトークンのラベルで絞った一覧の和だけを、期限つきで Stop / Remove する（R2・REPAIR-5）。
@@ -230,11 +252,14 @@ pub async fn reclaim(
         let g = lock(ledger);
         (g.containers.clone(), g.sandboxes.clone())
     };
-    let (lc, ls) = list_by_label(c, token, end).await;
+    let (lc, ls, _) = list_by_label(c, token, end).await;
     lc.into_iter().for_each(|i| push_unique(&mut cids, i));
     ls.into_iter().for_each(|i| push_unique(&mut sids, i));
 
-    let mut report = ReclaimReport::default();
+    let mut report = ReclaimReport {
+        token: token.to_owned(),
+        ..Default::default()
+    };
     for id in cids {
         let _ = call_with_deadline(
             c.stop_container(cri::StopContainerRequest {
@@ -281,7 +306,8 @@ pub async fn reclaim(
         forget_sandbox(ledger, &id);
     }
     // 取り直し: 一覧に残っているものは、Remove の応答に関わらず残骸にする。
-    let (rc, rs) = list_by_label(c, token, end).await;
+    let (rc, rs, errs) = list_by_label(c, token, end).await;
+    report.unverified = errs;
     rc.into_iter()
         .for_each(|i| push_unique(&mut report.left_containers, i));
     rs.into_iter()
@@ -316,6 +342,30 @@ fn reclaim_4142_left_line_exact() {
         )
     );
     assert_eq!(left_line("t", &ReclaimReport::default()), None);
+}
+
+#[test]
+fn reclaim_4142_list_failure_is_not_clean() {
+    let r = ReclaimReport {
+        token: "42-7".into(),
+        unverified: vec![
+            "list_containers: deadline_exceeded".into(),
+            "list_pod_sandbox: unavailable".into(),
+        ],
+        ..Default::default()
+    };
+    assert!(!r.is_clean());
+    assert_eq!(
+        left_line("t", &r).as_deref(),
+        Some(
+            "t: cleanup could not verify cri records token=42-7 reasons=list_containers: deadline_exceeded,list_pod_sandbox: unavailable sandboxes= containers=; see docs/setup/cri-record-recovery.md"
+        )
+    );
+    let with_left = ReclaimReport {
+        left_sandboxes: vec!["s".into()],
+        ..r
+    };
+    assert!(left_line("t", &with_left).unwrap().contains("sandboxes=s "));
 }
 
 #[test]

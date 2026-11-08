@@ -147,6 +147,17 @@ mod linux {
         idle(PROBE_LIFETIME)
     }
 
+    /// 起動済みの資源がある地点で前提欠如を見つけたときの `Err` の接頭辞。`process::exit` せず上位へ返し、
+    /// 回収の後で `main` が PRECONDITION FAILED を出す（REPAIR-5）。
+    const PRECOND_PREFIX: &str = "precondition: ";
+
+    fn print_precondition(reason: &str) {
+        // 前提欠如は回帰と 1 行目で見分ける（skip にしない）。メッセージはホストのパス・ID を含めない。
+        println!(
+            "shim_v2_kill_all_real: PRECONDITION FAILED (test environment, not a shim regression): {reason}"
+        );
+    }
+
     fn precondition_failed(reason: &str) -> ! {
         // 前提欠如は回帰と 1 行目で見分ける（skip にしない）。メッセージはホストのパス・ID を含めない。
         println!(
@@ -434,9 +445,9 @@ mod linux {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
                 // 縮退（STOPPED だけの確認）にはしない。共通祖先の cgroup.procs への書き込み権が環境の前提。
-                precondition_failed(
-                    "cannot move a host process into the container cgroup (write access to cgroup.procs of the common ancestor is required)",
-                );
+                return Err(format!(
+                    "{PRECOND_PREFIX}cannot move a host process into the container cgroup (write access to cgroup.procs of the common ancestor is required)"
+                ));
             }
             Err(e) => return Err(format!("move sleeper into the container cgroup: {e}")),
         }
@@ -681,7 +692,11 @@ mod linux {
                 ExitCode::SUCCESS
             }
             Err(e) => {
-                eprintln!("shim_v2_kill_all_real: FAILED: {e}");
+                // 回収は scenario 内で済んでいる。前提欠如は回帰と見分けられる行で非ゼロ終了にする。
+                match e.strip_prefix(PRECOND_PREFIX) {
+                    Some(reason) => print_precondition(reason),
+                    None => eprintln!("shim_v2_kill_all_real: FAILED: {e}"),
+                }
                 ExitCode::from(1)
             }
         }
@@ -738,6 +753,16 @@ mod linux {
             Ok(())
         })();
 
+        // 成功の経路: 強制回収の前に、期限つきで自然終了したこと（残存なし）を照合する。
+        // 残存していれば失敗として記録し、下の回収で止める（REPAIR-12）。
+        let clean: Result<(), String> = if outcome.is_ok() {
+            scenes
+                .iter()
+                .try_for_each(|scene| check_clean(&dir, &bin, &namespace, &scene.id))
+        } else {
+            Ok(())
+        };
+
         // 後始末（成否に関わらず）。残った sleeper・shim デーモン・supervisor を止める。
         if let Ok(pids) = PIDS.lock() {
             for pid in pids.iter() {
@@ -772,11 +797,7 @@ mod linux {
             eprintln!("shim_v2_kill_all_real: diagnostics end: {e}");
         }
         outcome?;
-
-        // 成功の経路: すべて片付いたことの照合。
-        for scene in &scenes {
-            check_clean(&dir, &bin, &namespace, &scene.id)?;
-        }
+        clean?;
         cleanup_state_dirs(&namespace);
         Ok(())
     }

@@ -2133,6 +2133,100 @@ async fn cri3_repair5_dropped_pull_rpc_cancels_worker_and_releases_slot() {
     result.expect("slot released").expect("second pull ok");
 }
 
+/// publish 済みの合図を出し、解放されるまで待ってから成功を返す puller（#4178 の窓への注入用）。
+struct PublishThenWait {
+    published: Mutex<std::sync::mpsc::Sender<()>>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+    observed: Mutex<std::sync::mpsc::Sender<bool>>,
+}
+
+impl ImagePuller for PublishThenWait {
+    fn pull(&self, _r: &PullRequest) -> Result<PulledImage, PullError> {
+        unreachable!("the service must call pull_cancellable")
+    }
+
+    fn pull_cancellable(
+        &self,
+        _r: &PullRequest,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<PulledImage, PullError> {
+        let _ = self.published.lock().expect("lock").send(());
+        let _ = self
+            .release
+            .lock()
+            .expect("lock")
+            .recv_timeout(Duration::from_secs(10));
+        let flagged = cancel.is_some_and(|c| c.load(Ordering::Acquire));
+        let _ = self.observed.lock().expect("lock").send(flagged);
+        Ok(PulledImage {
+            id: "sha256:aa".into(),
+            repo_tags: vec!["docker.io/library/busybox:1.36".into()],
+            repo_digests: vec![
+                format!("docker.io/library/busybox@sha256:{}", "f".repeat(64)),
+                format!("docker.io/library/busybox@sha256:{}", "0".repeat(64)),
+            ],
+            size: 1,
+        })
+    }
+}
+
+/// CRI-2・OCI-7・REPAIR-5・#4178: publish の確定後に RPC の future が破棄されても、worker は登録まで進み、
+/// 取り消し後の `ListImages` に pull したイメージが載る（publish と upsert の間の窓を稼働中に開けない）。
+#[tokio::test]
+async fn cri2_oci7_pull_cancelled_after_publish_still_registers() {
+    let (published_tx, published_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let (observed_tx, observed_rx) = std::sync::mpsc::channel();
+    let puller = Arc::new(PublishThenWait {
+        published: Mutex::new(published_tx),
+        release: Mutex::new(release_rx),
+        observed: Mutex::new(observed_tx),
+    });
+    let store = Arc::new(InMemoryImageStore::new());
+    let svc = Arc::new(
+        CriImageService::with_store(store.clone())
+            .with_puller(puller)
+            .with_max_concurrent_pulls(1),
+    );
+    let first = {
+        let svc = svc.clone();
+        tokio::spawn(async move {
+            ImageService::pull_image(svc.as_ref(), Request::new(pull_req("busybox"))).await
+        })
+    };
+    tokio::task::spawn_blocking(move || published_rx.recv_timeout(Duration::from_secs(10)))
+        .await
+        .expect("join")
+        .expect("publish reached");
+    first.abort();
+    let _ = first.await;
+    release_tx.send(()).expect("release");
+    let flagged =
+        tokio::task::spawn_blocking(move || observed_rx.recv_timeout(Duration::from_secs(10)))
+            .await
+            .expect("join")
+            .expect("worker returned");
+    assert!(flagged, "the cancel flag must be set inside the window");
+    // worker の登録の完了まで有界に待つ（取り消し済みの RPC からは結果が返らないため、在庫を直接見る）。
+    let mut registered = false;
+    for _ in 0..200 {
+        if !store.list().expect("list").is_empty() {
+            registered = true;
+            break;
+        }
+        tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(25)))
+            .await
+            .expect("join");
+    }
+    assert!(
+        registered,
+        "worker must register the image after the RPC was dropped"
+    );
+    let images = store.list().expect("list");
+    assert_eq!(images.len(), 1);
+    assert_eq!(images[0].id(), "sha256:aa");
+}
+
 /// OCI-7・SEC-1・CRI-3（#4179）: 2 回目の pull で config と layer1 をリース済みの既存 blob として再利用した後、
 /// layer2 の取得中に `blobs/sha256` がおとりへの symlink に差し替わっても、config の読み取りは検査済み root の fd 起点で
 /// 開き直して拒否される（おとりの config は読まれない。旧実装はパスを辿っておとりを読み `DataLoss` になっていた）。

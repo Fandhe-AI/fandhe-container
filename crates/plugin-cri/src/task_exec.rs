@@ -20,12 +20,14 @@
 //! - 待ちはすべて有界（handover・`Started`・セッション + 余裕）。panic しない。エラー文は固定の英文で argv・ID・パスを含めない。
 //!
 //! # 未実装・簡易実装・残余（REPAIR-3）
-//! - 消滅の確認: kill した exec・期限切れの exec・`Started` の後に `Failed` になった exec は、exec 子 cgroup の回収を plugin-cri
-//!   から観測できない（`ExecGuardPool` は supervisor の中。`Started` は payload 0 バイトで cgroup 名を運ばない）。そのため
-//!   `Exited` にせず「未確認」（`status()` が `UNAVAILABLE` の "exec termination is not confirmed"）を保ち、Wait は失敗し Delete は
-//!   除去を拒む（fail-closed）。確認の差し込み口は `ExecExtinctionProbe`。本番の `UnconfirmedExtinctionProbe` は常に `Unknown`
-//!   で、supervisor 側の wire 拡張（`Started` へ cgroup 名を載せる等。8 バイトの payload を超えるため version 変更）が入るまでの暫定。
-//!   帰結として、これらの登録はコンテナ削除の purge まで残り、コンテナあたりの exec の枠を消費する。
+//! - 消滅の確認（#4221 で実装）: kill した exec・期限切れの exec・`Started` の後に `Failed` になった exec は、いったん「未確認」
+//!   （`status()` が `UNAVAILABLE` の "exec termination is not confirmed"）になり、本番の `CgroupExtinctionProbe` が `Started` で通知された
+//!   exec 子 cgroup（stream-exec wire v2 で名前を運ぶ）の **不在** を読み取り専用で確かめられたときだけ `Exited`（コード無し）へ進む。
+//!   Wait は未確認の間 `extinction_grace`（既定 10 秒）だけ刻みごとに確かめ、Delete は確認できた exec の登録だけ除去する。確認できない
+//!   （材料が無い・照合に失敗・cgroup がまだ残る）間は fail-closed のまま `UNAVAILABLE` で、登録は purge まで残る。wire の版が合わない
+//!   旧い supervisor とは `Started` に至らず launch が失敗する（exec は始まらず、確認済みとも扱わない）。残余: 名前は helper の pid と
+//!   連番で、helper の回収後に別の helper が同じ名前を作りうる（probe は読むだけで kill しないため、起きるのは「まだある」と見える
+//!   安全側の誤りだけ）。コンテナ内から cgroupfs に書けない前提（`exec::cgroup_join` の doc と同じ）に依存する。
 //! - `pid()` は `None`（helper がコマンドの pid を返さない）。State の pid は 0 になる。
 //! - SIGKILL 以外のシグナル（helper の Signal frame）・env・cwd・user の受け入れは後続。
 

@@ -19,8 +19,8 @@
 //! 範囲外（REPAIR-3。未実装を装わない）と残余:
 //! - 送らない種別: TaskExecAdded・TaskExecStarted・TaskPaused・TaskResumed・TaskCheckpointed・TaskOOM（対応する RPC・仕組みが無い）。
 //! - Create・Start・Delete は RPC が成功する直前に 1 回だけ [`EventPublisher::publish`] で投入する（世代の guard は使わない。完了済みの事実の記録で、
-//!   ゲート保持中の投入順が FIFO の worker で保たれる）。符号化後 [`MAX_EVENT_LEN`] を超える TaskCreate（bundle が約 3.6 KiB 超）は送れず、
-//!   `encode` の失敗が 1 件記録される（RPC の応答は変えない）。上限を上げるのは stdin 書き込みの非ブロッキング化と同時に再評価する。
+//!   ゲート保持中の投入順が FIFO の worker で保たれる）。符号化後 [`MAX_EVENT_LEN`]（8192）を超えるイベントは子を起動せず、
+//!   `encode` の失敗が 1 件記録される（RPC の応答は変えない）。stdin は socketpair の片端で、親は非ブロッキングに期限内で書き、書き終えたら EOF を送る（#4223）。
 //! - shim の Shutdown でキューに残った未送信のイベントは捨てうる（worker は切り離されたスレッド。排出は未実装）。
 //! - `Child::kill` は直接の子だけを止める。publish バイナリの孫は止めない（containerd の `publish` は fork しない）。
 //!   プロセスグループごとの kill は `sys` の新規 unsafe が要るため採らない。
@@ -52,8 +52,11 @@ pub const TASK_START_TOPIC: &str = "/tasks/start";
 pub const TASK_DELETE_TOPIC: &str = "/tasks/delete";
 /// TaskExit の topic。
 pub const TASK_EXIT_TOPIC: &str = "/tasks/exit";
-/// 符号化後の `Any` の上限。pipe の容量（`PIPE_BUF` 以上）に収め、stdin への書き込みがブロックしないようにする。
-pub const MAX_EVENT_LEN: usize = 4096;
+/// 符号化後の `Any` の上限。1 件の確保と stdin の送信量を有界にするための値（REPAIR-2）。
+///
+/// stdin は期限内の非ブロッキング書き込みのため pipe 容量には依存しない（#4223）。導出: 最大の TaskCreate は
+/// `container_id` 255 バイト・`bundle` 4096 バイト（`BUNDLE_MAX_LEN`）・`pid` で約 4.4 KiB に収まり、その約 1.9 倍の余裕を取る。
+pub const MAX_EVENT_LEN: usize = 8192;
 /// 設定に許す最大の期限。
 const MAX_PUBLISH_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -394,6 +397,9 @@ pub use unix::{ExecEventPublisher, PublishTarget, exec_publisher_for, exec_publi
 mod unix {
     use std::ffi::OsString;
     use std::io::Write;
+    use std::net::Shutdown;
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
     use std::os::unix::process::ExitStatusExt;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
@@ -569,11 +575,16 @@ mod unix {
         let topic = event.topic();
         let fail = |stage| PublishFailure::new(stage, Some(topic));
         let payload = event.encode_any()?;
+        // stdin は AF_UNIX の stream socket。親側を非ブロッキングにして期限ループの中で書くため、
+        // 子が読まなくても worker は期限で必ず戻る（pipe 容量に依存しない。#4223・REPAIR-5）。
+        let (mut parent_end, child_end) =
+            UnixStream::pair().map_err(|e| fail(PublishStage::Spawn).with_errno(&e))?;
+        // Command は一時値のまま spawn し、親が持つ子側の端の複製を spawn 直後に閉じる（EOF・EPIPE の検出に必要）。
         let mut child = Command::new(target.binary())
             .args(target.args(topic))
             .env_clear()
             .current_dir("/")
-            .stdin(Stdio::piped())
+            .stdin(Stdio::from(OwnedFd::from(child_end)))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -581,17 +592,36 @@ mod unix {
         let deadline = Instant::now() + config.timeout();
         // 最初の失敗だけを覚え、回収は必ず続ける。
         let mut first: Option<PublishFailure> = None;
-        if let Some(mut stdin) = child.stdin.take() {
-            // 上限（MAX_EVENT_LEN）が pipe の容量に収まるため、子が読まなくてもブロックしない。drop で EOF を送る。
-            if let Err(e) = stdin.write_all(&payload) {
-                first = Some(fail(PublishStage::WriteStdin).with_errno(&e));
-            }
+        let mut rest: &[u8] = &payload;
+        // 書き込み側が開いている間 true。全部書けたら shutdown して EOF を送り、false にする。
+        let mut writing = true;
+        if let Err(e) = parent_end.set_nonblocking(true) {
+            first = Some(fail(PublishStage::WriteStdin).with_errno(&e));
+            writing = false;
         }
         loop {
+            if writing {
+                match write_some(&mut parent_end, &mut rest) {
+                    Ok(true) => {
+                        // 全部書けた。書き込み側を閉じて EOF を送る。
+                        let _ = parent_end.shutdown(Shutdown::Write);
+                        writing = false;
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        first = Some(fail(PublishStage::WriteStdin).with_errno(&e));
+                        writing = false;
+                    }
+                }
+            }
             match child.try_wait() {
                 Ok(Some(status)) => {
                     if let Some(f) = first {
                         return Err(f);
+                    }
+                    if writing && !rest.is_empty() {
+                        // 子が stdin を読み切る前に終わった。
+                        return Err(fail(PublishStage::WriteStdin));
                     }
                     if status.success() {
                         return Ok(());
@@ -620,6 +650,24 @@ mod unix {
             }
             std::thread::sleep(WAIT_SLICE.min(deadline - now));
         }
+    }
+
+    /// 非ブロッキングの stream へ未送信分を可能な限り書く。全部書けたら `Ok(true)`、
+    /// 詰まった（`WouldBlock`）なら `Ok(false)`（次の周回で再試行）。`rest` は書いた分だけ進む。
+    ///
+    /// Linux の `UnixStream::write` は `MSG_NOSIGNAL` で送るため、相手が閉じていても SIGPIPE ではなく
+    /// `EPIPE` が返る。macOS はランタイムが起動時に SIGPIPE を無視することに依拠する（#4223）。
+    pub(super) fn write_some(stream: &mut UnixStream, rest: &mut &[u8]) -> std::io::Result<bool> {
+        while !rest.is_empty() {
+            match stream.write(rest) {
+                Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+                Ok(n) => *rest = &rest[n..],
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(true)
     }
 
     /// kill の後、猶予内に回収する。回収できたか。
@@ -909,6 +957,48 @@ mod tests {
         assert!(g.to_json_line().contains(r#""stage":"disabled""#));
         assert!(g.to_json_line().contains(r#""topic":null"#));
     }
+
+    fn max_task_create() -> TaskEvent {
+        TaskEvent::Create(TaskCreate {
+            container_id: "c".repeat(255),
+            bundle: format!(
+                "/{}",
+                "b".repeat(crate::shim_v2::task_service::BUNDLE_MAX_LEN - 1)
+            ),
+            io: Some(TaskIo::default()),
+            pid: u32::MAX,
+            ..Default::default()
+        })
+    }
+
+    /// REPAIR-2・REPAIR-12・#4223: 検証済み入力の最大の TaskCreate は新上限に収まり、旧上限 4096 を超える（導出の機械照合）。
+    #[test]
+    fn repair2_4223_max_valid_task_create_fits_limit() {
+        let n = max_task_create().encode_any().unwrap().len();
+        assert!(n > 4096 && n <= MAX_EVENT_LEN, "{n}");
+    }
+
+    /// REPAIR-2・#4223: 符号化後ちょうど上限は成功し、1 バイト超えると `encode`（topic つき）で失敗する。
+    #[test]
+    fn repair2_4223_limit_boundary() {
+        let enc = |len: usize| {
+            TaskEvent::Create(TaskCreate {
+                container_id: "c1".into(),
+                bundle: "b".repeat(len),
+                ..Default::default()
+            })
+            .encode_any()
+        };
+        // 長さ接頭辞の varint 幅が段階的に変わるため、受理される最大の長さを探して境界を照合する。
+        let len = (0..=MAX_EVENT_LEN)
+            .take_while(|l| enc(*l).is_ok())
+            .last()
+            .unwrap();
+        assert_eq!(enc(len).unwrap().len(), MAX_EVENT_LEN);
+        let err = enc(len + 1).unwrap_err();
+        assert_eq!(err.stage, PublishStage::Encode);
+        assert_eq!(err.topic, Some("/tasks/create"));
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -1159,5 +1249,106 @@ mod unix_tests {
         let t = PublishTarget::from_context(&ctx).expect("some");
         assert_eq!(t.binary(), bin.as_path());
         assert_eq!(t.args("/tasks/exit").len(), 7);
+    }
+
+    fn long_task_create(bundle_len: usize) -> TaskEvent {
+        TaskEvent::Create(TaskCreate {
+            container_id: "c1".into(),
+            bundle: format!("/{}", "b".repeat(bundle_len - 1)),
+            io: Some(TaskIo::default()),
+            pid: 4242,
+            ..Default::default()
+        })
+    }
+
+    /// CRI-5・#4223: 4096 バイト近い bundle の TaskCreate（旧上限超過）が偽バイナリの stdin へ欠けずに届く。
+    #[test]
+    fn cri5_4223_large_task_create_reaches_fake_binary() {
+        let dir = test_root::test_root("pub", "t4223-large");
+        let bin = make_script(&dir, "fake", &recorder_body(&dir));
+        let log = Arc::new(CaptureLog::default());
+        let p = publisher(&bin, Duration::from_secs(5), log.clone());
+        let ev = long_task_create(4096);
+        assert!(ev.encode_any().unwrap().len() > 4096);
+        p.publish(ev.clone());
+        assert!(wait_until(Duration::from_secs(10), || dir
+            .join("stdin")
+            .exists()));
+        assert_eq!(
+            std::fs::read(dir.join("stdin")).unwrap(),
+            ev.encode_any().unwrap()
+        );
+        let argv = std::fs::read_to_string(dir.join("argv")).unwrap();
+        assert_eq!(argv.lines().last(), Some("/tasks/create"));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(log.0.lock().unwrap().is_empty());
+    }
+
+    /// REPAIR-5・#4223: stdin を読まない子に最大サイズの TaskCreate を送っても期限で戻り、子は kill・回収される。
+    #[test]
+    fn repair5_4223_non_reading_child_with_large_payload_is_reaped() {
+        let dir = test_root::test_root("pub", "t4223-sleep");
+        let bin = make_script(&dir, "fake", &sleeping_body(&dir));
+        let log = Arc::new(CaptureLog::default());
+        let timeout = Duration::from_millis(500);
+        let p = publisher(&bin, timeout, log.clone());
+        let started = std::time::Instant::now();
+        p.publish(long_task_create(4096));
+        assert!(wait_until(Duration::from_secs(10), || !log
+            .0
+            .lock()
+            .unwrap()
+            .is_empty()));
+        assert!(started.elapsed() < timeout + Duration::from_secs(3));
+        std::thread::sleep(Duration::from_millis(100));
+        let got = log.0.lock().unwrap().clone();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].stage, PublishStage::Deadline);
+        assert_eq!(got[0].reaped, Some(true));
+    }
+
+    /// REPAIR-5・#4223: 相手が読まない stream への書き込みは `WouldBlock` で戻り（未送信が残る）、閉じた相手へは `EPIPE` で失敗する。
+    #[test]
+    fn repair5_4223_write_helper_never_blocks() {
+        use std::os::unix::net::UnixStream;
+        let (mut a, b) = UnixStream::pair().unwrap();
+        a.set_nonblocking(true).unwrap();
+        let big = vec![7u8; 4 * 1024 * 1024];
+        let mut rest: &[u8] = &big;
+        let started = std::time::Instant::now();
+        assert!(!unix::write_some(&mut a, &mut rest).unwrap());
+        assert!(!rest.is_empty() && rest.len() < big.len());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(b);
+        let err = unix::write_some(&mut a, &mut rest).unwrap_err();
+        assert!(
+            matches!(err.raw_os_error(), Some(e) if e == 32 /* EPIPE */)
+                || err.kind() == std::io::ErrorKind::BrokenPipe,
+            "{err:?}"
+        );
+    }
+
+    /// REPAIR-5・#4223: 上限超過のイベントは子を起動せず、`encode` の失敗がちょうど 1 件。
+    #[test]
+    fn repair5_4223_oversized_event_is_not_spawned() {
+        let dir = test_root::test_root("pub", "t4223-over");
+        let bin = make_script(&dir, "fake", &recorder_body(&dir));
+        let log = Arc::new(CaptureLog::default());
+        let p = publisher(&bin, Duration::from_secs(5), log.clone());
+        p.publish(TaskEvent::Create(TaskCreate {
+            container_id: "c1".into(),
+            bundle: "b".repeat(MAX_EVENT_LEN),
+            ..Default::default()
+        }));
+        assert!(wait_until(Duration::from_secs(10), || !log
+            .0
+            .lock()
+            .unwrap()
+            .is_empty()));
+        std::thread::sleep(Duration::from_millis(200));
+        let got = log.0.lock().unwrap().clone();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].stage, PublishStage::Encode);
+        assert!(!dir.join("argv").exists() && !dir.join("stdin").exists());
     }
 }

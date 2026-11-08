@@ -13,6 +13,7 @@ use std::os::fd::{AsFd as _, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
+use fandhe_container_core::exec::ExecCgroupName;
 use fandhe_container_core::traits::ErrorCode;
 use fandhe_container_supervisor::stream_exec::channel::{
     ChannelError, HelperMessage, StdioSend, recv_from_helper, recv_stdio_handover, send_pty_master,
@@ -77,7 +78,12 @@ fn sup6_stdio_handover_and_helper_replies_roundtrip() {
     assert_eq!(out, b"pong");
 
     // helper → plugin-cri: Started → PtyMaster（pty master）→ Result。
-    send_started(&helper, far()).expect("send started");
+    send_started(
+        &helper,
+        &ExecCgroupName::new("exec-4242-0").expect("name"),
+        far(),
+    )
+    .expect("send started");
     let ptmx = File::options()
         .read(true)
         .write(true)
@@ -87,10 +93,10 @@ fn sup6_stdio_handover_and_helper_replies_roundtrip() {
     let outcome = StreamExecOutcome::Signaled(ExitSignal::new(9).expect("signal 9"));
     send_result(&helper, &outcome, far()).expect("send result");
 
-    assert!(matches!(
-        recv_from_helper(&plugin, far()).expect("started"),
-        HelperMessage::Started
-    ));
+    match recv_from_helper(&plugin, far()).expect("started") {
+        HelperMessage::Started(name) => assert_eq!(name.as_str(), "exec-4242-0"),
+        other => panic!("expected Started, got {other:?}"),
+    }
     match recv_from_helper(&plugin, far()).expect("pty") {
         HelperMessage::PtyMaster(m) => {
             let meta = File::from(m.into_owned_fd()).metadata().expect("stat");
@@ -166,6 +172,11 @@ fn sup6_peer_close_and_deadline_are_reported() {
 
     // 期限が過去なら送信も即 `Timeout`。
     let (plugin, _helper) = pair();
-    let err = send_started(&plugin, Instant::now()).expect_err("expired");
+    let err = send_started(
+        &plugin,
+        &ExecCgroupName::new("exec-4242-0").expect("name"),
+        Instant::now(),
+    )
+    .expect_err("expired");
     assert_eq!(err, ChannelError::Timeout);
 }

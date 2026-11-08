@@ -21,6 +21,11 @@ use super::*;
 use crate::streaming::log_attach::test_support::TempDir;
 
 const PID: u32 = 4242;
+
+/// 偽の helper が `Started` で運ぶ exec 子 cgroup の名前（CRI の Exec は名前を使わず読み捨てる。#4221）。
+fn cg_name() -> fandhe_container_core::exec::ExecCgroupName {
+    fandhe_container_core::exec::ExecCgroupName::new("exec-4242-0").expect("name")
+}
 const WAIT: Duration = Duration::from_secs(5);
 
 type Script = Arc<dyn Fn(StdUnixStream, StdioMask) + Send + Sync>;
@@ -215,7 +220,7 @@ async fn cri6_3761_stdio_selection_bytes_and_exit_code() {
             if let Some(fd) = fds.stderr {
                 File::from(fd).write_all(b"err-line\n").expect("err");
             }
-            send_started(&end, deadline()).expect("started");
+            send_started(&end, &cg_name(), deadline()).expect("started");
             let mut got = Vec::new();
             if let Some(fd) = fds.stdin {
                 File::from(fd).read_to_end(&mut got).expect("stdin");
@@ -271,7 +276,7 @@ async fn cri6_3761_dropping_the_session_kills_the_helper() {
     let fx = Fixture::new("drop");
     let script: Script = Arc::new(|end, mask| {
         let _ = recv_stdio_handover(&end, mask, deadline()).expect("handover");
-        send_started(&end, deadline()).expect("started");
+        send_started(&end, &cg_name(), deadline()).expect("started");
         std::thread::sleep(Duration::from_secs(30));
     });
     let (launcher, pids) = fx.launcher(false, script);
@@ -293,7 +298,7 @@ async fn cri6_3761_shutdown_all_kills_tracked_helpers() {
     let fx = Fixture::new("shutdown");
     let script: Script = Arc::new(|end, mask| {
         let _ = recv_stdio_handover(&end, mask, deadline()).expect("handover");
-        send_started(&end, deadline()).expect("started");
+        send_started(&end, &cg_name(), deadline()).expect("started");
         std::thread::sleep(Duration::from_secs(30));
     });
     let (launcher, pids) = fx.launcher(false, script);
@@ -376,7 +381,7 @@ async fn cri6_3761_signaled_result_reaches_the_exit_future() {
     let fx = Fixture::new("signaled");
     let script: Script = Arc::new(|end, mask| {
         let _ = recv_stdio_handover(&end, mask, deadline()).expect("handover");
-        send_started(&end, deadline()).expect("started");
+        send_started(&end, &cg_name(), deadline()).expect("started");
         send_result(
             &end,
             &StreamExecOutcome::Signaled(ExitSignal::new(9).expect("signal")),
@@ -468,7 +473,7 @@ async fn cri6_3761_resize_is_forwarded_to_the_pty_master() {
     let probe2 = Arc::clone(&probe);
     let script: Script = Arc::new(move |end, mask| {
         let _ = recv_stdio_handover(&end, mask, deadline()).expect("handover");
-        send_started(&end, deadline()).expect("started");
+        send_started(&end, &cg_name(), deadline()).expect("started");
         let master = File::options()
             .read(true)
             .write(true)
@@ -505,7 +510,7 @@ async fn cri6_3761_non_pty_master_fails_the_launch() {
     let fx = Fixture::new("badpty");
     let script: Script = Arc::new(|end, mask| {
         let _ = recv_stdio_handover(&end, mask, deadline()).expect("handover");
-        send_started(&end, deadline()).expect("started");
+        send_started(&end, &cg_name(), deadline()).expect("started");
         let null = File::options()
             .read(true)
             .write(true)
@@ -617,7 +622,7 @@ fn collected_lines(sink: &LineSink, buf: &Arc<Mutex<Vec<u8>>>) -> Vec<String> {
 fn quick_script() -> Script {
     Arc::new(|end, mask| {
         let _ = recv_stdio_handover(&end, mask, deadline()).expect("handover");
-        send_started(&end, deadline()).expect("started");
+        send_started(&end, &cg_name(), deadline()).expect("started");
         std::thread::sleep(Duration::from_millis(300));
         let _ = send_result(&end, &StreamExecOutcome::Exited(0), deadline());
     })
@@ -756,7 +761,7 @@ async fn repair5_4171_shutdown_all_is_bounded_when_stderr_is_held() {
     });
     let hold: Script = Arc::new(|end, mask| {
         let _ = recv_stdio_handover(&end, mask, deadline()).expect("handover");
-        send_started(&end, deadline()).expect("started");
+        send_started(&end, &cg_name(), deadline()).expect("started");
         std::thread::sleep(Duration::from_secs(30));
     });
     let (launcher, pids) = fx.launcher_with_diag(false, hold, Some(diag));

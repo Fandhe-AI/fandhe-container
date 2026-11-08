@@ -746,7 +746,7 @@ impl SupervisorExecLauncher {
         let started_deadline = Instant::now() + STARTED_BUDGET;
         // `Result` が先に来たら起動の失敗（`Started` 前）。
         match recv_from_helper(&channel, started_deadline) {
-            Ok(HelperMessage::Started) => {}
+            Ok(HelperMessage::Started(_)) => {}
             Ok(HelperMessage::Result(outcome)) => {
                 return Err(match map_outcome(outcome) {
                     Err(e) => e,

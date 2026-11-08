@@ -508,22 +508,29 @@ impl CriImageService {
             cancel: Arc::clone(&cancel),
             armed: true,
         };
+        let store = Arc::clone(&self.store);
+        // publish 確定後の登録（`into_record` と `upsert`）も worker の中で行う（#4178・OCI-7・CRI-2）。
+        // RPC の future が破棄されても blocking タスクは最後まで走るため、oci の在庫に載った pull は
+        // 必ず CRI の在庫へも載り、取り消しの窓（publish と upsert の間）が稼働中に開かない。
+        // worker は publish の後に取り消しの旗を見ない。`upsert` が実行器のスレッドでロック待ちと
+        // fsync の間ほかの RPC を止める問題もこれで外れる。
         let joined = tokio::task::spawn_blocking(move || {
-            // スロットはタスクの完了（成否・panic）まで保持する。
+            // スロットは登録の完了（成否・panic）まで保持する。
             let _slot = slot;
-            puller.pull_cancellable(&pull_request, Some(&cancel))
+            let pulled = puller
+                .pull_cancellable(&pull_request, Some(&cancel))
+                .map_err(CriError::from)?;
+            let record = pulled.into_record().map_err(CriError::from)?;
+            let image_ref = record.id().to_owned();
+            store
+                .upsert(record)
+                .map_err(|_| CriError::internal("image store failure"))?;
+            Ok::<String, CriError>(image_ref)
         })
         .await;
         // worker が戻ったあとは旗を立てない（成否・panic を問わない）。
         guard.disarm();
-        let pulled = joined
-            .map_err(|_| CriError::internal("image pull task failed"))?
-            .map_err(CriError::from)?;
-        let record = pulled.into_record().map_err(CriError::from)?;
-        let image_ref = record.id().to_owned();
-        self.store
-            .upsert(record)
-            .map_err(|_| CriError::internal("image store failure"))?;
+        let image_ref = joined.map_err(|_| CriError::internal("image pull task failed"))??;
         Ok(v1::PullImageResponse { image_ref })
     }
 

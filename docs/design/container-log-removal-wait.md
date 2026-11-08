@@ -101,11 +101,19 @@ plugin-cri の `RemoveContainer`（`CoreLifecycleRuntime::delete`）は、core �
 - 取り消しの口: `ImagePuller::pull_cancellable`（既定は旗を無視して `pull`。`PullRequest` は変えない）
 - 分割できない区間: blob 1 本の取得（`blob_request_timeout` で有界）・blob 1 本の sha256 検証・1 エントリの書き込み・失敗時の削除。
   worker の最悪の残存は `pull_deadline` + 分割できない区間 1 つ分
-- 残余（REPAIR-3）: 取り消しが `publish` と handler の `upsert` の間に届くと、永続在庫には登録されるが `CriImageService` のメモリのストアは
-  更新されない（従来の gRPC タイムアウトにもある窓で、再試行がキャッシュ命中で揃える）。oci の `fetch_blob` の通信を途中で取り消す口は無い。
-  期限の数値（540 秒・1 時間）の見直しはオーナー判断
+- publish と登録の間の取り消しの窓（#4178・CRI-2・OCI-7・REPAIR-3。#2967 の残余）: `into_record` と `store.upsert` を `spawn_blocking` の worker の中へ移した。
+  blocking タスクは future の破棄では止まらず、worker は publish の後に取り消しの旗を見ないため、oci の在庫に載った pull は必ず CRI の在庫（メモリと永続側）にも載り、稼働中に窓は開かない。
+  `PullSlot` は登録の完了まで握る。`upsert` が実行器のスレッドでロック待ち（既定 5 秒）と fsync の間ほかの RPC を止める問題も同時に外れる。
+  期限は pull の期限（540 秒）にロック待ち 5 秒と fsync が足されるだけで、`PLUGIN_REQUEST_TIMEOUT`（600 秒）の内側に収まる（`repair5_pull_deadline_fits_inside_request_timeout`）
+  - 不採用: (a) 次の照会で永続側から読み直す（窓では永続側にも記録が無く、読む対象が無い。oci の在庫から導出する方式は #4176 で不採用。同期 RPC で I/O もする）、
+    (b) `upsert` を publish の前へ移す（記録は pull の結果からしか作れず、失敗時に CRI の在庫だけにある逆向きの不一致を作る）、
+    (c) 再起動に任せる（`open` は oci の在庫を読まないため再起動では揃わない）
+  - 残る不一致と解消条件: publish の後、`upsert` の完了前にプロセスが死ぬと oci の在庫にだけ載る。同じ参照の次の `PullImage`（キャッシュ命中で再登録）で揃う。再起動だけでは揃わない（oci の在庫との突き合わせは #4177）。
+    `upsert` 自体の失敗（`Io`・`Corrupt`・`StoreFull`・`TooManyRefs`）は、RPC が生きていれば `Internal` で kubelet の再試行により揃い、取り消し済みなら次の `PullImage` まで残る
+  - 並び（#3038・#2969）: `repo_digests` は top-level 区間（multi-arch では index digest）→ 補助区間の順で、各区間と `repo_tags` は辞書順。永続在庫は区間を分けて保存するため往復しても変わらない
+  - oci の `fetch_blob` の通信を途中で取り消す口は無い。期限の数値（540 秒・1 時間）の見直しはオーナー判断
 - 照合: `cri3_repair5_pull_cancel_during_extraction_*`・`cri3_repair5_pull_cancel_during_fetch_*`・`cri3_repair5_pull_cancelled_before_start_*`・
-  `cri3_repair5_extraction_shares_the_pull_deadline`・`cri3_repair5_dropped_pull_rpc_cancels_worker_and_releases_slot`
+  `cri3_repair5_extraction_shares_the_pull_deadline`・`cri3_repair5_dropped_pull_rpc_cancels_worker_and_releases_slot`・`cri2_oci7_pull_cancelled_after_publish_still_registers`（cri）・`cri2_oci7_pull_cancelled_between_publish_and_upsert_matches_persistent_store`・`cri2_oci1_multi_arch_digest_order_survives_reopen`（plugin-cri）
 
 ## 待ち切れなかったことの区別（#2760）
 

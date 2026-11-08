@@ -41,7 +41,9 @@
 //! `virt/kvm/eventfd.c` の `kvm_irqfd_assign` は `kvm_arch_intc_initialized()` が偽なら `-EAGAIN` を返す（初期化前の irqfd は拒否される）。
 //! irqfd の GSI は SPI 番号に等しい（`arch/arm64/kvm/vgic/vgic-irqfd.c` の既定 routing は pin = GSI で、注入は INTID = pin + 32）。
 //!
-//! aarch64 の machine type（IPA サイズ）は既定の 0 を使う。指定は TASK-75 で再検討する。
+//! aarch64 の machine type（IPA サイズ）は既定の 0（= 40 bit。Linux の `KVM_PHYS_SHIFT`）を使う。上限が 40 未満のホストでは
+//! `KVM_CREATE_VM` が EINVAL になるため、[`KvmDevice::arm_vm_ipa_size`] で上限を照会して VM を作る前に拒否する（#4227。
+//! 明示指定 `KVM_VM_TYPE_ARM_IPA_SIZE(n)` は範囲外。判断記録は docs/design/microvm-memory-ownership.md の #4227 の節）。
 //! [`KvmDevice`]・[`VmFd`]・[`VcpuFd`] は `OwnedFd` を持つため `Send` / `Sync`。
 
 #![cfg(target_os = "linux")]
@@ -1984,6 +1986,14 @@ impl KvmDevice {
                 MicrovmError::new(MicrovmErrorCode::FailedPrecondition, "not a KVM device")
             }
         })
+    }
+
+    /// `KVM_CHECK_EXTENSION(KVM_CAP_ARM_VM_IPA_SIZE)`（system fd）。ホストの IPA 上限のビット数（0 以下は非対応）。
+    /// 値の解釈は `crate::gpa_width::kvm_arm64_type0_ipa_bits`。失敗の message にパス・数値は載せない（#4227・MVM-1）。
+    #[cfg(target_arch = "aarch64")]
+    pub fn arm_vm_ipa_size(&self) -> Result<i32, MicrovmError> {
+        sys::kvm_check_extension(self.fd.as_fd(), sys::consts::KVM_CAP_ARM_VM_IPA_SIZE)
+            .map_err(|e| classify_irq_error(IrqStage::CheckExtension, e))
     }
 
     /// `KVM_CREATE_VM`（machine type 0）で VM fd を作る。

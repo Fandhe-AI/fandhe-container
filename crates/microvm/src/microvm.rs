@@ -100,16 +100,17 @@
 //! memslot のフラグ（`KVM_MEM_READONLY` / `KVM_MEM_LOG_DIRTY_PAGES`）は [`GuestRam::register_with_flags`] で領域ごとに指定できる（#4158）。
 //!
 //! # 範囲外（REPAIR-3）
-//! hugepage の opt-in（採らない判断を記録済み。docs/design/microvm-memory-ownership.md の #4159 の節）・dirty log の取得（`KVM_GET_DIRTY_LOG`）・aarch64 の IPA サイズ（`KVM_CAP_ARM_VM_IPA_SIZE`）の照合は未実装
+//! hugepage の opt-in（採らない判断を記録済み。docs/design/microvm-memory-ownership.md の #4159 の節）・dirty log の取得（`KVM_GET_DIRTY_LOG`）・`KVM_VM_TYPE_ARM_IPA_SIZE(n)` による IPA 幅の明示指定は未実装
 //! （複数領域と `KVM_CAP_NR_MEMSLOTS` の照会は #3697、x86_64 の物理アドレス幅〔CPUID leaf 0x8000_0008〕と最上位 GPA の照合・
-//! e820 の予約表記は #4106 で実装済み。下記）。
+//! e820 の予約表記は #4106、aarch64 の `KVM_CAP_ARM_VM_IPA_SIZE`（machine type 0 = 40 bit）と最上位 GPA の照合は #4227 で実装済み。下記）。
 //!
 //! # 複数領域（#3697・MVM-1）
 //! x86_64 は RAM を MMIO hole `[X86_LOW_RAM_LIMIT, 4 GiB)` の前後に分け、領域ごとに別の memslot（slot = 領域の index）で登録する
 //! （`plan_ram_regions_x86`・[`register_ram_regions`]）。slot の上限は登録の前に `KVM_CAP_NR_MEMSLOTS` で確かめ、足りなければ
 //! `ResourceExhausted`。aarch64 の RAM は hole が無いので 1 領域のまま同じ経路を通る。macOS（HVF）は 1 領域。
 //! e820 は登録した領域の一覧から作る（`boot_x86::plan_boot`）。x86_64 の `assemble` は `create_vm` の前に、vCPU に渡す CPUID の
-//! 物理アドレス幅と最上位 GPA（`system_regions` の最大の終端）を照合し、収まらなければ `FailedPrecondition`（#4106）。
+//! 物理アドレス幅と最上位 GPA（`system_regions` の最大の終端）を照合し、収まらなければ `FailedPrecondition`（#4106）。aarch64 も同じく
+//! `create_vm` の前に `KVM_CAP_ARM_VM_IPA_SIZE` から machine type 0 の幅（40 bit。上限が 40 未満なら拒否）を決めて `Arm64Layout::max_region_end` と照合する（#4227。`crate::gpa_width`）。
 //! 判断記録は docs/design/microvm-memory-ownership.md。
 //!
 //! # 寿命
@@ -925,13 +926,11 @@ fn max_region_end(reserved: &[Region], occupied: &[Region]) -> Option<u64> {
 /// エラーの message に幅・アドレスは載せない（ERR-1）。
 #[cfg(target_arch = "x86_64")]
 fn check_physical_address_width(bits: u8, top_end: u64) -> Result<(), MicrovmError> {
-    match 1u64.checked_shl(u32::from(bits)) {
-        Some(limit) if top_end <= limit => Ok(()),
-        _ => Err(MicrovmError::new(
-            MicrovmErrorCode::FailedPrecondition,
-            "guest physical address space exceeds the CPUID physical address width",
-        )),
-    }
+    crate::gpa_width::check_gpa_fits(
+        u32::from(bits),
+        top_end,
+        crate::gpa_width::GpaWidthSource::X86Cpuid,
+    )
 }
 
 /// e820 に載せる予約: `system_regions` の RAM 以外の領域（virtio-mmio の窓・IOAPIC・LAPIC・identity map・TSS）を
@@ -1418,6 +1417,13 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
             config.mem_size,
             config.block.len(),
             config.net.len(),
+        )?;
+        // IPA 幅の照合（#4227・MVM-1）。VM fd を作る前に、machine type 0 の幅と最上位 GPA を突き合わせる。
+        let bits = crate::gpa_width::kvm_arm64_type0_ipa_bits(kvm.arm_vm_ipa_size()?)?;
+        crate::gpa_width::check_gpa_fits(
+            bits,
+            layout.max_region_end()?,
+            crate::gpa_width::GpaWidthSource::KvmArm64Ipa,
         )?;
         let vm = kvm.create_vm()?;
         let memory = register_ram_regions(

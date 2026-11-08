@@ -114,6 +114,7 @@ pub mod error;
 pub mod esr;
 pub mod exit;
 pub mod fdt;
+pub mod gpa_width;
 pub mod guest_memory;
 #[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
 pub mod guest_memory_slot;

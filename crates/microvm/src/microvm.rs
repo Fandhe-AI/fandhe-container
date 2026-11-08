@@ -5968,7 +5968,10 @@ mod ioevent_tests {
     fn voluntary_switches(name: &str) -> Option<u64> {
         for ent in std::fs::read_dir("/proc/self/task").ok()?.flatten() {
             let dir = ent.path();
-            let comm = std::fs::read_to_string(dir.join("comm")).ok()?;
+            // 列挙後に無関係なスレッドが終了すると comm が ENOENT になる。対象特定前の失敗は次の tid へ進める。
+            let Ok(comm) = std::fs::read_to_string(dir.join("comm")) else {
+                continue;
+            };
             if comm.trim_end() != name {
                 continue;
             }

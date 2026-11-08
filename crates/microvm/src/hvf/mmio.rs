@@ -143,33 +143,21 @@ fn internal(msg: &'static str) -> MicrovmError {
     MicrovmError::new(MicrovmErrorCode::Internal, msg)
 }
 
-/// data abort を処理する。MMIO を dispatcher へ渡し、読み出しなら応答を `SRT` へ書き、PC を進めて続行する。
-pub fn handle_data_abort(
-    vcpu: &mut HvVcpu<'_>,
+/// 組み立てた MMIO exit を dispatcher へ渡し、結果に応じた計数と route の呼び出しまでを行う（#4231・MVM-5・MVM-1）。
+///
+/// [`handle_data_abort`] の vCPU（`hv_*`）に触れない部分で、実機なしで `QueueNotify` / `QueueStopped` などの振り分けを
+/// 試験できる継ぎ目。dispatcher の lock は dispatch の式の終わりで解放し、route へ進む（lock の順は変えない）。
+/// 戻りの `Some(action)` は route が VM の停止を求めた場合で、呼び出し元は PC を進めずにそのまま返す。
+fn dispatch_and_route(
     handler: &mut MmioHandler,
-    abort: &DataAbort,
-    exception: &HvVcpuExitException,
-) -> Result<ExitAction, MicrovmError> {
-    mmio_abort::ensure_mmio_fault(abort)?;
-
-    let write_value = if abort.direction == AccessDirection::Write {
-        if abort.register.is_zero_register() {
-            mmio_abort::write_source_value(abort, None)
-        } else {
-            let reg = HvReg::x(abort.register.get()).ok_or_else(|| internal("invalid SRT"))?;
-            mmio_abort::write_source_value(abort, Some(vcpu.get_reg(reg)?))
-        }
-    } else {
-        0
-    };
-
-    let exit = mmio_abort::mmio_exit_from_abort(abort, exception.physical_address, write_value);
+    exit: &crate::exit::VcpuExit,
+) -> Result<(DispatchOutcome, Option<ExitAction>), MicrovmError> {
     // dispatcher の lock はこの式の終わりで解放する（ACK の後処理でトランスポートの lock を取るため、同時保持しない）。
     let outcome = handler
         .dispatcher
         .lock()
         .map_err(|_| internal("mmio dispatcher lock poisoned"))?
-        .dispatch(&exit)?;
+        .dispatch(exit)?;
     match &outcome {
         DispatchOutcome::Mmio {
             device,
@@ -208,8 +196,7 @@ pub fn handle_data_abort(
                         "level=error op=hvf.mmio.queue_notify outcome=error source={source} code={code} device={} queue={q}",
                         device.index()
                     ));
-                    // PC は進めない。VM は止まり、書き込みなので SRT へ返す応答も無い。
-                    return Ok(action);
+                    return Ok((outcome, Some(action)));
                 }
             }
         }
@@ -217,6 +204,36 @@ pub fn handle_data_abort(
             handler.unhandled = handler.unhandled.saturating_add(1);
         }
         _ => {}
+    }
+
+    Ok((outcome, None))
+}
+
+/// data abort を処理する。MMIO を dispatcher へ渡し、読み出しなら応答を `SRT` へ書き、PC を進めて続行する。
+pub fn handle_data_abort(
+    vcpu: &mut HvVcpu<'_>,
+    handler: &mut MmioHandler,
+    abort: &DataAbort,
+    exception: &HvVcpuExitException,
+) -> Result<ExitAction, MicrovmError> {
+    mmio_abort::ensure_mmio_fault(abort)?;
+
+    let write_value = if abort.direction == AccessDirection::Write {
+        if abort.register.is_zero_register() {
+            mmio_abort::write_source_value(abort, None)
+        } else {
+            let reg = HvReg::x(abort.register.get()).ok_or_else(|| internal("invalid SRT"))?;
+            mmio_abort::write_source_value(abort, Some(vcpu.get_reg(reg)?))
+        }
+    } else {
+        0
+    };
+
+    let exit = mmio_abort::mmio_exit_from_abort(abort, exception.physical_address, write_value);
+    let (outcome, stop) = dispatch_and_route(handler, &exit)?;
+    if let Some(action) = stop {
+        // PC は進めない。VM は止まり、書き込みなので SRT へ返す応答も無い。
+        return Ok(action);
     }
 
     if abort.direction == AccessDirection::Read {
@@ -375,5 +392,161 @@ mod tests {
             .dispatch(&exit)
             .unwrap();
         assert_eq!(out.read_response(), Some(&0x7472_6976u32.to_le_bytes()[..]));
+    }
+
+    /// `queue_stopped` / `reset` の呼び出しだけを記録して本物のデバイスへ委譲するアダプタ（#4231）。
+    struct Recording<D: crate::virtio_mmio::VirtioDevice> {
+        inner: D,
+        stopped: Vec<u16>,
+    }
+
+    impl<D: crate::virtio_mmio::VirtioDevice> crate::virtio_mmio::VirtioDevice for Recording<D> {
+        fn device_type(&self) -> crate::virtio_mmio::VirtioDeviceType {
+            self.inner.device_type()
+        }
+        fn device_features(&self) -> crate::virtio_mmio::FeatureBits {
+            self.inner.device_features()
+        }
+        fn queue_max_sizes(&self) -> &[u16] {
+            self.inner.queue_max_sizes()
+        }
+        fn read_config(&self, offset: u64, data: &mut [u8]) {
+            self.inner.read_config(offset, data)
+        }
+        fn write_config(&mut self, offset: u64, data: &[u8]) {
+            self.inner.write_config(offset, data)
+        }
+        fn accepts_features(&self, features: crate::virtio_mmio::FeatureBits) -> bool {
+            self.inner.accepts_features(features)
+        }
+        fn activate(
+            &mut self,
+            f: crate::virtio_mmio::FeatureBits,
+            q: &[crate::virtio_mmio::QueueConfig],
+        ) -> Result<(), MicrovmError> {
+            self.inner.activate(f, q)
+        }
+        fn queue_stopped(&mut self, index: u16) {
+            self.stopped.push(index);
+            self.inner.queue_stopped(index);
+        }
+        fn reset(&mut self) {
+            self.inner.reset();
+        }
+    }
+
+    /// 呼ばれた回数だけを数える `QueueNotifyRoute`。呼ばれたら失敗を返す（停止後の通知が route に届かないことの確認用）。
+    #[derive(Debug, Default)]
+    struct CountingRoute(std::sync::atomic::AtomicU32);
+
+    impl QueueNotifyRoute for CountingRoute {
+        fn on_queue_notify(
+            &self,
+            _queue: u16,
+        ) -> Result<crate::interrupt::QueueNotifyReport, MicrovmError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(internal("counting route called"))
+        }
+    }
+
+    fn mmio(addr: u64, value: u32, is_write: bool) -> crate::exit::VcpuExit {
+        let mut data = [0u8; 8];
+        data[..4].copy_from_slice(&value.to_le_bytes());
+        crate::exit::VcpuExit::Mmio {
+            phys_addr: addr,
+            data,
+            len: 4,
+            is_write,
+        }
+    }
+
+    fn write_reg(h: &mut MmioHandler, base: u64, reg: u64, v: u32) -> MmioWriteOutcome {
+        let (out, stop) = dispatch_and_route(h, &mmio(base + reg, v, true)).unwrap();
+        assert_eq!(stop, None);
+        match out {
+            DispatchOutcome::Mmio {
+                access: MmioAccess::Write(o),
+                ..
+            } => o,
+            other => panic!("expected mmio write, got {other:?}"),
+        }
+    }
+
+    /// MVM-5・MVM-1・#4231: `handle_data_abort` の振り分け（`dispatch_and_route`）を通した `QueueReady=0` で
+    /// `queue_stopped` がちょうど 1 回呼ばれ、`QueueNotify` の route・計数は動かない。`HvfDeviceBus::bind` と同じく
+    /// `SharedTransport` を登録する。回数は `Recording` が直接数える。`hv_*` は呼ばない。
+    #[test]
+    fn mvm5_4231_queue_ready_zero_stops_once_via_mmio_handler() {
+        use crate::virtio_mmio::{SharedTransport, reg};
+        const BASE: u64 = 0x0a00_0000;
+        let transport = Arc::new(Mutex::new(
+            VirtioMmioTransport::new(Recording {
+                inner: VirtioBlock::new(MemoryBlockBackend::new(16 * 512, false).unwrap()),
+                stopped: Vec::new(),
+            })
+            .unwrap(),
+        ));
+        let mut d = ExitDispatcher::new();
+        let id = d
+            .register_mmio(
+                BASE,
+                0x200,
+                Box::new(SharedTransport(Arc::clone(&transport))),
+            )
+            .unwrap();
+        let route = Arc::new(CountingRoute::default());
+        let mut h = MmioHandler::with_dispatcher(d)
+            .with_queue_notify_routes(vec![(id, Arc::clone(&route) as Arc<dyn QueueNotifyRoute>)]);
+
+        // 交渉 → キュー 0 の設定 → DRIVER_OK。
+        write_reg(&mut h, BASE, reg::STATUS, 1);
+        write_reg(&mut h, BASE, reg::STATUS, 3);
+        write_reg(&mut h, BASE, reg::DEVICE_FEATURES_SEL, 0);
+        let low = {
+            let (out, _) =
+                dispatch_and_route(&mut h, &mmio(BASE + reg::DEVICE_FEATURES, 0, false)).unwrap();
+            let r = out.read_response().unwrap();
+            u32::from_le_bytes([r[0], r[1], r[2], r[3]])
+        };
+        write_reg(&mut h, BASE, reg::DRIVER_FEATURES_SEL, 0);
+        write_reg(&mut h, BASE, reg::DRIVER_FEATURES, low);
+        write_reg(&mut h, BASE, reg::DRIVER_FEATURES_SEL, 1);
+        write_reg(&mut h, BASE, reg::DRIVER_FEATURES, 1);
+        assert_eq!(
+            write_reg(&mut h, BASE, reg::STATUS, 11),
+            MmioWriteOutcome::FeaturesAccepted
+        );
+        write_reg(&mut h, BASE, reg::QUEUE_SEL, 0);
+        write_reg(&mut h, BASE, reg::QUEUE_NUM, 16);
+        write_reg(&mut h, BASE, reg::QUEUE_DESC_LOW, 0x1000);
+        write_reg(&mut h, BASE, reg::QUEUE_DRIVER_LOW, 0x2000);
+        write_reg(&mut h, BASE, reg::QUEUE_DEVICE_LOW, 0x3000);
+        write_reg(&mut h, BASE, reg::QUEUE_READY, 1);
+        assert_eq!(
+            write_reg(&mut h, BASE, reg::STATUS, 15),
+            MmioWriteOutcome::DeviceActivated
+        );
+        assert!(transport.lock().unwrap().device().stopped.is_empty());
+
+        assert_eq!(
+            write_reg(&mut h, BASE, reg::QUEUE_READY, 0),
+            MmioWriteOutcome::QueueStopped(0)
+        );
+        assert_eq!(transport.lock().unwrap().device().stopped, vec![0u16]);
+
+        // 2 回目は増えない。
+        assert_eq!(
+            write_reg(&mut h, BASE, reg::QUEUE_READY, 0),
+            MmioWriteOutcome::Handled
+        );
+        assert_eq!(transport.lock().unwrap().device().stopped, vec![0u16]);
+
+        // 停止後の QueueNotify は無視され、計数も route も動かない。
+        assert!(matches!(
+            write_reg(&mut h, BASE, reg::QUEUE_NOTIFY, 0),
+            MmioWriteOutcome::Ignored(_)
+        ));
+        assert_eq!(h.queue_notify_count(), 0);
+        assert_eq!(route.0.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }

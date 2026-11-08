@@ -2040,6 +2040,10 @@ struct VcpuWorker<B: BlockBackend, N: NetBackend> {
 
 /// `Io` / `Mmio` exit を共有部のデバイスへ振り分け、virtqueue の通知なら完了まで処理する。
 /// 失敗は fail-closed で `Finish` にする（lock の poison を含む）。
+///
+/// 共有部の lock だけを担い、振り分けと停止判断の本体は [`dispatch_exit_with`] にある（KVM なしで試験するための継ぎ目。#4231）。
+/// 試験の対象外として残るのは、この lock / poison と [`VcpuFd::handle_exit`]（`kvm_run` 領域との照合と応答の書き戻し）で、
+/// 後者は実 KVM の `kvm_device_exit_dispatch` が担う。
 fn dispatch_exit<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static>(
     vcpu: &mut VcpuFd,
     shared: &Mutex<VmShared<B, N>>,
@@ -2049,7 +2053,26 @@ fn dispatch_exit<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'stati
         return LoopStep::Finish(StopReason::Failed(poisoned().code()));
     };
     let g = &mut *guard;
-    let outcome = match vcpu.handle_exit(exit, &mut g.devices.dispatcher) {
+    dispatch_exit_with(&mut g.devices, &mut g.memory, exit, |e, d| {
+        vcpu.handle_exit(e, d)
+    })
+}
+
+/// [`dispatch_exit`] の本体（#4231・MVM-1）。`respond` が exit を `ExitDispatcher` へ渡して結果を返す口で、
+/// 本番は `VcpuFd::handle_exit`、試験は dispatcher を直接呼ぶ。以降の通知の完了と停止判断は本番と同じ経路を通る。
+fn dispatch_exit_with<B, N, L, Q, M>(
+    devices: &mut DeviceBus<B, N, L, Q>,
+    memory: &mut GuestMemory<M>,
+    exit: &VcpuExit,
+    respond: impl FnOnce(&VcpuExit, &mut ExitDispatcher) -> Result<DispatchOutcome, MicrovmError>,
+) -> LoopStep
+where
+    B: BlockBackend + Send + 'static,
+    N: NetBackend + Send + 'static,
+    L: InterruptLine,
+    M: GuestMemoryBacking,
+{
+    let outcome = match respond(exit, &mut devices.dispatcher) {
         Ok(o) => o,
         Err(e) => return LoopStep::Finish(StopReason::Failed(e.code())),
     };
@@ -2057,7 +2080,7 @@ fn dispatch_exit<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'stati
     // リング破損などは外側の `Err` ではなく report.queue_error に入り last_avail も進まないため、
     // 続行するとゲストが完了しない要求を待ち続ける。呼び出し元（ここ）が停止を判断する。
     if let Some((id, queue)) = queue_notify_of(&outcome) {
-        match g.devices.complete_queue_notify(id, queue, &mut g.memory) {
+        match devices.complete_queue_notify(id, queue, memory) {
             Err(e) => return LoopStep::Finish(StopReason::Failed(e.code())),
             Ok(report) => {
                 if let Some(e) = report.queue_error() {
@@ -5159,6 +5182,211 @@ mod assemble_tests {
     fn mvm1_697_microvm_is_send() {
         fn assert_send<T: Send>() {}
         assert_send::<MicroVm<MemoryBlockBackend, MemoryNetBackend>>();
+    }
+
+    // ---- #4231: dispatch_exit の経路を通る queue_stopped（MVM-1） ----
+    //
+    // 本番の `DeviceBus`（`SharedTransport` 登録）へ `dispatch_exit_with` 経由で MMIO exit を流す。`VcpuFd` と `VmShared` は KVM が要るため
+    // 使わず、応答の関数だけ dispatcher を直接呼ぶものに替える（実 KVM の `kvm_run` 照合は `kvm_device_exit_dispatch` が担う）。
+    // 回数は `QueueStopped(i)` の結果で数える。`write_queue_ready` は `queue_stopped(i)` の直後にだけ `QueueStopped(i)` を返す
+    // （#4031 の単体試験が固定）ため、1:1 に対応する。
+    // tests/queue_stopped_dispatch.rs と同じ手順の小さな複製なのは、lib の試験から tests/ の補助を使えないため。
+
+    fn mmio_write(addr: u64, value: u32) -> VcpuExit {
+        let mut data = [0u8; 8];
+        data[..4].copy_from_slice(&value.to_le_bytes());
+        VcpuExit::Mmio {
+            phys_addr: addr,
+            data,
+            len: 4,
+            is_write: true,
+        }
+    }
+
+    /// `exit` を `dispatch_exit_with` へ流し、dispatcher の結果を `outcomes` へ残す。
+    fn flow(
+        bus: &mut Bus,
+        mem: &mut Mem,
+        outcomes: &mut Vec<DispatchOutcome>,
+        addr: u64,
+        value: u32,
+    ) -> LoopStep {
+        dispatch_exit_with(bus, mem, &mmio_write(addr, value), |e, d| {
+            let o = d.dispatch(e)?;
+            outcomes.push(o.clone());
+            Ok(o)
+        })
+    }
+
+    fn stopped_count(outcomes: &[DispatchOutcome], queue: u16) -> usize {
+        outcomes
+            .iter()
+            .filter(|o| {
+                matches!(
+                    o,
+                    DispatchOutcome::Mmio {
+                        access: MmioAccess::Write(MmioWriteOutcome::QueueStopped(q)),
+                        ..
+                    } if *q == queue
+                )
+            })
+            .count()
+    }
+
+    fn last_write(outcomes: &[DispatchOutcome]) -> MmioWriteOutcome {
+        match outcomes.last() {
+            Some(DispatchOutcome::Mmio {
+                access: MmioAccess::Write(o),
+                ..
+            }) => o.clone(),
+            other => panic!("expected mmio write, got {other:?}"),
+        }
+    }
+
+    /// 交渉 → キュー設定 → DRIVER_OK。`queues` は `(番号, desc, avail, used)`。
+    fn bring_up(
+        bus: &mut Bus,
+        mem: &mut Mem,
+        out: &mut Vec<DispatchOutcome>,
+        base: u64,
+        queues: &[(u32, u32, u32, u32)],
+    ) {
+        let go = |bus: &mut Bus, mem: &mut Mem, out: &mut Vec<DispatchOutcome>, r: u64, v: u32| {
+            assert_eq!(flow(bus, mem, out, base + r, v), LoopStep::Continue);
+        };
+        go(bus, mem, out, reg::STATUS, 1);
+        go(bus, mem, out, reg::STATUS, 3);
+        // デバイスが提示した下位ワードをそのまま受け入れ、上位ワードは VIRTIO_F_VERSION_1（bit 0）だけ受け入れる。
+        go(bus, mem, out, reg::DEVICE_FEATURES_SEL, 0);
+        let low = {
+            let read = VcpuExit::Mmio {
+                phys_addr: base + reg::DEVICE_FEATURES,
+                data: [0; 8],
+                len: 4,
+                is_write: false,
+            };
+            let o = bus.dispatcher.dispatch(&read).unwrap();
+            let r = o.read_response().unwrap();
+            u32::from_le_bytes([r[0], r[1], r[2], r[3]])
+        };
+        go(bus, mem, out, reg::DRIVER_FEATURES_SEL, 0);
+        go(bus, mem, out, reg::DRIVER_FEATURES, low);
+        go(bus, mem, out, reg::DRIVER_FEATURES_SEL, 1);
+        go(bus, mem, out, reg::DRIVER_FEATURES, 1);
+        go(bus, mem, out, reg::STATUS, 11);
+        assert_eq!(last_write(out), MmioWriteOutcome::FeaturesAccepted);
+        for &(q, desc, avail, used) in queues {
+            go(bus, mem, out, reg::QUEUE_SEL, q);
+            go(bus, mem, out, reg::QUEUE_NUM, 16);
+            go(bus, mem, out, reg::QUEUE_DESC_LOW, desc);
+            go(bus, mem, out, reg::QUEUE_DRIVER_LOW, avail);
+            go(bus, mem, out, reg::QUEUE_DEVICE_LOW, used);
+            go(bus, mem, out, reg::QUEUE_READY, 1);
+        }
+        go(bus, mem, out, reg::STATUS, 15);
+        assert_eq!(last_write(out), MmioWriteOutcome::DeviceActivated);
+    }
+
+    /// MVM-1・#4231: block の QueueReady=0 は `dispatch_exit_with` 経由でちょうど 1 回 `queue_stopped(0)` になり、
+    /// 2 回目は増えない。停止後の QueueNotify は無視され、停止前は処理できた完了処理がデバイス側で拒否される。
+    #[test]
+    fn mvm1_4231_block_queue_ready_zero_stops_once_via_dispatch_exit() {
+        let (mut bus, mut mem) = bus(1, 0);
+        let base = bus.block[0].slot.mmio_base;
+        let id = bus.block[0].id;
+        let mut out = Vec::new();
+        bring_up(
+            &mut bus,
+            &mut mem,
+            &mut out,
+            base,
+            &[(0, 0x1000, 0x2000, 0x3000)],
+        );
+        assert_eq!(stopped_count(&out, 0), 0);
+        assert!(
+            bus.complete_queue_notify(id, 0, &mut mem)
+                .unwrap()
+                .queue_error()
+                .is_none()
+        );
+
+        out.clear();
+        assert_eq!(
+            flow(&mut bus, &mut mem, &mut out, base + reg::QUEUE_READY, 0),
+            LoopStep::Continue
+        );
+        assert_eq!(stopped_count(&out, 0), 1);
+        assert_eq!(last_write(&out), MmioWriteOutcome::QueueStopped(0));
+
+        assert_eq!(
+            flow(&mut bus, &mut mem, &mut out, base + reg::QUEUE_READY, 0),
+            LoopStep::Continue
+        );
+        assert_eq!(last_write(&out), MmioWriteOutcome::Handled);
+        assert_eq!(stopped_count(&out, 0), 1);
+
+        // 停止後の QueueNotify は受理されず、完了処理に進まない。
+        assert_eq!(
+            flow(&mut bus, &mut mem, &mut out, base + reg::QUEUE_NOTIFY, 0),
+            LoopStep::Continue
+        );
+        assert!(matches!(last_write(&out), MmioWriteOutcome::Ignored(_)));
+        // デバイス側の効果: 停止したキューの処理はリング側のエラーとして報告される。
+        let err = bus
+            .complete_queue_notify(id, 0, &mut mem)
+            .unwrap()
+            .queue_error()
+            .map(MicrovmError::code);
+        assert_eq!(err, Some(MicrovmErrorCode::FailedPrecondition));
+    }
+
+    /// MVM-1・#4231: net はキュー 1 だけを止めても、キュー 0 は有効なまま。回数は対象のキューごとに 1。
+    #[test]
+    fn mvm1_4231_net_queue_ready_zero_stops_only_target_queue_via_dispatch_exit() {
+        let (mut bus, mut mem) = bus(0, 1);
+        let base = bus.net[0].slot.mmio_base;
+        let id = bus.net[0].id;
+        let mut out = Vec::new();
+        bring_up(
+            &mut bus,
+            &mut mem,
+            &mut out,
+            base,
+            &[(0, 0x1000, 0x2000, 0x3000), (1, 0x4000, 0x5000, 0x6000)],
+        );
+
+        out.clear();
+        assert_eq!(
+            flow(&mut bus, &mut mem, &mut out, base + reg::QUEUE_SEL, 1),
+            LoopStep::Continue
+        );
+        assert_eq!(
+            flow(&mut bus, &mut mem, &mut out, base + reg::QUEUE_READY, 0),
+            LoopStep::Continue
+        );
+        assert_eq!(last_write(&out), MmioWriteOutcome::QueueStopped(1));
+        assert_eq!(
+            flow(&mut bus, &mut mem, &mut out, base + reg::QUEUE_READY, 0),
+            LoopStep::Continue
+        );
+        assert_eq!(last_write(&out), MmioWriteOutcome::Handled);
+        assert_eq!(stopped_count(&out, 1), 1);
+        assert_eq!(stopped_count(&out, 0), 0);
+
+        // キュー 0 は動き続け、キュー 1 の処理だけが拒否される。
+        assert!(
+            bus.complete_queue_notify(id, 0, &mut mem)
+                .unwrap()
+                .queue_error()
+                .is_none()
+        );
+        assert_eq!(
+            bus.complete_queue_notify(id, 1, &mut mem)
+                .unwrap()
+                .queue_error()
+                .map(MicrovmError::code),
+            Some(MicrovmErrorCode::FailedPrecondition)
+        );
     }
 }
 

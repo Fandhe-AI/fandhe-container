@@ -42,7 +42,8 @@ mod linux {
 
     use fandhe_container_core::cgroups::{CgroupName, Controller, ControllerSet, PidsMax};
     use fandhe_container_core::exec::{
-        ExecCgroupName, ExecCgroupRemoval, ExecChildCgroup, remove_exec_child_cgroup_in,
+        ExecCgroupName, ExecCgroupPresence, ExecCgroupRemoval, ExecChildCgroup,
+        exec_child_cgroup_presence_in, remove_exec_child_cgroup_in,
     };
     use fandhe_container_core::traits::ContainerId;
 
@@ -109,6 +110,18 @@ mod linux {
             .expect("create exec child cgroup");
         let exec_dir = container_dir.join(exec_name.as_str());
         assert!(exec_dir.is_dir());
+        // #4221・CRI-5・SEC-1・REPAIR-12: 本番の消滅確認（plugin-cri の `CgroupExtinctionProbe`）が使う読み取り専用の確認。
+        // 作成直後・プロセスが居る間・`cgroup.kill` の後で未回収の間は `Present`（未確認を保つ）、回収後にだけ `Absent`、
+        // コンテナ cgroup 自体が無ければ `ContainerCgroupAbsent`（確認済み）になる。確認は cgroup を変更しない。
+        assert_eq!(
+            exec_child_cgroup_presence_in(&container_path, &exec_name).unwrap(),
+            ExecCgroupPresence::Present
+        );
+        assert_eq!(
+            exec_child_cgroup_presence_in(&format!("{container_path}-missing"), &exec_name)
+                .unwrap(),
+            ExecCgroupPresence::ContainerCgroupAbsent
+        );
         // 内部プロセス禁止規則: コンテナ cgroup・子 cgroup とも controller を有効化しない。
         for dir in [&container_dir, &exec_dir] {
             assert_eq!(
@@ -123,6 +136,11 @@ mod linux {
         });
         let members = pids_in(&exec_dir);
         assert!(members.contains(&command.id()));
+        assert_eq!(
+            exec_child_cgroup_presence_in(&container_path, &exec_name).unwrap(),
+            ExecCgroupPresence::Present,
+            "populated"
+        );
 
         command.kill().expect("kill the direct child only");
         crate::reap::reap(&mut command, crate::reap::reap_within())
@@ -143,12 +161,24 @@ mod linux {
         wait_until("all descendants to be gone", || {
             members.iter().all(|p| !pid_exists(*p))
         });
+        // プロセスが消えても、ディレクトリを回収する（rmdir）までは `Present`（確認の読み取りは削除しない）。
+        assert_eq!(
+            exec_child_cgroup_presence_in(&container_path, &exec_name).unwrap(),
+            ExecCgroupPresence::Present,
+            "emptied but not yet reaped"
+        );
+        assert!(exec_dir.is_dir(), "the probe must not remove the cgroup");
         assert_eq!(
             remove_exec_child_cgroup_in(&container_path, &exec_name, Duration::from_secs(5))
                 .unwrap(),
             ExecCgroupRemoval::Removed
         );
         assert!(!exec_dir.exists());
+        assert_eq!(
+            exec_child_cgroup_presence_in(&container_path, &exec_name).unwrap(),
+            ExecCgroupPresence::Absent,
+            "reaped"
+        );
         // (4) 冪等: 削除済みの後始末は成功扱い（Absent）。
         assert_eq!(
             remove_exec_child_cgroup_in(&container_path, &exec_name, Duration::from_secs(5))

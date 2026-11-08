@@ -1,6 +1,9 @@
 //! `ShimExecLauncher` の試験（CRI-5・CRI-1・SEC-1・REPAIR-5・#4148）。root も実コンテナも使わず、偽の helper
 //! （`/bin/sleep` を helper の `Child` とし、channel の相手は試験スレッドが演じる）で終了コードの写像・kill の範囲・
 //! 未確認の保持・期限・drop の契約を具体値で照合する。実 supervisor と実コンテナでの通しは #4150。
+//! #4221 の消滅確認（`Started` が運ぶ exec 子 cgroup の名前を probe へ渡す・確認できた exec だけ終了へ進める・版の不一致は拒否）も
+//! 偽の probe で照合する。Delete が登録を除去する側（`Exited` なら除去・`Err` なら拒否）は cri の
+//! `task_service` の試験（`cri5_3681_delete_exec_each_status` ほか）が `TaskExecProcess` の状態ごとに照合している。
 
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::DirBuilderExt as _;
@@ -8,6 +11,7 @@ use std::os::unix::net::UnixStream;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU8, Ordering};
 
+use fandhe_container_core::exec::ExecError;
 use fandhe_container_core::state_store::{FileStateStore, StateRoot};
 use fandhe_container_core::traits::{ContainerStatus, CreateStateRequest, UpdateStateRequest};
 use fandhe_container_cri::error::CriErrorCode;
@@ -60,11 +64,19 @@ impl HelperSpawner for FakeSpawner {
     }
 }
 
-/// 試験が結果を切り替えられる probe（0: Unknown、1: Confirmed、2: Failed）。
-struct FakeProbe(AtomicU8);
+/// 偽の helper が `Started` で運ぶ exec 子 cgroup の名前。
+const CG: &str = "exec-4242-0";
+
+fn cg() -> ExecCgroupName {
+    ExecCgroupName::new(CG).expect("name")
+}
+
+/// 試験が結果を切り替えられる probe（0: Unknown、1: Confirmed、2: Failed）。受け取った target も記録する。
+struct FakeProbe(AtomicU8, Mutex<Vec<ExecExtinctionTarget>>);
 
 impl ExecExtinctionProbe for FakeProbe {
-    fn confirm(&self, _c: &ContainerId) -> ExtinctionOutcome {
+    fn confirm(&self, t: &ExecExtinctionTarget) -> ExtinctionOutcome {
+        self.1.lock().expect("lock").push(t.clone());
         match self.0.load(Ordering::SeqCst) {
             1 => ExtinctionOutcome::Confirmed,
             2 => ExtinctionOutcome::Failed,
@@ -150,7 +162,7 @@ impl Fixture {
 }
 
 fn probe(v: u8) -> Arc<FakeProbe> {
-    Arc::new(FakeProbe(AtomicU8::new(v)))
+    Arc::new(FakeProbe(AtomicU8::new(v), Mutex::new(Vec::new())))
 }
 
 fn short() -> ExecBudgets {
@@ -159,6 +171,7 @@ fn short() -> ExecBudgets {
         started: Duration::from_millis(300),
         session: Duration::from_millis(200),
         result_grace: Duration::from_millis(200),
+        extinction_grace: Duration::from_millis(300),
     }
 }
 
@@ -205,7 +218,7 @@ fn finishing(outcome: StreamExecOutcome) -> Script {
     let outcome = Mutex::new(Some(outcome));
     Arc::new(move |end, mask| {
         recv_stdio_handover(&end, mask, deadline()).expect("handover");
-        send_started(&end, deadline()).expect("started");
+        send_started(&end, &cg(), deadline()).expect("started");
         if let Some(o) = outcome.lock().expect("lock").take() {
             send_result(&end, &o, deadline()).expect("result");
         }
@@ -216,7 +229,7 @@ fn finishing(outcome: StreamExecOutcome) -> Script {
 fn holding() -> Script {
     Arc::new(|end, mask| {
         recv_stdio_handover(&end, mask, deadline()).expect("handover");
-        send_started(&end, deadline()).expect("started");
+        send_started(&end, &cg(), deadline()).expect("started");
         std::thread::sleep(Duration::from_secs(10));
     })
 }
@@ -275,7 +288,11 @@ fn cri5_4148_signaled_exit_is_128_plus_signal() {
 fn sec1_4148_sigkill_hits_only_helper_and_stays_unconfirmed() {
     let fx = Fixture::new("kill");
     let pr = probe(0);
-    let (l, pids) = fx.launcher(holding(), Arc::clone(&pr), ExecBudgets::default());
+    let budgets = ExecBudgets {
+        extinction_grace: Duration::from_millis(100),
+        ..ExecBudgets::default()
+    };
+    let (l, pids) = fx.launcher(holding(), Arc::clone(&pr), budgets);
     let p = l.launch(&cid("run1"), &eid(), &ok_spec()).expect("launch");
     assert_eq!(p.status(), Ok(ExecProcessStatus::Running));
     assert_eq!(l.tracked_helpers(), 1);
@@ -519,4 +536,219 @@ fn repair5_4148_drop_keeps_helper_and_shutdown_stops_it() {
         (e.code(), e.message()),
         (CriErrorCode::Unavailable, "exec launcher is stopped")
     );
+}
+
+/// 材料を 1 つ書き換えた `FakeProbe` の記録を取り出す。
+fn recorded(pr: &FakeProbe) -> Vec<ExecExtinctionTarget> {
+    pr.1.lock().expect("lock").clone()
+}
+
+/// CRI-5・SEC-1・#4221: kill の後の確認で、`Started` が運んだ exec 子 cgroup の名前と launch 時のコンテナが probe へ渡る。
+#[test]
+fn cri5_4221_started_cgroup_name_reaches_probe() {
+    let fx = Fixture::new("name");
+    let pr = probe(0);
+    let (l, _) = fx.launcher(holding(), Arc::clone(&pr), ExecBudgets::default());
+    let p = l.launch(&cid("run1"), &eid(), &ok_spec()).expect("launch");
+    p.signal(Signal::SIGKILL).expect("kill");
+    assert!(p.status().is_err());
+    let got = recorded(&pr);
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].cgroup.as_str(), "exec-4242-0");
+    assert_eq!(got[0].container.as_str(), "run1");
+    // fixture の記録には cgroup 配置が無い（launch の時点の値を保持する）。
+    assert!(got[0].placement.is_none());
+}
+
+/// CRI-5・REPAIR-5・#4221: kill した exec は、回収が少し遅れて確認できても Wait が終了（コード無し）を返す。
+#[test]
+fn cri5_4221_kill_then_confirmed_wait_returns_exit() {
+    let fx = Fixture::new("killwait");
+    let pr = probe(0);
+    let budgets = ExecBudgets {
+        extinction_grace: Duration::from_secs(5),
+        ..ExecBudgets::default()
+    };
+    let (l, _) = fx.launcher(holding(), Arc::clone(&pr), budgets);
+    let p = l.launch(&cid("run1"), &eid(), &ok_spec()).expect("launch");
+    p.signal(Signal::SIGKILL).expect("kill");
+    let flip = Arc::clone(&pr);
+    let t = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        flip.0.store(1, Ordering::SeqCst);
+    });
+    assert_eq!(
+        p.wait_exit(WAIT, Duration::from_millis(10), &never_cancel),
+        Ok(None)
+    );
+    t.join().expect("join");
+    assert_eq!(p.status(), Ok(ExecProcessStatus::Exited { code: None }));
+    assert!(
+        recorded(&pr).len() >= 2,
+        "the probe is polled during the wait"
+    );
+}
+
+/// CRI-5・REPAIR-5・#4221: 監視期限が切れた exec も、確認できれば Wait が終了を返す（確認できなければ猶予後に UNAVAILABLE）。
+#[test]
+fn cri5_4221_expired_then_confirmed_wait_returns_exit() {
+    let fx = Fixture::new("expired");
+    let pr = probe(0);
+    let budgets = ExecBudgets {
+        extinction_grace: Duration::from_secs(5),
+        ..short()
+    };
+    let (l, _) = fx.launcher(holding(), Arc::clone(&pr), budgets);
+    let p = l.launch(&cid("run1"), &eid(), &ok_spec()).expect("launch");
+    let flip = Arc::clone(&pr);
+    // session 200ms + grace 200ms で監視期限が切れた後に回収が済んだ想定。
+    let t = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(600));
+        flip.0.store(1, Ordering::SeqCst);
+    });
+    assert_eq!(
+        p.wait_exit(WAIT, Duration::from_millis(10), &never_cancel),
+        Ok(None)
+    );
+    t.join().expect("join");
+}
+
+/// CRI-5・REPAIR-3・#4221: helper 自身の `Failed(Timeout)` の後も、確認できれば Wait が終了を返す。
+#[test]
+fn cri5_4221_helper_failed_then_confirmed_wait_returns_exit() {
+    let fx = Fixture::new("hfailed");
+    let (l, _) = fx.launcher(
+        finishing(StreamExecOutcome::Failed(ErrorCode::Timeout)),
+        probe(1),
+        ExecBudgets::default(),
+    );
+    let p = l.launch(&cid("run1"), &eid(), &ok_spec()).expect("launch");
+    assert_eq!(
+        p.wait_exit(WAIT, Duration::from_millis(10), &never_cancel),
+        Ok(None)
+    );
+}
+
+/// SEC-1・CRI-5・#4221: 確認できないままなら `UNAVAILABLE` を保つ（猶予の後に同じコードで失敗し、status も未確認）。
+#[test]
+fn sec1_4221_unconfirmed_keeps_unavailable_after_grace() {
+    let fx = Fixture::new("keep");
+    let pr = probe(0);
+    let budgets = ExecBudgets {
+        extinction_grace: Duration::from_millis(200),
+        ..ExecBudgets::default()
+    };
+    let (l, _) = fx.launcher(holding(), Arc::clone(&pr), budgets);
+    let p = l.launch(&cid("run1"), &eid(), &ok_spec()).expect("launch");
+    p.signal(Signal::SIGKILL).expect("kill");
+    let t = Instant::now();
+    let e = p
+        .wait_exit(WAIT, Duration::from_millis(10), &never_cancel)
+        .expect_err("unconfirmed");
+    assert_eq!(
+        (e.code(), e.message()),
+        (
+            CriErrorCode::Unavailable,
+            "exec termination is not confirmed"
+        )
+    );
+    assert!(t.elapsed() >= Duration::from_millis(200));
+    assert!(t.elapsed() < Duration::from_secs(3));
+    let e = p.status().expect_err("still unconfirmed");
+    assert_eq!(e.code(), CriErrorCode::Unavailable);
+}
+
+/// REPAIR-5・#4221: Wait 全体の期限が確認の猶予より先に来たら `DEADLINE_EXCEEDED`、取り消しは `UNAVAILABLE`。
+#[test]
+fn repair5_4221_wait_deadline_and_cancel_win_over_grace() {
+    let fx = Fixture::new("order");
+    let (l, _) = fx.launcher(holding(), probe(0), ExecBudgets::default());
+    let p = l.launch(&cid("run1"), &eid(), &ok_spec()).expect("launch");
+    p.signal(Signal::SIGKILL).expect("kill");
+    let e = p
+        .wait_exit(
+            Duration::from_millis(100),
+            Duration::from_millis(10),
+            &never_cancel,
+        )
+        .expect_err("timeout");
+    assert_eq!(e.code(), CriErrorCode::Timeout);
+    let e = p
+        .wait_exit(WAIT, Duration::from_millis(10), &|| true)
+        .expect_err("cancelled");
+    assert_eq!(
+        (e.code(), e.message()),
+        (CriErrorCode::Unavailable, "wait cancelled")
+    );
+}
+
+/// SEC-1・#4221: 本番の probe は記録に cgroup 配置が無ければ確認の材料が無く `Unknown`（fail-closed）。
+#[test]
+fn sec1_4221_production_probe_without_placement_is_unknown() {
+    let t = ExecExtinctionTarget {
+        container: cid("run1"),
+        placement: None,
+        cgroup: cg(),
+    };
+    assert_eq!(
+        CgroupExtinctionProbe.confirm(&t),
+        ExtinctionOutcome::Unknown
+    );
+}
+
+/// SEC-1・#4221: core の確認結果の写像。不在だけが `Confirmed`、残っている・失敗は `Unknown`。
+#[test]
+fn sec1_4221_production_probe_mapping() {
+    let map = CgroupExtinctionProbe::map_presence;
+    assert_eq!(
+        map(Ok(ExecCgroupPresence::Absent)),
+        ExtinctionOutcome::Confirmed
+    );
+    assert_eq!(
+        map(Ok(ExecCgroupPresence::ContainerCgroupAbsent)),
+        ExtinctionOutcome::Confirmed
+    );
+    assert_eq!(
+        map(Ok(ExecCgroupPresence::Present)),
+        ExtinctionOutcome::Unknown
+    );
+    let err: ExecError = ExecCgroupName::new("bad").expect_err("invalid name");
+    assert_eq!(map(Err(err)), ExtinctionOutcome::Unknown);
+}
+
+/// SEC-1・REPAIR-3・#4221: 旧い version 1 の `Started`（payload なし）は拒否され、launch は失敗して helper は止まり、probe は呼ばれない。
+/// 不正な名前欄の `Started`（version 2）も同じ。確認済みとして扱わない（fail-closed）。
+#[test]
+fn sec1_4221_v1_or_malformed_started_is_rejected_and_never_confirmed() {
+    use std::io::Write as _;
+    let frames: [Vec<u8>; 2] = [
+        // version 1 の `Started`（header のみ）。
+        b"FCSX\x01\x02\x00\x00".to_vec(),
+        // version 2 だが名前欄が不正（name_len = 0）。
+        {
+            let mut v = b"FCSX\x02\x02\x00\x41".to_vec();
+            v.extend_from_slice(&[0u8; 65]);
+            v
+        },
+    ];
+    for bytes in frames {
+        let fx = Fixture::new("v1");
+        let bytes = Arc::new(bytes);
+        let script: Script = Arc::new(move |mut end, mask| {
+            recv_stdio_handover(&end, mask, deadline()).expect("handover");
+            end.write_all(&bytes).expect("raw frame");
+            std::thread::sleep(Duration::from_secs(1));
+        });
+        let pr = probe(1);
+        let (l, pids) = fx.launcher(script, Arc::clone(&pr), ExecBudgets::default());
+        let e = l
+            .launch(&cid("run1"), &eid(), &ok_spec())
+            .err()
+            .expect("rejected");
+        assert_eq!(e.code(), CriErrorCode::InvalidArgument);
+        assert_eq!(l.tracked_helpers(), 0);
+        let helper = *pids.lock().expect("lock").first().expect("pid");
+        assert!(gone(helper), "helper must be reaped");
+        assert!(recorded(&pr).is_empty(), "probe must never be consulted");
+    }
 }

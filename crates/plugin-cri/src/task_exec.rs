@@ -2,8 +2,8 @@
 //!
 //! 呼び出し元: shim の `TaskService`（cri の `shim_v2::task_service`）が `Start(exec_id)` で `ShimExecLauncher::launch` を呼び、
 //! 返る `TaskExecProcess` を登録簿（`ExecRegistry`）が保持して `State` / `Kill` / `Wait` / `Delete`（`exec_id` つき）に使う。
-//! 差し込み（`registry_in` から `TaskService::with_exec_launcher`）は #4149、実機前提試験は #4150 の範囲で、本モジュールは
-//! 部品と単体試験までを担う。cri に実装を置かず supervisor 依存も足さないのは PLUG-1 のため
+//! 差し込み（`shim::registry_parts_in` から v2・v3 の `TaskService::with_exec_launcher`。停止時は登録簿の drop で `shutdown_all`）は
+//! #4149 で済み、実機前提試験は #4150 の範囲で、本モジュールは部品と単体試験までを担う。cri に実装を置かず supervisor 依存も足さないのは PLUG-1 のため
 //! （設計は `docs/design/shim-v2-production-binary.md`「Exec の橋渡し」案 A）。
 //!
 //! # 方式

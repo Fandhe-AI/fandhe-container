@@ -4,10 +4,10 @@
 //! 行う。[`super::task_service::TaskService`] が `Exec` で [`parse_process_spec`] と [`ExecRegistry`] を使い、
 //! `Start(exec_id)` で [`TaskExecLauncher`] を呼ぶ。
 //!
-//! 起動役 [`TaskExecLauncher`] は本モジュールで定義するだけで、本番の実装は無い（REPAIR-3）。`ContainerRuntime`
+//! 起動役 [`TaskExecLauncher`] は本モジュールでトレイトとして定義するだけで、実装は持たない。`ContainerRuntime`
 //! （core）に exec は無く、本番の入口は supervisor の `run_command_with_pidfd` にあるが cri は依存しない
-//! （PLUG-1 の境界を保つ）。supervisor への橋渡しと配線は未実装で、追跡 issue は #4053（TASK-62.7 の範囲。
-//! 閉じた #803 は ContainerRuntime 境界の接続までで、exec の起動役は含まない）。
+//! （PLUG-1 の境界を保つ）。本番の実装は plugin-cri の `task_exec::ShimExecLauncher`（Linux のみ。#4148）で、shim バイナリの
+//! 登録簿が v2・v3 の `TaskService` へ差し込む（#4149。TASK-62.7）。
 //! 差し込まれない既定の `TaskService` は `Exec` / `Start(exec_id)` と、`exec_id` つきの `State` / `Kill` / `Wait` /
 //! `Delete` を `UNIMPLEMENTED` で拒否する（fail-closed）。
 //!
@@ -121,7 +121,7 @@ impl ExecProcessSpec {
 /// - [`Self::wait_exit`] は期限で `Timeout`、取り消しで `Unavailable` を返し、有界の刻みで確認する（REPAIR-5）。
 /// - drop は資源の解放だけを行い、プロセスの停止は要求しない（コンテナ削除の purge で drop される）。
 ///
-/// 本番の実装は無い（REPAIR-3）。
+/// 本番の実装は plugin-cri の `task_exec` の `ShimExecProcess`（Linux のみ。#4148）。
 pub trait TaskExecProcess: Send + Sync {
     /// 起動したプロセスの PID（不明なら `None`）。
     fn pid(&self) -> Option<NonZeroU32>;
@@ -203,7 +203,8 @@ pub(super) fn sleep_until(until: Instant, cancelled: &dyn Fn() -> bool) -> bool 
 /// - panic しないこと。panic すると登録簿の状態が `Starting` のまま残り、コンテナのゲートも毒される
 ///   （以後そのストライプは `INTERNAL`）。
 ///
-/// 本番の実装は無い（REPAIR-3。supervisor の exec 入口への橋渡しは追跡先は #4053）。
+/// 本番の実装は plugin-cri の `task_exec::ShimExecLauncher`（Linux のみ。#4148。shim バイナリの登録簿が差し込む。#4149）。
+/// 非 Linux と、起動役を差さない `TaskService`（試験を含む）は `UNIMPLEMENTED` のまま（REPAIR-3）。
 pub trait TaskExecLauncher: Send + Sync {
     /// exec プロセスを起動する。
     fn launch(

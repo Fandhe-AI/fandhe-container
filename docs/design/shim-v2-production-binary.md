@@ -135,12 +135,12 @@ containerd は shim が死んだ後や start が失敗した後に `-id <id> -bu
 ### 送る種別の範囲
 
 - 送る: TaskCreate・TaskStart・TaskDelete・TaskExit の 4 種（runc shim の `cmd/containerd-shim-runc-v2/task/service.go` が `s.send` で送る種別のうち、本リポで RPC が実装済みのもの）
-- 除く: TaskExecAdded・TaskExecStarted（exec の起動役の本番実装が無く `UNIMPLEMENTED`）、TaskPaused・TaskResumed・TaskCheckpointed（Pause・Resume・Checkpoint が `UNIMPLEMENTED`）、TaskOOM（memory.events を監視する仕組みが無い）
+- 除く: TaskExecAdded・TaskExecStarted（起動役は配線済みだが、送る実装が無い。後続）、TaskPaused・TaskResumed・TaskCheckpointed（Pause・Resume・Checkpoint が `UNIMPLEMENTED`）、TaskOOM（memory.events を監視する仕組みが無い）
 - 再評価条件: 各 RPC が実装されたとき
 
 ## Exec の橋渡し（#4147・CRI-5・CRI-1・PLUG-1・SEC-1・REPAIR-3・REPAIR-5・TASK-62.7）
 
-shim v2 の `Exec`・`Start(exec_id)`・`exec_id` つきの `State` / `Kill` / `Wait` / `Delete` は、注入トレイト `TaskExecLauncher` / `TaskExecProcess`（`crates/cri/src/shim_v2/exec.rs`）と登録簿 `ExecRegistry` まで実装済みで、本番の起動役だけが無い。本節は本番の起動役の橋渡し方式を、後続の #4148（本体）・#4149（配線）・#4150（実機前提試験）が正として読めるよう記録する。本メモは main の設計判断の記録であり、オーナー承認は得ていない（1 時間の上限は #4116 の暫定値に従う）。
+shim v2 の `Exec`・`Start(exec_id)`・`exec_id` つきの `State` / `Kill` / `Wait` / `Delete` は、注入トレイト `TaskExecLauncher` / `TaskExecProcess`（`crates/cri/src/shim_v2/exec.rs`）と登録簿 `ExecRegistry` まで実装済みで、本番の起動役は #4148（本体）・#4149（配線）で入った。本節は本番の起動役の橋渡し方式を、後続の #4148（本体）・#4149（配線）・#4150（実機前提試験）が正として読めるよう記録する。本メモは main の設計判断の記録であり、オーナー承認は得ていない（1 時間の上限は #4116 の暫定値に従う）。
 
 ### 前提（事実）
 
@@ -184,7 +184,7 @@ A の共通モジュールの候補は `crates/plugin-cri/src/exec_helper.rs`（
 | `status()` | `Result` を受けるまで `Running`。`Exited(n)` / `Signaled(s)` / `NotStarted` は `map_outcome` の写像で `Exited { code }`。`Started` 後の `Failed(code)` は消滅の証明にならないため一律には `Exited` にしない。消滅を確認できた種別だけ `Exited { code: None }`（State は 255）にし、確認できない種別はエラーとして保持する（下表） |
 | `signal(sig)` | SIGKILL のときだけ受け、`HelperGuard::kill` で helper を SIGKILL する。helper の制御チャネルが閉じると supervisor の `exec_guard` が通知済みの exec 子 cgroup を `cgroup.kill` で回収する。届くのは exec 子 cgroup だけで init には届かない。SIGKILL 以外は `UNIMPLEMENTED`（"exec signal is not supported"）で拒否し、黙って SIGKILL へ読み替えない（REPAIR-3）。終了済みは `NOT_FOUND` |
 | `wait_exit` | 監視スレッドの結果を `Mutex` + `Condvar` で受けるイベント駆動。取り消しは 10 ms 以下の刻みで確認し、期限で `Timeout`、取り消しで `Unavailable`（REPAIR-5） |
-| drop | 契約どおり停止は要求しない。helper の持ち主は launcher の追跡一覧に残り、shim の停止時に全 helper を kill する（配線は #4149） |
+| drop | 契約どおり停止は要求しない。helper の持ち主は launcher の追跡一覧に残り、shim の停止時に全 helper を kill する（配線済み。登録簿の drop で `shutdown_all`。#4149） |
 
 `Started` 後の `Failed(code)` の扱い（fail-closed。`TaskExecProcess::status` の「照会失敗は `Err`」の契約に合わせる）:
 
@@ -281,13 +281,12 @@ TaskService は期限を足さず、実装側が持つ（トレイトの契約�
 - **#4148 の実装記録（本体は実装済み。配線は #4149）**: 起動役は `crates/plugin-cri/src/task_exec.rs`（Linux 実装は `task_exec/linux.rs`、非 Linux は `UNIMPLEMENTED` のスタブ）。共通モジュール `exec_helper.rs` への切り出しは行わず、`streaming/exec_launcher.rs` の `HelperGuard`・`Shared`・各期限定数・`HelperSpawner` を `pub(crate)` にして再利用した（移動のみのリファクタで既存の async 側の試験を動かすリスクを避けるため。重複するのは `launch` の順序だけ）。`TaskService::kill_exec` は `status()` が `Err` でも SIGKILL のときだけ `signal` へ進む。
   - 消滅確認の暫定（REPAIR-3）: 上の「SIGKILL 後の消滅確認」は launcher からは観測できなかった。`ExecGuardPool` は supervisor の中にあり、`Started` の payload は 0 バイト、`Result` は不透明な `Failed(code)` で、exec 子 cgroup の名前（helper 内で生成）が plugin-cri に届かない。pid からの推測は pid 再利用による誤停止のため採らない。そこで差し込み口 `ExecExtinctionProbe` だけを置き、本番の `UnconfirmedExtinctionProbe` は常に `Unknown` を返す。kill・期限切れ・`Started` 後の `Failed` の exec は `Exited` にならず `status()` が `UNAVAILABLE`（"exec termination is not confirmed"）を保ち、Wait は失敗し Delete は除去を拒む。帰結として、これらの登録はコンテナ削除の purge まで残り、コンテナあたりの exec の枠を消費する。解消には supervisor 側の wire 拡張（`Started` へ cgroup 名を載せる、または新しい frame kind。8 バイトの payload を超えるため version 変更）が要り、後続候補とする
   - `pid()` は `None`（State の pid は 0）。SIGKILL 以外・env・cwd・user は `UNIMPLEMENTED`
-- **#4149 配線**: `registry_in` で scoped root と同じ `StateStore` から launcher を作り、`TaskService::with_exec_launcher` で v2・v3 に差す。shim の停止時に追跡中の helper を kill する。「本番の実装は無い」の表記（`exec.rs`・`shim_v2.rs`・`shim.rs`・本メモの「残り」・`docs/setup/linux.md`）を更新する
+- **#4149 の実装記録**: `registry_parts_in`（`registry_in` の本体）で、scoped root と同じパス・同じ `StateStore` から `ShimExecLauncher::production` を 1 つ作り、停止用の包み `StopHelpersOnDrop` を通して v2・v3 の両方へ `with_exec_launcher` で差す（同時数の枠と追跡一覧は shim で 1 つ）。停止時の kill は cri の bootstrap に注入口を足さず、`run_serve` の終わりに登録簿が drop されて包みの最後の参照が落ちたとき `shutdown_all` が走る形にした（Shutdown RPC でも socket 消失でも同じ）。採らない案: bootstrap への停止注入口（cri の公開 API が変わる）、`ShutdownSignal` の見張りスレッド（socket 消失の経路を拾えず常駐スレッドが増える）、プロセス全体の `OnceLock`（同一プロセスの複数登録簿で衝突）、`ShimExecLauncher` 本体への `Drop`（#4148 の契約「drop は止めない」を変える）。非 Linux は `EmptyTaskService` のまま。試験: `cri5_4149_registry_exec_reaches_launcher`・`repair5_4149_registry_drop_stops_exec_helpers`・`cri5_4149_non_linux_registry_stays_empty`・bin 経由の `cri5_4149_bin_exec_*`。残余（REPAIR-3）: サーバー停止の期限切れで接続スレッドが残る場合と shim の SIGKILL では `shutdown_all` が走らず、helper は exec の期限（最長 1 時間）まで残る（PDEATHSIG を使わない既存の残余と同じ）。コンテナの削除・停止で cgroup が回収されれば helper は終わる。
 - **#4150 実機前提試験**: shim の ttrpc を直接叩き、最小の Process spec（env 空・cwd `/`・user なし・stdio なし）で exec し、CapEff・Seccomp・ns の inode・exec 子 cgroup の配置を具体値で init と照合する
 - **後続候補（未起票）**: stream-exec の Signal frame、`Started` への pid の追加、stdio の FIFO の受け入れ、spec の欄を `config.json` と照合して受ける拡張と supervisor の exec ごとの env・cwd・user（#2712・#680 系列）、cri → supervisor の辺の機械照合（`dependency_direction.rs` の拡張）
 
 ## 残り（REPAIR-3）
 
-- exec の起動役（`TaskExecLauncher`）の配線。本体は #4148 で実装済み（`ShimExecLauncher`）だが差し込まれておらず、exec は `UNIMPLEMENTED` のまま。方式は「Exec の橋渡し」節。配線は #4149、実機前提試験は #4150
 - containerd が shim の死後に呼ぶ `delete` action の停止・回収・応答は実装済みで、bin 経由の試験も済み（D5・D6。#4151・#4152・#4153）。回収しない場合（Creating の記録・supervisor が居ない Running の記録。fail-closed）は D6 の「残余」、実 containerd での確認は #3685
 - rootful での shim 対応（#2442・#2241 の判断待ち）
 - containerd 実機シナリオの CI への組み込み（ランナーの containerd の版に依存する）

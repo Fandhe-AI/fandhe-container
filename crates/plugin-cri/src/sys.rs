@@ -207,6 +207,117 @@ fn register() -> Result<(), PluginError> {
     Ok(())
 }
 
+/// [`poll_writable`] の結果（REPAIR-5・CRI-6・#4077）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WritePoll {
+    /// 1 バイト以上書ける（パイプは `PIPE_BUF` まで、pty は空きがある）。
+    Ready,
+    /// 期限内に書けるようにならなかった（または `EINTR`）。
+    NotReady,
+    /// 相手が閉じた・エラー・無効な fd（`POLLERR`・`POLLHUP`・`POLLNVAL`）。
+    Closed,
+}
+
+/// `fd` が書き込み可能になるまで最大 `timeout_ms` ミリ秒待つ（`poll(2)`。`fd` の記述のフラグは変えない）。
+///
+/// 呼び出し元は `supervisor_attach` の入力スレッド。blocking の `write` の前に呼び、取り消しを見ながら
+/// 有限の刻みで待つことで、コンテナが stdin を読まなくても回収できるようにする（REPAIR-5）。
+/// 失敗（`poll` の `EINTR` 以外のエラー）は `Err`。非対応の組では常に `Err(Unsupported)`（呼び出し側は書き込みを諦める）。
+pub fn poll_writable(
+    fd: std::os::fd::BorrowedFd<'_>,
+    timeout_ms: i32,
+) -> std::io::Result<WritePoll> {
+    poll_imp::poll_writable(fd, timeout_ms)
+}
+
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+mod poll_imp {
+    use std::os::fd::{AsRawFd as _, BorrowedFd};
+
+    use super::WritePoll;
+
+    // 値は Linux の `include/uapi/asm-generic/poll.h`（x86_64・aarch64 とも同じ）と macOS の `sys/poll.h` で同じ。
+    const POLLOUT: i16 = 0x0004;
+    const POLLERR: i16 = 0x0008;
+    const POLLHUP: i16 = 0x0010;
+    const POLLNVAL: i16 = 0x0020;
+
+    /// `struct pollfd`（`int fd; short events; short revents;`。Linux・macOS 共通のレイアウト）。
+    #[repr(C)]
+    struct PollFd {
+        fd: i32,
+        events: i16,
+        revents: i16,
+    }
+
+    /// `nfds_t`: Linux は `unsigned long`、macOS は `unsigned int`。
+    #[cfg(target_os = "linux")]
+    type NfdsT = std::ffi::c_ulong;
+    #[cfg(target_os = "macos")]
+    type NfdsT = std::ffi::c_uint;
+
+    unsafe extern "C" {
+        // SAFETY（宣言そのものの妥当性）: POSIX の `int poll(struct pollfd *fds, nfds_t nfds, int timeout)`。
+        // `PollFd` は上のとおり `struct pollfd` と同じレイアウト。
+        fn poll(fds: *mut PollFd, nfds: NfdsT, timeout: i32) -> i32;
+    }
+
+    pub(super) fn poll_writable(fd: BorrowedFd<'_>, timeout_ms: i32) -> std::io::Result<WritePoll> {
+        let mut pfd = PollFd {
+            fd: fd.as_raw_fd(),
+            events: POLLOUT,
+            revents: 0,
+        };
+        // SAFETY: `pfd` は 1 要素の有効な `struct pollfd` で、`nfds` は 1。呼び出しの間 `fd`（BorrowedFd）は開いたまま。
+        // `poll` は `revents` だけを書き、保持しない。
+        let rc = unsafe { poll(&raw mut pfd, 1, timeout_ms) };
+        if rc < 0 {
+            let e = std::io::Error::last_os_error();
+            return if e.kind() == std::io::ErrorKind::Interrupted {
+                Ok(WritePoll::NotReady)
+            } else {
+                Err(e)
+            };
+        }
+        if rc == 0 {
+            return Ok(WritePoll::NotReady);
+        }
+        if pfd.revents & POLLOUT != 0 {
+            Ok(WritePoll::Ready)
+        } else if pfd.revents & (POLLERR | POLLHUP | POLLNVAL) != 0 {
+            Ok(WritePoll::Closed)
+        } else {
+            Ok(WritePoll::NotReady)
+        }
+    }
+}
+
+#[cfg(not(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+)))]
+mod poll_imp {
+    use std::os::fd::BorrowedFd;
+
+    use super::WritePoll;
+
+    pub(super) fn poll_writable(
+        _fd: BorrowedFd<'_>,
+        _timeout_ms: i32,
+    ) -> std::io::Result<WritePoll> {
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+    }
+}
+
 #[cfg(all(
     test,
     any(

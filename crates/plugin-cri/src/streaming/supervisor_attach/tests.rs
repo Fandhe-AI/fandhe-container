@@ -567,6 +567,38 @@ async fn cri6_4077_stdin_roundtrip_and_shutdown_closes_the_pipe() {
     wait_active_zero(&b);
 }
 
+/// コンテナが stdin を読まず pipe が満杯でも、セッションの drop で入力スレッドが抜けて枠が返る（REPAIR-5）。
+#[tokio::test]
+async fn cri6_repair5_4077_stalled_stdin_write_is_reclaimed_on_drop() {
+    let fx = Fixture::new("stall");
+    let (r, w) = std::io::pipe().expect("pipe");
+    let w = Mutex::new(Some(w));
+    let source = FakeSource::new(Box::new(move |_| {
+        let w = w.lock().expect("lock").take().expect("once");
+        Ok(AttachIo {
+            input: Some(AttachInput::Pipe(OwnedFd::from(w))),
+            stdout: Some(sock_pair().0),
+            stderr: None,
+        })
+    }));
+    let b = fx.backend(source, idle_notifier(Arc::new(AtomicBool::new(false))));
+    let mut session = within(b.attach(target(true, true, false, false)))
+        .await
+        .expect("attach");
+    let mut stdin = session.stdin.take().expect("stdin");
+    // 読まれない pipe（既定 64 KiB）と socketpair のバッファを十分に超える量を、書き込みが止まるまで送る。
+    let chunk = vec![b'x'; 8192];
+    for _ in 0..64 {
+        let _ =
+            tokio::time::timeout(Duration::from_millis(50), write_all(&mut *stdin, &chunk)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    drop(stdin);
+    drop(session);
+    wait_active_zero(&b);
+    drop(r);
+}
+
 #[tokio::test]
 async fn cri6_4077_tap_is_relayed_and_eof_completes_exited() {
     let fx = Fixture::new("tap");
@@ -592,7 +624,7 @@ async fn cri6_4077_tap_is_relayed_and_eof_completes_exited() {
 }
 
 #[tokio::test]
-async fn cri6_4077_exit_notification_completes_exited() {
+async fn cri6_4077_exit_notification_completes_exited_when_the_store_says_gone() {
     let fx = Fixture::new("woken");
     let notifier = Arc::new(FakeNotifier {
         f: Box::new(|_| ExitWatchOutcome::Woken),
@@ -601,6 +633,27 @@ async fn cri6_4077_exit_notification_completes_exited() {
     let mut session = within(b.attach(target(false, true, false, false)))
         .await
         .expect("attach");
+    fx.stop("run1");
+    within(&mut session.exited).await;
+}
+
+#[tokio::test]
+async fn cri6_4077_spurious_wakeup_does_not_complete_exited_while_running() {
+    let fx = Fixture::new("spurious");
+    let notifier = Arc::new(FakeNotifier {
+        f: Box::new(|_| ExitWatchOutcome::Woken),
+    });
+    let b = fx.backend(plain_source(), notifier);
+    let mut session = within(b.attach(target(false, true, false, false)))
+        .await
+        .expect("attach");
+    // 通知接続だけが切れた起床では、稼働中のコンテナの attach を終了扱いにしない。
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1500), &mut session.exited)
+            .await
+            .is_err()
+    );
+    fx.stop("run1");
     within(&mut session.exited).await;
 }
 

@@ -10,7 +10,7 @@
 //! 1. 状態ストアで Running と pid1 を確かめる（`exec_launcher` と同じ写像）
 //! 2. `AttachIoSource::obtain`（本番は制御チャネルの kind 9。本数・`MSG_CTRUNC`・種別は supervisor 側のクライアントが検証）で
 //!    入力の fd（stdin の pipe の書き込み端、tty なら pty master の複製）と出力の tap を受ける
-//! 3. [`validate_attach_io`] が要求との形の照合をやり直す（多層防御。`AttachIoSource` は注入でき、中身を信用しない。D9）。
+//! 3. `validate_attach_io` が要求との形の照合をやり直す（多層防御。`AttachIoSource` は注入でき、中身を信用しない。D9）。
 //!    不一致は固定文言の `INTERNAL` で、`AttachIo` の drop が全 fd を閉じる（fail-closed）
 //! 4. 入力は専用 std スレッドと socketpair で橋渡しする（`AsyncFd` を使わない理由: `O_NONBLOCK` は open file description 単位で、
 //!    dup した fd に立てると supervisor 側の同じ記述にも効き、pty master を blocking で読む捕捉のリーダーが `EAGAIN` で壊れる）。
@@ -30,7 +30,9 @@
 //!   RPC 時に断られる。stdin・tty・resize の経路は偽の `AttachIoSource` を使う単体試験からしか届かない。`read_only` の解除・
 //!   bundle の `tty/stdin` 拒否の解除・RPC 時の整合検査は #4078（C10）、実機の通し確認は #4079（C11）
 //! - `AttachSession.stdin` の「バッファしない」に対し、socketpair のバッファ分だけ先行する（`exec_launcher` と同じ逸脱）
-//! - コンテナが stdin を読まないと入力スレッドは `write` で止まり、コンテナが読むか終了するまで残る（枠は数え続けるので有界）
+//! - コンテナが stdin を読まず pipe / pty が満杯でも、入力スレッドは `poll(POLLOUT)` を 10 ms 刻みで待つだけで、セッションの
+//!   drop（取り消し）で抜ける（`write` で無期限に止まらない）。書き込みは詰まらない大きさに絞る（fifo は 512 バイト、
+//!   pty・socket は 1 バイト）ため、大きな貼り付けは遅い。生きたセッションが読まれない stdin を待ち続ける間は枠を占有する
 //! - `stdin_once` のとき `obtain` が戻った後に future が drop されると、`AttachIo` の drop で唯一の書き込み端が閉じ、コンテナは
 //!   EOF を受ける（supervisor 側の `sendmsg` 直後の窓と同種の残余で、なくせない）
 //! - tty でも stdin を要求しない接続には master が渡らず、resize は `None`
@@ -41,7 +43,7 @@ use std::fs::File;
 use std::future::Future;
 use std::io::{Read as _, Write as _};
 use std::num::NonZeroU32;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd as _, OwnedFd};
 use std::os::unix::fs::FileTypeExt as _;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::pin::Pin;
@@ -74,6 +76,9 @@ const TICK: Duration = Duration::from_millis(10);
 
 /// 退避経路（状態ストアの照会）の間隔。
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// fifo への 1 回の書き込みの上限（`PIPE_BUF` 以下は空きが 1 枠あれば詰まらない。Linux は 4096）。
+const PIPE_SLICE: usize = 512;
 
 /// 入力の橋渡しの 1 回の読み取り量。
 const INPUT_CHUNK: usize = 4096;
@@ -344,8 +349,16 @@ fn watch_exit(
             let until = Instant::now() + MAX_EXIT_WATCH_HOLD;
             match notifier.watch(id, pid, until, &|| cancel.load(Ordering::SeqCst)) {
                 ExitWatchOutcome::Woken | ExitWatchOutcome::PidChanged => {
-                    signal.fire();
-                    return;
+                    // 起床は「状態を読み直す合図」で終了の確定ではない（通知接続だけが切れても Woken になる。CRI-6）。
+                    // 状態ストアで終了か世代交代を確かめたときだけ完了し、そうでなければ間を置いて再購読する。
+                    if is_gone(store, id, pid) {
+                        signal.fire();
+                        return;
+                    }
+                    if sleep_cancellable(POLL_INTERVAL, cancel) {
+                        return;
+                    }
+                    continue;
                 }
                 ExitWatchOutcome::Expired => continue,
                 ExitWatchOutcome::Cancelled => return,
@@ -370,18 +383,29 @@ fn watch_exit(
     }
 }
 
-/// `file` へ全部書く。`WouldBlock`（他者が `O_NONBLOCK` を立てた場合の防御）は取り消しを見ながら再試行する。
-fn write_all_retry(file: &mut File, mut data: &[u8], cancel: &AtomicBool) -> bool {
+/// `file` へ全部書く（REPAIR-5）。書く前に毎回 `poll(POLLOUT)` を 10 ms 刻みで待ち、取り消しを見る。
+/// 記述のフラグ（`O_NONBLOCK`）は変えない（supervisor 側と共有の open file description のため）。
+/// 書ける合図の後だけ blocking の `write` を呼ぶので、コンテナが読まず pipe / pty が満杯でも、
+/// セッションの drop（取り消し）で抜けてスレッド・fd・枠を返せる。1 回の書き込みは、満杯でも詰まらない大きさに
+/// 絞る（`slice`: fifo は `PIPE_BUF` 以下、pty・socket は 1 バイト）。
+fn write_all_retry(file: &mut File, mut data: &[u8], slice: usize, cancel: &AtomicBool) -> bool {
+    use crate::sys::{WritePoll, poll_writable};
+
     while !data.is_empty() {
-        match file.write(data) {
+        if cancel.load(Ordering::SeqCst) {
+            return false;
+        }
+        match poll_writable(file.as_fd(), 10) {
+            Ok(WritePoll::Ready) => {}
+            Ok(WritePoll::NotReady) => continue,
+            Ok(WritePoll::Closed) | Err(_) => return false,
+        }
+        let part = data.get(..slice.min(data.len())).unwrap_or_default();
+        match file.write(part) {
             Ok(0) => return false,
             Ok(n) => data = data.get(n..).unwrap_or_default(),
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                if sleep_cancellable(TICK, cancel) {
-                    return false;
-                }
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(_) => return false,
         }
     }
@@ -398,6 +422,7 @@ fn to_tokio(s: StdUnixStream) -> Result<tokio::net::UnixStream, CriError> {
 /// 入力の橋渡し: tokio 側の書き口を返し、専用スレッドが socket から読んで `file` へ書く。
 fn bridge_input(
     mut file: File,
+    slice: usize,
     cancel: Arc<AtomicBool>,
     slot: Arc<SlotGuard>,
 ) -> Result<tokio::net::UnixStream, CriError> {
@@ -413,7 +438,7 @@ fn bridge_input(
                     Ok(0) | Err(_) => return,
                     Ok(n) => {
                         let Some(chunk) = buf.get(..n) else { return };
-                        if !write_all_retry(&mut file, chunk, &cancel) {
+                        if !write_all_retry(&mut file, chunk, slice, &cancel) {
                             return;
                         }
                     }
@@ -543,7 +568,13 @@ impl AttachBackend for SupervisorAttachBackend {
             let stdin: Option<Box<dyn AsyncWrite + Send + Unpin>> = match input {
                 None => None,
                 Some(ValidInput::Pipe(file)) => {
-                    let w = bridge_input(file, Arc::clone(&cancel), Arc::clone(&slot))?;
+                    // fifo 以外（socket）は部分書き込みで詰まりうるため 1 バイトずつ書く。
+                    let slice = if file.metadata().is_ok_and(|m| m.file_type().is_fifo()) {
+                        PIPE_SLICE
+                    } else {
+                        1
+                    };
+                    let w = bridge_input(file, slice, Arc::clone(&cancel), Arc::clone(&slot))?;
                     Some(Box::new(InputWriter {
                         inner: w,
                         _life: Arc::clone(&life),
@@ -554,7 +585,8 @@ impl AttachBackend for SupervisorAttachBackend {
                         .as_fd()
                         .try_clone_to_owned()
                         .map_err(|_| CriError::internal("attach pty setup failed"))?;
-                    let w = bridge_input(File::from(dup), Arc::clone(&cancel), Arc::clone(&slot))?;
+                    let w =
+                        bridge_input(File::from(dup), 1, Arc::clone(&cancel), Arc::clone(&slot))?;
                     let master = Arc::new(master);
                     // 失敗は `()` を返す契約のため捨てる。0 行・0 列はそのまま渡す（カーネルは受け付ける）。
                     resize = Some(Box::new(move |size: TerminalSize| {

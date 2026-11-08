@@ -572,6 +572,8 @@ impl TaskService {
             .create(&req.id, bundle)
             .map_err(|e| to_status(&e))?;
         created.insert(req.id.clone());
+        // 外で消えたコンテナの旧 watcher も取り消す（旧インスタンスの TaskExit を新コンテナの後に出さない。#4155）。
+        self.revoke_watcher(&req.id);
         // 作成に成功した＝その ID は直前まで存在しなかったので、外で消えたコンテナの旧登録を引き継がない。
         if let Some(container) = &container {
             self.execs
@@ -605,7 +607,17 @@ impl TaskService {
         .encode_to_vec())
     }
 
-    /// init の終了 watcher を起こす（#4155）。publisher が無い・既に同じ ID の watcher がある場合は何もしない。
+    /// 同じ ID の終了 watcher を取り消す。取り消しの印（`revoked`）を先に立ててから登録表から外す。
+    /// 登録表のロックを持ったまま行うので、登録が無いと見えた側は必ず印を見る（#4155）。
+    fn revoke_watcher(&self, id: &str) {
+        let mut set = self.exit_watchers.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(old) = set.get(id) {
+            old.revoked.store(true, Ordering::Release);
+        }
+        set.remove(id);
+    }
+
+    /// init の終了 watcher を起こす（#4155）。publisher が無い場合は何もしない。既存の同じ ID の登録は置き換える。
     /// 上限超過とスレッドの起動失敗は構造化ログを 1 件出して起こさない（Start の応答は変えない）。
     fn spawn_exit_watcher(&self, id: &str, start_pid: u32) {
         let Some(publisher) = &self.event_publisher else {
@@ -615,8 +627,10 @@ impl TaskService {
         let revoked = Arc::new(AtomicBool::new(false));
         {
             let mut set = self.exit_watchers.lock().unwrap_or_else(|p| p.into_inner());
-            if set.get(id).is_some_and(|e| !e.done) {
-                return;
+            // Delete・Create が取り消さずに残った旧世代（外で消えたコンテナ等）は、Start 成功の時点で
+            // 現在のインスタンスのものではない。印を先に立ててから置き換える（#4155）。
+            if let Some(old) = set.remove(id) {
+                old.revoked.store(true, Ordering::SeqCst);
             }
             if set.values().filter(|e| !e.done).count() >= MAX_EXIT_WATCHERS {
                 drop(set);
@@ -688,15 +702,7 @@ impl TaskService {
         created.remove(&req.id);
         drop(created);
         // 旧コンテナの終了 watcher を取り消す。同じ ID の再作成・再 Start で新しい世代が登録でき、旧世代は publish しない（#4155）。
-        // 取り消しの印を立ててから外す。キューで待つ旧世代の TaskExit は worker が送信直前に捨てる。
-        if let Some(old) = self
-            .exit_watchers
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(&req.id)
-        {
-            old.revoked.store(true, Ordering::SeqCst);
-        }
+        self.revoke_watcher(&req.id);
         // 削除成功後に旧コンテナの exec 登録を除去する（同じ ID の再作成で引き継がない。CRI-5）。
         if let Some(container) = &container {
             self.execs
@@ -958,7 +964,7 @@ impl ExitWatch {
         }
         // 確認後に Delete・再作成が割り込んでも、キューの中と送信直前で世代を再確認して旧世代を捨てる。
         let revoked = Arc::clone(&self.revoked);
-        let guard: EventGuard = Arc::new(move || !revoked.load(Ordering::SeqCst));
+        let guard: EventGuard = Arc::new(move || !revoked.load(Ordering::Acquire));
         self.publisher.publish_guarded(
             TaskEvent::Exit(TaskExit {
                 container_id: self.id.clone(),
@@ -3633,6 +3639,61 @@ mod tests {
         s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
         s.handle("Start", &start_req("c1")).unwrap();
         // 同じ ID の新世代が登録されても旧世代の述語は無効のまま。
+        assert!(!guard());
+    }
+
+    /// CRI-5・#4155: Delete を経ずに外で消えた ID を Create し直すと、旧 watcher の印が先に立って登録が外れ、
+    /// キュー済みの旧 TaskExit の述語が無効になる。再 Start は新しい世代で watcher を起こす。
+    #[test]
+    fn cri5_4155_create_revokes_stale_watcher_and_start_respawns() {
+        use super::super::publish::EventGuard;
+        #[derive(Default)]
+        struct Holding(Mutex<Vec<EventGuard>>);
+        impl EventPublisher for Holding {
+            fn publish(&self, _: TaskEvent) {}
+            fn publish_guarded(&self, _: TaskEvent, g: EventGuard) {
+                self.0.lock().unwrap().push(g);
+            }
+            fn report(&self, _: PublishFailure) {}
+        }
+        let fake = Fake {
+            create_pid: Some(111),
+            ..Fake::default()
+        };
+        let h = Arc::new(Holding::default());
+        let (s, f) = svc(TaskApiVersion::V2, fake);
+        let s = fast_wait(s, 100).with_event_publisher(h.clone());
+        s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
+        s.handle("Start", &start_req("c1")).unwrap();
+        let old = s
+            .exit_watchers
+            .lock()
+            .unwrap()
+            .get("c1")
+            .unwrap()
+            .generation;
+        stopped_with_time(&f, "c1", Some(0), 1_700_000_000_000_000_000);
+        assert!(wait_until(std::time::Duration::from_secs(5), || !h
+            .0
+            .lock()
+            .unwrap()
+            .is_empty()));
+        let guard = h.0.lock().unwrap()[0].clone();
+        assert!(guard());
+        // Delete を経ずにコンテナが外で消え、同じ ID が再作成される。
+        remove_externally(&f, "c1");
+        s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
+        assert!(!guard());
+        assert!(s.exit_watchers.lock().unwrap().get("c1").is_none());
+        s.handle("Start", &start_req("c1")).unwrap();
+        let new = s
+            .exit_watchers
+            .lock()
+            .unwrap()
+            .get("c1")
+            .unwrap()
+            .generation;
+        assert_ne!(old, new);
         assert!(!guard());
     }
 

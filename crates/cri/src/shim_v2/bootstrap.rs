@@ -45,6 +45,9 @@
 //! 計測（REPAIR-4）: `start` / `delete` / デーモンの ttrpc は、結果と所要時間を置き場所の `ops.log`
 //! （0600・JSON Lines・1 MiB で `ops.log.1` へ回す）へ追記する。stdout / stderr は汚さない。
 //!
+//! 終了時の順序（#4222）: Shutdown の応答を流し切る → サーバー停止 → ロック・socket の片付け → publish キューの排出（有界。
+//! containerd の Shutdown 呼び出しの期限〔既定 3 秒〕を排出で食わないよう、応答の後に行う）。
+//!
 //! 範囲外（REPAIR-3。未実装を装わない）:
 //! - デーモンの寿命は Shutdown RPC（[`ShutdownSignal`]。TASK-62.7.2・#873）と socket の `(dev, ino, mtime)` の生存確認（1 秒間隔。
 //!   delete 経路用）の併用。Shutdown で抜けたときは応答を流し切る有界な猶予（`SHUTDOWN_RESPONSE_GRACE`）の後にサーバーを止め、
@@ -472,6 +475,7 @@ pub struct ServeContext {
     namespace: Option<ShimIdentifier>,
     address: Option<PathBuf>,
     publish_binary: Option<PublishBinary>,
+    drains: super::publish::PublisherDrains,
 }
 
 impl ServeContext {
@@ -486,7 +490,14 @@ impl ServeContext {
             namespace: None,
             address: None,
             publish_binary: None,
+            drains: super::publish::PublisherDrains::default(),
         }
+    }
+
+    /// publish の排出の登録口（clone は同じ登録先を共有する）。`exec_publisher_for_with` が作った publisher を載せ、
+    /// `run_serve` が Shutdown の片付けの後に排出する（TASK-62.6・REPAIR-5・#4222）。
+    pub fn publisher_drains(&self) -> super::publish::PublisherDrains {
+        self.drains.clone()
     }
 
     /// 検査済みの `-publish-binary` を足す（イベント publish の送信側が使う。CRI-5・#4154）。
@@ -1654,11 +1665,11 @@ mod unix_impl {
             .as_deref()
             .map(PublishBinary::verify)
             .transpose()?;
-        let registry = make_registry(
-            super::ServeContext::new(signal.clone(), audit.clone())
-                .with_origin(inv.namespace.clone(), inv.address.clone())
-                .with_publish_binary(publish_binary),
-        )?;
+        let ctx = super::ServeContext::new(signal.clone(), audit.clone())
+            .with_origin(inv.namespace.clone(), inv.address.clone())
+            .with_publish_binary(publish_binary);
+        let drains = ctx.publisher_drains();
+        let registry = make_registry(ctx)?;
         let euid = crate::sys::effective_uid();
         let config = ServerConfig {
             // 同じ uid と root だけを受ける（PLUG-12）。
@@ -1705,6 +1716,9 @@ mod unix_impl {
         if shutdown_requested {
             cleanup_after_shutdown(inv, dir, expected, first, held);
         }
+        // サーバー停止後なので新しい投入は入らない。ID ロックと socket を手放した後に、キューの未送信（最後の TaskDelete 等）を
+        // 有界時間で排出してから抜ける（runc shim と同じ順序。socket の消失で抜けた場合も同じ。結果の 1 行は publisher が出す。#4222）。
+        let _ = drains.drain_all();
         result
     }
 }

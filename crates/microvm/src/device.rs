@@ -1642,8 +1642,8 @@ impl VmFd {
 
     /// memslot のフラグがこの VM で使えるかを登録の前に確かめる（#4157・MVM-1・#4105）。
     ///
-    /// `READONLY` を含むときだけ VM fd に `KVM_CAP_READONLY_MEM` を照会する（x86 は VM ごとに答えが変わりうるため
-    /// `/dev/kvm` でなく VM fd）。非対応は `FailedPrecondition`。`GuestRam::register_with_flags` が登録の前に同じ判定を通す（#4158）。
+    /// `READONLY` を含むときだけ VM fd に `KVM_CAP_READONLY_MEM` を照会する（x86 の SEV-ES・SNP と arm64 の pKVM の保護 VM で 0 を返すため
+    /// `/dev/kvm` でなく VM fd。v6.12。詳細は `memslot_flags` のモジュール doc）。非対応は `FailedPrecondition`。`GuestRam::register_with_flags` が登録の前に同じ判定を通す（#4158）。
     pub fn check_memslot_flags(&self, flags: MemslotFlags) -> Result<(), MicrovmError> {
         check_memslot_flags_supported(flags, self)
     }

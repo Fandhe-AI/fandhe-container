@@ -9,7 +9,13 @@
 //! 一次情報（Linux v6.12）: `KVM_MEM_READONLY` は `Documentation/virt/kvm/api.rst` のとおり `KVM_CAP_READONLY_MEM` が許すときだけ
 //! 設定できる。`KVM_MEM_LOG_DIRTY_PAGES` は cap の照会を要さない（`check_memory_region_flags` の既定の有効フラグ）。
 //! `KVM_MEM_GUEST_MEMFD`（bit 2）は `KVM_SET_USER_MEMORY_REGION2` 専用で本 crate は扱わず、[`MemslotFlags::try_from_raw`] が拒否する。
-//! 照会先を VM fd にするのは、`KVM_CHECK_EXTENSION` が VM ごとに答えを変えうる（x86）ため（アーキ別の返し方の個別確認は未実施）。
+//! `KVM_CAP_READONLY_MEM` の返し方（v6.12 の原文で確認済み。#4226）: system fd は x86・arm64 とも常に 1。VM fd は
+//! x86 が `!kvm->arch.has_protected_state`（SEV-ES・SNP の VM でだけ 0）、arm64 が pKVM の保護 VM でだけ 0（`arm.c` の
+//! `kvm_vm_is_protected` と `pkvm_ext_allowed`）で、それ以外は 1。本 crate の VM（machine type 0）はどちらも 1 になる。
+//! 照会先を VM fd にするのは、将来ほかの VM type を作ったときにも正しく判定するため。
+//! `READONLY | LOG_DIRTY_PAGES` の同時指定は、`check_memory_region_flags`（`virt/kvm/kvm_main.c`）が cap と同じ述語
+//! `kvm_arch_has_readonly_mem` で `READONLY` を有効フラグに足すだけで組み合わせを禁じないため、cap が 1 なら受理される。
+//! 出典の行範囲・確認していない範囲は docs/design/microvm-memory-ownership.md の #4226 の節を参照。
 
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::sys::{self, KvmCap, SysError};

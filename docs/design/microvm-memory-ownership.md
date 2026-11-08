@@ -182,3 +182,17 @@ Agent が記録した判断（オーナー承認待ちの位置づけは冒頭�
 - 一次情報の確認状況: 本記録の作成時に Linux v6.12 の原文（`transhuge.rst`・`hugetlbpage.rst`・`mm/madvise.c`・`arch/x86/kvm/x86.c` の `disallow_lpage` 周辺・`arch/x86/kvm/mmu/`・`arch/arm64/kvm/mmu.c`）は確認していない（未確認）。上記の THP の `always` の挙動、`madvise` の戻り値（THP 無効ビルドと `never` の差）、整列が食い違う slot で large page が無効になること、dirty log 中の分割、`MAP_HUGETLB` の pool・SIGBUS・cgroup 計上は一般知識に基づく記述で、再評価時に原文で確かめる。`MADV_DONTFORK` / `MADV_DONTDUMP` と THP・hugetlb の併用の制約も未確認
 - 対応: hugepage の項目は本記録で閉じる。memslot のフラグは #4157（型）と #4158（登録への結線）が担う
 - `MAP_HUGETLB` の別 issue: 現時点では不要と判断（再評価条件 4 が出たら起票）。この判断はオーナーの確認待ち
+
+## #4226 での KVM_CAP_READONLY_MEM の返し方と READONLY・LOG_DIRTY_PAGES の同時指定の確認記録（MVM-1・REPAIR-3・REPAIR-12）
+
+Agent が記録した判断（オーナー承認待ちの位置づけは冒頭と同じ）。#4157・#4158 で入れた memslot フラグについて、Linux v6.12 の原文で確かめた結果を書く。
+
+- 共通の入口（`virt/kvm/kvm_main.c`）: system fd の `KVM_CHECK_EXTENSION` は `kvm_vm_ioctl_check_extension_generic(NULL, arg)`、VM fd は `(kvm, arg)`。generic は `KVM_CAP_READONLY_MEM` を扱わず、末尾でアーキ側の `kvm_vm_ioctl_check_extension` へ渡す
+- x86（`arch/x86/kvm/x86.c`）: `r = kvm ? kvm_arch_has_readonly_mem(kvm) : 1`。`kvm_arch_has_readonly_mem` は `!kvm->arch.has_protected_state`（`asm/kvm_host.h`）。`has_protected_state` を真にするのは `svm/svm.c` の `svm_vm_init` で、VM type が `KVM_X86_SEV_ES_VM`・`KVM_X86_SNP_VM` のときだけ（v6.12 の `vmx/` には参照が無く、TDX は未導入）。system fd は常に 1、VM fd は SEV-ES・SNP の VM でだけ 0
+- arm64（`arch/arm64/kvm/arm.c`）: 冒頭で `kvm && kvm_vm_is_protected(kvm) && !pkvm_ext_allowed(kvm, ext)` なら 0。`pkvm_ext_allowed` の許可一覧に `KVM_CAP_READONLY_MEM` は無い。それ以外は `r = 1`。system fd は常に 1、VM fd は pKVM の保護 VM でだけ 0。`kvm.arch.pkvm.enabled` を真にする箇所は `arm.c`・`pkvm.c` の範囲には無かった（他のファイルは未確認）
+- 本 crate の VM での値: machine type 0（x86 は `KVM_X86_DEFAULT_VM`）の VM fd では、x86・arm64 とも 1。VM fd へ照会するのは、将来ほかの VM type を作ったときにも正しく判定するため
+- 同時指定の受理: 旧 ioctl の入口は `KVM_SET_USER_MEMORY_REGION_V1_FLAGS`（`LOG_DIRTY_PAGES | READONLY`）以外を EINVAL にするだけで、両ビットは通る。`__kvm_set_memory_region` が最初に呼ぶ `check_memory_region_flags` は `valid_flags = LOG_DIRTY_PAGES` に、`kvm_arch_has_readonly_mem(kvm) && !(flags & GUEST_MEMFD)` のとき `READONLY` を足し、`flags & ~valid_flags` だけを EINVAL にする。組み合わせを禁じる分岐は無い。既存 slot の `READONLY` の反転を禁じる EINVAL は新規作成には効かない。x86 の `kvm_arch_prepare_memory_region` はフラグを見ず、arm64 の同関数が `LOG_DIRTY_PAGES` で返す EINVAL は `VM_PFNMAP` の VMA の場合だけで、匿名 mmap の本 crate では該当しない。cap の判定とフラグ検査は同じ述語のため、x86 の VM fd では cap と検査結果が常に一致し、arm64 でも pKVM の保護 VM を除いて一致する
+- 観察: READONLY の slot はゲストが書けないため、`LOG_DIRTY_PAGES` の dirty の追跡は実質的に働かない（x86 の `kvm_mmu_slot_apply_flags` は READONLY で早期 return、arm64 の `memslot_is_logging` は READONLY を除外）。dirty bitmap の確保自体は行われる
+- 試験を絞る判断: `kvm_device_register_guest_memory_with_flags` は同時指定の結果に `InvalidArgument` を許さず、`READONLY` 単独と同じ結果（受理、非対応なら `FailedPrecondition`。x86_64 では受理を要求）を求める。許容を狭める方向で fail-closed を強める。実機での実行と記録は人間担当の #3781
+- 一次情報の確認状況: v6.12 のタグで上記のファイル・関数を確認した。master でも `check_memory_region_flags` が同じ述語の構造であること（`KVM_MEM_GUEST_MEMFD` の有効化条件の差のみ）を見たが、他の版は見ていない。手元のホストは 7.0 系で、手元の `--ignored` 実行は v6.12 の確認にならない
+- 再評価条件: SEV-ES・SNP・TDX・pKVM の保護 VM など machine type 0 以外の VM を作るとき、`KVM_SET_USER_MEMORY_REGION2`・guest_memfd を使うとき、実機（#3781）で同時指定の拒否を観測したとき

@@ -71,8 +71,13 @@
 //! 解放する（running の強制削除。プロセスの強制終了と、実待機の上限・REPAIR-5 のタイムアウトは TASK-59 で
 //! 追加する。REPAIR-3）。
 //!
-//! **ListContainers/ContainerStatus の扱い（CRI-1・ERR-3・TASK-58.3・#435）**: `ListContainers` は読み取り専用
-//! （自然終了の観測は #4175 の E2 まで行わない）。`ContainerStatus` は実行層接続時に running の記録について
+//! **ListContainers/ContainerStatus の扱い（CRI-1・ERR-3・TASK-58.3・#435）**: `ListContainers` は実行層接続時、
+//! 状態のフィルタが指定なし・Running・Exited のとき、running の候補を `(最後に読んだ時刻・created_at・id)` の
+//! 昇順に最大 `LIST_EXIT_OBSERVE_MAX`（64 件・暫定）まで、全体 `LIST_EXIT_OBSERVE_BUDGET`（1 秒・暫定）の予算で
+//! 1 本の worker が順に読み、停止済みなら exited に取り込んでから絞り込む（#4175・#4173 の E2。kubelet の PLEG が
+//! 一覧の状態の差で終了を検知するため）。読めない候補は記録の値のまま返し、他の候補に影響しない。先行する List の
+//! worker が残っている間は読まない（サービス単位の排他）。切り捨て・予算切れは `RESOURCE_EXHAUSTED` を 1 件だけ
+//! `cri.container_exit_observe` に記録する。記録ファイルへは書かない。`ContainerStatus` は実行層接続時に running の記録について
 //! `RuntimeAdapter::state` を期限つき（`CONTAINER_EXIT_OBSERVE_TIMEOUT` 1 秒・暫定）で 1 回読み、停止済みなら
 //! `StopContainer` と同じ代入（`apply_exit`）で exited・終了コード・finished_at を取り込む（#4174・#4173 の E1。
 //! 失敗・期限切れは記録の値で成功し `cri.container_exit_observe` に 1 件記録。記録ファイルへは書かない）。
@@ -340,6 +345,8 @@ pub struct CriRuntimeService {
     runtime_timeout: Duration,
     /// `ContainerStatus` の観測で実行層の状態を 1 回読む待ちの上限（#4174。既定は [`CONTAINER_EXIT_OBSERVE_TIMEOUT`]）。
     exit_observe_timeout: Duration,
+    /// `ListContainers` の観測の worker が残っている間は真（サービス単位の排他。#4175・REPAIR-5）。
+    list_exit_observe_busy: Arc<AtomicBool>,
     /// pod の netns を作って結線する注入点（#2675・CRI-2・NET-1）。`None` のときは従来どおり何も呼ばない。
     pod_network: Option<Arc<dyn PodNetworkProvider>>,
     /// `UpdateRuntimeConfig` で最後に受け入れた pod CIDR（#2896）。レジストリとは別のロックで、保持は一瞬。
@@ -393,6 +400,11 @@ const DEFAULT_RUNTIME_TIMEOUT: Duration = Duration::from_secs(10);
 /// kubelet の PLEG が頻繁に呼ぶ RPC のため、`StopContainer` の期限や記録の `@lock` 待ち（5 秒）より短くする。
 /// 期限切れでも RPC は記録の値（running）で成功する。根拠と見直しの条件は `docs/design/cri-record-readoption.md`。
 const CONTAINER_EXIT_OBSERVE_TIMEOUT: Duration = Duration::from_secs(1);
+/// 1 回の `ListContainers` が実行層の状態を読む候補の上限（#4175。暫定値。見直しの条件は
+/// `docs/design/cri-record-readoption.md`）。超えた分は次の List で読む（未観測・古い順）。
+const LIST_EXIT_OBSERVE_MAX: usize = 64;
+/// 1 回の `ListContainers` の観測全体の予算（#4175。暫定値。`with_exit_observe_timeout` で短縮できる）。
+const LIST_EXIT_OBSERVE_BUDGET: Duration = Duration::from_secs(1);
 
 /// `reserve_container` の戻り値（登録したコンテナの識別子と、bundle 供給元へ渡す設定）。
 struct ReservedContainer {
@@ -1285,6 +1297,7 @@ impl ExitObserveMark {
             return;
         };
         record.exit_observe_pending = false;
+        record.exit_observed_at = Some(std::time::Instant::now());
         if let Ok(status) = result
             && status.lifecycle == RuntimeLifecycle::Stopped
             && record.state == ContainerState::Running
@@ -1297,6 +1310,25 @@ impl ExitObserveMark {
             };
             apply_exit(record, &exit, now_nanos().unwrap_or(0));
         }
+    }
+}
+
+/// 観測の候補にできる記録か（`ContainerStatus`〔E1〕と `ListContainers`〔E2〕が共有する判定。実行層の有無は
+/// 呼び出し側が見る）。running で、Stop・Remove の途中でなく、実行層の資源を持ち、他の観測が走っていないとき真。
+fn exit_observe_candidate(record: &ContainerRecord) -> bool {
+    record.state == ContainerState::Running
+        && !record.in_flight
+        && record.runtime_owned
+        && !record.exit_observe_pending
+}
+
+/// `ListContainers` の観測 worker が持つ排他の番人。`Drop` で解除するので、RPC の破棄・期限後の完了・worker の
+/// 起動失敗のいずれでも漏れない（#4175・REPAIR-5）。
+struct ListObserveBusy(Arc<AtomicBool>);
+
+impl Drop for ListObserveBusy {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
     }
 }
 
@@ -1807,6 +1839,7 @@ impl CriRuntimeService {
             runtime: None,
             runtime_timeout: DEFAULT_RUNTIME_TIMEOUT,
             exit_observe_timeout: CONTAINER_EXIT_OBSERVE_TIMEOUT,
+            list_exit_observe_busy: Arc::new(AtomicBool::new(false)),
             pod_network: None,
             pod_cidrs: Mutex::new(None),
             record_store: None,
@@ -1950,6 +1983,7 @@ impl CriRuntimeService {
     }
 
     /// `ContainerStatus` の観測の待ちの上限を指定する（既定 1 秒より長くはできない。試験で短縮する用。#4174・REPAIR-5）。
+    /// `ListContainers` の観測全体の予算も `min(LIST_EXIT_OBSERVE_BUDGET, この値)` になる（#4175）。
     pub fn with_exit_observe_timeout(mut self, timeout: Duration) -> Self {
         self.exit_observe_timeout = timeout.min(CONTAINER_EXIT_OBSERVE_TIMEOUT);
         self
@@ -3021,6 +3055,7 @@ impl CriRuntimeService {
                 applied_user: None,
                 resolved_image: None,
                 exit_observe_pending: false,
+                exit_observed_at: None,
             },
         );
         registry.container_keys.insert(key);
@@ -3814,7 +3849,8 @@ impl CriRuntimeService {
     /// 立てない（観測中の StopContainer を `FAILED_PRECONDITION` にしない）。registry のロックは実行層を呼ぶ前に外す。
     /// 取り込みは worker が所有する [`ExitObserveMark`] が比較交換で行う。読み取りの失敗・期限切れは
     /// `cri.container_exit_observe` に 1 件記録するだけで `Ok` を返し、記録の値で応答させる。未知 ID は `NOT_FOUND`。
-    /// ID・パス・実行層の文言は記録しない（REPAIR-4）。`ListContainers`（E2・#4175）からも呼べる形にしてある。
+    /// ID・パス・実行層の文言は記録しない（REPAIR-4）。候補の判定は [`exit_observe_candidate`] を `ListContainers`
+    /// （E2・#4175）と共有する。
     async fn observe_container_exit(&self, container_id: &str) -> Result<(), CriError> {
         let mark = {
             let mut registry = self
@@ -3825,12 +3861,7 @@ impl CriRuntimeService {
                 .containers
                 .get_mut(container_id)
                 .ok_or_else(|| CriError::not_found("container not found"))?;
-            if self.runtime.is_none()
-                || record.state != ContainerState::Running
-                || record.in_flight
-                || !record.runtime_owned
-                || record.exit_observe_pending
-            {
+            if self.runtime.is_none() || !exit_observe_candidate(record) {
                 return Ok(());
             }
             record.exit_observe_pending = true;
@@ -3986,11 +4017,24 @@ impl CriRuntimeService {
     ///
     /// 一致なし・未知 ID・`CONTAINER_UNKNOWN` は空の一覧。未知の state 値と過大な `label_selector` は
     /// `INVALID_ARGUMENT`。件数はレジストリの上限（[`MAX_CONTAINERS`]）で有界。
-    fn list_containers_impl(
+    ///
+    /// 実行層接続時、状態のフィルタが指定なし・Running・Exited なら、絞り込みの前に running の候補の自然終了を
+    /// 取り込む（#4175・#4173 の E2）。候補は状態以外の条件に合う記録で、最後に読んだ時刻が古い（未観測が先）順に
+    /// [`LIST_EXIT_OBSERVE_MAX`] 件まで。読み取りは worker 1 本が [`LIST_EXIT_OBSERVE_BUDGET`] の予算で順に行い、
+    /// 先行する List の worker が残っている間は読まない（`list_exit_observe_busy`）。読めない・期限切れの候補は
+    /// 記録の値のまま返し、RPC は失敗にしない。registry のロックは実行層の呼び出し中は持たず、`in_flight` も立てない
+    /// （観測中の StopContainer を拒否しない）。取り込みは [`ExitObserveMark`] の比較交換で、記録ファイルへは書かない。
+    /// 計測は読み取り 1 回ごとに 1 件、切り捨て・予算切れは `RESOURCE_EXHAUSTED` を 1 件だけ記録する（ID は載せない）。
+    /// ハングした 1 件の `state()` は予算を使い切り、戻るまで残りの候補の印と排他を持ち続ける（残余。切り離した
+    /// スレッドは同時に 1 本までに抑えられる）。
+    async fn list_containers_impl(
         &self,
         req: v1::ListContainersRequest,
     ) -> Result<v1::ListContainersResponse, CriError> {
         let filter = ValidatedContainerFilter::new(req.filter)?;
+        if filter.wants_exit_observation() {
+            self.observe_list_exits(&filter).await?;
+        }
         let mut containers = {
             let registry = self
                 .registry
@@ -4005,6 +4049,119 @@ impl CriRuntimeService {
         };
         containers.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
         Ok(v1::ListContainersResponse { containers })
+    }
+
+    /// `ListContainers` の観測（#4175）。候補を選んで印を立て、worker 1 本を期限つきで待つ。失敗は返さない
+    /// （記録の値で応答する）。呼び出し元は [`Self::list_containers_impl`]。
+    async fn observe_list_exits(&self, filter: &ValidatedContainerFilter) -> Result<(), CriError> {
+        let Some(binding) = &self.runtime else {
+            return Ok(());
+        };
+        if self
+            .list_exit_observe_busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(());
+        }
+        let busy = ListObserveBusy(Arc::clone(&self.list_exit_observe_busy));
+        let (marks, truncated) = {
+            let mut registry = self
+                .registry
+                .lock()
+                .map_err(|_| CriError::internal("sandbox registry is unavailable"))?;
+            let mut candidates: Vec<(Option<std::time::Instant>, i128, String)> = registry
+                .containers
+                .iter()
+                .filter(|(id, record)| {
+                    filter.matches_except_state(id, record) && exit_observe_candidate(record)
+                })
+                .map(|(id, record)| {
+                    (
+                        record.exit_observed_at,
+                        record.created_at_nanos.into(),
+                        id.clone(),
+                    )
+                })
+                .collect();
+            candidates.sort();
+            let truncated = candidates.len() > LIST_EXIT_OBSERVE_MAX;
+            candidates.truncate(LIST_EXIT_OBSERVE_MAX);
+            let mut marks = Vec::with_capacity(candidates.len());
+            for (_, _, id) in candidates {
+                if let Some(record) = registry.containers.get_mut(&id) {
+                    record.exit_observe_pending = true;
+                    marks.push(ExitObserveMark {
+                        registry: Arc::clone(&self.registry),
+                        id,
+                        done: false,
+                    });
+                }
+            }
+            (marks, truncated)
+        };
+        if marks.is_empty() {
+            return Ok(());
+        }
+        let adapter = binding.adapter.clone();
+        let recorder = Arc::clone(&self.recorder);
+        let budget = self.exit_observe_timeout.min(LIST_EXIT_OBSERVE_BUDGET);
+        // worker が期限後に遅れて完了しても、番人の `Drop` が排他と印を外す。RPC は期限切れ・worker の
+        // 起動失敗でも成功させるが、その結果は呼び出し側が 1 件記録する（REPAIR-4）。期限切れ後に
+        // 遅れて完了した worker は `expired` を見て記録しない（二重計上と、後からの OK だけの記録を防ぐ）。
+        if truncated {
+            // 候補が上限を超えて切り捨てた場合は、読み取りの前に 1 件だけ記録する（ID は載せない）。
+            CriOpTimer::start(self.recorder.as_ref(), CriOpKind::ContainerExitObserve)
+                .finish_with::<()>(&Err(Status::from(CriError::resource_exhausted(
+                    "list exit observation was truncated",
+                ))));
+        }
+        // 外側の計測は期限切れ・起動失敗のときだけ確定し、正常完了では読み取りごとの記録に任せて破棄する。
+        let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::ContainerExitObserve);
+        let expired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_expired = Arc::clone(&expired);
+        // RPC 全体の絶対期限。`run_bounded` の待ちより前に確定するので、worker の時計（遅れて始まる）より
+        // 先に切れる。`expired` は `run_bounded` の復帰後にしか立たないため、期限の判定はこちらを正とする。
+        let deadline = std::time::Instant::now() + budget;
+        let bounded = run_bounded(budget, move || {
+            let _busy = busy;
+            let mut skipped = false;
+            for mark in marks {
+                if std::time::Instant::now() >= deadline || worker_expired.load(Ordering::Acquire) {
+                    // 期限後は実行層を新たに呼ばない。読まない候補の印は `Drop` が外す（次の List で先に読まれる）。
+                    skipped = true;
+                    continue;
+                }
+                let timer = CriOpTimer::start(recorder.as_ref(), CriOpKind::ContainerExitObserve);
+                let result = adapter.state(&mark.id);
+                let observed: Result<(), Status> = result
+                    .as_ref()
+                    .map(|_| ())
+                    .map_err(|e| Status::from(e.clone()));
+                mark.finish(&result);
+                if std::time::Instant::now() >= deadline || worker_expired.load(Ordering::Acquire) {
+                    // 期限切れは呼び出し側が記録済み。確定せず Drop すると INTERNAL を重ねるため破棄する。
+                    timer.discard();
+                    continue;
+                }
+                timer.finish_with(&observed);
+            }
+            // 予算切れで読まなかった候補の存在は、期限切れの記録とは別に 1 件だけ記録する（切り捨ては呼び出し側）。
+            if skipped && !truncated {
+                let timer = CriOpTimer::start(recorder.as_ref(), CriOpKind::ContainerExitObserve);
+                timer.finish_with::<()>(&Err(Status::from(CriError::resource_exhausted(
+                    "list exit observation was truncated",
+                ))));
+            }
+        });
+        match bounded.await {
+            Ok(()) => timer.discard(),
+            Err(e) => {
+                expired.store(true, Ordering::Release);
+                timer.finish_with::<()>(&Err(Status::from(e)));
+            }
+        }
+        Ok(())
     }
 
     /// `PodSandboxStatus` の本体。読み取り専用（CRI-1・ERR-3・TASK-57.3）。
@@ -4422,6 +4579,7 @@ impl RuntimeService for CriRuntimeService {
         let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::ListContainers);
         let result = self
             .list_containers_impl(request.into_inner())
+            .await
             .map_err(Status::from);
         timer.finish_with(&result);
         result.map(Response::new)

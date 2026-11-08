@@ -13,7 +13,8 @@
 //!   排他を oci と共有する）。`list` / `get` はメモリ上の表示だけを読み、I/O をしない
 //! - `upsert` は排他区間の中でファイルを読み直し、cri の `InMemoryImageStore::upsert`（統合・タグの付け替え）で
 //!   組み直してから、一時ファイル → fsync → rename → ディレクトリの fsync で原子的に書く。成功した後だけメモリ表示を
-//!   差し替える（失敗時はメモリもファイルも元のまま）
+//!   差し替える（rename 前の失敗はメモリもファイルも元のまま。rename 後のディレクトリ fsync の失敗は永続側が
+//!   新しい内容なので、メモリ表示も新しい内容へ揃えたうえで `Io` を返す）
 //!
 //! # fail-closed
 //!
@@ -134,6 +135,22 @@ impl ImageStore for PersistentImageStore {
     }
 
     fn upsert(&self, record: ImageRecord) -> Result<(), ImageStoreError> {
+        self.upsert_with(record, sync_dir)
+    }
+}
+
+/// 公開（rename）後のディレクトリの fsync。
+fn sync_dir(root: &Path) -> std::io::Result<()> {
+    File::open(root)?.sync_all()
+}
+
+impl PersistentImageStore {
+    /// [`ImageStore::upsert`] の本体。公開後のディレクトリ fsync を差し替えられる（失敗注入の試験用）。
+    fn upsert_with(
+        &self,
+        record: ImageRecord,
+        sync: fn(&Path) -> std::io::Result<()>,
+    ) -> Result<(), ImageStoreError> {
         // 壊れた状態で開いたストアは書かない（壊れたファイルを上書きしない）。
         self.ready()?;
         // 排他区間の中で永続側を読み直して統合し、書けたときだけメモリ表示を差し替える。
@@ -141,7 +158,25 @@ impl ImageStore for PersistentImageStore {
         let mem = build_memory(read_records(self.oci.root())?)?;
         mem.upsert(record)?;
         let bytes = encode_image_records(&mem.list()?)?;
-        write_atomically(self.oci.root(), &bytes)?;
+        let written = write_atomically(self.oci.root(), &bytes, sync);
+        match written {
+            Ok(()) => {}
+            // rename 前の失敗は永続側が元のまま。メモリも元のまま失敗を返す。
+            Err(WriteFailure {
+                error,
+                published: false,
+            }) => return Err(error),
+            // rename 後（公開後）の失敗は永続側が新しい内容になっている。古い対応を使い続けないよう、
+            // メモリ表示を新しい内容へ揃えてから失敗を返す（再起動後の見え方と一致させる）。
+            Err(WriteFailure {
+                error,
+                published: true,
+            }) => {
+                *self.view.lock().map_err(|_| ImageStoreError::Poisoned)? =
+                    View::Ready(Arc::new(mem));
+                return Err(error);
+            }
+        }
         *self.view.lock().map_err(|_| ImageStoreError::Poisoned)? = View::Ready(Arc::new(mem));
         Ok(())
     }
@@ -187,12 +222,19 @@ fn read_records(root: &Path) -> Result<Vec<ImageRecord>, ImageStoreError> {
 }
 
 /// 一時ファイル → fsync → rename → ディレクトリの fsync。失敗したら一時ファイルを消す（最善努力）。
-fn write_atomically(root: &Path, bytes: &[u8]) -> Result<(), ImageStoreError> {
+///
+/// 失敗時は rename の前後を `published` で区別する（rename 後は永続側が新しい内容になっている）。
+fn write_atomically(
+    root: &Path,
+    bytes: &[u8],
+    sync: fn(&Path) -> std::io::Result<()>,
+) -> Result<(), WriteFailure> {
     let tmp: PathBuf = root.join(format!(
         "{TMP_PREFIX}{}-{}",
         std::process::id(),
         TMP_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
+    let mut published = false;
     let result = (|| -> std::io::Result<()> {
         let mut file = OpenOptions::new()
             .write(true)
@@ -202,12 +244,22 @@ fn write_atomically(root: &Path, bytes: &[u8]) -> Result<(), ImageStoreError> {
         file.write_all(bytes)?;
         file.sync_all()?;
         std::fs::rename(&tmp, root.join(CRI_IMAGE_RECORDS_FILE_NAME))?;
-        File::open(root)?.sync_all()
+        published = true;
+        sync(root)
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
-    result.map_err(|_| ImageStoreError::Io)
+    result.map_err(|_| WriteFailure {
+        error: ImageStoreError::Io,
+        published,
+    })
+}
+
+/// [`write_atomically`] の失敗。`published` は rename が成功した後の失敗かどうか。
+struct WriteFailure {
+    error: ImageStoreError,
+    published: bool,
 }
 
 /// 前回の書き込み途中の残骸（自前の接頭辞の通常ファイル）を消す。排他区間の中で呼ぶ。
@@ -435,6 +487,26 @@ mod tests {
         let store = PersistentImageStore::open(&dir).expect("reopen");
         assert!(!leftover.exists());
         assert_eq!(store.list().expect("list").len(), 1);
+    }
+
+    /// CRI-2・OCI-7: rename 後のディレクトリ fsync が失敗しても、永続側は新しい内容になっているため、
+    /// メモリ表示も新しい対応へ揃い（古いタグの対応を使い続けない）、`Io` を返す。再起動後の見え方とも一致する。
+    #[test]
+    fn cri2_oci7_post_publish_sync_failure_resyncs_view() {
+        let dir = scratch("postpub");
+        let s = PersistentImageStore::open(&dir).expect("open");
+        s.upsert(rec("sha256:aaa", "t:1")).expect("first");
+        let r = s.upsert_with(rec("sha256:bbb", "t:1"), |_| {
+            Err(std::io::Error::other("injected"))
+        });
+        assert_eq!(r, Err(ImageStoreError::Io));
+        assert_eq!(s.get("t:1").expect("get").expect("rec").id(), "sha256:bbb");
+        drop(s);
+        let again = PersistentImageStore::open(&dir).expect("reopen");
+        assert_eq!(
+            again.get("t:1").expect("get").expect("rec").id(),
+            "sha256:bbb"
+        );
     }
 
     /// CRI-2: upsert は排他区間でファイルを読み直す。別の store の書き込みを落とさない。

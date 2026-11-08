@@ -1782,7 +1782,7 @@ fn prepare_private_dir(state_root: &std::path::Path, rel: &str) -> Result<PathBu
     Ok(cur)
 }
 
-/// 状態ルート配下の `.cri/images`（pull と同じ root）を 0700 で用意し、永続の在庫 [`PersistentImageStore`] を開く
+/// 状態ルート配下の `.cri/images`（pull と同じ root）を 0700 で用意し、永続の在庫 `PersistentImageStore` を開く
 /// （CRI-1・CRI-2・OCI-7。#4176）。`production()` の組み立てで 1 回だけ呼ぶ。
 ///
 /// root が不信・排他が取れない場合は `Err`（起動を止める）。記録ファイルだけが壊れているときは `Ok` で、

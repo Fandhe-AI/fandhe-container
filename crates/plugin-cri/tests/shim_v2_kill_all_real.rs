@@ -409,7 +409,9 @@ mod linux {
         cmd.args(["-namespace", namespace])
             .arg("-address")
             .arg(dir.join("containerd.sock"))
-            .args(["-publish-binary", "/usr/bin/containerd", "-id", id, "start"])
+            .arg("-publish-binary")
+            .arg(&shim)
+            .args(["-id", id, "start"])
             // XDG_RUNTIME_DIR は上書きしない（supervisor の `systemd-run --user` に user マネージャが要る）。
             .env("FANDHE_CONTAINER_SHIM_SOCKET_DIR", dir.join("s"))
             .current_dir(dir)

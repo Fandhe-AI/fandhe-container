@@ -4,77 +4,22 @@
 //! write / read 要求の処理、status・used リングの書き戻しまでを具体値で照合する。
 //! KVM は不要で、既定のテスト集合で走る。
 
-use fandhe_container_microvm::error::{MicrovmError, MicrovmErrorCode};
+use fandhe_container_microvm::error::MicrovmErrorCode;
 use fandhe_container_microvm::guest_memory::{GuestAddress, GuestMemory, HeapBacking};
-use fandhe_container_microvm::interrupt::{
-    InterruptDelivery, InterruptLine, complete_block_notify,
-};
+use fandhe_container_microvm::interrupt::{InterruptDelivery, complete_block_notify};
 use fandhe_container_microvm::virtio_block::{MemoryBlockBackend, VirtioBlock};
 use fandhe_container_microvm::virtio_mmio::{
-    InterruptReason, MmioReadOutcome, MmioWriteOutcome, VirtioMmioTransport, reg,
+    InterruptReason, MmioWriteOutcome, VirtioMmioTransport, reg,
 };
+
+/// virtqueue の試験補助の正本（`tests/support/virtqueue_driver.rs`。複製しない・#4113）。
+#[path = "support/virtqueue_driver.rs"]
+mod virtqueue_driver;
+use virtqueue_driver::block::{AVAIL, DATA, STATUS, USED, init, submit};
+use virtqueue_driver::{CountLine, wr};
 
 type T = VirtioMmioTransport<VirtioBlock<MemoryBlockBackend>>;
 type Mem = GuestMemory<HeapBacking>;
-
-const DESC: u64 = 0x1000;
-const AVAIL: u64 = 0x2000;
-const USED: u64 = 0x3000;
-const HDR: u64 = 0x10000;
-const DATA: u64 = 0x11000;
-const STATUS: u64 = 0x12000;
-
-fn wr(t: &mut T, off: u64, v: u32) -> MmioWriteOutcome {
-    t.write(off, &v.to_le_bytes())
-}
-
-fn init(t: &mut T) {
-    wr(t, reg::STATUS, 1);
-    wr(t, reg::STATUS, 3);
-    // 提示された feature をそのまま受ける（下位 32 bit と VERSION_1）。
-    let mut b = [0u8; 4];
-    wr(t, reg::DEVICE_FEATURES_SEL, 0);
-    assert_eq!(
-        t.read(reg::DEVICE_FEATURES, &mut b),
-        MmioReadOutcome::Handled
-    );
-    wr(t, reg::DRIVER_FEATURES_SEL, 0);
-    wr(t, reg::DRIVER_FEATURES, u32::from_le_bytes(b));
-    wr(t, reg::DRIVER_FEATURES_SEL, 1);
-    wr(t, reg::DRIVER_FEATURES, 1);
-    assert_eq!(wr(t, reg::STATUS, 11), MmioWriteOutcome::FeaturesAccepted);
-    wr(t, reg::QUEUE_SEL, 0);
-    wr(t, reg::QUEUE_NUM, 16);
-    wr(t, reg::QUEUE_DESC_LOW, DESC as u32);
-    wr(t, reg::QUEUE_DRIVER_LOW, AVAIL as u32);
-    wr(t, reg::QUEUE_DEVICE_LOW, USED as u32);
-    wr(t, reg::QUEUE_READY, 1);
-    assert_eq!(wr(t, reg::STATUS, 15), MmioWriteOutcome::DeviceActivated);
-}
-
-fn desc(m: &mut Mem, i: u64, addr: u64, len: u32, flags: u16, next: u16) {
-    let at = DESC + i * 16;
-    m.write_at(GuestAddress::new(at), &addr.to_le_bytes())
-        .unwrap();
-    m.write_u32_le(GuestAddress::new(at + 8), len).unwrap();
-    m.write_u16_le(GuestAddress::new(at + 12), flags).unwrap();
-    m.write_u16_le(GuestAddress::new(at + 14), next).unwrap();
-}
-
-/// head=0 の [header R][data][status W] を avail の `slot` に積む。
-fn submit(m: &mut Mem, slot: u16, ty: u32, sector: u64, len: u32, data_flags: u16) {
-    m.write_u32_le(GuestAddress::new(HDR), ty).unwrap();
-    m.write_at(GuestAddress::new(HDR + 8), &sector.to_le_bytes())
-        .unwrap();
-    desc(m, 0, HDR, 16, 1, 1);
-    desc(m, 1, DATA, len, data_flags | 1, 2);
-    desc(m, 2, STATUS, 1, 2, 0);
-    m.write_at(GuestAddress::new(STATUS), &[0xff]).unwrap();
-    let a = AVAIL + 4 + 2 * u64::from(slot);
-    m.write_u16_le(GuestAddress::new(a), 0).unwrap();
-    m.write_u16_le(GuestAddress::new(AVAIL + 2), slot + 1)
-        .unwrap();
-}
 
 /// 受け入れ条件: virtio-block のキューを経由して read/write を処理できる。
 #[test]
@@ -133,31 +78,6 @@ fn mvm1_878_block_queue_write_then_read() {
     assert_eq!(e.code(), MicrovmErrorCode::FailedPrecondition);
     assert_eq!(e.message(), "block queue is not active");
 }
-/// 割り込みを数える偽の割り込み線。
-struct CountLine {
-    count: std::cell::Cell<u32>,
-    fail: bool,
-}
-
-impl CountLine {
-    fn new(fail: bool) -> Self {
-        Self {
-            count: std::cell::Cell::new(0),
-            fail,
-        }
-    }
-}
-
-impl InterruptLine for CountLine {
-    fn trigger(&self) -> Result<(), MicrovmError> {
-        if self.fail {
-            return Err(MicrovmError::new(MicrovmErrorCode::Internal, "line down"));
-        }
-        self.count.set(self.count.get() + 1);
-        Ok(())
-    }
-}
-
 fn fresh() -> (T, Mem) {
     let mut t = VirtioMmioTransport::new(VirtioBlock::new(
         MemoryBlockBackend::new(16 * 512, false).unwrap(),
@@ -178,7 +98,7 @@ fn mvm1_879_notify_with_one_request_triggers_once() {
     assert_eq!((r.stats.completed, r.stats.ok), (1, 1));
     assert_eq!(r.delivery, InterruptDelivery::Triggered);
     assert_eq!(r.queue_error, None);
-    assert_eq!(line.count.get(), 1);
+    assert_eq!(line.count(), 1);
     assert_eq!(t.interrupt_status(), 1);
 }
 
@@ -190,7 +110,7 @@ fn mvm1_879_notify_with_empty_queue_does_not_trigger() {
     let r = complete_block_notify(&mut t, &mut mem, &line).unwrap();
     assert_eq!(r.stats.completed, 0);
     assert_eq!(r.delivery, InterruptDelivery::NotNeeded);
-    assert_eq!(line.count.get(), 0);
+    assert_eq!(line.count(), 0);
     assert_eq!(t.interrupt_status(), 0);
 }
 
@@ -211,7 +131,7 @@ fn mvm1_879_notify_after_partial_progress_still_triggers() {
         r.queue_error.map(|e| e.code()),
         Some(MicrovmErrorCode::InvalidArgument)
     );
-    assert_eq!(line.count.get(), 1);
+    assert_eq!(line.count(), 1);
     assert_eq!(t.interrupt_status(), 1);
 }
 
@@ -229,7 +149,7 @@ fn mvm1_879_notify_with_broken_first_request_does_not_trigger() {
         r.queue_error.map(|e| e.code()),
         Some(MicrovmErrorCode::InvalidArgument)
     );
-    assert_eq!(line.count.get(), 0);
+    assert_eq!(line.count(), 0);
     assert_eq!(t.interrupt_status(), 0);
 }
 
@@ -259,5 +179,5 @@ fn mvm1_879_notify_before_activation_reports_queue_error() {
         r.queue_error.map(|e| e.code()),
         Some(MicrovmErrorCode::FailedPrecondition)
     );
-    assert_eq!(line.count.get(), 0);
+    assert_eq!(line.count(), 0);
 }

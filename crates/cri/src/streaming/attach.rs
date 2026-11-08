@@ -197,9 +197,8 @@ impl StreamHandler for AttachHandler {
             let backend = Arc::clone(&self.backend);
             let limits = self.limits;
             let recorder = Arc::clone(&self.recorder);
-            tokio::spawn(async move {
-                // 同時接続数の枠は IO の寿命まで保持する（`StreamHandler::handle` の契約）。
-                let _permit = permit;
+            // 同時接続数の枠は spawn_session がタスクの寿命まで保持する（`StreamHandler::handle` の契約。#4164）。
+            permit.spawn_session(async move {
                 let Ok(upgraded) = on_upgrade.await else {
                     return;
                 };

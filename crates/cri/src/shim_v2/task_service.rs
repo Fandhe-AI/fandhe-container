@@ -82,9 +82,10 @@
 //! 期限（REPAIR-5）: Wait は上記の期限を持つ。他のメソッドは `ContainerRuntime` の契約で実装側が期限を持ち、
 //! shim は追加の期限を設けない。socket の権限・peer UID の照合は #803（TASK-62.7）の範囲。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -95,6 +96,10 @@ use super::exec::{
     sleep_until,
 };
 use super::message::{RpcStatus, count_top_level_field};
+use super::publish::{
+    EventGuard, EventPublisher, PublishFailure, PublishStage, TaskCreate, TaskDelete, TaskEvent,
+    TaskExit, TaskIo, TaskStart,
+};
 use super::service::shutdown_gate_failure;
 use super::service::{CallContext, TaskApiVersion, TtrpcService, unimplemented_status};
 use super::shutdown::ShutdownSignal;
@@ -117,6 +122,12 @@ const FIELD_OPTIONS: u64 = 10;
 
 /// 終了コードが不明なときの `exit_status`。containerd クライアントの `UnknownExitStatus` に倣う。
 const UNKNOWN_EXIT_STATUS: u32 = 255;
+/// 同時に動かす終了 watcher の上限（`CREATED_MAX` と同じ。REPAIR-5）。
+const MAX_EXIT_WATCHERS: usize = CREATED_MAX;
+/// 終了 watcher の作成世代の採番（プロセス内で単調増加）。
+static NEXT_WATCH_GENERATION: AtomicU64 = AtomicU64::new(1);
+/// 照会の失敗が続いたときに watcher が諦めるまでの連続回数。
+const EXIT_WATCH_MAX_ERRORS: u32 = 3;
 /// 記録しておく作成済み ID の上限。Delete で除去するが、除去されない経路でも無制限に増やさない（REPAIR-5）。
 const CREATED_MAX: usize = 1024;
 
@@ -138,6 +149,11 @@ pub struct TaskService {
     ///
     /// v2 と v3 を同じ shim に登録するときは [`TaskService::with_shared_created`] で共有する。
     created: Arc<Mutex<BTreeSet<String>>>,
+    /// イベント 4 種の送り先。無ければ Create・Start・Delete は送らず、終了 watcher も起こさない（#4155・#4156・CRI-5）。
+    event_publisher: Option<Arc<dyn EventPublisher>>,
+    /// 稼働中の終了 watcher の ID。v2 と v3 で共有し、同じ ID の watcher を重複させず、数を `MAX_EXIT_WATCHERS` で抑える。
+    /// 値は作成世代のトークン。Delete が登録を外し、世代が違う watcher は publish しない（#4155）。
+    exit_watchers: WatchRegistry,
 }
 
 impl std::fmt::Debug for TaskService {
@@ -159,7 +175,24 @@ impl TaskService {
             wait_config: WaitConfig::default(),
             shutdown: None,
             created: Arc::new(Mutex::new(BTreeSet::new())),
+            event_publisher: None,
+            exit_watchers: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+
+    /// イベントの送り先を差し込む。差し込むと、Create・Start・Delete の成功ごとにイベントを投入し、init の `Start` 成功ごとに終了 watcher を 1 本起こし、
+    /// 終了を観測したら 1 回だけ publish する（#4155・CRI-5・REPAIR-5）。Start・Wait・State・Delete の応答は変えない。
+    ///
+    /// watcher は `RuntimeAdapter::wait_exit` を期限つきで繰り返す。plugin-cri の `CoreLifecycleRuntime` は呼び出しごとに
+    /// supervisor の終了通知を購読し（枠はコンテナごとに 8、超えたら照会へ縮退）、containerd の Wait RPC と並んでも壊れない。
+    /// 待ち 1 回は [`WaitConfig`] の期限で有界だが、watcher の寿命全体は有界でない（コンテナが動く間は続く）。
+    /// 数は `MAX_EXIT_WATCHERS` が上限。Wait・State・Delete の経路からは publish しない（重複排除の仕組みが要るため）。
+    ///
+    /// 残余: Wait の直後 1 照会間隔以内に Delete する利用者（`ctr` 型）は、watcher の観測より先に削除が走ると取り逃しうる
+    /// （CRI の流れは `/tasks/exit` を受けてから Delete するので起きない）。restart による一時的な Stopped は対象外。
+    pub fn with_event_publisher(mut self, publisher: Arc<dyn EventPublisher>) -> Self {
+        self.event_publisher = Some(publisher);
+        self
     }
 
     /// Shutdown RPC の終了要求の送り先を差し込む。無ければ `Shutdown` は `UNIMPLEMENTED`（TASK-62.7.2）。
@@ -174,6 +207,7 @@ impl TaskService {
     pub fn with_shared_created(mut self, other: &TaskService) -> Self {
         self.created = Arc::clone(&other.created);
         self.execs = Arc::clone(&other.execs);
+        self.exit_watchers = Arc::clone(&other.exit_watchers);
         self
     }
 
@@ -198,6 +232,9 @@ impl TaskService {
         let st = self.adapter.state(&req.id).map_err(|e| to_status(&e))?;
         let (status, exit_status) = match st.lifecycle {
             RuntimeLifecycle::Creating | RuntimeLifecycle::Created => (TaskStatus::Created, 0),
+            // 起動の途中（Running を記録したが init の pid がまだ無い）は未起動として返す。RUNNING・pid 0 を返すと
+            // containerd が実在しない pid の RUNNING を見る（#4104・CRI-5）。pid が判明すれば RUNNING になる。
+            RuntimeLifecycle::Running if st.pid.is_none() => (TaskStatus::Created, 0),
             RuntimeLifecycle::Running => (TaskStatus::Running, 0),
             RuntimeLifecycle::Stopped => (TaskStatus::Stopped, stopped_exit_status(&st)),
             _ => (TaskStatus::Unknown, 0),
@@ -543,16 +580,33 @@ impl TaskService {
             .create(&req.id, bundle)
             .map_err(|e| to_status(&e))?;
         created.insert(req.id.clone());
+        // 外で消えたコンテナの旧 watcher も取り消す（旧インスタンスの TaskExit を新コンテナの後に出さない。#4155）。
+        self.revoke_watcher(&req.id);
         // 作成に成功した＝その ID は直前まで存在しなかったので、外で消えたコンテナの旧登録を引き継がない。
         if let Some(container) = &container {
             self.execs
                 .purge_container(container)
                 .map_err(|e| to_status(&e))?;
         }
-        Ok(CreateTaskResponse {
-            pid: status.pid.unwrap_or(0),
+        let pid = status.pid.unwrap_or(0);
+        // #4156: 成功する直前（ゲート保持中）に投入する。失敗した RPC では出さない。
+        self.emit(TaskEvent::Create(TaskCreate {
+            container_id: req.id.clone(),
+            bundle: req.bundle.clone(),
+            rootfs: Vec::new(),
+            io: Some(TaskIo::default()),
+            checkpoint: String::new(),
+            pid,
+        }));
+        Ok(CreateTaskResponse { pid }.encode_to_vec())
+    }
+
+    /// Create・Start・Delete の成功イベントを投入する（#4156）。publisher が無ければ何もしない。
+    /// 世代の guard は使わない（完了済みの RPC の事実の記録で、投入順はコンテナのゲートが決める）。
+    fn emit(&self, event: TaskEvent) {
+        if let Some(publisher) = &self.event_publisher {
+            publisher.publish(event);
         }
-        .encode_to_vec())
     }
 
     fn start(&self, payload: &[u8]) -> Result<Vec<u8>, RpcStatus> {
@@ -560,11 +614,90 @@ impl TaskService {
         if !req.exec_id.is_empty() {
             return self.start_exec(&req);
         }
+        // 実行層の Start から終了 watcher の登録までを、Create・Delete と同じコンテナ単位のゲートで排他する。
+        // ゲート無しだと、旧 Start が中断中に旧コンテナの Delete・同 ID の再作成が済み、旧 pid の watcher が
+        // 再作成後に登録されて新コンテナの TaskExit が `instance_mismatch` で捨てられる（CRI-5・#4155）。
+        let container = ContainerId::new(&req.id).ok();
+        let _gate = match &container {
+            Some(c) => Some(self.execs.lock_container(c).map_err(|e| to_status(&e))?),
+            None => None,
+        };
         let status = self.adapter.start(&req.id).map_err(|e| to_status(&e))?;
-        Ok(StartResponse {
-            pid: status.pid.unwrap_or(0),
+        let pid = status.pid.unwrap_or(0);
+        // TaskStart を TaskExit より先に投入する（速く終わるコンテナでも順序を保つ。#4156）。
+        self.emit(TaskEvent::Start(TaskStart {
+            container_id: req.id.clone(),
+            pid,
+        }));
+        self.spawn_exit_watcher(&req.id, pid);
+        Ok(StartResponse { pid }.encode_to_vec())
+    }
+
+    /// 同じ ID の終了 watcher を取り消す。取り消しの印（`revoked`）を先に立ててから登録表から外す。
+    /// 登録表のロックを持ったまま行うので、登録が無いと見えた側は必ず印を見る（#4155）。
+    fn revoke_watcher(&self, id: &str) {
+        let mut set = self.exit_watchers.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(old) = set.get(id) {
+            old.revoked.store(true, Ordering::Release);
         }
-        .encode_to_vec())
+        set.remove(id);
+    }
+
+    /// init の終了 watcher を起こす（#4155）。publisher が無い場合は何もしない。既存の同じ ID の登録は置き換える。
+    /// 上限超過とスレッドの起動失敗は構造化ログを 1 件出して起こさない（Start の応答は変えない）。
+    fn spawn_exit_watcher(&self, id: &str, start_pid: u32) {
+        let Some(publisher) = &self.event_publisher else {
+            return;
+        };
+        let generation = NEXT_WATCH_GENERATION.fetch_add(1, Ordering::Relaxed);
+        let revoked = Arc::new(AtomicBool::new(false));
+        {
+            let mut set = self.exit_watchers.lock().unwrap_or_else(|p| p.into_inner());
+            // Delete・Create が取り消さずに残った旧世代（外で消えたコンテナ等）は、Start 成功の時点で
+            // 現在のインスタンスのものではない。印を先に立ててから置き換える（#4155）。
+            if let Some(old) = set.remove(id) {
+                old.revoked.store(true, Ordering::SeqCst);
+            }
+            if set.values().filter(|e| !e.done).count() >= MAX_EXIT_WATCHERS {
+                drop(set);
+                publisher.report(PublishFailure::new(PublishStage::WatchLimit, None));
+                return;
+            }
+            set.insert(
+                id.to_owned(),
+                WatchEntry {
+                    generation,
+                    done: false,
+                    revoked: Arc::clone(&revoked),
+                },
+            );
+        }
+        let ctx = ExitWatch {
+            adapter: self.adapter.clone(),
+            publisher: Arc::clone(publisher),
+            wait: self.wait_config,
+            shutdown: self.shutdown.clone(),
+            id: id.to_owned(),
+            start_pid,
+            generation,
+            revoked,
+            watchers: Arc::clone(&self.exit_watchers),
+        };
+        let watchers = Arc::clone(&self.exit_watchers);
+        let spawned = std::thread::Builder::new()
+            .name("shim-exit-watch".into())
+            .spawn(move || {
+                ctx.run();
+                ctx.unregister();
+            });
+        if spawned.is_err() {
+            let mut set = watchers.lock().unwrap_or_else(|p| p.into_inner());
+            if set.get(id).is_some_and(|e| e.generation == generation) {
+                set.remove(id);
+            }
+            drop(set);
+            publisher.report(PublishFailure::new(PublishStage::WatchSpawn, None));
+        }
     }
 
     fn delete(&self, payload: &[u8]) -> Result<Vec<u8>, RpcStatus> {
@@ -594,18 +727,27 @@ impl TaskService {
         self.adapter.remove(&req.id, false).map_err(gone)?;
         created.remove(&req.id);
         drop(created);
+        // 旧コンテナの終了 watcher を取り消す。同じ ID の再作成・再 Start で新しい世代が登録でき、旧世代は publish しない（#4155）。
+        self.revoke_watcher(&req.id);
         // 削除成功後に旧コンテナの exec 登録を除去する（同じ ID の再作成で引き継がない。CRI-5）。
         if let Some(container) = &container {
             self.execs
                 .purge_container(container)
                 .map_err(|e| to_status(&e))?;
         }
-        Ok(DeleteResponse {
+        let resp = DeleteResponse {
             pid: before.pid.unwrap_or(0),
             exit_status: exit_status_of(&before),
             exited_at: exited_at_of(&before),
-        }
-        .encode_to_vec())
+        };
+        self.emit(TaskEvent::Delete(TaskDelete {
+            container_id: req.id.clone(),
+            pid: resp.pid,
+            exit_status: resp.exit_status,
+            exited_at: resp.exited_at.clone(),
+            id: req.id.clone(),
+        }));
+        Ok(resp.encode_to_vec())
     }
 
     /// `Delete(exec_id)`: 未起動または終了済みの exec の登録を除去する（#3681・CRI-5）。
@@ -742,6 +884,130 @@ impl TaskService {
             exited_at: exited_at_of(&st),
         }
         .encode_to_vec())
+    }
+}
+
+/// 終了 watcher の登録表（ID → 登録）。v2 と v3 で共有する。
+type WatchRegistry = Arc<Mutex<BTreeMap<String, WatchEntry>>>;
+
+/// 登録 1 件。`revoked` は Delete だけが立てる。watcher が終了して登録を外しても立たないため、
+/// キューで待つ TaskExit は「Delete された世代」だけを送信直前の再確認で捨てられる（CRI-5・#4155）。
+#[derive(Debug, Clone)]
+struct WatchEntry {
+    generation: u64,
+    /// watcher の thread が終わった。登録は Delete まで残し（`revoked` を立てる先を失わない）、同じ ID の再 Start では置き換える。
+    done: bool,
+    revoked: Arc<AtomicBool>,
+}
+
+/// 終了 watcher 1 本の持ち物（#4155）。`TaskService::spawn_exit_watcher` が起こすスレッドが所有する。
+struct ExitWatch {
+    adapter: RuntimeAdapter,
+    publisher: Arc<dyn EventPublisher>,
+    wait: WaitConfig,
+    shutdown: Option<ShutdownSignal>,
+    id: String,
+    start_pid: u32,
+    /// この watcher の作成世代。登録表の値と一致する間だけ有効（Delete で外れる）。
+    generation: u64,
+    revoked: Arc<AtomicBool>,
+    watchers: WatchRegistry,
+}
+
+impl ExitWatch {
+    /// 登録表の世代が自分のものか。Delete・再作成で外れていれば false。
+    fn is_current(&self) -> bool {
+        self.watchers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&self.id)
+            .is_some_and(|e| e.generation == self.generation)
+    }
+
+    /// 自分の世代の登録を終了済みにする（新しい世代の登録は触らない）。登録自体は Delete まで残し、
+    /// キューで待つ TaskExit の取り消し先（`revoked`）を失わない。
+    fn unregister(&self) {
+        let mut set = self.watchers.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(e) = set.get_mut(&self.id)
+            && e.generation == self.generation
+        {
+            e.done = true;
+        }
+    }
+
+    /// 終了を観測して TaskExit を 1 回だけ publish する。`Timeout` は周回を続け、`NotFound`（観測前の削除）と取り消しは黙って終わる。
+    /// その他の失敗は照会間隔だけ待って再試行し、連続 [`EXIT_WATCH_MAX_ERRORS`] 回で `watch` を 1 件記録して諦める。
+    fn run(&self) {
+        let cancelled = || {
+            self.shutdown
+                .as_ref()
+                .is_some_and(ShutdownSignal::is_requested)
+                || !self.is_current()
+        };
+        let mut errors = 0;
+        loop {
+            if cancelled() {
+                return;
+            }
+            match self.adapter.wait_exit(
+                &self.id,
+                self.wait.timeout(),
+                self.wait.poll_interval(),
+                &cancelled,
+            ) {
+                Ok(st) => {
+                    self.publish_exit(&st);
+                    return;
+                }
+                Err(e) => match e.code() {
+                    CriErrorCode::Timeout => errors = 0,
+                    CriErrorCode::NotFound => return,
+                    _ => {
+                        errors += 1;
+                        if cancelled() {
+                            return;
+                        }
+                        if errors >= EXIT_WATCH_MAX_ERRORS {
+                            self.publisher
+                                .report(PublishFailure::new(PublishStage::Watch, None));
+                            return;
+                        }
+                        sleep_until(Instant::now() + self.wait.poll_interval(), &cancelled);
+                    }
+                },
+            }
+        }
+    }
+
+    /// 停止済みの状態から TaskExit を組み立てて送る。pid が Start 時と食い違えば作り直しとみなして送らない。
+    fn publish_exit(&self, st: &RuntimeContainerStatus) {
+        // 取り消された世代（Delete 後の旧コンテナ）の終了は送らない。
+        if !self.is_current() {
+            return;
+        }
+        if let Some(p) = st.pid
+            && self.start_pid != 0
+            && p != self.start_pid
+        {
+            self.publisher.report(PublishFailure::new(
+                PublishStage::InstanceMismatch,
+                Some(super::publish::TASK_EXIT_TOPIC),
+            ));
+            return;
+        }
+        // 確認後に Delete・再作成が割り込んでも、キューの中と送信直前で世代を再確認して旧世代を捨てる。
+        let revoked = Arc::clone(&self.revoked);
+        let guard: EventGuard = Arc::new(move || !revoked.load(Ordering::Acquire));
+        self.publisher.publish_guarded(
+            TaskEvent::Exit(TaskExit {
+                container_id: self.id.clone(),
+                id: self.id.clone(),
+                pid: st.pid.unwrap_or(self.start_pid),
+                exit_status: stopped_exit_status(st),
+                exited_at: exited_at_of(st),
+            }),
+            guard,
+        );
     }
 }
 
@@ -900,6 +1166,8 @@ mod tests {
         wrong_id: bool,
         /// state が返す状態の上書き（終了コード等を差し込む）。
         preset: Mutex<HashMap<String, ContainerStatus>>,
+        /// `Kill(all=true)` を配置の記録が無いコンテナと同じ `FailedPrecondition` で失敗させる（#4055）。
+        kill_all_err: bool,
         /// state が UNAVAILABLE を返す ID（一時的な不達の注入。#4058）。
         fail_state: Mutex<std::collections::HashSet<String>>,
     }
@@ -953,6 +1221,17 @@ mod tests {
                 }
                 _ => format!("kill {id} {}", r.signal().as_u8()),
             });
+            if self.0.kill_all_err
+                && matches!(
+                    r.target(),
+                    fandhe_container_core::traits::KillTarget::AllProcesses
+                )
+            {
+                return Err(TraitError::new(
+                    ErrorCode::FailedPrecondition,
+                    "no cgroup placement recorded",
+                ));
+            }
             Ok(ContainerStatus::running(
                 r.id().clone(),
                 NonZeroU32::new(4242),
@@ -1490,6 +1769,19 @@ mod tests {
         }
     }
 
+    /// CRI-5・#4104: 起動途中（Running だが pid 未判明）の State は RUNNING・pid 0 ではなく CREATED を返す。
+    #[test]
+    fn cri5_4104_state_running_without_pid_is_created() {
+        let (s, f) = svc(TaskApiVersion::V2, Fake::default());
+        s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
+        f.preset.lock().unwrap().insert(
+            "c1".into(),
+            ContainerStatus::running(RtId::new("c1").unwrap(), None),
+        );
+        let r = state_of(&s, "c1");
+        assert_eq!((r.pid, r.status), (0, TaskStatus::Created as i32));
+    }
+
     /// CRI-5・TASK-62.6: Connect は Created で task_pid 0・Running で pid・shim_pid は自 pid を返す。
     #[test]
     fn cri5_676_connect_reports_pids() {
@@ -1589,6 +1881,25 @@ mod tests {
             err_code(s.handle("Kill", &kill_req("zz", 9, false, ""))).0,
             NOT_FOUND
         );
+    }
+
+    /// CRI-5・CORE-4・#4055: 配置の記録が無いコンテナへの `Kill(all=true)` は core の `FailedPrecondition` が
+    /// shim の層で code 9 に写る（init だけを殺す縮退をしない）。`all=false` は影響を受けない。
+    /// core 側は `cri5_kill_all_without_placement_is_failed_precondition`、実 cgroup の照合は `shim_v2_kill_all_real`。
+    #[test]
+    fn cri5_4055_kill_all_failed_precondition_maps_to_code_9() {
+        let (s, f) = svc(
+            TaskApiVersion::V2,
+            Fake {
+                kill_all_err: true,
+                ..Fake::default()
+            },
+        );
+        running_container(&s, "c1");
+        let (code, _) = err_code(s.handle("Kill", &kill_req("c1", 9, true, "")));
+        assert_eq!(code, PRECOND);
+        assert_eq!(f.calls.lock().unwrap().last().unwrap(), "kill-all c1 9");
+        s.handle("Kill", &kill_req("c1", 9, false, "")).unwrap();
     }
 
     /// CRI-5・TASK-62.7.2: 停止済みへの Kill は NOT_FOUND で、シグナルを送らない。
@@ -3140,6 +3451,560 @@ mod tests {
                 (UNIMPL, "exec_id is not supported"),
                 "{m}"
             );
+        }
+    }
+
+    // ---- TaskExit の終了 watcher（#4155・CRI-5・REPAIR-5） ----
+
+    use super::super::publish::testkit::{CapturePublisher, wait_until};
+    use super::super::publish::{PublishStage as Stage, TaskEvent as Ev};
+
+    fn svc_pub(fake: Fake) -> (TaskService, Arc<Fake>, Arc<CapturePublisher>) {
+        let (s, f) = svc(TaskApiVersion::V2, fake);
+        let cap = Arc::new(CapturePublisher::default());
+        let s = fast_wait(s, 100).with_event_publisher(cap.clone());
+        (s, f, cap)
+    }
+
+    // ---- Create・Start・Delete のイベント（#4156・CRI-5・REPAIR-5） ----
+
+    /// CRI-5・#4156: V2 / V3 の両方で、Create → Start → 停止 → Delete が TaskCreate・TaskStart・TaskExit・TaskDelete を
+    /// この順に具体値で投入し、Delete の値は `DeleteResponse` と一致する。
+    #[test]
+    fn cri5_4156_create_start_delete_publish_events_in_order() {
+        for v in [TaskApiVersion::V2, TaskApiVersion::V3] {
+            let fake = Fake {
+                create_pid: Some(4242),
+                ..Fake::default()
+            };
+            let (s, f) = svc(v, fake);
+            let cap = Arc::new(CapturePublisher::default());
+            let s = fast_wait(s, 100).with_event_publisher(cap.clone());
+            let created = s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
+            assert_eq!(CreateTaskResponse::decode(&created[..]).unwrap().pid, 4242);
+            s.handle("Start", &start_req("c1")).unwrap();
+            stopped_with_time(&f, "c1", Some(3), 1_700_000_000_000_000_005);
+            assert!(wait_until(std::time::Duration::from_secs(10), || {
+                cap.events.lock().unwrap().len() >= 3
+            }));
+            let out = s.handle("Delete", &delete_req("c1", "")).unwrap();
+            let resp = DeleteResponse::decode(&out[..]).unwrap();
+            let evs = cap.events.lock().unwrap().clone();
+            assert_eq!(evs.len(), 4, "{v:?}: {evs:?}");
+            assert_eq!(
+                evs[0],
+                Ev::Create(TaskCreate {
+                    container_id: "c1".into(),
+                    bundle: abs("/b"),
+                    rootfs: Vec::new(),
+                    io: Some(TaskIo::default()),
+                    checkpoint: String::new(),
+                    pid: 4242,
+                })
+            );
+            assert_eq!(
+                evs[1],
+                Ev::Start(TaskStart {
+                    container_id: "c1".into(),
+                    pid: 4242
+                })
+            );
+            assert!(matches!(&evs[2], Ev::Exit(_)));
+            assert_eq!(
+                evs[3],
+                Ev::Delete(TaskDelete {
+                    container_id: "c1".into(),
+                    pid: resp.pid,
+                    exit_status: 3,
+                    exited_at: resp.exited_at.clone(),
+                    id: "c1".into(),
+                })
+            );
+            assert_eq!(resp.exit_status, 3);
+            assert!(resp.exited_at.is_some());
+            assert!(cap.failures.lock().unwrap().is_empty());
+        }
+    }
+
+    /// CRI-5・#4156: 失敗した Create・Start・Delete はイベントを出さない。
+    #[test]
+    fn cri5_4156_failed_rpcs_publish_nothing() {
+        let (s, _f, cap) = svc_pub(Fake::default());
+        // Create の拒否（相対 bundle・terminal・stdio）。
+        assert!(s.handle("Create", &create_req("c1", "rel/b")).is_err());
+        let term = CreateTaskRequest {
+            id: "c1".into(),
+            bundle: abs("/b"),
+            terminal: true,
+            ..Default::default()
+        }
+        .encode_to_vec();
+        assert!(s.handle("Create", &term).is_err());
+        let io = CreateTaskRequest {
+            id: "c1".into(),
+            bundle: abs("/b"),
+            stdout: "/x".into(),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        assert!(s.handle("Create", &io).is_err());
+        // 存在しない ID の Start・Delete。
+        assert!(s.handle("Start", &start_req("nope")).is_err());
+        assert!(s.handle("Delete", &delete_req("nope", "")).is_err());
+        assert!(cap.events.lock().unwrap().is_empty());
+        // 実行中のコンテナの Delete は拒否され、増えるのは Create・Start の 2 件だけ。
+        s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
+        s.handle("Start", &start_req("c1")).unwrap();
+        assert!(s.handle("Delete", &delete_req("c1", "")).is_err());
+        let evs = cap.events.lock().unwrap().clone();
+        assert!(
+            matches!(evs.as_slice(), [Ev::Create(_), Ev::Start(_)]),
+            "{evs:?}"
+        );
+    }
+
+    /// CRI-5・#4156: exec の経路（Exec・Start(exec_id)・Delete(exec_id)）はイベントを出さない。
+    #[test]
+    fn cri5_4156_exec_paths_publish_nothing() {
+        let (s, _f, _l) = svc_exec(TaskApiVersion::V2);
+        let cap = Arc::new(CapturePublisher::default());
+        let s = fast_wait(s, 100).with_event_publisher(cap.clone());
+        running_container(&s, "c1");
+        s.handle("Exec", &exec_req("c1", "e1", SPEC)).unwrap();
+        s.handle("Start", &start_exec_req("c1", "e1")).unwrap();
+        let _ = s.handle("Delete", &delete_req("c1", "e1"));
+        let evs = cap.events.lock().unwrap().clone();
+        assert!(
+            matches!(evs.as_slice(), [Ev::Create(_), Ev::Start(_)]),
+            "{evs:?}"
+        );
+    }
+
+    /// CRI-5・#4155: Start 成功後の watcher が終了を観測し、TaskExit を具体値で 1 回だけ送る。
+    /// 同じ ID の watcher は重複しない。
+    #[test]
+    fn cri5_4155_start_spawns_watcher_publishing_exit_once() {
+        let fake = Fake {
+            create_pid: Some(4242),
+            ..Fake::default()
+        };
+        let (s, f, cap) = svc_pub(fake);
+        s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
+        s.handle("Start", &start_req("c1")).unwrap();
+        s.spawn_exit_watcher("c1", 4242);
+        assert_eq!(s.exit_watchers.lock().unwrap().len(), 1);
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        let head = vec![
+            Ev::Create(TaskCreate {
+                container_id: "c1".into(),
+                bundle: abs("/b"),
+                rootfs: Vec::new(),
+                io: Some(TaskIo::default()),
+                checkpoint: String::new(),
+                pid: 4242,
+            }),
+            Ev::Start(TaskStart {
+                container_id: "c1".into(),
+                pid: 4242,
+            }),
+        ];
+        assert_eq!(
+            *cap.events.lock().unwrap(),
+            head,
+            "running: Create and Start only"
+        );
+        stopped_with_time(&f, "c1", Some(3), 1_700_000_000_000_000_005);
+        assert!(wait_until(std::time::Duration::from_secs(10), || {
+            cap.events.lock().unwrap().len() > 2
+        }));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let got = cap.events.lock().unwrap().clone();
+        let mut want = head;
+        want.push(Ev::Exit(TaskExit {
+            container_id: "c1".into(),
+            id: "c1".into(),
+            pid: 4242,
+            exit_status: 3,
+            exited_at: Some(Timestamp {
+                seconds: 1_700_000_000,
+                nanos: 5,
+            }),
+        }));
+        assert_eq!(got, want);
+        assert!(cap.failures.lock().unwrap().is_empty());
+        assert!(wait_until(std::time::Duration::from_secs(5), || {
+            s.exit_watchers.lock().unwrap().values().all(|e| e.done)
+        }));
+    }
+
+    /// CRI-5・#4155: 観測前に削除された（`NOT_FOUND`）ときは何も送らず、ログも出さず、watcher の登録も消える。
+    #[test]
+    fn cri5_4155_watcher_is_silent_when_container_vanishes() {
+        let (s, f, cap) = svc_pub(Fake::default());
+        s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
+        s.handle("Start", &start_req("c1")).unwrap();
+        f.states.lock().unwrap().remove("c1");
+        assert!(wait_until(std::time::Duration::from_secs(5), || {
+            s.exit_watchers.lock().unwrap().values().all(|e| e.done)
+        }));
+        // Exit は出ない（Create・Start だけ。#4156）。
+        let got = cap.events.lock().unwrap().clone();
+        assert!(
+            matches!(got.as_slice(), [Ev::Create(_), Ev::Start(_)]),
+            "{got:?}"
+        );
+        assert!(cap.failures.lock().unwrap().is_empty());
+    }
+
+    /// CRI-5・#4155: publisher が無ければ watcher を起こさない。
+    #[test]
+    fn cri5_4155_no_publisher_no_watcher() {
+        let (s, _f) = svc(TaskApiVersion::V2, Fake::default());
+        s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
+        s.handle("Start", &start_req("c1")).unwrap();
+        assert!(s.exit_watchers.lock().unwrap().is_empty());
+    }
+
+    /// CRI-5・SEC-1・#4155: Stopped の状態の pid が Start 時と食い違えば作り直しとみなして送らず、`instance_mismatch` を 1 件。
+    /// pid が無ければ Start 時の pid を使う。
+    #[test]
+    fn cri5_4155_pid_mismatch_is_not_published() {
+        let cap = Arc::new(CapturePublisher::default());
+        let (adapter, _f) = {
+            let f = Arc::new(Fake::default());
+            (RuntimeAdapter::from_runtime(Shared(f.clone())), f)
+        };
+        let watch = ExitWatch {
+            adapter,
+            publisher: cap.clone(),
+            wait: WaitConfig::default(),
+            shutdown: None,
+            id: "c1".into(),
+            start_pid: 4242,
+            generation: 7,
+            revoked: Arc::new(AtomicBool::new(false)),
+            watchers: Arc::new(Mutex::new(BTreeMap::from([(
+                "c1".to_owned(),
+                WatchEntry {
+                    generation: 7,
+                    done: false,
+                    revoked: Arc::new(AtomicBool::new(false)),
+                },
+            )]))),
+        };
+        let mut st = RuntimeContainerStatus::from(&ContainerStatus::stopped(
+            RtId::new("c1").unwrap(),
+            Some(0),
+        ));
+        st.pid = Some(9999);
+        watch.publish_exit(&st);
+        assert!(cap.events.lock().unwrap().is_empty()); // watch を直接呼ぶのでサービスのイベントは無い
+        let fails = cap.failures.lock().unwrap().clone();
+        assert_eq!(fails.len(), 1);
+        assert_eq!(fails[0].stage, Stage::InstanceMismatch);
+        st.pid = None;
+        watch.publish_exit(&st);
+        let evs = cap.events.lock().unwrap().clone();
+        assert_eq!(evs.len(), 1);
+        let Ev::Exit(e) = &evs[0] else {
+            panic!("{evs:?}")
+        };
+        assert_eq!((e.pid, e.exit_status, e.exited_at.clone()), (4242, 0, None));
+    }
+
+    /// CRI-5・#4155: init の Start はコンテナ単位のゲートを取り、Delete・再作成の最中は watcher を登録しない。
+    #[test]
+    fn cri5_4155_start_waits_for_container_gate() {
+        let fake = Fake {
+            create_pid: Some(111),
+            ..Fake::default()
+        };
+        let (s, _f, _cap) = svc_pub(fake);
+        s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
+        let c1 = ContainerId::new("c1").unwrap();
+        let gate = s.execs.lock_container(&c1).unwrap();
+        std::thread::scope(|scope| {
+            let h = scope.spawn(|| s.handle("Start", &start_req("c1")).unwrap());
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            assert!(!h.is_finished(), "Start must wait for the container gate");
+            assert!(s.exit_watchers.lock().unwrap().is_empty());
+            drop(gate);
+            h.join().unwrap();
+        });
+        assert_eq!(s.exit_watchers.lock().unwrap().len(), 1);
+    }
+
+    /// CRI-5・#4155: Delete 後に同じ ID で Create・Start し直すと、旧 watcher は取り消されて旧 pid を publish せず、
+    /// 新しい watcher が登録される（世代違いの終了は送らない）。
+    #[test]
+    fn cri5_4155_recreate_after_delete_replaces_watcher() {
+        let fake = Fake {
+            create_pid: Some(111),
+            ..Fake::default()
+        };
+        let (s, f, cap) = svc_pub(fake);
+        s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
+        s.handle("Start", &start_req("c1")).unwrap();
+        let old = s
+            .exit_watchers
+            .lock()
+            .unwrap()
+            .get("c1")
+            .unwrap()
+            .generation;
+        // 旧コンテナを停止させずに削除する（force なしで通る状態にするため停止にしてから）。
+        stopped_with_time(&f, "c1", Some(0), 1_700_000_000_000_000_000);
+        s.handle("Delete", &delete_req("c1", "")).unwrap();
+        assert!(s.exit_watchers.lock().unwrap().get("c1").is_none());
+        f.preset.lock().unwrap().remove("c1");
+        s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
+        s.handle("Start", &start_req("c1")).unwrap();
+        let new = s
+            .exit_watchers
+            .lock()
+            .unwrap()
+            .get("c1")
+            .unwrap()
+            .generation;
+        assert_ne!(old, new);
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        // 旧世代の watcher の終了後も新しい登録は残る。
+        assert_eq!(
+            s.exit_watchers
+                .lock()
+                .unwrap()
+                .get("c1")
+                .unwrap()
+                .generation,
+            new
+        );
+        let evs = cap.events.lock().unwrap().clone();
+        assert!(
+            evs.iter()
+                .all(|e| !matches!(e, Ev::Exit(x) if x.exit_status != 0)),
+            "{evs:?}"
+        );
+        // Create・Start・Delete・Create・Start の並び（Exit は旧世代の取り消しで揺れるため除く。#4156）。
+        let kinds: Vec<&str> = evs
+            .iter()
+            .filter_map(|e| match e {
+                Ev::Create(_) => Some("create"),
+                Ev::Start(_) => Some("start"),
+                Ev::Delete(_) => Some("delete"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(kinds, ["create", "start", "delete", "create", "start"]);
+    }
+
+    /// CRI-5・#4155: 確認後・キュー投入後に Delete・再作成されても、投入時に渡した述語が旧世代を無効と返す。
+    #[test]
+    fn cri5_4155_guard_of_queued_event_is_revoked_by_delete_and_recreate() {
+        use super::super::publish::EventGuard;
+        #[derive(Default)]
+        struct Holding(Mutex<Vec<EventGuard>>);
+        impl EventPublisher for Holding {
+            fn publish(&self, _: TaskEvent) {}
+            fn publish_guarded(&self, _: TaskEvent, g: EventGuard) {
+                self.0.lock().unwrap().push(g);
+            }
+            fn report(&self, _: PublishFailure) {}
+        }
+        let fake = Fake {
+            create_pid: Some(111),
+            ..Fake::default()
+        };
+        let h = Arc::new(Holding::default());
+        let (s, f) = svc(TaskApiVersion::V2, fake);
+        let s = fast_wait(s, 100).with_event_publisher(h.clone());
+        s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
+        s.handle("Start", &start_req("c1")).unwrap();
+        stopped_with_time(&f, "c1", Some(0), 1_700_000_000_000_000_000);
+        assert!(wait_until(std::time::Duration::from_secs(5), || !h
+            .0
+            .lock()
+            .unwrap()
+            .is_empty()));
+        let guard = h.0.lock().unwrap()[0].clone();
+        assert!(guard());
+        s.handle("Delete", &delete_req("c1", "")).unwrap();
+        assert!(!guard());
+        f.preset.lock().unwrap().remove("c1");
+        s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
+        s.handle("Start", &start_req("c1")).unwrap();
+        // 同じ ID の新世代が登録されても旧世代の述語は無効のまま。
+        assert!(!guard());
+    }
+
+    /// CRI-5・#4155: Delete を経ずに外で消えた ID を Create し直すと、旧 watcher の印が先に立って登録が外れ、
+    /// キュー済みの旧 TaskExit の述語が無効になる。再 Start は新しい世代で watcher を起こす。
+    #[test]
+    fn cri5_4155_create_revokes_stale_watcher_and_start_respawns() {
+        use super::super::publish::EventGuard;
+        #[derive(Default)]
+        struct Holding(Mutex<Vec<EventGuard>>);
+        impl EventPublisher for Holding {
+            fn publish(&self, _: TaskEvent) {}
+            fn publish_guarded(&self, _: TaskEvent, g: EventGuard) {
+                self.0.lock().unwrap().push(g);
+            }
+            fn report(&self, _: PublishFailure) {}
+        }
+        let fake = Fake {
+            create_pid: Some(111),
+            ..Fake::default()
+        };
+        let h = Arc::new(Holding::default());
+        let (s, f) = svc(TaskApiVersion::V2, fake);
+        let s = fast_wait(s, 100).with_event_publisher(h.clone());
+        s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
+        s.handle("Start", &start_req("c1")).unwrap();
+        let old = s
+            .exit_watchers
+            .lock()
+            .unwrap()
+            .get("c1")
+            .unwrap()
+            .generation;
+        stopped_with_time(&f, "c1", Some(0), 1_700_000_000_000_000_000);
+        assert!(wait_until(std::time::Duration::from_secs(5), || !h
+            .0
+            .lock()
+            .unwrap()
+            .is_empty()));
+        let guard = h.0.lock().unwrap()[0].clone();
+        assert!(guard());
+        // Delete を経ずにコンテナが外で消え、同じ ID が再作成される。
+        remove_externally(&f, "c1");
+        s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
+        assert!(!guard());
+        assert!(s.exit_watchers.lock().unwrap().get("c1").is_none());
+        s.handle("Start", &start_req("c1")).unwrap();
+        let new = s
+            .exit_watchers
+            .lock()
+            .unwrap()
+            .get("c1")
+            .unwrap()
+            .generation;
+        assert_ne!(old, new);
+        assert!(!guard());
+    }
+
+    /// REPAIR-5・#4155: watcher の数の上限を超えたら起こさず、`watch_limit` を 1 件記録する（Start の応答は変えない）。
+    #[test]
+    fn repair5_4155_watcher_limit() {
+        let (s, _f, cap) = svc_pub(Fake::default());
+        {
+            let mut set = s.exit_watchers.lock().unwrap();
+            for i in 0..MAX_EXIT_WATCHERS {
+                set.insert(
+                    format!("w{i}"),
+                    WatchEntry {
+                        generation: 0,
+                        done: false,
+                        revoked: Arc::new(AtomicBool::new(false)),
+                    },
+                );
+            }
+        }
+        s.spawn_exit_watcher("extra", 1);
+        let fails = cap.failures.lock().unwrap().clone();
+        assert_eq!(fails.len(), 1);
+        assert_eq!(fails[0].stage, Stage::WatchLimit);
+        assert_eq!(s.exit_watchers.lock().unwrap().len(), MAX_EXIT_WATCHERS);
+    }
+
+    /// REPAIR-5・CRI-5・#4155: publish バイナリが非 0 終了・期限超過でも、Start・State・Wait・Delete の応答は
+    /// publisher 無しと同じバイト列で、ログの失敗は 4 件（create・start・exit・delete の順。#4156）。
+    #[cfg(unix)]
+    #[test]
+    fn repair5_4155_rpc_responses_unchanged_when_publish_fails() {
+        use super::super::bootstrap::{PublishBinary, ServeContext, ShimIdentifier};
+        use super::super::publish::testkit::{
+            CaptureLog, failing_body, make_script, sleeping_body,
+        };
+        use super::super::publish::{PublishConfig, exec_publisher_for_with};
+        use crate::test_root;
+
+        let run = |s: &TaskService, f: &Fake| -> Vec<Vec<u8>> {
+            let out = vec![
+                s.handle("Create", &create_req("c1", &abs("/b"))).unwrap(),
+                s.handle("Start", &start_req("c1")).unwrap(),
+            ];
+            stopped_with_time(f, "c1", Some(3), 1_700_000_000_000_000_005);
+            out
+        };
+        let tail = |s: &TaskService| -> Vec<Vec<u8>> {
+            vec![
+                s.handle(
+                    "State",
+                    &WireState {
+                        id: "c1".into(),
+                        exec_id: String::new(),
+                    }
+                    .encode_to_vec(),
+                )
+                .unwrap(),
+                s.handle("Wait", &wait_req("c1", "")).unwrap(),
+                s.handle("Delete", &delete_req("c1", "")).unwrap(),
+            ]
+        };
+        for (name, deadline_stage) in [("fail", Stage::ExitStatus), ("sleep", Stage::Deadline)] {
+            let dir = test_root::test_root("pubsvc", name);
+            let body = if name == "fail" {
+                failing_body()
+            } else {
+                sleeping_body(&dir)
+            };
+            let bin = make_script(&dir, "fake", &body);
+            let log = Arc::new(CaptureLog::default());
+            let ctx = ServeContext::new(ShutdownSignal::new(), None)
+                .with_origin(
+                    Some(ShimIdentifier::parse("default").unwrap()),
+                    Some("/run/x.sock".into()),
+                )
+                .with_publish_binary(Some(PublishBinary::verify(&bin).unwrap()));
+            let publisher = exec_publisher_for_with(
+                &ctx,
+                PublishConfig::new(std::time::Duration::from_millis(400)).unwrap(),
+                log.clone(),
+            )
+            .unwrap();
+
+            let (with_pub, f1) = svc(TaskApiVersion::V2, Fake::default());
+            let with_pub = fast_wait(with_pub, 100).with_event_publisher(publisher);
+            let mut a = run(&with_pub, &f1);
+            // Create・Start・Exit の 3 件の publish が失敗してから残りを呼ぶ（先に Delete すると
+            // 世代 guard が Exit を捨てて件数が揺れる。#4156）。
+            assert!(wait_until(std::time::Duration::from_secs(20), || {
+                log.0.lock().unwrap().len() >= 3
+            }));
+            a.extend(tail(&with_pub));
+
+            let (plain, f2) = svc(TaskApiVersion::V2, Fake::default());
+            let plain = fast_wait(plain, 100);
+            let mut b = run(&plain, &f2);
+            b.extend(tail(&plain));
+
+            assert_eq!(a, b, "{name}");
+            assert!(wait_until(std::time::Duration::from_secs(20), || {
+                log.0.lock().unwrap().len() >= 4
+            }));
+            let got = log.0.lock().unwrap().clone();
+            assert_eq!(got.len(), 4, "{name}: {got:?}");
+            let topics: Vec<_> = got.iter().map(|f| f.topic).collect();
+            assert_eq!(
+                topics,
+                [
+                    Some("/tasks/create"),
+                    Some("/tasks/start"),
+                    Some("/tasks/exit"),
+                    Some("/tasks/delete")
+                ],
+                "{name}"
+            );
+            assert!(got.iter().all(|f| f.stage == deadline_stage), "{name}");
         }
     }
 }

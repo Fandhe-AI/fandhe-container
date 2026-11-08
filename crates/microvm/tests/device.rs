@@ -11,11 +11,11 @@ use std::sync::{Arc, Mutex};
 use fandhe_container_microvm::dispatch::{
     DeviceId, DispatchOutcome, ExitDispatcher, MmioAccess, MmioDevice, UnhandledAccess,
 };
-use fandhe_container_microvm::error::{MicrovmError, MicrovmErrorCode};
+use fandhe_container_microvm::error::MicrovmErrorCode;
 use fandhe_container_microvm::exit::{IoDirection, VcpuExit};
-use fandhe_container_microvm::guest_memory::{GuestAddress, GuestMemory, HeapBacking};
+use fandhe_container_microvm::guest_memory::{GuestMemory, HeapBacking};
 use fandhe_container_microvm::interrupt::{
-    InterruptDelivery, InterruptLine, NetQueueStats, complete_block_notify, complete_net_notify,
+    InterruptDelivery, NetQueueStats, complete_block_notify, complete_net_notify,
 };
 use fandhe_container_microvm::virtio_block::{MemoryBlockBackend, VirtioBlock};
 use fandhe_container_microvm::virtio_mmio::{
@@ -30,27 +30,17 @@ type Net = VirtioMmioTransport<VirtioNet<MemoryNetBackend>>;
 const BLK_BASE: u64 = 0x0a00_0000;
 const NET_BASE: u64 = 0x0a00_0200;
 const WINDOW: u64 = 0x200;
-const MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
 
-const DESC: u64 = 0x1000;
-const AVAIL: u64 = 0x2000;
-const USED: u64 = 0x3000;
-const HDR: u64 = 0x10000;
-const DATA: u64 = 0x11000;
-const STATUS: u64 = 0x12000;
-
-const RX_DESC: u64 = 0x1000;
-const RX_AVAIL: u64 = 0x2000;
-const RX_USED: u64 = 0x3000;
-const TX_DESC: u64 = 0x4000;
-const TX_AVAIL: u64 = 0x5000;
-const TX_USED: u64 = 0x6000;
-const TX_BUF: u64 = 0x10000;
-const RX_BUF: u64 = 0x11000;
-
-fn ga(a: u64) -> GuestAddress {
-    GuestAddress::new(a)
-}
+/// virtqueue の試験補助の正本（`tests/support/virtqueue_driver.rs`。複製しない・#4113）。
+/// ここの `wr` は dispatcher 経由の別物のため、共有側の `wr` は取り込まない。
+#[path = "support/virtqueue_driver.rs"]
+mod virtqueue_driver;
+use virtqueue_driver::block::{AVAIL, DATA, DESC, STATUS, USED, submit as blk_submit};
+use virtqueue_driver::net::{
+    MAC, RX_AVAIL, RX_BUF, RX_DESC, RX_USED, TX_AVAIL, TX_BUF, TX_DESC, TX_USED, desc as net_desc,
+    publish as net_publish,
+};
+use virtqueue_driver::{CountLine, ga};
 
 /// ディスパッチャーへ所有を渡しつつ、試験側も同じトランスポートを触るための共有ラッパー。
 struct Shared<D>(Arc<Mutex<D>>);
@@ -70,17 +60,6 @@ impl MmioDevice for Shared<Net> {
     }
     fn write(&mut self, offset: u64, data: &[u8]) -> MmioWriteOutcome {
         self.0.lock().expect("lock").write(offset, data)
-    }
-}
-
-/// 割り込み注入の回数を数える偽の割り込み線。
-#[derive(Default)]
-struct CountLine(std::cell::Cell<u32>);
-
-impl InterruptLine for CountLine {
-    fn trigger(&self) -> Result<(), MicrovmError> {
-        self.0.set(self.0.get() + 1);
-        Ok(())
     }
 }
 
@@ -195,41 +174,6 @@ fn init_net(d: &mut ExitDispatcher) {
     );
 }
 
-fn blk_desc(m: &mut Mem, i: u64, addr: u64, len: u32, flags: u16, next: u16) {
-    let at = DESC + i * 16;
-    m.write_at(ga(at), &addr.to_le_bytes()).unwrap();
-    m.write_u32_le(ga(at + 8), len).unwrap();
-    m.write_u16_le(ga(at + 12), flags).unwrap();
-    m.write_u16_le(ga(at + 14), next).unwrap();
-}
-
-/// [header R][data][status W] を avail の `slot` に積む（`tests/virtio_block.rs` と同じ配置）。
-fn blk_submit(m: &mut Mem, slot: u16, ty: u32, sector: u64, len: u32, data_flags: u16) {
-    m.write_u32_le(ga(HDR), ty).unwrap();
-    m.write_at(ga(HDR + 8), &sector.to_le_bytes()).unwrap();
-    blk_desc(m, 0, HDR, 16, 1, 1);
-    blk_desc(m, 1, DATA, len, data_flags | 1, 2);
-    blk_desc(m, 2, STATUS, 1, 2, 0);
-    m.write_at(ga(STATUS), &[0xff]).unwrap();
-    m.write_u16_le(ga(AVAIL + 4 + 2 * u64::from(slot)), 0)
-        .unwrap();
-    m.write_u16_le(ga(AVAIL + 2), slot + 1).unwrap();
-}
-
-fn net_desc(m: &mut Mem, base: u64, i: u64, addr: u64, len: u32, flags: u16) {
-    let at = base + i * 16;
-    m.write_at(ga(at), &addr.to_le_bytes()).unwrap();
-    m.write_u32_le(ga(at + 8), len).unwrap();
-    m.write_u16_le(ga(at + 12), flags).unwrap();
-    m.write_u16_le(ga(at + 14), 0).unwrap();
-}
-
-fn net_publish(m: &mut Mem, avail: u64, slot: u16) {
-    m.write_u16_le(ga(avail + 4 + 2 * u64::from(slot)), slot)
-        .unwrap();
-    m.write_u16_le(ga(avail + 2), slot + 1).unwrap();
-}
-
 /// 受け入れ条件 1: 2 デバイスの識別レジスタが exit 経由で具体値のまま読める。
 #[test]
 fn mvm1_693_identification_via_dispatch() {
@@ -309,7 +253,7 @@ fn mvm1_693_block_write_then_read_via_dispatch() {
     };
     assert_eq!((r.stats.completed, r.stats.ok), (1, 1));
     assert_eq!(r.delivery, InterruptDelivery::Triggered);
-    assert_eq!(line.0.get(), 1);
+    assert_eq!(line.count(), 1);
     let mut st = [0u8; 1];
     b.mem.read_at(ga(STATUS), &mut st).unwrap();
     assert_eq!(st, [0]);
@@ -340,7 +284,7 @@ fn mvm1_693_block_write_then_read_via_dispatch() {
     b.mem.read_at(ga(DATA), &mut got).unwrap();
     assert_eq!(got, payload);
     assert_eq!(b.mem.read_u16_le(ga(USED + 2)).unwrap(), 2);
-    assert_eq!(line.0.get(), 2);
+    assert_eq!(line.count(), 2);
 }
 
 /// 受け入れ条件 1: virtio-net の送信（tx）と受信（rx）が exit 経由の kick で通る。
@@ -384,7 +328,7 @@ fn mvm1_693_net_tx_and_rx_via_dispatch() {
         other => panic!("unexpected {other:?}"),
     }
     assert_eq!(r.delivery, InterruptDelivery::Triggered);
-    assert_eq!(line.0.get(), 1);
+    assert_eq!(line.count(), 1);
     assert_eq!(
         b.net.lock().unwrap().device().backend().sent(),
         std::slice::from_ref(&out)
@@ -414,7 +358,7 @@ fn mvm1_693_net_tx_and_rx_via_dispatch() {
         NetQueueStats::Rx(s) => assert_eq!((s.completed, s.delivered), (1, 1)),
         other => panic!("unexpected {other:?}"),
     }
-    assert_eq!(line.0.get(), 2);
+    assert_eq!(line.count(), 2);
     let mut got = vec![0u8; 112];
     b.mem.read_at(ga(RX_BUF), &mut got).unwrap();
     assert_eq!(&got[..12], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0]);

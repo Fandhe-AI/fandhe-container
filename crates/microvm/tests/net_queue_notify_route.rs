@@ -6,115 +6,26 @@
 //! ホスト側の到着を契機にした受信（受信ポーラー）は `tests/net_rx_poller.rs`（#4030）で扱い、ここでは扱わない。
 #![cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use fandhe_container_microvm::error::{MicrovmError, MicrovmErrorCode};
 use fandhe_container_microvm::guest_memory::{GuestAddress, GuestMemory, HeapBacking};
 use fandhe_container_microvm::guest_memory_slot::GuestMemorySlot;
 use fandhe_container_microvm::interrupt::{
-    InterruptDelivery, InterruptLine, NetNotifyReport, NetQueueNotifyRoute, NetQueueStats,
-    QueueNotifyReport, QueueNotifyRoute,
+    InterruptDelivery, NetNotifyReport, NetQueueNotifyRoute, NetQueueStats, QueueNotifyReport,
+    QueueNotifyRoute,
 };
-use fandhe_container_microvm::virtio_mmio::{MmioWriteOutcome, VirtioMmioTransport, reg};
+use fandhe_container_microvm::virtio_mmio::VirtioMmioTransport;
 use fandhe_container_microvm::virtio_net::{MemoryNetBackend, VirtioNet};
 
 type T = VirtioMmioTransport<VirtioNet<MemoryNetBackend>>;
 type Mem = GuestMemory<HeapBacking>;
 
-const MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
-const RX_DESC: u64 = 0x1000;
-const RX_AVAIL: u64 = 0x2000;
-const RX_USED: u64 = 0x3000;
-const TX_DESC: u64 = 0x4000;
-const TX_AVAIL: u64 = 0x5000;
-const TX_USED: u64 = 0x6000;
-const TX_BUF: u64 = 0x10000;
-const RX_BUF: u64 = 0x11000;
-
-/// 回数を数える `Send + Sync` の偽の割り込み線。
-#[derive(Clone, Default)]
-struct CountLine(Arc<AtomicU32>);
-
-impl CountLine {
-    fn count(&self) -> u32 {
-        self.0.load(Ordering::SeqCst)
-    }
-}
-
-impl InterruptLine for CountLine {
-    fn trigger(&self) -> Result<(), MicrovmError> {
-        self.0.fetch_add(1, Ordering::SeqCst);
-        Ok(())
-    }
-}
-
-fn ga(a: u64) -> GuestAddress {
-    GuestAddress::new(a)
-}
-
-fn wr(t: &mut T, off: u64, v: u32) -> MmioWriteOutcome {
-    t.write(off, &v.to_le_bytes())
-}
-
-fn init(t: &mut T) {
-    wr(t, reg::STATUS, 1);
-    wr(t, reg::STATUS, 3);
-    let mut b = [0u8; 4];
-    wr(t, reg::DEVICE_FEATURES_SEL, 0);
-    t.read(reg::DEVICE_FEATURES, &mut b);
-    wr(t, reg::DRIVER_FEATURES_SEL, 0);
-    wr(t, reg::DRIVER_FEATURES, u32::from_le_bytes(b));
-    wr(t, reg::DRIVER_FEATURES_SEL, 1);
-    wr(t, reg::DRIVER_FEATURES, 1);
-    assert_eq!(wr(t, reg::STATUS, 11), MmioWriteOutcome::FeaturesAccepted);
-    for (q, d, a, u) in [
-        (0, RX_DESC, RX_AVAIL, RX_USED),
-        (1, TX_DESC, TX_AVAIL, TX_USED),
-    ] {
-        wr(t, reg::QUEUE_SEL, q);
-        wr(t, reg::QUEUE_NUM, 16);
-        wr(t, reg::QUEUE_DESC_LOW, d as u32);
-        wr(t, reg::QUEUE_DRIVER_LOW, a as u32);
-        wr(t, reg::QUEUE_DEVICE_LOW, u as u32);
-        wr(t, reg::QUEUE_READY, 1);
-    }
-    assert_eq!(wr(t, reg::STATUS, 15), MmioWriteOutcome::DeviceActivated);
-}
-
-fn desc(m: &mut Mem, base: u64, i: u64, addr: u64, len: u32, flags: u16) {
-    let at = base + i * 16;
-    m.write_at(ga(at), &addr.to_le_bytes()).unwrap();
-    m.write_u32_le(ga(at + 8), len).unwrap();
-    m.write_u16_le(ga(at + 12), flags).unwrap();
-    m.write_u16_le(ga(at + 14), 0).unwrap();
-}
-
-fn publish(m: &mut Mem, avail: u64, slot: u16) {
-    m.write_u16_le(ga(avail + 4 + 2 * u64::from(slot)), slot)
-        .unwrap();
-    m.write_u16_le(ga(avail + 2), slot + 1).unwrap();
-}
-
-/// transmitq の `slot` へ（ヘッダ 12 バイト + 64 バイトのフレーム）を積み、フレームを返す。
-fn submit_tx(m: &mut Mem, slot: u16) -> Vec<u8> {
-    let frame: Vec<u8> = (0..64u32)
-        .map(|i| ((i + u32::from(slot)) % 251) as u8)
-        .collect();
-    let mut data = vec![0u8; 12];
-    data.extend_from_slice(&frame);
-    let buf = TX_BUF + u64::from(slot) * 0x1000;
-    m.write_at(ga(buf), &data).unwrap();
-    desc(m, TX_DESC, u64::from(slot), buf, data.len() as u32, 0);
-    publish(m, TX_AVAIL, slot);
-    frame
-}
-
-/// receiveq の 0 番へ 2048 バイトの書き込み用バッファを積む。
-fn submit_rx(m: &mut Mem) {
-    desc(m, RX_DESC, 0, RX_BUF, 2048, 2);
-    publish(m, RX_AVAIL, 0);
-}
+/// virtqueue の試験補助の正本（`tests/support/virtqueue_driver.rs`。複製しない・#4113）。
+#[path = "support/virtqueue_driver.rs"]
+mod virtqueue_driver;
+use virtqueue_driver::net::{MAC, RX_BUF, RX_USED, TX_AVAIL, TX_USED, init, submit_rx, submit_tx};
+use virtqueue_driver::{CountLine, ga};
 
 struct Fixture {
     transport: Arc<Mutex<T>>,

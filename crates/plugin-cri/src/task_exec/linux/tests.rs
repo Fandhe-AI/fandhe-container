@@ -51,6 +51,7 @@ impl HelperSpawner for FakeSpawner {
         Ok(SpawnedHelper {
             child,
             channel: plugin_end,
+            diagnostics: None,
         })
     }
 

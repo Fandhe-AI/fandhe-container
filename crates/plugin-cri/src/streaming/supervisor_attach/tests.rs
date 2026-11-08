@@ -862,3 +862,145 @@ async fn cri6_repair5_4077_concurrent_sessions_are_bounded() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
+
+#[derive(Clone, Default)]
+struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for SharedBuf {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// 非対応の警告はプロセスで 1 行だけ（REPAIR-4・CRI-6・#4135）。
+#[test]
+fn cri6_repair4_repair5_4135_unsupported_poll_warns_exactly_once() {
+    let buf = SharedBuf::default();
+    let sink = LineSink::spawn(Box::new(buf.clone()), 8);
+    let warned = AtomicBool::new(false);
+    assert!(warn_poll_unsupported_once(&warned, &sink));
+    assert!(!warn_poll_unsupported_once(&warned, &sink));
+    sink.wait_idle(WAIT);
+    let out = String::from_utf8(buf.0.lock().unwrap_or_else(PoisonError::into_inner).clone())
+        .expect("utf8");
+    assert_eq!(out, format!("{POLL_UNSUPPORTED_LINE}\n"));
+    assert_eq!(sink.dropped(), 0);
+}
+
+/// 警告行は固定語彙で、改行・非 ASCII を含まない。
+#[test]
+fn cri6_repair4_4135_warning_line_is_fixed_vocabulary() {
+    assert!(!POLL_UNSUPPORTED_LINE.contains('\n'));
+    assert!(POLL_UNSUPPORTED_LINE.is_ascii());
+    assert!(POLL_UNSUPPORTED_LINE.contains("\"level\":\"warn\""));
+    assert!(POLL_UNSUPPORTED_LINE.contains("\"code\":\"UNIMPLEMENTED\""));
+}
+
+/// `Unsupported` だけが警告の対象で、他の io エラーでは出さない。
+#[test]
+fn cri6_repair4_4135_only_unsupported_triggers_warning() {
+    use std::io::{Error, ErrorKind};
+    assert!(is_poll_unsupported(&Error::from(ErrorKind::Unsupported)));
+    assert!(!is_poll_unsupported(&Error::from(ErrorKind::Other)));
+    assert!(!is_poll_unsupported(&Error::from_raw_os_error(9)));
+}
+
+/// 排他の保持者が `write` で止まっても、別セッションの取得待ちは取り消しで有限時間に抜ける（CRI-6・REPAIR-5・#4134）。
+#[test]
+fn cri6_repair5_4134_arbiter_wait_is_cancelled_while_the_holder_is_stalled_in_write() {
+    use std::io::Read as _;
+    let arbiter = Mutex::new(());
+    let cancel = AtomicBool::new(false);
+    let (r_stall, mut w_stall) = std::io::pipe().expect("pipe");
+    let (mut r, w) = std::io::pipe().expect("pipe");
+    let mut wf = File::from(std::os::fd::OwnedFd::from(w));
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    std::thread::scope(|sc| {
+        let holder = sc.spawn(|| {
+            let _g = arbiter.lock().unwrap();
+            tx.send(()).unwrap();
+            // 読まれない pipe が満杯になると排他を握ったまま write で止まる。
+            w_stall.write_all(&vec![0u8; 1 << 20])
+        });
+        rx.recv().unwrap();
+        let waiter = sc.spawn(|| {
+            let ok = write_all_retry(&mut wf, b"abc", PIPE_SLICE, &cancel, &arbiter);
+            drop(wf);
+            ok
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!waiter.is_finished());
+        let t0 = Instant::now();
+        cancel.store(true, Ordering::SeqCst);
+        let ok = waiter.join().unwrap();
+        // 理論上は刻み 1 ms 前後。CI の揺れを見込んで 500 ms を上限にする。
+        assert!(
+            t0.elapsed() < Duration::from_millis(500),
+            "elapsed {:?}",
+            t0.elapsed()
+        );
+        assert!(!ok);
+        drop(r_stall);
+        assert!(holder.join().unwrap().is_err());
+    });
+    let mut v = Vec::new();
+    assert_eq!(r.read_to_end(&mut v).unwrap(), 0);
+    assert!(v.is_empty());
+}
+
+/// 保持者が離せば取得待ちは再開して書ける（陽性対照。CRI-6・REPAIR-5・#4134）。
+#[test]
+fn cri6_repair5_4134_arbiter_wait_resumes_after_the_holder_releases() {
+    use std::io::Read as _;
+    let arbiter = Mutex::new(());
+    let cancel = AtomicBool::new(false);
+    let (mut r, w) = std::io::pipe().expect("pipe");
+    let mut wf = File::from(std::os::fd::OwnedFd::from(w));
+    let guard = arbiter.lock().unwrap();
+    let ok = std::thread::scope(|sc| {
+        let waiter = sc.spawn(|| {
+            let ok = write_all_retry(&mut wf, b"abc", PIPE_SLICE, &cancel, &arbiter);
+            drop(wf);
+            ok
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!waiter.is_finished());
+        drop(guard);
+        waiter.join().unwrap()
+    });
+    assert!(ok);
+    let mut v = Vec::new();
+    assert_eq!(r.read_to_end(&mut v).unwrap(), 3);
+    assert_eq!(v, b"abc");
+}
+
+/// 毒になった排他でも従来どおり取って書ける（CRI-6・REPAIR-5・#4134）。
+#[test]
+fn cri6_repair5_4134_poisoned_arbiter_is_still_acquired() {
+    use std::io::Read as _;
+    let arbiter = Mutex::new(());
+    std::thread::scope(|sc| {
+        let r = sc.spawn(|| {
+            let _g = arbiter.lock().unwrap();
+            panic!("poison");
+        });
+        assert!(r.join().is_err());
+    });
+    let cancel = AtomicBool::new(false);
+    let (mut r, w) = std::io::pipe().expect("pipe");
+    let mut wf = File::from(std::os::fd::OwnedFd::from(w));
+    assert!(write_all_retry(
+        &mut wf, b"z", PIPE_SLICE, &cancel, &arbiter
+    ));
+    drop(wf);
+    let mut v = Vec::new();
+    assert_eq!(r.read_to_end(&mut v).unwrap(), 1);
+    assert_eq!(v, b"z");
+}

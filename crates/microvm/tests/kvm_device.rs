@@ -1,4 +1,4 @@
-//! `/dev/kvm` 実機前提の試験（MVM-1・TASK-74.1.1・TASK-74.1.2・TASK-74.4.1・TASK-74.4.2・TASK-74.2.3・TASK-74.3.2・TASK-75.1・TASK-75.2・TASK-75.3.1・TASK-75.3.2・TASK-75.4.1・TASK-75.4.2・TASK-75.5・#3733・#3734・#3735・#3738・#3918）。`--ignored` 指定時だけ走る。
+//! `/dev/kvm` 実機前提の試験（MVM-1・TASK-74.1.1・TASK-74.1.2・TASK-74.4.1・TASK-74.4.2・TASK-74.2.3・TASK-74.3.2・TASK-75.1・TASK-75.2・TASK-75.3.1・TASK-75.3.2・TASK-75.4.1・TASK-75.4.2・TASK-75.5・#3733・#3734・#3735・#3738・#3918・#4158）。`--ignored` 指定時だけ走る。
 //! 必要環境: Linux・`/dev/kvm` の読み書き権限（`kvm` グループ等）。root は不要。
 //! aarch64 の試験（`kvm_device_arm64_*`。#3696）は、加えて aarch64 Linux ホストと in-kernel GICv3 が要る（ネイティブ arm64 の CI は無く、実機は人間担当。#2274・#3781）。
 #![cfg(target_os = "linux")]
@@ -516,6 +516,145 @@ fn kvm_device_check_memslot_flags() {
         }
     }
     assert!(MemslotFlags::try_from_raw(1 << 2).is_err());
+}
+
+/// MVM-1・#4158: `register_with_flags` で `LOG_DIRTY_PAGES`・`READONLY` つきの memslot を登録でき、ホストからの読み書きは往復する。
+/// `READONLY` はゲスト側の書き込みだけを止めるため、ホストの `write_at` は通る。非対応の kernel では `FailedPrecondition`
+/// （x86_64 の KVM は対応するため受理を要求する）。`READONLY | LOG_DIRTY_PAGES` の同時指定は、カーネルが EINVAL で
+/// 拒否しうるため `InvalidArgument` も許容する（受理か拒否かを具体的に確かめ、組み合わせの禁止を示す文言は付けない）。
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_register_guest_memory_with_flags() {
+    use fandhe_container_microvm::guest_memory::GuestAddress;
+    use fandhe_container_microvm::memslot_flags::MemslotFlags;
+    use fandhe_container_microvm::microvm::GuestRam;
+
+    let dev = open_kvm();
+    let vm = dev.create_vm().unwrap();
+    let both = MemslotFlags::READONLY.union(MemslotFlags::LOG_DIRTY_PAGES);
+    let cases = [
+        (0u16, MemslotFlags::NONE, 0x0u64),
+        (1, MemslotFlags::LOG_DIRTY_PAGES, 0x1000_0000),
+        (2, MemslotFlags::READONLY, 0x2000_0000),
+        (3, both, 0x3000_0000),
+    ];
+    let mut live = Vec::new();
+    for (slot, flags, base) in cases {
+        let r = GuestRam::new(1 << 20).unwrap().register_with_flags(
+            &vm,
+            slot,
+            GuestAddress::new(base),
+            flags,
+        );
+        match r {
+            Ok(mut mem) => {
+                mem.write_at(GuestAddress::new(base + 0x10), &[9, 8, 7, 6])
+                    .unwrap();
+                assert_eq!(
+                    mem.read_u32_le(GuestAddress::new(base + 0x10)).unwrap(),
+                    0x0607_0809
+                );
+                live.push(mem);
+            }
+            Err(e) => {
+                assert!(
+                    flags.contains(MemslotFlags::READONLY),
+                    "flags {:?} rejected: {e:?}",
+                    flags
+                );
+                let allowed = if flags == both {
+                    matches!(
+                        e.code(),
+                        MicrovmErrorCode::FailedPrecondition | MicrovmErrorCode::InvalidArgument
+                    )
+                } else {
+                    e.code() == MicrovmErrorCode::FailedPrecondition
+                };
+                assert!(allowed, "unexpected error: {e:?}");
+                #[cfg(target_arch = "x86_64")]
+                if flags == MemslotFlags::READONLY {
+                    panic!("x86_64 KVM must accept READONLY memslots: {e:?}");
+                }
+            }
+        }
+    }
+    drop(live);
+    drop(vm);
+}
+
+/// MVM-1・#4158: `READONLY` の memslot へのゲストの書き込みは MMIO exit になり、RAM には届かない（x86_64）。
+/// リセットベクタのゲストコード `mov byte cs:[0x0100], 0x5A; hlt` が `0xFFFF_0100` へ書く。
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_readonly_memslot_guest_write_exits_mmio() {
+    use fandhe_container_microvm::exit::VcpuExit;
+    use fandhe_container_microvm::guest_memory::GuestAddress;
+    use fandhe_container_microvm::memslot_flags::MemslotFlags;
+    use fandhe_container_microvm::microvm::GuestRam;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let dev = open_kvm();
+    // REPAIR-5: 止まった vCPU スレッドが残っても、期限切れでテストごと失敗にする。
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let run = || -> Result<(u64, u8, u8), String> {
+            let vm = dev.create_vm().map_err(|e| e.to_string())?;
+            let mut mem = GuestRam::new(64 << 10)
+                .and_then(|r| {
+                    r.register_with_flags(
+                        &vm,
+                        0,
+                        GuestAddress::new(0xFFFF_0000),
+                        MemslotFlags::READONLY,
+                    )
+                })
+                .map_err(|e| e.to_string())?;
+            let code = [0x2E, 0xC6, 0x06, 0x00, 0x01, 0x5A, 0xF4];
+            mem.write_at(GuestAddress::new(0xFFFF_FFF0), &code)
+                .map_err(|e| e.to_string())?;
+            let mut vcpu = vm.create_vcpu(0).map_err(|e| e.to_string())?;
+            let mut mmio: Option<(u64, u8, u8)> = None;
+            for _ in 0..8 {
+                match vcpu
+                    .run_once(Duration::from_secs(5))
+                    .map_err(|e| e.to_string())?
+                {
+                    VcpuExit::Interrupted => continue,
+                    VcpuExit::Mmio {
+                        phys_addr,
+                        len,
+                        is_write: true,
+                        data,
+                    } if mmio.is_none() => {
+                        if len != 1 {
+                            return Err(format!("unexpected mmio len {len}"));
+                        }
+                        mmio = Some((phys_addr, data[0], 0));
+                    }
+                    VcpuExit::Hlt => {
+                        let (addr, val, _) = mmio.ok_or("no MMIO exit before HLT")?;
+                        let mut b = [0u8; 1];
+                        mem.read_at(GuestAddress::new(0xFFFF_0100), &mut b)
+                            .map_err(|e| e.to_string())?;
+                        drop(vcpu);
+                        return Ok((addr, val, b[0]));
+                    }
+                    other => return Err(format!("unexpected exit: {other:?}")),
+                }
+            }
+            Err("too many runs".to_string())
+        };
+        let _ = tx.send(run());
+    });
+    let (addr, val, ram_byte) = rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("readonly memslot test did not finish within 30s")
+        .unwrap();
+    assert_eq!(addr, 0xFFFF_0100);
+    assert_eq!(val, 0x5A);
+    assert_eq!(ram_byte, 0, "guest write must not reach read-only RAM");
 }
 
 /// MVM-1・TASK-75.1: mmap したゲスト RAM を memslot に登録でき、読み書きが往復し、範囲の重なる登録は拒否される。

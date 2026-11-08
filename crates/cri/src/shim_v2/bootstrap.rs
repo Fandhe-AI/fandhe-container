@@ -39,6 +39,9 @@
 //! （0600・追記。開く時に 1 MiB 以上なら `daemon.log.1` へ回す）へ向ける。
 //! 非 Linux は記録先を持たない（plugin-cri の main と同じ。#2430）。
 //!
+//! `-publish-binary` は検証して [`ServeContext`] に保持し（#4154）、[`super::publish`] が TaskCreate・TaskStart・TaskDelete・TaskExit を送る（#4155・#4156）。
+//! 呼び出し形・送る種別は `docs/design/shim-v2-production-binary.md` の「イベントの publish」を参照。
+//!
 //! 計測（REPAIR-4）: `start` / `delete` / デーモンの ttrpc は、結果と所要時間を置き場所の `ops.log`
 //! （0600・JSON Lines・1 MiB で `ops.log.1` へ回す）へ追記する。stdout / stderr は汚さない。
 //!
@@ -48,7 +51,7 @@
 //!   ロック保持下で自分が bind した socket と lock を片付ける（取れなければ固定語彙を `daemon.log` へ出して残す）
 //! - delete での実行層のコンテナの後始末（containerd が shim の死後に呼ぶ `delete` action は、まだ実行層に触れない。#3684・#4152）。
 //!   入口の `-id`・`-bundle` の検証と状態ルートの記録の照合は、注入口 [`run_with_hooks`] の前段で plugin-cri が行う（#4151。副作用なし）
-//! - stdin の options・`-publish-binary` のイベント publish・デーモンのログ（`<bundle>/log`）・grouping
+//! - stdin の options・デーモンのログ（`<bundle>/log`）・grouping
 //! - Windows。`run` は `UNIMPLEMENTED`
 
 use std::ffi::OsString;
@@ -143,8 +146,63 @@ pub struct ShimInvocation {
     pub address: Option<PathBuf>,
     /// bundle のパス（delete のみ。絶対パスであることだけを検証し使わない）。
     pub bundle: Option<PathBuf>,
+    /// `-publish-binary`（containerd の実行ファイル。字面だけ検証済みで、実体の検査は `PublishBinary::verify`。#4154）。
+    pub publish_binary: Option<PathBuf>,
     /// `-debug`。
     pub debug: bool,
+}
+
+/// 実体を検査した `-publish-binary`（containerd がイベント publish に使う実行ファイル。CRI-5・SEC-1・#4154）。
+///
+/// 作れるのは `PublishBinary::verify`（unix のみ）だけで、symlink・通常ファイル以外・実行ビットなし・
+/// other 書き込み可を fail-closed で拒否した値を運ぶ。start / デーモンの起動時に検査し、送信側（#4155・#4156）は
+/// [`ServeContext::publish_binary`] から受け取る。検査から exec までの差し替え（TOCTOU）は残余で、doc に記す。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishBinary(PathBuf);
+
+impl PublishBinary {
+    /// 検査済みのパス。
+    pub fn as_path(&self) -> &Path {
+        &self.0
+    }
+
+    /// 実体を `lstat` で検査して作る（symlink は辿らず拒否）。無い・症状の違いは理由別の固定メッセージ（`FAILED_PRECONDITION`）。
+    #[cfg(unix)]
+    pub fn verify(path: &Path) -> Result<Self, CriError> {
+        use std::os::unix::fs::PermissionsExt;
+        let bad = |m: &'static str| CriError::failed_precondition(m);
+        let md = std::fs::symlink_metadata(path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                bad("publish binary not found")
+            } else {
+                bad("cannot stat publish binary")
+            }
+        })?;
+        if md.file_type().is_symlink() {
+            return Err(bad("publish binary must not be a symlink"));
+        }
+        if !md.is_file() {
+            return Err(bad("publish binary must be a regular file"));
+        }
+        let mode = md.permissions().mode();
+        if mode & 0o111 == 0 {
+            return Err(bad("publish binary must be executable"));
+        }
+        if mode & 0o002 != 0 {
+            return Err(bad("publish binary must not be world writable"));
+        }
+        Ok(Self(path.to_path_buf()))
+    }
+}
+
+/// `-publish-binary` の字面の検査（絶対・長さ・NUL・`.`/`..` 要素なし。3 OS 共通）。
+fn clean_abs_path(s: &str) -> Result<PathBuf, CriError> {
+    let p = abs_path(s, ADDRESS_MAX_LEN)
+        .map_err(|_| invalid("publish binary must be a clean absolute path"))?;
+    if s.split(SEPARATORS).any(|e| e == "." || e == "..") {
+        return Err(invalid("publish binary must be a clean absolute path"));
+    }
+    Ok(p)
 }
 
 fn invalid(msg: &'static str) -> CriError {
@@ -183,6 +241,7 @@ pub fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<ShimInvoc
     let mut id = None;
     let mut address = None;
     let mut bundle = None;
+    let mut publish_binary = None;
     let (mut debug, mut version, mut info) = (false, false, false);
     let mut i = 0;
     while i < list.len() {
@@ -234,8 +293,8 @@ pub fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<ShimInvoc
                     "id" => id = Some(ShimIdentifier::parse(&val)?),
                     "address" => address = Some(abs_path(&val, ADDRESS_MAX_LEN)?),
                     "bundle" => bundle = Some(abs_path(&val, ADDRESS_MAX_LEN)?),
-                    // publish-binary はイベント publish が範囲外のため受けて捨てる。
-                    _ => {}
+                    // 実体の検査は unix の start / serve が `PublishBinary::verify` で行う（#4154）。
+                    _ => publish_binary = Some(clean_abs_path(&val)?),
                 }
             }
             _ => return Err(invalid("unknown flag")),
@@ -267,6 +326,7 @@ pub fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<ShimInvoc
         id,
         address,
         bundle,
+        publish_binary,
         debug,
     })
 }
@@ -352,6 +412,7 @@ pub struct ServeContext {
     audit: Option<std::sync::Arc<dyn fandhe_container_core::audit_log::AuditSink>>,
     namespace: Option<ShimIdentifier>,
     address: Option<PathBuf>,
+    publish_binary: Option<PublishBinary>,
 }
 
 impl ServeContext {
@@ -365,7 +426,19 @@ impl ServeContext {
             audit,
             namespace: None,
             address: None,
+            publish_binary: None,
         }
+    }
+
+    /// 検査済みの `-publish-binary` を足す（イベント publish の送信側が使う。CRI-5・#4154）。
+    pub fn with_publish_binary(mut self, publish_binary: Option<PublishBinary>) -> Self {
+        self.publish_binary = publish_binary;
+        self
+    }
+
+    /// 検査済みの `-publish-binary`。containerd が渡さなかったときは `None`。
+    pub fn publish_binary(&self) -> Option<&PublishBinary> {
+        self.publish_binary.as_ref()
     }
 
     /// 呼び出しの containerd の namespace と ttrpc アドレスを足す（状態の分離キー。CRI-5・#3684）。
@@ -536,7 +609,8 @@ mod unix_impl {
     use std::time::{Duration, Instant};
 
     use super::{
-        READY_LINE, START_READY_TIMEOUT, ShimInvocation, encode_delete_response, socket_file_name,
+        PublishBinary, READY_LINE, START_READY_TIMEOUT, ShimInvocation, encode_delete_response,
+        socket_file_name,
     };
     use crate::error::{CriError, CriErrorCode};
     use crate::instrument::{CriOpKind, CriOpRecorder, CriOpSample};
@@ -1051,6 +1125,10 @@ mod unix_impl {
 
     /// start の本体。`unix://<path>` を返す。
     pub fn run_start(inv: &ShimInvocation, dir: &Path) -> Result<String, CriError> {
+        // 生成物を残さず拒否するため、置き場所を作る前に検査する（#4154）。
+        if let Some(p) = &inv.publish_binary {
+            PublishBinary::verify(p)?;
+        }
         prepare_socket_dir(dir)?;
         let path = socket_path(dir, inv)?;
         let address = format!("unix://{}", path.display());
@@ -1113,6 +1191,9 @@ mod unix_impl {
         cmd.arg("-namespace").arg(ns.as_str());
         cmd.arg("-id").arg(id.as_str());
         cmd.arg("-address").arg(addr);
+        if let Some(p) = &inv.publish_binary {
+            cmd.arg("-publish-binary").arg(p);
+        }
         if inv.debug {
             cmd.arg("-debug");
         }
@@ -1452,9 +1533,16 @@ mod unix_impl {
                 .map(|l| Box::new(l) as Box<dyn std::any::Any + Send>)
                 .map_err(|_| ())
         }));
+        // start の検査からデーモンの起動までの差し替えの窓を狭めるため、もう一度検査する（#4154）。
+        let publish_binary = inv
+            .publish_binary
+            .as_deref()
+            .map(PublishBinary::verify)
+            .transpose()?;
         let registry = make_registry(
             super::ServeContext::new(signal.clone(), audit.clone())
-                .with_origin(inv.namespace.clone(), inv.address.clone()),
+                .with_origin(inv.namespace.clone(), inv.address.clone())
+                .with_publish_binary(publish_binary),
         )?;
         let euid = crate::sys::effective_uid();
         let config = ServerConfig {
@@ -2099,6 +2187,107 @@ mod tests {
         let e = unix_impl::check_ancestors_with(&t.0.join("f").join("sock"), true, |u| u == 0)
             .unwrap_err();
         assert!(e.message().contains("not a directory"), "{}", e.message());
+    }
+
+    /// CRI-5・SEC-1・#4154: `-publish-binary` の字面の検査。不正は `INVALID_ARGUMENT`、正しい値は保持、省略は `None`。
+    #[test]
+    fn cri5_4154_publish_binary_syntax() {
+        let base = |pb_val: &str| {
+            parse_args(args(&[
+                "-namespace",
+                "k8s.io",
+                "-address",
+                &abs("/run/containerd/containerd.sock"),
+                "-publish-binary",
+                pb_val,
+                "-id",
+                "abc",
+                "start",
+            ]))
+        };
+        let long = format!("/{}", "a".repeat(ADDRESS_MAX_LEN));
+        for bad in [
+            "containerd",
+            "bin/containerd",
+            &abs("/usr/./bin/containerd"),
+            &abs("/usr/../bin/containerd"),
+            &long,
+            "/usr/bin/con\0tainerd",
+        ] {
+            let e = base(bad).unwrap_err();
+            assert_eq!(e.code(), CriErrorCode::InvalidArgument, "{bad:?}");
+            assert_eq!(e.message(), "publish binary must be a clean absolute path");
+        }
+        let inv = base(&abs("/usr/bin/containerd")).unwrap();
+        assert_eq!(inv.publish_binary, Some(pb("/usr/bin/containerd")));
+        let none = parse_args(args(&[
+            "-namespace",
+            "k8s.io",
+            "-address",
+            &abs("/run/c.sock"),
+            "-id",
+            "abc",
+            "start",
+        ]))
+        .unwrap();
+        assert_eq!(none.publish_binary, None);
+    }
+
+    /// CRI-5・SEC-1・#4154: 実体の検査の表。拒否は理由別のメッセージと `FAILED_PRECONDITION`、正しい値は保持される。
+    #[cfg(unix)]
+    #[test]
+    fn cri5_4154_publish_binary_verify_table() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let t = Tmp::new("pubbin");
+        let mk = |name: &str, mode: u32| {
+            let p = t.0.join(name);
+            std::fs::write(&p, b"#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+            p
+        };
+        let good = mk("good", 0o755);
+        std::fs::create_dir(t.0.join("dir")).unwrap();
+        symlink(&good, t.0.join("link")).unwrap();
+        let cases: Vec<(PathBuf, &str)> = vec![
+            (t.0.join("missing"), "publish binary not found"),
+            (t.0.join("dir"), "publish binary must be a regular file"),
+            (t.0.join("link"), "publish binary must not be a symlink"),
+            (mk("noexec", 0o644), "publish binary must be executable"),
+            (mk("ww", 0o757), "publish binary must not be world writable"),
+        ];
+        for (path, msg) in cases {
+            let e = PublishBinary::verify(&path).unwrap_err();
+            assert_eq!(e.code(), CriErrorCode::FailedPrecondition, "{path:?}");
+            assert_eq!(e.message(), msg, "{path:?}");
+        }
+        let ok = PublishBinary::verify(&good).unwrap();
+        assert_eq!(ok.as_path(), good.as_path());
+    }
+
+    /// CRI-5・#4154: start は不正な `-publish-binary` を、置き場所を作る前に拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn cri5_4154_start_rejects_bad_publish_binary_before_side_effects() {
+        let t = Tmp::new("pubstart");
+        let dir = t.0.join("sock");
+        let mut inv = start_inv("pb1");
+        inv.publish_binary = Some(t.0.join("missing"));
+        let e = unix_impl::run_start(&inv, &dir).unwrap_err();
+        assert_eq!(e.code(), CriErrorCode::FailedPrecondition);
+        assert_eq!(e.message(), "publish binary not found");
+        assert!(!dir.exists());
+    }
+
+    /// CRI-5・#4154: 注入口へ渡す文脈が検査済みの値を保持する。
+    #[cfg(unix)]
+    #[test]
+    fn cri5_4154_serve_context_holds_publish_binary() {
+        let ctx = ServeContext::new(ShutdownSignal::new(), None);
+        assert!(ctx.publish_binary().is_none());
+        let exe = std::env::current_exe().unwrap();
+        let pbin = PublishBinary::verify(&exe).unwrap();
+        let ctx = ctx.with_publish_binary(Some(pbin.clone()));
+        assert_eq!(ctx.publish_binary(), Some(&pbin));
     }
 
     /// CRI-5・TASK-62.6・REPAIR-4・#4151: delete の前段が `Err` なら socket に触れず `run_delete` に進まず、

@@ -499,9 +499,8 @@ impl fandhe_container_cri::streaming::StreamHandler for UpgradeHoldHandler {
         let hold = self.hold;
         Box::pin(async move {
             let on_upgrade = hyper::upgrade::on(&mut http);
-            tokio::spawn(async move {
-                // Upgrade 後の IO の寿命まで接続枠を保持する（契約: StreamHandler::handle）。
-                let _permit = permit;
+            // Upgrade 後の IO の寿命まで接続枠を保持する（契約: StreamHandler::handle。#4164 で追跡対象にした）。
+            permit.spawn_session(async move {
                 let Ok(upgraded) = on_upgrade.await else {
                     return;
                 };
@@ -807,4 +806,217 @@ async fn cri6_repair3_default_bind_issues_nothing() {
     assert_eq!(exec.expect_err("exec").code(), Code::Unimplemented);
     assert_eq!(attach.expect_err("attach").code(), Code::Unimplemented);
     assert_eq!(pf.expect_err("port forward").code(), Code::Unimplemented);
+}
+/// Upgrade の後、container_id が `fast` なら短い遅延の後に `done-fast` を書いて閉じ、
+/// それ以外は永久に保持するテスト用ハンドラ（停止時のドレインと強制クローズの照合用。#4164）。
+#[cfg(unix)]
+struct DrainHandler;
+
+#[cfg(unix)]
+impl fandhe_container_cri::streaming::StreamHandler for DrainHandler {
+    fn wiring(&self) -> StreamWiring {
+        StreamWiring::only(StreamKind::Exec)
+    }
+
+    fn handle(
+        &self,
+        request: fandhe_container_cri::streaming::StreamRequest,
+        mut http: hyper::Request<hyper::body::Incoming>,
+        permit: fandhe_container_cri::streaming::ConnectionPermit,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = hyper::Response<fandhe_container_cri::streaming::StreamBody>,
+                > + Send
+                + '_,
+        >,
+    > {
+        let fast = matches!(
+            &request,
+            fandhe_container_cri::streaming::StreamRequest::Exec(r) if r.container_id == "fast"
+        );
+        Box::pin(async move {
+            let on_upgrade = hyper::upgrade::on(&mut http);
+            permit.spawn_session(async move {
+                let Ok(upgraded) = on_upgrade.await else {
+                    return;
+                };
+                let mut io = upgraded;
+                if fast {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    let _ = std::future::poll_fn(|cx| {
+                        hyper::rt::Write::poll_write(std::pin::Pin::new(&mut io), cx, b"done-fast")
+                    })
+                    .await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            });
+            let mut response =
+                hyper::Response::new(fandhe_container_cri::streaming::StreamBody::empty());
+            *response.status_mut() = hyper::StatusCode::SWITCHING_PROTOCOLS;
+            response.headers_mut().insert(
+                hyper::header::CONNECTION,
+                hyper::header::HeaderValue::from_static("Upgrade"),
+            );
+            response.headers_mut().insert(
+                hyper::header::UPGRADE,
+                hyper::header::HeaderValue::from_static("SPDY/3.1"),
+            );
+            response
+        })
+    }
+}
+
+/// Upgrade 要求を送り、EOF まで（読み取り期限つきで）読んだ内容を返す。
+#[cfg(unix)]
+fn upgrade_client(addr: SocketAddr, path: String) -> tokio::task::JoinHandle<String> {
+    tokio::task::spawn_blocking(move || {
+        let mut stream =
+            TcpStream::connect_timeout(&addr, Duration::from_secs(5)).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let raw = format!(
+            "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: SPDY/3.1\r\n\r\n"
+        );
+        stream.write_all(raw.as_bytes()).expect("write");
+        let mut out = Vec::new();
+        let _ = stream.read_to_end(&mut out);
+        String::from_utf8_lossy(&out).into_owned()
+    })
+}
+
+/// 件数が `n` に達するまで（2 秒の上限で）待つ。
+#[cfg(unix)]
+async fn wait_open(sessions: &fandhe_container_cri::streaming::StreamingSessions, n: usize) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while sessions.open() < n && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(sessions.open(), n);
+}
+
+/// CRI-6・REPAIR-5・#4164: 3 セッションを開いたまま待ち受けを閉じると、期限内に自然に終わった 1 件の応答は
+/// 欠けず、残り 2 件は `close_all` で閉じられる（EOF）。全体が時間の上限内に収まる。
+#[cfg(unix)]
+#[tokio::test]
+async fn cri6_repair5_4164_drain_keeps_natural_response_and_force_closes_rest() {
+    let started = std::time::Instant::now();
+    let server =
+        StreamingServer::bind_with_handler(StreamingConfig::default(), Arc::new(DrainHandler))
+            .await
+            .expect("bind");
+    let addr = server.local_addr();
+    let sessions = server.sessions();
+    let mut clients = Vec::new();
+    for id in ["fast", "slow-b", "slow-c"] {
+        let url = server
+            .issuer()
+            .issue(fandhe_container_cri::streaming::StreamRequest::Exec(
+                exec_request(id),
+            ))
+            .expect("issue");
+        clients.push(upgrade_client(addr, path_of(&url)));
+    }
+    wait_open(&sessions, 3).await;
+
+    server.shutdown();
+    let left = sessions
+        .wait_idle_until(std::time::Instant::now() + Duration::from_millis(1500))
+        .await;
+    assert_eq!(left, 2, "the natural session must have finished by itself");
+    sessions.close_all();
+    let left = sessions
+        .wait_idle_until(std::time::Instant::now() + Duration::from_millis(1000))
+        .await;
+    assert_eq!(left, 0, "forced close must release every slot");
+    assert!(started.elapsed() < Duration::from_secs(5));
+
+    let mut results = Vec::new();
+    for c in clients {
+        results.push(
+            tokio::time::timeout(Duration::from_secs(3), c)
+                .await
+                .expect("client must see EOF")
+                .expect("join"),
+        );
+    }
+    assert!(results[0].ends_with("done-fast"), "{}", results[0]);
+    for body in &results[1..] {
+        assert!(body.starts_with("HTTP/1.1 101"), "{body}");
+        assert!(!body.contains("done-"), "{body}");
+    }
+}
+
+/// CRI-6・REPAIR-5・#4164: 強制クローズの後に受け付けた接続は直ちに閉じられ、件数は 0 に戻る
+/// （登録の取りこぼしを作らない）。
+#[cfg(unix)]
+#[tokio::test]
+async fn cri6_repair5_4164_connection_after_close_all_is_aborted() {
+    let server =
+        StreamingServer::bind_with_handler(StreamingConfig::default(), Arc::new(DrainHandler))
+            .await
+            .expect("bind");
+    let sessions = server.sessions();
+    sessions.close_all();
+    let url = server
+        .issuer()
+        .issue(fandhe_container_cri::streaming::StreamRequest::Exec(
+            exec_request("slow"),
+        ))
+        .expect("issue");
+    let client = upgrade_client(server.local_addr(), path_of(&url));
+    let body = tokio::time::timeout(Duration::from_secs(3), client)
+        .await
+        .expect("client must see EOF")
+        .expect("join");
+    assert!(!body.contains("done-"), "{body}");
+    let left = sessions
+        .wait_idle_until(std::time::Instant::now() + Duration::from_secs(2))
+        .await;
+    assert_eq!(left, 0);
+}
+
+/// CRI-6・REPAIR-5・#4164: ヘッダを送らない（Upgrade 前の）接続も `close_all` で閉じられ、
+/// ヘッダ読み取りの期限（既定 10 秒）を待たない。
+#[cfg(unix)]
+#[tokio::test]
+async fn cri6_repair5_4164_close_all_cuts_pre_upgrade_connections() {
+    let server =
+        StreamingServer::bind_with_handler(StreamingConfig::default(), Arc::new(DrainHandler))
+            .await
+            .expect("bind");
+    let addr = server.local_addr();
+    let sessions = server.sessions();
+    let started = std::time::Instant::now();
+    let mut clients = Vec::new();
+    for _ in 0..3 {
+        clients.push(tokio::task::spawn_blocking(move || {
+            let mut stream =
+                TcpStream::connect_timeout(&addr, Duration::from_secs(5)).expect("connect");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("read timeout");
+            let mut out = Vec::new();
+            let _ = stream.read_to_end(&mut out);
+            out
+        }));
+    }
+    wait_open(&sessions, 3).await;
+    sessions.close_all();
+    assert_eq!(
+        sessions
+            .wait_idle_until(std::time::Instant::now() + Duration::from_millis(1000))
+            .await,
+        0
+    );
+    for c in clients {
+        let out = tokio::time::timeout(Duration::from_secs(3), c)
+            .await
+            .expect("client must see EOF")
+            .expect("join");
+        assert!(out.is_empty());
+    }
+    assert!(started.elapsed() < Duration::from_secs(4));
 }

@@ -84,9 +84,15 @@ impl Drop for ChildGuard {
 }
 
 fn spawn_server(sock: &Path, xdg: &Path) -> ChildGuard {
+    spawn_server_with(sock, xdg, &[])
+}
+
+/// `--streaming-*` 等の追加引数つきで起動する（#4110）。
+fn spawn_server_with(sock: &Path, xdg: &Path, extra: &[&str]) -> ChildGuard {
     let child = Command::new(BIN)
         .arg("--socket")
         .arg(sock)
+        .args(extra)
         .env_clear()
         .env("XDG_RUNTIME_DIR", xdg)
         .stdin(Stdio::null())
@@ -306,6 +312,145 @@ async fn cri6_3761_production_binary_exec_is_wired_and_fail_closed() {
 
         drop((c, ch));
         assert!(guard.exited().is_none(), "server must still be running");
+    })
+    .await
+    .expect("watchdog");
+}
+
+/// SIGTERM で正常停止させ、期限つきで回収して stderr 全体を返す（#4110。警告行の照合用）。
+async fn terminate_and_read_stderr(guard: &mut ChildGuard) -> String {
+    let pid = guard.0.id().to_string();
+    let st = Command::new("kill")
+        .args(["-TERM", &pid])
+        .status()
+        .expect("kill");
+    assert!(st.success(), "kill -TERM");
+    let start = Instant::now();
+    while guard.exited().is_none() {
+        assert!(
+            start.elapsed() < REAP_GRACE * 2,
+            "server must stop on SIGTERM"
+        );
+        // 同期の sleep だと current-thread のランタイムが止まり、クライアント接続の後始末が進まず停止が猶予まで延びる。
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mut err = String::new();
+    if let Some(mut s) = guard.0.stderr.take() {
+        use std::io::Read;
+        let _ = s.read_to_string(&mut err);
+    }
+    err
+}
+
+/// 警告行（固定 JSON 1 行）の出現回数。
+fn count_warning(stderr: &str) -> usize {
+    stderr
+        .lines()
+        .filter(|l| l.contains("cri_streaming_external_exposure"))
+        .count()
+}
+
+/// CRI-6・REPAIR-3・SEC-1・#4110: 既定は loopback の URL を返し、警告行を出さない。
+#[tokio::test]
+async fn cri6_4110_production_binary_default_is_loopback_without_warning() {
+    tokio::time::timeout(WATCHDOG, async {
+        let dir = TempDir::new("dfsock");
+        let xdg = TempDir::new("dfxdg");
+        let sock = dir.0.join("s.sock");
+        let mut guard = spawn_server(&sock, &xdg.0);
+        let ch = connect_when_ready(&sock, &mut guard).await;
+        let mut c = RuntimeServiceClient::new(ch.clone());
+        let sandbox = call_with_deadline(c.run_pod_sandbox(run_node_req("df-node")), RPC_DEADLINE)
+            .await
+            .expect("run node sandbox")
+            .into_inner()
+            .pod_sandbox_id;
+        let url = call_with_deadline(
+            c.port_forward(cri::PortForwardRequest {
+                pod_sandbox_id: sandbox,
+                port: vec![8080],
+            }),
+            RPC_DEADLINE,
+        )
+        .await
+        .expect("port-forward url")
+        .into_inner()
+        .url;
+        assert!(url.starts_with("http://127.0.0.1:"), "url must be loopback");
+        drop((c, ch));
+        let err = terminate_and_read_stderr(&mut guard).await;
+        assert_eq!(count_warning(&err), 0, "no warning by default: {err}");
+    })
+    .await
+    .expect("watchdog");
+}
+
+/// CRI-6・REPAIR-3・SEC-1・#4110: opt-in で 0.0.0.0 に bind し、広告アドレスの URL を返し、警告行をちょうど 1 回出す。
+/// 広告アドレス（192.0.2.7、TEST-NET-1）は到達できないので、authority を 127.0.0.1 に差し替えてワイルドカード bind を実証する。
+#[tokio::test]
+async fn cri6_4110_production_binary_opt_in_binds_wildcard_and_advertises() {
+    tokio::time::timeout(WATCHDOG, async {
+        let dir = TempDir::new("optsock");
+        let xdg = TempDir::new("optxdg");
+        let sock = dir.0.join("s.sock");
+        let mut guard = spawn_server_with(
+            &sock,
+            &xdg.0,
+            &[
+                "--streaming-bind=0.0.0.0:0",
+                "--streaming-allow-external",
+                "--streaming-advertise=192.0.2.7",
+            ],
+        );
+        let ch = connect_when_ready(&sock, &mut guard).await;
+        let mut c = RuntimeServiceClient::new(ch.clone());
+        let sandbox = call_with_deadline(c.run_pod_sandbox(run_node_req("opt-node")), RPC_DEADLINE)
+            .await
+            .expect("run node sandbox")
+            .into_inner()
+            .pod_sandbox_id;
+        let echo = spdy_client::spawn_echo();
+        let url = call_with_deadline(
+            c.port_forward(cri::PortForwardRequest {
+                pod_sandbox_id: sandbox,
+                port: vec![i32::from(echo.port())],
+            }),
+            RPC_DEADLINE,
+        )
+        .await
+        .expect("port-forward url")
+        .into_inner()
+        .url;
+        assert!(
+            url.starts_with("http://192.0.2.7:"),
+            "url must carry the advertise address"
+        );
+        let (authority, path) = spdy_client::split_url(&url);
+        let port: u16 = authority
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse().ok())
+            .expect("advertised port");
+        assert_ne!(port, 0);
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("loopback addr");
+        let want = payload();
+        let echo_port = echo.port();
+        let got = tokio::time::timeout(
+            ROUND_TRIP_DEADLINE,
+            tokio::task::spawn_blocking({
+                let want = want.clone();
+                move || round_trip(addr, &path, echo_port, &want)
+            }),
+        )
+        .await
+        .expect("round trip deadline")
+        .expect("round trip task");
+        assert!(got == want, "echoed bytes must match exactly");
+        drop((c, ch));
+        let err = terminate_and_read_stderr(&mut guard).await;
+        assert_eq!(count_warning(&err), 1, "exactly one warning: {err}");
+        assert!(err.contains("without TLS or authentication"), "{err}");
+        assert!(!err.contains("192.0.2.7"), "address must not be logged");
     })
     .await
     .expect("watchdog");

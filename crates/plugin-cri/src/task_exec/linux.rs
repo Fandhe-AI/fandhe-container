@@ -3,6 +3,7 @@
 
 use std::num::NonZeroU32;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
@@ -21,7 +22,8 @@ use fandhe_container_supervisor::stream_exec::wire::{StdioMask, StreamExecOutcom
 
 use crate::streaming::exec_launcher::{
     HANDOVER_BUDGET, HelperGuard, HelperSpawner, ProductionHelperSpawner, RESULT_GRACE,
-    SESSION_TIMEOUT, STARTED_BUDGET, Shared, SpawnedHelper, channel_error, cri_error, map_outcome,
+    SESSION_TIMEOUT, STARTED_BUDGET, Shared, SpawnedHelper, channel_error, cri_error, diagnostics,
+    map_outcome,
 };
 
 /// 待ちの刻み。取り消しと期限をこの刻みで確かめる（REPAIR-5）。
@@ -269,12 +271,38 @@ impl TaskExecLauncher for ShimExecLauncher {
         )
         .map_err(|_| CriError::invalid_argument("exec request was rejected"))?;
 
-        let SpawnedHelper { child, channel } = self.spawner.spawn(&args)?;
+        let SpawnedHelper {
+            child,
+            channel,
+            diagnostics,
+        } = self.spawner.spawn(&args)?;
+        let diag_stop = Arc::new(AtomicBool::new(false));
         let guard = Arc::new(HelperGuard {
             child: Mutex::new(Some(child)),
             shared: Arc::clone(&self.shared),
+            diag_stop: Arc::clone(&diag_stop),
             _slot: slot,
         });
+        // helper の fd 2 は CRI の exec と同じく上限つきの読み手で固定語彙の構造化ログへ転送する（#4171）。
+        // 作れなくても exec は失敗にしない（観測は最善努力）。
+        if let Some(sock) = diagnostics {
+            let reader_deadline = Instant::now()
+                + self.budgets.started
+                + self.budgets.session
+                + self.budgets.result_grace;
+            let sink = crate::telemetry::stderr_sink().clone();
+            if diagnostics::spawn_reader(
+                sock,
+                diag_stop,
+                reader_deadline,
+                sink.clone(),
+                &self.shared.diag,
+            )
+            .is_err()
+            {
+                let _ = sink.submit(diagnostics::reader_unavailable_line());
+            }
+        }
         {
             let mut t = lock_tracker(&self.tracker);
             if t.stopped {

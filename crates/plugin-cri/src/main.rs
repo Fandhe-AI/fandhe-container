@@ -361,11 +361,12 @@ fn serve(socket: &std::path::Path) -> ExitCode {
             vec![recorder, oci_recorder],
             telemetry::OP_STATS_EXPORT_INTERVAL,
         ));
-        // shutdown future は待ち受けを閉じるだけで待たない。セッションのドレインと強制クローズは serve が戻った後の
-        // `finish` が、シグナルの受信時刻からの絶対時刻の期限で行う（#4164・REPAIR-5）。
+        // shutdown future は待ち受けを閉じて停止処理を別タスクで起動するだけで待たない。ドレイン・exec の停止・強制クローズは
+        // serve の戻りと無関係に、シグナルの受信時刻からの期限で進む（#4164・REPAIR-5）。`finish` は結果を受け取る。
         let (streaming_shutdown, streaming_stop) = streaming::stop_streaming_on(
             streaming,
-            || {
+            streaming::PRODUCTION_STOP_LIMITS,
+            move || {
                 #[cfg(target_os = "linux")]
                 exec_launcher.shutdown_all();
             },
@@ -380,9 +381,7 @@ fn serve(socket: &std::path::Path) -> ExitCode {
             streaming_shutdown,
         )
         .await;
-        let report = streaming_stop
-            .finish(streaming::PRODUCTION_STOP_LIMITS)
-            .await;
+        let report = streaming_stop.finish().await;
         // 件数と経過だけの 1 行。終了行の書き出しの待ちより前に出し、まとめて flush させる（REPAIR-4）。
         let _ = telemetry::stderr_sink().submit(report.line());
         stats.abort();

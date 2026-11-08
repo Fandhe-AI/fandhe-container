@@ -462,7 +462,7 @@ CRI の `ExecSync`（現状 `UNIMPLEMENTED`）も本設計の helper を再利�
 
 ### 方針
 
-期限つきでドレインし、期限を過ぎたら exec を止めてから強制的に閉じる。基準はシグナルの受信時刻 T の絶対時刻で、`serve_with_audit` が戻った後に `StreamingStop::finish` が実行する。shutdown future 自体は待ちを持たない（TCP の待ち受けを閉じる契約〔#3226〕を遅らせないため）。
+期限つきでドレインし、期限を過ぎたら exec を止めてから強制的に閉じる。基準はシグナルの受信時刻 T の絶対時刻で、シグナル受信時に shutdown future が別タスクとして起動し、`serve_with_audit` の戻り（RPC が残ると gRPC の猶予 10 秒を使う）を待たずに期限どおり進む。`StreamingStop::finish` はその結果を受け取る。shutdown future 自体は待ちを持たない（TCP の待ち受けを閉じる契約〔#3226〕を遅らせないため）。
 
 | 段 | 時刻 | 内容 |
 | -- | ---- | ---- |
@@ -488,7 +488,7 @@ CRI の `ExecSync`（現状 `UNIMPLEMENTED`）も本設計の helper を再利�
 ### 試験
 
 - cri `tests/streaming_server.rs`: 3 セッションのうち自然に終わる 1 件の応答が欠けず、残り 2 件が `close_all` で閉じる（`cri6_repair5_4164_drain_keeps_natural_response_and_force_closes_rest`）、強制クローズ後の接続の即時 abort、Upgrade 前の接続の強制クローズ
-- plugin-cri `streaming.rs`: 3 件を開いたままの停止が期限内に終わり全件閉じること、`on_stop` が 1 回で強制クローズより前に呼ばれること、期限内に終わった応答が欠けないこと、期限後の `finish` が待たないこと、ログ行の形
+- plugin-cri `streaming.rs`: 3 件を開いたままの停止が期限内に終わり全件閉じること、`on_stop` が 1 回で強制クローズより前に呼ばれること、期限内に終わった応答が欠けないこと、`finish` を呼ばなくても期限どおりに `on_stop` と強制クローズが行われること、期限後の `finish` が待たないこと、ログ行の形
 
 ## 依存
 

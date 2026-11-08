@@ -28,8 +28,8 @@
 //! # 停止（REPAIR-5・#4164）
 //! 停止は「期限つきドレイン、exec を止める、残りを強制クローズ」の順で行う（方針と理由は設計書の「停止時のセッションの扱い」）。
 //! [`stop_streaming_on`] が返す shutdown future は、シグナルの受信で TCP の待ち受けを閉じて**すぐに**完了する
-//! （gRPC の listener を閉じる契約〔#3226〕を遅らせないため、待ちは入れない）。待ちは `serve_with_audit` が戻った後に
-//! [`StreamingStop::finish`] が行う。基準はシグナルの受信時刻 T の絶対時刻で、(1) T..T+[`STREAMING_DRAIN_WAIT`] は
+//! （gRPC の listener を閉じる契約〔#3226〕を遅らせないため、待ちは入れない）。停止処理はシグナル受信時に別タスクとして起動し、`serve_with_audit` の戻りを待たない
+//! （RPC が残って gRPC の猶予を使い切る間も期限どおり動く）。[`StreamingStop::finish`] はその結果を受け取る。基準はシグナルの受信時刻 T の絶対時刻で、(1) T..T+[`STREAMING_DRAIN_WAIT`] は
 //! セッションが自分で終わるのを待つ（全部閉じたら早く抜ける）、(2) 期限で `on_stop`（exec の追跡中 helper の kill と
 //! 以後の launch の拒否）を呼び、(3) [`STREAMING_CLOSE_WAIT`] まで exec が閉じるのを待ち、(4) 残りを abort する。
 //! (1)+(3) は `PLUGIN_SHUTDOWN_GRACE` 以内に収め、`shutdown::SHUTDOWN_TOTAL_BOUND` は変えない（試験で固定）。
@@ -200,71 +200,109 @@ pub const PRODUCTION_STOP_LIMITS: StreamingStopLimits = StreamingStopLimits {
     close: STREAMING_CLOSE_WAIT,
 };
 
-/// シグナルの受信時刻と、その時点で開いていた件数（shutdown future が記録し、`finish` が読む）。
-type SignalCell = Arc<Mutex<Option<(Instant, usize)>>>;
+/// シグナルを受けて起動した停止処理のタスク（結果の報告を返す）。
+type StopTask = Arc<Mutex<Option<tokio::task::JoinHandle<StreamingStopReport>>>>;
 
-/// [`stop_streaming_on`] が返す、`serve_with_audit` の後に行う停止処理の持ち主。
+/// [`stop_streaming_on`] が返す、停止処理の結果を受け取る持ち主。
 ///
-/// 呼び出し元は `main.rs` の `serve`。`finish` を呼ばずに drop されたとき（serve のエラー・future の取消）も、
-/// `on_stop` を 1 回呼び、全セッションを abort する（helper を残さない。REPAIR-5・#3761）。
-pub struct StreamingStop<G: FnOnce()> {
+/// 呼び出し元は `main.rs` の `serve`。ドレイン・`on_stop`・強制クローズはシグナルの受信時に shutdown future が
+/// 別タスクとして起動し、`serve_with_audit`（gRPC の終了待ち）の戻りを待たずに、シグナルの受信時刻 T からの
+/// 絶対時刻で進む（RPC が残って gRPC の猶予を使い切る間も期限どおりに動く。#4164・REPAIR-5）。`finish` はそのタスクの終了を待って
+/// 結果を返す。`finish` を呼ばずに drop されたとき（serve のエラー・future の取消）も、`on_stop` を 1 回呼び、
+/// 全セッションを abort する（helper を残さない。REPAIR-5・#3761）。
+pub struct StreamingStop<G: FnOnce() + Send + 'static> {
     sessions: StreamingSessions,
-    signal: SignalCell,
-    on_stop: Option<G>,
+    on_stop: Arc<Mutex<Option<G>>>,
+    task: StopTask,
 }
 
-impl<G: FnOnce()> Drop for StreamingStop<G> {
+/// `on_stop` を（まだなら）1 回だけ呼ぶ。
+fn take_and_run<G: FnOnce()>(on_stop: &Mutex<Option<G>>) {
+    let f = on_stop
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some(f) = f {
+        f();
+    }
+}
+
+impl<G: FnOnce() + Send + 'static> Drop for StreamingStop<G> {
     fn drop(&mut self) {
-        if let Some(f) = self.on_stop.take() {
-            f();
+        if let Some(h) = self
+            .task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            h.abort();
         }
+        take_and_run(&self.on_stop);
         self.sessions.close_all();
     }
 }
 
-impl<G: FnOnce()> StreamingStop<G> {
-    /// ドレイン、`on_stop`、強制クローズを行い、結果を返す。
+/// シグナルの受信時刻 `t0` を起点にした停止処理の本体（別タスクで走る）。
+async fn run_stop<G: FnOnce()>(
+    sessions: StreamingSessions,
+    on_stop: Arc<Mutex<Option<G>>>,
+    limits: StreamingStopLimits,
+    t0: Instant,
+    open_at_stop: usize,
+) -> StreamingStopReport {
+    let exceeded = sessions.wait_idle_until(t0 + limits.drain).await;
+    // 期限を超えたので exec を止める（helper の kill と以後の launch の拒否）。exec のセッションは終了を観測して閉じる。
+    take_and_run(&on_stop);
+    let forced = sessions
+        .wait_idle_until(t0 + limits.drain + limits.close)
+        .await;
+    if forced > 0 {
+        sessions.close_all();
+    }
+    // close_all は予約済みの登録も止める。abort したタスクの破棄は次の poll で起きるため、枠が返るのを短く確かめる。
+    let remaining = sessions
+        .wait_idle_until(Instant::now() + STREAMING_FORCE_CONFIRM_WAIT)
+        .await;
+    StreamingStopReport {
+        open_at_stop,
+        drained: open_at_stop.saturating_sub(exceeded),
+        exceeded,
+        forced,
+        remaining,
+        elapsed_ms: u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX),
+    }
+}
+
+impl<G: FnOnce() + Send + 'static> StreamingStop<G> {
+    /// 停止処理の終了を待って結果を返す。
     ///
-    /// 期限はシグナルの受信時刻からの絶対時刻なので、`serve_with_audit` が期限より後に戻ったときは
-    /// 待たずに即座に `on_stop` と強制クローズへ進む（停止の上限を延ばさない）。シグナルが記録されていない
-    /// （serve が先にエラーで戻った）ときも待たない。
-    pub async fn finish(mut self, limits: StreamingStopLimits) -> StreamingStopReport {
-        let recorded = self
-            .signal
+    /// 停止処理はシグナルの受信時に起動済みで、期限もその時刻が基準なので、ここでの待ちは期限を延ばさない。
+    /// シグナルが記録されていない（serve が先にエラーで戻った）ときは待たずに `on_stop` と強制クローズへ進む。
+    pub async fn finish(self) -> StreamingStopReport {
+        let handle = self
+            .task
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
-        let (t0, open_at_stop, drain_deadline, close_deadline) = match recorded {
-            Some((t0, open)) => (
-                t0,
-                open,
-                t0 + limits.drain,
-                t0 + limits.drain + limits.close,
-            ),
-            None => {
-                let now = Instant::now();
-                (now, self.sessions.open(), now, now)
-            }
-        };
-        let exceeded = self.sessions.wait_idle_until(drain_deadline).await;
-        // 期限を超えたので exec を止める（helper の kill と以後の launch の拒否）。exec のセッションは終了を観測して閉じる。
-        if let Some(f) = self.on_stop.take() {
-            f();
+        // タスクが panic した場合（`Err`）は下へ進み、止める処理を自分で行って残りを数える。
+        if let Some(h) = handle
+            && let Ok(report) = h.await
+        {
+            return report;
         }
-        let forced = self.sessions.wait_idle_until(close_deadline).await;
-        if forced > 0 {
-            self.sessions.close_all();
-        }
-        // close_all は予約済みの登録も止める。abort したタスクの破棄は次の poll で起きるため、枠が返るのを短く確かめる。
+        let t0 = Instant::now();
+        let open_at_stop = self.sessions.open();
+        take_and_run(&self.on_stop);
+        self.sessions.close_all();
         let remaining = self
             .sessions
             .wait_idle_until(Instant::now() + STREAMING_FORCE_CONFIRM_WAIT)
             .await;
         StreamingStopReport {
             open_at_stop,
-            drained: open_at_stop.saturating_sub(exceeded),
-            exceeded,
-            forced,
+            drained: 0,
+            exceeded: open_at_stop,
+            forced: open_at_stop.saturating_sub(remaining),
             remaining,
             elapsed_ms: u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX),
         }
@@ -308,32 +346,36 @@ impl StreamingStopReport {
     }
 }
 
-/// `shutdown` の完了で `server` の待ち受けを閉じる future と、その後の停止処理 [`StreamingStop`] の組を返す。
-/// 第 1 要素は `serve_with_audit` の shutdown future として渡し、第 2 要素は serve が戻った後に
-/// [`StreamingStop::finish`] する。
+/// `shutdown` の完了で `server` の待ち受けを閉じ、停止処理（ドレイン・`on_stop`・強制クローズ）を別タスクで起動する
+/// future と、その結果を受け取る [`StreamingStop`] の組を返す。
 ///
-/// 第 1 要素は待ちを持たない（gRPC の listener を閉じる契約を遅らせない）。ドロップされたときも
-/// `StreamingServer::drop` が待ち受けを閉じ、`StreamingStop` の drop が `on_stop` を呼ぶ。
-pub fn stop_streaming_on<F: Future<Output = ()>, G: FnOnce()>(
+/// 第 1 要素は `serve_with_audit` の shutdown future として渡す。待ちは持たず（gRPC の listener を閉じる契約を遅らせない）、
+/// シグナル受信時刻 T を基準に停止処理のタスクを `tokio::spawn` して直ちに完了する。タスクは `serve_with_audit` の戻りと無関係に
+/// 期限（T+`limits.drain` で `on_stop`、T+`limits.drain`+`limits.close` で強制クローズ）どおりに進む。
+/// 第 2 要素は serve が戻った後に [`StreamingStop::finish`] する。`tokio` の実行時の中で polling されること。
+pub fn stop_streaming_on<F: Future<Output = ()>, G: FnOnce() + Send + 'static>(
     server: StreamingServer,
+    limits: StreamingStopLimits,
     on_stop: G,
     shutdown: F,
 ) -> (impl Future<Output = ()>, StreamingStop<G>) {
     let sessions = server.sessions();
-    let signal: SignalCell = Arc::new(Mutex::new(None));
+    let on_stop = Arc::new(Mutex::new(Some(on_stop)));
+    let task: StopTask = Arc::new(Mutex::new(None));
     let stop = StreamingStop {
         sessions: sessions.clone(),
-        signal: Arc::clone(&signal),
-        on_stop: Some(on_stop),
+        on_stop: Arc::clone(&on_stop),
+        task: Arc::clone(&task),
     };
     let fut = async move {
         shutdown.await;
         let at = Instant::now();
         let open = sessions.open();
-        *signal
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((at, open));
         server.shutdown();
+        let handle = tokio::spawn(run_stop(sessions, on_stop, limits, at, open));
+        *task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
     };
     (fut, stop)
 }
@@ -575,6 +617,7 @@ mod tests {
         let c = Arc::clone(&count);
         let (fut, stop) = stop_streaming_on(
             server,
+            TEST_LIMITS,
             move || {
                 c.fetch_add(1, Ordering::SeqCst);
             },
@@ -604,7 +647,7 @@ mod tests {
         let addr = server.local_addr();
         let flag = Arc::new(AtomicBool::new(false));
         let f = Arc::clone(&flag);
-        let (fut, _stop) = stop_streaming_on(server, || {}, async move {
+        let (fut, _stop) = stop_streaming_on(server, TEST_LIMITS, || {}, async move {
             while !f.load(Ordering::SeqCst) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -702,6 +745,7 @@ mod tests {
         );
         let (fut, stop) = stop_streaming_on(
             server,
+            TEST_LIMITS,
             move || {
                 c.fetch_add(1, Ordering::SeqCst);
                 o.store(s2.open(), Ordering::SeqCst);
@@ -710,7 +754,7 @@ mod tests {
         );
         fut.await;
         let started = Instant::now();
-        let report = tokio::time::timeout(Duration::from_secs(5), stop.finish(TEST_LIMITS))
+        let report = tokio::time::timeout(Duration::from_secs(5), stop.finish())
             .await
             .expect("finish must be bounded");
         assert!(
@@ -752,7 +796,7 @@ mod tests {
         let addr = server.local_addr();
         let sessions = server.sessions();
         let mut conns = open_idle_connections(addr, &sessions, 3).await;
-        let (fut, stop) = stop_streaming_on(server, || {}, std::future::ready(()));
+        let (fut, stop) = stop_streaming_on(server, TEST_LIMITS, || {}, std::future::ready(()));
         fut.await;
         // 停止を受けた後に、不正なトークンの要求を 1 本だけ送る。404 の応答全体を受け取って閉じるはず。
         let mut talker = conns.remove(0);
@@ -767,7 +811,7 @@ mod tests {
             let _ = talker.read_to_end(&mut out);
             String::from_utf8_lossy(&out).into_owned()
         });
-        let report = tokio::time::timeout(Duration::from_secs(5), stop.finish(TEST_LIMITS))
+        let report = tokio::time::timeout(Duration::from_secs(5), stop.finish())
             .await
             .expect("finish must be bounded");
         let response = client.await.expect("join");
@@ -806,11 +850,11 @@ mod tests {
             drain: Duration::from_millis(100),
             close: Duration::from_millis(100),
         };
-        let (fut, stop) = stop_streaming_on(server, || {}, std::future::ready(()));
+        let (fut, stop) = stop_streaming_on(server, limits, || {}, std::future::ready(()));
         fut.await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         let started = Instant::now();
-        let report = stop.finish(limits).await;
+        let report = stop.finish().await;
         assert!(
             started.elapsed() < Duration::from_millis(250),
             "{:?}",
@@ -840,13 +884,14 @@ mod tests {
         let c = Arc::clone(&calls);
         let (_fut, stop) = stop_streaming_on(
             server,
+            PRODUCTION_STOP_LIMITS,
             move || {
                 c.fetch_add(1, Ordering::SeqCst);
             },
             std::future::pending::<()>(),
         );
         let started = Instant::now();
-        let report = stop.finish(PRODUCTION_STOP_LIMITS).await;
+        let report = stop.finish().await;
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "{:?}",
@@ -860,6 +905,51 @@ mod tests {
         for conn in conns {
             assert_closed_by_peer(conn).await;
         }
+    }
+
+    /// REPAIR-5・#4164: `finish` を呼ばないまま（serve が RPC の残りで戻らない状況）でも、期限どおりに
+    /// `on_stop` が呼ばれ、全セッションが強制クローズされる。時間は具体値で確認する。
+    #[tokio::test]
+    async fn repair5_4164_stop_runs_on_deadline_without_finish() {
+        let server = bind_production_streaming(
+            production_streaming_config(),
+            fake_attach(),
+            None,
+            noop_recorder(),
+            noop_observer(),
+        )
+        .await
+        .expect("bind");
+        let sessions = server.sessions();
+        let conns = open_idle_connections(server.local_addr(), &sessions, 2).await;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = Arc::clone(&calls);
+        let (fut, stop) = stop_streaming_on(
+            server,
+            TEST_LIMITS,
+            move || {
+                c.fetch_add(1, Ordering::SeqCst);
+            },
+            std::future::ready(()),
+        );
+        fut.await;
+        let t0 = Instant::now();
+        // ドレインの期限（500ms）の手前では on_stop はまだ呼ばれず、セッションも開いたまま。
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(sessions.open(), 2);
+        // 強制クローズの期限（700ms）の後。finish は呼んでいない。
+        tokio::time::sleep(Duration::from_millis(750).saturating_sub(t0.elapsed())).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(sessions.open(), 0);
+        for conn in conns {
+            assert_closed_by_peer(conn).await;
+        }
+        let report = stop.finish().await;
+        assert_eq!(
+            (report.open_at_stop, report.forced, report.remaining),
+            (2, 2, 0)
+        );
     }
 
     /// REPAIR-4・#4164: 停止の 1 行の形（info / warn。トークン・ID・アドレスを含まない）。

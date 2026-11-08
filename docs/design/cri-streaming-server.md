@@ -245,19 +245,19 @@ plugin-cri が helper を kill せずに異常終了（SIGKILL 等）すると�
 - plugin-cri は channel の自分の側を `watch_result` の専用スレッドが `Result` を受けるまで持ち、`shutdown` しない。受信失敗・セッションの drop・`shutdown_all` では helper を SIGKILL する。よって「channel が閉じた」ことは「要求元はもう exec を必要としていない」ことと等価である。channel はパスの無い socketpair（CLOEXEC）で、第三者は接続も切断もできない
 - helper の送信は `MSG_NOSIGNAL` で、相手が消えていれば `Result` の送信は SIGPIPE なしに直ちに失敗する
 
-**4 案の比較**:
+**5 案（A・B・C1・C2・D）の比較**:
 
 | 案 | 内容 | 長所 | 短所 | 判断 |
 | -- | ---- | ---- | ---- | ---- |
 | A | fd 0 を `poll`（タイムアウト 0）し、`POLLHUP`・`POLLERR`・`POLLRDHUP`・`POLLNVAL` を要求元の消滅とする | プロセスの死とセッションの破棄（channel の drop）を同じ事象で拾う。pid を扱わず再利用の窓が無い。非ブロッキングの 1 回の syscall で単一スレッドのまま。第三者が起こせない | supervisor の sys に `poll` の FFI 宣言と `libc_abi` の照合が要る（事前承認の範囲の sys ラッパー）。plugin-cri の end が他のプロセスへ漏れると検知できない | 検知の信号として採用 |
 | B | 要求元の pid（`SO_PEERCRED`・`getppid`）を `pidfd_open` して終了を見る | channel の end の漏れに影響されない | 死から `pidfd_open` までに pid が再利用されうる。supervisor の sys に `pidfd_open` の宣言が要る。プロセスが生きたまま channel を捨てた場合を拾えない。「記録した pid から handle を導かない」方針（`exec-without-supervisor.md`）とずれる | 却下（A と同じ事象を競合と宣言を増やして拾うだけ。再評価条件に残す） |
-| C（core に取り消しトークン） | `ContainerChild::wait_timeout` 等に取り消しを足す | 汎用 | 実際のループは supervisor にあり、検知後は `kill_and_reap` へ切り替えれば待たずに済む。core の公開 API が増え healthcheck・CLI exec に波及する | 却下（core は変えない。PLUG-4・REPAIR-1） |
-| C（supervisor の serve ループに取り消し口） | `respond_and_collect` の `stop` を「worker の終了または取り消し」にし、取り消しなら `kill_and_reap` へ進む | 20 ms 刻みのループが既に `stop()` を呼ぶ。単一スレッドのまま。core は不変。他の呼び出し元は `None` で挙動不変 | `ExecLaunchIo` に任意項目が 1 つ増え、構築箇所 6 つの追従が要る | 取り消し口として採用（A の信号を受ける） |
+| C1（core に取り消しトークン） | `ContainerChild::wait_timeout` 等に取り消しを足す | 汎用 | 実際のループは supervisor にあり、検知後は `kill_and_reap` へ切り替えれば待たずに済む。core の公開 API が増え healthcheck・CLI exec に波及する | 却下（core は変えない。PLUG-4・REPAIR-1） |
+| C2（supervisor の serve ループに取り消し口） | `respond_and_collect` の `stop` を「worker の終了または取り消し」にし、取り消しなら `kill_and_reap` へ進む | 20 ms 刻みのループが既に `stop()` を呼ぶ。単一スレッドのまま。core は不変。他の呼び出し元は `None` で挙動不変 | `ExecLaunchIo` に任意項目が 1 つ増え、構築箇所 6 つの追従が要る | 取り消し口として採用（A の信号を受ける） |
 | D | helper が `PR_SET_PDEATHSIG` を使う | 単純 | PDEATHSIG は親を fork した「スレッド」の終了で発火し、plugin-cri は多スレッド（tokio の blocking pool は idle で終わる）なので正常なセッションを誤って止める。子側の設定は `pre_exec`（sys 外の unsafe）が要る | 却下（誤検知が避けられない。`helper.rs` のモジュール doc の既存の却下理由と同じ） |
 
 補足の却下: (1) core の `poll` ラッパーを公開して supervisor が使う案は、core の公開 API を増やし、crate ごとの sys に置いて共有下位 crate を作らない前例（`fdinfo-mnt-id-parsing.md`）に反する。(2) channel を非ブロッキングにして 1 バイト読む案は、データを消費し、O_NONBLOCK がオープンファイル記述で共有されて以後の送信の期限処理に影響する。
 
-**採用: A（信号）+ supervisor 側の C（取り消し口）**:
+**採用: A（信号）+ supervisor 側の C2（取り消し口）**:
 
 - 判定 `requester_gone`: fd 0 を `poll(timeout = 0)` し、`POLLHUP | POLLERR | POLLRDHUP | POLLNVAL` のいずれかで真。`POLLIN` だけ（想定外のデータ）は消滅とせず読みもしない。`poll` の失敗（`EINTR` 等）はその回は偽にし、既存の上限に任せる
 - 契約（要求元側）: plugin-cri はセッションを続けたい間、channel の自分の側を閉じず `shutdown` もしない（現状の `watch_result` が満たす）。この end を他のプロセスへ渡さない（CLOEXEC を保つ）。#4166 で `exec_launcher.rs` の doc にも書く

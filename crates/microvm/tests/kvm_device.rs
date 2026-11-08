@@ -776,7 +776,8 @@ struct DirtyObservation {
 
 /// MVM-1・#4225: `LOG_DIRTY_PAGES` つき memslot の dirty bitmap は、ゲストが書いたページのビットだけが立つ（x86_64）。
 /// リセットベクタのゲストコードが `0xFFFF_0100`（page 0）と `0xFFFF_2100`（page 2）へ書いて `hlt` する。ホストが書いた
-/// コードのページ（page 15）は立たず、読み取りと同時にクリアされるため 2 回目は全 0 になる。
+/// コードのページ（page 15）は実機で dirty になることがあるため照合から外し（マスク）、読み取りと同時にクリアされるため
+/// 2 回目は全 0 になる。
 #[cfg(target_arch = "x86_64")]
 #[test]
 #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]

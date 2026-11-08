@@ -744,3 +744,105 @@ fn oci7_sec1_expanded_measure_after_root_swap_reads_only_verified_root() {
     let _ = fs::remove_dir_all(&root);
     let _ = fs::remove_dir_all(&moved);
 }
+/// リース済みの blob（`blobs/sha256/<hex>` に `cached`）を 1 件持つ pull を作る。
+fn leased_pull<'a>(
+    store: &'a ImageStore,
+    root: &Path,
+) -> (super::pull::PullSession<'a>, Digest, String) {
+    let data = b"cached";
+    let dg = sha_of(data);
+    let hex = dg.to_string().replace("sha256:", "");
+    let dir = root.join("blobs").join("sha256");
+    fs::create_dir_all(&dir).expect("blob dir");
+    fs::write(dir.join(&hex), data).expect("blob");
+    let mut s = store.begin_pull(pid("p1")).expect("begin");
+    assert!(matches!(
+        s.lease_existing_blob(&dg).expect("lease"),
+        super::BlobReuse::Leased(_)
+    ));
+    (s, dg, hex)
+}
+
+/// `open_leased_blob` で開いたハンドルの全内容を読む。
+fn read_leased(
+    s: &super::pull::PullSession<'_>,
+    d: &Digest,
+) -> Result<Vec<u8>, crate::error::OciError> {
+    use std::io::Read as _;
+    let mut body = Vec::new();
+    s.open_leased_blob(d)?.read_to_end(&mut body).expect("read");
+    Ok(body)
+}
+
+/// OCI-7・SEC-1・CRI-3・#4179: リース後に root が別名へ移されて同名のおとりが置かれても、リース済み blob の読み取りは
+/// 検査済みの root の blob を返し、おとりは読まれず無傷である。
+#[test]
+fn oci7_sec1_leased_blob_read_after_root_swap_reads_verified_root() {
+    let root = temp_root("lb-root");
+    let moved = root.with_extension("moved");
+    let store = open_store(&root);
+    let (s, dg, hex) = leased_pull(&store, &root);
+    swap_root(&root, &moved);
+    let decoy_dir = root.join("blobs").join("sha256");
+    fs::create_dir_all(&decoy_dir).expect("decoy dir");
+    fs::write(decoy_dir.join(&hex), b"decoy!").expect("decoy blob");
+    assert_eq!(read_leased(&s, &dg).expect("open"), b"cached");
+    assert_eq!(fs::read(decoy_dir.join(&hex)).expect("intact"), b"decoy!");
+    drop(s);
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&moved);
+}
+
+/// OCI-7・SEC-1・CRI-3・#4179: リース後に `blobs/sha256`（または `blobs`）が root の外のディレクトリへの symlink に
+/// 差し替わっても、リース済み blob の読み取りは辿らず `FailedPrecondition` で拒否し、外側のファイルは無傷である。
+#[test]
+fn oci7_sec1_leased_blob_dir_swapped_to_symlink_is_rejected() {
+    use std::os::unix::fs::symlink;
+    let root = temp_root("lb-dir");
+    let outside = temp_root("lb-dir-out");
+    let store = open_store(&root);
+    let (s, dg, hex) = leased_pull(&store, &root);
+    fs::write(outside.join(&hex), b"cached").expect("outside blob");
+
+    let sha_dir = root.join("blobs").join("sha256");
+    fs::rename(&sha_dir, root.join("blobs").join("sha256-moved")).expect("move");
+    symlink(&outside, &sha_dir).expect("symlink");
+    let e = read_leased(&s, &dg).expect_err("symlinked blob dir");
+    assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+    assert_eq!(e.message(), "blob directory is not a plain directory");
+    assert_eq!(fs::read(outside.join(&hex)).expect("intact"), b"cached");
+
+    fs::remove_file(&sha_dir).expect("unlink");
+    fs::rename(root.join("blobs").join("sha256-moved"), &sha_dir).expect("restore");
+    assert_eq!(read_leased(&s, &dg).expect("restored"), b"cached");
+    fs::rename(root.join("blobs"), root.join("blobs-moved")).expect("move blobs");
+    symlink(root.join("blobs-moved"), root.join("blobs")).expect("symlink blobs");
+    let e = read_leased(&s, &dg).expect_err("symlinked blobs");
+    assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+    assert_eq!(e.message(), "blob directory is not a plain directory");
+    drop(s);
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&outside);
+}
+
+/// OCI-7・SEC-1・CRI-3・#4179: リース後に blob 自体が root の外への symlink に差し替わっても、辿らず
+/// `FailedPrecondition`（`cached blob is not a regular file`）で拒否する。
+#[test]
+fn oci7_sec1_leased_blob_entry_swapped_to_symlink_is_rejected() {
+    use std::os::unix::fs::symlink;
+    let root = temp_root("lb-ent");
+    let outside = temp_root("lb-ent-out");
+    let store = open_store(&root);
+    let (s, dg, hex) = leased_pull(&store, &root);
+    fs::write(outside.join("t"), b"cached").expect("outside");
+    let entry = root.join("blobs").join("sha256").join(&hex);
+    fs::remove_file(&entry).expect("unlink");
+    symlink(outside.join("t"), &entry).expect("symlink");
+    let e = read_leased(&s, &dg).expect_err("symlinked entry");
+    assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+    assert_eq!(e.message(), "cached blob is not a regular file");
+    assert_eq!(fs::read(outside.join("t")).expect("intact"), b"cached");
+    drop(s);
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&outside);
+}

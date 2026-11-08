@@ -25,7 +25,9 @@
 //!    スロットの clone → VM）を順に落とすと、最後の `Arc` の drop で unmap → munmap、続いて `hv_vm_destroy` が走る（#4032）。
 //!    切り離した vCPU スレッドが終わるまでは何も解放されず、終わった後に 1 回ずつ回収される。呼び出し元の契約は、全 vCPU スレッドが
 //!    スロットの clone と VM の `Arc` を持ち、vCPU を破棄した後に落とすこと（`hvf::vcpu::ExitHandlers::guest_memory`）。
-//!    実機で vCPU スレッドから `hv_vm_unmap`・`hv_vm_destroy` を呼べることは未確認（#4034）。
+//!    #4034 の実機確認では、切り離した vCPU スレッドの終了後に `op=hvf.vm_unmap outcome=error` が出ず、同じプロセスで VM を作り直せた
+//!    （`hv_vm_destroy` が失敗すると排他を戻さないため、作り直せたことは destroy の成功を意味する。間接の根拠）。回収がそのスレッドの上で
+//!    成功したことを直接示す行（`op=hvf.deferred_reclaim`）は #4146 で足した。次の実機確認で照合する。
 //!    例外: 補助スレッドの停止を確かめられなかった場合（[`StopOutcome::aux_unconfirmed`]。#4030）は、補助が RAM をまだ触りうるため遅延回収に回さず
 //!    RAM をリークする（`mem::forget`）。
 //!    例外: `release_devices` の失敗（デバイスの保持者が lock を持つ。期限切れの経路でも手放しの前に確かめ、失敗なら回収に回さない）では、デバイス → RAM → VM の順を強制できないため、従来どおり
@@ -332,12 +334,110 @@ where
 /// `hv_vm_destroy` が走る。対応付けが `Arc<HvVm>` を握るため、VM の破棄が unmap より先になることは型で起きない。
 ///
 /// 複数 vCPU でも、各スレッドは「デバイス → スロット」の順に落とすので、最後のスロットの drop は全スレッドのデバイスの drop より後になる。
-/// 残余: panic で巻き戻る場合の drop 順は保証しない（`run_loop` の panic は想定外）。実機で vCPU スレッドから unmap・destroy を
-/// 呼べることは未確認（#4034）。
+/// 残余: panic で巻き戻る場合の drop 順は保証しない（`run_loop` の panic は想定外）。回収の成功は、`hvf_loop::spawn_loop` が
+/// スレッドの終わりに [`take_thread_reclaim`] で読み、`op=hvf.deferred_reclaim` の行で出す（#4146。実機での照合は人間担当）。
 pub fn drop_vcpu_thread_state<H, M, V>(handlers: H, memory: M, vm: V) {
     drop(handlers);
     drop(memory);
     drop(vm);
+}
+
+/// このスレッドで実際に起きた `hv_vm_unmap`（ゲスト RAM の解放）・`hv_vm_destroy`（VM の破棄）の結果の記録（#4146・MVM-5・REPAIR-4）。
+///
+/// 書き手は macOS の `sys::hvf` の drop（`GuestMapping`・`HvVm`）、読み手は `hvf_loop::spawn_loop` のスレッド本体（`body` が戻った後に
+/// [`take_thread_reclaim`]）。期限切れで切り離した vCPU スレッドが最後の保持者として回収したときだけ、そのスレッドの記録が埋まる。
+/// 通常の `stop` では親のスレッドが回収するので、vCPU スレッドの記録は空のまま終わり、行は出ない。
+/// 同じ種類が複数回記録されたときは `Err` を優先し、最初の `Err` を残す。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ThreadReclaim {
+    /// このスレッドで実行した `hv_vm_unmap` の結果。
+    pub guest_ram: Option<Result<(), MicrovmErrorCode>>,
+    /// このスレッドで実行した `hv_vm_destroy` の結果。
+    pub vm: Option<Result<(), MicrovmErrorCode>>,
+}
+
+thread_local! {
+    static THREAD_RECLAIM: std::cell::Cell<ThreadReclaim> = const {
+        std::cell::Cell::new(ThreadReclaim { guest_ram: None, vm: None })
+    };
+}
+
+fn merge_result(
+    old: Option<Result<(), MicrovmErrorCode>>,
+    new: Result<(), MicrovmErrorCode>,
+) -> Option<Result<(), MicrovmErrorCode>> {
+    match old {
+        Some(Err(e)) => Some(Err(e)),
+        _ => Some(new),
+    }
+}
+
+/// 呼び出しスレッドで `hv_vm_unmap` を実行した結果を記録する（`sys::hvf::GuestMapping` の drop から。#4146）。
+/// スレッドローカルの破棄中は何も記録しない（drop の中で panic させない）。
+pub fn record_guest_ram_unmap(r: Result<(), MicrovmErrorCode>) {
+    let _ = THREAD_RECLAIM.try_with(|c| {
+        let mut v = c.get();
+        v.guest_ram = merge_result(v.guest_ram, r);
+        c.set(v);
+    });
+}
+
+/// 呼び出しスレッドで `hv_vm_destroy` を実行した結果を記録する（`sys::hvf::HvVm` の drop から。#4146）。
+pub fn record_vm_destroy(r: Result<(), MicrovmErrorCode>) {
+    let _ = THREAD_RECLAIM.try_with(|c| {
+        let mut v = c.get();
+        v.vm = merge_result(v.vm, r);
+        c.set(v);
+    });
+}
+
+/// 呼び出しスレッドの記録を取り出して空に戻す（`hvf_loop::spawn_loop` のスレッド本体から。#4146）。
+pub fn take_thread_reclaim() -> ThreadReclaim {
+    THREAD_RECLAIM
+        .try_with(|c| c.replace(ThreadReclaim::default()))
+        .unwrap_or_default()
+}
+
+/// 遅延回収の記録を 1 行にする（#4146・MVM-5・REPAIR-4）。記録が空なら `None`（行を出さない）。
+///
+/// 成功は `level=info op=hvf.deferred_reclaim outcome=ok thread=<name> released=guest_ram,vm`（実行した分だけ並べる）。
+/// 1 つでも失敗していれば `level=error ... outcome=error` で、成功した名前を `released=`、失敗した名前を `failed=`、最初の失敗の
+/// コードを `code=` に出す。名前の並びは常に `guest_ram`、`vm` の順。
+pub fn deferred_reclaim_line(thread: &str, r: ThreadReclaim) -> Option<String> {
+    if r.guest_ram.is_none() && r.vm.is_none() {
+        return None;
+    }
+    let mut released: Vec<&str> = Vec::new();
+    let mut failed: Vec<&str> = Vec::new();
+    let mut code: Option<MicrovmErrorCode> = None;
+    for (name, res) in [("guest_ram", r.guest_ram), ("vm", r.vm)] {
+        match res {
+            Some(Ok(())) => released.push(name),
+            Some(Err(e)) => {
+                failed.push(name);
+                code.get_or_insert(e);
+            }
+            None => {}
+        }
+    }
+    Some(match code {
+        None => format!(
+            "level=info op=hvf.deferred_reclaim outcome=ok thread={thread} released={}",
+            released.join(",")
+        ),
+        Some(c) => {
+            let rel = if released.is_empty() {
+                String::new()
+            } else {
+                format!(" released={}", released.join(","))
+            };
+            format!(
+                "level=error op=hvf.deferred_reclaim outcome=error thread={thread}{rel} failed={} code={}",
+                failed.join(","),
+                c.as_str()
+            )
+        }
+    })
 }
 
 /// teardown の開始を記録し、開始後の vCPU 作成を拒否するための印（TASK-192.16・#3798・MVM-5）。
@@ -488,6 +588,12 @@ mod tests {
         fn drop(&mut self) {
             if let Ok(mut v) = self.1.lock() {
                 v.push(self.0);
+            }
+            // 実際の drop で起きる解放の記録の模擬（`sys::hvf` の drop と同じ呼び出し。#4146）。
+            match self.0 {
+                "memory" => record_guest_ram_unmap(Ok(())),
+                "vm" => record_vm_destroy(Ok(())),
+                _ => {}
             }
         }
     }
@@ -664,6 +770,150 @@ mod tests {
         // 残りの clone を落としても増えない（中身は取り出し済み）。
         drop(ram);
         assert_eq!(snapshot(&log).len(), 5);
+    }
+
+    /// REPAIR-4・MVM-5・#4146: 遅延回収の行は固定語彙で、空なら出ない。
+    #[test]
+    fn repair4_mvm5_4146_deferred_reclaim_line_formats() {
+        let ok = Some(Ok(()));
+        let line = |g, v| {
+            deferred_reclaim_line(
+                "hvf-vcpu-0",
+                ThreadReclaim {
+                    guest_ram: g,
+                    vm: v,
+                },
+            )
+        };
+        assert_eq!(line(None, None), None);
+        assert_eq!(
+            line(ok, ok).as_deref(),
+            Some(
+                "level=info op=hvf.deferred_reclaim outcome=ok thread=hvf-vcpu-0 released=guest_ram,vm"
+            )
+        );
+        assert_eq!(
+            line(ok, None).as_deref(),
+            Some(
+                "level=info op=hvf.deferred_reclaim outcome=ok thread=hvf-vcpu-0 released=guest_ram"
+            )
+        );
+        assert_eq!(
+            line(None, ok).as_deref(),
+            Some("level=info op=hvf.deferred_reclaim outcome=ok thread=hvf-vcpu-0 released=vm")
+        );
+        assert_eq!(
+            line(ok, Some(Err(MicrovmErrorCode::Internal))).as_deref(),
+            Some(
+                "level=error op=hvf.deferred_reclaim outcome=error thread=hvf-vcpu-0 released=guest_ram failed=vm code=INTERNAL"
+            )
+        );
+        assert_eq!(
+            line(Some(Err(MicrovmErrorCode::Internal)), None).as_deref(),
+            Some(
+                "level=error op=hvf.deferred_reclaim outcome=error thread=hvf-vcpu-0 failed=guest_ram code=INTERNAL"
+            )
+        );
+    }
+
+    /// REPAIR-4・MVM-5・#4146: take は記録を空に戻し、同じ種類の記録は `Err` が残る。
+    #[test]
+    fn repair4_mvm5_4146_thread_reclaim_take_resets_and_prefers_err() {
+        let _ = take_thread_reclaim();
+        record_guest_ram_unmap(Ok(()));
+        record_guest_ram_unmap(Err(MicrovmErrorCode::Internal));
+        record_guest_ram_unmap(Ok(()));
+        record_vm_destroy(Ok(()));
+        assert_eq!(
+            take_thread_reclaim(),
+            ThreadReclaim {
+                guest_ram: Some(Err(MicrovmErrorCode::Internal)),
+                vm: Some(Ok(())),
+            }
+        );
+        assert_eq!(take_thread_reclaim(), ThreadReclaim::default());
+    }
+
+    /// MVM-5・REPAIR-4・#4146: 期限切れで切り離した vCPU スレッドが最後の保持者として回収したとき、そのスレッドの記録に
+    /// unmap と destroy の成功が残り、行になる。
+    #[test]
+    fn mvm5_repair4_4146_deferred_reclaim_recorded_on_vcpu_thread() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let ram = SharedRam::new(&log);
+        let vm = Arc::new(Rec("vm", Arc::clone(&log)));
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (rec_tx, rec_rx) = mpsc::channel::<ThreadReclaim>();
+        let (ram_t, vm_t, log_t) = (ram.clone(), Arc::clone(&vm), Arc::clone(&log));
+        let h = spawn_loop::<FakeKick, _>("hvf-test", LONG, move |start: LoopStart<FakeKick>| {
+            let _stop = start.ready(FakeKick);
+            let _ = release_rx.recv();
+            drop_vcpu_thread_state(Rec("handlers", log_t), ram_t, vm_t);
+            let _ = rec_tx.send(take_thread_reclaim());
+            (StopReason::Requested, HvRunStats::default())
+        })
+        .unwrap();
+        let r = Resources {
+            devices: Rec("devices", Arc::clone(&log)),
+            memory: ram,
+            vm,
+        };
+        let _ = take_thread_reclaim();
+        let e = stop_and_release("hvf.microvm.stop", h, Duration::from_millis(50), r).unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::DeadlineExceeded);
+        // 親のスレッドでは何も回収していない。
+        assert_eq!(take_thread_reclaim(), ThreadReclaim::default());
+        release_tx.send(()).unwrap();
+        let rec = rec_rx.recv_timeout(LONG).unwrap();
+        assert_eq!(
+            rec,
+            ThreadReclaim {
+                guest_ram: Some(Ok(())),
+                vm: Some(Ok(())),
+            }
+        );
+        assert_eq!(
+            deferred_reclaim_line("hvf-test", rec).as_deref(),
+            Some(
+                "level=info op=hvf.deferred_reclaim outcome=ok thread=hvf-test released=guest_ram,vm"
+            )
+        );
+    }
+
+    /// MVM-5・REPAIR-4・#4146: 通常の停止では vCPU スレッドの記録は空のままで（行が出ない）、回収は親のスレッドで起きる。
+    #[test]
+    fn mvm5_repair4_4146_normal_stop_records_nothing_on_vcpu_thread() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let ram = SharedRam::new(&log);
+        let vm = Arc::new(Rec("vm", Arc::clone(&log)));
+        let (ram_t, vm_t, log_t) = (ram.clone(), Arc::clone(&vm), Arc::clone(&log));
+        let (rec_tx, rec_rx) = mpsc::channel::<ThreadReclaim>();
+        let h = spawn_loop::<FakeKick, _>("hvf-test", LONG, move |start: LoopStart<FakeKick>| {
+            let stop = start.ready(FakeKick);
+            while !stop.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            drop_vcpu_thread_state(Rec("handlers", log_t), ram_t, vm_t);
+            let _ = rec_tx.send(take_thread_reclaim());
+            (StopReason::Requested, HvRunStats::default())
+        })
+        .unwrap();
+        let r = Resources {
+            devices: Rec("devices", Arc::clone(&log)),
+            memory: ram,
+            vm,
+        };
+        let _ = take_thread_reclaim();
+        stop_and_release("hvf.microvm.stop", h, LONG, r).unwrap();
+        let vcpu_side = rec_rx.recv_timeout(LONG).unwrap();
+        assert_eq!(vcpu_side, ThreadReclaim::default());
+        assert_eq!(deferred_reclaim_line("hvf-test", vcpu_side), None);
+        assert_eq!(
+            take_thread_reclaim(),
+            ThreadReclaim {
+                guest_ram: Some(Ok(())),
+                vm: Some(Ok(())),
+            }
+        );
     }
 
     /// 渡された期限いっぱいまで待ってから失敗するデバイス（別スレッドが dispatcher をロックし続けている状況の模擬）。

@@ -318,6 +318,15 @@ impl Drop for HvVm {
     fn drop(&mut self) {
         // SAFETY: 引数なし。`GuestMapping` が `&HvVm` を借用するか `Arc<HvVm>` を保持するため、対応付けが残った状態では到達しない。
         let rc = unsafe { hv_vm_destroy() };
+        // 実行したスレッドの結果を記録する。vCPU スレッドでの遅延回収なら `hvf_loop::spawn_loop` が行にする（#4146）。
+        let r = classify_hv_return(HvOp::VmDestroy, rc);
+        crate::hvf_lifecycle::record_vm_destroy(r.as_ref().map(|_| ()).map_err(|e| e.code()));
+        if let Err(e) = &r {
+            crate::hvf_loop::log_line(format_args!(
+                "level=error op=hvf.vm_destroy outcome=error code={}",
+                e.code().as_str()
+            ));
+        }
         // 失敗（例: HV_BUSY）ではプロセス内に VM が残るので、排他のフラグは true のままにする（fail-closed）。
         if rc == crate::hvf_abi::HV_SUCCESS {
             VM_EXISTS.store(false, Ordering::Release);
@@ -638,7 +647,15 @@ impl Drop for GuestMapping<'_> {
     fn drop(&mut self) {
         // 失敗時は backing をリークし、munmap しない（対応付けが残りうるため）。エラーは呼び出し元へ返せない（期限切れで
         // 切り離した vCPU スレッドが最後の `Arc` として落とす場合を含む。#4032）ため、リークしたことを 1 行だけ記録する。
-        if let Err(e) = self.release() {
+        let was_active = self.active;
+        let r = self.release();
+        if was_active {
+            // 明示の `unmap()` の後（active でない）は記録しない。遅延回収の行の材料（#4146）。
+            crate::hvf_lifecycle::record_guest_ram_unmap(
+                r.as_ref().map(|_| ()).map_err(|e| e.code()),
+            );
+        }
+        if let Err(e) = r {
             crate::hvf_loop::log_line(format_args!(
                 "level=error op=hvf.vm_unmap outcome=error code={} leaked=guest_ram",
                 e.code().as_str()

@@ -14,9 +14,9 @@
 //!    ハンドルで所有者・権限・ハードリンク数・digest を確かめて再利用する。それ以外はセッションのステージングへ
 //!    取得し（`open_staged_blob` の writer へ書いて `commit`。#2765）、`verify_staged_blob` で信頼条件と sha256 digest を検証する
 //! 7. config blob を開き（ステージングの blob は `PullSession::open_verified_staged_blob` が pull ディレクトリの
-//!    fd 起点で開いたハンドル。リース済みの既存 blob は symlink を辿らずパスで開く。#2893）、同じハンドルで信頼条件と
+//!    fd 起点で開いたハンドル。リース済みの既存 blob は `open_leased_blob` が検査済み root の fd 起点で開いたハンドル。#2893・#4179）、同じハンドルで信頼条件と
 //!    digest を確かめ、同じハンドルから上限つきで読んで `rootfs.diff_ids` を解析（`read_verified_config_file`）
-//! 8. 各 layer を `VerifiedLayerBlob`（検証済みハンドル。ステージングの blob は `from_file`、既存 blob は `open`）で開き直し、セッションのステージングの `unpack/` 配下の
+//! 8. 各 layer を `VerifiedLayerBlob`（検証済みハンドル。どちらも fd 起点のハンドルから `from_file`）で開き直し、セッションのステージングの `unpack/` 配下の
 //!    `rootfs/` へ `extract_image_layers_bounded` で展開しながら diff_id を突合（期限と取り消しをエントリ単位で確認。#2967・#2323・OCI-1・OCI-2）
 //! 9. 展開に成功したときだけ、組んだエントリ（`rootfs/` と展開設定の記録 `unpack-record`）を 1 回の `rename` で
 //!    `<cache_dir>/rootfs/sha256/<config-hex>/` へ公開する（記録の無い rootfs が残らない）。公開済みで、
@@ -62,7 +62,7 @@
 //! （他ユーザー所有・group / other 書き込み可のファイルや、別の場所からハードリンクされたファイルは、
 //! 検証後にも内容を変えられる）。そのため既存 blob は、次をすべて満たすときだけ再取得を省く。
 //!
-//! - パスの最終要素が symlink でない通常ファイルである（`open_blob_nofollow`。symlink は辿らない）
+//! - 検査済み root の fd 起点で開いた（`open_leased_blob`。途中の要素も最終要素も symlink を辿らない）通常ファイルである
 //! - 所有者が呼び出しプロセスと同じ（キャッシュのディレクトリ検証と同じ基準）
 //! - group / other の書き込み権限が無い
 //! - ハードリンク数が 1（キャッシュ外の名前から同じ inode を書き換えられない）
@@ -84,7 +84,7 @@
 //!   `extract_image_layers_bounded` だけを使う（#2309・#2323・#2967）。パスを受け取って開き直す旧入口
 //!   （`extract_layer_blob` / `extract_layer_blobs` 系）は、最終要素の symlink を辿り所有者・権限・ハードリンク数も
 //!   確かめないため #2535 で oci から廃止した
-//! - 各 layer は `ensure_blob`・`VerifiedLayerBlob::open`・展開のパス 1 とパス 3 で計 4 回読まれる（oci の契約に従った
+//! - 各 layer は `ensure_blob`・`VerifiedLayerBlob::from_file`・展開のパス 1 とパス 3 で計 4 回読まれる（oci の契約に従った
 //!   結果で、最適化していない）。開いておく fd の数は layer 数と同じで、oci の `MAX_LAYERS` が上限になる
 //! - 同一 UID の別プロセスと root による書き換えは対象外（キャッシュの所有者自身のため防げない）。所有者または
 //!   root が過去に権限を緩めていた間に他ユーザーが開いた書き込み用の記述子も、現在のメタデータからは検出できない
@@ -692,20 +692,12 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
                 let source = paths.get(&d.digest).ok_or_else(|| {
                     PullError::new(OciErrorCode::Internal, "image layer blob path is missing")
                 })?;
-                match source {
-                    // ステージングの blob は pull ディレクトリの fd 起点のハンドルから構築する（#2893）。
-                    BlobSource::Staged => {
-                        let file = session
-                            .open_verified_staged_blob(&d.digest)
-                            .map_err(|e| PullError::from_store(&e))?;
-                        VerifiedLayerBlob::from_file(file, &d.digest, d.size, blob_owner)
-                            .map_err(|e| PullError::from_extract(&e))
-                    }
-                    BlobSource::Cached(path) => {
-                        VerifiedLayerBlob::open(path, &d.digest, d.size, blob_owner)
-                            .map_err(|e| PullError::from_extract(&e))
-                    }
-                }
+                // どちらも検査済み root / pull ディレクトリの fd 起点のハンドルから構築する（#2893・#4179）。
+                let file = source
+                    .open(session, &d.digest)
+                    .map_err(|e| PullError::from_store(&e))?;
+                VerifiedLayerBlob::from_file(file, &d.digest, d.size, blob_owner)
+                    .map_err(|e| PullError::from_extract(&e))
             })
             .collect::<Result<Vec<_>, _>>()?;
         let refs: Vec<&VerifiedLayerBlob> = verified.iter().collect();
@@ -808,11 +800,17 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
             .lease_existing_blob(&descriptor.digest)
             .map_err(|e| PullError::from_store(&e))?
         {
-            let path = token.path().to_path_buf();
             // 不合格でも共有 blob はここでは消さない（一過性の読み出しエラーで検証済み blob を失わないため）。
-            // 取得・検証に成功した場合に限り、公開が置き換える。
-            if inspect_cached_blob(&path, &descriptor.digest, descriptor.size, blob_owner).is_ok() {
-                return Ok(BlobSource::Cached(path));
+            // 取得・検証に成功した場合に限り、公開が置き換える。開くのは検査済み root の fd 起点（#4179）。
+            if inspect_cached_blob(
+                session.open_leased_blob(token.digest()),
+                &descriptor.digest,
+                descriptor.size,
+                blob_owner,
+            )
+            .is_ok()
+            {
+                return Ok(BlobSource::Leased);
             }
             session
                 .release_leased(token)
@@ -907,25 +905,15 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
         let config_source = paths.get(&manifest.config.digest).ok_or_else(|| {
             PullError::new(OciErrorCode::Internal, "image config blob path is missing")
         })?;
-        let rootfs_cfg = match config_source {
-            BlobSource::Staged => {
-                let file = session
-                    .open_verified_staged_blob(&manifest.config.digest)
-                    .map_err(|e| PullError::from_store(&e))?;
-                read_verified_config_file(
-                    file,
-                    &manifest.config,
-                    blobs.owner,
-                    self.config.max_config_bytes,
-                )?
-            }
-            BlobSource::Cached(path) => read_verified_config(
-                path,
-                &manifest.config,
-                blobs.owner,
-                self.config.max_config_bytes,
-            )?,
-        };
+        let config_file = config_source
+            .open(session, &manifest.config.digest)
+            .map_err(|e| PullError::from_store(&e))?;
+        let rootfs_cfg = read_verified_config_file(
+            config_file,
+            &manifest.config,
+            blobs.owner,
+            self.config.max_config_bytes,
+        )?;
         self.ensure_rootfs(session, &paths, blobs.owner, manifest, &rootfs_cfg, budget)?;
         budget.check()?;
         ManifestComposition::new(
@@ -1014,9 +1002,19 @@ enum BlobSource {
     /// このセッションのステージングで検証済み。読むときに `PullSession::open_verified_staged_blob` で
     /// pull ディレクトリの fd 起点に開く。
     Staged,
-    /// リース済みの既存 blob（`blobs/sha256/<hex>`）。従来どおりパスを `open_blob_nofollow` で開く
-    /// （fd 起点化は #2893 の対象外）。
-    Cached(PathBuf),
+    /// リース済みの既存 blob（`blobs/sha256/<hex>`）。読むときに `PullSession::open_leased_blob` で
+    /// 検査済み root の fd 起点に開く（#4179）。
+    Leased,
+}
+
+impl BlobSource {
+    /// blob を fd 起点で開く唯一の入口（config の読み取りと layer の検証が使う。パス文字列は使わない）。
+    fn open(&self, session: &PullSession<'_>, digest: &Digest) -> Result<File, OciError> {
+        match self {
+            Self::Staged => session.open_verified_staged_blob(digest),
+            Self::Leased => session.open_leased_blob(digest),
+        }
+    }
 }
 
 /// 1 回の pull の間で共有する借用（引数の数を抑える）。
@@ -1307,12 +1305,12 @@ enum CachedBlobRejection {
 /// 計算して descriptor の `digest`・`size` と突合する。確認と読み取りの間でパスを再解決しないため、
 /// 確認したファイルと検証したファイルは同一である。ファイルは変更も削除もしない。
 fn inspect_cached_blob(
-    path: &Path,
+    opened: Result<File, OciError>,
     digest: &Digest,
     size: u64,
     owner: u32,
 ) -> Result<(), CachedBlobRejection> {
-    let file = open_blob_nofollow(path).map_err(|_| CachedBlobRejection::Unopenable)?;
+    let file = opened.map_err(|_| CachedBlobRejection::Unopenable)?;
     let facts = BlobFileFacts::from_file(&file).ok_or(CachedBlobRejection::Unverifiable)?;
     check_blob_trust(&facts, owner).map_err(CachedBlobRejection::Untrusted)?;
     // サイズは読み取り上限ではなく宣言値との完全一致で確認する（短い blob の誤受理を防ぐ。OCI-1）。
@@ -1325,22 +1323,13 @@ fn inspect_cached_blob(
 /// config blob を信頼条件の確認つきで 1 回だけ読み、読んだ本文そのもののハッシュを digest と照合してから
 /// rootfs 部だけ解析する（#2323・#2534・OCI-1）。
 ///
-/// 手順: symlink を辿らず開く → 同じハンドルで所有者・権限・ハードリンク数を確認 → 同じハンドルを先頭から上限つきで
+/// 手順: 呼び出し側が fd 起点で開いたハンドルを受け → 同じハンドルで所有者・権限・ハードリンク数を確認 → 同じハンドルを先頭から上限つきで
 /// 1 回だけ読む → 長さと [`verify_bytes_digest`] で本文を照合 → `parse_image_config_rootfs`。ハッシュ計算と解析の
 /// 読み取りを分けない（別々に読むと、その間に同じ inode を書き換えられて、検証していない `rootfs.diff_ids` を
 /// 解析しうる。#2309 でレイヤーに対して塞いだのと同じ型の穴）。パスは開き直さない。上限は `max_bytes` と oci の
 /// `MAX_CONFIG_BYTES` の小さい方で、`max_bytes` を大きくしても oci 側の 1 MiB で拒否される（fail-closed）。
-fn read_verified_config(
-    path: &Path,
-    descriptor: &Descriptor,
-    owner: u32,
-    max_bytes: u64,
-) -> Result<ImageRootFs, PullError> {
-    read_verified_config_inner(path, descriptor, owner, max_bytes, &|| {})
-}
-
-/// [`read_verified_config`] のハンドル版。`PullSession::open_verified_staged_blob` が fd 起点で開いたハンドルを受け、
-/// 開く手順以外（信頼条件の確認・上限つきの 1 回読み・digest 照合・解析）は同じ（#2893）。
+/// [`read_verified_config_file_inner`] の入口。`PullSession::open_verified_staged_blob` / `open_leased_blob` が
+/// fd 起点で開いたハンドルを受け、開く手順以外（信頼条件の確認・上限つきの 1 回読み・digest 照合・解析）を行う（#2893・#4179）。
 fn read_verified_config_file(
     file: File,
     descriptor: &Descriptor,
@@ -1350,20 +1339,8 @@ fn read_verified_config_file(
     read_verified_config_file_inner(file, descriptor, owner, max_bytes, &|| {})
 }
 
-/// [`read_verified_config`] の本体。`before_body_read` は信頼確認の後・本文を読む直前に呼ばれる試験用の差し込み口
-/// （本番は空。確認後に同じ inode を書き換える競合を再現する。oci の `open_blob_nofollow_inner` と同じ形）。
-fn read_verified_config_inner(
-    path: &Path,
-    descriptor: &Descriptor,
-    owner: u32,
-    max_bytes: u64,
-    before_body_read: &dyn Fn(),
-) -> Result<ImageRootFs, PullError> {
-    let file = open_blob_nofollow(path).map_err(|e| PullError::from_config(&e))?;
-    read_verified_config_file_inner(file, descriptor, owner, max_bytes, before_body_read)
-}
-
-/// [`read_verified_config_file`] の本体（開いたハンドルから読む部分。path 版も開いた後はここへ委ねる）。
+/// [`read_verified_config_file`] の本体。`before_body_read` は信頼確認の後・本文を読む直前に呼ばれる試験用の差し込み口
+/// （本番は空。確認後に同じ inode を書き換える競合を再現する）。
 fn read_verified_config_file_inner(
     mut file: File,
     descriptor: &Descriptor,
@@ -2376,9 +2353,15 @@ mod blob_trust_fs_tests {
     fn sec_cached_blob_is_reusable_when_trusted_and_verified() {
         let dir = TempDir::new("ok");
         let (path, uid) = blob_with_mode(&dir, "blob", 0o600);
-        assert_eq!(inspect_cached_blob(&path, &abc(), 3, uid), Ok(()));
+        assert_eq!(
+            inspect_cached_blob(open_blob_nofollow(&path), &abc(), 3, uid),
+            Ok(())
+        );
         let (readable, _) = blob_with_mode(&dir, "readable", 0o644);
-        assert_eq!(inspect_cached_blob(&readable, &abc(), 3, uid), Ok(()));
+        assert_eq!(
+            inspect_cached_blob(open_blob_nofollow(&readable), &abc(), 3, uid),
+            Ok(())
+        );
         assert_eq!(mode_of(&readable), 0o644);
         assert_eq!(fs::read(&path).expect("read"), b"abc");
     }
@@ -2390,7 +2373,7 @@ mod blob_trust_fs_tests {
         let (path, uid) = blob_with_mode(&dir, "blob", 0o600);
         let other = uid.wrapping_add(1);
         assert_eq!(
-            inspect_cached_blob(&path, &abc(), 3, other),
+            inspect_cached_blob(open_blob_nofollow(&path), &abc(), 3, other),
             Err(CachedBlobRejection::Untrusted(
                 BlobTrustViolation::UnexpectedOwner
             ))
@@ -2404,7 +2387,7 @@ mod blob_trust_fs_tests {
         for mode in [0o620, 0o602, 0o664, 0o666] {
             let (path, uid) = blob_with_mode(&dir, &format!("blob-{mode:o}"), mode);
             assert_eq!(
-                inspect_cached_blob(&path, &abc(), 3, uid),
+                inspect_cached_blob(open_blob_nofollow(&path), &abc(), 3, uid),
                 Err(CachedBlobRejection::Untrusted(
                     BlobTrustViolation::WritableByOthers
                 )),
@@ -2422,14 +2405,17 @@ mod blob_trust_fs_tests {
         fs::hard_link(&path, dir.0.join("alias")).expect("link");
         assert_eq!(fs::metadata(&path).expect("stat").nlink(), 2);
         assert_eq!(
-            inspect_cached_blob(&path, &abc(), 3, uid),
+            inspect_cached_blob(open_blob_nofollow(&path), &abc(), 3, uid),
             Err(CachedBlobRejection::Untrusted(
                 BlobTrustViolation::UnexpectedLinkCount
             ))
         );
         // リンクを外せば（リンク数 1）再利用できる。
         fs::remove_file(dir.0.join("alias")).expect("unlink");
-        assert_eq!(inspect_cached_blob(&path, &abc(), 3, uid), Ok(()));
+        assert_eq!(
+            inspect_cached_blob(open_blob_nofollow(&path), &abc(), 3, uid),
+            Ok(())
+        );
     }
 
     /// OCI-1・SEC: symlink（先が信頼条件を満たす正しい blob でも）・ディレクトリ・未存在は開かずに再利用しない。
@@ -2440,15 +2426,15 @@ mod blob_trust_fs_tests {
         let link = dir.0.join("link");
         std::os::unix::fs::symlink(&target, &link).expect("symlink");
         assert_eq!(
-            inspect_cached_blob(&link, &abc(), 3, uid),
+            inspect_cached_blob(open_blob_nofollow(&link), &abc(), 3, uid),
             Err(CachedBlobRejection::Unopenable)
         );
         assert_eq!(
-            inspect_cached_blob(&dir.0, &abc(), 3, uid),
+            inspect_cached_blob(open_blob_nofollow(&dir.0), &abc(), 3, uid),
             Err(CachedBlobRejection::Unopenable)
         );
         assert_eq!(
-            inspect_cached_blob(&dir.0.join("missing"), &abc(), 3, uid),
+            inspect_cached_blob(open_blob_nofollow(&dir.0.join("missing")), &abc(), 3, uid),
             Err(CachedBlobRejection::Unopenable)
         );
     }
@@ -2460,17 +2446,17 @@ mod blob_trust_fs_tests {
         let (path, uid) = blob_with_mode(&dir, "blob", 0o600);
         // 宣言サイズが実サイズより大きい（読み取り上限としては通るが完全一致しない）。
         assert_eq!(
-            inspect_cached_blob(&path, &abc(), 5, uid),
+            inspect_cached_blob(open_blob_nofollow(&path), &abc(), 5, uid),
             Err(CachedBlobRejection::ContentMismatch)
         );
         // 宣言サイズが実サイズより小さい。
         assert_eq!(
-            inspect_cached_blob(&path, &abc(), 2, uid),
+            inspect_cached_blob(open_blob_nofollow(&path), &abc(), 2, uid),
             Err(CachedBlobRejection::ContentMismatch)
         );
         fs::write(&path, b"xyz").expect("corrupt");
         assert_eq!(
-            inspect_cached_blob(&path, &abc(), 3, uid),
+            inspect_cached_blob(open_blob_nofollow(&path), &abc(), 3, uid),
             Err(CachedBlobRejection::ContentMismatch)
         );
     }
@@ -2508,8 +2494,13 @@ mod blob_trust_fs_tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod");
         let uid = fs::metadata(&path).expect("stat").uid();
         let descriptor = config_descriptor(CONFIG_A_SHA256, 115);
-        let root = read_verified_config(&path, &descriptor, uid, DEFAULT_MAX_CONFIG_BYTES)
-            .expect("config");
+        let root = read_verified_config_file(
+            open_blob_nofollow(&path).expect("open"),
+            &descriptor,
+            uid,
+            DEFAULT_MAX_CONFIG_BYTES,
+        )
+        .expect("config");
         let ids: Vec<&str> = root.diff_ids().iter().map(Digest::as_str).collect();
         assert_eq!(ids, [format!("sha256:{}", "a".repeat(64))]);
     }
@@ -2580,9 +2571,14 @@ mod blob_trust_fs_tests {
             f.write_all(&config_body('b')).expect("rewrite");
             assert_eq!(fs::metadata(&path).expect("stat").ino(), ino);
         };
-        let err =
-            read_verified_config_inner(&path, &descriptor, uid, DEFAULT_MAX_CONFIG_BYTES, &rewrite)
-                .expect_err("rewritten config must be rejected");
+        let err = read_verified_config_file_inner(
+            open_blob_nofollow(&path).expect("open"),
+            &descriptor,
+            uid,
+            DEFAULT_MAX_CONFIG_BYTES,
+            &rewrite,
+        )
+        .expect_err("rewritten config must be rejected");
         assert_eq!(
             err,
             PullError::new(OciErrorCode::DataLoss, "image config failed validation")
@@ -2598,8 +2594,13 @@ mod blob_trust_fs_tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod");
         let uid = fs::metadata(&path).expect("stat").uid();
         let descriptor = config_descriptor(CONFIG_A_SHA256, 114);
-        let err = read_verified_config(&path, &descriptor, uid, DEFAULT_MAX_CONFIG_BYTES)
-            .expect_err("length mismatch");
+        let err = read_verified_config_file(
+            open_blob_nofollow(&path).expect("open"),
+            &descriptor,
+            uid,
+            DEFAULT_MAX_CONFIG_BYTES,
+        )
+        .expect_err("length mismatch");
         assert_eq!(
             err,
             PullError::new(OciErrorCode::DataLoss, "image config failed validation")
@@ -2693,7 +2694,7 @@ mod non_unix_tests {
         )
         .expect("digest");
         assert_eq!(
-            inspect_cached_blob(&path, &digest, 3, 0),
+            inspect_cached_blob(open_blob_nofollow(&path), &digest, 3, 0),
             Err(CachedBlobRejection::Unopenable)
         );
         let file = fs::File::open(&path).expect("open");

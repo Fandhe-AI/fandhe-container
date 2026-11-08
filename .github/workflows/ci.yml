@@ -2333,7 +2333,8 @@ jobs:
       # CRI の Exec 用 stream-exec helper の本番の経路（制御チャネルの kind 6 / 7 → 実コマンド）を rootless の稼働中コンテナで通す。
       # 試験自身が `systemd-run --user --scope` で `--scenario` を起動するため、試験バイナリは外側を包まず scope を作らない補助で
       # 期限だけ持つ。helper は試験バイナリ自身の再実行のため supervisor の bin は要らない。範囲写像は使わない。
-      # 新しいジョブ・check-run・sudo・permissions は増やさない。
+      # 新しいジョブ・check-run・sudo・permissions は増やさない。成功行は 6 行（#4167 で requester_killed を追加: 要求元を SIGKILL して
+      # helper が 2 秒以内に終わり、exec のコマンドが残らないこと。経過 ms・カーネル版は情報行 `stream_exec_real: info` で出る）。
       - name: stream_exec_real のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
@@ -2361,7 +2362,7 @@ jobs:
             "${SER_BIN}" --ignored
           scripts/check-success-lines.sh --name stream_exec_real \
             --src crates/supervisor/tests/stream_exec_real.rs --log "${log}" \
-            --select '^stream_exec_real: (scenario=|real stream-exec helper ran)' --min 5 \
+            --select '^stream_exec_real: (scenario=|real stream-exec helper ran)' --min 6 \
             --forbid 'stream_exec_real: ignored' --forbid 'not verified' --forbid 'not applicable' \
             --forbid 'skipped' --forbid 'FAILED' --forbid 'PRECONDITION FAILED' --forbid 'root=true' --summary
 
@@ -2800,6 +2801,8 @@ jobs:
       # CRI-6・SEC-1・REPAIR-12・#3762）: 本番バイナリ越しに実コンテナ（busybox）へ Exec を通し、echo・exit 3 の
       # 具体値と、exec のプロセスの CapEff・Seccomp がコンテナの init を超えないことを照合する。前提・launcher 回避・
       # 成功行の照合は container_grpc と同じ。新しいジョブ・check-run・sudo は追加しない。
+      # 段 4（#4167）: 終わらない exec を開いたまま plugin-cri を SIGKILL し、helper が 2 秒以内に終わり exec のコマンドが残らないことを照合する。
+      # 後始末は再起動した plugin-cri が記録を再採用して行う（関数・pull は増えないため事前プローブの最低残量は変わらない）。
       # - 期限: 試験の watchdog 480 秒 < 補助 540 秒（= timeout-minutes 10 × 60 - 60）< ステップ 10 分。
       # - 代償: このステップはジョブの最後にあり、ubuntu のジョブ上限は 35 分（#3505）。ハング時は watchdog の行が
       #   残らずジョブ上限で取り消されることがある。ジョブ上限は変えない。

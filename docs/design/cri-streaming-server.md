@@ -231,7 +231,7 @@ helper を supervisor の bin に置く理由は、exec の領域（healthcheck 
 - **tty は本番で fail-closed**: helper に `--tty` が無く、supervisor の `ExecStdio` に pty が無い。`ExecStreamHandler::without_tty` で RPC 時に `INVALID_ARGUMENT`（「exec with tty is not supported」）とし、launcher も二重に断る。受け側（`PtyMaster::from_received` による検証・resize の `TIOCSWINSZ` 転送・pty と tokio の橋渡し）は偽の helper で試験済みで、supervisor 側の結線（後続 issue）が入れば能力フラグ `HelperCapabilities.tty` を true にするだけで有効にできる。`WindowSize` の 0 行・0 列はそのまま渡す
 - **stdio の fd 種別（SUP-6・SEC-1）**: helper は受け取った stdin・stdout・stderr が AF_UNIX の socket か FIFO のときだけ受け、通常ファイル・ディレクトリ・文字デバイス（tty・pty・`/dev/null` を含む）・ブロックデバイスは exec も kind 7 の通知もせず `InvalidArgument`（`require_stdio_kinds`）。ホストの端末 fd をコンテナのコマンドへ渡して境界を越えさせないため
 - 期限: helper の `--timeout-ms` は supervisor の上限 `MAX_EXEC_HOLD_SECS`（1 時間）なので、exec のセッションは最長 1 時間で止まる（kubelet の idle 4 時間より短い。#4116 の確認事項）。`Started` までは 25 秒（cri の `launch_timeout` 30 秒より短い）、stdio の受け渡しは 5 秒、kill 後の回収は 10 秒（`REAP_BUDGET`）で、回収できなければ保持一覧（上限 8）に入れる
-- 停止: ドレインの期限（シグナルから 5 秒）で `stop_streaming_on` の `on_stop` が `shutdown_all` を呼び、追跡中の helper を kill する（「停止時のセッションの扱い」）。plugin-cri が SIGKILL された場合は helper が期限まで残る（PDEATHSIG を使わない設計の残余）。検知の方式は下の「要求元の異常終了の検知」で選定済み（実装は #4166、実機の照合は #4167。実装までは残余のまま）
+- 停止: ドレインの期限（シグナルから 5 秒）で `stop_streaming_on` の `on_stop` が `shutdown_all` を呼び、追跡中の helper を kill する（「停止時のセッションの扱い」）。plugin-cri が SIGKILL された場合も、helper が fd 0 の切断を検知して通常 2 秒以内に終わる（下の「要求元の異常終了の検知」。実装は #4166、実機の照合は #4167 の `stream_exec_real` の `requester_killed` と `production_binary_exec_real` の段 4）。残る窓は listener の受け渡し前・通知処理中の最大 5 秒の遅れ・channel の端の漏れ
 - helper の fd 1 は `/dev/null`。fd 2 は AF_UNIX の socketpair で受け、固定語彙の構造化ログへ転送する（下の「helper の fd 2 の診断の転送」。#4171）。結果は `Result` frame の固定語彙で返る
 - 終了コード: `Exited(n)`→n、`Signaled(s)`→128+s、`NotStarted`→子の終了状態、`Failed(code)`→コード別の固定英文の `CriError`
 
@@ -248,7 +248,7 @@ helper を supervisor の bin に置く理由は、exec の領域（healthcheck 
 
 #### 要求元の異常終了の検知（#4165・#4112・SUP-6・SEC-1・REPAIR-5）
 
-plugin-cri が helper を kill せずに異常終了（SIGKILL 等）すると、単一スレッドの helper は exec の間 fd 0（plugin-cri との channel）を見ていないため、helper とコンテナ内のコマンドは exec の期限（`--timeout-ms`。上限 `MAX_EXEC_HOLD_SECS` 3600 秒）まで、kind 7 のガードは期限 + `hold_grace`（30 秒）まで残る。本節は検知の方式を選定する（設計のみ。実装は #4166、実機の照合は #4167）。
+plugin-cri が helper を kill せずに異常終了（SIGKILL 等）すると、単一スレッドの helper は exec の間 fd 0（plugin-cri との channel）を見ていないため、helper とコンテナ内のコマンドは exec の期限（`--timeout-ms`。上限 `MAX_EXEC_HOLD_SECS` 3600 秒）まで、kind 7 のガードは期限 + `hold_grace`（30 秒）まで残る。本節は検知の方式を選定する（設計。実装は #4166、実機の照合は #4167 で済み）。
 
 **前提（origin/main で確認した事実）**:
 
@@ -473,7 +473,7 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 | PortForward の dial / 対の揃い / 書き込みの stall | 10 秒 / 30 秒 / 30 秒 |
 | `StreamingServer` の SIGTERM での停止 | 受信の検知（100 ms 周期）で待ち受けを閉じる（待ちなし。#3754）。受け付け済みのセッションはシグナルから 5 秒（`STREAMING_DRAIN_WAIT`）ドレインし、期限で exec を止めて 1 秒（`STREAMING_CLOSE_WAIT`）待ち、残りを強制クローズする。gRPC の猶予 10 秒以内に収まり、全体の上限 13.7 秒は不変（#4164。暫定値で #4116 の対象） |
 | helper の fd 2 の読み手（#4171） | 読み取りの刻み 100 ms / 停止後の drain 50 ms / 終了時の待ち 500 ms / 絶対期限 25 秒 + 3600 秒 + 30 秒 |
-| 要求元の切断の検知（helper の serve の刻み）/ 検知から helper の終了まで | 20 ms / 合否値 2 秒（通知処理のない通常ケース。遅延・回収失敗ケースは検知最大 5 秒・回収込み 約 15 秒。期限と `hold_grace` は不変）。#4165。未実装（#4166） |
+| 要求元の切断の検知（helper の serve の刻み）/ 検知から helper の終了まで | 20 ms / 合否値 2 秒（通知処理のない通常ケース。遅延・回収失敗ケースは検知最大 5 秒・回収込み 約 15 秒。期限と `hold_grace` は不変）。#4165。実装済み（#4166）。実機前提試験は `stream_exec_real` の `requester_killed` と `production_binary_exec_real` の段 4（#4167） |
 
 ### 実装単位と兄弟 issue の対応
 
@@ -494,8 +494,8 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 | #3765 | 完全版 attach（A1 を本命として設計と分解） | 設計済み。子 issue は「完全版 Attach の設計（#3765）」を参照 |
 | #3766 | POD の port-forward の設計と分解 | — |
 | #4165 | 要求元の異常終了の検知方式の選定 | 設計済み（Exec 節の「要求元の異常終了の検知」） |
-| #4166 | 検知の実装（sys の `poll`・`ExecLaunchIo` の取り消し口・helper） | 未実装 |
-| #4167 | 検知の実機前提試験 | 未実装 |
+| #4166 | 検知の実装（sys の `poll`・`ExecLaunchIo` の取り消し口・helper） | 実装済み |
+| #4167 | 検知の実機前提試験 | 実装済み（`stream_exec_real` の `requester_killed`・`production_binary_exec_real` の段 4） |
 
 ### 未確認・オーナー確認事項
 
@@ -519,7 +519,7 @@ CRI の `ExecSync`（現状 `UNIMPLEMENTED`）も本設計の helper を再利�
 - Exec の tty（supervisor 側の pty 結線と helper の `--tty`。受け側は実装・試験済み）: 追跡 issue 未起票（親 #3726 の残り）。本番は RPC 時に `INVALID_ARGUMENT`
 - Exec の相対 argv[0]（PATH 解決）: #2439 の判断待ち。RPC 時に `INVALID_ARGUMENT`
 - Exec の実機前提試験: #3762。完全版 Attach の実機前提試験は #4079（`production_binary_attach_real`）で実装済み
-- Exec の残余: plugin-cri の異常終了時の helper の早期停止（#4112）（`PtyMaster` の fd 検証は #4100 で解消）
+- Exec の残余: plugin-cri の異常終了時の helper の早期停止は #4112（#4166・#4167）で解消。残る窓は listener の受け渡し前・通知処理中の最大 5 秒の遅れ・channel の端の漏れだけ（`PtyMaster` の fd 検証は #4100 で解消）
 - Exec の残余（診断）: helper の fd 2 へ段名と errno を出す生成側が無い（supervisor・core・転送側の分類語彙。#4172 で現状を試験に固定済み。生成側は後続 issue）
 - Attach の残余: 入力の書き込みは全セッション共通の排他（`WRITE_ARBITER`）で調停する。plugin 外の書き手が空きを使い切ると保持者は `write` で止まり、その間は全セッション・全コンテナの入力が進まない。他のセッションの排他の待ちは取り消しで抜け、スレッド・fd・枠を返す（#4134・CRI-6・REPAIR-5）
 - 暫定値・設計の確認事項（exec の全体上限・同時セッション数・`::1`・終了コード・観測名など）: 上の「未確認・オーナー確認事項」と #4116（オーナー判断）
@@ -572,7 +572,7 @@ CRI の `ExecSync`（現状 `UNIMPLEMENTED`）も本設計の helper を再利�
 
 - シグナルの受信からドレインの期限までは、受け付け済みで launch 前の exec が launch できる。期限の `shutdown_all` で止まり、停止直前に始めた exec と同じ扱いになる
 - abort されたセッションは `record_session` や observer の記録を通らない。件数は停止の 1 行に出る
-- plugin-cri が SIGKILL された場合は、従来どおり helper が期限まで残る（#4112）
+- plugin-cri が SIGKILL された場合は、helper が channel の切断を検知して通常 2 秒以内に終わる（#4112。実機照合は #4167）。残る窓は上記の Exec の残余
 - 実行中の blocking の dial は abort できず、ランタイムの `shutdown_timeout` が打ち切る
 
 ### 試験

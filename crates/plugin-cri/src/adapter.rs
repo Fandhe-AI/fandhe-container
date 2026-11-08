@@ -1505,7 +1505,7 @@ impl ContainerRuntime for CoreLifecycleRuntime {
     #[cfg(target_os = "linux")]
     fn start(&self, req: &StartRequest) -> Result<ContainerStatus, TraitError> {
         self.supervised
-            .start(&*self.store, req.id(), req.log_path())
+            .start(&*self.store, req.id(), req.log_path(), req.stdin())
     }
 
     #[cfg(not(target_os = "linux"))]

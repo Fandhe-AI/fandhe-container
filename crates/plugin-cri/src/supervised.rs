@@ -9,6 +9,7 @@
 //! - `start`: supervisor を `systemd-run --user --scope` で起動し、結果の 1 行を期限つきで受ける（期限は CLI と同じ
 //!   `start_contract::cli_receive_deadline`。REPAIR-5）。報告された pid を状態ストアの記録と照合し、Running で pid が
 //!   一致するか、直後に終了して Stopped が記録済みのときだけ成功とする。それ以外は `INTERNAL` で fail-closed。
+//!   `StartRequest::stdin` が `Open` / `Once` なら supervisor の argv に `--stdin open|once` を載せる（CRI-6・#4076）。
 //! - `kill`: 意図なしの `ProcessSignaler` で core の `oci_runtime::kill` を呼ぶ（終了は待たない）。
 //! - `stop`: `StopRequest::signal`（既定 SIGTERM。CRI の stop_signal。#2668）を stop の意図つきで送り（SUP-9。supervisor が意図を記録してから届けるので、`always` /
 //!   `on-failure` / `unless-stopped` でも再起動されない）、`grace` まで Stopped への遷移を状態ストアで待ち、超えたら
@@ -59,7 +60,7 @@ use fandhe_container_core::state_store::STATE_LOCK_TIMEOUT;
 use fandhe_container_core::traits::WaitExitRequest;
 use fandhe_container_core::traits::{
     ContainerId, ContainerLogPath, ContainerState, ContainerStatus, ErrorCode, GetStateRequest,
-    KillRequest, Signal, StateStore, StopRequest, TraitError,
+    KillRequest, Signal, StateStore, StdinMode, StopRequest, TraitError,
 };
 use fandhe_container_supervisor::control::protocol::MAX_EXIT_WATCH_HOLD;
 use fandhe_container_supervisor::control::{
@@ -67,8 +68,9 @@ use fandhe_container_supervisor::control::{
     production_stop_signaler,
 };
 use fandhe_container_supervisor::start_client::{
-    SupervisorLaunch, production_deadline, start_with_cri_log,
+    StartOptions, SupervisorLaunch, production_deadline, start_with_options,
 };
+use fandhe_container_supervisor::start_contract::StdinOption;
 
 /// 追跡する supervisor の子プロセスの上限。超えたら（回収しても空きが無ければ）新しい起動を拒否する（無制限の蓄積を防ぐ）。
 pub const MAX_TRACKED_SUPERVISORS: usize = 1024;
@@ -106,11 +108,12 @@ pub const MSG_STOP_DEADLINE: &str = "container did not stop within the deadline"
 pub trait SupervisorStarter: Send + Sync {
     /// `root`（状態ルートの絶対パス）の `id` を起動し、pid か構造化エラーを期限つきで受け取る。
     ///
-    /// `log_path` は CRI ログの書き先（supervisor の `--cri-log-path`。CRI-2・SUP-4・#2671）。`None` は従来どおり。
+    /// `opts` は argv の任意項目（CRI ログの書き先 `--cri-log-path`〔CRI-2・SUP-4・#2671〕と stdin の `--stdin`
+    /// 〔CRI-6・SUP-7・#4076〕）。未指定の項目は従来どおり。
     fn start(
         &self,
         root: &Path,
-        log_path: Option<&ContainerLogPath>,
+        opts: &StartOptions<'_>,
         id: &ContainerId,
     ) -> (Result<NonZeroU32, OciRuntimeError>, Option<Child>);
 }
@@ -124,7 +127,7 @@ impl SupervisorStarter for ProductionStarter {
     fn start(
         &self,
         root: &Path,
-        log_path: Option<&ContainerLogPath>,
+        opts: &StartOptions<'_>,
         id: &ContainerId,
     ) -> (Result<NonZeroU32, OciRuntimeError>, Option<Child>) {
         let exe = match std::env::current_exe() {
@@ -141,7 +144,7 @@ impl SupervisorStarter for ProductionStarter {
             }
         };
         match SupervisorLaunch::resolve_beside(&exe) {
-            Ok(launch) => start_with_cri_log(&launch, root, log_path, id, production_deadline()),
+            Ok(launch) => start_with_options(&launch, root, opts, id, production_deadline()),
             Err(e) => (Err(e), None),
         }
     }
@@ -167,10 +170,10 @@ impl SupervisorStarter for FixedLaunchStarter {
     fn start(
         &self,
         root: &Path,
-        log_path: Option<&ContainerLogPath>,
+        opts: &StartOptions<'_>,
         id: &ContainerId,
     ) -> (Result<NonZeroU32, OciRuntimeError>, Option<Child>) {
-        start_with_cri_log(&self.launch, root, log_path, id, self.within)
+        start_with_options(&self.launch, root, opts, id, self.within)
     }
 }
 
@@ -363,12 +366,21 @@ impl SupervisedLifecycle {
     ///
     /// `log_path` は CRI ログの書き先（`StartRequest::log_path`。CRI-2・SUP-4・#2671）。supervisor へ `--cri-log-path` で渡し、
     /// supervisor が再検証して CRI 形式で追記する（特権ランチャー経由では supervisor が拒否する）。
+    ///
+    /// `stdin` は `StartRequest::stdin`（cri が記録から導く。tty のコンテナは `Closed`）。`Open` / `Once` は supervisor の
+    /// `--stdin open|once` へ写す（CRI-6・SUP-7・#4076）。写せない値は supervisor を起動する前に拒否する。
     pub fn start(
         &self,
         store: &dyn StateStore,
         id: &ContainerId,
         log_path: Option<&ContainerLogPath>,
+        stdin: StdinMode,
     ) -> Result<ContainerStatus, TraitError> {
+        // 追跡枠の予約より前に対応づける。失敗したら何も起動しない。
+        let stdin = stdin_option(stdin)?;
+        let opts = StartOptions::new()
+            .with_cri_log_path(log_path)
+            .with_stdin(stdin);
         self.reap();
         let Some(root) = store.host_state_root() else {
             return Err(TraitError::new(
@@ -387,7 +399,7 @@ impl SupervisedLifecycle {
             }
             self.reserved.fetch_add(1, Ordering::SeqCst);
         }
-        let (result, child) = self.starter.start(root, log_path, id);
+        let (result, child) = self.starter.start(root, &opts, id);
         {
             // 予約を解放し、Child を得たなら同じロックの下で追跡枠へ移す。
             let mut children = self.lock_children();
@@ -543,6 +555,23 @@ impl StopBudget {
             }
             _ => Ok(()),
         }
+    }
+}
+
+/// core の `StdinMode` を supervisor の `--stdin` の値へ写す（CRI-6・SUP-7・#4076）。
+///
+/// cri は supervisor に依存しない（依存の向きは PLUG-1 のまま）ため、対応づけは plugin-cri が持つ。`StdinMode` は
+/// `#[non_exhaustive]` で、未知の値を黙って `None`（`/dev/null`）に倒すと要求より弱いコンテナができるため、
+/// spawn の前に `Unimplemented` で断る（fail-closed）。
+fn stdin_option(mode: StdinMode) -> Result<Option<StdinOption>, TraitError> {
+    match mode {
+        StdinMode::Closed => Ok(None),
+        StdinMode::Open => Ok(Some(StdinOption::Open)),
+        StdinMode::Once => Ok(Some(StdinOption::Once)),
+        _ => Err(TraitError::new(
+            ErrorCode::Unimplemented,
+            "stdin mode is not supported",
+        )),
     }
 }
 

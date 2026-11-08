@@ -29,7 +29,8 @@ use std::time::Duration;
 use fandhe_container_core::traits::{
     CleanupOutcome, ContainerId, ContainerLogPath, ContainerRuntime, ContainerState,
     ContainerStatus, CreateRequest, DeleteRequest, DeleteResponse, KillRequest, Signal,
-    StartRequest, StateRequest, StopRequest, TerminationReason, TraitError, WaitExitRequest,
+    StartRequest, StateRequest, StdinMode, StopRequest, TerminationReason, TraitError,
+    WaitExitRequest,
 };
 use tonic::Status;
 
@@ -579,7 +580,20 @@ impl RuntimeAdapter {
         id: &str,
         log_path: Option<ContainerLogPath>,
     ) -> Result<RuntimeContainerStatus, CriError> {
-        let mut req = StartRequest::new(Self::id(id)?);
+        self.start_with_options(id, log_path, StdinMode::Closed)
+    }
+
+    /// CRI ログの書き先と stdin の扱いつきで開始する（CRI-2・CRI-6・#4076）。
+    ///
+    /// `stdin` は記録の config から導いた値（tty のコンテナは `Closed`）で、`StartRequest::with_stdin` で実行層へ運ぶ。
+    /// `Closed` は [`Self::start_with_log_path`] と同じ。
+    pub fn start_with_options(
+        &self,
+        id: &str,
+        log_path: Option<ContainerLogPath>,
+        stdin: StdinMode,
+    ) -> Result<RuntimeContainerStatus, CriError> {
+        let mut req = StartRequest::new(Self::id(id)?).with_stdin(stdin);
         if let Some(log_path) = log_path {
             req = req.with_log_path(log_path);
         }

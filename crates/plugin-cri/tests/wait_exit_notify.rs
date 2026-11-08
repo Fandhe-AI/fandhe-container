@@ -16,17 +16,17 @@ use std::time::{Duration, Instant};
 
 use fandhe_container_core::oci_runtime::{LifecycleOp, OciRuntimeError, ProcessSignaler};
 use fandhe_container_core::traits::{
-    ContainerId, ContainerLogPath, ContainerRuntime, ContainerState, ContainerStatus,
-    CreateRequest, CreateStateRequest, DeleteRequest, DeleteResponse, DeleteStateRequest,
-    DeleteStateResponse, ErrorCode, GetStateRequest, KillRequest, ListStateRequest, StartRequest,
-    StateList, StateRecord, StateRequest, StateRevision, StateStore, StopRequest, TraitError,
-    WaitExitRequest,
+    ContainerId, ContainerRuntime, ContainerState, ContainerStatus, CreateRequest,
+    CreateStateRequest, DeleteRequest, DeleteResponse, DeleteStateRequest, DeleteStateResponse,
+    ErrorCode, GetStateRequest, KillRequest, ListStateRequest, StartRequest, StateList,
+    StateRecord, StateRequest, StateRevision, StateStore, StopRequest, TraitError, WaitExitRequest,
 };
 use fandhe_container_plugin_cri::adapter::CoreLifecycleRuntime;
 use fandhe_container_plugin_cri::supervised::{
     ExitNotifierSource, SignalerSource, SupervisedLifecycle, SupervisorStarter,
 };
 use fandhe_container_supervisor::control::{ExitNotifier, ExitWatchOutcome, UnavailableSignaler};
+use fandhe_container_supervisor::start_client::StartOptions;
 
 fn cid(s: &str) -> ContainerId {
     ContainerId::new(s).expect("valid id")
@@ -202,7 +202,7 @@ impl SupervisorStarter for NoStart {
     fn start(
         &self,
         _root: &Path,
-        _log_path: Option<&ContainerLogPath>,
+        _opts: &StartOptions<'_>,
         _id: &ContainerId,
     ) -> (Result<NonZeroU32, OciRuntimeError>, Option<Child>) {
         (

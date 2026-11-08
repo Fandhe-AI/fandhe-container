@@ -75,6 +75,8 @@ struct FakeRuntime {
     start_oom_killed: AtomicBool,
     /// start が受けた `StartRequest::log_path()`（CRI-2・SUP-4・#2671 の検証用）。
     start_log_paths: Mutex<Vec<Option<String>>>,
+    /// start が受けた `StartRequest::stdin()`（CRI-6・#4076 の検証用）。
+    start_stdin_modes: Mutex<Vec<fandhe_container_core::traits::StdinMode>>,
 }
 
 impl FakeRuntime {
@@ -117,6 +119,7 @@ impl ContainerRuntime for Shared {
             .lock()
             .unwrap()
             .push(r.log_path().map(|p| p.as_str().to_owned()));
+        self.0.start_stdin_modes.lock().unwrap().push(r.stdin());
         while self.0.hold_start.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -1799,6 +1802,47 @@ async fn cri_2_log_path_is_joined_and_reaches_start_request() {
         vec![Some(expected.to_owned())]
     );
     assert_eq!(status(&h.service, &id).await.log_path, expected);
+}
+
+/// CRI-6・CRI-2（#4076）: 記録の `stdin`・`stdin_once`・`tty` から導いた stdin の扱いが StartContainer で実行層へ届く
+/// （tty のコンテナは `Closed`。既定も `Closed`）。
+#[tokio::test]
+async fn cri6_start_container_carries_stdin_mode_from_record() {
+    use fandhe_container_core::traits::StdinMode;
+    let cases = [
+        (false, false, false, StdinMode::Closed),
+        (false, true, false, StdinMode::Open),
+        (false, true, true, StdinMode::Once),
+        (false, false, true, StdinMode::Closed),
+        (true, true, true, StdinMode::Closed),
+        (true, true, false, StdinMode::Closed),
+    ];
+    for (tty, stdin, stdin_once, want) in cases {
+        let h = harness();
+        let sb = run_sandbox(&h.service).await;
+        let mut cfg = container("c");
+        cfg.tty = tty;
+        cfg.stdin = stdin;
+        cfg.stdin_once = stdin_once;
+        let id = RuntimeService::create_container(
+            &h.service,
+            Request::new(v1::CreateContainerRequest {
+                pod_sandbox_id: sb,
+                config: Some(cfg),
+                sandbox_config: None,
+            }),
+        )
+        .await
+        .expect("create")
+        .into_inner()
+        .container_id;
+        start(&h.service, &id).await.expect("start");
+        assert_eq!(
+            h.runtime.start_stdin_modes.lock().unwrap().clone(),
+            vec![want],
+            "tty={tty} stdin={stdin} stdin_once={stdin_once}"
+        );
+    }
 }
 
 /// CRI-2・SUP-4（#2671）: log_path だけ（基点なし）の CreateContainer は INVALID_ARGUMENT で、記録を残さない。

@@ -1034,6 +1034,30 @@ mod tests {
         assert_sandbox_rejected(b"", "SECRETMARK");
     }
 
+    /// CRI-6・CRI-2・#4076: `stdin`・`stdin_once`・`tty` の 8 通りが v1 の記録の往復で保たれ、
+    /// 復号した config から導く `StdinMode` が元の config から導いた値と一致する（再起動後の StartContainer の入力）。
+    #[test]
+    fn cri6_stdin_flags_roundtrip_and_derive_same_stdin_mode() {
+        use super::super::container::start_stdin_mode;
+        use fandhe_container_core::traits::StdinMode;
+        for bits in 0u8..8 {
+            let (tty, stdin, stdin_once) = (bits & 1 != 0, bits & 2 != 0, bits & 4 != 0);
+            let mut data = container_data();
+            data.config.tty = tty;
+            data.config.stdin = stdin;
+            data.config.stdin_once = stdin_once;
+            let decoded = ContainerRecordData::decode(&data.encode().unwrap(), &id('b')).unwrap();
+            let c = &decoded.data.config;
+            assert_eq!((c.tty, c.stdin, c.stdin_once), (tty, stdin, stdin_once));
+            assert_eq!(start_stdin_mode(c), start_stdin_mode(&data.config));
+        }
+        let mut data = container_data();
+        data.config.stdin = true;
+        data.config.stdin_once = true;
+        let decoded = ContainerRecordData::decode(&data.encode().unwrap(), &id('b')).unwrap();
+        assert_eq!(start_stdin_mode(&decoded.data.config), StdinMode::Once);
+    }
+
     #[test]
     fn cri1_repair2_container_rejects_noncanonical_bool_wire_value() {
         // 長さを変えない非正準表現（bool true の 0x01 を 0x02）も拒否する（バイト完全一致の判定）。

@@ -461,12 +461,11 @@ pub fn production_delete(
             base.path(),
             |store| {
                 let store: std::sync::Arc<dyn StateStore> = std::sync::Arc::new(store);
-                std::sync::Arc::new(reclaim::GuardedCore {
-                    core: core_runtime_for(std::sync::Arc::clone(&store))
-                        .with_delete_deadline(budget.remove)
-                        .with_container_log_lock_wait(budget.remove),
-                    store,
-                })
+                std::sync::Arc::new(reclaim::GuardedCore::new(store, |pinned| {
+                    core_runtime_for(pinned)
+                        .with_delete_deadline(budget.cleanup())
+                        .with_container_log_lock_wait(budget.cleanup())
+                }))
             },
             &budget,
             deadline,

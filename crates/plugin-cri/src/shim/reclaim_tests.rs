@@ -440,6 +440,8 @@ fn cri5_4152_other_containers_are_untouched() {
 fn cri5_4152_production_budget_fits_containerd_cleanup() {
     assert!(ReclaimBudget::PRODUCTION.total() <= SHIM_DELETE_DEADLINE);
     assert!(SHIM_DELETE_DEADLINE < Duration::from_secs(5));
+    // 内側の後始末の期限は外側の remove の待ちより短い（Kept の応答を組み立てる余裕。#4152）。
+    assert!(ReclaimBudget::PRODUCTION.cleanup() < ReclaimBudget::PRODUCTION.remove);
 }
 
 /// CRI-5・REPAIR-3・#4152: 本番の `CoreLifecycleRuntime` で、pid の無い Created の記録が回収される（supervisor 不要の経路）。
@@ -456,13 +458,12 @@ fn cri5_4152_real_core_runtime_reclaims_created_without_pid() {
         &base,
         |store| {
             let store: Arc<dyn StateStore> = Arc::new(store);
-            Arc::new(GuardedCore {
-                core: core_runtime_for(Arc::clone(&store))
-                    .with_delete_deadline(budget.remove)
-                    .with_container_log_lock_wait(budget.remove)
-                    .with_cleanup_warning_sink(Arc::new(|_| {})),
-                store,
-            })
+            Arc::new(GuardedCore::new(store, |pinned| {
+                core_runtime_for(pinned)
+                    .with_delete_deadline(budget.cleanup())
+                    .with_container_log_lock_wait(budget.cleanup())
+                    .with_cleanup_warning_sink(Arc::new(|_| {}))
+            }))
         },
         &budget,
         std::time::Instant::now() + SHIM_DELETE_DEADLINE,
@@ -520,10 +521,7 @@ fn sec1_4152_stale_generation_does_not_touch_recreated_container() {
     let other = guard.join("other-bundle");
     std::fs::create_dir_all(&other).unwrap();
     recreate_with_other_bundle(&base, &inv, "abc", &other);
-    let rt = GuardedCore {
-        core: core_runtime_for(Arc::clone(&store)),
-        store: Arc::clone(&store),
-    };
+    let rt = GuardedCore::new(Arc::clone(&store), core_runtime_for);
     let stop = StopRequest::new(cid("abc"), Duration::ZERO).unwrap();
     let e = rt.stop(&stop, &stale).expect_err("stale stop");
     assert_eq!(e.code(), ErrorCode::FailedPrecondition);

@@ -21,13 +21,15 @@
 //! 照合にだけ使い削除の対象にしない。状態記録の pid へ生のシグナルは送らない（PID 再利用対策。SEC-1・CORE-1）。
 
 use std::path::PathBuf;
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use fandhe_container_core::traits::{
-    ContainerState, ContainerStatus, DeleteRequest, DeleteResponse, ErrorCode, GetStateRequest,
-    Signal, StateRecord, StateRevision, StateStore, StopRequest, TraitError,
+    ContainerId, ContainerState, ContainerStatus, CreateStateRequest, DeleteRequest,
+    DeleteResponse, DeleteStateRequest, DeleteStateResponse, ErrorCode, GetStateRequest,
+    ListStateRequest, Signal, StateList, StateRecord, StateRevision, StateStore, StopRequest,
+    TraitError, UpdateStateRequest,
 };
 use fandhe_container_cri::error::CriError;
 use fandhe_container_cri::shim_v2::bootstrap::ShimDeleteExit;
@@ -73,6 +75,13 @@ impl ReclaimBudget {
         remove: Duration::from_millis(1500),
     };
 
+    /// 内側（core の delete・ログの待ち）に渡す後始末の期限。外側の `remove` の待ちより短くし、内側が `Kept` の応答と
+    /// 警告を組み立てる余裕を残す（外側が先に切れると記録だけ消えて `AlreadyReclaimed` になり、cgroup・ログを回収し直せない。
+    /// CRI-5・REPAIR-5）。`remove` の 2/3。
+    pub(crate) fn cleanup(&self) -> Duration {
+        self.remove.saturating_mul(2) / 3
+    }
+
     /// 段の予算の合計（試験が [`SHIM_DELETE_DEADLINE`] に収まることを照合する）。
     #[cfg(test)]
     pub(crate) fn total(&self) -> Duration {
@@ -97,29 +106,91 @@ pub(crate) trait ReclaimRuntime: Send + Sync + 'static {
     ) -> Result<DeleteResponse, TraitError>;
 }
 
-/// 本番の窓口: `CoreLifecycleRuntime` に、世代の検証（記録の読み直し）を前置きする。
+/// 本番の窓口: `CoreLifecycleRuntime` に、照合した bundle への固定（[`PinnedStore`]）を前置きする。
 ///
-/// 検証と core の読み出しの間に残る窓は、並行する回収と再作成が連続して起きる場合の極小の区間だけ（core の stop・delete
-/// 自身の revision 検査は読み直した記録が基準のため、要求に期待 revision を持つ core の変更は別 issue）。
+/// core が自身の読み取りで得る記録を、照合した bundle のものに限る（読み取りの結果を検証するので、検証と読み出しの間の窓が無い）。
+/// core の stop・delete は読んだ記録の revision を基準に更新・削除するため、再作成された別 bundle のコンテナには届かない
+/// （revision は再利用されない。SEC-1・CORE-1・#4152）。revision の変化（supervisor の `Stopped` 記録など同一コンテナの更新）は許す。
 pub(crate) struct GuardedCore {
-    pub(crate) core: crate::adapter::CoreLifecycleRuntime,
-    pub(crate) store: Arc<dyn StateStore>,
+    core: crate::adapter::CoreLifecycleRuntime,
+    store: Arc<dyn StateStore>,
+    pin: Arc<Mutex<Option<PathBuf>>>,
 }
 
 impl GuardedCore {
-    fn current(
-        &self,
-        id: &fandhe_container_core::traits::ContainerId,
-        expected: &Generation,
-    ) -> Result<StateRecord, TraitError> {
+    /// `build` へ固定つきの `StateStore` を渡して core を作る（core は渡された store だけを読む）。
+    pub(crate) fn new(
+        store: Arc<dyn StateStore>,
+        build: impl FnOnce(Arc<dyn StateStore>) -> crate::adapter::CoreLifecycleRuntime,
+    ) -> Self {
+        let pin = Arc::new(Mutex::new(None));
+        let pinned: Arc<dyn StateStore> = Arc::new(PinnedStore {
+            inner: Arc::clone(&store),
+            pin: Arc::clone(&pin),
+        });
+        Self {
+            core: build(pinned),
+            store,
+            pin,
+        }
+    }
+
+    fn set_pin(&self, bundle: &std::path::Path) {
+        if let Ok(mut g) = self.pin.lock() {
+            *g = Some(bundle.to_path_buf());
+        }
+    }
+
+    fn current(&self, id: &ContainerId, expected: &Generation) -> Result<StateRecord, TraitError> {
         let rec = self.store.get(&GetStateRequest::new(id.clone()))?;
-        if Generation::of(&rec) != *expected {
-            return Err(TraitError::new(
-                ErrorCode::FailedPrecondition,
-                "container record changed since it was matched",
-            ));
+        if rec.bundle() != expected.bundle {
+            return Err(changed());
         }
         Ok(rec)
+    }
+}
+
+fn changed() -> TraitError {
+    TraitError::new(
+        ErrorCode::FailedPrecondition,
+        "container record changed since it was matched",
+    )
+}
+
+/// 照合した bundle 以外の記録を core に見せない `StateStore`（`get` の結果が固定の bundle と違えば `FailedPrecondition`）。
+struct PinnedStore {
+    inner: Arc<dyn StateStore>,
+    pin: Arc<Mutex<Option<PathBuf>>>,
+}
+
+impl StateStore for PinnedStore {
+    fn create(&self, req: &CreateStateRequest) -> Result<StateRecord, TraitError> {
+        self.inner.create(req)
+    }
+
+    fn update(&self, req: &UpdateStateRequest) -> Result<StateRecord, TraitError> {
+        self.inner.update(req)
+    }
+
+    fn get(&self, req: &GetStateRequest) -> Result<StateRecord, TraitError> {
+        let rec = self.inner.get(req)?;
+        let pinned = self.pin.lock().ok().and_then(|g| g.clone());
+        match pinned {
+            Some(b) if b != rec.bundle() => Err(changed()),
+            _ => Ok(rec),
+        }
+    }
+
+    fn list(&self, req: &ListStateRequest) -> Result<StateList, TraitError> {
+        self.inner.list(req)
+    }
+
+    fn delete(&self, req: &DeleteStateRequest) -> Result<DeleteStateResponse, TraitError> {
+        self.inner.delete(req)
+    }
+
+    fn host_state_root(&self) -> Option<&std::path::Path> {
+        self.inner.host_state_root()
     }
 }
 
@@ -130,14 +201,12 @@ impl ReclaimRuntime for GuardedCore {
         generation: &Generation,
     ) -> Result<(ContainerStatus, Generation), TraitError> {
         self.current(req.id(), generation)?;
+        self.set_pin(&generation.bundle);
         let status = fandhe_container_core::traits::ContainerRuntime::stop(&self.core, req)?;
         let after = self.store.get(&GetStateRequest::new(req.id().clone()))?;
         if after.bundle() != generation.bundle || after.status().state() != ContainerState::Stopped
         {
-            return Err(TraitError::new(
-                ErrorCode::FailedPrecondition,
-                "container record changed during stop",
-            ));
+            return Err(changed());
         }
         Ok((status, Generation::of(&after)))
     }
@@ -148,6 +217,7 @@ impl ReclaimRuntime for GuardedCore {
         generation: &Generation,
     ) -> Result<DeleteResponse, TraitError> {
         self.current(req.id(), generation)?;
+        self.set_pin(&generation.bundle);
         fandhe_container_core::traits::ContainerRuntime::delete(&self.core, req)
     }
 }
@@ -215,12 +285,21 @@ pub(crate) fn reclaim_recorded(
         let rt = Arc::clone(&rt);
         let id = id.clone();
         let limit = budget.stop.min(remaining(deadline, "stop")?);
-        run_stage(limit, "stop", move || {
+        let stopped = run_stage(limit, "stop", move || {
             let req = StopRequest::new(id, Duration::ZERO)
                 .map_err(|e| CriError::from(&e))?
                 .with_signal(Signal::SIGKILL);
-            rt.stop(&req, &generation).map_err(|e| CriError::from(&e))
-        })?
+            match rt.stop(&req, &generation) {
+                Ok(v) => Ok(Some(v)),
+                // 並行する回収が先に消した。目的は達している（remove 段と同じく冪等）。
+                Err(e) if e.code() == ErrorCode::NotFound => Ok(None),
+                Err(e) => Err(CriError::from(&e)),
+            }
+        })?;
+        match stopped {
+            Some(v) => v,
+            None => return Ok(ShimDeleteExit::from_core_status(before_pid, before)),
+        }
     } else {
         (before.clone(), generation)
     };

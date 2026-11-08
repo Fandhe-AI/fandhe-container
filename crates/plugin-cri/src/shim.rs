@@ -18,15 +18,16 @@
 //! 前提: rootless のみ。uid 0（rootful の containerd と、rootlesskit 配下で euid が 0 になる shim）の `start` は plugin-cri の
 //! `supervised` と同じく `UNIMPLEMENTED`（#2442・#2241）。supervisor は shim の実体と同じディレクトリの固定名から解決する。
 //!
-//! delete action の前段（#4151・CRI-5・SEC-1・REPAIR-3・REPAIR-4）: [`production_delete_preflight`] を bootstrap の注入口
-//! （`run_cli_with_hooks`）へ渡し、`-id`・`-bundle` の検証（[`validate_delete_invocation`]）と、serve が使う状態ルートの記録との照合
-//! （`delete_preflight_in`・[`match_delete_record`]）を行う。照合は読み取りだけで、状態ルートの作成・書き込み・シグナル・
-//! プロセス起動をしない。結果は [`DeleteRecordMatch`]（記録なし・記録あり・回収済み）で、停止・回収（#4152）が受け取って使う。
-//! 本 PR の bin は結果を捨てる（検証と照合の失敗だけが delete を止める）。判断は `docs/design/shim-v2-production-binary.md` D5。
+//! delete action（#4151・#4152・CRI-5・SEC-1・REPAIR-3・REPAIR-4・REPAIR-5）: [`production_delete`] を bootstrap の注入口
+//! （`run_cli_with_hooks`）へ渡す。`-id`・`-bundle` の検証（[`validate_delete_invocation`]）と、serve が使う状態ルートの記録との照合
+//! （`delete_preflight_in`・[`match_delete_record`]。読み取りだけで、状態ルートの作成・書き込み・シグナル・プロセス起動をしない）の結果
+//! [`DeleteRecordMatch`] が `Recorded` のときだけ、`reclaim` が残ったコンテナを止めて回収し（停止・削除。既存の
+//! `CoreLifecycleRuntime` を使う）終了状態を返す。記録なし・回収済みは何もせず成功する（冪等）。判断は
+//! `docs/design/shim-v2-production-binary.md` D5・D6。
 //!
 //! 未実装（REPAIR-3）: 非 Linux（macOS は既定の状態ルートが未決定で #2431、`start`・`kill`・`stop` も `Unimplemented`）は Shutdown だけの
-//! `EmptyTaskService` を登録する。exec の起動役（`TaskExecLauncher`）の本番実装は無く exec は `UNIMPLEMENTED`。`delete` action での
-//! 実行層の後始末（停止・回収・終了状態の応答。#4152）も未実装。`-publish-binary` による TaskCreate・TaskStart・TaskDelete・TaskExit の publish は実装済み（#4155・#4156）。非 Linux の delete は
+//! `EmptyTaskService` を登録する。exec の起動役（`TaskExecLauncher`）の本番実装は無く exec は `UNIMPLEMENTED`。
+//! `-publish-binary` による TaskCreate・TaskStart・TaskDelete・TaskExit の publish は実装済み（#4155・#4156）。非 Linux の delete は
 //! 引数の検証だけで、記録の照合はしない（既定の状態ルートが未決定で #2431）。
 
 use std::path::{Path, PathBuf};
@@ -36,7 +37,7 @@ use fandhe_container_core::traits::{
 };
 use fandhe_container_cri::error::CriError;
 use fandhe_container_cri::shim_v2::ServiceRegistry;
-use fandhe_container_cri::shim_v2::bootstrap::{ServeContext, ShimInvocation};
+use fandhe_container_cri::shim_v2::bootstrap::{ServeContext, ShimDeleteExit, ShimInvocation};
 
 /// 本番の登録簿を作る。失敗は固定語彙の `CriError` で返す（パスや状態の中身は含めない。REPAIR-4）。
 pub fn production_registry(ctx: ServeContext) -> Result<ServiceRegistry, CriError> {
@@ -141,6 +142,20 @@ fn check_private_dir(md: &std::fs::Metadata) -> Result<(), CriError> {
     Ok(())
 }
 
+/// 本番の `CoreLifecycleRuntime` を状態ストアの上に組む（serve の登録簿と delete action の回収で同じ組み立てを共有する。#4152）。
+///
+/// 呼び出し元: [`registry_in`]（serve。監査の記録先は呼び出し側が足す）と [`production_delete`]（delete action の回収）。
+/// 記録器は呼び出しごとの新しいものを使い、プロセスをまたいで観測値を共有しない。
+#[cfg(target_os = "linux")]
+fn core_runtime_for(state: std::sync::Arc<dyn StateStore>) -> crate::adapter::CoreLifecycleRuntime {
+    use fandhe_container_core::observability::OpRecorder;
+
+    crate::adapter::CoreLifecycleRuntime::with_recorder(
+        state,
+        std::sync::Arc::new(OpRecorder::new()),
+    )
+}
+
 /// 状態ルートを引数で受ける内側の関数（試験が一時ディレクトリの状態ルートで呼ぶ）。
 #[cfg(target_os = "linux")]
 pub(crate) fn registry_in(
@@ -149,19 +164,16 @@ pub(crate) fn registry_in(
 ) -> Result<ServiceRegistry, CriError> {
     use std::sync::Arc;
 
-    use fandhe_container_core::observability::OpRecorder;
     use fandhe_container_core::state_store::FileStateStore;
     use fandhe_container_core::traits::StateStore;
     use fandhe_container_cri::adapter::RuntimeAdapter;
     use fandhe_container_cri::shim_v2::{TaskApiVersion, TaskService};
 
-    use crate::adapter::CoreLifecycleRuntime;
-
     let state: Arc<dyn StateStore> = Arc::new(
         FileStateStore::open(root)
             .map_err(|_| CriError::internal("cannot open the state store"))?,
     );
-    let mut runtime = CoreLifecycleRuntime::with_recorder(state, Arc::new(OpRecorder::new()));
+    let mut runtime = core_runtime_for(state);
     if let Some(sink) = ctx.audit_sink() {
         runtime = runtime.with_create_audit_sink(sink);
     }
@@ -241,7 +253,7 @@ fn has_dot_segment(p: &Path) -> bool {
 
 /// delete の `-id`・`-bundle` を検証する（副作用は `lstat` だけ。全 OS 共通。CRI-5・SEC-1・#4151）。
 ///
-/// 呼び出し元は [`production_delete_preflight`]。`-id` は core の `ContainerId` に通す（`parse_args` の identifier 規則より緩い
+/// 呼び出し元は [`production_delete`]（delete action の前段）。`-id` は core の `ContainerId` に通す（`parse_args` の identifier 規則より緩い
 /// ので多層防御）。`-bundle` は containerd v2.1.4 の `core/runtime/v2/bundle.go` が `<state>/<namespace>/<id>` で組むため、
 /// 絶対パスで、`.`・`..` を含まず、末尾の要素が id と一致し、末尾の要素が実在するディレクトリ（symlink でない）であることを求める。
 /// 親の namespace との一致は見ない（記録の bundle との照合の方が強く、state の配置が変わったときに正当な呼び出しを拒否する危険を増やすだけ）。
@@ -363,11 +375,29 @@ fn open_scoped_store_read_only(
 /// delete の前段の本体を、状態ルートの基底（`StateRoot::resolve(None)` の結果）を引数で受けて行う（試験が一時ディレクトリで呼ぶ。#4151）。
 ///
 /// 引数の検証 → 状態ルートの記録の照合の順で、副作用は無い。`-namespace`・`-address` は `parse_args` が delete に必須としている。
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn delete_preflight_in(
     inv: &ShimInvocation,
     base: &Path,
 ) -> Result<DeleteRecordMatch, CriError> {
+    delete_preflight_store_in(inv, base).map(|(_, _, m)| m)
+}
+
+/// [`delete_preflight_in`] に、検証済みの対象と、照合に使った開き済みのストアを添えて返す版（回収が同じストアを使うため。#4152）。
+///
+/// ストアは記録がありうるとき（`NotRecorded` 以外）だけ `Some`。`NotRecorded` では状態ルートを作らない（#4151 の挙動を維持する）。
+#[cfg(target_os = "linux")]
+pub(crate) fn delete_preflight_store_in(
+    inv: &ShimInvocation,
+    base: &Path,
+) -> Result<
+    (
+        DeleteTarget,
+        Option<fandhe_container_core::state_store::FileStateStore>,
+        DeleteRecordMatch,
+    ),
+    CriError,
+> {
     let target = validate_delete_invocation(inv)?;
     let (Some(ns), Some(addr)) = (inv.namespace.as_ref(), inv.address.as_deref()) else {
         return Err(CriError::invalid_argument(
@@ -375,27 +405,145 @@ pub(crate) fn delete_preflight_in(
         ));
     };
     match open_scoped_store_read_only(base, ns, addr)? {
-        None => Ok(DeleteRecordMatch::NotRecorded),
-        Some(store) => match_delete_record(&store, &target),
+        None => Ok((target, None, DeleteRecordMatch::NotRecorded)),
+        Some(store) => {
+            let m = match_delete_record(&store, &target)?;
+            Ok((target, Some(store), m))
+        }
     }
 }
 
-/// bootstrap の delete の前段（`run_cli_with_hooks` の `before_delete`）として渡す本番の実装（CRI-5・SEC-1・#4151）。
+/// delete action の本体（検証 → 照合 → 回収）を、状態ルートの基底と実行層の組み立てを引数で受けて行う（試験が差し込む。#4152）。
 ///
-/// Linux は既定の状態ルート（`StateRoot::resolve(None)`。外部入力から受けない）で、引数の検証の後に記録を照合する。
-/// 結果の [`DeleteRecordMatch`] は本 PR では使わず捨てる（停止・回収は #4152。REPAIR-3）。非 Linux は引数の検証だけで、
-/// 既定の状態ルートが未決定（#2431）のため照合は縮退する。
-pub fn production_delete_preflight(inv: &ShimInvocation) -> Result<(), CriError> {
+/// `Recorded` のときだけ `make_runtime` を呼んで [`reclaim::reclaim_recorded`] へ進む。`NotRecorded`・`AlreadyReclaimed` は
+/// 実行層を作らず `Ok(None)`（冪等。呼び出し元は固定の応答を返す）。毎回照合からやり直すため、期限切れや kill の後の再実行は
+/// 記録の状態で続きの段から回収する（CRI-5・REPAIR-5）。
+#[cfg(target_os = "linux")]
+pub(crate) fn delete_in(
+    inv: &ShimInvocation,
+    base: &Path,
+    make_runtime: impl FnOnce(
+        fandhe_container_core::state_store::FileStateStore,
+    ) -> std::sync::Arc<dyn reclaim::ReclaimRuntime>,
+    budget: &reclaim::ReclaimBudget,
+    deadline: std::time::Instant,
+) -> Result<Option<ShimDeleteExit>, CriError> {
+    // 照合の読み取りは状態ロックを最大 5 秒待ちうるため、作業スレッドで走らせ、全体の絶対期限で待ちを打ち切る（REPAIR-5・D6）。
+    let limit = reclaim::remaining(deadline, "preflight")?;
+    let (inv_owned, base_owned) = (inv.clone(), base.to_path_buf());
+    let (target, store, matched) = reclaim::run_stage(limit, "preflight", move || {
+        delete_preflight_store_in(&inv_owned, &base_owned)
+    })?;
+    match (matched, store) {
+        (DeleteRecordMatch::Recorded(rec), Some(store)) => {
+            reclaim::reclaim_recorded(make_runtime(store), &target, &rec, budget, deadline)
+        }
+        (DeleteRecordMatch::Recorded(_), None) => {
+            Err(CriError::internal("cannot open the state store"))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// bootstrap の delete の前段（`run_cli_with_hooks` の `before_delete`）として渡す本番の実装（CRI-5・SEC-1・#4151・#4152）。
+///
+/// Linux は既定の状態ルート（`StateRoot::resolve(None)`。外部入力から受けない）で、引数の検証・記録の照合の後、記録のあるコンテナだけを
+/// 停止して回収し、終了状態を返す（`Some`）。記録なし・回収済みは `None`（固定の応答）。`deadline` は bootstrap が数える delete 全体の
+/// 絶対期限で、照合・各段（上限は `ReclaimBudget::PRODUCTION`）・socket 掃除・計測の待ちが共有する（containerd の cleanup の 5 秒より短い。
+/// `docs/design/shim-v2-production-binary.md` D6）。非 Linux は引数の検証だけで
+/// `None` を返す（既定の状態ルートが未決定で #2431。REPAIR-3）。
+pub fn production_delete(
+    inv: &ShimInvocation,
+    deadline: std::time::Instant,
+) -> Result<Option<ShimDeleteExit>, CriError> {
     #[cfg(target_os = "linux")]
     {
         let base = fandhe_container_core::state_store::StateRoot::resolve(None)
             .map_err(|_| CriError::internal("cannot resolve the state root"))?;
-        delete_preflight_in(inv, base.path()).map(drop)
+        let budget = reclaim::ReclaimBudget::PRODUCTION;
+        let result = delete_in(
+            inv,
+            base.path(),
+            |store| {
+                let store: std::sync::Arc<dyn StateStore> = std::sync::Arc::new(store);
+                std::sync::Arc::new(reclaim::GuardedCore::new(
+                    store,
+                    budget.cleanup(),
+                    |pinned, cleanup| {
+                        core_runtime_for(pinned)
+                            .with_delete_deadline(cleanup)
+                            .with_container_log_lock_wait(cleanup)
+                            .with_cleanup_warning_sink(std::sync::Arc::new(|line| {
+                                let _ = crate::telemetry::stderr_sink().submit(line);
+                            }))
+                    },
+                ))
+            },
+            &budget,
+            deadline,
+        );
+        // 後始末の警告（Kept）は応答の protobuf に載せられないので、専用 thread のキューに積んだ分を終了前に書き出す。
+        // 成否にかかわらず（Err でも）行う（REPAIR-4・REPAIR-5・#4152）。
+        flush_delete_warnings(
+            crate::telemetry::stderr_sink(),
+            Box::new(std::io::stderr()),
+            deadline,
+        );
+        result
     }
     #[cfg(not(target_os = "linux"))]
     {
-        validate_delete_invocation(inv).map(drop)
+        let _ = deadline;
+        validate_delete_invocation(inv).map(|_| None)
     }
+}
+
+/// delete の警告行（`CoreLifecycleRuntime` の後始末の警告）が `sink` から書き出されるのを、共有期限 `deadline` までに待つ。
+///
+/// delete は応答の後すぐプロセスを終了し、`LineSink` の専用 thread のキューを待たないため、待たないと Kept として残した資源の警告が
+/// 失われる（REPAIR-4）。期限内に書き出せなかった・キューへ積めず捨てた行があるときは、`fallback`（本番は stderr へ直接）に固定語彙の
+/// 1 行（`shim_delete_warnings_unflushed`）を出して欠落を残す。書き出せたかを返す（#4152）。
+///
+/// どの待ちも `deadline` を超えない（REPAIR-5）。stderr の受け手が止まると `fallback` の書き込み自体が（専用 writer の内部ロックの
+/// 待ちも含めて）戻らないため、書き込みは使い捨ての別 thread で行い、期限つきで結果を待つ（戻らなければ thread ごと捨てる。
+/// プロセスは応答の後に終了する）。この方式にしたのは、期限切れのときだけ直接書かない案では欠落の事実が残らず、応答の後へ回す案は
+/// `bootstrap`（cri crate）の応答の出力契約を変えるため。`sink` の待ちには期限の末尾の一部（`FALLBACK_RESERVE` まで）を残し、
+/// 待ちが期限いっぱいまで使われて `fallback` の分が無くなるのを避ける。
+///
+/// stdout の `DeleteResponse` の書き出し（`bootstrap`）は数十バイトで pipe の容量（64 KiB）に収まるため、受け手が読まなくても
+/// ブロックしない（受け手が閉じていれば `EPIPE` で即失敗）。
+#[cfg(target_os = "linux")]
+pub(crate) fn flush_delete_warnings(
+    sink: &crate::telemetry::LineSink,
+    fallback: Box<dyn std::io::Write + Send>,
+    deadline: std::time::Instant,
+) -> bool {
+    use std::time::{Duration, Instant};
+
+    /// `fallback` の書き込みに残す最大の待ち。
+    const FALLBACK_RESERVE: Duration = Duration::from_millis(200);
+    let left = deadline.saturating_duration_since(Instant::now());
+    let reserve = (left / 4).min(FALLBACK_RESERVE);
+    let drained = sink.flush(left.saturating_sub(reserve));
+    let dropped = sink.dropped();
+    if drained && dropped == 0 {
+        return true;
+    }
+    let line = format!(
+        "{{\"level\":\"warn\",\"event\":\"shim_delete_warnings_unflushed\",\"drained\":{drained},\"dropped\":{dropped},\"message\":\"delete cleanup warnings may be lost\"}}\n"
+    );
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let mut w = fallback;
+    let spawned = std::thread::Builder::new()
+        .name("cri-shim-delete-warn".into())
+        .spawn(move || {
+            let _ = w.write_all(line.as_bytes()).and_then(|()| w.flush());
+            let _ = tx.send(());
+        });
+    if spawned.is_ok() {
+        let _ = rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+    }
+    false
 }
 
 /// Shutdown だけを処理する登録簿（非 Linux の縮退。REPAIR-3）。
@@ -540,5 +688,11 @@ mod tests {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) mod reclaim;
+
 #[cfg(all(test, target_os = "linux"))]
 mod delete_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+mod reclaim_tests;

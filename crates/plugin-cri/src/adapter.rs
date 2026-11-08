@@ -792,6 +792,8 @@ pub struct CoreLifecycleRuntime {
     container_log_lock_wait: Duration,
     /// `delete` 全体の期限（`PLUGIN_FORCE_DELETE_DEADLINE` 以下。後始末の各段の予算を残りで頭打ちにする。#3027・REPAIR-5）。
     delete_deadline: Duration,
+    /// core の delete へ渡す絶対期限（`None` は期限なし）。shim の delete が段の期限から決めて渡す（#4152）。
+    core_delete_deadline: Option<Instant>,
     /// `delete` の後始末で残した資源の構造化ログ 1 行の出力先（本番は stderr の `LineSink`。試験で差し替える。#2633）。
     cleanup_warn: Arc<dyn Fn(String) + Send + Sync>,
     #[cfg(target_os = "linux")]
@@ -1113,6 +1115,7 @@ impl CoreLifecycleRuntime {
             create_audit: None,
             container_log_lock_wait: CONTAINER_LOG_LOCK_WAIT,
             delete_deadline: PLUGIN_FORCE_DELETE_DEADLINE,
+            core_delete_deadline: None,
             cleanup_warn: Arc::new(|line| {
                 let _ = crate::telemetry::stderr_sink().submit(line);
             }),
@@ -1148,6 +1151,16 @@ impl CoreLifecycleRuntime {
     #[must_use]
     pub fn with_delete_deadline(mut self, deadline: Duration) -> Self {
         self.delete_deadline = deadline.min(PLUGIN_FORCE_DELETE_DEADLINE);
+        self
+    }
+
+    /// core の delete（状態記録の削除・cgroup・rootfs の木）へ絶対期限を渡す（`DeleteOptions::with_deadline`。#4152・#4239）。
+    ///
+    /// 期限までに始められなければ記録を残して `Timeout`、rootfs の削除が期限で止まれば delete は成功のまま応答の
+    /// `image_rootfs` が `Kept { Timeout }` になり、警告として出る（REPAIR-4・REPAIR-5）。既定は期限なし。
+    #[must_use]
+    pub fn with_core_delete_deadline(mut self, deadline: Instant) -> Self {
+        self.core_delete_deadline = Some(deadline);
         self
     }
 
@@ -1580,8 +1593,18 @@ impl ContainerRuntime for CoreLifecycleRuntime {
                 self.stop_live_before_force_delete(req.id())?;
             }
         }
-        let response = oci_runtime::delete(&*self.store, &self.recorder, &*self.cgroups, req)
-            .map_err(to_trait_error)?;
+        let mut options = oci_runtime::DeleteOptions::default();
+        if let Some(d) = self.core_delete_deadline {
+            options = options.with_deadline(d);
+        }
+        let response = oci_runtime::delete_with_options(
+            &*self.store,
+            &self.recorder,
+            &*self.cgroups,
+            req,
+            &options,
+        )
+        .map_err(to_trait_error)?;
         // 2 つのログで待ちを共有する（最悪 10 + 5 + 5 = 20 秒。独立に待つと 30 秒で `PLUGIN_RUNTIME_TIMEOUT` の余裕が尽きる。#2964）。
         // 順序の根拠: コンテナログの sink は drain の終わりに閉じ、supervisor ログの flock はプロセス終了で外れる。
         // supervisor ログが解放されればコンテナログはほぼ即座に消せるため、先に supervisor ログを待つ。
@@ -2057,6 +2080,17 @@ mod tests {
     }
 
     /// #2760・REPAIR-4: 警告行の `reason` は、コンテナログが待ち切れなかった失敗にだけ付く。options 用の行は固定語彙。
+    /// REPAIR-4・REPAIR-5・CRI-5・#4152・#4239: rootfs の木の削除が期限で止まった（`Kept { Timeout }`）ときの警告の行は固定語彙で、
+    /// 既存の `LineSink` 経路（delete の終了前の書き出し待ち）へそのまま載る。
+    #[test]
+    fn repair4_4152_image_rootfs_timeout_warning_line() {
+        let id = ContainerId::new("c1").unwrap();
+        assert_eq!(
+            cleanup_warning_line(&id, CleanupTarget::ImageRootfs, ErrorCode::Timeout),
+            "{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"c1\",\"target\":\"image_rootfs\",\"code\":\"TIMEOUT\",\"message\":\"cleanup after delete left resources behind\"}"
+        );
+    }
+
     #[test]
     fn repair4_cri2_cleanup_warning_reason_only_for_sink_open() {
         let id = cid("c1");

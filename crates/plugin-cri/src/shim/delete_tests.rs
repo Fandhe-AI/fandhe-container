@@ -21,12 +21,12 @@ use fandhe_container_cri::shim_v2::bootstrap::{ShimIdentifier, parse_args};
 use super::*;
 use crate::test_root;
 
-const ADDR: &str = "/run/c.sock";
+pub(super) const ADDR: &str = "/run/c.sock";
 
-type Snap = BTreeMap<String, (bool, u64, i64, i64, u32)>;
+pub(super) type Snap = BTreeMap<String, (bool, u64, i64, i64, u32)>;
 
 /// delete の argv を組んで解析する。
-fn parse(id: &str, bundle: Option<&str>) -> Result<ShimInvocation, CriError> {
+pub(super) fn parse(id: &str, bundle: Option<&str>) -> Result<ShimInvocation, CriError> {
     let mut v: Vec<OsString> = ["-namespace", "default", "-address", ADDR, "-id", id]
         .iter()
         .map(OsString::from)
@@ -40,7 +40,7 @@ fn parse(id: &str, bundle: Option<&str>) -> Result<ShimInvocation, CriError> {
 }
 
 /// 木の完全な写し。前後で一致すれば何も書いていない。
-fn snapshot(root: &Path) -> Snap {
+pub(super) fn snapshot(root: &Path) -> Snap {
     fn walk(dir: &Path, root: &Path, out: &mut Snap) {
         for e in std::fs::read_dir(dir).unwrap() {
             let e = e.unwrap();
@@ -66,7 +66,7 @@ fn snapshot(root: &Path) -> Snap {
     out
 }
 
-fn ctx() -> ServeContext {
+pub(super) fn ctx() -> ServeContext {
     ServeContext::new(ShutdownSignal::new(), None).with_origin(
         Some(ShimIdentifier::parse("default").unwrap()),
         Some(PathBuf::from(ADDR)),
@@ -74,14 +74,14 @@ fn ctx() -> ServeContext {
 }
 
 /// bundle の実ディレクトリ `<root>/b/default/<id>` を作る。
-fn make_bundle(root: &Path, id: &str) -> PathBuf {
+pub(super) fn make_bundle(root: &Path, id: &str) -> PathBuf {
     let b = root.join("b").join("default").join(id);
     std::fs::create_dir_all(&b).unwrap();
     b
 }
 
 /// serve と同じ `scoped_root` のストアへ記録を 1 件入れる。
-fn seed(base: &Path, status: ContainerStatus, bundle: &Path) -> FileStateStore {
+pub(super) fn seed(base: &Path, status: ContainerStatus, bundle: &Path) -> FileStateStore {
     let store = FileStateStore::open(scoped_root(base, &ctx()).unwrap()).unwrap();
     store
         .create(&CreateStateRequest::new(status, bundle.to_path_buf()).unwrap())
@@ -89,7 +89,7 @@ fn seed(base: &Path, status: ContainerStatus, bundle: &Path) -> FileStateStore {
     store
 }
 
-fn cid(s: &str) -> ContainerId {
+pub(super) fn cid(s: &str) -> ContainerId {
     ContainerId::new(s).unwrap()
 }
 
@@ -380,4 +380,102 @@ fn cri5_4151_preflight_not_recorded_and_fail_closed() {
     std::os::unix::fs::symlink(&moved, &hashed).unwrap();
     let e = delete_preflight_in(&inv, &base).unwrap_err();
     assert_eq!(e.message(), "state root directory is not private");
+}
+
+/// 共有バッファへ遅延つきで書く出力先（専用 thread の書き出しが delete の終了より遅れる状況を作る）。
+#[derive(Clone)]
+struct SlowBuf(
+    std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    std::time::Duration,
+);
+
+impl std::io::Write for SlowBuf {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        std::thread::sleep(self.1);
+        self.0.lock().unwrap().extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// REPAIR-4・REPAIR-5・CRI-5・#4152: delete の警告行は、書き出しが遅くても共有期限内に全て書き出されてから戻る
+/// （終了前に失われない）。欠落は無いので fallback には何も出ない。
+#[test]
+fn repair4_4152_delete_warnings_are_written_before_return() {
+    let out = SlowBuf(Default::default(), std::time::Duration::from_millis(40));
+    let sink = crate::telemetry::LineSink::spawn(Box::new(out.clone()), 8);
+    for i in 0..3 {
+        assert!(sink.submit(format!("{{\"level\":\"warn\",\"n\":{i}}}")));
+    }
+    let fallback = SlowBuf(Default::default(), std::time::Duration::ZERO);
+    let ok = flush_delete_warnings(
+        &sink,
+        Box::new(fallback.clone()),
+        std::time::Instant::now() + std::time::Duration::from_secs(5),
+    );
+    assert!(ok);
+    assert_eq!(*fallback.0.lock().unwrap(), b"");
+    assert_eq!(
+        String::from_utf8(out.0.lock().unwrap().clone()).unwrap(),
+        "{\"level\":\"warn\",\"n\":0}\n{\"level\":\"warn\",\"n\":1}\n{\"level\":\"warn\",\"n\":2}\n"
+    );
+}
+
+/// REPAIR-4・REPAIR-5・#4152: 書き出しが期限内に終わらないとき、待ちは期限で戻り、欠落の可能性を固定の 1 行で fallback へ残す。
+#[test]
+fn repair4_4152_delete_warnings_unflushed_leaves_fixed_line_within_deadline() {
+    let out = SlowBuf(Default::default(), std::time::Duration::from_millis(600));
+    let sink = crate::telemetry::LineSink::spawn(Box::new(out), 8);
+    assert!(sink.submit("{\"level\":\"warn\"}".to_owned()));
+    let fallback = SlowBuf(Default::default(), std::time::Duration::ZERO);
+    let t0 = std::time::Instant::now();
+    let ok = flush_delete_warnings(
+        &sink,
+        Box::new(fallback.clone()),
+        t0 + std::time::Duration::from_millis(100),
+    );
+    assert!(!ok);
+    assert!(t0.elapsed() < std::time::Duration::from_millis(500));
+    assert_eq!(
+        String::from_utf8(fallback.0.lock().unwrap().clone()).unwrap(),
+        "{\"level\":\"warn\",\"event\":\"shim_delete_warnings_unflushed\",\"drained\":false,\"dropped\":0,\"message\":\"delete cleanup warnings may be lost\"}\n"
+    );
+}
+
+/// 受け手が読まず書き込みが戻らない出力先（詰まった stderr の偽物）。`release` が送られるまで書き込みで止まる。
+struct Stuck(std::sync::mpsc::Receiver<()>);
+
+impl std::io::Write for Stuck {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        let _ = self.0.recv();
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// REPAIR-5・REPAIR-4・#4152: sink の writer も fallback も詰まっている（stderr の受け手が止まった）とき、共有期限を超えず
+/// 戻る（応答を返せる）。書き出せていないので false。
+#[test]
+fn repair5_4152_delete_warnings_return_within_deadline_when_stderr_is_stuck() {
+    let (_keep_sink, rx_sink) = std::sync::mpsc::channel::<()>();
+    let (_keep_fb, rx_fb) = std::sync::mpsc::channel::<()>();
+    let sink = crate::telemetry::LineSink::spawn(Box::new(Stuck(rx_sink)), 8);
+    assert!(sink.submit("{\"level\":\"warn\"}".to_owned()));
+    let t0 = std::time::Instant::now();
+    let ok = flush_delete_warnings(
+        &sink,
+        Box::new(Stuck(rx_fb)),
+        t0 + std::time::Duration::from_millis(300),
+    );
+    let took = t0.elapsed();
+    assert!(!ok);
+    assert!(
+        took >= std::time::Duration::from_millis(250)
+            && took < std::time::Duration::from_millis(600),
+        "took {took:?}"
+    );
 }

@@ -1012,7 +1012,7 @@ impl ExitWatch {
 }
 
 /// 停止済みの状態から `exited_at` を決める。Stopped 以外・未記録・負値は未設定（値を捏造しない。CRI-5・#3682）。
-fn exited_at_of(status: &RuntimeContainerStatus) -> Option<Timestamp> {
+pub(crate) fn exited_at_of(status: &RuntimeContainerStatus) -> Option<Timestamp> {
     if status.lifecycle != RuntimeLifecycle::Stopped {
         return None;
     }
@@ -1047,7 +1047,7 @@ fn checked_signal(signal: u32) -> Result<u8, RpcStatus> {
 }
 
 /// 削除前の状態から `exit_status` を決める。未起動の Created は 0、終了コード不明・負値は 255。
-fn exit_status_of(status: &RuntimeContainerStatus) -> u32 {
+pub(crate) fn exit_status_of(status: &RuntimeContainerStatus) -> u32 {
     match (status.lifecycle, status.exit_code) {
         (RuntimeLifecycle::Stopped, _) => stopped_exit_status(status),
         (RuntimeLifecycle::Created, _) if status.pid.is_none() => 0,

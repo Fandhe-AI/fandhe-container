@@ -156,7 +156,7 @@ fn task_61_1_oversized_filter_is_invalid_argument() {
     );
 }
 
-/// REPAIR-3: 未実装の RPC は UNIMPLEMENTED を返す（実装済みを装わない）。
+/// REPAIR-3: 未実装の RPC（RemoveImage は #4177 で実装済み） は UNIMPLEMENTED を返す（実装済みを装わない）。
 #[test]
 fn task_61_1_other_rpcs_are_unimplemented() {
     let svc = CriImageService::new();
@@ -165,11 +165,6 @@ fn task_61_1_other_rpcs_are_unimplemented() {
         Request::new(Default::default()),
     ));
     assert_eq!(pull.err().map(|s| s.code()), Some(Code::Unimplemented));
-    let remove = block_on(ImageService::remove_image(
-        &svc,
-        Request::new(Default::default()),
-    ));
-    assert_eq!(remove.err().map(|s| s.code()), Some(Code::Unimplemented));
     let fs = block_on(ImageService::image_fs_info(
         &svc,
         Request::new(Default::default()),
@@ -255,4 +250,81 @@ fn task_61_2_image_status_invalid_reference() {
         let err = status(&svc, r, false).expect_err("must fail");
         assert_eq!(err.code(), Code::InvalidArgument);
     }
+}
+
+fn remove(svc: &CriImageService, reference: Option<&str>) -> Result<(), Code> {
+    let request = v1::RemoveImageRequest {
+        image: reference.map(|r| v1::ImageSpec {
+            image: r.into(),
+            ..Default::default()
+        }),
+    };
+    // RemoveImage は spawn_blocking を使うため、ノーオップ waker の block_on ではなく tokio のランタイムで待つ。
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    rt.block_on(ImageService::remove_image(svc, Request::new(request)))
+        .map(|_| ())
+        .map_err(|s| s.code())
+}
+
+/// CRI-1・CRI-2・#4177: id・タグ・digest のどの参照で消しても記録ごと消え、他は残る。再度の削除は成功（冪等）。
+#[test]
+fn cri1_cri2_remove_image_by_any_reference_removes_whole_record() {
+    for r in ["sha256:bb", "reg/b:2", "reg/b@sha256:bb"] {
+        let (recorder, svc) = seeded();
+        assert_eq!(remove(&svc, Some(r)), Ok(()), "{r}");
+        let ids: Vec<String> = list(&svc, None)
+            .expect("list")
+            .into_iter()
+            .map(|i| i.id)
+            .collect();
+        assert_eq!(ids, vec!["sha256:aa".to_owned(), "sha256:cc".to_owned()]);
+        for gone in ["sha256:bb", "reg/b:2", "reg/b@sha256:bb"] {
+            assert!(
+                status(&svc, Some(gone), false)
+                    .expect("status")
+                    .image
+                    .is_none()
+            );
+        }
+        assert_eq!(remove(&svc, Some(r)), Ok(()), "idempotent {r}");
+        let removes: Vec<_> = recorder
+            .lines()
+            .into_iter()
+            .filter(|l| l.0 == "cri.remove_image")
+            .collect();
+        assert_eq!(removes, vec![("cri.remove_image", "success", "OK"); 2]);
+    }
+}
+
+/// CRI-4・#4177: 短縮名は PullImage と同じ規則で正規化して消せる。
+#[test]
+fn cri4_remove_image_accepts_short_name() {
+    let store = Arc::new(InMemoryImageStore::new());
+    store
+        .insert(rec(
+            "sha256:aa",
+            "docker.io/library/busybox:1.36",
+            "docker.io/library/busybox@sha256:aa",
+            1,
+        ))
+        .expect("insert");
+    let svc = CriImageService::with_store(store.clone());
+    assert_eq!(remove(&svc, Some("busybox:1.36")), Ok(()));
+    assert!(store.is_empty());
+}
+
+/// ERR-3・CRI-2・REPAIR-4: 空・過長の参照は INVALID_ARGUMENT、store の失敗は INTERNAL で計装に残る。
+#[test]
+fn err3_remove_image_rejects_bad_reference_and_store_failure() {
+    let (recorder, svc) = seeded();
+    assert_eq!(remove(&svc, None), Err(Code::InvalidArgument));
+    assert_eq!(remove(&svc, Some("")), Err(Code::InvalidArgument));
+    let long = "x".repeat(MAX_FILTER_BYTES + 1);
+    assert_eq!(remove(&svc, Some(&long)), Err(Code::InvalidArgument));
+    assert_eq!(
+        recorder.lines(),
+        vec![("cri.remove_image", "failure", "INVALID_ARGUMENT"); 3]
+    );
 }

@@ -4109,13 +4109,21 @@ impl CriRuntimeService {
         // worker が期限後に遅れて完了しても、番人の `Drop` が排他と印を外す。RPC は期限切れ・worker の
         // 起動失敗でも成功させるが、その結果は呼び出し側が 1 件記録する（REPAIR-4）。期限切れ後に
         // 遅れて完了した worker は `expired` を見て記録しない（二重計上と、後からの OK だけの記録を防ぐ）。
+        if truncated {
+            // 候補が上限を超えて切り捨てた場合は、読み取りの前に 1 件だけ記録する（ID は載せない）。
+            CriOpTimer::start(self.recorder.as_ref(), CriOpKind::ContainerExitObserve)
+                .finish_with::<()>(&Err(Status::from(CriError::resource_exhausted(
+                    "list exit observation was truncated",
+                ))));
+        }
+        // 外側の計測は期限切れ・起動失敗のときだけ確定し、正常完了では読み取りごとの記録に任せて破棄する。
         let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::ContainerExitObserve);
         let expired = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker_expired = Arc::clone(&expired);
         let bounded = run_bounded(budget, move || {
             let _busy = busy;
             let started = std::time::Instant::now();
-            let mut skipped = truncated;
+            let mut skipped = false;
             for mark in marks {
                 if started.elapsed() >= budget {
                     // 読まない候補の印は `Drop` が外す（次の List で先に読まれる）。
@@ -4130,20 +4138,26 @@ impl CriRuntimeService {
                     .map_err(|e| Status::from(e.clone()));
                 mark.finish(&result);
                 if worker_expired.load(Ordering::Acquire) {
+                    // 期限切れは呼び出し側が記録済み。確定せず Drop すると INTERNAL を重ねるため破棄する。
+                    timer.discard();
                     continue;
                 }
                 timer.finish_with(&observed);
             }
-            if skipped && !worker_expired.load(Ordering::Acquire) {
+            // 予算切れで読まなかった候補の存在は、期限切れの記録とは別に 1 件だけ記録する（切り捨ては呼び出し側）。
+            if skipped && !truncated {
                 let timer = CriOpTimer::start(recorder.as_ref(), CriOpKind::ContainerExitObserve);
                 timer.finish_with::<()>(&Err(Status::from(CriError::resource_exhausted(
                     "list exit observation was truncated",
                 ))));
             }
         });
-        if let Err(e) = bounded.await {
-            expired.store(true, Ordering::Release);
-            timer.finish_with::<()>(&Err(Status::from(e)));
+        match bounded.await {
+            Ok(()) => timer.discard(),
+            Err(e) => {
+                expired.store(true, Ordering::Release);
+                timer.finish_with::<()>(&Err(Status::from(e)));
+            }
         }
         Ok(())
     }

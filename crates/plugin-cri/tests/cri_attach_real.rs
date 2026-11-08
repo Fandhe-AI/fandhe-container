@@ -336,28 +336,41 @@ async fn wait_natural_exit(
 /// 自然終了の観測の後の照合（`ListContainers` の EXITED フィルタに 1 件だけ返ること、続く `StopContainer` が
 /// 冪等に成功して終了コード・終了時刻が変わらないこと）をまとめて行い、終了コードを返す（#4175・E2 の本番経路での確認）。
 async fn exited_exit_code(c: &mut RuntimeServiceClient<Channel>, id: &str) -> i32 {
-    let observed = wait_natural_exit(c, id).await;
-    let listed = call_with_deadline(
-        c.list_containers(cri::ListContainersRequest {
-            filter: Some(cri::ContainerFilter {
-                id: id.into(),
-                state: Some(cri::ContainerStateValue {
-                    state: cri::ContainerState::ContainerExited as i32,
+    // ContainerStatus より先に、EXITED フィルタの ListContainers だけで自然終了が検知されることを期限つきで確かめる
+    // （List の観測を外すとこの段が期限切れで失敗する。#4175・REPAIR-12）。
+    let deadline = Instant::now() + NATURAL_EXIT_DEADLINE;
+    loop {
+        let listed = call_with_deadline(
+            c.list_containers(cri::ListContainersRequest {
+                filter: Some(cri::ContainerFilter {
+                    id: id.into(),
+                    state: Some(cri::ContainerStateValue {
+                        state: cri::ContainerState::ContainerExited as i32,
+                    }),
+                    ..Default::default()
                 }),
-                ..Default::default()
             }),
-        }),
-        RPC_DEADLINE,
-    )
-    .await
-    .expect("list")
-    .into_inner()
-    .containers;
-    assert_eq!(
-        listed.iter().map(|x| x.id.as_str()).collect::<Vec<_>>(),
-        vec![id],
-        "ListContainers with the EXITED filter must return the naturally exited container"
-    );
+            RPC_DEADLINE,
+        )
+        .await
+        .expect("list")
+        .into_inner()
+        .containers;
+        if !listed.is_empty() {
+            assert_eq!(
+                listed.iter().map(|x| x.id.as_str()).collect::<Vec<_>>(),
+                vec![id],
+                "ListContainers with the EXITED filter must return the naturally exited container"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "ListContainers with the EXITED filter must observe the natural exit without StopContainer"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let observed = wait_natural_exit(c, id).await;
     call_with_deadline(
         c.stop_container(cri::StopContainerRequest {
             container_id: id.into(),

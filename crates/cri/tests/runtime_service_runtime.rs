@@ -2993,6 +2993,54 @@ async fn repair5_4175_concurrent_list_skips_while_worker_remains() {
     }
 }
 
+/// REPAIR-4: 観測が正常に終わった List は、確定し忘れの `INTERNAL` を記録しない（OK だけが読み取りの数だけ並ぶ）。
+#[tokio::test]
+async fn repair4_4175_successful_list_records_no_internal() {
+    let h = harness();
+    let ids = running_n(&h, 2).await;
+    stop_in_fake(&h.runtime, &ids[0], 1);
+    let _ = list_with_state(&h.service, Some(S::ContainerExited)).await;
+    assert_eq!(count_observe(&h, "OK"), 2);
+    assert_eq!(observe_outcomes(&h).len(), 2);
+    assert_eq!(count_observe(&h, "INTERNAL"), 0);
+}
+
+/// REPAIR-4・REPAIR-5: 期限切れは `DEADLINE_EXCEEDED` を 1 件だけ記録し、遅れて戻った読み取りは重ねて記録しない。
+/// 予算切れで読まなかった候補は `RESOURCE_EXHAUSTED` を別に 1 件記録する。
+#[tokio::test]
+async fn repair4_4175_expired_list_records_deadline_once_and_exhausted_once() {
+    let h = harness();
+    let count = |code: &str| {
+        h.recorder
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| s.kind().as_str() == "cri.container_exit_observe")
+            .filter(|s| code_name(s.code()) == code)
+            .count()
+    };
+    let _ = running_n(&h, 2).await;
+    let service = h
+        .service
+        .with_exit_observe_timeout(Duration::from_millis(100));
+    h.runtime.hold_state.store(true, Ordering::SeqCst);
+    let _ = list_with_state(&service, None).await;
+    h.runtime.hold_state.store(false, Ordering::SeqCst);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while count("RESOURCE_EXHAUSTED") == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "skipped candidates must be recorded"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(count("DEADLINE_EXCEEDED"), 1);
+    assert_eq!(count("RESOURCE_EXHAUSTED"), 1);
+    assert_eq!(count("INTERNAL"), 0);
+    assert_eq!(count("OK"), 0);
+}
+
 /// CRI-2: List の観測の保留中でも StopContainer は拒否されず、Stop の値が後から届いた観測で上書きされない。
 #[tokio::test]
 async fn cri_2_4175_stop_during_list_observation_wins() {

@@ -144,7 +144,7 @@ pub struct ShimInvocation {
     pub address: Option<PathBuf>,
     /// bundle のパス（delete のみ。絶対パスであることだけを検証し使わない）。
     pub bundle: Option<PathBuf>,
-    /// `-publish-binary`（containerd の実行ファイル。字面だけ検証済みで、実体の検査は [`PublishBinary::verify`]。#4154）。
+    /// `-publish-binary`（containerd の実行ファイル。字面だけ検証済みで、実体の検査は `PublishBinary::verify`。#4154）。
     pub publish_binary: Option<PathBuf>,
     /// `-debug`。
     pub debug: bool,
@@ -152,7 +152,7 @@ pub struct ShimInvocation {
 
 /// 実体を検査した `-publish-binary`（containerd がイベント publish に使う実行ファイル。CRI-5・SEC-1・#4154）。
 ///
-/// 作れるのは [`PublishBinary::verify`]（unix のみ）だけで、symlink・通常ファイル以外・実行ビットなし・
+/// 作れるのは `PublishBinary::verify`（unix のみ）だけで、symlink・通常ファイル以外・実行ビットなし・
 /// other 書き込み可を fail-closed で拒否した値を運ぶ。start / デーモンの起動時に検査し、送信側（#4155・#4156）は
 /// [`ServeContext::publish_binary`] から受け取る。検査から exec までの差し替え（TOCTOU）は残余で、doc に記す。
 #[derive(Debug, Clone, PartialEq, Eq)]

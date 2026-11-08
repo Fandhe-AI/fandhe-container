@@ -4,6 +4,7 @@
 //! 偽なのは実行層（`ContainerRuntime`）と publish バイナリ（`/bin/sh` の記録スクリプト）だけ。Start の後に終了を
 //! 観測した watcher が、偽バイナリへ argv と `Any`（TaskExit）を渡し、イベントがちょうど 1 件であることを具体値で確かめる。
 //! Delete 後に同じ ID で作り直した場合に、旧世代が旧 pid のイベントを送らないことも確かめる。
+//! Wait の直後の Delete（ctr 型）やキュー投入後の Delete でも、TaskExit が TaskDelete より先にちょうど 1 件届くことも確かめる（#4224）。
 #![cfg(unix)]
 
 #[path = "../../oci/tests/support/test_root.rs"]
@@ -143,9 +144,15 @@ fn start_req(id: &str) -> Vec<u8> {
 /// 偽バイナリの `n` 回目の呼び出し（`call<n>`）の完了を待ち、argv の topic と `Any` を返す。
 fn wait_call(out: &std::path::Path, n: usize) -> (String, Any) {
     let dir = out.join(format!("call{n}"));
-    assert!(wait_until(Duration::from_secs(10), || dir
-        .join("stdin")
-        .exists()));
+    let ok = wait_until(Duration::from_secs(10), || dir.join("stdin").exists());
+    assert!(
+        ok,
+        "call{n} missing: {:?}",
+        std::fs::read_dir(out)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect::<Vec<_>>()
+    );
     let argv = std::fs::read_to_string(dir.join("argv")).unwrap();
     let lines: Vec<&str> = argv.lines().collect();
     assert_eq!(
@@ -303,5 +310,136 @@ fn cri5_4155_events_reach_fake_publish_binary_in_order() {
     assert_eq!((exit.pid, exit.exit_status), (4242, 0));
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(count_calls(&out), 7);
+    assert!(log.0.lock().unwrap().is_empty());
+}
+
+/// 偽 publish バイナリ（`slow` の分だけ遅い）を通す本番の組み立てを作る。照会間隔は `poll`。
+fn setup_4224(
+    name: &str,
+    slow: &str,
+    poll: Duration,
+) -> (
+    TaskService,
+    Arc<Fake>,
+    std::path::PathBuf,
+    String,
+    Arc<CaptureLog>,
+    test_root::TestRoot,
+) {
+    let dir = test_root::test_root("pubit", name);
+    let out = dir.join("out");
+    std::fs::create_dir(&out).unwrap();
+    let body = format!(
+        "#!/bin/sh\nn=$(( $(/bin/ls \"{o}\" | /usr/bin/wc -l) ))\nd=\"{o}/call$n\"\n/bin/mkdir \"$d\"\nprintf '%s\\n' \"$@\" > \"$d/argv\"\n/bin/cat > \"$d/stdin.tmp\"\n{slow}/bin/mv \"$d/stdin.tmp\" \"$d/stdin\"\n",
+        o = out.display()
+    );
+    let bin = make_script(&dir, &body);
+    let log = Arc::new(CaptureLog::default());
+    let ctx = ServeContext::new(ShutdownSignal::new(), None)
+        .with_origin(
+            Some(ShimIdentifier::parse("default").unwrap()),
+            Some("/run/containerd/containerd.sock".into()),
+        )
+        .with_publish_binary(Some(PublishBinary::verify(&bin).unwrap()));
+    let publisher = exec_publisher_for_with(
+        &ctx,
+        PublishConfig::new(Duration::from_secs(5)).unwrap(),
+        log.clone(),
+    )
+    .expect("publisher");
+    let fake = Arc::new(Fake::default());
+    let svc = TaskService::new(
+        TaskApiVersion::V2,
+        RuntimeAdapter::from_runtime(Shared(fake.clone())),
+    )
+    .with_wait_config(WaitConfig::new(Duration::from_secs(30), poll).unwrap())
+    .with_event_publisher(publisher);
+    let bundle = dir.join("bundle");
+    std::fs::create_dir(&bundle).unwrap();
+    (
+        svc,
+        fake,
+        out,
+        bundle.to_str().unwrap().to_owned(),
+        log,
+        dir,
+    )
+}
+
+fn wait_req(id: &str) -> Vec<u8> {
+    fandhe_container_cri::shim_v2::WaitRequest {
+        id: id.into(),
+        exec_id: String::new(),
+    }
+    .encode_to_vec()
+}
+
+fn delete_req(id: &str) -> Vec<u8> {
+    DeleteRequest {
+        id: id.into(),
+        exec_id: String::new(),
+    }
+    .encode_to_vec()
+}
+
+/// CRI-5・#4224: ctr 型（Wait の直後、watcher の照会間隔（5 秒）より短い間隔で Delete）でも、偽 publish バイナリが
+/// TaskExit を TaskDelete より先にちょうど 1 件受け取る。
+#[test]
+fn cri5_4224_wait_then_delete_reaches_fake_binary_exit_then_delete() {
+    let (svc, fake, out, bundle, log, _dir) = setup_4224("waitdel", "", Duration::from_secs(5));
+    svc.handle("Create", &create_req("c1", &bundle)).unwrap();
+    svc.handle("Start", &start_req("c1")).unwrap();
+    assert_eq!(wait_call(&out, 0).0, "/tasks/create");
+    assert_eq!(wait_call(&out, 1).0, "/tasks/start");
+    // watcher の初回照会（running）を済ませる。次の照会は 5 秒後。
+    std::thread::sleep(Duration::from_millis(300));
+    *fake.stopped.lock().unwrap() = Some((3, 1_700_000_000_000_000_005));
+    svc.handle("Wait", &wait_req("c1")).unwrap();
+    svc.handle("Delete", &delete_req("c1")).unwrap();
+    let (topic, any) = wait_call(&out, 2);
+    assert_eq!(topic, "/tasks/exit");
+    assert_eq!(
+        TaskExit::decode(any.value.as_slice()).unwrap(),
+        TaskExit {
+            container_id: "c1".into(),
+            id: "c1".into(),
+            pid: 4242,
+            exit_status: 3,
+            exited_at: Some(Timestamp {
+                seconds: 1_700_000_000,
+                nanos: 5
+            }),
+        }
+    );
+    assert_eq!(wait_call(&out, 3).0, "/tasks/delete");
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(count_calls(&out), 4);
+    assert!(log.0.lock().unwrap().is_empty());
+}
+
+/// CRI-5・#4224（残余 (3)）: watcher が TaskExit をキューへ入れた後（偽バイナリが遅く未送信）に Delete が走っても、
+/// TaskExit は捨てられず TaskDelete より先に届く。
+#[test]
+fn cri5_4224_exit_queued_before_delete_is_not_dropped() {
+    let (svc, fake, out, bundle, log, _dir) =
+        setup_4224("queued", "/bin/sleep 0.4\n", Duration::from_millis(10));
+    svc.handle("Create", &create_req("c1", &bundle)).unwrap();
+    svc.handle("Start", &start_req("c1")).unwrap();
+    // Create・Start の送信中（各 0.4 秒）に停止させ、watcher が Exit をキューへ入れるのを待ってから Delete する。
+    *fake.stopped.lock().unwrap() = Some((3, 1_700_000_000_000_000_005));
+    std::thread::sleep(Duration::from_millis(150));
+    svc.handle("Delete", &delete_req("c1")).unwrap();
+    let topics: Vec<String> = (0..4).map(|n| wait_call(&out, n).0).collect();
+    assert_eq!(
+        topics,
+        [
+            "/tasks/create",
+            "/tasks/start",
+            "/tasks/exit",
+            "/tasks/delete"
+        ]
+    );
+    std::thread::sleep(Duration::from_millis(600));
+    assert_eq!(count_calls(&out), 4);
     assert!(log.0.lock().unwrap().is_empty());
 }

@@ -42,7 +42,7 @@
 //! irqfd の GSI は SPI 番号に等しい（`arch/arm64/kvm/vgic/vgic-irqfd.c` の既定 routing は pin = GSI で、注入は INTID = pin + 32）。
 //!
 //! aarch64 の machine type（IPA サイズ）は既定の 0（= 40 bit。Linux の `KVM_PHYS_SHIFT`）を使う。上限が 40 未満のホストでは
-//! `KVM_CREATE_VM` が EINVAL になるため、[`KvmDevice::arm_vm_ipa_size`] で上限を照会して VM を作る前に拒否する（#4227。
+//! `KVM_CREATE_VM` が EINVAL になるため、`KvmDevice::arm_vm_ipa_size` で上限を照会して VM を作る前に拒否する（#4227。
 //! 明示指定 `KVM_VM_TYPE_ARM_IPA_SIZE(n)` は範囲外。判断記録は docs/design/microvm-memory-ownership.md の #4227 の節）。
 //! [`KvmDevice`]・[`VmFd`]・[`VcpuFd`] は `OwnedFd` を持つため `Send` / `Sync`。
 

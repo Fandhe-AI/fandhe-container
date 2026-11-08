@@ -147,7 +147,7 @@ Agent が記録した判断（オーナー承認待ちの位置づけは冒頭�
 - e820 の予約表記（載せる）: `system_regions` の RAM 以外の領域（使用中の virtio-mmio の窓・IOAPIC・LAPIC・identity map・TSS）を 1 対 1 で type 2 として載せる（`e820_reservations` → `plan_boot` の `E820Reservation`）。領域の一覧と e820 の出どころが 1 つなので一致が機械的に保たれる。`plan_boot` は addr の昇順に整列し、size 0・溢れ・RAM / MP テーブルの予約 / 予約どうしの重なり・合計が `E820_MAX`（128）超を `InvalidArgument` で拒否する（最悪でも約 16 件。const assert で固定）
 - 却下案: (1) hole 全体 `[0xd000_0000, 4 GiB)` を 1 本の reserved にする案。32 bit の範囲に未使用の隙間が無くなり、カーネルが PCI の隙間を探す処理に影響しうることと、「領域の一覧と一致」の単一の出どころから外れることが理由（カーネル側の挙動は `arch/x86/kernel/e820.c` の原文を未確認のため、影響は推測にとどまる）。(2) 36 bit フォールバック（上記）
 - 一次情報の確認状況: Intel SDM の leaf 0x8000_0008 の EAX\[7:0\] が MAXPHYADDR である点を前提にした。Linux の `arch/x86/kvm/cpuid.c`・`arch/x86/kernel/cpu/common.c` と EAX\[23:16\]（AMD の GuestPhysAddrSize）の扱いは今回原文で確認していない（未確認）。EAX\[23:16\] は未考慮（EAX\[7:0\] のみ参照）
-- 範囲外（REPAIR-3）: aarch64 の IPA サイズ（`KVM_CAP_ARM_VM_IPA_SIZE`）の照合、macOS（HVF。単一領域で e820 が無い）、SIPI ページの e820 予約、実カーネルでの e820 の予約と 4 GiB 超の RAM の `/proc/iomem`・`/proc/meminfo` での通し確認（実機前提。`tests/kernel_boot.rs` の `--ignored`。追跡 issue: #4194）
+- 範囲外（REPAIR-3）: aarch64 の IPA サイズ（`KVM_CAP_ARM_VM_IPA_SIZE`）の照合と macOS（HVF）の既定 IPA 幅の照合は #4227 で実装（本書末尾の節）、SIPI ページの e820 予約、実カーネルでの e820 の予約と 4 GiB 超の RAM の `/proc/iomem`・`/proc/meminfo` での通し確認（実機前提。`tests/kernel_boot.rs` の `--ignored`。追跡 issue: #4194）
 - 再評価条件: 4 GiB 超にデバイスの窓を置くとき、PCI を導入するとき、ゲストが予約の範囲で不具合を示したとき
 - 試験: 既定のテスト集合の `mvm1_4106_*`（cpuid_x86・boot_x86・microvm の各 tests）
 
@@ -182,3 +182,12 @@ Agent が記録した判断（オーナー承認待ちの位置づけは冒頭�
 - 一次情報の確認状況: 本記録の作成時に Linux v6.12 の原文（`transhuge.rst`・`hugetlbpage.rst`・`mm/madvise.c`・`arch/x86/kvm/x86.c` の `disallow_lpage` 周辺・`arch/x86/kvm/mmu/`・`arch/arm64/kvm/mmu.c`）は確認していない（未確認）。上記の THP の `always` の挙動、`madvise` の戻り値（THP 無効ビルドと `never` の差）、整列が食い違う slot で large page が無効になること、dirty log 中の分割、`MAP_HUGETLB` の pool・SIGBUS・cgroup 計上は一般知識に基づく記述で、再評価時に原文で確かめる。`MADV_DONTFORK` / `MADV_DONTDUMP` と THP・hugetlb の併用の制約も未確認
 - 対応: hugepage の項目は本記録で閉じる。memslot のフラグは #4157（型）と #4158（登録への結線）が担う
 - `MAP_HUGETLB` の別 issue: 現時点では不要と判断（再評価条件 4 が出たら起票）。この判断はオーナーの確認待ち
+
+## #4227 での aarch64（KVM）と macOS（HVF）の IPA 幅の照合の記録（MVM-1・MVM-5・REPAIR-3）
+
+- 照合の位置: `create_vm` / `hv_vm_create` の前。「VM が実際に使う IPA 幅」と「レイアウトの最上位 GPA（`Arm64Layout::max_region_end`。RAM・GIC・virtio の窓全体・シリアルの終端の最大値。`validate` と同じ領域一覧から作る）」を `gpa_width::check_gpa_fits` で突き合わせ、収まらなければ `FailedPrecondition`（x86_64 の #4106 と同じ関数・同じ分類。message は固定文で数値を載せない）。照合の論理は OS 非依存の `crates/microvm/src/gpa_width.rs` に置き、x86_64 の CI で境界値を照合する（`mvm1_4227_*`）。
+- aarch64（KVM）: `KvmDevice::arm_vm_ipa_size` が system fd へ `KVM_CHECK_EXTENSION(KVM_CAP_ARM_VM_IPA_SIZE = 165)` を発行する（新しい `unsafe` なし。定数は `sys.rs` に置き具体値で固定）。応答はホストの IPA 上限ビット数。`kvm_arm64_type0_ipa_bits` が、0 以下・52 超は `FailedPrecondition`、40 未満も `FailedPrecondition`（machine type 0 は `KVM_PHYS_SHIFT` = 40 を使い、上限が 40 未満だと `kvm_init_stage2_mmu` が `-EINVAL` にするため）、それ以外は 40 とする。
+- machine type: 0 のまま（`KvmDevice::create_vm` は変えない）。理由: レイアウトは既に `ARM64_DEFAULT_IPA_LIMIT`（36 bit）で抑えられ 40 bit の既定で足りる。`KVM_VM_TYPE_ARM_IPA_SIZE(n)` の明示は実機 CI が無く検証できない。上限 40 未満のホストを対象にする予定がまだ無い。pKVM では type 0 でも `kvm_ipa_limit` 全体が使われるが、40 未満を一律拒否する安全側に倒した。
+- macOS（HVF）: `hv_vm_config_get_default_ipa_size(uint32_t *)`（macOS 13.0 以降）を `sys/hvf.rs` の `default_ipa_bits` が `dlsym` で解決して呼ぶ（GIC と同じ方式。deployment target 11.0 でも起動できる。`dlopen`・`dlclose` なし。見つからなければ `Unimplemented`）。`HvfMicroVm::assemble` が `layout.validate()` の直後に `gpa_width::hvf_ipa_bits`（0・52 超は拒否）と `check_gpa_fits` で照合する。`HVF_DEFAULT_IPA_LIMIT`（36 bit）は NULL config の VM に渡す FFI 引数の天井として残す。新しい `unsafe` は `sys/hvf.rs` の transmute と呼び出しの 2 か所（`// SAFETY:` つき）。
+- 一次情報: Linux v6.12 の `include/uapi/linux/kvm.h`・`arch/arm64/kvm/arm.c`・`mmu.c`（`kvm_init_stage2_mmu`）・`reset.c`・`kvm_mmu.h`（`KVM_PHYS_SHIFT`）を原文で確認した。Apple はドキュメントの JSON（シグネチャ・macOS 13.0 導入）を確認した。SDK のヘッダ（`hv_vm_config.h`）は本記録の作成環境が Linux のため未確認。`hv_vm_config_get_max_ipa_size`・`hv_vm_config_set_ipa_size` も今回は使わず未確認。
+- 範囲外（REPAIR-3）: `KVM_VM_TYPE_ARM_IPA_SIZE(n)` での明示指定（上限 40 未満のホストへの対応）、HVF の `hv_vm_config_set_ipa_size` で 36 bit を超える幅を使うこと、実機（KVM aarch64〔#3781〕・macOS の複数機種）での既定幅の観測と通し確認（人間担当。既存の実機前提の assemble 試験が新しい経路を通る）。再評価条件: 上限 40 未満のホストを対象にするとき、レイアウトを 36 bit 超へ広げるとき。

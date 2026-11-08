@@ -115,3 +115,13 @@ PR #2927（#2898）でレジストリの HTTP 状態を `PullImage` のトレー
 - 失敗のときだけ記録する（`CoreCriRecorder`）。共有記録器の `cri.pull_image` の失敗 1 件と、区分側の失敗 1 件は同じ失敗を別の切り口で数えたもの（二重計上。意図どおり）
 - 実機前提試験 `production_binary_full_lifecycle_real` の pull 失敗時は、メタデータから区分を読み、429 なら `production_binary_full_lifecycle_real: registry rate limit (HTTP 429); ...` の固定行を出す（それ以外は `pull failed with code <CODE> registry_http=<区分>`）。成否の判定は変えない。CI の事前プローブ（`make docker-hub-ratelimit-probe`）は残す
 - 範囲外: 操作統計のメトリクス公開口への接続（#1869）
+
+## CRI の在庫の永続化（#4176・CRI-1・CRI-2・OCI-7）
+
+`CriPluginBackends::production()`（unix）の `images` は、cri の `InMemoryImageStore` から plugin-cri の `PersistentImageStore`（`crates/plugin-cri/src/image_inventory.rs`）へ替えた。注入経路（`new`・`with_recorder`）と非 unix は従来どおりメモリのみ。
+
+- 保存先: pull と同じ root（`<state_root>/.cri/images`。oci の `ImageStore::open` の root）直下の `@cri-image-records.json`（0600）。形式の符号化と復号は cri の `image_service::persist`（`ImageRecord` の項目が非公開で、plugin-cri は serde を持たないため）。`top_level_digests` と `auxiliary_digests` を分けて保存し、`from_parts` で読み戻す
+- oci の在庫（`@image-inventory.json`）から導出しない理由: 在庫のキーは platform manifest で、multi-arch の index digest（`repo_digests[0]`）とタグ無し pull の repo 名が残らない。読むたびに `@lock` を取る案は同期の RPC を止める。偽の puller の試験は oci の在庫へ publish しない
+- 排他: 起動時の読み込みと `upsert` の書き込みは oci の `ImageStore::lock()` の区間の中で行う（root の再検査とプロセス間の排他を oci と共有）。`upsert` は区間の中でファイルを読み直し、cri の `upsert`（統合・タグの付け替え）で組み直してから、一時ファイル → fsync → rename → ディレクトリの fsync で書く。成功したときだけメモリ表示を差し替える。`list` / `get` はメモリだけで I/O しない
+- fail-closed の分け方: root の不信・排他の失敗・読み取りの I/O 失敗は起動を止める。記録ファイルだけが壊れている（不正・矛盾・symlink・通常ファイルでない・所有者違い・group / other 書き込み権・上限超過）ときは「使えない」状態で開き、`list`・`get`・`upsert` は `Corrupt`（`CriImageService` では `Internal`「image store failure」）。空として扱わず上書きしない。RuntimeService は生かして既存コンテナの stop / remove を通す。直すには記録を手で直して plugin を再起動する
+- 残り（REPAIR-3）: 読み書きはパス起点（oci の `RootHandle` は非公開。`lock()` の root 再検査と fstat の dev / ino 照合で守る）。`upsert` は実行器のスレッドで同期的に呼ばれ、oci のロック待ち（既定 5 秒）と fsync がほかの RPC を止めうる（plugin は `@instance.lock` で 1 インスタンスのため許容。blocking worker へ移すかは #4178）。RemoveImage・oci の在庫との突き合わせは #4177、PullImage の取り消しの窓は #4178、展開済み rootfs の GC は #471 系

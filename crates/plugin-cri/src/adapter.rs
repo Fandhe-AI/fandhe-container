@@ -50,9 +50,11 @@
 //! - bundle 供給: 本番は `CriPluginBackends::production_bundle_provider`（unix のみ）（pull 済みイメージの再展開と
 //!   ContainerConfig → config.json 変換。#2433）。`ImageService` は同じ UDS でサーブし（`CriPluginBackends::image_service`。#2592）、
 //!   `PullImage` が登録したタグ・digest・image ID を同じ在庫から解決する（未知の参照は `NOT_FOUND`）。
-//!   在庫は cri の `InMemoryImageStore`（プロセス内だけ）で、plugin-cri の再起動でタグの対応は失われる
-//!   （ディスク上のキャッシュは残るので `PullImage` をやり直せば blob を再取得せずに戻る）。oci の永続の在庫
-//!   〔TASK-183・OCI-7・#2315・#2380〕への配線は別途（REPAIR-3）。展開の所有者写像は既定の `Keep` + `Strip` のまま
+//!   在庫は `production()`（unix）では永続の `PersistentImageStore`（`<state_root>/.cri/images` の oci の ImageStore の
+//!   root 直下へ記録を保存し、起動時に読み戻す。再起動後も同じ ID・タグ・digest・サイズを返す。#4176・
+//!   `crate::image_inventory`）。注入（`new`・`with_recorder`）と非 unix は cri の `InMemoryImageStore`（プロセス内だけ）。
+//!   oci の在庫との突き合わせ・`RemoveImage` は #4177、PullImage の取り消しの窓は #4178（REPAIR-3）。
+//!   展開の所有者写像は既定の `Keep` + `Strip` のまま
 //!   （#2241・#2315・#482 が前提）。展開・pull・起動時の回収の計装（`OciOpRecorder`）は `CoreOciRecorder` で
 //!   oci 専用の `OpRecorder`（[`CriPluginBackends::oci_op_recorder`]）へ `oci.*` の名前で記録する（REPAIR-4・#2900）。
 //!   共有記録器は操作名の種類に上限（`MAX_TRACKED_OPS`）があり、pull が枠を取ると `create`・`delete` の記録を捨てさせるため分ける。
@@ -147,7 +149,8 @@ pub struct CriPluginBackends {
     /// 全 clone が共有し、最後の clone が drop されるまで保持する（CRI-2・CORE-1・#2931）。
     _instance_lock: Option<Arc<crate::instance_lock::InstanceLock>>,
     /// `ImageService`（`PullImage` の登録先）と本番の `BundleProvider`（`CreateContainer` のタグ解決）が共有する在庫。
-    /// プロセス内だけで永続化しない（再起動でタグの対応は失われる。モジュール doc の REPAIR-3）。
+    /// `production()`（unix）は永続の `PersistentImageStore`、注入（`new`・`with_recorder`）と非 unix は
+    /// プロセス内だけの `InMemoryImageStore`（#4176。モジュール doc）。
     images: Arc<dyn ImageStore>,
 }
 
@@ -240,6 +243,19 @@ impl CriPluginBackends {
         }
         let runtime = Arc::new(runtime);
         let mut backends = Self::with_recorder(runtime, state, network, recorder);
+        // 在庫は pull と同じ root（`.cri/images`）の永続の記録を開く。インスタンスロックの取得後に開き、
+        // 先行インスタンスの書き込みを読み落とさない（#4176・CRI-1・CRI-2・OCI-7）。
+        #[cfg(unix)]
+        {
+            let store = production_image_store_in(&state_root, Some(backends.oci_adapter()))
+                .map_err(|_| {
+                    TraitError::new(
+                        ErrorCode::FailedPrecondition,
+                        "failed to prepare the image store",
+                    )
+                })?;
+            backends.images = store;
+        }
         backends.state_root = Some(state_root);
         backends._instance_lock = Some(instance_lock);
         Ok(backends)
@@ -1721,30 +1737,10 @@ pub fn bundle_provider_with(
     recorder: Option<Arc<dyn OciOpRecorder>>,
 ) -> Result<Arc<fandhe_container_cri::bundle::SpecBundleProvider>, CriError> {
     use fandhe_container_cri::bundle::{ImageRootfsSource, SpecBundleProvider};
-    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
 
     let fail = || CriError::failed_precondition("failed to prepare the bundle store");
-    let owner = std::fs::symlink_metadata(state_root)
-        .map_err(|_| fail())?
-        .uid();
-    let mut dirs = Vec::new();
-    for rel in [BUNDLES_DIR, IMAGES_DIR] {
-        let mut cur = state_root.to_path_buf();
-        for part in rel.split('/') {
-            cur.push(part);
-            match std::fs::DirBuilder::new().mode(0o700).create(&cur) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(_) => return Err(fail()),
-            }
-            let m = std::fs::symlink_metadata(&cur).map_err(|_| fail())?;
-            if !m.file_type().is_dir() || m.uid() != owner || m.permissions().mode() & 0o077 != 0 {
-                return Err(fail());
-            }
-        }
-        dirs.push(cur);
-    }
-    let [bundles, _images] = <[PathBuf; 2]>::try_from(dirs).map_err(|_| fail())?;
+    let bundles = prepare_private_dir(state_root, BUNDLES_DIR).map_err(|_| fail())?;
+    prepare_private_dir(state_root, IMAGES_DIR).map_err(|_| fail())?;
     // SpecBundleProvider は root の正規化済みパスを要求する（途中の symlink を拒否する）。
     let bundles = std::fs::canonicalize(bundles).map_err(|_| fail())?;
     let mut source = ImageRootfsSource::new(production_extract_config(state_root)?);
@@ -1758,6 +1754,53 @@ pub fn bundle_provider_with(
         bundles,
         Arc::new(source),
     )?))
+}
+
+/// `state_root` 配下の相対パス `rel`（`.` 始まりの固定の置き場）を 0700 で用意して返す（CRI-2・OCI-4・SEC-1）。
+///
+/// 各要素は新規なら 0700 で作り、既存のものは symlink でなく、状態ルートと同じ所有者で、group / other の権限が
+/// 無いことを確かめる。反すれば消さずに `Err(())`（呼び出し側が固定文言の `CriError` にする）。
+/// `bundle_provider_with` と `production_image_store_in` が同じ基準で共有する。
+#[cfg(unix)]
+fn prepare_private_dir(state_root: &std::path::Path, rel: &str) -> Result<PathBuf, ()> {
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+
+    let owner = std::fs::symlink_metadata(state_root).map_err(|_| ())?.uid();
+    let mut cur = state_root.to_path_buf();
+    for part in rel.split('/') {
+        cur.push(part);
+        match std::fs::DirBuilder::new().mode(0o700).create(&cur) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => return Err(()),
+        }
+        let m = std::fs::symlink_metadata(&cur).map_err(|_| ())?;
+        if !m.file_type().is_dir() || m.uid() != owner || m.permissions().mode() & 0o077 != 0 {
+            return Err(());
+        }
+    }
+    Ok(cur)
+}
+
+/// 状態ルート配下の `.cri/images`（pull と同じ root）を 0700 で用意し、永続の在庫 [`PersistentImageStore`] を開く
+/// （CRI-1・CRI-2・OCI-7。#4176）。`production()` の組み立てで 1 回だけ呼ぶ。
+///
+/// root が不信・排他が取れない場合は `Err`（起動を止める）。記録ファイルだけが壊れているときは `Ok` で、
+/// 在庫の操作が `Internal` を返す（詳細は `crate::image_inventory`）。
+#[cfg(unix)]
+pub fn production_image_store_in(
+    state_root: &std::path::Path,
+    recorder: Option<Arc<dyn OciOpRecorder>>,
+) -> Result<Arc<crate::image_inventory::PersistentImageStore>, CriError> {
+    let root = prepare_private_dir(state_root, IMAGES_DIR)
+        .map_err(|_| CriError::failed_precondition("failed to prepare the image store"))?;
+    let store = match recorder {
+        Some(recorder) => {
+            crate::image_inventory::PersistentImageStore::open_with_recorder(&root, recorder)
+        }
+        None => crate::image_inventory::PersistentImageStore::open(&root),
+    }?;
+    Ok(Arc::new(store))
 }
 
 /// bundle を供給できない `BundleProvider`（REPAIR-3）。`prepare` は `UNIMPLEMENTED`、`release` は
@@ -1789,6 +1832,44 @@ mod tests {
     use fandhe_container_cri::instrument::{CriOpKind, CriOpTimer};
 
     use super::*;
+
+    /// CRI-1・CRI-2・OCI-7・#4176: `.cri/images` を 0700 で作って永続の在庫を開き、開き直しで記録が見える。
+    /// 既存の `.cri/images` が group 書き込み可なら（`bundle_provider_with` と同じ基準で）拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn cri1_production_image_store_in_creates_private_dir_and_persists() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let state = crate::test_root::test_root("fcpc-imgstore", "t");
+        let store = production_image_store_in(&state, None).expect("open");
+        let images = state.join(".cri").join("images");
+        let mode = std::fs::symlink_metadata(&images)
+            .expect("meta")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+        store
+            .upsert(
+                fandhe_container_cri::image_service::ImageRecord::new(
+                    "sha256:aaa",
+                    vec!["docker.io/library/a:1".to_owned()],
+                    vec![],
+                    7,
+                )
+                .expect("record"),
+            )
+            .expect("upsert");
+        drop(store);
+        let again = production_image_store_in(&state, None).expect("reopen");
+        let listed = again.list().expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id(), "sha256:aaa");
+        drop(again);
+
+        std::fs::set_permissions(&images, std::fs::Permissions::from_mode(0o770)).expect("chmod");
+        let err = production_image_store_in(&state, None).expect_err("must reject");
+        assert_eq!(err.message(), "failed to prepare the image store");
+    }
 
     /// REPAIR-5・#2821: 本番の rootfs 展開設定は `PLUGIN_ROOTFS_DEADLINE`（600 秒）を明示して使う。
     #[cfg(unix)]

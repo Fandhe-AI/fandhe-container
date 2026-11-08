@@ -178,7 +178,7 @@
 use super::error::{LifecycleOp, OciRuntimeError};
 use super::image_refs::{ContainerImageRefs, ImageRefRelease};
 use super::image_rootfs::{
-    ImageRootfsPrivilege, RecordedRootfsRemoval, remove_recorded_rootfs_with,
+    ImageRootfsPrivilege, RecordedRootfsRemoval, remove_recorded_rootfs_until,
 };
 use super::launch::BundleLock;
 use crate::observability::{OpName, OpRecorder};
@@ -187,6 +187,7 @@ use crate::traits::{
     DeleteResponse, DeleteStateRequest, ErrorCode, GetStateRequest, StateRecord, StateRevision,
     StateStore, TraitError,
 };
+use std::time::Instant;
 
 /// [`OpRecorder`] に記録する操作名（REPAIR-4）。
 const DELETE_OP_NAME: &str = "delete";
@@ -287,6 +288,7 @@ pub trait ContainerCgroupRemover: Send + Sync {
 #[non_exhaustive]
 pub struct DeleteOptions {
     rootfs_privilege: ImageRootfsPrivilege,
+    deadline: Option<Instant>,
 }
 
 impl DeleteOptions {
@@ -302,6 +304,23 @@ impl DeleteOptions {
     /// うえで木を残し、`image_rootfs_remove` の失敗として記録する。
     pub fn with_rootfs_privilege(mut self, privilege: ImageRootfsPrivilege) -> Self {
         self.rootfs_privilege = privilege;
+        self
+    }
+
+    /// 呼び出し元の絶対期限を指定する（REPAIR-5・CRI-5・OCI-6・OCI-7・#4239）。
+    ///
+    /// 期限は次の 3 か所で効く。いずれも握り潰さない。
+    /// - 状態の検査後・cgroup に触れる前と、状態記録を消す直前（コミット前）に確かめる。過ぎていれば
+    ///   記録を残して [`ErrorCode::Timeout`] で失敗する（再実行できる）。
+    /// - 状態記録の削除は [`StateStore::delete_until`] へ期限を渡し、状態ロックの待ちと、ロックを取った後の
+    ///   確認にも使う。
+    /// - core が作った rootfs の木の削除はエントリごとに確かめ、止まったら木を残して
+    ///   [`DeleteResponse::image_rootfs`] に `Kept { code: Timeout }` を載せる（記録は既に消えているので
+    ///   delete 自体は成功。残骸は呼び出し元が警告として観測できる）。
+    ///
+    /// 既定は `None`（期限なし。従来どおり）。中断のあとの自動回収はこの設定の範囲外（#4152）。
+    pub fn with_deadline(mut self, deadline: Instant) -> Self {
+        self.deadline = Some(deadline);
         self
     }
 }
@@ -430,6 +449,8 @@ fn delete_inner(
     req: &DeleteRequest,
     options: &DeleteOptions,
 ) -> Result<DeleteResponse, TraitError> {
+    // 期限が既に過ぎていれば、何にも触れずに記録を残して失敗する（REPAIR-5・#4239）。
+    ensure_before_deadline(options.deadline, "cgroup and state removal")?;
     let record = store.get(&GetStateRequest::new(req.id().clone()))?;
     check_deletable(&record, req.force())?;
     // core が作った rootfs を持つコンテナは、状態削除から rootfs の後始末の完了まで bundle の所有ロックを保持する。
@@ -463,6 +484,9 @@ fn delete_inner(
         // 別の委譲スコープでの `NotPresent` は「cgroup 無し」の確認にならないので、不一致のときは
         // 記録のスコープを検証つきで直接開く経路へ渡す（#2060 案 B）。Removed / NotPresent はどちらも
         // 記録されたスコープ・instance で「cgroup が無い」状態に到達したので次へ進む。失敗はレコードを残して返す。
+        // 状態の再確認（ロック待ちを伴う読み取り）のあとの、cgroup の破壊的な削除の直前にも確かめる。
+        // 入口の確認だけでは、読み取りの間に過ぎた期限を見落とす（REPAIR-5・#4239）。
+        ensure_before_deadline(options.deadline, "cgroup removal")?;
         let removal = if scope_matches {
             cgroups.remove_with_recorder(req.id(), placement.instance(), recorder)?
         } else {
@@ -473,7 +497,14 @@ fn delete_inner(
         }
     }
     let delete_req = DeleteStateRequest::new(req.id().clone(), record.revision());
-    match store.delete(&delete_req) {
+    // コミット（記録の削除）の前に残り時間を確かめる。切れていれば記録を残す（再実行は cgroup が
+    // 既に無くても成功する）。ロックの待ちと取得後の確認はストアが担う（#4239）。
+    ensure_before_deadline(options.deadline, "state record removal")?;
+    let deleted = match options.deadline {
+        Some(deadline) => store.delete_until(&delete_req, deadline),
+        None => store.delete(&delete_req),
+    };
+    match deleted {
         Ok(_) => {
             // 状態を消した実際の revision のレコード（関数の先頭で読んだもの）に付いた記録だけを使う。
             let outcome = remove_core_created_rootfs(
@@ -481,6 +512,7 @@ fn delete_inner(
                 &record,
                 rootfs_lock.as_ref(),
                 &options.rootfs_privilege,
+                options.deadline,
             );
             Ok(DeleteResponse::new().with_image_rootfs(outcome))
         }
@@ -518,6 +550,7 @@ fn remove_core_created_rootfs(
     record: &StateRecord,
     lock: Option<&Result<BundleLock, TraitError>>,
     privilege: &ImageRootfsPrivilege,
+    deadline: Option<Instant>,
 ) -> CleanupOutcome {
     let Some(rec) = record.image_rootfs() else {
         return CleanupOutcome::NotApplicable;
@@ -529,7 +562,7 @@ fn remove_core_created_rootfs(
         };
     };
     let result = recorder.record_op(&name, || match lock {
-        Some(Ok(_held)) => remove_recorded_rootfs_with(record.bundle(), rec, privilege),
+        Some(Ok(_held)) => remove_recorded_rootfs_until(record.bundle(), rec, privilege, deadline),
         Some(Err(e)) if e.code() == ErrorCode::NotFound => Ok(RecordedRootfsRemoval::NotPresent),
         Some(Err(e)) => Err(TraitError::new(
             e.code(),
@@ -548,6 +581,17 @@ fn remove_core_created_rootfs(
 }
 
 /// 状態の判定表（モジュール doc）。`ContainerState` の追加をコンパイルエラーで検出するため網羅で書く。
+/// 絶対期限が過ぎていれば [`ErrorCode::Timeout`]（記録を残したまま失敗させる。#4239）。
+fn ensure_before_deadline(deadline: Option<Instant>, stage: &str) -> Result<(), TraitError> {
+    match deadline {
+        Some(d) if Instant::now() >= d => Err(TraitError::new(
+            ErrorCode::Timeout,
+            format!("delete deadline passed before {stage}; the state record was kept"),
+        )),
+        _ => Ok(()),
+    }
+}
+
 fn check_deletable(record: &StateRecord, force: bool) -> Result<(), TraitError> {
     let status = record.status();
     match (status.state(), status.pid()) {
@@ -1042,6 +1086,218 @@ mod tests {
             "container state changed during delete; retry"
         );
         assert!(store.has("c1"));
+    }
+
+    /// 期限つきの削除を記録するストア（`MemStateStore` を包む。#4239）。`delete` と `delete_until` の
+    /// どちらが呼ばれ、どの期限が渡ったかを残す。
+    struct UntilProbe<'a> {
+        inner: &'a MemStateStore,
+        until_calls: Mutex<Vec<Instant>>,
+        plain_calls: Mutex<u32>,
+    }
+
+    impl<'a> UntilProbe<'a> {
+        fn new(inner: &'a MemStateStore) -> Self {
+            Self {
+                inner,
+                until_calls: Mutex::new(Vec::new()),
+                plain_calls: Mutex::new(0),
+            }
+        }
+    }
+
+    impl StateStore for UntilProbe<'_> {
+        fn create(&self, req: &CreateStateRequest) -> Result<StateRecord, TraitError> {
+            self.inner.create(req)
+        }
+        fn update(&self, req: &UpdateStateRequest) -> Result<StateRecord, TraitError> {
+            self.inner.update(req)
+        }
+        fn get(&self, req: &GetStateRequest) -> Result<StateRecord, TraitError> {
+            self.inner.get(req)
+        }
+        fn list(&self, req: &ListStateRequest) -> Result<StateList, TraitError> {
+            self.inner.list(req)
+        }
+        fn delete(&self, req: &DeleteStateRequest) -> Result<DeleteStateResponse, TraitError> {
+            *self.plain_calls.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+            self.inner.delete(req)
+        }
+        fn delete_until(
+            &self,
+            req: &DeleteStateRequest,
+            deadline: Instant,
+        ) -> Result<DeleteStateResponse, TraitError> {
+            self.until_calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(deadline);
+            self.inner.delete(req)
+        }
+    }
+
+    /// 削除に時間がかかる cgroup 削除器の偽物（`RecordingRemover` を包んで `remove` の前に眠る）。
+    struct SlowRemover {
+        inner: RecordingRemover,
+        delay: std::time::Duration,
+    }
+
+    impl ContainerCgroupRemover for SlowRemover {
+        fn scope(&self) -> Result<CgroupScope, TraitError> {
+            self.inner.scope()
+        }
+        fn remove(
+            &self,
+            id: &ContainerId,
+            instance: StateRevision,
+        ) -> Result<CgroupRemoval, TraitError> {
+            std::thread::sleep(self.delay);
+            self.inner.remove(id, instance)
+        }
+    }
+
+    fn run_with_deadline(
+        store: &dyn StateStore,
+        cgroups: &dyn ContainerCgroupRemover,
+        deadline: Option<Instant>,
+    ) -> Result<DeleteResponse, OciRuntimeError> {
+        let mut options = DeleteOptions::new();
+        if let Some(d) = deadline {
+            options = options.with_deadline(d);
+        }
+        delete_with_options(
+            store,
+            &OpRecorder::new(),
+            cgroups,
+            &DeleteRequest::new(cid("c1")),
+            &options,
+        )
+    }
+
+    /// REPAIR-5・OCI-6・CRI-5（#4239）: 期限を渡すと `delete_until` へその値のまま渡り、`delete` は呼ばれない。
+    #[test]
+    fn repair5_4239_deadline_is_passed_to_delete_until() {
+        let mem = MemStateStore::with(ContainerStatus::stopped(cid("c1"), Some(0)));
+        let store = UntilProbe::new(&mem);
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        let remover = RecordingRemover::returning(Ok(CgroupRemoval::NotPresent));
+        run_with_deadline(&store, &remover, Some(deadline)).expect("delete");
+        assert_eq!(*store.until_calls.lock().expect("lock"), vec![deadline]);
+        assert_eq!(*store.plain_calls.lock().expect("lock"), 0);
+        assert!(!mem.has("c1"));
+    }
+
+    /// OCI-6（#4239）: 期限なし（`None`）は従来どおり `delete` を呼び、`delete_until` は呼ばない。
+    #[test]
+    fn oci6_4239_no_deadline_uses_plain_delete() {
+        let mem = MemStateStore::with(ContainerStatus::stopped(cid("c1"), Some(0)));
+        let store = UntilProbe::new(&mem);
+        let remover = RecordingRemover::returning(Ok(CgroupRemoval::NotPresent));
+        run_with_deadline(&store, &remover, None).expect("delete");
+        assert!(store.until_calls.lock().expect("lock").is_empty());
+        assert_eq!(*store.plain_calls.lock().expect("lock"), 1);
+        assert!(!mem.has("c1"));
+    }
+
+    /// OCI-6（#4239）: `delete_until` を上書きしない既存のストアでも、期限つきの delete は従来の `delete`
+    /// へ委譲されて成功する（既存の実装の挙動を変えない）。
+    #[test]
+    fn oci6_4239_default_delete_until_delegates_to_delete() {
+        let mem = MemStateStore::with(ContainerStatus::stopped(cid("c1"), Some(0)));
+        let remover = RecordingRemover::returning(Ok(CgroupRemoval::NotPresent));
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        run_with_deadline(&mem, &remover, Some(deadline)).expect("delete");
+        assert!(!mem.has("c1"));
+    }
+
+    /// REPAIR-5・CRI-5（#4239）: 開始時点で期限が過ぎていれば、cgroup にも記録にも触れず `Timeout`。
+    #[test]
+    fn repair5_4239_expired_deadline_touches_nothing() {
+        let mem = MemStateStore::with_scope(ContainerStatus::stopped(cid("c1"), Some(0)), SCOPE);
+        let remover = RecordingRemover::returning(Ok(CgroupRemoval::Removed));
+        let err = run_with_deadline(&mem, &remover, Some(Instant::now())).expect_err("timeout");
+        assert_eq!(err.code(), ErrorCode::Timeout);
+        assert!(remover.calls().is_empty());
+        assert!(mem.has("c1"));
+    }
+
+    /// `get` の n 回目の呼び出しの後に眠る遅い読み取りの偽物（`MemStateStore` を包む。#4239）。
+    struct SlowGetStore<'a> {
+        inner: &'a MemStateStore,
+        sleep_after_get: u32,
+        delay: std::time::Duration,
+        gets: Mutex<u32>,
+    }
+
+    impl StateStore for SlowGetStore<'_> {
+        fn create(&self, req: &CreateStateRequest) -> Result<StateRecord, TraitError> {
+            self.inner.create(req)
+        }
+        fn update(&self, req: &UpdateStateRequest) -> Result<StateRecord, TraitError> {
+            self.inner.update(req)
+        }
+        fn get(&self, req: &GetStateRequest) -> Result<StateRecord, TraitError> {
+            let r = self.inner.get(req);
+            let nth = {
+                let mut g = self.gets.lock().unwrap_or_else(|e| e.into_inner());
+                *g += 1;
+                *g
+            };
+            if nth == self.sleep_after_get {
+                std::thread::sleep(self.delay);
+            }
+            r
+        }
+        fn list(&self, req: &ListStateRequest) -> Result<StateList, TraitError> {
+            self.inner.list(req)
+        }
+        fn delete(&self, req: &DeleteStateRequest) -> Result<DeleteStateResponse, TraitError> {
+            self.inner.delete(req)
+        }
+    }
+
+    /// REPAIR-5・OCI-6・CRI-5（#4239）: 最初の `get` が遅く（状態ロック待ちの再現）、cgroup の削除の直前に
+    /// 期限が過ぎていれば、cgroup に触れず記録も残して `Timeout`。2 回目の `get` が遅い場合も同じ。
+    #[test]
+    fn repair5_4239_deadline_passing_during_reads_does_not_remove_cgroup() {
+        for sleep_after_get in [1, 2] {
+            let mem =
+                MemStateStore::with_scope(ContainerStatus::stopped(cid("c1"), Some(0)), SCOPE);
+            let store = SlowGetStore {
+                inner: &mem,
+                sleep_after_get,
+                delay: std::time::Duration::from_millis(300),
+                gets: Mutex::new(0),
+            };
+            let remover = RecordingRemover::returning(Ok(CgroupRemoval::Removed));
+            let deadline = Instant::now() + std::time::Duration::from_millis(100);
+            let err = run_with_deadline(&store, &remover, Some(deadline)).expect_err("timeout");
+            assert_eq!(err.code(), ErrorCode::Timeout, "get #{sleep_after_get}");
+            assert!(remover.calls().is_empty(), "get #{sleep_after_get}");
+            assert!(mem.has("c1"));
+        }
+    }
+
+    /// REPAIR-5・CRI-5・OCI-6（#4239）: cgroup の削除に時間がかかって、コミット前に期限が過ぎた場合は、
+    /// 記録を消さずに `Timeout`（再実行で続きから消せる）。
+    #[test]
+    fn repair5_4239_deadline_passing_during_cgroup_removal_keeps_record() {
+        let mem = MemStateStore::with_scope(ContainerStatus::stopped(cid("c1"), Some(0)), SCOPE);
+        let store = UntilProbe::new(&mem);
+        let slow = SlowRemover {
+            inner: RecordingRemover::returning(Ok(CgroupRemoval::Removed)),
+            delay: std::time::Duration::from_millis(300),
+        };
+        let deadline = Instant::now() + std::time::Duration::from_millis(100);
+        let err = run_with_deadline(&store, &slow, Some(deadline)).expect_err("timeout");
+        assert_eq!(err.code(), ErrorCode::Timeout);
+        assert_eq!(slow.inner.calls(), vec![cid("c1")]);
+        assert!(mem.has("c1"));
+        assert!(store.until_calls.lock().expect("lock").is_empty());
+        // 再実行（期限なし）は cgroup が無くても成功して記録を消す。
+        let again = RecordingRemover::returning(Ok(CgroupRemoval::NotPresent));
+        run_with_deadline(&mem, &again, None).expect("retry");
+        assert!(!mem.has("c1"));
     }
 
     /// CORE-2・OCI-5: get の後に同じ ID が削除・再作成されても、新しいレコードは消さない。再作成された

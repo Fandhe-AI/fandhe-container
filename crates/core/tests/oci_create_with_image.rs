@@ -19,9 +19,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use fandhe_container_core::observability::{OpName, OpRecorder};
 use fandhe_container_core::oci_runtime::{
-    CgroupRemoval, ContainerCgroupRemover, ContainerImage, ContainerImageRefs, ImageManifestDigest,
-    ImageRefGeneration, ImageRefRegistration, ImageRefRelease, ImageRootfsUnpacked,
-    ImageRootfsUnpacker, create_with_image, delete_releasing_image_ref,
+    CgroupRemoval, ContainerCgroupRemover, ContainerImage, ContainerImageRefs, DeleteOptions,
+    ImageManifestDigest, ImageRefGeneration, ImageRefRegistration, ImageRefRelease,
+    ImageRootfsUnpacked, ImageRootfsUnpacker, create_with_image, delete_releasing_image_ref,
+    delete_releasing_image_ref_with_options,
 };
 use fandhe_container_core::state_store::{FileStateStore, StateRoot};
 use fandhe_container_core::traits::{
@@ -412,6 +413,118 @@ fn oci7_delete_keeps_user_supplied_rootfs() {
         std::fs::read(sb.rootfs().join("user-data")).expect("kept"),
         b"keep"
     );
+    assert_eq!(rootfs_remove_counts(&rec), (0, 0));
+}
+
+/// 実 `FileStateStore` を包み、記録の削除（`delete_until`）の後に眠る（rootfs の木の削除に入る前に
+/// 絶対期限が過ぎた状況を作る遅い削除の偽物。#4239）。
+struct SlowAfterRecordDelete<'a> {
+    inner: &'a FileStateStore,
+    delay: std::time::Duration,
+}
+
+impl StateStore for SlowAfterRecordDelete<'_> {
+    fn create(&self, req: &CreateStateRequest) -> Result<StateRecord, TraitError> {
+        self.inner.create(req)
+    }
+    fn update(&self, req: &UpdateStateRequest) -> Result<StateRecord, TraitError> {
+        self.inner.update(req)
+    }
+    fn get(&self, req: &GetStateRequest) -> Result<StateRecord, TraitError> {
+        self.inner.get(req)
+    }
+    fn list(&self, req: &ListStateRequest) -> Result<StateList, TraitError> {
+        self.inner.list(req)
+    }
+    fn delete(&self, req: &DeleteStateRequest) -> Result<DeleteStateResponse, TraitError> {
+        self.inner.delete(req)
+    }
+    fn delete_until(
+        &self,
+        req: &DeleteStateRequest,
+        deadline: std::time::Instant,
+    ) -> Result<DeleteStateResponse, TraitError> {
+        let r = self.inner.delete_until(req, deadline);
+        std::thread::sleep(self.delay);
+        r
+    }
+    fn host_state_root(&self) -> Option<&Path> {
+        self.inner.host_state_root()
+    }
+}
+
+fn delete_c1_until(
+    store: &dyn StateStore,
+    rec: &OpRecorder,
+    refs: &Refs,
+    deadline: std::time::Instant,
+) -> Result<DeleteResponse, fandhe_container_core::oci_runtime::OciRuntimeError> {
+    delete_releasing_image_ref_with_options(
+        store,
+        rec,
+        &NoCgroup,
+        refs,
+        &DeleteRequest::new(ContainerId::new("c1").expect("id")),
+        &DeleteOptions::new().with_deadline(deadline),
+    )
+}
+
+/// REPAIR-5・OCI-7・CRI-5（#4239）: 記録の削除の後に期限が過ぎると、rootfs の木の削除は期限で止まり、
+/// delete 自体は成功したまま `Kept { Timeout }` を応答に載せる（握り潰さない）。木は残り、失敗として記録される。
+#[test]
+fn repair5_4239_delete_rootfs_removal_stops_at_deadline_and_reports_kept_timeout() {
+    let sb = Sandbox::new();
+    let inner = sb.store();
+    let refs = Refs::default();
+    run(&inner, &refs, &Unpacker { fail: false }, &sb).expect("create");
+    let store = SlowAfterRecordDelete {
+        inner: &inner,
+        delay: std::time::Duration::from_millis(400),
+    };
+    let rec = OpRecorder::new();
+    let started = std::time::Instant::now();
+    let deadline = started + std::time::Duration::from_millis(200);
+    let resp = delete_c1_until(&store, &rec, &refs, deadline).expect("delete succeeds");
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert_eq!(
+        resp.image_rootfs(),
+        CleanupOutcome::Kept {
+            code: ErrorCode::Timeout
+        }
+    );
+    assert_eq!(resp.kept().count(), 1);
+    assert!(sb.rootfs().join("bin").join("true").is_file());
+    assert_eq!(rootfs_remove_counts(&rec), (0, 1));
+    assert_eq!(get(&inner).expect_err("gone").code(), ErrorCode::NotFound);
+}
+
+/// OCI-7・REPAIR-5（#4239）: 期限に十分な余裕があれば、期限つきでも rootfs は消える（`Removed`）。
+#[test]
+fn oci7_4239_delete_with_generous_deadline_removes_rootfs() {
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let refs = Refs::default();
+    run(&store, &refs, &Unpacker { fail: false }, &sb).expect("create");
+    let rec = OpRecorder::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let resp = delete_c1_until(&store, &rec, &refs, deadline).expect("delete");
+    assert_eq!(resp.image_rootfs(), CleanupOutcome::Removed);
+    assert!(!sb.rootfs().exists());
+    assert_eq!(rootfs_remove_counts(&rec), (1, 0));
+}
+
+/// REPAIR-5・CRI-5（#4239）: 期限が過ぎた状態で始めた delete は、記録も rootfs も変えずに `Timeout`。
+#[test]
+fn repair5_4239_delete_with_expired_deadline_changes_nothing() {
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let refs = Refs::default();
+    run(&store, &refs, &Unpacker { fail: false }, &sb).expect("create");
+    let rec = OpRecorder::new();
+    let e = delete_c1_until(&store, &rec, &refs, std::time::Instant::now()).expect_err("timeout");
+    assert_eq!(e.code(), ErrorCode::Timeout);
+    assert!(get(&store).is_ok());
+    assert!(sb.rootfs().join("bin").join("true").is_file());
     assert_eq!(rootfs_remove_counts(&rec), (0, 0));
 }
 

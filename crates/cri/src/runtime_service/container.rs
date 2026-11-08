@@ -186,6 +186,11 @@ pub(super) struct ContainerRecord {
     /// メモリ専用で、記録ファイル（v1）へは書かない。同じコンテナの実行層の読み取りを同時に 1 本までにし、
     /// 期限切れで切り離した worker の累積を running の記録数で抑える（REPAIR-5）。
     pub(super) exit_observe_pending: bool,
+    /// 最後に実行層の状態を読み終えた時刻（単調時計。`None` は未観測。#4175・#4173 の E2）。
+    ///
+    /// `ListContainers` の観測が 1 回の上限で候補を切るとき、未観測・古い順に先に読むための並べ替えのキー。
+    /// `exit_observe_pending` と同じくメモリ専用で、記録ファイル（v1）へは書かない。
+    pub(super) exit_observed_at: Option<std::time::Instant>,
 }
 
 /// 新しい記録の `stop_signal` の初期値（config の値。`RUNTIME_DEFAULT` は `SIGTERM`）。
@@ -457,14 +462,28 @@ impl ValidatedContainerFilter {
 
     /// 全条件を AND で判定する。
     pub(super) fn matches(&self, id: &str, record: &ContainerRecord) -> bool {
+        self.matches_except_state(id, record) && self.state.is_none_or(|s| s == record.state)
+    }
+
+    /// 状態以外の条件（id・pod・ラベル）だけで判定する（`ListContainers` の観測の候補選びに使う。#4175）。
+    pub(super) fn matches_except_state(&self, id: &str, record: &ContainerRecord) -> bool {
         !self.matches_none
             && (self.id.is_empty() || self.id == id)
             && (self.pod_sandbox_id.is_empty() || self.pod_sandbox_id == record.pod_sandbox_id)
-            && self.state.is_none_or(|s| s == record.state)
             && self
                 .label_selector
                 .iter()
                 .all(|(k, v)| record.config.labels.get(k) == Some(v))
+    }
+
+    /// 実行層の状態を読んで自然終了を取り込む価値があるフィルタか。状態の指定なし・Running・Exited のとき真
+    /// （Created・Unknown の指定は取り込みで結果が増えないので読まない。#4175）。
+    pub(super) fn wants_exit_observation(&self) -> bool {
+        !self.matches_none
+            && matches!(
+                self.state,
+                None | Some(ContainerState::Running) | Some(ContainerState::Exited)
+            )
     }
 }
 

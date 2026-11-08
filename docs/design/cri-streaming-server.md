@@ -19,8 +19,8 @@ CRI の `Exec`・`Attach`・`PortForward` は、RPC 自体ではデータを流�
 
 ## バインドの方針
 
-- 既定は `127.0.0.1:0`（loopback、OS が空きポートを選ぶ）。外部への公開は `StreamingConfig::allow_external` を明示したときだけで、`0.0.0.0`・`::` も外部として扱う。違反は起動時に `INVALID_ARGUMENT`（fail-closed）
-- 発行 URL の host は `StreamingConfig::advertise_addr`（IP）を使い、ポートは実際の待ち受けポートにする。未指定なら bind したアドレスを使う。`0.0.0.0`・`::` で bind するときは kubelet から到達できない URL になるため広告アドレスを必須とし、無ければ（または広告アドレスが未指定アドレス・マルチキャストなら）起動時に `INVALID_ARGUMENT`（fail-closed）
+- 既定は `127.0.0.1:0`（loopback、OS が空きポートを選ぶ）。外部への公開は `StreamingConfig::allow_external` を明示したときだけで、`0.0.0.0`・`::` も外部として扱う（`::ffff:127.0.0.1` など IPv4 射影の loopback も loopback とは扱わず外部とする。緩めない・plugin-cri の判定と揃える。#4238・SEC-1）。違反は起動時に `INVALID_ARGUMENT`（fail-closed）
+- 発行 URL の host は `StreamingConfig::advertise_addr`（IP）を使い、ポートは実際の待ち受けポートにする。未指定なら bind したアドレスを使う。`0.0.0.0`・`::` で bind するときは kubelet から到達できない URL になるため広告アドレスを必須とし、無ければ（または広告アドレスが未指定アドレス・マルチキャストなら）起動時に `INVALID_ARGUMENT`（fail-closed）。ワイルドカード・未指定・マルチキャストの判定は IPv4 射影形を正規化してから行う（`::ffff:0.0.0.0` も拒否する。#4238）
 - 外部へ公開するときは TLS も認証も無い。URL を知ることが唯一の認可なので、前段のネットワーク制御（ファイアウォール・リバースプロキシ等）で守ること
 - plugin-cri の CLI は `--streaming-bind <ADDR>`・`--streaming-allow-external`・`--streaming-advertise <IP>` を `StreamingConfig` の `bind`・`allow_external`・`advertise_addr` へ 1:1 で写す（#4110・CRI-6・REPAIR-3）。`allow_external` は bind アドレスから推測せず別の明示フラグにする。cri の `validate()` に通し、さらに「opt-in だけ・広告だけが立つ指定」（非 loopback の bind なしの `--streaming-allow-external`、`--streaming-allow-external` なしの `--streaming-advertise`）も拒む。違反は起動前に `error: INVALID_ARGUMENT: invalid --streaming-* argument`（終了コード 2、値は含めない）。非 loopback で実際に待ち受けたときだけ、起動時に警告 1 行（`cri_streaming_external_exposure`、固定文言、アドレスなし）を stderr へ出す
 - UDS での待ち受けは扱わない。kubelet は返された `http://` の URL へ接続するため、UDS の URL を kubelet が使える根拠の一次情報が無い（未確認・後続）

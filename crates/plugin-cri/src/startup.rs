@@ -495,6 +495,15 @@ mod tests {
             vec!["--streaming-bind=192.0.2.1:0"],
             vec!["--streaming-bind=0.0.0.0:0", "--streaming-allow-external"],
             vec![
+                "--streaming-bind=[::ffff:0.0.0.0]:0",
+                "--streaming-allow-external",
+            ],
+            vec![
+                "--streaming-bind=0.0.0.0:0",
+                "--streaming-allow-external",
+                "--streaming-advertise=::ffff:0.0.0.0",
+            ],
+            vec![
                 "--streaming-bind=0.0.0.0:0",
                 "--streaming-allow-external",
                 "--streaming-advertise=0.0.0.0",

@@ -151,7 +151,7 @@ pub struct StreamingConfig {
     pub bind: SocketAddr,
     /// loopback 以外のアドレスでの待ち受けを許すか。既定は false（明示の opt-in。TLS も認証も無い）。
     pub allow_external: bool,
-    /// 発行 URL に埋め込む広告アドレス（IP）。`bind` がワイルドカード（`0.0.0.0`・`::`）のときは必須
+    /// 発行 URL に埋め込む広告アドレス（IP）。`bind` がワイルドカード（`0.0.0.0`・`::`・IPv4 射影形 `::ffff:0.0.0.0` を含む）のときは必須
     /// （kubelet から到達できない `http://0.0.0.0:port` を発行しないため。CRI-6）。ポートは実際の待ち受けポートを使う。
     pub advertise_addr: Option<IpAddr>,
     /// トークンの有効期間。既定は 60 秒（kubelet のトークンキャッシュの TTL に合わせる）。
@@ -250,20 +250,28 @@ impl StreamingConfig {
     }
 
     /// 設定を検証する（fail-closed）。外部アドレス（`0.0.0.0`・`::` を含む）は `allow_external` が無ければ拒否する。
+    ///
+    /// 未指定・マルチキャスト・ワイルドカードの判定は `IpAddr::to_canonical()` で IPv4 射影形
+    /// （`::ffff:0.0.0.0` 等）を IPv4 として扱う（到達できない URL の発行と広告アドレス必須の検査の
+    /// すり抜けを防ぐ。CRI-6・SEC-1・#4238）。loopback の判定は正規化せず、`::ffff:127.0.0.1` は外部扱い
+    /// （`allow_external` 必須）のままにする。緩める方向の変更をしないためと、plugin-cri の
+    /// `streaming_is_consistent` の判定と揃えるため。
     pub fn validate(&self) -> Result<(), CriError> {
+        let bind_canon = self.bind.ip().to_canonical();
+        let adv_canon = self.advertise_addr.map(|a| a.to_canonical());
         if !self.bind.ip().is_loopback() && !self.allow_external {
             return Err(CriError::invalid_argument(
                 "streaming server address must be loopback unless external exposure is explicitly enabled",
             ));
         }
-        if let Some(adv) = self.advertise_addr
+        if let Some(adv) = adv_canon
             && (adv.is_unspecified() || adv.is_multicast())
         {
             return Err(CriError::invalid_argument(
                 "streaming advertise address must be a concrete unicast address",
             ));
         }
-        if self.bind.ip().is_unspecified() && self.advertise_addr.is_none() {
+        if bind_canon.is_unspecified() && self.advertise_addr.is_none() {
             return Err(CriError::invalid_argument(
                 "streaming advertise address is required when binding a wildcard address",
             ));
@@ -1771,7 +1779,7 @@ mod tests {
     /// CRI-6: ワイルドカード bind は広告アドレスが無ければ拒否し、広告アドレスが未指定アドレスでも拒否する。
     #[test]
     fn cri6_config_wildcard_requires_advertise() {
-        for addr in ["0.0.0.0:0", "[::]:0"] {
+        for addr in ["0.0.0.0:0", "[::]:0", "[::ffff:0.0.0.0]:0"] {
             let base = StreamingConfig::default()
                 .with_bind(addr.parse().expect("addr"))
                 .with_allow_external(true);
@@ -1785,6 +1793,38 @@ mod tests {
                 .validate()
                 .expect("advertise ok");
         }
+    }
+
+    /// CRI-6・SEC-1・#4238: IPv4 射影形の未指定・マルチキャストの広告アドレスを拒否し、具体アドレスは受理する。
+    #[test]
+    fn cri6_sec1_4238_mapped_unspecified_and_multicast_advertise_rejected() {
+        let base = StreamingConfig::default()
+            .with_bind("0.0.0.0:0".parse().expect("addr"))
+            .with_allow_external(true);
+        for adv in ["::ffff:0.0.0.0", "::ffff:224.0.0.1"] {
+            let err = base
+                .clone()
+                .with_advertise_addr(adv.parse().expect("ip"))
+                .validate()
+                .expect_err(adv);
+            assert_eq!(err.code(), crate::error::CriErrorCode::InvalidArgument);
+        }
+        base.with_advertise_addr("::ffff:192.0.2.7".parse().expect("ip"))
+            .validate()
+            .expect("mapped concrete ok");
+    }
+
+    /// CRI-6・SEC-1・#4238: `::ffff:127.0.0.1` は loopback と見なさず外部扱い（opt-in 必須）。
+    /// 緩める方向に変えないためと plugin-cri の判定と揃えるため。
+    #[test]
+    fn cri6_sec1_4238_mapped_loopback_bind_requires_opt_in() {
+        let base =
+            StreamingConfig::default().with_bind("[::ffff:127.0.0.1]:0".parse().expect("addr"));
+        let err = base.validate().expect_err("no opt-in");
+        assert_eq!(err.code(), crate::error::CriErrorCode::InvalidArgument);
+        base.with_allow_external(true)
+            .validate()
+            .expect("opt-in ok");
     }
 
     /// CRI-6: ワイルドカード bind でも発行 URL は広告アドレスと実ポートで組み立てる（IPv6 は括弧つき）。

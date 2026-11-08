@@ -3,7 +3,7 @@
 //! containerd（特に CRI）はコンテナの終了を `/tasks/exit` の TaskExit で知る。shim は `-publish-binary`
 //! （検証済みの `PublishBinary`。#4154）を子として起動し、stdin へ `google.protobuf.Any` を渡す。
 //! 呼び出し元は [`super::task_service::TaskService`] の終了 watcher（`Start` 成功後に起こす）で、
-//! 差し込み口は [`exec_publisher_for`]（plugin-cri の `registry_in` が呼ぶ）。
+//! 差し込み口は `exec_publisher_for`（plugin-cri の `registry_in` が呼ぶ）。
 //!
 //! 契約:
 //! - 呼び出し形: `<publish-binary> --address <address> publish --namespace <namespace> --topic /tasks/exit`。
@@ -233,10 +233,23 @@ impl PublishLog for StderrPublishLog {
     }
 }
 
+/// イベントがまだ有効（取り消されていない世代）かを返す述語。worker スレッドから呼ばれる。
+pub type EventGuard = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
+
 /// イベントの送り先。`TaskService::with_event_publisher` で差し込む。
 pub trait EventPublisher: Send + Sync {
     /// イベントを送る。有界時間で戻る契約（キューへ入れるだけ）。失敗は戻り値でなくログに出す。
     fn publish(&self, event: TaskEvent);
+
+    /// 送信直前に `still_valid` を再確認して送る。false なら破棄する（Delete 後の旧世代のイベントを送らない。CRI-5・#4155）。
+    ///
+    /// 既定は呼び出し時に 1 回確認して [`Self::publish`] する。キューを持つ実装は、キューに積んだ後の取り消しを守るため
+    /// 子の起動の直前（worker 側）で再確認する。確認から exec までの極小の窓は残る（子の起動を Delete と直列にはしない。Delete を詰まらせないため）。
+    fn publish_guarded(&self, event: TaskEvent, still_valid: EventGuard) {
+        if still_valid() {
+            self.publish(event);
+        }
+    }
 
     /// publish 以外の失敗（watcher の起動失敗・上限・食い違い）を記録する。
     fn report(&self, failure: PublishFailure);
@@ -289,8 +302,8 @@ mod unix {
     use std::time::{Duration, Instant};
 
     use super::{
-        EventPublisher, PublishConfig, PublishFailure, PublishLog, PublishStage, StderrPublishLog,
-        TaskEvent,
+        EventGuard, EventPublisher, PublishConfig, PublishFailure, PublishLog, PublishStage,
+        StderrPublishLog, TaskEvent,
     };
     use crate::shim_v2::bootstrap::{PublishBinary, ServeContext, ShimIdentifier};
 
@@ -300,6 +313,9 @@ mod unix {
     const REAP_GRACE: Duration = Duration::from_secs(1);
     /// `try_wait` の刻み。
     const WAIT_SLICE: Duration = Duration::from_millis(10);
+
+    /// キューの 1 件。世代の述語（任意）をイベントと一緒に保持し、送信直前に再確認する。
+    type Queued = (TaskEvent, Option<EventGuard>);
 
     /// 子の起動に必要な検証済みの値の組。
     #[derive(Debug, Clone)]
@@ -343,7 +359,7 @@ mod unix {
         target: Arc<PublishTarget>,
         config: PublishConfig,
         log: Arc<dyn PublishLog>,
-        tx: Mutex<Option<SyncSender<TaskEvent>>>,
+        tx: Mutex<Option<SyncSender<Queued>>>,
     }
 
     impl std::fmt::Debug for ExecEventPublisher {
@@ -365,7 +381,7 @@ mod unix {
             }
         }
 
-        fn sender(&self, topic: &'static str) -> Option<SyncSender<TaskEvent>> {
+        fn sender(&self, topic: &'static str) -> Option<SyncSender<Queued>> {
             let mut guard = self.tx.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(tx) = guard.as_ref() {
                 return Some(tx.clone());
@@ -393,16 +409,12 @@ mod unix {
 
     impl EventPublisher for ExecEventPublisher {
         fn publish(&self, event: TaskEvent) {
-            let topic = event.topic();
-            let Some(tx) = self.sender(topic) else {
-                return;
-            };
-            match tx.try_send(event) {
-                Ok(()) => {}
-                Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
-                    self.log
-                        .record(&PublishFailure::new(PublishStage::Enqueue, Some(topic)));
-                }
+            self.enqueue(event, None);
+        }
+
+        fn publish_guarded(&self, event: TaskEvent, still_valid: EventGuard) {
+            if still_valid() {
+                self.enqueue(event, Some(still_valid));
             }
         }
 
@@ -411,14 +423,34 @@ mod unix {
         }
     }
 
+    impl ExecEventPublisher {
+        fn enqueue(&self, event: TaskEvent, guard: Option<EventGuard>) {
+            let topic = event.topic();
+            let Some(tx) = self.sender(topic) else {
+                return;
+            };
+            match tx.try_send((event, guard)) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
+                    self.log
+                        .record(&PublishFailure::new(PublishStage::Enqueue, Some(topic)));
+                }
+            }
+        }
+    }
+
     /// キューを直列に処理する。送り側（publisher）が落ちたら終わる。
     fn worker(
-        rx: &Receiver<TaskEvent>,
+        rx: &Receiver<Queued>,
         target: &PublishTarget,
         config: PublishConfig,
         log: &dyn PublishLog,
     ) {
-        while let Ok(event) = rx.recv() {
+        while let Ok((event, guard)) = rx.recv() {
+            // キューで待つ間に Delete された世代のイベントは送らない（CRI-5・#4155）。
+            if guard.as_ref().is_some_and(|g| !g()) {
+                continue;
+            }
             let started = Instant::now();
             let result = run_bounded(target, config, &event);
             if let Err(failure) = &result {
@@ -780,6 +812,34 @@ mod unix_tests {
             })
         );
         assert!(log.0.lock().unwrap().is_empty());
+    }
+
+    /// CRI-5・#4155: キューに積んだ後に取り消された世代のイベントは、worker が送信直前の再確認で捨てる。
+    #[test]
+    fn cri5_4155_queued_event_revoked_before_send_is_dropped() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = test_root::test_root("pub", "revoked");
+        let bin = make_script(&dir, "fake", &recorder_body(&dir));
+        let log = Arc::new(CaptureLog::default());
+        let p = publisher(&bin, Duration::from_secs(5), log.clone());
+        // 1 回目（投入時）は有効、2 回目（worker の再確認）は取り消し済み。
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&calls);
+        p.publish_guarded(
+            sample(),
+            Arc::new(move || c.fetch_add(1, Ordering::SeqCst) == 0),
+        );
+        assert!(wait_until(Duration::from_secs(10), || calls
+            .load(Ordering::SeqCst)
+            >= 2));
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!dir.join("stdin").exists());
+        assert!(log.0.lock().unwrap().is_empty());
+        // 有効なイベントは worker が生きていて送られる。
+        p.publish_guarded(sample(), Arc::new(|| true));
+        assert!(wait_until(Duration::from_secs(10), || dir
+            .join("stdin")
+            .exists()));
     }
 
     /// REPAIR-5・REPAIR-4: 非 0 終了はちょうど 1 件の `exit_status` で、argv・アドレスなどはログに出ない。

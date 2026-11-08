@@ -85,7 +85,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -96,7 +96,9 @@ use super::exec::{
     sleep_until,
 };
 use super::message::{RpcStatus, count_top_level_field};
-use super::publish::{EventPublisher, PublishFailure, PublishStage, TaskEvent, TaskExit};
+use super::publish::{
+    EventGuard, EventPublisher, PublishFailure, PublishStage, TaskEvent, TaskExit,
+};
 use super::service::shutdown_gate_failure;
 use super::service::{CallContext, TaskApiVersion, TtrpcService, unimplemented_status};
 use super::shutdown::ShutdownSignal;
@@ -150,7 +152,7 @@ pub struct TaskService {
     event_publisher: Option<Arc<dyn EventPublisher>>,
     /// 稼働中の終了 watcher の ID。v2 と v3 で共有し、同じ ID の watcher を重複させず、数を `MAX_EXIT_WATCHERS` で抑える。
     /// 値は作成世代のトークン。Delete が登録を外し、世代が違う watcher は publish しない（#4155）。
-    exit_watchers: Arc<Mutex<BTreeMap<String, u64>>>,
+    exit_watchers: WatchRegistry,
 }
 
 impl std::fmt::Debug for TaskService {
@@ -610,17 +612,25 @@ impl TaskService {
             return;
         };
         let generation = NEXT_WATCH_GENERATION.fetch_add(1, Ordering::Relaxed);
+        let revoked = Arc::new(AtomicBool::new(false));
         {
             let mut set = self.exit_watchers.lock().unwrap_or_else(|p| p.into_inner());
-            if set.contains_key(id) {
+            if set.get(id).is_some_and(|e| !e.done) {
                 return;
             }
-            if set.len() >= MAX_EXIT_WATCHERS {
+            if set.values().filter(|e| !e.done).count() >= MAX_EXIT_WATCHERS {
                 drop(set);
                 publisher.report(PublishFailure::new(PublishStage::WatchLimit, None));
                 return;
             }
-            set.insert(id.to_owned(), generation);
+            set.insert(
+                id.to_owned(),
+                WatchEntry {
+                    generation,
+                    done: false,
+                    revoked: Arc::clone(&revoked),
+                },
+            );
         }
         let ctx = ExitWatch {
             adapter: self.adapter.clone(),
@@ -630,6 +640,7 @@ impl TaskService {
             id: id.to_owned(),
             start_pid,
             generation,
+            revoked,
             watchers: Arc::clone(&self.exit_watchers),
         };
         let watchers = Arc::clone(&self.exit_watchers);
@@ -641,7 +652,7 @@ impl TaskService {
             });
         if spawned.is_err() {
             let mut set = watchers.lock().unwrap_or_else(|p| p.into_inner());
-            if set.get(id) == Some(&generation) {
+            if set.get(id).is_some_and(|e| e.generation == generation) {
                 set.remove(id);
             }
             drop(set);
@@ -677,10 +688,15 @@ impl TaskService {
         created.remove(&req.id);
         drop(created);
         // 旧コンテナの終了 watcher を取り消す。同じ ID の再作成・再 Start で新しい世代が登録でき、旧世代は publish しない（#4155）。
-        self.exit_watchers
+        // 取り消しの印を立ててから外す。キューで待つ旧世代の TaskExit は worker が送信直前に捨てる。
+        if let Some(old) = self
+            .exit_watchers
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .remove(&req.id);
+            .remove(&req.id)
+        {
+            old.revoked.store(true, Ordering::SeqCst);
+        }
         // 削除成功後に旧コンテナの exec 登録を除去する（同じ ID の再作成で引き継がない。CRI-5）。
         if let Some(container) = &container {
             self.execs
@@ -832,6 +848,19 @@ impl TaskService {
     }
 }
 
+/// 終了 watcher の登録表（ID → 登録）。v2 と v3 で共有する。
+type WatchRegistry = Arc<Mutex<BTreeMap<String, WatchEntry>>>;
+
+/// 登録 1 件。`revoked` は Delete だけが立てる。watcher が終了して登録を外しても立たないため、
+/// キューで待つ TaskExit は「Delete された世代」だけを送信直前の再確認で捨てられる（CRI-5・#4155）。
+#[derive(Debug, Clone)]
+struct WatchEntry {
+    generation: u64,
+    /// watcher の thread が終わった。登録は Delete まで残し（`revoked` を立てる先を失わない）、同じ ID の再 Start では置き換える。
+    done: bool,
+    revoked: Arc<AtomicBool>,
+}
+
 /// 終了 watcher 1 本の持ち物（#4155）。`TaskService::spawn_exit_watcher` が起こすスレッドが所有する。
 struct ExitWatch {
     adapter: RuntimeAdapter,
@@ -842,7 +871,8 @@ struct ExitWatch {
     start_pid: u32,
     /// この watcher の作成世代。登録表の値と一致する間だけ有効（Delete で外れる）。
     generation: u64,
-    watchers: Arc<Mutex<BTreeMap<String, u64>>>,
+    revoked: Arc<AtomicBool>,
+    watchers: WatchRegistry,
 }
 
 impl ExitWatch {
@@ -852,14 +882,17 @@ impl ExitWatch {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .get(&self.id)
-            == Some(&self.generation)
+            .is_some_and(|e| e.generation == self.generation)
     }
 
-    /// 自分の世代の登録だけを外す（新しい世代の登録は消さない）。
+    /// 自分の世代の登録を終了済みにする（新しい世代の登録は触らない）。登録自体は Delete まで残し、
+    /// キューで待つ TaskExit の取り消し先（`revoked`）を失わない。
     fn unregister(&self) {
         let mut set = self.watchers.lock().unwrap_or_else(|p| p.into_inner());
-        if set.get(&self.id) == Some(&self.generation) {
-            set.remove(&self.id);
+        if let Some(e) = set.get_mut(&self.id)
+            && e.generation == self.generation
+        {
+            e.done = true;
         }
     }
 
@@ -923,13 +956,19 @@ impl ExitWatch {
             ));
             return;
         }
-        self.publisher.publish(TaskEvent::Exit(TaskExit {
-            container_id: self.id.clone(),
-            id: self.id.clone(),
-            pid: st.pid.unwrap_or(self.start_pid),
-            exit_status: stopped_exit_status(st),
-            exited_at: exited_at_of(st),
-        }));
+        // 確認後に Delete・再作成が割り込んでも、キューの中と送信直前で世代を再確認して旧世代を捨てる。
+        let revoked = Arc::clone(&self.revoked);
+        let guard: EventGuard = Arc::new(move || !revoked.load(Ordering::SeqCst));
+        self.publisher.publish_guarded(
+            TaskEvent::Exit(TaskExit {
+                container_id: self.id.clone(),
+                id: self.id.clone(),
+                pid: st.pid.unwrap_or(self.start_pid),
+                exit_status: stopped_exit_status(st),
+                exited_at: exited_at_of(st),
+            }),
+            guard,
+        );
     }
 }
 
@@ -3411,7 +3450,7 @@ mod tests {
         );
         assert!(cap.failures.lock().unwrap().is_empty());
         assert!(wait_until(std::time::Duration::from_secs(5), || {
-            s.exit_watchers.lock().unwrap().is_empty()
+            s.exit_watchers.lock().unwrap().values().all(|e| e.done)
         }));
     }
 
@@ -3423,7 +3462,7 @@ mod tests {
         s.handle("Start", &start_req("c1")).unwrap();
         f.states.lock().unwrap().remove("c1");
         assert!(wait_until(std::time::Duration::from_secs(5), || {
-            s.exit_watchers.lock().unwrap().is_empty()
+            s.exit_watchers.lock().unwrap().values().all(|e| e.done)
         }));
         assert!(cap.events.lock().unwrap().is_empty());
         assert!(cap.failures.lock().unwrap().is_empty());
@@ -3455,7 +3494,15 @@ mod tests {
             id: "c1".into(),
             start_pid: 4242,
             generation: 7,
-            watchers: Arc::new(Mutex::new(BTreeMap::from([("c1".to_owned(), 7)]))),
+            revoked: Arc::new(AtomicBool::new(false)),
+            watchers: Arc::new(Mutex::new(BTreeMap::from([(
+                "c1".to_owned(),
+                WatchEntry {
+                    generation: 7,
+                    done: false,
+                    revoked: Arc::new(AtomicBool::new(false)),
+                },
+            )]))),
         };
         let mut st = RuntimeContainerStatus::from(&ContainerStatus::stopped(
             RtId::new("c1").unwrap(),
@@ -3508,7 +3555,13 @@ mod tests {
         let (s, f, cap) = svc_pub(fake);
         s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
         s.handle("Start", &start_req("c1")).unwrap();
-        let old = *s.exit_watchers.lock().unwrap().get("c1").unwrap();
+        let old = s
+            .exit_watchers
+            .lock()
+            .unwrap()
+            .get("c1")
+            .unwrap()
+            .generation;
         // 旧コンテナを停止させずに削除する（force なしで通る状態にするため停止にしてから）。
         stopped_with_time(&f, "c1", Some(0), 1_700_000_000_000_000_000);
         s.handle("Delete", &delete_req("c1", "")).unwrap();
@@ -3516,11 +3569,25 @@ mod tests {
         f.preset.lock().unwrap().remove("c1");
         s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
         s.handle("Start", &start_req("c1")).unwrap();
-        let new = *s.exit_watchers.lock().unwrap().get("c1").unwrap();
+        let new = s
+            .exit_watchers
+            .lock()
+            .unwrap()
+            .get("c1")
+            .unwrap()
+            .generation;
         assert_ne!(old, new);
         std::thread::sleep(std::time::Duration::from_millis(400));
         // 旧世代の watcher の終了後も新しい登録は残る。
-        assert_eq!(*s.exit_watchers.lock().unwrap().get("c1").unwrap(), new);
+        assert_eq!(
+            s.exit_watchers
+                .lock()
+                .unwrap()
+                .get("c1")
+                .unwrap()
+                .generation,
+            new
+        );
         assert!(
             cap.events
                 .lock()
@@ -3530,6 +3597,45 @@ mod tests {
         );
     }
 
+    /// CRI-5・#4155: 確認後・キュー投入後に Delete・再作成されても、投入時に渡した述語が旧世代を無効と返す。
+    #[test]
+    fn cri5_4155_guard_of_queued_event_is_revoked_by_delete_and_recreate() {
+        use super::super::publish::EventGuard;
+        #[derive(Default)]
+        struct Holding(Mutex<Vec<EventGuard>>);
+        impl EventPublisher for Holding {
+            fn publish(&self, _: TaskEvent) {}
+            fn publish_guarded(&self, _: TaskEvent, g: EventGuard) {
+                self.0.lock().unwrap().push(g);
+            }
+            fn report(&self, _: PublishFailure) {}
+        }
+        let fake = Fake {
+            create_pid: Some(111),
+            ..Fake::default()
+        };
+        let h = Arc::new(Holding::default());
+        let (s, f) = svc(TaskApiVersion::V2, fake);
+        let s = fast_wait(s, 100).with_event_publisher(h.clone());
+        s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
+        s.handle("Start", &start_req("c1")).unwrap();
+        stopped_with_time(&f, "c1", Some(0), 1_700_000_000_000_000_000);
+        assert!(wait_until(std::time::Duration::from_secs(5), || !h
+            .0
+            .lock()
+            .unwrap()
+            .is_empty()));
+        let guard = h.0.lock().unwrap()[0].clone();
+        assert!(guard());
+        s.handle("Delete", &delete_req("c1", "")).unwrap();
+        assert!(!guard());
+        f.preset.lock().unwrap().remove("c1");
+        s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
+        s.handle("Start", &start_req("c1")).unwrap();
+        // 同じ ID の新世代が登録されても旧世代の述語は無効のまま。
+        assert!(!guard());
+    }
+
     /// REPAIR-5・#4155: watcher の数の上限を超えたら起こさず、`watch_limit` を 1 件記録する（Start の応答は変えない）。
     #[test]
     fn repair5_4155_watcher_limit() {
@@ -3537,7 +3643,14 @@ mod tests {
         {
             let mut set = s.exit_watchers.lock().unwrap();
             for i in 0..MAX_EXIT_WATCHERS {
-                set.insert(format!("w{i}"), 0);
+                set.insert(
+                    format!("w{i}"),
+                    WatchEntry {
+                        generation: 0,
+                        done: false,
+                        revoked: Arc::new(AtomicBool::new(false)),
+                    },
+                );
             }
         }
         s.spawn_exit_watcher("extra", 1);

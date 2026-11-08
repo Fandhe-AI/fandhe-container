@@ -23,8 +23,12 @@ const ADDRESS: &str = "/run/containerd/containerd.sock";
 /// 回収済み・記録なしの冪等な応答の終了コード（`DELETE_EXIT_STATUS`）。
 const IDEMPOTENT_EXIT: u64 = 137;
 
+#[path = "support/mini_json.rs"]
+mod mini_json;
 #[path = "../../core/tests/support/reap.rs"]
 mod reap;
+#[path = "support/shim_wire.rs"]
+mod shim_wire;
 #[path = "../../oci/tests/support/test_root.rs"]
 mod test_root;
 
@@ -84,10 +88,15 @@ impl Scratch {
 
     /// delete を実バイナリで実行する（期限つき）。
     fn delete(&self, id: &str) -> Output {
+        self.delete_at(id, &self.bundle(id))
+    }
+
+    /// `-bundle` を指定して delete を実バイナリで実行する（期限つき）。
+    fn delete_at(&self, id: &str, bundle: &Path) -> Output {
         let mut cmd = Command::new(BIN);
         cmd.args(["-namespace", "default", "-address", ADDRESS])
             .args(["-publish-binary", BIN, "-id", id, "-bundle"])
-            .arg(self.bundle(id))
+            .arg(bundle)
             .arg("delete")
             .env("XDG_RUNTIME_DIR", &self.root)
             .env("FANDHE_CONTAINER_SHIM_SOCKET_DIR", self.root.join("s"))
@@ -96,6 +105,72 @@ impl Scratch {
         reap::output_within(&mut cmd, Duration::from_secs(30))
             .expect("shim delete must exit within the limit")
     }
+
+    /// bin の `start` を実行し、デーモンの socket のパスを返す（期限つき）。
+    fn start(&self, id: &str) -> PathBuf {
+        let mut cmd = Command::new(BIN);
+        cmd.args(["-namespace", "default", "-address", ADDRESS])
+            .args(["-publish-binary", BIN, "-id", id, "start"])
+            .env("XDG_RUNTIME_DIR", &self.root)
+            .env("FANDHE_CONTAINER_SHIM_SOCKET_DIR", self.root.join("s"))
+            .current_dir(&self.root)
+            .stdin(Stdio::null());
+        let out = reap::output_within(&mut cmd, Duration::from_secs(30))
+            .expect("shim start must exit within the limit");
+        assert!(out.status.success(), "{out:?}");
+        let addr = String::from_utf8(out.stdout).expect("utf8 address");
+        PathBuf::from(
+            addr.trim_end()
+                .strip_prefix("unix://")
+                .expect("unix:// address"),
+        )
+    }
+
+    /// Create に渡せる最小の bundle（`<root>/b/default/<id>` に rootfs と config.json を作る）。
+    fn make_bundle(&self, id: &str) -> PathBuf {
+        let b = self.bundle(id);
+        std::fs::create_dir_all(b.join("rootfs")).unwrap();
+        std::fs::write(
+            b.join("config.json"),
+            r#"{"ociVersion":"1.2.0","root":{"path":"rootfs"},"process":{"user":{"uid":0,"gid":0},"args":["/bin/true"],"cwd":"/"},"linux":{"namespaces":[{"type":"pid"},{"type":"mount"},{"type":"user"},{"type":"uts"},{"type":"ipc"}]}}"#,
+        )
+        .unwrap();
+        b
+    }
+}
+
+/// `-id <id>` を持つ shim バイナリのプロセス（デーモンと fork した監査 helper）の PID を `/proc` から集める。
+/// 記録の pid ではなく cmdline の一致だけで絞る（無関係なプロセスへ送らない。SEC-1）。
+fn daemon_pids(id: &str) -> Vec<u32> {
+    let needle = format!("-id\0{id}\0");
+    let Ok(rd) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    rd.flatten()
+        .filter_map(|e| {
+            let pid: u32 = e.file_name().to_str()?.parse().ok()?;
+            let c = std::fs::read(e.path().join("cmdline")).ok()?;
+            let s = String::from_utf8_lossy(&c).into_owned();
+            (s.contains(BIN) && s.contains(&needle)).then_some(pid)
+        })
+        .collect()
+}
+
+/// デーモンを SIGKILL で止め（containerd の「shim が死んだ」に最も近い）、期限内に消えたことを確かめる。
+fn kill_daemon(id: &str) {
+    let pids = daemon_pids(id);
+    assert!(!pids.is_empty(), "daemon for {id} must be running");
+    for pid in &pids {
+        let mut cmd = Command::new("kill");
+        cmd.args(["-s", "KILL", &pid.to_string()])
+            .stderr(Stdio::null());
+        let _ = reap::run_within(&mut cmd, Duration::from_secs(10));
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !daemon_pids(id).is_empty() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(daemon_pids(id).is_empty(), "daemon for {id} must be gone");
 }
 
 fn cid(s: &str) -> ContainerId {
@@ -254,4 +329,118 @@ fn cri5_4152_bin_delete_without_state_root_is_idempotent_and_creates_nothing() {
     let d = decode(&out.stdout);
     assert_eq!((d.pid, d.exit_status), (0, IDEMPOTENT_EXIT));
     assert!(!Path::new(&sc.scoped_root()).exists());
+}
+
+/// 失敗の契約: 非ゼロ終了・stdout は空・stderr は JSON 1 行で `code` と空でない `message`。
+fn assert_failed(out: &Output, code: &str) {
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert_eq!(out.stdout, b"");
+    let err = String::from_utf8(out.stderr.clone()).unwrap();
+    assert_eq!(err.lines().count(), 1, "{err}");
+    let v = mini_json::parse(err.trim_end()).unwrap_or_else(|| panic!("invalid JSON: {err}"));
+    assert_eq!(v.get("code").and_then(|x| x.as_str()), Some(code), "{err}");
+    assert!(
+        v.get("message")
+            .and_then(|x| x.as_str())
+            .is_some_and(|m| !m.is_empty()),
+        "{err}"
+    );
+}
+
+/// CRI-5・TASK-62.6・#4153: 本物の `start` と ttrpc の `Create` で作った Created のコンテナについて、
+/// デーモンが居なくなった後の `delete`（containerd が shim の死後に呼ぶ形）が実行層まで回収し、
+/// 終了コード 0・pid 0・終了状態 0 を返して状態ルートの `<id>` を消し、残った socket も消す。
+/// 2 回目は終了コード 0 の固定の応答（137・exited_at あり）で、状態ルートが無い場合の応答と欄が一致する。
+/// 記録の bundle と食い違う `-bundle`・不正な id は、記録に触れず構造化エラーで拒否する（SEC-1）。
+#[test]
+fn cri5_4153_bin_delete_after_daemon_death_reclaims_created_container() {
+    for (n, svc) in ["containerd.task.v2.Task", "containerd.task.v3.Task"]
+        .iter()
+        .enumerate()
+    {
+        let sc = Scratch::new();
+        let id = format!("d4153x{}n{n}", std::process::id());
+        let sock = sc.start(&id);
+        let bundle = sc.make_bundle(&id);
+        let b = bundle.to_str().expect("utf8 bundle");
+        let create =
+            shim_wire::call_method(&sock, svc, "Create", &shim_wire::create_request(&id, b))
+                .expect("Create must succeed");
+        assert_eq!(create.status, None, "{svc}");
+        let st = shim_wire::call_method(&sock, svc, "State", &shim_wire::id_request(&id))
+            .expect("State must succeed");
+        let f = shim_wire::decode_state_response(&st.payload).expect("StateResponse");
+        assert_eq!(
+            (f.id.as_str(), f.status, f.pid),
+            (id.as_str(), 1, 0),
+            "{svc}"
+        );
+        let record_dir = sc.scoped_root().join(&id);
+        assert!(record_dir.join("state.json").is_file(), "{svc}");
+
+        kill_daemon(&id);
+        assert!(sock.exists(), "SIGKILL leaves the stale socket behind");
+
+        // 記録の bundle と違う実在の bundle・不正な id は拒否し、記録は残る。
+        let other = sc.root.join("b2").join("default").join(&id);
+        std::fs::create_dir_all(&other).unwrap();
+        assert_failed(&sc.delete_at(&id, &other), "FAILED_PRECONDITION");
+        assert!(
+            record_dir.join("state.json").is_file(),
+            "mismatch must not reclaim"
+        );
+        let bad = sc.root.join("b").join("default").join("a");
+        std::fs::create_dir_all(&bad).unwrap();
+        let mut cmd = Command::new(BIN);
+        cmd.args(["-namespace", "default", "-address", ADDRESS])
+            .args(["-publish-binary", BIN, "-id", "a/b", "-bundle"])
+            .arg(&bad)
+            .arg("delete")
+            .env("XDG_RUNTIME_DIR", &sc.root)
+            .env("FANDHE_CONTAINER_SHIM_SOCKET_DIR", sc.root.join("s"))
+            .current_dir(&sc.root)
+            .stdin(Stdio::null());
+        let out = reap::output_within(&mut cmd, Duration::from_secs(30)).expect("exit");
+        assert_failed(&out, "INVALID_ARGUMENT");
+        assert!(
+            record_dir.join("state.json").is_file(),
+            "invalid id must not reclaim"
+        );
+
+        let out = sc.delete_at(&id, &bundle);
+        assert_success(&out);
+        let first = decode(&out.stdout);
+        assert_eq!(
+            first,
+            Decoded {
+                pid: 0,
+                exit_status: 0,
+                exited_at: None,
+            },
+            "{svc}"
+        );
+        assert!(!record_dir.exists(), "{svc}: record dir must be removed");
+        assert!(!sock.exists(), "{svc}: stale socket must be removed");
+
+        // 2 回目: 終了コード 0 の固定の応答。`exited_at` は「今」の時刻で毎回違うため値ではなく欄の有無で比べる。
+        let again = sc.delete_at(&id, &bundle);
+        assert_success(&again);
+        let second = decode(&again.stdout);
+        assert_eq!(
+            (second.pid, second.exit_status, second.exited_at.is_some()),
+            (0, IDEMPOTENT_EXIT, true),
+            "{svc}"
+        );
+
+        // 状態ルートが一度も作られていない場合の応答と、欄ごとに同じ形になる。
+        let fresh = Scratch::new();
+        let baseline = fresh.delete(&id);
+        assert_success(&baseline);
+        let base = decode(&baseline.stdout);
+        assert_eq!(
+            (base.pid, base.exit_status, base.exited_at.is_some()),
+            (second.pid, second.exit_status, second.exited_at.is_some()),
+            "{svc}"
+        );
+    }
 }

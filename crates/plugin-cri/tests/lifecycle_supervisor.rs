@@ -54,8 +54,15 @@ struct Scripts {
 
 /// 偽の supervisor。引数は `start --root <root> <id>`（契約の argv）で、`<id>` で報告を切り替える。
 const FAKE_SUPERVISOR: &str = r#"#!/bin/sh
+R="$3"
 if [ "$4" = "--cri-log-path" ]; then
-  printf '%s %s\n' "$5" "$6" > "$3/cri-log-arg"
+  shift 4
+  printf '%s\n' "$*" > "$R/cri-log-arg"
+  printf 'FCSUP1 OK 4242\n'; exec sleep 3
+fi
+if [ "$4" = "--stdin" ]; then
+  shift 4
+  printf '%s\n' "$*" > "$R/stdin-arg"
   printf 'FCSUP1 OK 4242\n'; exec sleep 3
 fi
 case "$4" in
@@ -358,6 +365,45 @@ fn cri2_start_passes_cri_log_path_to_supervisor_argv() {
     assert_eq!(status.state(), ContainerState::Running);
     let seen = std::fs::read_to_string(root.join("cri-log-arg")).expect("fake supervisor argv");
     assert_eq!(seen, "/var/log/pods/ns_p_u/c/0.log c-log\n");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// CRI-6・SUP-7・#4076: `StartRequest::stdin` は supervisor の argv `--stdin <open|once> <id>` として渡り、
+/// 書き先と併用すると `--cri-log-path` の後・ID の前に載る。`Closed`（既定）は `--stdin` を載せない。
+#[test]
+fn cri6_start_passes_stdin_to_supervisor_argv() {
+    use fandhe_container_core::traits::StdinMode;
+    for (id, mode, want) in [
+        ("c-stdin", StdinMode::Open, "open c-stdin\n"),
+        ("c-stdin", StdinMode::Once, "once c-stdin\n"),
+    ] {
+        let root = temp_root("stdin");
+        let h = harness(Sim::running_in(root.clone(), id, 4242), LONG);
+        let req = StartRequest::new(cid(id)).with_stdin(mode);
+        let status = h.rt.start(&req).expect("start");
+        assert_eq!(status.state(), ContainerState::Running);
+        let seen = std::fs::read_to_string(root.join("stdin-arg")).expect("fake supervisor argv");
+        assert_eq!(seen, want);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    let root = temp_root("stdinlog");
+    let h = harness(Sim::running_in(root.clone(), "c-log", 4242), LONG);
+    let lp = ContainerLogPath::new("/var/log/pods/ns_p_u/c/0.log").expect("log path");
+    let req = StartRequest::new(cid("c-log"))
+        .with_log_path(lp)
+        .with_stdin(StdinMode::Once);
+    h.rt.start(&req).expect("start");
+    let seen = std::fs::read_to_string(root.join("cri-log-arg")).expect("fake supervisor argv");
+    assert_eq!(seen, "/var/log/pods/ns_p_u/c/0.log --stdin once c-log\n");
+    let _ = std::fs::remove_dir_all(&root);
+
+    // Closed（既定）は --stdin を載せない: c-ok の分岐に入り、stdin-arg は作られない。
+    let root = temp_root("stdinclosed");
+    let h = harness(Sim::running_in(root.clone(), "c-ok", 4242), LONG);
+    let req = StartRequest::new(cid("c-ok")).with_stdin(StdinMode::Closed);
+    h.rt.start(&req).expect("start");
+    assert!(!root.join("stdin-arg").exists());
     let _ = std::fs::remove_dir_all(&root);
 }
 

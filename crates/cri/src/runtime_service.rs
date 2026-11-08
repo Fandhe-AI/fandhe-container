@@ -127,7 +127,7 @@ use tonic::{Request, Response, Status};
 
 use crate::bundle::{AppliedUser, ResolvedImage, resolve_log_path};
 use crate::error::{CriError, CriErrorCode};
-use fandhe_container_core::traits::ContainerLogPath;
+use fandhe_container_core::traits::{ContainerLogPath, StdinMode};
 
 use crate::adapter::{
     BundleProvider, BundleRequest, PodNetns, PodNetworkProvider, PodNetworkRequest, PreparedBundle,
@@ -3138,16 +3138,19 @@ impl CriRuntimeService {
         Ok(())
     }
 
-    /// 記録に保持した CRI ログの書き先を取り出す（無ければ `None`）。保持時に検証済みで、ここで失敗しない想定。
-    fn start_log_path(&self, id: &str) -> Result<Option<ContainerLogPath>, CriError> {
+    /// 記録から StartContainer の入力（CRI ログの書き先と stdin の扱い）を 1 回のロックで取り出す。
+    ///
+    /// 書き先は保持時に検証済み（無ければ `None`）。stdin の扱いは config の `tty`・`stdin`・`stdin_once` から導く
+    /// （tty なら `Closed`。CRI-6・#4076）。記録が無い場合は `(None, Closed)`。
+    fn start_inputs(&self, id: &str) -> Result<(Option<ContainerLogPath>, StdinMode), CriError> {
         let registry = self
             .registry
             .lock()
             .map_err(|_| CriError::internal("sandbox registry is unavailable"))?;
-        Ok(registry
-            .containers
-            .get(id)
-            .and_then(|r| r.resolved_log_path.clone()))
+        Ok(registry.containers.get(id).map_or_else(
+            || (None, StdinMode::Closed),
+            |r| (r.resolved_log_path.clone(), r.start_stdin_mode()),
+        ))
     }
 
     /// 実行層接続時の `StartContainer`（TASK-59.2・CRI-2）。
@@ -3165,7 +3168,7 @@ impl CriRuntimeService {
         let mut guard =
             InFlightGuard::new(Arc::clone(&self.registry), id.clone(), InFlightKind::Start);
         // 書き先の取得に失敗しても、実行層を呼ぶ前なので guard の破棄で created へ戻る。
-        let log_path = self.start_log_path(&id)?;
+        let (log_path, stdin) = self.start_inputs(&id)?;
         let adapter = binding.adapter.clone();
         let timeout = self.runtime_timeout;
         let record_store = self.record_store.clone();
@@ -3175,7 +3178,7 @@ impl CriRuntimeService {
             guard.arm_record_store(record_store);
             // 専用スレッドの起動に失敗した場合は未送信なので、送信の直前に結果不明へ倒す。
             guard.mark_dispatched();
-            let status = match adapter.start_with_log_path(&id, log_path) {
+            let status = match adapter.start_with_options(&id, log_path, stdin) {
                 Ok(status) => status,
                 Err(status) => {
                     // 確定失敗のコードに限り created へ戻す。タイムアウト・Unavailable・Internal 等は

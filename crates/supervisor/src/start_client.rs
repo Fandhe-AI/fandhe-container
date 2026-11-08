@@ -11,9 +11,9 @@
 //! 報告の復号は契約の型（`StartReport::decode`）に任せ、ここで書式を組まない・割らない（REPAIR-2）。
 //!
 //! # 契約の要点（呼び出し側の責務。詳細は `start_contract` の module doc）
-//! - argv: `start --root <状態ルートの絶対パス> [--audit-policy <best-effort|strict>] [--cri-log-path <絶対パス>] <id>`（`--restart` は渡さず既定の `no`。
+//! - argv: `start --root <状態ルートの絶対パス> [--audit-policy <best-effort|strict>] [--cri-log-path <絶対パス>] [--stdin <open|once>] <id>`（`--restart` は渡さず既定の `no`。
 //!   `--audit-policy` は CLI の `start --audit-policy` が指定したときだけ載せ、未指定なら supervisor の既定 best-effort が効く。
-//!   `--cri-log-path` は plugin-cri だけが使う。SEC-4・#2761）。`env_clear` の後に渡す環境は
+//!   `--cri-log-path` と `--stdin` は plugin-cri だけが使い、`--stdin` は tty のコンテナには渡さない。SEC-4・#2761・CRI-6・#4076）。`env_clear` の後に渡す環境は
 //!   許可リストの 2 つだけ: 固定の `PATH` と、`XDG_RUNTIME_DIR`（systemd-run が user マネージャへ接続するため。絶対パスを検証する）。
 //!   `DBUS_SESSION_BUS_ADDRESS` は渡さない（sd-bus のアドレスは `unixexec:` 等で任意プログラムの起動や接続先の付け替えができ、
 //!   user マネージャの直結ソケット `$XDG_RUNTIME_DIR/systemd/private` だけで足りる。`man sd_bus_default` と systemd の
@@ -115,7 +115,7 @@ use fandhe_container_core::traits::{ContainerId, ContainerLogPath, ErrorCode};
 
 use crate::launcher::{LAUNCHER_FILE_NAME, SUPERVISOR_FILE_NAME};
 use crate::start_contract::{
-    MAX_REPORT_LEN, StartReport, USER_SCOPE_WRAPPER_ARGS, cli_receive_deadline,
+    MAX_REPORT_LEN, StartReport, StdinOption, USER_SCOPE_WRAPPER_ARGS, cli_receive_deadline,
 };
 use crate::systemd_run::{
     Identity, SystemdRunRejection, identity_from_status, read_self_status, resolve_systemd_run,
@@ -228,7 +228,7 @@ fn map_received(received: Received) -> Result<NonZeroU32, OciRuntimeError> {
     }
 }
 
-/// `start` の argv に載せる任意の項目（`--audit-policy`・`--cri-log-path`）。
+/// `start` の argv に載せる任意の項目（`--audit-policy`・`--cri-log-path`・`--stdin`）。
 ///
 /// 呼び出し側（CLI の `start`・plugin-cri）が supervisor の契約（`crate::start_contract::StartArgs`）の任意引数を
 /// 渡すための入口。未指定（`None`）の項目は argv に載らず、supervisor の既定が効く。監査の方針は core のライフサイクル要求ではなく
@@ -240,6 +240,9 @@ pub struct StartOptions<'a> {
     pub cri_log_path: Option<&'a ContainerLogPath>,
     /// 監査の縮退の扱い（`start --audit-policy`。SEC-4・#2027・#2761）。
     pub audit_policy: Option<AuditCoveragePolicy>,
+    /// init の stdin の扱い（`--stdin <open|once>`。plugin-cri だけが指定し、tty のコンテナには指定しない。
+    /// SUP-7・SUP-3・CRI-6・#4076）。`None` は argv に載せず、従来どおり `/dev/null`。
+    pub stdin: Option<StdinOption>,
 }
 
 impl<'a> StartOptions<'a> {
@@ -259,6 +262,12 @@ impl<'a> StartOptions<'a> {
         self.audit_policy = policy;
         self
     }
+
+    /// init の stdin の扱いを設定する（`None` は argv に載せない。SUP-7・CRI-6・#4076）。
+    pub fn with_stdin(mut self, stdin: Option<StdinOption>) -> Self {
+        self.stdin = stdin;
+        self
+    }
 }
 
 /// 契約どおりの argv・stdio・環境・cwd を `cmd` に設定する（シェルも文字列連結も使わない）。
@@ -272,6 +281,10 @@ fn configure_common(cmd: &mut Command, root: &Path, opts: &StartOptions<'_>, id:
     // CRI ログの書き先は位置引数（ID）の前に置く（CRI-2・SUP-4・#2671）。値は検証済みの型で、argv の 1 要素として渡す。
     if let Some(path) = opts.cri_log_path {
         cmd.arg("--cri-log-path").arg(path.as_str());
+    }
+    // init の stdin は固定語彙（`open` / `once`）の 1 要素で渡す。tty のコンテナには呼び出し側（cri）が指定しない（D3・CRI-6・#4076）。
+    if let Some(stdin) = opts.stdin {
+        cmd.arg("--stdin").arg(stdin.as_str());
     }
     cmd.arg(id.as_str())
         .stdin(Stdio::null())
@@ -1170,6 +1183,60 @@ mod tests {
                     "c1"
                 ]
             );
+        }
+    }
+
+    /// CRI-6・SUP-7・#4076: `--stdin <open|once>` は `--cri-log-path` の後・ID の前に載り、契約の `StartArgs::parse` で受理される。
+    #[test]
+    fn cri6_scoped_command_carries_stdin() {
+        use crate::start_contract::StartArgs;
+        let id = ContainerId::new("c1").expect("id");
+        let lp = ContainerLogPath::new("/l/c/0.log").expect("log path");
+        for launcher in [None, Some(Path::new("/opt/x/fandhe-container-launcher"))] {
+            let args_of = |opts: &StartOptions<'_>| -> Vec<String> {
+                scoped_command(
+                    Path::new("/usr/bin/systemd-run"),
+                    launcher,
+                    Path::new("/opt/x/fandhe-container-supervisor"),
+                    Path::new("/r"),
+                    opts,
+                    &id,
+                    OsStr::new("/run/user/1000"),
+                )
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+            };
+            let open = StartOptions::new().with_stdin(Some(StdinOption::Open));
+            assert_eq!(
+                args_of(&open)[7..],
+                ["start", "--root", "/r", "--stdin", "open", "c1"]
+            );
+            let once = StartOptions::new().with_stdin(Some(StdinOption::Once));
+            assert_eq!(
+                args_of(&once)[7..],
+                ["start", "--root", "/r", "--stdin", "once", "c1"]
+            );
+            let with_log = once.with_cri_log_path(Some(&lp));
+            let a = args_of(&with_log);
+            assert_eq!(
+                a[7..],
+                [
+                    "start",
+                    "--root",
+                    "/r",
+                    "--cri-log-path",
+                    "/l/c/0.log",
+                    "--stdin",
+                    "once",
+                    "c1"
+                ]
+            );
+            let parsed =
+                StartArgs::parse(a[7..].iter().map(std::ffi::OsString::from)).expect("contract");
+            assert_eq!(parsed.stdin, Some(StdinOption::Once));
+            let none = args_of(&StartOptions::new().with_stdin(None));
+            assert!(!none.iter().any(|x| x == "--stdin"));
         }
     }
 

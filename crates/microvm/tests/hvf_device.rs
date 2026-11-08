@@ -1,4 +1,4 @@
-//! Hypervisor.framework 実機前提の試験（MVM-5・MVM-1・TASK-192.1・#3783・TASK-192.3・#3789・TASK-192.12・#3792・TASK-192.13・#3795・TASK-192.10・#3793・TASK-192.11・#3794・TASK-192.15・#3797・TASK-192.16・#3798・#3882・#3887・#3891）。`--ignored` 指定時だけ走る。
+//! Hypervisor.framework 実機前提の試験（MVM-5・MVM-1・TASK-192.1・#3783・TASK-192.3・#3789・TASK-192.12・#3792・TASK-192.13・#3795・TASK-192.10・#3793・TASK-192.11・#3794・TASK-192.15・#3797・TASK-192.16・#3798・#3882・#3887・#3891・#4231）。`--ignored` 指定時だけ走る。
 //! 必要環境: Apple Silicon の macOS 15 以降、`com.apple.security.hypervisor` 付きの ad-hoc 署名。root は不要。
 //! 手順は docs/verification/real-machine-tests.md の `hvf_device` の項。ゲストを走らせない試験は待ちがなく、vCPU を
 //! 走らせる試験は期限 watchdog を持つ（REPAIR-5）。1 プロセス 1 VM のため `--test-threads=1` で実行する。
@@ -2286,4 +2286,120 @@ fn hvf_device_pending_cancels_collapse() {
         assert_reaches_hvc(vcpu, hvc_at);
         eprintln!("hvf_device: pending_cancel: {CANCELS} cancels collapsed into one");
     });
+}
+
+/// `HvfDeviceBus::new` / `bind` が組んだ本番の `SharedTransport` を通した `QueueReady=0` で、`queue_stopped` が対象のキューごとに
+/// ちょうど 1 回だけ起きること（#4231・MVM-5・MVM-1）。block 1 台 + net 1 台を assemble し（start しない）、組み立て済みの dispatcher へ
+/// `VcpuExit::Mmio` を流す。回数は `QueueStopped(i)` の結果で数える（`write_queue_ready` は `queue_stopped(i)` の直後にだけ
+/// これを返す。#4031）。`handle_data_abort` の振り分けは `hvf::mmio` の単体試験が担い、ゲスト自身が書く経路は対象外。
+/// 期限 watchdog 30 秒つき（超過は `hvf_device: WATCHDOG EXPIRED` と終了コード 124）。
+#[test]
+#[ignore = "requires Apple silicon macOS 15+ and a binary signed with com.apple.security.hypervisor (MVM-5)"]
+fn hvf_device_queue_ready_zero_stops_once_via_device_bus() {
+    use fandhe_container_microvm::dispatch::{DispatchOutcome, ExitDispatcher, MmioAccess};
+    use fandhe_container_microvm::exit::VcpuExit;
+    use fandhe_container_microvm::hvf::{HvfMicroVm, HvfNetDeviceConfig};
+    use fandhe_container_microvm::virtio_mmio::{MmioWriteOutcome, reg};
+    use fandhe_container_microvm::virtio_net::MemoryNetBackend;
+
+    fn write(d: &mut ExitDispatcher, addr: u64, value: u32) -> MmioWriteOutcome {
+        let mut data = [0u8; 8];
+        data[..4].copy_from_slice(&value.to_le_bytes());
+        let exit = VcpuExit::Mmio {
+            phys_addr: addr,
+            data,
+            len: 4,
+            is_write: true,
+        };
+        match d.dispatch(&exit).unwrap() {
+            DispatchOutcome::Mmio {
+                access: MmioAccess::Write(o),
+                ..
+            } => o,
+            other => panic!("expected mmio write, got {other:?}"),
+        }
+    }
+    fn read(d: &mut ExitDispatcher, addr: u64) -> u32 {
+        let exit = VcpuExit::Mmio {
+            phys_addr: addr,
+            data: [0; 8],
+            len: 4,
+            is_write: false,
+        };
+        let out = d.dispatch(&exit).unwrap();
+        let r = out.read_response().expect("read response");
+        u32::from_le_bytes([r[0], r[1], r[2], r[3]])
+    }
+    /// 交渉 → 指定キューの設定 → DRIVER_OK。
+    fn bring_up(d: &mut ExitDispatcher, base: u64, queues: &[u32]) {
+        write(d, base + reg::STATUS, 1);
+        write(d, base + reg::STATUS, 3);
+        write(d, base + reg::DEVICE_FEATURES_SEL, 0);
+        let low = read(d, base + reg::DEVICE_FEATURES);
+        write(d, base + reg::DRIVER_FEATURES_SEL, 0);
+        write(d, base + reg::DRIVER_FEATURES, low);
+        write(d, base + reg::DRIVER_FEATURES_SEL, 1);
+        write(d, base + reg::DRIVER_FEATURES, 1);
+        assert_eq!(
+            write(d, base + reg::STATUS, 11),
+            MmioWriteOutcome::FeaturesAccepted
+        );
+        for &q in queues {
+            let off = 0x1000 * (u64::from(q) + 1);
+            write(d, base + reg::QUEUE_SEL, q);
+            write(d, base + reg::QUEUE_NUM, 16);
+            write(d, base + reg::QUEUE_DESC_LOW, off as u32);
+            write(d, base + reg::QUEUE_DRIVER_LOW, (off + 0x400) as u32);
+            write(d, base + reg::QUEUE_DEVICE_LOW, (off + 0x800) as u32);
+            write(d, base + reg::QUEUE_READY, 1);
+        }
+        assert_eq!(
+            write(d, base + reg::STATUS, 15),
+            MmioWriteOutcome::DeviceActivated
+        );
+    }
+
+    let _wd = Watchdog::start(ASSEMBLE_DEADLINE);
+    let layout = Arm64Layout::new(64 << 20, 1, 2).unwrap();
+    require_vm_with_gic(&layout);
+    let mut cfg = assemble_config(layout, synthetic_image(true), 1, false);
+    cfg.net = vec![HvfNetDeviceConfig {
+        backend: MemoryNetBackend::new(),
+        mac: [2, 0, 0, 0, 0, 1],
+    }];
+    let vm = HvfMicroVm::assemble(cfg).unwrap();
+    let devices = vm.devices();
+    assert_eq!(devices.len(), 2);
+    let (blk, net) = (devices[0].window.base.raw(), devices[1].window.base.raw());
+    let mut d = vm.dispatcher().lock().unwrap();
+
+    // block: 1 回目の QueueReady=0 で QueueStopped(0)、2 回目は何も起きない。
+    bring_up(&mut d, blk, &[0]);
+    write(&mut d, blk + reg::QUEUE_SEL, 0);
+    assert_eq!(read(&mut d, blk + reg::QUEUE_READY), 1);
+    assert_eq!(
+        write(&mut d, blk + reg::QUEUE_READY, 0),
+        MmioWriteOutcome::QueueStopped(0)
+    );
+    assert_eq!(read(&mut d, blk + reg::QUEUE_READY), 0);
+    assert_eq!(
+        write(&mut d, blk + reg::QUEUE_READY, 0),
+        MmioWriteOutcome::Handled
+    );
+
+    // net: キュー 1 だけが止まり、キュー 0 は有効なまま。
+    bring_up(&mut d, net, &[0, 1]);
+    write(&mut d, net + reg::QUEUE_SEL, 1);
+    assert_eq!(
+        write(&mut d, net + reg::QUEUE_READY, 0),
+        MmioWriteOutcome::QueueStopped(1)
+    );
+    assert_eq!(
+        write(&mut d, net + reg::QUEUE_READY, 0),
+        MmioWriteOutcome::Handled
+    );
+    write(&mut d, net + reg::QUEUE_SEL, 0);
+    assert_eq!(read(&mut d, net + reg::QUEUE_READY), 1);
+    eprintln!("hvf_device: queue_stopped via device bus: block 1, net queue 1 only");
+    drop(d);
 }

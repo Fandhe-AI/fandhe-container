@@ -462,28 +462,32 @@ mod tests {
         }
     }
 
-    /// 拒否した `/dev/null` の fd は受け側で閉じられ、`/proc/self/fd` の `/dev/null` の数が増えたままにならない。
+    /// 拒否した fd は受け側で閉じられ、専用の一時ファイルを指す fd の数が増えたままにならない。
+    /// 並列に走る他の試験の `/dev/null` の開閉の影響を受けないよう、この試験だけが開く一時ファイルで数える。
     #[test]
     fn sup6_rejected_pty_master_fd_is_closed() {
-        fn null_links() -> usize {
+        let path = std::env::temp_dir().join(format!(
+            "fandhe-sup6-rejected-fd-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let file = File::create(&path).unwrap();
+        let links = |p: &std::path::Path| -> usize {
             std::fs::read_dir("/proc/self/fd")
                 .unwrap()
                 .filter_map(Result::ok)
-                .filter(|e| {
-                    std::fs::read_link(e.path())
-                        .is_ok_and(|p| p == std::path::Path::new("/dev/null"))
-                })
+                .filter(|e| std::fs::read_link(e.path()).is_ok_and(|l| l == p))
                 .count()
-        }
+        };
         let (a, b) = pair();
-        let null = File::open("/dev/null").unwrap();
-        let before = null_links();
-        send_pty_master(&a, null.as_fd(), far()).unwrap();
-        assert_eq!(
-            recv_from_helper(&b, far()).unwrap_err(),
-            ChannelError::NotPtyMaster
-        );
-        assert_eq!(null_links(), before);
+        let before = links(&path);
+        assert_eq!(before, 1);
+        send_pty_master(&a, file.as_fd(), far()).unwrap();
+        let result = recv_from_helper(&b, far());
+        let after = links(&path);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(result.unwrap_err(), ChannelError::NotPtyMaster);
+        assert_eq!(after, before);
     }
 
     #[test]

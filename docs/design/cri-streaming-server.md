@@ -12,10 +12,10 @@ CRI の `Exec`・`Attach`・`PortForward` は、RPC 自体ではデータを流�
 | URL の発行（一意・単回使用・TTL つき） | 実装済み | #679 |
 | 3 RPC の入力検証と存在照合 | 浅い検証まで実装済み | #679 |
 | Exec の SPDY/3.1・Upgrade 後のストリーム | 実装済み（`ExecStreamHandler`。#681 の codec・交渉・`SessionLimits` を再利用。本番の起動役は plugin-cri の `SupervisorExecLauncher` で結線済み〔Linux のみ。stdin・stdout・stderr のみで、tty と相対 argv[0] は RPC 時に `INVALID_ARGUMENT`、非 Linux は未結線の `UNIMPLEMENTED`〕。注入が無ければ Exec は結線済みと答えず、RPC は `UNIMPLEMENTED`） | #680（TASK-63.2）・#3761 |
-| Attach の SPDY/3.1・remotecommand・Upgrade 後のセッション | 実装済み（fake backend での結合試験）。本番の backend は読み取り専用〔`LogFollowAttachBackend`。回転ログの follow〕で結線済み。stdin・tty は RPC 時と接続時に `INVALID_ARGUMENT` で、完全版は未実装。backend が無ければ Attach は結線済みと答えず、RPC は `UNIMPLEMENTED`） | #681（TASK-63.3）・#3763 |
+| Attach の SPDY/3.1・remotecommand・Upgrade 後のセッション | 実装済み（fake backend での結合試験）。本番の backend は読み取り専用〔`LogFollowAttachBackend`。回転ログの follow〕で結線済み。非 Linux ではこの読み取り専用が本番で、stdin・tty は RPC 時と接続時に `INVALID_ARGUMENT`。Linux の本番は完全版（#4077・#4078）。backend が無ければ Attach は結線済みと答えず、RPC は `UNIMPLEMENTED`） | #681（TASK-63.3）・#3763 |
 | PortForward | `PortForwardHandler` は実装済み。NODE の dialer で結線済み。POD は RPC 時と dialer の両方で `UNIMPLEMENTED` | #682（TASK-63.4）・#3755 |
 | plugin-cri からのサーバー起動と `with_streaming` での注入 | 実装済み（loopback で起動し `StreamDispatcher` で注入。結線済みは PortForward〔NODE のみ。#3755〕・Attach〔読み取り専用。#3763〕・Exec〔Linux のみ。#3761〕。非 Linux の Exec は「not wired」の `UNIMPLEMENTED`） | #3754 |
-| 本番 backend（Exec の helper・Attach・PortForward の dialer） | PortForward の NODE の dialer は実装済み（#3755）。Exec の stream-exec helper は実装済み（#3760）、plugin-cri 側の本番 launcher と結線も実装済み（#3761。tty は本番で fail-closed）。Attach は段階 1（読み取り専用）が実装済み（#3763）で完全版は未実装。POD の PortForward は未実装。設計は「本番 backend の設計」の節 | #3753〜#3766 |
+| 本番 backend（Exec の helper・Attach・PortForward の dialer） | PortForward の NODE の dialer は実装済み（#3755）。Exec の stream-exec helper は実装済み（#3760）、plugin-cri 側の本番 launcher と結線も実装済み（#3761。tty は本番で fail-closed）。Attach は段階 1（読み取り専用）が実装済み（#3763）で、完全版も Linux で実装済み（#4077・#4078。実機の確認は #4079）。POD の PortForward は未実装。設計は「本番 backend の設計」の節 | #3753〜#3766 |
 
 ## バインドの方針
 
@@ -100,7 +100,7 @@ CRI の定義は tty のとき stderr を false に固定する。RPC（`validat
 
 ### Attach の本番 backend（段階 1 は実装済み・完全版は未実装・REPAIR-3）
 
-実行中コンテナの stdin / stdout / stderr と tty を渡す経路は、core の `ContainerRuntime` にも supervisor にも無い（CreateContainer の `stdin`・`stdin_once`・`tty` の bundle への反映もまだ）。`ContainerRuntime` トレイトの拡張か supervisor の新しい経路かは PLUG-1・SUP 系の設計判断（main の設計が要る）であり、本 issue では注入点（`AttachBackend`）までとした。判断材料として、supervisor のログの sink は stdout / stderr を読んでいるため読み側だけは供給できる可能性があるが、stdin の経路と tty は無く、断定していない。plugin-cri からの `StreamingServer` の起動と `StreamDispatcher` / `AttachHandler` の組み立ては #3754。方式の設計は「本番 backend の設計」の「Attach」節。段階 1（読み取り専用）は #3763 で実装済み、完全版（stdin・tty・resize）は #3765 の設計に従う未実装。
+実行中コンテナの stdin / stdout / stderr と tty を渡す経路は、core の `ContainerRuntime` にも supervisor にも無い（CreateContainer の `stdin`・`stdin_once`・`tty` の bundle への反映もまだ）。`ContainerRuntime` トレイトの拡張か supervisor の新しい経路かは PLUG-1・SUP 系の設計判断（main の設計が要る）であり、本 issue では注入点（`AttachBackend`）までとした。判断材料として、supervisor のログの sink は stdout / stderr を読んでいるため読み側だけは供給できる可能性があるが、stdin の経路と tty は無く、断定していない。plugin-cri からの `StreamingServer` の起動と `StreamDispatcher` / `AttachHandler` の組み立ては #3754。方式の設計は「本番 backend の設計」の「Attach」節。段階 1（読み取り専用）は #3763 で実装済み、完全版（stdin・tty・resize）は #3765 の設計に従い Linux で実装済み（#4077・#4078。実機の確認は #4079）。
 
 ## Exec（#680・TASK-63.2・CRI-6）
 
@@ -145,7 +145,7 @@ core の `ContainerRuntime` に exec は無く、shim v2 の `TaskExecLauncher` 
 
 ## 本番 backend の設計（#3752）
 
-2026-11-03 に main が決めた要点（Attach は段階方式、Exec は制御チャネルの exec 要求と fd 渡しで孤児時に縮退しない、PortForward は NODE を先に入れ POD は #2877 の後、依存は plugin-cri から supervisor への一方向で cri に実装を入れない）を詳しくした設計記録である。後続の兄弟 issue（#3753〜#3766。親 #3726・TASK-63・MS-7）はこの記録を正として実装する。オーナーの確認が要る点は末尾の「未確認・オーナー確認事項」にまとめ、それ以外は確定扱いとする。**本節は設計記録であり、実装の状況は冒頭の表と各小節の「実装」の記述を正とする。Exec（#3761）・読み取り専用の Attach（#3763）・NODE の PortForward（#3755）は実装済みで、完全版 Attach・Exec の tty・POD の PortForward は未実装である（REPAIR-3）**。
+2026-11-03 に main が決めた要点（Attach は段階方式、Exec は制御チャネルの exec 要求と fd 渡しで孤児時に縮退しない、PortForward は NODE を先に入れ POD は #2877 の後、依存は plugin-cri から supervisor への一方向で cri に実装を入れない）を詳しくした設計記録である。後続の兄弟 issue（#3753〜#3766。親 #3726・TASK-63・MS-7）はこの記録を正として実装する。オーナーの確認が要る点は末尾の「未確認・オーナー確認事項」にまとめ、それ以外は確定扱いとする。**本節は設計記録であり、実装の状況は冒頭の表と各小節の「実装」の記述を正とする。Exec（#3761）・Attach（#3763 の読み取り専用と、Linux の完全版 #4077・#4078。実機の確認は #4079）・NODE の PortForward（#3755）は実装済みで、Exec の tty・POD の PortForward は未実装である（REPAIR-3）**。
 
 対象ビヘイビア: CRI-6・PLUG-1・SUP-4・SUP-6・SEC-1・REPAIR-2・REPAIR-3・REPAIR-5（関連: CORE-1・CORE-5・SUP-3・SUP-5・SUP-7・NET-3）。
 
@@ -248,7 +248,7 @@ helper を supervisor の bin に置く理由は、exec の領域（healthcheck 
 **段階 1 の実装（#3763。実装済み）**:
 
 - 置き場: plugin-cri の `streaming/log_attach.rs`（`LogFollowAttachBackend`）。`production_stream_dispatcher(attach)` が `AttachHandler::read_only()` に包んで結線し、`main.rs` が `CriPluginBackends::log_attach_backend()` で作って `bind_production_streaming` へ渡す（作れなければ起動しない）
-- RPC 時の拒否: `StreamWiring` に `attach_interactive`（既定 false）を足した。`AttachHandler::read_only()` の結線は宣言せず、`attach_impl` が `require_attach_options` で stdin・tty を URL の発行前に `INVALID_ARGUMENT`（`attach with stdin or tty is not supported`）で断る。`issue()` も同じ位置で断る（多層防御）。接続時は backend も同じ文言で断る
+- RPC 時の拒否（現在は非 Linux の読み取り専用の結線だけ。Linux は #4078 で対話可能になった）: `StreamWiring` に `attach_interactive`（既定 false）を足した。`AttachHandler::read_only()` の結線は宣言せず、`attach_impl` が `require_attach_options` で stdin・tty を URL の発行前に `INVALID_ARGUMENT`（`attach with stdin or tty is not supported`）で断る。`issue()` も同じ位置で断る（多層防御）。接続時は backend も同じ文言で断る
 - follow の実行: セッションごとに専用の `std::thread`（blocking プールを使わない）で `read_container_log_with_cancel`（`tail 0`・stream 絞り込みなし）を回し、supervisor の `RecordDemux` がタグを外して stdout / stderr へ分ける。tokio への橋渡しは std の `UnixStream::pair` 3 組（stdout・stderr・終了通知）で、tokio の feature は増やしていない。背圧は socketpair のバッファ。同時数の上限は 64（超えたら `RESOURCE_EXHAUSTED`）
 - 終わり方: supervisor が `FollowEnd`（`Stopped`・`LogRemoved`・`Deadline`・`Cancelled`）を報告する。`Stopped`・`LogRemoved`・`Cancelled` は読み口が EOF で終わり、`Deadline` と読み取りの失敗は EOF の後に読み口が `io::Error` を返す（セッションは Success にしない）。どの場合も終了通知を完了させる
 - 取り消し: 読み口と終了通知の future が取り消しの旗を共有し、最後の 1 つが drop されたら旗が立つ（セッションの終了・切断・idle・停止）。follow は次のポーリング（200 ms）の前に旗を見て、書き込みが詰まっていても 200 ms 刻みで旗を見る
@@ -320,7 +320,7 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 
 **D8. 拒否を外す順序（fail-closed の段階）**
 
-- `bundle/spec.rs` の `unsupported("tty/stdin")` を外すのは最後の実装 issue（C10）だけにする。それまでの途中の状態では拒否を残し、要求より弱い挙動のコンテナ（stdin が `/dev/null`、端末が無い）を作らせない。core の `process.terminal` の拒否は D3 の opt-in で段階的に外す。shim v2 の terminal の拒否（`task_service.rs`）は本件の範囲外でそのまま残す
+- `bundle/spec.rs` の `unsupported("tty/stdin")` を外すのは最後の実装 issue（C10）だけにする（**#4078 で解除済み**。tty は `process.terminal` へ写り、stdin / stdin_once は記録と StartContainer で運ぶ）。それまでの途中の状態では拒否を残し、要求より弱い挙動のコンテナ（stdin が `/dev/null`、端末が無い）を作らせない。core の `process.terminal` の拒否は D3 の opt-in で段階的に外す。shim v2 の terminal の拒否（`task_service.rs`）は本件の範囲外でそのまま残す
 
 **D9. SEC-1 と OWASP の観点**
 
@@ -350,9 +350,9 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 | C5 | #4072 | supervisor: 捕捉からの出力の tap（実装済み。sink 優先・背圧なし・溢れたら切断・購読者数の上限 8 は初期案。購読 API は `CaptureHub::subscribe_output`、kind 9 での受け渡しは C6） | なし |
 | C6 | #4075 | supervisor: kind 9 `AttachRequest` と fd 応答（実装済み: `control::protocol` の `AttachRequestFrame`・`control::server` の `handle_attach`・クライアント入口 `AttachIoSource` / `ControlAttach`。結線は C9） | C4・C5・#3759 |
 | C7 | #4073 | core: `StartRequest` の `StdinMode`（実装済み。`StartRequest::with_stdin` / `stdin`、既定 `Closed`。値の参照は C4・C8） | なし |
-| C8 | #4076 | cri: 記録への保存と StartContainer での運搬（実装済み: 記録の config〔永続記録 v1 のまま〕から `start_stdin_mode` で導き、`RuntimeAdapter::start_with_options` が `StartRequest::with_stdin` に載せる。plugin-cri の `supervised.rs` が `StartOptions::with_stdin` で argv `--stdin <open\|once>` へ写す。`bundle/spec.rs` の `tty/stdin` の拒否は C10 まで残すため、本番の CreateContainer はまだ通らない） | C7・C4 |
-| C9 | #4077 | plugin-cri: 完全版 `AttachBackend`（実装済み: Linux の `streaming::supervisor_attach::SupervisorAttachBackend`。状態確認 → kind 9 の `AttachIoSource::obtain` → `validate_attach_io` で形を再照合 → 入力は専用スレッド＋socketpair、tap は tokio 化、resize は `PtyMaster::resize`、`exited` は tap の EOF と kind 8 の購読。`CriPluginBackends::supervisor_attach_backend` が組み `main.rs` が Linux で使う。`production_stream_dispatcher` は `read_only` のままで、stdin・tty・resize は偽の source を使う単体試験からしか届かない） | C6・C8・#3763・#3754・#3761 |
-| C10 | #4078 | cri: 拒否の解除と整合検査 | C3・C9 |
+| C8 | #4076 | cri: 記録への保存と StartContainer での運搬（実装済み: 記録の config〔永続記録 v1 のまま〕から `start_stdin_mode` で導き、`RuntimeAdapter::start_with_options` が `StartRequest::with_stdin` に載せる。plugin-cri の `supervised.rs` が `StartOptions::with_stdin` で argv `--stdin <open\|once>` へ写す。`bundle/spec.rs` の `tty/stdin` の拒否は C8 の時点では C10 まで残していたが、#4078 で解除済み） | C7・C4 |
+| C9 | #4077 | plugin-cri: 完全版 `AttachBackend`（実装済み: Linux の `streaming::supervisor_attach::SupervisorAttachBackend`。状態確認 → kind 9 の `AttachIoSource::obtain` → `validate_attach_io` で形を再照合 → 入力は専用スレッド＋socketpair、tap は tokio 化、resize は `PtyMaster::resize`、`exited` は tap の EOF と kind 8 の購読。`CriPluginBackends::supervisor_attach_backend` が組み `main.rs` が Linux で使う。C10 の前の状態の記述。現在は #4078 で `ProductionAttach::interactive` により `read_only` を外し、Linux の本番で届く） | C6・C8・#3763・#3754・#3761 |
+| C10 | #4078 | cri: 拒否の解除と整合検査（実装済み: `bundle/spec.rs` の拒否を外し tty を `process.terminal` へ写す。`attach_impl` が URL の発行前に記録から 1 回のロックで状態・`config.tty`・`config.stdin` を読み、未知 ID は `NOT_FOUND`、running でない・tty の不一致〔どちらの向きも〕・stdin 未開への stdin 要求は `FAILED_PRECONDITION`〔固定文 `MSG_ATTACH_*`〕。stdin は `start_stdin_mode` でなく `config.stdin` を直接見る〔tty のコンテナでは常に `Closed` で、supervisor は tty に master を渡すため、stdin なしの tty コンテナへの入力の注入を断れるのはここだけ〕。plugin-cri の `ProductionAttach::interactive` で `read_only` を外す。containerd との差は設計の既定のままで D10-1 はオーナー確認事項） | C3・C9 |
 | C11 | #4079 | 実機前提試験・手順・CI の追記 | C10 |
 
 ### PortForward（NET-3・SEC-1）
@@ -426,7 +426,7 @@ CRI の `ExecSync`（現状 `UNIMPLEMENTED`）も本設計の helper を再利�
 
 実装済みは Exec の本番 launcher（#3761。Linux のみ）、読み取り専用の Attach（#3763）、NODE の PortForward（#3755）。未実装の組は次のとおり（REPAIR-3）。
 
-- 完全な Attach（stdin・stdin_once・tty・resize）: plugin-cri の backend は実装済み（#4077）だが本番の dispatcher は `read_only` のまま（解除と bundle の拒否の解除は #4078、実機は #4079）。#3765（設計のみ・closed）の子 issue で追う。個別の状態は「完全版 Attach の設計（#3765）」の子 issue 表を正とする
+- 完全な Attach（stdin・stdin_once・tty・resize）: 実装済み（#4077・#4078。dispatcher の `read_only` と bundle の拒否は解除済み）。残るのは実機前提試験・手順・CI（#4079）。#3765（設計のみ・closed）の子 issue で追う。個別の状態は「完全版 Attach の設計（#3765）」の子 issue 表を正とする
 - POD ネットワークの PortForward: 設計と分解は #3766、前提は保持役 provider の #2877。RPC 時と dialer の両方で `UNIMPLEMENTED`
 - Exec の tty（supervisor 側の pty 結線と helper の `--tty`。受け側は実装・試験済み）: 追跡 issue 未起票（親 #3726 の残り）。本番は RPC 時に `INVALID_ARGUMENT`
 - Exec の相対 argv[0]（PATH 解決）: #2439 の判断待ち。RPC 時に `INVALID_ARGUMENT`
@@ -446,7 +446,7 @@ CRI の `ExecSync`（現状 `UNIMPLEMENTED`）も本設計の helper を再利�
 
 - 置き場は plugin-cri の `streaming`（`production_streaming_config`・`production_stream_dispatcher`・`bind_production_streaming`・`stop_streaming_on`）。`main.rs` が runtime の構築直後、UDS の bind より前に呼ぶ
 - 設定は `StreamingConfig::default()`（`127.0.0.1:0`・外部公開なし・TTL 60 秒）。外部公開の口は plugin-cri から出さない。TLS・認証は無く、URL のトークンが唯一の認可
-- dispatcher は Attach（`AttachHandler::read_only()`。#3763）・PortForward（NODE の `NodeLoopbackDialer`。#3755）・Exec（Linux で `exec_stream_launcher` があるとき。`without_tty`・`absolute_command_only`。#3761）を結線して注入する（`production_stream_dispatcher(attach, exec, recorder)`。`PortForwardHandler::new` の失敗を `INTERNAL` に写すため `Result`）。非 Linux の Exec は未結線で「not wired」の `UNIMPLEMENTED`。兄弟 issue は `with_*` を足す（`wiring` は bind 時に取られるため bind より前）
+- dispatcher は Attach（Linux は対話可能な完全版、非 Linux は `AttachHandler::read_only()`。`ProductionAttach` で宣言する。#3763・#4078）・PortForward（NODE の `NodeLoopbackDialer`。#3755）・Exec（Linux で `exec_stream_launcher` があるとき。`without_tty`・`absolute_command_only`。#3761）を結線して注入する（`production_stream_dispatcher(attach: ProductionAttach, exec, recorder)`。`PortForwardHandler::new` の失敗を `INTERNAL` に写すため `Result`）。非 Linux の Exec は未結線で「not wired」の `UNIMPLEMENTED`。兄弟 issue は `with_*` を足す（`wiring` は bind 時に取られるため bind より前）
 - bind の失敗は fail-closed（`error: UNAVAILABLE: failed to start the streaming server`、設定検証の失敗は `INTERNAL`）。縮退すると「未結線」と区別できないため。UDS より先に判定するので socket を残さない
 - 停止は SIGTERM・SIGINT の検知と同時に TCP の待ち受けを閉じ、待ちを足さない。受け付け済みで Upgrade しない接続は既存の `RUNTIME_SHUTDOWN_WAIT`（1 秒）が打ち切り、`SHUTDOWN_TOTAL_BOUND`（13.7 秒）は変わらない
 

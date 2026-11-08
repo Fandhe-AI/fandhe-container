@@ -8,9 +8,10 @@
 //!
 //! ## 本番の [`AttachBackend`]（REPAIR-3）
 //!
-//! 段階 1（#3763）は plugin-cri の回転ログの follow（読み取り専用）で、[`AttachHandler::read_only`] で組む。
+//! 非 Linux の本番は plugin-cri の回転ログの follow（読み取り専用。#3763）で、[`AttachHandler::read_only`] で組む。
 //! stdin・tty は RPC 時（`StreamingUrlIssuer::require_attach_options`）と接続時（backend）の両方で `INVALID_ARGUMENT` にする。
-//! 完全版（stdin・tty・resize）は supervisor の制御チャネルへ足す経路（#3765 の設計）で、未実装。
+//! Linux の本番は完全版（stdin・tty・resize。supervisor の制御チャネル kind 9 の fd と tap。#3765 の設計・#4077・#4078）で、
+//! `read_only` を付けない。RPC 時の整合検査（構成と要求の不一致を `FAILED_PRECONDITION`）は `runtime_service` の `attach_impl`（D7）が担う。
 //! backend を注入しない構成では Attach は結線されず（`StreamHandler::wiring`）、RPC は URL を返さず `UNIMPLEMENTED` になる（#3753）。実装済みを装わない。
 //!
 //! ## セッションの構造
@@ -103,7 +104,7 @@ impl std::fmt::Debug for AttachSession {
     }
 }
 
-/// 実行中コンテナの stdio をセッションへ渡す口（拡張点。本番の実装は未接続。モジュール doc の REPAIR-3 を参照）。
+/// 実行中コンテナの stdio をセッションへ渡す口（拡張点。本番の実装は plugin-cri。モジュール doc の REPAIR-3 を参照）。
 ///
 /// 返す future は `'static`（実装は必要な状態を clone して move する）。コンテナが running でなければ
 /// `FAILED_PRECONDITION`、未知なら `NOT_FOUND` を返す（RPC 時の検証と接続時の間のレースをここで再確認する）。

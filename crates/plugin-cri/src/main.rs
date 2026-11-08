@@ -261,10 +261,8 @@ fn serve(socket: &std::path::Path) -> ExitCode {
     // Attach の backend。Linux は完全版（kind 9 の fd と tap。#4077）、非 Linux は読み取り専用（回転ログの follow。#3763）。
     // 作れなければ起動しない（fail-closed）。
     #[cfg(target_os = "linux")]
-    let attach_backend: std::sync::Arc<
-        dyn fandhe_container_cri::streaming::attach::AttachBackend,
-    > = match backends.supervisor_attach_backend() {
-        Ok(b) => b,
+    let attach_backend = match backends.supervisor_attach_backend() {
+        Ok(b) => streaming::ProductionAttach::interactive(b),
         Err(_) => {
             return fail(
                 PluginErrorCode::Internal,
@@ -273,10 +271,8 @@ fn serve(socket: &std::path::Path) -> ExitCode {
         }
     };
     #[cfg(not(target_os = "linux"))]
-    let attach_backend: std::sync::Arc<
-        dyn fandhe_container_cri::streaming::attach::AttachBackend,
-    > = match backends.log_attach_backend() {
-        Ok(b) => b,
+    let attach_backend = match backends.log_attach_backend() {
+        Ok(b) => streaming::ProductionAttach::read_only(b),
         Err(_) => {
             return fail(
                 PluginErrorCode::Internal,

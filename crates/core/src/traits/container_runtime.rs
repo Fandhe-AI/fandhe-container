@@ -328,7 +328,7 @@ impl CreateRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 pub enum StdinMode {
-    /// stdin を開かない（CRI の `stdin=false`。既定）。attach の stdin 要求は後続で断る。
+    /// stdin を開かない（CRI の `stdin=false`。既定）。attach の stdin 要求は cri の RPC 時の整合検査（D7。#4078）と supervisor の kind 9 の `StdinNotOpen` で断る。
     #[default]
     Closed,
     /// stdin を開いたまま保持する（`stdin=true, stdin_once=false`）。attach のたびに複製を渡す。

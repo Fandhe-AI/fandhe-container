@@ -234,7 +234,7 @@ impl ContainerRecord {
     /// ここで 3 値へ畳む。別欄に持つと二重管理になるため、導出はこの純関数に一本化する。
     ///
     /// - `tty` が真なら常に `Closed`: tty の入力は pty の master が担い、`--stdin` を渡すと core が fork 前に
-    ///   `Pipe` と tty の併用として拒否する（D3）。tty での stdin の可否は C10（#4078）が RPC の時点で判断する。
+    ///   `Pipe` と tty の併用として拒否する（D3）。tty のコンテナへの stdin の要求の可否は `attach_impl` の整合検査（D7。`config.stdin` を直接見る。#4078）が RPC の時点で判断する。
     /// - `stdin` が偽なら `Closed`（`stdin_once` だけでは何も開かない）。
     /// - `stdin` が真なら `stdin_once` で `Once` / `Open`。
     pub(super) fn start_stdin_mode(&self) -> StdinMode {

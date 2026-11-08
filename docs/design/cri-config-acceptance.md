@@ -25,7 +25,7 @@
 
 受け入れない項目（順 7 の Bidirectional を含む）の `UNIMPLEMENTED` の照合は `crates/cri/tests/bundle_spec.rs` に残し、受け入れた HostToContainer は同じ試験で `config.json` の `mounts[].options`（`rslave`）を具体値で照合する（#2669・CRI-2・OCI-4）。
 
-本表の外の項目（tty / stdin・SELinux・AppArmor・privileged・resources の一部）は #2606 の列挙の対象外である。受け入れない項目の `UNIMPLEMENTED` の照合は `crates/cri/tests/bundle_spec.rs` に残している。
+本表の外の項目（SELinux・AppArmor・privileged・resources の一部）は #2606 の列挙の対象外である（tty は `process.terminal`、stdin / stdin_once は記録と StartContainer で運ぶ形で #4078 で受け入れ済み）。受け入れない項目の `UNIMPLEMENTED` の照合は `crates/cri/tests/bundle_spec.rs` に残している。
 
 ## イメージ User の解決方式（SEC-1・SEC-5・REPAIR-5）
 

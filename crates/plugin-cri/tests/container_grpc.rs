@@ -1518,7 +1518,7 @@ async fn cri6_repair3_3754_production_binary_wired_streaming_rpcs_report_not_fou
         )
         .await
         .expect_err("attach");
-        // Attach は結線済み（読み取り専用。#3763）。未知の ID は存在照合の NOT_FOUND になる。
+        // Attach は結線済み（stdout のみの要求。#3763・#4078）。未知の ID は存在照合の NOT_FOUND になる。
         assert_eq!(e.code(), PluginErrorCode::NotFound);
         assert_eq!(e.message(), "container not found");
         let e = call_with_deadline(

@@ -13,6 +13,9 @@
 //! （cri は core の `traits` だけを参照する境界のため。CRI-7）。一致は試験で core の定数と照合する。
 //!
 //! **未実装・簡易実装（REPAIR-3）**:
+//! - tty は `process.terminal` へ写す。stdin / stdin_once は config.json に出さず、記録と StartContainer で運ぶ
+//!   （#4076）。attach の整合検査は `runtime_service::attach_impl`（D7。#4078）が担い、core の terminal は
+//!   supervisor の opt-in でだけ受ける（CRI-2・CRI-6）。
 //! - namespace の共有: pid の `POD` は未実装で、コンテナごとの新しい namespace にする（共有の欠落であり、
 //!   要求より分離が弱くなる方向ではない。core の PID 1 前提の証跡と両立しないため。#2674 の後続）。ipc の `POD` は
 //!   [`PodNamespacePaths`]（pod の保持役が作った user＋ipc namespace のパス）が与えられたときだけ
@@ -378,6 +381,9 @@ struct SpecOut<'a> {
 /// `"readonly":true,` の長さ（JSON の大きさの会計）。
 const ROOT_READONLY_BYTES: usize = 16;
 
+/// `"terminal":true,` の長さ（JSON の大きさの会計）。
+const PROCESS_TERMINAL_BYTES: usize = 16;
+
 #[derive(Serialize)]
 struct RootOut {
     path: &'static str,
@@ -395,6 +401,10 @@ struct ProcessOut {
     /// `drop_capabilities` の指定があるときだけ書く（無ければ core が OCI 既定集合を使う）。
     #[serde(skip_serializing_if = "Option::is_none")]
     capabilities: Option<CapabilitiesOut>,
+    /// CRI の `tty` を写す。真のときだけ出す（偽は従来の出力とバイト単位で同じ）。
+    /// core の start は端末対応を opt-in 済みの launcher だけが受ける（#4070・#4074）。
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    terminal: bool,
 }
 
 /// `process.capabilities`。3 集合を同じ値にする（core が drop だけを解釈済みにする形。#2666）。
@@ -1361,10 +1371,9 @@ fn build_inner(
     pod_netns: Option<&str>,
     stage: Stage,
 ) -> Result<RuntimeConfigJson, CriError> {
-    // 実行層が受けない・無視すると要求より弱くなる入力を先に拒否する。
-    if container.tty || container.stdin || container.stdin_once {
-        return Err(unsupported("tty/stdin"));
-    }
+    // tty は `process.terminal` へ写し、stdin / stdin_once は OCI に欄が無いため config.json には出さない
+    // （記録に残り、StartContainer が `StdinMode` で supervisor へ運ぶ。#4076）。attach 時の整合検査は
+    // `runtime_service::attach_impl`（D7。#4078）が担う。
     // devices・cdi_devices は core の `linux.devices` の適用・device cgroup の許可リスト・gpu の CDI 適用が揃うまで
     // 拒否する。受けて値を捨てると、要求したデバイスが黙って無いコンテナが起動するため（一般デバイスは GPU-9 が
     // 検討中）。docs/design/cri-devices-cdi.md・#2673（CRI-2・GPU-1）。
@@ -1596,6 +1605,9 @@ fn build_inner(
     if readonly_root {
         budget.spend(ROOT_READONLY_BYTES)?;
     }
+    if container.tty {
+        budget.spend(PROCESS_TERMINAL_BYTES)?;
+    }
 
     let out = SpecOut {
         oci_version: OCI_VERSION,
@@ -1614,6 +1626,7 @@ fn build_inner(
                 additional_gids: additional_gids.clone(),
             },
             capabilities,
+            terminal: container.tty,
         },
         mounts,
         linux: LinuxOut {

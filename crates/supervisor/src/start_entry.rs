@@ -2661,7 +2661,7 @@ mod linux {
                 .audit_coverage_policy(self.audit_policy);
             // start と restart の再 launch の launcher だけが端末つき起動（`process.terminal: true`）を受ける。master は
             // 捕捉（`LogCapture`）が必ず読む（捕捉のハブは本番では常に `Some`）。残存確認だけの launcher は launch しない
-            // ので opt-in しない。cri の bundle の拒否は残る（D8。CRI-6・SEC-1・CORE-5・#4074）。
+            // ので opt-in しない。cri の bundle の拒否は #4078 で解除済み（D8。CRI-6・SEC-1・CORE-5・#4074）。
             let builder = if with_mapping {
                 builder.with_terminal_support()
             } else {

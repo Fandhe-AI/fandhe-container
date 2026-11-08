@@ -1,7 +1,7 @@
 //! shim v2 バイナリ（`containerd-shim-fandhe-container-v2`）が登録するサービスの組み立て（CRI-5・CRI-7・PLUG-1・TASK-62.6・#3684）。
 //!
-//! 呼び出し元: `src/bin/containerd_shim_v2.rs` の main が [`production_registry`] を
-//! `fandhe_container_cri::shim_v2::bootstrap::run_cli_with_context` の注入口として渡す。serve（常駐デーモン）のときだけ呼ばれる。
+//! 呼び出し元: `src/bin/containerd_shim_v2.rs` の main が [`production_registry`]（serve 用）と [`production_delete`]（delete の前段）を
+//! `fandhe_container_cri::shim_v2::bootstrap::run_cli_with_hooks` の注入口として渡す。`production_registry` は serve（常駐デーモン）のときだけ呼ばれる。
 //! 本番の `ContainerRuntime`（[`crate::adapter::CoreLifecycleRuntime`]）は plugin-cri にしか無く、cri から plugin-cri への依存は
 //! `crates/cri/tests/dependency_direction.rs` が禁じているため、bin の置き場所をここにした
 //! （判断は `docs/design/shim-v2-production-binary.md`）。辺の向きは plugin-cri → cri・core の一方向のままで、core は変わらない（PLUG-4）。
@@ -23,7 +23,8 @@
 //! （`delete_preflight_in`・[`match_delete_record`]。読み取りだけで、状態ルートの作成・書き込み・シグナル・プロセス起動をしない）の結果
 //! [`DeleteRecordMatch`] が `Recorded` のときだけ、`reclaim` が残ったコンテナを止めて回収し（停止・削除。既存の
 //! `CoreLifecycleRuntime` を使う）終了状態を返す。記録なし・回収済みは何もせず成功する（冪等）。判断は
-//! `docs/design/shim-v2-production-binary.md` D5・D6。
+//! `docs/design/shim-v2-production-binary.md` D5・D6。bin 経由の試験は `tests/shim_bin_delete_reclaim.rs`（#4153。本物の
+//! start → Create → デーモンの SIGKILL → delete の回収と冪等）と `tests/shim_bin_bootstrap.rs` の `cri5_4151_*`（不正な引数）。
 //!
 //! 未実装（REPAIR-3）: 非 Linux（macOS は既定の状態ルートが未決定で #2431、`start`・`kill`・`stop` も `Unimplemented`）は Shutdown だけの
 //! `EmptyTaskService` を登録する。exec の起動役（`TaskExecLauncher`）の本番実装は無く exec は `UNIMPLEMENTED`。
@@ -222,7 +223,7 @@ impl DeleteTarget {
 /// delete の対象と状態ルートの記録との照合結果（副作用なしで得る。REPAIR-4・#4151）。
 ///
 /// 停止・回収（#4152）がこの値を受け取り、`Recorded` のときだけ実行層に触れる。`NotRecorded` と `AlreadyReclaimed` は
-/// どちらも副作用 0 回で成功させる想定で、挙動は変わらない。
+/// どちらも実行層を作らず副作用 0 回で、固定の応答（pid 0・終了状態 137）で成功する（挙動は変わらない）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DeleteRecordMatch {

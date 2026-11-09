@@ -592,7 +592,7 @@ pub fn prepare_restrictions(
 /// `root_override` が `None` なら core の既定ルート解決に従い（`state::open_default_store` と同じ規則）、状態ストアを
 /// 開いてから `<状態ルート>/@audit.log` を主経路とする `FileAuditSink` を返す。返す sink はファイルを開いたまま
 /// 持たないので、fork 前に作っても worker へ fd は継承されない。[`run_command_with_pidfd`] / `run_command_in` の
-/// `audit` へ渡す。Linux 以外では core が `Unimplemented` を返す（fail-closed）。supervisor の start 入口（`start_entry`）から
+/// `audit` へ渡す。Windows ホストでは core が設計上の拒否（`FailedPrecondition`）を返す（fail-closed。この module は Linux 限定のため参考）。supervisor の start 入口（`start_entry`）から
 /// 配線済み（#1717・#2481）。healthcheck の exec 専用 helper（#2441）と CLI の `exec`（#2626）からも配線済み。
 pub fn default_audit_sink(
     root_override: Option<std::path::PathBuf>,

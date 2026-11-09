@@ -1645,7 +1645,7 @@ fn err2_create_rejects_relative_bundle() {
 
 /// OCI-5・SEC-4・CLI-1: Linux 以外の日常コマンドが fail-closed で終わった後の状態ルートの期待。
 /// plugin 拒否の監査記録先（`@audit.log`）を作る際に、`FileStateStore::open` が macOS では状態ルートを
-/// 0700 で作り、Windows（`Unimplemented`）では何も作らない。
+/// 0700 で作り、Windows ホスト（設計上の拒否 `FailedPrecondition`。#2428 の案 C）では何も作らない。
 #[cfg(not(target_os = "linux"))]
 fn assert_state_root_after_fail_closed(root: &std::path::Path) {
     if cfg!(target_os = "macos") {

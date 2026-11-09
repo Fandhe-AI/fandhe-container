@@ -68,8 +68,8 @@
 //! - `injected_files`: secrets / configs 注入の検証済み仕様型（SUP-12・TASK-169.4.2）。OS 非依存で、
 //!   Linux 限定の適用は `exec::inject_files`（専用 tmpfs へ書き込み後に read-only 化）。配線は未実装（REPAIR-3）
 //! - `state_store`: ファイルベース `StateStore`（TASK-31.1・OCI-5）は実装済み。3 OS でコンパイルされるが
-//!   使えるのは Linux のみで、他 OS の `FileStateStore::open` は状態ルートの信頼境界（所有者・ACL）を
-//!   検査できないため `Unimplemented`（fail-closed。start の `BundleLock` と同じ扱い）。
+//!   使えるのは Linux・macOS で、Windows ホストの `FileStateStore::open` は設計上の恒久拒否
+//!   （`FailedPrecondition`。状態はゲスト内の Linux パスに置く。#2428 の案 C・#4332。fail-closed）。
 //!   fsync・残骸掃除の強化は TASK-31.2（#156）、結合テスト（ライフサイクル経由の `state.json` 照合）は TASK-31.3（#157）で実装済み。CLI と supervisor の書き込み排他（`@lock`＋期限つき `try_lock`＋revision による楽観的排他）の検証・明文化は TASK-157.9（#1069）
 //! - `cgroups`: 委譲 cgroup v2 の検出・コンテナ用子 cgroup 作成・自プロセス退避の検証・controller
 //!   有効化・`memory.max` / `memory.swap.max` 設定・`cpu.max` 設定（Linux 限定。TASK-32.1・TASK-32.2・

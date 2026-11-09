@@ -131,7 +131,7 @@ plugin-cri の `ProductionPodHolder`（`crates/plugin-cri/src/pod_holder.rs`）�
 
 あわせて readopt の不具合を直した（H4 の残り）: 保持役の注入下では起動の前に `pending=1`（`network_pending=0`）を書くため、クラッシュ後の再採用が `network_owned=true` に倒すと、pod network provider を差さない本番で Stop・Remove が回収待ちから抜けられなくなる。`network_owned` は `network_pending` だけから導く（`pending_unresolved` には従来どおり数える）。R11（#2940）は #2877 に依存しており循環するため、ここで直した。
 
-未実装（REPAIR-3）: 保持役の pid から `PodNamespacePaths` を作って bundle へ渡す配線は H5（#2876）、保持役の netns を pod ネットワークへ渡すのは H8（#2878）で、それまでコンテナは保持役の namespace に join しない（保持役は起動して生きているだけ）。素性の永続化と再起動後の再採用は R11（#2940）。
+未実装（REPAIR-3）: 保持役の pid から `PodNamespacePaths` を作って bundle へ渡す配線（H5・#2876）は配線済みで、POD のコンテナは user・ipc に join する。保持役の netns を pod ネットワークへ渡すのは H8（#2878）で未実装。素性の永続化と再起動後の再採用は R11（#2940）。
 
 ## 実装単位
 

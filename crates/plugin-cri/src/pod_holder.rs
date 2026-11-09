@@ -23,14 +23,14 @@
 //!   待ちの間は保たない（ブロックしない syscall の間だけ保つ）。エラー文言は固定の英文でパス・pid・errno を含めない（REPAIR-4）。
 //!
 //! # 未実装・簡易実装（REPAIR-3）
-//! 保持役の pid から `PodNamespacePaths` を作って bundle へ渡す配線は H5（#2876）、保持役の netns を pod ネットワークへ渡す
-//! のは H8（#2878）で、それまでコンテナは保持役の namespace に join しない（保持役は起動して生きているだけ）。素性（pid・
+//! 保持役の pid から `PodNamespacePaths` を作って bundle へ渡す配線（H5・#2876）は配線済み（user・ipc の join）。保持役の
+//! netns を pod ネットワークへ渡すのは H8（#2878）で未実装。素性（pid・
 //! starttime・ns）の永続化と再起動後の再採用は R11（#2940）。rootful（uid 0）は `UNIMPLEMENTED`（#2241・#2442 の判断まで）。
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::os::fd::{AsFd as _, AsRawFd as _};
-use std::os::unix::fs::MetadataExt as _;
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::Path;
 #[cfg(any(test, feature = "pod-holder-test-support"))]
 use std::path::PathBuf;
@@ -502,7 +502,12 @@ fn kill_and_reap(mut child: Child) -> Option<Child> {
 fn open_trusted_executable(path: &Path, euid: u32) -> Result<File, TraitError> {
     let bad = || TraitError::new(ErrorCode::FailedPrecondition, MSG_UNTRUSTED_EXE);
     // 保持役は自分の実体を開き直すため、読めない bin では成り立たない（`would_dump` の MAY_READ の代理）。
-    let file = File::open(path).map_err(|_| bad())?;
+    // FIFO 等で open が無期限にブロックしないよう O_NONBLOCK で開き、同じ fd の種別を fstat で検証する（REPAIR-5）。
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc_o_nonblock())
+        .open(path)
+        .map_err(|_| bad())?;
     let meta = file.metadata().map_err(|_| bad())?;
     if !meta.is_file() || !(meta.uid() == 0 || meta.uid() == euid) || meta.mode() & 0o022 != 0 {
         return Err(bad());
@@ -517,11 +522,22 @@ fn check_ancestors_trust(path: &Path, euid: u32) -> Result<(), TraitError> {
     let real = std::fs::canonicalize(path).map_err(|_| bad())?;
     for dir in real.ancestors().skip(1) {
         let meta = std::fs::metadata(dir).map_err(|_| bad())?;
-        if !meta.is_dir() || !(meta.uid() == 0 || meta.uid() == euid) || meta.mode() & 0o022 != 0 {
+        // sticky ビットつきで root 所有の祖先（`/tmp` 等）は、他者が自分の所有でない子を改名・削除できない
+        // ため許容する。直下の子は次の反復で所有者検査を受ける。
+        let sticky_root = meta.uid() == 0 && meta.mode() & 0o1000 != 0;
+        if !meta.is_dir() || !(meta.uid() == 0 || meta.uid() == euid) {
+            return Err(bad());
+        }
+        if meta.mode() & 0o022 != 0 && !sticky_root {
             return Err(bad());
         }
     }
     Ok(())
+}
+
+/// `O_NONBLOCK`（Linux の値。本モジュールは Linux 限定）。
+const fn libc_o_nonblock() -> i32 {
+    0o4000
 }
 
 /// 実効 uid（`/proc/self/status`）。root（real か effective が 0）なら 0 を返す。読めなければ `Err`。

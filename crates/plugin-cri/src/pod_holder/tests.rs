@@ -157,6 +157,31 @@ fn cri2_plug11_executable_trust_checks() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// bin が FIFO でも open がブロックせず拒否される（writer が居ない FIFO の blocking open は無期限。REPAIR-5）。
+#[test]
+fn cri2_repair5_fifo_executable_is_rejected_without_blocking() {
+    let euid = current_euid().unwrap();
+    let path = scratch("fifo");
+    let _ = std::fs::remove_file(&path);
+    let ok = Command::new("mkfifo")
+        .arg(&path)
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok);
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let p2 = path.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(open_trusted_executable(&p2, euid).map(|_| ()));
+    });
+    let r = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("open must not block on a FIFO");
+    assert_eq!(r.unwrap_err().message(), MSG_UNTRUSTED_EXE);
+    let _ = std::fs::remove_file(&path);
+}
+
 /// 祖先ディレクトリの検査: 全祖先が自分（か root）所有で group/other 書き込み不可のときだけ通す（PLUG-11）。
 #[test]
 fn cri2_plug11_ancestor_directories_must_not_be_writable_by_others() {

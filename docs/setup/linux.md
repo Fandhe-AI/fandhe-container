@@ -72,7 +72,7 @@ plugin-cri は rootless（非 root）で `RunPodSandbox` のたびに、supervis
 - 非特権 user namespace を作れること（Ubuntu 24.04 以降の `kernel.apparmor_restrict_unprivileged_userns=1` では `PermissionDenied` で失敗するため緩和が要る。subuid / subgid の範囲写像は次節）
 - uid 0 の plugin-cri には保持役を注入せず、従来どおり（start は `UNIMPLEMENTED`）
 
-保持役は起動して生きているだけで、コンテナが保持役の namespace に join する配線は未実装（H5・#2876、H8・#2878）。
+POD のコンテナは保持役の user・ipc namespace に join する（H5・#2876 は配線済み）。保持役の netns を pod ネットワークへ渡す配線は未実装（H8・#2878）。
 
 ## containerd の shim（rootless のみ。#3684）
 

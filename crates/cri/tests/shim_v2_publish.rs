@@ -5,6 +5,8 @@
 //! 偽なのは実行層（`ContainerRuntime`）と publish バイナリ（`/bin/sh` の記録スクリプト）だけ。Start の後に終了を
 //! 観測した watcher が、偽バイナリへ argv と `Any`（TaskExit）を渡し、イベントがちょうど 1 件であることを具体値で確かめる。
 //! Delete 後に同じ ID で作り直した場合に、旧世代が旧 pid のイベントを送らないことも確かめる。
+//! stdin 上の `Any` が 4096 バイトを超える TaskCreate（id 255 + bundle 4096 の最大値と、超える最小の組）の到達と、
+//! 子が読まない場合の期限内の kill・回収も長い本文で照合する（#4291・#4223・REPAIR-12）。
 #![cfg(unix)]
 
 #[path = "../../oci/tests/support/test_root.rs"]
@@ -379,20 +381,17 @@ fn create_delete_shutdown(svc: &TaskService, dir: &std::path::Path, signal: &Shu
     let bundle = dir.join("bundle");
     std::fs::create_dir(&bundle).unwrap();
     let bundle = bundle.to_str().unwrap().to_owned();
-    svc.handle("Create", &create_req("c1", &bundle)).unwrap();
-    svc.handle(
-        "Delete",
-        &DeleteRequest {
-            id: "c1".into(),
-            exec_id: String::new(),
-        }
-        .encode_to_vec(),
-    )
-    .unwrap();
+    create_delete_shutdown_with(svc, "c1", &bundle, signal);
+}
+
+/// `create_delete_shutdown` の id・bundle 指定版。bundle は実在を確認されない（偽 runtime はパスに触れない）。
+fn create_delete_shutdown_with(svc: &TaskService, id: &str, bundle: &str, signal: &ShutdownSignal) {
+    svc.handle("Create", &create_req(id, bundle)).unwrap();
+    svc.handle("Delete", &delete_req(id)).unwrap();
     svc.handle(
         "Shutdown",
         &ShutdownRequest {
-            id: "c1".into(),
+            id: id.into(),
             now: false,
         }
         .encode_to_vec(),
@@ -685,4 +684,110 @@ fn cri5_4281_exec_events_reach_fake_binary_in_order() {
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(count_calls(&out), 4, "exactly one event per step");
     assert!(log.0.lock().unwrap().is_empty());
+}
+
+/// 偽バイナリが受け取るはずの TaskCreate の `Any`（stdin 全体）。本体の定数とは独立に組み立てる。
+fn expected_create_any(id: &str, bundle: &str) -> Vec<u8> {
+    Any {
+        type_url: "containerd.events.TaskCreate".into(),
+        value: TaskCreate {
+            container_id: id.into(),
+            bundle: bundle.into(),
+            rootfs: Vec::new(),
+            io: Some(TaskIo::default()),
+            checkpoint: String::new(),
+            pid: 0,
+        }
+        .encode_to_vec(),
+    }
+    .encode_to_vec()
+}
+
+/// 長い bundle（`/` + `b` の繰り返し）。
+fn long_bundle(len: usize) -> String {
+    format!("/{}", "b".repeat(len - 1))
+}
+
+/// id `c1` で stdin 上の `Any` が 4096 バイトを超える最小の bundle 長を求める。
+fn min_bundle_len_over_4096() -> usize {
+    (1..=4096)
+        .find(|&l| expected_create_any("c1", &long_bundle(l)).len() > 4096)
+        .expect("4096 byte bundle exceeds 4096 byte Any")
+}
+
+/// CRI-5・REPAIR-12・#4291・#4223: stdin 上の `Any` が 4096 バイトを超える TaskCreate（id 255 + bundle 4096 の最大値と、
+/// 4096 を超える最小の組）が、本番の組み立てを通って偽バイナリの stdin へ欠けずにバイト単位で一致して届く。
+#[test]
+fn cri5_4291_large_task_create_reaches_fake_binary_intact() {
+    let min_len = min_bundle_len_over_4096();
+    assert_eq!(min_len, 4055);
+    assert!(expected_create_any("c1", &long_bundle(min_len - 1)).len() <= 4096);
+    let (svc, _fake, out, _bundle, log, _dir) = setup_4224("long", "", Duration::from_secs(5));
+    let max_id = "c".repeat(255);
+    let max_bundle = long_bundle(4096);
+    assert_eq!(max_bundle.len(), 4096);
+    let min_bundle = long_bundle(min_len);
+    let cases = [
+        (max_id.as_str(), max_bundle.as_str(), 4392usize),
+        ("c1", min_bundle.as_str(), 4097usize),
+    ];
+    for (id, bundle, _) in cases {
+        svc.handle("Create", &create_req(id, bundle)).unwrap();
+    }
+    for (n, (id, bundle, want_len)) in cases.into_iter().enumerate() {
+        assert_eq!(wait_call(&out, n).0, "/tasks/create");
+        let raw = std::fs::read(out.join(format!("call{n}/stdin"))).unwrap();
+        assert_eq!(raw.len(), want_len);
+        assert!(raw.len() > 4096 && raw.len() <= 8192);
+        assert_eq!(raw, expected_create_any(id, bundle));
+        let any = Any::decode(raw.as_slice()).unwrap();
+        let ev = TaskCreate::decode(any.value.as_slice()).unwrap();
+        assert_eq!(ev.container_id, id);
+        assert_eq!(ev.bundle, bundle);
+        assert_eq!(ev.pid, 0);
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(count_calls(&out), 2);
+    assert!(log.0.lock().unwrap().is_empty());
+}
+
+/// REPAIR-5・REPAIR-12・CRI-5・#4291・#4222: 子が読まないまま長い TaskCreate（id 255 + bundle 4096）を送っても、
+/// 排出は期限内に戻り、子を kill して回収する。ログに id・bundle は出ない。
+#[test]
+fn repair5_4291_drain_deadline_reaps_non_reading_child_with_large_task_create() {
+    let (svc, ctx, signal, _dir, out, _log) = drain_setup(
+        "drain-deadline-long",
+        false,
+        true,
+        Duration::from_millis(300),
+    );
+    let max_id = "c".repeat(255);
+    create_delete_shutdown_with(&svc, &max_id, &long_bundle(4096), &signal);
+    assert!(wait_until(Duration::from_secs(10), || out
+        .join("call0/pid")
+        .exists()));
+    let started = Instant::now();
+    let drains = ctx.publisher_drains().drain_all();
+    let took = started.elapsed();
+    assert!(took < Duration::from_millis(2000), "{took:?}");
+    assert_eq!(drains.len(), 1);
+    let d = drains[0];
+    assert!(d.deadline_hit, "{d:?}");
+    assert!(d.worker_finished, "{d:?}");
+    assert_eq!((d.queued, d.dropped), (2, 2), "{d:?}");
+    let line = d.to_json_line();
+    assert!(line.contains(r#""dropped":2"#), "{line}");
+    assert!(line.contains(r#""outcome":"deadline""#), "{line}");
+    for secret in ["/run/containerd", "default", "ccccc", "bbbbb"] {
+        assert!(!line.contains(secret), "{line}");
+    }
+    assert_eq!(count_calls(&out), 1, "queued event must not start a child");
+    #[cfg(target_os = "linux")]
+    {
+        let pid = std::fs::read_to_string(out.join("call0/pid")).unwrap();
+        assert!(
+            !std::path::Path::new(&format!("/proc/{}", pid.trim())).exists(),
+            "child must be reaped"
+        );
+    }
 }

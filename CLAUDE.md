@@ -127,7 +127,7 @@ fandhe-container/
 │   │   ├── cri-devices-cdi.md     # CRI の devices・CDI の受け入れ方針の判断記録（#2673・CRI-2・GPU-1・SEC-1。オーナー判断待ち。判断が出るまで `UNIMPLEMENTED`）
 │   │   ├── cdi-rootless-device-nodes.md  # rootless での CDI deviceNodes をホストのノードの bind で供給する方式の設計・判断シート（#2986・GPU-2・GPU-4・CORE-6・SEC-5。オーナー承認待ち）
 │   │   ├── config-id-mappings.md  # config の linux.uidMappings / gidMappings を受けるかの判断記録（#2240・SEC-5・CORE-6。オーナー承認待ち）
-│   │   ├── windows-state-store-acl.md  # Windows の FileStateStore の所有者 SID 照合・保護 DACL の実装方式（windows-sys / 自前宣言 / 恒久拒否）の判断記録（#2428・OCI-5・SEC-4。オーナー承認待ち）
+│   │   ├── windows-state-store-acl.md  # Windows の FileStateStore の所有者 SID 照合・保護 DACL の実装方式（windows-sys / 自前宣言 / 恒久拒否）の判断記録（#2428・#4332・OCI-5・SEC-4。案 C〔Windows ホストは恒久拒否〕で決定）
 │   │   ├── oci-mounts-implicit-entries.md  # mounts[] の bind・sysfs 以外（暗黙に供給済みの /proc・/dev 系・tmpfs 等）を受けるかの判断記録（#2347・TASK-29 追補・OCI-4・SEC-1。オーナー承認待ち）
 │   │   ├── network-reclaim-persistence.md  # 作成失敗の回収待ちの記録（請求書）と attach の取り残しの記録を plugin の再起動をまたいで残す設計（置き場所・形式・排他・書く/消す時点・起動時の読み込み・再起動後に回収できる範囲・write-ahead を採らない判断。IPAM 等は #1870 の後続。#2604・#2681・NET-1・NET-6・REPAIR-3・REPAIR-4・REPAIR-5）
 │   │   ├── container-ref-reconcile.md  # コンテナ参照の照合とクラッシュ復旧 GC の起動点（create ゲートの共有 / 排他・契機 A / B・probe の写し方。`Present` かつ未確定の扱いはオーナー確認待ち。#2495・OCI-7・CLI-1・CORE-1）

@@ -624,6 +624,7 @@ fn cri5_sup7_4280_bin_serve_sweeps_unrecorded_container_logs() {
     sc.seed(&store, ContainerStatus::created(cid("present1"), None));
     drop(open_container_sink(&root, "present1"));
     drop(open_container_sink(&root, "closed1"));
+    drop(open_container_sink(&root, "closed2"));
     let _live = open_container_sink(&root, "live1");
 
     let id = format!("sw{}", std::process::id());
@@ -635,7 +636,7 @@ fn cri5_sup7_4280_bin_serve_sweeps_unrecorded_container_logs() {
     let mut text = String::new();
     while std::time::Instant::now() < deadline {
         text = std::fs::read_to_string(&log).unwrap_or_default();
-        if text.contains(r#""event":"container_log_sweep""#) {
+        if text.contains(r#""event":"op_stats_meta""#) {
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -645,7 +646,7 @@ fn cri5_sup7_4280_bin_serve_sweeps_unrecorded_container_logs() {
         .filter(|l| l.contains(r#""event":"container_log_sweep""#))
         .collect();
     assert_eq!(lines.len(), 1, "{text}");
-    assert!(lines[0].contains(r#""reclaimed_ids":1"#), "{}", lines[0]);
+    assert!(lines[0].contains(r#""reclaimed_ids":2"#), "{}", lines[0]);
     assert!(lines[0].contains(r#""skipped_live":1"#), "{}", lines[0]);
     assert!(lines[0].contains(r#""skipped_present":1"#), "{}", lines[0]);
     assert!(!lines[0].contains("closed1"), "{}", lines[0]);
@@ -654,6 +655,25 @@ fn cri5_sup7_4280_bin_serve_sweeps_unrecorded_container_logs() {
         "{}",
         lines[0]
     );
+
+    // 書き出された記録器の計数（#4319）。ID・パスは含まない。
+    let stats: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains(r#""op":"container_log_reclaim""#))
+        .collect();
+    assert_eq!(stats.len(), 1, "{text}");
+    assert!(
+        stats[0].contains(r#""success":2,"failure":0,"count":2"#),
+        "{}",
+        stats[0]
+    );
+    assert!(!stats[0].contains("closed"), "{}", stats[0]);
+    assert!(
+        !stats[0].contains(sc.root.to_str().unwrap()),
+        "{}",
+        stats[0]
+    );
+    assert!(text.contains(r#""event":"op_stats_meta""#), "{text}");
 
     let mut left: Vec<String> = std::fs::read_dir(container_log_dir(&root))
         .unwrap()

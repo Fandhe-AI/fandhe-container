@@ -390,6 +390,91 @@ impl PodNetns {
     }
 }
 
+/// pod の namespace を持ち続ける「保持役」プロセスの注入点（#2871・CRI-2・CORE-3・REPAIR-5。設計は
+/// `docs/design/pod-namespace-holder.md`、実装単位 H4）。
+///
+/// `RunPodSandbox` が [`PodNamespaceHolderProvider::spawn`] で保持役を起動し、`StopPodSandbox`・
+/// `RemovePodSandbox` が [`PodNamespaceHolderProvider::release`] で解放する。`PodSandboxStatus`・
+/// `ListPodSandbox`・`CreateContainer` は [`PodNamespaceHolderProvider::liveness`] で死活を照会し、
+/// 保持役が死んだ sandbox を `SANDBOX_NOTREADY`（`CreateContainer` は `FAILED_PRECONDITION`）にする。
+/// キーは sandbox ID（[`PodNetworkProvider::tear_down`] と同じ）。pid と子プロセスの対応は実装側が持つ。
+///
+/// 実装は `/proc`・pidfd・シグナルを扱うため cri には置かない（cri は 3 OS でビルドされる。CRI-7）。
+/// **未実装・簡易実装（REPAIR-3）**: 本番の実装（supervisor の `pod-holder` モードを exec する provider）は
+/// H6（#2877）、pid から namespace のパスを作って bundle へ渡す配線は H5（#2876）が担う。本 trait は
+/// 注入点と sandbox 記録への pid の保持（メモリ上のみ。記録ファイルへの永続化は R11〔#2940〕）だけを定める。
+/// エラー文言に config の値・パス・pid を含めないこと。
+pub trait PodNamespaceHolderProvider: Send + Sync {
+    /// 保持役を起動し、READY を受けて pid を返す。`req.ready_timeout()` 以内に戻ること（REPAIR-5）。
+    /// 失敗・期限超過のときは子を SIGKILL して回収してから `Err` を返し、資源を残さない。
+    fn spawn(&self, req: &PodHolderRequest<'_>) -> Result<PodHolder, CriError>;
+
+    /// 保持役を解放する（stdin を閉じる → `timeout` まで待つ → 超過なら SIGKILL → 回収）。冪等で、
+    /// 未知の ID・解放済みは `Ok`。`Err` は保持役が残りうることを意味し、呼び出し側は記録を残して再試行する。
+    fn release(&self, sandbox_id: &str, timeout: Duration) -> Result<(), CriError>;
+
+    /// 保持役が生きているかを返す。ブロックせず、回収もしない（pid を zombie のまま保って再利用を防ぐため。
+    /// 記録が残る間は実装が回収しない契約）。cri のロックを保ったまま呼ばれることはない。
+    /// `Err` は判定不能で、呼び出し側は fail-closed に not ready として扱う。
+    fn liveness(&self, sandbox_id: &str) -> Result<PodHolderLiveness, CriError>;
+}
+
+/// [`PodNamespaceHolderProvider::spawn`] への入力。将来の項目追加に備えて `#[non_exhaustive]`。
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct PodHolderRequest<'a> {
+    /// サンドボックス ID（`RunPodSandbox` が採番した値）。
+    pub sandbox_id: &'a str,
+    /// サンドボックスの設定。
+    pub config: &'a PodSandboxConfig,
+    ready_timeout: Duration,
+}
+
+impl<'a> PodHolderRequest<'a> {
+    /// 各項目から入力を作る。
+    pub fn new(sandbox_id: &'a str, config: &'a PodSandboxConfig, ready_timeout: Duration) -> Self {
+        Self {
+            sandbox_id,
+            config,
+            ready_timeout,
+        }
+    }
+
+    /// READY を待つ上限。`spawn` はこれ以内に戻る。
+    pub fn ready_timeout(&self) -> Duration {
+        self.ready_timeout
+    }
+}
+
+/// [`PodNamespaceHolderProvider::spawn`] の結果（保持役の pid）。将来の項目追加に備えて `#[non_exhaustive]`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PodHolder {
+    pid: std::num::NonZeroU32,
+}
+
+impl PodHolder {
+    /// 保持役の pid から作る（0 は表現できない）。
+    pub fn new(pid: std::num::NonZeroU32) -> Self {
+        Self { pid }
+    }
+
+    /// 保持役の pid（`/proc/<pid>/ns/*` の入力。パスへの変換は H5 が担う）。
+    pub fn pid(&self) -> std::num::NonZeroU32 {
+        self.pid
+    }
+}
+
+/// [`PodNamespaceHolderProvider::liveness`] の結果。真偽値にせず将来の状態を足せる形にする。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PodHolderLiveness {
+    /// 生きている。
+    Alive,
+    /// 終了している。
+    Exited,
+}
+
 /// [`BundleProvider::prepare`] の結果（bundle のパスと、実際に適用する値の報告。#2771・CRI-2・OCI-1・SEC-5）。
 ///
 /// 将来の報告項目の追加に備えて `#[non_exhaustive]` とし、[`PreparedBundle::new`] と `with_*` で作る。

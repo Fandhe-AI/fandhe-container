@@ -28,7 +28,7 @@
 | ---- | ---- |
 | sandbox 記録（config・状態・作成時刻・ネットワークのフラグ） | 決定し実装単位へ |
 | コンテナ記録（CRI 層の項目一式・`image_ref`・`image_id`） | 決定し実装単位へ |
-| 保持役の pid と素性 | 記録の形を決定。再採用の可否は要確認事項 1 |
+| 保持役の pid と素性 | 記録の形を決定。再採用の可否は要確認事項 1。#2871 は pid を sandbox 記録のメモリにだけ持ち、v1 の記録ファイルには書かない（永続化は R11 #2940）。再採用した記録の pid は常に無い |
 | ネットワーク資源（`network_owned`・`pod_netns`） | フラグの永続は決定。再起動後の `tear_down` は #1870 の後 |
 | plugin-cri の在庫の永続化 | #4176 で配線済み（`PersistentImageStore`）。RemoveImage と再起動後の一貫性は #4177 で実装済み、取り消しの窓が #4178。記録の `image_ref`・`image_id` は create 時のスナップショットとして独立に永続化するため依存しない |
 
@@ -64,7 +64,7 @@
 - 書けなかった場合: 副作用の前なら RPC を `Internal` で失敗させる（成功を装わない）。確定・更新の書き込み失敗はメモリの記録を保持して `Internal` を返し、次の起動では古い記録と core の状態で照合される（次節の表で安全側に倒れる）
 - 性能: RPC ごとに fsync が 1〜2 回増える。CORE-10 の起動 p95 への影響は #3224 で計測した（下記「計測」。暫定値）
 - R4 の実装（#2933。`crates/cri/src/runtime_service.rs` の `with_record_store`・`persist_sandbox`・`remove_sandbox`）: sandbox 記録だけを書く（コンテナは R5）。注入しなければ何も書かない
-  - 書く時点: ネットワークなしの Run は予約後に確定版を 1 回書く（現時点で副作用が無く、pending を書くと R6 が所有情報不足として保持し続けるため。保持役の起動を入れる #2871 がその前に pending の書き込みを足す）。pod network ありの Run は、予約後に `pending=1`・notready・`network_pending=1` を書き、`set_up` 成功後に `pending=0`・ready・`network_owned=1` へ置き換える。Stop は配下の停止とネットワークの回収が済んだ後に状態を書く（途中の失敗では書かない。ディスクの古い ready は安全側で、R6 は常に NotReady で再採用する）。Remove は資源の回収と除去条件の検査が済んだ後に、先にファイルを消してからメモリを除去する
+  - 書く時点: ネットワークなしの Run は予約後に確定版を 1 回書く（現時点で副作用が無く、pending を書くと R6 が所有情報不足として保持し続けるため。保持役を注入した構成では #2871 が起動の前に pending を書く）。pod network ありの Run は、予約後に `pending=1`・notready・`network_pending=1` を書き、`set_up` 成功後に `pending=0`・ready・`network_owned=1` へ置き換える。Stop は配下の停止とネットワークの回収が済んだ後に状態を書く（途中の失敗では書かない。ディスクの古い ready は安全側で、R6 は常に NotReady で再採用する）。Remove は資源の回収と除去条件の検査が済んだ後に、先にファイルを消してからメモリを除去する
   - ファイルを先に消す理由: この時点で資源は回収済みで、所有の証明を消しても回収不能な資源は残らない。メモリを先に消すと、削除に失敗した後の再試行が「未知 ID は成功」でファイルに触れず、孤児が再起動まで残る。削除に失敗したらメモリを残して `INTERNAL` を返す
   - 失敗の写し方: `put`・`remove`・符号化の失敗はコード（`DEADLINE_EXCEEDED`・`FAILED_PRECONDITION` を含む）によらず固定文言の `INTERNAL` にする。副作用の前の `put` の失敗は予約を戻し `set_up` を呼ばない。確定の `put` の失敗は notready のままメモリに残す（`network_owned` なので Stop・Remove が回収できる）
   - 並行操作: `SandboxRecord::record_write` を書く間だけ立て、同じ ID への Stop・Remove・CreateContainer を `FAILED_PRECONDITION` で拒否する。`put` / `remove`（fsync）は registry の `Mutex` の外で行い、書くたびにロック下でスナップショットを取り直す

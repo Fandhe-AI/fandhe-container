@@ -30,6 +30,10 @@
 //! の `RunPodSandbox` が作って結線し、`StopPodSandbox`・`RemovePodSandbox` が回収し、`CreateContainer` が bundle へ
 //! netns のパスを渡す（#2675・CRI-2・NET-1）。core の start は network namespace の join を未実装で拒否するため、
 //! 本番（plugin-cri）は注入していない（`docs/design/cri-config-acceptance.md` の順 13）。
+//! pod の namespace の保持役は [`CriRuntimeService::with_pod_holder`] で `PodNamespaceHolderProvider` を注入したときだけ、
+//! `RunPodSandbox` が write-ahead の後に起動し（失敗・期限超過で資源が無ければ登録しない）、Stop・Remove が冪等に解放する。
+//! 死んだ保持役の sandbox は Status・List で `SANDBOX_NOTREADY`、`CreateContainer` は `FAILED_PRECONDITION`（#2871・CRI-2・REPAIR-5）。
+//! 本番の provider（H6〔#2877〕）と bundle への配線（H5〔#2876〕）は未実装（REPAIR-3）。pid はメモリ上のみで記録ファイルへ書かない（R11〔#2940〕）。
 //! bundle の生成（config 変換・bundle ディレクトリの寿命・image 展開の `ImageRootfsSource`）は `crate::bundle`（#2395・#2433）で、
 //! plugin-cri への結線は #2433 で済み、core の本番 launcher との結線は TASK-114、一連の結合試験は TASK-59.4 で扱う。Start 後に中断・確定失敗した場合は、
 //! 実行層が running の可能性があるため記録を unknown にして再 Start を拒否する（fail-closed）。
@@ -121,6 +125,7 @@
 
 mod config_limits;
 mod container;
+mod pod_holder;
 mod readopt;
 mod record;
 mod record_store;
@@ -143,8 +148,9 @@ use crate::error::{CriError, CriErrorCode};
 use fandhe_container_core::traits::{ContainerLogPath, StdinMode};
 
 use crate::adapter::{
-    BundleProvider, BundleRequest, PodNetns, PodNetworkProvider, PodNetworkRequest, PreparedBundle,
-    ReleaseBudget, RuntimeAdapter, RuntimeContainerStatus, RuntimeLifecycle,
+    BundleProvider, BundleRequest, PodHolder, PodNamespaceHolderProvider, PodNetns,
+    PodNetworkProvider, PodNetworkRequest, PreparedBundle, ReleaseBudget, RuntimeAdapter,
+    RuntimeContainerStatus, RuntimeLifecycle,
 };
 use crate::image_service::CancelOnDrop;
 use crate::instrument::{CriOpKind, CriOpRecorder, CriOpTimer, NoopCriOpRecorder};
@@ -300,6 +306,16 @@ struct SandboxRecord {
     network_teardown: bool,
     /// set_up が返した、結線済みの pod network namespace。配下のコンテナの bundle へ渡す。
     pod_netns: Option<PodNetns>,
+    /// 保持役（`PodNamespaceHolderProvider::spawn` の結果。#2871・CRI-2）。メモリ上のみで、記録ファイルには
+    /// 書かない（永続化と素性は R11〔#2940〕）。再採用した記録は常に `None`（保持役は再起動をまたがない）。
+    pod_holder: Option<PodHolder>,
+    /// 保持役を `spawn` している最中。真の間は配下の作成と Stop・Remove を拒否する（`network_pending` と同じ）。
+    holder_pending: bool,
+    /// 保持役が残りうる（spawn の成功、または結果不明）。Stop・Remove が `release` で解放し、成功したら偽に戻す。
+    /// 失敗したら真のまま保持して再試行できるようにする（fail-closed）。
+    holder_owned: bool,
+    /// `release` の worker が走っている間は真（重複起動を拒否する。`HolderReleaseGuard` が解除する）。
+    holder_release: bool,
     /// 記録ストアへの書き込み・削除の最中（#2933・CRI-1・CRI-2）。真の間は同じ ID への Stop・Remove・
     /// CreateContainer を `FAILED_PRECONDITION` で拒否する（fsync を registry の `Mutex` の外で行うため、
     /// 並行操作が古いスナップショットを後から書いたり、所有者の無い記録ファイルを残したりするのを防ぐ）。
@@ -349,6 +365,8 @@ pub struct CriRuntimeService {
     list_exit_observe_busy: Arc<AtomicBool>,
     /// pod の netns を作って結線する注入点（#2675・CRI-2・NET-1）。`None` のときは従来どおり何も呼ばない。
     pod_network: Option<Arc<dyn PodNetworkProvider>>,
+    /// pod の namespace の保持役を起動・解放・死活確認する注入点（#2871・CRI-2・CORE-3）。`None` のときは従来どおり何も呼ばない。
+    pod_holder: Option<Arc<dyn PodNamespaceHolderProvider>>,
     /// `UpdateRuntimeConfig` で最後に受け入れた pod CIDR（#2896）。レジストリとは別のロックで、保持は一瞬。
     /// 読む利用者はまだ無い（REPAIR-3。結線は後続）。
     pod_cidrs: Mutex<Option<PodCidrs>>,
@@ -1440,6 +1458,12 @@ fn plan_sandbox_removal(
         .retained_bytes
         .checked_sub(record.retained_bytes)
         .ok_or_else(|| CriError::internal("sandbox registry is inconsistent"))?;
+    // 保持役が残りうる（起動中・解放中・未解放）間は除去しない（プロセスの追跡情報を失わない。#2871）。
+    if record.holder_pending || record.holder_release || record.holder_owned {
+        return Err(CriError::failed_precondition(
+            "sandbox namespace holder is pending release",
+        ));
+    }
     // 配下に実行層を呼び出し中のコンテナがあれば除去しない（実行層に資源が残るため。TASK-59.2）。
     if registry
         .containers
@@ -1841,6 +1865,7 @@ impl CriRuntimeService {
             exit_observe_timeout: CONTAINER_EXIT_OBSERVE_TIMEOUT,
             list_exit_observe_busy: Arc::new(AtomicBool::new(false)),
             pod_network: None,
+            pod_holder: None,
             pod_cidrs: Mutex::new(None),
             record_store: None,
             streaming: None,
@@ -1863,6 +1888,18 @@ impl CriRuntimeService {
     /// （`docs/design/cri-config-acceptance.md` の順 13）。core の対応まで本番では差さない。
     pub fn with_pod_network(mut self, provider: Arc<dyn PodNetworkProvider>) -> Self {
         self.pod_network = Some(provider);
+        self
+    }
+
+    /// pod の namespace の保持役の注入点を差す（#2871・CRI-2・CORE-3・REPAIR-5。設計は `docs/design/pod-namespace-holder.md`）。
+    ///
+    /// 呼ばなければ従来どおり保持役に触れない。差すと、`namespace_options` によらずすべての `RunPodSandbox` が
+    /// 保持役を起動し（どの namespace が保持役を使うかは H5〔#2876〕・H8〔#2878〕が決める）、Stop・Remove が解放する。
+    /// 起動の失敗・期限超過では sandbox を登録しない。保持役が死んだ sandbox は Status・List で `SANDBOX_NOTREADY`、
+    /// `CreateContainer` は `FAILED_PRECONDITION` になる。`Status` RPC（Runtime/NetworkReady）には影響させない。
+    /// **注意（REPAIR-3）**: 本番の provider は H6〔#2877〕、bundle への配線は H5。それまで本番では差さない。
+    pub fn with_pod_holder(mut self, provider: Arc<dyn PodNamespaceHolderProvider>) -> Self {
+        self.pod_holder = Some(provider);
         self
     }
 
@@ -2092,7 +2129,7 @@ impl CriRuntimeService {
                 config: config.into_config(),
                 // netns の用意が済むまでは Ready にしない（List・Status に未完了の sandbox を見せない。CRI-2）。
                 // `run_sandbox_networked` の worker が set_up 成功を確定するロック内で Ready へ遷移させる。
-                state: if network_pending {
+                state: if network_pending || self.pod_holder.is_some() {
                     SandboxState::NotReady
                 } else {
                     SandboxState::Ready
@@ -2104,6 +2141,10 @@ impl CriRuntimeService {
                 network_owned: false,
                 network_teardown: false,
                 pod_netns: None,
+                pod_holder: None,
+                holder_pending: false,
+                holder_owned: false,
+                holder_release: false,
                 // ストアを注入しているときは、確定の書き込みが済むまで並行操作を拒否する。
                 record_write: u32::from(self.record_store.is_some()),
             },
@@ -2133,6 +2174,22 @@ impl CriRuntimeService {
         // `persist_sandbox_rollbackable` が持つ。手放した put は worker が遅れて書けた記録を消し、予約を戻す。
         self.persist_sandbox_rollbackable(&id, true, &mut write_guard)
             .await?;
+        // 保持役を先に起動する（順序は「保持役 → 結線」。#2871・CRI-2）。失敗で資源が無いと確かめられたら
+        // 予約を戻す。残りうる・起動中なら NotReady で残し（`set_up` は走らないので `network_pending` は外す）、
+        // Stop・Remove が解放する。
+        if let Some(holder) = self.pod_holder.clone()
+            && let Err(failure) = self.spawn_pod_holder(&holder, &id, false).await
+        {
+            if failure.clear {
+                self.release_unwritten_sandbox(&id, &mut write_guard).await;
+            } else if let Ok(mut registry) = self.registry.lock()
+                && let Some(record) = registry.records.get_mut(&id)
+            {
+                record.network_pending = false;
+                record.state = SandboxState::NotReady;
+            }
+            return Err(failure.err);
+        }
         // 以降は await を挟まず `NetworkSetUpGuard` が引き継ぐ。
         let config = {
             let registry = self
@@ -2201,7 +2258,15 @@ impl CriRuntimeService {
                 // worker を起動できなかった（`ran` が偽の `UNAVAILABLE`）なら資源は作られていない。
                 // 予約を巻き戻して記録を除去する（pending を残して Stop・Remove を塞がない）。
                 if err.code() == CriErrorCode::Unavailable && !ran.load(Ordering::SeqCst) {
-                    self.release_unwritten_sandbox(&id, &mut write_guard).await;
+                    // 逆順に戻す（結線は無いので保持役だけ）。解放できなければ記録を残して Stop・Remove に任せる。
+                    if self.rollback_pod_holder(&id).await {
+                        self.release_unwritten_sandbox(&id, &mut write_guard).await;
+                    } else if let Ok(mut registry) = self.registry.lock()
+                        && let Some(record) = registry.records.get_mut(&id)
+                    {
+                        record.network_pending = false;
+                        record.state = SandboxState::NotReady;
+                    }
                     return Err(err);
                 }
                 // 期限超過・待ち受け側の失敗は worker がまだ走っている可能性があり、tear_down を同時に呼ばない。
@@ -2223,9 +2288,12 @@ impl CriRuntimeService {
                     }
                 };
                 if reclaimed {
-                    // 資源は無い。記録ファイルを消せた worker が件数枠ごとメモリの記録を除去する
-                    // （失敗しても元のエラーを返す。消せなければ notready の記録のまま残り Remove で回収できる）。
-                    self.release_unwritten_sandbox(&id, &mut write_guard).await;
+                    // 結線の資源は無い。保持役も解放できたら、記録ファイルを消せた worker が件数枠ごとメモリの記録を
+                    // 除去する（失敗しても元のエラーを返す。消せなければ notready の記録のまま残り Remove で回収できる）。
+                    // 保持役を解放できなければ記録を残し、Remove の再試行に任せる（逆順: tear_down → release）。
+                    if self.rollback_pod_holder(&id).await {
+                        self.release_unwritten_sandbox(&id, &mut write_guard).await;
+                    }
                 } else if let Ok(mut registry) = self.registry.lock()
                     && let Some(record) = registry.records.get_mut(&id)
                 {
@@ -2405,6 +2473,7 @@ impl CriRuntimeService {
     ) -> Result<v1::StopPodSandboxResponse, CriError> {
         self.ensure_record_not_writing(&req.pod_sandbox_id)?;
         self.ensure_owned_network_reclaimable(&req.pod_sandbox_id)?;
+        self.ensure_holder_operable(&req.pod_sandbox_id)?;
         if self.pod_network.is_some() && !req.pod_sandbox_id.is_empty() {
             self.ensure_network_not_pending(&req.pod_sandbox_id)?;
         }
@@ -2414,6 +2483,8 @@ impl CriRuntimeService {
             None => self.stop_sandbox(req),
         }?;
         self.release_pod_network(&id, deadline).await?;
+        // 保持役は結線の後に解放する（Run の逆順。#2871）。
+        self.release_pod_holder(&id, deadline).await?;
         // 停止とネットワークの回収が済んだ時点の状態を書く（途中の失敗では書かない: ディスクの古い ready は
         // 安全側で、R6 は常に NotReady として再採用する）。失敗してもメモリは Stop 後のまま INTERNAL を返す。
         // 記録が無い（並行する Remove が完了した・未知 ID）ときは書く対象が無く、成功のまま返す。
@@ -2442,15 +2513,18 @@ impl CriRuntimeService {
         let deadline = Some(&deadline);
         self.ensure_record_not_writing(&req.pod_sandbox_id)?;
         self.ensure_owned_network_reclaimable(&req.pod_sandbox_id)?;
-        if self.pod_network.is_some() && !req.pod_sandbox_id.is_empty() {
-            self.ensure_network_not_pending(&req.pod_sandbox_id)?;
+        self.ensure_holder_operable(&req.pod_sandbox_id)?;
+        if !req.pod_sandbox_id.is_empty() {
+            if self.pod_network.is_some() {
+                self.ensure_network_not_pending(&req.pod_sandbox_id)?;
+            }
             let owned = self
                 .registry
                 .lock()
                 .map_err(|_| CriError::internal("sandbox registry is unavailable"))?
                 .records
                 .get(&req.pod_sandbox_id)
-                .is_some_and(|r| r.network_owned);
+                .is_some_and(|r| r.network_owned || r.holder_owned);
             if owned {
                 self.stop_sandbox_within(
                     v1::StopPodSandboxRequest {
@@ -2803,8 +2877,10 @@ impl CriRuntimeService {
 
     /// ネットワークなしの `RunPodSandbox`。予約 → 確定版を 1 回書く。
     ///
-    /// 現時点では副作用が無いため pending を書かない（pending を書くと R6 が所有情報不足として保持し続ける）。
-    /// 保持役の起動を入れる #2871 は、その前に pending の書き込みを足すこと（REPAIR-3）。
+    /// 保持役を注入していなければ副作用が無いため pending を書かない（pending を書くと R6 が所有情報不足として
+    /// 保持し続ける）。注入していれば、副作用（保持役の起動）の前に pending つきで書き（write-ahead）、
+    /// 起動に成功したら確定版を書く。起動の失敗・期限超過で保持役が残っていないと確かめられたら sandbox を
+    /// 登録しない（#2871・CRI-2・REPAIR-3・REPAIR-5）。
     async fn run_sandbox_plain(
         &self,
         req: v1::RunPodSandboxRequest,
@@ -2812,10 +2888,22 @@ impl CriRuntimeService {
         let (resp, _) = self.reserve_sandbox(req, false)?;
         let id = resp.pod_sandbox_id.clone();
         let mut write_guard = self.write_guard(&id);
+        let holder = self.pod_holder.clone();
         // 予約の巻き戻しは `persist_sandbox_rollbackable` が持つ（put の worker が終わるまで予約を保つ）。
-        self.persist_sandbox_rollbackable(&id, false, &mut write_guard)
+        self.persist_sandbox_rollbackable(&id, holder.is_some(), &mut write_guard)
             .await?;
-        Ok(resp)
+        let Some(holder) = holder else {
+            return Ok(resp);
+        };
+        match self.spawn_pod_holder(&holder, &id, true).await {
+            Ok(()) => self.confirm_run(&id, &mut write_guard, resp).await,
+            Err(failure) => {
+                if failure.clear {
+                    self.release_unwritten_sandbox(&id, &mut write_guard).await;
+                }
+                Err(failure.err)
+            }
+        }
     }
 
     /// set_up の最中なら `FAILED_PRECONDITION`（未知 ID は何もしない）。
@@ -2968,6 +3056,8 @@ impl CriRuntimeService {
         let mut retained_bytes = config.retained_bytes();
         let created_at_nanos = now_nanos()?;
 
+        // 保持役が死んでいれば Ready を NotReady に倒してから判定する（ロックの外で照会する。#2871）。
+        self.reconcile_holders(Some(pod_sandbox_id.as_str()));
         let mut registry = self
             .registry
             .lock()
@@ -2982,6 +3072,11 @@ impl CriRuntimeService {
         if sandbox.network_pending {
             return Err(CriError::failed_precondition(
                 "sandbox network setup is in progress",
+            ));
+        }
+        if sandbox.holder_pending {
+            return Err(CriError::failed_precondition(
+                "sandbox holder startup is in progress",
             ));
         }
         if sandbox.record_write > 0 {
@@ -4204,6 +4299,7 @@ impl CriRuntimeService {
         if req.pod_sandbox_id.is_empty() {
             return Err(CriError::invalid_argument("pod_sandbox_id is required"));
         }
+        self.reconcile_holders(Some(req.pod_sandbox_id.as_str()));
         let status = {
             let registry = self
                 .registry
@@ -4233,6 +4329,7 @@ impl CriRuntimeService {
         req: v1::ListPodSandboxRequest,
     ) -> Result<v1::ListPodSandboxResponse, CriError> {
         let filter = ValidatedFilter::new(req.filter)?;
+        self.reconcile_holders(None);
         let mut items = {
             let registry = self
                 .registry

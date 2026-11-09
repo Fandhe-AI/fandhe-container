@@ -419,6 +419,11 @@ impl CriRuntimeService {
                 network_owned: data.network_owned || unresolved,
                 network_teardown: false,
                 pod_netns: None,
+                // 保持役は plugin-cri と同じ寿命で、再起動をまたがない（#2871。素性の永続化は R11〔#2940〕）。
+                pod_holder: None,
+                holder_pending: false,
+                holder_owned: false,
+                holder_release: false,
                 record_write: 0,
             };
             if accepted.iter().any(|(_, r)| same_metadata(r, &record)) {

@@ -97,6 +97,9 @@ struct FakeRuntime {
     start_log_paths: Mutex<Vec<Option<String>>>,
     /// ID ごとに state が報告するインスタンス識別子（無ければ報告しない。#4286 の検証用）。
     instances: Mutex<std::collections::HashMap<String, u64>>,
+    /// 設定されていれば、create が報告するインスタンス識別子（同じ値を `instances` へも登録し、以後の state も
+    /// 同じ値を返す。#4322 の検証用）。
+    create_instance: Mutex<Option<u64>>,
     /// start が受けた `StartRequest::stdin()`（CRI-6・#4076 の検証用）。
     start_stdin_modes: Mutex<Vec<fandhe_container_core::traits::StdinMode>>,
 }
@@ -128,7 +131,18 @@ impl ContainerRuntime for Shared {
         if self.0.create_returns_running.load(Ordering::SeqCst) {
             return Ok(ContainerStatus::running(r.id().clone(), None));
         }
-        Ok(ContainerStatus::created(r.id().clone(), None))
+        let status = ContainerStatus::created(r.id().clone(), None);
+        if let Some(i) = *self.0.create_instance.lock().unwrap() {
+            self.0
+                .instances
+                .lock()
+                .unwrap()
+                .insert(r.id().as_str().to_owned(), i);
+            return Ok(status.with_instance(
+                fandhe_container_core::traits::ContainerInstance::from_raw(i),
+            ));
+        }
+        Ok(status)
     }
     fn start(&self, r: &StartRequest) -> Result<ContainerStatus, TraitError> {
         self.0
@@ -3240,30 +3254,76 @@ async fn fetch_and_instance(x: &ExecHarness, url: &str) -> Option<u64> {
 }
 
 /// CRI-5・SEC-1・CORE-1（#4286）: 実行層が報告したインスタンスが、発行時に保存した要求へ入る。
+/// create 時の値（#4322）と発行時の値が同じなので発行される。
 #[cfg(unix)]
 #[tokio::test]
 async fn cri5_4286_exec_url_records_runtime_instance() {
     let x = exec_harness(None).await;
+    *x.h.runtime.create_instance.lock().unwrap() = Some(7);
     let sb = run_sandbox(&x.h.service).await;
     let id = running_container(&x.h, &sb, "c").await;
-    x.h.runtime.instances.lock().unwrap().insert(id.clone(), 7);
     let url = issue_exec(&x.h, &id).await.expect("exec");
     assert_eq!(fetch_and_instance(&x, &url).await, Some(7));
 }
 
-/// CRI-5・SEC-1（#4286）: 保存される値は発行時のもので、発行後の作り直し（識別子の変化）で書き換わらない。
+/// CRI-5・SEC-1（#4286・#4322）: 保存される値は発行時のもので、発行後の作り直し（識別子の変化）で書き換わらない。
+/// 作り直し後の新しい Exec は create 時の値と合わず、URL を発行しない。
 #[cfg(unix)]
 #[tokio::test]
 async fn cri5_4286_exec_url_keeps_issue_time_instance_after_recreate() {
     let x = exec_harness(None).await;
+    *x.h.runtime.create_instance.lock().unwrap() = Some(7);
+    let sb = run_sandbox(&x.h.service).await;
+    let id = running_container(&x.h, &sb, "c").await;
+    let old_url = issue_exec(&x.h, &id).await.expect("exec");
+    x.h.runtime.instances.lock().unwrap().insert(id.clone(), 8);
+    let e = issue_exec(&x.h, &id).await.expect_err("recreated");
+    assert_eq!(e.code(), Code::FailedPrecondition);
+    assert_eq!(
+        e.message(),
+        "container was recreated after it was created through CRI"
+    );
+    assert_eq!(fetch_and_instance(&x, &old_url).await, Some(7));
+    assert_eq!(x.handler.0.lock().unwrap().len(), 1);
+}
+
+/// CRI-2・CRI-6・SEC-1（#4322）: CRI の外で作り直された（create 時と違う値の）コンテナへの Exec は、
+/// URL を発行する前に `FAILED_PRECONDITION` で拒否する。
+#[cfg(unix)]
+#[tokio::test]
+async fn cri6_sec1_4322_exec_rejects_container_recreated_before_exec() {
+    let x = exec_harness(None).await;
+    *x.h.runtime.create_instance.lock().unwrap() = Some(7);
+    let sb = run_sandbox(&x.h.service).await;
+    let id = running_container(&x.h, &sb, "c").await;
+    x.h.runtime.instances.lock().unwrap().insert(id.clone(), 8);
+    let e = issue_exec(&x.h, &id).await.expect_err("recreated");
+    assert_eq!(e.code(), Code::FailedPrecondition);
+    assert_eq!(
+        e.message(),
+        "container was recreated after it was created through CRI"
+    );
+    assert!(x.handler.0.lock().unwrap().is_empty());
+}
+
+/// CRI-2・CRI-6・SEC-1（#4322）: create 時の値が無い記録（旧版の記録・write-ahead 段階で落ちた記録と同じ形）に
+/// 対し、現在値が報告されるなら fail-closed で拒否する。
+#[cfg(unix)]
+#[tokio::test]
+async fn cri6_sec1_4322_exec_rejects_when_record_has_no_instance() {
+    let x = exec_harness(None).await;
     let sb = run_sandbox(&x.h.service).await;
     let id = running_container(&x.h, &sb, "c").await;
     x.h.runtime.instances.lock().unwrap().insert(id.clone(), 7);
-    let old_url = issue_exec(&x.h, &id).await.expect("exec");
-    x.h.runtime.instances.lock().unwrap().insert(id.clone(), 8);
-    let new_url = issue_exec(&x.h, &id).await.expect("exec");
-    assert_eq!(fetch_and_instance(&x, &old_url).await, Some(7));
-    assert_eq!(fetch_and_instance(&x, &new_url).await, Some(8));
+    let e = issue_exec(&x.h, &id)
+        .await
+        .expect_err("no recorded instance");
+    assert_eq!(e.code(), Code::FailedPrecondition);
+    assert_eq!(
+        e.message(),
+        "container was recreated after it was created through CRI"
+    );
+    assert!(x.handler.0.lock().unwrap().is_empty());
 }
 
 /// CRI-5（#4286）: 実行層が識別子を報告しなければ `None`（保護されない残余。doc に記載）。

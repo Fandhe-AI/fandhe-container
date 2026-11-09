@@ -102,6 +102,13 @@
 //!   `ns/user`・`ns/ipc` が A と同一で、`ns/pid`・`ns/mnt`・`ns/uts` は異なることを照合する。否定として、試験プロセス自身の
 //!   namespace を指す path は fork の前に `PermissionDenied` で拒否され、状態は Created のまま子が残らない。成功行の前に
 //!   `production_launcher: pod ipc namespace joined (scenario=W ...)` を出す
+//! - シナリオ W-net（pod の user・ipc・network namespace への join。#2872・CORE-3・SEC-5・NET-3・SEC-4）: `Loopback` の launcher で
+//!   起動したコンテナ A（netns は A の user namespace の所有）に対し、`FromConfig` の launcher で B の `linux.namespaces` の
+//!   `user`・`ipc`・`network` に `/proc/<A の pid>/ns/{user,ipc,net}` を入れて start する。B の `ns/user`・`ns/ipc`・`ns/net` が
+//!   A と同一で、`ns/pid`・`ns/mnt`・`ns/uts` は異なり、監査に `pod_join_accepted_user_ipc_net` が 1 件残る。否定として、
+//!   ホストの netns（HostShared のコンテナの `ns/net`）を組にした B は fork の前に `Unimplemented`（`pod_join_net_not_pod_owned`）、
+//!   別の `Loopback` コンテナの netns を組にした B は `PermissionDenied`（`pod_join_net_owner_mismatch`）で、状態は Created
+//!   のまま子が残らない。成功行 `production_launcher: pod network namespace joined (scenario=W-net ...)`
 //! - root で実行された場合: 主経路は非 root（SEC-5）。launch が拒否され、状態が Created に戻り、子が残らないことだけを
 //!   照合する（コンテナ内 root をホスト root へ写す起動は試さない）
 //!
@@ -1317,6 +1324,7 @@ mod linux {
         scenario_v_sysctls(&env, tag);
         scenario_stdin_pipe(&env, tag);
         scenario_w_pod_ipc_join(&env, tag);
+        scenario_w_net_pod_network_join(&env, tag);
         scenario_l_working_dir(&env, tag);
         scenario_m_n_working_dir_refused(&env, tag);
         scenario_o_user_outside_mapping_refused(&env, tag);
@@ -3806,6 +3814,183 @@ mod linux {
         finish_started(a, verified);
         assert!(
             children_of_self().is_empty(),
+            "no child may remain after terminate"
+        );
+    }
+
+    /// W-net: 記録した監査レコードのうち、結果トークンを含むものの件数。
+    fn count_records(sink: &MemSink, token: &str) -> usize {
+        sink.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|r| r.contains(token))
+            .count()
+    }
+
+    /// W-net: pod の保持役の代わりのコンテナを `launcher` で起動する（`FromConfig` ならホストの netns、`Loopback` なら
+    /// 自 user namespace 所有の新しい netns を持つ）。
+    fn start_net_holder(
+        env: &Env,
+        launcher: &Arc<dyn ProcessLauncher>,
+        label: &str,
+        id: &ContainerId,
+    ) -> fandhe_container_core::oci_runtime::StartedContainer {
+        let bundle = Bundle::new(label);
+        let ld = make_rootfs(&bundle.rootfs(), true);
+        write_config(&bundle, &ld, &[], json!([]));
+        do_create(env, &bundle, id);
+        wait_single_thread();
+        let started = start(
+            &env.store,
+            &env.recorder,
+            launcher,
+            &StartRequest::new(id.clone()),
+            &timeouts(),
+        )
+        .unwrap_or_else(|e| panic!("start {label} failed: {:?} {}", e.code(), e.message()));
+        wait_probe_ready(&started);
+        started
+    }
+
+    /// W-net: B（`FromConfig`）の `linux.namespaces` に user・ipc・net の path を入れて start を試みる。
+    fn try_start_pod_member(
+        env: &Env,
+        launcher: &Arc<dyn ProcessLauncher>,
+        label: &str,
+        id: &ContainerId,
+        user_ipc_pid: impl std::fmt::Display,
+        net_pid: impl std::fmt::Display,
+    ) -> Result<
+        fandhe_container_core::oci_runtime::StartedContainer,
+        fandhe_container_core::oci_runtime::OciRuntimeError,
+    > {
+        let bundle = Bundle::new(label);
+        let ld = make_rootfs(&bundle.rootfs(), true);
+        write_config(&bundle, &ld, &[], json!([]));
+        patch_namespaces(
+            &bundle,
+            json!([
+                {"type": "pid"}, {"type": "mount"}, {"type": "uts"},
+                {"type": "ipc", "path": format!("/proc/{user_ipc_pid}/ns/ipc")},
+                {"type": "user", "path": format!("/proc/{user_ipc_pid}/ns/user")},
+                {"type": "network", "path": format!("/proc/{net_pid}/ns/net")}
+            ]),
+        );
+        do_create(env, &bundle, id);
+        wait_single_thread();
+        start(
+            &env.store,
+            &env.recorder,
+            launcher,
+            &StartRequest::new(id.clone()),
+            &timeouts(),
+        )
+    }
+
+    /// シナリオ W-net: pod の user・ipc・network namespace への join（#2872・CORE-3・SEC-5・NET-3・SEC-4。モジュール doc）。
+    fn scenario_w_net_pod_network_join(env: &Env, tag: u32) {
+        let mut tmpfs = TmpfsMountSet::new();
+        tmpfs.ensure_default_dev_shm().expect("default dev shm");
+        let options = LaunchOptions::new(tmpfs, InjectedFileSet::new(), LaunchIpcMode::Private)
+            .expect("launch options")
+            .with_network(LaunchNetworkMode::Loopback);
+        let loopback: Arc<dyn ProcessLauncher> = Arc::new(
+            ProductionLauncher::builder()
+                .privilege(IsolationPrivilege::RootlessSingleId)
+                .audit_sink(Arc::new(MemSink(std::sync::Mutex::new(Vec::new()))))
+                .launch_options(options)
+                .build()
+                .expect("build launcher for the pod holder"),
+        );
+        let sink = Arc::new(MemSink(std::sync::Mutex::new(Vec::new())));
+        let sink_dyn: Arc<dyn AuditSink> = sink.clone();
+        let member: Arc<dyn ProcessLauncher> = Arc::new(
+            ProductionLauncher::builder()
+                .privilege(IsolationPrivilege::RootlessSingleId)
+                .audit_sink(sink_dyn)
+                .build()
+                .expect("build launcher for the pod member"),
+        );
+
+        let a_id = ContainerId::new(format!("plwna{tag}")).expect("id");
+        let a = start_net_holder(env, &loopback, "wn-a", &a_id);
+        let a_pid = a.process().pid();
+        let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // 正常: A の user・ipc・net に B が join する。
+            let b_id = ContainerId::new(format!("plwnb{tag}")).expect("id");
+            let b = try_start_pod_member(env, &member, "wn-b", &b_id, a_pid, a_pid)
+                .unwrap_or_else(|e| panic!("start B failed: {:?} {}", e.code(), e.message()));
+            let b_pid = b.process().pid();
+            let b_verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                wait_probe_ready(&b);
+                for shared in ["user", "ipc", "net"] {
+                    assert_eq!(
+                        ns_link(b_pid, shared),
+                        ns_link(a_pid, shared),
+                        "B must share A's {shared} namespace"
+                    );
+                }
+                for own in ["pid", "mnt", "uts"] {
+                    assert_ne!(
+                        ns_link(b_pid, own),
+                        ns_link(a_pid, own),
+                        "B must have its own {own} namespace"
+                    );
+                }
+                assert_ne!(
+                    ns_link(b_pid, "net"),
+                    std::fs::read_link("/proc/self/ns/net")
+                        .expect("host netns")
+                        .display()
+                        .to_string(),
+                    "the pod netns must not be the host's"
+                );
+                let nspid =
+                    status_field(&format!("/proc/{b_pid}/status"), "NSpid:").expect("host NSpid");
+                assert_eq!(nspid.split_whitespace().last(), Some("1"));
+                assert_eq!(count_records(&sink, "pod_join_accepted_user_ipc_net"), 1);
+            }));
+            finish_started(b, b_verified);
+
+            // 否定 1: ホスト側の netns(HostShared のコンテナの ns/net)を組にすると fork の前に Unimplemented。
+            let h_id = ContainerId::new(format!("plwnh{tag}")).expect("id");
+            let h = start_net_holder(env, &env.launcher, "wn-h", &h_id);
+            let h_pid = h.process().pid();
+            let h_verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let id = ContainerId::new(format!("plwnr1{tag}")).expect("id");
+                let Err(err) = try_start_pod_member(env, &member, "wn-r1", &id, a_pid, h_pid)
+                else {
+                    panic!("a host-owned netns must be refused");
+                };
+                assert_eq!(err.code(), ErrorCode::Unimplemented);
+                assert_eq!(state_of(&env.store, &id), ContainerState::Created);
+                assert_eq!(count_records(&sink, "pod_join_net_not_pod_owned"), 1);
+            }));
+            finish_started(h, h_verified);
+
+            // 否定 2: 別の Loopback コンテナ(別 user namespace)の netns を組にすると PermissionDenied(取り違え)。
+            let c_id = ContainerId::new(format!("plwnc{tag}")).expect("id");
+            let c = start_net_holder(env, &loopback, "wn-c", &c_id);
+            let c_pid = c.process().pid();
+            let c_verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let id = ContainerId::new(format!("plwnr2{tag}")).expect("id");
+                let Err(err) = try_start_pod_member(env, &member, "wn-r2", &id, a_pid, c_pid)
+                else {
+                    panic!("another pod's netns must be refused");
+                };
+                assert_eq!(err.code(), ErrorCode::PermissionDenied);
+                assert_eq!(state_of(&env.store, &id), ContainerState::Created);
+                assert_eq!(count_records(&sink, "pod_join_net_owner_mismatch"), 1);
+            }));
+            finish_started(c, c_verified);
+            println!(
+                "production_launcher: pod network namespace joined (scenario=W-net user, ipc and net shared, pid/mnt/uts separate, host and foreign netns refused)"
+            );
+        }));
+        finish_started(a, verified);
+        assert!(
+            eventually(|| children_of_self().is_empty()),
             "no child may remain after terminate"
         );
     }

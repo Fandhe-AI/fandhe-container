@@ -6,7 +6,8 @@
 //! namespace を変えるので、親は自身を `--child <case>` で再入させて期限つきで待つ(REPAIR-5)。
 //!
 //! # 子の照合(ケース `single`、`FANDHE_CONTAINER_TEST_ID_HELPER=1` のときは `subordinate` も)
-//! - 呼び出し前に `PR_SET_DUMPABLE=0` にし、呼び出し後も non-dumpable であること
+//! - (`subordinate` のみ)呼び出し前に `PR_SET_DUMPABLE=0` にし、呼び出し後も non-dumpable であること
+//!   (`single` は自プロセスの `/proc/self` へ写像を書くため事前に non-dumpable にしない。#2875)
 //! - 返った写像・実際の `/proc/self/{uid,gid}_map`・計画(`single` は `0 <euid> 1`)の 3 者が完全一致すること
 //! - user / ipc / net の素性が呼び出し前と異なり、報告の `(dev, ino)` が `/proc/self/ns/*` と一致すること
 //! - `lo` が up であること(自己宛ての UDP 送受信が通る。down なら `ENETUNREACH`)
@@ -17,7 +18,7 @@
 //! 非特権 user namespace を許可するホストが必要(AppArmor の `kernel.apparmor_restrict_unprivileged_userns=1`
 //! では失敗する)。`-- --ignored` 指定時のみ実行する(docs/verification/real-machine-tests.md)。範囲写像は
 //! `uidmap`・subuid / subgid の自ユーザー行・Linux 6.9 以降が要り、前提が無ければ `PRECONDITION FAILED` で失敗する
-//! (skip で成功にしない)。CI への組み込みは #2875。
+//! (skip で成功にしない)。CI の `platform-ci` の ubuntu で実行する（#2875）。
 
 #[cfg(target_os = "linux")]
 #[path = "support/precondition.rs"]
@@ -231,7 +232,14 @@ mod linux {
         }
 
         let before = [ns_identity("user"), ns_identity("ipc"), ns_identity("net")];
-        set_non_dumpable_for_test().expect("set non-dumpable");
+        // single は自プロセスの /proc/self/{setgroups,uid_map,gid_map} へ書く。non-dumpable のプロセスの /proc/self は
+        // root（init user namespace の kuid 0）所有になり、unshare 後の namespace では写像が無く書き込みが拒否される
+        // ため、single では事前に non-dumpable にしない（実機の CI で PermissionDenied になった。#2875）。範囲写像は
+        // 別 holder が書くので、non-dumpable の維持の照合は subordinate だけで行う。
+        let preset_non_dumpable = case == "subordinate";
+        if preset_non_dumpable {
+            set_non_dumpable_for_test().expect("set non-dumpable");
+        }
         let got = establish_pod_namespaces(privilege, source).expect("establish pod namespaces");
 
         // 写像: 内側から読む /proc の host_id は開いた側基準で変わりうるため、報告(計画値)と
@@ -274,7 +282,9 @@ mod linux {
         assert!(got.loopback_up());
 
         assert_loopback_up();
-        assert_eq!(is_non_dumpable_for_test(), Some(true), "dumpable window");
+        if preset_non_dumpable {
+            assert_eq!(is_non_dumpable_for_test(), Some(true), "dumpable window");
+        }
         assert_no_children();
         println!("{success}");
     }

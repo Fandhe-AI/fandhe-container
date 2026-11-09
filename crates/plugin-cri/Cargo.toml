@@ -37,7 +37,19 @@ fandhe-container-supervisor = { path = "../supervisor" }
 # workspace 内 path 依存で外部クレートの追加ではない。net は依存を持たない core 側ライブラリで、辺は plugin-cri → net の一方向（PLUG-1・CRI-7）。
 fandhe-container-net = { path = "../net" }
 
+[features]
+default = []
+# op-stats-test-support: op-stats のスナップショットファイルの書き出し周期を環境変数
+# `FANDHE_CONTAINER_TEST_OP_STATS_INTERVAL_MS`（10 進ミリ秒）で短くできるようにする（既定の周期は 60 秒で、周期の書き出しを
+# 見る結合試験を書けないため。#4340・CRI-6・REPAIR-5）。既定のビルドには含めず、リリースビルドで有効にするとコンパイルが止まる
+# （src/lib.rs の `compile_error!`）。依存は増えない。
+op-stats-test-support = []
+
 [dev-dependencies]
+# 自己参照の dev-dependency（cli・supervisor・core と同じ仕組み。workspace 内の参照で外部クレートの追加ではない）:
+# 自 crate の試験では `op-stats-test-support` を常に有効にする。通常のビルド（`cargo build`・リリース成果物）は
+# dev-dependency を解決しないため、feature は無効のまま。
+fandhe-container-plugin-cri = { path = ".", features = ["op-stats-test-support"] }
 tokio = { workspace = true, features = ["rt", "macros", "net", "time"] }
 # #2484: 結合試験 `peer_auth_audit_delivery` が `UdsIncoming` の期待 UID だけを差し替える口（feature `test-support`。
 # 既定で無効・workspace 内 path 依存の feature 追加のみで外部依存の追加ではない）を使う。本番の依存では有効にしない。

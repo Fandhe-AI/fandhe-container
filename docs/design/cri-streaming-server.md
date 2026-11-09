@@ -113,6 +113,7 @@ CRI の定義は tty のとき stderr を false に固定する。RPC（`validat
 - 期限（REPAIR-5）: `SessionLimits`（作成 30 秒・idle 4 時間・流し切り 5 秒・最後の送出 5 秒）に加え、Exec 固有の `launch_timeout`（既定 30 秒）と `stdin_stall_timeout`（既定 60 秒。溜めた stdin をプロセスが読まないとき、ソケットを読めず切断を検知できない時間の上限）
 - 受信バッファが上限を超えた場合は EOF と区別して `ProtocolError`（GOAWAY）で閉じる
 - インスタンスの照合（#4286・CRI-5・SEC-1・CORE-1）: `Exec` RPC は URL の発行前に、実行層の `state` を `exit_observe_timeout`（有界）で 1 回読み、コンテナのインスタンス識別子を `StreamRequest::Exec { request, instance }` に保存する（実行層が無いスタブ経路は `None`。読めなければ RPC を失敗させ URL を発行しない）。起動役は対象のプロセスを決める状態読み取りと同じ読み取りで得た値と `adapter::instance_matches`（shim v2 の T5 と同じ規則。`None` 同士は通し、値違い・片側だけ `None` は不一致）で比べ、不一致なら helper を起動せず `FAILED_PRECONDITION` `"container was recreated after the exec request"`（`MSG_EXEC_INSTANCE_CHANGED`。ID・値を含めない）で拒否する。コードが shim の `NOT_FOUND "exec not found"` と違うのは、後者が登録簿から除去した結果の語彙で、ストリーミング経路には登録簿が無いため。kubelet には他の起動失敗と同じ `InternalError` の Status として見える
+- 発行前の照合（#4322・CRI-2・CRI-6・SEC-1）: CRI の記録 `ContainerRecord` は create 時に実行層が報告したインスタンスを `instance` として持ち（記録ファイル v2 の `instance=` 行にも書き、再採用は記録の値をそのまま復元する。core が今報告する値で補わない）、`Exec` RPC は URL の発行前に、この値と発行時に読んだ値を同じ `instance_matches` で比べる。不一致、または記録が `None` で現在値がある場合は `FAILED_PRECONDITION` `"container was recreated after it was created through CRI"`（`MSG_EXEC_INSTANCE_NOT_CREATED_ONE`）で URL を発行しない（fail-closed）。旧版の記録（v1）・write-ahead 段階で落ちた記録・本変更前に作られたコンテナは記録が `None` のため、本番の実行層（必ず値を報告する）のもとでは Exec が拒否される。回復手順は RemoveContainer → CreateContainer（運用上は pod の再作成）。再評価条件: v1 の記録を持つ稼働環境があり Exec の拒否が運用上の問題として報告されたとき。両側 `None`（スタブ・識別子を報告しない実行層）は従来どおり通る
 
 ### 注入トレイト `ExecStreamLauncher`
 
@@ -473,7 +474,7 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 | follow のポーリング / 上限 | 200 ms / 24 時間 |
 | attach の follow スレッドの書き込みの刻み（取り消しの確認） | 200 ms |
 | PortForward の dial / 対の揃い / 書き込みの stall | 10 秒 / 30 秒 / 30 秒 |
-| `StreamingServer` の SIGTERM での停止 | 受信の検知（100 ms 周期）で待ち受けを閉じる（待ちなし。#3754）。受け付け済みのセッションはシグナルから 5 秒（`STREAMING_DRAIN_WAIT`）ドレインし、期限で exec を止めて 1 秒（`STREAMING_CLOSE_WAIT`）待ち、残りを強制クローズする。gRPC の猶予 10 秒以内に収まり、全体の上限 13.7 秒は不変（#4164。暫定値で #4116 の対象） |
+| `StreamingServer` の SIGTERM での停止 | 受信の検知（100 ms 周期）で待ち受けを閉じる（待ちなし。#3754）。受け付け済みのセッションはシグナルから 5 秒（`STREAMING_DRAIN_WAIT`）ドレインし、期限で exec を止めて 1 秒（`STREAMING_CLOSE_WAIT`）待ち、残りを強制クローズする。gRPC の猶予 10 秒以内に収まり、streaming は全体の上限を延ばさない（全体は #4340 で op-stats の最後の書き出し 1 秒が別に足されて 14.7 秒）（#4164。暫定値で #4116 の対象） |
 | helper の fd 2 の読み手（#4171） | 読み取りの刻み 100 ms / 停止後の drain 50 ms / 終了時の待ち 500 ms / 絶対期限 25 秒 + 3600 秒 + 30 秒 |
 | 要求元の切断の検知（helper の serve の刻み）/ 検知から helper の終了まで | 20 ms / 合否値 2 秒（通知処理のない通常ケース。遅延・回収失敗ケースは検知最大 5 秒・回収込み 約 15 秒。期限と `hold_grace` は不変）。#4165。実装済み（#4166）。実機前提試験は `stream_exec_real` の `requester_killed` と `production_binary_exec_real` の段 4（#4167） |
 
@@ -529,7 +530,7 @@ CRI の `ExecSync`（現状 `UNIMPLEMENTED`）も本設計の helper を再利�
 - rootful: plugin-cri の start が uid 0 を `UNIMPLEMENTED` にするため、rootful のコンテナは無く 3 RPC とも使えない（uid 0 の拒否は #2442、rootful を許すかは #2241 の判断待ち）
 - 非 Linux: Exec は未結線の `UNIMPLEMENTED`。コンテナの start 自体も未実装（macOS の状態ルートは #2431）
 - `ExecSync`: `UNIMPLEMENTED` のまま。追跡 issue 未起票。実装するときは Exec と同じインスタンスの記録と起動時の照合を入れる義務がある（#4286）
-- Exec のインスタンス照合の残余（#4286）: (1) 識別子を報告しない実装・記録の無い旧い `state.json` は両側 `None` で保護されない（試験で固定）。(2) CRI の記録（`ContainerRecord`）は create 時のインスタンスを持たないため、`Exec` RPC より前に外で作り直されたコンテナには新しいインスタンスで URL が発行される（塞ぐには記録ファイルと再採用へインスタンスを持たせる必要があり、本件の範囲外）。(3) 照合の違反の観測は `ExecStreamOutcome::InstanceChanged`（コードと文 `MSG_EXEC_INSTANCE_CHANGED` の両方で判定）として他の起動失敗と区別され、操作別計装 `cri.exec.session`（`FAILED_PRECONDITION`）に加えて `cri.exec.instance_changed` の失敗として別の行にも出る（二重計上。60 秒周期の `op_stats` 行。#4324・CRI-6・REPAIR-4）。クライアントへの Status は `InternalError` のままで観測だけが分かれる。即時の構造化行は未実装
+- Exec のインスタンス照合の残余（#4286）: (1) 識別子を報告しない実装・記録の無い旧い `state.json` は両側 `None` で保護されない（試験で固定）。(2) 解消済み（#4322）: create 時のインスタンスを記録と記録ファイル v2 に持たせ、発行前に照合する（旧版の記録・write-ahead の記録は fail-closed。代償と回復手順は上記）。(3) 照合の違反の観測は `ExecStreamOutcome::InstanceChanged`（コードと文 `MSG_EXEC_INSTANCE_CHANGED` の両方で判定）として他の起動失敗と区別され、操作別計装 `cri.exec.session`（`FAILED_PRECONDITION`）に加えて `cri.exec.instance_changed` の失敗として別の行にも出る（二重計上。60 秒周期の `op_stats` 行。#4324・CRI-6・REPAIR-4）。クライアントへの Status は `InternalError` のままで観測だけが分かれる。即時の構造化行は未実装
 - 外部公開の TLS・認証（無い。opt-in の口は #4110 で plugin-cri の CLI に出した。前段の守りが前提）
 - Upgrade 後のセッションの停止時のドレイン方針の再評価（REPAIR-5）: #4111。`ConnectionObserver` の telemetry への接続（REPAIR-4）は #4163 で実装済み（下の「plugin-cri での起動と停止」）
 - ポートの到達性など深い意味検証
@@ -543,14 +544,14 @@ CRI の `ExecSync`（現状 `UNIMPLEMENTED`）も本設計の helper を再利�
 - dispatcher は Attach（Linux は対話可能な完全版、非 Linux は `AttachHandler::read_only()`。`ProductionAttach` で宣言する。#3763・#4078）・PortForward（NODE の `NodeLoopbackDialer`。#3755）・Exec（Linux で `exec_stream_launcher` があるとき。`without_tty`・`absolute_command_only`。#3761）を結線して注入する（`production_stream_dispatcher(attach: ProductionAttach, exec, recorder)`。`PortForwardHandler::new` の失敗を `INTERNAL` に写すため `Result`）。非 Linux の Exec は未結線で「not wired」の `UNIMPLEMENTED`。兄弟 issue は `with_*` を足す（`wiring` は bind 時に取られるため bind より前）
 - 接続の観測（#4163・CRI-6・REPAIR-4）: `bind_production_streaming` は `ConnectionObserver` を受け取り `bind_with_observer` へ渡す。本番は `streaming::connection_observer::TelemetryConnectionObserver`（共有 `OpRecorder` と `stderr_sink()`。作れなければ起動しない）。件数は共有記録器の `cri.streaming.connection`（受理の成功・HTTP 失敗）・`cri.streaming.connection_deadline`・`cri.streaming.connection_rejected`・`cri.streaming.accept_failed` で、既存の 60 秒周期の `op_stats` 行に出る（正の件数）。異常の構造化行 `{"event":"cri_streaming_connection","op":…,"outcome":"error","reason":…,"count":…}` の reason は固定語彙 `max_connections`・`deadline_exceeded`・`accept_failed` の 3 種で、理由ごとの累計が 2 のべき乗に達した時だけ出す（接続の洪水で、監査行と共用の stderr sink を埋めないため。HTTP 失敗は件数のみ）。`observe` は I/O をせず `try_send` のみでブロックしない。トークン・コンテナ ID・入出力・パス・相手アドレスは出さない（イベント型が文字列を持たない）
 - bind の失敗は fail-closed（`error: UNAVAILABLE: failed to start the streaming server`、設定検証の失敗は `INTERNAL`）。縮退すると「未結線」と区別できないため。UDS より先に判定するので socket を残さない
-- 停止は SIGTERM・SIGINT の検知と同時に TCP の待ち受けを閉じる（shutdown future は待たない）。その後のセッションの扱いは次節。`SHUTDOWN_TOTAL_BOUND`（13.7 秒）は変わらない
+- 停止は SIGTERM・SIGINT の検知と同時に TCP の待ち受けを閉じる（shutdown future は待たない）。その後のセッションの扱いは次節。`SHUTDOWN_TOTAL_BOUND`（14.7 秒。#4340 で op-stats の最後の書き出し 1 秒が別に足された）は本件で延ばさない
 
 ## 停止時のセッションの扱い（#4164・CRI-6・REPAIR-5）
 
 ### 判断材料
 
 - kubelet の期限はストリーム作成 30 秒・idle 4 時間（`SessionLimits::default()`）で、停止の予算よりずっと長い。「自然に終わるまで待つ」は採れない
-- 本体の停止の上限は `SHUTDOWN_TOTAL_BOUND` 13.7 秒（検知 100 ms + gRPC の猶予 10 秒 + 強制回収 2 秒 + 書き出し 3 × 200 ms + ランタイム 1 秒）で、`shutdown.rs` の試験が固定している。本件はこの値を変えない
+- 本体の停止の上限は `SHUTDOWN_TOTAL_BOUND` 14.7 秒（検知 100 ms + gRPC の猶予 10 秒 + 強制回収 2 秒 + 書き出し 3 × 200 ms + ランタイム 1 秒 + op-stats の最後の書き出し 1 秒〔#4340。streaming の分ではない〕）で、`shutdown.rs` の試験が固定している。本件はこの値を延ばさない
 - 変更前は、シグナルで exec の helper を即座に kill し（停止間際に終わるはずだった応答も欠ける）、Upgrade 後の Attach・PortForward のセッションは追跡も期限も記録も無いまま、gRPC の猶予の後にランタイムの停止が切っていた
 - 受け入れた各セッションのタスクは handler が捨てハンドルで `tokio::spawn` しており、停止の経路だけでは強制クローズも件数の把握もできなかった。このため cri に `ConnectionPermit::spawn_session`（タスクの寿命 = 枠の寿命を型で結ぶ）と `StreamingSessions`（件数・`close_all`・`wait_idle_until`）を足し、3 つの handler の起動をそれに置き換えた（挙動は変えない）。Upgrade 前の接続のタスクも同じ追跡簿に登録する
 
@@ -568,7 +569,7 @@ CRI の `ExecSync`（現状 `UNIMPLEMENTED`）も本設計の helper を再利�
 | 6 | 最後 | 構造化ログを 1 行出す（`event=cri_streaming_stop`。`open_at_stop`・`drained`・`exceeded`・`forced`・`remaining`・`elapsed_ms`。期限を超えたか残ったときは `warn`） |
 
 - 順序の理由: exec のプロセスを先に止めてから接続を閉じる。クライアントに「切れた」と見えた後もコマンドが動き続ける窓をなくし、終了コード（Status）をできるだけ届けるため。強制クローズでも `ExecSession` の drop が helper を kill する（二重の経路）
-- 上限の不変性: 5 秒 + 1 秒 = 6 秒 ≤ `PLUGIN_SHUTDOWN_GRACE` 10 秒。期限は T からの絶対時刻なので、serve が期限より後に戻ったときは待たずに段 3 へ進み、停止全体は serve の戻りと 6 秒 + 100 ms の大きい方で終わる。13.7 秒は変わらない（`repair5_4164_stop_waits_fit_within_grpc_grace_and_total_bound` で固定）
+- 上限の不変性: 5 秒 + 1 秒 = 6 秒 ≤ `PLUGIN_SHUTDOWN_GRACE` 10 秒。期限は T からの絶対時刻なので、serve が期限より後に戻ったときは待たずに段 3 へ進み、停止全体は serve の戻りと 6 秒 + 100 ms の大きい方で終わる。streaming 由来では延びない（`repair5_4164_stop_waits_fit_within_grpc_grace_and_total_bound` で固定）
 - シグナルが記録されないまま `finish` したとき（serve が先にエラーで戻った）、`finish` を呼ばず drop したときも、待たずに `on_stop` と強制クローズを行う
 - 暫定値: 5 秒は cri の `SessionLimits` の `drain_timeout`（終了後の流し切りの予算）と同じ、1 秒は `RUNTIME_SHUTDOWN_WAIT` と同じ。どちらも暫定値で、オーナー確認は #4116 の対象。承認は得ていない
 

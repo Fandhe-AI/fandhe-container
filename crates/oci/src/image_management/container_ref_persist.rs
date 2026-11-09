@@ -490,21 +490,32 @@ fn write_and_rename(root: &RootHandle, tmp: &str, bytes: &[u8]) -> Result<(), Oc
 #[cfg(test)]
 mod tests {
     use super::*;
+    // ストアを開く試験（unix 限定）だけが使う道具。Windows ホストは設計上 `ImageStore` を開けない
+    // （#2428 の案 C・#4333・OCI-5・OCI-7。拒否は store.rs の `windows_rejection_tests` が具体値で照合）。
+    #[cfg(unix)]
     use crate::image_management::root_handle::rh;
+    #[cfg(unix)]
     use crate::image_management::{ContainerRefRelease, ImageStore, ManifestComposition};
+    #[cfg(unix)]
     use std::fs::OpenOptions;
+    #[cfg(unix)]
     use std::path::{Path, PathBuf};
+    #[cfg(unix)]
     use std::sync::atomic::AtomicU32;
+    #[cfg(unix)]
     use std::time::Duration;
 
+    #[cfg(unix)]
     fn d(n: u8) -> Digest {
         Digest::parse(&format!("sha256:{}", format!("{n:02x}").repeat(32))).expect("digest")
     }
 
+    #[cfg(unix)]
     fn cid(s: &str) -> ContainerRefId {
         ContainerRefId::new(s).expect("id")
     }
 
+    #[cfg(unix)]
     fn root(label: &str) -> PathBuf {
         static SEQ: AtomicU32 = AtomicU32::new(0);
         let p = std::env::temp_dir().join(format!(
@@ -524,6 +535,7 @@ mod tests {
     }
 
     /// manifest `d(0xa0)` を種に入れたストアを開く（在庫は永続化されないので毎回入れ直す）。
+    #[cfg(unix)]
     fn open(root: &Path) -> ImageStore {
         let store = ImageStore::open(root)
             .expect("open")
@@ -532,6 +544,7 @@ mod tests {
         store
     }
 
+    #[cfg(unix)]
     fn seed(store: &ImageStore) {
         store
             .lock()
@@ -543,6 +556,7 @@ mod tests {
             .expect("manifest");
     }
 
+    #[cfg(unix)]
     fn write_file(root: &Path, json: &str) {
         fs::write(root.join(CONTAINER_REFS_FILE_NAME), json).expect("write");
         #[cfg(unix)]
@@ -556,6 +570,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn lock_code(root: &Path) -> OciErrorCode {
         let s = ImageStore::open(root)
             .expect("open")
@@ -570,6 +585,7 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
     fn containers_of(s: &ImageStore, m: u8) -> Vec<ContainerRefId> {
         s.lock()
             .expect("lock")
@@ -578,6 +594,7 @@ mod tests {
     }
 
     /// OCI-7・#2341: 登録・確定・解除の状態と世代が、開き直した後も具体値で一致する。
+    #[cfg(unix)]
     #[test]
     fn oci7_save_and_reload_preserves_state_and_generations() {
         let r = root("reload");
@@ -618,6 +635,7 @@ mod tests {
     }
 
     /// OCI-7・#2341: 解除した ID の再登録は過去の世代を再発行せず、旧世代の解除は効かない。
+    #[cfg(unix)]
     #[test]
     fn oci7_generation_is_not_reissued_after_reopen() {
         let r = root("regen");
@@ -641,6 +659,7 @@ mod tests {
     }
 
     /// OCI-7・#2341: 同じ root の 2 ハンドルは区間ごとにディスクを読み直し、世代が重複しない。
+    #[cfg(unix)]
     #[test]
     fn oci7_two_handles_share_state_per_critical_section() {
         let r = root("share");
@@ -656,6 +675,7 @@ mod tests {
     }
 
     /// OCI-7・#2341: 壊れた JSON は DataLoss で、ファイルは変わらない。
+    #[cfg(unix)]
     #[test]
     fn oci7_corrupt_json_is_data_loss_and_file_untouched() {
         let r = root("corrupt");
@@ -669,6 +689,7 @@ mod tests {
     }
 
     /// OCI-7・#2341: 上限を 1 バイト超えるファイルは確保の前に ResourceExhausted。
+    #[cfg(unix)]
     #[test]
     fn oci7_oversized_file_is_resource_exhausted() {
         let r = root("big");
@@ -777,6 +798,7 @@ mod tests {
     }
 
     /// OCI-7・#2341: 残った一時ファイル（書きかけを含む）は読み込みに影響せず、完全な状態だけが読まれる。
+    #[cfg(unix)]
     #[test]
     fn oci7_leftover_temp_file_is_ignored() {
         let r = root("tmp");
@@ -796,6 +818,7 @@ mod tests {
 
     /// OCI-7・#2379: クラッシュで残った参照表の一時ファイルは lock 取得時に回収される。symlink・ディレクトリ・
     /// 固定名の本体・無関係なファイルは残り、登録済みの参照は変わらない。
+    #[cfg(unix)]
     #[test]
     fn oci7_stale_container_refs_tmp_is_reaped_on_lock() {
         let r = root("reap-tmp");
@@ -827,6 +850,7 @@ mod tests {
     }
 
     /// OCI-7・#2379: 照合（`reconcile_container_refs`）の経路でも、残った一時ファイルが回収される。
+    #[cfg(unix)]
     #[test]
     fn oci7_reconcile_reaps_stale_container_refs_tmp() {
         use crate::image_management::ContainerStatePresence;
@@ -842,6 +866,7 @@ mod tests {
     }
 
     /// OCI-7・#2341: 件数・サイズの上限を超える保存は ResourceExhausted で、既存ファイルを壊さない。
+    #[cfg(unix)]
     #[test]
     fn oci7_save_over_limits_is_rejected_and_keeps_existing_file() {
         let r = root("save-limits");
@@ -875,6 +900,7 @@ mod tests {
     }
 
     /// OCI-7・#2341: 登録が件数上限に達していたら ResourceExhausted でテーブルを変えない。
+    #[cfg(unix)]
     #[test]
     fn oci7_register_at_limit_is_rejected() {
         let r = root("reg-limit");
@@ -898,6 +924,7 @@ mod tests {
     }
 
     /// OCI-7・#2341: 保存に失敗したら登録を戻して保存のエラーを返し、件数と次の世代が変わらない。
+    #[cfg(unix)]
     #[test]
     fn oci7_failed_save_rolls_back_table() {
         /// 失敗注入を必ず解除する（assert が失敗しても他の試験へ漏らさない）。
@@ -936,6 +963,7 @@ mod tests {
     }
 
     /// OCI-7・#2341: 在庫に無い manifest への参照が残る間は、`image rm` / `image prune` が blob を消さない。
+    #[cfg(unix)]
     #[test]
     fn oci7_unresolved_container_ref_blocks_blob_deletion() {
         let r = root("unresolved");

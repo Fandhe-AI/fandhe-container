@@ -29,7 +29,7 @@
 | sandbox 記録（config・状態・作成時刻・ネットワークのフラグ） | 決定し実装単位へ |
 | コンテナ記録（CRI 層の項目一式・`image_ref`・`image_id`） | 決定し実装単位へ |
 | 保持役の pid と素性 | 記録の形を決定。再採用の可否は要確認事項 1。#2871 は pid を sandbox 記録のメモリにだけ持ち、v1 の記録ファイルには書かない（永続化は R11 #2940）。再採用した記録の pid は常に無い |
-| ネットワーク資源（`network_owned`・`pod_netns`） | フラグの永続は決定。再起動後の `tear_down` は #1870 の後 |
+| ネットワーク資源（`network_owned`・`pod_netns`） | フラグの永続は決定。再起動後の `tear_down` は #1870 の後。`pod_netns` に載る報告済み IP（`PodSandboxStatus.network`・#2873）も永続しないため、再採用後の network は空 |
 | plugin-cri の在庫の永続化 | #4176 で配線済み（`PersistentImageStore`）。RemoveImage と再起動後の一貫性は #4177 で実装済み、取り消しの窓が #4178。記録の `image_ref`・`image_id` は create 時のスナップショットとして独立に永続化するため依存しない |
 
 ## 置き場所
@@ -43,12 +43,12 @@
 
 ## 形式
 
-- serde を使わない。固定のヘッダ行（LF・ASCII。版の行 `fandhe-cri-sandbox-record v1` / `fandhe-cri-container-record v1`、キー順固定のスカラー項目）と、`config=<長さ>` の行に続く長さちょうどの prost 符号化した `PodSandboxConfig` / `ContainerConfig`。prost は既存依存で、新規依存は足さない
+- serde を使わない。固定のヘッダ行（LF・ASCII。版の行 `fandhe-cri-sandbox-record v1` / `fandhe-cri-container-record v2`（コンテナは #4322 で v2。v1 も復号で受ける）、キー順固定のスカラー項目）と、`config=<長さ>` の行に続く長さちょうどの prost 符号化した `PodSandboxConfig` / `ContainerConfig`。prost は既存依存で、新規依存は足さない
 - 復号は厳密にする。版の完全一致・キー順固定・重複/未知キー/余分な行/CRLF なし・ID とファイル名の一致・長さの上限（config は `MAX_CONFIG_ENCODED_BYTES`、記録全体の上限を先に確認）。復号後に `config_limits` と同じ上限検証を通し、RunPodSandbox/CreateContainer と同じ上限を再採用時にも効かせる。違反は `InvalidArgument`（入力値をメッセージに載せない。REPAIR-4）
 - 秘密の最小化: `ContainerConfig.envs` は記録に書かない（Status/List は返さず、bundle 作成後は不要）。`command`・`args` も応答に出ないため書かない案があるが、推奨は envs だけを除く（要確認事項 2）
 - 保持量（`retained_bytes`）は読み込み時に再計算し、記録に書かない
-- v1 の実装（R1・#2930。`crates/cri/src/runtime_service/record.rs`）: 「LF・ASCII」はキーと版の行が ASCII という意味で、値は LF 以外の制御文字（CR を含む）を含まない UTF-8（`log_path` は非 ASCII を許す）。sandbox の鍵は `id`・`state`・`created_at`・`runtime_handler`・`pending`・`network_owned`・`network_pending`・`config`、コンテナの鍵は `id`・`pod_sandbox_id`・`state`・`in_flight`（種類。`-` は無し）・`created_at`・`started_at`・`finished_at`・`exit_code`・`termination`・`stop_signal`・`log_path`・`user`・`image_id`・`image_ref`・`image_tag`・`config`（値のない項目は `-`）の順。整数は正準形（先頭 0・`+`・`-0` なし）、ID は 64 文字の小文字 16 進。config 部は復号後に再符号化した長さが `config=` の長さと一致することを要求し、未知フィールド・重複フィールド・非正準な符号化を拒否する。コンテナは `envs` が空であることも要求する。`image_ref`・`image_tag` は `ResolvedImage` と同じ判定を構築の前に適用し、不正値を黙って落とさず拒否する
-- 版を上げる条件: 保持役の素性（R11 #2940）や `pod_netns`・provider 識別子（R12 #2941）の鍵を足すときは `v2` とする（版は完全一致のため、旧版の扱いはそれぞれの issue で決める）
+- v1 の実装（R1・#2930。`crates/cri/src/runtime_service/record.rs`）: 「LF・ASCII」はキーと版の行が ASCII という意味で、値は LF 以外の制御文字（CR を含む）を含まない UTF-8（`log_path` は非 ASCII を許す）。sandbox の鍵は `id`・`state`・`created_at`・`runtime_handler`・`pending`・`network_owned`・`network_pending`・`config`、コンテナの鍵は `id`・`pod_sandbox_id`・`state`・`in_flight`（種類。`-` は無し）・`created_at`・`started_at`・`finished_at`・`exit_code`・`termination`・`stop_signal`・`instance`（v2 のみ。create 時に実行層が報告したインスタンスの正準形 u64、無ければ `-`。v1 の記録は行が無く `None`。#4322）・`log_path`・`user`・`image_id`・`image_ref`・`image_tag`・`config`（値のない項目は `-`）の順。整数は正準形（先頭 0・`+`・`-0` なし）、ID は 64 文字の小文字 16 進。config 部は復号後に再符号化した長さが `config=` の長さと一致することを要求し、未知フィールド・重複フィールド・非正準な符号化を拒否する。コンテナは `envs` が空であることも要求する。`image_ref`・`image_tag` は `ResolvedImage` と同じ判定を構築の前に適用し、不正値を黙って落とさず拒否する
+- 版を上げる条件: 保持役の素性（R11 #2940）や `pod_netns`・provider 識別子（R12 #2941）の鍵を足すときは、コンテナ記録は `v3`・sandbox 記録は `v2` とする（版は完全一致のため、旧版の扱いはそれぞれの issue で決める）。v1 のコンテナ記録は次の状態遷移の `put` で v2 に書き換わる。ダウングレードで旧バイナリが v2 を読むと `malformed` として数えられ、記録は消されず残る（#4322）
 
 ## 排他
 
@@ -253,8 +253,8 @@ CORE-10 への当てはめ（CORE-10 の目標 0.136 秒、Linux の Docker 0.29
 - 受付の停止: ストリーミングサーバーの TCP listener も同時に閉じる（上限は延ばさない。`cri-streaming-server.md` の「plugin-cri での起動と停止（#3754）」）。シグナルを受けたら listener を即座に閉じる（tonic はドレイン中も incoming を持ち続けるため、`server::StopOnShutdown` が drop する）。socket は `UdsListener::drop` が bind 時の dev/ino と一致する場合だけ検証済みディレクトリの fd 基点で unlink する。起動段（ロック取得・pull の回収・記録の再採用）は段の境界でだけ受信を見て、受けていれば bind せずに終了コード 0 で終える
 - 実行中の RPC: `PLUGIN_SHUTDOWN_GRACE`（10 秒）まで待つ。超えたら接続を強制的に閉じ（回収の上限 2 秒）、`error: TIMEOUT: ...`・終了コード 1 で終える。打ち切った RPC・`spawn_blocking`（`shutdown_timeout` 1 秒で置き去り）は結果不明のまま残り、再起動時に R7 の照合表・`recover_stale_image_pulls`（OCI-7）が扱う。記録は rename による不可分の置き換えなので半端なファイルは残らない
 - インスタンスロック: fd の close で外れる。ロックファイルは消さない（unlink すると二重に取得され得る）。確定はプロセスの終了。新しいインスタンスは `INSTANCE_LOCK_TIMEOUT`（5 秒）しか待たないため、旧インスタンスの終了を待ってから起動する運用を前提とする
-- 終了コードと stderr: 正常停止は終了コード 0 と固定の 1 行 `cri plugin shutdown: signal=<SIGTERM|SIGINT> stage=<startup|serve>`（パス・pid・ID を含めない）。停止の全体の上限は 13.7 秒（検知 0.1 + 猶予 10 + 強制回収 2 + 書き出し 0.6〔serve_with_audit の sink・forwarder と終了行の 3 回 × 0.2〕+ ランタイム 1。`shutdown::SHUTDOWN_TOTAL_BOUND` を試験で固定）
-- 監査 helper の止まり方（#3300・SEC-4・PLUG-12・REPAIR-5）: helper は fork の直後に SIGTERM・SIGINT を `SIG_IGN` にする（opt-in の `ControlAuditRelay::spawn_ignoring_stop_signals`。supervisor の `spawn` は不変）。プロセスグループ宛て・systemd の `KillMode=control-group`（cgroup 全体宛て）の SIGTERM でも helper は先に死なず、ドレイン中の peer 認証の拒否が `@audit.log` に届く。終わるのは本体の終了（socketpair の EOF）か SIGKILL のとき。本体の終了後の残存は処理中の 1 件を書き終えるまでで最悪 `AUDIT_HELPER_LINGER_BOUND`（= `RECORD_WAIT_LIMIT` 11.45 秒）。本体の 13.7 秒は延ばさず、単位全体の最悪は `UNIT_STOP_BOUND`（25.15 秒。systemd の既定 90 秒より短い。`shutdown` の試験で固定）。結合試験 `shutdown_audit_helper` が、グループ宛て SIGTERM の後のドレイン中の拒否の到達と helper の期限つきの終了を照合する。却下案: 本体が先にハンドラを登録して helper へ継承させる（EINTR が出る・継承に頼る）、helper を別のプロセスグループへ移す（cgroup 全体宛てに効かない）、本体が終了の枠を送る（プロトコルが増える）
+- 終了コードと stderr: 正常停止は終了コード 0 と固定の 1 行 `cri plugin shutdown: signal=<SIGTERM|SIGINT> stage=<startup|serve>`（パス・pid・ID を含めない）。停止の全体の上限は 14.7 秒（検知 0.1 + 猶予 10 + 強制回収 2 + 書き出し 0.6〔serve_with_audit の sink・forwarder と終了行の 3 回 × 0.2〕+ ランタイム 1 + op-stats の最後の書き出し 1〔`--op-stats-file` 指定時のみ。`OP_STATS_FINAL_WRITE_WAIT`・#4340〕。`shutdown::SHUTDOWN_TOTAL_BOUND` を試験で固定）
+- 監査 helper の止まり方（#3300・SEC-4・PLUG-12・REPAIR-5）: helper は fork の直後に SIGTERM・SIGINT を `SIG_IGN` にする（opt-in の `ControlAuditRelay::spawn_ignoring_stop_signals`。supervisor の `spawn` は不変）。プロセスグループ宛て・systemd の `KillMode=control-group`（cgroup 全体宛て）の SIGTERM でも helper は先に死なず、ドレイン中の peer 認証の拒否が `@audit.log` に届く。終わるのは本体の終了（socketpair の EOF）か SIGKILL のとき。本体の終了後の残存は処理中の 1 件を書き終えるまでで最悪 `AUDIT_HELPER_LINGER_BOUND`（= `RECORD_WAIT_LIMIT` 11.45 秒）。本体の 14.7 秒は延ばさず、単位全体の最悪は `UNIT_STOP_BOUND`（26.15 秒。systemd の既定 90 秒より短い。`shutdown` の試験で固定）。結合試験 `shutdown_audit_helper` が、グループ宛て SIGTERM の後のドレイン中の拒否の到達と helper の期限つきの終了を照合する。却下案: 本体が先にハンドラを登録して helper へ継承させる（EINTR が出る・継承に頼る）、helper を別のプロセスグループへ移す（cgroup 全体宛てに効かない）、本体が終了の枠を送る（プロトコルが増える）
 - fork した子へのハンドラの継承（#3300）: 登録したハンドラは exec しない fork の子へ引き継がれる。exec した子は `execve` で `SIG_DFL` に戻る（試験で固定）。exec しない fork は core の `fork_single_threaded*` だけで、複数スレッドのプロセスでは拒否されるため、ランタイム等のスレッドができた後は到達しない。残る窓はハンドラ登録後から最初のスレッドまでの起動段だけで、そこの子は各段の予算と SIGKILL で回収される。core の fork 原語で `SIG_DFL` に戻す案は launcher・PID 1 の経路に及ぶため採らない。単体試験は libtest のプロセスに停止シグナルのハンドラを入れない（`install_shutdown_signals` を呼ばない）
 - 残余（REPAIR-3）: 起動段の途中では段の予算まで待つ。relay の fork より前に届いたシグナルは既定動作で即終了する（SIGKILL と同じく再採用が扱う）。libc との機械照合は plugin-cri に dev-dependency の `libc` が無いため未導入（依存の追加は承認事項）。running のコンテナを残した実機での SIGTERM 再起動の確認は R13 #2942（人間担当）
 
@@ -369,11 +369,13 @@ kubernetes v1.37.1（commit `d2b770f4c94636a992534a8d3156b6b2d8e82ac3`）で確�
 - `production_binary_full_lifecycle_real`: pull は 1 回で、本体を 2 回走らせる。1 回目は Start と Running の確認の直後に注入した失敗で落とし、台帳とトークン label の回収が 1 件ずつ消すことを照合する。2 回目は同じ metadata で通す（回収が効かなければ `ALREADY_EXISTS`）。回収時に plugin が死んでいれば同じ状態ルートで起動し直す
 - `production_binary_restart_readopts_running_container_real`: 先頭の回収はちょうど 1 回で、状態ルートに残骸があるときだけ使い捨ての plugin を起動して許可リストの所有者 label の記録を消す。その後の前提検査（`restart_gate`）は従来どおり label の無い残骸で失敗し（fail-closed）、本体の照合（件数・フィルタなしの一覧）は緩めない。本体が失敗したら plugin を起動し直して自分のトークンの記録を回収する
 - `production_binary_exec_real` の段 4: SIGKILL → 起動し直し → 再採用の後、回収が Remove と残存確認を担い、回収した ID が自分の 1 件ずつであることを照合する
+- `production_binary_exec_real`・`production_binary_attach_real` の外側の回収（#4326）: 試行 1 の注入で StartContainer の直後に plugin-cri を SIGKILL してから panic させ、外側の回収が共有の `reclaim_restarting`（死活の判定 `needs_restart`・回収 2 回・固定の 1 行）で起動し直して回収する。旧 plugin の kill と回収・spawn・接続は試験ごとに複製したハーネスのクロージャで注入する。照合は「起動し直した」「1 回目が `plugin_unreachable`」「回収が 1/1 で `is_clean()`」「旧 ID が `NOT_FOUND`」で、固定の 1 行 `<試験名>: plugin restarted for reclaim reclaimed containers=1 sandboxes=1` は CI が `--require` で照合する。試行 2 の後は plugin が生きているので起動し直さない。`container_grpc.rs` の局所の重複もこの部品に寄せた
+- 既定の集合の根拠（起動し直しの部品。#4326）: `cri1_cri6_4326_reclaim_restarting_respawns_dead_plugin_and_reclaims_token_records`（root・ネットワーク不要）が、死んだ接続で `plugin_unreachable`、起動し直した後に 1/1 を回収して `is_clean()`、固定の 1 行が完全一致、記録ファイルが消えることを照合する
 - 既定の集合の根拠: `cri1_cri6_4285_owned_residue_is_readopted_and_reclaimed_after_plugin_sigkill`（root・ネットワーク不要）が、死んだ plugin への接続での `unverified`、起動し直した plugin での所有者ごとの回収、label の無い記録が残り前提検査が `entries=1` の固定文言で失敗すること、再採用の要約行を具体値で照合する
 - `shim_v2_{containerd,kill_all,exec}_real`: CRI の記録を持たないため gRPC の回収は当てはまらない。コンテナ ID・namespace に pid と時刻のタグを入れて一意にし（`support/shim_real_unique.rs`）、旧形式（pid だけ）の残骸のおとりを排他作成して結果に影響しないことを確かめる（kill_all・exec）。状態ディレクトリの先頭での自動削除はしない（生きている supervisor の状態を消すおそれ）
 
 却下案: restart の本体で残骸を許す変更、shim の状態ディレクトリの自動削除。
-残余: `cri_attach_real` と `cri_exec_real` の外側の回収で plugin が予期せず死んだときの起動し直し（今回は container_grpc と段 4 のみ）、label の無い残骸の自動回収（手動の手順は `docs/setup/cri-record-recovery.md`）。ステップの期限・watchdog・pull の回数（4）・`PROBE_MIN_REMAINING=4` は変えない。
+残余: 起動し直した後に Exec / Attach を再採用したコンテナへ通す確認（回収は Stop / Remove だけを使う）、label の無い残骸の自動回収（手動の手順は `docs/setup/cri-record-recovery.md`）。ステップの期限・watchdog・pull の回数（4）・`PROBE_MIN_REMAINING=4` は変えない。
 
 ## セキュリティ上の要点
 

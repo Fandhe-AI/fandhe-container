@@ -2246,6 +2246,8 @@ fn supervise_running(
         }
     }
 }
+#[cfg(target_os = "linux")]
+pub(crate) use linux::resolve_self_launch_privilege;
 #[cfg(all(target_os = "linux", feature = "exec-test-support"))]
 pub use linux::run_start_after_options_worker_for_test;
 #[cfg(target_os = "linux")]
@@ -2465,6 +2467,21 @@ mod linux {
                 subordinate: Some(source),
             }),
         }
+    }
+
+    /// 自プロセスの資格情報から権限モデルと範囲写像の入力元を決める（`start` の `ProductionStartDeps::new` と同じ
+    /// `resolve_launch_privilege`・同じ既定パス）。pod の保持役（`pod_holder`。#2874・CRI-2・SEC-5）が
+    /// `establish_pod_namespaces` へ渡す値を、`start` と食い違わせずに得るための入口。副作用は無い。
+    pub(crate) fn resolve_self_launch_privilege()
+    -> Result<(IsolationPrivilege, Option<SubordinateIdSource>), TraitError> {
+        let text = read_self_status()?;
+        let resolved = resolve_launch_privilege(
+            &text,
+            Path::new(SYSTEM_PASSWD),
+            Path::new(SYSTEM_SUBUID),
+            Path::new(SYSTEM_SUBGID),
+        )?;
+        Ok((resolved.privilege, resolved.subordinate))
     }
 
     /// `/proc/self/status` を上限つきで読む。

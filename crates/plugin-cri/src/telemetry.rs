@@ -16,19 +16,27 @@
 //! ストリーミングサーバーの接続の件数（`cri.streaming.*`）は共有記録器に載り、異常の構造化行（`cri_streaming_connection`。2 のべき乗の累計でのみ出す）も
 //! この sink へ出る（`streaming::connection_observer`。#4163・CRI-6）。
 //!
+//! # スナップショットファイル sink（#4337・CRI-6・REPAIR-4・REPAIR-5・SEC-4）
+//! [`OpStatsFileSink`] は 1 周期分の操作統計（記録器ごとのブロックを共有 → oci の順に連結。版のヘッダ行は付けない）を
+//! 専用 thread が `SnapshotTarget::replace` で原子的に置き換える。送り手はブロックせず、仕事中の周期は飛ばして数える。
+//! 失敗・飛ばしは `op_stats_file_failed` / `op_stats_file_skipped` の固定語彙の行で残す（パス・errno・コンテナ ID を含めない）。
+//!
 //! 操作統計は記録器ごとのブロックで出す。本番は共有記録器と oci 専用記録器の 2 つで、1 周期に `op_stats_meta` 行が 2 行出る（共有・oci の順。#2900）。
 //!
 //! # 未実装（REPAIR-3）
-//! - 操作統計の出力先は stderr のみ。stderr 以外の公開口の方式は `docs/design/cri-op-stats-export.md`（#4228・CRI-6・REPAIR-4）で
-//!   決めた（原子的に置き換えるスナップショットファイルを opt-in で出す案。オーナー承認は未取得）。実装は同書 6 章の作業単位（未起票）
+//! - 操作統計の stderr 以外の公開口は `docs/design/cri-op-stats-export.md`（#4228・CRI-6・REPAIR-4）の案 C（原子的に置き換える
+//!   スナップショットファイルを opt-in で出す）。sink（[`OpStatsFileSink`]・[`op_stats_export_loop_with`]）は実装済み（#4337）で、
+//!   `main.rs` へ `--op-stats-file` として結線済み（#4340。指定時のみ開き、停止時に期限つきで最後の 1 回を書く）。
+//!   設計書の状態の更新は W5（#4341）
 //! - 監査の永続化経路は Linux 限定（`ControlAuditRelay` が Linux 限定、非 Linux の `FileAuditSink` は #2430 の
 //!   判断待ち）。非 Linux では `PeerAuditForwarder` を渡さず、拒否は stderr にだけ残る
 
 use std::io::Write;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
+use crate::snapshot_file::{SnapshotError, SnapshotTarget};
 use fandhe_container_core::audit_log::{
     AuditRecord, AuditSink, AuditTimestamp, PluginPeerRejection, current_pid,
 };
@@ -36,12 +44,105 @@ use fandhe_container_core::observability::OpRecorder;
 use fandhe_container_plugin::transport::UDS_ACCEPT_PEER_REJECTION_LIMIT;
 use fandhe_container_plugin::{
     JsonLinesPeerAuthObserver, PeerAuthObserver, PeerAuthRejectReason, PeerAuthRejection,
+    PluginError, PluginErrorCode,
 };
 
 /// 監査行を回収して書き出す間隔。
 pub const AUDIT_DRAIN_INTERVAL: Duration = Duration::from_secs(1);
 /// 操作統計を書き出す間隔。
 pub const OP_STATS_EXPORT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// 操作統計の書き出し周期。既定は [`OP_STATS_EXPORT_INTERVAL`]。試験用 feature `op-stats-test-support` が有効なときだけ、
+/// 環境変数 `FANDHE_CONTAINER_TEST_OP_STATS_INTERVAL_MS`（10 進ミリ秒。1..=60000 のみ採用し、範囲外・不正は既定）で短くできる
+/// （周期の書き出しを数秒で見る結合試験のため。#4340・CRI-6・REPAIR-5。リリースビルドでは feature が有効にならない）。
+/// `main.rs` の `serve` が [`op_stats_export_loop_with`] へ渡す。
+pub fn op_stats_export_interval() -> Duration {
+    #[cfg(feature = "op-stats-test-support")]
+    if let Some(d) = std::env::var("FANDHE_CONTAINER_TEST_OP_STATS_INTERVAL_MS")
+        .ok()
+        .as_deref()
+        .and_then(parse_interval_ms)
+    {
+        return d;
+    }
+    OP_STATS_EXPORT_INTERVAL
+}
+
+/// 試験用の周期指定の解釈（10 進ミリ秒の 1..=60000 だけ。それ以外は `None`）。
+#[cfg(any(test, feature = "op-stats-test-support"))]
+fn parse_interval_ms(s: &str) -> Option<Duration> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let ms: u64 = s.parse().ok()?;
+    (1..=60_000)
+        .contains(&ms)
+        .then(|| Duration::from_millis(ms))
+}
+
+/// 本番の記録器の数（共有記録器と oci 専用記録器の 2 つ）。スナップショットのサイズ上限（64 KiB × 2）の根拠（#2900・#4340）。
+pub const PRODUCTION_OP_STATS_BLOCKS: usize = 2;
+
+/// 停止時の最後の書き出しの結果（[`write_final_snapshot`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FinalSnapshot {
+    /// 期限内に置き換えが済んだ。
+    Written,
+    /// 期限内に書き込み thread が空かず、または書き終わらなかったため諦めた（失敗として数え、行を残した）。
+    TimedOut,
+    /// 書き込みに失敗した（行は書き込み thread が残した）。
+    Failed,
+    /// 記録器の符号化に失敗したため書かなかった（失敗として数え、行を残した）。
+    EncodeFailed,
+}
+
+/// `--op-stats-file` の置き先を検査して開く（#4340・CRI-6・REPAIR-4・SEC-1）。`main.rs` の `serve` が、audit relay の fork・状態ルート・
+/// ロック・socket より前に呼ぶ（thread を作らず、開いた fd は `O_CLOEXEC`）。置き先ディレクトリ（symlink・他 UID 所有・
+/// group/other 書き込み可は拒否）に加え、最終名が通常ファイルか不在であることも起動時に確かめる（fail-closed）。
+/// 失敗は固定文言（パス・errno を含めない）。非 Linux は `UNIMPLEMENTED`。
+pub fn open_op_stats_target(path: &std::path::Path) -> Result<SnapshotTarget, PluginError> {
+    use crate::snapshot_file::SnapshotLimit;
+    let blocks = std::num::NonZeroUsize::new(PRODUCTION_OP_STATS_BLOCKS)
+        .ok_or_else(|| op_stats_open_error(SnapshotError::LimitOutOfRange))?;
+    let limit = SnapshotLimit::for_blocks(blocks).map_err(op_stats_open_error)?;
+    let target = SnapshotTarget::open(path, limit).map_err(op_stats_open_error)?;
+    target.check_target().map_err(op_stats_open_error)?;
+    Ok(target)
+}
+
+/// 検証済みの置き先から書き込み sink を起こす（thread を作る）。audit relay の fork の後に呼ぶ（relay は単一スレッドを要求する）。
+/// thread を作れなければ起動を中止する（fail-closed）。
+pub fn spawn_op_stats_file_sink(
+    target: SnapshotTarget,
+    notices: LineSink,
+) -> Result<OpStatsFileSink, PluginError> {
+    OpStatsFileSink::spawn(target, notices)
+        .map_err(|_| PluginError::new(PluginErrorCode::Internal, MSG_OP_STATS_FILE_SPAWN_FAILED))
+}
+
+/// 置き先を開けないときの固定文言の前半（後ろに `: <SnapshotError::code()>` が付く。パス・errno は含めない）。
+pub const MSG_OP_STATS_FILE_OPEN_FAILED: &str = "failed to open the op-stats snapshot file";
+/// 書き込み thread を作れないときの固定文言。
+pub const MSG_OP_STATS_FILE_SPAWN_FAILED: &str = "failed to start the op-stats snapshot writer";
+
+/// [`SnapshotError`] を `PluginError`（固定文言 + 固定コード）へ写す。
+fn op_stats_open_error(e: SnapshotError) -> PluginError {
+    let code = match e {
+        SnapshotError::Unsupported => PluginErrorCode::Unimplemented,
+        SnapshotError::RelativePath | SnapshotError::InvalidPath => {
+            PluginErrorCode::InvalidArgument
+        }
+        SnapshotError::UntrustedDirectory
+        | SnapshotError::UntrustedProcess
+        | SnapshotError::TargetNotRegular => PluginErrorCode::PermissionDenied,
+        _ => PluginErrorCode::Internal,
+    };
+    PluginError::new(
+        code,
+        format!("{MSG_OP_STATS_FILE_OPEN_FAILED}: {}", e.code()),
+    )
+}
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     // 毒化しても記録は続ける（監査を落とさない）。
@@ -345,7 +446,295 @@ pub fn export_op_stats_to(recorder: &OpRecorder, sink: &LineSink) -> usize {
 /// 複数の記録器の操作統計を、記録器ごとのブロック（各ブロックは自分の `op_stats_meta` 行で終わる）として順に `sink` へ渡す。
 /// 積めた行数の合計を返す（共有記録器と oci 専用記録器を分けて持つため。REPAIR-4・#2900）。
 pub fn export_many_to(recorders: &[Arc<OpRecorder>], sink: &LineSink) -> usize {
-    recorders.iter().map(|r| export_op_stats_to(r, sink)).sum()
+    export_cycle(recorders, sink, None).stderr_lines
+}
+
+/// スナップショットを原子的に置き換える口（[`OpStatsFileSink`] の書き込み先）。本番は [`SnapshotTarget`]、
+/// 試験では詰まる・失敗する fake に差し替える。
+trait SnapshotWrite: Send {
+    fn replace(&self, contents: &[u8]) -> Result<(), SnapshotError>;
+}
+
+impl SnapshotWrite for SnapshotTarget {
+    fn replace(&self, contents: &[u8]) -> Result<(), SnapshotError> {
+        SnapshotTarget::replace(self, contents).map(drop)
+    }
+}
+
+/// [`OpStatsFileSink::submit`] の結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FileSubmit {
+    /// 書き込み thread に渡した。
+    Queued,
+    /// 前の書き込みが終わっていないので、この周期は飛ばして数えた。
+    SkippedBusy,
+    /// 書き込み thread が使えない（失敗として数えた）。
+    Unavailable,
+    /// 記録器の符号化に失敗したため、この周期のファイルは書かなかった（失敗として数えた）。
+    EncodeFailed,
+}
+
+/// [`OpStatsFileSink`] の累計（観測用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct OpStatsFileCounts {
+    /// 置き換えに成功した回数。
+    pub written: u64,
+    /// 仕事中のため飛ばした周期の回数。
+    pub skipped_busy: u64,
+    /// サイズ上限超過で書かなかった回数。
+    pub too_large: u64,
+    /// 書き込み失敗（thread 不在・符号化失敗を含む）の回数。
+    pub failed: u64,
+}
+
+#[derive(Default)]
+struct FileCounters {
+    written: AtomicU64,
+    skipped_busy: AtomicU64,
+    too_large: AtomicU64,
+    failed: AtomicU64,
+}
+
+struct FileSinkInner {
+    tx: std::sync::mpsc::SyncSender<Vec<u8>>,
+    busy: AtomicBool,
+    counters: FileCounters,
+    notices: LineSink,
+}
+
+/// 操作統計のスナップショットファイル（`docs/design/cri-op-stats-export.md` 案 C。CRI-6・REPAIR-4・REPAIR-5・SEC-4・#4337）の
+/// 書き込み口。書き込みは専用 OS thread だけが行い、送り手（`op_stats_export_loop_with` の task。current_thread ランタイム上）は
+/// ブロックしない。前の書き込みが終わっていなければその周期は飛ばして数える（同時に抱えるスナップショットは高々 1 つ）。
+///
+/// 失敗（上限超過・書き込み失敗）と飛ばしは黙って捨てず、固定語彙の 1 行（パス・errno・コンテナ ID を含めない）を
+/// `notices`（本番は stderr の [`LineSink`]）へ残す。呼び出し元は `main.rs`（#4340）が `spawn` し、
+/// [`op_stats_export_loop_with`] へ渡す（`--op-stats-file` 指定時のみ。停止時は [`write_final_snapshot`] が最後の 1 回を書く。#4340）。
+#[derive(Clone)]
+pub struct OpStatsFileSink {
+    inner: Arc<FileSinkInner>,
+}
+
+impl OpStatsFileSink {
+    /// `target` へ書く thread を起こす。thread を作れなければ `Err` を返す（呼び出し側は起動を中止する。fail-closed）。
+    pub fn spawn(target: SnapshotTarget, notices: LineSink) -> std::io::Result<Self> {
+        Self::spawn_with(
+            |job| {
+                std::thread::Builder::new()
+                    .name("cri-op-stats-file".into())
+                    .spawn(job)
+                    .map(drop)
+            },
+            Box::new(target),
+            notices,
+        )
+    }
+
+    /// [`Self::spawn`] の本体。thread の生成器と書き込み先を差し替えられる（試験用）。
+    fn spawn_with(
+        start: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+        writer: Box<dyn SnapshotWrite>,
+        notices: LineSink,
+    ) -> std::io::Result<Self> {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
+        let inner = Arc::new(FileSinkInner {
+            tx,
+            busy: AtomicBool::new(false),
+            counters: FileCounters::default(),
+            notices,
+        });
+        // thread は Weak で持つ。送り手が全て落ちると rx が閉じて終わる（join しない）。
+        let weak = Arc::downgrade(&inner);
+        start(Box::new(move || {
+            while let Ok(bytes) = rx.recv() {
+                let result = writer.replace(&bytes);
+                let Some(inner) = weak.upgrade() else { return };
+                match result {
+                    Ok(()) => {
+                        inner.counters.written.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(SnapshotError::TooLarge) => {
+                        let n = inner.counters.too_large.fetch_add(1, Ordering::Relaxed) + 1;
+                        inner.notice_failed(SnapshotError::TooLarge.code(), n);
+                    }
+                    Err(e) => {
+                        let n = inner.counters.failed.fetch_add(1, Ordering::Relaxed) + 1;
+                        inner.notice_failed(e.code(), n);
+                    }
+                }
+                inner.busy.store(false, Ordering::Release);
+            }
+        }))?;
+        Ok(Self { inner })
+    }
+
+    /// スナップショット 1 つを書き込み thread へ渡す。ブロックしない。
+    pub fn submit(&self, snapshot: Vec<u8>) -> FileSubmit {
+        let inner = &self.inner;
+        if inner
+            .busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            let n = inner.counters.skipped_busy.fetch_add(1, Ordering::Relaxed) + 1;
+            inner.notices.submit(format!(
+                "{{\"event\":\"op_stats_file_skipped\",\"outcome\":\"error\",\"reason\":\"busy\",\"count\":{n}}}"
+            ));
+            return FileSubmit::SkippedBusy;
+        }
+        if inner.tx.try_send(snapshot).is_err() {
+            inner.busy.store(false, Ordering::Release);
+            let n = inner.counters.failed.fetch_add(1, Ordering::Relaxed) + 1;
+            inner.notice_failed("writer_unavailable", n);
+            return FileSubmit::Unavailable;
+        }
+        FileSubmit::Queued
+    }
+
+    /// 符号化に失敗してスナップショットを作れなかった周期を失敗として数え、行を残す。
+    fn note_encode_failure(&self) {
+        let n = self.inner.counters.failed.fetch_add(1, Ordering::Relaxed) + 1;
+        self.inner.notice_failed("encode_failed", n);
+    }
+
+    /// 最後の書き出しが期限内に済まなかったことを失敗として数え、固定語彙の行を残す（[`write_final_snapshot`]）。
+    fn note_final_timeout(&self) {
+        let n = self.inner.counters.failed.fetch_add(1, Ordering::Relaxed) + 1;
+        self.inner.notice_failed("final_timeout", n);
+    }
+
+    /// 累計を返す。
+    pub fn counts(&self) -> OpStatsFileCounts {
+        let c = &self.inner.counters;
+        OpStatsFileCounts {
+            written: c.written.load(Ordering::Relaxed),
+            skipped_busy: c.skipped_busy.load(Ordering::Relaxed),
+            too_large: c.too_large.load(Ordering::Relaxed),
+            failed: c.failed.load(Ordering::Relaxed),
+        }
+    }
+
+    /// 書き込みが終わる（仕事中でなくなる）まで最大 `timeout` 待ち、終わったかを返す。
+    /// 停止時の最後の書き出し（#4340）と試験用。書き込みが止まっていても `timeout` で返る。
+    pub fn wait_idle(&self, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while self.inner.busy.load(Ordering::Acquire) {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        true
+    }
+}
+
+impl FileSinkInner {
+    /// 失敗の固定語彙の行を残す。`reason` は固定語彙（`SnapshotError::code()` など）だけを渡す（SEC-4）。
+    fn notice_failed(&self, reason: &str, count: u64) {
+        self.notices.submit(format!(
+            "{{\"event\":\"op_stats_file_failed\",\"outcome\":\"error\",\"reason\":\"{reason}\",\"count\":{count}}}"
+        ));
+    }
+}
+
+/// [`export_cycle`] の結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct OpStatsCycle {
+    /// stderr 側へ積めた行数。
+    pub stderr_lines: usize,
+    /// ファイル sink を渡したときの結果（渡さなければ `None`）。
+    pub file: Option<FileSubmit>,
+}
+
+/// 1 周期分の操作統計を、記録器ごとに 1 回だけ符号化して `stderr` へ行で渡し、`file` があれば
+/// 同じ内容を連結した 1 つのスナップショット（共有 → oci の順。既存の JSON Lines のまま）としてファイル sink へ渡す。
+/// どちらもブロックしない。1 ブロックでも符号化に失敗したら、不完全なスナップショットを出さないためその周期のファイルは書かない。
+pub fn export_cycle(
+    recorders: &[Arc<OpRecorder>],
+    stderr: &LineSink,
+    file: Option<&OpStatsFileSink>,
+) -> OpStatsCycle {
+    let mut snapshot: Vec<u8> = Vec::new();
+    let mut encode_ok = true;
+    let mut stderr_lines = 0;
+    for r in recorders {
+        match encode_block(r) {
+            Some(block) => {
+                stderr_lines += String::from_utf8_lossy(&block)
+                    .lines()
+                    .filter(|l| stderr.submit((*l).to_string()))
+                    .count();
+                snapshot.extend_from_slice(&block);
+            }
+            None => encode_ok = false,
+        }
+    }
+    let file = file.map(|f| {
+        if encode_ok {
+            f.submit(snapshot)
+        } else {
+            f.note_encode_failure();
+            FileSubmit::EncodeFailed
+        }
+    });
+    OpStatsCycle { stderr_lines, file }
+}
+
+/// 記録器 1 つ分のブロック（JSON Lines。`op_stats_meta` 行で終わる）を符号化する。失敗は `None`。
+fn encode_block(recorder: &OpRecorder) -> Option<Vec<u8>> {
+    let mut block: Vec<u8> = Vec::new();
+    recorder.export_json_lines(Some(&mut block)).ok()?;
+    Some(block)
+}
+
+/// 停止時の最後のスナップショットを `budget` 以内で 1 回書く（#4340・CRI-6・REPAIR-4・REPAIR-5）。
+/// `main.rs` が、周期の task を止めランタイムを畳んだ後（周期の送り手がいない状態）に呼ぶ。期限は `budget` 全体で 1 つ:
+/// 書き込み中の分を待つ → ファイル用だけに符号化して渡す（stderr へはブロックを出さない）→ 書き終わるのを待つ。
+/// 期限を超えたら諦めて `final_timeout` の行を残し、停止を続ける（無期限に待たない）。成否は書き込み thread の累計
+/// （[`OpStatsFileCounts::written`]）が増えたかで判定する。
+pub fn write_final_snapshot(
+    recorders: &[Arc<OpRecorder>],
+    file: &OpStatsFileSink,
+    budget: Duration,
+) -> FinalSnapshot {
+    let deadline = std::time::Instant::now() + budget;
+    let remaining = || deadline.saturating_duration_since(std::time::Instant::now());
+    if !file.wait_idle(remaining()) {
+        file.note_final_timeout();
+        return FinalSnapshot::TimedOut;
+    }
+    let mut snapshot: Vec<u8> = Vec::new();
+    for r in recorders {
+        match encode_block(r) {
+            Some(block) => snapshot.extend_from_slice(&block),
+            None => {
+                file.note_encode_failure();
+                return FinalSnapshot::EncodeFailed;
+            }
+        }
+    }
+    let before = file.counts().written;
+    match file.submit(snapshot) {
+        FileSubmit::Queued => {}
+        FileSubmit::EncodeFailed => return FinalSnapshot::EncodeFailed,
+        FileSubmit::Unavailable => return FinalSnapshot::Failed,
+        // 直前に空きを確認済みのため通常は起きない。起きたら書けていないので諦めた扱いにする。
+        FileSubmit::SkippedBusy => {
+            file.note_final_timeout();
+            return FinalSnapshot::TimedOut;
+        }
+    }
+    if !file.wait_idle(remaining()) {
+        file.note_final_timeout();
+        return FinalSnapshot::TimedOut;
+    }
+    if file.counts().written > before {
+        FinalSnapshot::Written
+    } else {
+        FinalSnapshot::Failed
+    }
 }
 
 /// `period` ごとに操作統計を stderr 書き出し口へ渡し続ける（呼び出し側が abort して止める）。
@@ -356,11 +745,26 @@ pub async fn op_stats_export_loop(recorder: Arc<OpRecorder>, period: Duration) {
 /// [`op_stats_export_loop`] の複数記録器版。1 周期に記録器の数だけブロック（`op_stats_meta` 行も同数）が出る
 /// （本番は共有・oci 専用の順。#2900）。
 pub async fn op_stats_export_loop_many(recorders: Vec<Arc<OpRecorder>>, period: Duration) {
+    op_stats_export_loop_with(recorders, period, stderr_sink().clone(), None).await;
+}
+
+/// [`op_stats_export_loop_many`] の出力先を差し替えられる版。`file` が `Some` なら、同じ周期の内容をスナップショットファイルへも
+/// 渡す（#4337）。`None` の挙動は `op_stats_export_loop_many` と同じ。`main.rs`（#4340）は、`--op-stats-file` が
+/// 有効なときに [`spawn_op_stats_file_sink`] した sink をここへ渡す。
+pub async fn op_stats_export_loop_with(
+    recorders: Vec<Arc<OpRecorder>>,
+    period: Duration,
+    stderr: LineSink,
+    file: Option<OpStatsFileSink>,
+) {
     loop {
         tokio::time::sleep(period).await;
-        export_many_to(&recorders, stderr_sink());
+        export_cycle(&recorders, &stderr, file.as_ref());
     }
 }
+
+#[cfg(test)]
+mod op_stats_file_tests;
 
 #[cfg(test)]
 mod tests {

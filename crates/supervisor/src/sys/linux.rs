@@ -266,6 +266,7 @@ mod syscall_ffi {
     /// `siginfo_t` を受ける領域の大きさ（カーネル ABI で 128 バイト固定。中身は読まない）。
     pub(super) const SIGINFO_BYTES: usize = 128;
     /// include/uapi/linux/prctl.h の値。prctl は可変長部を `unsigned long` で渡すため LP64 限定（#3202）。
+    pub(super) const PR_GET_DUMPABLE: i32 = 3;
     pub(super) const PR_SET_DUMPABLE: i32 = 4;
     pub(super) const PR_GET_KEEPCAPS: i32 = 7;
     pub(super) const PR_SET_KEEPCAPS: i32 = 8;
@@ -343,6 +344,16 @@ mod syscall_ffi {
         // SAFETY: 引数は整数のみでポインタを渡さない。影響は呼び出しプロセスの dumpable 属性のみ。
         let rc = unsafe { prctl(PR_SET_DUMPABLE, u64::from(on), 0u64, 0u64, 0u64) };
         check(i64::from(rc)).map(|_| ())
+    }
+
+    /// `PR_GET_DUMPABLE` で自プロセスの dumpable 属性を読む（`true` は 1〈SUID_DUMP_USER〉。0 と 2 は `false`）。
+    ///
+    /// pod の保持役（`pod_holder`。#2874・SEC-5）が、再 exec で dumpable が 1 に戻った後に
+    /// `set_dumpable(false)` が効いていることを fail-closed で確かめるために使う。
+    pub(crate) fn get_dumpable() -> io::Result<bool> {
+        // SAFETY: 引数は整数のみでポインタを渡さない。読み取りだけで状態を変えない。
+        let rc = unsafe { prctl(PR_GET_DUMPABLE, 0u64, 0u64, 0u64, 0u64) };
+        Ok(check(i64::from(rc))? == 1)
     }
 
     /// `capget(2)` / `capset(2)` のヘッダ（`struct __user_cap_header_struct`）。
@@ -545,6 +556,10 @@ mod syscall_ffi {
         Err(unsupported())
     }
 
+    pub(crate) fn get_dumpable() -> io::Result<bool> {
+        Err(unsupported())
+    }
+
     pub(crate) fn execveat_fd(_fd: i32, _argv: &[CString], _envp: &[CString]) -> io::Result<()> {
         Err(unsupported())
     }
@@ -569,7 +584,7 @@ mod syscall_ffi {
 use syscall_ffi::*;
 pub(crate) use syscall_ffi::{
     cap_ambient_clear_all, cap_ambient_raise, cap_bounding_drop, cap_set_thread, close_fds_from,
-    execveat_fd, get_keep_caps, has_any_child, set_dumpable, set_keep_caps,
+    execveat_fd, get_dumpable, get_keep_caps, has_any_child, set_dumpable, set_keep_caps,
 };
 
 /// `close_range` が無いカーネル向けの代替。`/proc/self/fd` の列挙を先に集めてから閉じる（列挙中の fd を閉じない）。
@@ -1436,6 +1451,7 @@ mod libc_abi {
         assert!(EOPNOTSUPP == libc::EOPNOTSUPP);
         assert!(ERANGE == libc::ERANGE);
         // prctl。
+        assert!(PR_GET_DUMPABLE == libc::PR_GET_DUMPABLE);
         assert!(PR_SET_DUMPABLE == libc::PR_SET_DUMPABLE);
         assert!(PR_GET_KEEPCAPS == libc::PR_GET_KEEPCAPS);
         assert!(PR_SET_KEEPCAPS == libc::PR_SET_KEEPCAPS);
@@ -2069,6 +2085,7 @@ mod tests {
     /// SUP-14・TASK-171 追補(#1719): execveat / close_range / dumpable の番号と値を固定する。
     #[test]
     fn sup14_task1719_launcher_constants_are_fixed() {
+        assert_eq!(PR_GET_DUMPABLE, 3);
         assert_eq!(PR_SET_DUMPABLE, 4);
         assert_eq!(F_GETFD, 1);
     }

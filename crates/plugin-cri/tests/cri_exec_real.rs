@@ -18,6 +18,7 @@
 //!
 //!
 //! 失敗後の残骸の回収（#4142）: 本体を 2 回走らせる（1 回目は StartContainer の直後に注入した失敗、回収、2 回目は同じ metadata で通す）。
+//! 注入では plugin-cri を SIGKILL してから panic させ、外側の回収が死活を判定して起動し直して回収する（#4326。共有部品 `reclaim_restarting`）。
 //! 回収の部品は `support/cri_real_reclaim.rs`（トークンのラベルと台帳の ID だけを期限つきで Stop / Remove する）。
 //!
 //! ハーネス（TempDir・ChildGuard・接続待ち・pull の失敗行）は `container_grpc.rs` の段 C と同じものを最小化して複製した
@@ -490,6 +491,22 @@ fn lock_srv(srv: &SharedSrv) -> std::sync::MutexGuard<'_, Srv> {
     srv.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// 外側の回収が呼ぶ起動し直し（#4326）。旧 plugin-cri を kill・回収して `.cri/@instance.lock` を解放してから、
+/// `sock` で起動し直して接続し、共有の `srv` を差し替えて新しい client を返す。`srv` の lock は await をまたがない。
+async fn restart_plugin(srv: &SharedSrv, bin: &Path, sock: &Path) -> RuntimeServiceClient<Channel> {
+    kill_and_reap(&mut lock_srv(srv).guard);
+    let mut guard = spawn_server_inherit_env(bin, sock);
+    let config = GrpcClientConfig::new()
+        .with_request_timeout(Duration::from_secs(600))
+        .expect("request timeout");
+    let ch = connect_when_ready_with(sock, &mut guard, config).await;
+    *lock_srv(srv) = Srv {
+        guard,
+        ch: ch.clone(),
+    };
+    RuntimeServiceClient::new(ch)
+}
+
 /// 試験本体（sandbox の作成から exec の照合・後始末まで）。`inject` が真なら StartContainer と Running の確認の直後に
 /// 固定文言で panic する（失敗後の回収の自己照合。#4142）。作った ID は台帳へ登録し、Remove が成功したら外す。
 async fn scenario(
@@ -578,6 +595,8 @@ async fn scenario(
     .expect("status body");
     assert_eq!(st.state, cri::ContainerState::ContainerRunning as i32);
     if inject {
+        // plugin-cri が予期せず死んだ場面を作る（#4326）。外側の回収が起動し直して回収する。
+        kill_and_reap(&mut lock_srv(&srv).guard);
         panic!("{}", reclaim::injected_message(TEST));
     }
 
@@ -805,6 +824,8 @@ async fn production_binary_exec_real() {
             ch: ch.clone(),
         }));
         let sock2 = dir.0.join("b.sock");
+        let r1_sock = dir.0.join("r1.sock");
+        let r2_sock = dir.0.join("r2.sock");
 
         if let Err(st) = pull_image_raw(&mut images, IMAGE, PULL_DEADLINE).await {
             let line = pull_failure_line(&st);
@@ -816,6 +837,8 @@ async fn production_binary_exec_real() {
         let ledger = reclaim::Ledger::default();
 
         // 試行 1（注入）: StartContainer の直後に固定文言で panic させ、回収が効くことを確かめる。
+        // 試行 1 が確保するのは自分の回収（再起動を含め 2 回）分だけにする。試行 2 の分は試行 2 の直前に
+        // 経過を差し引いて確保するため、ここで先取りすると pull が長引いたときに注入の期限が 0 になる。
         let b1 = reclaim::scenario_budget(started.elapsed(), WATCHDOG, 2)
             .min(reclaim::INJECT_ATTEMPT_LIMIT);
         let r1 = reclaim::guarded(
@@ -831,8 +854,16 @@ async fn production_binary_exec_real() {
             b1,
         )
         .await;
-        let rep1 = reclaim::reclaim(&mut c, &ledger, &token, reclaim::CLEANUP_BUDGET).await;
-        if let Some(line) = reclaim::left_line(TEST, &rep1) {
+        let rr1 = reclaim::reclaim_restarting(
+            &mut c,
+            &ledger,
+            &token,
+            || lock_srv(&srv).guard.exited().is_some(),
+            async || restart_plugin(&srv, &plugin_bin, &r1_sock).await,
+        )
+        .await;
+        let rep1 = rr1.final_report();
+        if let Some(line) = reclaim::left_line(TEST, rep1) {
             eprintln!("{line}");
         }
         match r1 {
@@ -844,9 +875,12 @@ async fn production_binary_exec_real() {
             }
             Ok(()) => panic!("{TEST}: injected attempt did not fail"),
         }
-        assert_eq!(rep1.reclaimed_containers.len(), 1, "{rep1:?}");
-        assert_eq!(rep1.reclaimed_sandboxes.len(), 1, "{rep1:?}");
-        assert!(rep1.is_clean(), "{rep1:?}");
+        // 注入で plugin-cri が死んでいるので、起動し直して回収したことを具体値で照合する（#4326）。
+        assert!(rr1.restarted(), "{rr1:?}");
+        assert!(reclaim::plugin_unreachable(&rr1.first), "{rr1:?}");
+        assert_eq!(rep1.reclaimed_containers.len(), 1, "{rr1:?}");
+        assert_eq!(rep1.reclaimed_sandboxes.len(), 1, "{rr1:?}");
+        assert!(rep1.is_clean(), "{rr1:?}");
         let old_c = rep1.reclaimed_containers[0].clone();
         let old_s = rep1.reclaimed_sandboxes[0].clone();
         let st = call_with_deadline(
@@ -869,38 +903,68 @@ async fn production_binary_exec_real() {
         .await
         .expect_err("reclaimed sandbox must be gone");
         assert_eq!(st.code(), PluginErrorCode::NotFound);
+        let want =
+            format!("{TEST}: plugin restarted for reclaim reclaimed containers=1 sandboxes=1");
+        assert_eq!(
+            reclaim::restart_reclaim_line(TEST, &rr1),
+            Some(want.clone())
+        );
+        // `std::io::stderr()` への直接書き込みは libtest の出力捕捉（`print!` / `eprintln!` 系のみが対象）を受けないため、
+        // `--nocapture` なしの CI でも `--require` で照合できる。
+        {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "{want}");
+        }
         eprintln!("{TEST}: injected failure reclaimed containers=1 sandboxes=1");
 
         // 試行 2（本番）: 同じトークン（同じ metadata）で最後まで通す。回収が効いていなければ ALREADY_EXISTS で落ちる。
-        let b2 = reclaim::scenario_budget(started.elapsed(), WATCHDOG, 1);
-        let r2 = reclaim::guarded(
-            scenario(
-                c.clone(),
-                token.clone(),
-                ledger.clone(),
-                false,
-                srv.clone(),
-                plugin_bin.clone(),
-                sock2.clone(),
-            ),
-            b2,
+        // 残りが試行 2 に足りなければ始めず、回収（予約済み）を先に走らせて期限超過で失敗させる。
+        let r2 = match reclaim::attempt2_budget(started.elapsed(), WATCHDOG, STARTUP_DEADLINE) {
+            Some(b2) => {
+                reclaim::guarded(
+                    scenario(
+                        c.clone(),
+                        token.clone(),
+                        ledger.clone(),
+                        false,
+                        srv.clone(),
+                        plugin_bin.clone(),
+                        sock2.clone(),
+                    ),
+                    b2,
+                )
+                .await
+            }
+            None => Err(reclaim::AttemptFailure::Deadline),
+        };
+        // 段 4 の後は plugin-cri が再起動済みなので、回収は共有の入れ物の最新の接続で行う（死んでいれば起動し直す。#4326）。
+        let mut c = RuntimeServiceClient::new(lock_srv(&srv).ch.clone());
+        let rr2 = reclaim::reclaim_restarting(
+            &mut c,
+            &ledger,
+            &token,
+            || lock_srv(&srv).guard.exited().is_some(),
+            async || restart_plugin(&srv, &plugin_bin, &r2_sock).await,
         )
         .await;
-        // 段 4 の後は plugin-cri が再起動済みなので、回収は共有の入れ物の最新の接続で行う。
-        let mut c = RuntimeServiceClient::new(lock_srv(&srv).ch.clone());
-        let rep2 = reclaim::reclaim(&mut c, &ledger, &token, reclaim::CLEANUP_BUDGET).await;
-        if let Some(line) = reclaim::left_line(TEST, &rep2) {
+        let rep2 = rr2.final_report();
+        if let Some(line) = reclaim::left_line(TEST, rep2) {
             eprintln!("{line}");
         }
         match r2 {
-            Ok(()) => {}
+            // 成功時だけ「plugin が生きたまま」を確かめる。失敗・期限切れの回は起動し直しが正当なので、
+            // 先に下の失敗の報告（deadline 等）を出す。
+            Ok(()) => assert!(
+                !rr2.restarted(),
+                "plugin must be alive after scenario: {rr2:?}"
+            ),
             Err(reclaim::AttemptFailure::Panicked(p)) => std::panic::resume_unwind(p),
             Err(reclaim::AttemptFailure::Deadline) => {
                 panic!("{TEST}: scenario deadline exceeded")
             }
         }
         assert_eq!(
-            rep2,
+            *rep2,
             reclaim::ReclaimReport {
                 token: token.clone(),
                 ..reclaim::ReclaimReport::default()

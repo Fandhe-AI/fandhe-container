@@ -22,6 +22,7 @@
 //! （bundle の供給は [`BundleProvider`] の注入点だけを定義し、config 変換と bundle の寿命は `crate::bundle`）。
 
 use std::fmt;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -318,6 +319,7 @@ impl<'a> BundleRequest<'a> {
 /// エラー文言に config の値・パスを含めないこと。
 pub trait PodNetworkProvider: Send + Sync {
     /// サンドボックスの netns を作って結線し、そのパスを返す。失敗時は資源を残さない（残るなら `Err` で報告）。
+    /// 割り当てた IP は [`PodNetns::with_ips`] で報告できる。報告しなければ Status の network は空（CRI-2・NET-3）。
     fn set_up(&self, req: &PodNetworkRequest<'_>) -> Result<PodNetns, CriError>;
 
     /// `set_up` で用意した資源を解放する。冪等で、未知の ID・不在は `Ok`。失敗は資源が残るとみなされる。
@@ -361,11 +363,42 @@ impl<'a> PodNetworkRequest<'a> {
 
 /// [`PodNetworkProvider::set_up`] の結果（結線済みの pod network namespace）。
 ///
-/// 将来の項目（IP の報告等）の追加に備えて `#[non_exhaustive]` とし、[`PodNetns::new`] で作る。
+/// 将来の項目の追加に備えて `#[non_exhaustive]` とし、[`PodNetns::new`] で作る。
+///
+/// IP は provider が [`PodNetns::with_ips`] で報告した値だけを保持し、`PodSandboxStatus.network` へそのまま返す
+/// （サブネットのリース等からの推測はしない。無報告なら Status の network は空。CRI-2・NET-3・REPAIR-3）。
+/// provider は plugin 側の実装で untrusted のため、`with_ips` が型（`IpAddr`）・範囲・重複・件数を検証する（SEC-1）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct PodNetns {
     path: PathBuf,
+    ip: Option<IpAddr>,
+    additional_ips: Vec<IpAddr>,
+}
+
+/// 追加 IP の保持件数の上限。メモリの有界化のための値で、Kubernetes の意味論ではない（件数は取り込み前に検査する）。
+pub const MAX_POD_ADDITIONAL_IPS: usize = 8;
+
+/// IPv4 射影形を IPv4 に寄せ、pod の IP になり得ない範囲を拒否する（`port_mapping` の host_ip と同じ IPv4 範囲）。
+fn canonical_pod_ip(ip: IpAddr) -> Result<IpAddr, CriError> {
+    let ip = ip.to_canonical();
+    let bad = match ip {
+        IpAddr::V4(v4) => {
+            // 添字アクセスを避け、分配束縛で先頭オクテットを取り出す。
+            let [first, ..] = v4.octets();
+            v4.is_unspecified()
+                || v4.is_loopback()
+                || first == 0
+                || v4.is_multicast()
+                || first >= 240
+        }
+        IpAddr::V6(v6) => v6.is_unspecified() || v6.is_loopback() || v6.is_multicast(),
+    };
+    if bad {
+        Err(CriError::internal("invalid pod ip report"))
+    } else {
+        Ok(ip)
+    }
 }
 
 impl PodNetns {
@@ -378,7 +411,11 @@ impl PodNetns {
             .to_str()
             .is_some_and(|s| crate::bundle::spec::check_host_source("pod netns path", s).is_ok());
         if ok {
-            Ok(Self { path })
+            Ok(Self {
+                path,
+                ip: None,
+                additional_ips: Vec::new(),
+            })
         } else {
             Err(CriError::internal("invalid pod network namespace path"))
         }
@@ -387,6 +424,38 @@ impl PodNetns {
     /// netns のパス。
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// provider が割り当てた IP（主 IP と追加 IP）の報告を足す（CRI-2・NET-3）。
+    ///
+    /// 射影形（`::ffff:a.b.c.d`）は IPv4 に正規化する。未指定・loopback・multicast（IPv4 は加えて 0/8・240/4）、
+    /// 追加 IP 同士および主 IP との重複、[`MAX_POD_ADDITIONAL_IPS`] 超過は `INTERNAL`（文言は固定で値を含めない）。
+    pub fn with_ips(mut self, ip: IpAddr, additional: Vec<IpAddr>) -> Result<Self, CriError> {
+        if additional.len() > MAX_POD_ADDITIONAL_IPS {
+            return Err(CriError::internal("invalid pod ip report"));
+        }
+        let primary = canonical_pod_ip(ip)?;
+        let mut extra: Vec<IpAddr> = Vec::with_capacity(additional.len());
+        for a in additional {
+            let a = canonical_pod_ip(a)?;
+            if a == primary || extra.contains(&a) {
+                return Err(CriError::internal("invalid pod ip report"));
+            }
+            extra.push(a);
+        }
+        self.ip = Some(primary);
+        self.additional_ips = extra;
+        Ok(self)
+    }
+
+    /// 報告された主 IP。無報告なら `None`。
+    pub fn ip(&self) -> Option<IpAddr> {
+        self.ip
+    }
+
+    /// 報告された追加 IP（主 IP を含まない）。
+    pub fn additional_ips(&self) -> &[IpAddr] {
+        &self.additional_ips
     }
 }
 

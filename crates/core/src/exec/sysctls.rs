@@ -8,7 +8,8 @@
 //! IPC namespace（`current->nsproxy`）に効くので、子が新しい IPC namespace に入った後なら、書かれるのはコンテナ側の値で
 //! ホストの値は変わらない。pod の user・ipc namespace へ join する起動（`oci_runtime::NamespaceJoin`。#2674）では、
 //! 中間プロセスが join した後に子がこの段を通るため、書かれるのは共有された pod の IPC namespace の値になる（join 先は
-//! 自身の子の user namespace が所有するものに限られ、ホストの IPC namespace ではない）。
+//! 自身の子の user namespace が所有するものに限られ、ホストの IPC namespace ではない）。pod の netns も join する起動
+//! （#2872）では `net.*` の書き込み先も共有された pod の netns になる（join 先は pod の user namespace 所有の netns に限る）。
 //!
 //! ```text
 //! prepare_rootfs -> verify_pinned -> apply_sysctls(&isolation, &prepared, &plan) -> mount_sysfs

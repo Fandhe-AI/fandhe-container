@@ -5,7 +5,7 @@
 ## 背景
 
 - cri は pod の ipc 共有を bundle へ変換できる（#2674）。パスは `PodNamespacePaths::for_holder_pid`（`/proc/<pid>/ns/{user,ipc}` だけ。#2776）でしか作れないが、供給元の保持役が無い。このため `CriRuntimeService::create_container_runtime` は `with_pod_namespaces` を渡さず、本番の pod のコンテナは常に新しい namespace で起動する
-- pod の netns は `PodNetworkProvider`（cri）と plugin-cri の `NetsetupPodNetwork`（bridge・veth。rootful 前提）まで実装済み（#2675・#2676）。ただし本番へは未注入で、core の `NamespaceJoin` は network の path を `Unimplemented` で拒否し、`PodSandboxStatus.network` は空のスタブ
+- pod の netns は `PodNetworkProvider`（cri）と plugin-cri の `NetsetupPodNetwork`（bridge・veth。rootful 前提）まで実装済み（#2675・#2676）。ただし本番へは未注入で、core の `NamespaceJoin` は network の path を `Unimplemented` で拒否し、`PodSandboxStatus.network` は provider の報告だけを返す経路が実装済み（#2873）だが、provider 未注入のため実際には空
 - plugin-cri の本番は rootless（uid 0 は `UNIMPLEMENTED`。#2442・#2241）。bridge・veth は作れず、rootless の netns は pasta 構成（NET-9。#1935・#341）の領域
 - 受け入れ方式の現状は [cri-config-acceptance.md](cri-config-acceptance.md) の順 12〜14
 
@@ -51,6 +51,7 @@
 
 - 保持役は user → ipc → net の順に作り、netns は pod の userns が所有する
 - core の `NamespaceJoin` を拡張し、user＋ipc に加えて任意で net を受ける。net の所有 userns（`NS_GET_USERNS`）が join する user と同じであることを照合し、`setns` は user → ipc → net → 残りの `unshare` の順にする。net 単独の path・user が無い path は従来どおり `Unimplemented`
+- 実装済み（H7・#2872）: `paths_of` は user＋ipc の組に net を足す形だけを受け、`pin` は net の所有 userns を照合する（呼び出し側自身または外側の所有は `Unimplemented`〔`pod_join_net_not_pod_owned`〕、別の userns 所有は `PermissionDenied`〔`pod_join_net_owner_mismatch`〕）。`EffectiveNetwork::PodJoined` を足し、exec 直前の netns 素性の同期点（D8）にも通す（pin 時に固定した netns の素性との一致を期待する。`FromConfig` の CRI の経路のうち join する起動だけ）。受理と拒否は層 `pod_namespace_join` の監査に残す（SEC-4）
 - 現行の注記（netns を userns より先に `setns` する順序）は、userns が所有する netns では問題にならない。user の後に net へ入れる
 - rootful の init userns 所有の netns（bridge・veth の `NetsetupPodNetwork`）は、#2241 の判断まで `Unimplemented` のまま
 - cri: `PodNamespacePaths` に net（同じ pid の `/proc/<pid>/ns/net`）を足す。構築口は `for_holder_pid` のまま。`namespace_options.network` が `POD` で保持役があれば bundle の network に保持役の path を出す
@@ -68,6 +69,7 @@
 - 新しい netns の `lo` は down で、join だけでは localhost 通信が成立しない（`crates/net/tests/lo_self_delivery.rs` が前提を固定。NET-2・NET-11）。provider の有無に依らず localhost を共有するため、`lo` を up にする責務は provider ではなく保持役に置く
 - 保持役は pod の userns が所有する netns の中で（userns 内の `CAP_NET_ADMIN` で）、READY を返す前に `lo` を up にする。失敗したら READY を返さず固定文言のエラーで終了し、Run は保持役を回収して失敗する（fail-closed）。provider が結線する場合も `lo` は既に up で、provider は触らない
 - 実装単位は H2（#2874）に含める（`lo` の up の実装と、provider が無い `POD` で pod 内の 2 コンテナが `127.0.0.1` で通信できる実機試験。H3 #2875 が CI へ組み込む）。H7（#2872）は join の受け口のみ。新規 issue の起票が要る場合は承認事項として報告する
+- 実装の現況（H2・#2874）: `lo` の up は H1 の `establish_pod_namespaces`（#2870）が netns の作成直後に行う（失敗したらエラー）ため、`pod-holder` モードは重ねて up にせず、保持役の netns の中で `127.0.0.1` が使えることを実機試験で確かめる（`pod_holder_bin_real` のシナリオ B。保持役の netns へ `nsenter` で入った 2 つのプロセスが TCP で往復する）。コンテナを使った「pod 内の 2 コンテナ」の試験は core の net join（H7・#2872）が要るため、H7 の後に H3（#2875）か H5 で扱う
 
 ## PodSandboxStatus.network の IP 報告
 
@@ -94,8 +96,27 @@
 ## オーナー判断（2026-11-09）
 
 1. 保持役の dumpable の扱い: 案 (a)（`unshare(USER)` の後に自身を再 exec して non-dumpable を保つ）を作業仮説とする。確定は H2（#2874）の受け入れ条件で、カーネルの一次情報（tag・commit を固定した `fs/proc/namespaces.c`・`kernel/ptrace.c`）と実機（ubuntu CI の `--ignored`）で行い、それまでは未確定として扱う。背景は、`/proc/<pid>/ns/*` の open が `PTRACE_MODE_READ_FSCREDS` を要し、non-dumpable の保持役が exec 後に `unshare` すると同じ uid の core から開けない恐れがあること。確定前の代替は案 (b)（dumpable にして fd・秘密を一切持たない）
+
 2. provider が無い `POD`: 保持役の netns（`lo` のみ。保持役が up にする。H2・#2874）へ join し、pod 内で localhost を共有する（Kubernetes の意味論。core の net の join〔H7・#2872〕が入った後）。`NetworkReady=false` は維持する
 3. 本番の pasta provider: #340 の決定（利用者が導入した pasta を exec）で決着した。H10（#2879）は #341 待ちのまま。依存（crate）の追加は伴わない
+
+### 脚注: 案 (a) の根拠と確認結果（H2・#2874）
+
+一次情報（Linux v6.12 の tag。`gh api repos/torvalds/linux/contents/<path>?ref=v6.12` で確認）:
+
+- `fs/proc/namespaces.c` の `proc_ns_get_link`（58 行）・`proc_ns_readlink`（83 行）は `ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS)` を求める
+- `kernel/ptrace.c` の `__ptrace_may_access`（276 行）は、uid が同じなら資格情報の検査を通した後（324 行は `ptrace_has_cap(tcred->user_ns, mode)`）、`get_dumpable(mm) != SUID_DUMP_USER` かつ `!ptrace_has_cap(mm->user_ns, mode)` なら拒否する（342〜343 行）
+- `mm->user_ns` は `mm_alloc` → `mm_init(mm, current, current_user_ns())`（`kernel/fork.c` 1336 行）で exec 時の user namespace に決まる（`fs/exec.c` 383 行の `bprm_mm_init`）。exec は dumpable を `SUID_DUMP_USER` に戻す（`fs/exec.c` 1342〜1347 行）。実行ファイルが読めないと `would_dump` が `BINPRM_FLAGS_ENFORCE_NONDUMP` を立てる（1411 行）ため、bin は利用者に読める必要がある（インストールスクリプトは 0755）
+
+したがって、`unshare(USER)` の後に再 exec しないと `mm->user_ns` は初期 namespace のままで、同じ uid の core・plugin-cri は `CAP_SYS_PTRACE` が無く開けない。再 exec すると `mm->user_ns` が pod の user namespace になり、その作成者（親 namespace で euid が owner）は全 capability を持つので開ける。案 (a) の手順は `crates/supervisor/src/pod_holder/holder.rs` の module doc を参照。
+
+実機での確認（`crates/supervisor/tests/pod_holder_bin_real.rs` のシナリオ E）:
+
+- 陰性対照（再 exec しない non-dumpable の保持役相当）では、親が `/proc/<pid>/ns/net` を開けず `PermissionDenied` になる
+- 案 (a) の保持役では、親が `ns/net`・`ns/ipc`・`ns/user`・`environ` を開ける。pod の user namespace の中で capability を持たないプロセスは `environ` を開けない（non-dumpable の効果）。同じプロセスが `ns/net` は開けた（Linux 7.0.0-34-generic の実測。ns リンクの扱いはカーネルの版で異なり得るため、non-dumpable の判別には `environ` を使い、ns リンクの拒否は assert しない）
+- 保持役自身が READY の前に `PR_GET_DUMPABLE == 0` を確かめる（fail-closed）
+- 守れないもの: 親 namespace の同じ uid からの ptrace は non-dumpable でも防げない（設計上の前提）。exec から `PR_SET_DUMPABLE 0` までの短い窓があるが、その間の保持役は秘密を持たない（env は空、argv は namespace の番号だけ）
+- 実行記録: ローカル（Linux 7.0.0-34-generic、`kernel.apparmor_restrict_unprivileged_userns=1`、subuid の範囲写像）で 6 シナリオが通った。ubuntu CI の `--ignored` での確認は H3（#2875）で CI に組み込んだ後に行う（それまで CI での確定は未了）
 
 ## 実装単位
 
@@ -104,7 +125,7 @@
 | 記号 | issue | 内容 | 担当 | 依存 |
 | ---- | ----- | ---- | ---- | ---- |
 | H1 | #2870 | core: 保持役の namespace 確立 API | runtime-builder | なし |
-| H2 | #2874 | supervisor: `pod-holder` モード（netns 内の `lo` の up を含む） | runtime-builder | H1 |
+| H2 | #2874 | supervisor: `pod-holder` モード（`lo` の up は H1 の API が実施済み。確認のみ） | runtime-builder | H1 |
 | H3 | #2875 | ci: 実機前提試験の組み込み | infra-builder | H2・H7 |
 | H4 | #2871 | cri: 保持役の注入点と sandbox 記録への pid の保持 | oci-cri-builder | なし |
 | H5 | #2876 | cri: `with_pod_namespaces` の配線と pod A/B の結合試験 | oci-cri-builder | H4 |

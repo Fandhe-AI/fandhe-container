@@ -57,10 +57,10 @@ CLI を使う手順では plugin-cri と同じ状態ルートを指すこと（`
 
   ```sh
   [ -f <名前> ] && [ ! -L <名前> ] && timeout 5 head -c 256 -- <名前> \
-    | LC_ALL=C grep -a -x -m 3 -E 'fandhe-cri-(sandbox|container)-record v1|id=[0-9a-f]{64}|pod_sandbox_id=[0-9a-f]{64}'
+    | LC_ALL=C grep -a -x -m 3 -E 'fandhe-cri-(sandbox-record v1|container-record v[12])|id=[0-9a-f]{64}|pod_sandbox_id=[0-9a-f]{64}'
   ```
 
-  何も出ない、または 1 行目の版・2 行目の `id=` が揃わない記録はヘッダ不正として扱い、内容は表示しない。見るのは、1 行目が `fandhe-cri-sandbox-record v1` または `fandhe-cri-container-record v1` か、`id=` がファイル名と一致するか、コンテナの `pod_sandbox_id=` の sandbox に `sandboxes/<その ID>.rec` があるか（無い、または壊れていれば `parentless`）。通常ファイル以外（FIFO・symlink・ディレクトリ）は開かない
+  何も出ない、または 1 行目の版・2 行目の `id=` が揃わない記録はヘッダ不正として扱い、内容は表示しない。見るのは、1 行目が `fandhe-cri-sandbox-record v1` または `fandhe-cri-container-record v1`（旧版）・`fandhe-cri-container-record v2` か、`id=` がファイル名と一致するか、コンテナの `pod_sandbox_id=` の sandbox に `sandboxes/<その ID>.rec` があるか（無い、または壊れていれば `parentless`）。通常ファイル以外（FIFO・symlink・ディレクトリ）は開かない
 - 再採用の有無: plugin-cri が動いている間の `crictl pods -q --no-trunc` と `crictl ps -a -q --no-trunc` の ID を控え、どちらにも出ない `.rec` を候補にする
 - ヘッダが正しく config 部だけが壊れた `malformed` は手では判定できない。上の条件の消去法で候補とし、既定では残す
 

@@ -41,7 +41,7 @@ use std::os::fd::AsFd as _;
 
 use super::SubordinateIdSource;
 use super::launcher::{SubordinateIds, resolve_privilege};
-use super::namespace_join::identity;
+use super::namespace_join::identity_plain as identity;
 use crate::exec::{
     IdMapping, IsolationConfig, IsolationPrivilege, Namespace, NamespaceSet, plan,
     plan_rootless_subordinate,

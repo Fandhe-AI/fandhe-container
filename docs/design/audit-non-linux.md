@@ -7,7 +7,7 @@
 - 対象ビヘイビア: SEC-4（関連: REPAIR-3・REPAIR-5・CLI-1・OCI-5・WIN-1・MAC-4・PLUG-11）
 - タスク: TASK-41 追補、#2430（親 #2247）
 - 作成日: 2026-10-20
-- 関連: #2018（配送経路の方式採用。[audit-delivery.md](audit-delivery.md)）・#2429（macOS の主経路）・#2428（Windows の `FileStateStore` の実装方式）・#2459（#2428 の判断資料）・#1415 / #1539（Windows 構成 C）・#2027（縮退の扱い）
+- 関連: #2018（配送経路の方式採用。[audit-delivery.md](audit-delivery.md)）・#2429（macOS の主経路）・#2428（Windows の `FileStateStore` は案 C で恒久拒否に決定・2026-11-09）・#2459（#2428 の判断資料）・#1415 / #1539（Windows 構成 C）・#2027（縮退の扱い）
 - 出典: SSOT は `docs/spec` の `04-behavior/`（SEC-4 ほか）。本書は ID で参照し、長い引用はしない
 
 ## 1. 背景と現状
@@ -25,7 +25,7 @@
 | Linux | 同一ホストの seccomp・Landlock | 実装済み・一部未着手（audit-delivery.md） |
 | macOS ホスト | ホスト側の層（plugin の信頼性検証・CLI）のみ | `FileStateStore` は通り（#2247）、主経路は実装済み（#2429）で成功すれば記録される。代替経路は無く、主経路が失敗すれば `SinkFailed` |
 | macOS ゲスト VM | ゲストの Linux 内（seccomp・Landlock） | 本書の論点外（9 章） |
-| Windows ホスト | ホスト側の層のみ（構成 C ではゲスト内の core が分離を担う。#1415・#1539） | `FileStateStore::open` が `Unimplemented`（#2428）で構築入口も fail-closed |
+| Windows ホスト | ホスト側の層のみ（構成 C ではゲスト内の core が分離を担う。#1415・#1539） | `FileStateStore::open` が設計上の拒否 `FailedPrecondition`（#2428 の案 C・#4332）で構築入口も fail-closed |
 | WSL2 ゲスト | ゲスト内の Linux | Linux の実装がそのまま動く |
 
 どの案でも、記録できないときに拒否が許可へ倒れない（`SinkFailed` で拒否を保つ。fail-closed）ことを前提とする。

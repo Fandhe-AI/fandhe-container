@@ -287,6 +287,7 @@ microVM の OS ごとのバックエンド（KVM・Hypervisor.framework・WHP）
 | CRI-8 | オーケストレーション本体（スケジューラ・マルチノード調整）は MVP 対象外とし、4 つの拡張点トレイトの設計のみを MVP に含める | `api-cri.md` | [orchestration-scope.md](design/orchestration-scope.md)（TASK-5・#20） |
 | WIN-6 | Windows ネイティブコンテナは MVP の射程外。Hyper-V 直接方式は将来の強分離オプションとして設計上残す | `api-platform-windows.md` | 本書「Windows ネイティブコンテナ・Hyper-V 直接方式の MVP スコープ（WIN-6）」節を参照 |
 | MAC-4 | 既定は常駐 VM＋軽量プロセス分離とし、1 コンテナ = 1 VM はオプション扱いとする | `api-platform-macos.md` | [macos-shared-vm.md](design/macos-shared-vm.md)（TASK-191 の未決事項の設計案。承認待ち #1906）・[macos-vm-strategy.md](design/macos-vm-strategy.md)（TASK-66・#369。#370〔TASK-66.h1〕で確認済み・2026-10-12。既定方式の実装は TASK-191〔#1905・#1906〕） |
+| OCI-5・SEC-4・WIN-1 の Windows ホストの `FileStateStore` | Windows ホストでは設計上恒久的に拒否する（案 C。2026-11-09 のオーナー判断）。`open` は `FailedPrecondition`。状態はゲスト内の Linux パスに置く。Windows ホストで状態を持つ構成になったら再評価 | `04-behavior/` の OCI-5 (4) | [windows-state-store-acl.md](design/windows-state-store-acl.md)（#2428・#4332。呼び出しの棚卸し表を含む） |
 | REPAIR-1・REPAIR-4・MAC-1 のログ回転の共通化 | supervisor の `RotatingFileSink` と platform-macos のコンソールログ回転は共通化せず 2 か所に置く（オーナー決定ではなく現状維持の判断。再評価条件あり） | REPAIR 系・MAC-1・SUP-7 の各ビヘイビア | [rotating-log-sharing.md](design/rotating-log-sharing.md)（#2172） |
 | REPAIR-1・PLUG-4 の frame_loop の置き場所 | plugin-macos・plugin-windows・plugin-microvm の受信ループは既存の `crates/plugin` に共通化する（案 a。2026-11-03 オーナー決定。共通化できない部分は案 c） | REPAIR-1・PLUG-1・PLUG-4・OSS-3 | [plugin-frame-loop-sharing.md](design/plugin-frame-loop-sharing.md)（#3772・[#3773](https://github.com/Fandhe-AI/fandhe-container/issues/3773#issuecomment-6595749900)） |
 | MVM-1・MVM-4 のゲスト物理メモリアクセス型の所有先 | アクセス型は TASK-74.1 側（OS 非依存・コピー API・heap backing で試験）、mmap と KVM 登録は TASK-75.1 側（オーナー決定ではなく Agent の記録した判断。再評価条件あり） | MVM-1・MVM-4 | [microvm-memory-ownership.md](design/microvm-memory-ownership.md)（#876） |
@@ -331,7 +332,6 @@ core を参照しない crate（`io`・`net`・`oci`・`cri`・`platform-windows
 - イメージストア root の検査の基準（OCI-7・SEC-1）: [image-store-root-trust.md](design/image-store-root-trust.md)（#2547。権限ビットと所有者の基準はオーナー承認待ち。決まるまで現行を保つ）
 - macOS の既定の状態ルート（OCI-5・SEC-4）: [macos-state-root.md](design/macos-state-root.md)（#2431。オーナー承認待ち。決まるまで `resolve(None)` は `Unimplemented`）
 - Windows の実行構成（ゲスト内の core とホストの起動役。WIN-1・TASK-116 追補）: [windows-execution-layout.md](design/windows-execution-layout.md)（#1862。#1415・#1539 の決定部分以外はオーナー承認待ち）
-- Windows の `FileStateStore` の所有者 SID・保護 DACL の実装方式（OCI-5・SEC-4）: [windows-state-store-acl.md](design/windows-state-store-acl.md)（#2428。オーナー承認待ち）
 - 非 Linux の監査の記録経路（Windows の主経路の隔離・代替経路。SEC-4・REPAIR-3）: [audit-non-linux.md](design/audit-non-linux.md)（#2430。判断シートあり・オーナー承認待ち）
 - 電源断・カーネルクラッシュ後の媒体永続化の検証方式（IO-2・IO-3）: [io-power-loss-verification.md](design/io-power-loss-verification.md)（#1965。オーナー承認待ち。実機前提の試験 `power_loss` は用意済みで実行は人間）
 - ランタイム自身の封印複製（方式 B。CORE-5・CORE-7〜9・REPAIR-3）: [runtime-self-sealed-copy.md](design/runtime-self-sealed-copy.md)（#2686。オーナー承認待ち。決まるまで現行の A・B'・C を保つ）

@@ -706,7 +706,7 @@ mod tests {
         );
         // 日常操作は OS 固有設定を要求しないが、plugin 拒否の監査記録先（`<状態ルート>/@audit.log`。SEC-4）を
         // 作る際に `FileStateStore::open` が状態ルートを 0700 で作る。macOS は FileStateStore 対応済み（OCI-5）で作り、
-        // Windows は未対応（Unimplemented。fail-closed）で何も作らない。
+        // Windows ホストは設計上の恒久拒否（FailedPrecondition。#2428 の案 C）で何も作らない。
         if cfg!(target_os = "macos") {
             assert!(root.is_dir(), "state root must be created on macOS");
             #[cfg(unix)]

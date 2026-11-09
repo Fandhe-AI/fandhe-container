@@ -11,7 +11,8 @@
 //! 停止は `microvm::RunningMicroVm::stop` が `StopSignal` を立て、実行中の `KVM_RUN` を `immediate_exit` と kick で即時に中断する（TASK-75.4.1・#886・#3736）。
 //! 一時停止は未実装で、後続が [`VmFd`]・[`VcpuFd`]（いずれも `AsFd`）を使って足す（REPAIR-3）。
 //! `run_once` は期限つき（`immediate_exit` とシグナルで中断し `DeadlineExceeded`。REPAIR-5）で、結果と所要時間を
-//! [`RunStats`]・[`RunObserver`] へ残す（REPAIR-4）。
+//! [`RunStats`]・[`RunObserver`] へ残す（REPAIR-4）。期限の監視は vCPU ごとの常駐スレッド（`RunWatchdog`）が担い、
+//! `KVM_RUN` ごとの処理は武装・解除だけでスレッドの生成・join をしない（#4288・MVM-1・CORE-7）。
 //! TASK-74.2.3（#879）で割り込み通知を足した: [`VmFd::create_irqchip`]（x86_64。vCPU より前に作る）・
 //! [`VmFd::register_irqfd`]（`KVM_IRQFD`。eventfd への書き込みで GSI の割り込みを注入）・
 //! [`VmFd::register_ioeventfd`]（`KVM_IOEVENTFD`。ゲストの `QueueNotify` を VM exit なしで eventfd へ）と、
@@ -209,8 +210,12 @@ pub enum Arm64VcpuPower {
 /// `KVM_CREATE_VCPU` で得た vCPU fd と、その `kvm_run` 領域の mmap。drop で munmap・close される。
 #[derive(Debug)]
 pub struct VcpuFd {
-    // フィールドの宣言順 = drop 順。mmap（run）を fd より先に解く。
-    run: sys::KvmRunMap,
+    // フィールドの宣言順 = drop 順。常駐の監視スレッド（`kvm-run-deadline`。最初の `run_once` で生成）を先に止めて join し
+    // （監視スレッドが持つ `run` の clone も解ける）、次に mmap（run）を、最後に fd を解く。
+    watchdog: Option<RunWatchdog<KvmWatchEffects>>,
+    run: Arc<sys::KvmRunMap>,
+    /// kick の宛先。`run_bounded` が `KVM_RUN` の間だけ自スレッドで武装し、監視スレッドが武装中だけ送る。
+    kick: Arc<sys::KickCell>,
     fd: OwnedFd,
     id: u32,
     stats: RunStats,
@@ -394,6 +399,9 @@ pub struct RunStats {
     pub errors: u64,
     /// 所要時間の合計。
     pub total_elapsed: Duration,
+    /// 期限監視スレッド（`kvm-run-deadline`）を生成した回数。常駐化後は vCPU ごとに高々 1 で、`KVM_RUN` を
+    /// 繰り返しても増えない（#4288・MVM-1・CORE-7）。
+    pub watchdog_spawns: u64,
 }
 
 fn exit_kind(e: &VcpuExit) -> &'static str {
@@ -412,6 +420,13 @@ fn exit_kind(e: &VcpuExit) -> &'static str {
 
 /// 期限監視スレッドが超過後に `kick`（シグナル）を繰り返す間隔。
 const KICK_INTERVAL: Duration = Duration::from_millis(10);
+/// 常駐の期限監視スレッドへ `KVM_RUN` の完了を知らせてから、解除の応答（ack）を待つ上限。監視スレッドは
+/// 完了を観測すると kick を止めて戻るだけなので通常は µs 単位。超えたら期限なしで続けず `Internal`（REPAIR-5）。
+pub(crate) const RUN_WATCHDOG_ACK_WAIT: Duration = Duration::from_secs(1);
+/// `VcpuFd` の drop で常駐の期限監視スレッドの終了を待つ上限。超えたら join せず切り離し、構造化ログを 1 行出す。
+pub(crate) const RUN_WATCHDOG_JOIN_WAIT: Duration = Duration::from_secs(1);
+// ack の待ちは kick の間隔より十分長く（通常の解除は µs 単位）、drop の待ちとの関係は `microvm` 側でコンパイル時に検査する。
+const _: () = assert!(RUN_WATCHDOG_ACK_WAIT.as_millis() >= 10 * KICK_INTERVAL.as_millis());
 /// `run_once` の期限の上限（異常な値で実質無期限になるのを防ぐ）。
 pub const RUN_DEADLINE_MAX: Duration = Duration::from_secs(3600);
 
@@ -896,8 +911,8 @@ impl VcpuFd {
     ///
     /// `timeout` を超えてもゲストが exit しないときは、別スレッドが `kvm_run.immediate_exit` を立てて
     /// 呼び出しスレッドへ `SIGUSR2` を送り（何もしない handler を `sigaction` で入れる。既存の別 handler があれば
-    /// 失敗にする）、`KVM_RUN` を中断して `DeadlineExceeded` を返す（REPAIR-5）。監視スレッドは戻る前に
-    /// 必ず join し、`immediate_exit` は下ろす。`timeout` は 0 より大きく [`RUN_DEADLINE_MAX`] 以下。
+    /// 失敗にする）、`KVM_RUN` を中断して `DeadlineExceeded` を返す（REPAIR-5）。監視スレッドは vCPU ごとの常駐 1 本で、
+    /// 戻る前に解除の応答（ack）を待ち（生成・join は `KVM_RUN` ごとには行わない。#4288）、`immediate_exit` は下ろす。`timeout` は 0 より大きく [`RUN_DEADLINE_MAX`] 以下。
     /// EINTR / EAGAIN は [`VcpuExit::Interrupted`]（再実行できる）。exit のデバイスへの振り分けと
     /// IN・MMIO 読み出しの応答の書き戻しは [`VcpuFd::handle_exit`] が担う（次の `run_once` の前に呼ぶ）。結果と所要時間は統計と記録器へ残す（REPAIR-4）。
     pub fn run_once(&mut self, timeout: Duration) -> Result<VcpuExit, MicrovmError> {
@@ -951,12 +966,20 @@ impl VcpuFd {
         exit: &VcpuExit,
         dispatcher: &mut ExitDispatcher,
     ) -> Result<DispatchOutcome, MicrovmError> {
-        exit::ensure_exit_matches_area(&self.run, exit)?;
+        exit::ensure_exit_matches_area(&*self.run, exit)?;
         let outcome = dispatcher.dispatch(exit)?;
         if let Some(response) = outcome.read_response() {
+            // 書き戻しは `&mut`（排他）でだけ行う。監視スレッドは ack の前に `run` の clone を落とすので、
+            // 実行の外ではここが唯一の所有者のはず。取れなければ handshake が崩れているため fail-closed にする。
+            let run = Arc::get_mut(&mut self.run).ok_or_else(|| {
+                MicrovmError::new(
+                    MicrovmErrorCode::Internal,
+                    "kvm_run area is still shared with the deadline thread",
+                )
+            })?;
             match exit {
-                VcpuExit::Io { .. } => exit::complete_io_in(&mut self.run, response)?,
-                VcpuExit::Mmio { .. } => exit::complete_mmio_read(&mut self.run, response)?,
+                VcpuExit::Io { .. } => exit::complete_io_in(run, response)?,
+                VcpuExit::Mmio { .. } => exit::complete_mmio_read(run, response)?,
                 _ => {}
             }
         }
@@ -1007,62 +1030,53 @@ impl VcpuFd {
         if signal.is_requested() {
             return Ok(VcpuExit::Interrupted);
         }
-        // `target` は closure の中でだけ使え、vCPU スレッドが生存中であることを型が保証する（sys::KickTarget）。
-        // kick を出すのはこの scope の監視スレッドだけで、`KVM_RUN` 1 回分の間しか生きない。
-        let timed_out = AtomicBool::new(false);
-        let fired = AtomicBool::new(false);
-        let run_done = AtomicBool::new(false);
-        // `KVM_RUN` の間、監視スレッドが `&KvmRunMap` に触るのは `set_immediate_exit` だけ（`read_into` は実行の外。#3679）。
-        let run = &self.run;
+        // 期限の監視は vCPU ごとの常駐スレッドが担い、ここでは武装・解除だけを行う（生成・join は `KVM_RUN` ごとには無い。#4288）。
+        // kick の宛先は `KickCell::armed` の中（= `KVM_RUN` の発行中の自スレッド）にだけ入り、解除は監視スレッドの送信と直列。
+        if self.watchdog.is_none() {
+            let wd =
+                RunWatchdog::spawn("kvm-run-deadline", RUN_WATCHDOG_ACK_WAIT).map_err(|_| {
+                    MicrovmError::new(
+                        MicrovmErrorCode::ResourceExhausted,
+                        "cannot spawn KVM_RUN deadline thread",
+                    )
+                })?;
+            self.stats.watchdog_spawns += 1;
+            self.watchdog = Some(wd);
+        }
+        let Some(watchdog) = self.watchdog.as_ref() else {
+            return Err(MicrovmError::new(
+                MicrovmErrorCode::Internal,
+                "KVM_RUN deadline thread is missing",
+            ));
+        };
+        let effects = KvmWatchEffects {
+            run: Arc::clone(&self.run),
+            kick: Arc::clone(&self.kick),
+        };
         let fd = self.fd.as_fd();
-        let timed_out_ref = &timed_out;
-        let fired_ref = &fired;
-        let run_done_ref = &run_done;
-        let outcome = sys::with_current_thread(|target| {
-            std::thread::scope(|scope| {
-                let watchdog = std::thread::Builder::new()
-                    .name("kvm-run-deadline".into())
-                    .spawn_scoped(scope, move || {
-                        let o = watch_run(
-                            signal,
-                            run_done_ref,
-                            timeout,
-                            |on| {
-                                let _ = run.set_immediate_exit(on);
-                            },
-                            || {
-                                let _ = target.kick();
-                            },
-                        );
-                        match o {
-                            WatchOutcome::Finished => {}
-                            WatchOutcome::TimedOut => {
-                                timed_out_ref.store(true, Ordering::SeqCst);
-                                fired_ref.store(true, Ordering::SeqCst);
-                            }
-                            WatchOutcome::Stopped => fired_ref.store(true, Ordering::SeqCst),
-                        }
-                    })
-                    .map_err(|_| {
-                        MicrovmError::new(
-                            MicrovmErrorCode::ResourceExhausted,
-                            "cannot spawn KVM_RUN deadline thread",
-                        )
-                    })?;
-                let r = sys::kvm_run(fd);
-                run_done.store(true, Ordering::SeqCst);
-                signal.notify();
-                let _ = watchdog.join();
-                Ok::<_, MicrovmError>(r)
-            })
+        let kick = &self.kick;
+        // `KVM_RUN` の間、監視スレッドが `KvmRunMap` に触るのは `set_immediate_exit` だけ（`read_into` は実行の外。#3679）。
+        let (armed, watch) =
+            watchdog.run_watched(timeout, signal, effects, || kick.armed(|| sys::kvm_run(fd)))?;
+        let outcome = armed.map_err(|e| match e {
+            SysError::Unsupported => MicrovmError::new(
+                MicrovmErrorCode::Unimplemented,
+                "KVM is not supported on this architecture",
+            ),
+            _ => MicrovmError::new(
+                MicrovmErrorCode::Internal,
+                "vCPU kick target is already armed by another thread",
+            ),
         })?;
-        let expired = timed_out.load(Ordering::SeqCst);
-        if fired.load(Ordering::SeqCst) {
-            // 監視スレッドは join 済み。次回の実行を妨げないよう下ろす（期限切れ・停止要求のどちらでも）。
+        let timed_out = watch == WatchOutcome::TimedOut;
+        let fired = watch != WatchOutcome::Finished;
+        let expired = timed_out;
+        if fired {
+            // 監視スレッドは解除の応答（ack）済みで `immediate_exit` に触らない。次回の実行を妨げないよう下ろす（期限切れ・停止要求のどちらでも）。
             let _ = self.run.set_immediate_exit(false);
         }
         match outcome {
-            Ok(()) => exit::decode_exit(&self.run),
+            Ok(()) => exit::decode_exit(&*self.run),
             Err(e) => match classify_run_error(e) {
                 Ok(VcpuExit::Interrupted) if expired => Err(MicrovmError::new(
                     MicrovmErrorCode::DeadlineExceeded,
@@ -1078,12 +1092,31 @@ impl VcpuFd {
 ///
 /// 所有関係: `RunningMicroVm` と vCPU ループが持つのはこの `Arc<StopSignal>` だけで、スレッド識別子は持たない。
 /// [`StopSignal::request`] は状態の更新と condvar の通知だけを行い、シグナルは送らない。kick（`SIGUSR2`）を出すのは
-/// `run_bounded` の `with_current_thread` の中で生きている監視スレッドだけで、そのスレッドは `KVM_RUN` 1 回分の間だけ生き、
-/// join されてから `with_current_thread` が戻る。したがって vCPU スレッドが終わった後に `request` が呼ばれても
-/// `pthread_kill` は発行されず、終了したスレッドへの送信も tid の再利用も構造上起きない。
+/// 常駐の期限監視スレッド（`RunWatchdog`）だけで、`KickCell` が武装中（`KVM_RUN` の発行中）のときにしか送らない。
+/// 解除と送信は同じ mutex で直列なので、vCPU スレッドが終わった後に `request` が呼ばれても `pthread_kill` は発行されず、
+/// 終了したスレッドへの送信も tid の再利用も構造上起きない。
 /// 全 vCPU スレッドが同じ信号を共有する（#3738。run ごとの完了状態は共有せず、`run_bounded` のローカルに置く）。
+///
+/// 実体は `Arc<StopState>` の薄い包みで、`Clone` は同じ状態を共有する。常駐の監視スレッドは武装中の間だけ clone を持つ（#4288）。
+#[derive(Debug, Default, Clone)]
+pub(crate) struct StopSignal(Arc<StopState>);
+
+impl std::ops::Deref for StopSignal {
+    type Target = StopState;
+    fn deref(&self) -> &StopState {
+        &self.0
+    }
+}
+
+impl StopSignal {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// [`StopSignal`] の共有状態（要求フラグ・condvar・wake 用 eventfd の一覧）。
 #[derive(Debug, Default)]
-pub(crate) struct StopSignal {
+pub(crate) struct StopState {
     requested: Mutex<bool>,
     cv: Condvar,
     /// 停止要求で鳴らす wake 用 eventfd（`poll(2)` で待つ補助スレッドを即時に起こす。#4160・MVM-1・CORE-7・REPAIR-5）。
@@ -1092,11 +1125,7 @@ pub(crate) struct StopSignal {
     wakers: Mutex<Vec<Weak<crate::irq::EventFd>>>,
 }
 
-impl StopSignal {
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
+impl StopState {
     /// 停止を要求して待ち手をすべて起こす。何度呼んでもよい。
     ///
     /// フラグを立てて condvar を通知した**後に** wake 用 eventfd を鳴らす。待ち手は登録後に必ずフラグを確かめてから `poll` に入るので、
@@ -1164,7 +1193,7 @@ impl StopSignal {
 
 /// 監視スレッドの結末。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WatchOutcome {
+pub(crate) enum WatchOutcome {
     /// run が先に終わった（kick も `immediate_exit` も使っていない）。
     Finished,
     /// 期限に達した。
@@ -1220,6 +1249,271 @@ fn watch_run(
     outcome
 }
 
+/// 常駐の期限監視スレッドが武装中に行う副作用（`immediate_exit` の設定と kick）。KVM なしでも試験できるよう差し替えられる。
+/// `Send + 'static` なのは、常駐スレッドへ渡して実行の後に落とす（所有物の clone を ack の前に解く）ため（#4288）。
+pub(crate) trait WatchEffects: Send + 'static {
+    /// `kvm_run.immediate_exit` を立てる / 下ろす。
+    fn set_exit(&self, on: bool);
+    /// vCPU スレッドへ中断シグナルを送る（未武装なら何もしない）。
+    fn kick(&self);
+}
+
+/// 本番の副作用。`run` は `immediate_exit` の atomic 書き込みだけに使い、`kick` は `KickCell`（武装中だけ送る）。
+#[derive(Debug)]
+pub(crate) struct KvmWatchEffects {
+    run: Arc<sys::KvmRunMap>,
+    kick: Arc<sys::KickCell>,
+}
+
+impl WatchEffects for KvmWatchEffects {
+    fn set_exit(&self, on: bool) {
+        let _ = self.run.set_immediate_exit(on);
+    }
+    fn kick(&self) {
+        let _ = self.kick.kick();
+    }
+}
+
+/// 常駐監視スレッドの状態機械。`Idle`（待機。所有物の clone を持たない）→ `Armed`（1 回分の仕事）→ `Running` →
+/// `Done`（ack）→ 呼び出し側が `Idle` へ戻す。`Shutdown`（drop の要求）・`Dead`（スレッドが終了した）は終端。
+enum WatchState<E> {
+    Idle,
+    Armed(WatchJob<E>),
+    Running,
+    Done(WatchOutcome),
+    Shutdown,
+    Dead,
+}
+
+/// `KVM_RUN` 1 回分の仕事。監視スレッドは実行後に必ず落とす（`Arc<KvmRunMap>` の clone を ack の前に解く）。
+struct WatchJob<E> {
+    timeout: Duration,
+    stop: StopSignal,
+    run_done: Arc<AtomicBool>,
+    effects: E,
+}
+
+struct WatchShared<E> {
+    state: Mutex<WatchState<E>>,
+    cv: Condvar,
+}
+
+impl<E> WatchShared<E> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, WatchState<E>> {
+        self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
+/// スレッドの終了（panic の巻き戻しを含む）で `Dead` にして待ち手を起こす guard。
+struct DeadGuard<E>(Arc<WatchShared<E>>);
+
+impl<E> Drop for DeadGuard<E> {
+    fn drop(&mut self) {
+        *self.0.lock() = WatchState::Dead;
+        self.0.cv.notify_all();
+    }
+}
+
+/// `run` の完了をスコープの終わり（panic の巻き戻しを含む）で必ず知らせる guard（監視スレッドを期限まで残さない）。
+struct RunDoneGuard<'a> {
+    done: &'a AtomicBool,
+    stop: &'a StopSignal,
+}
+
+impl Drop for RunDoneGuard<'_> {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::SeqCst);
+        self.stop.notify();
+    }
+}
+
+/// vCPU ごとに 1 本だけ常駐する期限監視スレッド（`kvm-run-deadline`）。`KVM_RUN` ごとに作らず、
+/// [`RunWatchdog::run_watched`] が武装・解除（ack 待ち）だけを行う（#4288・MVM-1・CORE-7・REPAIR-5）。
+///
+/// 呼び出し元は `VcpuFd::run_bounded`（vCPU スレッド）。監視の本体は従来どおり [`watch_run`] で、停止要求・期限・kick の
+/// 契約（#3736）は変えない。kick の宛先の生存は `sys::KickCell` が保つ。
+///
+/// fail-closed: 監視スレッドの死亡・ack の期限切れ・前回の仕事の取り残しは、期限なしで実行せず `Internal` にする。
+/// drop は `Shutdown` を伝え、`RUN_WATCHDOG_JOIN_WAIT` 以内に終われば join し、超えたら切り離して構造化ログを出す。
+/// `Idle` のスレッドは所有物の clone を持たないので、切り離しても「drop 後は資源が解放済み」の契約は崩れない
+/// （武装中に詰まっても持つのは `Arc` の clone で、mmap の延命にとどまり健全性は保たれる）。
+pub(crate) struct RunWatchdog<E: WatchEffects> {
+    shared: Arc<WatchShared<E>>,
+    run_done: Arc<AtomicBool>,
+    ack_wait: Duration,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl<E: WatchEffects> std::fmt::Debug for RunWatchdog<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunWatchdog")
+            .field("ack_wait", &self.ack_wait)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<E: WatchEffects> RunWatchdog<E> {
+    /// 名前つきの常駐スレッドを 1 本生成する。生成の失敗は `Err`（呼び出し側が `ResourceExhausted` にする）。
+    pub(crate) fn spawn(name: &str, ack_wait: Duration) -> io::Result<Self> {
+        let shared = Arc::new(WatchShared {
+            state: Mutex::new(WatchState::Idle),
+            cv: Condvar::new(),
+        });
+        let th_shared = Arc::clone(&shared);
+        let handle = std::thread::Builder::new()
+            .name(name.into())
+            .spawn(move || watchdog_main(th_shared))?;
+        Ok(Self {
+            shared,
+            run_done: Arc::new(AtomicBool::new(false)),
+            ack_wait,
+            handle: Some(handle),
+        })
+    }
+
+    /// `run` を期限つきで実行する。`run` は呼び出しスレッド上で同期実行され、その間だけ監視スレッドが武装する。
+    /// 戻るときは監視スレッドが所有物を返却済み（ack）で、監視の結末を返す。
+    pub(crate) fn run_watched<R>(
+        &self,
+        timeout: Duration,
+        stop: &StopSignal,
+        effects: E,
+        run: impl FnOnce() -> R,
+    ) -> Result<(R, WatchOutcome), MicrovmError> {
+        {
+            let mut g = self.shared.lock();
+            if !matches!(*g, WatchState::Idle) {
+                return Err(MicrovmError::new(
+                    MicrovmErrorCode::Internal,
+                    "KVM_RUN deadline thread is not idle",
+                ));
+            }
+            self.run_done.store(false, Ordering::SeqCst);
+            *g = WatchState::Armed(WatchJob {
+                timeout,
+                stop: stop.clone(),
+                run_done: Arc::clone(&self.run_done),
+                effects,
+            });
+        }
+        self.shared.cv.notify_all();
+        let r = {
+            let _done = RunDoneGuard {
+                done: &self.run_done,
+                stop,
+            };
+            run()
+        };
+        let limit = Instant::now() + self.ack_wait;
+        let mut g = self.shared.lock();
+        loop {
+            match *g {
+                WatchState::Done(outcome) => {
+                    *g = WatchState::Idle;
+                    return Ok((r, outcome));
+                }
+                WatchState::Dead | WatchState::Shutdown => {
+                    return Err(MicrovmError::new(
+                        MicrovmErrorCode::Internal,
+                        "KVM_RUN deadline thread exited",
+                    ));
+                }
+                _ => {}
+            }
+            let left = limit.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(MicrovmError::new(
+                    MicrovmErrorCode::Internal,
+                    "KVM_RUN deadline thread did not acknowledge",
+                ));
+            }
+            g = self
+                .shared
+                .cv
+                .wait_timeout(g, left)
+                .unwrap_or_else(|p| p.into_inner())
+                .0;
+        }
+    }
+}
+
+impl<E: WatchEffects> Drop for RunWatchdog<E> {
+    fn drop(&mut self) {
+        {
+            let mut g = self.shared.lock();
+            if !matches!(*g, WatchState::Dead) {
+                *g = WatchState::Shutdown;
+            }
+        }
+        self.shared.cv.notify_all();
+        // 武装中の監視を待っている場合に備え、完了も知らせる。
+        self.run_done.store(true, Ordering::SeqCst);
+        let limit = Instant::now() + RUN_WATCHDOG_JOIN_WAIT;
+        let mut g = self.shared.lock();
+        while !matches!(*g, WatchState::Dead) {
+            let left = limit.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            g = self
+                .shared
+                .cv
+                .wait_timeout(g, left)
+                .unwrap_or_else(|p| p.into_inner())
+                .0;
+        }
+        let dead = matches!(*g, WatchState::Dead);
+        drop(g);
+        if let Some(h) = self.handle.take() {
+            if dead {
+                let _ = h.join();
+            } else {
+                use std::io::Write as _;
+                drop(writeln!(
+                    std::io::stderr(),
+                    "level=error op=microvm.run_watchdog_join outcome=error code=deadline_exceeded"
+                ));
+            }
+        }
+    }
+}
+
+/// 常駐監視スレッドの本体。`Armed` を待ち、[`watch_run`] を実行し、所有物を落としてから `Done` を知らせる。
+fn watchdog_main<E: WatchEffects>(shared: Arc<WatchShared<E>>) {
+    let _dead = DeadGuard(Arc::clone(&shared));
+    loop {
+        let job = {
+            let mut g = shared.lock();
+            loop {
+                match std::mem::replace(&mut *g, WatchState::Running) {
+                    WatchState::Armed(job) => break job,
+                    WatchState::Shutdown => {
+                        *g = WatchState::Shutdown;
+                        return;
+                    }
+                    other => *g = other,
+                }
+                g = shared.cv.wait(g).unwrap_or_else(|p| p.into_inner());
+            }
+        };
+        let outcome = watch_run(
+            &job.stop,
+            &job.run_done,
+            job.timeout,
+            |on| job.effects.set_exit(on),
+            || job.effects.kick(),
+        );
+        // 所有物（`Arc<KvmRunMap>` の clone）を ack の前に返す。呼び出し側は ack 後に `Arc::get_mut` で排他を取る。
+        drop(job);
+        let mut g = shared.lock();
+        if matches!(*g, WatchState::Shutdown) {
+            return;
+        }
+        *g = WatchState::Done(outcome);
+        drop(g);
+        shared.cv.notify_all();
+    }
+}
 impl AsFd for VcpuFd {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.fd.as_fd()
@@ -1827,7 +2121,9 @@ impl VmFd {
         let run = sys::KvmRunMap::map(fd.as_fd(), self.vcpu_mmap_size)
             .map_err(|e| classify_vcpu_error(VcpuStage::Mmap, e))?;
         Ok(VcpuFd {
-            run,
+            watchdog: None,
+            run: Arc::new(run),
+            kick: Arc::new(sys::KickCell::default()),
             fd,
             id,
             stats: RunStats::default(),
@@ -3386,5 +3682,257 @@ mod tests {
         let t = Instant::now();
         assert!(sig.wait_requested(Duration::from_secs(10)));
         assert!(t.elapsed() < Duration::from_secs(1));
+    }
+
+    // ---- 常駐の期限監視スレッド（#4288・MVM-1・CORE-7・REPAIR-5）。KVM なしの副作用で状態機械と常駐を照合する ----
+
+    use std::sync::atomic::AtomicU64;
+    use std::thread::ThreadId;
+
+    #[derive(Default)]
+    struct Probe {
+        exits: Mutex<Vec<bool>>,
+        kicks: AtomicU32,
+        kick_threads: Mutex<Vec<ThreadId>>,
+        kick_panics: AtomicBool,
+        exit_entered: AtomicBool,
+        exit_sleep_ms: AtomicU64,
+    }
+
+    struct Fx(Arc<Probe>);
+
+    impl WatchEffects for Fx {
+        fn set_exit(&self, on: bool) {
+            self.0.exit_entered.store(true, Ordering::SeqCst);
+            let ms = self.0.exit_sleep_ms.load(Ordering::SeqCst);
+            if ms > 0 {
+                std::thread::sleep(Duration::from_millis(ms));
+            }
+            self.0.exits.lock().unwrap().push(on);
+        }
+        fn kick(&self) {
+            self.0
+                .kick_threads
+                .lock()
+                .unwrap()
+                .push(std::thread::current().id());
+            self.0.kicks.fetch_add(1, Ordering::SeqCst);
+            assert!(
+                !self.0.kick_panics.load(Ordering::SeqCst),
+                "injected kick panic"
+            );
+        }
+    }
+
+    /// 条件成立を期限つき（10 秒）で待つ。超えたら panic（無期限に待たない。REPAIR-5）。
+    fn wait_until(what: &str, cond: impl Fn() -> bool) {
+        let start = Instant::now();
+        while !cond() {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "timed out: {what}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// この名前のスレッドの数（`/proc/self/task/*/comm`。comm は 15 文字まで）。読めなければ skip せず panic する。
+    fn tasks_named(name: &str) -> usize {
+        std::fs::read_dir("/proc/self/task")
+            .expect("/proc/self/task must be readable")
+            .filter(|e| {
+                let p = e.as_ref().expect("task entry").path().join("comm");
+                std::fs::read_to_string(p).is_ok_and(|c| c.trim_end() == name)
+            })
+            .count()
+    }
+
+    /// #4288・CORE-7: `KVM_RUN` 相当の実行を期限切れ・正常終了で繰り返しても、監視スレッドは常駐 1 本のまま
+    /// （kick を出したスレッドの ID が 1 種類・名前つきのスレッドが 1 本・drop 後は 0 本）で、各回の結末は具体値どおり。
+    #[test]
+    fn mvm1_4288_resident_watchdog_spawns_once() {
+        const NAME: &str = "mvm4288-res";
+        let probe = Arc::new(Probe::default());
+        let wd = RunWatchdog::spawn(NAME, Duration::from_secs(5)).unwrap();
+        let stop = StopSignal::new();
+        let mut outcomes = vec![];
+        for round in 0..100 {
+            if round % 2 == 0 {
+                let base = probe.kicks.load(Ordering::SeqCst);
+                let p = Arc::clone(&probe);
+                let (_, o) = wd
+                    .run_watched(
+                        Duration::from_millis(1),
+                        &stop,
+                        Fx(Arc::clone(&probe)),
+                        || {
+                            wait_until("kick", || p.kicks.load(Ordering::SeqCst) > base);
+                        },
+                    )
+                    .unwrap();
+                outcomes.push(o);
+            } else {
+                let (v, o) = wd
+                    .run_watched(Duration::from_secs(10), &stop, Fx(Arc::clone(&probe)), || 7)
+                    .unwrap();
+                assert_eq!(v, 7);
+                outcomes.push(o);
+            }
+            if round == 49 {
+                assert_eq!(tasks_named(NAME), 1);
+            }
+        }
+        assert_eq!(tasks_named(NAME), 1);
+        let expected: Vec<_> = (0..100)
+            .map(|r| {
+                if r % 2 == 0 {
+                    WatchOutcome::TimedOut
+                } else {
+                    WatchOutcome::Finished
+                }
+            })
+            .collect();
+        assert_eq!(outcomes, expected);
+        let ids: std::collections::HashSet<_> =
+            probe.kick_threads.lock().unwrap().iter().copied().collect();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(*probe.exits.lock().unwrap(), vec![true; 50]);
+        let t = Instant::now();
+        drop(wd);
+        assert!(t.elapsed() < RUN_WATCHDOG_JOIN_WAIT);
+        assert_eq!(tasks_named(NAME), 0);
+    }
+
+    /// #4288・REPAIR-5: 武装中の停止要求は `Stopped` で kick と `immediate_exit` を使い、解除後は kick が増えない。
+    #[test]
+    fn mvm1_4288_resident_watchdog_stop_request_kicks_while_armed() {
+        let probe = Arc::new(Probe::default());
+        let wd = RunWatchdog::spawn("mvm4288-stop", Duration::from_secs(5)).unwrap();
+        let stop = StopSignal::new();
+        let (p, s2) = (Arc::clone(&probe), stop.clone());
+        let (_, o) = wd
+            .run_watched(
+                Duration::from_secs(10),
+                &stop,
+                Fx(Arc::clone(&probe)),
+                || {
+                    let h = std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(5));
+                        s2.request();
+                    });
+                    wait_until("kick", || p.kicks.load(Ordering::SeqCst) > 0);
+                    h.join().unwrap();
+                },
+            )
+            .unwrap();
+        assert_eq!(o, WatchOutcome::Stopped);
+        assert_eq!(*probe.exits.lock().unwrap(), vec![true]);
+        let kicks = probe.kicks.load(Ordering::SeqCst);
+        assert!(kicks >= 1);
+        std::thread::sleep(KICK_INTERVAL * 3);
+        assert_eq!(probe.kicks.load(Ordering::SeqCst), kicks);
+    }
+
+    /// #4288: 解除中（`Idle`）に停止を要求しても kick も `immediate_exit` も使わない。
+    #[test]
+    fn mvm1_4288_resident_watchdog_no_kick_while_idle() {
+        let probe = Arc::new(Probe::default());
+        let wd = RunWatchdog::spawn("mvm4288-idle", Duration::from_secs(5)).unwrap();
+        let stop = StopSignal::new();
+        let (_, o) = wd
+            .run_watched(
+                Duration::from_secs(10),
+                &stop,
+                Fx(Arc::clone(&probe)),
+                || (),
+            )
+            .unwrap();
+        assert_eq!(o, WatchOutcome::Finished);
+        stop.request();
+        std::thread::sleep(KICK_INTERVAL * 3);
+        assert_eq!(probe.kicks.load(Ordering::SeqCst), 0);
+        assert!(probe.exits.lock().unwrap().is_empty());
+    }
+
+    /// #4288・REPAIR-5: 監視スレッドが死んだら、以後の実行は `run` を実行せず `Internal`（期限なしで続けない）。
+    #[test]
+    fn mvm1_4288_resident_watchdog_dead_thread_fails_closed() {
+        let probe = Arc::new(Probe::default());
+        probe.kick_panics.store(true, Ordering::SeqCst);
+        let wd = RunWatchdog::spawn("mvm4288-dead", Duration::from_secs(5)).unwrap();
+        let stop = StopSignal::new();
+        let p = Arc::clone(&probe);
+        let e = wd
+            .run_watched(
+                Duration::from_millis(1),
+                &stop,
+                Fx(Arc::clone(&probe)),
+                || {
+                    wait_until("kick attempt", || p.kicks.load(Ordering::SeqCst) > 0);
+                },
+            )
+            .unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::Internal);
+        assert_eq!(e.message(), "KVM_RUN deadline thread exited");
+        let mut ran = false;
+        let e = wd
+            .run_watched(
+                Duration::from_secs(1),
+                &stop,
+                Fx(Arc::clone(&probe)),
+                || ran = true,
+            )
+            .unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::Internal);
+        assert!(!ran);
+    }
+
+    /// #4288・REPAIR-5: ack が期限内に来なければ `Internal` で、以後も実行しない。
+    #[test]
+    fn mvm1_4288_resident_watchdog_ack_timeout_fails_closed() {
+        let probe = Arc::new(Probe::default());
+        probe.exit_sleep_ms.store(400, Ordering::SeqCst);
+        let wd = RunWatchdog::spawn("mvm4288-ack", Duration::from_millis(50)).unwrap();
+        let stop = StopSignal::new();
+        let p = Arc::clone(&probe);
+        let e = wd
+            .run_watched(
+                Duration::from_millis(1),
+                &stop,
+                Fx(Arc::clone(&probe)),
+                || {
+                    wait_until("set_exit entered", || p.exit_entered.load(Ordering::SeqCst));
+                },
+            )
+            .unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::Internal);
+        assert_eq!(e.message(), "KVM_RUN deadline thread did not acknowledge");
+        let mut ran = false;
+        let e = wd
+            .run_watched(
+                Duration::from_secs(1),
+                &stop,
+                Fx(Arc::clone(&probe)),
+                || ran = true,
+            )
+            .unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::Internal);
+        assert!(!ran);
+        let t = Instant::now();
+        drop(wd);
+        assert!(t.elapsed() < RUN_WATCHDOG_JOIN_WAIT);
+        assert_eq!(tasks_named("mvm4288-ack"), 0);
+    }
+
+    /// #4288: 待機中の drop は `RUN_WATCHDOG_JOIN_WAIT` 未満で戻り、スレッドは残らない。
+    #[test]
+    fn mvm1_4288_resident_watchdog_drop_joins_within_bound() {
+        let wd: RunWatchdog<Fx> =
+            RunWatchdog::spawn("mvm4288-drop", Duration::from_secs(5)).unwrap();
+        assert_eq!(tasks_named("mvm4288-drop"), 1);
+        let t = Instant::now();
+        drop(wd);
+        assert!(t.elapsed() < RUN_WATCHDOG_JOIN_WAIT);
+        assert_eq!(tasks_named("mvm4288-drop"), 0);
     }
 }

@@ -100,12 +100,64 @@ vCPU あたりの起床は約 10 分の 1 になる。RSS は動かないため 
 ### 再評価条件
 
 - `op=microvm.vcpu_loop` の `deadline_exceeded` が停止の後詰めとして効いた形跡（停止要求から kick より長い遅延）が実環境で観測されたとき。
-- `run_once` ごとの監視スレッドの生成をなくす改修（常駐の監視スレッド化）を入れるとき。
+- `run_once` ごとの監視スレッドの生成をなくす改修（常駐の監視スレッド化）は #4288 で実施済み（下の「vCPU の期限監視スレッドの常駐化」の節）。
 - aarch64 の実機（#3781・人間担当・未実施）で、電源 off の AP の停止が kick で即時でないと分かったとき。
 - HVF の `VCPU_RUN_SLICE` を見直すとき。
 
 ### 残余
 
-- `run_once` ごとの `kvm-run-deadline` スレッドの生成・join（スタックの確保と clone）は残る。起床回数は減るが、1 回あたりの費用は変えていない。
+- `run_once` ごとの `kvm-run-deadline` スレッドの生成・join は #4288 で常駐 1 本に置き換えた（下の節）。この節の実測値は生成・join が残っていた時点のもの。
 - HVF（macOS）の `VCPU_RUN_SLICE`（100 ms）は別の値・別の停止経路のため本件の対象外。
 - aarch64 は未検証。モジュール doc の電源 off の AP の記述は「kick で戻る想定」とし、確認済みを装わない（REPAIR-3）。
+
+## vCPU の期限監視スレッドの常駐化（#4288・MVM-1・CORE-7・REPAIR-5）
+
+### 背景
+
+#4229 の後も `VcpuFd::run_bounded` は `KVM_RUN` のたびに `thread::scope` の中で `kvm-run-deadline` を生成し、終わるたびに join していた
+（clone とスタック確保・解放が `run_once` の回数だけ起きる。アイドルでは期限切れごと、実行中は exit ごと）。
+
+### 判断: vCPU ごとに常駐 1 本にする
+
+- 監視スレッド（`device::RunWatchdog`）は最初の `run_once` で 1 本だけ作り、以後は `KVM_RUN` ごとに「武装（仕事を渡す）→ `KVM_RUN` → 完了を知らせる → 解除の応答（ack）を待つ」だけを行う。
+  監視の本体は従来の `watch_run` のまま（停止要求・期限・kick の契約は #3736 のまま）。
+- **kick の宛先の生存**: scoped thread の join に頼れなくなるため、`sys::KickCell`（宛先の `pthread_t` を入れる mutex つきのセル）に置き換えた。
+  vCPU スレッドが `KickCell::armed` の閉包の中（= `KVM_RUN` の発行中）にだけ自分を入れ、戻る前（panic の巻き戻しを含む）に空へ戻す。
+  `kick` は mutex を保持したまま `pthread_kill` するので、解除後に送信が残ることも、終了したスレッドへ送ることも無い。新しい FFI 宣言は無く、`unsafe` は `sys` 内の既存宣言の呼び出しだけ。
+- **`kvm_run` の mmap の共有**: 監視スレッドは `Arc<KvmRunMap>` の clone を武装中だけ持ち（`immediate_exit` の atomic 書き込みだけ）、ack の前に落とす。
+  IN・MMIO read の応答の書き戻し（`handle_exit`）は `Arc::get_mut` の排他でだけ行い、取れなければ `Internal` で fail-closed にする（handshake が崩れたことの検出を兼ねる）。
+- **`StopSignal`** は `Arc<StopState>` の薄い包み（`Clone` は共有）にし、武装中だけ監視スレッドが clone を持つ。`step` の署名・公開 API は変えない。
+- fail-closed（REPAIR-5）: 監視スレッドの死亡・ack の期限切れ（`RUN_WATCHDOG_ACK_WAIT` = 1 s）・前回の仕事の取り残し・二重武装は、期限なしで実行せず `Internal`。
+  drop は `Shutdown` を伝え、`RUN_WATCHDOG_JOIN_WAIT`（1 s）以内に終われば join、超えたら切り離して `op=microvm.run_watchdog_join outcome=error code=deadline_exceeded` を 1 行出す。
+  待機中のスレッドは所有物の clone を持たないので、切り離しても解放済みの契約は崩れない。2 定数の和は `DROP_STOP_WAIT` 未満をコンパイル時に検査する。
+- 計装: `RunStats::watchdog_spawns`（監視スレッドの生成回数）を足し、`op=microvm.vcpu_loop` の終了ログに `watchdog_spawns=` を出す。
+
+### 却下案
+
+- 生の `Send` ハンドルで offset 1 のバイトを触る案: `sys` の `unsafe` が増える。`Arc<KvmRunMap>` なら既存の atomic 書き込みを再利用できる。
+- eventfd で武装・解除を知らせる案: `watch_run` が既に condvar で待つため、fd を増やす利点が無い。
+- 公開の `run_once` だけ従来の生成方式で残す案: 2 経路の維持費が掛かる。公開の `run_once` も同じ常駐経路を通す（呼び出しごとに信号は作る）。
+
+### 実測（x86_64・Linux 7.0.0-34-generic・debug ビルド・1 vCPU・HLT ゲスト・5 回の期限切れ）
+
+| 状態 | 監視スレッドの生成 | vCPU スレッドの自発的コンテキストスイッチ（5 s） |
+| ---- | ------------------ | ---------------------------------------------- |
+| 変更前（#4229 の 1 s） | `run_once` の回数（6 回の期限切れで 6 回以上） | 10 |
+| 変更後 | 1 | 10 |
+
+手順: `cargo test -p fandhe-container-microvm --test kvm_device -- --ignored --exact kvm_device_idle_halted_vcpu_wakeups --nocapture` が
+`mvm4229 idle vcpu in 5001ms: deadline_expiries=5 voluntary_switches=10` と `mvm4288 idle vcpu: deadline_exceeded=6 watchdog_spawns=1` を出す。
+変更前の値は同じ試験を変更前のコード（origin/main）に当てて採った（生成回数は変更前は計装が無く、1 回の `run_once` に 1 回の生成という構造から数える）。
+**起床回数（自発的コンテキストスイッチ）は変わらない**（期限切れ 1 回あたり `KVM_RUN` の眠りと ack の待ちで約 2 回）。減ったのは期限切れ・exit ごとの
+スレッドの clone・スタックの確保と解放・join で、これらは自発的コンテキストスイッチの数には現れない。RSS・CORE-7 の数値への直接の影響は無い。
+
+### 照合
+
+- `mvm1_4288_resident_watchdog_spawns_once`（KVM 不要）: 期限切れ 50 回と正常終了 50 回を交互に繰り返しても、kick を出したスレッドの ID が 1 種類・名前つきスレッドが 1 本・drop 後は 0 本で、各回の結末が具体値どおり。
+- `mvm1_4288_resident_watchdog_*`: 武装中の停止要求の kick・待機中は kick しない・死亡と ack 切れの fail-closed・drop が上限内で終わる。
+- `kvm_device_idle_halted_vcpu_wakeups`（実機）: 期限切れ 6 回以上で `watchdog_spawns == 1`。停止の即時性の試験（50 ms 閾値）は変えていない（武装・解除の handshake の費用の回帰ガード）。
+
+### 再評価条件・残余
+
+- D 状態で KILL が効かない vCPU は、ack 待ちが `RUN_WATCHDOG_ACK_WAIT` で切れて `Internal` になる（期限なしでは続けない）。
+- aarch64 の実機（#3781・人間担当）は未検証。HVF（macOS）は別の停止経路のため対象外。

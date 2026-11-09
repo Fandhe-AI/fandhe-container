@@ -4,6 +4,9 @@
 //! 残したリースを、親が開き直して読めること、別プロセスのリースが `image prune` と回収 GC に見える
 //! ことを具体値で確かめる。子の待機には期限を置く（REPAIR-5）。
 
+// Windows ホストは設計上 `ImageStore` を開けない（#4333・#2428 案 C。拒否は src/image_management/store.rs の試験が照合）ため unix に限る。
+#![cfg(unix)]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};

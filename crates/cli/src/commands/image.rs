@@ -383,7 +383,7 @@ fn run_image_tag_with(
 }
 
 /// `image ls` の実処理（ストアは呼び出し側が開く。計装なし。試験用）。
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn run_image_ls_with(store: &ImageStore, out: &mut dyn Write) -> CliExit {
     run_image_ls_recorded(
         store,
@@ -412,7 +412,7 @@ fn run_image_ls_recorded(
 }
 
 /// `system df` の実処理（計装なし。試験用）。
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn run_system_df_with(store: &ImageStore, out: &mut dyn Write) -> CliExit {
     run_system_df_recorded(
         store,
@@ -441,7 +441,7 @@ fn run_system_df_recorded(
 }
 
 /// `image rm` の実処理（参照の照合なし）。`run_image_rm_reclaiming` の `reclaim` を何もしない形にしたもの（試験用）。
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn run_image_rm_with(
     store: &ImageStore,
     target: &ImageRmTarget,
@@ -456,7 +456,7 @@ fn run_image_rm_with(
 ///
 /// 1 回目の判定が使用中で拒否したら、**ガードを手放した状態で** `reclaim`（拒否に載った参照の照合と回収。契機 B・#2495）を
 /// 呼び、判定をやり直す。照合に失敗・保留しても従来どおりの拒否に進む（残す側に誤る）。
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn run_image_rm_reclaiming(
     store: &ImageStore,
     target: &ImageRmTarget,
@@ -740,15 +740,21 @@ mod tests {
         }
         assert_eq!(folded, [OciErrorCode::DataLoss, OciErrorCode::Internal]);
     }
+    #[cfg(unix)]
     use fandhe_container_oci::image_management::{ManifestComposition, ReferenceTable};
     use fandhe_container_oci::reference::{RegistryHost, Repository, Tag};
+    #[cfg(unix)]
     use std::cell::Cell;
+    #[cfg(unix)]
     use std::path::{Path, PathBuf};
+    #[cfg(unix)]
     use std::sync::atomic::{AtomicU32, Ordering};
 
     /// 試験用の一時ディレクトリ（drop で削除）。
     /// 第 2 要素は排他作成した実体（Drop で後始末する。REPAIR-12・#3475）。
+    #[cfg(unix)]
     struct Tmp(PathBuf, #[allow(dead_code)] crate::test_root::TestRoot);
+    #[cfg(unix)]
     impl Tmp {
         fn new() -> Self {
             static N: AtomicU32 = AtomicU32::new(0);
@@ -796,6 +802,7 @@ mod tests {
     }
 
     /// manifest(config=`c`, layers=`l`) を登録する。
+    #[cfg(unix)]
     fn add_manifest(t: &mut ReferenceTable, m: char, c: char, l: &[char]) {
         let layers = l.iter().map(|x| dg(*x)).collect();
         t.register_manifest(
@@ -805,6 +812,7 @@ mod tests {
         .expect("register");
     }
 
+    #[cfg(unix)]
     fn out_of(f: impl FnOnce(&mut Vec<u8>) -> CliExit) -> (CliExit, String) {
         let mut buf = Vec::new();
         let e = f(&mut buf);
@@ -817,11 +825,13 @@ mod tests {
         String::from_utf8(b).expect("utf8")
     }
 
+    #[cfg(unix)]
     fn no_snapshot() -> Result<StoppedContainers, CliExit> {
         panic!("snapshot must not be read");
     }
 
     /// CLI-1・OCI-7: 空ストアの image ls はヘッダのみで 0。
+    #[cfg(unix)]
     #[test]
     fn cli1_oci7_image_ls_empty_is_header_only() {
         let tmp = Tmp::new();
@@ -832,6 +842,7 @@ mod tests {
     }
 
     /// CLI-1・OCI-7: タグつき 2 行とタグなし 1 行・欠損 blob を具体値で照合する。
+    #[cfg(unix)]
     #[test]
     fn cli1_oci7_image_ls_lists_tagged_and_dangling_rows() {
         let tmp = Tmp::new();
@@ -862,6 +873,7 @@ mod tests {
     }
 
     /// CLI-1・OCI-7: system df の 9 行を具体値で照合する（共有レイヤーは二重計上しない・未登録 blob は別集計）。
+    #[cfg(unix)]
     #[test]
     fn cli1_oci7_system_df_fixed_nine_rows() {
         let tmp = Tmp::new();
@@ -905,6 +917,7 @@ mod tests {
         assert!(out.contains("cache.unregistered_bytes\t7\n"));
     }
 
+    #[cfg(unix)]
     fn rm_store(tmp: &Tmp, containers: &[&str]) -> ImageStore {
         // manifest 1: config a + layer b（共有しない）、タグ latest 1 件。
         let mut t = ReferenceTable::new();
@@ -918,11 +931,13 @@ mod tests {
         ImageStore::with_table(tmp.path(), t).expect("open")
     }
 
+    #[cfg(unix)]
     fn target(s: &str) -> ImageRmTarget {
         parse_target(s).expect("target")
     }
 
     /// OCI-7: タグが 2 件あるイメージのタグ指定は untag だけで blob を残す。
+    #[cfg(unix)]
     #[test]
     fn cli1_oci7_image_rm_tag_with_two_tags_untags_only() {
         let tmp = Tmp::new();
@@ -943,6 +958,7 @@ mod tests {
     }
 
     /// OCI-7: 最後のタグの削除は完全削除（manifest と blob の実ファイルが消える）。
+    #[cfg(unix)]
     #[test]
     fn cli1_oci7_image_rm_last_tag_deletes_blobs() {
         let tmp = Tmp::new();
@@ -961,6 +977,7 @@ mod tests {
     }
 
     /// OCI-7: digest 指定の完全削除。
+    #[cfg(unix)]
     #[test]
     fn cli1_oci7_image_rm_by_digest() {
         let tmp = Tmp::new();
@@ -975,6 +992,7 @@ mod tests {
     }
 
     /// OCI-7・#2659: `name@digest` は name が一致しても digest で解決し、素の digest と同じ出力で削除する。
+    #[cfg(unix)]
     #[test]
     fn cli1_oci7_image_rm_name_at_digest_matching_name_deletes_by_digest() {
         let tmp = Tmp::new();
@@ -993,6 +1011,7 @@ mod tests {
     }
 
     /// OCI-7・#2659: name が食い違っても digest 優先で削除する（(a) の残余リスクを固定。切り替え時は意図した試験の変更になる）。
+    #[cfg(unix)]
     #[test]
     fn cli1_oci7_image_rm_name_at_digest_mismatched_name_is_digest_first() {
         let tmp = Tmp::new();
@@ -1008,6 +1027,7 @@ mod tests {
     }
 
     /// OCI-7・#2659: 在庫に無い digest の `name@digest` は INVALID_ARGUMENT ではなく 3 / NOT_FOUND。
+    #[cfg(unix)]
     #[test]
     fn cli1_oci7_image_rm_name_at_unknown_digest_is_not_found() {
         let tmp = Tmp::new();
@@ -1021,6 +1041,7 @@ mod tests {
     }
 
     /// OCI-7: コンテナ参照ありで --force なしは 5。文言は固定でコンテナ ID を含まない。ファイルは不変。
+    #[cfg(unix)]
     #[test]
     fn cli1_oci7_image_rm_in_use_refuses_without_leaking_container_id() {
         let tmp = Tmp::new();
@@ -1039,6 +1060,7 @@ mod tests {
     }
 
     /// OCI-7: --force かつスナップショットで停止中なら untag だけで blob を残す。
+    #[cfg(unix)]
     #[test]
     fn cli1_oci7_image_rm_force_stopped_untags_only() {
         let tmp = Tmp::new();
@@ -1065,6 +1087,7 @@ mod tests {
     /// OCI-7・#2495: 状態の無い参照だけが残った manifest の `image rm` は、拒否の前に照合・回収されて成功する。
     /// 他の状態ルートの参照は回収されず、従来どおり拒否される。
     #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn oci7_image_rm_reclaims_stale_ref_then_deletes() {
         use super::super::ref_reconcile::reconcile_in_use;
@@ -1122,6 +1145,7 @@ mod tests {
 
     /// OCI-7: アダプタが scope つきで登録した参照（長い ID を含む）は、同じ参照キーの停止中スナップショットで
     /// 停止後の `image rm --force` が通る。
+    #[cfg(unix)]
     #[test]
     fn oci7_image_rm_force_stopped_with_scoped_ref_keys() {
         let scope = "0123456789abcdef0123456789abcdef";
@@ -1152,6 +1176,7 @@ mod tests {
     }
 
     /// OCI-7: --force でもスナップショットに無い（実行中扱い）コンテナは拒否する。
+    #[cfg(unix)]
     #[test]
     fn cli1_oci7_image_rm_force_running_is_refused() {
         let tmp = Tmp::new();
@@ -1165,6 +1190,7 @@ mod tests {
     }
 
     /// OCI-7・REPAIR-5: --force でスナップショット取得が失敗したらそのエラーで終わり、何も変えない（fail-closed）。
+    #[cfg(unix)]
     #[test]
     fn cli1_oci7_image_rm_force_snapshot_failure_is_fail_closed() {
         let tmp = Tmp::new();
@@ -1186,6 +1212,7 @@ mod tests {
     }
 
     /// OCI-7: 未知の参照は 3、不正な参照は parse_target の段階で失敗する。
+    #[cfg(unix)]
     #[test]
     fn cli1_oci7_image_rm_unknown_and_invalid_reference() {
         let tmp = Tmp::new();
@@ -1202,6 +1229,7 @@ mod tests {
     }
 
     /// CLI-1・OCI-7: root の不在は 3、通常ファイルは 5、blobs が symlink なら ls は 5。
+    #[cfg(unix)]
     #[test]
     fn cli1_oci7_store_root_failures() {
         let tmp = Tmp::new();
@@ -1227,6 +1255,7 @@ mod tests {
     }
 
     /// REPAIR-4・OCI-1: 記録付きで開いたストアの `image ls` / `system df` が `oci.*` の操作を記録器へ入れる。
+    #[cfg(unix)]
     #[test]
     fn repair4_recorded_store_feeds_oci_ops_into_recorder() {
         let tmp = Tmp::new();
@@ -1247,6 +1276,7 @@ mod tests {
     }
 
     /// REPAIR-4・OCI-7（#2223）: 記録付きストアの `image rm` が実行段の成功を `oci.image.rm` に記録する。
+    #[cfg(unix)]
     #[test]
     fn repair4_image_rm_records_oci_image_rm() {
         let tmp = Tmp::new();
@@ -1323,6 +1353,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     fn tag_store(tmp: &Tmp, tags: &[(&str, char)]) -> ImageStore {
         let mut t = ReferenceTable::new();
         add_manifest(&mut t, '1', 'a', &[]);
@@ -1334,6 +1365,7 @@ mod tests {
         ImageStore::with_table(tmp.path(), t).expect("open")
     }
 
+    #[cfg(unix)]
     fn run_tag(store: &ImageStore, source: &str, target: &str) -> (CliExit, String) {
         let source = parse_tag_source(source).expect("source");
         let target = parse_tag_target(target).expect("target");
@@ -1341,6 +1373,7 @@ mod tests {
     }
 
     /// CLI-1・OCI-7: タグ source で新規タグを付けると tagged 行を出して 0。
+    #[cfg(unix)]
     #[test]
     fn cli1_oci7_image_tag_added_by_tag_source() {
         let tmp = Tmp::new();
@@ -1359,6 +1392,7 @@ mod tests {
     }
 
     /// CLI-1・OCI-7: digest source でも tagged 行になる。
+    #[cfg(unix)]
     #[test]
     fn cli1_oci7_image_tag_by_digest_source() {
         let tmp = Tmp::new();
@@ -1375,6 +1409,7 @@ mod tests {
     }
 
     /// CLI-1・OCI-7・#2659: tag の source が `name@digest` なら name の一致・不一致によらず digest で解決する。
+    #[cfg(unix)]
     #[test]
     fn cli1_oci7_image_tag_name_at_digest_source_match_and_mismatch() {
         let h = "1".repeat(64);
@@ -1389,6 +1424,7 @@ mod tests {
     }
 
     /// CLI-1・OCI-7: 別 manifest を指すタグの付け替えは retagged 行（付け替え前 → 後）。
+    #[cfg(unix)]
     #[test]
     fn cli1_oci7_image_tag_retag_reports_from_and_to() {
         let tmp = Tmp::new();
@@ -1408,6 +1444,7 @@ mod tests {
     }
 
     /// CLI-1・OCI-7: 同じ付け先への再付与は unchanged 行で 0。
+    #[cfg(unix)]
     #[test]
     fn cli1_oci7_image_tag_unchanged() {
         let tmp = Tmp::new();
@@ -1424,6 +1461,7 @@ mod tests {
     }
 
     /// CLI-1・OCI-7・ERR-1: 存在しない source は 3 / NOT_FOUND で、stdout は空・テーブル不変・argv を出力しない。
+    #[cfg(unix)]
     #[test]
     fn cli1_oci7_image_tag_unknown_source_is_not_found() {
         let tmp = Tmp::new();
@@ -1523,6 +1561,7 @@ mod tests {
     }
 
     /// CLI-1・OCI-7: タグ件数が上限なら新規タグは 10 / RESOURCE_EXHAUSTED と固定文言、付け替えは成功する。
+    #[cfg(unix)]
     #[test]
     fn cli1_oci7_image_tag_limit_is_resource_exhausted_with_fixed_message() {
         use fandhe_container_oci::image_management::MAX_TAG_REFS;

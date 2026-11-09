@@ -6,6 +6,9 @@
 //! 成功経路とリダイレクトは `registry.rs` のユニットテスト（通信を差し替えた照合）が担い、
 //! 実ネットワークでの成功は `blob_live.rs`（ignore）が担う。
 
+// Windows ホストは設計上 `ImageStore` を開けない（#4333・#2428 案 C。拒否は src/image_management/store.rs の試験が照合）ため unix に限る。
+#![cfg(unix)]
+
 use fandhe_container_oci::auth::RegistryAuth;
 use fandhe_container_oci::error::OciErrorCode;
 use fandhe_container_oci::image_management::ImageStore;

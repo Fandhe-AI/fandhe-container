@@ -545,6 +545,7 @@ mod tests {
     }
 
     /// OCI-7・#473: ストアのガード越しに ls / df を呼べる（排他の内側で集計する契約）。
+    #[cfg(unix)]
     #[test]
     fn oci7_ls_and_df_run_under_store_guard() {
         let root = Root::new("guard");

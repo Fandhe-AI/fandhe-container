@@ -61,7 +61,7 @@ PR #2520（#2380）で manifest の在庫・タグ・pull リースを `@image-i
 - `InMemoryImageStore` の置き換え（TASK-183）。plugin-cri の ImageService と本番の `PullConfig` は #2592 で配線済み
 - #2377（本番の `ImageRootfsUnpacker`）には、在庫に layer の mediaType・`diff_ids` が要る。`@image-inventory.json` のスキーマは広げていない
 - 展開済み `rootfs/sha256/<hex>` の GC と `image rm` / `prune` への接続（#2315・#471）
-- Windows のパス起点（#4181）。公開先 `rootfs/sha256`・create 経路の読み取りは #4283、`unpack/` は #4180、検証後のステージング blob の読み取りは #2893、リース済み blob の読み取りは #4179 で fd 起点に移した
+- Windows ホストは `ImageStore::open` の恒久拒否（#2428 案 C・#4333。#4181 は not planned）で到達しないため対象外。公開先 `rootfs/sha256`・create 経路の読み取りは #4283、`unpack/` は #4180、検証後のステージング blob の読み取りは #2893、リース済み blob の読み取りは #4179 で fd 起点に移した
 
 ## 起動時の pull 回収 GC の配線（#2819・OCI-7・OCI-1・REPAIR-3・REPAIR-4・REPAIR-5）
 

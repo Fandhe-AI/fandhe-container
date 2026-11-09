@@ -3,6 +3,9 @@
 //! `ImageStore::lock` のガード越しの公開 API だけで受け入れ条件 1〜3 と排他区間の内側でしか動かないことを確かめる。
 //! 停止中コンテナの実際の `start` での確認は TASK-184（#664・#665）の担当。
 
+// Windows ホストは設計上 `ImageStore` を開けない（#4333・#2428 案 C。拒否は src/image_management/store.rs の試験が照合）ため unix に限る。
+#![cfg(unix)]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;

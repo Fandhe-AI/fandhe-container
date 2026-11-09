@@ -39,7 +39,7 @@
 //! # fd 起点にしない範囲（残余。#4283）
 //!
 //! - Linux 以外の unix（macOS 等）は `RootHandle`・`BlobDir`・`ExtractRoot::from_path` がパス起点で、入口の再検査に頼る
-//!   （本番の macOS は cli の `non_linux_failure` がホストでの展開の前に fail-closed にする）。Windows は #4181
+//!   （本番の macOS は cli の `non_linux_failure` がホストでの展開の前に fail-closed にする）。Windows ホストは `ImageStore::open` が設計上の恒久拒否のため到達しない（#2428 の案 C・#4333）
 //! - bundle の親ディレクトリ（`SpecBundleProvider` が作る `<bundles>/<id>`）の作成・巻き戻しと `release` は #4321 で
 //!   `BundleDir` の fd 起点にした（`release_bounded` も `bundle` 直下の `rootfs` を fd 起点で消す）。Linux 以外の unix は
 //!   `ExtractRoot` のパス起点の実装で、入口の再検査に頼る

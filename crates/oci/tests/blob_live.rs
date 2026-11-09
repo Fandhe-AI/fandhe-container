@@ -4,6 +4,9 @@
 //! リダイレクトするため、手動リダイレクト追従（Authorization 非送信・公開 IP のみ）の実網検証も兼ねる。
 //! 実行: `cargo test -p fandhe-container-oci --test blob_live -- --ignored`
 
+// Windows ホストは設計上 `ImageStore` を開けない（#4333・#2428 案 C。拒否は src/image_management/store.rs の試験が照合）ため unix に限る。
+#![cfg(unix)]
+
 use fandhe_container_oci::manifest::Platform;
 use fandhe_container_oci::reference::ImageReference;
 use fandhe_container_oci::registry::{RegistryClient, RegistryClientConfig, RegistryEndpoint};

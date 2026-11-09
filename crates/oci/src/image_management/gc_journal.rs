@@ -119,6 +119,7 @@ pub(super) struct GcJournal {
 impl GcJournal {
     /// 何も消さない空のジャーナル（削除確定の fsync が未了であることを示す墓標）か。
     #[cfg(test)]
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn is_tombstone(&self) -> bool {
         self.manifests.is_empty() && self.untag.is_empty() && self.delete_blobs.is_empty()
     }
@@ -182,11 +183,13 @@ mod test_hook {
     }
 
     /// ジャーナルの unlink を `times` 回失敗させる。
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(super) fn fail_unlink(times: u32) {
         FAIL_UNLINK.with(|c| c.set(times));
     }
 
     /// 削除開始後のジャーナル書き直しを公開前に `times` 回失敗させる。
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(super) fn fail_rewrite(times: u32) {
         FAIL_REWRITE.with(|c| c.set(times));
     }
@@ -207,10 +210,12 @@ mod test_hook {
         take(&FAIL_REWRITE)
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(super) fn fail_sync_of(dir: &Path, times: u32) {
         FAIL.with(|f| *f.borrow_mut() = Some((dir.to_path_buf(), times)));
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(super) fn clear() {
         FAIL_UNLINK.with(|c| c.set(0));
         FAIL_REWRITE.with(|c| c.set(0));
@@ -770,6 +775,7 @@ impl ReferenceTable {
 
     /// 試験用: パスから検査なしでハンドルを開いて設定する。
     #[cfg(test)]
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(super) fn set_journal_root(&mut self, root: &Path) {
         let h = RootHandle::open_unchecked(root).expect("open root handle");
         self.set_root_handle(Arc::new(h));
@@ -935,13 +941,18 @@ mod tests {
     use crate::image_management::root_handle::rh;
     use crate::image_management::usage::blob_path;
     use crate::image_management::{
-        ContainerRefId, ImageRmKind, ImageRmOptions, ImageRmTarget, ImageStore,
-        ManifestComposition, PullId, StoppedContainers,
+        ImageRmKind, ImageRmOptions, ImageRmTarget, ManifestComposition, StoppedContainers,
     };
+    // ImageStore を開く試験（unix 限定）だけが使う。Windows ホストは ImageStore を開けない（#4333）。
+    #[cfg(unix)]
+    use crate::image_management::{ContainerRefId, ImageStore, PullId};
+    #[cfg(unix)]
     use crate::instrument::testing::Collect;
+    #[cfg(unix)]
     use crate::instrument::{OciOpKind, OciOpOutcome};
     use std::fs::{self, File};
     use std::path::PathBuf;
+    #[cfg(unix)]
     use std::sync::Arc;
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -1020,6 +1031,7 @@ mod tests {
             attempts: 0,
         }
     }
+    #[cfg(unix)]
     fn after_state(root: &Root, t: &ReferenceTable) {
         assert_eq!(
             t.manifests().map(|(x, _)| x.clone()).collect::<Vec<_>>(),
@@ -1036,6 +1048,7 @@ mod tests {
     }
 
     /// OCI-7: ジャーナルの前の中断は削除前のまま（ジャーナルも無く、何も消えていない）。
+    #[cfg(unix)]
     #[test]
     fn oci7_interrupted_before_journal_converges_to_before() {
         let root = Root::new();
@@ -1049,6 +1062,7 @@ mod tests {
     }
 
     /// OCI-7: ジャーナル後・unlink 前の中断は、再起動で戻ったテーブルでも削除後に収束する。
+    #[cfg(unix)]
     #[test]
     fn oci7_interrupted_after_journal_before_unlink_converges_to_after() {
         let root = Root::new();
@@ -1066,6 +1080,7 @@ mod tests {
     }
 
     /// OCI-7: k / n 件を unlink した後の中断は、k の全通りで同じ削除後に収束する。
+    #[cfg(unix)]
     #[test]
     fn oci7_interrupted_midway_converges_to_after() {
         let blobs = [d(0x11), d(0xc1)];
@@ -1087,6 +1102,7 @@ mod tests {
     }
 
     /// OCI-7: 全件 unlink 後・ジャーナル削除前の中断は、ジャーナルだけを片づける。
+    #[cfg(unix)]
     #[test]
     fn oci7_interrupted_after_all_unlinks_clears_journal() {
         let root = Root::new();
@@ -1104,6 +1120,7 @@ mod tests {
     }
 
     /// OCI-7: 再起動後のテーブルに別の manifest・リースが blob を参照していれば、その blob は残る。
+    #[cfg(unix)]
     #[test]
     fn oci7_recovery_recounts_and_keeps_blob_referenced_after_restart() {
         let root = Root::new();
@@ -1127,6 +1144,7 @@ mod tests {
     }
 
     /// OCI-7: ジャーナルの manifest にコンテナ参照が戻っていたら外さず、conflicted に載せる。
+    #[cfg(unix)]
     #[test]
     fn oci7_recovery_keeps_manifest_that_regained_reference() {
         let root = Root::new();
@@ -1145,6 +1163,7 @@ mod tests {
     }
 
     /// OCI-7: 再試行は冪等（2 回目は何もしない）。
+    #[cfg(unix)]
     #[test]
     fn oci7_recovery_is_idempotent() {
         let root = Root::new();
@@ -1284,6 +1303,7 @@ mod tests {
 
     /// OCI-7・#851: blob ディレクトリが無いとき、全件を不在として回復を完了しジャーナルを消す。
     /// `blobs` ごと無い場合と `blobs/sha256` だけ無い場合の両方を、実際に取り除いて確かめる。
+    #[cfg(unix)]
     #[test]
     fn oci7_resume_completes_when_blob_dirs_missing() {
         for remove_whole_blobs in [true, false] {
@@ -1347,6 +1367,7 @@ mod tests {
 
     /// OCI-7: 公開後の fsync も取り消しの fsync も失敗したら、削除は始めず（Err）、
     /// 墓標（空のジャーナル）を残す。次の lock が何も消さずに片づける。
+    #[cfg(unix)]
     #[test]
     fn oci7_publish_fsync_failure_and_revoke_fsync_failure_leaves_tombstone() {
         let root = Root::new();
@@ -1369,6 +1390,7 @@ mod tests {
 
     /// OCI-7: ジャーナル削除後の root の fsync が失敗したら Pending で、墓標が残り、
     /// 次の lock が復旧して再試行するまで新しい削除は拒否される。
+    #[cfg(unix)]
     #[test]
     fn oci7_journal_removal_fsync_failure_keeps_pending_until_next_lock() {
         let root = Root::new();
@@ -1394,6 +1416,7 @@ mod tests {
 
     /// OCI-7: 全 blob を unlink した後に blob ディレクトリの fsync が失敗して Pending のとき、
     /// 再 pull で同じ manifest・タグが再登録されても、次の復旧はそれらを外さず消さない。
+    #[cfg(unix)]
     #[test]
     fn oci7_pending_after_table_update_does_not_remove_reregistered_tag() {
         let root = Root::new();
@@ -1433,6 +1456,7 @@ mod tests {
 
     /// OCI-7: 削除開始後のジャーナル書き直しで rename 後に root の fsync が失敗しても、
     /// ジャーナルを取り消さず Pending を返し、次の復旧が delete_blobs を消す。
+    #[cfg(unix)]
     #[test]
     fn oci7_rewrite_root_fsync_failure_keeps_journal_and_recovers() {
         let root = Root::new();
@@ -1457,6 +1481,7 @@ mod tests {
 
     /// OCI-7: 削除完了時のジャーナル unlink が失敗してテーブル操作入りのジャーナルが残る間は、
     /// lock が FailedPrecondition で拒否され、障害を除くと復旧が完了して変更が通る。
+    #[cfg(unix)]
     #[test]
     fn oci7_unlink_failure_blocks_lock_until_recovered() {
         let root = Root::new();
@@ -1492,6 +1517,7 @@ mod tests {
     }
 
     /// OCI-7: blobs だけへの書き直しが公開前に失敗して元のジャーナルが残る間も、lock は拒否される。
+    #[cfg(unix)]
     #[test]
     fn oci7_rewrite_failure_blocks_lock_until_recovered() {
         let root = Root::new();
@@ -1533,6 +1559,7 @@ mod tests {
 
     /// OCI-7: 取得済みのガードで rm が Pending（ジャーナル unlink 失敗）を返した後は、同じガードでの
     /// 変更系が FailedPrecondition になる。障害を除いて再 lock すると復旧が完了し登録が通る。
+    #[cfg(unix)]
     #[test]
     fn oci7_rm_pending_blocks_mutations_in_same_guard() {
         let root = Root::new();
@@ -1574,6 +1601,7 @@ mod tests {
     }
 
     /// OCI-7: prune が Pending を返した後も、同じガードでの変更系は FailedPrecondition になる。
+    #[cfg(unix)]
     #[test]
     fn oci7_prune_pending_blocks_mutations_in_same_guard() {
         let root = Root::new();
@@ -1599,6 +1627,7 @@ mod tests {
     /// OCI-7: blob のみのジャーナルが Pending で残る間は、参照の追加（register_manifest・
     /// register_tag・acquire_lease）が FailedPrecondition になり、新しい lock も拒否される。
     /// 障害を除いて再 lock すると復旧が完了し、その後は通る。
+    #[cfg(unix)]
     #[test]
     fn oci7_blob_only_pending_blocks_reference_additions() {
         let root = Root::new();
@@ -1639,6 +1668,7 @@ mod tests {
 
     /// OCI-7: 墓標の公開後に root の fsync が失敗しても、墓標が見えている間は lock と変更系が
     /// FailedPrecondition になる。障害を除くと復旧が完了して変更が通る。
+    #[cfg(unix)]
     #[test]
     fn oci7_tombstone_visible_blocks_lock_and_mutations() {
         let root = Root::new();
@@ -1671,6 +1701,7 @@ mod tests {
 
     /// OCI-7: 初回の write_journal の公開後に root の fsync が失敗しても、ジャーナルを直接 unlink せず
     /// 墓標へ置換する。確定できない間は見えている墓標で変更が拒否され、障害を除くと変更が通る。
+    #[cfg(unix)]
     #[test]
     fn oci7_initial_publish_fsync_failure_tombstones_instead_of_unlink() {
         let root = Root::new();
@@ -1692,6 +1723,7 @@ mod tests {
     }
 
     /// OCI-7: 通常の lock 経路でも復旧結果（Abandoned と孤児 blob）が guard から取れる。
+    #[cfg(unix)]
     #[test]
     fn oci7_lock_exposes_abandoned_recovery() {
         let root = Root::new();
@@ -1724,6 +1756,7 @@ mod tests {
     }
 
     /// OCI-7: 書き込み中のクラッシュで残った一時ファイルは lock 時に回収される。
+    #[cfg(unix)]
     #[test]
     fn oci7_stale_journal_tmp_is_reaped_on_lock() {
         let root = Root::new();
@@ -1760,6 +1793,7 @@ mod tests {
     }
 
     /// 信頼性検査: 壊れた JSON・未知の version は DataLoss、ファイルには触らない。
+    #[cfg(unix)]
     #[test]
     fn oci7_journal_corrupt_or_unknown_version_is_data_loss() {
         for body in [
@@ -1854,6 +1888,7 @@ mod tests {
     }
 
     /// REPAIR-4: ジャーナルがあったときだけ gc_recover が記録される。
+    #[cfg(unix)]
     #[test]
     fn repair4_recovery_is_recorded_only_when_journal_exists() {
         let root = Root::new();

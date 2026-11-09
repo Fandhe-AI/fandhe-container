@@ -1,5 +1,7 @@
 //! `ref_reconcile` の単体試験（OCI-7・REPAIR-5・#2495）。状態ストアは `get` だけを差し替えた偽物を使い、root 不要。
 
+// Windows ホストは設計上 `ImageStore` を開けない（#4333）ため、ストアを使う試験とその補助は個別に unix に限る。
+
 use super::*;
 use fandhe_container_core::traits::{
     DeleteStateRequest, DeleteStateResponse, ListStateRequest, StateList, UpdateStateRequest,
@@ -45,14 +47,17 @@ impl StateStore for SpyStore {
 
 const SCOPE: &str = "0123456789abcdef0123456789abcdef";
 const OTHER_SCOPE: &str = "fedcba9876543210fedcba9876543210";
+#[cfg(unix)]
 const MANIFEST: &str = "sha256:a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0";
 
 fn key(scope: &str, id: &str) -> ContainerRefId {
     ContainerRefId::new(&ref_key(scope, id)).expect("key")
 }
 
+#[cfg(unix)]
 struct Tmp(std::path::PathBuf);
 
+#[cfg(unix)]
 impl Tmp {
     fn new(name: &str) -> Self {
         let dir =
@@ -68,12 +73,14 @@ impl Tmp {
     }
 }
 
+#[cfg(unix)]
 impl Drop for Tmp {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
+#[cfg(unix)]
 fn seeded_store(tmp: &Tmp) -> ImageStore {
     use fandhe_container_oci::image_management::ManifestComposition;
     use fandhe_container_oci::reference::Digest;
@@ -96,6 +103,7 @@ fn seeded_store(tmp: &Tmp) -> ImageStore {
     store
 }
 
+#[cfg(unix)]
 fn register(store: &ImageStore, k: &ContainerRefId) {
     use fandhe_container_oci::reference::Digest;
     store
@@ -103,6 +111,7 @@ fn register(store: &ImageStore, k: &ContainerRefId) {
         .expect("register");
 }
 
+#[cfg(unix)]
 fn unbound_keys(store: &ImageStore) -> Vec<ContainerRefId> {
     store
         .lock()
@@ -161,6 +170,7 @@ fn oci7_probe_skips_foreign_scope_and_folded_keys() {
 }
 
 /// OCI-7: 状態を読めない（Timeout）参照は照合しても残り、kept_undetermined に載る。
+#[cfg(unix)]
 #[test]
 fn oci7_reconcile_keeps_undetermined() {
     let tmp = Tmp::new("undetermined");
@@ -175,6 +185,7 @@ fn oci7_reconcile_keeps_undetermined() {
 }
 
 /// OCI-7: 別の状態ルートの参照は、同じイメージストアにあっても回収しない（読みもしない）。
+#[cfg(unix)]
 #[test]
 fn oci7_reconcile_does_not_cross_state_roots() {
     let tmp = Tmp::new("cross");
@@ -191,6 +202,7 @@ fn oci7_reconcile_does_not_cross_state_roots() {
 }
 
 /// OCI-7・REPAIR-5: 進行中の create（ゲートの共有）がある間は未確定参照を回収せず、終わった後は回収する。
+#[cfg(unix)]
 #[test]
 fn oci7_reclaim_skips_while_create_in_progress() {
     let tmp = Tmp::new("busy");
@@ -215,6 +227,7 @@ fn oci7_reclaim_skips_while_create_in_progress() {
 }
 
 /// OCI-7: 状態を確認できない・存在する未確定参照は、契機 A でも外さない。
+#[cfg(unix)]
 #[test]
 fn oci7_reclaim_keeps_unbound_when_undetermined() {
     let tmp = Tmp::new("keep");

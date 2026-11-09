@@ -1254,6 +1254,7 @@ mod tests {
     use crate::manifest::MEDIA_TYPE_OCI_LAYER_GZIP;
     use crate::reference::ImageReference;
     use rustls_native_certs::CertificateResult;
+    #[cfg(unix)]
     use std::path::PathBuf;
 
     /// OCI-1: manifest / blob URL の具体値。
@@ -2612,9 +2613,12 @@ mod tests {
         }
     }
 
+    // Windows ホストは設計上 `ImageStore` を開けない（#4333・#2428 案 C。拒否は store.rs の試験が照合）ため unix に限る。
     /// 一意な一時ストア root（0700。drop で削除）。`PullSession::open_staged_blob` の writer を得る土台。
+    #[cfg(unix)]
     struct TmpDir(PathBuf);
 
+    #[cfg(unix)]
     impl TmpDir {
         fn new(tag: &str) -> Self {
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -2657,6 +2661,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl Drop for TmpDir {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
@@ -2832,6 +2837,7 @@ mod tests {
     /// OCI-1・OCI-7・SEC-1（#2765）: `dest` の digest が descriptor と違えば `InvalidArgument`、書き込み済みの writer の
     /// 再利用は `FailedPrecondition`。どちらも通信 0 回で、writer の中身は変わらない。
     #[test]
+    #[cfg(unix)]
     fn blob_dest_mismatch_and_reuse_make_no_request() {
         let tmp = TmpDir::new("dest-checks");
         let store = tmp.store();
@@ -2900,6 +2906,7 @@ mod tests {
     /// OCI-1・OCI-7（#2765）: 公開メソッド `fetch_blob` が検査済み root の fd 起点の writer へ書き、`commit` の後に
     /// `<hex>` だけが残る（`.part` なし）。失敗した取得は `.part` を残さない。成功と失敗は 1 件ずつ記録される。
     #[test]
+    #[cfg(unix)]
     fn fetch_blob_public_api_writes_through_writer_and_records_outcomes() {
         use crate::instrument::{OciOpKind, OciOpOutcome};
         let (ep, repo) = alpine();
@@ -3235,6 +3242,7 @@ mod tests {
     }
 
     /// `get`（probe・token・manifest）と `get_stream`（blob）の両方を台本で返す偽の通信。
+    #[cfg_attr(not(unix), allow(dead_code))]
     #[derive(Debug)]
     struct FakePull {
         get: FakeTransport,
@@ -3254,6 +3262,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn pull_client(
         pull: Arc<FakePull>,
         rec: Arc<crate::instrument::testing::Collect>,
@@ -3269,6 +3278,7 @@ mod tests {
     /// OCI-3・TASK-54.3（受け入れ条件）: 認証が必要なレジストリで、公開メソッドだけで
     /// 認証 → manifest → blob の一連の pull が通り、各段に正しい Authorization が載る。
     #[test]
+    #[cfg(unix)]
     fn full_pull_with_bearer_registry() {
         let tmp = TmpDir::new("pull-bearer");
         let store = tmp.store();
@@ -3335,6 +3345,7 @@ mod tests {
     /// OCI-3・TASK-54.3: Basic のみのレジストリでも一連の pull が通り、manifest / blob に Basic が載る。
     /// blob が CDN へリダイレクトされても Authorization は漏れない。
     #[test]
+    #[cfg(unix)]
     fn full_pull_with_basic_registry_does_not_leak_to_redirect() {
         let tmp = TmpDir::new("pull-basic");
         let store = tmp.store();

@@ -2839,9 +2839,12 @@ jobs:
             echo "::error::${msg}" >&2
             exit 1
           fi
+          # 注入で plugin-cri を殺した後、外側の回収が起動し直して回収した固定の 1 行（#4326）。
           scripts/check-success-lines.sh --name production_binary_exec_real \
             --src crates/plugin-cri/tests/cri_exec_real.rs --log "${log}" --libtest-ignored \
-            --select '^test [A-Za-z0-9_]+ \.\.\. ' --forbid 'PRECONDITION FAILED' --summary
+            --select '^test [A-Za-z0-9_]+ \.\.\. ' --forbid 'PRECONDITION FAILED' \
+            --require 'production_binary_exec_real: plugin restarted for reclaim reclaimed containers=1 sandboxes=1' \
+            --summary
 
       # production_binary_attach_real（`crates/plugin-cri/tests/cri_attach_real.rs`。libtest の `#[ignore]`。
       # CRI-6・SUP-4・SEC-1・REPAIR-12・#4079）: 本番バイナリ越しに実コンテナ（busybox）へ完全版 Attach を通し、
@@ -2884,9 +2887,12 @@ jobs:
             echo "::error::${msg}" >&2
             exit 1
           fi
+          # 注入で plugin-cri を殺した後、外側の回収が起動し直して回収した固定の 1 行（#4326）。
           scripts/check-success-lines.sh --name production_binary_attach_real \
             --src crates/plugin-cri/tests/cri_attach_real.rs --log "${log}" --libtest-ignored \
-            --select '^test [A-Za-z0-9_]+ \.\.\. ' --forbid 'PRECONDITION FAILED' --summary
+            --select '^test [A-Za-z0-9_]+ \.\.\. ' --forbid 'PRECONDITION FAILED' \
+            --require 'production_binary_attach_real: plugin restarted for reclaim reclaimed containers=1 sandboxes=1' \
+            --summary
 
   # --------------------------------------------------
   # bench-regression（ベンチ回帰「比較の仕組み」導入: TASK-86.3・REPAIR-7 第 4 段階・REPAIR-8）

@@ -21,7 +21,9 @@
 //!
 //! plugin 自体が死んだ場合（#4285）: 本部品は接続済みの client だけを使う。接続できないとき [`reclaim`] は `unverified` を
 //! 返すので、呼び出し側が [`plugin_unreachable`] で判定し、同じ状態ルートで plugin を起動し直してから回収し直す
-//! （`container_grpc.rs`・`cri_exec_real.rs` の段 4）。`cri_attach_real.rs` の外側の回収で起動し直す経路は未対応（REPAIR-3）。
+//! （`container_grpc.rs`・`cri_exec_real.rs` の段 4）。外側の回収で起動し直す手順は [`reclaim_restarting`] に寄せた（#4326）。
+//! 判断（[`needs_restart`]）と回収の 2 回は本部品が持ち、旧 plugin の kill と回収・spawn・接続は試験ごとに複製した
+//! ハーネスを使うクロージャで注入する（`container_grpc.rs`・`cri_exec_real.rs`・`cri_attach_real.rs` が利用）。
 //!
 //! 取り込みの注意: `#[path]` で複数の試験バイナリへ取り込まれるため、本部品の自己照合の `#[test]` は取り込み側ごとに重ねて走る。
 
@@ -249,6 +251,80 @@ pub fn plugin_unreachable(r: &ReclaimReport) -> bool {
     !r.unverified.is_empty()
         && r.reclaimed_containers.is_empty()
         && r.reclaimed_sandboxes.is_empty()
+}
+
+#[allow(dead_code)] // 取り込む試験ごとに使う項目が異なるため
+/// 起動し直しが要るか（#4326）。plugin の子プロセスが終了済み、または [`plugin_unreachable`] のとき真。
+pub fn needs_restart(plugin_exited: bool, r: &ReclaimReport) -> bool {
+    plugin_exited || plugin_unreachable(r)
+}
+
+#[allow(dead_code)] // 取り込む試験ごとに使う項目が異なるため
+/// [`reclaim_restarting`] の結果。
+#[derive(Debug)]
+pub struct RestartReclaim {
+    /// 起動し直す前の回収の結果。
+    pub first: ReclaimReport,
+    /// 起動し直した後の回収の結果（起動し直したときだけ `Some`）。
+    pub after_restart: Option<ReclaimReport>,
+}
+
+#[allow(dead_code)] // 取り込む試験ごとに使う項目が異なるため
+impl RestartReclaim {
+    pub fn restarted(&self) -> bool {
+        self.after_restart.is_some()
+    }
+
+    /// 最終の回収の結果（起動し直したならその後のもの）。
+    pub fn final_report(&self) -> &ReclaimReport {
+        self.after_restart.as_ref().unwrap_or(&self.first)
+    }
+
+    /// 最終の回収の結果を取り出す。
+    pub fn into_final(self) -> ReclaimReport {
+        self.after_restart.unwrap_or(self.first)
+    }
+}
+
+#[allow(dead_code)] // 取り込む試験ごとに使う項目が異なるため
+/// 回収し、plugin が死んでいたら `restart` で起動し直して回収し直す（#4326・CRI-1・CRI-6・REPAIR-12）。
+/// `restart` は旧 plugin の kill と回収（`.cri/@instance.lock` の解放）→ spawn → 接続を行い、新しい client を返す
+/// （新しい guard の保管も呼び出し側が行う）。起動し直しは高々 1 回。台帳は 1 回目の回収で空になるので、
+/// 起動し直した後はトークン label の一覧で記録を見つける。
+pub async fn reclaim_restarting<R>(
+    c: &mut RuntimeServiceClient<Channel>,
+    ledger: &Ledger,
+    token: &str,
+    plugin_exited: bool,
+    restart: R,
+) -> RestartReclaim
+where
+    R: AsyncFnOnce() -> RuntimeServiceClient<Channel>,
+{
+    let first = reclaim(c, ledger, token, CLEANUP_BUDGET).await;
+    if !needs_restart(plugin_exited, &first) {
+        return RestartReclaim {
+            first,
+            after_restart: None,
+        };
+    }
+    *c = restart().await;
+    let after = reclaim(c, ledger, token, CLEANUP_BUDGET).await;
+    RestartReclaim {
+        first,
+        after_restart: Some(after),
+    }
+}
+
+#[allow(dead_code)] // 取り込む試験ごとに使う項目が異なるため
+/// 起動し直して回収したときの固定の 1 行（REPAIR-4。ID は出さない）。起動し直していなければ `None`。
+pub fn restart_reclaim_line(test: &str, r: &RestartReclaim) -> Option<String> {
+    let a = r.after_restart.as_ref()?;
+    Some(format!(
+        "{test}: plugin restarted for reclaim reclaimed containers={} sandboxes={}",
+        a.reclaimed_containers.len(),
+        a.reclaimed_sandboxes.len()
+    ))
 }
 
 /// label の selector で絞った一覧。失敗した一覧は空にして理由を 3 つ目に返す（残存なしとは見なさない）。
@@ -545,4 +621,54 @@ fn reclaim_4142_ledger_record_and_forget() {
     let g = lock(&l);
     assert_eq!(g.sandboxes, vec!["s1".to_owned()]);
     assert_eq!(g.containers, vec!["c2".to_owned()]);
+}
+
+#[test]
+fn reclaim_4326_needs_restart_boundaries() {
+    let empty = ReclaimReport::default();
+    assert!(needs_restart(true, &empty));
+    assert!(!needs_restart(false, &empty));
+    let unv = ReclaimReport {
+        unverified: vec!["list_containers: unavailable".into()],
+        ..Default::default()
+    };
+    assert!(needs_restart(false, &unv));
+    let got = ReclaimReport {
+        reclaimed_sandboxes: vec!["s".into()],
+        ..unv
+    };
+    assert!(!needs_restart(false, &got));
+}
+
+#[test]
+fn reclaim_4326_restart_line_and_final_report() {
+    let first = ReclaimReport {
+        unverified: vec!["list_containers: unavailable".into()],
+        ..Default::default()
+    };
+    let none = RestartReclaim {
+        first,
+        after_restart: None,
+    };
+    assert!(!none.restarted());
+    assert_eq!(restart_reclaim_line("t", &none), None);
+    assert_eq!(none.final_report().unverified.len(), 1);
+    let done = RestartReclaim {
+        first: ReclaimReport::default(),
+        after_restart: Some(ReclaimReport {
+            reclaimed_containers: vec!["c".into()],
+            reclaimed_sandboxes: vec!["s".into()],
+            ..Default::default()
+        }),
+    };
+    assert!(done.restarted());
+    assert_eq!(
+        restart_reclaim_line("t", &done).as_deref(),
+        Some("t: plugin restarted for reclaim reclaimed containers=1 sandboxes=1")
+    );
+    assert_eq!(
+        done.final_report().reclaimed_containers,
+        vec!["c".to_owned()]
+    );
+    assert_eq!(done.into_final().reclaimed_sandboxes, vec!["s".to_owned()]);
 }

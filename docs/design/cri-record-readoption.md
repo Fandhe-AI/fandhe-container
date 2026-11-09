@@ -369,11 +369,13 @@ kubernetes v1.37.1（commit `d2b770f4c94636a992534a8d3156b6b2d8e82ac3`）で確�
 - `production_binary_full_lifecycle_real`: pull は 1 回で、本体を 2 回走らせる。1 回目は Start と Running の確認の直後に注入した失敗で落とし、台帳とトークン label の回収が 1 件ずつ消すことを照合する。2 回目は同じ metadata で通す（回収が効かなければ `ALREADY_EXISTS`）。回収時に plugin が死んでいれば同じ状態ルートで起動し直す
 - `production_binary_restart_readopts_running_container_real`: 先頭の回収はちょうど 1 回で、状態ルートに残骸があるときだけ使い捨ての plugin を起動して許可リストの所有者 label の記録を消す。その後の前提検査（`restart_gate`）は従来どおり label の無い残骸で失敗し（fail-closed）、本体の照合（件数・フィルタなしの一覧）は緩めない。本体が失敗したら plugin を起動し直して自分のトークンの記録を回収する
 - `production_binary_exec_real` の段 4: SIGKILL → 起動し直し → 再採用の後、回収が Remove と残存確認を担い、回収した ID が自分の 1 件ずつであることを照合する
+- `production_binary_exec_real`・`production_binary_attach_real` の外側の回収（#4326）: 試行 1 の注入で StartContainer の直後に plugin-cri を SIGKILL してから panic させ、外側の回収が共有の `reclaim_restarting`（死活の判定 `needs_restart`・回収 2 回・固定の 1 行）で起動し直して回収する。旧 plugin の kill と回収・spawn・接続は試験ごとに複製したハーネスのクロージャで注入する。照合は「起動し直した」「1 回目が `plugin_unreachable`」「回収が 1/1 で `is_clean()`」「旧 ID が `NOT_FOUND`」で、固定の 1 行 `<試験名>: plugin restarted for reclaim reclaimed containers=1 sandboxes=1` は CI が `--require` で照合する。試行 2 の後は plugin が生きているので起動し直さない。`container_grpc.rs` の局所の重複もこの部品に寄せた
+- 既定の集合の根拠（起動し直しの部品。#4326）: `cri1_cri6_4326_reclaim_restarting_respawns_dead_plugin_and_reclaims_token_records`（root・ネットワーク不要）が、死んだ接続で `plugin_unreachable`、起動し直した後に 1/1 を回収して `is_clean()`、固定の 1 行が完全一致、記録ファイルが消えることを照合する
 - 既定の集合の根拠: `cri1_cri6_4285_owned_residue_is_readopted_and_reclaimed_after_plugin_sigkill`（root・ネットワーク不要）が、死んだ plugin への接続での `unverified`、起動し直した plugin での所有者ごとの回収、label の無い記録が残り前提検査が `entries=1` の固定文言で失敗すること、再採用の要約行を具体値で照合する
 - `shim_v2_{containerd,kill_all,exec}_real`: CRI の記録を持たないため gRPC の回収は当てはまらない。コンテナ ID・namespace に pid と時刻のタグを入れて一意にし（`support/shim_real_unique.rs`）、旧形式（pid だけ）の残骸のおとりを排他作成して結果に影響しないことを確かめる（kill_all・exec）。状態ディレクトリの先頭での自動削除はしない（生きている supervisor の状態を消すおそれ）
 
 却下案: restart の本体で残骸を許す変更、shim の状態ディレクトリの自動削除。
-残余: `cri_attach_real` と `cri_exec_real` の外側の回収で plugin が予期せず死んだときの起動し直し（今回は container_grpc と段 4 のみ）、label の無い残骸の自動回収（手動の手順は `docs/setup/cri-record-recovery.md`）。ステップの期限・watchdog・pull の回数（4）・`PROBE_MIN_REMAINING=4` は変えない。
+残余: 起動し直した後に Exec / Attach を再採用したコンテナへ通す確認（回収は Stop / Remove だけを使う）、label の無い残骸の自動回収（手動の手順は `docs/setup/cri-record-recovery.md`）。ステップの期限・watchdog・pull の回数（4）・`PROBE_MIN_REMAINING=4` は変えない。
 
 ## セキュリティ上の要点
 

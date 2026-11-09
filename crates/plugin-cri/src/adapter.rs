@@ -121,7 +121,8 @@ use fandhe_container_supervisor::logs::{
     remove_container_logs_guarded_bounded_waiting,
 };
 use fandhe_container_supervisor::supervisor_log::{
-    SUPERVISOR_LOG_REMOVE_TIMEOUT, remove_guarded_bounded_waiting,
+    SUPERVISOR_LOG_REMOVE_TIMEOUT, remove_guarded_bounded, remove_guarded_bounded_waiting,
+    sweep_stale_supervisor_logs,
 };
 
 /// 起動・シグナル系の未実装文言（固定。入力を含めない。非 Linux でだけ返す。Linux は supervisor 経由で結線済み）。
@@ -505,7 +506,7 @@ impl CriPluginBackends {
 /// supervisor の起動結果の受信期限（`start_contract::cli_receive_deadline`）に 2 秒の余裕を足した値。CRI の既定
 /// （10 秒）のままだと、起動が成功しても結果不明（exited）に倒れる。`stop` の待ちは CRI 側がこれに SIGTERM の猶予を足す。
 ///
-/// `create` の最悪（#2760）: ログ回収 5 秒 + 起動オプション文書の掃除 10 秒 + 状態ロック 5 秒 + 監査記録 2 回（22.9 秒）= 42.9 秒。
+/// `create` の最悪（#2760）: コンテナログ回収 5 秒 + supervisor ログ回収 5 秒（#4342）+ 起動オプション文書の掃除 10 秒 + 状態ロック 5 秒 + 監査記録 2 回（22.9 秒）= 47.9 秒。
 /// running への force `delete` の最悪: 全体を [`PLUGIN_FORCE_DELETE_DEADLINE`]（47 秒）で打ち切る。後始末の前は、状態の読み取り 5 秒、
 /// stop 22 秒（`FORCE_DELETE_STOP_BUDGET`。状態ロックの待ちを含めて各段を admission で頭打ちにする。#3143）、
 /// core の delete 20 秒（状態ロック 3 回と exec 掃除 5 秒）の計 47 秒で、後始末（ログ 2 件〔共有の待ち 10 秒と各最後の試行 5 秒ずつ。#2964〕と
@@ -513,7 +514,7 @@ impl CriPluginBackends {
 /// どちらもこの値に収まる（`tests/lifecycle_supervisor.rs` の `repair5_*_worst_case_fits_runtime_timeout` で照合する）。
 /// bundle の用意（`BundleProvider::prepare`）と core の create のファイル I/O は 2 段で上限づける（#2821）。RPC の応答は
 /// この値で打ち切られ（DEADLINE_EXCEEDED）、実行層への dispatch より前の worker は取り消しの旗で打ち切られる（展開は
-/// エントリ単位。#2899）。dispatch 後の worker は打ち切れず、core の create 42.9 秒 + 失敗時の削除確認（この値）で有限になる
+/// エントリ単位。#2899）。dispatch 後の worker は打ち切れず、core の create 47.9 秒 + 失敗時の削除確認（この値）で有限になる
 /// （内訳は `docs/design/container-log-removal-wait.md`、照合は `repair5_create_worker_residual_is_bounded`）。
 pub const PLUGIN_RUNTIME_TIMEOUT: Duration = Duration::from_millis(60_900);
 
@@ -548,6 +549,10 @@ fn production_extract_config(
 }
 
 /// 起動時の残りログの走査の全体の期限（#2760・REPAIR-5。サーブの開始は待たせず、別スレッドで走る）。
+///
+/// コンテナログの走査と supervisor ログの走査（#4342）が共有する 1 つの枠で、コンテナログが先に全期限で走り、
+/// supervisor ログは残りの時間を使う（置き去りにされうる blocking タスクの壁時計の上限を 30 秒のまま保つ。
+/// 既存のコンテナログの走査の期限を食わず、2 つが共有の作業枠を奪い合わないよう並行させない）。
 pub const STARTUP_LOG_SWEEP_BUDGET: Duration = Duration::from_secs(30);
 
 /// plugin の起動時に 1 回、状態の記録が無い ID の残りコンテナログを回収する（#2760・CRI-2・SUP-7・REPAIR-4）。
@@ -559,21 +564,66 @@ pub const STARTUP_LOG_SWEEP_BUDGET: Duration = Duration::from_secs(30);
 /// `container_log_reclaim` へ Success を計上する。呼び出し元は `main.rs` の `serve`（ブロッキングスレッド）と、shim v2 の serve の
 /// 起動時（`shim::startup_sweep`。scoped 状態ルートを裏の thread で走査する。#4280）。
 /// 走査はこの時点で存在する残りだけを対象にし、稼働中に発生した残りは次の起動まで残る（設計: `docs/design/container-log-removal-wait.md`）。
+/// supervisor ログ側は [`sweep_leftover_supervisor_logs`]。
 pub fn sweep_leftover_container_logs(
     store: &Arc<dyn StateStore>,
     recorder: &OpRecorder,
     budget: Duration,
 ) -> Option<fandhe_container_supervisor::logs::SweepReport> {
+    sweep_leftover_with(
+        store,
+        recorder,
+        budget,
+        fandhe_container_supervisor::logs::sweep_stale_container_logs,
+        "container_log_reclaim",
+    )
+}
+
+/// plugin の起動時に 1 回、状態の記録が無い ID の残り supervisor ログ（`@supervisor-logs`）を回収する
+/// （#4342・#4296・CRI-2・SUP-7・REPAIR-4）。
+///
+/// [`sweep_leftover_container_logs`] と同じ guard（記録が無く、sink の flock が外れている ID だけ）と契約で、走査本体は
+/// `supervisor_log::sweep_stale_supervisor_logs`。消せた ID ごとに記録器の `supervisor_log_reclaim` へ Success を計上する
+/// （`container_log_reclaim` とは別の固定の名前）。呼び出し元は `main.rs` の `serve`（コンテナログの走査の後、残りの期限で）。
+pub fn sweep_leftover_supervisor_logs(
+    store: &Arc<dyn StateStore>,
+    recorder: &OpRecorder,
+    budget: Duration,
+) -> Option<fandhe_container_supervisor::logs::SweepReport> {
+    sweep_leftover_with(
+        store,
+        recorder,
+        budget,
+        sweep_stale_supervisor_logs,
+        "supervisor_log_reclaim",
+    )
+}
+
+/// 走査関数の型（ディレクトリ別の走査関数を差し替える）。
+type SweepFn = fn(
+    &std::path::Path,
+    Arc<dyn Fn(&ContainerId) -> bool + Send + Sync>,
+    Duration,
+) -> fandhe_container_supervisor::logs::SweepReport;
+
+/// 起動時の走査の共通本体（REPAIR-1）。ディレクトリ別の走査関数と計上する操作名だけが 2 種の入口で違う。
+fn sweep_leftover_with(
+    store: &Arc<dyn StateStore>,
+    recorder: &OpRecorder,
+    budget: Duration,
+    sweep: SweepFn,
+    op_name: &'static str,
+) -> Option<fandhe_container_supervisor::logs::SweepReport> {
     let root = store.host_state_root()?;
     let started = Instant::now();
     let guard_store = Arc::clone(store);
-    let report = fandhe_container_supervisor::logs::sweep_stale_container_logs(
+    let report = sweep(
         root,
         Arc::new(move |id| CoreLifecycleRuntime::id_is_absent(&guard_store, id)),
         budget,
     );
     if report.reclaimed_ids > 0
-        && let Ok(name) = OpName::new("container_log_reclaim")
+        && let Ok(name) = OpName::new(op_name)
     {
         let each = started.elapsed() / u32::try_from(report.reclaimed_ids).unwrap_or(u32::MAX);
         for _ in 0..report.reclaimed_ids {
@@ -581,6 +631,24 @@ pub fn sweep_leftover_container_logs(
         }
     }
     Some(report)
+}
+
+/// 起動時の 2 種の走査（コンテナログ → supervisor ログ）を [`STARTUP_LOG_SWEEP_BUDGET`] の 1 つの枠で順に行う
+/// （#4342・REPAIR-5）。supervisor ログは `budget` からコンテナログの走査に使った時間を引いた残りで走る
+/// （残りが 0 なら期限切れの報告になる）。戻りは（コンテナログ, supervisor ログ）。
+pub fn sweep_leftover_logs_at_startup(
+    store: &Arc<dyn StateStore>,
+    recorder: &OpRecorder,
+    budget: Duration,
+) -> (
+    Option<fandhe_container_supervisor::logs::SweepReport>,
+    Option<fandhe_container_supervisor::logs::SweepReport>,
+) {
+    let started = Instant::now();
+    let containers = sweep_leftover_container_logs(store, recorder, budget);
+    let supervisors =
+        sweep_leftover_supervisor_logs(store, recorder, budget.saturating_sub(started.elapsed()));
+    (containers, supervisors)
 }
 
 /// ログ削除の結果（`Ok`／`Err`）を `container_delete_cleanup` の結果へ写す（#2894・#2964・ERR-1）。
@@ -599,8 +667,20 @@ fn cleanup_outcome_of(result: &Result<RemovedLogs, TraitError>) -> CleanupOutcom
 /// 起動時の走査の結果の構造化ログ 1 行（`event: container_log_sweep`。#2760・REPAIR-4）。件数だけで、パス・ID は含めない。
 /// `workers_busy` は枠の満杯で打ち切ったことを示し、期限切れの `timed_out` とは別（#2894）。
 pub fn sweep_summary_line(r: &fandhe_container_supervisor::logs::SweepReport) -> String {
+    sweep_line("container_log_sweep", r)
+}
+
+/// supervisor ログの起動時の走査の結果の構造化ログ 1 行（`event: supervisor_log_sweep`。#4342・REPAIR-4）。
+/// 欄は [`sweep_summary_line`] と同じ並びで、`event` だけが違う（コンテナログと supervisor ログの件数を区別する）。
+pub fn supervisor_log_sweep_summary_line(
+    r: &fandhe_container_supervisor::logs::SweepReport,
+) -> String {
+    sweep_line("supervisor_log_sweep", r)
+}
+
+fn sweep_line(event: &'static str, r: &fandhe_container_supervisor::logs::SweepReport) -> String {
     format!(
-        "{{\"level\":\"info\",\"event\":\"container_log_sweep\",\"scanned\":{},\"reclaimed_ids\":{},\"removed_files\":{},\"skipped_live\":{},\"skipped_present\":{},\"skipped_undecodable\":{},\"failed\":{},\"timed_out\":{},\"workers_busy\":{}}}",
+        "{{\"level\":\"info\",\"event\":\"{event}\",\"scanned\":{},\"reclaimed_ids\":{},\"removed_files\":{},\"skipped_live\":{},\"skipped_present\":{},\"skipped_undecodable\":{},\"failed\":{},\"timed_out\":{},\"workers_busy\":{}}}",
         r.scanned,
         r.reclaimed_ids,
         r.removed_files,
@@ -1371,8 +1451,8 @@ impl CoreLifecycleRuntime {
     /// （CLI の `create` と同じ契約。#2760・CRI-2・SUP-7・SUP-12・REPAIR-4・REPAIR-5）。
     ///
     /// CRI は ID を使い回さないため通常は何も無いが、`CreateContainer` が失敗した後の再試行や、手動で ID を指定した再作成で
-    /// 残りが新しい sink に混ざるのを防ぐ。待たずに 1 回だけ試し（ログ 5 秒・文書 10 秒が上限）、生きている sink・状態が既にある
-    /// ID には触れない。ログ回収が期限切れなら、作業スレッドが残り得るため core を呼ばずに `Timeout` で失敗させる
+    /// 残りが新しい sink に混ざるのを防ぐ。待たずに 1 回だけ試し（コンテナログ 5 秒・supervisor ログ 5 秒・文書 10 秒が上限。supervisor ログは #4342）、生きている sink・状態が既にある
+    /// ID には触れない。ログ回収（どちらの種類でも）が期限切れなら、作業スレッドが残り得るため core を呼ばずに `Timeout` で失敗させる
     /// （後続の監査記録は単一スレッド前提の fork を要する。SEC-4）。それ以外の失敗は best effort で create を続ける。
     /// 状態ルートを持たないストアでは何もしない。
     ///
@@ -1400,6 +1480,25 @@ impl CoreLifecycleRuntime {
             let _ = self.recorder.record(&name, outcome, started.elapsed());
         }
         result?;
+        // supervisor ログ（`@supervisor-logs`）の残り。コンテナログと同じ規則で、待たずに 1 回だけ試す（#4342・SUP-7）。
+        let started = Instant::now();
+        let store = Arc::clone(&self.store);
+        let guard_id = id.clone();
+        let removed = remove_guarded_bounded(root, id, SUPERVISOR_LOG_REMOVE_TIMEOUT, move || {
+            Self::id_is_absent(&store, &guard_id)
+        });
+        let sup_reclaim = supervisor_log_reclaim_of(&removed);
+        let sup_outcome = match sup_reclaim {
+            StaleLogReclaim::Removed(_) => Some(OpOutcome::Success),
+            StaleLogReclaim::Nothing => None,
+            StaleLogReclaim::Failed(_) | StaleLogReclaim::TimedOut => Some(OpOutcome::Failure),
+        };
+        if let Some(outcome) = sup_outcome
+            && let Ok(name) = OpName::new("supervisor_log_reclaim")
+        {
+            let _ = self.recorder.record(&name, outcome, started.elapsed());
+        }
+        supervisor_reclaim_timeout_result(sup_reclaim)?;
         // 起動オプション文書の残骸（best effort。失敗しても create は続ける。文書は世代の照合で採用されない）。
         let _ = self.remove_stale_options(id, options_store::OPTIONS_REMOVE_TIMEOUT);
         Ok(())
@@ -1610,6 +1709,27 @@ fn reclaim_timeout_result(reclaim: StaleLogReclaim) -> Result<(), TraitError> {
         StaleLogReclaim::TimedOut => Err(TraitError::new(
             ErrorCode::Timeout,
             "stale container log reclaim did not finish within the deadline",
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// supervisor ログの回収結果を `StaleLogReclaim` へ写す（`reclaim_stale_container_logs` と同じ分類。#4342・SUP-7）。
+fn supervisor_log_reclaim_of(result: &Result<RemovedLogs, TraitError>) -> StaleLogReclaim {
+    match result {
+        Ok(r) if r.log_files() > 0 => StaleLogReclaim::Removed(r.log_files()),
+        Ok(_) => StaleLogReclaim::Nothing,
+        Err(e) if e.code() == ErrorCode::Timeout => StaleLogReclaim::TimedOut,
+        Err(e) => StaleLogReclaim::Failed(e.code()),
+    }
+}
+
+/// create 前の supervisor ログ回収の結果を、core を呼ぶかの判断へ写す（期限切れだけが失敗。固定文言。#4342・SEC-4・REPAIR-5）。
+fn supervisor_reclaim_timeout_result(reclaim: StaleLogReclaim) -> Result<(), TraitError> {
+    match reclaim {
+        StaleLogReclaim::TimedOut => Err(TraitError::new(
+            ErrorCode::Timeout,
+            "stale supervisor log reclaim did not finish within the deadline",
         )),
         _ => Ok(()),
     }
@@ -2426,6 +2546,55 @@ mod tests {
             ),
             "{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"c1\",\"target\":\"container_options\",\"code\":\"RESOURCE_EXHAUSTED\",\"message\":\"cleanup after delete left resources behind\"}"
         );
+    }
+
+    /// #4342: supervisor ログの要約の行は `event` だけが違い、欄の並びは同じ。
+    #[test]
+    fn sup7_4342_supervisor_sweep_summary_line_differs_only_in_event() {
+        let r = fandhe_container_supervisor::logs::SweepReport {
+            workers_busy: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            supervisor_log_sweep_summary_line(&r),
+            "{\"level\":\"info\",\"event\":\"supervisor_log_sweep\",\"scanned\":0,\"reclaimed_ids\":0,\"removed_files\":0,\"skipped_live\":0,\"skipped_present\":0,\"skipped_undecodable\":0,\"failed\":0,\"timed_out\":false,\"workers_busy\":true}"
+        );
+        assert_eq!(
+            supervisor_log_sweep_summary_line(&r)
+                .replace("supervisor_log_sweep", "container_log_sweep"),
+            sweep_summary_line(&r)
+        );
+    }
+
+    /// #4342: supervisor ログ回収の結果の写像（失敗・期限切れ・0 件）と、期限切れだけが失敗になること。
+    #[test]
+    fn sup7_4342_supervisor_log_reclaim_mapping() {
+        let err = |c| Err(TraitError::new(c, "x"));
+        assert_eq!(
+            supervisor_log_reclaim_of(&err(ErrorCode::Timeout)),
+            StaleLogReclaim::TimedOut
+        );
+        assert_eq!(
+            supervisor_log_reclaim_of(&err(ErrorCode::FailedPrecondition)),
+            StaleLogReclaim::Failed(ErrorCode::FailedPrecondition)
+        );
+        assert_eq!(
+            supervisor_log_reclaim_of(&err(ErrorCode::ResourceExhausted)),
+            StaleLogReclaim::Failed(ErrorCode::ResourceExhausted)
+        );
+        let e = supervisor_reclaim_timeout_result(StaleLogReclaim::TimedOut).expect_err("timeout");
+        assert_eq!(e.code(), ErrorCode::Timeout);
+        assert_eq!(
+            e.message(),
+            "stale supervisor log reclaim did not finish within the deadline"
+        );
+        for ok in [
+            StaleLogReclaim::Removed(2),
+            StaleLogReclaim::Nothing,
+            StaleLogReclaim::Failed(ErrorCode::FailedPrecondition),
+        ] {
+            assert!(supervisor_reclaim_timeout_result(ok).is_ok());
+        }
     }
 
     /// #2894: 走査の要約行は `workers_busy` を `timed_out` と別に出す。

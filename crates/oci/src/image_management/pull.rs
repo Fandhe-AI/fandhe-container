@@ -77,7 +77,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use super::root_handle::{self, BlobDir, PullDir, RootHandle, SubDir, SubDirError};
 use super::tag::ImageTagChange;
 use super::usage::blob_path;
-use super::{ImageStore, MAX_COMPOSITION_LAYERS, ManifestComposition, PullId, TagKey};
+use super::{
+    IMAGE_STORE_BLOB_DIR as BLOB_DIR, ImageStore, MAX_COMPOSITION_LAYERS, ManifestComposition,
+    PullId, TagKey,
+};
 use crate::error::{OciError, OciErrorCode};
 use crate::instrument::{OciOpKind, OciOpRecorder, record_oci_op};
 #[cfg(not(unix))]
@@ -254,6 +257,33 @@ impl PublishedRootfsParent {
     }
 }
 
+/// 開いた `<root>/blobs`（配下の `sha256` を作る前に信頼条件を確かめるための中間値。pull の入口 `blobs_dir` が使う。
+/// OCI-7・SEC-1・CRI-3・#4320）。
+#[derive(Debug)]
+pub struct BlobDirParent {
+    blobs: SubDir,
+}
+
+impl BlobDirParent {
+    /// `<root>/blobs` 自身のメタデータ（開いた fd の fstat）。
+    pub fn metadata(&self) -> Result<std::fs::Metadata, OciError> {
+        self.blobs.meta().map_err(blob_stat_err)
+    }
+
+    /// 直下の `sha256` を（無ければ 0700 で）作って開き、その fd の fstat を返す。
+    pub fn ensure_sha256(&self) -> Result<std::fs::Metadata, OciError> {
+        let sha256 = self.blobs.ensure_subdir(BLOB_DIR[1])?;
+        sha256.meta().map_err(blob_stat_err)
+    }
+}
+
+fn blob_stat_err(_: std::io::Error) -> OciError {
+    err(
+        OciErrorCode::Internal,
+        "failed to inspect the blob directory",
+    )
+}
+
 /// 公開済み rootfs の 1 エントリ `<root>/rootfs/sha256/<hex>`（[`PublishedRootfsDir::open_entry`] が開く）。
 #[derive(Debug)]
 pub struct PublishedRootfsEntry {
@@ -348,6 +378,14 @@ impl ImageStore {
             return Ok(None);
         };
         Ok(Some(PublishedRootfsDir { rootfs, sha256 }))
+    }
+
+    /// blob 置き場の親 `<root>/blobs` だけを（無ければ 0700 で）検査済み root の fd 起点で作って開く。呼び出し側が
+    /// [`BlobDirParent::metadata`] で所有者・権限を確かめてから [`BlobDirParent::ensure_sha256`] を呼ぶ
+    /// （検証前に配下を作らない。OCI-7・SEC-1・CRI-3・#4320）。
+    pub fn ensure_blob_dir_parent(&self) -> Result<BlobDirParent, OciError> {
+        let blobs = self.handle().ensure_subdir(BLOB_DIR[0])?;
+        Ok(BlobDirParent { blobs })
     }
 
     /// `blobs` と `blobs/sha256` 自身のメタデータ（開いた fd の fstat。この順）を返す。どちらかが無ければ `None`、

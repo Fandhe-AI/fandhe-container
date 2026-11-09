@@ -173,6 +173,7 @@ fn short() -> ExecBudgets {
         result_grace: Duration::from_millis(200),
         extinction_grace: Duration::from_millis(300),
         signal_ack: Duration::from_millis(400),
+        spawned: Duration::from_millis(100),
     }
 }
 
@@ -386,9 +387,9 @@ fn spawning(gap: Duration, spawn_count: usize, outcome: Option<StreamExecOutcome
     })
 }
 
-/// CRI-5・SUP-6・#4316: `Spawned` が届く前の `pid()` は `None`、届いた後は具体値 4242。`Result` の後も値は保たれる。
+/// CRI-5・SUP-6・#4318: launch は `Spawned` を待ってから返すため、戻りの時点で `pid()` は具体値 4242。`Result` の後も保たれる。
 #[test]
-fn cri5_4316_shim_pid_is_reported_after_spawned() {
+fn cri5_4318_launch_waits_for_spawned() {
     let fx = Fixture::new("spawned");
     let (l, _) = fx.launcher(
         spawning(
@@ -399,8 +400,11 @@ fn cri5_4316_shim_pid_is_reported_after_spawned() {
         probe(0),
         ExecBudgets::default(),
     );
+    let t = Instant::now();
     let p = l.launch(&cid("run1"), &eid(), &ok_spec()).expect("launch");
-    assert_eq!(p.pid(), None, "Spawned has not arrived yet");
+    assert_eq!(p.pid(), NonZeroU32::new(4242));
+    assert!(t.elapsed() >= Duration::from_millis(300));
+    assert!(t.elapsed() < Duration::from_secs(2));
     assert_eq!(
         p.wait_exit(WAIT, Duration::from_millis(10), &never_cancel),
         Ok(Some(0))
@@ -408,16 +412,68 @@ fn cri5_4316_shim_pid_is_reported_after_spawned() {
     assert_eq!(p.pid(), NonZeroU32::new(4242));
 }
 
+/// CRI-5・SUP-6・#4318: 予算内に `Spawned` が届かなければ launch は成功したまま `pid()` は `None`。後で届けば値になる。
+#[test]
+fn cri5_4318_spawned_after_budget_is_none_then_value() {
+    let fx = Fixture::new("spawnedlate");
+    let budgets = ExecBudgets {
+        spawned: Duration::from_millis(50),
+        ..ExecBudgets::default()
+    };
+    let (l, _) = fx.launcher(
+        spawning(
+            Duration::from_millis(400),
+            1,
+            Some(StreamExecOutcome::Exited(0)),
+        ),
+        probe(0),
+        budgets,
+    );
+    let p = l.launch(&cid("run1"), &eid(), &ok_spec()).expect("launch");
+    assert_eq!(p.pid(), None, "Spawned has not arrived within the budget");
+    assert_eq!(
+        p.wait_exit(WAIT, Duration::from_millis(10), &never_cancel),
+        Ok(Some(0))
+    );
+    assert_eq!(p.pid(), NonZeroU32::new(4242));
+}
+
+/// REPAIR-5・CRI-5・#4318: `Spawned` も `Result` も来ない保持では、待ちは `spawned` の予算で打ち切られ pid 不明の Running を返す。
+#[test]
+fn repair5_4318_holding_without_spawned_is_bounded() {
+    let fx = Fixture::new("spawnedhold");
+    let budgets = ExecBudgets {
+        spawned: Duration::from_millis(200),
+        ..ExecBudgets::default()
+    };
+    let (l, _) = fx.launcher(holding(), probe(0), budgets);
+    let t = Instant::now();
+    let p = l.launch(&cid("run1"), &eid(), &ok_spec()).expect("launch");
+    assert!(t.elapsed() >= Duration::from_millis(200));
+    assert!(t.elapsed() < Duration::from_secs(2));
+    assert_eq!(p.pid(), None);
+    assert_eq!(p.status(), Ok(ExecProcessStatus::Running));
+}
+
 /// CRI-5・SUP-6・#4316: `Spawned` が無いまま `Result` が来ても正当で、`pid()` は `None` のまま。`wait_exit` は終了コードを返す。
 #[test]
 fn cri5_4316_shim_result_without_spawned_keeps_pid_none() {
     let fx = Fixture::new("nospawn");
+    let budgets = ExecBudgets {
+        spawned: Duration::from_secs(5),
+        ..ExecBudgets::default()
+    };
     let (l, _) = fx.launcher(
         spawning(Duration::ZERO, 0, Some(StreamExecOutcome::Exited(0))),
         probe(0),
-        ExecBudgets::default(),
+        budgets,
     );
+    let t = Instant::now();
     let p = l.launch(&cid("run1"), &eid(), &ok_spec()).expect("launch");
+    assert!(
+        t.elapsed() < Duration::from_secs(1),
+        "a Result without Spawned must not consume the budget"
+    );
     assert_eq!(
         p.wait_exit(WAIT, Duration::from_millis(10), &never_cancel),
         Ok(Some(0))

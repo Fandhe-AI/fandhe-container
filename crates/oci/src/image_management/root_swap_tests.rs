@@ -1116,3 +1116,63 @@ fn oci7_sec1_published_rootfs_dir_open_and_ensure() {
     let _ = fs::remove_dir_all(&root);
     let _ = fs::remove_dir_all(&outside);
 }
+/// OCI-7・SEC-1・CRI-3・#4320: `ImageStore::open` の後に root が差し替わっても、`blobs/sha256` は検査済み root（移動先）に
+/// 作られ、おとりには何も作られない。返る fstat は移動先の実体と同じ inode（元の inode に留まる）。
+#[test]
+fn oci7_sec1_ensure_blob_dir_after_root_swap_creates_in_checked_root() {
+    use std::os::unix::fs::MetadataExt as _;
+    let root = temp_root("bd-root");
+    let moved = temp_root("bd-root-moved");
+    fs::remove_dir_all(&moved).expect("rm");
+    let store = open_store(&root);
+    swap_root(&root, &moved);
+
+    let parent = store.ensure_blob_dir_parent().expect("parent");
+    let meta = parent.ensure_sha256().expect("sha256");
+    assert_eq!(names(&root), Vec::<String>::new());
+    assert!(names(&moved).contains(&"blobs".to_string()));
+    let real = fs::metadata(moved.join("blobs").join("sha256")).expect("real");
+    assert_eq!(real.mode() & 0o777, 0o700);
+    assert_eq!(meta.ino(), real.ino());
+    drop(store);
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&moved);
+}
+
+/// OCI-7・SEC-1・CRI-3・#4320: open の後に `blobs` が別ディレクトリへの symlink に差し替わると `FailedPrecondition` で
+/// 拒否し、symlink 先には `sha256` を作らない。
+#[test]
+fn oci7_sec1_ensure_blob_dir_rejects_blobs_swapped_to_symlink() {
+    use std::os::unix::fs::symlink;
+    let root = temp_root("bd-sym");
+    let decoy = temp_root("bd-sym-decoy");
+    let store = open_store(&root);
+    store.ensure_blob_dir_parent().expect("create blobs");
+    fs::rename(root.join("blobs"), root.join("blobs-moved")).expect("move");
+    symlink(&decoy, root.join("blobs")).expect("symlink");
+
+    let e = store.ensure_blob_dir_parent().expect_err("symlinked blobs");
+    assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+    assert_eq!(names(&decoy), Vec::<String>::new());
+    drop(store);
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&decoy);
+}
+
+/// OCI-7・SEC-1・CRI-3・#4320: 親だけを用意した時点では `sha256` は無く（検証前に配下を作らない）、`ensure_sha256` の後に
+/// 1 件だけ現れ、2 回目も同じ inode を返す（冪等）。
+#[test]
+fn oci7_sec1_ensure_blob_dir_parent_checks_before_creating_sha256() {
+    use std::os::unix::fs::MetadataExt as _;
+    let root = temp_root("bd-order");
+    let store = open_store(&root);
+    let parent = store.ensure_blob_dir_parent().expect("parent");
+    assert_eq!(names(&root.join("blobs")), Vec::<String>::new());
+    assert_eq!(parent.metadata().expect("meta").mode() & 0o777, 0o700);
+    let first = parent.ensure_sha256().expect("sha256");
+    assert_eq!(names(&root.join("blobs")), vec!["sha256".to_string()]);
+    let second = parent.ensure_sha256().expect("again");
+    assert_eq!(first.ino(), second.ino());
+    drop(store);
+    let _ = fs::remove_dir_all(&root);
+}

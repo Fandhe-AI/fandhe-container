@@ -127,7 +127,15 @@ pub struct ExecBudgets {
     /// SIGKILL 以外のシグナルの `SignalAck` を待つ上限（helper の保留の猶予 2 秒より長くする。#4282・REPAIR-5）。
     /// 過ぎたら `DEADLINE_EXCEEDED`。
     pub signal_ack: Duration,
+    /// `Started` の後、`Spawned`（コマンドのホスト側 pid）を launch が待つ上限（#4318・CRI-5・REPAIR-5）。
+    /// 過ぎても届かなければ pid 不明のまま launch は成功する（pid は表示用）。
+    pub spawned: Duration,
 }
+
+/// `Spawned` を launch が待つ既定の上限。helper が worker から pid と pidfd を待つ猶予（`SIGNAL_START_GRACE` 2 秒）に揃える。
+/// 通常は fork からの待ちの刻み（数十〜100 ms）で届く。`start_exec` はコンテナ単位のゲートを持ったまま launch を呼ぶため、
+/// worker が詰まった異常時は最悪この時間だけ同じコンテナの操作を待たせる（#4318）。
+const SPAWNED_BUDGET: Duration = Duration::from_secs(2);
 
 /// 未確認になってから Wait が消滅の確認を待つ既定の猶予（supervisor の `REAP_BUDGET` と同じ 10 秒）。
 const EXTINCTION_GRACE: Duration = Duration::from_secs(10);
@@ -147,6 +155,7 @@ impl Default for ExecBudgets {
             result_grace: RESULT_GRACE,
             extinction_grace: EXTINCTION_GRACE,
             signal_ack: SIGNAL_ACK_BUDGET,
+            spawned: SPAWNED_BUDGET,
         }
     }
 }
@@ -208,9 +217,36 @@ impl Inner {
 
     /// `Spawned` の pid を記録する。2 回目以降（プロトコル違反）は `false` で、値は最初のものを保つ。
     fn record_pid(&self, pid: NonZeroU32) -> bool {
-        self.pid
+        let ok = self
+            .pid
             .compare_exchange(0, pid.get(), Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+            .is_ok();
+        if ok {
+            // 待ち手は phase のロック下で pid を確かめるため、ロックを一瞬取ってから起こして取りこぼしを防ぐ（#4318）。
+            drop(self.lock());
+            self.changed.notify_all();
+        }
+        ok
+    }
+
+    /// `Spawned` の記録・実行の終了・期限のいずれかまで待つ（launch から。#4318・REPAIR-5）。
+    fn wait_spawned(&self, until: Instant) {
+        let mut p = self.lock();
+        loop {
+            if self.recorded_pid().is_some() || !matches!(*p, Phase::Running) {
+                return;
+            }
+            let now = Instant::now();
+            if now >= until {
+                return;
+            }
+            let slice = WAIT_SLICE.min(until - now);
+            p = self
+                .changed
+                .wait_timeout(p, slice)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
     }
 
     /// 記録済みの pid（未着なら `None`）。
@@ -505,6 +541,11 @@ impl TaskExecLauncher for ShimExecLauncher {
                 );
             })
             .map_err(|_| fail(CriError::unavailable("failed to start the exec watcher")))?;
+        // `Spawned` か終了か予算切れまで待ってから返す。cri の Start 応答と TaskExecStarted が実 pid を持てる（#4318）。
+        // 届かなくても失敗にはしない（pid は表示用で、不明なら 0 のまま）。
+        if let Some(until) = Instant::now().checked_add(self.budgets.spawned) {
+            inner.wait_spawned(until);
+        }
         // 送信用の端は手放さず `ShimExecProcess` が持つ（SIGKILL 以外のシグナルの `Signal` frame を送る。#4282）。
         // 要求元の消滅の検知は「端がすべて閉じる」ことなので、監視スレッドの端が残る間は handle の drop で誤検知しない。
 
@@ -686,8 +727,9 @@ enum Snapshot {
 }
 
 impl TaskExecProcess for ShimExecProcess {
-    /// helper の `Spawned` が届いた後は、コマンドのホスト側 pid（plugin-cri と同じ pid namespace の値。#4316）。届く前・
-    /// 届かなかったとき（起動の失敗・中継の失敗）は `None`。表示用で、シグナルの宛先にしてはならない（pid は再利用される）。
+    /// コマンドのホスト側 pid（plugin-cri と同じ pid namespace の値。#4316）。launch は `Spawned` を `spawned` の予算まで待つため
+    /// 通常は戻りの時点で値がある（#4318）。予算内に届かなかった・`Spawned` 無しで終わった（起動の失敗・中継の失敗）ときは
+    /// `None`（後で届けば値になる）。表示用で、シグナルの宛先にしてはならない（pid は再利用される）。
     fn pid(&self) -> Option<NonZeroU32> {
         self.inner.recorded_pid()
     }

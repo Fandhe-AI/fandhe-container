@@ -162,7 +162,12 @@ fn expected_id_maps(
     }
 }
 
-/// 読み戻した写像が期待と完全一致するか(行数・順序を含む)を照合する(SEC-5)。
+/// 読み戻した写像が期待と構造上一致するか(行数・順序・`container_id`・`count`)を照合する(SEC-5)。
+///
+/// 確立後の呼び出し側は新しい user namespace の内側にいるため、`/proc/self/{uid,gid}_map` の `host_id` は
+/// 開いた側の namespace を基準に報告され、ホスト側の計画値とは一致しない場合がある。そのため `host_id` は比較しない
+/// (範囲写像の `host_id` は `apply_id_maps` が書き込み時にホスト側で読み戻して照合済み。単一 ID は計画の 1 行を
+/// カーネルが書いたもの)。
 fn verify_id_maps(
     read: impl Fn(IdKind) -> Result<Vec<IdMapping>, RootlessError>,
     uid: &[IdMapping],
@@ -170,7 +175,10 @@ fn verify_id_maps(
 ) -> Result<(), TraitError> {
     for (kind, expected) in [(IdKind::Uid, uid), (IdKind::Gid, gid)] {
         let got = read(kind).map_err(|e| TraitError::new(e.code, MSG_INSPECT))?;
-        if got != expected {
+        let shape = |v: &[IdMapping]| -> Vec<(u32, u32)> {
+            v.iter().map(|e| (e.container_id, e.count)).collect()
+        };
+        if shape(&got) != shape(expected) {
             return Err(TraitError::new(
                 ErrorCode::FailedPrecondition,
                 MSG_MAP_MISMATCH,
@@ -310,7 +318,7 @@ mod tests {
         assert_eq!(g, vec![m(0, 1001, 1)]);
     }
 
-    /// 照合は行の完全一致(過不足・順序・値の違いを拒否)。
+    /// 照合は行の構造の一致(過不足・順序・container_id・count の違いを拒否。host_id は比較しない)。
     #[test]
     fn sec5_2870_verify_id_maps_requires_exact_match() {
         let uid = vec![m(0, 1000, 1), m(1, 100000, 65536)];
@@ -328,8 +336,8 @@ mod tests {
             Ok(())
         );
         let bad: [(Vec<IdMapping>, Vec<IdMapping>); 5] = [
-            (vec![m(0, 1001, 1), m(1, 100000, 65536)], gid.clone()),
-            (uid.clone(), vec![m(0, 1001, 1)]),
+            (vec![m(0, 1000, 2), m(1, 100000, 65536)], gid.clone()),
+            (uid.clone(), vec![m(1, 1000, 1)]),
             (
                 vec![m(0, 1000, 1), m(1, 100000, 65536), m(65537, 5, 1)],
                 gid.clone(),
@@ -337,6 +345,15 @@ mod tests {
             (vec![m(0, 1000, 1)], gid.clone()),
             (vec![m(1, 100000, 65536), m(0, 1000, 1)], gid.clone()),
         ];
+        // host_id は開いた側の namespace 基準で変わりうるため、違っていても受理する。
+        assert_eq!(
+            verify_id_maps(
+                reader(vec![m(0, 0, 1), m(1, 1, 65536)], vec![m(0, 0, 1)]),
+                &uid,
+                &gid
+            ),
+            Ok(())
+        );
         for (u, g) in bad {
             let err = verify_id_maps(reader(u, g), &uid, &gid).expect_err("mismatch");
             assert_eq!(err.code(), ErrorCode::FailedPrecondition);

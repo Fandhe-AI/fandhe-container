@@ -221,10 +221,15 @@ mod linux {
         set_non_dumpable_for_test().expect("set non-dumpable");
         let got = establish_pod_namespaces(privilege, source).expect("establish pod namespaces");
 
-        // 写像: 報告・実際の /proc・計画の 3 者が完全一致する。
+        // 写像: 内側から読む /proc の host_id は開いた側基準で変わりうるため、報告(計画値)と
+        // 実際の /proc は container_id・count の構造で照合し、host_id は計画値を具体値で固定する。
         let (uid_map, gid_map) = (read_map("uid_map"), read_map("gid_map"));
-        assert_eq!(got.uid_map(), uid_map.as_slice());
-        assert_eq!(got.gid_map(), gid_map.as_slice());
+        let shape = |v: &[IdMapping]| -> Vec<(u32, u32)> {
+            v.iter().map(|e| (e.container_id, e.count)).collect()
+        };
+        assert_eq!(shape(got.uid_map()), shape(&uid_map));
+        assert_eq!(shape(got.gid_map()), shape(&gid_map));
+        let (uid_map, gid_map) = (got.uid_map().to_vec(), got.gid_map().to_vec());
         let first = |host| IdMapping {
             container_id: 0,
             host_id: host,

@@ -828,15 +828,17 @@ async fn production_binary_attach_real() {
         eprintln!("{TEST}: injected failure reclaimed containers=1 sandboxes=1");
 
         // 試行 2（本番）: 同じトークン（同じ metadata）で場面 A・B を最後まで通す。回収が効いていなければ ALREADY_EXISTS で落ちる。
-        // 試行 1 で PULL_DEADLINE 近くまで使っても 0 にならないよう下限を持つ（試行 2 の pull は取得済みで速い）。
-        let b2 = reclaim::scenario_budget(started.elapsed(), WATCHDOG, 2)
-            .saturating_sub(STARTUP_DEADLINE)
-            .max(Duration::from_secs(30));
-        let r2 = reclaim::guarded(
-            scenario(c.clone(), token.clone(), ledger.clone(), false, srv.clone()),
-            b2,
-        )
-        .await;
+        // 残りが試行 2 に足りなければ始めず、回収（予約済み）を先に走らせて期限超過で失敗させる。
+        let r2 = match reclaim::attempt2_budget(started.elapsed(), WATCHDOG, STARTUP_DEADLINE) {
+            Some(b2) => {
+                reclaim::guarded(
+                    scenario(c.clone(), token.clone(), ledger.clone(), false, srv.clone()),
+                    b2,
+                )
+                .await
+            }
+            None => Err(reclaim::AttemptFailure::Deadline),
+        };
         let rr2 = reclaim::reclaim_restarting(
             &mut c,
             &ledger,

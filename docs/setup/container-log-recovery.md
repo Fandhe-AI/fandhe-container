@@ -18,6 +18,7 @@ supervisor ログの扱いは末尾の「supervisor ログ」の節に分けて�
 - CLI の `create`、plugin-cri の `CreateContainer` は、同じ ID の残りを core を呼ぶ前に消す（best effort。古い supervisor が生きていれば消さず、状態がある ID も消さない）
 - plugin-cri は起動時に 1 回、`<state_root>/@container-logs` を走査し、状態の記録が無く、sink も生きていない ID のログを消す（#2760）。
   CRI は ID を使い回さないため、delete の待ちを超えて残ったログは plugin-cri を再起動すれば消える
+- shim v2 の serve は起動時に 1 回、scoped 状態ルート（`<base>-shim-state/...`）の `@container-logs` を同じ規則で走査する（期限つき・裏の thread。#4280）
 - plugin-cri の `create` / `delete` は、状態の記録が無い ID の起動オプション文書（`<state_root>/@container-options/<id>`）の残骸も消す
 
 自動では消えないもの（次の「手動の手順」の対象）:
@@ -25,7 +26,7 @@ supervisor ログの扱いは末尾の「supervisor ログ」の節に分けて�
 - 古い supervisor が生きていて sink のロックを持ち続けているログ（`skipped_live`）
 - 状態がある ID のログ（`skipped_present`）。この ID は消さない
 - ID に戻せない名前（`skipped_undecodable`。大文字入りなど、sink が作らない名前）
-- shim v2（`<base>-shim-state/...`）の状態ルートの残り。containerd が同じ ID で delete を呼び直したときは、記録の無い ID の残骸 3 種（supervisor ログ・コンテナログ・起動オプション文書）が自動で回収される（`docs/design/shim-v2-production-binary.md` の D7・#4279）。呼び直しが無い場合、sink が生きていた場合、ロックつきの操作が一度も無い状態ルートの残りは手動で消す。serve の起動時の走査は #4280 で未実装
+- shim v2（`<base>-shim-state/...`）の状態ルートの残り。containerd が同じ ID で delete を呼び直したときは、記録の無い ID の残骸 3 種（supervisor ログ・コンテナログ・起動オプション文書）が自動で回収される（`docs/design/shim-v2-production-binary.md` の D7・#4279）。コンテナログは shim の serve の起動時の走査でも回収される（#4280）。呼び直しが無い場合の起動オプション文書と supervisor ログ、sink が生きていた場合、ロックつきの操作が一度も無い状態ルートの残りは手動で消す
 - plugin-cri が動いている間に発生した残り（次の起動まで）と、plugin-cri と異なる `--root` の状態ルート
 
 ## 手動の手順

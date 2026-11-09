@@ -122,6 +122,15 @@ impl ReclaimRuntime for Fake {
         }
         Ok(DeleteResponse::new())
     }
+
+    fn reclaim_leftovers(
+        &self,
+        id: &ContainerId,
+        _deadline: std::time::Instant,
+    ) -> crate::adapter::LeftoverReclaim {
+        self.log("leftovers", id);
+        crate::adapter::LeftoverReclaim::default()
+    }
 }
 
 /// 1 回の `delete_in` の結果と観測。
@@ -212,13 +221,15 @@ fn cri5_4152_running_is_stopped_then_deleted() {
     assert_eq!((at.seconds, at.nanos), (1_700_000_000, 5));
     assert!(!entry(&base, &inv, "abc").exists());
 
-    // 2 回目は回収済み: 実行層を作らず成功（冪等）。
+    // 2 回目は回収済み: 状態記録・cgroup・プロセスには触れず（stop・delete を呼ばず）、残骸の回収だけを 1 回呼んで成功する（冪等。#4279）。
     let again = run(&inv, &base, None, None, &ReclaimBudget::PRODUCTION);
     assert!(again.result.unwrap().is_none());
-    assert_eq!((again.made, again.calls.len()), (0, 0));
+    assert_eq!(again.made, 1);
+    assert_eq!(again.calls, ["leftovers:abc"]);
 }
 
-/// CRI-5・REPAIR-4・#4152: 記録なし・回収済みは実行層を作らず、状態ルートの木を変えずに `Ok(None)`。何度呼んでも同じ。
+/// CRI-5・REPAIR-4・#4152・#4279: 記録なしは実行層を作らず状態ルートも作らない。回収済みは残骸の回収を 1 回だけ呼び（状態記録・
+/// cgroup・プロセスに触れる stop・delete は呼ばない）、残骸の無い状態ルートの木は変えない。どちらも `Ok(None)` で、何度呼んでも同じ。
 #[test]
 fn cri5_4152_not_recorded_and_reclaimed_touch_nothing() {
     let guard = test_root::test_root("shim", "r-none");
@@ -242,7 +253,8 @@ fn cri5_4152_not_recorded_and_reclaimed_touch_nothing() {
     for _ in 0..2 {
         let r = run(&inv, &base, None, None, &ReclaimBudget::PRODUCTION);
         assert!(r.result.unwrap().is_none());
-        assert_eq!((r.made, r.calls.len()), (0, 0));
+        assert_eq!(r.made, 1);
+        assert_eq!(r.calls, ["leftovers:abc"]);
         assert_eq!(snapshot(&sib), before);
     }
 }
@@ -300,7 +312,7 @@ fn cri5_4152_stage_deadline_then_resume() {
             None,
             Some(Inject::HangAfter),
             vec!["stop:abc", "delete:abc"],
-            vec![],
+            vec!["leftovers:abc"],
             false,
         ),
     ];
@@ -491,10 +503,11 @@ fn cri5_4152_real_core_runtime_reclaims_created_without_pid() {
     assert_eq!((out.pid(), out.exit_status()), (0, 0));
     assert!(out.exited_at().is_none());
     assert!(!entry(&base, &inv, "abc").exists());
+    // 回収済み: 実の実行層でも残骸の回収だけを行い、固定の応答（`None`）になる（#4279）。
     let again = delete_in(
         &inv,
         &base,
-        |_| unreachable!("no runtime for a reclaimed container"),
+        |store| real_runtime(store, Arc::new(Mutex::new(Vec::new()))),
         &budget,
         std::time::Instant::now() + SHIM_DELETE_DEADLINE,
     );
@@ -880,4 +893,235 @@ fn repair5_4152_pinned_store_forwards_deadline_to_delete_until() {
     assert_eq!(seen.len(), 1);
     assert!(seen[0] <= t0 + Duration::from_millis(300) + Duration::from_millis(50));
     assert!(seen[0] > t0);
+}
+
+// ---- #4279: AlreadyReclaimed の残骸の回収（実の実行層と実ファイルで照合する） ----
+
+/// 実の `CoreLifecycleRuntime` を載せた窓口。警告行（stderr に出る行）を `lines` へ集める。
+fn real_runtime(store: FileStateStore, lines: Arc<Mutex<Vec<String>>>) -> Arc<dyn ReclaimRuntime> {
+    let store: Arc<dyn StateStore> = Arc::new(store);
+    Arc::new(GuardedCore::new(
+        store,
+        Duration::from_secs(1),
+        move |pinned, cleanup| {
+            let lines = Arc::clone(&lines);
+            core_runtime_for(pinned)
+                .with_delete_deadline(cleanup)
+                .with_container_log_lock_wait(cleanup)
+                .with_cleanup_warning_sink(Arc::new(move |line| lines.lock().unwrap().push(line)))
+        },
+    ))
+}
+
+fn names(dir: &Path) -> Vec<String> {
+    let mut v: Vec<String> = match std::fs::read_dir(dir) {
+        Ok(rd) => rd
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    v.sort();
+    v
+}
+
+fn open_container_sink(
+    root: &Path,
+    id: &str,
+) -> fandhe_container_supervisor::logs::RotatingFileSink {
+    use fandhe_container_supervisor::logs::{
+        LogSink as _, RotatingFileSink, StreamKind, container_log_dir,
+        container_log_rotation_config,
+    };
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = container_log_dir(root);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let sink = RotatingFileSink::open(&dir, &cid(id), container_log_rotation_config()).unwrap();
+    sink.append(StreamKind::Stdout, b"x").unwrap();
+    sink.flush().unwrap();
+    sink
+}
+
+fn put_options(root: &Path, id: &str) {
+    use fandhe_container_supervisor::container_options::document::ContainerOptionsDocument;
+    use fandhe_container_supervisor::container_options::store as options_store;
+    let doc = ContainerOptionsDocument::new(
+        vec!["nofile=1024:2048".into()],
+        vec!["A=1".into()],
+        None,
+        None,
+        vec![],
+    )
+    .unwrap()
+    .with_generation("g1".to_owned())
+    .unwrap();
+    options_store::write_new(root, &cid(id), &doc).unwrap();
+}
+
+/// 閉じた残骸 3 種（supervisor ログ・コンテナログ・起動オプション文書）を置く。
+fn plant(root: &Path, id: &str) {
+    drop(fandhe_container_supervisor::supervisor_log::open(root, &cid(id)).unwrap());
+    drop(open_container_sink(root, id));
+    put_options(root, id);
+}
+
+/// root 配下の残骸の名前（supervisor ログ・コンテナログ・起動オプション文書・文書のロック）。
+fn leftover_names(root: &Path) -> [Vec<String>; 4] {
+    use fandhe_container_supervisor::container_options::store as options_store;
+    [
+        names(&fandhe_container_supervisor::supervisor_log::log_dir(root)),
+        names(&fandhe_container_supervisor::logs::container_log_dir(root)),
+        names(&options_store::options_dir(root))
+            .into_iter()
+            .filter(|n| n != options_store::LOCKS_DIR_NAME)
+            .collect(),
+        names(&options_store::options_dir(root).join(options_store::LOCKS_DIR_NAME)),
+    ]
+}
+
+/// 他 ID の記録を 1 件入れて、状態ルートの `@lock` を作る（`AlreadyReclaimed` の照合に必要。ロックつきの操作が一度も無い
+/// 状態ルートは `NotRecorded` になる）。
+fn scoped_with_lock(guard: &Path) -> (std::path::PathBuf, ShimInvocation, std::path::PathBuf) {
+    let base = guard.join("state");
+    let other = make_bundle(guard, "other");
+    seed(&base, ContainerStatus::created(cid("other"), None), &other);
+    let bundle = make_bundle(guard, "abc");
+    let inv = parse("abc", Some(bundle.to_str().unwrap())).unwrap();
+    let root = scoped_root_path(&base, inv.namespace.as_ref(), inv.address.as_deref()).unwrap();
+    (base, inv, root)
+}
+
+/// CRI-5・REPAIR-4・OCI-7・SUP-7・#4279: `AlreadyReclaimed` の delete は、記録の無い ID の残骸 3 種（ログの現在・世代・ロック、
+/// 起動オプション文書とそのロック）を消す。前方一致する別 ID の残骸と、他の記録には触れず、警告行は出ない。
+#[test]
+fn cri5_4279_already_reclaimed_removes_three_leftovers() {
+    let guard = test_root::test_root("shim", "r-left");
+    let (base, inv, root) = scoped_with_lock(&guard);
+    plant(&root, "abc");
+    // 現在ログを世代へ退避させる（`abc.log.1` を作る）。
+    drop(open_container_sink(&root, "abc"));
+    plant(&root, "abcd");
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let l = Arc::clone(&lines);
+    let out = delete_in(
+        &inv,
+        &base,
+        move |store| real_runtime(store, l),
+        &ReclaimBudget::PRODUCTION,
+        std::time::Instant::now() + SHIM_DELETE_DEADLINE,
+    );
+    assert!(out.unwrap().is_none());
+    let [sup, logs, opts, locks] = leftover_names(&root);
+    // abc の分は残らず、前方一致する abcd の分は置いたまま（ロックファイルの有無は sink の閉じ方に依るため名前で絞る）。
+    for names in [&sup, &logs] {
+        assert!(names.contains(&"abcd.log".to_owned()), "{names:?}");
+        assert!(
+            names.iter().all(|n| n.starts_with("abcd.")),
+            "abc leftovers remain: {names:?}"
+        );
+    }
+    assert_eq!(opts, ["abcd"]);
+    assert!(locks.is_empty(), "{locks:?}");
+    assert!(root.join("other").is_dir());
+    assert_eq!(lines.lock().unwrap().as_slice(), &[] as &[String]);
+}
+
+/// SEC-1・CORE-1・SUP-7・#4279: 照合をすり抜けて記録が再作成された ID の残骸は、各段の guard が見送り、消さない（警告行も出ない）。
+#[test]
+fn sec1_cri5_4279_recorded_id_leftovers_untouched() {
+    let guard = test_root::test_root("shim", "r-left-rec");
+    let (base, inv, root) = scoped_with_lock(&guard);
+    let bundle = make_bundle(&guard, "abc");
+    let store = seed(&base, ContainerStatus::created(cid("abc"), None), &bundle);
+    plant(&root, "abc");
+    let before = leftover_names(&root);
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let rt = real_runtime(store, Arc::clone(&lines));
+    let got = rt.reclaim_leftovers(
+        &cid("abc"),
+        std::time::Instant::now() + SHIM_DELETE_DEADLINE,
+    );
+    use crate::adapter::LeftoverStage::{Done, Superseded};
+    assert_eq!(
+        (got.supervisor_log, got.container_log, got.options),
+        (Superseded, Superseded, Done)
+    );
+    // データ（ログの現在ファイルと起動オプション文書）は残る。ロックファイルは guard が見送る過程で掃除されうるため比べない。
+    let after = leftover_names(&root);
+    assert_eq!(after[0], ["abc.log"]);
+    assert_eq!(after[1], ["abc.log"]);
+    assert_eq!(after[2], ["abc"]);
+    assert_eq!(before[0].first().map(String::as_str), Some("abc.log"));
+    assert!(lines.lock().unwrap().is_empty());
+    let _ = inv;
+}
+
+/// SUP-7・REPAIR-4・REPAIR-5・#4279: 生きている sink（flock 保持）のログは待たずに残し、`sink_open_after_wait` の警告行を 1 件ずつ出す。
+/// 起動オプション文書は別のロックなので消える。
+#[test]
+fn sup7_cri5_4279_live_sink_untouched() {
+    let guard = test_root::test_root("shim", "r-left-live");
+    let (base, inv, root) = scoped_with_lock(&guard);
+    let sup = fandhe_container_supervisor::supervisor_log::open(&root, &cid("abc")).unwrap();
+    let sink = open_container_sink(&root, "abc");
+    put_options(&root, "abc");
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let l = Arc::clone(&lines);
+    let t0 = std::time::Instant::now();
+    let out = delete_in(
+        &inv,
+        &base,
+        move |store| real_runtime(store, l),
+        &ReclaimBudget::PRODUCTION,
+        t0 + SHIM_DELETE_DEADLINE,
+    );
+    assert!(out.unwrap().is_none());
+    // flock を待たない（既定のコンテナログの待ちは 10 秒）。
+    assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
+    let [s, c, o, _] = leftover_names(&root);
+    assert_eq!(s, ["abc.log", "abc.log.lock"]);
+    assert_eq!(c, ["abc.log", "abc.log.lock"]);
+    assert!(o.is_empty());
+    assert_eq!(
+        lines.lock().unwrap().as_slice(),
+        [
+            "{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"abc\",\"target\":\"supervisor_log\",\"code\":\"FAILED_PRECONDITION\",\"reason\":\"sink_open_after_wait\",\"message\":\"cleanup after delete left resources behind\"}",
+            "{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"abc\",\"target\":\"container_log\",\"code\":\"FAILED_PRECONDITION\",\"reason\":\"sink_open_after_wait\",\"message\":\"cleanup after delete left resources behind\"}",
+        ]
+    );
+    drop((sup, sink));
+}
+
+/// REPAIR-5・REPAIR-4・#4279: 残りが下限未満（予約を引いた予算が `LEFTOVER_MIN_ATTEMPT` 未満）なら、どの段も試さず残骸は残り、
+/// `existence: unverified` の警告行を 3 段ぶん出す。
+#[test]
+fn repair5_cri5_4279_below_min_remaining_skips_with_warning() {
+    let guard = test_root::test_root("shim", "r-left-min");
+    let (base, inv, root) = scoped_with_lock(&guard);
+    plant(&root, "abc");
+    let before = leftover_names(&root);
+    let (_, store, matched) = delete_preflight_store_in(&inv, &base).unwrap();
+    assert_eq!(matched, DeleteRecordMatch::AlreadyReclaimed);
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let rt = real_runtime(store.unwrap(), Arc::clone(&lines));
+    let target = validate_delete_invocation(&inv).unwrap();
+    let deadline = std::time::Instant::now()
+        + super::reclaim::LEFTOVER_RESERVE
+        + super::reclaim::LEFTOVER_MIN_ATTEMPT / 2;
+    let out = super::reclaim::reclaim_leftovers(rt, &target, deadline);
+    assert!(out.unwrap().is_none());
+    assert_eq!(leftover_names(&root), before);
+    let skipped = |t: &str| {
+        format!(
+            "{{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"abc\",\"target\":\"{t}\",\"code\":\"TIMEOUT\",\"existence\":\"unverified\",\"message\":\"cleanup after delete left resources behind\"}}"
+        )
+    };
+    assert_eq!(
+        lines.lock().unwrap().as_slice(),
+        [
+            skipped("supervisor_log"),
+            skipped("container_log"),
+            skipped("container_options")
+        ]
+    );
 }

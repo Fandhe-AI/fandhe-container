@@ -43,7 +43,7 @@ containerd は shim が死んだ後や start が失敗した後に `-id <id> -bu
 - `-bundle`: 絶対パス・`.`/`..` の要素なし・末尾の要素が id と一致・末尾の要素が実在するディレクトリ（symlink でない）を求める。一次情報は containerd v2.1.4 の `core/runtime/v2/bundle.go`（`Path: filepath.Join(state, ns, id)`）と `binary.go`（`-id b.bundle.ID -bundle b.bundle.Path ... delete`）。親の namespace との一致は見ない: 状態ルートの記録の bundle との照合の方が強い同一性検査で、state の配置が変わったときに正当な呼び出しを拒否する危険を増やすだけのため。祖先の symlink は許す（macOS の `/tmp` → `/private/tmp` など）。末尾の区切りと区切りの重複は畳んでから `lstat` する（`link/` が symlink を辿るため）
 - 状態ルートの特定: serve と同じ式（`scoped_root_path`。純粋関数）で `<base>-shim-state/<FNV-1a(address)>/<namespace>` を出す。serve 側の `scoped_root` は同じ関数を呼んだ後に階層を作る。インスタンスロックは取らない（D2）
 - 読み取り専用での開き方: 階層のどれかが無ければ記録なし。各階層は `ensure_private_dir` と同じ基準（ディレクトリ・symlink でない・group/other に権限なし）を fail-closed で検査する。`@lock` が無いとき、`@` で始まらないエントリ（コンテナの階層）が無ければ記録なし（一度もロックつきの操作が無い）、あれば不整合として拒否する。`@lock` があるときは `FileStateStore::open` を使う。既にエントリがあるルートでは `open` は作成も初期化も `sync_dir` もせず、`get` は既存の `@lock` の flock だけで、木（内容・mtime・mode）が前後で変わらないことを試験（`cri5_4151_*`）で照合する
-- 分類（`DeleteRecordMatch`）: `NotRecorded`（階層なし、または一度もロックつきの操作が無い）・`Recorded`（Creating・Created・Running・Stopped のいずれの記録も、id と bundle が対象と一致するとき）・`AlreadyReclaimed`（ストアはあるが id の記録が無い）。`StateStore` に tombstone が無く `get` は「一度も作られなかった」と「削除済み」を共に `NotFound` で返すため、ストアはあるが一度も作られなかった id も `AlreadyReclaimed` に入る（区別できるように装わない）。#4152 はどちらも副作用 0 回で成功させる想定で、挙動は変わらない
+- 分類（`DeleteRecordMatch`）: `NotRecorded`（階層なし、または一度もロックつきの操作が無い）・`Recorded`（Creating・Created・Running・Stopped のいずれの記録も、id と bundle が対象と一致するとき）・`AlreadyReclaimed`（ストアはあるが id の記録が無い）。`StateStore` に tombstone が無く `get` は「一度も作られなかった」と「削除済み」を共に `NotFound` で返すため、ストアはあるが一度も作られなかった id も `AlreadyReclaimed` に入る（区別できるように装わない）。`NotRecorded` は副作用 0 回（状態ルートも作らない）。`AlreadyReclaimed` は状態記録・cgroup・プロセスに触れず、ID 単位の残骸 3 種（supervisor ログ・コンテナログ・起動オプション文書）の guard つき削除だけを行う（D7・#4279）。一度も作られなかった id は残骸が無いので何も起きない。応答はどちらも固定
 - 記録の bundle との照合: create が受けた bundle は正規化されず絶対パスのまま記録されるため、`Path` の比較（区切りの重複・末尾の区切りを無視）で `-bundle` と比べる。食い違いは `FAILED_PRECONDITION`、記録の id の食い違いは `INTERNAL`（ストアの不整合）、読み取りの期限切れは `DEADLINE_EXCEEDED`、その他の読み取り失敗は固定文言の `INTERNAL`
 - 非 Linux: 既定の状態ルートが未決定（#2431）のため、引数の検証だけを行い照合は縮退する
 - 前段の戻り値は #4151 の時点では `Result<(), CriError>` にとどめ、照合結果を捨てていた。#4152 で `Result<Option<ShimDeleteExit>, CriError>` へ広げた（D6）
@@ -55,7 +55,8 @@ containerd は shim が死んだ後や start が失敗した後に `-id <id> -bu
 
 | 記録の状態 | 実行層の呼び出し | 応答 |
 | --- | --- | --- |
-| 記録なし・回収済み | 呼ばない（実行層も作らない） | 固定応答（pid 0・137・now。runc shim の cleanup と同じ） |
+| 記録なし | 呼ばない（実行層も作らない・状態ルートも作らない） | 固定応答（pid 0・137・now。runc shim の cleanup と同じ） |
+| 回収済み | 残骸 3 種の guard つき削除を 1 回ずつ（状態記録・cgroup・プロセスには触れない。`reclaim_leftovers`・#4279・D7） | 固定応答（同上） |
 | Stopped | delete だけ | 記録の終了コード・`exited_at`（未記録は未設定）、pid は 0 |
 | pid の無い Created | delete だけ | 終了コード 0 |
 | Running・pid つき Created | stop（猶予 0・SIGKILL）→ delete | 停止で得た Stopped の終了コード・`exited_at`、pid は記録の pid |
@@ -64,17 +65,17 @@ containerd は shim が死んだ後や start が失敗した後に `-id <id> -bu
 - `delete(force=true)` には寄せない: force は内部で停止しても状態を捨て、応答に要る終了コードが取れないため。変換規則（不明・負値は 255、`exited_at` は Stopped で記録があるときだけ）は `task_service` の関数を共有する（cri の `ShimDeleteExit`）。
 - 期限: containerd v2.1.4 の `pkg/shim/util.go` の `Command` は `exec.CommandContext` で shim を起動し、`core/runtime/v2/shim.go` の `cleanupAfterDeadShim` は `io.containerd.timeout.shim.cleanup`（既定 5 秒）の ctx で `binary.Delete`（`core/runtime/v2/binary.go`）を呼ぶ。切れると shim は kill され、失敗として exit_status 255 の TaskExit が publish される。このため全体を `SHIM_DELETE_DEADLINE`（4 秒）に収め、段の予算は停止 2.5 秒・削除 1.5 秒とする。plugin の 47 秒（`PLUGIN_FORCE_DELETE_DEADLINE`）からは導かない。
 - 各段は作業スレッドで走らせ `recv_timeout` で待ち、切れたら `DEADLINE_EXCEEDED`（固定文言）を返す。内側の `SupervisedLifecycle::stop_within` の予算は段の最悪値（状態ロックの 5 秒を含む）で admit するため、4 秒未満の予算を渡すと常に拒否される。そのため停止は予算なしの `stop` を呼び、外側の待ちで有界にする。切れた後のスレッドはプロセスの終了で消える。
-- 再実行: 毎回、照合からやり直し、記録の状態で続きの段から回収する。停止まで済めば次回は Stopped として delete だけ、delete まで済めば次回は回収済みで何も呼ばず成功する。containerd に kill された場合も同じ。
+- 再実行: 毎回、照合からやり直し、記録の状態で続きの段から回収する。停止まで済めば次回は Stopped として delete だけ、delete まで済めば次回は回収済みとなり、状態記録の削除の後の後始末（ログ・起動オプション文書）が中断していても残骸 3 種を回収して成功する（#4279）。containerd に kill された場合も同じ。
 - stderr: `CoreLifecycleRuntime::delete` の後始末の警告行は stderr に出うる。containerd は delete の成功時の stderr を warn として記録するだけで stdout の protobuf は汚れない（`binary.go`）。「成功時は stderr へ何も書かない」は start の制約。
 - 生の kill をしない: 状態記録の pid へ生のシグナルは送らない（PID 再利用。SEC-1・CORE-1）。supervisor に届かない Running の記録は停止の失敗を構造化エラーのまま返す。
 - 回収が触れるのは照合済みの id の記録だけ。`-bundle` は照合にだけ使い、削除の対象やパスの組み立てに使わない。
 - 絶対期限の共有（REPAIR-5）: 期限は bootstrap の `delete_recorded` が開始時刻から数える `Instant`（`SHIM_DELETE_DEADLINE`）で、`before_delete` の第 2 引数として前段へ渡す。照合の読み取り（状態ロックの待ちが最大 5 秒）は作業スレッドで走らせ残り時間で打ち切り、各段の待ちは「段の予算と残り時間の短い方」、`run_delete` の socket の lock 待ち（既定 10 秒）は残り時間で短縮し、`ops.log` の計測の記録の待ち（既定 2 秒）は期限 + 0.5 秒で打ち切る。
 - 世代の保持（SEC-1・CORE-1）: 照合した記録の世代（bundle と revision）を stop と delete に渡し、本番の窓口 `GuardedCore` が副作用の直前に記録を読み直して一致を確かめる（不一致は `FAILED_PRECONDITION`。再作成された別のコンテナには触れない）。stop の後は停止後の記録から世代を取り直して delete に使う。検証と core の読み出しの間の極小の窓は残る。要求に期待 revision を持たせる core の変更で閉じられるが、`StopRequest`・`DeleteRequest` の全実装に及ぶため別 issue とする。
-- 残余: Creating の記録と、supervisor が不在の Running の記録は回収できない（fail-closed）。`exited_at` が未設定のときの containerd の挙動の実機確認は #3685。
+- 残余: Creating の記録と、supervisor が不在の Running の記録は回収できない（fail-closed）。残骸の回収（#4279）の残余: 呼び直しが無い ID の起動オプション文書と supervisor ログ（serve の起動時の走査は `@container-logs` だけ。#4280・#4296）、ロックつきの操作が一度も無い状態ルート（`NotRecorded` に分類される）の残骸、残りが下限（`LEFTOVER_MIN_ATTEMPT` 50ms）に満たず試さなかった段（`existence: unverified` の警告行を出す）。`exited_at` が未設定のときの containerd の挙動の実機確認は #3685。
 
 ## D7 期限で中断された delete の残骸の回収（#4241。CRI-5・REPAIR-3・REPAIR-4・REPAIR-5・OCI-6・OCI-7・SEC-1・SUP-7・SUP-12）
 
-設計の判断記録。本節の内容は未実装で、現在の挙動は D5・D6 のとおり（実装済みを装わない）。
+設計の判断記録。実装 1（`delete_in` の `AlreadyReclaimed` での ID 単位の回収）は #4279 で実装済み（`shim/reclaim.rs` の `reclaim_leftovers`・`adapter.rs` の `reclaim_unrecorded_leftovers`）。実装 2（serve の起動時の走査）は #4280 で未実装（実装済みを装わない）。
 
 ### 問題
 
@@ -108,6 +109,7 @@ A を採らない理由:
 
 - `AlreadyReclaimed`: 「副作用 0 回」から、「状態記録・cgroup・プロセスには触れず、記録の無い ID の残骸 3 種の回収だけを行う」へ改める。containerd への応答は今の固定応答（pid 0・137・now）のまま変えない
 - `NotRecorded`（状態ルートが無い）は副作用 0 回のまま。状態ルートを作らない
+- 実装の定数（#4279）: 末尾に残す余裕 `LEFTOVER_RESERVE` は 500ms（回収の後の `flush_delete_warnings` の fallback の分 200ms と socket 掃除の lock 取得が同じ期限を見るため）、1 段を試す下限 `LEFTOVER_MIN_ATTEMPT` は 50ms（試行は予算の 1/2 以下のため、これ未満では意味のある時間にならない）。回収の失敗・期限切れは delete を失敗にしない（best effort。containerd に TaskExit 255 や再試行を誘発しない）
 - 期限: 照合から回収までと同じ絶対期限を共有する（REPAIR-5）。各削除は flock を待たず 1 回だけ試し、上限は「残り時間 - 下限の余裕」と既存の上限の短い方にする。残りが下限に満たなければ試さず、既存の `existence: unverified` の警告行を出す。`reclaim_before_create` の上限（ログ 5 秒・文書 10 秒）は 4 秒の期限に収まらないので流用しない
 - 結果: 既存の `container_delete_cleanup` の警告行（stderr。パス・errno は含めない）と記録器の操作名で残す（REPAIR-4）
 - 競合: guard はロックを取ったうえで試行ごとに評価するため、同じ ID の再作成と並んでも、記録がある ID・生きている sink には触れない。文書は世代で照合される
@@ -135,7 +137,7 @@ shim の serve の起動時に、scoped 状態ルートを `sweep_leftover_conta
 | 実装 1 | `delete_in` の `AlreadyReclaimed` で ID 単位の回収（`shim.rs`・`shim/reclaim.rs`・`adapter.rs` の helper の `pub(crate)` 化。bin 試験で、後始末の期限切れの後の 2 回目の delete で残骸が消え 3 回目が固定応答であることを照合） | 約 2〜3h |
 | 実装 2 | serve の起動時の走査（`sweep_leftover_container_logs` を再利用） | 約 1.5h |
 
-実装 issue は未起票（起票は承認事項のため。下書きは PR 本文）。起票後に番号をここへ追記する。D5 の `AlreadyReclaimed` の記述と D6 の「再実行」「残余」は、実装 1 のときに更新する。
+実装 issue: 実装 1 は #4279（実装済み。D5 の `AlreadyReclaimed` の記述と D6 の「再実行」「残余」も更新済み）、実装 2 は #4280（未実装）。
 
 ## `exited_at` が未設定のときの containerd の扱い（#3682 の依頼）
 

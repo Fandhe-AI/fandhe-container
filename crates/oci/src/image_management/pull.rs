@@ -45,8 +45,7 @@
 //! 所有者がステージング領域と同じ・ハードリンク数 1・group / other 書き込み不可（unix）。ステージングの
 //! blob は検証時に開いたハンドルで確認し、権限だけ 0600 へ狭める（所有者・リンク数は変えられないので拒否）。
 //! 公開直前と既存宛先の受け入れでも同じ条件を確かめ、満たさない宛先は受け入れず検証済みの実体で置き換える。
-//! Windows の再ハッシュは排他区間の外で行う: 検証済みの内容を私的な一時名へ `hard_link` で結び付け、
-//! 書き込み共有拒否で開いたまま再ハッシュし、排他区間では一時名の `rename` だけを行う。
+//! Windows ホストは `ImageStore::open` が恒久拒否のため、Windows 専用の公開経路（一時名での固定）は持たない（#4377）。
 //!
 //! 公開の移動は `hard_link` で宛先を置き換えずに作り、成功後にステージング側の名前を消す
 //! （公開後のハードリンク数を 1 に保つ。oci の `layer.rs` の `check_blob_trust` の条件と整合）。宛先が既にある
@@ -54,8 +53,10 @@
 //! 指紋が一致するときだけ受け入れ、それ以外は検証済みのステージングで置き換える。
 //!
 //! 未実装（実装済みを装わない。REPAIR-3）:
-//! - Windows の `PullDir`・[`PullSession::open_verified_staged_blob`]・[`PullSession::open_leased_blob`] の非 unix 実装は、
-//!   Windows ホストは `ImageStore::open` が設計上の恒久拒否（#2428 の案 C・#4333。#4181 は not planned）のため到達しない。型検査のために残してあり、削除は別の整理。
+//! - Windows ホストは `ImageStore::open` が設計上の恒久拒否（#2428 の案 C・#4333。#4181 は not planned）のため、
+//!   Windows 専用の実装は持たない（#4377）。非 unix に残るのは、型検査のための拒否・`Unimplemented` の stub
+//!   （[`PullSession::verify_staged_blob`]・[`PullSession::open_verified_staged_blob`]・[`PullSession::open_leased_blob`] 等）と、
+//!   macOS と共有するパス起点の shim だけ。
 //! - `PullSession` に `Drop` は実装しない（ロック待ちの Timeout・panic 中の毒化があり、ロックを取る
 //!   `Drop` は危険なため）。publish も abort もせずに drop すると、リースとステージングが残る
 //!   （余分に残す側）。呼び出し側は失敗経路で [`PullSession::abort`] を呼ぶ契約である。
@@ -76,18 +77,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::root_handle::{self, BlobDir, PullDir, RootHandle, SubDir, SubDirError};
 use super::tag::ImageTagChange;
-use super::usage::blob_path;
 use super::{
     IMAGE_STORE_BLOB_DIR as BLOB_DIR, ImageStore, MAX_COMPOSITION_LAYERS, ManifestComposition,
     PullId, TagKey,
 };
 use crate::error::{OciError, OciErrorCode};
 use crate::instrument::{OciOpKind, OciOpRecorder, record_oci_op};
-#[cfg(not(unix))]
-use crate::layer::verify_blob_digest_with;
-use crate::layer::{
-    VerifiedBlob, blob_trust_violation, verify_blob_file_digest, verify_blob_file_digest_with,
-};
+#[cfg(unix)]
+use crate::layer::verify_blob_file_digest_with;
+use crate::layer::{VerifiedBlob, blob_trust_violation, verify_blob_file_digest};
 use crate::reference::Digest;
 
 /// ストア root 直下のステージング領域名。GC・`image ls` の走査対象外。
@@ -411,7 +409,7 @@ impl ImageStore {
     /// 呼ぶたびに root の fd から `blobs/sha256` を開き直して `openat2`（`NO_SYMLINKS`・`O_NOFOLLOW`）で開く。返したハンドルは
     /// 未検証で、信頼条件・digest・サイズの確認は呼び出し側が同じハンドルで行う（OCI-1）。無ければ `NotFound`、
     /// 通常ファイルでなければ `FailedPrecondition`。Linux x86_64 / aarch64 以外の unix はパス起点、非 unix は
-    /// Windows ホストは `ImageStore::open` が設計上の恒久拒否（#2428 の案 C・#4333。#4181 は not planned）のため到達しない（型検査のために残した実装）。
+    /// Windows ホストは `ImageStore::open` が設計上の恒久拒否（#2428 の案 C・#4333。#4181 は not planned）のため到達しない（型検査のための stub。#4377）。
     pub fn open_cached_blob(&self, digest: &Digest) -> Result<File, OciError> {
         open_blob_readonly(self, hex_of(digest)?)
     }
@@ -1082,7 +1080,7 @@ impl PullSession<'_> {
     /// `cfg` ごとの扱い:
     /// - Linux x86_64 / aarch64: 検査済み root の fd からの `openat2`（`NO_SYMLINKS`・`O_NOFOLLOW`）。
     /// - その他の unix（macOS 等）: `PullDir` がパス起点のため、差し替えは指紋の照合で `DataLoss` として検出する。
-    /// - 非 unix（Windows）: Windows ホストは `ImageStore::open` が設計上の恒久拒否（#2428 の案 C・#4333。#4181 は not planned）のため到達しない。型検査のために `Unimplemented` の実装を残す。
+    /// - 非 unix（Windows）: Windows ホストは `ImageStore::open` が設計上の恒久拒否（#2428 の案 C・#4333。#4181 は not planned）のため到達しない。型検査のための `Unimplemented` の stub だけを残す（#4377）。
     pub fn open_verified_staged_blob(&self, digest: &Digest) -> Result<File, OciError> {
         let hex = hex_of(digest)?;
         let Some(entry) = self.verified.get(digest) else {
@@ -1157,7 +1155,7 @@ impl PullSession<'_> {
     /// `cfg` ごとの扱い:
     /// - Linux x86_64 / aarch64: 検査済み root の fd 起点の `openat2`。
     /// - その他の unix（macOS 等）: `BlobDir` がパス起点（最終要素のみ symlink を辿らない）。入口の再検査に頼る。
-    /// - 非 unix（Windows）: Windows ホストは `ImageStore::open` が設計上の恒久拒否（#2428 の案 C・#4333。#4181 は not planned）のため到達しない。型検査のために `Unimplemented` の実装を残す。
+    /// - 非 unix（Windows）: Windows ホストは `ImageStore::open` が設計上の恒久拒否（#2428 の案 C・#4333。#4181 は not planned）のため到達しない。型検査のための `Unimplemented` の stub だけを残す（#4377）。
     pub fn open_leased_blob(&self, digest: &Digest) -> Result<File, OciError> {
         let hex = hex_of(digest)?;
         if !self.leased.contains(digest) {
@@ -1178,6 +1176,25 @@ impl PullSession<'_> {
         digest: &Digest,
         max_bytes: u64,
     ) -> Result<VerifiedBlob, OciError> {
+        // Windows ホストは `ImageStore::open` が恒久拒否のため到達しない（#4333）。パスを開き直す検証は持たない（#4377）。
+        #[cfg(not(unix))]
+        {
+            let _ = (digest, max_bytes);
+            Err(super::store::windows_host_rejected())
+        }
+        #[cfg(unix)]
+        {
+            self.verify_staged_blob_unix(digest, max_bytes)
+        }
+    }
+
+    /// [`Self::verify_staged_blob`] の unix 本体（確認済みの同じハンドルの内容を検証する）。
+    #[cfg(unix)]
+    fn verify_staged_blob_unix(
+        &mut self,
+        digest: &Digest,
+        max_bytes: u64,
+    ) -> Result<VerifiedBlob, OciError> {
         self.note_blob(digest)?;
         // 再検証の開始時に以前の検証結果を無効化する（信頼性検査を含め、失敗した再検証の前の登録を残さない）。
         self.verified.remove(digest);
@@ -1194,7 +1211,6 @@ impl PullSession<'_> {
             Err(e) => return Err(io_err(&e, "failed to stat staged blob")),
         }
         // 開いたハンドルで信頼条件を確認し、権限を 0600 へ狭める（公開前に必ず行う。OCI-1・SEC）。
-        #[cfg(unix)]
         let file = self.secure_staged_blob(hex)?;
         // 検証の前後で指紋が一致することを確かめ、検証した実体を固定する（公開直前の再ハッシュの代わり）。
         let before = FileIdent::of_regular(self.pull_dir.stat_name(hex))
@@ -1207,7 +1223,6 @@ impl PullSession<'_> {
             })?;
         // unix は検証するハンドル自身の指紋を採り、名前側の指紋と一致することを確かめる。名前の再解決だけで
         // 指紋を採ると、確認後に同名へ差し替えた別実体の指紋が検証済みハンドルに結び付く（OCI-1・OCI-7・SEC-1）。
-        #[cfg(unix)]
         {
             let handle_ident = FileIdent::of(
                 &file
@@ -1222,15 +1237,7 @@ impl PullSession<'_> {
             }
         }
         // unix は確認済みの同じハンドルの内容を検証する（パスを開き直さない）。
-        #[cfg(unix)]
         let v = verify_blob_file_digest_with(self.store.recorder(), &file, digest, max_bytes)?;
-        #[cfg(not(unix))]
-        let v = verify_blob_digest_with(
-            self.store.recorder(),
-            &self.staging_dir.join(hex),
-            digest,
-            max_bytes,
-        )?;
         let after = FileIdent::of_regular(self.pull_dir.stat_name(hex))
             .map_err(|e| io_err(&e, "failed to stat staged blob"))?;
         if after.as_ref() != Some(&before) {
@@ -1298,75 +1305,6 @@ impl PullSession<'_> {
             ));
         }
         Ok(file)
-    }
-
-    /// Windows では排他区間の外で、検証済みの内容を公開専用の私的な名前へ固定する。
-    ///
-    /// 手順は、(1) ステージング名の指紋を照合して `hard_link` で私的な一時名（宛先と同じディレクトリ）へ
-    /// 結び付け、(2) 一時名を書き込み共有拒否（`FILE_SHARE_READ | FILE_SHARE_DELETE`。値 5）で開いたまま
-    /// 再ハッシュして digest を確定する。排他区間の中では再ハッシュせず、この一時名を `rename` で
-    /// 宛先へ移すだけ（メタデータ操作のみ。ガード保持を期限内に収める）。
-    ///
-    /// 方式の理由: Windows の `FileIdent` は size / mtime だけで差し替えを検出できず、`hard_link` で
-    /// 実体のハンドルを直接渡す API も無い（`windows-sys` は oci の依存に無く FFI は足さない）。
-    /// そこで「検証した実体そのもの」を一時名で保持して宛先へ rename すれば、宛先の内容は常に digest
-    /// 検証済みになる。既存の宛先は置換するが、置換後の内容は同じ digest で検証済みのため害は無い
-    /// （検証前の内容で共有の `blobs/sha256` を上書きしない。fail-closed。OCI-1・OCI-7）。
-    /// `FILE_SHARE_DELETE` を含めるのは自分の `rename` / `hard_link` を共有違反にしないため。
-    /// 残る差し替えの窓は、所有者専用のストア内の私的な一時名に限られる。
-    // Windows ホストは `ImageStore::open` が恒久拒否のため到達しない（#4333）。型検査のために残す（削除は別の整理）。
-    #[cfg(windows)]
-    fn pin_staged_blobs(
-        &self,
-        to_move: &[Digest],
-        tmps: &mut PublishTmpCleanup,
-        nonce: u64,
-    ) -> Result<BTreeMap<Digest, fs::File>, OciError> {
-        use std::os::windows::fs::OpenOptionsExt;
-        let root = self.store.root();
-        let mut pinned = BTreeMap::new();
-        for b in to_move {
-            let src = self.staging_dir.join(hex_of(b)?);
-            let Some(entry) = self.verified.get(b) else {
-                return Err(err(
-                    OciErrorCode::FailedPrecondition,
-                    "blob is neither leased nor verified by this pull",
-                ));
-            };
-            let tmp = publish_tmp_path(&blob_path(root, b)?, nonce);
-            let _ = fs::remove_file(&tmp);
-            fs::hard_link(&src, &tmp)
-                .map_err(|e| io_err(&e, "failed to stage blob for publish"))?;
-            tmps.add(tmp.clone());
-            let file = fs::OpenOptions::new()
-                .read(true)
-                .share_mode(5)
-                .open(&tmp)
-                .map_err(|e| io_err(&e, "failed to pin staged blob"))?;
-            let m = file
-                .metadata()
-                .map_err(|e| io_err(&e, "failed to stat staged blob"))?;
-            if !m.is_file() {
-                return Err(err(
-                    OciErrorCode::FailedPrecondition,
-                    "staged blob is not a regular file",
-                ));
-            }
-            verify_blob_file_digest_with(self.store.recorder(), &file, b, entry.size)?;
-            pinned.insert(b.clone(), file);
-        }
-        Ok(pinned)
-    }
-
-    /// unix では固定しない（指紋と信頼条件の照合で足りる）。
-    #[cfg(not(windows))]
-    fn pin_staged_blobs(
-        &self,
-        _to_move: &[Digest],
-        _tmps: &mut PublishTmpCleanup,
-        _nonce: u64,
-    ) -> Result<BTreeMap<Digest, fs::File>, OciError> {
-        Ok(BTreeMap::new())
     }
 
     /// 公開する（OCI-7 (C)）。排他区間の下で、ステージングからの移動・manifest とタグの登録・
@@ -1488,12 +1426,7 @@ impl PullSession<'_> {
             Some(handle.ensure_blob_dirs()?)
         };
 
-        let root = self.store.root().to_path_buf();
         let owner = dir_owner(&self.pull_dir)?;
-        // Windows: 実体を共有拒否のハンドルで固定して検証する（ガードの外。以降は固定済みの実体を公開する）。
-        let nonce = next_publish_nonce();
-        let mut tmps = PublishTmpCleanup::default();
-        let mut pinned = self.pin_staged_blobs(&to_move, &mut tmps, nonce)?;
         // 既存の宛先の内容検証（再ハッシュ）はガードの外で済ませ、検証した実体の指紋を控える。
         // 排他区間の中では指紋の照合だけを行う（大容量 blob でガード保持が期限を超えないように。
         // ロックの規律）。
@@ -1503,9 +1436,6 @@ impl PullSession<'_> {
             let Some(bd) = blob_dir.as_ref() else {
                 return Err(err(OciErrorCode::Internal, "blob directory is unavailable"));
             };
-            // Windows の指紋は size / mtime だけで差し替えを検出できないが、既存の宛先は受け入れの根拠にせず
-            // 報告（already_present か moved か）にだけ使う。宛先の内容は検証済みの一時名の rename で
-            // 常に確定する（OCI-1・OCI-7）。
             let size = self.verified.get(b).map_or(0, |v| v.size);
             let ident = match bd.stat(hex) {
                 Ok(Some(before_meta))
@@ -1572,42 +1502,7 @@ impl PullSession<'_> {
                 };
                 // 検証後にステージングのファイルが差し替わっても未検証の内容を公開しないよう、
                 // 排他区間の下では再ハッシュせず、検証した実体の指紋と信頼条件を照合する（OCI-1・OCI-7）。
-                // Windows は指紋が size / mtime だけのため、ガードの外で digest 検証済みの一時名へ結び付けて
-                // 固定してあり（`pin_staged_blobs`）、ここではその一時名を rename で宛先へ移すだけにする
-                // （ガード内で再ハッシュしない。既存の宛先は同じ digest の検証済みの内容で置換される）。
                 self.check_staged_ident(hex, b)?;
-                if cfg!(windows) {
-                    let dst = blob_path(&root, b)?;
-                    let existed = match bd.stat(hex) {
-                        Ok(Some(m)) if m.is_file() => true,
-                        Ok(Some(_)) => {
-                            return Err(err(
-                                OciErrorCode::FailedPrecondition,
-                                "blob destination is not a regular file",
-                            ));
-                        }
-                        // 「不在」と確定できるのは不在のときだけ。共有違反・アクセス拒否などは
-                        // 存在の有無が不明なため、失敗にして共有の blob をロールバックで消さない。
-                        Ok(None) => false,
-                        Err(e) => return Err(io_err(&e, "failed to stat blob destination")),
-                    };
-                    fs::rename(publish_tmp_path(&dst, nonce), &dst)
-                        .map_err(|_| err(OciErrorCode::Internal, "failed to publish blob"))?;
-                    if !existed {
-                        created.push(hex.to_owned());
-                        moved.push(b.clone());
-                    } else if dst_checked.get(b).is_some_and(Option::is_some) {
-                        // ガードの外で digest 検証済みだった既存の宛先。同じ内容で置換済みのため報告だけ区別する。
-                        present.push(b.clone());
-                    } else {
-                        moved.push(b.clone());
-                    }
-                    pinned.remove(b);
-                    self.pull_dir
-                        .unlink(hex)
-                        .map_err(|_| err(OciErrorCode::Internal, "failed to remove staged blob"))?;
-                    continue;
-                }
                 match bd.link_from(&self.pull_dir, hex, hex) {
                     Ok(()) => {
                         created.push(hex.to_owned());
@@ -1657,8 +1552,6 @@ impl PullSession<'_> {
                     Err(_) => return Err(err(OciErrorCode::Internal, "failed to publish blob")),
                 }
                 // 公開後のハードリンク数を 1 に保つため、ステージング側の名前を消す
-                // （Windows は固定を外してから。公開は固定した実体への hard_link で済んでいる）。
-                pinned.remove(b);
                 self.pull_dir
                     .unlink(hex)
                     .map_err(|_| err(OciErrorCode::Internal, "failed to remove staged blob"))?;
@@ -1794,42 +1687,6 @@ fn sync_published_blobs(
     handle.sync_blobs_parent().map_err(|_| fail())?;
     handle.sync().map_err(|_| fail())?;
     Ok(())
-}
-
-/// Windows の公開用の私的な一時名（宛先と同じディレクトリ。同一ボリュームで rename できる）。
-///
-/// 同一プロセス内の並行する公開（別セッション・同じ digest）と衝突しないよう、`nonce`（公開ごとに
-/// 採番。[`next_publish_nonce`]）を名前に含める。
-fn publish_tmp_path(dst: &Path, nonce: u64) -> PathBuf {
-    let mut name = dst.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(".publish-{}-{nonce}", std::process::id()));
-    dst.with_file_name(name)
-}
-
-/// 公開ごとに一意な採番（プロセス内で単調増加）。
-fn next_publish_nonce() -> u64 {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-}
-
-/// 公開用の一時名の後始末。drop で残っている一時名を消す（成功時は rename 済みで no-op）。
-/// `publish_inner` の途中で失敗・早期 return しても一時名を残さないためのガード（OCI-7）。
-#[derive(Default)]
-struct PublishTmpCleanup(Vec<PathBuf>);
-
-impl PublishTmpCleanup {
-    #[cfg_attr(not(windows), allow(dead_code))]
-    fn add(&mut self, p: PathBuf) {
-        self.0.push(p);
-    }
-}
-
-impl Drop for PublishTmpCleanup {
-    fn drop(&mut self) {
-        for p in &self.0 {
-            let _ = fs::remove_file(p);
-        }
-    }
 }
 
 // Windows ホストは設計上 `ImageStore` を開けない（#4333・#2428 案 C。拒否は store.rs の試験が照合）ため、
@@ -2842,7 +2699,6 @@ mod tests {
         assert_eq!(out.already_present_blobs, vec![dg.clone()]);
         assert!(out.moved_blobs.is_empty());
         assert_eq!(fs::read(&dst).unwrap(), b"config-body");
-        assert!(!publish_tmp_path(&dst, 0).exists());
     }
 
     /// group / other 書き込み可能なステージングの blob は 0600 へ狭めてから検証・公開する。
@@ -3211,28 +3067,5 @@ mod store_free_tests {
         assert_eq!(PullId::new(a.as_str()).unwrap(), a);
         let first = a.as_str().split('-').next().unwrap();
         assert_eq!(first, std::process::id().to_string());
-    }
-
-    /// 公開用の一時名の後始末は、drop で残った一時名を消し、無い名前があっても失敗しない（OCI-7）。
-    #[test]
-    fn oci7_publish_tmp_cleanup_removes_leftovers() {
-        // 排他作成の試験ルート（既存の名前は消さず辿らない。drop で自分のパスだけ消す。REPAIR-12・#3506）。
-        let root = crate::test_root::test_root("fc-oci-pull-tmpclean", "leftovers");
-        let dir: &std::path::Path = &root;
-        let dst = dir.join("abc");
-        let tmp = publish_tmp_path(&dst, 7);
-        assert_eq!(
-            tmp.file_name().unwrap().to_string_lossy(),
-            format!("abc.publish-{}-7", std::process::id())
-        );
-        assert_ne!(publish_tmp_path(&dst, 8), tmp);
-        assert_ne!(next_publish_nonce(), next_publish_nonce());
-        fs::write(&tmp, b"x").unwrap();
-        {
-            let mut c = PublishTmpCleanup::default();
-            c.add(tmp.clone());
-            c.add(dir.join("missing"));
-        }
-        assert!(!tmp.exists());
     }
 }

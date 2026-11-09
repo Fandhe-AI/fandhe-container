@@ -1657,6 +1657,43 @@ jobs:
             --forbid 'pod_holder_bin_real: ignored' --forbid 'not applicable' --forbid 'PRECONDITION FAILED' \
             --forbid 'WATCHDOG EXPIRED' --forbid 'root=true' --forbid 'FAILED' --summary
 
+      # pod_holder_provider_real（`crates/plugin-cri/tests/pod_holder_provider_real.rs`。CRI-2・CORE-1・SEC-5・REPAIR-5・REPAIR-12・#2877・H6）:
+      # plugin-cri の本番の保持役 provider（`ProductionPodHolder`）を本物の supervisor の bin の `pod-holder` モードで通す実機前提テスト
+      # （harness = false。シナリオ A〜D と最終行の 5 行）。supervisor の bin を先にビルドし（試験バイナリが `target/<profile>/` の隣から探す）、
+      # 試験自身の watchdog が 240 秒のため、補助 540 秒・ステップ 10 分とし、試験の watchdog、補助、ステップ、ジョブの順を保つ。
+      # 上で緩和した AppArmor の sysctl を使い回す。委譲スコープでは包まない。新しいジョブ・check-run・sudo・permissions は増やさない。
+      - name: pod_holder_provider_real のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          cargo build -p fandhe-container-supervisor --bin fandhe-container-supervisor
+          json="${RUNNER_TEMP}/phpr-build.json"
+          cargo test -p fandhe-container-plugin-cri --test pod_holder_provider_real --no-run \
+            --message-format=json > "${json}"
+          sel='select(.profile.test == true and .target.name == "pod_holder_provider_real") | .executable'
+          bins="$(jq -r "${sel}" "${json}" | grep -v '^null$' | sort -u)"
+          if [ -z "${bins}" ] || [ "$(printf '%s\n' "${bins}" | wc -l)" -ne 1 ]; then
+            echo "::error::pod_holder_provider_real test binary not uniquely identified" >&2
+            exit 1
+          fi
+          echo "PHPR_BIN=${bins}" >> "$GITHUB_ENV"
+
+      - name: pod_holder_provider_real の実行（実機前提テスト・--ignored。CRI-2・CORE-1・SEC-5・#2877）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/pod_holder_provider_real.log"
+          scripts/run-with-deadline.sh --name pod_holder_provider_real --deadline 540 --log "${log}" -- \
+            "${PHPR_BIN}" --ignored
+          scripts/check-success-lines.sh --name pod_holder_provider_real \
+            --src crates/plugin-cri/tests/pod_holder_provider_real.rs --log "${log}" \
+            --select '^pod_holder_provider_real: (scenario [A-D] ok:|the production pod holder provider works)' \
+            --min 5 \
+            --forbid 'pod_holder_provider_real: ignored' --forbid 'not applicable' --forbid 'PRECONDITION FAILED' \
+            --forbid 'WATCHDOG EXPIRED' --forbid 'root=true' --forbid 'FAILED' --summary
+
       # runtime_service_namespaces（`crates/cri/tests/runtime_service_namespaces.rs`。CRI-2・TASK-59.2・TASK-59.3・
       # #438・#439・#2188・#2220）: CRI ハンドラが adapter 経由で実際にプロセスを起動するところまで届くこと、
       # `/proc/<pid>/ns/*` で分離が成り立つこと、Remove の後に namespace を参照するプロセスが残らないことを照合する

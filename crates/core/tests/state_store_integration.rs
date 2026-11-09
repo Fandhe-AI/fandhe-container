@@ -6,10 +6,9 @@
 //! （追加依存なし）。子プロセスの待機には上限時間を設ける（REPAIR-5）。root 不要で既定の
 //! テスト集合で動く。
 //!
-//! `FileStateStore` は Linux 限定（他 OS の `open` は `Unimplemented`。`state_store` のモジュール doc
-//! 「対応プラットフォーム」）のため、ストアを使う試験は `linux` モジュールに置き、macOS / Windows では
-//! fail-closed の挙動（何も作らずに `Unimplemented`）を `oci5_open_is_unimplemented_outside_linux` で
-//! 照合する（CLI-1）。
+//! ストアを使う試験は Linux 限定の `linux` モジュールに置く。Windows ホストの `open` は設計上の恒久拒否
+//! （`FailedPrecondition`。#2428 の案 C・#4332。`state_store` のモジュール doc「対応プラットフォーム」）で、
+//! 何も作らない fail-closed の挙動を `oci5_4332_open_is_rejected_by_design_on_windows_host` で照合する（CLI-1）。
 //!
 //! TASK-157.9（#1069）: CLI 役（親）と supervisor 役（子プロセス）が同じ ID の `state.json` へ同時に
 //! 書いても破損・lost update がないこと、別プロセスが `@lock` を保持している間の書き込みが期限で
@@ -47,10 +46,11 @@ fn oci5_open_works_on_macos() {
     );
 }
 
-/// OCI-5・CLI-1: Linux・macOS 以外（Windows）では状態ルートを作らずに `Unimplemented` を返す。
+/// OCI-5・SEC-4・WIN-1・CLI-1（#4332）: Windows ホストでは状態ルートを作らずに `FailedPrecondition` で
+/// 設計上の恒久拒否をする（#2428 の案 C）。
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[test]
-fn oci5_open_is_unimplemented_outside_linux() {
+fn oci5_4332_open_is_rejected_by_design_on_windows_host() {
     use fandhe_container_core::state_store::{FileStateStore, StateRoot};
     use fandhe_container_core::traits::ErrorCode;
     // 作られないことを照合するため、排他作成の `ScratchDir` の下の存在しない子を渡す（#3434・REPAIR-12）。
@@ -60,12 +60,13 @@ fn oci5_open_is_unimplemented_outside_linux() {
     );
     let root = scratch.path().join("root");
     let e = FileStateStore::open(StateRoot::from_override(root.clone()).unwrap()).unwrap_err();
-    assert_eq!(e.code(), ErrorCode::Unimplemented);
+    assert_eq!(e.code(), ErrorCode::FailedPrecondition);
     assert_eq!(
         e.message(),
-        "file state store requires Linux or macOS to verify the state root"
+        "file state store is not supported on a Windows host by design; the state root belongs in the Linux guest"
     );
     assert!(!root.exists());
+    assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 0);
 }
 
 /// ストアを使う試験（Linux 限定）。

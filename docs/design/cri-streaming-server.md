@@ -529,7 +529,7 @@ CRI の `ExecSync`（現状 `UNIMPLEMENTED`）も本設計の helper を再利�
 - rootful: plugin-cri の start が uid 0 を `UNIMPLEMENTED` にするため、rootful のコンテナは無く 3 RPC とも使えない（uid 0 の拒否は #2442、rootful を許すかは #2241 の判断待ち）
 - 非 Linux: Exec は未結線の `UNIMPLEMENTED`。コンテナの start 自体も未実装（macOS の状態ルートは #2431）
 - `ExecSync`: `UNIMPLEMENTED` のまま。追跡 issue 未起票。実装するときは Exec と同じインスタンスの記録と起動時の照合を入れる義務がある（#4286）
-- Exec のインスタンス照合の残余（#4286）: (1) 識別子を報告しない実装・記録の無い旧い `state.json` は両側 `None` で保護されない（試験で固定）。(2) CRI の記録（`ContainerRecord`）は create 時のインスタンスを持たないため、`Exec` RPC より前に外で作り直されたコンテナには新しいインスタンスで URL が発行される（塞ぐには記録ファイルと再採用へインスタンスを持たせる必要があり、本件の範囲外）。(3) 照合の違反の観測は `ExecStreamOutcome::LaunchFailed` に含まれ、区別した計装は無い
+- Exec のインスタンス照合の残余（#4286）: (1) 識別子を報告しない実装・記録の無い旧い `state.json` は両側 `None` で保護されない（試験で固定）。(2) CRI の記録（`ContainerRecord`）は create 時のインスタンスを持たないため、`Exec` RPC より前に外で作り直されたコンテナには新しいインスタンスで URL が発行される（塞ぐには記録ファイルと再採用へインスタンスを持たせる必要があり、本件の範囲外）。(3) 照合の違反の観測は `ExecStreamOutcome::InstanceChanged`（コードと文 `MSG_EXEC_INSTANCE_CHANGED` の両方で判定）として他の起動失敗と区別され、操作別計装 `cri.exec.session`（`FAILED_PRECONDITION`）に加えて `cri.exec.instance_changed` の失敗として別の行にも出る（二重計上。60 秒周期の `op_stats` 行。#4324・CRI-6・REPAIR-4）。クライアントへの Status は `InternalError` のままで観測だけが分かれる。即時の構造化行は未実装
 - 外部公開の TLS・認証（無い。opt-in の口は #4110 で plugin-cri の CLI に出した。前段の守りが前提）
 - Upgrade 後のセッションの停止時のドレイン方針の再評価（REPAIR-5）: #4111。`ConnectionObserver` の telemetry への接続（REPAIR-4）は #4163 で実装済み（下の「plugin-cri での起動と停止」）
 - ポートの到達性など深い意味検証

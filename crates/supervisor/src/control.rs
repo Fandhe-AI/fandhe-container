@@ -90,6 +90,8 @@ pub mod listener;
 #[cfg(target_os = "linux")]
 pub mod observe;
 #[cfg(target_os = "linux")]
+pub(crate) mod os_errno;
+#[cfg(target_os = "linux")]
 pub mod server;
 
 pub use client::{CancelOutcome, ControlExitWatcher, ControlRestartCanceller, ControlSignaler};
@@ -249,6 +251,57 @@ pub trait ExecPidfdSource: Send + Sync {
         pid: std::num::NonZeroU32,
         deadline: std::time::Instant,
     ) -> Result<ExecHandover, fandhe_container_core::traits::TraitError>;
+
+    /// [`Self::obtain`] と同じだが、失敗に OS の errno を添えて返す（stream-exec helper の診断行用。SUP-6・REPAIR-4・#4284）。
+    /// 既定は errno なしで [`Self::obtain`] を包む（errno を運べない実装は従来どおり）。
+    fn obtain_with_errno(
+        &self,
+        id: &fandhe_container_core::traits::ContainerId,
+        pid: std::num::NonZeroU32,
+        deadline: std::time::Instant,
+    ) -> Result<ExecHandover, ExecControlFailure> {
+        self.obtain(id, pid, deadline)
+            .map_err(ExecControlFailure::from)
+    }
+}
+
+/// 制御チャネルの失敗と、その原因の OS の errno（分かるときだけ）。stream-exec helper の診断行が段名と一緒に出す
+/// （SUP-6・REPAIR-4・#4284）。core の `TraitError` は errno を持たないため、supervisor 内でだけ添えて運ぶ。
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecControlFailure {
+    error: fandhe_container_core::traits::TraitError,
+    errno: Option<i32>,
+}
+
+#[cfg(target_os = "linux")]
+impl ExecControlFailure {
+    /// 失敗と errno から作る。
+    pub fn new(error: fandhe_container_core::traits::TraitError, errno: Option<i32>) -> Self {
+        Self { error, errno }
+    }
+
+    /// 構造化エラー。
+    pub fn error(&self) -> &fandhe_container_core::traits::TraitError {
+        &self.error
+    }
+
+    /// OS の errno（OS 由来でない失敗は `None`）。
+    pub fn errno(&self) -> Option<i32> {
+        self.errno
+    }
+
+    /// 構造化エラーだけを取り出す。
+    pub fn into_error(self) -> fandhe_container_core::traits::TraitError {
+        self.error
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl From<fandhe_container_core::traits::TraitError> for ExecControlFailure {
+    fn from(error: fandhe_container_core::traits::TraitError) -> Self {
+        Self { error, errno: None }
+    }
 }
 
 /// exec 子 cgroup の作成を、pidfd を渡した supervisor へ通知する口（SUP-6・REPAIR-5・#2626）。
@@ -263,6 +316,16 @@ pub trait ExecCreatedNotifier: Send {
         name: &fandhe_container_core::exec::ExecCgroupName,
         hold_until: std::time::Instant,
     ) -> Result<(), fandhe_container_core::traits::TraitError>;
+
+    /// [`Self::notify_created`] と同じだが、失敗に OS の errno を添える（#4284）。既定は errno なしで包む。
+    fn notify_created_with_errno(
+        &self,
+        name: &fandhe_container_core::exec::ExecCgroupName,
+        hold_until: std::time::Instant,
+    ) -> Result<(), ExecControlFailure> {
+        self.notify_created(name, hold_until)
+            .map_err(ExecControlFailure::from)
+    }
 }
 
 /// [`ExecPidfdSource::obtain`] の結果: 起動時 pidfd の複製と、supervisor との接続（作成通知の口）。
@@ -301,6 +364,15 @@ impl ExecHandover {
         hold_until: std::time::Instant,
     ) -> Result<(), fandhe_container_core::traits::TraitError> {
         self.notifier.notify_created(name, hold_until)
+    }
+
+    /// [`Self::notify_created`] の errno つき版（#4284）。
+    pub fn notify_created_with_errno(
+        &self,
+        name: &fandhe_container_core::exec::ExecCgroupName,
+        hold_until: std::time::Instant,
+    ) -> Result<(), ExecControlFailure> {
+        self.notifier.notify_created_with_errno(name, hold_until)
     }
 }
 

@@ -105,8 +105,14 @@ pub fn open_state_dir(
         .read(true)
         .custom_flags(flags)
         .open(state_root.join(id.as_str()))
-        .map_err(|_| unavailable())?;
-    let meta = dir.metadata().map_err(|_| unavailable())?;
+        .map_err(|e| {
+            super::os_errno::record(&e);
+            unavailable()
+        })?;
+    let meta = dir.metadata().map_err(|e| {
+        super::os_errno::record(&e);
+        unavailable()
+    })?;
     check_dir_meta(meta.is_dir(), meta.uid(), meta.mode(), expected_uid)?;
     Ok(dir)
 }

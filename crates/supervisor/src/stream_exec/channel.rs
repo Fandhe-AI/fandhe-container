@@ -59,8 +59,13 @@ pub enum ChannelError {
     NotPtyMaster,
     /// 番号表に無い値のため符号化できない。
     Unencodable(EncodeError),
-    /// その他の入出力の失敗。
-    Io(io::ErrorKind),
+    /// その他の入出力の失敗（OS の errno があれば保持する。診断行の errno 用。#4284）。
+    Io {
+        /// 失敗の種別。
+        kind: io::ErrorKind,
+        /// OS の errno（OS 由来でない入出力の失敗は `None`）。
+        errno: Option<i32>,
+    },
 }
 
 impl ChannelError {
@@ -69,7 +74,7 @@ impl ChannelError {
     pub fn code(&self) -> ErrorCode {
         match self {
             Self::Timeout => ErrorCode::Timeout,
-            Self::Closed | Self::Io(_) => ErrorCode::Unavailable,
+            Self::Closed | Self::Io { .. } => ErrorCode::Unavailable,
             Self::Unencodable(_) => ErrorCode::Internal,
             Self::Malformed(_)
             | Self::FdCountMismatch
@@ -77,6 +82,14 @@ impl ChannelError {
             | Self::FdOnContinuation
             | Self::MaskMismatch
             | Self::NotPtyMaster => ErrorCode::InvalidArgument,
+        }
+    }
+
+    /// OS の errno（[`Self::Io`] のときだけ。診断行用。#4284）。
+    pub fn errno(&self) -> Option<i32> {
+        match self {
+            Self::Io { errno, .. } => *errno,
+            _ => None,
         }
     }
 }
@@ -134,7 +147,10 @@ fn map_io(e: &io::Error) -> ChannelError {
         io::ErrorKind::BrokenPipe
         | io::ErrorKind::ConnectionReset
         | io::ErrorKind::UnexpectedEof => ChannelError::Closed,
-        k => ChannelError::Io(k),
+        kind => ChannelError::Io {
+            kind,
+            errno: e.raw_os_error(),
+        },
     }
 }
 
@@ -820,12 +836,30 @@ mod tests {
         assert_eq!(err, ChannelError::Timeout);
     }
 
+    /// SUP-6・REPAIR-4（#4284）: OS の errno は `Io` に保持され、timeout・切断・OS 由来でない失敗は errno を持たない。
+    #[test]
+    fn sup6_4284_map_io_keeps_the_os_errno() {
+        let ebadf = map_io(&io::Error::from_raw_os_error(9));
+        assert_eq!(ebadf.errno(), Some(9));
+        assert_eq!(ebadf.code(), ErrorCode::Unavailable);
+        assert_eq!(map_io(&io::Error::from(io::ErrorKind::Other)).errno(), None);
+        assert_eq!(
+            map_io(&io::Error::from_raw_os_error(32)),
+            ChannelError::Closed
+        );
+        assert_eq!(ChannelError::Closed.errno(), None);
+    }
+
     #[test]
     fn sup6_error_codes_map_to_machine_readable_classes() {
         assert_eq!(ChannelError::Timeout.code(), ErrorCode::Timeout);
         assert_eq!(ChannelError::Closed.code(), ErrorCode::Unavailable);
         assert_eq!(
-            ChannelError::Io(io::ErrorKind::Other).code(),
+            ChannelError::Io {
+                kind: io::ErrorKind::Other,
+                errno: None
+            }
+            .code(),
             ErrorCode::Unavailable
         );
         assert_eq!(

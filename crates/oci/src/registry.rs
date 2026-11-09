@@ -2458,7 +2458,7 @@ mod tests {
         assert_eq!(e.code(), OciErrorCode::PermissionDenied);
     }
 
-    /// SEC: 公開 / 非公開アドレスの判定（具体値）。
+    /// IPv4 射影形の IPv6 が IPv4 と同じ分類になること（具体値。SEC-1・#4290）。
     #[test]
     fn sec1_4290_mapped_ipv4_follows_ipv4_classification() {
         for (v4, want) in [
@@ -2480,6 +2480,7 @@ mod tests {
         }
     }
 
+    /// SEC: 公開 / 非公開アドレスの判定（具体値）。
     #[test]
     fn public_ip_classification() {
         let private = [

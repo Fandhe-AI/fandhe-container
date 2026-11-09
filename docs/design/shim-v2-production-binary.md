@@ -124,7 +124,7 @@ shim の serve の起動時に、scoped 状態ルートを `sweep_leftover_conta
 実装記録（#4280。`crates/plugin-cri/src/shim/startup_sweep.rs`）:
 
 - 差し込み口: `registry_parts_in` の末尾（登録簿の組み立てに成功した後。失敗した serve では走査しない）。`spawn_startup_log_sweep` が detached の std thread（`cri-shim-log-sweep`）で `sweep_leftover_container_logs` を 1 回だけ呼び、serve は待たない。期限は plugin-cri と同じ 30 秒（`STARTUP_LOG_SWEEP_BUDGET`）。ID 数の上限・各削除の期限は supervisor 側の既存実装
-- 出力: 結果が既定値（何も無かった）でないときだけ、`sweep_summary_line` の 1 行（`event: container_log_sweep`。件数だけ）を shim の stderr（`daemon.log`）へ出す。thread を作れなかったときは固定の警告行（`outcome: spawn_failed`）を出して serve を続ける。記録器は serve の core のものを共有するが、shim は記録器を書き出さないため `container_log_reclaim` の計数は外から見えない
+- 出力: 結果が既定値（何も無かった）でないときだけ、`sweep_summary_line` の 1 行（`event: container_log_sweep`。件数だけ）を shim の stderr（`daemon.log`）へ出す。thread を作れなかったときは固定の警告行（`outcome: spawn_failed`）を出して serve を続ける。記録器は serve の core のものを共有し、回収が 1 件以上あったときだけ走査の完了時点のスナップショットを `export_json_lines` 形式（`op_stats` 行 + `op_stats_meta` 行）で 1 回だけ同じ stderr へ出す（#4319。定期出力は無く、その後の計数は出ない。送り先が詰まっても走査の結果は変わらない。試験: `cri5_repair4_4319_*`）
 - 残余: 同じ scoped 状態ルートに複数の shim が同時に起動すると走査が競合しうるが、ID ごとの削除はロックの下で guard を評価するので無害（片方が消し、もう片方は見送る）。serve が走査より先に終わるとプロセスの終了で走査が途切れ、次の shim の起動時に回収される。稼働中に発生した残りも次の shim の起動まで残る
 - 試験: `shim/startup_sweep_tests.rs` の `cri5_sup7_4280_*`・`cri5_repair5_4280_*`（記録の無い閉じた ID だけが消える・何も無いと行を出さない・guard が止まっても呼び出しは戻り期限で `timed_out`）と、bin を通した `tests/shim_bin_delete_reclaim.rs` の `cri5_sup7_4280_bin_serve_sweeps_unrecorded_container_logs`
 

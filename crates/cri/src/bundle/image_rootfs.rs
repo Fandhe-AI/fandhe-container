@@ -757,7 +757,7 @@ impl RootfsSource for ImageRootfsSource {
             .map_err(|e| CriError::from(PullError::from_store(&e)))?
             .ok_or_else(not_cached)?;
         // 中間ディレクトリ（rootfs・rootfs/sha256・blobs・blobs/sha256）も、開いた fd の fstat に従来の信頼条件
-        // （所有者一致・group/other 書き込み不可）を課す（pull の `prepare_private_dir` と同じ。OCI-7・SEC-1・#4283）。
+        // （所有者一致・group/other 書き込み不可）を課す（pull の `blobs_dir` と同じ。OCI-7・SEC-1・#4283）。
         for meta in [published.parent_metadata(), published.metadata()] {
             let meta = meta.map_err(|e| CriError::from(PullError::from_store(&e)))?;
             verify_private_meta(&meta, owner).map_err(CriError::from)?;

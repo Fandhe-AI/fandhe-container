@@ -87,7 +87,7 @@
 //! 巻き戻り（panic）時の drop 順は保証しない。
 //!
 //! # 範囲外（REPAIR-3。担当 issue）
-//! - virtio-block の QueueNotify の処理は #4028 で結線済み（`HvfDeviceBus::queue_notify_routes`。失敗は VM を止める）。virtio-net の QueueNotify（送信と
+//! - virtio-block の QueueNotify の処理は #4028 で結線済み（`hvf_device_bus::HvfDeviceBus::queue_notify_routes`。#4293 で生成関数つきに汎用化。失敗は VM を止める）。virtio-net の QueueNotify（送信と
 //!   ゲストの kick による受信）も #4029 で結線済み。ホスト側の到着を契機にした受信は #4030 で受信ポーラー（`net_rx_poll`）を `start` で起動して結線済み、期限切れ後の最後の `Arc` での RAM の回収は #4032、
 //!   全体の追跡は #3908。
 //!   実カーネルでの block-read（edge と LevelHigh の割り込みの配送）は `tests/hvf_kernel_boot.rs`（#4014）で、ACK の後処理の結果は
@@ -116,22 +116,18 @@ use crate::hvf::memory::{HvfGuestRam, RegisteredHvfRam};
 use crate::hvf::mmio::MmioHandler;
 use crate::hvf::vcpu::{ExitHandlers, VcpuSet, VcpuThread, VcpuThreadConfig};
 use crate::hvf_abi::{HvReg, HvSysReg, HvfAssembleInput, check_assemble_input};
+use crate::hvf_device_bus::HvfDeviceBus;
 use crate::hvf_lifecycle::{
-    DROP_STOP_DEADLINE, HvfStopReport, ReleaseDevices, Resources, StopWithAux, VcpuStopper,
-    stop_and_release,
+    DROP_STOP_DEADLINE, HvfStopReport, Resources, StopWithAux, VcpuStopper, stop_and_release,
 };
 use crate::hvf_loop::log_line;
 use crate::hvf_smp::{ApMailbox, HvfPowerControl};
-use crate::interrupt::{
-    BlockQueueNotifyRoute, BoundAckRoute, InterruptAckCounts, InterruptAckRoute, InterruptAckTally,
-    InterruptLine, NetQueueNotifyRoute, NetRxPollRoute, QueueNotifyRoute,
-};
+use crate::interrupt::{InterruptAckCounts, InterruptAckTally};
 use crate::net_rx_poll::{NET_RX_POLL_INTERVAL, NetRxPollerHandle, spawn_net_rx_poller};
 use crate::psci::PsciCpus;
 use crate::uart::SerialConsole;
-use crate::virtio_block::{BlockBackend, VirtioBlock};
-use crate::virtio_mmio::{SharedTransport, VirtioMmioTransport};
-use crate::virtio_net::{NetBackend, VirtioNet};
+use crate::virtio_block::BlockBackend;
+use crate::virtio_net::NetBackend;
 
 fn internal(msg: &'static str) -> MicrovmError {
     MicrovmError::new(MicrovmErrorCode::Internal, msg)
@@ -201,263 +197,31 @@ pub struct HvfDeviceInfo {
     pub id: DeviceId,
 }
 
-/// 登録済みのデバイス 1 台（トランスポート・識別子・窓・割り込み線）。
-struct HvfBoundDevice<D: crate::virtio_mmio::VirtioDevice> {
-    /// QueueNotify の route（#4028）と ACK の route（#3863）が型つきで触る。dispatcher と共有する。
-    transport: Arc<Mutex<VirtioMmioTransport<D>>>,
-    id: DeviceId,
-    window: MmioRegion,
-    line: GicSpiLine,
-    /// ACK の後処理の結果の累計（観測専用。全 vCPU のハンドラと共有する。#4014）。
-    ack_tally: Arc<InterruptAckTally>,
-}
+/// 本番のバス（virtio の割り込み線は HVF の GIC の SPI）。
+type HvfBus<B, N> = HvfDeviceBus<B, N, GicSpiLine>;
 
-/// 登録済みのシリアル（ホストが出力を取り出すハンドル・識別子・窓・SPI の INTID）。
-struct HvfSerial {
-    console: SerialConsole,
-    /// 登録の識別子（観測・将来の登録解除用）。
-    #[allow(dead_code)]
-    id: DeviceId,
-    #[allow(dead_code)]
-    window: MmioRegion,
-    /// THRE 割り込みの INTID（level の SPI。#3892）。結線は `SpiLevelLine` が持つため今は読まず、
-    /// 診断用に保持する（将来 `devices()` 相当の一覧へ載せる想定）。
-    #[allow(dead_code)]
-    spi_intid: u32,
-}
-
-/// virtio-mmio のデバイス群とシリアル、それを引く `ExitDispatcher`。macOS には PIO は無い（arm64）。
-struct HvfDeviceBus<B: BlockBackend, N: NetBackend> {
-    dispatcher: Arc<Mutex<ExitDispatcher>>,
-    serial: Option<HvfSerial>,
-    block: Vec<HvfBoundDevice<VirtioBlock<B>>>,
-    net: Vec<HvfBoundDevice<VirtioNet<N>>>,
-}
-
-impl<B: BlockBackend, N: NetBackend> Drop for HvfDeviceBus<B, N> {
-    /// dispatcher の `Arc` は vCPU の `MmioHandler` や `HvfVmParts` も持ち、バスを drop してもデバイス（と backend）は
-    /// dispatcher の範囲表に残る。RAM と VM の解放より前にデバイスを手放すため、ここで範囲表を空にする（MVM-5・REPAIR-5）。
-    /// vCPU スレッドがロックを持ったまま止まっている（期限切れ）場合に待たないよう `try_lock` を使い、
-    /// 取れなければ空にしない（そのときは RAM もリークされ、解放順序の違反は起きない）。
-    fn drop(&mut self) {
-        match self.dispatcher.try_lock() {
-            Ok(mut d) => d.clear(),
-            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner().clear(),
-            Err(std::sync::TryLockError::WouldBlock) => {}
-        }
-    }
-}
-
-impl<B: BlockBackend, N: NetBackend> ReleaseDevices for HvfDeviceBus<B, N> {
-    /// dispatcher の範囲表を空にする。`dispatcher()` の clone 保持者がロック中なら `deadline` まで 1ms 刻みで再試行し、
-    /// それでも取れなければ `DeadlineExceeded`（成功扱いにしない。呼び出し側が RAM・VM を解放しない。MVM-5・REPAIR-5）。
-    fn release_devices(&mut self, deadline: std::time::Duration) -> Result<(), MicrovmError> {
-        let limit = std::time::Instant::now() + deadline;
-        loop {
-            match self.dispatcher.try_lock() {
-                Ok(mut d) => {
-                    d.clear();
-                    return Ok(());
-                }
-                Err(std::sync::TryLockError::Poisoned(e)) => {
-                    e.into_inner().clear();
-                    return Ok(());
-                }
-                Err(std::sync::TryLockError::WouldBlock) => {
-                    if std::time::Instant::now() >= limit {
-                        return Err(MicrovmError::new(
-                            MicrovmErrorCode::DeadlineExceeded,
-                            "device dispatcher is locked; devices not released",
-                        ));
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-            }
-        }
-    }
-}
-
-impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfDeviceBus<B, N> {
-    /// block → net → シリアルの順に窓（`layout.virtio_mmio_window(i)`）と SPI（`vm.spi_line(layout, i)`）を割り当てて登録する。
-    fn new(
-        layout: &Arm64Layout,
-        vm: &VmWithGic,
-        block: Vec<B>,
-        net: Vec<HvfNetDeviceConfig<N>>,
-    ) -> Result<Self, MicrovmError> {
-        let mut bus = HvfDeviceBus {
-            dispatcher: Arc::new(Mutex::new(ExitDispatcher::new())),
-            block: Vec::with_capacity(block.len()),
-            net: Vec::with_capacity(net.len()),
-            serial: None,
-        };
-        let mut index: u32 = 0;
-        for backend in block {
-            let transport = Arc::new(Mutex::new(VirtioMmioTransport::new(VirtioBlock::new(
-                backend,
-            ))?));
-            let dev = bus.bind(layout, vm, index, transport)?;
-            bus.block.push(dev);
-            index += 1;
-        }
-        for cfg in net {
-            let transport = Arc::new(Mutex::new(VirtioMmioTransport::new(VirtioNet::new(
-                cfg.backend,
-                cfg.mac,
-            ))?));
-            let dev = bus.bind(layout, vm, index, transport)?;
-            bus.net.push(dev);
-            index += 1;
-        }
-        // シリアルは virtio の後に登録する（virtio の DeviceId を変えない）。THRE 割り込みは level の SPI で結ぶ（#3892）。
-        if let Some(window) = layout.serial {
-            let console = SerialConsole::new();
-            let line = vm.serial_line(layout)?;
-            let spi_intid = line.intid();
-            let id = bus
-                .dispatcher
-                .lock()
-                .map_err(|_| internal("device dispatcher lock poisoned"))?
-                .register_mmio(
-                    window.base.raw(),
-                    window.size,
-                    console.mmio_device_with_irq(Arc::new(line)),
-                )?;
-            bus.serial = Some(HvfSerial {
-                console,
-                id,
-                window,
-                spi_intid,
-            });
-        }
-        Ok(bus)
-    }
-
-    /// `index` 番目の窓に `transport` を登録し、割り込み線を結ぶ。
-    fn bind<D: crate::virtio_mmio::VirtioDevice + Send + 'static>(
-        &self,
-        layout: &Arm64Layout,
-        vm: &VmWithGic,
-        index: u32,
-        transport: Arc<Mutex<VirtioMmioTransport<D>>>,
-    ) -> Result<HvfBoundDevice<D>, MicrovmError> {
-        let window = layout.virtio_mmio_window(index)?;
-        let line = vm.spi_line(layout, index)?;
-        layout.check_virtio_injection(line.injection())?;
-        let id = self
-            .dispatcher
-            .lock()
-            .map_err(|_| internal("device dispatcher lock poisoned"))?
-            .register_mmio(
-                window.base.raw(),
-                window.size,
-                Box::new(SharedTransport(Arc::clone(&transport))),
-            )?;
-        Ok(HvfBoundDevice {
-            transport,
-            id,
-            window,
-            line,
-            ack_tally: Arc::new(InterruptAckTally::default()),
-        })
-    }
-}
-
-impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfDeviceBus<B, N> {
-    /// 全デバイスの `InterruptACK` の後処理（#3863）。
-    fn ack_routes(&self) -> Vec<(DeviceId, Arc<dyn InterruptAckRoute>)> {
-        fn route<D: crate::virtio_mmio::VirtioDevice + Send + 'static>(
-            d: &HvfBoundDevice<D>,
-        ) -> (DeviceId, Arc<dyn InterruptAckRoute>) {
-            (
-                d.id,
-                Arc::new(BoundAckRoute {
-                    transport: Arc::clone(&d.transport),
-                    line: d.line.clone(),
-                }),
-            )
-        }
-        let b = self.block.iter().map(route);
-        let n = self.net.iter().map(route);
-        b.chain(n).collect()
-    }
-
-    /// 全デバイスの `InterruptACK` の後処理の結果の計数（観測専用。#4014）。`Arc` の clone を全 vCPU が共有する。
-    fn ack_tallies(&self) -> Vec<(DeviceId, Arc<InterruptAckTally>)> {
-        let b = self.block.iter().map(|d| (d.id, Arc::clone(&d.ack_tally)));
-        let n = self.net.iter().map(|d| (d.id, Arc::clone(&d.ack_tally)));
-        b.chain(n).collect()
-    }
-
-    /// virtio-block の `QueueNotify` の処理（virtqueue の処理と完了の割り込み。#4028・MVM-5・MVM-1）。
-    ///
-    /// 台ごとに 1 回だけ作り、全 vCPU の `MmioHandler` が同じ実体（`Arc`）を共有する。ゲスト RAM は `memory` スロットの
-    /// clone で受け渡す（`HvfVmParts::release` が停止確認後に取り出すため、解放後の通知は `Internal` で fail-closed）。
-    /// virtio-net の台にも同じ形で route を作る（#4029。送信とゲストの kick による受信まで。ホスト側の到着による受信は `net_rx_poll_routes` と受信ポーラー〔#4030〕）。
-    fn queue_notify_routes(
-        &self,
-        memory: &GuestMemorySlot<RegisteredHvfRam<'static>>,
-    ) -> Vec<(DeviceId, Arc<dyn QueueNotifyRoute>)> {
-        let b = self.block.iter().map(|d| {
-            let route: Arc<dyn QueueNotifyRoute> = Arc::new(BlockQueueNotifyRoute::new(
-                Arc::clone(&d.transport),
-                memory.clone(),
-                d.line.clone(),
-            ));
-            (d.id, route)
-        });
-        let n = self.net.iter().map(|d| {
-            let route: Arc<dyn QueueNotifyRoute> = Arc::new(NetQueueNotifyRoute::new(
-                Arc::clone(&d.transport),
-                memory.clone(),
-                d.line.clone(),
-            ));
-            (d.id, route)
-        });
-        b.chain(n).collect()
-    }
-
-    /// virtio-net の台ごとの受信ポーラー用の route（ホスト側の到着を契機にした受信。#4030・MVM-5・MVM-1）。
-    ///
-    /// `queue_notify_routes` の net と同じ種類（`NetQueueNotifyRoute`）を別に作る。ゲスト RAM は `memory` スロットの clone で、
-    /// ポーラーのスレッドが終了の直前に落とす（停止の確認が RAM の解放より前になる）。net が無ければ空。
-    fn net_rx_poll_routes(
-        &self,
-        memory: &GuestMemorySlot<RegisteredHvfRam<'static>>,
-    ) -> Vec<Arc<dyn NetRxPollRoute>> {
-        self.net
-            .iter()
-            .map(|d| {
-                let route: Arc<dyn NetRxPollRoute> = Arc::new(NetQueueNotifyRoute::new(
-                    Arc::clone(&d.transport),
-                    memory.clone(),
-                    d.line.clone(),
-                ));
-                route
-            })
-            .collect()
-    }
-}
-
-impl<B: BlockBackend, N: NetBackend> HvfDeviceBus<B, N> {
+impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static>
+    HvfDeviceBus<B, N, GicSpiLine>
+{
     fn infos(&self) -> Vec<HvfDeviceInfo> {
-        let b = self
-            .block
-            .iter()
-            .enumerate()
-            .map(|(i, d)| (HvfDeviceKind::Block, i, d.id, d.window, d.line.intid()));
-        let n = self
-            .net
-            .iter()
-            .enumerate()
-            .map(|(i, d)| (HvfDeviceKind::Net, i, d.id, d.window, d.line.intid()));
-        b.chain(n)
-            .map(|(kind, index, id, window, spi_intid)| HvfDeviceInfo {
-                kind,
-                index,
-                window,
-                spi_intid,
-                id,
+        let (mut bi, mut ni) = (0usize, 0usize);
+        self.summaries()
+            .into_iter()
+            .map(|s| {
+                let (kind, index) = if s.is_net {
+                    ni += 1;
+                    (HvfDeviceKind::Net, ni - 1)
+                } else {
+                    bi += 1;
+                    (HvfDeviceKind::Block, bi - 1)
+                };
+                HvfDeviceInfo {
+                    kind,
+                    index,
+                    window: s.window,
+                    spi_intid: s.spi_intid,
+                    id: s.id,
+                }
             })
             .collect()
     }
@@ -480,7 +244,7 @@ struct HvfVmParts<B: BlockBackend, N: NetBackend> {
     vcpus: Option<VcpuSet>,
     /// 各 vCPU の `MPIDR_EL1` の読み戻し（生の値。index 順）。
     mpidrs: Vec<u64>,
-    devices: Option<HvfDeviceBus<B, N>>,
+    devices: Option<HvfBus<B, N>>,
     /// ゲスト RAM の所有。`release` がスロットの clone を渡し、停止確認後に期限つきで取り出す（#4027・#4092）。
     memory: GuestMemorySlot<RegisteredHvfRam<'static>>,
     vm: Option<Arc<VmWithGic>>,
@@ -640,7 +404,17 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfMicroV
         // 以降の失敗経路は、スロットを取り出してから返す（`abort_after_spawn`）。vCPU スレッドが route 越しに最後の `Arc` を
         // 持って unmap と `hv_vm_destroy` を担う形（採らない案 2）にしないため。
         let memory = GuestMemorySlot::new(memory);
-        let devices = HvfDeviceBus::new(&layout, &vm, block, net)?;
+        let devices = HvfDeviceBus::new(
+            &layout,
+            block,
+            net.into_iter().map(|c| (c.backend, c.mac)).collect(),
+            |i| vm.spi_line(&layout, i),
+            || {
+                let line = vm.serial_line(&layout)?;
+                let intid = line.intid();
+                Ok((line, intid))
+            },
+        )?;
         let queue_routes = devices.queue_notify_routes(&memory);
 
         let psci = Arc::new(PsciCpus::new(layout.vcpus)?);
@@ -678,7 +452,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfMicroV
                     .map_err(|_| internal("boot readback was recorded twice"))
             },
             ExitHandlers {
-                mmio: MmioHandler::with_shared_dispatcher(Arc::clone(&devices.dispatcher))
+                mmio: MmioHandler::with_shared_dispatcher(Arc::clone(devices.dispatcher()))
                     .with_ack_routes(devices.ack_routes())
                     .with_ack_tallies(devices.ack_tallies())
                     .with_queue_notify_routes(queue_routes.clone())
@@ -705,7 +479,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfMicroV
             let spawned =
                 HvcHandler::with_cpus(Arc::clone(&psci), power.clone(), index).and_then(|hvc| {
                     let handlers = ExitHandlers {
-                        mmio: MmioHandler::with_shared_dispatcher(Arc::clone(&devices.dispatcher))
+                        mmio: MmioHandler::with_shared_dispatcher(Arc::clone(devices.dispatcher()))
                             .with_ack_routes(devices.ack_routes())
                             .with_ack_tallies(devices.ack_tallies())
                             .with_queue_notify_routes(queue_routes.clone())
@@ -738,10 +512,10 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfMicroV
                 }
             }
         }
-        let dispatcher = Arc::clone(&devices.dispatcher);
+        let dispatcher = Arc::clone(devices.dispatcher());
         let infos = devices.infos();
         let ack_tallies = devices.ack_tallies();
-        let serial = devices.serial.as_ref().map(|s| s.console.clone());
+        let serial = devices.serial_console();
         Ok(HvfMicroVm {
             parts: HvfVmParts {
                 vcpus: Some(vcpu_set),

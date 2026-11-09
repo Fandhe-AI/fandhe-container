@@ -295,3 +295,65 @@ fn sec1_4233_unknown_event_is_unparsed() {
         assert!(summary_line(DiagEnd::Eof, &st).is_some(), "{l}");
     }
 }
+/// CRI-6・SUP-6・REPAIR-4（#4284）: helper の全段が、数値 errno と `none` の両方で語彙どおりに転送される。
+#[test]
+fn cri6_4284_every_helper_stage_is_forwarded_with_errno_and_none() {
+    use fandhe_container_supervisor::stream_exec::diag::{HelperFailure, HelperStage};
+    for stage in HelperStage::ALL {
+        for (errno, rendered) in [(Some(2), "2"), (None, "\"none\"")] {
+            let line = HelperFailure::new(stage, ErrorCode::Unavailable, errno).diagnostic_line();
+            assert_eq!(
+                classify_str(&line),
+                Classified::Forwarded(format!(
+                    "{{\"event\":\"cri_exec_helper_diagnostic\",\"component\":\"supervisor.stream_exec\",\"code\":\"UNAVAILABLE\",\"stage\":\"{}\",\"errno\":{rendered}}}",
+                    stage.as_str()
+                )),
+                "{line}"
+            );
+        }
+    }
+}
+
+/// CRI-6・SUP-6（#4284）: helper の component の行に限り、語彙外の stage・errno 名は `other` として転送する。
+#[test]
+fn cri6_4284_unknown_vocabulary_falls_back_to_other_only_for_the_helper_component() {
+    let helper = |stage: &str, errno: &str| {
+        format!(
+            "{{\"component\":\"supervisor.stream_exec\",\"stage\":\"{stage}\",\"code\":\"INTERNAL\",\"errno\":{errno}}}"
+        )
+    };
+    assert_eq!(
+        classify_str(&helper("helper_future_stage", "\"EWHATEVER\"")),
+        Classified::Forwarded(
+            "{\"event\":\"cri_exec_helper_diagnostic\",\"component\":\"supervisor.stream_exec\",\"code\":\"INTERNAL\",\"stage\":\"other\",\"errno\":\"other\"}"
+                .to_string()
+        )
+    );
+    // 形が不正な値は保留せず解釈できない行にする。
+    assert_eq!(
+        classify_str(&helper("Helper-Stage", "2")),
+        Classified::Unparsed
+    );
+    assert_eq!(
+        classify_str(&helper("helper_x", "\"e e\"")),
+        Classified::Unparsed
+    );
+    // component が無い・他の component の語彙外は従来どおり解釈できない行（fail-closed）。
+    assert_eq!(
+        classify_str("{\"stage\":\"helper_future_stage\",\"errno\":2}"),
+        Classified::Unparsed
+    );
+    assert_eq!(
+        classify_str(
+            "{\"component\":\"core.exec\",\"stage\":\"not_a_stage_marker\",\"errno\":\"none\"}"
+        ),
+        Classified::Unparsed
+    );
+    // 順序に依らない（component が stage より後ろでも同じ）。
+    assert!(matches!(
+        classify_str(
+            "{\"stage\":\"helper_future_stage\",\"errno\":3,\"component\":\"supervisor.stream_exec\"}"
+        ),
+        Classified::Forwarded(_)
+    ));
+}

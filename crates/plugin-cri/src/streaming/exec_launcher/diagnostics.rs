@@ -33,12 +33,13 @@
 //! 継承しうるため、helper を kill しても EOF にならないことがある）。停止後は [`DIAG_STOP_DRAIN`] だけ残りを読んで終える。
 //!
 //! # 残余（REPAIR-3）
-//! - 現状、`stage=… errno=N` の形（本ファイルが受け入れる文法）を fd 2 へ出す生成側は supervisor・core には無い。
-//!   子の段の失敗は `Result` frame の `NotStarted` で返る。#4172 で確認した結果、helper が fd 2 へ書くのは
-//!   「fd 0 が socket でない」「要求元の消滅で取り消した」の 2 行（`code` と `message` だけ）で、状態の不一致・kind 6 の
-//!   失敗・stdio の受け取りの失敗は `Failed(code)` の `Result` frame だけで返り、errno はどこにも運ばれない。この現状を
-//!   `tests/exec_helper_failure_diag.rs` が実 helper のコードで具体値に固定している（生成側が入ったら期待値を直す）。
-//!   生成側の追加（制御クライアントへの errno の受け渡し・helper の段の語彙・本ファイルの分類語彙の拡張）は後続 issue で扱う。
+//! - 生成側は #4284 で入った。helper（supervisor の `stream_exec::helper`）が起動の失敗を
+//!   `{"component":"supervisor.stream_exec","stage":"helper_*","code":…,"errno":N|"none"}` の 1 行にして fd 2 へ出す
+//!   （語彙は `stream_exec::diag::HelperStage`。errno は OS の errno があるときだけ数値、無い段は `"none"`）。状態ストア・
+//!   launch env・監査 sink・要求の検証の失敗は core の `TraitError` が errno を持たないため `"none"` になる。子の段の
+//!   失敗は `Result` frame の `NotStarted` で返り、行は足されない。この component の行に限り、語彙外の `stage`・errno 名
+//!   （版のずれ）は `"other"` として転送し、他の component の語彙外は従来どおり解釈できない行にする（fail-closed）。
+//!   実 helper での具体値は `tests/exec_helper_failure_diag.rs` が固定する。
 //! - `count` が 10 桁を超える seccomp の集計行は、行全体を解釈できない行（unparsed）として数える。
 //! - start 経路のハブだけが出す `seccomp_notify_join_timeout` は exec 経路の fd 2 に来ないため、語彙に含めない。
 //! - 停止後の drain 上限を超えて残った診断は失う（要約の `end` は `stopped`）。
@@ -53,6 +54,7 @@ use fandhe_container_core::exec::SealedCopyUnavailable;
 use fandhe_container_core::exec::{EntrypointExecMode, ExecChildStep, IsolationStage};
 use fandhe_container_core::traits::ErrorCode;
 use fandhe_container_supervisor::seccomp_notify::SeccompReportEvent;
+use fandhe_container_supervisor::stream_exec::diag::HelperStage;
 
 use crate::telemetry::LineSink;
 
@@ -81,7 +83,7 @@ const READ_CHUNK: usize = 4096;
 const MAX_PAIRS: usize = 12;
 
 /// 転送する errno の名前の表（core の `pidfd_errno_name` と diagnostic の `errno_name` を含む閉じた集合）。
-const ERRNO_NAMES: [&str; 24] = [
+const ERRNO_NAMES: [&str; 25] = [
     "EPERM",
     "ENOENT",
     "ESRCH",
@@ -105,10 +107,21 @@ const ERRNO_NAMES: [&str; 24] = [
     "ENAMETOOLONG",
     "EAGAIN",
     "ECONNREFUSED",
+    // helper の起動失敗の段に OS の errno が無いことを表す固定語（0 は errno として受けないため。#4284）。
+    "none",
     "other",
 ];
 
-const COMPONENTS: [&str; 3] = ["core.exec", "supervisor.exec", "supervisor"];
+const COMPONENTS: [&str; 4] = [
+    "core.exec",
+    "supervisor.exec",
+    "supervisor",
+    HELPER_COMPONENT,
+];
+
+/// helper 自身の起動失敗の行の `component`（supervisor の `stream_exec::diag::DIAG_COMPONENT`。#4284）。
+/// この component の行に限り、未知の `stage`・errno 名を `"other"` へ落とす（版のずれで診断を捨てないため）。
+const HELPER_COMPONENT: &str = "supervisor.stream_exec";
 const OPERATIONS: [&str; 2] = ["launch_pidfd", "entrypoint_mode"];
 const OUTCOMES: [&str; 1] = ["unavailable"];
 const PIDFD_REASONS: [&str; 3] = ["denied", "failed", "unsupported"];
@@ -138,6 +151,13 @@ struct Fields {
     has_count: bool,
     /// `message`（値は捨てるので、混入の検出だけのために見たかを持つ）。
     has_message: bool,
+}
+
+/// 語彙外の `stage`・errno 名を見たか（`component` が確定してから扱うため、ループの後で判定する。#4284）。
+#[derive(Debug, Default, Clone, Copy)]
+struct Unknown {
+    stage: bool,
+    errno: bool,
 }
 
 /// 1 行の分類結果。
@@ -276,6 +296,21 @@ fn code_token_eq(canonical: &str, token: &str) -> bool {
     upper || lower_hyphen
 }
 
+/// 語彙外の `stage` を保留してよい形（小文字・数字・`_` の 1〜64 文字）。
+fn is_token_shape(s: &str) -> bool {
+    (1..=64).contains(&s.len())
+        && s.bytes()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
+}
+
+/// 語彙外の errno 名を保留してよい形（大文字・数字の 1〜32 文字。`EXXX` 表記）。
+fn is_token_shape_upper(s: &str) -> bool {
+    (1..=32).contains(&s.len())
+        && s.bytes()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+        && !s.bytes().all(|c| c.is_ascii_digit())
+}
+
 fn pick(set: &[&'static str], v: &str) -> Option<&'static str> {
     set.iter().copied().find(|s| *s == v)
 }
@@ -328,6 +363,7 @@ fn classify(line: &[u8]) -> Classified {
         return Classified::Unparsed;
     }
     let mut f = Fields::default();
+    let mut unknown = Unknown::default();
     let mut seen: Vec<&str> = Vec::new();
     for (k, v) in pairs {
         if seen.contains(&k) {
@@ -339,15 +375,38 @@ fn classify(line: &[u8]) -> Classified {
             Raw::Num(_) => None,
         };
         let ok = match k {
-            "stage" => s
-                .and_then(|s| {
-                    ExecChildStep::from_token(s)
-                        .map(ExecChildStep::as_str)
-                        .or_else(|| IsolationStage::from_token(s).map(IsolationStage::as_str))
-                })
-                .map(|v| f.stage = Some(v))
-                .is_some(),
-            "errno" => parse_errno(v).map(|e| f.errno = Some(e)).is_some(),
+            "stage" => match s {
+                Some(s) => match ExecChildStep::from_token(s)
+                    .map(ExecChildStep::as_str)
+                    .or_else(|| IsolationStage::from_token(s).map(IsolationStage::as_str))
+                    .or_else(|| HelperStage::from_token(s).map(HelperStage::as_str))
+                {
+                    Some(v) => {
+                        f.stage = Some(v);
+                        true
+                    }
+                    // 語彙外でも形が安全なら保留する（helper の component のときだけ `other` へ落とす）。
+                    None if is_token_shape(s) => {
+                        unknown.stage = true;
+                        true
+                    }
+                    None => false,
+                },
+                None => false,
+            },
+            "errno" => match parse_errno(v) {
+                Some(e) => {
+                    f.errno = Some(e);
+                    true
+                }
+                None => match v {
+                    Raw::Str(s) if is_token_shape_upper(s) => {
+                        unknown.errno = true;
+                        true
+                    }
+                    _ => false,
+                },
+            },
             "code" => s
                 .and_then(|s| {
                     // 大文字の `ErrorCode::as_str()` 表記と、helper の `diagnose()` が出す小文字ハイフン表記の両方を受け、
@@ -412,6 +471,18 @@ fn classify(line: &[u8]) -> Classified {
         };
         if !ok {
             return Classified::Unparsed;
+        }
+    }
+    // 語彙外の `stage`・errno 名は、helper の component の行だけ `other` として転送する（他は解釈できない行）。
+    if unknown.stage || unknown.errno {
+        if f.component != Some(HELPER_COMPONENT) {
+            return Classified::Unparsed;
+        }
+        if unknown.stage {
+            f.stage = Some("other");
+        }
+        if unknown.errno {
+            f.errno = Some(Errno::Name("other"));
         }
     }
     // 方式と理由の組は core の復号で検証する（`sealed_copy` の理由は空）。

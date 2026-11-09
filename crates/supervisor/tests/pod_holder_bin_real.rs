@@ -301,7 +301,7 @@ mod linux {
 
     impl Holder {
         fn pid(&self) -> u32 {
-            self.ready.pid
+            self.ready.pid()
         }
 
         fn stop_by_eof(&mut self) -> std::process::ExitStatus {
@@ -352,9 +352,9 @@ mod linux {
         let pid = h.pid();
         assert_eq!(pid, h.child.id(), "READY pid is the spawned pid");
         for (which, got) in [
-            ("user", h.ready.user),
-            ("ipc", h.ready.ipc),
-            ("net", h.ready.net),
+            ("user", h.ready.user()),
+            ("ipc", h.ready.ipc()),
+            ("net", h.ready.net()),
         ] {
             assert_eq!(ns_stat(pid, which), (got.dev, got.ino), "{which} identity");
         }
@@ -384,7 +384,7 @@ mod linux {
     fn scenario_b() {
         let mut h = start_holder(None);
         let pid = h.pid();
-        let net = h.ready.net;
+        let net = h.ready.net();
         let mut listener = nsenter_cmd(pid)
             .arg(exe())
             .args(["--role", "listen"])
@@ -476,12 +476,12 @@ mod linux {
         reap::reap_or_report(&mut mid, reap::reap_within());
         std::thread::sleep(Duration::from_millis(500));
         assert!(
-            !pid_gone(ready.pid),
+            !pid_gone(ready.pid()),
             "the holder outlives its spawner (no PDEATHSIG)"
         );
         drop(stdin_w);
         let until = Instant::now() + STEP;
-        while !pid_gone(ready.pid) {
+        while !pid_gone(ready.pid()) {
             if Instant::now() >= until {
                 fail("the holder did not exit after stdin EOF");
             }

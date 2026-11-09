@@ -96,6 +96,9 @@
 
 1. 保持役の dumpable の扱い: 案 (a)（`unshare(USER)` の後に自身を再 exec して non-dumpable を保つ）を作業仮説とする。確定は H2（#2874）の受け入れ条件で、カーネルの一次情報（tag・commit を固定した `fs/proc/namespaces.c`・`kernel/ptrace.c`）と実機（ubuntu CI の `--ignored`）で行い、それまでは未確定として扱う。背景は、`/proc/<pid>/ns/*` の open が `PTRACE_MODE_READ_FSCREDS` を要し、non-dumpable の保持役が exec 後に `unshare` すると同じ uid の core から開けない恐れがあること。確定前の代替は案 (b)（dumpable にして fd・秘密を一切持たない）
 
+2. provider が無い `POD`: 保持役の netns（`lo` のみ。保持役が up にする。H2・#2874）へ join し、pod 内で localhost を共有する（Kubernetes の意味論。core の net の join〔H7・#2872〕が入った後）。`NetworkReady=false` は維持する
+3. 本番の pasta provider: #340 の決定（利用者が導入した pasta を exec）で決着した。H10（#2879）は #341 待ちのまま。依存（crate）の追加は伴わない
+
 ### 脚注: 案 (a) の根拠と確認結果（H2・#2874）
 
 一次情報（Linux v6.12 の tag。`gh api repos/torvalds/linux/contents/<path>?ref=v6.12` で確認）:
@@ -113,8 +116,6 @@
 - 保持役自身が READY の前に `PR_GET_DUMPABLE == 0` を確かめる（fail-closed）
 - 守れないもの: 親 namespace の同じ uid からの ptrace は non-dumpable でも防げない（設計上の前提）。exec から `PR_SET_DUMPABLE 0` までの短い窓があるが、その間の保持役は秘密を持たない（env は空、argv は namespace の番号だけ）
 - 実行記録: ローカル（Linux 7.0.0-34-generic、`kernel.apparmor_restrict_unprivileged_userns=1`、subuid の範囲写像）で 6 シナリオが通った。ubuntu CI の `--ignored` での確認は H3（#2875）で CI に組み込んだ後に行う（それまで CI での確定は未了）
-2. provider が無い `POD`: 保持役の netns（`lo` のみ。保持役が up にする。H2・#2874）へ join し、pod 内で localhost を共有する（Kubernetes の意味論。core の net の join〔H7・#2872〕が入った後）。`NetworkReady=false` は維持する
-3. 本番の pasta provider: #340 の決定（利用者が導入した pasta を exec）で決着した。H10（#2879）は #341 待ちのまま。依存（crate）の追加は伴わない
 
 ## 実装単位
 

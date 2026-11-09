@@ -45,6 +45,8 @@ const HOLDER_ARG0: &str = "fandhe-container-supervisor";
 const STATUS_LIMIT: u64 = 64 * 1024;
 /// 失敗行の stderr 書き込みを待つ上限（読み手が止まっていても終わる。REPAIR-5）。
 const FAIL_LINE_TIMEOUT: Duration = Duration::from_millis(500);
+/// READY・ERROR フレームの stdout 書き込みを待つ上限（読み手が止まっていても終わる。REPAIR-5）。
+const FRAME_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// SIGTERM のビット（`SigIgn`・`SigBlk` は `1 << (signo - 1)`）。
 const SIGTERM_MASK: u64 = 1 << 14;
 /// 初期 user namespace の `uid_map` の 1 行目（`inside outside count`）。
@@ -110,12 +112,31 @@ fn usage_error(message: &'static str) -> ExitCode {
 
 fn fail(f: &Fail) -> ExitCode {
     // READY の前だけ呼ばれる。ERROR フレームは best effort（読み手がいなければ書けない）。
-    if let Ok(owned) = std::io::stdout().as_fd().try_clone_to_owned() {
-        let mut out = File::from(owned);
-        let _ = out.write_all(PodHolderFrame::error(f.code).as_bytes());
-    }
+    let _ = write_stdout_bounded(PodHolderFrame::error(f.code).as_bytes());
     stderr_line(f.code, f.message);
     ExitCode::from(1)
+}
+
+/// フレームを stdout へ書く。読み手が止まって pipe / socket が満杯でも `FRAME_WRITE_TIMEOUT` で見切る
+/// （別スレッドで書き、期限切れならスレッドを残したまま `Err` を返す。呼び出し側はその後プロセスを終える。REPAIR-5）。
+/// `CLONE_NEWUSER` の後に呼ばれるが、書き込みスレッドは完了するか期限切れで終了へ向かうため、待ちの間の単一スレッド前提は壊れない。
+fn write_stdout_bounded(bytes: &[u8]) -> Result<(), ()> {
+    let owned = std::io::stdout()
+        .as_fd()
+        .try_clone_to_owned()
+        .map_err(|_| ())?;
+    let data = bytes.to_vec();
+    let (tx, rx) = std::sync::mpsc::channel::<bool>();
+    std::thread::Builder::new()
+        .spawn(move || {
+            let ok = File::from(owned).write_all(&data).is_ok();
+            let _ = tx.send(ok);
+        })
+        .map_err(|_| ())?;
+    match rx.recv_timeout(FRAME_WRITE_TIMEOUT) {
+        Ok(true) => Ok(()),
+        _ => Err(()),
+    }
 }
 
 /// 失敗行を stderr へ出す。読み手が止まって pipe が満杯でも終了を妨げないよう別スレッドで書き、期限で見切る
@@ -364,12 +385,7 @@ fn stage2(args: &[OsString]) -> Result<(), StageEnd> {
 
     let ready = PodHolderReady::new(std::process::id(), user, ipc, net)
         .map_err(|e| from_trait(&e, "failed to build the READY frame"))?;
-    let owned = std::io::stdout()
-        .as_fd()
-        .try_clone_to_owned()
-        .map_err(|_| Fail::new(ErrorCode::Internal, "failed to write READY"))?;
-    File::from(owned)
-        .write_all(PodHolderFrame::ready(&ready).as_bytes())
+    write_stdout_bounded(PodHolderFrame::ready(&ready).as_bytes())
         .map_err(|_| Fail::new(ErrorCode::Unavailable, "failed to write READY"))?;
     wait_for_stdin_close()
 }

@@ -31,13 +31,13 @@ pub struct NsId {
 #[non_exhaustive]
 pub struct PodHolderReady {
     /// 保持役の pid（exec をまたいで不変）。
-    pub pid: u32,
+    pid: u32,
     /// pod の user namespace。
-    pub user: NsId,
+    user: NsId,
     /// pod の ipc namespace。
-    pub ipc: NsId,
+    ipc: NsId,
     /// pod の net namespace（`lo` は up）。
-    pub net: NsId,
+    net: NsId,
 }
 
 impl PodHolderReady {
@@ -61,6 +61,26 @@ impl PodHolderReady {
             ipc,
             net,
         })
+    }
+
+    /// 保持役の pid（検証済み。フィールドは非公開で、`new` を通らない値は作れない。REPAIR-2）。
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// pod の user namespace。
+    pub fn user(&self) -> NsId {
+        self.user
+    }
+
+    /// pod の ipc namespace。
+    pub fn ipc(&self) -> NsId {
+        self.ipc
+    }
+
+    /// pod の net namespace。
+    pub fn net(&self) -> NsId {
+        self.net
     }
 }
 

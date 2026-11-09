@@ -789,9 +789,34 @@ pub fn decode_irouter(raw: u64) -> IrouterRoute {
     IrouterRoute::Affinity(aff012 | (aff3 << 24))
 }
 
+/// `HostMapping` の drop で `munmap` が失敗したときに出す固定の 1 行（MVM-5・REPAIR-4・#4292）。
+/// 既存の `op=hvf.vm_unmap` / `op=hvf.vm_destroy` の文法（`level=.. op=.. outcome=error leaked=..`）に揃える。
+/// errno・アドレス・長さ・スレッド名は出さない（ホストのアドレス配置を漏らさず、行を完全な定数にする）。
+pub const HOST_UNMAP_FAILED_LINE: &str =
+    "level=error op=hvf.host_unmap outcome=error leaked=host_mapping";
+
+/// `munmap` の戻り値から観測用の行を決める純関数。`sys::hvf` の `HostMapping` の drop から呼ばれる。
+/// 0 以外はすべて失敗とみなす（fail-closed。munmap は成功 0・失敗 -1 だが戻り値の細部に依らない）。
+pub fn host_unmap_failure_line(rc: i32) -> Option<&'static str> {
+    if rc == 0 {
+        None
+    } else {
+        Some(HOST_UNMAP_FAILED_LINE)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// munmap の戻り値と行の対応を具体値で固定する（MVM-5・REPAIR-4・#4292）。
+    #[test]
+    fn mvm5_4292_host_unmap_failure_line_maps_rc() {
+        assert_eq!(host_unmap_failure_line(0), None);
+        let want = "level=error op=hvf.host_unmap outcome=error leaked=host_mapping";
+        assert_eq!(host_unmap_failure_line(-1), Some(want));
+        assert_eq!(host_unmap_failure_line(1), Some(want));
+    }
 
     #[test]
     fn mvm5_3783_constants_have_expected_values() {

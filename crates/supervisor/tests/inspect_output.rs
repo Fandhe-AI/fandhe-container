@@ -1267,13 +1267,17 @@ mod linux {
     }
 }
 
-/// Linux 以外では core が `Unimplemented` を返し、そのまま伝播する（CLI-1）。
+/// Windows ホストでは core が設計上の恒久拒否（`FailedPrecondition`。#4332・#2428 の案 C・WIN-1）を返し、そのまま伝播する（CLI-1）。
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[test]
-fn sup11_task168_1_open_store_is_unimplemented_outside_linux() {
+fn sup11_task168_1_open_store_is_rejected_by_design_on_windows_host() {
     use fandhe_container_core::traits::ErrorCode;
     use fandhe_container_supervisor::state::open_default_store;
     let root = std::env::temp_dir().join(format!("fandhe-sup-insp-nolinux-{}", std::process::id()));
     let e = open_default_store(Some(root)).err().unwrap();
-    assert_eq!(e.code(), ErrorCode::Unimplemented);
+    assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+    assert_eq!(
+        e.message(),
+        "file state store is not supported on a Windows host by design; the state root belongs in the Linux guest"
+    );
 }

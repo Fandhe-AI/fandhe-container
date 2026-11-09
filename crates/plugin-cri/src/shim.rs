@@ -230,7 +230,9 @@ pub(crate) fn registry_parts_in(
         Arc::clone(&state),
     ));
     let exec: Arc<dyn TaskExecLauncher> = Arc::new(StopHelpersOnDrop(Arc::clone(&launcher)));
-    let mut runtime = core_runtime_for(state);
+    let mut runtime = core_runtime_for(Arc::clone(&state));
+    // 起動時の走査（#4280）の記録器は serve の core のものを共有する（shim の 1 プロセスで計数を 1 つに揃える）。
+    let sweep_recorder = Arc::clone(runtime.recorder());
     if let Some(sink) = ctx.audit_sink() {
         runtime = runtime.with_create_audit_sink(sink);
     }
@@ -253,6 +255,15 @@ pub(crate) fn registry_parts_in(
         reg.register(svc)
             .map_err(|_| CriError::internal("cannot register task service"))?;
     }
+    // 登録簿の組み立てに成功した後で、残りのコンテナログを裏の thread で 1 回だけ走査する（D7・#4280。待たない）。
+    let _ = startup_sweep::spawn_startup_log_sweep(
+        state,
+        sweep_recorder,
+        startup_sweep::SHIM_STARTUP_LOG_SWEEP_BUDGET,
+        Arc::new(|line| {
+            let _ = crate::telemetry::stderr_sink().submit(line);
+        }),
+    );
     Ok((reg, launcher))
 }
 
@@ -837,6 +848,9 @@ mod non_linux_tests {
 
 #[cfg(target_os = "linux")]
 pub(crate) mod reclaim;
+
+#[cfg(target_os = "linux")]
+pub(crate) mod startup_sweep;
 
 #[cfg(all(test, target_os = "linux"))]
 mod delete_tests;

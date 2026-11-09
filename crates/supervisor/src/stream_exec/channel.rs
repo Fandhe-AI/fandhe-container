@@ -25,6 +25,7 @@
 //! （期限の値は #3760・#3761 が決める。本モジュールに既定値は置かない）。
 
 use std::io;
+use std::num::NonZeroU32;
 use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
@@ -131,6 +132,11 @@ pub enum HelperMessage {
         signal: ExecSignal,
         /// 結果。
         code: SignalAckCode,
+    },
+    /// コマンドのホスト側 pid（検証済みで 0 でない。helper が fork した後に高々 1 回。#4316）。
+    Spawned {
+        /// helper と同じ pid namespace から見たコマンドの pid。表示用で、シグナルの宛先にしない。
+        pid: NonZeroU32,
     },
 }
 
@@ -255,6 +261,15 @@ pub fn send_signal_ack(
     send_frame(stream, &Frame::SignalAck { signal, code }, &[], deadline)
 }
 
+/// helper → plugin-cri: コマンドのホスト側 pid を知らせる（#4316・SUP-6。fork の後に高々 1 回。fd は付けない）。
+pub fn send_spawned(
+    stream: &UnixStream,
+    pid: NonZeroU32,
+    deadline: Instant,
+) -> Result<(), ChannelError> {
+    send_frame(stream, &Frame::Spawned(pid), &[], deadline)
+}
+
 /// `buf` を満たすまで受ける。fd は frame 全体の最初の `recvmsg`（`first`）で受けたものだけを `fds` に集め、
 /// 後続の読み取りに付いていたら拒否する。通常の `read` は fd を黙って捨てるため使わない。
 fn recv_exact(
@@ -371,7 +386,7 @@ pub fn try_recv_signal(stream: &UnixStream) -> Result<Option<ExecSignal>, Channe
     }
 }
 
-/// plugin-cri 側: helper からの frame（`Started`・`PtyMaster`・`Result`・`SignalAck`）を 1 つ受ける。`PtyMaster` の fd は
+/// plugin-cri 側: helper からの frame（`Started`・`PtyMaster`・`Result`・`SignalAck`・`Spawned`）を 1 つ受ける。`PtyMaster` の fd は
 /// pty master であることを確かめ、違えば fd を閉じて `NotPtyMaster` で拒否する（#4100）。失敗後は channel を再利用しない。
 pub fn recv_from_helper(
     stream: &UnixStream,
@@ -397,6 +412,7 @@ pub fn recv_from_helper(
             Ok(HelperMessage::PtyMaster(master))
         }
         Frame::SignalAck { signal, code } => Ok(HelperMessage::SignalAck { signal, code }),
+        Frame::Spawned(pid) => Ok(HelperMessage::Spawned { pid }),
         Frame::StdioHandover(_) | Frame::Signal(_) => {
             Err(ChannelError::Malformed(WireError::UnknownKind))
         }
@@ -510,6 +526,33 @@ mod tests {
 
     #[test]
     fn sup6_helper_messages_roundtrip() {
+        // #4316: Spawned の往復（fd なし）。
+        {
+            let (a, b) = pair();
+            send_spawned(&a, NonZeroU32::new(4242).unwrap(), far()).unwrap();
+            match recv_from_helper(&b, far()).unwrap() {
+                HelperMessage::Spawned { pid } => assert_eq!(pid.get(), 4242),
+                other => panic!("unexpected {other:?}"),
+            }
+            // fd を添えた Spawned は拒否する。
+            let (a, b) = pair();
+            let f = std::fs::File::open("/dev/null").unwrap();
+            let bytes = Frame::Spawned(NonZeroU32::new(1).unwrap())
+                .encode()
+                .unwrap();
+            sys::send_with_fds(a.as_fd(), bytes.as_bytes(), &[f.as_fd()]).unwrap();
+            assert_eq!(
+                recv_from_helper(&b, far()).unwrap_err(),
+                ChannelError::FdCountMismatch
+            );
+            // helper 側の Signal 受信は向き違いとして拒否する。
+            let (a, b) = pair();
+            send_spawned(&a, NonZeroU32::new(1).unwrap(), far()).unwrap();
+            assert_eq!(
+                try_recv_signal(&b).unwrap_err(),
+                ChannelError::Malformed(WireError::UnknownKind)
+            );
+        }
         let (a, b) = pair();
         send_started(&a, &ExecCgroupName::new("exec-4242-0").unwrap(), far()).unwrap();
         match recv_from_helper(&b, far()).unwrap() {
@@ -602,7 +645,7 @@ mod tests {
         let two = [null.as_fd(), null.as_fd()];
         let one = [null.as_fd()];
         let frame = |kind: u8, plen: u8, payload: &[u8], fds: &[BorrowedFd<'_>]| {
-            let mut v = vec![b'F', b'C', b'S', b'X', 3, kind, 0, plen];
+            let mut v = vec![b'F', b'C', b'S', b'X', 4, kind, 0, plen];
             v.extend_from_slice(payload);
             sys::send_with_fds(a.as_fd(), &v, fds).unwrap();
         };
@@ -645,7 +688,7 @@ mod tests {
     fn sup6_fd_on_continuation_rejected() {
         let (a, b) = pair();
         let null = File::open("/dev/null").unwrap();
-        let head = [b'F', b'C', b'S', b'X', 3, 1, 0, 1];
+        let head = [b'F', b'C', b'S', b'X', 4, 1, 0, 1];
         sys::send_with_fds(a.as_fd(), &head, &[]).unwrap();
         sys::send_with_fds(a.as_fd(), &[0b001], &[null.as_fd()]).unwrap();
         assert_eq!(
@@ -659,7 +702,7 @@ mod tests {
         let (a, b) = pair();
         let (mut r, w) = std::io::pipe().unwrap();
         // 不正な magic の frame に pipe の書き込み端を添える。
-        let bad = [b'X', b'C', b'S', b'X', 3, 2, 0, 0];
+        let bad = [b'X', b'C', b'S', b'X', 4, 2, 0, 0];
         sys::send_with_fds(a.as_fd(), &bad, &[w.as_fd()]).unwrap();
         assert_eq!(
             recv_from_helper(&b, far()).unwrap_err(),
@@ -678,7 +721,7 @@ mod tests {
     #[test]
     fn sup6_oversized_header_rejected_without_payload() {
         let (a, b) = pair();
-        let head = [b'F', b'C', b'S', b'X', 3, 4, 0xFF, 0xFF];
+        let head = [b'F', b'C', b'S', b'X', 4, 4, 0xFF, 0xFF];
         sys::send_with_fds(a.as_fd(), &head, &[]).unwrap();
         let t = Instant::now();
         let err = recv_from_helper(&b, Instant::now() + Duration::from_secs(5)).unwrap_err();
@@ -689,7 +732,7 @@ mod tests {
     #[test]
     fn sup6_unknown_and_reverse_direction_kinds_rejected() {
         let (a, b) = pair();
-        let unknown = [b'F', b'C', b'S', b'X', 3, 9, 0, 0];
+        let unknown = [b'F', b'C', b'S', b'X', 4, 9, 0, 0];
         sys::send_with_fds(a.as_fd(), &unknown, &[]).unwrap();
         assert_eq!(
             recv_from_helper(&b, far()).unwrap_err(),
@@ -741,7 +784,7 @@ mod tests {
         };
         // SIGKILL(9) は許可外。
         let (a, b) = pair();
-        let mut v = hdr(3, 5, 1);
+        let mut v = hdr(4, 5, 1);
         v.push(9);
         send(&a, &v, &[]);
         assert_eq!(
@@ -751,7 +794,7 @@ mod tests {
         // 0 と 65 は範囲外。
         for n in [0u8, 65] {
             let (a, b) = pair();
-            let mut v = hdr(3, 5, 1);
+            let mut v = hdr(4, 5, 1);
             v.push(n);
             send(&a, &v, &[]);
             assert_eq!(
@@ -771,13 +814,13 @@ mod tests {
         // fd 付きの Signal は拒否し、受け取った fd は閉じる。
         let (a, b) = pair();
         let null = File::open("/dev/null").unwrap();
-        let mut v = hdr(3, 5, 1);
+        let mut v = hdr(4, 5, 1);
         v.push(15);
         send(&a, &v, &[null.as_fd()]);
         assert_eq!(try_recv_signal(&b), Err(ChannelError::FdCountMismatch));
         // 向きの違う frame（helper → plugin-cri の SignalAck・Started）。
         let (a, b) = pair();
-        let mut v = hdr(3, 6, 2);
+        let mut v = hdr(4, 6, 2);
         v.extend_from_slice(&[15, 1]);
         send(&a, &v, &[]);
         assert_eq!(

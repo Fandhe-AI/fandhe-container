@@ -18,7 +18,7 @@ use fandhe_container_cri::error::CriErrorCode;
 use fandhe_container_cri::shim_v2::exec::{PROCESS_TYPE_URL, parse_process_spec};
 use fandhe_container_cri::shim_v2::task_api::Any;
 use fandhe_container_supervisor::stream_exec::channel::{
-    recv_stdio_handover, send_result, send_signal_ack, send_started,
+    recv_stdio_handover, send_result, send_signal_ack, send_spawned, send_started,
 };
 use fandhe_container_supervisor::stream_exec::wire::{ExitSignal, StdioMask};
 
@@ -367,6 +367,81 @@ fn cri5_4148_failed_after_started_is_unconfirmed() {
     assert_eq!(err.code(), CriErrorCode::Timeout);
     pr.0.store(1, Ordering::SeqCst);
     assert_eq!(p.status(), Ok(ExecProcessStatus::Exited { code: None }));
+}
+
+/// `Started` の後に `Spawned(4242)` を送り（`gap` の後）、続けて `then` を実行して保持する script（#4316）。
+fn spawning(gap: Duration, spawn_count: usize, outcome: Option<StreamExecOutcome>) -> Script {
+    let outcome = Mutex::new(outcome);
+    Arc::new(move |end, mask| {
+        recv_stdio_handover(&end, mask, deadline()).expect("handover");
+        send_started(&end, &cg(), deadline()).expect("started");
+        std::thread::sleep(gap);
+        for _ in 0..spawn_count {
+            send_spawned(&end, NonZeroU32::new(4242).expect("pid"), deadline()).expect("spawned");
+        }
+        if let Some(o) = outcome.lock().expect("lock").take() {
+            send_result(&end, &o, deadline()).expect("result");
+        }
+        std::thread::sleep(Duration::from_secs(10));
+    })
+}
+
+/// CRI-5・SUP-6・#4316: `Spawned` が届く前の `pid()` は `None`、届いた後は具体値 4242。`Result` の後も値は保たれる。
+#[test]
+fn cri5_4316_shim_pid_is_reported_after_spawned() {
+    let fx = Fixture::new("spawned");
+    let (l, _) = fx.launcher(
+        spawning(
+            Duration::from_millis(300),
+            1,
+            Some(StreamExecOutcome::Exited(0)),
+        ),
+        probe(0),
+        ExecBudgets::default(),
+    );
+    let p = l.launch(&cid("run1"), &eid(), &ok_spec()).expect("launch");
+    assert_eq!(p.pid(), None, "Spawned has not arrived yet");
+    assert_eq!(
+        p.wait_exit(WAIT, Duration::from_millis(10), &never_cancel),
+        Ok(Some(0))
+    );
+    assert_eq!(p.pid(), NonZeroU32::new(4242));
+}
+
+/// CRI-5・SUP-6・#4316: `Spawned` が無いまま `Result` が来ても正当で、`pid()` は `None` のまま。`wait_exit` は終了コードを返す。
+#[test]
+fn cri5_4316_shim_result_without_spawned_keeps_pid_none() {
+    let fx = Fixture::new("nospawn");
+    let (l, _) = fx.launcher(
+        spawning(Duration::ZERO, 0, Some(StreamExecOutcome::Exited(0))),
+        probe(0),
+        ExecBudgets::default(),
+    );
+    let p = l.launch(&cid("run1"), &eid(), &ok_spec()).expect("launch");
+    assert_eq!(
+        p.wait_exit(WAIT, Duration::from_millis(10), &never_cancel),
+        Ok(Some(0))
+    );
+    assert_eq!(p.pid(), None);
+}
+
+/// SEC-1・SUP-6・#4316: `Spawned` が 2 回来るのはプロトコル違反。helper を止めて未確認に倒し、最初の pid を保つ。
+#[test]
+fn sec1_4316_shim_duplicate_spawned_is_unconfirmed() {
+    let fx = Fixture::new("dupspawn");
+    let (l, pids) = fx.launcher(
+        spawning(Duration::from_millis(50), 2, None),
+        probe(0),
+        ExecBudgets::default(),
+    );
+    let p = l.launch(&cid("run1"), &eid(), &ok_spec()).expect("launch");
+    let helper = *pids.lock().expect("lock").first().expect("pid");
+    assert!(gone(helper), "helper must be killed");
+    assert_eq!(
+        p.status().expect_err("unconfirmed").code(),
+        CriErrorCode::Unavailable
+    );
+    assert_eq!(p.pid(), NonZeroU32::new(4242));
 }
 
 /// CRI-5: 起動の失敗は固定語彙の種別になり、helper は起動しないか止まっている。
@@ -722,22 +797,30 @@ fn sec1_4221_production_probe_mapping() {
 }
 
 /// SEC-1・REPAIR-3・#4221: 旧い version 1 の `Started`（payload なし）は拒否され、launch は失敗して helper は止まり、probe は呼ばれない。
-/// 不正な名前欄の `Started`（version 3）と、version 2 の正しい `Started`（#4282）も同じ。確認済みとして扱わない（fail-closed）。
+/// 不正な名前欄の `Started`（version 4）と、version 2・3 の正しい `Started`（#4282・#4316）も同じ。確認済みとして扱わない（fail-closed）。
 #[test]
 fn sec1_4221_v1_or_malformed_started_is_rejected_and_never_confirmed() {
     use std::io::Write as _;
-    let frames: [Vec<u8>; 3] = [
+    let frames: [Vec<u8>; 4] = [
         // version 1 の `Started`（header のみ）。
         b"FCSX\x01\x02\x00\x00".to_vec(),
-        // version 3 だが名前欄が不正（name_len = 0）。
+        // version 4 だが名前欄が不正（name_len = 0）。
         {
-            let mut v = b"FCSX\x03\x02\x00\x41".to_vec();
+            let mut v = b"FCSX\x04\x02\x00\x41".to_vec();
             v.extend_from_slice(&[0u8; 65]);
             v
         },
-        // version 2 の正しい `Started`（name_len = 11 の `exec-4242-0`。v3 の相手とは混在させない。#4282）。
+        // version 2・3 の正しい `Started`（name_len = 11 の `exec-4242-0`。v4 の相手とは混在させない。#4282・#4316）。
         {
             let mut v = b"FCSX\x02\x02\x00\x41".to_vec();
+            let mut name = [0u8; 65];
+            name[0] = 11;
+            name[1..12].copy_from_slice(b"exec-4242-0");
+            v.extend_from_slice(&name);
+            v
+        },
+        {
+            let mut v = b"FCSX\x03\x02\x00\x41".to_vec();
             let mut name = [0u8; 65];
             name[0] = 11;
             name[1..12].copy_from_slice(b"exec-4242-0");
@@ -865,7 +948,7 @@ fn cri5_4282_sigterm_is_sent_as_a_signal_frame_and_ends_with_143() {
     p.signal(Signal::SIGTERM).expect("signal");
     assert_eq!(
         *log.lock().expect("lock"),
-        vec![b"FCSX\x03\x05\x00\x01\x0f".to_vec()]
+        vec![b"FCSX\x04\x05\x00\x01\x0f".to_vec()]
     );
     assert_eq!(
         p.wait_exit(WAIT, Duration::from_millis(10), &never_cancel),

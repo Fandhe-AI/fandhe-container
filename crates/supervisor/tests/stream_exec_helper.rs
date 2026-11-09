@@ -39,7 +39,7 @@ use fandhe_container_supervisor::stream_exec::channel::{
 };
 use fandhe_container_supervisor::stream_exec::diag::HelperStage;
 use fandhe_container_supervisor::stream_exec::helper::{
-    Deps, ServeReport, StreamExecArgs, serve_reporting,
+    Deps, RunnerExit, ServeReport, StreamExecArgs, serve_reporting,
 };
 use fandhe_container_supervisor::stream_exec::wire::{SignalAckCode, StdioMask, StreamExecOutcome};
 
@@ -215,6 +215,10 @@ struct Scenario {
     signal_watch: Option<Duration>,
     /// 偽の signaler の `deliver` の結果の列（足りない分は最後の値の繰り返し。空なら `Unavailable`）。
     deliveries: Vec<ExecSignalDelivery>,
+    /// 偽の実行役が成功側で返すコマンドの pid（`Spawned` を後始末で送る経路の照合。#4316）。
+    runner_pid: Option<u32>,
+    /// 偽の signaler の `command_pid` が返す pid（刻みで `Spawned` を送る経路の照合。#4316）。
+    signaler_pid: Option<u32>,
 }
 
 /// 偽の [`CommandSignaler`]（呼ばれた番号を `Counts::signals` に記録し、決めた列で結果を返す。#4282）。
@@ -222,9 +226,14 @@ struct FakeSignaler<'a> {
     counts: &'a Counts,
     deliveries: &'a [ExecSignalDelivery],
     calls: AtomicUsize,
+    pid: Option<u32>,
 }
 
 impl CommandSignaler for FakeSignaler<'_> {
+    fn command_pid(&self) -> Option<NonZeroU32> {
+        self.pid.and_then(NonZeroU32::new)
+    }
+
     fn deliver(&self, number: NonZeroU8) -> ExecSignalDelivery {
         self.counts.signals.lock().expect("lock").push(number.get());
         let i = self.calls.fetch_add(1, Ordering::SeqCst);
@@ -236,7 +245,7 @@ impl CommandSignaler for FakeSignaler<'_> {
     }
 }
 
-/// 版 3 の `Signal` frame の生のバイト列（#4282。`version` は壊れた版の注入にも使う）。
+/// 版 4 の `Signal` frame の生のバイト列（#4282。`version` は壊れた版の注入にも使う）。
 fn signal_bytes(version: u8, number: u8) -> Vec<u8> {
     vec![b'F', b'C', b'S', b'X', version, 5, 0, 1, number]
 }
@@ -255,6 +264,8 @@ impl Default for Scenario {
             pre_send: Vec::new(),
             signal_watch: None,
             deliveries: Vec::new(),
+            runner_pid: None,
+            signaler_pid: None,
         }
     }
 }
@@ -322,7 +333,7 @@ fn drive_reporting(
                _: Duration,
                _: &dyn AuditSink,
                io: fandhe_container_supervisor::exec::ExecLaunchIo<'_>|
-     -> Result<ExecExit, AuditedRejection<TraitError>> {
+     -> Result<RunnerExit, AuditedRejection<TraitError>> {
         counts.run.fetch_add(1, Ordering::SeqCst);
         if let Some(hook) = io.on_created {
             let name = ExecCgroupName::new("exec-4242-0").expect("name");
@@ -349,6 +360,7 @@ fn drive_reporting(
                 counts: &counts,
                 deliveries: &sc.deliveries,
                 calls: AtomicUsize::new(0),
+                pid: sc.signaler_pid,
             };
             let begin = Instant::now();
             while begin.elapsed() < span {
@@ -357,7 +369,10 @@ fn drive_reporting(
             }
         }
         counts.event("run-done");
-        Ok(sc.exit)
+        Ok(RunnerExit {
+            exit: sc.exit,
+            command_pid: sc.runner_pid.and_then(NonZeroU32::new),
+        })
     };
     let deps = Deps {
         store,
@@ -980,6 +995,8 @@ fn collect_acks(plugin: &UnixStream) -> (bool, Vec<(u8, SignalAckCode)>) {
         match recv_from_helper(plugin, Instant::now() + Duration::from_millis(150)) {
             Ok(HelperMessage::Started(_)) => started = true,
             Ok(HelperMessage::SignalAck { signal, code }) => acks.push((signal.get(), code)),
+            // `Spawned` は順序の照合（`collect_events`）で見る。ここでは数えない（#4316）。
+            Ok(HelperMessage::Spawned { .. }) => {}
             Ok(other) => panic!("unexpected {other:?}"),
             Err(ChannelError::Timeout | ChannelError::Closed) => return (started, acks),
             Err(e) => panic!("unexpected channel error {e:?}"),
@@ -1005,7 +1022,7 @@ fn sup6_4282_signal_frame_is_delivered_and_acked_once() {
     seed(&base, &store, "run1", Some(PID));
     let args = args_for(&base, "run1", PID, 0);
     let sc = signal_scenario(
-        vec![signal_bytes(3, 15)],
+        vec![signal_bytes(4, 15)],
         vec![ExecSignalDelivery::Delivered],
     );
     let (out, counts, plugin) = drive(&store, &args, &StdioSend::default(), &sc);
@@ -1027,7 +1044,7 @@ fn sup6_4282_delivery_results_map_to_ack_codes() {
         let store = open(&base);
         seed(&base, &store, "run1", Some(PID));
         let args = args_for(&base, "run1", PID, 0);
-        let sc = signal_scenario(vec![signal_bytes(3, 2)], vec![delivery]);
+        let sc = signal_scenario(vec![signal_bytes(4, 2)], vec![delivery]);
         let (_out, counts, plugin) = drive(&store, &args, &StdioSend::default(), &sc);
         assert_eq!(*counts.signals.lock().expect("lock"), vec![2]);
         let (_started, acks) = collect_acks(&plugin);
@@ -1043,7 +1060,7 @@ fn sup6_4282_pending_signal_times_out_as_not_started() {
     seed(&base, &store, "run1", Some(PID));
     let args = args_for(&base, "run1", PID, 0);
     let mut sc = signal_scenario(
-        vec![signal_bytes(3, 15)],
+        vec![signal_bytes(4, 15)],
         vec![ExecSignalDelivery::NotStarted],
     );
     sc.signal_watch = Some(Duration::from_millis(2_600));
@@ -1080,7 +1097,7 @@ fn sup6_4282_pending_signal_at_exec_end_gets_an_ack() {
         seed(&base, &store, "run1", Some(PID));
         let args = args_for(&base, "run1", PID, 0);
         let mut sc = signal_scenario(
-            vec![signal_bytes(3, 1)],
+            vec![signal_bytes(4, 1)],
             vec![ExecSignalDelivery::NotStarted],
         );
         sc.signal_watch = Some(Duration::from_millis(100));
@@ -1096,17 +1113,17 @@ fn sup6_4282_pending_signal_at_exec_end_gets_an_ack() {
 #[test]
 fn sec1_4282_malformed_signal_frame_disables_further_signals() {
     for (label, bad) in [
-        ("sigkill", signal_bytes(3, 9)),
+        ("sigkill", signal_bytes(4, 9)),
         ("v2", signal_bytes(2, 15)),
-        ("zero", signal_bytes(3, 0)),
-        ("out of range", signal_bytes(3, 65)),
+        ("zero", signal_bytes(4, 0)),
+        ("out of range", signal_bytes(4, 65)),
     ] {
         let base = Tmp::new("sigbad");
         let store = open(&base);
         seed(&base, &store, "run1", Some(PID));
         let args = args_for(&base, "run1", PID, 0);
         let sc = signal_scenario(
-            vec![bad, signal_bytes(3, 15)],
+            vec![bad, signal_bytes(4, 15)],
             vec![ExecSignalDelivery::Delivered],
         );
         let (out, counts, plugin) = drive(&store, &args, &StdioSend::default(), &sc);
@@ -1128,9 +1145,9 @@ fn sec1_4282_wrong_direction_signal_ack_frame_is_rejected() {
     let store = open(&base);
     seed(&base, &store, "run1", Some(PID));
     let args = args_for(&base, "run1", PID, 0);
-    let wrong = vec![b'F', b'C', b'S', b'X', 3, 6, 0, 2, 15, 1];
+    let wrong = vec![b'F', b'C', b'S', b'X', 4, 6, 0, 2, 15, 1];
     let sc = signal_scenario(
-        vec![wrong, signal_bytes(3, 15)],
+        vec![wrong, signal_bytes(4, 15)],
         vec![ExecSignalDelivery::Delivered],
     );
     let (out, counts, plugin) = drive(&store, &args, &StdioSend::default(), &sc);
@@ -1138,4 +1155,105 @@ fn sec1_4282_wrong_direction_signal_ack_frame_is_rejected() {
     assert!(counts.signals.lock().expect("lock").is_empty());
     let (_started, acks) = collect_acks(&plugin);
     assert_eq!(acks, vec![]);
+}
+
+/// `serve` の後に plugin 側で受けられる frame を、届いた順に固定語彙の文字列にして集める（#4316）。
+fn collect_events(plugin: &UnixStream) -> Vec<String> {
+    let mut events = Vec::new();
+    loop {
+        match recv_from_helper(plugin, Instant::now() + Duration::from_millis(150)) {
+            Ok(HelperMessage::Started(_)) => events.push("started".to_owned()),
+            Ok(HelperMessage::Spawned { pid }) => events.push(format!("spawned:{}", pid.get())),
+            Ok(HelperMessage::SignalAck { signal, code }) => {
+                events.push(format!("ack:{}:{code:?}", signal.get()));
+            }
+            Ok(other) => panic!("unexpected {other:?}"),
+            Err(ChannelError::Timeout | ChannelError::Closed) => return events,
+            Err(e) => panic!("unexpected channel error {e:?}"),
+        }
+    }
+}
+
+/// SUP-6・CRI-5・#4316: 刻みで pid が届けば `Started` → `Spawned(4242)` の順にちょうど 1 回（後始末で二重に送らない）。
+#[test]
+fn sup6_4316_spawned_follows_started_exactly_once() {
+    let base = Tmp::new("spawn1");
+    let store = open(&base);
+    seed(&base, &store, "run1", Some(PID));
+    let args = args_for(&base, "run1", PID, 0);
+    let mut sc = signal_scenario(vec![], vec![]);
+    sc.signaler_pid = Some(4242);
+    sc.runner_pid = Some(4242);
+    let (out, _counts, plugin) = drive(&store, &args, &StdioSend::default(), &sc);
+    assert_eq!(out, StreamExecOutcome::Exited(3));
+    assert_eq!(collect_events(&plugin), vec!["started", "spawned:4242"]);
+}
+
+/// SUP-6・CRI-5・#4316: 刻みより先に終わった短命なコマンドでも、結果の pid から `Spawned` を `SignalAck` より前に送る。
+#[test]
+fn sup6_4316_fast_exit_still_sends_spawned_from_the_outcome() {
+    let base = Tmp::new("spawn2");
+    let store = open(&base);
+    seed(&base, &store, "run1", Some(PID));
+    let args = args_for(&base, "run1", PID, 0);
+    let mut sc = Scenario {
+        pre_send: vec![signal_bytes(4, 15)],
+        deliveries: vec![ExecSignalDelivery::NotStarted],
+        signal_watch: Some(Duration::from_millis(100)),
+        exit: ExecExit::Command(ChildExit::Exited(0)),
+        ..Scenario::default()
+    };
+    sc.runner_pid = Some(5150);
+    let (out, _counts, plugin) = drive(&store, &args, &StdioSend::default(), &sc);
+    assert_eq!(out, StreamExecOutcome::Exited(0));
+    assert_eq!(
+        collect_events(&plugin),
+        vec!["started", "spawned:5150", "ack:15:Exited"]
+    );
+}
+
+/// SUP-6・CRI-5・#4316: pid が無ければ（起動しなかった・中継できなかった）`Spawned` は送らない（pid 無しの結果を固定する）。
+#[test]
+fn sup6_4316_no_pid_means_no_spawned() {
+    let base = Tmp::new("spawn3");
+    let store = open(&base);
+    seed(&base, &store, "run1", Some(PID));
+    let args = args_for(&base, "run1", PID, 0);
+    for exit in [
+        ExecExit::Command(ChildExit::Exited(0)),
+        ExecExit::SetupFailed {
+            exit: ChildExit::Exited(127),
+            violation: None,
+            code: ErrorCode::NotFound,
+            step: None,
+        },
+    ] {
+        let sc = Scenario {
+            signal_watch: Some(Duration::from_millis(100)),
+            exit,
+            ..Scenario::default()
+        };
+        let (_out, _counts, plugin) = drive(&store, &args, &StdioSend::default(), &sc);
+        assert_eq!(collect_events(&plugin), vec!["started"]);
+    }
+}
+
+/// SUP-6・CRI-5・#4316: 同じ刻みに pid と `Signal` が来ても、`Spawned` → `SignalAck` の順。
+#[test]
+fn sup6_4316_spawned_precedes_signal_ack() {
+    let base = Tmp::new("spawn4");
+    let store = open(&base);
+    seed(&base, &store, "run1", Some(PID));
+    let args = args_for(&base, "run1", PID, 0);
+    let mut sc = signal_scenario(
+        vec![signal_bytes(4, 15)],
+        vec![ExecSignalDelivery::Delivered],
+    );
+    sc.signaler_pid = Some(4242);
+    sc.runner_pid = Some(4242);
+    let (_out, _counts, plugin) = drive(&store, &args, &StdioSend::default(), &sc);
+    assert_eq!(
+        collect_events(&plugin),
+        vec!["started", "spawned:4242", "ack:15:Delivered"]
+    );
 }

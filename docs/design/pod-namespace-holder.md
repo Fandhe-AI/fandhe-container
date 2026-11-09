@@ -54,7 +54,7 @@
 - 現行の注記（netns を userns より先に `setns` する順序）は、userns が所有する netns では問題にならない。user の後に net へ入れる
 - rootful の init userns 所有の netns（bridge・veth の `NetsetupPodNetwork`）は、#2241 の判断まで `Unimplemented` のまま
 - cri: `PodNamespacePaths` に net（同じ pid の `/proc/<pid>/ns/net`）を足す。構築口は `for_holder_pid` のまま。`namespace_options.network` が `POD` で保持役があれば bundle の network に保持役の path を出す
-- `PodNetworkRequest`（`#[non_exhaustive]`）に保持役の netns を渡す欄を足す。provider は自前で netns を作らず、その netns を結線する（rootless では pasta が保持役の user / net へ attach）。`lo` の up は provider の責務（NET-2・NET-11）
+- `PodNetworkRequest`（`#[non_exhaustive]`）に保持役の netns を渡す欄を足す。provider は自前で netns を作らず、その netns を結線する（rootless では pasta が保持役の user / net へ attach）。`lo` の up は provider の責務にせず、保持役が netns 作成直後に行う（次節の「`lo` の up」）
 
 ## 本番の PodNetworkProvider 注入
 
@@ -62,6 +62,12 @@
 - 保持役の注入は Linux・非 root で常に行う。ipc の共有は provider が無くても成立する
 - provider が無い `POD` は、保持役の netns（`lo` のみ）へ join して pod 内で localhost を共有する（オーナー判断 2）。`NetworkReady=false` は維持する
 - 本番の pod ネットワークが動くとは書かない
+
+### `lo` の up
+
+- 新しい netns の `lo` は down で、join だけでは localhost 通信が成立しない（`crates/net/tests/lo_self_delivery.rs` が前提を固定。NET-2・NET-11）。provider の有無に依らず localhost を共有するため、`lo` を up にする責務は provider ではなく保持役に置く
+- 保持役は pod の userns が所有する netns の中で（userns 内の `CAP_NET_ADMIN` で）、READY を返す前に `lo` を up にする。失敗したら READY を返さず固定文言のエラーで終了し、Run は保持役を回収して失敗する（fail-closed）。provider が結線する場合も `lo` は既に up で、provider は触らない
+- 実装単位は H2（#2874）に含める（`lo` の up の実装と、provider が無い `POD` で pod 内の 2 コンテナが `127.0.0.1` で通信できる実機試験。H3 #2875 が CI へ組み込む）。H7（#2872）は join の受け口のみ。新規 issue の起票が要る場合は承認事項として報告する
 
 ## PodSandboxStatus.network の IP 報告
 
@@ -88,7 +94,7 @@
 ## オーナー判断（2026-11-09）
 
 1. 保持役の dumpable の扱い: 案 (a)（`unshare(USER)` の後に自身を再 exec して non-dumpable を保つ）を作業仮説とする。確定は H2（#2874）の受け入れ条件で、カーネルの一次情報（tag・commit を固定した `fs/proc/namespaces.c`・`kernel/ptrace.c`）と実機（ubuntu CI の `--ignored`）で行い、それまでは未確定として扱う。背景は、`/proc/<pid>/ns/*` の open が `PTRACE_MODE_READ_FSCREDS` を要し、non-dumpable の保持役が exec 後に `unshare` すると同じ uid の core から開けない恐れがあること。確定前の代替は案 (b)（dumpable にして fd・秘密を一切持たない）
-2. provider が無い `POD`: 保持役の netns（`lo` のみ）へ join し、pod 内で localhost を共有する（Kubernetes の意味論。core の net の join〔H7・#2872〕が入った後）。`NetworkReady=false` は維持する
+2. provider が無い `POD`: 保持役の netns（`lo` のみ。保持役が up にする。H2・#2874）へ join し、pod 内で localhost を共有する（Kubernetes の意味論。core の net の join〔H7・#2872〕が入った後）。`NetworkReady=false` は維持する
 3. 本番の pasta provider: #340 の決定（利用者が導入した pasta を exec）で決着した。H10（#2879）は #341 待ちのまま。依存（crate）の追加は伴わない
 
 ## 実装単位
@@ -98,7 +104,7 @@
 | 記号 | issue | 内容 | 担当 | 依存 |
 | ---- | ----- | ---- | ---- | ---- |
 | H1 | #2870 | core: 保持役の namespace 確立 API | runtime-builder | なし |
-| H2 | #2874 | supervisor: `pod-holder` モード | runtime-builder | H1 |
+| H2 | #2874 | supervisor: `pod-holder` モード（netns 内の `lo` の up を含む） | runtime-builder | H1 |
 | H3 | #2875 | ci: 実機前提試験の組み込み | infra-builder | H2・H7 |
 | H4 | #2871 | cri: 保持役の注入点と sandbox 記録への pid の保持 | oci-cri-builder | なし |
 | H5 | #2876 | cri: `with_pod_namespaces` の配線と pod A/B の結合試験 | oci-cri-builder | H4 |

@@ -659,7 +659,7 @@ async fn cri6_repair3_dispatcher_with_port_forward_only_refuses_exec_issue() {
     assert!(issuer.is_wired(fandhe_container_cri::streaming::StreamKind::PortForward));
     assert!(!issuer.is_wired(fandhe_container_cri::streaming::StreamKind::Exec));
     let err = issuer
-        .issue(StreamRequest::Exec(v1::ExecRequest {
+        .issue(StreamRequest::exec(v1::ExecRequest {
             container_id: "c1".to_string(),
             cmd: vec!["sh".to_string()],
             tty: false,

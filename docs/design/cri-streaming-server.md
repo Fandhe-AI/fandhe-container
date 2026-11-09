@@ -112,10 +112,11 @@ CRI の定義は tty のとき stderr を false に固定する。RPC（`validat
 - フロー制御は Attach と同じく強制しない（「意図的な逸脱」）。送信キュー 1 MiB の上限と、stdin をプロセスへ書き終えるまで次のフレームを読まないことで背圧を TCP に任せる。試験 `cri6_exec_large_stdin_roundtrip_beyond_window` が 256 KiB の往復を固定する
 - 期限（REPAIR-5）: `SessionLimits`（作成 30 秒・idle 4 時間・流し切り 5 秒・最後の送出 5 秒）に加え、Exec 固有の `launch_timeout`（既定 30 秒）と `stdin_stall_timeout`（既定 60 秒。溜めた stdin をプロセスが読まないとき、ソケットを読めず切断を検知できない時間の上限）
 - 受信バッファが上限を超えた場合は EOF と区別して `ProtocolError`（GOAWAY）で閉じる
+- インスタンスの照合（#4286・CRI-5・SEC-1・CORE-1）: `Exec` RPC は URL の発行前に、実行層の `state` を `exit_observe_timeout`（有界）で 1 回読み、コンテナのインスタンス識別子を `StreamRequest::Exec { request, instance }` に保存する（実行層が無いスタブ経路は `None`。読めなければ RPC を失敗させ URL を発行しない）。起動役は対象のプロセスを決める状態読み取りと同じ読み取りで得た値と `adapter::instance_matches`（shim v2 の T5 と同じ規則。`None` 同士は通し、値違い・片側だけ `None` は不一致）で比べ、不一致なら helper を起動せず `FAILED_PRECONDITION` `"container was recreated after the exec request"`（`MSG_EXEC_INSTANCE_CHANGED`。ID・値を含めない）で拒否する。コードが shim の `NOT_FOUND "exec not found"` と違うのは、後者が登録簿から除去した結果の語彙で、ストリーミング経路には登録簿が無いため。kubelet には他の起動失敗と同じ `InternalError` の Status として見える
 
 ### 注入トレイト `ExecStreamLauncher`
 
-core の `ContainerRuntime` に exec は無く、shim v2 の `TaskExecLauncher` は stdio を持たない（containerd の FIFO 前提）。そこで stdio を持つ起動役を `crates/cri` の注入トレイトとして定義した（`ContainerRuntime` は変えない。PLUG-1）。`ExecLaunch` には発行時に保存した要求から作った値だけを入れ、通信路の内容から cmd を組み立てない。契約は、要求された stdio だけを返す・`ExecSession` の drop でプロセスを止める・コンテナの namespace / cgroup / seccomp / capability を継承して広げない（SEC-1）・panic しない。**本番の実装は plugin-cri の `streaming::exec_launcher`（#3761）**。supervisor の exec 入口（pidfd 経由）へ stdio のパイプと pty を付ける橋渡しの設計は「本番 backend の設計」の「Exec」節（#3757〜#3762）。
+core の `ContainerRuntime` に exec は無く、shim v2 の `TaskExecLauncher` は stdio を持たない（containerd の FIFO 前提）。そこで stdio を持つ起動役を `crates/cri` の注入トレイトとして定義した（`ContainerRuntime` は変えない。PLUG-1）。`ExecLaunch` には発行時に保存した要求から作った値だけを入れ、通信路の内容から cmd を組み立てない。契約は、要求された stdio だけを返す・`ExecSession` の drop でプロセスを止める・`ExecLaunch::instance` を起動時の状態読み取りと照合して不一致なら起動しない（#4286）・コンテナの namespace / cgroup / seccomp / capability を継承して広げない（SEC-1）・panic しない。**本番の実装は plugin-cri の `streaming::exec_launcher`（#3761）**。supervisor の exec 入口（pidfd 経由）へ stdio のパイプと pty を付ける橋渡しの設計は「本番 backend の設計」の「Exec」節（#3757〜#3762）。
 
 ## PortForward（#682・TASK-63.4・CRI-6）
 
@@ -526,7 +527,8 @@ CRI の `ExecSync`（現状 `UNIMPLEMENTED`）も本設計の helper を再利�
 - 暫定値・設計の確認事項（exec の全体上限・同時セッション数・`::1`・終了コード・観測名など）: 上の「未確認・オーナー確認事項」と #4116（オーナー判断）
 - rootful: plugin-cri の start が uid 0 を `UNIMPLEMENTED` にするため、rootful のコンテナは無く 3 RPC とも使えない（uid 0 の拒否は #2442、rootful を許すかは #2241 の判断待ち）
 - 非 Linux: Exec は未結線の `UNIMPLEMENTED`。コンテナの start 自体も未実装（macOS の状態ルートは #2431）
-- `ExecSync`: `UNIMPLEMENTED` のまま。追跡 issue 未起票
+- `ExecSync`: `UNIMPLEMENTED` のまま。追跡 issue 未起票。実装するときは Exec と同じインスタンスの記録と起動時の照合を入れる義務がある（#4286）
+- Exec のインスタンス照合の残余（#4286）: (1) 識別子を報告しない実装・記録の無い旧い `state.json` は両側 `None` で保護されない（試験で固定）。(2) CRI の記録（`ContainerRecord`）は create 時のインスタンスを持たないため、`Exec` RPC より前に外で作り直されたコンテナには新しいインスタンスで URL が発行される（塞ぐには記録ファイルと再採用へインスタンスを持たせる必要があり、本件の範囲外）。(3) 照合の違反の観測は `ExecStreamOutcome::LaunchFailed` に含まれ、区別した計装は無い
 - 外部公開の TLS・認証（無い。opt-in の口は #4110 で plugin-cri の CLI に出した。前段の守りが前提）
 - Upgrade 後のセッションの停止時のドレイン方針の再評価（REPAIR-5）: #4111。`ConnectionObserver` の telemetry への接続（REPAIR-4）は #4163 で実装済み（下の「plugin-cri での起動と停止」）
 - ポートの到達性など深い意味検証

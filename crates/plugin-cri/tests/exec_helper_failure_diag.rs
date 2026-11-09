@@ -283,6 +283,8 @@ mod linux {
                     stdin: true,
                     stdout: true,
                     stderr: true,
+                    // 照合で先に拒否されると helper まで届かない（試験の意図が崩れる）ため、記録の値を渡す。
+                    instance: created.instance().map(|i| i.value()),
                 }),
             )
             .await

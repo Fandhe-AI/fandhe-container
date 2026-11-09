@@ -94,9 +94,10 @@ pub use usage::{
 
 mod pull;
 pub use pull::{
-    BlobReuse, LeasedBlob, MAX_PUBLISH_TAGS, PULL_LOCK_FILE_NAME, PublishedRootfsDir,
-    PublishedRootfsEntry, PublishedRootfsParent, PullAbortOutcome, PullPublishOutcome,
-    PullPublishRequest, PullSession, StagedBlobWriter, StagingCleanup, UnpackDir,
+    BlobDirParent, BlobReuse, LeasedBlob, MAX_PUBLISH_TAGS, PULL_LOCK_FILE_NAME,
+    PublishedRootfsDir, PublishedRootfsEntry, PublishedRootfsParent, PullAbortOutcome,
+    PullPublishOutcome, PullPublishRequest, PullSession, StagedBlobWriter, StagingCleanup,
+    UnpackDir,
 };
 
 mod pull_recovery;

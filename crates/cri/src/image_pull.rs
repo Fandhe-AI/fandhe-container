@@ -148,8 +148,8 @@ use fandhe_container_oci::auth::{BasicCredentials, RegistryAuth};
 use fandhe_container_oci::config::{ImageRootFs, MAX_CONFIG_BYTES, parse_image_config_rootfs};
 use fandhe_container_oci::error::{OciError, OciErrorCode};
 use fandhe_container_oci::image_management::{
-    BlobReuse, IMAGE_STORE_BLOB_DIR, ImageStore, ManifestComposition, PublishedRootfsDir,
-    PublishedRootfsEntry, PullPublishRequest, PullSession, StagedBlobWriter, TagKey, UnpackDir,
+    BlobReuse, ImageStore, ManifestComposition, PublishedRootfsDir, PublishedRootfsEntry,
+    PullPublishRequest, PullSession, StagedBlobWriter, TagKey, UnpackDir,
 };
 use fandhe_container_oci::instrument::{NoopOciOpRecorder, OciOpRecorder};
 use fandhe_container_oci::layer::extract::{
@@ -632,11 +632,6 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
             .map_err(|e| PullError::from_oci(&e))
     }
 
-    /// `blobs/sha256` を作る（Unix では 0700）。
-    fn blobs_dir(&self) -> Result<TrustedDir, PullError> {
-        prepare_private_dir(&self.config.cache_dir, &IMAGE_STORE_BLOB_DIR)
-    }
-
     /// 展開済み rootfs の公開先（`<cache_dir>/rootfs/sha256/<hex>/rootfs`。キーはイメージ ID = config digest）。
     ///
     /// 親の `<hex>/` エントリは `rootfs/`（展開物）と `unpack-record`（展開時の設定の記録）を持ち、1 回の `rename` で
@@ -666,7 +661,7 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
         budget: &PullBudget<'_>,
     ) -> Result<(), PullError> {
         // 公開先 `rootfs/sha256` は検査済み root の fd 起点で作って開く（祖先の差し替えがおとりへ届かない。#4283）。
-        // キャッシュの祖先の検証は pull の入口の `blobs_dir` と `ImageStore::open` が済ませている。
+        // キャッシュの祖先の検証は pull の入口の `prepare_cache_root` と `ImageStore::open` が済ませている。
         // `rootfs` の所有者・権限を確かめてから配下の `sha256` を作る（検証前に配下を作らない）。
         let rootfs_parent = session
             .ensure_published_rootfs_parent()
@@ -1157,10 +1152,11 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
         // 在庫（`@image-inventory.json`）への登録は oci の `ImageStore` を通す（#2539・OCI-1・OCI-7）。
         // 取得・検証した blob は `PullSession` のステージングに置き、`publish` が `blobs/sha256` への公開・
         // manifest とタグの登録・リース解放を排他の下でまとめて行う。cri 自身は `blobs/sha256` へ置かない。
-        let blobs = self.blobs_dir()?;
+        let probe_owner = prepare_cache_root(&self.config.cache_dir)?;
         let store = ImageStore::open(&self.config.cache_dir)
             .map_err(|e| PullError::from_store(&e))?
             .with_recorder(Arc::clone(&self.recorder));
+        let blobs = blobs_dir(&store, probe_owner)?;
         let mut session = store
             .begin_pull_generated()
             .map_err(|e| PullError::from_store(&e))?;
@@ -1264,23 +1260,50 @@ pub fn canonical_reference(input: &str) -> Option<String> {
     })
 }
 
-/// キャッシュ配下のディレクトリを 1 要素ずつ作り、既存要素も検証する（SEC・OCI-1）。
+/// `blobs` と `blobs/sha256` を、`ImageStore::open` が検査済みで保持する root の fd 起点で用意し、所有者・権限を
+/// 検証して所有者基準を返す（OCI-7・SEC-1・CRI-3・#4320）。
+///
+/// pull の入口（`pull`）から、`begin_pull` より前に呼ばれる。作成も検証も root の fd から 1 要素ずつ
+/// （`mkdirat` → `O_NOFOLLOW` open → fstat）行うため、検証した inode とストアが以後使う inode が同じで、
+/// キャッシュの祖先を検査後に差し替えてもおとりには届かない。所有者基準は root の fd の fstat（`root_owner`）から取り、
+/// パス起点で得た `probe_owner`（[`prepare_cache_root`]）と食い違えば拒否する。`blobs` を検証してから `sha256` を作る
+/// （検証前に配下を作らない）。blob 公開（rename）で未検証の内容が混入する経路を塞ぐ。
+///
+/// 残余: キャッシュ root 自身（と無い祖先）の作成は、開く前の fd が無いためパス起点のまま（`ImageStore::open` と同じ前提）。
+pub(crate) fn blobs_dir(store: &ImageStore, probe_owner: u32) -> Result<TrustedDir, PullError> {
+    let owner = store.root_owner().map_err(|e| PullError::from_store(&e))?;
+    if owner != probe_owner {
+        return Err(PullError::new(
+            OciErrorCode::FailedPrecondition,
+            "image cache directory has an unexpected owner",
+        ));
+    }
+    let parent = store
+        .ensure_blob_dir_parent()
+        .map_err(|e| PullError::from_store(&e))?;
+    verify_private_meta(
+        &parent.metadata().map_err(|e| PullError::from_store(&e))?,
+        owner,
+    )?;
+    let sha256 = parent
+        .ensure_sha256()
+        .map_err(|e| PullError::from_store(&e))?;
+    verify_private_meta(&sha256, owner)?;
+    Ok(TrustedDir { owner })
+}
+
+/// キャッシュ root（と無い祖先）を 1 要素ずつ作り、既存要素も検証して、パス起点の所有者基準を返す（SEC・OCI-1）。
+///
+/// `blobs` / `blobs/sha256` は含まない（検査済み fd 起点の [`blobs_dir`] が担う。#4320）。
 ///
 /// 副作用のない検証を作成より先に行う。まず `cache_dir` の既存部分（実在する最も深い祖先まで）を
 /// `symlink_metadata` で辿り、利用者所有の symlink と `..` を拒否する。次にその既存祖先で所有者基準を取得し、
 /// 祖先連鎖を検証してから、足りない要素を検証済みディレクトリの配下へ非再帰で 1 要素ずつ作る。
 /// 検証前に再帰作成や probe ファイルの作成をしないため、他ユーザーが張った symlink 経由で
 /// キャッシュ外にディレクトリ・ファイルが作られない。
-/// `components` は `cache_dir` 直下から順に非再帰で作成し（既存は許容）、各要素について
-/// 「symlink でない通常ディレクトリ」「呼び出しプロセスと同一所有者」「group / other 書き込み権限なし」
-/// （Unix）を確認する。検証済みの所有者専用ディレクトリは他ユーザーが差し替えられないため、検証後の
-/// blob 公開（rename）で未検証の内容が混入する経路を塞ぐ。ディレクトリの検証は配下の既存 inode の書き換えを
-/// 防がないため、blob ファイル自体の所有者・権限・ハードリンク数は [`check_blob_trust`] で別に確認する。
-/// 0700 の指定は新規作成時にしか効かないので、既存ディレクトリは必ずここで検証する。
-pub(crate) fn prepare_private_dir(
-    cache_dir: &Path,
-    components: &[&str],
-) -> Result<TrustedDir, PullError> {
+/// 各要素について「symlink でない通常ディレクトリ」「呼び出しプロセスと同一所有者」「group / other 書き込み権限なし」
+/// （Unix）を確認する。0700 の指定は新規作成時にしか効かないので、既存ディレクトリは必ずここで検証する。
+pub(crate) fn prepare_cache_root(cache_dir: &Path) -> Result<u32, PullError> {
     let prep_err = || {
         PullError::new(
             OciErrorCode::FailedPrecondition,
@@ -1295,11 +1318,7 @@ pub(crate) fn prepare_private_dir(
     if missing.is_empty() {
         verify_private_dir(&current, owner)?;
     }
-    let names = missing
-        .iter()
-        .map(|c| c.as_os_str())
-        .chain(components.iter().map(std::ffi::OsStr::new));
-    for name in names {
+    for name in missing.iter().map(|c| c.as_os_str()) {
         current.push(name);
         #[cfg_attr(not(unix), allow(unused_mut))]
         let mut single = fs::DirBuilder::new();
@@ -1315,13 +1334,13 @@ pub(crate) fn prepare_private_dir(
         }
         verify_private_dir(&current, owner)?;
     }
-    Ok(TrustedDir { owner })
+    Ok(owner)
 }
 
-/// 検証済みのキャッシュ配下ディレクトリの検証に使った所有者基準（[`prepare_private_dir`] の戻り値。パスは持たない。
+/// 検証済みのキャッシュ配下ディレクトリの検証に使った所有者基準（[`blobs_dir`] の戻り値。パスは持たない。
 /// 以後の操作は検査済み root の fd 起点で行う。#4283）。
 ///
-/// `owner` は呼び出しプロセスの実効 UID 相当（`owner_probe`）で、配下の blob ファイルの所有者確認
+/// `owner` は検査済み root の fd の fstat（`root_owner`）で、配下の blob ファイルの所有者確認
 /// （[`check_blob_trust`]）にも同じ値を使う（基準を取り直さない）。
 #[derive(Debug)]
 pub(crate) struct TrustedDir {
@@ -1673,7 +1692,7 @@ fn staging_dir_error() -> PullError {
 
 /// create 経路の入口で、キャッシュの root を作らずに検査する（#4283・OCI-7・SEC-1・CRI-3）。
 ///
-/// 副作用はない（`prepare_private_dir` と違い何も作らず、所有者のプローブファイルも作らない）。キャッシュの実在する
+/// 副作用はない（`prepare_cache_root` と違い何も作らず、所有者のプローブファイルも作らない）。キャッシュの実在する
 /// 祖先を辿って利用者所有の symlink と `..` を拒否し、祖先連鎖を [`verify_ancestors`] で検証して、キャッシュ root 自身を
 /// [`verify_private_dir`] で検証する。キャッシュ（またはその祖先）が無ければ `Ok(false)`（キャッシュ未作成）。
 /// 続けて呼び出し側が `ImageStore::open` を通すため、root の所有者が実効 uid であることと mode の検査はそこでも行われる。
@@ -2467,6 +2486,36 @@ mod blob_trust_fs_tests {
         fs::symlink_metadata(path).expect("stat").mode() & 0o777
     }
 
+    /// OCI-7・SEC-1・CRI-3・#4320: `ImageStore::open` の後にキャッシュ root が差し替わっても、`blobs_dir` は検査済み root
+    /// （移動先）を検証して作り、おとり（0777 の `blobs/sha256` を持つ）には触れず、拒否もしない。
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn oci7_sec1_4320_blob_dir_check_follows_checked_root_after_swap() {
+        let dir = TempDir::new("blobs-swap");
+        let cache = dir.0.join("cache");
+        let moved = dir.0.join("cache-moved");
+        fs::create_dir(&cache).expect("cache");
+        fs::set_permissions(&cache, fs::Permissions::from_mode(0o700)).expect("chmod");
+        let probe_owner = prepare_cache_root(&cache).expect("prepare");
+        let store = ImageStore::open(&cache).expect("open");
+
+        fs::rename(&cache, &moved).expect("move");
+        fs::create_dir(&cache).expect("decoy");
+        fs::set_permissions(&cache, fs::Permissions::from_mode(0o700)).expect("chmod decoy");
+        let decoy_sha = cache.join("blobs").join("sha256");
+        fs::create_dir_all(&decoy_sha).expect("decoy blobs");
+        fs::set_permissions(&decoy_sha, fs::Permissions::from_mode(0o777)).expect("chmod 777");
+
+        let trusted = blobs_dir(&store, probe_owner).expect("checked root passes");
+        assert_eq!(trusted.owner, probe_owner);
+        assert_eq!(mode_of(&decoy_sha), 0o777);
+        assert_eq!(fs::read_dir(&decoy_sha).expect("decoy").count(), 0);
+        assert_eq!(mode_of(&moved.join("blobs").join("sha256")), 0o700);
+    }
+
     /// OCI-1・SEC: 所有者専用・リンク数 1・内容一致の既存 blob は再利用でき、検査はファイルを変えない。
     #[test]
     fn sec_cached_blob_is_reusable_when_trusted_and_verified() {
@@ -2797,7 +2846,7 @@ mod non_unix_tests {
     #[test]
     fn sec_cache_preparation_is_rejected_without_acl_verification() {
         let dir = std::env::temp_dir().join(format!("fandhe-cri-acl-{}", std::process::id()));
-        let err = prepare_private_dir(&dir, &["staging"]).expect_err("rejected");
+        let err = prepare_cache_root(&dir).expect_err("rejected");
         assert_eq!(err.code(), OciErrorCode::Unimplemented);
         let _ = fs::remove_dir_all(&dir);
     }

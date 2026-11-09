@@ -814,3 +814,31 @@ fn oci7_sec1_4321_rollback_with_swapped_bundle_root_removes_only_the_own_bundle(
     );
     assert!(!src.real().join("ctr1").exists(), "own bundle is removed");
 }
+/// OCI-7・SEC-1・#4378: `list_bundle_ids` は root の差し替え後におとりの ID を返さず、`FAILED_PRECONDITION`
+/// （root がおとりの symlink になるため `bundle root must be a directory`）で拒否する。差し替え前は具体値の ID 一覧を返す（対照）。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[test]
+fn oci7_sec1_4378_list_bundle_ids_with_swapped_root_fails_closed_without_decoy_ids() {
+    let id_a = "a".repeat(64);
+    let id_b = "b".repeat(64);
+    let tmp = TempDir::new("list-swap");
+    let root = tmp.0.join("b");
+    fs::create_dir(&root).expect("root");
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::create_dir(root.join(&id_a)).expect("bundle a");
+    let p = SpecBundleProvider::new(root.clone(), Arc::new(FakeRootfs::default())).expect("p");
+    let listing = p.list_bundle_ids(10).expect("list");
+    assert_eq!(listing.ids, vec![id_a.clone()]);
+
+    let decoy = tmp.0.join("decoy");
+    fs::create_dir_all(decoy.join(&id_b)).expect("decoy");
+    fs::rename(&root, tmp.0.join("b-real")).expect("move root");
+    std::os::unix::fs::symlink(&decoy, &root).expect("plant symlink");
+    let e = p.list_bundle_ids(10).unwrap_err();
+    assert_eq!(e.code(), CriErrorCode::FailedPrecondition);
+    assert_eq!(e.message(), "bundle root must be a directory");
+    assert!(decoy.join(&id_b).is_dir(), "decoy is untouched");
+}

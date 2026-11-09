@@ -42,6 +42,9 @@
 //! だけ）。`child_matches` は子の名前が開いた別の fd と同じ実体かを照合する検出器で、差し替えを検出したら呼び出し側は名前に
 //! 触れない。Linux 以外の unix・Windows はパス起点（`child_matches` は常に真）。
 //!
+//! `child_names` は root の fd を `.` で開き直した独立の description で子の名前を列挙する（#4378。cri の
+//! `list_bundle_ids` が root の差し替え後におとりの中身を読まないため）。
+//!
 //! 展開の根を fd で受ける入口（#4180）: パスを受ける `extract_image_layers_bounded` とは別に、開いた fd を
 //! [`ExtractRoot`] で受ける `extract_image_layers_bounded_in` がある。cri の pull が `staging/<id>/unpack/entry/rootfs` を
 //! pull ディレクトリの fd 起点で作って渡す。この場合、変更操作は渡された fd を起点にし（`AnchoredRoot` を開き直さない）、
@@ -277,6 +280,47 @@ mod imp {
                 }
                 Err(e) => Err(map_at_err(&e)),
             }
+        }
+
+        /// 直下の子の名前を列挙する（`.`・`..` を除く。順序は不定。OCI-7・SEC-1・#4378）。
+        ///
+        /// 開いた root の fd を `.` で開き直した独立の open file description で `getdents64` を読むため、dup と違って
+        /// offset を共有せず、呼び出しごとに先頭から読む。開いた後に root のパスが symlink へ差し替わっても、
+        /// 読むのは固定した実体の名前だけ。`max_entries` を超える件数は、超えた時点で打ち切って `ResourceExhausted`。
+        pub fn child_names(&self, max_entries: usize) -> Result<Vec<OsString>, OciError> {
+            let dot = at::relative_cstring::<&str>(&[]).map_err(|e| map_fs_err(&e))?;
+            let dir = at::openat2(
+                Some(self.fd.as_fd()),
+                &dot,
+                DIR_FLAGS_RW,
+                0,
+                RESOLVE_DESCEND,
+            )
+            .map_err(|e| map_at_err(&e))?;
+            let mut buf = vec![0u8; DIRENT_BUF_LEN];
+            let mut names: Vec<OsString> = Vec::new();
+            let mut too_many = false;
+            loop {
+                let n = at::getdents64(dir.as_fd(), &mut buf).map_err(|e| map_fs_err(&e))?;
+                if n == 0 {
+                    break;
+                }
+                at::for_each_dirent(buf.get(..n).unwrap_or(&[]), |name| {
+                    if names.len() >= max_entries {
+                        too_many = true;
+                    } else {
+                        names.push(OsString::from_vec(name.to_vec()));
+                    }
+                })
+                .map_err(|e| map_fs_err(&e))?;
+                if too_many {
+                    return Err(err(
+                        OciErrorCode::ResourceExhausted,
+                        "directory has too many entries",
+                    ));
+                }
+            }
+            Ok(names)
         }
 
         /// 直下の子ディレクトリ `name` の有無を、読み取り権限を要求せず（`O_PATH`）symlink を辿らず確かめる。
@@ -1001,6 +1045,23 @@ mod imp {
             }
         }
 
+        /// 直下の子の名前を列挙する（パス起点。`.`・`..` を除く。順序は不定。#4378）。`max_entries` を超えたら
+        /// `ResourceExhausted`。
+        pub fn child_names(&self, max_entries: usize) -> Result<Vec<OsString>, OciError> {
+            let mut names = Vec::new();
+            for entry in fs::read_dir(&self.path).map_err(|e| map_fs_err(&e))? {
+                let entry = entry.map_err(|e| map_fs_err(&e))?;
+                if names.len() >= max_entries {
+                    return Err(err(
+                        OciErrorCode::ResourceExhausted,
+                        "directory has too many entries",
+                    ));
+                }
+                names.push(entry.file_name());
+            }
+            Ok(names)
+        }
+
         /// 直下の子ディレクトリ `name` の有無を確かめる（パス起点）。無ければ `false`、ディレクトリでなければ
         /// `FailedPrecondition`。
         pub fn child_dir_exists(&self, name: &str) -> Result<bool, OciError> {
@@ -1329,6 +1390,49 @@ mod tests {
 
     fn os(v: &[&str]) -> Vec<OsString> {
         v.iter().map(OsString::from).collect()
+    }
+
+    /// OCI-7・SEC-1・#4378: `child_names` は具体値で子の名前を返し、繰り返しても先頭から読み、件数の境界（N 件は可、
+    /// N+1 件は `ResourceExhausted`）を守る。開いた後に root が symlink（おとり）へ差し替わっても、おとりの名前を返さず、
+    /// 排他作成・削除も元の実体にだけ届く。
+    #[test]
+    fn oci7_sec1_4378_child_names_is_fd_anchored_and_bounded() {
+        let base = tmp("cn");
+        let dir = base.join("d");
+        fs::create_dir_all(dir.join("a")).unwrap();
+        fs::create_dir_all(dir.join("b")).unwrap();
+        fs::write(dir.join("f"), b"x").unwrap();
+        let root = ExtractRoot::open_existing_dir(&dir).unwrap();
+        for _ in 0..2 {
+            let mut names = root.child_names(10).unwrap();
+            names.sort();
+            assert_eq!(names, os(&["a", "b", "f"]));
+        }
+        assert!(root.child_names(3).is_ok());
+        let e = root.child_names(2).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::ResourceExhausted);
+
+        let real = base.join("d-real");
+        fs::rename(&dir, &real).unwrap();
+        let decoy = base.join("decoy");
+        fs::create_dir_all(decoy.join("zzz")).unwrap();
+        std::os::unix::fs::symlink(&decoy, &dir).unwrap();
+        // 対照: パス起点ならおとりの名前が見える。
+        let via_path: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(via_path, os(&["zzz"]));
+        let mut names = root.child_names(10).unwrap();
+        names.sort();
+        assert_eq!(names, os(&["a", "b", "f"]));
+
+        drop(root.create_new_file("p", 0o600).unwrap());
+        assert!(real.join("p").exists());
+        root.remove_child_tree("p").unwrap();
+        assert!(!real.join("p").exists());
+        assert_eq!(fs::read_dir(&decoy).unwrap().count(), 1);
+        let _ = fs::remove_dir_all(&base);
     }
 
     /// OCI-7・SEC-1・CRI-3・#4283: `create_private_dir` は 0700 の根を作って開き、既存は拒否する。作成後に親が別名へ

@@ -18,8 +18,9 @@
 //!
 //! **fd 起点にしない範囲（残余。REPAIR-3）**: fd 起点の操作は oci の `ExtractRoot` の安全な API（`unsafe` は oci の `sys` に
 //! 閉じる）を使い、本 crate に `unsafe` は足さない。Linux の x86_64 / aarch64 以外（macOS 等）はパス起点の実装で、入口の
-//! 再検査に頼る。`list_bundle_ids` の列挙（`read_dir`）と `effective_uid` の使い捨てファイルはパス起点のまま（削除を
-//! 伴わず、`verify_root` が前後で root の (dev, ino) を確かめる）。差し替えを検出した巻き戻しは、移動先に残る空の
+//! 再検査に頼る。`list_bundle_ids` の列挙と `effective_uid` の使い捨てファイルも root の fd 起点（#4378。前後の
+//! `verify_root` は検出器として残す）。パス起点に残るのは root の祖先の所有者・書き込み権の検査（`check_trusted_chain`）。
+//! 差し替えを検出した巻き戻しは、移動先に残る空の
 //! bundle ディレクトリの名前が分からないため回収しない（`config.json`・`resolv.conf` と rootfs の中身だけを消す）。
 //! `PreparedBundle` が返すパスを core がその後に使う経路は対象外（返す時点の同一性だけを確かめる）。
 //! `root` を信頼できる所有者の非共有ディレクトリに置く前提で使う。
@@ -286,15 +287,16 @@ impl SpecBundleProvider {
                     "bundle root must not contain symlinks",
                 ));
             }
-            check_trusted_chain(&root, &meta)?;
             (meta.dev(), meta.ino())
         };
-        // 検査したパスと同じ実体を、symlink を辿らず fd で固定する。以後の操作はこの fd を起点にする。
+        // 検査したパスと同じ実体を、symlink を辿らず fd で固定する。以後の操作（使い捨てファイルの作成を含む）は
+        // この fd を起点にする。
         let root_dir = ExtractRoot::open_existing_dir(&root)
             .map_err(|_| CriError::failed_precondition("bundle root is unavailable"))?;
         if root_dir.identity().ok() != Some(root_identity) {
             return Err(CriError::failed_precondition("bundle root has changed"));
         }
+        check_trusted_chain(&root, &meta, &root_dir)?;
         Ok(Self {
             root,
             rootfs,
@@ -326,8 +328,10 @@ impl SpecBundleProvider {
 
     /// bundle の置き場 `root` 直下の ID を列挙する（孤児 bundle の回収の候補作り。R8 #2937・OCI-7・CRI-1）。
     ///
-    /// plugin-cri の `reclaim_orphan_bundles`（インスタンスロックの下）が呼ぶ。列挙の前に `verify_root` で
-    /// root の (dev, ino) を確かめ、各エントリは `symlink_metadata` だけで判定する（symlink は辿らない）。サービス採番の
+    /// plugin-cri の `reclaim_orphan_bundles`（インスタンスロックの下）が呼ぶ。列挙は構築時に開いた root の fd 起点
+    /// （独立した open file description）で行い、各エントリも同じ fd から symlink を辿らずに種別を判定する（#4378）。
+    /// このため root のパスが列挙の途中で symlink へ差し替えられても、おとりの中身は読まない。前後の `verify_root` は
+    /// 差し替えを成功に見せない検出器として残す。サービス採番の
     /// ID（64 文字の小文字 16 進。`RecordId` と同じ形）でない名前は [`BundleListing::skipped_unrecognized`]、
     /// ディレクトリでないもの（symlink・通常ファイル等）は [`BundleListing::skipped_not_dir`] に数え、どちらも
     /// 触らない。走査数が `max_entries` を超えたら何も返さず `FAILED_PRECONDITION`（無制限確保の防止）。
@@ -335,17 +339,28 @@ impl SpecBundleProvider {
     #[cfg(unix)]
     pub fn list_bundle_ids(&self, max_entries: usize) -> Result<BundleListing, CriError> {
         self.verify_root()?;
-        let entries = fs::read_dir(&self.root)
-            .map_err(|_| CriError::internal("failed to list bundle root"))?;
+        let mut listing = self.scan_bundle_ids(max_entries)?;
+        // fd 起点の列挙では冗長だが、列挙の間に root が差し替わったなら成功として返さない（fail-closed）。
+        self.verify_root()?;
+        listing.ids.sort();
+        Ok(listing)
+    }
+
+    /// `list_bundle_ids` の本体。`verify_root` を呼ばず、root の fd 起点の列挙と分類だけを行う
+    /// （試験が差し替えの窓を直接突くための継ぎ目。#4378）。
+    #[cfg(unix)]
+    fn scan_bundle_ids(&self, max_entries: usize) -> Result<BundleListing, CriError> {
+        let names = self
+            .root_dir
+            .child_names(max_entries)
+            .map_err(|e| match e.code() {
+                OciErrorCode::ResourceExhausted => {
+                    CriError::failed_precondition("bundle root has too many entries")
+                }
+                _ => CriError::internal("failed to list bundle root"),
+            })?;
         let mut listing = BundleListing::default();
-        for (scanned, entry) in entries.enumerate() {
-            if scanned >= max_entries {
-                return Err(CriError::failed_precondition(
-                    "bundle root has too many entries",
-                ));
-            }
-            let entry = entry.map_err(|_| CriError::internal("failed to list bundle root"))?;
-            let name = entry.file_name();
+        for name in names {
             let Some(name) = name.to_str() else {
                 listing.skipped_unrecognized += 1;
                 continue;
@@ -354,18 +369,13 @@ impl SpecBundleProvider {
                 listing.skipped_unrecognized += 1;
                 continue;
             }
-            let is_dir = fs::symlink_metadata(entry.path())
-                .map(|m| m.file_type().is_dir())
-                .unwrap_or(false);
-            if is_dir {
+            // `Ok(false)`（列挙の後に消えた）と判定の失敗は、従来の `unwrap_or(false)` と同じく数えて触らない。
+            if matches!(self.root_dir.child_dir_exists(name), Ok(true)) {
                 listing.ids.push(name.to_owned());
             } else {
                 listing.skipped_not_dir += 1;
             }
         }
-        // 列挙の途中で root が差し替わっていないことを再確認する。
-        self.verify_root()?;
-        listing.ids.sort();
         Ok(listing)
     }
 
@@ -386,22 +396,21 @@ impl SpecBundleProvider {
 /// この process の実効 UID を、root 直下に作った使い捨てファイルの所有者から独立に求める（unix）。
 ///
 /// 新規作成したファイルの所有者は作成者の実効 UID になる。検証対象（root）の所有者や `/proc/self` の所有者
-/// （non-dumpable 時は root になる）を代用しない。作成・読み取りに失敗したら拒否する（fail-closed）。
+/// （non-dumpable 時は root になる）を代用しない。使い捨てファイルは構築時に開いた root の fd 起点で
+/// 排他作成し（`O_EXCL | O_NOFOLLOW`）、`unlinkat` で消す（#4378）。root のパスが差し替わってもおとりへ書かない。
+/// 作成・読み取りに失敗したら拒否する（fail-closed）。
 #[cfg(unix)]
-fn effective_uid(root: &Path) -> Result<u32, CriError> {
-    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
-    let probe = root.join(format!(".fandhe-uid-probe-{}", std::process::id()));
-    let _ = fs::remove_file(&probe);
-    let file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&probe);
-    let uid = file
-        .and_then(|f| f.metadata())
+fn effective_uid(root_dir: &ExtractRoot) -> Result<u32, CriError> {
+    use std::os::unix::fs::MetadataExt as _;
+    let name = format!(".fandhe-uid-probe-{}", std::process::id());
+    let _ = root_dir.remove_child_tree(&name);
+    let uid = root_dir
+        .create_new_file(&name, 0o600)
+        .map_err(|_| ())
+        .and_then(|f| f.metadata().map_err(|_| ()))
         .map(|m| m.uid())
-        .map_err(|_| CriError::failed_precondition("effective uid is unavailable"));
-    let _ = fs::remove_file(&probe);
+        .map_err(|()| CriError::failed_precondition("effective uid is unavailable"));
+    let _ = root_dir.remove_child_tree(&name);
     uid
 }
 
@@ -410,9 +419,13 @@ fn effective_uid(root: &Path) -> Result<u32, CriError> {
 /// 所有者は root（uid 0）か、この process の実効 UID（[`effective_uid`] で独立に取得。取得できなければ拒否）。
 /// group / other に書き込み権のある祖先は、sticky bit がある場合だけ許す。
 #[cfg(unix)]
-fn check_trusted_chain(root: &Path, root_meta: &fs::Metadata) -> Result<(), CriError> {
+fn check_trusted_chain(
+    root: &Path,
+    root_meta: &fs::Metadata,
+    root_dir: &ExtractRoot,
+) -> Result<(), CriError> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-    let me = effective_uid(root)?;
+    let me = effective_uid(root_dir)?;
     if root_meta.uid() != me && root_meta.uid() != 0 {
         return Err(CriError::failed_precondition(
             "bundle root has an untrusted owner",
@@ -654,5 +667,97 @@ impl BundleProvider for SpecBundleProvider {
         self.root_dir
             .remove_child_tree_bounded(container_id, &budget.to_extract_budget())
             .map_err(|e| map_remove_err(&e, "failed to remove bundle"))
+    }
+}
+#[cfg(all(
+    test,
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    /// 何も用意しない `RootfsSource`（列挙と uid 取得の試験には使わない）。
+    struct NoRootfs;
+
+    impl RootfsSource for NoRootfs {
+        fn prepare(
+            &self,
+            _image: &ImageSpec,
+            _bundle: &BundleDir,
+            _user: &UserResolveRequest<'_>,
+        ) -> Result<ImageDefaults, CriError> {
+            Err(CriError::unimplemented("test"))
+        }
+        fn release(&self, _bundle: &BundleDir) -> Result<(), CriError> {
+            Ok(())
+        }
+    }
+
+    /// `<base>/bundles` を 0755 で作って `(base, bundles)` を返す。
+    fn setup(tag: &str) -> (PathBuf, PathBuf) {
+        let base = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("fc-cri-provider-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o755)).unwrap();
+        let bundles = base.join("bundles");
+        fs::create_dir(&bundles).unwrap();
+        fs::set_permissions(&bundles, fs::Permissions::from_mode(0o755)).unwrap();
+        (base, bundles)
+    }
+
+    fn swap_to_decoy(base: &Path, bundles: &Path, decoy: &Path) {
+        fs::rename(bundles, base.join("bundles-real")).unwrap();
+        std::os::unix::fs::symlink(decoy, bundles).unwrap();
+    }
+
+    /// OCI-7・SEC-1・#4378: 列挙の窓（`verify_root` の外）で root がおとりへ差し替わっても、`scan_bundle_ids` は
+    /// 元の実体の ID だけを返し、おとりの ID を返さない。公開の `list_bundle_ids` は差し替えを拒否する。
+    #[test]
+    fn oci7_sec1_4378_scan_after_root_swap_returns_only_real_ids() {
+        let (base, bundles) = setup("scan");
+        let id_a = "a".repeat(64);
+        let id_b = "b".repeat(64);
+        fs::create_dir(bundles.join(&id_a)).unwrap();
+        let p = SpecBundleProvider::new(bundles.clone(), Arc::new(NoRootfs)).unwrap();
+        let decoy = base.join("decoy");
+        fs::create_dir_all(decoy.join(&id_b)).unwrap();
+        swap_to_decoy(&base, &bundles, &decoy);
+
+        let listing = p.scan_bundle_ids(10).unwrap();
+        assert_eq!(
+            listing,
+            BundleListing {
+                ids: vec![id_a],
+                skipped_unrecognized: 0,
+                skipped_not_dir: 0,
+            }
+        );
+        let e = p.list_bundle_ids(10).unwrap_err();
+        assert_eq!(e.message(), "bundle root must be a directory");
+        assert!(decoy.join(&id_b).is_dir());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// OCI-7・SEC-1・#4378: 差し替え後の `effective_uid` は固定した実体の fd 起点で動き、おとりにファイルを
+    /// 作らず、元の実体にも残さない。返す uid は新規作成したファイルの所有者と一致する。
+    #[test]
+    fn oci7_sec1_4378_effective_uid_does_not_create_files_in_the_decoy() {
+        let (base, bundles) = setup("uid");
+        let root_dir = ExtractRoot::open_existing_dir(&bundles).unwrap();
+        let decoy = base.join("decoy");
+        fs::create_dir_all(&decoy).unwrap();
+        swap_to_decoy(&base, &bundles, &decoy);
+
+        let uid = effective_uid(&root_dir).unwrap();
+        let probe = base.join("probe-owner");
+        fs::write(&probe, b"x").unwrap();
+        assert_eq!(uid, fs::metadata(&probe).unwrap().uid());
+        assert_eq!(fs::read_dir(&decoy).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(base.join("bundles-real")).unwrap().count(), 0);
+        let _ = fs::remove_dir_all(&base);
     }
 }

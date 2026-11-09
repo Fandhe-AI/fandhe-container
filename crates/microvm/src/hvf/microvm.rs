@@ -681,7 +681,8 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfMicroV
                 mmio: MmioHandler::with_shared_dispatcher(Arc::clone(&devices.dispatcher))
                     .with_ack_routes(devices.ack_routes())
                     .with_ack_tallies(devices.ack_tallies())
-                    .with_queue_notify_routes(queue_routes.clone()),
+                    .with_queue_notify_routes(queue_routes.clone())
+                    .with_observer(vcpu.observer.clone()),
                 hvc: HvcHandler::with_cpus(Arc::clone(&psci), power.clone(), 0)?,
                 // 期限切れで切り離した後の回収を、このスレッドの終了に任せる（#4032。全 vCPU が持つ）。
                 guest_memory: Some(memory.clone()),
@@ -707,7 +708,8 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfMicroV
                         mmio: MmioHandler::with_shared_dispatcher(Arc::clone(&devices.dispatcher))
                             .with_ack_routes(devices.ack_routes())
                             .with_ack_tallies(devices.ack_tallies())
-                            .with_queue_notify_routes(queue_routes.clone()),
+                            .with_queue_notify_routes(queue_routes.clone())
+                            .with_observer(ap_config.observer.clone()),
                         hvc,
                         guest_memory: Some(memory.clone()),
                     };

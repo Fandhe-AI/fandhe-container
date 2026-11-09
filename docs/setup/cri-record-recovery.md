@@ -91,6 +91,12 @@ CLI を使う手順では plugin-cri と同じ状態ルートを指すこと（`
 行に出た ID だけを `crictl stopp` / `rmp`・`crictl stop` / `rm`（または下の手動の手順）で回収する。残っていても次の実行は uid が違うので `already exists` にならないが、
 `production_binary_restart_readopts_running_container_real` は記録が空でなければ何も消さずに失敗するため、その前に回収する。
 
+`container_grpc` の 2 試験（`production_binary_full_lifecycle_real`・`production_binary_restart_readopts_running_container_real`）の記録も同じ方式で、label には試験名の `io.fandhe-container.test.owner` も付く（#4285）。
+`production_binary_restart_readopts_running_container_real` は先頭で、この所有者 label（許可リストの 4 試験名）を持つ記録だけを使い捨ての plugin で回収する。label の無い残骸が残っていれば
+`state root is not clean (entries=<n>)` で失敗するので、上の手順で回収する。
+
+`shim_v2_*_real` の残骸は CRI の記録ではなく `<XDG_RUNTIME_DIR>/fandhe-container-shim-state/<hash>/<namespace>/<id>` にある。消す前に shim と supervisor が生きていないことを確かめ、glob を使わず正確な名前で消す。
+
 ## 消してはいけないもの
 
 - `.cri/records/.lock` と `.cri/@instance.lock`（どちらも unlink しない設計）

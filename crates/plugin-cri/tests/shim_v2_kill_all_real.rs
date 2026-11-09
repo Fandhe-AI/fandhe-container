@@ -69,6 +69,10 @@ mod shim_wire;
 #[cfg(target_os = "linux")]
 #[path = "../../oci/tests/support/test_root.rs"]
 mod test_root;
+// 実行ごとに一意な ID・namespace と旧形式の残骸のおとり（#4285）。
+#[cfg(target_os = "linux")]
+#[path = "support/shim_real_unique.rs"]
+mod shim_unique;
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -86,7 +90,7 @@ mod linux {
         Resp, TaskFields, call_method, create_request, decode_state_response, id_request,
         kill_request, shutdown_request,
     };
-    use super::{minimal_rootfs, reap, test_root};
+    use super::{minimal_rootfs, reap, shim_unique, test_root};
 
     /// 全体の期限（REPAIR-5）。超えたら子を回収して `WATCHDOG EXPIRED` と終了コード 124 で終わる。
     const WATCHDOG: Duration = Duration::from_secs(300);
@@ -181,8 +185,8 @@ mod linux {
 
     fn scene_ids() -> [String; 2] {
         [
-            format!("kar{}", std::process::id()),
-            format!("kbr{}", std::process::id()),
+            format!("kar{}", shim_unique::run_tag()),
+            format!("kbr{}", shim_unique::run_tag()),
         ]
     }
 
@@ -533,7 +537,7 @@ mod linux {
 
     /// シーン A: `Kill(all=true)` が init・コンテナ内の子・移したホストのプロセスをすべて止める。
     fn scene_all(dir: &Path, namespace: &str) -> Result<Scene, String> {
-        let id = format!("kar{}", std::process::id());
+        let id = format!("kar{}", shim_unique::run_tag());
         let scene = launch(dir, namespace, &id, 1)?;
         let mut sleeper = spawn_migrated_sleeper(&scene)?;
         rpc(&scene.sock, "Kill", &kill_request(&scene.id, 9, true))?;
@@ -583,7 +587,7 @@ mod linux {
     /// systemd の回収と競合しないため `WasEmpty` を厳密に要求できる。
     fn scene_recorded_empty() -> Result<(), String> {
         let own = proc_cgroup(std::process::id()).ok_or("cannot read own cgroup")?;
-        let id = format!("kcr{}", std::process::id());
+        let id = format!("kcr{}", shim_unique::run_tag());
         let instance = 1u64;
         let leaf = cgroup_file(&own, &format!("fc-{id}@{instance}"));
         std::fs::create_dir(&leaf).map_err(|e| format!("mkdir dedicated cgroup: {e}"))?;
@@ -618,7 +622,7 @@ mod linux {
 
     /// シーン B（対照）: `Kill(all=false)` は init とコンテナ内の子を止めるが、移したホストのプロセスは止めない。
     fn scene_control(dir: &Path, namespace: &str) -> Result<Scene, String> {
-        let id = format!("kbr{}", std::process::id());
+        let id = format!("kbr{}", shim_unique::run_tag());
         let scene = launch(dir, namespace, &id, 2)?;
         let mut sleeper = spawn_migrated_sleeper(&scene)?;
         rpc(&scene.sock, "Kill", &kill_request(&scene.id, 9, false))?;
@@ -836,7 +840,17 @@ mod linux {
         std::fs::create_dir(&bin).map_err(|e| format!("mkdir bin: {e}"))?;
         install_exe(Path::new(SHIM_SRC), &bin.join(SHIM_NAME))?;
         install_exe(&sup_src, &bin.join(SUPERVISOR_NAME))?;
-        let namespace = format!("fckillall{}", std::process::id());
+        let namespace = format!("fckillall{}", shim_unique::run_tag());
+        // 旧形式（pid だけ）の残骸があっても結果に影響しないことの確認用のおとり（#4285）。Drop で自分の分だけ消す。
+        let pid = std::process::id();
+        let _decoy = shim_unique::Decoy::place(&format!("fckillall{pid}"), &format!("kar{pid}"))?;
+        for id in scene_ids() {
+            for p in state_dirs(&namespace, Some(&id))? {
+                if p.symlink_metadata().is_ok() {
+                    return Err(format!("state directory already exists: {}", p.display()));
+                }
+            }
+        }
         if let Ok(mut w) = WORK.lock() {
             *w = Some((dir.clone(), bin.clone()));
         }

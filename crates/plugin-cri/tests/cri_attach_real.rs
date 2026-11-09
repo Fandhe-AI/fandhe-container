@@ -414,7 +414,7 @@ async fn create_and_start(
                 }),
                 image: Some(image_spec(IMAGE)),
                 command: vec![cmd.into()],
-                labels: reclaim::config_labels(token),
+                labels: reclaim::config_labels(TEST, token),
                 stdin,
                 stdin_once,
                 tty,
@@ -485,7 +485,7 @@ async fn scenario(
                 namespace: "default".into(),
                 attempt: 0,
             }),
-            labels: reclaim::config_labels(&token),
+            labels: reclaim::config_labels(TEST, &token),
             ..Default::default()
         }),
         ..Default::default()

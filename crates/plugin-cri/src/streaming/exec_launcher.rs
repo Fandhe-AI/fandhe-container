@@ -457,21 +457,28 @@ fn watch_result(
     mut exit_w: StdUnixStream,
     deadline: Instant,
 ) {
-    let (result, code) = match recv_from_helper(&channel, deadline) {
-        Ok(HelperMessage::Result(outcome)) => {
-            let code = match outcome {
-                StreamExecOutcome::Failed(c) => c,
-                _ => ErrorCode::Internal,
-            };
-            (map_outcome(outcome), code)
-        }
-        Ok(_) => {
-            kill_weak(&guard);
-            (Err(CriError::internal("exec failed")), ErrorCode::Internal)
-        }
-        Err(e) => {
-            kill_weak(&guard);
-            (Err(channel_error(&e)), e.code())
+    // `Spawned`（コマンドのホスト側 pid。#4316）は高々 1 回読み捨てて `Result` を待つ。CRI の Exec は pid を使わず、
+    // `ExecSession` にも置き場が無い（pid が要るのは shim v2 の経路で、そちらは `task_exec` が記録する）。
+    let mut spawned_seen = false;
+    let (result, code) = loop {
+        match recv_from_helper(&channel, deadline) {
+            Ok(HelperMessage::Spawned { .. }) if !spawned_seen => spawned_seen = true,
+            Ok(HelperMessage::Result(outcome)) => {
+                let code = match outcome {
+                    StreamExecOutcome::Failed(c) => c,
+                    _ => ErrorCode::Internal,
+                };
+                break (map_outcome(outcome), code);
+            }
+            // 2 回目の `Spawned`・この経路が送らない `Signal` への `SignalAck`・`PtyMaster` はプロトコル違反。
+            Ok(_) => {
+                kill_weak(&guard);
+                break (Err(CriError::internal("exec failed")), ErrorCode::Internal);
+            }
+            Err(e) => {
+                kill_weak(&guard);
+                break (Err(channel_error(&e)), e.code());
+            }
         }
     };
     // 受け側が先に消えていれば書き込みは失敗するが、害は無い。
@@ -769,7 +776,12 @@ impl SupervisorExecLauncher {
                 });
             }
             // この経路は `Signal` を送らないので、`SignalAck` が来るのは想定外（#4282。想定外の frame として失敗にする）。
-            Ok(HelperMessage::PtyMaster(_) | HelperMessage::SignalAck { .. }) => {
+            // `Spawned` が `Started` より前に来るのも順序違反（#4316）。
+            Ok(
+                HelperMessage::PtyMaster(_)
+                | HelperMessage::SignalAck { .. }
+                | HelperMessage::Spawned { .. },
+            ) => {
                 return Err(CriError::internal("exec failed"));
             }
             Err(e) => return Err(channel_error(&e)),

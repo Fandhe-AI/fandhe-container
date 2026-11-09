@@ -15,7 +15,7 @@ use fandhe_container_core::traits::{
 };
 use fandhe_container_cri::error::CriErrorCode;
 use fandhe_container_supervisor::stream_exec::channel::{
-    recv_stdio_handover, send_pty_master, send_result, send_started,
+    recv_stdio_handover, send_pty_master, send_result, send_spawned, send_started,
 };
 use fandhe_container_supervisor::stream_exec::wire::ExitSignal;
 use tokio::io::ReadBuf;
@@ -437,6 +437,85 @@ async fn cri6_3761_signaled_result_reaches_the_exit_future() {
         .expect("timed out")
         .expect("exit");
     assert_eq!(code, 137);
+}
+
+/// CRI-6・SUP-6・#4316: `Started` と `Result` の間の `Spawned`（コマンドのホスト側 pid）は読み捨てられ、exit future は終了コードで終わる。
+#[tokio::test]
+async fn cri6_4316_spawned_before_result_is_accepted() {
+    let fx = Fixture::new("spawned");
+    let script: Script = Arc::new(|end, mask| {
+        let _ = recv_stdio_handover(&end, mask, deadline()).expect("handover");
+        send_started(&end, &cg_name(), deadline()).expect("started");
+        send_spawned(
+            &end,
+            std::num::NonZeroU32::new(4242).expect("pid"),
+            deadline(),
+        )
+        .expect("spawned");
+        send_result(&end, &StreamExecOutcome::Exited(0), deadline()).expect("result");
+    });
+    let (launcher, pids) = fx.launcher(false, script);
+    let mut session = launcher
+        .launch(fx.req("run1", false, true, false, false))
+        .await
+        .expect("launch");
+    let code = tokio::time::timeout(WAIT, &mut session.exit)
+        .await
+        .expect("timed out")
+        .expect("exit");
+    assert_eq!(code, 0);
+    drop(pids);
+}
+
+/// SEC-1・SUP-6・#4316: `Spawned` が 2 回来るのは違反で内部エラーになり、helper は kill される。
+#[tokio::test]
+async fn sec1_4316_duplicate_spawned_is_internal_and_kills_the_helper() {
+    let fx = Fixture::new("dupspawned");
+    let script: Script = Arc::new(|end, mask| {
+        let _ = recv_stdio_handover(&end, mask, deadline()).expect("handover");
+        send_started(&end, &cg_name(), deadline()).expect("started");
+        let pid = std::num::NonZeroU32::new(4242).expect("pid");
+        send_spawned(&end, pid, deadline()).expect("spawned");
+        send_spawned(&end, pid, deadline()).expect("spawned again");
+        std::thread::sleep(Duration::from_secs(10));
+    });
+    let (launcher, pids) = fx.launcher(false, script);
+    let mut session = launcher
+        .launch(fx.req("run1", false, true, false, false))
+        .await
+        .expect("launch");
+    let err = tokio::time::timeout(WAIT, &mut session.exit)
+        .await
+        .expect("timed out")
+        .expect_err("protocol violation");
+    assert_eq!(err.code(), CriErrorCode::Internal);
+    let pid = *pids.lock().expect("lock").first().expect("pid");
+    assert!(gone(pid), "helper must be killed");
+}
+
+/// SEC-1・SUP-6・#4316: `Started` より前の `Spawned` は順序違反で起動の失敗になり、helper は kill される。
+#[tokio::test]
+async fn sec1_4316_spawned_before_started_fails_the_launch() {
+    let fx = Fixture::new("earlyspawn");
+    let script: Script = Arc::new(|end, mask| {
+        let _ = recv_stdio_handover(&end, mask, deadline()).expect("handover");
+        send_spawned(
+            &end,
+            std::num::NonZeroU32::new(4242).expect("pid"),
+            deadline(),
+        )
+        .expect("spawned");
+        std::thread::sleep(Duration::from_secs(10));
+    });
+    let (launcher, pids) = fx.launcher(false, script);
+    let err = launcher
+        .launch(fx.req("run1", false, true, false, false))
+        .await
+        .expect_err("launch must fail");
+    assert_eq!(err.code(), CriErrorCode::Internal);
+    let pid = *pids.lock().expect("lock").first().expect("pid");
+    assert!(gone(pid));
+    assert_eq!(launcher.active_sessions(), 0);
 }
 
 /// 拒否: 能力の無い tty・相対 argv[0]・不在・稼働していない。

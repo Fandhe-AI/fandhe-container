@@ -1140,7 +1140,11 @@ impl ConnectionObserver for NoopObserver {
 fn is_unroutable_advertise(adv: IpAddr) -> bool {
     match adv {
         IpAddr::V4(v) => v.is_broadcast(),
-        IpAddr::V6(v) => v.segments()[..6] == [0; 6] && !v.is_unspecified() && !v.is_loopback(),
+        IpAddr::V6(v) => {
+            // 配列分解で先頭 6 要素を取り出す（添字アクセスを使わない）。
+            let [s0, s1, s2, s3, s4, s5, _, _] = v.segments();
+            [s0, s1, s2, s3, s4, s5] == [0; 6] && !v.is_unspecified() && !v.is_loopback()
+        }
     }
 }
 

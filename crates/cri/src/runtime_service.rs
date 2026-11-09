@@ -1052,6 +1052,38 @@ impl Drop for NetworkSetUpGuard {
     }
 }
 
+/// 保持役の起動待ち（`set_up` の前の await）で `RunPodSandbox` の future が破棄されたとき、
+/// 予約時に立てた `network_pending` を解除して NotReady へ倒す guard（#2871・CRI-2・REPAIR-5）。
+///
+/// `set_up` は始まっていないため資源は無く、`network_owned` は付けない。保持役側の印は
+/// `HolderSpawnGuard` が持つ。`NetworkSetUpGuard` へ引き継ぐ前に `disarm` する。
+struct NetworkPendingAbortGuard {
+    registry: Arc<Mutex<SandboxRegistry>>,
+    id: String,
+    armed: bool,
+}
+
+impl NetworkPendingAbortGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for NetworkPendingAbortGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Ok(mut registry) = self.registry.lock()
+            && let Some(record) = registry.records.get_mut(&self.id)
+            && record.network_pending
+        {
+            record.network_pending = false;
+            record.state = SandboxState::NotReady;
+        }
+    }
+}
+
 /// `tear_down` の worker が終わるまで `network_teardown` を保つ guard（worker へ move する）。
 ///
 /// 期限超過で呼び出し側が先に返っても worker の終了（panic 含む）で解除されるため、ハングした worker が
@@ -2174,6 +2206,12 @@ impl CriRuntimeService {
         // `persist_sandbox_rollbackable` が持つ。手放した put は worker が遅れて書けた記録を消し、予約を戻す。
         self.persist_sandbox_rollbackable(&id, true, &mut write_guard)
             .await?;
+        // 保持役の await 中に future が破棄されても `network_pending` を残さない（#2871・CRI-2・REPAIR-5）。
+        let mut abort_guard = NetworkPendingAbortGuard {
+            registry: Arc::clone(&self.registry),
+            id: id.clone(),
+            armed: true,
+        };
         // 保持役を先に起動する（順序は「保持役 → 結線」。#2871・CRI-2）。失敗で資源が無いと確かめられたら
         // 予約を戻す。残りうる・起動中なら NotReady で残し（`set_up` は走らないので `network_pending` は外す）、
         // Stop・Remove が解放する。
@@ -2191,6 +2229,7 @@ impl CriRuntimeService {
             return Err(failure.err);
         }
         // 以降は await を挟まず `NetworkSetUpGuard` が引き継ぐ。
+        abort_guard.disarm();
         let config = {
             let registry = self
                 .registry

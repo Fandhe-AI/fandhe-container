@@ -344,6 +344,47 @@ async fn repair5_outer_deadline_keeps_a_notready_record_and_releases_the_late_ho
     assert!(list(&svc).await.is_empty());
 }
 
+/// 保持役の起動待ち中に RunPodSandbox の future が破棄されても `network_pending` が残らず、
+/// Stop・Remove と同 metadata の再 Run が通ること（#2871・CRI-2・REPAIR-5）。
+#[tokio::test]
+async fn repair5_dropped_run_during_holder_spawn_does_not_leave_network_pending() {
+    let log = new_log();
+    let holder = FakeHolder::new(&log, Spawn::Hang);
+    let net = Arc::new(FakeNet {
+        log: Arc::clone(&log),
+        fail_set_up: false,
+    });
+    let svc = service(&holder).with_pod_network(net);
+    let dropped = tokio::time::timeout(Duration::from_millis(50), run(&svc)).await;
+    assert!(dropped.is_err(), "run must still be awaiting the holder");
+    let items = list(&svc).await;
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].1, NOTREADY);
+    let id = items[0].0.clone();
+    // 保持役の worker が終わると、Remove が解放して記録を消せる（network_pending で塞がれない）。
+    holder.unblock.store(true, Ordering::SeqCst);
+    let start = Instant::now();
+    loop {
+        match remove(&svc, &id).await {
+            Ok(()) => break,
+            Err(e) => {
+                assert_eq!(e.code(), Code::FailedPrecondition);
+                assert!(
+                    start.elapsed() < Duration::from_secs(10),
+                    "remove never succeeded"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+    assert_eq!(holder.count("release"), 1);
+    assert!(list(&svc).await.is_empty());
+    assert!(!log.lock().unwrap().iter().any(|l| l == "set_up"));
+    // 同じ metadata の再 Run が通る。
+    *holder.spawn.lock().unwrap() = Spawn::Ok;
+    run(&svc).await.unwrap();
+}
+
 #[tokio::test]
 async fn cri2_stop_releases_once_and_is_idempotent() {
     let log = new_log();

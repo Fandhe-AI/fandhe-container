@@ -822,11 +822,11 @@ impl SubordinateIdSource {
 /// 構築時に解決・検証済みの範囲写像(`Inner` が保持し、起動のたびに `plan_rootless_subordinate` へ渡す)。
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone)]
-struct SubordinateIds {
-    uid: IdMapSet,
-    gid: IdMapSet,
-    writer: IdMapWriter,
-    timeout: Duration,
+pub(super) struct SubordinateIds {
+    pub(super) uid: IdMapSet,
+    pub(super) gid: IdMapSet,
+    pub(super) writer: IdMapWriter,
+    pub(super) timeout: Duration,
 }
 
 /// 権限モデルと写像の入力元の整合を検査し、`RootlessSubordinateIds` なら写像を解決する(副作用なし。
@@ -837,7 +837,7 @@ struct SubordinateIds {
 /// (`PermissionDenied`。`IdMapSet::new`)、subuid / subgid の読み取り・解析の失敗、helper の検証の失敗。
 /// 文言は固定の英語で、パス・errno・ユーザー名を含めない。
 #[cfg(target_os = "linux")]
-fn resolve_privilege(
+pub(super) fn resolve_privilege(
     privilege: IsolationPrivilege,
     source: Option<SubordinateIdSource>,
     euid: u32,

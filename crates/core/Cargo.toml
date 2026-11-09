@@ -60,6 +60,13 @@ name = "unshare_isolation"
 path = "tests/unshare_isolation.rs"
 harness = false
 
+# pod の保持役の namespace 確立 API の結合試験（CRI-2・CORE-3・SEC-5・#2870）。libtest はマルチスレッドで
+# `CLONE_NEWUSER` が EINVAL になるため harness = false。`-- --ignored` 指定時のみ実行する実機前提テスト。
+[[test]]
+name = "pod_holder"
+path = "tests/pod_holder.rs"
+harness = false
+
 # rootfs 切替（pivot_root）の結合試験（CORE-1・TASK-27.3）。上と同じ理由で harness = false。
 # `-- --ignored` 指定時のみ実行する実機前提テスト（AGENTS.md）。
 [[test]]

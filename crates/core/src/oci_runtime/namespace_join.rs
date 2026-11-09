@@ -46,7 +46,8 @@
 //!
 //! # 未実装・残余（REPAIR-3）
 //!
-//! - 供給元（pod の保持役）は未実装で、cri は当面パスを出さない（本番では共有されない）。cri が出せるパスは
+//! - 供給元のうち namespace の確立 API(`pod_holder::establish_pod_namespaces`。#2870)は実装済みだが、保持役のプロセス
+//!   (supervisor の `pod-holder` モード。#2874)は未実装で、cri は当面パスを出さない（本番では共有されない）。cri が出せるパスは
 //!   保持役の pid からの `/proc/<pid>/ns/{user,ipc}` だけに限られる（#2776）。保持役は #2675 の pod の
 //!   netns と共有する設計の後続 issue。
 //! - pid の共有（`shareProcessNamespace`）は未対応。コンテナの init が PID 1 であることを制限適用の証跡の前提に
@@ -276,7 +277,7 @@ fn open_ns(path: &Path) -> Result<OwnedFd, TraitError> {
 
 /// namespace の同一性（nsfs の `st_dev`・`st_ino`）。
 #[cfg(target_os = "linux")]
-fn identity(fd: BorrowedFd<'_>) -> Result<(u64, u64), TraitError> {
+pub(super) fn identity(fd: BorrowedFd<'_>) -> Result<(u64, u64), TraitError> {
     use std::os::unix::fs::MetadataExt as _;
     let file = std::fs::File::from(
         fd.try_clone_to_owned()

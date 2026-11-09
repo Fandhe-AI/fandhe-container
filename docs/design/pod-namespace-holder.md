@@ -51,6 +51,7 @@
 
 - 保持役は user → ipc → net の順に作り、netns は pod の userns が所有する
 - core の `NamespaceJoin` を拡張し、user＋ipc に加えて任意で net を受ける。net の所有 userns（`NS_GET_USERNS`）が join する user と同じであることを照合し、`setns` は user → ipc → net → 残りの `unshare` の順にする。net 単独の path・user が無い path は従来どおり `Unimplemented`
+- 実装済み（H7・#2872）: `paths_of` は user＋ipc の組に net を足す形だけを受け、`pin` は net の所有 userns を照合する（呼び出し側自身または外側の所有は `Unimplemented`〔`pod_join_net_not_pod_owned`〕、別の userns 所有は `PermissionDenied`〔`pod_join_net_owner_mismatch`〕）。`EffectiveNetwork::PodJoined` を足し、exec 直前の netns 素性の同期点（D8）にも通す（pin 時に固定した netns の素性との一致を期待する。`FromConfig` の CRI の経路のうち join する起動だけ）。受理と拒否は層 `pod_namespace_join` の監査に残す（SEC-4）
 - 現行の注記（netns を userns より先に `setns` する順序）は、userns が所有する netns では問題にならない。user の後に net へ入れる
 - rootful の init userns 所有の netns（bridge・veth の `NetsetupPodNetwork`）は、#2241 の判断まで `Unimplemented` のまま
 - cri: `PodNamespacePaths` に net（同じ pid の `/proc/<pid>/ns/net`）を足す。構築口は `for_holder_pid` のまま。`namespace_options.network` が `POD` で保持役があれば bundle の network に保持役の path を出す

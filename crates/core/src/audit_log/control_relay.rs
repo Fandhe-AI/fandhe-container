@@ -23,7 +23,8 @@
 //!   出す bind・sysfs の拒否。パスは生バイトで運ぶ）・閉じた表（`MOUNT_REASONS`）の理由つきの `Mount`（#2623。start の
 //!   作業スレッドが出す rootfs の固定の検証後の差し替えの 2 理由）・[`AuditEvent::PastaVerify`]（#3330。
 //!   supervisor の `start` が構築済みの中継経由で期限つきに配送する pasta バイナリの再検証の拒否。理由は閉じた表
-//!   `PASTA_VERIFY_REJECTIONS` の 2 理由）の記録だけ（他の層と、表に無い理由の `Mount`・`PastaVerify` は
+//!   `PASTA_VERIFY_REJECTIONS` の 2 理由）・[`AuditEvent::PodNamespaceJoin`]（#2872。start の作業スレッドが出す
+//!   pod の namespace join の受理と拒否。結果は閉じた表 `PodNamespaceJoinOutcome::ALL` で、パスは持たない）の記録だけ（他の層と、表に無い理由の `Mount`・`PastaVerify` は
 //!   `InvalidArgument`。理由トークンは静的文字列の開いた語彙で、復号側が閉じた表へ戻せるものだけを運ぶ。それ以外の
 //!   理由つきの記録は単一スレッドの launch が `FileAuditSink` へ直接出す）。時刻・PID・
 //!   コンテナ ID・理由トークン（seccomp は種別トークンと syscall 番号・arch）を固定の枠で送り、helper が [`AuditRecord`] を
@@ -129,6 +130,12 @@ const PASTA_VERIFY_REJECTIONS: [super::PastaVerifyRejection; 2] = [
     super::PastaVerifyRejection::PermissionDenied,
 ];
 
+/// pod の namespace join の結果（`AuditEvent::PodNamespaceJoin`。SEC-4・SEC-5・CORE-3・NET-3・#2872）の記録を示す先頭バイト。
+/// コンテナ ID の後に結果の添字（`PodNamespaceJoinOutcome::ALL` の位置 1）が付く。start の作業スレッドが出す。
+const TAG_POD_NAMESPACE_JOIN: u8 = 0x87;
+/// pod_namespace_join の枠だけが持つ追加部の長さ（結果の添字 1）。
+const POD_NAMESPACE_JOIN_EXTRA_LEN: usize = 1;
+
 /// 先頭バイトから、コンテナ ID の後ろに続く追加部の長さを返す（`serve` の読み取り量を 1 か所で決める）。
 const fn extra_len(tag: u8) -> usize {
     match tag {
@@ -138,6 +145,7 @@ const fn extra_len(tag: u8) -> usize {
         TAG_PLUGIN_PEER => PLUGIN_PEER_EXTRA_LEN,
         TAG_MOUNT_REASON => MOUNT_REASON_EXTRA_LEN,
         TAG_PASTA_VERIFY => PASTA_VERIFY_EXTRA_LEN,
+        TAG_POD_NAMESPACE_JOIN => POD_NAMESPACE_JOIN_EXTRA_LEN,
         _ => 0,
     }
 }
@@ -194,6 +202,22 @@ fn encode(record: &AuditRecord) -> Result<Vec<u8>, TraitError> {
             };
             let mut frame = Vec::with_capacity(FIXED_LEN + 1 + PASTA_VERIFY_EXTRA_LEN);
             push_head(&mut frame, TAG_PASTA_VERIFY, record)?;
+            frame.push(index);
+            return Ok(frame);
+        }
+        AuditEvent::PodNamespaceJoin { reason } => {
+            let Some(index) = super::PodNamespaceJoinOutcome::ALL
+                .iter()
+                .position(|r| r.as_str() == reason.as_str())
+                .and_then(|i| u8::try_from(i).ok())
+            else {
+                return Err(err(
+                    ErrorCode::InvalidArgument,
+                    "the audit relay does not know this pod namespace join outcome",
+                ));
+            };
+            let mut frame = Vec::with_capacity(FIXED_LEN + 1 + POD_NAMESPACE_JOIN_EXTRA_LEN);
+            push_head(&mut frame, TAG_POD_NAMESPACE_JOIN, record)?;
             frame.push(index);
             return Ok(frame);
         }
@@ -468,6 +492,13 @@ fn decode(frame: &[u8]) -> Option<AuditRecord> {
         let (id, extra) = rest.split_at(id_len);
         let rejection = PASTA_VERIFY_REJECTIONS.get(usize::from(*extra.first()?))?;
         (id, rejection.audit_event())
+    } else if tag == TAG_POD_NAMESPACE_JOIN {
+        if rest.len() != id_len.checked_add(POD_NAMESPACE_JOIN_EXTRA_LEN)? {
+            return None;
+        }
+        let (id, extra) = rest.split_at(id_len);
+        let outcome = super::PodNamespaceJoinOutcome::ALL.get(usize::from(*extra.first()?))?;
+        (id, outcome.audit_event())
     } else if tag == TAG_SECCOMP {
         // 長さは厳密に一致させる（余りも不足も壊れた枠）。
         if rest.len() != id_len.checked_add(SECCOMP_EXTRA_LEN)? {
@@ -1265,6 +1296,51 @@ mod tests {
             Some(id) => r.with_container_id(ContainerId::new(id).unwrap()),
             None => r,
         }
+    }
+
+    /// SEC-4・SEC-5・NET-3・#2872: pod_namespace_join の枠は 11 結果すべてで理由・コンテナ ID・PID・時刻が往復で一致し、
+    /// 壊れた枠(不足・余り・表外の添字)は記録にならず、表に無い理由は符号化を拒否する。
+    #[test]
+    fn sec4_2872_pod_namespace_join_frame_round_trips() {
+        for outcome in super::super::PodNamespaceJoinOutcome::ALL {
+            let rec = AuditRecord::new(
+                AuditTimestamp::from_unix_duration(Duration::new(1_700_000_000, 7)),
+                AuditPid::new(77).unwrap(),
+                outcome.audit_event(),
+            )
+            .with_container_id(ContainerId::new("pod-a").unwrap());
+            let frame = encode(&rec).unwrap();
+            assert_eq!(frame[0], TAG_POD_NAMESPACE_JOIN);
+            assert_eq!(frame.len(), FIXED_LEN + 5 + POD_NAMESPACE_JOIN_EXTRA_LEN);
+            assert_eq!(extra_len(frame[0]), POD_NAMESPACE_JOIN_EXTRA_LEN);
+            let back = decode(&frame).unwrap();
+            assert_eq!(
+                back.reason().map(super::super::AuditReason::as_str),
+                Some(outcome.as_str())
+            );
+            assert_eq!(back.pid(), rec.pid());
+            assert_eq!(back.timestamp(), rec.timestamp());
+            assert_eq!(back.container_id(), rec.container_id());
+            assert!(decode(&frame[..frame.len() - 1]).is_none());
+            let mut longer = frame.clone();
+            longer.push(0);
+            assert!(decode(&longer).is_none());
+            let mut bad = frame.clone();
+            *bad.last_mut().unwrap() =
+                u8::try_from(super::super::PodNamespaceJoinOutcome::ALL.len()).unwrap();
+            assert!(decode(&bad).is_none());
+        }
+        let unknown = AuditRecord::new(
+            AuditTimestamp::from_unix_duration(Duration::new(1, 0)),
+            AuditPid::new(1).unwrap(),
+            AuditEvent::PodNamespaceJoin {
+                reason: super::super::AuditReason::new("pod_join_unknown"),
+            },
+        );
+        assert_eq!(
+            encode(&unknown).unwrap_err().code(),
+            ErrorCode::InvalidArgument
+        );
     }
 
     /// SEC-4・NET-9・PLUG-11・#3330: pasta_verify の枠は理由・コンテナ ID・PID・時刻が往復で一致し、

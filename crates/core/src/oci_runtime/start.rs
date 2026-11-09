@@ -73,10 +73,11 @@
 //! - `mounts` のうち bind・`/sys` の sysfs（`SysfsMountSpec`。読み取り専用で供給する。#2020）以外の種類・#1910 の拒否規則に反する bind（`BindMountSet`。検証済みの bind は
 //!   launcher が pivot 前に適用する。#1915。状態ルートとの重なりは字句・`canonicalize`・mountinfo の実体照合で検査する。`ro` の bind は root が書き込み可能でも受ける〔#1917。Landlock のルール生成へ検証済みの集合を渡す〕）
 //! - `linux.namespaces[].path` の指定のうち、`user` と `ipc` を組で指す以外（pod の user・ipc namespace への join だけを
-//!   受ける。`NamespaceJoin` が fork の前に fd へ固定して所有者・種別・親子を検証する。pid・mount・uts 等の path と
-//!   片方だけの path は未実装。CRI-2・CORE-3。#2674）
+//!   受け、組に足す形で `network` の path も受ける。`NamespaceJoin` が fork の前に fd へ固定して所有者・種別・親子を検証し、
+//!   受理と拒否を監査に残す。pid・mount・uts 等の path、片方だけの path、network 単独の path は未実装。CRI-2・CORE-3・NET-3。
+//!   #2674・#2872）
 //! - `cgroup`・`time` namespace（exec の対応は PID/Mount/UTS/IPC/User のみ）。`network` は起動オプションの network モードとの
-//!   突き合わせ（`network_mode.rs` の D7 の表。NET-6・SEC-1・#3058）で、既定の `FromConfig` ではエントリありを `Unimplemented`
+//!   突き合わせ（`network_mode.rs` の D7 の表。NET-6・SEC-1・#3058）で、既定の `FromConfig` ではエントリありを `Unimplemented`(pod の user・ipc の path の組に足した network の path は `PodJoined`。#2872)
 //! - `linux.namespaces` に user namespace が無い（`process.user` がホストの uid として働いてしまう。
 //!   `PermissionDenied`。SEC-5）
 //! - `linux.namespaces` に IPC namespace が無い（ホストの IPC を共有する起動を防ぐ。共有の明示許可は
@@ -886,7 +887,12 @@ fn build_spec_with_swap(
     }
     // 起動オプションの network モードと config の突き合わせ(D7)は予約・fork より前に終える(NET-6・SEC-1・#3058)。
     let network_mode = launcher.network_mode();
-    let network = reconcile_network(&config, network_mode)?;
+    // path の形(pod の user・ipc の組と任意の net)は I/O なしの純粋関数で先に決め、network の突き合わせへ渡す(#2872)。
+    // 形の誤りは突き合わせの拒否(従来の `InvalidArgument` / `Unimplemented`)より後に返し、既存の判定順を変えない。
+    let join_paths = NamespaceJoin::paths_of(&config);
+    let pod_net_join = matches!(&join_paths, Ok(Some(p)) if p.net.is_some());
+    let network = reconcile_network(&config, network_mode, pod_net_join)?;
+    let join_paths = join_paths?;
     reject_unsupported_linux(&config)?;
     reject_net_sysctls_without_network_namespace(&config, network)?;
     reject_protected_paths_over_implicit_dev(&config)?;
@@ -947,7 +953,7 @@ fn build_spec_with_swap(
     let rootfs_dir = pin_rootfs_audited(bundle, &rootfs, id, launcher)?;
     // pod の user・ipc namespace への join（`linux.namespaces[].path`）。path を 1 回だけ開いて fd へ固定し、
     // 所有者・種別・親子関係を fork の前に検証する（失敗してもプロセスのいない Running を残さない。#2674）。
-    let namespace_join = pin_namespace_join_audited(&config, id, launcher)?;
+    let namespace_join = pin_namespace_join_audited(join_paths, id, launcher)?;
     Ok(LaunchSpec::new(
         rootfs,
         rootfs_dir,
@@ -970,34 +976,38 @@ fn build_spec_with_swap(
     .with_terminal(terminal))
 }
 
-/// pod の namespace join を固定し、検証による拒否（自身の user namespace・親子関係違反・所有者の不一致・
-/// パスの形の不正。`PermissionDenied` / `InvalidArgument`）なら launcher の拒否の記録先へ記録する
-/// （SEC-4・SEC-1・CORE-3・#2674）。
+/// pod の namespace join を固定し、素性検査の結果（受理と拒否）を launcher の拒否の記録先へ記録する
+/// （SEC-4・SEC-1・SEC-5・CORE-3・NET-3・#2674・#2872）。
 ///
-/// 記録は層 `mount`・理由なし（中継が運ぶ閉じた理由表に join 用の語彙がまだ無いため。REPAIR-3）で、参加先の
-/// user namespace のパスとコンテナ ID を載せる。記録の成否で拒否は覆さない。I/O の失敗（`Internal` 等）と
-/// 非 Linux の `Unimplemented` は検証による拒否ではないため記録しない。
+/// 記録は層 `pod_namespace_join`・閉じた語彙の結果（[`PodNamespaceJoinOutcome`](crate::audit_log::PodNamespaceJoinOutcome)）で、
+/// パス・pid・inode は載せない（型で持たない）。受理は素性検査の受理（fork の前）に 1 件で、後段の launch の失敗は別の記録。
+/// 記録の成否で判定は覆さない。開けない path（`FailedPrecondition`）・I/O の失敗（`Internal`）・非 Linux の
+/// `Unimplemented`・path の形の拒否（`paths_of`）は素性検査の結果ではないため記録しない。
 fn pin_namespace_join_audited(
-    config: &OciConfig,
+    paths: Option<super::namespace_join::JoinPaths<'_>>,
     id: &ContainerId,
     launcher: &dyn ProcessLauncher,
 ) -> Result<Option<NamespaceJoin>, TraitError> {
-    let Some((user, ipc)) = NamespaceJoin::paths_of(config)? else {
+    let Some(paths) = paths else {
         return Ok(None);
     };
-    NamespaceJoin::pin(user, ipc).map(Some).inspect_err(|err| {
-        if matches!(
-            err.code(),
-            ErrorCode::PermissionDenied | ErrorCode::InvalidArgument
-        ) && let Some(sink) = launcher.rejection_audit_sink()
-        {
-            let event = crate::audit_log::AuditEvent::Mount {
-                path: Some(crate::audit_log::AuditPath::new(user)),
-                reason: None,
-            };
-            let _ = crate::audit_log::mount::deliver(event, Some(id), sink);
+    let record = |outcome: crate::audit_log::PodNamespaceJoinOutcome| {
+        if let Some(sink) = launcher.rejection_audit_sink() {
+            let _ = crate::audit_log::mount::deliver(outcome.audit_event(), Some(id), sink);
         }
-    })
+    };
+    match NamespaceJoin::pin(paths) {
+        Ok((join, outcome)) => {
+            record(outcome);
+            Ok(Some(join))
+        }
+        Err(rejection) => {
+            if let Some(outcome) = rejection.outcome {
+                record(outcome);
+            }
+            Err(rejection.error)
+        }
+    }
 }
 
 /// rootfs を固定し、検証後の差し替えによる違反（`RootfsPinError::violation`）なら launcher の拒否の記録先
@@ -1377,7 +1387,7 @@ fn reject_unsupported_linux(config: &OciConfig) -> Result<(), TraitError> {
 ///
 /// 実効の network が `HostShared`（ホストの netns を共有）なら `net.*` を拒否する。`NewLoopback`（新しい netns。
 /// 実体は #3064 で実装済み）なら通す。`FromConfig` で network エントリがある構成は `reconcile_network` が先に `Unimplemented`
-/// で拒否する（pod の netns の結線は #2675）。起動オプションの network モードとの突き合わせは NET-6・#3058。
+/// で拒否し、pod の netns へ join する構成（`PodJoined`。#2872）は pod の netns に書く（通す）。起動オプションの network モードとの突き合わせは NET-6・#3058。
 /// IPC 系は IPC namespace の必須検査（本関数の呼び出し側）と、launcher の実効の名前空間との照合
 /// （`--ipc=host` との組み合わせの拒否）が担う。
 fn reject_net_sysctls_without_network_namespace(
@@ -2239,8 +2249,9 @@ mod tests {
         assert_eq!(err.code(), ErrorCode::FailedPrecondition);
     }
 
-    /// SEC-4・CORE-3（#2674）: pod の namespace join の検証による拒否は、launcher の拒否の記録先へ mount 層で
-    /// コンテナ ID つき 1 件記録される。開けない path（`FailedPrecondition`）は検証による拒否ではなく記録しない。
+    /// SEC-4・CORE-3（#2674・#2872）: pod の namespace join の検証による拒否は、launcher の拒否の記録先へ
+    /// `pod_namespace_join` 層・閉じた語彙の結果（`pod_join_user_is_own`）・コンテナ ID つき 1 件記録され、パスは載らない。
+    /// 開けない path（`FailedPrecondition`）は検証による拒否ではなく記録しない。
     #[cfg(target_os = "linux")]
     #[test]
     fn sec4_start_records_pod_join_rejection_to_launcher_audit_sink() {
@@ -2260,9 +2271,81 @@ mod tests {
         assert_eq!(launcher.calls(), 0);
         let recs = sink.snapshot();
         assert_eq!(recs.len(), 1);
+        assert_eq!(
+            recs[0].layer(),
+            crate::audit_log::AuditLayer::PodNamespaceJoin
+        );
+        assert_eq!(
+            recs[0].reason().map(crate::audit_log::AuditReason::as_str),
+            Some("pod_join_user_is_own")
+        );
+        assert_eq!(recs[0].path(), None);
+        assert_eq!(
+            recs[0].container_id().map(ContainerId::as_str),
+            Some("rej-join-audit")
+        );
         let line = format!("{:?}", recs[0]);
-        assert!(line.contains("rej-join-audit"), "{line}");
-        assert!(line.contains("/proc/self/ns/user"), "{line}");
+        assert!(!line.contains("/proc/self/ns"), "{line}");
+        // 開けない path は検証による拒否ではなく、記録先に増えない。
+        let mut gone = valid_config();
+        gone["linux"]["namespaces"] = json!([
+            {"type": "pid"}, {"type": "mount"}, {"type": "uts"},
+            {"type": "ipc", "path": "/proc/2147483647/ns/ipc"},
+            {"type": "user", "path": "/proc/2147483647/ns/user"}
+        ]);
+        let (b2, store2) = created("rej-join-gone");
+        b2.write_config(&gone);
+        let err = run(&store2, &launcher, "rej-join-gone").expect_err("must fail");
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(sink.snapshot().len(), 1);
+    }
+
+    /// NET-3・SEC-1・SEC-4（#2872）: network の path 単独、user と net だけ（ipc なし）の path は fork の前に
+    /// `Unimplemented`（ipc と組でない pod の path）。network のエントリが無いのに user・ipc の path だけの config は従来どおり。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn net3_2872_start_rejects_net_path_without_the_user_ipc_pair() {
+        let base = |extra: Vec<Value>| {
+            let mut v = vec![
+                json!({"type": "pid"}),
+                json!({"type": "mount"}),
+                json!({"type": "uts"}),
+            ];
+            v.extend(extra);
+            let mut cfg = valid_config();
+            cfg["linux"]["namespaces"] = Value::Array(v);
+            cfg
+        };
+        let cases = [
+            (
+                "net-only",
+                base(vec![
+                    json!({"type": "ipc"}),
+                    json!({"type": "user"}),
+                    json!({"type": "network", "path": "/proc/self/ns/net"}),
+                ]),
+            ),
+            (
+                "user-net",
+                base(vec![
+                    json!({"type": "ipc"}),
+                    json!({"type": "user", "path": "/proc/self/ns/user"}),
+                    json!({"type": "network", "path": "/proc/self/ns/net"}),
+                ]),
+            ),
+        ];
+        for (name, cfg) in cases {
+            let err = start_rejected_after_rewrite(name, &cfg);
+            assert_eq!(err.code(), ErrorCode::Unimplemented, "{name}");
+        }
+        // pod の組があり net の所有が呼び出し側(user が自身)なら、素性検査で拒否される(user の自身検査が先)。
+        let triple = base(vec![
+            json!({"type": "ipc", "path": "/proc/self/ns/ipc"}),
+            json!({"type": "user", "path": "/proc/self/ns/user"}),
+            json!({"type": "network", "path": "/proc/self/ns/net"}),
+        ]);
+        let err = start_rejected_after_rewrite("triple-own", &triple);
+        assert_eq!(err.code(), ErrorCode::PermissionDenied);
     }
 
     /// SEC-1・SEC-5・CORE-5: start が適用できない指定は黙って無視せず Unimplemented で拒否する。

@@ -25,13 +25,15 @@
 //! - route の無いデバイスは `QueueNotify` を数えて [`MmioHandler::last_queue_notify`] に残すだけで、キューは処理せず続行する。
 //!   virtio-block（#4028）と virtio-net（#4029）は [`MmioHandler::with_queue_notify_routes`] で結んだ route が処理する
 //!   （失敗は VM を止める）。net のホスト側の到着を契機にした受信は #4030。
+//! - MMIO の値の観測口（#4289）は [`MmioHandler::with_observer`] で結ぶ opt-in で、`VcpuExitObserver::on_value` へ dispatch の前に渡す
+//!   （vCPU 番号は渡らない。route・dispatch の結果には影響しない）。
 //! - ゲストが big-endian（`SCTLR_EL1.EE` / `E0E`）の場合は扱わない（little-endian 固定）。
 
 use crate::dispatch::{DeviceId, DispatchOutcome, ExitDispatcher, MmioAccess};
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::esr::{AccessDirection, DataAbort};
 use crate::hvf_abi::{HvReg, HvVcpuExitException};
-use crate::hvf_loop::{ExitAction, log_line};
+use crate::hvf_loop::{ExitAction, VcpuExitObserver, log_line, observe_exit_value};
 use crate::interrupt::{InterruptAckRoute, InterruptAckTally, QueueNotifyRoute};
 use crate::mmio_abort;
 use crate::stop::StopReason;
@@ -53,6 +55,8 @@ pub struct MmioHandler {
     ack_tallies: Vec<(DeviceId, Arc<InterruptAckTally>)>,
     /// `QueueNotify` の virtqueue 処理（#4028）。route の無いデバイスは計数だけで続行する（block・net は #4028・#4029 で route を結ぶ）。
     queue_routes: Vec<(DeviceId, Arc<dyn QueueNotifyRoute>)>,
+    /// MMIO の値の観測口（opt-in。`wants_values` が真の観測器にだけ値を渡す。#4289・MVM-5・MVM-1）。
+    observer: Option<Arc<dyn VcpuExitObserver>>,
 }
 
 impl MmioHandler {
@@ -94,6 +98,13 @@ impl MmioHandler {
         routes: Vec<(DeviceId, Arc<dyn QueueNotifyRoute>)>,
     ) -> Self {
         self.queue_routes = routes;
+        self
+    }
+
+    /// MMIO の値の観測器を結ぶ（#4289・MVM-5・MVM-1）。`vcpu` の `VcpuThreadConfig::observer` と同じ実体を渡す。
+    /// 観測器が `wants_values` を返したときだけ、dispatch の前に MMIO の書き込み値・読み出しの別が渡る（結果は dispatch に影響しない）。
+    pub fn with_observer(mut self, observer: Option<Arc<dyn VcpuExitObserver>>) -> Self {
+        self.observer = observer;
         self
     }
 
@@ -152,6 +163,9 @@ fn dispatch_and_route(
     handler: &mut MmioHandler,
     exit: &crate::exit::VcpuExit,
 ) -> Result<(DispatchOutcome, Option<ExitAction>), MicrovmError> {
+    // 値の観測は dispatcher の lock を取る前に行う（lock の順序〔dispatcher → transport → memory〕に触れない。#4289）。
+    // dispatch の結果（未登録・route の失敗）に関係なく届く。
+    observe_exit_value(handler.observer.as_deref(), exit);
     // dispatcher の lock はこの式の終わりで解放する（ACK の後処理でトランスポートの lock を取るため、同時保持しない）。
     let outcome = handler
         .dispatcher
@@ -548,5 +562,65 @@ mod tests {
         ));
         assert_eq!(h.queue_notify_count(), 0);
         assert_eq!(route.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// 値を数える偽観測器（#4289）。
+    #[derive(Debug, Default)]
+    struct CountingObserver {
+        want: bool,
+        seen: Mutex<Vec<(u64, bool)>>,
+    }
+
+    impl VcpuExitObserver for CountingObserver {
+        fn on_exit(&self, _kind: crate::hvf_loop::ExitKind) {}
+        fn wants_values(&self) -> bool {
+            self.want
+        }
+        fn on_value(&self, value: &crate::exit::ExitValue) {
+            if let crate::exit::ExitValue::Mmio {
+                phys_addr,
+                is_write,
+                ..
+            } = value
+            {
+                self.seen.lock().unwrap().push((*phys_addr, *is_write));
+            }
+        }
+    }
+
+    /// MVM-5・MVM-1・#4289: 観測器は dispatch の前に MMIO の値を 1 回受ける。未登録アドレスでも届き（dispatch の結果に依らない）、
+    /// `wants_values` が偽なら受けない。`hv_*` は呼ばない。
+    #[test]
+    fn mvm5_4289_dispatch_and_route_reports_value_before_dispatch() {
+        use crate::virtio_mmio::reg;
+        const BASE: u64 = 0x0a00_0000;
+        let block = VirtioMmioTransport::new(VirtioBlock::new(
+            MemoryBlockBackend::new(16 * 512, false).unwrap(),
+        ))
+        .unwrap();
+        let mut dispatcher = ExitDispatcher::new();
+        dispatcher
+            .register_mmio(BASE, 0x200, Box::new(block))
+            .unwrap();
+        let obs = Arc::new(CountingObserver {
+            want: true,
+            ..Default::default()
+        });
+        let mut h = MmioHandler::with_dispatcher(dispatcher).with_observer(Some(obs.clone()));
+        dispatch_and_route(&mut h, &mmio(BASE + reg::STATUS, 0x0B, true)).unwrap();
+        assert_eq!(*obs.seen.lock().unwrap(), vec![(BASE + reg::STATUS, true)]);
+        // 未登録アドレスの書き込みでも値は届く。
+        dispatch_and_route(&mut h, &mmio(0x0b00_0000, 1, true)).unwrap();
+        assert_eq!(obs.seen.lock().unwrap().len(), 2);
+        assert_eq!(obs.seen.lock().unwrap()[1], (0x0b00_0000, true));
+        // 読み出しも届く（data は空。書き込みとの区別は `is_write`）。
+        dispatch_and_route(&mut h, &mmio(BASE, 0, false)).unwrap();
+        assert_eq!(obs.seen.lock().unwrap()[2], (BASE, false));
+
+        // wants_values が偽の観測器には届かない。
+        let quiet = Arc::new(CountingObserver::default());
+        let mut h = MmioHandler::new().with_observer(Some(quiet.clone()));
+        dispatch_and_route(&mut h, &mmio(BASE + reg::STATUS, 0x0B, true)).unwrap();
+        assert!(quiet.seen.lock().unwrap().is_empty());
     }
 }

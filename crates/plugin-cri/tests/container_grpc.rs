@@ -996,6 +996,33 @@ async fn container_lifecycle_crosses_the_uds_grpc_boundary() {
     .expect("watchdog");
 }
 
+/// 回収を実行し、plugin が死んでいた（終了済み・到達不能）なら同じ状態ルートで起動し直して回収し直す（#4285）。
+/// 旧 plugin が生きたまま到達不能だと `.cri/@instance.lock` を握り続けるため、新 plugin の起動前に旧 guard を drop
+/// （kill と回収）して lock を解放してから spawn する。両試行の後始末で共通に使う。
+async fn reclaim_restarting_dead_plugin(
+    mut guard: ChildGuard,
+    mut c: RuntimeServiceClient<Channel>,
+    ledger: &reclaim::Ledger,
+    token: &str,
+    plugin_bin: &Path,
+    new_sock: &Path,
+    config: GrpcClientConfig,
+) -> (
+    ChildGuard,
+    RuntimeServiceClient<Channel>,
+    reclaim::ReclaimReport,
+) {
+    let mut rep = reclaim::reclaim(&mut c, ledger, token, reclaim::CLEANUP_BUDGET).await;
+    if guard.exited().is_some() || reclaim::plugin_unreachable(&rep) {
+        drop(guard);
+        guard = spawn_server_inherit_env(plugin_bin, new_sock);
+        let ch = connect_when_ready_with(new_sock, Some(&mut guard), config).await;
+        c = RuntimeServiceClient::new(ch);
+        rep = reclaim::reclaim(&mut c, ledger, token, reclaim::CLEANUP_BUDGET).await;
+    }
+    (guard, c, rep)
+}
+
 /// 環境を引き継いで `bin` の本番バイナリを spawn する（段 C 用。`XDG_RUNTIME_DIR`・`DBUS_SESSION_BUS_ADDRESS` 等を
 /// systemd --user の委譲 scope・user manager の private ソケットへ届けるため `env_clear` しない）。
 fn spawn_server_inherit_env(bin: &Path, sock: &Path) -> ChildGuard {
@@ -1188,6 +1215,7 @@ async fn production_binary_full_lifecycle_real() {
         let dir = TempDir::new("sock-real");
         let sock = dir.0.join("s.sock");
         let sock2 = dir.0.join("s2.sock");
+        let sock3 = dir.0.join("s3.sock");
         let (bin_dir, plugin_bin) = production_bin_dir("bin-real");
         let _keep_bin_dir = &bin_dir;
         let mut guard = spawn_server_inherit_env(&plugin_bin, &sock);
@@ -1237,7 +1265,7 @@ async fn production_binary_full_lifecycle_real() {
         let ledger = reclaim::Ledger::default();
 
         // 試行 1（注入）: Start と Running の確認の直後に落とし、回収が効くことを確かめる。
-        let b1 = reclaim::scenario_budget(started.elapsed(), FULL_WATCHDOG, 2)
+        let b1 = reclaim::scenario_budget(started.elapsed(), FULL_WATCHDOG, 4)
             .min(reclaim::INJECT_ATTEMPT_LIMIT);
         let r1 = reclaim::guarded(
             full_lifecycle_scenario(
@@ -1250,17 +1278,18 @@ async fn production_binary_full_lifecycle_real() {
             b1,
         )
         .await;
-        let mut rep1 = reclaim::reclaim(&mut c, &ledger, &token, reclaim::CLEANUP_BUDGET).await;
-        if guard.exited().is_some() || reclaim::plugin_unreachable(&rep1) {
-            // plugin が死んでいたら、同じ状態ルートで起動し直してから回収し直す（再採用された記録を消す。#4285）。
-            // 旧 plugin が生きたまま到達不能だと `.cri/@instance.lock` を握り続けるため、新 plugin の起動前に
-            // 旧 guard を drop（kill と回収）して lock を解放する。
-            drop(guard);
-            guard = spawn_server_inherit_env(&plugin_bin, &sock2);
-            let ch2 = connect_when_ready_with(&sock2, Some(&mut guard), new_config()).await;
-            c = RuntimeServiceClient::new(ch2);
-            rep1 = reclaim::reclaim(&mut c, &ledger, &token, reclaim::CLEANUP_BUDGET).await;
-        }
+        let (g1, c1, rep1) = reclaim_restarting_dead_plugin(
+            guard,
+            c,
+            &ledger,
+            &token,
+            &plugin_bin,
+            &sock2,
+            new_config(),
+        )
+        .await;
+        guard = g1;
+        c = c1;
         if let Some(line) = reclaim::left_line(FULL_TEST, &rep1) {
             eprintln!("{line}");
         }
@@ -1284,7 +1313,8 @@ async fn production_binary_full_lifecycle_real() {
         eprintln!("{FULL_TEST}: injected failure reclaimed containers=1 sandboxes=1");
 
         // 試行 2（本番）: 同じトークン（同じ metadata）で最後まで通す。
-        let b2 = reclaim::scenario_budget(started.elapsed(), FULL_WATCHDOG, 1);
+        // 回収の失敗で再起動する分（回収 2 回）を予算に確保する。
+        let b2 = reclaim::scenario_budget(started.elapsed(), FULL_WATCHDOG, 2);
         let r2 = reclaim::guarded(
             full_lifecycle_scenario(
                 c.clone(),
@@ -1296,7 +1326,18 @@ async fn production_binary_full_lifecycle_real() {
             b2,
         )
         .await;
-        let rep2 = reclaim::reclaim(&mut c, &ledger, &token, reclaim::CLEANUP_BUDGET).await;
+        let (g2, c2, rep2) = reclaim_restarting_dead_plugin(
+            guard,
+            c,
+            &ledger,
+            &token,
+            &plugin_bin,
+            &sock3,
+            new_config(),
+        )
+        .await;
+        guard = g2;
+        c = c2;
         if let Some(line) = reclaim::left_line(FULL_TEST, &rep2) {
             eprintln!("{line}");
         }

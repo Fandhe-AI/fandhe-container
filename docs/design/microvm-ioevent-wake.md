@@ -114,7 +114,7 @@ vCPU あたりの起床は約 10 分の 1 になる。RSS は動かないため 
 
 ### 背景
 
-#4229 の後も `VcpuFd::run_bounded` は `KVM_RUN` のたびに `thread::scope` の中で `kvm-run-deadline` を生成し、終わるたびに join していた
+Issue #4229 の後も `VcpuFd::run_bounded` は `KVM_RUN` のたびに `thread::scope` の中で `kvm-run-deadline` を生成し、終わるたびに join していた
 （clone とスタック確保・解放が `run_once` の回数だけ起きる。アイドルでは期限切れごと、実行中は exit ごと）。
 
 ### 判断: vCPU ごとに常駐 1 本にする
@@ -159,5 +159,5 @@ vCPU あたりの起床は約 10 分の 1 になる。RSS は動かないため 
 
 ### 再評価条件・残余
 
-- D 状態で KILL が効かない vCPU は、ack 待ちが `RUN_WATCHDOG_ACK_WAIT` で切れて `Internal` になる（期限なしでは続けない）。
+- ack の期限（`RUN_WATCHDOG_ACK_WAIT`）は `run()`（本番では `sys::kvm_run`）が戻った後の、監視スレッドの解除待ちにだけ適用される（`run_watched` は `run()` の復帰後に期限を設定する）。D 状態などで `KVM_RUN` から戻らない vCPU は ack 待ちに到達せず、1 秒で `Internal` にはならない。その場合は既存の停止・drop 側の期限と残余リスクに従う（本件の保護範囲外。REPAIR-5 の保護範囲を誤認しないこと）。
 - aarch64 の実機（#3781・人間担当）は未検証。HVF（macOS）は別の停止経路のため対象外。

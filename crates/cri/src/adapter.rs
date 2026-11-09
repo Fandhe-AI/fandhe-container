@@ -384,11 +384,13 @@ fn canonical_pod_ip(ip: IpAddr) -> Result<IpAddr, CriError> {
     let ip = ip.to_canonical();
     let bad = match ip {
         IpAddr::V4(v4) => {
+            // 添字アクセスを避け、分配束縛で先頭オクテットを取り出す。
+            let [first, ..] = v4.octets();
             v4.is_unspecified()
                 || v4.is_loopback()
-                || v4.octets()[0] == 0
+                || first == 0
                 || v4.is_multicast()
-                || v4.octets()[0] >= 240
+                || first >= 240
         }
         IpAddr::V6(v6) => v6.is_unspecified() || v6.is_loopback() || v6.is_multicast(),
     };

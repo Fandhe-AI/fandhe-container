@@ -210,6 +210,45 @@ async fn cri6_bind_rejects_external_without_opt_in() {
     assert_eq!(err.code(), CriErrorCode::InvalidArgument);
 }
 
+/// CRI-6・SEC-1・#4290: broadcast・IPv4 互換形の広告アドレスは起動を拒否し、
+/// 射影形の広告アドレスは URL の host を IPv4 表記・ポートを実ポートで発行する。
+#[cfg(unix)]
+#[tokio::test]
+async fn cri6_sec1_4290_advertise_addr_rejects_and_canonicalizes() {
+    let external = || {
+        StreamingConfig::default()
+            .with_bind("0.0.0.0:0".parse().expect("addr"))
+            .with_allow_external(true)
+    };
+    for adv in ["255.255.255.255", "::ffff:255.255.255.255", "::192.0.2.7"] {
+        let err = StreamingServer::bind_with_handler(
+            external().with_advertise_addr(adv.parse().expect("ip")),
+            all_wired(),
+        )
+        .await
+        .expect_err(adv);
+        assert_eq!(err.code(), CriErrorCode::InvalidArgument, "{adv}");
+    }
+
+    let server = StreamingServer::bind_with_handler(
+        external().with_advertise_addr("::ffff:192.0.2.7".parse().expect("ip")),
+        all_wired(),
+    )
+    .await
+    .expect("bind");
+    let port = server.local_addr().port();
+    let url = server
+        .issuer()
+        .issue(fandhe_container_cri::streaming::StreamRequest::exec(
+            exec_request("c1"),
+        ))
+        .expect("issue");
+    assert!(
+        url.starts_with(&format!("http://192.0.2.7:{port}/exec/")),
+        "{url}"
+    );
+}
+
 /// CRI-6: 有効なトークンはハンドラへ届き（200）、2 回目は 404。
 #[cfg(unix)]
 #[tokio::test]

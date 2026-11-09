@@ -1120,6 +1120,10 @@ fn build_agent(
 
 /// 公開アドレス以外（ループバック・プライベート・リンクローカル・CGNAT・予約・マルチキャスト等）なら false。
 /// IPv4 を埋め込む IPv6（v4-mapped・NAT64・6to4・v4-compatible）は埋め込まれた IPv4 を検査する。
+///
+/// `IpAddr::to_canonical()` へは置き換えない。`to_canonical` が戻すのは v4-mapped だけで、
+/// 互換形・NAT64・6to4 の判定が後退するため。`::` と `::1` は先に v6 として拒否するので互換形の
+/// 分岐と衝突しない（#4290・SEC-1）。
 fn is_public_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_public_v4(v4),
@@ -2454,6 +2458,28 @@ mod tests {
         assert_eq!(e.code(), OciErrorCode::PermissionDenied);
     }
 
+    /// IPv4 射影形の IPv6 が IPv4 と同じ分類になること（具体値。SEC-1・#4290）。
+    #[test]
+    fn sec1_4290_mapped_ipv4_follows_ipv4_classification() {
+        for (v4, want) in [
+            ("0.0.0.0", false),
+            ("127.0.0.1", false),
+            ("10.0.0.1", false),
+            ("172.16.0.1", false),
+            ("192.168.1.1", false),
+            ("169.254.169.254", false),
+            ("100.64.0.1", false),
+            ("224.0.0.1", false),
+            ("255.255.255.255", false),
+            ("8.8.8.8", true),
+        ] {
+            let plain = is_public_ip(v4.parse().expect("ip"));
+            let mapped = is_public_ip(format!("::ffff:{v4}").parse().expect("ip"));
+            assert_eq!(plain, want, "{v4}");
+            assert_eq!(mapped, want, "::ffff:{v4}");
+        }
+    }
+
     /// SEC: 公開 / 非公開アドレスの判定（具体値）。
     #[test]
     fn public_ip_classification() {
@@ -2477,6 +2503,9 @@ mod tests {
             "ff02::1",
             "::ffff:127.0.0.1",
             "::ffff:10.0.0.1",
+            "::ffff:0.0.0.0",
+            "::ffff:169.254.169.254",
+            "::ffff:192.168.1.1",
             "::10.0.0.1",
             "64:ff9b::a00:1",
             "2002:7f00:1::1",

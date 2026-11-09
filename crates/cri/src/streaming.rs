@@ -268,6 +268,7 @@ impl StreamingConfig {
 
     /// 設定を検証する（fail-closed）。外部アドレス（`0.0.0.0`・`::` を含む）は `allow_external` が無ければ拒否する。
     ///
+    /// 広告アドレスは broadcast と IPv4 互換形 `::a.b.c.d`（`::` `::1` を除く）も拒否する（#4290）。
     /// 未指定・マルチキャスト・ワイルドカードの判定は `IpAddr::to_canonical()` で IPv4 射影形
     /// （`::ffff:0.0.0.0` 等）を IPv4 として扱う（到達できない URL の発行と広告アドレス必須の検査の
     /// すり抜けを防ぐ。CRI-6・SEC-1・#4238）。loopback の判定は正規化せず、`::ffff:127.0.0.1` は外部扱い
@@ -282,7 +283,7 @@ impl StreamingConfig {
             ));
         }
         if let Some(adv) = adv_canon
-            && (adv.is_unspecified() || adv.is_multicast())
+            && (adv.is_unspecified() || adv.is_multicast() || is_unroutable_advertise(adv))
         {
             return Err(CriError::invalid_argument(
                 "streaming advertise address must be a concrete unicast address",
@@ -1134,6 +1135,26 @@ impl ConnectionObserver for NoopObserver {
     fn observe(&self, _event: ConnectionEvent) {}
 }
 
+/// 広告アドレスとして到達できない形（正規化後の IPv4 broadcast、IPv4 互換形 `::a.b.c.d`）か。
+/// `::`（未指定）は別の判定で拒否し、`::1`（loopback）は受理のままにする（#4290・CRI-6・SEC-1）。
+fn is_unroutable_advertise(adv: IpAddr) -> bool {
+    match adv {
+        IpAddr::V4(v) => v.is_broadcast(),
+        IpAddr::V6(v) => {
+            // 配列分解で先頭 6 要素を取り出す（添字アクセスを使わない）。
+            let [s0, s1, s2, s3, s4, s5, _, _] = v.segments();
+            [s0, s1, s2, s3, s4, s5] == [0; 6] && !v.is_unspecified() && !v.is_loopback()
+        }
+    }
+}
+
+/// URL に出すソケットアドレス。広告アドレス（無ければ待ち受けの実アドレス）を `to_canonical()` で
+/// IPv4 表記へ寄せ、ポートは実ポートを使う（射影形を括弧つき IPv6 で出さない。#4290）。
+fn advertised_socket_addr(advertise: Option<IpAddr>, local: SocketAddr) -> SocketAddr {
+    let ip = advertise.unwrap_or_else(|| local.ip()).to_canonical();
+    SocketAddr::new(ip, local.port())
+}
+
 /// 発行 URL の基底（`http://host:port`。IPv6 は括弧つき）。ソケットを要さない純関数。
 fn format_base_url(advertised: SocketAddr) -> String {
     format!("http://{advertised}")
@@ -1186,10 +1207,7 @@ impl StreamingServer {
             .local_addr()
             .map_err(|_| CriError::unavailable("failed to read streaming server address"))?;
         let cache = Arc::new(TokenCache::new(config.token_ttl, config.max_in_flight));
-        let advertised = match config.advertise_addr {
-            Some(ip) => SocketAddr::new(ip, local_addr.port()),
-            None => local_addr,
-        };
+        let advertised = advertised_socket_addr(config.advertise_addr, local_addr);
         let issuer = Arc::new(StreamingUrlIssuer {
             base_url: format_base_url(advertised),
             cache: Arc::clone(&cache),
@@ -1829,6 +1847,62 @@ mod tests {
         base.with_advertise_addr("::ffff:192.0.2.7".parse().expect("ip"))
             .validate()
             .expect("mapped concrete ok");
+    }
+
+    /// CRI-6・SEC-1・#4290: broadcast と互換形の広告アドレスは拒否し、陽性対照は受理する。
+    #[test]
+    fn cri6_sec1_4290_broadcast_and_compat_advertise_rejected() {
+        let base = StreamingConfig::default()
+            .with_bind("0.0.0.0:0".parse().expect("addr"))
+            .with_allow_external(true);
+        for adv in ["255.255.255.255", "::ffff:255.255.255.255", "::192.0.2.7"] {
+            let err = base
+                .clone()
+                .with_advertise_addr(adv.parse().expect("ip"))
+                .validate()
+                .expect_err(adv);
+            assert_eq!(err.code(), crate::error::CriErrorCode::InvalidArgument);
+        }
+        for adv in ["::1", "192.0.2.7", "2001:db8::1"] {
+            base.clone()
+                .with_advertise_addr(adv.parse().expect("ip"))
+                .validate()
+                .expect(adv);
+        }
+    }
+
+    /// CRI-6・#4290: URL 用のアドレスは射影形を IPv4 表記へ寄せ、実ポートを使う。
+    #[test]
+    fn cri6_sec1_4290_advertised_socket_addr_canonicalizes() {
+        let local: SocketAddr = "0.0.0.0:4321".parse().expect("addr");
+        let got = advertised_socket_addr(Some("::ffff:192.0.2.7".parse().expect("ip")), local);
+        assert_eq!(got, "192.0.2.7:4321".parse::<SocketAddr>().expect("addr"));
+        assert_eq!(format_base_url(got), "http://192.0.2.7:4321");
+        let local: SocketAddr = "[::ffff:192.0.2.7]:4321".parse().expect("addr");
+        assert_eq!(
+            advertised_socket_addr(None, local),
+            "192.0.2.7:4321".parse::<SocketAddr>().expect("addr")
+        );
+        let v6: IpAddr = "2001:db8::1".parse().expect("ip");
+        assert_eq!(advertised_socket_addr(Some(v6), local).ip(), v6);
+    }
+
+    /// CRI-6・#4290: 射影形の広告アドレスでも発行 URL は IPv4 表記。
+    #[tokio::test]
+    async fn cri6_sec1_4290_base_url_canonical_for_mapped_advertise() {
+        let server = StreamingServer::bind(
+            StreamingConfig::default()
+                .with_bind("0.0.0.0:0".parse().expect("addr"))
+                .with_allow_external(true)
+                .with_advertise_addr("::ffff:192.0.2.7".parse().expect("ip")),
+        )
+        .await
+        .expect("bind");
+        let port = server.local_addr().port();
+        assert_eq!(
+            server.issuer().base_url(),
+            format!("http://192.0.2.7:{port}")
+        );
     }
 
     /// CRI-6・SEC-1・#4238: `::ffff:127.0.0.1` は loopback と見なさず外部扱い（opt-in 必須）。

@@ -100,7 +100,10 @@ fn parse_item(m: &PortMapping) -> Result<Item, CriError> {
     if m.host_ip.is_empty() {
         return Ok(Item::Unsupported);
     }
+    // IPv4 射影形（`::ffff:a.b.c.d`）は中身の IPv4 として判定する（#4290・SEC-1）。互換形
+    // `::a.b.c.d` と他の IPv6 は `to_canonical` が戻さないので従来どおり未対応になる。
     let ip: IpAddr = m.host_ip.parse().map_err(|_| invalid())?;
+    let ip = ip.to_canonical();
     let IpAddr::V4(host_ip) = ip else {
         return Ok(Item::Unsupported);
     };
@@ -218,6 +221,49 @@ mod tests {
         assert_eq!(got[1].host_port().get(), 5353);
         assert_eq!(got[1].container_port().get(), 53);
         assert!(parse_port_mappings(&[]).expect("empty").is_empty());
+    }
+
+    /// CRI-2・SEC-1・#4290: IPv4 射影形は対応する IPv4 と同じ結果になる。
+    #[test]
+    fn cri2_sec1_4290_mapped_ipv4_matches_ipv4() {
+        for (mapped, plain, want) in [
+            ("::ffff:0.0.0.0", "0.0.0.0", CriErrorCode::Unimplemented),
+            ("::ffff:127.0.0.1", "127.0.0.1", CriErrorCode::Unimplemented),
+            (
+                "::ffff:224.0.0.1",
+                "224.0.0.1",
+                CriErrorCode::InvalidArgument,
+            ),
+            (
+                "::ffff:255.255.255.255",
+                "255.255.255.255",
+                CriErrorCode::InvalidArgument,
+            ),
+            ("::ffff:0.1.2.3", "0.1.2.3", CriErrorCode::InvalidArgument),
+        ] {
+            let a = code(parse_port_mappings(&[m(0, 8080, 80, mapped)]));
+            let b = code(parse_port_mappings(&[m(0, 8080, 80, plain)]));
+            assert_eq!(a, b, "{mapped}");
+            assert_eq!(a, want, "{mapped}");
+        }
+        assert_eq!(
+            code(parse_port_mappings(&[m(2, 8080, 80, "::ffff:224.0.0.1")])),
+            CriErrorCode::InvalidArgument
+        );
+        let got =
+            parse_port_mappings(&[m(0, 8080, 80, "::ffff:192.0.2.10")]).expect("mapped unicast");
+        assert_eq!(got[0].host_ip(), Ipv4Addr::new(192, 0, 2, 10));
+        assert_eq!(
+            code(parse_port_mappings(&[
+                m(0, 8080, 80, "192.0.2.10"),
+                m(0, 8080, 80, "::ffff:192.0.2.10"),
+            ])),
+            CriErrorCode::InvalidArgument
+        );
+        assert_eq!(
+            code(parse_port_mappings(&[m(0, 8080, 80, "::192.0.2.10")])),
+            CriErrorCode::Unimplemented
+        );
     }
 
     /// CRI-2: 未対応の指定は `UNIMPLEMENTED`。

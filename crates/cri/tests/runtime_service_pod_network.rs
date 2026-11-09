@@ -564,3 +564,36 @@ async fn port_publishes_without_pod_network_are_unimplemented() {
     assert_eq!(e.code(), Code::Unimplemented);
     assert!(net.calls().is_empty());
 }
+
+/// CRI-2・SEC-1・#4290: IPv4 射影形の host_ip は正規化した IPv4 として provider へ渡り、
+/// 禁止アドレス（射影形の broadcast・multicast）は IPv4 と同じく `INVALID_ARGUMENT` で拒否する。
+#[tokio::test]
+async fn sec1_4290_mapped_ipv4_host_ip_is_normalized_or_rejected() {
+    let net = FakeNetwork::new(SetUp::Ok);
+    let svc = service(&net);
+    run_with_ports(&svc, None, vec![port(0, 8080, 80, "::ffff:192.0.2.10")])
+        .await
+        .unwrap();
+    assert_eq!(
+        *net.publishes.lock().unwrap(),
+        vec!["tcp 192.0.2.10:8080->80".to_owned()]
+    );
+
+    let before = net.calls().len();
+    for ip in [
+        "::ffff:255.255.255.255",
+        "::ffff:224.0.0.1",
+        "::ffff:0.1.2.3",
+    ] {
+        let e = run_with_ports(&svc, None, vec![port(0, 8081, 80, ip)])
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), Code::InvalidArgument, "{ip}");
+    }
+    // 互換形 `::a.b.c.d` は従来どおり未対応。
+    let e = run_with_ports(&svc, None, vec![port(0, 8082, 80, "::192.0.2.10")])
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), Code::Unimplemented);
+    assert_eq!(net.calls().len(), before);
+}

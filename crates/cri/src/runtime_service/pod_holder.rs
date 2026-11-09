@@ -303,9 +303,17 @@ impl CriRuntimeService {
         let provider = Arc::clone(provider);
         let registry = Arc::clone(&self.registry);
         let id = sandbox_id.to_owned();
-        run_bounded(timeout + HOLDER_OUTER_SLACK, move || {
+        // 共有期限がある（Remove 等）ときは外側の待ちを残り期限ぴったりで頭打ちにし、provider へは
+        // 余裕分（残りの半分を上限）を引いた猶予を渡して契約どおり先に戻れるようにする（#3142・REPAIR-5）。
+        // 期限が無いとき（Stop 単独の内部呼び出し等）は従来どおり外側に余裕を足す。
+        let (provider_timeout, outer) = if deadline.is_some() {
+            (timeout - HOLDER_OUTER_SLACK.min(timeout / 2), timeout)
+        } else {
+            (timeout, timeout + HOLDER_OUTER_SLACK)
+        };
+        run_bounded(outer, move || {
             let _guard = guard;
-            let result = provider.release(&id, timeout);
+            let result = provider.release(&id, provider_timeout);
             if result.is_ok()
                 && let Ok(mut registry) = registry.lock()
                 && let Some(record) = registry.records.get_mut(&id)

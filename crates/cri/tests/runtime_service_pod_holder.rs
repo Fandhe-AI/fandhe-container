@@ -45,6 +45,7 @@ struct FakeHolder {
     release_fails: AtomicBool,
     live: Mutex<Live>,
     unblock: AtomicBool,
+    release_hangs: AtomicBool,
     pid: u32,
 }
 
@@ -56,6 +57,7 @@ impl FakeHolder {
             release_fails: AtomicBool::new(false),
             live: Mutex::new(Live::Alive),
             unblock: AtomicBool::new(false),
+            release_hangs: AtomicBool::new(false),
             pid: 4242,
         })
     }
@@ -95,6 +97,12 @@ impl PodNamespaceHolderProvider for FakeHolder {
             .lock()
             .unwrap()
             .push(format!("release {sandbox_id}"));
+        if self.release_hangs.load(Ordering::SeqCst) {
+            let start = Instant::now();
+            while !self.unblock.load(Ordering::SeqCst) && start.elapsed() < Duration::from_secs(3) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
         if self.release_fails.load(Ordering::SeqCst) {
             Err(CriError::internal("release failed"))
         } else {
@@ -479,6 +487,26 @@ async fn repair5_release_failure_keeps_the_record_and_retry_succeeds() {
     remove(&svc, &id).await.unwrap();
     assert_eq!(holder.count("release"), 3);
     assert!(list(&svc).await.is_empty());
+}
+
+/// REPAIR-5・CRI-2（#3142）: release が戻らなくても Remove 全体は runtime_timeout（300ms）で頭打ちになる
+/// （外側の余裕 500ms を足して約 800ms 待たない）。
+#[tokio::test]
+async fn repair5_remove_with_hanging_release_is_capped_at_runtime_timeout() {
+    let log = new_log();
+    let holder = FakeHolder::new(&log, Spawn::Ok);
+    let svc = service(&holder);
+    let id = run(&svc).await.unwrap();
+    holder.release_hangs.store(true, Ordering::SeqCst);
+    let start = Instant::now();
+    let err = remove(&svc, &id).await.unwrap_err();
+    let elapsed = start.elapsed();
+    holder.unblock.store(true, Ordering::SeqCst);
+    assert_eq!(err.code(), Code::DeadlineExceeded);
+    assert!(
+        elapsed < Duration::from_millis(450),
+        "remove waited {elapsed:?}"
+    );
 }
 
 #[tokio::test]

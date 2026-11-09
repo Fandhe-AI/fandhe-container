@@ -20,11 +20,14 @@
 //! | 記録 | 登録する値 |
 //! | ---- | ---------- |
 //! | `pending=0` かつ `network_pending=0` | `NotReady`、`network_owned` は記録どおり、`network_pending=false` |
-//! | `pending=1` または `network_pending=1` | `NotReady`、`network_pending=false`、`network_owned=true`（回収待ち） |
+//! | `network_pending=1` | `NotReady`、`network_pending=false`、`network_owned=true`（回収待ち） |
+//! | `pending=1` かつ `network_pending=0` | `NotReady`、`network_owned` は記録どおり（保持役だけの作成途中。回収待ちにしない） |
 //!
-//! `pending=1` は v1 では保持役の素性も `pod_netns` も記録に無く「副作用が無かった」と確認できないため、記録を
-//! 破棄せず回収待ちへ倒す（fail-closed）。再採用した記録の pid から namespace のパスを作らず、シグナルも送らない
-//! （SEC-5・#2776。v1 の記録に pid の鍵は無い）。
+//! `network_pending=1` は pod network provider の予約の時点で書かれ、資源を作った可能性を否定できないため、記録を
+//! 破棄せず回収待ちへ倒す（fail-closed）。`pending=1` だけの記録は保持役の起動だけが理由で、保持役は plugin-cri の
+//! 終了（stdin の EOF）で消えるため、ネットワーク資源の所有とは数えない。数えると本番（pod network provider 未注入）で
+//! Stop・Remove が `FAILED_PRECONDITION` から抜けられなくなる（H6・#2877）。どちらも `pending_unresolved` には数える。
+//! 再採用した記録の pid から namespace のパスを作らず、シグナルも送らない（SEC-5・#2776。v1 の記録に pid の鍵は無い）。
 //!
 //! # コンテナ記録の再採用と core の状態との照合（R7 #2936。CRI-1・OCI-7・CORE-1）
 //!
@@ -417,7 +420,7 @@ impl CriRuntimeService {
                 runtime_handler: data.runtime_handler,
                 retained_bytes: decoded.retained_bytes,
                 network_pending: false,
-                network_owned: data.network_owned || unresolved,
+                network_owned: data.network_owned || data.network_pending,
                 network_teardown: false,
                 pod_netns: None,
                 // 保持役は plugin-cri と同じ寿命で、再起動をまたがない（#2871。素性の永続化は R11〔#2940〕）。
@@ -1014,6 +1017,30 @@ mod tests {
             ]
         );
         assert_eq!(*store.calls.lock().unwrap(), (0, 0));
+    }
+
+    /// CRI-2・H6・#2877: 保持役だけの作成途中（pending=1・network_pending=0）はネットワーク資源の所有に数えず、
+    /// network_pending=1 は従来どおり回収待ち（network_owned=true）。どちらも pending_unresolved に数える。
+    #[test]
+    fn cri2_readopt_holder_only_pending_is_not_network_owned() {
+        let mut a = data('a', "p1");
+        a.pending = true;
+        let mut b = data('b', "p2");
+        b.network_pending = true;
+        let store = Fake::with(vec![ok(&a), ok(&b)], 0);
+        let s = svc(store, Arc::default());
+        let r = s.readopt_sandboxes(ListBudget::default()).unwrap();
+        assert_eq!((r.adopted, r.pending_unresolved), (2, 2));
+        assert_eq!(
+            snapshot(&s),
+            vec![
+                (id('a'), SandboxState::NotReady, false, false),
+                (id('b'), SandboxState::NotReady, true, false),
+            ]
+        );
+        let reg = s.registry.lock().unwrap();
+        let rec = reg.records.get(&id('a')).unwrap();
+        assert!(!rec.holder_owned && !rec.holder_pending && rec.pod_holder.is_none());
     }
 
     /// CRI-2・REPAIR-4: 壊れた記録は登録せず、内訳と記録器の失敗に計上する。

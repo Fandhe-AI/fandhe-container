@@ -515,12 +515,17 @@ impl HostMapping {
 
 impl Drop for HostMapping {
     fn drop(&mut self) {
-        // SAFETY: ptr・len は `new` で得た mmap 領域そのもの。二重 munmap は起きない（drop は 1 回）。
+        // SAFETY: 通常の経路では ptr・len は `new` で得た mmap 領域そのもの。二重 munmap は起きない（drop は 1 回）。
         // ゲストへ対応付けた `HostMapping` は `GuestMapping` が `Option` で所有し、`release()` が `take()` して
         // `hv_vm_unmap` が成功したときだけここへ来る（失敗時は `mem::forget` でリークし、ここへは来ない）。
         // それ以外にここへ来るのは対応付けていない backing（`map` の前、または検査か `hv_vm_map` の失敗で
-        // 対応付けができなかったとき）だけなので、ゲストから見えている領域は munmap しない。失敗は後始末のため無視する。
-        let _ = unsafe { munmap(self.ptr, self.len) };
+        // 対応付けができなかったとき）だけなので、ゲストから見えている領域は munmap しない。
+        // 試験の失敗注入では ptr をページ境界からずらすが、munmap は引数を参照外しせず不正なら EINVAL を返すだけ。
+        // 失敗は固定の 1 行（`op=hvf.host_unmap`。#4292）で観測し、それ以外は何もしない（リークを受け入れる・panic しない）。
+        let rc = unsafe { munmap(self.ptr, self.len) };
+        if let Some(line) = crate::hvf_abi::host_unmap_failure_line(rc) {
+            crate::hvf_loop::log_line(format_args!("{line}"));
+        }
     }
 }
 
@@ -1282,6 +1287,34 @@ impl Drop for GicConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// munmap の失敗（ページ境界でない ptr は EINVAL）を注入し、固定の 1 行がちょうど 1 回出ることを照合する
+    /// （MVM-5・REPAIR-4・#4292）。mmap だけで entitlement は不要。
+    #[test]
+    fn mvm5_4292_host_unmap_failure_emits_one_line() {
+        let page = HostMapping::page_size().expect("page size");
+        let m = HostMapping::new(page).expect("mmap");
+        let fake = HostMapping {
+            ptr: m.ptr.wrapping_byte_add(1),
+            len: m.len,
+            page_size: m.page_size,
+        };
+        let ((), lines) = crate::hvf_loop::capture_log_lines(|| drop(fake));
+        assert_eq!(
+            lines,
+            vec!["level=error op=hvf.host_unmap outcome=error leaked=host_mapping".to_string()]
+        );
+        drop(m);
+    }
+
+    /// 成功した munmap は行を出さない（#4292）。
+    #[test]
+    fn mvm5_4292_host_unmap_success_emits_no_line() {
+        let page = HostMapping::page_size().expect("page size");
+        let m = HostMapping::new(page).expect("mmap");
+        let ((), lines) = crate::hvf_loop::capture_log_lines(|| drop(m));
+        assert_eq!(lines, Vec::<String>::new());
+    }
 
     /// `HostMapping` を別スレッドへ move して読み書きと drop ができる（`Send` の実行時確認。MVM-5・MVM-1・SEC-1・#4024）。
     /// mmap だけで entitlement は不要。

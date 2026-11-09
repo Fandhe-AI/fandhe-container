@@ -596,7 +596,43 @@ impl LogSink {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// 試験専用の行の捕捉先。`Some` の間、現在のスレッドの `log_line` は sink へ送らずここへ積む。
+    static CAPTURE: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// 試験専用。`f` の実行中に現在のスレッドが `log_line` へ渡した行を集めて返す（#4292）。
+/// スレッドローカルなので並列の試験同士・別スレッドの行は混ざらない。
+#[cfg(test)]
+pub(crate) fn capture_log_lines<R>(f: impl FnOnce() -> R) -> (R, Vec<String>) {
+    CAPTURE.with(|c| *c.borrow_mut() = Some(Vec::new()));
+    let r = f();
+    let lines = CAPTURE.with(|c| c.borrow_mut().take()).unwrap_or_default();
+    (r, lines)
+}
+
 pub(crate) fn log_line(args: fmt::Arguments<'_>) {
+    // drop 中にも呼ばれるため、捕捉の失敗（TLS 破棄後・二重借用）では panic せず通常経路へ落とす。
+    #[cfg(test)]
+    {
+        let line = args.to_string();
+        let captured = CAPTURE
+            .try_with(|c| match c.try_borrow_mut() {
+                Ok(mut g) => match g.as_mut() {
+                    Some(v) => {
+                        v.push(line);
+                        true
+                    }
+                    None => false,
+                },
+                Err(_) => false,
+            })
+            .unwrap_or(false);
+        if captured {
+            return;
+        }
+    }
     static SINK: std::sync::OnceLock<Option<LogSink>> = std::sync::OnceLock::new();
     let sink = SINK.get_or_init(|| LogSink::start(std::io::stderr(), LOG_QUEUE_CAP));
     if let Some(sink) = sink {
@@ -1124,6 +1160,21 @@ impl<K: VcpuKick> Drop for LoopHandle<K> {
 
 #[cfg(test)]
 mod tests {
+    /// `capture_log_lines` は捕捉中の現スレッドの行だけを順に返し、別スレッドの行は混ざらない（#4292）。
+    #[test]
+    fn mvm5_4292_capture_log_lines_collects_on_current_thread() {
+        let (r, lines) = super::capture_log_lines(|| {
+            super::log_line(format_args!("a={}", 1));
+            std::thread::spawn(|| super::log_line(format_args!("other")))
+                .join()
+                .expect("join");
+            super::log_line(format_args!("b"));
+            7
+        });
+        assert_eq!(r, 7);
+        assert_eq!(lines, vec!["a=1".to_string(), "b".to_string()]);
+    }
+
     use super::*;
     use crate::esr::WfxKind;
     use std::collections::VecDeque;

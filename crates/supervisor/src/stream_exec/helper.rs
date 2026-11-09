@@ -26,7 +26,7 @@
 //! pid が `--expect-pid` と一致。不一致は exec も監査もしない）→ launch 時 env の読み込み → 監査 sink の構築（作れなければ
 //! exec も pidfd の要求もしない。SEC-4）→ kind 6 で pidfd の複製を受ける（孤児は `Unavailable`。記録 pid からの
 //! `pidfd_open` へは縮退しない。SEC-1）→ `StdioHandover` の受信（mask は `--stdio` と一致が必要）→ exec の通し
-//! （`on_created` で kind 7 の通知と ack の後に、exec 子 cgroup の名前を載せた `Started` を送る。#4221）→ exec の待ちの刻みごとに fd 0 の `Signal` を受けて `SignalAck` を返す（wire v3・#4282。`signal_tick`）
+//! （`on_created` で kind 7 の通知と ack の後に、exec 子 cgroup の名前を載せた `Started` を送る。#4221）→ exec の待ちの刻みごとに fd 0 の `Signal` を受けて `SignalAck` を返す（wire v4・#4282。`signal_tick`）。コマンドの pid が worker から届けば `Spawned` を送る（刻みで届かなかった短命なコマンドは後始末で `Result` の前に送る。#4316）
 //! → `Result` の送信。以降の失敗はすべて `Result` frame で返す。
 //!
 //! # コマンドへのシグナル（#4282・SUP-6・CRI-5・SEC-1）
@@ -351,7 +351,19 @@ pub fn outcome_from_result(
     }
 }
 
-/// 実行役の型（本番は `production_runner`。試験は偽を渡す）。成功側は終了状態だけに絞る。
+/// 実行役の成功側（終了状態と、起動したコマンドのホスト側 pid。#4316）。
+///
+/// `command_pid` は `Command`（コマンドが起動して終了した）ときだけ `Some`。短命なコマンドが刻みの中継より先に終わっても、
+/// 後始末で `Spawned` を `Result` より前に送るための控え（[`serve_reporting`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunnerExit {
+    /// コマンドの終了状態。
+    pub exit: ExecExit,
+    /// コマンドの pid（起動していなければ `None`）。
+    pub command_pid: Option<NonZeroU32>,
+}
+
+/// 実行役の型（本番は `production_runner`。試験は偽を渡す）。成功側は終了状態と pid だけに絞る。
 pub type Runner<'a> = dyn Fn(
         &StateRecord,
         BorrowedFd<'_>,
@@ -359,7 +371,7 @@ pub type Runner<'a> = dyn Fn(
         Duration,
         &dyn AuditSink,
         ExecLaunchIo<'_>,
-    ) -> Result<ExecExit, AuditedRejection<TraitError>>
+    ) -> Result<RunnerExit, AuditedRejection<TraitError>>
     + 'a;
 
 /// 監査 sink の生成口の型。
@@ -393,9 +405,12 @@ fn production_runner(
     timeout: Duration,
     audit: &dyn AuditSink,
     io: ExecLaunchIo<'_>,
-) -> Result<ExecExit, AuditedRejection<TraitError>> {
+) -> Result<RunnerExit, AuditedRejection<TraitError>> {
     crate::exec::run_command_with_pidfd_output_notify(record, pidfd, request, timeout, audit, io)
-        .map(|audited| audited.outcome.exit)
+        .map(|audited| RunnerExit {
+            exit: audited.outcome.exit,
+            command_pid: audited.outcome.command_pid,
+        })
 }
 
 /// `Started` の送信期限。`SEND_BUDGET` を `total_deadline` で頭打ちにする（期限後に `Started` を出さない。REPAIR-5・SUP-6）。
@@ -432,7 +447,7 @@ fn early_channel(stage: HelperStage, e: &ChannelError) -> ServeReport {
     early(stage, e.code(), e.errno())
 }
 
-/// 前提検査から exec の通しまで（処理順はモジュール doc）。`channel` へは `Started` だけを送り、`Result` は返り値で
+/// 前提検査から exec の通しまで（処理順はモジュール doc）。`channel` へは `Started`・`Spawned`・`SignalAck` を送り、`Result` は返り値で
 /// 呼び出し側（[`run_stream_exec_main`]）が送る。失敗の段・errno が要るときは [`serve_reporting`]。
 pub fn serve(channel: &UnixStream, args: &StreamExecArgs, deps: &Deps<'_>) -> StreamExecOutcome {
     serve_reporting(channel, args, deps).outcome
@@ -572,7 +587,13 @@ pub fn serve_reporting(
             "stream-exec requester went away; exec cancelled",
         );
     }
-    let outcome = outcome_from_result(result);
+    // 短命なコマンドが刻みの中継より先に終わったときのため、起動したコマンドの pid を結果から控える（#4316）。
+    let runner_pid = result.as_ref().ok().and_then(|r| r.command_pid);
+    let outcome = outcome_from_result(result.map(|r| r.exit));
+    // 刻みで送れていなければ、保留の ack と `Result` より前に `Spawned` を送る（`Spawned` は常に `Result` の前。#4316）。
+    if let Some(pid) = runner_pid {
+        send_spawned_once(channel, &signal_state, pid);
+    }
     // exec が終わった時点で保留のシグナルがあれば、`Result` の前に ack を返す（#4282）。コマンドが終わっていれば
     // `exited`、そうでなければ pidfd が届かないままだったので `not_started`。要求元が消えていれば送れず、結果は捨てる。
     if let Some((signal, _)) = signal_state.pending.take() {
@@ -609,6 +630,17 @@ struct SignalState {
     pending: std::cell::Cell<Option<(ExecSignal, Instant)>>,
     /// 受信に失敗した（frame の境界を信頼できないため、以後は受信も ack の送信もしない）。
     dead: std::cell::Cell<bool>,
+    /// `Spawned` を送る試行を済ませた（成功・失敗を問わず再送しない。#4316）。
+    spawned_sent: std::cell::Cell<bool>,
+}
+
+/// `Spawned` を高々 1 回だけ best-effort で送る（#4316・SUP-6）。送信の失敗は握りつぶす（pid は表示用で、`Result` と exec は
+/// 止めない）。部分書き込みで後続の frame の境界が崩れる窓は `SignalAck` と同じ残余（期限は [`SIGNAL_ACK_BUDGET`]）。
+fn send_spawned_once(channel: &UnixStream, state: &SignalState, pid: NonZeroU32) {
+    if state.spawned_sent.replace(true) {
+        return;
+    }
+    let _ = channel::send_spawned(channel, pid, Instant::now() + SIGNAL_ACK_BUDGET);
 }
 
 /// exec の待ちの刻みごとのシグナル処理（[`ExecLaunchIo::signal`] の実体。#4282・SUP-6・SEC-1・REPAIR-5）。
@@ -617,6 +649,12 @@ struct SignalState {
 /// `SignalAck` で返す（`NotStarted` は [`SIGNAL_START_GRACE`] まで保留して再試行）。受信に失敗した（壊れた frame・許可外の番号・
 /// 旧い版・fd 付き）ときは以後シグナルを受けず（ack も返さない）、固定語彙の診断行を 1 行出す。exec は止めず従来の期限で終わる。
 fn signal_tick(channel: &UnixStream, state: &SignalState, signaler: &dyn CommandSignaler) {
+    // コマンドの pid が worker から届いていれば、同じ刻みの `SignalAck` より前に `Spawned` を送る（#4316）。
+    if !state.spawned_sent.get()
+        && let Some(pid) = signaler.command_pid()
+    {
+        send_spawned_once(channel, state, pid);
+    }
     if state.pending.get().is_none() && !state.dead.get() {
         match channel::try_recv_signal(channel) {
             Ok(Some(signal)) => state.pending.set(Some((signal, Instant::now()))),

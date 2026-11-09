@@ -1198,6 +1198,25 @@ pub enum ExecSignalDelivery {
 pub trait CommandSignaler {
     /// `number` を送る。pidfd が未着なら 1 本だけ非ブロッキングで受け取ってから送る。
     fn deliver(&self, number: NonZeroU8) -> ExecSignalDelivery;
+
+    /// worker が中継したコマンドのホスト側 pid（helper と同じ pid namespace の値。#4316・SUP-6・CRI-5）。未着・中継できなかった
+    /// ときは `None`。未着なら非ブロッキングで 1 回だけ受け取りを試みる。**表示用**で、シグナルの宛先にしてはならない
+    /// （pid は再利用される。宛先は [`Self::deliver`] の pidfd）。既定は `None`（pid を運ばない実装）。
+    fn command_pid(&self) -> Option<NonZeroU32> {
+        None
+    }
+}
+
+/// worker → 親の中継の 4 バイト（コマンドの pid の big-endian。#4316）。pidfd の目印 1 バイトだった #4282 の中継を置き換える。
+/// worker は helper の fork なので内部の版ずれは無い。
+fn encode_spawn_note(pid: NonZeroU32) -> [u8; 4] {
+    pid.get().to_be_bytes()
+}
+
+/// [`encode_spawn_note`] の復号。4 バイトちょうど・0 でないときだけ `Some`（それ以外は pid 不明として扱う）。
+fn decode_spawn_note(bytes: &[u8]) -> Option<NonZeroU32> {
+    let arr = <[u8; 4]>::try_from(bytes).ok()?;
+    NonZeroU32::new(u32::from_be_bytes(arr))
 }
 
 /// exec の待ちの刻みごとに呼ばれるシグナル処理のフック型（[`ExecLaunchIo::signal`]）。非ブロッキングで速く返ること。
@@ -1215,6 +1234,8 @@ struct PidfdSignaler {
 #[derive(Default)]
 struct PidfdState {
     pidfd: Option<OwnedFd>,
+    /// worker が中継したコマンドの pid（4 バイトの目印が揃ったときだけ。#4316）。
+    pid: Option<NonZeroU32>,
     /// worker の端が閉じた（pidfd が届いていなければ、もう届かない）。
     closed: bool,
 }
@@ -1233,12 +1254,16 @@ impl PidfdSignaler {
         if state.pidfd.is_some() || state.closed {
             return;
         }
-        let mut byte = [0u8; 1];
-        match crate::sys::recv_with_fds(self.rx.as_fd(), &mut byte) {
+        let mut note = [0u8; 4];
+        match crate::sys::recv_with_fds(self.rx.as_fd(), &mut note) {
             Ok(got) if got.len == 0 => state.closed = true,
             Ok(got) => {
                 if !got.truncated && got.fds.len() == 1 {
                     state.pidfd = got.fds.into_iter().next();
+                }
+                // pid は 4 バイトが揃い 0 でないときだけ採る（分割・短い受信は pid 不明のまま。pidfd の扱いは変えない）。
+                if let Some(pid) = note.get(..got.len).and_then(decode_spawn_note) {
+                    state.pid = Some(pid);
                 }
             }
             Err(_) => {}
@@ -1266,6 +1291,11 @@ impl CommandSignaler for PidfdSignaler {
             }
             _ => ExecSignalDelivery::Unavailable,
         }
+    }
+
+    fn command_pid(&self) -> Option<NonZeroU32> {
+        self.fetch();
+        self.state.borrow().pid
     }
 }
 
@@ -2748,11 +2778,13 @@ fn run_in_child_cgroup(
     .map_err(from_exec_error_staged)?;
     let child = spawn_exec_command_with_stdio(ready, &command, child_cgroup, stdio)
         .map_err(from_exec_error_staged)?;
-    // コマンドの pidfd を親（stream-exec の helper）へ 1 本だけ渡す（SIGKILL 以外のシグナルの宛先。#4282・SUP-6・SEC-1）。
-    // 最善努力: 送れなくても（pidfd なし・コンテナの seccomp が `sendmsg` を拒否・親が閉じた）exec は続け、結果は捨てる。
+    // コマンドの pid（4 バイト）と pidfd を親（stream-exec の helper）へ 1 回で渡す（pidfd は SIGKILL 以外のシグナルの宛先。
+    // #4282・SUP-6・SEC-1。pid は表示用で `Spawned` frame になる。#4316）。pidfd が無ければ pid だけを渡す。
+    // 最善努力: 送れなくても（コンテナの seccomp が `sendmsg` を拒否・親が閉じた）exec は続け、結果は捨てる。
     // 親は届かない間 `NotStarted` を返し、猶予を過ぎると `Unavailable` になる（fail-closed。シグナルは届かない側へ倒れる）。
-    if let (Some(tx), Some(pidfd)) = (io.signal_tx, child.pidfd()) {
-        let _ = crate::sys::send_with_fds(tx, &[1u8], &[pidfd]);
+    if let (Some(tx), Some(pid)) = (io.signal_tx, NonZeroU32::new(child.pid())) {
+        let fds: Vec<BorrowedFd<'_>> = child.pidfd().into_iter().collect();
+        let _ = crate::sys::send_with_fds(tx, &encode_spawn_note(pid), &fds);
     }
     // 回収する前に控える（worker の PID namespace の値。`SetupFailed` の判定は `exit` が持つ）。
     let spawned_pid = NonZeroU32::new(child.pid());
@@ -2941,6 +2973,50 @@ fn from_exec_error_staged(err: ExecError) -> WorkerError {
 mod tests {
     use super::*;
     use fandhe_container_core::audit_log::{AuditDelivery, AuditLayer, AuditRecord};
+
+    /// SUP-6・CRI-5・#4316: worker → 親の pid の目印は 4 バイトの big-endian で、長さが違う・0 は pid 不明になる。
+    #[test]
+    fn sup6_4316_spawn_note_roundtrips_and_rejects_malformed() {
+        let pid = NonZeroU32::new(4242).unwrap();
+        assert_eq!(encode_spawn_note(pid), [0, 0, 0x10, 0x92]);
+        assert_eq!(decode_spawn_note(&[0, 0, 0x10, 0x92]), Some(pid));
+        assert_eq!(decode_spawn_note(&[0, 0, 0, 0]), None);
+        assert_eq!(decode_spawn_note(&[1]), None);
+        assert_eq!(decode_spawn_note(&[0, 0, 0x10]), None);
+        assert_eq!(decode_spawn_note(&[0, 0, 0, 0, 1]), None);
+    }
+
+    /// SUP-6・CRI-5・#4316: 実プロセスの pid を中継すると `PidfdSignaler::command_pid` がその値を具体値で返し、pidfd も採れる。
+    #[test]
+    fn sup6_4316_pidfd_signaler_reports_the_relayed_child_pid() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = NonZeroU32::new(child.id()).unwrap();
+        let (tx, rx) = UnixStream::pair().unwrap();
+        rx.set_nonblocking(true).unwrap();
+        let signaler = PidfdSignaler::new(rx);
+        // 未着の間は None（待たない）。
+        assert_eq!(signaler.command_pid(), None);
+        let fd = std::fs::File::open("/dev/null").unwrap();
+        crate::sys::send_with_fds(tx.as_fd(), &encode_spawn_note(pid), &[fd.as_fd()]).unwrap();
+        assert_eq!(signaler.command_pid(), Some(pid));
+        // 2 回目以降も同じ値。
+        assert_eq!(signaler.command_pid(), Some(pid));
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// SUP-6・#4316: fd が無い・4 バイトに満たない中継では pid は None のまま（pidfd の扱いは従来どおり）。
+    #[test]
+    fn sup6_4316_short_note_keeps_pid_unknown() {
+        let (tx, rx) = UnixStream::pair().unwrap();
+        rx.set_nonblocking(true).unwrap();
+        let signaler = PidfdSignaler::new(rx);
+        crate::sys::send_with_fds(tx.as_fd(), &[1u8], &[]).unwrap();
+        assert_eq!(signaler.command_pid(), None);
+    }
     use fandhe_container_core::exec::{IntegrityLsm, PathBoundLsm, exec_child_violation_reasons};
     use fandhe_container_core::traits::{
         CgroupPlacement, CgroupScope, ContainerStatus, StateRevision,

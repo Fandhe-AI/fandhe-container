@@ -4,7 +4,7 @@
 use std::collections::VecDeque;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
@@ -190,6 +190,9 @@ struct Inner {
     /// `SignalAck` の受け渡し（#4282）。ロックの順序は「ack → phase」だけ（phase を持ったまま ack を取らない）。
     ack: Mutex<AckSlot>,
     acked: Condvar,
+    /// helper の `Spawned` が運んだコマンドのホスト側 pid（0 は未着。#4316・CRI-5・SUP-6）。ロックを増やさないため原子にする
+    /// （「ack → phase」のロック順に加わらない）。表示用で、シグナルの宛先にしない（pid は再利用される）。
+    pid: AtomicU32,
 }
 
 impl Inner {
@@ -199,7 +202,20 @@ impl Inner {
             changed: Condvar::new(),
             ack: Mutex::new(AckSlot::default()),
             acked: Condvar::new(),
+            pid: AtomicU32::new(0),
         }
+    }
+
+    /// `Spawned` の pid を記録する。2 回目以降（プロトコル違反）は `false` で、値は最初のものを保つ。
+    fn record_pid(&self, pid: NonZeroU32) -> bool {
+        self.pid
+            .compare_exchange(0, pid.get(), Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// 記録済みの pid（未着なら `None`）。
+    fn recorded_pid(&self) -> Option<NonZeroU32> {
+        NonZeroU32::new(self.pid.load(Ordering::Acquire))
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Phase> {
@@ -347,9 +363,9 @@ impl ShimExecLauncher {
         Ok(())
     }
 
-    /// helper へ空の stdio を渡し `Started` まで進め、helper が通知した exec 子 cgroup の名前を返す（wire v2・#4221）。
+    /// helper へ空の stdio を渡し `Started` まで進め、helper が通知した exec 子 cgroup の名前を返す（wire v2・#4221。現行は v4・#4316）。
     ///
-    /// 旧い helper（v1）とは version の不一致で `Started` に至らず、ここで `Err`（exec は始まらず、登録も probe も作らない。fail-closed）。
+    /// 旧い helper（v1〜v3）とは version の不一致で `Started` に至らず、ここで `Err`（exec は始まらず、登録も probe も作らない。fail-closed）。
     fn handshake(
         &self,
         channel: &std::os::unix::net::UnixStream,
@@ -370,9 +386,12 @@ impl ShimExecLauncher {
                 Err(e) => e,
                 Ok(_) => CriError::internal("exec ended before it started"),
             }),
-            Ok(HelperMessage::PtyMaster(_) | HelperMessage::SignalAck { .. }) => {
-                Err(CriError::internal("exec failed"))
-            }
+            // `Spawned` は `Started` より前には来ない（fork の後に送られる。#4316）。順序違反は想定外の frame として失敗にする。
+            Ok(
+                HelperMessage::PtyMaster(_)
+                | HelperMessage::SignalAck { .. }
+                | HelperMessage::Spawned { .. },
+            ) => Err(CriError::internal("exec failed")),
             Err(e) => Err(channel_error(&e)),
         }
     }
@@ -525,6 +544,14 @@ fn watch_result(
                 guard.kill();
                 break Phase::unconfirmed(CriError::unavailable(UNCONFIRMED));
             }
+            // コマンドのホスト側 pid（#4316）。高々 1 回で、2 回目はプロトコル違反。届かないまま `Result` が来ても正当（pid は不明のまま）。
+            Ok(HelperMessage::Spawned { pid }) => {
+                if inner.record_pid(pid) {
+                    continue;
+                }
+                guard.kill();
+                break Phase::unconfirmed(CriError::unavailable(UNCONFIRMED));
+            }
             Ok(HelperMessage::Result(StreamExecOutcome::Failed(code))) => {
                 break Phase::unconfirmed(cri_error(code));
             }
@@ -659,8 +686,10 @@ enum Snapshot {
 }
 
 impl TaskExecProcess for ShimExecProcess {
+    /// helper の `Spawned` が届いた後は、コマンドのホスト側 pid（plugin-cri と同じ pid namespace の値。#4316）。届く前・
+    /// 届かなかったとき（起動の失敗・中継の失敗）は `None`。表示用で、シグナルの宛先にしてはならない（pid は再利用される）。
     fn pid(&self) -> Option<NonZeroU32> {
-        None
+        self.inner.recorded_pid()
     }
 
     fn status(&self) -> Result<ExecProcessStatus, CriError> {

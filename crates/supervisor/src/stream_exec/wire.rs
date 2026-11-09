@@ -10,7 +10,7 @@
 //! | オフセット | 長さ | 内容 |
 //! | --- | --- | --- |
 //! | 0 | 4 | magic `FCSX`（制御チャネルの `FCSC` と別。取り違えを検出する） |
-//! | 4 | 1 | version `u8` = 3（#4221 で `Started` に exec 子 cgroup の名前を載せるため 1 から 2 へ、#4282 で `Signal`・`SignalAck` を足すため 3 へ上げた。旧い相手とは混在させない） |
+//! | 4 | 1 | version `u8` = 4（#4316 で `Spawned` を足すため 3 から 4 へ上げた。#4221 で `Started` に exec 子 cgroup の名前を載せるため 1 から 2 へ、#4282 で `Signal`・`SignalAck` を足すため 3 へ上げた。旧い相手とは混在させない） |
 //! | 5 | 1 | kind `u8` |
 //! | 6 | 2 | payload_len `u16`（big-endian） |
 //!
@@ -27,6 +27,7 @@
 //! | 4 | `Result` | helper → plugin-cri | 5 バイト | 13 | 0 |
 //! | 5 | `Signal` | plugin-cri → helper | signal `u8` | 9 | 0 |
 //! | 6 | `SignalAck` | helper → plugin-cri | `[signal, code]` 2 バイト | 10 | 0 |
+//! | 7 | `Spawned` | helper → plugin-cri | pid `u32`（big-endian・0 は不可） | 12 | 0 |
 //!
 //! mask: bit0 = stdin、bit1 = stdout、bit2 = stderr。bit3〜7 は 0 でなければ拒否。fd の並びはビット昇順。
 //!
@@ -39,6 +40,21 @@
 //! `SignalAck` は helper がその結果を 1 つ返す（要求 1 件につき高々 1 件）。code: 1 = delivered、2 = not_started（コマンドの
 //! pidfd がまだ届いていない。猶予を過ぎた）、3 = exited（既に終わっていた）、4 = unavailable（送れなかった）。未知の code は
 //! `UnknownSignalAck` で frame ごと拒否する。
+//!
+//! # `Spawned`（#4316・SUP-6・CRI-5・CRI-6）
+//!
+//! コマンドの子を fork した後に helper が 1 回だけ送る、コマンドのホスト側 pid（helper = plugin-cri と同じ pid namespace から
+//! 見た値）。`Started` は fork の前に送るため pid を載せられず、別の frame にした。payload は pid の `u32`（big-endian）で、
+//! 0 は `InvalidPid` で frame ごと拒否する。
+//!
+//! - 送信順: `Started` →（tty なら `PtyMaster`）→ `Spawned`（高々 1 回）→ `SignalAck`（0 件以上）→ `Result`。`Spawned` は
+//!   常に `Result` より前に来る。`Started` より前の `Spawned`・2 回目の `Spawned` は受け側がプロトコル違反として扱う。
+//! - **届かないことがある**（互換の扱い）: `NotStarted`・`Failed` で終わった、worker から pidfd を中継できなかった、送信に
+//!   失敗した場合は `Spawned` が無いまま `Result` が来る。これは正当な状態で、消費側は pid を「不明」のままにして
+//!   exec と `Result` を普通に処理する。version 3 以下の相手は `BadVersion` で拒否し、exec の開始前に失敗させる（混在させない）。
+//! - 意味は「子を fork し、その pid が存在した」こと。execve の成否は `Result` で示す。
+//! - pid は表示（State・Delete の応答）だけに使い、シグナルの宛先にしない。pid は再利用されるため、SIGKILL 以外のシグナルは
+//!   pidfd を使う `Signal` frame、SIGKILL は cgroup ごとの停止で送る（SEC-1）。
 //!
 //! # `Started` の payload（65 バイト。#4221）
 //!
@@ -60,7 +76,7 @@
 //! step: 0 = なし、1〜16 = `ExecChildStep`。1〜15 は宣言順（`ControllingTty` を除く）、後から足した `ControllingTty`（#3758）は既存番号を動かさないため末尾の 16。code: 1〜10 = `ErrorCode` を宣言順に 1 から。
 //! 番号は `ALL` の添字からではなく明示の `match` で固定し、core の並び替えで動かさない。未知の番号は frame 全体を拒否する。
 
-use std::num::NonZeroU8;
+use std::num::{NonZeroU8, NonZeroU32};
 
 use fandhe_container_core::exec::{ExecCgroupName, ExecChildStep};
 use fandhe_container_core::traits::ErrorCode;
@@ -68,7 +84,7 @@ use fandhe_container_core::traits::ErrorCode;
 /// 先頭の識別子（制御チャネルの `FCSC` と別）。
 pub const MAGIC: [u8; 4] = *b"FCSX";
 /// 語彙の版。
-pub const VERSION: u8 = 3;
+pub const VERSION: u8 = 4;
 /// ヘッダの長さ。
 pub const HEADER_LEN: usize = 8;
 /// payload の上限（`Started` の 65 バイト）。これを超えるヘッダは payload を読まずに拒否する。
@@ -81,6 +97,8 @@ pub const CGROUP_NAME_FIELD_LEN: usize = ExecCgroupName::MAX_LEN;
 pub const STARTED_PAYLOAD_LEN: usize = 1 + CGROUP_NAME_FIELD_LEN;
 /// `Result` の payload 長。
 pub const RESULT_PAYLOAD_LEN: usize = 5;
+/// `Spawned` の payload 長（pid の `u32`）。
+pub const SPAWNED_PAYLOAD_LEN: usize = 4;
 
 /// 復号の失敗（固定語彙。入力値を載せない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +125,8 @@ pub enum WireError {
     UnknownCode,
     /// `Started` の名前欄が不正（長さ 0・上限超・埋めが 0 でない・名前の検証に失敗）。
     InvalidCgroupName,
+    /// `Spawned` の pid が 0（#4316）。
+    InvalidPid,
     /// `Signal` の番号が範囲外（0 と 65 以上。#4282）。
     SignalOutOfRange,
     /// `Signal` の番号が 1〜64 だが許可リストに無い（#4282）。
@@ -141,6 +161,8 @@ pub enum Kind {
     Signal,
     /// helper → plugin-cri。`Signal` の結果（#4282）。
     SignalAck,
+    /// helper → plugin-cri。コマンドのホスト側 pid（#4316）。
+    Spawned,
 }
 
 impl Kind {
@@ -152,6 +174,7 @@ impl Kind {
             4 => Some(Self::Result),
             5 => Some(Self::Signal),
             6 => Some(Self::SignalAck),
+            7 => Some(Self::Spawned),
             _ => None,
         }
     }
@@ -164,6 +187,7 @@ impl Kind {
             Self::Result => 4,
             Self::Signal => 5,
             Self::SignalAck => 6,
+            Self::Spawned => 7,
         }
     }
 
@@ -175,6 +199,7 @@ impl Kind {
             Self::Started => STARTED_PAYLOAD_LEN as u16,
             Self::Result => 5,
             Self::SignalAck => 2,
+            Self::Spawned => SPAWNED_PAYLOAD_LEN as u16,
         }
     }
 
@@ -188,7 +213,7 @@ impl Kind {
     pub fn is_from_helper(self) -> bool {
         matches!(
             self,
-            Self::Started | Self::PtyMaster | Self::Result | Self::SignalAck
+            Self::Started | Self::PtyMaster | Self::Result | Self::SignalAck | Self::Spawned
         )
     }
 }
@@ -481,6 +506,8 @@ pub enum Frame {
         /// 結果。
         code: SignalAckCode,
     },
+    /// コマンドのホスト側 pid（helper → plugin-cri。fork の後に高々 1 回。#4316）。
+    Spawned(NonZeroU32),
 }
 
 /// 符号化済みの frame（固定長の入れ物）。
@@ -533,6 +560,7 @@ impl Frame {
             Self::Result(_) => Kind::Result,
             Self::Signal(_) => Kind::Signal,
             Self::SignalAck { .. } => Kind::SignalAck,
+            Self::Spawned(_) => Kind::Spawned,
         }
     }
 
@@ -547,6 +575,7 @@ impl Frame {
             Self::SignalAck { signal, code } => {
                 build(Kind::SignalAck, &[signal.get(), code.as_u8()])
             }
+            Self::Spawned(pid) => build(Kind::Spawned, &pid.get().to_be_bytes()),
         })
     }
 
@@ -586,6 +615,13 @@ impl Frame {
                 let signal = ExecSignal::new(n).map_err(WireError::from)?;
                 let code = SignalAckCode::from_u8(c).ok_or(WireError::UnknownSignalAck)?;
                 Ok(Self::SignalAck { signal, code })
+            }
+            Kind::Spawned => {
+                let arr = <[u8; SPAWNED_PAYLOAD_LEN]>::try_from(payload)
+                    .map_err(|_| WireError::LengthMismatch)?;
+                NonZeroU32::new(u32::from_be_bytes(arr))
+                    .map(Self::Spawned)
+                    .ok_or(WireError::InvalidPid)
             }
         }
     }
@@ -746,7 +782,7 @@ mod tests {
 
     fn hdr(kind: u8, len: u16) -> [u8; 8] {
         let l = len.to_be_bytes();
-        [b'F', b'C', b'S', b'X', 3, kind, l[0], l[1]]
+        [b'F', b'C', b'S', b'X', 4, kind, l[0], l[1]]
     }
 
     fn roundtrip(frame: Frame) -> Vec<u8> {
@@ -770,7 +806,7 @@ mod tests {
         }
         assert_eq!(
             roundtrip(Frame::StdioHandover(StdioMask::new(0b101).unwrap())),
-            vec![0x46, 0x43, 0x53, 0x58, 3, 1, 0, 1, 0x05]
+            vec![0x46, 0x43, 0x53, 0x58, 4, 1, 0, 1, 0x05]
         );
     }
 
@@ -783,7 +819,7 @@ mod tests {
     fn sup6_simple_frames_concrete_bytes() {
         assert_eq!(
             roundtrip(Frame::PtyMaster),
-            vec![0x46, 0x43, 0x53, 0x58, 3, 3, 0, 0]
+            vec![0x46, 0x43, 0x53, 0x58, 4, 3, 0, 0]
         );
     }
 
@@ -794,7 +830,7 @@ mod tests {
         assert_eq!(bytes.len(), 73);
         assert_eq!(
             bytes.get(..8),
-            Some(&[0x46, 0x43, 0x53, 0x58, 3, 2, 0, 65][..])
+            Some(&[0x46, 0x43, 0x53, 0x58, 4, 2, 0, 65][..])
         );
         assert_eq!(bytes.get(8), Some(&11u8));
         assert_eq!(bytes.get(9..20), Some(&b"exec-4242-0"[..]));
@@ -841,7 +877,44 @@ mod tests {
             v2[4] = 2;
             assert_eq!(parse_header(&v2), Err(WireError::BadVersion), "kind {kind}");
         }
-        assert_eq!(VERSION, 3);
+        assert_eq!(VERSION, 4);
+    }
+
+    /// SUP-6・SEC-1・#4316: 旧い version 3 のヘッダは `BadVersion`（exec の開始前に fail-closed。旧い frame の結果を固定する）。
+    #[test]
+    fn sec1_4316_v3_frames_are_rejected_as_bad_version() {
+        for (kind, len) in [(1u8, 1u16), (2, 65), (3, 0), (4, 5), (5, 1), (6, 2)] {
+            let mut v3 = hdr(kind, len);
+            v3[4] = 3;
+            assert_eq!(parse_header(&v3), Err(WireError::BadVersion), "kind {kind}");
+        }
+    }
+
+    /// SUP-6・REPAIR-2・#4316: `Spawned` の具体バイト（pid 4242 = 0x1092）と往復。
+    #[test]
+    fn sup6_4316_spawned_frame_roundtrips_the_pid() {
+        let pid = NonZeroU32::new(4242).unwrap();
+        assert_eq!(
+            roundtrip(Frame::Spawned(pid)),
+            vec![0x46, 0x43, 0x53, 0x58, 4, 7, 0, 4, 0, 0, 0x10, 0x92]
+        );
+    }
+
+    /// SEC-1・REPAIR-2・#4316: pid 0 と長さの不一致は frame ごと拒否する。向きは helper → plugin-cri。
+    #[test]
+    fn sec1_4316_spawned_rejects_zero_pid_and_wrong_length() {
+        assert_eq!(
+            Frame::decode(Kind::Spawned, &[0, 0, 0, 0]),
+            Err(WireError::InvalidPid)
+        );
+        assert_eq!(
+            Frame::decode(Kind::Spawned, &[0, 0, 1]),
+            Err(WireError::LengthMismatch)
+        );
+        assert_eq!(parse_header(&hdr(7, 3)), Err(WireError::LengthMismatch));
+        assert_eq!(parse_header(&hdr(7, 5)), Err(WireError::LengthMismatch));
+        assert!(Kind::Spawned.is_from_helper());
+        assert!(!Kind::Spawned.is_to_helper());
     }
 
     /// SUP-6・REPAIR-2・#4282: `Signal` / `SignalAck` の具体バイトの往復。
@@ -850,7 +923,7 @@ mod tests {
         let term = ExecSignal::new(15).unwrap();
         assert_eq!(
             roundtrip(Frame::Signal(term)),
-            vec![0x46, 0x43, 0x53, 0x58, 3, 5, 0, 1, 0x0F]
+            vec![0x46, 0x43, 0x53, 0x58, 4, 5, 0, 1, 0x0F]
         );
         for code in [
             SignalAckCode::Delivered,
@@ -865,7 +938,7 @@ mod tests {
                 signal: term,
                 code: SignalAckCode::Delivered
             }),
-            vec![0x46, 0x43, 0x53, 0x58, 3, 6, 0, 2, 0x0F, 1]
+            vec![0x46, 0x43, 0x53, 0x58, 4, 6, 0, 2, 0x0F, 1]
         );
         assert_eq!(
             roundtrip(Frame::SignalAck {
@@ -933,6 +1006,7 @@ mod tests {
             (Kind::PtyMaster, false, true),
             (Kind::Result, false, true),
             (Kind::SignalAck, false, true),
+            (Kind::Spawned, false, true),
         ] {
             assert_eq!(kind.is_to_helper(), to_helper, "{kind:?}");
             assert_eq!(kind.is_from_helper(), from_helper, "{kind:?}");
@@ -1031,10 +1105,10 @@ mod tests {
         let mut bad = hdr(2, 65);
         bad[0] = b'X';
         assert_eq!(parse_header(&bad), Err(WireError::BadMagic));
-        let mut v4 = hdr(2, 65);
-        v4[4] = 4;
-        assert_eq!(parse_header(&v4), Err(WireError::BadVersion));
-        for k in [0u8, 7, 255] {
+        let mut v5 = hdr(2, 65);
+        v5[4] = 5;
+        assert_eq!(parse_header(&v5), Err(WireError::BadVersion));
+        for k in [0u8, 8, 255] {
             assert_eq!(parse_header(&hdr(k, 0)), Err(WireError::UnknownKind));
         }
         assert_eq!(

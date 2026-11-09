@@ -503,6 +503,8 @@ mod linux {
     /// 1 回の exec の結果。
     struct Finished {
         started: bool,
+        /// `Result` より前に届いた `Spawned` の pid（#4316）。
+        spawned: Option<u32>,
         outcome: StreamExecOutcome,
         stdout: Vec<u8>,
         stderr: Vec<u8>,
@@ -578,9 +580,14 @@ mod linux {
     /// `Result` まで受け、helper の終了（コード 0）と出力を回収する。
     fn finish(mut sp: Spawned) -> Finished {
         let mut started = false;
+        let mut spawned: Option<u32> = None;
         let outcome = loop {
             match recv_from_helper(&sp.plugin, Instant::now() + timeout()) {
                 Ok(HelperMessage::Started(_)) => started = true,
+                Ok(HelperMessage::Spawned { pid }) => {
+                    assert!(started, "Spawned must follow Started");
+                    assert!(spawned.replace(pid.get()).is_none(), "Spawned at most once");
+                }
                 Ok(HelperMessage::Result(o)) => break o,
                 Ok(HelperMessage::PtyMaster(_)) => panic!("unexpected PtyMaster without a tty"),
                 Ok(HelperMessage::SignalAck { .. }) => panic!("unexpected SignalAck"),
@@ -595,6 +602,7 @@ mod linux {
         let stderr = read_to_end_bounded(sp.stderr.try_clone().expect("clone stderr"), deadline);
         Finished {
             started,
+            spawned,
             outcome,
             stdout,
             stderr,
@@ -912,13 +920,26 @@ mod linux {
         let (cmd_pid, cmd_start) = cmds[0];
         let term = ExecSignal::new(15).expect("SIGTERM is allowed");
         send_signal(&sp.plugin, term, Instant::now() + timeout()).expect("send the signal");
-        match recv_from_helper(&sp.plugin, Instant::now() + timeout()).expect("signal ack") {
-            HelperMessage::SignalAck { signal, code } => {
-                assert_eq!(signal.get(), 15);
-                assert_eq!(code, SignalAckCode::Delivered);
+        // `Spawned`（コマンドのホスト側 pid）は `SignalAck` より前に 1 回だけ届き、`/proc` で特定した実コマンドの pid と一致する（#4316）。
+        let mut spawned: Option<u32> = None;
+        loop {
+            match recv_from_helper(&sp.plugin, Instant::now() + timeout()).expect("signal ack") {
+                HelperMessage::Spawned { pid } => {
+                    assert!(spawned.replace(pid.get()).is_none(), "Spawned at most once");
+                }
+                HelperMessage::SignalAck { signal, code } => {
+                    assert_eq!(signal.get(), 15);
+                    assert_eq!(code, SignalAckCode::Delivered);
+                    break;
+                }
+                other => panic!("expected Spawned or SignalAck, got {other:?}"),
             }
-            other => panic!("expected SignalAck, got {other:?}"),
         }
+        assert_eq!(
+            spawned,
+            Some(cmd_pid),
+            "Spawned must carry the real command pid and precede the SignalAck"
+        );
         match recv_from_helper(&sp.plugin, Instant::now() + timeout()).expect("result") {
             HelperMessage::Result(o) => assert_eq!(
                 o,
@@ -938,7 +959,7 @@ mod linux {
         );
         let _ = std::fs::remove_file(&ready);
         println!(
-            "stream_exec_real: scenario=signal_term SIGTERM reached the command, acked delivered, and the result was signaled 15"
+            "stream_exec_real: scenario=signal_term SIGTERM reached the command, spawned pid matched, acked delivered, and the result was signaled 15"
         );
     }
 
@@ -947,6 +968,10 @@ mod linux {
         let sp = spawn_exec(ctx, "echo", None, 20_000, HelperStderr::Inherit);
         let f = finish(sp);
         assert!(f.started, "Started must precede the result");
+        assert!(
+            f.spawned.is_some_and(|p| p > 0),
+            "Spawned must precede the result"
+        );
         assert_eq!(f.outcome, StreamExecOutcome::Exited(0));
         assert_eq!(f.stdout, b"se-stdout-line\n".to_vec());
         assert_eq!(f.stderr, b"se-stderr-line\n".to_vec());
@@ -961,6 +986,7 @@ mod linux {
             HelperStderr::Inherit,
         ));
         assert!(f.started);
+        assert!(f.spawned.is_some(), "Spawned must precede the result");
         assert_eq!(f.outcome, StreamExecOutcome::Exited(3));
         assert_eq!(f.stdout, Vec::<u8>::new());
         println!("stream_exec_real: scenario=exit3 exit code 3");
@@ -974,6 +1000,7 @@ mod linux {
             HelperStderr::Inherit,
         ));
         assert_eq!(f.outcome, StreamExecOutcome::Exited(0));
+        assert!(f.spawned.is_some(), "Spawned must precede the result");
         assert_eq!(f.stdout, b"se-stdin-payload\n".to_vec());
         println!("stream_exec_real: scenario=stdin payload echoed back");
 
@@ -988,7 +1015,14 @@ mod linux {
         );
         sp.child.kill().expect("kill the helper");
         crate::reap::reap_or_report(&mut sp.child, crate::reap::reap_within());
-        let err = recv_from_helper(&sp.plugin, Instant::now() + timeout()).unwrap_err();
+        // 死ぬ前に送られた `Spawned` が残っていることがある。読み捨ててから EOF と結果が無いことを確かめる（#4316）。
+        let err = loop {
+            match recv_from_helper(&sp.plugin, Instant::now() + timeout()) {
+                Ok(HelperMessage::Spawned { .. }) => {}
+                Ok(other) => panic!("unexpected {other:?} after the helper died"),
+                Err(e) => break e,
+            }
+        };
         assert_eq!(err, ChannelError::Closed, "no result after the helper died");
         let stopped = eventually(|| {
             let a = std::fs::metadata(&beat).map_or(0, |m| m.len());

@@ -95,15 +95,18 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use prost::Message;
 
 use super::exec::{
-    ExecId, ExecPhase, ExecProcessStatus, ExecRegistry, TaskExecLauncher, parse_process_spec,
-    sleep_until,
+    ExecId, ExecPhase, ExecProcessStatus, ExecRegistry, TaskExecLauncher, TaskExecProcess,
+    parse_process_spec, sleep_until,
+};
+use super::exec_exit_watch::{
+    ExecExitWatch, MAX_EXEC_EXIT_WATCHERS, WatchSlot, claim_and_publish, exec_task_exit,
 };
 use super::message::{RpcStatus, count_top_level_field};
 use super::publish::{
@@ -164,6 +167,10 @@ pub struct TaskService {
     /// 稼働中の終了 watcher の ID。v2 と v3 で共有し、同じ ID の watcher を重複させず、数を `MAX_EXIT_WATCHERS` で抑える。
     /// 値は作成世代のトークン。Delete が登録を外し、世代が違う watcher は publish しない（#4155）。
     exit_watchers: WatchRegistry,
+    /// 稼働中の exec 終了 watcher の数。v2 と v3 で共有し、`exec_watch_limit` で抑える（#4317・REPAIR-5）。
+    exec_exit_watchers: Arc<AtomicUsize>,
+    /// exec 終了 watcher の上限。既定は `MAX_EXEC_EXIT_WATCHERS`（試験だけが小さくする）。
+    exec_watch_limit: usize,
 }
 
 impl std::fmt::Debug for TaskService {
@@ -187,6 +194,8 @@ impl TaskService {
             created: Arc::new(Mutex::new(BTreeSet::new())),
             event_publisher: None,
             exit_watchers: Arc::new(Mutex::new(BTreeMap::new())),
+            exec_exit_watchers: Arc::new(AtomicUsize::new(0)),
+            exec_watch_limit: MAX_EXEC_EXIT_WATCHERS,
         }
     }
 
@@ -199,7 +208,9 @@ impl TaskService {
     /// 数は `MAX_EXIT_WATCHERS` が上限。Wait・State の経路からは publish しない。Delete は watcher と送信権（`exit_claim`）を取り合い、未送信なら TaskDelete の直前に代わりに送る（#4224）。
     ///
     /// `Exec`・`Start(exec_id)` の成功では TaskExecAdded・TaskExecStarted も送る（#4281）。`Delete(exec_id)` は runc shim と同じく送らない。
-    /// exec の TaskExit は送らない（exec 用の終了 watcher が無い。後続候補）。
+    /// `Start(exec_id)` の成功ごとに exec 用の終了 watcher も 1 本起こし、終了を観測したら TaskExit（`id = exec_id`）を 1 回だけ送る（#4317）。
+    /// 数は `MAX_EXEC_EXIT_WATCHERS` が上限で、超過・起動失敗は `watch_limit`・`watch_spawn` を 1 件記録する（Start の応答は変えない）。
+    /// 送信権は登録簿のエントリの印で `Delete(exec_id)`・コンテナの Delete と取り合い、二重には送らない。
     ///
     /// 残余: restart による一時的な Stopped は対象外。
     pub fn with_event_publisher(mut self, publisher: Arc<dyn EventPublisher>) -> Self {
@@ -220,6 +231,7 @@ impl TaskService {
         self.created = Arc::clone(&other.created);
         self.execs = Arc::clone(&other.execs);
         self.exit_watchers = Arc::clone(&other.exit_watchers);
+        self.exec_exit_watchers = Arc::clone(&other.exec_exit_watchers);
         self
     }
 
@@ -573,7 +585,56 @@ impl TaskService {
             exec_id: exec_id.as_str().to_owned(),
             pid,
         }));
+        // ExecStarted の後に起こす（速く終わる exec でも FIFO の worker が ExecStarted → TaskExit の順を保つ。#4317）。
+        self.spawn_exec_exit_watcher(&container, &exec_id, ticket.token(), process);
         Ok(StartResponse { pid }.encode_to_vec())
+    }
+
+    /// exec の終了 watcher を起こす（#4317）。publisher が無ければ何もしない。呼び出しはコンテナのゲート保持中。
+    /// 上限超過・スレッドの起動失敗は構造化ログを 1 件出して起こさない（Start の応答は変えない）。
+    /// 起こせなかった場合も、`Delete(exec_id)` が終了済みを確認できれば TaskExit を 1 回だけ補完する。
+    fn spawn_exec_exit_watcher(
+        &self,
+        container: &ContainerId,
+        exec_id: &ExecId,
+        token: u64,
+        process: Arc<dyn TaskExecProcess>,
+    ) {
+        let Some(publisher) = &self.event_publisher else {
+            return;
+        };
+        let Ok(snap) = self.execs.snapshot(container, exec_id) else {
+            return;
+        };
+        let Some(slot) = WatchSlot::acquire(&self.exec_exit_watchers, self.exec_watch_limit) else {
+            publisher.report(PublishFailure::new(
+                PublishStage::WatchLimit,
+                Some(super::publish::TASK_EXIT_TOPIC),
+            ));
+            return;
+        };
+        let ctx = ExecExitWatch {
+            process,
+            execs: Arc::clone(&self.execs),
+            container: container.clone(),
+            exec_id: exec_id.clone(),
+            token,
+            exit_claim: snap.exit_claim(),
+            publisher: Arc::clone(publisher),
+            wait: self.wait_config,
+            shutdown: self.shutdown.clone(),
+            _slot: slot,
+        };
+        let spawned = std::thread::Builder::new()
+            .name("shim-exec-exit-watch".into())
+            .spawn(move || ctx.run());
+        // 失敗時はクロージャ（ctx と枠）が drop され、枠は戻る。
+        if spawned.is_err() {
+            publisher.report(PublishFailure::new(
+                PublishStage::WatchSpawn,
+                Some(super::publish::TASK_EXIT_TOPIC),
+            ));
+        }
     }
 
     fn create(&self, payload: &[u8]) -> Result<Vec<u8>, RpcStatus> {
@@ -807,6 +868,26 @@ impl TaskService {
             }
             drop(guard);
         }
+        // 起動済みの exec の TaskExit を TaskDelete より前に確定する（#4317）。終了済みなら補完し、
+        // 実行中・照会の失敗は印だけ取って送らない（終了を捏造しない。purge 後は watcher も黙る）。
+        if let (Some(publisher), Some(container)) = (&self.event_publisher, &container) {
+            for (exec_id, process, claim) in self.execs.started_of(container) {
+                let finished = match process.status() {
+                    Ok(ExecProcessStatus::Exited { code }) => Some(code),
+                    _ => None,
+                };
+                match finished {
+                    Some(code) => {
+                        claim_and_publish(&claim, publisher.as_ref(), || {
+                            exec_task_exit(container, &exec_id, process.as_ref(), code)
+                        });
+                    }
+                    None => {
+                        *claim.lock().unwrap_or_else(|p| p.into_inner()) = true;
+                    }
+                }
+            }
+        }
         // 削除成功後に旧コンテナの exec 登録を除去する（同じ ID の再作成で引き継がない。CRI-5）。
         if let Some(container) = &container {
             self.execs
@@ -849,18 +930,31 @@ impl TaskService {
                 "cannot delete a running process",
             ))
         };
+        let mut exited = None;
+        let claim = snap.exit_claim();
         let (pid, exit_status) = match snap.phase {
             ExecPhase::Created => (0, 0),
             // ゲート保持中に Starting を見るのは起動役の panic で残った場合だけ。生きているかもしれないので除去しない。
             ExecPhase::Starting => return Err(running()),
             ExecPhase::Started { process } => match process.status().map_err(|e| to_status(&e))? {
                 ExecProcessStatus::Running => return Err(running()),
-                ExecProcessStatus::Exited { code } => (
-                    process.pid().map_or(0, NonZeroU32::get),
-                    exit_status_from_code(code),
-                ),
+                ExecProcessStatus::Exited { code } => {
+                    exited = Some((Arc::clone(&process), code));
+                    (
+                        process.pid().map_or(0, NonZeroU32::get),
+                        exit_status_from_code(code),
+                    )
+                }
             },
         };
+        // 終了済みの exec の TaskExit を、watcher と送信権を取り合って未送信なら補完する（#4317）。
+        // watcher が無い場合（上限超過・起動失敗・断念）も 1 回だけ送る。除去より前に行い、
+        // 取り合いの途中で登録が消えて watcher が黙る窓を作らない。
+        if let (Some(publisher), Some((process, code))) = (&self.event_publisher, exited) {
+            claim_and_publish(&claim, publisher.as_ref(), || {
+                exec_task_exit(&container, &exec_id, process.as_ref(), code)
+            });
+        }
         self.execs
             .remove(&container, &exec_id)
             .map_err(|e| to_status(&e))?;
@@ -1136,7 +1230,7 @@ fn stopped_exit_status(status: &RuntimeContainerStatus) -> u32 {
 }
 
 /// 終了コードから `exit_status` を決める。不明・負値は 255。
-fn exit_status_from_code(code: Option<i32>) -> u32 {
+pub(super) fn exit_status_from_code(code: Option<i32>) -> u32 {
     code.and_then(|c| u32::try_from(c).ok())
         .unwrap_or(UNKNOWN_EXIT_STATUS)
 }
@@ -3799,10 +3893,233 @@ mod tests {
                         exec_id: "e1".into(),
                         pid: 5151
                     }),
+                    // #4317: 終了後の Delete(exec_id) は、watcher が先でも補完でも TaskExit がちょうど 1 件。
+                    Ev::Exit(TaskExit {
+                        container_id: "c1".into(),
+                        id: "e1".into(),
+                        pid: 5151,
+                        exit_status: 0,
+                        exited_at: None,
+                    }),
                 ]
             );
             assert!(cap.failures.lock().unwrap().is_empty());
         }
+    }
+
+    /// exec の TaskExit だけを抜き出す。
+    fn exec_exits(cap: &CapturePublisher, exec_id: &str) -> Vec<TaskExit> {
+        cap.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                Ev::Exit(x) if x.id == exec_id => Some(x.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 起動済みの exec `e1`（コンテナ `c1`）と publisher つきのサービスを作る。
+    fn started_exec(
+        v: TaskApiVersion,
+        wait_ms: u64,
+        poll_ms: u64,
+    ) -> (
+        TaskService,
+        Arc<Fake>,
+        Arc<FakeLauncher>,
+        Arc<CapturePublisher>,
+    ) {
+        let (s, f, l) = svc_exec(v);
+        let cap = Arc::new(CapturePublisher::default());
+        let s = s
+            .with_wait_config(
+                WaitConfig::new(
+                    std::time::Duration::from_millis(wait_ms),
+                    std::time::Duration::from_millis(poll_ms),
+                )
+                .unwrap(),
+            )
+            .with_event_publisher(cap.clone());
+        running_container(&s, "c1");
+        s.handle("Exec", &exec_req("c1", "e1", SPEC)).unwrap();
+        s.handle("Start", &start_exec_req("c1", "e1")).unwrap();
+        (s, f, l, cap)
+    }
+
+    /// CRI-5・#4317: exec の終了で TaskExit（id = exec_id）が終了コード 0 と 3 の具体値でちょうど 1 回、ExecStarted の後に出る。
+    #[test]
+    fn cri5_4317_exec_exit_publishes_task_exit_once_for_codes_0_and_3() {
+        for v in [TaskApiVersion::V2, TaskApiVersion::V3] {
+            for code in [0u32, 3] {
+                let (s, _f, l, cap) = started_exec(v, 100, 10);
+                l.last().exit(Some(code as i32));
+                assert!(wait_until(std::time::Duration::from_secs(10), || {
+                    !exec_exits(&cap, "e1").is_empty()
+                }));
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                assert_eq!(
+                    exec_exits(&cap, "e1"),
+                    vec![TaskExit {
+                        container_id: "c1".into(),
+                        id: "e1".into(),
+                        pid: 5151,
+                        exit_status: code,
+                        exited_at: None,
+                    }],
+                    "{v:?} {code}"
+                );
+                let evs = cap.events.lock().unwrap().clone();
+                let started = evs
+                    .iter()
+                    .position(|e| matches!(e, Ev::ExecStarted(_)))
+                    .unwrap();
+                let exit = evs
+                    .iter()
+                    .position(|e| matches!(e, Ev::Exit(x) if x.id == "e1"))
+                    .unwrap();
+                assert!(started < exit, "{evs:?}");
+                assert!(cap.failures.lock().unwrap().is_empty());
+                assert!(wait_until(std::time::Duration::from_secs(10), || {
+                    s.exec_exit_watchers.load(Ordering::Acquire) == 0
+                }));
+            }
+        }
+    }
+
+    /// CRI-5・#4317: 終了コード不明は 255。
+    #[test]
+    fn cri5_4317_unknown_exit_code_is_255() {
+        let (_s, _f, l, cap) = started_exec(TaskApiVersion::V2, 100, 10);
+        l.last().exit(None);
+        assert!(wait_until(std::time::Duration::from_secs(10), || {
+            !exec_exits(&cap, "e1").is_empty()
+        }));
+        assert_eq!(exec_exits(&cap, "e1")[0].exit_status, 255);
+    }
+
+    /// CRI-5・#4317: watcher が観測する前の Delete(exec_id) が補完し、watcher は後から重複して送らない。
+    #[test]
+    fn cri5_4317_delete_exec_before_watcher_publishes_once() {
+        let (s, _f, l, cap) = started_exec(TaskApiVersion::V2, 5_000, 2_000);
+        l.last().exit(Some(3));
+        s.handle("Delete", &delete_req("c1", "e1")).unwrap();
+        assert_eq!(exec_exits(&cap, "e1").len(), 1);
+        // 登録が除去されたので watcher は取り消されて終わる。
+        assert!(wait_until(std::time::Duration::from_secs(10), || {
+            s.exec_exit_watchers.load(Ordering::Acquire) == 0
+        }));
+        assert_eq!(exec_exits(&cap, "e1").len(), 1);
+        assert_eq!(exec_exits(&cap, "e1")[0].exit_status, 3);
+    }
+
+    /// CRI-5・#4317: watcher が先に送った後の Delete(exec_id) は増やさない。
+    #[test]
+    fn cri5_4317_watcher_before_delete_exec_publishes_once() {
+        let (s, _f, l, cap) = started_exec(TaskApiVersion::V3, 100, 10);
+        l.last().exit(Some(0));
+        assert!(wait_until(std::time::Duration::from_secs(10), || {
+            !exec_exits(&cap, "e1").is_empty()
+        }));
+        s.handle("Delete", &delete_req("c1", "e1")).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(exec_exits(&cap, "e1").len(), 1);
+    }
+
+    /// CRI-5・#4317: 終了と Delete(exec_id) の間隔を変えて繰り返しても、毎回ちょうど 1 件。
+    #[test]
+    fn cri5_4317_delete_exec_race_never_duplicates() {
+        for i in 0..40u64 {
+            let (s, _f, l, cap) = started_exec(TaskApiVersion::V2, 100, 5);
+            l.last().exit(Some(0));
+            std::thread::sleep(std::time::Duration::from_millis(i % 8));
+            s.handle("Delete", &delete_req("c1", "e1")).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            assert_eq!(exec_exits(&cap, "e1").len(), 1, "round {i}");
+        }
+    }
+
+    /// CRI-5・#4317: 上限超過は `watch_limit` を記録し、Delete(exec_id) が終了済みを 1 回だけ補完する。
+    #[test]
+    fn cri5_4317_watch_limit_reports_and_delete_compensates() {
+        let (s, _f, l) = svc_exec(TaskApiVersion::V2);
+        let cap = Arc::new(CapturePublisher::default());
+        let mut s = fast_wait(s, 100).with_event_publisher(cap.clone());
+        s.exec_watch_limit = 1;
+        running_container(&s, "c1");
+        for e in ["e1", "e2"] {
+            s.handle("Exec", &exec_req("c1", e, SPEC)).unwrap();
+            s.handle("Start", &start_exec_req("c1", e)).unwrap();
+        }
+        let failures = cap.failures.lock().unwrap().clone();
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].stage, PublishStage::WatchLimit);
+        let second = Arc::clone(l.procs.lock().unwrap().get(1).unwrap());
+        second.exit(Some(7));
+        s.handle("Delete", &delete_req("c1", "e2")).unwrap();
+        assert_eq!(exec_exits(&cap, "e2").len(), 1);
+        assert_eq!(exec_exits(&cap, "e2")[0].exit_status, 7);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(exec_exits(&cap, "e2").len(), 1);
+    }
+
+    /// CRI-5・#4317: 未起動の Delete と起動役の失敗は TaskExit を出さず、watcher も起こさない。
+    #[test]
+    fn cri5_4317_created_exec_delete_and_failed_start_publish_no_exit() {
+        let (s, _f, l) = svc_exec(TaskApiVersion::V2);
+        let cap = Arc::new(CapturePublisher::default());
+        let s = fast_wait(s, 100).with_event_publisher(cap.clone());
+        running_container(&s, "c1");
+        s.handle("Exec", &exec_req("c1", "e1", SPEC)).unwrap();
+        s.handle("Delete", &delete_req("c1", "e1")).unwrap();
+        s.handle("Exec", &exec_req("c1", "e2", SPEC)).unwrap();
+        *l.fail.lock().unwrap() = true;
+        assert!(s.handle("Start", &start_exec_req("c1", "e2")).is_err());
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(s.exec_exit_watchers.load(Ordering::Acquire), 0);
+        assert!(exec_exits(&cap, "e1").is_empty());
+        assert!(exec_exits(&cap, "e2").is_empty());
+    }
+
+    /// CRI-5・#4317: コンテナの Delete は、終了済みの exec の TaskExit を TaskDelete より前に 1 件だけ出す。
+    #[test]
+    fn cri5_4317_container_delete_orders_exec_exit_before_task_delete() {
+        let (s, f, l, cap) = started_exec(TaskApiVersion::V2, 5_000, 2_000);
+        l.last().exit(Some(3));
+        stopped_with_time(&f, "c1", Some(0), 1_700_000_000_000_000_005);
+        s.handle("Delete", &delete_req("c1", "")).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let evs = cap.events.lock().unwrap().clone();
+        let exits: Vec<usize> = evs
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| matches!(e, Ev::Exit(x) if x.id == "e1"))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(exits.len(), 1, "{evs:?}");
+        let del = evs.iter().position(|e| matches!(e, Ev::Delete(_))).unwrap();
+        assert!(exits[0] < del, "{evs:?}");
+    }
+
+    /// CRI-5・#4317: Shutdown の要求で実行中 exec の watcher は取り消され、TaskExit は出ない。
+    #[test]
+    fn cri5_4317_shutdown_cancels_exec_watcher() {
+        let shutdown = ShutdownSignal::new();
+        let (s, _f, _l) = svc_exec(TaskApiVersion::V2);
+        let cap = Arc::new(CapturePublisher::default());
+        let s = fast_wait(s, 5_000)
+            .with_shutdown(shutdown.clone())
+            .with_event_publisher(cap.clone());
+        running_container(&s, "c1");
+        s.handle("Exec", &exec_req("c1", "e1", SPEC)).unwrap();
+        s.handle("Start", &start_exec_req("c1", "e1")).unwrap();
+        assert_eq!(s.exec_exit_watchers.load(Ordering::Acquire), 1);
+        let _ = shutdown.request();
+        assert!(wait_until(std::time::Duration::from_secs(10), || {
+            s.exec_exit_watchers.load(Ordering::Acquire) == 0
+        }));
+        assert!(exec_exits(&cap, "e1").is_empty());
     }
 
     /// CRI-5・#4281: 失敗した Exec・Start(exec_id) はイベントを出さない。

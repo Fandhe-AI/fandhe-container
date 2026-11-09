@@ -398,12 +398,19 @@ pub struct ExecSnapshot {
     /// 段階。
     pub phase: ExecPhase,
     token: u64,
+    exit_claim: Arc<Mutex<bool>>,
 }
 
 impl ExecSnapshot {
     /// 同じ登録の snapshot か（削除・再作成で別の登録になっていないか）。
     pub fn is_same_registration(&self, other: &ExecSnapshot) -> bool {
         self.token == other.token
+    }
+
+    /// exec の TaskExit の送信権の印（#4317）。真なら送信済み。取った側だけが送る。
+    /// 登録のエントリが持つので、エントリの除去とともに消える。ロックは送信（キュー投入）の完了まで保持する。
+    pub fn exit_claim(&self) -> Arc<Mutex<bool>> {
+        Arc::clone(&self.exit_claim)
     }
 }
 
@@ -416,6 +423,8 @@ struct ExecEntry {
     token: u64,
     /// 登録時のコンテナのインスタンス識別子（#4220）。現在の値と違えば別インスタンスの登録とみなす。
     instance: Option<u64>,
+    /// exec の TaskExit の送信権の印（#4317）。終了 watcher と `Delete(exec_id)`・コンテナの Delete が取り合う。
+    exit_claim: Arc<Mutex<bool>>,
 }
 
 /// `Start(exec_id)` の起動開始時に得る、検証済み仕様と登録固有のトークン。
@@ -424,6 +433,13 @@ pub struct StartTicket {
     /// 起動する exec の仕様。
     pub spec: ExecProcessSpec,
     token: u64,
+}
+
+impl StartTicket {
+    /// この登録に固有のトークン（終了 watcher が登録の生存確認に使う。#4317）。
+    pub(crate) fn token(&self) -> u64 {
+        self.token
+    }
 }
 
 /// コンテナ単位の排他に使うロックの本数（コンテナ ID のハッシュで選ぶ。増え続けない）。
@@ -590,6 +606,7 @@ impl ExecRegistry {
                 state: ExecState::Created,
                 token,
                 instance,
+                exit_claim: Arc::new(Mutex::new(false)),
             },
         );
         Ok(())
@@ -662,7 +679,45 @@ impl ExecRegistry {
         Ok(ExecSnapshot {
             phase,
             token: entry.token,
+            exit_claim: Arc::clone(&entry.exit_claim),
         })
+    }
+
+    /// 同じ登録（`token` が一致）が残っていて `Started` か。終了 watcher の取り消し判定に使う（#4317・REPAIR-5）。
+    /// 除去・コンテナの purge・作り直しの掃除・再登録のいずれでも偽になる。
+    pub fn is_live(&self, container: &ContainerId, exec_id: &ExecId, token: u64) -> bool {
+        let Ok(inner) = self.inner.lock() else {
+            return false;
+        };
+        inner
+            .map
+            .get(&key(container, exec_id))
+            .is_some_and(|e| e.token == token && matches!(e.state, ExecState::Started(_)))
+    }
+
+    /// コンテナの `Started` の exec の一覧（exec ID・ハンドル・送信権の印）。件数は
+    /// [`MAX_EXECS_PER_CONTAINER`] 以下。コンテナの Delete が exec の TaskExit を補完するために使う（#4317）。
+    #[allow(clippy::type_complexity)]
+    pub fn started_of(
+        &self,
+        container: &ContainerId,
+    ) -> Vec<(ExecId, Arc<dyn TaskExecProcess>, Arc<Mutex<bool>>)> {
+        let Ok(inner) = self.inner.lock() else {
+            return Vec::new();
+        };
+        inner
+            .map
+            .iter()
+            .filter(|((c, _), _)| c == container.as_str())
+            .filter_map(|((_, e), entry)| match &entry.state {
+                ExecState::Started(p) => Some((
+                    ExecId::new(e).ok()?,
+                    Arc::clone(p),
+                    Arc::clone(&entry.exit_claim),
+                )),
+                _ => None,
+            })
+            .collect()
     }
 
     /// 登録を除去する（`Delete(exec_id)` が、コンテナのゲート保持中に呼ぶ）。未登録は `NOT_FOUND`。
@@ -1073,5 +1128,31 @@ mod tests {
         );
         *p.0.lock().unwrap() = ExecProcessStatus::Exited { code: None };
         assert_eq!(p.wait_exit(Duration::ZERO, ms, &|| false).unwrap(), None);
+    }
+
+    /// CRI-5・#4317: `is_live` は Started の間だけ真で、除去・purge・再登録で偽になる。`started_of` は Started だけを返す。
+    #[test]
+    fn cri5_4317_registry_is_live_and_started_of() {
+        let r = ExecRegistry::new();
+        let c = ContainerId::new("c1").unwrap();
+        let e = ExecId::new("e1").unwrap();
+        let spec = parse_process_spec(&any(OK)).unwrap();
+        r.register(&c, &e, spec.clone(), None).unwrap();
+        let t = r.begin_start(&c, &e).unwrap();
+        assert!(!r.is_live(&c, &e, t.token()));
+        assert!(r.started_of(&c).is_empty());
+        let p = TestProc::running();
+        r.finish_start(&c, &e, &t, some(&p)).unwrap();
+        assert!(r.is_live(&c, &e, t.token()));
+        assert!(!r.is_live(&c, &e, t.token() + 1));
+        let started = r.started_of(&c);
+        assert_eq!(started.len(), 1);
+        assert_eq!(started[0].0, e);
+        r.remove(&c, &e).unwrap();
+        assert!(!r.is_live(&c, &e, t.token()));
+        r.register(&c, &e, spec, None).unwrap();
+        assert!(!r.is_live(&c, &e, t.token()));
+        r.purge_container(&c).unwrap();
+        assert!(r.started_of(&c).is_empty());
     }
 }

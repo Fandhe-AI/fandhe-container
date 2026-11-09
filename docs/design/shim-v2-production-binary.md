@@ -208,8 +208,8 @@ shim の serve の起動時に、scoped 状態ルートを `sweep_leftover_conta
 
 ### 送る種別の範囲
 
-- 送る: TaskCreate・TaskStart・TaskDelete・TaskExit・TaskExecAdded・TaskExecStarted の 6 種（runc shim の `cmd/containerd-shim-runc-v2/task/service.go` が `s.send` で送る種別のうち、本リポで RPC が実装済みのもの）
-- 除く: exec の TaskExit（exec 用の終了 watcher が無い。後続候補・未起票）、TaskPaused・TaskResumed・TaskCheckpointed（Pause・Resume・Checkpoint が `UNIMPLEMENTED`）、TaskOOM（memory.events を監視する仕組みが無い）
+- 送る: TaskCreate・TaskStart・TaskDelete・TaskExit（exec の終了を含む。#4317）・TaskExecAdded・TaskExecStarted の 6 種（runc shim の `cmd/containerd-shim-runc-v2/task/service.go` が `s.send` で送る種別のうち、本リポで RPC が実装済みのもの）
+- 除く: TaskPaused・TaskResumed・TaskCheckpointed（Pause・Resume・Checkpoint が `UNIMPLEMENTED`）、TaskOOM（memory.events を監視する仕組みが無い）
 - 再評価条件: 各 RPC が実装されたとき
 
 ### TaskExecAdded・TaskExecStarted の送信（実装済み。#4281・TASK-62.6・REPAIR-3・REPAIR-5）
@@ -220,7 +220,19 @@ shim の serve の起動時に、scoped 状態ルートを `sweep_leftover_conta
 - 各欄: TaskExecAdded は `container_id`・`exec_id`、TaskExecStarted は `container_id`・`exec_id`・`pid`（`StartResponse.pid` と同じ値）。本番の `TaskExecProcess::pid()` は `None` を返すため、本番の `pid` は 0（実 pid を装わない。REPAIR-3）。topic は `/tasks/exec-added`・`/tasks/exec-started`、type URL は `containerd.events.TaskExecAdded`・`containerd.events.TaskExecStarted`
 - 出典: containerd/containerd v2.1.4（commit `75cb2b7193e4e490e9fbdc236c0e811ccaba3376`）の `api/events/task.proto`（TaskExecAdded 1〜2・TaskExecStarted 1〜3）、`cmd/containerd-shim-runc-v2/task/service.go`（`Start` が成功後に exec なら TaskExecStarted、`Exec` が成功後に TaskExecAdded を `s.send`）、`internal/cri/server/events.go`（CRI は exec の TaskExit を `Use ID instead of ContainerID to rule out TaskExit event for exec.` として無視する）
 - 失敗: 既存の 4 種と同じ語彙・構造化ログ（topic は `/tasks/exec-added`・`/tasks/exec-started`）。コンテナ ID・exec ID は出さない。RPC の応答は変えない。上限（`MAX_EVENT_LEN`）は 255 バイトの ID 2 本でも収まることを試験で機械照合する
-- 残余: (1) exec の TaskExit は送らない。exec 用の終了 watcher（スレッド上限・`Delete(exec_id)` との送信権の取り合い）が要り、containerd の CRI は exec の TaskExit を無視し、CRI 以外のクライアントは Wait RPC で終了を知るため。後続候補（未起票）。再評価条件: CRI 以外のクライアント対応が要るとき、または exec の終了 watcher を入れるとき。(2) 本番の `pid` は 0（`Started` の wire への pid の追加に従属）。(3) 実 containerd での受信の確認は `shim_v2_containerd_real` と人間担当の #3685 に委ねる
+- 残余: (1) 解消（#4317。次節）。(2) 本番の `pid` は 0（`Started` の wire への pid の追加に従属）。(3) 実 containerd での受信の確認は `shim_v2_containerd_real` と人間担当の #3685 に委ねる
+
+### exec の TaskExit の送信（実装済み。#4317・TASK-62.6・CRI-5・REPAIR-3・REPAIR-5）
+
+本節は main の設計判断の記録であり、オーナー承認は得ていない。
+
+- 契機: `Start(exec_id)` が起動に成功し TaskExecStarted を投入した直後（コンテナのゲート保持中）に、exec ごとに終了 watcher を 1 本起こす（`exec_exit_watch.rs`）。TaskExecStarted を先にキューへ入れるので、速く終わる exec でも FIFO の worker が ExecStarted → TaskExit の順を保つ。publisher が無いとき、起動役が失敗した `Start(exec_id)` では起こさない
+- 待ち: `TaskExecProcess::wait_exit` を `WaitConfig` の期限で繰り返す。取り消しは Shutdown と「登録が消えた」（`ExecRegistry::is_live` が偽）で、10 ミリ秒刻みで効く。照会の失敗は連続 3 回で `watch` を 1 件記録して止まる。状態を確かめられないまま終了コードを作らない
+- 各欄: `container_id` はコンテナ ID、`id` は exec ID（containerd の CRI は `id != container_id` で exec の TaskExit を除外する）、`pid` は `TaskExecProcess::pid()`（本番は 0）、`exit_status` は終了コード（不明・負値は 255）、`exited_at` は未設定。世代の guard は使わない（終了は既に起きた事実）
+- 上限: 生存数は共有の `AtomicUsize` と RAII の枠で数え、上限 `MAX_EXEC_EXIT_WATCHERS`（= `MAX_EXECS_TOTAL` の 1024）を超えると `watch_limit`、スレッドの起動失敗は `watch_spawn` を 1 件記録して起こさない（`Start(exec_id)` の応答は変えない）。起動済みの exec は登録数以下なので正常系では超えない
+- 送信権: 印（`exit_claim`）は init の watcher の登録表ではなく exec 登録簿のエントリが持つ。エントリの除去経路（`Delete(exec_id)`・purge・作り直しの掃除）で印と生存確認が一緒に消えるため、経路ごとの同期が要らない。watcher・`Delete(exec_id)`・コンテナの Delete のうち先に印を取った 1 者だけが送る。ロック順は ゲート → claim → 登録簿の内部ロックで、watcher はゲートを取らない
+- 補完: `Delete(exec_id)` は `Started` かつ `Exited` のとき、印が未取得なら TaskExit を送ってから除去する（watcher が無い場合も同じ）。`Created` / `Starting` の Delete と `Running` の拒否では送らない。コンテナの Delete は、削除の成功後・TaskDelete の前に、そのコンテナの `Started` の exec を列挙し、終了済みなら TaskExit を補完、実行中・照会失敗は印だけ取って送らない。これで exec の TaskExit が TaskDelete より後に届くことは無い
+- 残余: (1) `exited_at` は未設定（exec の終了時刻の記録が無い。再評価条件: exec のハンドルが終了時刻を持つとき）。(2) 本番の `pid` は 0（TaskExecStarted と同じで、`Started` の wire への pid の追加に従属）。(3) 実行中の exec を持つコンテナが外で消えた・作り直された場合（Create・T4・T5 の除去）は、終了を確かめられないためその exec の TaskExit は送らない。(4) watcher が印を取った後に `try_send` がキュー満杯で失敗した TaskExit は失われる（init の残余 (1) と同じ性質）。(5) 本番の未確認の状態が猶予を超えると watcher は `watch` を記録して止まる。その後の `Delete(exec_id)` が `Exited` を確認できたときだけ補完する。(6) 実 containerd での受信の確認は人間担当の #3685
 
 ## Exec の橋渡し（#4147・CRI-5・CRI-1・PLUG-1・SEC-1・REPAIR-3・REPAIR-5・TASK-62.7）
 
@@ -397,7 +409,7 @@ TaskService は期限を足さず、実装側が持つ（トレイトの契約�
   - `pid()` は `None`（State の pid は 0）。許可リスト外のシグナル・env・cwd・user は `UNIMPLEMENTED`（許可内のシグナルは #4282 で対応）
 - **#4149 の実装記録**: `registry_parts_in`（`registry_in` の本体）で、scoped root と同じパス・同じ `StateStore` から `ShimExecLauncher::production` を 1 つ作り、停止用の包み `StopHelpersOnDrop` を通して v2・v3 の両方へ `with_exec_launcher` で差す（同時数の枠と追跡一覧は shim で 1 つ）。停止時の kill は cri の bootstrap に注入口を足さず、`run_serve` の終わりに登録簿が drop されて包みの最後の参照が落ちたとき `shutdown_all` が走る形にした（Shutdown RPC でも socket 消失でも同じ）。採らない案: bootstrap への停止注入口（cri の公開 API が変わる）、`ShutdownSignal` の見張りスレッド（socket 消失の経路を拾えず常駐スレッドが増える）、プロセス全体の `OnceLock`（同一プロセスの複数登録簿で衝突）、`ShimExecLauncher` 本体への `Drop`（#4148 の契約「drop は止めない」を変える）。非 Linux は `EmptyTaskService` のまま。試験: `cri5_4149_registry_exec_reaches_launcher`・`repair5_4149_registry_drop_stops_exec_helpers`・`cri5_4149_non_linux_registry_stays_empty`・bin 経由の `cri5_4149_bin_exec_*`。残余（REPAIR-3）: サーバー停止の期限切れで接続スレッドが残る場合と shim の SIGKILL では `shutdown_all` が走らず、helper は exec の期限（最長 1 時間）まで残る（PDEATHSIG を使わない既存の残余と同じ）。コンテナの削除・停止で cgroup が回収されれば helper は終わる。
 - **#4150 実機前提試験**（実装済み。`crates/plugin-cri/tests/shim_v2_exec_real.rs`）: shim の ttrpc を直接叩き、最小の Process spec（env 空・cwd `/`・user なし・stdio なし）で exec し、CapEff・Seccomp・ns の inode・exec 子 cgroup の配置を具体値で init と照合する。実装の判断: (1) `harness = false`（exec は stdio が `/dev/null` で pid も返さないため、試験バイナリ自身が rootfs の `/probe` として init と exec のコマンドを兼ねる再入が要る）、(2) cgroup は「init の直下の `exec-*` 子 cgroup 1 要素」で照合する（init と同じ cgroup にはならない）、(3) 解放は rootfs 直下の合図ファイルによる自然終了（SIGKILL は消滅を確認できず Delete が拒否される）、(4) CI の `platform-ci`（ubuntu）に組み込み済み。残余: 実コンテナのホスト `/proc/<pid>/ns/*` の読み取りは ptrace の READ 権に依存し、CI での初回実行で確認する
-- **後続候補（未起票）**: exec の TaskExit（exec 用の終了 watcher）、`Started` への pid の追加、stdio の FIFO の受け入れ、spec の欄を `config.json` と照合して受ける拡張と supervisor の exec ごとの env・cwd・user（#2712・#680 系列）、cri → supervisor の辺の機械照合（`dependency_direction.rs` の拡張）
+- **後続候補（未起票）**: `Started` への pid の追加、stdio の FIFO の受け入れ、spec の欄を `config.json` と照合して受ける拡張と supervisor の exec ごとの env・cwd・user（#2712・#680 系列）、cri → supervisor の辺の機械照合（`dependency_direction.rs` の拡張）
 
 ## 残り（REPAIR-3）
 

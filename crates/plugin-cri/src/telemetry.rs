@@ -17,13 +17,13 @@
 //! この sink へ出る（`streaming::connection_observer`。#4163・CRI-6）。
 //!
 //! # スナップショットファイル sink（#4337・CRI-6・REPAIR-4・REPAIR-5・SEC-4）
-//! [`OpStatsFileSink`] は 1 周期分の操作統計（記録器ごとのブロックを共有 → oci の順に連結。版のヘッダ行は付けない）を
+//! [`OpStatsFileSink`] は 1 周期分の操作統計（記録器ごとのブロックを CRI → ライフサイクル → oci の順（#4380）に連結。版のヘッダ行は付けない）を
 //! 専用 thread が `SnapshotTarget::replace` で原子的に置き換える。送り手はブロックせず、仕事中の周期は飛ばして数える。
 //! 失敗・飛ばしは `op_stats_file_failed` / `op_stats_file_skipped` の固定語彙の行で残す（パス・errno・コンテナ ID を含めない）。
 //! 設計の出典は `docs/design/cri-op-stats-export.md` の案 C（2026-11-09 承認・#4295）。`main.rs` へは `--op-stats-file`（#4340）で結線済みで、
 //! 指定時だけ開き、停止時は期限つきで最後の 1 回を書く。
 //!
-//! 操作統計は記録器ごとのブロックで出す。本番は共有記録器と oci 専用記録器の 2 つで、1 周期に `op_stats_meta` 行が 2 行出る（共有・oci の順。#2900）。
+//! 操作統計は記録器ごとのブロックで出す。本番は CRI 記録器・ライフサイクル記録器・oci 専用記録器の 3 つで、1 周期に `op_stats_meta` 行が 3 行出る（CRI・ライフサイクル・oci の順。#2900・#4380）。
 //!
 //! # 未実装（REPAIR-3）
 //! - Prometheus / OpenMetrics 形式の公開口は未対応（形式は stderr と同じ JSON Lines のまま）。監視基盤の要件が出たら再評価する
@@ -743,7 +743,7 @@ pub async fn op_stats_export_loop(recorder: Arc<OpRecorder>, period: Duration) {
 }
 
 /// [`op_stats_export_loop`] の複数記録器版。1 周期に記録器の数だけブロック（`op_stats_meta` 行も同数）が出る
-/// （本番は共有・oci 専用の順。#2900）。
+/// （本番は CRI・ライフサイクル・oci 専用の順。#2900・#4380）。
 pub async fn op_stats_export_loop_many(recorders: Vec<Arc<OpRecorder>>, period: Duration) {
     op_stats_export_loop_with(recorders, period, stderr_sink().clone(), None).await;
 }

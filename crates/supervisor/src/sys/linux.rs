@@ -170,6 +170,42 @@ fn unsupported() -> io::Error {
     io::Error::from(io::ErrorKind::Unsupported)
 }
 
+/// `PR_GET_DUMPABLE` の戻り値の分類（prctl(2) の `SUID_DUMP_*`）。
+///
+/// pod 保持役の段 2（`pod_holder`。#2874・#4376・SEC-5・CRI-2）が「0 のときだけ non-dumpable」と
+/// 照合するために使う。`Unknown` は未知の値で、呼び出し側は dumpable と同様に拒否する（fail-closed）。
+/// 値はカーネル内部の定義（`include/linux/sched/coredump.h`）で uapi の FFI 定数ではないため、
+/// `libc_abi` の照合の対象にしない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DumpableMode {
+    /// 0 (`SUID_DUMP_DISABLE`)。
+    Disable,
+    /// 1 (`SUID_DUMP_USER`)。
+    User,
+    /// 2 (`SUID_DUMP_ROOT`)。
+    Root,
+    /// 上記以外の値。
+    Unknown,
+}
+
+/// `PR_GET_DUMPABLE` の戻り値を [`DumpableMode`] へ分類する純関数。
+// 非 LP64 では `get_dumpable` のスタブがこの関数を呼ばず、lib ビルドで未使用になるため抑止する。
+#[cfg_attr(
+    not(any(
+        all(target_arch = "x86_64", target_pointer_width = "64"),
+        all(target_arch = "aarch64", target_pointer_width = "64")
+    )),
+    allow(dead_code)
+)]
+pub(crate) fn dumpable_mode_from_prctl(rc: i64) -> DumpableMode {
+    match rc {
+        0 => DumpableMode::Disable,
+        1 => DumpableMode::User,
+        2 => DumpableMode::Root,
+        _ => DumpableMode::Unknown,
+    }
+}
+
 /// `-1` なら直後の errno を `io::Error` にする（`-1` の直後に呼ぶこと）。
 fn check(rc: i64) -> io::Result<i64> {
     if rc == -1 {
@@ -346,14 +382,15 @@ mod syscall_ffi {
         check(i64::from(rc)).map(|_| ())
     }
 
-    /// `PR_GET_DUMPABLE` で自プロセスの dumpable 属性を読む（`true` は 1〈SUID_DUMP_USER〉。0 と 2 は `false`）。
+    /// `PR_GET_DUMPABLE` で自プロセスの dumpable 属性を読み、[`DumpableMode`] に分類する
+    /// （0 だけが `Disable`。2〈SUID_DUMP_ROOT〉と未知の値は non-dumpable とみなさない。#4376）。
     ///
     /// pod の保持役（`pod_holder`。#2874・SEC-5）が、再 exec で dumpable が 1 に戻った後に
     /// `set_dumpable(false)` が効いていることを fail-closed で確かめるために使う。
-    pub(crate) fn get_dumpable() -> io::Result<bool> {
+    pub(crate) fn get_dumpable() -> io::Result<DumpableMode> {
         // SAFETY: 引数は整数のみでポインタを渡さない。読み取りだけで状態を変えない。
         let rc = unsafe { prctl(PR_GET_DUMPABLE, 0u64, 0u64, 0u64, 0u64) };
-        Ok(check(i64::from(rc))? == 1)
+        check(i64::from(rc)).map(dumpable_mode_from_prctl)
     }
 
     /// `capget(2)` / `capset(2)` のヘッダ（`struct __user_cap_header_struct`）。
@@ -556,7 +593,7 @@ mod syscall_ffi {
         Err(unsupported())
     }
 
-    pub(crate) fn get_dumpable() -> io::Result<bool> {
+    pub(crate) fn get_dumpable() -> io::Result<DumpableMode> {
         Err(unsupported())
     }
 
@@ -1547,6 +1584,17 @@ mod libc_abi {
 
 #[cfg(test)]
 mod tests {
+    /// SEC-5・CRI-2・CORE-1・#4376: 0 だけが Disable。2 と未知の値は Disable にならない。
+    #[test]
+    fn sec5_4376_dumpable_mode_from_prctl_maps_concrete_values() {
+        assert_eq!(dumpable_mode_from_prctl(0), DumpableMode::Disable);
+        assert_eq!(dumpable_mode_from_prctl(1), DumpableMode::User);
+        assert_eq!(dumpable_mode_from_prctl(2), DumpableMode::Root);
+        assert_eq!(dumpable_mode_from_prctl(3), DumpableMode::Unknown);
+        assert_eq!(dumpable_mode_from_prctl(-2), DumpableMode::Unknown);
+        assert_eq!(dumpable_mode_from_prctl(i64::MAX), DumpableMode::Unknown);
+    }
+
     /// 対応外 arch の失敗は `pre_exec`（fork 後）から返るため、ヒープを確保する custom error ではなく
     /// `ErrorKind` だけの error である（inner が無く errno も持たない）。SUP-6・#3313・REPAIR-12。
     #[test]

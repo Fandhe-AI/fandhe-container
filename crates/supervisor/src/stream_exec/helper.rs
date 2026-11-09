@@ -14,7 +14,10 @@
 //!
 //! - fd 0: plugin-cri との channel（socket であることを確かめる。socket でなければ診断行を fd 2 に出して終了コード 1）
 //! - fd 1: `/dev/null`（helper 自身は書かない。コマンドの stdout は channel で受け取った fd）
-//! - fd 2: 診断行（channel を確保できない場合と、core の診断 JSON 行）
+//! - fd 2: 診断行。起動の失敗は段名・分類・errno の 1 行（[`HelperFailure::diagnostic_line`]。語彙は [`super::diag`]。#4284）を
+//!   `Result` の送信より前に書く（plugin-cri の読み手が停止後の短い drain で確実に拾えるように）。`Result` の送信が失敗した
+//!   ときは `helper_result_send` の行を足す。子の段の失敗（`NotStarted`）は `Result` frame が段を運ぶので行を足さない。
+//!   要求元の消滅で取り消したときの行（`code` と `message`）は従来の形のまま（実機前提の試験が照合する。#4166）。core の診断 JSON 行もここへ出る
 //! - 環境変数は空・cwd は `/`（[`stream_exec_command`]）。引数は [`StreamExecArgs`] の形式
 //!
 //! # 処理順
@@ -44,6 +47,8 @@
 //!   漏らした場合（端が閉じず検知できない）。
 //! - launch 時 env の読み込み（`launch_env_for`）は I/O が止まり得るが、単一スレッドを保つため期限つきの作業スレッドで
 //!   包まない（healthcheck helper・CLI exec と同じ残余）。
+//! - 起動失敗の errno は OS の errno があるときだけ運べる。状態ストア・launch env・監査 sink・要求の検証の失敗は core の
+//!   `TraitError` が errno を持たないため `none` になる（#4284。`TraitError` へ errno を持たせる案は別 issue）。
 //! - env は受け付けない（CRI は env を渡さず、基底は `config.json` の `process.env` と launch 時 env だけ。SEC-1）。
 //! - `argv` の先頭（コマンド本体）は絶対パスのみ（PATH 探索は #2439 の判断待ち）。
 
@@ -64,11 +69,12 @@ use fandhe_container_core::traits::{
 };
 
 use super::channel::{self, ChannelError};
+use super::diag::{HelperFailure, HelperStage};
 use super::wire::{
     ChildStatus, ExitSignal, StdioMask, StreamExecOutcome, error_code_to_u8, step_to_u8,
 };
 use crate::control::protocol::MAX_EXEC_HOLD_SECS;
-use crate::control::{ControlExecHandover, ExecPidfdSource};
+use crate::control::{ControlExecHandover, ExecControlFailure, ExecPidfdSource};
 use crate::exec::{ExecLaunchIo, ExecRequest, ExecStdio, default_audit_sink};
 
 /// helper を起動するサブコマンド名（bin の第 1 引数）。
@@ -378,42 +384,75 @@ fn production_runner(
         .map(|audited| audited.outcome.exit)
 }
 
-fn failed(e: &TraitError) -> StreamExecOutcome {
-    StreamExecOutcome::Failed(e.code())
-}
-
-fn channel_failed(e: &ChannelError) -> StreamExecOutcome {
-    StreamExecOutcome::Failed(e.code())
-}
-
 /// `Started` の送信期限。`SEND_BUDGET` を `total_deadline` で頭打ちにする（期限後に `Started` を出さない。REPAIR-5・SUP-6）。
 /// 期限切れ（`now >= total_deadline`）なら期限は `now` となり、`send_started` は送らず `Timeout` で失敗する。
 fn started_send_deadline(now: Instant, total_deadline: Instant) -> Instant {
     total_deadline.min(now + SEND_BUDGET)
 }
 
+/// [`serve_reporting`] の結果: `Result` frame の値と、起動の失敗の段・errno（#4284）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServeReport {
+    /// `Result` frame として送る値。
+    pub outcome: StreamExecOutcome,
+    /// 起動の失敗の段・分類・errno（`Exited`・`Signaled`・`NotStarted` と、要求元の消滅による取り消しは `None`）。
+    pub failure: Option<HelperFailure>,
+}
+
+fn early(stage: HelperStage, code: ErrorCode, errno: Option<i32>) -> ServeReport {
+    ServeReport {
+        outcome: StreamExecOutcome::Failed(code),
+        failure: Some(HelperFailure::new(stage, code, errno)),
+    }
+}
+
+fn early_trait(stage: HelperStage, e: &TraitError) -> ServeReport {
+    early(stage, e.code(), None)
+}
+
+fn early_control(stage: HelperStage, e: &ExecControlFailure) -> ServeReport {
+    early(stage, e.error().code(), e.errno())
+}
+
+fn early_channel(stage: HelperStage, e: &ChannelError) -> ServeReport {
+    early(stage, e.code(), e.errno())
+}
+
 /// 前提検査から exec の通しまで（処理順はモジュール doc）。`channel` へは `Started` だけを送り、`Result` は返り値で
-/// 呼び出し側（[`run_stream_exec_main`]）が送る。
+/// 呼び出し側（[`run_stream_exec_main`]）が送る。失敗の段・errno が要るときは [`serve_reporting`]。
 pub fn serve(channel: &UnixStream, args: &StreamExecArgs, deps: &Deps<'_>) -> StreamExecOutcome {
+    serve_reporting(channel, args, deps).outcome
+}
+
+/// [`serve`] と同じ処理で、`Result` の値に加えて起動の失敗の段・errno を返す（fd 2 の診断行用。SUP-6・REPAIR-4・#4284）。
+pub fn serve_reporting(
+    channel: &UnixStream,
+    args: &StreamExecArgs,
+    deps: &Deps<'_>,
+) -> ServeReport {
     let started = Instant::now();
     let total_deadline = started.checked_add(args.timeout()).unwrap_or(started);
 
     let record = match deps.store.get(&GetStateRequest::new(args.id().clone())) {
         Ok(record) => record,
-        Err(e) => return failed(&e),
+        Err(e) => return early_trait(HelperStage::StateGet, &e),
     };
     let status = record.status();
     if status.state() != ContainerState::Running || status.pid() != Some(args.expect_pid()) {
-        return StreamExecOutcome::Failed(ErrorCode::FailedPrecondition);
+        return early(
+            HelperStage::StateMismatch,
+            ErrorCode::FailedPrecondition,
+            None,
+        );
     }
     let launch_env = match (deps.launch_env)(args.root(), &record) {
         Ok(env) => env,
-        Err(e) => return failed(&e),
+        Err(e) => return early_trait(HelperStage::LaunchEnv, &e),
     };
     // 監査の記録先を先に作る（作れなければ supervisor へ接続も exec もしない。fail-closed。SEC-4）。
     let sink = match (deps.make_sink)(args.root()) {
         Ok(sink) => sink,
-        Err(e) => return failed(&e),
+        Err(e) => return early_trait(HelperStage::AuditSink, &e),
     };
     let request = match args
         .command()
@@ -421,41 +460,63 @@ pub fn serve(channel: &UnixStream, args: &StreamExecArgs, deps: &Deps<'_>) -> St
         .map(|first| ExecRequest::new(first.as_str(), args.command().iter().cloned()))
     {
         Some(Ok(request)) => request,
-        Some(Err(e)) => return failed(&e),
-        None => return StreamExecOutcome::Failed(ErrorCode::InvalidArgument),
+        Some(Err(e)) => return early_trait(HelperStage::Request, &e),
+        None => return early(HelperStage::Request, ErrorCode::InvalidArgument, None),
     };
 
     // 接続（`handover`）は exec の後始末が終わるまで保持する。drop が切断で、supervisor は通知済みの exec 子 cgroup を回収する。
     let pid = args.expect_pid();
     let handover_deadline = total_deadline.min(Instant::now() + HANDOVER_BUDGET);
-    let handover = match deps.source.obtain(args.id(), pid, handover_deadline) {
+    let handover = match deps
+        .source
+        .obtain_with_errno(args.id(), pid, handover_deadline)
+    {
         Ok(handover) => handover,
-        Err(e) => return failed(&e),
+        Err(e) => return early_control(HelperStage::PidfdHandover, &e),
     };
 
     let stdio_deadline = total_deadline.min(Instant::now() + STDIO_BUDGET);
     let fds = match channel::recv_stdio_handover(channel, args.stdio(), stdio_deadline) {
         Ok(fds) => fds,
-        Err(e) => return channel_failed(&e),
+        Err(e) => return early_channel(HelperStage::StdioHandover, &e),
     };
     // 受け取った fd の種別を exec より前に検査する。不一致は fork も kind 7 の通知もせず終える（SEC-1・#3761）。
-    if let Err(code) = require_stdio_kinds(&fds) {
-        return StreamExecOutcome::Failed(code);
+    if let Err(failure) = require_stdio_kinds(&fds) {
+        return ServeReport {
+            outcome: StreamExecOutcome::Failed(failure.code),
+            failure: Some(failure),
+        };
     }
 
     let remaining = total_deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
-        return StreamExecOutcome::Failed(ErrorCode::Timeout);
+        return early(HelperStage::Deadline, ErrorCode::Timeout, None);
     }
     // 通知（kind 7 と ack）に成功してから `Started` を送る。どちらかが失敗したら worker を fork せず exec を中止する。
+    // 失敗の段と errno は実行役の `Err` へ写る前にここで覚える（core の `TraitError` は errno を持たない。#4284）。
+    let created_failure: std::cell::Cell<Option<HelperFailure>> = std::cell::Cell::new(None);
     let on_created = |name: &ExecCgroupName| -> Result<(), TraitError> {
-        handover.notify_created(name, total_deadline)?;
+        if let Err(e) = handover.notify_created_with_errno(name, total_deadline) {
+            created_failure.set(Some(HelperFailure::new(
+                HelperStage::CgroupNotify,
+                e.error().code(),
+                e.errno(),
+            )));
+            return Err(e.into_error());
+        }
         channel::send_started(
             channel,
             name,
             started_send_deadline(Instant::now(), total_deadline),
         )
-        .map_err(|e| TraitError::new(e.code(), "failed to report the exec start to the caller"))
+        .map_err(|e| {
+            created_failure.set(Some(HelperFailure::new(
+                HelperStage::StartedSend,
+                e.code(),
+                e.errno(),
+            )));
+            TraitError::new(e.code(), "failed to report the exec start to the caller")
+        })
     };
     // 要求元（plugin-cri）の消滅の検知（#4166）。fd 0 の channel を読まずに `poll(timeout = 0)` で見て、消滅なら exec を
     // 取り消す（短絡に限り、期限と `hold_grace` は弱めない）。取り消したかは診断行のために覚える。
@@ -492,7 +553,20 @@ pub fn serve(channel: &UnixStream, args: &StreamExecArgs, deps: &Deps<'_>) -> St
             "stream-exec requester went away; exec cancelled",
         );
     }
-    outcome_from_result(result)
+    let outcome = outcome_from_result(result);
+    // 失敗の段: 通知・`Started` の送信で覚えたものを優先し、無ければ実行役の失敗（`Failed`）を `helper_exec` とする。
+    // 取り消し（要求元の消滅）は従来の行があるので足さない。
+    let failure = match created_failure.take() {
+        Some(f) => Some(f),
+        None if cancelled.get() => None,
+        None => match outcome {
+            StreamExecOutcome::Failed(code) => {
+                Some(HelperFailure::new(HelperStage::Exec, code, None))
+            }
+            _ => None,
+        },
+    };
+    ServeReport { outcome, failure }
 }
 
 /// 受け取った stdin・stdout・stderr の fd が AF_UNIX の socket か FIFO（pipe）であることを確かめる（SUP-6・SEC-1・#3761）。
@@ -500,19 +574,24 @@ pub fn serve(channel: &UnixStream, args: &StreamExecArgs, deps: &Deps<'_>) -> St
 /// 通常ファイル・ディレクトリ・文字デバイス（tty・pty・`/dev/null` を含む）・ブロックデバイスは `InvalidArgument`。
 /// ホストの端末 fd をコンテナのコマンドへ渡すと `TIOCSTI` 等で境界を越えうるため、plugin-cri が作る socketpair か
 /// pipe 以外を受けない。fd は複製して `fstat` し、複製は直ちに閉じる（`unsafe` なし）。
-fn require_stdio_kinds(fds: &channel::StdioFds) -> Result<(), ErrorCode> {
+fn require_stdio_kinds(fds: &channel::StdioFds) -> Result<(), HelperFailure> {
+    let internal = |e: std::io::Error| {
+        HelperFailure::new(
+            HelperStage::StdioKind,
+            ErrorCode::Internal,
+            e.raw_os_error(),
+        )
+    };
     for fd in [&fds.stdin, &fds.stdout, &fds.stderr].into_iter().flatten() {
-        let dup = fd
-            .as_fd()
-            .try_clone_to_owned()
-            .map_err(|_| ErrorCode::Internal)?;
+        let dup = fd.as_fd().try_clone_to_owned().map_err(internal)?;
         let file = std::fs::File::from(dup);
-        let ty = file
-            .metadata()
-            .map_err(|_| ErrorCode::Internal)?
-            .file_type();
+        let ty = file.metadata().map_err(internal)?.file_type();
         if !(ty.is_socket() || ty.is_fifo()) {
-            return Err(ErrorCode::InvalidArgument);
+            return Err(HelperFailure::new(
+                HelperStage::StdioKind,
+                ErrorCode::InvalidArgument,
+                None,
+            ));
         }
     }
     Ok(())
@@ -520,16 +599,23 @@ fn require_stdio_kinds(fds: &channel::StdioFds) -> Result<(), ErrorCode> {
 
 /// fd 0 の複製を channel として確保する。socket でなければ `None`（fail-closed）。`unsafe` を使わず、複製した fd が
 /// socket であることを `fstat` で確かめてから `UnixStream` にする。
-fn channel_from_stdin() -> Option<UnixStream> {
-    let dup = std::io::stdin().as_fd().try_clone_to_owned().ok()?;
+fn channel_from_stdin() -> Result<UnixStream, HelperFailure> {
+    let fail = |errno: Option<i32>| {
+        HelperFailure::new(HelperStage::Channel, ErrorCode::InvalidArgument, errno)
+    };
+    let dup = std::io::stdin()
+        .as_fd()
+        .try_clone_to_owned()
+        .map_err(|e| fail(e.raw_os_error()))?;
     let file = std::fs::File::from(dup);
-    if !file.metadata().ok()?.file_type().is_socket() {
-        return None;
+    let meta = file.metadata().map_err(|e| fail(e.raw_os_error()))?;
+    if !meta.file_type().is_socket() {
+        return Err(fail(None));
     }
-    Some(UnixStream::from(OwnedFd::from(file)))
+    Ok(UnixStream::from(OwnedFd::from(file)))
 }
 
-/// fd 2 へ構造化された診断行を 1 本書く（channel を確保できない場合の唯一の報告口。固定語彙のみ）。
+/// fd 2 へ構造化された診断行を 1 本書く（要求元の消滅の取り消しの行。固定語彙のみ）。
 fn diagnose(code: &str, message: &str) {
     let mut err = std::io::stderr();
     let _ = writeln!(err, "{{\"code\":\"{code}\",\"message\":\"{message}\"}}");
@@ -543,32 +629,53 @@ where
 {
     // 継承 fd の整理が最初。fd 0〜2 は呼び出し側の `Command` が置いたものだけを使う。
     let _ = crate::sys::close_fds_from(3);
-    let Some(channel) = channel_from_stdin() else {
-        diagnose("invalid-argument", "stream-exec requires a socket on fd 0");
-        return ExitCode::FAILURE;
+    let channel = match channel_from_stdin() {
+        Ok(channel) => channel,
+        Err(failure) => {
+            write_failure_line(&failure);
+            return ExitCode::FAILURE;
+        }
     };
-    let outcome = run_with_channel(&channel, args);
+    let ServeReport { outcome, failure } = run_with_channel(&channel, args);
+    // 診断行は `Result` の送信より前に書く（読み手は `Result` を受けてから停止し、短い drain で残りを読むため）。
+    if let Some(failure) = failure {
+        write_failure_line(&failure);
+    }
     match channel::send_result(&channel, &outcome, Instant::now() + SEND_BUDGET) {
         Ok(()) => ExitCode::SUCCESS,
-        Err(_) => ExitCode::FAILURE,
+        Err(e) => {
+            write_failure_line(&HelperFailure::new(
+                HelperStage::ResultSend,
+                e.code(),
+                e.errno(),
+            ));
+            ExitCode::FAILURE
+        }
     }
 }
 
-fn run_with_channel<I>(channel: &UnixStream, args: I) -> StreamExecOutcome
+/// 起動の失敗 1 件を fd 2 へ 1 行で書く（[`HelperFailure::diagnostic_line`]。固定語彙と整数だけ）。
+fn write_failure_line(failure: &HelperFailure) {
+    let mut err = std::io::stderr();
+    let _ = writeln!(err, "{}", failure.diagnostic_line());
+    let _ = err.flush();
+}
+
+fn run_with_channel<I>(channel: &UnixStream, args: I) -> ServeReport
 where
     I: IntoIterator<Item = OsString>,
 {
     // dumpable を落とせないまま特権操作へ進まない（fail-closed。SEC-1）。
-    if crate::sys::set_dumpable(false).is_err() {
-        return StreamExecOutcome::Failed(ErrorCode::Internal);
+    if let Err(e) = crate::sys::set_dumpable(false) {
+        return early(HelperStage::Dumpable, ErrorCode::Internal, e.raw_os_error());
     }
     let args = match StreamExecArgs::parse(args) {
         Ok(args) => args,
-        Err(e) => return failed(&e),
+        Err(e) => return early_trait(HelperStage::Args, &e),
     };
     let store = match crate::state::open_default_store(Some(args.root().to_path_buf())) {
         Ok(store) => store,
-        Err(e) => return failed(&e),
+        Err(e) => return early_trait(HelperStage::StateOpen, &e),
     };
     let source = ControlExecHandover::new(args.root().to_path_buf());
     let deps = Deps {
@@ -578,7 +685,7 @@ where
         launch_env: &crate::container_options::store::launch_env_for,
         run: &production_runner,
     };
-    serve(channel, &args, &deps)
+    serve_reporting(channel, &args, &deps)
 }
 
 #[cfg(test)]

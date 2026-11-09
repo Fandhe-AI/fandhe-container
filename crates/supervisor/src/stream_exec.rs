@@ -11,6 +11,7 @@
 //! 構成:
 //! - [`wire`]: 固定長・big-endian の frame の型と codec（純粋関数。語彙の正は同モジュールの doc）
 //! - [`channel`]: socketpair 上の期限つき送受信。fd の本数・向き・mask・pty master を検証して返す（受信失敗後は再利用しない契約。channel の doc）
+//! - [`diag`]: helper の起動失敗の段名・errno を fd 2 へ出す診断行の語彙と組み立て（#4284）
 //! - [`helper`]: helper の本体（`main` の `stream-exec` 振り分けの先。引数・処理順・結果の写像。#3760）
 //!
 //! # 未実装（REPAIR-3）
@@ -21,5 +22,6 @@
 //! Linux 限定（core の `exec::ExecChildStep` が Linux でしか使えないため。`exec` と同じ cfg）。
 
 pub mod channel;
+pub mod diag;
 pub mod helper;
 pub mod wire;

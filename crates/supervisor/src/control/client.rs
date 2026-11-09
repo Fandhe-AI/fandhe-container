@@ -140,6 +140,19 @@ impl super::ExecPidfdSource for ControlExecHandover {
     ) -> Result<super::ExecHandover, TraitError> {
         linux::exec_handover(&self.state_root, id, pid, deadline)
     }
+
+    /// errno つき版（#4284）。呼び出しの前後で同一スレッドの errno の受け渡し口を空にし、失敗に実際の errno だけを添える。
+    fn obtain_with_errno(
+        &self,
+        id: &ContainerId,
+        pid: NonZeroU32,
+        deadline: Instant,
+    ) -> Result<super::ExecHandover, super::ExecControlFailure> {
+        super::os_errno::clear();
+        let result = linux::exec_handover(&self.state_root, id, pid, deadline);
+        let errno = super::os_errno::take();
+        result.map_err(|e| super::ExecControlFailure::new(e, errno))
+    }
 }
 
 /// supervisor の制御チャネルから、稼働中コンテナの Attach 用の入力 fd と出力の tap の端を受け取る
@@ -434,7 +447,10 @@ mod linux {
                     }
                     CONNECT_BACKLOG_INTERVAL
                 }
-                Err(_) => return Err(unavailable()),
+                Err(e) => {
+                    crate::control::os_errno::record(&e);
+                    return Err(unavailable());
+                }
             };
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -445,6 +461,7 @@ mod linux {
     }
 
     fn io_error(e: &io::Error) -> TraitError {
+        crate::control::os_errno::record(e);
         if e.kind() == io::ErrorKind::TimedOut {
             timeout()
         } else {
@@ -476,7 +493,10 @@ mod linux {
         let mut stream = connect_until(&path, deadline)?;
 
         // listen 側の資格情報を確かめる（別 uid が同名のソケットを置いていても送らない）。
-        let cred = crate::sys::peer_credentials(stream.as_fd()).map_err(|_| unavailable())?;
+        let cred = crate::sys::peer_credentials(stream.as_fd()).map_err(|e| {
+            crate::control::os_errno::record(&e);
+            unavailable()
+        })?;
         if !peer_allowed(cred.uid, euid) {
             return Err(TraitError::new(
                 ErrorCode::PermissionDenied,
@@ -1022,6 +1042,18 @@ mod linux {
                 None => Ok(()),
                 Some(e) => Err(e),
             }
+        }
+
+        /// errno つき版（#4284）。書き込み・読み取りの OS エラーの errno だけを添える。
+        fn notify_created_with_errno(
+            &self,
+            name: &ExecCgroupName,
+            hold_until: Instant,
+        ) -> Result<(), crate::control::ExecControlFailure> {
+            crate::control::os_errno::clear();
+            let result = self.notify_created(name, hold_until);
+            let errno = crate::control::os_errno::take();
+            result.map_err(|e| crate::control::ExecControlFailure::new(e, errno))
         }
     }
     #[cfg(test)]

@@ -63,6 +63,8 @@ fn id(c: char) -> String {
 #[derive(Clone, Copy)]
 enum Answer {
     Running,
+    /// 終了コードつきの Stopped（E3 #4278 で `CorePresence::Present` が運ぶ値。R8 は見ない）。
+    Stopped,
     Internal,
     Sleep(Duration),
 }
@@ -94,6 +96,7 @@ impl ContainerRuntime for FakeRuntime {
         match self.0.get(r.id().as_str()).copied() {
             None => Err(TraitError::new(ErrorCode::NotFound, "gone")),
             Some(Answer::Running) => Ok(ContainerStatus::running(cid, None)),
+            Some(Answer::Stopped) => Ok(ContainerStatus::stopped(cid, Some(7))),
             Some(Answer::Internal) => Err(TraitError::new(ErrorCode::Internal, "failed")),
             Some(Answer::Sleep(d)) => {
                 std::thread::sleep(d);
@@ -252,6 +255,29 @@ fn oci7_orphan_bundles_reclaim_only_unowned_absent_directories() {
     // symlink もリンク先も残る。
     assert!(fs::symlink_metadata(bundles_dir(root).join(id('9'))).is_ok());
     assert!(outside.join("keep").exists());
+}
+
+/// OCI-7・CRI-1（E3 #4278）: core が終了コードつきの Stopped を答えても、記録なしの bundle は lifecycle だけを
+/// 見て「core にある」と扱い回収しない。
+#[test]
+fn oci7_orphan_bundles_keep_core_stopped() {
+    let tmp = TempDir::new("stopped");
+    let root = &tmp.0;
+    let provider = bundle_provider_in(root).expect("provider");
+    let store = FileRecordStore::open(root).expect("record store");
+    let lock =
+        std::sync::Arc::new(acquire_instance_lock_in(root, Duration::from_secs(1)).expect("lock"));
+    mkbundle(root, &id('a'));
+    let runtime = RuntimeAdapter::new(Arc::new(FakeRuntime(HashMap::from([(
+        id('a'),
+        Answer::Stopped,
+    )]))));
+    let out = reclaim_orphan_bundles(&lock, &provider, &store, &runtime, budget());
+    assert_eq!(
+        (out.scan, out.scanned, out.reclaimed, out.kept_present),
+        (OrphanScan::Completed, 1, 0, 1)
+    );
+    assert!(exists(root, &id('a')));
 }
 
 /// REPAIR-4: 要約行は固定語彙（文字列全体）で ID・パスを含まない。

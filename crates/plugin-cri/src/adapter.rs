@@ -2548,7 +2548,6 @@ mod tests {
         );
     }
 
-    /// #2894: 走査の要約行は `workers_busy` を `timed_out` と別に出す。
     /// #4342: supervisor ログの要約の行は `event` だけが違い、欄の並びは同じ。
     #[test]
     fn sup7_4342_supervisor_sweep_summary_line_differs_only_in_event() {
@@ -2598,6 +2597,7 @@ mod tests {
         }
     }
 
+    /// #2894: 走査の要約行は `workers_busy` を `timed_out` と別に出す。
     #[test]
     fn err1_2894_sweep_summary_line_has_workers_busy() {
         let r = fandhe_container_supervisor::logs::SweepReport {

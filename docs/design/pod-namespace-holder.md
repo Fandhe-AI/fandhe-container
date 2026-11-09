@@ -1,6 +1,6 @@
 # pod の namespace 保持役・netns の共有・本番の PodNetworkProvider 注入の設計（CRI-2・CORE-3・SEC-5・NET-3・CORE-1）
 
-設計記録（#2838）。コードは本変更で変えない。実装は「実装単位」の各 issue で行う。オーナー確認が要る点は「要確認事項」に分けて列挙する。
+設計記録（#2838）。コードは本変更で変えない。実装は「実装単位」の各 issue で行う。オーナーが 2026-11-09 に承認した（記録は #2838 のコメント）。採用は supervisor の bin の `pod-holder` モード・依存の追加なし・`unsafe` は各 crate の `sys` の事前承認範囲。旧要確認事項 3 点の決定は「オーナー判断（2026-11-09）」に記す。
 
 ## 背景
 
@@ -58,9 +58,9 @@
 
 ## 本番の PodNetworkProvider 注入
 
-- `CriPluginBackends::runtime_service` に、権限モデルが許すときだけ provider を差す受け口を設ける。rootless は pasta の provider（#1935・#341 の後）、rootful は #2241 の判断の後
+- `CriPluginBackends::runtime_service` に、権限モデルが許すときだけ provider を差す受け口を設ける。rootless は pasta の provider（起動方式は #340 の決定で決着済み。実装は #341 の後）、rootful は #2241 の判断の後
 - 保持役の注入は Linux・非 root で常に行う。ipc の共有は provider が無くても成立する
-- provider が無い `POD` の扱いは要確認事項 2
+- provider が無い `POD` は、保持役の netns（`lo` のみ）へ join して pod 内で localhost を共有する（オーナー判断 2）。`NetworkReady=false` は維持する
 - 本番の pod ネットワークが動くとは書かない
 
 ## PodSandboxStatus.network の IP 報告
@@ -85,15 +85,15 @@
 - rootful（uid 0）は #2241 の判断まで `UNIMPLEMENTED`。init userns 所有の netns への join は受けない
 - 依存は追加しない。追加が必要と分かったら承認事項として報告する
 
-## 要確認事項
+## オーナー判断（2026-11-09）
 
-1. 保持役の dumpable の扱い（未照合。H2 の受け入れ条件で、カーネルの一次情報〔tag・commit を固定した `fs/proc/namespaces.c`・`kernel/ptrace.c`〕と実機で確認する）。`/proc/<pid>/ns/*` の open は `PTRACE_MODE_READ_FSCREDS` を要し、non-dumpable の保持役が exec 後に `unshare` すると、同じ uid の core から開けない恐れがある。候補 (a) `unshare(USER)` の後に自身を再 exec して non-dumpable を保つ（推奨）、候補 (b) dumpable にして fd・秘密を一切持たない
-2. provider が無い `POD` で保持役の netns（`lo` だけ）へ join して pod 内で localhost を共有するか（推奨。core の net の join が入った後。`NetworkReady` は false のまま）
-3. 本番の pasta provider の起動点・版（#1935 に依存。依存の追加はユーザー承認制）
+1. 保持役の dumpable の扱い: 案 (a)（`unshare(USER)` の後に自身を再 exec して non-dumpable を保つ）を作業仮説とする。確定は H2（#2874）の受け入れ条件で、カーネルの一次情報（tag・commit を固定した `fs/proc/namespaces.c`・`kernel/ptrace.c`）と実機（ubuntu CI の `--ignored`）で行い、それまでは未確定として扱う。背景は、`/proc/<pid>/ns/*` の open が `PTRACE_MODE_READ_FSCREDS` を要し、non-dumpable の保持役が exec 後に `unshare` すると同じ uid の core から開けない恐れがあること。確定前の代替は案 (b)（dumpable にして fd・秘密を一切持たない）
+2. provider が無い `POD`: 保持役の netns（`lo` のみ）へ join し、pod 内で localhost を共有する（Kubernetes の意味論。core の net の join〔H7・#2872〕が入った後）。`NetworkReady=false` は維持する
+3. 本番の pasta provider: #340 の決定（利用者が導入した pasta を exec）で決着した。H10（#2879）は #341 待ちのまま。依存（crate）の追加は伴わない
 
 ## 実装単位
 
-起票元は #2838。すべて #2778 の sub-issue（`phase:7`）。
+起票元は #2838。H1〜H10 は中間親 #4334（`phase:7`・#4054 の配下）の sub-issue（#2643 への一時退避から付け替え済み）。H11（#2880）は人間担当として #816 の配下。
 
 | 記号 | issue | 内容 | 担当 | 依存 |
 | ---- | ----- | ---- | ---- | ---- |

@@ -36,8 +36,8 @@ use crate::run::MAX_WRITE_ATTEMPTS;
 
 /// core の既定ストア（`FileStateStore`）を開く。
 ///
-/// `root_override` が `None` なら core の既定ルート解決に従う。Linux 以外では core が `Unimplemented` を
-/// 返すので、そのまま伝播する（fail-closed。CLI-1）。
+/// `root_override` が `None` なら core の既定ルート解決に従う。macOS は core がストアを開け、Windows ホストでは core が設計上の拒否
+/// （`FailedPrecondition`。#2428 の案 C）を返すので、そのまま伝播する（fail-closed。CLI-1）。
 pub fn open_default_store(
     root_override: Option<PathBuf>,
 ) -> Result<Arc<dyn StateStore>, TraitError> {

@@ -98,8 +98,9 @@
 //! スレッド数も `proc_pidinfo` で数える（複数スレッドなら fork せず `MultiThreaded`）。macOS の代替経路
 //! （`kernel_audit.rs` は `UnsupportedTransport`）は未実装のため、主経路が失敗すれば記録は `SinkFailed` のままである
 //! （拒否の判定は覆らない。独自ハンドラを緩めない判断〔Agent の判断〕と拡張 ACL の判定不能の可用性の制約は
-//! `docs/design/audit-non-linux.md` 8 章。代替経路の方式は #2430 の案 N-L で未決定）。Windows は `FileStateStore::open` が
-//! `Unimplemented`（所有者 SID・DACL の検査に Win32 FFI が要るため）を返し、構築入口も fail-closed になる。
+//! `docs/design/audit-non-linux.md` 8 章。代替経路の方式は #2430 の案 N-L で未決定）。Windows ホストは `FileStateStore::open` が
+//! 設計上の恒久拒否（`FailedPrecondition`。状態はゲスト内の Linux パスに置く。#2428 の案 C・#4332）を返し、
+//! 記録先を持たず構築入口も fail-closed になる。
 //! Windows の主経路の隔離と非 Linux の代替経路の選択肢は `docs/design/audit-non-linux.md`（#2430・オーナー承認待ち）
 //! の判断資料にあり、方式は未決定である。
 //!
@@ -878,7 +879,7 @@ impl FileAuditSink {
     ///
     /// 呼び出し元: supervisor の `exec::default_audit_sink`（委譲）と、CLI の plugin バックエンド（plugin 信頼検証の
     /// 拒否の記録先）。`root_override` が `None` なら [`StateRoot::resolve`] の既定規則に従う。ストアを開く順序は
-    /// [`Self::in_state_store`] の型による固定と同じ。Windows では `FileStateStore::open` が `Unimplemented` を
+    /// [`Self::in_state_store`] の型による固定と同じ。Windows ホストでは `FileStateStore::open` が設計上の拒否（`FailedPrecondition`）を
     /// 返す（作成の前に拒否するため副作用は無い）。macOS はストアを開け、主経路が成功すれば記録できる（#2429）。
     /// 主経路が失敗すると代替経路が未実装のため `SinkFailed` になる（REPAIR-3・#2247。上の「未実装」節）。
     pub fn open_in_state_root(root_override: Option<PathBuf>) -> Result<Self, TraitError> {

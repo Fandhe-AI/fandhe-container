@@ -837,7 +837,9 @@ async fn production_binary_exec_real() {
         let ledger = reclaim::Ledger::default();
 
         // 試行 1（注入）: StartContainer の直後に固定文言で panic させ、回収が効くことを確かめる。
-        let b1 = reclaim::scenario_budget(started.elapsed(), WATCHDOG, 4)
+        // 試行 1 が確保するのは自分の回収（再起動を含め 2 回）分だけにする。試行 2 の分は試行 2 の直前に
+        // 経過を差し引いて確保するため、ここで先取りすると pull が長引いたときに注入の期限が 0 になる。
+        let b1 = reclaim::scenario_budget(started.elapsed(), WATCHDOG, 2)
             .min(reclaim::INJECT_ATTEMPT_LIMIT);
         let r1 = reclaim::guarded(
             scenario(
@@ -852,10 +854,13 @@ async fn production_binary_exec_real() {
             b1,
         )
         .await;
-        let exited = lock_srv(&srv).guard.exited().is_some();
-        let rr1 = reclaim::reclaim_restarting(&mut c, &ledger, &token, exited, async || {
-            restart_plugin(&srv, &plugin_bin, &r1_sock).await
-        })
+        let rr1 = reclaim::reclaim_restarting(
+            &mut c,
+            &ledger,
+            &token,
+            || lock_srv(&srv).guard.exited().is_some(),
+            async || restart_plugin(&srv, &plugin_bin, &r1_sock).await,
+        )
         .await;
         let rep1 = rr1.final_report();
         if let Some(line) = reclaim::left_line(TEST, rep1) {
@@ -904,7 +909,8 @@ async fn production_binary_exec_real() {
             reclaim::restart_reclaim_line(TEST, &rr1),
             Some(want.clone())
         );
-        // libtest の出力捕捉を迂回して CI の `--require` で照合できるようにする。
+        // `std::io::stderr()` への直接書き込みは libtest の出力捕捉（`print!` / `eprintln!` 系のみが対象）を受けないため、
+        // `--nocapture` なしの CI でも `--require` で照合できる。
         {
             use std::io::Write as _;
             let _ = writeln!(std::io::stderr(), "{want}");
@@ -912,27 +918,34 @@ async fn production_binary_exec_real() {
         eprintln!("{TEST}: injected failure reclaimed containers=1 sandboxes=1");
 
         // 試行 2（本番）: 同じトークン（同じ metadata）で最後まで通す。回収が効いていなければ ALREADY_EXISTS で落ちる。
-        let b2 = reclaim::scenario_budget(started.elapsed(), WATCHDOG, 2)
-            .saturating_sub(STARTUP_DEADLINE);
-        let r2 = reclaim::guarded(
-            scenario(
-                c.clone(),
-                token.clone(),
-                ledger.clone(),
-                false,
-                srv.clone(),
-                plugin_bin.clone(),
-                sock2.clone(),
-            ),
-            b2,
-        )
-        .await;
+        // 残りが試行 2 に足りなければ始めず、回収（予約済み）を先に走らせて期限超過で失敗させる。
+        let r2 = match reclaim::attempt2_budget(started.elapsed(), WATCHDOG, STARTUP_DEADLINE) {
+            Some(b2) => {
+                reclaim::guarded(
+                    scenario(
+                        c.clone(),
+                        token.clone(),
+                        ledger.clone(),
+                        false,
+                        srv.clone(),
+                        plugin_bin.clone(),
+                        sock2.clone(),
+                    ),
+                    b2,
+                )
+                .await
+            }
+            None => Err(reclaim::AttemptFailure::Deadline),
+        };
         // 段 4 の後は plugin-cri が再起動済みなので、回収は共有の入れ物の最新の接続で行う（死んでいれば起動し直す。#4326）。
         let mut c = RuntimeServiceClient::new(lock_srv(&srv).ch.clone());
-        let exited = lock_srv(&srv).guard.exited().is_some();
-        let rr2 = reclaim::reclaim_restarting(&mut c, &ledger, &token, exited, async || {
-            restart_plugin(&srv, &plugin_bin, &r2_sock).await
-        })
+        let rr2 = reclaim::reclaim_restarting(
+            &mut c,
+            &ledger,
+            &token,
+            || lock_srv(&srv).guard.exited().is_some(),
+            async || restart_plugin(&srv, &plugin_bin, &r2_sock).await,
+        )
         .await;
         let rep2 = rr2.final_report();
         if let Some(line) = reclaim::left_line(TEST, rep2) {

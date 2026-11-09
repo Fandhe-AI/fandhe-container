@@ -189,6 +189,22 @@ pub fn scenario_budget(elapsed: Duration, watchdog: Duration, cleanups: u32) -> 
         .saturating_sub(MARGIN)
 }
 
+/// 試行 2（本番）に最低限必要な予算（exec の段 4 の plugin kill・helper 待ち・再起動や attach の自然終了待ち 30 秒を収める）。
+#[allow(dead_code)] // 取り込む試験ごとに使う項目が異なるため
+pub const ATTEMPT2_MIN_BUDGET: Duration = Duration::from_secs(90);
+
+#[allow(dead_code)] // 取り込む試験ごとに使う項目が異なるため
+/// 試行 2 の予算。回収の予約を食い込む固定の下限は置かず、`scenario_budget` から `startup` を引いた残りが
+/// `ATTEMPT2_MIN_BUDGET` に満たなければ `None`（試行 2 を始めず、回収を先に走らせて期限超過で失敗させる。#4326）。
+pub fn attempt2_budget(
+    elapsed: Duration,
+    watchdog: Duration,
+    startup: Duration,
+) -> Option<Duration> {
+    let b = scenario_budget(elapsed, watchdog, 2).saturating_sub(startup);
+    (b >= ATTEMPT2_MIN_BUDGET).then_some(b)
+}
+
 #[allow(dead_code)] // 取り込む試験ごとに使う項目が異なるため
 /// 回収の結果。
 #[derive(Debug, Default, PartialEq)]
@@ -291,18 +307,21 @@ impl RestartReclaim {
 /// `restart` は旧 plugin の kill と回収（`.cri/@instance.lock` の解放）→ spawn → 接続を行い、新しい client を返す
 /// （新しい guard の保管も呼び出し側が行う）。起動し直しは高々 1 回。台帳は 1 回目の回収で空になるので、
 /// 起動し直した後はトークン label の一覧で記録を見つける。
-pub async fn reclaim_restarting<R>(
+/// `plugin_exited` は 1 回目の回収の後に評価する（回収の途中で plugin が死んだ場合を、回収前の古い観測で見逃さないため。
+/// 一覧が失敗しても他の記録を回収できていると [`plugin_unreachable`] は偽になるので、死活は別に確かめる）。
+pub async fn reclaim_restarting<E, R>(
     c: &mut RuntimeServiceClient<Channel>,
     ledger: &Ledger,
     token: &str,
-    plugin_exited: bool,
+    plugin_exited: E,
     restart: R,
 ) -> RestartReclaim
 where
+    E: FnOnce() -> bool,
     R: AsyncFnOnce() -> RuntimeServiceClient<Channel>,
 {
     let first = reclaim(c, ledger, token, CLEANUP_BUDGET).await;
-    if !needs_restart(plugin_exited, &first) {
+    if !needs_restart(plugin_exited(), &first) {
         return RestartReclaim {
             first,
             after_restart: None,

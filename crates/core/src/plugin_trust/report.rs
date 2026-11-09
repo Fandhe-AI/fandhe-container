@@ -27,7 +27,7 @@
 //!   も実装済みで、主経路が成功すれば拒否は記録される。未実装なのは代替経路（#2430）で、主経路が失敗すると
 //!   記録は `SinkFailed` のまま（拒否は覆らない）。失敗する例は、呼び出し元が複数スレッド、SIGCHLD が `SIG_DFL`
 //!   でない、ACL を判定できない FS（`docs/design/audit-non-linux.md` 8 章）。Windows は検証が常に `Unsupported` を
-//!   返し、`FileStateStore::open` が `Unimplemented`（所有者 SID・DACL の検査が未実装。#2428）で記録先を作れない
+//!   返し、`FileStateStore::open` が設計上の恒久拒否（`FailedPrecondition`。#2428 の案 C・#4332）で記録先を作れない
 //! - レジストリ登録・spawn の経路（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認と実装 issue の起票は #2232〕）への配線: 現状の呼び出し元は CLI の plugin バックエンドだけ
 //!
 //! # `container_id` を付けない理由（R4）

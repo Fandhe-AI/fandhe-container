@@ -1121,7 +1121,7 @@ impl KickCell {
         };
         // SAFETY: `thread` は `armed` が武装中に `pthread_self` で入れた値で、`armed` の閉包（対象スレッドの上で
         // 同期実行）が戻るまで対象スレッドは生存する。解除は同じ mutex の下で行われ、この `g` を保持している間は
-        // 解除されないので、終了したスレッドへは送らない。シグナル番号は固定の SIGUSR2。ポインタ引数は無い。
+        // 解除されないので、終了したスレッドへは送らない（`Disarm::drop` も同じ `target` の mutex を取る。#4329）。シグナル番号は固定の SIGUSR2。ポインタ引数は無い。
         // 戻り値は errno そのもの。
         let r = unsafe { pthread_kill(thread, SIG_VCPU_KICK) };
         drop(g);
@@ -1734,8 +1734,12 @@ impl RunAreaMut for KvmRunMap {
 impl Drop for KvmRunMap {
     fn drop(&mut self) {
         // SAFETY: `ptr` / `len` は `map` が成功した mmap の戻り値と長さそのもので、drop は 1 度だけ呼ばれる。
-        // 失敗しても何もできず、drop で panic しないため戻り値は無視する。
-        let _ = unsafe { munmap(self.ptr.as_ptr().cast::<c_void>(), self.len) };
+        // 失敗しても再試行・panic はせずリークを受け入れ、固定の 1 行で観測するだけにする（#4330・REPAIR-4）。
+        // 試験は ptr をずらして EINVAL を起こすが、munmap は引数を参照外ししない。
+        let rc = unsafe { munmap(self.ptr.as_ptr().cast::<c_void>(), self.len) };
+        if let Some(line) = unmap_failure_line(rc, KVM_RUN_UNMAP_FAILED_LINE) {
+            crate::hvf_loop::log_line(format_args!("{line}"));
+        }
     }
 }
 
@@ -2093,9 +2097,27 @@ impl Drop for GuestRamMap {
     fn drop(&mut self) {
         // SAFETY: `ptr` / `len` は `map` が成功した mmap の戻り値と長さそのもので、drop は 1 度だけ呼ばれる。
         // KVM への登録中は `RegisteredGuestRam` が所有し、slot の削除に成功した後にだけここへ来る（失敗時は
-        // `forget` で漏らす）。失敗しても何もできず、drop で panic しないため戻り値は無視する。
-        let _ = unsafe { munmap(self.ptr.as_ptr().cast::<c_void>(), self.len) };
+        // `forget` で漏らす）。失敗しても再試行・panic はせずリークを受け入れ、固定の 1 行で観測するだけにする
+        // （#4330・REPAIR-4）。試験は ptr をずらして EINVAL を起こすが、munmap は引数を参照外ししない。
+        let rc = unsafe { munmap(self.ptr.as_ptr().cast::<c_void>(), self.len) };
+        if let Some(line) = unmap_failure_line(rc, GUEST_RAM_UNMAP_FAILED_LINE) {
+            crate::hvf_loop::log_line(format_args!("{line}"));
+        }
     }
+}
+
+/// `GuestRamMap` の munmap 失敗時に出す固定の 1 行（MVM-1・REPAIR-4・#4330）。HVF の `op=hvf.host_unmap`
+/// （#4292）と同じ文法。errno・アドレス・長さは出さず（ホストのアドレス配置を漏らさない）完全な定数にする。
+const GUEST_RAM_UNMAP_FAILED_LINE: &str =
+    "level=error op=kvm.guest_ram_unmap outcome=error leaked=guest_ram";
+
+/// `KvmRunMap` の munmap 失敗時に出す固定の 1 行（MVM-1・REPAIR-4・#4330）。出さない情報は上と同じ。
+const KVM_RUN_UNMAP_FAILED_LINE: &str = "level=error op=kvm.run_unmap outcome=error leaked=kvm_run";
+
+/// munmap の戻り値から出す行を決める純関数。0 以外はすべて失敗として `line` を返す（fail-closed）。
+/// `GuestRamMap` / `KvmRunMap` の drop から呼ばれる。
+fn unmap_failure_line(rc: i32, line: &'static str) -> Option<&'static str> {
+    if rc == 0 { None } else { Some(line) }
 }
 
 /// `slot` の memslot を削除する（`memory_size = 0` の再登録）。
@@ -3278,6 +3300,65 @@ mod tests {
         assert!(present(&needle));
         drop(m);
         assert!(!present(&needle));
+    }
+
+    /// MVM-1・REPAIR-4・#4330: munmap の戻り値と固定行の対応。0 は行なし、それ以外はすべて行あり。
+    #[test]
+    fn mvm1_4330_unmap_failure_line_maps_rc() {
+        assert_eq!(unmap_failure_line(0, GUEST_RAM_UNMAP_FAILED_LINE), None);
+        for rc in [-1, 1] {
+            assert_eq!(
+                unmap_failure_line(rc, GUEST_RAM_UNMAP_FAILED_LINE),
+                Some("level=error op=kvm.guest_ram_unmap outcome=error leaked=guest_ram")
+            );
+            assert_eq!(
+                unmap_failure_line(rc, KVM_RUN_UNMAP_FAILED_LINE),
+                Some("level=error op=kvm.run_unmap outcome=error leaked=kvm_run")
+            );
+        }
+    }
+
+    /// MVM-1・REPAIR-4・#4330: ゲスト RAM の munmap が失敗（ptr をずらして EINVAL）したら固定の 1 行が出る。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn mvm1_4330_guest_ram_unmap_failure_emits_one_line() {
+        let m = GuestRamMap::map(8192).unwrap();
+        let fake = GuestRamMap {
+            ptr: NonNull::new(m.ptr.as_ptr().wrapping_byte_add(1)).unwrap(),
+            len: m.len,
+        };
+        let ((), lines) = crate::hvf_loop::capture_log_lines(|| drop(fake));
+        assert_eq!(
+            lines,
+            vec!["level=error op=kvm.guest_ram_unmap outcome=error leaked=guest_ram".to_string()]
+        );
+        drop(m);
+    }
+
+    /// MVM-1・REPAIR-4・#4330: `kvm_run` 領域の munmap 失敗でも固定の 1 行が出る（KVM 不要）。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn mvm1_4330_kvm_run_unmap_failure_emits_one_line() {
+        let m = GuestRamMap::map(8192).unwrap();
+        let fake = KvmRunMap {
+            ptr: NonNull::new(m.ptr.as_ptr().wrapping_byte_add(1)).unwrap(),
+            len: m.len,
+        };
+        let ((), lines) = crate::hvf_loop::capture_log_lines(|| drop(fake));
+        assert_eq!(
+            lines,
+            vec!["level=error op=kvm.run_unmap outcome=error leaked=kvm_run".to_string()]
+        );
+        drop(m);
+    }
+
+    /// MVM-1・REPAIR-4・#4330: munmap が成功したら行は出ない。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn mvm1_4330_guest_ram_unmap_success_emits_no_line() {
+        let m = GuestRamMap::map(8192).unwrap();
+        let ((), lines) = crate::hvf_loop::capture_log_lines(|| drop(m));
+        assert_eq!(lines, Vec::<String>::new());
     }
 
     /// MVM-1・#4158: 登録に渡る構造体の `flags` は指定値（0・1・2・3）のまま、他のフィールドも具体値どおり。

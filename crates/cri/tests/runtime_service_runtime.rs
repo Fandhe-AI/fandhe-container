@@ -95,6 +95,8 @@ struct FakeRuntime {
     fail_state_ids: Mutex<std::collections::HashMap<String, ErrorCode>>,
     /// start が受けた `StartRequest::log_path()`（CRI-2・SUP-4・#2671 の検証用）。
     start_log_paths: Mutex<Vec<Option<String>>>,
+    /// ID ごとに state が報告するインスタンス識別子（無ければ報告しない。#4286 の検証用）。
+    instances: Mutex<std::collections::HashMap<String, u64>>,
     /// start が受けた `StartRequest::stdin()`（CRI-6・#4076 の検証用）。
     start_stdin_modes: Mutex<Vec<fandhe_container_core::traits::StdinMode>>,
 }
@@ -217,6 +219,20 @@ impl ContainerRuntime for Shared {
         Err(TraitError::new(ErrorCode::Unimplemented, "not used"))
     }
     fn state(&self, r: &StateRequest) -> Result<ContainerStatus, TraitError> {
+        let status = self.state_inner(r)?;
+        Ok(
+            match self.0.instances.lock().unwrap().get(r.id().as_str()) {
+                Some(i) => status.with_instance(
+                    fandhe_container_core::traits::ContainerInstance::from_raw(*i),
+                ),
+                None => status,
+            },
+        )
+    }
+}
+
+impl Shared {
+    fn state_inner(&self, r: &StateRequest) -> Result<ContainerStatus, TraitError> {
         self.0.state_calls.fetch_add(1, Ordering::SeqCst);
         while self.0.hold_state.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(1));
@@ -3102,4 +3118,193 @@ async fn cri_2_4175_stop_during_list_observation_wins() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     let st = status(&service, &id).await;
     assert_eq!((st.state, st.exit_code), (S::ContainerExited as i32, 137));
+}
+
+// ---- #4286: RuntimeService の Exec の URL 発行時にインスタンスを記録する（CRI-5・SEC-1・CORE-1） ----
+
+/// 発行された要求を記録して 200 を返すテスト用ハンドラ（Exec を結線済みと答える）。
+#[cfg(unix)]
+#[derive(Default)]
+struct RecordingHandler(Mutex<Vec<fandhe_container_cri::streaming::StreamRequest>>);
+
+#[cfg(unix)]
+impl fandhe_container_cri::streaming::StreamHandler for RecordingHandler {
+    fn wiring(&self) -> fandhe_container_cri::streaming::StreamWiring {
+        fandhe_container_cri::streaming::StreamWiring::only(
+            fandhe_container_cri::streaming::StreamKind::Exec,
+        )
+        .with_exec_tty()
+        .with_exec_relative_command()
+    }
+
+    fn handle(
+        &self,
+        request: fandhe_container_cri::streaming::StreamRequest,
+        _http: hyper::Request<hyper::body::Incoming>,
+        _permit: fandhe_container_cri::streaming::ConnectionPermit,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = hyper::Response<fandhe_container_cri::streaming::StreamBody>,
+                > + Send
+                + '_,
+        >,
+    > {
+        self.0.lock().unwrap().push(request);
+        Box::pin(async {
+            hyper::Response::new(fandhe_container_cri::streaming::StreamBody::empty())
+        })
+    }
+}
+
+#[cfg(unix)]
+struct ExecHarness {
+    h: Harness,
+    handler: Arc<RecordingHandler>,
+    server: fandhe_container_cri::streaming::StreamingServer,
+}
+
+#[cfg(unix)]
+async fn exec_harness(exit_observe_timeout: Option<Duration>) -> ExecHarness {
+    let handler = Arc::new(RecordingHandler::default());
+    let server = fandhe_container_cri::streaming::StreamingServer::bind_with_handler(
+        fandhe_container_cri::streaming::StreamingConfig::default(),
+        handler.clone(),
+    )
+    .await
+    .expect("bind");
+    let runtime = Arc::new(FakeRuntime::default());
+    let bundles = Arc::new(FakeBundles::default());
+    let recorder = Arc::new(Collect::default());
+    let mut service = CriRuntimeService::with_recorder(recorder.clone()).with_runtime(
+        RuntimeAdapter::new(Arc::new(Shared(runtime.clone()))),
+        bundles.clone(),
+    );
+    if let Some(t) = exit_observe_timeout {
+        service = service.with_exit_observe_timeout(t);
+    }
+    let service = service.with_streaming(server.issuer());
+    ExecHarness {
+        h: Harness {
+            service,
+            runtime,
+            bundles,
+            recorder,
+        },
+        handler,
+        server,
+    }
+}
+
+#[cfg(unix)]
+async fn issue_exec(h: &Harness, container_id: &str) -> Result<String, Status> {
+    use fandhe_container_cri::runtime::v1::runtime_service_server::RuntimeService as _;
+    h.service
+        .exec(Request::new(v1::ExecRequest {
+            container_id: container_id.to_string(),
+            cmd: vec!["/bin/true".to_string()],
+            tty: false,
+            stdin: false,
+            stdout: true,
+            stderr: false,
+        }))
+        .await
+        .map(|r| r.into_inner().url)
+}
+
+/// 発行した URL へ GET を送り、ハンドラが受けた最後の要求の Exec のインスタンスを返す。
+#[cfg(unix)]
+async fn fetch_and_instance(x: &ExecHarness, url: &str) -> Option<u64> {
+    use std::io::{Read, Write};
+    let addr = x.server.local_addr();
+    let rest = url.strip_prefix("http://").expect("http url");
+    let path = rest[rest.find('/').expect("path")..].to_string();
+    tokio::task::spawn_blocking(move || {
+        let mut stream =
+            std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5)).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        let raw = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        stream.write_all(raw.as_bytes()).expect("write");
+        let mut out = Vec::new();
+        let _ = stream.read_to_end(&mut out);
+    })
+    .await
+    .expect("join");
+    let got = x.handler.0.lock().unwrap();
+    match got.last().expect("handler received the request") {
+        fandhe_container_cri::streaming::StreamRequest::Exec { instance, .. } => *instance,
+        other => panic!("unexpected request: {other:?}"),
+    }
+}
+
+/// CRI-5・SEC-1・CORE-1（#4286）: 実行層が報告したインスタンスが、発行時に保存した要求へ入る。
+#[cfg(unix)]
+#[tokio::test]
+async fn cri5_4286_exec_url_records_runtime_instance() {
+    let x = exec_harness(None).await;
+    let sb = run_sandbox(&x.h.service).await;
+    let id = running_container(&x.h, &sb, "c").await;
+    x.h.runtime.instances.lock().unwrap().insert(id.clone(), 7);
+    let url = issue_exec(&x.h, &id).await.expect("exec");
+    assert_eq!(fetch_and_instance(&x, &url).await, Some(7));
+}
+
+/// CRI-5・SEC-1（#4286）: 保存される値は発行時のもので、発行後の作り直し（識別子の変化）で書き換わらない。
+#[cfg(unix)]
+#[tokio::test]
+async fn cri5_4286_exec_url_keeps_issue_time_instance_after_recreate() {
+    let x = exec_harness(None).await;
+    let sb = run_sandbox(&x.h.service).await;
+    let id = running_container(&x.h, &sb, "c").await;
+    x.h.runtime.instances.lock().unwrap().insert(id.clone(), 7);
+    let old_url = issue_exec(&x.h, &id).await.expect("exec");
+    x.h.runtime.instances.lock().unwrap().insert(id.clone(), 8);
+    let new_url = issue_exec(&x.h, &id).await.expect("exec");
+    assert_eq!(fetch_and_instance(&x, &old_url).await, Some(7));
+    assert_eq!(fetch_and_instance(&x, &new_url).await, Some(8));
+}
+
+/// CRI-5（#4286）: 実行層が識別子を報告しなければ `None`（保護されない残余。doc に記載）。
+#[cfg(unix)]
+#[tokio::test]
+async fn cri5_4286_exec_url_without_reported_instance_is_none() {
+    let x = exec_harness(None).await;
+    let sb = run_sandbox(&x.h.service).await;
+    let id = running_container(&x.h, &sb, "c").await;
+    let url = issue_exec(&x.h, &id).await.expect("exec");
+    assert_eq!(fetch_and_instance(&x, &url).await, None);
+}
+
+/// SEC-1（#4286）: 発行時に状態を読めなければ URL を発行しない（fail-closed）。
+#[cfg(unix)]
+#[tokio::test]
+async fn cri5_4286_exec_state_not_found_fails_rpc() {
+    let x = exec_harness(None).await;
+    let sb = run_sandbox(&x.h.service).await;
+    let id = running_container(&x.h, &sb, "c").await;
+    x.h.runtime
+        .fail_state_ids
+        .lock()
+        .unwrap()
+        .insert(id.clone(), ErrorCode::NotFound);
+    let e = issue_exec(&x.h, &id).await.expect_err("not found");
+    assert_eq!(e.code(), Code::NotFound);
+    assert_eq!(e.message(), "container not found");
+    assert!(x.handler.0.lock().unwrap().is_empty());
+}
+
+/// REPAIR-5（#4286）: 発行時の状態読み取りは有界で、期限で `DEADLINE_EXCEEDED` になる。
+#[cfg(unix)]
+#[tokio::test]
+async fn repair5_4286_exec_state_read_is_bounded() {
+    let x = exec_harness(Some(Duration::from_millis(50))).await;
+    let sb = run_sandbox(&x.h.service).await;
+    let id = running_container(&x.h, &sb, "c").await;
+    x.h.runtime.hold_state.store(true, Ordering::SeqCst);
+    let e = issue_exec(&x.h, &id).await.expect_err("deadline");
+    x.h.runtime.hold_state.store(false, Ordering::SeqCst);
+    assert_eq!(e.code(), Code::DeadlineExceeded);
+    assert!(x.handler.0.lock().unwrap().is_empty());
 }

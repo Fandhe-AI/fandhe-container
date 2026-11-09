@@ -27,6 +27,12 @@
 //! 受けるまで（exec を続けたい間は）channel の自分の側を閉じず、`shutdown` もせず、端を他のプロセスへ渡さない
 //! （子プロセスへ継承させない。渡すと plugin-cri が死んでも端が閉じず、従来の期限と `hold_grace` で終わる）。
 //!
+//! # インスタンスの照合（#4286・CRI-5・SEC-1・CORE-1）
+//! 状態ストアの読み取り（`store.get`）の直後、Running・pid の確認より前に、`ExecLaunch::instance`（URL 発行時に実行層が
+//! 報告した値）と record のインスタンス識別子を `instance_matches` で比べる。不一致（値違い・片側だけ `None`）は helper を
+//! 起動せず `FAILED_PRECONDITION`（`MSG_EXEC_INSTANCE_CHANGED`）で拒否する。pid も同じ record から取るため TOCTOU は無い。
+//! 保護されない残余: 両側とも `None`（識別子を報告しない実装・記録の無い旧い `state.json`）は判定できないので通す。
+//!
 //! # 未実装・簡易実装・残余（REPAIR-3）
 //! - tty: 受け側（`PtyMaster` の検証と resize の転送）は実装・試験済みだが、helper が `--tty` を受けず supervisor の
 //!   `ExecStdio` に pty が無いため、本番の spawner は能力 `tty = false` で、tty の要求は launcher でも断る（後続 issue。
@@ -54,11 +60,12 @@ use std::time::{Duration, Instant};
 
 use fandhe_container_core::exec::{PtyMaster, WindowSize};
 use fandhe_container_core::traits::{
-    ContainerId, ContainerState, ErrorCode, GetStateRequest, StateStore,
+    ContainerId, ContainerInstance, ContainerState, ErrorCode, GetStateRequest, StateStore,
 };
+use fandhe_container_cri::adapter::instance_matches;
 use fandhe_container_cri::error::CriError;
 use fandhe_container_cri::streaming::exec::{
-    ExecLaunch, ExecSession, ExecStreamLauncher, TerminalResizer,
+    ExecLaunch, ExecSession, ExecStreamLauncher, MSG_EXEC_INSTANCE_CHANGED, TerminalResizer,
 };
 use fandhe_container_cri::streaming::remotecommand::TerminalSize;
 use fandhe_container_supervisor::control::protocol::MAX_EXEC_HOLD_SECS;
@@ -620,6 +627,14 @@ impl SupervisorExecLauncher {
                     CriError::unavailable("container state is unavailable")
                 }
             })?;
+        // 作り直されたコンテナでは同一性がもう成り立たないため、Running・pid の確認より先に照合する。pid も
+        // 同じ record から取るので、照合と pid の間に TOCTOU は無い。helper の起動前に返す（#4286・CRI-5・SEC-1・CORE-1）。
+        if !instance_matches(
+            req.instance,
+            record.instance().map(ContainerInstance::value),
+        ) {
+            return Err(CriError::failed_precondition(MSG_EXEC_INSTANCE_CHANGED));
+        }
         let status = record.status();
         let pid: NonZeroU32 = match (status.state(), status.pid()) {
             (ContainerState::Running, Some(pid)) => pid,

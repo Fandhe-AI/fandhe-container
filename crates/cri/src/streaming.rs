@@ -119,8 +119,17 @@ impl StreamKind {
 /// 発行時に保存する要求。消費側（#680〜#682）が URL ではなくこの値から処理を組み立てる（URL 経由で改ざんされない。CRI-6）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum StreamRequest {
-    /// `RuntimeService.Exec` の要求。
-    Exec(v1::ExecRequest),
+    /// `RuntimeService.Exec` の要求。`instance` は URL 発行時に実行層が報告したコンテナの
+    /// インスタンス識別子（[`crate::adapter::RuntimeContainerStatus::instance`]。#4286・CRI-5・SEC-1・CORE-1）。
+    /// 起動役が起動時に同じ状態読み取りで得た値と [`crate::adapter::instance_matches`] で比べる。
+    /// `None` は報告なし（スタブ経路・識別子を報告しない実装・記録の無い旧い状態）。
+    /// core の newtype ではなく `Option<u64>` なのは cri の境界の型に揃えるため。
+    Exec {
+        /// CRI の要求。
+        request: v1::ExecRequest,
+        /// 発行時のインスタンス識別子。
+        instance: Option<u64>,
+    },
     /// `RuntimeService.Attach` の要求。
     Attach(v1::AttachRequest),
     /// `RuntimeService.PortForward` の要求。`network` は RPC 時に sandbox の記録から決めた値で、
@@ -134,10 +143,18 @@ pub enum StreamRequest {
 }
 
 impl StreamRequest {
+    /// インスタンス識別子を持たない（報告なしの）Exec 要求を作る。スタブ経路・試験用。
+    pub fn exec(request: v1::ExecRequest) -> Self {
+        StreamRequest::Exec {
+            request,
+            instance: None,
+        }
+    }
+
     /// この要求の種別。
     pub fn kind(&self) -> StreamKind {
         match self {
-            StreamRequest::Exec(_) => StreamKind::Exec,
+            StreamRequest::Exec { .. } => StreamKind::Exec,
             StreamRequest::Attach(_) => StreamKind::Attach,
             StreamRequest::PortForward { .. } => StreamKind::PortForward,
         }
@@ -655,7 +672,7 @@ impl StreamingUrlIssuer {
         if let StreamRequest::Attach(a) = &request {
             self.require_attach_options(a.stdin, a.tty)?;
         }
-        if let StreamRequest::Exec(e) = &request {
+        if let StreamRequest::Exec { request: e, .. } = &request {
             self.require_exec_options(e.tty, &e.cmd)?;
         }
         if let StreamRequest::PortForward { network, .. } = &request {
@@ -1372,7 +1389,7 @@ mod tests {
     use super::*;
 
     fn exec_req() -> StreamRequest {
-        StreamRequest::Exec(v1::ExecRequest {
+        StreamRequest::exec(v1::ExecRequest {
             container_id: "c1".to_string(),
             cmd: vec!["sh".to_string()],
             tty: false,

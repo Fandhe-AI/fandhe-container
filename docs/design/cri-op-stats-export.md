@@ -11,7 +11,7 @@ plugin-cri の常駐サーバーが集計する操作統計を、stderr 以外�
 ## 1. 目的と範囲
 
 - 対象: plugin-cri の常駐サーバーの操作統計。共有記録器と oci 専用記録器の 2 ブロック（`cri.streaming.*` の接続件数を含む）
-- 対象外: shim（`containerd-shim-fandhe-container-v2`）。短命のため stderr のままとする
+- 対象外: shim（`containerd-shim-fandhe-container-v2`）。短命のため stderr のままとする（定期出力・ファイル公開口の対象外。起動時の `@container-logs` 走査の後に限り、回収が 1 件以上あれば操作統計のブロックを 1 回だけ stderr へ出す。#4319・CRI-5）
 
 ## 2. 現状
 

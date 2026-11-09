@@ -124,7 +124,20 @@ fn cri5_sup7_4280_startup_sweep_removes_only_closed_unrecorded_logs() {
     );
     // 要約行は emit が thread の中で送り終えてから結果を送るので、結果を受けた時点で積まれている。
     let got = lines.lock().unwrap().clone();
-    assert_eq!(got, vec![crate::adapter::sweep_summary_line(&report)]);
+    // 要約行の後に、回収 1 件の op_stats 行と meta 行が続く（#4319）。
+    assert_eq!(got.len(), 3, "{got:?}");
+    assert_eq!(got[0], crate::adapter::sweep_summary_line(&report));
+    assert!(
+        got[1].starts_with(
+            r#"{"event":"op_stats","op":"container_log_reclaim","success":1,"failure":0,"count":1,"#
+        ),
+        "{}",
+        got[1]
+    );
+    assert_eq!(
+        got[2],
+        r#"{"event":"op_stats_meta","ops":1,"dropped_records":0}"#
+    );
     let snap = recorder
         .snapshot_op(&OpName::new("container_log_reclaim").unwrap())
         .unwrap();
@@ -223,4 +236,87 @@ fn cri5_repair5_4280_startup_sweep_does_not_block_and_returns_by_budget() {
     assert!(container_log_dir(&root).join("closed1.log").exists());
     // 止まった作業スレッドを解放する（他の試験へ作業枠を残さない）。
     drop(release_tx);
+}
+
+/// CRI-5・REPAIR-4・#4319: 回収 N=3 件のとき、書き出された `container_log_reclaim` の計数が 3 になる。
+#[test]
+fn cri5_repair4_4319_startup_sweep_exports_reclaim_count_n() {
+    let guard = test_root::test_root("shim", "sweep4");
+    let (store, root) = open_store(&guard);
+    for n in ["closed1", "closed2", "closed3"] {
+        drop(open_sink(&root, n));
+    }
+    let recorder = Arc::new(OpRecorder::new());
+    let (lines, emit) = collector();
+    let h = spawned(spawn_startup_log_sweep(
+        Arc::clone(&store),
+        Arc::clone(&recorder),
+        Duration::from_secs(30),
+        emit,
+    ));
+    let report = h
+        .wait_within(Duration::from_secs(20))
+        .expect("sweep finishes")
+        .expect("report");
+    assert_eq!(report.reclaimed_ids, 3);
+    assert_eq!(report.removed_files, 3);
+    let got = lines.lock().unwrap().clone();
+    let stats: Vec<&String> = got
+        .iter()
+        .filter(|l| l.contains(r#""op":"container_log_reclaim""#))
+        .collect();
+    assert_eq!(stats.len(), 1, "{got:?}");
+    assert!(
+        stats[0].starts_with(
+            r#"{"event":"op_stats","op":"container_log_reclaim","success":3,"failure":0,"count":3,"#
+        ),
+        "{}",
+        stats[0]
+    );
+    assert_eq!(
+        got.last().unwrap(),
+        r#"{"event":"op_stats_meta","ops":1,"dropped_records":0}"#
+    );
+    assert!(got.iter().all(|l| !l.contains("closed1")), "{got:?}");
+}
+
+/// REPAIR-5・#4319: 書き出し先が詰まって行が落ちても、走査の結果・削除は変わらない。
+#[test]
+fn cri5_repair4_4319_startup_sweep_result_unaffected_by_stalled_stats_sink() {
+    use crate::telemetry::LineSink;
+    struct Stall(Receiver<()>);
+    impl std::io::Write for Stall {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            let _ = self.0.recv();
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let guard = test_root::test_root("shim", "sweep5");
+    let (store, root) = open_store(&guard);
+    drop(open_sink(&root, "closed1"));
+    drop(open_sink(&root, "closed2"));
+    let (gate, rx) = mpsc::channel::<()>();
+    let sink = Arc::new(LineSink::spawn(Box::new(Stall(rx)), 1));
+    let s2 = Arc::clone(&sink);
+    let emit: Emit = Arc::new(move |l| {
+        let _ = s2.submit(l);
+    });
+    let h = spawned(spawn_startup_log_sweep(
+        Arc::clone(&store),
+        Arc::new(OpRecorder::new()),
+        Duration::from_secs(30),
+        emit,
+    ));
+    let report = h
+        .wait_within(Duration::from_secs(20))
+        .expect("sweep finishes despite stalled sink")
+        .expect("report");
+    assert_eq!(report.reclaimed_ids, 2);
+    assert_eq!(report.failed, 0);
+    assert!(names(&container_log_dir(&root)).is_empty());
+    assert!(sink.dropped() > 0, "export must actually have been dropped");
+    drop(gate);
 }

@@ -279,6 +279,7 @@ fn encode_payload(record: &AuditRecord) -> Result<String, AuditWriteError> {
         | AuditEvent::ExecTarget { .. }
         | AuditEvent::Entrypoint { .. }
         | AuditEvent::PastaVerify { .. }
+        | AuditEvent::PodNamespaceJoin { .. }
         | AuditEvent::ControlPeer { .. }
         | AuditEvent::ExitSignal { .. }
         | AuditEvent::AuditCoverageDegraded { .. } => None,

@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use fandhe_container_core::traits::{
     ContainerRuntime, ContainerStatus, CreateRequest, DeleteRequest, DeleteResponse, ErrorCode,
-    KillRequest, StartRequest, StateRequest, StopRequest, TraitError,
+    ExitTime, KillRequest, StartRequest, StateRequest, StopRequest, TraitError,
 };
 use fandhe_container_cri::adapter::{
     BundleProvider, BundleRequest, PreparedBundle, RuntimeAdapter,
@@ -53,6 +53,8 @@ fn containers_dir(root: &Path) -> PathBuf {
 #[derive(Default)]
 struct Core {
     known: Mutex<HashMap<String, bool>>,
+    /// Stopped と答える ID と（終了コード・終了時刻のナノ秒）。`known` より優先する（E3 #4278）。
+    stopped: Mutex<HashMap<String, (i32, i64)>>,
     fail_state: Mutex<bool>,
 }
 
@@ -90,6 +92,13 @@ impl ContainerRuntime for Shared {
     fn state(&self, r: &StateRequest) -> Result<ContainerStatus, TraitError> {
         if *self.0.fail_state.lock().unwrap() {
             return Err(TraitError::new(ErrorCode::Unavailable, "down"));
+        }
+        if let Some((code, at)) = self.0.stopped.lock().unwrap().get(r.id().as_str()) {
+            return Ok(ContainerStatus::stopped_at(
+                r.id().clone(),
+                Some(*code),
+                ExitTime::from_unix_nanos(*at),
+            ));
         }
         match self.0.known.lock().unwrap().get(r.id().as_str()) {
             None => Err(TraitError::new(ErrorCode::NotFound, "gone")),
@@ -298,6 +307,47 @@ async fn cri1_oci7_readopt_after_restart_restores_container_values() {
     }
     // 記録の無い core のコンテナには触れない（一覧にも出ない）。
     assert!(list(&b).await.iter().all(|c| c.id != "e".repeat(64)));
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// CRI-1・CRI-2（E3 #4278）: 記録は Running のまま plugin-cri が再起動し、core が Stopped（終了コード 7）と
+/// 答えたら、再採用後の ContainerStatus が exited・7・core の時刻を返す。記録ファイルは書き換えない。
+#[tokio::test]
+async fn cri1_cri2_readopt_running_record_takes_core_exit_after_restart() {
+    const T: i64 = 4_000_000_000_000_000_000;
+    let root = temp_root("core-exit");
+    let core_a = Arc::new(Core::default());
+    let a = service(&root, &core_a);
+    let sb = run_sandbox(&a).await;
+    let cid = create(&a, &sb, "run").await;
+    start(&a, &cid).await;
+    drop(a);
+    let snapshot = |root: &Path| -> Vec<(PathBuf, Vec<u8>)> {
+        let mut v: Vec<_> = fs::read_dir(containers_dir(root))
+            .unwrap()
+            .map(|e| {
+                let p = e.unwrap().path();
+                let b = fs::read(&p).unwrap();
+                (p, b)
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let before = snapshot(&root);
+    assert_eq!(before.len(), 1);
+
+    let core_b = Arc::new(Core::default());
+    core_b.stopped.lock().unwrap().insert(cid.clone(), (7, T));
+    let b = restart(&root, &core_b);
+    let r = b.readopt_containers(ListBudget::default()).unwrap();
+    assert_eq!((r.adopted, r.present, r.broken.total()), (1, 1, 0));
+    let st = status(&b, &cid).await;
+    assert_eq!(st.state, ContainerState::ContainerExited as i32);
+    assert_eq!(st.exit_code, 7);
+    assert_eq!(st.finished_at, T);
+    assert_eq!(st.reason, "Error");
+    assert_eq!(snapshot(&root), before);
     let _ = fs::remove_dir_all(&root);
 }
 

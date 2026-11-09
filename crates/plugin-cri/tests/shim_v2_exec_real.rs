@@ -15,7 +15,7 @@
 //!   （supervisor の exec が作る。#1466・CORE-4）に居る。exit 後に子 cgroup が回収される。
 //!
 //! # Issue の文面と異なる点
-//! - ハーネスは `harness = false`。shim の exec は stdio が `/dev/null` で pid も返さないため、試験バイナリ自身を
+//! - ハーネスは `harness = false`。shim の exec は stdio が `/dev/null` のため、試験バイナリ自身を
 //!   rootfs の `/probe` として init と exec のコマンドの両方に使う独自 argv の再入が要る（兄弟の
 //!   `shim_v2_kill_all_real` と同じ形）。`--ignored`・委譲 scope・全体期限・`PRECONDITION FAILED` の契約は保つ。
 //! - cgroup は「init と同じ」ではなく「init の直下の `exec-*` 子 cgroup」で照合する（exec は init と同じ cgroup にならない）。
@@ -567,15 +567,20 @@ mod linux {
 
         // exec を通す（env 空・cwd `/`・user なし・stdio なし）。
         rpc(&sock, "Exec", &exec_request(id, EXEC_ID, exec_spec()))?;
-        rpc(&sock, "Start", &exec_id_request(id, EXEC_ID))?;
+        let start = rpc(&sock, "Start", &exec_id_request(id, EXEC_ID))?;
+        // StartResponse の pid（field 1 の varint）は DeleteResponse の pid と同じ形（#4318）。
+        let start_pid = decode_delete_response(&start.payload)
+            .ok_or("undecodable exec StartResponse")?
+            .pid;
         let st = wait_exec_state(&sock, id, STATUS_RUNNING)?;
-        if st.pid != 0 {
+        let (exec_pid, exec_dir) = find_exec_pid(&leaf)?;
+        // launch は helper の Spawned を待つため、Start の応答と State の pid は実コマンドの pid と一致する（#4318・CRI-5）。
+        if start_pid != exec_pid || st.pid != exec_pid {
             return Err(format!(
-                "exec State reported pid {} (the shim exec does not expose pids; want 0)",
+                "exec pid mismatch: StartResponse={start_pid} State={} actual={exec_pid}",
                 st.pid
             ));
         }
-        let (exec_pid, exec_dir) = find_exec_pid(&leaf)?;
         if let (Ok(mut p), Some(start)) = (PIDS.lock(), proc_starttime(exec_pid)) {
             p.push((exec_pid, start));
         }

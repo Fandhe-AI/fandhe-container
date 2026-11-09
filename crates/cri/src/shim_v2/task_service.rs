@@ -567,7 +567,7 @@ impl TaskService {
             .map_err(|e| to_status(&e))?;
         let process = result.map_err(|e| to_status(&e))?;
         let pid = process.pid().map_or(0, NonZeroU32::get);
-        // #4281: 成功する直前（ゲート保持中）に投入する。pid は応答と同じ値（本番の起動役は 0）。
+        // #4281: 成功する直前（ゲート保持中）に投入する。pid は応答と同じ値（本番の起動役は `Spawned` を待つため通常は実 pid。届かなければ 0）。
         self.emit(TaskEvent::ExecStarted(TaskExecStarted {
             container_id: container.as_str().to_owned(),
             exec_id: exec_id.as_str().to_owned(),

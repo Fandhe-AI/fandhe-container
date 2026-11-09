@@ -256,7 +256,7 @@ pub(crate) fn registry_parts_in(
         reg.register(svc)
             .map_err(|_| CriError::internal("cannot register task service"))?;
     }
-    // 登録簿の組み立てに成功した後で、残りのコンテナログを裏の thread で 1 回だけ走査する（D7・#4280。待たない）。
+    // 登録簿の組み立てに成功した後で、残りのコンテナログ → supervisor ログの順に裏の thread で 1 回だけ走査する（D7・#4280・#4343。待たない）。
     let _ = startup_sweep::spawn_startup_log_sweep(
         state,
         sweep_recorder,

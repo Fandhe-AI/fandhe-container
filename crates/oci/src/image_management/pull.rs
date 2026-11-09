@@ -232,6 +232,28 @@ pub struct PublishedRootfsDir {
     sha256: SubDir,
 }
 
+/// 開いた `<root>/rootfs`（配下の `sha256` を作る前に信頼条件を確かめるための中間値。#4283）。
+#[derive(Debug)]
+pub struct PublishedRootfsParent {
+    rootfs: SubDir,
+}
+
+impl PublishedRootfsParent {
+    /// `<root>/rootfs` 自身のメタデータ（開いた fd の fstat）。
+    pub fn metadata(&self) -> Result<std::fs::Metadata, OciError> {
+        self.rootfs.meta().map_err(stat_err)
+    }
+
+    /// 直下の `sha256` を（無ければ 0700 で）作って開く。
+    pub fn ensure_sha256(self) -> Result<PublishedRootfsDir, OciError> {
+        let sha256 = self.rootfs.ensure_subdir("sha256")?;
+        Ok(PublishedRootfsDir {
+            rootfs: self.rootfs,
+            sha256,
+        })
+    }
+}
+
 /// 公開済み rootfs の 1 エントリ `<root>/rootfs/sha256/<hex>`（[`PublishedRootfsDir::open_entry`] が開く）。
 #[derive(Debug)]
 pub struct PublishedRootfsEntry {
@@ -293,7 +315,17 @@ impl PublishedRootfsEntry {
 
     /// 直下の `name`（固定の定数）のメタデータ（symlink は辿らない）。無ければ `None`。
     pub fn stat(&self, name: &str) -> Result<Option<std::fs::Metadata>, OciError> {
-        self.dir.stat(name).map_err(stat_err)
+        self.dir.stat(name).map_err(|e| {
+            // symlink・非ディレクトリへの差し替えは「信頼できない」（Internal にしない）。
+            if e.kind() == std::io::ErrorKind::InvalidInput {
+                err(
+                    OciErrorCode::FailedPrecondition,
+                    "published rootfs directory is not a plain directory",
+                )
+            } else {
+                stat_err(e)
+            }
+        })
     }
 
     /// 直下の通常ファイル `name`（固定の定数）を、symlink を辿らず非ブロッキングで開く。
@@ -316,6 +348,22 @@ impl ImageStore {
             return Ok(None);
         };
         Ok(Some(PublishedRootfsDir { rootfs, sha256 }))
+    }
+
+    /// `blobs` と `blobs/sha256` 自身のメタデータ（開いた fd の fstat。この順）を返す。どちらかが無ければ `None`、
+    /// symlink・非ディレクトリは `FailedPrecondition`（create 経路が従来と同じ信頼条件を課すための入口。#4283）。
+    pub fn cached_blob_dir_metadata(&self) -> Result<Option<[std::fs::Metadata; 2]>, OciError> {
+        let h = self.handle();
+        let Some(blobs) = h.open_subdir("blobs").map_err(subdir_err)? else {
+            return Ok(None);
+        };
+        let Some(sha256) = blobs.open_subdir("sha256").map_err(subdir_err)? else {
+            return Ok(None);
+        };
+        Ok(Some([
+            blobs.meta().map_err(stat_err)?,
+            sha256.meta().map_err(stat_err)?,
+        ]))
     }
 
     /// キャッシュ済みの blob（`blobs/sha256/<hex>`）を、検査済み root の fd 起点で読み取り専用に開く（create 経路用。
@@ -1047,9 +1095,14 @@ impl PullSession<'_> {
     /// 作成も開き直しも root の fd から 1 要素ずつ（`mkdirat` → `O_NOFOLLOW`）行うため、キャッシュの祖先を差し替えても
     /// おとりには届かない。既にあるものが symlink・非ディレクトリなら `FailedPrecondition`。
     pub fn ensure_published_rootfs_dir(&self) -> Result<PublishedRootfsDir, OciError> {
+        self.ensure_published_rootfs_parent()?.ensure_sha256()
+    }
+
+    /// 公開済み rootfs の親 `<root>/rootfs` だけを（無ければ 0700 で）作って開く。呼び出し側が [`PublishedRootfsParent::metadata`]
+    /// で所有者・権限を確かめてから [`PublishedRootfsParent::ensure_sha256`] を呼ぶ（検証前に配下を作らない。#4283）。
+    pub fn ensure_published_rootfs_parent(&self) -> Result<PublishedRootfsParent, OciError> {
         let rootfs = self.store.handle().ensure_subdir("rootfs")?;
-        let sha256 = rootfs.ensure_subdir("sha256")?;
-        Ok(PublishedRootfsDir { rootfs, sha256 })
+        Ok(PublishedRootfsParent { rootfs })
     }
 
     /// [`PullSession::lease_existing_blob`] でリース済みの既存 blob（`blobs/sha256/<hex>`）を、検査済み root の fd 起点で

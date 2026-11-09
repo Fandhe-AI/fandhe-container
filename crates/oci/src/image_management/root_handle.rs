@@ -600,6 +600,11 @@ mod imp {
             ) {
                 Ok(fd) => File::from(fd).metadata().map(Some),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+                // 最終要素が symlink（`ELOOP`）なら辿らず `InvalidInput` にする（呼び出し側が「信頼できない」へ写す）。
+                Err(e) if matches!(errno(&e), Some(ELOOP | ENOTDIR)) => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "not a plain entry",
+                )),
                 Err(e) => Err(e),
             }
         }

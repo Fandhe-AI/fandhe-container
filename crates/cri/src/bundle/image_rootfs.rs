@@ -100,6 +100,7 @@ use crate::error::CriError;
 use crate::image_pull::{
     DEFAULT_MAX_IMAGE_BYTES, PullConfig, PullError, canonical_reference, expected_root_owner_for,
     inspect_published_entry, read_entry_record_body, record_settings, verify_cache_root,
+    verify_private_meta,
 };
 use crate::image_service::{ImageStore, MAX_IMAGE_FIELD_BYTES};
 use crate::runtime::v1::ImageSpec;
@@ -754,6 +755,19 @@ impl RootfsSource for ImageRootfsSource {
             .open_published_rootfs_dir()
             .map_err(|e| CriError::from(PullError::from_store(&e)))?
             .ok_or_else(not_cached)?;
+        // 中間ディレクトリ（rootfs・rootfs/sha256・blobs・blobs/sha256）も、開いた fd の fstat に従来の信頼条件
+        // （所有者一致・group/other 書き込み不可）を課す（pull の `prepare_private_dir` と同じ。OCI-7・SEC-1・#4283）。
+        for meta in [published.parent_metadata(), published.metadata()] {
+            let meta = meta.map_err(|e| CriError::from(PullError::from_store(&e)))?;
+            verify_private_meta(&meta, owner).map_err(CriError::from)?;
+        }
+        let blob_dirs = store
+            .cached_blob_dir_metadata()
+            .map_err(|e| CriError::from(PullError::from_store(&e)))?
+            .ok_or_else(not_cached)?;
+        for meta in &blob_dirs {
+            verify_private_meta(meta, owner).map_err(CriError::from)?;
+        }
         // 公開済みエントリは「pull が検証を完了した」印としてだけ見る。展開済み rootfs は開かず、書かない。
         let Some(entry) = inspect_published_entry(&published, &id, owner, root_owner)? else {
             return Err(not_cached());

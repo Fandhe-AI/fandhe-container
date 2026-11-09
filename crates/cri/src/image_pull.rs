@@ -667,13 +667,21 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
     ) -> Result<(), PullError> {
         // 公開先 `rootfs/sha256` は検査済み root の fd 起点で作って開く（祖先の差し替えがおとりへ届かない。#4283）。
         // キャッシュの祖先の検証は pull の入口の `blobs_dir` と `ImageStore::open` が済ませている。
-        let rootfs_dir = session
-            .ensure_published_rootfs_dir()
+        // `rootfs` の所有者・権限を確かめてから配下の `sha256` を作る（検証前に配下を作らない）。
+        let rootfs_parent = session
+            .ensure_published_rootfs_parent()
             .map_err(|e| PullError::from_store(&e))?;
-        for meta in [rootfs_dir.parent_metadata(), rootfs_dir.metadata()] {
-            let meta = meta.map_err(|e| PullError::from_store(&e))?;
-            verify_private_meta(&meta, blob_owner)?;
-        }
+        let parent_meta = rootfs_parent
+            .metadata()
+            .map_err(|e| PullError::from_store(&e))?;
+        verify_private_meta(&parent_meta, blob_owner)?;
+        let rootfs_dir = rootfs_parent
+            .ensure_sha256()
+            .map_err(|e| PullError::from_store(&e))?;
+        let sha_meta = rootfs_dir
+            .metadata()
+            .map_err(|e| PullError::from_store(&e))?;
+        verify_private_meta(&sha_meta, blob_owner)?;
         let published_path = self.config.cache_dir.join("rootfs").join("sha256");
         // 公開済みでも件数の照合を飛ばさない（余分な layer を足した不整合な manifest を成功させない。OCI-1）。
         if manifest.layers.len() != rootfs_cfg.diff_ids().len() {
@@ -2805,7 +2813,12 @@ mod non_unix_tests {
         )
         .expect("digest");
         assert_eq!(
-            inspect_cached_blob(open_blob_nofollow(&path), &digest, 3, 0),
+            inspect_cached_blob(
+                fandhe_container_oci::layer::open_blob_nofollow(&path),
+                &digest,
+                3,
+                0
+            ),
             Err(CachedBlobRejection::Unopenable)
         );
         let file = fs::File::open(&path).expect("open");

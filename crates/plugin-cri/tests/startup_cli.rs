@@ -54,7 +54,7 @@ fn help_exits_zero_with_usage() {
     assert_eq!(o.code, Some(0));
     assert_eq!(
         o.stdout,
-        "usage: fandhe-container-plugin-cri [--help] | --socket <PATH> [--streaming-bind <ADDR>] [--streaming-allow-external] [--streaming-advertise <IP>]\n"
+        "usage: fandhe-container-plugin-cri [--help] | --socket <PATH> [--streaming-bind <ADDR>] [--streaming-allow-external] [--streaming-advertise <IP>] [--op-stats-file <PATH>]\n"
     );
     assert_eq!(o.stderr, "");
 }
@@ -138,5 +138,42 @@ fn insecure_socket_dir_exits_one_without_echoing_path() {
     assert_eq!(o.code, Some(1));
     assert!(o.stderr.starts_with("error: "), "stderr: {}", o.stderr);
     assert!(!o.stderr.contains("fcpc-insecure"));
+    assert_eq!(o.stdout, "");
+}
+
+/// CRI-6・REPAIR-3・#4336: 結線（#4340）までは `--op-stats-file` の指定で起動せず、値も出さない。
+#[cfg(unix)]
+#[test]
+fn cri6_4336_op_stats_file_is_unimplemented_until_wired() {
+    let o = run(&[
+        "--socket",
+        "/nonexistent-4336/s.sock",
+        "--op-stats-file",
+        "/nonexistent-4336/secret-stats.jsonl",
+    ]);
+    assert_eq!(o.code, Some(1));
+    assert_eq!(
+        o.stderr,
+        "error: UNIMPLEMENTED: --op-stats-file is not implemented yet\n"
+    );
+    assert_eq!(o.stdout, "");
+}
+
+/// CRI-6・REPAIR-4・#4336: 相対パスは終了コード 2 で、値をエコーしない。
+#[cfg(unix)]
+#[test]
+fn cri6_4336_invalid_op_stats_file_exits_two_without_echo() {
+    let o = run(&[
+        "--socket",
+        "/nonexistent-4336/s.sock",
+        "--op-stats-file",
+        "rel/secret.jsonl",
+    ]);
+    assert_eq!(o.code, Some(2));
+    assert_eq!(
+        o.stderr,
+        "error: INVALID_ARGUMENT: invalid --op-stats-file argument\n"
+    );
+    assert!(!o.stderr.contains("secret"));
     assert_eq!(o.stdout, "");
 }

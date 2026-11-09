@@ -8,6 +8,9 @@
 //! ストリーミングサーバーの外部公開は既定で閉じ、`--streaming-bind <ADDR>`・`--streaming-allow-external`・`--streaming-advertise <IP>`
 //! （`=` 形も可）を明示したときだけ開く（#4110・CRI-6・REPAIR-3）。値は `SocketAddr` / `IpAddr` として解釈し、cri の
 //! `StreamingConfig::validate()` に通してから受ける。TLS も認証も無く、URL のトークンが唯一の認可なので、前段の守りが前提になる。
+//! 操作統計のスナップショットファイルは `--op-stats-file <PATH>`（`=` 形も可）で opt-in する（既定は無効で stderr のみ。#4336・CRI-6・REPAIR-4）。
+//! ここでは構文（絶対パス・`..`・NUL なし・ファイル名あり）だけを検査し、置き先の実在・所有者・権限は
+//! スナップショット書き出し側（#4335 の `snapshot_file`・結線は #4340）に任せる。環境変数での指定は作らない（設計は `docs/design/cri-op-stats-export.md`）。
 //! 既定の socket パスの解決は未定義（spec に定めが無い。#459 と #1869 の設計〔承認と実装 issue の起票は #2232〕で決める）ため、引数なしは成功を装わず失敗させる（REPAIR-3）。
 
 use std::ffi::OsString;
@@ -26,6 +29,10 @@ pub const MSG_ARGS_TOO_LARGE: &str = "too many or too long arguments";
 pub const MSG_INVALID_SOCKET: &str = "invalid --socket argument";
 /// `--streaming-*` の値の欠落・重複・不正な値・組み合わせ違反に対する固定文言（値は含めない）。
 pub const MSG_INVALID_STREAMING: &str = "invalid --streaming-* argument";
+/// `--op-stats-file` の値の欠落・重複・不正なパスに対する固定文言（値は含めない。#4336）。
+pub const MSG_INVALID_OP_STATS_FILE: &str = "invalid --op-stats-file argument";
+/// `--op-stats-file` の結線（#4340）が済むまでの fail-closed 用の固定文言（指定を黙って捨てない。REPAIR-3）。
+pub const MSG_OP_STATS_FILE_NOT_WIRED: &str = "--op-stats-file is not implemented yet";
 /// 既定の socket パスが未定義であることを伝える固定文言（成功終了で実装済みを装わない。REPAIR-3）。
 pub const MSG_SOCKET_DEFAULT_UNDEFINED: &str =
     "default socket path is not defined yet; pass --socket <PATH>";
@@ -59,12 +66,15 @@ pub enum Invocation {
         socket: PathBuf,
         /// 検証済みのストリーミング待ち受けの指定（既定は loopback）。
         streaming: StreamingOptions,
+        /// `--op-stats-file`: 検証済み（絶対・`..` なし・NUL なし・ファイル名あり）のスナップショットの置き先。
+        /// `None` は無効（既定。stderr のみ）。置き先の実在・権限は検査していない（#4335・#4340）。
+        op_stats_file: Option<PathBuf>,
     },
 }
 
 /// usage（末尾改行つき 1 行）。
 pub fn usage() -> &'static str {
-    "usage: fandhe-container-plugin-cri [--help] | --socket <PATH> [--streaming-bind <ADDR>] [--streaming-allow-external] [--streaming-advertise <IP>]\n"
+    "usage: fandhe-container-plugin-cri [--help] | --socket <PATH> [--streaming-bind <ADDR>] [--streaming-allow-external] [--streaming-advertise <IP>] [--op-stats-file <PATH>]\n"
 }
 
 fn invalid(msg: &'static str) -> PluginError {
@@ -100,6 +110,20 @@ fn parse_value<T: std::str::FromStr>(value: Option<OsString>) -> Option<T> {
 
 /// socket パスを検証する（空でない・NUL なし・絶対・`..` なし）。
 fn validate_socket(value: OsString) -> Result<PathBuf, PluginError> {
+    validate_abs_path(value, MSG_INVALID_SOCKET)
+}
+
+/// `--op-stats-file` の値を検証する（`validate_abs_path` に加え、rename 先となるファイル名があること。#4336）。
+fn validate_op_stats_file(value: OsString) -> Result<PathBuf, PluginError> {
+    let path = validate_abs_path(value, MSG_INVALID_OP_STATS_FILE)?;
+    if path.file_name().is_none() {
+        return Err(invalid(MSG_INVALID_OP_STATS_FILE));
+    }
+    Ok(path)
+}
+
+/// 空でない・NUL なし・絶対・`..` なしの検査（socket と op-stats-file で共有。失敗は `msg` の固定文言）。
+fn validate_abs_path(value: OsString, msg: &'static str) -> Result<PathBuf, PluginError> {
     #[cfg(unix)]
     let has_nul = {
         use std::os::unix::ffi::OsStrExt;
@@ -113,7 +137,7 @@ fn validate_socket(value: OsString) -> Result<PathBuf, PluginError> {
         || !path.is_absolute()
         || path.components().any(|c| matches!(c, Component::ParentDir))
     {
-        return Err(invalid(MSG_INVALID_SOCKET));
+        return Err(invalid(msg));
     }
     Ok(path)
 }
@@ -148,7 +172,8 @@ fn streaming_config_is_valid(_o: &StreamingOptions) -> bool {
 /// 引数（`argv[0]` を除く）を解析する。
 ///
 /// `--help` がちょうど 1 個だけなら `Help`、引数なしなら `Run`、`--socket` がちょうど 1 回なら `Serve`、
-/// それ以外は `InvalidArgument`。
+/// それ以外は `InvalidArgument`。`--op-stats-file` は `--socket` と併用でちょうど 1 回（構文のみ検査。#4336）。
+/// エラーの優先順は 未知の引数・併用違反、socket、streaming、op-stats-file。
 pub fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<Invocation, PluginError> {
     let mut count = 0usize;
     let mut bytes = 0usize;
@@ -170,6 +195,9 @@ pub fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<Invocatio
     let mut streaming_error = false;
     let mut seen_bind = false;
     let mut seen_advertise = false;
+    let mut op_stats_file: Option<PathBuf> = None;
+    let mut op_stats_given = false;
+    let mut op_stats_error = false;
     let mut iter = all.into_iter();
     while let Some(a) = iter.next() {
         if a == "--help" && !help {
@@ -218,6 +246,22 @@ pub fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<Invocatio
             }
             continue;
         }
+        let op_stats_value = if a == "--op-stats-file" {
+            Some(iter.next())
+        } else {
+            strip_prefix_arg(&a, "--op-stats-file=").map(Some)
+        };
+        if let Some(v) = op_stats_value {
+            if op_stats_given {
+                op_stats_error = true;
+            }
+            op_stats_given = true;
+            match v.map(validate_op_stats_file) {
+                Some(Ok(p)) => op_stats_file = Some(p),
+                _ => op_stats_error = true,
+            }
+            continue;
+        }
         let value = if a == "--socket" {
             // 値の欠落は不正（None のまま下で socket_error になる）。
             iter.next()
@@ -237,7 +281,10 @@ pub fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<Invocatio
         }
     }
     let socket_given = socket.is_some() || socket_error;
-    if other || (help && (socket_given || streaming_given)) || (streaming_given && !socket_given) {
+    if other
+        || (help && (socket_given || streaming_given || op_stats_given))
+        || ((streaming_given || op_stats_given) && !socket_given)
+    {
         return Err(invalid(MSG_UNEXPECTED_ARGUMENT));
     }
     if socket_error {
@@ -246,9 +293,16 @@ pub fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<Invocatio
     if streaming_given && (streaming_error || !streaming_is_consistent(&streaming)) {
         return Err(invalid(MSG_INVALID_STREAMING));
     }
+    if op_stats_error {
+        return Err(invalid(MSG_INVALID_OP_STATS_FILE));
+    }
     Ok(match (help, socket) {
         (true, _) => Invocation::Help,
-        (false, Some(socket)) => Invocation::Serve { socket, streaming },
+        (false, Some(socket)) => Invocation::Serve {
+            socket,
+            streaming,
+            op_stats_file,
+        },
         (false, None) => Invocation::Run,
     })
 }
@@ -340,7 +394,7 @@ mod tests {
     fn usage_is_fixed() {
         assert_eq!(
             usage(),
-            "usage: fandhe-container-plugin-cri [--help] | --socket <PATH> [--streaming-bind <ADDR>] [--streaming-allow-external] [--streaming-advertise <IP>]\n"
+            "usage: fandhe-container-plugin-cri [--help] | --socket <PATH> [--streaming-bind <ADDR>] [--streaming-allow-external] [--streaming-advertise <IP>] [--op-stats-file <PATH>]\n"
         );
     }
 
@@ -351,6 +405,7 @@ mod tests {
         let want = Invocation::Serve {
             socket: PathBuf::from("/run/x/s.sock"),
             streaming: StreamingOptions::default(),
+            op_stats_file: None,
         };
         assert_eq!(p(&["--socket", "/run/x/s.sock"]).expect("ok"), want);
         assert_eq!(p(&["--socket=/run/x/s.sock"]).expect("ok"), want);
@@ -584,5 +639,159 @@ mod tests {
                 "args: {a:?}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    const OPSTATS: &str = "/run/x/stats.jsonl";
+    #[cfg(windows)]
+    const OPSTATS: &str = "C:\\run\\x\\stats.jsonl";
+    #[cfg(unix)]
+    const OPSTATS_EQ: &str = "--op-stats-file=/run/x/stats.jsonl";
+    #[cfg(windows)]
+    const OPSTATS_EQ: &str = "--op-stats-file=C:\\run\\x\\stats.jsonl";
+
+    fn op_err(a: &[&str]) -> bool {
+        msg(p(a))
+            == (
+                PluginErrorCode::InvalidArgument,
+                MSG_INVALID_OP_STATS_FILE.to_string(),
+            )
+    }
+
+    /// CRI-6・REPAIR-4・#4336: 2 つの形で同じ値になる。
+    #[test]
+    fn cri6_4336_op_stats_file_both_forms() {
+        let want = Invocation::Serve {
+            socket: PathBuf::from(SOCK),
+            streaming: StreamingOptions::default(),
+            op_stats_file: Some(PathBuf::from(OPSTATS)),
+        };
+        assert_eq!(
+            p(&["--socket", SOCK, "--op-stats-file", OPSTATS]).expect("ok"),
+            want
+        );
+        assert_eq!(p(&[OPSTATS_EQ, SOCK_EQ]).expect("ok"), want);
+    }
+
+    /// CRI-6・#4336: Issue 記載の具体パス。
+    #[cfg(unix)]
+    #[test]
+    fn cri6_4336_issue_example_path() {
+        for a in [
+            &["--socket=/a/s", "--op-stats-file", "/run/x/stats.jsonl"][..],
+            &["--socket=/a/s", "--op-stats-file=/run/x/stats.jsonl"],
+        ] {
+            match p(a).expect("ok") {
+                Invocation::Serve { op_stats_file, .. } => {
+                    assert_eq!(op_stats_file, Some(PathBuf::from("/run/x/stats.jsonl")))
+                }
+                other => panic!("unexpected: {other:?}"),
+            }
+        }
+    }
+
+    /// CRI-6・#4336: 未指定は None で従来どおり。streaming と併用しても値は変わらない。
+    #[test]
+    fn cri6_4336_absent_is_none_and_unchanged() {
+        assert_eq!(
+            p(&["--socket", SOCK]).expect("ok"),
+            Invocation::Serve {
+                socket: PathBuf::from(SOCK),
+                streaming: StreamingOptions::default(),
+                op_stats_file: None,
+            }
+        );
+        match p(&[SOCK_EQ, "--streaming-bind=127.0.0.1:9000", OPSTATS_EQ]).expect("ok") {
+            Invocation::Serve {
+                streaming,
+                op_stats_file,
+                ..
+            } => {
+                assert_eq!(
+                    streaming.bind,
+                    Some("127.0.0.1:9000".parse().expect("addr"))
+                );
+                assert_eq!(op_stats_file, Some(PathBuf::from(OPSTATS)));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// CRI-6・#4336: 非 UTF-8 のバイト列も保持する。
+    #[cfg(unix)]
+    #[test]
+    fn cri6_4336_non_utf8_path_accepted() {
+        use std::os::unix::ffi::OsStringExt;
+        let arg = OsString::from_vec(b"--op-stats-file=/run/\xff.jsonl".to_vec());
+        match parse_args([OsString::from("--socket=/a/s"), arg]).expect("ok") {
+            Invocation::Serve { op_stats_file, .. } => assert_eq!(
+                op_stats_file.expect("some").as_os_str().as_encoded_bytes(),
+                b"/run/\xff.jsonl"
+            ),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// CRI-6・REPAIR-4・#4336: 不正な指定は固定文言で、値を含めない。
+    #[test]
+    fn cri6_4336_invalid_values_rejected_without_echo() {
+        #[allow(unused_mut)]
+        let mut cases: Vec<Vec<&str>> = vec![
+            vec!["--op-stats-file"],
+            vec!["--op-stats-file="],
+            vec!["--op-stats-file", ""],
+            vec!["--op-stats-file", "rel/secret.jsonl"],
+            vec!["--op-stats-file=secret.jsonl"],
+            vec!["--op-stats-file", OPSTATS, "--op-stats-file", OPSTATS],
+            vec!["--op-stats-file", OPSTATS, OPSTATS_EQ],
+        ];
+        #[cfg(unix)]
+        {
+            cases.push(vec!["--op-stats-file=/a/../secret.jsonl"]);
+            cases.push(vec!["--op-stats-file=/"]);
+        }
+        for c in cases {
+            let args: Vec<&str> = ["--socket", SOCK]
+                .iter()
+                .copied()
+                .chain(c.iter().copied())
+                .collect();
+            assert!(op_err(&args), "args: {args:?}");
+            let m = msg(p(&args)).1;
+            assert!(!m.contains("secret") && !m.contains(".jsonl") && !m.contains("/a/"));
+        }
+    }
+
+    /// CRI-6・#4336: socket なし・--help との併用は未知の引数として拒む。
+    #[test]
+    fn cri6_4336_without_socket_or_with_help_is_unexpected() {
+        for a in [
+            &["--op-stats-file", OPSTATS][..],
+            &[OPSTATS_EQ],
+            &["--help", OPSTATS_EQ],
+            &[SOCK_EQ, "--help", OPSTATS_EQ],
+        ] {
+            assert_eq!(
+                msg(p(a)),
+                (
+                    PluginErrorCode::InvalidArgument,
+                    MSG_UNEXPECTED_ARGUMENT.to_string()
+                ),
+                "args: {a:?}"
+            );
+        }
+    }
+
+    /// CRI-6・#4336: エラーの優先順は socket、streaming、op-stats-file。
+    #[test]
+    fn cri6_4336_error_precedence() {
+        assert_eq!(
+            msg(p(&["--socket", "rel", "--op-stats-file", "rel"])).1,
+            MSG_INVALID_SOCKET
+        );
+        assert_eq!(
+            msg(p(&[SOCK_EQ, "--streaming-bind=abc", "--op-stats-file=rel"])).1,
+            MSG_INVALID_STREAMING
+        );
     }
 }

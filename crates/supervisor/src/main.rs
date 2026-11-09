@@ -36,6 +36,12 @@ fn main() -> std::process::ExitCode {
     {
         return fandhe_container_supervisor::stream_exec::helper::run_stream_exec_main(args);
     }
+    // 第 1 引数が `pod-holder` なら pod の保持役へ振り分ける（CRI-2・CORE-1・SEC-5・#2874）。
+    // 同じ位置・同じ理由（結果を固定長の READY フレームで返すため `run_main` の fd 検証・結果チャネルを通さない）。
+    // 特権ランチャーは `StartArgs::parse` を通った argv だけを転送するので、この分岐の入口にはならない。
+    if fandhe_container_supervisor::pod_holder::is_pod_holder_invocation(first.as_deref()) {
+        return fandhe_container_supervisor::pod_holder::run_pod_holder_main(args);
+    }
     fandhe_container_supervisor::start_entry::run_main(first.into_iter().chain(args))
 }
 

@@ -271,6 +271,14 @@ name = "exec_launch_netns_rootless"
 path = "tests/exec_launch_netns_rootless.rs"
 harness = false
 
+# supervisor の bin の `pod-holder` モード（pod の user・ipc・net namespace の保持役）を本物のバイナリで通す実機前提の
+# 結合試験（CRI-2・CORE-1・SEC-5・REPAIR-5・#2874。依存は不変）。再 exec・nsenter を使うため独自 main（harness = false）。
+# `-- --ignored` 指定時のみ実行する。CI への組み込みは #2875。
+[[test]]
+name = "pod_holder_bin_real"
+path = "tests/pod_holder_bin_real.rs"
+harness = false
+
 # 本番 launcher（ProductionLauncher）と実際の pasta を通した rootless の通し確認の実機前提の結合試験（NET-9・NET-3・CORE-1・SUP-2・#3331。依存は不変）。
 # holder と pasta を試験バイナリ自身の再実行で起動するため独自 main（harness = false）で `netns-holder` を振り分ける。`-- --ignored` 指定時のみ実行する。
 [[test]]

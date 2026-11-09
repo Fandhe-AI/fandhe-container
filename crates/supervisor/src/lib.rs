@@ -90,6 +90,7 @@ pub mod net_error;
 pub mod netns_holder;
 #[cfg(target_os = "linux")]
 pub mod pasta_attach;
+pub mod pod_holder;
 pub mod privilege;
 pub mod restart;
 pub mod run;

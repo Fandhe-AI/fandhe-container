@@ -1029,43 +1029,29 @@ mod tests {
 #[cfg(all(test, not(unix)))]
 mod windows_rejection_tests {
     use super::*;
-    use std::sync::atomic::{AtomicU32, Ordering};
-
     const EXPECTED_MESSAGE: &str =
         "image store is rejected on Windows hosts by design; it runs inside the Linux guest";
-
-    fn scratch(label: &str) -> PathBuf {
-        static SEQ: AtomicU32 = AtomicU32::new(0);
-        let p = std::env::temp_dir().join(format!(
-            "fc-oci-winreject-{}-{}-{label}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = fs::remove_dir_all(&p);
-        p
-    }
 
     /// 存在しない root でも `NotFound` ではなく設計上の拒否になり、root を作らない。
     #[test]
     fn oci7_open_is_rejected_by_design_without_side_effects() {
-        let root = scratch("open").join("child");
+        // 排他作成した専用の親の下の未作成パスを使う（既存パスを消さない）。
+        let parent = crate::test_root::test_root("fc-oci-winreject", "open");
+        let root = parent.join("child");
         let err = ImageStore::open(&root).expect_err("must be rejected");
         assert_eq!(err.code(), OciErrorCode::FailedPrecondition);
         assert_eq!(err.message(), EXPECTED_MESSAGE);
         assert!(!root.exists());
-        assert!(!root.parent().expect("parent").exists());
     }
 
     /// 既存の空ディレクトリでも `@lock` 等を作らず拒否する。
     #[test]
     fn oci7_with_table_is_rejected_by_design_without_side_effects() {
-        let root = scratch("with-table");
-        fs::create_dir_all(&root).expect("mkdir");
+        let root = crate::test_root::test_root("fc-oci-winreject", "with-table");
         let err =
             ImageStore::with_table(&root, ReferenceTable::new()).expect_err("must be rejected");
         assert_eq!(err.code(), OciErrorCode::FailedPrecondition);
         assert_eq!(err.message(), EXPECTED_MESSAGE);
-        assert_eq!(fs::read_dir(&root).expect("read_dir").count(), 0);
-        let _ = fs::remove_dir_all(&root);
+        assert_eq!(fs::read_dir(&*root).expect("read_dir").count(), 0);
     }
 }

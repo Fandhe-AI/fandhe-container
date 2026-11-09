@@ -1,7 +1,7 @@
 //! 作業枠の満杯（即時 Busy）が、期限切れと別の結果になることの結合試験（#2894・CLI-1・SUP-7・REPAIR-5・ERR-1）。
 //!
 //! 枠（`MAX_INFLIGHT_LOG_REMOVALS`）はプロセス共有の static のため、枠を埋める本試験は専用の試験バイナリに置き、
-//! 試験関数は 1 つだけにする。以前は `run_log_removal_bounded`・`remove_stale_bounded`・`sweep_stale_container_logs`
+//! 試験関数は 1 つだけにする。以前は `run_log_removal_bounded`・`remove_stale_bounded`・`sweep_stale_container_logs`・`sweep_stale_supervisor_logs`
 //! がいずれも枠の満杯を期限切れ（`TimedOut`・`TIMEOUT`・`timed_out`）として返していた。
 
 #![cfg(target_os = "linux")]
@@ -20,6 +20,7 @@ use fandhe_container_supervisor::container_options::store::{acquire_lock, remove
 use fandhe_container_supervisor::logs::{SweepReport, sweep_stale_container_logs};
 use fandhe_container_supervisor::supervisor_log::{
     BoundedFailure, LogRemoval, run_bounded_classified, run_log_removal_bounded,
+    sweep_stale_supervisor_logs,
 };
 
 /// 枠の上限（`MAX_INFLIGHT_LOG_REMOVALS`）と同じ値。
@@ -67,6 +68,15 @@ fn repair5_err1_2894_slot_busy_is_distinct_from_timeout() {
         "container options file removal workers are busy"
     );
     let report = sweep_stale_container_logs(&tmp, Arc::new(|_| true), Duration::from_secs(30));
+    assert_eq!(
+        report,
+        SweepReport {
+            workers_busy: true,
+            ..SweepReport::default()
+        }
+    );
+    assert!(!report.timed_out);
+    let report = sweep_stale_supervisor_logs(&tmp, Arc::new(|_| true), Duration::from_secs(30));
     assert_eq!(
         report,
         SweepReport {

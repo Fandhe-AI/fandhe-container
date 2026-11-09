@@ -25,8 +25,9 @@
 //!
 //! # 未実装（REPAIR-3）
 //! - 操作統計の stderr 以外の公開口は `docs/design/cri-op-stats-export.md`（#4228・CRI-6・REPAIR-4）の案 C（原子的に置き換える
-//!   スナップショットファイルを opt-in で出す）。sink（[`OpStatsFileSink`]・[`op_stats_export_loop_with`]）は実装済み（#4337）だが、
-//!   `main.rs` への結線（起動引数・停止時の最後の書き出し）は W4（#4340）で、現状 `main.rs` は stderr のみへ出す
+//!   スナップショットファイルを opt-in で出す）。sink（[`OpStatsFileSink`]・[`op_stats_export_loop_with`]）は実装済み（#4337）で、
+//!   `main.rs` へ `--op-stats-file` として結線済み（#4340。指定時のみ開き、停止時に期限つきで最後の 1 回を書く）。
+//!   設計書の状態の更新は W5（#4341）
 //! - 監査の永続化経路は Linux 限定（`ControlAuditRelay` が Linux 限定、非 Linux の `FileAuditSink` は #2430 の
 //!   判断待ち）。非 Linux では `PeerAuditForwarder` を渡さず、拒否は stderr にだけ残る
 
@@ -43,12 +44,105 @@ use fandhe_container_core::observability::OpRecorder;
 use fandhe_container_plugin::transport::UDS_ACCEPT_PEER_REJECTION_LIMIT;
 use fandhe_container_plugin::{
     JsonLinesPeerAuthObserver, PeerAuthObserver, PeerAuthRejectReason, PeerAuthRejection,
+    PluginError, PluginErrorCode,
 };
 
 /// 監査行を回収して書き出す間隔。
 pub const AUDIT_DRAIN_INTERVAL: Duration = Duration::from_secs(1);
 /// 操作統計を書き出す間隔。
 pub const OP_STATS_EXPORT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// 操作統計の書き出し周期。既定は [`OP_STATS_EXPORT_INTERVAL`]。試験用 feature `op-stats-test-support` が有効なときだけ、
+/// 環境変数 `FANDHE_CONTAINER_TEST_OP_STATS_INTERVAL_MS`（10 進ミリ秒。1..=60000 のみ採用し、範囲外・不正は既定）で短くできる
+/// （周期の書き出しを数秒で見る結合試験のため。#4340・CRI-6・REPAIR-5。リリースビルドでは feature が有効にならない）。
+/// `main.rs` の `serve` が [`op_stats_export_loop_with`] へ渡す。
+pub fn op_stats_export_interval() -> Duration {
+    #[cfg(feature = "op-stats-test-support")]
+    if let Some(d) = std::env::var("FANDHE_CONTAINER_TEST_OP_STATS_INTERVAL_MS")
+        .ok()
+        .as_deref()
+        .and_then(parse_interval_ms)
+    {
+        return d;
+    }
+    OP_STATS_EXPORT_INTERVAL
+}
+
+/// 試験用の周期指定の解釈（10 進ミリ秒の 1..=60000 だけ。それ以外は `None`）。
+#[cfg(any(test, feature = "op-stats-test-support"))]
+fn parse_interval_ms(s: &str) -> Option<Duration> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let ms: u64 = s.parse().ok()?;
+    (1..=60_000)
+        .contains(&ms)
+        .then(|| Duration::from_millis(ms))
+}
+
+/// 本番の記録器の数（共有記録器と oci 専用記録器の 2 つ）。スナップショットのサイズ上限（64 KiB × 2）の根拠（#2900・#4340）。
+pub const PRODUCTION_OP_STATS_BLOCKS: usize = 2;
+
+/// 停止時の最後の書き出しの結果（[`write_final_snapshot`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FinalSnapshot {
+    /// 期限内に置き換えが済んだ。
+    Written,
+    /// 期限内に書き込み thread が空かず、または書き終わらなかったため諦めた（失敗として数え、行を残した）。
+    TimedOut,
+    /// 書き込みに失敗した（行は書き込み thread が残した）。
+    Failed,
+    /// 記録器の符号化に失敗したため書かなかった（失敗として数え、行を残した）。
+    EncodeFailed,
+}
+
+/// `--op-stats-file` の置き先を検査して開く（#4340・CRI-6・REPAIR-4・SEC-1）。`main.rs` の `serve` が、audit relay の fork・状態ルート・
+/// ロック・socket より前に呼ぶ（thread を作らず、開いた fd は `O_CLOEXEC`）。置き先ディレクトリ（symlink・他 UID 所有・
+/// group/other 書き込み可は拒否）に加え、最終名が通常ファイルか不在であることも起動時に確かめる（fail-closed）。
+/// 失敗は固定文言（パス・errno を含めない）。非 Linux は `UNIMPLEMENTED`。
+pub fn open_op_stats_target(path: &std::path::Path) -> Result<SnapshotTarget, PluginError> {
+    use crate::snapshot_file::SnapshotLimit;
+    let blocks = std::num::NonZeroUsize::new(PRODUCTION_OP_STATS_BLOCKS)
+        .ok_or_else(|| op_stats_open_error(SnapshotError::LimitOutOfRange))?;
+    let limit = SnapshotLimit::for_blocks(blocks).map_err(op_stats_open_error)?;
+    let target = SnapshotTarget::open(path, limit).map_err(op_stats_open_error)?;
+    target.check_target().map_err(op_stats_open_error)?;
+    Ok(target)
+}
+
+/// 検証済みの置き先から書き込み sink を起こす（thread を作る）。audit relay の fork の後に呼ぶ（relay は単一スレッドを要求する）。
+/// thread を作れなければ起動を中止する（fail-closed）。
+pub fn spawn_op_stats_file_sink(
+    target: SnapshotTarget,
+    notices: LineSink,
+) -> Result<OpStatsFileSink, PluginError> {
+    OpStatsFileSink::spawn(target, notices)
+        .map_err(|_| PluginError::new(PluginErrorCode::Internal, MSG_OP_STATS_FILE_SPAWN_FAILED))
+}
+
+/// 置き先を開けないときの固定文言の前半（後ろに `: <SnapshotError::code()>` が付く。パス・errno は含めない）。
+pub const MSG_OP_STATS_FILE_OPEN_FAILED: &str = "failed to open the op-stats snapshot file";
+/// 書き込み thread を作れないときの固定文言。
+pub const MSG_OP_STATS_FILE_SPAWN_FAILED: &str = "failed to start the op-stats snapshot writer";
+
+/// [`SnapshotError`] を `PluginError`（固定文言 + 固定コード）へ写す。
+fn op_stats_open_error(e: SnapshotError) -> PluginError {
+    let code = match e {
+        SnapshotError::Unsupported => PluginErrorCode::Unimplemented,
+        SnapshotError::RelativePath | SnapshotError::InvalidPath => {
+            PluginErrorCode::InvalidArgument
+        }
+        SnapshotError::UntrustedDirectory
+        | SnapshotError::UntrustedProcess
+        | SnapshotError::TargetNotRegular => PluginErrorCode::PermissionDenied,
+        _ => PluginErrorCode::Internal,
+    };
+    PluginError::new(
+        code,
+        format!("{MSG_OP_STATS_FILE_OPEN_FAILED}: {}", e.code()),
+    )
+}
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     // 毒化しても記録は続ける（監査を落とさない）。
@@ -415,8 +509,8 @@ struct FileSinkInner {
 /// ブロックしない。前の書き込みが終わっていなければその周期は飛ばして数える（同時に抱えるスナップショットは高々 1 つ）。
 ///
 /// 失敗（上限超過・書き込み失敗）と飛ばしは黙って捨てず、固定語彙の 1 行（パス・errno・コンテナ ID を含めない）を
-/// `notices`（本番は stderr の [`LineSink`]）へ残す。呼び出し元は W4（#4340）で `main.rs` が `spawn` し、
-/// [`op_stats_export_loop_with`] へ渡す予定（現時点では未結線。REPAIR-3）。
+/// `notices`（本番は stderr の [`LineSink`]）へ残す。呼び出し元は `main.rs`（#4340）が `spawn` し、
+/// [`op_stats_export_loop_with`] へ渡す（`--op-stats-file` 指定時のみ。停止時は [`write_final_snapshot`] が最後の 1 回を書く。#4340）。
 #[derive(Clone)]
 pub struct OpStatsFileSink {
     inner: Arc<FileSinkInner>,
@@ -504,6 +598,12 @@ impl OpStatsFileSink {
         self.inner.notice_failed("encode_failed", n);
     }
 
+    /// 最後の書き出しが期限内に済まなかったことを失敗として数え、固定語彙の行を残す（[`write_final_snapshot`]）。
+    fn note_final_timeout(&self) {
+        let n = self.inner.counters.failed.fetch_add(1, Ordering::Relaxed) + 1;
+        self.inner.notice_failed("final_timeout", n);
+    }
+
     /// 累計を返す。
     pub fn counts(&self) -> OpStatsFileCounts {
         let c = &self.inner.counters;
@@ -516,7 +616,7 @@ impl OpStatsFileSink {
     }
 
     /// 書き込みが終わる（仕事中でなくなる）まで最大 `timeout` 待ち、終わったかを返す。
-    /// 停止時の最後の書き出し（W4・#4340）と試験用。書き込みが止まっていても `timeout` で返る。
+    /// 停止時の最後の書き出し（#4340）と試験用。書き込みが止まっていても `timeout` で返る。
     pub fn wait_idle(&self, timeout: Duration) -> bool {
         let deadline = std::time::Instant::now() + timeout;
         while self.inner.busy.load(Ordering::Acquire) {
@@ -560,16 +660,15 @@ pub fn export_cycle(
     let mut encode_ok = true;
     let mut stderr_lines = 0;
     for r in recorders {
-        let mut block: Vec<u8> = Vec::new();
-        match r.export_json_lines(Some(&mut block)) {
-            Ok(_) => {
+        match encode_block(r) {
+            Some(block) => {
                 stderr_lines += String::from_utf8_lossy(&block)
                     .lines()
                     .filter(|l| stderr.submit((*l).to_string()))
                     .count();
                 snapshot.extend_from_slice(&block);
             }
-            Err(_) => encode_ok = false,
+            None => encode_ok = false,
         }
     }
     let file = file.map(|f| {
@@ -581,6 +680,61 @@ pub fn export_cycle(
         }
     });
     OpStatsCycle { stderr_lines, file }
+}
+
+/// 記録器 1 つ分のブロック（JSON Lines。`op_stats_meta` 行で終わる）を符号化する。失敗は `None`。
+fn encode_block(recorder: &OpRecorder) -> Option<Vec<u8>> {
+    let mut block: Vec<u8> = Vec::new();
+    recorder.export_json_lines(Some(&mut block)).ok()?;
+    Some(block)
+}
+
+/// 停止時の最後のスナップショットを `budget` 以内で 1 回書く（#4340・CRI-6・REPAIR-4・REPAIR-5）。
+/// `main.rs` が、周期の task を止めランタイムを畳んだ後（周期の送り手がいない状態）に呼ぶ。期限は `budget` 全体で 1 つ:
+/// 書き込み中の分を待つ → ファイル用だけに符号化して渡す（stderr へはブロックを出さない）→ 書き終わるのを待つ。
+/// 期限を超えたら諦めて `final_timeout` の行を残し、停止を続ける（無期限に待たない）。成否は書き込み thread の累計
+/// （[`OpStatsFileCounts::written`]）が増えたかで判定する。
+pub fn write_final_snapshot(
+    recorders: &[Arc<OpRecorder>],
+    file: &OpStatsFileSink,
+    budget: Duration,
+) -> FinalSnapshot {
+    let deadline = std::time::Instant::now() + budget;
+    let remaining = || deadline.saturating_duration_since(std::time::Instant::now());
+    if !file.wait_idle(remaining()) {
+        file.note_final_timeout();
+        return FinalSnapshot::TimedOut;
+    }
+    let mut snapshot: Vec<u8> = Vec::new();
+    for r in recorders {
+        match encode_block(r) {
+            Some(block) => snapshot.extend_from_slice(&block),
+            None => {
+                file.note_encode_failure();
+                return FinalSnapshot::EncodeFailed;
+            }
+        }
+    }
+    let before = file.counts().written;
+    match file.submit(snapshot) {
+        FileSubmit::Queued => {}
+        FileSubmit::EncodeFailed => return FinalSnapshot::EncodeFailed,
+        FileSubmit::Unavailable => return FinalSnapshot::Failed,
+        // 直前に空きを確認済みのため通常は起きない。起きたら書けていないので諦めた扱いにする。
+        FileSubmit::SkippedBusy => {
+            file.note_final_timeout();
+            return FinalSnapshot::TimedOut;
+        }
+    }
+    if !file.wait_idle(remaining()) {
+        file.note_final_timeout();
+        return FinalSnapshot::TimedOut;
+    }
+    if file.counts().written > before {
+        FinalSnapshot::Written
+    } else {
+        FinalSnapshot::Failed
+    }
 }
 
 /// `period` ごとに操作統計を stderr 書き出し口へ渡し続ける（呼び出し側が abort して止める）。
@@ -595,8 +749,8 @@ pub async fn op_stats_export_loop_many(recorders: Vec<Arc<OpRecorder>>, period: 
 }
 
 /// [`op_stats_export_loop_many`] の出力先を差し替えられる版。`file` が `Some` なら、同じ周期の内容をスナップショットファイルへも
-/// 渡す（#4337）。`None` の挙動は `op_stats_export_loop_many` と同じ。W4（#4340）の `main.rs` は、`--op-stats-file` が
-/// 有効なときに [`OpStatsFileSink::spawn`] した sink をここへ渡す（呼び出し元は現時点で未結線。REPAIR-3）。
+/// 渡す（#4337）。`None` の挙動は `op_stats_export_loop_many` と同じ。`main.rs`（#4340）は、`--op-stats-file` が
+/// 有効なときに [`spawn_op_stats_file_sink`] した sink をここへ渡す。
 pub async fn op_stats_export_loop_with(
     recorders: Vec<Arc<OpRecorder>>,
     period: Duration,

@@ -1,8 +1,8 @@
 //! op-stats のスナップショットファイルを安全に開いて原子的に置き換える部品（#4335・CRI-6・REPAIR-4・SEC-1）。
 //!
 //! 呼び出し元: `telemetry::OpStatsFileSink`（#4337）の専用 thread が [`SnapshotTarget::replace`] を呼ぶ
-//! （本部品は同期 I/O のため RPC 経路から直接呼ばない。REPAIR-5）。`main.rs` への結線は未了で、起動引数の解析（W2・#4336）・
-//! 停止時の最後の書き出し（W4・#4340）・設計書の更新（W5・#4341）は別 issue。契約の出典は
+//! （本部品は同期 I/O のため RPC 経路から直接呼ばない。REPAIR-5）。`main.rs` へは `--op-stats-file` として結線済み
+//! （起動引数の解析は W2・#4336、起動時の [`SnapshotTarget::check_target`] と停止時の最後の書き出しは W4・#4340。設計書の更新は W5・#4341）。契約の出典は
 //! `docs/design/cri-op-stats-export.md`（案 C。opt-in の絶対パスへ原子的に置き換えるスナップショット）。
 //!
 //! # 契約
@@ -173,6 +173,21 @@ impl SnapshotTarget {
     pub fn open(path: &Path, limit: SnapshotLimit) -> Result<Self, SnapshotError> {
         let euid = imp::unelevated_euid()?;
         imp::open_with_euid(path, limit, euid)
+    }
+
+    /// 最終名が通常ファイルか不在であることを確かめる（symlink・ディレクトリ・FIFO 等は `TargetNotRegular`）。
+    /// [`Self::open`] はディレクトリしか見ないため、起動時に最終名の不正を見つける口（#4340。fail-closed）。
+    /// 非 Linux は `Unsupported`。
+    #[cfg(not(target_os = "linux"))]
+    pub fn check_target(&self) -> Result<(), SnapshotError> {
+        Err(SnapshotError::Unsupported)
+    }
+
+    /// 最終名が通常ファイルか不在であることを確かめる（symlink・ディレクトリ・FIFO 等は `TargetNotRegular`）。
+    /// [`Self::open`] はディレクトリしか見ないため、起動時に最終名の不正を見つける口（#4340。fail-closed）。
+    #[cfg(target_os = "linux")]
+    pub fn check_target(&self) -> Result<(), SnapshotError> {
+        imp::check_final_name(self)
     }
 
     /// 内容を原子的に置き換える。非 Linux は `Unsupported`。
@@ -346,6 +361,17 @@ mod imp {
         Err(SnapshotError::CreateFailed)
     }
 
+    /// 最終名が通常ファイルか不在かを lstat で確かめる（`replace` と起動時の `check_target` が共有）。
+    pub(super) fn check_final_name(t: &SnapshotTarget) -> Result<(), SnapshotError> {
+        match std::fs::symlink_metadata(child_via_fd(&t.dir, &t.name)) {
+            // symlink は is_file() が false になる（lstat）。FIFO・デバイス・ディレクトリも同様。
+            Ok(fm) if fm.file_type().is_file() => Ok(()),
+            Ok(_) => Err(SnapshotError::TargetNotRegular),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(SnapshotError::TargetNotRegular),
+        }
+    }
+
     fn write_and_install(
         t: &SnapshotTarget,
         file: &mut std::fs::File,
@@ -362,14 +388,8 @@ mod imp {
         file.write_all(contents)
             .map_err(|_| SnapshotError::WriteFailed)?;
         file.sync_all().map_err(|_| SnapshotError::SyncFailed)?;
+        check_final_name(t)?;
         let final_path = child_via_fd(&t.dir, &t.name);
-        match std::fs::symlink_metadata(&final_path) {
-            // symlink は is_file() が false になる（lstat）。FIFO・デバイス・ディレクトリも同様。
-            Ok(fm) if fm.file_type().is_file() => {}
-            Ok(_) => return Err(SnapshotError::TargetNotRegular),
-            Err(e) if e.kind() == ErrorKind::NotFound => {}
-            Err(_) => return Err(SnapshotError::TargetNotRegular),
-        }
         std::fs::rename(tmp_path, &final_path).map_err(|_| SnapshotError::RenameFailed)?;
         // rename を永続化する。失敗しても置き換え自体は済んでいる（モジュール doc の残余 5）。
         t.dir.sync_all().map_err(|_| SnapshotError::SyncFailed)

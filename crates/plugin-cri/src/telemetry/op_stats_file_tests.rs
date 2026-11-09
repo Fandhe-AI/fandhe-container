@@ -314,3 +314,166 @@ mod linux {
         );
     }
 }
+/// 書き込み内容を覚える fake。
+struct Capture(Arc<Mutex<Vec<Vec<u8>>>>);
+impl SnapshotWrite for Capture {
+    fn replace(&self, contents: &[u8]) -> Result<(), SnapshotError> {
+        lock(&self.0).push(contents.to_vec());
+        Ok(())
+    }
+}
+
+/// 1 回の書き込みに時間がかかる fake（完了を待つ経路の確認用）。
+struct Slow(Duration);
+impl SnapshotWrite for Slow {
+    fn replace(&self, _contents: &[u8]) -> Result<(), SnapshotError> {
+        std::thread::sleep(self.0);
+        Ok(())
+    }
+}
+
+/// REPAIR-4・#4340: idle のとき最後のスナップショットは 2 ブロック（共有 → oci の順）で `Written`、stderr へはブロックを出さない。
+#[test]
+fn repair4_4340_final_snapshot_is_written_with_both_blocks() {
+    let (notices, out) = buf_sink();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sink = spawn_fake(Box::new(Capture(Arc::clone(&seen))), notices.clone());
+    let recs = [recorder("a", 1), recorder("b", 2)];
+    let r = write_final_snapshot(&recs, &sink, Duration::from_secs(5));
+    assert_eq!(r, FinalSnapshot::Written);
+    let got = lock(&seen).clone();
+    assert_eq!(got.len(), 1);
+    let body = String::from_utf8(got[0].clone()).unwrap();
+    assert_eq!(
+        body.matches("\"event\":\"op_stats_meta\"").count(),
+        2,
+        "{body}"
+    );
+    assert!(body.lines().last().unwrap().contains("op_stats_meta"));
+    assert_eq!(sink.counts().written, 1);
+    assert_eq!(text(&notices, &out), "");
+}
+
+/// REPAIR-5・#4340: 書き込み中の分は飛ばさず、期限内に終わるのを待ってから書く。
+#[test]
+fn repair5_4340_final_snapshot_waits_for_inflight_write() {
+    let (notices, _out) = buf_sink();
+    let sink = spawn_fake(Box::new(Slow(Duration::from_millis(150))), notices);
+    assert_eq!(sink.submit(b"x\n".to_vec()), FileSubmit::Queued);
+    let r = write_final_snapshot(&[recorder("a", 1)], &sink, Duration::from_secs(5));
+    assert_eq!(r, FinalSnapshot::Written);
+    let c = sink.counts();
+    assert_eq!((c.written, c.skipped_busy, c.failed), (2, 0, 0));
+}
+
+/// REPAIR-5・#4340: writer が止まったままなら期限で諦め、`final_timeout` の行を残し、期限 + 余裕以内に戻る。
+#[test]
+fn repair5_4340_final_snapshot_times_out_on_stalled_writer() {
+    let (gate, rx) = std::sync::mpsc::channel::<()>();
+    let (notices, out) = buf_sink();
+    let sink = spawn_fake(Box::new(Stall(rx)), notices.clone());
+    assert_eq!(sink.submit(b"x\n".to_vec()), FileSubmit::Queued);
+    let start = std::time::Instant::now();
+    let r = write_final_snapshot(&[recorder("a", 1)], &sink, Duration::from_millis(200));
+    let elapsed = start.elapsed();
+    assert_eq!(r, FinalSnapshot::TimedOut);
+    assert!(elapsed >= Duration::from_millis(200), "{elapsed:?}");
+    assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+    assert_eq!(sink.counts().failed, 1);
+    assert_eq!(
+        text(&notices, &out),
+        "{\"event\":\"op_stats_file_failed\",\"outcome\":\"error\",\"reason\":\"final_timeout\",\"count\":1}\n"
+    );
+    drop(gate);
+}
+
+/// REPAIR-4・#4340: 書き込みが失敗したら `Failed`（行は書き込み thread が残す）。
+#[test]
+fn repair4_4340_final_snapshot_reports_write_failure() {
+    let (notices, out) = buf_sink();
+    let sink = spawn_fake(Box::new(Fail(SnapshotError::WriteFailed)), notices.clone());
+    let r = write_final_snapshot(&[recorder("a", 1)], &sink, Duration::from_secs(5));
+    assert_eq!(r, FinalSnapshot::Failed);
+    assert_eq!(sink.counts().failed, 1);
+    assert!(text(&notices, &out).contains("\"reason\":\"write_failed\""));
+}
+
+/// SEC-4・#4340: 置き先を開けない失敗は全 variant でコードと文言が固定で、パスを含まない。
+#[test]
+fn sec4_4340_open_error_mapping_is_fixed_vocabulary() {
+    use fandhe_container_plugin::PluginErrorCode as C;
+    let cases = [
+        (SnapshotError::Unsupported, C::Unimplemented, "unsupported"),
+        (
+            SnapshotError::RelativePath,
+            C::InvalidArgument,
+            "relative_path",
+        ),
+        (
+            SnapshotError::InvalidPath,
+            C::InvalidArgument,
+            "invalid_path",
+        ),
+        (
+            SnapshotError::UntrustedDirectory,
+            C::PermissionDenied,
+            "untrusted_directory",
+        ),
+        (
+            SnapshotError::UntrustedProcess,
+            C::PermissionDenied,
+            "untrusted_process",
+        ),
+        (
+            SnapshotError::TargetNotRegular,
+            C::PermissionDenied,
+            "target_not_regular",
+        ),
+        (
+            SnapshotError::LimitOutOfRange,
+            C::Internal,
+            "limit_out_of_range",
+        ),
+        (SnapshotError::CreateFailed, C::Internal, "create_failed"),
+    ];
+    for (e, code, tag) in cases {
+        let pe = op_stats_open_error(e);
+        assert_eq!(pe.code(), code, "{tag}");
+        assert_eq!(
+            pe.message(),
+            format!("failed to open the op-stats snapshot file: {tag}")
+        );
+        assert!(!pe.message().contains('/'));
+    }
+}
+
+/// #4340: 試験用の周期指定は 10 進ミリ秒の 1..=60000 だけを採る。
+#[test]
+fn repair5_4340_interval_override_parsing() {
+    assert_eq!(parse_interval_ms("300"), Some(Duration::from_millis(300)));
+    assert_eq!(parse_interval_ms("1"), Some(Duration::from_millis(1)));
+    assert_eq!(parse_interval_ms("60000"), Some(Duration::from_secs(60)));
+    for bad in [
+        "",
+        "0",
+        "60001",
+        "-5",
+        "1e3",
+        "abc",
+        " 5",
+        "5 ",
+        "+5",
+        "99999999999999999999",
+    ] {
+        assert_eq!(parse_interval_ms(bad), None, "{bad:?}");
+    }
+}
+
+/// #4340: 環境変数が無いときの周期は既定の 60 秒。
+#[cfg(feature = "op-stats-test-support")]
+#[test]
+fn repair5_4340_interval_defaults_without_override() {
+    if std::env::var_os("FANDHE_CONTAINER_TEST_OP_STATS_INTERVAL_MS").is_none() {
+        assert_eq!(op_stats_export_interval(), OP_STATS_EXPORT_INTERVAL);
+    }
+}

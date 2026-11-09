@@ -256,4 +256,44 @@ mod linux {
         assert!(reader.join().unwrap() >= 1);
         assert!(leftovers(&r).is_empty());
     }
+
+    /// #4340: 起動時の最終名の検査。不在・通常ファイルは通し、symlink（ダングリング含む）・ディレクトリ・FIFO は拒否する。
+    #[test]
+    fn sec1_4340_check_target_accepts_absent_and_regular() {
+        let r = root("chkok");
+        let p = r.join("s.json");
+        assert_eq!(open(&p, 1).unwrap().check_target(), Ok(()));
+        std::fs::write(&p, b"x").unwrap();
+        assert_eq!(open(&p, 1).unwrap().check_target(), Ok(()));
+    }
+
+    #[test]
+    fn sec1_4340_check_target_rejects_non_regular() {
+        let r = root("chkbad");
+        // 実在の先への symlink。
+        std::fs::write(r.join("victim"), b"keep").unwrap();
+        let live = r.join("live.json");
+        std::os::unix::fs::symlink(r.join("victim"), &live).unwrap();
+        // ダングリング symlink。
+        let dangling = r.join("dangling.json");
+        std::os::unix::fs::symlink(r.join("nowhere"), &dangling).unwrap();
+        // ディレクトリ。
+        let dir = r.join("dir.json");
+        std::fs::create_dir(&dir).unwrap();
+        // FIFO。
+        let fifo = r.join("fifo.json");
+        let st = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        for p in [live, dangling, dir, fifo] {
+            assert_eq!(
+                open(&p, 1).unwrap().check_target(),
+                Err(SnapshotError::TargetNotRegular),
+                "{p:?}"
+            );
+        }
+        assert!(leftovers(&r).is_empty());
+    }
 }

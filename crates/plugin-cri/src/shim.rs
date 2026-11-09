@@ -280,8 +280,8 @@ impl DeleteTarget {
 
 /// delete の対象と状態ルートの記録との照合結果（副作用なしで得る。REPAIR-4・#4151）。
 ///
-/// 停止・回収（#4152）がこの値を受け取り、`Recorded` のときだけ実行層に触れる。`NotRecorded` と `AlreadyReclaimed` は
-/// どちらも実行層を作らず副作用 0 回で、固定の応答（pid 0・終了状態 137）で成功する（挙動は変わらない）。
+/// 停止・回収（#4152）がこの値を受け取り、`Recorded` のときだけ状態記録・cgroup・プロセスに触れる。`NotRecorded` は副作用 0 回、
+/// `AlreadyReclaimed` は ID 単位の残骸 3 種の guard つき削除だけを行う（#4279・D7）。どちらも固定の応答（pid 0・終了状態 137）で成功する。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DeleteRecordMatch {
@@ -474,9 +474,10 @@ pub(crate) fn delete_preflight_store_in(
 
 /// delete action の本体（検証 → 照合 → 回収）を、状態ルートの基底と実行層の組み立てを引数で受けて行う（試験が差し込む。#4152）。
 ///
-/// `Recorded` のときだけ `make_runtime` を呼んで [`reclaim::reclaim_recorded`] へ進む。`NotRecorded`・`AlreadyReclaimed` は
-/// 実行層を作らず `Ok(None)`（冪等。呼び出し元は固定の応答を返す）。毎回照合からやり直すため、期限切れや kill の後の再実行は
-/// 記録の状態で続きの段から回収する（CRI-5・REPAIR-5）。
+/// `Recorded` のとき `make_runtime` を呼んで [`reclaim::reclaim_recorded`] へ進む。`AlreadyReclaimed` は実行層を作り、
+/// 状態記録・cgroup・プロセスに触れず ID 単位の残骸 3 種だけを [`reclaim::reclaim_leftovers`] で回収する（#4279・D7）。
+/// `NotRecorded` は実行層を作らず状態ルートも作らない。どちらも `Ok(None)`（冪等。呼び出し元は固定の応答を返す）。
+/// 毎回照合からやり直すため、期限切れや kill の後の再実行は記録の状態で続きの段から回収する（CRI-5・REPAIR-5）。
 #[cfg(target_os = "linux")]
 pub(crate) fn delete_in(
     inv: &ShimInvocation,
@@ -500,7 +501,14 @@ pub(crate) fn delete_in(
         (DeleteRecordMatch::Recorded(_), None) => {
             Err(CriError::internal("cannot open the state store"))
         }
-        _ => Ok(None),
+        // 記録なし: 副作用 0 回。状態ルートも作らず、実行層も組み立てない（#4151）。
+        (DeleteRecordMatch::NotRecorded, _) => Ok(None),
+        // 回収済み: 状態記録・cgroup・プロセスに触れず、ID 単位の残骸 3 種だけを回収する（D7・#4279）。
+        (DeleteRecordMatch::AlreadyReclaimed, Some(store)) => {
+            reclaim::reclaim_leftovers(make_runtime(store), &target, deadline)
+        }
+        // 照合は `AlreadyReclaimed` のとき必ず開いたストアを返すため到達しない。fail-closed で何もしない。
+        (DeleteRecordMatch::AlreadyReclaimed, None) => Ok(None),
     }
 }
 

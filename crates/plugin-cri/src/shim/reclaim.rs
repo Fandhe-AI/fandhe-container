@@ -1,6 +1,6 @@
 //! delete action の停止・回収（CRI-5・CRI-7・PLUG-1・TASK-62.6・REPAIR-3・REPAIR-5・#4152）。
 //!
-//! 呼び出し元: `shim::delete_in`（記録の照合が `Recorded` のときだけ）。呼び出し先: 実行層（本番は
+//! 呼び出し元: `shim::delete_in`（記録の照合が `Recorded` のとき [`reclaim_recorded`]、`AlreadyReclaimed` のとき [`reclaim_leftovers`]）。呼び出し先: 実行層（本番は
 //! [`crate::adapter::CoreLifecycleRuntime`] の `stop`・`delete`。手順は複製しない）。
 //!
 //! 段の分解（`delete(force=true)` には寄せない。force は内部で停止しても終了状態を捨てるため、containerd へ返す終了コードが取れない）:
@@ -11,6 +11,8 @@
 //! | pid の無い Created | delete だけ | 終了コード 0（`TaskService` の Delete と同じ） |
 //! | Running・pid つき Created | stop（猶予 0・SIGKILL）→ delete | 停止で得た Stopped の終了コード |
 //! | Creating・未知の状態 | 呼ばない | `FAILED_PRECONDITION`（fail-closed。core の delete も拒否する） |
+//! | 記録なし（`NotRecorded`） | 呼ばない（状態ルートも作らない） | 固定の応答（`None`） |
+//! | 回収済み（`AlreadyReclaimed`） | 残骸 3 種の guard つき削除を 1 回ずつ（[`reclaim_leftovers`]。#4279・D7） | 固定の応答（`None`） |
 //!
 //! 期限（REPAIR-5）: containerd は shim の delete を 5 秒（`io.containerd.timeout.shim.cleanup`）で kill するため、全体は
 //! bootstrap の絶対期限（`SHIM_DELETE_DEADLINE`。`delete_recorded` が開始時刻から数え、照合・回収・socket 掃除・計測が共有する）に
@@ -107,6 +109,16 @@ impl Generation {
 /// core の delete を始めてよい内側期限の下限。これ未満なら delete を始めず `DEADLINE_EXCEEDED` にする（record は残る）。
 pub(crate) const MIN_CLEANUP: Duration = Duration::from_millis(1);
 
+/// `AlreadyReclaimed` の残骸の回収が、全体の期限の末尾に残す余裕（#4279・REPAIR-5）。
+///
+/// 回収の後に走る `flush_delete_warnings`（fallback の書き込みの分として最大 200ms を残す）と、bootstrap の socket 掃除
+/// （`acquire_lock_until` が同じ絶対期限を見る）が、期限切れで失敗しないようにする。`ReclaimBudget`（Recorded の経路）とは独立。
+pub(crate) const LEFTOVER_RESERVE: Duration = Duration::from_millis(500);
+
+/// 残骸の回収の 1 段を試してよい予算の下限（#4279）。これ未満の段は試さず、`existence: unverified` の警告行を出す。
+/// 試行は予算の 1/2 以下に抑えられるため、これ未満では 1 回の試行も意味のある時間にならない。
+pub(crate) const LEFTOVER_MIN_ATTEMPT: Duration = Duration::from_millis(50);
+
 /// 段の残り `left` に収まる後始末の期限（`default` を上限に残りの 2/3）。`remove` 段の開始時と、実行層が世代確認（状態ロックの待ちを含む）の
 /// 後に残りから決め直すときの両方が使う（REPAIR-5・#4152）。
 pub(crate) fn cleanup_within_left(default: Duration, left: Duration) -> Duration {
@@ -170,6 +182,14 @@ pub(crate) trait ReclaimRuntime: Send + Sync + 'static {
         generation: &Generation,
         stage_end: Instant,
     ) -> Result<DeleteResponse, TraitError>;
+    /// 記録の無い（`AlreadyReclaimed`）ID の残骸 3 種を、`deadline` までに 1 回ずつ回収する（#4279・D7）。
+    ///
+    /// 状態記録・cgroup・プロセスに触れない。世代は無く、各段の guard（状態記録が無いこと）をロック保持中に評価する。
+    fn reclaim_leftovers(
+        &self,
+        id: &ContainerId,
+        deadline: Instant,
+    ) -> crate::adapter::LeftoverReclaim;
 }
 
 /// 本番の窓口: `CoreLifecycleRuntime` に、照合した bundle への固定（[`PinnedStore`]）を前置きする。
@@ -332,6 +352,16 @@ impl ReclaimRuntime for GuardedCore {
             .with_core_delete_deadline(Instant::now() + cleanup);
         fandhe_container_core::traits::ContainerRuntime::delete(&core, req)
     }
+
+    fn reclaim_leftovers(
+        &self,
+        id: &ContainerId,
+        deadline: Instant,
+    ) -> crate::adapter::LeftoverReclaim {
+        // 固定する世代は無い（記録が無い ID。照合をすり抜けて再作成されても、各段の guard が記録の存在で見送る。SEC-1）。
+        let core = (self.build)(Arc::clone(&self.store), self.default_cleanup);
+        core.reclaim_unrecorded_leftovers(id, deadline, LEFTOVER_RESERVE, LEFTOVER_MIN_ATTEMPT)
+    }
 }
 
 /// 全体の絶対期限までの残り。尽きていれば固定文言の `DEADLINE_EXCEEDED`（REPAIR-5）。
@@ -448,4 +478,29 @@ pub(crate) fn reclaim_recorded(
         before_pid,
         &final_status,
     )))
+}
+
+/// `AlreadyReclaimed` の ID の残骸 3 種（supervisor ログ・コンテナログ・起動オプション文書）を回収する（CRI-5・REPAIR-4・REPAIR-5・
+/// OCI-7・SEC-1・#4279。`docs/design/shim-v2-production-binary.md` D7）。
+///
+/// 呼び出し元は `shim::delete_in`。回収は best effort で、失敗・期限切れでも delete を失敗にせず固定の応答（`Ok(None)`）を返す
+/// （containerd に TaskExit 255 や再試行を誘発しない）。結果は実行層が警告行（stderr）と記録器の操作名で残す。各段は flock を待たず
+/// 1 回だけ試し、全体の絶対期限 `deadline` を照合・他の段と共有する。残りが 0 でも実行層を呼び、全段を `existence: unverified` の
+/// 警告行にする。作業スレッドの待ちは `deadline` で打ち切る（各段は既に有界のため多層防御）。
+pub(crate) fn reclaim_leftovers(
+    rt: Arc<dyn ReclaimRuntime>,
+    target: &DeleteTarget,
+    deadline: Instant,
+) -> Result<Option<ShimDeleteExit>, CriError> {
+    let id = target.id().clone();
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        let _ = rt.reclaim_leftovers(&id, deadline);
+        return Ok(None);
+    }
+    let _ = run_stage(left, "leftovers", move || {
+        let _ = rt.reclaim_leftovers(&id, deadline);
+        Ok(())
+    });
+    Ok(None)
 }

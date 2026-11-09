@@ -329,6 +329,174 @@ fn cri5_4152_bin_delete_without_state_root_is_idempotent_and_creates_nothing() {
     let d = decode(&out.stdout);
     assert_eq!((d.pid, d.exit_status), (0, IDEMPOTENT_EXIT));
     assert!(!Path::new(&sc.scoped_root()).exists());
+    // 記録なし（NotRecorded）は副作用 0 回: 状態ルートの基底も作らず、後始末の警告も出さない（#4279）。
+    assert!(!sc.guard.join("fandhe-container-shim-state").exists());
+    assert_eq!(out.stderr, Vec::<u8>::new());
+}
+
+/// 状態ルート配下のエントリ名（相対パス）を再帰で集める（残骸の有無の照合に使う）。
+fn tree(root: &Path) -> Vec<String> {
+    fn walk(dir: &Path, root: &Path, out: &mut Vec<String>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in rd {
+            let e = e.unwrap();
+            out.push(
+                e.path()
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            if e.file_type().unwrap().is_dir() {
+                walk(&e.path(), root, out);
+            }
+        }
+    }
+    let mut v = Vec::new();
+    walk(root, root, &mut v);
+    v.sort();
+    v
+}
+
+/// 起動オプション文書を置く（残骸の 1 種。作成世代つき）。
+fn put_options(root: &Path, id: &str) {
+    use fandhe_container_supervisor::container_options::document::ContainerOptionsDocument;
+    let doc = ContainerOptionsDocument::new(
+        vec!["nofile=1024:2048".into()],
+        vec!["A=1".into()],
+        None,
+        None,
+        vec![],
+    )
+    .unwrap()
+    .with_generation("g1".to_owned())
+    .unwrap();
+    fandhe_container_supervisor::container_options::store::write_new(root, &cid(id), &doc).unwrap();
+}
+
+/// コンテナログの sink を開いて 1 行書く（drop するとファイルが残骸になる）。
+fn open_container_sink(
+    root: &Path,
+    id: &str,
+) -> fandhe_container_supervisor::logs::RotatingFileSink {
+    use fandhe_container_supervisor::logs::{
+        LogSink as _, RotatingFileSink, StreamKind, container_log_dir,
+        container_log_rotation_config,
+    };
+    let dir = container_log_dir(root);
+    let _ = std::fs::DirBuilder::new().mode(0o700).create(&dir);
+    let sink = RotatingFileSink::open(&dir, &cid(id), container_log_rotation_config()).unwrap();
+    sink.append(StreamKind::Stdout, b"x").unwrap();
+    sink.flush().unwrap();
+    sink
+}
+
+/// `id` の名前（`<id>` そのもの、または `<id>.` 始まり）を含むエントリ。
+fn of_id(entries: &[String], id: &str) -> Vec<String> {
+    let dotted = format!("{id}.");
+    entries
+        .iter()
+        .filter(|e| {
+            let leaf = e.rsplit('/').next().unwrap();
+            leaf == id || leaf.starts_with(&dotted)
+        })
+        .cloned()
+        .collect()
+}
+
+/// CRI-5・REPAIR-4・REPAIR-5・OCI-7・SUP-7・SUP-12・#4279: 後始末（ログ・起動オプション文書）が中断した delete の次の delete
+/// （`AlreadyReclaimed`）で、その ID の残骸 3 種が消える。固定の応答（137）のまま、別 ID の記録・残骸には触れず、
+/// 3 回目は状態ルートの木を変えない。
+#[test]
+fn cri5_4279_bin_delete_reclaims_leftovers_after_interrupted_cleanup() {
+    use fandhe_container_supervisor::container_options::store as options_store;
+    let sc = Scratch::new();
+    let store = sc.store();
+    let root = sc.scoped_root();
+    let at = ExitTime::from_unix_nanos(1_700_000_000_123_456_789).unwrap();
+    sc.seed(
+        &store,
+        ContainerStatus::stopped_at(cid("abc"), Some(7), Some(at)),
+    );
+    sc.seed(&store, ContainerStatus::created(cid("abcd"), None));
+    // 別 ID（前方一致）の残骸。
+    drop(fandhe_container_supervisor::supervisor_log::open(&root, &cid("abcd")).unwrap());
+    drop(open_container_sink(&root, "abcd"));
+    put_options(&root, "abcd");
+    // abc の 3 種のロックを試験プロセスが保持し、1 回目の後始末を中断させる（待ちの期限まで解放されない）。
+    let sup = fandhe_container_supervisor::supervisor_log::open(&root, &cid("abc")).unwrap();
+    let sink = open_container_sink(&root, "abc");
+    put_options(&root, "abc");
+    let lock = options_store::acquire_lock(&root, &cid("abc"), Duration::from_secs(5)).unwrap();
+
+    let first = sc.delete("abc");
+    assert_success(&first);
+    let d = decode(&first.stdout);
+    assert_eq!((d.pid, d.exit_status), (0, 7));
+    assert!(!recorded(&store, "abc"));
+    assert!(recorded(&store, "abcd"));
+    let after_first = tree(&root);
+    assert!(
+        !of_id(&after_first, "abc").is_empty(),
+        "leftovers must remain: {after_first:?}"
+    );
+    drop((sup, sink, lock));
+
+    // 2 回目（回収済み）: 固定の応答で、abc の残骸 3 種だけが消える。警告は出ない。
+    let second = sc.delete("abc");
+    assert_success(&second);
+    let d = decode(&second.stdout);
+    assert_eq!((d.pid, d.exit_status), (0, IDEMPOTENT_EXIT));
+    assert!(d.exited_at.is_some());
+    assert_eq!(second.stderr, Vec::<u8>::new());
+    let after_second = tree(&root);
+    assert_eq!(of_id(&after_second, "abc"), Vec::<String>::new());
+    assert!(of_id(&after_second, "abcd").len() >= 4, "{after_second:?}");
+    assert_eq!(ids(&store), vec!["abcd".to_owned()]);
+
+    // 3 回目: 固定の応答で、状態ルートの木は変わらない。
+    let third = sc.delete("abc");
+    assert_success(&third);
+    assert_eq!(decode(&third.stdout).exit_status, IDEMPOTENT_EXIT);
+    assert_eq!(tree(&root), after_second);
+}
+
+/// SUP-7・REPAIR-4・#4279: 生きている sink のログは `AlreadyReclaimed` でも消さない（待たずに警告行を 1 件出す）。
+/// 他の 2 種は消える。
+#[test]
+fn sup7_cri5_4279_bin_delete_keeps_leftovers_of_live_sink() {
+    let sc = Scratch::new();
+    let store = sc.store();
+    let root = sc.scoped_root();
+    sc.seed(&store, ContainerStatus::created(cid("other"), None));
+    let sup = fandhe_container_supervisor::supervisor_log::open(&root, &cid("abc")).unwrap();
+    drop(open_container_sink(&root, "abc"));
+    put_options(&root, "abc");
+
+    let out = sc.delete("abc");
+    assert_success(&out);
+    assert_eq!(decode(&out.stdout).exit_status, IDEMPOTENT_EXIT);
+    let t = tree(&root);
+    assert!(t.contains(&"@supervisor-logs/abc.log".to_owned()), "{t:?}");
+    assert_eq!(
+        of_id(&t, "abc")
+            .iter()
+            .filter(|e| !e.starts_with("@supervisor-logs/"))
+            .count(),
+        0,
+        "{t:?}"
+    );
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    let hits: Vec<&str> = stderr
+        .lines()
+        .filter(|l| {
+            l.contains("\"target\":\"supervisor_log\",\"code\":\"FAILED_PRECONDITION\",\"reason\":\"sink_open_after_wait\"")
+        })
+        .collect();
+    assert_eq!(hits.len(), 1, "{stderr}");
+    drop(sup);
 }
 
 /// 失敗の契約: 非ゼロ終了・stdout は空・stderr は JSON 1 行で `code` と空でない `message`。

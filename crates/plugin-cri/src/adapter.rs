@@ -1418,6 +1418,18 @@ impl CoreLifecycleRuntime {
         remaining: Duration,
     ) -> Result<(), OptionsCleanupFailure> {
         use fandhe_container_supervisor::container_options::store as options_store;
+        self.remove_stale_options_with(id, remaining, options_store::OPTIONS_LOCK_WAIT)
+    }
+
+    /// [`Self::remove_stale_options`] のロックの待ちの上限を呼び出し側が渡す版。shim の delete の `AlreadyReclaimed` の回収は
+    /// flock を待たず 1 回だけ試すため `Duration::ZERO` を渡す（#4279・REPAIR-5）。
+    fn remove_stale_options_with(
+        &self,
+        id: &ContainerId,
+        remaining: Duration,
+        lock_wait_cap: Duration,
+    ) -> Result<(), OptionsCleanupFailure> {
+        use fandhe_container_supervisor::container_options::store as options_store;
         let Some(root) = self.store.host_state_root() else {
             return Ok(());
         };
@@ -1433,7 +1445,7 @@ impl CoreLifecycleRuntime {
                 root,
                 id,
                 move || Self::id_is_absent(&store, &guard_id),
-                options_store::OPTIONS_LOCK_WAIT.min(timeout),
+                lock_wait_cap.min(timeout),
                 timeout,
             )
         };
@@ -1454,6 +1466,117 @@ impl CoreLifecycleRuntime {
             }
         }
     }
+
+    /// shim の delete が `AlreadyReclaimed`（状態記録が既に無い）と照合した ID の残骸 3 種（supervisor ログ・コンテナログ・
+    /// 起動オプション文書）を 1 回ずつ回収する（CRI-5・REPAIR-4・REPAIR-5・OCI-7・SEC-1・SUP-7・SUP-12・#4279。
+    /// `docs/design/shim-v2-production-binary.md` D7 の案 B）。
+    ///
+    /// 呼び出し元は `shim::reclaim::GuardedCore::reclaim_leftovers`。状態記録・cgroup・プロセスには触れず、パスは
+    /// 状態ストアの `host_state_root()`（外部入力から受けない）と検証済みの `ContainerId` だけから組む。各段の guard
+    /// （[`Self::id_is_absent`]）はロック保持中に試行ごと評価され、記録のある ID・生きている sink には触れない。
+    /// 段は `delete` と同じ順に直列で回し、flock は待たず（`lock_wait = 0`）1 回だけ試す。各段の予算は
+    /// `deadline` までの残りから `reserve`（後続の警告の書き出しと socket 掃除の分）を引いた値で、`min_attempt` に
+    /// 満たない段は試さず `existence: unverified` の警告行を出す。失敗した段は `delete` と同じ警告行（パス・errno なし）で
+    /// `cleanup_warn` へ流し、戻り値でも段ごとに返す。状態ルートを持たないストアでは何もしない。
+    #[cfg(target_os = "linux")]
+    pub(crate) fn reclaim_unrecorded_leftovers(
+        &self,
+        id: &ContainerId,
+        deadline: Instant,
+        reserve: Duration,
+        min_attempt: Duration,
+    ) -> LeftoverReclaim {
+        let budget = || {
+            deadline
+                .saturating_duration_since(Instant::now())
+                .saturating_sub(reserve)
+        };
+        let mut out = LeftoverReclaim::default();
+        if self.store.host_state_root().is_none() {
+            return out;
+        }
+        for target in [CleanupTarget::SupervisorLog, CleanupTarget::ContainerLog] {
+            let b = budget();
+            let stage = if b < min_attempt {
+                LogStage::Skipped
+            } else if target == CleanupTarget::SupervisorLog {
+                self.remove_supervisor_log(id, Duration::ZERO, b)
+            } else {
+                self.record_container_log_removal(id, Duration::ZERO, b)
+            };
+            match &stage {
+                LogStage::Skipped => {
+                    (self.cleanup_warn)(skipped_log_cleanup_warning_line(id, target));
+                }
+                LogStage::Attempted(CleanupOutcome::Kept { code }) => {
+                    (self.cleanup_warn)(cleanup_warning_line(id, target, *code));
+                }
+                LogStage::Attempted(_) => {}
+            }
+            let slot = LeftoverStage::of_log(&stage);
+            if target == CleanupTarget::SupervisorLog {
+                out.supervisor_log = slot;
+            } else {
+                out.container_log = slot;
+            }
+        }
+        let b = budget();
+        let failure = if b < min_attempt {
+            Err(OptionsCleanupFailure::Skipped)
+        } else {
+            self.remove_stale_options_with(id, b, Duration::ZERO)
+        };
+        out.options = match failure {
+            Ok(()) => LeftoverStage::Done,
+            Err(f) => {
+                (self.cleanup_warn)(options_cleanup_warning_line(id, f));
+                match f {
+                    OptionsCleanupFailure::Skipped => LeftoverStage::Skipped,
+                    OptionsCleanupFailure::Failed(code) => LeftoverStage::Kept(code),
+                }
+            }
+        };
+        out
+    }
+}
+
+/// [`CoreLifecycleRuntime::reclaim_unrecorded_leftovers`] の 1 段の結果（CRI-5・REPAIR-4・#4279）。
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum LeftoverStage {
+    /// 対象が無い、または消した（ファイルが無かった成功を含む）。既定値。
+    #[default]
+    Done,
+    /// guard が拒否した（同じ ID が再作成済み）。消さずに残した。失敗ではない。
+    Superseded,
+    /// 消せずに残した（理由の分類）。
+    Kept(ErrorCode),
+    /// 残り時間が下限に満たず試さなかった（存在は未確認）。
+    Skipped,
+}
+
+#[cfg(target_os = "linux")]
+impl LeftoverStage {
+    fn of_log(stage: &LogStage) -> Self {
+        match stage {
+            LogStage::Skipped => Self::Skipped,
+            LogStage::Attempted(CleanupOutcome::Superseded) => Self::Superseded,
+            LogStage::Attempted(CleanupOutcome::Kept { code }) => Self::Kept(*code),
+            LogStage::Attempted(_) => Self::Done,
+        }
+    }
+}
+
+/// 残骸 3 種の回収結果（段ごと。真偽値に潰さない。#4279）。
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct LeftoverReclaim {
+    /// supervisor ログ（`@supervisor-logs/<id>.log*`）。
+    pub(crate) supervisor_log: LeftoverStage,
+    /// コンテナログ（`@container-logs/<id>.log*`）。
+    pub(crate) container_log: LeftoverStage,
+    /// 起動オプション文書（`@container-options/<id>`）。
+    pub(crate) options: LeftoverStage,
 }
 
 /// `delete` の後始末の 1 段に使える (ロックの待ち, 1 回の試行の期限) を、全体の期限までの `remaining` で頭打ちにして決める

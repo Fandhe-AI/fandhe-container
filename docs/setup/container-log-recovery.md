@@ -25,7 +25,7 @@ supervisor ログの扱いは末尾の「supervisor ログ」の節に分けて�
 - 古い supervisor が生きていて sink のロックを持ち続けているログ（`skipped_live`）
 - 状態がある ID のログ（`skipped_present`）。この ID は消さない
 - ID に戻せない名前（`skipped_undecodable`。大文字入りなど、sink が作らない名前）
-- shim v2（`<base>-shim-state/...`）の状態ルートの残り。今は自動では回収されず、手動で消す。自動化の方式は `docs/design/shim-v2-production-binary.md` の D7（#4241）で決め、実装は未着手
+- shim v2（`<base>-shim-state/...`）の状態ルートの残り。containerd が同じ ID で delete を呼び直したときは、記録の無い ID の残骸 3 種（supervisor ログ・コンテナログ・起動オプション文書）が自動で回収される（`docs/design/shim-v2-production-binary.md` の D7・#4279）。呼び直しが無い場合、sink が生きていた場合、ロックつきの操作が一度も無い状態ルートの残りは手動で消す。serve の起動時の走査は #4280 で未実装
 - plugin-cri が動いている間に発生した残り（次の起動まで）と、plugin-cri と異なる `--root` の状態ルート
 
 ## 手動の手順

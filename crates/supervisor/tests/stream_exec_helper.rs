@@ -493,32 +493,47 @@ fn sup6_3760_started_follows_notify_and_failure_aborts() {
     assert_eq!(err, ChannelError::Closed);
 }
 
-/// 本物の bin を `stream-exec` で起動する（診断の受け口として stderr を pipe にする）。
-fn spawn_helper(args: &[&str], stdin: Stdio) -> std::process::Child {
-    Command::new(env!("CARGO_BIN_EXE_fandhe-container-supervisor"))
+/// 起動した helper と、その fd 2 の受け口（診断は AF_UNIX socket にだけ書かれる。本番の supervisor と同じ構成）。
+struct Spawned {
+    child: std::process::Child,
+    diag: UnixStream,
+}
+
+/// 本物の bin を `stream-exec` で起動する（fd 2 に socketpair の片端を渡し、診断行の受け口にする）。
+fn spawn_helper(args: &[&str], stdin: Stdio) -> Spawned {
+    let (parent_end, child_end) = UnixStream::pair().expect("socketpair");
+    let child = Command::new(env!("CARGO_BIN_EXE_fandhe-container-supervisor"))
         .arg("stream-exec")
         .args(args)
         .env_clear()
         .current_dir("/")
         .stdin(stdin)
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::from(OwnedFd::from(child_end)))
         .spawn()
-        .expect("spawn")
+        .expect("spawn");
+    Spawned {
+        child,
+        diag: parent_end,
+    }
 }
 
 /// helper の終了を期限つきで待つ（REPAIR-5・#3760）。期限超過なら kill して回収してから panic する。
 /// stderr は別スレッドで集め、受け取りにも有限の期限を置く（試験自身で有界化し CI の watchdog に頼らない）。
-fn wait_bounded(mut child: std::process::Child, limit: Duration) -> (Option<i32>, String) {
-    let reader = child.stderr.take().map(|mut e| {
+fn wait_bounded(spawned: Spawned, limit: Duration) -> (Option<i32>, String) {
+    let Spawned {
+        mut child,
+        diag: mut e,
+    } = spawned;
+    let reader = {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut buf = String::new();
             let _ = e.read_to_string(&mut buf);
             let _ = tx.send(buf);
         });
-        rx
-    });
+        Some(rx)
+    };
     let deadline = Instant::now() + limit;
     let status = loop {
         match child.try_wait().expect("try_wait") {

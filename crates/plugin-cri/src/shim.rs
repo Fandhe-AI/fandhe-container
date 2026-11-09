@@ -235,7 +235,7 @@ pub(crate) fn registry_parts_in(
         runtime = runtime.with_create_audit_sink(sink);
     }
     let adapter = RuntimeAdapter::new(Arc::new(runtime));
-    // イベント 4 種の送り先（`-publish-binary` が無ければ `None`。cri 側が `disabled` を記録する。CRI-5・#4155・#4156）。
+    // イベント 6 種の送り先（`-publish-binary` が無ければ `None`。cri 側が `disabled` を記録する。CRI-5・#4155・#4156）。
     let publisher = fandhe_container_cri::shim_v2::publish::exec_publisher_for(&ctx);
     let mut v2 = TaskService::new(TaskApiVersion::V2, adapter.clone())
         .with_shutdown(ctx.shutdown().clone())

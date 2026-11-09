@@ -1,7 +1,8 @@
-//! shim v2 のイベント publish（TaskCreate・TaskStart・TaskDelete・TaskExit の 4 種）。期限つきの子プロセスで containerd の `publish` を呼ぶ（CRI-5・TASK-62.6・REPAIR-3・REPAIR-5・#4155）。
+//! shim v2 のイベント publish（TaskCreate・TaskStart・TaskDelete・TaskExit・TaskExecAdded・TaskExecStarted の 6 種）。期限つきの子プロセスで containerd の `publish` を呼ぶ（CRI-5・TASK-62.6・REPAIR-3・REPAIR-5・#4155）。
 //!
 //! containerd（特に CRI）はコンテナの終了を `/tasks/exit` の TaskExit で知る。Create・Start・Delete の成功も
-//! `/tasks/create`・`/tasks/start`・`/tasks/delete` で送る（#4156。init だけで、exec の経路は送らない）。shim は `-publish-binary`
+//! `/tasks/create`・`/tasks/start`・`/tasks/delete` で送り（#4156）、exec の `Exec`・`Start(exec_id)` の成功も
+//! `/tasks/exec-added`・`/tasks/exec-started` で送る（#4281。runc shim と同じ時点・同じ欄）。shim は `-publish-binary`
 //! （検証済みの `PublishBinary`。#4154）を子として起動し、stdin へ `google.protobuf.Any` を渡す。
 //! 呼び出し元は [`super::task_service::TaskService`] の終了 watcher（`Start` 成功後に起こす）で、
 //! 差し込み口は `exec_publisher_for`（plugin-cri の `registry_in` が呼ぶ）。
@@ -17,8 +18,8 @@
 //!   ログは段名・errno・終了コード・シグナル・topic だけを持ち、argv・アドレス・namespace・コンテナ ID・環境変数・イベントの本文は出さない（REPAIR-4）。
 //!
 //! 範囲外（REPAIR-3。未実装を装わない）と残余:
-//! - 送らない種別: TaskExecAdded・TaskExecStarted・TaskPaused・TaskResumed・TaskCheckpointed・TaskOOM（対応する RPC・仕組みが無い）。
-//! - Create・Start・Delete は RPC が成功する直前に 1 回だけ [`EventPublisher::publish`] で投入する（世代の guard は使わない。完了済みの事実の記録で、
+//! - 送らない種別: exec の TaskExit（exec 用の終了 watcher が無い。後続候補。containerd の CRI は exec の TaskExit を無視する）・TaskPaused・TaskResumed・TaskCheckpointed・TaskOOM（対応する RPC・仕組みが無い）。
+//! - Create・Start・Delete・ExecAdded・ExecStarted は RPC が成功する直前に 1 回だけ [`EventPublisher::publish`] で投入する（世代の guard は使わない。完了済みの事実の記録で、
 //!   ゲート保持中の投入順が FIFO の worker で保たれる）。符号化後 [`MAX_EVENT_LEN`]（8192）を超えるイベントは子を起動せず、
 //!   `encode` の失敗が 1 件記録される（RPC の応答は変えない）。stdin は socketpair の片端で、親は非ブロッキングに期限内で書き、書き終えたら EOF を送る（#4223）。
 //! - shim の Shutdown でキューに残った未送信のイベントは、[`PublisherDrains::drain_all`] が排出する（#4222）。呼ぶのは `bootstrap` の
@@ -48,6 +49,14 @@ pub const TASK_CREATE_TYPE_URL: &str = "containerd.events.TaskCreate";
 pub const TASK_START_TYPE_URL: &str = "containerd.events.TaskStart";
 /// TaskDelete の type URL。
 pub const TASK_DELETE_TYPE_URL: &str = "containerd.events.TaskDelete";
+/// TaskExecAdded の type URL。
+pub const TASK_EXEC_ADDED_TYPE_URL: &str = "containerd.events.TaskExecAdded";
+/// TaskExecStarted の type URL。
+pub const TASK_EXEC_STARTED_TYPE_URL: &str = "containerd.events.TaskExecStarted";
+/// TaskExecAdded の topic。
+pub const TASK_EXEC_ADDED_TOPIC: &str = "/tasks/exec-added";
+/// TaskExecStarted の topic。
+pub const TASK_EXEC_STARTED_TOPIC: &str = "/tasks/exec-started";
 /// TaskCreate の topic。
 pub const TASK_CREATE_TOPIC: &str = "/tasks/create";
 /// TaskStart の topic。
@@ -157,7 +166,32 @@ pub struct TaskDelete {
     pub id: String,
 }
 
-/// publish するイベント（#4155・#4156）。
+/// `containerd.events.TaskExecAdded`（番号 1〜2）。`Exec` の成功で送る（#4281）。
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct TaskExecAdded {
+    /// コンテナ ID。
+    #[prost(string, tag = "1")]
+    pub container_id: String,
+    /// exec の ID。
+    #[prost(string, tag = "2")]
+    pub exec_id: String,
+}
+
+/// `containerd.events.TaskExecStarted`（番号 1〜3）。`Start(exec_id)` の成功で送る（#4281）。
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct TaskExecStarted {
+    /// コンテナ ID。
+    #[prost(string, tag = "1")]
+    pub container_id: String,
+    /// exec の ID。
+    #[prost(string, tag = "2")]
+    pub exec_id: String,
+    /// exec プロセスの pid。`StartResponse.pid` と同じ値で、本番の起動役は pid を返さないため 0 になる（実 pid を装わない。REPAIR-3）。
+    #[prost(uint32, tag = "3")]
+    pub pid: u32,
+}
+
+/// publish するイベント（#4155・#4156・#4281）。
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum TaskEvent {
@@ -169,6 +203,10 @@ pub enum TaskEvent {
     Delete(TaskDelete),
     /// コンテナ init の終了（`/tasks/exit`）。
     Exit(TaskExit),
+    /// exec の登録成功（`/tasks/exec-added`）。
+    ExecAdded(TaskExecAdded),
+    /// exec の起動成功（`/tasks/exec-started`）。
+    ExecStarted(TaskExecStarted),
 }
 
 impl TaskEvent {
@@ -179,6 +217,8 @@ impl TaskEvent {
             Self::Start(_) => TASK_START_TOPIC,
             Self::Delete(_) => TASK_DELETE_TOPIC,
             Self::Exit(_) => TASK_EXIT_TOPIC,
+            Self::ExecAdded(_) => TASK_EXEC_ADDED_TOPIC,
+            Self::ExecStarted(_) => TASK_EXEC_STARTED_TOPIC,
         }
     }
 
@@ -189,6 +229,8 @@ impl TaskEvent {
             Self::Start(e) => (TASK_START_TYPE_URL, e.encode_to_vec()),
             Self::Delete(e) => (TASK_DELETE_TYPE_URL, e.encode_to_vec()),
             Self::Exit(e) => (TASK_EXIT_TYPE_URL, e.encode_to_vec()),
+            Self::ExecAdded(e) => (TASK_EXEC_ADDED_TYPE_URL, e.encode_to_vec()),
+            Self::ExecStarted(e) => (TASK_EXEC_STARTED_TYPE_URL, e.encode_to_vec()),
         };
         let bytes = Any {
             type_url: type_url.to_owned(),
@@ -950,7 +992,8 @@ pub(crate) mod testkit {
     use std::time::{Duration, Instant};
 
     use super::{
-        EventPublisher, PublishFailure, TaskCreate, TaskDelete, TaskEvent, TaskIo, TaskStart,
+        EventPublisher, PublishFailure, TaskCreate, TaskDelete, TaskEvent, TaskExecAdded,
+        TaskExecStarted, TaskIo, TaskStart,
     };
     #[cfg(unix)]
     use super::{PublishDrain, PublishLog};
@@ -1057,6 +1100,21 @@ pub(crate) mod testkit {
                     nanos: 5,
                 }),
                 id: String::new(),
+            }),
+        ]
+    }
+
+    /// exec の 2 種の見本（#4281）。
+    pub(crate) fn exec_events() -> [TaskEvent; 2] {
+        [
+            TaskEvent::ExecAdded(TaskExecAdded {
+                container_id: "c1".into(),
+                exec_id: "e1".into(),
+            }),
+            TaskEvent::ExecStarted(TaskExecStarted {
+                container_id: "c1".into(),
+                exec_id: "e1".into(),
+                pid: 4242,
             }),
         ]
     }
@@ -1362,10 +1420,55 @@ mod unix_tests {
         assert!(log.0.lock().unwrap().is_empty());
     }
 
+    /// CRI-5・#4281: exec の 2 種の topic・type URL・wire 形式を具体値で照合する。
+    #[test]
+    fn cri5_4281_task_exec_added_started_encode_as_any() {
+        let [added, started] = exec_events();
+        assert_eq!(added.topic(), "/tasks/exec-added");
+        assert_eq!(started.topic(), "/tasks/exec-started");
+        let a = Any::decode(&added.encode_any().unwrap()[..]).unwrap();
+        assert_eq!(a.type_url, "containerd.events.TaskExecAdded");
+        assert_eq!(a.value, [0x0a, 2, b'c', b'1', 0x12, 2, b'e', b'1']);
+        let s = Any::decode(&started.encode_any().unwrap()[..]).unwrap();
+        assert_eq!(s.type_url, "containerd.events.TaskExecStarted");
+        assert_eq!(
+            s.value,
+            [0x0a, 2, b'c', b'1', 0x12, 2, b'e', b'1', 0x18, 0x92, 0x21]
+        );
+        assert_eq!(
+            TaskExecStarted::decode(&s.value[..]).unwrap(),
+            TaskExecStarted {
+                container_id: "c1".into(),
+                exec_id: "e1".into(),
+                pid: 4242
+            }
+        );
+    }
+
+    /// REPAIR-2・REPAIR-12・#4281: 最大長の ID・pid でも exec の 2 種は上限に収まる。
+    #[test]
+    fn repair2_4281_max_exec_events_fit_limit() {
+        let id = "a".repeat(255);
+        for ev in [
+            TaskEvent::ExecAdded(TaskExecAdded {
+                container_id: id.clone(),
+                exec_id: id.clone(),
+            }),
+            TaskEvent::ExecStarted(TaskExecStarted {
+                container_id: id.clone(),
+                exec_id: id.clone(),
+                pid: u32::MAX,
+            }),
+        ] {
+            let bytes = ev.encode_any().unwrap();
+            assert!(bytes.len() <= MAX_EVENT_LEN, "{}", bytes.len());
+        }
+    }
+
     /// CRI-5・#4156: 3 種それぞれで、偽の publish バイナリが argv の topic と stdin の `Any` を具体値で受け取る。
     #[test]
     fn cri5_4156_publish_passes_argv_and_stdin_for_each_topic() {
-        for (i, ev) in three_events().into_iter().enumerate() {
+        for (i, ev) in three_events().into_iter().chain(exec_events()).enumerate() {
             let dir = test_root::test_root("pub", &format!("t4156-{i}"));
             let bin = make_script(&dir, "fake", &recorder_body(&dir));
             let log = Arc::new(CaptureLog::default());
@@ -1397,7 +1500,7 @@ mod unix_tests {
     /// REPAIR-5・REPAIR-4・#4156: 3 種それぞれの非 0 終了は topic つきの失敗がちょうど 1 件で、秘匿値はログに出ない。
     #[test]
     fn repair5_4156_nonzero_exit_logs_one_failure_per_topic() {
-        for (i, ev) in three_events().into_iter().enumerate() {
+        for (i, ev) in three_events().into_iter().chain(exec_events()).enumerate() {
             let dir = test_root::test_root("pub", &format!("f4156-{i}"));
             let bin = make_script(&dir, "fake", &failing_body());
             let log = Arc::new(CaptureLog::default());
@@ -1415,7 +1518,7 @@ mod unix_tests {
             assert_eq!(got[0].stage, PublishStage::ExitStatus);
             assert_eq!(got[0].topic, Some(topic));
             let line = got[0].to_json_line();
-            for secret in [ADDR, "default", "c1", "/run/b", "secret-addr-4155"] {
+            for secret in [ADDR, "default", "c1", "e1", "/run/b", "secret-addr-4155"] {
                 assert!(!line.contains(secret), "{line}");
             }
         }

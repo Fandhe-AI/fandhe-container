@@ -35,11 +35,9 @@ mod exclusive_dir;
 #[path = "../../core/tests/support/reap.rs"]
 mod reap;
 // 実機前提試験の失敗後の残骸の回収（#4142・#4285）。取り込む試験ごとに使う項目が異なる。
-#[allow(dead_code)]
 #[path = "support/cri_real_reclaim.rs"]
 mod reclaim;
 // shim_v2_*_real の一意な ID とおとりの部品。harness = false の試験では自己照合が走らないため、既定の集合のここで走らせる（#4285）。
-#[allow(dead_code)]
 #[path = "support/shim_real_unique.rs"]
 mod shim_unique;
 

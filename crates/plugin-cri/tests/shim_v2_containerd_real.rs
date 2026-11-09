@@ -67,7 +67,7 @@ mod reap;
 #[path = "../../oci/tests/support/test_root.rs"]
 mod test_root;
 // 実行ごとに一意な ID・namespace と旧形式の残骸のおとり（#4285）。
-#[allow(dead_code)]
+#[cfg(target_os = "linux")]
 #[path = "support/shim_real_unique.rs"]
 mod shim_unique;
 

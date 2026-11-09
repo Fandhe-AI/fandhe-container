@@ -37,10 +37,13 @@ use fandhe_container_plugin::PluginErrorCode;
 use fandhe_container_plugin::grpc::call_with_deadline;
 use tonic::transport::Channel;
 
+#[allow(dead_code)] // 取り込む試験ごとに使う項目が異なるため
 /// 試験が作った記録に付けるラベルのキー。値は [`run_token`]。
 pub const LABEL_KEY: &str = "io.fandhe-container.test.run";
+#[allow(dead_code)] // 取り込む試験ごとに使う項目が異なるため
 /// 安定した所有者 label のキー（#4285）。値は [`OWNERS`] のいずれか。
 pub const OWNER_KEY: &str = "io.fandhe-container.test.owner";
+#[allow(dead_code)] // 取り込む試験ごとに使う項目が異なるため
 /// 所有者 label の許可リスト（試験名。先頭の回収の対象はこの値の記録だけ）。
 pub const OWNERS: [&str; 4] = [
     "production_binary_full_lifecycle_real",
@@ -48,15 +51,18 @@ pub const OWNERS: [&str; 4] = [
     "production_binary_exec_real",
     "production_binary_attach_real",
 ];
+#[allow(dead_code)] // 取り込む試験ごとに使う項目が異なるため
 /// 回収全体の上限（REPAIR-5）。
 pub const CLEANUP_BUDGET: Duration = Duration::from_secs(60);
 /// 回収の RPC 1 回の上限。
 const RPC_LIMIT: Duration = Duration::from_secs(20);
 /// 本体の期限から差し引く余裕。
 const MARGIN: Duration = Duration::from_secs(5);
+#[allow(dead_code)] // 取り込む試験ごとに使う項目が異なるため
 /// 注入した失敗の 1 回目の試行の上限（2 回目の時間を食いつぶさない）。
 pub const INJECT_ATTEMPT_LIMIT: Duration = Duration::from_secs(120);
 
+#[allow(dead_code)] // 取り込む試験ごとに使う項目が異なるため
 /// 実行ごとに一意なトークン（pid と UNIX 時刻 ns。文字種は `[0-9a-z-]`）。
 pub fn run_token() -> String {
     let nanos = SystemTime::now()
@@ -66,21 +72,25 @@ pub fn run_token() -> String {
     format!("{}-{nanos}", std::process::id())
 }
 
+#[allow(dead_code)] // 取り込む試験ごとに使う項目が異なるため
 /// sandbox の uid（`<prefix>-<token>`）。
 pub fn sandbox_uid(prefix: &str, token: &str) -> String {
     format!("{prefix}-{token}")
 }
 
+#[allow(dead_code)] // 取り込む試験ごとに使う項目が異なるため
 /// sandbox・コンテナに付けるラベル。
 pub fn labels(token: &str) -> HashMap<String, String> {
     HashMap::from([(LABEL_KEY.to_owned(), token.to_owned())])
 }
 
+#[allow(dead_code)] // 取り込む試験ごとに使う項目が異なるため
 /// 所有者 label だけの selector（先頭の回収用）。
 pub fn owner_selector(owner: &str) -> HashMap<String, String> {
     HashMap::from([(OWNER_KEY.to_owned(), owner.to_owned())])
 }
 
+#[allow(dead_code)] // 取り込む試験ごとに使う項目が異なるため
 /// `PodSandboxConfig`・`ContainerConfig` の `labels` 用（`BTreeMap`）。トークンと所有者の 2 つを持つ。
 /// `owner` が許可リストに無いのは試験コードの誤りなので panic する。
 pub fn config_labels(owner: &str, token: &str) -> std::collections::BTreeMap<String, String> {
@@ -90,6 +100,7 @@ pub fn config_labels(owner: &str, token: &str) -> std::collections::BTreeMap<Str
     m
 }
 
+#[allow(dead_code)] // 取り込む試験ごとに使う項目が異なるため
 /// 試験が作った ID の台帳。
 #[derive(Default, Debug)]
 pub struct OwnedIds {
@@ -97,34 +108,41 @@ pub struct OwnedIds {
     containers: Vec<String>,
 }
 
+#[allow(dead_code)] // 取り込む試験ごとに使う項目が異なるため
 pub type Ledger = Arc<Mutex<OwnedIds>>;
 
 fn lock(l: &Ledger) -> std::sync::MutexGuard<'_, OwnedIds> {
     l.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+#[allow(dead_code)] // 取り込む試験ごとに使う項目が異なるため
 pub fn record_sandbox(l: &Ledger, id: &str) {
     lock(l).sandboxes.push(id.to_owned());
 }
 
+#[allow(dead_code)] // 取り込む試験ごとに使う項目が異なるため
 pub fn record_container(l: &Ledger, id: &str) {
     lock(l).containers.push(id.to_owned());
 }
 
+#[allow(dead_code)] // 取り込む試験ごとに使う項目が異なるため
 pub fn forget_sandbox(l: &Ledger, id: &str) {
     lock(l).sandboxes.retain(|s| s != id);
 }
 
+#[allow(dead_code)] // 取り込む試験ごとに使う項目が異なるため
 pub fn forget_container(l: &Ledger, id: &str) {
     lock(l).containers.retain(|s| s != id);
 }
 
+#[allow(dead_code)] // 取り込む試験ごとに使う項目が異なるため
 /// 試行の失敗の種類。
 pub enum AttemptFailure {
     Panicked(Box<dyn Any + Send>),
     Deadline,
 }
 
+#[allow(dead_code)] // 取り込む試験ごとに使う項目が異なるため
 /// 本体を `tokio::spawn` で走らせ、panic は捕まえ、期限切れは abort して待ち切る。
 pub async fn guarded<F>(fut: F, limit: Duration) -> Result<(), AttemptFailure>
 where
@@ -143,11 +161,13 @@ where
     }
 }
 
+#[allow(dead_code)] // 取り込む試験ごとに使う項目が異なるため
 /// 注入する失敗の固定文言。
 pub fn injected_message(test: &str) -> String {
     format!("{test}: injected failure after StartContainer (expected; reclaim self-check #4142)")
 }
 
+#[allow(dead_code)] // 取り込む試験ごとに使う項目が異なるため
 /// panic の payload が注入した失敗の文言そのものか（`&str`・`String` の両方を見る）。
 pub fn is_injected(test: &str, payload: &(dyn Any + Send)) -> bool {
     let want = injected_message(test);
@@ -158,6 +178,7 @@ pub fn is_injected(test: &str, payload: &(dyn Any + Send)) -> bool {
     got == Some(want.as_str())
 }
 
+#[allow(dead_code)] // 取り込む試験ごとに使う項目が異なるため
 /// 本体に割ける期限。`watchdog` から経過・回収の予約（`cleanups` 回分）・余裕を引く（足りなければ 0）。
 pub fn scenario_budget(elapsed: Duration, watchdog: Duration, cleanups: u32) -> Duration {
     watchdog
@@ -166,6 +187,7 @@ pub fn scenario_budget(elapsed: Duration, watchdog: Duration, cleanups: u32) -> 
         .saturating_sub(MARGIN)
 }
 
+#[allow(dead_code)] // 取り込む試験ごとに使う項目が異なるため
 /// 回収の結果。
 #[derive(Debug, Default, PartialEq)]
 pub struct ReclaimReport {
@@ -179,7 +201,9 @@ pub struct ReclaimReport {
     pub token: String,
 }
 
+#[allow(dead_code)] // 取り込む試験ごとに使う項目が異なるため
 impl ReclaimReport {
+    #[allow(dead_code)] // 取り込む試験ごとに使う項目が異なるため
     pub fn is_clean(&self) -> bool {
         self.left_containers.is_empty()
             && self.left_sandboxes.is_empty()
@@ -187,6 +211,7 @@ impl ReclaimReport {
     }
 }
 
+#[allow(dead_code)] // 取り込む試験ごとに使う項目が異なるため
 /// 残骸があるときの固定の 1 行（REPAIR-4）。ID は 64 文字の 16 進で秘密ではない。無ければ `None`。
 pub fn left_line(test: &str, r: &ReclaimReport) -> Option<String> {
     if r.is_clean() {
@@ -218,6 +243,7 @@ fn push_unique(v: &mut Vec<String>, id: String) {
     }
 }
 
+#[allow(dead_code)] // 取り込む試験ごとに使う項目が異なるため
 /// 起動し直しが要るか（#4285）。一覧を確認できず（`unverified`）、何も回収できなかったとき真。
 pub fn plugin_unreachable(r: &ReclaimReport) -> bool {
     !r.unverified.is_empty()
@@ -272,6 +298,7 @@ async fn list_by_selector(
     (containers, sandboxes, errors)
 }
 
+#[allow(dead_code)] // 取り込む試験ごとに使う項目が異なるため
 /// 台帳の ID と自分のトークンのラベルで絞った一覧の和だけを、期限つきで Stop / Remove する（R2・REPAIR-5）。
 /// `NOT_FOUND` は回収済みとして扱う。
 pub async fn reclaim(
@@ -283,6 +310,7 @@ pub async fn reclaim(
     reclaim_by_selector(c, ledger, labels(token), token, budget).await
 }
 
+#[allow(dead_code)] // 取り込む試験ごとに使う項目が異なるため
 /// [`reclaim`] の一般形。`selector` は label の完全一致（トークン、または [`owner_selector`]）。`name` は未確認の報告に載せる
 /// 識別子（トークン、または `owner=<値>`）。
 pub async fn reclaim_by_selector(

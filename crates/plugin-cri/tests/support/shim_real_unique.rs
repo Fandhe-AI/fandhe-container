@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[allow(dead_code)] // 取り込む試験ごとに使う項目が異なるため
 /// 実行ごとに一意なタグ（pid と UNIX 時刻 ns の下位 32 bit の 16 進。文字種は `[0-9a-f]`）。同じ実行では同じ値を返す
 /// （通常の後始末と watchdog の緊急回収が同じ ID を見るため）。
 pub fn run_tag() -> &'static str {
@@ -26,13 +27,16 @@ pub fn run_tag() -> &'static str {
     })
 }
 
+#[allow(dead_code)] // 取り込む試験ごとに使う項目が異なるため
 /// 旧形式（pid だけ）の残骸のおとり。`<XDG>/fandhe-container-shim-state/fc-test-decoy-<tag>/<ns>/<id>` を排他作成し、
 /// Drop で自分が作ったパスだけを深い順に `remove_dir` する（既存のパスは辿らず、消さない）。
 pub struct Decoy {
     created: Vec<PathBuf>,
 }
 
+#[allow(dead_code)] // 取り込む試験ごとに使う項目が異なるため
 impl Decoy {
+    #[allow(dead_code)] // 取り込む試験ごとに使う項目が異なるため
     /// おとりを置く。`XDG_RUNTIME_DIR` が無い・排他作成に失敗したときは `Err`（既存のパスは消さない）。
     pub fn place(old_namespace: &str, old_id: &str) -> Result<Self, String> {
         let xdg = std::env::var_os("XDG_RUNTIME_DIR")

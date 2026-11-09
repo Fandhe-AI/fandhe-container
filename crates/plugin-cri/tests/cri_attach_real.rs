@@ -38,7 +38,6 @@ mod spdy_client;
 // serde_json を plugin-cri の依存に足さないための最小 JSON 読み取り。
 #[path = "support/mini_json.rs"]
 mod mini_json;
-#[allow(dead_code)] // 取り込む試験ごとに使う項目が異なるため
 #[path = "support/cri_real_reclaim.rs"]
 mod reclaim;
 

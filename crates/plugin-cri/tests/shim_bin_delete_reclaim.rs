@@ -612,3 +612,55 @@ fn cri5_4153_bin_delete_after_daemon_death_reclaims_created_container() {
         );
     }
 }
+
+/// CRI-5・SUP-7・REPAIR-4・REPAIR-5・#4280: serve の起動時の走査で、記録の無い ID の閉じたコンテナログだけが消える。
+/// 記録のある ID と生きている sink のログは残り、`daemon.log` の要約行にパス・ID は含まれない。
+#[test]
+fn cri5_sup7_4280_bin_serve_sweeps_unrecorded_container_logs() {
+    use fandhe_container_supervisor::logs::container_log_dir;
+    let sc = Scratch::new();
+    let store = sc.store();
+    let root = sc.scoped_root();
+    sc.seed(&store, ContainerStatus::created(cid("present1"), None));
+    drop(open_container_sink(&root, "present1"));
+    drop(open_container_sink(&root, "closed1"));
+    let _live = open_container_sink(&root, "live1");
+
+    let id = format!("sw{}", std::process::id());
+    let _sock = sc.start(&id);
+
+    // 要約行を期限つきで待つ。
+    let log = sc.root.join("s").join("daemon.log");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut text = String::new();
+    while std::time::Instant::now() < deadline {
+        text = std::fs::read_to_string(&log).unwrap_or_default();
+        if text.contains(r#""event":"container_log_sweep""#) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains(r#""event":"container_log_sweep""#))
+        .collect();
+    assert_eq!(lines.len(), 1, "{text}");
+    assert!(lines[0].contains(r#""reclaimed_ids":1"#), "{}", lines[0]);
+    assert!(lines[0].contains(r#""skipped_live":1"#), "{}", lines[0]);
+    assert!(lines[0].contains(r#""skipped_present":1"#), "{}", lines[0]);
+    assert!(!lines[0].contains("closed1"), "{}", lines[0]);
+    assert!(
+        !lines[0].contains(sc.root.to_str().unwrap()),
+        "{}",
+        lines[0]
+    );
+
+    let mut left: Vec<String> = std::fs::read_dir(container_log_dir(&root))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    left.sort();
+    assert_eq!(left, ["live1.log", "live1.log.lock", "present1.log"]);
+
+    kill_daemon(&id);
+}

@@ -556,7 +556,8 @@ pub const STARTUP_LOG_SWEEP_BUDGET: Duration = Duration::from_secs(30);
 /// `@container-logs` を走査し、状態ストアに記録が無く、sink も生きていない ID のログだけを消す
 /// （`fandhe_container_supervisor::logs::sweep_stale_container_logs`。生きている sink・記録のある ID・帰属できない名前は残す。
 /// 読み取りに失敗した ID も消さない）。状態ルートを持たないストアでは `None`。消せた ID ごとに記録器の
-/// `container_log_reclaim` へ Success を計上する。呼び出し元は `main.rs` の `serve`（ブロッキングスレッド）。
+/// `container_log_reclaim` へ Success を計上する。呼び出し元は `main.rs` の `serve`（ブロッキングスレッド）と、shim v2 の serve の
+/// 起動時（`shim::startup_sweep`。scoped 状態ルートを裏の thread で走査する。#4280）。
 /// 走査はこの時点で存在する残りだけを対象にし、稼働中に発生した残りは次の起動まで残る（設計: `docs/design/container-log-removal-wait.md`）。
 pub fn sweep_leftover_container_logs(
     store: &Arc<dyn StateStore>,

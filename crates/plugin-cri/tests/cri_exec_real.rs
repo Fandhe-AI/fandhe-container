@@ -938,12 +938,13 @@ async fn production_binary_exec_real() {
         if let Some(line) = reclaim::left_line(TEST, rep2) {
             eprintln!("{line}");
         }
-        assert!(
-            !rr2.restarted(),
-            "plugin must be alive after scenario: {rr2:?}"
-        );
         match r2 {
-            Ok(()) => {}
+            // 成功時だけ「plugin が生きたまま」を確かめる。失敗・期限切れの回は起動し直しが正当なので、
+            // 先に下の失敗の報告（deadline 等）を出す。
+            Ok(()) => assert!(
+                !rr2.restarted(),
+                "plugin must be alive after scenario: {rr2:?}"
+            ),
             Err(reclaim::AttemptFailure::Panicked(p)) => std::panic::resume_unwind(p),
             Err(reclaim::AttemptFailure::Deadline) => {
                 panic!("{TEST}: scenario deadline exceeded")

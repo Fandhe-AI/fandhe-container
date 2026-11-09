@@ -83,6 +83,9 @@ use tonic::transport::Channel;
 
 const BIN: &str = env!("CARGO_BIN_EXE_fandhe-container-plugin-cri");
 const WATCHDOG: Duration = Duration::from_secs(60);
+/// `reclaim_restarting` を包む試験の期限。内部は回収 2 回（各 `CLEANUP_BUDGET`）と起動し直しを行うため、
+/// 回収 2 回分に起動し直しの余裕 60 秒を足す。ステップ・試験バイナリの期限（300 秒）より小さく、層の順序は崩さない（#4326・REPAIR-5）。
+const RESTART_WATCHDOG: Duration = Duration::from_secs(2 * reclaim::CLEANUP_BUDGET.as_secs() + 60);
 const STARTUP_DEADLINE: Duration = Duration::from_secs(10);
 const RPC_DEADLINE: Duration = Duration::from_secs(5);
 const REAP_GRACE: Duration = Duration::from_secs(5);
@@ -1664,7 +1667,7 @@ async fn cri1_cri6_4285_owned_residue_is_readopted_and_reclaimed_after_plugin_si
 #[tokio::test]
 async fn cri1_cri6_4326_reclaim_restarting_respawns_dead_plugin_and_reclaims_token_records() {
     const TEST_4326: &str = "cri1_cri6_4326";
-    tokio::time::timeout(WATCHDOG, async {
+    tokio::time::timeout(RESTART_WATCHDOG, async {
         let dir = TempDir::new("sock-4326");
         let xdg = TempDir::new("xdg-4326");
         let sock_a = dir.0.join("a.sock");

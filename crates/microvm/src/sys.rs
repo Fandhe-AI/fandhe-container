@@ -1121,7 +1121,7 @@ impl KickCell {
         };
         // SAFETY: `thread` は `armed` が武装中に `pthread_self` で入れた値で、`armed` の閉包（対象スレッドの上で
         // 同期実行）が戻るまで対象スレッドは生存する。解除は同じ mutex の下で行われ、この `g` を保持している間は
-        // 解除されないので、終了したスレッドへは送らない。シグナル番号は固定の SIGUSR2。ポインタ引数は無い。
+        // 解除されないので、終了したスレッドへは送らない（`Disarm::drop` も同じ `target` の mutex を取る。#4329）。シグナル番号は固定の SIGUSR2。ポインタ引数は無い。
         // 戻り値は errno そのもの。
         let r = unsafe { pthread_kill(thread, SIG_VCPU_KICK) };
         drop(g);

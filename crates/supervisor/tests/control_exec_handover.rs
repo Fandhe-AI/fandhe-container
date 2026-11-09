@@ -10,6 +10,10 @@
 //! 拒否の応答は `SCM_RIGHTS` が 0 本かつ `MSG_CTRUNC` なし、成功は 1 本であることを照合する（クライアント入口は
 //! 拒否に付いた fd を黙って閉じるため、サーバが fd を添えていないことはここでしか観測できない）。
 //!
+//! 追加（#4328・REPAIR-12）: kind 6 の成功の後、同じ接続で kind 7（ExecCgroupNotify）の拒否の応答を生受信し、
+//! `SCM_RIGHTS` 0 本・`MSG_CTRUNC` なしを照合する（成功の ack も 0 本）。応答を書かない分岐（途中までの送信・読み取り期限切れ）
+//! と到達できない分岐（名前の長さ超過・`get_mut` の `None`）は観測できないため対象外。
+//!
 //! 追加（#2626 の codex P1）: pidfd を渡した接続を supervisor のガードが預かり、CLI の作成通知（ExecCgroupNotify）の後に
 //! 接続が切れる（CLI の消滅を含む）か保持期限が来たら、偽の回収役が通知された名前で 1 回だけ呼ばれることを照合する
 //! （SUP-6・REPAIR-5・REPAIR-4）。実 cgroup の回収は実機前提の試験が担う。
@@ -553,6 +557,135 @@ fn sup6_sec1_repair12_4277_ok_carries_exactly_one_descriptor() {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(pool.active(), 0);
+}
+
+/// 同じ接続へ kind 7 などの生の frame を送り、応答の理由・添付 fd の本数・`MSG_CTRUNC` を返す。
+/// `ControlExecHandover::notify_created` を通さず応答を判定せずに受ける（制御バッファは fd 4 本分）。
+fn raw_notify_with_fds(stream: &mut UnixStream, frame: &[u8]) -> (ControlReason, usize, bool) {
+    stream.write_all(frame).unwrap();
+    let raw = recv_response_raw_for_test(stream, Instant::now() + Duration::from_secs(5)).unwrap();
+    let mut resp = raw.bytes;
+    if resp.len() < RESPONSE_LEN {
+        let mut rest = vec![0u8; RESPONSE_LEN - resp.len()];
+        stream.read_exact(&mut rest).unwrap();
+        resp.extend_from_slice(&rest);
+    }
+    let expected_head: [u8; HEADER_LEN] = [b'F', b'C', b'S', b'C', 1, 3, 0, 1];
+    assert_eq!(resp.get(..HEADER_LEN), Some(&expected_head[..]));
+    let reason = ControlReason::from_u8(*resp.last().unwrap()).unwrap();
+    (reason, raw.fds.len(), raw.truncated)
+}
+
+/// kind 7 の frame（ヘッダ 8 バイト + 保持期限 + 名前）。壊れた値を作るための試験専用の手組み。
+fn notify_bytes(head: [u8; HEADER_LEN], hold: u64, name: &[u8]) -> Vec<u8> {
+    let mut v = head.to_vec();
+    v.extend_from_slice(&hold.to_be_bytes());
+    v.extend_from_slice(name);
+    v
+}
+
+/// SUP-6・SEC-1・REPAIR-12・#4328: kind 7 の拒否の応答は `SCM_RIGHTS` の fd を 0 本しか持たず、`MSG_CTRUNC` も立たない。
+/// 成功の ack も 0 本。対照は同じ接続の直前の kind 6（`raw_handover` が fd ちょうど 1 本を assert）。
+#[test]
+fn sup6_sec1_repair12_4328_notify_rejections_carry_no_scm_rights() {
+    let rig = Rig::start_with("nf-reject", true, true, Some(test_limits(32)));
+    let h = |version: u8, kind: u8, len: u8| [b'F', b'C', b'S', b'C', version, kind, 0, len];
+    let name = b"exec-12-34";
+    let cases: Vec<(&str, Vec<u8>, ControlReason)> = vec![
+        (
+            "bad magic",
+            [b'X', b'C', b'S', b'C', 1, 7, 0, 18].to_vec(),
+            ControlReason::Malformed,
+        ),
+        (
+            "bad version",
+            h(2, 7, 18).to_vec(),
+            ControlReason::UnsupportedVersion,
+        ),
+        ("too large", h(1, 7, 65).to_vec(), ControlReason::TooLarge),
+        ("wrong kind", h(1, 6, 12).to_vec(), ControlReason::Malformed),
+        ("too short", h(1, 7, 8).to_vec(), ControlReason::Malformed),
+        (
+            "hold zero",
+            notify_bytes(h(1, 7, 18), 0, name),
+            ControlReason::Malformed,
+        ),
+        (
+            "name not utf8",
+            notify_bytes(h(1, 7, 10), u64::MAX, &[0xff, 0xfe]),
+            ControlReason::Malformed,
+        ),
+        (
+            "name bad format",
+            notify_bytes(h(1, 7, 16), u64::MAX, b"Exec_BAD"),
+            ControlReason::Malformed,
+        ),
+        (
+            "name prefix only",
+            notify_bytes(h(1, 7, 13), u64::MAX, b"exec-"),
+            ControlReason::Malformed,
+        ),
+        (
+            "hold in the past",
+            notify_bytes(h(1, 7, 18), 1, name),
+            ControlReason::Timeout,
+        ),
+        (
+            "hold beyond cap",
+            notify_bytes(h(1, 7, 18), u64::MAX, name),
+            ControlReason::Malformed,
+        ),
+    ];
+    for (label, frame, reason) in cases {
+        let mut s = raw_handover(&rig);
+        // ヘッダで拒否される場合、サーバは payload を読まない。余りを送らず、ヘッダ 8 バイトだけにする。
+        let frame = if matches!(
+            label,
+            "bad magic" | "bad version" | "too large" | "wrong kind" | "too short"
+        ) {
+            frame.get(..HEADER_LEN).unwrap().to_vec()
+        } else {
+            frame
+        };
+        assert_eq!(
+            raw_notify_with_fds(&mut s, &frame),
+            (reason, 0, false),
+            "{label}"
+        );
+    }
+
+    // 受け付け前（kind 6 の無い新しい接続）の kind 7。
+    let frame = notify_bytes(h(1, 7, 18), u64::MAX, name);
+    let (reason, fds, truncated, _s) = raw_handover_with_fds(&rig, &frame);
+    assert_eq!(
+        (reason, fds.len(), truncated),
+        (ControlReason::Malformed, 0, false)
+    );
+
+    // 成功の ack も fd を持たない。保持期限は kind 6 と同じ時計の絶対時刻で今から 30 秒後。
+    let hold = SignalDeadline::from_now(Duration::from_secs(30))
+        .unwrap()
+        .as_nanos();
+    let mut s = raw_handover(&rig);
+    assert_eq!(
+        raw_notify_with_fds(&mut s, &notify_bytes(h(1, 7, 18), hold, name)),
+        (ControlReason::Ok, 0, false),
+        "ack"
+    );
+    drop(s);
+
+    // 拒否では回収せず、ack の接続を閉じたときだけ 1 回回収する。ガードの枠は全て戻る。
+    assert_eq!(
+        rig.reclaimer.wait_for(1, Duration::from_secs(3)),
+        vec!["exec-12-34".to_owned()]
+    );
+    let pool = rig.pool.as_ref().unwrap();
+    let until = Instant::now() + Duration::from_secs(3);
+    while pool.active() != 0 && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(pool.active(), 0);
+    assert_eq!(rig.reclaimer.calls().len(), 1);
 }
 
 /// SEC-1・REPAIR-2・SUP-6・#2626: 不正な名前の通知は `Malformed` で拒否され、回収役は呼ばれない。

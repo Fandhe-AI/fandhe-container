@@ -909,7 +909,8 @@ async fn production_binary_exec_real() {
             reclaim::restart_reclaim_line(TEST, &rr1),
             Some(want.clone())
         );
-        // libtest の出力捕捉を迂回して CI の `--require` で照合できるようにする。
+        // `std::io::stderr()` への直接書き込みは libtest の出力捕捉（`print!` / `eprintln!` 系のみが対象）を受けないため、
+        // `--nocapture` なしの CI でも `--require` で照合できる。
         {
             use std::io::Write as _;
             let _ = writeln!(std::io::stderr(), "{want}");
@@ -917,8 +918,10 @@ async fn production_binary_exec_real() {
         eprintln!("{TEST}: injected failure reclaimed containers=1 sandboxes=1");
 
         // 試行 2（本番）: 同じトークン（同じ metadata）で最後まで通す。回収が効いていなければ ALREADY_EXISTS で落ちる。
+        // 試行 1 で PULL_DEADLINE 近くまで使っても 0 にならないよう下限を持つ（試行 2 の pull は取得済みで速い）。
         let b2 = reclaim::scenario_budget(started.elapsed(), WATCHDOG, 2)
-            .saturating_sub(STARTUP_DEADLINE);
+            .saturating_sub(STARTUP_DEADLINE)
+            .max(Duration::from_secs(30));
         let r2 = reclaim::guarded(
             scenario(
                 c.clone(),

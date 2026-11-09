@@ -1586,6 +1586,77 @@ jobs:
             --log "${log}" --select '^netns_holder_launch_userns: holder spawned' \
             --forbid 'netns_holder_launch_userns: ignored' --forbid 'not applicable' --forbid 'FAILED' --summary
 
+      # pod_holder（`crates/core/tests/pod_holder.rs`。CRI-2・CORE-3・SEC-5・NET-2・REPAIR-12・#2870・#2875）: pod の保持役が呼ぶ
+      # `establish_pod_namespaces` が user（写像つき）・ipc・net namespace を確立し、写像・素性・`lo` up・non-dumpable の維持を
+      # 照合する実機前提テスト（harness = false）。単一行写像（single）と範囲写像（subordinate。`FANDHE_CONTAINER_TEST_ID_HELPER=1`）
+      # の 2 ケースを回し、subordinate が黙って落ちないよう `subordinate case not requested` を禁止する。cgroup を使わないため
+      # 委譲スコープで包まず、scope を作らない補助で期限だけ持つ（試験自身の期限は 1 ケース 40 秒。補助 240 秒、ステップ 5 分の順）。
+      # 上で緩和した sysctl を使い回し、新しいジョブ・check-run・sudo・permissions は増やさない。root の分岐は CI で回さない。
+      - name: pod_holder のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          json="${RUNNER_TEMP}/ph-build.json"
+          cargo test -p fandhe-container-core --test pod_holder --no-run --message-format=json > "${json}"
+          sel='select(.profile.test == true and .target.name == "pod_holder") | .executable'
+          bins="$(jq -r "${sel}" "${json}" | grep -v '^null$' | sort -u)"
+          if [ -z "${bins}" ] || [ "$(printf '%s\n' "${bins}" | wc -l)" -ne 1 ]; then
+            echo "::error::pod_holder test binary not uniquely identified" >&2
+            exit 1
+          fi
+          echo "PH_BIN=${bins}" >> "$GITHUB_ENV"
+
+      - name: pod_holder の実行（実機前提テスト・--ignored。CRI-2・CORE-3・SEC-5・#2875）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/pod_holder.log"
+          FANDHE_CONTAINER_TEST_ID_HELPER=1 USER="$(id -un)" \
+            scripts/run-with-deadline.sh --name pod_holder --deadline 240 --log "${log}" -- \
+            "${PH_BIN}" --ignored
+          scripts/check-success-lines.sh --name pod_holder --src crates/core/tests/pod_holder.rs --log "${log}" \
+            --select '^pod_holder: (single|subordinate) id namespaces established' --min 2 \
+            --forbid 'pod_holder: ignored' --forbid 'subordinate case not requested' --forbid 'not applicable' \
+            --forbid 'PRECONDITION FAILED' --forbid 'WATCHDOG EXPIRED' --forbid 'root=true' --forbid 'FAILED' --summary
+
+      # pod_holder_bin_real（`crates/supervisor/tests/pod_holder_bin_real.rs`。CRI-2・CORE-1・SEC-5・REPAIR-5・REPAIR-12・#2874・#2875）:
+      # supervisor の bin の `pod-holder` モードを本物のバイナリで通す実機前提テスト（harness = false。シナリオ A〜F と最終行の 7 行）。
+      # 試験自身の watchdog が 240 秒のため、補助 540 秒・ステップ 10 分とし、試験の watchdog、補助、ステップ、ジョブの順を保つ。
+      # 範囲写像（`FANDHE_CONTAINER_TEST_ID_HELPER=1`）を要求する。委譲スコープでは包まない。util-linux の nsenter・setpriv が要る
+      # （ランナーイメージの既定）。新しいジョブ・check-run・sudo・permissions は増やさない。
+      - name: pod_holder_bin_real のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          json="${RUNNER_TEMP}/phb-build.json"
+          cargo test -p fandhe-container-supervisor --test pod_holder_bin_real --no-run \
+            --message-format=json > "${json}"
+          sel='select(.profile.test == true and .target.name == "pod_holder_bin_real") | .executable'
+          bins="$(jq -r "${sel}" "${json}" | grep -v '^null$' | sort -u)"
+          if [ -z "${bins}" ] || [ "$(printf '%s\n' "${bins}" | wc -l)" -ne 1 ]; then
+            echo "::error::pod_holder_bin_real test binary not uniquely identified" >&2
+            exit 1
+          fi
+          echo "PHB_BIN=${bins}" >> "$GITHUB_ENV"
+
+      - name: pod_holder_bin_real の実行（実機前提テスト・--ignored。CRI-2・CORE-1・SEC-5・#2875）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/pod_holder_bin_real.log"
+          FANDHE_CONTAINER_TEST_ID_HELPER=1 USER="$(id -un)" \
+            scripts/run-with-deadline.sh --name pod_holder_bin_real --deadline 540 --log "${log}" -- \
+            "${PHB_BIN}" --ignored
+          scripts/check-success-lines.sh --name pod_holder_bin_real \
+            --src crates/supervisor/tests/pod_holder_bin_real.rs --log "${log}" \
+            --select '^pod_holder_bin_real: (scenario [A-F] ok:|the pod-holder mode works)' --min 7 \
+            --forbid 'pod_holder_bin_real: ignored' --forbid 'not applicable' --forbid 'PRECONDITION FAILED' \
+            --forbid 'WATCHDOG EXPIRED' --forbid 'root=true' --forbid 'FAILED' --summary
+
       # runtime_service_namespaces（`crates/cri/tests/runtime_service_namespaces.rs`。CRI-2・TASK-59.2・TASK-59.3・
       # #438・#439・#2188・#2220）: CRI ハンドラが adapter 経由で実際にプロセスを起動するところまで届くこと、
       # `/proc/<pid>/ns/*` で分離が成り立つこと、Remove の後に namespace を参照するプロセスが残らないことを照合する
@@ -1662,6 +1733,24 @@ jobs:
             --src crates/core/src/oci_runtime/start.rs --log "${log}" \
             --libtest-ignored --libtest-module "${m}" \
             --select '^(test [A-Za-z0-9_:]+ \.\.\. |ok: sec1_2823)' --min 2 --summary
+
+      # net3_2872_real_holder_net_join_identity_and_ownership（`crates/core/src/oci_runtime/namespace_join.rs` の lib 内
+      # `#[ignore]` 試験 1 件。CORE-3・SEC-5・NET-3・SEC-4・#2872・#2875）: 保持役の代わりの `unshare --user --map-root-user --ipc --net`
+      # の ns で `NamespaceJoin::pin` を実機照合する。上で緩和した sysctl を使い回し、ビルドは sec1_2536 のステップの lib を使い回す
+      # （新しいビルドステップは足さない）。新しいジョブ・check-run・sudo は増やさない。
+      - name: net3_2872_real_holder_net_join_identity_and_ownership の実行（実機前提テスト・--ignored。NET-3・SEC-5・#2872・#2875）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/net3_2872_real_holder_net_join.log"
+          scripts/run-with-deadline.sh --name net3_2872_real_holder_net_join --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-core --lib -- --ignored --exact \
+              oci_runtime::namespace_join::tests::net3_2872_real_holder_net_join_identity_and_ownership
+          scripts/check-success-lines.sh --name net3_2872_real_holder_net_join_identity_and_ownership \
+            --src crates/core/src/oci_runtime/namespace_join.rs --log "${log}" \
+            --libtest-ignored --libtest-module 'oci_runtime::namespace_join::tests' \
+            --select '^test [A-Za-z0-9_:]+ \.\.\. ' --summary
 
       # CDI createContainer フックの namespace 前提の実機前提テスト 2 件（`crates/gpu/src/cdi_apply/hooks/run.rs` の lib 内
       # `#[ignore]` 試験。GPU-2・SEC-1・REPAIR-2・REPAIR-12・TASK-127.3・#549・#2980・#2987）。上で緩和した sysctl を使い回し、
@@ -2017,14 +2106,14 @@ jobs:
           }
           code='[A-Z][A-Za-z]+'
           # 二者択一（rslave-bind・p2/r3/r4 の start refused）と root 専用の行は select に入れない。
-          # --min は導出件数の実測値（A 24・B 9・C 2・D 2・E 1）で、select の書き損じによる取りこぼしを防ぐ。
+          # --min は導出件数の見込み（A 25〔W-net を #2875 で追加。実測は CI の --summary で確認〕・B 9・C 2・D 2・E 1）で、select の書き損じによる取りこぼしを防ぐ。
           # 定数の出典は production_launcher.rs の const（HOSTNAME・BIND_DEST・LO_TMPFS_DEST・WANT・EXIT_CODE）と scenario_k の配列。
           # A: 位置プレースホルダの無い行（最終行・正常系・説明行）。rslave-bind は到達だけを --require で照合する
           sel_a='^production_launcher: (pid1, default |scenario=(ok|bind-mount|multithreaded-refused|j|k'
           sel_a+='|working-dir|dropped-handle-confirmed'
           sel_a+='|bare-name|cwd-relative|user-applied|groups-applied) |launch options |readonly rootfs '
           sel_a+='|injected secret '
-          sel_a+='|capabilities drop |sysctls applied |pod ipc |entrypoint violation |exit_signal '
+          sel_a+='|capabilities drop |sysctls applied |pod ipc |pod network |entrypoint violation |exit_signal '
           sel_a+='|network loopback |init pty )'
           check --select "${sel_a}" \
             --subst-re pid='[1-9][0-9]*' --subst-re nspid='"[1-9][0-9]*\\t1"' \
@@ -2032,7 +2121,7 @@ jobs:
             --subst WANT=4194304 --subst-re host_before='[0-9]+' --subst EXIT_CODE=7 \
             --subst name=unshare,ptrace,kexec_load \
             --subst-re host_uid='[0-9]+' --subst-re host_gids='[0-9]+,[0-9]+' \
-            --require 'production_launcher: scenario=rslave-bind host=' --min 25 --summary
+            --require 'production_launcher: scenario=rslave-bind host=' --min 26 --summary
           # B: code={:?} が 1 つの拒否系。exec-failure の case/code/phase の組は --require で値まで照合する
           ef='production_launcher: scenario=exec-failure'
           ef_tail='state=created audit=0 children=0'

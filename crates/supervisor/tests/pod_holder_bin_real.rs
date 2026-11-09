@@ -2,7 +2,7 @@
 //! REPAIR-12。#2874。設計は `docs/design/pod-namespace-holder.md` の H2）。
 //!
 //! 保持役は `unshare(CLONE_NEWUSER)` を使うため、非特権 user namespace を作れる環境（`kernel.apparmor_restrict_unprivileged_userns`
-//! の緩和など）と util-linux の `nsenter`・`setpriv` が要る。CI への組み込みは H3（#2875）。`harness = false` で
+//! の緩和など）と util-linux の `nsenter`・`setpriv` が要る。CI の `platform-ci` の ubuntu で実行する（#2875）。`harness = false` で
 //! `-- --ignored` 指定時のみ動かす（AGENTS.md）。前提が欠けていれば `PRECONDITION FAILED` で終了コード 1（成功を装わない）。
 //!
 //! # シナリオ（各成功行は固定の文字列。`scripts/check-success-lines.sh` が本ファイルのリテラルから導出して照合する）
@@ -15,7 +15,7 @@
 //! - F: 拒否（余分な argv は終了コード 2、SIGTERM が無視された起動は ERROR フレームと終了コード 1）
 //!
 //! 範囲外: provider の無い `POD` で pod 内の 2 コンテナが通信する試験は core の net join（H7・#2872）が要るため、
-//! H7 の後に H3 か H5 で扱う。
+//! H7 の後に H5（#2876）か H8（#2878）で扱う。
 
 #[cfg(not(target_os = "linux"))]
 fn main() {

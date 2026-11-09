@@ -17,7 +17,7 @@
 //! 非特権 user namespace を許可するホストが必要(AppArmor の `kernel.apparmor_restrict_unprivileged_userns=1`
 //! では失敗する)。`-- --ignored` 指定時のみ実行する(docs/verification/real-machine-tests.md)。範囲写像は
 //! `uidmap`・subuid / subgid の自ユーザー行・Linux 6.9 以降が要り、前提が無ければ `PRECONDITION FAILED` で失敗する
-//! (skip で成功にしない)。CI への組み込みは #2875。
+//! (skip で成功にしない)。CI の `platform-ci` の ubuntu で実行する（#2875）。
 
 #[cfg(target_os = "linux")]
 #[path = "support/precondition.rs"]

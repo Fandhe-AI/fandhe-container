@@ -1836,6 +1836,31 @@ fn pod_network_provider_set_up_and_tear_down() {
     assert!(provider.tear_down("bad_id").is_err());
 }
 
+/// provider: 保持役の netns を結線できないため、資源を作らずに `UNIMPLEMENTED` で拒否する（#2878・NET-3）。
+/// `NetworkPlugin` の呼び出しは 0 件で、サブネットのリースも消費しない（後続の通常の set_up が同じ枠から始まる）。
+#[test]
+fn net3_pod_network_provider_rejects_holder_namespaces_without_side_effects() {
+    use fandhe_container_cri::adapter::{PodNetworkProvider, PodNetworkRequest};
+    use fandhe_container_cri::bundle::PodNamespacePaths;
+    use fandhe_container_cri::error::CriErrorCode;
+    use fandhe_container_cri::runtime::v1::PodSandboxConfig;
+    let fake = Fake::default();
+    let provider = provider_with(&fake);
+    let cfg = PodSandboxConfig::default();
+    let holder =
+        PodNamespacePaths::for_holder_pid(std::num::NonZeroU32::new(4242).expect("nz")).expect("p");
+    let err = provider
+        .set_up(&PodNetworkRequest::new(SB, &cfg).with_holder_namespaces(&holder))
+        .expect_err("holder");
+    assert_eq!(err.code(), CriErrorCode::Unimplemented);
+    assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+    assert!(fake.netns_calls().is_empty(), "{:?}", fake.netns_calls());
+    provider
+        .set_up(&PodNetworkRequest::new(SB, &cfg))
+        .expect("plain set up after reject");
+    assert_eq!(fake.calls()[0], format!("create_network {SB} 10.90.0.1/24"));
+}
+
 /// provider: 巻き戻しが完了した失敗は枠を返し、次の set_up が同じ枠から始まる。
 #[test]
 fn pod_network_provider_reuses_the_subnet_after_a_clean_rollback() {

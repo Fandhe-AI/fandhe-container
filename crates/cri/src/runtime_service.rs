@@ -2257,19 +2257,45 @@ impl CriRuntimeService {
             }
             return Err(failure.err);
         }
-        // 以降は await を挟まず `NetworkSetUpGuard` が引き継ぐ。
-        abort_guard.disarm();
-        let config = {
+        // 設定の複製と、保持役の namespace のパス（自 sandbox の記録の pid からだけ作る。#2878・NET-3・SEC-5）。
+        // `network_pending` が Stop・Remove を拒否するため、spawn から set_up までに `pod_holder` は消えない。
+        let (config, holder_paths) = {
             let registry = self
                 .registry
                 .lock()
                 .map_err(|_| CriError::internal("sandbox registry is unavailable"))?;
-            registry
+            let record = registry
                 .records
                 .get(&id)
-                .map(|r| r.config.clone())
-                .ok_or_else(|| CriError::internal("sandbox record is unavailable"))?
+                .ok_or_else(|| CriError::internal("sandbox record is unavailable"))?;
+            let holder_paths = match (&record.pod_holder, self.pod_holder.is_some()) {
+                (Some(h), _) => crate::bundle::PodNamespacePaths::for_holder_pid(h.pid()).map(Some),
+                // 保持役を注入したのに記録に無い。保持役なしへ黙って落とさず失敗させる（fail-closed）。
+                (None, true) => Err(CriError::failed_precondition(
+                    "sandbox holder is unavailable",
+                )),
+                (None, false) => Ok(None),
+            };
+            (record.config.clone(), holder_paths)
         };
+        let holder_paths = match holder_paths {
+            Ok(p) => p,
+            Err(err) => {
+                // set_up は始まっていない。保持役を戻して記録を除去する（解放できなければ Stop・Remove に任せる）。
+                if self.rollback_pod_holder(&id).await {
+                    self.release_unwritten_sandbox(&id, &mut write_guard).await;
+                } else if let Ok(mut registry) = self.registry.lock()
+                    && let Some(record) = registry.records.get_mut(&id)
+                {
+                    record.network_pending = false;
+                    record.state = SandboxState::NotReady;
+                }
+                return Err(err);
+            }
+        };
+        // 以降は await を挟まず `NetworkSetUpGuard` が引き継ぐ。上の失敗分岐の `rollback_pod_holder` の await 中に
+        // future が破棄されても `network_pending` が残らないよう、disarm はここまで遅らせる（#2878・CRI-2・REPAIR-5）。
+        abort_guard.disarm();
         let worker_provider = Arc::clone(provider);
         let worker_id = id.clone();
         let worker_registry = Arc::clone(&self.registry);
@@ -2290,10 +2316,27 @@ impl CriRuntimeService {
         let set_up = run_bounded(self.runtime_timeout, move || {
             let _guard = guard;
             worker_ran.store(true, Ordering::SeqCst);
-            let result = worker_provider.set_up(
-                &PodNetworkRequest::new(&worker_id, &config).with_port_publishes(&publishes),
-            );
+            let mut request =
+                PodNetworkRequest::new(&worker_id, &config).with_port_publishes(&publishes);
+            if let Some(h) = holder_paths.as_ref() {
+                request = request.with_holder_namespaces(h);
+            }
+            let result = worker_provider.set_up(&request);
             let (netns, outcome) = match result {
+                // 契約の照合: 保持役があるとき、provider は保持役の netns をそのまま結線して返す（#2878・NET-3）。
+                // 食い違いは provider の誤りなので採用せず、`network_owned` で回収させる（untrusted な実装）。
+                Ok(netns)
+                    if holder_paths
+                        .as_ref()
+                        .is_some_and(|h| netns.path() != std::path::Path::new(h.net())) =>
+                {
+                    (
+                        None,
+                        Err(CriError::internal(
+                            "pod network provider did not wire the holder network namespace",
+                        )),
+                    )
+                }
                 Ok(netns) => (Some(netns), Ok(())),
                 Err(err) => (None, Err(err)),
             };
@@ -5523,8 +5566,10 @@ mod tests {
         let pb = rb.provider_pod_namespaces.unwrap();
         assert_eq!(pa.user(), "/proc/111/ns/user");
         assert_eq!(pa.ipc(), "/proc/111/ns/ipc");
+        assert_eq!(pa.net(), "/proc/111/ns/net");
         assert_eq!(pb.user(), "/proc/222/ns/user");
         assert_eq!(pb.ipc(), "/proc/222/ns/ipc");
+        assert_eq!(pb.net(), "/proc/222/ns/net");
     }
 
     /// CRI-2・REPAIR-3・#2876: provider を注入したのに保持役の無い Ready の記録は、黙って降格せず拒否する。

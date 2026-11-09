@@ -2362,7 +2362,7 @@ jobs:
             "${SER_BIN}" --ignored
           scripts/check-success-lines.sh --name stream_exec_real \
             --src crates/supervisor/tests/stream_exec_real.rs --log "${log}" \
-            --select '^stream_exec_real: (scenario=|real stream-exec helper ran)' --min 6 \
+            --select '^stream_exec_real: (scenario=|real stream-exec helper ran)' --min 7 \
             --forbid 'stream_exec_real: ignored' --forbid 'not verified' --forbid 'not applicable' \
             --forbid 'skipped' --forbid 'FAILED' --forbid 'PRECONDITION FAILED' --forbid 'root=true' --summary
 

@@ -18,7 +18,7 @@ use fandhe_container_cri::error::CriErrorCode;
 use fandhe_container_cri::shim_v2::exec::{PROCESS_TYPE_URL, parse_process_spec};
 use fandhe_container_cri::shim_v2::task_api::Any;
 use fandhe_container_supervisor::stream_exec::channel::{
-    recv_stdio_handover, send_result, send_started,
+    recv_stdio_handover, send_result, send_signal_ack, send_started,
 };
 use fandhe_container_supervisor::stream_exec::wire::{ExitSignal, StdioMask};
 
@@ -172,6 +172,7 @@ fn short() -> ExecBudgets {
         session: Duration::from_millis(200),
         result_grace: Duration::from_millis(200),
         extinction_grace: Duration::from_millis(300),
+        signal_ack: Duration::from_millis(400),
     }
 }
 
@@ -299,12 +300,16 @@ fn sec1_4148_sigkill_hits_only_helper_and_stays_unconfirmed() {
     let helper = *pids.lock().expect("lock").first().expect("helper pid");
     assert_ne!(helper, fx.init.id());
 
-    assert_eq!(
-        p.signal(Signal::new(15).expect("sig"))
-            .err()
-            .map(|e| e.code()),
-        Some(CriErrorCode::Unimplemented)
-    );
+    // 許可リスト外（SIGSTOP 19・SIGCONT 18）は従来どおり `UNIMPLEMENTED`（#4282）。helper は無傷。
+    for n in [19u8, 18] {
+        assert_eq!(
+            p.signal(Signal::new(n).expect("sig"))
+                .err()
+                .map(|e| e.code()),
+            Some(CriErrorCode::Unimplemented),
+            "signal {n}"
+        );
+    }
     assert!(alive(helper));
 
     p.signal(Signal::SIGKILL).expect("kill");
@@ -717,17 +722,26 @@ fn sec1_4221_production_probe_mapping() {
 }
 
 /// SEC-1・REPAIR-3・#4221: 旧い version 1 の `Started`（payload なし）は拒否され、launch は失敗して helper は止まり、probe は呼ばれない。
-/// 不正な名前欄の `Started`（version 2）も同じ。確認済みとして扱わない（fail-closed）。
+/// 不正な名前欄の `Started`（version 3）と、version 2 の正しい `Started`（#4282）も同じ。確認済みとして扱わない（fail-closed）。
 #[test]
 fn sec1_4221_v1_or_malformed_started_is_rejected_and_never_confirmed() {
     use std::io::Write as _;
-    let frames: [Vec<u8>; 2] = [
+    let frames: [Vec<u8>; 3] = [
         // version 1 の `Started`（header のみ）。
         b"FCSX\x01\x02\x00\x00".to_vec(),
-        // version 2 だが名前欄が不正（name_len = 0）。
+        // version 3 だが名前欄が不正（name_len = 0）。
+        {
+            let mut v = b"FCSX\x03\x02\x00\x41".to_vec();
+            v.extend_from_slice(&[0u8; 65]);
+            v
+        },
+        // version 2 の正しい `Started`（name_len = 11 の `exec-4242-0`。v3 の相手とは混在させない。#4282）。
         {
             let mut v = b"FCSX\x02\x02\x00\x41".to_vec();
-            v.extend_from_slice(&[0u8; 65]);
+            let mut name = [0u8; 65];
+            name[0] = 11;
+            name[1..12].copy_from_slice(b"exec-4242-0");
+            v.extend_from_slice(&name);
             v
         },
     ];
@@ -750,5 +764,289 @@ fn sec1_4221_v1_or_malformed_started_is_rejected_and_never_confirmed() {
         let helper = *pids.lock().expect("lock").first().expect("pid");
         assert!(gone(helper), "helper must be reaped");
         assert!(recorded(&pr).is_empty(), "probe must never be consulted");
+    }
+}
+
+/// 偽の helper が `Signal` frame を受けたときの応答（#4282）。
+#[derive(Clone, Copy)]
+enum Reply {
+    /// この code の `SignalAck` を返し、保持を続ける。
+    Ack(SignalAckCode),
+    /// 何も返さない。
+    Silent,
+    /// 要求と違う番号（SIGHUP）の ack を返す。
+    WrongNumber,
+    /// `delivered` の ack の後に `Result(Signaled(15))` を返す。
+    DeliveredThenTerminated,
+    /// 1 件目だけ `delay` 待ってから `delivered` の ack を返し、2 件目以降は即座に返す（期限切れ後の遅延 ack の再現）。
+    FirstAckDelayed(Duration),
+}
+
+/// `Started` の後に `Signal` frame（生の 9 バイト）を読み、`log` へ積んで `reply` に従う script（最長 10 秒保持）。
+fn signal_script(reply: Reply, log: Arc<Mutex<Vec<Vec<u8>>>>) -> Script {
+    use std::io::Read as _;
+    Arc::new(move |mut end, mask| {
+        recv_stdio_handover(&end, mask, deadline()).expect("handover");
+        send_started(&end, &cg(), deadline()).expect("started");
+        end.set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("timeout");
+        let end_until = Instant::now() + Duration::from_secs(10);
+        let mut seen = 0usize;
+        while Instant::now() < end_until {
+            let mut frame = [0u8; 9];
+            match end.read_exact(&mut frame) {
+                Ok(()) => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    continue;
+                }
+                Err(_) => return,
+            }
+            log.lock().expect("lock").push(frame.to_vec());
+            let requested = ExecSignal::new(frame[8]).expect("allowed signal");
+            seen += 1;
+            match reply {
+                Reply::FirstAckDelayed(delay) => {
+                    if seen == 1 {
+                        std::thread::sleep(delay);
+                    }
+                    send_signal_ack(&end, requested, SignalAckCode::Delivered, deadline())
+                        .expect("ack");
+                }
+                Reply::Ack(code) => {
+                    send_signal_ack(&end, requested, code, deadline()).expect("ack");
+                }
+                Reply::Silent => {}
+                Reply::WrongNumber => {
+                    send_signal_ack(
+                        &end,
+                        ExecSignal::new(1).expect("hup"),
+                        SignalAckCode::Delivered,
+                        deadline(),
+                    )
+                    .expect("ack");
+                }
+                Reply::DeliveredThenTerminated => {
+                    send_signal_ack(&end, requested, SignalAckCode::Delivered, deadline())
+                        .expect("ack");
+                    send_result(
+                        &end,
+                        &StreamExecOutcome::Signaled(ExitSignal::new(15).expect("15")),
+                        deadline(),
+                    )
+                    .expect("result");
+                    return;
+                }
+            }
+        }
+    })
+}
+
+fn new_log() -> Arc<Mutex<Vec<Vec<u8>>>> {
+    Arc::new(Mutex::new(Vec::new()))
+}
+
+/// CRI-5・SUP-6・SEC-1・#4282: SIGTERM は `Signal` frame の生のバイト列（版 3・kind 5・番号 15）で helper へ届き、
+/// `delivered` の ack で `Ok`。helper が返す `Signaled(15)` は 143 になる。
+#[test]
+fn cri5_4282_sigterm_is_sent_as_a_signal_frame_and_ends_with_143() {
+    let fx = Fixture::new("sigterm");
+    let log = new_log();
+    let (l, _) = fx.launcher(
+        signal_script(Reply::DeliveredThenTerminated, Arc::clone(&log)),
+        probe(0),
+        ExecBudgets::default(),
+    );
+    let p = l.launch(&cid("run1"), &eid(), &ok_spec()).expect("launch");
+    p.signal(Signal::SIGTERM).expect("signal");
+    assert_eq!(
+        *log.lock().expect("lock"),
+        vec![b"FCSX\x03\x05\x00\x01\x0f".to_vec()]
+    );
+    assert_eq!(
+        p.wait_exit(WAIT, Duration::from_millis(10), &never_cancel),
+        Ok(Some(143))
+    );
+    assert_eq!(
+        p.signal(Signal::SIGTERM).err().map(|e| e.code()),
+        Some(CriErrorCode::NotFound),
+        "finished exec"
+    );
+}
+
+/// CRI-5・SUP-6・#4282: ack の code ごとの CRI の結果（not_started → `FAILED_PRECONDITION`・exited → `NOT_FOUND`・
+/// unavailable → `UNAVAILABLE`）。exec は Running のまま、helper は生きている。
+#[test]
+fn cri5_4282_ack_codes_map_to_cri_errors() {
+    for (code, expect, message) in [
+        (
+            SignalAckCode::NotStarted,
+            CriErrorCode::FailedPrecondition,
+            "exec process is not started yet",
+        ),
+        (
+            SignalAckCode::Exited,
+            CriErrorCode::NotFound,
+            "process already finished",
+        ),
+        (
+            SignalAckCode::Unavailable,
+            CriErrorCode::Unavailable,
+            "exec signal could not be delivered",
+        ),
+    ] {
+        let fx = Fixture::new("ackmap");
+        let log = new_log();
+        let (l, pids) = fx.launcher(
+            signal_script(Reply::Ack(code), Arc::clone(&log)),
+            probe(0),
+            ExecBudgets::default(),
+        );
+        let p = l.launch(&cid("run1"), &eid(), &ok_spec()).expect("launch");
+        let e = p.signal(Signal::SIGTERM).expect_err("rejected");
+        assert_eq!(e.code(), expect);
+        assert_eq!(e.message(), message);
+        assert_eq!(p.status(), Ok(ExecProcessStatus::Running));
+        let helper = *pids.lock().expect("lock").first().expect("pid");
+        assert!(alive(helper));
+        // 次の要求も同じ経路で通る（1 件ずつ排他して順に処理される）。
+        let e2 = p.signal(Signal::new(10).expect("usr1")).expect_err("again");
+        assert_eq!(e2.code(), expect);
+        assert_eq!(log.lock().expect("lock").len(), 2);
+    }
+}
+
+/// REPAIR-5・#4282: ack が来なければ期限で `DEADLINE_EXCEEDED`（Timeout）。exec は Running のまま。
+#[test]
+fn repair5_4282_missing_ack_times_out() {
+    let fx = Fixture::new("noack");
+    let log = new_log();
+    let (l, _) = fx.launcher(
+        signal_script(Reply::Silent, Arc::clone(&log)),
+        probe(0),
+        short_with_long_session(),
+    );
+    let p = l.launch(&cid("run1"), &eid(), &ok_spec()).expect("launch");
+    let begin = Instant::now();
+    let e = p.signal(Signal::SIGTERM).expect_err("no ack");
+    assert_eq!(e.code(), CriErrorCode::Timeout);
+    assert_eq!(e.message(), "exec signal was not acknowledged");
+    assert!(begin.elapsed() >= Duration::from_millis(400));
+    assert_eq!(p.status(), Ok(ExecProcessStatus::Running));
+}
+
+/// REPAIR-5・SUP-6・CRI-6・#4282: 期限切れの要求に遅れて届く正常な ack では exec を止めない（helper は無傷で Running のまま）。
+#[test]
+fn repair5_4282_late_ack_after_timeout_does_not_kill_exec() {
+    let fx = Fixture::new("lateack");
+    let log = new_log();
+    let (l, pids) = fx.launcher(
+        signal_script(
+            Reply::FirstAckDelayed(Duration::from_millis(900)),
+            Arc::clone(&log),
+        ),
+        probe(0),
+        short_with_long_session(),
+    );
+    let p = l.launch(&cid("run1"), &eid(), &ok_spec()).expect("launch");
+    let e = p.signal(Signal::SIGTERM).expect_err("timeout");
+    assert_eq!(e.code(), CriErrorCode::Timeout);
+    // 遅れた ack が届く時間を待つ。
+    std::thread::sleep(Duration::from_millis(900));
+    let helper = *pids.lock().expect("lock").first().expect("pid");
+    assert!(alive(helper), "late ack must not stop the helper");
+    assert_eq!(p.status(), Ok(ExecProcessStatus::Running));
+    // 以後の要求は通常どおり成功する。
+    p.signal(Signal::SIGTERM).expect("next request succeeds");
+    assert_eq!(log.lock().expect("lock").len(), 2);
+}
+
+/// REPAIR-5・#4282: 期限切れ → 再要求のとき、古い ack は新要求の成功にならず消費され、2 件目の ack が新要求の成功になる（停止なし）。
+#[test]
+fn repair5_4282_timeout_then_retry_with_two_acks_succeeds_once() {
+    let fx = Fixture::new("retryack");
+    let log = new_log();
+    let (l, pids) = fx.launcher(
+        signal_script(
+            Reply::FirstAckDelayed(Duration::from_millis(700)),
+            Arc::clone(&log),
+        ),
+        probe(0),
+        short_with_long_session(),
+    );
+    let p = l.launch(&cid("run1"), &eid(), &ok_spec()).expect("launch");
+    let e = p.signal(Signal::SIGTERM).expect_err("timeout");
+    assert_eq!(e.code(), CriErrorCode::Timeout);
+    // 再要求: 古い ack（約 700ms）を消費したあと、2 件目の ack で成功する。
+    p.signal(Signal::SIGTERM).expect("retry succeeds");
+    std::thread::sleep(Duration::from_millis(500));
+    let helper = *pids.lock().expect("lock").first().expect("pid");
+    assert!(alive(helper), "no ack may stop the helper");
+    assert_eq!(p.status(), Ok(ExecProcessStatus::Running));
+    assert_eq!(log.lock().expect("lock").len(), 2);
+}
+
+/// SEC-1・REPAIR-3・#4282: 要求と違う番号の ack はプロトコル違反。helper を止めて未確認にし、要求は `UNAVAILABLE`。
+#[test]
+fn sec1_4282_wrong_number_ack_kills_helper_and_stays_unconfirmed() {
+    let fx = Fixture::new("wrongack");
+    let log = new_log();
+    let (l, pids) = fx.launcher(
+        signal_script(Reply::WrongNumber, Arc::clone(&log)),
+        probe(0),
+        short_with_long_session(),
+    );
+    let p = l.launch(&cid("run1"), &eid(), &ok_spec()).expect("launch");
+    let e = p.signal(Signal::SIGTERM).expect_err("violation");
+    assert_eq!(e.code(), CriErrorCode::Unavailable);
+    let helper = *pids.lock().expect("lock").first().expect("pid");
+    assert!(gone(helper), "helper must be killed");
+    assert_eq!(
+        p.status().expect_err("unconfirmed").code(),
+        CriErrorCode::Unavailable
+    );
+    // 未確認の exec へ許可されたシグナルは送らない。
+    let e = p.signal(Signal::SIGTERM).expect_err("unconfirmed");
+    assert_eq!(e.code(), CriErrorCode::Unavailable);
+    assert_eq!(log.lock().expect("lock").len(), 1);
+}
+
+/// SEC-1・#4282: 許可リスト外（SIGSTOP・SIGCONT・SIGWINCH・実時間シグナル）の番号は `UNIMPLEMENTED` で、frame を 1 バイトも送らない。
+#[test]
+fn sec1_4282_disallowed_signals_send_no_frame() {
+    let fx = Fixture::new("disallowed");
+    let log = new_log();
+    let (l, pids) = fx.launcher(
+        signal_script(Reply::Ack(SignalAckCode::Delivered), Arc::clone(&log)),
+        probe(0),
+        ExecBudgets::default(),
+    );
+    let p = l.launch(&cid("run1"), &eid(), &ok_spec()).expect("launch");
+    for n in [19u8, 18, 28, 34, 64, 20] {
+        let e = p
+            .signal(Signal::new(n).expect("sig"))
+            .expect_err("rejected");
+        assert_eq!(e.code(), CriErrorCode::Unimplemented, "signal {n}");
+        assert_eq!(e.message(), "exec signal is not supported");
+    }
+    std::thread::sleep(Duration::from_millis(700));
+    assert!(log.lock().expect("lock").is_empty(), "no frame may be sent");
+    let helper = *pids.lock().expect("lock").first().expect("pid");
+    assert!(alive(helper));
+    assert_eq!(p.status(), Ok(ExecProcessStatus::Running));
+}
+
+/// 保持が長く、`signal_ack` だけ短い期限（ack の待ちが先に切れる構成）。
+fn short_with_long_session() -> ExecBudgets {
+    ExecBudgets {
+        started: WAIT,
+        session: Duration::from_secs(20),
+        result_grace: Duration::from_secs(5),
+        signal_ack: Duration::from_millis(500),
+        ..ExecBudgets::default()
     }
 }

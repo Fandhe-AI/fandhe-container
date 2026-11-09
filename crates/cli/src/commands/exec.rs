@@ -172,6 +172,7 @@ mod linux {
                 stdio: ExecStdio::NONE,
                 on_created: Some(ctx.on_created),
                 cancel: None,
+                signal: None,
             },
         )
         .map(|AuditedOutcome { outcome, .. }| outcome.exit)

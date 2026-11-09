@@ -143,6 +143,14 @@ impl ExecChild {
         self.child.pid()
     }
 
+    /// fork 直後（回収前）に開いた子の pidfd の借用（なければ `None`。[`ContainerChild::pidfd`] の委譲）。
+    ///
+    /// stream-exec の worker が、コマンドの pidfd を親（helper）へ `SCM_RIGHTS` で渡して SIGKILL 以外のシグナルの宛先にするために使う
+    /// （[`send_signal_via_pidfd`]。SUP-6・SEC-1・CRI-5・#4282）。pid が再利用されても元のプロセスを指し続ける。
+    pub fn pidfd(&self) -> Option<BorrowedFd<'_>> {
+        self.child.pidfd()
+    }
+
     /// 子の終了を `timeout` まで待ち、コマンドが起動したかどうかを添えて返す（REPAIR-5）。
     ///
     /// 期限を過ぎたら未回収に限り `SIGKILL` して回収し `Timeout`（[`ContainerChild::wait_timeout`] と同じ）。
@@ -178,6 +186,36 @@ impl ExecChild {
                 "the exec status could not be read; cannot tell whether the command started",
             )
         })
+    }
+}
+
+/// [`send_signal_via_pidfd`] の結果（#4282・SUP-6）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PidfdSignalDelivery {
+    /// シグナルを送れた（ゾンビへの送信もカーネルは成功にするため、「コマンドが生きていた」の証明ではない）。
+    Delivered,
+    /// pidfd の指すプロセスは既に回収済み（`ESRCH`）。再利用された別プロセスには届かない。
+    Gone,
+}
+
+/// `pidfd` の指すプロセス **1 つだけ** へシグナル `number`（1..=64）を送る（`pidfd_send_signal`。子孫・プロセスグループへは送らない）。
+///
+/// 呼び出し元は stream-exec の helper（SUP-6・CRI-5・#4282）。pid ではなく pidfd で送るので、回収後の pid の再利用で別のプロセスに
+/// 届くことはない（SEC-1・CORE-1）。送る番号の許可リストは呼び出し側が持つ（本関数は 1..=64 の範囲だけを受ける）。
+/// `ESRCH` は [`PidfdSignalDelivery::Gone`]、それ以外の失敗（pidfd でない fd・権限不足・未対応カーネル）は `Err`。
+pub fn send_signal_via_pidfd(
+    pidfd: BorrowedFd<'_>,
+    number: std::num::NonZeroU8,
+) -> Result<PidfdSignalDelivery, ExecError> {
+    match sys::pidfd_send_signal(pidfd, sys::Signal::Number(number)) {
+        Ok(()) => Ok(PidfdSignalDelivery::Delivered),
+        Err(sys::SysError::Os(e)) if e == sys::ESRCH => Ok(PidfdSignalDelivery::Gone),
+        Err(e) => Err(ExecError::from_sys(
+            e,
+            IsolationStage::Spawn,
+            "pidfd_send_signal",
+        )),
     }
 }
 
@@ -978,5 +1016,43 @@ mod tests {
             assert_eq!(e.stage, IsolationStage::Spawn);
             assert_eq!(take_calls(), vec!["prctl(PR_GET_DUMPABLE)", "fchdir(root)"]);
         }
+    }
+}
+
+#[cfg(test)]
+mod pidfd_signal_tests {
+    use std::num::NonZeroU8;
+    use std::os::unix::process::ExitStatusExt as _;
+
+    use super::*;
+
+    /// SUP-6・SEC-1・CRI-5・#4282: 自プロセスの子の pidfd へ SIGTERM を送ると届き（`Signaled(15)`）、回収後は `Gone`（pid の再利用先へは届かない）。
+    #[test]
+    fn sup6_4282_send_signal_via_pidfd_delivers_then_reports_gone() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pidfd = sys::pidfd_open(child.id()).expect("pidfd_open");
+        let term = NonZeroU8::new(15).expect("15");
+        assert_eq!(
+            send_signal_via_pidfd(pidfd.as_fd(), term).expect("send"),
+            PidfdSignalDelivery::Delivered
+        );
+        let status = child.wait().expect("wait");
+        assert_eq!(status.signal(), Some(15));
+        // 回収済み: 同じ pidfd への送信は ESRCH で `Gone`。
+        assert_eq!(
+            send_signal_via_pidfd(pidfd.as_fd(), term).expect("send after reap"),
+            PidfdSignalDelivery::Gone
+        );
+    }
+
+    /// SUP-6・SEC-1・#4282: pidfd でない fd への送信は `Err`（`Gone` や `Delivered` に偽装しない）。
+    #[test]
+    fn sup6_4282_send_signal_via_non_pidfd_is_an_error() {
+        let null = std::fs::File::open("/dev/null").expect("open");
+        let term = NonZeroU8::new(15).expect("15");
+        assert!(send_signal_via_pidfd(null.as_fd(), term).is_err());
     }
 }

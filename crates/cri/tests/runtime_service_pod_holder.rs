@@ -414,6 +414,40 @@ async fn cri2_dropped_run_then_late_holder_success_stays_notready() {
     assert_eq!(holder.count("release"), 1);
 }
 
+/// 記録ストアなしでも、保持役の起動中は並行する Stop・Remove が `FAILED_PRECONDITION` で拒否され、
+/// 起動の完了後は受理されること（予約時に `holder_pending` を立てる。CRI-2・REPAIR-5・#2871）。
+#[tokio::test]
+async fn cri2_stop_and_remove_are_rejected_while_holder_spawn_is_in_flight() {
+    let log = new_log();
+    let holder = FakeHolder::new(&log, Spawn::Hang);
+    let svc = Arc::new(service(&holder));
+    let run_svc = Arc::clone(&svc);
+    let task = tokio::spawn(async move { run(&run_svc).await });
+    let start = Instant::now();
+    let id = loop {
+        let items = list(&svc).await;
+        if let Some((id, _)) = items.first() {
+            break id.clone();
+        }
+        assert!(start.elapsed() < Duration::from_secs(2));
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    assert_eq!(
+        stop(&svc, &id).await.unwrap_err().code(),
+        Code::FailedPrecondition
+    );
+    assert_eq!(
+        remove(&svc, &id).await.unwrap_err().code(),
+        Code::FailedPrecondition
+    );
+    assert_eq!(holder.count("release"), 0);
+    holder.unblock.store(true, Ordering::SeqCst);
+    assert_eq!(task.await.unwrap().unwrap(), id);
+    assert_eq!(state_of(&svc, &id).await, READY);
+    stop(&svc, &id).await.unwrap();
+    assert_eq!(holder.count("release"), 1);
+}
+
 #[tokio::test]
 async fn cri2_stop_releases_once_and_is_idempotent() {
     let log = new_log();

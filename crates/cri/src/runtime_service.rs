@@ -1179,6 +1179,8 @@ impl PutRollback {
             && let Some(record) = registry.records.get_mut(&self.sandbox_id)
         {
             record.network_pending = false;
+            // 保持役は起動されていない（write-ahead の失敗）。予約時の印を外す（外さないと Stop・Remove が塞がる）。
+            record.holder_pending = false;
             record.state = SandboxState::NotReady;
         }
     }
@@ -2174,7 +2176,10 @@ impl CriRuntimeService {
                 network_teardown: false,
                 pod_netns: None,
                 pod_holder: None,
-                holder_pending: false,
+                // 保持役を注入しているときは予約と同じロック内で印を立てる（record store が無くても、
+                // spawn の前に並行する Stop・Remove が成功して Run が保持役を起動する窓を作らない。
+                // `spawn_pod_holder` の結果の受領、または失敗・手放しの後始末が解除する。#2871・CRI-2・REPAIR-5）。
+                holder_pending: self.pod_holder.is_some(),
                 holder_owned: false,
                 holder_release: false,
                 // ストアを注入しているときは、確定の書き込みが済むまで並行操作を拒否する。
@@ -2902,6 +2907,7 @@ impl CriRuntimeService {
             if let Some(record) = registry.records.get_mut(id) {
                 record.network_pending = false;
                 record.network_owned = false;
+                record.holder_pending = false;
                 record.state = SandboxState::NotReady;
             }
             if self.record_store.is_none() {

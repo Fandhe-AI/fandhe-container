@@ -42,10 +42,15 @@ struct HolderSpawnGuard {
     registry: Arc<Mutex<SandboxRegistry>>,
     id: String,
     ran: Arc<AtomicBool>,
+    /// worker が結果の確定まで正常に終えたら真（以後の `holder_pending` は呼び出し側の受領が解除する）。
+    settled: bool,
 }
 
 impl Drop for HolderSpawnGuard {
     fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
         if let Ok(mut registry) = self.registry.lock()
             && let Some(record) = registry.records.get_mut(&self.id)
             && record.holder_pending
@@ -76,15 +81,34 @@ impl Drop for HolderReleaseGuard {
     }
 }
 
-/// `spawn_pod_holder` の future が起動待ちの途中で破棄された（RPC の取り消し）とき、settlement を放棄する guard。
+/// `spawn_pod_holder` の future が起動待ちの途中で破棄されたとき、settlement を放棄する guard。
 /// 放棄しないと切り離された worker が後から成功して Ready を公開し、確定版の記録なしに CreateContainer が通る
 /// （CRI-2 の fail-closed 違反）。放棄後の成功は `pod_holder`・`holder_owned` だけ記録し NotReady に保つ。
-struct SettlementAbandonOnDrop(Arc<SetUpSettlement>);
+///
+/// worker が既に確定していた（結果の受領前に future が破棄された）場合は、worker が `holder_pending` を
+/// 保ったままのため、ここで解除して NotReady へ倒す（解除しないと Stop・Remove が永久に拒否される。
+/// 保持役は `holder_owned` で追跡済みなので Stop・Remove が解放できる）。受領後は `disarm` する。
+struct SettlementAbandonOnDrop {
+    settlement: Arc<SetUpSettlement>,
+    registry: Arc<Mutex<SandboxRegistry>>,
+    id: String,
+    armed: bool,
+}
 
 impl Drop for SettlementAbandonOnDrop {
     fn drop(&mut self) {
-        // 既に worker が確定していれば何もしない（戻り値は不要）。
-        let _ = self.0.abandon();
+        if !self.armed {
+            return;
+        }
+        // 放棄に勝てば worker が後で `holder_pending` を解除する。負けた（worker が確定済み）なら自分で解除する。
+        if !self.settlement.abandon()
+            && let Ok(mut registry) = self.registry.lock()
+            && let Some(record) = registry.records.get_mut(&self.id)
+            && record.holder_pending
+        {
+            record.holder_pending = false;
+            record.state = SandboxState::NotReady;
+        }
     }
 }
 
@@ -146,6 +170,7 @@ impl CriRuntimeService {
                 let record = registry.records.get_mut(id).ok_or_else(|| {
                     unavailable(CriError::internal("sandbox record is unavailable"))
                 })?;
+                // 予約時に立てた印を保つ（保持役の起動から結果の受領までの間、Stop・Remove を拒否する）。
                 record.holder_pending = true;
                 record.config.clone()
             };
@@ -154,45 +179,62 @@ impl CriRuntimeService {
             registry: Arc::clone(&self.registry),
             id: id.to_owned(),
             ran: Arc::clone(&ran),
+            settled: false,
         };
         let settlement = Arc::new(SetUpSettlement::new());
         let worker_settlement = Arc::clone(&settlement);
-        let _abandon_on_drop = SettlementAbandonOnDrop(Arc::clone(&settlement));
+        let mut abandon_on_drop = SettlementAbandonOnDrop {
+            settlement: Arc::clone(&settlement),
+            registry: Arc::clone(&self.registry),
+            id: id.to_owned(),
+            armed: true,
+        };
         let worker_provider = Arc::clone(provider);
         let worker_registry = Arc::clone(&self.registry);
         let worker_id = id.to_owned();
         let worker_ran = Arc::clone(&ran);
         let ready_timeout = self.runtime_timeout;
         let result = run_bounded(self.runtime_timeout + HOLDER_OUTER_SLACK, move || {
-            let _guard = guard;
+            let mut guard = guard;
             worker_ran.store(true, Ordering::SeqCst);
             let result =
                 worker_provider.spawn(&PodHolderRequest::new(&worker_id, &config, ready_timeout));
             if let Ok(mut registry) = worker_registry.lock()
                 && let Some(record) = registry.records.get_mut(&worker_id)
             {
-                record.holder_pending = false;
                 // 手放しとの競合の決着だけを取る。Ready は worker では公開しない（結果の受領前に呼び出し側が
                 // 破棄されても Ready が残らないよう、呼び出し側が受領と同じ同期区間で公開する）。
-                let _ = worker_settlement.settle_by_worker();
+                let settled = worker_settlement.settle_by_worker();
                 if let Ok(holder) = &result {
                     record.pod_holder = Some(*holder);
                     record.holder_owned = true;
                 }
+                // 成功を呼び出し側が受領できる（確定に勝った）間は `holder_pending` を保ち、受領と同じ同期区間で
+                // 呼び出し側が解除する（解除と Ready 公開の間に Stop が解放できる窓を作らない）。
+                // 失敗・手放し後の完了では worker が解除する（手放し後は NotReady のまま `holder_owned` で追跡）。
+                if result.is_err() || !settled {
+                    record.holder_pending = false;
+                    if !settled {
+                        record.state = SandboxState::NotReady;
+                    }
+                }
+                guard.settled = true;
             }
             result
         })
         .await
         .and_then(|r| r.map(|_| ()));
+        // 以降は await を挟まない（future の破棄で guard が走る窓を作らない）。
+        abandon_on_drop.armed = false;
         let Err(err) = result else {
-            // 結果を受領した。await を挟まずに Ready を公開する（取り消しの窓を作らない）。
-            if publish_ready
-                && let Ok(mut registry) = self.registry.lock()
+            // 結果を受領した。保持役の起動中の印を外し、同じ同期区間で Ready を公開する。
+            if let Ok(mut registry) = self.registry.lock()
                 && let Some(record) = registry.records.get_mut(id)
-                && record.pod_holder.is_some()
-                && record.holder_owned
             {
-                record.state = SandboxState::Ready;
+                record.holder_pending = false;
+                if publish_ready && record.pod_holder.is_some() && record.holder_owned {
+                    record.state = SandboxState::Ready;
+                }
             }
             return Ok(());
         };
@@ -206,8 +248,9 @@ impl CriRuntimeService {
             return Err(unavailable(err));
         };
         if !abandoned && record.pod_holder.is_some() && record.holder_owned {
-            // 通常の成功経路と同じく、ここでも Ready を公開する（worker は Ready を公開しないため、
+            // 通常の成功経路と同じく、ここでも印を外して Ready を公開する（worker は Ready を公開しないため、
             // 省くと network なしの RunPodSandbox が成功しても NotReady のまま残り CreateContainer が拒否される。CRI-2）。
+            record.holder_pending = false;
             if publish_ready {
                 record.state = SandboxState::Ready;
             }

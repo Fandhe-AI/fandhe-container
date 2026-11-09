@@ -28,7 +28,8 @@
 //!   旧い supervisor とは `Started` に至らず launch が失敗する（exec は始まらず、確認済みとも扱わない）。残余: 名前は helper の pid と
 //!   連番で、helper の回収後に別の helper が同じ名前を作りうる（probe は読むだけで kill しないため、起きるのは「まだある」と見える
 //!   安全側の誤りだけ）。コンテナ内から cgroupfs に書けない前提（`exec::cgroup_join` の doc と同じ）に依存する。
-//! - `pid()` は `None`（helper がコマンドの pid を返さない）。State の pid は 0 になる。
+//! - `pid()` は launch が `Spawned`（コマンドのホスト側 pid。#4316）を最長 `ExecBudgets::spawned` まで待つため通常は実 pid（#4318）。
+//!   届かない経路（`Spawned` 無しの `Result`・予算切れ）は `None` で、Start 応答・TaskExecStarted・State の pid は 0 になる。
 //! - 許可リスト外のシグナル・env・cwd・user の受け入れは後続（許可リストの SIGKILL 以外は helper の `Signal` frame で対応済み。#4282）。
 
 #[cfg(target_os = "linux")]

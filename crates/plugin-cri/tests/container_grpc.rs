@@ -83,6 +83,9 @@ use tonic::transport::Channel;
 
 const BIN: &str = env!("CARGO_BIN_EXE_fandhe-container-plugin-cri");
 const WATCHDOG: Duration = Duration::from_secs(60);
+/// `reclaim_restarting` を包む試験の期限。内部は回収 2 回（各 `CLEANUP_BUDGET`）と起動し直しを行うため、
+/// 回収 2 回分に起動し直しの余裕 60 秒を足す。ステップ・試験バイナリの期限（300 秒）より小さく、層の順序は崩さない（#4326・REPAIR-5）。
+const RESTART_WATCHDOG: Duration = Duration::from_secs(2 * reclaim::CLEANUP_BUDGET.as_secs() + 60);
 const STARTUP_DEADLINE: Duration = Duration::from_secs(10);
 const RPC_DEADLINE: Duration = Duration::from_secs(5);
 const REAP_GRACE: Duration = Duration::from_secs(5);
@@ -1000,7 +1003,7 @@ async fn container_lifecycle_crosses_the_uds_grpc_boundary() {
 /// 旧 plugin が生きたまま到達不能だと `.cri/@instance.lock` を握り続けるため、新 plugin の起動前に旧 guard を drop
 /// （kill と回収）して lock を解放してから spawn する。両試行の後始末で共通に使う。
 async fn reclaim_restarting_dead_plugin(
-    mut guard: ChildGuard,
+    guard: ChildGuard,
     mut c: RuntimeServiceClient<Channel>,
     ledger: &reclaim::Ledger,
     token: &str,
@@ -1012,15 +1015,28 @@ async fn reclaim_restarting_dead_plugin(
     RuntimeServiceClient<Channel>,
     reclaim::ReclaimReport,
 ) {
-    let mut rep = reclaim::reclaim(&mut c, ledger, token, reclaim::CLEANUP_BUDGET).await;
-    if guard.exited().is_some() || reclaim::plugin_unreachable(&rep) {
-        drop(guard);
-        guard = spawn_server_inherit_env(plugin_bin, new_sock);
-        let ch = connect_when_ready_with(new_sock, Some(&mut guard), config).await;
-        c = RuntimeServiceClient::new(ch);
-        rep = reclaim::reclaim(&mut c, ledger, token, reclaim::CLEANUP_BUDGET).await;
-    }
-    (guard, c, rep)
+    let slot = std::cell::RefCell::new(Some(guard));
+    // 判断と回収 2 回は共有部品（#4326）。起動し直すときだけ、旧 guard を drop（kill と回収）してから新しい guard を入れる。
+    let rr = reclaim::reclaim_restarting(
+        &mut c,
+        ledger,
+        token,
+        || {
+            slot.borrow_mut()
+                .as_mut()
+                .is_some_and(|g| g.exited().is_some())
+        },
+        async || {
+            drop(slot.borrow_mut().take());
+            let mut g = spawn_server_inherit_env(plugin_bin, new_sock);
+            let ch = connect_when_ready_with(new_sock, Some(&mut g), config).await;
+            *slot.borrow_mut() = Some(g);
+            RuntimeServiceClient::new(ch)
+        },
+    )
+    .await;
+    let guard = slot.into_inner().expect("plugin guard is always kept");
+    (guard, c, rr.into_final())
 }
 
 /// 環境を引き継いで `bin` の本番バイナリを spawn する（段 C 用。`XDG_RUNTIME_DIR`・`DBUS_SESSION_BUS_ADDRESS` 等を
@@ -1650,6 +1666,87 @@ async fn cri1_cri6_4285_owned_residue_is_readopted_and_reclaimed_after_plugin_si
     .await
     .expect("watchdog");
 }
+
+/// 段 D（CRI-1・CRI-6・REPAIR-12・#4326。root 不要・ネットワーク不要）: 外側の回収が使う [`reclaim::reclaim_restarting`] は、
+/// plugin が死んでいたら起動し直して回収し直す。実機前提試験（`cri_exec_real`・`cri_attach_real`）の外側の回収と同じ部品の、
+/// 既定の集合での唯一の証拠になる。
+///
+/// 照合: 死んだ接続への 1 回目は `plugin_unreachable`（起動し直しが要る）。起動し直した後の回収は sandbox 1 件・コンテナ 1 件を
+/// 回収して `is_clean()`、固定の 1 行が具体値と完全一致し、記録ファイルが消える。
+#[tokio::test]
+async fn cri1_cri6_4326_reclaim_restarting_respawns_dead_plugin_and_reclaims_token_records() {
+    const TEST_4326: &str = "cri1_cri6_4326";
+    tokio::time::timeout(RESTART_WATCHDOG, async {
+        let dir = TempDir::new("sock-4326");
+        let xdg = TempDir::new("xdg-4326");
+        let sock_a = dir.0.join("a.sock");
+        let sock_b = dir.0.join("b.sock");
+        let state_root = xdg.0.join("fandhe-container");
+        let token = reclaim::run_token();
+        let ledger = reclaim::Ledger::default();
+
+        let mut guard = spawn_server(&sock_a, &xdg.0);
+        let ch = connect_when_ready(&sock_a, Some(&mut guard)).await;
+        let mut c = RuntimeServiceClient::new(ch.clone());
+        let mut run = run_req("pod-4326");
+        {
+            let cfg = run.config.as_mut().expect("config");
+            if let Some(m) = cfg.metadata.as_mut() {
+                m.uid = reclaim::sandbox_uid("uid-4326", &token);
+            }
+            cfg.labels = reclaim::config_labels(RESTART_TEST, &token);
+        }
+        let sb = call_with_deadline(c.run_pod_sandbox(run), RPC_DEADLINE)
+            .await
+            .expect("run sandbox")
+            .into_inner()
+            .pod_sandbox_id;
+        reclaim::record_sandbox(&ledger, &sb);
+        let image_id = pull_fixture_image(&state_root.join(".cri/images"));
+        let mut creq = create_req(&sb, "c-4326", &image_id);
+        creq.config.as_mut().expect("config").labels = reclaim::config_labels(RESTART_TEST, &token);
+        let cid = call_with_deadline(c.create_container(creq), RPC_DEADLINE)
+            .await
+            .expect("create container")
+            .into_inner()
+            .container_id;
+        reclaim::record_container(&ledger, &cid);
+        let sb_rec = records_dir(&xdg.0, "sandboxes").join(format!("{sb}.rec"));
+        let c_rec = records_dir(&xdg.0, "containers").join(format!("{cid}.rec"));
+        assert!(sb_rec.is_file() && c_rec.is_file());
+        let _ = kill_and_collect_stderr(guard);
+
+        let mut new_guard: Option<ChildGuard> = None;
+        let rr = reclaim::reclaim_restarting(
+            &mut c,
+            &ledger,
+            &token,
+            || true,
+            async || {
+                let mut g = spawn_server(&sock_b, &xdg.0);
+                let ch = connect_when_ready(&sock_b, Some(&mut g)).await;
+                new_guard = Some(g);
+                RuntimeServiceClient::new(ch)
+            },
+        )
+        .await;
+        assert!(rr.restarted(), "{rr:?}");
+        assert!(reclaim::plugin_unreachable(&rr.first), "{rr:?}");
+        let fin = rr.final_report();
+        assert_eq!(fin.reclaimed_containers, vec![cid.clone()], "{rr:?}");
+        assert_eq!(fin.reclaimed_sandboxes, vec![sb.clone()], "{rr:?}");
+        assert!(fin.is_clean(), "{rr:?}");
+        assert_eq!(
+            reclaim::restart_reclaim_line(TEST_4326, &rr).as_deref(),
+            Some("cri1_cri6_4326: plugin restarted for reclaim reclaimed containers=1 sandboxes=1")
+        );
+        assert!(!sb_rec.exists() && !c_rec.exists());
+        assert!(new_guard.is_some());
+    })
+    .await
+    .expect("watchdog");
+}
+
 /// 段 D（CRI-2・REPAIR-5）: 記録の件数が上限を超えていたら、起動を止める（fail-closed。socket も作らない）。
 #[tokio::test]
 async fn cri2_record_limit_exceeded_stops_startup() {

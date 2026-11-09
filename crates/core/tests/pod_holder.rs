@@ -98,9 +98,22 @@ mod linux {
                 break s;
             }
             if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("pod_holder: child `{case}` exceeded the deadline (WATCHDOG EXPIRED)");
+                let kill_result = child.kill();
+                // kill 後も回収を無期限に待たない（D 状態の子で親が固まるのを防ぐ。REPAIR-5）。
+                let reap_deadline = Instant::now() + Duration::from_secs(10);
+                let reaped = loop {
+                    match child.try_wait() {
+                        Ok(Some(_)) => break true,
+                        Ok(None) if Instant::now() < reap_deadline => {
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                        _ => break false,
+                    }
+                };
+                panic!(
+                    "pod_holder: child `{case}` exceeded the deadline (WATCHDOG EXPIRED); \
+                     kill={kill_result:?} reaped={reaped}"
+                );
             }
             std::thread::sleep(Duration::from_millis(20));
         };

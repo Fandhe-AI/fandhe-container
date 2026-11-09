@@ -226,6 +226,8 @@ shim の serve の起動時に、scoped 状態ルートを `sweep_leftover_conta
 
 補足（#4286）: T5（#4220）のインスタンス照合の規則は `adapter::instance_matches` にまとめた（挙動は不変）。RuntimeService 側の Exec（ストリーミング）も同じ規則で、URL 発行時に記録した値を起動時に照合する（`cri-streaming-server.md`「Exec」）。
 
+補足（#4323・CRI-5・SEC-1）: `Start(exec_id)` の `purge_mismatched` は shim の読み取りで、起動役 `ShimExecLauncher::launch` の状態読み取りとは別なので、その間に外で作り直されると旧登録の argv が新インスタンスへ起動されうる（TOCTOU）。`TaskExecLauncher::launch` に登録時の `expected_instance` を渡し、起動役が pid を決めるのと同じ `StateRecord` で `instance_matches` により照合する（Running・pid の確認より前。不一致は helper を起動せず `FAILED_PRECONDITION`、文言は `MSG_EXEC_INSTANCE_CHANGED`）。拒否した回の応答は `FAILED_PRECONDITION` のままで（T5 の `NOT_FOUND` は登録簿から除いた結果の語彙）、登録は `Created` に戻り、次の Start で `purge_mismatched` が旧登録を除いて `NOT_FOUND` になる。残余: 識別子を報告しない実装・旧い記録（両側 `None`）は保護されない。起動役の読み取りから helper の読み取りまでの窓は、helper の pid 一致の確認が担う。照合拒否を区別して数える計装は無い（REPAIR-4）。
+
 shim v2 の `Exec`・`Start(exec_id)`・`exec_id` つきの `State` / `Kill` / `Wait` / `Delete` は、注入トレイト `TaskExecLauncher` / `TaskExecProcess`（`crates/cri/src/shim_v2/exec.rs`）と登録簿 `ExecRegistry` まで実装済みで、本番の起動役は #4148（本体）・#4149（配線）で入った。本節は本番の起動役の橋渡し方式を、後続の #4148（本体）・#4149（配線）・#4150（実機前提試験）が正として読めるよう記録する。本メモは main の設計判断の記録であり、オーナー承認は得ていない（1 時間の上限は #4116 の暫定値に従う）。
 
 ### 前提（事実）

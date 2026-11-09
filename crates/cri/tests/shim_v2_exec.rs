@@ -106,6 +106,7 @@ impl TaskExecLauncher for Launcher {
         c: &ContainerId,
         e: &ExecId,
         s: &ExecProcessSpec,
+        _expected_instance: Option<u64>,
     ) -> Result<Arc<dyn TaskExecProcess>, CriError> {
         self.calls
             .lock()

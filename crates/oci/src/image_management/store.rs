@@ -48,9 +48,13 @@
 //!   `usage` の読み取りと `pull` の staging・公開はパス起点のまま（根拠は同 doc の論点 3）。
 //!   Linux 5.6 未満など `openat2` が使えない環境では `open` が `Unimplemented` で拒否する。
 
-use std::fs::{self, File, TryLockError};
+#[cfg(any(unix, test))]
+use std::fs;
+use std::fs::{File, TryLockError};
 use std::ops::{Deref, DerefMut};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError as MutexTryLockError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -63,7 +67,9 @@ use super::gc_journal::{
 use super::inventory_persist::load_image_inventory;
 use super::root_handle::{RootHandle, map_root_io};
 use crate::error::{OciError, OciErrorCode};
-use crate::instrument::{NoopOciOpRecorder, OciOpKind, OciOpRecorder, record_oci_op};
+#[cfg(unix)]
+use crate::instrument::NoopOciOpRecorder;
+use crate::instrument::{OciOpKind, OciOpRecorder, record_oci_op};
 
 /// ストア root 直下の排他用ロックファイル名。
 pub const IMAGE_STORE_LOCK_FILE_NAME: &str = "@lock";
@@ -101,9 +107,17 @@ impl ImageStore {
     /// 既存の参照テーブル（永続化からの読み込み結果。#853 等）でストアを開く。
     ///
     /// 非 unix は [`Self::open`] と同じく、最初に設計上の恒久拒否を返す（root は見ない・何も作らない）。
+    #[cfg(not(unix))]
     pub fn with_table(root: &Path, table: ReferenceTable) -> Result<Self, OciError> {
         // 副作用（root の検査・ディレクトリ作成・`@lock` の open）より前に Windows ホストを拒否する。
-        ensure_supported_host()?;
+        // Windows 専用のストア実装は持たない（#4377。#4333 の恒久拒否で到達しなくなった実装を削除済み）。
+        let _ = (root, table);
+        Err(windows_host_rejected())
+    }
+
+    /// 既存の参照テーブルでストアを開く本体（unix）。上記の `with_table` の文書を参照（OCI-7・SEC-1）。
+    #[cfg(unix)]
+    pub fn with_table(root: &Path, table: ReferenceTable) -> Result<Self, OciError> {
         // 末尾の区切りがあると symlink_metadata が symlink を辿るため、components で正規化してから判定する。
         let root: PathBuf = root.components().collect();
         if root.as_os_str().is_empty() {
@@ -126,15 +140,10 @@ impl ImageStore {
                 "image store root is not a directory",
             ));
         }
-        #[cfg(unix)]
         let handle = {
             let (canonical, id) = verify_root_trust(root, &meta)?;
             RootHandle::open_checked(canonical, id)?
         };
-        // 非 unix は冒頭の `ensure_supported_host` が必ず拒否するためここへは到達しない。
-        // Windows 専用の `RootHandle` 実装を型検査し続けるために残す（削除は別の整理）。
-        #[cfg(not(unix))]
-        let handle = RootHandle::open_checked(root)?;
         Ok(Self {
             handle: Arc::new(handle),
             table: Mutex::new(table),
@@ -357,25 +366,20 @@ impl ImageStore {
 const WINDOWS_HOST_REJECTED_MESSAGE: &str =
     "image store is rejected on Windows hosts by design; it runs inside the Linux guest";
 
-/// `ImageStore::with_table` の最初に呼ぶ、実行ホストの対応可否の検査（OCI-7・SEC-1・OCI-5・#4333）。
+/// Windows ホストで `ImageStore` を開こうとしたときの設計上の拒否（OCI-7・SEC-1・OCI-5・#4333・#4377）。
 ///
 /// core・CLI・supervisor は WSL2 ゲスト内で動く構成（`docs/design/windows-execution-layout.md`・#1415）で、
 /// Windows ホストで oci のイメージストアを開く設計上の呼び出し元は無い。所有者 SID・DACL の検査も持たないため、
 /// 信頼検査なしにパス起点で動く状態を作らず、副作用の前に `FailedPrecondition` で恒久的に拒否する
 /// （#2428 の案 C。#4181 は not planned）。`Unimplemented` ではなく前提（Linux ゲスト内で動く）の
-/// 不成立を表す。core の `FileStateStore::open`（#4332）と流儀をそろえる。
-#[cfg(unix)]
-fn ensure_supported_host() -> Result<(), OciError> {
-    Ok(())
-}
-
-/// 非 unix（Windows ホスト）の本体。上記のとおり常に設計上の拒否を返す。
+/// 不成立を表す。core の `FileStateStore::open`（#4332）と流儀をそろえる。pull 側の非 unix の stub
+/// からも同じ値を返す。
 #[cfg(not(unix))]
-fn ensure_supported_host() -> Result<(), OciError> {
-    Err(OciError::new(
+pub(super) fn windows_host_rejected() -> OciError {
+    OciError::new(
         OciErrorCode::FailedPrecondition,
         WINDOWS_HOST_REJECTED_MESSAGE,
-    ))
+    )
 }
 
 fn lock_file_error() -> OciError {

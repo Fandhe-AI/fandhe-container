@@ -29,14 +29,15 @@
 //!   macOS は本番経路が `ImageStore::open` に届かず（cli の `non_linux_failure`）、`openat` 系の定数・FFI・
 //!   libc 照合を足す根拠が無い。
 //! - Windows: ホストでは `ImageStore::open` が設計上の恒久拒否（#2428 の案 C・#4333）のため、この実装には到達しない。
-//!   `cfg(not(unix))` の実装は型検査のために残してあり、削除は別の整理。
+//!   Windows 専用の実装は持たない（#4377 で削除）。`cfg(not(unix))` に残るのは、macOS と共有するパス起点の実装を
+//!   Windows ターゲットでも型検査・構築するための shim だけ（検査なしの単体テーブルの読み取り専用 API と試験が使う）。
 //! - Linux の他アーキテクチャ: `sys::at` の定数・番号を確かめていないため、パス起点へ縮退せず
 //!   `Unimplemented` で拒否する（`layer::anchored` と同じ fail-closed。#2701）。
 //!
 //! # 移していない操作（実装済みを装わない。REPAIR-3）
 //!
 //! `pull` / `pull_recovery` の staging・公開・回収は `staging` 子モジュールの `StagingDir` / `PullDir` と
-//! `BlobDir` 経由で fd 起点へ移した（#2694）。移していないのは Windows の `PullDir`（パス起点）だけだが、Windows ホストは `ImageStore::open` で恒久拒否のため到達しない（#4181 は not planned）。根拠と追跡 issue は
+//! `BlobDir` 経由で fd 起点へ移した（#2694）。Windows ホストは `ImageStore::open` で恒久拒否のため pull の経路に到達せず、Windows 専用の `PullDir` は持たない（#4181 は not planned・#4377）。根拠と追跡 issue は
 //! `docs/design/image-store-root-trust.md` の論点 3 を参照。
 //!
 //! - fetcher（`RegistryClient::fetch_blob`）の書き込み先も fd 起点である（#2765）。`PullSession::open_staged_blob`
@@ -172,10 +173,12 @@ impl RootHandle {
             use std::os::unix::fs::MetadataExt;
             std::fs::metadata(p).is_ok_and(|m| (m.dev(), m.ino()) == self.id)
         }
+        // 照合不能なときは一致としない（fail-closed）。呼び出し元はガードの中の pull だけで、Windows ホストは
+        // `ImageStore::open` が恒久拒否のため到達しない（#4333・#4377）。
         #[cfg(not(unix))]
         {
-            let norm: PathBuf = p.components().collect();
-            norm == self.path
+            let _ = p;
+            false
         }
     }
 
@@ -1129,14 +1132,10 @@ mod imp {
             fs::hard_link(src.0.join(from), self.0.join(to))
         }
 
-        /// blob 本体を fsync する。unix は読み取り専用で開いても fsync できる。Windows は書き込み権が要る。
+        /// blob 本体を fsync する。unix は読み取り専用で開いても fsync できる。
+        /// 呼び出し元は pull だけで、Windows ホストは到達しない（#4333・#4377）。
         pub(crate) fn sync_blob(&self, hex: &str) -> io::Result<()> {
-            let p = self.0.join(hex);
-            #[cfg(unix)]
-            let file = File::open(&p);
-            #[cfg(not(unix))]
-            let file = OpenOptions::new().write(true).open(&p);
-            file?.sync_all()
+            File::open(self.0.join(hex))?.sync_all()
         }
 
         /// pull ディレクトリの `from` を、この置き場の `to` へ移す（宛先があれば置き換える）。
@@ -1146,30 +1145,15 @@ mod imp {
 
         /// blob を symlink を辿らず読み取りで開く。無ければ `NotFound`、通常ファイルでなければ `InvalidInput`。
         pub(crate) fn open_nofollow(&self, hex: &str) -> io::Result<File> {
-            let p = self.0.join(hex);
-            #[cfg(unix)]
-            {
-                crate::layer::open_blob_nofollow(&p).map_err(|e| match e.code() {
-                    super::OciErrorCode::NotFound => {
-                        io::Error::new(io::ErrorKind::NotFound, "blob not found")
-                    }
-                    super::OciErrorCode::InvalidArgument
-                    | super::OciErrorCode::FailedPrecondition => {
-                        io::Error::new(io::ErrorKind::InvalidInput, "blob is not a plain file")
-                    }
-                    _ => io::Error::other("failed to open blob"),
-                })
-            }
-            #[cfg(not(unix))]
-            {
-                if !fs::symlink_metadata(&p)?.is_file() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "blob is not a plain file",
-                    ));
+            crate::layer::open_blob_nofollow(&self.0.join(hex)).map_err(|e| match e.code() {
+                super::OciErrorCode::NotFound => {
+                    io::Error::new(io::ErrorKind::NotFound, "blob not found")
                 }
-                File::open(&p)
-            }
+                super::OciErrorCode::InvalidArgument | super::OciErrorCode::FailedPrecondition => {
+                    io::Error::new(io::ErrorKind::InvalidInput, "blob is not a plain file")
+                }
+                _ => io::Error::other("failed to open blob"),
+            })
         }
 
         /// ディレクトリを fsync する（Windows は何もしない）。
@@ -1212,13 +1196,6 @@ impl RootHandle {
     #[cfg(unix)]
     pub(crate) fn open_checked(path: PathBuf, id: (u64, u64)) -> Result<Self, OciError> {
         Self::open_dir(path, Some(id))
-    }
-
-    /// 正規化済みのパスから開く（非 unix は dev / ino を持たない）。Windows ホストは `ImageStore::open` が先に恒久拒否するため
-    /// 到達しない（#4333）。型検査のために残す。
-    #[cfg(not(unix))]
-    pub(crate) fn open_checked(path: PathBuf) -> Result<Self, OciError> {
-        Self::open_dir(path, None)
     }
 
     /// `blobs/sha256` の検査（`usage::check_blob_dirs` と同じ判定。root の fd 起点）。

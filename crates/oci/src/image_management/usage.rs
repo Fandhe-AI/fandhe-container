@@ -191,6 +191,9 @@ pub(super) fn blob_dir(root: &Path) -> PathBuf {
 }
 
 /// 検証済み `Digest` の hex 部だけからパスを組み立てる。
+///
+/// 本番の呼び出し元は Windows 専用の公開経路と共に削除したため（#4377）、試験の補助としてだけ残す。
+#[cfg(test)]
 pub(super) fn blob_path(root: &Path, digest: &Digest) -> Result<PathBuf, OciError> {
     let hex = digest
         .as_str()

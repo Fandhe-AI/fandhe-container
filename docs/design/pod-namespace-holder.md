@@ -5,7 +5,7 @@
 ## 背景
 
 - cri は pod の ipc 共有を bundle へ変換できる（#2674）。パスは `PodNamespacePaths::for_holder_pid`（`/proc/<pid>/ns/{user,ipc}` だけ。#2776）でしか作れないが、供給元の保持役が無い。このため `CriRuntimeService::create_container_runtime` は `with_pod_namespaces` を渡さず、本番の pod のコンテナは常に新しい namespace で起動する
-- pod の netns は `PodNetworkProvider`（cri）と plugin-cri の `NetsetupPodNetwork`（bridge・veth。rootful 前提）まで実装済み（#2675・#2676）。ただし本番へは未注入で、core の `NamespaceJoin` は network の path を `Unimplemented` で拒否し、`PodSandboxStatus.network` は空のスタブ
+- pod の netns は `PodNetworkProvider`（cri）と plugin-cri の `NetsetupPodNetwork`（bridge・veth。rootful 前提）まで実装済み（#2675・#2676）。ただし本番へは未注入で、core の `NamespaceJoin` は network の path を `Unimplemented` で拒否し、`PodSandboxStatus.network` は provider の報告だけを返す経路が実装済み（#2873）だが、provider 未注入のため実際には空
 - plugin-cri の本番は rootless（uid 0 は `UNIMPLEMENTED`。#2442・#2241）。bridge・veth は作れず、rootless の netns は pasta 構成（NET-9。#1935・#341）の領域
 - 受け入れ方式の現状は [cri-config-acceptance.md](cri-config-acceptance.md) の順 12〜14
 

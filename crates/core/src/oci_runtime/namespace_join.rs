@@ -52,9 +52,10 @@
 //!
 //! # 未実装・残余（REPAIR-3）
 //!
-//! - 供給元（pod の保持役）は #2870（H1）・#2874（H2）、cri が bundle に path を出す側は #2878（H8）で、core の受け口
-//!   （本モジュール。H7・#2872）だけが先にある。cri が出せるパスは保持役の pid からの
-//!   `/proc/<pid>/ns/{user,ipc,net}` に限られる（#2776）。
+//! - 供給元のうち namespace の確立 API(`pod_holder::establish_pod_namespaces`。#2870)は実装済みだが、保持役のプロセス
+//!   (supervisor の `pod-holder` モード。#2874)は未実装で、cri は当面パスを出さない（本番では共有されない）。cri が出せるパスは
+//!   保持役の pid からの `/proc/<pid>/ns/{user,ipc}` だけに限られる（#2776）。保持役は #2675 の pod の
+//!   netns と共有する設計の後続 issue。
 //! - init（呼び出し側）の user namespace 所有の netns（rootful・ホストの netns）への join は受けない（`Unimplemented`。
 //!   #2241 の判断待ち）。
 //! - pid の共有（`shareProcessNamespace`）は未対応。コンテナの init が PID 1 であることを制限適用の証跡の前提に
@@ -485,6 +486,12 @@ fn identity(fd: BorrowedFd<'_>) -> Result<(u64, u64), PinRejection> {
     let file = std::fs::File::from(fd.try_clone_to_owned().map_err(|_| fail())?);
     let meta = file.metadata().map_err(|_| fail())?;
     Ok((meta.dev(), meta.ino()))
+}
+
+/// `identity` の `TraitError` 版。`pod_holder` が使う（監査の結果を持たない呼び出し側向け）。
+#[cfg(target_os = "linux")]
+pub(super) fn identity_plain(fd: BorrowedFd<'_>) -> Result<(u64, u64), TraitError> {
+    identity(fd).map_err(|r| r.error)
 }
 
 #[cfg(all(test, target_os = "linux"))]

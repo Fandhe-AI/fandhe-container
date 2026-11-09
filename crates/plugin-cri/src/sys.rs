@@ -234,6 +234,21 @@ pub fn poll_writable(
     poll_imp::poll_writable(fd, timeout_ms)
 }
 
+/// `open(2)` の `O_NONBLOCK`（CRI-6・REPAIR-5・#4287）。`/proc/self/fd/N` の開き直し（Linux のみ）で使う。
+/// 値は Linux の `include/uapi/asm-generic/fcntl.h`（x86_64・aarch64 とも 0o4000）。他の組は `None`
+/// （開き直さず従来の共有記述の経路を使う）。`libc` の機械照合は plugin-cri には未導入。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub const O_NONBLOCK: Option<i32> = Some(0o4000);
+/// 非対応の組では開き直さない。
+#[cfg(not(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
+pub const O_NONBLOCK: Option<i32> = None;
+
 #[cfg(any(
     target_os = "macos",
     all(

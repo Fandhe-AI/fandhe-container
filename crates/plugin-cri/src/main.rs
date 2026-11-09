@@ -386,15 +386,23 @@ fn serve(
     let result = rt.block_on(async {
         // 前回までに残ったコンテナログを 1 回だけ回収する（サーブの開始は待たせない。監査 relay は作成済みで、単一スレッド前提を壊さない。#2760）。
         drop(tokio::task::spawn_blocking(move || {
-            if let Some(report) = adapter::sweep_leftover_container_logs(
+            // コンテナログ → supervisor ログの順に、1 つの期限の枠を共有して走査する（#4342）。
+            let (containers, supervisors) = adapter::sweep_leftover_logs_at_startup(
                 &sweep_store,
                 &sweep_recorder,
                 adapter::STARTUP_LOG_SWEEP_BUDGET,
-            ) {
-                // 走査に何も無かった（空の状態ルート等）ときは出さない。起動の失敗時の stderr を静かに保つ。
-                if report != Default::default() {
-                    let _ = telemetry::stderr_sink().submit(adapter::sweep_summary_line(&report));
-                }
+            );
+            // 走査に何も無かった（空の状態ルート等）ときは出さない。起動の失敗時の stderr を静かに保つ。
+            if let Some(report) = containers
+                && report != Default::default()
+            {
+                let _ = telemetry::stderr_sink().submit(adapter::sweep_summary_line(&report));
+            }
+            if let Some(report) = supervisors
+                && report != Default::default()
+            {
+                let _ = telemetry::stderr_sink()
+                    .submit(adapter::supervisor_log_sweep_summary_line(&report));
             }
         }));
         // 操作の件数・レイテンシを定期的に構造化ログとして stderr へ出す（REPAIR-4）。

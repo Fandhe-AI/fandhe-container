@@ -4,18 +4,18 @@
 supervisor が `terminate` の既定（5 秒）を超えて sink を閉じなかったときで、delete 自体は成功のまま終わる
 （`docs/design/container-log-removal-wait.md`・#2698）。
 supervisor の構造化ログ（`<state_root>/@supervisor-logs/<encoded-id>.log`・`.log.<n>`・`.log.lock`）も同様に残り得る（#2892・#2964）。
-supervisor ログの扱いは末尾の「supervisor ログ」の節に分けて書く（#3034）。以降の「見分け方」「自動回収」「手動の手順」はコンテナログの記述である。
+supervisor ログの扱いは末尾の「supervisor ログ」の節に分けて書く（#3034）。以降の「見分け方」「自動回収」「手動の手順」はコンテナログの記述である。plugin-cri の自動回収（起動時の走査と `CreateContainer` の前の回収）は、supervisor ログも同じ規則で対象にする（#4342）。
 
 ## 見分け方
 
 - CLI の `delete` が stderr に `{"level":"warn","code":"FAILED_PRECONDITION"|"TIMEOUT",...,"message":"container log removal failed; leftover logs may remain"}` を出した。`FAILED_PRECONDITION` の行には `"reason":"sink_open_after_wait"` が付く（待ちを使い切っても古い supervisor が sink を閉じなかった。`TIMEOUT` など他の失敗には付かない）
 - plugin-cri の `{"event":"container_delete_cleanup","target":"container_log",...}` の行（同じく待ち切れなかった場合は `"reason":"sink_open_after_wait"`）、行に `"existence":"unverified"` があれば、`delete` の期限を使い切って段を試しておらず、ファイルがあるかは確かめていない（手動で確かめてから消す。#3260）、または op 名 `container_log_remove.<code>` の Failure が計上された（`container_log_remove.failed_precondition` が「待ち切れなかった」）
-- plugin-cri の起動時に `{"event":"container_log_sweep",...}` の 1 行が出る。`skipped_live`・`skipped_present`・`skipped_undecodable`・`failed` が 0 でなければ、その件数ぶんの残りが自動では消えていない
+- plugin-cri の起動時に `{"event":"container_log_sweep",...}` の 1 行が出る（supervisor ログの走査は別の `{"event":"supervisor_log_sweep",...}` の行で、件数は混ざらない。#4342）。`skipped_live`・`skipped_present`・`skipped_undecodable`・`failed` が 0 でなければ、その件数ぶんの残りが自動では消えていない
 - ID の符号化の規則: 大文字 `X` は `_x`、`_` は `__`、Windows の予約名には先頭に `_0` が付く
 
 ## 自動回収
 
-- CLI の `create`、plugin-cri の `CreateContainer` は、同じ ID の残りを core を呼ぶ前に消す（best effort。古い supervisor が生きていれば消さず、状態がある ID も消さない）
+- CLI の `create`、plugin-cri の `CreateContainer` は、同じ ID の残りを core を呼ぶ前に消す（best effort。古い supervisor が生きていれば消さず、状態がある ID も消さない）。CLI の `create` が消すのはコンテナログだけで、plugin-cri の `CreateContainer` は supervisor ログも消す（#4342）
 - plugin-cri は起動時に 1 回、`<state_root>/@container-logs` を走査し、状態の記録が無く、sink も生きていない ID のログを消す（#2760）。
   CRI は ID を使い回さないため、delete の待ちを超えて残ったログは plugin-cri を再起動すれば消える
 - shim v2 の serve は起動時に 1 回、scoped 状態ルート（`<base>-shim-state/...`）の `@container-logs` を同じ規則で走査する（期限つき・裏の thread。#4280）
@@ -26,7 +26,7 @@ supervisor ログの扱いは末尾の「supervisor ログ」の節に分けて�
 - 古い supervisor が生きていて sink のロックを持ち続けているログ（`skipped_live`）
 - 状態がある ID のログ（`skipped_present`）。この ID は消さない
 - ID に戻せない名前（`skipped_undecodable`。大文字入りなど、sink が作らない名前）
-- shim v2（`<base>-shim-state/...`）の状態ルートの残り。containerd が同じ ID で delete を呼び直したときは、記録の無い ID の残骸 3 種（supervisor ログ・コンテナログ・起動オプション文書）が自動で回収される（`docs/design/shim-v2-production-binary.md` の D7・#4279）。コンテナログは shim の serve の起動時の走査でも回収される（#4280）。呼び直しが無い場合の起動オプション文書と supervisor ログ、sink が生きていた場合、ロックつきの操作が一度も無い状態ルートの残りは手動で消す
+- shim v2（`<base>-shim-state/...`）の状態ルートの残り。containerd が同じ ID で delete を呼び直したときは、記録の無い ID の残骸 3 種（supervisor ログ・コンテナログ・起動オプション文書）が自動で回収される（`docs/design/shim-v2-production-binary.md` の D7・#4279）。コンテナログは shim の serve の起動時の走査でも回収される（#4280）。呼び直しが無い場合の起動オプション文書と supervisor ログ（shim の serve の起動時の走査は `@container-logs` だけ。supervisor ログの走査は #4343。同じ ID の Create の前の回収には supervisor ログが入っている）、sink が生きていた場合、ロックつきの操作が一度も無い状態ルートの残りは手動で消す
 - plugin-cri が動いている間に発生した残り（次の起動まで）と、plugin-cri と異なる `--root` の状態ルート
 
 ## 手動の手順
@@ -56,7 +56,12 @@ supervisor ログの扱いは末尾の「supervisor ログ」の節に分けて�
 
 ### supervisor ログの自動回収
 
-自動では回収されない。同じ ID の次の `start` で世代として回るだけで、`create` 前の回収と plugin-cri の起動時の走査（`container_log_sweep`）は `@container-logs` だけを対象にする。`container_log_sweep` の件数に supervisor ログは含まれない。CRI は ID を使い回さないため、plugin-cri の残りは次の手順で手動で消す。
+plugin-cri は次の 2 経路で回収する（#4342・#4296）。いずれも guard は「状態の記録が無い」かつ「sink の flock が外れている」で、生きている supervisor のログと状態がある ID のログには触れない。
+
+- 起動時の走査: plugin-cri は起動時に 1 回、コンテナログの走査の後に `<state_root>/@supervisor-logs` を走査する。期限（30 秒）はコンテナログの走査と共有し、supervisor ログは残りの時間を使う。要約は `{"event":"supervisor_log_sweep",...}` の 1 行で、件数だけを出す。消せた ID ごとに op 名 `supervisor_log_reclaim` の Success が計上される
+- `CreateContainer` の前の回収: 同じ ID の閉じた supervisor ログを core を呼ぶ前に、待たずに 1 回だけ（上限 5 秒）消す。失敗（sink が生きている等）は op 名 `supervisor_log_reclaim` の Failure で、create は続く。期限切れのときは core を呼ばず `TIMEOUT` で create を失敗させる
+
+自動では消えないものは手動のままとする: 生きている sink・状態がある ID・帰属できない名前、plugin-cri の稼働中に出た残り（次の起動まで）、plugin-cri と異なる `--root` の状態ルート、ロックつきの操作が一度も無い状態ルートの残り。CLI の `create` と shim の serve の起動時の走査（#4343）は supervisor ログを自動では回収しない。同じ ID の次の `start` では世代として回るだけである。手動の手順は次のとおり。
 
 ### supervisor ログの手動の手順
 

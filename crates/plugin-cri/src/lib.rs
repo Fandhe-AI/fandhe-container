@@ -20,6 +20,7 @@
 //! （#3754・CRI-6・REPAIR-5。結線済みは Attach〔Linux は kind 9 の tap と fd の完全版 backend `streaming::supervisor_attach`〔#4077。stdin・tty を受ける。#4078。実機の通しは `tests/cri_attach_real.rs`（#4079）〕、非 Linux は読み取り専用の回転ログの follow の `streaming::log_attach`〔#3763〕〕・PortForward の NODE の pod・Exec〔Linux のみ。supervisor の helper 経由の `streaming::exec_launcher`。tty と相対 `argv[0]` は断る。#3761〕で、POD の PortForward は `UNIMPLEMENTED`。REPAIR-3）。
 //! shim v2 バイナリ `containerd-shim-fandhe-container-v2`（`src/bin/containerd_shim_v2.rs`）も本 crate が持つ（#3684・CRI-5・CRI-7・TASK-62.6）。
 //! 本番の `ContainerRuntime` が本 crate にしか無く cri から本 crate への依存は禁止のため。登録簿の組み立ては [`shim`]。
+//! op-stats のスナップショットファイルを安全に開いて原子的に置き換える部品は [`snapshot_file`]（#4335・CRI-6・REPAIR-4・SEC-1。未結線で、W3〔#4337〕の sink が使う。REPAIR-3）。
 //! PLUG-1 区分は plugin（crate-naming.md）。
 
 pub mod adapter;
@@ -39,6 +40,7 @@ pub mod server;
 pub mod shim;
 #[cfg(unix)]
 pub mod shutdown;
+pub mod snapshot_file;
 pub mod startup;
 #[cfg(unix)]
 pub mod streaming;

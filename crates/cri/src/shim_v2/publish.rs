@@ -992,11 +992,10 @@ pub(crate) mod testkit {
     use std::time::{Duration, Instant};
 
     use super::{
-        EventPublisher, PublishFailure, TaskCreate, TaskDelete, TaskEvent, TaskExecAdded,
-        TaskExecStarted, TaskIo, TaskStart,
+        EventPublisher, PublishFailure, TaskCreate, TaskDelete, TaskEvent, TaskIo, TaskStart,
     };
     #[cfg(unix)]
-    use super::{PublishDrain, PublishLog};
+    use super::{PublishDrain, PublishLog, TaskExecAdded, TaskExecStarted};
     use crate::shim_v2::task_api::Timestamp;
 
     /// 捕捉用の出力先。
@@ -1105,6 +1104,7 @@ pub(crate) mod testkit {
     }
 
     /// exec の 2 種の見本（#4281）。
+    #[cfg(unix)]
     pub(crate) fn exec_events() -> [TaskEvent; 2] {
         [
             TaskEvent::ExecAdded(TaskExecAdded {

@@ -437,6 +437,7 @@ dependencies = [
  "fandhe-container-net",
  "fandhe-container-oci",
  "fandhe-container-plugin",
+ "fandhe-container-plugin-cri",
  "fandhe-container-supervisor",
  "tokio",
  "tonic",

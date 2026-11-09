@@ -141,21 +141,59 @@ fn insecure_socket_dir_exits_one_without_echoing_path() {
     assert_eq!(o.stdout, "");
 }
 
-/// CRI-6・REPAIR-3・#4336: 結線（#4340）までは `--op-stats-file` の指定で起動せず、値も出さない。
-#[cfg(unix)]
+/// CRI-6・SEC-1・REPAIR-4・#4340: 置き先のディレクトリが無い指定は、状態ルート・socket に触る前に固定文言で起動を断る。
+/// 環境は `env_clear()`（XDG なし）なので、状態ルートの解決より前に失敗していることも示す。値は出さない。
+#[cfg(target_os = "linux")]
 #[test]
-fn cri6_4336_op_stats_file_is_unimplemented_until_wired() {
+fn cri6_4340_op_stats_file_untrusted_dir_fails_before_state_root() {
     let o = run(&[
         "--socket",
-        "/nonexistent-4336/s.sock",
+        "/nonexistent-4340/s.sock",
         "--op-stats-file",
-        "/nonexistent-4336/secret-stats.jsonl",
+        "/nonexistent-4340/secret-stats.jsonl",
     ]);
     assert_eq!(o.code, Some(1));
     assert_eq!(
         o.stderr,
-        "error: UNIMPLEMENTED: --op-stats-file is not implemented yet\n"
+        "error: PERMISSION_DENIED: failed to open the op-stats snapshot file: untrusted_directory\n"
     );
+    assert_eq!(o.stdout, "");
+}
+
+/// CRI-6・#4340: Linux 以外では指定を `UNIMPLEMENTED` で拒否する（fail-closed）。PR では型検査のみで、実行は main の 3 OS 実行。
+#[cfg(all(unix, not(target_os = "linux")))]
+#[test]
+fn cri6_4340_op_stats_file_is_unimplemented_on_non_linux() {
+    let o = run(&[
+        "--socket",
+        "/nonexistent-4340/s.sock",
+        "--op-stats-file",
+        "/nonexistent-4340/secret-stats.jsonl",
+    ]);
+    assert_eq!(o.code, Some(1));
+    assert_eq!(
+        o.stderr,
+        "error: UNIMPLEMENTED: failed to open the op-stats snapshot file: unsupported\n"
+    );
+    assert_eq!(o.stdout, "");
+}
+
+/// CRI-6・#4340: socket と同じパスの指定は終了コード 2 の固定文言で、値をエコーしない。
+#[cfg(unix)]
+#[test]
+fn cri6_4340_op_stats_file_same_as_socket_exits_two() {
+    let o = run(&[
+        "--socket",
+        "/nonexistent-4340/same-secret",
+        "--op-stats-file",
+        "/nonexistent-4340/same-secret",
+    ]);
+    assert_eq!(o.code, Some(2));
+    assert_eq!(
+        o.stderr,
+        "error: INVALID_ARGUMENT: invalid --op-stats-file argument\n"
+    );
+    assert!(!o.stderr.contains("secret"));
     assert_eq!(o.stdout, "");
 }
 

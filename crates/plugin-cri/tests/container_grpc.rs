@@ -86,8 +86,8 @@ const WATCHDOG: Duration = Duration::from_secs(60);
 const STARTUP_DEADLINE: Duration = Duration::from_secs(10);
 const RPC_DEADLINE: Duration = Duration::from_secs(5);
 const REAP_GRACE: Duration = Duration::from_secs(5);
-/// 停止シグナルから終了までの期限（停止の全体の上限 13.7 秒 + 余裕。`shutdown::SHUTDOWN_TOTAL_BOUND`）。
-const STOP_DEADLINE: Duration = Duration::from_secs(15);
+/// 停止シグナルから終了までの期限（停止の全体の上限 14.7 秒 + 余裕。`shutdown::SHUTDOWN_TOTAL_BOUND`）。
+const STOP_DEADLINE: Duration = Duration::from_secs(17);
 /// 停止時にフェイクが返す終了コード（SIGTERM 相当。境界越しの反映確認用の具体値）。
 const STOP_EXIT_CODE: i32 = 143;
 

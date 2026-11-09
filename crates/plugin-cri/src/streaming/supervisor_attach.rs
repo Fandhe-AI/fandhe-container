@@ -23,7 +23,7 @@
 //! # 後始末（REPAIR-5）
 //! セッションの部品がすべて drop されると取り消しの旗が立ち、監視スレッドは 10 ms 刻みで抜ける。入力スレッドは socket の EOF
 //! （`poll_shutdown`・drop）か書き込みの失敗で抜ける。スレッドは detached でプロセスの停止を待たせない
-//! （`shutdown::SHUTDOWN_TOTAL_BOUND` は変わらない）。同時数は [`MAX_ATTACH_SESSIONS`] で、止まったスレッドも数える。
+//! （`shutdown::SHUTDOWN_TOTAL_BOUND` を延ばさない）。同時数は [`MAX_ATTACH_SESSIONS`] で、止まったスレッドも数える。
 //!
 //! # 未実装・簡易実装・残余（REPAIR-3）
 //! - 本番の attach は結線済み（#4078）: `production_stream_dispatcher` は `ProductionAttach::interactive` で `read_only` を付けず、

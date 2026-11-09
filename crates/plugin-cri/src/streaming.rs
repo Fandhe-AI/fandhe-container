@@ -34,7 +34,7 @@
 //! （RPC が残って gRPC の猶予を使い切る間も期限どおり動く）。[`StreamingStop::finish`] はその結果を受け取る。基準はシグナルの受信時刻 T の絶対時刻で、(1) T..T+[`STREAMING_DRAIN_WAIT`] は
 //! セッションが自分で終わるのを待つ（全部閉じたら早く抜ける）、(2) 期限で `on_stop`（exec の追跡中 helper の kill と
 //! 以後の launch の拒否）を呼び、(3) [`STREAMING_CLOSE_WAIT`] まで exec が閉じるのを待ち、(4) 残りを abort する。
-//! (1)+(3) は `PLUGIN_SHUTDOWN_GRACE` 以内に収め、`shutdown::SHUTDOWN_TOTAL_BOUND` は変えない（試験で固定）。
+//! (1)+(3) は `PLUGIN_SHUTDOWN_GRACE` 以内に収め、`shutdown::SHUTDOWN_TOTAL_BOUND` を延ばさない（値は試験で固定。#4340 で op-stats の最後の書き出しが別に足された）。
 //! 期限を過ぎて残った件数は [`StreamingStopReport::line`] の構造化ログ 1 行に出す。
 //! PortForward の実行中の blocking の dial（最長 `dial_timeout` 10 秒）は abort できず、プロセス終了時の
 //! `rt.shutdown_timeout` が打ち切る（待ちは増えない）。
@@ -1073,7 +1073,7 @@ mod tests {
         );
     }
 
-    /// REPAIR-5・#4164: ドレインと閉鎖の待ちの合計は gRPC の猶予以内で、停止の全体の上限（13.7 秒）は変わらない。
+    /// REPAIR-5・#4164: ドレインと閉鎖の待ちの合計は gRPC の猶予以内で、streaming は停止の上限を延ばさない（全体の上限は #4340 で op-stats の最後の書き出し 1 秒が別に足されて 14.7 秒）。
     #[test]
     fn repair5_4164_stop_waits_fit_within_grpc_grace_and_total_bound() {
         assert_eq!(STREAMING_DRAIN_WAIT, Duration::from_secs(5));
@@ -1083,7 +1083,7 @@ mod tests {
         );
         assert_eq!(
             crate::shutdown::SHUTDOWN_TOTAL_BOUND,
-            Duration::from_millis(13_700)
+            Duration::from_millis(14_700)
         );
     }
 

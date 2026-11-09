@@ -10,7 +10,7 @@
 //! `StreamingConfig::validate()` に通してから受ける。TLS も認証も無く、URL のトークンが唯一の認可なので、前段の守りが前提になる。
 //! 操作統計のスナップショットファイルは `--op-stats-file <PATH>`（`=` 形も可）で opt-in する（既定は無効で stderr のみ。#4336・CRI-6・REPAIR-4）。
 //! ここでは構文（絶対パス・`..`・NUL なし・ファイル名あり）だけを検査し、置き先の実在・所有者・権限は
-//! スナップショット書き出し側（#4335 の `snapshot_file`・結線は #4340）に任せる。環境変数での指定は作らない（設計は `docs/design/cri-op-stats-export.md`）。
+//! スナップショット書き出し側（#4335 の `snapshot_file`・起動時の検査は #4340 の `telemetry::open_op_stats_target`）に任せる。環境変数での指定は作らない（設計は `docs/design/cri-op-stats-export.md`）。
 //! 既定の socket パスの解決は未定義（spec に定めが無い。#459 と #1869 の設計〔承認と実装 issue の起票は #2232〕で決める）ため、引数なしは成功を装わず失敗させる（REPAIR-3）。
 
 use std::ffi::OsString;
@@ -31,8 +31,6 @@ pub const MSG_INVALID_SOCKET: &str = "invalid --socket argument";
 pub const MSG_INVALID_STREAMING: &str = "invalid --streaming-* argument";
 /// `--op-stats-file` の値の欠落・重複・不正なパスに対する固定文言（値は含めない。#4336）。
 pub const MSG_INVALID_OP_STATS_FILE: &str = "invalid --op-stats-file argument";
-/// `--op-stats-file` の結線（#4340）が済むまでの fail-closed 用の固定文言（指定を黙って捨てない。REPAIR-3）。
-pub const MSG_OP_STATS_FILE_NOT_WIRED: &str = "--op-stats-file is not implemented yet";
 /// 既定の socket パスが未定義であることを伝える固定文言（成功終了で実装済みを装わない。REPAIR-3）。
 pub const MSG_SOCKET_DEFAULT_UNDEFINED: &str =
     "default socket path is not defined yet; pass --socket <PATH>";
@@ -294,6 +292,10 @@ pub fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<Invocatio
         return Err(invalid(MSG_INVALID_STREAMING));
     }
     if op_stats_error {
+        return Err(invalid(MSG_INVALID_OP_STATS_FILE));
+    }
+    // socket と同じパスをスナップショットの置き先にすると、socket の inode を壊す・壊されるため字句の一致で断る（#4340）。
+    if socket.is_some() && socket == op_stats_file {
         return Err(invalid(MSG_INVALID_OP_STATS_FILE));
     }
     Ok(match (help, socket) {
@@ -730,6 +732,14 @@ mod tests {
             ),
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    /// CRI-6・REPAIR-4・#4340: socket と同じパスの指定は拒否し、別名なら受理する。
+    #[test]
+    fn cri6_4340_op_stats_file_equal_to_socket_is_rejected() {
+        assert!(op_err(&["--socket", SOCK, "--op-stats-file", SOCK]));
+        assert!(op_err(&[SOCK_EQ, "--op-stats-file", SOCK]));
+        assert!(p(&["--socket", SOCK, "--op-stats-file", OPSTATS]).is_ok());
     }
 
     /// CRI-6・REPAIR-4・#4336: 不正な指定は固定文言で、値を含めない。

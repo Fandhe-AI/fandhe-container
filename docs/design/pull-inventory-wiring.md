@@ -21,7 +21,7 @@ PR #2520（#2380）で manifest の在庫・タグ・pull リースを `@image-i
 3. config を読み、layer を `staging/<id>/unpack/entry/rootfs` へ展開（diff_id 突合）。ステージングの blob は
    `open_verified_staged_blob` で pull ディレクトリ fd 起点に開いたハンドルから読む（#2893）。リース済みの既存 blob は
    `open_leased_blob` で検査済み root の fd 起点に開く（#4179）。`unpack/` の作成・展開・記録・公開元・後始末も pull ディレクトリの fd 起点〔#4180〕）
-4. rootfs のエントリを `rootfs/sha256/<config-hex>` へ rename（記録と一緒に原子的）
+4. rootfs のエントリを `rootfs/sha256/<config-hex>` へ rename（記録と一緒に原子的。宛先は検査済み root の fd 起点で開いた `PublishedRootfsDir`、公開の直前にパスとの同一性を照合する。#4283）
 5. `publish`（blob の公開・manifest とタグの登録・リース解放を排他の下で 1 回の保存）
 
 - 4 を 5 の前にする理由: rootfs は config digest をキーにした冪等なキャッシュで GC に未接続のため、5 が失敗して rootfs だけが
@@ -61,7 +61,7 @@ PR #2520（#2380）で manifest の在庫・タグ・pull リースを `@image-i
 - `InMemoryImageStore` の置き換え（TASK-183）。plugin-cri の ImageService と本番の `PullConfig` は #2592 で配線済み
 - #2377（本番の `ImageRootfsUnpacker`）には、在庫に layer の mediaType・`diff_ids` が要る。`@image-inventory.json` のスキーマは広げていない
 - 展開済み `rootfs/sha256/<hex>` の GC と `image rm` / `prune` への接続（#2315・#471）
-- Windows のパス起点（#4181）、公開先 `rootfs/sha256` の fd 起点化（`unpack/` は #4180 で移した）。検証後のステージング blob の読み取りは #2893、リース済み blob の読み取りは #4179 で移した
+- Windows のパス起点（#4181）。公開先 `rootfs/sha256`・create 経路の読み取りは #4283、`unpack/` は #4180、検証後のステージング blob の読み取りは #2893、リース済み blob の読み取りは #4179 で fd 起点に移した
 
 ## 起動時の pull 回収 GC の配線（#2819・OCI-7・OCI-1・REPAIR-3・REPAIR-4・REPAIR-5）
 

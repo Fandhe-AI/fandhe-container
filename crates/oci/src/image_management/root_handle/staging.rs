@@ -54,6 +54,7 @@ mod imp {
     use std::os::unix::fs::MetadataExt as _;
     use std::path::Path;
 
+    use super::super::SubDir;
     use super::super::imp::RESOLVE;
     use crate::error::{OciError, OciErrorCode};
     use crate::image_management::PullId;
@@ -364,28 +365,18 @@ mod imp {
             at::unlinkat_name(self.0.as_fd(), OsStr::new(name), false)
         }
 
-        /// 直下の `name` を `dest_dir` 直下の `dest_name` へ移す（公開）。`dest_dir` は `O_NOFOLLOW` で開き、
-        /// 宛先が空でない既存ディレクトリなら失敗する。
+        /// 直下の `name` を、開いた `dest` 直下の `dest_name` へ移す（公開。#4283）。`dest` は呼び出し側が
+        /// 検査済み root の fd 起点で開いたもので、パスで開き直さない。宛先が空でない既存ディレクトリなら失敗する。
         pub(crate) fn rename_child_into(
             &self,
             name: &str,
-            dest_dir: &Path,
+            dest: &SubDir,
             dest_name: &str,
         ) -> io::Result<()> {
-            use std::os::unix::ffi::OsStrExt as _;
-            let c = std::ffi::CString::new(dest_dir.as_os_str().as_bytes())
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid path"))?;
-            let dest = at::openat2(
-                None,
-                &c,
-                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC,
-                0,
-                0,
-            )?;
             at::renameat_names(
                 self.0.as_fd(),
                 OsStr::new(name),
-                dest.as_fd(),
+                dest.as_dir_fd(),
                 OsStr::new(dest_name),
             )
         }
@@ -411,7 +402,7 @@ mod imp {
 
     use crate::error::{OciError, OciErrorCode};
     use crate::image_management::PullId;
-    use crate::image_management::root_handle::RootHandle;
+    use crate::image_management::root_handle::{RootHandle, SubDir};
 
     const STAGING: &str = "staging";
 
@@ -674,14 +665,14 @@ mod imp {
             fs::remove_file(self.0.join(name))
         }
 
-        /// 直下の `name` を `dest_dir` 直下の `dest_name` へ移す（公開）。
+        /// 直下の `name` を、開いた `dest` 直下の `dest_name` へ移す（公開。パス起点。#4283）。
         pub(crate) fn rename_child_into(
             &self,
             name: &str,
-            dest_dir: &Path,
+            dest: &SubDir,
             dest_name: &str,
         ) -> io::Result<()> {
-            fs::rename(self.0.join(name), dest_dir.join(dest_name))
+            fs::rename(self.0.join(name), dest.dir_path().join(dest_name))
         }
 
         /// 展開器へ渡す根（パス）。

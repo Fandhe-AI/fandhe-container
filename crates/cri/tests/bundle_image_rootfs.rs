@@ -1113,3 +1113,94 @@ fn sec1_run_as_username_with_symlinked_etc_is_rejected() {
     assert_eq!(e.code(), CriErrorCode::FailedPrecondition);
     assert_eq!(bundle_count(&env), 0);
 }
+
+/// 最初の `ExtractLayer` の記録を見たら `on_extract` を呼ぶ記録先（展開の途中に差し替えを差し込む。#4283）。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+struct SwapAfterFirstLayer {
+    on_extract: Box<dyn Fn() + Send + Sync>,
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+impl std::fmt::Debug for SwapAfterFirstLayer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SwapAfterFirstLayer")
+    }
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+impl OciOpRecorder for SwapAfterFirstLayer {
+    fn record_oci_op(&self, sample: &OciOpSample) {
+        if sample.kind() == OciOpKind::ExtractLayer && sample.outcome() == OciOpOutcome::Success {
+            (self.on_extract)();
+        }
+    }
+}
+
+/// OCI-7・SEC-1・CRI-3・#4283: create の展開の途中で、rootfs の親（bundle）が別名へ移されておとりへの symlink に
+/// 差し替わっても、展開・chmod・`proc` の作成は作った実体にだけ届き、おとり側の `rootfs/`（0700・空）は無傷で、
+/// 最後の照合が `FAILED_PRECONDITION` で拒否する。パス起点の `remove_extracted_tree` でおとりを消さない。
+/// 旧実装（パスで開き直す chmod・`proc`）は、おとりの `rootfs` を 0755 にして `proc` を作っていた。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[test]
+fn oci7_sec1_create_rootfs_swapped_parent_is_not_written() {
+    use fandhe_container_cri::bundle::{RootfsSource, UserResolveRequest};
+    let env = pulled_env("swapparent", CONFIG_SECTION);
+    let parent = env.tmp.0.join("b");
+    fs::create_dir(&parent).expect("parent");
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+    let real = env.tmp.0.join("b-real");
+    let decoy = env.tmp.0.join("decoy");
+    fs::create_dir_all(decoy.join("rootfs")).expect("decoy");
+    fs::set_permissions(decoy.join("rootfs"), fs::Permissions::from_mode(0o700)).unwrap();
+    let (p2, r2, d2) = (parent.clone(), real.clone(), decoy.clone());
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let done2 = Arc::clone(&done);
+    let rec = Arc::new(SwapAfterFirstLayer {
+        on_extract: Box::new(move || {
+            if !done2.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                fs::rename(&p2, &r2).expect("move parent");
+                std::os::unix::fs::symlink(&d2, &p2).expect("symlink");
+            }
+        }),
+    });
+    let source = ImageRootfsSource::new(env.extract_config()).with_recorder(rec);
+    let spec = ImageSpec {
+        image: env.image_id.clone(),
+        ..Default::default()
+    };
+    let err = source
+        .prepare(&spec, &parent.join("rootfs"), &UserResolveRequest::none())
+        .expect_err("rejected");
+    assert!(done.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(err.code(), CriErrorCode::FailedPrecondition);
+    assert_eq!(
+        err.message(),
+        "image rootfs path changed during preparation"
+    );
+    // おとりは無傷（空・0700）。
+    assert_eq!(fs::read_dir(decoy.join("rootfs")).unwrap().count(), 0);
+    assert_eq!(
+        fs::metadata(decoy.join("rootfs")).unwrap().mode() & 0o777,
+        0o700
+    );
+    // 作った実体（移動先）に展開物があり、検索権限（0755）と `proc`（0555）が届いている。
+    let real_rootfs = real.join("rootfs");
+    assert_eq!(fs::metadata(&real_rootfs).unwrap().mode() & 0o777, 0o755);
+    assert_eq!(
+        fs::metadata(real_rootfs.join("proc")).unwrap().mode() & 0o777,
+        0o555
+    );
+    assert!(real_rootfs.join("etc").exists());
+}

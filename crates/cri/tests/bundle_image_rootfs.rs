@@ -1155,11 +1155,12 @@ impl OciOpRecorder for SwapAfterFirstLayer {
 ))]
 #[test]
 fn oci7_sec1_create_rootfs_swapped_parent_is_not_written() {
-    use fandhe_container_cri::bundle::{RootfsSource, UserResolveRequest};
+    use fandhe_container_cri::bundle::{BundleDir, RootfsSource, UserResolveRequest};
     let env = pulled_env("swapparent", CONFIG_SECTION);
     let parent = env.tmp.0.join("b");
     fs::create_dir(&parent).expect("parent");
     fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+    let bundle = BundleDir::open(&parent).expect("open bundle");
     let real = env.tmp.0.join("b-real");
     let decoy = env.tmp.0.join("decoy");
     fs::create_dir_all(decoy.join("rootfs")).expect("decoy");
@@ -1181,7 +1182,7 @@ fn oci7_sec1_create_rootfs_swapped_parent_is_not_written() {
         ..Default::default()
     };
     let err = source
-        .prepare(&spec, &parent.join("rootfs"), &UserResolveRequest::none())
+        .prepare(&spec, &bundle, &UserResolveRequest::none())
         .expect_err("rejected");
     assert!(done.load(std::sync::atomic::Ordering::SeqCst));
     assert_eq!(err.code(), CriErrorCode::FailedPrecondition);
@@ -1203,4 +1204,50 @@ fn oci7_sec1_create_rootfs_swapped_parent_is_not_written() {
         0o555
     );
     assert!(real_rootfs.join("etc").exists());
+}
+
+/// OCI-7・SEC-1・#4321: 本番の `ImageRootfsSource::release` は bundle を fd で受けて消すため、確認の後に bundle のパスが
+/// おとりへの symlink に差し替わっても、おとり側の `rootfs/` の木は消えず、fd が指す元の実体の `rootfs/` だけが消える。
+/// 旧実装（`rootfs` のパスから `remove_extracted_tree_bounded` が親を開く）は、おとりの `rootfs/keep` を消していた。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[test]
+fn oci7_sec1_4321_release_with_swapped_bundle_does_not_remove_the_decoy_tree() {
+    use fandhe_container_cri::bundle::{BundleDir, RootfsSource, UserResolveRequest};
+    let env = pulled_env("swaprelease", CONFIG_SECTION);
+    let parent = env.tmp.0.join("b");
+    fs::create_dir(&parent).expect("parent");
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+    let bundle = BundleDir::open(&parent).expect("open bundle");
+    let source = ImageRootfsSource::new(env.extract_config());
+    let spec = ImageSpec {
+        image: env.image_id.clone(),
+        ..Default::default()
+    };
+    source
+        .prepare(&spec, &bundle, &UserResolveRequest::none())
+        .expect("prepare");
+    assert!(parent.join("rootfs").join("etc").exists());
+    // おとり: rootfs/keep を持つ別ディレクトリ。
+    let decoy = env.tmp.0.join("decoy");
+    fs::create_dir_all(decoy.join("rootfs")).expect("decoy");
+    fs::write(decoy.join("rootfs").join("keep"), b"keep").expect("keep");
+    // release の前に bundle のパスを別名へ移し、元のパスにおとりへの symlink を置く。
+    let moved = env.tmp.0.join("b-moved");
+    fs::rename(&parent, &moved).expect("move");
+    std::os::unix::fs::symlink(&decoy, &parent).expect("symlink");
+    source.release(&bundle).expect("release via fd");
+    assert_eq!(
+        fs::read(decoy.join("rootfs").join("keep")).unwrap(),
+        b"keep".to_vec()
+    );
+    assert!(!moved.join("rootfs").exists(), "own rootfs is removed");
+    assert!(
+        fs::symlink_metadata(&parent)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
 }

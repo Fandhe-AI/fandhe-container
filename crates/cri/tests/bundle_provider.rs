@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use fandhe_container_core::oci_runtime;
 use fandhe_container_cri::adapter::{BundleProvider, BundleRequest};
 use fandhe_container_cri::bundle::{
-    ImageDefaults, RootfsSource, SpecBundleProvider, UserResolveRequest,
+    BundleDir, ImageDefaults, RootfsSource, SpecBundleProvider, UserResolveRequest,
 };
 use fandhe_container_cri::error::{CriError, CriErrorCode};
 use fandhe_container_cri::runtime::v1::{
@@ -61,19 +61,36 @@ struct FakeRootfs {
     resolve_username: Mutex<Option<(u32, u32)>>,
     /// 受け取った解決要求の (run_as_user, image_groups)（#2667）。
     seen_groups_request: Mutex<Option<(Option<u32>, bool)>>,
+    /// 設定されていれば、`prepare` が rootfs を作った直後に bundle のパスをこの「おとり」へ差し替える
+    /// （bundle を別名へ移し、元のパスにおとりへの symlink を置く。OCI-7・SEC-1・#4321）。
+    swap_in_prepare: Mutex<Option<PathBuf>>,
+    /// 設定されていれば、`release` が rootfs を消す直前に同じ差し替えを行う。
+    swap_in_release: Mutex<Option<PathBuf>>,
+}
+
+/// bundle のパスを `<path>-moved` へ移し、元のパスに `decoy` への symlink を置く（確認の後の差し替えの再現）。
+fn swap_bundle_path(bundle: &BundleDir, decoy: &Path) {
+    let moved = PathBuf::from(format!("{}-moved", bundle.path().display()));
+    fs::rename(bundle.path(), &moved).expect("move bundle");
+    std::os::unix::fs::symlink(decoy, bundle.path()).expect("plant symlink");
 }
 
 impl RootfsSource for FakeRootfs {
     fn prepare(
         &self,
         _image: &ImageSpec,
-        rootfs: &Path,
+        bundle: &BundleDir,
         user: &UserResolveRequest<'_>,
     ) -> Result<ImageDefaults, CriError> {
         self.prepares.fetch_add(1, Ordering::SeqCst);
         *self.seen_username.lock().unwrap() = user.run_as_username.map(str::to_owned);
         *self.seen_groups_request.lock().unwrap() = Some((user.run_as_user, user.image_groups));
-        fs::create_dir(rootfs).map_err(|_| CriError::internal("rootfs"))?;
+        bundle
+            .create_rootfs_dir()
+            .map_err(|_| CriError::internal("rootfs"))?;
+        if let Some(decoy) = self.swap_in_prepare.lock().unwrap().as_ref() {
+            swap_bundle_path(bundle, decoy);
+        }
         if *self.fail_prepare.lock().unwrap() {
             return Err(CriError::resource_exhausted("no space"));
         }
@@ -83,13 +100,14 @@ impl RootfsSource for FakeRootfs {
         }
         Ok(d)
     }
-    fn release(&self, rootfs: &Path) -> Result<(), CriError> {
+    fn release(&self, bundle: &BundleDir) -> Result<(), CriError> {
         self.releases.fetch_add(1, Ordering::SeqCst);
-        match fs::remove_dir_all(rootfs) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(_) => Err(CriError::internal("rootfs release")),
+        if let Some(decoy) = self.swap_in_release.lock().unwrap().as_ref() {
+            swap_bundle_path(bundle, decoy);
         }
+        bundle
+            .remove_rootfs_tree()
+            .map_err(|_| CriError::internal("rootfs release"))
     }
 }
 
@@ -451,12 +469,12 @@ fn rootfs_release_failure_during_rollback_keeps_the_bundle() {
         fn prepare(
             &self,
             i: &ImageSpec,
-            r: &Path,
+            r: &BundleDir,
             u: &UserResolveRequest<'_>,
         ) -> Result<ImageDefaults, CriError> {
             self.0.prepare(i, r, u)
         }
-        fn release(&self, _r: &Path) -> Result<(), CriError> {
+        fn release(&self, _r: &BundleDir) -> Result<(), CriError> {
             Err(CriError::internal("rootfs release"))
         }
     }
@@ -639,4 +657,160 @@ fn release_removes_the_resolv_conf_with_the_bundle() {
     let dir = prepare_dns(&p, "ctr1").expect("prepare");
     p.release("ctr1").expect("release");
     assert!(!dir.exists());
+}
+// ---- OCI-7・SEC-1・#4321: bundle の親の作成・巻き戻し・release は検査済み fd 起点（差し替えてもおとりの木を消さない）----
+
+/// おとり `decoy/{keep,rootfs/keep}` を `root` 直下に用意して返す。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn make_decoy(root: &Path) -> PathBuf {
+    let decoy = root.join("decoy");
+    fs::create_dir_all(decoy.join("rootfs")).expect("decoy");
+    fs::write(decoy.join("keep"), b"keep").expect("keep");
+    fs::write(decoy.join("rootfs").join("keep"), b"keep").expect("rootfs keep");
+    decoy
+}
+
+/// release の途中（確認の後・削除の前）で `<root>/<id>` がおとりへの symlink に差し替わったら、`FAILED_PRECONDITION` で
+/// 名前に触れず、おとりの `keep`・`rootfs/keep` は無傷。旧実装（パス起点の `remove_dir_all`）はおとりの木を消していた。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[test]
+fn oci7_sec1_4321_release_with_swapped_bundle_path_keeps_the_decoy_tree() {
+    let (tmp, rootfs, p) = setup("swap-release");
+    prepare(&p, "ctr1", &container()).expect("prepare");
+    let decoy = make_decoy(&tmp.0);
+    *rootfs.swap_in_release.lock().unwrap() = Some(decoy.clone());
+    let e = p.release("ctr1").unwrap_err();
+    assert_eq!(e.code(), CriErrorCode::FailedPrecondition);
+    assert_eq!(e.message(), "bundle path changed during release");
+    assert_eq!(fs::read(decoy.join("keep")).unwrap(), b"keep".to_vec());
+    assert_eq!(
+        fs::read(decoy.join("rootfs").join("keep")).unwrap(),
+        b"keep".to_vec()
+    );
+    assert!(
+        fs::symlink_metadata(tmp.0.join("ctr1"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(!tmp.0.join("ctr1-moved").join("rootfs").exists());
+}
+
+/// prepare の失敗後の巻き戻しの途中で `<root>/<id>` が差し替わっても、元のエラーを返し、おとりは無傷で、
+/// おとりへ `config.json` を作らない。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[test]
+fn oci7_sec1_4321_prepare_rollback_with_swapped_bundle_path_keeps_the_decoy_tree() {
+    let (tmp, rootfs, p) = setup("swap-rollback");
+    let decoy = make_decoy(&tmp.0);
+    *rootfs.swap_in_prepare.lock().unwrap() = Some(decoy.clone());
+    *rootfs.fail_prepare.lock().unwrap() = true;
+    let e = prepare(&p, "ctr1", &container()).unwrap_err();
+    assert_eq!(e.code(), CriErrorCode::ResourceExhausted);
+    assert_eq!(fs::read(decoy.join("keep")).unwrap(), b"keep".to_vec());
+    assert_eq!(
+        fs::read(decoy.join("rootfs").join("keep")).unwrap(),
+        b"keep".to_vec()
+    );
+    assert!(!decoy.join("config.json").exists());
+    assert!(
+        fs::symlink_metadata(tmp.0.join("ctr1"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    // 作った実体の rootfs は fd 起点で解放済み。
+    assert!(!tmp.0.join("ctr1-moved").join("rootfs").exists());
+}
+
+/// prepare が成功する経路で `<root>/<id>` が差し替わったら、成功に見せず `FAILED_PRECONDITION`。`config.json`・
+/// `resolv.conf` は作った実体（移動先）にだけ書かれ、おとりには書かれず、巻き戻しで消える。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[test]
+fn oci7_sec1_4321_prepare_success_path_swap_is_rejected_and_decoy_is_untouched() {
+    let (tmp, rootfs, p) = setup("swap-success");
+    let decoy = make_decoy(&tmp.0);
+    *rootfs.swap_in_prepare.lock().unwrap() = Some(decoy.clone());
+    let pod = dns_pod();
+    let e = p
+        .prepare(&BundleRequest::new("ctr1", "sb", &pod, &container()))
+        .unwrap_err();
+    assert_eq!(e.code(), CriErrorCode::FailedPrecondition);
+    assert_eq!(e.message(), "bundle path changed during preparation");
+    assert!(!decoy.join("config.json").exists());
+    assert!(!decoy.join("resolv.conf").exists());
+    assert_eq!(fs::read(decoy.join("keep")).unwrap(), b"keep".to_vec());
+    let moved = tmp.0.join("ctr1-moved");
+    assert!(!moved.join("config.json").exists());
+    assert!(!moved.join("resolv.conf").exists());
+    assert!(!moved.join("rootfs").exists());
+}
+
+/// bundle root 自体が巻き戻しの途中でおとりへの symlink に差し替わっても、構築時に固定した fd 起点で作った実体
+/// （`b-real/ctr1`）だけを消し、おとりの `ctr1/keep` は無傷。旧実装の `fs::remove_dir_all(<root>/<id>)` は symlink を辿り
+/// おとりの木を消していた。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[test]
+fn oci7_sec1_4321_rollback_with_swapped_bundle_root_removes_only_the_own_bundle() {
+    struct RootSwap {
+        root: PathBuf,
+        decoy: PathBuf,
+    }
+    impl RootSwap {
+        fn real(&self) -> PathBuf {
+            PathBuf::from(format!("{}-real", self.root.display()))
+        }
+    }
+    impl RootfsSource for RootSwap {
+        fn prepare(
+            &self,
+            _i: &ImageSpec,
+            b: &BundleDir,
+            _u: &UserResolveRequest<'_>,
+        ) -> Result<ImageDefaults, CriError> {
+            b.create_rootfs_dir()
+                .map_err(|_| CriError::internal("rootfs"))?;
+            fs::rename(&self.root, self.real()).expect("move root");
+            std::os::unix::fs::symlink(&self.decoy, &self.root).expect("symlink");
+            Err(CriError::resource_exhausted("no space"))
+        }
+        fn release(&self, b: &BundleDir) -> Result<(), CriError> {
+            b.remove_rootfs_tree()
+                .map_err(|_| CriError::internal("rootfs release"))
+        }
+    }
+    let tmp = TempDir::new("swap-root");
+    let root = tmp.0.join("b");
+    fs::create_dir(&root).expect("root");
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+    let decoy = tmp.0.join("decoy");
+    fs::create_dir_all(decoy.join("ctr1")).expect("decoy");
+    fs::write(decoy.join("ctr1").join("keep"), b"keep").expect("keep");
+    let src = Arc::new(RootSwap {
+        root: root.clone(),
+        decoy: decoy.clone(),
+    });
+    let p = SpecBundleProvider::new(root.clone(), src.clone()).expect("provider");
+    let e = prepare(&p, "ctr1", &container()).unwrap_err();
+    assert_eq!(e.code(), CriErrorCode::ResourceExhausted);
+    assert_eq!(
+        fs::read(decoy.join("ctr1").join("keep")).unwrap(),
+        b"keep".to_vec()
+    );
+    assert!(!src.real().join("ctr1").exists(), "own bundle is removed");
 }

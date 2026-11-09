@@ -69,7 +69,7 @@ Agent の推奨（決定ではない）: 案 A + 案 A'（現行維持）。既�
 
 ### 3-c. 残る隙間
 
-- Windows のパス起点（#4181）と、pull の `blobs_dir()` が `blobs/sha256` を用意して所有者基準を取る部分（パス起点の `prepare_private_dir`。公開と読み取りは `BlobDir` で fd 起点）、bundle の親ディレクトリの作成・巻き戻し・`release` のパス起点（`SpecBundleProvider` の範囲）。fetcher の書き込み先・検証後の読み取り・リース済み blob の読み取りは #2765・#2893・#4179 で fd 起点にした
+- Windows のパス起点（#4181）と、pull の `blobs_dir()` が `blobs/sha256` を用意して所有者基準を取る部分（パス起点の `prepare_private_dir`。公開と読み取りは `BlobDir` で fd 起点）。bundle の親ディレクトリの作成・巻き戻し・`release` は #4321 で `SpecBundleProvider` が検査済み fd 起点にした（Linux 以外の unix はパス起点）。fetcher の書き込み先・検証後の読み取り・リース済み blob の読み取りは #2765・#2893・#4179 で fd 起点にした
 - fd を開いた後に、所有者自身が root を信頼できない場所へ移す操作は信頼境界の内側。入口の再検査で検出される
 - 試験: `xdev_tests.rs`（3-d の拒否を `EXDEV` の注入で決定的に再現。既定のテスト集合）・`tests/image_store_xdev.rs`（実マウントでの確認。実機前提・`--ignored`）
 - 試験: `root_swap_tests.rs`（Linux の x86_64 / aarch64。再検査の直後・区間内で root を差し替えても、参照・在庫・ジャーナル・blob の削除・残骸の回収が検査済みの root にだけ作用し、おとりが無傷であることを具体値で照合する。#2695 で `disk_usage` / `list_images` / `ExpandedSizePlan::measure` の読み取りが検査済みの実体の値だけを返すことも加えた）。pull は `begin_pull`・`publish`・`abort`・`recover_stale_pulls` の各排他区間の直後に差し替えた場合と、fetcher がおとりへ書いた場合（公開されない）を `oci7_sec1_root_swapped_during_*`・`oci7_sec1_fetch_into_swapped_root_is_not_published` で照合する（#2694）。検証後に root・`staging`・pull ディレクトリを差し替えても検証済みの blob を読むことは `oci7_sec1_root_swapped_during_begin_pull_keeps_staging_in_verified_root`・`oci7_sec1_staging_swapped_after_verify_reads_verified_blob`・`oci7_sec1_pull_dir_swapped_after_verify_reads_verified_blob` で照合する（#2893）

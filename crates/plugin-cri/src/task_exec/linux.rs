@@ -213,11 +213,26 @@ const OP_EXEC_INSTANCE_CHANGED: &str = "shim_exec_instance_changed";
 /// `Started` の後、`Spawned` が `ExecBudgets::spawned` 内に届かず pid 0 のまま返した回の操作名（#4379・CRI-5・REPAIR-4）。
 const OP_EXEC_PID_UNREPORTED: &str = "shim_exec_pid_unreported";
 
-fn record_failure(recorder: &OpRecorder, name: &str, elapsed: Duration) {
+/// 発生時の構造化行の送り先（本番は `telemetry::stderr_sink` の `submit`。有界で満杯なら捨て、exec を待たせない）。
+type EventEmit = Arc<dyn Fn(String) + Send + Sync>;
+
+fn default_event_emit() -> EventEmit {
+    Arc::new(|line| {
+        let _ = crate::telemetry::stderr_sink().submit(line);
+    })
+}
+
+/// 発生時の 1 行（固定の操作名と経過ミリ秒のみ。ID・argv・パスは載せない。serve 開始後も外から観測できる。#4379・REPAIR-4）。
+fn event_line(name: &str, elapsed: Duration) -> String {
+    format!("event: {name} elapsed_ms={}", elapsed.as_millis())
+}
+
+fn record_failure(recorder: &OpRecorder, emit: &EventEmit, name: &str, elapsed: Duration) {
     // 記録できなくても exec の応答は変えない（既存の記録の流儀）。固定の操作名のみで ID・argv・パスは載せない。
-    if let Ok(name) = OpName::new(name) {
-        let _ = recorder.record(&name, OpOutcome::Failure, elapsed);
+    if let Ok(op) = OpName::new(name) {
+        let _ = recorder.record(&op, OpOutcome::Failure, elapsed);
     }
+    emit(event_line(name, elapsed));
 }
 
 struct Inner {
@@ -359,9 +374,19 @@ pub struct ShimExecLauncher {
     tracker: Arc<Mutex<Tracker>>,
     /// 拒否・pid 未着の計数先。shim の serve では core の共有記録器を差し込む（#4379）。
     recorder: Arc<OpRecorder>,
+    /// 計数と同時に出す発生時の行の送り先（#4379・REPAIR-4）。
+    emit: EventEmit,
 }
 
 impl ShimExecLauncher {
+    /// 発生時の行の送り先を差し替える（試験用）。
+    #[must_use]
+    #[cfg(test)]
+    pub(crate) fn with_event_emit(mut self, emit: EventEmit) -> Self {
+        self.emit = emit;
+        self
+    }
+
     /// 計数先の記録器を差し替える（shim の共有記録器。#4379・REPAIR-4）。
     #[must_use]
     pub fn with_recorder(mut self, recorder: Arc<OpRecorder>) -> Self {
@@ -401,6 +426,7 @@ impl ShimExecLauncher {
             shared: Arc::new(Shared::default()),
             tracker: Arc::new(Mutex::new(Tracker::default())),
             recorder: Arc::new(OpRecorder::new()),
+            emit: default_event_emit(),
         }
     }
 
@@ -513,6 +539,7 @@ impl TaskExecLauncher for ShimExecLauncher {
         ) {
             record_failure(
                 &self.recorder,
+                &self.emit,
                 OP_EXEC_INSTANCE_CHANGED,
                 launch_started.elapsed(),
             );
@@ -611,6 +638,7 @@ impl TaskExecLauncher for ShimExecLauncher {
         {
             record_failure(
                 &self.recorder,
+                &self.emit,
                 OP_EXEC_PID_UNREPORTED,
                 wait_started.elapsed(),
             );

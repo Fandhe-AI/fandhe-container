@@ -1464,6 +1464,28 @@ fn repair4_4379_spawned_budget_expiry_counts_once() {
     assert_eq!(counts(&l, "shim_exec_instance_changed"), None);
 }
 
+/// #4379・REPAIR-4: 計数と同時に発生時の行が出る（serve 開始後も外から観測できる）。
+#[test]
+fn repair4_4379_expiry_emits_event_line() {
+    let fx = Fixture::new("t4379-emit");
+    let budgets = ExecBudgets {
+        spawned: Duration::from_millis(100),
+        ..ExecBudgets::default()
+    };
+    let (l, _) = fx.launcher(holding(), probe(0), budgets);
+    let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sink = Arc::clone(&lines);
+    let l = l.with_event_emit(Arc::new(move |s| sink.lock().unwrap().push(s)));
+    l.launch(&cid("run1"), &eid(), &ok_spec(), fx.instance("run1"))
+        .expect("launch");
+    let got = lines.lock().unwrap().clone();
+    assert_eq!(got.len(), 1);
+    assert!(
+        got[0].starts_with("event: shim_exec_pid_unreported elapsed_ms="),
+        "{got:?}"
+    );
+}
+
 /// #4379: 予算内に `Spawned` が届いた回は数えない。
 #[test]
 fn repair4_4379_spawned_in_time_is_not_counted() {

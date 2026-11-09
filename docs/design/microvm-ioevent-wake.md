@@ -155,9 +155,11 @@ Issue #4229 の後も `VcpuFd::run_bounded` は `KVM_RUN` のたびに `thread::
 
 - `mvm1_4288_resident_watchdog_spawns_once`（KVM 不要）: 期限切れ 50 回と正常終了 50 回を交互に繰り返しても、kick を出したスレッドの ID が 1 種類・名前つきスレッドが 1 本・drop 後は 0 本で、各回の結末が具体値どおり。
 - `mvm1_4288_resident_watchdog_*`: 武装中の停止要求の kick・待機中は kick しない・死亡と ack 切れの fail-closed・drop が上限内で終わる。
+- `mvm1_4329_kick_just_before_disarm_leaves_no_pending_signal`・`mvm1_4329_pending_kick_is_consumed_by_unblock_before_next_run`（KVM 不要・MVM-1・CORE-7・#4329）: kick の直後に武装が解けても SIGUSR2 は保留で残らず、保留を作っても次の run の前の解除の syscall で配送されて消え、偽の EINTR（`Interrupted`）にならない。実 KVM の期限とゲスト exit の同時発生の再現はしない。
 - `kvm_device_idle_halted_vcpu_wakeups`（実機）: 期限切れ 6 回以上で `watchdog_spawns == 1`。停止の即時性の試験（50 ms 閾値）は変えていない（武装・解除の handshake の費用の回帰ガード）。
 
 ### 再評価条件・残余
 
 - ack の期限（`RUN_WATCHDOG_ACK_WAIT`）は `run()`（本番では `sys::kvm_run`）が戻った後の、監視スレッドの解除待ちにだけ適用される（`run_watched` は `run()` の復帰後に期限を設定する）。D 状態などで `KVM_RUN` から戻らない vCPU は ack 待ちに到達せず、1 秒で `Internal` にはならない。その場合は既存の停止・drop 側の期限と残余リスクに従う（本件の保護範囲外。REPAIR-5 の保護範囲を誤認しないこと）。
+- `pthread_kill` の非同期配送で保留になった kick は、次の `run_bounded` の `KickUnblocked::new`（解除の syscall）の戻りで配送される（#4329 で固定）。
 - aarch64 の実機（#3781・人間担当）は未検証。HVF（macOS）は別の停止経路のため対象外。

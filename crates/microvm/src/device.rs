@@ -1012,6 +1012,8 @@ impl VcpuFd {
             ),
         })?;
         // 呼び出しスレッドが SIGUSR2 をブロックしていても中断が届くよう、実行中だけ解除する（drop で復元）。
+        // この解除の syscall の戻りで、前回の run の解除直前に送られて保留になった kick は handler へ配送される。
+        // 保留の kick は次の `KVM_RUN` の入口まで残らず、偽の `Interrupted` にならない（#4329・MVM-1）。
         let _unblocked = sys::KickUnblocked::new().map_err(|e| match e {
             SysError::Unsupported => MicrovmError::new(
                 MicrovmErrorCode::Unimplemented,
@@ -3745,6 +3747,118 @@ mod tests {
                 std::fs::read_to_string(p).is_ok_and(|c| c.trim_end() == name)
             })
             .count()
+    }
+
+    /// SIGUSR2（12）の保留ビット（`SigPnd`・`ShdPnd` の第 11 ビット）。
+    const KICK_BIT: u64 = 1 << 11;
+
+    /// 呼び出しスレッドの保留シグナル集合（`/proc/thread-self/status` の `field`。tgkill 宛ては `SigPnd`）。
+    /// 読めない・解析できないときは skip せず panic する。
+    fn thread_sig_pending(field: &str) -> u64 {
+        let st = std::fs::read_to_string("/proc/thread-self/status")
+            .expect("/proc/thread-self/status must be readable");
+        let hex = st
+            .lines()
+            .find_map(|l| l.strip_prefix(field)?.strip_prefix(':'))
+            .unwrap_or_else(|| panic!("{field} line missing"));
+        u64::from_str_radix(hex.trim(), 16).expect("hex sigset")
+    }
+
+    /// 実 `KickCell` へ kick する試験用の副作用（送れた回数を数える。`KvmRunMap` は使わない）。
+    struct CellFx {
+        cell: Arc<sys::KickCell>,
+        sent: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl WatchEffects for CellFx {
+        fn set_exit(&self, _on: bool) {}
+        fn kick(&self) {
+            if self.cell.kick() == Ok(true) {
+                self.sent.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// #4329・MVM-1・CORE-7: kick の直後に武装が解けても、解除後に SIGUSR2 は保留で残らず、
+    /// 未武装の次の run へは 1 件も送られない（偽の EINTR の元を作らない）。
+    /// 実 KVM の期限とゲスト exit の同時発生（時間依存のレース）そのものは再現しない。
+    #[cfg(all(
+        target_env = "gnu",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn mvm1_4329_kick_just_before_disarm_leaves_no_pending_signal() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            sys::install_kick_handler().unwrap();
+            let _unblocked = sys::KickUnblocked::new().unwrap();
+            let cell = Arc::new(sys::KickCell::default());
+            let sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let wd = RunWatchdog::spawn("mvm4329-kick", Duration::from_secs(5)).unwrap();
+            let stop = StopSignal::new();
+            let fx = || CellFx {
+                cell: Arc::clone(&cell),
+                sent: Arc::clone(&sent),
+            };
+            // kick の直後に armed が戻る窓そのもの。
+            let (r, o) = wd
+                .run_watched(Duration::from_millis(20), &stop, fx(), || {
+                    cell.armed(|| wait_until("kick sent", || sent.load(Ordering::SeqCst) >= 1))
+                })
+                .unwrap();
+            assert_eq!(r, Ok(()));
+            assert_eq!(o, WatchOutcome::TimedOut);
+            assert_eq!(thread_sig_pending("SigPnd") & KICK_BIT, 0);
+            assert_eq!(thread_sig_pending("ShdPnd") & KICK_BIT, 0);
+            // 次の run（期限内に完了）へは 1 件も送られず、保留も無い。
+            let before = sent.load(Ordering::SeqCst);
+            let (r, o) = wd
+                .run_watched(Duration::from_secs(5), &stop, fx(), || cell.armed(|| ()))
+                .unwrap();
+            assert_eq!(r, Ok(()));
+            assert_eq!(o, WatchOutcome::Finished);
+            assert_eq!(sent.load(Ordering::SeqCst), before);
+            assert_eq!(thread_sig_pending("SigPnd") & KICK_BIT, 0);
+            tx.send(()).unwrap();
+        });
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("test thread timed out or panicked");
+    }
+
+    /// #4329・MVM-1・CORE-7（陽性対照つき）: SIGUSR2 をブロックしたまま kick して保留を作れること（`0x800`）、
+    /// `run_bounded` と同じ `KickUnblocked::new` の戻りで保留が配送されて消え、次の `KVM_RUN` 相当の入口検査
+    /// （保留があれば EINTR）が EINTR にならないこと。EINTR が `Interrupted` になる写像は
+    /// `classify_run_error_table` が固定済み。x86_64 のみ（`blocked_for_probe` が x86_64 限定）。
+    #[cfg(all(target_env = "gnu", target_arch = "x86_64"))]
+    #[test]
+    fn mvm1_4329_pending_kick_is_consumed_by_unblock_before_next_run() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            sys::install_kick_handler().unwrap();
+            let blk = sys::KickUnblocked::blocked_for_probe().unwrap();
+            let cell = sys::KickCell::default();
+            assert_eq!(cell.armed(|| cell.kick()).unwrap(), Ok(true));
+            assert_eq!(thread_sig_pending("SigPnd") & KICK_BIT, KICK_BIT);
+            let u = sys::KickUnblocked::new().unwrap();
+            assert_eq!(thread_sig_pending("SigPnd") & KICK_BIT, 0);
+            let entry = cell
+                .armed(|| {
+                    if thread_sig_pending("SigPnd") & KICK_BIT != 0 {
+                        Err(sys::SysError::Os(4))
+                    } else {
+                        Ok(())
+                    }
+                })
+                .unwrap();
+            assert_eq!(entry, Ok(()));
+            drop(u);
+            assert!(sys::KickUnblocked::kick_is_blocked().unwrap());
+            assert_eq!(thread_sig_pending("SigPnd") & KICK_BIT, 0);
+            drop(blk);
+            tx.send(()).unwrap();
+        });
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("test thread timed out or panicked");
     }
 
     /// #4288・CORE-7: `KVM_RUN` 相当の実行を期限切れ・正常終了で繰り返しても、監視スレッドは常駐 1 本のまま

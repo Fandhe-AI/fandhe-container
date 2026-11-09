@@ -403,14 +403,17 @@ impl SpecBundleProvider {
 fn effective_uid(root_dir: &ExtractRoot) -> Result<u32, CriError> {
     use std::os::unix::fs::MetadataExt as _;
     let name = format!(".fandhe-uid-probe-{}", std::process::id());
-    let _ = root_dir.remove_child_tree(&name);
+    // 同名のディレクトリ等が既にあっても再帰削除せず拒否する（#4378。所有者検証より前に破壊的操作をしない）
+    root_dir
+        .unlink_child_file(&name)
+        .map_err(|_| CriError::failed_precondition("effective uid is unavailable"))?;
     let uid = root_dir
         .create_new_file(&name, 0o600)
         .map_err(|_| ())
         .and_then(|f| f.metadata().map_err(|_| ()))
         .map(|m| m.uid())
         .map_err(|()| CriError::failed_precondition("effective uid is unavailable"));
-    let _ = root_dir.remove_child_tree(&name);
+    let _ = root_dir.unlink_child_file(&name);
     uid
 }
 
@@ -758,6 +761,22 @@ mod tests {
         assert_eq!(uid, fs::metadata(&probe).unwrap().uid());
         assert_eq!(fs::read_dir(&decoy).unwrap().count(), 0);
         assert_eq!(fs::read_dir(base.join("bundles-real")).unwrap().count(), 0);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// OCI-7・SEC-1・#4378: 同名のディレクトリが root 直下にあっても `effective_uid` は拒否するだけで、
+    /// 再帰削除せず中身を残す。
+    #[test]
+    fn oci7_sec1_4378_effective_uid_keeps_a_same_named_directory() {
+        let (base, bundles) = setup("uiddir");
+        let root_dir = ExtractRoot::open_existing_dir(&bundles).unwrap();
+        let name = format!(".fandhe-uid-probe-{}", std::process::id());
+        let dir = bundles.join(&name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("keep"), b"x").unwrap();
+        let e = effective_uid(&root_dir).unwrap_err();
+        assert_eq!(e.message(), "effective uid is unavailable");
+        assert!(dir.join("keep").exists());
         let _ = fs::remove_dir_all(&base);
     }
 }

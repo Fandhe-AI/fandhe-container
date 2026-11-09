@@ -139,6 +139,7 @@ mod imp {
     const DIR_FLAGS: u64 = at::O_PATH | at::O_DIRECTORY | at::O_NOFOLLOW | at::O_CLOEXEC;
     const DIR_FLAGS_RW: u64 = at::O_RDONLY | at::O_DIRECTORY | at::O_NOFOLLOW | at::O_CLOEXEC;
     const ENOENT: i32 = 2;
+    const EISDIR: i32 = 21;
 
     /// `openat2` 等の errno を構造化エラーにする。差し替えの疑い（`ELOOP`・`EXDEV`・`ENOTDIR`・`EAGAIN` の
     /// 再試行超過）は `path_changed`、それ以外は `map_fs_err`。
@@ -351,6 +352,21 @@ mod imp {
             )
             .map(File::from)
             .map_err(|e| map_at_err(&e))
+        }
+
+        /// 直下の `name` を通常の `unlinkat`（`AT_REMOVEDIR` なし）で 1 エントリだけ消す（不在は成功）。
+        /// ディレクトリには触れず `FailedPrecondition` で拒否する（再帰削除・権限変更をしない。#4378）。
+        pub fn unlink_child_file(&self, name: &str) -> Result<(), OciError> {
+            child_cstring(OsStr::new(name))?;
+            match at::unlinkat_name(self.fd.as_fd(), OsStr::new(name), false) {
+                Ok(()) => Ok(()),
+                Err(e) if e.raw_os_error() == Some(ENOENT) => Ok(()),
+                Err(e) if e.raw_os_error() == Some(EISDIR) => Err(err(
+                    OciErrorCode::FailedPrecondition,
+                    "a child is a directory",
+                )),
+                Err(e) => Err(map_at_err(&e)),
+            }
         }
 
         /// 直下の `name` を symlink を追従せず木ごと消す（不在は成功）。
@@ -1089,6 +1105,23 @@ mod imp {
             o.open(&p).map_err(|e| map_fs_err(&e))
         }
 
+        /// 直下の `name` を `remove_file` で 1 エントリだけ消す（不在は成功。ディレクトリは拒否。#4378）。
+        pub fn unlink_child_file(&self, name: &str) -> Result<(), OciError> {
+            let p = self.path.join(checked_child(name)?);
+            match fs::symlink_metadata(&p) {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => return Err(map_fs_err(&e)),
+                Ok(m) if m.is_dir() => {
+                    return Err(err(
+                        OciErrorCode::FailedPrecondition,
+                        "a child is a directory",
+                    ));
+                }
+                Ok(_) => {}
+            }
+            fs::remove_file(&p).map_err(|e| map_fs_err(&e))
+        }
+
         /// 直下の `name` を symlink を追従せず木ごと消す（パス起点。不在は成功）。
         pub fn remove_child_tree(&self, name: &str) -> Result<(), OciError> {
             remove_path_tree(&self.path.join(checked_child(name)?))
@@ -1708,6 +1741,23 @@ mod tests {
         assert!(root.child_matches("b", &child));
         assert!(!root.child_matches("link", &child));
         assert!(!root.child_matches("absent", &child));
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// OCI-7・SEC-1・#4378: `unlink_child_file` は通常ファイルを消し、不在は成功、ディレクトリは中身を残して拒否する。
+    #[test]
+    fn sec1_4378_unlink_child_file_rejects_directories() {
+        let base = tmp("unlinkfile");
+        let root = ExtractRoot::open_existing_dir(&base).unwrap();
+        drop(root.create_new_file("f", 0o600).unwrap());
+        root.unlink_child_file("f").unwrap();
+        assert!(!base.join("f").exists());
+        root.unlink_child_file("f").unwrap();
+        fs::create_dir_all(base.join("d")).unwrap();
+        fs::write(base.join("d/keep"), b"x").unwrap();
+        let e = root.unlink_child_file("d").unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+        assert!(base.join("d/keep").exists());
         fs::remove_dir_all(&base).unwrap();
     }
 

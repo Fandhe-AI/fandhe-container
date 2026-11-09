@@ -1012,18 +1012,27 @@ async fn reclaim_restarting_dead_plugin(
     RuntimeServiceClient<Channel>,
     reclaim::ReclaimReport,
 ) {
-    let mut slot = Some(guard);
-    let exited = slot.as_mut().is_some_and(|g| g.exited().is_some());
+    let slot = std::cell::RefCell::new(Some(guard));
     // 判断と回収 2 回は共有部品（#4326）。起動し直すときだけ、旧 guard を drop（kill と回収）してから新しい guard を入れる。
-    let rr = reclaim::reclaim_restarting(&mut c, ledger, token, exited, async || {
-        drop(slot.take());
-        let mut g = spawn_server_inherit_env(plugin_bin, new_sock);
-        let ch = connect_when_ready_with(new_sock, Some(&mut g), config).await;
-        slot = Some(g);
-        RuntimeServiceClient::new(ch)
-    })
+    let rr = reclaim::reclaim_restarting(
+        &mut c,
+        ledger,
+        token,
+        || {
+            slot.borrow_mut()
+                .as_mut()
+                .is_some_and(|g| g.exited().is_some())
+        },
+        async || {
+            drop(slot.borrow_mut().take());
+            let mut g = spawn_server_inherit_env(plugin_bin, new_sock);
+            let ch = connect_when_ready_with(new_sock, Some(&mut g), config).await;
+            *slot.borrow_mut() = Some(g);
+            RuntimeServiceClient::new(ch)
+        },
+    )
     .await;
-    let guard = slot.expect("plugin guard is always kept");
+    let guard = slot.into_inner().expect("plugin guard is always kept");
     (guard, c, rr.into_final())
 }
 
@@ -1705,12 +1714,18 @@ async fn cri1_cri6_4326_reclaim_restarting_respawns_dead_plugin_and_reclaims_tok
         let _ = kill_and_collect_stderr(guard);
 
         let mut new_guard: Option<ChildGuard> = None;
-        let rr = reclaim::reclaim_restarting(&mut c, &ledger, &token, true, async || {
-            let mut g = spawn_server(&sock_b, &xdg.0);
-            let ch = connect_when_ready(&sock_b, Some(&mut g)).await;
-            new_guard = Some(g);
-            RuntimeServiceClient::new(ch)
-        })
+        let rr = reclaim::reclaim_restarting(
+            &mut c,
+            &ledger,
+            &token,
+            || true,
+            async || {
+                let mut g = spawn_server(&sock_b, &xdg.0);
+                let ch = connect_when_ready(&sock_b, Some(&mut g)).await;
+                new_guard = Some(g);
+                RuntimeServiceClient::new(ch)
+            },
+        )
         .await;
         assert!(rr.restarted(), "{rr:?}");
         assert!(reclaim::plugin_unreachable(&rr.first), "{rr:?}");

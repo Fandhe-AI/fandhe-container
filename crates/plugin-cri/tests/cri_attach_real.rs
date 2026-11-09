@@ -762,10 +762,13 @@ async fn production_binary_attach_real() {
             b1,
         )
         .await;
-        let exited = lock_srv(&srv).guard.exited().is_some();
-        let rr1 = reclaim::reclaim_restarting(&mut c, &ledger, &token, exited, async || {
-            restart_plugin(&srv, &plugin_bin, &r1_sock).await
-        })
+        let rr1 = reclaim::reclaim_restarting(
+            &mut c,
+            &ledger,
+            &token,
+            || lock_srv(&srv).guard.exited().is_some(),
+            async || restart_plugin(&srv, &plugin_bin, &r1_sock).await,
+        )
         .await;
         let rep1 = rr1.final_report();
         if let Some(line) = reclaim::left_line(TEST, rep1) {
@@ -829,10 +832,13 @@ async fn production_binary_attach_real() {
             b2,
         )
         .await;
-        let exited = lock_srv(&srv).guard.exited().is_some();
-        let rr2 = reclaim::reclaim_restarting(&mut c, &ledger, &token, exited, async || {
-            restart_plugin(&srv, &plugin_bin, &r2_sock).await
-        })
+        let rr2 = reclaim::reclaim_restarting(
+            &mut c,
+            &ledger,
+            &token,
+            || lock_srv(&srv).guard.exited().is_some(),
+            async || restart_plugin(&srv, &plugin_bin, &r2_sock).await,
+        )
         .await;
         let rep2 = rr2.final_report();
         if let Some(line) = reclaim::left_line(TEST, rep2) {

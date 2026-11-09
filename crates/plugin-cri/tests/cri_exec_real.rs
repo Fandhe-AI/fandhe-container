@@ -852,10 +852,13 @@ async fn production_binary_exec_real() {
             b1,
         )
         .await;
-        let exited = lock_srv(&srv).guard.exited().is_some();
-        let rr1 = reclaim::reclaim_restarting(&mut c, &ledger, &token, exited, async || {
-            restart_plugin(&srv, &plugin_bin, &r1_sock).await
-        })
+        let rr1 = reclaim::reclaim_restarting(
+            &mut c,
+            &ledger,
+            &token,
+            || lock_srv(&srv).guard.exited().is_some(),
+            async || restart_plugin(&srv, &plugin_bin, &r1_sock).await,
+        )
         .await;
         let rep1 = rr1.final_report();
         if let Some(line) = reclaim::left_line(TEST, rep1) {
@@ -929,10 +932,13 @@ async fn production_binary_exec_real() {
         .await;
         // 段 4 の後は plugin-cri が再起動済みなので、回収は共有の入れ物の最新の接続で行う（死んでいれば起動し直す。#4326）。
         let mut c = RuntimeServiceClient::new(lock_srv(&srv).ch.clone());
-        let exited = lock_srv(&srv).guard.exited().is_some();
-        let rr2 = reclaim::reclaim_restarting(&mut c, &ledger, &token, exited, async || {
-            restart_plugin(&srv, &plugin_bin, &r2_sock).await
-        })
+        let rr2 = reclaim::reclaim_restarting(
+            &mut c,
+            &ledger,
+            &token,
+            || lock_srv(&srv).guard.exited().is_some(),
+            async || restart_plugin(&srv, &plugin_bin, &r2_sock).await,
+        )
         .await;
         let rep2 = rr2.final_report();
         if let Some(line) = reclaim::left_line(TEST, rep2) {

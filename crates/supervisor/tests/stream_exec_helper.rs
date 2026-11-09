@@ -30,12 +30,17 @@ use fandhe_container_core::traits::{
     ContainerId, ContainerStatus, CreateStateRequest, ErrorCode, StateStore as _, TraitError,
     UpdateStateRequest,
 };
-use fandhe_container_supervisor::control::{ExecCreatedNotifier, ExecHandover, ExecPidfdSource};
+use fandhe_container_supervisor::control::{
+    ControlExecHandover, ExecControlFailure, ExecCreatedNotifier, ExecHandover, ExecPidfdSource,
+};
 use fandhe_container_supervisor::exec::{CommandSignaler, ExecSignalDelivery};
 use fandhe_container_supervisor::stream_exec::channel::{
     ChannelError, HelperMessage, StdioSend, recv_from_helper, send_stdio_handover,
 };
-use fandhe_container_supervisor::stream_exec::helper::{Deps, StreamExecArgs, serve};
+use fandhe_container_supervisor::stream_exec::diag::HelperStage;
+use fandhe_container_supervisor::stream_exec::helper::{
+    Deps, ServeReport, StreamExecArgs, serve_reporting,
+};
 use fandhe_container_supervisor::stream_exec::wire::{SignalAckCode, StdioMask, StreamExecOutcome};
 
 const PID: u32 = 4242;
@@ -124,6 +129,8 @@ impl AuditSink for NoopSink {
 struct FakeNotifier {
     counts: Arc<Counts>,
     fail: bool,
+    /// 失敗時に添える OS の errno（#4284）。
+    errno: Option<i32>,
 }
 
 impl ExecCreatedNotifier for FakeNotifier {
@@ -135,12 +142,23 @@ impl ExecCreatedNotifier for FakeNotifier {
             Ok(())
         }
     }
+
+    fn notify_created_with_errno(
+        &self,
+        name: &ExecCgroupName,
+        hold: Instant,
+    ) -> Result<(), ExecControlFailure> {
+        self.notify_created(name, hold)
+            .map_err(|e| ExecControlFailure::new(e, self.errno))
+    }
 }
 
 struct FakeSource {
     counts: Arc<Counts>,
     unavailable: bool,
     notify_fails: bool,
+    /// 取得失敗・通知失敗に添える OS の errno（#4284）。
+    errno: Option<i32>,
 }
 
 impl ExecPidfdSource for FakeSource {
@@ -160,8 +178,19 @@ impl ExecPidfdSource for FakeSource {
             Box::new(FakeNotifier {
                 counts: Arc::clone(&self.counts),
                 fail: self.notify_fails,
+                errno: self.errno,
             }),
         ))
+    }
+
+    fn obtain_with_errno(
+        &self,
+        id: &ContainerId,
+        pid: NonZeroU32,
+        deadline: Instant,
+    ) -> Result<ExecHandover, ExecControlFailure> {
+        self.obtain(id, pid, deadline)
+            .map_err(|e| ExecControlFailure::new(e, self.errno))
     }
 }
 
@@ -169,6 +198,10 @@ struct Scenario {
     sink_fails: bool,
     source_unavailable: bool,
     notify_fails: bool,
+    /// 取得・通知の失敗に添える errno（#4284）。
+    errno: Option<i32>,
+    /// 真なら launch 時 env の読み込みが失敗する（#4284）。
+    launch_env_fails: bool,
     exit: ExecExit,
     /// 真なら偽の実行役が `io.cancel` を 10 ms 刻みでこの長さの間見続ける（`serve` の取り消し判定の配線の照合。#4166）。
     /// 真になれば `Unavailable` の拒否で終わり、最後まで偽なら `exit` で終わる。`None` は見ない。
@@ -214,6 +247,8 @@ impl Default for Scenario {
             sink_fails: false,
             source_unavailable: false,
             notify_fails: false,
+            errno: None,
+            launch_env_fails: false,
             exit: ExecExit::Command(ChildExit::Exited(3)),
             watch_cancel: None,
             close_plugin_after: None,
@@ -243,6 +278,17 @@ fn drive(
     stdio: &StdioSend<'_>,
     sc: &Scenario,
 ) -> (StreamExecOutcome, Arc<Counts>, UnixStream) {
+    let (report, counts, plugin) = drive_reporting(store, args, stdio, sc);
+    (report.outcome, counts, plugin)
+}
+
+/// [`drive`] と同じだが、起動の失敗の段・errno も返す（#4284）。
+fn drive_reporting(
+    store: &FileStateStore,
+    args: &StreamExecArgs,
+    stdio: &StdioSend<'_>,
+    sc: &Scenario,
+) -> (ServeReport, Arc<Counts>, UnixStream) {
     let counts = Arc::new(Counts::default());
     let (plugin, helper) = UnixStream::pair().expect("pair");
     send_stdio_handover(&plugin, stdio, Instant::now() + Duration::from_secs(5)).expect("send");
@@ -253,6 +299,7 @@ fn drive(
         counts: Arc::clone(&counts),
         unavailable: sc.source_unavailable,
         notify_fails: sc.notify_fails,
+        errno: sc.errno,
     };
     let make_sink = |_: &Path| -> Result<Box<dyn AuditSink>, TraitError> {
         counts.sink.fetch_add(1, Ordering::SeqCst);
@@ -262,7 +309,13 @@ fn drive(
             Ok(Box::new(NoopSink))
         }
     };
-    let launch_env = |_: &Path, _: &_| -> Result<Vec<String>, TraitError> { Ok(Vec::new()) };
+    let launch_env = |_: &Path, _: &_| -> Result<Vec<String>, TraitError> {
+        if sc.launch_env_fails {
+            Err(TraitError::new(ErrorCode::Internal, "launch env failed"))
+        } else {
+            Ok(Vec::new())
+        }
+    };
     let run = |_: &_,
                _: std::os::fd::BorrowedFd<'_>,
                _: &_,
@@ -323,11 +376,11 @@ fn drive(
         }
         None => (plugin, None),
     };
-    let outcome = serve(&helper, args, &deps);
+    let report = serve_reporting(&helper, args, &deps);
     if let Some(closer) = closer {
         closer.join().expect("closer thread");
     }
-    (outcome, counts, plugin)
+    (report, counts, plugin)
 }
 
 fn assert_nothing_ran(counts: &Counts, source: usize) {
@@ -492,32 +545,47 @@ fn sup6_3760_started_follows_notify_and_failure_aborts() {
     assert_eq!(err, ChannelError::Closed);
 }
 
-/// 本物の bin を `stream-exec` で起動する（診断の受け口として stderr を pipe にする）。
-fn spawn_helper(args: &[&str], stdin: Stdio) -> std::process::Child {
-    Command::new(env!("CARGO_BIN_EXE_fandhe-container-supervisor"))
+/// 起動した helper と、その fd 2 の受け口（診断は AF_UNIX socket にだけ書かれる。本番の supervisor と同じ構成）。
+struct Spawned {
+    child: std::process::Child,
+    diag: UnixStream,
+}
+
+/// 本物の bin を `stream-exec` で起動する（fd 2 に socketpair の片端を渡し、診断行の受け口にする）。
+fn spawn_helper(args: &[&str], stdin: Stdio) -> Spawned {
+    let (parent_end, child_end) = UnixStream::pair().expect("socketpair");
+    let child = Command::new(env!("CARGO_BIN_EXE_fandhe-container-supervisor"))
         .arg("stream-exec")
         .args(args)
         .env_clear()
         .current_dir("/")
         .stdin(stdin)
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::from(OwnedFd::from(child_end)))
         .spawn()
-        .expect("spawn")
+        .expect("spawn");
+    Spawned {
+        child,
+        diag: parent_end,
+    }
 }
 
 /// helper の終了を期限つきで待つ（REPAIR-5・#3760）。期限超過なら kill して回収してから panic する。
 /// stderr は別スレッドで集め、受け取りにも有限の期限を置く（試験自身で有界化し CI の watchdog に頼らない）。
-fn wait_bounded(mut child: std::process::Child, limit: Duration) -> (Option<i32>, String) {
-    let reader = child.stderr.take().map(|mut e| {
+fn wait_bounded(spawned: Spawned, limit: Duration) -> (Option<i32>, String) {
+    let Spawned {
+        mut child,
+        diag: mut e,
+    } = spawned;
+    let reader = {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut buf = String::new();
             let _ = e.read_to_string(&mut buf);
             let _ = tx.send(buf);
         });
-        rx
-    });
+        Some(rx)
+    };
     let deadline = Instant::now() + limit;
     let status = loop {
         match child.try_wait().expect("try_wait") {
@@ -640,7 +708,7 @@ fn sec1_3760_real_bin_requires_a_socket_on_fd0() {
     assert_eq!(code, Some(1));
     assert_eq!(
         err,
-        "{\"code\":\"invalid-argument\",\"message\":\"stream-exec requires a socket on fd 0\"}\n"
+        "{\"component\":\"supervisor.stream_exec\",\"stage\":\"helper_channel\",\"code\":\"INVALID_ARGUMENT\",\"errno\":\"none\"}\n"
     );
 }
 
@@ -689,6 +757,218 @@ fn sup6_4166_open_requester_never_fires_the_cancel_hook() {
     assert_eq!(out, StreamExecOutcome::Exited(3));
     assert_eq!(counts.run.load(Ordering::SeqCst), 1);
     drop(plugin);
+}
+
+/// 診断行に秘密（コンテナ ID・argv・状態ルート名）が現れないことを照合する（SEC-1・#4284）。
+fn assert_no_secrets(text: &str, secrets: &[&str]) {
+    for secret in secrets {
+        assert!(!text.contains(secret), "secret {secret:?} leaked: {text:?}");
+    }
+}
+
+fn line_of(report: &ServeReport) -> String {
+    report
+        .failure
+        .expect("failure must be reported")
+        .diagnostic_line()
+}
+
+/// SUP-6・REPAIR-4・SEC-1（#4284）: 起動前の各段の失敗は、段名・分類・errno が具体値で報告される。
+#[test]
+fn sup6_4284_serve_reports_the_failing_stage_and_errno() {
+    let base = Tmp::new("diag");
+    let store = open(&base);
+    seed(&base, &store, "created1", None);
+    seed(&base, &store, "run1", Some(PID));
+    let none = StdioSend::default();
+    let prefix = "{\"component\":\"supervisor.stream_exec\",";
+
+    // 記録なし: 状態の取得（errno なし）。
+    let args = args_for(&base, "ghost1", PID, 0);
+    let (r, _c, _p) = drive_reporting(&store, &args, &none, &Scenario::default());
+    assert_eq!(r.outcome, StreamExecOutcome::Failed(ErrorCode::NotFound));
+    assert_eq!(
+        line_of(&r),
+        format!(
+            "{prefix}\"stage\":\"helper_state_get\",\"code\":\"NOT_FOUND\",\"errno\":\"none\"}}"
+        )
+    );
+    // 稼働中でない・pid 不一致: 状態の照合。
+    let args = args_for(&base, "created1", PID, 0);
+    let (r, _c, _p) = drive_reporting(&store, &args, &none, &Scenario::default());
+    assert_eq!(
+        line_of(&r),
+        format!(
+            "{prefix}\"stage\":\"helper_state_mismatch\",\"code\":\"FAILED_PRECONDITION\",\"errno\":\"none\"}}"
+        )
+    );
+    // launch env・sink の失敗。
+    let args = args_for(&base, "run1", PID, 0);
+    let sc = Scenario {
+        launch_env_fails: true,
+        ..Scenario::default()
+    };
+    let (r, _c, _p) = drive_reporting(&store, &args, &none, &sc);
+    assert_eq!(
+        line_of(&r),
+        format!(
+            "{prefix}\"stage\":\"helper_launch_env\",\"code\":\"INTERNAL\",\"errno\":\"none\"}}"
+        )
+    );
+    let sc = Scenario {
+        sink_fails: true,
+        ..Scenario::default()
+    };
+    let (r, _c, _p) = drive_reporting(&store, &args, &none, &sc);
+    assert_eq!(
+        line_of(&r),
+        format!(
+            "{prefix}\"stage\":\"helper_audit_sink\",\"code\":\"INTERNAL\",\"errno\":\"none\"}}"
+        )
+    );
+    // pidfd の取得の失敗: OS の errno（ECONNREFUSED = 111）が運ばれる。
+    let sc = Scenario {
+        source_unavailable: true,
+        errno: Some(111),
+        ..Scenario::default()
+    };
+    let (r, _c, _p) = drive_reporting(&store, &args, &none, &sc);
+    assert_eq!(r.outcome, StreamExecOutcome::Failed(ErrorCode::Unavailable));
+    assert_eq!(
+        line_of(&r),
+        format!(
+            "{prefix}\"stage\":\"helper_pidfd_handover\",\"code\":\"UNAVAILABLE\",\"errno\":111}}"
+        )
+    );
+    // mask の不一致（stdin を要求したが fd を送っていない）: stdio の受信。
+    let args_mask = args_for(&base, "run1", PID, 7);
+    let (r, _c, _p) = drive_reporting(&store, &args_mask, &none, &Scenario::default());
+    let failure = r.failure.expect("failure");
+    assert_eq!(failure.stage, HelperStage::StdioHandover);
+    assert_eq!(failure.errno, None);
+    assert_eq!(r.outcome, StreamExecOutcome::Failed(failure.code));
+    // 通知の失敗: kind 7（EPIPE = 32）。
+    let sc = Scenario {
+        notify_fails: true,
+        errno: Some(32),
+        ..Scenario::default()
+    };
+    let (r, _c, _p) = drive_reporting(&store, &args, &none, &sc);
+    assert_eq!(
+        line_of(&r),
+        format!(
+            "{prefix}\"stage\":\"helper_cgroup_notify\",\"code\":\"UNAVAILABLE\",\"errno\":32}}"
+        )
+    );
+    // 秘密は行に現れない（ID・argv・状態ルートの名前）。
+    let root_name = base.state_root().display().to_string();
+    assert_no_secrets(&line_of(&r), &["run1", "/bin/echo", "hi", &root_name]);
+}
+
+/// SUP-6・REPAIR-4（#4284）: 正常終了と子の段の失敗（`NotStarted`）では、失敗の段は報告されない（`Result` frame が運ぶ）。
+#[test]
+fn sup6_4284_serve_reports_no_failure_on_success_or_child_exit() {
+    let base = Tmp::new("diag-ok");
+    let store = open(&base);
+    seed(&base, &store, "run1", Some(PID));
+    let none = StdioSend::default();
+    let args = args_for(&base, "run1", PID, 0);
+    let (r, _c, _p) = drive_reporting(&store, &args, &none, &Scenario::default());
+    assert_eq!(r.outcome, StreamExecOutcome::Exited(3));
+    assert_eq!(r.failure, None);
+    // `serve` は従来どおり結果だけを返す。
+    let (out, _c, _p) = drive(&store, &args, &none, &Scenario::default());
+    assert_eq!(out, StreamExecOutcome::Exited(3));
+}
+
+/// SUP-6・REPAIR-4（#4284）: 本物の bin の失敗は fd 2 の 1 行に段名・分類・errno が出て、`Result` frame の値と矛盾しない。
+#[test]
+fn sup6_4284_real_bin_writes_the_stage_line_to_fd2() {
+    let prefix = "{\"component\":\"supervisor.stream_exec\",";
+    // 不正な引数（絶対でない argv0）: 引数の解釈。
+    let args = with(&["--stdio", "0", "--", "echo"]);
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (plugin, helper_end) = UnixStream::pair().expect("pair");
+    let child = spawn_helper(&refs, Stdio::from(OwnedFd::from(helper_end)));
+    let msg = recv_from_helper(&plugin, Instant::now() + Duration::from_secs(20)).expect("result");
+    assert!(matches!(
+        msg,
+        HelperMessage::Result(StreamExecOutcome::Failed(ErrorCode::InvalidArgument))
+    ));
+    let (code, err) = wait_bounded(child, Duration::from_secs(20));
+    assert_eq!(code, Some(0));
+    assert_eq!(
+        err,
+        format!(
+            "{prefix}\"stage\":\"helper_args\",\"code\":\"INVALID_ARGUMENT\",\"errno\":\"none\"}}\n"
+        )
+    );
+
+    // 記録なし: 状態の取得。
+    let base = Tmp::new("diag-bin");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(base.state_root())
+        .expect("root");
+    let root = base.state_root();
+    let (plugin, helper_end) = UnixStream::pair().expect("pair");
+    let child = spawn_helper(
+        &[
+            "--root",
+            root.to_str().expect("utf8"),
+            "--id",
+            "ghost1",
+            "--expect-pid",
+            "10",
+            "--timeout-ms",
+            "1000",
+            "--stdio",
+            "0",
+            "--",
+            "/bin/echo",
+            "hi",
+        ],
+        Stdio::from(OwnedFd::from(helper_end)),
+    );
+    let msg = recv_from_helper(&plugin, Instant::now() + Duration::from_secs(20)).expect("result");
+    assert!(matches!(
+        msg,
+        HelperMessage::Result(StreamExecOutcome::Failed(ErrorCode::NotFound))
+    ));
+    let (code, err) = wait_bounded(child, Duration::from_secs(20));
+    assert_eq!(code, Some(0));
+    assert_eq!(
+        err,
+        format!(
+            "{prefix}\"stage\":\"helper_state_get\",\"code\":\"NOT_FOUND\",\"errno\":\"none\"}}\n"
+        )
+    );
+    assert_no_secrets(&err, &["ghost1", "/bin/echo", root.to_str().expect("utf8")]);
+}
+
+/// SUP-6・REPAIR-4（#4284）: 本番の制御クライアントは、状態ディレクトリを開けない失敗の OS の errno（ENOENT = 2）を
+/// 構造化エラー（`Unavailable`）と一緒に返し、別の呼び出しの errno を引きずらない。
+#[test]
+fn sup6_4284_control_client_carries_the_os_errno() {
+    let base = Tmp::new("diag-ctl");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(base.state_root())
+        .expect("root");
+    let source = ControlExecHandover::new(base.state_root());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let pid = NonZeroU32::new(PID).expect("pid");
+    let failure = source
+        .obtain_with_errno(&cid("ghost1"), pid, deadline)
+        .expect_err("no state directory");
+    assert_eq!(failure.error().code(), ErrorCode::Unavailable);
+    assert_eq!(failure.errno(), Some(2));
+    // 続く OS 由来でない失敗（期限切れ）は、前回の errno を引きずらない。
+    let expired = source
+        .obtain_with_errno(&cid("ghost1"), pid, Instant::now())
+        .expect_err("expired");
+    assert_eq!(expired.error().code(), ErrorCode::Timeout);
+    assert_eq!(expired.errno(), None);
 }
 
 /// `serve` の後に plugin 側で受けられる frame を集める（`Started` は数えず、`SignalAck` は (番号, code) にする。

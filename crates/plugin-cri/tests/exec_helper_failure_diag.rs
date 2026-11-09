@@ -11,15 +11,16 @@
 //! 場面（具体値で固定する）:
 //!
 //! - A: fd 0 が socket でない helper（`InvalidArgument` になる stdio の注入）。fd 2 の診断を本番と同じ読み手
-//!   （`diagnostics::spawn_reader`）が拾い、`code` だけの 1 行が構造化ログへ出る。
+//!   （`diagnostics::spawn_reader`）が拾い、段名 `helper_channel`・errno `none` の 1 行が構造化ログへ出る。
 //! - B: 存在しない pid のコンテナを本番の `SupervisorExecLauncher` で exec する。supervisor が不在なので
-//!   `Unavailable` で失敗し、`Failed(code)` の `Result` frame だけが返る。
+//!   `Unavailable` で失敗し、段名 `helper_pidfd_handover` と OS の errno（状態ディレクトリが無い `ENOENT`）の 1 行が出る。
+//! - C: 不正な引数（予約済みの stdio ビット）の helper。段名 `helper_args`・errno `none`。
+//! - D: 記録の無いコンテナ ID。段名 `helper_state_get`・`NOT_FOUND`・errno `none`。
 //!
-//! 現状の観測事実（REPAIR-3）: helper が fd 2 へ書くのは「fd 0 が socket でない」「要求元の消滅で取り消した」の
-//! 2 行だけで、段名と errno を出す生成側は supervisor・core に無い（状態の不一致・kind 6 の失敗・stdio の受け取りの
-//! 失敗は `Result` frame の `Failed(code)` だけで返る）。よって A は `code` だけの行、B は転送行 0 件になる。
-//! 生成側（段名・errno）が入ったら、この期待値を「段名と errno の行が 1 件以上」へ直す。後続 issue で扱う。
-//! `require_stdio_kinds`・mask の不一致の場面は kind 6 の成功（稼働中の supervisor）が前提のため、ここでは起こせない。
+//! 生成側は #4284 で入った（`supervisor::stream_exec::diag`）。errno は OS の errno があるときだけ数値で、状態ストア等の
+//! 失敗は core の `TraitError` が errno を持たないため `none` になる（残余。`docs/design/cri-streaming-server.md`）。
+//! `require_stdio_kinds`・mask の不一致の場面は kind 6 の成功（稼働中の supervisor）が前提のため、ここでは起こせない
+//! （supervisor の `stream_exec_helper` が偽の取得元で段名を具体値で固定する）。
 //!
 //! 秘密の非出力（SEC-1）: 既知のコンテナ ID・argv・トークン風の引数・状態ルートの名前が、sink の全バイト列に
 //! 部分文字列として現れないことを両場面で照合する。
@@ -215,12 +216,105 @@ mod linux {
         );
         sink.wait_idle(IDLE_WAIT);
         let text = text_of(&buf);
-        // 段名・errno の欄は無い（生成側が無い現状。入ったらこの期待値を直す）。message は捨てられる。
         assert_eq!(
-            text, "{\"event\":\"cri_exec_helper_diagnostic\",\"code\":\"INVALID_ARGUMENT\"}\n",
+            text,
+            "{\"event\":\"cri_exec_helper_diagnostic\",\"component\":\"supervisor.stream_exec\",\"code\":\"INVALID_ARGUMENT\",\"stage\":\"helper_channel\",\"errno\":\"none\"}\n",
             "scene A: sink output"
         );
         assert_no_secrets("scene A", &text);
+        Ok(())
+    }
+
+    /// fd 0 に socketpair・fd 2 に診断の socketpair を渡して helper を起動し、診断の転送行を返す（場面 C・D 用）。
+    /// `Result` frame は読まない（helper の終了コード 0 と、読み手の停止だけを照合する）。
+    fn run_helper_with_socket(scene: &str, mut command: Command) -> Result<String, String> {
+        let (plugin_end, helper_in) = UnixStream::pair().map_err(|e| format!("pair: {e}"))?;
+        let (diag_end, helper_err) = UnixStream::pair().map_err(|e| format!("pair: {e}"))?;
+        command
+            .stdin(Stdio::from(OwnedFd::from(helper_in)))
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(OwnedFd::from(helper_err)));
+        let spawned = command.spawn();
+        drop(command);
+        let mut child = spawned.map_err(|e| format!("spawn: {e}"))?;
+        let (sink, buf) = new_sink();
+        let tracker = Arc::new(DiagTracker::default());
+        spawn_reader(
+            diag_end,
+            Arc::new(AtomicBool::new(false)),
+            Instant::now() + Duration::from_secs(30),
+            sink.clone(),
+            &tracker,
+        )
+        .map_err(|_| "reader did not start".to_string())?;
+        let status = wait_child(&mut child);
+        drop(plugin_end);
+        assert_eq!(status.code(), Some(0), "{scene}: helper status {status:?}");
+        assert_eq!(
+            tracker.wait_idle(IDLE_WAIT),
+            0,
+            "{scene}: reader must stop by EOF"
+        );
+        sink.wait_idle(IDLE_WAIT);
+        Ok(text_of(&buf))
+    }
+
+    /// 場面 C: 不正な引数（予約済みの stdio ビット）。helper は引数の解釈で失敗する。
+    fn scene_c_invalid_args() -> Result<(), String> {
+        let dir = TempDir::new();
+        let args = StreamExecArgs::new(
+            state_root(&dir.0),
+            ContainerId::new(SENTINEL_ID).expect("id"),
+            dead_pid(),
+            Duration::from_secs(5),
+            StdioMask::from_presence(false, false, false),
+            sentinel_argv(),
+        )
+        .map_err(|e| format!("args: {e:?}"))?;
+        // 正しい引数を生成してから `--stdio` の値だけを予約済みのビットへ差し替える。
+        let mut raw = args.to_args();
+        let idx = raw
+            .iter()
+            .position(|a| a == "--stdio")
+            .ok_or("no --stdio")?;
+        *raw.get_mut(idx + 1).ok_or("no stdio value")? = "8".into();
+        let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+        let mut command = Command::new(&exe);
+        command
+            .arg("stream-exec")
+            .args(raw)
+            .env_clear()
+            .current_dir("/");
+        let text = run_helper_with_socket("scene C", command)?;
+        assert_eq!(
+            text,
+            "{\"event\":\"cri_exec_helper_diagnostic\",\"component\":\"supervisor.stream_exec\",\"code\":\"INVALID_ARGUMENT\",\"stage\":\"helper_args\",\"errno\":\"none\"}\n",
+            "scene C: sink output"
+        );
+        assert_no_secrets("scene C", &text);
+        Ok(())
+    }
+
+    /// 場面 D: 記録の無いコンテナ ID（状態ストアは空）。helper は状態の取得で `NOT_FOUND` になる。
+    fn scene_d_missing_record() -> Result<(), String> {
+        let dir = TempDir::new();
+        let args = StreamExecArgs::new(
+            state_root(&dir.0),
+            ContainerId::new(SENTINEL_ID).expect("id"),
+            dead_pid(),
+            Duration::from_secs(5),
+            StdioMask::from_presence(false, false, false),
+            sentinel_argv(),
+        )
+        .map_err(|e| format!("args: {e:?}"))?;
+        let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+        let text = run_helper_with_socket("scene D", stream_exec_command(&exe, &args))?;
+        assert_eq!(
+            text,
+            "{\"event\":\"cri_exec_helper_diagnostic\",\"component\":\"supervisor.stream_exec\",\"code\":\"NOT_FOUND\",\"stage\":\"helper_state_get\",\"errno\":\"none\"}\n",
+            "scene D: sink output"
+        );
+        assert_no_secrets("scene D", &text);
         Ok(())
     }
 
@@ -313,8 +407,14 @@ mod linux {
         sink.wait_idle(IDLE_WAIT);
         let text = text_of(&buf);
         let lines: Vec<&str> = text.lines().collect();
-        // 生成側が無い現状: `Failed(code)` の `Result` frame だけが返り、fd 2 に転送行は出ない。
-        assert_eq!(lines, Vec::<&str>::new(), "scene B: sink lines");
+        // 状態ディレクトリが無く制御チャネルへ届かない: kind 6 の段の失敗が OS の errno（ENOENT = 2）つきで出る。
+        assert_eq!(
+            lines,
+            [
+                "{\"event\":\"cri_exec_helper_diagnostic\",\"component\":\"supervisor.stream_exec\",\"code\":\"UNAVAILABLE\",\"stage\":\"helper_pidfd_handover\",\"errno\":2}"
+            ],
+            "scene B: sink lines"
+        );
         assert_no_secrets("scene B", &text);
         // エラーメッセージにも秘密を含めない（CRI クライアントへ返る値）。
         assert_no_secrets("scene B error", err.message());
@@ -331,9 +431,11 @@ mod linux {
             return run_stream_exec_main(args);
         }
         let mut failed = false;
-        let scenes: [(&str, Scene); 2] = [
+        let scenes: [(&str, Scene); 4] = [
             ("fd0_not_socket", scene_a_fd0_not_socket),
             ("dead_pid_via_launcher", scene_b_dead_pid_via_launcher),
+            ("invalid_args", scene_c_invalid_args),
+            ("missing_record", scene_d_missing_record),
         ];
         for (name, scene) in scenes {
             match std::panic::catch_unwind(scene) {

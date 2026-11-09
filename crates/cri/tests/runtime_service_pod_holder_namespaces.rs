@@ -81,6 +81,9 @@ struct Seen {
     supplied: Option<(String, String)>,
     user_path: Option<String>,
     ipc_path: Option<String>,
+    /// 供給された保持役の net と、生成した config の network の path（#2878・NET-3）。
+    supplied_net: Option<String>,
+    net_path: Option<String>,
 }
 
 #[derive(Default)]
@@ -117,6 +120,8 @@ impl BundleProvider for RecordingBundles {
                 .map(|p| (p.user().to_owned(), p.ipc().to_owned())),
             user_path: ns_path(&value, "user"),
             ipc_path: ns_path(&value, "ipc"),
+            supplied_net: req.pod_namespaces.map(|p| p.net().to_owned()),
+            net_path: ns_path(&value, "network"),
         });
         // bundle のパスは絶対パスで返す（Windows はドライブ接頭辞を要する。CLI-1）。
         let root = if cfg!(windows) {
@@ -353,4 +358,32 @@ async fn cri2_out_of_range_holder_pid_is_internal_and_leaves_no_record() {
     assert_eq!(e.code(), Code::Internal);
     assert!(bundles.seen().is_empty());
     assert!(list_container_ids(&svc).await.is_empty());
+}
+
+/// NET-3・SEC-5（#2878）: provider なしの `POD`（network 既定）で、各コンテナの network は自 sandbox の保持役の
+/// `/proc/<pid>/ns/net` へ join し、別 pod の pid のパスは出ない。
+#[tokio::test]
+async fn net3_pod_network_joins_only_own_holder_net() {
+    let holder = PerSandboxHolder::new();
+    let bundles = Arc::new(RecordingBundles::default());
+    let svc = service(&holder, &bundles, true);
+    let a = run(&svc, "a").await;
+    let b = run(&svc, "b").await;
+    let (pid_a, pid_b) = (holder.pid_of(&a), holder.pid_of(&b));
+    for (i, sb) in [&b, &a].into_iter().enumerate() {
+        create(&svc, sb, &format!("n{i}"), BTreeMap::new())
+            .await
+            .unwrap();
+    }
+    for s in bundles.seen() {
+        let own = if s.sandbox_id == a { pid_a } else { pid_b };
+        let other = if s.sandbox_id == a { pid_b } else { pid_a };
+        let want = format!("/proc/{own}/ns/net");
+        assert_eq!(s.supplied_net.as_deref(), Some(want.as_str()));
+        assert_eq!(s.net_path.as_deref(), Some(want.as_str()));
+        assert_ne!(
+            s.net_path.as_deref(),
+            Some(format!("/proc/{other}/ns/net").as_str())
+        );
+    }
 }

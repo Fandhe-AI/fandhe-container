@@ -18,16 +18,17 @@
 //!   supervisor の opt-in でだけ受ける（CRI-2・CRI-6）。
 //! - namespace の共有: pid の `POD` は未実装で、コンテナごとの新しい namespace にする（共有の欠落であり、
 //!   要求より分離が弱くなる方向ではない。core の PID 1 前提の証跡と両立しないため。#2674 の後続）。ipc の `POD` は
-//!   [`PodNamespacePaths`]（pod の保持役が作った user＋ipc namespace のパス）が与えられたときだけ
+//!   [`PodNamespacePaths`]（pod の保持役が作った user＋ipc＋net namespace のパス）が与えられたときだけ
 //!   `linux.namespaces[].path` で join する（core が user＋ipc の組に限って受ける。CRI-2・CORE-3。#2674）。
-//!   [`PodNamespacePaths`] は保持役の pid から `/proc/<pid>/ns/{user,ipc}` だけを組み立てる（#2776）。
+//!   [`PodNamespacePaths`] は保持役の pid から `/proc/<pid>/ns/{user,ipc,net}` だけを組み立てる（#2776・#2878）。
 //!   `CriRuntimeService` は保持役の provider を注入したときだけ自 sandbox の記録の pid から作った値を渡す（#2876）。
 //!   本番（plugin-cri）は provider が未注入（H6・#2877）のため、本番では共有されず新しい namespace になる。`/dev/shm` は共有しない（core がコンテナごとの tmpfs を載せる）。`/proc/<pid>` を
 //!   Create の時点で書く方式は pid の再利用で別 pod の namespace へ入り得る（SEC-1）ため採らない。
 //! - network namespace: `POD` / `CONTAINER` は `{"type":"network"}` を出す。`POD` で pod の netns のパスを受けたとき
 //!   （[`build_runtime_config_with_pod_netns`]。`NetworkPlugin` 経由で作って結線した netns。#2675・NET-1）は
-//!   `{"type":"network","path":…}` にする。core の start は network namespace も `linux.namespaces[].path` の
-//!   network もまだ受けず `Unimplemented` で拒否する（core の join は後続。`docs/design/cri-config-acceptance.md` の順 13）。`NODE`（host）は
+//!   `{"type":"network","path":…}` にする。保持役のパスがあり ipc も join するときは保持役の `/proc/<pid>/ns/net` を出す
+//!   （#2878・NET-3。core の join は #2872 で実装済み）。パス無しの network は core の start が `Unimplemented` で拒否する
+//!   （`docs/design/cri-config-acceptance.md` の順 13）。`NODE`（host）は
 //!   network namespace を出さない（ホストの netns で動く。利用者が明示した場合だけ）。crictl 疎通確認
 //!   （#442）の pod.json（`scripts/testdata/cri/pod.json`）は `namespace_options.network = NODE` を明示して揃えてある（#2592）。
 //! - user namespace: `userns_options.mode` が `NODE` でも新しい user namespace にする（分離を強める方向。
@@ -490,11 +491,11 @@ struct NamespaceOut<'a> {
     path: Option<&'a str>,
 }
 
-/// pod の保持役が作った user・ipc namespace のパス（CRI-2・CORE-3・SEC-5。#2674・#2776）。
+/// pod の保持役が作った user・ipc・net namespace のパス（CRI-2・CORE-3・NET-3・SEC-5。#2674・#2776・#2878）。
 ///
 /// `SpecBundleProvider::prepare` が `BundleRequest` 経由で受け、ipc の `POD` を join に変える。
-/// 公開の構築口は [`PodNamespacePaths::for_holder_pid`] だけで、`/proc/<pid>/ns/user` と
-/// `/proc/<同じ pid>/ns/ipc` しか作れない。任意の文字列から作る口は crate の外へ出さない。
+/// 公開の構築口は [`PodNamespacePaths::for_holder_pid`] だけで、`/proc/<pid>/ns/user`・
+/// `/proc/<同じ pid>/ns/ipc`・`/proc/<同じ pid>/ns/net` しか作れない（net は #2878）。任意の文字列から作る口は crate の外へ出さない。
 ///
 /// # 保持役を配線するときの契約（#2776）
 ///
@@ -512,6 +513,7 @@ struct NamespaceOut<'a> {
 pub struct PodNamespacePaths {
     user: String,
     ipc: String,
+    net: String,
 }
 
 /// `/proc/<pid>/ns/<kind>` と完全一致するパスから pid を取り出す。pid は 1 以上 `i32::MAX` 以下の正準な
@@ -535,23 +537,29 @@ fn holder_pid_of(path: &str, kind: &str) -> Option<u32> {
 }
 
 impl PodNamespacePaths {
-    /// 保持役の pid から `/proc/<pid>/ns/user` と `/proc/<同じ pid>/ns/ipc` を組み立てる（#2776）。
+    /// 保持役の pid から `/proc/<pid>/ns/{user,ipc,net}` を組み立てる（#2776・#2878）。
     /// `pid_t` の正の上限（`i32::MAX`）を超える値は供給元の誤りなので `INTERNAL`。
     pub fn for_holder_pid(pid: NonZeroU32) -> Result<Self, CriError> {
         let pid = pid.get();
         Self::from_paths(
             &format!("/proc/{pid}/ns/user"),
             &format!("/proc/{pid}/ns/ipc"),
+            &format!("/proc/{pid}/ns/net"),
         )
     }
 
-    /// 形式（`/proc/<pid>/ns/{user,ipc}` の完全一致・user と ipc で同じ pid）を検査して作る。不変条件の定義は
+    /// 形式（`/proc/<pid>/ns/{user,ipc,net}` の完全一致・3 本で同じ pid）を検査して作る。不変条件の定義は
     /// ここ 1 か所に置く。違反は供給元の誤りなので、値を含まない固定文言の `INTERNAL`。
-    pub(crate) fn from_paths(user: &str, ipc: &str) -> Result<Self, CriError> {
-        match (holder_pid_of(user, "user"), holder_pid_of(ipc, "ipc")) {
-            (Some(u), Some(i)) if u == i => Ok(Self {
+    pub(crate) fn from_paths(user: &str, ipc: &str, net: &str) -> Result<Self, CriError> {
+        match (
+            holder_pid_of(user, "user"),
+            holder_pid_of(ipc, "ipc"),
+            holder_pid_of(net, "net"),
+        ) {
+            (Some(u), Some(i), Some(n)) if u == i && i == n => Ok(Self {
                 user: user.to_owned(),
                 ipc: ipc.to_owned(),
+                net: net.to_owned(),
             }),
             _ => Err(CriError::internal("invalid pod namespace path")),
         }
@@ -565,6 +573,12 @@ impl PodNamespacePaths {
     /// ipc namespace のパス。
     pub fn ipc(&self) -> &str {
         &self.ipc
+    }
+
+    /// 保持役の network namespace のパス（`/proc/<pid>/ns/net`。#2878・NET-3）。pod の `POD` network の join 先で、
+    /// `PodNetworkRequest::holder_namespaces` 経由で provider にも渡る（provider は新しい netns を作らずこれを結線する）。
+    pub fn net(&self) -> &str {
+        &self.net
     }
 }
 
@@ -928,12 +942,26 @@ fn namespaces<'a>(
         }
     }
     match resolve_mode("namespace_options.network", o.network)? {
-        // POD で pod の netns のパスを受けたときだけ join 指定にする。パス無しは従来どおり path なしの
-        // 要素で、core の start が `UNIMPLEMENTED` で拒否する（実装済みを装わない。REPAIR-3）。
-        NamespaceMode::Pod => out.push(NamespaceOut {
-            kind: "network",
-            path: pod_netns,
-        }),
+        // 保持役があり ipc を join するときは、保持役の netns へ join する（#2878・NET-3）。provider のパスが
+        // あれば保持役のパスと完全一致を要求する（二次防御）。core の net の join は user＋ipc の組に足す形でしか
+        // 受けないため、ipc を join しない構成での network の `POD` は cri で先に `UNIMPLEMENTED` にする（fail-closed）。
+        // 保持役が無ければ従来どおり provider のパス、無ければ path なしで core の start が拒否する（REPAIR-3）。
+        NamespaceMode::Pod => {
+            let path = match (pod, join) {
+                (Some(h), Some(_)) => {
+                    if pod_netns.is_some_and(|p| p != h.net()) {
+                        return Err(CriError::internal("pod network namespace path mismatch"));
+                    }
+                    Some(h.net())
+                }
+                (Some(_), None) => return Err(unsupported("namespace_options.network")),
+                (None, _) => pod_netns,
+            };
+            out.push(NamespaceOut {
+                kind: "network",
+                path,
+            });
+        }
         NamespaceMode::Container => out.push(NamespaceOut {
             kind: "network",
             path: None,
@@ -1727,12 +1755,16 @@ mod tests {
     #[test]
     fn accepts_canonical_pair() {
         for pid in ["4242", "1", "2147483647"] {
-            let (u, i) = (
+            let (u, i, n) = (
                 format!("/proc/{pid}/ns/user"),
                 format!("/proc/{pid}/ns/ipc"),
+                format!("/proc/{pid}/ns/net"),
             );
-            let p = PodNamespacePaths::from_paths(&u, &i).expect("canonical");
-            assert_eq!((p.user(), p.ipc()), (u.as_str(), i.as_str()));
+            let p = PodNamespacePaths::from_paths(&u, &i, &n).expect("canonical");
+            assert_eq!(
+                (p.user(), p.ipc(), p.net()),
+                (u.as_str(), i.as_str(), n.as_str())
+            );
         }
     }
 
@@ -1759,8 +1791,29 @@ mod tests {
             ("proc/1/ns/user", "proc/1/ns/ipc"),
         ];
         for (u, i) in cases {
-            let e = PodNamespacePaths::from_paths(u, i).expect_err(u);
+            // net は ipc と同じ pid の正準形にして、user / ipc 側の不正だけを見る。
+            let n = i.replace("/ns/ipc", "/ns/net");
+            let e = PodNamespacePaths::from_paths(u, i, &n).expect_err(u);
             assert_eq!(e.code(), CriErrorCode::Internal, "{u} {i}");
+        }
+    }
+
+    /// net の不正（pid の不一致・種別違い・形式違反）も `INTERNAL`（NET-3・SEC-5。#2878）。
+    #[test]
+    fn rejects_malformed_net_path_with_internal() {
+        let (u, i) = ("/proc/1/ns/user", "/proc/1/ns/ipc");
+        for n in [
+            "/proc/2/ns/net",
+            "/proc/1/ns/user",
+            "/proc/1/ns/ipc",
+            "/proc/self/ns/net",
+            "/proc/1/ns/net/",
+            "/proc/01/ns/net",
+            "/run/netns/x",
+            "",
+        ] {
+            let e = PodNamespacePaths::from_paths(u, i, n).expect_err(n);
+            assert_eq!(e.code(), CriErrorCode::Internal, "{n}");
         }
     }
 
@@ -1769,6 +1822,7 @@ mod tests {
         let p = PodNamespacePaths::for_holder_pid(NonZeroU32::new(4242).expect("nz")).expect("ok");
         assert_eq!(p.user(), "/proc/4242/ns/user");
         assert_eq!(p.ipc(), "/proc/4242/ns/ipc");
+        assert_eq!(p.net(), "/proc/4242/ns/net");
         let max = i32::MAX as u32;
         PodNamespacePaths::for_holder_pid(NonZeroU32::new(max).expect("nz")).expect("max");
         for over in [max + 1, u32::MAX] {

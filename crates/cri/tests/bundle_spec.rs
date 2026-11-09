@@ -1145,17 +1145,17 @@ fn pod_ipc_is_joined_when_paths_are_supplied() {
             {"type": "mount"},
             {"type": "uts"},
             {"type": "user", "path": "/proc/4242/ns/user"},
-            {"type": "network"},
+            {"type": "network", "path": "/proc/4242/ns/net"},
         ])
     );
 }
 
 #[test]
 fn container_ipc_and_pid_never_join() {
-    // ipc CONTAINER は供給元があっても新しい namespace。
+    // ipc CONTAINER は供給元があっても新しい namespace（network は join しないので CONTAINER にして切り離す）。
     let c = with_sc(|sc| {
         sc.namespace_options = Some(ns(
-            NamespaceMode::Pod,
+            NamespaceMode::Container,
             NamespaceMode::Pod,
             NamespaceMode::Container,
         ));
@@ -1218,6 +1218,118 @@ fn pod_ipc_join_conflicts_with_container_userns() {
     build(&pod(), &c);
 }
 
+fn build_pods_json(
+    p: &PodSandboxConfig,
+    c: &ContainerConfig,
+    pod_paths: Option<&PodNamespacePaths>,
+    pod_netns: Option<&str>,
+) -> Result<Value, fandhe_container_cri::error::CriError> {
+    let json = fandhe_container_cri::bundle::build_runtime_config_with_files_and_pods(
+        p,
+        c,
+        &ImageDefaults::default(),
+        &BundleFiles::none(),
+        pod_paths,
+        pod_netns,
+    )?;
+    Ok(serde_json::from_slice(json.as_bytes()).expect("json"))
+}
+
+/// CRI-2・NET-3・SEC-5（#2878）: ipc × network × 保持役の行列。保持役の netns は ipc を join する構成の
+/// network `POD` にだけ出る。ipc を join しない network `POD` は fail-closed で `UNIMPLEMENTED`。
+#[test]
+fn net3_holder_netns_matrix() {
+    let paths = pod_paths();
+    let c = |net, ipc| with_sc(|sc| sc.namespace_options = Some(ns(net, NamespaceMode::Pod, ipc)));
+    let netw = |v: &Value| network_entry(v).cloned();
+    // (POD, POD, あり) → 保持役の net の path。
+    let v = build_pods_json(
+        &pod(),
+        &c(NamespaceMode::Pod, NamespaceMode::Pod),
+        Some(&paths),
+        None,
+    )
+    .expect("pod/pod");
+    assert_eq!(
+        netw(&v),
+        Some(serde_json::json!({"type": "network", "path": "/proc/4242/ns/net"}))
+    );
+    // network CONTAINER → path 無しの network。
+    let v = build_pods_json(
+        &pod(),
+        &c(NamespaceMode::Container, NamespaceMode::Pod),
+        Some(&paths),
+        None,
+    )
+    .expect("container");
+    assert_eq!(netw(&v), Some(serde_json::json!({"type": "network"})));
+    // network NODE → network エントリ無し。
+    let v = build_pods_json(
+        &pod(),
+        &c(NamespaceMode::Node, NamespaceMode::Pod),
+        Some(&paths),
+        None,
+    )
+    .expect("node");
+    assert_eq!(netw(&v), None);
+    // ipc CONTAINER・network POD・保持役あり → UNIMPLEMENTED（net 単独の join は core が受けない）。
+    let e = build_pods_json(
+        &pod(),
+        &c(NamespaceMode::Pod, NamespaceMode::Container),
+        Some(&paths),
+        None,
+    )
+    .expect_err("ipc not joined");
+    assert_eq!(e.code(), CriErrorCode::Unimplemented);
+    // 保持役なし → 従来の出力（path 無し）。
+    let v = build_pods_json(&pod(), &ctr(), None, None).expect("none");
+    assert_eq!(netw(&v), Some(serde_json::json!({"type": "network"})));
+}
+
+/// CRI-2・NET-3（#2878）: provider のパスが保持役の net と一致なら 1 件だけ出し、食い違えば `INTERNAL`。
+#[test]
+fn net3_holder_netns_and_provider_path_must_agree() {
+    let paths = pod_paths();
+    let v = build_pods_json(&pod(), &ctr(), Some(&paths), Some("/proc/4242/ns/net")).expect("same");
+    let n: Vec<_> = v["linux"]["namespaces"]
+        .as_array()
+        .expect("arr")
+        .iter()
+        .filter(|e| e["type"] == "network")
+        .collect();
+    assert_eq!(
+        n,
+        vec![&serde_json::json!({"type": "network", "path": "/proc/4242/ns/net"})]
+    );
+    let e = build_pods_json(&pod(), &ctr(), Some(&paths), Some(POD_NETNS)).expect_err("mismatch");
+    assert_eq!(e.code(), CriErrorCode::Internal);
+}
+
+/// CRI-2・NET-3（#2878）: 保持役の netns では公開できない。provider の netns が無ければ `port_mappings` は
+/// `UNIMPLEMENTED` のまま。
+#[test]
+fn net3_holder_netns_does_not_satisfy_port_mappings() {
+    let mut p = pod();
+    p.port_mappings = vec![port_mapping(0, 8080, 80, "192.0.2.10")];
+    let e = build_pods_json(&p, &ctr(), Some(&pod_paths()), None).expect_err("no provider");
+    assert_eq!(e.code(), CriErrorCode::Unimplemented);
+}
+
+/// SEC-5（#2878）: pid が別の 2 つのパスは互いの pid を含まない。
+#[test]
+fn net3_paths_of_two_holders_do_not_mix() {
+    let a = PodNamespacePaths::for_holder_pid(NonZeroU32::new(4242).expect("nz")).expect("a");
+    let b = PodNamespacePaths::for_holder_pid(NonZeroU32::new(4343).expect("nz")).expect("b");
+    let va = build_pods_json(&pod(), &ctr(), Some(&a), None).expect("a");
+    let vb = build_pods_json(&pod(), &ctr(), Some(&b), None).expect("b");
+    assert!(!va.to_string().contains("4343"));
+    assert!(!vb.to_string().contains("4242"));
+    assert_eq!(
+        network_entry(&vb),
+        Some(&serde_json::json!({"type": "network", "path": "/proc/4343/ns/net"}))
+    );
+}
+
 /// 公開の構築口は保持役の pid だけ（#2776）。文字列形式の拒否の照合は spec.rs の単体試験にある。
 #[test]
 fn pod_namespace_paths_only_from_holder_pid() {
@@ -1227,6 +1339,7 @@ fn pod_namespace_paths_only_from_holder_pid() {
             .expect("in range");
         assert_eq!(p.user(), format!("/proc/{pid}/ns/user"));
         assert_eq!(p.ipc(), format!("/proc/{pid}/ns/ipc"));
+        assert_eq!(p.net(), format!("/proc/{pid}/ns/net"));
     }
     let e = PodNamespacePaths::for_holder_pid(NonZeroU32::new(max + 1).expect("nonzero"))
         .expect_err("over pid_t");

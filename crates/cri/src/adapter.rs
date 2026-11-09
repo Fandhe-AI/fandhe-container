@@ -296,7 +296,7 @@ impl<'a> BundleRequest<'a> {
         self
     }
 
-    /// pod の user・ipc namespace のパスを足す（#2674）。
+    /// pod の user・ipc・net namespace のパスを足す（#2674・#2878）。
     #[must_use]
     pub fn with_pod_namespaces(
         mut self,
@@ -313,9 +313,16 @@ impl<'a> BundleRequest<'a> {
 /// `StopPodSandbox`・`RemovePodSandbox` が [`PodNetworkProvider::tear_down`] を呼ぶ。実装は plugin-cri が
 /// `NetworkPlugin`（core のトレイト境界）へ写して差す。cri は net の具象型を知らない（CRI-7）。
 ///
-/// **未実装・簡易実装（REPAIR-3）**: コンテナが netns へ入る側（core の `linux.namespaces[].path` の受け入れ）は
-/// 未実装で、注入しても start は `UNIMPLEMENTED` で拒否される。本番の plugin-cri は注入しない
-/// （`docs/design/cri-config-acceptance.md` の順 13）。
+/// # 保持役の netns の契約（#2878・NET-3）
+///
+/// [`PodNetworkRequest::holder_namespaces`] が `Some` のとき、pod の netns は保持役が作ったもの（`/proc/<pid>/ns/net`）で、
+/// provider は新しい netns を作らず、その netns を結線する。返す [`PodNetns`] のパスは
+/// `holder_namespaces().net()` と完全一致させる（`CriRuntimeService` が照合し、食い違えば `INTERNAL` で
+/// 失敗にして `tear_down` で回収する）。結線できない provider は資源を作らずに `Err`（`UNIMPLEMENTED`）を返す。
+///
+/// **簡易実装（REPAIR-3）**: コンテナが netns へ入る側（core の join）は #2872 で実装済みで、保持役がある構成では
+/// bundle が保持役の netns へ join する。本番の plugin-cri はまだ provider を注入しない（H10・#2879。
+/// `docs/design/cri-config-acceptance.md` の順 13）。
 /// エラー文言に config の値・パスを含めないこと。
 pub trait PodNetworkProvider: Send + Sync {
     /// サンドボックスの netns を作って結線し、そのパスを返す。失敗時は資源を残さない（残るなら `Err` で報告）。
@@ -337,6 +344,8 @@ pub struct PodNetworkRequest<'a> {
     pub config: &'a PodSandboxConfig,
     /// 検証済みの公開指定（`port_mappings` のうち `host_port > 0` のもの。#2676・CRI-2・NET-3）。
     port_publishes: &'a [PodPortPublish],
+    /// pod の保持役の namespace（net は `/proc/<pid>/ns/net`。#2878・NET-3）。無ければ provider が netns を作る。
+    holder_namespaces: Option<&'a crate::bundle::PodNamespacePaths>,
 }
 
 impl<'a> PodNetworkRequest<'a> {
@@ -346,6 +355,7 @@ impl<'a> PodNetworkRequest<'a> {
             sandbox_id,
             config,
             port_publishes: &[],
+            holder_namespaces: None,
         }
     }
 
@@ -353,6 +363,18 @@ impl<'a> PodNetworkRequest<'a> {
     pub fn with_port_publishes(mut self, port_publishes: &'a [PodPortPublish]) -> Self {
         self.port_publishes = port_publishes;
         self
+    }
+
+    /// 保持役の namespace を足す（#2878）。`set_up` は新しい netns を作らず `net()` の netns を結線する。
+    #[must_use]
+    pub fn with_holder_namespaces(mut self, p: &'a crate::bundle::PodNamespacePaths) -> Self {
+        self.holder_namespaces = Some(p);
+        self
+    }
+
+    /// 保持役の namespace。`Some` のとき provider は [`PodNetworkProvider`] の契約に従う。
+    pub fn holder_namespaces(&self) -> Option<&'a crate::bundle::PodNamespacePaths> {
+        self.holder_namespaces
     }
 
     /// 検証済みの公開指定。`set_up` はこれをすべて公開するか、失敗して資源を残さない。

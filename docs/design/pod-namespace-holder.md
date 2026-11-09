@@ -131,7 +131,7 @@
 | H5 | #2876 | cri: `with_pod_namespaces` の配線と pod A/B の結合試験 | oci-cri-builder | H4 |
 | H6 | #2877 | plugin-cri: 本番の保持役 provider と注入 | oci-cri-builder | H2・H4 |
 | H7 | #2872 | core: pod の network namespace の join | runtime-builder | なし |
-| H8 | #2878 | cri: 保持役の netns を bundle と `PodNetworkRequest` へ渡す | oci-cri-builder | H5・H7 |
+| H8 | #2878 | cri: 保持役の netns を bundle と `PodNetworkRequest` へ渡す（実装済み） | oci-cri-builder | H5・H7 |
 | H9 | #2873 | cri: `PodSandboxStatus.network` の IP の報告 | oci-cri-builder | なし |
 | H10 | #2879 | cri: rootless の本番 `PodNetworkProvider`（pasta）の注入 | oci-cri-builder・net-builder | #1935・#341・H8 |
 | H11 | #2880 | 実機確認（人間担当） | 人間 | H6・H8 |

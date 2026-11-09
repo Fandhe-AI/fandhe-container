@@ -118,9 +118,14 @@ impl PodNamespaceHolderProvider for FakeHolder {
     }
 }
 
+#[derive(Default)]
 struct FakeNet {
     log: Log,
     fail_set_up: bool,
+    /// 保持役の netns と違うパスを返す（契約違反の provider。#2878）。
+    wrong_path: bool,
+    /// `set_up` が受けた保持役の (user, ipc, net)。
+    seen: Mutex<Vec<Option<(String, String, String)>>>,
 }
 
 impl PodNetworkProvider for FakeNet {
@@ -129,10 +134,18 @@ impl PodNetworkProvider for FakeNet {
         if self.fail_set_up {
             return Err(CriError::failed_precondition("network unavailable"));
         }
-        PodNetns::new(std::path::PathBuf::from(format!(
-            "/state/.netns/{}",
-            req.sandbox_id
-        )))
+        self.seen.lock().unwrap().push(
+            req.holder_namespaces()
+                .map(|h| (h.user().to_owned(), h.ipc().to_owned(), h.net().to_owned())),
+        );
+        // 契約: 保持役があるときはその netns をそのまま返す（#2878）。
+        match req.holder_namespaces() {
+            Some(h) if !self.wrong_path => PodNetns::new(std::path::PathBuf::from(h.net())),
+            _ => PodNetns::new(std::path::PathBuf::from(format!(
+                "/state/.netns/{}",
+                req.sandbox_id
+            ))),
+        }
     }
     fn tear_down(&self, _sandbox_id: &str) -> Result<(), CriError> {
         self.log.lock().unwrap().push("tear_down".into());
@@ -361,6 +374,7 @@ async fn repair5_dropped_run_during_holder_spawn_does_not_leave_network_pending(
     let net = Arc::new(FakeNet {
         log: Arc::clone(&log),
         fail_set_up: false,
+        ..Default::default()
     });
     let svc = service(&holder).with_pod_network(net);
     let dropped = tokio::time::timeout(Duration::from_millis(50), run(&svc)).await;
@@ -563,6 +577,7 @@ async fn cri2_holder_is_spawned_before_set_up_and_released_after_tear_down() {
     let net = Arc::new(FakeNet {
         log: Arc::clone(&log),
         fail_set_up: false,
+        ..Default::default()
     });
     let svc = service(&holder).with_pod_network(net);
     let id = run(&svc).await.unwrap();
@@ -585,6 +600,7 @@ async fn cri2_set_up_failure_unwinds_in_reverse_order() {
     let net = Arc::new(FakeNet {
         log: Arc::clone(&log),
         fail_set_up: true,
+        ..Default::default()
     });
     let svc = service(&holder).with_pod_network(net);
     let e = run(&svc).await.unwrap_err();
@@ -689,4 +705,73 @@ async fn cri2_run_dropped_after_holder_ready_before_confirm_stays_notready() {
     assert_eq!(items[0].1, NOTREADY);
     assert_eq!(state_of(&svc, &id).await, NOTREADY);
     assert!(create_container(&svc, &id).await.is_err());
+}
+
+/// NET-3・SEC-5（#2878）: `set_up` は自 sandbox の保持役の pid の `/proc/<pid>/ns/{user,ipc,net}` を受ける。
+#[tokio::test]
+async fn net3_set_up_receives_the_holder_namespaces_of_its_own_sandbox() {
+    let log = new_log();
+    let holder = FakeHolder::new(&log, Spawn::Ok);
+    let net = Arc::new(FakeNet {
+        log: Arc::clone(&log),
+        ..Default::default()
+    });
+    let svc = service(&holder).with_pod_network(net.clone());
+    run(&svc).await.unwrap();
+    assert_eq!(
+        *net.seen.lock().unwrap(),
+        vec![Some((
+            "/proc/4242/ns/user".to_owned(),
+            "/proc/4242/ns/ipc".to_owned(),
+            "/proc/4242/ns/net".to_owned()
+        ))]
+    );
+}
+
+/// NET-3（#2878）: 保持役の netns と違うパスを返す provider は採用せず、逆順に回収して記録を残さない。
+#[tokio::test]
+async fn net3_provider_path_mismatch_is_internal_and_unwinds() {
+    let log = new_log();
+    let holder = FakeHolder::new(&log, Spawn::Ok);
+    let net = Arc::new(FakeNet {
+        log: Arc::clone(&log),
+        wrong_path: true,
+        ..Default::default()
+    });
+    let svc = service(&holder).with_pod_network(net);
+    let e = run(&svc).await.unwrap_err();
+    assert_eq!(e.code(), Code::Internal);
+    assert_eq!(
+        e.message(),
+        "pod network provider did not wire the holder network namespace"
+    );
+    let calls = log.lock().unwrap().clone();
+    assert_eq!(calls.len(), 4, "{calls:?}");
+    assert!(calls[0].starts_with("spawn "));
+    assert_eq!(calls[1], "set_up");
+    assert_eq!(calls[2], "tear_down");
+    assert!(calls[3].starts_with("release "));
+    assert!(list(&svc).await.is_empty());
+}
+
+/// NET-3・CRI-2（#2878）: provider なし・保持役ありの `POD` は `NetworkReady` を偽に保ち、Status の network は空。
+#[tokio::test]
+async fn net3_without_provider_status_network_stays_empty() {
+    let log = new_log();
+    let holder = FakeHolder::new(&log, Spawn::Ok);
+    let svc = service(&holder);
+    let id = run(&svc).await.unwrap();
+    let st = RuntimeService::pod_sandbox_status(
+        &svc,
+        Request::new(v1::PodSandboxStatusRequest {
+            pod_sandbox_id: id,
+            verbose: false,
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner()
+    .status
+    .unwrap();
+    assert!(st.network.is_none_or(|n| n.ip.is_empty()));
 }

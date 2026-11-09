@@ -7,9 +7,11 @@
 //! （試験だけが呼ぶ。net にコンテナ単位の切り離しが無く、共有ネットワークでは pod ごとの後始末ができないため。REPAIR-3）。
 //!
 //! 呼び出し元: `RunPodSandbox` / `StopPodSandbox` / `RemovePodSandbox`（cri の `CriRuntimeService::with_pod_network`
-//! で注入したときだけ）。**本番（`CriPluginBackends::production`）は注入しない**: core の start が network namespace の
-//! join を未実装で拒否するため、注入すると bridge・netns・veth を作るのに start が `UNIMPLEMENTED` で失敗する
-//! （`docs/design/cri-config-acceptance.md` の順 13。REPAIR-3）。
+//! で注入したときだけ）。**本番（`CriPluginBackends::production`）は注入しない**: この provider は rootful 前提で自前の
+//! netns を作って pin し、保持役（pod の userns 所有）の netns は結線できない。core の join は #2872 で実装済みだが、
+//! init userns 所有の netns の join は #2241 まで受けない。保持役がある構成（`PodNetworkRequest::holder_namespaces`
+//! が `Some`）では資源を作らずに `UNIMPLEMENTED` で拒否する（#2878・NET-3。
+//! `docs/design/cri-config-acceptance.md` の順 13。REPAIR-3）。
 //!
 //! | CRI の操作 | 関数 | `NetworkPlugin` の呼び出し |
 //! | ---------- | ---- | -------------------------- |
@@ -431,6 +433,12 @@ impl NetsetupPodNetwork {
 impl PodNetworkProvider for NetsetupPodNetwork {
     fn set_up(&self, req: &PodNetworkRequest<'_>) -> Result<PodNetns, CriError> {
         let to_cri = |e: TraitError| CriError::from(&e);
+        // 保持役の netns は結線できない。資源（ネットワーク・リース・netns）を作る前に拒否する（#2878・NET-3）。
+        if req.holder_namespaces().is_some() {
+            return Err(CriError::unimplemented(
+                "pod network provider cannot attach to a holder network namespace",
+            ));
+        }
         let (_, _, netns_name) = sandbox_names(req.sandbox_id).map_err(to_cri)?;
         // 資源を作る前にパスを検証する（作った後で拒否して残骸を作らない）。
         let netns = PodNetns::new(self.netns_path(&netns_name)?)?;

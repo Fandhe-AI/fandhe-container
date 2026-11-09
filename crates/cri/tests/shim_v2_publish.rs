@@ -713,7 +713,7 @@ impl TaskExecLauncher for ExitableLauncher {
         _: &ContainerId,
         _: &ExecId,
         _: &ExecProcessSpec,
-        _: Option<u64>,
+        _expected_instance: Option<u64>,
     ) -> Result<Arc<dyn TaskExecProcess>, CriError> {
         Ok(Arc::new(ExitableProc(Arc::clone(&self.0))))
     }

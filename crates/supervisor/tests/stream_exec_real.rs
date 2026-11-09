@@ -10,6 +10,14 @@
 //! - `echo`: `Started` の後に `Result(Exited(0))`。stdout は `se-stdout-line\n`、stderr は `se-stderr-line\n` と別々に一致する。
 //! - `exit3`: `Result(Exited(3))`。
 //! - `stdin`: 渡した stdin のバイト列（`se-stdin-payload\n`）がコマンドの stdout に戻る。
+//! - `mask_mismatch`（SUP-6・SEC-1・REPAIR-12・#4327）: helper の期待 mask と送る fd の組が食い違う 2 方向（余分な stdin・足りない stdin）で、
+//!   最初のメッセージが `Result(Failed(InvalidArgument))`（`Started`・`Spawned` 無し）、helper は終了コード 0、fd 2（socketpair）の診断行が
+//!   `{"component":"supervisor.stream_exec","stage":"helper_stdio_handover","code":"INVALID_ARGUMENT","errno":"none"}` に完全一致し、
+//!   コマンド（`mark`）が実行されない。陽性対照（一致する組なら `mark` の証跡が現れる）つき。診断行は AF_UNIX の socket にしか出ないため pipe は使わない。
+//! - `stdio_kind`（同上）: 有無は一致するが fd が文字デバイス（stdin の `/dev/null`）・通常ファイル（stdout）の 2 件で、
+//!   段が `helper_stdio_kind`、他は `mask_mismatch` と同じ照合（通常ファイルは 0 バイトのまま）。
+//!   対象外: `FdCountMismatch`（`StdioSend` は fd の有無から mask を導くため本数の不一致を作れない）と、`require_stdio_kinds` の errno つき
+//!   `Internal`（受け取った直後の dup・fstat の失敗は実環境で決定的に起こせない）。どちらもユニット試験で担保する。
 //! - `disconnect`（接続断での停止。REPAIR-5）: `Started` の後に helper を SIGKILL すると、supervisor のガードが exec 子 cgroup
 //!   を回収し、コマンドの心拍ファイルが増えなくなる。`Result` は届かず channel は EOF（`Closed`）になる。
 //! - `signal_term`（SIGKILL 以外のシグナル。SUP-6・SEC-1・CRI-5・#4282）: 終わらないコマンド（`ready-sleep`）が起動した後に `Signal(SIGTERM)` を送ると、
@@ -195,6 +203,12 @@ mod linux {
     const REQUESTER_READY_FILE: &str = "se-requester-ready";
     /// 要求元の消滅から helper の終了までの合格の上限（`docs/design/cri-streaming-server.md` の目標値。通知処理のない通常ケース）。
     const REQUESTER_KILL_BUDGET: Duration = Duration::from_secs(2);
+    /// `mark` コマンドが書く証跡のファイル名（`mask_mismatch`・`stdio_kind` 用。exec が起きたかの判定）。
+    const MARK_FILE: &str = "se-must-not-run";
+    const MARK_CONTENT: &str = "MARK";
+    /// fd 2 に出る診断行の期待値（`HelperFailure::diagnostic_line` + 改行。errno は OS 由来でないため `"none"`。#4284）。
+    const DIAG_MASK_MISMATCH: &str = "{\"component\":\"supervisor.stream_exec\",\"stage\":\"helper_stdio_handover\",\"code\":\"INVALID_ARGUMENT\",\"errno\":\"none\"}\n";
+    const DIAG_STDIO_KIND: &str = "{\"component\":\"supervisor.stream_exec\",\"stage\":\"helper_stdio_kind\",\"code\":\"INVALID_ARGUMENT\",\"errno\":\"none\"}\n";
     /// pid1 とコマンドの寿命の上限（取り残し防止。REPAIR-5）。
     const PROBE_LIFETIME: Duration = Duration::from_secs(60);
 
@@ -241,6 +255,14 @@ mod linux {
                 std::process::exit(0);
             }
             Some("exit3") => std::process::exit(3),
+            Some("mark") => {
+                // exec が起きたことの証跡（stdio の種別に依らない）。拒否の場面ではこのファイルが現れないことを確かめる。
+                let path = format!("{DATA_DEST}/{MARK_FILE}");
+                if std::fs::write(&path, MARK_CONTENT).is_err() {
+                    std::process::exit(9);
+                }
+                std::process::exit(0);
+            }
             Some("cat") => {
                 let mut data = Vec::new();
                 if std::io::stdin().read_to_end(&mut data).is_err() {
@@ -498,6 +520,9 @@ mod linux {
     enum HelperStderr {
         Inherit,
         Piped,
+        /// AF_UNIX の socketpair の片端。診断行（`emit_diagnostic_line_to`）は出力先が AF_UNIX の socket のときだけ書かれ、
+        /// pipe では捨てられる（`NotUnixSocket`）ため、起動失敗の行を読むにはこれを使う。
+        Socket,
     }
 
     /// 1 回の exec の結果。
@@ -536,43 +561,83 @@ mod linux {
         });
         let (stdout_w, stderr_w) = (OwnedFd::from(stdout_w), OwnedFd::from(stderr_w));
         let mask = StdioMask::from_presence(stdin_r.is_some(), true, true);
-        let args = StreamExecArgs::new(
-            ctx.state_root.clone(),
-            ctx.id.clone(),
-            ctx.pid,
-            Duration::from_millis(timeout_ms),
+        let raw = spawn_with(
+            ctx,
+            mode,
+            timeout_ms,
             mask,
-            vec!["/probe".into(), "--se-cmd".into(), mode.into()],
-        )
-        .expect("stream-exec args");
-        let (plugin, helper_end) = UnixStream::pair().expect("socketpair");
-        let mut command = stream_exec_command(&ctx.exe, &args);
-        command
-            .stdin(Stdio::from(OwnedFd::from(helper_end)))
-            .stdout(Stdio::null())
-            .stderr(match helper_stderr {
-                HelperStderr::Inherit => Stdio::inherit(),
-                HelperStderr::Piped => Stdio::piped(),
-            });
-        let mut child = command.spawn().expect("spawn the stream-exec helper");
-        let helper_stderr = child.stderr.take().map(|e| File::from(OwnedFd::from(e)));
-        send_stdio_handover(
-            &plugin,
             &StdioSend {
                 stdin: stdin_r.as_ref().map(AsFd::as_fd),
                 stdout: Some(stdout_w.as_fd()),
                 stderr: Some(stderr_w.as_fd()),
             },
-            Instant::now() + timeout(),
-        )
-        .expect("send the stdio handover");
+            helper_stderr,
+        );
         // 送り側の複製は閉じる（コマンドが持つ書き込み端だけが残り、終了で EOF になる）。
         drop((stdout_w, stderr_w, stdin_r));
         Spawned {
-            child,
-            plugin,
+            child: raw.child,
+            plugin: raw.plugin,
             stdout: File::from(OwnedFd::from(stdout_r)),
             stderr: File::from(OwnedFd::from(stderr_r)),
+            helper_stderr: raw.helper_stderr,
+        }
+    }
+
+    /// helper の起動と stdio の受け渡しだけの結果（fd の保持は呼び出し側）。
+    struct RawSpawned {
+        child: Child,
+        plugin: UnixStream,
+        helper_stderr: Option<File>,
+    }
+
+    /// helper を起動し、`send` の fd を渡す。helper へ引数で渡す期待 mask（`expected`）と `send` の mask を
+    /// 別々に決められるので、mask 不一致・fd 種別の不正といった拒否の経路を作れる（SUP-6・REPAIR-12・#4327）。
+    fn spawn_with(
+        ctx: &Ctx,
+        mode: &str,
+        timeout_ms: u64,
+        expected: StdioMask,
+        send: &StdioSend<'_>,
+        helper_stderr: HelperStderr,
+    ) -> RawSpawned {
+        let args = StreamExecArgs::new(
+            ctx.state_root.clone(),
+            ctx.id.clone(),
+            ctx.pid,
+            Duration::from_millis(timeout_ms),
+            expected,
+            vec!["/probe".into(), "--se-cmd".into(), mode.into()],
+        )
+        .expect("stream-exec args");
+        let (plugin, helper_end) = UnixStream::pair().expect("socketpair");
+        let mut command = stream_exec_command(&ctx.exe, &args);
+        let mut diag_parent: Option<UnixStream> = None;
+        command
+            .stdin(Stdio::from(OwnedFd::from(helper_end)))
+            .stdout(Stdio::null());
+        match helper_stderr {
+            HelperStderr::Inherit => command.stderr(Stdio::inherit()),
+            HelperStderr::Piped => command.stderr(Stdio::piped()),
+            HelperStderr::Socket => {
+                let (parent, child_end) = UnixStream::pair().expect("diagnostic socketpair");
+                diag_parent = Some(parent);
+                command.stderr(Stdio::from(OwnedFd::from(child_end)))
+            }
+        };
+        let mut child = command.spawn().expect("spawn the stream-exec helper");
+        // `command` が持つ子側の端は親に残さない（helper の終了で EOF になるように）。
+        drop(command);
+        let helper_stderr = child
+            .stderr
+            .take()
+            .map(|e| File::from(OwnedFd::from(e)))
+            .or_else(|| diag_parent.map(|s| File::from(OwnedFd::from(s))));
+        send_stdio_handover(&plugin, send, Instant::now() + timeout())
+            .expect("send the stdio handover");
+        RawSpawned {
+            child,
+            plugin,
             helper_stderr,
         }
     }
@@ -963,6 +1028,199 @@ mod linux {
         );
     }
 
+    /// 拒否された起動の観測結果。
+    struct Rejected {
+        first: HelperMessage,
+        exit: Option<i32>,
+        /// helper の fd 2（socketpair）を EOF まで読んだ内容。
+        diag: String,
+    }
+
+    /// 最初のメッセージ（`Result`）と helper の終了コード、fd 2 の診断行を期限つきで回収する（REPAIR-5）。
+    fn finish_rejected(mut sp: RawSpawned) -> Rejected {
+        let first = recv_from_helper(&sp.plugin, Instant::now() + timeout())
+            .unwrap_or_else(|e| panic!("channel failed before the result: {e:?}"));
+        let exit = wait_child(&mut sp.child);
+        let diag = read_to_end_bounded(
+            sp.helper_stderr.take().expect("helper stderr was a socket"),
+            Instant::now() + timeout(),
+        );
+        Rejected {
+            first,
+            exit,
+            diag: String::from_utf8_lossy(&diag).into_owned(),
+        }
+    }
+
+    /// 拒否の共通の照合: `Result(Failed(InvalidArgument))` だけが届き、helper は 0 で終わり、診断行が期待と完全一致する。
+    /// 診断行にコンテナ ID・状態ルート・argv を含まない（SEC-1）。
+    fn assert_rejected(r: &Rejected, ctx: &Ctx, want_diag: &str, what: &str) {
+        assert!(
+            matches!(
+                &r.first,
+                HelperMessage::Result(StreamExecOutcome::Failed(ErrorCode::InvalidArgument))
+            ),
+            "{what}: the first message must be the failed result (no Started/Spawned): {:?}",
+            r.first
+        );
+        assert_eq!(r.exit, Some(0), "{what}: the helper must exit 0");
+        assert_eq!(r.diag, want_diag, "{what}: diagnostic line");
+        let root = ctx.state_root.to_string_lossy();
+        assert!(
+            !r.diag.contains(ctx.id.as_str())
+                && !r.diag.contains(root.as_ref())
+                && !r.diag.contains("/probe"),
+            "{what}: the diagnostic line must not leak the id, the state root or argv: {}",
+            r.diag
+        );
+    }
+
+    /// mask_mismatch: helper が期待する mask と plugin-cri 役が送る fd の組が食い違うと、`helper_stdio_handover` の段で
+    /// `INVALID_ARGUMENT`（errno `none`）として拒否され、exec は起きない（SUP-6・SEC-1・REPAIR-12・#4327）。
+    /// kind 6 の後の段のため、稼働中の supervisor（制御サーバー）が居る間に回す。
+    fn mask_mismatch(ctx: &Ctx, hostdata: &Path) {
+        let mark = hostdata.join(MARK_FILE);
+        let _ = std::fs::remove_file(&mark);
+
+        // 陽性対照: 一致する組なら `mark` が実行され、証跡が現れる（後の「現れない」を空の主張にしない）。
+        let f = finish(spawn_exec(ctx, "mark", None, 20_000, HelperStderr::Inherit));
+        assert_eq!(f.outcome, StreamExecOutcome::Exited(0));
+        assert_eq!(
+            std::fs::read_to_string(&mark).as_deref().ok(),
+            Some(MARK_CONTENT),
+            "the positive control must leave the mark"
+        );
+        std::fs::remove_file(&mark).expect("remove the mark");
+
+        // (a) 期待は stdout+stderr、送るのは stdin+stdout+stderr。
+        let (so_r, so_w) = std::io::pipe().expect("stdout pipe");
+        let (se_r, se_w) = std::io::pipe().expect("stderr pipe");
+        let (si_r, si_w) = std::io::pipe().expect("stdin pipe");
+        drop(si_w);
+        let (so_w, se_w, si_r) = (
+            OwnedFd::from(so_w),
+            OwnedFd::from(se_w),
+            OwnedFd::from(si_r),
+        );
+        let raw = spawn_with(
+            ctx,
+            "mark",
+            20_000,
+            StdioMask::from_presence(false, true, true),
+            &StdioSend {
+                stdin: Some(si_r.as_fd()),
+                stdout: Some(so_w.as_fd()),
+                stderr: Some(se_w.as_fd()),
+            },
+            HelperStderr::Socket,
+        );
+        drop((so_w, se_w, si_r));
+        let r = finish_rejected(raw);
+        assert_rejected(&r, ctx, DIAG_MASK_MISMATCH, "mask (a) extra stdin");
+        assert!(!mark.exists(), "mask (a): the command must not run");
+        assert_eq!(
+            read_to_end_bounded(File::from(OwnedFd::from(so_r)), Instant::now() + timeout()),
+            Vec::<u8>::new(),
+            "mask (a): stdout must be empty and reach EOF"
+        );
+        drop(se_r);
+
+        // (b) 期待は stdin+stdout+stderr、送るのは stdout+stderr だけ。
+        let (so_r, so_w) = std::io::pipe().expect("stdout pipe");
+        let (se_r, se_w) = std::io::pipe().expect("stderr pipe");
+        let (so_w, se_w) = (OwnedFd::from(so_w), OwnedFd::from(se_w));
+        let raw = spawn_with(
+            ctx,
+            "mark",
+            20_000,
+            StdioMask::from_presence(true, true, true),
+            &StdioSend {
+                stdin: None,
+                stdout: Some(so_w.as_fd()),
+                stderr: Some(se_w.as_fd()),
+            },
+            HelperStderr::Socket,
+        );
+        drop((so_w, se_w));
+        let r = finish_rejected(raw);
+        assert_rejected(&r, ctx, DIAG_MASK_MISMATCH, "mask (b) missing stdin");
+        assert!(!mark.exists(), "mask (b): the command must not run");
+        assert_eq!(
+            read_to_end_bounded(File::from(OwnedFd::from(so_r)), Instant::now() + timeout()),
+            Vec::<u8>::new(),
+            "mask (b): stdout must be empty and reach EOF"
+        );
+        drop(se_r);
+        println!(
+            "stream_exec_real: scenario=mask_mismatch rejected the stdio handover before exec with stage helper_stdio_handover code INVALID_ARGUMENT errno none"
+        );
+    }
+
+    /// stdio_kind: 期待 mask と送る fd の有無は一致しても、fd が socket でも FIFO でもない（文字デバイス・通常ファイル）と
+    /// `helper_stdio_kind` の段で `INVALID_ARGUMENT`（errno `none`）として拒否され、exec は起きない。端末など
+    /// ホスト側の fd を渡す経路（`TIOCSTI` 等）を fork の前に塞ぐ（SUP-6・SEC-1・REPAIR-12・#3761・#4327）。
+    fn stdio_kind(ctx: &Ctx, hostdata: &Path) {
+        let mark = hostdata.join(MARK_FILE);
+        let _ = std::fs::remove_file(&mark);
+
+        // (a) 文字デバイス（/dev/null）を stdin に渡す。
+        let (so_r, so_w) = std::io::pipe().expect("stdout pipe");
+        let (se_r, se_w) = std::io::pipe().expect("stderr pipe");
+        let (so_w, se_w) = (OwnedFd::from(so_w), OwnedFd::from(se_w));
+        let null = OwnedFd::from(File::open("/dev/null").expect("open /dev/null"));
+        let raw = spawn_with(
+            ctx,
+            "mark",
+            20_000,
+            StdioMask::from_presence(true, true, true),
+            &StdioSend {
+                stdin: Some(null.as_fd()),
+                stdout: Some(so_w.as_fd()),
+                stderr: Some(se_w.as_fd()),
+            },
+            HelperStderr::Socket,
+        );
+        drop((so_w, se_w, null));
+        let r = finish_rejected(raw);
+        assert_rejected(&r, ctx, DIAG_STDIO_KIND, "kind (a) char device");
+        assert!(!mark.exists(), "kind (a): the command must not run");
+        drop((so_r, se_r));
+
+        // (b) 通常ファイルを stdout に渡す。
+        let regular = hostdata.join("se-kind-regular");
+        let file = OwnedFd::from(File::create(&regular).expect("create the regular file"));
+        let (se_r, se_w) = std::io::pipe().expect("stderr pipe");
+        let se_w = OwnedFd::from(se_w);
+        let raw = spawn_with(
+            ctx,
+            "mark",
+            20_000,
+            StdioMask::from_presence(false, true, true),
+            &StdioSend {
+                stdin: None,
+                stdout: Some(file.as_fd()),
+                stderr: Some(se_w.as_fd()),
+            },
+            HelperStderr::Socket,
+        );
+        drop((file, se_w));
+        let r = finish_rejected(raw);
+        assert_rejected(&r, ctx, DIAG_STDIO_KIND, "kind (b) regular file");
+        assert!(!mark.exists(), "kind (b): the command must not run");
+        assert_eq!(
+            std::fs::metadata(&regular)
+                .expect("stat the regular file")
+                .len(),
+            0,
+            "kind (b): nothing may be written to the regular file"
+        );
+        let _ = std::fs::remove_file(&regular);
+        drop(se_r);
+        println!(
+            "stream_exec_real: scenario=stdio_kind rejected a char device and a regular file before exec with stage helper_stdio_kind code INVALID_ARGUMENT errno none"
+        );
+    }
+
     fn scenarios(ctx: &Ctx, hostdata: &Path, server: ControlServer, listener: ControlListener) {
         // echo: stdout と stderr が別々の fd で返る。
         let sp = spawn_exec(ctx, "echo", None, 20_000, HelperStderr::Inherit);
@@ -1003,6 +1261,10 @@ mod linux {
         assert!(f.spawned.is_some(), "Spawned must precede the result");
         assert_eq!(f.stdout, b"se-stdin-payload\n".to_vec());
         println!("stream_exec_real: scenario=stdin payload echoed back");
+
+        // 拒否の経路（kind 6 の後の段のため、supervisor が居る間に回す。orphan より前）。
+        mask_mismatch(ctx, hostdata);
+        stdio_kind(ctx, hostdata);
 
         // disconnect: Started の後に helper を SIGKILL すると、ガードが exec 子 cgroup を回収してコマンドが止まる。
         let mut sp = spawn_exec(ctx, "beat", None, 60_000, HelperStderr::Inherit);

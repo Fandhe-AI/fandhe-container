@@ -4,16 +4,17 @@
 //! 登録と解除、共有 blob の保護判定までを流す。`image tag` の排他下の入口（TASK-183.4）も
 //! `ImageStore` 経由で流す。永続化・CLI 経路は未実装のため対象外。
 
-// Windows ホストは設計上 `ImageStore` を開けない（#4333・#2428 案 C。拒否は src/image_management/store.rs の試験が照合）ため unix に限る。
-#![cfg(unix)]
-
 use fandhe_container_oci::error::OciErrorCode;
+// Windows ホストは設計上 `ImageStore` を開けない（#4333・#2428 案 C。拒否は src/image_management/store.rs の試験が照合）ため、
+// ストアを開く試験とその補助だけを unix に限る（`ReferenceTable` だけの試験は全 OS で回す）。
 use fandhe_container_oci::image_management::{
-    ContainerRefId, ImageStore, ImageTagChange, ImageTagSource, ManifestComposition, PullId,
-    ReferenceTable, TagKey,
+    ContainerRefId, ManifestComposition, PullId, ReferenceTable, TagKey,
 };
+#[cfg(unix)]
+use fandhe_container_oci::image_management::{ImageStore, ImageTagChange, ImageTagSource};
 use fandhe_container_oci::reference::{Digest, RegistryHost, Repository, Tag};
 
+#[cfg(unix)]
 #[path = "support/test_root.rs"]
 mod test_root;
 
@@ -117,6 +118,7 @@ fn oci7_missing_targets_report_not_found() {
 /// テーブルとディスクに揃っている）と 2（無参照のイメージの削除で manifest・config・非共有レイヤーが消える）を
 /// 確かめる。実際の `start` は oci から呼べない（core に依存しない）ため、実機での
 /// `create`・`stop`・`image rm --force`・`start` の確認は TASK-184 に任せる。
+#[cfg(unix)]
 #[test]
 fn oci7_image_rm_force_through_store_guard() {
     use fandhe_container_oci::image_management::{
@@ -206,6 +208,7 @@ fn oci7_image_rm_force_through_store_guard() {
 }
 
 /// OCI-7（TASK-183.4）: `ImageStore` 経由のタグ付与 → 付け替え → 未登録 digest の NotFound。
+#[cfg(unix)]
 #[test]
 fn oci7_image_store_tag_flow_through_public_api() {
     let root = test_root::test_root("fc-oci-it-tag", "tag");

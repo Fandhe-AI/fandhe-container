@@ -159,19 +159,26 @@ impl ImageStore {
     }
 }
 
-// Windows ホストは設計上 `ImageStore` を開けない（#4333・#2428 案 C。拒否は store.rs の試験が照合）ため unix に限る。
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::image_management::ManifestComposition;
     use crate::instrument::OciOpOutcome;
     use crate::instrument::testing::Collect;
     use crate::reference::{RegistryHost, Repository, Tag};
+    // Windows ホストは設計上 `ImageStore` を開けない（#4333・#2428 案 C。拒否は store.rs の試験が照合）ため、
+    // ストアを開く試験とその補助だけを unix に限る（テーブルだけの試験は全 OS で回す）。
+    #[cfg(unix)]
     use std::fs;
+    #[cfg(unix)]
     use std::path::PathBuf;
+    #[cfg(unix)]
     use std::sync::Arc;
+    #[cfg(unix)]
     use std::sync::atomic::{AtomicU32, Ordering};
+    #[cfg(unix)]
     use std::thread;
+    #[cfg(unix)]
     use std::time::Duration;
 
     fn d(n: u8) -> Digest {
@@ -198,6 +205,7 @@ mod tests {
         t
     }
 
+    #[cfg(unix)]
     fn temp_root(label: &str) -> PathBuf {
         static SEQ: AtomicU32 = AtomicU32::new(0);
         let p = std::env::temp_dir().join(format!(
@@ -249,6 +257,7 @@ mod tests {
     }
 
     /// OCI-7: ImageStore::tag_image 経由でも上限が効き、付け替えは通る（#2316）。
+    #[cfg(unix)]
     #[test]
     fn oci7_tag_image_at_limit_is_resource_exhausted() {
         let root = temp_root("limit");
@@ -352,6 +361,7 @@ mod tests {
     }
 
     /// OCI-7: ガード保持中の `ImageStore::tag_image` は Timeout になり、解放後は成功する。
+    #[cfg(unix)]
     #[test]
     fn oci7_image_store_tag_holds_exclusive_section() {
         let root = temp_root("excl");
@@ -371,6 +381,7 @@ mod tests {
     }
 
     /// OCI-7: 排他区間で manifest が削除される間に待った tag は、解放後に NotFound になる。
+    #[cfg(unix)]
     #[test]
     fn oci7_image_store_tag_after_concurrent_removal_is_not_found() {
         let root = temp_root("race");

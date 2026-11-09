@@ -1832,11 +1832,12 @@ impl Drop for PublishTmpCleanup {
     }
 }
 
-// Windows ホストは設計上 `ImageStore` を開けない（#4333・#2428 案 C。拒否は store.rs の試験が照合）ため unix に限る。
+// Windows ホストは設計上 `ImageStore` を開けない（#4333・#2428 案 C。拒否は store.rs の試験が照合）ため、
+// ストアを開く試験はこのモジュールで unix に限る。ストアを開かない試験は下の `store_free_tests` で全 OS に残す。
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::image_management::{PULL_ID_MAX_BYTES, ReferenceTable};
+    use crate::image_management::ReferenceTable;
 
     fn d(n: u8) -> Digest {
         Digest::parse(&format!("sha256:{}", format!("{n:02x}").repeat(32))).unwrap()
@@ -2399,18 +2400,6 @@ mod tests {
         assert_eq!(table, ReferenceTable::new());
     }
 
-    /// OCI-7: 生成した pull ID は互いに異なり、検証を通り、先頭は PID。
-    #[test]
-    fn oci7_generated_pull_id_round_trips() {
-        let a = PullId::generate().unwrap();
-        let b = PullId::generate().unwrap();
-        assert_ne!(a, b);
-        assert!(a.as_str().len() <= PULL_ID_MAX_BYTES);
-        assert_eq!(PullId::new(a.as_str()).unwrap(), a);
-        let first = a.as_str().split('-').next().unwrap();
-        assert_eq!(first, std::process::id().to_string());
-    }
-
     // ---- 公開とロールバック（OCI-7・TASK-183.10・#475） ----
 
     use crate::instrument::OciOpOutcome;
@@ -2831,27 +2820,6 @@ mod tests {
         assert!(!root.blob(&dg).exists());
     }
 
-    /// 公開用の一時名の後始末は、drop で残った一時名を消し、無い名前があっても失敗しない（OCI-7）。
-    #[test]
-    fn oci7_publish_tmp_cleanup_removes_leftovers() {
-        let root = Root::new("pub-tmp-cleanup");
-        let dst = root.0.join("abc");
-        let tmp = publish_tmp_path(&dst, 7);
-        assert_eq!(
-            tmp.file_name().unwrap().to_string_lossy(),
-            format!("abc.publish-{}-7", std::process::id())
-        );
-        assert_ne!(publish_tmp_path(&dst, 8), tmp);
-        assert_ne!(next_publish_nonce(), next_publish_nonce());
-        fs::write(&tmp, b"x").unwrap();
-        {
-            let mut c = PublishTmpCleanup::default();
-            c.add(tmp.clone());
-            c.add(root.0.join("missing"));
-        }
-        assert!(!tmp.exists());
-    }
-
     /// 既に正しい内容で存在する宛先は、全 OS で置き換えずそのまま受け入れる（OCI-1・OCI-7）。
     #[test]
     fn oci7_publish_keeps_existing_verified_destination() {
@@ -3224,5 +3192,48 @@ mod tests {
         assert_eq!(r.reclaimed(), &[pid("p1")]);
         assert!(!staged.exists());
         assert!(leases(&store, &cached).is_empty());
+    }
+}
+
+/// ストアを開かない試験（全 OS で回す。Windows ホストは `ImageStore` を開けないが、これらは不要。#4333・OCI-7）。
+#[cfg(test)]
+mod store_free_tests {
+    use super::*;
+    use crate::image_management::PULL_ID_MAX_BYTES;
+
+    /// OCI-7: 生成した pull ID は互いに異なり、検証を通り、先頭は PID。
+    #[test]
+    fn oci7_generated_pull_id_round_trips() {
+        let a = PullId::generate().unwrap();
+        let b = PullId::generate().unwrap();
+        assert_ne!(a, b);
+        assert!(a.as_str().len() <= PULL_ID_MAX_BYTES);
+        assert_eq!(PullId::new(a.as_str()).unwrap(), a);
+        let first = a.as_str().split('-').next().unwrap();
+        assert_eq!(first, std::process::id().to_string());
+    }
+
+    /// 公開用の一時名の後始末は、drop で残った一時名を消し、無い名前があっても失敗しない（OCI-7）。
+    #[test]
+    fn oci7_publish_tmp_cleanup_removes_leftovers() {
+        let dir = std::env::temp_dir().join(format!("fc-oci-pull-tmpclean-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let dst = dir.join("abc");
+        let tmp = publish_tmp_path(&dst, 7);
+        assert_eq!(
+            tmp.file_name().unwrap().to_string_lossy(),
+            format!("abc.publish-{}-7", std::process::id())
+        );
+        assert_ne!(publish_tmp_path(&dst, 8), tmp);
+        assert_ne!(next_publish_nonce(), next_publish_nonce());
+        fs::write(&tmp, b"x").unwrap();
+        {
+            let mut c = PublishTmpCleanup::default();
+            c.add(tmp.clone());
+            c.add(dir.join("missing"));
+        }
+        assert!(!tmp.exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

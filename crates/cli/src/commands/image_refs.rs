@@ -343,10 +343,8 @@ impl ContainerImageRefs for StoreImageRefs<'_> {
     }
 }
 
-// Windows ホストは設計上 `ImageStore` を開けない（#4333）ため、ストアを使う試験とその補助は unix に限り、
-// Windows で使われなくなる補助・import を許す。
+// Windows ホストは設計上 `ImageStore` を開けない（#4333）ため、ストアを使う試験とその補助は個別に unix に限る。
 #[cfg(test)]
-#[cfg_attr(not(unix), allow(dead_code, unused_imports))]
 mod tests {
     /// OCI-7・CLI-1（#2600）: digest 風入力の述語（create と rm / tag が共有）。
     #[test]
@@ -368,17 +366,22 @@ mod tests {
 
     use super::*;
     use fandhe_container_core::traits::ErrorCode;
+    #[cfg(unix)]
     use fandhe_container_oci::image_management::ManifestComposition;
 
     const MANIFEST: &str =
         "sha256:a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0";
+    #[cfg(unix)]
     const OTHER: &str = "sha256:b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1";
     const SCOPE: &str = "00000000000000000000000000000001";
+    #[cfg(unix)]
     const CONFIG: &str = "sha256:c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1";
 
     /// 一意な一時ディレクトリ（終了時に削除）。
+    #[cfg(unix)]
     pub(crate) struct Tmp(std::path::PathBuf);
 
+    #[cfg(unix)]
     impl Tmp {
         pub(crate) fn new(name: &str) -> Self {
             let dir = std::env::temp_dir()
@@ -398,6 +401,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl Drop for Tmp {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
@@ -422,6 +426,7 @@ mod tests {
         store
     }
 
+    #[cfg(unix)]
     fn cid(s: &str) -> ContainerId {
         ContainerId::new(s).expect("id")
     }

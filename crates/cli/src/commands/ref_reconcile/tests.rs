@@ -1,8 +1,6 @@
 //! `ref_reconcile` の単体試験（OCI-7・REPAIR-5・#2495）。状態ストアは `get` だけを差し替えた偽物を使い、root 不要。
 
-// Windows ホストは設計上 `ImageStore` を開けない（#4333）ため、ストアを使う試験とその補助は unix に限り、
-// Windows で使われなくなる補助・import を許す。
-#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
+// Windows ホストは設計上 `ImageStore` を開けない（#4333）ため、ストアを使う試験とその補助は個別に unix に限る。
 
 use super::*;
 use fandhe_container_core::traits::{
@@ -49,14 +47,17 @@ impl StateStore for SpyStore {
 
 const SCOPE: &str = "0123456789abcdef0123456789abcdef";
 const OTHER_SCOPE: &str = "fedcba9876543210fedcba9876543210";
+#[cfg(unix)]
 const MANIFEST: &str = "sha256:a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0";
 
 fn key(scope: &str, id: &str) -> ContainerRefId {
     ContainerRefId::new(&ref_key(scope, id)).expect("key")
 }
 
+#[cfg(unix)]
 struct Tmp(std::path::PathBuf);
 
+#[cfg(unix)]
 impl Tmp {
     fn new(name: &str) -> Self {
         let dir =
@@ -72,6 +73,7 @@ impl Tmp {
     }
 }
 
+#[cfg(unix)]
 impl Drop for Tmp {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);

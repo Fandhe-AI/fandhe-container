@@ -2,7 +2,7 @@
 //!
 //! 役割: Hypervisor.framework の vCPU は作ったスレッドに束縛される（`hv_vcpu_run`・レジスタ操作・destroy は作成スレッドから呼ぶ）。
 //! 専用スレッドで vCPU を作って所有し、`run` → exit の分類 → 振り分け、を繰り返す論理と、停止要求（`AtomicBool` ＋ kick）、
-//! 作成待ち・停止待ちの期限、exit の種別と回数の観測（REPAIR-4）をここに置く。`hv_*` を呼ばないため、偽の実行体
+//! 作成待ち・停止待ちの期限、exit の種別と回数の観測（REPAIR-4。MMIO の値は opt-in の `on_value`・#4289）をここに置く。`hv_*` を呼ばないため、偽の実行体
 //! （[`VcpuExec`]）と偽の kick（[`VcpuKick`]）で Linux の PR CI でも単体試験が走る（macOS の PR CI は型検査のみ）。
 //!
 //! 呼び出し元は `hvf::vcpu`（macOS かつ aarch64 限定。`HvVcpu` に [`VcpuExec`] を、`VcpuCanceller` に [`VcpuKick`] を実装して
@@ -38,6 +38,7 @@ use std::time::{Duration, Instant};
 
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::esr::{EsrClass, SysRegDirection, WfxKind, decode_esr, instruction_length};
+use crate::exit::{ExitValue, VcpuExit};
 use crate::hvf_abi::{HvRunStats, HvVcpuExit, HvVcpuExitException};
 use crate::hvf_lifecycle::{deferred_reclaim_line, take_thread_reclaim};
 use crate::stop::StopReason;
@@ -189,9 +190,40 @@ pub fn classify_exit(exit: &HvVcpuExit) -> HvExit {
 /// exit の種別と回数の観測口（REPAIR-4。Linux の `RunObserver` に相当）。
 ///
 /// vCPU スレッドから同期で呼ばれるため、実装はブロックしないこと（ログ・メトリクスへの非同期な受け渡しに留める）。
+///
+/// MMIO の値（STATUS・DRIVER_FEATURES 等への書き込み）は opt-in の [`VcpuExitObserver::on_value`] で渡す（#4289・MVM-5・MVM-1。
+/// Linux の `RunObserver::wants_values` と `RunRecord::value` に相当）。種別だけを数える観測器は何も実装せず、値は取り出されない。
+/// 種別・値のどちらにも vCPU 番号は渡らない（必要になれば別途拡張する）。
 pub trait VcpuExitObserver: Send + Sync + fmt::Debug {
     /// 分類した exit 1 件ごと、振り分けの前に呼ばれる。
     fn on_exit(&self, kind: ExitKind);
+
+    /// MMIO の値を [`VcpuExitObserver::on_value`] へ受け取るか。既定は `false`（opt-in）。
+    /// 値はゲスト由来で秘密を含みうるため、求めた観測器にだけ渡す。
+    fn wants_values(&self) -> bool {
+        false
+    }
+
+    /// MMIO exit 1 件ごと、dispatcher へ渡す前に呼ばれる（[`VcpuExitObserver::wants_values`] が真のときだけ）。
+    /// 書き込みは `data[..len]`、読み出しは `data` が空（`ExitValue::from_exit` の規則）。
+    /// vCPU スレッドから同期で呼ばれるため、ブロック・割り当てをしないこと。値はゲスト由来（untrusted）で、検証して数えるだけにする。
+    fn on_value(&self, _value: &ExitValue) {}
+}
+
+/// `observer` が値を求めている（[`VcpuExitObserver::wants_values`]）ときだけ、MMIO・PIO の `exit` を
+/// [`ExitValue`] にして [`VcpuExitObserver::on_value`] へ渡す（#4289）。観測器なし・値を求めない・値を持たない exit では何もしない。
+/// 呼び出し元は macOS の `hvf::mmio` の dispatch 入口（dispatcher の lock を取る前）。変換規則は `ExitValue::from_exit` に任せ、
+/// ここでは持たない。結果は dispatch・停止の判断に影響しない（戻り値なし）。
+pub fn observe_exit_value(observer: Option<&dyn VcpuExitObserver>, exit: &VcpuExit) {
+    let Some(o) = observer else {
+        return;
+    };
+    if !o.wants_values() {
+        return;
+    }
+    if let Some(v) = ExitValue::from_exit(exit) {
+        o.on_value(&v);
+    }
 }
 
 /// 種別ごとに数えるだけの [`VcpuExitObserver`]。
@@ -1228,6 +1260,104 @@ mod tests {
         assert_eq!(c.count(ExitKind::Hvc), 2);
         assert_eq!(c.count(ExitKind::Smc), 1);
         assert_eq!(c.count(ExitKind::Wfx), 0);
+    }
+
+    /// 値を記録する偽観測器（#4289）。
+    #[derive(Debug, Default)]
+    struct ValueRecorder {
+        want: bool,
+        values: Mutex<Vec<ExitValue>>,
+    }
+
+    impl VcpuExitObserver for ValueRecorder {
+        fn on_exit(&self, _kind: ExitKind) {}
+        fn wants_values(&self) -> bool {
+            self.want
+        }
+        fn on_value(&self, value: &ExitValue) {
+            self.values.lock().unwrap().push(*value);
+        }
+    }
+
+    fn mmio_exit(addr: u64, value: u32, is_write: bool) -> VcpuExit {
+        let mut data = [0u8; 8];
+        data[..4].copy_from_slice(&value.to_le_bytes());
+        VcpuExit::Mmio {
+            phys_addr: addr,
+            data,
+            len: 4,
+            is_write,
+        }
+    }
+
+    /// MVM-5・MVM-1・#4289: 値を求める観測器へ MMIO の書き込み値が具体値で渡る。
+    #[test]
+    fn mvm5_4289_observe_exit_value_passes_mmio_write() {
+        let o = ValueRecorder {
+            want: true,
+            ..Default::default()
+        };
+        observe_exit_value(Some(&o), &mmio_exit(0x0a00_0070, 0x0B, true));
+        let got = o.values.lock().unwrap();
+        assert_eq!(got.len(), 1);
+        let ExitValue::Mmio {
+            phys_addr,
+            len,
+            is_write,
+            data,
+        } = got[0]
+        else {
+            panic!("expected mmio value: {:?}", got[0]);
+        };
+        assert_eq!(phys_addr, 0x0a00_0070);
+        assert_eq!(len, 4);
+        assert!(is_write);
+        assert_eq!(data.as_bytes(), &0x0Bu32.to_le_bytes()[..]);
+    }
+
+    /// 読み出しでは `data` が空（`ExitValue::from_exit` の規則）。
+    #[test]
+    fn mvm5_4289_observe_exit_value_read_has_empty_data() {
+        let o = ValueRecorder {
+            want: true,
+            ..Default::default()
+        };
+        observe_exit_value(Some(&o), &mmio_exit(0x0a00_0000, 0, false));
+        let got = o.values.lock().unwrap();
+        assert_eq!(got.len(), 1);
+        let ExitValue::Mmio { is_write, data, .. } = got[0] else {
+            panic!("expected mmio value");
+        };
+        assert!(!is_write);
+        assert!(data.as_bytes().is_empty());
+    }
+
+    /// `wants_values` が偽（既定）なら `on_value` は呼ばれない。
+    #[test]
+    fn mvm5_4289_observe_exit_value_skips_when_not_wanted() {
+        let o = ValueRecorder::default();
+        observe_exit_value(Some(&o), &mmio_exit(0x0a00_0070, 0x0B, true));
+        assert_eq!(o.values.lock().unwrap().len(), 0);
+    }
+
+    /// 観測器なし・値を持たない exit では何も起きない。
+    #[test]
+    fn mvm5_4289_observe_exit_value_none_and_non_mmio() {
+        observe_exit_value(None, &mmio_exit(0x0a00_0070, 0x0B, true));
+        let o = ValueRecorder {
+            want: true,
+            ..Default::default()
+        };
+        observe_exit_value(Some(&o), &VcpuExit::Hlt);
+        assert_eq!(o.values.lock().unwrap().len(), 0);
+    }
+
+    /// 既定実装: 種別だけ数える `ExitCounts` は値を求めない。
+    #[test]
+    fn mvm5_4289_default_methods() {
+        let c = ExitCounts::new();
+        assert!(!c.wants_values());
+        c.on_value(&ExitValue::from_exit(&mmio_exit(0, 0, true)).unwrap());
     }
 
     /// 台本どおりに戻る偽の実行体（`hv_*` を呼ばない）。

@@ -60,21 +60,33 @@
 //! assert しない（判断材料。評価は #3988）。カーネルは `CONFIG_VIRTIO_MMIO`・`CONFIG_VIRTIO_BLK`・`CONFIG_BLOCK`・`CONFIG_DEVTMPFS`
 //! （`kernel_boot` の aarch64 の項と同じ）。負の対照は block デバイス無しで、不一致 marker が出る（一致 marker が block に由来する裏づけ）。
 //!
+//! 交渉結果の観測（#4289・MVM-5・MVM-1）: lib の `VcpuExitObserver::wants_values` / `on_value`（opt-in。MMIO の書き込み値を vCPU スレッドから
+//! dispatch の前に渡す。vCPU 番号は渡らない）で、観測器 `HvfBootObserver` が block の窓の `DRIVER_FEATURES`・STATUS を集計する
+//! （窓の集計と照合は `support/virtio_window.rs` で KVM の `kernel_boot.rs` と共有）。block-read の陽性 2 件は、FEATURES_OK `0x0B` が
+//! ちょうど 1 回・ビット 40（`VIRTIO_F_RING_RESET`。`docs/design/microvm-virtio-ring-reset.md`）が 0・上位ページがちょうど `0x1`
+//! （VERSION_1 のみ）・下位ページが提示集合の部分集合・DRIVER_OK `0x0F`・FAILED 0 件・QUEUE_READY=1 がちょうど 1 回であることを照合し、
+//! 結果行へ `features_ok=0x0b driver_features=0x... ring_reset=0` を足す。負の対照（block 無し）は窓が無いこと（`None`）を見る。
+//! 実機での確認は #3988（人間担当）。Agent は実行していない。
+//!
 //! 未実装（REPAIR-3）: virtio-net の `QueueNotify`（#4029）は未結線のため net は載せない。
 //! 実機での実行と記録は #3988（人間担当）。Agent は実カーネルでの起動を確かめていない（`serial-echo` と `block-read` の `/init` も未実行）。
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
 #[path = "support/guest_boot.rs"]
 mod guest_boot;
+/// virtio-mmio の窓の集計と交渉結果の照合（`kernel_boot.rs` の KVM 版と共有。#4289・REPAIR-1）。
+#[path = "support/virtio_window.rs"]
+mod virtio_window;
 
 use fandhe_container_microvm::arm64_layout::{ARM64_SERIAL_BASE, ARM64_SERIAL_SPI, Arm64Layout};
 use fandhe_container_microvm::boot_arm64::Arm64ImageHeader;
 use fandhe_container_microvm::error::MicrovmErrorCode;
+use fandhe_container_microvm::exit::ExitValue;
 use fandhe_container_microvm::hvf::{
     HvfDeviceKind, HvfMicroVm, HvfMicroVmConfig, VcpuThreadConfig, VmWithGic,
 };
 use fandhe_container_microvm::hvf_abi::HvRunStats;
-use fandhe_container_microvm::hvf_loop::{ExitCounts, ExitKind};
+use fandhe_container_microvm::hvf_loop::{ExitCounts, ExitKind, VcpuExitObserver};
 use fandhe_container_microvm::interrupt::{InterruptAckCounts, IrqTrigger};
 use fandhe_container_microvm::stop::StopReason;
 use fandhe_container_microvm::uart::{SerialConsole, UartStats};
@@ -91,6 +103,10 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
+use virtio_window::{
+    BLOCK_OFFERED_LOW, VirtioWindows, WindowKind, WindowStats, assert_features_negotiated,
+    features_result_fields,
+};
 
 /// `console=ttyS0` で FDT の `ns16550a` を 8250 のコンソールに選び、`rdinit=/init` で initrd の `/init` を起動する。
 const DEFAULT_CMDLINE: &str = "console=ttyS0 rdinit=/init";
@@ -321,6 +337,31 @@ struct Outcome {
     ack: Option<InterruptAckCounts>,
     /// block 0 台目の SPI の INTID（block 無しは `None`）。
     block_spi_intid: Option<u32>,
+    /// block の窓の観測値（STATUS・QUEUE_READY・DRIVER_FEATURES への書き込み。block を載せた構成だけ `Some`。#4289）。
+    block_window: Option<WindowStats>,
+}
+
+/// HVF の観測器（#4289）。exit の種別の集計（`ExitCounts`）と、MMIO の値の窓ごとの集計（`VirtioWindows`。KVM の
+/// `VirtioWindowObserver` と共有の補助）をまとめる。`VcpuThreadConfig::observer` の枠は 1 つのためこの型で包む。
+/// 値は vCPU スレッドから同期で渡る（割り当て・待ちなし。値はゲスト由来で数えるだけ）。
+#[derive(Debug, Default)]
+struct HvfBootObserver {
+    counts: ExitCounts,
+    windows: VirtioWindows,
+}
+
+impl VcpuExitObserver for HvfBootObserver {
+    fn on_exit(&self, kind: ExitKind) {
+        self.counts.on_exit(kind);
+    }
+
+    fn wants_values(&self) -> bool {
+        true
+    }
+
+    fn on_value(&self, value: &ExitValue) {
+        self.windows.record_value(value);
+    }
 }
 
 /// vCPU ごとの統計を空白なしの 1 トークンにする（行の照合・grep をしやすくする。診断と成功行が共有）。
@@ -346,7 +387,7 @@ impl Outcome {
     fn diag(&self) -> String {
         format!(
             "reason={:?} vcpus={} errors={} exits={} per_vcpu={} wfx={} vtimer={} data_abort={} hvc={} \
-             ack={:?} block_spi_intid={:?} timed_out={} elapsed={:?} uart_dropped={} uart={:?} rx_latencies={:?} interaction_error={:?} \
+             ack={:?} block_spi_intid={:?} block_window={:?} timed_out={} elapsed={:?} uart_dropped={} uart={:?} rx_latencies={:?} interaction_error={:?} \
              output_len={} output_tail=\"{}\"",
             self.reason,
             self.vcpu_count,
@@ -359,6 +400,7 @@ impl Outcome {
             self.hvc,
             self.ack,
             self.block_spi_intid,
+            self.block_window,
             self.timed_out,
             self.elapsed,
             self.uart_dropped,
@@ -496,7 +538,7 @@ impl SerialEcho {
 fn boot(inp: Inputs, plan: BootPlan, mut interaction: Interaction) -> Result<Outcome, String> {
     let started = Instant::now();
     let boot_timeout = Duration::from_secs(inp.secs);
-    let counts = Arc::new(ExitCounts::new());
+    let obs = Arc::new(HvfBootObserver::default());
     let vcpus = plan.layout.vcpus;
     let config: HvfMicroVmConfig<MemoryBlockBackend, MemoryNetBackend> = HvfMicroVmConfig {
         layout: plan.layout,
@@ -507,7 +549,7 @@ fn boot(inp: Inputs, plan: BootPlan, mut interaction: Interaction) -> Result<Out
         block: plan.block,
         net: Vec::new(),
         vcpu: VcpuThreadConfig {
-            observer: Some(counts.clone()),
+            observer: Some(obs.clone()),
             ..Default::default()
         },
         serial: true,
@@ -520,6 +562,11 @@ fn boot(inp: Inputs, plan: BootPlan, mut interaction: Interaction) -> Result<Out
         .devices()
         .into_iter()
         .find(|d| d.kind == HvfDeviceKind::Block);
+    // 窓は start の前に結ぶ（ゲストの最初の書き込みを取りこぼさない。#4289）。block を載せない構成では結ばない。
+    if let Some(b) = block_info {
+        obs.windows
+            .bind(WindowKind::Block, b.window.base.raw(), b.window.size);
+    }
     let running = vm.start().map_err(|e| format!("start failed: {e}"))?;
     let mut output: Vec<u8> = Vec::new();
     let mut timed_out = false;
@@ -592,12 +639,13 @@ fn boot(inp: Inputs, plan: BootPlan, mut interaction: Interaction) -> Result<Out
         interaction_error,
         timed_out,
         elapsed,
-        wfx: counts.count(ExitKind::Wfx),
-        vtimer: counts.count(ExitKind::Vtimer),
-        data_abort: counts.count(ExitKind::DataAbort),
-        hvc: counts.count(ExitKind::Hvc),
+        wfx: obs.counts.count(ExitKind::Wfx),
+        vtimer: obs.counts.count(ExitKind::Vtimer),
+        data_abort: obs.counts.count(ExitKind::DataAbort),
+        hvc: obs.counts.count(ExitKind::Hvc),
         ack,
         block_spi_intid: block_info.map(|b| b.spi_intid),
+        block_window: block_info.map(|_| obs.windows.stats(WindowKind::Block)),
     })
 }
 
@@ -743,6 +791,7 @@ fn hvf_kernel_boot_without_initrd_does_not_shut_down() {
 /// 既定の `MARKER` が 0 回、`GuestShutdown`・エラー 0・UART の取りこぼし 0・期限内であることを具体値で照合する。
 /// ACK の後処理の計数は結果行に出すだけで assert しない（判断は #3988）。届いた証跡は marker で取る。
 fn run_block_read(plan: BootPlan, expect: &str, other: &str, case: &str) {
+    let block_present = !plan.block.is_empty();
     let secs = boot_timeout_secs();
     let _wd = Watchdog::start(overall_deadline(secs));
     let inp = inputs(InitrdKind::BlockRead, secs);
@@ -771,6 +820,19 @@ fn run_block_read(plan: BootPlan, expect: &str, other: &str, case: &str) {
         "default init marker must not appear with the block-read initrd: {diag}"
     );
     assert_eq!(o.uart_dropped, 0, "uart dropped bytes: {diag}");
+    // 交渉結果（#4289・MVM-5・MVM-1）。block を載せた構成だけ照合し、載せない負の対照では窓が無いことを見る。
+    match (block_present, o.block_window) {
+        (true, Some(s)) => {
+            assert_features_negotiated(&s, BLOCK_OFFERED_LOW, "block", &diag);
+            assert_eq!(s.driver_ok_first, Some(0x0F), "block DRIVER_OK: {diag}");
+            assert_eq!(s.failed_writes, 0, "block FAILED writes: {diag}");
+            assert_eq!(s.queue_ready_one, 1, "block QUEUE_READY=1 count: {diag}");
+        }
+        (false, None) => {}
+        (present, window) => panic!(
+            "block window observation mismatch (block present={present}, window={window:?}): {diag}"
+        ),
+    }
     eprintln!("{}", block_result_line(&o, case, trigger));
 }
 
@@ -793,8 +855,13 @@ fn block_result_line(o: &Outcome, case: &str, trigger: IrqTrigger) -> String {
             "acks=none deasserted=none reasserted=none not_applicable=none resets=none".to_owned()
         }
     };
+    // 交渉結果（#4289）。block 無しは none。`ring_reset=0` は VIRTIO_F_RING_RESET（ビット 40）を受けていないこと。
+    let features = match &o.block_window {
+        Some(s) => features_result_fields("", s),
+        None => "features_ok=none driver_features=none ring_reset=none".to_owned(),
+    };
     format!(
-        "hvf_kernel_boot: block ok arch=aarch64 case={case} trigger={trigger} spi_intid={spi} elapsed_ms={} exits={} data_abort={} wfx={} {ack}",
+        "hvf_kernel_boot: block ok arch=aarch64 case={case} trigger={trigger} spi_intid={spi} elapsed_ms={} exits={} data_abort={} wfx={} {ack} {features}",
         o.elapsed.as_millis(),
         o.exits,
         o.data_abort,
@@ -1089,22 +1156,73 @@ fn mvm5_4014_block_result_line_shape() {
         hvc: 1,
         ack: Some(counts),
         block_spi_intid: Some(48),
+        block_window: Some(WindowStats {
+            features_ok_first: Some(0x0B),
+            driver_features: Some(0x0000_0001_0000_0206),
+            ..WindowStats::default()
+        }),
     };
     assert_eq!(
         block_result_line(&o, "block_read_level_high", IrqTrigger::LevelHigh),
         "hvf_kernel_boot: block ok arch=aarch64 case=block_read_level_high trigger=level_high spi_intid=48 \
-         elapsed_ms=1234 exits=10 data_abort=7 wfx=3 acks=5 deasserted=4 reasserted=1 not_applicable=0 resets=2"
+         elapsed_ms=1234 exits=10 data_abort=7 wfx=3 acks=5 deasserted=4 reasserted=1 not_applicable=0 resets=2 \
+         features_ok=0x0b driver_features=0x0000000100000206 ring_reset=0"
     );
     let none = Outcome {
         ack: None,
         block_spi_intid: None,
+        block_window: None,
         ..o
     };
     assert!(
         block_result_line(&none, "block_read_absent", IrqTrigger::EdgeRising).ends_with(
-            "spi_intid=none elapsed_ms=1234 exits=10 data_abort=7 wfx=3 acks=none deasserted=none reasserted=none not_applicable=none resets=none"
+            "spi_intid=none elapsed_ms=1234 exits=10 data_abort=7 wfx=3 acks=none deasserted=none reasserted=none not_applicable=none resets=none features_ok=none driver_features=none ring_reset=none"
         )
     );
+}
+
+/// #4289・MVM-5・MVM-1: HVF の観測器は MMIO の値を窓へ集計し、exit の種別を数え、値を求める（opt-in）。
+/// 実 VM は使わず、合成の `ExitValue::Mmio` を `on_value` へ直接与える。
+#[test]
+fn mvm5_4289_hvf_observer_routes_values_to_windows() {
+    use fandhe_container_microvm::exit::ExitData;
+    use fandhe_container_microvm::virtio_mmio::reg;
+    let obs = HvfBootObserver::default();
+    assert!(obs.wants_values());
+    let base = 0x0a00_0000u64;
+    obs.windows.bind(WindowKind::Block, base, 0x200);
+    let write = |off: u64, v: u32| {
+        obs.on_value(&ExitValue::Mmio {
+            phys_addr: base + off,
+            len: 4,
+            is_write: true,
+            data: ExitData::from_slice(&v.to_le_bytes()),
+        })
+    };
+    // 窓の外への書き込みは数えない。
+    obs.on_value(&ExitValue::Mmio {
+        phys_addr: base + 0x1000 + reg::STATUS,
+        len: 4,
+        is_write: true,
+        data: ExitData::from_slice(&0x0Bu32.to_le_bytes()),
+    });
+    write(reg::DRIVER_FEATURES_SEL, 0);
+    write(reg::DRIVER_FEATURES, 0x0000_0206);
+    write(reg::DRIVER_FEATURES_SEL, 1);
+    write(reg::DRIVER_FEATURES, 0x1);
+    write(reg::STATUS, 0x0B);
+    write(reg::STATUS, 0x0F);
+    let s = obs.windows.stats(WindowKind::Block);
+    assert_eq!(s.driver_features, Some(0x0000_0001_0000_0206));
+    assert_eq!(s.features_ok_first, Some(0x0B));
+    assert_eq!(s.features_ok_writes, 1);
+    assert_eq!(s.driver_ok_first, Some(0x0F));
+    assert_eq!(s.status_writes, 2);
+    assert_features_negotiated(&s, BLOCK_OFFERED_LOW, "block", "unit");
+    obs.on_exit(ExitKind::DataAbort);
+    obs.on_exit(ExitKind::DataAbort);
+    assert_eq!(obs.counts.count(ExitKind::DataAbort), 2);
+    assert_eq!(obs.counts.count(ExitKind::Hvc), 0);
 }
 
 /// initrd の種類ごとの環境変数名・既定パス・ヒント（#3987）。`None` には initrd が無い。

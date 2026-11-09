@@ -22,7 +22,7 @@ MVM-1・MVM-5・#4169（親 #4115、停止側の実装は #4031 / PR #4093）。
 
 ## 影響
 
-`RING_RESET` を前提にするゲストの機能（例: 実行中にキュー数や長さを変える操作）は使えないか、デバイス全体の reset に縮退する。実ゲストでの観測は `kernel_boot.rs` の実機前提試験が担い、ドライバが FEATURES_OK の時点で書いた features とビット 40 を結果行に出して照合する（#4234。実機での記録は #3781・人間担当。macOS の `hvf_kernel_boot.rs` は MMIO の値の観測口が無く対象外）。
+`RING_RESET` を前提にするゲストの機能（例: 実行中にキュー数や長さを変える操作）は使えないか、デバイス全体の reset に縮退する。実ゲストでの観測は `kernel_boot.rs` の実機前提試験が担い、ドライバが FEATURES_OK の時点で書いた features とビット 40 を結果行に出して照合する（#4234。実機での記録は #3781・人間担当。macOS の `hvf_kernel_boot.rs` にも同じ照合を #4289 で足した。lib の `VcpuExitObserver` に opt-in の値の観測口〔`wants_values`・`on_value`〕を設け、窓の集計と照合は `tests/support/virtio_window.rs` で KVM と共有する。実機の記録は #3988・人間担当）。
 
 ## 再評価条件
 

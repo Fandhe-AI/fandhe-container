@@ -119,10 +119,11 @@ mod linux {
     }
 }
 
-/// Linux 以外では実ストアは core が `Unimplemented`（CLI-1）。変換までを上のテストで照合している。
+/// Windows ホストでは実ストアは core が設計上の恒久拒否（`FailedPrecondition`。#4332・#2428 の案 C・CLI-1・WIN-1）。
+/// 変換までを上のテストで照合している。
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[test]
-fn sup12_task169_5_1_store_is_unimplemented_outside_linux() {
+fn sup12_task169_5_1_store_is_rejected_by_design_on_windows_host() {
     use fandhe_container_core::traits::ErrorCode;
     use fandhe_container_supervisor::state::open_default_store;
     let root =
@@ -130,6 +131,10 @@ fn sup12_task169_5_1_store_is_unimplemented_outside_linux() {
     // PID 再利用による前回の残骸を、存在しないことの照合の前に消す（#3374・REPAIR-12）。
     let _ = std::fs::remove_dir_all(&root);
     let e = open_default_store(Some(root.clone())).err().unwrap();
-    assert_eq!(e.code(), ErrorCode::Unimplemented);
+    assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+    assert_eq!(
+        e.message(),
+        "file state store is not supported on a Windows host by design; the state root belongs in the Linux guest"
+    );
     assert!(!root.exists());
 }

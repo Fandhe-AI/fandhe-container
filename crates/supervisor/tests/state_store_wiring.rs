@@ -31,16 +31,21 @@ fn task_157_3_supervisor_has_no_own_serialization() {
     }
 }
 
-/// OCI-5・CLI-1: Linux・macOS 以外（Windows）では状態ルートを作らずに `Unimplemented` を返す。
+/// OCI-5・CLI-1・WIN-1（#4332）: Linux・macOS 以外（Windows ホスト）では状態ルートを作らずに、設計上の恒久拒否として
+/// `FailedPrecondition` を返す（#2428 の案 C。core の `FileStateStore::open` の拒否がそのまま伝播する）。
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[test]
-fn sup1_task157_3_open_default_store_is_unimplemented_outside_linux() {
+fn sup1_task157_3_open_default_store_is_rejected_by_design_on_windows_host() {
     use fandhe_container_core::traits::ErrorCode;
     use fandhe_container_supervisor::state::open_default_store;
     let root = std::env::temp_dir().join(format!("fandhe-sup-nolinux-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let e = open_default_store(Some(root.clone())).err().unwrap();
-    assert_eq!(e.code(), ErrorCode::Unimplemented);
+    assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+    assert_eq!(
+        e.message(),
+        "file state store is not supported on a Windows host by design; the state root belongs in the Linux guest"
+    );
     assert!(!root.exists());
 }
 

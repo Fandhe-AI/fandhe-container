@@ -12,7 +12,7 @@
 //! - `client`（Linux）: 受信側の期限つき `read_ready`
 //!
 //! # 未実装・残余（REPAIR-3）
-//! 保持役の起動・回収・ハンドル化（plugin-cri）は H6（#2877）、CI の `--ignored` への組み込みは H3（#2875）、
+//! 保持役の起動・回収・ハンドル化（plugin-cri）は H6（#2877）、CI の `--ignored` は `platform-ci` の ubuntu で実行済み（#2875）、
 //! core の net join は H7（#2872）。本モジュールは READY を返して待つ保持役プロセスまで。
 
 use std::ffi::OsStr;

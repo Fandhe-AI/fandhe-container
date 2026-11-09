@@ -51,6 +51,9 @@ struct FakeHolder {
 
 impl FakeHolder {
     fn new(log: &Log, spawn: Spawn) -> Arc<Self> {
+        Self::with_pid(log, spawn, 4242)
+    }
+    fn with_pid(log: &Log, spawn: Spawn, pid: u32) -> Arc<Self> {
         Arc::new(Self {
             log: Arc::clone(log),
             spawn: Mutex::new(spawn),
@@ -58,7 +61,7 @@ impl FakeHolder {
             live: Mutex::new(Live::Alive),
             unblock: AtomicBool::new(false),
             release_hangs: AtomicBool::new(false),
-            pid: 4242,
+            pid,
         })
     }
     fn count(&self, prefix: &str) -> usize {
@@ -751,6 +754,43 @@ async fn net3_provider_path_mismatch_is_internal_and_unwinds() {
     assert_eq!(calls[1], "set_up");
     assert_eq!(calls[2], "tear_down");
     assert!(calls[3].starts_with("release "));
+    assert!(list(&svc).await.is_empty());
+}
+
+/// CRI-2・REPAIR-5（#2878）: 保持役の pid が範囲外（i32::MAX 超）で巻き戻しの解放待ち中に RunPodSandbox の
+/// future が破棄されても `network_pending` が残らず、Stop・Remove が拒否され続けないこと。
+#[tokio::test]
+async fn repair5_dropped_run_during_out_of_range_pid_rollback_does_not_leave_network_pending() {
+    let log = new_log();
+    let holder = FakeHolder::with_pid(&log, Spawn::Ok, i32::MAX as u32 + 1);
+    holder.release_hangs.store(true, Ordering::SeqCst);
+    let net = Arc::new(FakeNet {
+        log: Arc::clone(&log),
+        ..Default::default()
+    });
+    let svc = service(&holder).with_pod_network(net);
+    let dropped = tokio::time::timeout(Duration::from_millis(100), run(&svc)).await;
+    assert!(dropped.is_err(), "run must still be awaiting the rollback");
+    assert!(!log.lock().unwrap().iter().any(|l| l == "set_up"));
+    let items = list(&svc).await;
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].1, NOTREADY);
+    let id = items[0].0.clone();
+    holder.unblock.store(true, Ordering::SeqCst);
+    let start = Instant::now();
+    loop {
+        match remove(&svc, &id).await {
+            Ok(()) => break,
+            Err(e) => {
+                assert_eq!(e.code(), Code::FailedPrecondition);
+                assert!(
+                    start.elapsed() < Duration::from_secs(10),
+                    "remove never succeeded"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
     assert!(list(&svc).await.is_empty());
 }
 

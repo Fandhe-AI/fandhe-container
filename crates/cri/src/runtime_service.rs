@@ -2257,8 +2257,6 @@ impl CriRuntimeService {
             }
             return Err(failure.err);
         }
-        // 以降は await を挟まず `NetworkSetUpGuard` が引き継ぐ。
-        abort_guard.disarm();
         // 設定の複製と、保持役の namespace のパス（自 sandbox の記録の pid からだけ作る。#2878・NET-3・SEC-5）。
         // `network_pending` が Stop・Remove を拒否するため、spawn から set_up までに `pod_holder` は消えない。
         let (config, holder_paths) = {
@@ -2295,6 +2293,9 @@ impl CriRuntimeService {
                 return Err(err);
             }
         };
+        // 以降は await を挟まず `NetworkSetUpGuard` が引き継ぐ。上の失敗分岐の `rollback_pod_holder` の await 中に
+        // future が破棄されても `network_pending` が残らないよう、disarm はここまで遅らせる（#2878・CRI-2・REPAIR-5）。
+        abort_guard.disarm();
         let worker_provider = Arc::clone(provider);
         let worker_id = id.clone();
         let worker_registry = Arc::clone(&self.registry);

@@ -43,12 +43,12 @@
 
 ## 形式
 
-- serde を使わない。固定のヘッダ行（LF・ASCII。版の行 `fandhe-cri-sandbox-record v1` / `fandhe-cri-container-record v1`、キー順固定のスカラー項目）と、`config=<長さ>` の行に続く長さちょうどの prost 符号化した `PodSandboxConfig` / `ContainerConfig`。prost は既存依存で、新規依存は足さない
+- serde を使わない。固定のヘッダ行（LF・ASCII。版の行 `fandhe-cri-sandbox-record v1` / `fandhe-cri-container-record v2`（コンテナは #4322 で v2。v1 も復号で受ける）、キー順固定のスカラー項目）と、`config=<長さ>` の行に続く長さちょうどの prost 符号化した `PodSandboxConfig` / `ContainerConfig`。prost は既存依存で、新規依存は足さない
 - 復号は厳密にする。版の完全一致・キー順固定・重複/未知キー/余分な行/CRLF なし・ID とファイル名の一致・長さの上限（config は `MAX_CONFIG_ENCODED_BYTES`、記録全体の上限を先に確認）。復号後に `config_limits` と同じ上限検証を通し、RunPodSandbox/CreateContainer と同じ上限を再採用時にも効かせる。違反は `InvalidArgument`（入力値をメッセージに載せない。REPAIR-4）
 - 秘密の最小化: `ContainerConfig.envs` は記録に書かない（Status/List は返さず、bundle 作成後は不要）。`command`・`args` も応答に出ないため書かない案があるが、推奨は envs だけを除く（要確認事項 2）
 - 保持量（`retained_bytes`）は読み込み時に再計算し、記録に書かない
-- v1 の実装（R1・#2930。`crates/cri/src/runtime_service/record.rs`）: 「LF・ASCII」はキーと版の行が ASCII という意味で、値は LF 以外の制御文字（CR を含む）を含まない UTF-8（`log_path` は非 ASCII を許す）。sandbox の鍵は `id`・`state`・`created_at`・`runtime_handler`・`pending`・`network_owned`・`network_pending`・`config`、コンテナの鍵は `id`・`pod_sandbox_id`・`state`・`in_flight`（種類。`-` は無し）・`created_at`・`started_at`・`finished_at`・`exit_code`・`termination`・`stop_signal`・`log_path`・`user`・`image_id`・`image_ref`・`image_tag`・`config`（値のない項目は `-`）の順。整数は正準形（先頭 0・`+`・`-0` なし）、ID は 64 文字の小文字 16 進。config 部は復号後に再符号化した長さが `config=` の長さと一致することを要求し、未知フィールド・重複フィールド・非正準な符号化を拒否する。コンテナは `envs` が空であることも要求する。`image_ref`・`image_tag` は `ResolvedImage` と同じ判定を構築の前に適用し、不正値を黙って落とさず拒否する
-- 版を上げる条件: 保持役の素性（R11 #2940）や `pod_netns`・provider 識別子（R12 #2941）の鍵を足すときは `v2` とする（版は完全一致のため、旧版の扱いはそれぞれの issue で決める）
+- v1 の実装（R1・#2930。`crates/cri/src/runtime_service/record.rs`）: 「LF・ASCII」はキーと版の行が ASCII という意味で、値は LF 以外の制御文字（CR を含む）を含まない UTF-8（`log_path` は非 ASCII を許す）。sandbox の鍵は `id`・`state`・`created_at`・`runtime_handler`・`pending`・`network_owned`・`network_pending`・`config`、コンテナの鍵は `id`・`pod_sandbox_id`・`state`・`in_flight`（種類。`-` は無し）・`created_at`・`started_at`・`finished_at`・`exit_code`・`termination`・`stop_signal`・`instance`（v2 のみ。create 時に実行層が報告したインスタンスの正準形 u64、無ければ `-`。v1 の記録は行が無く `None`。#4322）・`log_path`・`user`・`image_id`・`image_ref`・`image_tag`・`config`（値のない項目は `-`）の順。整数は正準形（先頭 0・`+`・`-0` なし）、ID は 64 文字の小文字 16 進。config 部は復号後に再符号化した長さが `config=` の長さと一致することを要求し、未知フィールド・重複フィールド・非正準な符号化を拒否する。コンテナは `envs` が空であることも要求する。`image_ref`・`image_tag` は `ResolvedImage` と同じ判定を構築の前に適用し、不正値を黙って落とさず拒否する
+- 版を上げる条件: 保持役の素性（R11 #2940）や `pod_netns`・provider 識別子（R12 #2941）の鍵を足すときは、コンテナ記録は `v3`・sandbox 記録は `v2` とする（版は完全一致のため、旧版の扱いはそれぞれの issue で決める）。v1 のコンテナ記録は次の状態遷移の `put` で v2 に書き換わる。ダウングレードで旧バイナリが v2 を読むと `malformed` として数えられ、記録は消されず残る（#4322）
 
 ## 排他
 

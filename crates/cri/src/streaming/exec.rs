@@ -150,6 +150,13 @@ pub struct ExecLaunch {
     pub instance: Option<u64>,
 }
 
+/// `Exec` RPC が URL を発行する前に、CRI の create 時のインスタンスと発行時の値が一致しない（CRI の外で作り直された）、
+/// または記録に create 時の値が無い（旧版の記録・write-ahead 段階で落ちた記録。fail-closed）ときの拒否の文
+/// （固定の英文。ID・識別子を含めない。`FAILED_PRECONDITION`。#4322・CRI-2・CRI-6・SEC-1）。
+/// [`MSG_EXEC_INSTANCE_CHANGED`] は URL 発行後の作り直しの語彙で、こちらは発行前。
+pub const MSG_EXEC_INSTANCE_NOT_CREATED_ONE: &str =
+    "container was recreated after it was created through CRI";
+
 /// 発行後に同じ ID のコンテナが作り直されていたときの拒否の文（固定の英文。ID・識別子を含めない。#4286）。
 /// shim v2 の `NOT_FOUND "exec not found"` は登録簿から除去した結果の語彙で、ストリーミング経路には登録簿が無いため
 /// コードも `FAILED_PRECONDITION`（状態が前提を満たさない）に揃えてある。

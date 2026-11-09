@@ -144,7 +144,7 @@ use fandhe_container_core::traits::{ContainerLogPath, StdinMode};
 
 use crate::adapter::{
     BundleProvider, BundleRequest, PodNetns, PodNetworkProvider, PodNetworkRequest, PreparedBundle,
-    ReleaseBudget, RuntimeAdapter, RuntimeContainerStatus, RuntimeLifecycle,
+    ReleaseBudget, RuntimeAdapter, RuntimeContainerStatus, RuntimeLifecycle, instance_matches,
 };
 use crate::image_service::CancelOnDrop;
 use crate::instrument::{CriOpKind, CriOpRecorder, CriOpTimer, NoopCriOpRecorder};
@@ -153,6 +153,7 @@ use crate::runtime::v1::{
     self, ContainerState as CriContainerState, PodSandboxConfig, PodSandboxState,
     runtime_service_server::RuntimeService,
 };
+use crate::streaming::exec::MSG_EXEC_INSTANCE_NOT_CREATED_ONE;
 use crate::streaming::port_forward::PortForwardNetwork;
 use crate::streaming::{
     StreamKind, StreamRequest, StreamingUrlIssuer, validate_attach_request, validate_exec_request,
@@ -1663,6 +1664,26 @@ fn identity_retained_extra(user: Option<&AppliedUser>, image: Option<&ResolvedIm
     user_extra.saturating_add(image_extra)
 }
 
+/// create が実行層から受けたインスタンス識別子を記録へ書く（#4322・CRI-2・CRI-6・SEC-1）。
+///
+/// `create_container_runtime` の worker から `guard.commit()` の前に呼ぶ（commit が registry の記録を複製して
+/// 記録ファイルへ符号化するため、その時点で値が入っている必要がある）。記録が無ければ `INTERNAL`。
+fn attach_instance(
+    registry: &Mutex<SandboxRegistry>,
+    container_id: &str,
+    instance: Option<u64>,
+) -> Result<(), CriError> {
+    let mut registry = registry
+        .lock()
+        .map_err(|_| CriError::internal("sandbox registry is unavailable"))?;
+    let record = registry
+        .containers
+        .get_mut(container_id)
+        .ok_or_else(|| CriError::internal("container registry is inconsistent"))?;
+    record.instance = instance;
+    Ok(())
+}
+
 /// `BundleProvider::prepare` が報告した識別情報と stop signal を、実行層へ渡す前に記録へ反映する（#2771・CRI-2）。
 ///
 /// `create_container_runtime` の worker から呼ぶ。識別情報の保持量（補助グループは最大 65,536 件）を
@@ -3052,6 +3073,7 @@ impl CriRuntimeService {
                 in_flight,
                 runtime_owned: false,
                 stop_signal,
+                instance: None,
                 applied_user: None,
                 resolved_image: None,
                 exit_observe_pending: false,
@@ -3164,6 +3186,14 @@ impl CriRuntimeService {
                         guard.mark_definitely_failed();
                     }
                     return Err(CriError::internal("runtime returned an unexpected state"));
+                }
+                // 実行層が報告した create 時のインスタンスを、確定（記録ファイルへの書き込み）の前に記録へ入れる。
+                // 書けなければ（記録が無い等）確定せず、commit 失敗と同じく削除確認つきで巻き戻す。
+                if let Err(err) = attach_instance(&registry, &id, status.instance) {
+                    if confirm_removed(&adapter, &id, timeout) {
+                        guard.mark_definitely_failed();
+                    }
+                    return Err(err);
                 }
                 if let Err(status) = guard.commit() {
                     // メモリを確定済みで記録の書き込みだけが失敗した場合は、実行層に作成済みの資源があるまま
@@ -3917,14 +3947,21 @@ impl CriRuntimeService {
         Ok(status.instance)
     }
 
-    /// `Exec` の本体。検証 → 存在照合 → インスタンスの記録 → URL 発行（CRI-6・TASK-63.1。注入が無ければ `UNIMPLEMENTED`）。
+    /// `Exec` の本体。検証 → 存在照合と create 時のインスタンス取得 → 発行時のインスタンス読み取り → 両者の照合（不一致は拒否。#4322）→ URL 発行（CRI-6・TASK-63.1。注入が無ければ `UNIMPLEMENTED`）。
     async fn exec_impl(&self, req: v1::ExecRequest) -> Result<v1::ExecResponse, CriError> {
         let issuer = self.streaming_issuer(StreamKind::Exec, "exec")?;
         validate_exec_request(&req)?;
         // 起動役が受けない tty・相対 argv[0] は URL の発行前に断る（#3761・REPAIR-3）。
         issuer.require_exec_options(req.tty, &req.cmd)?;
-        self.require_container(&req.container_id)?;
+        let recorded = self.container_create_instance(&req.container_id)?;
         let instance = self.exec_instance_at_issue(&req.container_id).await?;
+        // create 時の値と発行時の値が違う（CRI の外で作り直された）、または記録に値が無い（旧版の記録・
+        // write-ahead 段階で落ちた記録）のに現在値がある場合は、URL を発行しない（fail-closed。#4322・SEC-1）。
+        if !instance_matches(recorded, instance) {
+            return Err(CriError::failed_precondition(
+                MSG_EXEC_INSTANCE_NOT_CREATED_ONE,
+            ));
+        }
         let url = issuer.issue(StreamRequest::Exec {
             request: req,
             instance,
@@ -4027,19 +4064,16 @@ impl CriRuntimeService {
         Ok(())
     }
 
-    /// コンテナの存在を照合する。レジストリのロックは返す前に放す（発行とロックを入れ子にしない）。
-    fn require_container(&self, container_id: &str) -> Result<(), CriError> {
-        let exists = self
-            .registry
+    /// コンテナの存在を照合し、create 時のインスタンス識別子を返す（#4322）。未知 ID は `NOT_FOUND`。
+    /// レジストリのロックは返す前に放す。
+    fn container_create_instance(&self, container_id: &str) -> Result<Option<u64>, CriError> {
+        self.registry
             .lock()
             .map_err(|_| CriError::internal("sandbox registry is unavailable"))?
             .containers
-            .contains_key(container_id);
-        if exists {
-            Ok(())
-        } else {
-            Err(CriError::not_found("container not found"))
-        }
+            .get(container_id)
+            .map(|record| record.instance)
+            .ok_or_else(|| CriError::not_found("container not found"))
     }
 
     /// `ListContainers` の本体。フィルタは AND、並びは `(created_at, id)` の昇順（CRI-1・TASK-58.3・#435）。

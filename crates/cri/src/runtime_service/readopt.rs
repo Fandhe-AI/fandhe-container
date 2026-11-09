@@ -633,6 +633,9 @@ impl CriRuntimeService {
                 in_flight: false,
                 runtime_owned,
                 stop_signal: data.stop_signal,
+                // 記録の値をそのまま復元する。core が今報告する値で補わない（再起動の間に作り直された
+                // コンテナの値を受け入れてしまい、Exec の照合が無意味になる。#4322・SEC-1）。
+                instance: data.instance,
                 applied_user: data.applied_user,
                 resolved_image: data.resolved_image,
                 exit_observe_pending: false,
@@ -1434,6 +1437,7 @@ mod tests {
             exit_code: Some(7),
             termination: None,
             stop_signal: Signal::Sigint as i32,
+            instance: Some(5),
             resolved_log_path: Some(ContainerLogPath::new(LOG).unwrap()),
             applied_user: Some(AppliedUser::new(1000, 1000, vec![2000])),
             resolved_image: Some(
@@ -1754,6 +1758,41 @@ mod tests {
         assert_eq!(st.exit_code, 137);
         assert_eq!(st.finished_at, STOPPED_AT);
         assert_eq!(st.reason, "OOMKilled");
+    }
+
+    /// 再採用された記録の create 時のインスタンスを返す（#4322）。
+    fn readopted_instance(rec: ContainerRecordData, listed: Option<Vec<u8>>) -> Option<u64> {
+        let id = rec.id.clone();
+        let listed = ListedRecord {
+            id: RecordId::new(&id).unwrap(),
+            outcome: Ok(listed.unwrap_or_else(|| rec.encode().unwrap())),
+        };
+        let e = env(vec![listed], &[(id.clone(), Core::Running)]);
+        let r = readopt_all(&e).unwrap();
+        assert_eq!((r.adopted, r.broken.total()), (1, 0));
+        let reg = e.svc.registry.lock().unwrap();
+        reg.containers.get(&id).unwrap().instance
+    }
+
+    /// CRI-2・CRI-6・SEC-1（#4322）: 再採用は記録の `instance` をそのまま復元する（core が今報告する値で補わない）。
+    #[test]
+    fn cri2_4322_readopt_keeps_recorded_instance() {
+        let rec = cdata('1', "c", None, ContainerState::Running);
+        assert_eq!(rec.instance, Some(5));
+        assert_eq!(readopted_instance(rec, None), Some(5));
+    }
+
+    /// CRI-2・SEC-1（#4322）: v1 の記録（`instance=` 行なし）は再採用でき、`instance` は `None`（Exec は fail-closed）。
+    #[test]
+    fn cri2_4322_readopt_v1_record_has_no_instance() {
+        let rec = cdata('1', "c", None, ContainerState::Running);
+        let bytes = rec.encode().unwrap();
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let v1 = text
+            .replacen("record v2\n", "record v1\n", 1)
+            .replacen("instance=5\n", "", 1);
+        assert_ne!(v1, text);
+        assert_eq!(readopted_instance(rec, Some(v1.into_bytes())), None);
     }
 
     /// CRI-1・CRI-2（E3 #4278）: core が終了時刻を報告しないときは再採用の時刻（開始時刻以上で正の値）を使う。

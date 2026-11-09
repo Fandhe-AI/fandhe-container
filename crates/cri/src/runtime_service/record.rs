@@ -6,14 +6,18 @@
 //! 符号化と、壊れた入力・改ざんされた入力を untrusted として拒否する復号を提供する。ファイルの置き場・排他・
 //! fsync（R2 #2932）、registry との変換と書く / 消す時点（R4 #2933・R5 #2934）、起動時の再採用（R6 #2935・R7 #2936 は実装済みで `readopt` が呼ぶ）は範囲外で、本モジュールは純粋な関数だけを持つ（ファイル I/O なし）。
 //!
-//! # 形式 v1
+//! # 形式
+//!
+//! sandbox 記録は v1。コンテナ記録は v2（`stop_signal=` の直後に `instance=<u64 の正準形 | ->` を持つ。#4322）で、
+//! 符号化は常に v2。復号は v1（`instance=` 行なし。インスタンスは `None`）と v2 を受け、版と行の組の不一致
+//! （v1 に `instance=` がある・v2 に無い・未知の版）は拒否する。
 //!
 //! 「固定ヘッダ（版の行＋キー順固定のスカラー項目、各行は LF 終端）」と、`config=<長さ>` の行に続く
 //! 「長さちょうどの prost 符号化した `PodSandboxConfig` / `ContainerConfig`」から成る。ヘッダは ASCII の
 //! キーと、LF 以外の制御文字を含まない UTF-8 の値で、`log_path` など非 ASCII を許す値があるため値は ASCII に
 //! 限らない。`ContainerConfig.envs` は記録に書かない（秘密値を状態ルートへ残さない。符号化で消し、復号で非空を拒否）。
-//! 版は完全一致のみを受ける。保持役の素性（R11）や `pod_netns`（R12）の鍵を足すときは `v2` とし、旧版の扱いは
-//! それぞれの issue で決める。
+//! 版は完全一致のみを受ける。保持役の素性（R11）や `pod_netns`（R12）の鍵を足すときは `v3`（コンテナ記録）とし、
+//! 旧版の扱いはそれぞれの issue で決める。
 //!
 //! 復号は次のどれかに反する入力を、固定文言の `INVALID_ARGUMENT` で拒否する（メッセージに入力値・長さ・鍵名を
 //! 載せない。REPAIR-4）: 版の完全一致・キー順固定・重複キーなし・未知キーなし・余分な行なし・CRLF なし・
@@ -45,7 +49,10 @@ use fandhe_container_core::traits::{CONTAINER_LOG_PATH_MAX_BYTES, ContainerLogPa
 use fandhe_container_oci::reference::Digest;
 
 const SANDBOX_VERSION_LINE: &str = "fandhe-cri-sandbox-record v1";
-const CONTAINER_VERSION_LINE: &str = "fandhe-cri-container-record v1";
+/// コンテナ記録の現行の版の行（符号化は常にこちら。`instance=` 行を持つ。#4322）。
+const CONTAINER_VERSION_LINE: &str = "fandhe-cri-container-record v2";
+/// 旧版の行（`instance=` 行が無い。復号だけ受け、インスタンスは `None` とする。#4322）。
+const CONTAINER_VERSION_LINE_V1: &str = "fandhe-cri-container-record v1";
 
 /// 版の行・スカラー行の内容の上限（バイト。LF を含まない。最長は `pod_sandbox_id=` + 64 文字の 79）。
 const LINE_MAX_SCALAR: usize = 96;
@@ -60,7 +67,7 @@ const LINE_MAX_IMAGE_FIELD: usize = 10 + MAX_IMAGE_FIELD_BYTES;
 /// network_owned・network_pending・config の 9 行（各 LF 込み）。
 pub(super) const SANDBOX_HEADER_BUDGET: usize = 9 * (LINE_MAX_SCALAR + 1);
 /// コンテナ記録のヘッダ部の予算。スカラー行 14（版・id・pod_sandbox_id・state・in_flight・created_at・
-/// started_at・finished_at・exit_code・termination・stop_signal・config の 12 行と余裕 2）と
+/// started_at・finished_at・exit_code・termination・stop_signal・instance・config の 13 行と余裕 1）と
 /// `user`・`log_path`・`image_id`・`image_ref`・`image_tag` の可変行（image_id は digest 文字列で 64 バイトを超える）。
 pub(super) const CONTAINER_HEADER_BUDGET: usize = 14 * (LINE_MAX_SCALAR + 1)
     + (LINE_MAX_USER + 1)
@@ -110,6 +117,8 @@ pub(super) struct ContainerRecordData {
     pub(super) exit_code: Option<i32>,
     pub(super) termination: Option<RuntimeTerminationReason>,
     pub(super) stop_signal: i32,
+    /// create 時に実行層が報告したインスタンス識別子（`ContainerRecord::instance`。v1 の記録は `None`。#4322）。
+    pub(super) instance: Option<u64>,
     pub(super) resolved_log_path: Option<ContainerLogPath>,
     pub(super) applied_user: Option<AppliedUser>,
     pub(super) resolved_image: Option<ResolvedImage>,
@@ -327,6 +336,12 @@ impl<'a> Lines<'a> {
         value.strip_prefix('=').ok_or(Bad)
     }
 
+    /// 版の行が候補のどれかに完全一致することを確かめ、一致した候補を返す。
+    fn version_of(&mut self, candidates: &[&'static str]) -> R<&'static str> {
+        let line = self.line(LINE_MAX_SCALAR)?;
+        candidates.iter().copied().find(|c| *c == line).ok_or(Bad)
+    }
+
     /// 版の行の完全一致。
     fn version(&mut self, expected: &str) -> R<()> {
         if self.line(LINE_MAX_SCALAR)? == expected {
@@ -524,6 +539,7 @@ impl ContainerRecordData {
             exit_code: record.exit_code,
             termination: record.termination,
             stop_signal: record.stop_signal,
+            instance: record.instance,
             resolved_log_path: record.resolved_log_path.clone(),
             applied_user: record.applied_user.clone(),
             resolved_image: record.resolved_image.clone(),
@@ -562,6 +578,9 @@ impl ContainerRecordData {
         let exit_code = self
             .exit_code
             .map_or_else(|| "-".to_owned(), |c| c.to_string());
+        let instance = self
+            .instance
+            .map_or_else(|| "-".to_owned(), |v| v.to_string());
 
         let mut config = self.config.clone();
         config.envs.clear();
@@ -570,7 +589,7 @@ impl ContainerRecordData {
         }
         let payload = config.encode_to_vec();
         let header = format!(
-            "{CONTAINER_VERSION_LINE}\nid={}\npod_sandbox_id={}\nstate={}\nin_flight={}\ncreated_at={}\nstarted_at={}\nfinished_at={}\nexit_code={}\ntermination={}\nstop_signal={}\nlog_path={}\nuser={}\nimage_id={}\nimage_ref={}\nimage_tag={}\nconfig={}\n",
+            "{CONTAINER_VERSION_LINE}\nid={}\npod_sandbox_id={}\nstate={}\nin_flight={}\ncreated_at={}\nstarted_at={}\nfinished_at={}\nexit_code={}\ntermination={}\nstop_signal={}\ninstance={}\nlog_path={}\nuser={}\nimage_id={}\nimage_ref={}\nimage_tag={}\nconfig={}\n",
             self.id,
             self.pod_sandbox_id,
             container_state_token(self.state),
@@ -581,6 +600,7 @@ impl ContainerRecordData {
             exit_code,
             termination_token(self.termination),
             self.stop_signal,
+            instance,
             log_path,
             user,
             image.0,
@@ -626,7 +646,8 @@ fn header_lines_ok(header: &str) -> bool {
 
 fn decode_container(bytes: &[u8], expect_id: &str) -> R<DecodedContainer> {
     let mut l = Lines::new(bytes);
-    l.version(CONTAINER_VERSION_LINE)?;
+    let has_instance = l.version_of(&[CONTAINER_VERSION_LINE_V1, CONTAINER_VERSION_LINE])?
+        == CONTAINER_VERSION_LINE;
     let id = parse_record_id(l.key("id", LINE_MAX_SCALAR)?)?;
     if id != expect_id {
         return Err(Bad);
@@ -646,6 +667,15 @@ fn decode_container(bytes: &[u8], expect_id: &str) -> R<DecodedContainer> {
     if !is_concrete_signal(stop_signal) {
         return Err(Bad);
     }
+    // v2 だけが `instance=` を持つ。v1 は行が無く `None`（旧版の扱いは Exec の照合で fail-closed。#4322）。
+    let instance = if has_instance {
+        match dash_none(l.key("instance", LINE_MAX_SCALAR)?) {
+            None => None,
+            Some(v) => Some(parse_canonical_u64(v)?),
+        }
+    } else {
+        None
+    };
     let resolved_log_path = match dash_none(l.key("log_path", LINE_MAX_LOG_PATH)?) {
         None => None,
         Some(v) => Some(ContainerLogPath::new(v).map_err(|_| Bad)?),
@@ -700,6 +730,7 @@ fn decode_container(bytes: &[u8], expect_id: &str) -> R<DecodedContainer> {
             exit_code,
             termination,
             stop_signal,
+            instance,
             resolved_log_path,
             applied_user,
             resolved_image,
@@ -803,6 +834,7 @@ mod tests {
             exit_code: Some(-137),
             termination: Some(RuntimeTerminationReason::OomKilled),
             stop_signal: Signal::Sigkill as i32,
+            instance: Some(7),
             resolved_log_path: Some(
                 ContainerLogPath::new("/var/log/pods/ns_p_uid/c/0.log").unwrap(),
             ),
@@ -925,11 +957,55 @@ mod tests {
         let head = std::str::from_utf8(&bytes[..bytes.len() - n]).unwrap();
         let hex = "ab".repeat(32);
         let expected = format!(
-            "fandhe-cri-container-record v1\nid={}\npod_sandbox_id={}\nstate=exited\nin_flight=create\ncreated_at=1700000000000000001\nstarted_at=1700000000000000002\nfinished_at=1700000000000000003\nexit_code=-137\ntermination=oom_killed\nstop_signal=13\nlog_path=/var/log/pods/ns_p_uid/c/0.log\nuser=1000:1000:2000,3000\nimage_id=sha256:{hex}\nimage_ref=busybox@sha256:{hex}\nimage_tag=busybox:1.36\nconfig={n}\n",
+            "fandhe-cri-container-record v2\nid={}\npod_sandbox_id={}\nstate=exited\nin_flight=create\ncreated_at=1700000000000000001\nstarted_at=1700000000000000002\nfinished_at=1700000000000000003\nexit_code=-137\ntermination=oom_killed\nstop_signal=13\ninstance=7\nlog_path=/var/log/pods/ns_p_uid/c/0.log\nuser=1000:1000:2000,3000\nimage_id=sha256:{hex}\nimage_ref=busybox@sha256:{hex}\nimage_tag=busybox:1.36\nconfig={n}\n",
             id('b'),
             id('a'),
         );
         assert_eq!(head, expected);
+    }
+
+    /// #4322・CRI-2・SEC-1: `instance` は Some / None / 最大値で往復する。
+    #[test]
+    fn cri2_4322_container_instance_roundtrips() {
+        for value in [Some(0), Some(7), Some(u64::MAX), None] {
+            let mut d = container_data();
+            d.instance = value;
+            let bytes = d.encode().unwrap();
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+            let line =
+                value.map_or_else(|| "instance=-\n".to_owned(), |v| format!("instance={v}\n"));
+            assert!(text.contains(&line), "missing {line:?}");
+            let got = ContainerRecordData::decode(&bytes, &d.id).unwrap();
+            assert_eq!(got.data.instance, value);
+        }
+    }
+
+    /// #4322: v1 の記録（`instance=` 行なし）は復号でき、インスタンスは `None`、ほかの項目は一致する。
+    #[test]
+    fn cri2_4322_v1_record_decodes_with_no_instance() {
+        let data = container_data();
+        let bytes = data.encode().unwrap();
+        let n = payload_len(&bytes);
+        let head = std::str::from_utf8(&bytes[..bytes.len() - n]).unwrap();
+        let v1_head =
+            head.replacen("record v2\n", "record v1\n", 1)
+                .replacen("instance=7\n", "", 1);
+        let mut v1 = v1_head.into_bytes();
+        v1.extend_from_slice(&bytes[bytes.len() - n..]);
+        let got = ContainerRecordData::decode(&v1, &data.id).unwrap();
+        let mut expected = data.clone();
+        expected.config.envs.clear();
+        expected.instance = None;
+        assert_eq!(got.data, expected);
+        // v1 に instance 行が残っていれば拒否する。
+        let with_line = String::from_utf8_lossy(&bytes[..bytes.len() - n]).replacen(
+            "record v2\n",
+            "record v1\n",
+            1,
+        );
+        let mut bad = with_line.into_bytes();
+        bad.extend_from_slice(&bytes[bytes.len() - n..]);
+        assert_container_rejected(&bad);
     }
 
     #[test]
@@ -1156,7 +1232,20 @@ mod tests {
     #[test]
     fn cri1_repair2_container_rejects_header_violations() {
         for (from, to) in [
-            ("record v1\n", "record v2\n"),
+            ("record v2\n", "record v3\n"),
+            ("record v2\n", "record v2 \n"),
+            ("record v2\n", "record v1\n"),
+            ("stop_signal=13\ninstance=7\n", "stop_signal=13\n"),
+            ("instance=7", "instance=07"),
+            ("instance=7", "instance=-1"),
+            ("instance=7", "instance=+1"),
+            ("instance=7", "instance="),
+            ("instance=7", "instance=184467440737095516160"),
+            ("instance=7\n", "instance=7\r\n"),
+            (
+                "stop_signal=13\ninstance=7\n",
+                "instance=7\nstop_signal=13\n",
+            ),
             ("state=exited\n", "state=Exited\n"),
             ("state=exited\n", "state=gone\n"),
             ("in_flight=create\n", "in_flight=bogus\n"),

@@ -1,6 +1,7 @@
 //! `TaskExecLauncher` の Linux 実装（stream-exec helper 経由）。契約と残余は親モジュール `task_exec` の doc を参照
 //! （CRI-5・CRI-1・SEC-1・REPAIR-3・REPAIR-5・#4148）。
 
+use std::collections::VecDeque;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -16,10 +17,12 @@ use fandhe_container_cri::shim_v2::{
     ExecId, ExecProcessSpec, ExecProcessStatus, TaskExecLauncher, TaskExecProcess,
 };
 use fandhe_container_supervisor::stream_exec::channel::{
-    HelperMessage, StdioSend, recv_from_helper, send_stdio_handover,
+    HelperMessage, StdioSend, recv_from_helper, send_signal, send_stdio_handover,
 };
 use fandhe_container_supervisor::stream_exec::helper::StreamExecArgs;
-use fandhe_container_supervisor::stream_exec::wire::{StdioMask, StreamExecOutcome};
+use fandhe_container_supervisor::stream_exec::wire::{
+    ExecSignal, SignalAckCode, StdioMask, StreamExecOutcome,
+};
 
 use crate::streaming::exec_launcher::{
     HANDOVER_BUDGET, HelperGuard, HelperSpawner, ProductionHelperSpawner, RESULT_GRACE,
@@ -121,10 +124,19 @@ pub struct ExecBudgets {
     /// 未確認になってから、Wait が消滅の確認を待つ猶予（supervisor の exec 子 cgroup の回収の上限に余裕を足した値。#4221）。
     /// 過ぎても確認できなければ従来どおり `UNAVAILABLE` を返す。
     pub extinction_grace: Duration,
+    /// SIGKILL 以外のシグナルの `SignalAck` を待つ上限（helper の保留の猶予 2 秒より長くする。#4282・REPAIR-5）。
+    /// 過ぎたら `DEADLINE_EXCEEDED`。
+    pub signal_ack: Duration,
 }
 
 /// 未確認になってから Wait が消滅の確認を待つ既定の猶予（supervisor の `REAP_BUDGET` と同じ 10 秒）。
 const EXTINCTION_GRACE: Duration = Duration::from_secs(10);
+
+/// `Signal` frame の送信に割り当てる上限（#4282・REPAIR-5）。
+const SIGNAL_SEND_BUDGET: Duration = Duration::from_secs(2);
+
+/// `SignalAck` を待つ既定の上限（helper の保留の猶予〔2 秒〕に刻みと送信の余裕を足した値。#4282・REPAIR-5）。
+const SIGNAL_ACK_BUDGET: Duration = Duration::from_secs(5);
 
 impl Default for ExecBudgets {
     fn default() -> Self {
@@ -134,6 +146,7 @@ impl Default for ExecBudgets {
             session: SESSION_TIMEOUT,
             result_grace: RESULT_GRACE,
             extinction_grace: EXTINCTION_GRACE,
+            signal_ack: SIGNAL_ACK_BUDGET,
         }
     }
 }
@@ -157,14 +170,44 @@ impl Phase {
     }
 }
 
+/// 未応答の要求の保持上限（これ以上は新しい要求を送らず `UNAVAILABLE`。無制限の蓄積を防ぐ。REPAIR-5）。
+const MAX_PENDING_SIGNALS: usize = 16;
+
+/// SIGKILL 以外のシグナルの `SignalAck` の受け渡し口（待っている要求 1 件と、監視スレッドが受けた結果。#4282）。
+#[derive(Default)]
+struct AckSlot {
+    /// helper へ送って ack をまだ受けていない要求（送信順。helper は frame の順に 1 件ずつ ack する）。
+    /// 各要素は (シグナル, 待ち手が諦めた〔期限切れ・結果先着〕か)。諦めていない要求は高々 1 件で、必ず末尾（要求は排他）。
+    /// 諦めた要求の遅れた ack は黙って消費し、停止も新要求の成功扱いもしない（REPAIR-5・#4282）。
+    pending: VecDeque<(ExecSignal, bool)>,
+    /// 受けた結果（待っている要求のものだけ）。
+    received: Option<SignalAckCode>,
+}
+
 struct Inner {
     phase: Mutex<Phase>,
     changed: Condvar,
+    /// `SignalAck` の受け渡し（#4282）。ロックの順序は「ack → phase」だけ（phase を持ったまま ack を取らない）。
+    ack: Mutex<AckSlot>,
+    acked: Condvar,
 }
 
 impl Inner {
+    fn new() -> Self {
+        Self {
+            phase: Mutex::new(Phase::Running),
+            changed: Condvar::new(),
+            ack: Mutex::new(AckSlot::default()),
+            acked: Condvar::new(),
+        }
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Phase> {
         self.phase.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn lock_ack(&self) -> std::sync::MutexGuard<'_, AckSlot> {
+        self.ack.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// 実行中のときだけ遷移させる（終了済みを上書きしない）。
@@ -175,6 +218,35 @@ impl Inner {
         }
         drop(p);
         self.changed.notify_all();
+        // ack を待っている要求を起こす（結果・切断が先に来たことを知らせる）。
+        self.acked.notify_all();
+    }
+
+    /// 受けた `SignalAck` を先頭の未応答の要求へ対応づける。諦められた要求の ack は黙って消費して `true`。
+    /// 未応答が無い・シグナルが合わない・既に受け取り済みなら `false`（プロトコル違反。呼び出し側が helper を止める）。
+    fn deliver_ack(&self, signal: ExecSignal, code: SignalAckCode) -> bool {
+        let mut a = self.lock_ack();
+        // ack が来なかった（送信失敗後の欠落等）諦め済みの要求は読み飛ばす。
+        while matches!(a.pending.front(), Some((s, true)) if *s != signal) {
+            a.pending.pop_front();
+        }
+        match a.pending.pop_front() {
+            Some((s, true)) if s == signal => true,
+            Some((s, false)) if s == signal && a.received.is_none() => {
+                a.received = Some(code);
+                drop(a);
+                self.acked.notify_all();
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// 末尾の（待ち手が今いる）要求を「諦めた」印にする。
+fn abandon_last(a: &mut AckSlot) {
+    if let Some(last) = a.pending.back_mut() {
+        last.1 = true;
     }
 }
 
@@ -298,7 +370,9 @@ impl ShimExecLauncher {
                 Err(e) => e,
                 Ok(_) => CriError::internal("exec ended before it started"),
             }),
-            Ok(HelperMessage::PtyMaster(_)) => Err(CriError::internal("exec failed")),
+            Ok(HelperMessage::PtyMaster(_) | HelperMessage::SignalAck { .. }) => {
+                Err(CriError::internal("exec failed"))
+            }
             Err(e) => Err(channel_error(&e)),
         }
     }
@@ -395,10 +469,7 @@ impl TaskExecLauncher for ShimExecLauncher {
         let watch_channel = channel
             .try_clone()
             .map_err(|_| fail(CriError::unavailable("exec channel setup failed")))?;
-        let inner = Arc::new(Inner {
-            phase: Mutex::new(Phase::Running),
-            changed: Condvar::new(),
-        });
+        let inner = Arc::new(Inner::new());
         let deadline = Instant::now() + self.budgets.session + self.budgets.result_grace;
         let thread_inner = Arc::clone(&inner);
         let thread_guard = Arc::clone(&guard);
@@ -415,9 +486,12 @@ impl TaskExecLauncher for ShimExecLauncher {
                 );
             })
             .map_err(|_| fail(CriError::unavailable("failed to start the exec watcher")))?;
-        drop(channel);
+        // 送信用の端は手放さず `ShimExecProcess` が持つ（SIGKILL 以外のシグナルの `Signal` frame を送る。#4282）。
+        // 要求元の消滅の検知は「端がすべて閉じる」ことなので、監視スレッドの端が残る間は handle の drop で誤検知しない。
 
         Ok(Arc::new(ShimExecProcess {
+            signal_tx: Mutex::new(Some(channel)),
+            signal_ack: self.budgets.signal_ack,
             inner,
             guard: Arc::downgrade(&guard),
             tracker: Arc::clone(&self.tracker),
@@ -440,17 +514,30 @@ fn watch_result(
     guard: &Arc<HelperGuard>,
     tracker: &Mutex<Tracker>,
 ) {
-    let next = match recv_from_helper(channel, deadline) {
-        Ok(HelperMessage::Result(StreamExecOutcome::Failed(code))) => {
-            Phase::unconfirmed(cri_error(code))
-        }
-        Ok(HelperMessage::Result(outcome)) => match map_outcome(outcome) {
-            Ok(code) => Phase::Exited(Some(code)),
-            Err(e) => Phase::unconfirmed(e),
-        },
-        Ok(_) | Err(_) => {
-            guard.kill();
-            Phase::unconfirmed(CriError::unavailable(UNCONFIRMED))
+    // helper → plugin-cri の唯一の読み手。`SignalAck` は待っている要求へ渡して読み続け、`Result` で抜ける（#4282）。
+    let next = loop {
+        match recv_from_helper(channel, deadline) {
+            Ok(HelperMessage::SignalAck { signal, code }) => {
+                if inner.deliver_ack(signal, code) {
+                    continue;
+                }
+                // 待っていない・番号違いの ack はプロトコル違反（helper の kill → 未確認）。
+                guard.kill();
+                break Phase::unconfirmed(CriError::unavailable(UNCONFIRMED));
+            }
+            Ok(HelperMessage::Result(StreamExecOutcome::Failed(code))) => {
+                break Phase::unconfirmed(cri_error(code));
+            }
+            Ok(HelperMessage::Result(outcome)) => {
+                break match map_outcome(outcome) {
+                    Ok(code) => Phase::Exited(Some(code)),
+                    Err(e) => Phase::unconfirmed(e),
+                };
+            }
+            Ok(_) | Err(_) => {
+                guard.kill();
+                break Phase::unconfirmed(CriError::unavailable(UNCONFIRMED));
+            }
         }
     };
     inner.settle_if_running(next);
@@ -466,9 +553,80 @@ struct ShimExecProcess {
     /// 消滅確認の材料（launch の時点で固定。#4221）。
     target: ExecExtinctionTarget,
     extinction_grace: Duration,
+    /// helper への `Signal` frame の送信用の端（`launch` の channel）。ロックが SIGKILL 以外のシグナルの要求を 1 件ずつ排他する。
+    /// 送信に失敗したら `None` にして以後は送らない（frame の境界を信頼できないため）。#4282
+    signal_tx: Mutex<Option<std::os::unix::net::UnixStream>>,
+    /// `SignalAck` を待つ上限。
+    signal_ack: Duration,
 }
 
 impl ShimExecProcess {
+    /// SIGKILL 以外の許可されたシグナルを helper へ送り、`SignalAck` を期限つきで待って CRI の結果へ写す（#4282・SUP-6・CRI-5）。
+    ///
+    /// 要求は 1 件ずつ排他する。結果・切断が ack より先に来たら `NOT_FOUND` / `UNAVAILABLE`。期限切れは `DEADLINE_EXCEEDED`。
+    fn send_exec_signal(&self, signal: ExecSignal) -> Result<(), CriError> {
+        let undelivered = || CriError::unavailable("exec signal could not be delivered");
+        let mut tx = self
+            .signal_tx
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let Some(stream) = tx.as_ref() else {
+            return Err(undelivered());
+        };
+        {
+            let mut a = self.inner.lock_ack();
+            if a.pending.len() >= MAX_PENDING_SIGNALS {
+                return Err(undelivered());
+            }
+            a.pending.push_back((signal, false));
+            a.received = None;
+        }
+        if send_signal(stream, signal, Instant::now() + SIGNAL_SEND_BUDGET).is_err() {
+            // 途中まで書いた frame は境界が崩れている。以後この channel へは送らない（helper は受信失敗で signal を無視する）。
+            *tx = None;
+            // 送り切れていないので ack は来ない。末尾の自分の要求を取り除く。
+            self.inner.lock_ack().pending.pop_back();
+            return Err(undelivered());
+        }
+        let until = Instant::now() + self.signal_ack;
+        let mut a = self.inner.lock_ack();
+        loop {
+            if let Some(code) = a.received.take() {
+                return match code {
+                    SignalAckCode::Delivered => Ok(()),
+                    SignalAckCode::NotStarted => Err(CriError::failed_precondition(
+                        "exec process is not started yet",
+                    )),
+                    SignalAckCode::Exited => Err(CriError::not_found("process already finished")),
+                    SignalAckCode::Unavailable => Err(undelivered()),
+                };
+            }
+            // ack より先に結果・切断が来た（ack は来ない）。
+            let ended = match &*self.inner.lock() {
+                Phase::Running => None,
+                Phase::Exited(_) => Some(CriError::not_found("process already finished")),
+                Phase::Unconfirmed { .. } => Some(CriError::unavailable(UNCONFIRMED)),
+            };
+            if let Some(e) = ended {
+                abandon_last(&mut a);
+                return Err(e);
+            }
+            let now = Instant::now();
+            if now >= until {
+                // helper は後から ack しうる。その ack は諦め済みとして消費させる。
+                abandon_last(&mut a);
+                return Err(CriError::timeout("exec signal was not acknowledged"));
+            }
+            let slice = WAIT_SLICE.min(until - now);
+            a = self
+                .inner
+                .acked
+                .wait_timeout(a, slice)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+    }
+
     /// 未確認のとき probe を 1 回照会し、`Confirmed` なら `Exited(None)` へ進める。lock の外で probe を呼ぶ。
     fn try_confirm(&self) {
         if self.probe.confirm(&self.target) == ExtinctionOutcome::Confirmed {
@@ -524,7 +682,14 @@ impl TaskExecProcess for ShimExecProcess {
             return Err(CriError::not_found("process already finished"));
         }
         if signal != Signal::SIGKILL {
-            return Err(CriError::unimplemented("exec signal is not supported"));
+            // 許可リスト（SIGHUP・SIGINT・SIGQUIT・SIGUSR1・SIGUSR2・SIGTERM）の外は従来どおり `UNIMPLEMENTED`（#4282）。
+            let allowed = ExecSignal::new(signal.as_u8())
+                .map_err(|_| CriError::unimplemented("exec signal is not supported"))?;
+            // 未確認の exec へは送らない（cri の `kill_exec` も SIGKILL 以外は拒否する。helper の生存を確かめられない）。
+            if matches!(*self.inner.lock(), Phase::Unconfirmed { .. }) {
+                return Err(CriError::unavailable(UNCONFIRMED));
+            }
+            return self.send_exec_signal(allowed);
         }
         // helper だけを kill する。init へは送らない（SEC-1）。helper が既に無ければ止まっている。
         if let Some(g) = self.guard.upgrade() {

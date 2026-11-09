@@ -232,7 +232,7 @@ shim v2 の `Exec`・`Start(exec_id)`・`exec_id` つきの `State` / `Kill` / `
 - shim のデーモンは多スレッド（`crates/cri/src/shim_v2/server.rs` の accept スレッドと接続ごとのスレッド）。tokio は使わない
 - cri の `Cargo.toml` に supervisor への依存は無い（依存は oci と core〔`default-features = false`〕）。plugin-cri は cri・core・supervisor・net へ path 依存を持つ。`crates/cri/tests/dependency_direction.rs` が機械照合しているのは「core・cri の推移閉包に plugin-cri が入らない」ことだけで、cri → supervisor の辺は照合していない。cri に supervisor を入れない規則の根拠は `cri-streaming-server.md`「crate の担当と依存方向（PLUG-1）」の表と `Cargo.toml` の現状である
 - #3761 の `SupervisorExecLauncher`（`crates/plugin-cri/src/streaming/exec_launcher.rs`。Linux のみ）は async の `ExecStreamLauncher` を実装し、同期の中核（`HelperSpawner` / `ProductionHelperSpawner`・`launch_blocking`・`watch_result`・`map_outcome`・`cri_error`・同時 `MAX_EXEC_SESSIONS` = 64・回収できない helper の保持 `MAX_STUCK_HELPERS` = 8）を持つ。helper は自分の実体と同じディレクトリの固定名の supervisor を `stream-exec` で起動する
-- stream-exec helper（`crates/supervisor/src/stream_exec/helper.rs` の `serve`）の順序は、状態記録（Running・pid が `--expect-pid` と一致）の照合、`launch_env_for`、監査 sink の作成（作れなければ exec しない）、kind 6 の pidfd 受領（`ControlExecHandover`。孤児なら `Unavailable` で記録 pid へ縮退しない）、stdio の受領と `require_stdio_kinds`、kind 7 の exec 子 cgroup 通知と ack、`Started` 送信、`run_command_with_pidfd_output_notify`、`Result` 送信。env・cwd・user の上書きは受けず（`StreamExecArgs` は root / id / expect_pid / timeout / stdio mask / command だけ）、argv[0] は絶対パスに限る。helper は単一スレッドで exec 中に fd 0 を見張れないため Signal frame は無く、`Started` にコマンドの pid は載らない
+- stream-exec helper（`crates/supervisor/src/stream_exec/helper.rs` の `serve`）の順序は、状態記録（Running・pid が `--expect-pid` と一致）の照合、`launch_env_for`、監査 sink の作成（作れなければ exec しない）、kind 6 の pidfd 受領（`ControlExecHandover`。孤児なら `Unavailable` で記録 pid へ縮退しない）、stdio の受領と `require_stdio_kinds`、kind 7 の exec 子 cgroup 通知と ack、`Started` 送信、`run_command_with_pidfd_output_notify`、`Result` 送信。env・cwd・user の上書きは受けず（`StreamExecArgs` は root / id / expect_pid / timeout / stdio mask / command だけ）、argv[0] は絶対パスに限る。exec の待ちの刻みごとに fd 0 の `Signal` frame を受けて `SignalAck` を返す（wire v3・#4282。下の「exec のシグナル」）。`Started` にコマンドの pid は載せない
 - shim の `TaskService::exec` は現状 `terminal` と stdio のパスを `UNIMPLEMENTED` で拒否し、`parse_process_spec` は `capabilities`・`rlimits`・`noNewPrivileges`・`apparmorProfile` 等も `UNIMPLEMENTED` で拒否する。`delete_exec` は実行中の exec を `FAILED_PRECONDITION` で除去しないため、実行中のハンドルが drop されるのはコンテナ削除の purge のときだけ
 - exec は init と同じ cgroup ではなく、コンテナの cgroup の下の exec 子 cgroup（`exec.rs` の `create_child_cgroup`）で動く。supervisor にはコンテナごとの同時 exec 上限 16（`DEFAULT_MAX_EXEC_GUARDS`、`control/exec_guard.rs` の `ExecGuardLimits`）がある
 
@@ -264,9 +264,9 @@ A の共通モジュールの候補は `crates/plugin-cri/src/exec_helper.rs`（
 
 | メソッド | 対応 |
 | -------- | ---- |
-| `pid()` | `None`。helper がコマンドの pid を返さないため State の pid は 0。返すには `Started` の拡張が要り後続候補 |
+| `pid()` | `None`。State の pid は 0。`Started` は exec 子 cgroup の作成直後（worker の fork 前）に送るため、この時点でコマンドの pid は存在しない。pid を返すには spawn 後に新しい frame を足して worker から親へ中継する必要があり、さらに pid namespace の内外どちらの値か・再利用の問題が残る。#4282 のシグナルは pidfd で宛先を固定するので pid は不要で、足さない（後続候補に残す） |
 | `status()` | `Result` を受けるまで `Running`。`Exited(n)` / `Signaled(s)` / `NotStarted` は `map_outcome` の写像で `Exited { code }`。`Started` 後の `Failed(code)` は消滅の証明にならないため一律には `Exited` にしない。消滅を確認できた種別だけ `Exited { code: None }`（State は 255）にし、確認できない種別はエラーとして保持する（下表） |
-| `signal(sig)` | SIGKILL のときだけ受け、`HelperGuard::kill` で helper を SIGKILL する。helper の制御チャネルが閉じると supervisor の `exec_guard` が通知済みの exec 子 cgroup を `cgroup.kill` で回収する。届くのは exec 子 cgroup だけで init には届かない。SIGKILL 以外は `UNIMPLEMENTED`（"exec signal is not supported"）で拒否し、黙って SIGKILL へ読み替えない（REPAIR-3）。終了済みは `NOT_FOUND` |
+| `signal(sig)` | SIGKILL は `HelperGuard::kill` で helper を SIGKILL する。helper の制御チャネルが閉じると supervisor の `exec_guard` が通知済みの exec 子 cgroup を `cgroup.kill` で回収する。届くのは exec 子 cgroup だけで init には届かない。許可リスト（SIGHUP・SIGINT・SIGQUIT・SIGUSR1・SIGUSR2・SIGTERM）の SIGKILL 以外は `Signal` frame で helper へ送り `SignalAck` を待つ（#4282。下の「exec のシグナル」）。許可外の番号は `UNIMPLEMENTED`（"exec signal is not supported"）で拒否し、黙って SIGKILL へ読み替えない（REPAIR-3）。終了済みは `NOT_FOUND` |
 | `wait_exit` | 監視スレッドの結果を `Mutex` + `Condvar` で受けるイベント駆動。取り消しは 10 ms 以下の刻みで確認し、期限で `Timeout`、取り消しで `Unavailable`（REPAIR-5） |
 | drop | 契約どおり停止は要求しない。helper の持ち主は launcher の追跡一覧に残り、shim の停止時に全 helper を kill する（配線済み。登録簿の drop で `shutdown_all`。#4149） |
 
@@ -302,7 +302,35 @@ SIGKILL 後の消滅確認（helper の `Result` に依存しない。SEC-1・SU
 
 - `exec_id` とプロセスの対応は cri の `ExecRegistry` だけが持つ。launcher は上限と停止のための helper の追跡だけを持ち、exec_id の表は持たない（二重管理をしない）。永続化せず、shim の再起動で exec の記録は失われる
 - 残余: shim が SIGKILL された場合、helper は exec の期限（最長 1 時間）まで残る。PDEATHSIG を使わない設計で #3761 と同じ
-- 任意のシグナルへの対応は stream-exec の wire に Signal frame を足し、helper の待ちで fd 0 を見張る拡張が要る（後続候補）
+- 任意のシグナルのうち許可リスト内は #4282 で対応した（下の「exec のシグナル」）。許可外（STOP 系・CONT・WINCH・実時間シグナル）は対象外のまま
+
+### exec のシグナル（#4282・SUP-6・CRI-5・SEC-1・REPAIR-2・REPAIR-3・REPAIR-5）
+
+shim の `Kill(exec_id)` が受けるシグナルを SIGKILL だけから、許可リストの SIGKILL 以外へ広げた。wire は version 3（`stream_exec/wire.rs` の doc が語彙の正。旧い v1・v2 の相手とは混在させず `BadVersion` で拒否する）。
+
+- frame: kind 5 `Signal`（plugin-cri → helper。payload 1 バイトのシグナル番号。全長 9）、kind 6 `SignalAck`（helper → plugin-cri。`[signal, code]`。全長 10）。いずれも fd なし
+- 許可リスト `ExecSignal`: SIGHUP 1・SIGINT 2・SIGQUIT 3・SIGUSR1 10・SIGUSR2 12・SIGTERM 15（x86_64 と aarch64 で同じ番号。型でしか作れず、許可外は作れない）。対象外の理由: SIGKILL は既存の cgroup ごとの停止のほうが強い、STOP・TSTP・TTIN・TTOU・CONT は exec を期限まで止める・再開させる、WINCH は tty 未対応、実時間シグナルは glibc の予約を含む、0 は存在確認でありシグナルではない
+- 拒否の語彙: 0 と 65 以上は `SignalOutOfRange`、1〜64 の許可外は `SignalNotAllowed`、ack の未知の code は `UnknownSignalAck`。plugin-cri の `signal()` は許可外の番号を従来の文言の `UNIMPLEMENTED` で返し、frame は 1 バイトも送らない
+- ack の code: delivered（1）・not_started（2。コマンドの pidfd がまだ届かず猶予を過ぎた）・exited（3）・unavailable（4）。CRI への写像は delivered → OK、not_started → `FAILED_PRECONDITION`、exited → `NOT_FOUND`、unavailable → `UNAVAILABLE`、ack の期限切れ → `DEADLINE_EXCEEDED`（5 秒）、ack より先に `Result` / 切断 → `NOT_FOUND` / `UNAVAILABLE`。未確認の exec へは送らず `UNAVAILABLE`
+
+#### 宛先と権限（pidfd を worker から helper へ渡す）
+
+- 送る主体は helper（親）。worker はコマンドを fork した直後に、`ContainerChild` が fork 直後に開いたコマンドの pidfd を、fork 前に作った socketpair 経由で `SCM_RIGHTS` で 1 本だけ親へ渡す（最善努力。送れなければ not_started のまま猶予を過ぎて unavailable になる）。helper は `pidfd_send_signal` で送る（core の `send_signal_via_pidfd`。新しい `unsafe` は無い）
+- 権限の根拠: helper は seccomp・Landlock・cap drop を受けていない。rootless では helper の euid がコンテナの user namespace の所有者で親の namespace にいるため CAP_KILL を持ち、範囲写像で uid が違うコマンドにも送れる。rootful は root。pidfd で送るので pid の再利用で別のプロセスに届かず（SEC-1・CORE-1）、送り先はコマンド本体の 1 プロセスだけで子孫には送らない
+- 却下: (A) worker が転送する案は、worker がコンテナの seccomp・Landlock・cap drop を受けた後にコマンドを起動するため、範囲写像で uid の違うコマンドへ CAP_KILL が無く、seccomp profile にも依存して脆い。(B) helper が exec 子 cgroup の `cgroup.procs` を列挙して送る案は、「子孫すべてへ送る」意味に変わり pid の TOCTOU が残り、core に読み取り API も要る。`cgroup.kill` は SIGKILL しか送れないので手段にならない
+
+#### helper の受信規則
+
+- exec の待ちの刻み（応答者の `SERVE_STEP` と終了待ちの `CANCEL_POLL_STEP`）ごとに、要求元の取り消しが偽のときだけ、fd 0 に `POLLIN` があれば `Signal` を 1 件、短い期限（200 ms）で受ける。受けてよいのは `Signal` だけで、fd が付いていれば閉じて拒否する。保留は 1 件までで、pidfd が未着なら刻みごとに再試行し、2 秒を過ぎたら not_started を返す。exec が終わった時点で保留が残っていれば `Result` の前に ack を送る（コマンドが終わっていれば exited、そうでなければ not_started）
+- 受信に失敗した後（壊れた frame・許可外・旧い版・fd 付き・向きの違う frame）は以後シグナルを受けず ack も返さない（frame の境界を信頼できない。channel の「受信失敗後は再利用しない」契約）。fd 2 に固定語彙の診断行を 1 行出し、exec は止めず従来の期限で終わる。ack の送信は 500 ms の期限で、刻みの中で長く止めない
+- plugin-cri は要求を 1 件ずつ排他し、`watch_result` を helper → plugin-cri の唯一の読み手のままにして `SignalAck` を待っている要求へ渡す。待っていない ack・番号違いの ack はプロトコル違反として helper を止め、未確認にする
+
+#### 残余
+
+- ゾンビへの送信もカーネルは成功にするため、delivered は「コマンドが生きていた」の証明ではない
+- worker の `sendmsg` がコンテナの seccomp profile で拒否されると pidfd が届かず、not_started / unavailable になる（fail-closed。応答者の監査に 1 件残りうる）
+- SIGKILL 以外の配送は待ちの刻み（最大約 100 ms）の分だけ遅れる
+- 試験: 実機前提の `stream_exec_real` のシナリオ `signal_term`（SIGTERM がコマンドへ届き `Signaled(15)`）、既定の集合の `stream_exec_helper`・`wire`・`channel`・plugin-cri の `task_exec/linux/tests.rs`
 
 ### spec の欄（env・cwd・user）の扱い
 
@@ -332,7 +360,7 @@ TaskService は期限を足さず、実装側が持つ（トレイトの契約�
 
 | 状況 | CriError |
 | ---- | -------- |
-| 非 Linux・spec の非対応の欄・SIGKILL 以外のシグナル | `UNIMPLEMENTED` |
+| 非 Linux・spec の非対応の欄・許可リスト外のシグナル | `UNIMPLEMENTED` |
 | argv が相対パス・helper の引数検証の失敗 | `INVALID_ARGUMENT` |
 | 状態記録が無い | `NOT_FOUND`（"container not found"） |
 | 状態ストアの読み取り失敗 | `UNAVAILABLE` |
@@ -364,10 +392,10 @@ TaskService は期限を足さず、実装側が持つ（トレイトの契約�
 - **#4148 の追補（`TaskService` の変更。作業範囲に明記）**: `crates/cri/src/shim_v2/task_service.rs` の `kill_exec` は現状 `process.status().map_err(...)?` で早期 return し、`status()` が `Err` のとき `signal(SIGKILL)` に到達しない。`status()` の `Err` では拒否せず `signal(SIGKILL)` まで進める変更（`Exited` のときだけ `NOT_FOUND`）を、#4148 と同じ PR で `crates/cri/` に入れる（cri のコード変更であり、依存は変えない）。本設計の暫定動作の記述は、この変更が入るまでは現状の `kill_exec` と食い違う（REPAIR-3）
 - **#4148 の実装記録（本体は実装済み。配線は #4149）**: 起動役は `crates/plugin-cri/src/task_exec.rs`（Linux 実装は `task_exec/linux.rs`、非 Linux は `UNIMPLEMENTED` のスタブ）。共通モジュール `exec_helper.rs` への切り出しは行わず、`streaming/exec_launcher.rs` の `HelperGuard`・`Shared`・各期限定数・`HelperSpawner` を `pub(crate)` にして再利用した（移動のみのリファクタで既存の async 側の試験を動かすリスクを避けるため。重複するのは `launch` の順序だけ）。`TaskService::kill_exec` は `status()` が `Err` でも SIGKILL のときだけ `signal` へ進む。
   - 消滅確認（#4221 で解消。CRI-5・SEC-1・REPAIR-3・REPAIR-5）: #4148 の時点では exec 子 cgroup の名前が plugin-cri に届かず、本番の probe が常に `Unknown` だった。#4221 で stream-exec の wire を version 2 にし、`Started` の payload を固定 65 バイト（`name_len: u8` + 名前 64 バイト。NUL 埋め）にして helper が作った exec 子 cgroup の名前を運ぶ（新しい frame kind にしないのは、`Started` の直後の kill より前に名前が届く必要があり、SIGKILL された helper はもう送れないため）。plugin-cri の本番の probe `CgroupExtinctionProbe` は core の `exec_child_cgroup_presence`（読み取り専用）でコンテナ cgroup 直下にその名前のディレクトリが **無い** ことを確かめ、不在（またはコンテナ cgroup 自体が無い）なら `Confirmed`、残っている・照合に失敗・cgroup ルートを開けない・記録に配置が無いなら `Unknown`。cgroup v2 のディレクトリはプロセスが残る間 `rmdir` できないので、不在はそこにいたプロセス全体の消滅の証拠になる。確認の材料（記録の cgroup 配置と名前）は launch の時点で固定する（restart で別の世代の経路を見て誤って不在と判定しないため）。Wait は未確認の間 `extinction_grace`（既定 10 秒。`REAP_BUDGET` と同じ）だけ刻みごとに照会し、`Confirmed` で `Ok(None)`、猶予切れで従来どおり `UNAVAILABLE`、Wait 全体の期限が先なら `DEADLINE_EXCEEDED`、取り消しは `UNAVAILABLE`。版が合わない旧い supervisor とは `StdioHandover` の version 不一致で `Started` に至らず launch が失敗し、確認済みとして扱わない（v1 を受けて `Unknown` に落とす案は、v1 の `Started` に名前が無く恒久的に未確認になるだけなので採らない）。不採用: pid からの推測（pid 再利用で誤停止）、helper の終了を証拠にする、plugin-cri 自身が `remove_exec_child_cgroup` で回収する（名前の再利用で別の exec を kill しうる）、回収結果を運ぶ新しい frame（kill 経路で役に立たない）。残余: 名前は helper の pid と連番で、回収後に別の helper が同じ名前を作ると「まだある」と見えて `Unknown` のまま残る（安全側。purge で回収）。コンテナ内から cgroupfs に書けない前提は既存の guard の回収と同じ。実 cgroup での kill → 回収 → Wait → Delete の通しは単体試験の範囲外で、実機前提試験（#4150）に後続で足す
-  - `pid()` は `None`（State の pid は 0）。SIGKILL 以外・env・cwd・user は `UNIMPLEMENTED`
+  - `pid()` は `None`（State の pid は 0）。許可リスト外のシグナル・env・cwd・user は `UNIMPLEMENTED`（許可内のシグナルは #4282 で対応）
 - **#4149 の実装記録**: `registry_parts_in`（`registry_in` の本体）で、scoped root と同じパス・同じ `StateStore` から `ShimExecLauncher::production` を 1 つ作り、停止用の包み `StopHelpersOnDrop` を通して v2・v3 の両方へ `with_exec_launcher` で差す（同時数の枠と追跡一覧は shim で 1 つ）。停止時の kill は cri の bootstrap に注入口を足さず、`run_serve` の終わりに登録簿が drop されて包みの最後の参照が落ちたとき `shutdown_all` が走る形にした（Shutdown RPC でも socket 消失でも同じ）。採らない案: bootstrap への停止注入口（cri の公開 API が変わる）、`ShutdownSignal` の見張りスレッド（socket 消失の経路を拾えず常駐スレッドが増える）、プロセス全体の `OnceLock`（同一プロセスの複数登録簿で衝突）、`ShimExecLauncher` 本体への `Drop`（#4148 の契約「drop は止めない」を変える）。非 Linux は `EmptyTaskService` のまま。試験: `cri5_4149_registry_exec_reaches_launcher`・`repair5_4149_registry_drop_stops_exec_helpers`・`cri5_4149_non_linux_registry_stays_empty`・bin 経由の `cri5_4149_bin_exec_*`。残余（REPAIR-3）: サーバー停止の期限切れで接続スレッドが残る場合と shim の SIGKILL では `shutdown_all` が走らず、helper は exec の期限（最長 1 時間）まで残る（PDEATHSIG を使わない既存の残余と同じ）。コンテナの削除・停止で cgroup が回収されれば helper は終わる。
 - **#4150 実機前提試験**（実装済み。`crates/plugin-cri/tests/shim_v2_exec_real.rs`）: shim の ttrpc を直接叩き、最小の Process spec（env 空・cwd `/`・user なし・stdio なし）で exec し、CapEff・Seccomp・ns の inode・exec 子 cgroup の配置を具体値で init と照合する。実装の判断: (1) `harness = false`（exec は stdio が `/dev/null` で pid も返さないため、試験バイナリ自身が rootfs の `/probe` として init と exec のコマンドを兼ねる再入が要る）、(2) cgroup は「init の直下の `exec-*` 子 cgroup 1 要素」で照合する（init と同じ cgroup にはならない）、(3) 解放は rootfs 直下の合図ファイルによる自然終了（SIGKILL は消滅を確認できず Delete が拒否される）、(4) CI の `platform-ci`（ubuntu）に組み込み済み。残余: 実コンテナのホスト `/proc/<pid>/ns/*` の読み取りは ptrace の READ 権に依存し、CI での初回実行で確認する
-- **後続候補（未起票）**: exec の TaskExit（exec 用の終了 watcher）、stream-exec の Signal frame、`Started` への pid の追加、stdio の FIFO の受け入れ、spec の欄を `config.json` と照合して受ける拡張と supervisor の exec ごとの env・cwd・user（#2712・#680 系列）、cri → supervisor の辺の機械照合（`dependency_direction.rs` の拡張）
+- **後続候補（未起票）**: exec の TaskExit（exec 用の終了 watcher）、`Started` への pid の追加、stdio の FIFO の受け入れ、spec の欄を `config.json` と照合して受ける拡張と supervisor の exec ごとの env・cwd・user（#2712・#680 系列）、cri → supervisor の辺の機械照合（`dependency_direction.rs` の拡張）
 
 ## 残り（REPAIR-3）
 

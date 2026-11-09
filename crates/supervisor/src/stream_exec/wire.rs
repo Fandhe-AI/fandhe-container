@@ -10,7 +10,7 @@
 //! | オフセット | 長さ | 内容 |
 //! | --- | --- | --- |
 //! | 0 | 4 | magic `FCSX`（制御チャネルの `FCSC` と別。取り違えを検出する） |
-//! | 4 | 1 | version `u8` = 2（#4221 で `Started` に exec 子 cgroup の名前を載せるため 1 から上げた。旧い相手とは混在させない） |
+//! | 4 | 1 | version `u8` = 3（#4221 で `Started` に exec 子 cgroup の名前を載せるため 1 から 2 へ、#4282 で `Signal`・`SignalAck` を足すため 3 へ上げた。旧い相手とは混在させない） |
 //! | 5 | 1 | kind `u8` |
 //! | 6 | 2 | payload_len `u16`（big-endian） |
 //!
@@ -25,8 +25,20 @@
 //! | 2 | `Started` | helper → plugin-cri | 65 バイト（exec 子 cgroup の名前） | 73 | 0 |
 //! | 3 | `PtyMaster` | helper → plugin-cri | なし | 8 | 1（文字デバイス） |
 //! | 4 | `Result` | helper → plugin-cri | 5 バイト | 13 | 0 |
+//! | 5 | `Signal` | plugin-cri → helper | signal `u8` | 9 | 0 |
+//! | 6 | `SignalAck` | helper → plugin-cri | `[signal, code]` 2 バイト | 10 | 0 |
 //!
 //! mask: bit0 = stdin、bit1 = stdout、bit2 = stderr。bit3〜7 は 0 でなければ拒否。fd の並びはビット昇順。
+//!
+//! # `Signal` と `SignalAck`（#4282・SUP-6・CRI-5・SEC-1）
+//!
+//! `Signal` は exec のコマンド（本体の 1 プロセス。子孫へは送らない）へ SIGKILL 以外のシグナルを届ける要求。番号は許可リスト
+//! [`ExecSignal`]（SIGHUP 1・SIGINT 2・SIGQUIT 3・SIGUSR1 10・SIGUSR2 12・SIGTERM 15。x86_64 と aarch64 で同じ）だけで、
+//! 0 と 65 以上は `SignalOutOfRange`、1〜64 の許可外（SIGKILL は既存の cgroup ごとの停止のほうが強い・STOP 系と CONT は exec を止める・
+//! WINCH は tty 未対応・実時間シグナルは glibc の予約を含む）は `SignalNotAllowed` で frame ごと拒否する。
+//! `SignalAck` は helper がその結果を 1 つ返す（要求 1 件につき高々 1 件）。code: 1 = delivered、2 = not_started（コマンドの
+//! pidfd がまだ届いていない。猶予を過ぎた）、3 = exited（既に終わっていた）、4 = unavailable（送れなかった）。未知の code は
+//! `UnknownSignalAck` で frame ごと拒否する。
 //!
 //! # `Started` の payload（65 バイト。#4221）
 //!
@@ -48,13 +60,15 @@
 //! step: 0 = なし、1〜16 = `ExecChildStep`。1〜15 は宣言順（`ControllingTty` を除く）、後から足した `ControllingTty`（#3758）は既存番号を動かさないため末尾の 16。code: 1〜10 = `ErrorCode` を宣言順に 1 から。
 //! 番号は `ALL` の添字からではなく明示の `match` で固定し、core の並び替えで動かさない。未知の番号は frame 全体を拒否する。
 
+use std::num::NonZeroU8;
+
 use fandhe_container_core::exec::{ExecCgroupName, ExecChildStep};
 use fandhe_container_core::traits::ErrorCode;
 
 /// 先頭の識別子（制御チャネルの `FCSC` と別）。
 pub const MAGIC: [u8; 4] = *b"FCSX";
 /// 語彙の版。
-pub const VERSION: u8 = 2;
+pub const VERSION: u8 = 3;
 /// ヘッダの長さ。
 pub const HEADER_LEN: usize = 8;
 /// payload の上限（`Started` の 65 バイト）。これを超えるヘッダは payload を読まずに拒否する。
@@ -93,6 +107,12 @@ pub enum WireError {
     UnknownCode,
     /// `Started` の名前欄が不正（長さ 0・上限超・埋めが 0 でない・名前の検証に失敗）。
     InvalidCgroupName,
+    /// `Signal` の番号が範囲外（0 と 65 以上。#4282）。
+    SignalOutOfRange,
+    /// `Signal` の番号が 1〜64 だが許可リストに無い（#4282）。
+    SignalNotAllowed,
+    /// `SignalAck` の code が未知（#4282）。
+    UnknownSignalAck,
 }
 
 /// 符号化の失敗（core に値が増えて番号表に無いとき。既知の値へ黙って置き換えない）。
@@ -117,6 +137,10 @@ pub enum Kind {
     PtyMaster,
     /// helper → plugin-cri。終了の結果。
     Result,
+    /// plugin-cri → helper。exec のコマンドへ SIGKILL 以外のシグナルを送る要求（#4282）。
+    Signal,
+    /// helper → plugin-cri。`Signal` の結果（#4282）。
+    SignalAck,
 }
 
 impl Kind {
@@ -126,6 +150,8 @@ impl Kind {
             2 => Some(Self::Started),
             3 => Some(Self::PtyMaster),
             4 => Some(Self::Result),
+            5 => Some(Self::Signal),
+            6 => Some(Self::SignalAck),
             _ => None,
         }
     }
@@ -136,27 +162,34 @@ impl Kind {
             Self::Started => 2,
             Self::PtyMaster => 3,
             Self::Result => 4,
+            Self::Signal => 5,
+            Self::SignalAck => 6,
         }
     }
 
     /// この kind の payload 長（固定）。
     pub fn payload_len(self) -> u16 {
         match self {
-            Self::StdioHandover => 1,
+            Self::StdioHandover | Self::Signal => 1,
             Self::PtyMaster => 0,
             Self::Started => STARTED_PAYLOAD_LEN as u16,
             Self::Result => 5,
+            Self::SignalAck => 2,
         }
     }
 
     /// helper が受けてよい kind（plugin-cri → helper の向き）。
     pub fn is_to_helper(self) -> bool {
-        matches!(self, Self::StdioHandover)
+        matches!(self, Self::StdioHandover | Self::Signal)
     }
 
-    /// plugin-cri が受けてよい kind（helper → plugin-cri の向き）。
+    /// plugin-cri が受けてよい kind（helper → plugin-cri の向き）。向きは明示の集合で持ち、kind を足したとき
+    /// 「`is_to_helper` でなければ helper 発」と黙って決まらないようにする（#4282）。
     pub fn is_from_helper(self) -> bool {
-        !self.is_to_helper()
+        matches!(
+            self,
+            Self::Started | Self::PtyMaster | Self::Result | Self::SignalAck
+        )
     }
 }
 
@@ -314,6 +347,91 @@ impl ExitSignal {
     }
 }
 
+/// `ExecSignal::new` の拒否の理由（#4282。固定語彙）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalRejection {
+    /// 0 または 65 以上。
+    OutOfRange,
+    /// 1〜64 だが許可リストに無い。
+    NotAllowed,
+}
+
+/// `Signal` frame で送れるシグナル番号（許可リストの newtype。許可外の値は作れない。#4282・SUP-6・SEC-1）。
+///
+/// 許可: SIGHUP 1・SIGINT 2・SIGQUIT 3・SIGUSR1 10・SIGUSR2 12・SIGTERM 15（x86_64 と aarch64 の asm-generic で同じ番号）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecSignal(NonZeroU8);
+
+impl ExecSignal {
+    /// 許可する番号（昇順）。
+    pub const ALLOWED: [u8; 6] = [1, 2, 3, 10, 12, 15];
+
+    /// 検証して作る。0 と 65 以上は `OutOfRange`、1〜64 の許可外は `NotAllowed`。
+    pub fn new(n: u8) -> Result<Self, SignalRejection> {
+        let nz = NonZeroU8::new(n).ok_or(SignalRejection::OutOfRange)?;
+        if n > 64 {
+            return Err(SignalRejection::OutOfRange);
+        }
+        if !Self::ALLOWED.contains(&n) {
+            return Err(SignalRejection::NotAllowed);
+        }
+        Ok(Self(nz))
+    }
+
+    /// シグナル番号。
+    pub fn get(self) -> u8 {
+        self.0.get()
+    }
+
+    /// 番号（`NonZeroU8`。core の送信口へ渡す）。
+    pub fn number(self) -> NonZeroU8 {
+        self.0
+    }
+}
+
+impl From<SignalRejection> for WireError {
+    fn from(r: SignalRejection) -> Self {
+        match r {
+            SignalRejection::OutOfRange => Self::SignalOutOfRange,
+            SignalRejection::NotAllowed => Self::SignalNotAllowed,
+        }
+    }
+}
+
+/// `SignalAck` の code（#4282）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalAckCode {
+    /// シグナルをコマンドへ送れた（1）。
+    Delivered,
+    /// コマンドの pidfd がまだ届いておらず、猶予を過ぎた（2）。
+    NotStarted,
+    /// コマンドは既に終わっていた（3）。
+    Exited,
+    /// 送れなかった（pidfd を使えない・送信の失敗。4）。
+    Unavailable,
+}
+
+impl SignalAckCode {
+    fn as_u8(self) -> u8 {
+        match self {
+            Self::Delivered => 1,
+            Self::NotStarted => 2,
+            Self::Exited => 3,
+            Self::Unavailable => 4,
+        }
+    }
+
+    fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            1 => Some(Self::Delivered),
+            2 => Some(Self::NotStarted),
+            3 => Some(Self::Exited),
+            4 => Some(Self::Unavailable),
+            _ => None,
+        }
+    }
+}
+
 /// 子プロセスの終了状態。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChildStatus {
@@ -354,6 +472,15 @@ pub enum Frame {
     PtyMaster,
     /// 終了の結果。
     Result(StreamExecOutcome),
+    /// コマンドへのシグナルの要求（plugin-cri → helper。#4282）。
+    Signal(ExecSignal),
+    /// `Signal` の結果（helper → plugin-cri。要求の番号を折り返す。#4282）。
+    SignalAck {
+        /// 要求されたシグナル。
+        signal: ExecSignal,
+        /// 結果。
+        code: SignalAckCode,
+    },
 }
 
 /// 符号化済みの frame（固定長の入れ物）。
@@ -404,6 +531,8 @@ impl Frame {
             Self::Started(_) => Kind::Started,
             Self::PtyMaster => Kind::PtyMaster,
             Self::Result(_) => Kind::Result,
+            Self::Signal(_) => Kind::Signal,
+            Self::SignalAck { .. } => Kind::SignalAck,
         }
     }
 
@@ -414,6 +543,10 @@ impl Frame {
             Self::Started(name) => build(Kind::Started, &name.encode_payload()),
             Self::PtyMaster => build(Kind::PtyMaster, &[]),
             Self::Result(outcome) => build(Kind::Result, &encode_outcome(outcome)?),
+            Self::Signal(signal) => build(Kind::Signal, &[signal.get()]),
+            Self::SignalAck { signal, code } => {
+                build(Kind::SignalAck, &[signal.get(), code.as_u8()])
+            }
         })
     }
 
@@ -440,6 +573,19 @@ impl Frame {
                 let arr = <&[u8; RESULT_PAYLOAD_LEN]>::try_from(payload)
                     .map_err(|_| WireError::LengthMismatch)?;
                 decode_outcome(arr).map(Self::Result)
+            }
+            Kind::Signal => {
+                let [n] = *<&[u8; 1]>::try_from(payload).map_err(|_| WireError::LengthMismatch)?;
+                ExecSignal::new(n)
+                    .map(Self::Signal)
+                    .map_err(WireError::from)
+            }
+            Kind::SignalAck => {
+                let [n, c] =
+                    *<&[u8; 2]>::try_from(payload).map_err(|_| WireError::LengthMismatch)?;
+                let signal = ExecSignal::new(n).map_err(WireError::from)?;
+                let code = SignalAckCode::from_u8(c).ok_or(WireError::UnknownSignalAck)?;
+                Ok(Self::SignalAck { signal, code })
             }
         }
     }
@@ -600,7 +746,7 @@ mod tests {
 
     fn hdr(kind: u8, len: u16) -> [u8; 8] {
         let l = len.to_be_bytes();
-        [b'F', b'C', b'S', b'X', 2, kind, l[0], l[1]]
+        [b'F', b'C', b'S', b'X', 3, kind, l[0], l[1]]
     }
 
     fn roundtrip(frame: Frame) -> Vec<u8> {
@@ -624,7 +770,7 @@ mod tests {
         }
         assert_eq!(
             roundtrip(Frame::StdioHandover(StdioMask::new(0b101).unwrap())),
-            vec![0x46, 0x43, 0x53, 0x58, 2, 1, 0, 1, 0x05]
+            vec![0x46, 0x43, 0x53, 0x58, 3, 1, 0, 1, 0x05]
         );
     }
 
@@ -637,7 +783,7 @@ mod tests {
     fn sup6_simple_frames_concrete_bytes() {
         assert_eq!(
             roundtrip(Frame::PtyMaster),
-            vec![0x46, 0x43, 0x53, 0x58, 2, 3, 0, 0]
+            vec![0x46, 0x43, 0x53, 0x58, 3, 3, 0, 0]
         );
     }
 
@@ -648,7 +794,7 @@ mod tests {
         assert_eq!(bytes.len(), 73);
         assert_eq!(
             bytes.get(..8),
-            Some(&[0x46, 0x43, 0x53, 0x58, 2, 2, 0, 65][..])
+            Some(&[0x46, 0x43, 0x53, 0x58, 3, 2, 0, 65][..])
         );
         assert_eq!(bytes.get(8), Some(&11u8));
         assert_eq!(bytes.get(9..20), Some(&b"exec-4242-0"[..]));
@@ -685,6 +831,128 @@ mod tests {
         let mut v1_old_started = hdr(2, 0);
         v1_old_started[4] = 1;
         assert_eq!(parse_header(&v1_old_started), Err(WireError::BadVersion));
+    }
+
+    /// SUP-6・SEC-1・REPAIR-2・#4282: 旧い version 2 のヘッダは `BadVersion`（旧い相手に `Signal` を送らず、旧い相手の `Started` も確認済みにしない）。
+    #[test]
+    fn sup6_4282_v2_header_is_rejected() {
+        for (kind, len) in [(1u8, 1u16), (2, 65), (3, 0), (4, 5), (5, 1), (6, 2)] {
+            let mut v2 = hdr(kind, len);
+            v2[4] = 2;
+            assert_eq!(parse_header(&v2), Err(WireError::BadVersion), "kind {kind}");
+        }
+        assert_eq!(VERSION, 3);
+    }
+
+    /// SUP-6・REPAIR-2・#4282: `Signal` / `SignalAck` の具体バイトの往復。
+    #[test]
+    fn sup6_4282_signal_frames_concrete_bytes() {
+        let term = ExecSignal::new(15).unwrap();
+        assert_eq!(
+            roundtrip(Frame::Signal(term)),
+            vec![0x46, 0x43, 0x53, 0x58, 3, 5, 0, 1, 0x0F]
+        );
+        for code in [
+            SignalAckCode::Delivered,
+            SignalAckCode::NotStarted,
+            SignalAckCode::Exited,
+            SignalAckCode::Unavailable,
+        ] {
+            roundtrip(Frame::SignalAck { signal: term, code });
+        }
+        assert_eq!(
+            roundtrip(Frame::SignalAck {
+                signal: term,
+                code: SignalAckCode::Delivered
+            }),
+            vec![0x46, 0x43, 0x53, 0x58, 3, 6, 0, 2, 0x0F, 1]
+        );
+        assert_eq!(
+            roundtrip(Frame::SignalAck {
+                signal: ExecSignal::new(1).unwrap(),
+                code: SignalAckCode::Unavailable
+            })
+            .get(8..),
+            Some(&[1u8, 4][..])
+        );
+    }
+
+    /// SUP-6・SEC-1・#4282: 許可リストはちょうど {1, 2, 3, 10, 12, 15}。範囲外と許可外は別の固定語彙で拒否する。
+    #[test]
+    fn sup6_4282_signal_allow_list_is_exact() {
+        let allowed: Vec<u8> = (0..=255u8)
+            .filter(|n| ExecSignal::new(*n).is_ok())
+            .collect();
+        assert_eq!(allowed, vec![1, 2, 3, 10, 12, 15]);
+        assert_eq!(ExecSignal::ALLOWED.to_vec(), allowed);
+        for n in [9u8, 19, 18, 34, 20, 21, 22, 28, 17, 64, 32, 33] {
+            assert_eq!(ExecSignal::new(n), Err(SignalRejection::NotAllowed), "{n}");
+            assert_eq!(
+                Frame::decode(Kind::Signal, &[n]),
+                Err(WireError::SignalNotAllowed),
+                "{n}"
+            );
+        }
+        for n in [0u8, 65, 255] {
+            assert_eq!(ExecSignal::new(n), Err(SignalRejection::OutOfRange), "{n}");
+            assert_eq!(
+                Frame::decode(Kind::Signal, &[n]),
+                Err(WireError::SignalOutOfRange),
+                "{n}"
+            );
+        }
+    }
+
+    /// SUP-6・REPAIR-2・#4282: `SignalAck` の不正（未知の code・許可外の番号）と長さの不一致・向きの集合。
+    #[test]
+    fn sup6_4282_signal_ack_rejections_and_directions() {
+        for code in [0u8, 5, 255] {
+            assert_eq!(
+                Frame::decode(Kind::SignalAck, &[15, code]),
+                Err(WireError::UnknownSignalAck)
+            );
+        }
+        assert_eq!(
+            Frame::decode(Kind::SignalAck, &[9, 1]),
+            Err(WireError::SignalNotAllowed)
+        );
+        assert_eq!(
+            Frame::decode(Kind::SignalAck, &[15]),
+            Err(WireError::LengthMismatch)
+        );
+        assert_eq!(
+            Frame::decode(Kind::Signal, &[15, 1]),
+            Err(WireError::LengthMismatch)
+        );
+        assert_eq!(parse_header(&hdr(5, 2)), Err(WireError::LengthMismatch));
+        assert_eq!(parse_header(&hdr(6, 1)), Err(WireError::LengthMismatch));
+        for (kind, to_helper, from_helper) in [
+            (Kind::StdioHandover, true, false),
+            (Kind::Signal, true, false),
+            (Kind::Started, false, true),
+            (Kind::PtyMaster, false, true),
+            (Kind::Result, false, true),
+            (Kind::SignalAck, false, true),
+        ] {
+            assert_eq!(kind.is_to_helper(), to_helper, "{kind:?}");
+            assert_eq!(kind.is_from_helper(), from_helper, "{kind:?}");
+        }
+    }
+
+    /// REPAIR-12・#4282: 許可リストの番号は `libc` の定義と一致する（Linux。x86_64 と aarch64 で同じ値）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sup6_4282_allow_list_matches_libc() {
+        let expected = [
+            libc::SIGHUP,
+            libc::SIGINT,
+            libc::SIGQUIT,
+            libc::SIGUSR1,
+            libc::SIGUSR2,
+            libc::SIGTERM,
+        ];
+        let got: Vec<i32> = ExecSignal::ALLOWED.iter().map(|n| i32::from(*n)).collect();
+        assert_eq!(got, expected.to_vec());
     }
 
     /// REPAIR-2・SEC-1・#4221: `Started` の名前欄の不正は frame 全体を拒否する。
@@ -763,10 +1031,10 @@ mod tests {
         let mut bad = hdr(2, 65);
         bad[0] = b'X';
         assert_eq!(parse_header(&bad), Err(WireError::BadMagic));
-        let mut v3 = hdr(2, 65);
-        v3[4] = 3;
-        assert_eq!(parse_header(&v3), Err(WireError::BadVersion));
-        for k in [0u8, 5, 255] {
+        let mut v4 = hdr(2, 65);
+        v4[4] = 4;
+        assert_eq!(parse_header(&v4), Err(WireError::BadVersion));
+        for k in [0u8, 7, 255] {
             assert_eq!(parse_header(&hdr(k, 0)), Err(WireError::UnknownKind));
         }
         assert_eq!(

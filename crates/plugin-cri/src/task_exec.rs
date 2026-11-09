@@ -15,7 +15,7 @@
 //! # 契約
 //! - env・cwd（`/` 以外）・user は黙って捨てず `UNIMPLEMENTED`（helper が受けないため）。`argv[0]` が絶対パスでなければ `INVALID_ARGUMENT`。
 //! - 存在しないコンテナは `NOT_FOUND`、Running でない・pid が無いコンテナは `FAILED_PRECONDITION`、状態ストアの失敗は `UNAVAILABLE`。
-//! - シグナルは SIGKILL だけ（helper の kill）。init へは送らない。SIGKILL 以外は `UNIMPLEMENTED`。
+//! - シグナルは SIGKILL（helper の kill）と、許可リスト（SIGHUP・SIGINT・SIGQUIT・SIGUSR1・SIGUSR2・SIGTERM。#4282）の `Signal` frame。init へは送らない。許可外は `UNIMPLEMENTED`。
 //! - ハンドルの drop は helper を止めない（追跡一覧が強参照を持つ）。止めるのは `ShimExecLauncher::shutdown_all`・SIGKILL・期限切れ。
 //! - 待ちはすべて有界（handover・`Started`・セッション + 余裕）。panic しない。エラー文は固定の英文で argv・ID・パスを含めない。
 //!
@@ -29,7 +29,7 @@
 //!   連番で、helper の回収後に別の helper が同じ名前を作りうる（probe は読むだけで kill しないため、起きるのは「まだある」と見える
 //!   安全側の誤りだけ）。コンテナ内から cgroupfs に書けない前提（`exec::cgroup_join` の doc と同じ）に依存する。
 //! - `pid()` は `None`（helper がコマンドの pid を返さない）。State の pid は 0 になる。
-//! - SIGKILL 以外のシグナル（helper の Signal frame）・env・cwd・user の受け入れは後続。
+//! - 許可リスト外のシグナル・env・cwd・user の受け入れは後続（許可リストの SIGKILL 以外は helper の `Signal` frame で対応済み。#4282）。
 
 #[cfg(target_os = "linux")]
 mod linux;

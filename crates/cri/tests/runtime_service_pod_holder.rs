@@ -385,6 +385,35 @@ async fn repair5_dropped_run_during_holder_spawn_does_not_leave_network_pending(
     run(&svc).await.unwrap();
 }
 
+/// network なしの Run が保持役の起動待ち中に取り消され、worker が後から成功しても Ready を公開せず
+/// CreateContainer が通らないこと（CRI-2 の fail-closed・REPAIR-5・#2871）。
+#[tokio::test]
+async fn cri2_dropped_run_then_late_holder_success_stays_notready() {
+    let log = new_log();
+    let holder = FakeHolder::new(&log, Spawn::Hang);
+    let svc = service(&holder);
+    let dropped = tokio::time::timeout(Duration::from_millis(50), run(&svc)).await;
+    assert!(dropped.is_err(), "run must still be awaiting the holder");
+    let items = list(&svc).await;
+    assert_eq!(items.len(), 1);
+    let id = items[0].0.clone();
+    holder.unblock.store(true, Ordering::SeqCst);
+    // worker が成功を確定するまで待つ（Remove が受理される = 保持役の確定後）が、その前に状態を観測する。
+    let start = Instant::now();
+    loop {
+        assert_eq!(state_of(&svc, &id).await, NOTREADY);
+        assert!(create_container(&svc, &id).await.is_err());
+        if start.elapsed() > Duration::from_millis(500) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(state_of(&svc, &id).await, NOTREADY);
+    assert!(create_container(&svc, &id).await.is_err());
+    remove(&svc, &id).await.unwrap();
+    assert_eq!(holder.count("release"), 1);
+}
+
 #[tokio::test]
 async fn cri2_stop_releases_once_and_is_idempotent() {
     let log = new_log();

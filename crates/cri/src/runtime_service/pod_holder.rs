@@ -76,6 +76,18 @@ impl Drop for HolderReleaseGuard {
     }
 }
 
+/// `spawn_pod_holder` の future が起動待ちの途中で破棄された（RPC の取り消し）とき、settlement を放棄する guard。
+/// 放棄しないと切り離された worker が後から成功して Ready を公開し、確定版の記録なしに CreateContainer が通る
+/// （CRI-2 の fail-closed 違反）。放棄後の成功は `pod_holder`・`holder_owned` だけ記録し NotReady に保つ。
+struct SettlementAbandonOnDrop(Arc<SetUpSettlement>);
+
+impl Drop for SettlementAbandonOnDrop {
+    fn drop(&mut self) {
+        // 既に worker が確定していれば何もしない（戻り値は不要）。
+        let _ = self.0.abandon();
+    }
+}
+
 impl CriRuntimeService {
     /// 保持役を起動して記録へ確定する（`RunPodSandbox` から、write-ahead の後に呼ぶ）。
     ///
@@ -110,6 +122,7 @@ impl CriRuntimeService {
         };
         let settlement = Arc::new(SetUpSettlement::new());
         let worker_settlement = Arc::clone(&settlement);
+        let _abandon_on_drop = SettlementAbandonOnDrop(Arc::clone(&settlement));
         let worker_provider = Arc::clone(provider);
         let worker_registry = Arc::clone(&self.registry);
         let worker_id = id.to_owned();

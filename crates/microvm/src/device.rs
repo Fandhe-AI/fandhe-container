@@ -3929,7 +3929,9 @@ mod tests {
     fn mvm1_4288_resident_watchdog_drop_joins_within_bound() {
         let wd: RunWatchdog<Fx> =
             RunWatchdog::spawn("mvm4288-drop", Duration::from_secs(5)).unwrap();
-        assert_eq!(tasks_named("mvm4288-drop"), 1);
+        wait_until("watchdog thread visible", || {
+            tasks_named("mvm4288-drop") == 1
+        });
         let t = Instant::now();
         drop(wd);
         assert!(t.elapsed() < RUN_WATCHDOG_JOIN_WAIT);

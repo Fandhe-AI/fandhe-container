@@ -192,7 +192,7 @@ async fn cri6_default_binds_loopback_and_url_prefix() {
     assert!(server.local_addr().ip().is_loopback());
     let url = server
         .issuer()
-        .issue(fandhe_container_cri::streaming::StreamRequest::Exec(
+        .issue(fandhe_container_cri::streaming::StreamRequest::exec(
             exec_request("c1"),
         ))
         .expect("issue");
@@ -219,7 +219,7 @@ async fn cri6_valid_token_reaches_handler_then_single_use_404() {
         .expect("bind");
     let url = server
         .issuer()
-        .issue(fandhe_container_cri::streaming::StreamRequest::Exec(
+        .issue(fandhe_container_cri::streaming::StreamRequest::exec(
             exec_request("c1"),
         ))
         .expect("issue");
@@ -250,7 +250,7 @@ async fn cri6_unknown_mismatch_expired_and_method() {
     );
 
     let url = issuer
-        .issue(fandhe_container_cri::streaming::StreamRequest::Exec(
+        .issue(fandhe_container_cri::streaming::StreamRequest::exec(
             exec_request("c1"),
         ))
         .expect("issue");
@@ -262,7 +262,7 @@ async fn cri6_unknown_mismatch_expired_and_method() {
     assert_eq!(status_line(&after), "HTTP/1.1 404 Not Found");
 
     let expired_url = issuer
-        .issue(fandhe_container_cri::streaming::StreamRequest::Exec(
+        .issue(fandhe_container_cri::streaming::StreamRequest::exec(
             exec_request("c1"),
         ))
         .expect("issue");
@@ -464,7 +464,7 @@ async fn cri6_issue_unavailable_on_non_unix() {
         .expect("bind");
     let err = server
         .issuer()
-        .issue(fandhe_container_cri::streaming::StreamRequest::Exec(
+        .issue(fandhe_container_cri::streaming::StreamRequest::exec(
             exec_request("c1"),
         ))
         .expect_err("unavailable");
@@ -542,7 +542,7 @@ async fn cri6_upgraded_connection_survives_overall_deadline() {
     .expect("bind");
     let url = server
         .issuer()
-        .issue(fandhe_container_cri::streaming::StreamRequest::Exec(
+        .issue(fandhe_container_cri::streaming::StreamRequest::exec(
             exec_request("c1"),
         ))
         .expect("issue");
@@ -595,7 +595,7 @@ async fn cri6_upgrade_holds_connection_slot_and_observes() {
     let addr = server.local_addr();
     let url = server
         .issuer()
-        .issue(StreamRequest::Exec(exec_request("c1")))
+        .issue(StreamRequest::exec(exec_request("c1")))
         .expect("issue");
     let path = path_of(&url);
     let raw = format!(
@@ -833,7 +833,7 @@ impl fandhe_container_cri::streaming::StreamHandler for DrainHandler {
     > {
         let fast = matches!(
             &request,
-            fandhe_container_cri::streaming::StreamRequest::Exec(r) if r.container_id == "fast"
+            fandhe_container_cri::streaming::StreamRequest::Exec { request: r, .. } if r.container_id == "fast"
         );
         Box::pin(async move {
             let on_upgrade = hyper::upgrade::on(&mut http);
@@ -913,7 +913,7 @@ async fn cri6_repair5_4164_drain_keeps_natural_response_and_force_closes_rest() 
     for id in ["fast", "slow-b", "slow-c"] {
         let url = server
             .issuer()
-            .issue(fandhe_container_cri::streaming::StreamRequest::Exec(
+            .issue(fandhe_container_cri::streaming::StreamRequest::exec(
                 exec_request(id),
             ))
             .expect("issue");
@@ -962,7 +962,7 @@ async fn cri6_repair5_4164_connection_after_close_all_is_aborted() {
     sessions.close_all();
     let url = server
         .issuer()
-        .issue(fandhe_container_cri::streaming::StreamRequest::Exec(
+        .issue(fandhe_container_cri::streaming::StreamRequest::exec(
             exec_request("slow"),
         ))
         .expect("issue");

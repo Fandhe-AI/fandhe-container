@@ -34,6 +34,12 @@ mod exclusive_dir;
 
 #[path = "../../core/tests/support/reap.rs"]
 mod reap;
+// 実機前提試験の失敗後の残骸の回収（#4142・#4285）。取り込む試験ごとに使う項目が異なる。
+#[path = "support/cri_real_reclaim.rs"]
+mod reclaim;
+// shim_v2_*_real の一意な ID とおとりの部品。harness = false の試験では自己照合が走らないため、既定の集合のここで走らせる（#4285）。
+#[path = "support/shim_real_unique.rs"]
+mod shim_unique;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -990,6 +996,33 @@ async fn container_lifecycle_crosses_the_uds_grpc_boundary() {
     .expect("watchdog");
 }
 
+/// 回収を実行し、plugin が死んでいた（終了済み・到達不能）なら同じ状態ルートで起動し直して回収し直す（#4285）。
+/// 旧 plugin が生きたまま到達不能だと `.cri/@instance.lock` を握り続けるため、新 plugin の起動前に旧 guard を drop
+/// （kill と回収）して lock を解放してから spawn する。両試行の後始末で共通に使う。
+async fn reclaim_restarting_dead_plugin(
+    mut guard: ChildGuard,
+    mut c: RuntimeServiceClient<Channel>,
+    ledger: &reclaim::Ledger,
+    token: &str,
+    plugin_bin: &Path,
+    new_sock: &Path,
+    config: GrpcClientConfig,
+) -> (
+    ChildGuard,
+    RuntimeServiceClient<Channel>,
+    reclaim::ReclaimReport,
+) {
+    let mut rep = reclaim::reclaim(&mut c, ledger, token, reclaim::CLEANUP_BUDGET).await;
+    if guard.exited().is_some() || reclaim::plugin_unreachable(&rep) {
+        drop(guard);
+        guard = spawn_server_inherit_env(plugin_bin, new_sock);
+        let ch = connect_when_ready_with(new_sock, Some(&mut guard), config).await;
+        c = RuntimeServiceClient::new(ch);
+        rep = reclaim::reclaim(&mut c, ledger, token, reclaim::CLEANUP_BUDGET).await;
+    }
+    (guard, c, rep)
+}
+
 /// 環境を引き継いで `bin` の本番バイナリを spawn する（段 C 用。`XDG_RUNTIME_DIR`・`DBUS_SESSION_BUS_ADDRESS` 等を
 /// systemd --user の委譲 scope・user manager の private ソケットへ届けるため `env_clear` しない）。
 fn spawn_server_inherit_env(bin: &Path, sock: &Path) -> ChildGuard {
@@ -1029,10 +1062,139 @@ fn production_bin_dir(tag: &str) -> (TempDir, PathBuf) {
     (bin_dir, plugin_bin)
 }
 
+const FULL_TEST: &str = "production_binary_full_lifecycle_real";
+const FULL_IMAGE: &str = "docker.io/library/busybox:1.36";
+/// 実機前提試験の全体の watchdog。
+const FULL_WATCHDOG: Duration = Duration::from_secs(900);
+
+/// `production_binary_full_lifecycle_real` の本体 1 試行（#4285）。同じ metadata・トークンで何度走らせても、前の試行の記録が
+/// 回収されていなければ `ALREADY_EXISTS` で落ちる。`inject` のときは Start と Running の確認の直後に固定文言で panic する。
+/// 作った ID は台帳へ登録し、Remove に成功したら外す。`guarded` の `tokio::spawn` で走らせるため `'static + Send`。
+async fn full_lifecycle_scenario(
+    mut c: Client,
+    token: String,
+    ledger: reclaim::Ledger,
+    image_ref: String,
+    inject: bool,
+) {
+    // pod.json (scripts/testdata/cri/pod.json) と同じく、core の start が受けられる NODE の network namespace にする。
+    let mut run = run_req("pod-real");
+    {
+        let cfg = run.config.as_mut().expect("config");
+        if let Some(m) = cfg.metadata.as_mut() {
+            m.uid = reclaim::sandbox_uid("uid-full", &token);
+        }
+        cfg.labels = reclaim::config_labels(FULL_TEST, &token);
+        cfg.linux
+            .get_or_insert_with(Default::default)
+            .security_context
+            .get_or_insert_with(Default::default)
+            .namespace_options = Some(cri::NamespaceOption {
+            network: cri::NamespaceMode::Node as i32,
+            ..Default::default()
+        });
+    }
+    let sb = call_with_deadline(c.run_pod_sandbox(run), RPC_DEADLINE)
+        .await
+        .expect("run sandbox")
+        .into_inner()
+        .pod_sandbox_id;
+    reclaim::record_sandbox(&ledger, &sb);
+
+    // タグで作る（在庫から image ID へ解決される）。
+    let long = Duration::from_secs(120);
+    let id = call_with_deadline(
+        c.create_container(cri::CreateContainerRequest {
+            pod_sandbox_id: sb.clone(),
+            config: Some(cri::ContainerConfig {
+                metadata: Some(cri::ContainerMetadata {
+                    name: "c".into(),
+                    attempt: 0,
+                }),
+                image: Some(image_spec(FULL_IMAGE)),
+                command: vec!["/bin/sleep".into(), "300".into()],
+                labels: reclaim::config_labels(FULL_TEST, &token),
+                ..Default::default()
+            }),
+            sandbox_config: None,
+        }),
+        long,
+    )
+    .await
+    .expect("create by tag")
+    .into_inner()
+    .container_id;
+    reclaim::record_container(&ledger, &id);
+    call_with_deadline(
+        c.start_container(cri::StartContainerRequest {
+            container_id: id.clone(),
+        }),
+        long,
+    )
+    .await
+    .expect("start");
+    let st = container_status(&mut c, &id).await.expect("status");
+    assert_eq!(st.state, cri::ContainerState::ContainerRunning as i32);
+    if inject {
+        panic!("{}", reclaim::injected_message(FULL_TEST));
+    }
+    // 解決結果の報告（#2831）: image_id は PullImage の image_ref と同じ（proto の MUST）、image_ref は digest 参照。
+    assert_eq!(st.image_id, image_ref);
+    let repo = FULL_IMAGE.rsplit_once(':').map_or(FULL_IMAGE, |(r, _)| r);
+    assert!(
+        st.image_ref.contains(&format!(
+            "{}@sha256:",
+            repo.rsplit('/').next().unwrap_or(repo)
+        )),
+        "image_ref: {}",
+        st.image_ref
+    );
+
+    call_with_deadline(
+        c.stop_container(cri::StopContainerRequest {
+            container_id: id.clone(),
+            timeout: 2,
+        }),
+        long,
+    )
+    .await
+    .expect("stop");
+    let st = container_status(&mut c, &id).await.expect("status");
+    assert_eq!(st.state, cri::ContainerState::ContainerExited as i32);
+
+    remove_container(&mut c, &id).await.expect("remove");
+    reclaim::forget_container(&ledger, &id);
+    // 共有の状態ルートの他の記録に依らないよう、自分の sandbox とトークンで絞った件数を見る。
+    let left = call_with_deadline(
+        c.list_containers(cri::ListContainersRequest {
+            filter: Some(cri::ContainerFilter {
+                pod_sandbox_id: sb.clone(),
+                label_selector: reclaim::labels(&token),
+                ..Default::default()
+            }),
+        }),
+        RPC_DEADLINE,
+    )
+    .await
+    .expect("list containers")
+    .into_inner()
+    .containers
+    .len();
+    assert_eq!(left, 0);
+    stop_sandbox(&mut c, &sb).await.expect("stop sandbox");
+    remove_sandbox(&mut c, &sb).await.expect("remove sandbox");
+    reclaim::forget_sandbox(&ledger, &sb);
+}
+
 /// 段 C（実機前提・`#[ignore]`。PLUG-1・CRI-1・CRI-2・CRI-3・#2592）: 本番バイナリ越しに、`PullImage`（実レジストリ）→
 /// 正規化タグが `ImageStatus`・`ListImages` に見える → ホストの network namespace の sandbox → **タグで** CreateContainer →
 /// StartContainer（`CONTAINER_RUNNING`）→ StopContainer（`CONTAINER_EXITED`）→ RemoveContainer → StopPodSandbox → RemovePodSandbox
 /// の一連が成功する。
+///
+/// 残骸の回収（#4285・#4142 と同じ 2 層）: pull は 1 回だけで、本体（[`full_lifecycle_scenario`]）を 2 回走らせる。1 回目は
+/// Start と Running の確認の直後に注入した失敗で落とし、台帳とトークン label で絞った回収が自分の 1 件ずつを消すことを具体値で
+/// 照合する。2 回目は同じ metadata・トークンで最後まで通す（回収が効いていなければ `ALREADY_EXISTS`）。回収の時点で plugin が
+/// 死んでいれば、同じ状態ルートで起動し直してから回収する。sandbox の uid と label にトークンを、label に所有者（試験名）を入れる。
 ///
 /// `#[ignore]` の理由（既定の集合から分ける）: (1) StartContainer は supervisor 経由の本番経路で、`systemd --user` の委譲 cgroup scope の
 /// 中で動かす必要がある（Landlock ABI・user manager の private ソケット・`XDG_RUNTIME_DIR` も要る）、(2) 外向き HTTPS で実レジストリ
@@ -1046,26 +1208,30 @@ fn production_bin_dir(tag: &str) -> (TempDir, PathBuf) {
 #[tokio::test]
 #[ignore = "requires systemd --user delegated scope, supervisor bin, and outbound HTTPS to a registry (CRI-1/CRI-2/CRI-3, #2592)"]
 async fn production_binary_full_lifecycle_real() {
-    const IMAGE: &str = "docker.io/library/busybox:1.36";
     // 取得は ImageService の pull 期限（540 秒）に収まる範囲で待つ。
     const PULL_DEADLINE: Duration = Duration::from_secs(300);
-    tokio::time::timeout(Duration::from_secs(900), async {
+    tokio::time::timeout(FULL_WATCHDOG, async {
+        let started = Instant::now();
         let dir = TempDir::new("sock-real");
         let sock = dir.0.join("s.sock");
+        let sock2 = dir.0.join("s2.sock");
+        let sock3 = dir.0.join("s3.sock");
         let (bin_dir, plugin_bin) = production_bin_dir("bin-real");
         let _keep_bin_dir = &bin_dir;
         let mut guard = spawn_server_inherit_env(&plugin_bin, &sock);
         // Channel の request timeout を pull の期限（300 秒）以上にする。既定の 10 秒だと
         // call_with_deadline の長い期限より先に打ち切られる（REPAIR-5・REPAIR-12）。
-        let config = GrpcClientConfig::new()
-            .with_request_timeout(Duration::from_secs(600))
-            .expect("request timeout");
-        let ch = connect_when_ready_with(&sock, Some(&mut guard), config).await;
+        let new_config = || {
+            GrpcClientConfig::new()
+                .with_request_timeout(Duration::from_secs(600))
+                .expect("request timeout")
+        };
+        let ch = connect_when_ready_with(&sock, Some(&mut guard), new_config()).await;
         let mut c = RuntimeServiceClient::new(ch.clone());
         let mut images = ImageServiceClient::new(ch.clone());
 
         // 失敗時はレジストリの HTTP 状態を固定行で出す（429 は rate limit と分かる。#2966）。成否の判定は変えない。
-        let image_ref = match pull_image_raw(&mut images, IMAGE, PULL_DEADLINE).await {
+        let image_ref = match pull_image_raw(&mut images, FULL_IMAGE, PULL_DEADLINE).await {
             Ok(r) => r,
             Err(st) => {
                 let line = pull_failure_line(&st);
@@ -1076,7 +1242,7 @@ async fn production_binary_full_lifecycle_real() {
         assert!(image_ref.starts_with("sha256:"), "image ref: {image_ref}");
         let status = call_with_deadline(
             images.image_status(cri::ImageStatusRequest {
-                image: Some(image_spec(IMAGE)),
+                image: Some(image_spec(FULL_IMAGE)),
                 verbose: false,
             }),
             RPC_DEADLINE,
@@ -1085,7 +1251,7 @@ async fn production_binary_full_lifecycle_real() {
         .expect("image status")
         .into_inner();
         let record = status.image.expect("pulled image is visible by tag");
-        assert!(record.repo_tags.iter().any(|t| t == IMAGE));
+        assert!(record.repo_tags.iter().any(|t| t == FULL_IMAGE));
         let listed = call_with_deadline(
             images.list_images(cri::ListImagesRequest { filter: None }),
             RPC_DEADLINE,
@@ -1095,85 +1261,101 @@ async fn production_binary_full_lifecycle_real() {
         .into_inner();
         assert!(listed.images.iter().any(|i| i.id == record.id));
 
-        // pod.json (scripts/testdata/cri/pod.json) と同じく、core の start が受けられる NODE の network namespace にする。
-        let mut run = run_req("pod-real");
-        run.config
-            .as_mut()
-            .expect("config")
-            .linux
-            .get_or_insert_with(Default::default)
-            .security_context
-            .get_or_insert_with(Default::default)
-            .namespace_options = Some(cri::NamespaceOption {
-            network: cri::NamespaceMode::Node as i32,
-            ..Default::default()
-        });
-        let sb = call_with_deadline(c.run_pod_sandbox(run), RPC_DEADLINE)
+        let token = reclaim::run_token();
+        let ledger = reclaim::Ledger::default();
+
+        // 試行 1（注入）: Start と Running の確認の直後に落とし、回収が効くことを確かめる。
+        let b1 = reclaim::scenario_budget(started.elapsed(), FULL_WATCHDOG, 4)
+            .min(reclaim::INJECT_ATTEMPT_LIMIT);
+        let r1 = reclaim::guarded(
+            full_lifecycle_scenario(
+                c.clone(),
+                token.clone(),
+                ledger.clone(),
+                image_ref.clone(),
+                true,
+            ),
+            b1,
+        )
+        .await;
+        let (g1, c1, rep1) = reclaim_restarting_dead_plugin(
+            guard,
+            c,
+            &ledger,
+            &token,
+            &plugin_bin,
+            &sock2,
+            new_config(),
+        )
+        .await;
+        guard = g1;
+        c = c1;
+        if let Some(line) = reclaim::left_line(FULL_TEST, &rep1) {
+            eprintln!("{line}");
+        }
+        match r1 {
+            Err(reclaim::AttemptFailure::Panicked(p))
+                if reclaim::is_injected(FULL_TEST, p.as_ref()) => {}
+            Err(reclaim::AttemptFailure::Panicked(p)) => std::panic::resume_unwind(p),
+            Err(reclaim::AttemptFailure::Deadline) => {
+                panic!("{FULL_TEST}: injected attempt exceeded its deadline")
+            }
+            Ok(()) => panic!("{FULL_TEST}: injected attempt did not fail"),
+        }
+        assert_eq!(rep1.reclaimed_containers.len(), 1, "{rep1:?}");
+        assert_eq!(rep1.reclaimed_sandboxes.len(), 1, "{rep1:?}");
+        assert!(rep1.is_clean(), "{rep1:?}");
+        let old_c = rep1.reclaimed_containers[0].clone();
+        let err = container_status(&mut c, &old_c)
             .await
-            .expect("run sandbox")
-            .into_inner()
-            .pod_sandbox_id;
+            .expect_err("reclaimed container must be gone");
+        assert_eq!(err.code(), PluginErrorCode::NotFound);
+        eprintln!("{FULL_TEST}: injected failure reclaimed containers=1 sandboxes=1");
 
-        // タグで作る（在庫から image ID へ解決される）。
-        let long = Duration::from_secs(120);
-        let id = call_with_deadline(
-            c.create_container(cri::CreateContainerRequest {
-                pod_sandbox_id: sb.clone(),
-                config: Some(cri::ContainerConfig {
-                    metadata: Some(cri::ContainerMetadata {
-                        name: "c".into(),
-                        attempt: 0,
-                    }),
-                    image: Some(image_spec(IMAGE)),
-                    command: vec!["/bin/sleep".into(), "300".into()],
-                    ..Default::default()
-                }),
-                sandbox_config: None,
-            }),
-            long,
+        // 試行 2（本番）: 同じトークン（同じ metadata）で最後まで通す。
+        // 回収の失敗で再起動する分（回収 2 回）を予算に確保する。
+        let b2 = reclaim::scenario_budget(started.elapsed(), FULL_WATCHDOG, 2);
+        let r2 = reclaim::guarded(
+            full_lifecycle_scenario(
+                c.clone(),
+                token.clone(),
+                ledger.clone(),
+                image_ref.clone(),
+                false,
+            ),
+            b2,
         )
-        .await
-        .expect("create by tag")
-        .into_inner()
-        .container_id;
-        call_with_deadline(
-            c.start_container(cri::StartContainerRequest {
-                container_id: id.clone(),
-            }),
-            long,
+        .await;
+        let (g2, c2, rep2) = reclaim_restarting_dead_plugin(
+            guard,
+            c,
+            &ledger,
+            &token,
+            &plugin_bin,
+            &sock3,
+            new_config(),
         )
-        .await
-        .expect("start");
-        let st = container_status(&mut c, &id).await.expect("status");
-        assert_eq!(st.state, cri::ContainerState::ContainerRunning as i32);
-        // 解決結果の報告（#2831）: image_id は PullImage の image_ref と同じ（proto の MUST）、image_ref は digest 参照。
-        assert_eq!(st.image_id, image_ref);
-        let repo = IMAGE.rsplit_once(':').map_or(IMAGE, |(r, _)| r);
-        assert!(
-            st.image_ref.contains(&format!(
-                "{}@sha256:",
-                repo.rsplit('/').next().unwrap_or(repo)
-            )),
-            "image_ref: {}",
-            st.image_ref
+        .await;
+        guard = g2;
+        c = c2;
+        if let Some(line) = reclaim::left_line(FULL_TEST, &rep2) {
+            eprintln!("{line}");
+        }
+        match r2 {
+            Ok(()) => {}
+            Err(reclaim::AttemptFailure::Panicked(p)) => std::panic::resume_unwind(p),
+            Err(reclaim::AttemptFailure::Deadline) => {
+                panic!("{FULL_TEST}: scenario deadline exceeded")
+            }
+        }
+        assert_eq!(
+            rep2,
+            reclaim::ReclaimReport {
+                token: token.clone(),
+                ..reclaim::ReclaimReport::default()
+            },
+            "nothing may be left to reclaim"
         );
-
-        call_with_deadline(
-            c.stop_container(cri::StopContainerRequest {
-                container_id: id.clone(),
-                timeout: 2,
-            }),
-            long,
-        )
-        .await
-        .expect("stop");
-        let st = container_status(&mut c, &id).await.expect("status");
-        assert_eq!(st.state, cri::ContainerState::ContainerExited as i32);
-
-        remove_container(&mut c, &id).await.expect("remove");
-        assert_eq!(list_containers_len(&mut c).await, 0);
-        stop_sandbox(&mut c, &sb).await.expect("stop sandbox");
-        remove_sandbox(&mut c, &sb).await.expect("remove sandbox");
         drop((c, images, ch));
         assert!(guard.exited().is_none(), "server must still be running");
     })
@@ -1356,6 +1538,118 @@ async fn cri1_cri2_core1_records_survive_plugin_restart() {
     .expect("watchdog");
 }
 
+/// 段 D（CRI-1・CRI-6・REPAIR-4・REPAIR-12・#4285。root 不要・ネットワーク不要）: plugin が SIGKILL で死んだ後、同じ状態ルートで
+/// 起動し直した plugin が記録を再採用し、許可リストの所有者 label を持つ自分の記録だけを回収できる。
+///
+/// 照合: (1) 死んだ plugin への接続では回収が `unverified` を返し [`reclaim::plugin_unreachable`] が真になる（起動し直しが要る判定）。
+/// (2) 起動し直した plugin での所有者ごとの回収は、自分の所有者の report だけが sandbox 1 件・コンテナ 1 件を回収し、ほかの所有者の
+/// report は空。(3) label の無い他人の sandbox の記録は消えず、段 E の前提検査 [`restart_gate`] が `entries=1` の固定文言で失敗する
+/// （label の無い残骸は先頭の回収で消えず fail-closed になる）。(4) その sandbox を片付ければ前提検査は通る。(5) 再採用の要約行が
+/// 具体値で出て、ID は出ない。
+#[tokio::test]
+async fn cri1_cri6_4285_owned_residue_is_readopted_and_reclaimed_after_plugin_sigkill() {
+    tokio::time::timeout(WATCHDOG, async {
+        let dir = TempDir::new("sock-4285");
+        let xdg = TempDir::new("xdg-4285");
+        let sock_a = dir.0.join("a.sock");
+        let sock_b = dir.0.join("b.sock");
+        let state_root = xdg.0.join("fandhe-container");
+        let token = reclaim::run_token();
+        let ledger = reclaim::Ledger::default();
+
+        // 1 回目: 所有者つきの sandbox とコンテナ、label の無い他人の sandbox を作る。
+        let mut guard = spawn_server(&sock_a, &xdg.0);
+        let ch = connect_when_ready(&sock_a, Some(&mut guard)).await;
+        let mut c = RuntimeServiceClient::new(ch.clone());
+        let mut run = run_req("pod-owned");
+        {
+            let cfg = run.config.as_mut().expect("config");
+            if let Some(m) = cfg.metadata.as_mut() {
+                m.uid = reclaim::sandbox_uid("uid-4285", &token);
+            }
+            cfg.labels = reclaim::config_labels(RESTART_TEST, &token);
+        }
+        let sb = call_with_deadline(c.run_pod_sandbox(run), RPC_DEADLINE)
+            .await
+            .expect("run owned sandbox")
+            .into_inner()
+            .pod_sandbox_id;
+        reclaim::record_sandbox(&ledger, &sb);
+        let foreign = run_sandbox(&mut c, "pod-foreign").await;
+        let image_id = pull_fixture_image(&state_root.join(".cri/images"));
+        let mut creq = create_req(&sb, "c-owned", &image_id);
+        creq.config.as_mut().expect("config").labels =
+            reclaim::config_labels(RESTART_TEST, &token);
+        let cid = call_with_deadline(c.create_container(creq), RPC_DEADLINE)
+            .await
+            .expect("create owned container")
+            .into_inner()
+            .container_id;
+        reclaim::record_container(&ledger, &cid);
+        assert!(records_dir(&xdg.0, "sandboxes").join(format!("{sb}.rec")).is_file());
+        assert!(records_dir(&xdg.0, "sandboxes").join(format!("{foreign}.rec")).is_file());
+        assert!(records_dir(&xdg.0, "containers").join(format!("{cid}.rec")).is_file());
+        let first_stderr = kill_and_collect_stderr(guard);
+        assert!(!first_stderr.contains("cri record readoption"), "{first_stderr}");
+
+        // (1) 死んだ plugin への古い接続: 確認できず、何も回収できない。
+        let dead = reclaim::reclaim(&mut c, &ledger, &token, Duration::from_secs(10)).await;
+        assert!(!dead.is_clean(), "{dead:?}");
+        assert!(dead.reclaimed_containers.is_empty() && dead.reclaimed_sandboxes.is_empty());
+        assert!(reclaim::plugin_unreachable(&dead), "{dead:?}");
+        drop((c, ch));
+
+        // (2) 同じ状態ルート・別 socket で起動し直し、許可リストの所有者ごとに回収する。
+        let mut guard = spawn_server(&sock_b, &xdg.0);
+        let ch = connect_when_ready(&sock_b, Some(&mut guard)).await;
+        let mut c = RuntimeServiceClient::new(ch.clone());
+        let reports = reclaim_owned(&mut c).await;
+        assert_eq!(reports.len(), reclaim::OWNERS.len());
+        for (owner, r) in reclaim::OWNERS.iter().zip(&reports) {
+            assert!(r.is_clean(), "{owner}: {r:?}");
+            if *owner == RESTART_TEST {
+                assert_eq!(r.reclaimed_containers, vec![cid.clone()], "{r:?}");
+                assert_eq!(r.reclaimed_sandboxes, vec![sb.clone()], "{r:?}");
+            } else {
+                assert!(
+                    r.reclaimed_containers.is_empty() && r.reclaimed_sandboxes.is_empty(),
+                    "{owner}: {r:?}"
+                );
+            }
+        }
+        assert_eq!(list_containers_len(&mut c).await, 0);
+
+        // (3) 所有する記録は消え、label の無い他人の sandbox は残る。前提検査は固定文言で失敗する。
+        assert!(!records_dir(&xdg.0, "sandboxes").join(format!("{sb}.rec")).exists());
+        assert!(!records_dir(&xdg.0, "containers").join(format!("{cid}.rec")).exists());
+        assert!(!state_root.join(".cri/bundles").join(&cid).exists());
+        assert!(records_dir(&xdg.0, "sandboxes").join(format!("{foreign}.rec")).is_file());
+        assert_eq!(
+            restart_gate(&xdg.0),
+            Err(format!(
+                "{RESTART_TEST}: state root is not clean (entries=1); see docs/setup/cri-record-recovery.md"
+            ))
+        );
+
+        // (4) 他人の sandbox を片付ければ前提検査は通る。
+        stop_sandbox(&mut c, &foreign).await.expect("stop foreign");
+        remove_sandbox(&mut c, &foreign).await.expect("remove foreign");
+        assert_eq!(restart_gate(&xdg.0), Ok(()));
+        drop((c, ch));
+
+        // (5) 再採用の要約行は具体値で出て、ID は出ない。
+        let second_stderr = kill_and_collect_stderr(guard);
+        for want in [
+            "cri record readoption: kind=sandbox adopted=2 pending_unresolved=0 broken=0 malformed=0 ",
+            "cri record readoption: kind=container adopted=1 present=1 absent_exited=0 remove_pending=0 undetermined=0 stale_create=0 broken=0 malformed=0 ",
+        ] {
+            assert!(second_stderr.contains(want), "missing {want:?} in: {second_stderr}");
+        }
+        assert!(!second_stderr.contains(&sb) && !second_stderr.contains(&cid));
+    })
+    .await
+    .expect("watchdog");
+}
 /// 段 D（CRI-2・REPAIR-5）: 記録の件数が上限を超えていたら、起動を止める（fail-closed。socket も作らない）。
 #[tokio::test]
 async fn cri2_record_limit_exceeded_stops_startup() {
@@ -1805,7 +2099,11 @@ const RESTART_TEST: &str = "production_binary_restart_readopts_running_container
 /// `#[ignore]` の理由: `production_binary_full_lifecycle_real` と同じ（委譲 cgroup scope・supervisor の bin・外向き HTTPS）。
 /// 加えて、supervisor の起動が本物の `XDG_RUNTIME_DIR/systemd/private` を要するため `XDG_RUNTIME_DIR` を一時ディレクトリへ
 /// 向けられず、本物の状態ルート（`$XDG_RUNTIME_DIR/fandhe-container`）を共有する。そのため前提検査として記録と bundle が
-/// 空であることを確かめ、満たさなければ何も消さずに失敗する（fail-closed）。試験が消すのは自分で作った壊れた記録 1 件だけ。
+/// 空であることを確かめ、満たさなければ失敗する（fail-closed）。先頭の回収（#4285）は、残骸があるときにだけ使い捨ての
+/// plugin を起動し、許可リストの所有者 label（`io.fandhe-container.test.owner`）を持つ記録だけを消す（ちょうど 1 回）。
+/// label の無い残骸・許可リスト外の残骸は消さず、前提検査（[`restart_gate`]）が従来どおり失敗させる。本体は残骸を許さず、
+/// 件数・フィルタなしの一覧の照合は厳密なまま。本体が失敗したら、plugin を起動し直して自分のトークンの記録を回収する。
+/// 試験が消すのは自分で作った壊れた記録 1 件と、台帳・自分のトークンの記録だけ。
 /// 同じバイナリの `#[ignore]` 試験とはインスタンスロックのため直列（`--test-threads=1`）で実行する。
 /// sandbox は NODE の network namespace（core の start が pod の netns への join をまだ受けないための試験専用の設定）。
 /// 失敗で running のコンテナが残った場合は `docs/setup/cri-record-recovery.md` で手動回収する。
@@ -1814,25 +2112,135 @@ const RESTART_TEST: &str = "production_binary_restart_readopts_running_container
 #[tokio::test]
 #[ignore = "requires systemd --user delegated scope, supervisor bin, real XDG_RUNTIME_DIR state root, and outbound HTTPS to a registry (CRI-1/CRI-2/CORE-1, #3225)"]
 async fn production_binary_restart_readopts_running_container_real() {
-    const IMAGE: &str = "docker.io/library/busybox:1.36";
-    const PULL_DEADLINE: Duration = Duration::from_secs(300);
-    tokio::time::timeout(Duration::from_secs(600), async {
+    const WATCHDOG_RESTART: Duration = Duration::from_secs(600);
+    tokio::time::timeout(WATCHDOG_RESTART, async {
+        let started = Instant::now();
         let xdg = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").expect("XDG_RUNTIME_DIR"));
         assert!(xdg.is_absolute(), "XDG_RUNTIME_DIR must be absolute");
-        let state_root = xdg.join("fandhe-container");
-
-        // 前提検査（何も消さない）。
-        let dirty = count_entries(&records_dir(&xdg, "sandboxes"), Some("rec"))
-            + count_entries(&records_dir(&xdg, "containers"), Some("rec"))
-            + count_entries(&state_root.join(".cri/bundles"), None);
-        assert_eq!(
-            dirty, 0,
-            "{RESTART_TEST}: state root is not clean; see docs/setup/cri-record-recovery.md"
-        );
-
         let dir = TempDir::new("sock-restart");
         let (bin_dir, plugin_bin) = production_bin_dir("bin-restart");
         let _keep_bin_dir = &bin_dir;
+
+        // 先頭の回収（ちょうど 1 回。#4285）: 残骸があるときだけ使い捨ての plugin を起動し、許可リストの所有者 label の記録を消す。
+        if state_root_dirt(&xdg) > 0 {
+            head_reclaim(&plugin_bin, &dir.0.join("h.sock")).await;
+        }
+        // 前提検査（本体の前。何も消さない）。label の無い残骸が残っていればここで失敗する（fail-closed）。
+        restart_gate(&xdg).unwrap_or_else(|m| panic!("{m}"));
+
+        let token = reclaim::run_token();
+        let ledger = reclaim::Ledger::default();
+        let budget = reclaim::scenario_budget(started.elapsed(), WATCHDOG_RESTART, 1);
+        let outcome = reclaim::guarded(
+            restart_body(
+                xdg.clone(),
+                plugin_bin.clone(),
+                dir.0.clone(),
+                token.clone(),
+                ledger.clone(),
+            ),
+            budget,
+        )
+        .await;
+        if let Err(failure) = outcome {
+            // 本体の失敗: 新しい plugin を起動し直して自分のトークンの記録だけを回収し、元の失敗を再送出する。
+            let sock_r = dir.0.join("r.sock");
+            let mut guard = spawn_server_inherit_env(&plugin_bin, &sock_r);
+            let config = GrpcClientConfig::new()
+                .with_request_timeout(Duration::from_secs(600))
+                .expect("request timeout");
+            let ch = connect_when_ready_with(&sock_r, Some(&mut guard), config).await;
+            let mut c = RuntimeServiceClient::new(ch.clone());
+            let rep = reclaim::reclaim(&mut c, &ledger, &token, reclaim::CLEANUP_BUDGET).await;
+            if let Some(line) = reclaim::left_line(RESTART_TEST, &rep) {
+                eprintln!("{line}");
+            }
+            drop((c, ch));
+            let _ = kill_and_collect_stderr(guard);
+            match failure {
+                reclaim::AttemptFailure::Panicked(p) => std::panic::resume_unwind(p),
+                reclaim::AttemptFailure::Deadline => {
+                    panic!("{RESTART_TEST}: scenario deadline exceeded")
+                }
+            }
+        }
+        println!("{RESTART_TEST}: running container readopted after plugin restart");
+    })
+    .await
+    .expect("watchdog");
+}
+
+/// 状態ルート配下の残骸の件数（sandbox・コンテナの記録と bundle）。
+fn state_root_dirt(xdg: &Path) -> usize {
+    let state_root = xdg.join("fandhe-container");
+    count_entries(&records_dir(xdg, "sandboxes"), Some("rec"))
+        + count_entries(&records_dir(xdg, "containers"), Some("rec"))
+        + count_entries(&state_root.join(".cri/bundles"), None)
+}
+
+/// 段 E の前提検査（#4285）。残骸が 0 件なら `Ok`。固定の文言で失敗を返す（既定の集合で照合する）。
+fn restart_gate(xdg: &Path) -> Result<(), String> {
+    match state_root_dirt(xdg) {
+        0 => Ok(()),
+        n => Err(format!(
+            "{RESTART_TEST}: state root is not clean (entries={n}); see docs/setup/cri-record-recovery.md"
+        )),
+    }
+}
+
+/// 許可リストの所有者 label の記録を、所有者ごとに 1 回ずつの一覧で回収する（#4285）。label の無い記録には触れない。
+async fn reclaim_owned(c: &mut Client) -> Vec<reclaim::ReclaimReport> {
+    let ledger = reclaim::Ledger::default();
+    let mut out = Vec::new();
+    for owner in reclaim::OWNERS {
+        out.push(
+            reclaim::reclaim_by_selector(
+                c,
+                &ledger,
+                reclaim::owner_selector(owner),
+                &format!("owner={owner}"),
+                reclaim::CLEANUP_BUDGET,
+            )
+            .await,
+        );
+    }
+    out
+}
+
+/// 先頭の回収: 使い捨ての plugin を起動して所有者 label の記録を回収し、SIGKILL する（インスタンスロックで起動できなければ失敗）。
+async fn head_reclaim(plugin_bin: &Path, sock: &Path) {
+    let mut guard = spawn_server_inherit_env(plugin_bin, sock);
+    let config = GrpcClientConfig::new()
+        .with_request_timeout(Duration::from_secs(600))
+        .expect("request timeout");
+    let ch = connect_when_ready_with(sock, Some(&mut guard), config).await;
+    let mut c = RuntimeServiceClient::new(ch.clone());
+    let reports = reclaim_owned(&mut c).await;
+    let (mut cn, mut sn) = (0, 0);
+    for r in &reports {
+        cn += r.reclaimed_containers.len();
+        sn += r.reclaimed_sandboxes.len();
+        if let Some(line) = reclaim::left_line(RESTART_TEST, r) {
+            eprintln!("{line}");
+        }
+    }
+    eprintln!("{RESTART_TEST}: head reclaim reclaimed containers={cn} sandboxes={sn}");
+    drop((c, ch));
+    let _ = kill_and_collect_stderr(guard);
+}
+
+/// 段 E の本体（`guarded` で走らせるため `'static + Send`）。照合は緩めない。
+async fn restart_body(
+    xdg: PathBuf,
+    plugin_bin: PathBuf,
+    dir: PathBuf,
+    token: String,
+    ledger: reclaim::Ledger,
+) {
+    const IMAGE: &str = "docker.io/library/busybox:1.36";
+    const PULL_DEADLINE: Duration = Duration::from_secs(300);
+    {
+        let state_root = xdg.join("fandhe-container");
         let long = Duration::from_secs(120);
         let new_config = || {
             GrpcClientConfig::new()
@@ -1841,7 +2249,7 @@ async fn production_binary_restart_readopts_running_container_real() {
         };
 
         // 1 回目: pull → NODE sandbox → タグで create → start（running）。
-        let sock_a = dir.0.join("a.sock");
+        let sock_a = dir.join("a.sock");
         let mut guard = spawn_server_inherit_env(&plugin_bin, &sock_a);
         let ch = connect_when_ready_with(&sock_a, Some(&mut guard), new_config()).await;
         let mut c = RuntimeServiceClient::new(ch.clone());
@@ -1856,22 +2264,27 @@ async fn production_binary_restart_readopts_running_container_real() {
         };
         assert!(image_ref.starts_with("sha256:"), "image ref: {image_ref}");
         let mut run = run_req("pod-restart-real");
-        run.config
-            .as_mut()
-            .expect("config")
-            .linux
-            .get_or_insert_with(Default::default)
-            .security_context
-            .get_or_insert_with(Default::default)
-            .namespace_options = Some(cri::NamespaceOption {
-            network: cri::NamespaceMode::Node as i32,
-            ..Default::default()
-        });
+        {
+            let cfg = run.config.as_mut().expect("config");
+            if let Some(m) = cfg.metadata.as_mut() {
+                m.uid = reclaim::sandbox_uid("uid-restart", &token);
+            }
+            cfg.labels = reclaim::config_labels(RESTART_TEST, &token);
+            cfg.linux
+                .get_or_insert_with(Default::default)
+                .security_context
+                .get_or_insert_with(Default::default)
+                .namespace_options = Some(cri::NamespaceOption {
+                network: cri::NamespaceMode::Node as i32,
+                ..Default::default()
+            });
+        }
         let sb = call_with_deadline(c.run_pod_sandbox(run), RPC_DEADLINE)
             .await
             .expect("run sandbox")
             .into_inner()
             .pod_sandbox_id;
+        reclaim::record_sandbox(&ledger, &sb);
         let cid = call_with_deadline(
             c.create_container(cri::CreateContainerRequest {
                 pod_sandbox_id: sb.clone(),
@@ -1882,6 +2295,7 @@ async fn production_binary_restart_readopts_running_container_real() {
                     }),
                     image: Some(image_spec(IMAGE)),
                     command: vec!["/bin/sleep".into(), "600".into()],
+                    labels: reclaim::config_labels(RESTART_TEST, &token),
                     ..Default::default()
                 }),
                 sandbox_config: None,
@@ -1892,6 +2306,7 @@ async fn production_binary_restart_readopts_running_container_real() {
         .expect("create by tag")
         .into_inner()
         .container_id;
+        reclaim::record_container(&ledger, &cid);
         call_with_deadline(
             c.start_container(cri::StartContainerRequest {
                 container_id: cid.clone(),
@@ -1923,7 +2338,7 @@ async fn production_binary_restart_readopts_running_container_real() {
         );
 
         // 2 回目: 再採用。running のまま同じ実体が見える。
-        let sock_b = dir.0.join("b.sock");
+        let sock_b = dir.join("b.sock");
         let mut guard = spawn_server_inherit_env(&plugin_bin, &sock_b);
         let ch = connect_when_ready_with(&sock_b, Some(&mut guard), new_config()).await;
         let mut c = RuntimeServiceClient::new(ch.clone());
@@ -1934,7 +2349,10 @@ async fn production_binary_restart_readopts_running_container_real() {
         let listed = list_containers(&mut c).await;
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, cid);
-        assert_eq!(listed[0].state, cri::ContainerState::ContainerRunning as i32);
+        assert_eq!(
+            listed[0].state,
+            cri::ContainerState::ContainerRunning as i32
+        );
         let after = container_status(&mut c, &cid).await.expect("status");
         assert_eq!(after.state, cri::ContainerState::ContainerRunning as i32);
         assert_eq!(identity_of(&after), ident);
@@ -1947,17 +2365,21 @@ async fn production_binary_restart_readopts_running_container_real() {
             "cri stale create release: released=0 kept=0 release_failed=0 record_remove_failed=0 not_attempted=0 skipped=0",
             "cri orphan bundle reclamation: scan=completed scanned=1 reclaimed=0 kept_has_record=1 ",
         ] {
-            assert!(second_stderr.contains(want), "missing {want:?} in: {second_stderr}");
+            assert!(
+                second_stderr.contains(want),
+                "missing {want:?} in: {second_stderr}"
+            );
         }
         assert!(!second_stderr.contains(&sb) && !second_stderr.contains(&cid));
 
         // 壊れた記録 1 件を注入（自分のファイルだけを Drop で消す）。
         let garbage_name = format!("{:064x}", 0x3225_u32);
         write_garbage_record(&records_dir(&xdg, "containers"), &garbage_name);
-        let garbage = OwnedFile(records_dir(&xdg, "containers").join(format!("{garbage_name}.rec")));
+        let garbage =
+            OwnedFile(records_dir(&xdg, "containers").join(format!("{garbage_name}.rec")));
 
         // 3 回目: 壊れた記録があっても起動は止まらず、再採用は冪等。後始末を kubelet の順で通す。
-        let sock_c = dir.0.join("c.sock");
+        let sock_c = dir.join("c.sock");
         let mut guard = spawn_server_inherit_env(&plugin_bin, &sock_c);
         let ch = connect_when_ready_with(&sock_c, Some(&mut guard), new_config()).await;
         let mut c = RuntimeServiceClient::new(ch.clone());
@@ -1967,7 +2389,10 @@ async fn production_binary_restart_readopts_running_container_real() {
         );
         let listed = list_containers(&mut c).await;
         assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].state, cri::ContainerState::ContainerRunning as i32);
+        assert_eq!(
+            listed[0].state,
+            cri::ContainerState::ContainerRunning as i32
+        );
         let again = container_status(&mut c, &cid).await.expect("status");
         assert_eq!(identity_of(&again), ident);
 
@@ -1991,6 +2416,7 @@ async fn production_binary_restart_readopts_running_container_real() {
         )
         .await
         .expect("remove container");
+        reclaim::forget_container(&ledger, &cid);
         assert_eq!(list_containers_len(&mut c).await, 0);
         assert!(!c_rec.exists() && !bundle.exists());
         if had_state_dir {
@@ -1998,6 +2424,7 @@ async fn production_binary_restart_readopts_running_container_real() {
         }
         stop_sandbox(&mut c, &sb).await.expect("stop sandbox");
         remove_sandbox(&mut c, &sb).await.expect("remove sandbox");
+        reclaim::forget_sandbox(&ledger, &sb);
         assert!(!sb_rec.exists());
         assert!(garbage.0.is_file(), "broken record must be left in place");
         assert!(guard.exited().is_none(), "server must still be running");
@@ -2008,12 +2435,12 @@ async fn production_binary_restart_readopts_running_container_real() {
             "cri record readoption: kind=container adopted=1 present=1 absent_exited=0 remove_pending=0 undetermined=0 stale_create=0 broken=1 malformed=1 ",
             "cri orphan bundle reclamation: scan=completed scanned=1 reclaimed=0 kept_has_record=1 ",
         ] {
-            assert!(third_stderr.contains(want), "missing {want:?} in: {third_stderr}");
+            assert!(
+                third_stderr.contains(want),
+                "missing {want:?} in: {third_stderr}"
+            );
         }
         assert!(!third_stderr.contains(&sb) && !third_stderr.contains(&cid));
         drop(garbage);
-        println!("{RESTART_TEST}: running container readopted after plugin restart");
-    })
-    .await
-    .expect("watchdog");
+    }
 }

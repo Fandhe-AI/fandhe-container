@@ -9,7 +9,10 @@ use std::process::Command;
 use std::sync::mpsc;
 
 use fandhe_container_core::state_store::{FileStateStore, StateRoot};
-use fandhe_container_core::traits::{ContainerStatus, CreateStateRequest, UpdateStateRequest};
+use fandhe_container_core::traits::{
+    ContainerStatus, CreateStateRequest, DeleteStateRequest, DeleteStateResponse, ListStateRequest,
+    StateList, StateRecord, TraitError, UpdateStateRequest,
+};
 use fandhe_container_cri::error::CriErrorCode;
 use fandhe_container_supervisor::stream_exec::channel::{
     recv_stdio_handover, send_pty_master, send_result, send_started,
@@ -142,16 +145,51 @@ impl Fixture {
         );
         (l, pids)
     }
-}
 
-fn req(id: &str, stdin: bool, stdout: bool, stderr: bool, tty: bool) -> ExecLaunch {
-    ExecLaunch {
-        container_id: id.to_string(),
-        cmd: vec!["/bin/true".to_string()],
-        tty,
-        stdin,
-        stdout,
-        stderr,
+    /// 同じ ID のコンテナを外側（CLI 等）で削除・再作成して Running にする（インスタンスが変わる）。
+    fn recreate_running(&self, name: &str) {
+        let id = ContainerId::new(name).expect("id");
+        let old = self
+            .store
+            .get(&GetStateRequest::new(id.clone()))
+            .expect("get");
+        self.store
+            .delete(&DeleteStateRequest::new(id.clone(), old.revision()))
+            .expect("delete");
+        let created = self
+            .store
+            .create(
+                &CreateStateRequest::new(
+                    ContainerStatus::created(id.clone(), None),
+                    self.dir.0.join("bundle"),
+                )
+                .expect("req"),
+            )
+            .expect("create");
+        self.store
+            .update(&UpdateStateRequest::new(
+                ContainerStatus::running(id, NonZeroU32::new(PID)),
+                created.revision(),
+            ))
+            .expect("running");
+    }
+
+    /// 状態ストアが今報告しているインスタンス識別子を `instance` に入れた起動要求（記録が無ければ `None`）。
+    fn req(&self, id: &str, stdin: bool, stdout: bool, stderr: bool, tty: bool) -> ExecLaunch {
+        let instance = ContainerId::new(id)
+            .ok()
+            .and_then(|id| self.store.get(&GetStateRequest::new(id)).ok())
+            .and_then(|r| r.instance())
+            .map(|i| i.value());
+        ExecLaunch {
+            container_id: id.to_string(),
+            cmd: vec!["/bin/true".to_string()],
+            tty,
+            stdin,
+            stdout,
+            stderr,
+            instance,
+        }
     }
 }
 
@@ -230,7 +268,7 @@ async fn cri6_3761_stdio_selection_bytes_and_exit_code() {
         });
         let (launcher, _pids) = fx.launcher(false, script);
         let mut session = launcher
-            .launch(req("run1", stdin, stdout, stderr, false))
+            .launch(fx.req("run1", stdin, stdout, stderr, false))
             .await
             .expect("launch");
         assert_eq!(session.stdin.is_some(), stdin);
@@ -281,7 +319,7 @@ async fn cri6_3761_dropping_the_session_kills_the_helper() {
     });
     let (launcher, pids) = fx.launcher(false, script);
     let session = launcher
-        .launch(req("run1", false, true, false, false))
+        .launch(fx.req("run1", false, true, false, false))
         .await
         .expect("launch");
     assert_eq!(launcher.active_sessions(), 1);
@@ -303,11 +341,11 @@ async fn cri6_3761_shutdown_all_kills_tracked_helpers() {
     });
     let (launcher, pids) = fx.launcher(false, script);
     let _s1 = launcher
-        .launch(req("run1", false, true, false, false))
+        .launch(fx.req("run1", false, true, false, false))
         .await
         .expect("launch");
     let _s2 = launcher
-        .launch(req("run1", false, true, false, false))
+        .launch(fx.req("run1", false, true, false, false))
         .await
         .expect("launch");
     launcher.shutdown_all();
@@ -331,7 +369,7 @@ async fn cri6_3761_result_before_started_is_a_launch_error() {
     });
     let (launcher, pids) = fx.launcher(false, script);
     let err = launcher
-        .launch(req("run1", false, true, false, false))
+        .launch(fx.req("run1", false, true, false, false))
         .await
         .expect_err("launch must fail");
     assert_eq!(err.code(), CriErrorCode::FailedPrecondition);
@@ -391,7 +429,7 @@ async fn cri6_3761_signaled_result_reaches_the_exit_future() {
     });
     let (launcher, _pids) = fx.launcher(false, script);
     let mut session = launcher
-        .launch(req("run1", false, true, false, false))
+        .launch(fx.req("run1", false, true, false, false))
         .await
         .expect("launch");
     let code = tokio::time::timeout(WAIT, &mut session.exit)
@@ -409,26 +447,26 @@ async fn cri6_3761_rejections_use_fixed_codes() {
     let (launcher, pids) = fx.launcher(false, script);
 
     let e = launcher
-        .launch(req("run1", false, true, false, true))
+        .launch(fx.req("run1", false, true, false, true))
         .await
         .expect_err("tty");
     assert_eq!(e.code(), CriErrorCode::InvalidArgument);
     assert_eq!(e.message(), "exec with tty is not supported");
 
-    let mut relative = req("run1", false, true, false, false);
+    let mut relative = fx.req("run1", false, true, false, false);
     relative.cmd = vec!["true".to_string()];
     let e = launcher.launch(relative).await.expect_err("relative");
     assert_eq!(e.code(), CriErrorCode::InvalidArgument);
     assert_eq!(e.message(), "exec request was rejected");
 
     let e = launcher
-        .launch(req("nope", false, true, false, false))
+        .launch(fx.req("nope", false, true, false, false))
         .await
         .expect_err("missing");
     assert_eq!(e.code(), CriErrorCode::NotFound);
 
     let e = launcher
-        .launch(req("created1", false, true, false, false))
+        .launch(fx.req("created1", false, true, false, false))
         .await
         .expect_err("not running");
     assert_eq!(e.code(), CriErrorCode::FailedPrecondition);
@@ -485,7 +523,7 @@ async fn cri6_3761_resize_is_forwarded_to_the_pty_master() {
     });
     let (launcher, _pids) = fx.launcher(true, script);
     let mut session = launcher
-        .launch(req("run1", true, true, false, true))
+        .launch(fx.req("run1", true, true, false, true))
         .await
         .expect("launch");
     assert!(session.stdin.is_some());
@@ -521,7 +559,7 @@ async fn cri6_3761_non_pty_master_fails_the_launch() {
     });
     let (launcher, pids) = fx.launcher(true, script);
     let e = launcher
-        .launch(req("run1", false, true, false, true))
+        .launch(fx.req("run1", false, true, false, true))
         .await
         .expect_err("must fail");
     assert_eq!(e.code(), CriErrorCode::Internal);
@@ -544,7 +582,7 @@ async fn cri6_3761_launch_after_shutdown_is_rejected() {
     let (launcher, pids) = fx.launcher(false, script);
     launcher.shutdown_all();
     let Err(e) = launcher
-        .launch(req("run1", false, true, false, false))
+        .launch(fx.req("run1", false, true, false, false))
         .await
     else {
         panic!("launch after shutdown must be rejected");
@@ -652,7 +690,7 @@ async fn repair5_4171_flood_is_bounded_and_counted() {
     let (launcher, _pids) = fx.launcher_with_diag(false, quick_script(), Some(diag));
     let launcher = launcher.with_diagnostic_sink(sink.clone());
     let mut session = launcher
-        .launch(req("run1", false, true, false, false))
+        .launch(fx.req("run1", false, true, false, false))
         .await
         .expect("launch");
     done_rx
@@ -696,7 +734,7 @@ async fn cri6_4171_stage_and_errno_line_is_logged_once() {
     let (launcher, _pids) = fx.launcher_with_diag(false, quick_script(), Some(diag));
     let launcher = launcher.with_diagnostic_sink(sink.clone());
     let mut session = launcher
-        .launch(req("run1", false, true, false, false))
+        .launch(fx.req("run1", false, true, false, false))
         .await
         .expect("launch");
     let _ = tokio::time::timeout(WAIT, &mut session.exit).await;
@@ -724,7 +762,7 @@ async fn sec1_4171_argv_container_id_and_token_are_not_logged() {
     });
     let (launcher, _pids) = fx.launcher_with_diag(false, quick_script(), Some(diag));
     let launcher = launcher.with_diagnostic_sink(sink.clone());
-    let mut launch = req("run1", false, true, false, false);
+    let mut launch = fx.req("run1", false, true, false, false);
     launch.cmd = vec!["/bin/argv-marker-4171".to_string()];
     let mut session = launcher.launch(launch).await.expect("launch");
     let _ = tokio::time::timeout(WAIT, &mut session.exit).await;
@@ -767,7 +805,7 @@ async fn repair5_4171_shutdown_all_is_bounded_when_stderr_is_held() {
     let (launcher, pids) = fx.launcher_with_diag(false, hold, Some(diag));
     let launcher = launcher.with_diagnostic_sink(sink.clone());
     let _session = launcher
-        .launch(req("run1", false, true, false, false))
+        .launch(fx.req("run1", false, true, false, false))
         .await
         .expect("launch");
     let t0 = Instant::now();
@@ -790,4 +828,111 @@ async fn repair5_4171_shutdown_all_is_bounded_when_stderr_is_held() {
     for pid in pids.lock().expect("lock").iter() {
         assert!(gone(*pid), "helper {pid}");
     }
+}
+
+/// 識別子を報告しない（instance を外した record を返す）状態ストア。旧い記録・識別子を報告しない実装の模擬。
+struct NoInstanceStore(Arc<FileStateStore>);
+
+impl StateStore for NoInstanceStore {
+    fn create(&self, req: &CreateStateRequest) -> Result<StateRecord, TraitError> {
+        self.0.create(req)
+    }
+    fn update(&self, req: &UpdateStateRequest) -> Result<StateRecord, TraitError> {
+        self.0.update(req)
+    }
+    fn get(&self, req: &GetStateRequest) -> Result<StateRecord, TraitError> {
+        let r = self.0.get(req)?;
+        StateRecord::new(r.status().clone(), r.bundle().to_path_buf(), r.revision())
+    }
+    fn list(&self, req: &ListStateRequest) -> Result<StateList, TraitError> {
+        self.0.list(req)
+    }
+    fn delete(&self, req: &DeleteStateRequest) -> Result<DeleteStateResponse, TraitError> {
+        self.0.delete(req)
+    }
+}
+
+fn hold_script() -> Script {
+    Arc::new(|end, mask| {
+        let _ = recv_stdio_handover(&end, mask, deadline()).expect("handover");
+        send_started(&end, &cg_name(), deadline()).expect("started");
+        std::thread::sleep(Duration::from_secs(30));
+    })
+}
+
+/// CRI-5・SEC-1・CORE-1（#4286）: 発行時と同じインスタンスなら起動する。
+#[tokio::test]
+async fn cri5_4286_matching_instance_launches() {
+    let fx = Fixture::new("inst-match");
+    let (launcher, pids) = fx.launcher(false, hold_script());
+    let launch = fx.req("run1", false, true, false, false);
+    assert!(launch.instance.is_some(), "store reports an instance");
+    let _session = launcher.launch(launch).await.expect("launch");
+    assert_eq!(pids.lock().expect("lock").len(), 1);
+}
+
+/// SEC-1・CORE-1（#4286）: 発行後に外で削除・再作成されたコンテナへは、helper を起動せず拒否する。
+#[tokio::test]
+async fn sec1_4286_recreated_container_is_rejected_without_helper() {
+    let fx = Fixture::new("inst-recreate");
+    let (launcher, pids) = fx.launcher(false, hold_script());
+    let issued = fx.req("run1", false, true, false, false);
+    fx.recreate_running("run1");
+    let e = launcher.launch(issued).await.expect_err("recreated");
+    assert_eq!(e.code(), CriErrorCode::FailedPrecondition);
+    assert_eq!(e.message(), MSG_EXEC_INSTANCE_CHANGED);
+    assert!(pids.lock().expect("lock").is_empty(), "no helper started");
+    assert_eq!(launcher.active_sessions(), 0);
+    // 新しいインスタンスを控え直した要求は起動する。
+    let _session = launcher
+        .launch(fx.req("run1", false, true, false, false))
+        .await
+        .expect("relaunch");
+    assert_eq!(pids.lock().expect("lock").len(), 1);
+}
+
+/// SEC-1（#4286）: 発行時に識別子があり、起動時の記録に無い（片側だけ None）なら拒否する。
+#[tokio::test]
+async fn sec1_4286_one_sided_none_is_rejected() {
+    let fx = Fixture::new("inst-onesided");
+    let issued = fx.req("run1", false, true, false, false);
+    assert!(issued.instance.is_some());
+    let pids = Arc::new(Mutex::new(Vec::new()));
+    let spawner = FakeSpawner {
+        tty: false,
+        script: hold_script(),
+        diag: None,
+        pids: Arc::clone(&pids),
+    };
+    let launcher = SupervisorExecLauncher::new(
+        fx.dir.0.join("state"),
+        Arc::new(NoInstanceStore(Arc::clone(&fx.store))) as Arc<dyn StateStore>,
+        Arc::new(spawner),
+    );
+    let e = launcher.launch(issued).await.expect_err("one-sided");
+    assert_eq!(e.code(), CriErrorCode::FailedPrecondition);
+    assert_eq!(e.message(), MSG_EXEC_INSTANCE_CHANGED);
+    assert!(pids.lock().expect("lock").is_empty());
+}
+
+/// 残余の固定（#4286）: 識別子を報告しない実装・旧い記録（両側 None）は判定できないので起動する（保護されない）。
+#[tokio::test]
+async fn cri5_4286_unreported_instance_on_both_sides_is_not_protected() {
+    let fx = Fixture::new("inst-none");
+    let mut issued = fx.req("run1", false, true, false, false);
+    issued.instance = None;
+    let pids = Arc::new(Mutex::new(Vec::new()));
+    let spawner = FakeSpawner {
+        tty: false,
+        script: hold_script(),
+        diag: None,
+        pids: Arc::clone(&pids),
+    };
+    let launcher = SupervisorExecLauncher::new(
+        fx.dir.0.join("state"),
+        Arc::new(NoInstanceStore(Arc::clone(&fx.store))) as Arc<dyn StateStore>,
+        Arc::new(spawner),
+    );
+    let _session = launcher.launch(issued).await.expect("launch");
+    assert_eq!(pids.lock().expect("lock").len(), 1);
 }

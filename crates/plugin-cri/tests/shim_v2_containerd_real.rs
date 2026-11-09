@@ -66,6 +66,10 @@ mod reap;
 #[cfg(target_os = "linux")]
 #[path = "../../oci/tests/support/test_root.rs"]
 mod test_root;
+// 実行ごとに一意な ID・namespace と旧形式の残骸のおとり（#4285）。
+#[cfg(target_os = "linux")]
+#[path = "support/shim_real_unique.rs"]
+mod shim_unique;
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -76,7 +80,7 @@ mod linux {
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
-    use super::{minimal_rootfs, reap, test_root};
+    use super::{minimal_rootfs, reap, shim_unique, test_root};
 
     /// 全体の期限（REPAIR-5）。超えたら子を回収して `WATCHDOG EXPIRED` と終了コード 124 で終わる。
     const WATCHDOG: Duration = Duration::from_secs(300);
@@ -456,8 +460,8 @@ mod linux {
         install_exe(&sup_src, &bin.join(SUPERVISOR_NAME))?;
         let wrapper = install_proc_wrapper(&bin, &shim)?;
         let spec = write_spec(&dir)?;
-        let id = format!("shimreal{}", std::process::id());
-        let id_b = format!("shimrealb{}", std::process::id());
+        let id = format!("shimreal{}", shim_unique::run_tag());
+        let id_b = format!("shimrealb{}", shim_unique::run_tag());
         let cfg_path = dir.join("config.toml");
         std::fs::write(&cfg_path, containerd_config(&dir, uid, gid))
             .map_err(|e| format!("config: {e}"))?;

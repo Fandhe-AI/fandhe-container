@@ -224,6 +224,8 @@ shim の serve の起動時に、scoped 状態ルートを `sweep_leftover_conta
 
 ## Exec の橋渡し（#4147・CRI-5・CRI-1・PLUG-1・SEC-1・REPAIR-3・REPAIR-5・TASK-62.7）
 
+補足（#4286）: T5（#4220）のインスタンス照合の規則は `adapter::instance_matches` にまとめた（挙動は不変）。RuntimeService 側の Exec（ストリーミング）も同じ規則で、URL 発行時に記録した値を起動時に照合する（`cri-streaming-server.md`「Exec」）。
+
 shim v2 の `Exec`・`Start(exec_id)`・`exec_id` つきの `State` / `Kill` / `Wait` / `Delete` は、注入トレイト `TaskExecLauncher` / `TaskExecProcess`（`crates/cri/src/shim_v2/exec.rs`）と登録簿 `ExecRegistry` まで実装済みで、本番の起動役は #4148（本体）・#4149（配線）で入った。本節は本番の起動役の橋渡し方式を、後続の #4148（本体）・#4149（配線）・#4150（実機前提試験）が正として読めるよう記録する。本メモは main の設計判断の記録であり、オーナー承認は得ていない（1 時間の上限は #4116 の暫定値に従う）。
 
 ### 前提（事実）

@@ -107,6 +107,16 @@ pub struct RuntimeContainerStatus {
     pub instance: Option<u64>,
 }
 
+/// コンテナのインスタンス識別子の照合規則（shim v2 の exec 登録簿と RuntimeService の Exec の起動で共有する。
+/// #4220・#4286・CRI-5・SEC-1・CORE-1）。
+///
+/// `expected` は登録・URL 発行時に実行層が報告した値、`current` は照合時点で同じ実行層から読んだ値。
+/// `None` 同士は判定できないので通す（識別子を報告しない実装・記録の無い旧い状態は保護されない）。
+/// 値が違うもの・片側だけ `None` のものは不一致（fail-closed）。値の大小に意味は持たせず等値だけを見る。
+pub fn instance_matches(expected: Option<u64>, current: Option<u64>) -> bool {
+    expected == current
+}
+
 impl From<&ContainerStatus> for RuntimeContainerStatus {
     fn from(s: &ContainerStatus) -> Self {
         let (state, lifecycle) = match s.state() {
@@ -732,6 +742,16 @@ mod tests {
         assert_eq!(RuntimeContainerStatus::from(&st).instance, None);
         let st = st.with_instance(ContainerInstance::from_raw(9));
         assert_eq!(RuntimeContainerStatus::from(&st).instance, Some(9));
+    }
+
+    /// CRI-5・SEC-1・CORE-1（#4286）: 照合規則は等値で、None 同士だけ通り、片側だけ None は不一致。
+    #[test]
+    fn cri5_4286_instance_matches_rule() {
+        assert!(instance_matches(None, None));
+        assert!(instance_matches(Some(1), Some(1)));
+        assert!(!instance_matches(Some(1), Some(2)));
+        assert!(!instance_matches(Some(1), None));
+        assert!(!instance_matches(None, Some(1)));
     }
 
     /// CRI-2: core の状態を CRI の状態へ具体値で写す。

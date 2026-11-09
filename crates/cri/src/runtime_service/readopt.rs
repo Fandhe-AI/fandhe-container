@@ -77,13 +77,13 @@ use std::time::{Duration, Instant};
 
 use tonic::Code;
 
-use super::container::{ContainerRecord, ContainerState};
+use super::container::{ContainerRecord, ContainerState, ExitReport, apply_exit};
 use super::record::{ContainerRecordData, SandboxRecordData};
 use super::{
     CriRuntimeService, InFlightKind, ListBudget, ListLimits, ListedRecord, RecordId, RecordKind,
     RecordReadFailure, SandboxRecord, SandboxState, call_with_deadline, identity_retained_extra,
 };
-use crate::adapter::{RuntimeAdapter, RuntimeLifecycle};
+use crate::adapter::{RuntimeAdapter, RuntimeContainerStatus, RuntimeLifecycle};
 use crate::error::{CriError, CriErrorCode};
 use crate::instrument::{CriOpKind, CriOpSample};
 
@@ -203,11 +203,12 @@ impl ContainerReadoption {
 ///
 /// 写し方は [`probe_core_presence`] の 1 か所に集め、コンテナ記録の再採用（R7）・`stale_create` の解放・孤児 bundle の
 /// 回収（plugin-cri。R8）が共有する。消してよいのは [`Self::Absent`] のときだけ（fail-closed）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CorePresence {
-    /// 状態を返した。
-    Present(RuntimeLifecycle),
+    /// 状態を返した。core の応答全体を運ぶ。R7 は Stopped の終了コード・理由・時刻も使い（E3 #4278・CRI-1・
+    /// CRI-2）、R8 は `lifecycle` だけを見る。
+    Present(RuntimeContainerStatus),
     /// `NOT_FOUND` だけ。
     Absent,
     /// それ以外の失敗（`INTERNAL`・ID 不一致・`DEADLINE_EXCEEDED`・`UNAVAILABLE`・`PERMISSION_DENIED`・
@@ -222,7 +223,7 @@ pub fn probe_core_presence(adapter: &RuntimeAdapter, id: &str, timeout: Duration
     let adapter = adapter.clone();
     let id = id.to_owned();
     match call_with_deadline(timeout, move || adapter.state(&id)) {
-        Some(Ok(status)) => CorePresence::Present(status.lifecycle),
+        Some(Ok(status)) => CorePresence::Present(status),
         Some(Err(e)) if e.code() == CriErrorCode::NotFound => CorePresence::Absent,
         _ => CorePresence::Undetermined,
     }
@@ -278,6 +279,8 @@ enum Outcome {
         state: ContainerState,
         runtime_owned: bool,
         bucket: Bucket,
+        /// core が Stopped と答えたときの終了の値（E3 #4278）。記録が Exited かの判定は呼び出し側。
+        exit: Option<ExitReport>,
     },
 }
 
@@ -297,6 +300,7 @@ fn reconcile(in_flight: Option<InFlightKind>, probe: CorePresence) -> Outcome {
         state,
         runtime_owned,
         bucket,
+        exit: None,
     };
     match (in_flight, probe) {
         (_, CorePresence::Undetermined) => {
@@ -309,7 +313,17 @@ fn reconcile(in_flight: Option<InFlightKind>, probe: CorePresence) -> Outcome {
         (Some(Remove), CorePresence::Absent) => {
             register(ContainerState::Unknown, true, Bucket::RemovePending)
         }
-        (_, CorePresence::Present(l)) => register(state_of_lifecycle(l), true, Bucket::Present),
+        (_, CorePresence::Present(status)) => Outcome::Register {
+            state: state_of_lifecycle(status.lifecycle),
+            runtime_owned: true,
+            bucket: Bucket::Present,
+            // Stopped のときだけ core の終了コード・理由・時刻を運ぶ（E3 #4278・CRI-1・CRI-2）。
+            exit: (status.lifecycle == RuntimeLifecycle::Stopped).then_some(ExitReport {
+                code: status.exit_code,
+                termination: status.termination,
+                exited_at_nanos: status.exited_at_nanos,
+            }),
+        },
         (_, CorePresence::Absent) => register(ContainerState::Exited, false, Bucket::AbsentExited),
     }
 }
@@ -557,7 +571,7 @@ impl CriRuntimeService {
                 self.record_load(e.code().grpc_code(), start);
                 return Err(e);
             }
-            let (state, runtime_owned, bucket) = match reconcile(data.in_flight, probe) {
+            let (state, runtime_owned, bucket, exit) = match reconcile(data.in_flight, probe) {
                 Outcome::StaleCreate => {
                     result.stale_create += 1;
                     result.stale_create_ids.push(id.as_str().to_owned());
@@ -568,7 +582,8 @@ impl CriRuntimeService {
                     state,
                     runtime_owned,
                     bucket,
-                } => (state, runtime_owned, bucket),
+                    exit,
+                } => (state, runtime_owned, bucket, exit),
             };
             if !keys.insert(key) {
                 result.broken.duplicate_metadata += 1;
@@ -603,28 +618,34 @@ impl CriRuntimeService {
                 Bucket::RemovePending => result.remove_pending += 1,
                 Bucket::Undetermined => result.undetermined += 1,
             }
-            accepted.push((
-                id.as_str().to_owned(),
-                ContainerRecord {
-                    pod_sandbox_id: data.pod_sandbox_id,
-                    config: data.config,
-                    state,
-                    created_at_nanos: data.created_at_nanos,
-                    started_at_nanos: data.started_at_nanos,
-                    finished_at_nanos: data.finished_at_nanos,
-                    exit_code: data.exit_code,
-                    termination: data.termination,
-                    retained_bytes,
-                    resolved_log_path: data.resolved_log_path,
-                    in_flight: false,
-                    runtime_owned,
-                    stop_signal: data.stop_signal,
-                    applied_user: data.applied_user,
-                    resolved_image: data.resolved_image,
-                    exit_observe_pending: false,
-                    exit_observed_at: None,
-                },
-            ));
+            let recorded_state = data.state;
+            let mut record = ContainerRecord {
+                pod_sandbox_id: data.pod_sandbox_id,
+                config: data.config,
+                state,
+                created_at_nanos: data.created_at_nanos,
+                started_at_nanos: data.started_at_nanos,
+                finished_at_nanos: data.finished_at_nanos,
+                exit_code: data.exit_code,
+                termination: data.termination,
+                retained_bytes,
+                resolved_log_path: data.resolved_log_path,
+                in_flight: false,
+                runtime_owned,
+                stop_signal: data.stop_signal,
+                applied_user: data.applied_user,
+                resolved_image: data.resolved_image,
+                exit_observe_pending: false,
+                exit_observed_at: None,
+            };
+            // 記録が Exited でなく core が Stopped なら core の終了の値を使う（E3 #4278）。
+            // 記録が Exited なら記録の値のまま。
+            if let Some(exit) = exit
+                && recorded_state != ContainerState::Exited
+            {
+                apply_exit(&mut record, &exit, super::now_nanos().unwrap_or(0));
+            }
+            accepted.push((id.as_str().to_owned(), record));
             self.record_load(Code::Ok, one);
         }
 
@@ -1139,10 +1160,12 @@ mod tests {
 
     use super::super::InFlightKind;
     use super::super::container::ContainerState;
+    use super::super::container::ExitReport;
     use super::super::record::ContainerRecordData;
     use super::{Bucket, CorePresence, Outcome, reconcile, state_of_lifecycle};
     use crate::adapter::{
-        BundleProvider, BundleRequest, PreparedBundle, RuntimeAdapter, RuntimeLifecycle,
+        BundleProvider, BundleRequest, PreparedBundle, RuntimeAdapter, RuntimeContainerStatus,
+        RuntimeLifecycle,
     };
     use crate::bundle::{AppliedUser, ResolvedImage};
     use crate::runtime::v1::{
@@ -1151,8 +1174,8 @@ mod tests {
     };
     use fandhe_container_core::traits::{
         ContainerId, ContainerLogPath, ContainerRuntime, ContainerStatus, CreateRequest,
-        DeleteRequest, DeleteResponse, ErrorCode, KillRequest, StartRequest, StateRequest,
-        StopRequest, TraitError,
+        DeleteRequest, DeleteResponse, ErrorCode, ExitTime, KillRequest, StartRequest,
+        StateRequest, StopRequest, TerminationReason, TraitError,
     };
     use fandhe_container_oci::reference::Digest;
     use std::collections::HashMap;
@@ -1199,11 +1222,16 @@ mod tests {
         }
     }
 
+    /// `Core::Stopped` が報告する終了時刻（記録の時刻 1_700_000_000_000_000_00x より後）。
+    const STOPPED_AT: i64 = 1_800_000_000_000_000_000;
+
     #[derive(Clone, Copy)]
     enum Core {
         Created,
         Running,
         Stopped,
+        /// 終了コード・理由（OOM か）・終了時刻（UNIX ナノ秒）を報告する Stopped（E3 #4278）。
+        StoppedAt(i32, bool, i64),
         Creating,
         Fail(ErrorCode),
         WrongId,
@@ -1276,7 +1304,24 @@ mod tests {
                 None => Err(TraitError::new(ErrorCode::NotFound, "gone")),
                 Some(Core::Created) => Ok(ContainerStatus::created(cid, None)),
                 Some(Core::Running) => Ok(ContainerStatus::running(cid, None)),
-                Some(Core::Stopped) => Ok(ContainerStatus::stopped(cid, Some(9))),
+                Some(Core::Stopped) => Ok(ContainerStatus::stopped_at(
+                    cid,
+                    Some(9),
+                    ExitTime::from_unix_nanos(STOPPED_AT),
+                )),
+                Some(Core::StoppedAt(code, oom, at)) => {
+                    let at = ExitTime::from_unix_nanos(at);
+                    if oom {
+                        Ok(ContainerStatus::stopped_with_reason_at(
+                            cid,
+                            Some(code),
+                            TerminationReason::OomKilled,
+                            at,
+                        ))
+                    } else {
+                        Ok(ContainerStatus::stopped_at(cid, Some(code), at))
+                    }
+                }
                 Some(Core::Creating) => Ok(ContainerStatus::creating(cid)),
                 Some(Core::Fail(c)) => Err(TraitError::new(c, "failed")),
                 Some(Core::WrongId) => Ok(ContainerStatus::running(
@@ -1434,15 +1479,27 @@ mod tests {
     #[test]
     fn cri1_oci7_reconcile_table_all_cells() {
         use ContainerState::{Created, Exited, Running, Unknown};
-        let present = CorePresence::Present(RuntimeLifecycle::Running);
+        let status = |lifecycle| {
+            let cid = ContainerId::new("a".repeat(64)).unwrap();
+            let s = match lifecycle {
+                RuntimeLifecycle::Stopped => {
+                    ContainerStatus::stopped_at(cid, Some(7), ExitTime::from_unix_nanos(STOPPED_AT))
+                }
+                _ => ContainerStatus::running(cid, None),
+            };
+            CorePresence::Present(RuntimeContainerStatus::from(&s))
+        };
+        let present = status(RuntimeLifecycle::Running);
+        let stopped = status(RuntimeLifecycle::Stopped);
         let reg = |state, runtime_owned, bucket| Outcome::Register {
             state,
             runtime_owned,
             bucket,
+            exit: None,
         };
         let cases = [
             // 確定（in_flight なし）
-            (None, present, reg(Running, true, Bucket::Present)),
+            (None, present.clone(), reg(Running, true, Bucket::Present)),
             (
                 None,
                 CorePresence::Absent,
@@ -1456,7 +1513,7 @@ mod tests {
             // in_flight=create
             (
                 Some(InFlightKind::Create),
-                present,
+                present.clone(),
                 reg(Unknown, true, Bucket::Present),
             ),
             (
@@ -1472,7 +1529,7 @@ mod tests {
             // in_flight=start
             (
                 Some(InFlightKind::Start),
-                present,
+                present.clone(),
                 reg(Running, true, Bucket::Present),
             ),
             (
@@ -1488,7 +1545,7 @@ mod tests {
             // in_flight=stop
             (
                 Some(InFlightKind::Stop),
-                present,
+                present.clone(),
                 reg(Running, true, Bucket::Present),
             ),
             (
@@ -1504,7 +1561,7 @@ mod tests {
             // in_flight=remove
             (
                 Some(InFlightKind::Remove),
-                present,
+                present.clone(),
                 reg(Unknown, true, Bucket::Present),
             ),
             (
@@ -1518,9 +1575,36 @@ mod tests {
                 reg(Unknown, true, Bucket::Undetermined),
             ),
         ];
+        // E3 #4278: Stopped の Present は終了の値を運ぶ。start / stop / 確定で同じ。
+        let exit = Some(ExitReport {
+            code: Some(7),
+            termination: None,
+            exited_at_nanos: Some(STOPPED_AT),
+        });
+        let stopped_reg = Outcome::Register {
+            state: Exited,
+            runtime_owned: true,
+            bucket: Bucket::Present,
+            exit,
+        };
+        for in_flight in [None, Some(InFlightKind::Start), Some(InFlightKind::Stop)] {
+            assert_eq!(
+                reconcile(in_flight, stopped.clone()),
+                stopped_reg,
+                "{in_flight:?} x Stopped"
+            );
+        }
+        // create / remove の最中は Present でも unknown のまま（終了の値は使わない）。
+        for in_flight in [InFlightKind::Create, InFlightKind::Remove] {
+            assert_eq!(
+                reconcile(Some(in_flight), stopped.clone()),
+                reg(Unknown, true, Bucket::Present),
+                "{in_flight:?} x Stopped"
+            );
+        }
         for (in_flight, probe, want) in cases {
             assert_eq!(
-                reconcile(in_flight, probe),
+                reconcile(in_flight, probe.clone()),
                 want,
                 "{in_flight:?} x {probe:?}"
             );
@@ -1590,13 +1674,21 @@ mod tests {
                 (id('7'), ContainerState::Unknown, true, false),
             ]
         );
-        // 記録の値は保持される（終了コードは記録の値。core の 9 では上書きしない）。
+        // 記録 '3'（Absent）は記録の終了の値のまま（Absent の規則は変えない）。
+        {
+            let reg = e.svc.registry.lock().unwrap();
+            let c3 = reg.containers.get(&id('3')).unwrap();
+            assert_eq!(c3.exit_code, Some(7));
+            assert_eq!(c3.finished_at_nanos, 1_700_000_000_000_000_003);
+        }
+        // 記録 '2' は Running で core が Stopped（9・STOPPED_AT）なので core の終了の値を使う（E3 #4278）。
+        // それ以外の欄は記録の値のまま。
         {
             let reg = e.svc.registry.lock().unwrap();
             let c2 = reg.containers.get(&id('2')).unwrap();
-            assert_eq!(c2.exit_code, Some(7));
+            assert_eq!(c2.exit_code, Some(9));
             assert_eq!(c2.started_at_nanos, 1_700_000_000_000_000_002);
-            assert_eq!(c2.finished_at_nanos, 1_700_000_000_000_000_003);
+            assert_eq!(c2.finished_at_nanos, STOPPED_AT);
             assert_eq!(c2.stop_signal, Signal::Sigint as i32);
             assert_eq!(c2.resolved_log_path.as_ref().map(|p| p.as_str()), Some(LOG));
             assert_eq!(c2.applied_user.as_ref().map(|u| u.uid()), Some(1000));
@@ -1631,6 +1723,61 @@ mod tests {
         let codes = load_codes(&e.rec);
         // sandbox 1 件 + コンテナ 7 件（stale_create を含む）はすべて成功。
         assert_eq!(codes, vec![Code::Ok; 8]);
+    }
+
+    /// 1 件の記録と core の応答で再採用し、再採用後の記録の `to_status` を返す。
+    fn readopt_one_status(
+        rec: ContainerRecordData,
+        core: Core,
+    ) -> crate::runtime::v1::ContainerStatus {
+        let cid = rec.id.clone();
+        let e = env(vec![cok(&rec)], &[(cid.clone(), core)]);
+        let r = readopt_all(&e).unwrap();
+        assert_eq!((r.adopted, r.present), (1, 1));
+        e.svc.registry.lock().unwrap().containers[&cid].to_status(&cid)
+    }
+
+    /// CRI-1・CRI-2（E3 #4278）: 記録が Running で core が Stopped なら、core の終了コード・理由・時刻を使う。
+    #[test]
+    fn cri1_cri2_readopt_running_record_takes_core_stopped_exit() {
+        use crate::runtime::v1::ContainerState as V1;
+        let mut rec = cdata('1', "c", None, ContainerState::Running);
+        rec.exit_code = None;
+        rec.finished_at_nanos = 0;
+        let st = readopt_one_status(rec.clone(), Core::StoppedAt(7, false, STOPPED_AT));
+        assert_eq!(st.state, V1::ContainerExited as i32);
+        assert_eq!(st.exit_code, 7);
+        assert_eq!(st.finished_at, STOPPED_AT);
+        assert_eq!(st.reason, "Error");
+        // OOM の場面。
+        let st = readopt_one_status(rec, Core::StoppedAt(137, true, STOPPED_AT));
+        assert_eq!(st.exit_code, 137);
+        assert_eq!(st.finished_at, STOPPED_AT);
+        assert_eq!(st.reason, "OOMKilled");
+    }
+
+    /// CRI-1・CRI-2（E3 #4278）: core が終了時刻を報告しないときは再採用の時刻（開始時刻以上で正の値）を使う。
+    #[test]
+    fn cri1_cri2_readopt_running_record_without_core_time_uses_now() {
+        let mut rec = cdata('1', "c", None, ContainerState::Running);
+        rec.exit_code = None;
+        rec.finished_at_nanos = 0;
+        let started = rec.started_at_nanos;
+        let st = readopt_one_status(rec, Core::StoppedAt(3, false, 0));
+        assert_eq!(st.exit_code, 3);
+        assert!(st.finished_at >= started, "finished_at={}", st.finished_at);
+    }
+
+    /// CRI-1・CRI-2（E3 #4278）: 記録がすでに Exited なら、core が Stopped でも記録の値のまま。
+    #[test]
+    fn cri1_cri2_readopt_exited_record_keeps_record_exit() {
+        use crate::runtime::v1::ContainerState as V1;
+        let rec = cdata('1', "c", None, ContainerState::Exited);
+        let st = readopt_one_status(rec, Core::StoppedAt(9, true, STOPPED_AT));
+        assert_eq!(st.state, V1::ContainerExited as i32);
+        assert_eq!(st.exit_code, 7);
+        assert_eq!(st.finished_at, 1_700_000_000_000_000_003);
+        assert_eq!(st.reason, "Error");
     }
 
     /// CRI-1・REPAIR-5: 確定できない応答（各種エラー・ID 不一致・期限切れ）は unknown で保持し、何も消さない。
@@ -2102,6 +2249,25 @@ mod tests {
             .lock()
             .unwrap()
             .insert(id('5'), Core::Fail(ErrorCode::Internal));
+        let out = e
+            .svc
+            .release_stale_creates(&r, ListBudget::default())
+            .unwrap();
+        assert_eq!((out.released, out.kept), (0, 2));
+        assert_eq!(*e.bundles.0.lock().unwrap(), 0);
+        assert!(e.store.removed.lock().unwrap().is_empty());
+    }
+
+    /// OCI-7・CRI-1（E3 #4278）: 再照会が終了の値つきの Stopped でも、R8 は lifecycle だけを見て解放しない。
+    #[test]
+    fn oci7_stale_create_reprobe_stopped_is_kept() {
+        let (e, r) = stale_env(&[]);
+        e.core
+            .states
+            .lock()
+            .unwrap()
+            .insert(id('4'), Core::StoppedAt(7, false, STOPPED_AT));
+        e.core.states.lock().unwrap().insert(id('5'), Core::Stopped);
         let out = e
             .svc
             .release_stale_creates(&r, ListBudget::default())

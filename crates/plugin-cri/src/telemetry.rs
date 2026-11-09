@@ -20,14 +20,14 @@
 //! [`OpStatsFileSink`] は 1 周期分の操作統計（記録器ごとのブロックを共有 → oci の順に連結。版のヘッダ行は付けない）を
 //! 専用 thread が `SnapshotTarget::replace` で原子的に置き換える。送り手はブロックせず、仕事中の周期は飛ばして数える。
 //! 失敗・飛ばしは `op_stats_file_failed` / `op_stats_file_skipped` の固定語彙の行で残す（パス・errno・コンテナ ID を含めない）。
+//! 設計の出典は `docs/design/cri-op-stats-export.md` の案 C（2026-11-09 承認・#4295）。`main.rs` へは `--op-stats-file`（#4340）で結線済みで、
+//! 指定時だけ開き、停止時は期限つきで最後の 1 回を書く。
 //!
 //! 操作統計は記録器ごとのブロックで出す。本番は共有記録器と oci 専用記録器の 2 つで、1 周期に `op_stats_meta` 行が 2 行出る（共有・oci の順。#2900）。
 //!
 //! # 未実装（REPAIR-3）
-//! - 操作統計の stderr 以外の公開口は `docs/design/cri-op-stats-export.md`（#4228・CRI-6・REPAIR-4）の案 C（原子的に置き換える
-//!   スナップショットファイルを opt-in で出す）。sink（[`OpStatsFileSink`]・[`op_stats_export_loop_with`]）は実装済み（#4337）で、
-//!   `main.rs` へ `--op-stats-file` として結線済み（#4340。指定時のみ開き、停止時に期限つきで最後の 1 回を書く）。
-//!   設計書の状態の更新は W5（#4341）
+//! - Prometheus / OpenMetrics 形式の公開口は未対応（形式は stderr と同じ JSON Lines のまま）。監視基盤の要件が出たら再評価する
+//!   （`docs/design/cri-op-stats-export.md` 7 章。CRI-6・REPAIR-4）
 //! - 監査の永続化経路は Linux 限定（`ControlAuditRelay` が Linux 限定、非 Linux の `FileAuditSink` は #2430 の
 //!   判断待ち）。非 Linux では `PeerAuditForwarder` を渡さず、拒否は stderr にだけ残る
 

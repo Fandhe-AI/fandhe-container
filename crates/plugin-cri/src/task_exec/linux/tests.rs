@@ -1436,3 +1436,110 @@ fn cri5_4323_unreported_instance_on_both_sides_is_not_protected() {
         .expect("launch");
     assert_eq!(pids.lock().expect("lock").len(), 1);
 }
+/// 起動役の記録器から操作名の (success, failure) を読む。未記録は `None`（#4379）。
+fn counts(l: &ShimExecLauncher, name: &str) -> Option<(u64, u64)> {
+    l.recorder()
+        .snapshot_op(&fandhe_container_core::observability::OpName::new(name).expect("name"))
+        .map(|s| (s.success(), s.failure()))
+}
+
+/// REPAIR-4・CRI-5・#4379: `Spawned` が予算内に届かない回は 1 回につきちょうど 1 数える。launch は成功し pid は不明のまま。
+#[test]
+fn repair4_4379_spawned_budget_expiry_counts_once() {
+    let fx = Fixture::new("t4379-expiry");
+    let budgets = ExecBudgets {
+        spawned: Duration::from_millis(100),
+        ..ExecBudgets::default()
+    };
+    let (l, _) = fx.launcher(holding(), probe(0), budgets);
+    let p = l
+        .launch(&cid("run1"), &eid(), &ok_spec(), fx.instance("run1"))
+        .expect("launch");
+    assert_eq!(p.pid(), None);
+    assert_eq!(counts(&l, "shim_exec_pid_unreported"), Some((0, 1)));
+    l.launch(&cid("run1"), &eid(), &ok_spec(), fx.instance("run1"))
+        .expect("second launch");
+    assert_eq!(counts(&l, "shim_exec_pid_unreported"), Some((0, 2)));
+    assert_eq!(counts(&l, "shim_exec_instance_changed"), None);
+}
+
+/// #4379: 予算内に `Spawned` が届いた回は数えない。
+#[test]
+fn repair4_4379_spawned_in_time_is_not_counted() {
+    let fx = Fixture::new("t4379-intime");
+    let (l, _) = fx.launcher(
+        spawning(Duration::from_millis(50), 1, None),
+        probe(0),
+        ExecBudgets::default(),
+    );
+    let p = l
+        .launch(&cid("run1"), &eid(), &ok_spec(), fx.instance("run1"))
+        .expect("launch");
+    assert_eq!(p.pid(), NonZeroU32::new(4242));
+    assert_eq!(counts(&l, "shim_exec_pid_unreported"), None);
+}
+
+/// #4379: `Spawned` 無しで `Result` が来て終わる回（予算の不足ではない）は数えない。
+#[test]
+fn repair4_4379_result_without_spawned_is_not_counted() {
+    let fx = Fixture::new("t4379-nospawn");
+    let budgets = ExecBudgets {
+        spawned: Duration::from_secs(5),
+        ..ExecBudgets::default()
+    };
+    let (l, _) = fx.launcher(
+        spawning(Duration::ZERO, 0, Some(StreamExecOutcome::Exited(0))),
+        probe(0),
+        budgets,
+    );
+    let p = l
+        .launch(&cid("run1"), &eid(), &ok_spec(), fx.instance("run1"))
+        .expect("launch");
+    assert_eq!(p.pid(), None);
+    assert_eq!(counts(&l, "shim_exec_pid_unreported"), None);
+}
+
+/// SEC-1・CRI-5・#4379: インスタンス不一致の拒否は 1 回につき 1 数え、helper を起動しない。pid 未着は数えない。
+#[test]
+fn repair4_4379_instance_changed_counts_once_without_helper() {
+    let fx = Fixture::new("t4379-instance");
+    let (l, pids) = fx.launcher(holding(), probe(0), ExecBudgets::default());
+    let registered = fx.instance("run1");
+    fx.recreate_running("run1", fx.init.id());
+    let e = l
+        .launch(&cid("run1"), &eid(), &ok_spec(), registered)
+        .err()
+        .expect("recreated");
+    assert_eq!(
+        (e.code(), e.message()),
+        (CriErrorCode::FailedPrecondition, MSG_EXEC_INSTANCE_CHANGED)
+    );
+    assert!(pids.lock().expect("lock").is_empty());
+    assert_eq!(l.tracked_helpers(), 0);
+    assert_eq!(counts(&l, "shim_exec_instance_changed"), Some((0, 1)));
+    assert_eq!(counts(&l, "shim_exec_pid_unreported"), None);
+}
+
+/// #4379: ほかの拒否（not running・not found）では照合拒否の計数は増えない。
+#[test]
+fn repair4_4379_other_rejections_are_not_counted() {
+    let fx = Fixture::new("t4379-other");
+    let (l, _) = fx.launcher(holding(), probe(0), ExecBudgets::default());
+    for name in ["stopped1", "created1"] {
+        let e = l
+            .launch(&cid(name), &eid(), &ok_spec(), fx.instance(name))
+            .err()
+            .expect("not running");
+        assert_eq!(
+            (e.code(), e.message()),
+            (CriErrorCode::FailedPrecondition, "container is not running")
+        );
+    }
+    let e = l
+        .launch(&cid("nosuch"), &eid(), &ok_spec(), None)
+        .err()
+        .expect("not found");
+    assert_eq!(e.message(), "container not found");
+    assert_eq!(counts(&l, "shim_exec_instance_changed"), None);
+    assert_eq!(counts(&l, "shim_exec_pid_unreported"), None);
+}

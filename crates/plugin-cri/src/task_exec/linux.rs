@@ -9,6 +9,7 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use fandhe_container_core::exec::{ExecCgroupName, ExecCgroupPresence, exec_child_cgroup_presence};
+use fandhe_container_core::observability::{OpName, OpOutcome, OpRecorder};
 use fandhe_container_core::traits::{
     CgroupPlacement, ContainerId, ContainerInstance, ContainerState, ErrorCode, GetStateRequest,
     Signal, StateStore,
@@ -196,6 +197,29 @@ struct AckSlot {
     received: Option<SignalAckCode>,
 }
 
+/// `Inner::wait_spawned` が戻った理由。数えるのは `Expired` だけ（#4379・REPAIR-4）。
+enum SpawnedWait {
+    /// pid を記録した。
+    Recorded,
+    /// pid 未記録のまま実行が終わった（`Spawned` 無しの `Result`・違反・切断など）。予算の不足ではないので数えない。
+    Settled,
+    /// 期限まで pid が届かず、実行も続いている。
+    Expired,
+}
+
+/// 登録時のインスタンスと現在の記録が食い違い、helper の起動前に拒否した回の操作名（#4379・CRI-5・REPAIR-4）。
+/// shim の `TaskService` から見て、`purge_mismatched` の後の読み取りの窓で作り直された回だけがここに届く。
+const OP_EXEC_INSTANCE_CHANGED: &str = "shim_exec_instance_changed";
+/// `Started` の後、`Spawned` が `ExecBudgets::spawned` 内に届かず pid 0 のまま返した回の操作名（#4379・CRI-5・REPAIR-4）。
+const OP_EXEC_PID_UNREPORTED: &str = "shim_exec_pid_unreported";
+
+fn record_failure(recorder: &OpRecorder, name: &str, elapsed: Duration) {
+    // 記録できなくても exec の応答は変えない（既存の記録の流儀）。固定の操作名のみで ID・argv・パスは載せない。
+    if let Ok(name) = OpName::new(name) {
+        let _ = recorder.record(&name, OpOutcome::Failure, elapsed);
+    }
+}
+
 struct Inner {
     phase: Mutex<Phase>,
     changed: Condvar,
@@ -232,16 +256,20 @@ impl Inner {
         ok
     }
 
-    /// `Spawned` の記録・実行の終了・期限のいずれかまで待つ（launch から。#4318・REPAIR-5）。
-    fn wait_spawned(&self, until: Instant) {
+    /// `Spawned` の記録・実行の終了・期限のいずれかまで待ち、戻った理由を返す（launch から。#4318・#4379・REPAIR-5）。
+    /// 期限切れの判定はロック下の同じ判断で決める（遅れて届いた `Spawned` との競合で数えが揺れないため）。
+    fn wait_spawned(&self, until: Instant) -> SpawnedWait {
         let mut p = self.lock();
         loop {
-            if self.recorded_pid().is_some() || !matches!(*p, Phase::Running) {
-                return;
+            if self.recorded_pid().is_some() {
+                return SpawnedWait::Recorded;
+            }
+            if !matches!(*p, Phase::Running) {
+                return SpawnedWait::Settled;
             }
             let now = Instant::now();
             if now >= until {
-                return;
+                return SpawnedWait::Expired;
             }
             let slice = WAIT_SLICE.min(until - now);
             p = self
@@ -329,9 +357,23 @@ pub struct ShimExecLauncher {
     budgets: ExecBudgets,
     shared: Arc<Shared>,
     tracker: Arc<Mutex<Tracker>>,
+    /// 拒否・pid 未着の計数先。shim の serve では core の共有記録器を差し込む（#4379）。
+    recorder: Arc<OpRecorder>,
 }
 
 impl ShimExecLauncher {
+    /// 計数先の記録器を差し替える（shim の共有記録器。#4379・REPAIR-4）。
+    #[must_use]
+    pub fn with_recorder(mut self, recorder: Arc<OpRecorder>) -> Self {
+        self.recorder = recorder;
+        self
+    }
+
+    /// 計数先の記録器（観測・試験用）。
+    pub fn recorder(&self) -> &Arc<OpRecorder> {
+        &self.recorder
+    }
+
     /// 状態ルート（絶対パス）・状態ストア・helper の起動口・消滅確認の口から作る。
     pub fn new(
         state_root: PathBuf,
@@ -358,6 +400,7 @@ impl ShimExecLauncher {
             budgets,
             shared: Arc::new(Shared::default()),
             tracker: Arc::new(Mutex::new(Tracker::default())),
+            recorder: Arc::new(OpRecorder::new()),
         }
     }
 
@@ -444,6 +487,7 @@ impl TaskExecLauncher for ShimExecLauncher {
         spec: &ExecProcessSpec,
         expected_instance: Option<u64>,
     ) -> Result<Arc<dyn TaskExecProcess>, CriError> {
+        let launch_started = Instant::now();
         Self::check_spec(spec)?;
         if lock_tracker(&self.tracker).stopped {
             return Err(CriError::unavailable("exec launcher is stopped"));
@@ -467,6 +511,11 @@ impl TaskExecLauncher for ShimExecLauncher {
             expected_instance,
             record.instance().map(ContainerInstance::value),
         ) {
+            record_failure(
+                &self.recorder,
+                OP_EXEC_INSTANCE_CHANGED,
+                launch_started.elapsed(),
+            );
             return Err(CriError::failed_precondition(MSG_EXEC_INSTANCE_CHANGED));
         }
         let placement = record.cgroup().cloned();
@@ -555,9 +604,16 @@ impl TaskExecLauncher for ShimExecLauncher {
             })
             .map_err(|_| fail(CriError::unavailable("failed to start the exec watcher")))?;
         // `Spawned` か終了か予算切れまで待ってから返す。cri の Start 応答と TaskExecStarted が実 pid を持てる（#4318）。
-        // 届かなくても失敗にはしない（pid は表示用で、不明なら 0 のまま）。
-        if let Some(until) = Instant::now().checked_add(self.budgets.spawned) {
-            inner.wait_spawned(until);
+        // 届かなくても失敗にはしない（pid は表示用で、不明なら 0 のまま）。予算切れの回だけ数える（#4379・REPAIR-4）。
+        let wait_started = Instant::now();
+        if let Some(until) = wait_started.checked_add(self.budgets.spawned)
+            && matches!(inner.wait_spawned(until), SpawnedWait::Expired)
+        {
+            record_failure(
+                &self.recorder,
+                OP_EXEC_PID_UNREPORTED,
+                wait_started.elapsed(),
+            );
         }
         // 送信用の端は手放さず `ShimExecProcess` が持つ（SIGKILL 以外のシグナルの `Signal` frame を送る。#4282）。
         // 要求元の消滅の検知は「端がすべて閉じる」ことなので、監視スレッドの端が残る間は handle の drop で誤検知しない。

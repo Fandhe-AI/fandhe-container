@@ -223,8 +223,13 @@ fn default_event_emit() -> EventEmit {
 }
 
 /// 発生時の 1 行（固定の操作名と経過ミリ秒のみ。ID・argv・パスは載せない。serve 開始後も外から観測できる。#4379・REPAIR-4）。
+/// stderr は JSON Lines のため、近傍の occurrence ログと同じ `{"event":"<操作名>","elapsed_ms":N}` の JSON 1 行にする
+/// （操作名は本ファイルの固定 ASCII 定数のみで、エスケープは要らない）。
 fn event_line(name: &str, elapsed: Duration) -> String {
-    format!("event: {name} elapsed_ms={}", elapsed.as_millis())
+    format!(
+        r#"{{"event":"{name}","elapsed_ms":{}}}"#,
+        elapsed.as_millis()
+    )
 }
 
 fn record_failure(recorder: &OpRecorder, emit: &EventEmit, name: &str, elapsed: Duration) {

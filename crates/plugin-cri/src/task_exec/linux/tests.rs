@@ -1481,7 +1481,8 @@ fn repair4_4379_expiry_emits_event_line() {
     let got = lines.lock().unwrap().clone();
     assert_eq!(got.len(), 1);
     assert!(
-        got[0].starts_with("event: shim_exec_pid_unreported elapsed_ms="),
+        got[0].starts_with(r#"{"event":"shim_exec_pid_unreported","elapsed_ms":"#)
+            && got[0].ends_with('}'),
         "{got:?}"
     );
 }

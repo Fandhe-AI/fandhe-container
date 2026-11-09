@@ -361,6 +361,20 @@ kubernetes v1.37.1（commit `d2b770f4c94636a992534a8d3156b6b2d8e82ac3`）で確�
 - 案 B の再評価: A の実測で List の所要や `@lock` の競合が問題になったとき、または `GetContainerEvents`（Evented PLEG。現状 `UNIMPLEMENTED`）を実装するとき
 - 観測のログに ID を載せず、記録 pid を調べない（下の「セキュリティ上の要点」）
 
+## 実機前提試験の残骸と再起動後の回収（#4142・#4285・CRI-1・CRI-6・REPAIR-4・REPAIR-5・REPAIR-12）
+
+実機前提の CRI 試験は本物の状態ルートを共有するため、失敗の残骸が次の実行や `production_binary_restart_readopts_running_container_real` の前提検査（残骸 0 件）を落とす。次の方式にする。
+
+- 共有部品 `crates/plugin-cri/tests/support/cri_real_reclaim.rs` に安定な所有者 label `io.fandhe-container.test.owner=<試験名>` を足す。値は許可リスト `OWNERS`（4 試験の名前）に固定する。CRI の `label_selector` は完全一致のため、先頭の回収は許可リストの値ごとに一覧を取る。フィルタなしの一覧からは消さず、label の無い記録・記録ファイルには触れない
+- `production_binary_full_lifecycle_real`: pull は 1 回で、本体を 2 回走らせる。1 回目は Start と Running の確認の直後に注入した失敗で落とし、台帳とトークン label の回収が 1 件ずつ消すことを照合する。2 回目は同じ metadata で通す（回収が効かなければ `ALREADY_EXISTS`）。回収時に plugin が死んでいれば同じ状態ルートで起動し直す
+- `production_binary_restart_readopts_running_container_real`: 先頭の回収はちょうど 1 回で、状態ルートに残骸があるときだけ使い捨ての plugin を起動して許可リストの所有者 label の記録を消す。その後の前提検査（`restart_gate`）は従来どおり label の無い残骸で失敗し（fail-closed）、本体の照合（件数・フィルタなしの一覧）は緩めない。本体が失敗したら plugin を起動し直して自分のトークンの記録を回収する
+- `production_binary_exec_real` の段 4: SIGKILL → 起動し直し → 再採用の後、回収が Remove と残存確認を担い、回収した ID が自分の 1 件ずつであることを照合する
+- 既定の集合の根拠: `cri1_cri6_4285_owned_residue_is_readopted_and_reclaimed_after_plugin_sigkill`（root・ネットワーク不要）が、死んだ plugin への接続での `unverified`、起動し直した plugin での所有者ごとの回収、label の無い記録が残り前提検査が `entries=1` の固定文言で失敗すること、再採用の要約行を具体値で照合する
+- `shim_v2_{containerd,kill_all,exec}_real`: CRI の記録を持たないため gRPC の回収は当てはまらない。コンテナ ID・namespace に pid と時刻のタグを入れて一意にし（`support/shim_real_unique.rs`）、旧形式（pid だけ）の残骸のおとりを排他作成して結果に影響しないことを確かめる（kill_all・exec）。状態ディレクトリの先頭での自動削除はしない（生きている supervisor の状態を消すおそれ）
+
+却下案: restart の本体で残骸を許す変更、shim の状態ディレクトリの自動削除。
+残余: `cri_attach_real` と `cri_exec_real` の外側の回収で plugin が予期せず死んだときの起動し直し（今回は container_grpc と段 4 のみ）、label の無い残骸の自動回収（手動の手順は `docs/setup/cri-record-recovery.md`）。ステップの期限・watchdog・pull の回数（4）・`PROBE_MIN_REMAINING=4` は変えない。
+
 ## セキュリティ上の要点
 
 - 記録のパスは状態ルート配下の固定位置とサービス採番の ID だけから作り、記録内のパス文字列を信頼しない

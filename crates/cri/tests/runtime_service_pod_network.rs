@@ -5,6 +5,7 @@
 //! 本番（plugin-cri）はコア側の network namespace の join が入るまで provider を差さない（`docs/design/cri-config-acceptance.md`）。
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -45,6 +46,8 @@ struct FakeNetwork {
     tear_down_fails: Mutex<bool>,
     /// `set_up` が受けた公開指定（`protocol host_ip:host_port->container_port`）。
     publishes: Mutex<Vec<String>>,
+    /// `SetUp::Ok` で報告する IP（主, 追加）。`None` は無報告。
+    report: Mutex<Option<(IpAddr, Vec<IpAddr>)>>,
 }
 
 impl FakeNetwork {
@@ -54,6 +57,7 @@ impl FakeNetwork {
             set_up: Mutex::new(set_up),
             tear_down_fails: Mutex::new(false),
             publishes: Mutex::new(Vec::new()),
+            report: Mutex::new(None),
         })
     }
     fn calls(&self) -> Vec<String> {
@@ -77,7 +81,13 @@ impl PodNetworkProvider for FakeNetwork {
             ));
         }
         match *self.set_up.lock().unwrap() {
-            SetUp::Ok => PodNetns::new(netns_path(req.sandbox_id)),
+            SetUp::Ok => {
+                let netns = PodNetns::new(netns_path(req.sandbox_id))?;
+                match self.report.lock().unwrap().clone() {
+                    Some((ip, extra)) => netns.with_ips(ip, extra),
+                    None => Ok(netns),
+                }
+            }
             SetUp::Fail => Err(CriError::failed_precondition("network unavailable")),
             SetUp::BadPath => PodNetns::new(PathBuf::from("relative/ns")),
             SetUp::Hang => {
@@ -596,4 +606,143 @@ async fn sec1_4290_mapped_ipv4_host_ip_is_normalized_or_rejected() {
         .unwrap_err();
     assert_eq!(e.code(), Code::Unimplemented);
     assert_eq!(net.calls().len(), before);
+}
+
+fn ip(s: &str) -> IpAddr {
+    s.parse().unwrap()
+}
+
+async fn status_network(svc: &CriRuntimeService, id: &str) -> Option<v1::PodSandboxNetworkStatus> {
+    svc.pod_sandbox_status(Request::new(v1::PodSandboxStatusRequest {
+        pod_sandbox_id: id.to_owned(),
+        verbose: false,
+    }))
+    .await
+    .unwrap()
+    .into_inner()
+    .status
+    .unwrap()
+    .network
+}
+
+/// CRI-2・NET-3: provider が報告した IP がそのまま Status に出る。
+#[tokio::test]
+async fn cri_2_net_3_status_reports_provider_ips() {
+    let net = FakeNetwork::new(SetUp::Ok);
+    *net.report.lock().unwrap() = Some((ip("10.88.0.5"), vec![ip("fd00::5")]));
+    let svc = service(&net);
+    let id = run(&svc, None).await.unwrap();
+    assert_eq!(
+        status_network(&svc, &id).await,
+        Some(v1::PodSandboxNetworkStatus {
+            ip: "10.88.0.5".into(),
+            additional_ips: vec![v1::PodIp {
+                ip: "fd00::5".into()
+            }],
+        })
+    );
+}
+
+/// CRI-2・NET-3: IPv4 射影形は IPv4 表記で報告する。
+#[tokio::test]
+async fn cri_2_net_3_status_reports_mapped_ipv4_as_ipv4() {
+    let net = FakeNetwork::new(SetUp::Ok);
+    *net.report.lock().unwrap() = Some((ip("::ffff:10.88.0.6"), vec![]));
+    let svc = service(&net);
+    let id = run(&svc, None).await.unwrap();
+    let n = status_network(&svc, &id).await.unwrap();
+    assert_eq!(n.ip, "10.88.0.6");
+    assert!(n.additional_ips.is_empty());
+}
+
+/// CRI-2・NET-3: 無報告・provider 無し・NODE では network は空。
+#[tokio::test]
+async fn cri_2_status_network_is_empty_without_report_or_provider() {
+    let net = FakeNetwork::new(SetUp::Ok);
+    let svc = service(&net);
+    let id = run(&svc, None).await.unwrap();
+    assert_eq!(status_network(&svc, &id).await, None);
+
+    *net.report.lock().unwrap() = Some((ip("10.88.0.7"), vec![]));
+    let svc = service(&net);
+    let node = run(&svc, Some(NamespaceMode::Node)).await.unwrap();
+    assert_eq!(status_network(&svc, &node).await, None);
+
+    let bare = CriRuntimeService::new();
+    let id = run(&bare, None).await.unwrap();
+    assert_eq!(status_network(&bare, &id).await, None);
+}
+
+/// CRI-2・NET-3: Stop の tear_down 成功後は解放済みの IP を報告しない。失敗中は保持した報告を返す。
+#[tokio::test]
+async fn cri_2_status_network_is_cleared_after_stop() {
+    let net = FakeNetwork::new(SetUp::Ok);
+    *net.report.lock().unwrap() = Some((ip("10.88.0.8"), vec![]));
+    let svc = service(&net);
+    let id = run(&svc, None).await.unwrap();
+    assert_eq!(status_network(&svc, &id).await.unwrap().ip, "10.88.0.8");
+    *net.tear_down_fails.lock().unwrap() = true;
+    assert!(stop(&svc, &id).await.is_err());
+    assert_eq!(status_network(&svc, &id).await.unwrap().ip, "10.88.0.8");
+    *net.tear_down_fails.lock().unwrap() = false;
+    stop(&svc, &id).await.unwrap();
+    assert_eq!(status_network(&svc, &id).await, None);
+}
+
+/// 検証で拒否される報告を返す provider の Run は失敗し、記録が残らない。
+#[tokio::test]
+async fn cri_2_sec_1_invalid_ip_report_fails_run_and_registers_nothing() {
+    let net = FakeNetwork::new(SetUp::Ok);
+    *net.report.lock().unwrap() = Some((ip("127.0.0.1"), vec![]));
+    let svc = service(&net);
+    let e = run(&svc, None).await.unwrap_err();
+    assert_eq!(e.code(), Code::Internal);
+    assert!(list_ids(&svc).await.is_empty());
+}
+
+/// CRI-2・SEC-1: `with_ips` の検証（範囲・重複・件数・正規化）。
+#[test]
+fn cri_2_sec_1_pod_netns_with_ips_validates_report() {
+    let base = || PodNetns::new(PathBuf::from("/state/.netns/abc")).unwrap();
+    for bad in [
+        "0.0.0.0",
+        "127.0.0.1",
+        "0.1.2.3",
+        "224.0.0.1",
+        "240.0.0.1",
+        "255.255.255.255",
+        "::",
+        "::1",
+        "ff02::1",
+    ] {
+        assert!(base().with_ips(ip(bad), vec![]).is_err(), "{bad}");
+        assert!(
+            base().with_ips(ip("10.0.0.1"), vec![ip(bad)]).is_err(),
+            "extra {bad}"
+        );
+    }
+    assert!(
+        base()
+            .with_ips(ip("10.0.0.1"), vec![ip("fd00::1"), ip("fd00::1")])
+            .is_err()
+    );
+    assert!(
+        base()
+            .with_ips(ip("10.0.0.1"), vec![ip("10.0.0.1")])
+            .is_err()
+    );
+    assert!(
+        base()
+            .with_ips(ip("10.0.0.1"), vec![ip("::ffff:10.0.0.1")])
+            .is_err()
+    );
+    let max = fandhe_container_cri::adapter::MAX_POD_ADDITIONAL_IPS;
+    let many =
+        |n: usize| -> Vec<IpAddr> { (0..n).map(|i| ip(&format!("fd00::{:x}", i + 1))).collect() };
+    assert!(base().with_ips(ip("10.0.0.1"), many(max + 1)).is_err());
+    let ok = base().with_ips(ip("10.0.0.1"), many(max)).unwrap();
+    assert_eq!(ok.additional_ips().len(), max);
+    let mapped = base().with_ips(ip("::ffff:192.0.2.10"), vec![]).unwrap();
+    assert_eq!(mapped.ip(), Some(ip("192.0.2.10")));
+    assert_eq!(base().ip(), None);
 }

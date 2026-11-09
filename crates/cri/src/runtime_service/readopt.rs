@@ -70,6 +70,7 @@
 //!
 //! 未実装（REPAIR-3）: 保持役の素性による pending の解決は R11 #2940、`pod_netns`・provider 識別子の永続と再起動後の
 //! `tear_down` は R12 #2941、手動回収の手順は R10 #2939。
+//! `pod_netns` に載る報告済み IP（`PodSandboxStatus.network`。#2873）も記録に無いため再起動で失われ、再採用後の network は空。
 
 use std::collections::HashSet;
 use std::sync::Arc;

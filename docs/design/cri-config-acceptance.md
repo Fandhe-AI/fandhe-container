@@ -327,7 +327,7 @@ CRI の `namespace_options.network` は既定が `POD` で、netns は sandbox �
 - 本番の plugin-cri は rootless で、bridge・veth の pin は初期 user namespace の `CAP_NET_ADMIN`・`CAP_SYS_ADMIN` を要するため作れない。rootless の pod netns は pasta 構成（NET-9。#1935 系）の領域で、rootful は #2241 のオーナー承認待ち
 - net にコンテナ単位の切り離しが無いため、pod ごとにネットワーク（bridge と nft テーブル）を作って `delete_network` で一括解放する。共有ネットワークと per-container の detach への移行は後続（CORE-9 の資源効率）
 - 未 attach の事前作成 netns は route ソケットの fd を 1 本保持する（件数は `MAX_NETWORKS` × `MAX_CONTAINERS_PER_NETWORK` で有界）。状態はプロセスのメモリだけで、plugin の再起動で失われる
-- `port_mappings` は下記「port_mappings の受け入れ方式」（#2676）。`PodSandboxStatus` の `network`（IP の報告）は空のスタブのまま（実装は #2873）
+- `port_mappings` は下記「port_mappings の受け入れ方式」（#2676）。`PodSandboxStatus` の `network` は `PodNetworkProvider::set_up` が `PodNetns::with_ips` で報告した IP だけを返す（#2873・CRI-2・NET-3。推測しない。provider が無い・NODE・無報告・Stop の tear_down 成功後・plugin-cri の再起動後の再採用では空。報告は射影形の正規化・禁止範囲・重複・追加 8 件の上限で検証し、違反は INTERNAL）。本番の plugin-cri は provider 未注入のため実際には空
 - 実機（root）の試験は `crates/net/tests/network_attach_privileged.rs` に準備したが、本変更では未実行
 
 ## port_mappings の受け入れ方式（CRI-2・NET-3・NET-4・PLUG-1。#2676）

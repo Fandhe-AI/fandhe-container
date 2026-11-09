@@ -76,9 +76,12 @@
 //!   制約: 既定で deny の ACL が付いた場所（ホームディレクトリ等）の下には状態ルートを置けない。既定の
 //!   状態ルート（[`StateRoot::resolve`]）は Linux のみで、macOS では上書き指定が必須
 //!   （macOS の既定はオーナー判断待ち。#2431・`docs/design/macos-state-root.md`）
-//! - Windows: [`FileStateStore::open`] は何も作らずに `Unimplemented`（fail-closed）。所有者 SID の照合と
-//!   保護 DACL でのディレクトリ作成には Win32 FFI が要り、core は `windows-sys` に依存しないため
-//!   （依存の追加はユーザー承認事項。REPAIR-3）。実装方式は #2428 で判断待ち（`docs/design/windows-state-store-acl.md`）
+//! - Windows ホスト: [`FileStateStore::open`] は何も作らずに `FailedPrecondition` で**設計上恒久的に**拒否する
+//!   （#2428 の案 C・2026-11-09 のオーナー判断。OCI-5 (4)・WIN-1）。macOS / Windows の状態はゲスト VM 内の
+//!   Linux パスに置く構成で（core・CLI・supervisor は WSL2 ゲスト内で動く。#1415・
+//!   `docs/design/windows-execution-layout.md`）、ホストは状態を持たないため、所有者 SID・DACL の検査
+//!   （Win32 FFI・`windows-sys`）は実装しない。Windows ホストで状態を持つ構成になったら再評価する
+//!   （`docs/design/windows-state-store-acl.md`）。ホストは監査の記録先も持てない（`SinkFailed`）
 //! - Linux・macOS でも、`open(2)` フラグの値を `sys` が持たないアーキテクチャ（x86_64・aarch64 以外）では
 //!   同様に `Unimplemented`
 //!
@@ -437,8 +440,8 @@ impl FileStateStore {
     /// ルートがなければ 0700 で作る。親ディレクトリは作らない（`/run` や
     /// `$XDG_RUNTIME_DIR` がなければ `NotFound`）。symlink・ディレクトリでないもの・
     /// 他ユーザー所有・group / other に権限ビットのある（0700 でない）ルートは `PermissionDenied`。
-    /// Windows では何も作らずに `Unimplemented`（信頼境界を検査できないため。fail-closed。macOS は拡張 ACL
-    /// も拒否する。モジュール doc「対応プラットフォーム」）。
+    /// Windows ホストでは何も作らずに `FailedPrecondition`（設計上の恒久拒否。状態はゲスト内の Linux
+    /// パスに置く。#2428 の案 C。macOS は拡張 ACL も拒否する。モジュール doc「対応プラットフォーム」）。
     pub fn open(root: StateRoot) -> Result<Self, TraitError> {
         // 副作用（ルートの作成）より前に拒否する。
         ensure_supported_platform()?;
@@ -1206,14 +1209,17 @@ fn ensure_supported_platform() -> Result<(), TraitError> {
     Ok(())
 }
 
-/// Linux・macOS 以外（Windows）では状態ルートの信頼境界（所有者 SID・DACL）を検査できないため
-/// 拒否する（fail-closed。検査には Win32 FFI が要り、core は `windows-sys` に依存しない）。
-/// 実装方式は #2428 で判断待ち（`docs/design/windows-state-store-acl.md`）。
+/// Linux・macOS 以外（対応 3 OS ではこの分岐に入るのは Windows だけ）では、状態ルートを作らずに設計上
+/// 恒久的に拒否する（fail-closed。#2428 の案 C・2026-11-09 のオーナー判断。OCI-5 (4)・WIN-1）。
+/// 状態はゲスト内の Linux パスに置き、Windows ホストの起動役は状態を持たない（#1415）。「未実装」ではない
+/// ため `Unimplemented` ではなく、前提（Linux ゲスト内で動く）の不成立を表す `FailedPrecondition` を返す。
+/// `StateRoot::resolve` の `Unimplemented`（macOS の既定の置き場。#2431）とは別の判断。
+/// `open` の先頭（副作用の前）から呼ぶ。`docs/design/windows-state-store-acl.md`。
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn ensure_supported_platform() -> Result<(), TraitError> {
     Err(err(
-        ErrorCode::Unimplemented,
-        "file state store requires Linux or macOS to verify the state root",
+        ErrorCode::FailedPrecondition,
+        "file state store is not supported on a Windows host by design; the state root belongs in the Linux guest",
     ))
 }
 
@@ -2716,11 +2722,11 @@ mod platform_tests {
         );
     }
 
-    /// OCI-5・CLI-1: Linux・macOS 以外（Windows）では状態ルートを作らずに `Unimplemented` を返す
-    /// （信頼境界を検査できないため。start の `BundleLock::acquire` と同じ扱い）。
+    /// OCI-5・SEC-4・WIN-1・CLI-1（#4332）: Windows ホストでは状態ルートを作らずに `FailedPrecondition` で
+    /// 設計上の恒久拒否をする（#2428 の案 C）。
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     #[test]
-    fn oci5_open_is_unimplemented_outside_linux() {
+    fn oci5_4332_open_is_rejected_by_design_on_windows_host() {
         // 作られないことを照合するため、排他作成の `ScratchDir` の下の存在しない子を渡す（#3434・REPAIR-12）。
         let scratch = crate::scratch_root::ScratchDir::new(
             "fandhe-state-store-nolinux",
@@ -2728,12 +2734,15 @@ mod platform_tests {
         );
         let root = scratch.path().join("root");
         let e = FileStateStore::open(StateRoot::from_override(root.clone()).unwrap()).unwrap_err();
-        assert_eq!(e.code(), ErrorCode::Unimplemented);
+        assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(e.code().as_str(), "FAILED_PRECONDITION");
         assert_eq!(
             e.message(),
-            "file state store requires Linux or macOS to verify the state root"
+            "file state store is not supported on a Windows host by design; the state root belongs in the Linux guest"
         );
+        assert!(!e.message_truncated());
         assert!(!root.exists());
+        assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 0);
     }
 }
 
@@ -2933,7 +2942,7 @@ mod macos_tests {
     }
 }
 
-/// ストアを開く試験（Linux 限定。Windows では `open` が `Unimplemented` を返し、その挙動は
+/// ストアを開く試験（Linux 限定。Windows ホストでは `open` が `FailedPrecondition` を返し、その挙動は
 /// `platform_tests` が照合する。モジュール doc「対応プラットフォーム」）。
 #[cfg(all(test, target_os = "linux"))]
 mod tests {

@@ -27,8 +27,8 @@
 //! - 信頼性検証: macOS は core で実装済み（拡張 ACL を含む。#1865）で、拒否は `Untrusted` に写す。Windows はホストで
 //!   検証せず（core が `Unsupported` で拒否）、`TrustNotPerformedOnHost` に写す。この拒否も `unsupported` として記録を
 //!   試みる。macOS は `FileStateStore` 対応済み（OCI-5）で記録先を作れ、主経路（#2429）が成功すれば監査ファイルに残る
-//!   （代替経路は未実装で、主経路が失敗すれば `SinkFailed`。#2430）。Windows は `FileStateStore::open` が
-//!   `Unimplemented` を返し記録先が作れないため、記録は `SinkFailed` になる（`FileStateStore` の Windows 実装待ち）。
+//!   （代替経路は未実装で、主経路が失敗すれば `SinkFailed`。#2430）。Windows ホストは `FileStateStore::open` が
+//!   設計上の恒久拒否（`FailedPrecondition`。#2428 の案 C・#4332）を返し記録先を持たないため、記録は `SinkFailed` になる。
 //! - 許可済みハッシュ一覧の配置・指定方法が未確定のため一覧は既定の空（全件拒否）のままで、読み込み経路は無い
 //!   （設計案は `docs/design/plugin-hash-allowlist.md`・設計は #1868、承認の追跡は #2231。承認待ち）。
 //! - 検証を通過した plugin の起動と RPC は未実装。core 側の型つき `ContainerRuntime` proxy と spawn の配線は

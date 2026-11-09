@@ -474,7 +474,7 @@ impl<'a> ExtractBudget<'a> {
     }
 
     /// 木の削除用の確認（文言のみ違う。`remove_extracted_tree_bounded` から呼ぶ。#3142）。
-    fn check_removal(&self) -> Result<(), OciError> {
+    pub(super) fn check_removal(&self) -> Result<(), OciError> {
         self.check().map_err(|_| {
             let cancelled = self.cancel.is_some_and(|c| c.load(AtomicOrdering::Acquire));
             err(

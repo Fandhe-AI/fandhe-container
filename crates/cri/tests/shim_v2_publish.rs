@@ -1,6 +1,7 @@
 //! shim v2 の TaskCreate・TaskStart・TaskDelete・TaskExit の publish を、公開 API だけで本番の組み立て（`TaskService` + `exec_publisher_for_with` +
 //! 検証済みの `PublishBinary`）を通して照合する結合試験（CRI-5・TASK-62.6・REPAIR-10・REPAIR-12・#4155・#4156）。
 //!
+//! exec は Exec → Start(exec_id) の TaskExecAdded・TaskExecStarted の順序と内容も照合する（#4281）。
 //! 偽なのは実行層（`ContainerRuntime`）と publish バイナリ（`/bin/sh` の記録スクリプト）だけ。Start の後に終了を
 //! 観測した watcher が、偽バイナリへ argv と `Any`（TaskExit）を渡し、イベントがちょうど 1 件であることを具体値で確かめる。
 //! Delete 後に同じ ID で作り直した場合に、旧世代が旧 pid のイベントを送らないことも確かめる。
@@ -15,19 +16,21 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use fandhe_container_core::traits::{
-    ContainerRuntime, ContainerStatus, CreateRequest, DeleteRequest as RtDelete,
-    DeleteResponse as RtDeleteResponse, ErrorCode, ExitTime, KillRequest, StartRequest as RtStart,
-    StateRequest, StopRequest, TraitError,
+    ContainerId, ContainerRuntime, ContainerStatus, CreateRequest, DeleteRequest as RtDelete,
+    DeleteResponse as RtDeleteResponse, ErrorCode, ExitTime, KillRequest, Signal,
+    StartRequest as RtStart, StateRequest, StopRequest, TraitError,
 };
 use fandhe_container_cri::adapter::RuntimeAdapter;
+use fandhe_container_cri::error::CriError;
 use fandhe_container_cri::shim_v2::bootstrap::{PublishBinary, ServeContext, ShimIdentifier};
 use fandhe_container_cri::shim_v2::publish::{
-    PublishConfig, PublishDrain, PublishFailure, PublishLog, TaskCreate, TaskDelete, TaskExit,
-    TaskIo, TaskStart, exec_publisher_for_with,
+    PublishConfig, PublishDrain, PublishFailure, PublishLog, TaskCreate, TaskDelete, TaskExecAdded,
+    TaskExecStarted, TaskExit, TaskIo, TaskStart, exec_publisher_for_with,
 };
 use fandhe_container_cri::shim_v2::{
-    Any, CreateTaskRequest, DeleteRequest, ShutdownRequest, ShutdownSignal, StartRequest,
-    TaskApiVersion, TaskService, Timestamp, TtrpcService, WaitConfig,
+    Any, CreateTaskRequest, DeleteRequest, ExecId, ExecProcessRequest, ExecProcessSpec,
+    ExecProcessStatus, ShutdownRequest, ShutdownSignal, StartRequest, TaskApiVersion,
+    TaskExecLauncher, TaskExecProcess, TaskService, Timestamp, TtrpcService, WaitConfig,
 };
 use prost::Message;
 
@@ -594,5 +597,92 @@ fn cri5_4224_exit_queued_before_delete_is_not_dropped() {
     );
     std::thread::sleep(Duration::from_millis(600));
     assert_eq!(count_calls(&out), 4);
+    assert!(log.0.lock().unwrap().is_empty());
+}
+
+/// 常に Running で pid 9001 の偽 exec プロセス。
+struct ExecProc;
+
+impl TaskExecProcess for ExecProc {
+    fn pid(&self) -> Option<NonZeroU32> {
+        NonZeroU32::new(9001)
+    }
+    fn status(&self) -> Result<ExecProcessStatus, CriError> {
+        Ok(ExecProcessStatus::Running)
+    }
+    fn signal(&self, _: Signal) -> Result<(), CriError> {
+        Ok(())
+    }
+}
+
+/// 常に成功する偽の起動役。
+struct ExecLauncher;
+
+impl TaskExecLauncher for ExecLauncher {
+    fn launch(
+        &self,
+        _: &ContainerId,
+        _: &ExecId,
+        _: &ExecProcessSpec,
+    ) -> Result<Arc<dyn TaskExecProcess>, CriError> {
+        Ok(Arc::new(ExecProc))
+    }
+}
+
+/// CRI-5・#4281: 公開 API の Exec → Start(exec_id) が、偽 publish バイナリへ TaskExecAdded、TaskExecStarted の順に
+/// ちょうど 1 件ずつ届く。Create・Start（init）の 2 件の後に続き、受信内容を具体値で照合する。
+#[test]
+fn cri5_4281_exec_events_reach_fake_binary_in_order() {
+    let (svc, _fake, out, bundle, log, _dir) = setup_4224("execev", "", Duration::from_secs(5));
+    let svc = svc.with_exec_launcher(Arc::new(ExecLauncher));
+    svc.handle("Create", &create_req("c1", &bundle)).unwrap();
+    svc.handle("Start", &start_req("c1")).unwrap();
+    assert_eq!(wait_call(&out, 0).0, "/tasks/create");
+    assert_eq!(wait_call(&out, 1).0, "/tasks/start");
+
+    let exec = ExecProcessRequest {
+        id: "c1".into(),
+        exec_id: "e1".into(),
+        spec: Some(Any {
+            type_url: "types.containerd.io/opencontainers/runtime-spec/1/Process".into(),
+            value: br#"{"cwd":"/","args":["/bin/true"]}"#.to_vec(),
+        }),
+        ..Default::default()
+    }
+    .encode_to_vec();
+    svc.handle("Exec", &exec).unwrap();
+    let (topic, any) = wait_call(&out, 2);
+    assert_eq!(topic, "/tasks/exec-added");
+    assert_eq!(any.type_url, "containerd.events.TaskExecAdded");
+    assert_eq!(
+        TaskExecAdded::decode(any.value.as_slice()).unwrap(),
+        TaskExecAdded {
+            container_id: "c1".into(),
+            exec_id: "e1".into(),
+        }
+    );
+    // Exec だけでは起動イベントは出ない。
+    std::thread::sleep(Duration::from_millis(250));
+    assert_eq!(count_calls(&out), 3);
+
+    let start = StartRequest {
+        id: "c1".into(),
+        exec_id: "e1".into(),
+    }
+    .encode_to_vec();
+    svc.handle("Start", &start).unwrap();
+    let (topic, any) = wait_call(&out, 3);
+    assert_eq!(topic, "/tasks/exec-started");
+    assert_eq!(any.type_url, "containerd.events.TaskExecStarted");
+    assert_eq!(
+        TaskExecStarted::decode(any.value.as_slice()).unwrap(),
+        TaskExecStarted {
+            container_id: "c1".into(),
+            exec_id: "e1".into(),
+            pid: 9001,
+        }
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(count_calls(&out), 4, "exactly one event per step");
     assert!(log.0.lock().unwrap().is_empty());
 }

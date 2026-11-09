@@ -6,6 +6,10 @@
 //! 持つ（届いた fd が元の fd と同じ実体を指すことを `/proc/self/fd` の読み出しで確かめる。pidfd としての同一性の照合は
 //! 受け取った側の `identify_pid1_with_pidfd` の責務で、実 pidfd を使う通しは実機前提の試験が担う）。
 //!
+//! 追加（#4277・REPAIR-12）: 生の UDS と試験専用の受信入口 `recv_response_raw_for_test`（制御バッファは fd 4 本分）で、
+//! 拒否の応答は `SCM_RIGHTS` が 0 本かつ `MSG_CTRUNC` なし、成功は 1 本であることを照合する（クライアント入口は
+//! 拒否に付いた fd を黙って閉じるため、サーバが fd を添えていないことはここでしか観測できない）。
+//!
 //! 追加（#2626 の codex P1）: pidfd を渡した接続を supervisor のガードが預かり、CLI の作成通知（ExecCgroupNotify）の後に
 //! 接続が切れる（CLI の消滅を含む）か保持期限が来たら、偽の回収役が通知された名前で 1 回だけ呼ばれることを照合する
 //! （SUP-6・REPAIR-5・REPAIR-4）。実 cgroup の回収は実機前提の試験が担う。
@@ -21,11 +25,12 @@ use std::time::{Duration, Instant};
 use fandhe_container_core::exec::ExecCgroupName;
 use fandhe_container_core::oci_runtime::{LaunchedProcess, ProcessExit};
 use fandhe_container_core::traits::{ContainerId, ErrorCode, Signal, TraitError};
+use fandhe_container_supervisor::control::client::recv_response_raw_for_test;
 use fandhe_container_supervisor::control::listener::{ControlListener, effective_uid};
 use fandhe_container_supervisor::control::observe::ControlObserver;
 use fandhe_container_supervisor::control::protocol::{
     ControlReason, ExecHandoverRequestFrame, HEADER_LEN, RESPONSE_LEN, ResponseFrame,
-    SignalDeadline,
+    SignalDeadline, encode_hello,
 };
 use fandhe_container_supervisor::control::server::{ControlServer, ServeConfig};
 use fandhe_container_supervisor::control::target::{ControlledProcess, SignalSlot};
@@ -386,25 +391,168 @@ fn repair5_sup6_guard_reclaims_at_hold_deadline() {
     assert_eq!(rig.reclaimer.calls().len(), 1);
 }
 
+/// kind 6 の生の要求を送り、応答の理由・添付 fd・`MSG_CTRUNC` を受けたまま返す。`ControlExecHandover` を通さないので
+/// 添付 fd を黙って捨てない。制御バッファは fd 4 本分あるため「0 本かつ切り詰めなし」は実際に添えられていないことを意味する。
+/// 成功ではガードが接続を預かるため、呼び出し側が drop の時点を決められるよう stream も返す。
+fn raw_handover_with_fds(
+    rig: &Rig,
+    frame: &[u8],
+) -> (ControlReason, Vec<OwnedFd>, bool, UnixStream) {
+    let path = rig.root.0.join(rig.id.as_str()).join("supervisor.sock");
+    let mut s = UnixStream::connect(path).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut hello = [0u8; HEADER_LEN];
+    s.read_exact(&mut hello).unwrap();
+    assert_eq!(hello, encode_hello());
+    s.write_all(frame).unwrap();
+    let raw = recv_response_raw_for_test(&s, Instant::now() + Duration::from_secs(5)).unwrap();
+    let mut resp = raw.bytes;
+    if resp.len() < RESPONSE_LEN {
+        let mut rest = vec![0u8; RESPONSE_LEN - resp.len()];
+        s.read_exact(&mut rest).unwrap();
+        resp.extend_from_slice(&rest);
+    }
+    let expected_head: [u8; HEADER_LEN] = [b'F', b'C', b'S', b'C', 1, 3, 0, 1];
+    assert_eq!(resp.get(..HEADER_LEN), Some(&expected_head[..]));
+    let reason = ControlReason::from_u8(*resp.last().unwrap()).unwrap();
+    (reason, raw.fds, raw.truncated, s)
+}
+
+/// kind 6 の要求 frame（20 バイト）。
+fn handover_frame(pid: u32, deadline: SignalDeadline) -> [u8; 20] {
+    ExecHandoverRequestFrame {
+        pid: NonZeroU32::new(pid).unwrap(),
+        deadline,
+    }
+    .encode()
+}
+
 /// 生の接続で pidfd の受け渡しまで済ませ、ExecCgroupNotify を手で書けるようにする（検証の拒否の照合用）。
 fn raw_handover(rig: &Rig) -> UnixStream {
-    let path = rig.root.0.join(rig.id.as_str()).join("supervisor.sock");
-    let mut stream = UnixStream::connect(path).unwrap();
+    let frame = handover_frame(
+        PID,
+        SignalDeadline::from_now(Duration::from_secs(3)).unwrap(),
+    );
+    let (reason, fds, truncated, stream) = raw_handover_with_fds(rig, &frame);
+    assert_eq!(
+        (reason, fds.len(), truncated),
+        (ControlReason::Ok, 1, false)
+    );
     stream
-        .set_read_timeout(Some(Duration::from_secs(3)))
-        .unwrap();
-    let mut hello = [0u8; HEADER_LEN];
-    stream.read_exact(&mut hello).unwrap();
-    let frame = ExecHandoverRequestFrame {
-        pid: NonZeroU32::new(PID).unwrap(),
-        deadline: SignalDeadline::from_now(Duration::from_secs(3)).unwrap(),
+}
+
+/// SUP-6・SEC-1・REPAIR-12・#4277: kind 6 の拒否の応答は `SCM_RIGHTS` の fd を 0 本しか持たず、`MSG_CTRUNC` も立たない。
+#[test]
+fn sup6_sec1_repair12_4277_rejections_carry_no_scm_rights() {
+    let none = |reason| (reason, 0usize, false);
+    let observe = |rig: &Rig, frame: &[u8]| {
+        let (reason, fds, truncated, _s) = raw_handover_with_fds(rig, frame);
+        (reason, fds.len(), truncated)
     };
-    stream.write_all(&frame.encode()).unwrap();
-    // 応答（Response(Ok) + SCM_RIGHTS）。通常の read は添付 fd を捨てるので、本文 9 バイトだけ読む。
-    let mut resp = [0u8; RESPONSE_LEN];
-    stream.read_exact(&mut resp).unwrap();
-    assert_eq!(resp.get(HEADER_LEN).copied(), Some(ControlReason::Ok as u8));
-    stream
+    let soon = || SignalDeadline::from_now(Duration::from_secs(3)).unwrap();
+
+    // 共通の Rig で足りる場面（pid 不一致・Malformed 2 件・Timeout）。
+    let rig = Rig::start("rf-common", true, true);
+    assert_eq!(
+        observe(&rig, &handover_frame(PID + 1, soon())),
+        none(ControlReason::PidMismatch),
+        "pid mismatch"
+    );
+    assert_eq!(
+        observe(
+            &rig,
+            &handover_frame(
+                PID,
+                SignalDeadline::from_now(Duration::from_secs(30)).unwrap()
+            )
+        ),
+        none(ControlReason::Malformed),
+        "deadline beyond the cap"
+    );
+    let mut zero_pid = handover_frame(PID, soon());
+    zero_pid[8..12].copy_from_slice(&0u32.to_be_bytes());
+    assert_eq!(
+        observe(&rig, &zero_pid),
+        none(ControlReason::Malformed),
+        "pid 0"
+    );
+    assert_eq!(
+        observe(
+            &rig,
+            &handover_frame(PID, SignalDeadline::from_nanos(1).unwrap())
+        ),
+        none(ControlReason::Timeout),
+        "past deadline"
+    );
+    assert_eq!(rig.reclaimer.calls(), Vec::<String>::new());
+
+    let rig = Rig::start("rf-empty", false, false);
+    assert_eq!(
+        observe(&rig, &handover_frame(PID, soon())),
+        none(ControlReason::NoHandle),
+        "empty slot"
+    );
+    let rig = Rig::start("rf-nofd", true, false);
+    assert_eq!(
+        observe(&rig, &handover_frame(PID, soon())),
+        none(ControlReason::NoHandle),
+        "no pidfd duplicate"
+    );
+    let rig = Rig::start("rf-exit", true, true);
+    {
+        use fandhe_container_core::oci_runtime::LaunchedProcess as _;
+        rig.process
+            .as_ref()
+            .unwrap()
+            .terminate(Duration::from_secs(1))
+            .unwrap();
+    }
+    assert_eq!(
+        observe(&rig, &handover_frame(PID, soon())),
+        none(ControlReason::ContainerExited),
+        "exited"
+    );
+    let rig = Rig::start_with("rf-norec", true, true, None);
+    assert_eq!(
+        observe(&rig, &handover_frame(PID, soon())),
+        none(ControlReason::ExecReclaimUnavailable),
+        "no reclaimer"
+    );
+    let rig = Rig::start_with("rf-limit", true, true, Some(test_limits(2)));
+    let held = (
+        rig.obtain(PID, Duration::from_secs(2)).unwrap(),
+        rig.obtain(PID, Duration::from_secs(2)).unwrap(),
+    );
+    assert_eq!(
+        observe(&rig, &handover_frame(PID, soon())),
+        none(ControlReason::ExecGuardExhausted),
+        "guard limit"
+    );
+    drop(held);
+}
+
+/// SUP-6・SEC-1・REPAIR-12・#4277（対照）: 成功の応答は fd をちょうど 1 本持つ。0 本の照合が受信経路の見落としでないことを示す。
+#[test]
+fn sup6_sec1_repair12_4277_ok_carries_exactly_one_descriptor() {
+    let rig = Rig::start("ok-one", true, true);
+    let frame = handover_frame(
+        PID,
+        SignalDeadline::from_now(Duration::from_secs(3)).unwrap(),
+    );
+    let (reason, fds, truncated, stream) = raw_handover_with_fds(&rig, &frame);
+    assert_eq!(
+        (reason, fds.len(), truncated),
+        (ControlReason::Ok, 1, false)
+    );
+    let link = std::fs::read_link(format!("/proc/self/fd/{}", fds[0].as_raw_fd())).unwrap();
+    assert_eq!(link.to_string_lossy(), "/dev/null");
+    drop((fds, stream));
+    let pool = rig.pool.as_ref().unwrap();
+    let until = Instant::now() + Duration::from_secs(2);
+    while pool.active() != 0 && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(pool.active(), 0);
 }
 
 /// SEC-1・REPAIR-2・SUP-6・#2626: 不正な名前の通知は `Malformed` で拒否され、回収役は呼ばれない。

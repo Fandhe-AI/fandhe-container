@@ -171,6 +171,13 @@ pub(super) struct ContainerRecord {
     /// StopContainer / StopPodSandbox が使う。記録ストア注入時はコンテナ記録へも書く（R5 #2934。再起動後は R7 #2936 の `readopt_containers` が記録から復元する）
     /// （`exit_code`・`resolved_log_path` と同じ寿命。config の annotations には書かない）。
     pub(super) stop_signal: i32,
+    /// create 時に実行層が報告したインスタンス識別子（`RuntimeContainerStatus::instance`。#4322・CRI-2・CRI-6・SEC-1）。
+    ///
+    /// `Exec` の URL 発行前に、発行時に実行層から読んだ値と `instance_matches` で比べる基準で、CRI の外で同じ ID の
+    /// まま作り直されたコンテナへの exec を断る。記録ストア注入時はコンテナ記録（v2）へも書き、再採用
+    /// （`readopt_containers`）は記録の値をそのまま復元する（再採用時の core の値では補わない。補うと再起動の間の
+    /// 作り直しを受け入れる）。報告の無い経路・v1 の記録・write-ahead 段階で落ちた記録は `None`。
+    pub(super) instance: Option<u64>,
     /// 起動時に適用する識別情報（`ContainerStatus.user.linux` の元。#2771・CRI-2・SEC-5・KEP-3619）。
     ///
     /// 実行層の経路で `SpecBundleProvider` が config.json に書いた値だけが入る。報告の無い経路は `None`
@@ -183,13 +190,13 @@ pub(super) struct ContainerRecord {
     pub(super) resolved_image: Option<ResolvedImage>,
     /// `ContainerStatus` の観測（#4174・#4173 の E1）が `RuntimeAdapter::state` を呼び出し中。
     ///
-    /// メモリ専用で、記録ファイル（v1）へは書かない。同じコンテナの実行層の読み取りを同時に 1 本までにし、
+    /// メモリ専用で、記録ファイルへは書かない。同じコンテナの実行層の読み取りを同時に 1 本までにし、
     /// 期限切れで切り離した worker の累積を running の記録数で抑える（REPAIR-5）。
     pub(super) exit_observe_pending: bool,
     /// 最後に実行層の状態を読み終えた時刻（単調時計。`None` は未観測。#4175・#4173 の E2）。
     ///
     /// `ListContainers` の観測が 1 回の上限で候補を切るとき、未観測・古い順に先に読むための並べ替えのキー。
-    /// `exit_observe_pending` と同じくメモリ専用で、記録ファイル（v1）へは書かない。
+    /// `exit_observe_pending` と同じくメモリ専用で、記録ファイルへは書かない。
     pub(super) exit_observed_at: Option<std::time::Instant>,
 }
 

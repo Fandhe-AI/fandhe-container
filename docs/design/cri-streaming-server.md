@@ -113,6 +113,7 @@ CRI の定義は tty のとき stderr を false に固定する。RPC（`validat
 - 期限（REPAIR-5）: `SessionLimits`（作成 30 秒・idle 4 時間・流し切り 5 秒・最後の送出 5 秒）に加え、Exec 固有の `launch_timeout`（既定 30 秒）と `stdin_stall_timeout`（既定 60 秒。溜めた stdin をプロセスが読まないとき、ソケットを読めず切断を検知できない時間の上限）
 - 受信バッファが上限を超えた場合は EOF と区別して `ProtocolError`（GOAWAY）で閉じる
 - インスタンスの照合（#4286・CRI-5・SEC-1・CORE-1）: `Exec` RPC は URL の発行前に、実行層の `state` を `exit_observe_timeout`（有界）で 1 回読み、コンテナのインスタンス識別子を `StreamRequest::Exec { request, instance }` に保存する（実行層が無いスタブ経路は `None`。読めなければ RPC を失敗させ URL を発行しない）。起動役は対象のプロセスを決める状態読み取りと同じ読み取りで得た値と `adapter::instance_matches`（shim v2 の T5 と同じ規則。`None` 同士は通し、値違い・片側だけ `None` は不一致）で比べ、不一致なら helper を起動せず `FAILED_PRECONDITION` `"container was recreated after the exec request"`（`MSG_EXEC_INSTANCE_CHANGED`。ID・値を含めない）で拒否する。コードが shim の `NOT_FOUND "exec not found"` と違うのは、後者が登録簿から除去した結果の語彙で、ストリーミング経路には登録簿が無いため。kubelet には他の起動失敗と同じ `InternalError` の Status として見える
+- 発行前の照合（#4322・CRI-2・CRI-6・SEC-1）: CRI の記録 `ContainerRecord` は create 時に実行層が報告したインスタンスを `instance` として持ち（記録ファイル v2 の `instance=` 行にも書き、再採用は記録の値をそのまま復元する。core が今報告する値で補わない）、`Exec` RPC は URL の発行前に、この値と発行時に読んだ値を同じ `instance_matches` で比べる。不一致、または記録が `None` で現在値がある場合は `FAILED_PRECONDITION` `"container was recreated after it was created through CRI"`（`MSG_EXEC_INSTANCE_NOT_CREATED_ONE`）で URL を発行しない（fail-closed）。旧版の記録（v1）・write-ahead 段階で落ちた記録・本変更前に作られたコンテナは記録が `None` のため、本番の実行層（必ず値を報告する）のもとでは Exec が拒否される。回復手順は RemoveContainer → CreateContainer（運用上は pod の再作成）。再評価条件: v1 の記録を持つ稼働環境があり Exec の拒否が運用上の問題として報告されたとき。両側 `None`（スタブ・識別子を報告しない実行層）は従来どおり通る
 
 ### 注入トレイト `ExecStreamLauncher`
 
@@ -529,7 +530,7 @@ CRI の `ExecSync`（現状 `UNIMPLEMENTED`）も本設計の helper を再利�
 - rootful: plugin-cri の start が uid 0 を `UNIMPLEMENTED` にするため、rootful のコンテナは無く 3 RPC とも使えない（uid 0 の拒否は #2442、rootful を許すかは #2241 の判断待ち）
 - 非 Linux: Exec は未結線の `UNIMPLEMENTED`。コンテナの start 自体も未実装（macOS の状態ルートは #2431）
 - `ExecSync`: `UNIMPLEMENTED` のまま。追跡 issue 未起票。実装するときは Exec と同じインスタンスの記録と起動時の照合を入れる義務がある（#4286）
-- Exec のインスタンス照合の残余（#4286）: (1) 識別子を報告しない実装・記録の無い旧い `state.json` は両側 `None` で保護されない（試験で固定）。(2) CRI の記録（`ContainerRecord`）は create 時のインスタンスを持たないため、`Exec` RPC より前に外で作り直されたコンテナには新しいインスタンスで URL が発行される（塞ぐには記録ファイルと再採用へインスタンスを持たせる必要があり、本件の範囲外）。(3) 照合の違反の観測は `ExecStreamOutcome::InstanceChanged`（コードと文 `MSG_EXEC_INSTANCE_CHANGED` の両方で判定）として他の起動失敗と区別され、操作別計装 `cri.exec.session`（`FAILED_PRECONDITION`）に加えて `cri.exec.instance_changed` の失敗として別の行にも出る（二重計上。60 秒周期の `op_stats` 行。#4324・CRI-6・REPAIR-4）。クライアントへの Status は `InternalError` のままで観測だけが分かれる。即時の構造化行は未実装
+- Exec のインスタンス照合の残余（#4286）: (1) 識別子を報告しない実装・記録の無い旧い `state.json` は両側 `None` で保護されない（試験で固定）。(2) 解消済み（#4322）: create 時のインスタンスを記録と記録ファイル v2 に持たせ、発行前に照合する（旧版の記録・write-ahead の記録は fail-closed。代償と回復手順は上記）。(3) 照合の違反の観測は `ExecStreamOutcome::InstanceChanged`（コードと文 `MSG_EXEC_INSTANCE_CHANGED` の両方で判定）として他の起動失敗と区別され、操作別計装 `cri.exec.session`（`FAILED_PRECONDITION`）に加えて `cri.exec.instance_changed` の失敗として別の行にも出る（二重計上。60 秒周期の `op_stats` 行。#4324・CRI-6・REPAIR-4）。クライアントへの Status は `InternalError` のままで観測だけが分かれる。即時の構造化行は未実装
 - 外部公開の TLS・認証（無い。opt-in の口は #4110 で plugin-cri の CLI に出した。前段の守りが前提）
 - Upgrade 後のセッションの停止時のドレイン方針の再評価（REPAIR-5）: #4111。`ConnectionObserver` の telemetry への接続（REPAIR-4）は #4163 で実装済み（下の「plugin-cri での起動と停止」）
 - ポートの到達性など深い意味検証

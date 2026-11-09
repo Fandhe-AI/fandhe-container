@@ -735,6 +735,7 @@ mod tests {
     /// CRI-6・REPAIR-4・#4336: 不正な指定は固定文言で、値を含めない。
     #[test]
     fn cri6_4336_invalid_values_rejected_without_echo() {
+        // Unix 限定のケース追加にだけ可変性が必要で、Windows では不要になるため抑止する。
         #[allow(unused_mut)]
         let mut cases: Vec<Vec<&str>> = vec![
             vec!["--op-stats-file"],

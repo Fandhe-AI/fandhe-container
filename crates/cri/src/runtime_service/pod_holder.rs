@@ -9,8 +9,8 @@
 //! 契約: provider の呼び出しはレジストリのロックを保ったまま行わない。保持役の pid は sandbox 記録の
 //! メモリ上にだけ置く（記録ファイルへの永続化と素性の照合は R11〔#2940〕）。
 //!
-//! **未実装・簡易実装（REPAIR-3）**: 本番の provider は H6〔#2877〕、pid から namespace のパスを作って
-//! bundle へ渡す配線は H5〔#2876〕が担う。ここは注入点と記録の保持、解放の冪等・再試行、死活の反映まで。
+//! **未実装・簡易実装（REPAIR-3）**: 本番の provider は H6〔#2877〕。pid から namespace のパスを作って
+//! bundle へ渡す配線は H5〔#2876〕で `reserve_container` に実装済み。ここは注入点と記録の保持、解放の冪等・再試行、死活の反映まで。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};

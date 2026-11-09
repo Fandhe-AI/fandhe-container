@@ -500,7 +500,7 @@ impl Fixture {
         let url = self
             .server
             .issuer()
-            .issue(StreamRequest::Exec(v1::ExecRequest {
+            .issue(StreamRequest::exec(v1::ExecRequest {
                 container_id: "c1".to_string(),
                 cmd: cmd.iter().map(|s| s.to_string()).collect(),
                 tty,

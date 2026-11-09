@@ -555,9 +555,9 @@ impl ExecRegistry {
     ) -> Result<usize, CriError> {
         let mut inner = self.inner.lock().map_err(|_| poisoned())?;
         let before = inner.map.len();
-        inner
-            .map
-            .retain(|(c, _), e| c != container.as_str() || e.instance == current);
+        inner.map.retain(|(c, _), e| {
+            c != container.as_str() || crate::adapter::instance_matches(e.instance, current)
+        });
         Ok(before - inner.map.len())
     }
 

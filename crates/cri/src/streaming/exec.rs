@@ -143,7 +143,17 @@ pub struct ExecLaunch {
     pub stdout: bool,
     /// stderr を接続するか（tty のときは false）。
     pub stderr: bool,
+    /// URL 発行時に実行層が報告したインスタンス識別子（#4286・CRI-5・SEC-1・CORE-1）。発行時に保存した値で、
+    /// 通信路の内容ではない。起動役は対象のプロセスを決める状態読み取りと同じ読み取りで得た値と
+    /// [`crate::adapter::instance_matches`] で比べ、不一致なら起動せず
+    /// `FAILED_PRECONDITION`（[`MSG_EXEC_INSTANCE_CHANGED`]）で拒否する。
+    pub instance: Option<u64>,
 }
+
+/// 発行後に同じ ID のコンテナが作り直されていたときの拒否の文（固定の英文。ID・識別子を含めない。#4286）。
+/// shim v2 の `NOT_FOUND "exec not found"` は登録簿から除去した結果の語彙で、ストリーミング経路には登録簿が無いため
+/// コードも `FAILED_PRECONDITION`（状態が前提を満たさない）に揃えてある。
+pub const MSG_EXEC_INSTANCE_CHANGED: &str = "container was recreated after the exec request";
 
 /// pty のサイズ変更の受け口。
 pub trait TerminalResizer: Send {
@@ -186,6 +196,9 @@ impl fmt::Debug for ExecSession {
 /// - 起動したプロセスはコンテナの namespace・cgroup・seccomp・capability を継承し、広げない（SEC-1）
 /// - `req` の `stdin` / `stdout` / `stderr` が true のものだけを `Some` で返す
 /// - 返した [`ExecSession`] の drop でプロセスを止める
+/// - 起動対象のプロセスを決める状態読み取りと同じ読み取りで得たインスタンス識別子を `req.instance` と
+///   [`crate::adapter::instance_matches`] で比べ、不一致なら起動せず拒否する
+///   （`FAILED_PRECONDITION`・[`MSG_EXEC_INSTANCE_CHANGED`]。#4286・CRI-5・SEC-1・CORE-1）
 /// - panic しない。失敗は `CriError` で返す（メッセージに内部のパス・資格情報を含めない）
 pub trait ExecStreamLauncher: Send + Sync + 'static {
     /// プロセスを起動して stdio を返す。呼び出し側が `launch_timeout` を付ける。
@@ -311,6 +324,7 @@ impl ExecStreamHandler {
     fn handle_exec(
         &self,
         req: v1::ExecRequest,
+        instance: Option<u64>,
         http: Request<Incoming>,
         permit: ConnectionPermit,
     ) -> Response<StreamBody> {
@@ -333,6 +347,7 @@ impl ExecStreamHandler {
                         protocol,
                         options,
                         &req,
+                        instance,
                         launcher.as_ref(),
                         &config,
                     )
@@ -369,7 +384,9 @@ impl StreamHandler for ExecStreamHandler {
     ) -> Pin<Box<dyn Future<Output = Response<StreamBody>> + Send + '_>> {
         Box::pin(async move {
             match request {
-                StreamRequest::Exec(req) => self.handle_exec(req, http, permit),
+                StreamRequest::Exec { request, instance } => {
+                    self.handle_exec(request, instance, http, permit)
+                }
                 // 振り分けの誤り。到達しないが、別種別の要求を処理せず固定の応答にする。
                 _ => plain_response(hyper::StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
             }
@@ -1527,6 +1544,7 @@ pub(crate) async fn run_exec_session<T: AsyncRead + AsyncWrite + Unpin>(
     protocol: Protocol,
     options: StreamOptions,
     req: &v1::ExecRequest,
+    instance: Option<u64>,
     launcher: &dyn ExecStreamLauncher,
     config: &ExecStreamConfig,
 ) -> (ExecStreamOutcome, IoStats) {
@@ -1572,6 +1590,7 @@ pub(crate) async fn run_exec_session<T: AsyncRead + AsyncWrite + Unpin>(
         stdin: options.stdin,
         stdout: options.stdout,
         stderr: options.stderr,
+        instance,
     };
     let session = match tokio::time::timeout(config.launch_timeout, launcher.launch(launch)).await {
         Ok(Ok(session)) if session_matches(&session, options) => session,
@@ -2105,6 +2124,7 @@ mod tests {
             Protocol::V4,
             StreamOptions::new(false, true, false, false),
             &v1::ExecRequest::default(),
+            None,
             &OutputLauncher(20_000),
             &config,
         )

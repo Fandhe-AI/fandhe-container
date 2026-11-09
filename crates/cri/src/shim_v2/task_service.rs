@@ -76,6 +76,8 @@
 //!   コンテナ単位の上限も回復する。`None` 同士は判定できないので残す（片側だけ `None` は除去する）。
 //!   exec_id つきの State / Kill / Wait / Delete は照合しない（adapter を呼ばない不変条件を保つ）ため、作り直された後の
 //!   未起動の exec は次の Exec・Start(exec_id)・T4 で除去されるまで見えたままになるが、起動はされない。
+//! - RuntimeService 側の Exec（ストリーミング）も同じ規則 `adapter::instance_matches` で、URL 発行時に記録した値を
+//!   起動時に照合する（#4286。実装は plugin-cri の `exec_launcher`）。
 //! - 残余: 識別子を報告しない実行層の実装と、識別子の記録が無い旧い状態のコンテナは T5 で保護されない。状態ルートを
 //!   消して作り直すと revision の採番が初めからになるが、shim の寿命の中では現実には起きない。
 //!

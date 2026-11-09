@@ -3892,14 +3892,43 @@ impl CriRuntimeService {
         Ok(())
     }
 
-    /// `Exec` の本体。検証 → 存在照合 → URL 発行（CRI-6・TASK-63.1。注入が無ければ `UNIMPLEMENTED`）。
-    fn exec_impl(&self, req: v1::ExecRequest) -> Result<v1::ExecResponse, CriError> {
+    /// URL 発行時点のコンテナのインスタンス識別子を実行層から 1 回だけ読む（#4286・CRI-5・SEC-1・CORE-1）。
+    ///
+    /// 起動役（`ExecStreamLauncher`）が起動時に同じ状態読み取りで得た値と `instance_matches` で比べるための
+    /// 基準になる。実行層の結線が無い（スタブ）ときは `None`。読めなければ RPC を失敗させ URL を発行しない
+    /// （fail-closed）。期限は URL 発行には長すぎる `runtime_timeout` ではなく、状態を 1 回読むための
+    /// `exit_observe_timeout` を使う（REPAIR-5）。メッセージにコンテナ ID・識別子を含めない。
+    async fn exec_instance_at_issue(&self, container_id: &str) -> Result<Option<u64>, CriError> {
+        let Some(binding) = &self.runtime else {
+            return Ok(None);
+        };
+        let adapter = binding.adapter.clone();
+        let id = container_id.to_owned();
+        let status = run_bounded(self.exit_observe_timeout, move || adapter.state(&id))
+            .await?
+            .map_err(|e| {
+                // 実行層のメッセージは通さず、既存の語彙に揃える（ID・内部の文言を出さない）。
+                if e.code() == CriErrorCode::NotFound {
+                    CriError::not_found("container not found")
+                } else {
+                    e
+                }
+            })?;
+        Ok(status.instance)
+    }
+
+    /// `Exec` の本体。検証 → 存在照合 → インスタンスの記録 → URL 発行（CRI-6・TASK-63.1。注入が無ければ `UNIMPLEMENTED`）。
+    async fn exec_impl(&self, req: v1::ExecRequest) -> Result<v1::ExecResponse, CriError> {
         let issuer = self.streaming_issuer(StreamKind::Exec, "exec")?;
         validate_exec_request(&req)?;
         // 起動役が受けない tty・相対 argv[0] は URL の発行前に断る（#3761・REPAIR-3）。
         issuer.require_exec_options(req.tty, &req.cmd)?;
         self.require_container(&req.container_id)?;
-        let url = issuer.issue(StreamRequest::Exec(req))?;
+        let instance = self.exec_instance_at_issue(&req.container_id).await?;
+        let url = issuer.issue(StreamRequest::Exec {
+            request: req,
+            instance,
+        })?;
         Ok(v1::ExecResponse { url })
     }
 
@@ -4618,6 +4647,8 @@ impl RuntimeService for CriRuntimeService {
     ) -> Result<Response<v1::ReopenContainerLogResponse>, Status> {
         Err(CriError::unimplemented("reopen_container_log").into())
     }
+    /// 未実装。実装するときは Exec と同じく、要求の受理時にインスタンスを記録し、起動時に
+    /// `instance_matches` で照合すること（#4286・CRI-5・SEC-1・CORE-1）。
     async fn exec_sync(
         &self,
         _request: Request<v1::ExecSyncRequest>,
@@ -4630,7 +4661,10 @@ impl RuntimeService for CriRuntimeService {
         request: Request<v1::ExecRequest>,
     ) -> Result<Response<v1::ExecResponse>, Status> {
         let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::Exec);
-        let result = self.exec_impl(request.into_inner()).map_err(Status::from);
+        let result = self
+            .exec_impl(request.into_inner())
+            .await
+            .map_err(Status::from);
         timer.finish_with(&result);
         result.map(Response::new)
     }

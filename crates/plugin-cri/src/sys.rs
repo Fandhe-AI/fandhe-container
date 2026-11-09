@@ -338,6 +338,75 @@ mod poll_imp {
     }
 }
 
+/// 自分の子が終了済みかを、回収せずに確かめる（Linux の x86_64・aarch64 のみ。H6・#2877・CRI-2・SEC-5・REPAIR-5）。
+///
+/// 呼び出し元は本番の保持役 provider（`crate::pod_holder`）。sandbox の記録が残る間は子を `wait` せず、pid を zombie のまま
+/// 保って再利用を防ぐ契約のため、`waitid(P_PID, pid, WEXITED | WNOHANG | WNOWAIT)` で終了だけを観測する。
+/// `Ok(true)` は終了済み（未回収のまま）、`Ok(false)` は未終了。自分の子でない pid・回収済みの pid などは `Err`
+/// （呼び出し側は判定不能として fail-closed に扱う）。
+///
+/// 番号とレイアウトの出典（plugin-cri は `libc` の dev-dependency を持たず機械照合は未導入。導入は #1837 の子の後続）:
+/// `P_PID=1`・`WEXITED=4`・`WNOHANG=1`・`WNOWAIT=0x0100_0000` は Linux `include/uapi/linux/wait.h`。`siginfo_t` は 128 バイトで、
+/// `si_pid` は `include/uapi/asm-generic/siginfo.h` の 64 ビット（`__ARCH_SI_PREAMBLE_SIZE = 4 * sizeof(int)`）でオフセット 16 の
+/// `int`（x86_64・aarch64 とも同じ）。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub fn child_exit_observed(pid: std::num::NonZeroU32) -> std::io::Result<bool> {
+    const P_PID: i32 = 1;
+    const WEXITED: i32 = 4;
+    const WNOHANG: i32 = 1;
+    const WNOWAIT: i32 = 0x0100_0000;
+    const SI_PID_OFFSET: usize = 16;
+
+    /// `siginfo_t`（128 バイト）の受け皿。0 で初期化して渡す。
+    #[repr(C, align(8))]
+    struct SigInfoBuf([u8; 128]);
+
+    unsafe extern "C" {
+        // SAFETY（宣言そのものの妥当性）: POSIX / Linux の `int waitid(idtype_t, id_t, siginfo_t *, int)`。
+        // `idtype_t` と `id_t`（`id_t` は `u32`）は int 幅、`SigInfoBuf` は `siginfo_t` と同じ大きさと整列。
+        fn waitid(idtype: i32, id: u32, infop: *mut SigInfoBuf, options: i32) -> i32;
+    }
+
+    loop {
+        let mut info = SigInfoBuf([0; 128]);
+        // SAFETY: `info` は呼び出しの間有効な 128 バイト（`siginfo_t` 以上）の書き込み可能な領域で、`waitid` は
+        // その範囲だけを書き保持しない。`WNOWAIT` を付けるため子の状態を消費せず（回収しない）、`WNOHANG` で待たない。
+        // `pid` は `NonZeroU32` で、`P_PID` は指定の 1 プロセスだけを対象にする（`-1` のような全子プロセスの指定は作れない）。
+        let rc = unsafe { waitid(P_PID, pid.get(), &raw mut info, WEXITED | WNOHANG | WNOWAIT) };
+        if rc < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
+        let raw = info
+            .0
+            .get(SI_PID_OFFSET..SI_PID_OFFSET + 4)
+            .and_then(|b| <[u8; 4]>::try_from(b).ok())
+            .map(i32::from_ne_bytes)
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
+        return match u32::try_from(raw) {
+            Ok(0) => Ok(false),
+            Ok(p) if p == pid.get() => Ok(true),
+            _ => Err(std::io::Error::from(std::io::ErrorKind::InvalidData)),
+        };
+    }
+}
+
+/// 他アーキテクチャの Linux では `waitid` の `siginfo_t` のレイアウトを確認していないため、常に `Unsupported`
+/// （保持役 provider は判定不能として fail-closed に扱う）。
+#[cfg(all(
+    target_os = "linux",
+    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+pub fn child_exit_observed(_pid: std::num::NonZeroU32) -> std::io::Result<bool> {
+    Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+}
+
 #[cfg(all(
     test,
     any(
@@ -417,6 +486,43 @@ mod tests {
         let e = t.elapsed();
         assert!(e >= std::time::Duration::from_millis(9), "{e:?}");
         assert!(e < std::time::Duration::from_secs(5), "{e:?}");
+    }
+
+    /// 子の終了の観測は回収しない（終了後も `/proc/<pid>` が残る）。生きている子は `false`、回収後は `Err`。
+    /// （H6・#2877・CRI-2・REPAIR-5）
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cri2_child_exit_observed_does_not_reap() {
+        use std::process::{Command, Stdio};
+        let mut done = Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("sh");
+        let pid = std::num::NonZeroU32::new(done.id()).expect("pid");
+        let mut seen = false;
+        for _ in 0..500 {
+            if child_exit_observed(pid).expect("waitid") {
+                seen = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(seen, "exit was not observed");
+        // 何度観測しても未回収のまま残る。
+        assert!(child_exit_observed(pid).expect("waitid again"));
+        assert!(std::path::Path::new(&format!("/proc/{}", pid.get())).exists());
+        done.wait().expect("reap");
+        assert!(child_exit_observed(pid).is_err());
+
+        let mut alive = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("sleep");
+        let apid = std::num::NonZeroU32::new(alive.id()).expect("pid");
+        assert!(!child_exit_observed(apid).expect("alive"));
+        alive.kill().expect("kill");
+        alive.wait().expect("reap");
     }
 
     /// 陽性対照: 空きのある socket は `Ready`。

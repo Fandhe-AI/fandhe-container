@@ -102,6 +102,8 @@ fn spawn_server(sock: &Path, xdg: &Path) -> ChildGuard {
         .arg(sock)
         .env_clear()
         .env("XDG_RUNTIME_DIR", xdg)
+        // 既定の集合では本番の保持役（AppArmor の緩和と supervisor の bin が要る）を注入しない。実機前提の試験は注入する（H6・#2877）。
+        .env("FANDHE_CONTAINER_TEST_POD_HOLDER", "off")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -248,6 +250,58 @@ async fn pod_sandbox_rpcs_cross_the_uds_grpc_boundary() {
 
         drop((c, ch));
         assert!(guard.exited().is_none(), "server must still be running");
+    })
+    .await
+    .expect("watchdog");
+}
+/// CRI-2・PLUG-11・REPAIR-5・H6・#2877: 保持役の注入が本番バイナリで効いている。supervisor の bin が隣に無い（バイナリだけを
+/// 専用ディレクトリへ複製し、`FANDHE_CONTAINER_TEST_POD_HOLDER=off` を付けない）と、保持役を起動できず `RunPodSandbox` が
+/// `FAILED_PRECONDITION` で失敗し、sandbox は登録されない（`ListPodSandbox` が空）。userns は不要で既定の集合で走る。
+#[tokio::test]
+async fn cri2_h6_injected_pod_holder_fails_closed_without_supervisor_bin() {
+    use std::os::unix::fs::PermissionsExt as _;
+    tokio::time::timeout(WATCHDOG, async {
+        let dir = TempDir::new("h6sock");
+        let xdg = TempDir::new("h6xdg");
+        let bindir = dir.0.join("bin");
+        std::fs::create_dir(&bindir).expect("bin dir");
+        std::fs::set_permissions(&bindir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        let bin = bindir.join("fandhe-container-plugin-cri");
+        std::fs::copy(BIN, &bin).expect("copy plugin binary");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let sock = dir.0.join("s.sock");
+        let child = Command::new(&bin)
+            .arg("--socket")
+            .arg(&sock)
+            .env_clear()
+            .env("XDG_RUNTIME_DIR", &xdg.0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn plugin binary");
+        let mut guard = ChildGuard(child);
+        let ch = connect_when_ready(&sock, &mut guard).await;
+        let mut c = RuntimeServiceClient::new(ch.clone());
+
+        let st = call_with_deadline(c.run_pod_sandbox(run_req("pod-h6")), RPC_DEADLINE)
+            .await
+            .expect_err("holder cannot start without the supervisor bin");
+        assert!(
+            st.message()
+                .contains("pod holder executable is not trusted or not readable"),
+            "{}",
+            st.message()
+        );
+        let list = call_with_deadline(
+            c.list_pod_sandbox(cri::ListPodSandboxRequest::default()),
+            RPC_DEADLINE,
+        )
+        .await
+        .expect("list")
+        .into_inner();
+        assert!(list.items.is_empty());
+        drop((c, ch));
     })
     .await
     .expect("watchdog");

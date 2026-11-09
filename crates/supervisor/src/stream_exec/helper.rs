@@ -63,7 +63,9 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use fandhe_container_core::audit_log::{AuditSink, AuditedRejection};
-use fandhe_container_core::exec::{ChildExit, ENTRYPOINT_MAX_ARGS, ExecCgroupName, ExecExit};
+use fandhe_container_core::exec::{
+    ChildExit, ENTRYPOINT_MAX_ARGS, ExecCgroupName, ExecExit, emit_diagnostic_line_to,
+};
 use fandhe_container_core::traits::{
     ContainerId, ContainerState, ErrorCode, GetStateRequest, StateRecord, StateStore, TraitError,
 };
@@ -655,10 +657,15 @@ where
 }
 
 /// 起動の失敗 1 件を fd 2 へ 1 行で書く（[`HelperFailure::diagnostic_line`]。固定語彙と整数だけ）。
+///
+/// fd 2 は読み手が読まない・端だけ保持することがあるため、待たない最善努力の送信
+/// （`emit_diagnostic_line_to`。`MSG_DONTWAIT`）にする。満杯なら捨て、後続の `Result` の送信を止めない（REPAIR-5）。
 fn write_failure_line(failure: &HelperFailure) {
-    let mut err = std::io::stderr();
-    let _ = writeln!(err, "{}", failure.diagnostic_line());
-    let _ = err.flush();
+    write_failure_line_to(std::io::stderr().as_fd(), failure);
+}
+
+fn write_failure_line_to(out: BorrowedFd<'_>, failure: &HelperFailure) {
+    let _ = emit_diagnostic_line_to(out, &failure.diagnostic_line());
 }
 
 fn run_with_channel<I>(channel: &UnixStream, args: I) -> ServeReport
@@ -713,6 +720,39 @@ mod tests {
             "/bin/echo",
             "hello world",
         ])
+    }
+
+    /// SUP-6・REPAIR-5（#4284）: 満杯の診断 socket へも `write_failure_line_to` は停止せず戻り、空きがあれば行が届く。
+    #[test]
+    fn sup6_4284_write_failure_line_does_not_block_on_full_socket() {
+        let (a, mut b) = UnixStream::pair().unwrap();
+        a.set_nonblocking(true).unwrap();
+        let chunk = [b'x'; 4096];
+        let mut filled = 0usize;
+        while let Ok(n) = std::io::Write::write(&mut &a, &chunk) {
+            filled += n;
+            assert!(filled < 64 << 20, "socket never filled");
+        }
+        assert!(filled > 0);
+        let failure = HelperFailure::new(HelperStage::ResultSend, ErrorCode::Internal, Some(32));
+        let t = Instant::now();
+        write_failure_line_to(a.as_fd(), &failure);
+        assert!(t.elapsed() < Duration::from_secs(2));
+        // 満杯の間に書いた分は捨てられ、drain 後の送信は 1 行そのまま届く。
+        b.set_nonblocking(true).unwrap();
+        let mut buf = vec![0u8; 1 << 16];
+        let mut drained = 0usize;
+        while let Ok(n) = std::io::Read::read(&mut b, &mut buf) {
+            if n == 0 {
+                break;
+            }
+            drained += n;
+        }
+        assert_eq!(drained, filled, "full-socket write must be dropped");
+        write_failure_line_to(a.as_fd(), &failure);
+        let n = std::io::Read::read(&mut b, &mut buf).unwrap();
+        let expected = format!("{}\n", failure.diagnostic_line());
+        assert_eq!(&buf[..n], expected.as_bytes());
     }
 
     /// SUP-6・REPAIR-5（#3760）: `Started` の送信期限は `total_deadline` で頭打ちになり、期限後は送られず `Timeout` になる。

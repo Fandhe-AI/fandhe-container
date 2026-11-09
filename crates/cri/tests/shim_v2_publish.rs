@@ -623,6 +623,7 @@ impl TaskExecLauncher for ExecLauncher {
         _: &ContainerId,
         _: &ExecId,
         _: &ExecProcessSpec,
+        _expected_instance: Option<u64>,
     ) -> Result<Arc<dyn TaskExecProcess>, CriError> {
         Ok(Arc::new(ExecProc))
     }

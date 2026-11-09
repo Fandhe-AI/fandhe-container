@@ -15,6 +15,8 @@
 //! # 契約
 //! - env・cwd（`/` 以外）・user は黙って捨てず `UNIMPLEMENTED`（helper が受けないため）。`argv[0]` が絶対パスでなければ `INVALID_ARGUMENT`。
 //! - 存在しないコンテナは `NOT_FOUND`、Running でない・pid が無いコンテナは `FAILED_PRECONDITION`、状態ストアの失敗は `UNAVAILABLE`。
+//! - 登録時のインスタンス識別子 `expected_instance` を、pid を決めるのと同じ状態読み取りで `instance_matches` により照合し、
+//!   不一致（値が違う・片側だけ `None`）は helper を起動せず `FAILED_PRECONDITION`（`MSG_EXEC_INSTANCE_CHANGED`）。照合は Running・pid の確認より前（#4323）。
 //! - シグナルは SIGKILL（helper の kill）と、許可リスト（SIGHUP・SIGINT・SIGQUIT・SIGUSR1・SIGUSR2・SIGTERM。#4282）の `Signal` frame。init へは送らない。許可外は `UNIMPLEMENTED`。
 //! - ハンドルの drop は helper を止めない（追跡一覧が強参照を持つ）。止めるのは `ShimExecLauncher::shutdown_all`・SIGKILL・期限切れ。
 //! - 待ちはすべて有界（handover・`Started`・セッション + 余裕）。panic しない。エラー文は固定の英文で argv・ID・パスを含めない。
@@ -64,6 +66,7 @@ mod unsupported {
             _container: &ContainerId,
             _exec_id: &ExecId,
             _spec: &ExecProcessSpec,
+            _expected_instance: Option<u64>,
         ) -> Result<Arc<dyn TaskExecProcess>, CriError> {
             Err(CriError::unimplemented(
                 "exec is not supported on this platform",
@@ -90,7 +93,7 @@ mod unsupported {
             let id = ContainerId::new("c1").expect("id");
             let exec = ExecId::new("e1").expect("exec id");
             let err = ShimExecLauncher::unsupported()
-                .launch(&id, &exec, &spec)
+                .launch(&id, &exec, &spec, None)
                 .err()
                 .expect("err");
             assert_eq!(err.code(), CriErrorCode::Unimplemented);

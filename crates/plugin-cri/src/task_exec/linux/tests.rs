@@ -13,7 +13,10 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 use fandhe_container_core::exec::ExecError;
 use fandhe_container_core::state_store::{FileStateStore, StateRoot};
-use fandhe_container_core::traits::{ContainerStatus, CreateStateRequest, UpdateStateRequest};
+use fandhe_container_core::traits::{
+    ContainerStatus, CreateStateRequest, DeleteStateRequest, DeleteStateResponse, ListStateRequest,
+    StateList, StateRecord, TraitError, UpdateStateRequest,
+};
 use fandhe_container_cri::error::CriErrorCode;
 use fandhe_container_cri::shim_v2::exec::{PROCESS_TYPE_URL, parse_process_spec};
 use fandhe_container_cri::shim_v2::task_api::Any;
@@ -139,6 +142,43 @@ impl Fixture {
         Self { dir, store, init }
     }
 
+    /// 状態記録が今報告しているインスタンス識別子（登録時の値の代わりに渡す。存在しなければ `None`）。
+    fn instance(&self, name: &str) -> Option<u64> {
+        let id = ContainerId::new(name).expect("id");
+        self.store
+            .get(&GetStateRequest::new(id))
+            .ok()
+            .and_then(|r| r.instance().map(ContainerInstance::value))
+    }
+
+    /// 同じ ID のコンテナを外側（CLI 等）で削除・再作成して Running にする（インスタンスが変わる。#4323）。
+    fn recreate_running(&self, name: &str, pid: u32) {
+        let id = ContainerId::new(name).expect("id");
+        let old = self
+            .store
+            .get(&GetStateRequest::new(id.clone()))
+            .expect("get");
+        self.store
+            .delete(&DeleteStateRequest::new(id.clone(), old.revision()))
+            .expect("delete");
+        let created = self
+            .store
+            .create(
+                &CreateStateRequest::new(
+                    ContainerStatus::created(id.clone(), None),
+                    self.dir.0.join("bundle"),
+                )
+                .expect("req"),
+            )
+            .expect("create");
+        self.store
+            .update(&UpdateStateRequest::new(
+                ContainerStatus::running(id, NonZeroU32::new(pid)),
+                created.revision(),
+            ))
+            .expect("running");
+    }
+
     fn launcher(
         &self,
         script: Script,
@@ -250,7 +290,9 @@ fn cri5_4148_exit_codes_reach_status_and_wait() {
             probe(0),
             ExecBudgets::default(),
         );
-        let p = l.launch(&cid("run1"), &eid(), &ok_spec()).expect("launch");
+        let p = l
+            .launch(&cid("run1"), &eid(), &ok_spec(), fx.instance("run1"))
+            .expect("launch");
         assert_eq!(p.pid(), None);
         let got = p.wait_exit(WAIT, Duration::from_millis(10), &never_cancel);
         assert_eq!(got, Ok(Some(i32::from(code))));
@@ -278,7 +320,9 @@ fn cri5_4148_signaled_exit_is_128_plus_signal() {
         probe(0),
         ExecBudgets::default(),
     );
-    let p = l.launch(&cid("run1"), &eid(), &ok_spec()).expect("launch");
+    let p = l
+        .launch(&cid("run1"), &eid(), &ok_spec(), fx.instance("run1"))
+        .expect("launch");
     assert_eq!(
         p.wait_exit(WAIT, Duration::from_millis(10), &never_cancel),
         Ok(Some(137))
@@ -295,7 +339,9 @@ fn sec1_4148_sigkill_hits_only_helper_and_stays_unconfirmed() {
         ..ExecBudgets::default()
     };
     let (l, pids) = fx.launcher(holding(), Arc::clone(&pr), budgets);
-    let p = l.launch(&cid("run1"), &eid(), &ok_spec()).expect("launch");
+    let p = l
+        .launch(&cid("run1"), &eid(), &ok_spec(), fx.instance("run1"))
+        .expect("launch");
     assert_eq!(p.status(), Ok(ExecProcessStatus::Running));
     assert_eq!(l.tracked_helpers(), 1);
     let helper = *pids.lock().expect("lock").first().expect("helper pid");
@@ -356,7 +402,9 @@ fn cri5_4148_failed_after_started_is_unconfirmed() {
         Arc::clone(&pr),
         ExecBudgets::default(),
     );
-    let p = l.launch(&cid("run1"), &eid(), &ok_spec()).expect("launch");
+    let p = l
+        .launch(&cid("run1"), &eid(), &ok_spec(), fx.instance("run1"))
+        .expect("launch");
     let until = Instant::now() + WAIT;
     let err = loop {
         if let Err(e) = p.status() {
@@ -401,7 +449,9 @@ fn cri5_4318_launch_waits_for_spawned() {
         ExecBudgets::default(),
     );
     let t = Instant::now();
-    let p = l.launch(&cid("run1"), &eid(), &ok_spec()).expect("launch");
+    let p = l
+        .launch(&cid("run1"), &eid(), &ok_spec(), fx.instance("run1"))
+        .expect("launch");
     assert_eq!(p.pid(), NonZeroU32::new(4242));
     assert!(t.elapsed() >= Duration::from_millis(300));
     assert!(t.elapsed() < Duration::from_secs(2));
@@ -429,7 +479,9 @@ fn cri5_4318_spawned_after_budget_is_none_then_value() {
         probe(0),
         budgets,
     );
-    let p = l.launch(&cid("run1"), &eid(), &ok_spec()).expect("launch");
+    let p = l
+        .launch(&cid("run1"), &eid(), &ok_spec(), fx.instance("run1"))
+        .expect("launch");
     assert_eq!(p.pid(), None, "Spawned has not arrived within the budget");
     assert_eq!(
         p.wait_exit(WAIT, Duration::from_millis(10), &never_cancel),
@@ -448,7 +500,9 @@ fn repair5_4318_holding_without_spawned_is_bounded() {
     };
     let (l, _) = fx.launcher(holding(), probe(0), budgets);
     let t = Instant::now();
-    let p = l.launch(&cid("run1"), &eid(), &ok_spec()).expect("launch");
+    let p = l
+        .launch(&cid("run1"), &eid(), &ok_spec(), fx.instance("run1"))
+        .expect("launch");
     assert!(t.elapsed() >= Duration::from_millis(200));
     assert!(t.elapsed() < Duration::from_secs(2));
     assert_eq!(p.pid(), None);
@@ -469,7 +523,9 @@ fn cri5_4316_shim_result_without_spawned_keeps_pid_none() {
         budgets,
     );
     let t = Instant::now();
-    let p = l.launch(&cid("run1"), &eid(), &ok_spec()).expect("launch");
+    let p = l
+        .launch(&cid("run1"), &eid(), &ok_spec(), fx.instance("run1"))
+        .expect("launch");
     assert!(
         t.elapsed() < Duration::from_secs(1),
         "a Result without Spawned must not consume the budget"
@@ -490,7 +546,9 @@ fn sec1_4316_shim_duplicate_spawned_is_unconfirmed() {
         probe(0),
         ExecBudgets::default(),
     );
-    let p = l.launch(&cid("run1"), &eid(), &ok_spec()).expect("launch");
+    let p = l
+        .launch(&cid("run1"), &eid(), &ok_spec(), fx.instance("run1"))
+        .expect("launch");
     let helper = *pids.lock().expect("lock").first().expect("pid");
     assert!(gone(helper), "helper must be killed");
     assert_eq!(
@@ -505,7 +563,11 @@ fn sec1_4316_shim_duplicate_spawned_is_unconfirmed() {
 fn cri5_4148_launch_failures_map_to_fixed_codes() {
     let fx = Fixture::new("fail");
     let (l, pids) = fx.launcher(holding(), probe(0), ExecBudgets::default());
-    let code = |c: &str, s: &ExecProcessSpec| l.launch(&cid(c), &eid(), s).err().expect("err");
+    let code = |c: &str, s: &ExecProcessSpec| {
+        l.launch(&cid(c), &eid(), s, fx.instance(c))
+            .err()
+            .expect("err")
+    };
     let e = code("nosuch", &ok_spec());
     assert_eq!(
         (e.code(), e.message()),
@@ -567,7 +629,7 @@ fn cri5_4148_result_before_started_is_launch_failure() {
     });
     let (l, pids) = fx.launcher(script, probe(0), ExecBudgets::default());
     let e = l
-        .launch(&cid("run1"), &eid(), &ok_spec())
+        .launch(&cid("run1"), &eid(), &ok_spec(), fx.instance("run1"))
         .err()
         .expect("err");
     assert_eq!(
@@ -587,7 +649,9 @@ fn cri5_4148_result_before_started_is_launch_failure() {
 fn repair5_4148_result_deadline_kills_helper() {
     let fx = Fixture::new("deadline");
     let (l, pids) = fx.launcher(holding(), probe(0), short());
-    let p = l.launch(&cid("run1"), &eid(), &ok_spec()).expect("launch");
+    let p = l
+        .launch(&cid("run1"), &eid(), &ok_spec(), fx.instance("run1"))
+        .expect("launch");
     let e = p
         .wait_exit(
             Duration::from_millis(50),
@@ -623,7 +687,7 @@ fn repair5_4148_started_deadline_kills_helper() {
     });
     let (l, pids) = fx.launcher(script, probe(0), short());
     let e = l
-        .launch(&cid("run1"), &eid(), &ok_spec())
+        .launch(&cid("run1"), &eid(), &ok_spec(), fx.instance("run1"))
         .err()
         .expect("err");
     assert_eq!(e.code(), CriErrorCode::Timeout);
@@ -637,7 +701,9 @@ fn repair5_4148_started_deadline_kills_helper() {
 fn repair5_4148_wait_is_cancellable() {
     let fx = Fixture::new("cancel");
     let (l, _) = fx.launcher(holding(), probe(0), ExecBudgets::default());
-    let p = l.launch(&cid("run1"), &eid(), &ok_spec()).expect("launch");
+    let p = l
+        .launch(&cid("run1"), &eid(), &ok_spec(), fx.instance("run1"))
+        .expect("launch");
     let e = p
         .wait_exit(WAIT, Duration::from_millis(10), &|| true)
         .expect_err("cancelled");
@@ -653,7 +719,9 @@ fn repair5_4148_wait_is_cancellable() {
 fn repair5_4148_drop_keeps_helper_and_shutdown_stops_it() {
     let fx = Fixture::new("drop");
     let (l, pids) = fx.launcher(holding(), probe(0), ExecBudgets::default());
-    let p = l.launch(&cid("run1"), &eid(), &ok_spec()).expect("launch");
+    let p = l
+        .launch(&cid("run1"), &eid(), &ok_spec(), fx.instance("run1"))
+        .expect("launch");
     let helper = *pids.lock().expect("lock").first().expect("pid");
     drop(p);
     std::thread::sleep(Duration::from_millis(100));
@@ -665,7 +733,7 @@ fn repair5_4148_drop_keeps_helper_and_shutdown_stops_it() {
     l.shutdown_all();
     assert!(gone(helper));
     let e = l
-        .launch(&cid("run1"), &eid(), &ok_spec())
+        .launch(&cid("run1"), &eid(), &ok_spec(), fx.instance("run1"))
         .err()
         .expect("stopped");
     assert_eq!(
@@ -685,7 +753,9 @@ fn cri5_4221_started_cgroup_name_reaches_probe() {
     let fx = Fixture::new("name");
     let pr = probe(0);
     let (l, _) = fx.launcher(holding(), Arc::clone(&pr), ExecBudgets::default());
-    let p = l.launch(&cid("run1"), &eid(), &ok_spec()).expect("launch");
+    let p = l
+        .launch(&cid("run1"), &eid(), &ok_spec(), fx.instance("run1"))
+        .expect("launch");
     p.signal(Signal::SIGKILL).expect("kill");
     assert!(p.status().is_err());
     let got = recorded(&pr);
@@ -706,7 +776,9 @@ fn cri5_4221_kill_then_confirmed_wait_returns_exit() {
         ..ExecBudgets::default()
     };
     let (l, _) = fx.launcher(holding(), Arc::clone(&pr), budgets);
-    let p = l.launch(&cid("run1"), &eid(), &ok_spec()).expect("launch");
+    let p = l
+        .launch(&cid("run1"), &eid(), &ok_spec(), fx.instance("run1"))
+        .expect("launch");
     p.signal(Signal::SIGKILL).expect("kill");
     let flip = Arc::clone(&pr);
     let t = std::thread::spawn(move || {
@@ -735,7 +807,9 @@ fn cri5_4221_expired_then_confirmed_wait_returns_exit() {
         ..short()
     };
     let (l, _) = fx.launcher(holding(), Arc::clone(&pr), budgets);
-    let p = l.launch(&cid("run1"), &eid(), &ok_spec()).expect("launch");
+    let p = l
+        .launch(&cid("run1"), &eid(), &ok_spec(), fx.instance("run1"))
+        .expect("launch");
     let flip = Arc::clone(&pr);
     // session 200ms + grace 200ms で監視期限が切れた後に回収が済んだ想定。
     let t = std::thread::spawn(move || {
@@ -758,7 +832,9 @@ fn cri5_4221_helper_failed_then_confirmed_wait_returns_exit() {
         probe(1),
         ExecBudgets::default(),
     );
-    let p = l.launch(&cid("run1"), &eid(), &ok_spec()).expect("launch");
+    let p = l
+        .launch(&cid("run1"), &eid(), &ok_spec(), fx.instance("run1"))
+        .expect("launch");
     assert_eq!(
         p.wait_exit(WAIT, Duration::from_millis(10), &never_cancel),
         Ok(None)
@@ -775,7 +851,9 @@ fn sec1_4221_unconfirmed_keeps_unavailable_after_grace() {
         ..ExecBudgets::default()
     };
     let (l, _) = fx.launcher(holding(), Arc::clone(&pr), budgets);
-    let p = l.launch(&cid("run1"), &eid(), &ok_spec()).expect("launch");
+    let p = l
+        .launch(&cid("run1"), &eid(), &ok_spec(), fx.instance("run1"))
+        .expect("launch");
     p.signal(Signal::SIGKILL).expect("kill");
     let t = Instant::now();
     let e = p
@@ -799,7 +877,9 @@ fn sec1_4221_unconfirmed_keeps_unavailable_after_grace() {
 fn repair5_4221_wait_deadline_and_cancel_win_over_grace() {
     let fx = Fixture::new("order");
     let (l, _) = fx.launcher(holding(), probe(0), ExecBudgets::default());
-    let p = l.launch(&cid("run1"), &eid(), &ok_spec()).expect("launch");
+    let p = l
+        .launch(&cid("run1"), &eid(), &ok_spec(), fx.instance("run1"))
+        .expect("launch");
     p.signal(Signal::SIGKILL).expect("kill");
     let e = p
         .wait_exit(
@@ -895,7 +975,7 @@ fn sec1_4221_v1_or_malformed_started_is_rejected_and_never_confirmed() {
         let pr = probe(1);
         let (l, pids) = fx.launcher(script, Arc::clone(&pr), ExecBudgets::default());
         let e = l
-            .launch(&cid("run1"), &eid(), &ok_spec())
+            .launch(&cid("run1"), &eid(), &ok_spec(), fx.instance("run1"))
             .err()
             .expect("rejected");
         assert_eq!(e.code(), CriErrorCode::InvalidArgument);
@@ -1000,7 +1080,9 @@ fn cri5_4282_sigterm_is_sent_as_a_signal_frame_and_ends_with_143() {
         probe(0),
         ExecBudgets::default(),
     );
-    let p = l.launch(&cid("run1"), &eid(), &ok_spec()).expect("launch");
+    let p = l
+        .launch(&cid("run1"), &eid(), &ok_spec(), fx.instance("run1"))
+        .expect("launch");
     p.signal(Signal::SIGTERM).expect("signal");
     assert_eq!(
         *log.lock().expect("lock"),
@@ -1045,7 +1127,9 @@ fn cri5_4282_ack_codes_map_to_cri_errors() {
             probe(0),
             ExecBudgets::default(),
         );
-        let p = l.launch(&cid("run1"), &eid(), &ok_spec()).expect("launch");
+        let p = l
+            .launch(&cid("run1"), &eid(), &ok_spec(), fx.instance("run1"))
+            .expect("launch");
         let e = p.signal(Signal::SIGTERM).expect_err("rejected");
         assert_eq!(e.code(), expect);
         assert_eq!(e.message(), message);
@@ -1069,7 +1153,9 @@ fn repair5_4282_missing_ack_times_out() {
         probe(0),
         short_with_long_session(),
     );
-    let p = l.launch(&cid("run1"), &eid(), &ok_spec()).expect("launch");
+    let p = l
+        .launch(&cid("run1"), &eid(), &ok_spec(), fx.instance("run1"))
+        .expect("launch");
     let begin = Instant::now();
     let e = p.signal(Signal::SIGTERM).expect_err("no ack");
     assert_eq!(e.code(), CriErrorCode::Timeout);
@@ -1091,7 +1177,9 @@ fn repair5_4282_late_ack_after_timeout_does_not_kill_exec() {
         probe(0),
         short_with_long_session(),
     );
-    let p = l.launch(&cid("run1"), &eid(), &ok_spec()).expect("launch");
+    let p = l
+        .launch(&cid("run1"), &eid(), &ok_spec(), fx.instance("run1"))
+        .expect("launch");
     let e = p.signal(Signal::SIGTERM).expect_err("timeout");
     assert_eq!(e.code(), CriErrorCode::Timeout);
     // 遅れた ack が届く時間を待つ。
@@ -1117,7 +1205,9 @@ fn repair5_4282_timeout_then_retry_with_two_acks_succeeds_once() {
         probe(0),
         short_with_long_session(),
     );
-    let p = l.launch(&cid("run1"), &eid(), &ok_spec()).expect("launch");
+    let p = l
+        .launch(&cid("run1"), &eid(), &ok_spec(), fx.instance("run1"))
+        .expect("launch");
     let e = p.signal(Signal::SIGTERM).expect_err("timeout");
     assert_eq!(e.code(), CriErrorCode::Timeout);
     // 再要求: 古い ack（約 700ms）を消費したあと、2 件目の ack で成功する。
@@ -1139,7 +1229,9 @@ fn sec1_4282_wrong_number_ack_kills_helper_and_stays_unconfirmed() {
         probe(0),
         short_with_long_session(),
     );
-    let p = l.launch(&cid("run1"), &eid(), &ok_spec()).expect("launch");
+    let p = l
+        .launch(&cid("run1"), &eid(), &ok_spec(), fx.instance("run1"))
+        .expect("launch");
     let e = p.signal(Signal::SIGTERM).expect_err("violation");
     assert_eq!(e.code(), CriErrorCode::Unavailable);
     let helper = *pids.lock().expect("lock").first().expect("pid");
@@ -1164,7 +1256,9 @@ fn sec1_4282_disallowed_signals_send_no_frame() {
         probe(0),
         ExecBudgets::default(),
     );
-    let p = l.launch(&cid("run1"), &eid(), &ok_spec()).expect("launch");
+    let p = l
+        .launch(&cid("run1"), &eid(), &ok_spec(), fx.instance("run1"))
+        .expect("launch");
     for n in [19u8, 18, 28, 34, 64, 20] {
         let e = p
             .signal(Signal::new(n).expect("sig"))
@@ -1188,4 +1282,157 @@ fn short_with_long_session() -> ExecBudgets {
         signal_ack: Duration::from_millis(500),
         ..ExecBudgets::default()
     }
+}
+
+/// 識別子を報告しない（instance を外した record を返す）状態ストア。旧い記録の模擬（#4323）。
+struct NoInstanceStore(Arc<FileStateStore>);
+
+impl StateStore for NoInstanceStore {
+    fn create(&self, req: &CreateStateRequest) -> Result<StateRecord, TraitError> {
+        self.0.create(req)
+    }
+    fn update(&self, req: &UpdateStateRequest) -> Result<StateRecord, TraitError> {
+        self.0.update(req)
+    }
+    fn get(&self, req: &GetStateRequest) -> Result<StateRecord, TraitError> {
+        let r = self.0.get(req)?;
+        StateRecord::new(r.status().clone(), r.bundle().to_path_buf(), r.revision())
+    }
+    fn list(&self, req: &ListStateRequest) -> Result<StateList, TraitError> {
+        self.0.list(req)
+    }
+    fn delete(&self, req: &DeleteStateRequest) -> Result<DeleteStateResponse, TraitError> {
+        self.0.delete(req)
+    }
+}
+
+/// CRI-5・SEC-1・CORE-1（#4323）: 登録時と同じインスタンスなら起動する。
+#[test]
+fn cri5_4323_matching_instance_launches() {
+    let fx = Fixture::new("t4323-match");
+    let (l, pids) = fx.launcher(holding(), probe(0), ExecBudgets::default());
+    let inst = fx.instance("run1");
+    assert!(inst.is_some(), "store reports an instance");
+    l.launch(&cid("run1"), &eid(), &ok_spec(), inst)
+        .expect("launch");
+    assert_eq!(pids.lock().expect("lock").len(), 1);
+}
+
+/// SEC-1・CORE-1（#4323）: 登録後（shim の purge_mismatched の後）に外で作り直されたコンテナへは、
+/// 旧登録の argv を起動せず `FAILED_PRECONDITION` で拒否し、helper を起動しない。
+#[test]
+fn sec1_4323_recreated_between_reads_is_rejected_without_helper() {
+    let fx = Fixture::new("t4323-recreate");
+    let (l, pids) = fx.launcher(holding(), probe(0), ExecBudgets::default());
+    let registered = fx.instance("run1");
+    fx.recreate_running("run1", fx.init.id());
+    let current = fx.instance("run1");
+    assert!(registered.is_some() && current.is_some());
+    assert_ne!(registered, current, "recreation changes the instance");
+    let e = l
+        .launch(&cid("run1"), &eid(), &ok_spec(), registered)
+        .err()
+        .expect("recreated");
+    assert_eq!(
+        (e.code(), e.message()),
+        (CriErrorCode::FailedPrecondition, MSG_EXEC_INSTANCE_CHANGED)
+    );
+    assert!(pids.lock().expect("lock").is_empty(), "no helper started");
+    assert_eq!(l.tracked_helpers(), 0);
+    // 新しい値を控え直した登録は起動する。
+    l.launch(&cid("run1"), &eid(), &ok_spec(), current)
+        .expect("relaunch");
+    assert_eq!(pids.lock().expect("lock").len(), 1);
+}
+
+/// 照合は Running の確認より先（#4323）: 作り直された後に停止したコンテナも "not running" ではなく recreated になる。
+#[test]
+fn sec1_4323_recreated_then_stopped_reports_recreated() {
+    let fx = Fixture::new("t4323-stopped");
+    let (l, pids) = fx.launcher(holding(), probe(0), ExecBudgets::default());
+    let registered = fx.instance("stopped1");
+    // stopped1 を別インスタンスに差し替える（Created のまま）。
+    let id = cid("stopped1");
+    let old = fx
+        .store
+        .get(&GetStateRequest::new(id.clone()))
+        .expect("get");
+    fx.store
+        .delete(&DeleteStateRequest::new(id.clone(), old.revision()))
+        .expect("delete");
+    fx.store
+        .create(
+            &CreateStateRequest::new(
+                ContainerStatus::created(id.clone(), None),
+                fx.dir.0.join("bundle"),
+            )
+            .expect("req"),
+        )
+        .expect("create");
+    let e = l
+        .launch(&id, &eid(), &ok_spec(), registered)
+        .err()
+        .expect("err");
+    assert_eq!(
+        (e.code(), e.message()),
+        (CriErrorCode::FailedPrecondition, MSG_EXEC_INSTANCE_CHANGED)
+    );
+    assert!(pids.lock().expect("lock").is_empty());
+}
+
+/// SEC-1（#4323）: 片側だけ None（登録に識別子があり記録に無い・その逆）は拒否する。
+#[test]
+fn sec1_4323_one_sided_none_is_rejected() {
+    let fx = Fixture::new("t4323-onesided");
+    let pids = Arc::new(Mutex::new(Vec::new()));
+    let l = ShimExecLauncher::with_budgets(
+        fx.dir.0.join("state"),
+        Arc::new(NoInstanceStore(Arc::clone(&fx.store))) as Arc<dyn StateStore>,
+        Arc::new(FakeSpawner {
+            script: holding(),
+            pids: Arc::clone(&pids),
+        }),
+        probe(0),
+        ExecBudgets::default(),
+    );
+    // 登録に Some、記録（instance を外した）が None。
+    let some = fx.instance("run1");
+    assert!(some.is_some());
+    let e = l
+        .launch(&cid("run1"), &eid(), &ok_spec(), some)
+        .err()
+        .expect("one-sided");
+    assert_eq!(
+        (e.code(), e.message()),
+        (CriErrorCode::FailedPrecondition, MSG_EXEC_INSTANCE_CHANGED)
+    );
+    assert!(pids.lock().expect("lock").is_empty());
+    // 登録が None、記録が Some（通常の FileStateStore）。
+    let (l2, pids2) = fx.launcher(holding(), probe(0), ExecBudgets::default());
+    let e = l2
+        .launch(&cid("run1"), &eid(), &ok_spec(), None)
+        .err()
+        .expect("one-sided reverse");
+    assert_eq!(e.message(), MSG_EXEC_INSTANCE_CHANGED);
+    assert!(pids2.lock().expect("lock").is_empty());
+}
+
+/// 残余の固定（#4323）: 両側 None（識別子を報告しない実装・旧い記録）は判定できないので起動する（保護されない）。
+#[test]
+fn cri5_4323_unreported_instance_on_both_sides_is_not_protected() {
+    let fx = Fixture::new("t4323-none");
+    let pids = Arc::new(Mutex::new(Vec::new()));
+    let l = ShimExecLauncher::with_budgets(
+        fx.dir.0.join("state"),
+        Arc::new(NoInstanceStore(Arc::clone(&fx.store))) as Arc<dyn StateStore>,
+        Arc::new(FakeSpawner {
+            script: holding(),
+            pids: Arc::clone(&pids),
+        }),
+        probe(0),
+        ExecBudgets::default(),
+    );
+    l.launch(&cid("run1"), &eid(), &ok_spec(), None)
+        .expect("launch");
+    assert_eq!(pids.lock().expect("lock").len(), 1);
 }

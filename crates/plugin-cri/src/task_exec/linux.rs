@@ -10,12 +10,15 @@ use std::time::{Duration, Instant};
 
 use fandhe_container_core::exec::{ExecCgroupName, ExecCgroupPresence, exec_child_cgroup_presence};
 use fandhe_container_core::traits::{
-    CgroupPlacement, ContainerId, ContainerState, ErrorCode, GetStateRequest, Signal, StateStore,
+    CgroupPlacement, ContainerId, ContainerInstance, ContainerState, ErrorCode, GetStateRequest,
+    Signal, StateStore,
 };
+use fandhe_container_cri::adapter::instance_matches;
 use fandhe_container_cri::error::CriError;
 use fandhe_container_cri::shim_v2::{
     ExecId, ExecProcessSpec, ExecProcessStatus, TaskExecLauncher, TaskExecProcess,
 };
+use fandhe_container_cri::streaming::exec::MSG_EXEC_INSTANCE_CHANGED;
 use fandhe_container_supervisor::stream_exec::channel::{
     HelperMessage, StdioSend, recv_from_helper, send_signal, send_stdio_handover,
 };
@@ -439,6 +442,7 @@ impl TaskExecLauncher for ShimExecLauncher {
         container: &ContainerId,
         _exec_id: &ExecId,
         spec: &ExecProcessSpec,
+        expected_instance: Option<u64>,
     ) -> Result<Arc<dyn TaskExecProcess>, CriError> {
         Self::check_spec(spec)?;
         if lock_tracker(&self.tracker).stopped {
@@ -456,6 +460,15 @@ impl TaskExecLauncher for ShimExecLauncher {
                     CriError::unavailable("container state is unavailable")
                 }
             })?;
+        // 登録時のインスタンスを、pid を決めるのと同じ record で照合する。shim の `purge_mismatched` は別の読み取りなので、
+        // その後に外で作り直されても旧登録の argv を新インスタンスへ起動しない。helper の起動前に返す
+        // （作り直し後に停止していても "not running" ではなくこちらを返す。#4323・CRI-5・SEC-1・CORE-1）。
+        if !instance_matches(
+            expected_instance,
+            record.instance().map(ContainerInstance::value),
+        ) {
+            return Err(CriError::failed_precondition(MSG_EXEC_INSTANCE_CHANGED));
+        }
         let placement = record.cgroup().cloned();
         let status = record.status();
         let pid: NonZeroU32 = match (status.state(), status.pid()) {

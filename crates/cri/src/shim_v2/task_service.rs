@@ -573,7 +573,7 @@ impl TaskService {
             .execs
             .begin_start(&container, &exec_id)
             .map_err(|e| to_status(&e))?;
-        let result = launcher.launch(&container, &exec_id, &ticket.spec);
+        let result = launcher.launch(&container, &exec_id, &ticket.spec, ticket.instance);
         self.execs
             .finish_start(&container, &exec_id, &ticket, result.as_ref().ok().cloned())
             .map_err(|e| to_status(&e))?;
@@ -1536,6 +1536,10 @@ mod tests {
         launched: Mutex<Vec<(String, String, ExecProcessSpec)>>,
         procs: Mutex<Vec<Arc<FakeProc>>>,
         fail: Mutex<bool>,
+        /// 受け取った `expected_instance` の記録（#4323）。
+        instances: Mutex<Vec<Option<u64>>>,
+        /// `Some` なら起動役の照合による拒否を模して返す（#4323）。
+        reject: Mutex<Option<CriError>>,
     }
 
     impl FakeLauncher {
@@ -1550,7 +1554,12 @@ mod tests {
             c: &ContainerId,
             e: &ExecId,
             s: &ExecProcessSpec,
+            expected_instance: Option<u64>,
         ) -> Result<Arc<dyn TaskExecProcess>, CriError> {
+            self.instances.lock().unwrap().push(expected_instance);
+            if let Some(e) = self.reject.lock().unwrap().clone() {
+                return Err(e);
+            }
             if *self.fail.lock().unwrap() {
                 return Err(CriError::unavailable("launch failed"));
             }
@@ -1832,6 +1841,7 @@ mod tests {
                 _c: &ContainerId,
                 _e: &ExecId,
                 _s: &ExecProcessSpec,
+                _expected_instance: Option<u64>,
             ) -> Result<Arc<dyn TaskExecProcess>, CriError> {
                 // 起動中に init が停止した場面を作ってから Delete を走らせる。
                 stopped(&self.fake, "c1", Some(0));
@@ -3298,6 +3308,7 @@ mod tests {
                 _c: &ContainerId,
                 _e: &ExecId,
                 _s: &ExecProcessSpec,
+                _expected_instance: Option<u64>,
             ) -> Result<Arc<dyn TaskExecProcess>, CriError> {
                 self.entered.lock().unwrap().send(()).unwrap();
                 std::thread::sleep(std::time::Duration::from_millis(300));
@@ -3537,6 +3548,43 @@ mod tests {
             assert_eq!(launched[0].2.args(), ["/bin/true"]);
             assert_eq!(launched[0].2.env(), ["N=1"]);
         }
+    }
+
+    /// #4323・CRI-5・SEC-1: Start は登録時のインスタンス識別子を起動役へ渡す（V2 / V3）。
+    #[test]
+    fn cri5_4323_start_passes_registered_instance() {
+        for v in [TaskApiVersion::V2, TaskApiVersion::V3] {
+            let (s, f, l) = svc_exec(v);
+            running_container(&s, "c1");
+            set_instance(&f, "c1", 7);
+            s.handle("Exec", &exec_req("c1", "e0", SPEC)).unwrap();
+            s.handle("Start", &start_exec_req("c1", "e0")).unwrap();
+            assert_eq!(*l.instances.lock().unwrap(), vec![Some(7)]);
+        }
+    }
+
+    /// #4323: 起動役が照合で拒否すると FAILED_PRECONDITION のまま返り、登録は Created に戻る。
+    /// 次の Start は新しいインスタンスを読んで旧登録を除き、NOT_FOUND になって起動役を呼ばない。
+    #[test]
+    fn cri5_4323_launcher_instance_rejection_leaves_entry_and_next_start_purges() {
+        let (s, f, l) = svc_exec(TaskApiVersion::V2);
+        running_container(&s, "c1");
+        set_instance(&f, "c1", 1);
+        s.handle("Exec", &exec_req("c1", "e0", SPEC)).unwrap();
+        *l.reject.lock().unwrap() = Some(CriError::failed_precondition(
+            "container was recreated after the exec request",
+        ));
+        let (code, msg) = err_code(s.handle("Start", &start_exec_req("c1", "e0")));
+        assert_eq!(code, PRECOND);
+        assert_eq!(msg, "container was recreated after the exec request");
+        assert_eq!(
+            state_exec_of(&s, "c1", "e0").status,
+            TaskStatus::Created as i32
+        );
+        recreate_externally(&f, "c1", 2);
+        let (code, msg) = err_code(s.handle("Start", &start_exec_req("c1", "e0")));
+        assert_eq!((code, msg.as_str()), (NOT_FOUND, "exec not found"));
+        assert_eq!(l.instances.lock().unwrap().len(), 1);
     }
 
     /// #4220: Exec は旧い登録を除いてから登録するので、コンテナ単位の上限も同じ exec_id の再登録も回復する。

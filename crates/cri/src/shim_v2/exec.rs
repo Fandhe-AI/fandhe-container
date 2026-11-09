@@ -200,6 +200,10 @@ pub(super) fn sleep_until(until: Instant, cancelled: &dyn Fn() -> bool) -> bool 
 /// - 戻り値は起動したプロセスのハンドル [`TaskExecProcess`]。
 /// - shim は `Start` の直前にコンテナが Running かを再確認するが、確認から起動までの間に停止しうる。
 ///   停止済みコンテナへの起動は実装側が拒否する（`FAILED_PRECONDITION`）。
+/// - `expected_instance` は登録時に実行層が報告したインスタンス識別子。実装は**起動対象（pid）を決める状態読み取りと
+///   同じ読み取り**で [`crate::adapter::instance_matches`] により照合し、不一致（値が違う・片側だけ `None`）なら
+///   起動せず `FAILED_PRECONDITION`（`MSG_EXEC_INSTANCE_CHANGED`）を返す。shim の `purge_mismatched` は別の読み取りで
+///   行うため、その後の作り直し（TOCTOU）は起動役の照合だけが塞ぐ（#4323・CRI-5・SEC-1）。
 /// - panic しないこと。panic すると登録簿の状態が `Starting` のまま残り、コンテナのゲートも毒される
 ///   （以後そのストライプは `INTERNAL`）。
 ///
@@ -212,6 +216,7 @@ pub trait TaskExecLauncher: Send + Sync {
         container: &ContainerId,
         exec_id: &ExecId,
         spec: &ExecProcessSpec,
+        expected_instance: Option<u64>,
     ) -> Result<Arc<dyn TaskExecProcess>, CriError>;
 }
 
@@ -442,6 +447,8 @@ struct ExecEntry {
 pub struct StartTicket {
     /// 起動する exec の仕様。
     pub spec: ExecProcessSpec,
+    /// 登録時にコンテナが報告したインスタンス識別子（#4323）。起動役が自分の状態読み取りと照合する。
+    pub instance: Option<u64>,
     token: u64,
 }
 
@@ -672,6 +679,7 @@ impl ExecRegistry {
                 entry.state = ExecState::Starting;
                 Ok(StartTicket {
                     spec: entry.spec.clone(),
+                    instance: entry.instance,
                     token: entry.token,
                 })
             }
@@ -1074,6 +1082,7 @@ mod tests {
         r.register(&c, &e, spec.clone(), None).unwrap();
         r.register(&c2, &e, spec.clone(), None).unwrap();
         let old = r.begin_start(&c, &e).unwrap();
+        assert_eq!(old.instance, None);
         r.purge_container(&c).unwrap();
         assert_eq!(
             r.begin_start(&c, &e).unwrap_err().code(),

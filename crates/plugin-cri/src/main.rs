@@ -21,6 +21,7 @@
 //! 正常停止は stderr に固定の 1 行 `cri plugin shutdown: signal=<SIGTERM|SIGINT> stage=<startup|serve>` を出し、終了コード 0。
 //! 監査 relay の helper は SIGTERM・SIGINT を無視し、本体の終了（EOF）で終わる（グループ・cgroup 宛ての停止で先に死なず、ドレイン中の拒否も
 //! `@audit.log` に届く。#3300）。fork した子へのハンドラの継承は `sys` の doc「fork した子への継承」。SIGHUP は対象外。
+//! 操作統計のスナップショットは `--op-stats-file <PATH>` で opt-in する設計（#4336 で解析のみ。既定は無効。結線は #4340 までは `UNIMPLEMENTED` で起動しない）。
 //!
 //! 終了コード: 0 = `--help` と正常停止、2 = `InvalidArgument`（plugin-macos / plugin-mcp と同じ値）、1 = それ以外の失敗
 //! （未実装・起動失敗・serve の失敗）。
@@ -454,7 +455,19 @@ fn main() -> ExitCode {
             print!("{}", startup::usage());
             ExitCode::SUCCESS
         }
-        Ok(Invocation::Serve { socket, streaming }) => serve(&socket, &streaming),
+        Ok(Invocation::Serve {
+            socket,
+            streaming,
+            op_stats_file: None,
+        }) => serve(&socket, &streaming),
+        // 結線（#4340）までは、指定を黙って捨てず起動しない（REPAIR-3）。W4 でこの腕を結線に置き換える。
+        Ok(Invocation::Serve {
+            op_stats_file: Some(_),
+            ..
+        }) => fail(
+            PluginErrorCode::Unimplemented,
+            startup::MSG_OP_STATS_FILE_NOT_WIRED,
+        ),
         Ok(_) => {
             // `Run` と、将来足される値は成功扱いにしない。
             fail(

@@ -102,8 +102,8 @@ use std::time::Instant;
 use prost::Message;
 
 use super::exec::{
-    ExecId, ExecPhase, ExecProcessStatus, ExecRegistry, TaskExecLauncher, TaskExecProcess,
-    parse_process_spec, sleep_until,
+    ExecId, ExecPhase, ExecProcessStatus, ExecRegistry, StartedExec, TaskExecLauncher,
+    TaskExecProcess, parse_process_spec, sleep_until,
 };
 use super::exec_exit_watch::{
     ExecExitWatch, MAX_EXEC_EXIT_WATCHERS, WatchSlot, claim_and_publish, exec_task_exit,
@@ -871,7 +871,12 @@ impl TaskService {
         // 起動済みの exec の TaskExit を TaskDelete より前に確定する（#4317）。終了済みなら補完し、
         // 実行中・照会の失敗は印だけ取って送らない（終了を捏造しない。purge 後は watcher も黙る）。
         if let (Some(publisher), Some(container)) = (&self.event_publisher, &container) {
-            for (exec_id, process, claim) in self.execs.started_of(container) {
+            for StartedExec {
+                exec_id,
+                process,
+                exit_claim: claim,
+            } in self.execs.started_of(container)
+            {
                 let finished = match process.status() {
                     Ok(ExecProcessStatus::Exited { code }) => Some(code),
                     _ => None,

@@ -392,6 +392,16 @@ impl std::fmt::Debug for ExecPhase {
     }
 }
 
+/// `Started` の exec 1 件（コンテナの Delete が TaskExit を補完するときの持ち物。#4317）。
+pub struct StartedExec {
+    /// exec ID。
+    pub exec_id: ExecId,
+    /// 起動済みのプロセスのハンドル。
+    pub process: Arc<dyn TaskExecProcess>,
+    /// 送信権の印（`exit_claim`）。
+    pub exit_claim: Arc<Mutex<bool>>,
+}
+
 /// ある時点の exec の段階と、登録固有のトークン（再登録の検出に使う）。
 #[derive(Debug, Clone)]
 pub struct ExecSnapshot {
@@ -731,11 +741,7 @@ impl ExecRegistry {
 
     /// コンテナの `Started` の exec の一覧（exec ID・ハンドル・送信権の印）。件数は
     /// [`MAX_EXECS_PER_CONTAINER`] 以下。コンテナの Delete が exec の TaskExit を補完するために使う（#4317）。
-    #[allow(clippy::type_complexity)]
-    pub fn started_of(
-        &self,
-        container: &ContainerId,
-    ) -> Vec<(ExecId, Arc<dyn TaskExecProcess>, Arc<Mutex<bool>>)> {
+    pub fn started_of(&self, container: &ContainerId) -> Vec<StartedExec> {
         let Ok(inner) = self.inner.lock() else {
             return Vec::new();
         };
@@ -744,11 +750,11 @@ impl ExecRegistry {
             .iter()
             .filter(|((c, _), _)| c == container.as_str())
             .filter_map(|((_, e), entry)| match &entry.state {
-                ExecState::Started(p) => Some((
-                    ExecId::new(e).ok()?,
-                    Arc::clone(p),
-                    Arc::clone(&entry.exit_claim),
-                )),
+                ExecState::Started(p) => Some(StartedExec {
+                    exec_id: ExecId::new(e).ok()?,
+                    process: Arc::clone(p),
+                    exit_claim: Arc::clone(&entry.exit_claim),
+                }),
                 _ => None,
             })
             .collect()
@@ -1181,7 +1187,7 @@ mod tests {
         assert!(!r.is_live(&c, &e, t.token() + 1));
         let started = r.started_of(&c);
         assert_eq!(started.len(), 1);
-        assert_eq!(started[0].0, e);
+        assert_eq!(started[0].exec_id, e);
         r.remove(&c, &e).unwrap();
         assert!(!r.is_live(&c, &e, t.token()));
         r.register(&c, &e, spec, None).unwrap();

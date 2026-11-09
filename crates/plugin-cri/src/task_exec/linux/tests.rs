@@ -1436,6 +1436,7 @@ fn cri5_4323_unreported_instance_on_both_sides_is_not_protected() {
         .expect("launch");
     assert_eq!(pids.lock().expect("lock").len(), 1);
 }
+
 /// 起動役の記録器から操作名の (success, failure) を読む。未記録は `None`（#4379）。
 fn counts(l: &ShimExecLauncher, name: &str) -> Option<(u64, u64)> {
     l.recorder()

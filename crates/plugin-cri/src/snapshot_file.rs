@@ -1,7 +1,7 @@
 //! op-stats のスナップショットファイルを安全に開いて原子的に置き換える部品（#4335・CRI-6・REPAIR-4・SEC-1）。
 //!
-//! 呼び出し元の予定: W3（#4337）の telemetry sink が専用 thread から [`SnapshotTarget::replace`] を呼ぶ
-//! （本部品は同期 I/O のため RPC 経路から直接呼ばない。REPAIR-5）。現時点では未結線で、起動引数の解析（W2・#4336）・
+//! 呼び出し元: `telemetry::OpStatsFileSink`（#4337）の専用 thread が [`SnapshotTarget::replace`] を呼ぶ
+//! （本部品は同期 I/O のため RPC 経路から直接呼ばない。REPAIR-5）。`main.rs` への結線は未了で、起動引数の解析（W2・#4336）・
 //! 停止時の最後の書き出し（W4・#4340）・設計書の更新（W5・#4341）は別 issue。契約の出典は
 //! `docs/design/cri-op-stats-export.md`（案 C。opt-in の絶対パスへ原子的に置き換えるスナップショット）。
 //!

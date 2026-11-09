@@ -312,7 +312,7 @@ pub fn reclaim_stale_container_logs(
 /// 起動時の走査が処理する ID 数の上限（無制限の走査を避ける。REPAIR-5）。
 pub const MAX_SWEEP_IDS: usize = 4096;
 
-/// [`sweep_stale_container_logs`] の結果。パス・ID は含めない（件数のみ。ERR-1）。
+/// [`sweep_stale_container_logs`] と `supervisor_log::sweep_stale_supervisor_logs` の結果。パス・ID は含めない（件数のみ。ERR-1）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SweepReport {
     /// 走査したディレクトリエントリ数。
@@ -347,10 +347,70 @@ pub fn sweep_stale_container_logs(
     may_remove: Arc<dyn Fn(&fandhe_container_core::traits::ContainerId) -> bool + Send + Sync>,
     budget: Duration,
 ) -> SweepReport {
+    sweep_stale_logs_in(
+        root,
+        SweepTarget::ContainerLogs,
+        may_remove,
+        budget,
+        MAX_SWEEP_IDS,
+    )
+}
+
+/// 走査の対象。差し替えるのはディレクトリと ID ごとの削除関数（とその試行上限）だけで、走査の手順は共有する（REPAIR-1）。
+///
+/// 削除関数は `impl Fn` を受けるため関数ポインタにできず、2 値の閉じた enum の `match` で切り替える。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SweepTarget {
+    /// `@container-logs`（[`remove_container_logs_guarded_bounded`]）。
+    ContainerLogs,
+    /// `@supervisor-logs`（`supervisor_log::remove_guarded_bounded`。#4339）。
+    SupervisorLogs,
+}
+
+impl SweepTarget {
+    fn dir(self, root: &std::path::Path) -> std::path::PathBuf {
+        match self {
+            Self::ContainerLogs => container_log_dir(root),
+            Self::SupervisorLogs => crate::supervisor_log::log_dir(root),
+        }
+    }
+
+    fn remove_timeout(self) -> Duration {
+        match self {
+            Self::ContainerLogs => CONTAINER_LOG_REMOVE_TIMEOUT,
+            Self::SupervisorLogs => crate::supervisor_log::SUPERVISOR_LOG_REMOVE_TIMEOUT,
+        }
+    }
+
+    fn remove_bounded(
+        self,
+        root: &std::path::Path,
+        id: &fandhe_container_core::traits::ContainerId,
+        timeout: Duration,
+        guard: impl Fn() -> bool + Send + 'static,
+    ) -> Result<RemovedLogs, TraitError> {
+        match self {
+            Self::ContainerLogs => remove_container_logs_guarded_bounded(root, id, timeout, guard),
+            Self::SupervisorLogs => {
+                crate::supervisor_log::remove_guarded_bounded(root, id, timeout, guard)
+            }
+        }
+    }
+}
+
+/// 2 つの走査関数の共通本体。対象のディレクトリだけを走査し、`max_ids` を超える分は打ち切る（`timed_out`）。
+/// 公開の入口は常に [`MAX_SWEEP_IDS`] を渡す。
+pub(crate) fn sweep_stale_logs_in(
+    root: &std::path::Path,
+    target: SweepTarget,
+    may_remove: Arc<dyn Fn(&fandhe_container_core::traits::ContainerId) -> bool + Send + Sync>,
+    budget: Duration,
+    max_ids: usize,
+) -> SweepReport {
     use std::sync::atomic::AtomicBool;
     let started = Instant::now();
     let mut report = SweepReport::default();
-    let dir = container_log_dir(root);
+    let dir = target.dir(root);
     // 初期検査と列挙も無期限に止まり得る（応答しない FUSE 等）ため、残り予算で期限つきの作業スレッドに包む（REPAIR-5）。
     enum Initial {
         Missing,
@@ -366,7 +426,7 @@ pub fn sweep_stale_container_logs(
     };
     let initial = crate::supervisor_log::run_bounded_classified(
         move || match std::fs::symlink_metadata(&dir) {
-            Ok(_) => match rotating::list_stale_log_ids(&dir, MAX_SWEEP_IDS) {
+            Ok(_) => match rotating::list_stale_log_ids(&dir, max_ids) {
                 Ok(s) => Initial::Scan(s),
                 Err(_) => Initial::Failed,
             },
@@ -408,10 +468,10 @@ pub fn sweep_stale_container_logs(
         let guard_blocked = Arc::clone(&blocked);
         let guard_fn = Arc::clone(&may_remove);
         let guard_id = id.clone();
-        let result = remove_container_logs_guarded_bounded(
+        let result = target.remove_bounded(
             root,
             id,
-            CONTAINER_LOG_REMOVE_TIMEOUT.min(remaining),
+            target.remove_timeout().min(remaining),
             move || {
                 let ok = guard_fn(&guard_id);
                 if !ok {

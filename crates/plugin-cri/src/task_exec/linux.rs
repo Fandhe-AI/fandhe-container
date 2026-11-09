@@ -1,6 +1,7 @@
 //! `TaskExecLauncher` の Linux 実装（stream-exec helper 経由）。契約と残余は親モジュール `task_exec` の doc を参照
 //! （CRI-5・CRI-1・SEC-1・REPAIR-3・REPAIR-5・#4148）。
 
+use std::collections::VecDeque;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -169,12 +170,17 @@ impl Phase {
     }
 }
 
+/// 未応答の要求の保持上限（これ以上は新しい要求を送らず `UNAVAILABLE`。無制限の蓄積を防ぐ。REPAIR-5）。
+const MAX_PENDING_SIGNALS: usize = 16;
+
 /// SIGKILL 以外のシグナルの `SignalAck` の受け渡し口（待っている要求 1 件と、監視スレッドが受けた結果。#4282）。
 #[derive(Default)]
 struct AckSlot {
-    /// ack を待っている要求のシグナル（要求は 1 件ずつ排他するので高々 1 件）。
-    waiting: Option<ExecSignal>,
-    /// 受けた結果（待っている要求の番号と一致したものだけ）。
+    /// helper へ送って ack をまだ受けていない要求（送信順。helper は frame の順に 1 件ずつ ack する）。
+    /// 各要素は (シグナル, 待ち手が諦めた〔期限切れ・結果先着〕か)。諦めていない要求は高々 1 件で、必ず末尾（要求は排他）。
+    /// 諦めた要求の遅れた ack は黙って消費し、停止も新要求の成功扱いもしない（REPAIR-5・#4282）。
+    pending: VecDeque<(ExecSignal, bool)>,
+    /// 受けた結果（待っている要求のものだけ）。
     received: Option<SignalAckCode>,
 }
 
@@ -216,17 +222,31 @@ impl Inner {
         self.acked.notify_all();
     }
 
-    /// 受けた `SignalAck` を待っている要求へ渡す。待っていない・番号が違う・既に受け取り済みなら `false`
-    /// （プロトコル違反。呼び出し側が helper を止める）。
+    /// 受けた `SignalAck` を先頭の未応答の要求へ対応づける。諦められた要求の ack は黙って消費して `true`。
+    /// 未応答が無い・シグナルが合わない・既に受け取り済みなら `false`（プロトコル違反。呼び出し側が helper を止める）。
     fn deliver_ack(&self, signal: ExecSignal, code: SignalAckCode) -> bool {
         let mut a = self.lock_ack();
-        if a.waiting != Some(signal) || a.received.is_some() {
-            return false;
+        // ack が来なかった（送信失敗後の欠落等）諦め済みの要求は読み飛ばす。
+        while matches!(a.pending.front(), Some((s, true)) if *s != signal) {
+            a.pending.pop_front();
         }
-        a.received = Some(code);
-        drop(a);
-        self.acked.notify_all();
-        true
+        match a.pending.pop_front() {
+            Some((s, true)) if s == signal => true,
+            Some((s, false)) if s == signal && a.received.is_none() => {
+                a.received = Some(code);
+                drop(a);
+                self.acked.notify_all();
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// 末尾の（待ち手が今いる）要求を「諦めた」印にする。
+fn abandon_last(a: &mut AckSlot) {
+    if let Some(last) = a.pending.back_mut() {
+        last.1 = true;
     }
 }
 
@@ -555,20 +575,23 @@ impl ShimExecProcess {
         };
         {
             let mut a = self.inner.lock_ack();
-            a.waiting = Some(signal);
+            if a.pending.len() >= MAX_PENDING_SIGNALS {
+                return Err(undelivered());
+            }
+            a.pending.push_back((signal, false));
             a.received = None;
         }
         if send_signal(stream, signal, Instant::now() + SIGNAL_SEND_BUDGET).is_err() {
             // 途中まで書いた frame は境界が崩れている。以後この channel へは送らない（helper は受信失敗で signal を無視する）。
             *tx = None;
-            self.inner.lock_ack().waiting = None;
+            // 送り切れていないので ack は来ない。末尾の自分の要求を取り除く。
+            self.inner.lock_ack().pending.pop_back();
             return Err(undelivered());
         }
         let until = Instant::now() + self.signal_ack;
         let mut a = self.inner.lock_ack();
         loop {
             if let Some(code) = a.received.take() {
-                a.waiting = None;
                 return match code {
                     SignalAckCode::Delivered => Ok(()),
                     SignalAckCode::NotStarted => Err(CriError::failed_precondition(
@@ -585,12 +608,13 @@ impl ShimExecProcess {
                 Phase::Unconfirmed { .. } => Some(CriError::unavailable(UNCONFIRMED)),
             };
             if let Some(e) = ended {
-                a.waiting = None;
+                abandon_last(&mut a);
                 return Err(e);
             }
             let now = Instant::now();
             if now >= until {
-                a.waiting = None;
+                // helper は後から ack しうる。その ack は諦め済みとして消費させる。
+                abandon_last(&mut a);
                 return Err(CriError::timeout("exec signal was not acknowledged"));
             }
             let slice = WAIT_SLICE.min(until - now);

@@ -778,6 +778,8 @@ enum Reply {
     WrongNumber,
     /// `delivered` の ack の後に `Result(Signaled(15))` を返す。
     DeliveredThenTerminated,
+    /// 1 件目だけ `delay` 待ってから `delivered` の ack を返し、2 件目以降は即座に返す（期限切れ後の遅延 ack の再現）。
+    FirstAckDelayed(Duration),
 }
 
 /// `Started` の後に `Signal` frame（生の 9 バイト）を読み、`log` へ積んで `reply` に従う script（最長 10 秒保持）。
@@ -789,6 +791,7 @@ fn signal_script(reply: Reply, log: Arc<Mutex<Vec<Vec<u8>>>>) -> Script {
         end.set_read_timeout(Some(Duration::from_millis(500)))
             .expect("timeout");
         let end_until = Instant::now() + Duration::from_secs(10);
+        let mut seen = 0usize;
         while Instant::now() < end_until {
             let mut frame = [0u8; 9];
             match end.read_exact(&mut frame) {
@@ -805,7 +808,15 @@ fn signal_script(reply: Reply, log: Arc<Mutex<Vec<Vec<u8>>>>) -> Script {
             }
             log.lock().expect("lock").push(frame.to_vec());
             let requested = ExecSignal::new(frame[8]).expect("allowed signal");
+            seen += 1;
             match reply {
+                Reply::FirstAckDelayed(delay) => {
+                    if seen == 1 {
+                        std::thread::sleep(delay);
+                    }
+                    send_signal_ack(&end, requested, SignalAckCode::Delivered, deadline())
+                        .expect("ack");
+                }
                 Reply::Ack(code) => {
                     send_signal_ack(&end, requested, code, deadline()).expect("ack");
                 }
@@ -926,6 +937,57 @@ fn repair5_4282_missing_ack_times_out() {
     assert_eq!(e.message(), "exec signal was not acknowledged");
     assert!(begin.elapsed() >= Duration::from_millis(400));
     assert_eq!(p.status(), Ok(ExecProcessStatus::Running));
+}
+
+/// REPAIR-5・SUP-6・CRI-6・#4282: 期限切れの要求に遅れて届く正常な ack では exec を止めない（helper は無傷で Running のまま）。
+#[test]
+fn repair5_4282_late_ack_after_timeout_does_not_kill_exec() {
+    let fx = Fixture::new("lateack");
+    let log = new_log();
+    let (l, pids) = fx.launcher(
+        signal_script(
+            Reply::FirstAckDelayed(Duration::from_millis(900)),
+            Arc::clone(&log),
+        ),
+        probe(0),
+        short_with_long_session(),
+    );
+    let p = l.launch(&cid("run1"), &eid(), &ok_spec()).expect("launch");
+    let e = p.signal(Signal::SIGTERM).expect_err("timeout");
+    assert_eq!(e.code(), CriErrorCode::Timeout);
+    // 遅れた ack が届く時間を待つ。
+    std::thread::sleep(Duration::from_millis(900));
+    let helper = *pids.lock().expect("lock").first().expect("pid");
+    assert!(alive(helper), "late ack must not stop the helper");
+    assert_eq!(p.status(), Ok(ExecProcessStatus::Running));
+    // 以後の要求は通常どおり成功する。
+    p.signal(Signal::SIGTERM).expect("next request succeeds");
+    assert_eq!(log.lock().expect("lock").len(), 2);
+}
+
+/// REPAIR-5・#4282: 期限切れ → 再要求のとき、古い ack は新要求の成功にならず消費され、2 件目の ack が新要求の成功になる（停止なし）。
+#[test]
+fn repair5_4282_timeout_then_retry_with_two_acks_succeeds_once() {
+    let fx = Fixture::new("retryack");
+    let log = new_log();
+    let (l, pids) = fx.launcher(
+        signal_script(
+            Reply::FirstAckDelayed(Duration::from_millis(700)),
+            Arc::clone(&log),
+        ),
+        probe(0),
+        short_with_long_session(),
+    );
+    let p = l.launch(&cid("run1"), &eid(), &ok_spec()).expect("launch");
+    let e = p.signal(Signal::SIGTERM).expect_err("timeout");
+    assert_eq!(e.code(), CriErrorCode::Timeout);
+    // 再要求: 古い ack（約 700ms）を消費したあと、2 件目の ack で成功する。
+    p.signal(Signal::SIGTERM).expect("retry succeeds");
+    std::thread::sleep(Duration::from_millis(500));
+    let helper = *pids.lock().expect("lock").first().expect("pid");
+    assert!(alive(helper), "no ack may stop the helper");
+    assert_eq!(p.status(), Ok(ExecProcessStatus::Running));
+    assert_eq!(log.lock().expect("lock").len(), 2);
 }
 
 /// SEC-1・REPAIR-3・#4282: 要求と違う番号の ack はプロトコル違反。helper を止めて未確認にし、要求は `UNAVAILABLE`。

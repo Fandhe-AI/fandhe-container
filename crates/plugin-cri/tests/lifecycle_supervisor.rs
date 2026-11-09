@@ -1397,16 +1397,18 @@ fn repair5_create_worst_case_fits_runtime_timeout() {
     use fandhe_container_core::state_store::STATE_LOCK_TIMEOUT;
     use fandhe_container_supervisor::container_options::store::OPTIONS_REMOVE_TIMEOUT;
     use fandhe_container_supervisor::logs::CONTAINER_LOG_REMOVE_TIMEOUT;
-    let reclaim = CONTAINER_LOG_REMOVE_TIMEOUT + OPTIONS_REMOVE_TIMEOUT;
-    assert_eq!(reclaim, Duration::from_secs(15));
+    let reclaim = CONTAINER_LOG_REMOVE_TIMEOUT
+        + fandhe_container_supervisor::supervisor_log::SUPERVISOR_LOG_REMOVE_TIMEOUT
+        + OPTIONS_REMOVE_TIMEOUT;
+    assert_eq!(reclaim, Duration::from_secs(20));
     let audit = RECORD_WAIT_LIMIT * 2;
     assert_eq!(audit, Duration::from_millis(22_900));
     let total = reclaim + STATE_LOCK_TIMEOUT + audit;
-    assert_eq!(total, Duration::from_millis(42_900));
+    assert_eq!(total, Duration::from_millis(47_900));
     assert!(total < PLUGIN_RUNTIME_TIMEOUT);
 }
 
-/// REPAIR-5・#2821: `create` の worker の残存は rootfs の期限 + core の create の 42.9 秒で有限になり、RPC の応答は
+/// REPAIR-5・#2821: `create` の worker の残存は rootfs の期限 + core の create の 47.9 秒で有限になり、RPC の応答は
 /// worker を待たず `PLUGIN_RUNTIME_TIMEOUT` で打ち切られる。分割できない区間（blob 1 本の検証・展開全体）は大きさの上限で有界。
 #[test]
 fn repair5_create_worker_residual_is_bounded() {
@@ -1415,23 +1417,23 @@ fn repair5_create_worker_residual_is_bounded() {
         DEFAULT_MAX_EXTRACTED_BYTES, DEFAULT_MAX_LAYER_ENTRIES,
     };
     assert_eq!(PLUGIN_ROOTFS_DEADLINE, Duration::from_secs(600));
-    let core_create = Duration::from_millis(42_900);
+    let core_create = Duration::from_millis(47_900);
     assert_eq!(
         PLUGIN_ROOTFS_DEADLINE + core_create,
-        Duration::from_millis(642_900)
+        Duration::from_millis(647_900)
     );
     assert!(PLUGIN_RUNTIME_TIMEOUT < PLUGIN_ROOTFS_DEADLINE);
     // #2899: RPC の期限切れの後、dispatch 前の worker は取り消しで止まる。dispatch 後は打ち切れず、
-    // core の create（42.9 秒）+ 失敗時の削除確認（confirm_removed は PLUGIN_RUNTIME_TIMEOUT まで）で有限になる。
+    // core の create（47.9 秒）+ 失敗時の削除確認（confirm_removed は PLUGIN_RUNTIME_TIMEOUT まで）で有限になる。
     assert_eq!(
         core_create + PLUGIN_RUNTIME_TIMEOUT,
-        Duration::from_millis(103_800)
+        Duration::from_millis(108_800)
     );
     assert!(core_create + PLUGIN_RUNTIME_TIMEOUT < PLUGIN_ROOTFS_DEADLINE);
     // #3142: 巻き戻しの release も `PLUGIN_RUNTIME_TIMEOUT` で打ち切られる（従来は上限が無かった）。
     assert_eq!(
         core_create + PLUGIN_RUNTIME_TIMEOUT + PLUGIN_RUNTIME_TIMEOUT,
-        Duration::from_millis(164_700)
+        Duration::from_millis(169_700)
     );
     assert!(core_create + PLUGIN_RUNTIME_TIMEOUT * 2 < PLUGIN_ROOTFS_DEADLINE);
     assert_eq!(DEFAULT_MAX_IMAGE_BYTES, 16 * 1024 * 1024 * 1024);

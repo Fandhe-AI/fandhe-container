@@ -54,7 +54,12 @@ impl Decoy {
     }
 
     fn make(&mut self, p: &Path) -> Result<(), String> {
-        std::fs::create_dir(p).map_err(|e| format!("create decoy dir {}: {e}", p.display()))?;
+        // 本番 shim の状態ルート検査（private = 0700）と揃える。umask 022 の 0755 だと shim が拒否する。
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(p)
+            .map_err(|e| format!("create decoy dir {}: {e}", p.display()))?;
         self.created.push(p.to_path_buf());
         Ok(())
     }

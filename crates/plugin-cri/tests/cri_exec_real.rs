@@ -742,6 +742,14 @@ async fn scenario(
     )
     .await
     .expect("stop");
+    call_with_deadline(
+        c.stop_pod_sandbox(cri::StopPodSandboxRequest {
+            pod_sandbox_id: sb.clone(),
+        }),
+        long,
+    )
+    .await
+    .expect("stop sandbox");
     let rep = reclaim::reclaim(&mut c, &ledger, &token, reclaim::CLEANUP_BUDGET).await;
     assert_eq!(rep.reclaimed_containers, vec![id.clone()], "{rep:?}");
     assert_eq!(rep.reclaimed_sandboxes, vec![sb.clone()], "{rep:?}");

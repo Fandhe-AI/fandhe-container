@@ -1255,6 +1255,9 @@ async fn production_binary_full_lifecycle_real() {
         let mut rep1 = reclaim::reclaim(&mut c, &ledger, &token, reclaim::CLEANUP_BUDGET).await;
         if guard.exited().is_some() || reclaim::plugin_unreachable(&rep1) {
             // plugin が死んでいたら、同じ状態ルートで起動し直してから回収し直す（再採用された記録を消す。#4285）。
+            // 旧 plugin が生きたまま到達不能だと `.cri/@instance.lock` を握り続けるため、新 plugin の起動前に
+            // 旧 guard を drop（kill と回収）して lock を解放する。
+            drop(guard);
             guard = spawn_server_inherit_env(&plugin_bin, &sock2);
             let ch2 = connect_when_ready_with(&sock2, Some(&mut guard), new_config()).await;
             c = RuntimeServiceClient::new(ch2);

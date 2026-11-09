@@ -487,8 +487,7 @@ fn write_and_rename(root: &RootHandle, tmp: &str, bytes: &[u8]) -> Result<(), Oc
     Ok(())
 }
 
-// Windows ホストは設計上 `ImageStore` を開けない（#4333・#2428 案 C。拒否は store.rs の試験が照合）ため unix に限る。
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::image_management::root_handle::rh;

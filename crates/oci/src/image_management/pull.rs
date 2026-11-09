@@ -3216,9 +3216,9 @@ mod store_free_tests {
     /// 公開用の一時名の後始末は、drop で残った一時名を消し、無い名前があっても失敗しない（OCI-7）。
     #[test]
     fn oci7_publish_tmp_cleanup_removes_leftovers() {
-        let dir = std::env::temp_dir().join(format!("fc-oci-pull-tmpclean-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        // 排他作成の試験ルート（既存の名前は消さず辿らない。drop で自分のパスだけ消す。REPAIR-12・#3506）。
+        let root = crate::test_root::test_root("fc-oci-pull-tmpclean", "leftovers");
+        let dir: &std::path::Path = &root;
         let dst = dir.join("abc");
         let tmp = publish_tmp_path(&dst, 7);
         assert_eq!(
@@ -3234,6 +3234,5 @@ mod store_free_tests {
             c.add(dir.join("missing"));
         }
         assert!(!tmp.exists());
-        let _ = fs::remove_dir_all(&dir);
     }
 }

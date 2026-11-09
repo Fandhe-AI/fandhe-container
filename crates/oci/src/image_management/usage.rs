@@ -478,8 +478,7 @@ fn scan_cache(dir: &BlobDir, registered: &BTreeSet<&Digest>) -> Result<CacheUsag
     Ok(usage)
 }
 
-// Windows ホストは設計上 `ImageStore` を開けない（#4333・#2428 案 C。拒否は store.rs の試験が照合）ため unix に限る。
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::image_management::{ContainerRefId, ManifestComposition, PullId};
@@ -546,6 +545,7 @@ mod tests {
     }
 
     /// OCI-7・#473: ストアのガード越しに ls / df を呼べる（排他の内側で集計する契約）。
+    #[cfg(unix)]
     #[test]
     fn oci7_ls_and_df_run_under_store_guard() {
         let root = Root::new("guard");

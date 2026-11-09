@@ -32,7 +32,7 @@
 //! - `AttachSession.stdin` の「バッファしない」に対し、socketpair のバッファ分だけ先行する（`exec_launcher` と同じ逸脱）
 //! - コンテナが stdin を読まず pipe / pty が満杯でも、入力スレッドは待たない `poll(POLLOUT)` と書き込みを書き込み先の記述（dev/ino）ごとの排他の中で行い、10 ms 刻みで再確認するだけで、セッションの
 //!   drop（取り消し）で抜ける（`write` で無期限に止まらない）。書き込みは詰まらない大きさに絞る（fifo は 512 バイト、
-//!   pty・socket は 1 バイト）ため、大きな貼り付けは遅い。排他の保持者が plugin 外の書き手のせいで `write` に止まると同じ記述（同じコンテナ）の入力だけが進まず（別コンテナは進む）、同じ記述の他セッションは取り消しで抜けられる（#4134）。保持者本人の取り消しは採らない（理由・再評価条件は `ArbiterTable` の doc と設計書。#4232）。生きたセッションが読まれない stdin を待ち続ける間は枠を占有する
+//!   pty・socket は 1 バイト）ため、大きな貼り付けは遅い。排他の保持者が plugin 外の書き手のせいで `write` に止まると同じ記述（同じコンテナ）の入力だけが進まず（別コンテナは進む）、同じ記述の他セッションは取り消しで抜けられる（#4134）。保持者本人の取り消しは pipe だけ、自分専用の `O_NONBLOCK` 記述へ開き直して解消した（#4287）。pty・socket は残余（理由・再評価条件は `ArbiterTable` の doc と設計書。#4232）。生きたセッションが読まれない stdin を待ち続ける間は枠を占有する
 //! - `stdin_once` のとき `obtain` が戻った後に future が drop されると、`AttachIo` の drop で唯一の書き込み端が閉じ、コンテナは
 //!   EOF を受ける（supervisor 側の `sendmsg` 直後の窓と同種の残余で、なくせない）
 //! - tty でも stdin を要求しない接続には master が渡らず、resize は `None`
@@ -464,8 +464,14 @@ fn arbiter_key(file: &File) -> Result<ArbiterKey, CriError> {
 /// 残余（#4232。REPAIR-3）: plugin 外の書き手（supervisor 自身など）が同じ記述へ書く場合は調停できない。`poll` と `write` の
 /// 間に空きを使い切られると、保持者は記述が空くか閉じるまで `write` の中で止まり取り消しを見られず、その間は同じ記述
 /// （同じコンテナ）の入力だけが進まない。別の記述の入力は進む。同じ記述の他セッションは取り消しで抜け、スレッド・fd・枠を返せる。
-/// 保持者本人の取り消しは本 issue では採らない（`O_NONBLOCK` は supervisor 側と共有の記述のため立てられず、スレッド宛てシグナルは
-/// プロセス全体のシグナル配置と `libc` の機械照合が要る）。再評価条件・比較は `docs/design/cri-streaming-server.md`。
+/// 保持者本人の取り消しは pipe（本番の stdin）だけ #4287 で解消した: `/proc/self/fd/N` から `O_NONBLOCK` の専用記述へ開き直し
+/// （[`reopen_pipe_nonblocking`]）、`write` が `EAGAIN` で即戻るので保持は有限になる。pty は開き直すと新しい pty が割り当てられ、
+/// socket は開けないため `PollFirst` のまま残る（残余。スレッド宛てシグナルは `SA_RESTART` の回避に `sigaction`・`pthread_kill` の
+/// FFI と `libc` の機械照合が要り承認待ち。本番で master へ書くのは plugin-cri だけで、起きない見込み）。再評価条件・比較は
+/// `docs/design/cri-streaming-server.md`。
+///
+/// 同じ devpts instance の複数の pty master は同じキー（ptmx の dev/ino）に畳まれる。将来 attach が別の pty を対象にするなら
+/// pty 番号をキーに足す必要があり、core の `PtyMaster` に番号の取得口が要る。
 struct ArbiterTable {
     map: Mutex<std::collections::HashMap<ArbiterKey, std::sync::Weak<Mutex<()>>>>,
     cap: usize,
@@ -527,6 +533,43 @@ fn warn_poll_unsupported_once(warned: &AtomicBool, sink: &LineSink) -> bool {
     true
 }
 
+/// 入力の書き方（CRI-6・REPAIR-5・#4287）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WriteMode {
+    /// supervisor と共有の記述（`O_NONBLOCK` を立てられない）。排他の中で「待たない poll → 書き込み」をする。
+    PollFirst,
+    /// [`reopen_pipe_nonblocking`] で開き直した plugin-cri 専用の `O_NONBLOCK` 記述。`write` が `EAGAIN` で即戻るため、
+    /// 保持者本人の `write` も無期限に止まらない。
+    OwnNonblocking,
+}
+
+/// 無名 pipe（FIFO）の書き込み端を `/proc/self/fd/N` から `O_NONBLOCK` の専用記述として開き直す（CRI-6・REPAIR-5・#4287）。
+///
+/// 呼び出し元は `attach` の `ValidInput::Pipe` の分岐。共有の記述に `O_NONBLOCK` を立てると supervisor 側の捕捉のリーダーが
+/// 壊れるため、開き直しで別の open file description を作る。FIFO 以外は開かずに `None` を返す: pty master の
+/// `/proc/self/fd/N` を開くと新しい pty が割り当てられて入力が別の端末へ流れ、socket は `ENXIO` になるため。開いた後も
+/// FIFO であることと (dev, ino) の一致を照合し、外れたら閉じて `None`。失敗はすべて `None` で、呼び出し側は従来の
+/// 共有記述の経路（`PollFirst`。残余は `ArbiterTable` の doc）へ戻る（attach を止めない。入力の完全性は変わらない）。
+fn reopen_pipe_nonblocking(file: &File) -> Option<File> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    let flag = crate::sys::O_NONBLOCK?;
+    let before = file.metadata().ok()?;
+    if !before.file_type().is_fifo() {
+        return None;
+    }
+    let path = std::path::Path::new("/proc/self/fd").join(file.as_raw_fd().to_string());
+    let reopened = File::options()
+        .write(true)
+        .custom_flags(flag)
+        .open(path)
+        .ok()?;
+    let after = reopened.metadata().ok()?;
+    (after.file_type().is_fifo() && after.dev() == before.dev() && after.ino() == before.ino())
+        .then_some(reopened)
+}
+
 /// `file` へ全部書く（REPAIR-5）。書く前に毎回 `poll(POLLOUT)` を待たずに確かめ、書けなければ排他の外で
 /// 10 ms 待って取り消しを見る。記述のフラグ（`O_NONBLOCK`）は変えない（supervisor 側と共有の open file description
 /// のため）。書ける確認から書き込みまでは記述ごとの排他（[`ArbiterTable`]）で調停するので、コンテナが読まず pipe / pty が満杯でも、
@@ -539,6 +582,7 @@ fn write_all_retry(
     slice: usize,
     cancel: &AtomicBool,
     arbiter: &Mutex<()>,
+    mode: WriteMode,
 ) -> bool {
     use crate::sys::{WritePoll, poll_writable};
 
@@ -551,27 +595,43 @@ fn write_all_retry(
             let Some(_turn) = lock_cancellable(arbiter, cancel) else {
                 return false;
             };
-            match poll_writable(file.as_fd(), 0) {
-                Ok(WritePoll::Ready) => {
-                    let part = data.get(..slice.min(data.len())).unwrap_or_default();
-                    match file.write(part) {
-                        Ok(0) => return false,
-                        Ok(n) => {
-                            data = data.get(n..).unwrap_or_default();
-                            continue;
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                        Err(_) => return false,
+            if mode == WriteMode::OwnNonblocking {
+                // 自分専用の `O_NONBLOCK` 記述: poll を挟まず直接書く。空きが無ければ `WouldBlock` で即戻るので、
+                // 保持は 1 回の書き込みの間に限られる（#4287）。
+                let part = data.get(..slice.min(data.len())).unwrap_or_default();
+                match file.write(part) {
+                    Ok(0) => return false,
+                    Ok(n) => {
+                        data = data.get(n..).unwrap_or_default();
+                        continue;
                     }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(_) => return false,
                 }
-                Ok(WritePoll::NotReady) => {}
-                Ok(WritePoll::Closed) => return false,
-                Err(e) => {
-                    // 警告の出力は排他を出てから行う（排他の保持を短く保つ）。
-                    unsupported = is_poll_unsupported(&e);
-                    if !unsupported {
-                        return false;
+            } else {
+                match poll_writable(file.as_fd(), 0) {
+                    Ok(WritePoll::Ready) => {
+                        let part = data.get(..slice.min(data.len())).unwrap_or_default();
+                        match file.write(part) {
+                            Ok(0) => return false,
+                            Ok(n) => {
+                                data = data.get(n..).unwrap_or_default();
+                                continue;
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                            Err(_) => return false,
+                        }
+                    }
+                    Ok(WritePoll::NotReady) => {}
+                    Ok(WritePoll::Closed) => return false,
+                    Err(e) => {
+                        // 警告の出力は排他を出てから行う（排他の保持を短く保つ）。
+                        unsupported = is_poll_unsupported(&e);
+                        if !unsupported {
+                            return false;
+                        }
                     }
                 }
             }
@@ -601,6 +661,7 @@ fn bridge_input(
     cancel: Arc<AtomicBool>,
     slot: Arc<SlotGuard>,
     arbiter: Arc<Mutex<()>>,
+    mode: WriteMode,
 ) -> Result<tokio::net::UnixStream, CriError> {
     let (tokio_side, mut thread_side) =
         StdUnixStream::pair().map_err(|_| CriError::unavailable("attach stdio setup failed"))?;
@@ -614,7 +675,7 @@ fn bridge_input(
                     Ok(0) | Err(_) => return,
                     Ok(n) => {
                         let Some(chunk) = buf.get(..n) else { return };
-                        if !write_all_retry(&mut file, chunk, slice, &cancel, &arbiter) {
+                        if !write_all_retry(&mut file, chunk, slice, &cancel, &arbiter, mode) {
                             return;
                         }
                     }
@@ -753,9 +814,21 @@ impl AttachBackend for SupervisorAttachBackend {
                     } else {
                         1
                     };
+                    // FIFO は専用の非ブロッキング記述へ開き直し、元の記述はすぐ閉じる（唯一の書き込み端が閉じたときに
+                    // コンテナへ EOF が届く性質を保つ）。失敗・socket は共有記述のまま（#4287）。
+                    let (file, mode) = match reopen_pipe_nonblocking(&file) {
+                        Some(own) => (own, WriteMode::OwnNonblocking),
+                        None => (file, WriteMode::PollFirst),
+                    };
                     let arbiter = inner.arbiters.acquire(arbiter_key(&file)?)?;
-                    let w =
-                        bridge_input(file, slice, Arc::clone(&cancel), Arc::clone(&slot), arbiter)?;
+                    let w = bridge_input(
+                        file,
+                        slice,
+                        Arc::clone(&cancel),
+                        Arc::clone(&slot),
+                        arbiter,
+                        mode,
+                    )?;
                     Some(Box::new(InputWriter {
                         inner: w,
                         _life: Arc::clone(&life),
@@ -768,7 +841,14 @@ impl AttachBackend for SupervisorAttachBackend {
                         .map_err(|_| CriError::internal("attach pty setup failed"))?;
                     let dup = File::from(dup);
                     let arbiter = inner.arbiters.acquire(arbiter_key(&dup)?)?;
-                    let w = bridge_input(dup, 1, Arc::clone(&cancel), Arc::clone(&slot), arbiter)?;
+                    let w = bridge_input(
+                        dup,
+                        1,
+                        Arc::clone(&cancel),
+                        Arc::clone(&slot),
+                        arbiter,
+                        WriteMode::PollFirst,
+                    )?;
                     let master = Arc::new(master);
                     // 失敗は `()` を返す契約のため捨てる。0 行・0 列はそのまま渡す（カーネルは受け付ける）。
                     resize = Some(Box::new(move |size: TerminalSize| {

@@ -931,7 +931,14 @@ fn cri6_repair5_4134_arbiter_wait_is_cancelled_while_the_holder_is_stalled_in_wr
         });
         rx.recv().unwrap();
         let waiter = sc.spawn(|| {
-            let ok = write_all_retry(&mut wf, b"abc", PIPE_SLICE, &cancel, &arbiter);
+            let ok = write_all_retry(
+                &mut wf,
+                b"abc",
+                PIPE_SLICE,
+                &cancel,
+                &arbiter,
+                WriteMode::PollFirst,
+            );
             drop(wf);
             ok
         });
@@ -966,7 +973,14 @@ fn cri6_repair5_4134_arbiter_wait_resumes_after_the_holder_releases() {
     let guard = arbiter.lock().unwrap();
     let ok = std::thread::scope(|sc| {
         let waiter = sc.spawn(|| {
-            let ok = write_all_retry(&mut wf, b"abc", PIPE_SLICE, &cancel, &arbiter);
+            let ok = write_all_retry(
+                &mut wf,
+                b"abc",
+                PIPE_SLICE,
+                &cancel,
+                &arbiter,
+                WriteMode::PollFirst,
+            );
             drop(wf);
             ok
         });
@@ -997,7 +1011,12 @@ fn cri6_repair5_4134_poisoned_arbiter_is_still_acquired() {
     let (mut r, w) = std::io::pipe().expect("pipe");
     let mut wf = File::from(std::os::fd::OwnedFd::from(w));
     assert!(write_all_retry(
-        &mut wf, b"z", PIPE_SLICE, &cancel, &arbiter
+        &mut wf,
+        b"z",
+        PIPE_SLICE,
+        &cancel,
+        &arbiter,
+        WriteMode::PollFirst
     ));
     drop(wf);
     let mut v = Vec::new();
@@ -1075,7 +1094,12 @@ fn cri6_repair5_4232_other_descriptor_progresses_while_a_holder_is_stalled_in_wr
         rx.recv().unwrap();
         let t0 = Instant::now();
         assert!(write_all_retry(
-            &mut wf_b, b"abc", PIPE_SLICE, &cancel, &arb_b
+            &mut wf_b,
+            b"abc",
+            PIPE_SLICE,
+            &cancel,
+            &arb_b,
+            WriteMode::PollFirst
         ));
         assert!(
             t0.elapsed() < Duration::from_millis(500),
@@ -1108,7 +1132,16 @@ fn cri6_repair5_4232_same_descriptor_waiter_still_waits_and_cancels() {
             w_a.write_all(&vec![0u8; 1 << 20])
         });
         rx.recv().unwrap();
-        let waiter = sc.spawn(|| write_all_retry(&mut wf, b"abc", PIPE_SLICE, &cancel, &arb2));
+        let waiter = sc.spawn(|| {
+            write_all_retry(
+                &mut wf,
+                b"abc",
+                PIPE_SLICE,
+                &cancel,
+                &arb2,
+                WriteMode::PollFirst,
+            )
+        });
         std::thread::sleep(Duration::from_millis(100));
         assert!(!waiter.is_finished());
         let t0 = Instant::now();
@@ -1182,4 +1215,195 @@ async fn cri6_repair5_4232_two_containers_pipes_complete_independently() {
     }
     assert_eq!(within(ra).await.expect("join"), total);
     assert_eq!(within(rb).await.expect("join"), total);
+}
+/// 書き込み端を `O_NONBLOCK` の別記述で満杯にして、詰めた量を返す（元の記述には触れない。#4287 の試験補助）。
+fn fill_pipe(w: &File) -> usize {
+    let mut filler = reopen_pipe_nonblocking(w).expect("reopen filler");
+    let mut total = 0usize;
+    for size in [4096usize, 1] {
+        loop {
+            match filler.write(&vec![b'f'; size]) {
+                Ok(n) => total += n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("fill: {e}"),
+            }
+        }
+    }
+    total
+}
+
+/// 開き直しは別の記述（O_NONBLOCK あり）で、元の記述には立たず、同じ inode を指す（CRI-6・REPAIR-5・#4287）。
+#[test]
+fn cri6_repair5_4287_reopen_is_a_separate_nonblocking_description_of_the_same_pipe() {
+    use std::os::unix::fs::MetadataExt as _;
+    let (_r, w) = std::io::pipe().expect("pipe");
+    let orig = File::from(std::os::fd::OwnedFd::from(w));
+    let own = reopen_pipe_nonblocking(&orig).expect("reopen");
+    assert!(own.metadata().expect("meta").file_type().is_fifo());
+    assert_eq!(
+        own.metadata().expect("meta").ino(),
+        orig.metadata().expect("meta").ino()
+    );
+    assert_eq!(
+        own.metadata().expect("meta").dev(),
+        orig.metadata().expect("meta").dev()
+    );
+    assert_eq!(fd_flags(&own) & 0o4000, 0o4000);
+    assert_eq!(fd_flags(&orig) & 0o4000, 0);
+}
+
+/// pty master と socket は開き直さない（pty は新しい pty が割り当てられるため。CRI-6・REPAIR-5・#4287）。
+#[test]
+fn cri6_repair5_4287_reopen_refuses_pty_master_and_socket() {
+    assert!(reopen_pipe_nonblocking(&open_ptmx()).is_none());
+    let (a, _b) = sock_pair();
+    assert!(reopen_pipe_nonblocking(&File::from(OwnedFd::from(a))).is_none());
+}
+
+/// 満杯の pipe で保持者本人の write が取り消しで 500 ms 未満に戻り、排他が解放され、次の書き込みが通る（CRI-6・REPAIR-5・#4287）。
+#[test]
+fn cri6_repair5_4287_holder_write_on_full_pipe_is_cancellable_and_releases_the_arbiter() {
+    use std::io::Read as _;
+    let (mut r, w) = std::io::pipe().expect("pipe");
+    let orig = File::from(std::os::fd::OwnedFd::from(w));
+    let mut own = reopen_pipe_nonblocking(&orig).expect("reopen");
+    let filled = fill_pipe(&orig);
+    assert!(filled > 0);
+    let arbiter = Mutex::new(());
+    let cancel = AtomicBool::new(false);
+    std::thread::scope(|sc| {
+        let holder = sc.spawn(|| {
+            write_all_retry(
+                &mut own,
+                b"abc",
+                PIPE_SLICE,
+                &cancel,
+                &arbiter,
+                WriteMode::OwnNonblocking,
+            )
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!holder.is_finished());
+        // 待っている間は排他を持たない（取り消しと他セッションを妨げない）。
+        assert!(arbiter.try_lock().is_ok());
+        let t0 = Instant::now();
+        cancel.store(true, Ordering::SeqCst);
+        assert!(!holder.join().expect("join"));
+        assert!(
+            t0.elapsed() < Duration::from_millis(500),
+            "elapsed {:?}",
+            t0.elapsed()
+        );
+    });
+    assert!(arbiter.try_lock().is_ok());
+    let mut drained = vec![0u8; filled];
+    r.read_exact(&mut drained).expect("drain");
+    assert!(drained.iter().all(|b| *b == b'f'));
+    let cancel = AtomicBool::new(false);
+    assert!(write_all_retry(
+        &mut own,
+        b"abc",
+        PIPE_SLICE,
+        &cancel,
+        &arbiter,
+        WriteMode::OwnNonblocking
+    ));
+    let mut got = [0u8; 3];
+    r.read_exact(&mut got).expect("read");
+    assert_eq!(&got, b"abc");
+}
+
+/// 通し: 満杯の stdin へ書いたセッションを drop すると枠が戻り、同じ記述への次の attach が通ってバイト列が届く（CRI-6・REPAIR-5・#4287）。
+#[tokio::test]
+async fn cri6_repair5_4287_dropped_session_on_full_stdin_frees_the_slot_and_next_attach_works() {
+    use std::io::Read as _;
+    let fx = Fixture::new("own-nonblock");
+    let (mut r, w) = std::io::pipe().expect("pipe");
+    let w = File::from(std::os::fd::OwnedFd::from(w));
+    let filled = fill_pipe(&w);
+    let source = FakeSource::new(Box::new(move |_| {
+        Ok(AttachIo {
+            input: Some(AttachInput::Pipe(OwnedFd::from(
+                w.try_clone().expect("dup"),
+            ))),
+            stdout: Some(sock_pair().0),
+            stderr: None,
+        })
+    }));
+    let b = fx.backend(source, idle_notifier(Arc::new(AtomicBool::new(false))));
+    let mut session = within(b.attach(target(true, true, false, false)))
+        .await
+        .expect("attach");
+    let mut stdin = session.stdin.take().expect("stdin");
+    within(write_all(&mut *stdin, b"blocked")).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    drop(stdin);
+    drop(session);
+    wait_active_zero(&b);
+    let mut r = tokio::task::spawn_blocking(move || {
+        let mut drained = vec![0u8; filled];
+        r.read_exact(&mut drained).expect("drain");
+        r
+    })
+    .await
+    .expect("join");
+    let mut session = within(b.attach(target(true, true, false, false)))
+        .await
+        .expect("second attach");
+    let mut stdin = session.stdin.take().expect("stdin");
+    within(write_all(&mut *stdin, b"next")).await;
+    let got = tokio::task::spawn_blocking(move || {
+        let mut buf = [0u8; 4];
+        r.read_exact(&mut buf).expect("read");
+        buf
+    })
+    .await
+    .expect("join");
+    assert_eq!(&got, b"next");
+    drop(stdin);
+    drop(session);
+}
+
+/// pty（共有記述のまま）でも、満杯での取り消しで保持者が戻り排他が解放され、項目が掃除される（CRI-6・REPAIR-5・#4287。
+/// 保持者が `write` の中で止まる場面は残余で、ここでは扱わない）。
+#[test]
+fn cri6_repair5_4287_pty_holder_waiting_on_full_master_is_cancellable() {
+    use crate::sys::{WritePoll, poll_writable};
+    let mut master = open_ptmx();
+    let mut n = 0usize;
+    while matches!(poll_writable(master.as_fd(), 0), Ok(WritePoll::Ready)) {
+        master.write_all(b"x\n").expect("fill");
+        n += 1;
+        assert!(n < 1 << 20, "pty never filled");
+    }
+    let table = ArbiterTable::new(4);
+    let arbiter = table
+        .acquire(arbiter_key(&master).expect("key"))
+        .expect("acquire");
+    let cancel = AtomicBool::new(false);
+    std::thread::scope(|sc| {
+        let holder = sc.spawn(|| {
+            write_all_retry(
+                &mut master,
+                b"a",
+                1,
+                &cancel,
+                &arbiter,
+                WriteMode::PollFirst,
+            )
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!holder.is_finished());
+        let t0 = Instant::now();
+        cancel.store(true, Ordering::SeqCst);
+        assert!(!holder.join().expect("join"));
+        assert!(
+            t0.elapsed() < Duration::from_millis(500),
+            "elapsed {:?}",
+            t0.elapsed()
+        );
+    });
+    assert!(arbiter.try_lock().is_ok());
+    drop(arbiter);
+    assert_eq!(table.live_len(), 0);
 }

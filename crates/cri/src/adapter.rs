@@ -477,6 +477,8 @@ impl PodNetns {
 pub trait PodNamespaceHolderProvider: Send + Sync {
     /// 保持役を起動し、READY を受けて pid を返す。`req.ready_timeout()` 以内に戻ること（REPAIR-5）。
     /// 失敗・期限超過のときは子を SIGKILL して回収してから `Err` を返し、資源を残さない。
+    /// SIGKILL の後も回収を確認できない子が残るときだけ例外で、provider が子を sandbox ID 付きで保持し、
+    /// [`CriError::with_resource_retained`] 付きの `Err` を返す（呼び出し側は記録を残し、`release` で回収を再試行する）。
     fn spawn(&self, req: &PodHolderRequest<'_>) -> Result<PodHolder, CriError>;
 
     /// 保持役を解放する（stdin を閉じる → `timeout` まで待つ → 超過なら SIGKILL → 回収）。冪等で、

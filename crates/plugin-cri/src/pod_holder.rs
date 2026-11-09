@@ -9,11 +9,15 @@
 //!
 //! # 契約
 //! - bin は plugin-cri の実体と同じディレクトリの固定名（[`holder_executable_beside`]）。`PATH`・環境変数・引数による
-//!   上書きは作らない（PLUG-11）。起動の前に、通常ファイル・所有者が root か実効 uid・group / other 書き込み不可・
-//!   読み取り可（保持役が `would_dump` で自分の実体を開き直すため、読めない bin では成り立たない）を確かめる（fail-closed）。
+//!   上書きは作らない（PLUG-11）。bin を一度だけ開き、その fd に対して通常ファイル・所有者が root か実効 uid・group / other
+//!   書き込み不可・読み取り可（保持役が `would_dump` で自分の実体を開き直すため、読めない bin では成り立たない）を確かめ、
+//!   祖先ディレクトリも同じ所有者・書き込み条件で確かめる（fail-closed）。起動は検証した fd を `/proc/self/fd/N` として
+//!   exec し、検証後のパス再解決による差し替え（TOCTOU）を避ける。
 //! - 子は sandbox の記録が残る間 `wait`（回収）しない。pid を zombie のままでも保って再利用を防ぐ（SEC-5・#2776）。生存は
 //!   [`crate::sys::child_exit_observed`]（`waitid(WNOWAIT)`）で見て、回収は `release` が終了を確かめた後に限る。
-//! - 追跡する子は [`MAX_TRACKED_POD_HOLDERS`] 件まで（起動途中・回収できなかった子を含む）。1 件あたり stdin のパイプ 1 本の
+//! - 追跡する子は [`MAX_TRACKED_POD_HOLDERS`] 件まで（起動途中・回収できなかった子を含む）。起動失敗で SIGKILL 後も回収を
+//!   確認できなかった子は sandbox ID 付きで保持し、`spawn` は [`CriError::with_resource_retained`] 付きの `Err` を返す
+//!   （CRI は記録を残し、`release` が回収を再試行する）。1 件あたり stdin のパイプ 1 本の
 //!   fd を保つ。超えたら `RESOURCE_EXHAUSTED`。
 //! - 解放は stdin を閉じる → 期限つきで待つ → SIGKILL → 回収の順。READY・解放・回収の待ちはすべて期限つきで、ロックは
 //!   待ちの間は保たない（ブロックしない syscall の間だけ保つ）。エラー文言は固定の英文でパス・pid・errno を含めない（REPAIR-4）。
@@ -24,7 +28,8 @@
 //! starttime・ns）の永続化と再起動後の再採用は R11（#2940）。rootful（uid 0）は `UNIMPLEMENTED`（#2241・#2442 の判断まで）。
 
 use std::collections::{HashMap, HashSet};
-use std::os::fd::AsFd as _;
+use std::fs::File;
+use std::os::fd::{AsFd as _, AsRawFd as _};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
 #[cfg(any(test, feature = "pod-holder-test-support"))]
@@ -92,8 +97,8 @@ struct Table {
     entries: HashMap<String, HolderEntry>,
     /// 起動途中の sandbox ID（同時の二重起動と上限の数に含める）。
     spawning: HashSet<String>,
-    /// SIGKILL の後も回収を確認できなかった子（上限に数え、次の `spawn` で回収を試みる）。
-    orphans: Vec<Child>,
+    /// SIGKILL の後も回収を確認できなかった子（sandbox ID 付き。上限に数え、`release` と次の `spawn` で回収を試みる）。
+    orphans: HashMap<String, Child>,
 }
 
 /// 本番の保持役 provider。注入口は `CriPluginBackends`（`crate::adapter`）。
@@ -160,8 +165,9 @@ impl ProductionPodHolder {
         }
     }
 
-    /// 起動する (program, 先頭引数, euid) を決め、bin を検査する。
-    fn resolve_command(&self) -> Result<Command, TraitError> {
+    /// 起動する Command を決め、bin を検査する。本番は検証済みの fd を返し、Command はその fd を
+    /// `/proc/self/fd/N` として exec する（呼び出し側は spawn が終わるまで返された `File` を保つ）。
+    fn resolve_command(&self) -> Result<(Command, Option<File>), TraitError> {
         match &self.exe {
             ExeSource::Beside => {
                 let exe = std::env::current_exe().map_err(|_| {
@@ -177,8 +183,10 @@ impl ProductionPodHolder {
                         "cannot determine the plugin process credentials",
                     )
                 })?;
-                check_executable_trust(&program, euid)?;
-                Ok(Command::new(program))
+                check_ancestors_trust(&program, euid)?;
+                let file = open_trusted_executable(&program, euid)?;
+                let cmd = Command::new(format!("/proc/self/fd/{}", file.as_raw_fd()));
+                Ok((cmd, Some(file)))
             }
             #[cfg(any(test, feature = "pod-holder-test-support"))]
             ExeSource::Fixed {
@@ -188,7 +196,7 @@ impl ProductionPodHolder {
             } => {
                 let mut c = Command::new(program);
                 c.args(prefix_args);
-                Ok(c)
+                Ok((c, None))
             }
         }
     }
@@ -208,14 +216,17 @@ impl ProductionPodHolder {
         &self,
         ready_timeout: Duration,
     ) -> Result<(Child, ChildStdin), (TraitError, Option<Child>)> {
-        let mut cmd = self.resolve_command().map_err(|e| (e, None))?;
+        let (mut cmd, exe_fd) = self.resolve_command().map_err(|e| (e, None))?;
         cmd.arg(POD_HOLDER_SUBCOMMAND)
             .env_clear()
             .current_dir("/")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        let mut child = cmd.spawn().map_err(|_| {
+        let spawned = cmd.spawn();
+        // 子は exec 済み（または失敗）なので、検証済み fd はここで閉じてよい。
+        drop(exe_fd);
+        let mut child = spawned.map_err(|_| {
             (
                 TraitError::new(ErrorCode::Unavailable, MSG_SPAWN_FAILED),
                 None,
@@ -277,31 +288,48 @@ impl ProductionPodHolder {
         Ok(())
     }
 
-    fn spawn_inner(&self, req: &PodHolderRequest<'_>) -> Result<PodHolder, TraitError> {
-        self.rootful_guard()?;
+    /// `Err` の第 2 要素は、SIGKILL の後も回収を確認できない子が `orphans` に残った（資源が残りうる）こと。
+    fn spawn_inner(&self, req: &PodHolderRequest<'_>) -> Result<PodHolder, (TraitError, bool)> {
+        self.rootful_guard().map_err(|e| (e, false))?;
         let id = req.sandbox_id.to_owned();
         {
-            let mut t = self.lock()?;
+            let mut t = self.lock().map_err(|e| (e, false))?;
             if t.entries.contains_key(&id) || t.spawning.contains(&id) {
-                return Err(TraitError::new(ErrorCode::AlreadyExists, MSG_DUPLICATE));
+                return Err((
+                    TraitError::new(ErrorCode::AlreadyExists, MSG_DUPLICATE),
+                    false,
+                ));
             }
-            t.orphans.retain_mut(|c| matches!(c.try_wait(), Ok(None)));
+            if t.orphans.contains_key(&id) {
+                return Err((
+                    TraitError::new(ErrorCode::AlreadyExists, MSG_DUPLICATE),
+                    false,
+                ));
+            }
+            t.orphans.retain(|_, c| matches!(c.try_wait(), Ok(None)));
             if t.entries.len() + t.spawning.len() + t.orphans.len() >= self.limit {
-                return Err(TraitError::new(ErrorCode::ResourceExhausted, MSG_TOO_MANY));
+                return Err((
+                    TraitError::new(ErrorCode::ResourceExhausted, MSG_TOO_MANY),
+                    false,
+                ));
             }
             t.spawning.insert(id.clone());
         }
         let started = self.start_child(req.ready_timeout());
-        let mut t = self.lock()?;
+        let mut t = self.lock().map_err(|e| (e, false))?;
         t.spawning.remove(&id);
         match started {
             Ok((child, stdin)) => {
                 let Some(pid) = std::num::NonZeroU32::new(child.id()) else {
                     drop(stdin);
                     if let Some(left) = kill_and_reap(child) {
-                        t.orphans.push(left);
+                        t.orphans.insert(id, left);
+                        return Err((TraitError::new(ErrorCode::Internal, MSG_PID_MISMATCH), true));
                     }
-                    return Err(TraitError::new(ErrorCode::Internal, MSG_PID_MISMATCH));
+                    return Err((
+                        TraitError::new(ErrorCode::Internal, MSG_PID_MISMATCH),
+                        false,
+                    ));
                 };
                 t.entries.insert(
                     id,
@@ -313,10 +341,11 @@ impl ProductionPodHolder {
                 Ok(PodHolder::new(pid))
             }
             Err((e, left)) => {
+                let retained = left.is_some();
                 if let Some(c) = left {
-                    t.orphans.push(c);
+                    t.orphans.insert(id, c);
                 }
-                Err(e)
+                Err((e, retained))
             }
         }
     }
@@ -345,10 +374,38 @@ impl ProductionPodHolder {
         }
     }
 
+    /// 起動失敗で回収できなかった子（`orphans`）を、`deadline` まで SIGKILL と回収で再試行する。回収できたか、
+    /// 追跡が無ければ `Ok`。回収できなければ `Timeout`（子は `orphans` に残り、再試行できる）。
+    fn reap_orphan_until(&self, sandbox_id: &str, deadline: Instant) -> Result<(), TraitError> {
+        loop {
+            {
+                let mut t = self.lock()?;
+                let Some(c) = t.orphans.get_mut(sandbox_id) else {
+                    return Ok(());
+                };
+                let _ = c.kill();
+                // 状態を取れない子（既に回収済み等）はこれ以上できないので追跡から外す。
+                if !matches!(c.try_wait(), Ok(None)) {
+                    t.orphans.remove(sandbox_id);
+                    return Ok(());
+                }
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(TraitError::new(ErrorCode::Timeout, MSG_RELEASE_TIMEOUT));
+            }
+            std::thread::sleep(POLL_STEP.min(deadline - now));
+        }
+    }
+
     fn release_inner(&self, sandbox_id: &str, timeout: Duration) -> Result<(), TraitError> {
         let deadline = Instant::now() + timeout;
         {
             let mut t = self.lock()?;
+            if !t.entries.contains_key(sandbox_id) {
+                drop(t);
+                return self.reap_orphan_until(sandbox_id, deadline);
+            }
             let Some(e) = t.entries.get_mut(sandbox_id) else {
                 return Ok(());
             };
@@ -400,7 +457,14 @@ impl ProductionPodHolder {
 
 impl PodNamespaceHolderProvider for ProductionPodHolder {
     fn spawn(&self, req: &PodHolderRequest<'_>) -> Result<PodHolder, CriError> {
-        self.spawn_inner(req).map_err(|e| CriError::from(&e))
+        self.spawn_inner(req).map_err(|(e, retained)| {
+            let err = CriError::from(&e);
+            if retained {
+                err.with_resource_retained()
+            } else {
+                err
+            }
+        })
     }
 
     fn release(&self, sandbox_id: &str, timeout: Duration) -> Result<(), CriError> {
@@ -433,15 +497,30 @@ fn kill_and_reap(mut child: Child) -> Option<Child> {
     }
 }
 
-/// bin の検査: 通常ファイル・所有者が root か `euid`・group / other に書き込み不可・読み取り専用で開ける。
-fn check_executable_trust(path: &Path, euid: u32) -> Result<(), TraitError> {
+/// bin を一度だけ開き、開いた fd に対して検査する（検査と exec の間でパスが差し替わっても、検証した実体を使う。PLUG-11）。
+/// 通常ファイル・所有者が root か `euid`・group / other に書き込み不可・読み取り専用で開ける、を満たすときだけ返す。
+fn open_trusted_executable(path: &Path, euid: u32) -> Result<File, TraitError> {
     let bad = || TraitError::new(ErrorCode::FailedPrecondition, MSG_UNTRUSTED_EXE);
-    let meta = std::fs::metadata(path).map_err(|_| bad())?;
+    // 保持役は自分の実体を開き直すため、読めない bin では成り立たない（`would_dump` の MAY_READ の代理）。
+    let file = File::open(path).map_err(|_| bad())?;
+    let meta = file.metadata().map_err(|_| bad())?;
     if !meta.is_file() || !(meta.uid() == 0 || meta.uid() == euid) || meta.mode() & 0o022 != 0 {
         return Err(bad());
     }
-    // 保持役は自分の実体を開き直すため、読めない bin では成り立たない（`would_dump` の MAY_READ の代理）。
-    std::fs::File::open(path).map_err(|_| bad())?;
+    Ok(file)
+}
+
+/// bin の祖先ディレクトリの検査: すべて所有者が root か `euid`で group / other に書き込み不可（別ユーザーが
+/// 祖先を書き換えて bin を差し替えられないこと。PLUG-11）。symlink は辿った先を見る。
+fn check_ancestors_trust(path: &Path, euid: u32) -> Result<(), TraitError> {
+    let bad = || TraitError::new(ErrorCode::FailedPrecondition, MSG_UNTRUSTED_EXE);
+    let real = std::fs::canonicalize(path).map_err(|_| bad())?;
+    for dir in real.ancestors().skip(1) {
+        let meta = std::fs::metadata(dir).map_err(|_| bad())?;
+        if !meta.is_dir() || !(meta.uid() == 0 || meta.uid() == euid) || meta.mode() & 0o022 != 0 {
+            return Err(bad());
+        }
+    }
     Ok(())
 }
 

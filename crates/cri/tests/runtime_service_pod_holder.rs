@@ -28,6 +28,8 @@ type Log = Arc<Mutex<Vec<String>>>;
 enum Spawn {
     Ok,
     Fail(Code),
+    /// 回収を確認できない子が残る失敗（資源残存の印つき）。
+    FailRetained,
     /// 解除されるまで待つ（`unblock` を立てる）。
     Hang,
 }
@@ -81,6 +83,9 @@ impl PodNamespaceHolderProvider for FakeHolder {
             Spawn::Ok => Ok(PodHolder::new(self.pid.try_into().unwrap())),
             Spawn::Fail(Code::DeadlineExceeded) => Err(CriError::timeout("holder not ready")),
             Spawn::Fail(_) => Err(CriError::failed_precondition("holder unavailable")),
+            Spawn::FailRetained => {
+                Err(CriError::timeout("holder not ready").with_resource_retained())
+            }
             Spawn::Hang => {
                 let start = Instant::now();
                 while !self.unblock.load(Ordering::SeqCst)
@@ -306,6 +311,27 @@ async fn cri2_spawn_failure_registers_nothing_and_allows_rerun() {
         let id = run(&svc).await.unwrap();
         assert_eq!(state_of(&svc, &id).await, READY);
     }
+}
+
+/// REPAIR-5・CRI-2: 資源残存の印つきの起動失敗は記録を消さず、Stop・Remove の `release` が再試行できる。
+#[tokio::test]
+async fn repair5_retained_spawn_failure_keeps_the_record_and_release_retries() {
+    let log = new_log();
+    let holder = FakeHolder::new(&log, Spawn::FailRetained);
+    let svc = service(&holder);
+    let e = run(&svc).await.unwrap_err();
+    assert_eq!(e.code(), Code::DeadlineExceeded);
+    let listed = list(&svc).await;
+    assert_eq!(listed.len(), 1);
+    assert_ne!(listed[0].1, READY);
+    let id = listed[0].0.clone();
+    holder.release_fails.store(true, Ordering::SeqCst);
+    assert_eq!(remove(&svc, &id).await.unwrap_err().code(), Code::Internal);
+    assert_eq!(list(&svc).await.len(), 1);
+    holder.release_fails.store(false, Ordering::SeqCst);
+    remove(&svc, &id).await.unwrap();
+    assert_eq!(holder.count("release"), 2);
+    assert!(list(&svc).await.is_empty());
 }
 
 #[tokio::test]

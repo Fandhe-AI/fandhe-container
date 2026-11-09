@@ -129,7 +129,7 @@ fn cri2_sec5_ready_pid_mismatch_is_rejected_and_child_reaped() {
     let _ = std::fs::remove_file(&pidfile);
 }
 
-/// bin の検査: 通常ファイルで自分（か root）所有・group/other 書き込み不可・読み取り可だけを通す。
+/// bin の検査: 開いた fd に対し、通常ファイルで自分（か root）所有・group/other 書き込み不可・読み取り可だけを通す。
 #[test]
 fn cri2_plug11_executable_trust_checks() {
     let euid = current_euid().unwrap();
@@ -138,23 +138,101 @@ fn cri2_plug11_executable_trust_checks() {
     let set =
         |mode: u32| std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
     set(0o755);
-    assert!(check_executable_trust(&path, euid).is_ok());
+    assert!(open_trusted_executable(&path, euid).is_ok());
     set(0o775);
     assert_eq!(
-        check_executable_trust(&path, euid).unwrap_err().message(),
+        open_trusted_executable(&path, euid).unwrap_err().message(),
         MSG_UNTRUSTED_EXE
     );
     set(0o757);
-    assert!(check_executable_trust(&path, euid).is_err());
+    assert!(open_trusted_executable(&path, euid).is_err());
     // root は読み取り権限を無視できるため、読めない場合の拒否は非 root のときだけ確かめる。
     set(0o300);
     if euid != 0 {
-        assert!(check_executable_trust(&path, euid).is_err());
+        assert!(open_trusted_executable(&path, euid).is_err());
     }
     set(0o755);
-    assert!(check_executable_trust(Path::new("/nonexistent/fc-holder"), euid).is_err());
-    assert!(check_executable_trust(Path::new("/"), euid).is_err());
+    assert!(open_trusted_executable(Path::new("/nonexistent/fc-holder"), euid).is_err());
+    assert!(open_trusted_executable(Path::new("/"), euid).is_err());
     let _ = std::fs::remove_file(&path);
+}
+
+/// 祖先ディレクトリの検査: 全祖先が自分（か root）所有で group/other 書き込み不可のときだけ通す（PLUG-11）。
+#[test]
+fn cri2_plug11_ancestor_directories_must_not_be_writable_by_others() {
+    let euid = current_euid().unwrap();
+    let mut dir = std::env::temp_dir();
+    dir.push(format!("fc-podholder-anc-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    let exe = dir.join("sub").join("holder");
+    std::fs::write(&exe, b"x").unwrap();
+    let set = |p: &Path, mode: u32| {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap()
+    };
+    set(&dir, 0o755);
+    set(&dir.join("sub"), 0o755);
+    // /tmp 自体が他者書き込み可（sticky）の環境では祖先全体は通らないため、検査対象を自作の部分に限って確かめる。
+    let tmp_ok = check_ancestors_trust(&exe, euid).is_ok();
+    set(&dir, 0o775);
+    assert_eq!(
+        check_ancestors_trust(&exe, euid).unwrap_err().message(),
+        MSG_UNTRUSTED_EXE
+    );
+    set(&dir, 0o755);
+    set(&dir.join("sub"), 0o757);
+    assert!(check_ancestors_trust(&exe, euid).is_err());
+    set(&dir.join("sub"), 0o755);
+    assert_eq!(check_ancestors_trust(&exe, euid).is_ok(), tmp_ok);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 検証した fd は、パスが差し替わった後でも元の実体を指す（`/proc/self/fd/N` で exec する前提。PLUG-11）。
+#[test]
+fn cri2_plug11_verified_fd_survives_path_replacement() {
+    let euid = current_euid().unwrap();
+    let path = scratch("swap");
+    std::fs::write(&path, b"original").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let file = open_trusted_executable(&path, euid).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    std::fs::write(&path, b"replaced").unwrap();
+    let via_fd = std::fs::read(format!("/proc/self/fd/{}", file.as_raw_fd())).unwrap();
+    assert_eq!(via_fd, b"original");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// 回収できなかった子は sandbox ID 付きで保持され、`release` が SIGKILL と回収を再試行して追跡から外す（REPAIR-5・SEC-5）。
+#[test]
+fn cri2_repair5_orphan_is_kept_by_id_and_reaped_by_release() {
+    let p = sh("exit 0", 8);
+    let c = Command::new("sleep")
+        .arg("30")
+        .stdin(Stdio::null())
+        .spawn()
+        .unwrap();
+    let pid = c.id();
+    p.table.lock().unwrap().orphans.insert("o1".to_owned(), c);
+    // 同じ ID の起動は拒否される（残存する子を見失わない）。
+    let cfg = config();
+    assert_eq!(
+        p.spawn(&req("o1", &cfg, 1000)).unwrap_err().code(),
+        CriErrorCode::AlreadyExists
+    );
+    p.release("o1", Duration::from_secs(2)).unwrap();
+    assert!(p.table.lock().unwrap().orphans.is_empty());
+    assert!(proc_gone(pid));
+    // 冪等。
+    p.release("o1", Duration::from_secs(1)).unwrap();
+}
+
+/// 起動失敗の `Err` が資源残存の印を運ぶ（回収できなかった子があるときだけ）。
+#[test]
+fn cri2_repair5_retained_flag_follows_orphan_presence() {
+    let p = sh("exit 3", 8);
+    let cfg = config();
+    let e = p.spawn(&req("r1", &cfg, 1000)).unwrap_err();
+    assert!(!e.resource_retained());
 }
 
 /// 上限と重複: 上限に達した追跡があれば `RESOURCE_EXHAUSTED`、同じ ID は `ALREADY_EXISTS`。解放後は上限を外れる。

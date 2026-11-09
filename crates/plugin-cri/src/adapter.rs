@@ -146,7 +146,7 @@ pub struct CriPluginBackends {
     /// REPAIR-4・CRI-6・#4380）。注入（`with_recorder`）では実行層もここへ書く。
     recorder: Arc<OpRecorder>,
     /// 本番（`production()`）だけが持つライフサイクル記録器（core の `oci_runtime`・コンテナログ・net の bridge / netsetup の
-    /// 操作名。最悪 43 種）。CRI 記録器と枠を分け、合算が `MAX_TRACKED_OPS` を超えて記録が捨てられるのを防ぐ
+    /// 操作名。最悪 53 種）。CRI 記録器と枠を分け、合算が `MAX_TRACKED_OPS` を超えて記録が捨てられるのを防ぐ
     /// （REPAIR-4・#4380。pull 用は #2900 で分離済み）。注入で組んだときは `None`。
     lifecycle_recorder: Option<Arc<OpRecorder>>,
     /// oci の pull・展開・回収の操作統計（`oci.*`）と `cri.pull_image.registry_http.*`（#2966）専用の記録器。共有記録器とは枠を分ける（`MAX_TRACKED_OPS`。REPAIR-4・#2900）。
@@ -1116,7 +1116,7 @@ impl AuditSink for ObservedCreateAudit {
 /// （`RegistryHttpClass`）を `cri.pull_image.registry_http.<区分>` の失敗として受ける（#2966・REPAIR-4・CRI-3）。
 /// CRI 記録器の `MAX_TRACKED_OPS` を区分の 8 種で圧迫しないため分ける。pull 用記録器の名前数は
 /// oci 22 種 + 区分 8 種 = 30 種で上限（64）に収まる。CRI 記録器・ライフサイクル記録器の最悪数
-/// （45 種・43 種）は試験 `repair4_4380_*` が固定する（#4380）。
+/// （45 種・53 種）は試験 `repair4_4380_*` が固定する（#4380）。
 /// `cri.pull_image`（共有）の失敗 1 件と区分側の 1 件は同じ失敗を別の切り口で数えたもの（二重計上）。
 /// 生の HTTP 状態・URL・資格情報は記録しない。
 struct CoreCriRecorder {
@@ -2781,6 +2781,8 @@ mod tests {
     }
 
     /// 名前の一覧を新しい記録器へ全件記録し、種類数・取りこぼしなし・`OpName` 規則・重複なしを確かめる補助（#4380）。
+    /// 呼び出し側の試験が Linux 限定のため同じ gate を付ける（他 OS では未使用になり dead_code になる）。
+    #[cfg(target_os = "linux")]
     fn record_all_names(names: &[&str]) -> OpRecorder {
         let distinct: std::collections::BTreeSet<&str> = names.iter().copied().collect();
         assert_eq!(distinct.len(), names.len(), "duplicate op name in the list");
@@ -2796,10 +2798,12 @@ mod tests {
     }
 
     /// 今後の追加分として残す余裕（名前の種類数）。
+    #[cfg(unix)]
     const NAME_HEADROOM: usize = 8;
 
     /// REPAIR-4・CRI-6（#4380）: CRI 記録器（本番の `recorder`）へ届きうる操作名の最悪数は 45 種で、
     /// `MAX_TRACKED_OPS - 8` 以下。`CriOpKind` の全種（`CriOpKind::ALL`）を数えるので、種別を足すと本試験が落ちて列挙の見直しを求める。
+    #[cfg(unix)]
     #[test]
     fn repair4_4380_cri_recorder_worst_case_name_count_leaves_headroom() {
         let rec = Arc::new(OpRecorder::new());
@@ -2837,9 +2841,10 @@ mod tests {
         );
     }
 
-    /// REPAIR-4・NET-1・CORE-1（#4380）: ライフサイクル記録器（本番のみ）へ届きうる操作名の最悪数は 43 種で、
+    /// REPAIR-4・NET-1・CORE-1（#4380）: ライフサイクル記録器（本番のみ）へ届きうる操作名の最悪数は 53 種で、
     /// `MAX_TRACKED_OPS - 8` 以下。名前の出典: core の `oci_runtime`（create・delete・kill と image_ref_*・image_rootfs_* の定数。
-    /// start は記録器を渡さない）・本ファイルの `CoreLifecycleRuntime` の記録・`netsetup.rs` の `net.*`・`net_op_name` の 8 種。
+    /// start は記録器を渡さない）・本ファイルの `CoreLifecycleRuntime` の記録・`netsetup.rs` の `net.*`・`net_op_name` の 8 種・delete が `remove_with_recorder` 経由で書く `exec_cgroup_sweep_*` の 10 種
+    /// （`cgroups/exec_kill.rs` の kill_all と unpopulated の各 5 名）。
     #[cfg(target_os = "linux")]
     #[test]
     fn repair4_4380_lifecycle_recorder_worst_case_name_count_leaves_headroom() {
@@ -2862,6 +2867,18 @@ mod tests {
             "image_rootfs_reap_truncated",
             "image_rootfs_reap_scan_failed",
             "image_rootfs_orphan_reap",
+        ];
+        let sweep_names = [
+            "exec_cgroup_sweep_kill_all",
+            "exec_cgroup_sweep_kill_all_cut",
+            "exec_cgroup_sweep_kill_all_child",
+            "exec_cgroup_sweep_kill_all_left_populated",
+            "exec_cgroup_sweep_kill_all_left_owner_alive",
+            "exec_cgroup_sweep_unpopulated",
+            "exec_cgroup_sweep_unpopulated_cut",
+            "exec_cgroup_sweep_unpopulated_child",
+            "exec_cgroup_sweep_unpopulated_left_populated",
+            "exec_cgroup_sweep_unpopulated_left_owner_alive",
         ];
         let plugin_names = [
             "supervisor_log_remove",
@@ -2931,13 +2948,18 @@ mod tests {
 
         let mut all: Vec<&str> = Vec::new();
         all.extend(core_names);
+        all.extend(sweep_names);
         all.extend(plugin_names);
         all.extend(failure_ops.iter().copied());
         all.extend(netsetup_names);
         all.extend(net_names.iter().copied());
         let rec = record_all_names(&all);
         let total = rec.snapshot().len();
-        assert_eq!(total, 17 + 5 + 5 + 8 + 8, "lifecycle recorder worst case");
+        assert_eq!(
+            total,
+            17 + 10 + 5 + 5 + 8 + 8,
+            "lifecycle recorder worst case"
+        );
         assert!(
             total <= fandhe_container_core::observability::MAX_TRACKED_OPS - NAME_HEADROOM,
             "{total} names leave less than {NAME_HEADROOM} of headroom"

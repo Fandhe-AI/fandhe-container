@@ -36,6 +36,12 @@
 //! を照合する検出器。Linux 以外の unix はパス起点で、入口の再検査に頼る（本番の macOS は cli の `non_linux_failure` が
 //! ホストでの展開の前に fail-closed にする）。
 //!
+//! bundle の親（cri の `SpecBundleProvider` の `<root>/<id>`）も同じ型で fd 起点にする（#4321）: `open_existing_dir` が
+//! root を `RESOLVE_NO_SYMLINKS` で開いて固定し、`create_child_private_dir`・`open_child_dir`・`create_new_file`・
+//! `remove_child_tree(_bounded)` が子の作成・排他書き込み・木ごとの削除を fd 起点で行う（削除は symlink を辿らず unlink する
+//! だけ）。`child_matches` は子の名前が開いた別の fd と同じ実体かを照合する検出器で、差し替えを検出したら呼び出し側は名前に
+//! 触れない。Linux 以外の unix・Windows はパス起点（`child_matches` は常に真）。
+//!
 //! 展開の根を fd で受ける入口（#4180）: パスを受ける `extract_image_layers_bounded` とは別に、開いた fd を
 //! [`ExtractRoot`] で受ける `extract_image_layers_bounded_in` がある。cri の pull が `staging/<id>/unpack/entry/rootfs` を
 //! pull ディレクトリの fd 起点で作って渡す。この場合、変更操作は渡された fd を起点にし（`AnchoredRoot` を開き直さない）、
@@ -60,7 +66,15 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{OciError, OciErrorCode};
 
-use super::extract::{err, map_fs_err};
+use super::extract::{ExtractBudget, err, map_fs_err};
+
+/// 子が期待した種別（ディレクトリ）でないときのエラー（パスは載せない）。
+fn not_a_directory() -> OciError {
+    err(
+        OciErrorCode::FailedPrecondition,
+        "a child is not a directory",
+    )
+}
 
 /// 確認の後に展開経路が差し替えられた（または差し替えが疑われる）ときのエラー（パスは載せない）。
 pub(super) fn path_changed() -> OciError {
@@ -81,8 +95,8 @@ mod imp {
     use std::os::unix::fs::PermissionsExt as _;
 
     use super::{
-        File, OciError, OciErrorCode, OsStr, OsString, Path, PathBuf, err, fs, io, map_fs_err,
-        path_changed,
+        ExtractBudget, File, OciError, OciErrorCode, OsStr, OsString, Path, PathBuf, err, fs, io,
+        map_fs_err, not_a_directory, path_changed,
     };
     use crate::sys::at;
     use crate::whiteout::MAX_REMOVE_DEPTH;
@@ -130,6 +144,12 @@ mod imp {
             Some(at::ELOOP | at::EXDEV | at::ENOTDIR | at::EAGAIN) => path_changed(),
             _ => map_fs_err(e),
         }
+    }
+
+    /// 子の名前（1 コンポーネント）を検証して `CString` にする。
+    fn child_cstring(name: &OsStr) -> Result<std::ffi::CString, OciError> {
+        at::component_cstring(name)
+            .map_err(|_| err(OciErrorCode::InvalidArgument, "directory name is invalid"))
     }
 
     /// 開いたディレクトリ fd を展開の根として渡すための値（#4180。`extract_image_layers_bounded_in`）。
@@ -184,6 +204,150 @@ mod imp {
                     Err(map_at_err(&e))
                 }
             }
+        }
+
+        /// 既存のディレクトリ `path` を symlink を一切辿らずに開いて fd で保持する（`openat2` の
+        /// `RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`）。cri の `SpecBundleProvider` が bundle root を構築時に
+        /// 固定するための入口（OCI-7・SEC-1・#4321）。`path` は呼び出し側が検査済みの絶対パスであること。
+        /// `openat2` が使えないカーネルは `Unimplemented`（パス起点へ縮退しない）。
+        pub fn open_existing_dir(path: &Path) -> Result<Self, OciError> {
+            let c = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+                err(
+                    OciErrorCode::InvalidArgument,
+                    "extraction root path is invalid",
+                )
+            })?;
+            let fd = at::openat2(
+                None,
+                &c,
+                DIR_FLAGS_RW,
+                0,
+                at::RESOLVE_NO_SYMLINKS | at::RESOLVE_NO_MAGICLINKS,
+            )
+            .map_err(|e| match e.raw_os_error() {
+                Some(at::ENOSYS | at::E2BIG | at::EINVAL) => err(
+                    OciErrorCode::Unimplemented,
+                    "openat2 is not available on this kernel",
+                ),
+                Some(at::ELOOP | at::ENOTDIR) => path_changed(),
+                _ => map_fs_err(&e),
+            })?;
+            Ok(Self { fd })
+        }
+
+        /// 開いた fd の (dev, ino)。構築時の検査結果との照合に使う。
+        pub fn identity(&self) -> Result<(u64, u64), OciError> {
+            use std::os::unix::fs::MetadataExt as _;
+            let m = File::from(self.fd.try_clone().map_err(|e| map_fs_err(&e))?)
+                .metadata()
+                .map_err(|e| map_fs_err(&e))?;
+            Ok((m.dev(), m.ino()))
+        }
+
+        /// 直下に 0700 の子ディレクトリ `name`（1 コンポーネント）を新規に作って fd で開く（`mkdirat` → `openat2`）。
+        /// 既存（symlink を含む）は `AlreadyExists`。開けなければ自分が作った名前を消す（OCI-7・SEC-1・#4321）。
+        pub fn create_child_private_dir(&self, name: &str) -> Result<Self, OciError> {
+            let name_os = OsStr::new(name);
+            let name_c = child_cstring(name_os)?;
+            at::mkdirat_name(self.fd.as_fd(), name_os, 0o700).map_err(|e| {
+                if e.kind() == io::ErrorKind::AlreadyExists {
+                    err(OciErrorCode::AlreadyExists, "directory already exists")
+                } else {
+                    map_fs_err(&e)
+                }
+            })?;
+            match at::openat2(Some(self.fd.as_fd()), &name_c, DIR_FLAGS_RW, 0, RESOLVE) {
+                Ok(fd) => Ok(Self { fd }),
+                Err(e) => {
+                    let _ = at::unlinkat_name(self.fd.as_fd(), name_os, true);
+                    Err(map_at_err(&e))
+                }
+            }
+        }
+
+        /// 直下の子ディレクトリ `name` を symlink を辿らず開く。無ければ `None`。symlink・通常ファイルは
+        /// `FailedPrecondition`（種別の不一致。呼び出し側が拒否に写す）。
+        pub fn open_child_dir(&self, name: &str) -> Result<Option<Self>, OciError> {
+            let name_c = child_cstring(OsStr::new(name))?;
+            match at::openat2(Some(self.fd.as_fd()), &name_c, DIR_FLAGS_RW, 0, RESOLVE) {
+                Ok(fd) => Ok(Some(Self { fd })),
+                Err(e) if e.raw_os_error() == Some(ENOENT) => Ok(None),
+                Err(e) if matches!(e.raw_os_error(), Some(at::ELOOP | at::ENOTDIR)) => {
+                    Err(not_a_directory())
+                }
+                Err(e) => Err(map_at_err(&e)),
+            }
+        }
+
+        /// 直下の子ディレクトリ `name` の有無を、読み取り権限を要求せず（`O_PATH`）symlink を辿らず確かめる。
+        /// 無ければ `false`。symlink・通常ファイルは `FailedPrecondition`。mode 0000 / 0300 の子も `true`
+        /// （削除側が権限を戻して消すため、種別確認で回収を妨げない。OCI-7・CRI-2・#4348）。
+        pub fn child_dir_exists(&self, name: &str) -> Result<bool, OciError> {
+            let name_c = child_cstring(OsStr::new(name))?;
+            match at::openat2(Some(self.fd.as_fd()), &name_c, DIR_FLAGS, 0, RESOLVE) {
+                Ok(_) => Ok(true),
+                Err(e) if e.raw_os_error() == Some(ENOENT) => Ok(false),
+                Err(e) if matches!(e.raw_os_error(), Some(at::ELOOP | at::ENOTDIR)) => {
+                    Err(not_a_directory())
+                }
+                Err(e) => Err(map_at_err(&e)),
+            }
+        }
+
+        /// 直下に `name` を排他作成（`O_EXCL | O_NOFOLLOW`）して書き込み用に開く。mode は umask で削られうるため、
+        /// 呼び出し側が返した `File` に明示的に設定し直すこと。
+        pub fn create_new_file(&self, name: &str, mode: u32) -> Result<File, OciError> {
+            let name_c = child_cstring(OsStr::new(name))?;
+            at::openat2(
+                Some(self.fd.as_fd()),
+                &name_c,
+                at::O_WRONLY | at::O_CREAT | at::O_EXCL | at::O_NOFOLLOW | at::O_CLOEXEC,
+                u64::from(mode),
+                RESOLVE,
+            )
+            .map(File::from)
+            .map_err(|e| map_at_err(&e))
+        }
+
+        /// 直下の `name` を symlink を追従せず木ごと消す（不在は成功）。
+        pub fn remove_child_tree(&self, name: &str) -> Result<(), OciError> {
+            self.remove_child_tree_bounded(name, &ExtractBudget::new())
+        }
+
+        /// `remove_child_tree` に期限と取り消しを足した版。
+        pub fn remove_child_tree_bounded(
+            &self,
+            name: &str,
+            budget: &ExtractBudget<'_>,
+        ) -> Result<(), OciError> {
+            child_cstring(OsStr::new(name))?;
+            let mut buf = vec![0u8; DIRENT_BUF_LEN];
+            remove_at(
+                at::openat2,
+                self.fd.as_fd(),
+                OsStr::new(name),
+                0,
+                &mut buf,
+                &|| budget.check_removal(),
+            )
+        }
+
+        /// 直下の `name` が `other`（開いた別の fd）と同じ実体か（dev / ino）。差し替えの検出器。失敗は偽。
+        pub fn child_matches(&self, name: &str, other: &Self) -> bool {
+            use std::os::unix::fs::MetadataExt as _;
+            let Ok(name_c) = child_cstring(OsStr::new(name)) else {
+                return false;
+            };
+            let Ok(child) = at::openat2(Some(self.fd.as_fd()), &name_c, DIR_FLAGS, 0, RESOLVE)
+            else {
+                return false;
+            };
+            let Ok(mine) = File::from(child).metadata() else {
+                return false;
+            };
+            other
+                .identity()
+                .is_ok_and(|o| o == (mine.dev(), mine.ino()))
         }
 
         /// 根ディレクトリ自身の mode を fd の `fchmod` で変える（パスを開き直さない）。
@@ -725,7 +889,8 @@ mod imp {
 )))]
 mod imp {
     use super::{
-        File, OciError, OciErrorCode, OsStr, OsString, Path, PathBuf, err, fs, io, map_fs_err,
+        ExtractBudget, File, OciError, OciErrorCode, OsStr, OsString, Path, PathBuf, err, fs, io,
+        map_fs_err, not_a_directory,
     };
     use crate::whiteout;
 
@@ -742,6 +907,20 @@ mod imp {
     /// 構造化エラーへの写像（差し替え検出は fd 起点の実装だけが行う）。
     pub(in crate::layer) fn map_at_err(e: &io::Error) -> OciError {
         map_fs_err(e)
+    }
+
+    /// 子の名前が 1 コンポーネントであることを確かめる。
+    fn checked_child(name: &str) -> Result<&OsStr, OciError> {
+        let ok =
+            !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\', '\0']);
+        if ok {
+            Ok(OsStr::new(name))
+        } else {
+            Err(err(
+                OciErrorCode::InvalidArgument,
+                "directory name is invalid",
+            ))
+        }
     }
 
     /// 展開の根として渡すパス（パス起点のホスト。#4180。`extract_image_layers_bounded_in`）。
@@ -766,6 +945,108 @@ mod imp {
             }
             b.create(path).map_err(|e| map_fs_err(&e))?;
             Ok(Self::from_path(path.to_path_buf()))
+        }
+
+        /// 既存のディレクトリ `path` を保持する（パス起点。symlink・非ディレクトリは拒否）。
+        pub fn open_existing_dir(path: &Path) -> Result<Self, OciError> {
+            let m = fs::symlink_metadata(path).map_err(|e| map_fs_err(&e))?;
+            if !m.file_type().is_dir() {
+                return Err(not_a_directory());
+            }
+            Ok(Self::from_path(path.to_path_buf()))
+        }
+
+        /// 保持するディレクトリの (dev, ino)（unix 以外は `(0, 0)`）。
+        pub fn identity(&self) -> Result<(u64, u64), OciError> {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                let m = fs::metadata(&self.path).map_err(|e| map_fs_err(&e))?;
+                Ok((m.dev(), m.ino()))
+            }
+            #[cfg(not(unix))]
+            {
+                Ok((0, 0))
+            }
+        }
+
+        /// 直下に 0700 の子ディレクトリ `name` を新規に作る（パス起点）。既存は `AlreadyExists`。
+        pub fn create_child_private_dir(&self, name: &str) -> Result<Self, OciError> {
+            let p = self.path.join(checked_child(name)?);
+            #[cfg_attr(not(unix), allow(unused_mut))]
+            let mut b = fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt as _;
+                b.mode(0o700);
+            }
+            b.create(&p).map_err(|e| {
+                if e.kind() == io::ErrorKind::AlreadyExists {
+                    err(OciErrorCode::AlreadyExists, "directory already exists")
+                } else {
+                    map_fs_err(&e)
+                }
+            })?;
+            Ok(Self::from_path(p))
+        }
+
+        /// 直下の子ディレクトリ `name` を開く。無ければ `None`。ディレクトリでなければ `FailedPrecondition`。
+        pub fn open_child_dir(&self, name: &str) -> Result<Option<Self>, OciError> {
+            let p = self.path.join(checked_child(name)?);
+            match fs::symlink_metadata(&p) {
+                Ok(m) if m.file_type().is_dir() => Ok(Some(Self::from_path(p))),
+                Ok(_) => Err(not_a_directory()),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(map_fs_err(&e)),
+            }
+        }
+
+        /// 直下の子ディレクトリ `name` の有無を確かめる（パス起点）。無ければ `false`、ディレクトリでなければ
+        /// `FailedPrecondition`。
+        pub fn child_dir_exists(&self, name: &str) -> Result<bool, OciError> {
+            let p = self.path.join(checked_child(name)?);
+            match fs::symlink_metadata(&p) {
+                Ok(m) if m.file_type().is_dir() => Ok(true),
+                Ok(_) => Err(not_a_directory()),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+                Err(e) => Err(map_fs_err(&e)),
+            }
+        }
+
+        /// 直下に `name` を排他作成して書き込み用に開く（パス起点）。
+        pub fn create_new_file(&self, name: &str, mode: u32) -> Result<File, OciError> {
+            let p = self.path.join(checked_child(name)?);
+            let mut o = fs::OpenOptions::new();
+            o.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                o.mode(mode);
+            }
+            #[cfg(not(unix))]
+            let _ = mode;
+            o.open(&p).map_err(|e| map_fs_err(&e))
+        }
+
+        /// 直下の `name` を symlink を追従せず木ごと消す（パス起点。不在は成功）。
+        pub fn remove_child_tree(&self, name: &str) -> Result<(), OciError> {
+            remove_path_tree(&self.path.join(checked_child(name)?))
+        }
+
+        /// `remove_child_tree` に期限と取り消しを足した版（パス起点）。
+        pub fn remove_child_tree_bounded(
+            &self,
+            name: &str,
+            budget: &ExtractBudget<'_>,
+        ) -> Result<(), OciError> {
+            remove_path_tree_checked(&self.path.join(checked_child(name)?), &|| {
+                budget.check_removal()
+            })
+        }
+
+        /// パス起点の実装は同じパスを辿るため常に真（差し替えは入口の再検査だけで検出する）。
+        pub fn child_matches(&self, _name: &str, _other: &Self) -> bool {
+            true
         }
 
         /// 根ディレクトリ自身の mode を変える（パス起点。Windows は何もしない）。
@@ -1293,6 +1574,82 @@ mod tests {
                 "{name}"
             );
         }
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// OCI-7・SEC-1・#4321: 子ディレクトリの作成は既存（symlink を含む）を `AlreadyExists` で区別して拒否し、
+    /// `open_child_dir` は不在を `None`・symlink を `FailedPrecondition` にし、`create_new_file` は排他作成する。
+    #[test]
+    fn oci7_sec1_4321_child_create_open_and_file_are_confined() {
+        let base = tmp("child");
+        let root = ExtractRoot::open_existing_dir(&base).unwrap();
+        let child = root.create_child_private_dir("b").unwrap();
+        assert_eq!(
+            fs::metadata(base.join("b")).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let e = root.create_child_private_dir("b").unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::AlreadyExists);
+        std::os::unix::fs::symlink(&base, base.join("link")).unwrap();
+        let e = root.create_child_private_dir("link").unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::AlreadyExists);
+        assert!(root.open_child_dir("absent").unwrap().is_none());
+        let e = root.open_child_dir("link").unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+        assert_eq!(e.message(), "a child is not a directory");
+        assert!(root.create_child_private_dir("a/b").is_err());
+        assert!(root.create_child_private_dir("..").is_err());
+        drop(child.create_new_file("f", 0o600).unwrap());
+        assert!(child.create_new_file("f", 0o600).is_err());
+        assert!(root.child_matches("b", &child));
+        assert!(!root.child_matches("link", &child));
+        assert!(!root.child_matches("absent", &child));
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// OCI-7・SEC-1・#4321: `remove_child_tree` は子が symlink なら unlink するだけでリンク先の木を消さず、0555 の木も消せる。
+    /// `child_matches` は子が別名へ移されおとりの symlink に差し替わると偽になる。
+    #[test]
+    fn sec1_4321_remove_child_tree_does_not_follow_a_swapped_symlink() {
+        let base = tmp("rmchild");
+        let decoy = base.join("decoy");
+        fs::create_dir_all(decoy.join("rootfs")).unwrap();
+        fs::write(decoy.join("rootfs").join("keep"), b"keep").unwrap();
+        let root = ExtractRoot::open_existing_dir(&base).unwrap();
+        let own = root.create_child_private_dir("own").unwrap();
+        fs::create_dir_all(base.join("own/sub")).unwrap();
+        fs::write(base.join("own/sub/f"), b"x").unwrap();
+        fs::set_permissions(base.join("own/sub"), fs::Permissions::from_mode(0o555)).unwrap();
+        assert!(root.child_matches("own", &own));
+        fs::rename(base.join("own"), base.join("moved")).unwrap();
+        std::os::unix::fs::symlink(&decoy, base.join("own")).unwrap();
+        assert!(!root.child_matches("own", &own));
+        root.remove_child_tree("own").unwrap();
+        assert!(fs::symlink_metadata(base.join("own")).is_err());
+        assert_eq!(
+            fs::read(decoy.join("rootfs").join("keep")).unwrap(),
+            b"keep".to_vec()
+        );
+        root.remove_child_tree("moved").unwrap();
+        assert!(!base.join("moved").exists());
+        root.remove_child_tree("moved").unwrap();
+        assert!(root.remove_child_tree("a/b").is_err());
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// OCI-7・SEC-1・#4321: `open_existing_dir` は symlink と通常ファイルを拒否し、`identity` は開いた実体の (dev, ino)。
+    #[test]
+    fn sec1_4321_open_existing_dir_rejects_symlink_and_file() {
+        use std::os::unix::fs::MetadataExt as _;
+        let base = tmp("openexist");
+        fs::create_dir_all(base.join("d")).unwrap();
+        fs::write(base.join("f"), b"x").unwrap();
+        std::os::unix::fs::symlink(base.join("d"), base.join("l")).unwrap();
+        assert!(ExtractRoot::open_existing_dir(&base.join("l")).is_err());
+        assert!(ExtractRoot::open_existing_dir(&base.join("f")).is_err());
+        let d = ExtractRoot::open_existing_dir(&base.join("d")).unwrap();
+        let m = fs::metadata(base.join("d")).unwrap();
+        assert_eq!(d.identity().unwrap(), (m.dev(), m.ino()));
         fs::remove_dir_all(&base).unwrap();
     }
 }

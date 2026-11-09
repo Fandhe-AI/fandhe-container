@@ -5,18 +5,24 @@
 //! `RemoveContainer` が `release` を呼ぶ。bundle は `<root>/<container_id>/` に作り、`config.json` を書く。
 //! `rootfs/` の中身（イメージの展開）は注入された [`RootfsSource`] が用意する。
 //!
-//! 安全性: `root` は構築時に固定し要求から受けない。コンテナ ID は `ContainerId::new` で検証してから join し、
-//! ディレクトリは `create_dir`（末尾の symlink を辿らない・既存は `FAILED_PRECONDITION` で消さない）で作る。
-//! 解放は `symlink_metadata` で通常のディレクトリと確認できたものだけを消し、symlink は消さずに拒否する。
-//! I/O エラーの OS 文字列やパスはメッセージへ含めない（固定文言のみ）。
+//! 安全性: `root` は構築時に固定し要求から受けない。コンテナ ID は `ContainerId::new` で検証してから 1 コンポーネントの
+//! 名前として使う。bundle ディレクトリは構築時に開いた root の fd 起点で `mkdirat`（末尾の symlink を辿らない・既存は
+//! `FAILED_PRECONDITION` で消さない）し、fd で受けた [`BundleDir`] を `RootfsSource` と `config.json` の書き込みへ渡す。
+//! 解放と `prepare` の巻き戻しも fd 起点で、`<root>/<id>` が作った実体と同じことを (dev, ino) で確かめた時だけ名前を
+//! 消す（差し替えを検出したら名前に触れず `FAILED_PRECONDITION`。おとりの木を消さない。OCI-7・SEC-1・#4321）。
+//! symlink・通常ファイルの bundle は消さずに拒否する。I/O エラーの OS 文字列やパスはメッセージへ含めない（固定文言のみ）。
 //!
 //! 所有: 既存の bundle を理由に `prepare` が拒否した ID は「この provider が作っていない」ため記録し、直後の
 //! `release`（呼び出し元の巻き戻し）では何も消さない。`root` は構築時に所有者・祖先の書き込み権・symlink を検証し、
 //! 操作のたびに構築時の (dev, ino) と一致することを確かめる。
 //!
-//! **残る制約（REPAIR-3）**: 検証済みディレクトリを fd で固定して `openat` 系で操作することは、`unsafe` / FFI を要し
-//! 本 crate には `sys` モジュールが無いため未実装。root の差し替えは (dev, ino) の再確認で検出するが、確認から
-//! 操作までの極小の窓は残る。`root` を信頼できる所有者の非共有ディレクトリに置く前提で使う。
+//! **fd 起点にしない範囲（残余。REPAIR-3）**: fd 起点の操作は oci の `ExtractRoot` の安全な API（`unsafe` は oci の `sys` に
+//! 閉じる）を使い、本 crate に `unsafe` は足さない。Linux の x86_64 / aarch64 以外（macOS 等）はパス起点の実装で、入口の
+//! 再検査に頼る。`list_bundle_ids` の列挙（`read_dir`）と `effective_uid` の使い捨てファイルはパス起点のまま（削除を
+//! 伴わず、`verify_root` が前後で root の (dev, ino) を確かめる）。差し替えを検出した巻き戻しは、移動先に残る空の
+//! bundle ディレクトリの名前が分からないため回収しない（`config.json`・`resolv.conf` と rootfs の中身だけを消す）。
+//! `PreparedBundle` が返すパスを core がその後に使う経路は対象外（返す時点の同一性だけを確かめる）。
+//! `root` を信頼できる所有者の非共有ディレクトリに置く前提で使う。
 
 use std::collections::HashSet;
 use std::fs;
@@ -25,6 +31,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use fandhe_container_core::traits::ContainerId;
+use fandhe_container_oci::error::{OciError, OciErrorCode};
+use fandhe_container_oci::layer::extract::{ExtractBudget, ExtractRoot};
 
 use super::resolv_conf;
 use super::spec::{
@@ -79,11 +87,83 @@ impl<'a> UserResolveRequest<'a> {
     }
 }
 
+/// 作成済みの bundle ディレクトリ `<root>/<id>` を検査済み fd で保持する値（OCI-7・SEC-1・#4321）。
+///
+/// `SpecBundleProvider` が `prepare` / `release` で作って [`RootfsSource`] へ渡す。`RootfsSource` は直下の `rootfs/` の
+/// 作成・解放を、パスで開き直さずこの fd 起点で行う（bundle の親を symlink へ差し替えられても、おとりの木を作らず消さない）。
+/// 子の名前は `rootfs` / `config.json` / `resolv.conf` の固定値に閉じる。[`Self::path`] は `PreparedBundle` と
+/// `config.json` の bind source に載せる表示・引き渡し用のパスで、操作には使わない。
+#[derive(Debug)]
+pub struct BundleDir {
+    dir: ExtractRoot,
+    path: PathBuf,
+}
+
+/// bundle 直下の rootfs の固定名。
+const ROOTFS_NAME: &str = "rootfs";
+
+impl BundleDir {
+    /// 既存のディレクトリ `path` を symlink を辿らず開いて fd で保持する（試験・外部実装向け）。
+    pub fn open(path: &Path) -> Result<Self, OciError> {
+        Ok(Self {
+            dir: ExtractRoot::open_existing_dir(path)?,
+            path: path.to_path_buf(),
+        })
+    }
+
+    /// bundle ディレクトリのパス（引き渡し・表示用。操作には使わない）。
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// `rootfs/` のパス（`path().join("rootfs")`。fd を使わない照合・表示用）。
+    pub fn rootfs_path(&self) -> PathBuf {
+        self.path.join(ROOTFS_NAME)
+    }
+
+    /// 直下に 0700 の `rootfs/` を新規に作って fd で開く。既存は `AlreadyExists`。
+    pub fn create_rootfs_dir(&self) -> Result<ExtractRoot, OciError> {
+        self.dir.create_child_private_dir(ROOTFS_NAME)
+    }
+
+    /// 直下の `rootfs/` を開く。無ければ `None`、ディレクトリでなければ `FailedPrecondition`。
+    pub fn open_rootfs_dir(&self) -> Result<Option<ExtractRoot>, OciError> {
+        self.dir.open_child_dir(ROOTFS_NAME)
+    }
+
+    /// 直下に `rootfs/` がディレクトリとして在るか（読み取り権限を要求しない。mode 0000 でも `true`）。
+    /// 無ければ `false`、ディレクトリでなければ `FailedPrecondition`。解放前の種別確認用（CRI-2）。
+    pub fn rootfs_dir_exists(&self) -> Result<bool, OciError> {
+        self.dir.child_dir_exists(ROOTFS_NAME)
+    }
+
+    /// 直下の `rootfs/` を symlink を辿らず木ごと消す（不在は成功）。
+    pub fn remove_rootfs_tree(&self) -> Result<(), OciError> {
+        self.dir.remove_child_tree(ROOTFS_NAME)
+    }
+
+    /// `remove_rootfs_tree` に期限と取り消しを足した版。
+    pub fn remove_rootfs_tree_bounded(&self, budget: &ExtractBudget<'_>) -> Result<(), OciError> {
+        self.dir.remove_child_tree_bounded(ROOTFS_NAME, budget)
+    }
+
+    /// 直下に `name`（`config.json` 等の固定名）を排他作成して書き込み用に開く。
+    fn create_file(&self, name: &str, mode: u32) -> Result<fs::File, OciError> {
+        self.dir.create_new_file(name, mode)
+    }
+
+    /// 直下の `name`（固定名）を消す（不在は成功）。
+    fn remove_child(&self, name: &str) -> Result<(), OciError> {
+        self.dir.remove_child_tree(name)
+    }
+}
+
 /// `rootfs/` の用意と解放の注入点（本番の実装は [`super::ImageRootfsSource`]。#2433）。
 ///
 /// 実装は rootfs の内容と digest を検証する責務を持つ。
 pub trait RootfsSource: Send + Sync {
-    /// 存在しないパス `rootfs` を作成して `image` の内容で満たし、イメージ config 由来の既定値を返す。
+    /// `bundle` 直下に存在しない `rootfs/` を作成して `image` の内容で満たし、イメージ config 由来の既定値を返す。
+    /// 作成は `bundle` の fd 起点で行うこと（[`BundleDir::create_rootfs_dir`]。OCI-7・SEC-1・#4321）。
     ///
     /// `user.run_as_username` が `Some` なら rootfs の passwd で解決して
     /// [`ImageDefaults::resolved_run_as_username`] を埋めるか `Err` を返す。対応しない実装は無視してよく、
@@ -91,7 +171,7 @@ pub trait RootfsSource: Send + Sync {
     fn prepare(
         &self,
         image: &ImageSpec,
-        rootfs: &Path,
+        bundle: &BundleDir,
         user: &UserResolveRequest<'_>,
     ) -> Result<ImageDefaults, CriError>;
 
@@ -101,21 +181,25 @@ pub trait RootfsSource: Send + Sync {
     fn prepare_cancellable(
         &self,
         image: &ImageSpec,
-        rootfs: &Path,
+        bundle: &BundleDir,
         user: &UserResolveRequest<'_>,
         cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<ImageDefaults, CriError> {
         let _ = cancel;
-        self.prepare(image, rootfs, user)
+        self.prepare(image, bundle, user)
     }
 
-    /// `prepare` で作った rootfs を解放する（不在は `Ok`）。
-    fn release(&self, rootfs: &Path) -> Result<(), CriError>;
+    /// `prepare` で作った `bundle` 直下の rootfs を fd 起点で解放する（不在は `Ok`）。
+    fn release(&self, bundle: &BundleDir) -> Result<(), CriError>;
 
     /// `release` に期限と取り消しを足した版（#3142・CRI-2・REPAIR-5）。既定は予算を無視して `release` を呼ぶ。
-    fn release_bounded(&self, rootfs: &Path, budget: &ReleaseBudget<'_>) -> Result<(), CriError> {
+    fn release_bounded(
+        &self,
+        bundle: &BundleDir,
+        budget: &ReleaseBudget<'_>,
+    ) -> Result<(), CriError> {
         let _ = budget;
-        self.release(rootfs)
+        self.release(bundle)
     }
 }
 
@@ -138,6 +222,8 @@ pub struct SpecBundleProvider {
     /// 構築時に検証した root の (dev, ino)（unix のみ）。
     #[cfg(unix)]
     root_identity: (u64, u64),
+    /// 構築時に検査して開いた root の fd（構築できるのは unix のみ）。bundle の作成・巻き戻し・解放はこの fd 起点（#4321）。
+    root_dir: ExtractRoot,
     /// `prepare` が bundle を作成できずに失敗した ID（事前検証の失敗・既存 bundle を含む）（この provider が作っていない実体を `release` が消さないため）。
     refused: Mutex<HashSet<String>>,
 }
@@ -203,11 +289,18 @@ impl SpecBundleProvider {
             check_trusted_chain(&root, &meta)?;
             (meta.dev(), meta.ino())
         };
+        // 検査したパスと同じ実体を、symlink を辿らず fd で固定する。以後の操作はこの fd を起点にする。
+        let root_dir = ExtractRoot::open_existing_dir(&root)
+            .map_err(|_| CriError::failed_precondition("bundle root is unavailable"))?;
+        if root_dir.identity().ok() != Some(root_identity) {
+            return Err(CriError::failed_precondition("bundle root has changed"));
+        }
         Ok(Self {
             root,
             rootfs,
             #[cfg(unix)]
             root_identity,
+            root_dir,
             refused: Mutex::new(HashSet::new()),
         })
     }
@@ -343,41 +436,17 @@ fn check_trusted_chain(root: &Path, root_meta: &fs::Metadata) -> Result<(), CriE
     Ok(())
 }
 
-fn create_private_dir(path: &Path) -> Result<(), CriError> {
-    #[cfg_attr(not(unix), allow(unused_mut))]
-    let mut b = fs::DirBuilder::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt as _;
-        b.mode(0o700);
-    }
-    b.create(path).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::AlreadyExists {
-            CriError::failed_precondition("bundle already exists")
-        } else {
-            CriError::internal("failed to create bundle directory")
-        }
-    })
-}
-
-/// 既存・symlink を辿らず排他作成して書く。失敗の文言は固定（`what` はファイル名）。
+/// bundle 直下に `name` を排他作成して書く（fd 起点・symlink を辿らない）。失敗の文言は固定（`what` はファイル名）。
 fn write_new_file(
-    path: &Path,
+    bundle: &BundleDir,
+    name: &str,
     bytes: &[u8],
     mode: u32,
     what: &'static str,
 ) -> Result<(), CriError> {
-    let mut o = fs::OpenOptions::new();
-    o.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        o.mode(mode);
-    }
-    #[cfg(not(unix))]
-    let _ = mode;
-    let mut f = o
-        .open(path)
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut f = bundle
+        .create_file(name, mode)
         .map_err(|_| CriError::internal(format!("failed to create {what}")))?;
     // open 時の mode は umask で削られる（umask 077 だと 0644 が 0600 になる）。排他作成した自分のハンドルに
     // 対して明示的に設定し直す（プロセス全体の umask は変えない）。
@@ -390,6 +459,15 @@ fn write_new_file(
     f.write_all(bytes)
         .and_then(|()| f.sync_all())
         .map_err(|_| CriError::internal(format!("failed to write {what}")))
+}
+
+/// 期限切れ・取り消し（oci の `Timeout`）を cri の `Timeout` に、それ以外を `fallback` の固定文言に写す。
+fn map_remove_err(e: &OciError, fallback: &'static str) -> CriError {
+    if e.code() == OciErrorCode::Timeout {
+        CriError::timeout("bundle release exceeded its deadline")
+    } else {
+        CriError::internal(fallback)
+    }
 }
 
 impl BundleProvider for SpecBundleProvider {
@@ -414,9 +492,22 @@ impl BundleProvider for SpecBundleProvider {
             .ok_or_else(|| CriError::invalid_argument("image is required"))?;
 
         // 作成に成功した時だけ所有する（拒否扱いを外す）。既存・作成失敗は拒否扱いのまま残す。
-        create_private_dir(&dir)?;
+        // root の fd 起点で作り、以後の操作は作った実体の fd だけを使う（OCI-7・SEC-1・#4321）。
+        let created = self
+            .root_dir
+            .create_child_private_dir(req.container_id)
+            .map_err(|e| {
+                if e.code() == OciErrorCode::AlreadyExists {
+                    CriError::failed_precondition("bundle already exists")
+                } else {
+                    CriError::internal("failed to create bundle directory")
+                }
+            })?;
         self.lock_refused().remove(req.container_id);
-        let rootfs = dir.join("rootfs");
+        let bundle = BundleDir {
+            dir: created,
+            path: dir,
+        };
         let username = req
             .config
             .linux
@@ -443,7 +534,7 @@ impl BundleProvider for SpecBundleProvider {
         let built = (|| -> Result<_, CriError> {
             let defaults = self
                 .rootfs
-                .prepare_cancellable(image, &rootfs, &user, req.cancel)?;
+                .prepare_cancellable(image, &bundle, &user, req.cancel)?;
             // dns_config: 検証済みの resolv.conf を bundle に書き、そのパスを config.json の bind の source にする。
             // mode は 0644（mount の root がファイル自身になり bundle の 0700 が効かないため、写像された
             // 非 root の uid で動く process が読めるようにする。DNS 設定だけで秘密値は含まない）。
@@ -454,10 +545,10 @@ impl BundleProvider for SpecBundleProvider {
                 .map(resolv_conf::render)
                 .transpose()?
                 .flatten();
-            let resolv_path = dir.join("resolv.conf");
+            let resolv_path = bundle.path().join("resolv.conf");
             let files = match &resolv {
                 Some(r) => {
-                    write_new_file(&resolv_path, r.as_bytes(), 0o644, "resolv.conf")?;
+                    write_new_file(&bundle, "resolv.conf", r.as_bytes(), 0o644, "resolv.conf")?;
                     let p = resolv_path
                         .to_str()
                         .ok_or_else(|| CriError::internal("bundle path is not valid UTF-8"))?;
@@ -474,11 +565,20 @@ impl BundleProvider for SpecBundleProvider {
                 req.pod_netns_path.and_then(|p| p.to_str()),
             )?;
             write_new_file(
-                &dir.join("config.json"),
+                &bundle,
+                "config.json",
                 json.as_bytes(),
                 0o600,
                 "config.json",
             )?;
+            // 返すパスが作った実体であることを確かめる（root・`<root>/<id>` の差し替えを成功に見せない。fd 起点の
+            // 書き込みは作った実体にだけ届いており、おとりへは書かれていない）。
+            if !self.root_dir.child_matches(req.container_id, &bundle.dir) {
+                return Err(CriError::failed_precondition(
+                    "bundle path changed during preparation",
+                ));
+            }
+            self.verify_root()?;
             // CRI が RUNTIME_DEFAULT のときだけイメージの StopSignal を使う（#2771・CRI-2・OCI-1）。
             let stop = resolve_stop_signal(req.config.stop_signal, defaults.stop_signal)?;
             Ok((
@@ -492,13 +592,20 @@ impl BundleProvider for SpecBundleProvider {
             Err(e) => {
                 // 自分が作ったものだけを後始末する。rootfs の解放に失敗したら bundle を残し（通常の release と同じ
                 // 順序: rootfs 解放 → bundle 削除）、再試行は呼び出し元の release が担う。元のエラーを返す。
-                if self.rootfs.release(&rootfs).is_ok() {
-                    let _ = fs::remove_dir_all(&dir);
+                // すべて fd 起点。`<root>/<id>` が差し替わっていれば名前に触れず、作った実体の中の固定名のファイルだけ
+                // を消す（移動先の空ディレクトリは名前が分からず残る。モジュール冒頭「残余」）。
+                if self.rootfs.release(&bundle).is_ok() {
+                    if self.root_dir.child_matches(req.container_id, &bundle.dir) {
+                        let _ = self.root_dir.remove_child_tree(req.container_id);
+                    } else {
+                        let _ = bundle.remove_child("config.json");
+                        let _ = bundle.remove_child("resolv.conf");
+                    }
                 }
                 return Err(e);
             }
         };
-        let prepared = PreparedBundle::new(dir)
+        let prepared = PreparedBundle::new(bundle.path)
             .with_user(applied)
             .with_stop_signal(stop);
         Ok(match image {
@@ -522,18 +629,30 @@ impl BundleProvider for SpecBundleProvider {
             return Ok(());
         }
         self.verify_root()?;
-        let meta = match fs::symlink_metadata(&dir) {
-            Ok(m) => m,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        // symlink・通常ファイル等は消さない（リンク先の削除を防ぐ。fail-closed）。不在は冪等に成功。
+        let opened = match self.root_dir.open_child_dir(container_id) {
+            Ok(Some(d)) => d,
+            Ok(None) => return Ok(()),
+            Err(e) if e.code() == OciErrorCode::FailedPrecondition => {
+                return Err(CriError::internal("bundle path is not a directory"));
+            }
             Err(_) => return Err(CriError::internal("failed to inspect bundle")),
         };
-        // symlink・通常ファイル等は消さない（リンク先の削除を防ぐ。fail-closed）。
-        if !meta.file_type().is_dir() {
-            return Err(CriError::internal("bundle path is not a directory"));
-        }
+        let bundle = BundleDir {
+            dir: opened,
+            path: dir,
+        };
         budget.check()?;
-        self.rootfs.release_bounded(&dir.join("rootfs"), budget)?;
+        self.rootfs.release_bounded(&bundle, budget)?;
+        // 確認から削除までの間に `<root>/<id>` が差し替わっていたら、名前に触れない（おとりを消さない。#4321）。
+        if !self.root_dir.child_matches(container_id, &bundle.dir) {
+            return Err(CriError::failed_precondition(
+                "bundle path changed during release",
+            ));
+        }
         // rootfs を消した後の bundle 直下は小さなファイル（config.json 等）だけで、分割しない。
-        fs::remove_dir_all(&dir).map_err(|_| CriError::internal("failed to remove bundle"))
+        self.root_dir
+            .remove_child_tree_bounded(container_id, &budget.to_extract_budget())
+            .map_err(|e| map_remove_err(&e, "failed to remove bundle"))
     }
 }

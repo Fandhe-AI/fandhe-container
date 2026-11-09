@@ -1918,13 +1918,15 @@ pub fn plan_rootless_subordinate(
     )
 }
 
-/// 中間プロセス I が、pod の user・ipc namespace へ join して残りを分離する(CRI-2・CORE-3・SEC-1・SEC-5。#2674)。
+/// 中間プロセス I が、pod の user・ipc(と任意で network)namespace へ join して残りを分離する(CRI-2・CORE-3・NET-3・SEC-1・SEC-5。
+/// #2674・#2872)。
 ///
 /// 本番 launcher の中間プロセス(`launch_intermediate`)だけが、`NamespaceJoin` があるときに [`isolate`] /
 /// [`isolate_rootless_subordinate`] の代わりに呼ぶ。`plan` は通常どおり検証済みの計画(`User`・`Ipc` を含む。
 /// 権限モデルの写像と hostname を持つ)で、join では `User`・`Ipc` を作らず参加する。
 ///
-/// 処理順: 実行 ID の再検証 → `setns(user)` → `setns(ipc)` → `/proc/self/{uid,gid}_map` を読み直し、計画の期待する
+/// 処理順: 実行 ID の再検証 → `setns(user)` → `setns(ipc)` → `setns(net)`(join に net があるとき。pod の userns が所有する
+/// netns への参加で、`lo` は触らない〔保持役の責務〕) → `/proc/self/{uid,gid}_map` を読み直し、計画の期待する
 /// 写像と **完全一致** することを確かめる(不一致は `FailedPrecondition`。コンテナ内 root をホストの非特権 UID へ
 /// 写す SEC-5 と `process.user` の照合の前提を、参加先の userns でも保つ) → 残りの namespace(pid・mount・uts)を
 /// `unshare` → `/` を再帰 private 化 → hostname。
@@ -1980,6 +1982,13 @@ pub(crate) fn isolate_join(
     }
     sys::setns_fd(join.ipc_fd(), NsFlag::Ipc)
         .map_err(|e| ExecError::from_sys(e, IsolationStage::SetNs, "setns(ipc)"))?;
+    let net_joined = if let Some(net) = join.net_fd() {
+        sys::setns_fd(net, NsFlag::Net)
+            .map_err(|e| ExecError::from_sys(e, IsolationStage::SetNs, "setns(net)"))?;
+        true
+    } else {
+        false
+    };
     verify_joined_id_maps(
         |kind| {
             let target = rootless::TargetPid::new(std::process::id())?;
@@ -1988,7 +1997,10 @@ pub(crate) fn isolate_join(
         &uid,
         &gid,
     )?;
-    let rest = namespaces.without(Namespace::User).without(Namespace::Ipc);
+    let mut rest = namespaces.without(Namespace::User).without(Namespace::Ipc);
+    if net_joined {
+        rest = rest.without(Namespace::Net);
+    }
     if !rest.is_empty() {
         unshare_and_configure(rest, hostname, None, root_propagation)?;
     }

@@ -18,7 +18,7 @@
 | 10 | cgroup_parent | core の `linux.cgroupsPath`（#2010 の方針で拒否。再判断が要る。判断材料は [cri-cgroup-parent.md](cri-cgroup-parent.md)。オーナー承認待ちで、それまで `UNIMPLEMENTED`） | core → cri | #2672 |
 | 11 | devices・CDI | core の `linux.devices`（UnappliedField）・gpu の CDI 適用（判断材料は [cri-devices-cdi.md](cri-devices-cdi.md)。gpu の TASK-127・128・129 の完了とオーナー判断まで `UNIMPLEMENTED`。一般デバイスは GPU-9 が検討中） | gpu・core → cri | #2673 |
 | 12 | pod の pid / ipc の共有（join） | core は user＋ipc の path の組だけ受理済み（#2674）。cri は変換まで実装済みで、供給元（pod の保持役）は未実装のため本番では常に新しい namespace。構築口は #2776 で保持役の pid からの `PodNamespacePaths::for_holder_pid`（`/proc/<pid>/ns/{user,ipc}`）に限った。保持役の設計は [pod-namespace-holder.md](pod-namespace-holder.md)（#2838）で、実装は #2870〜#2880（保持役の配線は #2871・#2876・#2877）。pid の共有は未対応 | core → cri | #2674・#2776・#2838 |
-| 13 | pod netns の作成・結線 | core の network namespace の拒否（netns への join）。net・plugin-cri・cri の結線と注入点は本変更で実装済み。core の join と本番への注入は後続（設計は [pod-namespace-holder.md](pod-namespace-holder.md)・#2838。実装は #2872・#2878・#2879） | net・core・cri | #2675・#2838 |
+| 13 | pod netns の作成・結線 | net・plugin-cri・cri の結線と注入点は本変更で実装済み。core の network namespace の join（user＋ipc＋net。#2872）は実装済みで、cri が path を出す側と本番への注入は後続（設計は [pod-namespace-holder.md](pod-namespace-holder.md)・#2838。実装は #2878・#2879） | net・core・cri | #2675・#2838 |
 | 14 | port_mappings | plugin-cri `netsetup` の `publish_port`（本変更で実装済み。provider を注入した構成の `POD` だけ。本番は順 13 と同じく未注入のため `UNIMPLEMENTED`。下記「port_mappings の受け入れ方式」） | net・plugin-cri・cri | #2676 |
 | 15 | userns の uids / gids の写像 | オーナー判断待ち | core → cri | #2240 |
 | 16 | readonly_rootfs | core の `root.readonly`（#2767 で実装済み）→ cri が写す（実装済み。下記「readonly_rootfs の受け入れ方式」） | core → cri | #2827 |
@@ -322,12 +322,12 @@ CRI の `namespace_options.network` は既定が `POD` で、netns は sandbox �
 
 既知の差:
 
-- **コンテナが pod netns へ入る側（core）は未実装**: core は `linux.namespaces[].path` のうち `user` と `ipc` の組（順 12。#2674）だけを受け、`network` の path は `UNIMPLEMENTED` で拒否する。network の join は user namespace より前に `setns(CLONE_NEWNET)` する順序と、netns の検証（`O_NOFOLLOW`・`NSFS_MAGIC`・`NS_GET_NSTYPE`・置き場の配下性・所有者）を要し、方式は #1870 の設計事項で、保持役の userns が所有する netns への join は [pod-namespace-holder.md](pod-namespace-holder.md)（#2838。実装は #2872）。順 12（pid / ipc の join。#2674）と共通の土台にする。それまで provider を差した構成の start は `UNIMPLEMENTED` で失敗する
+- **コンテナが pod netns へ入る側（core）**: core は `linux.namespaces[].path` のうち `user` と `ipc` の組（順 12。#2674）に加えて、組に **足す形で** `network` の path を受ける（#2872・CORE-3・SEC-5・NET-3。設計は [pod-namespace-holder.md](pod-namespace-holder.md)・#2838）。`setns` の順は user → ipc → net → 残りの `unshare`、netns の素性（nsfs・種別・所有する user namespace が join する user と同じ）は fd に固定して照合し、受理と拒否は監査（層 `pod_namespace_join`・閉じた語彙の結果）に残す。network 単独の path・user が無い path・呼び出し側（init）の user namespace 所有の netns（rootful・ホストの netns）は `UNIMPLEMENTED` のまま（rootful は #2241 の判断待ち）。cri が bundle に path を出す側は #2878（H8）で、それまで本番は pod の netns を共有しない
 - **本番へは注入しない**: 差すと `RunPodSandbox` が bridge・netns・veth を作るのに start が失敗する。pod 用サブネットの出どころ（起動引数・固定値・設定）も未決（kubelet の `UpdateRuntimeConfig` の pod CIDR は検証して `CriRuntimeService::pod_cidrs` に記録するようになったが、読む利用者は無く、`PodSubnetPool` への結線は順 13 の本番注入と一緒に後続で行う。#2896・`docs/design/cri-status-rpc.md`）
 - 本番の plugin-cri は rootless で、bridge・veth の pin は初期 user namespace の `CAP_NET_ADMIN`・`CAP_SYS_ADMIN` を要するため作れない。rootless の pod netns は pasta 構成（NET-9。#1935 系）の領域で、rootful は #2241 のオーナー承認待ち
 - net にコンテナ単位の切り離しが無いため、pod ごとにネットワーク（bridge と nft テーブル）を作って `delete_network` で一括解放する。共有ネットワークと per-container の detach への移行は後続（CORE-9 の資源効率）
 - 未 attach の事前作成 netns は route ソケットの fd を 1 本保持する（件数は `MAX_NETWORKS` × `MAX_CONTAINERS_PER_NETWORK` で有界）。状態はプロセスのメモリだけで、plugin の再起動で失われる
-- `port_mappings` は下記「port_mappings の受け入れ方式」（#2676）。`PodSandboxStatus` の `network`（IP の報告）は空のスタブのまま（実装は #2873）
+- `port_mappings` は下記「port_mappings の受け入れ方式」（#2676）。`PodSandboxStatus` の `network` は `PodNetworkProvider::set_up` が `PodNetns::with_ips` で報告した IP だけを返す（#2873・CRI-2・NET-3。推測しない。provider が無い・NODE・無報告・Stop の tear_down 成功後・plugin-cri の再起動後の再採用では空。報告は射影形の正規化・禁止範囲・重複・追加 8 件の上限で検証し、違反は INTERNAL）。本番の plugin-cri は provider 未注入のため実際には空
 - 実機（root）の試験は `crates/net/tests/network_attach_privileged.rs` に準備したが、本変更では未実行
 
 ## port_mappings の受け入れ方式（CRI-2・NET-3・NET-4・PLUG-1。#2676）

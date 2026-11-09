@@ -643,7 +643,7 @@ thread_local! {
 }
 
 /// 試験用: このスレッドの在庫の保存失敗の注入を切り替える（権限に依存せず保存失敗を再現する）。
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) fn set_fail_save(on: bool) {
     FAIL_SAVE.with(|c| c.set(on));
 }
@@ -752,9 +752,13 @@ fn write_and_rename(root: &RootHandle, tmp: &str, bytes: &[u8]) -> Result<(), Oc
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Windows ホストは設計上 `ImageStore` を開けない（#4333・#2428 案 C。拒否は store.rs の試験が照合）ため、
+    // ストアを開く試験とその補助だけを unix に限る（永続化層の関数だけの試験は全 OS で回す）。
+    #[cfg(unix)]
     use crate::image_management::ImageStore;
     use crate::image_management::root_handle::rh;
     use std::path::{Path, PathBuf};
+    #[cfg(unix)]
     use std::time::Duration;
 
     fn d(n: u8) -> Digest {
@@ -855,6 +859,7 @@ mod tests {
         assert!(fs::symlink_metadata(&dangling).is_ok());
     }
 
+    #[cfg(unix)]
     fn open(root: &Path) -> ImageStore {
         ImageStore::open(root)
             .expect("open")
@@ -1241,6 +1246,7 @@ mod tests {
     }
 
     /// OCI-7: 別のストアインスタンス（別プロセス相当）の保存が、次の `lock` で見える。
+    #[cfg(unix)]
     #[test]
     fn oci7_store_reload_sees_other_instances_saves() {
         let r = root("reload");
@@ -1274,6 +1280,7 @@ mod tests {
     }
 
     /// OCI-7: 壊れた在庫ファイルでは `lock` 自体が失敗する（fail-closed）。
+    #[cfg(unix)]
     #[test]
     fn oci7_store_lock_fails_on_corrupt_inventory() {
         let r = root("lockfail");
@@ -1283,6 +1290,7 @@ mod tests {
     }
 
     /// OCI-7: 保存失敗の注入で `persist_inventory` はテーブルを元へ戻し、書かない。
+    #[cfg(unix)]
     #[test]
     fn oci7_persist_failure_restores_table() {
         let r = root("restore");
@@ -1303,6 +1311,7 @@ mod tests {
     }
 
     /// OCI-7: 変わっていなければ保存しない（失敗注入が効かない）。
+    #[cfg(unix)]
     #[test]
     fn oci7_persist_skips_when_unchanged() {
         let r = root("unchanged");

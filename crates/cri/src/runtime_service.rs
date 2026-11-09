@@ -4294,6 +4294,23 @@ fn now_nanos() -> Result<i64, CriError> {
         .ok_or_else(|| CriError::internal("system clock is invalid"))
 }
 
+/// provider が報告した IP を `PodSandboxStatus.network` へ写す（CRI-2・NET-3・REPAIR-3）。
+///
+/// 報告が無ければ `None`（推測しない）。Stop・Remove の tear_down 成功で `pod_netns` が消えるため解放済みの
+/// アドレスは返さない。tear_down 失敗で資源を保持している間、および期限超過後に遅れて成功した set_up
+/// （NotReady 固定）は、provider の報告をそのまま返す。再起動後の再採用では記録に載らず空（readopt.rs の R12）。
+fn pod_network_status(netns: &PodNetns) -> Option<v1::PodSandboxNetworkStatus> {
+    let ip = netns.ip()?;
+    Some(v1::PodSandboxNetworkStatus {
+        ip: ip.to_string(),
+        additional_ips: netns
+            .additional_ips()
+            .iter()
+            .map(|a| v1::PodIp { ip: a.to_string() })
+            .collect(),
+    })
+}
+
 impl SandboxRecord {
     /// Status 応答用の変換。labels・annotations は保持した値を無改変でコピーする。
     fn to_status(&self, id: &str) -> v1::PodSandboxStatus {
@@ -4302,7 +4319,7 @@ impl SandboxRecord {
             metadata: self.config.metadata.clone(),
             state: self.state.to_proto() as i32,
             created_at: self.created_at_nanos,
-            network: None,
+            network: self.pod_netns.as_ref().and_then(pod_network_status),
             linux: None,
             labels: self.config.labels.clone().into_iter().collect(),
             annotations: self.config.annotations.clone().into_iter().collect(),

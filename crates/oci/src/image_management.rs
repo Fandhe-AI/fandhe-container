@@ -55,7 +55,8 @@ pub use inventory_persist::{
     IMAGE_INVENTORY_FILE_NAME, MAX_IMAGE_INVENTORY_FILE_BYTES, MAX_IMAGE_MANIFESTS, MAX_PULL_LEASES,
 };
 
-#[cfg(test)]
+// Windows ホストは設計上 `ImageStore` を開けない（#4333・#2428 案 C。拒否は store.rs の試験が照合）ため unix に限る。
+#[cfg(all(test, unix))]
 mod inventory_ops_tests;
 
 mod container_ref;

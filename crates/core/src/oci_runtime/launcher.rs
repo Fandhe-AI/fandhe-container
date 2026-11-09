@@ -544,8 +544,10 @@ fn check_attach_hook_pairing(
 /// `docs/design/network-wiring.md` D8)。
 ///
 /// `Host` かつ `HostShared` は基準と同じ、`Loopback` / `Attachable` かつ `NewLoopback` は基準と異なる(`Attachable` は
-/// netns と user namespace の 2 本を渡す。NET-9・#1939)。`FromConfig`(既定・CRI の経路)は
-/// 同期点を通さない(D7: 既定を変えても CRI の経路の挙動を変えない。pod の netns の join〔#2838〕で見直す)。
+/// netns と user namespace の 2 本を渡す。NET-9・#1939)。`FromConfig`(既定・CRI の経路)は、実効が `PodJoined`
+/// (pod の netns へ join。#2872)のときだけ、pin 時に固定した netns の素性との一致を期待して通す(`pinned`。
+/// `setns` は固定した fd で行うため通常は一致する。D8 の多重防御)。`HostShared`・`NewLoopback` の `FromConfig` は
+/// 通さない(D7: 既定を変えても CRI の経路の挙動を変えない)。
 /// 上の組以外は start の突き合わせ(`reconcile_network`)と食い違う不整合で、fork の前に `Internal` で拒否する。
 /// `baseline` は試験用の差し替え(通常は `None`で、launch の入口で C が自分の netns から取る)。
 #[cfg(target_os = "linux")]
@@ -553,10 +555,41 @@ fn netns_sync_request(
     mode: LaunchNetworkMode,
     effective: EffectiveNetwork,
     baseline: Option<crate::exec::NetnsIdentity>,
+    pinned: Option<crate::exec::NetnsIdentity>,
 ) -> Result<Option<crate::exec::NetnsSyncRequest>, TraitError> {
     use crate::exec::{NetnsExpectation, NetnsHandover, NetnsSyncRequest};
-    let (expectation, handover) = match (mode, effective) {
+    // pod の netns へ join する起動は、基準に pin した netns の素性を渡して一致を期待する(試験用の差し替えは使わない)。
+    let (baseline, (expectation, handover)) = match (mode, effective) {
+        (LaunchNetworkMode::FromConfig, EffectiveNetwork::PodJoined) => match pinned {
+            Some(pinned) => (
+                Some(pinned),
+                (NetnsExpectation::SameAsBaseline, NetnsHandover::NetOnly),
+            ),
+            None => {
+                return Err(TraitError::new(
+                    ErrorCode::Internal,
+                    "the pod network join has no pinned network namespace",
+                ));
+            }
+        },
         (LaunchNetworkMode::FromConfig, _) => return Ok(None),
+        (_, mode_effective) => (baseline, plain_netns_expectation(mode, mode_effective)?),
+    };
+    Ok(Some(NetnsSyncRequest {
+        expectation,
+        baseline,
+        handover,
+    }))
+}
+
+/// `Host`・`Loopback`・`Attachable` の同期点の期待(`netns_sync_request` の表の残り)。組が不整合なら `Internal`。
+#[cfg(target_os = "linux")]
+fn plain_netns_expectation(
+    mode: LaunchNetworkMode,
+    effective: EffectiveNetwork,
+) -> Result<(crate::exec::NetnsExpectation, crate::exec::NetnsHandover), TraitError> {
+    use crate::exec::{NetnsExpectation, NetnsHandover};
+    let (expectation, handover) = match (mode, effective) {
         (LaunchNetworkMode::Host, EffectiveNetwork::HostShared) => {
             (NetnsExpectation::SameAsBaseline, NetnsHandover::NetOnly)
         }
@@ -575,11 +608,7 @@ fn netns_sync_request(
             ));
         }
     };
-    Ok(Some(NetnsSyncRequest {
-        expectation,
-        baseline,
-        handover,
-    }))
+    Ok((expectation, handover))
 }
 
 /// 利用者指定の tmpfs と注入ディレクトリ(いずれも pivot 前段で載せる tmpfs)が、config の
@@ -822,11 +851,11 @@ impl SubordinateIdSource {
 /// 構築時に解決・検証済みの範囲写像(`Inner` が保持し、起動のたびに `plan_rootless_subordinate` へ渡す)。
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone)]
-struct SubordinateIds {
-    uid: IdMapSet,
-    gid: IdMapSet,
-    writer: IdMapWriter,
-    timeout: Duration,
+pub(super) struct SubordinateIds {
+    pub(super) uid: IdMapSet,
+    pub(super) gid: IdMapSet,
+    pub(super) writer: IdMapWriter,
+    pub(super) timeout: Duration,
 }
 
 /// 権限モデルと写像の入力元の整合を検査し、`RootlessSubordinateIds` なら写像を解決する(副作用なし。
@@ -837,7 +866,7 @@ struct SubordinateIds {
 /// (`PermissionDenied`。`IdMapSet::new`)、subuid / subgid の読み取り・解析の失敗、helper の検証の失敗。
 /// 文言は固定の英語で、パス・errno・ユーザー名を含めない。
 #[cfg(target_os = "linux")]
-fn resolve_privilege(
+pub(super) fn resolve_privilege(
     privilege: IsolationPrivilege,
     source: Option<SubordinateIdSource>,
     euid: u32,
@@ -1720,6 +1749,7 @@ impl Inner {
             options.network(),
             spec.network(),
             self.netns_baseline_override(),
+            spec.namespace_join().and_then(|j| j.net_identity()),
         )?;
         // `Attachable` はフックが要る。無いまま fork して合図を送れない子を作らない(build の組の検査の多重防御。fail-closed)。
         if netns_sync.is_some_and(|r| r.handover == crate::exec::NetnsHandover::NetAndUser)
@@ -2204,6 +2234,15 @@ fn isolation_config_of(
             "a pod namespace join cannot be combined with the loopback network mode",
         ));
     }
+    // pod の netns へ join する(`PodJoined`)ことと、`NamespaceJoin` が net の fd を持つことは対で成り立つ。食い違いは
+    // start との不整合で、黙って別の netns で動かさない(fail-closed。NET-3・SEC-1・#2872)。
+    let join_has_net = spec.namespace_join().is_some_and(|j| j.has_net());
+    if (spec.network() == EffectiveNetwork::PodJoined) != join_has_net {
+        return Err(TraitError::new(
+            ErrorCode::Internal,
+            "the pod network join does not match the pinned namespaces",
+        ));
+    }
     // join する起動でも `User`・`Ipc` は集合に含める(計画の検証〔user namespace 必須・権限モデルの写像〕を通すため)。
     // 実際には作らず、中間プロセスが `NamespaceJoin` の fd へ参加する(`exec::isolate_join`)。
     let mut namespaces = NamespaceSet::empty();
@@ -2213,6 +2252,8 @@ fn isolation_config_of(
             NamespaceKind::Ipc if ipc == LaunchIpcMode::Host => continue,
             // `Host`(path 無しの network エントリ)は start が `HostShared` と判定済み。新しい netns は作らない(NET-6・#3058)。
             NamespaceKind::Network if spec.network() == EffectiveNetwork::HostShared => continue,
+            // path 付きの network エントリで実効が `PodJoined` なら、集合には含めるが作らない(中間プロセスが
+            // `NamespaceJoin` の fd へ参加する。`User`・`Ipc` と同じ。#2872)。
             // path 無しの network エントリで実効が `NewLoopback` なら、新しい netns を作る(中間プロセスが `lo` を up にする。
             // NET-6・#3064)。
             NamespaceKind::Network => Namespace::Net,
@@ -4717,7 +4758,7 @@ mod tests {
     #[test]
     fn net6_sec1_3206_netns_sync_request_follows_mode_and_effective_network() {
         use crate::exec::NetnsExpectation;
-        let req = |m, e| netns_sync_request(m, e, None);
+        let req = |m, e| netns_sync_request(m, e, None, None);
         assert_eq!(
             req(LaunchNetworkMode::Host, EffectiveNetwork::HostShared)
                 .unwrap()
@@ -4756,6 +4797,93 @@ mod tests {
             assert_eq!(
                 err.message(),
                 "the network mode does not match the reconciled network namespace plan"
+            );
+        }
+    }
+
+    /// NET-3・CORE-3・SEC-1(#2872): pod の netns へ join する起動(`FromConfig` かつ `PodJoined`)は、pin 時に固定した
+    /// netns の素性との一致(`SameAsBaseline` の基準が pinned)を期待して同期点を通す。pinned が無い・他モードとの組は
+    /// fork の前に `Internal`。
+    #[test]
+    fn net3_2872_pod_joined_sync_request_expects_the_pinned_identity() {
+        use crate::exec::{NetnsExpectation, NetnsHandover, NetnsIdentity};
+        let pinned = NetnsIdentity::from_parts(7, 4_026_531_840);
+        let request = netns_sync_request(
+            LaunchNetworkMode::FromConfig,
+            EffectiveNetwork::PodJoined,
+            // 試験用の差し替えがあっても join では使わない。
+            Some(NetnsIdentity::from_parts(1, 1)),
+            Some(pinned),
+        )
+        .unwrap()
+        .expect("a pod join passes the sync point");
+        assert_eq!(request.expectation, NetnsExpectation::SameAsBaseline);
+        assert_eq!(request.handover, NetnsHandover::NetOnly);
+        assert_eq!(request.baseline, Some(pinned));
+        let err = netns_sync_request(
+            LaunchNetworkMode::FromConfig,
+            EffectiveNetwork::PodJoined,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::Internal);
+        assert_eq!(
+            err.message(),
+            "the pod network join has no pinned network namespace"
+        );
+        for m in [
+            LaunchNetworkMode::Host,
+            LaunchNetworkMode::Loopback,
+            LaunchNetworkMode::Attachable,
+        ] {
+            let err =
+                netns_sync_request(m, EffectiveNetwork::PodJoined, None, Some(pinned)).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::Internal);
+            assert_eq!(
+                err.message(),
+                "the network mode does not match the reconciled network namespace plan"
+            );
+        }
+    }
+
+    /// NET-3・CORE-3・SEC-1(#2872): 分離の集合に、`PodJoined` かつ join が net の fd を持つときだけ `Net` が入る(作らず
+    /// 参加する型)。`PodJoined` なのに join に net が無い・join に net があるのに `PodJoined` でないのは `Internal`。
+    #[test]
+    fn net3_2872_pod_joined_isolation_config_requires_a_matching_net_join() {
+        let open =
+            || -> std::os::fd::OwnedFd { std::fs::File::open("/dev/null").expect("open").into() };
+        let joined = spec_for("pod-net", net_namespaces())
+            .with_namespace_join(Some(super::super::NamespaceJoin::for_test_with_net(
+                open(),
+                open(),
+                open(),
+            )))
+            .with_network(
+                super::super::EffectiveNetwork::PodJoined,
+                LaunchNetworkMode::FromConfig,
+            );
+        let cfg = isolation_config_of(&joined, LaunchIpcMode::Private).expect("config");
+        assert!(cfg.namespaces.contains(Namespace::Net));
+        assert!(cfg.namespaces.contains(Namespace::User));
+        let no_net_fd = spec_for("pod-net-no-fd", net_namespaces())
+            .with_namespace_join(Some(super::super::NamespaceJoin::for_test(open(), open())))
+            .with_network(
+                super::super::EffectiveNetwork::PodJoined,
+                LaunchNetworkMode::FromConfig,
+            );
+        let net_fd_but_host =
+            spec_for("pod-net-host", serde_json::json!({})).with_namespace_join(Some(
+                super::super::NamespaceJoin::for_test_with_net(open(), open(), open()),
+            ));
+        for spec in [no_net_fd, net_fd_but_host] {
+            let Err(err) = isolation_config_of(&spec, LaunchIpcMode::Private) else {
+                panic!("must be rejected");
+            };
+            assert_eq!(err.code(), ErrorCode::Internal);
+            assert_eq!(
+                err.message(),
+                "the pod network join does not match the pinned namespaces"
             );
         }
     }

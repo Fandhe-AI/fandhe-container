@@ -23,6 +23,11 @@ pub const RUNTIME_SHUTDOWN_WAIT: Duration = Duration::from_secs(1);
 /// 監査 forwarder、`main` の終了行の sink。[`FINAL_FLUSH_WAITS`]）。
 pub const FINAL_FLUSH_WAIT: Duration = Duration::from_millis(200);
 
+/// `--op-stats-file` 指定時の、停止時の最後のスナップショットの書き出し全体の期限（書き込み中の分の待ち + 符号化 + 置き換え。
+/// 2 回の fsync を含むため `FINAL_FLUSH_WAIT` より長くとる。超えたら諦めて停止を続ける。#4340・CRI-6・REPAIR-5）。
+/// 指定が無い起動ではこの待ちは発生しないが、停止の上限は構成の最悪値として持つ。
+pub const OP_STATS_FINAL_WRITE_WAIT: Duration = Duration::from_secs(1);
+
 /// 停止経路の書き出し待ちの回数（serve_with_audit の sink・forwarder + main の終了行）。
 pub const FINAL_FLUSH_WAITS: u64 = 3;
 
@@ -55,13 +60,14 @@ pub fn shutdown_line(signal: ShutdownSignal, stage: ShutdownStage) -> String {
 }
 
 /// 停止の全体の上限: 検知の周期 + 猶予 + 強制回収（`serve_router` の `FORCE_RECLAIM_WAIT` 2 秒）+ 最後の書き出し（3 回）
-/// + ランタイムの待ち。これを超えて待つ経路は無い（REPAIR-5）。
+/// + ランタイムの待ち + op-stats の最後の書き出し（[`OP_STATS_FINAL_WRITE_WAIT`]。#4340）。これを超えて待つ経路は無い（REPAIR-5）。
 pub const SHUTDOWN_TOTAL_BOUND: Duration = Duration::from_millis(
     SHUTDOWN_SIGNAL_POLL.as_millis() as u64
         + crate::adapter::PLUGIN_SHUTDOWN_GRACE.as_millis() as u64
         + 2_000
         + FINAL_FLUSH_WAITS * FINAL_FLUSH_WAIT.as_millis() as u64
-        + RUNTIME_SHUTDOWN_WAIT.as_millis() as u64,
+        + RUNTIME_SHUTDOWN_WAIT.as_millis() as u64
+        + OP_STATS_FINAL_WRITE_WAIT.as_millis() as u64,
 );
 
 /// 監査 relay の helper が本体の終了後に残る時間の上限（Linux）。helper は停止シグナルを無視し、本体の終了
@@ -83,9 +89,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn unit_stop_bound_is_pinned_and_below_systemd_default() {
-        assert_eq!(SHUTDOWN_TOTAL_BOUND, Duration::from_millis(13_700));
+        assert_eq!(SHUTDOWN_TOTAL_BOUND, Duration::from_millis(14_700));
         assert_eq!(AUDIT_HELPER_LINGER_BOUND, Duration::from_millis(11_450));
-        assert_eq!(UNIT_STOP_BOUND, Duration::from_millis(25_150));
+        assert_eq!(UNIT_STOP_BOUND, Duration::from_millis(26_150));
         assert!(UNIT_STOP_BOUND < Duration::from_secs(90));
     }
 
@@ -112,7 +118,7 @@ mod tests {
     /// CRI-1・REPAIR-5: 停止の全体の上限が 15 秒以下で、systemd の既定の停止猶予（90 秒）より十分短い。
     #[test]
     fn total_bound_is_within_fifteen_seconds() {
-        assert_eq!(SHUTDOWN_TOTAL_BOUND, Duration::from_millis(13_700));
+        assert_eq!(SHUTDOWN_TOTAL_BOUND, Duration::from_millis(14_700));
         assert!(SHUTDOWN_TOTAL_BOUND <= Duration::from_secs(15));
     }
 }

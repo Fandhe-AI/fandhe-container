@@ -10,7 +10,8 @@
 //! | モード | config の network エントリ | 結果 |
 //! | ---- | ---- | ---- |
 //! | `FromConfig` | 無し | `HostShared`(現行どおりホストの netns を共有) |
-//! | `FromConfig` | 有り | `Unimplemented`(現行どおり) |
+//! | `FromConfig` | 有り(path 付きで、user と ipc の path の組がある〔pod の join。#2872〕) | `PodJoined`(pod の netns へ参加する) |
+//! | `FromConfig` | 有り(上記以外) | `Unimplemented`(現行どおり) |
 //! | `Loopback` | 無し、または path 無し | `NewLoopback`(新しい netns と lo の up) |
 //! | `Loopback` | path 付き / 重複 | `InvalidArgument` |
 //! | `Attachable` | 無し、または path 無し | `NewLoopback`(`Loopback` と同じ。exec 前の同期点で netns と user namespace の fd を呼び出し側へ渡す。#1939) |
@@ -51,12 +52,19 @@ pub enum EffectiveNetwork {
     HostShared,
     /// 新しい network namespace を作り lo を up する(実体は #3064 で実装済み)。
     NewLoopback,
+    /// pod の保持役が作った network namespace へ、固定した fd で参加する(pod の user・ipc・net の join。
+    /// CORE-3・SEC-5・NET-3・#2872。設計 #2838 の H7)。netns は作らず `lo` も触らない(保持役の責務)。
+    PodJoined,
 }
 
 /// D7 の表で config と起動オプションを突き合わせる(モジュール doc)。
+///
+/// `pod_net_join` は、`NamespaceJoin::paths_of` が network の path を含む user・ipc・net の組を返したか(start が先に
+/// 純粋関数で判定して渡す)。`FromConfig` の path 付きエントリは、これが真のときだけ `PodJoined` になる。
 pub(super) fn reconcile_network(
     config: &OciConfig,
     mode: LaunchNetworkMode,
+    pod_net_join: bool,
 ) -> Result<EffectiveNetwork, TraitError> {
     let mut entries = config
         .namespaces()
@@ -67,6 +75,9 @@ pub(super) fn reconcile_network(
     match mode {
         LaunchNetworkMode::FromConfig => match first {
             None => Ok(EffectiveNetwork::HostShared),
+            Some(n) if pod_net_join && !has_second && n.path().is_some() => {
+                Ok(EffectiveNetwork::PodJoined)
+            }
             Some(_) => Err(TraitError::new(
                 ErrorCode::Unimplemented,
                 "start does not support yet: network / cgroup / time namespace",
@@ -113,7 +124,37 @@ mod tests {
     const NET_TWICE: &str = r#"{"type":"network"},{"type":"network"}"#;
 
     fn run(ns: &str, mode: LaunchNetworkMode) -> Result<EffectiveNetwork, TraitError> {
-        reconcile_network(&config_with(ns), mode)
+        reconcile_network(&config_with(ns), mode, false)
+    }
+
+    /// CORE-3・SEC-5・NET-3・#2872: `FromConfig` の path 付き network は、pod の組の path があるとき(`pod_net_join`)だけ
+    /// `PodJoined`。path 無し・重複は組があっても `Unimplemented` のまま。
+    #[test]
+    fn net3_2872_from_config_pod_net_join_accepts_only_a_path_entry() {
+        let reconcile = |ns: &str, pod: bool| {
+            reconcile_network(&config_with(ns), LaunchNetworkMode::FromConfig, pod)
+        };
+        assert_eq!(
+            reconcile(NET_PATH, true).unwrap(),
+            EffectiveNetwork::PodJoined
+        );
+        for (ns, pod) in [(NET_PATH, false), (NET, true), (NET_TWICE, true)] {
+            let err = reconcile(ns, pod).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::Unimplemented);
+            assert_eq!(
+                err.message(),
+                "start does not support yet: network / cgroup / time namespace"
+            );
+        }
+        // 他モードは pod の組があっても path 付きを拒否する(起動オプションが優先。`InvalidArgument`)。
+        for mode in [
+            LaunchNetworkMode::Loopback,
+            LaunchNetworkMode::Attachable,
+            LaunchNetworkMode::Host,
+        ] {
+            let err = reconcile_network(&config_with(NET_PATH), mode, true).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        }
     }
 
     #[test]

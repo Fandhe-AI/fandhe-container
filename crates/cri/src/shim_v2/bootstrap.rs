@@ -39,7 +39,7 @@
 //! （0600・追記。開く時に 1 MiB 以上なら `daemon.log.1` へ回す）へ向ける。
 //! 非 Linux は記録先を持たない（plugin-cri の main と同じ。#2430）。
 //!
-//! `-publish-binary` は検証して [`ServeContext`] に保持し（#4154）、[`super::publish`] が TaskCreate・TaskStart・TaskDelete・TaskExit・TaskExecAdded・TaskExecStarted を送る（#4155・#4156・#4281）。
+//! `-publish-binary` は検証して [`ServeContext`] に保持し（#4154）、[`super::publish`] が TaskCreate・TaskStart・TaskDelete・TaskExit・TaskExecAdded・TaskExecStarted・exec の TaskExit を送る（#4155・#4156・#4281・#4317）。
 //! 呼び出し形・送る種別は `docs/design/shim-v2-production-binary.md` の「イベントの publish」を参照。
 //!
 //! 計測（REPAIR-4）: `start` / `delete` / デーモンの ttrpc は、結果と所要時間を置き場所の `ops.log`

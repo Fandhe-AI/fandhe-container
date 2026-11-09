@@ -2515,6 +2515,54 @@ mod tests {
         assert_eq!(pull.dropped_records(), 0);
     }
 
+    /// CRI-6・REPAIR-4・#4324: インスタンス不一致による Exec 拒否は `cri.exec.instance_changed` の別の行として出る。
+    #[test]
+    fn cri6_repair4_4324_instance_changed_is_separate_op_stats_line() {
+        let shared = Arc::new(OpRecorder::new());
+        let pull = Arc::new(OpRecorder::new());
+        let bridge = CoreCriRecorder::new(Arc::clone(&shared), Arc::clone(&pull));
+        let ms = Duration::from_millis;
+        bridge.record_cri_op(&CriOpSample::new(
+            CriOpKind::ExecSession,
+            tonic::Code::FailedPrecondition,
+            ms(2),
+        ));
+        bridge.record_cri_op(&CriOpSample::new(
+            CriOpKind::ExecInstanceChanged,
+            tonic::Code::FailedPrecondition,
+            ms(2),
+        ));
+        bridge.record_cri_op(&CriOpSample::new(
+            CriOpKind::ExecSession,
+            tonic::Code::Unavailable,
+            ms(3),
+        ));
+        let get = |n: &str| {
+            shared
+                .snapshot_op(&OpName::new(n).expect("name"))
+                .map(|s| (s.success(), s.failure()))
+        };
+        assert_eq!(get("cri.exec.session"), Some((0, 2)));
+        assert_eq!(get("cri.exec.instance_changed"), Some((0, 1)));
+        assert_eq!(pull.snapshot().len(), 0);
+        assert_eq!(shared.dropped_records(), 0);
+        let mut out: Vec<u8> = Vec::new();
+        shared.export_json_lines(Some(&mut out)).expect("export");
+        let text = String::from_utf8(out).expect("utf8");
+        let changed: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains(r#""op":"cri.exec.instance_changed""#))
+            .collect();
+        let session: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains(r#""op":"cri.exec.session""#))
+            .collect();
+        assert_eq!(changed.len(), 1, "{text}");
+        assert_eq!(session.len(), 1, "{text}");
+        assert!(changed[0].contains(r#""failure":1"#), "{}", changed[0]);
+        assert!(session[0].contains(r#""failure":2"#), "{}", session[0]);
+    }
+
     /// 22 種すべての `OciOpKind` の名前（REPAIR-4・OCI-1・#2900 の写像の固定用）。
     #[cfg(unix)]
     fn all_oci_kinds() -> [(OciOpKind, &'static str); 22] {

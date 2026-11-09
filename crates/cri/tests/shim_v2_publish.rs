@@ -623,6 +623,7 @@ impl TaskExecLauncher for ExecLauncher {
         _: &ContainerId,
         _: &ExecId,
         _: &ExecProcessSpec,
+        _expected_instance: Option<u64>,
     ) -> Result<Arc<dyn TaskExecProcess>, CriError> {
         Ok(Arc::new(ExecProc))
     }
@@ -684,6 +685,119 @@ fn cri5_4281_exec_events_reach_fake_binary_in_order() {
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(count_calls(&out), 4, "exactly one event per step");
     assert!(log.0.lock().unwrap().is_empty());
+}
+
+/// 外から終了させられる偽 exec プロセス（pid 9002）。`exit_code` が `Some` になると `Exited` を返す。
+struct ExitableProc(Arc<Mutex<Option<i32>>>);
+
+impl TaskExecProcess for ExitableProc {
+    fn pid(&self) -> Option<NonZeroU32> {
+        NonZeroU32::new(9002)
+    }
+    fn status(&self) -> Result<ExecProcessStatus, CriError> {
+        Ok(match *self.0.lock().unwrap() {
+            Some(code) => ExecProcessStatus::Exited { code: Some(code) },
+            None => ExecProcessStatus::Running,
+        })
+    }
+    fn signal(&self, _: Signal) -> Result<(), CriError> {
+        Ok(())
+    }
+}
+
+struct ExitableLauncher(Arc<Mutex<Option<i32>>>);
+
+impl TaskExecLauncher for ExitableLauncher {
+    fn launch(
+        &self,
+        _: &ContainerId,
+        _: &ExecId,
+        _: &ExecProcessSpec,
+        _expected_instance: Option<u64>,
+    ) -> Result<Arc<dyn TaskExecProcess>, CriError> {
+        Ok(Arc::new(ExitableProc(Arc::clone(&self.0))))
+    }
+}
+
+/// CRI-5・REPAIR-10・REPAIR-12・#4317: 公開 API の Exec → Start(exec_id) → exec の終了 が、偽 publish バイナリへ
+/// TaskExecAdded、TaskExecStarted、TaskExit（`id` = exec ID・pid 9002・終了コード 7）の順にちょうど 1 件ずつ届く。
+/// init の TaskExit（`id` = コンテナ ID）とは `id` で区別でき、終了後に追加の通知は出ない。
+#[test]
+fn cri5_4317_exec_exit_reaches_fake_binary_with_exec_id() {
+    let (svc, _fake, out, bundle, log, _dir) =
+        setup_4224("execexit", "", Duration::from_millis(50));
+    let code = Arc::new(Mutex::new(None));
+    let svc = svc.with_exec_launcher(Arc::new(ExitableLauncher(Arc::clone(&code))));
+    svc.handle("Create", &create_req("c1", &bundle)).unwrap();
+    svc.handle("Start", &start_req("c1")).unwrap();
+    assert_eq!(wait_call(&out, 0).0, "/tasks/create");
+    assert_eq!(wait_call(&out, 1).0, "/tasks/start");
+
+    let exec = ExecProcessRequest {
+        id: "c1".into(),
+        exec_id: "e1".into(),
+        spec: Some(Any {
+            type_url: "types.containerd.io/opencontainers/runtime-spec/1/Process".into(),
+            value: br#"{"cwd":"/","args":["/bin/true"]}"#.to_vec(),
+        }),
+        ..Default::default()
+    }
+    .encode_to_vec();
+    svc.handle("Exec", &exec).unwrap();
+    assert_eq!(wait_call(&out, 2).0, "/tasks/exec-added");
+    let start = StartRequest {
+        id: "c1".into(),
+        exec_id: "e1".into(),
+    }
+    .encode_to_vec();
+    svc.handle("Start", &start).unwrap();
+    assert_eq!(wait_call(&out, 3).0, "/tasks/exec-started");
+
+    // 実行中は TaskExit を出さない。
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(count_calls(&out), 4);
+
+    *code.lock().unwrap() = Some(7);
+    let (topic, any) = wait_call(&out, 4);
+    assert_eq!(topic, "/tasks/exit");
+    assert_eq!(any.type_url, "containerd.events.TaskExit");
+    assert_eq!(
+        TaskExit::decode(any.value.as_slice()).unwrap(),
+        TaskExit {
+            container_id: "c1".into(),
+            id: "e1".into(),
+            pid: 9002,
+            exit_status: 7,
+            exited_at: None,
+        }
+    );
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(count_calls(&out), 5, "exactly one TaskExit");
+    assert!(log.0.lock().unwrap().is_empty());
+}
+
+/// CRI-5・SEC-1・#4317: exec ID がコンテナ ID と同じ Exec は拒否される（init の終了と誤認されないため）。
+#[test]
+fn cri5_4317_exec_id_equal_to_container_id_is_rejected() {
+    let (svc, _fake, out, bundle, _log, _dir) =
+        setup_4224("execsame", "", Duration::from_millis(50));
+    let svc = svc.with_exec_launcher(Arc::new(ExecLauncher));
+    svc.handle("Create", &create_req("c1", &bundle)).unwrap();
+    svc.handle("Start", &start_req("c1")).unwrap();
+    assert_eq!(wait_call(&out, 1).0, "/tasks/start");
+    let exec = ExecProcessRequest {
+        id: "c1".into(),
+        exec_id: "c1".into(),
+        spec: Some(Any {
+            type_url: "types.containerd.io/opencontainers/runtime-spec/1/Process".into(),
+            value: br#"{"cwd":"/","args":["/bin/true"]}"#.to_vec(),
+        }),
+        ..Default::default()
+    }
+    .encode_to_vec();
+    assert!(svc.handle("Exec", &exec).is_err());
+    std::thread::sleep(Duration::from_millis(250));
+    assert_eq!(count_calls(&out), 2);
 }
 
 /// 偽バイナリが受け取るはずの TaskCreate の `Any`（stdin 全体）。本体の定数とは独立に組み立てる。

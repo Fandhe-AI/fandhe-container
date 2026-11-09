@@ -21,6 +21,12 @@
 //! 正常停止は stderr に固定の 1 行 `cri plugin shutdown: signal=<SIGTERM|SIGINT> stage=<startup|serve>` を出し、終了コード 0。
 //! 監査 relay の helper は SIGTERM・SIGINT を無視し、本体の終了（EOF）で終わる（グループ・cgroup 宛ての停止で先に死なず、ドレイン中の拒否も
 //! `@audit.log` に届く。#3300）。fork した子へのハンドラの継承は `sys` の doc「fork した子への継承」。SIGHUP は対象外。
+//! 操作統計のスナップショットは `--op-stats-file <PATH>` で opt-in する（既定は無効で何も開かない。#4336・#4340・CRI-6・REPAIR-4）。
+//! 指定時だけ、状態ルート・ロック・socket より前に置き先を検査して開き（symlink・他 UID 所有・group/other 書き込み可のディレクトリ、
+//! 通常ファイルでない最終名は `PERMISSION_DENIED` の固定文言で起動しない。fail-closed）、audit relay の fork の後に書き込み thread を起こして周期の書き出しへ渡す。
+//! 非 Linux では指定を `UNIMPLEMENTED` で拒否する。停止シグナルを受けて UDS とストリーミングを畳んだ後、`shutdown::OP_STATS_FINAL_WRITE_WAIT`（1 秒）を
+//! 期限に最後のスナップショットを 1 回書く（書き込み中の分は待ち、超えたら `final_timeout` の行を残して諦め、停止を続ける）。
+//! シグナルを受けていない経路（起動の失敗・起動段 `stage=startup` での停止）では書かない（失敗時の stderr は `error: ` の行で始まる契約を保つ。受付の前は記録すべき操作も無い）。
 //!
 //! 終了コード: 0 = `--help` と正常停止、2 = `InvalidArgument`（plugin-macos / plugin-mcp と同じ値）、1 = それ以外の失敗
 //! （未実装・起動失敗・serve の失敗）。
@@ -92,6 +98,7 @@ fn stop_at_startup_boundary() -> Option<ExitCode> {
 fn serve(
     socket: &std::path::Path,
     streaming_opts: &fandhe_container_plugin_cri::startup::StreamingOptions,
+    op_stats_file: Option<&std::path::Path>,
 ) -> ExitCode {
     use fandhe_container_plugin::grpc::GrpcServerConfig;
     use fandhe_container_plugin_cri::adapter::{
@@ -99,6 +106,13 @@ fn serve(
     };
     use fandhe_container_plugin_cri::{server, telemetry};
 
+    // `--op-stats-file` の置き先は、状態ルート・ロック・socket に触る前に検査して開く（fail-closed。#4340）。thread は作らない
+    // （fd は `O_CLOEXEC` で、audit relay の helper は fd 3 以上を閉じる）。非 Linux はここで `UNIMPLEMENTED` になる。
+    let op_stats_target = match op_stats_file.map(telemetry::open_op_stats_target) {
+        Some(Ok(t)) => Some(t),
+        Some(Err(e)) => return fail_err(&e),
+        None => None,
+    };
     // 監査の記録経路（Linux）は、スレッド・listener・ランタイムを作る前に用意する（SEC-4・PLUG-12・#2484）。
     // `ControlAuditRelay::spawn` は単一スレッドのときだけ成功し、helper は fd 3 以上を閉じるため。
     // 作れなければ「記録されないまま受け付ける」状態を避けて起動しない（fail-closed。supervisor の #2027 と同じ）。
@@ -118,6 +132,15 @@ fn serve(
     if let Err(e) = sys::install_shutdown_signals() {
         return fail(e.code(), e.message());
     }
+    // 書き込み thread は relay の fork の後に起こす（relay は単一スレッドの呼び出し元を要求する）。ロックの取得や bind より前に
+    // 作れなければ起動しない（fail-closed。#4340）。
+    let op_stats_sink = match op_stats_target {
+        Some(t) => match telemetry::spawn_op_stats_file_sink(t, telemetry::stderr_sink().clone()) {
+            Ok(s) => Some(s),
+            Err(e) => return fail_err(&e),
+        },
+        None => None,
+    };
     // create の `mounts[].destination` 拒否も同じ relay で永続化する（SEC-4・OCI-4・#2594）。プロセスは常に複数スレッドで
     // `FileAuditSink` を直接使えないため、`PeerAuditForwarder` と共有する。非 Linux は記録先が無く記録しない。
     #[cfg(target_os = "linux")]
@@ -152,6 +175,11 @@ fn serve(
     }
     let recorder = std::sync::Arc::clone(backends.op_recorder());
     let oci_recorder = std::sync::Arc::clone(backends.oci_op_recorder());
+    // 停止時の最後のスナップショット用（周期の task へ move する前に控える。共有 → oci の順は周期と同じ。#4340）。
+    let final_recorders = vec![
+        std::sync::Arc::clone(&recorder),
+        std::sync::Arc::clone(&oci_recorder),
+    ];
     let sweep_store = std::sync::Arc::clone(backends.state());
     let sweep_recorder = std::sync::Arc::clone(&recorder);
     // bundle の供給は fail-closed。置き場を用意できなければ（fixed 文言のみ出して）起動しない。
@@ -354,6 +382,7 @@ fn serve(
     // 非 Linux は永続化経路が未実装（#2430 の判断待ち。REPAIR-3）。拒否は stderr にだけ残る。
     #[cfg(not(target_os = "linux"))]
     let audit = None;
+    let op_stats_sink_for_loop = op_stats_sink.clone();
     let result = rt.block_on(async {
         // 前回までに残ったコンテナログを 1 回だけ回収する（サーブの開始は待たせない。監査 relay は作成済みで、単一スレッド前提を壊さない。#2760）。
         drop(tokio::task::spawn_blocking(move || {
@@ -369,9 +398,12 @@ fn serve(
             }
         }));
         // 操作の件数・レイテンシを定期的に構造化ログとして stderr へ出す（REPAIR-4）。
-        let stats = tokio::spawn(telemetry::op_stats_export_loop_many(
+        // `--op-stats-file` 指定時は同じ周期の内容をスナップショットファイルへも渡す（無指定は stderr のみで従来どおり。#4340）。
+        let stats = tokio::spawn(telemetry::op_stats_export_loop_with(
             vec![recorder, oci_recorder],
-            telemetry::OP_STATS_EXPORT_INTERVAL,
+            telemetry::op_stats_export_interval(),
+            telemetry::stderr_sink().clone(),
+            op_stats_sink_for_loop,
         ));
         #[cfg(target_os = "linux")]
         let exec_launcher_stop = std::sync::Arc::clone(&exec_launcher);
@@ -413,6 +445,16 @@ fn serve(
     // 置き去りにしたタスクの結果は不明のまま残り、再起動時に再採用・回収が扱う。
     // ストリーミングのセッションは上の `finish` で閉じ済みで、ここで切られるのは実行中の blocking の dial 等の残りだけ（#4164）。
     rt.shutdown_timeout(shutdown::RUNTIME_SHUTDOWN_WAIT);
+    // 停止シグナルを受けていれば、最後のスナップショットを期限つきで 1 回書く（#4340・CRI-6・REPAIR-5）。周期の task は abort 済みで
+    // ランタイムも畳んだため、周期の送り手とは競合しない。結果は捨てる（失敗・期限切れの行は sink が stderr へ残し、停止を続ける）。
+    // 受信なしの停止（起動の失敗など）では書かない（失敗時の stderr は `error: ` の行で始まる契約を保つ）。
+    if let (Some(sink), Some(_)) = (&op_stats_sink, sys::received()) {
+        let _ = telemetry::write_final_snapshot(
+            &final_recorders,
+            sink,
+            shutdown::OP_STATS_FINAL_WRITE_WAIT,
+        );
+    }
     // インスタンスロックは `backends` が持つ。`shutdown_timeout` は未完了の blocking worker を残して返るため、
     // ここで drop すると worker が状態を変えうる間に別インスタンスがロックを取り再採用・回収を始められる。
     // プロセス終了（fd の close）まで保持するため leak させる（CRI-2・CORE-1。終了行の書き出しの窓も覆う）。
@@ -441,6 +483,7 @@ fn serve(
 fn serve(
     _socket: &std::path::Path,
     _streaming_opts: &fandhe_container_plugin_cri::startup::StreamingOptions,
+    _op_stats_file: Option<&std::path::Path>,
 ) -> ExitCode {
     fail(
         PluginErrorCode::Unimplemented,
@@ -454,7 +497,11 @@ fn main() -> ExitCode {
             print!("{}", startup::usage());
             ExitCode::SUCCESS
         }
-        Ok(Invocation::Serve { socket, streaming }) => serve(&socket, &streaming),
+        Ok(Invocation::Serve {
+            socket,
+            streaming,
+            op_stats_file,
+        }) => serve(&socket, &streaming, op_stats_file.as_deref()),
         Ok(_) => {
             // `Run` と、将来足される値は成功扱いにしない。
             fail(

@@ -200,6 +200,10 @@ pub(super) fn sleep_until(until: Instant, cancelled: &dyn Fn() -> bool) -> bool 
 /// - 戻り値は起動したプロセスのハンドル [`TaskExecProcess`]。
 /// - shim は `Start` の直前にコンテナが Running かを再確認するが、確認から起動までの間に停止しうる。
 ///   停止済みコンテナへの起動は実装側が拒否する（`FAILED_PRECONDITION`）。
+/// - `expected_instance` は登録時に実行層が報告したインスタンス識別子。実装は**起動対象（pid）を決める状態読み取りと
+///   同じ読み取り**で [`crate::adapter::instance_matches`] により照合し、不一致（値が違う・片側だけ `None`）なら
+///   起動せず `FAILED_PRECONDITION`（`MSG_EXEC_INSTANCE_CHANGED`）を返す。shim の `purge_mismatched` は別の読み取りで
+///   行うため、その後の作り直し（TOCTOU）は起動役の照合だけが塞ぐ（#4323・CRI-5・SEC-1）。
 /// - panic しないこと。panic すると登録簿の状態が `Starting` のまま残り、コンテナのゲートも毒される
 ///   （以後そのストライプは `INTERNAL`）。
 ///
@@ -212,6 +216,7 @@ pub trait TaskExecLauncher: Send + Sync {
         container: &ContainerId,
         exec_id: &ExecId,
         spec: &ExecProcessSpec,
+        expected_instance: Option<u64>,
     ) -> Result<Arc<dyn TaskExecProcess>, CriError>;
 }
 
@@ -392,18 +397,35 @@ impl std::fmt::Debug for ExecPhase {
     }
 }
 
+/// `Started` の exec 1 件（コンテナの Delete が TaskExit を補完するときの持ち物。#4317）。
+pub struct StartedExec {
+    /// exec ID。
+    pub exec_id: ExecId,
+    /// 起動済みのプロセスのハンドル。
+    pub process: Arc<dyn TaskExecProcess>,
+    /// 送信権の印（`exit_claim`）。
+    pub exit_claim: Arc<Mutex<bool>>,
+}
+
 /// ある時点の exec の段階と、登録固有のトークン（再登録の検出に使う）。
 #[derive(Debug, Clone)]
 pub struct ExecSnapshot {
     /// 段階。
     pub phase: ExecPhase,
     token: u64,
+    exit_claim: Arc<Mutex<bool>>,
 }
 
 impl ExecSnapshot {
     /// 同じ登録の snapshot か（削除・再作成で別の登録になっていないか）。
     pub fn is_same_registration(&self, other: &ExecSnapshot) -> bool {
         self.token == other.token
+    }
+
+    /// exec の TaskExit の送信権の印（#4317）。真なら送信済み。取った側だけが送る。
+    /// 登録のエントリが持つので、エントリの除去とともに消える。ロックは送信（キュー投入）の完了まで保持する。
+    pub fn exit_claim(&self) -> Arc<Mutex<bool>> {
+        Arc::clone(&self.exit_claim)
     }
 }
 
@@ -416,6 +438,8 @@ struct ExecEntry {
     token: u64,
     /// 登録時のコンテナのインスタンス識別子（#4220）。現在の値と違えば別インスタンスの登録とみなす。
     instance: Option<u64>,
+    /// exec の TaskExit の送信権の印（#4317）。終了 watcher と `Delete(exec_id)`・コンテナの Delete が取り合う。
+    exit_claim: Arc<Mutex<bool>>,
 }
 
 /// `Start(exec_id)` の起動開始時に得る、検証済み仕様と登録固有のトークン。
@@ -423,7 +447,24 @@ struct ExecEntry {
 pub struct StartTicket {
     /// 起動する exec の仕様。
     pub spec: ExecProcessSpec,
+    /// 登録時にコンテナが報告したインスタンス識別子（#4323）。起動役が自分の状態読み取りと照合する。
+    pub instance: Option<u64>,
     token: u64,
+}
+
+impl StartTicket {
+    /// この登録に固有のトークン（終了 watcher が登録の生存確認に使う。#4317）。
+    pub(crate) fn token(&self) -> u64 {
+        self.token
+    }
+}
+
+/// 除去した登録の送信権を封じる。登録簿のロックを手放してから取るため、公開の最中の watcher の完了を待ち、
+/// 戻った後は旧登録の TaskExit が出ない（purge と再登録・再作成の競合を塞ぐ。#4317・CRI-5・REPAIR-1）。
+fn seal_claims(claims: &[Arc<Mutex<bool>>]) {
+    for c in claims {
+        *c.lock().unwrap_or_else(|p| p.into_inner()) = true;
+    }
 }
 
 /// コンテナ単位の排他に使うロックの本数（コンテナ ID のハッシュで選ぶ。増え続けない）。
@@ -536,8 +577,19 @@ impl ExecRegistry {
 
     /// コンテナの exec 登録をすべて除去する（Delete 成功後、ゲート保持中に呼ぶ。CRI-5）。
     pub fn purge_container(&self, container: &ContainerId) -> Result<(), CriError> {
-        let mut inner = self.inner.lock().map_err(|_| poisoned())?;
-        inner.map.retain(|(c, _), _| c != container.as_str());
+        let claims = {
+            let mut inner = self.inner.lock().map_err(|_| poisoned())?;
+            let mut claims = Vec::new();
+            inner.map.retain(|(c, _), e| {
+                let keep = c != container.as_str();
+                if !keep {
+                    claims.push(Arc::clone(&e.exit_claim));
+                }
+                keep
+            });
+            claims
+        };
+        seal_claims(&claims);
         Ok(())
     }
 
@@ -553,12 +605,21 @@ impl ExecRegistry {
         container: &ContainerId,
         current: Option<u64>,
     ) -> Result<usize, CriError> {
-        let mut inner = self.inner.lock().map_err(|_| poisoned())?;
-        let before = inner.map.len();
-        inner.map.retain(|(c, _), e| {
-            c != container.as_str() || crate::adapter::instance_matches(e.instance, current)
-        });
-        Ok(before - inner.map.len())
+        let claims = {
+            let mut inner = self.inner.lock().map_err(|_| poisoned())?;
+            let mut claims = Vec::new();
+            inner.map.retain(|(c, _), e| {
+                let keep = c != container.as_str()
+                    || crate::adapter::instance_matches(e.instance, current);
+                if !keep {
+                    claims.push(Arc::clone(&e.exit_claim));
+                }
+                keep
+            });
+            claims
+        };
+        seal_claims(&claims);
+        Ok(claims.len())
     }
 
     /// 登録する。重複は `ALREADY_EXISTS`、上限超過は `RESOURCE_EXHAUSTED`。
@@ -572,6 +633,12 @@ impl ExecRegistry {
         spec: ExecProcessSpec,
         instance: Option<u64>,
     ) -> Result<(), CriError> {
+        // containerd は `id == container_id` の TaskExit を init の終了として扱うため、同じ ID は受けない（SEC-1）。
+        if exec_id.as_str() == container.as_str() {
+            return Err(CriError::invalid_argument(
+                "exec id must differ from container id",
+            ));
+        }
         let mut inner = self.inner.lock().map_err(|_| poisoned())?;
         let k = key(container, exec_id);
         if inner.map.contains_key(&k) {
@@ -590,6 +657,7 @@ impl ExecRegistry {
                 state: ExecState::Created,
                 token,
                 instance,
+                exit_claim: Arc::new(Mutex::new(false)),
             },
         );
         Ok(())
@@ -611,6 +679,7 @@ impl ExecRegistry {
                 entry.state = ExecState::Starting;
                 Ok(StartTicket {
                     spec: entry.spec.clone(),
+                    instance: entry.instance,
                     token: entry.token,
                 })
             }
@@ -662,7 +731,41 @@ impl ExecRegistry {
         Ok(ExecSnapshot {
             phase,
             token: entry.token,
+            exit_claim: Arc::clone(&entry.exit_claim),
         })
+    }
+
+    /// 同じ登録（`token` が一致）が残っていて `Started` か。終了 watcher の取り消し判定に使う（#4317・REPAIR-5）。
+    /// 除去・コンテナの purge・作り直しの掃除・再登録のいずれでも偽になる。
+    pub fn is_live(&self, container: &ContainerId, exec_id: &ExecId, token: u64) -> bool {
+        let Ok(inner) = self.inner.lock() else {
+            return false;
+        };
+        inner
+            .map
+            .get(&key(container, exec_id))
+            .is_some_and(|e| e.token == token && matches!(e.state, ExecState::Started(_)))
+    }
+
+    /// コンテナの `Started` の exec の一覧（exec ID・ハンドル・送信権の印）。件数は
+    /// [`MAX_EXECS_PER_CONTAINER`] 以下。コンテナの Delete が exec の TaskExit を補完するために使う（#4317）。
+    pub fn started_of(&self, container: &ContainerId) -> Vec<StartedExec> {
+        let Ok(inner) = self.inner.lock() else {
+            return Vec::new();
+        };
+        inner
+            .map
+            .iter()
+            .filter(|((c, _), _)| c == container.as_str())
+            .filter_map(|((_, e), entry)| match &entry.state {
+                ExecState::Started(p) => Some(StartedExec {
+                    exec_id: ExecId::new(e).ok()?,
+                    process: Arc::clone(p),
+                    exit_claim: Arc::clone(&entry.exit_claim),
+                }),
+                _ => None,
+            })
+            .collect()
     }
 
     /// 登録を除去する（`Delete(exec_id)` が、コンテナのゲート保持中に呼ぶ）。未登録は `NOT_FOUND`。
@@ -979,6 +1082,7 @@ mod tests {
         r.register(&c, &e, spec.clone(), None).unwrap();
         r.register(&c2, &e, spec.clone(), None).unwrap();
         let old = r.begin_start(&c, &e).unwrap();
+        assert_eq!(old.instance, None);
         r.purge_container(&c).unwrap();
         assert_eq!(
             r.begin_start(&c, &e).unwrap_err().code(),
@@ -1073,5 +1177,80 @@ mod tests {
         );
         *p.0.lock().unwrap() = ExecProcessStatus::Exited { code: None };
         assert_eq!(p.wait_exit(Duration::ZERO, ms, &|| false).unwrap(), None);
+    }
+
+    /// CRI-5・#4317: `is_live` は Started の間だけ真で、除去・purge・再登録で偽になる。`started_of` は Started だけを返す。
+    #[test]
+    fn cri5_4317_registry_is_live_and_started_of() {
+        let r = ExecRegistry::new();
+        let c = ContainerId::new("c1").unwrap();
+        let e = ExecId::new("e1").unwrap();
+        let spec = parse_process_spec(&any(OK)).unwrap();
+        r.register(&c, &e, spec.clone(), None).unwrap();
+        let t = r.begin_start(&c, &e).unwrap();
+        assert!(!r.is_live(&c, &e, t.token()));
+        assert!(r.started_of(&c).is_empty());
+        let p = TestProc::running();
+        r.finish_start(&c, &e, &t, some(&p)).unwrap();
+        assert!(r.is_live(&c, &e, t.token()));
+        assert!(!r.is_live(&c, &e, t.token() + 1));
+        let started = r.started_of(&c);
+        assert_eq!(started.len(), 1);
+        assert_eq!(started[0].exec_id, e);
+        r.remove(&c, &e).unwrap();
+        assert!(!r.is_live(&c, &e, t.token()));
+        r.register(&c, &e, spec, None).unwrap();
+        assert!(!r.is_live(&c, &e, t.token()));
+        r.purge_container(&c).unwrap();
+        assert!(r.started_of(&c).is_empty());
+    }
+    /// CRI-5・SEC-1・#4317: exec ID がコンテナ ID と同じ登録は `INVALID_ARGUMENT` で拒否する。
+    #[test]
+    fn cri5_4317_register_rejects_exec_id_equal_to_container_id() {
+        let r = ExecRegistry::new();
+        let c = ContainerId::new("same").unwrap();
+        let e = ExecId::new("same").unwrap();
+        let spec = parse_process_spec(&any(OK)).unwrap();
+        let err = r.register(&c, &e, spec, None).unwrap_err();
+        assert_eq!(err.code(), CriErrorCode::InvalidArgument);
+        assert!(!r.is_container_full(&c).unwrap());
+    }
+
+    /// CRI-5・REPAIR-1・#4317: purge は除去した登録の送信権を封じ、公開の最中の watcher の完了を待つ。
+    #[test]
+    fn cri5_4317_purge_seals_claim_and_waits_for_inflight_publish() {
+        let r = Arc::new(ExecRegistry::new());
+        let c = ContainerId::new("c1").unwrap();
+        let e = ExecId::new("e1").unwrap();
+        let spec = parse_process_spec(&any(OK)).unwrap();
+        r.register(&c, &e, spec, None).unwrap();
+        let t = r.begin_start(&c, &e).unwrap();
+        let p = TestProc::running();
+        r.finish_start(&c, &e, &t, some(&p)).unwrap();
+        let claim = r.snapshot(&c, &e).unwrap().exit_claim();
+        // watcher が送信権を持って公開中の状況を模す。
+        let guard = claim.lock().unwrap();
+        let (r2, c2) = (Arc::clone(&r), c.clone());
+        let h = std::thread::spawn(move || r2.purge_container(&c2).unwrap());
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!h.is_finished(), "purge must wait for in-flight publish");
+        assert!(!*guard);
+        drop(guard);
+        h.join().unwrap();
+        assert!(*claim.lock().unwrap(), "claim sealed after purge");
+        assert!(!r.is_live(&c, &e, t.token()));
+    }
+
+    /// CRI-5・#4317: purge_mismatched も除去した登録の送信権を封じる。
+    #[test]
+    fn cri5_4317_purge_mismatched_seals_claim() {
+        let r = ExecRegistry::new();
+        let c = ContainerId::new("c1").unwrap();
+        let e = ExecId::new("e1").unwrap();
+        let spec = parse_process_spec(&any(OK)).unwrap();
+        r.register(&c, &e, spec, Some(1)).unwrap();
+        let claim = r.snapshot(&c, &e).unwrap().exit_claim();
+        assert_eq!(r.purge_mismatched(&c, Some(2)).unwrap(), 1);
+        assert!(*claim.lock().unwrap());
     }
 }

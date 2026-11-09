@@ -30,6 +30,9 @@
 //!   [`AuditEvent::PastaVerify`] として中継 sink（`ControlAuditRelay`）経由で 1 拒否 1 件を配送する（実装済み）。理由は
 //!   [`PastaVerifyRejection`] の 2 種（`pasta_record_changed`・`pasta_permission_denied`）で、パスは持たない（型で保証）。
 //!   作成時（CLI の create）の `PermissionDenied` は D2 と両立しないため記録しない
+//! - pod の namespace への join（`linux.namespaces[].path`。層 `pod_namespace_join`。SEC-4・SEC-5・CORE-3・NET-3・#2872）は、
+//!   start の素性検査の受理と拒否を [`AuditEvent::PodNamespaceJoin`] として 1 件ずつ配送する（閉じた語彙の
+//!   [`PodNamespaceJoinOutcome`] 11 種。パス・pid・inode は持たない〔型で保証〕。作業スレッドからは `ControlAuditRelay` が運ぶ）
 //! - supervisor の制御チャネルの接続元の拒否（層 `control_channel`。SEC-4・SEC-1・SUP-1・#2058）は、制御チャネルのサーバー
 //!   （`fandhe-container-supervisor` の `control/server.rs`）が `ControlObserver::record_peer_rejection`
 //!   （`control/observe.rs`）経由で [`AuditEvent::ControlPeer`] として記録する。理由は [`ControlPeerRejection`] の 2 種
@@ -493,6 +496,8 @@ pub enum AuditLayer {
     AuditCoverage,
     /// start の起動時に行う pasta バイナリの再検証が改ざんの疑いで拒否した記録（SEC-4・PLUG-11・NET-9・#3330）。
     PastaVerify,
+    /// pod の namespace への join（`linux.namespaces[].path`）の受理と拒否の記録（SEC-4・SEC-5・CORE-3・NET-3・#2872）。
+    PodNamespaceJoin,
 }
 
 impl AuditLayer {
@@ -510,6 +515,7 @@ impl AuditLayer {
             AuditLayer::ExitSignal => "exit_signal",
             AuditLayer::AuditCoverage => "audit_coverage",
             AuditLayer::PastaVerify => "pasta_verify",
+            AuditLayer::PodNamespaceJoin => "pod_namespace_join",
         }
     }
 }
@@ -599,6 +605,14 @@ pub enum AuditEvent {
         /// 拒否理由トークン（[`PastaVerifyRejection::as_str`]）。
         reason: AuditReason,
     },
+    /// pod の namespace への join の受理または拒否の記録（SEC-4・SEC-5・CORE-3・NET-3・#2872）。
+    ///
+    /// 理由トークンだけを持ち、**パス・pid・inode は持たない**（型で保証する。REPAIR-2・REPAIR-4）。コンテナ ID は
+    /// 記録の共通部に載る。構築は [`PodNamespaceJoinOutcome::audit_event`] で行う。
+    PodNamespaceJoin {
+        /// 結果の理由トークン（[`PodNamespaceJoinOutcome::as_str`]）。
+        reason: AuditReason,
+    },
     /// supervisor の制御チャネルが接続元を拒否した記録（SEC-4・SEC-1・SUP-1・#2058）。
     ///
     /// 理由トークンだけを持ち、パス・接続元の uid・pid は持たない（型で保証する。REPAIR-2）。
@@ -656,6 +670,80 @@ impl PastaVerifyRejection {
     /// 対応する監査イベントを返す。
     pub fn audit_event(self) -> AuditEvent {
         AuditEvent::PastaVerify {
+            reason: AuditReason::new(self.as_str()),
+        }
+    }
+}
+
+/// pod の namespace への join の素性検査の結果（SEC-4・SEC-5・CORE-3・NET-3・#2872）。固定語彙で、入力値を載せない。
+///
+/// 呼び出し元は `oci_runtime::start` の join の固定（`NamespaceJoin::pin`）。受理は素性検査の受理（fork の前）で、
+/// 後段の launch の失敗は別の記録になる。開けない path（`FailedPrecondition`）・I/O の失敗は素性検査の結果ではなく
+/// 系のエラーのため、ここには含めない。中継（`control_relay`）はこの表の添字で運ぶ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PodNamespaceJoinOutcome {
+    /// user と ipc の組を受理した。
+    AcceptedUserIpc,
+    /// user・ipc・net の組を受理した。
+    AcceptedUserIpcNet,
+    /// path が相対・`..` を含む・長さ上限超過。
+    PathMalformed,
+    /// path が namespace ファイルでない、または宣言した種別と違う。
+    NotNamespaceFile,
+    /// path を開く権限が無い。
+    OpenDenied,
+    /// user が呼び出し側自身の namespace。
+    UserIsOwn,
+    /// user が呼び出し側の直下の子でない。
+    UserNotChild,
+    /// user の作成者 uid が起動ユーザーと違う。
+    UserOwnerMismatch,
+    /// ipc を所有するのが join する user namespace でない。
+    IpcOwnerMismatch,
+    /// net を所有するのが join する user namespace でない（別 pod の userns 所有など）。
+    NetOwnerMismatch,
+    /// net が pod の user namespace 所有でなくホスト側（呼び出し側）の所有（未対応。`Unimplemented`）。
+    NetNotPodOwned,
+}
+
+impl PodNamespaceJoinOutcome {
+    /// 中継の閉じた表（添字がワイヤー上の値。増やすときは末尾に足す。中継は Linux 限定）。
+    #[cfg(target_os = "linux")]
+    pub(crate) const ALL: [Self; 11] = [
+        Self::AcceptedUserIpc,
+        Self::AcceptedUserIpcNet,
+        Self::PathMalformed,
+        Self::NotNamespaceFile,
+        Self::OpenDenied,
+        Self::UserIsOwn,
+        Self::UserNotChild,
+        Self::UserOwnerMismatch,
+        Self::IpcOwnerMismatch,
+        Self::NetOwnerMismatch,
+        Self::NetNotPodOwned,
+    ];
+
+    /// 監査レコードに入る静的トークン。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AcceptedUserIpc => "pod_join_accepted_user_ipc",
+            Self::AcceptedUserIpcNet => "pod_join_accepted_user_ipc_net",
+            Self::PathMalformed => "pod_join_path_malformed",
+            Self::NotNamespaceFile => "pod_join_not_namespace_file",
+            Self::OpenDenied => "pod_join_open_denied",
+            Self::UserIsOwn => "pod_join_user_is_own",
+            Self::UserNotChild => "pod_join_user_not_child",
+            Self::UserOwnerMismatch => "pod_join_user_owner_mismatch",
+            Self::IpcOwnerMismatch => "pod_join_ipc_owner_mismatch",
+            Self::NetOwnerMismatch => "pod_join_net_owner_mismatch",
+            Self::NetNotPodOwned => "pod_join_net_not_pod_owned",
+        }
+    }
+
+    /// 対応する監査イベントを返す。
+    pub fn audit_event(self) -> AuditEvent {
+        AuditEvent::PodNamespaceJoin {
             reason: AuditReason::new(self.as_str()),
         }
     }
@@ -740,6 +828,7 @@ impl AuditEvent {
             AuditEvent::ExecTarget { .. } => AuditLayer::ExecTarget,
             AuditEvent::Entrypoint { .. } => AuditLayer::Entrypoint,
             AuditEvent::PastaVerify { .. } => AuditLayer::PastaVerify,
+            AuditEvent::PodNamespaceJoin { .. } => AuditLayer::PodNamespaceJoin,
             AuditEvent::ControlPeer { .. } => AuditLayer::ControlChannel,
             AuditEvent::ExitSignal { .. } => AuditLayer::ExitSignal,
             AuditEvent::AuditCoverageDegraded { .. } => AuditLayer::AuditCoverage,
@@ -854,6 +943,7 @@ impl AuditRecord {
             | AuditEvent::ExecTarget { .. }
             | AuditEvent::Entrypoint { .. }
             | AuditEvent::PastaVerify { .. }
+            | AuditEvent::PodNamespaceJoin { .. }
             | AuditEvent::ControlPeer { .. }
             | AuditEvent::ExitSignal { .. }
             | AuditEvent::AuditCoverageDegraded { .. } => None,
@@ -891,6 +981,7 @@ impl AuditRecord {
             | AuditEvent::ExecTarget { .. }
             | AuditEvent::Entrypoint { .. }
             | AuditEvent::PastaVerify { .. }
+            | AuditEvent::PodNamespaceJoin { .. }
             | AuditEvent::ControlPeer { .. }
             | AuditEvent::ExitSignal { .. }
             | AuditEvent::AuditCoverageDegraded { .. } => None,
@@ -924,6 +1015,7 @@ impl AuditRecord {
             | AuditEvent::ExecTarget { reason }
             | AuditEvent::Entrypoint { reason }
             | AuditEvent::PastaVerify { reason }
+            | AuditEvent::PodNamespaceJoin { reason }
             | AuditEvent::ControlPeer { reason } => Some(*reason),
             _ => None,
         }
@@ -1116,6 +1208,46 @@ mod tests {
         assert_eq!(
             r.reason().map(AuditReason::as_str),
             Some("pasta_permission_denied")
+        );
+        assert!(r.path().is_none());
+        assert!(r.syscall().is_none());
+    }
+
+    /// SEC-4・SEC-5・NET-3・#2872: pod_namespace_join の層トークンと 11 結果のトークン(固定値・重複なし・
+    /// `pod_join_` 接頭辞)、レコードのアクセサ(パスを持たない)。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec4_2872_pod_namespace_join_tokens_and_accessors() {
+        assert_eq!(AuditLayer::PodNamespaceJoin.as_str(), "pod_namespace_join");
+        let tokens: Vec<&str> = PodNamespaceJoinOutcome::ALL
+            .iter()
+            .map(|o| o.as_str())
+            .collect();
+        assert_eq!(
+            tokens,
+            [
+                "pod_join_accepted_user_ipc",
+                "pod_join_accepted_user_ipc_net",
+                "pod_join_path_malformed",
+                "pod_join_not_namespace_file",
+                "pod_join_open_denied",
+                "pod_join_user_is_own",
+                "pod_join_user_not_child",
+                "pod_join_user_owner_mismatch",
+                "pod_join_ipc_owner_mismatch",
+                "pod_join_net_owner_mismatch",
+                "pod_join_net_not_pod_owned",
+            ]
+        );
+        let r = AuditRecord::new(
+            AuditTimestamp::from_unix_duration(Duration::new(1_700_000_000, 5)),
+            AuditPid::new(9).unwrap(),
+            PodNamespaceJoinOutcome::NetOwnerMismatch.audit_event(),
+        );
+        assert_eq!(r.layer(), AuditLayer::PodNamespaceJoin);
+        assert_eq!(
+            r.reason().map(AuditReason::as_str),
+            Some("pod_join_net_owner_mismatch")
         );
         assert!(r.path().is_none());
         assert!(r.syscall().is_none());

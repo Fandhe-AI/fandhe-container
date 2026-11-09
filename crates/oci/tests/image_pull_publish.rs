@@ -3,6 +3,9 @@
 //! 公開 API だけを通し、公開完了までイメージが `image ls` に現れないこと、公開の途中で失敗すると
 //! 自分のリースが解放されステージングが消えることを照合する。
 
+// Windows ホストは設計上 `ImageStore` を開けない（#4333・#2428 案 C。拒否は src/image_management/store.rs の試験が照合）ため unix に限る。
+#![cfg(unix)]
+
 use std::fs;
 use std::path::PathBuf;
 

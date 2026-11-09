@@ -99,6 +99,9 @@ fn unguarded_table_still_serves_read_only_usage() {
 }
 
 /// OCI-7・SEC-1・#2701: ガードを drop した後に複製で取り出した単体テーブルも、rm・prune・復旧を拒否される。
+// Windows ホストは設計上 `ImageStore` を開けない（#4333・#2428 案 C。拒否は src/image_management/store.rs の試験が照合）ため、
+// ストアを開くこの試験だけを unix に限る（ストアを開かない他の試験は全 OS で回す）。
+#[cfg(unix)]
 #[test]
 fn detached_clone_of_guarded_table_rejects_persisting_ops() {
     use fandhe_container_oci::image_management::ImageStore;

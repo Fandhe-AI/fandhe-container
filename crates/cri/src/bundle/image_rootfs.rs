@@ -31,17 +31,18 @@
 //!    `rootfs.diff_ids` と `config` 節を同じ本文から解析する
 //! 5. layer は記録の `layer=` 行から得る。件数は config の `diff_ids` と一致を要求し、各 blob は 1 回だけ開いた
 //!    ハンドルの fstat のサイズで `VerifiedLayerBlob::from_file`（信頼条件・digest・サイズ照合）してから展開する
-//! 6. 展開先の bundle `rootfs/` は `ExtractRoot::create_private_dir`（親だけをパスで開き、`mkdirat` → `openat2`）で
-//!    作って fd で受け、展開（`extract_image_layers_bounded_in`）・chmod・`proc` の作成・passwd / group の読み取りを
+//! 6. 展開先の bundle `rootfs/` は、`SpecBundleProvider` が fd で保持する bundle ディレクトリ（`BundleDir`）の直下に
+//!    `mkdirat` → `openat2` で作って fd で受け（親をパスで開き直さない。#4321）、展開（`extract_image_layers_bounded_in`）・chmod・`proc` の作成・passwd / group の読み取りを
 //!    同じ fd 起点で行う。最後に根のパスが開いた根と同じ実体であることを照合し、差し替えを成功に見せない（検出時は
 //!    `FAILED_PRECONDITION`。パス起点の削除でおとりを消さない）
 //!
 //! # fd 起点にしない範囲（残余。#4283）
 //!
 //! - Linux 以外の unix（macOS 等）は `RootHandle`・`BlobDir`・`ExtractRoot::from_path` がパス起点で、入口の再検査に頼る
-//!   （本番の macOS は cli の `non_linux_failure` がホストでの展開の前に fail-closed にする）。Windows は #4181
-//! - bundle の親ディレクトリ（`SpecBundleProvider` が作る `<bundles>/<id>`）の作成・巻き戻しと `release` の
-//!   `remove_extracted_tree` はパス起点（bundle の親の差し替えは provider の範囲）
+//!   （本番の macOS は cli の `non_linux_failure` がホストでの展開の前に fail-closed にする）。Windows ホストは `ImageStore::open` が設計上の恒久拒否のため到達しない（#2428 の案 C・#4333）
+//! - bundle の親ディレクトリ（`SpecBundleProvider` が作る `<bundles>/<id>`）の作成・巻き戻しと `release` は #4321 で
+//!   `BundleDir` の fd 起点にした（`release_bounded` も `bundle` 直下の `rootfs` を fd 起点で消す）。Linux 以外の unix は
+//!   `ExtractRoot` のパス起点の実装で、入口の再検査に頼る
 //!
 //! # 未実装・簡易実装（REPAIR-3）
 //!
@@ -72,7 +73,7 @@
 //! - 展開済み rootfs・blob の GC は TASK-183（OCI-7）の担当
 
 use std::io::Read as _;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -85,7 +86,7 @@ use fandhe_container_oci::image_management::{ImageStore as OciImageStore, Publis
 use fandhe_container_oci::instrument::{NoopOciOpRecorder, OciOpRecorder};
 use fandhe_container_oci::layer::extract::{
     ExtractBudget, ExtractLimits, ExtractOptions, ExtractRoot, ImageLayer,
-    extract_image_layers_bounded_in, remove_extracted_tree, remove_extracted_tree_bounded,
+    extract_image_layers_bounded_in,
 };
 use fandhe_container_oci::layer::{
     BlobFileFacts, VerifiedLayerBlob, check_blob_trust, read_rootfs_file_in,
@@ -93,7 +94,7 @@ use fandhe_container_oci::layer::{
 use fandhe_container_oci::manifest::MAX_LAYERS;
 use fandhe_container_oci::reference::Digest;
 
-use super::provider::{RootfsSource, UserResolveRequest};
+use super::provider::{BundleDir, RootfsSource, UserResolveRequest};
 use super::spec::{ImageDefaults, ResolvedImage};
 use crate::adapter::ReleaseBudget;
 use crate::error::CriError;
@@ -715,16 +716,16 @@ impl RootfsSource for ImageRootfsSource {
     fn prepare(
         &self,
         image: &ImageSpec,
-        rootfs: &Path,
+        bundle: &BundleDir,
         user: &UserResolveRequest<'_>,
     ) -> Result<ImageDefaults, CriError> {
-        self.prepare_cancellable(image, rootfs, user, None)
+        self.prepare_cancellable(image, bundle, user, None)
     }
 
     fn prepare_cancellable(
         &self,
         image: &ImageSpec,
-        rootfs: &Path,
+        bundle: &BundleDir,
         user: &UserResolveRequest<'_>,
         cancel: Option<&AtomicBool>,
     ) -> Result<ImageDefaults, CriError> {
@@ -819,10 +820,10 @@ impl RootfsSource for ImageRootfsSource {
             .map(|((b, l), d)| ImageLayer::new(b, &l.media_type, d))
             .collect();
         self.check_budget(started, cancel)?;
-        // 呼び出し元（SpecBundleProvider）が渡す不在のパスを 0700 で作って fd で開く（親だけをパスで開き、`mkdirat` →
-        // `openat2`）。以後の展開・chmod・`proc`・passwd の読み取りはこの fd 起点で、作成後に祖先が差し替えられても
-        // おとりへ届かない（#4283）。作れなければ他人の実体の可能性があり消さない。
-        let root = ExtractRoot::create_private_dir(rootfs).map_err(|_| {
+        // 呼び出し元（SpecBundleProvider）が fd で渡す bundle の直下に不在の `rootfs/` を 0700 で作って fd で開く
+        // （`mkdirat` → `openat2`）。以後の展開・chmod・`proc`・passwd の読み取りはこの fd 起点で、作成後に祖先が
+        // 差し替えられてもおとりへ届かない（#4283・#4321）。作れなければ他人の実体の可能性があり消さない。
+        let root = bundle.create_rootfs_dir().map_err(|_| {
             CriError::failed_precondition("failed to create the image rootfs staging directory")
         })?;
         // 展開はエントリ単位で期限（この prepare の開始からの deadline）と取り消しを確かめる。1 エントリの書き込みは分割しない。
@@ -877,8 +878,9 @@ impl RootfsSource for ImageRootfsSource {
         });
         // 最後に、根のパスが開いた根と同じ実体であることを確かめる（fd 起点の操作は作った実体にだけ届き、おとりへは
         // 書かれていない。差し替えを成功に見せない検出器。OCI-7・SEC-1・#4283）。
+        let rootfs = bundle.rootfs_path();
         let extracted = extracted.and_then(|()| {
-            if root.matches_path(rootfs) {
+            if root.matches_path(&rootfs) {
                 Ok(())
             } else {
                 Err(CriError::failed_precondition(
@@ -889,32 +891,39 @@ impl RootfsSource for ImageRootfsSource {
         if let Err(e) = extracted {
             // 差し替えを検出したときは、パスがおとりを指している可能性があるため消さない（パス起点の削除はおとりを
             // 消しうる。展開済みの実体は残る側に倒す）。それ以外は自分が作った rootfs だけを消す（0555 等も権限を戻して消す）。
-            if root.matches_path(rootfs) {
-                let _ = remove_extracted_tree(rootfs);
+            if root.matches_path(&rootfs) {
+                let _ = bundle.remove_rootfs_tree();
             }
             return Err(e);
         }
         Ok(defaults)
     }
 
-    fn release(&self, rootfs: &Path) -> Result<(), CriError> {
-        self.release_bounded(rootfs, &ReleaseBudget::new())
+    fn release(&self, bundle: &BundleDir) -> Result<(), CriError> {
+        self.release_bounded(bundle, &ReleaseBudget::new())
     }
 
-    fn release_bounded(&self, rootfs: &Path, budget: &ReleaseBudget<'_>) -> Result<(), CriError> {
-        match std::fs::symlink_metadata(rootfs) {
-            Ok(m) if m.file_type().is_dir() => {
-                remove_extracted_tree_bounded(rootfs, &budget.to_extract_budget()).map_err(|e| {
+    fn release_bounded(
+        &self,
+        bundle: &BundleDir,
+        budget: &ReleaseBudget<'_>,
+    ) -> Result<(), CriError> {
+        // `bundle` の fd 起点で `rootfs` が本物のディレクトリか確かめてから消す。symlink・通常ファイル等は辿らず
+        // 消さない（リンク先の削除を防ぐ。fail-closed）。パスで開き直さないので bundle の親の差し替えはおとりへ届かない。
+        match bundle.rootfs_dir_exists() {
+            Ok(true) => bundle
+                .remove_rootfs_tree_bounded(&budget.to_extract_budget())
+                .map_err(|e| {
                     if e.code() == OciErrorCode::Timeout {
                         CriError::timeout("bundle release exceeded its deadline")
                     } else {
                         CriError::internal("failed to remove rootfs")
                     }
-                })
+                }),
+            Ok(false) => Ok(()),
+            Err(e) if e.code() == OciErrorCode::FailedPrecondition => {
+                Err(CriError::internal("rootfs path is not a directory"))
             }
-            // symlink・通常ファイル等は辿らず消さない（リンク先の削除を防ぐ。fail-closed）。
-            Ok(_) => Err(CriError::internal("rootfs path is not a directory")),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(_) => Err(CriError::internal("failed to inspect rootfs")),
         }
     }

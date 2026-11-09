@@ -6,6 +6,9 @@
 //! 実機での 50 並列・SIGKILL 復旧・別プロセスでの再起動後の照合は TASK-184 の担当で、ここでは扱わない。
 //! コンテナ参照は `ImageStore` の入口だけで扱う（ガード越しの直接登録は永続化との読み直しで消えるため）。
 
+// Windows ホストは設計上 `ImageStore` を開けない（#4333・#2428 案 C。拒否は src/image_management/store.rs の試験が照合）ため unix に限る。
+#![cfg(unix)]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};

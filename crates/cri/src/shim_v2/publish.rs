@@ -2,7 +2,7 @@
 //!
 //! containerd（特に CRI）はコンテナの終了を `/tasks/exit` の TaskExit で知る。Create・Start・Delete の成功も
 //! `/tasks/create`・`/tasks/start`・`/tasks/delete` で送り（#4156）、exec の `Exec`・`Start(exec_id)` の成功も
-//! `/tasks/exec-added`・`/tasks/exec-started` で送る（#4281。runc shim と同じ時点・同じ欄）。shim は `-publish-binary`
+//! `/tasks/exec-added`・`/tasks/exec-started` で送り（#4281。runc shim と同じ時点・同じ欄）、exec の終了も `/tasks/exit`（`id = exec_id`）で送る（#4317）。shim は `-publish-binary`
 //! （検証済みの `PublishBinary`。#4154）を子として起動し、stdin へ `google.protobuf.Any` を渡す。
 //! 呼び出し元は [`super::task_service::TaskService`] の終了 watcher（`Start` 成功後に起こす）で、
 //! 差し込み口は `exec_publisher_for`（plugin-cri の `registry_in` が呼ぶ）。
@@ -18,7 +18,7 @@
 //!   ログは段名・errno・終了コード・シグナル・topic だけを持ち、argv・アドレス・namespace・コンテナ ID・環境変数・イベントの本文は出さない（REPAIR-4）。
 //!
 //! 範囲外（REPAIR-3。未実装を装わない）と残余:
-//! - 送らない種別: exec の TaskExit（exec 用の終了 watcher が無い。後続候補。containerd の CRI は exec の TaskExit を無視する）・TaskPaused・TaskResumed・TaskCheckpointed・TaskOOM（対応する RPC・仕組みが無い）。
+//! - 送らない種別: TaskPaused・TaskResumed・TaskCheckpointed・TaskOOM（対応する RPC・仕組みが無い）。
 //! - Create・Start・Delete・ExecAdded・ExecStarted は RPC が成功する直前に 1 回だけ [`EventPublisher::publish`] で投入する（世代の guard は使わない。完了済みの事実の記録で、
 //!   ゲート保持中の投入順が FIFO の worker で保たれる）。符号化後 [`MAX_EVENT_LEN`]（8192）を超えるイベントは子を起動せず、
 //!   `encode` の失敗が 1 件記録される（RPC の応答は変えない）。stdin は socketpair の片端で、親は非ブロッキングに期限内で書き、書き終えたら EOF を送る（#4223）。

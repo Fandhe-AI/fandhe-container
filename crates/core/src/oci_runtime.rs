@@ -49,6 +49,8 @@ mod namespace_join;
 #[cfg(target_os = "linux")]
 mod netns_attach;
 mod network_mode;
+#[cfg(target_os = "linux")]
+mod pod_holder;
 mod resources;
 mod start;
 mod sysfs_mount;
@@ -116,6 +118,8 @@ pub use namespace_join::NamespaceJoin;
 #[cfg(target_os = "linux")]
 pub use netns_attach::{AttachableNamespaces, NetnsAttachHook};
 pub use network_mode::{EffectiveNetwork, LaunchNetworkMode};
+#[cfg(target_os = "linux")]
+pub use pod_holder::{NamespaceIdentity, PodHolderNamespaces, establish_pod_namespaces};
 pub use resources::{ByteLimit, CgroupsPath, IoThrottle, LinuxResourceLimits};
 #[cfg(feature = "exec-test-support")]
 #[doc(hidden)]

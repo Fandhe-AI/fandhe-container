@@ -30,6 +30,7 @@
 //! 1 ID あたり 3 MiB に収まり、同じ ID の次の start で世代として回される。CLI の `delete` は
 //! [`remove_guarded_bounded_waiting`] で、ロック保持中（`stop` 直後の drain 中）だけ期限つきで待つ（#2892）。
 //! plugin-cri の `RemoveContainer` も同じ関数で、コンテナログと待ちを共有する（#2964）。
+//! 起動時の走査の入口は [`sweep_stale_supervisor_logs`]（記録の無い ID の残りを回収する。未結線で、結線は #4342・#4343）。
 //!
 //! # 未実装・残余（REPAIR-3）
 //! 保存されるのは `stderr_sink` を通る構造化ログだけ。次は fd 2 へ直接書かれ、CLI 起動では null、ランチャー経由では
@@ -169,6 +170,31 @@ pub fn remove_guarded(
             "supervisor log directory inspection failed",
         )),
     }
+}
+
+/// 状態ルートの `@supervisor-logs` を走査し、状態の記録が無い ID の残りログを回収する（#4339・#4296・SUP-7・CRI-2・REPAIR-5）。
+///
+/// [`crate::logs::sweep_stale_container_logs`] と同じ契約で、ディレクトリと ID ごとの削除関数
+/// （[`remove_guarded_bounded`]）だけが違う（走査本体は共有。REPAIR-1）。supervisor は記録があるときだけ自分のログを開き、
+/// 生きている間は sink の flock を持つ。したがって「記録が無く、かつ flock が外れている」ID の書き手は生きていない
+/// （#4296 のオーナー判断。更新時刻などの追加条件は置かない）。`may_remove(id)` はロック保持中に評価され、`false`
+/// （記録がある・評価できない）なら消さない。生きている sink・ID に戻せない名前も消さない。全体の期限は `budget`、
+/// ID 数の上限は [`crate::logs::MAX_SWEEP_IDS`]。作業枠はコンテナログの削除と共有する。
+///
+/// # 未結線（REPAIR-3）
+/// 呼び出し元はまだ無い。plugin-cri の起動時の走査と create 前の回収（#4342）、shim の serve 起動時の走査（#4343）が足される予定。
+pub fn sweep_stale_supervisor_logs(
+    root: &Path,
+    may_remove: Arc<dyn Fn(&ContainerId) -> bool + Send + Sync>,
+    budget: std::time::Duration,
+) -> crate::logs::SweepReport {
+    crate::logs::sweep_stale_logs_in(
+        root,
+        crate::logs::SweepTarget::SupervisorLogs,
+        may_remove,
+        budget,
+        crate::logs::MAX_SWEEP_IDS,
+    )
 }
 
 /// [`remove_guarded`] を作業スレッドで `timeout` までだけ待って 1 回試す（#2892・REPAIR-5）。

@@ -176,9 +176,10 @@ impl fandhe_container_cri::shim_v2::exec::TaskExecLauncher for StopHelpersOnDrop
         container: &ContainerId,
         exec_id: &fandhe_container_cri::shim_v2::exec::ExecId,
         spec: &fandhe_container_cri::shim_v2::exec::ExecProcessSpec,
+        expected_instance: Option<u64>,
     ) -> Result<std::sync::Arc<dyn fandhe_container_cri::shim_v2::exec::TaskExecProcess>, CriError>
     {
-        self.0.launch(container, exec_id, spec)
+        self.0.launch(container, exec_id, spec, expected_instance)
     }
 }
 
@@ -814,10 +815,16 @@ mod tests {
         .expect("spec");
         let cid = ContainerId::new("nope").expect("id");
         let eid = ExecId::new("e1").expect("exec id");
-        let before = launcher.launch(&cid, &eid, &spec).err().expect("error");
+        let before = launcher
+            .launch(&cid, &eid, &spec, None)
+            .err()
+            .expect("error");
         assert_eq!(before.message(), "container not found");
         drop(reg);
-        let after = launcher.launch(&cid, &eid, &spec).err().expect("error");
+        let after = launcher
+            .launch(&cid, &eid, &spec, None)
+            .err()
+            .expect("error");
         assert_eq!(after.message(), "exec launcher is stopped");
         assert_eq!(launcher.tracked_helpers(), 0);
     }

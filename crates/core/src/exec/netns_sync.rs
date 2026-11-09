@@ -59,8 +59,10 @@
 //!
 //! # 範囲と残余（REPAIR-3）
 //!
-//! - 同期点を通すのは `LaunchNetworkMode::Loopback`・`Attachable`・`Host` の起動だけ。`FromConfig`（CRI の経路）は通さない
-//!   （pod の netns への join〔#2838〕が入るときに見直す）
+//! - 同期点を通すのは `LaunchNetworkMode::Loopback`・`Attachable`・`Host` の起動と、`FromConfig` で pod の netns へ
+//!   join する起動（`EffectiveNetwork::PodJoined`。#2872）。join は `SameAsBaseline` の基準に **pin 時に固定した
+//!   netns の素性** を渡し、PID 1 の netns がそれと一致することを確かめる（`setns` は固定した fd で行うため通常は一致する。
+//!   D8 の多重防御）。join しない `FromConfig`（`HostShared`）は通さない
 //! - `network_mode=host` の構造化ログと、net crate の `HostNetns` を使う結線は supervisor の start に実装済み
 //!   （#1873・PR #3322）。pasta 構成のフックの実装（holder の保持と pasta の起動）も #1940 で実装済み
 //! - user namespace と netns の所有関係は C では照合しない（`NS_GET_USERNS` の ioctl は新しい `unsafe`）。holder の
@@ -97,6 +99,11 @@ pub(crate) struct NetnsIdentity {
 }
 
 impl NetnsIdentity {
+    /// (dev, ino) から作る。pod の netns の join で、pin 時に取った素性を同期点の期待値に渡す（#2872）。
+    pub(crate) fn from_parts(dev: u64, ino: u64) -> Self {
+        Self { dev, ino }
+    }
+
     /// 試験用: 値を直接指定する（拒否の場面で基準を差し替えるため）。
     #[cfg(any(test, feature = "exec-test-support"))]
     pub(crate) fn from_parts_for_test(dev: u64, ino: u64) -> Self {

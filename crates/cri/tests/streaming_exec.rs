@@ -23,7 +23,7 @@ use fandhe_container_cri::instrument::{CriOpKind, CriOpRecorder, CriOpSample};
 use fandhe_container_cri::runtime::v1;
 use fandhe_container_cri::streaming::exec::{
     ExecLaunch, ExecObserver, ExecSession, ExecStreamConfig, ExecStreamHandler, ExecStreamLauncher,
-    ExecStreamOutcome, TerminalResizer,
+    ExecStreamOutcome, MSG_EXEC_INSTANCE_CHANGED, TerminalResizer,
 };
 use fandhe_container_cri::streaming::remotecommand::TerminalSize;
 use fandhe_container_cri::streaming::spdy::{
@@ -301,6 +301,12 @@ impl ExecStreamLauncher for FakeLauncher {
             self.launches.fetch_add(1, Ordering::SeqCst);
             *self.last.lock().expect("lock") = Some(req.clone());
             let program = req.cmd.first().cloned().unwrap_or_default();
+            if program == "instance-changed" {
+                return Err(CriError::failed_precondition(MSG_EXEC_INSTANCE_CHANGED));
+            }
+            if program == "not-running" {
+                return Err(CriError::failed_precondition("container is not running"));
+            }
             if program == "fail-launch" {
                 return Err(CriError::internal("secret-path /var/lib/fandhe/x"));
             }
@@ -1141,6 +1147,66 @@ async fn cri6_exec_launch_failure_hides_details() {
         fx.wait_outcomes(1).await,
         vec![ExecStreamOutcome::LaunchFailed]
     );
+}
+
+/// 起動失敗を 1 件起こして Status と記録を集める補助。
+async fn run_launch_failure(cmd: &str) -> (String, Vec<ExecStreamOutcome>, Vec<(CriOpKind, Code)>) {
+    let fx = Fixture::new(fast_config(), 8).await;
+    let path = fx.exec_path(&[cmd], false, false, true, false);
+    let addr = fx.addr();
+    let c = tokio::task::spawn_blocking(move || {
+        let mut client = Client::upgrade(addr, &path);
+        client.syn(1, "error");
+        client.syn(3, "stdout");
+        client.expect_reply(1);
+        client.expect_reply(3);
+        client.collect()
+    })
+    .await
+    .expect("join");
+    assert_eq!(c.goaway, Some(goaway_status::OK));
+    let outcomes = fx.wait_outcomes(1).await;
+    (c.text(1), outcomes, fx.recorded())
+}
+
+/// CRI-6・REPAIR-4・#4324: インスタンス不一致による拒否は別の結果と別の操作名で数え、
+/// クライアントへは他の起動失敗と同じ内部エラーの Status のまま。
+#[tokio::test]
+async fn cri6_repair4_4324_instance_changed_is_distinct_outcome() {
+    let (status, outcomes, recorded) = run_launch_failure("instance-changed").await;
+    assert!(
+        status.contains(r#""reason":"InternalError""#),
+        "status: {status}"
+    );
+    assert!(!status.contains("recreated"), "status: {status}");
+    assert_eq!(outcomes, vec![ExecStreamOutcome::InstanceChanged]);
+    let count = |kind, code| recorded.iter().filter(|r| **r == (kind, code)).count();
+    assert_eq!(count(CriOpKind::ExecSession, Code::FailedPrecondition), 1);
+    assert_eq!(
+        count(CriOpKind::ExecInstanceChanged, Code::FailedPrecondition),
+        1
+    );
+    assert_eq!(count(CriOpKind::ExecSession, Code::Unavailable), 0);
+}
+
+/// CRI-6・REPAIR-4・#4324: 他の起動失敗（同じ `FAILED_PRECONDITION` でも文が違うものを含む）は
+/// `LaunchFailed` のままで、不一致の操作名には数えない。
+#[tokio::test]
+async fn cri6_repair4_4324_other_launch_failures_stay_launch_failed() {
+    for cmd in ["fail-launch", "not-running"] {
+        let (_, outcomes, recorded) = run_launch_failure(cmd).await;
+        assert_eq!(outcomes, vec![ExecStreamOutcome::LaunchFailed], "{cmd}");
+        assert!(
+            recorded.contains(&(CriOpKind::ExecSession, Code::Unavailable)),
+            "{cmd}: {recorded:?}"
+        );
+        assert!(
+            !recorded
+                .iter()
+                .any(|r| r.0 == CriOpKind::ExecInstanceChanged),
+            "{cmd}: {recorded:?}"
+        );
+    }
 }
 
 /// CRI-6・REPAIR-3・#3753: 握手の失敗（版ヘッダ無しは 400、対応しないサブプロトコルは 403）と、

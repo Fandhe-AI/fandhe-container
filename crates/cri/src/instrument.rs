@@ -101,6 +101,9 @@ pub enum CriOpKind {
     AttachStreamWrite,
     /// Exec ストリーミングの 1 セッション（接続から終了まで。CRI-6・TASK-63.2・REPAIR-4）。
     ExecSession,
+    /// Exec の起動がインスタンス不一致（URL 発行後の作り直し）で拒否された件数
+    /// （`ExecSession` の失敗と同じ事象を別に数える。CRI-6・REPAIR-4・#4324）。
+    ExecInstanceChanged,
     /// Exec の backend 出力（stdout / stderr）の読み取り（セッション内の成功 / 失敗。CRI-6・TASK-63.2・REPAIR-4）。
     ExecStreamRead,
     /// Exec の backend stdin への書き込み（セッション内の成功 / 失敗。CRI-6・TASK-63.2・REPAIR-4）。
@@ -147,6 +150,7 @@ impl CriOpKind {
             CriOpKind::AttachStreamRead => "cri.attach.stream_read",
             CriOpKind::AttachStreamWrite => "cri.attach.stream_write",
             CriOpKind::ExecSession => "cri.exec.session",
+            CriOpKind::ExecInstanceChanged => "cri.exec.instance_changed",
             CriOpKind::ExecStreamRead => "cri.exec.stream_read",
             CriOpKind::ExecStreamWrite => "cri.exec.stream_write",
             CriOpKind::ExecConnRead => "cri.exec.conn_read",
@@ -469,7 +473,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    const ALL_KINDS: [CriOpKind; 33] = [
+    const ALL_KINDS: [CriOpKind; 34] = [
         CriOpKind::ContainerExitObserve,
         CriOpKind::RunPodSandbox,
         CriOpKind::StopPodSandbox,
@@ -499,6 +503,7 @@ mod tests {
         CriOpKind::AttachStreamRead,
         CriOpKind::AttachStreamWrite,
         CriOpKind::ExecSession,
+        CriOpKind::ExecInstanceChanged,
         CriOpKind::ExecStreamRead,
         CriOpKind::ExecStreamWrite,
         CriOpKind::ExecConnRead,

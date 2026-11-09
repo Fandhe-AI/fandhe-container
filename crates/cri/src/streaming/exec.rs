@@ -59,7 +59,7 @@ use super::{
     ConnectionPermit, StreamBody, StreamHandler, StreamKind, StreamRequest, StreamWiring,
     plain_response,
 };
-use crate::error::CriError;
+use crate::error::{CriError, CriErrorCode};
 use crate::instrument::{CriOpKind, CriOpRecorder, CriOpSample, NoopCriOpRecorder};
 use crate::runtime::v1;
 
@@ -222,8 +222,13 @@ pub enum ExecStreamOutcome {
     OutputFailed,
     /// プロセス終了後の drain の期限までに出力を送り切れなかった（内部エラーの Status を通知した）。
     OutputTruncated,
-    /// 起動に失敗した、または期限切れ・stdio の食い違い（内部エラーの Status を通知した）。
+    /// 起動に失敗した、または期限切れ・stdio の食い違い（内部エラーの Status を通知した。
+    /// インスタンス不一致による拒否は除く。[`Self::InstanceChanged`]）。
     LaunchFailed,
+    /// 起動役が「URL 発行後の作り直し」（[`MSG_EXEC_INSTANCE_CHANGED`]）を理由に起動を拒否した
+    /// （内部エラーの Status を通知した。クライアントへの見え方は [`Self::LaunchFailed`] と同じで、
+    /// 計装だけが分かれる。CRI-6・REPAIR-4・#4324・#4286）。
+    InstanceChanged,
     /// 必要なストリームが期限内に揃わなかった（起動していない）。
     StreamCreationTimeout,
     /// 入出力が途絶えて閉じた。
@@ -415,6 +420,12 @@ pub(crate) struct IoStats {
     pub(crate) conn_write_failed: bool,
 }
 
+/// 起動役の拒否が「インスタンス不一致」か判定する（コードと文の両方で見る。
+/// 起動役は同じ `FAILED_PRECONDITION` で "container is not running" も返すため。#4324）。
+fn is_instance_changed(e: &CriError) -> bool {
+    e.code() == CriErrorCode::FailedPrecondition && e.message() == MSG_EXEC_INSTANCE_CHANGED
+}
+
 /// 終わり方を gRPC のコードへ写す（操作別計装の結果区分。終了コードが非 0 でも運用上の失敗ではない）。
 fn outcome_code(outcome: ExecStreamOutcome) -> Code {
     match outcome {
@@ -427,6 +438,7 @@ fn outcome_code(outcome: ExecStreamOutcome) -> Code {
         | ExecStreamOutcome::IdleTimeout
         | ExecStreamOutcome::DeliveryTimedOut { .. } => Code::DeadlineExceeded,
         ExecStreamOutcome::ProtocolError => Code::InvalidArgument,
+        ExecStreamOutcome::InstanceChanged => Code::FailedPrecondition,
         ExecStreamOutcome::PeerClosed => Code::Cancelled,
     }
 }
@@ -445,6 +457,15 @@ fn record_session(
         outcome_code(outcome),
         latency,
     ));
+    // 不一致による拒否は `cri.exec.session` の失敗と別の切り口でも数える（二重計上。
+    // `cri.pull_image.registry_http.*` と同じ流儀。CRI-6・REPAIR-4・#4324）。
+    if outcome == ExecStreamOutcome::InstanceChanged {
+        recorder.record_cri_op(&CriOpSample::new(
+            CriOpKind::ExecInstanceChanged,
+            Code::FailedPrecondition,
+            latency,
+        ));
+    }
     for (kind, ok, failed) in [
         (
             CriOpKind::ExecStreamRead,
@@ -1592,9 +1613,14 @@ pub(crate) async fn run_exec_session<T: AsyncRead + AsyncWrite + Unpin>(
         stderr: options.stderr,
         instance,
     };
-    let session = match tokio::time::timeout(config.launch_timeout, launcher.launch(launch)).await {
+    let launched = tokio::time::timeout(config.launch_timeout, launcher.launch(launch)).await;
+    let session = match launched {
         Ok(Ok(session)) if session_matches(&session, options) => session,
-        _ => {
+        other => {
+            let outcome = match &other {
+                Ok(Err(e)) if is_instance_changed(e) => ExecStreamOutcome::InstanceChanged,
+                _ => ExecStreamOutcome::LaunchFailed,
+            };
             let status = status_internal_error(protocol);
             send_status(
                 &mut conn,
@@ -1606,7 +1632,7 @@ pub(crate) async fn run_exec_session<T: AsyncRead + AsyncWrite + Unpin>(
                 close_timeout,
             )
             .await;
-            return (ExecStreamOutcome::LaunchFailed, conn.stats);
+            return (outcome, conn.stats);
         }
     };
 

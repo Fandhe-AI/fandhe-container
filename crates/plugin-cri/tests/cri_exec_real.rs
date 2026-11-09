@@ -837,7 +837,9 @@ async fn production_binary_exec_real() {
         let ledger = reclaim::Ledger::default();
 
         // 試行 1（注入）: StartContainer の直後に固定文言で panic させ、回収が効くことを確かめる。
-        let b1 = reclaim::scenario_budget(started.elapsed(), WATCHDOG, 4)
+        // 試行 1 が確保するのは自分の回収（再起動を含め 2 回）分だけにする。試行 2 の分は試行 2 の直前に
+        // 経過を差し引いて確保するため、ここで先取りすると pull が長引いたときに注入の期限が 0 になる。
+        let b1 = reclaim::scenario_budget(started.elapsed(), WATCHDOG, 2)
             .min(reclaim::INJECT_ATTEMPT_LIMIT);
         let r1 = reclaim::guarded(
             scenario(

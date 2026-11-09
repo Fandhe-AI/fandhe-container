@@ -30,6 +30,14 @@ compile_error!(
     "the `op-stats-test-support` feature lets the op-stats export interval be overridden by an environment variable and must not be enabled in release builds"
 );
 
+// `pod-holder-test-support` は保持役 provider の実行ファイルを差し替える試験専用の入口と、既定の集合の試験が保持役の注入を
+// 止める環境変数 `FANDHE_CONTAINER_TEST_POD_HOLDER=off` を有効にする feature で、製品のバイナリに含める理由がない。
+// 最適化ビルドで有効になっていたらコンパイルを止める（H6・#2877・CRI-2・REPAIR-3。`op-stats-test-support` と同じ方式）。
+#[cfg(all(feature = "pod-holder-test-support", not(debug_assertions)))]
+compile_error!(
+    "the `pod-holder-test-support` feature lets the pod holder injection and executable be overridden and must not be enabled in release builds"
+);
+
 pub mod adapter;
 #[cfg(target_os = "linux")]
 pub mod audit_relay;
@@ -39,6 +47,8 @@ pub mod instance_lock;
 pub mod netsetup;
 #[cfg(unix)]
 pub mod orphan_bundles;
+#[cfg(target_os = "linux")]
+pub mod pod_holder;
 pub mod pod_network;
 #[cfg(unix)]
 pub mod record_readoption;

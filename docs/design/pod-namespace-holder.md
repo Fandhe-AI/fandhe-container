@@ -118,6 +118,21 @@
 - 守れないもの: 親 namespace の同じ uid からの ptrace は non-dumpable でも防げない（設計上の前提）。exec から `PR_SET_DUMPABLE 0` までの短い窓があるが、その間の保持役は秘密を持たない（env は空、argv は namespace の番号だけ）
 - 実行記録: ローカル（Linux 7.0.0-34-generic、`kernel.apparmor_restrict_unprivileged_userns=1`、subuid の範囲写像）で 6 シナリオが通った。ubuntu CI の `--ignored` での確認は H3（#2875）で CI に組み込んだ後に行う（それまで CI での確定は未了）
 
+## 実装の現況（H6・#2877）
+
+plugin-cri の `ProductionPodHolder`（`crates/plugin-cri/src/pod_holder.rs`）が `PodNamespaceHolderProvider` の本番実装で、`CriPluginBackends::production*()` が Linux・非 root の構成だけで `runtime_service()` に注入する。判断（自動運転のため安全側で決めたもの。異論はオーナー判断で差し替える）:
+
+1. **bin の事前検査は行う（fail-closed）**: spawn の前に、実体の隣の固定名（`holder_executable_beside`。`PATH`・環境変数・引数の上書きなし）について、通常ファイル・所有者が root か実効 uid・group / other 書き込み不可・読み取り専用の `open` 成功を確かめる。保持役は段 1 で `/proc/self/exe` を開き直し、non-dumpable 下では `would_dump` の読み取り許可が要るため、読めない bin では成り立たない。読み取り専用の `open` がその代理になる。失敗は固定文言の `FAILED_PRECONDITION`。
+2. **READY の後の検証（fail-closed）**: READY の pid が spawn した子の pid と一致し、`/proc/<pid>/ns/{user,ipc,net}` の `(dev, ino)` が READY と一致することを確かめる。この stat は ptrace のアクセス検査を通るため、案 (a)（再 exec で non-dumpable を保つ）が実際に成り立つことの直接の確認にもなる。不一致は SIGKILL して回収し `FAILED_PRECONDITION`。
+3. **注入の条件**: `production()`／`production_with_audit_sink()` の構成で、実効 uid が 0 と確定しないときだけ注入する（読めない場合は注入し、spawn の検査が落とす）。provider 自身も uid 0 では `UNIMPLEMENTED`（rootful は #2241・#2442 の判断まで従来どおり）。`new`／`with_recorder` の構成には注入せず、`with_pod_holder_provider` で差す。
+4. **上限**: 追跡する子は `MAX_TRACKED_POD_HOLDERS`（1024。`MAX_TRACKED_SUPERVISORS` に倣う）まで。起動途中と回収できなかった子（orphan）も数え、超えたら `RESOURCE_EXHAUSTED`。1 件あたり stdin のパイプ 1 本の fd を保つ。
+5. **生存は回収しない**: sandbox の記録が残る間は子を `wait` しない（pid を zombie のままでも保って再利用を防ぐ。SEC-5・#2776）。生存は `waitid(P_PID, WEXITED | WNOHANG | WNOWAIT)` で判定する（pidfd だと 1 件ごとに fd がもう 1 本要るため採らない）。ラッパー `sys::child_exit_observed` は plugin-cri の `sys` の事前承認範囲。回収は `release` が終了を確かめた後だけ。解放は stdin を閉じる → 期限の手前まで待つ → SIGKILL → 回収。
+6. **試験の opt-out**: 既定の集合の試験は本番バイナリで `RunPodSandbox` を呼ぶが、rust-ci は AppArmor を緩和せず supervisor の bin も隣に無い。試験用 feature `pod-holder-test-support`（release で有効にすると `compile_error!`）のビルドに限り、環境変数 `FANDHE_CONTAINER_TEST_POD_HOLDER=off` で注入を止める。実機前提の試験は注入する。注入の配線は `pod_sandbox_grpc` の `cri2_h6_injected_pod_holder_fails_closed_without_supervisor_bin` が固定する。
+
+あわせて readopt の不具合を直した（H4 の残り）: 保持役の注入下では起動の前に `pending=1`（`network_pending=0`）を書くため、クラッシュ後の再採用が `network_owned=true` に倒すと、pod network provider を差さない本番で Stop・Remove が回収待ちから抜けられなくなる。`network_owned` は `network_pending` だけから導く（`pending_unresolved` には従来どおり数える）。R11（#2940）は #2877 に依存しており循環するため、ここで直した。
+
+未実装（REPAIR-3）: 保持役の pid から `PodNamespacePaths` を作って bundle へ渡す配線（H5・#2876）は配線済みで、POD のコンテナは user・ipc に join する。保持役の netns を pod ネットワークへ渡すのは H8（#2878）で未実装。素性の永続化と再起動後の再採用は R11（#2940）。
+
 ## 実装単位
 
 起票元は #2838。H1〜H10 は中間親 #4334（`phase:7`・#4054 の配下）の sub-issue（#2643 への一時退避から付け替え済み）。H11（#2880）は人間担当として #816 の配下。

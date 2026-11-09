@@ -148,6 +148,8 @@ fn spawn_server(sock: &Path, xdg: &Path) -> ChildGuard {
         .arg(sock)
         .env_clear()
         .env("XDG_RUNTIME_DIR", xdg)
+        // 既定の集合では本番の保持役（AppArmor の緩和と supervisor の bin が要る）を注入しない。実機前提の試験は注入する（H6・#2877）。
+        .env("FANDHE_CONTAINER_TEST_POD_HOLDER", "off")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

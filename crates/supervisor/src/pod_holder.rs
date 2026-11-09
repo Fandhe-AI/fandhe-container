@@ -12,12 +12,15 @@
 //! - `client`（Linux）: 受信側の期限つき `read_ready`
 //!
 //! # 未実装・残余（REPAIR-3）
-//! 保持役の起動・回収・ハンドル化（plugin-cri）は H6（#2877）、CI の `--ignored` は `platform-ci` の ubuntu で実行済み（#2875）、
+//! 保持役の起動・回収・ハンドル化（plugin-cri）は H6（#2877。plugin-cri の `ProductionPodHolder`）、CI の `--ignored` は `platform-ci` の ubuntu で実行済み（#2875）、
 //! core の net join は H7（#2872）。本モジュールは READY を返して待つ保持役プロセスまで。
 
 use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
+
+use fandhe_container_core::traits::types::{ErrorCode, TraitError};
 
 mod frame;
 pub use frame::{FRAME_LEN, NsId, PodHolderFrame, PodHolderMessage, PodHolderReady};
@@ -35,6 +38,22 @@ pub const POD_HOLDER_SUBCOMMAND: &str = "pod-holder";
 /// 受信側が READY を待つ契約上の上限。保持役の内部の最長の待ち（`getent` の期限と範囲写像の helper の期限の和）
 /// 以上にする。下の単体試験が内部の期限との関係を照合する。
 pub const READY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// 呼び出し元の実体パス `exe` と同じディレクトリの固定名から、保持役として exec する supervisor の bin を決める（純関数。
+/// CRI-2・PLUG-11・#2877）。
+///
+/// plugin-cri の本番の保持役 provider が `current_exe()` を渡して呼ぶ。`PATH` 探索・環境変数・引数による上書きは受けず、
+/// `exe` が絶対パスの親を持たなければ固定文言の `FailedPrecondition` にする。保持役は委譲 scope に入らない直接の子なので、
+/// `systemd-run`・XDG の解決は行わない（`start_client` の supervisor の解決と同じ規則のうちパスの決定だけを共有する）。
+pub fn holder_executable_beside(exe: &Path) -> Result<PathBuf, TraitError> {
+    match exe.parent() {
+        Some(dir) if dir.is_absolute() => Ok(dir.join(crate::launcher::SUPERVISOR_FILE_NAME)),
+        _ => Err(TraitError::new(
+            ErrorCode::FailedPrecondition,
+            "cannot resolve the pod holder executable path",
+        )),
+    }
+}
 
 /// bin の main が保持役へ振り分ける呼び出しか（第 1 引数が `pod-holder`）。
 pub fn is_pod_holder_invocation(first: Option<&OsStr>) -> bool {
@@ -61,6 +80,19 @@ pub fn run_pod_holder_main(_args: impl Iterator<Item = std::ffi::OsString>) -> E
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CRI-2・PLUG-11・#2877: 保持役の bin は実体と同じディレクトリの固定名。相対パス・親なしは拒否する。
+    #[test]
+    fn cri2_holder_executable_beside_is_fixed_name_in_same_dir() {
+        assert_eq!(
+            holder_executable_beside(Path::new("/opt/x/fandhe-container-plugin-cri")).unwrap(),
+            PathBuf::from("/opt/x/fandhe-container-supervisor")
+        );
+        for bad in ["plugin", "x/plugin", "/", ""] {
+            let e = holder_executable_beside(Path::new(bad)).unwrap_err();
+            assert_eq!(e.code(), ErrorCode::FailedPrecondition, "{bad}");
+        }
+    }
 
     /// CRI-2・#2874: 振り分けは第 1 引数が完全一致のときだけ。
     #[test]

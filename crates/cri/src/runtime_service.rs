@@ -33,7 +33,7 @@
 //! pod の namespace の保持役は [`CriRuntimeService::with_pod_holder`] で `PodNamespaceHolderProvider` を注入したときだけ、
 //! `RunPodSandbox` が write-ahead の後に起動し（失敗・期限超過で資源が無ければ登録しない）、Stop・Remove が冪等に解放する。
 //! 死んだ保持役の sandbox は Status・List で `SANDBOX_NOTREADY`、`CreateContainer` は `FAILED_PRECONDITION`（#2871・CRI-2・REPAIR-5）。
-//! bundle への配線は済み（H5〔#2876〕。provider を注入したときだけ、ipc が `POD` のコンテナは保持役の user＋ipc へ join する）。本番の provider（H6〔#2877〕）と netns のパス（H8〔#2878〕）は未実装（REPAIR-3）。pid はメモリ上のみで記録ファイルへ書かない（R11〔#2940〕）。
+//! bundle への配線は済み（H5〔#2876〕。provider を注入したときだけ、ipc が `POD` のコンテナは保持役の user＋ipc へ join する）。本番の provider は plugin-cri の `ProductionPodHolder`（H6〔#2877〕。Linux・非 root の本番構成で注入）。netns のパス（H8〔#2878〕）は未実装（REPAIR-3）。pid はメモリ上のみで記録ファイルへ書かない（R11〔#2940〕）。
 //! bundle の生成（config 変換・bundle ディレクトリの寿命・image 展開の `ImageRootfsSource`）は `crate::bundle`（#2395・#2433）で、
 //! plugin-cri への結線は #2433 で済み、core の本番 launcher との結線は TASK-114、一連の結合試験は TASK-59.4 で扱う。Start 後に中断・確定失敗した場合は、
 //! 実行層が running の可能性があるため記録を unknown にして再 Start を拒否する（fail-closed）。
@@ -1955,7 +1955,7 @@ impl CriRuntimeService {
     /// 保持役を起動し（ipc は H5〔#2876〕で配線済み、netns は H8〔#2878〕）、Stop・Remove が解放する。
     /// 起動の失敗・期限超過では sandbox を登録しない。保持役が死んだ sandbox は Status・List で `SANDBOX_NOTREADY`、
     /// `CreateContainer` は `FAILED_PRECONDITION` になる。`Status` RPC（Runtime/NetworkReady）には影響させない。
-    /// **注意（REPAIR-3）**: 本番の provider は H6〔#2877〕。それまで本番では差さない（bundle への配線は H5〔#2876〕で済み）。
+    /// plugin-cri が Linux・非 root の本番構成で本番の provider を差す（H6・#2877）。bundle への配線は H5〔#2876〕で済み。
     pub fn with_pod_holder(mut self, provider: Arc<dyn PodNamespaceHolderProvider>) -> Self {
         self.pod_holder = Some(provider);
         self

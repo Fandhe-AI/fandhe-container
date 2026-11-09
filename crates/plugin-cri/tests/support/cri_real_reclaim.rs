@@ -14,8 +14,16 @@
 //! 呼び出し元: 取り込み側の試験が `#[path]` で共有する。`Drop` では `.await` できないため RPC を呼ぶガードは作らず、
 //! 本体を [`guarded`]（`tokio::spawn` で panic を捕まえ、期限切れは abort）で走らせた後に試験自身が [`reclaim`] を呼ぶ。
 //!
-//! 残余（REPAIR-3）: plugin 自体が死んだ後の起動し直しによる回収は扱わない（接続できなければ残骸の行を出す。第 2 層が
-//! 次の実行を守る）。
+//! 所有者 label（#4285）: 実行ごとのトークンでは過去の実行の残骸を回収できない。そこで試験名を値にした安定な 2 つ目の
+//! label（[`OWNER_KEY`]）を足す。値は許可リスト [`OWNERS`] に固定し、先頭の回収（[`reclaim_by_selector`] を許可リストの値ごとに
+//! 呼ぶ）はこの label を持つ記録だけを消す。CRI の `label_selector` は完全一致のため、許可リストの値ごとに一覧を取る。
+//! label の無い記録・許可リスト外の値の記録には触れない（手動回収。`docs/setup/cri-record-recovery.md`）。
+//!
+//! plugin 自体が死んだ場合（#4285）: 本部品は接続済みの client だけを使う。接続できないとき [`reclaim`] は `unverified` を
+//! 返すので、呼び出し側が [`plugin_unreachable`] で判定し、同じ状態ルートで plugin を起動し直してから回収し直す
+//! （`container_grpc.rs`・`cri_exec_real.rs` の段 4）。`cri_attach_real.rs` の外側の回収で起動し直す経路は未対応（REPAIR-3）。
+//!
+//! 取り込みの注意: `#[path]` で複数の試験バイナリへ取り込まれるため、本部品の自己照合の `#[test]` は取り込み側ごとに重ねて走る。
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -31,6 +39,15 @@ use tonic::transport::Channel;
 
 /// 試験が作った記録に付けるラベルのキー。値は [`run_token`]。
 pub const LABEL_KEY: &str = "io.fandhe-container.test.run";
+/// 安定した所有者 label のキー（#4285）。値は [`OWNERS`] のいずれか。
+pub const OWNER_KEY: &str = "io.fandhe-container.test.owner";
+/// 所有者 label の許可リスト（試験名。先頭の回収の対象はこの値の記録だけ）。
+pub const OWNERS: [&str; 4] = [
+    "production_binary_full_lifecycle_real",
+    "production_binary_restart_readopts_running_container_real",
+    "production_binary_exec_real",
+    "production_binary_attach_real",
+];
 /// 回収全体の上限（REPAIR-5）。
 pub const CLEANUP_BUDGET: Duration = Duration::from_secs(60);
 /// 回収の RPC 1 回の上限。
@@ -59,9 +76,18 @@ pub fn labels(token: &str) -> HashMap<String, String> {
     HashMap::from([(LABEL_KEY.to_owned(), token.to_owned())])
 }
 
-/// `PodSandboxConfig`・`ContainerConfig` の `labels` 用（`BTreeMap`）。
-pub fn config_labels(token: &str) -> std::collections::BTreeMap<String, String> {
-    labels(token).into_iter().collect()
+/// 所有者 label だけの selector（先頭の回収用）。
+pub fn owner_selector(owner: &str) -> HashMap<String, String> {
+    HashMap::from([(OWNER_KEY.to_owned(), owner.to_owned())])
+}
+
+/// `PodSandboxConfig`・`ContainerConfig` の `labels` 用（`BTreeMap`）。トークンと所有者の 2 つを持つ。
+/// `owner` が許可リストに無いのは試験コードの誤りなので panic する。
+pub fn config_labels(owner: &str, token: &str) -> std::collections::BTreeMap<String, String> {
+    assert!(OWNERS.contains(&owner), "owner {owner:?} is not in OWNERS");
+    let mut m: std::collections::BTreeMap<String, String> = labels(token).into_iter().collect();
+    m.insert(OWNER_KEY.to_owned(), owner.to_owned());
+    m
 }
 
 /// 試験が作った ID の台帳。
@@ -192,14 +218,21 @@ fn push_unique(v: &mut Vec<String>, id: String) {
     }
 }
 
-/// 自分のトークンのラベルで絞った一覧。失敗した一覧は空にして理由を 3 つ目に返す（残存なしとは見なさない）。
-async fn list_by_label(
+/// 起動し直しが要るか（#4285）。一覧を確認できず（`unverified`）、何も回収できなかったとき真。
+pub fn plugin_unreachable(r: &ReclaimReport) -> bool {
+    !r.unverified.is_empty()
+        && r.reclaimed_containers.is_empty()
+        && r.reclaimed_sandboxes.is_empty()
+}
+
+/// label の selector で絞った一覧。失敗した一覧は空にして理由を 3 つ目に返す（残存なしとは見なさない）。
+async fn list_by_selector(
     c: &mut RuntimeServiceClient<Channel>,
-    token: &str,
+    selector: &HashMap<String, String>,
     end: Instant,
 ) -> (Vec<String>, Vec<String>, Vec<String>) {
     let mut errors = Vec::new();
-    let selector = labels(token);
+    let selector = selector.clone();
     let containers = call_with_deadline(
         c.list_containers(cri::ListContainersRequest {
             filter: Some(cri::ContainerFilter {
@@ -247,12 +280,25 @@ pub async fn reclaim(
     token: &str,
     budget: Duration,
 ) -> ReclaimReport {
+    reclaim_by_selector(c, ledger, labels(token), token, budget).await
+}
+
+/// [`reclaim`] の一般形。`selector` は label の完全一致（トークン、または [`owner_selector`]）。`name` は未確認の報告に載せる
+/// 識別子（トークン、または `owner=<値>`）。
+pub async fn reclaim_by_selector(
+    c: &mut RuntimeServiceClient<Channel>,
+    ledger: &Ledger,
+    selector: HashMap<String, String>,
+    name: &str,
+    budget: Duration,
+) -> ReclaimReport {
+    let token = name;
     let end = Instant::now() + budget;
     let (mut cids, mut sids) = {
         let g = lock(ledger);
         (g.containers.clone(), g.sandboxes.clone())
     };
-    let (lc, ls, _) = list_by_label(c, token, end).await;
+    let (lc, ls, _) = list_by_selector(c, &selector, end).await;
     lc.into_iter().for_each(|i| push_unique(&mut cids, i));
     ls.into_iter().for_each(|i| push_unique(&mut sids, i));
 
@@ -306,7 +352,7 @@ pub async fn reclaim(
         forget_sandbox(ledger, &id);
     }
     // 取り直し: 一覧に残っているものは、Remove の応答に関わらず残骸にする。
-    let (rc, rs, errs) = list_by_label(c, token, end).await;
+    let (rc, rs, errs) = list_by_selector(c, &selector, end).await;
     report.unverified = errs;
     rc.into_iter()
         .for_each(|i| push_unique(&mut report.left_containers, i));
@@ -382,6 +428,49 @@ fn reclaim_4142_token_is_unique_and_safe() {
     assert!(uid.len() <= 253, "uid length {}", uid.len());
     assert_eq!(uid, format!("uid-attach-{a}"));
     assert_eq!(labels(&a).get(LABEL_KEY), Some(&a));
+}
+
+#[test]
+fn reclaim_4285_config_labels_carry_token_and_owner() {
+    let m = config_labels(OWNERS[0], "42-7");
+    assert_eq!(m.len(), 2);
+    assert_eq!(m.get(LABEL_KEY).map(String::as_str), Some("42-7"));
+    assert_eq!(m.get(OWNER_KEY).map(String::as_str), Some(OWNERS[0]));
+    // selector 用の labels はトークンだけ（部分集合で一致する）。
+    assert_eq!(labels("42-7").len(), 1);
+    let sel = owner_selector(OWNERS[1]);
+    assert_eq!(sel.len(), 1);
+    assert_eq!(sel.get(OWNER_KEY).map(String::as_str), Some(OWNERS[1]));
+}
+
+#[test]
+fn reclaim_4285_owners_are_unique() {
+    for (i, a) in OWNERS.iter().enumerate() {
+        for b in &OWNERS[i + 1..] {
+            assert_ne!(a, b);
+        }
+    }
+}
+
+#[test]
+#[should_panic(expected = "is not in OWNERS")]
+fn reclaim_4285_unknown_owner_panics() {
+    let _ = config_labels("not-an-owner", "t");
+}
+
+#[test]
+fn reclaim_4285_plugin_unreachable_boundaries() {
+    let unv = ReclaimReport {
+        unverified: vec!["list_containers: unavailable".into()],
+        ..Default::default()
+    };
+    assert!(plugin_unreachable(&unv));
+    let with_reclaimed = ReclaimReport {
+        reclaimed_containers: vec!["c".into()],
+        ..unv
+    };
+    assert!(!plugin_unreachable(&with_reclaimed));
+    assert!(!plugin_unreachable(&ReclaimReport::default()));
 }
 
 #[test]

@@ -66,6 +66,10 @@ mod shim_wire;
 #[cfg(target_os = "linux")]
 #[path = "../../oci/tests/support/test_root.rs"]
 mod test_root;
+// 実行ごとに一意な ID・namespace と旧形式の残骸のおとり（#4285）。
+#[allow(dead_code)]
+#[path = "support/shim_real_unique.rs"]
+mod shim_unique;
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -80,7 +84,7 @@ mod linux {
         decode_state_response, exec_id_request, exec_request, id_request, kill_request,
         shutdown_request,
     };
-    use super::{minimal_rootfs, reap, test_root};
+    use super::{minimal_rootfs, reap, shim_unique, test_root};
 
     /// 全体の期限（REPAIR-5）。超えたら子を回収して `WATCHDOG EXPIRED` と終了コード 124 で終わる。
     const WATCHDOG: Duration = Duration::from_secs(300);
@@ -196,7 +200,7 @@ mod linux {
     }
 
     fn container_id() -> String {
-        format!("xer{}", std::process::id())
+        format!("xer{}", shim_unique::run_tag())
     }
 
     /// 共通の回収処理（REPAIR-5）。追跡中の pid を止め、`kill_all_via_shim` なら shim の `Kill(all=true)` を期限つき
@@ -878,7 +882,15 @@ mod linux {
         std::fs::create_dir(&bin).map_err(|e| format!("mkdir bin: {e}"))?;
         install_exe(Path::new(SHIM_SRC), &bin.join(SHIM_NAME))?;
         install_exe(&sup_src, &bin.join(SUPERVISOR_NAME))?;
-        let namespace = format!("fcexec{}", std::process::id());
+        let namespace = format!("fcexec{}", shim_unique::run_tag());
+        // 旧形式（pid だけ）の残骸があっても結果に影響しないことの確認用のおとり（#4285）。Drop で自分の分だけ消す。
+        let pid = std::process::id();
+        let _decoy = shim_unique::Decoy::place(&format!("fcexec{pid}"), &format!("xer{pid}"))?;
+        for p in state_dirs(&namespace, Some(&container_id()))? {
+            if p.symlink_metadata().is_ok() {
+                return Err(format!("state directory already exists: {}", p.display()));
+            }
+        }
         if let Ok(mut w) = WORK.lock() {
             *w = Some((dir.clone(), bin.clone()));
         }

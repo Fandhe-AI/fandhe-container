@@ -41,6 +41,7 @@ mod spdy_client;
 // serde_json を plugin-cri の依存に足さないための最小 JSON 読み取り。
 #[path = "support/mini_json.rs"]
 mod mini_json;
+#[allow(dead_code)] // 取り込む試験ごとに使う項目が異なるため
 #[path = "support/cri_real_reclaim.rs"]
 mod reclaim;
 
@@ -510,7 +511,7 @@ async fn scenario(
                 namespace: "default".into(),
                 attempt: 0,
             }),
-            labels: reclaim::config_labels(&token),
+            labels: reclaim::config_labels(TEST, &token),
             ..Default::default()
         }),
         ..Default::default()
@@ -544,7 +545,7 @@ async fn scenario(
                 }),
                 image: Some(image_spec(IMAGE)),
                 command: vec!["/bin/sleep".into(), "300".into()],
-                labels: reclaim::config_labels(&token),
+                labels: reclaim::config_labels(TEST, &token),
                 ..Default::default()
             }),
             sandbox_config: None,
@@ -730,7 +731,8 @@ async fn scenario(
         ch: new_ch,
     };
 
-    // 後始末（成功経路）。照合は自分の sandbox とトークンのラベルで絞る（他の記録の有無には依らない）。
+    // 後始末（成功経路。#4285）。SIGKILL の後に再採用された記録を、台帳とトークンの回収で消す。Stop だけは先に通して
+    // 結果を厳密に見る。回収が Remove・一覧での残存確認を担い、回収した ID が自分の 1 件ずつであることを具体値で照合する。
     call_with_deadline(
         c.stop_container(cri::StopContainerRequest {
             container_id: id.clone(),
@@ -740,63 +742,13 @@ async fn scenario(
     )
     .await
     .expect("stop");
-    call_with_deadline(
-        c.remove_container(cri::RemoveContainerRequest {
-            container_id: id.clone(),
-        }),
-        long,
-    )
-    .await
-    .expect("remove");
-    reclaim::forget_container(&ledger, &id);
-    let left = call_with_deadline(
-        c.list_containers(cri::ListContainersRequest {
-            filter: Some(cri::ContainerFilter {
-                pod_sandbox_id: sb.clone(),
-                label_selector: reclaim::labels(&token),
-                ..Default::default()
-            }),
-        }),
-        RPC_DEADLINE,
-    )
-    .await
-    .expect("list containers")
-    .into_inner()
-    .containers
-    .len();
-    assert_eq!(left, 0);
-    call_with_deadline(
-        c.stop_pod_sandbox(cri::StopPodSandboxRequest {
-            pod_sandbox_id: sb.clone(),
-        }),
-        long,
-    )
-    .await
-    .expect("stop sandbox");
-    call_with_deadline(
-        c.remove_pod_sandbox(cri::RemovePodSandboxRequest {
-            pod_sandbox_id: sb.clone(),
-        }),
-        long,
-    )
-    .await
-    .expect("remove sandbox");
-    reclaim::forget_sandbox(&ledger, &sb);
-    let left_sb = call_with_deadline(
-        c.list_pod_sandbox(cri::ListPodSandboxRequest {
-            filter: Some(cri::PodSandboxFilter {
-                label_selector: reclaim::labels(&token),
-                ..Default::default()
-            }),
-        }),
-        RPC_DEADLINE,
-    )
-    .await
-    .expect("list sandboxes")
-    .into_inner()
-    .items
-    .len();
-    assert_eq!(left_sb, 0);
+    let rep = reclaim::reclaim(&mut c, &ledger, &token, reclaim::CLEANUP_BUDGET).await;
+    assert_eq!(rep.reclaimed_containers, vec![id.clone()], "{rep:?}");
+    assert_eq!(rep.reclaimed_sandboxes, vec![sb.clone()], "{rep:?}");
+    assert!(rep.is_clean(), "{rep:?}");
+    eprintln!(
+        "{TEST}: info readopted records reclaimed containers=1 sandboxes=1 after plugin restart"
+    );
 }
 
 /// 段階（本番バイナリ越しの実コンテナへの exec）。

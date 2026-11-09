@@ -208,6 +208,11 @@ impl CriRuntimeService {
                 if let Ok(holder) = &result {
                     record.pod_holder = Some(*holder);
                     record.holder_owned = true;
+                } else if let Err(e) = &result
+                    && e.resource_retained()
+                {
+                    // 回収を確認できない子が provider に残る。記録を残して Stop・Remove の `release` に再試行させる。
+                    record.holder_owned = true;
                 }
                 // 成功を呼び出し側が受領できる（確定に勝った）間は `holder_pending` を保ち、受領と同じ同期区間で
                 // 呼び出し側が解除する（解除と Ready 公開の間に Stop が解放できる窓を作らない）。

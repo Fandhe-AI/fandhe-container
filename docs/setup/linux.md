@@ -64,6 +64,16 @@ ln -sf ~/.local/libexec/fandhe-container/fandhe-container ~/.local/bin/fandhe-co
 - 置き場所とその祖先は、他の利用者が書き込めないようにする（g/o 書き込み不可）。CLI と supervisor の間に権限の境界は無いが、他人が書ける場所に置くとファイルを差し替えられる
 - 更新するときは CLI と supervisor を同じ版で置き直す
 
+## CRI の pod sandbox と保持役（rootless のみ。H6・#2877）
+
+plugin-cri は rootless（非 root）で `RunPodSandbox` のたびに、supervisor の bin の `pod-holder` モードを pod の namespace の保持役として起動する。前提は次のとおり。
+
+- supervisor の bin が plugin-cri の実体と同じディレクトリにあり、利用者（か root）所有・group / other 書き込み不可・利用者に読めること（0755 など）。満たさないと `RunPodSandbox` は `FAILED_PRECONDITION`（`pod holder executable is not trusted or not readable`）で失敗する
+- 非特権 user namespace を作れること（Ubuntu 24.04 以降の `kernel.apparmor_restrict_unprivileged_userns=1` では `PermissionDenied` で失敗するため緩和が要る。subuid / subgid の範囲写像は次節）
+- uid 0 の plugin-cri には保持役を注入せず、従来どおり（start は `UNIMPLEMENTED`）
+
+POD のコンテナは保持役の user・ipc namespace に join する（H5・#2876 は配線済み）。保持役の netns を pod ネットワークへ渡す配線は未実装（H8・#2878）。
+
 ## containerd の shim（rootless のみ。#3684）
 
 `containerd-shim-fandhe-container-v2`（`fandhe-container-plugin-cri` が持つ bin。CRI-5）は、containerd が exec する shim v2 で、本番の実行層（`CoreLifecycleRuntime`）を登録する。supervisor は shim の実体と同じディレクトリの固定名（`fandhe-container-supervisor`）から解決するため、同じディレクトリに置く。特権ランチャーは置かない（置くと rootful のインストールとみなされる）。

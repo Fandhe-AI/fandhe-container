@@ -215,7 +215,7 @@ CLI の delete の起動オプション文書の警告、plugin-cri の `contain
 - 観測: 要約は別の `event`（`supervisor_log_sweep`。欄は `container_log_sweep` と同じ並びで、`container_log_sweep` の行は変えない）。
   消せた ID ごとに op 名 `supervisor_log_reclaim`（固定語彙 1 つ）の Success を計上する
 - `reclaim_before_create` の supervisor ログの段: コンテナログの段の後、起動オプション文書の前。上限 5 秒（`SUPERVISOR_LOG_REMOVE_TIMEOUT`）
-- 範囲外: shim の serve の起動時の走査への結線（#4343）
+- shim の serve の起動時の走査（`shim::startup_sweep`）も同じ `sweep_leftover_logs_at_startup` で `@supervisor-logs` を回収する（#4343）。順序と期限の分け方は上と同じ（`docs/design/shim-v2-production-binary.md` の D7）
 
 ## 観測（REPAIR-4）
 
@@ -226,7 +226,7 @@ CLI の delete の起動オプション文書の警告、plugin-cri の `contain
 ## 残る制約・対象外
 
 - terminate は最大 600 秒まで設定できる。既定を超えて窓が 10 秒を超えたときは待ち切れず、`FailedPrecondition`（`reason: sink_open_after_wait`）として計上してログを残す
-  （1 ID あたり世代数 × 上限に収まる）。残りは CLI の同じ ID の `create`、plugin-cri の `CreateContainer`（同じ ID）、plugin-cri の次の起動時の走査で回収される（supervisor ログの残りは plugin-cri の 2 経路だけ。#4342）
+  （1 ID あたり世代数 × 上限に収まる）。残りは CLI の同じ ID の `create`、plugin-cri の `CreateContainer`（同じ ID）、plugin-cri の次の起動時の走査で回収される（supervisor ログの残りは plugin-cri の 2 経路と shim の serve の起動時の走査で回収される。#4342・#4343）
 - CLI の `delete` も同じ待ち（`remove_container_logs_guarded_bounded_waiting`）を使い、結果を `DeleteResponse` の
   `supervisor_log` / `container_log` に載せる（#2698）。CLI の後始末の最悪は、待ち 10 秒（2 つのログで共有。下記）+ supervisor ログの最後の試行 5 秒 +
   コンテナログの最後の試行 5 秒 = 20 秒（`repair5_cli_delete_cleanup_budget_fits_20s`）
@@ -234,7 +234,7 @@ CLI の delete の起動オプション文書の警告、plugin-cri の `contain
   `fandhe_container_supervisor::logs::reclaim_stale_container_logs` で、CLI（`reclaim_stale_container_log`）と plugin-cri
   （`CoreLifecycleRuntime::reclaim_before_create`）が共有する。古い supervisor が生きていれば何も消さず、状態がある ID は guard で消さない。
   best effort で create の成否は変えない（ただし回収が期限切れ `Timeout` のときは、作業スレッドを残したまま監査記録の fork〔単一スレッド前提。SEC-4〕へ進まないよう core を呼ばず `TIMEOUT` で create を失敗させる。CRI 層は `state` が `NotFound` であることを確かめて資源を解放する）。観測は op 名 `container_log_reclaim`（消した Success・エラーの Failure）。plugin-cri の `reclaim_before_create` は、続けて supervisor ログも同じ規則（待たずに 1 回・上限 5 秒・生きている sink と状態がある ID には触れない・期限切れは core を呼ばず `TIMEOUT`）で回収し、op 名 `supervisor_log_reclaim` で計上する（#4342。shim の Create も同じ `create` を通るため効く）
-- 上記で回収できない残り（生きている sink が続く・状態がある ID・帰属できない名前）は手動で消す（`docs/setup/container-log-recovery.md`）。supervisor ログは plugin-cri の起動時の走査と `CreateContainer` の前の回収で自動回収される（#4342）が、CLI と shim の serve の起動時の走査（#4343）は対象外で、自動で消えない残りは同じ手順書の「supervisor ログ」の節に従う（#3034）
+- 上記で回収できない残り（生きている sink が続く・状態がある ID・帰属できない名前）は手動で消す（`docs/setup/container-log-recovery.md`）。supervisor ログは plugin-cri の起動時の走査と `CreateContainer` の前の回収で自動回収される（#4342）に加え、shim の serve の起動時の走査も回収する（#4343）が、CLI は対象外で、自動で消えない残りは同じ手順書の「supervisor ログ」の節に従う（#3034）
 
 ## supervisor ログ側の待ち（#2892・SUP-7・CLI-1・REPAIR-5）
 
@@ -339,7 +339,7 @@ plugin-cri は `create_with_image` を使わず状態レコードに `image_root
 - 後始末の各段（supervisor ログ・コンテナログ・起動オプション文書）は、いまの上限と期限までの残りの小さい方で試す。ロックの待ちと 1 回の試行の
   和が残りを超えないようにし、残りが小さいときは半分ずつ渡す（試行の期限は上限であり通常は短時間で終わるため、残りを全部渡すと待ちが消える）
 - 残りが 0 の段は試さず、`Kept { code: Timeout }`（起動オプション文書は警告行と記録器の Failure）として残す。消さずに残す側に倒し、
-  起動時の走査（コンテナログと、plugin-cri は supervisor ログも。#4342）と手順書（`docs/setup/container-log-recovery.md`）で回収できる。新しい `reason` の語彙は足さない
+  起動時の走査（コンテナログと supervisor ログも。plugin-cri は #4342・shim の serve は #4343）と手順書（`docs/setup/container-log-recovery.md`）で回収できる。新しい `reason` の語彙は足さない
 - 全体の最悪は max(47, 47) = 47 秒で、`PLUGIN_RUNTIME_TIMEOUT` との余裕 13.9 秒は I/O の時間だけに充てる
 - 通常（後始末の前が名目の 17 秒以下）は後始末に 30 秒以上残るため、挙動は変わらない
 - 照合: `repair5_force_delete_worst_case_fits_runtime_timeout`（名目 17・厳密 42・67・予算 22 秒の具体値）・

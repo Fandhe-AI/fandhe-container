@@ -1,7 +1,7 @@
-//! shim v2 の serve の起動時の `@container-logs` 走査（D7 の「2 つ目の契機」。CRI-5・SUP-7・REPAIR-4・REPAIR-5・#4280）。
+//! shim v2 の serve の起動時の `@container-logs`・`@supervisor-logs` 走査（D7 の「2 つ目の契機」。CRI-5・SUP-7・REPAIR-4・REPAIR-5・#4280・#4343）。
 //!
 //! 呼び出し元: `shim::registry_parts_in`（登録簿の組み立てに成功した後。serve だけが通る）。呼び出し先: plugin-cri の起動時の走査と同じ
-//! [`crate::adapter::sweep_leftover_container_logs`]（新しい削除ロジックは持たない。guard は「状態記録が無い」かつ「sink の flock が
+//! [`crate::adapter::sweep_leftover_logs_at_startup`]（新しい削除ロジックは持たない。guard は「状態記録が無い」かつ「sink の flock が
 //! 外れている」。読み取りの失敗は消さない側へ倒れる）。
 //!
 //! 背景: shim の状態は containerd の address・namespace ごとの scoped 状態ルートに置かれ、plugin-cri 自身の起動時の走査（#2760）は
@@ -9,10 +9,13 @@
 //!
 //! 契約:
 //! - 走査は detached の std thread で 1 回だけ行い、serve の開始を待たせない。全体の期限は [`SHIM_STARTUP_LOG_SWEEP_BUDGET`]
-//! - `@container-options`・`@supervisor-logs` は走査しない（supervisor ログの扱いは #4296 のオーナー判断待ち）
-//! - 出力は件数だけの要約行（`event: container_log_sweep`）。何も無かったときは出さない（コンテナごとに起動する shim の `daemon.log` を
-//!   空の行で埋めない）
-//! - 回収が 1 件以上あったときだけ、走査の完了時点の共有記録器のスナップショットを core の `OpRecorder::export_json_lines` 形式
+//! - 対象は `@container-logs` → `@supervisor-logs` の順（#4296 のオーナー判断）。期限は 1 つを共有し、コンテナログを全期限で先に走査して
+//!   supervisor ログは残り時間で走る（コンテナログの期限を食わない・置き去りにされうる thread の上限を保つ・共有の削除作業枠を奪い合わない）。
+//!   コンテナログが期限を使い切ると supervisor ログは予算 0 の `timed_out` になり、残りは次の shim の起動で回収される
+//! - `@container-options`（起動オプション文書）は走査しない（容認する残余。D7）
+//! - 出力は件数だけの要約行（`event: container_log_sweep` と `event: supervisor_log_sweep`）。何も無かったときは出さない
+//!   （コンテナごとに起動する shim の `daemon.log` を空の行で埋めない）。thread を作れなかった固定行は両方の走査が走らないことを表す
+//! - どちらかの回収が 1 件以上あったときだけ、走査の完了時点の共有記録器のスナップショットを core の `OpRecorder::export_json_lines` 形式
 //!   （`event: op_stats` 行と `op_stats_meta` 行）で 1 回だけ `emit` へ流す（#4319・REPAIR-4）。値は固定語彙の操作名と整数だけで、
 //!   ID・パスは含まない。書き出しの失敗・送り先の詰まりは走査の結果・削除に影響しない（送り先は `try_send` で行を件数へ集約する）
 //!
@@ -48,10 +51,20 @@ pub(crate) enum StartupSweep {
     SpawnFailed,
 }
 
+/// 起動時の走査の結果（コンテナログと supervisor ログ。`@container-logs` が無い等で走査できなかった側は `None`）。
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug)]
+pub(crate) struct StartupSweepReports {
+    /// `@container-logs` の走査結果。
+    pub(crate) containers: Option<SweepReport>,
+    /// `@supervisor-logs` の走査結果。
+    pub(crate) supervisors: Option<SweepReport>,
+}
+
 /// 走査の結果の受け口。捨てても thread は最後まで走る。
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct SweepHandle {
-    rx: mpsc::Receiver<Option<SweepReport>>,
+    rx: mpsc::Receiver<StartupSweepReports>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -60,12 +73,12 @@ impl SweepHandle {
     pub(crate) fn wait_within(
         &self,
         limit: Duration,
-    ) -> Result<Option<SweepReport>, mpsc::RecvTimeoutError> {
+    ) -> Result<StartupSweepReports, mpsc::RecvTimeoutError> {
         self.rx.recv_timeout(limit)
     }
 }
 
-/// 記録の無い ID の残りのコンテナログを、裏の thread で 1 回だけ回収する。呼び出し側は待たない。
+/// 記録の無い ID の残りのコンテナログと supervisor ログを、裏の thread で 1 回だけ回収する。呼び出し側は待たない。
 ///
 /// `emit` は要約行の送り先（本番は `telemetry::stderr_sink` の `submit`。試験が行を捕まえるために注入できる）。
 pub(crate) fn spawn_startup_log_sweep(
@@ -79,19 +92,28 @@ pub(crate) fn spawn_startup_log_sweep(
     let spawned = std::thread::Builder::new()
         .name("cri-shim-log-sweep".to_owned())
         .spawn(move || {
-            let report = crate::adapter::sweep_leftover_container_logs(&state, &recorder, budget);
-            if let Some(r) = &report
+            let (containers, supervisors) =
+                crate::adapter::sweep_leftover_logs_at_startup(&state, &recorder, budget);
+            if let Some(r) = &containers
                 && *r != SweepReport::default()
             {
                 emit_in(crate::adapter::sweep_summary_line(r));
             }
-            if let Some(r) = &report
-                && r.reclaimed_ids > 0
+            if let Some(r) = &supervisors
+                && *r != SweepReport::default()
             {
+                emit_in(crate::adapter::supervisor_log_sweep_summary_line(r));
+            }
+            let reclaimed =
+                |r: &Option<SweepReport>| r.as_ref().is_some_and(|r| r.reclaimed_ids > 0);
+            if reclaimed(&containers) || reclaimed(&supervisors) {
                 export_reclaim_stats(&recorder, &*emit_in);
             }
             // 受け手が捨てられていても構わない。
-            let _ = tx.send(report);
+            let _ = tx.send(StartupSweepReports {
+                containers,
+                supervisors,
+            });
         });
     match spawned {
         Ok(_) => StartupSweep::Spawned(SweepHandle { rx }),

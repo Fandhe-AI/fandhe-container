@@ -95,7 +95,7 @@ use fandhe_container_core::traits::{
     TraitError,
 };
 use fandhe_container_cri::adapter::{
-    BundleProvider, BundleRequest, PreparedBundle, RuntimeAdapter,
+    BundleProvider, BundleRequest, PodNamespaceHolderProvider, PreparedBundle, RuntimeAdapter,
 };
 use fandhe_container_cri::error::CriError;
 #[cfg(unix)]
@@ -154,6 +154,9 @@ pub struct CriPluginBackends {
     /// `production()`（unix）は永続の `PersistentImageStore`、注入（`new`・`with_recorder`）と非 unix は
     /// プロセス内だけの `InMemoryImageStore`（#4176。モジュール doc）。
     images: Arc<dyn ImageStore>,
+    /// pod の namespace の保持役 provider（H6・#2877・CRI-2）。`production()` の Linux・非 root の構成だけが差し、注入で組んだ
+    /// ときは `None`（[`Self::with_pod_holder_provider`] で差せる）。`runtime_service` が `with_pod_holder` へ渡す。
+    pod_holder: Option<Arc<dyn PodNamespaceHolderProvider>>,
 }
 
 impl fmt::Debug for CriPluginBackends {
@@ -189,7 +192,18 @@ impl CriPluginBackends {
             state_root: None,
             _instance_lock: None,
             images: Arc::new(InMemoryImageStore::new()),
+            pod_holder: None,
         }
+    }
+
+    /// pod の namespace の保持役 provider を差す（試験と別実装への差し替え。H6・#2877・PLUG-1）。
+    /// 本番の provider は `production()` が Linux・非 root の構成で自動的に差す。
+    pub fn with_pod_holder_provider(
+        mut self,
+        provider: Arc<dyn PodNamespaceHolderProvider>,
+    ) -> Self {
+        self.pod_holder = Some(provider);
+        self
     }
 
     /// 既定の組み合わせを作る（`FileStateStore`・[`CoreLifecycleRuntime`]・`NetworkPlugin` は Linux で
@@ -260,6 +274,14 @@ impl CriPluginBackends {
         }
         backends.state_root = Some(state_root);
         backends._instance_lock = Some(instance_lock);
+        // 保持役は Linux・非 root の本番構成だけで差す（rootful は従来どおり差さず、start は `UNIMPLEMENTED`。#2241・#2442）。
+        // 試験ビルドでは環境変数で止められる（既定の集合の試験が AppArmor の緩和・supervisor の bin なしで動くように）。
+        #[cfg(target_os = "linux")]
+        if pod_holder_injection_enabled() {
+            backends.pod_holder = Some(Arc::new(
+                crate::pod_holder::ProductionPodHolder::production(),
+            ));
+        }
         Ok(backends)
     }
 
@@ -492,13 +514,28 @@ impl CriPluginBackends {
     /// 実行層の呼び出しの待ち上限は [`PLUGIN_RUNTIME_TIMEOUT`] にする（CRI の既定 10 秒では supervisor の起動の受信期限
     /// 〔約 58.9 秒〕より先に結果不明へ倒れるため。#2434・REPAIR-5）。
     pub fn runtime_service(&self, bundles: Arc<dyn BundleProvider>) -> CriRuntimeService {
-        CriRuntimeService::with_recorder(Arc::new(CoreCriRecorder::new(
+        let service = CriRuntimeService::with_recorder(Arc::new(CoreCriRecorder::new(
             Arc::clone(&self.recorder),
             Arc::clone(&self.oci_recorder),
         )))
         .with_runtime_timeout(PLUGIN_RUNTIME_TIMEOUT)
-        .with_runtime(RuntimeAdapter::new(Arc::clone(&self.runtime)), bundles)
+        .with_runtime(RuntimeAdapter::new(Arc::clone(&self.runtime)), bundles);
+        match &self.pod_holder {
+            Some(p) => service.with_pod_holder(Arc::clone(p)),
+            None => service,
+        }
     }
+}
+
+/// 本番の保持役 provider を注入するか（Linux のみ）。実効 uid が 0 のプロセスは注入しない。試験用 feature
+/// `pod-holder-test-support` のビルドでは、環境変数 `FANDHE_CONTAINER_TEST_POD_HOLDER=off` でも止める（`off` 以外の値は無視）。
+#[cfg(target_os = "linux")]
+fn pod_holder_injection_enabled() -> bool {
+    #[cfg(feature = "pod-holder-test-support")]
+    if std::env::var("FANDHE_CONTAINER_TEST_POD_HOLDER").is_ok_and(|v| v == "off") {
+        return false;
+    }
+    crate::pod_holder::inject_for_current_process()
 }
 
 /// CRI サービスが実行層の呼び出しを待つ上限（REPAIR-5・#2434）。

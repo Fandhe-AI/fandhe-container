@@ -142,6 +142,9 @@ pub struct CriError {
     code: CriErrorCode,
     message: String,
     registry_http_status: Option<u16>,
+    /// 失敗したが資源（pod の保持役など）が残りうる印。呼び出し側は記録を残し、解放を再試行する
+    /// （`PodNamespaceHolderProvider::spawn` の失敗時無残置契約の例外。CRI-2・REPAIR-5）。
+    resource_retained: bool,
 }
 
 impl CriError {
@@ -159,7 +162,20 @@ impl CriError {
             code,
             message,
             registry_http_status: None,
+            resource_retained: false,
         }
+    }
+
+    /// 失敗したが資源が残りうる印を付ける（`PodNamespaceHolderProvider::spawn` が、SIGKILL の後も回収を確認できない
+    /// 子を保持したまま失敗するときに使う。CRI-2・REPAIR-5）。
+    pub fn with_resource_retained(mut self) -> Self {
+        self.resource_retained = true;
+        self
+    }
+
+    /// 資源が残りうる失敗か。真なら呼び出し側は記録を残し、`release` で再試行する。
+    pub fn resource_retained(&self) -> bool {
+        self.resource_retained
     }
 
     /// レジストリ由来の HTTP 状態（`PullError` 経由のときだけ入る）。

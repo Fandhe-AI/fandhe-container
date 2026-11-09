@@ -18,6 +18,7 @@ use fandhe_container_core::traits::{
 use fandhe_container_supervisor::logs::{
     LogSink as _, RotatingFileSink, StreamKind, container_log_dir, container_log_rotation_config,
 };
+use fandhe_container_supervisor::supervisor_log::{self, SupervisorLogWriter};
 
 use super::*;
 use crate::test_root;
@@ -111,6 +112,7 @@ fn cri5_sup7_4280_startup_sweep_removes_only_closed_unrecorded_logs() {
     let report = h
         .wait_within(Duration::from_secs(20))
         .expect("sweep finishes")
+        .containers
         .expect("report");
     assert_eq!(report.reclaimed_ids, 1);
     assert_eq!(report.removed_files, 1);
@@ -159,6 +161,7 @@ fn cri5_sup7_4280_startup_sweep_silent_when_nothing_to_do() {
     let report = h
         .wait_within(Duration::from_secs(20))
         .expect("sweep finishes")
+        .containers
         .expect("report");
     assert_eq!(report, SweepReport::default());
     assert!(lines.lock().unwrap().is_empty());
@@ -230,6 +233,7 @@ fn cri5_repair5_4280_startup_sweep_does_not_block_and_returns_by_budget() {
     let report = h
         .wait_within(Duration::from_secs(20))
         .expect("sweep returns by budget")
+        .containers
         .expect("report");
     assert!(report.timed_out);
     assert_eq!(report.reclaimed_ids, 0);
@@ -257,6 +261,7 @@ fn cri5_repair4_4319_startup_sweep_exports_reclaim_count_n() {
     let report = h
         .wait_within(Duration::from_secs(20))
         .expect("sweep finishes")
+        .containers
         .expect("report");
     assert_eq!(report.reclaimed_ids, 3);
     assert_eq!(report.removed_files, 3);
@@ -313,10 +318,209 @@ fn cri5_repair4_4319_startup_sweep_result_unaffected_by_stalled_stats_sink() {
     let report = h
         .wait_within(Duration::from_secs(20))
         .expect("sweep finishes despite stalled sink")
+        .containers
         .expect("report");
     assert_eq!(report.reclaimed_ids, 2);
     assert_eq!(report.failed, 0);
     assert!(names(&container_log_dir(&root)).is_empty());
     assert!(sink.dropped() > 0, "export must actually have been dropped");
     drop(gate);
+}
+
+/// supervisor ログの書き手を開いて 1 行書く（再 open の競合は期限つきで再試行する）。
+fn open_sup_sink(root: &Path, name: &str) -> SupervisorLogWriter {
+    use std::io::Write as _;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut w = loop {
+        match supervisor_log::open(root, &cid(name)) {
+            Ok(w) => break w,
+            Err(e) if e.code() == ErrorCode::FailedPrecondition && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => panic!("open supervisor sink: {e:?}"),
+        }
+    };
+    w.write_all(format!("hello {name}\n").as_bytes()).unwrap();
+    w.flush().unwrap();
+    w
+}
+
+/// 記録 `present1` を作る。
+fn seed_present(store: &Arc<dyn StateStore>, base: &Path) {
+    let bundle = base.join("bundle");
+    std::fs::create_dir_all(&bundle).unwrap();
+    store
+        .create(
+            &CreateStateRequest::new(ContainerStatus::created(cid("present1"), None), bundle)
+                .unwrap(),
+        )
+        .unwrap();
+}
+
+/// 起動時の走査の削除は共有の作業枠を使うため、具体値を見る試験を直列にする。
+static SERIAL: Mutex<()> = Mutex::new(());
+
+/// CRI-5・SUP-7・REPAIR-4・#4343: 記録の無い閉じた supervisor ログだけが消え、記録ありと生きている sink は残る。
+#[test]
+fn cri5_sup7_4343_startup_sweep_removes_only_closed_unrecorded_supervisor_logs() {
+    let _s = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = test_root::test_root("shim", "sweep6");
+    let (store, root) = open_store(&guard);
+    seed_present(&store, &guard);
+    drop(open_sup_sink(&root, "present1"));
+    drop(open_sup_sink(&root, "closed1"));
+    drop(open_sup_sink(&root, "closed2"));
+    let _live = open_sup_sink(&root, "live1");
+
+    let recorder = Arc::new(OpRecorder::new());
+    let (lines, emit) = collector();
+    let h = spawned(spawn_startup_log_sweep(
+        Arc::clone(&store),
+        Arc::clone(&recorder),
+        Duration::from_secs(30),
+        emit,
+    ));
+    let reports = h
+        .wait_within(Duration::from_secs(20))
+        .expect("sweep finishes");
+    assert_eq!(reports.containers, Some(SweepReport::default()));
+    let report = reports.supervisors.expect("report");
+    assert_eq!(report.reclaimed_ids, 2);
+    assert_eq!(report.skipped_live, 1);
+    assert_eq!(report.skipped_present, 1);
+    assert_eq!(report.failed, 0);
+    assert!(!report.timed_out);
+    assert_eq!(
+        names(&supervisor_log::log_dir(&root)),
+        ["live1.log", "live1.log.lock", "present1.log"]
+    );
+    let got = lines.lock().unwrap().clone();
+    assert_eq!(got.len(), 3, "{got:?}");
+    assert_eq!(
+        got[0],
+        crate::adapter::supervisor_log_sweep_summary_line(&report)
+    );
+    assert!(got.iter().all(|l| !l.contains("container_log_sweep")));
+    assert!(
+        got[1].starts_with(
+            r#"{"event":"op_stats","op":"supervisor_log_reclaim","success":2,"failure":0,"count":2,"#
+        ),
+        "{}",
+        got[1]
+    );
+    assert_eq!(
+        got[2],
+        r#"{"event":"op_stats_meta","ops":1,"dropped_records":0}"#
+    );
+    assert!(got.iter().all(|l| !l.contains("closed1")), "{got:?}");
+    let snap = recorder
+        .snapshot_op(&OpName::new("supervisor_log_reclaim").unwrap())
+        .unwrap();
+    assert_eq!((snap.success(), snap.failure()), (2, 0));
+}
+
+/// CRI-5・REPAIR-4・#4343: 両方に残りがあるとき、行はコンテナログ -> supervisor ログ -> 書き出しの順になる。
+#[test]
+fn cri5_sup7_4343_startup_sweep_orders_container_then_supervisor() {
+    let _s = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = test_root::test_root("shim", "sweep7");
+    let (store, root) = open_store(&guard);
+    drop(open_sink(&root, "closed1"));
+    drop(open_sup_sink(&root, "closed2"));
+    let (lines, emit) = collector();
+    let h = spawned(spawn_startup_log_sweep(
+        Arc::clone(&store),
+        Arc::new(OpRecorder::new()),
+        Duration::from_secs(30),
+        emit,
+    ));
+    let reports = h
+        .wait_within(Duration::from_secs(20))
+        .expect("sweep finishes");
+    assert_eq!(reports.containers.expect("c").reclaimed_ids, 1);
+    assert_eq!(reports.supervisors.expect("s").reclaimed_ids, 1);
+    let got = lines.lock().unwrap().clone();
+    assert_eq!(got.len(), 5, "{got:?}");
+    assert!(
+        got[0].contains(r#""event":"container_log_sweep""#),
+        "{got:?}"
+    );
+    assert!(
+        got[1].contains(r#""event":"supervisor_log_sweep""#),
+        "{got:?}"
+    );
+    assert!(
+        got[2].contains(r#""op":"container_log_reclaim""#),
+        "{got:?}"
+    );
+    assert!(
+        got[3].contains(r#""op":"supervisor_log_reclaim""#),
+        "{got:?}"
+    );
+    assert_eq!(
+        got[4],
+        r#"{"event":"op_stats_meta","ops":2,"dropped_records":0}"#
+    );
+    assert!(got.iter().all(|l| !l.contains("closed")), "{got:?}");
+}
+
+/// REPAIR-4・#4343: `@supervisor-logs` が空のときは行を出さない。
+#[test]
+fn cri5_sup7_4343_startup_sweep_silent_when_supervisor_dir_empty() {
+    let _s = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = test_root::test_root("shim", "sweep8");
+    let (store, root) = open_store(&guard);
+    // ディレクトリだけを作って空にする。
+    drop(open_sup_sink(&root, "tmp1"));
+    let _ = supervisor_log::remove(&root, &cid("tmp1"));
+    let (lines, emit) = collector();
+    let h = spawned(spawn_startup_log_sweep(
+        store,
+        Arc::new(OpRecorder::new()),
+        Duration::from_secs(30),
+        emit,
+    ));
+    let reports = h
+        .wait_within(Duration::from_secs(20))
+        .expect("sweep finishes");
+    assert_eq!(reports.supervisors, Some(SweepReport::default()));
+    assert!(lines.lock().unwrap().is_empty());
+}
+
+/// REPAIR-5・#4343: supervisor ログの guard が止まっても起動は待たされず、走査は期限で戻り、ログは消さない。
+#[test]
+fn cri5_repair5_4343_supervisor_sweep_does_not_block_and_returns_by_budget() {
+    let _s = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = test_root::test_root("shim", "sweep9");
+    let (inner, root) = open_store(&guard);
+    drop(open_sup_sink(&root, "closed1"));
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let store: Arc<dyn StateStore> = Arc::new(BlockedGet {
+        inner,
+        entered: Mutex::new(entered_tx),
+        release: Mutex::new(release_rx),
+    });
+    let (_lines, emit) = collector();
+    let h = spawned(spawn_startup_log_sweep(
+        store,
+        Arc::new(OpRecorder::new()),
+        Duration::from_secs(1),
+        emit,
+    ));
+    entered_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("guard entered");
+    assert!(matches!(
+        h.wait_within(Duration::ZERO),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+    let reports = h
+        .wait_within(Duration::from_secs(20))
+        .expect("sweep returns by budget");
+    let report = reports.supervisors.expect("report");
+    assert!(report.timed_out);
+    assert_eq!(report.reclaimed_ids, 0);
+    assert!(supervisor_log::log_dir(&root).join("closed1.log").exists());
+    drop(release_tx);
 }

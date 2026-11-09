@@ -491,13 +491,16 @@ impl PodNetns {
 /// キーは sandbox ID（[`PodNetworkProvider::tear_down`] と同じ）。pid と子プロセスの対応は実装側が持つ。
 ///
 /// 実装は `/proc`・pidfd・シグナルを扱うため cri には置かない（cri は 3 OS でビルドされる。CRI-7）。
-/// **未実装・簡易実装（REPAIR-3）**: 本番の実装（supervisor の `pod-holder` モードを exec する provider）は
-/// H6（#2877）。pid から namespace のパスを作って bundle へ渡す配線は H5（#2876）で `CriRuntimeService` に実装済み。本 trait は
+/// **未実装・簡易実装（REPAIR-3）**: 本番の実装（supervisor の `pod-holder` モードを exec する provider）は plugin-cri の
+/// `ProductionPodHolder`（H6・#2877。Linux・非 root の本番構成で注入）。pid から namespace のパスを作って bundle へ渡す配線は
+/// H5（#2876）で `CriRuntimeService` に実装済み。本 trait は
 /// 注入点と sandbox 記録への pid の保持（メモリ上のみ。記録ファイルへの永続化は R11〔#2940〕）だけを定める。
 /// エラー文言に config の値・パス・pid を含めないこと。
 pub trait PodNamespaceHolderProvider: Send + Sync {
     /// 保持役を起動し、READY を受けて pid を返す。`req.ready_timeout()` 以内に戻ること（REPAIR-5）。
     /// 失敗・期限超過のときは子を SIGKILL して回収してから `Err` を返し、資源を残さない。
+    /// SIGKILL の後も回収を確認できない子が残るときだけ例外で、provider が子を sandbox ID 付きで保持し、
+    /// [`CriError::with_resource_retained`] 付きの `Err` を返す（呼び出し側は記録を残し、`release` で回収を再試行する）。
     fn spawn(&self, req: &PodHolderRequest<'_>) -> Result<PodHolder, CriError>;
 
     /// 保持役を解放する（stdin を閉じる → `timeout` まで待つ → 超過なら SIGKILL → 回収）。冪等で、

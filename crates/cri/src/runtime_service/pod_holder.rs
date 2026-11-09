@@ -199,13 +199,18 @@ impl CriRuntimeService {
         // 期限超過の判定から記録を取るまでの間に worker が成功を確定していたら成功として扱う
         // （手放しに勝てなかった場合。Ready を公開したまま失敗を返す食い違いを作らない）。
         let abandoned = settlement.abandon();
-        let Ok(registry) = self.registry.lock() else {
+        let Ok(mut registry) = self.registry.lock() else {
             return Err(unavailable(err));
         };
-        let Some(record) = registry.records.get(id) else {
+        let Some(record) = registry.records.get_mut(id) else {
             return Err(unavailable(err));
         };
         if !abandoned && record.pod_holder.is_some() && record.holder_owned {
+            // 通常の成功経路と同じく、ここでも Ready を公開する（worker は Ready を公開しないため、
+            // 省くと network なしの RunPodSandbox が成功しても NotReady のまま残り CreateContainer が拒否される。CRI-2）。
+            if publish_ready {
+                record.state = SandboxState::Ready;
+            }
             return Ok(());
         }
         let clear = !record.holder_owned && !record.holder_pending;

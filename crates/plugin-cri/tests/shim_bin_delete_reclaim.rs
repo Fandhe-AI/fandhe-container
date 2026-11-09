@@ -393,6 +393,18 @@ fn open_container_sink(
     sink
 }
 
+/// supervisor ログの書き手を開いて 1 行書く（drop するとファイルが残骸になる）。
+fn open_supervisor_sink(
+    root: &Path,
+    id: &str,
+) -> fandhe_container_supervisor::supervisor_log::SupervisorLogWriter {
+    use std::io::Write as _;
+    let mut w = fandhe_container_supervisor::supervisor_log::open(root, &cid(id)).unwrap();
+    w.write_all(b"x\n").unwrap();
+    w.flush().unwrap();
+    w
+}
+
 /// `id` の名前（`<id>` そのもの、または `<id>.` 始まり）を含むエントリ。
 fn of_id(entries: &[String], id: &str) -> Vec<String> {
     let dotted = format!("{id}.");
@@ -674,8 +686,77 @@ fn cri5_sup7_4280_bin_serve_sweeps_unrecorded_container_logs() {
         stats[0]
     );
     assert!(text.contains(r#""event":"op_stats_meta""#), "{text}");
+    // supervisor ログが無いときは supervisor_log_sweep 行を出さない（#4343）。
+    assert!(
+        !text.contains(r#""event":"supervisor_log_sweep""#),
+        "{text}"
+    );
 
     let mut left: Vec<String> = std::fs::read_dir(container_log_dir(&root))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    left.sort();
+    assert_eq!(left, ["live1.log", "live1.log.lock", "present1.log"]);
+
+    kill_daemon(&id);
+}
+
+/// CRI-5・SUP-7・REPAIR-4・#4343: serve の起動時の走査で、記録の無い ID の閉じた supervisor ログだけが消える。
+/// 記録のある ID と生きている sink のログは残り、`daemon.log` の要約行にパス・ID は含まれない。
+#[test]
+fn cri5_sup7_4343_bin_serve_sweeps_unrecorded_supervisor_logs() {
+    use fandhe_container_supervisor::supervisor_log::log_dir;
+    let sc = Scratch::new();
+    let store = sc.store();
+    let root = sc.scoped_root();
+    sc.seed(&store, ContainerStatus::created(cid("present1"), None));
+    drop(open_supervisor_sink(&root, "present1"));
+    drop(open_supervisor_sink(&root, "closed1"));
+    drop(open_supervisor_sink(&root, "closed2"));
+    let _live = open_supervisor_sink(&root, "live1");
+
+    let id = format!("sv{}", std::process::id());
+    let _sock = sc.start(&id);
+
+    let log = sc.root.join("s").join("daemon.log");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut text = String::new();
+    while std::time::Instant::now() < deadline {
+        text = std::fs::read_to_string(&log).unwrap_or_default();
+        if text.contains(r#""event":"op_stats_meta""#) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains(r#""event":"supervisor_log_sweep""#))
+        .collect();
+    assert_eq!(lines.len(), 1, "{text}");
+    assert!(lines[0].contains(r#""reclaimed_ids":2"#), "{}", lines[0]);
+    assert!(lines[0].contains(r#""skipped_live":1"#), "{}", lines[0]);
+    assert!(lines[0].contains(r#""skipped_present":1"#), "{}", lines[0]);
+    assert!(!lines[0].contains("closed1"), "{}", lines[0]);
+    assert!(
+        !lines[0].contains(sc.root.to_str().unwrap()),
+        "{}",
+        lines[0]
+    );
+    assert!(!text.contains(r#""event":"container_log_sweep""#), "{text}");
+    let stats: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains(r#""op":"supervisor_log_reclaim""#))
+        .collect();
+    assert_eq!(stats.len(), 1, "{text}");
+    assert!(
+        stats[0].contains(r#""success":2,"failure":0,"count":2"#),
+        "{}",
+        stats[0]
+    );
+    assert!(!stats[0].contains("closed"), "{}", stats[0]);
+
+    let mut left: Vec<String> = std::fs::read_dir(log_dir(&root))
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();

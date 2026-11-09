@@ -30,7 +30,7 @@
 //! 1 ID あたり 3 MiB に収まり、同じ ID の次の start で世代として回される。CLI の `delete` は
 //! [`remove_guarded_bounded_waiting`] で、ロック保持中（`stop` 直後の drain 中）だけ期限つきで待つ（#2892）。
 //! plugin-cri の `RemoveContainer` も同じ関数で、コンテナログと待ちを共有する（#2964）。
-//! 起動時の走査の入口は [`sweep_stale_supervisor_logs`]（記録の無い ID の残りを回収する。plugin-cri は結線済み〔#4342〕。shim の serve の起動時の走査は #4343）。
+//! 起動時の走査の入口は [`sweep_stale_supervisor_logs`]（記録の無い ID の残りを回収する。plugin-cri〔#4342〕と shim の serve の起動時の走査〔#4343〕が結線済み）。
 //!
 //! # 未実装・残余（REPAIR-3）
 //! 保存されるのは `stderr_sink` を通る構造化ログだけ。次は fd 2 へ直接書かれ、CLI 起動では null、ランチャー経由では
@@ -182,7 +182,7 @@ pub fn remove_guarded(
 /// ID 数の上限は [`crate::logs::MAX_SWEEP_IDS`]。作業枠はコンテナログの削除と共有する。
 ///
 /// # 呼び出し元（REPAIR-3）
-/// plugin-cri の起動時の走査（`adapter::sweep_leftover_supervisor_logs`。#4342）。shim の serve 起動時の走査（#4343）は未結線で、足される予定。
+/// plugin-cri の起動時の走査（`adapter::sweep_leftover_supervisor_logs`。#4342）。shim の serve の起動時の走査（`shim::startup_sweep`。コンテナログの後・残り時間で走る。#4343）。
 pub fn sweep_stale_supervisor_logs(
     root: &Path,
     may_remove: Arc<dyn Fn(&ContainerId) -> bool + Send + Sync>,

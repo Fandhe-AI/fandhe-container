@@ -21,8 +21,8 @@
 //!   [`PodNamespacePaths`]（pod の保持役が作った user＋ipc namespace のパス）が与えられたときだけ
 //!   `linux.namespaces[].path` で join する（core が user＋ipc の組に限って受ける。CRI-2・CORE-3。#2674）。
 //!   [`PodNamespacePaths`] は保持役の pid から `/proc/<pid>/ns/{user,ipc}` だけを組み立てる（#2776）。
-//!   供給元（保持役）はまだ無く、`CriRuntimeService` は当面 `None` を渡すため、本番では共有されず新しい
-//!   namespace になる。`/dev/shm` は共有しない（core がコンテナごとの tmpfs を載せる）。`/proc/<pid>` を
+//!   `CriRuntimeService` は保持役の provider を注入したときだけ自 sandbox の記録の pid から作った値を渡す（#2876）。
+//!   本番（plugin-cri）は provider が未注入（H6・#2877）のため、本番では共有されず新しい namespace になる。`/dev/shm` は共有しない（core がコンテナごとの tmpfs を載せる）。`/proc/<pid>` を
 //!   Create の時点で書く方式は pid の再利用で別 pod の namespace へ入り得る（SEC-1）ため採らない。
 //! - network namespace: `POD` / `CONTAINER` は `{"type":"network"}` を出す。`POD` で pod の netns のパスを受けたとき
 //!   （[`build_runtime_config_with_pod_netns`]。`NetworkPlugin` 経由で作って結線した netns。#2675・NET-1）は
@@ -507,7 +507,7 @@ struct NamespaceOut<'a> {
 /// - 保持役は Create から Start の間生きている必要がある。pid の再利用の窓は core が start で 1 回だけ開いて
 ///   fd に固定し、所有者・親子・種別を照合して閉じる。cri の検査は形式だけの二次防御で、認可の正は core
 ///
-/// 供給元（保持役）は未実装のため、`CriRuntimeService` は当面 `None` を渡す。
+/// `CriRuntimeService` は保持役の provider を注入したときだけ、自 sandbox の記録の pid から作った値を渡す（#2876）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PodNamespacePaths {
     user: String,

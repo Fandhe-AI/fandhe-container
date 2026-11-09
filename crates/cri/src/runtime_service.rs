@@ -33,7 +33,7 @@
 //! pod の namespace の保持役は [`CriRuntimeService::with_pod_holder`] で `PodNamespaceHolderProvider` を注入したときだけ、
 //! `RunPodSandbox` が write-ahead の後に起動し（失敗・期限超過で資源が無ければ登録しない）、Stop・Remove が冪等に解放する。
 //! 死んだ保持役の sandbox は Status・List で `SANDBOX_NOTREADY`、`CreateContainer` は `FAILED_PRECONDITION`（#2871・CRI-2・REPAIR-5）。
-//! 本番の provider は plugin-cri の `ProductionPodHolder`（H6〔#2877〕。Linux・非 root の本番構成で注入）。bundle への配線（H5〔#2876〕）は未実装（REPAIR-3）。pid はメモリ上のみで記録ファイルへ書かない（R11〔#2940〕）。
+//! bundle への配線は済み（H5〔#2876〕。provider を注入したときだけ、ipc が `POD` のコンテナは保持役の user＋ipc へ join する）。本番の provider は plugin-cri の `ProductionPodHolder`（H6〔#2877〕。Linux・非 root の本番構成で注入）。netns のパス（H8〔#2878〕）は未実装（REPAIR-3）。pid はメモリ上のみで記録ファイルへ書かない（R11〔#2940〕）。
 //! bundle の生成（config 変換・bundle ディレクトリの寿命・image 展開の `ImageRootfsSource`）は `crate::bundle`（#2395・#2433）で、
 //! plugin-cri への結線は #2433 で済み、core の本番 launcher との結線は TASK-114、一連の結合試験は TASK-59.4 で扱う。Start 後に中断・確定失敗した場合は、
 //! 実行層が running の可能性があるため記録を unknown にして再 Start を拒否する（fail-closed）。
@@ -436,6 +436,9 @@ struct ReservedContainer {
     provider_sandbox_config: Option<PodSandboxConfig>,
     /// 所属サンドボックスの結線済み pod netns のパス（`in_flight` 登録のときだけ。#2675）。
     provider_pod_netns: Option<std::path::PathBuf>,
+    /// 所属サンドボックスの記録の保持役の pid から `PodNamespacePaths::for_holder_pid` で作った user＋ipc のパス
+    /// （`in_flight` 登録かつ保持役があるときだけ `Some`）。CRI リクエストの値からは作らない（#2876・#2776・SEC-5）。
+    provider_pod_namespaces: Option<crate::bundle::PodNamespacePaths>,
 }
 
 /// 実行層を呼び出し中の操作の種類（[`InFlightGuard`] が巻き戻しの方法を選ぶ）。
@@ -1949,11 +1952,10 @@ impl CriRuntimeService {
     /// pod の namespace の保持役の注入点を差す（#2871・CRI-2・CORE-3・REPAIR-5。設計は `docs/design/pod-namespace-holder.md`）。
     ///
     /// 呼ばなければ従来どおり保持役に触れない。差すと、`namespace_options` によらずすべての `RunPodSandbox` が
-    /// 保持役を起動し（どの namespace が保持役を使うかは H5〔#2876〕・H8〔#2878〕が決める）、Stop・Remove が解放する。
+    /// 保持役を起動し（ipc は H5〔#2876〕で配線済み、netns は H8〔#2878〕）、Stop・Remove が解放する。
     /// 起動の失敗・期限超過では sandbox を登録しない。保持役が死んだ sandbox は Status・List で `SANDBOX_NOTREADY`、
     /// `CreateContainer` は `FAILED_PRECONDITION` になる。`Status` RPC（Runtime/NetworkReady）には影響させない。
-    /// plugin-cri が Linux・非 root の本番構成で本番の provider を差す（H6・#2877）。namespace のパスを bundle へ渡す配線は
-    /// H5（#2876）が担う（それまでコンテナは保持役の namespace に join しない。REPAIR-3）。
+    /// plugin-cri が Linux・非 root の本番構成で本番の provider を差す（H6・#2877）。bundle への配線は H5〔#2876〕で済み。
     pub fn with_pod_holder(mut self, provider: Arc<dyn PodNamespaceHolderProvider>) -> Self {
         self.pod_holder = Some(provider);
         self
@@ -3205,6 +3207,26 @@ impl CriRuntimeService {
         let provider_pod_netns = in_flight
             .then(|| sandbox.pod_netns.as_ref().map(|n| n.path().to_path_buf()))
             .flatten();
+        // 自 sandbox の記録の保持役の pid だけからパスを作る（ロック下・文字列の組み立てのみ。#2876・SEC-5）。
+        // provider を注入したのに保持役が無い Ready の記録は、黙って新しい namespace に降格せず拒否する（fail-closed）。
+        let provider_pod_namespaces = if in_flight {
+            match (&sandbox.pod_holder, self.pod_holder.is_some()) {
+                (Some(h), _) => Some(crate::bundle::PodNamespacePaths::for_holder_pid(h.pid())?),
+                (None, true) => {
+                    return Err(CriError::failed_precondition(
+                        "sandbox holder is unavailable",
+                    ));
+                }
+                (None, false) => None,
+            }
+        } else {
+            None
+        };
+        if in_flight && self.pod_holder.is_some() && !sandbox.holder_owned {
+            return Err(CriError::failed_precondition(
+                "sandbox holder is unavailable",
+            ));
+        }
         let sandbox_id = key.0.clone();
         registry.containers.insert(
             container_id.clone(),
@@ -3237,6 +3259,7 @@ impl CriRuntimeService {
             provider_config,
             provider_sandbox_config,
             provider_pod_netns,
+            provider_pod_namespaces,
         })
     }
 
@@ -3259,6 +3282,7 @@ impl CriRuntimeService {
             .provider_sandbox_config
             .ok_or_else(|| CriError::internal("sandbox config is unavailable"))?;
         let pod_netns = reserved.provider_pod_netns;
+        let pod_namespaces = reserved.provider_pod_namespaces;
         // bundle の用意・create・確定・巻き戻し・bundle の解放はすべて worker が所有する。RPC の future が
         // 中断・タイムアウトしても、実行層が処理中の間に記録・件数枠・bundle だけが解放されることはない。
         let mut guard = InFlightGuard::new(
@@ -3299,14 +3323,15 @@ impl CriRuntimeService {
                 if settlement.is_abandoned() {
                     return Err(CriError::timeout(RUNTIME_OPERATION_TIMED_OUT));
                 }
-                // pod の ipc 共有（BundleRequest::with_pod_namespaces）は pod の保持役が未実装のため当面渡さない
-                // （常に新しい namespace。CRI-2・CORE-3。#2674 の後続 issue で保持役とともに結線する）。
-                // 結線するときは sandbox の記録の保持役の pid から PodNamespacePaths::for_holder_pid で作る（#2776）。
-                let bundle = bundles.prepare(
-                    &BundleRequest::new(&id, &sandbox_id, &sandbox_config, &config)
-                        .with_pod_netns_path(pod_netns.as_deref())
-                        .with_cancel(&cancel),
-                )?;
+                // パスは reserve_container がロック下で自 sandbox の記録の保持役の pid から作った値だけを渡す
+                // （リクエストの値からは作らない。#2876・#2776・SEC-5）。pid の再利用の窓は core が start で fd に固定して閉じる。
+                let mut request = BundleRequest::new(&id, &sandbox_id, &sandbox_config, &config)
+                    .with_pod_netns_path(pod_netns.as_deref())
+                    .with_cancel(&cancel);
+                if let Some(p) = pod_namespaces.as_ref() {
+                    request = request.with_pod_namespaces(p);
+                }
+                let bundle = bundles.prepare(&request)?;
                 // 実行層へ渡す前に、報告された識別情報と解決済みの stop signal を記録へ反映する。保持量の上限を
                 // 超えたらここで失敗し、guard が bundle の解放と記録の巻き戻しを行う（#2771）。
                 attach_prepared(&registry, &id, &bundle, max_retained_bytes)?;
@@ -5444,6 +5469,81 @@ mod tests {
             );
             assert_eq!(svc.registry.lock().unwrap().containers.len(), 0);
         }
+    }
+
+    /// 常に Alive を返す試験用の保持役 provider（記録は試験が直接書く）。
+    struct AliveHolder;
+
+    impl PodNamespaceHolderProvider for AliveHolder {
+        fn spawn(&self, _: &crate::adapter::PodHolderRequest<'_>) -> Result<PodHolder, CriError> {
+            Err(CriError::internal("unused"))
+        }
+        fn release(&self, _: &str, _: Duration) -> Result<(), CriError> {
+            Ok(())
+        }
+        fn liveness(&self, _: &str) -> Result<crate::adapter::PodHolderLiveness, CriError> {
+            Ok(crate::adapter::PodHolderLiveness::Alive)
+        }
+    }
+
+    fn create_req_for(sandbox: &str, name: &str) -> v1::CreateContainerRequest {
+        v1::CreateContainerRequest {
+            pod_sandbox_id: sandbox.into(),
+            config: Some(container_config(name, 0)),
+            sandbox_config: None,
+        }
+    }
+
+    /// CRI-2・SEC-5・#2876: `reserve_container` が返すパスは、所属 sandbox の記録の pid だけから作られる。
+    #[test]
+    fn sec5_reserve_uses_the_record_pid_of_its_own_sandbox() {
+        let mut svc = CriRuntimeService::new();
+        let a = run(&svc, Some(config("a")), "")
+            .unwrap()
+            .into_inner()
+            .pod_sandbox_id;
+        let b = run(&svc, Some(config("b")), "")
+            .unwrap()
+            .into_inner()
+            .pod_sandbox_id;
+        svc.pod_holder = Some(Arc::new(AliveHolder));
+        for (id, pid) in [(&a, 111u32), (&b, 222u32)] {
+            let mut reg = svc.registry.lock().unwrap();
+            let rec = reg.records.get_mut(id).unwrap();
+            rec.pod_holder = Some(PodHolder::new(pid.try_into().unwrap()));
+            rec.holder_owned = true;
+        }
+        let ra = svc
+            .reserve_container(create_req_for(&a, "ca"), true)
+            .unwrap();
+        let rb = svc
+            .reserve_container(create_req_for(&b, "cb"), true)
+            .unwrap();
+        let pa = ra.provider_pod_namespaces.unwrap();
+        let pb = rb.provider_pod_namespaces.unwrap();
+        assert_eq!(pa.user(), "/proc/111/ns/user");
+        assert_eq!(pa.ipc(), "/proc/111/ns/ipc");
+        assert_eq!(pb.user(), "/proc/222/ns/user");
+        assert_eq!(pb.ipc(), "/proc/222/ns/ipc");
+    }
+
+    /// CRI-2・REPAIR-3・#2876: provider を注入したのに保持役の無い Ready の記録は、黙って降格せず拒否する。
+    #[test]
+    fn cri2_ready_record_without_holder_is_rejected_when_provider_is_injected() {
+        let mut svc = CriRuntimeService::new();
+        let a = run(&svc, Some(config("a")), "")
+            .unwrap()
+            .into_inner()
+            .pod_sandbox_id;
+        svc.pod_holder = Some(Arc::new(AliveHolder));
+        let bytes_before = svc.container_retained_bytes();
+        let err = svc
+            .reserve_container(create_req_for(&a, "c"), true)
+            .err()
+            .unwrap();
+        assert_eq!(err.code(), CriErrorCode::FailedPrecondition);
+        assert_eq!(svc.container_count(), 0);
+        assert_eq!(svc.container_retained_bytes(), bytes_before);
     }
 
     fn run(

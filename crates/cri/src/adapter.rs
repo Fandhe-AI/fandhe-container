@@ -255,7 +255,7 @@ pub struct BundleRequest<'a> {
     /// `path` として出す（#2675・CRI-2・NET-1）。
     pub pod_netns_path: Option<&'a Path>,
     /// pod の保持役が作った user・ipc namespace のパス（CRI-2・CORE-3。#2674）。`Some` で ipc が `POD` のとき
-    /// だけ ipc を join にする。供給元（保持役）は未実装のため、`CriRuntimeService` は当面 `None` を渡す。
+    /// だけ ipc を join にする。`CriRuntimeService` は保持役の provider を注入したときだけ、自 sandbox の記録の pid から作った値を渡す（#2876）。
     /// パスは sandbox の記録の保持役の pid から `crate::bundle::PodNamespacePaths::for_holder_pid` で作る（#2776）。
     pub pod_namespaces: Option<&'a crate::bundle::PodNamespacePaths>,
     /// 立ったら rootfs の用意（レイヤー展開）をエントリ単位で打ち切る取り消しの旗（REPAIR-5・CRI-2・#2899）。
@@ -470,8 +470,8 @@ impl PodNetns {
 ///
 /// 実装は `/proc`・pidfd・シグナルを扱うため cri には置かない（cri は 3 OS でビルドされる。CRI-7）。
 /// **未実装・簡易実装（REPAIR-3）**: 本番の実装（supervisor の `pod-holder` モードを exec する provider）は plugin-cri の
-/// `ProductionPodHolder`（H6・#2877。Linux・非 root の本番構成で注入）、pid から namespace のパスを作って bundle へ渡す配線は
-/// H5（#2876）が担う。本 trait は
+/// `ProductionPodHolder`（H6・#2877。Linux・非 root の本番構成で注入）。pid から namespace のパスを作って bundle へ渡す配線は
+/// H5（#2876）で `CriRuntimeService` に実装済み。本 trait は
 /// 注入点と sandbox 記録への pid の保持（メモリ上のみ。記録ファイルへの永続化は R11〔#2940〕）だけを定める。
 /// エラー文言に config の値・パス・pid を含めないこと。
 pub trait PodNamespaceHolderProvider: Send + Sync {
@@ -529,7 +529,7 @@ impl PodHolder {
         Self { pid }
     }
 
-    /// 保持役の pid（`/proc/<pid>/ns/*` の入力。パスへの変換は H5 が担う）。
+    /// 保持役の pid（`/proc/<pid>/ns/*` の入力。パスへの変換は `CriRuntimeService` が H5〔#2876〕で行う）。
     pub fn pid(&self) -> std::num::NonZeroU32 {
         self.pid
     }

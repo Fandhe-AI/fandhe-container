@@ -2,7 +2,7 @@
 //!
 //! 呼び出し元: `telemetry::OpStatsFileSink`（#4337）の専用 thread が [`SnapshotTarget::replace`] を呼ぶ
 //! （本部品は同期 I/O のため RPC 経路から直接呼ばない。REPAIR-5）。`main.rs` へは `--op-stats-file` として結線済み
-//! （起動引数の解析は W2・#4336、起動時の [`SnapshotTarget::check_target`] と停止時の最後の書き出しは W4・#4340。設計書の更新は W5・#4341）。契約の出典は
+//! （起動引数の解析は W2・#4336、起動時の [`SnapshotTarget::check_target`] と停止時の最後の書き出しは W4・#4340）。契約の出典は
 //! `docs/design/cri-op-stats-export.md`（案 C。opt-in の絶対パスへ原子的に置き換えるスナップショット）。
 //!
 //! # 契約

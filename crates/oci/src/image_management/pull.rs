@@ -74,7 +74,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::root_handle::{self, BlobDir, PullDir, RootHandle};
+use super::root_handle::{self, BlobDir, PullDir, RootHandle, SubDir, SubDirError};
 use super::tag::ImageTagChange;
 use super::usage::blob_path;
 use super::{ImageStore, MAX_COMPOSITION_LAYERS, ManifestComposition, PullId, TagKey};
@@ -193,15 +193,16 @@ impl UnpackDir {
         self.inner.unlink(name)
     }
 
-    /// 直下の `name` を `dest_dir` 直下の `dest_name` へ移す（公開）。`dest_dir` は `O_NOFOLLOW` で開き、
+    /// 直下の `name` を、開いた公開先 `dest` 直下の `dest_name` へ移す（公開。#4283）。`dest` は
+    /// [`PullSession::ensure_published_rootfs_dir`] が検査済み root の fd 起点で開いたもので、パスで開き直さない。
     /// 宛先が空でない既存ディレクトリなら失敗する（原子的な `renameat`）。
     pub fn rename_child_into(
         &self,
         name: &str,
-        dest_dir: &Path,
+        dest: &PublishedRootfsDir,
         dest_name: &str,
     ) -> std::io::Result<()> {
-        self.inner.rename_child_into(name, dest_dir, dest_name)
+        self.inner.rename_child_into(name, &dest.sha256, dest_name)
     }
 
     /// 展開器（`layer::extract::extract_image_layers_bounded_in`）へ渡す根。
@@ -212,6 +213,215 @@ impl UnpackDir {
                 "failed to prepare the extraction root",
             )
         })
+    }
+}
+
+/// 公開済み rootfs の置き場 `<root>/rootfs/sha256` を、検査済み root の fd 起点で開いたもの
+/// （OCI-7・SEC-1・CRI-3・#4283）。
+///
+/// 作れるのは [`PullSession::ensure_published_rootfs_dir`]（pull。無ければ 0700 で作る）と
+/// [`ImageStore::open_published_rootfs_dir`]（create。作らない）だけ。エントリの有無の確認・読み取り・公開の `renameat` は
+/// この fd 起点で行い、キャッシュの祖先が検査後におとりの symlink へ差し替えられても届かない（Linux x86_64 / aarch64。
+/// それ以外の unix はパス起点で、入口の再検査に頼る。Windows は #4181）。名前は検証済みの [`Digest`] の hex と
+/// 呼び出し側の固定の定数だけを受ける。
+#[derive(Debug)]
+pub struct PublishedRootfsDir {
+    /// `<root>/rootfs`。
+    rootfs: SubDir,
+    /// `<root>/rootfs/sha256`。
+    sha256: SubDir,
+}
+
+/// 開いた `<root>/rootfs`（配下の `sha256` を作る前に信頼条件を確かめるための中間値。#4283）。
+#[derive(Debug)]
+pub struct PublishedRootfsParent {
+    rootfs: SubDir,
+}
+
+impl PublishedRootfsParent {
+    /// `<root>/rootfs` 自身のメタデータ（開いた fd の fstat）。
+    pub fn metadata(&self) -> Result<std::fs::Metadata, OciError> {
+        self.rootfs.meta().map_err(stat_err)
+    }
+
+    /// 直下の `sha256` を（無ければ 0700 で）作って開く。
+    pub fn ensure_sha256(self) -> Result<PublishedRootfsDir, OciError> {
+        let sha256 = self.rootfs.ensure_subdir("sha256")?;
+        Ok(PublishedRootfsDir {
+            rootfs: self.rootfs,
+            sha256,
+        })
+    }
+}
+
+/// 公開済み rootfs の 1 エントリ `<root>/rootfs/sha256/<hex>`（[`PublishedRootfsDir::open_entry`] が開く）。
+#[derive(Debug)]
+pub struct PublishedRootfsEntry {
+    dir: SubDir,
+}
+
+fn subdir_err(e: SubDirError) -> OciError {
+    match e {
+        SubDirError::NotPlain => err(
+            OciErrorCode::FailedPrecondition,
+            "published rootfs directory is not a plain directory",
+        ),
+        SubDirError::Io => err(
+            OciErrorCode::Internal,
+            "failed to open the published rootfs directory",
+        ),
+    }
+}
+
+fn stat_err(_: std::io::Error) -> OciError {
+    err(
+        OciErrorCode::Internal,
+        "failed to inspect the published rootfs directory",
+    )
+}
+
+impl PublishedRootfsDir {
+    /// `<root>/rootfs/sha256` 自身のメタデータ（開いた fd の fstat）。
+    pub fn metadata(&self) -> Result<std::fs::Metadata, OciError> {
+        self.sha256.meta().map_err(stat_err)
+    }
+
+    /// `<root>/rootfs` 自身のメタデータ（開いた fd の fstat）。
+    pub fn parent_metadata(&self) -> Result<std::fs::Metadata, OciError> {
+        self.rootfs.meta().map_err(stat_err)
+    }
+
+    /// 直下のエントリ（`<hex>`）を開く。無ければ `None`、symlink・非ディレクトリは `FailedPrecondition`。
+    pub fn open_entry(&self, digest: &Digest) -> Result<Option<PublishedRootfsEntry>, OciError> {
+        let hex = hex_of(digest)?;
+        self.sha256
+            .open_subdir(hex)
+            .map(|o| o.map(|dir| PublishedRootfsEntry { dir }))
+            .map_err(subdir_err)
+    }
+
+    /// `p`（パスで辿った `<root>/rootfs/sha256`）が、開いたこの置き場と同じ実体か（dev / ino の照合）。
+    /// 公開の前に呼び、祖先の差し替えを成功に見せない検出器として使う。パス起点の実装は常に真。
+    pub fn matches_path(&self, p: &Path) -> bool {
+        self.sha256.matches_path(p)
+    }
+}
+
+impl PublishedRootfsEntry {
+    /// エントリ自身のメタデータ（開いた fd の fstat）。
+    pub fn metadata(&self) -> Result<std::fs::Metadata, OciError> {
+        self.dir.meta().map_err(stat_err)
+    }
+
+    /// 直下の `name`（固定の定数）のメタデータ（symlink は辿らない）。無ければ `None`。
+    pub fn stat(&self, name: &str) -> Result<Option<std::fs::Metadata>, OciError> {
+        self.dir.stat(name).map_err(|e| {
+            // symlink・非ディレクトリへの差し替えは「信頼できない」（Internal にしない）。
+            if e.kind() == std::io::ErrorKind::InvalidInput {
+                err(
+                    OciErrorCode::FailedPrecondition,
+                    "published rootfs directory is not a plain directory",
+                )
+            } else {
+                stat_err(e)
+            }
+        })
+    }
+
+    /// 直下の通常ファイル `name`（固定の定数）を、symlink を辿らず非ブロッキングで開く。
+    /// 無い・symlink・通常ファイルでないものは `None`。信頼条件の確認は呼び出し側が同じハンドルで行う。
+    pub fn open_file(&self, name: &str) -> Result<Option<File>, OciError> {
+        self.dir.open_file(name)
+    }
+}
+
+impl ImageStore {
+    /// 公開済み rootfs の置き場を、検査済み root の fd 起点で開く。作らない（create 経路用。#4283）。
+    ///
+    /// `rootfs` か `rootfs/sha256` が無ければ `None`。symlink・非ディレクトリは `FailedPrecondition`。
+    pub fn open_published_rootfs_dir(&self) -> Result<Option<PublishedRootfsDir>, OciError> {
+        let h = self.handle();
+        let Some(rootfs) = h.open_subdir("rootfs").map_err(subdir_err)? else {
+            return Ok(None);
+        };
+        let Some(sha256) = rootfs.open_subdir("sha256").map_err(subdir_err)? else {
+            return Ok(None);
+        };
+        Ok(Some(PublishedRootfsDir { rootfs, sha256 }))
+    }
+
+    /// `blobs` と `blobs/sha256` 自身のメタデータ（開いた fd の fstat。この順）を返す。どちらかが無ければ `None`、
+    /// symlink・非ディレクトリは `FailedPrecondition`（create 経路が従来と同じ信頼条件を課すための入口。#4283）。
+    pub fn cached_blob_dir_metadata(&self) -> Result<Option<[std::fs::Metadata; 2]>, OciError> {
+        let h = self.handle();
+        let Some(blobs) = h.open_subdir("blobs").map_err(subdir_err)? else {
+            return Ok(None);
+        };
+        let Some(sha256) = blobs.open_subdir("sha256").map_err(subdir_err)? else {
+            return Ok(None);
+        };
+        Ok(Some([
+            blobs.meta().map_err(stat_err)?,
+            sha256.meta().map_err(stat_err)?,
+        ]))
+    }
+
+    /// キャッシュ済みの blob（`blobs/sha256/<hex>`）を、検査済み root の fd 起点で読み取り専用に開く（create 経路用。
+    /// OCI-7・SEC-1・CRI-3・#4283）。
+    ///
+    /// リースは要らない（pull のセッションを持たない読み取り専用の口）。[`PullSession::open_leased_blob`] と同じく、
+    /// 呼ぶたびに root の fd から `blobs/sha256` を開き直して `openat2`（`NO_SYMLINKS`・`O_NOFOLLOW`）で開く。返したハンドルは
+    /// 未検証で、信頼条件・digest・サイズの確認は呼び出し側が同じハンドルで行う（OCI-1）。無ければ `NotFound`、
+    /// 通常ファイルでなければ `FailedPrecondition`。Linux x86_64 / aarch64 以外の unix はパス起点、非 unix は
+    /// `Unimplemented`（#4181）。
+    pub fn open_cached_blob(&self, digest: &Digest) -> Result<File, OciError> {
+        open_blob_readonly(self, hex_of(digest)?)
+    }
+
+    /// 検査済み root の所有 uid（開いた fd の fstat。`ImageStore::open` が実効 uid との一致を検査済み。#4283）。
+    pub fn root_owner(&self) -> Result<u32, OciError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            self.handle()
+                .root_meta()
+                .map(|m| m.uid())
+                .map_err(|_| err(OciErrorCode::Internal, "failed to inspect image store root"))
+        }
+        #[cfg(not(unix))]
+        {
+            Err(err(
+                OciErrorCode::Unimplemented,
+                "image store owner is not available on this platform",
+            ))
+        }
+    }
+}
+
+/// `blobs/sha256/<hex>` を root の fd 起点で読み取りで開く（[`PullSession::open_leased_blob`] と
+/// [`ImageStore::open_cached_blob`] の共通部）。
+fn open_blob_readonly(store: &ImageStore, hex: &str) -> Result<File, OciError> {
+    #[cfg(unix)]
+    {
+        let Some(bd) = store.handle().open_blob_dir()? else {
+            return Err(err(OciErrorCode::NotFound, "cached blob not found"));
+        };
+        bd.open_nofollow(hex).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => err(OciErrorCode::NotFound, "cached blob not found"),
+            std::io::ErrorKind::InvalidInput => err(
+                OciErrorCode::FailedPrecondition,
+                "cached blob is not a regular file",
+            ),
+            _ => io_err(&e, "failed to open cached blob"),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (store, hex);
+        Err(err(
+            OciErrorCode::Unimplemented,
+            "symlink-safe blob open is not supported on this platform",
+        ))
     }
 }
 
@@ -879,6 +1089,22 @@ impl PullSession<'_> {
         }
     }
 
+    /// 公開済み rootfs の置き場 `<root>/rootfs/sha256` を、検査済み root の fd 起点で（無ければ 0700 で）作って開く
+    /// （pull の公開先。OCI-7・SEC-1・CRI-3・#4283）。
+    ///
+    /// 作成も開き直しも root の fd から 1 要素ずつ（`mkdirat` → `O_NOFOLLOW`）行うため、キャッシュの祖先を差し替えても
+    /// おとりには届かない。既にあるものが symlink・非ディレクトリなら `FailedPrecondition`。
+    pub fn ensure_published_rootfs_dir(&self) -> Result<PublishedRootfsDir, OciError> {
+        self.ensure_published_rootfs_parent()?.ensure_sha256()
+    }
+
+    /// 公開済み rootfs の親 `<root>/rootfs` だけを（無ければ 0700 で）作って開く。呼び出し側が [`PublishedRootfsParent::metadata`]
+    /// で所有者・権限を確かめてから [`PublishedRootfsParent::ensure_sha256`] を呼ぶ（検証前に配下を作らない。#4283）。
+    pub fn ensure_published_rootfs_parent(&self) -> Result<PublishedRootfsParent, OciError> {
+        let rootfs = self.store.handle().ensure_subdir("rootfs")?;
+        Ok(PublishedRootfsParent { rootfs })
+    }
+
     /// [`PullSession::lease_existing_blob`] でリース済みの既存 blob（`blobs/sha256/<hex>`）を、検査済み root の fd 起点で
     /// 開いて返す（OCI-7・SEC-1・CRI-3・#4179）。
     ///
@@ -902,30 +1128,7 @@ impl PullSession<'_> {
                 "blob is not leased by this pull",
             ));
         }
-        #[cfg(unix)]
-        {
-            let Some(bd) = self.store.handle().open_blob_dir()? else {
-                return Err(err(OciErrorCode::NotFound, "cached blob not found"));
-            };
-            bd.open_nofollow(hex).map_err(|e| match e.kind() {
-                std::io::ErrorKind::NotFound => {
-                    err(OciErrorCode::NotFound, "cached blob not found")
-                }
-                std::io::ErrorKind::InvalidInput => err(
-                    OciErrorCode::FailedPrecondition,
-                    "cached blob is not a regular file",
-                ),
-                _ => io_err(&e, "failed to open cached blob"),
-            })
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = hex;
-            Err(err(
-                OciErrorCode::Unimplemented,
-                "symlink-safe blob open is not supported on this platform",
-            ))
-        }
+        open_blob_readonly(self.store, hex)
     }
 
     /// ステージング済みの blob の sha256 を検証し、成功したらこのセッションの「公開できる」集合へ入れる。

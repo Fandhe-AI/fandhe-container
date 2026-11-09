@@ -966,12 +966,17 @@ fn oci7_sec1_unpack_dir_zero_layers_and_publish_rename() {
         .expect("zero layers")
         .is_empty()
     );
-    let dest = root.join("dest");
-    fs::create_dir(&dest).expect("dest");
+    let dest = s.ensure_published_rootfs_dir().expect("dest");
     unpack
         .rename_child_into("entry", &dest, "abc")
         .expect("publish");
-    assert!(dest.join("abc").join("rootfs").is_dir());
+    assert!(
+        root.join("rootfs")
+            .join("sha256")
+            .join("abc")
+            .join("rootfs")
+            .is_dir()
+    );
     assert!(
         !root
             .join("staging")
@@ -983,4 +988,131 @@ fn oci7_sec1_unpack_dir_zero_layers_and_publish_rename() {
     s.remove_unpack_dir().expect("remove");
     drop(s);
     let _ = fs::remove_dir_all(&root);
+}
+
+/// OCI-7・SEC-1・CRI-3・#4283: `ImageStore::open` の後に root が別名へ移されて同名のおとりが置かれても、
+/// `open_cached_blob` は検査済みの root の blob を返し、おとりは読まれず無傷である。
+#[test]
+fn oci7_sec1_open_cached_blob_reads_checked_root_after_root_swap() {
+    use std::io::Read as _;
+    let root = temp_root("cb-root");
+    let moved = root.with_extension("moved");
+    let store = open_store(&root);
+    let data = b"cached";
+    let dg = sha_of(data);
+    let hex = dg.to_string().replace("sha256:", "");
+    let dir = root.join("blobs").join("sha256");
+    fs::create_dir_all(&dir).expect("blob dir");
+    fs::write(dir.join(&hex), data).expect("blob");
+    swap_root(&root, &moved);
+    let decoy_dir = root.join("blobs").join("sha256");
+    fs::create_dir_all(&decoy_dir).expect("decoy dir");
+    fs::write(decoy_dir.join(&hex), b"decoy!").expect("decoy blob");
+    let mut body = Vec::new();
+    store
+        .open_cached_blob(&dg)
+        .expect("open")
+        .read_to_end(&mut body)
+        .expect("read");
+    assert_eq!(body, b"cached");
+    assert_eq!(fs::read(decoy_dir.join(&hex)).expect("intact"), b"decoy!");
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&moved);
+}
+
+/// OCI-7・SEC-1・CRI-3・#4283: `blobs/sha256` が symlink に差し替わると `open_cached_blob` は辿らず
+/// `FailedPrecondition` で拒否し、外側のファイルは無傷である。無い blob は `NotFound`。
+#[test]
+fn oci7_sec1_open_cached_blob_rejects_swapped_blob_dir() {
+    use std::os::unix::fs::symlink;
+    let root = temp_root("cb-link");
+    let outside = temp_root("cb-link-out");
+    let store = open_store(&root);
+    let dg = sha_of(b"cached");
+    let hex = dg.to_string().replace("sha256:", "");
+    assert_eq!(
+        store.open_cached_blob(&dg).expect_err("absent").code(),
+        OciErrorCode::NotFound
+    );
+    fs::create_dir_all(root.join("blobs")).expect("blobs");
+    fs::create_dir_all(outside.join("sha256")).expect("out");
+    fs::write(outside.join("sha256").join(&hex), b"outside").expect("blob");
+    symlink(&outside, root.join("blobs").join("sha256")).expect("link");
+    assert_eq!(
+        store.open_cached_blob(&dg).expect_err("symlink").code(),
+        OciErrorCode::FailedPrecondition
+    );
+    assert_eq!(
+        fs::read(outside.join("sha256").join(&hex)).expect("intact"),
+        b"outside"
+    );
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&outside);
+}
+
+/// OCI-7・SEC-1・CRI-3・#4283: 公開先を開いたあとに `rootfs` が別名へ移されておとりの symlink に差し替わっても、
+/// 公開（`rename_child_into`）は検査済みの実体（移動先の本物の `sha256/<hex>`）へ届き、おとりの `sha256` は空のまま。
+/// パスとの照合（`matches_path`）は差し替えを検出する。
+#[test]
+fn oci7_sec1_publish_rootfs_entry_lands_in_checked_root() {
+    use std::os::unix::fs::symlink;
+    let root = temp_root("pub-root");
+    let store = open_store(&root);
+    let s = store.begin_pull(pid("p1")).expect("begin");
+    let dest = s.ensure_published_rootfs_dir().expect("dest");
+    assert!(dest.matches_path(&root.join("rootfs").join("sha256")));
+    let unpack = s.create_unpack_dir().expect("unpack");
+    unpack.create_subdir("entry").expect("entry");
+    let real = root.join("rootfs-real");
+    fs::rename(root.join("rootfs"), &real).expect("move rootfs");
+    let decoy = root.join("decoy");
+    fs::create_dir_all(decoy.join("sha256")).expect("decoy");
+    symlink(&decoy, root.join("rootfs")).expect("link");
+    assert!(!dest.matches_path(&root.join("rootfs").join("sha256")));
+    unpack
+        .rename_child_into("entry", &dest, "abc")
+        .expect("publish");
+    assert!(real.join("sha256").join("abc").is_dir());
+    assert_eq!(names(&decoy.join("sha256")), Vec::<String>::new());
+    s.remove_unpack_dir().expect("remove");
+    drop(s);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// OCI-7・SEC-1・#4283: `open_published_rootfs_dir` は作らず、無ければ `None`。symlink は `FailedPrecondition`。
+/// `ensure_published_rootfs_dir` は 0700 で作り、既存の symlink は拒否する。
+#[test]
+fn oci7_sec1_published_rootfs_dir_open_and_ensure() {
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+    let root = temp_root("pub-open");
+    let store = open_store(&root);
+    assert!(store.open_published_rootfs_dir().expect("none").is_none());
+    assert!(!root.join("rootfs").exists());
+    let s = store.begin_pull(pid("p1")).expect("begin");
+    s.ensure_published_rootfs_dir().expect("ensure");
+    let mode = fs::metadata(root.join("rootfs").join("sha256"))
+        .expect("meta")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o700);
+    let dir = store
+        .open_published_rootfs_dir()
+        .expect("open")
+        .expect("some");
+    assert!(dir.open_entry(&d(1)).expect("entry").is_none());
+    s.ensure_published_rootfs_dir().expect("idempotent");
+    drop(s);
+    fs::remove_dir_all(root.join("rootfs")).expect("rm");
+    let outside = temp_root("pub-open-out");
+    symlink(&outside, root.join("rootfs")).expect("link");
+    assert_eq!(
+        store
+            .open_published_rootfs_dir()
+            .expect_err("symlink")
+            .code(),
+        OciErrorCode::FailedPrecondition
+    );
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&outside);
 }

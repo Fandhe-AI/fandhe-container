@@ -423,6 +423,47 @@ mod imp {
         }
     }
 
+    /// `dirfd` 直下に 0700 でディレクトリを（無ければ）作って開く。既存が symlink・非ディレクトリなら
+    /// `FailedPrecondition`。並行する別の作成者に先を越された（`EEXIST`）場合は作られたものを開き直して検査する
+    /// （`ensure_blob_dirs` と同じ形。#4283）。
+    fn ensure_dir_at(dirfd: std::os::fd::BorrowedFd<'_>, name: &str) -> Result<SubDir, OciError> {
+        let n = at::component_cstring(OsStr::new(name)).map_err(|_| {
+            OciError::new(OciErrorCode::InvalidArgument, "directory name is invalid")
+        })?;
+        match at::mkdirat_name(dirfd, OsStr::new(name), 0o700) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(_) => {
+                return Err(OciError::new(
+                    OciErrorCode::Internal,
+                    "failed to create directory",
+                ));
+            }
+        }
+        match open_dir_at(dirfd, &n) {
+            Ok(Some(d)) => Ok(d),
+            Ok(None) => Err(OciError::new(
+                OciErrorCode::FailedPrecondition,
+                "directory is unavailable",
+            )),
+            Err(SubDirError::NotPlain) => Err(OciError::new(
+                OciErrorCode::FailedPrecondition,
+                "directory is not a plain directory",
+            )),
+            Err(SubDirError::Io) => Err(OciError::new(
+                OciErrorCode::Internal,
+                "failed to open directory",
+            )),
+        }
+    }
+
+    impl RootHandle {
+        /// 直下のサブディレクトリを（無ければ 0700 で）作って開く（root の fd 起点。#4283）。
+        pub(crate) fn ensure_subdir(&self, name: &str) -> Result<SubDir, OciError> {
+            ensure_dir_at(self.inner.as_fd(), name)
+        }
+    }
+
     /// 試験用: 指定した相対名（`@lock`・`blobs/sha256` 等）の `openat2` を `EXDEV` で失敗させる。
     ///
     /// root 配下の別マウント（bind mount・別ボリューム）が `RESOLVE_NO_XDEV` で拒否される状況を、
@@ -559,6 +600,11 @@ mod imp {
             ) {
                 Ok(fd) => File::from(fd).metadata().map(Some),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+                // 最終要素が symlink（`ELOOP`）なら辿らず `InvalidInput` にする（呼び出し側が「信頼できない」へ写す）。
+                Err(e) if matches!(errno(&e), Some(ELOOP | ENOTDIR)) => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "not a plain entry",
+                )),
                 Err(e) => Err(e),
             }
         }
@@ -570,6 +616,21 @@ mod imp {
         ) -> Result<Option<SubDir>, SubDirError> {
             let n = at::component_cstring(name.as_ref()).map_err(|_| SubDirError::Io)?;
             open_dir_at(self.0.as_fd(), &n)
+        }
+
+        /// 直下のサブディレクトリを（無ければ 0700 で）作って開く（#4283）。
+        pub(crate) fn ensure_subdir(&self, name: &str) -> Result<SubDir, OciError> {
+            ensure_dir_at(self.0.as_fd(), name)
+        }
+
+        /// このディレクトリ自身のメタデータ（開いた fd の fstat。パスの差し替えに影響されない）。
+        pub(crate) fn meta(&self) -> io::Result<Metadata> {
+            File::from(self.0.try_clone()?).metadata()
+        }
+
+        /// 公開の `renameat` の宛先に使うための fd（`UnpackDir::rename_child_into`。#4283）。
+        pub(super) fn as_dir_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+            self.0.as_fd()
         }
 
         /// 直下の名前を 1 件ずつ返す（`.` と `..` は除く）。呼ぶたびに新しい open file description を開く
@@ -877,6 +938,49 @@ mod imp {
         }
     }
 
+    /// `p` に 0700 でディレクトリを（無ければ）作って開く（パス起点。#4283）。
+    fn ensure_dir_path(p: PathBuf) -> Result<SubDir, OciError> {
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut b = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            b.mode(0o700);
+        }
+        match b.create(&p) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(_) => {
+                return Err(OciError::new(
+                    OciErrorCode::Internal,
+                    "failed to create directory",
+                ));
+            }
+        }
+        match open_dir_path(p) {
+            Ok(Some(d)) => Ok(d),
+            Ok(None) => Err(OciError::new(
+                OciErrorCode::FailedPrecondition,
+                "directory is unavailable",
+            )),
+            Err(SubDirError::NotPlain) => Err(OciError::new(
+                OciErrorCode::FailedPrecondition,
+                "directory is not a plain directory",
+            )),
+            Err(SubDirError::Io) => Err(OciError::new(
+                OciErrorCode::Internal,
+                "failed to open directory",
+            )),
+        }
+    }
+
+    impl RootHandle {
+        /// 直下のサブディレクトリを（無ければ 0700 で）作って開く（パス起点。#4283）。
+        pub(crate) fn ensure_subdir(&self, name: &str) -> Result<SubDir, OciError> {
+            ensure_dir_path(self.path.join(name))
+        }
+    }
+
     impl RootHandle {
         /// `blobs/sha256` を（無ければ 0700 で）用意して返す。symlink・非ディレクトリは拒否。
         pub(crate) fn ensure_blob_dirs(&self) -> Result<BlobDir, OciError> {
@@ -972,6 +1076,21 @@ mod imp {
             name: impl AsRef<OsStr>,
         ) -> Result<Option<SubDir>, SubDirError> {
             open_dir_path(self.0.join(name.as_ref()))
+        }
+
+        /// 直下のサブディレクトリを（無ければ 0700 で）作って開く（#4283）。
+        pub(crate) fn ensure_subdir(&self, name: &str) -> Result<SubDir, OciError> {
+            ensure_dir_path(self.0.join(name))
+        }
+
+        /// このディレクトリ自身のメタデータ（パスの lstat）。
+        pub(crate) fn meta(&self) -> io::Result<Metadata> {
+            fs::symlink_metadata(&self.0)
+        }
+
+        /// 公開の `rename` の宛先（パス起点。#4283）。
+        pub(super) fn dir_path(&self) -> &Path {
+            &self.0
         }
 
         /// 直下の名前を 1 件ずつ返す（`.` と `..` は除く）。
@@ -1078,7 +1197,6 @@ mod imp {
 }
 
 pub(crate) use imp::BlobDir;
-#[cfg(all(test, unix))]
 pub(crate) use imp::SubDir;
 #[cfg(all(
     test,

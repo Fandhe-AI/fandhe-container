@@ -982,6 +982,11 @@ pub fn extract_image_layers_with_options(
 /// 空の `budget` なら既存の入口と同一。`budget` はエントリ単位で確かめ、超過・取り消しなら `OciErrorCode::Timeout`。
 /// `Err` のときは先行の展開物が `root` に残りうるため、呼び出し側が `root` ごと破棄すること
 /// （cri の `ImageRootfsSource::prepare` は `remove_extracted_tree` で消す）。
+///
+/// 根を**パス**で受ける系列（`extract_image_layers` → `_with` → `_with_policy` → `_with_options` → 本関数）の本体で、
+/// 根を開き直す点だけが fd 版の [`extract_image_layers_bounded_in`] と違う。oci の試験と公開のパス起点の入口が使うため
+/// 残す。本番の cri（pull の `unpack/` と create の bundle `rootfs/`）は fd 版を使い、根を検査後にパスで開き直さない
+/// （#4180・#4283・OCI-7・SEC-1）。
 pub fn extract_image_layers_bounded(
     recorder: &dyn OciOpRecorder,
     layers: &[ImageLayer<'_>],

@@ -2314,3 +2314,53 @@ fn oci7_sec1_pull_rejects_swapped_pull_dir_and_decoy_stays_empty() {
             .unwrap_or(true)
     );
 }
+
+/// OCI-7・SEC-1・CRI-3・#4283: 展開の途中で公開先の `rootfs` が別名へ移されておとり（`sha256/` だけを持つ）への symlink に
+/// 差し替わると、pull は公開の前の照合で固定のエラー（`Internal`）として拒否する。おとりの `sha256` は空のまま、
+/// 移動先の本物の `sha256` にも公開されず、ステージングも残らない。旧実装（パス起点の公開）は差し替え後のおとりへ
+/// 公開して成功していた。Linux x86_64 / aarch64 だけで照合する。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[test]
+fn oci7_sec1_pull_rejects_swapped_rootfs_dir_and_decoy_stays_empty() {
+    let dir = TempDir::new("rootfsswap");
+    let cache = dir.0.join("cache");
+    let real = dir.0.join("cache-rootfs-real");
+    let decoy = dir.0.join("decoy-rootfs");
+    fs::create_dir_all(decoy.join("sha256")).expect("decoy dir");
+    let (c2, r2, d2) = (cache.clone(), real.clone(), decoy.clone());
+    let swapped = Arc::new(AtomicBool::new(false));
+    let s2 = Arc::clone(&swapped);
+    let probe = Arc::new(ExtractProbe {
+        extracted: AtomicUsize::new(0),
+        on_extract: Box::new(move || {
+            // 最初の層の展開の後に、公開先の `rootfs` を別名へ移しておとりの symlink を置く（1 回だけ）。
+            if !s2.swap(true, Ordering::SeqCst) {
+                fs::rename(c2.join("rootfs"), &r2).expect("move rootfs");
+                std::os::unix::fs::symlink(&d2, c2.join("rootfs")).expect("symlink");
+            }
+        }),
+    });
+    let err = OciImagePuller::new(
+        Arc::new(FakeClient::new(two_layer_manifest())),
+        config(&dir),
+    )
+    .with_recorder(probe)
+    .pull(&req("alpine:3.20"))
+    .expect_err("rejected");
+    assert_eq!(err.code(), OciErrorCode::Internal);
+    assert_eq!(
+        err.message(),
+        "image rootfs cache directory changed during the pull"
+    );
+    assert!(swapped.load(Ordering::SeqCst));
+    // おとりの `sha256` は空のまま。移動先の本物の `sha256` にも `<config-hex>` は公開されない。
+    assert_eq!(
+        fs::read_dir(decoy.join("sha256")).expect("decoy").count(),
+        0
+    );
+    assert_eq!(fs::read_dir(real.join("sha256")).expect("real").count(), 0);
+    assert!(staging_is_empty(&dir));
+}

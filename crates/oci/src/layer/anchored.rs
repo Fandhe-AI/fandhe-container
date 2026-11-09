@@ -30,6 +30,12 @@
 //! Linux 限定で `UnsupportedHost` に落ちるため、SEC-5 の TOCTOU は Linux 固有）。Linux の x86_64 / aarch64 以外は
 //! 定数と syscall 番号を確かめていないため、`open` が `Unimplemented` で拒否する。
 //!
+//! create 経路の bundle `rootfs/` も同じ入口で扱う（#4283）: `ExtractRoot::create_private_dir` が親だけをパスで開いて
+//! `mkdirat` → `openat2` で 0700 の根を作り、展開後の chmod（`set_mode`）・`proc` の作成（`ensure_child_dir`）・
+//! passwd / group の読み取り（`read_rootfs_file_in`）も同じ fd 起点で行う。`matches_path` は最後に根のパスが同じ実体か
+//! を照合する検出器。Linux 以外の unix はパス起点で、入口の再検査に頼る（本番の macOS は cli の `non_linux_failure` が
+//! ホストでの展開の前に fail-closed にする）。
+//!
 //! 展開の根を fd で受ける入口（#4180）: パスを受ける `extract_image_layers_bounded` とは別に、開いた fd を
 //! [`ExtractRoot`] で受ける `extract_image_layers_bounded_in` がある。cri の pull が `staging/<id>/unpack/entry/rootfs` を
 //! pull ディレクトリの fd 起点で作って渡す。この場合、変更操作は渡された fd を起点にし（`AnchoredRoot` を開き直さない）、
@@ -137,6 +143,89 @@ mod imp {
     impl ExtractRoot {
         pub(crate) fn from_fd(fd: OwnedFd) -> Self {
             Self { fd }
+        }
+
+        /// 親ディレクトリを信頼済みの接頭辞としてパスで 1 回だけ開き、直下に 0700 のディレクトリ `path` の最終要素を
+        /// 新規に作って fd で開く（`mkdirat` → `openat2`。既存は拒否）。create 経路の bundle `rootfs/` 用（OCI-7・SEC-1・
+        /// CRI-3・#4283）。以後の展開・chmod・`proc` の作成・passwd の読み取りは返した fd 起点で行い、作成の後に
+        /// 祖先が symlink へ差し替えられてもおとりには届かない。開けなければ作ったディレクトリを消す。
+        pub fn create_private_dir(path: &Path) -> Result<Self, OciError> {
+            let invalid = || {
+                err(
+                    OciErrorCode::InvalidArgument,
+                    "extraction root path is invalid",
+                )
+            };
+            let name = path.file_name().ok_or_else(invalid)?;
+            let parent = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .ok_or_else(invalid)?;
+            let name_c = at::component_cstring(name).map_err(|_| invalid())?;
+            let parent_c =
+                std::ffi::CString::new(parent.as_os_str().as_bytes()).map_err(|_| invalid())?;
+            let parent_fd =
+                at::openat2(None, &parent_c, DIR_FLAGS_RW, 0, 0).map_err(|e| {
+                    match e.raw_os_error() {
+                        Some(at::ENOSYS | at::E2BIG | at::EINVAL) => err(
+                            OciErrorCode::Unimplemented,
+                            "openat2 is not available on this kernel",
+                        ),
+                        Some(at::ELOOP | at::ENOTDIR) => path_changed(),
+                        _ => map_fs_err(&e),
+                    }
+                })?;
+            at::mkdirat_name(parent_fd.as_fd(), name, 0o700).map_err(|e| map_fs_err(&e))?;
+            match at::openat2(Some(parent_fd.as_fd()), &name_c, DIR_FLAGS_RW, 0, RESOLVE) {
+                Ok(fd) => Ok(Self { fd }),
+                Err(e) => {
+                    // 作った直後に開けなかった場合だけ、自分が作ったディレクトリを消す（失敗は元のエラーを隠さない）。
+                    let _ = at::unlinkat_name(parent_fd.as_fd(), name, true);
+                    Err(map_at_err(&e))
+                }
+            }
+        }
+
+        /// 根ディレクトリ自身の mode を fd の `fchmod` で変える（パスを開き直さない）。
+        pub fn set_mode(&self, mode: u32) -> Result<(), OciError> {
+            File::from(self.fd.try_clone().map_err(|e| map_fs_err(&e))?)
+                .set_permissions(fs::Permissions::from_mode(mode))
+                .map_err(|e| map_fs_err(&e))
+        }
+
+        /// 直下の子ディレクトリ `name`（固定の定数）が無ければ `mode` で作る。既にあれば種別を問わず触らない
+        /// （symlink・通常ファイルは呼び出し側の後続の検査が拒否する）。`mkdirat` は既存の symlink を辿らない。
+        pub fn ensure_child_dir(&self, name: &str, mode: u32) -> Result<(), OciError> {
+            let name_os = OsStr::new(name);
+            let name_c = at::component_cstring(name_os)
+                .map_err(|_| err(OciErrorCode::InvalidArgument, "directory name is invalid"))?;
+            match at::mkdirat_name(self.fd.as_fd(), name_os, 0o700) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Ok(()),
+                Err(e) => return Err(map_fs_err(&e)),
+            }
+            let child = at::openat2(Some(self.fd.as_fd()), &name_c, DIR_FLAGS_RW, 0, RESOLVE)
+                .map_err(|e| map_at_err(&e))?;
+            File::from(child)
+                .set_permissions(fs::Permissions::from_mode(mode))
+                .map_err(|e| map_fs_err(&e))
+        }
+
+        /// `p`（パスで辿った根）が、開いたこの fd と同じ実体か（dev / ino の照合）。差し替えを成功に見せない検出器。
+        pub fn matches_path(&self, p: &Path) -> bool {
+            use std::os::unix::fs::MetadataExt as _;
+            let Ok(fd) = self.fd.try_clone() else {
+                return false;
+            };
+            let Ok(mine) = File::from(fd).metadata() else {
+                return false;
+            };
+            fs::metadata(p).is_ok_and(|m| (m.dev(), m.ino()) == (mine.dev(), mine.ino()))
+        }
+
+        /// 根の fd の複製（`read_rootfs_file_in` が fd 起点で読むための口）。
+        pub(crate) fn try_clone_file(&self) -> io::Result<File> {
+            self.fd.try_clone().map(File::from)
         }
 
         /// 渡された fd を複製して `AnchoredRoot` にする（`root` を開き直さない）。ディレクトリでなければ拒否する。
@@ -666,6 +755,60 @@ mod imp {
             Self { path }
         }
 
+        /// 直下に 0700 のディレクトリ `path` を新規に作る（パス起点。#4283）。既存は拒否する。
+        pub fn create_private_dir(path: &Path) -> Result<Self, OciError> {
+            #[cfg_attr(not(unix), allow(unused_mut))]
+            let mut b = fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt as _;
+                b.mode(0o700);
+            }
+            b.create(path).map_err(|e| map_fs_err(&e))?;
+            Ok(Self::from_path(path.to_path_buf()))
+        }
+
+        /// 根ディレクトリ自身の mode を変える（パス起点。Windows は何もしない）。
+        pub fn set_mode(&self, mode: u32) -> Result<(), OciError> {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                fs::set_permissions(&self.path, fs::Permissions::from_mode(mode))
+                    .map_err(|e| map_fs_err(&e))
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = mode;
+                Ok(())
+            }
+        }
+
+        /// 直下の子ディレクトリが無ければ作る。既にあれば種別を問わず触らない（パス起点）。
+        pub fn ensure_child_dir(&self, name: &str, mode: u32) -> Result<(), OciError> {
+            let p = self.path.join(name);
+            match fs::symlink_metadata(&p) {
+                Ok(_) => Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    fs::create_dir(&p).map_err(|e| map_fs_err(&e))?;
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt as _;
+                        fs::set_permissions(&p, fs::Permissions::from_mode(mode))
+                            .map_err(|e| map_fs_err(&e))?;
+                    }
+                    #[cfg(not(unix))]
+                    let _ = mode;
+                    Ok(())
+                }
+                Err(e) => Err(map_fs_err(&e)),
+            }
+        }
+
+        /// パス起点の実装は同じパスを辿るため常に真（差し替えは入口の再検査だけで検出する）。
+        pub fn matches_path(&self, _p: &Path) -> bool {
+            true
+        }
+
         pub(in crate::layer) fn open_anchor(
             &self,
             hooks: AnchorHooks,
@@ -905,6 +1048,59 @@ mod tests {
 
     fn os(v: &[&str]) -> Vec<OsString> {
         v.iter().map(OsString::from).collect()
+    }
+
+    /// OCI-7・SEC-1・CRI-3・#4283: `create_private_dir` は 0700 の根を作って開き、既存は拒否する。作成後に親が別名へ
+    /// 移されて symlink（おとり）に差し替わっても、`set_mode`・`ensure_child_dir` は作った実体にだけ届き、おとりは無傷で、
+    /// `matches_path` は差し替えを検出する。`ensure_child_dir` は既存の子に触らない。
+    #[test]
+    fn oci7_sec1_create_private_dir_confines_followup_to_created_dir() {
+        let base = tmp("cpd");
+        let parent = base.join("b");
+        fs::create_dir_all(&parent).unwrap();
+        let rootfs = parent.join("rootfs");
+        let root = ExtractRoot::create_private_dir(&rootfs).unwrap();
+        assert_eq!(
+            fs::metadata(&rootfs).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert!(ExtractRoot::create_private_dir(&rootfs).is_err());
+        assert!(root.matches_path(&rootfs));
+        let real = base.join("b-real");
+        fs::rename(&parent, &real).unwrap();
+        let decoy = base.join("decoy");
+        fs::create_dir_all(decoy.join("rootfs")).unwrap();
+        fs::set_permissions(decoy.join("rootfs"), fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::symlink(&decoy, &parent).unwrap();
+        assert!(!root.matches_path(&rootfs));
+        root.set_mode(0o755).unwrap();
+        root.ensure_child_dir("proc", 0o555).unwrap();
+        root.ensure_child_dir("proc", 0o700).unwrap();
+        let real_rootfs = real.join("rootfs");
+        assert_eq!(
+            fs::metadata(&real_rootfs).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            fs::metadata(real_rootfs.join("proc"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o555
+        );
+        assert_eq!(
+            fs::metadata(decoy.join("rootfs"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(fs::read_dir(decoy.join("rootfs")).unwrap().count(), 0);
+        fs::remove_file(&parent).unwrap();
+        fs::set_permissions(real_rootfs.join("proc"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::remove_dir_all(&base).unwrap();
     }
 
     /// OCI-2・SEC-5・#2437: fd 起点の木ごとの削除は、0555 / 0500 のディレクトリの権限を戻して消し、

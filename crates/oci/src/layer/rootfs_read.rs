@@ -17,6 +17,7 @@
 
 use std::path::Path;
 
+use super::extract::ExtractRoot;
 use crate::error::OciError;
 
 /// `rel` が指す rootfs 内の通常ファイルを最大 `max_bytes` バイトまで読む。存在しなければ `Ok(None)`。
@@ -28,6 +29,17 @@ pub fn read_rootfs_file(
     max_bytes: u64,
 ) -> Result<Option<Vec<u8>>, OciError> {
     imp::read_rootfs_file(root, rel, max_bytes)
+}
+
+/// [`read_rootfs_file`] の、根を開いたディレクトリ fd（[`ExtractRoot`]）で受ける版（#4283）。
+///
+/// create 経路が `ExtractRoot::create_private_dir` で作った根を、パスで開き直さずに読む。契約は [`read_rootfs_file`] と同じ。
+pub fn read_rootfs_file_in(
+    root: &ExtractRoot,
+    rel: &[&str],
+    max_bytes: u64,
+) -> Result<Option<Vec<u8>>, OciError> {
+    imp::read_rootfs_file_in(root, rel, max_bytes)
 }
 
 #[cfg(all(
@@ -119,12 +131,38 @@ mod imp {
             ),
             _ => err(OciErrorCode::InvalidArgument, "rootfs root is not usable"),
         })?;
-        let root_file = File::from(root_fd);
+        read_in(&File::from(root_fd), &rel_c, max_bytes)
+    }
 
+    pub(super) fn read_rootfs_file_in(
+        root: &super::ExtractRoot,
+        rel: &[&str],
+        max_bytes: u64,
+    ) -> Result<Option<Vec<u8>>, OciError> {
+        let invalid = || err(OciErrorCode::InvalidArgument, "rootfs path is invalid");
+        if rel.is_empty() {
+            return Err(invalid());
+        }
+        let rel_c = at::relative_cstring(rel).map_err(|_| invalid())?;
+        let root_file = root.try_clone_file().map_err(|_| {
+            err(
+                OciErrorCode::Internal,
+                "failed to duplicate the rootfs root",
+            )
+        })?;
+        read_in(&root_file, &rel_c, max_bytes)
+    }
+
+    /// 開いた根 `root_file` を起点に `rel` の通常ファイルを読む（両入口の共通部）。
+    fn read_in(
+        root_file: &File,
+        rel_c: &std::ffi::CStr,
+        max_bytes: u64,
+    ) -> Result<Option<Vec<u8>>, OciError> {
         // 1. O_PATH で実体の種別だけ確かめる（FIFO・デバイスは読み取りで開かない）。
         let Some(probe) = open_rel(
-            &root_file,
-            &rel_c,
+            root_file,
+            rel_c,
             at::O_PATH | at::O_NOFOLLOW | at::O_CLOEXEC,
         )?
         else {
@@ -138,8 +176,8 @@ mod imp {
         }
         // 2. 同じ経路を非ブロッキングで開き直し、同じ実体であることを照合する（差し替えの検出）。
         let Some(file) = open_rel(
-            &root_file,
-            &rel_c,
+            root_file,
+            rel_c,
             at::O_RDONLY | at::O_NOFOLLOW | at::O_NONBLOCK | at::O_CLOEXEC,
         )?
         else {
@@ -177,6 +215,18 @@ mod imp {
     use std::path::Path;
 
     use crate::error::{OciError, OciErrorCode};
+
+    /// fd 起点の読み取りを持たない環境では、パス起点へ縮退せず拒否する（fail-closed）。
+    pub(super) fn read_rootfs_file_in(
+        _root: &super::ExtractRoot,
+        _rel: &[&str],
+        _max_bytes: u64,
+    ) -> Result<Option<Vec<u8>>, OciError> {
+        Err(crate::layer::extract::err(
+            OciErrorCode::Unimplemented,
+            "rootfs file reading is not available on this platform",
+        ))
+    }
 
     /// fd 起点の読み取りを持たない環境では、パス起点へ縮退せず拒否する（fail-closed）。
     pub(super) fn read_rootfs_file(
@@ -224,6 +274,34 @@ mod tests {
             None
         );
         let _ = std::fs::remove_dir_all(&r);
+    }
+
+    /// OCI-7・SEC-1・SEC-5・#4283: 根を fd で受ける版は、根のパスが別名へ移されておとりに差し替わっても、開いた
+    /// 実体の内容を返し、おとりの内容は読まない。
+    #[test]
+    fn oci7_sec1_read_in_reads_opened_root_after_path_swap() {
+        let base = tmp("in-swap");
+        let parent = base.join("b");
+        std::fs::create_dir(&parent).unwrap();
+        let rootfs = parent.join("rootfs");
+        let root = ExtractRoot::create_private_dir(&rootfs).unwrap();
+        std::fs::create_dir(rootfs.join("etc")).unwrap();
+        std::fs::write(rootfs.join("etc/passwd"), b"real\n").unwrap();
+        let real = base.join("b-real");
+        std::fs::rename(&parent, &real).unwrap();
+        let decoy = base.join("decoy");
+        std::fs::create_dir_all(decoy.join("rootfs/etc")).unwrap();
+        std::fs::write(decoy.join("rootfs/etc/passwd"), b"decoy\n").unwrap();
+        symlink(&decoy, &parent).unwrap();
+        assert_eq!(
+            read_rootfs_file_in(&root, &["etc", "passwd"], 1024).unwrap(),
+            Some(b"real\n".to_vec())
+        );
+        assert_eq!(
+            read_rootfs_file_in(&root, &["etc", "group"], 1024).unwrap(),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// SEC-1・SEC-5: `etc` がホスト側ディレクトリへの symlink でも内容を返さない。

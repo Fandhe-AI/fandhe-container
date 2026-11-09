@@ -2004,8 +2004,8 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
 /// kick）が届かなかったときの**後詰めの上限**であり、停止の遅延は決めない（停止は即時。`IOEVENT_IDLE_WAIT` と同じ考え方）。
 /// 期限切れは正常系（in-kernel irqchip の VM は HLT をユーザー空間へ出さず `KVM_RUN` の中で待つ）として継続する。
 ///
-/// 期限ごとに監視スレッド `kvm-run-deadline` の生成・join と `KVM_RUN` の再入が起きるため、アイドル時の起床は 1 vCPU・1 秒あたり
-/// 期限切れ 1 / 間隔 回、自発的コンテキストスイッチは約 2 倍になる。実測（x86_64・HLT ゲスト）は 100 ms で約 10 回/秒・約 20 回/秒、
+/// 期限ごとに `KVM_RUN` の再入と常駐の監視スレッド `kvm-run-deadline` の武装・解除が起きる（スレッドの生成・join は #4288 で無くなった）ため、
+/// アイドル時の起床は 1 vCPU・1 秒あたり期限切れ 1 / 間隔 回になる。以下の実測は生成・join が残っていた #4229 の時点のもの（自発的コンテキストスイッチは約 2 倍）。実測（x86_64・HLT ゲスト）は 100 ms で約 10 回/秒・約 20 回/秒、
 /// 1 s で約 1 回/秒・約 2 回/秒（`docs/design/microvm-ioevent-wake.md` の #4229 の節。MVM-1・CORE-7・REPAIR-5）。
 /// 「無くす」（無期限）は `run_once` が 0 と [`RUN_DEADLINE_MAX`](crate::device::RUN_DEADLINE_MAX) 超を拒否するため採らない。
 /// 上限は drop の待ち（`DROP_STOP_WAIT`）より短く保ち、コンパイル時に検査する。
@@ -2014,6 +2014,12 @@ pub const VCPU_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const _: () = assert!(VCPU_POLL_INTERVAL.as_millis() < DROP_STOP_WAIT.as_millis());
 const _: () =
     assert!(VCPU_POLL_INTERVAL.as_millis() <= crate::device::RUN_DEADLINE_MAX.as_millis());
+// 常駐の期限監視スレッドの ack・join の待ちは、drop の待ち（`DROP_STOP_WAIT`）の中に収まる（#4288・REPAIR-5）。
+const _: () = assert!(
+    (crate::device::RUN_WATCHDOG_JOIN_WAIT.as_millis()
+        + crate::device::RUN_WATCHDOG_ACK_WAIT.as_millis())
+        < DROP_STOP_WAIT.as_millis()
+);
 // 受信ポーラーの周期（`NET_RX_POLL_INTERVAL`。#3742）と範囲は OS 非依存の `net_rx_poll` へ移した（#4030）。公開パスは再公開で保つ。
 pub use crate::net_rx_poll::NET_RX_POLL_INTERVAL;
 /// ioeventfd の通知スレッド（`IoEventPoller`）が 1 回の `poll(2)` で待つ上限（#3698・#4160・MVM-1・CORE-7・REPAIR-5）。
@@ -2619,6 +2625,7 @@ fn add_stats(a: &mut RunStats, b: &RunStats) {
     a.deadline_exceeded = a.deadline_exceeded.saturating_add(b.deadline_exceeded);
     a.errors = a.errors.saturating_add(b.errors);
     a.total_elapsed = a.total_elapsed.saturating_add(b.total_elapsed);
+    a.watchdog_spawns = a.watchdog_spawns.saturating_add(b.watchdog_spawns);
 }
 
 impl StopAggregate {
@@ -2766,12 +2773,13 @@ fn vcpu_loop<T: VcpuLoopBody>(mut body: T, guard: &VcpuThreadGuard) {
         None => format!("op={aux_op} outcome={outcome}"),
     };
     log_line(format_args!(
-        "level={level} {who} reason={}{code} runs={} exits={} deadline_exceeded={} errors={} elapsed_us={}",
+        "level={level} {who} reason={}{code} runs={} exits={} deadline_exceeded={} errors={} watchdog_spawns={} elapsed_us={}",
         reason.as_str(),
         stats.runs,
         stats.exits,
         stats.deadline_exceeded,
         stats.errors,
+        stats.watchdog_spawns,
         guard.agg.started.elapsed().as_micros()
     ));
     guard.finish(stats);

@@ -21,7 +21,7 @@
 //! eventfd の読み書きは std の `File` で行い、ここには読み書きの `unsafe` を持たない。
 //! #3698 で ioeventfd の通知スレッドが eventfd を期限つきで待つための `poll(2)` のラッパー（`poll_readable`）を足した。
 //! `KVM_RUN` 以外の ioctl はブロックしない同期呼び出しで、`KVM_RUN` はゲストが exit しない限り戻らない
-//! （期限は `crate::device` が `KvmRunMap::set_immediate_exit` と `KickTarget::kick`（`SIGUSR2`。`with_current_thread` の中だけで使える）で中断する。REPAIR-5）。停止要求（`RunningMicroVm::stop` / drop）も同じ監視スレッド経由でこれを使い、`sys` に unsafe は足していない（#3736）。
+//! （期限は `crate::device` が `KvmRunMap::set_immediate_exit` と `KickCell::kick`（`SIGUSR2`。`KickCell::armed` の中の間だけ送る）で中断する。REPAIR-5）。停止要求（`RunningMicroVm::stop` / drop）も同じ監視スレッド経由でこれを使う（#3736）。監視スレッドは vCPU ごとの常駐 1 本で、`KickCell` が kick の宛先の生存を保つ（#4288）。
 //!
 //! # 契約（事前承認の条件を満たす設計）
 //! - `unsafe fn` はこのモジュールの外へ公開しない
@@ -1061,56 +1061,75 @@ const SIG_SETMASK: i32 = 2;
 
 extern "C" fn kick_handler(_sig: i32) {}
 
-/// `pthread_kill` の宛先スレッド。生存中のスレッドを指すことを型で保証する（`with_current_thread` が唯一の入口）。
+/// vCPU スレッドへの kick（`pthread_kill`）の宛先セル。常駐の期限監視スレッドと vCPU スレッドが共有する（#4288・MVM-1・REPAIR-5）。
+///
+/// vCPU スレッドが [`KickCell::armed`] の閉包の中で `KVM_RUN` を発行している間だけ、自分の `pthread_t` がセルに入る。
+/// 監視スレッド（`crate::device` の `RunWatchdog`）は [`KickCell::kick`] で、武装中のときだけ送る。
 ///
 /// # 健全性（終了したスレッドへの `pthread_kill` は glibc で未定義動作になりうる）
-/// `'a` は [`with_current_thread`] の高階クロージャが決めるため、呼び出し側は次のどれもできない:
-/// 戻り値への混入・外側の変数への保存・`'static` を要求する `std::thread::spawn` への受け渡し・クロージャより
-/// 外側の scope への `spawn`。渡せるのはクロージャの中で作る `thread::scope` の scoped thread だけで、それは
-/// scope が戻る前（panic の巻き戻しを含む）に必ず join される。クロージャは対象スレッド自身の上で同期実行される
-/// ため、`KickTarget` が使われうる間、対象スレッドは終了も join もしておらず、`pthread_t` も再利用されない。
+/// - `armed` は対象スレッド自身の上で閉包を同期実行し、閉包が戻る（panic の巻き戻しを含む。drop guard）前にセルを空へ戻す。
+///   閉包の実行中、対象スレッドは終了しないので `pthread_t` は生存し再利用されない
+/// - 解除と送信は同じ mutex の下で直列になる。`kick` は mutex を保持したまま `pthread_kill` を発行するため、
+///   `armed` が戻った（解除された）後に送信が残ることも、解除途中のスレッドへ送ることも無い
+/// - 生存の証明をスレッド結合（scoped thread）に頼らないので、監視スレッドは `'static` の常駐スレッドにできる。
+///   `mem::forget` できる guard を外へ出さず、閉包の形だけを公開するため、旧 `KickTarget` の doc にあった却下案
+///   （`!Send` guard の借用・`&Scope` 由来のライフタイム）の穴にも当たらない
+/// - 二重武装（別スレッドが武装中）は閉包を実行せず `Err` にする（fail-closed。1 つのセルは 1 つの vCPU スレッド専用）
 ///
-/// 対応外の対象（`consts::SUPPORTED` が偽）では `pthread_self` を呼ばず値 0 を持つが、`kick` が `Unsupported` を
-/// 先に返すので使われない（#3679・P3-1）。
-///
-/// 退けた案: `!Send` の guard 借用で生存を表す案は `Box::leak` で `'static` にでき、`&Scope` 由来のライフタイム案は
-/// scoped thread が自分を途中で join できるため、どちらも健全にならない。外へ持ち出せないことの compile-fail
-/// 試験は置かない（trybuild は依存の追加で、doctest は private な `sys` に届かない）。
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct KickTarget<'a> {
-    thread: u64,
-    _alive: std::marker::PhantomData<&'a ()>,
+/// 対応外の対象（`consts::SUPPORTED` が偽）では `pthread_self` を呼ばず、`armed` が `Unsupported` を返す。
+#[derive(Debug, Default)]
+pub(crate) struct KickCell {
+    target: std::sync::Mutex<Option<u64>>,
 }
 
-/// 呼び出しスレッドを宛先とする [`KickTarget`] を作って `f` を同期実行する。`f` が戻るまで対象スレッドは生存する。
-///
-/// `crate::device` の `run_bounded` が、vCPU スレッド上で期限監視の scoped thread へ `KickTarget` を渡すために使う。
-pub(crate) fn with_current_thread<R>(f: impl for<'a> FnOnce(KickTarget<'a>) -> R) -> R {
-    // 宣言が合わない対象（`SUPPORTED` が偽）では FFI を呼ばない。そのときの値 0 は使われない（用途は `kick` の
-    // `pthread_kill` だけで、`kick` は `Unsupported` を先に返す）。
-    let thread = if consts::SUPPORTED {
-        // SAFETY: 引数なしで呼び出しスレッドの `pthread_t` を返すだけ。副作用・失敗は無い。
-        unsafe { pthread_self() }
-    } else {
-        0
-    };
-    f(KickTarget {
-        thread,
-        _alive: std::marker::PhantomData,
-    })
+/// [`KickCell::armed`] の解除 guard（戻り・panic のどちらでもセルを空へ戻す）。
+struct Disarm<'a>(&'a KickCell);
+
+impl Drop for Disarm<'_> {
+    fn drop(&mut self) {
+        *self.0.target.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
 }
 
-impl KickTarget<'_> {
-    /// このスレッドへ vCPU 中断シグナルを送る。
-    pub(crate) fn kick(self) -> Result<(), SysError> {
+impl KickCell {
+    /// 呼び出しスレッドを宛先として武装して `f` を同期実行し、戻る前に解除する。`crate::device` の `run_bounded` が
+    /// `KVM_RUN` の発行を包むために使う。別スレッドが武装中なら `f` を実行せず `Err(SysError::Os(EBUSY))` を返す。
+    pub(crate) fn armed<R>(&self, f: impl FnOnce() -> R) -> Result<R, SysError> {
         if !consts::SUPPORTED {
             return Err(SysError::Unsupported);
         }
-        // SAFETY: `self.thread` は `with_current_thread` の中で `pthread_self` が返した値で、`'a` が高階のため
-        // `with_current_thread` が戻る前（対象スレッドが生存中）にしか使えない。シグナル番号は固定の SIGUSR2。
-        // ポインタ引数は無い。戻り値は errno そのもの。
-        let r = unsafe { pthread_kill(self.thread, SIG_VCPU_KICK) };
-        if r == 0 { Ok(()) } else { Err(SysError::Os(r)) }
+        {
+            let mut g = self.target.lock().unwrap_or_else(|p| p.into_inner());
+            if g.is_some() {
+                return Err(SysError::Os(EBUSY));
+            }
+            // SAFETY: 引数なしで呼び出しスレッドの `pthread_t` を返すだけ。副作用・失敗は無い。
+            *g = Some(unsafe { pthread_self() });
+        }
+        let _disarm = Disarm(self);
+        Ok(f())
+    }
+
+    /// 武装中なら宛先スレッドへ vCPU 中断シグナルを送って `Ok(true)`、未武装なら何もせず `Ok(false)`。
+    pub(crate) fn kick(&self) -> Result<bool, SysError> {
+        if !consts::SUPPORTED {
+            return Err(SysError::Unsupported);
+        }
+        let g = self.target.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(thread) = *g else {
+            return Ok(false);
+        };
+        // SAFETY: `thread` は `armed` が武装中に `pthread_self` で入れた値で、`armed` の閉包（対象スレッドの上で
+        // 同期実行）が戻るまで対象スレッドは生存する。解除は同じ mutex の下で行われ、この `g` を保持している間は
+        // 解除されないので、終了したスレッドへは送らない。シグナル番号は固定の SIGUSR2。ポインタ引数は無い。
+        // 戻り値は errno そのもの。
+        let r = unsafe { pthread_kill(thread, SIG_VCPU_KICK) };
+        drop(g);
+        if r == 0 {
+            Ok(true)
+        } else {
+            Err(SysError::Os(r))
+        }
     }
 }
 
@@ -1687,7 +1706,7 @@ impl KvmRunMap {
         // マッピングは `self` の生存中有効で、u8 のためアラインは自明。このバイトは KVM がユーザー空間の書き込みを
         // 前提に読む ABI。Rust 側でこのバイトに触るのは、この atomic store と `read_into` の atomic load だけ
         // （`write_from` は範囲検査でこのバイトを拒否する）。SeqCst は呼び出し側の
-        // `timed_out` の store と順序を揃え、その後の `KickTarget::kick` より前に見えることを保証する。
+        // `timed_out` の store と順序を揃え、その後の `KickCell::kick` より前に見えることを保証する。
         // カーネル側の読み取り（READ_ONCE）は Rust のメモリモデルの外にある。
         unsafe {
             AtomicU8::from_ptr(self.ptr.as_ptr().add(IMMEDIATE_EXIT_OFFSET))
@@ -2739,29 +2758,72 @@ mod tests {
         assert_eq!(consts::KVM_CREATE_VCPU, 0xAE41);
     }
 
-    /// REPAIR-5: handler 導入後は自スレッドへ中断シグナルを送ってもプロセスが終了しない（冪等な再導入も可）。
-    #[test]
-    fn kick_self_after_handler_install_survives() {
-        install_kick_handler().unwrap();
-        install_kick_handler().unwrap();
-        with_current_thread(|t| t.kick()).unwrap();
-    }
-
-    /// REPAIR-5・MVM-1: scoped thread から `KickTarget` で所有スレッドへ送れ、戻り値がそのまま返る。
+    /// REPAIR-5: handler 導入後は武装中の自スレッドへ中断シグナルを送ってもプロセスが終了しない（冪等な再導入も可）。
     #[cfg(all(
         target_env = "gnu",
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
     #[test]
-    fn kick_from_scoped_thread_reaches_owner() {
+    fn kick_self_after_handler_install_survives() {
         install_kick_handler().unwrap();
-        let v = with_current_thread(|t| {
-            std::thread::scope(|s| {
-                s.spawn(move || t.kick()).join().unwrap().unwrap();
-            });
-            42
-        });
-        assert_eq!(v, 42);
+        install_kick_handler().unwrap();
+        let cell = KickCell::default();
+        let v = cell.armed(|| cell.kick().unwrap()).unwrap();
+        assert!(v);
+    }
+
+    /// REPAIR-5・MVM-1・#4288: 別スレッドから武装中の所有スレッドへ送れて `Ok(true)`、解除後と未武装は `Ok(false)`。
+    /// `armed` の戻り値はそのまま返る。
+    #[cfg(all(
+        target_env = "gnu",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn kick_cell_sends_only_while_armed() {
+        install_kick_handler().unwrap();
+        let cell = std::sync::Arc::new(KickCell::default());
+        assert!(!cell.kick().unwrap());
+        let c2 = std::sync::Arc::clone(&cell);
+        let v = cell
+            .armed(|| {
+                std::thread::spawn(move || c2.kick())
+                    .join()
+                    .unwrap()
+                    .unwrap()
+            })
+            .unwrap();
+        assert!(v);
+        assert!(!cell.kick().unwrap());
+    }
+
+    /// #4288: 二重武装は閉包を実行せず `Err`（fail-closed）。内側が戻ると外側の武装も解除済みになる。
+    #[cfg(all(
+        target_env = "gnu",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn kick_cell_rejects_double_arm() {
+        let cell = KickCell::default();
+        let mut ran = false;
+        let r = cell.armed(|| cell.armed(|| ran = true)).unwrap();
+        assert!(matches!(r, Err(SysError::Os(EBUSY))));
+        assert!(!ran);
+        assert!(!cell.kick().unwrap());
+    }
+
+    /// #4288: 閉包が panic しても解除される。
+    #[cfg(all(
+        target_env = "gnu",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn kick_cell_disarms_on_panic() {
+        let cell = KickCell::default();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = cell.armed(|| panic!("boom"));
+        }));
+        assert!(r.is_err());
+        assert!(!cell.kick().unwrap());
     }
 
     /// MVM-1: sigaction / sigset_t のレイアウトの具体値。

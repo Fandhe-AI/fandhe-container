@@ -2181,7 +2181,7 @@ fn start_halted_guest(
 /// MVM-1・CORE-7・REPAIR-12・#4229: アイドル（HLT 中）の vCPU の起床回数を実測する。
 /// 観測器の `record`（vCPU スレッドが 1 回の `run_once` から戻るたびに呼ばれる）で、その時点のスレッドの自発的コンテキスト
 /// スイッチを採る。連続する 6 件の記録の間は期限切れ 5 回分で、`VCPU_POLL_INTERVAL` の 5 倍の時間が掛かることと、
-/// 全件が期限切れ（exit・エラー無し）であることを具体値で照合する。
+/// 全件が期限切れ（exit・エラー無し）であることを具体値で照合する。#4288 で期限監視スレッドの常駐化（生成 1 回）も照合する。
 #[cfg(target_arch = "x86_64")]
 #[test]
 #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
@@ -2231,11 +2231,18 @@ fn kvm_device_idle_halted_vcpu_wakeups() {
             && span < VCPU_POLL_INTERVAL * 5 + Duration::from_millis(500),
         "span={span:?}"
     );
-    // 1 回の期限切れの再入で自発的に眠る回数は数回（監視スレッドの生成・join・futex 待ち）。実測は約 2 回で、係数 4 を上限にする。
+    // 1 回の期限切れの再入で自発的に眠る回数は数回（`KVM_RUN` の再入・常駐の監視スレッドの武装と ack の futex 待ち）。係数 4 を上限にする。
     assert!(switches <= expired * 4, "switches={switches}");
     let report = running.stop(Duration::from_secs(5)).unwrap();
     assert_eq!(report.reason, StopReason::Requested);
     assert_eq!(report.stats.errors, 0);
+    // #4288: 期限切れが 6 回以上起きても、監視スレッド（`kvm-run-deadline`）の生成は vCPU あたり 1 回だけ（常駐）。
+    assert!(report.stats.deadline_exceeded >= need as u64);
+    assert_eq!(report.stats.watchdog_spawns, 1);
+    eprintln!(
+        "mvm4288 idle vcpu: deadline_exceeded={} watchdog_spawns={}",
+        report.stats.deadline_exceeded, report.stats.watchdog_spawns
+    );
     drop(rows);
     assert_eq!(Arc::strong_count(&obs), 1);
 }

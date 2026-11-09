@@ -88,11 +88,46 @@ impl Drop for SettlementAbandonOnDrop {
     }
 }
 
+/// 保持役の起動後〜確定版の記録の書き込みが終わるまでの間に RunPodSandbox の future が破棄されたとき、
+/// Ready を公開したままにせず NotReady へ戻す guard（確定版が書けていない sandbox に CreateContainer を
+/// 通さない。CRI-2 の fail-closed・REPAIR-5）。成功したら `disarm` する。
+pub(super) struct ReadyRevertOnDrop {
+    registry: Arc<Mutex<SandboxRegistry>>,
+    id: String,
+    armed: bool,
+}
+
+impl ReadyRevertOnDrop {
+    pub(super) fn new(registry: Arc<Mutex<SandboxRegistry>>, id: &str) -> Self {
+        Self {
+            registry,
+            id: id.to_owned(),
+            armed: true,
+        }
+    }
+
+    pub(super) fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ReadyRevertOnDrop {
+    fn drop(&mut self) {
+        if self.armed
+            && let Ok(mut registry) = self.registry.lock()
+            && let Some(record) = registry.records.get_mut(&self.id)
+            && record.state == SandboxState::Ready
+        {
+            record.state = SandboxState::NotReady;
+        }
+    }
+}
+
 impl CriRuntimeService {
     /// 保持役を起動して記録へ確定する（`RunPodSandbox` から、write-ahead の後に呼ぶ）。
     ///
     /// worker で `provider.spawn` を呼び、`runtime_timeout`（+ 余裕）で打ち切る。成功は worker がロック下で
-    /// `pod_holder`・`holder_owned` を確定し、`publish_ready` なら Ready にする（network を伴う経路は
+    /// `pod_holder`・`holder_owned` を確定し、`publish_ready` なら結果の受領後に呼び出し側が Ready にする（network を伴う経路は
     /// `set_up` が Ready にするので偽）。外側の期限超過で呼び出し側が先に手放した（provider の契約違反）場合、
     /// 遅れて成功した保持役は記録にだけ残す（NotReady のまま `holder_owned`。Stop・Remove が解放する）。
     /// 動いている資源が無いと確かめられたときだけ `clear`（登録しない）にする fail-closed。
@@ -137,13 +172,12 @@ impl CriRuntimeService {
                 && let Some(record) = registry.records.get_mut(&worker_id)
             {
                 record.holder_pending = false;
-                let settled = worker_settlement.settle_by_worker();
+                // 手放しとの競合の決着だけを取る。Ready は worker では公開しない（結果の受領前に呼び出し側が
+                // 破棄されても Ready が残らないよう、呼び出し側が受領と同じ同期区間で公開する）。
+                let _ = worker_settlement.settle_by_worker();
                 if let Ok(holder) = &result {
                     record.pod_holder = Some(*holder);
                     record.holder_owned = true;
-                    if settled && publish_ready {
-                        record.state = SandboxState::Ready;
-                    }
                 }
             }
             result
@@ -151,6 +185,15 @@ impl CriRuntimeService {
         .await
         .and_then(|r| r.map(|_| ()));
         let Err(err) = result else {
+            // 結果を受領した。await を挟まずに Ready を公開する（取り消しの窓を作らない）。
+            if publish_ready
+                && let Ok(mut registry) = self.registry.lock()
+                && let Some(record) = registry.records.get_mut(id)
+                && record.pod_holder.is_some()
+                && record.holder_owned
+            {
+                record.state = SandboxState::Ready;
+            }
             return Ok(());
         };
         // 期限超過の判定から記録を取るまでの間に worker が成功を確定していたら成功として扱う

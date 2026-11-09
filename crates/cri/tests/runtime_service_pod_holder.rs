@@ -584,3 +584,47 @@ async fn cri2_without_a_holder_provider_nothing_is_called() {
     assert!(log.lock().unwrap().is_empty());
     assert_eq!(holder.count(""), 0);
 }
+
+/// 確定版（pending=0）の put だけを一定時間止める記録ストア。
+#[derive(Debug)]
+struct SlowConfirmStore;
+
+impl RecordStore for SlowConfirmStore {
+    fn put(&self, _kind: RecordKind, _id: &RecordId, bytes: &[u8]) -> Result<(), CriError> {
+        if String::from_utf8_lossy(bytes)
+            .lines()
+            .any(|l| l == "pending=0")
+        {
+            std::thread::sleep(Duration::from_millis(400));
+        }
+        Ok(())
+    }
+    fn remove(&self, _kind: RecordKind, _id: &RecordId) -> Result<(), CriError> {
+        Ok(())
+    }
+    fn list(
+        &self,
+        _kind: RecordKind,
+        _budget: ListBudget,
+        _limits: ListLimits,
+    ) -> Result<RecordListing, CriError> {
+        Err(CriError::internal("not used"))
+    }
+}
+
+/// 保持役の起動後・確定版の記録が書き終わる前に RunPodSandbox の future が破棄されても、sandbox は
+/// NotReady のままで CreateContainer が拒否されること（CRI-2 の fail-closed・REPAIR-5・#2871）。
+#[tokio::test]
+async fn cri2_run_dropped_after_holder_ready_before_confirm_stays_notready() {
+    let log = new_log();
+    let holder = FakeHolder::new(&log, Spawn::Ok);
+    let svc = service(&holder).with_record_store(Arc::new(SlowConfirmStore));
+    let dropped = tokio::time::timeout(Duration::from_millis(100), run(&svc)).await;
+    assert!(dropped.is_err(), "run must still be awaiting the confirm");
+    let items = list(&svc).await;
+    assert_eq!(items.len(), 1);
+    let id = items[0].0.clone();
+    assert_eq!(items[0].1, NOTREADY);
+    assert_eq!(state_of(&svc, &id).await, NOTREADY);
+    assert!(create_container(&svc, &id).await.is_err());
+}

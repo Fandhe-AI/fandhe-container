@@ -2935,7 +2935,15 @@ impl CriRuntimeService {
             return Ok(resp);
         };
         match self.spawn_pod_holder(&holder, &id, true).await {
-            Ok(()) => self.confirm_run(&id, &mut write_guard, resp).await,
+            Ok(()) => {
+                // confirm の await 中に取り消されても Ready を残さない。
+                let revert = pod_holder::ReadyRevertOnDrop::new(Arc::clone(&self.registry), &id);
+                let out = self.confirm_run(&id, &mut write_guard, resp).await;
+                if out.is_ok() {
+                    revert.disarm();
+                }
+                out
+            }
             Err(failure) => {
                 if failure.clear {
                     self.release_unwritten_sandbox(&id, &mut write_guard).await;

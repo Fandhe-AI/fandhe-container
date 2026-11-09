@@ -123,6 +123,8 @@ pub mod guest_memory_slot;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub mod hvf;
 pub mod hvf_abi;
+#[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
+mod hvf_device_bus;
 pub mod hvf_lifecycle;
 pub mod hvf_loop;
 pub mod hvf_smp;

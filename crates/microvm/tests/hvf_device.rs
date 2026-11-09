@@ -2288,7 +2288,7 @@ fn hvf_device_pending_cancels_collapse() {
     });
 }
 
-/// `HvfDeviceBus::new` / `bind` が組んだ本番の `SharedTransport` を通した `QueueReady=0` で、`queue_stopped` が対象のキューごとに
+/// `HvfDeviceBus::new` / `bind` が組んだ本番の `SharedTransport`（実 GIC の線つき。HVF なしの同種の照合は crate 内の `mvm5_4293_*`）を通した `QueueReady=0` で、`queue_stopped` が対象のキューごとに
 /// ちょうど 1 回だけ起きること（#4231・MVM-5・MVM-1）。block 1 台 + net 1 台を assemble し（start しない）、組み立て済みの dispatcher へ
 /// `VcpuExit::Mmio` を流す。回数は `QueueStopped(i)` の結果で数える（`write_queue_ready` は `queue_stopped(i)` の直後にだけ
 /// これを返す。#4031）。`handle_data_abort` の振り分けは `hvf::mmio` の単体試験が担い、ゲスト自身が書く経路は対象外。

@@ -118,6 +118,7 @@
 //! [`RegisteredGuestRam`] は VM fd を dup して持つ（`'vm` の借用を持たないので、VM 構成体が VM fd と一緒に保持できる）。
 //! drop では slot を削除してから munmap する。削除に失敗したら mapping を解放せず漏らす（ゲストがまだ書けるメモリを
 //! 別の用途に再利用させない fail-closed）。
+//! slot 削除の後の munmap が失敗したら `level=error op=kvm.guest_ram_unmap outcome=error leaked=guest_ram` の 1 行を出す（#4330・REPAIR-4）。
 
 #![cfg(target_os = "linux")]
 
@@ -515,6 +516,7 @@ impl GuestMemoryBacking for GuestRam {
 ///
 /// 登録後はゲスト（vCPU）がいつでも書き換えるため、読み書きは常にコピーで行う。drop で slot を削除してから
 /// munmap する（削除に失敗したら mapping を漏らす）。
+/// slot 削除の後の munmap が失敗したら `op=kvm.guest_ram_unmap` の固定 1 行を出す（#4330・REPAIR-4）。
 #[derive(Debug)]
 pub struct RegisteredGuestRam {
     vm: OwnedFd,

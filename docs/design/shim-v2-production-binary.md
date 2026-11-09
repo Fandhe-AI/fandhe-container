@@ -83,8 +83,8 @@ D6 の delete は全体の期限（4 秒）で打ち切られる。状態記録�
 ### 調べた事実（origin/main 58a5985e2 時点）
 
 - shim の経路に、core が所有する rootfs は無い。`create_with_image` を呼ぶ箇所は `crates/cri`・`crates/plugin-cri` に無く、shim の Create は core の通常の `create` を通って bundle（rootfs を含む）は containerd が用意する。このため shim の `DeleteResponse::image_rootfs` は常に `NotApplicable` で、rootfs の木の残骸は今の shim では起きない
-- 状態記録を消した後に残りうるのは `CoreLifecycleRuntime::delete`（`adapter.rs`）が core の delete の成功後に消す 3 種。いずれも shim の scoped 状態ルートの `@` 始まりのディレクトリに ID 名で置かれる: supervisor ログ `@supervisor-logs/<id>.log*`・コンテナログ `@container-logs/<id>.log*`・起動オプション文書 `@container-options/<id>`
-- 3 種には guard つきの削除関数が既にある。guard は「この ID の状態記録が無い」と「sink の flock が外れている」で、ロックを取ったうえで試行ごとに評価する。plugin-cri は起動時の走査（#2760）と、同じ ID の create の前の回収で使っている。shim の Create も同じ `create` を通るので create 前の回収は効く。一方、shim の serve の起動時の走査は無く、plugin-cri の走査は plugin-cri 自身の状態ルートしか見ない
+- 状態記録を消した後に残りうるのは `CoreLifecycleRuntime::delete`（`adapter.rs`）が core の delete の成功後に消す 3 種。いずれも shim の scoped 状態ルートの `@` 始まりのディレクトリに ID 名で置かれる: supervisor ログ `@supervisor-logs/<encoded-id>.log`・`.log.<n>`・`.log.lock`・コンテナログ `@container-logs/<encoded-id>.log`・`.log.<n>`・`.log.lock`・起動オプション文書 `@container-options/<encoded-id>`
+- 3 種には guard つきの削除関数が既にある。guard は「この ID の状態記録が無い」と「sink の flock が外れている」で、ロックを取ったうえで試行ごとに評価する。plugin-cri は起動時の走査（#2760）と、同じ ID の create の前の回収で使っている。ただし `CoreLifecycleRuntime::reclaim_before_create` が回収するのはコンテナログと起動オプション文書の 2 種だけで、supervisor ログは回収しない。shim の Create も同じ `create` を通るので、この 2 種には create 前の回収が効く。一方、shim の serve の起動時の走査は無く、plugin-cri の走査は plugin-cri 自身の状態ルートしか見ない
 - 起動オプション文書は作成世代（`gen`）を持ち、読む側が照合する。記録の無い ID の文書を消しても、同じ ID で作り直した新しいインスタンスとは競合しない（`container-options-delivery.md`）
 - `AlreadyReclaimed` には「一度も作られなかった ID」も含まれ、両者は区別できない（D5）
 - containerd が delete の失敗後に同じ ID・bundle で delete を呼び直すか、bundle をいつ消すかは、一次情報で確かめていない（未確認。#3685 の実機確認で記録する）。D6 の「再実行」は前提であって確認済みではない。呼び直しが無い場合に備え、下の 2 つ目の契機を置く
@@ -117,7 +117,7 @@ A を採らない理由:
 
 shim の serve の起動時に、scoped 状態ルートを `sweep_leftover_container_logs` と同じ関数・同じ guard で、期限つきの裏の thread で 1 回だけ走査する（Linux のみ。serve の開始は待たせない）。既存の走査は supervisor ログを対象にしておらず、これは plugin-cri も同じ欠けである（本設計の対象外。別途追跡する）。
 
-起動時の走査（`sweep_leftover_container_logs`）が走査するのは `@container-logs` だけで、起動オプション文書（`@container-options`）と supervisor ログ（`@supervisor-logs`）は走査しない。本設計では 2 種を起動時走査の対象外とし、次の 2 経路だけで回収する。(1) containerd が同じ ID で delete を呼び直したときの再実行（D6）。(2) 同じ ID の create の前の回収（3 種とも guard つきの削除関数を通る）。delete の再呼び出しも同じ ID の再利用も無い場合、この 2 種は残り続ける。これは容認する残余で、手動回収とする: 該当 ID の状態記録が無く sink の flock が外れていることを確かめたうえで、shim の scoped 状態ルート配下の `@container-options/<id>` と `@supervisor-logs/<id>.log*` を削除する（文書の削除は世代照合があるため新しいインスタンスと競合しない）。起動時走査へ文書用の走査を足すかは、残骸の実測が出たときに再評価する（追跡: 実装 issue の分割で扱う）。
+起動時の走査（`sweep_leftover_container_logs`）が走査するのは `@container-logs` だけで、起動オプション文書（`@container-options`）と supervisor ログ（`@supervisor-logs`）は走査しない。本設計では 2 種を起動時走査の対象外とし、次の 2 経路だけで回収する。(1) containerd が同じ ID で delete を呼び直したときの再実行（D6）。(2) 同じ ID の create の前の回収（`reclaim_before_create` はコンテナログと起動オプション文書の 2 種を guard つきの削除関数で回収する。supervisor ログは対象外で、create 前に 3 種を回収するよう広げるかは実装 issue の分割で扱う。REPAIR-3）。delete の再呼び出しも同じ ID の再利用も無い場合、起動オプション文書と supervisor ログは残り続ける。これは容認する残余で、手動回収とする: 該当 ID の同じ状態ルートでの create・start を止め、状態記録が無く sink の flock が外れていることを確かめたうえで、符号化済み ID のファイルを個別に指定して削除する。supervisor ログは `@supervisor-logs/<encoded-id>.log`・`.log.lock`・数字だけの世代接尾辞の `.log.<n>` を 1 つずつ指定する（`<id>.log*` の前方一致 glob は ID が前方一致する別 ID のログ・ロックまで消すので使わない。`container-log-recovery.md` の手順に従う）。起動オプション文書 `@container-options/<encoded-id>` は、世代照合が防ぐのは古い文書の採用だけで、確認と削除の間に並行 create が書いた新しい文書を消しうるため、同じ ID の create・start を止めたうえで削除する（`remove_stale_bounded` が ID 単位の options ロックの下で状態を再確認するのと同じ排他が手動では取れないため。SUP-12・SEC-1）。起動時走査へ文書用の走査を足すかは、残骸の実測が出たときに再評価する（追跡: 実装 issue の分割で扱う）。
 
 ### 永続形式
 

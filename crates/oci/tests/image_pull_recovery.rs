@@ -3,6 +3,9 @@
 //! 公開 API だけを通し、生きている pull は回収されず、drop された pull（クラッシュ相当）は
 //! ステージングとリースが回収され、不在を確認できない残骸は残ることを具体値で照合する。
 
+// Windows ホストは設計上 `ImageStore` を開けない（#4333・#2428 案 C。拒否は src/image_management/store.rs の試験が照合）ため unix に限る。
+#![cfg(unix)]
+
 use std::fs;
 use std::path::PathBuf;
 

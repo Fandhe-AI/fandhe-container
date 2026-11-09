@@ -4,6 +4,9 @@
 //! 登録した参照を、親が開き直して読めること、世代が再発行されないこと、manifest の在庫が無い
 //! 参照があっても `image prune` が blob を消さないことを具体値で確かめる。待機には期限を置く（REPAIR-5）。
 
+// Windows ホストは設計上 `ImageStore` を開けない（#4333・#2428 案 C。拒否は src/image_management/store.rs の試験が照合）ため unix に限る。
+#![cfg(unix)]
+
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};

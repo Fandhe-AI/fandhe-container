@@ -54,8 +54,8 @@
 //! 指紋が一致するときだけ受け入れ、それ以外は検証済みのステージングで置き換える。
 //!
 //! 未実装（実装済みを装わない。REPAIR-3）:
-//! - Windows の `PullDir` はパス起点で、[`PullSession::open_verified_staged_blob`]・
-//!   [`PullSession::open_leased_blob`] は `Unimplemented`（#2428・#4181）。
+//! - Windows の `PullDir`・[`PullSession::open_verified_staged_blob`]・[`PullSession::open_leased_blob`] の非 unix 実装は、
+//!   Windows ホストは `ImageStore::open` が設計上の恒久拒否（#2428 の案 C・#4333。#4181 は not planned）のため到達しない。型検査のために残してあり、削除は別の整理。
 //! - `PullSession` に `Drop` は実装しない（ロック待ちの Timeout・panic 中の毒化があり、ロックを取る
 //!   `Drop` は危険なため）。publish も abort もせずに drop すると、リースとステージングが残る
 //!   （余分に残す側）。呼び出し側は失敗経路で [`PullSession::abort`] を呼ぶ契約である。
@@ -225,7 +225,7 @@ impl UnpackDir {
 /// 作れるのは [`PullSession::ensure_published_rootfs_dir`]（pull。無ければ 0700 で作る）と
 /// [`ImageStore::open_published_rootfs_dir`]（create。作らない）だけ。エントリの有無の確認・読み取り・公開の `renameat` は
 /// この fd 起点で行い、キャッシュの祖先が検査後におとりの symlink へ差し替えられても届かない（Linux x86_64 / aarch64。
-/// それ以外の unix はパス起点で、入口の再検査に頼る。Windows は #4181）。名前は検証済みの [`Digest`] の hex と
+/// それ以外の unix はパス起点で、入口の再検査に頼る。Windows ホストは `open` で恒久拒否のため到達しない）。名前は検証済みの [`Digest`] の hex と
 /// 呼び出し側の固定の定数だけを受ける。
 #[derive(Debug)]
 pub struct PublishedRootfsDir {
@@ -411,7 +411,7 @@ impl ImageStore {
     /// 呼ぶたびに root の fd から `blobs/sha256` を開き直して `openat2`（`NO_SYMLINKS`・`O_NOFOLLOW`）で開く。返したハンドルは
     /// 未検証で、信頼条件・digest・サイズの確認は呼び出し側が同じハンドルで行う（OCI-1）。無ければ `NotFound`、
     /// 通常ファイルでなければ `FailedPrecondition`。Linux x86_64 / aarch64 以外の unix はパス起点、非 unix は
-    /// `Unimplemented`（#4181）。
+    /// Windows ホストは `ImageStore::open` が設計上の恒久拒否（#2428 の案 C・#4333。#4181 は not planned）のため到達しない（型検査のために残した実装）。
     pub fn open_cached_blob(&self, digest: &Digest) -> Result<File, OciError> {
         open_blob_readonly(self, hex_of(digest)?)
     }
@@ -1082,7 +1082,7 @@ impl PullSession<'_> {
     /// `cfg` ごとの扱い:
     /// - Linux x86_64 / aarch64: 検査済み root の fd からの `openat2`（`NO_SYMLINKS`・`O_NOFOLLOW`）。
     /// - その他の unix（macOS 等）: `PullDir` がパス起点のため、差し替えは指紋の照合で `DataLoss` として検出する。
-    /// - 非 unix（Windows。#2428 の判断待ち）: 検証手段が無いため `Unimplemented` で拒否し、パス起点へ縮退しない。
+    /// - 非 unix（Windows）: Windows ホストは `ImageStore::open` が設計上の恒久拒否（#2428 の案 C・#4333。#4181 は not planned）のため到達しない。型検査のために `Unimplemented` の実装を残す。
     pub fn open_verified_staged_blob(&self, digest: &Digest) -> Result<File, OciError> {
         let hex = hex_of(digest)?;
         let Some(entry) = self.verified.get(digest) else {
@@ -1157,7 +1157,7 @@ impl PullSession<'_> {
     /// `cfg` ごとの扱い:
     /// - Linux x86_64 / aarch64: 検査済み root の fd 起点の `openat2`。
     /// - その他の unix（macOS 等）: `BlobDir` がパス起点（最終要素のみ symlink を辿らない）。入口の再検査に頼る。
-    /// - 非 unix（Windows。#4181）: `Unimplemented` で拒否し、パス起点へ縮退しない。
+    /// - 非 unix（Windows）: Windows ホストは `ImageStore::open` が設計上の恒久拒否（#2428 の案 C・#4333。#4181 は not planned）のため到達しない。型検査のために `Unimplemented` の実装を残す。
     pub fn open_leased_blob(&self, digest: &Digest) -> Result<File, OciError> {
         let hex = hex_of(digest)?;
         if !self.leased.contains(digest) {
@@ -1314,6 +1314,7 @@ impl PullSession<'_> {
     /// （検証前の内容で共有の `blobs/sha256` を上書きしない。fail-closed。OCI-1・OCI-7）。
     /// `FILE_SHARE_DELETE` を含めるのは自分の `rename` / `hard_link` を共有違反にしないため。
     /// 残る差し替えの窓は、所有者専用のストア内の私的な一時名に限られる。
+    // Windows ホストは `ImageStore::open` が恒久拒否のため到達しない（#4333）。型検査のために残す（削除は別の整理）。
     #[cfg(windows)]
     fn pin_staged_blobs(
         &self,
@@ -1831,7 +1832,8 @@ impl Drop for PublishTmpCleanup {
     }
 }
 
-#[cfg(test)]
+// Windows ホストは設計上 `ImageStore` を開けない（#4333・#2428 案 C。拒否は store.rs の試験が照合）ため unix に限る。
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::image_management::{PULL_ID_MAX_BYTES, ReferenceTable};
@@ -2291,11 +2293,6 @@ mod tests {
                 .read_to_end(&mut body)
                 .unwrap();
             assert_eq!(body, b"config-body");
-        }
-        #[cfg(not(unix))]
-        {
-            let e = s.open_verified_staged_blob(&dg).unwrap_err();
-            assert_eq!(e.code(), OciErrorCode::Unimplemented);
         }
     }
 

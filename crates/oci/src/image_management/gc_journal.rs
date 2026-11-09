@@ -119,6 +119,7 @@ pub(super) struct GcJournal {
 impl GcJournal {
     /// 何も消さない空のジャーナル（削除確定の fsync が未了であることを示す墓標）か。
     #[cfg(test)]
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn is_tombstone(&self) -> bool {
         self.manifests.is_empty() && self.untag.is_empty() && self.delete_blobs.is_empty()
     }
@@ -182,11 +183,13 @@ mod test_hook {
     }
 
     /// ジャーナルの unlink を `times` 回失敗させる。
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(super) fn fail_unlink(times: u32) {
         FAIL_UNLINK.with(|c| c.set(times));
     }
 
     /// 削除開始後のジャーナル書き直しを公開前に `times` 回失敗させる。
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(super) fn fail_rewrite(times: u32) {
         FAIL_REWRITE.with(|c| c.set(times));
     }
@@ -207,10 +210,12 @@ mod test_hook {
         take(&FAIL_REWRITE)
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(super) fn fail_sync_of(dir: &Path, times: u32) {
         FAIL.with(|f| *f.borrow_mut() = Some((dir.to_path_buf(), times)));
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(super) fn clear() {
         FAIL_UNLINK.with(|c| c.set(0));
         FAIL_REWRITE.with(|c| c.set(0));
@@ -770,6 +775,7 @@ impl ReferenceTable {
 
     /// 試験用: パスから検査なしでハンドルを開いて設定する。
     #[cfg(test)]
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(super) fn set_journal_root(&mut self, root: &Path) {
         let h = RootHandle::open_unchecked(root).expect("open root handle");
         self.set_root_handle(Arc::new(h));
@@ -929,7 +935,8 @@ impl ReferenceTable {
     }
 }
 
-#[cfg(test)]
+// Windows ホストは設計上 `ImageStore` を開けない（#4333・#2428 案 C。拒否は store.rs の試験が照合）ため unix に限る。
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::image_management::root_handle::rh;

@@ -25,16 +25,18 @@
 //!   `EPERM`）では `ImageStore::open` が `Unimplemented` で拒否し、パス起点へは縮退しない（fail-closed）。
 //!   root 配下の別マウントは `RESOLVE_NO_XDEV` の `EXDEV` で拒否し、`FailedPrecondition` と固定メッセージ
 //!   （[`MOUNT_CROSSING_MESSAGE`]）に写す（対応外。#2701・`docs/design/image-store-root-trust.md` 3-d）。
-//! - macOS と Windows: 正規パスを持つ従来のパス起点の実装で、差し替えは入口の再検査だけで検出する。
+//! - macOS: 正規パスを持つ従来のパス起点の実装で、差し替えは入口の再検査だけで検出する。
 //!   macOS は本番経路が `ImageStore::open` に届かず（cli の `non_linux_failure`）、`openat` 系の定数・FFI・
-//!   libc 照合を足す根拠が無い。Windows の ACL は #2428 の方式判断待ち。
+//!   libc 照合を足す根拠が無い。
+//! - Windows: ホストでは `ImageStore::open` が設計上の恒久拒否（#2428 の案 C・#4333）のため、この実装には到達しない。
+//!   `cfg(not(unix))` の実装は型検査のために残してあり、削除は別の整理。
 //! - Linux の他アーキテクチャ: `sys::at` の定数・番号を確かめていないため、パス起点へ縮退せず
 //!   `Unimplemented` で拒否する（`layer::anchored` と同じ fail-closed。#2701）。
 //!
 //! # 移していない操作（実装済みを装わない。REPAIR-3）
 //!
 //! `pull` / `pull_recovery` の staging・公開・回収は `staging` 子モジュールの `StagingDir` / `PullDir` と
-//! `BlobDir` 経由で fd 起点へ移した（#2694）。移していないのは Windows の `PullDir`（パス起点。#4181）だけである。根拠と追跡 issue は
+//! `BlobDir` 経由で fd 起点へ移した（#2694）。移していないのは Windows の `PullDir`（パス起点）だけだが、Windows ホストは `ImageStore::open` で恒久拒否のため到達しない（#4181 は not planned）。根拠と追跡 issue は
 //! `docs/design/image-store-root-trust.md` の論点 3 を参照。
 //!
 //! - fetcher（`RegistryClient::fetch_blob`）の書き込み先も fd 起点である（#2765）。`PullSession::open_staged_blob`
@@ -1212,7 +1214,8 @@ impl RootHandle {
         Self::open_dir(path, Some(id))
     }
 
-    /// 正規化済みのパスから開く（非 unix は dev / ino を持たない）。
+    /// 正規化済みのパスから開く（非 unix は dev / ino を持たない）。Windows ホストは `ImageStore::open` が先に恒久拒否するため
+    /// 到達しない（#4333）。型検査のために残す。
     #[cfg(not(unix))]
     pub(crate) fn open_checked(path: PathBuf) -> Result<Self, OciError> {
         Self::open_dir(path, None)

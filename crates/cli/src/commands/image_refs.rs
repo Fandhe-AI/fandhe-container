@@ -343,7 +343,10 @@ impl ContainerImageRefs for StoreImageRefs<'_> {
     }
 }
 
+// Windows ホストは設計上 `ImageStore` を開けない（#4333）ため、ストアを使う試験とその補助は unix に限り、
+// Windows で使われなくなる補助・import を許す。
 #[cfg(test)]
+#[cfg_attr(not(unix), allow(dead_code, unused_imports))]
 mod tests {
     /// OCI-7・CLI-1（#2600）: digest 風入力の述語（create と rm / tag が共有）。
     #[test]
@@ -402,6 +405,7 @@ mod tests {
     }
 
     /// 在庫に manifest を登録済みのストアを作る。
+    #[cfg(unix)]
     fn seeded(root: &std::path::Path, manifests: &[&str]) -> ImageStore {
         let store = ImageStore::open(root).expect("open");
         for m in manifests {
@@ -427,6 +431,7 @@ mod tests {
     }
 
     /// OCI-7: register の結果（新規・同一 manifest の再登録・別 manifest・在庫外）。
+    #[cfg(unix)]
     #[test]
     fn oci7_register_outcomes() {
         let tmp = Tmp::new("register");
@@ -454,6 +459,7 @@ mod tests {
     }
 
     /// OCI-7: registration は bind 前が None、bind 後が Some(世代)。
+    #[cfg(unix)]
     #[test]
     fn oci7_registration_is_none_until_bound() {
         let tmp = Tmp::new("bind");
@@ -467,6 +473,7 @@ mod tests {
     }
 
     /// OCI-7: release_if は世代違いで外さず、一致で外す。外して登録し直すと世代は変わる。
+    #[cfg(unix)]
     #[test]
     fn oci7_release_if_checks_generation_and_never_reissues() {
         let tmp = Tmp::new("gen");
@@ -502,6 +509,7 @@ mod tests {
     }
 
     /// OCI-7: 状態ルートが違えば同じコンテナ ID でも参照は別物で、他方の delete は外さない。
+    #[cfg(unix)]
     #[test]
     fn oci7_refs_are_scoped_per_state_root() {
         let tmp = Tmp::new("scope");
@@ -519,6 +527,7 @@ mod tests {
     }
 
     /// OCI-7: 223 バイト以上・255 バイトの長い ID も register / bind / release が通り、別 ID と混ざらない。
+    #[cfg(unix)]
     #[test]
     fn oci7_long_ids_round_trip() {
         let tmp = Tmp::new("long");
@@ -769,6 +778,7 @@ mod tests {
     }
 
     /// OCI-7・REPAIR-12（#2500・P2-3）: 長い別 ID の release / release_if は他方の確定済み参照を外さない。
+    #[cfg(unix)]
     #[test]
     fn oci7_long_id_delete_does_not_release_other() {
         let tmp = Tmp::new("longdel");
@@ -803,6 +813,7 @@ mod tests {
     }
 
     /// REPAIR-4・OCI-7: エラーの message は固定文言だけで、ID・パスを含まない。
+    #[cfg(unix)]
     #[test]
     fn oci7_error_messages_are_fixed_strings() {
         let tmp = Tmp::new("msg");

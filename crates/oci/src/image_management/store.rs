@@ -38,12 +38,14 @@
 //!   取得ごとに同じ検査を `@lock` / ゲートファイルの作成より前に再実行する（`reverify_root`・#2547）。
 //!   権限の基準（厳密な 0700 か現行の `0o022` か）と root の所有者の基準はオーナー判断待ちで、現行を保つ
 //!   （選択肢と影響は `docs/design/image-store-root-trust.md`・#2547）。残る制約: Windows は検査しない
-//!   （ACL は #2428 の方式判断後）、macOS の拡張 ACL は見ない（根拠は同 doc）。
+//!   （Windows ホストは検査ではなく `open` が設計上の恒久拒否。#2428 の案 C・#4333）、
+//!   macOS の拡張 ACL は見ない（根拠は同 doc）。
 //! - 再検査から使用までの差し替え（TOCTOU）は、Linux の x86_64 / aarch64 では root を開いたまま持つ
 //!   `RootHandle`（`root_handle`）の fd 起点の `openat2` / `*at` で閉じる（#2638）。入口の `reverify_root` が
 //!   差し替えを検出して拒否し、区間内の永続化操作（`@lock`・参照・在庫・ジャーナル・blob の削除）は検査済みの
-//!   実体にだけ届く。他の OS・アーキテクチャはパス起点＋入口の再検査のままで、「root と祖先は所有者専用」の
-//!   前提で防ぐ。`usage` の読み取りと `pull` の staging・公開はパス起点のまま（根拠は同 doc の論点 3）。
+//!   実体にだけ届く。macOS 等の他の unix・アーキテクチャはパス起点＋入口の再検査のままで、「root と祖先は所有者専用」の
+//!   前提で防ぐ。Windows ホストは `open` が恒久拒否のため到達しない。
+//!   `usage` の読み取りと `pull` の staging・公開はパス起点のまま（根拠は同 doc の論点 3）。
 //!   Linux 5.6 未満など `openat2` が使えない環境では `open` が `Unimplemented` で拒否する。
 
 use std::fs::{self, File, TryLockError};
@@ -89,12 +91,19 @@ impl ImageStore {
     ///
     /// unix では root が実効 uid の所有で group / other に書き込めず、祖先も root か実効 uid の所有で
     /// 他者に書き込めない（sticky 付きを除く）ことを要求し、違反は `PermissionDenied`（OCI-7・SEC-1・#2381）。
+    ///
+    /// 非 unix（Windows ホスト）は root の検査・副作用より前に設計上の恒久拒否（`FailedPrecondition`・固定 message。
+    /// OCI-7・SEC-1・OCI-5・#2428 の案 C・#4333）。core・CLI は WSL2 ゲスト内で動くため呼び出し元が無い。
     pub fn open(root: &Path) -> Result<Self, OciError> {
         Self::with_table(root, ReferenceTable::new())
     }
 
     /// 既存の参照テーブル（永続化からの読み込み結果。#853 等）でストアを開く。
+    ///
+    /// 非 unix は [`Self::open`] と同じく、最初に設計上の恒久拒否を返す（root は見ない・何も作らない）。
     pub fn with_table(root: &Path, table: ReferenceTable) -> Result<Self, OciError> {
+        // 副作用（root の検査・ディレクトリ作成・`@lock` の open）より前に Windows ホストを拒否する。
+        ensure_supported_host()?;
         // 末尾の区切りがあると symlink_metadata が symlink を辿るため、components で正規化してから判定する。
         let root: PathBuf = root.components().collect();
         if root.as_os_str().is_empty() {
@@ -122,6 +131,8 @@ impl ImageStore {
             let (canonical, id) = verify_root_trust(root, &meta)?;
             RootHandle::open_checked(canonical, id)?
         };
+        // 非 unix は冒頭の `ensure_supported_host` が必ず拒否するためここへは到達しない。
+        // Windows 専用の `RootHandle` 実装を型検査し続けるために残す（削除は別の整理）。
         #[cfg(not(unix))]
         let handle = RootHandle::open_checked(root)?;
         Ok(Self {
@@ -304,7 +315,7 @@ pub(super) fn wait_or_timeout(deadline: Instant) -> Result<(), OciError> {
 impl ImageStore {
     /// root と祖先の信頼性を再検査する（`lock` / create ゲートの取得ごと。副作用より前に呼ぶ。#2547・SEC-1）。
     ///
-    /// open 時の dev / ino と食い違えば差し替えとして `Internal`。非 unix は検査しない（Windows は #2428）。
+    /// open 時の dev / ino と食い違えば差し替えとして `Internal`。非 unix は `open` の時点で恒久拒否されるため到達しない（#4333）。
     pub(super) fn reverify_root(&self) -> Result<(), OciError> {
         #[cfg(unix)]
         {
@@ -339,6 +350,32 @@ impl ImageStore {
         }
         Ok(())
     }
+}
+
+/// Windows ホストで `ImageStore` を開くときの固定 message（パス・OS エラーを含めない。#4333）。
+#[cfg(not(unix))]
+const WINDOWS_HOST_REJECTED_MESSAGE: &str =
+    "image store is rejected on Windows hosts by design; it runs inside the Linux guest";
+
+/// `ImageStore::with_table` の最初に呼ぶ、実行ホストの対応可否の検査（OCI-7・SEC-1・OCI-5・#4333）。
+///
+/// core・CLI・supervisor は WSL2 ゲスト内で動く構成（`docs/design/windows-execution-layout.md`・#1415）で、
+/// Windows ホストで oci のイメージストアを開く設計上の呼び出し元は無い。所有者 SID・DACL の検査も持たないため、
+/// 信頼検査なしにパス起点で動く状態を作らず、副作用の前に `FailedPrecondition` で恒久的に拒否する
+/// （#2428 の案 C。#4181 は not planned）。`Unimplemented` ではなく前提（Linux ゲスト内で動く）の
+/// 不成立を表す。core の `FileStateStore::open`（#4332）と流儀をそろえる。
+#[cfg(unix)]
+fn ensure_supported_host() -> Result<(), OciError> {
+    Ok(())
+}
+
+/// 非 unix（Windows ホスト）の本体。上記のとおり常に設計上の拒否を返す。
+#[cfg(not(unix))]
+fn ensure_supported_host() -> Result<(), OciError> {
+    Err(OciError::new(
+        OciErrorCode::FailedPrecondition,
+        WINDOWS_HOST_REJECTED_MESSAGE,
+    ))
 }
 
 fn lock_file_error() -> OciError {
@@ -528,7 +565,9 @@ pub(super) mod test_hook {
     }
 }
 
-#[cfg(test)]
+// Windows ホストは設計上の拒否（#4333・#2428 案 C）で `ImageStore::open` が開けないため、ストアを開く以下の
+// 試験は unix に限る（CI を通すための skip ではなく前提の不成立。拒否そのものは `windows_rejection_tests` が照合する）。
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::image_management::{ContainerRefId, ManifestComposition, PullId, TagKey};
@@ -982,6 +1021,51 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
+        let _ = fs::remove_dir_all(&root);
+    }
+}
+
+/// OCI-7・SEC-1・OCI-5・#4333: Windows ホストの `ImageStore` は副作用の前に固定の設計上の拒否で失敗する。
+#[cfg(all(test, not(unix)))]
+mod windows_rejection_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    const EXPECTED_MESSAGE: &str =
+        "image store is rejected on Windows hosts by design; it runs inside the Linux guest";
+
+    fn scratch(label: &str) -> PathBuf {
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let p = std::env::temp_dir().join(format!(
+            "fc-oci-winreject-{}-{}-{label}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&p);
+        p
+    }
+
+    /// 存在しない root でも `NotFound` ではなく設計上の拒否になり、root を作らない。
+    #[test]
+    fn oci7_open_is_rejected_by_design_without_side_effects() {
+        let root = scratch("open").join("child");
+        let err = ImageStore::open(&root).expect_err("must be rejected");
+        assert_eq!(err.code(), OciErrorCode::FailedPrecondition);
+        assert_eq!(err.message(), EXPECTED_MESSAGE);
+        assert!(!root.exists());
+        assert!(!root.parent().expect("parent").exists());
+    }
+
+    /// 既存の空ディレクトリでも `@lock` 等を作らず拒否する。
+    #[test]
+    fn oci7_with_table_is_rejected_by_design_without_side_effects() {
+        let root = scratch("with-table");
+        fs::create_dir_all(&root).expect("mkdir");
+        let err =
+            ImageStore::with_table(&root, ReferenceTable::new()).expect_err("must be rejected");
+        assert_eq!(err.code(), OciErrorCode::FailedPrecondition);
+        assert_eq!(err.message(), EXPECTED_MESSAGE);
+        assert_eq!(fs::read_dir(&root).expect("read_dir").count(), 0);
         let _ = fs::remove_dir_all(&root);
     }
 }

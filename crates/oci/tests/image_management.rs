@@ -4,6 +4,9 @@
 //! 登録と解除、共有 blob の保護判定までを流す。`image tag` の排他下の入口（TASK-183.4）も
 //! `ImageStore` 経由で流す。永続化・CLI 経路は未実装のため対象外。
 
+// Windows ホストは設計上 `ImageStore` を開けない（#4333・#2428 案 C。拒否は src/image_management/store.rs の試験が照合）ため unix に限る。
+#![cfg(unix)]
+
 use fandhe_container_oci::error::OciErrorCode;
 use fandhe_container_oci::image_management::{
     ContainerRefId, ImageStore, ImageTagChange, ImageTagSource, ManifestComposition, PullId,

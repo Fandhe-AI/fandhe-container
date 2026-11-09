@@ -19,7 +19,8 @@
 //!
 //! `root_handle` と同じ分割（`cfg(target_os/arch)` は本ファイルと `root_handle.rs` の中だけ）。Linux の
 //! x86_64 / aarch64 は root の fd からの `openat2`（`RESOLVE_IN_ROOT | NO_SYMLINKS | NO_MAGICLINKS | NO_XDEV`、
-//! 最後の要素も `O_NOFOLLOW`）と `*at`。それ以外はパス起点の従来実装で、差し替えは入口の再検査だけで検出する。
+//! 最後の要素も `O_NOFOLLOW`）と `*at`。それ以外の unix はパス起点の従来実装で、差し替えは入口の再検査だけで検出する。
+//! Windows ホストは `ImageStore::open` が設計上の恒久拒否のため到達しない（#4333。非 unix の実装は型検査のために残す）。
 //!
 //! # fetcher の書き込み先（#2765）
 //!

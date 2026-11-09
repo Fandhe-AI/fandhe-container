@@ -4,6 +4,9 @@
 //! ステージング中の新規 blob が `image ls`・容量集計・参照テーブルに現れないことを照合する。
 //! 公開とロールバック（#475）は `image_pull_publish.rs` で扱う。
 
+// Windows ホストは設計上 `ImageStore` を開けない（#4333・#2428 案 C。拒否は src/image_management/store.rs の試験が照合）ため unix に限る。
+#![cfg(unix)]
+
 use std::fs;
 use std::path::PathBuf;
 

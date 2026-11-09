@@ -644,6 +644,7 @@ thread_local! {
 
 /// 試験用: このスレッドの在庫の保存失敗の注入を切り替える（権限に依存せず保存失敗を再現する）。
 #[cfg(test)]
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(super) fn set_fail_save(on: bool) {
     FAIL_SAVE.with(|c| c.set(on));
 }
@@ -749,7 +750,8 @@ fn write_and_rename(root: &RootHandle, tmp: &str, bytes: &[u8]) -> Result<(), Oc
     Ok(())
 }
 
-#[cfg(test)]
+// Windows ホストは設計上 `ImageStore` を開けない（#4333・#2428 案 C。拒否は store.rs の試験が照合）ため unix に限る。
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::image_management::ImageStore;

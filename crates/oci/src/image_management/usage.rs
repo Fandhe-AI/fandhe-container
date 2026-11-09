@@ -478,7 +478,8 @@ fn scan_cache(dir: &BlobDir, registered: &BTreeSet<&Digest>) -> Result<CacheUsag
     Ok(usage)
 }
 
-#[cfg(test)]
+// Windows ホストは設計上 `ImageStore` を開けない（#4333・#2428 案 C。拒否は store.rs の試験が照合）ため unix に限る。
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::image_management::{ContainerRefId, ManifestComposition, PullId};

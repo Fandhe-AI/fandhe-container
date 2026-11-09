@@ -21,7 +21,7 @@
 //! 9. 展開に成功したときだけ、組んだエントリ（`rootfs/` と展開設定の記録 `unpack-record`）を 1 回の `rename` で
 //!    `<cache_dir>/rootfs/sha256/<config-hex>/` へ公開する（記録の無い rootfs が残らない）。公開先 `rootfs/sha256` の
 //!    作成・命中判定・記録の読み取り・`renameat` は検査済み root の fd 起点（`PullSession::ensure_published_rootfs_dir`。
-//!    Linux x86_64 / aarch64。それ以外の unix はパス起点で入口の再検査に頼る。Windows は #4181。#4283）で行い、
+//!    Linux x86_64 / aarch64。それ以外の unix はパス起点で入口の再検査に頼る。Windows ホストは `ImageStore::open` が設計上の恒久拒否のため到達しない〔#2428 の案 C・#4333〕。#4283）で行い、
 //!    公開の直前にパスとの同一性を照合して差し替えを成功に見せない。公開済みで、
 //!    記録（config・展開設定）と layer の表現が今回と一致するときだけ 8 を省く。layer の表現（圧縮 blob の digest・
 //!    mediaType）だけ違うときは今回の descriptor で展開を検証し直す（公開はしない）。件数の照合は命中時も行い、

@@ -4,6 +4,9 @@
 //! 解放後に取得できることを確かめる。子プロセスは同じ試験バイナリを `--exact` で再起動する
 //! （core の state_store_integration と同じ形）。待機にはすべて期限を置く（REPAIR-5）。
 
+// Windows ホストは設計上 `ImageStore` を開けない（#4333・#2428 案 C。拒否は src/image_management/store.rs の試験が照合）ため unix に限る。
+#![cfg(unix)]
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};

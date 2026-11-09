@@ -196,7 +196,7 @@ helper を supervisor の bin に置く理由は、exec の領域（healthcheck 
 | 1 | `/dev/null` |
 | 2 | 診断行（JSON 1 行。上限つきで plugin-cri の構造化ログへ転送する。healthcheck と同じ扱い） |
 
-- channel の frame は固定長・big-endian で、壊れた値を表現できない型にする（REPAIR-2）。plugin-cri から helper へは `StdioHandover`（マスクと、そのビット数ちょうどの fd を SCM_RIGHTS で送る。最大 3 本）。helper から plugin-cri へは `Started`・`PtyMaster`（tty のときだけ fd 1 本）・`Result`（exited n / signaled s / not_started 段 コード / failed コード）。受け側は fd の本数・`MSG_CTRUNC`・マスクとの不一致をすべて拒否し、受け取った fd は drop で閉じる。magic・各 frame の長さ・語彙は #3759 で確定し、本書は構造と上限だけを定める
+- channel の frame は固定長・big-endian で、壊れた値を表現できない型にする（REPAIR-2）。plugin-cri から helper へは `StdioHandover`（マスクと、そのビット数ちょうどの fd を SCM_RIGHTS で送る。最大 3 本）。helper から plugin-cri へは `Started`・`PtyMaster`（tty のときだけ fd 1 本）・`Spawned`（コマンドのホスト側 pid。fork の後に高々 1 回。届かないこともある。#4316）・`Result`（exited n / signaled s / not_started 段 コード / failed コード）。受け側は fd の本数・`MSG_CTRUNC`・マスクとの不一致をすべて拒否し、受け取った fd は drop で閉じる。magic・各 frame の長さ・語彙は #3759 で確定し、本書は構造と上限だけを定める
 - pre_exec を使わず、子に渡す fd は `Stdio` の 3 本だけにする（新しい unsafe を sys の外に作らない）
 
 **stdio と pty**:

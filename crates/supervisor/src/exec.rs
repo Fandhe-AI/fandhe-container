@@ -282,8 +282,9 @@
 //! - 実機前提の通し試験 `tests/exec.rs` の実行結果の記録（root を要し、CI ではビルドのみで実行していない）
 
 use std::io::{BufRead as _, Read as _, Write as _};
-use std::num::NonZeroU32;
+use std::num::{NonZeroU8, NonZeroU32};
 use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
+use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 use fandhe_container_core::audit_log::{
@@ -931,7 +932,10 @@ pub fn run_command(
                 deadline,
                 child,
                 sender,
-                ExecStdio::NONE,
+                WorkerIo {
+                    stdio: ExecStdio::NONE,
+                    signal_tx: None,
+                },
             )
         },
     );
@@ -1094,6 +1098,7 @@ pub fn run_command_with_pidfd_env(
             stdio: ExecStdio::NONE,
             on_created: None,
             cancel: None,
+            signal: None,
         },
     )
 }
@@ -1127,6 +1132,7 @@ pub fn run_command_with_pidfd_output(
             stdio: ExecStdio::combined(output),
             on_created: None,
             cancel: None,
+            signal: None,
         },
     )
 }
@@ -1171,6 +1177,98 @@ pub type ExecCreatedHook<'a> = dyn Fn(&ExecCgroupName) -> Result<(), TraitError>
 /// （要求元の異常終了。#4166・SUP-6）。非ブロッキングで速く返ること（刻みごとに呼ばれる）。
 pub type ExecCancelHook<'a> = dyn Fn() -> bool + 'a;
 
+/// コマンドへのシグナルの配送の結果（[`CommandSignaler::deliver`]。#4282・SUP-6）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ExecSignalDelivery {
+    /// コマンドへ送れた。
+    Delivered,
+    /// コマンドの pidfd がまだ届いていない（コマンドの fork の前後。呼び出し側が猶予の間、刻みごとに再試行する）。
+    NotStarted,
+    /// コマンドは既に終わっていた（回収済みの pidfd への送信 `ESRCH`、または pidfd が渡される前に worker が終わった）。
+    Exited,
+    /// 送れなかった（pidfd として使えない fd・権限不足・未対応カーネル）。
+    Unavailable,
+}
+
+/// exec のコマンド（本体の 1 プロセス。子孫には送らない）へシグナルを送る口（[`ExecSignalHook`] の引数。#4282・SUP-6・SEC-1）。
+///
+/// 宛先は worker がコマンドを fork した直後に開いた pidfd で、pid の再利用で別のプロセスに届くことはない。番号の許可リストは
+/// 呼び出し側（stream-exec の helper。`stream_exec::wire::ExecSignal`）が持つ。非ブロッキングで速く返る。
+pub trait CommandSignaler {
+    /// `number` を送る。pidfd が未着なら 1 本だけ非ブロッキングで受け取ってから送る。
+    fn deliver(&self, number: NonZeroU8) -> ExecSignalDelivery;
+}
+
+/// exec の待ちの刻みごとに呼ばれるシグナル処理のフック型（[`ExecLaunchIo::signal`]）。非ブロッキングで速く返ること。
+pub type ExecSignalHook<'a> = dyn Fn(&dyn CommandSignaler) + 'a;
+
+/// 本番の [`CommandSignaler`]: worker から `SCM_RIGHTS` で渡されたコマンドの pidfd へ `pidfd_send_signal` する（#4282）。
+///
+/// 受信口 `rx` は fork 前に作った socketpair の親側（非ブロッキング）。worker は `spawn_exec_command_with_stdio` の直後に pidfd を
+/// 1 本だけ送る（送れなくても exec は続く。その場合は `NotStarted` のまま猶予を過ぎ、`Unavailable` になる）。
+struct PidfdSignaler {
+    rx: UnixStream,
+    state: std::cell::RefCell<PidfdState>,
+}
+
+#[derive(Default)]
+struct PidfdState {
+    pidfd: Option<OwnedFd>,
+    /// worker の端が閉じた（pidfd が届いていなければ、もう届かない）。
+    closed: bool,
+}
+
+impl PidfdSignaler {
+    fn new(rx: UnixStream) -> Self {
+        Self {
+            rx,
+            state: std::cell::RefCell::new(PidfdState::default()),
+        }
+    }
+
+    /// pidfd が未着なら、非ブロッキングで 1 回だけ受け取る（fd はちょうど 1 本のときだけ採る。それ以外は閉じる）。
+    fn fetch(&self) {
+        let mut state = self.state.borrow_mut();
+        if state.pidfd.is_some() || state.closed {
+            return;
+        }
+        let mut byte = [0u8; 1];
+        match crate::sys::recv_with_fds(self.rx.as_fd(), &mut byte) {
+            Ok(got) if got.len == 0 => state.closed = true,
+            Ok(got) => {
+                if !got.truncated && got.fds.len() == 1 {
+                    state.pidfd = got.fds.into_iter().next();
+                }
+            }
+            Err(_) => {}
+        }
+    }
+}
+
+impl CommandSignaler for PidfdSignaler {
+    fn deliver(&self, number: NonZeroU8) -> ExecSignalDelivery {
+        self.fetch();
+        let state = self.state.borrow();
+        let Some(pidfd) = state.pidfd.as_ref() else {
+            return if state.closed {
+                ExecSignalDelivery::Unavailable
+            } else {
+                ExecSignalDelivery::NotStarted
+            };
+        };
+        match fandhe_container_core::exec::send_signal_via_pidfd(pidfd.as_fd(), number) {
+            Ok(fandhe_container_core::exec::PidfdSignalDelivery::Delivered) => {
+                ExecSignalDelivery::Delivered
+            }
+            Ok(fandhe_container_core::exec::PidfdSignalDelivery::Gone) => {
+                ExecSignalDelivery::Exited
+            }
+            _ => ExecSignalDelivery::Unavailable,
+        }
+    }
+}
+
 /// exec の入出力・env・作成通知の束（引数の数を抑えるための要求型。SUP-4・SUP-6・#2441）。
 pub struct ExecLaunchIo<'a> {
     /// launch 時の起動オプションの env 上書き（`KEY=VALUE`。契約は [`run_command_with_pidfd_env`]）。
@@ -1187,6 +1285,12 @@ pub struct ExecLaunchIo<'a> {
     /// 期限で終わる）。`None` なら従来の経路をそのまま通る（helper 以外の呼び出し元の既定）。適用は listener を受け取って
     /// 応答者を回した後の段で、受け渡し前の窓は既存の短い期限に任せる。
     pub cancel: Option<&'a ExecCancelHook<'a>>,
+    /// コマンドへ SIGKILL 以外のシグナルを送るためのフック（stream-exec の helper だけが渡す。#4282・SUP-6・CRI-5・SEC-1）。
+    /// `Some` のとき、worker がコマンドの pidfd を親へ渡す口（socketpair）を fork 前に作り、exec の待ちの刻みごと
+    /// （応答者の `SERVE_STEP`・終了待ちの `CANCEL_POLL_STEP`）に、`cancel` が偽の間だけ [`CommandSignaler`] 付きで呼ぶ。
+    /// 期限・`WORKER_GRACE`・取り消しの意味は変えない。`None` なら従来の経路をそのまま通る（helper 以外の呼び出し元の既定。
+    /// CLI の exec・healthcheck はこの口に入れない）。
+    pub signal: Option<&'a ExecSignalHook<'a>>,
 }
 
 /// [`run_command_with_pidfd_output`] に、exec 子 cgroup の **作成成功の通知** `on_created` を足した入口
@@ -1222,15 +1326,51 @@ fn run_command_with_pidfd_inner(
         stdio,
         on_created,
         cancel,
+        signal,
     } = io;
     let deadline = Deadline::after(timeout);
     running_pid(record).map_err(AuditedRejection::not_applicable)?;
+    // シグナルのフックがあるときだけ、worker がコマンドの pidfd を親へ渡す socketpair を fork 前に作る（#4282）。
+    // 親は受信側（非ブロッキング）、worker は送信側を持つ。
+    let (signal_rx, signal_tx) = match signal {
+        Some(_) => {
+            let make = || -> std::io::Result<(UnixStream, UnixStream)> {
+                let (rx, tx) = UnixStream::pair()?;
+                rx.set_nonblocking(true)?;
+                Ok((rx, tx))
+            };
+            let (rx, tx) = make().map_err(|e| {
+                AuditedRejection::not_applicable(TraitError::new(
+                    ErrorCode::Internal,
+                    format!(
+                        "exec stage Spawn: signal channel setup failed: {}",
+                        e.kind()
+                    ),
+                ))
+            })?;
+            (Some(PidfdSignaler::new(rx)), Some(tx))
+        }
+        None => (None, None),
+    };
+    // 待ちの刻みごとの判定: 取り消しを先に見て、取り消しでなければシグナルを処理する（取り消し済みの exec へは送らない）。
+    let tick = || -> bool {
+        let gone = cancel.is_some_and(|c| c());
+        if !gone && let (Some(hook), Some(signaler)) = (signal, signal_rx.as_ref()) {
+            hook(signaler);
+        }
+        gone
+    };
+    let tick_hook: Option<&ExecCancelHook<'_>> = if cancel.is_some() || signal_rx.is_some() {
+        Some(&tick)
+    } else {
+        None
+    };
     let sweep = sweep_before_create(record);
     let name = ExecCgroupName::unique();
     let result = run_owning_child_cgroup(
         deadline,
         exec_responder(record, audit),
-        cancel,
+        tick_hook,
         || {
             let created = create_child_cgroup(record, &name)?;
             // 排他作成に成功した（所有を確定した）直後にだけ通知する。通知に失敗したら、所有している cgroup を
@@ -1245,10 +1385,22 @@ fn run_command_with_pidfd_inner(
             Ok(created)
         },
         || cleanup_child_cgroup(record, &name),
-        |proof, child, sender| {
+        // `move`: 送信側 `signal_tx` を worker だけが持つ（親は fork 後にこのクロージャごと drop して閉じる）。
+        move |proof, child, sender| {
             let target = identify_pid1_with_pidfd_staged(record, pidfd)?
                 .with_launch_env(launch_env.to_vec());
-            run_with_target(proof, &target, request, deadline, child, sender, stdio)
+            run_with_target(
+                proof,
+                &target,
+                request,
+                deadline,
+                child,
+                sender,
+                WorkerIo {
+                    stdio,
+                    signal_tx: signal_tx.as_ref().map(|s| s.as_fd()),
+                },
+            )
         },
     );
     audit_worker_result(
@@ -1302,7 +1454,10 @@ pub fn run_command_in(
                 deadline,
                 child,
                 sender,
-                ExecStdio::NONE,
+                WorkerIo {
+                    stdio: ExecStdio::NONE,
+                    signal_tx: None,
+                },
             )
         },
     );
@@ -2468,6 +2623,15 @@ fn decode_worker_result(line: &[u8]) -> Result<ExecOutcome, WorkerFailure> {
     })
 }
 
+/// worker（exec 専用プロセス）がコマンドの起動で使う入出力の束（引数の数を抑える。#4282）。
+#[derive(Clone, Copy)]
+struct WorkerIo<'a> {
+    /// コマンドの標準入出力の指定。
+    stdio: ExecStdio<'a>,
+    /// コマンドの pidfd を親（stream-exec の helper）へ渡す socketpair の送信側（`signal` のフックがあるときだけ。#4282）。
+    signal_tx: Option<BorrowedFd<'a>>,
+}
+
 /// 特定済みの対象に対して、参加 → 制限の再適用 → 実行 → 待機を順に行う（[`run_command_with_pidfd`] の本体）。
 fn run_with_target(
     proof: &ExecWorkerProof,
@@ -2476,7 +2640,7 @@ fn run_with_target(
     deadline: Deadline,
     child_cgroup: Option<&ExecChildCgroup>,
     listener: ExecListenerSender,
-    stdio: ExecStdio<'_>,
+    io: WorkerIo<'_>,
 ) -> Result<ExecOutcome, WorkerError> {
     // コマンドだけを入れる子 cgroup は、呼び出しプロセスが fork 前に作って所有する（worker は fd を継承して使う。
     // 同名の既存を後始末で止めないため。#1466）。配置の記録が無ければ `identify_pid1` が先に拒否しここへ来ない。
@@ -2486,15 +2650,7 @@ fn run_with_target(
             "exec stage CgroupJoin: the exec child cgroup was not created",
         )
     })?;
-    let result = run_in_child_cgroup(
-        proof,
-        target,
-        request,
-        deadline,
-        child_cgroup,
-        listener,
-        stdio,
-    );
+    let result = run_in_child_cgroup(proof, target, request, deadline, child_cgroup, listener, io);
     // 成否によらず、コマンドの子孫を子 cgroup ごと止める（exec の終了後に子孫を残さない。削除は呼び出しプロセスが行う）。
     // 失敗しても呼び出しプロセスの後始末が改めて `cgroup.kill` する。
     let _ = child_cgroup.kill_all();
@@ -2509,7 +2665,7 @@ fn run_in_child_cgroup(
     deadline: Deadline,
     child_cgroup: &ExecChildCgroup,
     listener: ExecListenerSender,
-    stdio: ExecStdio<'_>,
+    io: WorkerIo<'_>,
 ) -> Result<ExecOutcome, WorkerError> {
     // 参加する cgroup の準備（参加の前に済ませる。失敗しても呼び出し側が子 cgroup の後始末を行う）。
     let cgroup = prepare_cgroup_join_staged(target)?;
@@ -2577,21 +2733,27 @@ fn run_in_child_cgroup(
         };
     let stdio = ChildStdio::from_fds(
         dup(
-            stdio.stdin,
+            io.stdio.stdin,
             "exec stage Spawn: failed to duplicate the exec stdin",
         )?,
         dup(
-            stdio.stdout,
+            io.stdio.stdout,
             "exec stage Spawn: failed to duplicate the exec stdout",
         )?,
         dup(
-            stdio.stderr,
+            io.stdio.stderr,
             "exec stage Spawn: failed to duplicate the exec stderr",
         )?,
     )
     .map_err(from_exec_error_staged)?;
     let child = spawn_exec_command_with_stdio(ready, &command, child_cgroup, stdio)
         .map_err(from_exec_error_staged)?;
+    // コマンドの pidfd を親（stream-exec の helper）へ 1 本だけ渡す（SIGKILL 以外のシグナルの宛先。#4282・SUP-6・SEC-1）。
+    // 最善努力: 送れなくても（pidfd なし・コンテナの seccomp が `sendmsg` を拒否・親が閉じた）exec は続け、結果は捨てる。
+    // 親は届かない間 `NotStarted` を返し、猶予を過ぎると `Unavailable` になる（fail-closed。シグナルは届かない側へ倒れる）。
+    if let (Some(tx), Some(pidfd)) = (io.signal_tx, child.pidfd()) {
+        let _ = crate::sys::send_with_fds(tx, &[1u8], &[pidfd]);
+    }
     // 回収する前に控える（worker の PID namespace の値。`SetupFailed` の判定は `exit` が持つ）。
     let spawned_pid = NonZeroU32::new(child.pid());
     let exit = wait_or_stop(

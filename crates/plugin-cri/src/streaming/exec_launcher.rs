@@ -753,7 +753,10 @@ impl SupervisorExecLauncher {
                     Ok(_) => CriError::internal("exec ended before it started"),
                 });
             }
-            Ok(HelperMessage::PtyMaster(_)) => return Err(CriError::internal("exec failed")),
+            // この経路は `Signal` を送らないので、`SignalAck` が来るのは想定外（#4282。想定外の frame として失敗にする）。
+            Ok(HelperMessage::PtyMaster(_) | HelperMessage::SignalAck { .. }) => {
+                return Err(CriError::internal("exec failed"));
+            }
             Err(e) => return Err(channel_error(&e)),
         }
         let pty = if req.tty {

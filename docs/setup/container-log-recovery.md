@@ -25,6 +25,7 @@ supervisor ログの扱いは末尾の「supervisor ログ」の節に分けて�
 - 古い supervisor が生きていて sink のロックを持ち続けているログ（`skipped_live`）
 - 状態がある ID のログ（`skipped_present`）。この ID は消さない
 - ID に戻せない名前（`skipped_undecodable`。大文字入りなど、sink が作らない名前）
+- shim v2（`<base>-shim-state/...`）の状態ルートの残り。今は自動では回収されず、手動で消す。自動化の方式は `docs/design/shim-v2-production-binary.md` の D7（#4241）で決め、実装は未着手
 - plugin-cri が動いている間に発生した残り（次の起動まで）と、plugin-cri と異なる `--root` の状態ルート
 
 ## 手動の手順

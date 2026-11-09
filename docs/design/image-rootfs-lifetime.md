@@ -59,6 +59,7 @@ delete の rootfs 削除の失敗は `DeleteResponse` の `image_rootfs`（`Clea
 
 ## 対象外（後続の候補）
 
+- shim v2 の delete の経路は `create_with_image` を使わず、`image_rootfs` は常に `NotApplicable` である。CRI・shim が採用したときに、bundle から呼べる孤児回収の公開 API を足す（`shim-v2-production-binary.md` D7。#4241）
 - CLI / CRI / supervisor から `ImageRootfsPrivilege`・`DeleteOptions`・`ReapOptions` を渡す配線（#2315・#2243）と、マルチスレッド経路の子プロセス方式
 - 通常の `create` が core 製の木（同一性が一致する v2 / v3 の印を持つ木）を `root.path` で採用するのを拒否すること（同じ / 別の状態ルート。検出できないまま残る構成。決定 F）
 - `OpRecorder` の計数（`image_rootfs_orphan_reap` 等）を運用者へ出す手段

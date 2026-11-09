@@ -131,6 +131,12 @@ impl BundleDir {
         self.dir.open_child_dir(ROOTFS_NAME)
     }
 
+    /// 直下に `rootfs/` がディレクトリとして在るか（読み取り権限を要求しない。mode 0000 でも `true`）。
+    /// 無ければ `false`、ディレクトリでなければ `FailedPrecondition`。解放前の種別確認用（CRI-2）。
+    pub fn rootfs_dir_exists(&self) -> Result<bool, OciError> {
+        self.dir.child_dir_exists(ROOTFS_NAME)
+    }
+
     /// 直下の `rootfs/` を symlink を辿らず木ごと消す（不在は成功）。
     pub fn remove_rootfs_tree(&self) -> Result<(), OciError> {
         self.dir.remove_child_tree(ROOTFS_NAME)

@@ -279,6 +279,21 @@ mod imp {
             }
         }
 
+        /// 直下の子ディレクトリ `name` の有無を、読み取り権限を要求せず（`O_PATH`）symlink を辿らず確かめる。
+        /// 無ければ `false`。symlink・通常ファイルは `FailedPrecondition`。mode 0000 / 0300 の子も `true`
+        /// （削除側が権限を戻して消すため、種別確認で回収を妨げない。OCI-7・CRI-2・#4348）。
+        pub fn child_dir_exists(&self, name: &str) -> Result<bool, OciError> {
+            let name_c = child_cstring(OsStr::new(name))?;
+            match at::openat2(Some(self.fd.as_fd()), &name_c, DIR_FLAGS, 0, RESOLVE) {
+                Ok(_) => Ok(true),
+                Err(e) if e.raw_os_error() == Some(ENOENT) => Ok(false),
+                Err(e) if matches!(e.raw_os_error(), Some(at::ELOOP | at::ENOTDIR)) => {
+                    Err(not_a_directory())
+                }
+                Err(e) => Err(map_at_err(&e)),
+            }
+        }
+
         /// 直下に `name` を排他作成（`O_EXCL | O_NOFOLLOW`）して書き込み用に開く。mode は umask で削られうるため、
         /// 呼び出し側が返した `File` に明示的に設定し直すこと。
         pub fn create_new_file(&self, name: &str, mode: u32) -> Result<File, OciError> {
@@ -982,6 +997,18 @@ mod imp {
                 Ok(m) if m.file_type().is_dir() => Ok(Some(Self::from_path(p))),
                 Ok(_) => Err(not_a_directory()),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(map_fs_err(&e)),
+            }
+        }
+
+        /// 直下の子ディレクトリ `name` の有無を確かめる（パス起点）。無ければ `false`、ディレクトリでなければ
+        /// `FailedPrecondition`。
+        pub fn child_dir_exists(&self, name: &str) -> Result<bool, OciError> {
+            let p = self.path.join(checked_child(name)?);
+            match fs::symlink_metadata(&p) {
+                Ok(m) if m.file_type().is_dir() => Ok(true),
+                Ok(_) => Err(not_a_directory()),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
                 Err(e) => Err(map_fs_err(&e)),
             }
         }

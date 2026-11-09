@@ -910,8 +910,8 @@ impl RootfsSource for ImageRootfsSource {
     ) -> Result<(), CriError> {
         // `bundle` の fd 起点で `rootfs` が本物のディレクトリか確かめてから消す。symlink・通常ファイル等は辿らず
         // 消さない（リンク先の削除を防ぐ。fail-closed）。パスで開き直さないので bundle の親の差し替えはおとりへ届かない。
-        match bundle.open_rootfs_dir() {
-            Ok(Some(_)) => bundle
+        match bundle.rootfs_dir_exists() {
+            Ok(true) => bundle
                 .remove_rootfs_tree_bounded(&budget.to_extract_budget())
                 .map_err(|e| {
                     if e.code() == OciErrorCode::Timeout {
@@ -920,7 +920,7 @@ impl RootfsSource for ImageRootfsSource {
                         CriError::internal("failed to remove rootfs")
                     }
                 }),
-            Ok(None) => Ok(()),
+            Ok(false) => Ok(()),
             Err(e) if e.code() == OciErrorCode::FailedPrecondition => {
                 Err(CriError::internal("rootfs path is not a directory"))
             }

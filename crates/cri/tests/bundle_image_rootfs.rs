@@ -881,6 +881,21 @@ fn oci7_release_removes_the_bundle_with_readonly_directories() {
     );
 }
 
+/// release は読み取り権限のない rootfs（mode 0000 / 0300）も権限を戻して回収する（CRI-2・OCI-7・#4348）。
+/// 非 root のときだけ意味がある（root は権限を無視して開けるため回収できることだけを見る）。
+#[test]
+fn cri2_release_reclaims_a_rootfs_without_read_permission() {
+    for mode in [0o000_u32, 0o300] {
+        let env = pulled_env(&format!("release-mode-{mode:o}"), CONFIG_SECTION);
+        let p = env.provider();
+        let dir = prepare(&p, "ctr1", &container(&env.image_id)).unwrap();
+        fs::set_permissions(dir.join("rootfs"), fs::Permissions::from_mode(mode)).unwrap();
+        p.release("ctr1")
+            .unwrap_or_else(|e| panic!("release at mode {mode:o}: {e:?}"));
+        assert!(!dir.exists(), "bundle remains at mode {mode:o}");
+    }
+}
+
 /// release は rootfs が symlink なら辿らず消さずに拒否する。
 #[test]
 fn sec1_release_does_not_follow_a_rootfs_symlink() {

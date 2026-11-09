@@ -9,8 +9,8 @@
 #![cfg(target_os = "linux")]
 
 use std::fs::File;
-use std::io::Read as _;
-use std::num::NonZeroU32;
+use std::io::{Read as _, Write as _};
+use std::num::{NonZeroU8, NonZeroU32};
 use std::os::fd::{AsFd as _, OwnedFd};
 use std::os::unix::fs::DirBuilderExt as _;
 use std::os::unix::net::UnixStream;
@@ -33,6 +33,7 @@ use fandhe_container_core::traits::{
 use fandhe_container_supervisor::control::{
     ControlExecHandover, ExecControlFailure, ExecCreatedNotifier, ExecHandover, ExecPidfdSource,
 };
+use fandhe_container_supervisor::exec::{CommandSignaler, ExecSignalDelivery};
 use fandhe_container_supervisor::stream_exec::channel::{
     ChannelError, HelperMessage, StdioSend, recv_from_helper, send_stdio_handover,
 };
@@ -40,7 +41,7 @@ use fandhe_container_supervisor::stream_exec::diag::HelperStage;
 use fandhe_container_supervisor::stream_exec::helper::{
     Deps, ServeReport, StreamExecArgs, serve_reporting,
 };
-use fandhe_container_supervisor::stream_exec::wire::{StdioMask, StreamExecOutcome};
+use fandhe_container_supervisor::stream_exec::wire::{SignalAckCode, StdioMask, StreamExecOutcome};
 
 const PID: u32 = 4242;
 
@@ -107,6 +108,8 @@ struct Counts {
     run: AtomicUsize,
     /// 順序の記録（`notify` → `run-done` など）。
     events: Mutex<Vec<&'static str>>,
+    /// 偽の signaler が受けたシグナル番号（`deliver` の呼び出しごと。#4282）。
+    signals: Mutex<Vec<u8>>,
 }
 
 impl Counts {
@@ -206,6 +209,36 @@ struct Scenario {
     /// `Some` なら、`serve` の開始直後からこの時間の後に plugin 側の channel の端を別スレッドで閉じる
     /// （要求元の消滅の模擬。戻り値の端は別の socketpair のダミーになる）。
     close_plugin_after: Option<Duration>,
+    /// `serve` の開始前に plugin 側から送っておく生のバイト列（`Signal` frame と、壊れた frame の注入。#4282）。
+    pre_send: Vec<Vec<u8>>,
+    /// `Some` なら偽の実行役が `io.signal` のフックを 10 ms 刻みでこの長さの間呼び続ける（偽の signaler 付き。#4282）。
+    signal_watch: Option<Duration>,
+    /// 偽の signaler の `deliver` の結果の列（足りない分は最後の値の繰り返し。空なら `Unavailable`）。
+    deliveries: Vec<ExecSignalDelivery>,
+}
+
+/// 偽の [`CommandSignaler`]（呼ばれた番号を `Counts::signals` に記録し、決めた列で結果を返す。#4282）。
+struct FakeSignaler<'a> {
+    counts: &'a Counts,
+    deliveries: &'a [ExecSignalDelivery],
+    calls: AtomicUsize,
+}
+
+impl CommandSignaler for FakeSignaler<'_> {
+    fn deliver(&self, number: NonZeroU8) -> ExecSignalDelivery {
+        self.counts.signals.lock().expect("lock").push(number.get());
+        let i = self.calls.fetch_add(1, Ordering::SeqCst);
+        self.deliveries
+            .get(i)
+            .or(self.deliveries.last())
+            .copied()
+            .unwrap_or(ExecSignalDelivery::Unavailable)
+    }
+}
+
+/// 版 3 の `Signal` frame の生のバイト列（#4282。`version` は壊れた版の注入にも使う）。
+fn signal_bytes(version: u8, number: u8) -> Vec<u8> {
+    vec![b'F', b'C', b'S', b'X', version, 5, 0, 1, number]
 }
 
 impl Default for Scenario {
@@ -219,6 +252,9 @@ impl Default for Scenario {
             exit: ExecExit::Command(ChildExit::Exited(3)),
             watch_cancel: None,
             close_plugin_after: None,
+            pre_send: Vec::new(),
+            signal_watch: None,
+            deliveries: Vec::new(),
         }
     }
 }
@@ -256,6 +292,9 @@ fn drive_reporting(
     let counts = Arc::new(Counts::default());
     let (plugin, helper) = UnixStream::pair().expect("pair");
     send_stdio_handover(&plugin, stdio, Instant::now() + Duration::from_secs(5)).expect("send");
+    for bytes in &sc.pre_send {
+        (&plugin).write_all(bytes).expect("pre-send bytes");
+    }
     let source = FakeSource {
         counts: Arc::clone(&counts),
         unavailable: sc.source_unavailable,
@@ -301,6 +340,19 @@ fn drive_reporting(
                         "exec cancelled",
                     )));
                 }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        if let Some(span) = sc.signal_watch {
+            let hook = io.signal.expect("serve must pass the signal hook (#4282)");
+            let signaler = FakeSignaler {
+                counts: &counts,
+                deliveries: &sc.deliveries,
+                calls: AtomicUsize::new(0),
+            };
+            let begin = Instant::now();
+            while begin.elapsed() < span {
+                hook(&signaler);
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
@@ -917,4 +969,173 @@ fn sup6_4284_control_client_carries_the_os_errno() {
         .expect_err("expired");
     assert_eq!(expired.error().code(), ErrorCode::Timeout);
     assert_eq!(expired.errno(), None);
+}
+
+/// `serve` の後に plugin 側で受けられる frame を集める（`Started` は数えず、`SignalAck` は (番号, code) にする。
+/// 何も無くなる〔`Timeout`〕か、閉じるまで）。#4282
+fn collect_acks(plugin: &UnixStream) -> (bool, Vec<(u8, SignalAckCode)>) {
+    let mut started = false;
+    let mut acks = Vec::new();
+    loop {
+        match recv_from_helper(plugin, Instant::now() + Duration::from_millis(150)) {
+            Ok(HelperMessage::Started(_)) => started = true,
+            Ok(HelperMessage::SignalAck { signal, code }) => acks.push((signal.get(), code)),
+            Ok(other) => panic!("unexpected {other:?}"),
+            Err(ChannelError::Timeout | ChannelError::Closed) => return (started, acks),
+            Err(e) => panic!("unexpected channel error {e:?}"),
+        }
+    }
+}
+
+fn signal_scenario(pre_send: Vec<Vec<u8>>, deliveries: Vec<ExecSignalDelivery>) -> Scenario {
+    Scenario {
+        pre_send,
+        deliveries,
+        signal_watch: Some(Duration::from_millis(300)),
+        ..Scenario::default()
+    }
+}
+
+/// SUP-6・SEC-1・CRI-5（#4282）: `serve` はシグナルのフックを渡す。SIGTERM の frame は偽の signaler へ 15 として届き、
+/// `Started` の後に `SignalAck(15, delivered)` が 1 件だけ返る。結果の値は変わらない。
+#[test]
+fn sup6_4282_signal_frame_is_delivered_and_acked_once() {
+    let base = Tmp::new("sigok");
+    let store = open(&base);
+    seed(&base, &store, "run1", Some(PID));
+    let args = args_for(&base, "run1", PID, 0);
+    let sc = signal_scenario(
+        vec![signal_bytes(3, 15)],
+        vec![ExecSignalDelivery::Delivered],
+    );
+    let (out, counts, plugin) = drive(&store, &args, &StdioSend::default(), &sc);
+    assert_eq!(out, StreamExecOutcome::Exited(3));
+    assert_eq!(*counts.signals.lock().expect("lock"), vec![15]);
+    let (started, acks) = collect_acks(&plugin);
+    assert!(started);
+    assert_eq!(acks, vec![(15, SignalAckCode::Delivered)]);
+}
+
+/// SUP-6・REPAIR-5（#4282）: 配送の結果（exited・unavailable）は固定語彙の ack になる。
+#[test]
+fn sup6_4282_delivery_results_map_to_ack_codes() {
+    for (delivery, code) in [
+        (ExecSignalDelivery::Exited, SignalAckCode::Exited),
+        (ExecSignalDelivery::Unavailable, SignalAckCode::Unavailable),
+    ] {
+        let base = Tmp::new("sigmap");
+        let store = open(&base);
+        seed(&base, &store, "run1", Some(PID));
+        let args = args_for(&base, "run1", PID, 0);
+        let sc = signal_scenario(vec![signal_bytes(3, 2)], vec![delivery]);
+        let (_out, counts, plugin) = drive(&store, &args, &StdioSend::default(), &sc);
+        assert_eq!(*counts.signals.lock().expect("lock"), vec![2]);
+        let (_started, acks) = collect_acks(&plugin);
+        assert_eq!(acks, vec![(2, code)], "{delivery:?}");
+    }
+}
+
+/// SUP-6・REPAIR-5（#4282）: pidfd が届かない間は保留して再試行し、猶予（2 秒）を過ぎたら `not_started`。
+#[test]
+fn sup6_4282_pending_signal_times_out_as_not_started() {
+    let base = Tmp::new("signs");
+    let store = open(&base);
+    seed(&base, &store, "run1", Some(PID));
+    let args = args_for(&base, "run1", PID, 0);
+    let mut sc = signal_scenario(
+        vec![signal_bytes(3, 15)],
+        vec![ExecSignalDelivery::NotStarted],
+    );
+    sc.signal_watch = Some(Duration::from_millis(2_600));
+    let (_out, counts, plugin) = drive(&store, &args, &StdioSend::default(), &sc);
+    assert!(
+        counts.signals.lock().expect("lock").len() > 10,
+        "the pending signal must be retried on every tick"
+    );
+    let (_started, acks) = collect_acks(&plugin);
+    assert_eq!(acks, vec![(15, SignalAckCode::NotStarted)]);
+}
+
+/// SUP-6・REPAIR-5（#4282）: exec が終わった時点で保留が残っていれば、`Result` の前（`serve` の戻りの前）に ack を返す。
+/// コマンドが終わっていれば `exited`、起動に失敗していれば `not_started`。
+#[test]
+fn sup6_4282_pending_signal_at_exec_end_gets_an_ack() {
+    for (exit, code) in [
+        (
+            ExecExit::Command(ChildExit::Exited(0)),
+            SignalAckCode::Exited,
+        ),
+        (
+            ExecExit::SetupFailed {
+                exit: ChildExit::Exited(127),
+                violation: None,
+                code: ErrorCode::NotFound,
+                step: None,
+            },
+            SignalAckCode::NotStarted,
+        ),
+    ] {
+        let base = Tmp::new("sigend");
+        let store = open(&base);
+        seed(&base, &store, "run1", Some(PID));
+        let args = args_for(&base, "run1", PID, 0);
+        let mut sc = signal_scenario(
+            vec![signal_bytes(3, 1)],
+            vec![ExecSignalDelivery::NotStarted],
+        );
+        sc.signal_watch = Some(Duration::from_millis(100));
+        sc.exit = exit;
+        let (_out, _counts, plugin) = drive(&store, &args, &StdioSend::default(), &sc);
+        let (_started, acks) = collect_acks(&plugin);
+        assert_eq!(acks, vec![(1, code)]);
+    }
+}
+
+/// SUP-6・SEC-1・REPAIR-2（#4282）: 許可外の番号（SIGKILL）・旧い版・範囲外の frame を受けたら、以後は正しい frame にも
+/// 反応せず（signaler を呼ばず）ack も返さない。exec は止めず従来の結果で終わる。
+#[test]
+fn sec1_4282_malformed_signal_frame_disables_further_signals() {
+    for (label, bad) in [
+        ("sigkill", signal_bytes(3, 9)),
+        ("v2", signal_bytes(2, 15)),
+        ("zero", signal_bytes(3, 0)),
+        ("out of range", signal_bytes(3, 65)),
+    ] {
+        let base = Tmp::new("sigbad");
+        let store = open(&base);
+        seed(&base, &store, "run1", Some(PID));
+        let args = args_for(&base, "run1", PID, 0);
+        let sc = signal_scenario(
+            vec![bad, signal_bytes(3, 15)],
+            vec![ExecSignalDelivery::Delivered],
+        );
+        let (out, counts, plugin) = drive(&store, &args, &StdioSend::default(), &sc);
+        assert_eq!(out, StreamExecOutcome::Exited(3), "{label}");
+        assert!(
+            counts.signals.lock().expect("lock").is_empty(),
+            "{label}: the signaler must not be called"
+        );
+        let (started, acks) = collect_acks(&plugin);
+        assert!(started, "{label}");
+        assert_eq!(acks, vec![], "{label}");
+    }
+}
+
+/// SEC-1・REPAIR-2（#4282）: 向きの違う frame（`SignalAck`）と fd 付きの `Signal` も同様に拒否され、以後は受けない。
+#[test]
+fn sec1_4282_wrong_direction_signal_ack_frame_is_rejected() {
+    let base = Tmp::new("sigdir");
+    let store = open(&base);
+    seed(&base, &store, "run1", Some(PID));
+    let args = args_for(&base, "run1", PID, 0);
+    let wrong = vec![b'F', b'C', b'S', b'X', 3, 6, 0, 2, 15, 1];
+    let sc = signal_scenario(
+        vec![wrong, signal_bytes(3, 15)],
+        vec![ExecSignalDelivery::Delivered],
+    );
+    let (out, counts, plugin) = drive(&store, &args, &StdioSend::default(), &sc);
+    assert_eq!(out, StreamExecOutcome::Exited(3));
+    assert!(counts.signals.lock().expect("lock").is_empty());
+    let (_started, acks) = collect_acks(&plugin);
+    assert_eq!(acks, vec![]);
 }

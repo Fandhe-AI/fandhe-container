@@ -11,8 +11,8 @@
 //! `PullImage` が公開した展開済み rootfs（`<cache>/rootfs/sha256/<hex>/rootfs`）はコンテナの rootfs として直接使わない
 //! （コンテナの書き込みがキャッシュと次回以降の create に届くため）。ここでは公開済みエントリを「pull が検証を完了した」
 //! 印と展開記録（`unpack-record`）の置き場としてだけ読み、**キャッシュの検証済み layer blob から bundle の `rootfs/` へ
-//! 再展開**する（コンテナごとの私有の木ができる。複製の一形態）。pull と同じ入口（`VerifiedLayerBlob::open` →
-//! `extract_image_layers_with_options`）を通すため、所有者の写像・特殊ビット・展開上限・diff_id 照合は pull と同一になる。
+//! 再展開**する（コンテナごとの私有の木ができる。複製の一形態）。pull と同じ入口（`VerifiedLayerBlob::from_file` →
+//! `extract_image_layers_bounded_in`）を通すため、所有者の写像・特殊ビット・展開上限・diff_id 照合は pull と同一になる。
 //!
 //! 代償: create ごとに展開のコスト（時間・ディスク）がかかる。overlay の下位層にする最適化は `mount(2)` の `unsafe` を
 //! 要し、本 crate には `sys` モジュールが無いため未実装（REPAIR-3）。
@@ -21,14 +21,27 @@
 //!
 //! 1. 要求（`ImageSpec`）の長さ・NUL・`runtime_handler` を、キャッシュに触れる前に検証する。参照はパス要素に使わず、
 //!    `Digest::parse` で検証した 16 進部だけを使う
-//! 2. キャッシュの `blobs/sha256`・`rootfs/sha256` を所有者・権限・symlink の検証つきで開き、公開済みエントリが
-//!    信頼できなければ**消さずに**拒否する
+//! 2. キャッシュ root を作らずに祖先・所有者・権限・symlink を検証し（`verify_cache_root`）、`ImageStore::open` で
+//!    検査済み root の fd を得る。以後の blob（`open_cached_blob`）・公開済みエントリ（`open_published_rootfs_dir`）・
+//!    展開記録の読み取りはすべてこの fd 起点で、検査後に祖先をおとりの symlink へ差し替えても届かない
+//!    （Linux x86_64 / aarch64。#4283）。公開済みエントリが信頼できなければ**消さずに**拒否する
 //! 3. 展開記録を symlink を辿らず非ブロッキングで開き、同じハンドルの fstat で信頼条件を確かめ、`settings` 部が
 //!    今回の展開設定と完全一致することを要求する（食い違えば `FAILED_PRECONDITION`。黙って別設定で展開しない）
 //! 4. config blob は上限つきで 1 回だけ読み、**読んだバイト列そのもの**の sha256 を image ID と照合してから
 //!    `rootfs.diff_ids` と `config` 節を同じ本文から解析する
-//! 5. layer は記録の `layer=` 行から得る。件数は config の `diff_ids` と一致を要求し、各 blob は fstat のサイズで
-//!    `VerifiedLayerBlob::open`（digest・サイズ照合）してから展開する
+//! 5. layer は記録の `layer=` 行から得る。件数は config の `diff_ids` と一致を要求し、各 blob は 1 回だけ開いた
+//!    ハンドルの fstat のサイズで `VerifiedLayerBlob::from_file`（信頼条件・digest・サイズ照合）してから展開する
+//! 6. 展開先の bundle `rootfs/` は `ExtractRoot::create_private_dir`（親だけをパスで開き、`mkdirat` → `openat2`）で
+//!    作って fd で受け、展開（`extract_image_layers_bounded_in`）・chmod・`proc` の作成・passwd / group の読み取りを
+//!    同じ fd 起点で行う。最後に根のパスが開いた根と同じ実体であることを照合し、差し替えを成功に見せない（検出時は
+//!    `FAILED_PRECONDITION`。パス起点の削除でおとりを消さない）
+//!
+//! # fd 起点にしない範囲（残余。#4283）
+//!
+//! - Linux 以外の unix（macOS 等）は `RootHandle`・`BlobDir`・`ExtractRoot::from_path` がパス起点で、入口の再検査に頼る
+//!   （本番の macOS は cli の `non_linux_failure` がホストでの展開の前に fail-closed にする）。Windows は #4181
+//! - bundle の親ディレクトリ（`SpecBundleProvider` が作る `<bundles>/<id>`）の作成・巻き戻しと `release` の
+//!   `remove_extracted_tree` はパス起点（bundle の親の差し替えは provider の範囲）
 //!
 //! # 未実装・簡易実装（REPAIR-3）
 //!
@@ -52,7 +65,7 @@
 //!   （rootful の可否）・#2315・#482（core の user namespace 配線）が前提で（pull の呼び出し元の配線は #2592 で済み）、
 //!   それまで据え置く（#2534・SEC-5。`docs/design/oci-layer-special-bits.md`）。pull と create の設定は
 //!   [`ImageExtractConfig`] で 1 か所にまとめる
-//! - 展開は `extract_image_layers_bounded` でエントリ単位に期限（この `prepare` の開始からの `deadline`）と取り消しの
+//! - 展開は `extract_image_layers_bounded_in` でエントリ単位に期限（この `prepare` の開始からの `deadline`）と取り消しの
 //!   旗（`prepare_cancellable`）を確かめ、超過・取り消しは `Timeout`（`DEADLINE_EXCEEDED`）で止めて rootfs を消す
 //!   （REPAIR-5・#2899）。分割できない区間は blob 1 本の sha256 検証・1 エントリの書き込み・失敗時の削除で、いずれも
 //!   展開の上限で有界。`Timeout` は dispatch より前（bundle 用意）でしか起きないため、確定失敗の分類に入れない
@@ -68,14 +81,14 @@ use fandhe_container_oci::config::{
     ImageProcessConfig, MAX_CONFIG_BYTES, parse_verified_image_config,
 };
 use fandhe_container_oci::error::OciErrorCode;
-use fandhe_container_oci::image_management::IMAGE_STORE_BLOB_DIR;
+use fandhe_container_oci::image_management::{ImageStore as OciImageStore, PublishedRootfsEntry};
 use fandhe_container_oci::instrument::{NoopOciOpRecorder, OciOpRecorder};
 use fandhe_container_oci::layer::extract::{
-    ExtractBudget, ExtractLimits, ExtractOptions, ImageLayer, extract_image_layers_bounded,
-    remove_extracted_tree, remove_extracted_tree_bounded,
+    ExtractBudget, ExtractLimits, ExtractOptions, ExtractRoot, ImageLayer,
+    extract_image_layers_bounded_in, remove_extracted_tree, remove_extracted_tree_bounded,
 };
 use fandhe_container_oci::layer::{
-    BlobFileFacts, VerifiedLayerBlob, check_blob_trust, open_blob_nofollow, read_rootfs_file,
+    BlobFileFacts, VerifiedLayerBlob, check_blob_trust, read_rootfs_file_in,
 };
 use fandhe_container_oci::manifest::MAX_LAYERS;
 use fandhe_container_oci::reference::Digest;
@@ -85,9 +98,9 @@ use super::spec::{ImageDefaults, ResolvedImage};
 use crate::adapter::ReleaseBudget;
 use crate::error::CriError;
 use crate::image_pull::{
-    DEFAULT_MAX_IMAGE_BYTES, PullConfig, PullError, RECORD_FILE, canonical_reference,
-    create_private_dir, digest_hex, expected_root_owner_for, inspect_published_rootfs,
-    prepare_private_dir, read_unpack_record_body, record_settings,
+    DEFAULT_MAX_IMAGE_BYTES, PullConfig, PullError, canonical_reference, expected_root_owner_for,
+    inspect_published_entry, read_entry_record_body, record_settings, verify_cache_root,
+    verify_private_meta,
 };
 use crate::image_service::{ImageStore, MAX_IMAGE_FIELD_BYTES};
 use crate::runtime::v1::ImageSpec;
@@ -282,21 +295,13 @@ fn resolved_from_record(record: &crate::image_service::ImageRecord) -> Option<Re
 
 /// 展開成功後に rootfs 自体へ検索権限（0755）を付ける（CRI-2・SEC-1）。
 ///
-/// 展開中は 0700 のまま保ち（`create_private_dir`）、tar のルートエントリは展開処理が無視するため、放置すると
+/// 展開中は 0700 のまま保ち（`ExtractRoot::create_private_dir`）、tar のルートエントリは展開処理が無視するため、放置すると
 /// コンテナの `/` が 0700 になり、`User` が非 root（`1000:2000` や `run_as_user`）のプロセスが `/` 配下を
 /// 検索できず EACCES になる。外側の bundle ディレクトリは 0700 のまま変えない（ホスト側の他ユーザーを締め出す）。
-fn open_rootfs_for_search(rootfs: &Path) -> Result<(), CriError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(rootfs, std::fs::Permissions::from_mode(0o755))
-            .map_err(|_| CriError::internal("failed to set rootfs permissions"))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = rootfs;
-        Ok(())
-    }
+/// 根の fd の `fchmod` で行い、パスを開き直さない（祖先の差し替えがおとりへ届かない。OCI-7・SEC-1・#4283）。
+fn open_rootfs_for_search(root: &ExtractRoot) -> Result<(), CriError> {
+    root.set_mode(0o755)
+        .map_err(|_| CriError::internal("failed to set rootfs permissions"))
 }
 
 /// 展開後の rootfs に、core の起動が前提とするマウント先ディレクトリ（`proc`）が無ければ作る
@@ -305,27 +310,10 @@ fn open_rootfs_for_search(rootfs: &Path) -> Result<(), CriError> {
 /// busybox 等のイメージは `/proc` を持たず、core の rootfs 用意（`prepare_rootfs`）は `proc` が無いと
 /// `path_missing` で拒否するため、実イメージの起動が `PrepareRootfs` 段で失敗していた。ここは bundle が
 /// 今作ったばかりの私有の木（0700 の外側 bundle 配下）に対してだけ呼ばれる。既存のエントリは種別を問わず
-/// 触らない（symlink や通常ファイルは core 側の検査が拒否する。fail-closed）。
-fn ensure_mountpoints(rootfs: &Path) -> Result<(), CriError> {
-    let proc_path = rootfs.join("proc");
-    match std::fs::symlink_metadata(&proc_path) {
-        Ok(_) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::create_dir(&proc_path).map_err(|_| {
-                CriError::internal("failed to create the proc mount point in the rootfs")
-            })?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                std::fs::set_permissions(&proc_path, std::fs::Permissions::from_mode(0o555))
-                    .map_err(|_| CriError::internal("failed to set the proc mount point mode"))?;
-            }
-            Ok(())
-        }
-        Err(_) => Err(CriError::internal(
-            "failed to inspect the proc mount point in the rootfs",
-        )),
-    }
+/// 触らない（symlink や通常ファイルは core 側の検査が拒否する。fail-closed）。根の fd 起点（`mkdirat`）で作る（#4283）。
+fn ensure_mountpoints(root: &ExtractRoot) -> Result<(), CriError> {
+    root.ensure_child_dir("proc", 0o555)
+        .map_err(|_| CriError::internal("failed to create the proc mount point in the rootfs"))
 }
 
 fn untrusted(message: &'static str) -> CriError {
@@ -334,11 +322,11 @@ fn untrusted(message: &'static str) -> CriError {
 
 /// 展開記録を信頼条件つきで読み、`settings` 部の完全一致を確かめて `layer=` 行を返す。
 fn read_layers(
-    path: &Path,
+    entry: &PublishedRootfsEntry,
     expected_settings: &str,
     owner: u32,
 ) -> Result<Vec<RecordedLayer>, CriError> {
-    let body = read_unpack_record_body(path, owner).map_err(CriError::from)?;
+    let body = read_entry_record_body(entry, owner).map_err(CriError::from)?;
     let Some(rest) = body.strip_prefix(expected_settings.as_bytes()) else {
         return Err(untrusted(
             "image rootfs cache entry was unpacked with different settings",
@@ -371,11 +359,13 @@ fn read_layers(
 
 /// config blob を信頼条件つきで上限まで 1 回だけ読み、読んだ本文の digest を image ID と照合してから解析する。
 fn read_config(
-    blobs: &Path,
+    store: &OciImageStore,
     owner: u32,
     id: &Digest,
 ) -> Result<(Vec<Digest>, ImageProcessConfig), CriError> {
-    let mut file = open_blob_nofollow(&blobs.join(digest_hex(id)))
+    // 検査済み root の fd 起点で開く（キャッシュの祖先を差し替えてもおとりを読まない。#4283）。
+    let mut file = store
+        .open_cached_blob(id)
         .map_err(|e| CriError::from(PullError::from_config(&e)))?;
     let facts = BlobFileFacts::from_file(&file)
         .ok_or_else(|| untrusted("cached image config is not trusted"))?;
@@ -576,7 +566,7 @@ fn etc_read_error(e: EtcReadError, what: &'static str) -> CriError {
 /// （名前形式ならその名前、uid 形式なら passwd を uid で引く）。uid 0 は passwd を読まずに `None` とする
 /// （root にはイメージ由来のグループを付けない。#2667）。
 fn effective_username(
-    rootfs: &Path,
+    rootfs: &ExtractRoot,
     request: &UserResolveRequest<'_>,
     image_user: &str,
     defaults: &ImageDefaults,
@@ -622,7 +612,7 @@ fn effective_username(
 /// 実効 uid が 0 でなく名前が決まったときだけ group を読む。group が無ければ空、安全に読めなければ拒否する
 /// （読めなかったグループを黙って空にしない）。
 fn resolve_image_groups(
-    rootfs: &Path,
+    rootfs: &ExtractRoot,
     request: &UserResolveRequest<'_>,
     image_user: &str,
     defaults: &ImageDefaults,
@@ -637,9 +627,9 @@ fn resolve_image_groups(
         .unwrap_or_default())
 }
 
-/// rootfs の `etc/<file>` を fd 起点で読む。`Ok(None)` は不在、`Err` は読めない（呼び出し側が未解決にする）。
-fn read_etc(rootfs: &Path, file: &str) -> Result<Option<Vec<u8>>, EtcReadError> {
-    let body = read_rootfs_file(rootfs, &["etc", file], MAX_ETC_FILE_BYTES).map_err(|e| {
+/// rootfs の `etc/<file>` を、根の fd 起点（`read_rootfs_file_in`）で読む。`Ok(None)` は不在、`Err` は読めない（呼び出し側が未解決にする）。
+fn read_etc(rootfs: &ExtractRoot, file: &str) -> Result<Option<Vec<u8>>, EtcReadError> {
+    let body = read_rootfs_file_in(rootfs, &["etc", file], MAX_ETC_FILE_BYTES).map_err(|e| {
         if e.code() == OciErrorCode::Unimplemented {
             EtcReadError::Unsupported
         } else {
@@ -669,7 +659,7 @@ enum EtcReadError {
 /// 名前は passwd の第 1 フィールドとの完全一致比較にだけ使い、パス要素にしない。見つからない・passwd が無い場合は
 /// `INVALID_ARGUMENT`、安全に読めない場合は `FAILED_PRECONDITION`、読む手段が無い場合は `UNIMPLEMENTED`
 /// （いずれも root へ黙って落とさない）。メッセージに名前は含めない。
-fn resolve_run_as_username(rootfs: &Path, name: &str) -> Result<(u32, u32), CriError> {
+fn resolve_run_as_username(rootfs: &ExtractRoot, name: &str) -> Result<(u32, u32), CriError> {
     let key = match parse_id_part(name) {
         Some(k @ IdPart::Name(_)) => k,
         _ => return Err(CriError::invalid_argument("run_as_username is invalid")),
@@ -696,7 +686,7 @@ fn resolve_run_as_username(rootfs: &Path, name: &str) -> Result<(u32, u32), CriE
 ///
 /// uid のみで passwd に行が無い（または passwd が無い）ときは gid 0（runc / containerd と同じ。uid は root にしない）。
 /// passwd / group が読めない（symlink・FIFO・上限超過等）ときは gid 0 へ落とさず未解決にする。
-fn resolve_user(rootfs: &Path, lookup: &UserLookup) -> Option<(u32, u32)> {
+fn resolve_user(rootfs: &ExtractRoot, lookup: &UserLookup) -> Option<(u32, u32)> {
     let passwd = match &lookup.user {
         IdPart::Id(_) if matches!(lookup.group, Some(IdPart::Id(_))) => None,
         _ => Some(read_etc(rootfs, "passwd").ok()?),
@@ -743,19 +733,48 @@ impl RootfsSource for ImageRootfsSource {
         let id = Digest::parse(resolved.id_str())
             .map_err(|_| CriError::internal("resolved image id is invalid"))?;
         let opts = &self.config.extract_options;
-        let blobs = prepare_private_dir(&self.config.cache_dir, &IMAGE_STORE_BLOB_DIR)?;
-        let entries = prepare_private_dir(&self.config.cache_dir, &["rootfs", "sha256"])?;
-        let root_owner = expected_root_owner_for(opts, entries.owner)?;
-        let entry = entries.path.join(digest_hex(&id));
-        // 公開済みエントリは「pull が検証を完了した」印としてだけ見る。展開済み rootfs は開かず、書かない。
-        if !inspect_published_rootfs(&entry, entries.owner, root_owner)? {
-            return Err(CriError::not_found(
-                "image is not present in the local cache",
-            ));
+        // キャッシュ root は作らずに検査し（祖先の symlink・所有者・権限）、検査済み root の fd 起点で開く。以後の blob・
+        // 公開済みエントリ・展開記録の読み取りはすべてこの fd 起点で、検査後に祖先をおとりへ差し替えても届かない
+        // （OCI-7・SEC-1・CRI-3・#4283）。キャッシュが無ければ従来どおり `NOT_FOUND`（ディレクトリは作らない）。
+        let not_cached = || CriError::not_found("image is not present in the local cache");
+        if !verify_cache_root(&self.config.cache_dir).map_err(CriError::from)? {
+            return Err(not_cached());
         }
+        let store = OciImageStore::open(&self.config.cache_dir).map_err(|e| {
+            if e.code() == OciErrorCode::NotFound {
+                not_cached()
+            } else {
+                CriError::from(PullError::from_store(&e))
+            }
+        })?;
+        let owner = store
+            .root_owner()
+            .map_err(|e| CriError::from(PullError::from_store(&e)))?;
+        let root_owner = expected_root_owner_for(opts, owner)?;
+        let published = store
+            .open_published_rootfs_dir()
+            .map_err(|e| CriError::from(PullError::from_store(&e)))?
+            .ok_or_else(not_cached)?;
+        // 中間ディレクトリ（rootfs・rootfs/sha256・blobs・blobs/sha256）も、開いた fd の fstat に従来の信頼条件
+        // （所有者一致・group/other 書き込み不可）を課す（pull の `prepare_private_dir` と同じ。OCI-7・SEC-1・#4283）。
+        for meta in [published.parent_metadata(), published.metadata()] {
+            let meta = meta.map_err(|e| CriError::from(PullError::from_store(&e)))?;
+            verify_private_meta(&meta, owner).map_err(CriError::from)?;
+        }
+        let blob_dirs = store
+            .cached_blob_dir_metadata()
+            .map_err(|e| CriError::from(PullError::from_store(&e)))?
+            .ok_or_else(not_cached)?;
+        for meta in &blob_dirs {
+            verify_private_meta(meta, owner).map_err(CriError::from)?;
+        }
+        // 公開済みエントリは「pull が検証を完了した」印としてだけ見る。展開済み rootfs は開かず、書かない。
+        let Some(entry) = inspect_published_entry(&published, &id, owner, root_owner)? else {
+            return Err(not_cached());
+        };
         let settings = record_settings(&id, opts)?;
-        let layers = read_layers(&entry.join(RECORD_FILE), &settings, entries.owner)?;
-        let (diff_ids, process) = read_config(&blobs.path, blobs.owner, &id)?;
+        let layers = read_layers(&entry, &settings, owner)?;
+        let (diff_ids, process) = read_config(&store, owner, &id)?;
         let mut defaults = defaults_from(&process)?;
         defaults.resolved_image = Some(resolved);
         if layers.len() != diff_ids.len() {
@@ -770,17 +789,18 @@ impl RootfsSource for ImageRootfsSource {
         for l in &layers {
             // blob の sha256 検証は大きさに比例して長いため、1 本ごとに期限を確かめる（REPAIR-5・#2821）。
             self.check_budget(started, cancel)?;
-            let path = blobs.path.join(digest_hex(&l.digest));
-            let size = open_blob_nofollow(&path)
-                .and_then(|f| {
-                    f.metadata().map(|m| m.len()).map_err(|_| {
-                        fandhe_container_oci::error::OciError::new(
-                            OciErrorCode::DataLoss,
-                            "layer blob could not be inspected",
-                        )
-                    })
-                })
+            // 1 回だけ（検査済み root の fd 起点で）開き、同じハンドルでサイズ・信頼条件・digest を確かめる（#4283）。
+            let file = store
+                .open_cached_blob(&l.digest)
                 .map_err(|e| CriError::from(PullError::from_extract(&e)))?;
+            let size = file.metadata().map(|m| m.len()).map_err(|_| {
+                CriError::from(PullError::from_extract(
+                    &fandhe_container_oci::error::OciError::new(
+                        OciErrorCode::DataLoss,
+                        "layer blob could not be inspected",
+                    ),
+                ))
+            })?;
             total = total.saturating_add(size);
             if size > self.config.max_image_bytes || total > self.config.max_image_bytes {
                 return Err(CriError::resource_exhausted(
@@ -788,7 +808,7 @@ impl RootfsSource for ImageRootfsSource {
                 ));
             }
             verified.push(
-                VerifiedLayerBlob::open(&path, &l.digest, size, blobs.owner)
+                VerifiedLayerBlob::from_file(file, &l.digest, size, owner)
                     .map_err(|e| CriError::from(PullError::from_extract(&e)))?,
             );
         }
@@ -799,8 +819,12 @@ impl RootfsSource for ImageRootfsSource {
             .map(|((b, l), d)| ImageLayer::new(b, &l.media_type, d))
             .collect();
         self.check_budget(started, cancel)?;
-        // 呼び出し元（SpecBundleProvider）が渡す不在のパスを 0700 で作る。作れなければ他人の実体の可能性があり消さない。
-        create_private_dir(rootfs).map_err(CriError::from)?;
+        // 呼び出し元（SpecBundleProvider）が渡す不在のパスを 0700 で作って fd で開く（親だけをパスで開き、`mkdirat` →
+        // `openat2`）。以後の展開・chmod・`proc`・passwd の読み取りはこの fd 起点で、作成後に祖先が差し替えられても
+        // おとりへ届かない（#4283）。作れなければ他人の実体の可能性があり消さない。
+        let root = ExtractRoot::create_private_dir(rootfs).map_err(|_| {
+            CriError::failed_precondition("failed to create the image rootfs staging directory")
+        })?;
         // 展開はエントリ単位で期限（この prepare の開始からの deadline）と取り消しを確かめる。1 エントリの書き込みは分割しない。
         let mut budget = ExtractBudget::new();
         if let Some(d) = started.checked_add(self.config.deadline) {
@@ -809,10 +833,10 @@ impl RootfsSource for ImageRootfsSource {
         if let Some(c) = cancel {
             budget = budget.with_cancel(c);
         }
-        let extracted = extract_image_layers_bounded(
+        let extracted = extract_image_layers_bounded_in(
             self.recorder.as_ref(),
             &image_layers,
-            rootfs,
+            &root,
             self.config.max_uncompressed_layer_bytes,
             self.config.extract_limits,
             opts,
@@ -827,19 +851,19 @@ impl RootfsSource for ImageRootfsSource {
             }
         })
         .and_then(|_| self.check_budget(started, cancel))
-        .and_then(|()| open_rootfs_for_search(rootfs))
-        .and_then(|()| ensure_mountpoints(rootfs))
+        .and_then(|()| open_rootfs_for_search(&root))
+        .and_then(|()| ensure_mountpoints(&root))
         .and_then(|()| {
             // CRI の run_as_username は展開後の私有 rootfs の passwd で解決する（失敗は拒否。#2664）。
             if let Some(name) = user.run_as_username {
-                defaults.resolved_run_as_username = Some(resolve_run_as_username(rootfs, name)?);
+                defaults.resolved_run_as_username = Some(resolve_run_as_username(&root, name)?);
             }
             // 名前・uid のみの User は、展開後の私有 rootfs の passwd / group で解決する（失敗は未解決のまま返す）。
             // run_as_username があるときは CRI 側が優先するため省略する。
             if user.run_as_username.is_none()
                 && defaults.user_unresolved
                 && let Some(lookup) = parse_user_lookup(process.user())
-                && let Some(ids) = resolve_user(rootfs, &lookup)
+                && let Some(ids) = resolve_user(&root, &lookup)
             {
                 defaults.user = Some(ids);
                 defaults.user_unresolved = false;
@@ -847,13 +871,27 @@ impl RootfsSource for ImageRootfsSource {
             // 補助グループ（Merge のとき）: 実効ユーザーの所属グループを /etc/group から求める（#2667）。
             if user.image_groups {
                 defaults.supplementary_gids =
-                    resolve_image_groups(rootfs, user, process.user(), &defaults)?;
+                    resolve_image_groups(&root, user, process.user(), &defaults)?;
             }
             self.check_deadline(started)
         });
+        // 最後に、根のパスが開いた根と同じ実体であることを確かめる（fd 起点の操作は作った実体にだけ届き、おとりへは
+        // 書かれていない。差し替えを成功に見せない検出器。OCI-7・SEC-1・#4283）。
+        let extracted = extracted.and_then(|()| {
+            if root.matches_path(rootfs) {
+                Ok(())
+            } else {
+                Err(CriError::failed_precondition(
+                    "image rootfs path changed during preparation",
+                ))
+            }
+        });
         if let Err(e) = extracted {
-            // 先行レイヤーの展開物が残るため、自分が作った rootfs だけを消す（0555 等も権限を戻して消す）。
-            let _ = remove_extracted_tree(rootfs);
+            // 差し替えを検出したときは、パスがおとりを指している可能性があるため消さない（パス起点の削除はおとりを
+            // 消しうる。展開済みの実体は残る側に倒す）。それ以外は自分が作った rootfs だけを消す（0555 等も権限を戻して消す）。
+            if root.matches_path(rootfs) {
+                let _ = remove_extracted_tree(rootfs);
+            }
             return Err(e);
         }
         Ok(defaults)
@@ -964,7 +1002,7 @@ mod tests {
         target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
-    fn lookup_rootfs(passwd: Option<&str>, group: Option<&str>) -> std::path::PathBuf {
+    fn lookup_rootfs(passwd: Option<&str>, group: Option<&str>) -> TestRoot {
         use std::sync::atomic::{AtomicU32, Ordering};
         static N: AtomicU32 = AtomicU32::new(0);
         let r = std::env::temp_dir().join(format!(
@@ -973,6 +1011,7 @@ mod tests {
             N.fetch_add(1, Ordering::Relaxed)
         ));
         let _ = std::fs::remove_dir_all(&r);
+        let root = ExtractRoot::create_private_dir(&r).unwrap();
         std::fs::create_dir_all(r.join("etc")).unwrap();
         if let Some(p) = passwd {
             std::fs::write(r.join("etc/passwd"), p).unwrap();
@@ -980,7 +1019,48 @@ mod tests {
         if let Some(g) = group {
             std::fs::write(r.join("etc/group"), g).unwrap();
         }
-        r
+        TestRoot { path: r, root }
+    }
+
+    /// 試験用の根。fd 起点の解決関数へは `Deref` で `ExtractRoot` として渡し、ファイルの用意と後始末はパスで行う。
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    struct TestRoot {
+        path: std::path::PathBuf,
+        root: ExtractRoot,
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    impl TestRoot {
+        fn join(&self, p: &str) -> std::path::PathBuf {
+            self.path.join(p)
+        }
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    impl std::ops::Deref for TestRoot {
+        type Target = ExtractRoot;
+        fn deref(&self) -> &ExtractRoot {
+            &self.root
+        }
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    impl AsRef<std::path::Path> for TestRoot {
+        fn as_ref(&self) -> &std::path::Path {
+            &self.path
+        }
     }
 
     #[cfg(all(

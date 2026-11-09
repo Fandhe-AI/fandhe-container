@@ -12,6 +12,8 @@
 //! - `stdin`: 渡した stdin のバイト列（`se-stdin-payload\n`）がコマンドの stdout に戻る。
 //! - `disconnect`（接続断での停止。REPAIR-5）: `Started` の後に helper を SIGKILL すると、supervisor のガードが exec 子 cgroup
 //!   を回収し、コマンドの心拍ファイルが増えなくなる。`Result` は届かず channel は EOF（`Closed`）になる。
+//! - `signal_term`（SIGKILL 以外のシグナル。SUP-6・SEC-1・CRI-5・#4282）: 終わらないコマンド（`ready-sleep`）が起動した後に `Signal(SIGTERM)` を送ると、
+//!   `SignalAck(delivered, 15)` の後に `Result(Signaled(15))` が返り、helper は終了コード 0、コマンドは `/proc` に残らない。
 //! - `requester_killed`（要求元の異常終了。SUP-6・SEC-1・REPAIR-5・#4167）: 終わらないコマンド（`ready-sleep`）を exec の期限 120 秒で
 //!   実行し、要求元（channel の端を持つ偽の `/bin/sleep`）を SIGKILL してから helper が終わるまでを測る。2 秒以内（設計 doc の目標値）・
 //!   終了コード 1（`Result` を送る相手が居ない）・fd 2 の診断行・コマンドが `/proc` に残らないことを具体値で照合する。
@@ -174,10 +176,12 @@ mod linux {
         ExecCgroupReclaimer, ExecGuardLimits, ExecGuardPool, StoreExecReclaimer,
     };
     use fandhe_container_supervisor::stream_exec::channel::{
-        ChannelError, HelperMessage, StdioSend, recv_from_helper, send_stdio_handover,
+        ChannelError, HelperMessage, StdioSend, recv_from_helper, send_signal, send_stdio_handover,
     };
     use fandhe_container_supervisor::stream_exec::helper::{StreamExecArgs, stream_exec_command};
-    use fandhe_container_supervisor::stream_exec::wire::{StdioMask, StreamExecOutcome};
+    use fandhe_container_supervisor::stream_exec::wire::{
+        ExecSignal, ExitSignal, SignalAckCode, StdioMask, StreamExecOutcome,
+    };
 
     use super::rootfs;
 
@@ -579,6 +583,7 @@ mod linux {
                 Ok(HelperMessage::Started(_)) => started = true,
                 Ok(HelperMessage::Result(o)) => break o,
                 Ok(HelperMessage::PtyMaster(_)) => panic!("unexpected PtyMaster without a tty"),
+                Ok(HelperMessage::SignalAck { .. }) => panic!("unexpected SignalAck"),
                 Err(e) => panic!("channel failed before the result: {e:?}"),
             }
         };
@@ -885,6 +890,58 @@ mod linux {
         );
     }
 
+    /// signal_term: `Signal(SIGTERM)` がコマンド本体へ届き、`SignalAck(delivered)` の後に `Result(Signaled(15))` が返る
+    /// （SUP-6・SEC-1・CRI-5・#4282）。コマンドは `/proc` に残らず、helper は終了コード 0 で終わる。
+    fn signal_term(ctx: &Ctx, hostdata: &Path) {
+        let ready = hostdata.join(REQUESTER_READY_FILE);
+        let _ = std::fs::remove_file(&ready);
+        let mut sp = spawn_exec(ctx, "ready-sleep", None, 60_000, HelperStderr::Inherit);
+        let first = recv_from_helper(&sp.plugin, Instant::now() + timeout()).expect("started");
+        assert!(matches!(first, HelperMessage::Started(_)), "{first:?}");
+        assert!(
+            eventually(|| std::fs::read_to_string(&ready).is_ok_and(|s| s == READY_CONTENT)),
+            "the ready-sleep command must have started"
+        );
+        let argv = ["/probe", "--se-cmd", "ready-sleep"];
+        let cmds = live_pids_with_argv(&argv);
+        assert_eq!(
+            cmds.len(),
+            1,
+            "exactly one live ready-sleep command: {cmds:?}"
+        );
+        let (cmd_pid, cmd_start) = cmds[0];
+        let term = ExecSignal::new(15).expect("SIGTERM is allowed");
+        send_signal(&sp.plugin, term, Instant::now() + timeout()).expect("send the signal");
+        match recv_from_helper(&sp.plugin, Instant::now() + timeout()).expect("signal ack") {
+            HelperMessage::SignalAck { signal, code } => {
+                assert_eq!(signal.get(), 15);
+                assert_eq!(code, SignalAckCode::Delivered);
+            }
+            other => panic!("expected SignalAck, got {other:?}"),
+        }
+        match recv_from_helper(&sp.plugin, Instant::now() + timeout()).expect("result") {
+            HelperMessage::Result(o) => assert_eq!(
+                o,
+                StreamExecOutcome::Signaled(ExitSignal::new(15).expect("15"))
+            ),
+            other => panic!("expected Result, got {other:?}"),
+        }
+        assert_eq!(wait_child(&mut sp.child), Some(0), "the helper must exit 0");
+        assert!(
+            is_gone(cmd_pid, cmd_start),
+            "the exec command (pid {cmd_pid}) must be gone"
+        );
+        assert_eq!(
+            live_pids_with_argv(&argv),
+            Vec::<(u32, u64)>::new(),
+            "no ready-sleep command may remain"
+        );
+        let _ = std::fs::remove_file(&ready);
+        println!(
+            "stream_exec_real: scenario=signal_term SIGTERM reached the command, acked delivered, and the result was signaled 15"
+        );
+    }
+
     fn scenarios(ctx: &Ctx, hostdata: &Path, server: ControlServer, listener: ControlListener) {
         // echo: stdout と stderr が別々の fd で返る。
         let sp = spawn_exec(ctx, "echo", None, 20_000, HelperStderr::Inherit);
@@ -946,6 +1003,8 @@ mod linux {
         println!(
             "stream_exec_real: scenario=disconnect command stopped after the helper was killed"
         );
+
+        signal_term(ctx, hostdata);
 
         requester_killed(ctx, hostdata);
 

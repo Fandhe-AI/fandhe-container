@@ -39,7 +39,7 @@ pub mod extract;
 pub mod idmap;
 mod rootfs_read;
 
-pub use rootfs_read::read_rootfs_file;
+pub use rootfs_read::{read_rootfs_file, read_rootfs_file_in};
 
 #[cfg(all(
     target_os = "linux",

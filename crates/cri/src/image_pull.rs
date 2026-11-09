@@ -19,7 +19,10 @@
 //! 8. 各 layer を `VerifiedLayerBlob`（検証済みハンドル。どちらも fd 起点のハンドルから `from_file`）で開き直し、セッションのステージングの `unpack/` 配下の
 //!    `rootfs/`（`unpack/` 以下はすべて pull ディレクトリの fd 起点で作る。#4180）へ `extract_image_layers_bounded_in` で展開しながら diff_id を突合（期限と取り消しをエントリ単位で確認。#2967・#2323・OCI-1・OCI-2）
 //! 9. 展開に成功したときだけ、組んだエントリ（`rootfs/` と展開設定の記録 `unpack-record`）を 1 回の `rename` で
-//!    `<cache_dir>/rootfs/sha256/<config-hex>/` へ公開する（記録の無い rootfs が残らない）。公開済みで、
+//!    `<cache_dir>/rootfs/sha256/<config-hex>/` へ公開する（記録の無い rootfs が残らない）。公開先 `rootfs/sha256` の
+//!    作成・命中判定・記録の読み取り・`renameat` は検査済み root の fd 起点（`PullSession::ensure_published_rootfs_dir`。
+//!    Linux x86_64 / aarch64。それ以外の unix はパス起点で入口の再検査に頼る。Windows は #4181。#4283）で行い、
+//!    公開の直前にパスとの同一性を照合して差し替えを成功に見せない。公開済みで、
 //!    記録（config・展開設定）と layer の表現が今回と一致するときだけ 8 を省く。layer の表現（圧縮 blob の digest・
 //!    mediaType）だけ違うときは今回の descriptor で展開を検証し直す（公開はしない）。件数の照合は命中時も行い、
 //!    設定が違えば FailedPrecondition で拒否する（既存の展開物は消さない）。所有者写像では root の期待所有者を
@@ -81,7 +84,8 @@
 //!   開く → ハンドルで条件を確認 → 同じハンドルから読む）で開き直すこと。tar 展開の実体は
 //!   `fandhe_container_oci::layer::extract` にあり（TASK-52.3・TASK-52.4・TASK-53）、本モジュールは oci の契約を満たす
 //!   入口 `VerifiedLayerBlob`（symlink を辿らずに開き、同じハンドルで信頼条件と digest を確かめた値）と
-//!   `extract_image_layers_bounded` だけを使う（#2309・#2323・#2967）。パスを受け取って開き直す旧入口
+//!   `extract_image_layers_bounded_in`（根を fd で受ける版。パス版の `extract_image_layers_bounded` は本番では使わない。
+//!   #4180・#4283）だけを使う（#2309・#2323・#2967）。パスを受け取って開き直す旧入口
 //!   （`extract_layer_blob` / `extract_layer_blobs` 系）は、最終要素の symlink を辿り所有者・権限・ハードリンク数も
 //!   確かめないため #2535 で oci から廃止した
 //! - 各 layer は `ensure_blob`・`VerifiedLayerBlob::from_file`・展開のパス 1 とパス 3 で計 4 回読まれる（oci の契約に従った
@@ -113,7 +117,7 @@
 //!     （`docs/design/pull-inventory-wiring.md`）。本番の値が `Keep` + `Strip` の間は写像が空で効かず、
 //!     `ChownMapped` 等の配線時に start 側の写像との照合を足す（#2592・#2377・#2241・#482）
 //!   - 異常終了で残ったステージング（展開途中の rootfs を含む）の回収は、blob のステージングと同じく起動時 GC の担当（#2315）
-//!   - 展開は `extract_image_layers_bounded` で、期限（[`PullConfig::pull_deadline`] の絶対時刻を pull 全体で共有）と
+//!   - 展開は `extract_image_layers_bounded_in` で、期限（[`PullConfig::pull_deadline`] の絶対時刻を pull 全体で共有）と
 //!     取り消しの旗をエントリ単位で確認する。期限超過・取り消しは `Timeout`（gRPC `DEADLINE_EXCEEDED`）で止まり、
 //!     ステージング（展開途中の rootfs を含む）は `abort` が消し、在庫・リースは残らない（#2967・REPAIR-5）。
 //!     分割できない区間（1 エントリの書き込み・blob 1 本の取得と sha256 検証）は打ち切れない。設計と残余は
@@ -144,8 +148,8 @@ use fandhe_container_oci::auth::{BasicCredentials, RegistryAuth};
 use fandhe_container_oci::config::{ImageRootFs, MAX_CONFIG_BYTES, parse_image_config_rootfs};
 use fandhe_container_oci::error::{OciError, OciErrorCode};
 use fandhe_container_oci::image_management::{
-    BlobReuse, IMAGE_STORE_BLOB_DIR, ImageStore, ManifestComposition, PullPublishRequest,
-    PullSession, StagedBlobWriter, TagKey, UnpackDir,
+    BlobReuse, IMAGE_STORE_BLOB_DIR, ImageStore, ManifestComposition, PublishedRootfsDir,
+    PublishedRootfsEntry, PullPublishRequest, PullSession, StagedBlobWriter, TagKey, UnpackDir,
 };
 use fandhe_container_oci::instrument::{NoopOciOpRecorder, OciOpRecorder};
 use fandhe_container_oci::layer::extract::{
@@ -154,7 +158,7 @@ use fandhe_container_oci::layer::extract::{
 };
 use fandhe_container_oci::layer::{
     BlobFileFacts, BlobTrustViolation, DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES, VerifiedLayerBlob,
-    check_blob_trust, open_blob_nofollow, verify_blob_file_digest, verify_bytes_digest,
+    check_blob_trust, verify_blob_file_digest, verify_bytes_digest,
 };
 use fandhe_container_oci::manifest::{Descriptor, ImageManifest, Platform};
 use fandhe_container_oci::reference::{
@@ -661,8 +665,24 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
         rootfs_cfg: &ImageRootFs,
         budget: &PullBudget<'_>,
     ) -> Result<(), PullError> {
-        let rootfs_dir = prepare_private_dir(&self.config.cache_dir, &["rootfs", "sha256"])?;
-        let entry_path = rootfs_dir.path.join(digest_hex(&manifest.config.digest));
+        // 公開先 `rootfs/sha256` は検査済み root の fd 起点で作って開く（祖先の差し替えがおとりへ届かない。#4283）。
+        // キャッシュの祖先の検証は pull の入口の `blobs_dir` と `ImageStore::open` が済ませている。
+        // `rootfs` の所有者・権限を確かめてから配下の `sha256` を作る（検証前に配下を作らない）。
+        let rootfs_parent = session
+            .ensure_published_rootfs_parent()
+            .map_err(|e| PullError::from_store(&e))?;
+        let parent_meta = rootfs_parent
+            .metadata()
+            .map_err(|e| PullError::from_store(&e))?;
+        verify_private_meta(&parent_meta, blob_owner)?;
+        let rootfs_dir = rootfs_parent
+            .ensure_sha256()
+            .map_err(|e| PullError::from_store(&e))?;
+        let sha_meta = rootfs_dir
+            .metadata()
+            .map_err(|e| PullError::from_store(&e))?;
+        verify_private_meta(&sha_meta, blob_owner)?;
+        let published_path = self.config.cache_dir.join("rootfs").join("sha256");
         // 公開済みでも件数の照合を飛ばさない（余分な layer を足した不整合な manifest を成功させない。OCI-1）。
         if manifest.layers.len() != rootfs_cfg.diff_ids().len() {
             return Err(PullError::new(
@@ -671,13 +691,15 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
             ));
         }
         let record = self.unpack_record(manifest)?;
-        let root_owner = self.expected_root_owner(rootfs_dir.owner)?;
+        let root_owner = self.expected_root_owner(blob_owner)?;
         // 公開済みの命中は、同じ config・同じ展開設定の記録があるときに限る。layer の表現（圧縮 blob の digest・
         // mediaType）が違うだけなら、config の diff_ids が同じため展開物は同じ。その場合は今回の descriptor で
         // 展開を検証するだけで（公開はしない）成功とする（OCI-1）。
         let mut verify_only = false;
-        if inspect_published_rootfs(&entry_path, rootfs_dir.owner, root_owner)? {
-            match check_unpack_record(&entry_path.join(RECORD_FILE), &record, rootfs_dir.owner)? {
+        if let Some(entry) =
+            inspect_published_entry(&rootfs_dir, &manifest.config.digest, blob_owner, root_owner)?
+        {
+            match check_unpack_record(&entry, &record, blob_owner)? {
                 RecordMatch::Exact => return Ok(()),
                 RecordMatch::SameImageOtherLayers => verify_only = true,
             }
@@ -748,19 +770,27 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
             return Ok(());
         }
         write_unpack_record(&staged_entry, &record)?;
+        // 公開先のパスが、開いた公開先と同じ実体であることを公開の前に確かめる（fd 起点の操作は検査済みの実体にだけ届き、
+        // おとりへは書かれない。差し替えを成功に見せない検出器。OCI-7・SEC-1・#4283）。
+        if !rootfs_dir.matches_path(&published_path) {
+            return Err(PullError::new(
+                OciErrorCode::Internal,
+                "image rootfs cache directory changed during the pull",
+            ));
+        }
         // 原子的に公開する。並行する pull が先に公開していて信頼できるなら、その展開設定が同じときだけ成功とする。
-        // 公開元は `unpack/` の fd 起点の `renameat`（宛先ディレクトリは `O_NOFOLLOW` で開く。#4180）。
+        // 公開元は `unpack/` の fd 起点の `renameat`、宛先は開いた `rootfs/sha256`（#4180・#4283）。
         if unpack_dir
-            .rename_child_into(
-                "entry",
-                &rootfs_dir.path,
-                digest_hex(&manifest.config.digest),
-            )
+            .rename_child_into("entry", &rootfs_dir, digest_hex(&manifest.config.digest))
             .is_err()
         {
-            if inspect_published_rootfs(&entry_path, rootfs_dir.owner, root_owner).unwrap_or(false)
-            {
-                check_unpack_record(&entry_path.join(RECORD_FILE), &record, rootfs_dir.owner)?;
+            if let Ok(Some(entry)) = inspect_published_entry(
+                &rootfs_dir,
+                &manifest.config.digest,
+                blob_owner,
+                root_owner,
+            ) {
+                check_unpack_record(&entry, &record, blob_owner)?;
                 return Ok(());
             }
             return Err(PullError::new(
@@ -1285,19 +1315,16 @@ pub(crate) fn prepare_private_dir(
         }
         verify_private_dir(&current, owner)?;
     }
-    Ok(TrustedDir {
-        path: current,
-        owner,
-    })
+    Ok(TrustedDir { owner })
 }
 
-/// 検証済みのキャッシュ配下ディレクトリと、検証に使った所有者基準（[`prepare_private_dir`] の戻り値）。
+/// 検証済みのキャッシュ配下ディレクトリの検証に使った所有者基準（[`prepare_private_dir`] の戻り値。パスは持たない。
+/// 以後の操作は検査済み root の fd 起点で行う。#4283）。
 ///
 /// `owner` は呼び出しプロセスの実効 UID 相当（`owner_probe`）で、配下の blob ファイルの所有者確認
 /// （[`check_blob_trust`]）にも同じ値を使う（基準を取り直さない）。
 #[derive(Debug)]
 pub(crate) struct TrustedDir {
-    pub(crate) path: PathBuf,
     pub(crate) owner: u32,
 }
 
@@ -1481,48 +1508,56 @@ pub(crate) fn expected_root_owner_for(
     }
 }
 
-/// 公開済みエントリの有無を確かめる。有って信頼できれば `true`、無ければ `false`、有るのに信頼できなければ拒否する
+/// 公開済みエントリの有無を確かめる。有って信頼できれば `Some`、無ければ `None`、有るのに信頼できなければ拒否する
 /// （消さない。#2323）。信頼条件はキャッシュのディレクトリと同じ（symlink でない・所有者一致・group/other 書き込みなし）。
-/// エントリ（管理プロセス所有）と中の `rootfs/`（`root_owner` 所有）の両方を見る。
-pub(crate) fn inspect_published_rootfs(
-    entry: &Path,
+/// エントリ（管理プロセス所有）と中の `rootfs/`（`root_owner` 所有）の両方を、検査済み root の fd 起点で開いたハンドルの
+/// メタデータで見る（パスで辿り直さない。OCI-7・SEC-1・CRI-3・#4283）。pull の命中判定と create の入口が共有する。
+pub(crate) fn inspect_published_entry(
+    dir: &PublishedRootfsDir,
+    image_id: &Digest,
     owner: u32,
     root_owner: u32,
-) -> Result<bool, PullError> {
+) -> Result<Option<PublishedRootfsEntry>, PullError> {
     let untrusted = || {
         PullError::new(
             OciErrorCode::FailedPrecondition,
             "image rootfs cache entry is not trusted",
         )
     };
-    match fs::symlink_metadata(entry) {
-        Ok(_) => {
-            verify_private_dir(entry, owner).map_err(|_| untrusted())?;
-            verify_private_dir(&entry.join(ROOTFS_SUBDIR), root_owner).map_err(|_| untrusted())?;
-            Ok(true)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(_) => Err(PullError::new(
-            OciErrorCode::FailedPrecondition,
-            "failed to inspect the image rootfs cache entry",
-        )),
-    }
+    let entry = match dir.open_entry(image_id) {
+        Ok(Some(e)) => e,
+        Ok(None) => return Ok(None),
+        // symlink・非ディレクトリは信頼できない（消さずに拒否する）。
+        Err(e) if e.code() == OciErrorCode::FailedPrecondition => return Err(untrusted()),
+        Err(e) => return Err(PullError::from_store(&e)),
+    };
+    let meta = entry.metadata().map_err(|e| PullError::from_store(&e))?;
+    verify_private_meta(&meta, owner).map_err(|_| untrusted())?;
+    let rootfs = entry
+        .stat(ROOTFS_SUBDIR)
+        .map_err(|e| PullError::from_store(&e))?
+        .ok_or_else(untrusted)?;
+    verify_private_meta(&rootfs, root_owner).map_err(|_| untrusted())?;
+    Ok(Some(entry))
 }
 
 /// 照合用の記録の読み取り上限。
 pub(crate) const MAX_RECORD_BYTES: u64 = 64 * 1024;
 
-/// 展開記録を、種別の確認と同じハンドルから非ブロッキングで読む（#2534・OCI-1・SEC-5・REPAIR-5）。
+/// 展開記録を、公開済みエントリの fd 起点で開いたハンドルから読む（#2534・OCI-1・SEC-5・REPAIR-5・#4283）。
 ///
 /// pull の再利用判定（`check_unpack_record`）と create の `read_layers`（`bundle/image_rootfs.rs`）が共有する入口。
-/// `open_blob_nofollow` は lstat で種別を確かめ、`O_NONBLOCK` で開き、fstat と lstat の dev / ino を照合する。
-/// このため、lstat の後に FIFO へ差し替えられても open が無期限に止まらない。続けて同じハンドルの fstat で
+/// ハンドルは `PublishedRootfsEntry::open_file` が symlink を辿らず `O_NONBLOCK` で開いた通常ファイルのため、FIFO へ
+/// 差し替えられても open が無期限に止まらない。続けて同じハンドルの fstat で
 /// 「通常ファイル・所有者が `owner`・ハードリンク数 1・group / other 書き込み不可」を確認する
 /// （[`check_blob_trust`]）。上限は [`MAX_RECORD_BYTES`] で、超えたら黙って切り詰めず `ResourceExhausted` で
 /// 拒否する（切り詰めると `SameImageOtherLayers` に化けて再展開になる）。
 /// 失敗はいずれも固定文言で、パス・OS メッセージを含めない。
-pub(crate) fn read_unpack_record_body(path: &Path, owner: u32) -> Result<Vec<u8>, PullError> {
-    let mut file = open_blob_nofollow(path).map_err(|_| {
+pub(crate) fn read_entry_record_body(
+    entry: &PublishedRootfsEntry,
+    owner: u32,
+) -> Result<Vec<u8>, PullError> {
+    let mut file = entry.open_file(RECORD_FILE).ok().flatten().ok_or_else(|| {
         PullError::new(
             OciErrorCode::FailedPrecondition,
             "image rootfs cache entry has no unpack record",
@@ -1557,13 +1592,13 @@ pub(crate) fn read_unpack_record_body(path: &Path, owner: u32) -> Result<Vec<u8>
 
 /// 公開済みエントリの記録を `expected` と照合する。記録が無い・信頼できない・上限超過・設定が食い違う場合は再利用せず
 /// 拒否する（既存の展開物は消さない。コンテナの下位層として使われている可能性があるため）。読み取りは
-/// [`read_unpack_record_body`]（非ブロッキング・同じハンドル）。
+/// [`read_entry_record_body`]（非ブロッキング・同じハンドル）。
 fn check_unpack_record(
-    path: &Path,
+    entry: &PublishedRootfsEntry,
     expected: &UnpackRecord,
     owner: u32,
 ) -> Result<RecordMatch, PullError> {
-    let body = read_unpack_record_body(path, owner)?;
+    let body = read_entry_record_body(entry, owner)?;
     let Some(rest) = body.strip_prefix(expected.settings.as_bytes()) else {
         return Err(PullError::new(
             OciErrorCode::FailedPrecondition,
@@ -1628,7 +1663,7 @@ fn write_unpack_record_with(
     Ok(())
 }
 
-/// 展開の作業領域のディレクトリを作れなかったときの固定のエラー（`create_private_dir` と同じ文言）。
+/// 展開の作業領域のディレクトリを作れなかったときの固定のエラー。
 fn staging_dir_error() -> PullError {
     PullError::new(
         OciErrorCode::FailedPrecondition,
@@ -1636,23 +1671,42 @@ fn staging_dir_error() -> PullError {
     )
 }
 
-/// 非再帰で 0700 のディレクトリを作る（既存は拒否。展開の root は空であることが前提）。
-pub(crate) fn create_private_dir(path: &Path) -> Result<(), PullError> {
-    #[cfg(unix)]
-    let builder = {
-        use std::os::unix::fs::DirBuilderExt as _;
-        let mut builder = fs::DirBuilder::new();
-        builder.mode(0o700);
-        builder
-    };
-    #[cfg(not(unix))]
-    let builder = fs::DirBuilder::new();
-    builder.create(path).map_err(|_| {
+/// create 経路の入口で、キャッシュの root を作らずに検査する（#4283・OCI-7・SEC-1・CRI-3）。
+///
+/// 副作用はない（`prepare_private_dir` と違い何も作らず、所有者のプローブファイルも作らない）。キャッシュの実在する
+/// 祖先を辿って利用者所有の symlink と `..` を拒否し、祖先連鎖を [`verify_ancestors`] で検証して、キャッシュ root 自身を
+/// [`verify_private_dir`] で検証する。キャッシュ（またはその祖先）が無ければ `Ok(false)`（キャッシュ未作成）。
+/// 続けて呼び出し側が `ImageStore::open` を通すため、root の所有者が実効 uid であることと mode の検査はそこでも行われる。
+pub(crate) fn verify_cache_root(cache_dir: &Path) -> Result<bool, PullError> {
+    let (existing, missing) = split_existing_prefix(cache_dir)?;
+    if !missing.is_empty() {
+        return Ok(false);
+    }
+    let owner = dir_owner(&existing)?;
+    // `verify_ancestors` は引数の親を起点に検証するため、既存部分の直下の仮想子を渡す。
+    verify_ancestors(&existing.join("child"), owner)?;
+    verify_private_dir(&existing, owner)?;
+    Ok(true)
+}
+
+/// `dir` の所有 uid（symlink は辿らない）。非 Unix は所有者を確認できないため `Unimplemented`。
+#[cfg(unix)]
+fn dir_owner(dir: &Path) -> Result<u32, PullError> {
+    use std::os::unix::fs::MetadataExt as _;
+    fs::symlink_metadata(dir).map(|m| m.uid()).map_err(|_| {
         PullError::new(
             OciErrorCode::FailedPrecondition,
-            "failed to create the image rootfs staging directory",
+            "failed to inspect the image cache directory",
         )
     })
+}
+
+#[cfg(not(unix))]
+fn dir_owner(_dir: &Path) -> Result<u32, PullError> {
+    Err(PullError::new(
+        OciErrorCode::Unimplemented,
+        "image cache access control is not supported on this platform",
+    ))
 }
 
 /// `cache_dir` を絶対化し、実在する最も深い祖先（またはパス自身）と、その下の未作成要素に分ける。
@@ -1841,9 +1895,19 @@ fn verify_ancestors(_cache_dir: &Path, _owner: u32) -> Result<(), PullError> {
 
 /// `dir` が symlink でない通常ディレクトリで、`owner` の所有かつ他ユーザー書き込み不可であることを確認する。
 fn verify_private_dir(dir: &Path, owner: u32) -> Result<(), PullError> {
+    let meta = fs::symlink_metadata(dir).map_err(|_| {
+        PullError::new(
+            OciErrorCode::FailedPrecondition,
+            "failed to prepare the image cache directory",
+        )
+    })?;
+    verify_private_meta(&meta, owner)
+}
+
+/// [`verify_private_dir`] の判定を、取得済みのメタデータ（開いた fd の fstat か `symlink_metadata`）に対して行う。
+/// 信頼条件は同じ述語（ディレクトリである・`owner` の所有・group / other 書き込み不可）。
+pub(crate) fn verify_private_meta(meta: &fs::Metadata, owner: u32) -> Result<(), PullError> {
     let reject = |message: &'static str| PullError::new(OciErrorCode::FailedPrecondition, message);
-    let meta = fs::symlink_metadata(dir)
-        .map_err(|_| reject("failed to prepare the image cache directory"))?;
     if !meta.file_type().is_dir() {
         return Err(reject("image cache path is not a plain directory"));
     }
@@ -2370,6 +2434,7 @@ mod tests {
 #[cfg(all(test, unix))]
 mod blob_trust_fs_tests {
     use super::*;
+    use fandhe_container_oci::layer::open_blob_nofollow;
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
     /// `abc` の sha256。
@@ -2748,7 +2813,12 @@ mod non_unix_tests {
         )
         .expect("digest");
         assert_eq!(
-            inspect_cached_blob(open_blob_nofollow(&path), &digest, 3, 0),
+            inspect_cached_blob(
+                fandhe_container_oci::layer::open_blob_nofollow(&path),
+                &digest,
+                3,
+                0
+            ),
             Err(CachedBlobRejection::Unopenable)
         );
         let file = fs::File::open(&path).expect("open");

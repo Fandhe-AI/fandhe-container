@@ -26,7 +26,16 @@
 //! pid が `--expect-pid` と一致。不一致は exec も監査もしない）→ launch 時 env の読み込み → 監査 sink の構築（作れなければ
 //! exec も pidfd の要求もしない。SEC-4）→ kind 6 で pidfd の複製を受ける（孤児は `Unavailable`。記録 pid からの
 //! `pidfd_open` へは縮退しない。SEC-1）→ `StdioHandover` の受信（mask は `--stdio` と一致が必要）→ exec の通し
-//! （`on_created` で kind 7 の通知と ack の後に、exec 子 cgroup の名前を載せた `Started` を送る。wire v2・#4221）→ `Result` の送信。以降の失敗はすべて `Result` frame で返す。
+//! （`on_created` で kind 7 の通知と ack の後に、exec 子 cgroup の名前を載せた `Started` を送る。#4221）→ exec の待ちの刻みごとに fd 0 の `Signal` を受けて `SignalAck` を返す（wire v3・#4282。`signal_tick`）
+//! → `Result` の送信。以降の失敗はすべて `Result` frame で返す。
+//!
+//! # コマンドへのシグナル（#4282・SUP-6・CRI-5・SEC-1）
+//!
+//! plugin-cri の `Signal`（許可リスト [`super::wire::ExecSignal`]。SIGKILL は含まない）を、worker から渡されたコマンドの pidfd へ
+//! `pidfd_send_signal` する（`exec::CommandSignaler`。子孫へは送らない）。保留は 1 件まで、pidfd が未着の間は 2 秒まで再試行して
+//! `not_started`。受信に失敗した後は以後受けず ack も返さない（診断行 1 行。exec は止めない）。helper は seccomp・Landlock を受けて
+//! いないので、rootless でもコンテナの user namespace の所有者として CAP_KILL を持つ。詳細は `docs/design/shim-v2-production-binary.md`
+//! 「exec のシグナル」。
 //!
 //! # 接続断・期限（REPAIR-5）
 //!
@@ -73,11 +82,14 @@ use fandhe_container_core::traits::{
 use super::channel::{self, ChannelError};
 use super::diag::{HelperFailure, HelperStage};
 use super::wire::{
-    ChildStatus, ExitSignal, StdioMask, StreamExecOutcome, error_code_to_u8, step_to_u8,
+    ChildStatus, ExecSignal, ExitSignal, SignalAckCode, StdioMask, StreamExecOutcome,
+    error_code_to_u8, step_to_u8,
 };
 use crate::control::protocol::MAX_EXEC_HOLD_SECS;
 use crate::control::{ControlExecHandover, ExecControlFailure, ExecPidfdSource};
-use crate::exec::{ExecLaunchIo, ExecRequest, ExecStdio, default_audit_sink};
+use crate::exec::{
+    CommandSignaler, ExecLaunchIo, ExecRequest, ExecSignalDelivery, ExecStdio, default_audit_sink,
+};
 
 /// helper を起動するサブコマンド名（bin の第 1 引数）。
 pub const STREAM_EXEC_SUBCOMMAND: &str = "stream-exec";
@@ -530,6 +542,10 @@ pub fn serve_reporting(
         }
         gone
     };
+    // コマンドへのシグナル（#4282）。exec の刻みごとに fd 0 の `Signal` を受け、コマンドの pidfd へ送って `SignalAck` を返す。
+    let signal_state = SignalState::default();
+    let signal_hook =
+        |signaler: &dyn CommandSignaler| signal_tick(channel, &signal_state, signaler);
     let io = ExecLaunchIo {
         launch_env: &launch_env,
         stdio: ExecStdio {
@@ -539,6 +555,7 @@ pub fn serve_reporting(
         },
         on_created: Some(&on_created),
         cancel: Some(&cancel),
+        signal: Some(&signal_hook),
     };
     let result = (deps.run)(
         &record,
@@ -556,6 +573,15 @@ pub fn serve_reporting(
         );
     }
     let outcome = outcome_from_result(result);
+    // exec が終わった時点で保留のシグナルがあれば、`Result` の前に ack を返す（#4282）。コマンドが終わっていれば
+    // `exited`、そうでなければ pidfd が届かないままだったので `not_started`。要求元が消えていれば送れず、結果は捨てる。
+    if let Some((signal, _)) = signal_state.pending.take() {
+        let code = match outcome {
+            StreamExecOutcome::Exited(_) | StreamExecOutcome::Signaled(_) => SignalAckCode::Exited,
+            _ => SignalAckCode::NotStarted,
+        };
+        let _ = channel::send_signal_ack(channel, signal, code, Instant::now() + SIGNAL_ACK_BUDGET);
+    }
     // 失敗の段: 通知・`Started` の送信で覚えたものを優先し、無ければ実行役の失敗（`Failed`）を `helper_exec` とする。
     // 取り消し（要求元の消滅）は従来の行があるので足さない。
     let failure = match created_failure.take() {
@@ -569,6 +595,58 @@ pub fn serve_reporting(
         },
     };
     ServeReport { outcome, failure }
+}
+
+/// 保留のシグナルを持つ猶予の上限: コマンドの pidfd が届かないまま過ぎたら `not_started` を返す（REPAIR-5）。
+const SIGNAL_START_GRACE: Duration = Duration::from_secs(2);
+/// `SignalAck` の送信に割り当てる上限（exec の待ちの刻みの中で呼ばれるため短くする。REPAIR-5）。
+const SIGNAL_ACK_BUDGET: Duration = Duration::from_millis(500);
+
+/// helper が持つシグナルの状態（単一スレッド。#4282）。
+#[derive(Default)]
+struct SignalState {
+    /// 受け取って結果を返していないシグナルと、受け取った時刻（保留は 1 件まで）。
+    pending: std::cell::Cell<Option<(ExecSignal, Instant)>>,
+    /// 受信に失敗した（frame の境界を信頼できないため、以後は受信も ack の送信もしない）。
+    dead: std::cell::Cell<bool>,
+}
+
+/// exec の待ちの刻みごとのシグナル処理（[`ExecLaunchIo::signal`] の実体。#4282・SUP-6・SEC-1・REPAIR-5）。
+///
+/// 保留が無ければ fd 0 の `Signal` を 1 件だけ（待たずに）受ける。保留があれば [`CommandSignaler::deliver`] を試し、結果を
+/// `SignalAck` で返す（`NotStarted` は [`SIGNAL_START_GRACE`] まで保留して再試行）。受信に失敗した（壊れた frame・許可外の番号・
+/// 旧い版・fd 付き）ときは以後シグナルを受けず（ack も返さない）、固定語彙の診断行を 1 行出す。exec は止めず従来の期限で終わる。
+fn signal_tick(channel: &UnixStream, state: &SignalState, signaler: &dyn CommandSignaler) {
+    if state.pending.get().is_none() && !state.dead.get() {
+        match channel::try_recv_signal(channel) {
+            Ok(Some(signal)) => state.pending.set(Some((signal, Instant::now()))),
+            Ok(None) => {}
+            Err(_) => {
+                state.dead.set(true);
+                diagnose(
+                    "invalid-argument",
+                    "stream-exec received a malformed signal frame; further signals are ignored",
+                );
+            }
+        }
+    }
+    let Some((signal, since)) = state.pending.get() else {
+        return;
+    };
+    let code = match signaler.deliver(signal.number()) {
+        ExecSignalDelivery::Delivered => SignalAckCode::Delivered,
+        ExecSignalDelivery::Exited => SignalAckCode::Exited,
+        ExecSignalDelivery::NotStarted => {
+            if since.elapsed() < SIGNAL_START_GRACE {
+                return;
+            }
+            SignalAckCode::NotStarted
+        }
+        // `Unavailable` と将来の未知の結果は、送れなかったものとして返す（fail-closed）。
+        _ => SignalAckCode::Unavailable,
+    };
+    state.pending.set(None);
+    let _ = channel::send_signal_ack(channel, signal, code, Instant::now() + SIGNAL_ACK_BUDGET);
 }
 
 /// 受け取った stdin・stdout・stderr の fd が AF_UNIX の socket か FIFO（pipe）であることを確かめる（SUP-6・SEC-1・#3761）。

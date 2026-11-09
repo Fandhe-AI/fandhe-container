@@ -33,8 +33,8 @@ use fandhe_container_core::exec::{ExecCgroupName, PtyMaster};
 use fandhe_container_core::traits::ErrorCode;
 
 use super::wire::{
-    EncodeError, Frame, HEADER_LEN, Kind, MAX_FRAME_LEN, StdioMask, StreamExecOutcome,
-    WireCgroupName, WireError, parse_header,
+    EncodeError, ExecSignal, Frame, HEADER_LEN, Kind, MAX_FRAME_LEN, SignalAckCode, StdioMask,
+    StreamExecOutcome, WireCgroupName, WireError, parse_header,
 };
 use crate::sys;
 
@@ -125,6 +125,13 @@ pub enum HelperMessage {
     PtyMaster(PtyMaster),
     /// 終了の結果。
     Result(StreamExecOutcome),
+    /// `Signal` の結果（要求の番号と結果。検証済み。#4282）。
+    SignalAck {
+        /// 要求されたシグナル。
+        signal: ExecSignal,
+        /// 結果。
+        code: SignalAckCode,
+    },
 }
 
 fn remaining(deadline: Instant) -> Result<Duration, ChannelError> {
@@ -228,6 +235,26 @@ pub fn send_result(
     send_frame(stream, &Frame::Result(*outcome), &[], deadline)
 }
 
+/// plugin-cri → helper: exec のコマンドへ SIGKILL 以外のシグナルを送る要求（#4282・SUP-6）。番号は許可リストの [`ExecSignal`]
+/// でしか作れない。fd は付けない。
+pub fn send_signal(
+    stream: &UnixStream,
+    signal: ExecSignal,
+    deadline: Instant,
+) -> Result<(), ChannelError> {
+    send_frame(stream, &Frame::Signal(signal), &[], deadline)
+}
+
+/// helper → plugin-cri: `Signal` の結果を返す（#4282。要求の番号を折り返す）。
+pub fn send_signal_ack(
+    stream: &UnixStream,
+    signal: ExecSignal,
+    code: SignalAckCode,
+    deadline: Instant,
+) -> Result<(), ChannelError> {
+    send_frame(stream, &Frame::SignalAck { signal, code }, &[], deadline)
+}
+
 /// `buf` を満たすまで受ける。fd は frame 全体の最初の `recvmsg`（`first`）で受けたものだけを `fds` に集め、
 /// 後続の読み取りに付いていたら拒否する。通常の `read` は fd を黙って捨てるため使わない。
 fn recv_exact(
@@ -316,7 +343,35 @@ pub fn recv_stdio_handover(
     })
 }
 
-/// plugin-cri 側: helper からの frame（`Started`・`PtyMaster`・`Result`）を 1 つ受ける。`PtyMaster` の fd は
+/// `try_recv_signal` が 1 frame の受信に割り当てる上限（`POLLIN` を見てからの受信なので通常は即座に終わる。REPAIR-5）。
+pub const SIGNAL_RECV_BUDGET: Duration = Duration::from_millis(200);
+
+/// helper 側: plugin-cri からの `Signal` を、読めるデータがあるときだけ 1 つ受ける（#4282・SUP-6・SEC-1・REPAIR-5）。
+///
+/// `poll(timeout = 0)` で `POLLIN` が立っていなければ何も読まず `Ok(None)`（待たない。判定の失敗も `Ok(None)`）。立っていれば
+/// [`SIGNAL_RECV_BUDGET`] の期限つきで 1 frame を受け、`Signal` 以外（`StdioHandover` を含む）・fd が付いた frame・許可外の番号・
+/// 壊れた frame は `Err`（受け取った fd は閉じる）。`Err` の後は channel から二度と受信しないこと（frame の境界を信頼できない。
+/// モジュール doc「受信失敗後の扱い」）。切断（`POLLIN` と EOF）は `Closed`。
+pub fn try_recv_signal(stream: &UnixStream) -> Result<Option<ExecSignal>, ChannelError> {
+    match sys::poll_revents_now(stream.as_fd(), sys::POLL_IN) {
+        Ok(revents) if revents & sys::POLL_IN != 0 => {}
+        _ => return Ok(None),
+    }
+    let (frame, fds) = recv_frame(
+        stream,
+        Kind::is_to_helper,
+        Instant::now() + SIGNAL_RECV_BUDGET,
+    )?;
+    if !fds.is_empty() {
+        return Err(ChannelError::FdCountMismatch);
+    }
+    match frame {
+        Frame::Signal(signal) => Ok(Some(signal)),
+        _ => Err(ChannelError::Malformed(WireError::UnknownKind)),
+    }
+}
+
+/// plugin-cri 側: helper からの frame（`Started`・`PtyMaster`・`Result`・`SignalAck`）を 1 つ受ける。`PtyMaster` の fd は
 /// pty master であることを確かめ、違えば fd を閉じて `NotPtyMaster` で拒否する（#4100）。失敗後は channel を再利用しない。
 pub fn recv_from_helper(
     stream: &UnixStream,
@@ -341,7 +396,10 @@ pub fn recv_from_helper(
             let master = PtyMaster::from_received(fd).map_err(|_| ChannelError::NotPtyMaster)?;
             Ok(HelperMessage::PtyMaster(master))
         }
-        Frame::StdioHandover(_) => Err(ChannelError::Malformed(WireError::UnknownKind)),
+        Frame::SignalAck { signal, code } => Ok(HelperMessage::SignalAck { signal, code }),
+        Frame::StdioHandover(_) | Frame::Signal(_) => {
+            Err(ChannelError::Malformed(WireError::UnknownKind))
+        }
     }
 }
 
@@ -544,7 +602,7 @@ mod tests {
         let two = [null.as_fd(), null.as_fd()];
         let one = [null.as_fd()];
         let frame = |kind: u8, plen: u8, payload: &[u8], fds: &[BorrowedFd<'_>]| {
-            let mut v = vec![b'F', b'C', b'S', b'X', 2, kind, 0, plen];
+            let mut v = vec![b'F', b'C', b'S', b'X', 3, kind, 0, plen];
             v.extend_from_slice(payload);
             sys::send_with_fds(a.as_fd(), &v, fds).unwrap();
         };
@@ -587,7 +645,7 @@ mod tests {
     fn sup6_fd_on_continuation_rejected() {
         let (a, b) = pair();
         let null = File::open("/dev/null").unwrap();
-        let head = [b'F', b'C', b'S', b'X', 2, 1, 0, 1];
+        let head = [b'F', b'C', b'S', b'X', 3, 1, 0, 1];
         sys::send_with_fds(a.as_fd(), &head, &[]).unwrap();
         sys::send_with_fds(a.as_fd(), &[0b001], &[null.as_fd()]).unwrap();
         assert_eq!(
@@ -601,7 +659,7 @@ mod tests {
         let (a, b) = pair();
         let (mut r, w) = std::io::pipe().unwrap();
         // 不正な magic の frame に pipe の書き込み端を添える。
-        let bad = [b'X', b'C', b'S', b'X', 2, 2, 0, 0];
+        let bad = [b'X', b'C', b'S', b'X', 3, 2, 0, 0];
         sys::send_with_fds(a.as_fd(), &bad, &[w.as_fd()]).unwrap();
         assert_eq!(
             recv_from_helper(&b, far()).unwrap_err(),
@@ -620,7 +678,7 @@ mod tests {
     #[test]
     fn sup6_oversized_header_rejected_without_payload() {
         let (a, b) = pair();
-        let head = [b'F', b'C', b'S', b'X', 2, 4, 0xFF, 0xFF];
+        let head = [b'F', b'C', b'S', b'X', 3, 4, 0xFF, 0xFF];
         sys::send_with_fds(a.as_fd(), &head, &[]).unwrap();
         let t = Instant::now();
         let err = recv_from_helper(&b, Instant::now() + Duration::from_secs(5)).unwrap_err();
@@ -631,7 +689,7 @@ mod tests {
     #[test]
     fn sup6_unknown_and_reverse_direction_kinds_rejected() {
         let (a, b) = pair();
-        let unknown = [b'F', b'C', b'S', b'X', 2, 9, 0, 0];
+        let unknown = [b'F', b'C', b'S', b'X', 3, 9, 0, 0];
         sys::send_with_fds(a.as_fd(), &unknown, &[]).unwrap();
         assert_eq!(
             recv_from_helper(&b, far()).unwrap_err(),
@@ -647,6 +705,99 @@ mod tests {
         // `Started` の payload が未読のまま残るため、同じ組では続きの frame を読めない）。
         let (a, b) = pair();
         send_stdio_handover(&a, &StdioSend::default(), far()).unwrap();
+        assert_eq!(
+            recv_from_helper(&b, far()).unwrap_err(),
+            ChannelError::Malformed(WireError::UnknownKind)
+        );
+    }
+
+    /// SUP-6・SEC-1・#4282: `Signal` の往復と、データが無いときの `Ok(None)`（待たない）。`SignalAck` は plugin-cri 側で受ける。
+    #[test]
+    fn sup6_4282_signal_roundtrip_and_ack() {
+        let (plugin, helper) = pair();
+        let t = Instant::now();
+        assert_eq!(try_recv_signal(&helper), Ok(None));
+        assert!(t.elapsed() < Duration::from_millis(500));
+        let term = ExecSignal::new(15).unwrap();
+        send_signal(&plugin, term, far()).unwrap();
+        assert_eq!(try_recv_signal(&helper), Ok(Some(term)));
+        assert_eq!(try_recv_signal(&helper), Ok(None));
+        send_signal_ack(&helper, term, SignalAckCode::Delivered, far()).unwrap();
+        match recv_from_helper(&plugin, far()).unwrap() {
+            HelperMessage::SignalAck { signal, code } => {
+                assert_eq!(signal, term);
+                assert_eq!(code, SignalAckCode::Delivered);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// SUP-6・SEC-1・REPAIR-2・#4282: 許可外の番号・旧い版・fd 付き・向きの違う frame は `try_recv_signal` が拒否する。
+    #[test]
+    fn sup6_4282_try_recv_signal_rejections() {
+        let hdr = |ver: u8, kind: u8, plen: u8| vec![b'F', b'C', b'S', b'X', ver, kind, 0, plen];
+        let send = |a: &UnixStream, bytes: &[u8], fds: &[BorrowedFd<'_>]| {
+            sys::send_with_fds(a.as_fd(), bytes, fds).unwrap();
+        };
+        // SIGKILL(9) は許可外。
+        let (a, b) = pair();
+        let mut v = hdr(3, 5, 1);
+        v.push(9);
+        send(&a, &v, &[]);
+        assert_eq!(
+            try_recv_signal(&b),
+            Err(ChannelError::Malformed(WireError::SignalNotAllowed))
+        );
+        // 0 と 65 は範囲外。
+        for n in [0u8, 65] {
+            let (a, b) = pair();
+            let mut v = hdr(3, 5, 1);
+            v.push(n);
+            send(&a, &v, &[]);
+            assert_eq!(
+                try_recv_signal(&b),
+                Err(ChannelError::Malformed(WireError::SignalOutOfRange))
+            );
+        }
+        // 旧い版（v2）。
+        let (a, b) = pair();
+        let mut v = hdr(2, 5, 1);
+        v.push(15);
+        send(&a, &v, &[]);
+        assert_eq!(
+            try_recv_signal(&b),
+            Err(ChannelError::Malformed(WireError::BadVersion))
+        );
+        // fd 付きの Signal は拒否し、受け取った fd は閉じる。
+        let (a, b) = pair();
+        let null = File::open("/dev/null").unwrap();
+        let mut v = hdr(3, 5, 1);
+        v.push(15);
+        send(&a, &v, &[null.as_fd()]);
+        assert_eq!(try_recv_signal(&b), Err(ChannelError::FdCountMismatch));
+        // 向きの違う frame（helper → plugin-cri の SignalAck・Started）。
+        let (a, b) = pair();
+        let mut v = hdr(3, 6, 2);
+        v.extend_from_slice(&[15, 1]);
+        send(&a, &v, &[]);
+        assert_eq!(
+            try_recv_signal(&b),
+            Err(ChannelError::Malformed(WireError::UnknownKind))
+        );
+        // StdioHandover は向きは合うが Signal ではない。
+        let (a, b) = pair();
+        send_stdio_handover(&a, &StdioSend::default(), far()).unwrap();
+        assert_eq!(
+            try_recv_signal(&b),
+            Err(ChannelError::Malformed(WireError::UnknownKind))
+        );
+        // 切断は Closed。
+        let (a, b) = pair();
+        drop(a);
+        assert_eq!(try_recv_signal(&b), Err(ChannelError::Closed));
+        // plugin-cri 側は Signal を受けない。
+        let (a, b) = pair();
+        send_signal(&a, ExecSignal::new(15).unwrap(), far()).unwrap();
         assert_eq!(
             recv_from_helper(&b, far()).unwrap_err(),
             ChannelError::Malformed(WireError::UnknownKind)

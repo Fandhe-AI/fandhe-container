@@ -342,7 +342,7 @@ pod の netns の結線（順 13）の最後で、`port_mappings` を `NetworkPl
 | -------------------- | ---- |
 | protocol が TCP・UDP・SCTP 以外、container_port が 1..=65535 の外、host_port が 0..=65535 の外、host_ip が 64 バイト超・IP でない・multicast・`240/4`・`0/8`（`0.0.0.0` を除く）、完全に同じ受け口の重複、公開する要素が 64 件超 | `INVALID_ARGUMENT` |
 | `host_port == 0` | 公開しない（どのモードでも受ける） |
-| `host_port > 0` で SCTP、host_ip が空・`0.0.0.0`・`127.0.0.0/8`・IPv6、host_ip だけ違う同じ `(protocol, host_port)` | `UNIMPLEMENTED` |
+| `host_port > 0` で SCTP、host_ip が空・`0.0.0.0`・`127.0.0.0/8`・IPv6（IPv4 射影形を除く。互換形 `::a.b.c.d` を含む）、host_ip だけ違う同じ `(protocol, host_port)` | `UNIMPLEMENTED` |
 | 公開する要素があり、provider なし（本番）・`NODE`・`CONTAINER`・`TARGET` | `UNIMPLEMENTED`（RunPodSandbox で資源を作る前に返す。bundle も最終の防壁として同じ判定） |
 | 公開する要素があり、provider ありの `POD` | `set_up` の中で公開。失敗は `delete_network` で一括して戻す |
 
@@ -350,6 +350,7 @@ pod の netns の結線（順 13）の最後で、`port_mappings` を `NetworkPl
 
 ### 既知の差と残る制約（REPAIR-3）
 
+- **IPv4 射影形の host_ip（#4290・SEC-1）**: parse の後に `IpAddr::to_canonical()` で IPv4 へ寄せてから同じ判定にかける。`::ffff:224.0.0.1` は `INVALID_ARGUMENT`、`::ffff:0.0.0.0`・`::ffff:127.0.0.1` は `UNIMPLEMENTED`、`::ffff:192.0.2.10` は `192.0.2.10` として受ける（同じアドレスの別表記で、従来の `UNIMPLEMENTED` から受理範囲が広がる）。互換形と他の IPv6 は従来どおり `UNIMPLEMENTED`。述語は共通化しない（std の `to_canonical` だけで足りることと、oci の registry の公開アドレス判定は private も拒否し意味が違うため）
 - **空の host_ip は `UNIMPLEMENTED`**: kubelet の既定は空（全アドレス）で、containerd・CNI portmap も空と `0.0.0.0` を「全アドレス」として扱う（下記で照合済み）。一方、net は意図しない全アドレス公開を避けるため明示した非 loopback の unicast を必須にしており、黙って特定アドレスに置き換えない。このため実際の hostPort の大半はまだ通らない（net の拒否を見直すかはオーナー判断の候補）
 - `host_port == 0` を読み飛ばす扱いは kubelet・containerd と一致する（下記「外部の事実の照合（port_mappings）」で 2026-10-26 に照合済み。kubelet は `host_port == 0` の要素もそのまま CRI へ送り、containerd が `HostPort <= 0` を読み飛ばす）。hostNetwork の扱いは**挙動が食い違う**: kubelet は hostNetwork の pod の ports に `host_port = container_port` を入れて送り、containerd は `NODE` でネットワークの setup を行わず port_mappings を使わない（黙って無視する）。本実装は公開する要素がある `NODE` を `UNIMPLEMENTED` にするため、ports を宣言した hostNetwork の pod は本実装では起動できない（厳しい側の差）。無視に合わせるかはオーナー判断の事項で、コードは変えていない
 - masquerade 未実装と host の `ip_forward` が前提で、外部からの到達は保証しない

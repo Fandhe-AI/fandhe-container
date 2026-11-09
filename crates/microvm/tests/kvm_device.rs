@@ -1,4 +1,4 @@
-//! `/dev/kvm` 実機前提の試験（MVM-1・TASK-74.1.1・TASK-74.1.2・TASK-74.4.1・TASK-74.4.2・TASK-74.2.3・TASK-74.3.2・TASK-75.1・TASK-75.2・TASK-75.3.1・TASK-75.3.2・TASK-75.4.1・TASK-75.4.2・TASK-75.5・#3733・#3734・#3735・#3738・#3918・#4158）。`--ignored` 指定時だけ走る。
+//! `/dev/kvm` 実機前提の試験（MVM-1・TASK-74.1.1・TASK-74.1.2・TASK-74.4.1・TASK-74.4.2・TASK-74.2.3・TASK-74.3.2・TASK-75.1・TASK-75.2・TASK-75.3.1・TASK-75.3.2・TASK-75.4.1・TASK-75.4.2・TASK-75.5・#3733・#3734・#3735・#3738・#3918・#4225・#4158）。`--ignored` 指定時だけ走る。
 //! 必要環境: Linux・`/dev/kvm` の読み書き権限（`kvm` グループ等）。root は不要。
 //! aarch64 の試験（`kvm_device_arm64_*`。#3696）は、加えて aarch64 Linux ホストと in-kernel GICv3 が要る（ネイティブ arm64 の CI は無く、実機は人間担当。#2274・#3781）。
 #![cfg(target_os = "linux")]
@@ -552,6 +552,22 @@ fn kvm_device_register_guest_memory_with_flags() {
             Ok(mut mem) => {
                 mem.write_at(GuestAddress::new(base + 0x10), &[9, 8, 7, 6])
                     .unwrap();
+                // #4225: dirty log は LOG_DIRTY_PAGES つきだけ取れる。ホストの書き込みは追跡されず全ビット 0。
+                if flags.contains(MemslotFlags::LOG_DIRTY_PAGES) {
+                    let d = mem.dirty_log(0).unwrap();
+                    assert_eq!(d.page_count() * d.page_size(), 1 << 20);
+                    assert_eq!(d.as_bytes().len() as u64, d.page_count().div_ceil(64) * 8);
+                    assert!(d.as_bytes().iter().all(|b| *b == 0));
+                } else {
+                    assert_eq!(
+                        mem.dirty_log(0).unwrap_err().code(),
+                        MicrovmErrorCode::FailedPrecondition
+                    );
+                }
+                assert_eq!(
+                    mem.dirty_log(1).unwrap_err().code(),
+                    MicrovmErrorCode::InvalidArgument
+                );
                 assert_eq!(
                     mem.read_u32_le(GuestAddress::new(base + 0x10)).unwrap(),
                     0x0607_0809
@@ -751,6 +767,115 @@ fn kvm_device_guest_writes_registered_memory() {
         .expect("guest memory test did not finish within 30s")
         .unwrap();
     assert_eq!(byte, 0x5A);
+}
+
+/// `kvm_device_dirty_log_tracks_guest_writes` が vCPU スレッドから持ち帰る観測値（#4225）。
+#[cfg(target_arch = "x86_64")]
+struct DirtyObservation {
+    page_size: u64,
+    pages: u64,
+    bytes: Vec<u8>,
+    dirty: Vec<u64>,
+    second: Vec<u8>,
+    read_back: [u8; 2],
+}
+
+/// MVM-1・#4225: `LOG_DIRTY_PAGES` つき memslot の dirty bitmap は、ゲストが書いたページのビットだけが立つ（x86_64）。
+/// リセットベクタのゲストコードが `0xFFFF_0100`（page 0）と `0xFFFF_2100`（page 2）へ書いて `hlt` する。ホストが書いた
+/// コードのページ（page 15）は実機で dirty になることがあるため照合から外し（マスク）、読み取りと同時にクリアされるため
+/// 2 回目は全 0 になる。
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_dirty_log_tracks_guest_writes() {
+    use fandhe_container_microvm::exit::VcpuExit;
+    use fandhe_container_microvm::guest_memory::GuestAddress;
+    use fandhe_container_microvm::memslot_flags::MemslotFlags;
+    use fandhe_container_microvm::microvm::GuestRam;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let dev = open_kvm();
+    // REPAIR-5: 止まった vCPU スレッドが残っても、期限切れでテストごと失敗にする。
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let run = || -> Result<DirtyObservation, String> {
+            let vm = dev.create_vm().map_err(|e| e.to_string())?;
+            let mut mem = GuestRam::new(64 << 10)
+                .and_then(|r| {
+                    r.register_with_flags(
+                        &vm,
+                        0,
+                        GuestAddress::new(0xFFFF_0000),
+                        MemslotFlags::LOG_DIRTY_PAGES,
+                    )
+                })
+                .map_err(|e| e.to_string())?;
+            let code = [
+                0x2E, 0xC6, 0x06, 0x00, 0x01, 0x5A, // mov byte cs:[0x0100], 0x5A
+                0x2E, 0xC6, 0x06, 0x00, 0x21, 0xA5, // mov byte cs:[0x2100], 0xA5
+                0xF4, // hlt
+            ];
+            mem.write_at(GuestAddress::new(0xFFFF_FFF0), &code)
+                .map_err(|e| e.to_string())?;
+            let mut vcpu = vm.create_vcpu(0).map_err(|e| e.to_string())?;
+            for _ in 0..8 {
+                match vcpu
+                    .run_once(Duration::from_secs(5))
+                    .map_err(|e| e.to_string())?
+                {
+                    VcpuExit::Interrupted => continue,
+                    VcpuExit::Hlt => {
+                        let first = mem.dirty_log(0).map_err(|e| e.to_string())?;
+                        let second = mem.dirty_log(0).map_err(|e| e.to_string())?;
+                        let mut b = [0u8; 2];
+                        mem.read_at(GuestAddress::new(0xFFFF_0100), &mut b[..1])
+                            .map_err(|e| e.to_string())?;
+                        mem.read_at(GuestAddress::new(0xFFFF_2100), &mut b[1..])
+                            .map_err(|e| e.to_string())?;
+                        drop(vcpu);
+                        return Ok(DirtyObservation {
+                            page_size: first.page_size(),
+                            pages: first.page_count(),
+                            bytes: first.as_bytes().to_vec(),
+                            dirty: first.dirty_pages().collect(),
+                            second: second.as_bytes().to_vec(),
+                            read_back: b,
+                        });
+                    }
+                    other => return Err(format!("unexpected exit: {other:?}")),
+                }
+            }
+            Err("too many interrupted runs".to_string())
+        };
+        let _ = tx.send(run());
+    });
+    let DirtyObservation {
+        page_size,
+        pages,
+        bytes,
+        dirty,
+        second,
+        read_back,
+    } = rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("dirty log test did not finish within 30s")
+        .unwrap();
+    assert_eq!(page_size, 4096);
+    assert_eq!(pages, 16);
+    // page 15（ホストが書いたゲストコードのページ）は、ゲストが命令を実行するだけで KVM が dirty にする（実機で観測。hlt のみのコードでも
+    // 立つ）ため照合の対象から外し、ゲストが書いた page 0・2 だけが立つこと（page 1・3〜14 は立たない）を具体値で照合する。
+    let mask_code_page = |mut v: Vec<u8>| {
+        v[1] &= 0x7f;
+        v
+    };
+    assert_eq!(mask_code_page(bytes), vec![0x05, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        dirty.into_iter().filter(|p| *p != 15).collect::<Vec<_>>(),
+        vec![0, 2]
+    );
+    assert_eq!(mask_code_page(second), vec![0u8; 8]);
+    assert_eq!(read_back, [0x5A, 0xA5]);
 }
 
 /// MVM-1・TASK-75.2: デバイス・vCPU・メモリを 1 つの VM 構成体に組み立て、一貫した経路で触れること。

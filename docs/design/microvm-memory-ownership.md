@@ -113,7 +113,7 @@ backing と登録の所有先は `crates/microvm/src/hvf/memory.rs`（安全な 
 - 登録: 領域 i を slot i の別の memslot で登録する（`register_ram_regions`）。`KVM_CHECK_EXTENSION(KVM_CAP_NR_MEMSLOTS)`（`VmFd::max_user_memslots`。x86_64 は 32764）を mmap の前に照会し、足りなければ `ResourceExhausted`、照会できない・0 以下なら `FailedPrecondition`（fail-closed）。途中で失敗したときは登録済みの領域が drop され、slot の削除と munmap が済む（削除に失敗した領域は従来どおり漏らす）。aarch64 の RAM は hole が無いため 1 領域のまま同じ経路を通る。macOS（HVF）は 1 領域のまま
 - e820 との一致: 先頭の領域（GPA 0 から）が従来の 3 本（RAM・MP テーブルの予約・RAM）、2 番目以降が RAM 1 本ずつ。カーネル・initrd・boot_params・SIPI のページは先頭の領域の中にだけ置く。`check_loaded_within` と SIPI の範囲検査は総バイト数ではなく先頭の領域の長さで行い、hole を挟んでも SEC-1 の検査を緩めない
 - 挙動の変化: x86_64 で 3.25 GiB（`VIRTIO_MMIO_BASE`）を超える `mem_size` が受理されるようになった（以前は拒否）
-- 範囲外（REPAIR-3）: hugepage（#4159 で採らない判断を記録。本書末尾。`KVM_MEM_READONLY` / `KVM_MEM_LOG_DIRTY_PAGES` は #4158 で結線済み）。ゲストの物理アドレス幅と最上位 GPA の照合・e820 の予約表記は #4106 で実装済み（本書末尾の記録）。実カーネルを 4 GiB 超の RAM で起動し `/proc/meminfo` で確かめる通し試験。macOS（HVF）の複数領域は対象外（#4023 の判断。本書末尾の記録）
+- 範囲外（REPAIR-3）: hugepage（#4159 で採らない判断を記録。本書末尾。`KVM_MEM_READONLY` / `KVM_MEM_LOG_DIRTY_PAGES` は #4158 で結線済み。dirty bitmap の取得は #4225）。ゲストの物理アドレス幅と最上位 GPA の照合・e820 の予約表記は #4106 で実装済み（本書末尾の記録）。実カーネルを 4 GiB 超の RAM で起動し `/proc/meminfo` で確かめる通し試験。macOS（HVF）の複数領域は対象外（#4023 の判断。本書末尾の記録）
 - 試験: KVM を使わない部分は既定のテスト集合の `mvm1_3697_*`。実 KVM は `crates/microvm/tests/kvm_device.rs` の `kvm_device_assemble_microvm_high_memory`（実機前提。`docs/verification/real-machine-tests.md`）
 
 ## #4024 での `Send` の導入記録（MVM-5・MVM-1・SEC-1）

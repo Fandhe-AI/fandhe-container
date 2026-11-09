@@ -328,6 +328,15 @@ fn stage1() -> Result<(), StageEnd> {
 
 // ---- 段 2 ----
 
+/// 段 2 の dumpable 確認。`PR_GET_DUMPABLE` が 0（`SUID_DUMP_DISABLE`）のときだけ通し、
+/// 1・2（`SUID_DUMP_ROOT`）・未知の値・prctl の失敗はすべて拒否する(fail-closed。#4376・SEC-5)。
+fn require_non_dumpable(r: std::io::Result<sys::DumpableMode>) -> Result<(), Fail> {
+    match r {
+        Ok(sys::DumpableMode::Disable) => Ok(()),
+        _ => Err(Fail::new(ErrorCode::Internal, "the process is dumpable")),
+    }
+}
+
 fn stage2(args: &[OsString]) -> Result<(), StageEnd> {
     // exec で dumpable は 1 に戻るため最初に落とす(この窓の間、プロセスは秘密を持たない)。
     let dumpable_reset = set_non_dumpable();
@@ -337,12 +346,7 @@ fn stage2(args: &[OsString]) -> Result<(), StageEnd> {
     };
     dumpable_reset?;
     check_stdio()?;
-    match sys::get_dumpable() {
-        Ok(false) => {}
-        _ => {
-            return Err(Fail::new(ErrorCode::Internal, "the process is dumpable").into());
-        }
-    }
+    require_non_dumpable(sys::get_dumpable())?;
     // 待つだけのプロセスに pod の user namespace の capability を残さない(SEC-1)。
     sys::cap_ambient_clear_all()
         .map_err(|_| Fail::new(ErrorCode::Internal, "failed to drop capabilities"))?;
@@ -411,6 +415,21 @@ mod tests {
 
     fn os(v: &[&str]) -> Vec<OsString> {
         v.iter().map(OsString::from).collect()
+    }
+
+    /// CRI-2・SEC-5・#4376: 戻り値 0 のときだけ通り、1・2・未知・prctl の失敗は拒否する。
+    #[test]
+    fn cri2_sec5_4376_stage2_rejects_suid_dump_root() {
+        let mode = |rc| Ok(sys::dumpable_mode_from_prctl(rc));
+        assert!(require_non_dumpable(mode(0)).is_ok());
+        for rc in [1, 2, 3] {
+            let f = require_non_dumpable(mode(rc)).expect_err("must reject");
+            assert_eq!(f.code, ErrorCode::Internal);
+            assert_eq!(f.message, "the process is dumpable");
+        }
+        let f = require_non_dumpable(Err(std::io::Error::from(std::io::ErrorKind::Unsupported)))
+            .expect_err("must reject");
+        assert_eq!(f.message, "the process is dumpable");
     }
 
     /// CRI-2・REPAIR-5・#2874: SIGTERM が無視・ブロックされた起動を見分ける。

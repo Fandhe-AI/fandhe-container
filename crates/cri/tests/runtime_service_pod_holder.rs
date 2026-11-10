@@ -48,6 +48,8 @@ struct FakeHolder {
     live: Mutex<Live>,
     unblock: AtomicBool,
     release_hangs: AtomicBool,
+    /// `release` が受け取った期限の記録（#4418。時間に依存しない照合用）。
+    release_timeouts: Mutex<Vec<Duration>>,
     pid: u32,
 }
 
@@ -63,6 +65,7 @@ impl FakeHolder {
             live: Mutex::new(Live::Alive),
             unblock: AtomicBool::new(false),
             release_hangs: AtomicBool::new(false),
+            release_timeouts: Mutex::new(Vec::new()),
             pid,
         })
     }
@@ -100,7 +103,8 @@ impl PodNamespaceHolderProvider for FakeHolder {
             }
         }
     }
-    fn release(&self, sandbox_id: &str, _timeout: Duration) -> Result<(), CriError> {
+    fn release(&self, sandbox_id: &str, timeout: Duration) -> Result<(), CriError> {
+        self.release_timeouts.lock().unwrap().push(timeout);
         self.log
             .lock()
             .unwrap()
@@ -199,10 +203,17 @@ fn new_log() -> Log {
     Arc::new(Mutex::new(Vec::new()))
 }
 
+/// 試験で使う `runtime_timeout`（共有期限）。
+const RUNTIME_TIMEOUT: Duration = Duration::from_millis(300);
+
+/// `src/runtime_service/pod_holder.rs` の private 定数 `HOLDER_OUTER_SLACK`（外側の余裕 500ms）の写し。
+/// 本体の値を変えたらここも直す（#4418。公開 API は広げない）。
+const HOLDER_OUTER_SLACK: Duration = Duration::from_millis(500);
+
 fn service(holder: &Arc<FakeHolder>) -> CriRuntimeService {
     CriRuntimeService::new()
         .with_pod_holder(holder.clone())
-        .with_runtime_timeout(Duration::from_millis(300))
+        .with_runtime_timeout(RUNTIME_TIMEOUT)
 }
 
 fn run_req() -> v1::RunPodSandboxRequest {
@@ -532,10 +543,18 @@ async fn repair5_release_failure_keeps_the_record_and_retry_succeeds() {
     assert!(list(&svc).await.is_empty());
 }
 
-/// REPAIR-5・CRI-2（#3142）: release が戻らなくても Remove 全体は runtime_timeout（300ms）で頭打ちになる
+/// REPAIR-5・CRI-2（#3142・#4418）: release が戻らなくても Remove 全体は runtime_timeout（300ms）で頭打ちになる
 /// （外側の余裕 500ms を足して約 800ms 待たない）。
+///
+/// 閾値の根拠: 正しい実装は約 300ms。回帰（期限なし分岐と同じ `outer = 300 + 500`）は
+/// `recv_timeout` が期限より早く戻らないため 800ms 以上が決定的に保証される。上限は 650ms とし、
+/// 正しい値から 350ms の揺れ（macOS で観測した超過は約 153ms）を吸収しつつ回帰の下限より 150ms 短く保つ。
+/// 時間に依存しない補強として、provider へ渡された期限が共有期限の半分以下であることも照合する。
 #[tokio::test]
 async fn repair5_remove_with_hanging_release_is_capped_at_runtime_timeout() {
+    let upper = RUNTIME_TIMEOUT + HOLDER_OUTER_SLACK - Duration::from_millis(150);
+    assert!(upper > RUNTIME_TIMEOUT);
+    assert!(upper < RUNTIME_TIMEOUT + HOLDER_OUTER_SLACK);
     let log = new_log();
     let holder = FakeHolder::new(&log, Spawn::Ok);
     let svc = service(&holder);
@@ -547,8 +566,15 @@ async fn repair5_remove_with_hanging_release_is_capped_at_runtime_timeout() {
     holder.unblock.store(true, Ordering::SeqCst);
     assert_eq!(err.code(), Code::DeadlineExceeded);
     assert!(
-        elapsed < Duration::from_millis(450),
-        "remove waited {elapsed:?}"
+        elapsed < upper,
+        "remove waited {elapsed:?}, upper bound {upper:?}"
+    );
+    let timeouts = holder.release_timeouts.lock().unwrap().clone();
+    assert_eq!(timeouts.len(), 1, "release timeouts: {timeouts:?}");
+    assert!(
+        timeouts[0] <= RUNTIME_TIMEOUT / 2,
+        "release got {:?}",
+        timeouts[0]
     );
 }
 

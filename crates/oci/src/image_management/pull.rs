@@ -408,8 +408,8 @@ impl ImageStore {
     /// リースは要らない（pull のセッションを持たない読み取り専用の口）。[`PullSession::open_leased_blob`] と同じく、
     /// 呼ぶたびに root の fd から `blobs/sha256` を開き直して `openat2`（`NO_SYMLINKS`・`O_NOFOLLOW`）で開く。返したハンドルは
     /// 未検証で、信頼条件・digest・サイズの確認は呼び出し側が同じハンドルで行う（OCI-1）。無ければ `NotFound`、
-    /// 通常ファイルでなければ `FailedPrecondition`。Linux x86_64 / aarch64 以外の unix はパス起点、非 unix は
-    /// Windows ホストは `ImageStore::open` が設計上の恒久拒否（#2428 の案 C・#4333。#4181 は not planned）のため到達しない（型検査のための stub。#4377）。
+    /// 通常ファイルでなければ `FailedPrecondition`。Linux x86_64 / aarch64 以外の unix はパス起点。
+    /// 非 unix（Windows ホスト）は `ImageStore::open` が設計上の恒久拒否（#2428 の案 C・#4333。#4181 は not planned）のため到達しない（型検査のための stub。#4377）。
     pub fn open_cached_blob(&self, digest: &Digest) -> Result<File, OciError> {
         open_blob_readonly(self, hex_of(digest)?)
     }
@@ -426,10 +426,8 @@ impl ImageStore {
         }
         #[cfg(not(unix))]
         {
-            Err(err(
-                OciErrorCode::Unimplemented,
-                "image store owner is not available on this platform",
-            ))
+            // Windows ホストは `ImageStore::open` が恒久拒否のため到達しない（#4333）。型検査のための stub（#4377・#4407）。
+            Err(super::store::windows_host_rejected())
         }
     }
 }
@@ -453,11 +451,9 @@ fn open_blob_readonly(store: &ImageStore, hex: &str) -> Result<File, OciError> {
     }
     #[cfg(not(unix))]
     {
+        // Windows ホストは `ImageStore::open` が恒久拒否のため到達しない（#4333）。型検査のための stub（#4377・#4407）。
         let _ = (store, hex);
-        Err(err(
-            OciErrorCode::Unimplemented,
-            "symlink-safe blob open is not supported on this platform",
-        ))
+        Err(super::store::windows_host_rejected())
     }
 }
 
@@ -1117,11 +1113,9 @@ impl PullSession<'_> {
         }
         #[cfg(not(unix))]
         {
+            // Windows ホストは `ImageStore::open` が恒久拒否のため到達しない（#4333）。型検査のための stub（#4377・#4407）。
             let _ = (hex, entry);
-            Err(err(
-                OciErrorCode::Unimplemented,
-                "symlink-safe blob open is not supported on this platform",
-            ))
+            Err(super::store::windows_host_rejected())
         }
     }
 

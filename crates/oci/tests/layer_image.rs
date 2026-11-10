@@ -307,6 +307,10 @@ fn oci1_verified_layer_blob_is_unimplemented_off_unix() {
     std::fs::write(&p, b"x").unwrap();
     let e = VerifiedLayerBlob::open(&p, &sha(b"x"), 1, 0).unwrap_err();
     assert_eq!(e.code(), OciErrorCode::Unimplemented);
+    assert_eq!(
+        e.message(),
+        "verified blob access is not supported on non-unix hosts"
+    );
 }
 
 /// OCI-1・#2309: 検証の後に同じパスへ別の内容を被せても、検証済みハンドルの内容が展開される。

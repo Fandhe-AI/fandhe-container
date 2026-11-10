@@ -182,6 +182,15 @@ fn open_blob_nofollow_inner(
     Ok(file)
 }
 
+/// 非 unix（Windows ホスト）で検証済み blob の取得を拒否するときの固定 message（OCI-1・OCI-7・SEC-1・REPAIR-1・#4407）。
+///
+/// symlink を辿っていないこと・所有者・リンク数を確かめられないための fail-closed で、公開のパス API
+/// （[`open_blob_nofollow`]・[`VerifiedLayerBlob::open`] / `from_file`）が `Unimplemented` で返す。ImageStore の恒久拒否
+/// （`windows_host_rejected`・`FailedPrecondition`）とは別物で、パス・OS エラーは含めない。
+#[cfg_attr(unix, allow(dead_code))]
+const NON_UNIX_VERIFIED_BLOB_UNSUPPORTED_MESSAGE: &str =
+    "verified blob access is not supported on non-unix hosts";
+
 #[cfg(not(unix))]
 fn open_blob_nofollow_inner(
     _path: &Path,
@@ -190,7 +199,7 @@ fn open_blob_nofollow_inner(
 ) -> Result<File, OciError> {
     Err(OciError::new(
         OciErrorCode::Unimplemented,
-        "symlink-safe blob open is not supported on this platform",
+        NON_UNIX_VERIFIED_BLOB_UNSUPPORTED_MESSAGE,
     ))
 }
 
@@ -439,7 +448,8 @@ pub(crate) fn check_blob_trust_with_owner(
 /// 公開してよい blob の信頼条件の違反を返す（OCI-1・SEC。違反なしは `None`）。
 ///
 /// unix は `check_blob_trust_with_owner` への薄いラッパー（判定は 1 か所）。非 unix は所有者・リンク数を標準ライブラリで
-/// 取得できないため、従来どおり通常ファイルかだけを見る（意味論は変えない）。
+/// 取得できないため通常ファイルかだけを見る型検査用の stub で、Windows ホストでは到達する呼び出し元が無い
+/// （`ImageStore::open` の恒久拒否〔#4333〕と、`check_handle` の手前での拒否のため。#4407）。意味論は変えない。
 pub(crate) fn blob_trust_violation(
     m: &std::fs::Metadata,
     owner: Option<u32>,
@@ -540,11 +550,11 @@ impl VerifiedLayerBlob {
         owner: u32,
     ) -> Result<Self, OciError> {
         // 非 Unix: 所有者・権限・ハードリンク数を確かめられないため、ハンドルからの構築も拒否する（fail-closed）。
-        // 信頼条件を検証できる方式が入るまで `open_with` と同じく `Unimplemented`（OCI-7・SEC-1）。
+        // 信頼条件を検証できる方式が入るまで `open_with` と同じ固定 message の `Unimplemented`（OCI-7・SEC-1・#4407）。
         if cfg!(not(unix)) {
             return Err(OciError::new(
                 OciErrorCode::Unimplemented,
-                "blob trust check from a handle is not supported on this platform",
+                NON_UNIX_VERIFIED_BLOB_UNSUPPORTED_MESSAGE,
             ));
         }
         let meta = file.metadata().map_err(map_io_error)?;
@@ -1241,6 +1251,10 @@ mod tests {
         let abc = Digest::parse(ABC).unwrap();
         let e = VerifiedLayerBlob::from_file(File::open(&p).unwrap(), &abc, 3, 0).unwrap_err();
         assert_eq!(e.code(), OciErrorCode::Unimplemented);
+        assert_eq!(
+            e.message(),
+            "verified blob access is not supported on non-unix hosts"
+        );
     }
 
     /// OCI-7・SEC-1・CRI-3・#2893: `from_file` は渡されたハンドルの digest・サイズ・信頼条件を確かめて構築する。
@@ -1410,6 +1424,10 @@ mod tests {
         std::fs::write(&p, b"abc").unwrap();
         let e = open_blob_nofollow(&p).unwrap_err();
         assert_eq!(e.code(), OciErrorCode::Unimplemented);
+        assert_eq!(
+            e.message(),
+            "verified blob access is not supported on non-unix hosts"
+        );
         std::fs::remove_dir_all(&d).unwrap();
     }
 
@@ -1840,6 +1858,10 @@ mod tests {
         std::fs::write(&p, b"abc").unwrap();
         let e = VerifiedLayerBlob::open(&p, &Digest::parse(ABC).unwrap(), 3, 0).unwrap_err();
         assert_eq!(e.code(), OciErrorCode::Unimplemented);
+        assert_eq!(
+            e.message(),
+            "verified blob access is not supported on non-unix hosts"
+        );
         std::fs::remove_dir_all(&d).unwrap();
     }
 

@@ -64,7 +64,7 @@ Agent の推奨（決定ではない）: 案 A + 案 A'（現行維持）。既�
 
 - Linux の x86_64 / aarch64: fd 起点（`sys::at` の `openat2`・`renameat`・`unlinkat`・`getdents64`）。`openat2`（Linux 5.6 以降）が使えない環境（`ENOSYS`・seccomp による `EPERM`）では `ImageStore::open` が `Unimplemented` で拒否し、パス起点へは縮退しない（fail-closed）。Linux 5.6 未満ではストアを開けなくなる
 - macOS: 本番経路が `ImageStore::open` に届かない（cli の `non_linux_failure`）。fd 起点の `openat` 系には macOS 用の定数・FFI・libc 照合が要り、足す根拠が無いため、パス起点＋入口の再検査の現行を保つ。再検討の契機は論点 2 と同じ
-- Windows ホスト: 検査ではなく `ImageStore::open` の時点で設計上の恒久拒否（`FAILED_PRECONDITION`・固定 message。core・CLI・supervisor は WSL2 ゲスト内で動く構成のため呼び出し元が無い。#2428 の案 C・#4181 は not planned・#4333）。root の検査・副作用より前に拒否する
+- Windows ホスト: 検査ではなく `ImageStore::open` の時点で設計上の恒久拒否（`FAILED_PRECONDITION`・固定 message。core・CLI・supervisor は WSL2 ゲスト内で動く構成のため呼び出し元が無い。#2428 の案 C・#4181 は not planned・#4333）。root の検査・副作用より前に拒否する。`pull.rs` の非 unix の stub（`root_owner`・`open_blob_readonly`・`open_verified_staged_blob`）も同じ `windows_host_rejected()` を返す（#4407）。レイヤー展開側の非 unix 分岐を残す理由は `oci-layer-special-bits.md` を参照
 - Linux の他アーキテクチャ: `sys::at` の定数・番号を確かめていないため、パス起点へ縮退せず `ImageStore::open` が `Unimplemented` で拒否する（`layer::anchored` と同じ fail-closed。同じアーキテクチャではレイヤー展開も既に `Unimplemented` でイメージを使えない。#2701）
 
 ### 3-c. 残る隙間

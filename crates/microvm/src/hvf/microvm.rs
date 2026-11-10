@@ -125,6 +125,7 @@ use crate::hvf_smp::{ApMailbox, HvfPowerControl};
 use crate::interrupt::{InterruptAckCounts, InterruptAckTally};
 use crate::net_rx_poll::{NET_RX_POLL_INTERVAL, NetRxPollerHandle, spawn_net_rx_poller};
 use crate::psci::PsciCpus;
+use crate::stop::UnmapTally;
 use crate::uart::SerialConsole;
 use crate::virtio_block::BlockBackend;
 use crate::virtio_net::NetBackend;
@@ -248,6 +249,8 @@ struct HvfVmParts<B: BlockBackend, N: NetBackend> {
     /// ゲスト RAM の所有。`release` がスロットの clone を渡し、停止確認後に期限つきで取り出す（#4027・#4092）。
     memory: GuestMemorySlot<RegisteredHvfRam<'static>>,
     vm: Option<Arc<VmWithGic>>,
+    /// munmap の失敗を数える VM ごとの集約先（`HvVm` と共有。`release` が `Resources` で渡し、集約行の `unmap_failures=` に出す。#4411）。
+    unmap: Arc<UnmapTally>,
     /// 受信ポーラー `hvf-net-rx`（virtio-net がある構成の start 以降。`release` が vCPU の後に止める。#4030）。
     net_rx: Option<NetRxPollerHandle>,
     dispatcher: Arc<Mutex<ExitDispatcher>>,
@@ -303,6 +306,7 @@ impl<B: BlockBackend, N: NetBackend> HvfVmParts<B, N> {
                 devices,
                 memory: self.memory.clone(),
                 vm,
+                unmap: Arc::clone(&self.unmap),
             },
         )
     }
@@ -522,6 +526,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfMicroV
                 mpidrs,
                 devices: Some(devices),
                 memory,
+                unmap: vm.vm().unmap_tally(),
                 vm: Some(vm),
                 net_rx: None,
                 dispatcher,

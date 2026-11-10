@@ -196,6 +196,10 @@ pub struct HvfStopReport {
     /// ` vm_unmap_failures=` に出す。失敗した backing はリークし munmap されないため、`unmap_failures` とは互いに素。
     /// 集約行の時点の値で、期限切れ・遅延回収の経路で後から回収する失敗は含まない（`op=hvf.deferred_reclaim` で観測）。
     pub vm_unmap_failures: u64,
+    /// MMIO exit 経路で受理判定に落ちて捨てた `QUEUE_NOTIFY` の件数（VM ごと。HVF は ioeventfd が無く常にこの経路。観測専用。
+    /// MVM-1・MVM-5・REPAIR-4・#4459）。`stop_and_release` は 0 を入れ、デバイスを持つ `hvf::microvm` の `HvfVmParts::release` が
+    /// 解放の後に確定値を入れる。4 バイト以外の幅の書き込みは含まない。
+    pub mmio_ignored: u64,
 }
 
 /// 解放の対象。drop 順は [`stop_and_release`] が決める（フィールドの宣言順には依らない）。
@@ -289,6 +293,8 @@ where
                             // 資源を落とした後に下で確定値を入れる。
                             unmap_failures: 0,
                             vm_unmap_failures: 0,
+                            // `QueueNotifyTally` はデバイス側が持つため、呼び出し元（`hvf::microvm`）が確定値を入れる。
+                            mmio_ignored: 0,
                         })
                     }
                     Err(e) => {

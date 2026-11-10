@@ -128,6 +128,7 @@ use crate::psci::PsciCpus;
 use crate::stop::UnmapTally;
 use crate::uart::SerialConsole;
 use crate::virtio_block::BlockBackend;
+use crate::virtio_mmio::QueueNotifyTally;
 use crate::virtio_net::NetBackend;
 
 fn internal(msg: &'static str) -> MicrovmError {
@@ -254,6 +255,8 @@ struct HvfVmParts<B: BlockBackend, N: NetBackend> {
     /// `hv_vm_unmap` の失敗を数える VM ごとの集約先（`unmap` とは別。`release` が `Resources` で渡し、集約行の
     /// `vm_unmap_failures=` に出す。#4439）。
     vm_unmap: Arc<UnmapTally>,
+    /// MMIO exit 経路で捨てた QUEUE_NOTIFY の件数の集約先（`HvfDeviceBus` と共有。`release` が `Ok` の報告へ写す。#4459）。
+    queue_notify: Arc<QueueNotifyTally>,
     /// 受信ポーラー `hvf-net-rx`（virtio-net がある構成の start 以降。`release` が vCPU の後に止める。#4030）。
     net_rx: Option<NetRxPollerHandle>,
     dispatcher: Arc<Mutex<ExitDispatcher>>,
@@ -298,7 +301,7 @@ impl<B: BlockBackend, N: NetBackend> HvfVmParts<B, N> {
             ));
         };
         // 受信ポーラーは vCPU の後に止め、止まりを確かめるまで RAM を解放しない（#4030）。
-        stop_and_release(
+        let mut report = stop_and_release(
             op,
             StopWithAux {
                 vcpus,
@@ -312,7 +315,12 @@ impl<B: BlockBackend, N: NetBackend> HvfVmParts<B, N> {
                 unmap: Arc::clone(&self.unmap),
                 vm_unmap: Arc::clone(&self.vm_unmap),
             },
-        )
+        );
+        // デバイスを落とした後の最終値（観測専用。停止の合否には使わない。#4459）。
+        if let Ok(r) = &mut report {
+            r.mmio_ignored = self.queue_notify.mmio_ignored();
+        }
+        report
     }
 
     fn read_guest(&self, addr: u64, buf: &mut [u8]) -> Result<(), MicrovmError> {
@@ -524,6 +532,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfMicroV
         let infos = devices.infos();
         let ack_tallies = devices.ack_tallies();
         let serial = devices.serial_console();
+        let queue_notify = devices.queue_notify_tally();
         Ok(HvfMicroVm {
             parts: HvfVmParts {
                 vcpus: Some(vcpu_set),
@@ -532,6 +541,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfMicroV
                 memory,
                 unmap: vm.vm().unmap_tally(),
                 vm_unmap: vm.vm().vm_unmap_tally(),
+                queue_notify,
                 vm: Some(vm),
                 net_rx: None,
                 dispatcher,

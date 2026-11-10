@@ -93,6 +93,7 @@ impl MicrovmBackend for UnimplementedBackend {
             ioevent: None,
             unmap_failures: None,
             vm_unmap_failures: None,
+            mmio_ignored: None,
         })
     }
 

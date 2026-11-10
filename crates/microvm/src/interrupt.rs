@@ -101,7 +101,8 @@ pub struct InterruptAckReport {
 /// 各計数は `u64` の加算で、実用上あふれない。
 ///
 /// - `ignored`: 通知スレッドが受理判定（`complete_ioevent`）に回して `Ok(None)`（DRIVER_OK 前・FAILED・ready でないキュー等）で
-///   捨てた回数。複数回の kick が 1 回にまとまったものは 1 件。`take() == 0` の起床は数えない。MMIO exit 経路で捨てたものは対象外。
+///   捨てた回数。複数回の kick が 1 回にまとまったものは 1 件。`take() == 0` の起床は数えない。MMIO exit 経路で捨てたものは対象外
+///   （`crate::virtio_mmio::QueueNotifyTally` が数え、`StopReport::mmio_ignored` へ出る。#4459）。
 ///   `op=microvm.ioevent` の経路に対応する。
 /// - `unbind_failed`: `IoEventFd` の drop での `KVM_IOEVENTFD` 解除の失敗。`op=kvm.ioeventfd.deassign` の行と同じ事象
 ///   （そちらはプロセス全体の件数、本型は VM ごと）。

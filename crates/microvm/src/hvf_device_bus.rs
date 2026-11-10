@@ -29,7 +29,7 @@ use crate::interrupt::{
 };
 use crate::uart::SerialConsole;
 use crate::virtio_block::{BlockBackend, VirtioBlock};
-use crate::virtio_mmio::{SharedTransport, VirtioDevice, VirtioMmioTransport};
+use crate::virtio_mmio::{QueueNotifyTally, SharedTransport, VirtioDevice, VirtioMmioTransport};
 use crate::virtio_net::{NetBackend, VirtioNet};
 
 fn internal(m: &'static str) -> MicrovmError {
@@ -79,6 +79,8 @@ pub(crate) struct HvfDeviceBus<B: BlockBackend, N: NetBackend, L> {
     serial: Option<HvfSerial>,
     block: Vec<HvfBoundDevice<VirtioBlock<B>, L>>,
     net: Vec<HvfBoundDevice<VirtioNet<N>, L>>,
+    /// 全 virtio デバイスのトランスポートが共有する、MMIO exit 経路で捨てた QUEUE_NOTIFY の件数（VM ごと。HVF は常にこの経路。#4459）。
+    queue_notify: Arc<QueueNotifyTally>,
 }
 
 impl<B: BlockBackend, N: NetBackend, L> Drop for HvfDeviceBus<B, N, L> {
@@ -149,20 +151,23 @@ where
             block: Vec::with_capacity(block.len()),
             net: Vec::with_capacity(net.len()),
             serial: None,
+            queue_notify: Arc::default(),
         };
         let mut index: u32 = 0;
         for backend in block {
-            let transport = Arc::new(Mutex::new(VirtioMmioTransport::new(VirtioBlock::new(
-                backend,
-            ))?));
+            let transport = Arc::new(Mutex::new(
+                VirtioMmioTransport::new(VirtioBlock::new(backend))?
+                    .with_queue_notify_tally(Arc::clone(&bus.queue_notify)),
+            ));
             let dev = bus.bind(layout, &mut virtio_line, index, transport)?;
             bus.block.push(dev);
             index += 1;
         }
         for (backend, mac) in net {
-            let transport = Arc::new(Mutex::new(VirtioMmioTransport::new(VirtioNet::new(
-                backend, mac,
-            ))?));
+            let transport = Arc::new(Mutex::new(
+                VirtioMmioTransport::new(VirtioNet::new(backend, mac))?
+                    .with_queue_notify_tally(Arc::clone(&bus.queue_notify)),
+            ));
             let dev = bus.bind(layout, &mut virtio_line, index, transport)?;
             bus.net.push(dev);
             index += 1;
@@ -222,6 +227,11 @@ where
             spi_intid,
             ack_tally: Arc::new(InterruptAckTally::default()),
         })
+    }
+
+    /// MMIO exit 経路で捨てた QUEUE_NOTIFY の共有の計数（`HvfVmParts` が停止の報告の集約先として持つ。#4459）。
+    pub(crate) fn queue_notify_tally(&self) -> Arc<QueueNotifyTally> {
+        Arc::clone(&self.queue_notify)
     }
 
     /// dispatcher（vCPU の `MmioHandler` と共有する）。
@@ -335,7 +345,7 @@ mod tests {
     use crate::spi::tests::RecordingGic;
     use crate::spi::{SpiLevelLine, SpiLine};
     use crate::virtio_block::MemoryBlockBackend;
-    use crate::virtio_mmio::{MmioWriteOutcome, reg};
+    use crate::virtio_mmio::{IgnoredAccess, MmioWriteOutcome, reg};
     use crate::virtio_net::MemoryNetBackend;
 
     type Line = SpiLine<RecordingGic>;
@@ -426,6 +436,49 @@ mod tests {
 
     fn no_serial() -> Result<(SerialLine, u32), MicrovmError> {
         panic!("serial line factory must not be called without layout.serial");
+    }
+
+    /// MVM-5・MVM-1・REPAIR-4・#4459: HVF は常に MMIO exit 経路のため、DRIVER_OK 前の QUEUE_NOTIFY は VM ごとの計数に数えられ、
+    /// QUEUE_NOTIFY 以外の無視は数えられない。block と net の合算で、受理された通知も数えない。
+    #[test]
+    fn mvm5_4459_hvf_bus_counts_mmio_ignored_queue_notify() {
+        let layout = Arm64Layout::new(64 << 20, 1, 2).unwrap();
+        let gic = RecordingGic::default();
+        let mut seen = Vec::new();
+        let bus: Bus = HvfDeviceBus::new(
+            &layout,
+            block(),
+            net(),
+            factory(&layout, &gic, &mut seen, layout.virtio_spi_trigger),
+            no_serial,
+        )
+        .unwrap();
+        let tally = bus.queue_notify_tally();
+        let infos = bus.summaries();
+        let (blk, nt) = (infos[0].window.base.raw(), infos[1].window.base.raw());
+        let mut d = bus.dispatcher().lock().unwrap();
+        for base in [blk, blk, nt] {
+            assert_eq!(
+                write(&mut d, base + reg::QUEUE_NOTIFY, 0),
+                MmioWriteOutcome::Ignored(IgnoredAccess::WrongDeviceState)
+            );
+        }
+        assert_eq!(tally.mmio_ignored(), 3);
+        // 対照: QUEUE_NOTIFY 以外の Ignored（FEATURES_OK 前の QUEUE_NUM・読み取り専用の MAGIC）は増えない。
+        for off in [reg::QUEUE_NUM, reg::MAGIC] {
+            assert!(matches!(
+                write(&mut d, blk + off, 16),
+                MmioWriteOutcome::Ignored(_)
+            ));
+        }
+        assert_eq!(tally.mmio_ignored(), 3);
+        // 対照: 受理された通知（DRIVER_OK 後のキュー 0）は数えない。
+        bring_up(&mut d, blk, &[0]);
+        assert_eq!(
+            write(&mut d, blk + reg::QUEUE_NOTIFY, 0),
+            MmioWriteOutcome::QueueNotify(0)
+        );
+        assert_eq!(tally.mmio_ignored(), 3);
     }
 
     #[test]

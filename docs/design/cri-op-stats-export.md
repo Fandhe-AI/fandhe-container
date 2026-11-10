@@ -16,7 +16,7 @@ plugin-cri の常駐サーバーが集計する操作統計を、stderr 以外�
 ## 2. 現状
 
 - `telemetry::op_stats_export_loop_many` が 60 秒ごとに stderr の `LineSink` へ JSON Lines（core の `OpRecorder::export_json_lines`。`op_stats` 行と `op_stats_meta` 行）を出す
-- 1 周期に記録器ごとのブロックが出て、`op_stats_meta` は 2 行になる（#2900）。種類数の上限は 64。I/O は集計のロックを外してから行う（REPAIR-5）
+- 1 周期に記録器ごとのブロックが出て、`op_stats_meta` は 3 行になる（CRI・ライフサイクル・oci の順。#2900・#4380）。種類数の上限は 64。I/O は集計のロックを外してから行う（REPAIR-5）
 - CLI には `FANDHE_CONTAINER_OP_LOG` が指すファイルへ追記する前例がある（`crates/cli/src/commands/create_start.rs`。cli の private で plugin-cri からは使えない）
 
 ## 3. 前提・制約

@@ -88,8 +88,8 @@ plugin-cri の `adapter::CoreOciRecorder` が oci の `OciOpRecorder` を core �
 
 - 注入点は 4 つ: `image_service` の `OciImagePuller::with_recorder`（展開と pull 内の `ImageStore`）・`OciRegistryClient::with_recorder`（`oci.auth*`・`oci.manifest.fetch`・`oci.blob.fetch`。cri に素通しの口を足した）・`bundle_provider_with` の `ImageRootfsSource::with_recorder`（`CreateContainer` の展開）・`recover_stale_image_pulls_in` の `ImageStore::with_recorder`（起動時の回収）。`PullConfig` 自体に記録先の欄は無い
 - 写像: 操作名は `OciOpKind::as_str` と同じ固定 22 種（`oci.layer.extract`・`oci.pull.publish` 等。単体試験で全件を具体値と照合）。`Success` は成功、それ以外は失敗。レイテンシはそのまま。エラー code は名前に混ぜず落とす（種類数が掛け算で増えるため。分類は oci のエラー応答と構造化ログに残る）。`#[non_exhaustive]` の未知の種別は記録しない
-- 専用の記録器（`CriPluginBackends::oci_op_recorder`）に分ける理由: core の `OpRecorder` は操作名の種類を `MAX_TRACKED_OPS`（64）までしか持たず、上限後の新しい名前は捨てて `dropped_records` に数える。共有記録器には `cri.*`・`net.*`・`oci_runtime`・plugin-cri の `*_remove` 等で約 51〜56 種が入りうる一方、1 回の pull で通る oci の種別は約 16 ある。共有へ流すと pull が枠を取り、後続の `create`・`delete` の記録を捨てさせる。専用なら 22 種で 64 に収まる（`cri.pull_image.registry_http.*` の 8 種も同じ専用記録器へ入る。#2966）。core の上限は変えない（PLUG-4）
-- stderr: `op_stats_export_loop_many` が共有・oci の順に記録器ごとのブロックを出す。1 周期に `op_stats_meta` 行が 2 行になる
+- 専用の記録器（`CriPluginBackends::oci_op_recorder`）に分ける理由: core の `OpRecorder` は操作名の種類を `MAX_TRACKED_OPS`（64）までしか持たず、上限後の新しい名前は捨てて `dropped_records` に数える。当初の共有記録器には `cri.*`・`net.*`・`oci_runtime`・plugin-cri の `*_remove` 等が入り、#4380 の数え直しで最悪 98 種（上限超過）だったため、さらに CRI 記録器（最悪 45 種）とライフサイクル記録器（最悪 53 種。core の `oci_runtime`・ログの回収・net。本番のみ）に分けた（いずれも `MAX_TRACKED_OPS - 8` 以下を `repair4_4380_*` が固定）。一方、1 回の pull で通る oci の種別は約 16 ある。共有へ流すと pull が枠を取り、後続の `create`・`delete` の記録を捨てさせる。専用なら 22 種で 64 に収まる（`cri.pull_image.registry_http.*` の 8 種も同じ専用記録器へ入る。#2966）。core の上限は変えない（PLUG-4）
+- stderr: `op_stats_export_loop_many` が CRI・ライフサイクル・oci の順に記録器ごとのブロックを出す。1 周期に `op_stats_meta` 行が 3 行になる（#4380）
 - 二重計上: `oci.pull.gc_recover`（oci 側。排他の待ちを含む）と `image_pull_recovery`（plugin-cri 側。共有記録器）は同じ回収を別の意味で数える。意図どおり残す
 - 範囲外: 操作統計のメトリクス公開口への接続（方式は `cri-op-stats-export.md`・#4228。実装は後続）・CLI 側の橋渡し
 

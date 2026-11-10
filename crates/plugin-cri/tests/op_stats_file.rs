@@ -161,8 +161,8 @@ fn read_snapshot(path: &Path) -> (String, std::fs::Metadata) {
     (std::fs::read_to_string(path).expect("snapshot"), meta)
 }
 
-fn assert_two_blocks(body: &str) {
-    assert_eq!(body.matches(META).count(), 2, "{body}");
+fn assert_three_blocks(body: &str) {
+    assert_eq!(body.matches(META).count(), 3, "{body}");
     assert!(body.lines().last().expect("lines").contains(META), "{body}");
 }
 
@@ -198,7 +198,7 @@ fn cri6_4340_periodic_snapshot_appears_with_0600() {
     assert_eq!(meta.mode() & 0o777, 0o600);
     let own_uid = std::fs::metadata(&s.stats.0).expect("dir meta").uid();
     assert_eq!(meta.uid(), own_uid);
-    assert_two_blocks(&body);
+    assert_three_blocks(&body);
     // 次の周期で rename により置き換わる。
     let first_ino = meta.ino();
     let start = Instant::now();
@@ -240,7 +240,7 @@ fn final_snapshot_on(sig: &str, sig_name: &str, tag: &str) {
     let (body, meta) = read_snapshot(&path);
     assert!(meta.file_type().is_file());
     assert_eq!(meta.mode() & 0o777, 0o600);
-    assert_two_blocks(&body);
+    assert_three_blocks(&body);
     let err = s.stderr();
     assert!(
         err.contains(&format!(

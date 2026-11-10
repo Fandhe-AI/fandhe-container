@@ -2024,14 +2024,8 @@ impl GuestRamMap {
         if p as usize == usize::MAX {
             return Err(last_error());
         }
-        let advise = |ptr: NonNull<u8>, len: usize, advice: i32| {
-            // SAFETY: `ptr` / `len` は下の `finish_guest_ram_map` へ渡す mmap の領域そのもの。`MADV_DONTFORK` は fork 先に
-            // マッピングを作らず、`MADV_DONTDUMP` はコアダンプに含めない指示だけを行い、どちらも領域の内容・対応付けを変更しない。
-            let r = unsafe { madvise(ptr.as_ptr().cast::<c_void>(), len, advice) };
-            if r < 0 { Err(last_error()) } else { Ok(()) }
-        };
         // SAFETY: `p` / `len` は直前の mmap が成功して返した領域そのもので、他に所有者がいない。
-        unsafe { finish_guest_ram_map(p, len, advise) }
+        unsafe { finish_guest_ram_map(p, len, madvise_guest_ram) }
     }
 
     /// drop の munmap 失敗を数える VM ごとの集約先を付ける（`register_backing` が登録成功後に呼ぶ。#4382）。
@@ -2123,6 +2117,17 @@ impl Drop for GuestRamMap {
             }
         }
     }
+}
+
+/// ゲスト RAM の領域へ `madvise` を 1 回当て、失敗した errno を `SysError` へ写す（本番の `advise`）。
+///
+/// `GuestRamMap::map` が `finish_guest_ram_map` へ渡す。試験も同じ関数を使い、本番と同じ経路で
+/// `MADV_DONTFORK` / `MADV_DONTDUMP` を当てる（#4420・MVM-1）。
+fn madvise_guest_ram(ptr: NonNull<u8>, len: usize, advice: i32) -> Result<(), SysError> {
+    // SAFETY: `ptr` / `len` は呼び出し側（`finish_guest_ram_map`）が渡す mmap の領域そのもの。`MADV_DONTFORK` は fork 先に
+    // マッピングを作らず、`MADV_DONTDUMP` はコアダンプに含めない指示だけを行い、どちらも領域の内容・対応付けを変更しない。
+    let r = unsafe { madvise(ptr.as_ptr().cast::<c_void>(), len, advice) };
+    if r < 0 { Err(last_error()) } else { Ok(()) }
 }
 
 /// `GuestRamMap::map` の mmap 成功後の段（NULL 検査と `madvise` 2 回）。失敗時は munmap して `Err` を返す。

@@ -29,7 +29,8 @@
 //!   `legacy_tiocsti` の前提 (2)(3) は維持される）
 //!
 //! # 未実装（REPAIR-3）
-//! supervisor の `ExecStdio` への tty の追加と、受けた master を helper の channel へ返す結線は #3760・#3761、
+//! supervisor 側の結線（`ExecLaunchIo::pty`・stream-exec helper の `--tty`・`ExecPtyReceiver::try_receive` の刻みでの
+//! 非ブロッキング受信。#4416）は実装済みで、plugin-cri の能力フラグ・`without_tty` の撤去は #4417。
 //! plugin-cri の resize の転送は #3761 で実装済み、実コンテナ（Landlock・seccomp の下）での実機確認は #3762、
 //! launch の init の `/dev/console` への bind は `bind_console`（#4071）が行う（exec は `/dev/console` を触らない）。
 //!
@@ -411,6 +412,16 @@ pub fn open_host_pty_for_test(size: WindowSize) -> Result<(PtyMaster, PtySlave),
     Ok((master, PtySlave(slave)))
 }
 
+/// 試験専用: fd の端末サイズ（`TIOCGWINSZ`）を読む。コンテナ内の試験コマンドが `stty size` の代わりに使う
+/// （最小 rootfs に `stty` が無いため。#4416）。`exec-test-support` feature の下だけに存在する。
+#[cfg(any(test, feature = "exec-test-support"))]
+#[doc(hidden)]
+pub fn terminal_window_size_for_test(fd: BorrowedFd<'_>) -> Result<WindowSize, ExecError> {
+    sys::window_size(fd)
+        .map(|(rows, cols)| WindowSize::new(rows, cols))
+        .map_err(|e| ExecError::from_sys(e, STAGE, "ioctl(TIOCGWINSZ)"))
+}
+
 /// worker 側の master の送信口（[`spawn_exec_worker_with_listener_and_pty`](super::spawn_exec_worker_with_listener_and_pty)
 /// が worker へ渡す）。構築できるのは core だけで、`Clone` を持たない。
 #[derive(Debug)]
@@ -465,6 +476,40 @@ impl ExecPtyReceiver {
     /// 親の端の fd 番号（worker が継承した複製を閉じるために使う）。
     pub(crate) fn raw_fd(&self) -> std::os::fd::RawFd {
         self.0.as_raw_fd()
+    }
+
+    /// 届いていれば 1 通を **待たずに** 受信・検証する（届いていなければ `None`。SUP-6・SEC-1・REPAIR-5・#4416）。
+    ///
+    /// supervisor の応答者（seccomp の USER_NOTIF）を回すループの刻みから呼ぶための非ブロッキング版。ブロッキングの
+    /// [`Self::receive`] で待つと、worker の `allocate_pty` 中の syscall が通知に掛かったとき、応答者が回れず期限まで
+    /// 互いに待つ（本当の拒否と監査の記録ではなく `Timeout` になる）。検証は `receive` と同じ（`classify`）。
+    /// 終端の結果（`Some`）を得た後は再利用しない（`SenderClosed` の後に呼んでも `SenderClosed` を返し続けるだけで、
+    /// 受け取った master は呼び出し側が持つ）。`unsafe` は持たない。
+    pub fn try_receive(&self, worker: &ContainerChild) -> Option<PtyReceipt> {
+        use crate::exec::seccomp_listener::wait_readable;
+        let fail = |code, message: &'static str| {
+            PtyReceipt::Rejected(ExecError::new(code, STAGE, message))
+        };
+        match wait_readable(self.0.as_fd(), Instant::now()) {
+            Ok(true) => {}
+            Ok(false) => return None,
+            Err(e) => {
+                return Some(PtyReceipt::Rejected(ExecError::from_sys(
+                    e,
+                    STAGE,
+                    "poll for the pty master",
+                )));
+            }
+        }
+        match sys::seccomp_notify::recv_fd_with_creds(self.0.as_fd()) {
+            Err(sys::SysError::Os(e)) if e == sys::EAGAIN => None,
+            Err(e) => Some(PtyReceipt::Rejected(ExecError::from_sys(
+                e,
+                STAGE,
+                "receive of the pty master",
+            ))),
+            Ok(received) => Some(classify(received, worker.pid(), fail)),
+        }
     }
 
     /// master を期限つきで受信・検証する（REPAIR-5）。`worker` は送信元の pid の照合に使う。

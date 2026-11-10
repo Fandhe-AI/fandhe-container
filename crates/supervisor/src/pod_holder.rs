@@ -84,11 +84,18 @@ mod tests {
     /// CRI-2・PLUG-11・#2877: 保持役の bin は実体と同じディレクトリの固定名。相対パス・親なしは拒否する。
     #[test]
     fn cri2_holder_executable_beside_is_fixed_name_in_same_dir() {
+        // Windows では先頭が `/` だけのパスは絶対パスではない（ドライブ指定が要る）ため、OS ごとに絶対パスの根を選ぶ。
+        let root = PathBuf::from(if cfg!(windows) {
+            "C:\\opt\\x"
+        } else {
+            "/opt/x"
+        });
         assert_eq!(
-            holder_executable_beside(Path::new("/opt/x/fandhe-container-plugin-cri")).unwrap(),
-            PathBuf::from("/opt/x/fandhe-container-supervisor")
+            holder_executable_beside(&root.join("fandhe-container-plugin-cri")).unwrap(),
+            root.join(crate::launcher::SUPERVISOR_FILE_NAME)
         );
-        for bad in ["plugin", "x/plugin", "/", ""] {
+        let root_only = if cfg!(windows) { "C:\\" } else { "/" };
+        for bad in ["plugin", "x/plugin", root_only, ""] {
             let e = holder_executable_beside(Path::new(bad)).unwrap_err();
             assert_eq!(e.code(), ErrorCode::FailedPrecondition, "{bad}");
         }

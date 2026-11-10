@@ -531,6 +531,7 @@ CRI の `ExecSync`（現状 `UNIMPLEMENTED`）も本設計の helper を再利�
 - 非 Linux: Exec は未結線の `UNIMPLEMENTED`。コンテナの start 自体も未実装（macOS の状態ルートは #2431）
 - `ExecSync`: `UNIMPLEMENTED` のまま。追跡 issue 未起票。実装するときは Exec と同じインスタンスの記録と起動時の照合を入れる義務がある（#4286）
 - Exec のインスタンス照合の残余（#4286）: (1) 識別子を報告しない実装・記録の無い旧い `state.json` は両側 `None` で保護されない（試験で固定）。(2) 解消済み（#4322）: create 時のインスタンスを記録と記録ファイル v2 に持たせ、発行前に照合する（旧版の記録・write-ahead の記録は fail-closed。代償と回復手順は上記）。(3) 照合の違反の観測は `ExecStreamOutcome::InstanceChanged`（コードと文 `MSG_EXEC_INSTANCE_CHANGED` の両方で判定）として他の起動失敗と区別され、操作別計装 `cri.exec.session`（`FAILED_PRECONDITION`）に加えて `cri.exec.instance_changed` の失敗として別の行にも出る（二重計上。60 秒周期の `op_stats` 行。#4324・CRI-6・REPAIR-4）。クライアントへの Status は `InternalError` のままで観測だけが分かれる。即時の構造化行は未実装
+- Exec の起動失敗の内訳（#4381・CRI-6・REPAIR-4）: インスタンス不一致以外の起動失敗は `ExecStreamOutcome::LaunchFailed { cause }` として期限切れ（`TimedOut`）・stdio の食い違い（`StdioMismatch`）・起動役のエラー（`LauncherError`。helper の起動失敗や "container is not running" などの拒否を含む catch-all）に分け、それぞれ `cri.exec.launch_timeout`（`DEADLINE_EXCEEDED`）・`cri.exec.stdio_mismatch`（`INTERNAL`）・`cri.exec.launch_error`（`UNAVAILABLE`）で数える。コードは固定で、起動役のエラー文は渡さない。`cri.exec.session` の失敗（`UNAVAILABLE`）にも従来どおり計上する（二重計上）。クライアントへの Status はどの原因でも従来と同じ `InternalError` のまま。記録器の名前数の最悪値は 48 種（上限 `MAX_TRACKED_OPS - 8` 以下）
 - 外部公開の TLS・認証（無い。opt-in の口は #4110 で plugin-cri の CLI に出した。前段の守りが前提）
 - Upgrade 後のセッションの停止時のドレイン方針の再評価（REPAIR-5）: #4111。`ConnectionObserver` の telemetry への接続（REPAIR-4）は #4163 で実装済み（下の「plugin-cri での起動と停止」）
 - ポートの到達性など深い意味検証

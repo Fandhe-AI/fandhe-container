@@ -104,6 +104,15 @@ pub enum CriOpKind {
     /// Exec の起動がインスタンス不一致（URL 発行後の作り直し）で拒否された件数
     /// （`ExecSession` の失敗と同じ事象を別に数える。CRI-6・REPAIR-4・#4324）。
     ExecInstanceChanged,
+    /// Exec の起動が期限切れ（`launch_timeout`）で失敗した件数
+    /// （`ExecSession` の失敗と同じ事象を別に数える。CRI-6・REPAIR-4・#4381）。
+    ExecLaunchTimeout,
+    /// Exec の起動で起動役の返した stdio がリクエストと食い違った件数
+    /// （`ExecSession` の失敗と同じ事象を別に数える。CRI-6・REPAIR-4・#4381）。
+    ExecStdioMismatch,
+    /// Exec の起動役がエラーを返した件数（helper の起動失敗など。インスタンス不一致は除く。
+    /// `ExecSession` の失敗と同じ事象を別に数える。CRI-6・REPAIR-4・#4381）。
+    ExecLaunchError,
     /// Exec の backend 出力（stdout / stderr）の読み取り（セッション内の成功 / 失敗。CRI-6・TASK-63.2・REPAIR-4）。
     ExecStreamRead,
     /// Exec の backend stdin への書き込み（セッション内の成功 / 失敗。CRI-6・TASK-63.2・REPAIR-4）。
@@ -118,7 +127,7 @@ impl CriOpKind {
     /// 全種別を宣言順に並べたもの（plugin-cri が共有記録器へ届く操作名の最悪数を数える試験の列挙元。
     /// CRI-6・REPAIR-4・#4380）。種別を足したら本配列と、試験の通し番号の `match`
     /// （`repair4_4380_cri_op_kind_all_is_exhaustive`）を直す。直さないと cri の試験が失敗する。
-    pub const ALL: [CriOpKind; 37] = [
+    pub const ALL: [CriOpKind; 40] = [
         CriOpKind::RunPodSandbox,
         CriOpKind::StopPodSandbox,
         CriOpKind::RemovePodSandbox,
@@ -152,6 +161,9 @@ impl CriOpKind {
         CriOpKind::AttachStreamWrite,
         CriOpKind::ExecSession,
         CriOpKind::ExecInstanceChanged,
+        CriOpKind::ExecLaunchTimeout,
+        CriOpKind::ExecStdioMismatch,
+        CriOpKind::ExecLaunchError,
         CriOpKind::ExecStreamRead,
         CriOpKind::ExecStreamWrite,
         CriOpKind::ExecConnRead,
@@ -194,6 +206,9 @@ impl CriOpKind {
             CriOpKind::AttachStreamWrite => "cri.attach.stream_write",
             CriOpKind::ExecSession => "cri.exec.session",
             CriOpKind::ExecInstanceChanged => "cri.exec.instance_changed",
+            CriOpKind::ExecLaunchTimeout => "cri.exec.launch_timeout",
+            CriOpKind::ExecStdioMismatch => "cri.exec.stdio_mismatch",
+            CriOpKind::ExecLaunchError => "cri.exec.launch_error",
             CriOpKind::ExecStreamRead => "cri.exec.stream_read",
             CriOpKind::ExecStreamWrite => "cri.exec.stream_write",
             CriOpKind::ExecConnRead => "cri.exec.conn_read",
@@ -553,23 +568,26 @@ mod tests {
             CriOpKind::AttachStreamWrite => 30,
             CriOpKind::ExecSession => 31,
             CriOpKind::ExecInstanceChanged => 32,
-            CriOpKind::ExecStreamRead => 33,
-            CriOpKind::ExecStreamWrite => 34,
-            CriOpKind::ExecConnRead => 35,
-            CriOpKind::ExecConnWrite => 36,
+            CriOpKind::ExecLaunchTimeout => 33,
+            CriOpKind::ExecStdioMismatch => 34,
+            CriOpKind::ExecLaunchError => 35,
+            CriOpKind::ExecStreamRead => 36,
+            CriOpKind::ExecStreamWrite => 37,
+            CriOpKind::ExecConnRead => 38,
+            CriOpKind::ExecConnWrite => 39,
         }
     }
 
     /// REPAIR-4・CRI-6（#4380）: `ALL` は全種別を宣言順に過不足なく持ち、`as_str` が重複しない。
     #[test]
     fn repair4_4380_cri_op_kind_all_is_exhaustive() {
-        assert_eq!(CriOpKind::ALL.len(), 37);
+        assert_eq!(CriOpKind::ALL.len(), 40);
         for (i, kind) in CriOpKind::ALL.iter().enumerate() {
             assert_eq!(ordinal(*kind), i, "{kind:?} is out of place in ALL");
         }
         let names: std::collections::BTreeSet<&str> =
             CriOpKind::ALL.iter().map(|k| k.as_str()).collect();
-        assert_eq!(names.len(), 37);
+        assert_eq!(names.len(), 40);
     }
 
     /// REPAIR-4・CRI-3（#2966）: HTTP 状態から区分への写像（境界値）と語彙の健全性。

@@ -31,7 +31,7 @@
 //! 状態ストアの読み取り（`store.get`）の直後、Running・pid の確認より前に、`ExecLaunch::instance`（URL 発行時に実行層が
 //! 報告した値）と record のインスタンス識別子を `instance_matches` で比べる。不一致（値違い・片側だけ `None`）は helper を
 //! 起動せず `FAILED_PRECONDITION`（`MSG_EXEC_INSTANCE_CHANGED`）で拒否する。pid も同じ record から取るため TOCTOU は無い。
-//! この拒否は cri 側で `ExecStreamOutcome::InstanceChanged`（操作名 `cri.exec.instance_changed`）として他の起動失敗と区別して計装される（#4324・REPAIR-4）。
+//! この拒否は cri 側で `ExecStreamOutcome::InstanceChanged`（操作名 `cri.exec.instance_changed`）として他の起動失敗と区別して計装される（#4324・REPAIR-4）。残る起動失敗も cri 側で期限切れ・stdio の食い違い・起動役のエラーの 3 原因に分けて数える（`cri.exec.launch_timeout`・`cri.exec.stdio_mismatch`・`cri.exec.launch_error`。#4381）。
 //! 保護されない残余: 両側とも `None`（識別子を報告しない実装・記録の無い旧い `state.json`）は判定できないので通す。
 //!
 //! # 未実装・簡易実装・残余（REPAIR-3）

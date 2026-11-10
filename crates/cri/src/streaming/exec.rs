@@ -215,6 +215,18 @@ pub trait ExecStreamLauncher: Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = Result<ExecSession, CriError>> + Send + '_>>;
 }
 
+/// Exec の起動失敗の原因（クライアントへの Status はどれも同じ内部エラーで、計装だけが分ける。
+/// 呼び出し元は `run_exec_session` の起動段。CRI-6・REPAIR-4・#4381）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecLaunchFailure {
+    /// 起動が `launch_timeout` までに終わらなかった。
+    TimedOut,
+    /// 起動役の返した stdio がリクエストと食い違った。
+    StdioMismatch,
+    /// 起動役がエラーを返した（helper の起動失敗など。インスタンス不一致は除く）。
+    LauncherError,
+}
+
 /// セッションの結末（観測用。トークン・cmd・パスは含めない。REPAIR-4）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecStreamOutcome {
@@ -229,9 +241,13 @@ pub enum ExecStreamOutcome {
     OutputFailed,
     /// プロセス終了後の drain の期限までに出力を送り切れなかった（内部エラーの Status を通知した）。
     OutputTruncated,
-    /// 起動に失敗した、または期限切れ・stdio の食い違い（内部エラーの Status を通知した。
-    /// インスタンス不一致による拒否は除く。[`Self::InstanceChanged`]）。
-    LaunchFailed,
+    /// 起動に失敗した（期限切れ・stdio の食い違い・起動役のエラー。内部エラーの Status を通知した。
+    /// インスタンス不一致による拒否は除く。[`Self::InstanceChanged`]）。原因は計装だけが分ける
+    /// （CRI-6・REPAIR-4・#4381）。
+    LaunchFailed {
+        /// 起動失敗の原因。
+        cause: ExecLaunchFailure,
+    },
     /// 起動役が「URL 発行後の作り直し」（[`MSG_EXEC_INSTANCE_CHANGED`]）を理由に起動を拒否した
     /// （内部エラーの Status を通知した。クライアントへの見え方は [`Self::LaunchFailed`] と同じで、
     /// 計装だけが分かれる。CRI-6・REPAIR-4・#4324・#4286）。
@@ -439,7 +455,7 @@ fn outcome_code(outcome: ExecStreamOutcome) -> Code {
         ExecStreamOutcome::Exited { .. } => Code::Ok,
         ExecStreamOutcome::ExecFailed | ExecStreamOutcome::OutputFailed => Code::Internal,
         ExecStreamOutcome::OutputTruncated
-        | ExecStreamOutcome::LaunchFailed
+        | ExecStreamOutcome::LaunchFailed { .. }
         | ExecStreamOutcome::DeliveryFailed { .. } => Code::Unavailable,
         ExecStreamOutcome::StreamCreationTimeout
         | ExecStreamOutcome::IdleTimeout
@@ -447,6 +463,15 @@ fn outcome_code(outcome: ExecStreamOutcome) -> Code {
         ExecStreamOutcome::ProtocolError => Code::InvalidArgument,
         ExecStreamOutcome::InstanceChanged => Code::FailedPrecondition,
         ExecStreamOutcome::PeerClosed => Code::Cancelled,
+    }
+}
+
+/// 起動失敗の原因を操作名と記録するコードへ写す（コードは固定。起動役のエラー文は渡さない。#4381）。
+fn launch_failure_op(cause: ExecLaunchFailure) -> (CriOpKind, Code) {
+    match cause {
+        ExecLaunchFailure::TimedOut => (CriOpKind::ExecLaunchTimeout, Code::DeadlineExceeded),
+        ExecLaunchFailure::StdioMismatch => (CriOpKind::ExecStdioMismatch, Code::Internal),
+        ExecLaunchFailure::LauncherError => (CriOpKind::ExecLaunchError, Code::Unavailable),
     }
 }
 
@@ -472,6 +497,11 @@ fn record_session(
             Code::FailedPrecondition,
             latency,
         ));
+    }
+    // 起動失敗は原因別にも数える（二重計上。クライアントへの Status は変えない。#4381）。
+    if let ExecStreamOutcome::LaunchFailed { cause } = outcome {
+        let (kind, code) = launch_failure_op(cause);
+        recorder.record_cri_op(&CriOpSample::new(kind, code, latency));
     }
     for (kind, ok, failed) in [
         (
@@ -1625,8 +1655,16 @@ pub(crate) async fn run_exec_session<T: AsyncRead + AsyncWrite + Unpin>(
         Ok(Ok(session)) if session_matches(&session, options) => session,
         other => {
             let outcome = match &other {
+                Err(_) => ExecStreamOutcome::LaunchFailed {
+                    cause: ExecLaunchFailure::TimedOut,
+                },
+                Ok(Ok(_)) => ExecStreamOutcome::LaunchFailed {
+                    cause: ExecLaunchFailure::StdioMismatch,
+                },
                 Ok(Err(e)) if is_instance_changed(e) => ExecStreamOutcome::InstanceChanged,
-                _ => ExecStreamOutcome::LaunchFailed,
+                Ok(Err(_)) => ExecStreamOutcome::LaunchFailed {
+                    cause: ExecLaunchFailure::LauncherError,
+                },
             };
             let status = status_internal_error(protocol);
             send_status(

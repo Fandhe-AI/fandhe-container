@@ -103,23 +103,12 @@ fn oci7_open_leased_blob_requires_lease_and_reads_content() {
     let reuse = session.lease_existing_blob(&cached).expect("lease");
     assert!(matches!(reuse, BlobReuse::Leased(_)));
 
-    #[cfg(unix)]
-    {
-        use std::io::Read as _;
-        let mut body = Vec::new();
-        session
-            .open_leased_blob(&cached)
-            .expect("open leased")
-            .read_to_end(&mut body)
-            .expect("read");
-        assert_eq!(body, b"abc");
-    }
-    #[cfg(not(unix))]
-    {
-        let e = session.open_leased_blob(&cached).expect_err("unsupported");
-        assert_eq!(
-            e.code(),
-            fandhe_container_oci::error::OciErrorCode::Unimplemented
-        );
-    }
+    use std::io::Read as _;
+    let mut body = Vec::new();
+    session
+        .open_leased_blob(&cached)
+        .expect("open leased")
+        .read_to_end(&mut body)
+        .expect("read");
+    assert_eq!(body, b"abc");
 }

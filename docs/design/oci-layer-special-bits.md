@@ -202,6 +202,12 @@ tar のコンテナ内 ID をそのまま `chown` する（namespace の中で�
   0700 の bundle 配下から写像先の uid で到達できること（core の launcher 側。SEC-5・CRI-2）の試験を同時に足す
 - `IdMap` と core の `IdMapSet` を下位 crate へ共通化するかどうか（crate 境界の判断）
 
+## Windows ホストでの非 unix 分岐（#4407・OCI-1・OCI-7・SEC-1・REPAIR-1）
+
+- 本番経路では到達しない: CLI の `image` / `create` は `non_linux_failure` で先に拒否し、plugin-cri の `serve` は非 unix で `Unimplemented`、`VerifiedLayerBlob` の構築（`open` / `from_file`）も非 unix では常に `Unimplemented` のため、`VerifiedLayerBlob` を受ける `extract_image_layers*` は Windows で呼べない。
+- 削らない分岐: 生の reader を受ける公開の入口（`extract_tar*` / `extract_layers*`）と `remove_extracted_tree` は ImageStore を通らず Windows でもパス起点で動き、crate の試験（`layer_extract`・`layer_overlay`・`layer_whiteout`・`extract.rs` の単体試験）が main の Windows で回す。そのため `extract.rs`・`whiteout.rs` の非 unix 分岐は残す。特に `bytes_to_os` の `\`・`:` の拒否と、予約デバイス名・末尾の `.` / 空白の拒否はパス脱出の防御（OCI-1）で、消さない。
+- 拒否の message の使い分け: `layer.rs` の非 unix の `Unimplemented` は固定文言 `verified blob access is not supported on non-unix hosts`（定数 `NON_UNIX_VERIFIED_BLOB_UNSUPPORTED_MESSAGE`）に揃えた。ImageStore 側の stub（`pull.rs`）は `ImageStore::open` の恒久拒否と同じ `windows_host_rejected()`（`FailedPrecondition`）を返す。
+
 ## 試験との対応
 
 `extract.rs` の単体試験。`sec5_special_bits_preserved_when_owner_mapped`（条件を満たす経路で tar の値どおり）、

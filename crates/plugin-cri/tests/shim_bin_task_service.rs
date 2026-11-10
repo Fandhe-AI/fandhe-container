@@ -336,3 +336,69 @@ fn cri5_4222_bin_shutdown_drains_queued_task_delete() {
     sorted.sort();
     assert_eq!(sorted, ["/tasks/create", "/tasks/delete"], "{topics:?}");
 }
+
+/// `op_stats` の行から時間の欄（`min_us` 以降）を除いた前半を返す（時間は実行ごとに揺れるため照合しない）。
+fn op_stats_head(line: &str) -> &str {
+    line.split(r#","min_us""#).next().unwrap_or(line)
+}
+
+/// CRI-5・REPAIR-4・REPAIR-5・#4408: serve の終了（Shutdown RPC）の後、`daemon.log` に共有記録器の操作統計が `op_stats` 行と
+/// `op_stats_meta` 行の組で 1 回だけ出る。本番の bootstrap・`TtrpcServer` が終了後に登録簿の参照を解放し、プロセスの終了前に
+/// 書き出す接続の契約を、配布する bin で照合する（unit 試験は登録簿を直接 drop するため確かめない）。
+/// 起動時の走査は回収が 0 件のとき何も出さないので、Shutdown の前に `op_stats` 行は無く、出た行はすべて終了時のもの。
+#[test]
+fn cri5_4408_bin_shutdown_writes_final_op_stats_once() {
+    let sc = Scratch::new("os");
+    let id = format!("os{}", std::process::id());
+    let sock = start(&sc, &id);
+    let log = sc.sock_dir().join("daemon.log");
+    let bundle = make_bundle(&sc);
+    let bundle = bundle.to_str().expect("utf8 bundle");
+    ok(
+        call_method(&sock, SERVICES[0], "Create", &create_request(&id, bundle)),
+        "Create",
+    );
+    ok(
+        call_method(&sock, SERVICES[0], "Delete", &id_request(&id)),
+        "Delete",
+    );
+    // Shutdown の前には統計の行が無い（書き出しは終了時の 1 回だけ）。
+    let before = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(!before.contains(r#""event":"op_stats"#), "{before}");
+    shutdown_and_wait(&sock, &id);
+
+    // 書き出しは登録簿の解放（socket の消失の後、プロセスの終了前）に行われる。meta 行を待つ。
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut text = String::new();
+    while Instant::now() < deadline {
+        text = std::fs::read_to_string(&log).unwrap_or_default();
+        if text.contains(r#""event":"op_stats_meta""#) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let stats: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains(r#""event":"op_stats""#))
+        .map(op_stats_head)
+        .collect();
+    assert_eq!(
+        stats,
+        [
+            r#"{"event":"op_stats","op":"container_log_remove","success":1,"failure":0,"count":1"#,
+            r#"{"event":"op_stats","op":"create","success":1,"failure":0,"count":1"#,
+            r#"{"event":"op_stats","op":"delete","success":1,"failure":0,"count":1"#,
+            r#"{"event":"op_stats","op":"supervisor_log_remove","success":1,"failure":0,"count":1"#,
+        ],
+        "{text}"
+    );
+    let metas: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains(r#""event":"op_stats_meta""#))
+        .collect();
+    assert_eq!(
+        metas,
+        [r#"{"event":"op_stats_meta","ops":4,"dropped_records":0}"#],
+        "{text}"
+    );
+}

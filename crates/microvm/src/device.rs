@@ -3761,6 +3761,15 @@ mod tests {
             .count()
     }
 
+    /// join 済みのスレッドが `/proc/self/task` から消えるのを待つ（#4288・REPAIR-5・REPAIR-12）。
+    /// `pthread_join` はカーネルの tid クリア（exit_mm）で戻り、task エントリの解放（release_task）より先に
+    /// 返りうるため、join 直後の `tasks_named == 0` の即時 assert は間欠的に 1 を観測する。上限つきで 0 を待つ。
+    fn wait_tasks_gone(name: &str) {
+        wait_until(&format!("thread {name} gone from /proc"), || {
+            tasks_named(name) == 0
+        });
+    }
+
     /// SIGUSR2（12）の保留ビット（`SigPnd`・`ShdPnd` の第 11 ビット）。
     const KICK_BIT: u64 = 1 << 11;
 
@@ -3926,7 +3935,7 @@ mod tests {
         let t = Instant::now();
         drop(wd);
         assert!(t.elapsed() < RUN_WATCHDOG_JOIN_WAIT);
-        assert_eq!(tasks_named(NAME), 0);
+        wait_tasks_gone(NAME);
     }
 
     /// #4288・REPAIR-5: 武装中の停止要求は `Stopped` で kick と `immediate_exit` を使い、解除後は kick が増えない。
@@ -4047,7 +4056,7 @@ mod tests {
         let t = Instant::now();
         drop(wd);
         assert!(t.elapsed() < RUN_WATCHDOG_JOIN_WAIT);
-        assert_eq!(tasks_named("mvm4288-ack"), 0);
+        wait_tasks_gone("mvm4288-ack");
     }
 
     /// #4288: 待機中の drop は `RUN_WATCHDOG_JOIN_WAIT` 未満で戻り、スレッドは残らない。
@@ -4061,6 +4070,6 @@ mod tests {
         let t = Instant::now();
         drop(wd);
         assert!(t.elapsed() < RUN_WATCHDOG_JOIN_WAIT);
-        assert_eq!(tasks_named("mvm4288-drop"), 0);
+        wait_tasks_gone("mvm4288-drop");
     }
 }

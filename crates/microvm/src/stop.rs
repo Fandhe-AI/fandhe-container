@@ -39,7 +39,7 @@ impl StopReason {
 /// HVF では `HvVm` が持ち、ゲストへ対応付けた `HostMapping` が drop で加算し、`stop_and_release` が資源を落とした後に読む。
 /// 観測専用で、停止の合否には使わない。
 #[derive(Debug, Default)]
-pub(crate) struct UnmapTally {
+pub struct UnmapTally {
     failures: std::sync::atomic::AtomicU64,
 }
 

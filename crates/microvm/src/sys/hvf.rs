@@ -79,6 +79,7 @@ use crate::hvf_abi::{
     MemoryFlags, check_gic_supported, check_map_range, check_run_deadline, check_vm_map,
     classify_hv_return, decode_exit, finish_run, parse_macos_product_version,
 };
+use crate::stop::UnmapTally;
 use std::ffi::{CStr, c_char, c_int, c_long, c_void};
 use std::marker::PhantomData;
 use std::ptr;
@@ -183,6 +184,8 @@ fn host_page_size() -> Result<usize, MicrovmError> {
 #[derive(Debug)]
 pub struct HvVm {
     _private: (),
+    /// ゲスト RAM の backing の munmap 失敗を数える VM ごとの集約先。`map_with` が対応付けた `HostMapping` へ配る（#4411）。
+    unmap_tally: Arc<UnmapTally>,
 }
 
 impl HvVm {
@@ -204,7 +207,15 @@ impl HvVm {
             VM_EXISTS.store(false, Ordering::Release);
             return Err(e);
         }
-        Ok(HvVm { _private: () })
+        Ok(HvVm {
+            _private: (),
+            unmap_tally: Arc::default(),
+        })
+    }
+
+    /// munmap 失敗の集約先（停止・解放の集約行の `unmap_failures=` 用。MVM-5・REPAIR-4・#4411）。
+    pub(crate) fn unmap_tally(&self) -> Arc<UnmapTally> {
+        Arc::clone(&self.unmap_tally)
     }
 
     /// `host` の `offset` から `size` バイトを、ゲスト物理アドレス `ipa` に `flags` で対応付ける。
@@ -253,7 +264,7 @@ impl HvVm {
     fn map_with<'a>(
         &self,
         keep: VmRef<'a>,
-        host: HostMapping,
+        mut host: HostMapping,
         offset: usize,
         ipa: u64,
         size: usize,
@@ -274,6 +285,9 @@ impl HvVm {
         // unmap の成功まで munmap しない（失敗時はリーク）。
         let rc = unsafe { hv_vm_map(addr as *mut c_void, ipa, size, flags.bits()) };
         classify_hv_return(HvOp::VmMap, rc)?;
+        // 対応付けが成功してから VM の集約先を付ける。これ以前（検査・`hv_vm_map` の失敗）で落ちる backing の munmap 失敗は
+        // VM が決まる前のため数えない（固定の 1 行だけで観測。#4411）。
+        host.unmap_tally = Some(Arc::clone(&self.unmap_tally));
         Ok(GuestMapping {
             _vm: keep,
             ipa,
@@ -362,6 +376,8 @@ pub struct HostMapping {
     ptr: *mut c_void,
     len: usize,
     page_size: usize,
+    /// munmap 失敗の加算先。`HvVm::map*` の成功で付く（それ以前は `None`）。#4411
+    unmap_tally: Option<Arc<UnmapTally>>,
 }
 
 // SAFETY: 個別承認は #4022 の判断コメント（案 A）の 1 件に限る。維持すべき不変条件:
@@ -412,6 +428,7 @@ impl HostMapping {
             ptr: p,
             len,
             page_size,
+            unmap_tally: None,
         })
     }
 
@@ -525,6 +542,10 @@ impl Drop for HostMapping {
         let rc = unsafe { munmap(self.ptr, self.len) };
         if let Some(line) = crate::hvf_abi::host_unmap_failure_line(rc) {
             crate::hvf_loop::log_line(format_args!("{line}"));
+            // 失敗は VM ごとの件数にも数える（停止の報告と集約行へ届く。#4411）。
+            if let Some(t) = &self.unmap_tally {
+                t.record_failure();
+            }
         }
     }
 }
@@ -1298,6 +1319,7 @@ mod tests {
             ptr: m.ptr.wrapping_byte_add(1),
             len: m.len,
             page_size: m.page_size,
+            unmap_tally: None,
         };
         let ((), lines) = crate::hvf_loop::capture_log_lines(|| drop(fake));
         assert_eq!(
@@ -1305,6 +1327,30 @@ mod tests {
             vec!["level=error op=hvf.host_unmap outcome=error leaked=host_mapping".to_string()]
         );
         drop(m);
+    }
+
+    /// munmap の失敗が VM ごとの件数に数えられる。成功の対照は 0（MVM-5・REPAIR-4・#4411）。
+    #[test]
+    fn mvm5_4411_host_unmap_failure_records_tally() {
+        let page = HostMapping::page_size().expect("page size");
+        let m = HostMapping::new(page).expect("mmap");
+        let t = Arc::new(UnmapTally::default());
+        let fake = HostMapping {
+            ptr: m.ptr.wrapping_byte_add(1),
+            len: m.len,
+            page_size: m.page_size,
+            unmap_tally: Some(Arc::clone(&t)),
+        };
+        let ((), lines) = crate::hvf_loop::capture_log_lines(|| drop(fake));
+        assert_eq!(lines.len(), 1);
+        assert_eq!(t.count(), 1);
+        drop(m);
+        let ok_tally = Arc::new(UnmapTally::default());
+        let mut ok = HostMapping::new(page).expect("mmap");
+        ok.unmap_tally = Some(Arc::clone(&ok_tally));
+        let ((), lines) = crate::hvf_loop::capture_log_lines(|| drop(ok));
+        assert!(lines.is_empty());
+        assert_eq!(ok_tally.count(), 0);
     }
 
     /// 成功した munmap は行を出さない（#4292）。

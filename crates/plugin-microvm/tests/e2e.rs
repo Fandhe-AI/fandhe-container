@@ -156,6 +156,8 @@ mod mock_core {
         pub exited: std::collections::BTreeSet<u32>,
         /// 設定すると成功した stop がこの ioeventfd 件数を返す（結果行の `ignored=` / `unbind_failed=` の経路。#4161）。
         pub stop_ioevent: Option<fandhe_container_microvm::interrupt::IoEventCounts>,
+        /// 設定すると成功した stop がこの munmap 失敗件数を返す（`stop_all` の合算の経路。#4438）。
+        pub stop_unmap: Option<u64>,
     }
 
     /// 起動・停止の引数を記録する偽バックエンド（adapter の `#[cfg(test)]` 版は非公開のため独自に持つ）。
@@ -192,7 +194,7 @@ mod mock_core {
                 None => Ok(fandhe_container_plugin_microvm::adapter::StopOutcome {
                     reason: "requested",
                     ioevent: r.stop_ioevent,
-                    unmap_failures: None,
+                    unmap_failures: r.stop_unmap,
                 }),
             }
         }
@@ -434,7 +436,9 @@ fn task117_plug1_repair5_shutdown_flag_stops_running_vm_and_ignores_later_reques
         StopAllReport {
             stopped: 1,
             failed: 0,
-            remaining: 0
+            remaining: 0,
+            ioevent: None,
+            unmap_failures: None
         }
     );
     let r = record.lock().expect("lock");
@@ -482,7 +486,9 @@ fn task117_4_plug1_mvm1_ping_start_stop_roundtrip_via_uds() {
         StopAllReport {
             stopped: 0,
             failed: 0,
-            remaining: 0
+            remaining: 0,
+            ioevent: None,
+            unmap_failures: None
         }
     );
 }
@@ -597,13 +603,55 @@ fn task117_4_mvm1_disconnect_with_running_vm_is_reclaimed_by_stop_all() {
         StopAllReport {
             stopped: 1,
             failed: 0,
-            remaining: 0
+            remaining: 0,
+            ioevent: None,
+            unmap_failures: None
         }
     );
     let stops = record.lock().expect("lock").stops.clone();
     assert_eq!(stops.len(), 1);
     assert_eq!(stops[0].0, 1);
     assert!(stops[0].1 <= STOP_DEADLINE, "{:?}", stops[0].1);
+}
+
+/// MVM-1・REPAIR-4・#4438: 切断で取り残された 2 台を `stop_all` が回収したとき、件数が合算され、
+/// `result_line` の具体値（` ignored=4 unbind_failed=2 unmap_failures=6`）に伝播する。
+#[test]
+fn mvm1_repair4_4438_disconnect_stop_all_sums_counts_into_result_line() {
+    use fandhe_container_microvm::interrupt::IoEventCounts;
+    use fandhe_container_plugin_microvm::adapter::StopAllReport;
+    use fandhe_container_plugin_microvm::frame_loop::LoopExit;
+
+    let mut e = mock_core::E2e::start();
+    {
+        let mut r = e.record.lock().expect("lock");
+        r.stop_ioevent = Some(IoEventCounts::new(2, 1));
+        r.stop_unmap = Some(3);
+    }
+    let kernel = e.dir.file("k.bin", KERNEL);
+    for (id, name) in [(1, "vm1"), (2, "vm2")] {
+        let start = s(&["start", name, &kernel, "", "", "1", "64"]);
+        assert_eq!(
+            expect_ok(call(&mut e.stream, id, start), id),
+            s(&["running"])
+        );
+    }
+    let (exit, report) = e.finish();
+    assert!(matches!(exit, Ok(LoopExit::PeerClosed)), "{exit:?}");
+    assert_eq!(
+        report,
+        StopAllReport {
+            stopped: 2,
+            failed: 0,
+            remaining: 0,
+            ioevent: Some(IoEventCounts::new(4, 2)),
+            unmap_failures: Some(6)
+        }
+    );
+    assert_eq!(
+        report.result_line(0),
+        "level=info op=plugin.microvm.stop_all stopped=2 failed=0 remaining=0 detached=0 ignored=4 unbind_failed=2 unmap_failures=6"
+    );
 }
 
 #[test]

@@ -1701,7 +1701,7 @@ fn cri2_pod_ipc_sysctls_are_accepted() {
     assert!(v["linux"].get("sysctl").is_none());
 }
 
-/// CRI-2（#2670）: `net.*` と UTS 系は `UNIMPLEMENTED`、名前空間を持たないキー・文法違反・不正な値は
+/// CRI-2（#2670）: 保持役なしの `net.*` と UTS 系は `UNIMPLEMENTED`、名前空間を持たないキー・文法違反・不正な値は
 /// `INVALID_ARGUMENT`（SEC-1。ホストの値を書き換える経路を作らない）。
 #[test]
 fn cri2_pod_sysctls_rejections() {
@@ -2063,4 +2063,81 @@ fn port_mappings_are_accepted_only_with_pod_netns() {
     // 値の不正は INVALID_ARGUMENT。
     p.port_mappings = vec![port_mapping(0, 8080, 0, "192.0.2.10")];
     assert_eq!(code(&p, &ctr()), CriErrorCode::InvalidArgument);
+}
+/// CRI-2・CORE-3・NET-3・SEC-1（#4406）: 保持役があり ipc と network が POD なら `net.*` を `linux.sysctl` へ写す。
+#[test]
+fn cri2_net3_4406_holder_pod_net_sysctl_is_accepted() {
+    let key = "net.ipv4.ip_unprivileged_port_start";
+    let paths = pod_paths();
+    let p = pod_with_sysctls(&[(key, "0"), ("kernel.shmmax", "1024")]);
+    let v = build_pods_json(&p, &ctr(), Some(&paths), None).expect("build");
+    assert_eq!(v["linux"]["sysctl"][key], "0");
+    assert_eq!(v["linux"]["sysctl"]["kernel.shmmax"], "1024");
+    assert_eq!(
+        network_entry(&v).cloned().expect("network"),
+        serde_json::json!({"type": "network", "path": "/proc/4242/ns/net"})
+    );
+    validate_config_with_pods(&p, &ctr(), Some(&paths), None).expect("validate");
+}
+
+/// CRI-2・NET-3・SEC-1（#4406）: 受けない構成の拒否コード。
+#[test]
+fn cri2_net3_4406_net_sysctl_rejections_keep_codes() {
+    let key = "net.ipv4.ip_unprivileged_port_start";
+    let paths = pod_paths();
+    let c = |net, ipc| with_sc(|sc| sc.namespace_options = Some(ns(net, NamespaceMode::Pod, ipc)));
+    let (pod_m, node, cont, target) = (
+        NamespaceMode::Pod,
+        NamespaceMode::Node,
+        NamespaceMode::Container,
+        NamespaceMode::Target,
+    );
+    let un = CriErrorCode::Unimplemented;
+    let inv = CriErrorCode::InvalidArgument;
+    let cases: Vec<(
+        ContainerConfig,
+        Option<&PodNamespacePaths>,
+        Option<&str>,
+        CriErrorCode,
+    )> = vec![
+        (ctr(), None, None, un),
+        (ctr(), None, Some(POD_NETNS), un),
+        (c(pod_m, cont), Some(&paths), None, un),
+        (c(cont, pod_m), Some(&paths), None, un),
+        (c(target, pod_m), Some(&paths), None, un),
+        (c(node, pod_m), Some(&paths), None, inv),
+        (c(node, pod_m), None, None, inv),
+    ];
+    let p = pod_with_sysctls(&[(key, "0")]);
+    for (i, (cfg, pp, nn, want)) in cases.iter().enumerate() {
+        let e = build_pods_json(&p, cfg, *pp, *nn).expect_err("rejected");
+        assert_eq!(e.code(), *want, "build case {i}");
+        let e = validate_config_with_pods(&p, cfg, *pp, *nn).expect_err("rejected");
+        assert_eq!(e.code(), *want, "validate case {i}");
+    }
+    // 優先順位: 保持役なしの不正な値は従来どおり UNIMPLEMENTED、保持役ありなら INVALID_ARGUMENT。
+    let bad = pod_with_sysctls(&[("net.x", "")]);
+    assert_eq!(code(&bad, &ctr()), un);
+    let bad = pod_with_sysctls(&[(key, "0\n")]);
+    let e = build_pods_json(&bad, &ctr(), Some(&paths), None).expect_err("bad value");
+    assert_eq!(e.code(), inv);
+    // UTS 系は保持役ありでも UNIMPLEMENTED。
+    let uts = pod_with_sysctls(&[("kernel.hostname", "x")]);
+    let e = build_pods_json(&uts, &ctr(), Some(&paths), None).expect_err("uts");
+    assert_eq!(e.code(), un);
+    // NODE の拒否メッセージにキー・値を含めない。
+    let secret = pod_with_sysctls(&[(key, "secret-value")]);
+    let e = build_pods_json(&secret, &c(node, pod_m), Some(&paths), None).expect_err("node");
+    assert!(!e.to_string().contains("secret-value"), "{e}");
+    assert!(!e.to_string().contains(key), "{e}");
+    // コンテナ側の namespace_options が sandbox 側より優先される（sandbox は POD、コンテナは NODE）。
+    let mut sb = pod_with_sysctls(&[(key, "0")]);
+    sb.linux
+        .as_mut()
+        .expect("linux")
+        .security_context
+        .get_or_insert_with(Default::default)
+        .namespace_options = Some(ns(pod_m, pod_m, pod_m));
+    let e = build_pods_json(&sb, &c(node, pod_m), Some(&paths), None).expect_err("node wins");
+    assert_eq!(e.code(), inv);
 }

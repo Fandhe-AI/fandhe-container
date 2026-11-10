@@ -74,7 +74,10 @@
 //!   ipc の `POD` で [`PodNamespacePaths`] へ join するときは共有された pod の IPC namespace へ書く（各コンテナが同じ
 //!   pod の値を書く）。供給元（保持役）がまだ無い間は、pod 単位の値を各コンテナ自身の IPC namespace へ適用する近似になる
 //!   （containerd も pod の sysctls を各コンテナへ写す）。分類は core の `sysctl::SysctlKey` を使い、規則を二重に持たない:
-//!   `net.*`（pod の netns の結線 #2675 が前提）と UTS 系（`kernel.hostname`・`kernel.domainname`）は `UNIMPLEMENTED`、
+//!   `net.*` は保持役の `PodNamespacePaths` があり ipc と network がどちらも `POD`（保持役の netns へ join する）構成だけ
+//!   受け入れ、各コンテナが同じ pod の値を join 先の netns へ書く（network が `NODE` はホストの値を書き換えるため
+//!   `INVALID_ARGUMENT`、保持役なし等のそれ以外は `UNIMPLEMENTED`。#4406・NET-3・SEC-1。
+//!   `docs/design/cri-config-acceptance.md`）。UTS 系（`kernel.hostname`・`kernel.domainname`）は `UNIMPLEMENTED`、
 //!   文法違反・名前空間を持たないキー（`kernel.panic`・`vm.*` 等）・不正な値は `INVALID_ARGUMENT`。
 //! - `port_mappings` は検証し（`crate::port_mapping`）、公開する要素（`host_port > 0`）があるときは pod の
 //!   netns（`pod_netns`）がある構成だけ受ける（なければ `UNIMPLEMENTED`）。公開そのものは RunPodSandbox の結線
@@ -606,12 +609,43 @@ struct CpuOut {
     quota: Option<i64>,
 }
 
+/// pod の `net.*` sysctl を書ける構成かの判定（CRI-2・CORE-3・NET-3・SEC-1・#4406）。
+///
+/// `build_inner` が `check_sysctls` の前に求める。`namespaces()` の network `POD` の join 規則
+/// （保持役あり・ipc も `POD`）と同じ条件で、食い違いは `build_inner` の二次防御が `INTERNAL` にする。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NetSysctlTarget {
+    /// 保持役があり、ipc と network がどちらも `POD`（保持役の netns へ join する）。
+    HolderNetns,
+    /// network が `NODE`（ホストの netns を共有するので、書くとホストの値が変わる）。
+    HostNetwork,
+    /// それ以外（保持役なし・ipc が join しない・CONTAINER / TARGET / 未知の値）。値の不正は後段が拒否する。
+    NotEligible,
+}
+
+fn net_sysctl_target(
+    opts: Option<&NamespaceOption>,
+    pod: Option<&PodNamespacePaths>,
+) -> NetSysctlTarget {
+    let default = NamespaceOption::default();
+    let o = opts.unwrap_or(&default);
+    let mode = |v: i32| NamespaceMode::try_from(v).ok();
+    match (mode(o.network), mode(o.ipc)) {
+        (Some(NamespaceMode::Node), _) => NetSysctlTarget::HostNetwork,
+        (Some(NamespaceMode::Pod), Some(NamespaceMode::Pod)) if pod.is_some() => {
+            NetSysctlTarget::HolderNetns
+        }
+        _ => NetSysctlTarget::NotEligible,
+    }
+}
+
 /// pod の `sysctls` を core の分類で検証する（#2670）。キー昇順に走査して、複数の不正があっても結果を決定的にする。
-/// 受理した組は予算に計上し、`config.json` の `linux.sysctl` へ写す。
+/// 受理した組は予算に計上し、`config.json` の `linux.sysctl` へ写す。戻りの bool は `net.*` を含むか（#4406）。
 fn check_sysctls<'a>(
     sysctls: &'a BTreeMap<String, String>,
     budget: &mut Budget,
-) -> Result<BTreeMap<&'a str, &'a str>, CriError> {
+    net: NetSysctlTarget,
+) -> Result<(BTreeMap<&'a str, &'a str>, bool), CriError> {
     if sysctls.len() > SYSCTL_MAX_ENTRIES {
         return Err(invalid("linux.sysctls"));
     }
@@ -619,10 +653,20 @@ fn check_sysctls<'a>(
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
+    let mut has_net = false;
     for (key, value) in &sorted {
         match SysctlKey::parse(key) {
             Ok(k) if k.namespace() == SysctlNamespace::Ipc => {}
-            // net.* は pod の netns の結線（#2675）が前提で未実装。
+            // net.* は保持役の netns へ join する構成だけ受ける。メッセージはキーも値も含めない固定文言。
+            Ok(k) if k.namespace() == SysctlNamespace::Net => match net {
+                NetSysctlTarget::HolderNetns => has_net = true,
+                NetSysctlTarget::HostNetwork => {
+                    return Err(CriError::invalid_argument(
+                        "linux.sysctls net.* requires a pod network namespace",
+                    ));
+                }
+                NetSysctlTarget::NotEligible => return Err(unsupported("linux.sysctls")),
+            },
             Ok(_) | Err(SysctlError::Uts) => return Err(unsupported("linux.sysctls")),
             Err(_) => return Err(invalid("linux.sysctls")),
         }
@@ -633,7 +677,7 @@ fn check_sysctls<'a>(
                 .saturating_add(ITEM_OVERHEAD),
         )?;
     }
-    Ok(sorted)
+    Ok((sorted, has_net))
 }
 
 fn unsupported(field: &'static str) -> CriError {
@@ -1430,9 +1474,19 @@ fn build_inner(
     let mut budget = Budget::new();
 
     let sandbox_linux = sandbox.linux.as_ref();
-    let sysctls = match sandbox_linux {
-        Some(l) => check_sysctls(&l.sysctls, &mut budget)?,
-        None => BTreeMap::new(),
+    // 名前空間の指定は net.* の可否の判定（#4406）に要るため、sysctls の検証より前に求める（借用だけで副作用なし）。
+    let linux = container.linux.as_ref();
+    let sc = linux.and_then(|l| l.security_context.as_ref());
+    // 名前空間: コンテナ側の指定を優先し、無ければ sandbox 側。
+    let ns_opts = sc.and_then(|s| s.namespace_options.as_ref()).or_else(|| {
+        sandbox_linux
+            .and_then(|l| l.security_context.as_ref())
+            .and_then(|s| s.namespace_options.as_ref())
+    });
+    let net_target = net_sysctl_target(ns_opts, pod);
+    let (sysctls, has_net_sysctl) = match sandbox_linux {
+        Some(l) => check_sysctls(&l.sysctls, &mut budget, net_target)?,
+        None => (BTreeMap::new(), false),
     };
     if let Some(l) = sandbox_linux {
         // core は `linux.cgroupsPath` を #2010 の方針で値に関わらず拒否し、コンテナの cgroup を常に委譲スコープ配下の
@@ -1464,8 +1518,6 @@ fn build_inner(
         }
     }
 
-    let linux = container.linux.as_ref();
-    let sc = linux.and_then(|l| l.security_context.as_ref());
     let mut capabilities = None;
     let mut cri_groups = Vec::new();
     let mut policy = SupplementalGroupsPolicy::Merge;
@@ -1597,12 +1649,6 @@ fn build_inner(
         });
     }
 
-    // 名前空間: コンテナ側の指定を優先し、無ければ sandbox 側。
-    let ns_opts = sc.and_then(|s| s.namespace_options.as_ref()).or_else(|| {
-        sandbox_linux
-            .and_then(|l| l.security_context.as_ref())
-            .and_then(|s| s.namespace_options.as_ref())
-    });
     // 公開（DNAT）の宛先は pod の netns。コンテナの network が POD 以外だと宛先とコンテナの netns が食い違うため拒否する。
     if has_publish {
         let mode = resolve_mode(
@@ -1614,6 +1660,16 @@ fn build_inner(
         }
     }
     let namespaces = namespaces(ns_opts, pod, pod_netns)?;
+    // 二次防御: net.* を受けたのに network エントリが保持役の netns でなければ fail-closed（判定の食い違い。#4406・SEC-1）。
+    if has_net_sysctl {
+        let expected = pod.map(PodNamespacePaths::net);
+        let joined = namespaces
+            .iter()
+            .any(|n| n.kind == "network" && n.path.is_some() && n.path == expected);
+        if net_target != NetSysctlTarget::HolderNetns || !joined {
+            return Err(CriError::internal("pod network sysctl target mismatch"));
+        }
+    }
 
     let resources = match linux.and_then(|l| l.resources.as_ref()) {
         Some(r) => resources(r)?,

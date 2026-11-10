@@ -46,6 +46,7 @@ use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::hvf_abi::HvRunStats;
 use crate::hvf_loop::{LoopHandle, VCPU_STOP_DEADLINE_MAX, VcpuKick, VcpuSetStopReport, log_line};
 use crate::stop::{StopReason, UnmapTally};
+use crate::virtio_mmio::QueueNotifyTally;
 
 /// stop を経ない drop が vCPU スレッドの停止を待つ期限（REPAIR-5。Linux の `DROP_STOP_WAIT` と同値）。
 pub const DROP_STOP_DEADLINE: Duration = Duration::from_secs(5);
@@ -197,8 +198,8 @@ pub struct HvfStopReport {
     /// 集約行の時点の値で、期限切れ・遅延回収の経路で後から回収する失敗は含まない（`op=hvf.deferred_reclaim` で観測）。
     pub vm_unmap_failures: u64,
     /// MMIO exit 経路で受理判定に落ちて捨てた `QUEUE_NOTIFY` の件数（VM ごと。HVF は ioeventfd が無く常にこの経路。観測専用。
-    /// MVM-1・MVM-5・REPAIR-4・#4459）。`stop_and_release` は 0 を入れ、デバイスを持つ `hvf::microvm` の `HvfVmParts::release` が
-    /// 解放の後に確定値を入れる。4 バイト以外の幅の書き込みは含まない。
+    /// MVM-1・MVM-5・REPAIR-4・#4459）。`stop_and_release` が全 drop の後に [`Resources::mmio`] から 1 回だけ読んで入れ、
+    /// 集約行の ` mmio_ignored=` にも同じ値が載る（0 でも省かない。#4467）。4 バイト以外の幅の書き込みは含まない。
     pub mmio_ignored: u64,
 }
 
@@ -216,6 +217,9 @@ pub struct Resources<D, M, V> {
     /// `hv_vm_unmap` の失敗を数える VM ごとの集約先（`unmap` とは別インスタンス）。読むだけで drop 順には関与しない
     /// （`vm_unmap_failures=` に出す。#4439）。
     pub vm_unmap: Arc<UnmapTally>,
+    /// MMIO exit 経路で捨てた `QUEUE_NOTIFY` の件数の集約先（デバイスと共有）。読むだけで drop 順には関与しない
+    /// （`mmio_ignored=` に出す。#4467）。
+    pub mmio: Arc<QueueNotifyTally>,
 }
 
 /// `sys::hvf::GuestMapping` の drop で `hv_vm_unmap` が失敗したときの記録（固定の 1 行と VM ごとの件数。
@@ -267,6 +271,7 @@ where
         vm,
         unmap,
         vm_unmap,
+        mmio,
     } = resources;
     // 処理開始時に終了時刻の基準を 1 回だけ取り、vCPU の停止待ちとデバイス解放待ちで同じ期限を共有する（REPAIR-5）。
     let started = std::time::Instant::now();
@@ -293,7 +298,6 @@ where
                             // 資源を落とした後に下で確定値を入れる。
                             unmap_failures: 0,
                             vm_unmap_failures: 0,
-                            // `QueueNotifyTally` はデバイス側が持つため、呼び出し元（`hvf::microvm`）が確定値を入れる。
                             mmio_ignored: 0,
                         })
                     }
@@ -346,10 +350,12 @@ where
     // 含まない（後からの回収は `op=hvf.deferred_reclaim`（munmap の失敗は `failed=host_ram`。#4440）と `op=hvf.host_unmap` で観測。#4411）。
     let unmap_failures = unmap.count();
     let vm_unmap_failures = vm_unmap.count();
+    let mmio_ignored = mmio.mmio_ignored();
     let mut outcome = outcome;
     if let Ok(r) = &mut outcome {
         r.unmap_failures = unmap_failures;
         r.vm_unmap_failures = vm_unmap_failures;
+        r.mmio_ignored = mmio_ignored;
     }
     match &outcome {
         Ok(r) => {
@@ -358,12 +364,12 @@ where
                 _ => ("info", "ok"),
             };
             log_line(format_args!(
-                "level={level} op={op} outcome={result} reason={} released=true unmap_failures={unmap_failures} vm_unmap_failures={vm_unmap_failures}",
+                "level={level} op={op} outcome={result} reason={} released=true unmap_failures={unmap_failures} vm_unmap_failures={vm_unmap_failures} mmio_ignored={mmio_ignored}",
                 r.reason.as_str()
             ));
         }
         Err((e, tail)) => log_line(format_args!(
-            "level=error op={op} outcome=error code={} released=false {tail} unmap_failures={unmap_failures} vm_unmap_failures={vm_unmap_failures}",
+            "level=error op={op} outcome=error code={} released=false {tail} unmap_failures={unmap_failures} vm_unmap_failures={vm_unmap_failures} mmio_ignored={mmio_ignored}",
             e.code().as_str()
         )),
     }
@@ -691,6 +697,7 @@ mod tests {
             vm: Rec("vm", Arc::clone(log)),
             unmap: Arc::default(),
             vm_unmap: Arc::default(),
+            mmio: Arc::default(),
         }
     }
 
@@ -814,6 +821,7 @@ mod tests {
             vm,
             unmap: Arc::default(),
             vm_unmap: Arc::default(),
+            mmio: Arc::default(),
         };
         let e = stop_and_release("hvf.microvm.stop", h, Duration::from_millis(50), r).unwrap_err();
         assert_eq!(e.code(), MicrovmErrorCode::DeadlineExceeded);
@@ -853,6 +861,7 @@ mod tests {
             vm,
             unmap: Arc::default(),
             vm_unmap: Arc::default(),
+            mmio: Arc::default(),
         };
         stop_and_release("hvf.microvm.stop", h, LONG, r).unwrap();
         assert_eq!(
@@ -984,6 +993,7 @@ mod tests {
             vm,
             unmap: Arc::default(),
             vm_unmap: Arc::default(),
+            mmio: Arc::default(),
         };
         let _ = take_thread_reclaim();
         let e = stop_and_release("hvf.microvm.stop", h, Duration::from_millis(50), r).unwrap_err();
@@ -1032,6 +1042,7 @@ mod tests {
             vm,
             unmap: Arc::default(),
             vm_unmap: Arc::default(),
+            mmio: Arc::default(),
         };
         let _ = take_thread_reclaim();
         let e = stop_and_release("hvf.microvm.stop", h, Duration::from_millis(50), r).unwrap_err();
@@ -1079,6 +1090,7 @@ mod tests {
             vm,
             unmap: Arc::default(),
             vm_unmap: Arc::default(),
+            mmio: Arc::default(),
         };
         let _ = take_thread_reclaim();
         stop_and_release("hvf.microvm.stop", h, LONG, r).unwrap();
@@ -1119,6 +1131,7 @@ mod tests {
             vm: Rec("vm", Arc::clone(&log)),
             unmap: Arc::default(),
             vm_unmap: Arc::default(),
+            mmio: Arc::default(),
         };
         let deadline = Duration::from_millis(10);
         let t = std::time::Instant::now();
@@ -1144,6 +1157,7 @@ mod tests {
             vm: Rec("vm", Arc::clone(&log)),
             unmap: Arc::default(),
             vm_unmap: Arc::default(),
+            mmio: Arc::default(),
         };
         let e = stop_and_release("hvf.microvm.stop", responsive(), LONG, r).unwrap_err();
         assert_eq!(e.code(), MicrovmErrorCode::DeadlineExceeded);
@@ -1166,6 +1180,7 @@ mod tests {
             vm,
             unmap: Arc::default(),
             vm_unmap: Arc::default(),
+            mmio: Arc::default(),
         };
         let e = stop_and_release(
             "hvf.microvm.stop",
@@ -1253,6 +1268,7 @@ mod tests {
             vm,
             unmap: Arc::default(),
             vm_unmap: Arc::default(),
+            mmio: Arc::default(),
         };
         let e =
             stop_and_release("hvf.microvm.stop", set, Duration::from_millis(100), r).unwrap_err();
@@ -1294,6 +1310,7 @@ mod tests {
             vm: Rec("vm", Arc::clone(&log)),
             unmap: Arc::default(),
             vm_unmap: Arc::default(),
+            mmio: Arc::default(),
         };
         let t = std::time::Instant::now();
         let e = stop_and_release(
@@ -1443,6 +1460,7 @@ mod tests {
                 vm: Rec("vm", Arc::clone(&log)),
                 unmap: tally,
                 vm_unmap: Arc::default(),
+                mmio: Arc::default(),
             };
             let (res, lines) = stop_lines(r);
             let rep = res.unwrap();
@@ -1455,7 +1473,7 @@ mod tests {
             assert_eq!(
                 own,
                 vec![&format!(
-                    "level=info op=hvf.microvm.stop outcome=ok reason=requested released=true unmap_failures={want} vm_unmap_failures=0"
+                    "level=info op=hvf.microvm.stop outcome=ok reason=requested released=true unmap_failures={want} vm_unmap_failures=0 mmio_ignored=0"
                 )]
             );
         }
@@ -1476,6 +1494,7 @@ mod tests {
                 vm: Rec("vm", Arc::clone(&log)),
                 unmap: tally,
                 vm_unmap: Arc::default(),
+                mmio: Arc::default(),
             };
             let (res, lines) = crate::hvf_loop::capture_log_lines(|| {
                 stop_and_release("hvf.microvm.stop", responsive(), LONG, r)
@@ -1488,7 +1507,7 @@ mod tests {
             assert_eq!(
                 own,
                 vec![&format!(
-                    "level=error op=hvf.microvm.stop outcome=error code=TIMEOUT released=false leaked=guest_ram,vm unmap_failures={want} vm_unmap_failures=0"
+                    "level=error op=hvf.microvm.stop outcome=error code=TIMEOUT released=false leaked=guest_ram,vm unmap_failures={want} vm_unmap_failures=0 mmio_ignored=0"
                 )]
             );
         }
@@ -1521,6 +1540,7 @@ mod tests {
             vm: Rec("vm", log),
             unmap: Arc::clone(unmap),
             vm_unmap: Arc::clone(vm_unmap),
+            mmio: Arc::default(),
         }
     }
 
@@ -1544,7 +1564,7 @@ mod tests {
                 assert_eq!(
                     own,
                     vec![&format!(
-                        "level=info op={op} outcome=ok reason=requested released=true unmap_failures=0 vm_unmap_failures={want}"
+                        "level=info op={op} outcome=ok reason=requested released=true unmap_failures=0 vm_unmap_failures={want} mmio_ignored=0"
                     )]
                 );
                 let vm_lines: Vec<_> = lines
@@ -1577,6 +1597,7 @@ mod tests {
                 vm: Rec("vm", Arc::clone(&log)),
                 unmap: Arc::default(),
                 vm_unmap,
+                mmio: Arc::default(),
             };
             let (res, lines) = crate::hvf_loop::capture_log_lines(|| {
                 stop_and_release("hvf.microvm.stop", responsive(), LONG, r)
@@ -1589,7 +1610,87 @@ mod tests {
             assert_eq!(
                 own,
                 vec![&format!(
-                    "level=error op=hvf.microvm.stop outcome=error code=TIMEOUT released=false leaked=guest_ram,vm unmap_failures=0 vm_unmap_failures={want}"
+                    "level=error op=hvf.microvm.stop outcome=error code=TIMEOUT released=false leaked=guest_ram,vm unmap_failures=0 vm_unmap_failures={want} mmio_ignored=0"
+                )]
+            );
+        }
+    }
+
+    /// 件数 `n` を数えた `QueueNotifyTally` を作る。製品と同じ経路（トランスポートへの `QUEUE_NOTIFY` の書き込み。
+    /// 起動前の状態では受理判定に落ちて捨てられる）で数える（#4467）。
+    fn mmio_tally(n: u32) -> Arc<QueueNotifyTally> {
+        use crate::virtio_block::{MemoryBlockBackend, VirtioBlock};
+        use crate::virtio_mmio::{IgnoredAccess, MmioWriteOutcome, VirtioMmioTransport, reg};
+        let tally = Arc::new(QueueNotifyTally::default());
+        let mut t = VirtioMmioTransport::new(VirtioBlock::new(
+            MemoryBlockBackend::new(16 * 512, false).unwrap(),
+        ))
+        .unwrap()
+        .with_queue_notify_tally(Arc::clone(&tally));
+        for _ in 0..n {
+            assert_eq!(
+                t.write(reg::QUEUE_NOTIFY, &0u32.to_le_bytes()),
+                MmioWriteOutcome::Ignored(IgnoredAccess::WrongDeviceState)
+            );
+        }
+        tally
+    }
+
+    /// MVM-1・MVM-5・REPAIR-4・#4467: 捨てた `QUEUE_NOTIFY` の件数が報告と集約行（stop・drop の両 op）の
+    /// ` mmio_ignored=` に具体値で一致する（0 でも省かない）。
+    #[test]
+    fn mvm5_4467_mmio_ignored_reaches_stop_report_and_line() {
+        for op in ["hvf.microvm.stop", "hvf.microvm.drop"] {
+            for n in [0u32, 3] {
+                let mut r = resources(&Arc::new(Mutex::new(Vec::new())));
+                r.mmio = mmio_tally(n);
+                let (res, lines) = crate::hvf_loop::capture_log_lines(|| {
+                    stop_and_release(op, responsive(), LONG, r)
+                });
+                let rep = res.unwrap();
+                assert_eq!(rep.mmio_ignored, u64::from(n));
+                let own: Vec<_> = lines.iter().filter(|l| l.contains(op)).collect();
+                assert_eq!(
+                    own,
+                    vec![&format!(
+                        "level=info op={op} outcome=ok reason=requested released=true unmap_failures=0 vm_unmap_failures=0 mmio_ignored={n}"
+                    )]
+                );
+                let v: u64 = own[0]
+                    .split(" mmio_ignored=")
+                    .nth(1)
+                    .and_then(|x| x.parse().ok())
+                    .unwrap();
+                assert_eq!(v, rep.mmio_ignored);
+            }
+        }
+    }
+
+    /// MVM-1・MVM-5・REPAIR-4・#4467: 異常系の集約行にも ` mmio_ignored=` が出る。
+    #[test]
+    fn mvm5_4467_error_line_carries_mmio_ignored() {
+        for n in [0u32, 2] {
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let r = Resources {
+                devices: StuckDevices(Rec("devices", Arc::clone(&log))),
+                memory: Rec("memory", Arc::clone(&log)),
+                vm: Rec("vm", Arc::clone(&log)),
+                unmap: Arc::default(),
+                vm_unmap: Arc::default(),
+                mmio: mmio_tally(n),
+            };
+            let (res, lines) = crate::hvf_loop::capture_log_lines(|| {
+                stop_and_release("hvf.microvm.stop", responsive(), LONG, r)
+            });
+            assert!(res.is_err());
+            let own: Vec<_> = lines
+                .iter()
+                .filter(|l| l.contains("op=hvf.microvm.stop"))
+                .collect();
+            assert_eq!(
+                own,
+                vec![&format!(
+                    "level=error op=hvf.microvm.stop outcome=error code=TIMEOUT released=false leaked=guest_ram,vm unmap_failures=0 vm_unmap_failures=0 mmio_ignored={n}"
                 )]
             );
         }

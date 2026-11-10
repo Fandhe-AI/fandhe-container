@@ -431,6 +431,21 @@ pub async fn audit_drain_loop(buf: Arc<Mutex<JsonLinesPeerAuthObserver>>, period
     }
 }
 
+/// 記録器の集計を `export_json_lines` の形式で行に分けて返す（行の一覧と集計対象の操作の種類数。符号化の失敗は `None`）。
+///
+/// shim の起動時の走査（`shim::startup_sweep`）と終了時の書き出し（`shim::serve_end`）が共有する。1 回のスナップショットで
+/// 種類数と行を得るので、呼び出し側の「0 件なら出さない」の判定と出力の時点がずれない（CRI-5・REPAIR-4・#4408）。
+#[cfg(target_os = "linux")]
+pub(crate) fn op_stats_lines(recorder: &OpRecorder) -> Option<(Vec<String>, usize)> {
+    let mut buf: Vec<u8> = Vec::new();
+    let report = recorder.export_json_lines(Some(&mut buf)).ok()?;
+    let lines = String::from_utf8_lossy(&buf)
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    Some((lines, report.ops()))
+}
+
 /// 操作統計を JSON Lines で `sink` へ渡す。積めた行数（符号化失敗時は 0）を返す。
 pub fn export_op_stats_to(recorder: &OpRecorder, sink: &LineSink) -> usize {
     let mut out: Vec<u8> = Vec::new();

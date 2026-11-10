@@ -34,7 +34,7 @@
 //!   届かない経路（`Spawned` 無しの `Result`・予算切れ）は `None` で、Start 応答・TaskExecStarted・State の pid は 0 になる。
 //!   計数（#4379・REPAIR-4）: 予算切れの回は `shim_exec_pid_unreported`、登録時のインスタンスとの不一致の拒否は
 //!   `shim_exec_instance_changed` を共有記録器へ数える（`Spawned` 無しの終了・ほかの拒否は数えない）。発生ごとに `{"event":"<操作名>","elapsed_ms":N}` の JSON 1 行を
-//!   stderr の有界 sink へ出す（満杯なら捨て、exec は待たない）。集計の書き出しは起動時の走査の 1 回で、定期出力は #4228 の出力方式と合わせて後続。
+//!   stderr の有界 sink へ出す（満杯なら捨て、exec は待たない）。集計の書き出しは起動時の走査の後（回収 1 件以上）と serve の終了時（`shim::serve_end`。#4408）の 2 時点で、定期出力は #4228 の出力方式と合わせて後続。
 //! - 許可リスト外のシグナル・env・cwd・user の受け入れは後続（許可リストの SIGKILL 以外は helper の `Signal` frame で対応済み。#4282）。
 
 #[cfg(target_os = "linux")]

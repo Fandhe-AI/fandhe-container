@@ -235,7 +235,9 @@ pub fn poll_writable(
     poll_imp::poll_writable(fd, timeout_ms)
 }
 
-/// `open(2)` の `O_NONBLOCK`（CRI-6・REPAIR-5・#4287）。`/proc/self/fd/N` の開き直し（Linux のみ）で使う。
+/// `open(2)` の `O_NONBLOCK`（CRI-6・REPAIR-5・#4287）。利用者は 2 つ: `/proc/self/fd/N` の開き直し
+/// （streaming の attach。`None` なら開き直さない）と、pod_holder の保持役 bin の open（`None` なら固定文言の
+/// `FAILED_PRECONDITION` で拒否する。MVM-4・REPAIR-1・#4441）。
 /// 値は Linux の `include/uapi/asm-generic/fcntl.h`（x86_64・aarch64 とも 0o4000）。他の組は `None`
 /// （開き直さず従来の共有記述の経路を使う）。`libc` の機械照合は plugin-cri には未導入（#3290）で、
 /// 値は `abi_values` で具体値として固定する（#4415）。
@@ -244,7 +246,7 @@ pub fn poll_writable(
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 pub const O_NONBLOCK: Option<i32> = Some(0o4000);
-/// 非対応の組では開き直さない。
+/// 非対応の組。attach は開き直さず、pod_holder は bin の open を拒否する。
 #[cfg(not(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")

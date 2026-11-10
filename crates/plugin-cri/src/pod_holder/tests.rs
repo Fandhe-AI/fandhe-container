@@ -178,8 +178,47 @@ fn cri2_repair5_fifo_executable_is_rejected_without_blocking() {
     let r = rx
         .recv_timeout(Duration::from_secs(10))
         .expect("open must not block on a FIFO");
-    assert_eq!(r.unwrap_err().message(), MSG_UNTRUSTED_EXE);
+    let err = r.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+    assert_eq!(err.message(), MSG_UNTRUSTED_EXE);
     let _ = std::fs::remove_file(&path);
+}
+
+/// `sys::O_NONBLOCK` が `None` の組では、FIFO でも通常ファイルでも open より前に固定文言で拒否される
+/// （CRI-2・REPAIR-5・MVM-4・#4441）。`Some` の対照として通常ファイルは通る。
+#[test]
+fn cri2_repair5_mvm4_missing_o_nonblock_is_rejected_before_open() {
+    let euid = current_euid().unwrap();
+    let fifo = scratch("nonblock-fifo");
+    let reg = scratch("nonblock-reg");
+    let _ = std::fs::remove_file(&fifo);
+    assert!(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::fs::set_permissions(&fifo, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(&reg, b"x").unwrap();
+    std::fs::set_permissions(&reg, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for path in [fifo.clone(), reg.clone()] {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(open_trusted_executable_with(&path, euid, None).map(|_| ()));
+        });
+        let err = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("rejection must not block")
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(err.message(), MSG_NONBLOCK_UNSUPPORTED);
+    }
+    if let Some(flag) = crate::sys::O_NONBLOCK {
+        assert!(open_trusted_executable_with(&reg, euid, Some(flag)).is_ok());
+    }
+    let _ = std::fs::remove_file(&fifo);
+    let _ = std::fs::remove_file(&reg);
 }
 
 /// 祖先ディレクトリの検査: 全祖先が自分（か root）所有で group/other 書き込み不可のときだけ通す（PLUG-11）。

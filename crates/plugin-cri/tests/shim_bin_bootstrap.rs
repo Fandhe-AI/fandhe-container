@@ -195,7 +195,17 @@ fn cri5_873_shutdown_rpc_ends_daemon() {
     }
     assert!(!sock.exists(), "socket must be removed after shutdown");
     let lock = PathBuf::from(format!("{}.lock", sock.display()));
-    assert!(!lock.exists(), "lock must be removed after shutdown");
+    // デーモンはロック保持下で socket → lock の順に消す（`cleanup_after_shutdown`）ため、socket の消失の
+    // 直後には lock が残りうる（macOS の高負荷時に 2 回の unlink の間を観測した。#4445・CRI-5・REPAIR-12）。
+    // 同じ期限で lock の消失も待つ。本番の順序を逆にすると並行 start の締め出し（PLUG-12・REPAIR-5）が崩れるため試験側で吸収する。
+    while lock.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let dlog = std::fs::read_to_string(sc.sock_dir().join("daemon.log")).unwrap_or_default();
+    assert!(
+        !lock.exists(),
+        "lock must be removed after shutdown; daemon.log: {dlog}"
+    );
     #[cfg(target_os = "linux")]
     {
         while daemon_alive(&id) && std::time::Instant::now() < deadline {

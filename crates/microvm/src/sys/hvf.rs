@@ -186,6 +186,8 @@ pub struct HvVm {
     _private: (),
     /// ゲスト RAM の backing の munmap 失敗を数える VM ごとの集約先。`map_with` が対応付けた `HostMapping` へ配る（#4411）。
     unmap_tally: Arc<UnmapTally>,
+    /// `hv_vm_unmap` の失敗を数える VM ごとの集約先（`unmap_tally` とは別インスタンス）。`map_with` が `GuestMapping` へ配る（#4439）。
+    vm_unmap_tally: Arc<UnmapTally>,
 }
 
 impl HvVm {
@@ -210,7 +212,13 @@ impl HvVm {
         Ok(HvVm {
             _private: (),
             unmap_tally: Arc::default(),
+            vm_unmap_tally: Arc::default(),
         })
+    }
+
+    /// `hv_vm_unmap` 失敗の集約先（停止・解放の集約行の `vm_unmap_failures=` 用。MVM-5・REPAIR-4・#4439）。
+    pub(crate) fn vm_unmap_tally(&self) -> Arc<UnmapTally> {
+        Arc::clone(&self.vm_unmap_tally)
     }
 
     /// munmap 失敗の集約先（停止・解放の集約行の `unmap_failures=` 用。MVM-5・REPAIR-4・#4411）。
@@ -296,6 +304,7 @@ impl HvVm {
             active: true,
             host_offset: offset,
             host: Some(host),
+            vm_unmap_tally: Arc::clone(&self.vm_unmap_tally),
         })
     }
 }
@@ -574,6 +583,9 @@ pub struct GuestMapping<'a> {
     host_offset: usize,
     /// 登録済みの backing。解除成功時のみ drop し、失敗時は `leak_host` でリークする。
     host: Option<HostMapping>,
+    /// `hv_vm_unmap` の失敗件数の集約先（VM と共有。drop の失敗だけを数え、明示の `unmap()` の失敗は数えない。
+    /// `op=hvf.vm_unmap` の行数と件数を一致させるため。#4439）。
+    vm_unmap_tally: Arc<UnmapTally>,
 }
 
 impl GuestMapping<'_> {
@@ -687,10 +699,8 @@ impl Drop for GuestMapping<'_> {
             );
         }
         if let Err(e) = r {
-            crate::hvf_loop::log_line(format_args!(
-                "level=error op=hvf.vm_unmap outcome=error code={} leaked=guest_ram",
-                e.code().as_str()
-            ));
+            // 固定の 1 行と VM ごとの件数（`vm_unmap_failures=`）を同じ関数で出す（#4439）。
+            crate::hvf_lifecycle::report_vm_unmap_failure(e.code(), &self.vm_unmap_tally);
         }
         self.active = false;
     }

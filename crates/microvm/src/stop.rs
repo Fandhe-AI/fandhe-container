@@ -32,8 +32,9 @@ impl StopReason {
     }
 }
 
-/// VM ごとの munmap 失敗件数（drop の経路のみ。停止・解放の集約行の `unmap_failures=` に出す。
-/// #4382・#4411・MVM-1・MVM-5・REPAIR-4）。OS 非依存（`unsafe` なし）。
+/// VM ごとの unmap 系の失敗件数（drop の経路のみ。停止・解放の集約行に出す。#4382・#4411・#4439・MVM-1・MVM-5・REPAIR-4）。
+/// OS 非依存（`unsafe` なし）。munmap 用（`unmap_failures=`）と HVF の `hv_vm_unmap` 用（`vm_unmap_failures=`）を
+/// 別インスタンスで持ち、混ぜない。
 ///
 /// KVM では `VmFd` が持ち、`GuestRamMap` / `KvmRunMap` が drop で加算し、最後の停止スレッドが集約行を出す時に読む。
 /// HVF では `HvVm` が持ち、ゲストへ対応付けた `HostMapping` が drop で加算し、`stop_and_release` が資源を落とした後に読む。

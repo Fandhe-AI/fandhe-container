@@ -4530,6 +4530,24 @@ fn pod_network_status(netns: &PodNetns) -> Option<v1::PodSandboxNetworkStatus> {
     })
 }
 
+/// Status の `linux` を記録した config から作る（CRI-2・#4383）。
+///
+/// containerd（v2.4.2 `toCRISandboxStatus`）と同じく `linux`・`namespaces` はいつも `Some` にし、
+/// `namespace_options` は無改変で返す（未指定は `options: None`。既定値は補わない）。kubelet の
+/// `PodSandboxChanged` が `GetNamespaces().GetOptions().GetNetwork()` を pod の期待値と比べ、
+/// 食い違うと sandbox を作り直すため、hostNetwork（`NODE`）の pod の再作成ループを防ぐ。
+/// 実行時の内部状態（保持役の pid・ns パス）は載せない（SEC-5）。
+fn sandbox_linux_status(config: &PodSandboxConfig) -> v1::LinuxPodSandboxStatus {
+    let options = config
+        .linux
+        .as_ref()
+        .and_then(|l| l.security_context.as_ref())
+        .and_then(|s| s.namespace_options.clone());
+    v1::LinuxPodSandboxStatus {
+        namespaces: Some(v1::Namespace { options }),
+    }
+}
+
 impl SandboxRecord {
     /// Status 応答用の変換。labels・annotations は保持した値を無改変でコピーする。
     fn to_status(&self, id: &str) -> v1::PodSandboxStatus {
@@ -4539,7 +4557,7 @@ impl SandboxRecord {
             state: self.state.to_proto() as i32,
             created_at: self.created_at_nanos,
             network: self.pod_netns.as_ref().and_then(pod_network_status),
-            linux: None,
+            linux: Some(sandbox_linux_status(&self.config)),
             labels: self.config.labels.clone().into_iter().collect(),
             annotations: self.config.annotations.clone().into_iter().collect(),
             runtime_handler: self.runtime_handler.to_owned(),
@@ -6260,7 +6278,13 @@ mod tests {
         assert_eq!(st.runtime_handler, "");
         assert!(st.created_at > 0 && resp.timestamp >= st.created_at);
         assert!(resp.containers_statuses.is_empty() && resp.info.is_empty());
-        assert!(st.network.is_none() && st.linux.is_none());
+        assert!(st.network.is_none());
+        assert_eq!(
+            st.linux,
+            Some(v1::LinuxPodSandboxStatus {
+                namespaces: Some(v1::Namespace { options: None }),
+            })
+        );
 
         stop_id(&svc, &id);
         let st2 = status_of(&svc, &id).unwrap().status.unwrap();
@@ -6270,6 +6294,118 @@ mod tests {
 
         remove_id(&svc, &id);
         assert_eq!(status_of(&svc, &id).unwrap_err().code(), Code::NotFound);
+    }
+
+    /// namespace のオプションを持つ試験用 config。
+    fn config_with_ns(name: &str, opts: v1::NamespaceOption) -> PodSandboxConfig {
+        let mut c = config(name);
+        c.linux = Some(v1::LinuxPodSandboxConfig {
+            security_context: Some(v1::LinuxSandboxSecurityContext {
+                namespace_options: Some(opts),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        c
+    }
+
+    /// CRI-2・#4383: Status の `linux.namespaces.options` は config の値を無改変で返す
+    /// （network=NODE・pid=CONTAINER・ipc=POD）。Stop の後も変わらない。
+    #[test]
+    fn cri2_4383_status_linux_echoes_namespace_options() {
+        let svc = CriRuntimeService::new();
+        let opts = v1::NamespaceOption {
+            network: v1::NamespaceMode::Node as i32,
+            pid: v1::NamespaceMode::Container as i32,
+            ipc: v1::NamespaceMode::Pod as i32,
+            ..Default::default()
+        };
+        let id = run(&svc, Some(config_with_ns("p", opts.clone())), "")
+            .unwrap()
+            .into_inner()
+            .pod_sandbox_id;
+        let got = status_of(&svc, &id)
+            .unwrap()
+            .status
+            .unwrap()
+            .linux
+            .unwrap()
+            .namespaces
+            .unwrap()
+            .options
+            .unwrap();
+        assert_eq!(got.network, v1::NamespaceMode::Node as i32);
+        assert_eq!(got.pid, v1::NamespaceMode::Container as i32);
+        assert_eq!(got.ipc, v1::NamespaceMode::Pod as i32);
+        assert_eq!(got, opts);
+
+        stop_id(&svc, &id);
+        let after = status_of(&svc, &id)
+            .unwrap()
+            .status
+            .unwrap()
+            .linux
+            .unwrap()
+            .namespaces
+            .unwrap()
+            .options;
+        assert_eq!(after, Some(opts));
+    }
+
+    /// CRI-2・#4383: target_id と userns_options も無改変で返る。
+    #[test]
+    fn cri2_4383_status_linux_keeps_target_and_userns() {
+        let opts = v1::NamespaceOption {
+            network: v1::NamespaceMode::Pod as i32,
+            pid: v1::NamespaceMode::Target as i32,
+            target_id: "target-1".into(),
+            userns_options: Some(v1::UserNamespace {
+                mode: v1::NamespaceMode::Pod as i32,
+                uids: vec![v1::IdMapping {
+                    host_id: 65536,
+                    container_id: 0,
+                    length: 65536,
+                }],
+                gids: vec![v1::IdMapping {
+                    host_id: 65536,
+                    container_id: 0,
+                    length: 65536,
+                }],
+            }),
+            ..Default::default()
+        };
+        let st = sandbox_linux_status(&config_with_ns("p", opts.clone()));
+        assert_eq!(
+            st.namespaces,
+            Some(v1::Namespace {
+                options: Some(opts)
+            })
+        );
+    }
+
+    /// CRI-2・#4383: 未指定（linux なし・security_context なし・namespace_options なし）は
+    /// containerd と同じく `options: None`（既定値は補わない）で、linux・namespaces はある。
+    #[test]
+    fn cri2_4383_status_linux_default_when_unspecified() {
+        let expected = v1::LinuxPodSandboxStatus {
+            namespaces: Some(v1::Namespace { options: None }),
+        };
+        let mut no_ctx = config("a");
+        no_ctx.linux = Some(v1::LinuxPodSandboxConfig::default());
+        let mut no_opts = config("b");
+        no_opts.linux = Some(v1::LinuxPodSandboxConfig {
+            security_context: Some(v1::LinuxSandboxSecurityContext::default()),
+            ..Default::default()
+        });
+        for cfg in [config("c"), no_ctx, no_opts] {
+            let svc = CriRuntimeService::new();
+            let id = run(&svc, Some(cfg), "")
+                .unwrap()
+                .into_inner()
+                .pod_sandbox_id;
+            let st = status_of(&svc, &id).unwrap().status.unwrap();
+            assert_eq!(st.linux, Some(expected.clone()));
+        }
     }
 
     /// ERR-3・TASK-57.3: 空 ID は INVALID_ARGUMENT、未知 ID は NOT_FOUND で、文言に入力 ID を含めない。

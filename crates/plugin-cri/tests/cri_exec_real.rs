@@ -323,6 +323,10 @@ async fn exec_once(c: &mut RuntimeServiceClient<Channel>, id: &str, cmd: &[&str]
 
 // ---- 段 T（#4417）: tty の往復と resize ----
 
+/// 段 T の成功行（CI が `--require` で照合する。#4417）。
+const TTY_OK: &str =
+    "production_binary_exec_real: tty ok: round trip and resize (30x100, 40x120) matched stty size";
+
 /// 出力待ちの全体期限（REPAIR-5）。
 const OUTPUT_DEADLINE: Duration = Duration::from_secs(60);
 
@@ -1052,6 +1056,10 @@ async fn scenario(
 
     // 段 T（#4417）: tty の往復と resize。段 4 は plugin-cri を殺すため、その前に置く。
     tty_stage(&mut c, &id).await;
+    {
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), "{TTY_OK}");
+    }
 
     // 段 P（#4405）: POD ネットワークの pod 内往復。
     pod_network_stage(&mut c, &id, &token, &ledger).await;

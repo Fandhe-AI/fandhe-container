@@ -18,7 +18,7 @@
 //! # 未実装（REPAIR-3）
 //!
 //! helper は実装済み（#3760）で、plugin-cri 側の結線は #3761 で実装済み（受け取る stdio は socket か FIFO に限る）。
-//! tty は helper 側（`--tty`・pty の割り当て・`PtyMaster` の `Started` の後・`Spawned` の前の送信）が #4416 で実装済みで、plugin-cri 側の有効化（`HelperCapabilities.tty`・`without_tty` の撤去）は #4417 のため、plugin-cri は本番でそれまで tty を断る。helper は exec の待ちの刻みごとに fd 0 を見て `Signal` を受ける（#4282）が、plugin-cri が helper を kill
+//! tty は helper 側（`--tty`・pty の割り当て・`PtyMaster` の `Started` の後・`Spawned` の前の送信）が #4416 で実装済みで、plugin-cri 側の有効化（`HelperCapabilities.tty`・`without_tty` の撤去）も #4417 で実装済み。helper は exec の待ちの刻みごとに fd 0 を見て `Signal` を受ける（#4282）が、plugin-cri が helper を kill
 //! せずに死んだ場合は exec の期限（`--timeout-ms`）まで動く（詳細は [`helper`]）。制御チャネル（`control`）には触れない。
 //! Linux 限定（core の `exec::ExecChildStep` が Linux でしか使えないため。`exec` と同じ cfg）。
 

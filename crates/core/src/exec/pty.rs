@@ -30,7 +30,7 @@
 //!
 //! # 未実装（REPAIR-3）
 //! supervisor 側の結線（`ExecLaunchIo::pty`・stream-exec helper の `--tty`・`ExecPtyReceiver::try_receive` の刻みでの
-//! 非ブロッキング受信。#4416）は実装済みで、plugin-cri の能力フラグ・`without_tty` の撤去は #4417。
+//! 非ブロッキング受信。#4416）は実装済みで、plugin-cri の能力フラグ・`without_tty` の撤去も #4417 で実装済み。
 //! plugin-cri の resize の転送は #3761 で実装済み、実コンテナ（Landlock・seccomp の下）での実機確認は #3762、
 //! launch の init の `/dev/console` への bind は `bind_console`（#4071）が行う（exec は `/dev/console` を触らない）。
 //!

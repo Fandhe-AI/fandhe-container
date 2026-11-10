@@ -92,6 +92,7 @@ impl MicrovmBackend for UnimplementedBackend {
             reason: "requested",
             ioevent: None,
             unmap_failures: None,
+            vm_unmap_failures: None,
         })
     }
 

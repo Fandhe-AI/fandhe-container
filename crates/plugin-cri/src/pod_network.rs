@@ -15,7 +15,7 @@
 //!
 //! | CRI の操作 | 関数 | `NetworkPlugin` の呼び出し |
 //! | ---------- | ---- | -------------------------- |
-//! | `RunPodSandbox`（POD） | [`set_up_sandbox`] | `create_network` → `create_netns` → `attach` → `publish_port`（`port_mappings` の公開指定ごと。#2676）。失敗は逆順に戻す（公開途中の失敗は公開済みを `unpublish_port` で個別に解除してから `delete_network`。#2904） |
+//! | `RunPodSandbox`（POD） | [`set_up_sandbox`] | `create_network` → `create_netns` → `attach`（割り当てアドレスを `with_ips` で報告。#4384）→ `publish_port`（`port_mappings` の公開指定ごと。#2676）。失敗は逆順に戻す（公開途中の失敗は公開済みを `unpublish_port` で個別に解除してから `delete_network`。#2904） |
 //! | `StopPodSandbox` / `RemovePodSandbox` | [`tear_down_pod`] | `delete_network`（pod のネットワークごと一括解放） |
 //! | （試験のみ） | [`set_up_pod`]・[`set_up_container`] | `create_network`・`create_netns` → `attach` |
 
@@ -107,6 +107,15 @@ pub struct SandboxSetUpError {
     pub rolled_back: bool,
 }
 
+/// [`set_up_sandbox`] の成功結果。`attach` の応答を捨てず、割り当てアドレスを呼び出し側へ渡す（CRI-2・NET-3・#4384）。
+#[derive(Debug)]
+pub struct SandboxSetUp {
+    /// `create_netns` の結果。
+    pub netns: NetnsStatus,
+    /// `attach` の応答。plugin が実際に割り当てたアドレスは `attach.address()`（リースのサブネットから推測しない）。
+    pub attach: AttachResponse,
+}
+
 /// sandbox の識別子から導く 3 つの名前（ネットワーク名・コンテナ ID・netns 名はすべて同じ文字列）。
 fn sandbox_names(sandbox_id: &str) -> Result<(NetworkName, ContainerId, NetnsName), TraitError> {
     Ok((
@@ -151,7 +160,7 @@ pub fn set_up_sandbox(
     sandbox_id: &str,
     subnet: IpCidr,
     ports: &[PodPortPublish],
-) -> Result<NetnsStatus, SandboxSetUpError> {
+) -> Result<SandboxSetUp, SandboxSetUpError> {
     let plain = |error| SandboxSetUpError {
         error,
         rolled_back: true,
@@ -171,8 +180,13 @@ pub fn set_up_sandbox(
     {
         Err(e) => e,
         Ok(status) => match net.attach(&AttachRequest::new(name.clone(), container.clone())) {
-            Ok(_) => match publish_all(net, &name, &container, ports) {
-                Ok(()) => return Ok(status),
+            Ok(resp) => match publish_all(net, &name, &container, ports) {
+                Ok(()) => {
+                    return Ok(SandboxSetUp {
+                        netns: status,
+                        attach: resp,
+                    });
+                }
                 // attach 済みでも detach は呼ばない（pod 専用ネットワークなので delete_network が覆う）。公開済みを逆順に個別解除し、
                 // delete_network は必ず呼ぶ（テーブル単位の解放。結果不明の受け口の予約もここで回収する）。
                 Err((e, published)) => {
@@ -360,6 +374,10 @@ pub struct PodSubnetLease {
 /// `delete_network` の成功から枠の返却までの間に `set_up` が既存の枠でネットワークを作り直し、その後の返却で
 /// 稼働中のネットワークの枠が別 sandbox へ渡るのを防ぐ（NET-1）。別の sandbox どうしは並行できる。
 ///
+/// `set_up` は `attach` が割り当てたアドレスを `PodNetns::with_ips` で報告する（`PodSandboxStatus.network` に出る。
+/// 再起動後の IP の永続は #2941）。応答がこの sandbox のものでなければ報告しない。cri が拒否する値なら
+/// `INTERNAL` で失敗させ、`delete_network` で巻き戻す（CRI-2・NET-3・#4384）。
+///
 /// **未実装・簡易実装（REPAIR-3）**: 本番へは注入されない（モジュール doc）。サブネットのプールの出どころは未決で、
 /// 構築時の引数として受けるだけ。
 pub struct NetsetupPodNetwork {
@@ -450,7 +468,40 @@ impl PodNetworkProvider for NetsetupPodNetwork {
             lease.subnet,
             req.port_publishes(),
         ) {
-            Ok(_) => Ok(netns),
+            Ok(s) => {
+                let (name, container, _) = sandbox_names(req.sandbox_id).map_err(to_cri)?;
+                // attach の応答は plugin 境界の出力（untrusted）。この sandbox のものと確認できない応答の IP は
+                // 報告せず、リースのサブネットから推測した値でも埋めない（network は空のまま。CRI-2・NET-3・REPAIR-3）。
+                if s.attach.network() != &name || s.attach.container() != &container {
+                    return Ok(netns);
+                }
+                // サブネット包含・prefix 長の検査は NetworkPlugin 契約 10 で plugin 実装側の責務のため重複させない。
+                // 値の検証（loopback・未指定・multicast 等）は cri の `with_ips` に委ねる。
+                match netns.with_ips(s.attach.address().addr(), Vec::new()) {
+                    Ok(n) => Ok(n),
+                    Err(e) => {
+                        // 拒否された IP のまま pod を残さない。巻き戻しを確認できたときだけ枠を返す。
+                        match tear_down_pod(self.net.as_ref(), &name) {
+                            Ok(_) => {
+                                if lease.newly_allocated {
+                                    self.pool.release(req.sandbox_id);
+                                }
+                                Err(e)
+                            }
+                            Err(d) if d.code() == ErrorCode::NotFound => {
+                                if lease.newly_allocated {
+                                    self.pool.release(req.sandbox_id);
+                                }
+                                Err(e)
+                            }
+                            Err(d) => Err(to_cri(with_rollback_errors(
+                                TraitError::new(ErrorCode::Internal, e.message().to_owned()),
+                                &[("delete_network", d)],
+                            ))),
+                        }
+                    }
+                }
+            }
             Err(f) => {
                 // 今回新しく払い出した枠で、資源が残らないと確認できたときだけ返す。既存の予約（同じ sandbox の
                 // 稼働中のネットワーク・回収待ちの残骸）の枠は tear_down の成功まで保持する（NET-1）。

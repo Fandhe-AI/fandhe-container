@@ -91,6 +91,8 @@ struct Script {
     fail_unpublish_port: u16,
     /// 失敗させる unpublish_port の結果を不明（ルールが残った可能性）にするか。
     unpublish_unknown: bool,
+    /// `attach` が返すアドレス（`None` なら 10.89.0.2/24）。CRI-2・NET-3・#4384。
+    attach_address: Option<IpPrefix>,
 }
 
 #[derive(Clone, Default)]
@@ -249,7 +251,9 @@ impl NetsetupBackend for Fake {
         }
         Ok(AttachOutcome {
             container: FakeContainer(endpoint.as_str().to_owned()),
-            address: IpPrefix::new(IpAddr::V4(Ipv4Addr::new(10, 89, 0, 2)), 24).expect("prefix"),
+            address: s.attach_address.unwrap_or_else(|| {
+                IpPrefix::new(IpAddr::V4(Ipv4Addr::new(10, 89, 0, 2)), 24).expect("prefix")
+            }),
         })
     }
 
@@ -1671,7 +1675,8 @@ fn net1_create_netns_leftover_is_tracked_and_blocks_delete() {
 fn set_up_sandbox_calls_in_order() {
     let (net, fake) = plugin();
     let st = pod_network::set_up_sandbox(&net, SB, subnet(), &[]).expect("set up");
-    assert_eq!(st.name().as_str(), SB);
+    assert_eq!(st.netns.name().as_str(), SB);
+    assert_eq!(st.attach.address().to_string(), "10.89.0.2/24");
     assert_eq!(
         fake.calls(),
         vec![
@@ -2700,4 +2705,198 @@ fn cri2_set_up_sandbox_unpublished_ports_are_republishable_after_failed_delete()
     attached(&net, "other", "c9");
     net.publish_port(&publish_req("other", "c9", 8080, ip4()))
         .expect("8080 was released individually");
+}
+
+// ---- #4384: attach の割り当て IP の報告（CRI-2・NET-3）----
+
+fn ip_prefix(a: u8, b: u8, c: u8, d: u8, len: u8) -> IpPrefix {
+    IpPrefix::new(IpAddr::V4(Ipv4Addr::new(a, b, c, d)), len).expect("prefix")
+}
+
+fn cri_service_with(
+    provider: fandhe_container_plugin_cri::pod_network::NetsetupPodNetwork,
+) -> fandhe_container_cri::runtime_service::CriRuntimeService {
+    fandhe_container_cri::runtime_service::CriRuntimeService::new()
+        .with_pod_network(Arc::new(provider))
+}
+
+async fn run_sandbox(
+    svc: &fandhe_container_cri::runtime_service::CriRuntimeService,
+) -> Result<String, tonic::Status> {
+    use fandhe_container_cri::runtime::v1::{
+        self as v1, PodSandboxConfig, PodSandboxMetadata, runtime_service_server::RuntimeService,
+    };
+    RuntimeService::run_pod_sandbox(
+        svc,
+        tonic::Request::new(v1::RunPodSandboxRequest {
+            config: Some(PodSandboxConfig {
+                metadata: Some(PodSandboxMetadata {
+                    name: "pod".into(),
+                    uid: "uid-1".into(),
+                    namespace: "ns".into(),
+                    attempt: 0,
+                }),
+                ..Default::default()
+            }),
+            runtime_handler: String::new(),
+        }),
+    )
+    .await
+    .map(|r| r.into_inner().pod_sandbox_id)
+}
+
+async fn status_network(
+    svc: &fandhe_container_cri::runtime_service::CriRuntimeService,
+    id: &str,
+) -> Option<fandhe_container_cri::runtime::v1::PodSandboxNetworkStatus> {
+    use fandhe_container_cri::runtime::v1::{self as v1, runtime_service_server::RuntimeService};
+    svc.pod_sandbox_status(tonic::Request::new(v1::PodSandboxStatusRequest {
+        pod_sandbox_id: id.to_owned(),
+        verbose: false,
+    }))
+    .await
+    .expect("status")
+    .into_inner()
+    .status
+    .expect("status body")
+    .network
+}
+
+/// CRI-2・NET-3: attach が割り当てたアドレスが `PodSandboxStatus.network.ip` に出る（リースの 10.90.0.x ではなく
+/// plugin が返した値）。
+#[tokio::test]
+async fn cri_2_net_3_status_reports_netsetup_attach_ip() {
+    use fandhe_container_cri::runtime::v1::{self as v1, runtime_service_server::RuntimeService};
+    let fake = Fake::default();
+    fake.0.lock().expect("lock").attach_address = Some(ip_prefix(10, 90, 0, 7, 24));
+    let svc = cri_service_with(provider_with(&fake));
+    let id = run_sandbox(&svc).await.expect("run");
+    let net = status_network(&svc, &id).await.expect("network");
+    assert_eq!(net.ip, "10.90.0.7");
+    assert!(net.additional_ips.is_empty());
+    RuntimeService::stop_pod_sandbox(
+        &svc,
+        tonic::Request::new(v1::StopPodSandboxRequest {
+            pod_sandbox_id: id.clone(),
+        }),
+    )
+    .await
+    .expect("stop");
+    assert_eq!(status_network(&svc, &id).await, None);
+}
+
+/// attach の応答が別のコンテナのものなら IP を報告せず、network は空のまま（推測しない）。
+struct OtherContainerAttach(NetsetupNetwork<Fake>);
+
+impl NetworkPlugin for OtherContainerAttach {
+    fn create_network(
+        &self,
+        r: &CreateNetworkRequest,
+    ) -> Result<fandhe_container_core::traits::NetworkStatus, TraitError> {
+        self.0.create_network(r)
+    }
+    fn create_netns(
+        &self,
+        r: &CreateNetnsRequest,
+    ) -> Result<fandhe_container_core::traits::NetnsStatus, TraitError> {
+        self.0.create_netns(r)
+    }
+    fn attach(
+        &self,
+        r: &AttachRequest,
+    ) -> Result<fandhe_container_core::traits::AttachResponse, TraitError> {
+        let real = self.0.attach(r)?;
+        Ok(fandhe_container_core::traits::AttachResponse::new(
+            real.network().clone(),
+            cid(&"e".repeat(64)),
+            real.address(),
+            real.gateway(),
+        ))
+    }
+    fn publish_port(
+        &self,
+        r: &PublishPortRequest,
+    ) -> Result<fandhe_container_core::traits::PortMapping, TraitError> {
+        self.0.publish_port(r)
+    }
+    fn unpublish_port(
+        &self,
+        r: &UnpublishPortRequest,
+    ) -> Result<fandhe_container_core::traits::UnpublishPortResponse, TraitError> {
+        self.0.unpublish_port(r)
+    }
+    fn detach(
+        &self,
+        r: &DetachRequest,
+    ) -> Result<fandhe_container_core::traits::DetachResponse, TraitError> {
+        self.0.detach(r)
+    }
+    fn delete_network(
+        &self,
+        r: &DeleteNetworkRequest,
+    ) -> Result<fandhe_container_core::traits::DeleteNetworkResponse, TraitError> {
+        self.0.delete_network(r)
+    }
+}
+
+/// CRI-2・NET-3: この sandbox の応答と確認できない attach の IP は報告しない。
+#[tokio::test]
+async fn cri_2_net_3_status_network_empty_when_attach_reports_other_container() {
+    use fandhe_container_cri::adapter::{PodNetworkProvider, PodNetworkRequest};
+    use fandhe_container_cri::runtime::v1::PodSandboxConfig;
+    use fandhe_container_plugin_cri::pod_network::{NetsetupPodNetwork, PodSubnetPool};
+    let make = || {
+        let net: Arc<dyn NetworkPlugin> =
+            Arc::new(OtherContainerAttach(NetsetupNetwork::new(Fake::default())));
+        NetsetupPodNetwork::new(
+            net,
+            std::path::PathBuf::from("/state/.netns"),
+            PodSubnetPool::new(parent(), 24).expect("pool"),
+        )
+    };
+    let cfg = PodSandboxConfig::default();
+    let netns = make()
+        .set_up(&PodNetworkRequest::new(SB, &cfg))
+        .expect("set up");
+    assert_eq!(netns.ip(), None);
+    assert!(netns.additional_ips().is_empty());
+    let svc = cri_service_with(make());
+    let id = run_sandbox(&svc).await.expect("run");
+    assert_eq!(status_network(&svc, &id).await, None);
+}
+
+/// CRI-2・SEC-1: cri が拒否する IP（loopback）は INTERNAL で失敗し、delete_network で戻して枠も返す。
+#[test]
+fn cri_2_sec_1_netsetup_rejected_attach_ip_fails_and_rolls_back() {
+    use fandhe_container_cri::adapter::{PodNetworkProvider, PodNetworkRequest};
+    use fandhe_container_cri::error::CriErrorCode;
+    use fandhe_container_cri::runtime::v1::PodSandboxConfig;
+    let fake = Fake::default();
+    fake.0.lock().expect("lock").attach_address = Some(ip_prefix(127, 0, 0, 2, 8));
+    let provider = provider_with(&fake);
+    let cfg = PodSandboxConfig::default();
+    let e = provider
+        .set_up(&PodNetworkRequest::new(SB, &cfg))
+        .expect_err("rejected");
+    assert_eq!(e.code(), CriErrorCode::Internal);
+    assert_eq!(
+        fake.calls().last().unwrap(),
+        &format!("delete_network {SB} [{SB}]")
+    );
+    fake.0.lock().expect("lock").attach_address = None;
+    provider
+        .set_up(&PodNetworkRequest::new(SB, &cfg))
+        .expect("retry");
+    let creates: Vec<String> = fake
+        .calls()
+        .into_iter()
+        .filter(|c| c.starts_with("create_network"))
+        .collect();
+    assert_eq!(
+        creates,
+        vec![
+            format!("create_network {SB} 10.90.0.1/24"),
+            format!("create_network {SB} 10.90.0.1/24"),
+        ]
+    );
 }

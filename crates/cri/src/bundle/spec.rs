@@ -19,10 +19,10 @@
 //! - namespace の共有: pid の `POD` は未実装で、コンテナごとの新しい namespace にする（共有の欠落であり、
 //!   要求より分離が弱くなる方向ではない。core の PID 1 前提の証跡と両立しないため。#2674 の後続）。ipc の `POD` は
 //!   [`PodNamespacePaths`]（pod の保持役が作った user＋ipc＋net namespace のパス）が与えられたときだけ
-//!   `linux.namespaces[].path` で join する（core が user＋ipc の組に限って受ける。CRI-2・CORE-3。#2674）。
+//!   `linux.namespaces[].path` で join する（core が user＋ipc の組と、それに net を足す形を受ける〔#2872〕。CRI-2・CORE-3。#2674）。
 //!   [`PodNamespacePaths`] は保持役の pid から `/proc/<pid>/ns/{user,ipc,net}` だけを組み立てる（#2776・#2878）。
 //!   `CriRuntimeService` は保持役の provider を注入したときだけ自 sandbox の記録の pid から作った値を渡す（#2876）。
-//!   本番（plugin-cri）は provider が未注入（H6・#2877）のため、本番では共有されず新しい namespace になる。`/dev/shm` は共有しない（core がコンテナごとの tmpfs を載せる）。`/proc/<pid>` を
+//!   本番（plugin-cri）は Linux・非 root で provider を注入済み（H6・#2877）のため共有される。rootful など注入しない構成では新しい namespace になる。`/dev/shm` は共有しない（core がコンテナごとの tmpfs を載せる）。`/proc/<pid>` を
 //!   Create の時点で書く方式は pid の再利用で別 pod の namespace へ入り得る（SEC-1）ため採らない。
 //! - network namespace: `POD` / `CONTAINER` は `{"type":"network"}` を出す。`POD` で pod の netns のパスを受けたとき
 //!   （[`build_runtime_config_with_pod_netns`]。`NetworkPlugin` 経由で作って結線した netns。#2675・NET-1）は

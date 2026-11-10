@@ -4,8 +4,8 @@
 
 ## 背景
 
-- cri は pod の ipc 共有を bundle へ変換できる（#2674）。パスは `PodNamespacePaths::for_holder_pid`（`/proc/<pid>/ns/{user,ipc}` だけ。#2776）でしか作れない。`CriRuntimeService` の配線は #2876（H5）で実装済みで、保持役の provider を注入したときだけ `with_pod_namespaces` を渡す。本番（plugin-cri）は provider が未注入（H6・#2877）のため、pod のコンテナは常に新しい namespace で起動する
-- pod の netns は `PodNetworkProvider`（cri）と plugin-cri の `NetsetupPodNetwork`（bridge・veth。rootful 前提）まで実装済み（#2675・#2676）。ただし本番へは未注入で、core の `NamespaceJoin` は network の path を `Unimplemented` で拒否し、`PodSandboxStatus.network` は provider の報告だけを返す経路が実装済み（#2873）だが、provider 未注入のため実際には空
+- cri は pod の ipc 共有を bundle へ変換できる（#2674）。パスは `PodNamespacePaths::for_holder_pid`（`/proc/<pid>/ns/{user,ipc,net}` だけ。#2776・#2878）でしか作れない。`CriRuntimeService` の配線は #2876（H5）で実装済みで、保持役の provider を注入したときだけ `with_pod_namespaces` を渡す。本番（plugin-cri）は Linux・非 root で `ProductionPodHolder` を注入済み（H6・#2877）で、ipc が `POD` のコンテナは保持役の user＋ipc（network も `POD` なら net）へ join する。rootful（uid 0）は注入せず `UNIMPLEMENTED`（#2241・#2442）
+- pod の netns は `PodNetworkProvider`（cri）と plugin-cri の `NetsetupPodNetwork`（bridge・veth。rootful 前提）まで実装済み（#2675・#2676）。ただし本番へは未注入で、core の `NamespaceJoin` は user＋ipc の組に net を足す形を受理済み（H7・#2872）だが、本番の rootless では `NetsetupPodNetwork`（rootful 前提）を使えず rootless の provider は H10（#2879）で未実装のため、`PodSandboxStatus.network` は provider の報告だけを返す経路が実装済み（#2873）だが、provider 未注入（本番は rootless・H10 待ち）のため実際には空
 - plugin-cri の本番は rootless（uid 0 は `UNIMPLEMENTED`。#2442・#2241）。bridge・veth は作れず、rootless の netns は pasta 構成（NET-9。#1935・#341）の領域
 - 受け入れ方式の現状は [cri-config-acceptance.md](cri-config-acceptance.md) の順 12〜14
 
@@ -131,7 +131,7 @@ plugin-cri の `ProductionPodHolder`（`crates/plugin-cri/src/pod_holder.rs`）�
 
 あわせて readopt の不具合を直した（H4 の残り）: 保持役の注入下では起動の前に `pending=1`（`network_pending=0`）を書くため、クラッシュ後の再採用が `network_owned=true` に倒すと、pod network provider を差さない本番で Stop・Remove が回収待ちから抜けられなくなる。`network_owned` は `network_pending` だけから導く（`pending_unresolved` には従来どおり数える）。R11（#2940）は #2877 に依存しており循環するため、ここで直した。
 
-未実装（REPAIR-3）: 保持役の pid から `PodNamespacePaths` を作って bundle へ渡す配線（H5・#2876）は配線済みで、POD のコンテナは user・ipc に join する。保持役の netns を pod ネットワークへ渡すのは H8（#2878）で未実装。素性の永続化と再起動後の再採用は R11（#2940）。
+未実装（REPAIR-3）: 保持役の pid から `PodNamespacePaths` を作って bundle へ渡す配線（H5・#2876）は配線済みで、POD のコンテナは user・ipc に join する。保持役の netns の bundle への受け渡しも H8（#2878）で実装済み。未実装は、素性の永続化と再起動後の再採用（R11・#2940）・pod ネットワークの本番 provider（H10・#2879）・pid の共有（#2903）。
 
 ## 実装単位
 

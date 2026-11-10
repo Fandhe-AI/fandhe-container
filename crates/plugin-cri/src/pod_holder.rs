@@ -24,7 +24,7 @@
 //!
 //! # 未実装・簡易実装（REPAIR-3）
 //! 保持役の pid から `PodNamespacePaths` を作って bundle へ渡す配線（H5・#2876）は配線済み（user・ipc の join）。保持役の
-//! netns を pod ネットワークへ渡すのは H8（#2878）で未実装。素性（pid・
+//! netns の bundle への受け渡しは H8（#2878）で実装済み。pod ネットワークの本番 provider（rootless の pasta）は H10（#2879）で未実装。素性（pid・
 //! starttime・ns）の永続化と再起動後の再採用は R11（#2940）。rootful（uid 0）は `UNIMPLEMENTED`（#2241・#2442 の判断まで）。
 
 use std::collections::{HashMap, HashSet};

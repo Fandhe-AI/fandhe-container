@@ -468,8 +468,8 @@ impl CriPluginBackends {
     }
 
     /// `NetworkPlugin` の実装。写像は [`crate::pod_network`]（`NetsetupPodNetwork` が cri の `PodNetworkProvider` を実装）。
-    /// 本番の RPC からはまだ呼ばれない: core の network namespace の join が入るまで `with_pod_network` を差さない
-    /// （差すと RunPodSandbox が bridge・netns・veth を作るのに start が `UNIMPLEMENTED` で失敗する。#2675・REPAIR-3）。
+    /// 本番の RPC からはまだ呼ばれない: 本番は rootless で `NetsetupPodNetwork` は rootful 前提のため `with_pod_network` を差さない
+    /// （保持役のある構成は `UNIMPLEMENTED` で拒否される。rootless の provider は H10〔#2879〕で未実装。#2675・REPAIR-3）。
     pub fn network(&self) -> &Arc<dyn NetworkPlugin> {
         &self.network
     }

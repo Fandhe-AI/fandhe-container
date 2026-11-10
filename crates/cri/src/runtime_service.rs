@@ -25,15 +25,15 @@
 //! 呼び出し中はレジストリのロックを持たず、記録の `in_flight` フラグで二重 Start・Remove・親サンドボックスの
 //! 除去を `FAILED_PRECONDITION` にする。実行層が失敗したら記録を巻き戻し（Create）・Created へ戻し（Start）、
 //! 「記録上だけ running」のフォールバックはしない（fail-closed）。注入しない場合は従来のスタブ動作のまま。
-//! 未実装（REPAIR-3）: `RunPodSandbox` は実行層に対応操作が無く記録のみ（共有 namespace は後続）。pod の netns は
+//! 未実装（REPAIR-3）: `RunPodSandbox` は実行層に対応操作が無く記録のみ（共有 namespace は保持役〔H4〜H8〕で ipc・net を共有済み。pid の共有は #2903）。pod の netns は
 //! [`CriRuntimeService::with_pod_network`] で `PodNetworkProvider` を注入したときだけ、`namespace_options.network` が `POD`
 //! の `RunPodSandbox` が作って結線し、`StopPodSandbox`・`RemovePodSandbox` が回収し、`CreateContainer` が bundle へ
-//! netns のパスを渡す（#2675・CRI-2・NET-1）。core の start は network namespace の join を未実装で拒否するため、
-//! 本番（plugin-cri）は注入していない（`docs/design/cri-config-acceptance.md` の順 13）。
+//! netns のパスを渡す（#2675・CRI-2・NET-1）。本番（plugin-cri）は rootless で、`NetsetupPodNetwork` は rootful 前提（保持役のある構成は `UNIMPLEMENTED` で拒否）、
+//! rootless の provider は H10〔#2879〕で未実装のため注入していない（`docs/design/cri-config-acceptance.md` の順 13）。
 //! pod の namespace の保持役は [`CriRuntimeService::with_pod_holder`] で `PodNamespaceHolderProvider` を注入したときだけ、
 //! `RunPodSandbox` が write-ahead の後に起動し（失敗・期限超過で資源が無ければ登録しない）、Stop・Remove が冪等に解放する。
 //! 死んだ保持役の sandbox は Status・List で `SANDBOX_NOTREADY`、`CreateContainer` は `FAILED_PRECONDITION`（#2871・CRI-2・REPAIR-5）。
-//! bundle への配線は済み（H5〔#2876〕。provider を注入したときだけ、ipc が `POD` のコンテナは保持役の user＋ipc へ join する）。本番の provider は plugin-cri の `ProductionPodHolder`（H6〔#2877〕。Linux・非 root の本番構成で注入）。netns のパス（H8〔#2878〕）は未実装（REPAIR-3）。pid はメモリ上のみで記録ファイルへ書かない（R11〔#2940〕）。
+//! bundle への配線は済み（H5〔#2876〕。provider を注入したときだけ、ipc が `POD` のコンテナは保持役の user＋ipc へ join する）。本番の provider は plugin-cri の `ProductionPodHolder`（H6〔#2877〕。Linux・非 root の本番構成で注入）。netns のパスも実装済み（H8〔#2878〕。network が `POD` で ipc も join するとき保持役の netns へ join）。未実装は pid の共有（#2903）と pod ネットワークの本番 provider（H10〔#2879〕）（REPAIR-3）。pid はメモリ上のみで記録ファイルへ書かない（R11〔#2940〕）。
 //! bundle の生成（config 変換・bundle ディレクトリの寿命・image 展開の `ImageRootfsSource`）は `crate::bundle`（#2395・#2433）で、
 //! plugin-cri への結線は #2433 で済み、core の本番 launcher との結線は TASK-114、一連の結合試験は TASK-59.4 で扱う。Start 後に中断・確定失敗した場合は、
 //! 実行層が running の可能性があるため記録を unknown にして再 Start を拒否する（fail-closed）。

@@ -91,7 +91,7 @@ plugin-cri の `adapter::CoreOciRecorder` が oci の `OciOpRecorder` を core �
 - 専用の記録器（`CriPluginBackends::oci_op_recorder`）に分ける理由: core の `OpRecorder` は操作名の種類を `MAX_TRACKED_OPS`（64）までしか持たず、上限後の新しい名前は捨てて `dropped_records` に数える。当初の共有記録器には `cri.*`・`net.*`・`oci_runtime`・plugin-cri の `*_remove` 等が入り、#4380 の数え直しで最悪 98 種（上限超過）だったため、さらに CRI 記録器（最悪 48 種）とライフサイクル記録器（最悪 53 種。core の `oci_runtime`・ログの回収・net。本番のみ）に分けた（いずれも `MAX_TRACKED_OPS - 8` 以下を `repair4_4380_*` が固定）。一方、1 回の pull で通る oci の種別は約 16 ある。共有へ流すと pull が枠を取り、後続の `create`・`delete` の記録を捨てさせる。専用なら 22 種で 64 に収まる（`cri.pull_image.registry_http.*` の 8 種も同じ専用記録器へ入る。#2966）。core の上限は変えない（PLUG-4）
 - stderr: `op_stats_export_loop_many` が CRI・ライフサイクル・oci の順に記録器ごとのブロックを出す。1 周期に `op_stats_meta` 行が 3 行になる（#4380）
 - 二重計上: `oci.pull.gc_recover`（oci 側。排他の待ちを含む）と `image_pull_recovery`（plugin-cri 側。共有記録器）は同じ回収を別の意味で数える。意図どおり残す
-- 範囲外: 操作統計のメトリクス公開口への接続（方式は `cri-op-stats-export.md`・#4228。実装は後続）・CLI 側の橋渡し
+- 範囲外: 操作統計のメトリクス公開口への CLI 側の橋渡し（公開口そのものは `--op-stats-file`〔opt-in の原子的なスナップショットファイル。案 C・#4295・#4340〕で実装済み。詳細は `cri-op-stats-export.md`）
 
 ## レジストリの HTTP 状態の区分の計上（#2966・REPAIR-4・CRI-3・OCI-1）
 
@@ -114,7 +114,7 @@ PR #2927（#2898）でレジストリの HTTP 状態を `PullImage` のトレー
 - 置き場は oci 専用の記録器（`oci_op_recorder`）: 共有記録器へ 8 種を足すと `MAX_TRACKED_OPS`（64）に迫り `create`・`delete` の記録を捨てさせうる。専用は 22 + 8 = 30 種で収まる（単体試験の const 評価で照合）
 - 失敗のときだけ記録する（`CoreCriRecorder`）。共有記録器の `cri.pull_image` の失敗 1 件と、区分側の失敗 1 件は同じ失敗を別の切り口で数えたもの（二重計上。意図どおり）
 - 実機前提試験 `production_binary_full_lifecycle_real` の pull 失敗時は、メタデータから区分を読み、429 なら `production_binary_full_lifecycle_real: registry rate limit (HTTP 429); ...` の固定行を出す（それ以外は `pull failed with code <CODE> registry_http=<区分>`）。成否の判定は変えない。CI の事前プローブ（`make docker-hub-ratelimit-probe`）は残す
-- 範囲外: 操作統計のメトリクス公開口への接続（方式は `cri-op-stats-export.md`・#4228。実装は後続）
+- 範囲外: 操作統計のメトリクス公開口への接続（公開口は `--op-stats-file`〔opt-in の原子的なスナップショットファイル。案 C・#4295・#4340〕で実装済み。詳細は `cri-op-stats-export.md`）
 
 ## CRI の在庫の永続化（#4176・CRI-1・CRI-2・OCI-7）
 

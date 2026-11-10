@@ -1275,6 +1275,29 @@ mod real_hvf {
         );
         assert!(!err.contains("outcome=error"), "{err}");
         assert!(!err.contains("op=plugin.microvm.stop_all"), "{err}");
+        // #4437・MVM-5・REPAIR-4: stop の結果行に ` unmap_failures=0` が 0 件でも付く。
+        // microvm 本体の集約行 `op=hvf.microvm.stop ... unmap_failures=` と取り違えないよう、
+        // `op=plugin.microvm.stop outcome=` の行を起点に完全一致で照合する（adapter が None のままなら不一致）。
+        let line = err
+            .lines()
+            .find(|l| l.contains("op=plugin.microvm.stop outcome="))
+            .unwrap_or_else(|| panic!("no plugin stop line: {err}"));
+        let us = line
+            .split(" elapsed_us=")
+            .nth(1)
+            .and_then(|r| r.split(' ').next())
+            .unwrap_or_else(|| panic!("no elapsed_us: {line}"));
+        assert!(
+            !us.is_empty() && us.bytes().all(|b| b.is_ascii_digit()),
+            "{line}"
+        );
+        assert_eq!(
+            line,
+            format!(
+                "level=info op=plugin.microvm.stop outcome=ok elapsed_us={us} vms=0 unmap_failures=0"
+            ),
+            "{err}"
+        );
         assert_no_leak(&err, &dir, &kernel);
     }
 

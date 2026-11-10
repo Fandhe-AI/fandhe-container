@@ -226,14 +226,15 @@ pub(crate) fn registry_parts_in(
         FileStateStore::open(root)
             .map_err(|_| CriError::internal("cannot open the state store"))?,
     );
-    let launcher = Arc::new(crate::task_exec::ShimExecLauncher::production(
-        state_root,
-        Arc::clone(&state),
-    ));
-    let exec: Arc<dyn TaskExecLauncher> = Arc::new(StopHelpersOnDrop(Arc::clone(&launcher)));
     let mut runtime = core_runtime_for(Arc::clone(&state));
-    // 起動時の走査（#4280）の記録器は serve の core のものを共有する（shim の 1 プロセスで計数を 1 つに揃える）。
+    // 起動時の走査（#4280）と exec の起動役（pid 未着・インスタンス不一致の計数。#4379）は serve の core の記録器を共有する
+    // （shim の 1 プロセスで計数を 1 つに揃える）。`with_create_audit_sink` の再代入より前に Arc を取る。
     let sweep_recorder = Arc::clone(runtime.recorder());
+    let launcher = Arc::new(
+        crate::task_exec::ShimExecLauncher::production(state_root, Arc::clone(&state))
+            .with_recorder(Arc::clone(&sweep_recorder)),
+    );
+    let exec: Arc<dyn TaskExecLauncher> = Arc::new(StopHelpersOnDrop(Arc::clone(&launcher)));
     if let Some(sink) = ctx.audit_sink() {
         runtime = runtime.with_create_audit_sink(sink);
     }
@@ -827,6 +828,55 @@ mod tests {
             .expect("error");
         assert_eq!(after.message(), "exec launcher is stopped");
         assert_eq!(launcher.tracked_helpers(), 0);
+    }
+
+    /// REPAIR-4・CRI-5・#4379: 登録簿の exec 起動役はインスタンス不一致の拒否を自分の記録器へ数える
+    /// （serve の core と共有する記録器。既定の使い捨てではなく `with_recorder` で差されたもの）。
+    #[test]
+    fn repair4_4379_registry_launcher_counts_instance_mismatch() {
+        use fandhe_container_core::observability::OpName;
+        use fandhe_container_core::state_store::FileStateStore;
+        use fandhe_container_core::traits::{
+            ContainerId, ContainerStatus, CreateStateRequest, StateStore,
+        };
+        use fandhe_container_cri::shim_v2::exec::{ExecId, TaskExecLauncher, parse_process_spec};
+        use fandhe_container_cri::shim_v2::task_api::Any;
+
+        let guard = test_root::test_root("shim", "exec-mismatch-count");
+        let root = StateRoot::resolve(Some(guard.join("state"))).expect("state root");
+        let (_reg, launcher) =
+            registry_parts_in(root.clone(), ServeContext::new(ShutdownSignal::new(), None))
+                .expect("registry");
+        let store = FileStateStore::open(root).expect("open");
+        let id = ContainerId::new("c4379").expect("id");
+        let bundle = guard.join("bundle");
+        std::fs::create_dir_all(&bundle).expect("bundle");
+        store
+            .create(
+                &CreateStateRequest::new(ContainerStatus::created(id.clone(), None), bundle)
+                    .expect("req"),
+            )
+            .expect("create");
+        let spec = parse_process_spec(&Any {
+            type_url: fandhe_container_cri::shim_v2::exec::PROCESS_TYPE_URL.into(),
+            value: br#"{"cwd":"/","args":["/bin/true"]}"#.to_vec(),
+        })
+        .expect("spec");
+        let eid = ExecId::new("e1").expect("exec id");
+        // 記録は識別子を持つので、登録なし（None）は片側 None の不一致になる。
+        let e = launcher
+            .launch(&id, &eid, &spec, None)
+            .err()
+            .expect("mismatch");
+        assert_eq!(
+            e.message(),
+            fandhe_container_cri::streaming::exec::MSG_EXEC_INSTANCE_CHANGED
+        );
+        let stats = launcher
+            .recorder()
+            .snapshot_op(&OpName::new("shim_exec_instance_changed").expect("name"))
+            .expect("counted");
+        assert_eq!((stats.success(), stats.failure()), (0, 1));
     }
 }
 

@@ -1907,10 +1907,19 @@ mod tests {
     }
 
     fn stopped(f: &Fake, id: &str, code: Option<i32>) {
-        f.preset.lock().unwrap().insert(
-            id.into(),
+        stopped_status(
+            f,
+            id,
             ContainerStatus::stopped(RtId::new(id).unwrap(), code),
         );
+    }
+
+    /// 停止済みの状態を `preset` への 1 回の挿入で差し込む共通部（CRI-5・REPAIR-12・#4414）。
+    /// 偽の `state` は `preset` を優先して返すため、この挿入が watcher から見える唯一の切り替え点になる。
+    /// 時刻なしの Stopped を先に入れてから上書きする 2 段の更新は、`wait_exit` のポーリングが
+    /// 間に入ると `exited_at` なしの `TaskExit` を生むので作らない。
+    fn stopped_status(f: &Fake, id: &str, status: ContainerStatus) {
+        f.preset.lock().unwrap().insert(id.into(), status);
         f.states
             .lock()
             .unwrap()
@@ -2552,10 +2561,11 @@ mod tests {
     }
 
     /// 停止済みで core が終了検知時刻を記録していた状態を差し込む（#3682）。
+    /// 時刻なしの中間 Stopped を作らず 1 回の更新で差し込む（#4414）。
     fn stopped_with_time(f: &Fake, id: &str, code: Option<i32>, nanos: i64) {
-        stopped(f, id, code);
-        f.preset.lock().unwrap().insert(
-            id.into(),
+        stopped_status(
+            f,
+            id,
             ContainerStatus::stopped_at(
                 RtId::new(id).unwrap(),
                 code,

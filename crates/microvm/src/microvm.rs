@@ -485,11 +485,14 @@ impl GuestRam {
             RegisterMemslotError::Capability(e) => e,
             RegisterMemslotError::Ioctl(e) => classify_ram_error(RamStage::Register, e),
         })?;
+        // 登録に成功した mapping だけを VM の munmap 失敗件数に数える（失敗して捨てる mapping は数えない。#4382）。
+        let mut map = self.map;
+        map.set_unmap_tally(vm.unmap_tally());
         Ok(RegisteredGuestRam {
             vm: vm_fd,
             slot,
             flags,
-            map: Some(self.map),
+            map: Some(map),
         })
     }
 }
@@ -2057,6 +2060,9 @@ pub struct StopReport {
     /// ioeventfd の無視・解除失敗の件数（VM ごと。観測専用。#4161・MVM-1・REPAIR-4）。報告は最後のスレッドが共有部（全 `IoEventFd` の
     /// 解除）を落とした後に確定するので、解除失敗も含む最終値。
     pub ioevent: IoEventCounts,
+    /// munmap の失敗件数（VM ごと。観測専用。#4382・MVM-1・REPAIR-4）。最後のスレッドが共有部を落とした後の最終値。
+    /// map の失敗経路の munmap の失敗は VM が決まる前のため含まない（固定行だけで観測する）。
+    pub unmap_failures: u64,
 }
 
 /// 1 回の `run_once` の結果の分類（純粋関数 [`classify_run`] の戻り値）。
@@ -2606,6 +2612,36 @@ struct AggState {
     sender: Option<mpsc::Sender<StopReport>>,
 }
 
+/// 停止・解放完了の集約行（正常系・失敗終了）の本文を組み立てる純関数。`StopAggregate::complete_one` から呼ばれる。
+/// `unmap_failures` は munmap の失敗件数で、0 でも必ず出す（キーを省かない。#4382・MVM-1・REPAIR-4）。
+fn vcpus_stopped_log_line(
+    stop_reason: StopReason,
+    vcpus: u32,
+    stats: &RunStats,
+    unmap_failures: u64,
+    elapsed_us: u128,
+) -> String {
+    let (level, outcome, code) = match stop_reason {
+        StopReason::Failed(c) => ("error", "error", format!(" code={}", c.as_str())),
+        _ => ("info", "ok", String::new()),
+    };
+    format!(
+        "level={level} op=microvm.vcpus_stopped outcome={outcome} reason={}{code} vcpus={vcpus} runs={} exits={} errors={} unmap_failures={unmap_failures} elapsed_us={elapsed_us}",
+        stop_reason.as_str(),
+        stats.runs,
+        stats.exits,
+        stats.errors,
+    )
+}
+
+/// 異常終了（スレッドの panic の unwind）の集約行の本文。unwind で解放した分の munmap 失敗も見えるようにする。
+fn vcpus_stopped_abnormal_log_line(vcpus: u32, unmap_failures: u64) -> String {
+    format!(
+        "level=error op=microvm.vcpus_stopped outcome=error code={} vcpus={vcpus} unmap_failures={unmap_failures}",
+        MicrovmErrorCode::Internal.as_str(),
+    )
+}
+
 /// 全 vCPU スレッドの終了を 1 つの [`StopReport`] に集約する（#3738・MVM-1・REPAIR-5）。
 ///
 /// 全スレッドが同じ `Arc<StopSignal>` を共有するので、1 台が `Requested` 以外で終わったら `stop.request()` で全台を止める
@@ -2618,6 +2654,8 @@ struct StopAggregate {
     vcpu_count: u32,
     /// ioeventfd の件数。報告の確定時（全 body の drop 後。`AggState` の mutex 経由で他スレッドの加算が見える）に写しを取る（#4161）。
     ioevent: Arc<IoEventTally>,
+    /// munmap の失敗件数。`ioevent` と同じく確定時に読む（#4382）。
+    unmap: Arc<sys::UnmapTally>,
 }
 
 fn add_stats(a: &mut RunStats, b: &RunStats) {
@@ -2668,9 +2706,8 @@ impl StopAggregate {
         };
         if abnormal {
             log_line(format_args!(
-                "level=error op=microvm.vcpus_stopped outcome=error code={} vcpus={}",
-                MicrovmErrorCode::Internal.as_str(),
-                self.vcpu_count
+                "{}",
+                vcpus_stopped_abnormal_log_line(self.vcpu_count, self.unmap.count())
             ));
             self.exit.mark_abnormal_if_running();
             drop(sender);
@@ -2685,18 +2722,16 @@ impl StopAggregate {
             stats.errors = 1;
         }
         let elapsed = self.started.elapsed();
-        let (level, outcome, code) = match stop_reason {
-            StopReason::Failed(c) => ("error", "error", format!(" code={}", c.as_str())),
-            _ => ("info", "ok", String::new()),
-        };
+        let unmap_failures = self.unmap.count();
         log_line(format_args!(
-            "level={level} op=microvm.vcpus_stopped outcome={outcome} reason={}{code} vcpus={} runs={} exits={} errors={} elapsed_us={}",
-            stop_reason.as_str(),
-            self.vcpu_count,
-            stats.runs,
-            stats.exits,
-            stats.errors,
-            elapsed.as_micros()
+            "{}",
+            vcpus_stopped_log_line(
+                stop_reason,
+                self.vcpu_count,
+                &stats,
+                unmap_failures,
+                elapsed.as_micros()
+            )
         ));
         let report = StopReport {
             reason: stop_reason,
@@ -2705,6 +2740,7 @@ impl StopAggregate {
             vcpu_count: self.vcpu_count,
             origin_vcpu,
             ioevent: self.ioevent.snapshot(),
+            unmap_failures,
         };
         self.exit.complete(report);
         // 受け手（RunningMicroVm）が既に無ければ送信は失敗するが、解放は済んでいるので捨てる。
@@ -2900,7 +2936,7 @@ fn spawn_loops<T: VcpuLoopBody>(
     started: Instant,
     serial: SerialConsole,
 ) -> Result<RunningMicroVm, MicrovmError> {
-    spawn_loops_observed(bodies, aux, started, serial, Arc::default())
+    spawn_loops_observed(bodies, aux, started, serial, Arc::default(), Arc::default())
 }
 
 /// [`spawn_loops_gated`] を本番のゲート待ち上限と実スレッド生成で呼ぶ本番の入口。`ioevent` は VM ごとの件数（`start_inner` が渡す。#4161）。
@@ -2910,6 +2946,7 @@ fn spawn_loops_observed<T: VcpuLoopBody>(
     started: Instant,
     serial: SerialConsole,
     ioevent: Arc<IoEventTally>,
+    unmap: Arc<sys::UnmapTally>,
 ) -> Result<RunningMicroVm, MicrovmError> {
     spawn_loops_gated(
         bodies,
@@ -2917,6 +2954,7 @@ fn spawn_loops_observed<T: VcpuLoopBody>(
         started,
         serial,
         ioevent,
+        unmap,
         START_GATE_WAIT,
         |name, job| thread::Builder::new().name(name).spawn(job),
     )
@@ -2939,6 +2977,7 @@ where
         Vec::new(),
         started,
         serial,
+        Arc::default(),
         Arc::default(),
         START_GATE_WAIT,
         spawn,
@@ -2964,6 +3003,7 @@ where
         started,
         serial,
         Arc::default(),
+        Arc::default(),
         START_GATE_WAIT,
         spawn,
     )
@@ -2976,12 +3016,14 @@ where
 ///
 /// 数を検証してから確保する。k 本目の生成が失敗したら、全台へ停止を要求し、生成済みを 1 つの期限（[`DROP_STOP_WAIT`]）で
 /// 回収してから失敗を返す。未生成の `body` と失敗した job は drop される（fd・mmap は解放される。#887）。
+#[allow(clippy::too_many_arguments)] // 件数の集約先（ioevent・unmap）は VM ごとの観測値で、束ねる型を増やさない。
 fn spawn_loops_gated<T, S>(
     bodies: Vec<T>,
     aux: Vec<AuxThread>,
     started: Instant,
     serial: SerialConsole,
     ioevent: Arc<IoEventTally>,
+    unmap: Arc<sys::UnmapTally>,
     gate_wait: Duration,
     mut spawn: S,
 ) -> Result<RunningMicroVm, MicrovmError>
@@ -3006,6 +3048,7 @@ where
         started,
         vcpu_count: count,
         ioevent: Arc::clone(&ioevent),
+        unmap,
     });
     let gate = Arc::new(StartGate::new(gate_wait));
     let mut release = GateRelease {
@@ -3427,6 +3470,8 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
             ..
         } = self;
         let has_net = !devices.net.is_empty();
+        // 分解して `vm` を共有部へ移す前に、munmap 失敗件数の集約先を取る（#4382）。
+        let unmap_tally = vm.unmap_tally();
         // ioeventfd の通知スレッドが待つ対象（結んだ全キュー）。QueueNotify は VM exit しなくなるため、待つ側は必ず起動する（#3698）。
         let ioevents: Vec<(DeviceId, u16, Arc<IoEventFd>)> = devices
             .notifiers()
@@ -3465,7 +3510,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
             });
         }
         drop(shared);
-        spawn_loops_observed(workers, aux, started, serial, ioevent_tally)
+        spawn_loops_observed(workers, aux, started, serial, ioevent_tally, unmap_tally)
     }
 }
 
@@ -3957,6 +4002,7 @@ mod lifecycle_tests {
             vcpu_count: 1,
             origin_vcpu: None,
             ioevent: IoEventCounts::default(),
+            unmap_failures: 0,
         };
         cell.complete(report);
         cell.mark_abnormal_if_running();
@@ -4297,6 +4343,7 @@ mod lifecycle_tests {
             Vec::new(),
             Instant::now(),
             SerialConsole::new(),
+            Arc::default(),
             Arc::default(),
             Duration::from_millis(100),
             |name: String, job: VcpuJob| {
@@ -6270,6 +6317,7 @@ mod ioevent_tests {
             Instant::now(),
             SerialConsole::new(),
             Arc::clone(&tally),
+            Arc::default(),
         )
         .unwrap();
         a.ev.signal().unwrap();
@@ -6282,6 +6330,85 @@ mod ioevent_tests {
         let report = running.stop(Duration::from_secs(5)).unwrap();
         assert_eq!(report.ioevent, IoEventCounts::new(2, 1));
         assert_eq!(shared.lock().unwrap().calls.len(), 2);
+    }
+
+    /// munmap の失敗を drop で数える偽の body（実 munmap を起こさず、件数が報告まで届く経路だけを見る）。
+    struct UnmapFailing {
+        fail: bool,
+        tally: Arc<sys::UnmapTally>,
+    }
+
+    impl VcpuLoopBody for UnmapFailing {
+        fn step(&mut self, _slice: Duration, stop: &StopSignal) -> LoopStep {
+            stop.wait_requested(Duration::from_millis(20));
+            LoopStep::Continue
+        }
+        fn stats(&self) -> RunStats {
+            RunStats::default()
+        }
+    }
+
+    impl Drop for UnmapFailing {
+        fn drop(&mut self) {
+            if self.fail {
+                self.tally.record_failure();
+            }
+        }
+    }
+
+    /// MVM-1・REPAIR-4・#4382: 解放で数えた munmap の失敗が `StopReport::unmap_failures` に届く（失敗なしの対照は 0）。
+    #[test]
+    fn mvm1_4382_unmap_failures_reach_stop_report() {
+        for (fail, expected) in [(true, 1u64), (false, 0u64)] {
+            let tally = Arc::new(sys::UnmapTally::default());
+            let running = spawn_loops_observed(
+                vec![UnmapFailing {
+                    fail,
+                    tally: Arc::clone(&tally),
+                }],
+                Vec::new(),
+                Instant::now(),
+                SerialConsole::new(),
+                Arc::default(),
+                Arc::clone(&tally),
+            )
+            .unwrap();
+            let report = running.stop(Duration::from_secs(5)).unwrap();
+            assert_eq!(report.unmap_failures, expected);
+        }
+    }
+
+    /// MVM-1・REPAIR-4・#4382: 集約行は `unmap_failures=` を errors の後・elapsed_us の前に具体値で出す（0 でも省かない）。
+    #[test]
+    fn mvm1_4382_vcpus_stopped_line_carries_unmap_failures() {
+        let stats = RunStats {
+            runs: 10,
+            exits: 7,
+            errors: 0,
+            ..RunStats::default()
+        };
+        assert_eq!(
+            vcpus_stopped_log_line(StopReason::Requested, 2, &stats, 1, 42),
+            "level=info op=microvm.vcpus_stopped outcome=ok reason=requested vcpus=2 runs=10 exits=7 errors=0 unmap_failures=1 elapsed_us=42"
+        );
+        assert!(
+            vcpus_stopped_log_line(StopReason::Requested, 2, &stats, 0, 42)
+                .contains(" errors=0 unmap_failures=0 elapsed_us=42")
+        );
+        let failed = vcpus_stopped_log_line(
+            StopReason::Failed(MicrovmErrorCode::Internal),
+            1,
+            &stats,
+            3,
+            5,
+        );
+        assert!(failed.starts_with("level=error op=microvm.vcpus_stopped outcome=error reason="));
+        assert!(failed.contains(" code=INTERNAL vcpus=1 "));
+        assert!(failed.ends_with(" unmap_failures=3 elapsed_us=5"));
+        assert_eq!(
+            vcpus_stopped_abnormal_log_line(2, 1),
+            "level=error op=microvm.vcpus_stopped outcome=error code=INTERNAL vcpus=2 unmap_failures=1"
+        );
     }
 
     /// MVM-1・REPAIR-4・#4161: signal せずに起こされた（`take() == 0`）場合は無視として数えない。

@@ -117,6 +117,8 @@ pub struct VmFd {
     fd: OwnedFd,
     /// `KVM_GET_VCPU_MMAP_SIZE` の検証済みの値（`create_vcpu` の `kvm_run` の mmap に使う）。
     vcpu_mmap_size: usize,
+    /// この VM の `kvm_run` / ゲスト RAM の munmap 失敗件数（停止・解放の集約行の `unmap_failures=`。#4382・MVM-1・REPAIR-4）。
+    unmap_tally: Arc<sys::UnmapTally>,
 }
 
 /// `KVM_CREATE_DEVICE` で得た aarch64 の vGICv3 の device fd（MVM-1・#3696）。drop で close され、KVM がデバイスを破棄する。
@@ -2120,7 +2122,7 @@ impl VmFd {
             sys::kvm_arm_vcpu_init(fd.as_fd(), &init)
                 .map_err(|e| classify_vcpu_error(VcpuStage::VcpuInit, e))?;
         }
-        let run = sys::KvmRunMap::map(fd.as_fd(), self.vcpu_mmap_size)
+        let run = sys::KvmRunMap::map(fd.as_fd(), self.vcpu_mmap_size, Some(self.unmap_tally()))
             .map_err(|e| classify_vcpu_error(VcpuStage::Mmap, e))?;
         Ok(VcpuFd {
             watchdog: None,
@@ -2131,6 +2133,13 @@ impl VmFd {
             stats: RunStats::default(),
             observer: None,
         })
+    }
+}
+
+impl VmFd {
+    /// この VM の munmap 失敗件数の集約先（`kvm_run` / ゲスト RAM の mapping と `StopAggregate` が共有する。#4382）。
+    pub(crate) fn unmap_tally(&self) -> Arc<sys::UnmapTally> {
+        Arc::clone(&self.unmap_tally)
     }
 }
 
@@ -2316,6 +2325,7 @@ impl KvmDevice {
                 Ok(VmFd {
                     fd,
                     vcpu_mmap_size: validate_mmap_size(n)?,
+                    unmap_tally: Arc::default(),
                 })
             })
     }
@@ -3254,6 +3264,7 @@ mod tests {
         let vm = VmFd {
             fd: OwnedFd::from(f),
             vcpu_mmap_size: 4096 * 3,
+            unmap_tally: Arc::default(),
         };
         let e = vm.create_vcpu(0).unwrap_err();
         assert_eq!(e.code(), MicrovmErrorCode::FailedPrecondition);
@@ -3524,6 +3535,7 @@ mod tests {
         let vm = VmFd {
             fd: OwnedFd::from(f),
             vcpu_mmap_size: 4096 * 3,
+            unmap_tally: Arc::default(),
         };
         #[cfg(target_arch = "x86_64")]
         assert_eq!(

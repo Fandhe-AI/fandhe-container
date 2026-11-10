@@ -190,15 +190,15 @@ use crate::traits::{
 use std::time::Instant;
 
 /// [`OpRecorder`] に記録する操作名（REPAIR-4）。
-const DELETE_OP_NAME: &str = "delete";
+pub(super) const DELETE_OP_NAME: &str = "delete";
 
 /// core が作った rootfs の削除の操作名（REPAIR-4。OCI-7・#2378）。
-const IMAGE_ROOTFS_REMOVE_OP_NAME: &str = "image_rootfs_remove";
+pub(super) const IMAGE_ROOTFS_REMOVE_OP_NAME: &str = "image_rootfs_remove";
 
 /// 参照解除の操作名（REPAIR-4）。
-const IMAGE_REF_RELEASE_OP_NAME: &str = "image_ref_release";
+pub(super) const IMAGE_REF_RELEASE_OP_NAME: &str = "image_ref_release";
 /// 参照の登録世代の読み取りの操作名（REPAIR-4）。
-const IMAGE_REF_LOOKUP_OP_NAME: &str = "image_ref_lookup";
+pub(super) const IMAGE_REF_LOOKUP_OP_NAME: &str = "image_ref_lookup";
 
 /// [`ContainerCgroupRemover::remove`] の結果（将来の拡張に備え非網羅）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -105,14 +105,14 @@ const ORPHAN_SCAN_MAX_PAGES: usize = 200;
 const ORPHAN_SCAN_PAGE_SIZE: u32 = 500;
 
 /// 公開済みの孤児の回収の操作名（REPAIR-4・#2540）。
-const IMAGE_ROOTFS_ORPHAN_REAP_OP_NAME: &str = "image_rootfs_orphan_reap";
+pub(super) const IMAGE_ROOTFS_ORPHAN_REAP_OP_NAME: &str = "image_rootfs_orphan_reap";
 /// 展開途中の木の回収の結果の内訳を 1 件ずつ失敗として記録する操作名（REPAIR-4・#2540）。
 /// `OpRecorder::snapshot` の失敗数が、残した木の件数として読める。
-const REAP_KEPT_UNVERIFIED_OP_NAME: &str = "image_rootfs_reap_kept_unverified";
-const REAP_FAILED_OP_NAME: &str = "image_rootfs_reap_failed";
-const REAP_TRUNCATED_OP_NAME: &str = "image_rootfs_reap_truncated";
-const REAP_SCAN_FAILED_OP_NAME: &str = "image_rootfs_reap_scan_failed";
-const IMAGE_ROOTFS_REAP_OP_NAME: &str = "image_rootfs_reap";
+pub(super) const REAP_KEPT_UNVERIFIED_OP_NAME: &str = "image_rootfs_reap_kept_unverified";
+pub(super) const REAP_FAILED_OP_NAME: &str = "image_rootfs_reap_failed";
+pub(super) const REAP_TRUNCATED_OP_NAME: &str = "image_rootfs_reap_truncated";
+pub(super) const REAP_SCAN_FAILED_OP_NAME: &str = "image_rootfs_reap_scan_failed";
+pub(super) const IMAGE_ROOTFS_REAP_OP_NAME: &str = "image_rootfs_reap";
 
 /// 後始末で権限を補正しながら辿る項目数の上限（無制限の走査を避ける。展開側の既定上限と同程度）。
 #[cfg(target_os = "linux")]

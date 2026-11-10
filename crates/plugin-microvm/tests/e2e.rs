@@ -22,7 +22,8 @@
 //! shutdown を期待する負の対照は、停止要求と shutdown exit のどちらが先に観測されるかが競合し、
 //! 寛容な assert になるため置かない。Linux aarch64 の層 B は、ネイティブ arm64 の CI が無く（#2274）型検査のみ
 //! `cross-target-check` の `aarch64-unknown-linux-gnu` が担い、実機での実行は人間担当の #3781。
-//! KVM の stop の結果行（`ignored=`・`unbind_failed=`・`unmap_failures=`）は `check_kvm_stop_line` で完全一致照合する（#4456）。
+//! KVM の stop の結果行（`ignored=`・`unbind_failed=`・`unmap_failures=`・`mmio_ignored=`）は `check_kvm_stop_line` で完全一致照合する（#4456・#4465）。
+//! adapter が組み立てた KVM 形の行は既定集合の試験でも同じ関数に通す（#4465）。
 //! 待ちはすべて期限つきで、超過時は kill して失敗にする（REPAIR-5）。
 #![cfg(unix)]
 
@@ -89,7 +90,12 @@ impl Drop for TempDir {
 /// 実機前提の `real_kvm` / `real_kvm_arm64` の stop 試験が、plugin バイナリの stderr 全体を渡して呼ぶ。
 /// 起点は `op=plugin.microvm.stop outcome=` を含む行で、ちょうど 1 行だけを選ぶ（`stop_all` や microvm 本体の
 /// `unmap_failures=` を持つ行を取り違えないため）。`elapsed_us` と `ignored`（ゲストの通知の時機で変わる）は
-/// 数字であることだけを見て、残りは `vms=0 unbind_failed=0 unmap_failures=0` をこの順で完全一致させる。
+/// 数字であることだけを見て、残りは `vms=0 unbind_failed=0 unmap_failures=0 mmio_ignored=0` をこの順で完全一致させる。
+///
+/// 現行の adapter の KVM 変換（`vm_unmap_failures: None`・`mmio_ignored: Some(..)`。#4459）に合わせた形で、
+/// ` vm_unmap_failures=`（HVF の項目）は付かない。`mmio_ignored` を 0 固定にするのは、`KvmBackend` が block / net を
+/// 付けないため `VirtioMmioTransport` が無く `QUEUE_NOTIFY` の無視を数える経路が無く、合成ゲストも MMIO を叩かないため
+/// （構成が変わったか計数が退行したときに検出する。#4465）。
 fn check_kvm_stop_line(err: &str) -> Result<(), String> {
     const ANCHOR: &str = "op=plugin.microvm.stop outcome=";
     let lines: Vec<&str> = err.lines().filter(|l| l.contains(ANCHOR)).collect();
@@ -113,7 +119,7 @@ fn check_kvm_stop_line(err: &str) -> Result<(), String> {
     let us = number(" elapsed_us=")?;
     let ig = number(" ignored=")?;
     let expected = format!(
-        "level=info op=plugin.microvm.stop outcome=ok elapsed_us={us} vms=0 ignored={ig} unbind_failed=0 unmap_failures=0"
+        "level=info op=plugin.microvm.stop outcome=ok elapsed_us={us} vms=0 ignored={ig} unbind_failed=0 unmap_failures=0 mmio_ignored=0"
     );
     if line == expected {
         Ok(())
@@ -197,6 +203,8 @@ mod mock_core {
         pub stop_ioevent: Option<fandhe_container_microvm::interrupt::IoEventCounts>,
         /// 設定すると成功した stop がこの munmap 失敗件数を返す（`stop_all` の合算の経路。#4438）。
         pub stop_unmap: Option<u64>,
+        /// 設定すると成功した stop がこの MMIO 経路の無視件数を返す（結果行の ` mmio_ignored=` の経路。#4459・#4465）。
+        pub stop_mmio: Option<u64>,
     }
 
     /// 起動・停止の引数を記録する偽バックエンド（adapter の `#[cfg(test)]` 版は非公開のため独自に持つ）。
@@ -235,7 +243,7 @@ mod mock_core {
                     ioevent: r.stop_ioevent,
                     unmap_failures: r.stop_unmap,
                     vm_unmap_failures: None,
-                    mmio_ignored: None,
+                    mmio_ignored: r.stop_mmio,
                 }),
             }
         }
@@ -546,11 +554,11 @@ const IOEVENT_CHILD_ENV: &str = "FANDHE_E2E_IOEVENT_CHILD";
 /// `check_kvm_stop_line` の組み立てを偽の行で固定する（実機なしで動く。MVM-1・REPAIR-4・REPAIR-12・#4456）。
 #[test]
 fn mvm1_repair12_4456_kvm_stop_line_check_accepts_and_rejects_fixed_lines() {
-    const OK: &str = "level=info op=plugin.microvm.stop outcome=ok elapsed_us=123 vms=0 ignored=0 unbind_failed=0 unmap_failures=0";
+    const OK: &str = "level=info op=plugin.microvm.stop outcome=ok elapsed_us=123 vms=0 ignored=0 unbind_failed=0 unmap_failures=0 mmio_ignored=0";
     let decoys = "level=info op=plugin.microvm.start outcome=ok elapsed_us=5 vms=1\nlevel=info op=microvm.vcpus_stopped reason=requested unmap_failures=0\n";
     assert_eq!(check_kvm_stop_line(&format!("{decoys}{OK}\n")), Ok(()));
     assert_eq!(
-        check_kvm_stop_line(&OK.replace("ignored=0", "ignored=7")),
+        check_kvm_stop_line(&OK.replace(" ignored=0", " ignored=7")),
         Ok(())
     );
 
@@ -577,19 +585,36 @@ fn mvm1_repair12_4456_kvm_stop_line_check_accepts_and_rejects_fixed_lines() {
         "level=info op=plugin.microvm.stop outcome=ok elapsed_us=1 vms=0 ignored=2 unbind_failed=1",
         "unexpected stop line",
     );
+    // HVF の現行形（#4455・#4459。ignored= が無い）。
+    rejected(
+        "level=info op=plugin.microvm.stop outcome=ok elapsed_us=1 vms=0 unmap_failures=0 vm_unmap_failures=0 mmio_ignored=0",
+        "non-numeric  ignored=",
+    );
     for bad in [
-        "ignored=0 unbind_failed=0 unmap_failures=0|unbind_failed=0 ignored=0 unmap_failures=0",
-        "ignored=0 unbind_failed=0 unmap_failures=0|ignored=0 unmap_failures=0 unbind_failed=0",
-        "ignored=0 unbind_failed=0 unmap_failures=0|ignored=0 unbind_failed=1 unmap_failures=0",
-        "ignored=0 unbind_failed=0 unmap_failures=0|ignored=0 unbind_failed=0 unmap_failures=1",
-        "ignored=0 unbind_failed=0 unmap_failures=0|ignored=0 unbind_failed=0 unmap_failures=0 extra=1",
+        "ignored=0 unbind_failed=0 unmap_failures=0 mmio_ignored=0|unbind_failed=0 ignored=0 unmap_failures=0 mmio_ignored=0",
+        "ignored=0 unbind_failed=0 unmap_failures=0 mmio_ignored=0|ignored=0 unmap_failures=0 unbind_failed=0 mmio_ignored=0",
+        "ignored=0 unbind_failed=0 unmap_failures=0 mmio_ignored=0|ignored=0 unbind_failed=1 unmap_failures=0 mmio_ignored=0",
+        "ignored=0 unbind_failed=0 unmap_failures=0 mmio_ignored=0|ignored=0 unbind_failed=0 unmap_failures=1 mmio_ignored=0",
+        // #4465: mmio_ignored= の欠落（#4456 の旧形）・固定 0 以外・数字でない値・余り・順序・HVF 項目の混入。
+        "ignored=0 unbind_failed=0 unmap_failures=0 mmio_ignored=0|ignored=0 unbind_failed=0 unmap_failures=0",
+        "mmio_ignored=0|mmio_ignored=1",
+        "mmio_ignored=0|mmio_ignored=x",
+        "mmio_ignored=0|mmio_ignored=",
+        "mmio_ignored=0|mmio_ignored=-1",
+        "mmio_ignored=0|mmio_ignored=0 extra=1",
+        "unmap_failures=0 mmio_ignored=0|mmio_ignored=0 unmap_failures=0",
+        "unmap_failures=0 mmio_ignored=0|unmap_failures=0 vm_unmap_failures=0 mmio_ignored=0",
+        "ignored=0 unbind_failed=0 unmap_failures=0 mmio_ignored=0|ignored=0 unbind_failed=0 unmap_failures=0 mmio_ignored=0 extra=1",
         "vms=0|vms=1",
     ] {
         let (from, to) = bad.split_once('|').expect("pair");
         rejected(&OK.replace(from, to), "unexpected stop line");
     }
     for bad in ["ignored=", "ignored=x", "ignored=-1"] {
-        rejected(&OK.replace("ignored=0", bad), "non-numeric  ignored=");
+        rejected(
+            &OK.replace(" ignored=0", &format!(" {bad}")),
+            "non-numeric  ignored=",
+        );
     }
     for bad in ["elapsed_us=", "elapsed_us=abc"] {
         rejected(
@@ -672,6 +697,83 @@ fn mvm1_repair4_4161_stop_log_carries_ioevent_counts_via_uds() {
     assert!(
         stop_line.ends_with(" vms=0 ignored=2 unbind_failed=1"),
         "{stop_line}"
+    );
+}
+
+/// MVM-1・REPAIR-4・REPAIR-12・#4465: adapter が KVM 形（`vm_unmap_failures: None`・`mmio_ignored: Some(0)`）で
+/// 実際に組み立てた stop の結果行が、実機試験と同じ `check_kvm_stop_line` を通る。固定行では adapter の形の変化
+/// （`count_suffix` の順序・キー・`Some`/`None` の出し分け）を検出できないため、本物の出力を既定集合で照合する。
+/// `stop_mmio = None`（#4459 より前の形）の陰性対照も同じ仕組みで確かめる。
+///
+/// 残余: 偽 backend の値は `KvmBackend::stop` の変換と手で揃えており、その写像の変更には追従しない
+/// （そちらは実機の層 B・#3781 が検出する）。結果行は stderr へ直接書かれるため、自身を子プロセスで再実行して集める。
+#[test]
+fn mvm1_repair12_4465_adapter_kvm_shaped_stop_line_passes_kvm_stop_line_check() {
+    use fandhe_container_microvm::interrupt::IoEventCounts;
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+
+    const NAME: &str = "mvm1_repair12_4465_adapter_kvm_shaped_stop_line_passes_kvm_stop_line_check";
+    const MODE_ENV: &str = "FANDHE_E2E_KVM_STOP_LINE_CHILD";
+
+    if let Some(mode) = std::env::var_os(MODE_ENV) {
+        // 子: KVM 形（mode=full）または #4459 より前の形（mode=legacy）の台本で start → stop を通す。
+        let mut e = mock_core::E2e::start();
+        {
+            let mut r = e.record.lock().expect("lock");
+            r.stop_ioevent = Some(IoEventCounts::new(2, 0));
+            r.stop_unmap = Some(0);
+            r.stop_mmio = if mode == "legacy" { None } else { Some(0) };
+        }
+        let kernel = e.dir.file("k.bin", KERNEL);
+        let start = s(&["start", "vm1", &kernel, "", "", "1", "64"]);
+        assert_eq!(expect_ok(call(&mut e.stream, 1, start), 1), s(&["running"]));
+        assert_eq!(
+            expect_ok(call(&mut e.stream, 2, s(&["stop", "vm1"])), 2),
+            s(&["stopped", "requested"])
+        );
+        let _ = e.finish();
+        return;
+    }
+
+    let run_child = |mode: &str| -> String {
+        let exe = std::env::current_exe().expect("current_exe");
+        let mut child = Command::new(exe)
+            .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+            .env(MODE_ENV, mode)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn child");
+        let begin = Instant::now();
+        let status = loop {
+            if let Some(st) = child.try_wait().expect("try_wait") {
+                break st;
+            }
+            if begin.elapsed() > Duration::from_secs(60) {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("child did not finish within deadline");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let mut err = String::new();
+        if let Some(mut se) = child.stderr.take() {
+            let _ = se.read_to_string(&mut err);
+        }
+        assert!(status.success(), "child failed: {status:?}\n{err}");
+        err
+    };
+
+    let err = run_child("full");
+    assert_eq!(check_kvm_stop_line(&err), Ok(()), "{err}");
+    let err = run_child("legacy");
+    let r = check_kvm_stop_line(&err);
+    assert!(
+        matches!(&r, Err(m) if m.starts_with("unexpected stop line")),
+        "{r:?}\n{err}"
     );
 }
 
@@ -1189,7 +1291,7 @@ mod real_kvm {
         );
         assert!(!err.contains("outcome=error"), "{err}");
         assert!(!err.contains("op=plugin.microvm.stop_all"), "{err}");
-        // #4456・MVM-1・REPAIR-4: 本物の KvmBackend の stop の結果行は ignored= / unbind_failed= / unmap_failures= をこの順で必ず持つ。
+        // #4456・MVM-1・REPAIR-4: 本物の KvmBackend の stop の結果行は ignored= / unbind_failed= / unmap_failures= / mmio_ignored= をこの順で必ず持つ（#4465）。
         if let Err(why) = check_kvm_stop_line(&err) {
             panic!("{why}\n{err}");
         }
@@ -1322,7 +1424,7 @@ mod real_kvm_arm64 {
         );
         assert!(!err.contains("outcome=error"), "{err}");
         assert!(!err.contains("op=plugin.microvm.stop_all"), "{err}");
-        // #4456・MVM-1・REPAIR-4: 本物の KvmBackend の stop の結果行は ignored= / unbind_failed= / unmap_failures= をこの順で必ず持つ。
+        // #4456・MVM-1・REPAIR-4: 本物の KvmBackend の stop の結果行は ignored= / unbind_failed= / unmap_failures= / mmio_ignored= をこの順で必ず持つ（#4465）。
         if let Err(why) = check_kvm_stop_line(&err) {
             panic!("{why}\n{err}");
         }

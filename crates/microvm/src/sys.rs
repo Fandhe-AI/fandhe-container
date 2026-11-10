@@ -3501,24 +3501,69 @@ mod tests {
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn mvm1_4382_madvise_failure_rollback_success_emits_no_line() {
-        let m = std::mem::ManuallyDrop::new(GuestRamMap::map(8192).unwrap());
-        let p = m.ptr.as_ptr();
-        let len = m.len;
-        let needle = format!("{:x}-", p as usize);
-        let present = || {
-            std::fs::read_to_string("/proc/self/maps")
-                .unwrap()
-                .lines()
-                .any(|l| l.starts_with(&needle))
-        };
-        assert!(present());
-        // SAFETY: `p` / `len` は上の mmap の領域で、`ManuallyDrop` により他に所有者がいない。
-        let (res, lines) = crate::hvf_loop::capture_log_lines(|| unsafe {
-            finish_guest_ram_map(p.cast::<c_void>(), len, |_, _, _| Err(SysError::Os(99)))
-        });
-        assert!(matches!(res, Err(SysError::Os(99))));
-        assert_eq!(lines, Vec::<String>::new());
-        assert!(!present());
+        // `/proc/self/maps` のアドレス照合は、並列の別試験が解放直後の同じアドレスへ mmap すると誤る（#4412・REPAIR-12）。
+        // そこで PROT_NONE の予約の中へ MAP_FIXED で置き、巻き戻しの後に同じアドレスへ MAP_FIXED_NOREPLACE で
+        // 置き直せること（解放済み）で確かめる。解放した穴は他スレッドの mmap が拾いうるため、
+        // (1) 後始末で munmap するのは自分の予約の両端だけで、穴は置き直せた時だけ解除する（他スレッドの領域を巻き込まない）、
+        // (2) 穴を他スレッドに取られて置き直せなかった場合に備え、新しい予約で最大 ATTEMPTS 回やり直す。
+        //     本当に解放されない不具合なら毎回失敗するので、1 回も成功しなければ失敗にする。
+        // libc との機械照合は microvm に未導入（#3664・#3290）。定数は Linux の x86_64・aarch64 共通の ABI 値。
+        const PROT_NONE: i32 = 0;
+        const MAP_FIXED: i32 = 0x10;
+        const MAP_FIXED_NOREPLACE: i32 = 0x0010_0000;
+        const ATTEMPTS: usize = 16;
+        // ホストのページサイズ（4 KiB・16 KiB・64 KiB）に合わせて、オフセット・長さ・予約をページ単位で計算する。
+        let page = usize::try_from(host_page_size().unwrap()).unwrap();
+        let len = 2 * page;
+        let reserve = 64 * page;
+        let anon = consts::MAP_PRIVATE | consts::MAP_ANONYMOUS | consts::MAP_NORESERVE;
+        let mut released = false;
+        for _ in 0..ATTEMPTS {
+            // SAFETY: 新規の匿名マッピングで既存領域に触れない。戻り値は失敗値（-1）と比較してから使う。
+            let base = unsafe { mmap(std::ptr::null_mut(), reserve, PROT_NONE, anon, -1, 0) };
+            assert_ne!(base as isize, -1, "reserve failed");
+            let p = base.wrapping_byte_add(page);
+            // SAFETY: `p..p+len` は上の予約の内側で、MAP_FIXED が置き換えるのは自分の予約だけ。
+            let got = unsafe {
+                mmap(
+                    p,
+                    len,
+                    consts::PROT_READ | consts::PROT_WRITE,
+                    anon | MAP_FIXED,
+                    -1,
+                    0,
+                )
+            };
+            assert_eq!(got, p);
+            // 陽性対照: 使用中の範囲への NOREPLACE は置けない。
+            // SAFETY: NOREPLACE は既存の領域を置き換えず失敗するだけ。
+            let busy = unsafe { mmap(p, len, PROT_NONE, anon | MAP_FIXED_NOREPLACE, -1, 0) };
+            assert_eq!(busy as isize, -1);
+            // SAFETY: `p` / `len` は上の mmap の領域で、この試験の他に所有者がいない。
+            let (res, lines) = crate::hvf_loop::capture_log_lines(|| unsafe {
+                finish_guest_ram_map(p, len, |_, _, _| Err(SysError::Os(99)))
+            });
+            assert!(matches!(res, Err(SysError::Os(99))));
+            assert_eq!(lines, Vec::<String>::new());
+            // SAFETY: 解放済みなら同じアドレスへ置き直せる。置けなければ何も変わらない。
+            let again = unsafe { mmap(p, len, PROT_NONE, anon | MAP_FIXED_NOREPLACE, -1, 0) };
+            // SAFETY: 前後の予約 `base..p` と `p+len..base+reserve` は PROT_NONE の自分の予約で、他に所有者がいない。
+            let (head, tail) = unsafe {
+                (
+                    munmap(base, page),
+                    munmap(p.wrapping_byte_add(len), reserve - page - len),
+                )
+            };
+            assert_eq!((head, tail), (0, 0));
+            if again == p {
+                // SAFETY: NOREPLACE で自分が置いた領域。
+                assert_eq!(unsafe { munmap(p, len) }, 0);
+                released = true;
+                break;
+            }
+            // 穴は他スレッドに取られた可能性があるため、解除せずやり直す（他の領域を壊さない）。
+        }
+        assert!(released, "region was not released by the rollback");
     }
 
     /// MVM-1・REPAIR-4・#4382: drop の munmap 失敗は VM ごとの tally に 1 件数える。成功の drop は数えない。

@@ -48,7 +48,14 @@
 //! - tty（`--tty`。#4416）: helper は引数 `--tty` を受け、stdio の fd を受けずに（`--stdio 0`。併用は `InvalidArgument`）
 //!   exec の `ExecLaunchIo::pty` を渡す。worker が再適用の後にコンテナの devpts で pty を割り当て、親の応答者の刻みで受けた
 //!   master を channel の `PtyMaster` で要求元へ送る。送信順は `Started` → `PtyMaster` → `Spawned` → `SignalAck` → `Result`
-//!   で、master を送れなかった exec は `Spawned` を送らず `Result` の失敗で終える（段 `helper_pty_master`・`helper_pty_master_send`）。
+//!   で、master を送れなかった exec は `Spawned` を送らず `Result` の失敗で終える。診断行の段の意味（#4446・REPAIR-4）:
+//!   - `helper_pty_master`: exec 層から受け渡しの失敗が通知された（受信の検証で拒否・期限切れ・未知の受信結果・master を
+//!     渡さずに worker が成功）、または tty なのに master を送れないままコマンドの結果だけが届いた。分類は `Result` の
+//!     `Failed(code)` と同じ（例: master でない fd は `INVALID_ARGUMENT`）。残る窓: 拒否の通知の後に worker 自身の失敗
+//!     （違反・期限切れ）が返った場合も段はこれで、分類は worker の失敗のものになる。
+//!   - `helper_pty_master_send`: 検証済みの master を channel の `PtyMaster` で送れなかった（errno あり）。
+//!   - `helper_exec`: 上記以外の exec 層の失敗。tty の割り当て前に worker が自分の失敗で終わった場合を含む。
+//!
 //!   plugin-cri 側の有効化（`HelperCapabilities.tty`・`without_tty` の撤去）も #4417 で実装済み。
 //!   初期の端末サイズは 0 行 0 列で、kubelet の最初の resize で決まる。
 //! - 受け取る stdio の fd は socket か FIFO に限る（`require_stdio_kinds`。#3761・SEC-1）。plugin-cri 側の結線は #3761 で実装済み。
@@ -78,7 +85,7 @@ use std::time::{Duration, Instant};
 
 use fandhe_container_core::audit_log::{AuditSink, AuditedRejection};
 use fandhe_container_core::exec::{
-    ChildExit, ENTRYPOINT_MAX_ARGS, ExecCgroupName, ExecExit, PtyMaster, emit_diagnostic_line_to,
+    ChildExit, ENTRYPOINT_MAX_ARGS, ExecCgroupName, ExecExit, emit_diagnostic_line_to,
 };
 use fandhe_container_core::traits::{
     ContainerId, ContainerState, ErrorCode, GetStateRequest, StateRecord, StateStore, TraitError,
@@ -93,8 +100,8 @@ use super::wire::{
 use crate::control::protocol::MAX_EXEC_HOLD_SECS;
 use crate::control::{ControlExecHandover, ExecControlFailure, ExecPidfdSource};
 use crate::exec::{
-    CommandSignaler, ExecLaunchIo, ExecPtyHook, ExecRequest, ExecSignalDelivery, ExecStdio,
-    default_audit_sink,
+    CommandSignaler, ExecLaunchIo, ExecPtyEvent, ExecPtyHook, ExecRequest, ExecSignalDelivery,
+    ExecStdio, default_audit_sink,
 };
 
 /// helper を起動するサブコマンド名（bin の第 1 引数）。
@@ -604,7 +611,14 @@ pub fn serve_reporting(
     // tty の exec の pty master の受け取り（#4416）。親が応答者の刻みで受けた検証済みの master を、`Started` の後・`Spawned` の前に
     // 1 回だけ `PtyMaster` として送る。送信後は master を drop して helper に複製を残さない。送信の失敗は段を覚えて exec を止める。
     let pty_failure: std::cell::Cell<Option<HelperFailure>> = std::cell::Cell::new(None);
-    let pty_hook = |master: PtyMaster| -> Result<(), TraitError> {
+    // exec 層が通知した受け渡しの失敗（受信の検証で拒否・期限切れ・master 未着。#4446）。段 `helper_pty_master` で報告する。
+    let pty_handover_failed = std::cell::Cell::new(false);
+    let pty_hook = |event: ExecPtyEvent<'_>| -> Result<(), TraitError> {
+        let ExecPtyEvent::Master(master) = event else {
+            // `Failed` と、将来拡張される未知のイベント（fail-closed）。戻り値は exec 層に無視される。
+            pty_handover_failed.set(true);
+            return Ok(());
+        };
         if signal_state.pty_sent.get() {
             return Err(TraitError::new(
                 ErrorCode::Internal,
@@ -690,10 +704,18 @@ pub fn serve_reporting(
         };
         let _ = channel::send_signal_ack(channel, signal, code, Instant::now() + SIGNAL_ACK_BUDGET);
     }
-    // 失敗の段: 通知・`Started` の送信で覚えたものを優先し、無ければ実行役の失敗（`Failed`）を `helper_exec` とする。
-    // 取り消し（要求元の消滅）は従来の行があるので足さない。
+    // 失敗の段: 通知・`Started` の送信で覚えたもの、master の送信の失敗（`helper_pty_master_send`）、exec 層が通知した
+    // 受け渡しの失敗（`helper_pty_master`。分類は最終の outcome のもの）、master 未着（`helper_pty_master`）の順に優先し、
+    // 無ければ実行役の失敗（`Failed`）を `helper_exec` とする。取り消し（要求元の消滅）は従来の行があるので足さない。
+    let handover_code = match outcome {
+        StreamExecOutcome::Failed(code) if pty_handover_failed.get() => Some(code),
+        _ => None,
+    };
     let failure = match created_failure.take().or_else(|| pty_failure.take()) {
         Some(f) => Some(f),
+        None if handover_code.is_some() => {
+            handover_code.map(|code| HelperFailure::new(HelperStage::PtyMaster, code, None))
+        }
         None if pty_missing => Some(HelperFailure::new(
             HelperStage::PtyMaster,
             ErrorCode::Internal,

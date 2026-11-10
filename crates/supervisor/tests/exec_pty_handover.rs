@@ -40,10 +40,11 @@ mod linux {
     use std::os::fd::AsFd as _;
     use std::time::{Duration, Instant};
 
-    use fandhe_container_core::exec::{PtyMaster, WindowSize, open_host_pty_for_test};
+    use fandhe_container_core::exec::{WindowSize, open_host_pty_for_test};
     use fandhe_container_core::traits::{ErrorCode, TraitError};
     use fandhe_container_supervisor::exec::{
-        apply_seccomp_listener_for_test, open_socket_ids_for_test, run_in_worker_with_pty_for_test,
+        ExecPtyEvent, apply_seccomp_listener_for_test, open_socket_ids_for_test,
+        run_in_worker_with_pty_for_test,
     };
 
     pub fn run() {
@@ -64,9 +65,16 @@ mod linux {
         let seen = RefCell::new(None);
         let cleanups = Cell::new(0u32);
         let baseline = baseline_sockets();
-        let on_pty = |master: PtyMaster| {
-            calls.set(calls.get() + 1);
-            *seen.borrow_mut() = Some(master.window_size().expect("window size"));
+        let failed = RefCell::new(Vec::new());
+        let on_pty = |event: ExecPtyEvent<'_>| {
+            match event {
+                ExecPtyEvent::Master(master) => {
+                    calls.set(calls.get() + 1);
+                    *seen.borrow_mut() = Some(master.window_size().expect("window size"));
+                }
+                ExecPtyEvent::Failed(e) => failed.borrow_mut().push(e.code()),
+                _ => panic!("unexpected pty event"),
+            }
             Ok(())
         };
         let outcome = run_in_worker_with_pty_for_test(
@@ -88,6 +96,7 @@ mod linux {
         .unwrap_or_else(|e| panic!("handover failed: {:?} {}", e.code(), e.message()));
         assert_eq!(outcome.command_pid.map(|p| p.get()), Some(4321));
         assert_eq!(calls.get(), 1, "the hook runs exactly once");
+        assert!(failed.borrow().is_empty(), "no failure event on success");
         assert_eq!(*seen.borrow(), Some(WindowSize::new(24, 80)));
         assert_eq!(cleanups.get(), 1);
         println!("exec_pty_handover: scenario=correct_master hook=1 size=24x80 ok");
@@ -97,8 +106,13 @@ mod linux {
     fn success_without_a_master_is_rejected() {
         let calls = Cell::new(0u32);
         let baseline = baseline_sockets();
-        let on_pty = |_master: PtyMaster| {
-            calls.set(calls.get() + 1);
+        let failed = RefCell::new(Vec::new());
+        let on_pty = |event: ExecPtyEvent<'_>| {
+            match event {
+                ExecPtyEvent::Master(_) => calls.set(calls.get() + 1),
+                ExecPtyEvent::Failed(e) => failed.borrow_mut().push(e.code()),
+                _ => panic!("unexpected pty event"),
+            }
             Ok(())
         };
         let err = run_in_worker_with_pty_for_test(
@@ -118,6 +132,7 @@ mod linux {
             "exec stage Spawn: the exec worker finished without handing over the pty master"
         );
         assert_eq!(calls.get(), 0);
+        assert_eq!(*failed.borrow(), vec![ErrorCode::Internal]);
         println!("exec_pty_handover: scenario=no_master internal rejected, hook=0 ok");
     }
 
@@ -125,8 +140,13 @@ mod linux {
     fn non_master_fd_is_rejected() {
         let baseline = baseline_sockets();
         let calls = Cell::new(0u32);
-        let on_pty = |_master: PtyMaster| {
-            calls.set(calls.get() + 1);
+        let failed = RefCell::new(Vec::new());
+        let on_pty = |event: ExecPtyEvent<'_>| {
+            match event {
+                ExecPtyEvent::Master(_) => calls.set(calls.get() + 1),
+                ExecPtyEvent::Failed(e) => failed.borrow_mut().push(e.code()),
+                _ => panic!("unexpected pty event"),
+            }
             Ok(())
         };
         let started = Instant::now();
@@ -149,6 +169,7 @@ mod linux {
         .expect_err("a non-master fd must be rejected");
         assert_eq!(err.code(), ErrorCode::InvalidArgument);
         assert_eq!(calls.get(), 0);
+        assert_eq!(*failed.borrow(), vec![ErrorCode::InvalidArgument]);
         assert!(
             started.elapsed() < Duration::from_secs(15),
             "the worker must be stopped by the rejection, not by the deadline"
@@ -162,8 +183,13 @@ mod linux {
     fn hook_error_ends_with_its_code_and_reaps_the_worker() {
         let baseline = baseline_sockets();
         let started = Instant::now();
-        let on_pty =
-            |_master: PtyMaster| Err(TraitError::new(ErrorCode::Unavailable, "hook failed"));
+        let failed = Cell::new(0u32);
+        let on_pty = |event: ExecPtyEvent<'_>| {
+            if matches!(event, ExecPtyEvent::Failed(_)) {
+                failed.set(failed.get() + 1);
+            }
+            Err(TraitError::new(ErrorCode::Unavailable, "hook failed"))
+        };
         let err = run_in_worker_with_pty_for_test(
             Duration::from_secs(20),
             Duration::from_secs(10),
@@ -189,6 +215,11 @@ mod linux {
         assert!(
             started.elapsed() < Duration::from_secs(15),
             "the worker must be stopped by the hook failure, not by the deadline"
+        );
+        assert_eq!(
+            failed.get(),
+            0,
+            "a hook error must not be reported back as a failure"
         );
         println!("exec_pty_handover: scenario=hook_error UNAVAILABLE reaped in time ok");
     }

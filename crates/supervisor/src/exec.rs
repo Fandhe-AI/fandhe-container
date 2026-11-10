@@ -1181,8 +1181,24 @@ pub type ExecCreatedHook<'a> = dyn Fn(&ExecCgroupName) -> Result<(), TraitError>
 
 /// tty の exec で、worker が割り当てた pty の master を受け取るフックの型（[`ExecLaunchIo::pty`]。#4416・SUP-6・CRI-6）。
 ///
-/// 親が応答者の刻みの中で 1 回だけ呼ぶ。`Err` は exec の失敗として扱う（worker を止めて回収し、その構造化エラーで終える）。
-pub type ExecPtyHook<'a> = dyn Fn(PtyMaster) -> Result<(), TraitError> + 'a;
+/// 親が応答者の刻みの中で高々 1 回だけ呼ぶ（[`ExecPtyEvent::Master`] か [`ExecPtyEvent::Failed`] のどちらか一方）。
+/// `Master` への `Err` は exec の失敗として扱う（worker を止めて回収し、その構造化エラーで終える）。
+/// `Failed` の戻り値は無視される（exec は渡した失敗か worker 自身の失敗で終わり、縮退しない）。
+pub type ExecPtyHook<'a> = dyn Fn(ExecPtyEvent<'_>) -> Result<(), TraitError> + 'a;
+
+/// tty の exec の pty master の受け渡しのイベント（[`ExecPtyHook`] の引数。#4416・#4446・SUP-6・REPAIR-4）。
+///
+/// stream-exec helper が、受け渡しの失敗を段 `helper_pty_master` として報告できるようにするための通知。
+/// `Failed` は、フックが `Master` に `Err` を返したとき（呼び出し側が自分で失敗を記録済み）と、何も届かないまま
+/// worker が自分の失敗で終わったときには呼ばれない。
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum ExecPtyEvent<'e> {
+    /// 検証済みの master（高々 1 回）。
+    Master(PtyMaster),
+    /// 受け渡しの失敗（受信の検証で拒否・期限切れ・未知の受信結果・master を渡さずに worker が成功した）。
+    Failed(&'e TraitError),
+}
 
 /// tty の exec の初期の端末サイズ（0 行 0 列）。CRI の最初の resize（kubelet が送る）で決まる前提の既定値で、
 /// launch の init の pty の初期値（core の `LAUNCH_PTY_INITIAL_SIZE`）と揃える（`docs/design/cri-streaming-server.md` D6）。
@@ -1744,17 +1760,25 @@ fn poll_pty(
         return;
     };
     let next = match receipt {
-        PtyReceipt::Received(master) => match hook(master) {
+        PtyReceipt::Received(master) => match hook(ExecPtyEvent::Master(master)) {
             Ok(()) => PtyState::Delivered,
             Err(e) => PtyState::Failed(e),
         },
         PtyReceipt::SenderClosed => PtyState::Closed,
-        PtyReceipt::Rejected(e) | PtyReceipt::TimedOut(e) => PtyState::Failed(from_exec_error(e)),
+        PtyReceipt::Rejected(e) | PtyReceipt::TimedOut(e) => {
+            let e = from_exec_error(e);
+            let _ = hook(ExecPtyEvent::Failed(&e));
+            PtyState::Failed(e)
+        }
         // `PtyReceipt` は将来拡張される。未知の結果は受け取りを確認できないものとして拒否する（fail-closed）。
-        _ => PtyState::Failed(TraitError::new(
-            ErrorCode::Internal,
-            "exec stage Spawn: the pty master handover ended in an unknown state",
-        )),
+        _ => {
+            let e = TraitError::new(
+                ErrorCode::Internal,
+                "exec stage Spawn: the pty master handover ended in an unknown state",
+            );
+            let _ = hook(ExecPtyEvent::Failed(&e));
+            PtyState::Failed(e)
+        }
     };
     *state.borrow_mut() = next;
 }
@@ -1797,11 +1821,15 @@ fn finish_pty(
         }
         (PtyState::Failed(e), Ok(_)) => Err(e.into()),
         (PtyState::Delivered, result) => result,
-        (_, Ok(_)) => Err(TraitError::new(
-            ErrorCode::Internal,
-            "exec stage Spawn: the exec worker finished without handing over the pty master",
-        )
-        .into()),
+        (_, Ok(_)) => {
+            let e = TraitError::new(
+                ErrorCode::Internal,
+                "exec stage Spawn: the exec worker finished without handing over the pty master",
+            );
+            // 未着も受け渡しの失敗として通知する（helper が段 `helper_pty_master` で報告する。#4446）。
+            let _ = hook(ExecPtyEvent::Failed(&e));
+            Err(e.into())
+        }
         (_, Err(f)) => Err(f),
     }
 }
@@ -4303,7 +4331,7 @@ mod tests {
     #[test]
     fn sec1_4416_pty_with_stdio_fds_is_rejected_before_any_work() {
         let (sock, _peer) = UnixStream::pair().unwrap();
-        let pty_hook = |_master: PtyMaster| -> Result<(), TraitError> {
+        let pty_hook = |_event: ExecPtyEvent<'_>| -> Result<(), TraitError> {
             panic!("the pty hook must not run when the combination is rejected")
         };
         let rec = record(ContainerStatus::created(cid(), None));

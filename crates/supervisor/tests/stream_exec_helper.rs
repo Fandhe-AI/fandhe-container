@@ -35,7 +35,7 @@ use fandhe_container_core::traits::{
 use fandhe_container_supervisor::control::{
     ControlExecHandover, ExecControlFailure, ExecCreatedNotifier, ExecHandover, ExecPidfdSource,
 };
-use fandhe_container_supervisor::exec::{CommandSignaler, ExecSignalDelivery};
+use fandhe_container_supervisor::exec::{CommandSignaler, ExecPtyEvent, ExecSignalDelivery};
 use fandhe_container_supervisor::stream_exec::channel::{
     ChannelError, HelperMessage, StdioSend, recv_from_helper, send_stdio_handover,
 };
@@ -236,6 +236,10 @@ enum PtyBehavior {
     Skip,
     /// 2 回渡す（2 回目の拒否を `Counts::events` の `second-pty-rejected` に記録する）。
     DeliverTwice,
+    /// exec 層が受け渡しの失敗（受信の検証で拒否）を通知して、その分類の拒否を返す（#4446）。
+    Reject(ErrorCode),
+    /// master を渡す前に plugin 側の読み側を閉じる（`PtyMaster` の送信の失敗の模擬。#4446）。
+    CloseBeforeDeliver,
 }
 
 /// 偽の [`CommandSignaler`]（呼ばれた番号を `Counts::signals` に記録し、決めた列で結果を返す。#4282）。
@@ -346,6 +350,9 @@ fn drive_reporting(
             Ok(Vec::new())
         }
     };
+    // 複製は送信失敗の模擬のときだけ持つ（常に持つと plugin 側を drop しても端が閉じず、要求元の消滅の試験が成り立たない）。
+    let plugin_dup = matches!(sc.pty, PtyBehavior::CloseBeforeDeliver)
+        .then(|| plugin.try_clone().expect("clone plugin end"));
     let run = |_: &_,
                _: std::os::fd::BorrowedFd<'_>,
                _: &_,
@@ -367,15 +374,27 @@ fn drive_reporting(
             )));
         }
         if let Some(pty_hook) = io.pty {
+            if let PtyBehavior::Reject(code) = sc.pty {
+                let e = TraitError::new(
+                    code,
+                    "exec stage Exec: the received pty master was rejected",
+                );
+                let _ = pty_hook(ExecPtyEvent::Failed(&e));
+                return Err(AuditedRejection::not_applicable(e));
+            }
+            if let Some(dup) = &plugin_dup {
+                dup.shutdown(std::net::Shutdown::Read)
+                    .expect("shutdown plugin read side");
+            }
             let deliveries = match sc.pty {
-                PtyBehavior::Deliver => 1,
-                PtyBehavior::Skip => 0,
+                PtyBehavior::Deliver | PtyBehavior::CloseBeforeDeliver => 1,
+                PtyBehavior::Skip | PtyBehavior::Reject(_) => 0,
                 PtyBehavior::DeliverTwice => 2,
             };
             for i in 0..deliveries {
                 let (master, _slave) =
                     open_host_pty_for_test(WindowSize::new(24, 80)).expect("host pty");
-                match pty_hook(master) {
+                match pty_hook(ExecPtyEvent::Master(master)) {
                     Ok(()) => counts.event("pty-delivered"),
                     Err(_) if i > 0 => counts.event("second-pty-rejected"),
                     Err(e) => return Err(AuditedRejection::not_applicable(e)),
@@ -1430,4 +1449,76 @@ fn sec1_4416_pty_master_is_sent_at_most_once() {
             .count(),
         1
     );
+}
+
+/// SUP-6・REPAIR-4（#4446）: 受信の検証で拒否された pty master の失敗は、段 `helper_pty_master`（分類は `Result` と同じ）で
+/// 報告する。`PtyMaster`・`Spawned` は送らない。
+#[test]
+fn sup6_4446_rejected_pty_master_is_reported_as_helper_pty_master() {
+    let base = Tmp::new("tty7");
+    let store = open(&base);
+    seed(&base, &store, "run1", Some(PID));
+    let sc = Scenario {
+        runner_pid: Some(4242),
+        pty: PtyBehavior::Reject(ErrorCode::InvalidArgument),
+        ..Scenario::default()
+    };
+    let (report, counts, plugin) =
+        drive_reporting(&store, &args_tty(&base, "run1"), &StdioSend::default(), &sc);
+    assert_eq!(
+        report.outcome,
+        StreamExecOutcome::Failed(ErrorCode::InvalidArgument)
+    );
+    let failure = report.failure.expect("failure");
+    assert_eq!(failure.stage, HelperStage::PtyMaster);
+    assert_eq!(failure.code, ErrorCode::InvalidArgument);
+    assert_eq!(failure.errno, None);
+    assert_eq!(
+        failure.diagnostic_line(),
+        "{\"component\":\"supervisor.stream_exec\",\"stage\":\"helper_pty_master\",\"code\":\"INVALID_ARGUMENT\",\"errno\":\"none\"}"
+    );
+    assert_eq!(collect_events(&plugin), vec!["started"]);
+    assert_eq!(counts.run.load(Ordering::SeqCst), 1);
+}
+
+/// SUP-6・REPAIR-4（#4446）: 受け渡しの通知が無いまま実行役が失敗した tty の exec は、従来どおり段 `helper_exec`。
+#[test]
+fn sup6_4446_tty_runner_error_without_pty_event_stays_helper_exec() {
+    let base = Tmp::new("tty8");
+    let store = open(&base);
+    seed(&base, &store, "run1", Some(PID));
+    let sc = Scenario {
+        runner_error: Some(ErrorCode::Internal),
+        ..Scenario::default()
+    };
+    let (report, _counts, plugin) =
+        drive_reporting(&store, &args_tty(&base, "run1"), &StdioSend::default(), &sc);
+    assert_eq!(
+        report.outcome,
+        StreamExecOutcome::Failed(ErrorCode::Internal)
+    );
+    let failure = report.failure.expect("failure");
+    assert_eq!(failure.stage, HelperStage::Exec);
+    assert_eq!(failure.code, ErrorCode::Internal);
+    assert_eq!(collect_events(&plugin), vec!["started"]);
+}
+
+/// SUP-6・REPAIR-4（#4446）: 検証済みの master を送れなかった失敗は、段 `helper_pty_master_send`（errno つき）のまま。
+#[test]
+fn sup6_4446_pty_master_send_failure_is_reported_as_helper_pty_master_send() {
+    let base = Tmp::new("tty9");
+    let store = open(&base);
+    seed(&base, &store, "run1", Some(PID));
+    let sc = Scenario {
+        pty: PtyBehavior::CloseBeforeDeliver,
+        ..Scenario::default()
+    };
+    let (report, _counts, plugin) =
+        drive_reporting(&store, &args_tty(&base, "run1"), &StdioSend::default(), &sc);
+    assert!(matches!(report.outcome, StreamExecOutcome::Failed(_)));
+    let failure = report.failure.expect("failure");
+    assert_eq!(failure.stage, HelperStage::PtyMasterSend);
+    assert_eq!(failure.code, ErrorCode::Unavailable);
+    assert_eq!(failure.errno, None);
+    assert_eq!(collect_events(&plugin), vec!["started"]);
 }

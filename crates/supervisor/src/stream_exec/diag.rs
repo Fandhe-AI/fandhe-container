@@ -64,11 +64,11 @@ pub enum HelperStage {
     CgroupNotify,
     /// `Started` の送信。
     StartedSend,
-    /// tty の exec で `PtyMaster` の送信に失敗した（#4416）。
+    /// tty の exec で、検証済みの pty master を channel の `PtyMaster` で送れなかった（errno あり。#4416・#4446）。
     PtyMasterSend,
-    /// tty の exec なのに pty の master を送れなかった・受け取れなかった（拒否・未着。#4416）。
+    /// tty の exec で pty の受け渡しが失敗した（受信の検証で拒否・期限切れ・master 未着。分類は `Result` と同じ。#4416・#4446）。
     PtyMaster,
-    /// exec の通し（上記以外の失敗）。
+    /// exec の通し（上記以外の失敗。tty の割り当て前に worker が自分の失敗で終わった場合を含む）。
     Exec,
     /// `Result` の送信。
     ResultSend,

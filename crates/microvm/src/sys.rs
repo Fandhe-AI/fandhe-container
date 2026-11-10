@@ -54,6 +54,7 @@ use std::ffi::c_void;
 use std::io;
 use std::os::fd::{AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd};
 use std::ptr::NonNull;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::exit::{RunArea, RunAreaMut};
@@ -1601,6 +1602,8 @@ pub(crate) fn kvm_ioeventfd(
 pub(crate) struct KvmRunMap {
     ptr: NonNull<u8>,
     len: usize,
+    /// drop の munmap 失敗を数える VM ごとの集約先（観測専用。#4382）。
+    unmap_tally: Option<Arc<UnmapTally>>,
 }
 
 // SAFETY: 領域への書き込みはカーネルが `KVM_RUN` の実行中にだけ行い、`KVM_RUN` は `&mut VcpuFd` 経由でしか
@@ -1617,7 +1620,13 @@ unsafe impl Sync for KvmRunMap {}
 impl KvmRunMap {
     /// vCPU fd の先頭から `len` バイトを読み書き可能・共有で mmap する。`len` は呼び出し側が検証済み
     /// （非 0・上限内・ページ倍数）のものだけを渡す。
-    pub(crate) fn map(vcpu: BorrowedFd<'_>, len: usize) -> Result<KvmRunMap, SysError> {
+    ///
+    /// `tally` は drop の munmap 失敗の件数を VM ごとに集約する先（停止・解放の集約行の `unmap_failures=`。#4382）。
+    pub(crate) fn map(
+        vcpu: BorrowedFd<'_>,
+        len: usize,
+        tally: Option<Arc<UnmapTally>>,
+    ) -> Result<KvmRunMap, SysError> {
         if !consts::SUPPORTED {
             return Err(SysError::Unsupported);
         }
@@ -1637,11 +1646,17 @@ impl KvmRunMap {
             return Err(last_error());
         }
         match NonNull::new(p.cast::<u8>()) {
-            Some(ptr) => Ok(KvmRunMap { ptr, len }),
+            Some(ptr) => Ok(KvmRunMap {
+                ptr,
+                len,
+                unmap_tally: tally,
+            }),
             None => {
                 // SAFETY: 直前の mmap が返した長さ `len` の領域そのもので、他に所有者がいない。
-                let _ = unsafe { munmap(p, len) };
-                Err(SysError::NullMapping)
+                // 戻った後は `p` を使わない。
+                Err(unsafe {
+                    rollback_failed_map(p, len, KVM_RUN_UNMAP_FAILED_LINE, SysError::NullMapping)
+                })
             }
         }
     }
@@ -1739,6 +1754,9 @@ impl Drop for KvmRunMap {
         let rc = unsafe { munmap(self.ptr.as_ptr().cast::<c_void>(), self.len) };
         if let Some(line) = unmap_failure_line(rc, KVM_RUN_UNMAP_FAILED_LINE) {
             crate::hvf_loop::log_line(format_args!("{line}"));
+            if let Some(t) = &self.unmap_tally {
+                t.record_failure();
+            }
         }
     }
 }
@@ -1965,6 +1983,8 @@ impl Drop for RegisteredPage<'_> {
 pub(crate) struct GuestRamMap {
     ptr: NonNull<u8>,
     len: usize,
+    /// drop の munmap 失敗を数える VM ごとの集約先。VM が決まる登録時に `set_unmap_tally` で付ける（#4382）。
+    unmap_tally: Option<Arc<UnmapTally>>,
 }
 
 // SAFETY: ポインタはマッピングの生存中（drop まで）有効で、スレッドに固有ではない。Rust 側は参照を一切作らず
@@ -2004,23 +2024,19 @@ impl GuestRamMap {
         if p as usize == usize::MAX {
             return Err(last_error());
         }
-        let Some(ptr) = NonNull::new(p.cast::<u8>()) else {
-            // SAFETY: 直前の mmap が返した長さ `len` の領域そのもので、他に所有者がいない。
-            let _ = unsafe { munmap(p, len) };
-            return Err(SysError::NullMapping);
-        };
-        for advice in [consts::MADV_DONTFORK, consts::MADV_DONTDUMP] {
-            // SAFETY: `ptr` / `len` は直前の mmap が返した領域そのもの。`MADV_DONTFORK` は fork 先にマッピングを作らず、
-            // `MADV_DONTDUMP` はコアダンプに含めない指示だけを行い、どちらも領域の内容・対応付けを変更しない。
+        let advise = |ptr: NonNull<u8>, len: usize, advice: i32| {
+            // SAFETY: `ptr` / `len` は下の `finish_guest_ram_map` へ渡す mmap の領域そのもの。`MADV_DONTFORK` は fork 先に
+            // マッピングを作らず、`MADV_DONTDUMP` はコアダンプに含めない指示だけを行い、どちらも領域の内容・対応付けを変更しない。
             let r = unsafe { madvise(ptr.as_ptr().cast::<c_void>(), len, advice) };
-            if r < 0 {
-                let e = last_error();
-                // SAFETY: 上の mmap が返した領域そのもので、まだ誰にも渡しておらず他に所有者がいない。
-                let _ = unsafe { munmap(ptr.as_ptr().cast::<c_void>(), len) };
-                return Err(e);
-            }
-        }
-        Ok(GuestRamMap { ptr, len })
+            if r < 0 { Err(last_error()) } else { Ok(()) }
+        };
+        // SAFETY: `p` / `len` は直前の mmap が成功して返した領域そのもので、他に所有者がいない。
+        unsafe { finish_guest_ram_map(p, len, advise) }
+    }
+
+    /// drop の munmap 失敗を数える VM ごとの集約先を付ける（`register_backing` が登録成功後に呼ぶ。#4382）。
+    pub(crate) fn set_unmap_tally(&mut self, tally: Arc<UnmapTally>) {
+        self.unmap_tally = Some(tally);
     }
 
     /// マッピングのバイト数。
@@ -2102,7 +2118,88 @@ impl Drop for GuestRamMap {
         let rc = unsafe { munmap(self.ptr.as_ptr().cast::<c_void>(), self.len) };
         if let Some(line) = unmap_failure_line(rc, GUEST_RAM_UNMAP_FAILED_LINE) {
             crate::hvf_loop::log_line(format_args!("{line}"));
+            if let Some(t) = &self.unmap_tally {
+                t.record_failure();
+            }
         }
+    }
+}
+
+/// `GuestRamMap::map` の mmap 成功後の段（NULL 検査と `madvise` 2 回）。失敗時は munmap して `Err` を返す。
+///
+/// `advise` を引数にするのは、`madvise` の失敗を試験で注入するため（本番は syscall を包む閉包）。
+/// 失敗経路の munmap も失敗したら固定の 1 行を出し、返すエラーは元のまま変えない（#4382・MVM-1・REPAIR-4）。
+///
+/// # Safety
+///
+/// `p` / `len` は直前の mmap が成功して返した領域そのもので、他に所有者がいないこと。
+unsafe fn finish_guest_ram_map(
+    p: *mut c_void,
+    len: usize,
+    mut advise: impl FnMut(NonNull<u8>, usize, i32) -> Result<(), SysError>,
+) -> Result<GuestRamMap, SysError> {
+    let Some(ptr) = NonNull::new(p.cast::<u8>()) else {
+        // SAFETY: 呼び出し側の契約により `p` / `len` は直前の mmap の領域そのもの。戻った後は使わない。
+        return Err(unsafe {
+            rollback_failed_map(p, len, GUEST_RAM_UNMAP_FAILED_LINE, SysError::NullMapping)
+        });
+    };
+    for advice in [consts::MADV_DONTFORK, consts::MADV_DONTDUMP] {
+        // errno は munmap より前に取る（munmap の errno で上書きさせない）。`advise` の閉包が取得済み。
+        if let Err(e) = advise(ptr, len, advice) {
+            // SAFETY: 呼び出し側の契約により mmap の領域そのもので、まだ誰にも渡しておらず他に所有者がいない。
+            return Err(unsafe { rollback_failed_map(p, len, GUEST_RAM_UNMAP_FAILED_LINE, e) });
+        }
+    }
+    Ok(GuestRamMap {
+        ptr,
+        len,
+        unmap_tally: None,
+    })
+}
+
+/// map の失敗経路で mmap した領域を munmap して `err` を返す。munmap も失敗したら `line` を 1 行出す。
+///
+/// 失敗経路の時点では VM ごとの集約先が無いため、件数には数えず行だけで観測する（#4382）。
+/// `GuestRamMap::map` / `KvmRunMap::map` から呼ばれる。
+///
+/// # Safety
+///
+/// `addr` / `len` は直前の mmap が返した領域そのもので、他に所有者がいないこと。呼び出し後は `addr` を使わない。
+/// （試験は ptr をずらして EINVAL を起こすが、munmap は引数を参照外ししない。）
+unsafe fn rollback_failed_map(
+    addr: *mut c_void,
+    len: usize,
+    line: &'static str,
+    err: SysError,
+) -> SysError {
+    // SAFETY: 上の契約どおり。失敗しても再試行・panic はせずリークを受け入れて観測するだけにする。
+    let rc = unsafe { munmap(addr, len) };
+    if let Some(l) = unmap_failure_line(rc, line) {
+        crate::hvf_loop::log_line(format_args!("{l}"));
+    }
+    err
+}
+
+/// VM ごとの munmap 失敗件数（drop の経路のみ。停止・解放の集約行の `unmap_failures=` に出す。#4382・MVM-1・REPAIR-4）。
+///
+/// `VmFd` が持ち、`GuestRamMap` / `KvmRunMap` が drop で加算し、最後の停止スレッドが集約行を出す時に読む。
+/// 観測専用で、停止の合否には使わない。
+#[derive(Debug, Default)]
+pub(crate) struct UnmapTally {
+    failures: std::sync::atomic::AtomicU64,
+}
+
+impl UnmapTally {
+    /// munmap の失敗を 1 件数える。
+    pub(crate) fn record_failure(&self) {
+        self.failures
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// これまでの失敗件数。
+    pub(crate) fn count(&self) -> u64 {
+        self.failures.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -2970,7 +3067,7 @@ mod tests {
         use std::os::fd::AsFd as _;
         let f = dev_null();
         assert_eq!(
-            KvmRunMap::map(f.as_fd(), 4096).unwrap_err(),
+            KvmRunMap::map(f.as_fd(), 4096, None).unwrap_err(),
             SysError::Os(19)
         );
     }
@@ -2989,7 +3086,7 @@ mod tests {
             .write(true)
             .open("/dev/zero")
             .unwrap();
-        let mut m = KvmRunMap::map(f.as_fd(), 4096).unwrap();
+        let mut m = KvmRunMap::map(f.as_fd(), 4096, None).unwrap();
         assert!(m.write_from(0, &[7, 8]).is_err());
         assert!(m.write_from(1, &[9]).is_err());
         let mut head = [0xFFu8; 3];
@@ -3326,6 +3423,7 @@ mod tests {
         let fake = GuestRamMap {
             ptr: NonNull::new(m.ptr.as_ptr().wrapping_byte_add(1)).unwrap(),
             len: m.len,
+            unmap_tally: None,
         };
         let ((), lines) = crate::hvf_loop::capture_log_lines(|| drop(fake));
         assert_eq!(
@@ -3343,6 +3441,7 @@ mod tests {
         let fake = KvmRunMap {
             ptr: NonNull::new(m.ptr.as_ptr().wrapping_byte_add(1)).unwrap(),
             len: m.len,
+            unmap_tally: None,
         };
         let ((), lines) = crate::hvf_loop::capture_log_lines(|| drop(fake));
         assert_eq!(
@@ -3350,6 +3449,108 @@ mod tests {
             vec!["level=error op=kvm.run_unmap outcome=error leaked=kvm_run".to_string()]
         );
         drop(m);
+    }
+
+    /// MVM-1・REPAIR-4・#4382: NULL 検査の失敗経路の munmap が失敗したら、元のエラーを保ったまま固定の 1 行が出る。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn mvm1_4382_null_mapping_rollback_failure_emits_one_line_and_keeps_error() {
+        for (line, expected) in [
+            (
+                GUEST_RAM_UNMAP_FAILED_LINE,
+                "level=error op=kvm.guest_ram_unmap outcome=error leaked=guest_ram",
+            ),
+            (
+                KVM_RUN_UNMAP_FAILED_LINE,
+                "level=error op=kvm.run_unmap outcome=error leaked=kvm_run",
+            ),
+        ] {
+            let m = GuestRamMap::map(8192).unwrap();
+            let shifted = m.ptr.as_ptr().wrapping_byte_add(1).cast::<c_void>();
+            let len = m.len;
+            // SAFETY: munmap は引数を参照外ししない。ずらした ptr で EINVAL を起こすだけ（#4330 と同じ）。
+            let (err, lines) = crate::hvf_loop::capture_log_lines(|| unsafe {
+                rollback_failed_map(shifted, len, line, SysError::NullMapping)
+            });
+            assert!(matches!(err, SysError::NullMapping));
+            assert_eq!(lines, vec![expected.to_string()]);
+            drop(m);
+        }
+    }
+
+    /// MVM-1・REPAIR-4・#4382: `madvise` の失敗経路の munmap も失敗したら、errno を保ったまま 1 行だけ出る。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn mvm1_4382_madvise_failure_rollback_failure_emits_one_line_and_keeps_errno() {
+        let m = GuestRamMap::map(8192).unwrap();
+        let shifted = m.ptr.as_ptr().wrapping_byte_add(1).cast::<c_void>();
+        let len = m.len;
+        // SAFETY: 閉包はメモリに触れない。munmap は引数を参照外ししない。
+        let (res, lines) = crate::hvf_loop::capture_log_lines(|| unsafe {
+            finish_guest_ram_map(shifted, len, |_, _, _| Err(SysError::Os(99)))
+        });
+        assert!(matches!(res, Err(SysError::Os(99))));
+        assert_eq!(
+            lines,
+            vec!["level=error op=kvm.guest_ram_unmap outcome=error leaked=guest_ram".to_string()]
+        );
+        drop(m);
+    }
+
+    /// MVM-1・REPAIR-4・#4382: `madvise` が失敗し munmap が成功したら行は出ず、領域は実際に解放される。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn mvm1_4382_madvise_failure_rollback_success_emits_no_line() {
+        let m = std::mem::ManuallyDrop::new(GuestRamMap::map(8192).unwrap());
+        let p = m.ptr.as_ptr();
+        let len = m.len;
+        let needle = format!("{:x}-", p as usize);
+        let present = || {
+            std::fs::read_to_string("/proc/self/maps")
+                .unwrap()
+                .lines()
+                .any(|l| l.starts_with(&needle))
+        };
+        assert!(present());
+        // SAFETY: `p` / `len` は上の mmap の領域で、`ManuallyDrop` により他に所有者がいない。
+        let (res, lines) = crate::hvf_loop::capture_log_lines(|| unsafe {
+            finish_guest_ram_map(p.cast::<c_void>(), len, |_, _, _| Err(SysError::Os(99)))
+        });
+        assert!(matches!(res, Err(SysError::Os(99))));
+        assert_eq!(lines, Vec::<String>::new());
+        assert!(!present());
+    }
+
+    /// MVM-1・REPAIR-4・#4382: drop の munmap 失敗は VM ごとの tally に 1 件数える。成功の drop は数えない。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn mvm1_4382_drop_failure_records_tally() {
+        let t = Arc::new(UnmapTally::default());
+        let m = GuestRamMap::map(8192).unwrap();
+        let ram = GuestRamMap {
+            ptr: NonNull::new(m.ptr.as_ptr().wrapping_byte_add(1)).unwrap(),
+            len: m.len,
+            unmap_tally: Some(Arc::clone(&t)),
+        };
+        let ((), lines) = crate::hvf_loop::capture_log_lines(|| drop(ram));
+        assert_eq!(lines.len(), 1);
+        assert_eq!(t.count(), 1);
+        let run = KvmRunMap {
+            ptr: NonNull::new(m.ptr.as_ptr().wrapping_byte_add(1)).unwrap(),
+            len: m.len,
+            unmap_tally: Some(Arc::clone(&t)),
+        };
+        let ((), lines) = crate::hvf_loop::capture_log_lines(|| drop(run));
+        assert_eq!(lines.len(), 1);
+        assert_eq!(t.count(), 2);
+        drop(m);
+
+        let t2 = Arc::new(UnmapTally::default());
+        let mut ok = GuestRamMap::map(8192).unwrap();
+        ok.set_unmap_tally(Arc::clone(&t2));
+        let ((), lines) = crate::hvf_loop::capture_log_lines(|| drop(ok));
+        assert_eq!(lines, Vec::<String>::new());
+        assert_eq!(t2.count(), 0);
     }
 
     /// MVM-1・REPAIR-4・#4330: munmap が成功したら行は出ない。

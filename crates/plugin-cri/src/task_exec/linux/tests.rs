@@ -1567,3 +1567,131 @@ fn repair4_4379_other_rejections_are_not_counted() {
     assert_eq!(counts(&l, "shim_exec_instance_changed"), None);
     assert_eq!(counts(&l, "shim_exec_pid_unreported"), None);
 }
+
+/// `ExecProcessRequest { id = 1; exec_id = 2; spec = 7 }` を手で組む（prost を依存に足さない）。
+fn exec_request_payload(id: &str, exec_id: &str) -> Vec<u8> {
+    let spec = br#"{"cwd":"/","args":["/bin/true"]}"#;
+    let url = PROCESS_TYPE_URL.as_bytes();
+    let mut any = vec![0x0a, url.len() as u8];
+    any.extend_from_slice(url);
+    any.extend_from_slice(&[0x12, spec.len() as u8]);
+    any.extend_from_slice(spec);
+    let mut b = vec![0x0a, id.len() as u8];
+    b.extend_from_slice(id.as_bytes());
+    b.extend_from_slice(&[0x12, exec_id.len() as u8]);
+    b.extend_from_slice(exec_id.as_bytes());
+    b.extend_from_slice(&[0x3a, any.len() as u8]);
+    b.extend_from_slice(&any);
+    b
+}
+
+/// `StartRequest { id = 1; exec_id = 2 }` を手で組む。
+fn start_request_payload(id: &str, exec_id: &str) -> Vec<u8> {
+    let mut b = vec![0x0a, id.len() as u8];
+    b.extend_from_slice(id.as_bytes());
+    b.extend_from_slice(&[0x12, exec_id.len() as u8]);
+    b.extend_from_slice(exec_id.as_bytes());
+    b
+}
+
+/// TaskService の `Exec` → `Start(exec_id)` を通す。応答のバイト列と、終了時の書き出しを捕まえたバイト列、共有記録器を返す。
+/// 返す前に `TaskService` を drop し、終了時の書き出しを済ませる。
+fn drive_task_service_start(
+    tag: &str,
+    script: Script,
+) -> (Vec<u8>, Arc<Mutex<Vec<u8>>>, Arc<OpRecorder>) {
+    use fandhe_container_cri::adapter::RuntimeAdapter;
+    use fandhe_container_cri::shim_v2::{TaskApiVersion, TaskService, TtrpcService};
+
+    use crate::shim::serve_end::tests::capture_sink;
+    use crate::shim::serve_end::{FinalOpStatsExport, ServeEndLauncher};
+
+    let fx = Fixture::new(tag);
+    let rec = Arc::new(OpRecorder::new());
+    let budgets = ExecBudgets {
+        spawned: Duration::from_millis(100),
+        ..ExecBudgets::default()
+    };
+    let spawner = FakeSpawner {
+        script,
+        pids: Arc::new(Mutex::new(Vec::new())),
+    };
+    let launcher = Arc::new(
+        ShimExecLauncher::with_budgets(
+            fx.dir.0.join("state"),
+            Arc::clone(&fx.store) as Arc<dyn StateStore>,
+            Arc::new(spawner),
+            probe(0),
+            budgets,
+        )
+        .with_recorder(Arc::clone(&rec)),
+    );
+    let (sink, buf) = capture_sink();
+    let final_stats = FinalOpStatsExport::new(Arc::clone(&rec), sink.clone(), WAIT);
+    let runtime = crate::adapter::CoreLifecycleRuntime::with_recorder(
+        Arc::clone(&fx.store) as Arc<dyn StateStore>,
+        Arc::clone(&rec),
+    );
+    let service = TaskService::new(TaskApiVersion::V2, RuntimeAdapter::new(Arc::new(runtime)))
+        .with_exec_launcher(Arc::new(ServeEndLauncher::new(launcher, final_stats)));
+    service
+        .handle("Exec", &exec_request_payload("run1", "e1"))
+        .expect("exec registered");
+    let resp = service
+        .handle("Start", &start_request_payload("run1", "e1"))
+        .expect("start");
+    drop(service);
+    assert!(sink.flush(WAIT));
+    (resp, buf, rec)
+}
+
+fn rec_counts(rec: &OpRecorder, name: &str) -> Option<(u64, u64)> {
+    rec.snapshot_op(&fandhe_container_core::observability::OpName::new(name).expect("name"))
+        .map(|s| (s.success(), s.failure()))
+}
+
+/// CRI-5・REPAIR-4・#4408: `Spawned` が予算内に届かない exec の `Start` は pid 0（proto3 の既定値で空のバイト列）で成功し、
+/// `shim_exec_pid_unreported` がちょうど 1 になり、serve の終了時の書き出しに載る。
+#[test]
+fn cri5_repair4_4408_task_service_start_exec_reports_pid_zero_and_counts() {
+    use crate::shim::serve_end::tests::captured_lines;
+
+    let (resp, buf, rec) = drive_task_service_start("t4408-start", holding());
+    assert_eq!(resp, Vec::<u8>::new(), "pid 0 is encoded as empty");
+    assert_eq!(rec_counts(&rec, "shim_exec_pid_unreported"), Some((0, 1)));
+    assert_eq!(rec_counts(&rec, "shim_exec_instance_changed"), None);
+    let lines = captured_lines(&buf);
+    let stat: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.contains(r#""event":"op_stats","#))
+        .collect();
+    assert_eq!(stat.len(), 1, "{lines:?}");
+    assert!(
+        stat[0].starts_with(
+            r#"{"event":"op_stats","op":"shim_exec_pid_unreported","success":0,"failure":1,"count":1,"#
+        ),
+        "{lines:?}"
+    );
+    assert_eq!(
+        lines.iter().filter(|l| l.contains("op_stats_meta")).count(),
+        1,
+        "{lines:?}"
+    );
+}
+
+/// 対照（#4408）: `Spawned` が予算内に届く exec の `Start` は実 pid（4242 の varint）を返し、計数を増やさず、何も書き出さない。
+#[test]
+fn cri5_repair4_4408_task_service_start_exec_reports_real_pid_when_spawned() {
+    use crate::shim::serve_end::tests::captured_lines;
+
+    let (resp, buf, rec) =
+        drive_task_service_start("t4408-pid", spawning(Duration::from_millis(10), 1, None));
+    // 4242 = 0x1092 → varint [0x92, 0x21]。
+    assert_eq!(resp, vec![0x08, 0x92, 0x21]);
+    assert_eq!(rec_counts(&rec, "shim_exec_pid_unreported"), None);
+    assert!(
+        captured_lines(&buf).is_empty(),
+        "{:?}",
+        captured_lines(&buf)
+    );
+}

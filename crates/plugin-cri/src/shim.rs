@@ -9,7 +9,7 @@
 //! 組み立て（Linux）: 既定の状態ルート（`StateRoot::resolve(None)`。外部入力から受けない）の下を containerd の address・namespace ごとに分けた（`scoped_root`。状態ルートの兄弟に置く） `FileStateStore` の上に
 //! `CoreLifecycleRuntime` を作り、`RuntimeAdapter` で包んで `TaskService`（v2・v3。`with_shared_created` で共有）を登録する。
 //! exec（#4149）: `ShimExecLauncher`（#4148）を同じ状態ストアから作って v2・v3 へ `with_exec_launcher` で差す。停止時は登録簿の drop で
-//! 追跡中の helper を kill する（`StopHelpersOnDrop`）。
+//! 追跡中の helper を kill したのち、共有記録器の操作統計を stderr へ 1 回書き出す（`serve_end::ServeEndLauncher`。#4408）。
 //! デーモンの監査の記録先（`ServeContext::audit_sink`）を `with_create_audit_sink` に渡し、create の `mounts[].destination` の拒否を
 //! peer UID の拒否と同じ `@audit.log` へ残す（SEC-4）。
 //!
@@ -159,37 +159,6 @@ fn core_runtime_for(state: std::sync::Arc<dyn StateStore>) -> crate::adapter::Co
     )
 }
 
-/// shim の停止時に追跡中の exec helper を止める `TaskExecLauncher` の包み（CRI-5・REPAIR-5・#4149）。
-///
-/// `launch` は中の [`ShimExecLauncher`] へ委ねるだけで、`Drop` で `shutdown_all` を呼ぶ。cri の bootstrap に停止の注入口を足さずに済ませる
-/// ための置き場所で、`run_serve` の終わりに `TtrpcServer` が drop され、接続スレッドの join の後に登録簿・`TaskService`（v2・v3）が
-/// drop されると最後の参照が落ちて止まる（Shutdown RPC でも socket 消失でも同じ）。
-/// 残余: サーバー停止の期限切れで接続スレッドが残る場合と shim の SIGKILL では走らず、helper は exec の期限（最長 1 時間）まで残る
-/// （`docs/design/shim-v2-production-binary.md`「#4149 の実装記録」）。
-#[cfg(target_os = "linux")]
-struct StopHelpersOnDrop(std::sync::Arc<crate::task_exec::ShimExecLauncher>);
-
-#[cfg(target_os = "linux")]
-impl fandhe_container_cri::shim_v2::exec::TaskExecLauncher for StopHelpersOnDrop {
-    fn launch(
-        &self,
-        container: &ContainerId,
-        exec_id: &fandhe_container_cri::shim_v2::exec::ExecId,
-        spec: &fandhe_container_cri::shim_v2::exec::ExecProcessSpec,
-        expected_instance: Option<u64>,
-    ) -> Result<std::sync::Arc<dyn fandhe_container_cri::shim_v2::exec::TaskExecProcess>, CriError>
-    {
-        self.0.launch(container, exec_id, spec, expected_instance)
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl Drop for StopHelpersOnDrop {
-    fn drop(&mut self) {
-        self.0.shutdown_all();
-    }
-}
-
 /// 状態ルートを引数で受ける内側の関数（試験が一時ディレクトリの状態ルートで呼ぶ）。
 #[cfg(target_os = "linux")]
 pub(crate) fn registry_in(
@@ -206,6 +175,22 @@ pub(crate) fn registry_in(
 pub(crate) fn registry_parts_in(
     root: fandhe_container_core::state_store::StateRoot,
     ctx: ServeContext,
+) -> Result<
+    (
+        ServiceRegistry,
+        std::sync::Arc<crate::task_exec::ShimExecLauncher>,
+    ),
+    CriError,
+> {
+    registry_parts_with_sink(root, ctx, crate::telemetry::stderr_sink().clone())
+}
+
+/// [`registry_parts_in`] の本体。起動時の走査と終了時の操作統計（#4408）の送り先を引数で受ける（試験が行を捕まえる）。
+#[cfg(target_os = "linux")]
+pub(crate) fn registry_parts_with_sink(
+    root: fandhe_container_core::state_store::StateRoot,
+    ctx: ServeContext,
+    sink: crate::telemetry::LineSink,
 ) -> Result<
     (
         ServiceRegistry,
@@ -234,7 +219,16 @@ pub(crate) fn registry_parts_in(
         crate::task_exec::ShimExecLauncher::production(state_root, Arc::clone(&state))
             .with_recorder(Arc::clone(&sweep_recorder)),
     );
-    let exec: Arc<dyn TaskExecLauncher> = Arc::new(StopHelpersOnDrop(Arc::clone(&launcher)));
+    // 終了時（登録簿の drop）に helper を止めてから共有記録器の操作統計を 1 回書き出す（#4149・#4408）。
+    let final_stats = serve_end::FinalOpStatsExport::new(
+        Arc::clone(&sweep_recorder),
+        sink.clone(),
+        serve_end::SHIM_FINAL_OP_STATS_WAIT,
+    );
+    let exec: Arc<dyn TaskExecLauncher> = Arc::new(serve_end::ServeEndLauncher::new(
+        Arc::clone(&launcher),
+        final_stats,
+    ));
     if let Some(sink) = ctx.audit_sink() {
         runtime = runtime.with_create_audit_sink(sink);
     }
@@ -262,8 +256,8 @@ pub(crate) fn registry_parts_in(
         state,
         sweep_recorder,
         startup_sweep::SHIM_STARTUP_LOG_SWEEP_BUDGET,
-        Arc::new(|line| {
-            let _ = crate::telemetry::stderr_sink().submit(line);
+        Arc::new(move |line| {
+            let _ = sink.submit(line);
         }),
     );
     Ok((reg, launcher))
@@ -878,6 +872,95 @@ mod tests {
             .expect("counted");
         assert_eq!((stats.success(), stats.failure()), (0, 1));
     }
+
+    /// REPAIR-4・CRI-5・#4408: 登録簿を drop すると、serve 開始後に起動役が数えた計数が `op_stats` 行と `op_stats_meta` 行として
+    /// 1 回だけ出る。計数が無い登録簿は何も出さない。
+    #[test]
+    fn repair4_4408_registry_drop_exports_launcher_counts() {
+        use crate::shim::serve_end::tests::{capture_sink, captured_lines};
+        use fandhe_container_core::state_store::FileStateStore;
+        use fandhe_container_core::traits::{
+            ContainerId, ContainerStatus, CreateStateRequest, StateStore,
+        };
+        use fandhe_container_cri::shim_v2::exec::{ExecId, TaskExecLauncher, parse_process_spec};
+        use fandhe_container_cri::shim_v2::task_api::Any;
+
+        let guard = test_root::test_root("shim", "final-export");
+        let root = StateRoot::resolve(Some(guard.join("state"))).expect("state root");
+        let (sink, buf) = capture_sink();
+        let (reg, launcher) = registry_parts_with_sink(
+            root.clone(),
+            ServeContext::new(ShutdownSignal::new(), None),
+            sink.clone(),
+        )
+        .expect("registry");
+        let store = FileStateStore::open(root).expect("open");
+        let id = ContainerId::new("c4408").expect("id");
+        let bundle = guard.join("bundle");
+        std::fs::create_dir_all(&bundle).expect("bundle");
+        store
+            .create(
+                &CreateStateRequest::new(ContainerStatus::created(id.clone(), None), bundle)
+                    .expect("req"),
+            )
+            .expect("create");
+        let spec = parse_process_spec(&Any {
+            type_url: fandhe_container_cri::shim_v2::exec::PROCESS_TYPE_URL.into(),
+            value: br#"{"cwd":"/","args":["/bin/true"]}"#.to_vec(),
+        })
+        .expect("spec");
+        let eid = ExecId::new("e1").expect("exec id");
+        launcher
+            .launch(&id, &eid, &spec, None)
+            .err()
+            .expect("mismatch");
+        // drop 前は終了時の書き出しは出ない。
+        assert!(sink.flush(std::time::Duration::from_secs(5)));
+        assert!(
+            captured_lines(&buf).is_empty(),
+            "{:?}",
+            captured_lines(&buf)
+        );
+        drop(reg);
+        drop(launcher);
+        assert!(sink.flush(std::time::Duration::from_secs(5)));
+        let lines = captured_lines(&buf);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[0].starts_with(
+                r#"{"event":"op_stats","op":"shim_exec_instance_changed","success":0,"failure":1,"count":1,"#
+            ),
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines[1],
+            r#"{"event":"op_stats_meta","ops":1,"dropped_records":0}"#
+        );
+    }
+
+    /// #4408: 計数が 1 件も無い登録簿の drop は何も出さない（`daemon.log` を空のブロックで埋めない）。
+    #[test]
+    fn repair4_4408_registry_drop_silent_without_counts() {
+        use crate::shim::serve_end::tests::{capture_sink, captured_lines};
+
+        let guard = test_root::test_root("shim", "final-silent");
+        let root = StateRoot::resolve(Some(guard.join("state"))).expect("state root");
+        let (sink, buf) = capture_sink();
+        let (reg, launcher) = registry_parts_with_sink(
+            root,
+            ServeContext::new(ShutdownSignal::new(), None),
+            sink.clone(),
+        )
+        .expect("registry");
+        drop(reg);
+        drop(launcher);
+        assert!(sink.flush(std::time::Duration::from_secs(5)));
+        assert!(
+            captured_lines(&buf).is_empty(),
+            "{:?}",
+            captured_lines(&buf)
+        );
+    }
 }
 
 /// 非 Linux は Shutdown だけの `EmptyTaskService` のまま（exec も `UNIMPLEMENTED`。CRI-5・REPAIR-3・#4149）。
@@ -905,6 +988,9 @@ mod non_linux_tests {
 
 #[cfg(target_os = "linux")]
 pub(crate) mod reclaim;
+
+#[cfg(target_os = "linux")]
+pub(crate) mod serve_end;
 
 #[cfg(target_os = "linux")]
 pub(crate) mod startup_sweep;

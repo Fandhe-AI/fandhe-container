@@ -19,8 +19,9 @@
 //!   （`event: op_stats` 行と `op_stats_meta` 行）で 1 回だけ `emit` へ流す（#4319・REPAIR-4）。値は固定語彙の操作名と整数だけで、
 //!   ID・パスは含まない。書き出しの失敗・送り先の詰まりは走査の結果・削除に影響しない（送り先は `try_send` で行を件数へ集約する）
 //!
-//! 残余（REPAIR-3）: 書き出しは走査完了時点の 1 回だけで、その後の lifecycle 操作の計数は shim からは出ない（定期出力は無い。
-//! `docs/design/cri-op-stats-export.md` で shim は対象外）。
+//! 書き出しはこの走査完了時点の 1 回と、serve の終了時の 1 回（`shim::serve_end`。#4408。計数が 1 件以上のときだけ）の計 2 時点である。
+//!
+//! 残余（REPAIR-3）: 定期出力・ファイル公開口は無い（`docs/design/cri-op-stats-export.md`）。SIGKILL や停止の期限切れでは終了時の書き出しも出ない。
 //!
 //! 残余: 並行して起動した別の shim の走査とは競合しうるが、ID ごとの削除はロックの下で guard を評価するため無害（片方が消し、もう片方は
 //! 見送る）。serve が走査より先に終わるとプロセスの終了で走査が途中で切れ、次の shim の起動時に回収される。稼働中に発生した残りも次の
@@ -129,15 +130,12 @@ pub(crate) fn spawn_startup_log_sweep(
 /// 走査 thread から、回収が 1 件以上あったときだけ呼ばれる。符号化の失敗（固定スキーマでは起きない）は 1 行も出さずに戻る。
 /// 出した行数を返す（真偽値に潰さない）。
 fn export_reclaim_stats(recorder: &OpRecorder, emit: &dyn Fn(String)) -> usize {
-    let mut buf: Vec<u8> = Vec::new();
-    if recorder.export_json_lines(Some(&mut buf)).is_err() {
+    let Some((lines, _)) = crate::telemetry::op_stats_lines(recorder) else {
         return 0;
-    }
-    let text = String::from_utf8_lossy(&buf);
-    let mut n = 0;
-    for line in text.lines() {
-        emit(line.to_owned());
-        n += 1;
+    };
+    let n = lines.len();
+    for line in lines {
+        emit(line);
     }
     n
 }

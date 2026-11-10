@@ -2077,6 +2077,7 @@ pub struct StopReport {
     pub unmap_failures: u64,
     /// MMIO exit 経路で受理判定に落ちて捨てた `QUEUE_NOTIFY` の件数（VM ごと。観測専用。#4459・MVM-1・MVM-5・REPAIR-4）。
     /// ioeventfd 経路の無視（`ioevent.ignored`）とは互いに素で、4 バイト以外の幅の書き込みは含まない。
+    /// 停止の集約行 `op=microvm.vcpus_stopped` の ` mmio_ignored=` にも同じ値が載る（#4467）。
     pub mmio_ignored: u64,
 }
 
@@ -2628,12 +2629,14 @@ struct AggState {
 }
 
 /// 停止・解放完了の集約行（正常系・失敗終了）の本文を組み立てる純関数。`StopAggregate::complete_one` から呼ばれる。
-/// `unmap_failures` は munmap の失敗件数で、0 でも必ず出す（キーを省かない。#4382・MVM-1・REPAIR-4）。
+/// `unmap_failures` は munmap の失敗件数、`mmio_ignored` は MMIO exit 経路で捨てた `QUEUE_NOTIFY` の件数で、
+/// どちらも 0 でも必ず出す（キーを省かない。#4382・#4467・MVM-1・REPAIR-4）。
 fn vcpus_stopped_log_line(
     stop_reason: StopReason,
     vcpus: u32,
     stats: &RunStats,
     unmap_failures: u64,
+    mmio_ignored: u64,
     elapsed_us: u128,
 ) -> String {
     let (level, outcome, code) = match stop_reason {
@@ -2641,7 +2644,7 @@ fn vcpus_stopped_log_line(
         _ => ("info", "ok", String::new()),
     };
     format!(
-        "level={level} op=microvm.vcpus_stopped outcome={outcome} reason={}{code} vcpus={vcpus} runs={} exits={} errors={} unmap_failures={unmap_failures} elapsed_us={elapsed_us}",
+        "level={level} op=microvm.vcpus_stopped outcome={outcome} reason={}{code} vcpus={vcpus} runs={} exits={} errors={} unmap_failures={unmap_failures} mmio_ignored={mmio_ignored} elapsed_us={elapsed_us}",
         stop_reason.as_str(),
         stats.runs,
         stats.exits,
@@ -2650,10 +2653,24 @@ fn vcpus_stopped_log_line(
 }
 
 /// 異常終了（スレッドの panic の unwind）の集約行の本文。unwind で解放した分の munmap 失敗も見えるようにする。
-fn vcpus_stopped_abnormal_log_line(vcpus: u32, unmap_failures: u64) -> String {
+/// `mmio_ignored` も同じく 0 でも出す（#4467。異常終了は報告を送らないので行だけが観測口）。
+fn vcpus_stopped_abnormal_log_line(vcpus: u32, unmap_failures: u64, mmio_ignored: u64) -> String {
     format!(
-        "level=error op=microvm.vcpus_stopped outcome=error code={} vcpus={vcpus} unmap_failures={unmap_failures}",
+        "level=error op=microvm.vcpus_stopped outcome=error code={} vcpus={vcpus} unmap_failures={unmap_failures} mmio_ignored={mmio_ignored}",
         MicrovmErrorCode::Internal.as_str(),
+    )
+}
+
+/// 確定した [`StopReport`] から集約行を作る。行と報告が同じ値（特に `mmio_ignored`）を持つことを、
+/// 値を 1 回だけ読んで報告に入れ、行をそこから作る構造で保証する（#4467・MVM-1・REPAIR-4）。
+fn vcpus_stopped_report_line(report: &StopReport) -> String {
+    vcpus_stopped_log_line(
+        report.reason,
+        report.vcpu_count,
+        &report.stats,
+        report.unmap_failures,
+        report.mmio_ignored,
+        report.elapsed.as_micros(),
     )
 }
 
@@ -2724,7 +2741,11 @@ impl StopAggregate {
         if abnormal {
             log_line(format_args!(
                 "{}",
-                vcpus_stopped_abnormal_log_line(self.vcpu_count, self.unmap.count())
+                vcpus_stopped_abnormal_log_line(
+                    self.vcpu_count,
+                    self.unmap.count(),
+                    self.mmio.mmio_ignored()
+                )
             ));
             self.exit.mark_abnormal_if_running();
             drop(sender);
@@ -2740,16 +2761,6 @@ impl StopAggregate {
         }
         let elapsed = self.started.elapsed();
         let unmap_failures = self.unmap.count();
-        log_line(format_args!(
-            "{}",
-            vcpus_stopped_log_line(
-                stop_reason,
-                self.vcpu_count,
-                &stats,
-                unmap_failures,
-                elapsed.as_micros()
-            )
-        ));
         let report = StopReport {
             reason: stop_reason,
             stats,
@@ -2760,6 +2771,7 @@ impl StopAggregate {
             unmap_failures,
             mmio_ignored: self.mmio.mmio_ignored(),
         };
+        log_line(format_args!("{}", vcpus_stopped_report_line(&report)));
         self.exit.complete(report);
         // 受け手（RunningMicroVm）が既に無ければ送信は失敗するが、解放は済んでいるので捨てる。
         if let Some(tx) = sender {
@@ -6497,27 +6509,93 @@ mod ioevent_tests {
             ..RunStats::default()
         };
         assert_eq!(
-            vcpus_stopped_log_line(StopReason::Requested, 2, &stats, 1, 42),
-            "level=info op=microvm.vcpus_stopped outcome=ok reason=requested vcpus=2 runs=10 exits=7 errors=0 unmap_failures=1 elapsed_us=42"
+            vcpus_stopped_log_line(StopReason::Requested, 2, &stats, 1, 0, 42),
+            "level=info op=microvm.vcpus_stopped outcome=ok reason=requested vcpus=2 runs=10 exits=7 errors=0 unmap_failures=1 mmio_ignored=0 elapsed_us=42"
         );
         assert!(
-            vcpus_stopped_log_line(StopReason::Requested, 2, &stats, 0, 42)
-                .contains(" errors=0 unmap_failures=0 elapsed_us=42")
+            vcpus_stopped_log_line(StopReason::Requested, 2, &stats, 0, 0, 42)
+                .contains(" errors=0 unmap_failures=0 mmio_ignored=0 elapsed_us=42")
         );
         let failed = vcpus_stopped_log_line(
             StopReason::Failed(MicrovmErrorCode::Internal),
             1,
             &stats,
             3,
+            0,
             5,
         );
         assert!(failed.starts_with("level=error op=microvm.vcpus_stopped outcome=error reason="));
         assert!(failed.contains(" code=INTERNAL vcpus=1 "));
-        assert!(failed.ends_with(" unmap_failures=3 elapsed_us=5"));
+        assert!(failed.ends_with(" unmap_failures=3 mmio_ignored=0 elapsed_us=5"));
         assert_eq!(
-            vcpus_stopped_abnormal_log_line(2, 1),
-            "level=error op=microvm.vcpus_stopped outcome=error code=INTERNAL vcpus=2 unmap_failures=1"
+            vcpus_stopped_abnormal_log_line(2, 1, 0),
+            "level=error op=microvm.vcpus_stopped outcome=error code=INTERNAL vcpus=2 unmap_failures=1 mmio_ignored=0"
         );
+    }
+
+    /// MVM-1・MVM-5・REPAIR-4・#4467: 集約行は `mmio_ignored=` を 0 と 1 件以上の具体値で出す（0 でも省かない）。
+    #[test]
+    fn mvm1_4467_vcpus_stopped_line_carries_mmio_ignored() {
+        let stats = RunStats {
+            runs: 10,
+            exits: 7,
+            errors: 0,
+            ..RunStats::default()
+        };
+        assert_eq!(
+            vcpus_stopped_log_line(StopReason::Requested, 2, &stats, 1, 5, 42),
+            "level=info op=microvm.vcpus_stopped outcome=ok reason=requested vcpus=2 runs=10 exits=7 errors=0 unmap_failures=1 mmio_ignored=5 elapsed_us=42"
+        );
+        let failed = vcpus_stopped_log_line(
+            StopReason::Failed(MicrovmErrorCode::Internal),
+            1,
+            &stats,
+            0,
+            3,
+            5,
+        );
+        assert!(failed.ends_with(" unmap_failures=0 mmio_ignored=3 elapsed_us=5"));
+        assert_eq!(
+            vcpus_stopped_abnormal_log_line(2, 0, 3),
+            "level=error op=microvm.vcpus_stopped outcome=error code=INTERNAL vcpus=2 unmap_failures=0 mmio_ignored=3"
+        );
+    }
+
+    /// MVM-1・MVM-5・REPAIR-4・#4467: 報告から作る集約行の `mmio_ignored=` は報告の値と一致する。
+    /// 製品の `complete_one` は同じ関数で行を出す（行は最後の vCPU スレッドから stderr へ出るため試験からは捕捉できず、構造で保証する）。
+    #[test]
+    fn mvm1_4467_report_line_matches_report_mmio_ignored() {
+        for n in [0u64, 7] {
+            let report = StopReport {
+                reason: StopReason::Requested,
+                stats: RunStats {
+                    runs: 3,
+                    exits: 2,
+                    errors: 0,
+                    ..RunStats::default()
+                },
+                elapsed: Duration::from_micros(9),
+                vcpu_count: 2,
+                origin_vcpu: None,
+                ioevent: IoEventCounts::default(),
+                unmap_failures: 0,
+                mmio_ignored: n,
+            };
+            let line = vcpus_stopped_report_line(&report);
+            assert_eq!(
+                line,
+                format!(
+                    "level=info op=microvm.vcpus_stopped outcome=ok reason=requested vcpus=2 runs=3 exits=2 errors=0 unmap_failures=0 mmio_ignored={n} elapsed_us=9"
+                )
+            );
+            let v: u64 = line
+                .split(" mmio_ignored=")
+                .nth(1)
+                .and_then(|r| r.split(' ').next())
+                .and_then(|x| x.parse().ok())
+                .unwrap();
+            assert_eq!(v, report.mmio_ignored);
+        }
     }
 
     /// MVM-1・REPAIR-4・#4161: signal せずに起こされた（`take() == 0`）場合は無視として数えない。

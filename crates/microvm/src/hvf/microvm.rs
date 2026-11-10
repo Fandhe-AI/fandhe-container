@@ -255,7 +255,7 @@ struct HvfVmParts<B: BlockBackend, N: NetBackend> {
     /// `hv_vm_unmap` の失敗を数える VM ごとの集約先（`unmap` とは別。`release` が `Resources` で渡し、集約行の
     /// `vm_unmap_failures=` に出す。#4439）。
     vm_unmap: Arc<UnmapTally>,
-    /// MMIO exit 経路で捨てた QUEUE_NOTIFY の件数の集約先（`HvfDeviceBus` と共有。`release` が `Ok` の報告へ写す。#4459）。
+    /// MMIO exit 経路で捨てた QUEUE_NOTIFY の件数の集約先（`HvfDeviceBus` と共有。`release` が `Resources` で渡し、集約行の ` mmio_ignored=` と報告に同じ値を出す。#4459・#4467）。
     queue_notify: Arc<QueueNotifyTally>,
     /// 受信ポーラー `hvf-net-rx`（virtio-net がある構成の start 以降。`release` が vCPU の後に止める。#4030）。
     net_rx: Option<NetRxPollerHandle>,
@@ -301,7 +301,7 @@ impl<B: BlockBackend, N: NetBackend> HvfVmParts<B, N> {
             ));
         };
         // 受信ポーラーは vCPU の後に止め、止まりを確かめるまで RAM を解放しない（#4030）。
-        let mut report = stop_and_release(
+        stop_and_release(
             op,
             StopWithAux {
                 vcpus,
@@ -314,13 +314,9 @@ impl<B: BlockBackend, N: NetBackend> HvfVmParts<B, N> {
                 vm,
                 unmap: Arc::clone(&self.unmap),
                 vm_unmap: Arc::clone(&self.vm_unmap),
+                mmio: Arc::clone(&self.queue_notify),
             },
-        );
-        // デバイスを落とした後の最終値（観測専用。停止の合否には使わない。#4459）。
-        if let Ok(r) = &mut report {
-            r.mmio_ignored = self.queue_notify.mmio_ignored();
-        }
-        report
+        )
     }
 
     fn read_guest(&self, addr: u64, buf: &mut [u8]) -> Result<(), MicrovmError> {

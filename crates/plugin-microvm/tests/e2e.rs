@@ -7,8 +7,17 @@
 //!
 //! - 層 A（既定集合・unix・KVM 不要）: plugin 役のスレッドが `main.rs` と同じ順
 //!   （peer 認証つき connect → `MicrovmRuntimeAdapter` → `serve` → `stop_all`）を偽バックエンドで実行し、実 UDS 上で
-//!   起動・停止・切断時の回収・起動失敗後の接続維持を具体値で照合する。あわせて `serve_until` と停止フラグ
-//!   （SIGTERM 相当。#3747）で、実行中 VM の停止と、停止に入った後に届いた要求が処理されないことを照合する。
+//!   次を具体値で照合する。
+//!   - 起動・停止の往復、initrd の到達、切断時の `stop_all` による回収、起動失敗の Error フレームと接続の維持
+//!   - `serve_until` と停止フラグ（SIGTERM 相当。#3747）による実行中 VM の停止と、停止に入った後に届いた要求が処理されないこと
+//!   - イメージパスの読み取り失敗（実体でない・存在しない・権限なし）が固定文言の Error フレームになり、
+//!     パスや OS の文言を漏らさないこと（#3841）
+//!   - 停止期限切れで切り離した VM の枠が、終了を観測するまで返されず、観測後の start で回収されること（#3745）
+//!   - 構造化ログの結果行: stop の結果行に ioeventfd の件数（` ignored=`・` unbind_failed=`）が出ること（#4161）、
+//!     切断時の `stop_all` が複数台の件数を合算して集約行へ出すこと（#4438）。結果行は stderr へ直接書かれるため、
+//!     自身を子プロセスで再実行して集める
+//!   - 層 B で使う `check_kvm_stop_line` を、偽の行の受理・拒否で固定すること（#4456）と、adapter が KVM 形で実際に
+//!     組み立てた stop の結果行が同じ関数を通り、`mmio_ignored` を持たない旧い形は拒否されること（#4465）
 //! - 層 B（`#[ignore]`・実機前提）: 実バイナリを spawn し、Linux x86_64 では本物の `KvmBackend`（`/dev/kvm` が要る）、
 //!   Linux aarch64 でも本物の `KvmBackend`（`/dev/kvm` と in-kernel vGICv3・`KVM_CAP_ARM_PSCI_0_2` が要る。#3959）、
 //!   macOS aarch64 では本物の `HvfBackend`（Apple Silicon の macOS 15 以降と entitlement つきの署名が要る。TASK-192.18・#3800）で、
@@ -22,8 +31,10 @@
 //! shutdown を期待する負の対照は、停止要求と shutdown exit のどちらが先に観測されるかが競合し、
 //! 寛容な assert になるため置かない。Linux aarch64 の層 B は、ネイティブ arm64 の CI が無く（#2274）型検査のみ
 //! `cross-target-check` の `aarch64-unknown-linux-gnu` が担い、実機での実行は人間担当の #3781。
-//! KVM の stop の結果行（`ignored=`・`unbind_failed=`・`unmap_failures=`・`mmio_ignored=`）は `check_kvm_stop_line` で完全一致照合する（#4456・#4465）。
-//! adapter が組み立てた KVM 形の行は既定集合の試験でも同じ関数に通す（#4465）。
+//! KVM の stop の結果行は `check_kvm_stop_line` で照合する。期待形は
+//! `level=info op=plugin.microvm.stop outcome=ok elapsed_us=<数> vms=0 ignored=<数> unbind_failed=0 unmap_failures=0 mmio_ignored=0`
+//! で、`elapsed_us`・`ignored` は数字であることだけを見て、残りはこの順で完全一致させる（#4456・#4465）。
+//! 層 B（実機）と層 A（adapter の実出力・偽の行）の両方が同じ関数を通す。
 //! 待ちはすべて期限つきで、超過時は kill して失敗にする（REPAIR-5）。
 #![cfg(unix)]
 

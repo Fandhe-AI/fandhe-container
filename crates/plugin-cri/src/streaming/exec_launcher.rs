@@ -8,7 +8,9 @@
 //! Exec ごとに supervisor の実行ファイル（plugin-cri の実体と同じディレクトリの固定名。`PATH` 探索なし）を
 //! `stream-exec` で起動して単一スレッドの helper にし、パスを持たない socketpair（helper の fd 0）で次をやり取りする。
 //! 1. 要求された stdio の端（`UnixStream::pair` の片側）を `SCM_RIGHTS` で渡す（`send_stdio_handover`）
-//! 2. helper が `Started` を返す（exec の子 cgroup の通知後）。tty の能力があれば続けて `PtyMaster`
+//! 2. helper が `Started` を返す（exec の子 cgroup の通知後）。tty のときは続けて `PtyMaster`（ちょうど 1 回）、
+//!    その後 `Spawned`（高々 1 回）、最後に `Result`。順序違反（`Started` 前の `PtyMaster`・`Spawned`、tty で `Started` の
+//!    次が `PtyMaster` でない、`Result` 待ちの間の重複または非 tty の `PtyMaster`）は拒否し helper を kill する（SEC-1）
 //! 3. 専用 std スレッドが `Result` を待ち、終了コードを std の `UnixStream::pair` 経由で tokio 側へ渡す
 //!    （tokio の `sync`・`io-util`・`process` feature は使わない。`log_attach` と同じ橋渡し）
 //!
@@ -35,9 +37,8 @@
 //! 保護されない残余: 両側とも `None`（識別子を報告しない実装・記録の無い旧い `state.json`）は判定できないので通す。
 //!
 //! # 未実装・簡易実装・残余（REPAIR-3）
-//! - tty: 受け側（`PtyMaster` の検証と resize の転送）は実装・試験済みだが、helper が `--tty` を受けず supervisor の
-//!   `ExecStdio` に pty が無いため、本番の spawner は能力 `tty = false` で、tty の要求は launcher でも断る（後続 issue。
-//!   cri 側は RPC 時に `ExecStreamHandler::without_tty` で断る）。tty のときは stdio の fd を送らない（mask 0。暫定）。
+//! - tty: 実装済み（#4416・#4417）。本番の spawner は能力 `tty = true` で `--tty` を付けて起動し、`PtyMaster` の検証と
+//!   resize の転送を受け側が担う。tty のときは stdio の fd を送らない（mask 0 は契約。SEC-1）。0 行 0 列の resize はそのまま渡す。
 //! - helper の fd 1 は `/dev/null`。fd 2 は AF_UNIX の socketpair で受け、上限つきで固定語彙の構造化ログへ転送する
 //!   （[`diagnostics`]。上限・転送の規則・停止・残余は同モジュールの doc。#4171・REPAIR-4・REPAIR-5）。
 //! - セッションは最長 `MAX_EXEC_HOLD_SECS`（1 時間）で helper が止める（kubelet の idle 4 時間より短い）。
@@ -117,7 +118,7 @@ pub struct SpawnedHelper {
     pub diagnostics: Option<StdUnixStream>,
 }
 
-/// helper が対応する機能（本番の spawner は `tty = false`。後続 issue で true にする）。
+/// helper が対応する機能（本番の spawner は `tty = true`。試験の偽 spawner は false を宣言できる。#4417）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct HelperCapabilities {
     /// helper が pty を割り当てて `PtyMaster` を返せるか。
@@ -157,7 +158,7 @@ impl HelperSpawner for ProductionHelperSpawner {
     }
 
     fn capabilities(&self) -> HelperCapabilities {
-        HelperCapabilities { tty: false }
+        HelperCapabilities { tty: true }
     }
 }
 
@@ -652,7 +653,8 @@ impl SupervisorExecLauncher {
         if cancel.is_cancelled() {
             return Err(cancelled());
         }
-        // tty のときは stdio の fd を送らない（mask 0。supervisor 側の pty 結線が入るまでの暫定）。
+        // tty のときは stdio の fd を送らない（mask 0。契約: コマンドの fd 0〜2 は pty の slave になり、
+        // `with_tty()` と helper の引数解析が mask 0 を強制する。ホストの fd をコンテナへ渡さない。SEC-1・#4417）。
         let mask = if req.tty {
             StdioMask::from_presence(false, false, false)
         } else {
@@ -666,6 +668,8 @@ impl SupervisorExecLauncher {
             mask,
             req.cmd.clone(),
         )
+        // tty のときは `--tty` を付ける（mask 0 のときだけ成功する。#4417）。
+        .and_then(|a| if req.tty { a.with_tty() } else { Ok(a) })
         .map_err(|_| CriError::invalid_argument("exec request was rejected"))?;
 
         // 要求された分だけ socketpair を作る（親側 = plugin-cri、子側 = helper へ渡す端）。

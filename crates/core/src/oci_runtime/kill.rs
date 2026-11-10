@@ -62,7 +62,7 @@ use crate::traits::{
 };
 
 /// [`OpRecorder`] に記録する操作名（REPAIR-4）。
-const KILL_OP_NAME: &str = "kill";
+pub(super) const KILL_OP_NAME: &str = "kill";
 
 /// シグナル送信の境界（PID 再利用対策。SEC-1・CORE-1）。
 ///

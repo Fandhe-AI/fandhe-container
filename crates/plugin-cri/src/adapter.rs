@@ -2841,45 +2841,17 @@ mod tests {
         );
     }
 
-    /// REPAIR-4・NET-1・CORE-1（#4380）: ライフサイクル記録器（本番のみ）へ届きうる操作名の最悪数は 53 種で、
-    /// `MAX_TRACKED_OPS - 8` 以下。名前の出典: core の `oci_runtime`（create・delete・kill と image_ref_*・image_rootfs_* の定数。
-    /// start は記録器を渡さない）・本ファイルの `CoreLifecycleRuntime` の記録・`netsetup.rs` の `net.*`・`net_op_name` の 8 種・delete が `remove_with_recorder` 経由で書く `exec_cgroup_sweep_*` の 10 種
-    /// （`cgroups/exec_kill.rs` の kill_all と unpopulated の各 5 名）。
+    /// REPAIR-4・NET-1・CORE-1（#4380）: ライフサイクル記録器（本番のみ）へ届きうる操作名の最悪数は 54 種（core の一覧が
+    /// start を含むため実際より 1 多い安全側の数え方。実際は 53 種）で、`MAX_TRACKED_OPS - 8` 以下。名前の出典: core の
+    /// `oci_runtime::LIFECYCLE_OP_NAMES`（create・start・kill・delete と image_ref_*・image_rootfs_*。公開一覧から数え直す。#4409）・本ファイルの `CoreLifecycleRuntime` の記録・`netsetup.rs` の `net.*`・`net_op_name` の 8 種・delete が `remove_with_recorder` 経由で書く `exec_cgroup_sweep_*`
+    /// （core の `cgroups::EXEC_CGROUP_SWEEP_OP_NAMES`。kill_all と unpopulated の各 5 名）。
     #[cfg(target_os = "linux")]
     #[test]
     fn repair4_4380_lifecycle_recorder_worst_case_name_count_leaves_headroom() {
         use fandhe_container_net::instrument::NetOpKind as K;
-        let core_names = [
-            "create",
-            "delete",
-            "kill",
-            "image_ref_register",
-            "image_ref_rollback",
-            "image_ref_bind",
-            "image_ref_lookup",
-            "image_ref_release",
-            "image_rootfs_unpack",
-            "image_rootfs_cleanup",
-            "image_rootfs_remove",
-            "image_rootfs_reap",
-            "image_rootfs_reap_kept_unverified",
-            "image_rootfs_reap_failed",
-            "image_rootfs_reap_truncated",
-            "image_rootfs_reap_scan_failed",
-            "image_rootfs_orphan_reap",
-        ];
-        let sweep_names = [
-            "exec_cgroup_sweep_kill_all",
-            "exec_cgroup_sweep_kill_all_cut",
-            "exec_cgroup_sweep_kill_all_child",
-            "exec_cgroup_sweep_kill_all_left_populated",
-            "exec_cgroup_sweep_kill_all_left_owner_alive",
-            "exec_cgroup_sweep_unpopulated",
-            "exec_cgroup_sweep_unpopulated_cut",
-            "exec_cgroup_sweep_unpopulated_child",
-            "exec_cgroup_sweep_unpopulated_left_populated",
-            "exec_cgroup_sweep_unpopulated_left_owner_alive",
-        ];
+        // core の名前は core の公開一覧から取る（書き写さない。core に名前が増えたら数え直される。#4409）。
+        let core_names = fandhe_container_core::oci_runtime::LIFECYCLE_OP_NAMES;
+        let sweep_names = fandhe_container_core::cgroups::EXEC_CGROUP_SWEEP_OP_NAMES;
         let plugin_names = [
             "supervisor_log_remove",
             "container_log_remove",
@@ -2947,7 +2919,7 @@ mod tests {
         let net_names: Vec<&str> = net_recorded.iter().map(String::as_str).collect();
 
         let mut all: Vec<&str> = Vec::new();
-        all.extend(core_names);
+        all.extend(core_names.iter().copied());
         all.extend(sweep_names);
         all.extend(plugin_names);
         all.extend(failure_ops.iter().copied());
@@ -2957,7 +2929,12 @@ mod tests {
         let total = rec.snapshot().len();
         assert_eq!(
             total,
-            17 + 10 + 5 + 5 + 8 + 8,
+            core_names.len()
+                + sweep_names.len()
+                + plugin_names.len()
+                + failure_ops.len()
+                + netsetup_names.len()
+                + net_names.len(),
             "lifecycle recorder worst case"
         );
         assert!(

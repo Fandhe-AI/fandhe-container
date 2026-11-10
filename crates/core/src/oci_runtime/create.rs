@@ -96,16 +96,16 @@ use crate::traits::{
 const CONFIG_FILE_NAME: &str = "config.json";
 
 /// [`OpRecorder`] に記録する操作名（REPAIR-4）。
-const CREATE_OP_NAME: &str = "create";
+pub(super) const CREATE_OP_NAME: &str = "create";
 
 /// 参照登録・登録の巻き戻しの操作名（REPAIR-4）。
-const IMAGE_REF_REGISTER_OP_NAME: &str = "image_ref_register";
-const IMAGE_REF_ROLLBACK_OP_NAME: &str = "image_ref_rollback";
-const IMAGE_REF_BIND_OP_NAME: &str = "image_ref_bind";
+pub(super) const IMAGE_REF_REGISTER_OP_NAME: &str = "image_ref_register";
+pub(super) const IMAGE_REF_ROLLBACK_OP_NAME: &str = "image_ref_rollback";
+pub(super) const IMAGE_REF_BIND_OP_NAME: &str = "image_ref_bind";
 
 /// レイヤー展開と、失敗時の展開途中 rootfs の削除の操作名（REPAIR-4・#2342）。
-const IMAGE_ROOTFS_UNPACK_OP_NAME: &str = "image_rootfs_unpack";
-const IMAGE_ROOTFS_CLEANUP_OP_NAME: &str = "image_rootfs_cleanup";
+pub(super) const IMAGE_ROOTFS_UNPACK_OP_NAME: &str = "image_rootfs_unpack";
+pub(super) const IMAGE_ROOTFS_CLEANUP_OP_NAME: &str = "image_rootfs_cleanup";
 
 /// `config.json` を検証し、プロセス未起動の「created」状態を `store` に作る。
 ///

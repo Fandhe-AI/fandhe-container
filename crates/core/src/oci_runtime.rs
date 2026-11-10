@@ -56,6 +56,33 @@ mod start;
 mod sysfs_mount;
 mod working_dir;
 
+/// ライフサイクル操作（create・start・kill・delete と派生の `create_with_image`・`delete_releasing_image_ref` 等）が、
+/// 注入された `OpRecorder` へ書く固定の操作名の全部（REPAIR-4・CRI-6）。
+/// 記録箇所の定数から組むため二重管理にならない。記録器の名前の上限 `observability::MAX_TRACKED_OPS` の余裕を
+/// 数える利用者（plugin-cri の試験）のために公開する。delete は Linux で cgroup の掃除の名前
+/// （`cgroups::EXEC_CGROUP_SWEEP_OP_NAMES`）も書くが、Linux 限定のため別の一覧に分ける。
+/// 名前を足すときは記録箇所の定数を作ってここへ足す。
+pub const LIFECYCLE_OP_NAMES: &[&str] = &[
+    create::CREATE_OP_NAME,
+    start::START_OP_NAME,
+    kill::KILL_OP_NAME,
+    delete::DELETE_OP_NAME,
+    create::IMAGE_REF_REGISTER_OP_NAME,
+    create::IMAGE_REF_ROLLBACK_OP_NAME,
+    create::IMAGE_REF_BIND_OP_NAME,
+    create::IMAGE_ROOTFS_UNPACK_OP_NAME,
+    create::IMAGE_ROOTFS_CLEANUP_OP_NAME,
+    delete::IMAGE_ROOTFS_REMOVE_OP_NAME,
+    delete::IMAGE_REF_RELEASE_OP_NAME,
+    delete::IMAGE_REF_LOOKUP_OP_NAME,
+    image_rootfs::IMAGE_ROOTFS_ORPHAN_REAP_OP_NAME,
+    image_rootfs::REAP_KEPT_UNVERIFIED_OP_NAME,
+    image_rootfs::REAP_FAILED_OP_NAME,
+    image_rootfs::REAP_TRUNCATED_OP_NAME,
+    image_rootfs::REAP_SCAN_FAILED_OP_NAME,
+    image_rootfs::IMAGE_ROOTFS_REAP_OP_NAME,
+];
+
 #[cfg(target_os = "linux")]
 pub(crate) use bind_mounts::ProtectedFsRoot;
 pub use bind_mounts::{
@@ -134,3 +161,42 @@ pub use sysfs_mount::{
     SysfsMountError, SysfsMountErrorKind, SysfsMountSpec, audit_sysfs_mount_error,
 };
 pub use working_dir::ContainerWorkingDir;
+
+#[cfg(test)]
+mod lifecycle_op_names_tests {
+    use super::LIFECYCLE_OP_NAMES;
+    use crate::observability::OpName;
+
+    /// REPAIR-4・CRI-6（#4409）: 公開一覧は具体値で固定し、名前を足すと本試験の更新が要る。
+    #[test]
+    fn repair4_4409_lifecycle_op_names_are_exactly_the_recorded_names() {
+        assert_eq!(
+            LIFECYCLE_OP_NAMES,
+            &[
+                "create",
+                "start",
+                "kill",
+                "delete",
+                "image_ref_register",
+                "image_ref_rollback",
+                "image_ref_bind",
+                "image_rootfs_unpack",
+                "image_rootfs_cleanup",
+                "image_rootfs_remove",
+                "image_ref_release",
+                "image_ref_lookup",
+                "image_rootfs_orphan_reap",
+                "image_rootfs_reap_kept_unverified",
+                "image_rootfs_reap_failed",
+                "image_rootfs_reap_truncated",
+                "image_rootfs_reap_scan_failed",
+                "image_rootfs_reap",
+            ]
+        );
+        let unique: std::collections::BTreeSet<_> = LIFECYCLE_OP_NAMES.iter().collect();
+        assert_eq!(unique.len(), 18);
+        for n in LIFECYCLE_OP_NAMES {
+            assert!(OpName::new(*n).is_ok(), "{n}");
+        }
+    }
+}

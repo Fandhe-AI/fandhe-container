@@ -156,7 +156,7 @@ use crate::traits::{
 };
 
 /// [`OpRecorder`] に記録する操作名（REPAIR-4）。
-const START_OP_NAME: &str = "start";
+pub(super) const START_OP_NAME: &str = "start";
 
 /// 上限を過ぎてから実装自身の `Timeout` 応答（後始末済み）を受け取るまで待つ猶予（REPAIR-5）。
 ///

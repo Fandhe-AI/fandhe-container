@@ -558,22 +558,45 @@ struct SweepOpNames {
     left_owner_alive: &'static str,
 }
 
+/// `KillAll` の掃除の記録先の名前。
+const KILL_ALL_SWEEP_NAMES: SweepOpNames = SweepOpNames {
+    sweep: "exec_cgroup_sweep_kill_all",
+    cut: "exec_cgroup_sweep_kill_all_cut",
+    child: "exec_cgroup_sweep_kill_all_child",
+    left_populated: "exec_cgroup_sweep_kill_all_left_populated",
+    left_owner_alive: "exec_cgroup_sweep_kill_all_left_owner_alive",
+};
+
+/// `UnpopulatedOnly` の掃除の記録先の名前。
+const UNPOPULATED_SWEEP_NAMES: SweepOpNames = SweepOpNames {
+    sweep: "exec_cgroup_sweep_unpopulated",
+    cut: "exec_cgroup_sweep_unpopulated_cut",
+    child: "exec_cgroup_sweep_unpopulated_child",
+    left_populated: "exec_cgroup_sweep_unpopulated_left_populated",
+    left_owner_alive: "exec_cgroup_sweep_unpopulated_left_owner_alive",
+};
+
+/// exec 用子 cgroup の掃除が、注入された `OpRecorder` へ書きうる操作名の全部（REPAIR-4・CRI-6）。
+/// delete の前の掃除（`remove_with_recorder` 経由）が書く名前で、記録箇所の定数（`SweepOpNames`）から組む。
+/// `KillAll` は `left_*` を実際には記録しないが同じ形の名前の組を持つため含める（最悪数としては安全側）。
+/// 上限 `observability::MAX_TRACKED_OPS` の余裕を数える利用者（plugin-cri の試験）のために公開する。
+pub const EXEC_CGROUP_SWEEP_OP_NAMES: [&str; 10] = [
+    KILL_ALL_SWEEP_NAMES.sweep,
+    KILL_ALL_SWEEP_NAMES.cut,
+    KILL_ALL_SWEEP_NAMES.child,
+    KILL_ALL_SWEEP_NAMES.left_populated,
+    KILL_ALL_SWEEP_NAMES.left_owner_alive,
+    UNPOPULATED_SWEEP_NAMES.sweep,
+    UNPOPULATED_SWEEP_NAMES.cut,
+    UNPOPULATED_SWEEP_NAMES.child,
+    UNPOPULATED_SWEEP_NAMES.left_populated,
+    UNPOPULATED_SWEEP_NAMES.left_owner_alive,
+];
+
 fn sweep_op_names(mode: SweepMode) -> SweepOpNames {
     match mode {
-        SweepMode::KillAll => SweepOpNames {
-            sweep: "exec_cgroup_sweep_kill_all",
-            cut: "exec_cgroup_sweep_kill_all_cut",
-            child: "exec_cgroup_sweep_kill_all_child",
-            left_populated: "exec_cgroup_sweep_kill_all_left_populated",
-            left_owner_alive: "exec_cgroup_sweep_kill_all_left_owner_alive",
-        },
-        SweepMode::UnpopulatedOnly => SweepOpNames {
-            sweep: "exec_cgroup_sweep_unpopulated",
-            cut: "exec_cgroup_sweep_unpopulated_cut",
-            child: "exec_cgroup_sweep_unpopulated_child",
-            left_populated: "exec_cgroup_sweep_unpopulated_left_populated",
-            left_owner_alive: "exec_cgroup_sweep_unpopulated_left_owner_alive",
-        },
+        SweepMode::KillAll => KILL_ALL_SWEEP_NAMES,
+        SweepMode::UnpopulatedOnly => UNPOPULATED_SWEEP_NAMES,
     }
 }
 
@@ -722,6 +745,54 @@ fn classify_unpopulated_removal(result: Result<(), CgroupError>) -> ChildDisposi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// REPAIR-4・CRI-6（#4409）: 公開一覧は具体値で固定し、実際に記録される名前の集合と一致する。
+    #[test]
+    fn repair4_4409_exec_cgroup_sweep_op_names_match_recorded_names() {
+        assert_eq!(
+            EXEC_CGROUP_SWEEP_OP_NAMES,
+            [
+                "exec_cgroup_sweep_kill_all",
+                "exec_cgroup_sweep_kill_all_cut",
+                "exec_cgroup_sweep_kill_all_child",
+                "exec_cgroup_sweep_kill_all_left_populated",
+                "exec_cgroup_sweep_kill_all_left_owner_alive",
+                "exec_cgroup_sweep_unpopulated",
+                "exec_cgroup_sweep_unpopulated_cut",
+                "exec_cgroup_sweep_unpopulated_child",
+                "exec_cgroup_sweep_unpopulated_left_populated",
+                "exec_cgroup_sweep_unpopulated_left_owner_alive",
+            ]
+        );
+        let rec = OpRecorder::new();
+        for mode in [SweepMode::KillAll, SweepMode::UnpopulatedOnly] {
+            for d in [
+                ChildDisposition::Removed,
+                ChildDisposition::LeftPopulated,
+                ChildDisposition::LeftOwnerAlive,
+                ChildDisposition::Failed(ErrorCode::Internal),
+            ] {
+                record_child(&rec, mode, d, Duration::from_millis(1));
+            }
+            let truncated = Ok(ExecChildSweep {
+                truncated: true,
+                ..ExecChildSweep::default()
+            });
+            record_sweep(&rec, mode, &truncated, Duration::from_millis(1));
+        }
+        let mut recorded: Vec<String> = rec
+            .snapshot()
+            .iter()
+            .map(|s| s.name().to_string())
+            .collect();
+        recorded.sort();
+        let mut listed: Vec<String> = EXEC_CGROUP_SWEEP_OP_NAMES
+            .iter()
+            .map(|n| n.to_string())
+            .collect();
+        listed.sort();
+        assert_eq!(recorded, listed);
+    }
 
     fn tmp(label: &str) -> (crate::scratch_root::ScratchDir, std::path::PathBuf) {
         // pid だけの名前を先に消さず、排他作成の `ScratchDir` の子を使う（#3434・REPAIR-12）。

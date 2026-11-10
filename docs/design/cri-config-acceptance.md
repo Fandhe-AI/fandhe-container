@@ -328,6 +328,7 @@ CRI の `namespace_options.network` は既定が `POD` で、netns は sandbox �
 - net にコンテナ単位の切り離しが無いため、pod ごとにネットワーク（bridge と nft テーブル）を作って `delete_network` で一括解放する。共有ネットワークと per-container の detach への移行は後続（CORE-9 の資源効率）
 - 未 attach の事前作成 netns は route ソケットの fd を 1 本保持する（件数は `MAX_NETWORKS` × `MAX_CONTAINERS_PER_NETWORK` で有界）。状態はプロセスのメモリだけで、plugin の再起動で失われる
 - `port_mappings` は下記「port_mappings の受け入れ方式」（#2676）。`PodSandboxStatus` の `network` は `PodNetworkProvider::set_up` が `PodNetns::with_ips` で報告した IP だけを返す（#2873・CRI-2・NET-3。推測しない。provider が無い・NODE・無報告・Stop の tear_down 成功後・plugin-cri の再起動後の再採用では空。報告は射影形の正規化・禁止範囲・重複・追加 8 件の上限で検証し、違反は INTERNAL）。本番の plugin-cri は provider 未注入のため実際には空。`NetsetupPodNetwork` を注入した場合は `attach` の割り当てアドレスを報告し、応答が sandbox と一致しなければ空、cri が拒否する値なら INTERNAL で巻き戻す（#4384。下記「pod の IP の報告」）
+- `PodSandboxStatus.linux` は、記録した config の `linux.security_context.namespace_options`（network・pid・ipc・target_id・userns_options）を無改変で `linux.namespaces.options` に返す（#4383・CRI-2。containerd と同じ）。未指定でも `linux` と `namespaces` は常にあり、`options` は空（既定値の `POD` などは補わない）。kubelet の `PodSandboxChanged` が network のモードを pod の期待値と比べ、食い違うと sandbox を作り直すため、hostNetwork（`NODE`）の pod の作り直しの繰り返しを防ぐ。記録の config から作るので plugin-cri の再起動後の再採用でも返り、Stop の後も変わらない。保持役の pid や ns のパスなど実行時の内部状態は載せない
 - 実機（root）の試験は `crates/net/tests/network_attach_privileged.rs` に準備したが、本変更では未実行
 
 ## port_mappings の受け入れ方式（CRI-2・NET-3・NET-4・PLUG-1。#2676）
@@ -549,3 +550,14 @@ CreateContainer の時点で `ImageRootfsSource` が在庫（`ImageStore`）で�
 | containerd の Status は `sandbox.IP` を `network.ip`、`AdditionalIPs` を `additional_ips` に写す。値の検証はしない | containerd `internal/cri/server/sandbox_status.go`（L113・L154〜163） | 本実装の検証（loopback 等の拒否）のほうが厳しい |
 
 結論: kubelet・containerd が要求する形（主 IP は解析可能、追加 IP は主 IP の後）に対し、現行の `with_ips` の検証に違反はなく、cri のコードは変更しない。既知の差は、(1) loopback・未指定・multicast・0/8・240/4 を拒否する（containerd は通す）、(2) 追加 IP の上限 8 件（kubelet が使うのは最大 2 件）の 2 点で、いずれも安全側。再起動後の IP の永続は #2941、本番への注入は未決のまま。
+
+### PodSandboxStatus.linux（containerd・kubelet。CRI-2・#4383）
+
+確認日 2026-11-10。kubernetes `v1.37.1`（`f78e722310e50bcaca9276be22276d9e91d91308`）、containerd `v2.4.2`（`b7a25261e029d68978bbf290df0a62fc819b3c51`）。いずれも上の版表と同じ。
+
+| 主張 | 一次情報 |
+| ---- | ---- |
+| containerd は sandbox の config の `linux.security_context.namespace_options` をそのまま `linux.namespaces.options` に返す。`linux` と `namespaces` は常に非 nil で、未指定なら `options` は nil | containerd `internal/cri/server/sandbox_status.go` `toCRISandboxStatus`（L151 で取り出し、L165〜L167 で `Linux`・`Namespaces`・`Options` に入れる） |
+| kubelet は `GetLinux().GetNamespaces().GetOptions().GetNetwork()` と `NetworkNamespaceForPod(pod)` を比べ、違えば sandbox を作り直す。nil の options は getter で `POD`（0）として読まれる | kubernetes `pkg/kubelet/kuberuntime/util/util.go` `PodSandboxChanged`（L31〜、比較は L58）、`NetworkNamespaceForPod`（L83） |
+
+**判定: 一致。** 本実装は options を無改変で返し、未指定は `options` 空にする（推測した既定値を補わない。CRI の proto では pid の既定が CRI 上は `POD`、v1.PodSpec 上は `CONTAINER` で食い違うため）。照合は `runtime_service.rs` の試験 `cri2_4383_*`（NODE・CONTAINER・POD の具体値、target_id・userns_options、未指定 3 通り）。

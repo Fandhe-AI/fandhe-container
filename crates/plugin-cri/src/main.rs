@@ -174,14 +174,14 @@ fn serve(
         return code;
     }
     let recorder = std::sync::Arc::clone(backends.op_recorder());
-    let oci_recorder = std::sync::Arc::clone(backends.oci_op_recorder());
-    // 停止時の最後のスナップショット用（周期の task へ move する前に控える。共有 → oci の順は周期と同じ。#4340）。
-    let final_recorders = vec![
-        std::sync::Arc::clone(&recorder),
-        std::sync::Arc::clone(&oci_recorder),
-    ];
+    // 出力の順は CRI → ライフサイクル → oci（周期と停止時の最後のスナップショットで同じ。#4340・#4380）。
+    let stats_recorders = backends.op_stats_recorders();
+    let final_recorders = stats_recorders.clone();
     let sweep_store = std::sync::Arc::clone(backends.state());
-    let sweep_recorder = std::sync::Arc::clone(&recorder);
+    // 起動時のログ走査の記録先はライフサイクル記録器（削除時の同名の記録と同じ枠。#4380）。
+    let sweep_recorder = backends
+        .lifecycle_op_recorder()
+        .map_or_else(|| std::sync::Arc::clone(&recorder), std::sync::Arc::clone);
     // bundle の供給は fail-closed。置き場を用意できなければ（fixed 文言のみ出して）起動しない。
     let bundles = match backends.production_bundle_provider() {
         Ok(b) => b,
@@ -408,7 +408,7 @@ fn serve(
         // 操作の件数・レイテンシを定期的に構造化ログとして stderr へ出す（REPAIR-4）。
         // `--op-stats-file` 指定時は同じ周期の内容をスナップショットファイルへも渡す（無指定は stderr のみで従来どおり。#4340）。
         let stats = tokio::spawn(telemetry::op_stats_export_loop_with(
-            vec![recorder, oci_recorder],
+            stats_recorders,
             telemetry::op_stats_export_interval(),
             telemetry::stderr_sink().clone(),
             op_stats_sink_for_loop,

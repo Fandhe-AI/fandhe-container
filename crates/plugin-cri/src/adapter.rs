@@ -141,8 +141,14 @@ pub struct CriPluginBackends {
     runtime: Arc<dyn ContainerRuntime>,
     state: Arc<dyn StateStore>,
     network: Arc<dyn NetworkPlugin>,
-    /// 実行層（`oci_runtime`）と CRI サービスが共有する記録器（REPAIR-4）。
+    /// CRI 側の記録器（`cri.*`。`CriOpKind` の全種・記録ストア 3 種・ストリーミングの接続観測 4 種・
+    /// `image_pull_recovery`。名前は最悪 45 種で、`MAX_TRACKED_OPS` に 8 の余裕を残すことを試験で固定する。
+    /// REPAIR-4・CRI-6・#4380）。注入（`with_recorder`）では実行層もここへ書く。
     recorder: Arc<OpRecorder>,
+    /// 本番（`production()`）だけが持つライフサイクル記録器（core の `oci_runtime`・コンテナログ・net の bridge / netsetup の
+    /// 操作名。最悪 53 種）。CRI 記録器と枠を分け、合算が `MAX_TRACKED_OPS` を超えて記録が捨てられるのを防ぐ
+    /// （REPAIR-4・#4380。pull 用は #2900 で分離済み）。注入で組んだときは `None`。
+    lifecycle_recorder: Option<Arc<OpRecorder>>,
     /// oci の pull・展開・回収の操作統計（`oci.*`）と `cri.pull_image.registry_http.*`（#2966）専用の記録器。共有記録器とは枠を分ける（`MAX_TRACKED_OPS`。REPAIR-4・#2900）。
     oci_recorder: Arc<OpRecorder>,
     /// `production()` が解決した状態ルート（bundle とイメージキャッシュの置き場の親。注入で組んだときは `None`）。
@@ -188,6 +194,7 @@ impl CriPluginBackends {
             state,
             network,
             recorder,
+            lifecycle_recorder: None,
             oci_recorder: Arc::new(OpRecorder::new()),
             state_root: None,
             _instance_lock: None,
@@ -227,7 +234,9 @@ impl CriPluginBackends {
     fn production_inner(create_audit: Option<Arc<dyn AuditSink>>) -> Result<Self, TraitError> {
         let root = StateRoot::resolve(None)?;
         let state_root = root.path().to_path_buf();
+        // CRI 側（`cri.*`）とライフサイクル側（core・net・ログ）で記録器を分ける（REPAIR-4・#4380）。
         let recorder = Arc::new(OpRecorder::new());
+        let lifecycle_recorder = Arc::new(OpRecorder::new());
         // 状態ルートの作成・検証・初期化（`FileStateStore::open`）を先に済ませる。`ReclaimStore::open` はルートが
         // 既にあることを前提にし、先に `.cri` を作ると新規ストアの判定を壊すため（NET-1・#2604）。
         let state: Arc<dyn StateStore> = Arc::new(FileStateStore::open(root)?);
@@ -244,21 +253,24 @@ impl CriPluginBackends {
         let network: Arc<dyn NetworkPlugin> = Arc::new(NetsetupNetwork::with_reclaim_store(
             LinuxNetsetup::with_recorder(
                 state_root.join(".netns"),
-                Arc::new(CoreNetRecorder(Arc::clone(&recorder))),
+                Arc::new(CoreNetRecorder(Arc::clone(&lifecycle_recorder))),
             ),
             // 作成失敗の回収待ちの記録は状態ルート配下の固定の場所に残し、再起動後に読み込む（NET-1・#2604）。
             crate::netsetup::ReclaimStore::open(&state_root)?,
-            Some(Arc::clone(&recorder)),
+            Some(Arc::clone(&lifecycle_recorder)),
         )?);
         #[cfg(not(target_os = "linux"))]
         let network: Arc<dyn NetworkPlugin> = Arc::new(UnimplementedNetwork);
-        let mut runtime =
-            CoreLifecycleRuntime::with_recorder(Arc::clone(&state), Arc::clone(&recorder));
+        let mut runtime = CoreLifecycleRuntime::with_recorder(
+            Arc::clone(&state),
+            Arc::clone(&lifecycle_recorder),
+        );
         if let Some(sink) = create_audit {
             runtime = runtime.with_create_audit_sink(sink);
         }
         let runtime = Arc::new(runtime);
         let mut backends = Self::with_recorder(runtime, state, network, recorder);
+        backends.lifecycle_recorder = Some(lifecycle_recorder);
         // 在庫は pull と同じ root（`.cri/images`）の永続の記録を開く。インスタンスロックの取得後に開き、
         // 先行インスタンスの書き込みを読み落とさない（#4176・CRI-1・CRI-2・OCI-7）。
         #[cfg(unix)]
@@ -466,6 +478,23 @@ impl CriPluginBackends {
     /// （実行層の `create`・`delete` と CRI の各 RPC が同じ記録器へ書く。REPAIR-4）。
     pub fn op_recorder(&self) -> &Arc<OpRecorder> {
         &self.recorder
+    }
+
+    /// ライフサイクル記録器（本番のみ。注入で組んだときは `None`）。起動時のコンテナログ走査の記録先に使う
+    /// （`CoreLifecycleRuntime` の削除時の記録と同じ名前の枠にそろえる。REPAIR-4・#4380）。
+    pub fn lifecycle_op_recorder(&self) -> Option<&Arc<OpRecorder>> {
+        self.lifecycle_recorder.as_ref()
+    }
+
+    /// 操作統計の出力対象を CRI → ライフサイクル（あれば）→ oci の順で返す
+    /// （`op_stats_meta` のブロックの並び。`main.rs` の周期の出力と停止時の最後のスナップショットが使う。#4380）。
+    pub fn op_stats_recorders(&self) -> Vec<Arc<OpRecorder>> {
+        let mut v = vec![Arc::clone(&self.recorder)];
+        if let Some(l) = &self.lifecycle_recorder {
+            v.push(Arc::clone(l));
+        }
+        v.push(Arc::clone(&self.oci_recorder));
+        v
     }
 
     /// oci の pull・展開・起動時の回収の操作統計（`oci.*`）と、`PullImage` の失敗のレジストリ HTTP 状態の区分
@@ -1085,7 +1114,9 @@ impl AuditSink for ObservedCreateAudit {
 /// 2 本の記録器を持つ。`shared` は従来どおり `cri.<操作>` の成功 / 失敗とレイテンシを受ける。
 /// `pull` は oci 専用の記録器で、`PullImage` の失敗に付いたレジストリの HTTP 状態の区分
 /// （`RegistryHttpClass`）を `cri.pull_image.registry_http.<区分>` の失敗として受ける（#2966・REPAIR-4・CRI-3）。
-/// 共有記録器の `MAX_TRACKED_OPS` を区分の 8 種で圧迫しないため分ける（22 + 8 は上限に収まる）。
+/// CRI 記録器の `MAX_TRACKED_OPS` を区分の 8 種で圧迫しないため分ける。pull 用記録器の名前数は
+/// oci 22 種 + 区分 8 種 = 30 種で上限（64）に収まる。CRI 記録器・ライフサイクル記録器の最悪数
+/// （45 種・53 種）は試験 `repair4_4380_*` が固定する（#4380）。
 /// `cri.pull_image`（共有）の失敗 1 件と区分側の 1 件は同じ失敗を別の切り口で数えたもの（二重計上）。
 /// 生の HTTP 状態・URL・資格情報は記録しない。
 struct CoreCriRecorder {
@@ -1146,7 +1177,29 @@ impl RecordStoreOpRecorder for CoreRecordStoreRecorder {
     }
 }
 
-/// net の計測結果を core の `OpRecorder` へ流す橋渡し（操作名は `NetOpKind::as_str`。REPAIR-4）。
+/// ライフサイクル記録器へ通す net の操作種別（`NetOpKind::as_str` と同じ名前）。
+///
+/// `LinuxNetsetup` が route・nft のソケットから出す 8 種だけを明示して通し、それ以外は記録しない。
+/// `NetOpKind` は 32 種あり、全種を通すと配線が増えたとき（DNS ヘルパー・pasta・ネットワークストア等）に
+/// ライフサイクル記録器の名前数が `MAX_TRACKED_OPS` を超えうるため。種別の配線を足すときは本写像と
+/// 名前数の試験（`repair4_4380_*`）を一緒に直す（REPAIR-4・NET-1・#4380）。
+#[cfg(target_os = "linux")]
+fn net_op_name(kind: fandhe_container_net::instrument::NetOpKind) -> Option<&'static str> {
+    use fandhe_container_net::instrument::NetOpKind as K;
+    match kind {
+        K::NetlinkOpen
+        | K::NetlinkSend
+        | K::NetlinkRecv
+        | K::NetlinkRequest
+        | K::LinkCreate
+        | K::LinkSet
+        | K::LinkDelete
+        | K::NftBatch => Some(kind.as_str()),
+        _ => None,
+    }
+}
+
+/// net の計測結果を core の `OpRecorder` へ流す橋渡し（操作名は [`net_op_name`] の 8 種。REPAIR-4）。
 #[cfg(target_os = "linux")]
 struct CoreNetRecorder(Arc<OpRecorder>);
 
@@ -1154,7 +1207,10 @@ struct CoreNetRecorder(Arc<OpRecorder>);
 impl fandhe_container_net::instrument::NetOpRecorder for CoreNetRecorder {
     fn record_net_op(&self, sample: &fandhe_container_net::instrument::NetOpSample) {
         use fandhe_container_net::instrument::NetOpOutcome;
-        let Ok(name) = OpName::new(sample.kind().as_str()) else {
+        let Some(raw) = net_op_name(sample.kind()) else {
+            return;
+        };
+        let Ok(name) = OpName::new(raw) else {
             return;
         };
         let outcome = match sample.outcome() {
@@ -2244,7 +2300,10 @@ mod tests {
     fn cri2_injected_backends_hold_no_instance_lock_and_create_no_lock_file() {
         let dir = crate::test_root::test_root("fcpc-inj-nolock", "t");
         let store: Arc<dyn StateStore> = Arc::new(OneRecord::new(record(false)));
-        let rt = Arc::new(CoreLifecycleRuntime::new(Arc::clone(&store)));
+        let rt = Arc::new(CoreLifecycleRuntime::with_recorder(
+            Arc::clone(&store),
+            Arc::new(OpRecorder::new()),
+        ));
 
         let injected = CriPluginBackends::new(
             rt.clone(),
@@ -2682,7 +2741,7 @@ mod tests {
         use fandhe_container_cri::instrument::RegistryHttpClass;
         const {
             assert!(
-                (22 + 3) + RegistryHttpClass::ALL.len()
+                22 + RegistryHttpClass::ALL.len()
                     <= fandhe_container_core::observability::MAX_TRACKED_OPS
             )
         };
@@ -2719,6 +2778,235 @@ mod tests {
         assert_eq!(pull.snapshot().len(), 2);
         assert_eq!(shared.snapshot().len(), 1);
         assert_eq!(pull.dropped_records(), 0);
+    }
+
+    /// 名前の一覧を新しい記録器へ全件記録し、種類数・取りこぼしなし・`OpName` 規則・重複なしを確かめる補助（#4380）。
+    /// 呼び出し側の試験が Linux 限定のため同じ gate を付ける（他 OS では未使用になり dead_code になる）。
+    #[cfg(target_os = "linux")]
+    fn record_all_names(names: &[&str]) -> OpRecorder {
+        let distinct: std::collections::BTreeSet<&str> = names.iter().copied().collect();
+        assert_eq!(distinct.len(), names.len(), "duplicate op name in the list");
+        let rec = OpRecorder::new();
+        for n in names {
+            let name = OpName::new(*n).unwrap_or_else(|e| panic!("{n}: {e:?}"));
+            rec.record(&name, OpOutcome::Success, Duration::from_millis(1))
+                .unwrap_or_else(|e| panic!("{n}: {e:?}"));
+        }
+        assert_eq!(rec.dropped_records(), 0);
+        assert_eq!(rec.snapshot().len(), names.len());
+        rec
+    }
+
+    /// 今後の追加分として残す余裕（名前の種類数）。
+    #[cfg(unix)]
+    const NAME_HEADROOM: usize = 8;
+
+    /// REPAIR-4・CRI-6（#4380）: CRI 記録器（本番の `recorder`）へ届きうる操作名の最悪数は 45 種で、
+    /// `MAX_TRACKED_OPS - 8` 以下。`CriOpKind` の全種（`CriOpKind::ALL`）を数えるので、種別を足すと本試験が落ちて列挙の見直しを求める。
+    #[cfg(unix)]
+    #[test]
+    fn repair4_4380_cri_recorder_worst_case_name_count_leaves_headroom() {
+        let rec = Arc::new(OpRecorder::new());
+        let pull = Arc::new(OpRecorder::new());
+        let bridge = CoreCriRecorder::new(Arc::clone(&rec), pull);
+        for kind in CriOpKind::ALL {
+            bridge.record_cri_op(&CriOpSample::new(
+                kind,
+                tonic::Code::Ok,
+                Duration::from_millis(1),
+            ));
+        }
+        assert_eq!(rec.snapshot().len(), CriOpKind::ALL.len());
+        // CriOpKind 以外の固定名: 記録ストア 3（CoreRecordStoreRecorder）・ストリーミングの接続観測 4・起動時の pull 回収 1。
+        let fixed: [&str; 8] = [
+            "cri.record_store.put",
+            "cri.record_store.remove",
+            "cri.record_store.list",
+            crate::streaming::connection_observer::OP_CONNECTION,
+            crate::streaming::connection_observer::OP_CONNECTION_DEADLINE,
+            crate::streaming::connection_observer::OP_CONNECTION_REJECTED,
+            crate::streaming::connection_observer::OP_ACCEPT_FAILED,
+            "image_pull_recovery",
+        ];
+        for n in fixed {
+            let name = OpName::new(n).expect("name");
+            let _ = rec.record(&name, OpOutcome::Success, Duration::from_millis(1));
+        }
+        assert_eq!(rec.dropped_records(), 0);
+        let total = rec.snapshot().len();
+        assert_eq!(total, 37 + 8, "CriOpKind::ALL.len() = 37 + 8 fixed names");
+        assert!(
+            total <= fandhe_container_core::observability::MAX_TRACKED_OPS - NAME_HEADROOM,
+            "{total} names leave less than {NAME_HEADROOM} of headroom"
+        );
+    }
+
+    /// REPAIR-4・NET-1・CORE-1（#4380）: ライフサイクル記録器（本番のみ）へ届きうる操作名の最悪数は 53 種で、
+    /// `MAX_TRACKED_OPS - 8` 以下。名前の出典: core の `oci_runtime`（create・delete・kill と image_ref_*・image_rootfs_* の定数。
+    /// start は記録器を渡さない）・本ファイルの `CoreLifecycleRuntime` の記録・`netsetup.rs` の `net.*`・`net_op_name` の 8 種・delete が `remove_with_recorder` 経由で書く `exec_cgroup_sweep_*` の 10 種
+    /// （`cgroups/exec_kill.rs` の kill_all と unpopulated の各 5 名）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repair4_4380_lifecycle_recorder_worst_case_name_count_leaves_headroom() {
+        use fandhe_container_net::instrument::NetOpKind as K;
+        let core_names = [
+            "create",
+            "delete",
+            "kill",
+            "image_ref_register",
+            "image_ref_rollback",
+            "image_ref_bind",
+            "image_ref_lookup",
+            "image_ref_release",
+            "image_rootfs_unpack",
+            "image_rootfs_cleanup",
+            "image_rootfs_remove",
+            "image_rootfs_reap",
+            "image_rootfs_reap_kept_unverified",
+            "image_rootfs_reap_failed",
+            "image_rootfs_reap_truncated",
+            "image_rootfs_reap_scan_failed",
+            "image_rootfs_orphan_reap",
+        ];
+        let sweep_names = [
+            "exec_cgroup_sweep_kill_all",
+            "exec_cgroup_sweep_kill_all_cut",
+            "exec_cgroup_sweep_kill_all_child",
+            "exec_cgroup_sweep_kill_all_left_populated",
+            "exec_cgroup_sweep_kill_all_left_owner_alive",
+            "exec_cgroup_sweep_unpopulated",
+            "exec_cgroup_sweep_unpopulated_cut",
+            "exec_cgroup_sweep_unpopulated_child",
+            "exec_cgroup_sweep_unpopulated_left_populated",
+            "exec_cgroup_sweep_unpopulated_left_owner_alive",
+        ];
+        let plugin_names = [
+            "supervisor_log_remove",
+            "container_log_remove",
+            "container_log_reclaim",
+            "supervisor_log_reclaim",
+            "container_options_remove",
+        ];
+        let failure_ops: Vec<&str> = [
+            ErrorCode::FailedPrecondition,
+            ErrorCode::Timeout,
+            ErrorCode::InvalidArgument,
+            ErrorCode::Internal,
+            ErrorCode::NotFound,
+        ]
+        .into_iter()
+        .map(container_log_remove_failure_op)
+        .collect();
+        let netsetup_names = [
+            "net.create_network",
+            "net.create_netns",
+            "net.attach",
+            "net.publish_port",
+            "net.unpublish_port",
+            "net.detach",
+            "net.delete_network",
+            "net.reclaim_store_load",
+        ];
+        // 実際の橋渡し（`CoreNetRecorder`）に net の全種別を通し、写像の外が記録されないことも確かめる。
+        let net_rec = Arc::new(OpRecorder::new());
+        let bridge = CoreNetRecorder(Arc::clone(&net_rec));
+        let all_net = [
+            K::NetlinkOpen,
+            K::NetlinkSend,
+            K::NetlinkRecv,
+            K::NetlinkRequest,
+            K::LinkCreate,
+            K::LinkSet,
+            K::LinkDelete,
+            K::NftBatch,
+            K::DnsHelperStart,
+            K::PastaStart,
+            K::NetworkStoreOpen,
+            K::AddHostsApply,
+        ];
+        for k in all_net {
+            fandhe_container_net::instrument::NetOpRecorder::record_net_op(
+                &bridge,
+                &fandhe_container_net::instrument::NetOpSample::new(
+                    k,
+                    fandhe_container_net::instrument::NetOpOutcome::Success,
+                    Duration::from_millis(1),
+                ),
+            );
+        }
+        let net_recorded: Vec<String> = net_rec
+            .snapshot()
+            .iter()
+            .map(|s| s.name().to_string())
+            .collect();
+        assert_eq!(
+            net_recorded.len(),
+            8,
+            "only the 8 wired kinds: {net_recorded:?}"
+        );
+        let net_names: Vec<&str> = net_recorded.iter().map(String::as_str).collect();
+
+        let mut all: Vec<&str> = Vec::new();
+        all.extend(core_names);
+        all.extend(sweep_names);
+        all.extend(plugin_names);
+        all.extend(failure_ops.iter().copied());
+        all.extend(netsetup_names);
+        all.extend(net_names.iter().copied());
+        let rec = record_all_names(&all);
+        let total = rec.snapshot().len();
+        assert_eq!(
+            total,
+            17 + 10 + 5 + 5 + 8 + 8,
+            "lifecycle recorder worst case"
+        );
+        assert!(
+            total <= fandhe_container_core::observability::MAX_TRACKED_OPS - NAME_HEADROOM,
+            "{total} names leave less than {NAME_HEADROOM} of headroom"
+        );
+    }
+
+    /// REPAIR-4・NET-1（#4380）: `net_op_name` は配線済みの 8 種だけを `NetOpKind::as_str` と同じ名前で通し、他は通さない。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repair4_4380_net_op_name_passes_only_wired_kinds() {
+        use fandhe_container_net::instrument::NetOpKind as K;
+        for (k, expected) in [
+            (K::NetlinkOpen, "netlink.open"),
+            (K::NetlinkSend, "netlink.send"),
+            (K::NetlinkRecv, "netlink.recv"),
+            (K::NetlinkRequest, "netlink.request"),
+            (K::LinkCreate, "netlink.link.create"),
+            (K::LinkSet, "netlink.link.set"),
+            (K::LinkDelete, "netlink.link.delete"),
+            (K::NftBatch, "nftables.batch"),
+        ] {
+            assert_eq!(net_op_name(k), Some(expected));
+        }
+        for k in [
+            K::DnsHelperStart,
+            K::PastaStart,
+            K::NetworkStoreOpen,
+            K::AddHostsApply,
+        ] {
+            assert_eq!(net_op_name(k), None, "{k:?}");
+        }
+    }
+
+    /// CRI-6・REPAIR-4・#4380: 出力対象は CRI → ライフサイクル（本番のみ）→ oci の順。注入で組むとライフサイクルは無い。
+    #[test]
+    fn repair4_4380_op_stats_recorders_order() {
+        let store: Arc<dyn StateStore> = Arc::new(OneRecord::new(record(false)));
+        let rt = Arc::new(CoreLifecycleRuntime::with_recorder(
+            Arc::clone(&store),
+            Arc::new(OpRecorder::new()),
+        ));
+        let backends = CriPluginBackends::new(rt, store, Arc::new(UnimplementedNetwork));
+        assert!(backends.lifecycle_op_recorder().is_none());
+        let v = backends.op_stats_recorders();
+        assert_eq!(v.len(), 2);
+        assert!(Arc::ptr_eq(&v[0], backends.op_recorder()));
+        assert!(Arc::ptr_eq(&v[1], backends.oci_op_recorder()));
     }
 
     /// CRI-6・REPAIR-4・#4324: インスタンス不一致による Exec 拒否は `cri.exec.instance_changed` の別の行として出る。

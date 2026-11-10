@@ -115,6 +115,49 @@ pub enum CriOpKind {
 }
 
 impl CriOpKind {
+    /// 全種別を宣言順に並べたもの（plugin-cri が共有記録器へ届く操作名の最悪数を数える試験の列挙元。
+    /// CRI-6・REPAIR-4・#4380）。種別を足したら本配列と、試験の通し番号の `match`
+    /// （`repair4_4380_cri_op_kind_all_is_exhaustive`）を直す。直さないと cri の試験が失敗する。
+    pub const ALL: [CriOpKind; 37] = [
+        CriOpKind::RunPodSandbox,
+        CriOpKind::StopPodSandbox,
+        CriOpKind::RemovePodSandbox,
+        CriOpKind::PodSandboxStatus,
+        CriOpKind::ListPodSandbox,
+        CriOpKind::CreateContainer,
+        CriOpKind::StartContainer,
+        CriOpKind::StopContainer,
+        CriOpKind::RemoveContainer,
+        CriOpKind::ListContainers,
+        CriOpKind::ContainerStatus,
+        CriOpKind::ContainerExitObserve,
+        CriOpKind::Status,
+        CriOpKind::Version,
+        CriOpKind::UpdateRuntimeConfig,
+        CriOpKind::ListImages,
+        CriOpKind::ImageStatus,
+        CriOpKind::PullImage,
+        CriOpKind::RemoveImage,
+        CriOpKind::RecordStoreLoad,
+        CriOpKind::ShimV2Dispatch,
+        CriOpKind::ShimV2Frame,
+        CriOpKind::ShimV2Io,
+        CriOpKind::ShimV2Start,
+        CriOpKind::ShimV2Delete,
+        CriOpKind::Exec,
+        CriOpKind::Attach,
+        CriOpKind::PortForward,
+        CriOpKind::AttachSession,
+        CriOpKind::AttachStreamRead,
+        CriOpKind::AttachStreamWrite,
+        CriOpKind::ExecSession,
+        CriOpKind::ExecInstanceChanged,
+        CriOpKind::ExecStreamRead,
+        CriOpKind::ExecStreamWrite,
+        CriOpKind::ExecConnRead,
+        CriOpKind::ExecConnWrite,
+    ];
+
     /// core の `OpName` へ渡す安定した操作名。
     pub fn as_str(self) -> &'static str {
         match self {
@@ -473,42 +516,61 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    const ALL_KINDS: [CriOpKind; 34] = [
-        CriOpKind::ContainerExitObserve,
-        CriOpKind::RunPodSandbox,
-        CriOpKind::StopPodSandbox,
-        CriOpKind::RemovePodSandbox,
-        CriOpKind::PodSandboxStatus,
-        CriOpKind::ListPodSandbox,
-        CriOpKind::CreateContainer,
-        CriOpKind::StartContainer,
-        CriOpKind::StopContainer,
-        CriOpKind::RemoveContainer,
-        CriOpKind::ListContainers,
-        CriOpKind::ContainerStatus,
-        CriOpKind::Status,
-        CriOpKind::Version,
-        CriOpKind::UpdateRuntimeConfig,
-        CriOpKind::ListImages,
-        CriOpKind::ImageStatus,
-        CriOpKind::PullImage,
-        CriOpKind::RemoveImage,
-        CriOpKind::RecordStoreLoad,
-        CriOpKind::ShimV2Start,
-        CriOpKind::ShimV2Delete,
-        CriOpKind::Exec,
-        CriOpKind::Attach,
-        CriOpKind::PortForward,
-        CriOpKind::AttachSession,
-        CriOpKind::AttachStreamRead,
-        CriOpKind::AttachStreamWrite,
-        CriOpKind::ExecSession,
-        CriOpKind::ExecInstanceChanged,
-        CriOpKind::ExecStreamRead,
-        CriOpKind::ExecStreamWrite,
-        CriOpKind::ExecConnRead,
-        CriOpKind::ExecConnWrite,
-    ];
+    /// 種別の通し番号。ワイルドカードを置かない `match` なので、`CriOpKind` に種別を足すとここが
+    /// コンパイルエラーになり、`CriOpKind::ALL` の更新漏れに気づける（#4380）。
+    fn ordinal(kind: CriOpKind) -> usize {
+        match kind {
+            CriOpKind::RunPodSandbox => 0,
+            CriOpKind::StopPodSandbox => 1,
+            CriOpKind::RemovePodSandbox => 2,
+            CriOpKind::PodSandboxStatus => 3,
+            CriOpKind::ListPodSandbox => 4,
+            CriOpKind::CreateContainer => 5,
+            CriOpKind::StartContainer => 6,
+            CriOpKind::StopContainer => 7,
+            CriOpKind::RemoveContainer => 8,
+            CriOpKind::ListContainers => 9,
+            CriOpKind::ContainerStatus => 10,
+            CriOpKind::ContainerExitObserve => 11,
+            CriOpKind::Status => 12,
+            CriOpKind::Version => 13,
+            CriOpKind::UpdateRuntimeConfig => 14,
+            CriOpKind::ListImages => 15,
+            CriOpKind::ImageStatus => 16,
+            CriOpKind::PullImage => 17,
+            CriOpKind::RemoveImage => 18,
+            CriOpKind::RecordStoreLoad => 19,
+            CriOpKind::ShimV2Dispatch => 20,
+            CriOpKind::ShimV2Frame => 21,
+            CriOpKind::ShimV2Io => 22,
+            CriOpKind::ShimV2Start => 23,
+            CriOpKind::ShimV2Delete => 24,
+            CriOpKind::Exec => 25,
+            CriOpKind::Attach => 26,
+            CriOpKind::PortForward => 27,
+            CriOpKind::AttachSession => 28,
+            CriOpKind::AttachStreamRead => 29,
+            CriOpKind::AttachStreamWrite => 30,
+            CriOpKind::ExecSession => 31,
+            CriOpKind::ExecInstanceChanged => 32,
+            CriOpKind::ExecStreamRead => 33,
+            CriOpKind::ExecStreamWrite => 34,
+            CriOpKind::ExecConnRead => 35,
+            CriOpKind::ExecConnWrite => 36,
+        }
+    }
+
+    /// REPAIR-4・CRI-6（#4380）: `ALL` は全種別を宣言順に過不足なく持ち、`as_str` が重複しない。
+    #[test]
+    fn repair4_4380_cri_op_kind_all_is_exhaustive() {
+        assert_eq!(CriOpKind::ALL.len(), 37);
+        for (i, kind) in CriOpKind::ALL.iter().enumerate() {
+            assert_eq!(ordinal(*kind), i, "{kind:?} is out of place in ALL");
+        }
+        let names: std::collections::BTreeSet<&str> =
+            CriOpKind::ALL.iter().map(|k| k.as_str()).collect();
+        assert_eq!(names.len(), 37);
+    }
 
     /// REPAIR-4・CRI-3（#2966）: HTTP 状態から区分への写像（境界値）と語彙の健全性。
     #[test]
@@ -607,7 +669,7 @@ mod tests {
     /// 重複して固定する）。
     #[test]
     fn repair4_cri_op_kind_names_fit_core_op_name_contract() {
-        for kind in ALL_KINDS {
+        for kind in CriOpKind::ALL {
             let s = kind.as_str();
             assert!(!s.is_empty() && s.len() <= 64);
             assert!(

@@ -218,7 +218,7 @@ pub trait MicrovmBackend {
     type ExitWatch;
     /// 起動する。失敗時は資源が解放済みであること（microvm 側の保証）。
     fn start(&mut self, spec: BootSpec) -> Result<Self::Running, MicrovmError>;
-    /// `deadline` 以内に停止し、理由の固定名と（持つ backend は）ioeventfd の件数をと munmap の失敗件数を返す。`vm` は成否に関わらず消費される。
+    /// `deadline` 以内に停止し、理由の固定名と（持つ backend は）ioeventfd の件数と munmap の失敗件数を返す。`vm` は成否に関わらず消費される。
     fn stop(&mut self, vm: Self::Running, deadline: Duration) -> Result<StopOutcome, MicrovmError>;
     /// 終了観測ハンドルを取る。`stop` が `vm` を消費するため、**`stop` に渡す前**に取ること。
     fn exit_watch(&self, vm: &Self::Running) -> Self::ExitWatch;

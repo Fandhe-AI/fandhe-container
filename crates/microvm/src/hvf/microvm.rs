@@ -80,7 +80,7 @@
 //! リークし、`op=hvf.vm_unmap` の行で記録する（件数は停止の集約行の ` vm_unmap_failures=` にも載る。#4439）。
 //! #4034 の実機確認では、切り離した vCPU スレッドの終了後に `op=hvf.vm_unmap outcome=error` が出ず、同じプロセスで VM を作り直せた
 //! （destroy が失敗すると排他を戻さないため、作り直せたことは destroy の成功を意味する。間接の根拠）。回収がそのスレッドの上で成功した
-//! ことを直接示す行 `op=hvf.deferred_reclaim`（`outcome=ok thread=hvf-vcpu-N released=guest_ram,vm`）は #4146 で足した。通常の
+//! ことを直接示す行 `op=hvf.deferred_reclaim`（`outcome=ok thread=hvf-vcpu-N released=guest_ram,host_ram,vm`。munmap の失敗は `failed=host_ram`・#4440）は #4146 で足した。通常の
 //! `stop` では出ない。順序の単体試験は偽の資源（`hvf_lifecycle` の試験）で固定する。
 //! 回収されない経路: `release_devices` の失敗（デバイスの保持者が lock を持ち、デバイスが RAM・VM より後に落ちうる）と、RAM の
 //! 取得失敗（`take_within` の期限切れ・毒化。`GuestMemorySlot` がリーク）は、従来どおりプロセスの終了まで残る（plugin-microvm による再起動。#3800）。

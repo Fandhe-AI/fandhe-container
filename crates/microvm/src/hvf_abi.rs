@@ -805,9 +805,34 @@ pub fn host_unmap_failure_line(rc: i32) -> Option<&'static str> {
     }
 }
 
+/// `munmap` の戻り値を遅延回収の記録用の結果にする純関数（MVM-5・REPAIR-4・#4440）。
+/// `sys::hvf` の `HostMapping` の drop が [`crate::hvf_lifecycle::record_host_ram_unmap`] へ渡す。
+/// [`host_unmap_failure_line`] と同じく 0 以外はすべて失敗（fail-closed）で、コードは `Internal` に固定する。
+pub fn host_unmap_result(rc: i32) -> Result<(), crate::error::MicrovmErrorCode> {
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(crate::error::MicrovmErrorCode::Internal)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// munmap の戻り値と記録用の結果の対応を具体値で固定する（MVM-5・REPAIR-4・#4440）。
+    #[test]
+    fn mvm5_4440_host_unmap_result_maps_rc() {
+        assert_eq!(host_unmap_result(0), Ok(()));
+        assert_eq!(
+            host_unmap_result(-1),
+            Err(crate::error::MicrovmErrorCode::Internal)
+        );
+        assert_eq!(
+            host_unmap_result(1),
+            Err(crate::error::MicrovmErrorCode::Internal)
+        );
+    }
 
     /// munmap の戻り値と行の対応を具体値で固定する（MVM-5・REPAIR-4・#4292）。
     #[test]

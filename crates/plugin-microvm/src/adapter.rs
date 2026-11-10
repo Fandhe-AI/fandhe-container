@@ -33,6 +33,9 @@
 //! `ignored` は `op=microvm.ioevent` の経路で受理条件を満たさず捨てた通知、`unbind_failed` は `op=kvm.ioeventfd.deassign` と同じ解除失敗の VM ごとの件数。
 //! 数値と固定キーのみ。件数を持たない backend〔HVF 等〕・start・エラーは従来の行。UDS の応答は変えない。終了時の一括停止〔`stop_all`〕の行への合算と
 //! MMIO exit 経路で捨てた通知の件数は未実装）。
+//! あわせて backend が munmap の失敗件数を持つとき、その後ろに ` unmap_failures=K` を 0 件でも省かず足す（#4410・MVM-1・REPAIR-4。
+//! KVM は `StopReport::unmap_failures` の VM ごとの値で、`op=microvm.vcpus_stopped` の `unmap_failures=` と同じ。ホストのメモリのリークの兆候）。
+//! ioeventfd の件数と独立に出し（順序は ioevent → unmap）、持たない backend〔HVF は microvm 側の #4411 まで `None`〕は従来の行。`stop_all` の行への合算は未実装。
 //! # 注意・残余（REPAIR-3）
 //! - plugin プロセスは SIGUSR2 を使わない（microvm の `run_once` がプロセス全体の handler を入れる）。
 //! - stop が `TIMEOUT` の後、vCPU スレッドが自力で終わるまで資源（ゲスト RAM・fd）が残る。backend から終了を観測できないため、
@@ -188,6 +191,16 @@ pub struct StopOutcome {
     pub reason: &'static str,
     /// ioeventfd の無視・解除失敗の件数。持たない backend は `None`。
     pub ioevent: Option<IoEventCounts>,
+    /// munmap の失敗件数（`kvm_run` とゲスト RAM の合計。#4410）。持たない backend は `None`（0 と偽らない）。
+    pub unmap_failures: Option<u64>,
+}
+
+/// stop の結果行に載せる backend の件数（観測専用。応答や成否には影響しない。#4161・#4410）。
+/// start・エラー・件数を持たない backend は `Default`（すべて `None`）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct StopLineCounts {
+    ioevent: Option<IoEventCounts>,
+    unmap_failures: Option<u64>,
 }
 
 /// microVM 本体への委譲境界。3 OS でビルドでき、KVM なしの試験で差し替えられる。
@@ -205,7 +218,7 @@ pub trait MicrovmBackend {
     type ExitWatch;
     /// 起動する。失敗時は資源が解放済みであること（microvm 側の保証）。
     fn start(&mut self, spec: BootSpec) -> Result<Self::Running, MicrovmError>;
-    /// `deadline` 以内に停止し、理由の固定名と（持つ backend は）ioeventfd の件数を返す。`vm` は成否に関わらず消費される。
+    /// `deadline` 以内に停止し、理由の固定名と（持つ backend は）ioeventfd の件数と munmap の失敗件数を返す。`vm` は成否に関わらず消費される。
     fn stop(&mut self, vm: Self::Running, deadline: Duration) -> Result<StopOutcome, MicrovmError>;
     /// 終了観測ハンドルを取る。`stop` が `vm` を消費するため、**`stop` に渡す前**に取ること。
     fn exit_watch(&self, vm: &Self::Running) -> Self::ExitWatch;
@@ -265,6 +278,7 @@ impl MicrovmBackend for KvmBackend {
         vm.stop(deadline).map(|r| StopOutcome {
             reason: r.reason.as_str(),
             ioevent: Some(r.ioevent),
+            unmap_failures: Some(r.unmap_failures),
         })
     }
 
@@ -332,6 +346,8 @@ impl MicrovmBackend for HvfBackend {
         vm.stop(deadline).map(|r| StopOutcome {
             reason: r.reason.as_str(),
             ioevent: None,
+            // HvfStopReport はまだ munmap の失敗件数を持たない。microvm 側の #4411 の後に Some(..) へつなぐ（REPAIR-3）。
+            unmap_failures: None,
         })
     }
 
@@ -844,52 +860,58 @@ impl<B: MicrovmBackend> MicrovmRuntimeAdapter<B> {
         Ok(vec![REPLY_RUNNING.to_string()])
     }
 
-    /// 停止して応答と、結果行に出す ioeventfd の件数（成功かつ backend が持つときだけ `Some`）を返す。
-    fn do_stop(
-        &mut self,
-        body: &[String],
-    ) -> (Result<Vec<String>, PluginError>, Option<IoEventCounts>) {
+    /// 停止して応答と、結果行に出す件数（成功かつ backend が持つ項目だけ `Some`）を返す。
+    fn do_stop(&mut self, body: &[String]) -> (Result<Vec<String>, PluginError>, StopLineCounts) {
+        let none = StopLineCounts::default();
         let [_, id] = body else {
-            return (Err(invalid(MSG_MALFORMED)), None);
+            return (Err(invalid(MSG_MALFORMED)), none);
         };
         if let Err(e) = validate_id(id) {
-            return (Err(e), None);
+            return (Err(e), none);
         }
         let Some(vm) = self.vms.remove(id.as_str()) else {
-            return (Err(perr(PluginErrorCode::NotFound, MSG_NOT_FOUND)), None);
+            return (Err(perr(PluginErrorCode::NotFound, MSG_NOT_FOUND)), none);
         };
         let watch = self.backend.exit_watch(&vm);
         match self.backend.stop(vm, STOP_DEADLINE) {
             Ok(o) => (
                 Ok(vec![REPLY_STOPPED.to_string(), o.reason.to_string()]),
-                o.ioevent,
+                StopLineCounts {
+                    ioevent: o.ioevent,
+                    unmap_failures: o.unmap_failures,
+                },
             ),
             Err(e) => {
                 self.note_stop_error(&e, watch);
-                (Err(to_plugin_error(&e)), None)
+                (Err(to_plugin_error(&e)), none)
             }
         }
     }
 
     /// 結果行 1 行を組む（id・パス・cmdline は載せない。REPAIR-4）。
     ///
-    /// 成功で `ioevent` が `Some` のときだけ、末尾に ` ignored=N unbind_failed=M`（数値と固定キーのみ。0 件でも出す）を足す。
-    /// `None`（件数を持たない backend・start・エラー）は従来の行と同一。`ignored` は `op=microvm.ioevent` の経路、
+    /// 成功で `ioevent` が `Some` のときだけ、末尾に ` ignored=N unbind_failed=M`（数値と固定キーのみ。0 件でも出す）を足し、
+    /// 続けて `unmap_failures` が `Some` のときだけ ` unmap_failures=K`（0 件でも出す。#4410）を足す。
+    /// すべて `None`（件数を持たない backend・start・エラー）は従来の行と同一。`ignored` は `op=microvm.ioevent` の経路、
     /// `unbind_failed` は `op=kvm.ioeventfd.deassign` の件数と同じ事象の VM ごとの値（個々の失敗はそちらの行に出る）。
     fn result_line(
         op: &str,
         elapsed_us: u128,
         vms: usize,
         result: &Result<Vec<String>, PluginError>,
-        ioevent: Option<IoEventCounts>,
+        counts: StopLineCounts,
     ) -> String {
         match result {
             Ok(_) => {
-                let counts = ioevent
+                let mut extra = counts
+                    .ioevent
                     .map(|c| format!(" ignored={} unbind_failed={}", c.ignored, c.unbind_failed))
                     .unwrap_or_default();
+                if let Some(n) = counts.unmap_failures {
+                    extra.push_str(&format!(" unmap_failures={n}"));
+                }
                 format!(
-                    "level=info op=plugin.microvm.{op} outcome=ok elapsed_us={elapsed_us} vms={vms}{counts}"
+                    "level=info op=plugin.microvm.{op} outcome=ok elapsed_us={elapsed_us} vms={vms}{extra}"
                 )
             }
             Err(e) => format!(
@@ -905,10 +927,10 @@ impl<B: MicrovmBackend> MicrovmRuntimeAdapter<B> {
         started: Instant,
         vms: usize,
         result: &Result<Vec<String>, PluginError>,
-        ioevent: Option<IoEventCounts>,
+        counts: StopLineCounts,
     ) {
         use std::io::Write;
-        let line = Self::result_line(op, started.elapsed().as_micros(), vms, result, ioevent);
+        let line = Self::result_line(op, started.elapsed().as_micros(), vms, result, counts);
         let _ = writeln!(std::io::stderr(), "{line}");
     }
 }
@@ -921,13 +943,19 @@ impl<B: MicrovmBackend> RequestHandler for MicrovmRuntimeAdapter<B> {
             Some(OP_START) => {
                 let started = Instant::now();
                 let r = self.do_start(body);
-                Self::log("start", started, self.vms.len(), &r, None);
+                Self::log(
+                    "start",
+                    started,
+                    self.vms.len(),
+                    &r,
+                    StopLineCounts::default(),
+                );
                 r
             }
             Some(OP_STOP) => {
                 let started = Instant::now();
-                let (r, ioevent) = self.do_stop(body);
-                Self::log("stop", started, self.vms.len(), &r, ioevent);
+                let (r, counts) = self.do_stop(body);
+                Self::log("stop", started, self.vms.len(), &r, counts);
                 r
             }
             _ => Err(perr(PluginErrorCode::Unimplemented, MSG_UNIMPLEMENTED)),
@@ -1092,6 +1120,8 @@ mod tests {
         reason: &'static str,
         /// stop が返す ioeventfd の件数（#4161）。
         ioevent: Option<IoEventCounts>,
+        /// stop が返す munmap の失敗件数（#4410）。
+        unmap_failures: Option<u64>,
     }
 
     impl MicrovmBackend for FakeBackend {
@@ -1124,6 +1154,7 @@ mod tests {
                         self.reason
                     },
                     ioevent: self.ioevent,
+                    unmap_failures: self.unmap_failures,
                 }),
             }
         }
@@ -1217,28 +1248,44 @@ mod tests {
         );
     }
 
-    /// MVM-1・REPAIR-4・#4161: stop の結果行は件数があれば `ignored=` / `unbind_failed=` を足し、無ければ従来と同一。値は数値のみ。
+    /// 試験用: ioevent と unmap の件数から `StopLineCounts` を組む。
+    fn lc(ioevent: Option<(u64, u64)>, unmap: Option<u64>) -> StopLineCounts {
+        StopLineCounts {
+            ioevent: ioevent.map(|(i, u)| IoEventCounts::new(i, u)),
+            unmap_failures: unmap,
+        }
+    }
+
+    /// MVM-1・REPAIR-4・#4161・#4410: stop の結果行は件数があれば `ignored=` / `unbind_failed=` / `unmap_failures=` を足し、無ければ従来と同一。値は数値のみ。
     #[test]
     fn mvm1_4161_stop_result_line_carries_ioevent_counts() {
         type A = MicrovmRuntimeAdapter<FakeBackend>;
         let ok: Result<Vec<String>, PluginError> = Ok(s(&["stopped", "requested"]));
         assert_eq!(
-            A::result_line("stop", 7, 0, &ok, Some(IoEventCounts::new(2, 1))),
+            A::result_line("stop", 7, 0, &ok, lc(Some((2, 1)), Some(2))),
+            "level=info op=plugin.microvm.stop outcome=ok elapsed_us=7 vms=0 ignored=2 unbind_failed=1 unmap_failures=2"
+        );
+        assert_eq!(
+            A::result_line("stop", 7, 0, &ok, lc(Some((0, 0)), Some(0))),
+            "level=info op=plugin.microvm.stop outcome=ok elapsed_us=7 vms=0 ignored=0 unbind_failed=0 unmap_failures=0"
+        );
+        assert_eq!(
+            A::result_line("stop", 7, 0, &ok, lc(Some((2, 1)), None)),
             "level=info op=plugin.microvm.stop outcome=ok elapsed_us=7 vms=0 ignored=2 unbind_failed=1"
         );
         assert_eq!(
-            A::result_line("stop", 7, 0, &ok, Some(IoEventCounts::new(0, 0))),
-            "level=info op=plugin.microvm.stop outcome=ok elapsed_us=7 vms=0 ignored=0 unbind_failed=0"
+            A::result_line("stop", 7, 0, &ok, lc(None, Some(0))),
+            "level=info op=plugin.microvm.stop outcome=ok elapsed_us=7 vms=0 unmap_failures=0"
         );
         assert_eq!(
-            A::result_line("stop", 7, 0, &ok, None),
+            A::result_line("stop", 7, 0, &ok, StopLineCounts::default()),
             "level=info op=plugin.microvm.stop outcome=ok elapsed_us=7 vms=0"
         );
         let err: Result<Vec<String>, PluginError> =
             Err(perr(PluginErrorCode::NotFound, MSG_NOT_FOUND));
-        let line = A::result_line("stop", 7, 0, &err, Some(IoEventCounts::new(2, 1)));
+        let line = A::result_line("stop", 7, 0, &err, lc(Some((2, 1)), Some(2)));
         assert!(line.starts_with("level=error op=plugin.microvm.stop outcome=error code="));
-        assert!(!line.contains("ignored="));
+        assert!(!line.contains("ignored=") && !line.contains("unmap_failures="));
     }
 
     /// MVM-1・REPAIR-4・#4161: backend の件数が `do_stop` から結果行へ渡り、UDS の応答は変わらない。id・パスは行に出ない。
@@ -1248,10 +1295,11 @@ mod tests {
         let k = t.file("kernel-secret-name", b"KERNEL");
         let mut a = adapter();
         a.backend.ioevent = Some(IoEventCounts::new(2, 1));
+        a.backend.unmap_failures = Some(3);
         a.handle(&start_req("vm-secret-id", &k)).expect("start");
         let (r, counts) = a.do_stop(&s(&["stop", "vm-secret-id"]));
         assert_eq!(r.expect("stop"), s(&["stopped", "requested"]));
-        assert_eq!(counts, Some(IoEventCounts::new(2, 1)));
+        assert_eq!(counts, lc(Some((2, 1)), Some(3)));
         let line = MicrovmRuntimeAdapter::<FakeBackend>::result_line(
             "stop",
             1,
@@ -1263,7 +1311,28 @@ mod tests {
         // エラー（未登録 id）は件数なし。
         let (r, counts) = a.do_stop(&s(&["stop", "vm-secret-id"]));
         assert!(r.is_err());
-        assert_eq!(counts, None);
+        assert_eq!(counts, StopLineCounts::default());
+    }
+
+    /// MVM-1・REPAIR-4・#4410: backend の munmap 失敗件数が 0 でも 2 でも結果行に載り、UDS の応答は変わらない。
+    #[test]
+    fn mvm1_4410_stop_result_line_carries_unmap_failures() {
+        let t = Tmp::new("unmap");
+        let k = t.file("k", b"KERNEL");
+        for n in [0u64, 2] {
+            let mut a = adapter();
+            a.backend.unmap_failures = Some(n);
+            a.handle(&start_req("vm1", &k)).expect("start");
+            let (r, counts) = a.do_stop(&s(&["stop", "vm1"]));
+            assert_eq!(r.as_ref().expect("stop"), &s(&["stopped", "requested"]));
+            let line = MicrovmRuntimeAdapter::<FakeBackend>::result_line("stop", 7, 0, &r, counts);
+            assert_eq!(
+                line,
+                format!(
+                    "level=info op=plugin.microvm.stop outcome=ok elapsed_us=7 vms=0 unmap_failures={n}"
+                )
+            );
+        }
     }
 
     /// 重複 id は ALREADY_EXISTS（backend は呼ばれない）、上限超過は RESOURCE_EXHAUSTED。

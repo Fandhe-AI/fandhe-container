@@ -91,6 +91,7 @@ impl MicrovmBackend for UnimplementedBackend {
         Ok(fandhe_container_plugin_microvm::adapter::StopOutcome {
             reason: "requested",
             ioevent: None,
+            unmap_failures: None,
         })
     }
 

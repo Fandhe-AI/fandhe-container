@@ -69,7 +69,7 @@
 - 新しい netns の `lo` は down で、join だけでは localhost 通信が成立しない（`crates/net/tests/lo_self_delivery.rs` が前提を固定。NET-2・NET-11）。provider の有無に依らず localhost を共有するため、`lo` を up にする責務は provider ではなく保持役に置く
 - 保持役は pod の userns が所有する netns の中で（userns 内の `CAP_NET_ADMIN` で）、READY を返す前に `lo` を up にする。失敗したら READY を返さず固定文言のエラーで終了し、Run は保持役を回収して失敗する（fail-closed）。provider が結線する場合も `lo` は既に up で、provider は触らない
 - 実装単位は H2（#2874）に含める（`lo` の up の実装と、provider が無い `POD` で pod 内の 2 コンテナが `127.0.0.1` で通信できる実機試験。H3 #2875 が CI へ組み込む）。H7（#2872）は join の受け口のみ。新規 issue の起票が要る場合は承認事項として報告する
-- 実装の現況（H2・#2874）: `lo` の up は H1 の `establish_pod_namespaces`（#2870）が netns の作成直後に行う（失敗したらエラー）ため、`pod-holder` モードは重ねて up にせず、保持役の netns の中で `127.0.0.1` が使えることを実機試験で確かめる（`pod_holder_bin_real` のシナリオ B。保持役の netns へ `nsenter` で入った 2 つのプロセスが TCP で往復する）。コンテナを使った「pod 内の 2 コンテナ」の試験は core の net join（H7・#2872）が要るため、H7 の後に H3（#2875）か H5 で扱う
+- 実装の現況（H2・#2874）: `lo` の up は H1 の `establish_pod_namespaces`（#2870）が netns の作成直後に行う（失敗したらエラー）ため、`pod-holder` モードは重ねて up にせず、保持役の netns の中で `127.0.0.1` が使えることを実機試験で確かめる（`pod_holder_bin_real` のシナリオ B。保持役の netns へ `nsenter` で入った 2 つのプロセスが TCP で往復する）。コンテナを使った「pod 内の 2 コンテナ」の試験は core の net join（H7・#2872）が要るため、H7 の後に H3（#2875）か H5 で扱う（#4405 で `production_binary_exec_real` の段 P として実装済み。CI は platform-ci の ubuntu）。
 
 ## PodSandboxStatus.network の IP 報告
 

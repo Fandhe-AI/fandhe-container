@@ -2928,6 +2928,8 @@ jobs:
       # CRI-6・SEC-1・REPAIR-12・#3762）: 本番バイナリ越しに実コンテナ（busybox）へ Exec を通し、echo・exit 3 の
       # 具体値と、exec のプロセスの CapEff・Seccomp がコンテナの init を超えないことを照合する。前提・launcher 回避・
       # 成功行の照合は container_grpc と同じ。新しいジョブ・check-run・sudo は追加しない。
+      # 段 P（#4405）: POD ネットワークの 2 コンテナが保持役の netns で 127.0.0.1 を往復し、別 pod へは届かないことを同じ試験の段として照合する
+      # （pull は増えず事前プローブの最低残量 4 は変わらない。期限・ステップ数も不変）。
       # 段 4（#4167）: 終わらない exec を開いたまま plugin-cri を SIGKILL し、helper が 2 秒以内に終わり exec のコマンドが残らないことを照合する。
       # 後始末は再起動した plugin-cri が記録を再採用して行う（関数・pull は増えないため事前プローブの最低残量は変わらない）。
       # - 期限: 試験の watchdog 480 秒 < 補助 540 秒（= timeout-minutes 10 × 60 - 60）< ステップ 10 分。
@@ -2972,6 +2974,12 @@ jobs:
             --select '^test [A-Za-z0-9_]+ \.\.\. ' --forbid 'PRECONDITION FAILED' \
             --require 'production_binary_exec_real: plugin restarted for reclaim reclaimed containers=1 sandboxes=1' \
             --summary
+          # 段 P（#4405・CRI-2・NET-3）: POD ネットワークの pod 内 127.0.0.1 往復と別 pod への不達の成功行 2 行を試験ソースから導出して照合する。
+          # `--forbid ignored` は libtest の要約 `0 ignored` に当たるため付けない（ignored は上の呼び出しが `test ... ignored` として禁じる）。
+          scripts/check-success-lines.sh --name production_binary_exec_real_pod_net \
+            --src crates/plugin-cri/tests/cri_exec_real.rs --log "${log}" \
+            --select '^production_binary_exec_real: pod-net ok: ' --min 2 \
+            --forbid 'PRECONDITION FAILED' --forbid 'pod-net FAILED' --summary
 
       # production_binary_attach_real（`crates/plugin-cri/tests/cri_attach_real.rs`。libtest の `#[ignore]`。
       # CRI-6・SUP-4・SEC-1・REPAIR-12・#4079）: 本番バイナリ越しに実コンテナ（busybox）へ完全版 Attach を通し、

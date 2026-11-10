@@ -192,6 +192,7 @@ mod mock_core {
                 None => Ok(fandhe_container_plugin_microvm::adapter::StopOutcome {
                     reason: "requested",
                     ioevent: r.stop_ioevent,
+                    unmap_failures: None,
                 }),
             }
         }
@@ -292,6 +293,7 @@ mod mock_core {
             Ok(fandhe_container_plugin_microvm::adapter::StopOutcome {
                 reason: "requested",
                 ioevent: None,
+                unmap_failures: None,
             })
         }
 

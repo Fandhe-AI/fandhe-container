@@ -34,8 +34,10 @@
 //! 数値と固定キーのみ。件数を持たない backend〔HVF 等〕・start・エラーは従来の行。UDS の応答は変えない。終了時の一括停止〔`stop_all`〕の行への合算と
 //! MMIO exit 経路で捨てた通知の件数は未実装）。
 //! あわせて backend が munmap の失敗件数を持つとき、その後ろに ` unmap_failures=K` を 0 件でも省かず足す（#4410・MVM-1・REPAIR-4。
-//! KVM は `StopReport::unmap_failures` の VM ごとの値で、`op=microvm.vcpus_stopped` の `unmap_failures=` と同じ。ホストのメモリのリークの兆候）。
-//! ioeventfd の件数と独立に出し（順序は ioevent → unmap）、持たない backend〔HVF は microvm 側の #4411 まで `None`〕は従来の行。`stop_all` の行への合算は未実装。
+//! KVM は `StopReport::unmap_failures` の VM ごとの値で、`op=microvm.vcpus_stopped` の `unmap_failures=` と同じ。ホストのメモリのリークの兆候。
+//! HVF は `HvfStopReport::unmap_failures`（ゲスト RAM の backing の munmap のみ。`hv_vm_unmap` の失敗は含まない）の VM ごとの値で、
+//! `op=hvf.microvm.stop` の `unmap_failures=` と同じ。#4411・#4437）。
+//! ioeventfd の件数と独立に出し（順序は ioevent → unmap）、持たない backend〔試験の偽 backend 等。`UnsupportedBackend` は VM を作れず該当しない〕は従来の行。`stop_all` の行への合算は未実装。
 //! # 注意・残余（REPAIR-3）
 //! - plugin プロセスは SIGUSR2 を使わない（microvm の `run_once` がプロセス全体の handler を入れる）。
 //! - stop が `TIMEOUT` の後、vCPU スレッドが自力で終わるまで資源（ゲスト RAM・fd）が残る。backend から終了を観測できないため、
@@ -191,7 +193,8 @@ pub struct StopOutcome {
     pub reason: &'static str,
     /// ioeventfd の無視・解除失敗の件数。持たない backend は `None`。
     pub ioevent: Option<IoEventCounts>,
-    /// munmap の失敗件数（`kvm_run` とゲスト RAM の合計。#4410）。持たない backend は `None`（0 と偽らない）。
+    /// munmap の失敗件数。KVM は `kvm_run` とゲスト RAM の合計（#4410）、HVF はゲスト RAM の backing のみ
+    /// （`hv_vm_unmap` の失敗は含まない。#4437）。持たない backend は `None`（0 と偽らない）。
     pub unmap_failures: Option<u64>,
 }
 
@@ -346,8 +349,10 @@ impl MicrovmBackend for HvfBackend {
         vm.stop(deadline).map(|r| StopOutcome {
             reason: r.reason.as_str(),
             ioevent: None,
-            // HvfStopReport はまだ munmap の失敗件数を持たない。microvm 側の #4411 の後に Some(..) へつなぐ（REPAIR-3）。
-            unmap_failures: None,
+            // microvm の `HvfStopReport::unmap_failures`（VM ごとのゲスト RAM の backing の munmap の失敗件数。
+            // `hv_vm_unmap` の失敗は含まず、`op=hvf.vm_unmap` の行が別にある）。集約行 `op=hvf.microvm.stop` の
+            // `unmap_failures=` と同じ値（#4411・#4437・MVM-5・REPAIR-4）。
+            unmap_failures: Some(r.unmap_failures),
         })
     }
 

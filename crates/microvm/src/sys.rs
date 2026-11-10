@@ -2024,14 +2024,8 @@ impl GuestRamMap {
         if p as usize == usize::MAX {
             return Err(last_error());
         }
-        let advise = |ptr: NonNull<u8>, len: usize, advice: i32| {
-            // SAFETY: `ptr` / `len` は下の `finish_guest_ram_map` へ渡す mmap の領域そのもの。`MADV_DONTFORK` は fork 先に
-            // マッピングを作らず、`MADV_DONTDUMP` はコアダンプに含めない指示だけを行い、どちらも領域の内容・対応付けを変更しない。
-            let r = unsafe { madvise(ptr.as_ptr().cast::<c_void>(), len, advice) };
-            if r < 0 { Err(last_error()) } else { Ok(()) }
-        };
         // SAFETY: `p` / `len` は直前の mmap が成功して返した領域そのもので、他に所有者がいない。
-        unsafe { finish_guest_ram_map(p, len, advise) }
+        unsafe { finish_guest_ram_map(p, len, madvise_guest_ram) }
     }
 
     /// drop の munmap 失敗を数える VM ごとの集約先を付ける（`register_backing` が登録成功後に呼ぶ。#4382）。
@@ -2123,6 +2117,17 @@ impl Drop for GuestRamMap {
             }
         }
     }
+}
+
+/// ゲスト RAM の領域へ `madvise` を 1 回当て、失敗した errno を `SysError` へ写す（本番の `advise`）。
+///
+/// `GuestRamMap::map` が `finish_guest_ram_map` へ渡す。試験も同じ関数を使い、本番と同じ経路で
+/// `MADV_DONTFORK` / `MADV_DONTDUMP` を当てる（#4420・MVM-1）。
+fn madvise_guest_ram(ptr: NonNull<u8>, len: usize, advice: i32) -> Result<(), SysError> {
+    // SAFETY: `ptr` / `len` は呼び出し側（`finish_guest_ram_map`）が渡す mmap の領域そのもの。`MADV_DONTFORK` は fork 先に
+    // マッピングを作らず、`MADV_DONTDUMP` はコアダンプに含めない指示だけを行い、どちらも領域の内容・対応付けを変更しない。
+    let r = unsafe { madvise(ptr.as_ptr().cast::<c_void>(), len, advice) };
+    if r < 0 { Err(last_error()) } else { Ok(()) }
 }
 
 /// `GuestRamMap::map` の mmap 成功後の段（NULL 検査と `madvise` 2 回）。失敗時は munmap して `Err` を返す。
@@ -3084,35 +3089,44 @@ mod tests {
     }
 
     /// MVM-1・#3679: ゲスト RAM は fork 先へ引き継がれず（`dc`）、コアダンプにも含まれない（`dd`）。
+    ///
+    /// smaps の VMA は、試験が自分で置いて所有を確かめた範囲 `[p, p+len)` の両端と一致するものだけを対象にする
+    /// （カーネルが選んだアドレスを含む VMA を探さない。#4420・REPAIR-12）。
     #[cfg(all(
         target_env = "gnu",
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
     #[test]
     fn mvm1_3679_guest_ram_excluded_from_fork_and_core_dump() {
-        let m = GuestRamMap::map(8192).unwrap();
-        let addr = m.ptr.as_ptr() as usize;
-        let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
-        let mut in_range = false;
-        let mut flags: Option<&str> = None;
-        for line in smaps.lines() {
-            let head = line.split_whitespace().next().unwrap_or("");
-            if let Some((lo, hi)) = head.split_once('-')
-                && let (Ok(lo), Ok(hi)) =
-                    (usize::from_str_radix(lo, 16), usize::from_str_radix(hi, 16))
-            {
-                in_range = lo <= addr && addr < hi;
-                continue;
+        with_owned_hole(16, |p, len| {
+            // SAFETY: `p` / `len` は補助が置いた領域で、この試験の他に所有者がいない。
+            let m = unsafe { finish_guest_ram_map(p, len, madvise_guest_ram) }.unwrap();
+            let want = (p as usize, p as usize + len);
+            let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+            let mut in_range = false;
+            let mut matched = 0;
+            let mut flags: Option<&str> = None;
+            for line in smaps.lines() {
+                let head = line.split_whitespace().next().unwrap_or("");
+                if let Some((lo, hi)) = head.split_once('-')
+                    && let (Ok(lo), Ok(hi)) =
+                        (usize::from_str_radix(lo, 16), usize::from_str_radix(hi, 16))
+                {
+                    in_range = (lo, hi) == want;
+                    matched += usize::from(in_range);
+                    continue;
+                }
+                if in_range && line.starts_with("VmFlags:") {
+                    flags = Some(line);
+                }
             }
-            if in_range && line.starts_with("VmFlags:") {
-                flags = Some(line);
-                break;
-            }
-        }
-        let flags = flags.expect("VmFlags of the guest ram mapping");
-        let names: Vec<&str> = flags.split_whitespace().skip(1).collect();
-        assert!(names.contains(&"dc"), "{flags}");
-        assert!(names.contains(&"dd"), "{flags}");
+            assert_eq!(matched, 1, "one VMA must match the owned range exactly");
+            let flags = flags.expect("VmFlags of the guest ram mapping");
+            let names: Vec<&str> = flags.split_whitespace().skip(1).collect();
+            assert!(names.contains(&"dc"), "{flags}");
+            assert!(names.contains(&"dd"), "{flags}");
+            drop(m);
+        });
     }
 
     /// MVM-1: ゲストページへの書き込みの境界検査。
@@ -3361,22 +3375,90 @@ mod tests {
         }
     }
 
-    /// MVM-1・TASK-75.1: drop で munmap され、`/proc/self/maps` から範囲が消える。
+    /// MVM-1・TASK-75.1・REPAIR-12・#4420: drop で munmap され、同じ範囲へ `MAP_FIXED_NOREPLACE` で置き直せる。
+    ///
+    /// `/proc/self/maps` の行頭のアドレスでは、並列の別試験が解放直後の同じアドレスへ mmap すると誤るため使わない。
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn guest_ram_map_is_unmapped_on_drop() {
-        let m = GuestRamMap::map(1 << 20).unwrap();
-        let start = m.ptr.as_ptr() as usize;
-        let needle = format!("{start:x}-");
-        let present = |needle: &str| {
-            std::fs::read_to_string("/proc/self/maps")
-                .unwrap()
-                .lines()
-                .any(|l| l.starts_with(needle))
-        };
-        assert!(present(&needle));
-        drop(m);
-        assert!(!present(&needle));
+        with_owned_hole(16, |p, len| {
+            // SAFETY: `p` / `len` は補助が置いた領域で、この試験の他に所有者がいない。
+            let m = unsafe { finish_guest_ram_map(p, len, madvise_guest_ram) }.unwrap();
+            assert_eq!(m.len(), len);
+            drop(m);
+        });
+    }
+
+    /// 試験が所有を確かめた範囲（穴）の中で `body` を実行し、`body` が終えた後に穴が解放されたことを確かめる補助。
+    ///
+    /// `/proc/self/{maps,smaps}` のアドレス照合は、並列の別試験が解放直後の同じアドレスへ mmap すると誤る
+    /// （#4412・#4420・REPAIR-12）。そこで PROT_NONE の予約の中へ `MAP_FIXED` で穴（`pages` ページ）を置き、
+    /// 陽性対照（使用中の範囲への `MAP_FIXED_NOREPLACE` は失敗）で所有を確かめてから `body(p, len)` を呼ぶ。
+    /// `body` は穴を `GuestRamMap` 等に渡して解放（drop・巻き戻し）する。その後、同じ範囲へ NOREPLACE で置き直せれば
+    /// 解放済みと判断する。
+    /// (1) 後始末で munmap するのは自分の予約の両端だけで、穴は置き直せた時だけ解除する（他スレッドの領域を巻き込まない）。
+    /// (2) 穴を他スレッドに取られて置き直せなかった場合に備え、新しい予約で最大 `ATTEMPTS` 回やり直す。
+    ///     本当に解放されない不具合なら毎回失敗するので、1 回も成功しなければ失敗にする。
+    /// libc との機械照合は microvm に未導入（#3664・#3290）。定数は Linux の x86_64・aarch64 共通の ABI 値。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    fn with_owned_hole(pages: usize, mut body: impl FnMut(*mut c_void, usize)) {
+        const PROT_NONE: i32 = 0;
+        const MAP_FIXED: i32 = 0x10;
+        const MAP_FIXED_NOREPLACE: i32 = 0x0010_0000;
+        const EEXIST: i32 = 17;
+        const ATTEMPTS: usize = 16;
+        // ホストのページサイズ（4 KiB・16 KiB・64 KiB）に合わせて、オフセット・長さ・予約をページ単位で計算する。
+        let page = usize::try_from(host_page_size().unwrap()).unwrap();
+        let len = pages * page;
+        let reserve = len + 2 * page;
+        let anon = consts::MAP_PRIVATE | consts::MAP_ANONYMOUS | consts::MAP_NORESERVE;
+        for _ in 0..ATTEMPTS {
+            // SAFETY: 新規の匿名マッピングで既存領域に触れない。戻り値は失敗値（-1）と比較してから使う。
+            let base = unsafe { mmap(std::ptr::null_mut(), reserve, PROT_NONE, anon, -1, 0) };
+            assert_ne!(base as isize, -1, "reserve failed");
+            let p = base.wrapping_byte_add(page);
+            // SAFETY: `p..p+len` は上の予約の内側で、MAP_FIXED が置き換えるのは自分の予約だけ。
+            let got = unsafe {
+                mmap(
+                    p,
+                    len,
+                    consts::PROT_READ | consts::PROT_WRITE,
+                    anon | MAP_FIXED,
+                    -1,
+                    0,
+                )
+            };
+            assert_eq!(got, p);
+            // 陽性対照: 使用中の範囲への NOREPLACE は EEXIST で置けない。
+            // SAFETY: NOREPLACE は既存の領域を置き換えず失敗するだけ。
+            let busy = unsafe { mmap(p, len, PROT_NONE, anon | MAP_FIXED_NOREPLACE, -1, 0) };
+            assert_eq!(busy as isize, -1);
+            assert!(matches!(last_error(), SysError::Os(EEXIST)));
+            body(p, len);
+            // SAFETY: 解放済みなら同じアドレスへ置き直せる。置けなければ何も変わらない。
+            let again = unsafe { mmap(p, len, PROT_NONE, anon | MAP_FIXED_NOREPLACE, -1, 0) };
+            // SAFETY: 前後の予約 `base..p` と `p+len..base+reserve` は PROT_NONE の自分の予約で、他に所有者がいない。
+            let (head, tail) = unsafe {
+                (
+                    munmap(base, page),
+                    munmap(p.wrapping_byte_add(len), reserve - page - len),
+                )
+            };
+            assert_eq!((head, tail), (0, 0));
+            if again == p {
+                // SAFETY: NOREPLACE で自分が置いた領域。
+                assert_eq!(unsafe { munmap(p, len) }, 0);
+                return;
+            }
+            if again as isize != -1 {
+                // 古いカーネルは NOREPLACE を無視して別のアドレスへ置くことがある。自分が置いた領域を戻して失敗にする。
+                // SAFETY: 直前の mmap が返した、自分だけが所有する領域。
+                unsafe { munmap(again, len) };
+                panic!("MAP_FIXED_NOREPLACE was ignored by the kernel");
+            }
+            // 穴は他スレッドに取られた可能性があるため、解除せずやり直す（他の領域を壊さない）。
+        }
+        panic!("region was not released after the body");
     }
 
     /// MVM-1・REPAIR-4・#4330: munmap の戻り値と固定行の対応。0 は行なし、それ以外はすべて行あり。
@@ -3481,69 +3563,14 @@ mod tests {
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn mvm1_4382_madvise_failure_rollback_success_emits_no_line() {
-        // `/proc/self/maps` のアドレス照合は、並列の別試験が解放直後の同じアドレスへ mmap すると誤る（#4412・REPAIR-12）。
-        // そこで PROT_NONE の予約の中へ MAP_FIXED で置き、巻き戻しの後に同じアドレスへ MAP_FIXED_NOREPLACE で
-        // 置き直せること（解放済み）で確かめる。解放した穴は他スレッドの mmap が拾いうるため、
-        // (1) 後始末で munmap するのは自分の予約の両端だけで、穴は置き直せた時だけ解除する（他スレッドの領域を巻き込まない）、
-        // (2) 穴を他スレッドに取られて置き直せなかった場合に備え、新しい予約で最大 ATTEMPTS 回やり直す。
-        //     本当に解放されない不具合なら毎回失敗するので、1 回も成功しなければ失敗にする。
-        // libc との機械照合は microvm に未導入（#3664・#3290）。定数は Linux の x86_64・aarch64 共通の ABI 値。
-        const PROT_NONE: i32 = 0;
-        const MAP_FIXED: i32 = 0x10;
-        const MAP_FIXED_NOREPLACE: i32 = 0x0010_0000;
-        const ATTEMPTS: usize = 16;
-        // ホストのページサイズ（4 KiB・16 KiB・64 KiB）に合わせて、オフセット・長さ・予約をページ単位で計算する。
-        let page = usize::try_from(host_page_size().unwrap()).unwrap();
-        let len = 2 * page;
-        let reserve = 64 * page;
-        let anon = consts::MAP_PRIVATE | consts::MAP_ANONYMOUS | consts::MAP_NORESERVE;
-        let mut released = false;
-        for _ in 0..ATTEMPTS {
-            // SAFETY: 新規の匿名マッピングで既存領域に触れない。戻り値は失敗値（-1）と比較してから使う。
-            let base = unsafe { mmap(std::ptr::null_mut(), reserve, PROT_NONE, anon, -1, 0) };
-            assert_ne!(base as isize, -1, "reserve failed");
-            let p = base.wrapping_byte_add(page);
-            // SAFETY: `p..p+len` は上の予約の内側で、MAP_FIXED が置き換えるのは自分の予約だけ。
-            let got = unsafe {
-                mmap(
-                    p,
-                    len,
-                    consts::PROT_READ | consts::PROT_WRITE,
-                    anon | MAP_FIXED,
-                    -1,
-                    0,
-                )
-            };
-            assert_eq!(got, p);
-            // 陽性対照: 使用中の範囲への NOREPLACE は置けない。
-            // SAFETY: NOREPLACE は既存の領域を置き換えず失敗するだけ。
-            let busy = unsafe { mmap(p, len, PROT_NONE, anon | MAP_FIXED_NOREPLACE, -1, 0) };
-            assert_eq!(busy as isize, -1);
-            // SAFETY: `p` / `len` は上の mmap の領域で、この試験の他に所有者がいない。
+        with_owned_hole(2, |p, len| {
+            // SAFETY: `p` / `len` は補助が置いた領域で、この試験の他に所有者がいない。
             let (res, lines) = crate::hvf_loop::capture_log_lines(|| unsafe {
                 finish_guest_ram_map(p, len, |_, _, _| Err(SysError::Os(99)))
             });
             assert!(matches!(res, Err(SysError::Os(99))));
             assert_eq!(lines, Vec::<String>::new());
-            // SAFETY: 解放済みなら同じアドレスへ置き直せる。置けなければ何も変わらない。
-            let again = unsafe { mmap(p, len, PROT_NONE, anon | MAP_FIXED_NOREPLACE, -1, 0) };
-            // SAFETY: 前後の予約 `base..p` と `p+len..base+reserve` は PROT_NONE の自分の予約で、他に所有者がいない。
-            let (head, tail) = unsafe {
-                (
-                    munmap(base, page),
-                    munmap(p.wrapping_byte_add(len), reserve - page - len),
-                )
-            };
-            assert_eq!((head, tail), (0, 0));
-            if again == p {
-                // SAFETY: NOREPLACE で自分が置いた領域。
-                assert_eq!(unsafe { munmap(p, len) }, 0);
-                released = true;
-                break;
-            }
-            // 穴は他スレッドに取られた可能性があるため、解除せずやり直す（他の領域を壊さない）。
-        }
-        assert!(released, "region was not released by the rollback");
+        });
     }
 
     /// MVM-1・REPAIR-4・#4382: drop の munmap 失敗は VM ごとの tally に 1 件数える。成功の drop は数えない。

@@ -2181,27 +2181,7 @@ unsafe fn rollback_failed_map(
     err
 }
 
-/// VM ごとの munmap 失敗件数（drop の経路のみ。停止・解放の集約行の `unmap_failures=` に出す。#4382・MVM-1・REPAIR-4）。
-///
-/// `VmFd` が持ち、`GuestRamMap` / `KvmRunMap` が drop で加算し、最後の停止スレッドが集約行を出す時に読む。
-/// 観測専用で、停止の合否には使わない。
-#[derive(Debug, Default)]
-pub(crate) struct UnmapTally {
-    failures: std::sync::atomic::AtomicU64,
-}
-
-impl UnmapTally {
-    /// munmap の失敗を 1 件数える。
-    pub(crate) fn record_failure(&self) {
-        self.failures
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// これまでの失敗件数。
-    pub(crate) fn count(&self) -> u64 {
-        self.failures.load(std::sync::atomic::Ordering::Relaxed)
-    }
-}
+pub(crate) use crate::stop::UnmapTally;
 
 /// `GuestRamMap` の munmap 失敗時に出す固定の 1 行（MVM-1・REPAIR-4・#4330）。HVF の `op=hvf.host_unmap`
 /// （#4292）と同じ文法。errno・アドレス・長さは出さず（ホストのアドレス配置を漏らさない）完全な定数にする。

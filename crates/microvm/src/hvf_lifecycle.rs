@@ -38,13 +38,14 @@
 //! 止まりの確認は「N 台すべてが報告した」こと（`hvf_loop::stop_all`。parked の AP を含む）。1 台でも確かめられなければ RAM を
 //! 手放すだけにし、残った vCPU スレッドの終了後に回収する（#4032）。AP の exit（SYSTEM_OFF・fail-closed の停止）は `VcpuSet::is_finished` が VM 全体の終了として伝え、停止時の集約でその理由を返す（#3891）。
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::hvf_abi::HvRunStats;
 use crate::hvf_loop::{LoopHandle, VCPU_STOP_DEADLINE_MAX, VcpuKick, VcpuSetStopReport, log_line};
-use crate::stop::StopReason;
+use crate::stop::{StopReason, UnmapTally};
 
 /// stop を経ない drop が vCPU スレッドの停止を待つ期限（REPAIR-5。Linux の `DROP_STOP_WAIT` と同値）。
 pub const DROP_STOP_DEADLINE: Duration = Duration::from_secs(5);
@@ -185,6 +186,10 @@ pub struct HvfStopReport {
     pub vcpu_count: u32,
     /// vCPU ごとの実行統計（index 順。`[0]` が BSP。#3884）。
     pub per_vcpu: Vec<HvRunStats>,
+    /// ゲスト RAM の backing の munmap の失敗件数（VM ごと。観測専用で停止の合否には使わない。MVM-5・REPAIR-4・#4411）。
+    /// 正常系では RAM を落とした後の最終値。0 でない場合は backing をリークしている（固定の 1 行 `op=hvf.host_unmap`
+    /// も出る）。`hv_vm_unmap` の失敗は含まない（`op=hvf.vm_unmap`）。ゲストへ対応付ける前の `HostMapping` の失敗も含まない。
+    pub unmap_failures: u64,
 }
 
 /// 解放の対象。drop 順は [`stop_and_release`] が決める（フィールドの宣言順には依らない）。
@@ -196,6 +201,8 @@ pub struct Resources<D, M, V> {
     pub memory: M,
     /// GIC つきの VM。
     pub vm: V,
+    /// munmap の失敗を数える VM ごとの集約先。読むだけで drop 順には関与しない（`unmap_failures=` に出す。#4411）。
+    pub unmap: Arc<UnmapTally>,
 }
 
 /// 停止を試み、止まりを確かめられたときだけ資源を devices → memory → vm の順に drop する（モジュール doc の「解放順序」）。
@@ -230,6 +237,7 @@ where
         mut devices,
         memory,
         vm,
+        unmap,
     } = resources;
     // 処理開始時に終了時刻の基準を 1 回だけ取り、vCPU の停止待ちとデバイス解放待ちで同じ期限を共有する（REPAIR-5）。
     let started = std::time::Instant::now();
@@ -253,6 +261,8 @@ where
                             elapsed: report.elapsed,
                             vcpu_count: u32::try_from(report.per_vcpu.len()).unwrap_or(u32::MAX),
                             per_vcpu: report.per_vcpu.iter().map(|r| r.stats).collect(),
+                            // 資源を落とした後に下で確定値を入れる。
+                            unmap_failures: 0,
                         })
                     }
                     Err(e) => {
@@ -300,6 +310,13 @@ where
             }
         }
     };
+    // 全経路の drop を終えた後の値。期限切れ・遅延回収の経路では、切り離した vCPU スレッドが後で回収する RAM の失敗は
+    // 含まない（後からの回収は `op=hvf.deferred_reclaim` と `op=hvf.host_unmap` で観測。#4411）。
+    let unmap_failures = unmap.count();
+    let mut outcome = outcome;
+    if let Ok(r) = &mut outcome {
+        r.unmap_failures = unmap_failures;
+    }
     match &outcome {
         Ok(r) => {
             let (level, result) = match r.reason {
@@ -307,12 +324,12 @@ where
                 _ => ("info", "ok"),
             };
             log_line(format_args!(
-                "level={level} op={op} outcome={result} reason={} released=true",
+                "level={level} op={op} outcome={result} reason={} released=true unmap_failures={unmap_failures}",
                 r.reason.as_str()
             ));
         }
         Err((e, tail)) => log_line(format_args!(
-            "level=error op={op} outcome=error code={} released=false {tail}",
+            "level=error op={op} outcome=error code={} released=false {tail} unmap_failures={unmap_failures}",
             e.code().as_str()
         )),
     }
@@ -603,6 +620,7 @@ mod tests {
             devices: Rec("devices", Arc::clone(log)),
             memory: Rec("memory", Arc::clone(log)),
             vm: Rec("vm", Arc::clone(log)),
+            unmap: Arc::default(),
         }
     }
 
@@ -724,6 +742,7 @@ mod tests {
             devices: Rec("devices", Arc::clone(&log)),
             memory: ram,
             vm,
+            unmap: Arc::default(),
         };
         let e = stop_and_release("hvf.microvm.stop", h, Duration::from_millis(50), r).unwrap_err();
         assert_eq!(e.code(), MicrovmErrorCode::DeadlineExceeded);
@@ -761,6 +780,7 @@ mod tests {
             devices: Rec("devices", Arc::clone(&log)),
             memory: ram.clone(),
             vm,
+            unmap: Arc::default(),
         };
         stop_and_release("hvf.microvm.stop", h, LONG, r).unwrap();
         assert_eq!(
@@ -856,6 +876,7 @@ mod tests {
             devices: Rec("devices", Arc::clone(&log)),
             memory: ram,
             vm,
+            unmap: Arc::default(),
         };
         let _ = take_thread_reclaim();
         let e = stop_and_release("hvf.microvm.stop", h, Duration::from_millis(50), r).unwrap_err();
@@ -901,6 +922,7 @@ mod tests {
             devices: Rec("devices", Arc::clone(&log)),
             memory: ram,
             vm,
+            unmap: Arc::default(),
         };
         let _ = take_thread_reclaim();
         stop_and_release("hvf.microvm.stop", h, LONG, r).unwrap();
@@ -938,6 +960,7 @@ mod tests {
             devices: LockedDevices,
             memory: Rec("memory", Arc::clone(&log)),
             vm: Rec("vm", Arc::clone(&log)),
+            unmap: Arc::default(),
         };
         let deadline = Duration::from_millis(10);
         let t = std::time::Instant::now();
@@ -961,6 +984,7 @@ mod tests {
             devices: StuckDevices(Rec("devices", Arc::clone(&log))),
             memory: Rec("memory", Arc::clone(&log)),
             vm: Rec("vm", Arc::clone(&log)),
+            unmap: Arc::default(),
         };
         let e = stop_and_release("hvf.microvm.stop", responsive(), LONG, r).unwrap_err();
         assert_eq!(e.code(), MicrovmErrorCode::DeadlineExceeded);
@@ -981,6 +1005,7 @@ mod tests {
             devices: StuckDevices(Rec("devices", Arc::clone(&log))),
             memory: ram,
             vm,
+            unmap: Arc::default(),
         };
         let e = stop_and_release(
             "hvf.microvm.stop",
@@ -1066,6 +1091,7 @@ mod tests {
             devices: Rec("devices", Arc::clone(&log)),
             memory: ram,
             vm,
+            unmap: Arc::default(),
         };
         let e =
             stop_and_release("hvf.microvm.stop", set, Duration::from_millis(100), r).unwrap_err();
@@ -1105,6 +1131,7 @@ mod tests {
             devices: Rec("devices", Arc::clone(&log)),
             memory: slot.clone(),
             vm: Rec("vm", Arc::clone(&log)),
+            unmap: Arc::default(),
         };
         let t = std::time::Instant::now();
         let e = stop_and_release(
@@ -1216,5 +1243,88 @@ mod tests {
         let r = stop_and_release("test", stopper, LONG, resources(&log)).unwrap();
         assert_eq!(r.reason, StopReason::Requested);
         assert_eq!(*log.lock().unwrap(), vec!["devices", "memory", "vm"]);
+    }
+
+    /// 解放の中で munmap の失敗を `n` 件数える RAM の模擬（`HostMapping` の drop の代役。#4411）。
+    struct FailingRam(Arc<UnmapTally>, u32);
+
+    impl ReleaseMemory for FailingRam {
+        fn release_memory(self, _deadline: Duration) -> Result<(), MicrovmError> {
+            for _ in 0..self.1 {
+                self.0.record_failure();
+            }
+            Ok(())
+        }
+
+        fn detach(self) {}
+    }
+
+    /// 停止の集約行（`op=hvf.microvm.stop` の行だけ）を捕捉して返す。
+    fn stop_lines(
+        r: Resources<Rec, FailingRam, Rec>,
+    ) -> (Result<HvfStopReport, MicrovmError>, Vec<String>) {
+        crate::hvf_loop::capture_log_lines(|| {
+            stop_and_release("hvf.microvm.stop", responsive(), LONG, r)
+        })
+    }
+
+    /// MVM-5・REPAIR-4・#4411: munmap の失敗件数が `HvfStopReport` と集約行の `unmap_failures=` に具体値で一致する。
+    /// 失敗なしの対照は 0（0 でも省かない）。
+    #[test]
+    fn mvm5_4411_unmap_failures_reach_stop_report_and_line() {
+        for (n, want) in [(2u32, 2u64), (0, 0)] {
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let tally = Arc::new(UnmapTally::default());
+            let r = Resources {
+                devices: Rec("devices", Arc::clone(&log)),
+                memory: FailingRam(Arc::clone(&tally), n),
+                vm: Rec("vm", Arc::clone(&log)),
+                unmap: tally,
+            };
+            let (res, lines) = stop_lines(r);
+            assert_eq!(res.unwrap().unmap_failures, want);
+            let own: Vec<_> = lines
+                .iter()
+                .filter(|l| l.contains("op=hvf.microvm.stop"))
+                .collect();
+            assert_eq!(
+                own,
+                vec![&format!(
+                    "level=info op=hvf.microvm.stop outcome=ok reason=requested released=true unmap_failures={want}"
+                )]
+            );
+        }
+    }
+
+    /// MVM-5・REPAIR-4・#4411: 異常系（`outcome=error`）の集約行にも `unmap_failures=` が出る。
+    #[test]
+    fn mvm5_4411_error_line_carries_unmap_failures() {
+        for want in [1u64, 0] {
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let tally = Arc::new(UnmapTally::default());
+            for _ in 0..want {
+                tally.record_failure();
+            }
+            let r = Resources {
+                devices: StuckDevices(Rec("devices", Arc::clone(&log))),
+                memory: Rec("memory", Arc::clone(&log)),
+                vm: Rec("vm", Arc::clone(&log)),
+                unmap: tally,
+            };
+            let (res, lines) = crate::hvf_loop::capture_log_lines(|| {
+                stop_and_release("hvf.microvm.stop", responsive(), LONG, r)
+            });
+            assert!(res.is_err());
+            let own: Vec<_> = lines
+                .iter()
+                .filter(|l| l.contains("op=hvf.microvm.stop"))
+                .collect();
+            assert_eq!(
+                own,
+                vec![&format!(
+                    "level=error op=hvf.microvm.stop outcome=error code=TIMEOUT released=false leaked=guest_ram,vm unmap_failures={want}"
+                )]
+            );
+        }
     }
 }

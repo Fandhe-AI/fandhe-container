@@ -1190,7 +1190,7 @@ pub type ExecPtyHook<'a> = dyn Fn(ExecPtyEvent<'_>) -> Result<(), TraitError> + 
 ///
 /// stream-exec helper が、受け渡しの失敗を段 `helper_pty_master` として報告できるようにするための通知。
 /// `Failed` は、フックが `Master` に `Err` を返したとき（呼び出し側が自分で失敗を記録済み）と、何も届かないまま
-/// worker が自分の失敗で終わったときには呼ばれない。
+/// worker が自分の失敗で終わったときのどちらでも呼ばれない。
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum ExecPtyEvent<'e> {

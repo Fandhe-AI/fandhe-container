@@ -77,7 +77,7 @@
 //! 切り離したスレッドが後で自力で終わると、`hvf_lifecycle::drop_vcpu_thread_state` の順（vCPU の破棄 → デバイスの参照 → スロット
 //! → VM）で最後の `Arc` が落ち、`hv_vm_unmap` → munmap → `hv_vm_destroy` が走って「1 プロセス 1 VM」の占有が戻る。スレッドが終わる
 //! までは何も解放されず、同じプロセスでの再 assemble は `FailedPrecondition` になる。`hv_vm_unmap` が失敗したら backing は
-//! リークし、`op=hvf.vm_unmap` の行で記録する。
+//! リークし、`op=hvf.vm_unmap` の行で記録する（件数は停止の集約行の ` vm_unmap_failures=` にも載る。#4439）。
 //! #4034 の実機確認では、切り離した vCPU スレッドの終了後に `op=hvf.vm_unmap outcome=error` が出ず、同じプロセスで VM を作り直せた
 //! （destroy が失敗すると排他を戻さないため、作り直せたことは destroy の成功を意味する。間接の根拠）。回収がそのスレッドの上で成功した
 //! ことを直接示す行 `op=hvf.deferred_reclaim`（`outcome=ok thread=hvf-vcpu-N released=guest_ram,vm`）は #4146 で足した。通常の
@@ -251,6 +251,9 @@ struct HvfVmParts<B: BlockBackend, N: NetBackend> {
     vm: Option<Arc<VmWithGic>>,
     /// munmap の失敗を数える VM ごとの集約先（`HvVm` と共有。`release` が `Resources` で渡し、集約行の `unmap_failures=` に出す。#4411）。
     unmap: Arc<UnmapTally>,
+    /// `hv_vm_unmap` の失敗を数える VM ごとの集約先（`unmap` とは別。`release` が `Resources` で渡し、集約行の
+    /// `vm_unmap_failures=` に出す。#4439）。
+    vm_unmap: Arc<UnmapTally>,
     /// 受信ポーラー `hvf-net-rx`（virtio-net がある構成の start 以降。`release` が vCPU の後に止める。#4030）。
     net_rx: Option<NetRxPollerHandle>,
     dispatcher: Arc<Mutex<ExitDispatcher>>,
@@ -307,6 +310,7 @@ impl<B: BlockBackend, N: NetBackend> HvfVmParts<B, N> {
                 memory: self.memory.clone(),
                 vm,
                 unmap: Arc::clone(&self.unmap),
+                vm_unmap: Arc::clone(&self.vm_unmap),
             },
         )
     }
@@ -527,6 +531,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfMicroV
                 devices: Some(devices),
                 memory,
                 unmap: vm.vm().unmap_tally(),
+                vm_unmap: vm.vm().vm_unmap_tally(),
                 vm: Some(vm),
                 net_rx: None,
                 dispatcher,

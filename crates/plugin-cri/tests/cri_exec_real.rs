@@ -16,6 +16,10 @@
 //!   helper は plugin-cri の子から探し、開始時刻つきで消滅を判定する（plugin-cri の死後は init 等へ再親付けされるため）。
 //!   段 4 の後は再起動した plugin-cri が記録を再採用して後始末する（本物の状態ルートに記録を残さないため）。
 //!
+//! - 段 T（#4417・CRI-6・SEC-1・REPAIR-12）: tty の Exec（`/bin/sh`。stdin・stdout・resize、stderr は張らない）で、入力 `echo ab$((1+2))cd`
+//!   の実行結果 `ab3cd` が stdout に往復すること、resize（100x30 → 120x40）の後の `stty size` の出力が送った寸法（`30 100`・`40 120`）
+//!   と一致すること、`exit` で error ストリームが `Success`・GOAWAY が OK で終わることを具体値で照合する。pull は増やさない。
+//!
 //! - 段 P（#4405・CRI-2・CORE-3・NET-3・REPAIR-12）: network・ipc を `POD` にした sandbox 2 個（P・Q）で、P の 2 コンテナが
 //!   保持役の netns 内で `127.0.0.1` を往復し（busybox の `nc`）、Q のコンテナからは届かないことと、netns の inode が
 //!   pod ごとに異なり保持役（`pod-holder`）の netns と一致することを具体値で照合する。pull は増やさない。
@@ -28,8 +32,7 @@
 //! ハーネス（TempDir・ChildGuard・接続待ち・pull の失敗行）は `container_grpc.rs` の段 C と同じものを最小化して複製した
 //! （試験 crate 間でモジュールを共有できないため）。`container_grpc.rs` は変更しない（波及の最小化。REPAIR-1）。
 //!
-//! 残余（REPAIR-3）: tty（`kubectl exec -it`）は supervisor の pty 結線の後続まで `INVALID_ARGUMENT`。相対の `argv[0]` は
-//! #2439 まで拒否されるため、argv は絶対パスの固定リテラルだけを使う。実機の crictl での確認は人間担当（#3730 の子）。
+//! 残余（REPAIR-3）: 相対の `argv[0]` は #2439 まで拒否されるため、argv は絶対パスの固定リテラルだけを使う。実機の crictl での確認は人間担当（#3730 の子）。
 //!
 //! Linux 限定の理由: 本番の既定の状態ルート・supervisor・Landlock・cgroup v2 は Linux でだけ成り立つ（`container_grpc.rs` と同じ）。
 
@@ -316,6 +319,97 @@ async fn exec_once(c: &mut RuntimeServiceClient<Channel>, id: &str, cmd: &[&str]
         status,
         goaway,
     }
+}
+
+// ---- 段 T（#4417）: tty の往復と resize ----
+
+/// 段 T の成功行（CI が `--require` で照合する。#4417）。
+const TTY_OK: &str =
+    "production_binary_exec_real: tty ok: round trip and resize (30x100, 40x120) matched stty size";
+
+/// 出力待ちの全体期限（REPAIR-5）。
+const OUTPUT_DEADLINE: Duration = Duration::from_secs(60);
+
+/// resize ストリームへ送る JSON（kubelet の `TerminalSize`。キーは `Width`・`Height`）。`cri_attach_real.rs` の複製。
+fn resize_json(width: u16, height: u16) -> Vec<u8> {
+    format!("{{\"Width\":{width},\"Height\":{height}}}").into_bytes()
+}
+
+/// `haystack` の中に `needle` が含まれるか。`cri_attach_real.rs` の複製。
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// ストリーム `id` の `from` バイト目以降に `needle` が現れるまで読み、現在の長さを返す。期限を超えたら失敗にする
+/// （REPAIR-5。失敗文は長さとストリーム ID だけで、出力本文は出さない）。`cri_attach_real.rs` の複製。
+fn read_until_contains(s: &mut Spdy, id: u32, from: usize, needle: &[u8]) -> usize {
+    let start = Instant::now();
+    loop {
+        let buf = s.data.get(&id).map(Vec::as_slice).unwrap_or_default();
+        if contains(buf.get(from..).unwrap_or_default(), needle) {
+            return buf.len();
+        }
+        assert!(
+            start.elapsed() < OUTPUT_DEADLINE,
+            "expected output did not arrive on stream {id} (received {} bytes)",
+            buf.len()
+        );
+        s.pump_one();
+    }
+}
+
+/// 段 T（#4417・CRI-6・SEC-1・REPAIR-12）: tty の Exec（`kubectl exec -it` に当たる）で、シェルへの入力の往復と resize の
+/// 反映（`stty size` の出力が送った寸法と一致）を本番の経路で具体値に固定する。tty では stderr を張らない。
+async fn tty_stage(c: &mut RuntimeServiceClient<Channel>, id: &str) {
+    let url = call_with_deadline(
+        c.exec(cri::ExecRequest {
+            container_id: id.into(),
+            cmd: vec!["/bin/sh".to_string()],
+            tty: true,
+            stdin: true,
+            stdout: true,
+            stderr: false,
+        }),
+        RPC_DEADLINE,
+    )
+    .await
+    .expect("tty exec rpc")
+    .into_inner()
+    .url;
+    assert!(url.starts_with("http://127.0.0.1:"), "url: {url}");
+    let (authority, path) = split_url(&url);
+    let addr: SocketAddr = authority.parse().expect("authority");
+    let join = tokio::task::spawn_blocking(move || {
+        let mut s = Spdy::connect(addr, &path, &EXEC_VERSIONS, "v4.channel.k8s.io");
+        s.tcp
+            .set_read_timeout(Some(SPDY_READ_TIMEOUT))
+            .expect("read timeout");
+        let error = s.create_stream(&[("streamtype", "error")]);
+        let stdin = s.create_stream(&[("streamtype", "stdin")]);
+        let stdout = s.create_stream(&[("streamtype", "stdout")]);
+        let resize = s.create_stream(&[("streamtype", "resize")]);
+        // 往復: pty の行規律が入力をエコーするため、シェルの実行結果 `ab3cd` だけで判定する。
+        s.send_data(stdin, b"echo ab$((1+2))cd\n", false);
+        let mut pos = read_until_contains(&mut s, stdout, 0, b"ab3cd");
+        // 初期サイズは 0 行 0 列なので、`stty size` の前に必ず resize を送る。
+        for (w, h) in [(100u16, 30u16), (120, 40)] {
+            s.send_data(resize, &resize_json(w, h), false);
+            s.send_data(stdin, b"stty size\n", false);
+            let want = format!("{h} {w}");
+            pos = read_until_contains(&mut s, stdout, pos, want.as_bytes());
+        }
+        s.send_data(stdin, b"exit\n", false);
+        let raw = s.read_until_fin(error);
+        let text = String::from_utf8_lossy(&raw).into_owned();
+        let status =
+            mini_json::parse(&text).unwrap_or_else(|| panic!("status is not JSON: {text}"));
+        assert_eq!(status_str(&status, "status"), "Success", "{status:?}");
+        assert_eq!(s.wait_goaway(), goaway_status::OK);
+    });
+    tokio::time::timeout(Duration::from_secs(120), join)
+        .await
+        .expect("tty stage deadline")
+        .expect("tty stage join");
 }
 
 // ---- /proc の走査（段 4。外部入力なので失敗は「不一致」へ倒す） ----
@@ -960,6 +1054,13 @@ async fn scenario(
     assert_eq!(hex_field(&exec_st, "CapInh"), 0);
     assert_eq!(hex_field(&exec_st, "CapAmb"), 0);
 
+    // 段 T（#4417）: tty の往復と resize。段 4 は plugin-cri を殺すため、その前に置く。
+    tty_stage(&mut c, &id).await;
+    {
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), "{TTY_OK}");
+    }
+
     // 段 P（#4405）: POD ネットワークの pod 内往復。
     pod_network_stage(&mut c, &id, &token, &ledger).await;
 
@@ -1331,4 +1432,20 @@ fn repair12_4405_pod_net_commands_are_fixed() {
         pod_net_client_script(),
         "printf 'fandhe-pod-net-4405\\n' | /bin/nc -w 2 127.0.0.1 18181"
     );
+}
+
+/// 包含判定が tty のエコー混じりの出力から結果だけを見分けること（REPAIR-12・#4417）。
+#[test]
+fn cri6_4417_contains_helper_matches_tty_output() {
+    let echoed_and_result = b"echo ab$((1+2))cd\r\nab3cd\r\n/ # ";
+    assert!(contains(echoed_and_result, b"ab3cd"));
+    assert!(!contains(b"echo ab$((1+2))cd\r\n", b"ab3cd"));
+    assert!(contains(b"stty size\r\n30 100\r\n", b"30 100"));
+    assert!(!contains(b"", b"30 100"));
+}
+
+/// resize の JSON が kubelet の `TerminalSize` と同じキーで出ること（CRI-6・#4417）。
+#[test]
+fn cri6_4417_resize_json_literal() {
+    assert_eq!(resize_json(100, 30), br#"{"Width":100,"Height":30}"#);
 }

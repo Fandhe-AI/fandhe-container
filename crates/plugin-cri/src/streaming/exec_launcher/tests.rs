@@ -42,7 +42,12 @@ struct FakeSpawner {
     script: Script,
     diag: Option<DiagScript>,
     pids: Arc<Mutex<Vec<u32>>>,
+    /// 起動のたびに受けた引数の写し（tty・stdio の mask・`to_args()`。#4417）。
+    seen: SeenArgs,
 }
+
+/// `FakeSpawner` が記録する引数の列（#4417）。
+type SeenArgs = Arc<Mutex<Vec<(bool, u8, Vec<std::ffi::OsString>)>>>;
 
 impl HelperSpawner for FakeSpawner {
     fn spawn(&self, args: &StreamExecArgs) -> Result<SpawnedHelper, CriError> {
@@ -54,6 +59,10 @@ impl HelperSpawner for FakeSpawner {
             .spawn()
             .expect("spawn sleep");
         self.pids.lock().expect("lock").push(child.id());
+        self.seen
+            .lock()
+            .expect("lock")
+            .push((args.tty(), args.stdio().bits(), args.to_args()));
         let script = Arc::clone(&self.script);
         let mask = args.stdio();
         std::thread::spawn(move || script(script_end, mask));
@@ -137,6 +146,7 @@ impl Fixture {
             script,
             diag,
             pids: Arc::clone(&pids),
+            seen: SeenArgs::default(),
         };
         let l = SupervisorExecLauncher::new(
             self.dir.0.join("state"),
@@ -647,10 +657,193 @@ async fn cri6_3761_non_pty_master_fails_the_launch() {
     assert!(gone(pid));
 }
 
-/// 本番の spawner は tty の能力を持たない（supervisor 側の pty 結線が入るまで fail-closed）。
+/// 偽の helper の script から tty の契約順（`Started` → `PtyMaster` → `Spawned` → `Result`）で流す共通部品（#4417）。
+fn open_ptmx() -> File {
+    File::options()
+        .read(true)
+        .write(true)
+        .open("/dev/ptmx")
+        .expect("open /dev/ptmx")
+}
+
+/// CRI-6・SEC-1・#4417: tty の要求は helper に `--tty` を付け、stdio の mask は 0 のまま。非 tty には `--tty` を付けない。
+#[tokio::test]
+async fn cri6_4417_tty_launch_passes_tty_flag_and_zero_mask() {
+    let fx = Fixture::new("ttyflag");
+    for tty in [true, false] {
+        let seen = SeenArgs::default();
+        let pids = Arc::new(Mutex::new(Vec::new()));
+        let script: Script = Arc::new(move |end, mask| {
+            let _ = recv_stdio_handover(&end, mask, deadline()).expect("handover");
+            send_started(&end, &cg_name(), deadline()).expect("started");
+            if tty {
+                let master = open_ptmx();
+                send_pty_master(&end, std::os::fd::AsFd::as_fd(&master), deadline()).expect("pty");
+            }
+            send_result(&end, &StreamExecOutcome::Exited(0), deadline()).expect("result");
+        });
+        let spawner = FakeSpawner {
+            tty,
+            script,
+            diag: None,
+            pids: Arc::clone(&pids),
+            seen: Arc::clone(&seen),
+        };
+        let launcher = SupervisorExecLauncher::new(
+            fx.dir.0.join("state"),
+            Arc::clone(&fx.store) as Arc<dyn StateStore>,
+            Arc::new(spawner),
+        );
+        let _session = launcher
+            .launch(fx.req("run1", tty, true, false, tty))
+            .await
+            .expect("launch");
+        let seen = seen.lock().expect("lock");
+        let (got_tty, bits, argv) = seen.first().expect("spawned").clone();
+        assert_eq!(got_tty, tty);
+        let flags = argv.iter().filter(|a| *a == "--tty").count();
+        assert_eq!(flags, usize::from(tty), "argv: {argv:?}");
+        if tty {
+            assert_eq!(bits, 0, "tty must not hand over stdio fds");
+        }
+    }
+}
+
+/// CRI-6・SEC-1・#4417: 契約の順序 `Started` → `PtyMaster` → `Spawned` → `Result` で起動に成功し、終了コード 0 で終わる。
+#[tokio::test]
+async fn cri6_4417_tty_contract_order_is_accepted() {
+    let fx = Fixture::new("ttyorder");
+    let script: Script = Arc::new(|end, mask| {
+        let _ = recv_stdio_handover(&end, mask, deadline()).expect("handover");
+        send_started(&end, &cg_name(), deadline()).expect("started");
+        let master = open_ptmx();
+        send_pty_master(&end, std::os::fd::AsFd::as_fd(&master), deadline()).expect("pty");
+        send_spawned(
+            &end,
+            std::num::NonZeroU32::new(4242).expect("pid"),
+            deadline(),
+        )
+        .expect("spawned");
+        send_result(&end, &StreamExecOutcome::Exited(0), deadline()).expect("result");
+    });
+    let (launcher, _pids) = fx.launcher(true, script);
+    let mut session = launcher
+        .launch(fx.req("run1", true, true, false, true))
+        .await
+        .expect("launch");
+    assert!(session.stdin.is_some());
+    assert!(session.stdout.is_some());
+    assert!(session.stderr.is_none());
+    assert!(session.resize.is_some());
+    let code = tokio::time::timeout(WAIT, &mut session.exit)
+        .await
+        .expect("timed out")
+        .expect("exit");
+    assert_eq!(code, 0);
+}
+
+/// SEC-1・#4417: tty で `Started` の次が `Spawned`（`PtyMaster` の欠落）なら起動の失敗で、helper は kill される。
+#[tokio::test]
+async fn sec1_4417_spawned_instead_of_pty_master_fails_the_launch() {
+    let fx = Fixture::new("ttynopty");
+    let script: Script = Arc::new(|end, mask| {
+        let _ = recv_stdio_handover(&end, mask, deadline()).expect("handover");
+        send_started(&end, &cg_name(), deadline()).expect("started");
+        send_spawned(
+            &end,
+            std::num::NonZeroU32::new(4242).expect("pid"),
+            deadline(),
+        )
+        .expect("spawned");
+        std::thread::sleep(Duration::from_secs(10));
+    });
+    let (launcher, pids) = fx.launcher(true, script);
+    let e = launcher
+        .launch(fx.req("run1", true, true, false, true))
+        .await
+        .expect_err("must fail");
+    assert_eq!(e.code(), CriErrorCode::Internal);
+    let pid = *pids.lock().expect("lock").first().expect("pid");
+    assert!(gone(pid));
+    assert_eq!(launcher.active_sessions(), 0);
+}
+
+/// SEC-1・#4417: `PtyMaster` が 2 回届くのは違反で、exit future は内部エラーになり helper は kill される。
+#[tokio::test]
+async fn sec1_4417_duplicate_pty_master_is_internal_and_kills_the_helper() {
+    let fx = Fixture::new("ttydup");
+    let script: Script = Arc::new(|end, mask| {
+        let _ = recv_stdio_handover(&end, mask, deadline()).expect("handover");
+        send_started(&end, &cg_name(), deadline()).expect("started");
+        let master = open_ptmx();
+        send_pty_master(&end, std::os::fd::AsFd::as_fd(&master), deadline()).expect("pty");
+        send_pty_master(&end, std::os::fd::AsFd::as_fd(&master), deadline()).expect("pty again");
+        std::thread::sleep(Duration::from_secs(10));
+    });
+    let (launcher, pids) = fx.launcher(true, script);
+    let mut session = launcher
+        .launch(fx.req("run1", true, true, false, true))
+        .await
+        .expect("launch");
+    let err = tokio::time::timeout(WAIT, &mut session.exit)
+        .await
+        .expect("timed out")
+        .expect_err("protocol violation");
+    assert_eq!(err.code(), CriErrorCode::Internal);
+    let pid = *pids.lock().expect("lock").first().expect("pid");
+    assert!(gone(pid), "helper must be killed");
+}
+
+/// SEC-1・#4417: tty でないのに届いた `PtyMaster` は違反で、exit future は内部エラーになり helper は kill される。
+#[tokio::test]
+async fn sec1_4417_pty_master_without_tty_is_internal_and_kills_the_helper() {
+    let fx = Fixture::new("notty-pty");
+    let script: Script = Arc::new(|end, mask| {
+        let _ = recv_stdio_handover(&end, mask, deadline()).expect("handover");
+        send_started(&end, &cg_name(), deadline()).expect("started");
+        let master = open_ptmx();
+        send_pty_master(&end, std::os::fd::AsFd::as_fd(&master), deadline()).expect("pty");
+        std::thread::sleep(Duration::from_secs(10));
+    });
+    let (launcher, pids) = fx.launcher(false, script);
+    let mut session = launcher
+        .launch(fx.req("run1", false, true, false, false))
+        .await
+        .expect("launch");
+    let err = tokio::time::timeout(WAIT, &mut session.exit)
+        .await
+        .expect("timed out")
+        .expect_err("protocol violation");
+    assert_eq!(err.code(), CriErrorCode::Internal);
+    let pid = *pids.lock().expect("lock").first().expect("pid");
+    assert!(gone(pid), "helper must be killed");
+}
+
+/// SEC-1・#4417: `Started` より前の `PtyMaster` は順序違反で起動の失敗になり、helper は kill される。
+#[tokio::test]
+async fn sec1_4417_pty_master_before_started_fails_the_launch() {
+    let fx = Fixture::new("ptyearly");
+    let script: Script = Arc::new(|end, mask| {
+        let _ = recv_stdio_handover(&end, mask, deadline()).expect("handover");
+        let master = open_ptmx();
+        send_pty_master(&end, std::os::fd::AsFd::as_fd(&master), deadline()).expect("pty");
+        std::thread::sleep(Duration::from_secs(10));
+    });
+    let (launcher, pids) = fx.launcher(true, script);
+    let e = launcher
+        .launch(fx.req("run1", true, true, false, true))
+        .await
+        .expect_err("must fail");
+    assert_eq!(e.code(), CriErrorCode::Internal);
+    let pid = *pids.lock().expect("lock").first().expect("pid");
+    assert!(gone(pid));
+    assert_eq!(launcher.active_sessions(), 0);
+}
+
+/// 本番の spawner は tty の能力を持つ（`--tty` の helper と supervisor の pty 結線が入った後。#4416・#4417）。
 #[test]
-fn cri6_3761_production_spawner_has_no_tty_capability() {
-    assert!(!ProductionHelperSpawner.capabilities().tty);
+fn cri6_4417_production_spawner_has_tty_capability() {
+    assert!(ProductionHelperSpawner.capabilities().tty);
 }
 
 /// 停止後の `launch` は拒否され、helper を起動しない（REPAIR-5・#3761）。
@@ -982,6 +1175,7 @@ async fn sec1_4286_one_sided_none_is_rejected() {
         script: hold_script(),
         diag: None,
         pids: Arc::clone(&pids),
+        seen: SeenArgs::default(),
     };
     let launcher = SupervisorExecLauncher::new(
         fx.dir.0.join("state"),
@@ -1006,6 +1200,7 @@ async fn cri5_4286_unreported_instance_on_both_sides_is_not_protected() {
         script: hold_script(),
         diag: None,
         pids: Arc::clone(&pids),
+        seen: SeenArgs::default(),
     };
     let launcher = SupervisorExecLauncher::new(
         fx.dir.0.join("state"),

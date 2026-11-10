@@ -12,8 +12,7 @@
 //! ## 未実装（REPAIR-3）
 //!
 //! [`ExecStreamLauncher`] の本番の実装は plugin-cri の `streaming::exec_launcher`（supervisor の `stream-exec` helper 経由。
-//! #3761・PLUG-1）にあり、本 crate には置かない。本番では tty を宣言せず（[`ExecStreamHandler::without_tty`]。
-//! supervisor 側の pty 結線が後続のため）、相対 `argv[0]` も断る（[`ExecStreamHandler::absolute_command_only`]）。
+//! #3761・PLUG-1）にあり、本 crate には置かない。本番は tty を宣言する（#4417。[`ExecStreamHandler::without_tty`] は tty を扱えない起動役向けの opt-out）が、相対 `argv[0]` も断る（[`ExecStreamHandler::absolute_command_only`]）。
 //! WebSocket（`v5.channel.k8s.io`）も未対応。
 //!
 //! ## プロトコルの要点（kubernetes v1.34 の kubelet / apimachinery と moby/spdystream で確認）

@@ -276,7 +276,7 @@ async fn cri6_3756_production_binary_node_port_forward_round_trip() {
 }
 
 /// CRI-6・SEC-1・REPAIR-3・#3761: 本番構成で `Exec` が `UNIMPLEMENTED` ではなく結線済みで、検証の順序が固定である
-/// （tty と相対 `argv[0]` は URL の発行前に `INVALID_ARGUMENT`、不在のコンテナは `NOT_FOUND`）。
+/// （tty は結線済みで不在のコンテナは `NOT_FOUND`、tty と stderr の併用・相対 `argv[0]` は URL の発行前に `INVALID_ARGUMENT`）。
 /// `main.rs` の exec 起動役の注入が消えれば `UNIMPLEMENTED` に戻って検出できる。実コンテナでの通しは #3762。
 #[tokio::test]
 async fn cri6_3761_production_binary_exec_is_wired_and_fail_closed() {
@@ -302,9 +302,17 @@ async fn cri6_3761_production_binary_exec_is_wired_and_fail_closed() {
 
         let e = call_with_deadline(c.exec(exec("/bin/true", true)), RPC_DEADLINE)
             .await
-            .expect_err("tty");
+            .expect_err("tty reaches the lookup");
+        assert_eq!(e.code(), PluginErrorCode::NotFound, "tty must be wired");
+
+        // tty と stderr の併用は Attach と同じ検査で URL の発行前に断る（#4417）。
+        let mut both = exec("/bin/true", true);
+        both.stderr = true;
+        let e = call_with_deadline(c.exec(both), RPC_DEADLINE)
+            .await
+            .expect_err("tty with stderr");
         assert_eq!(e.code(), PluginErrorCode::InvalidArgument);
-        assert_eq!(e.message(), "exec with tty is not supported");
+        assert_eq!(e.message(), "stderr must be false when tty is set");
 
         let e = call_with_deadline(c.exec(exec("true", false)), RPC_DEADLINE)
             .await

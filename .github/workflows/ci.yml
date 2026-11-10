@@ -2932,6 +2932,8 @@ jobs:
       # 成功行の照合は container_grpc と同じ。新しいジョブ・check-run・sudo は追加しない。
       # 段 P（#4405）: POD ネットワークの 2 コンテナが保持役の netns で 127.0.0.1 を往復し、別 pod へは届かないことを同じ試験の段として照合する
       # （pull は増えず事前プローブの最低残量 4 は変わらない。期限・ステップ数も不変）。
+      # 段 T（#4417）: tty の Exec（/bin/sh）で入力の往復と resize 後の `stty size` が送った寸法と一致することを同じ試験の段として照合する
+      # （pull は増えず事前プローブの最低残量 4・期限・ステップ数は変わらない）。
       # 段 4（#4167）: 終わらない exec を開いたまま plugin-cri を SIGKILL し、helper が 2 秒以内に終わり exec のコマンドが残らないことを照合する。
       # 後始末は再起動した plugin-cri が記録を再採用して行う（関数・pull は増えないため事前プローブの最低残量は変わらない）。
       # - 期限: 試験の watchdog 480 秒 < 補助 540 秒（= timeout-minutes 10 × 60 - 60）< ステップ 10 分。
@@ -2975,6 +2977,7 @@ jobs:
             --src crates/plugin-cri/tests/cri_exec_real.rs --log "${log}" --libtest-ignored \
             --select '^test [A-Za-z0-9_]+ \.\.\. ' --forbid 'PRECONDITION FAILED' \
             --require 'production_binary_exec_real: plugin restarted for reclaim reclaimed containers=1 sandboxes=1' \
+            --require 'production_binary_exec_real: tty ok: round trip and resize (30x100, 40x120) matched stty size' \
             --summary
           # 段 P（#4405・CRI-2・NET-3）: POD ネットワークの pod 内 127.0.0.1 往復と別 pod への不達の成功行 2 行を試験ソースから導出して照合する。
           # `--forbid ignored` は libtest の要約 `0 ignored` に当たるため付けない（ignored は上の呼び出しが `test ... ignored` として禁じる）。

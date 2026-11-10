@@ -10,7 +10,7 @@
 //! 読み取り専用の [`log_attach::LogFollowAttachBackend`]〔回転ログの follow。#3763〕で、stdin・tty は RPC 時に `INVALID_ARGUMENT`）と、PortForward の NODE ネットワーク（hostNetwork）の pod
 //! （#3755。[`NodeLoopbackDialer`]）。POD ネットワークの pod は RPC 時（cri）と dialer の両方で `UNIMPLEMENTED` で、
 //! 保持役（#2877）と helper 方式（#3766）まで続く。Exec は Linux で結線済み（`exec_launcher::SupervisorExecLauncher`。
-//! supervisor の `stream-exec` helper 経由。stdin・stdout・stderr のみで、tty と相対 `argv[0]` は RPC 時に `INVALID_ARGUMENT`。#3761）で、
+//! supervisor の `stream-exec` helper 経由。stdin・stdout・stderr と、tty（stdin・stdout・resize。stderr は RPC 時に `INVALID_ARGUMENT`。#4417）を扱い、相対 `argv[0]` は RPC 時に `INVALID_ARGUMENT`。#3761）で、
 //! 非 Linux は「exec streaming is not wired」の `UNIMPLEMENTED`。`wiring` は bind 時に 1 回だけ取られるため、
 //! ハンドラは必ず bind より前に足す（[`bind_production_streaming`] が順序を固定する）。
 //!
@@ -136,7 +136,7 @@ impl ProductionAttach {
 }
 
 /// 本番の `StreamDispatcher`。Attach（Linux は対話可能な完全版、非 Linux は読み取り専用。#3763・#4078）・PortForward（NODE ネットワークの pod だけ。#3755）・
-/// Exec（`exec` が `Some` のとき。stdin・stdout・stderr のみで tty なし、絶対パスの `argv[0]` のみ。#3761）を結線する。
+/// Exec（`exec` が `Some` のとき。stdin・stdout・stderr と tty、絶対パスの `argv[0]` のみ。#3761・#4417）を結線する。
 ///
 /// 期限は本番の設定（[`production_streaming_config`]）の
 /// `session_limits()`。ハンドラの構築失敗（設定検証。既定では起きない）は `Internal` の固定文言に写す。
@@ -163,8 +163,8 @@ pub fn production_stream_dispatcher(
     let mut dispatcher = StreamDispatcher::new()
         .with_attach(Arc::new(attach_handler))
         .with_port_forward(Arc::new(port_forward));
-    // Exec は起動役（Linux の supervisor helper 経由。#3761）がある構成だけ結線する。tty と相対 argv[0] は宣言せず、
-    // RPC 時に `INVALID_ARGUMENT` で断る（supervisor 側の pty 結線と PATH 解決の判断が済むまで。REPAIR-3）。
+    // Exec は起動役（Linux の supervisor helper 経由。#3761）がある構成だけ結線する。相対 argv[0] は宣言せず
+    // RPC 時に `INVALID_ARGUMENT` で断る（PATH 解決の判断が済むまで。#2439・REPAIR-3）。tty は #4417 で宣言する。
     if let Some(launcher) = exec {
         let config = ExecStreamConfig {
             limits: production_streaming_config().session_limits(),
@@ -172,7 +172,6 @@ pub fn production_stream_dispatcher(
         };
         let exec_handler = ExecStreamHandler::new(launcher, config)
             .map_err(|_| PluginError::new(PluginErrorCode::Internal, MSG_STREAMING_START_FAILED))?
-            .without_tty()
             .absolute_command_only()
             // 本番の記録先を注入する（既定の Noop だと統計出力に届かない。REPAIR-4）。
             .with_recorder(recorder);
@@ -1322,7 +1321,7 @@ mod tests {
         }
     }
 
-    /// CRI-6・SEC-1・#3761: 本番構成の `Exec` RPC が URL を返す。tty と相対 `argv[0]` は URL を返さず `INVALID_ARGUMENT`
+    /// CRI-6・SEC-1・#3761: 本番構成の `Exec` RPC が URL を返す。tty は stderr なしなら URL を返し（#4417）、相対 `argv[0]` は URL を返さず `INVALID_ARGUMENT`
     /// （固定文）。不在のコンテナは `NOT_FOUND`。
     #[cfg(target_os = "linux")]
     #[tokio::test]
@@ -1340,7 +1339,7 @@ mod tests {
         let issuer = server.issuer();
         let w = issuer.wiring();
         assert!(w.is_wired(StreamKind::Exec));
-        assert!(!w.exec_tty());
+        assert!(w.exec_tty());
         assert!(!w.exec_relative_command());
         let svc = CriRuntimeService::new().with_streaming(Arc::clone(&issuer));
         let pod = cri::PodSandboxConfig {
@@ -1399,9 +1398,29 @@ mod tests {
             url.starts_with(&format!("{}/exec/", issuer.base_url())),
             "{url}"
         );
-        let e = exec("/bin/true", true, &container).await.expect_err("tty");
+        // tty は URL を返す（#4417）。stderr との併用だけ Attach と同じ検査で断る。
+        let url = exec("/bin/true", true, &container)
+            .await
+            .expect("tty exec url")
+            .into_inner()
+            .url;
+        assert!(
+            url.starts_with(&format!("{}/exec/", issuer.base_url())),
+            "{url}"
+        );
+        let e = svc
+            .exec(Request::new(cri::ExecRequest {
+                container_id: container.clone(),
+                cmd: vec!["/bin/true".to_string()],
+                stdout: true,
+                stderr: true,
+                tty: true,
+                ..Default::default()
+            }))
+            .await
+            .expect_err("tty with stderr");
         assert_eq!(e.code(), Code::InvalidArgument);
-        assert_eq!(e.message(), "exec with tty is not supported");
+        assert_eq!(e.message(), "stderr must be false when tty is set");
         let e = exec("true", false, &container).await.expect_err("relative");
         assert_eq!(e.code(), Code::InvalidArgument);
         assert_eq!(e.message(), "exec command must be an absolute path");

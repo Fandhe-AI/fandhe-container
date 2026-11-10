@@ -49,7 +49,7 @@
 //!   exec の `ExecLaunchIo::pty` を渡す。worker が再適用の後にコンテナの devpts で pty を割り当て、親の応答者の刻みで受けた
 //!   master を channel の `PtyMaster` で要求元へ送る。送信順は `Started` → `PtyMaster` → `Spawned` → `SignalAck` → `Result`
 //!   で、master を送れなかった exec は `Spawned` を送らず `Result` の失敗で終える（段 `helper_pty_master`・`helper_pty_master_send`）。
-//!   plugin-cri 側の有効化（`HelperCapabilities.tty`・`without_tty` の撤去）は #4417 で、本番の CRI の Exec の tty はそれまで fail-closed。
+//!   plugin-cri 側の有効化（`HelperCapabilities.tty`・`without_tty` の撤去）も #4417 で実装済み。
 //!   初期の端末サイズは 0 行 0 列で、kubelet の最初の resize で決まる。
 //! - 受け取る stdio の fd は socket か FIFO に限る（`require_stdio_kinds`。#3761・SEC-1）。plugin-cri 側の結線は #3761 で実装済み。
 //! - 要求元（plugin-cri）の異常終了の検知（#4166・SUP-6・SEC-1・REPAIR-5）: exec の間、supervisor の serve ループの刻みごとに

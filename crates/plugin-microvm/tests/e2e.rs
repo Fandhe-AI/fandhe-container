@@ -434,7 +434,9 @@ fn task117_plug1_repair5_shutdown_flag_stops_running_vm_and_ignores_later_reques
         StopAllReport {
             stopped: 1,
             failed: 0,
-            remaining: 0
+            remaining: 0,
+            ioevent: None,
+            unmap_failures: None
         }
     );
     let r = record.lock().expect("lock");
@@ -482,7 +484,9 @@ fn task117_4_plug1_mvm1_ping_start_stop_roundtrip_via_uds() {
         StopAllReport {
             stopped: 0,
             failed: 0,
-            remaining: 0
+            remaining: 0,
+            ioevent: None,
+            unmap_failures: None
         }
     );
 }
@@ -597,7 +601,9 @@ fn task117_4_mvm1_disconnect_with_running_vm_is_reclaimed_by_stop_all() {
         StopAllReport {
             stopped: 1,
             failed: 0,
-            remaining: 0
+            remaining: 0,
+            ioevent: None,
+            unmap_failures: None
         }
     );
     let stops = record.lock().expect("lock").stops.clone();

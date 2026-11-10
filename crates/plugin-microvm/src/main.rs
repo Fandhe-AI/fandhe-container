@@ -17,7 +17,7 @@
 //! 接続前に `sys::install_sigterm_flag` でフラグを登録する（失敗は終了コード 1 の fail-closed。VM を止められない
 //! 状態で動かさない）。SIGTERM を受けると `serve_until` が次の受信境界で抜け、stderr に
 //! `level=info op=plugin.microvm.shutdown reason=signal` を出し、`stop_all` で止めて結果行
-//! （`stopped=` / `failed=` / `remaining=` / `detached=`）を出して終わる。終了までの時間が最大で
+//! （`stopped=` / `failed=` / `remaining=` / `detached=`。件数を持つ backend のときは末尾に ` ignored=` / ` unbind_failed=` / ` unmap_failures=` の合算も付く。#4438）を出して終わる。終了までの時間が最大で
 //! `IDLE_POLL`（1 秒）と `STOP_ALL_BUDGET`（4 秒）の和になるのはアイドル時だけ。`serve_until` は受信途中の
 //! フレームを中断せず（`FRAME_DEADLINE` 10 秒）、処理中の要求とその応答送信の待ちも加わるため、処理中に
 //! SIGTERM を受けると 5 秒を超えうる。呼び出し側（core）の猶予を超えた場合は SIGKILL され VM が残りうる（残余）。
@@ -96,17 +96,10 @@ fn main() -> ExitCode {
     // 終了時に実行中 VM を期限つきで止める（drop 任せだと 1 台あたり最大 5 秒待つため。REPAIR-5）。
     let stop_report = adapter.stop_all(STOP_ALL_BUDGET);
     let detached = adapter.detached();
-    let incomplete = stop_report.remaining > 0 || stop_report.failed > 0 || detached > 0;
+    let incomplete = stop_report.is_incomplete(detached);
     // シャットダウンでは結果を常に出す。切断・異常終了では回収しきれないときだけ出す。
     if shutdown || incomplete {
-        eprintln!(
-            "level={} op=plugin.microvm.stop_all stopped={} failed={} remaining={} detached={}",
-            if incomplete { "warn" } else { "info" },
-            stop_report.stopped,
-            stop_report.failed,
-            stop_report.remaining,
-            detached
-        );
+        eprintln!("{}", stop_report.result_line(detached));
     }
     match outcome {
         Ok(LoopExit::PeerClosed | LoopExit::ShutdownRequested) => {

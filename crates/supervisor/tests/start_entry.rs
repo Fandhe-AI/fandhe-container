@@ -2161,9 +2161,15 @@ fn cri6_4074_terminal_master_is_capture_stdout_and_dup_per_generation() {
     // 複製への書き込みのエコーが捕捉側（元の master）から読める。
     let mut dup_file = std::fs::File::from(dup.into_owned_fd());
     dup_file.write_all(b"hi\n").unwrap();
+    // read は 1 回で全バイトが返るとは限らない（echo が分割して届く）ため、4 バイトそろうまで読み足す。
+    let mut got = Vec::new();
     let mut buf = [0u8; 16];
-    let n = reader.read(&mut buf).unwrap();
-    assert_eq!(&buf[..n], b"hi\r\n");
+    while got.len() < 4 {
+        let n = reader.read(&mut buf).unwrap();
+        assert!(n > 0, "unexpected EOF, got {got:?}");
+        got.extend_from_slice(&buf[..n]);
+    }
+    assert_eq!(got.as_slice(), b"hi\r\n");
     // 再 launch: 新しい世代の master の複製が返る。出力は再 launch の中で捕捉のハブへ渡し済み（取り出せない）。
     let again = running
         .relauncher

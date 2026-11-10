@@ -481,24 +481,21 @@ impl PodNetworkProvider for NetsetupPodNetwork {
                     Ok(n) => Ok(n),
                     Err(e) => {
                         // 拒否された IP のまま pod を残さない。巻き戻しを確認できたときだけ枠を返す。
+                        // 解放済み（NotFound）も巻き戻し済みと同じ扱い。
                         match tear_down_pod(self.net.as_ref(), &name) {
-                            Ok(_) => {
-                                if lease.newly_allocated {
-                                    self.pool.release(req.sandbox_id);
-                                }
-                                Err(e)
+                            Ok(_) => {}
+                            Err(d) if d.code() == ErrorCode::NotFound => {}
+                            Err(d) => {
+                                return Err(to_cri(with_rollback_errors(
+                                    TraitError::new(ErrorCode::Internal, e.message().to_owned()),
+                                    &[("delete_network", d)],
+                                )));
                             }
-                            Err(d) if d.code() == ErrorCode::NotFound => {
-                                if lease.newly_allocated {
-                                    self.pool.release(req.sandbox_id);
-                                }
-                                Err(e)
-                            }
-                            Err(d) => Err(to_cri(with_rollback_errors(
-                                TraitError::new(ErrorCode::Internal, e.message().to_owned()),
-                                &[("delete_network", d)],
-                            ))),
                         }
+                        if lease.newly_allocated {
+                            self.pool.release(req.sandbox_id);
+                        }
+                        Err(e)
                     }
                 }
             }

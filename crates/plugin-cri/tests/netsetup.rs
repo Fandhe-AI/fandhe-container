@@ -1970,6 +1970,36 @@ fn pod_network_provider_duplicate_set_up_keeps_the_subnet_in_use() {
     );
 }
 
+/// CRI-2・SEC-1・NET-1: IP 拒否後の巻き戻し（delete_network）自体が失敗したら Internal で、枠は返さない。
+#[test]
+fn cri_2_net_1_netsetup_rejected_attach_ip_rollback_failure_keeps_lease() {
+    use fandhe_container_cri::adapter::{PodNetworkProvider, PodNetworkRequest};
+    use fandhe_container_cri::error::CriErrorCode;
+    use fandhe_container_cri::runtime::v1::PodSandboxConfig;
+    let fake = Fake::default();
+    {
+        let mut s = fake.0.lock().expect("lock");
+        s.attach_address = Some(ip_prefix(127, 0, 0, 2, 8));
+        s.fail_delete = 1;
+    }
+    let provider = provider_with(&fake);
+    let cfg = PodSandboxConfig::default();
+    let e = provider
+        .set_up(&PodNetworkRequest::new(SB, &cfg))
+        .expect_err("rejected");
+    assert_eq!(e.code(), CriErrorCode::Internal);
+    // 枠が返っていなければ、別 sandbox は SB と同じ 10.90.0.1/24 を受ける。保持されていれば次の枠になる。
+    let other = "b".repeat(64);
+    fake.0.lock().expect("lock").attach_address = None;
+    provider
+        .set_up(&PodNetworkRequest::new(&other, &cfg))
+        .expect("other");
+    assert!(
+        fake.calls()
+            .contains(&format!("create_network {other} 10.90.1.1/24"))
+    );
+}
+
 /// `create_network` で指定の名前だけ止める NetworkPlugin（他は内側へ委譲）。並行試験用。
 struct GatedNetwork {
     inner: NetsetupNetwork<Fake>,

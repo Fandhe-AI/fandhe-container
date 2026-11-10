@@ -16,6 +16,10 @@
 //!   helper は plugin-cri の子から探し、開始時刻つきで消滅を判定する（plugin-cri の死後は init 等へ再親付けされるため）。
 //!   段 4 の後は再起動した plugin-cri が記録を再採用して後始末する（本物の状態ルートに記録を残さないため）。
 //!
+//! - 段 P（#4405・CRI-2・CORE-3・NET-3・REPAIR-12）: network・ipc を `POD` にした sandbox 2 個（P・Q）で、P の 2 コンテナが
+//!   保持役の netns 内で `127.0.0.1` を往復し（busybox の `nc`）、Q のコンテナからは届かないことと、netns の inode が
+//!   pod ごとに異なり保持役（`pod-holder`）の netns と一致することを具体値で照合する。pull は増やさない。
+//!   成功行 2 行（`pod-net ok:`）を CI が試験ソースから導出して照合する。
 //!
 //! 失敗後の残骸の回収（#4142）: 本体を 2 回走らせる（1 回目は StartContainer の直後に注入した失敗、回収、2 回目は同じ metadata で通す）。
 //! 注入では plugin-cri を SIGKILL してから panic させ、外側の回収が死活を判定して起動し直して回収する（#4326。共有部品 `reclaim_restarting`）。
@@ -507,6 +511,308 @@ async fn restart_plugin(srv: &SharedSrv, bin: &Path, sock: &Path) -> RuntimeServ
     RuntimeServiceClient::new(ch)
 }
 
+// ---- 段 P（#4405）: POD ネットワークの pod 内 2 コンテナが保持役の netns で 127.0.0.1 を往復する ----
+
+/// 段 P の待ち受けポート。新しい netns の中なので他と衝突しない。
+const POD_NET_PORT: u16 = 18181;
+/// 段 P で往復させるバイト列（固定リテラル）。
+const POD_NET_PAYLOAD: &str = "fandhe-pod-net-4405\n";
+/// 段 P の成功行 2 行（`check-success-lines.sh` が試験ソースから導出して照合する。プレースホルダは使わない）。
+const POD_NET_OK_ROUND_TRIP: &str = "production_binary_exec_real: pod-net ok: same-pod containers echoed the payload over 127.0.0.1 in the holder netns";
+const POD_NET_OK_ISOLATED: &str = "production_binary_exec_real: pod-net ok: a container in another pod could not reach 127.0.0.1:18181";
+
+/// 待ち受け側の command。エコーを返す待ち受けをループで保つ（否定対照の時点でも生きているため）。
+fn pod_net_server_script() -> String {
+    format!("while :; do /bin/nc -l -p {POD_NET_PORT} -e /bin/cat; done")
+}
+
+/// 接続側の command。固定のペイロードを送って応答を stdout へ出す。
+fn pod_net_client_script() -> String {
+    format!(
+        "printf '{}' | /bin/nc -w 2 127.0.0.1 {POD_NET_PORT}",
+        POD_NET_PAYLOAD.replace('\n', "\\n")
+    )
+}
+
+/// network・ipc を `POD` にした sandbox を作り、台帳へ載せる。
+async fn run_pod_net_sandbox(
+    c: &mut RuntimeServiceClient<Channel>,
+    name: &str,
+    uid_prefix: &str,
+    token: &str,
+    ledger: &reclaim::Ledger,
+) -> String {
+    let mut run = cri::RunPodSandboxRequest {
+        config: Some(cri::PodSandboxConfig {
+            metadata: Some(cri::PodSandboxMetadata {
+                name: name.into(),
+                uid: reclaim::sandbox_uid(uid_prefix, token),
+                namespace: "default".into(),
+                attempt: 0,
+            }),
+            labels: reclaim::config_labels(TEST, token),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    run.config
+        .as_mut()
+        .expect("config")
+        .linux
+        .get_or_insert_with(Default::default)
+        .security_context
+        .get_or_insert_with(Default::default)
+        .namespace_options = Some(cri::NamespaceOption {
+        network: cri::NamespaceMode::Pod as i32,
+        ipc: cri::NamespaceMode::Pod as i32,
+        ..Default::default()
+    });
+    let sb = call_with_deadline(c.run_pod_sandbox(run), RPC_DEADLINE)
+        .await
+        .expect("run pod-net sandbox")
+        .into_inner()
+        .pod_sandbox_id;
+    reclaim::record_sandbox(ledger, &sb);
+    sb
+}
+
+/// コンテナを作って起動し、Running を確かめる。台帳へ載せる。
+async fn create_started(
+    c: &mut RuntimeServiceClient<Channel>,
+    sb: &str,
+    name: &str,
+    command: &[&str],
+    token: &str,
+    ledger: &reclaim::Ledger,
+) -> String {
+    let long = Duration::from_secs(120);
+    let id = call_with_deadline(
+        c.create_container(cri::CreateContainerRequest {
+            pod_sandbox_id: sb.into(),
+            config: Some(cri::ContainerConfig {
+                metadata: Some(cri::ContainerMetadata {
+                    name: name.into(),
+                    attempt: 0,
+                }),
+                image: Some(image_spec(IMAGE)),
+                command: command.iter().map(|s| s.to_string()).collect(),
+                labels: reclaim::config_labels(TEST, token),
+                ..Default::default()
+            }),
+            sandbox_config: None,
+        }),
+        long,
+    )
+    .await
+    .expect("create pod-net container")
+    .into_inner()
+    .container_id;
+    reclaim::record_container(ledger, &id);
+    call_with_deadline(
+        c.start_container(cri::StartContainerRequest {
+            container_id: id.clone(),
+        }),
+        long,
+    )
+    .await
+    .expect("start pod-net container");
+    let st = call_with_deadline(
+        c.container_status(cri::ContainerStatusRequest {
+            container_id: id.clone(),
+            verbose: false,
+        }),
+        RPC_DEADLINE,
+    )
+    .await
+    .expect("pod-net status")
+    .into_inner()
+    .status
+    .expect("status body");
+    assert_eq!(st.state, cri::ContainerState::ContainerRunning as i32);
+    id
+}
+
+/// コンテナの netns の識別子（`net:[<inode>]`）。
+async fn exec_netns(c: &mut RuntimeServiceClient<Channel>, id: &str) -> String {
+    let o = exec_once(c, id, &["/bin/readlink", "/proc/self/ns/net"]).await;
+    assert_eq!(status_str(&o.status, "status"), "Success", "{:?}", o.status);
+    let s = String::from_utf8(o.stdout).expect("netns link is utf-8");
+    let s = s.trim().to_string();
+    assert!(s.starts_with("net:["), "unexpected netns link: {s}");
+    s
+}
+
+/// 接続側を 1 回実行する。
+async fn pod_net_client_once(c: &mut RuntimeServiceClient<Channel>, id: &str) -> ExecOutcome {
+    exec_once(c, id, &["/bin/sh", "-c", &pod_net_client_script()]).await
+}
+
+/// 待ち受けの起動は非同期なので、応答がペイロードと一致するまで期限つきで繰り返す（REPAIR-5・REPAIR-12）。
+async fn round_trip_until_match(c: &mut RuntimeServiceClient<Channel>, id: &str) {
+    let start = Instant::now();
+    loop {
+        let o = pod_net_client_once(c, id).await;
+        if o.stdout == POD_NET_PAYLOAD.as_bytes() {
+            return;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "no echo within 20s: stdout={:?} stderr={:?} status={:?}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr),
+            o.status
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// argv に `pod-holder` を含む保持役のうち、netns が `want`（`net:[<inode>]`）のものの数。
+fn holders_with_netns(want: &str) -> usize {
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return 0;
+    };
+    let mut n = 0;
+    for e in dir.flatten() {
+        let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        if cmdline_args(pid).is_some_and(|a| a.iter().any(|x| x == "pod-holder"))
+            && std::fs::read_link(format!("/proc/{pid}/ns/net"))
+                .is_ok_and(|l| l.to_string_lossy() == want)
+        {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// 段 P の後始末。成功したら台帳から外す（失敗したら panic し、外側の回収がラベルと台帳で片付ける）。
+async fn remove_pod(
+    c: &mut RuntimeServiceClient<Channel>,
+    ledger: &reclaim::Ledger,
+    sb: &str,
+    cids: &[&str],
+) {
+    let long = Duration::from_secs(120);
+    for cid in cids {
+        call_with_deadline(
+            c.stop_container(cri::StopContainerRequest {
+                container_id: (*cid).into(),
+                timeout: 1,
+            }),
+            long,
+        )
+        .await
+        .expect("stop pod-net container");
+        call_with_deadline(
+            c.remove_container(cri::RemoveContainerRequest {
+                container_id: (*cid).into(),
+            }),
+            long,
+        )
+        .await
+        .expect("remove pod-net container");
+        reclaim::forget_container(ledger, cid);
+    }
+    call_with_deadline(
+        c.stop_pod_sandbox(cri::StopPodSandboxRequest {
+            pod_sandbox_id: sb.into(),
+        }),
+        long,
+    )
+    .await
+    .expect("stop pod-net sandbox");
+    call_with_deadline(
+        c.remove_pod_sandbox(cri::RemovePodSandboxRequest {
+            pod_sandbox_id: sb.into(),
+        }),
+        long,
+    )
+    .await
+    .expect("remove pod-net sandbox");
+    reclaim::forget_sandbox(ledger, sb);
+}
+
+/// 段 P（#4405・CRI-2・CORE-3・NET-3・REPAIR-12）。pod network provider の無い本番構成で、`POD` の network を持つ
+/// 同じ pod の 2 コンテナが保持役の netns 内で `127.0.0.1` を往復し、別の pod からは届かないことを照合する。
+/// pull は増やさない（既存の busybox を使う）。
+async fn pod_network_stage(
+    c: &mut RuntimeServiceClient<Channel>,
+    node_id: &str,
+    token: &str,
+    ledger: &reclaim::Ledger,
+) {
+    // image の前提確認: nc の applet があること。
+    let o = exec_once(c, node_id, &["/bin/busybox", "--list"]).await;
+    let applets = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(
+        applets.lines().any(|l| l.trim() == "nc"),
+        "production_binary_exec_real: busybox image lacks the nc applet"
+    );
+
+    let sb_p = run_pod_net_sandbox(c, "pod-exec-real-net-a", "uid-exec-neta", token, ledger).await;
+    let sb_q = run_pod_net_sandbox(c, "pod-exec-real-net-b", "uid-exec-netb", token, ledger).await;
+    let server_script = pod_net_server_script();
+    let srv = create_started(
+        c,
+        &sb_p,
+        "srv",
+        &["/bin/sh", "-c", &server_script],
+        token,
+        ledger,
+    )
+    .await;
+    let cli_p = create_started(c, &sb_p, "cli", &["/bin/sleep", "300"], token, ledger).await;
+    let cli_q = create_started(c, &sb_q, "cli", &["/bin/sleep", "300"], token, ledger).await;
+
+    // netns の素性: 同じ pod は同じ、別の pod は別、NODE（試験プロセス）とも別。保持役の netns と一致する。
+    let (ns_srv, ns_p, ns_q) = (
+        exec_netns(c, &srv).await,
+        exec_netns(c, &cli_p).await,
+        exec_netns(c, &cli_q).await,
+    );
+    assert_eq!(ns_srv, ns_p, "same-pod containers must share a netns");
+    assert_ne!(ns_p, ns_q, "different pods must not share a netns");
+    let node_ns = std::fs::read_link("/proc/self/ns/net")
+        .expect("read own netns")
+        .to_string_lossy()
+        .into_owned();
+    assert_ne!(ns_p, node_ns, "pod netns must differ from the NODE netns");
+    assert_ne!(ns_q, node_ns, "pod netns must differ from the NODE netns");
+    assert_eq!(
+        holders_with_netns(&ns_p),
+        1,
+        "exactly one pod-holder must own the netns {ns_p}"
+    );
+
+    // 正: 同じ pod の接続側から待ち受けへ往復する。
+    round_trip_until_match(c, &cli_p).await;
+    // 否定対照: 別の pod からは届かない（拒否か期限切れ）。
+    let o = pod_net_client_once(c, &cli_q).await;
+    assert!(
+        o.stdout.is_empty(),
+        "another pod must not reach the listener: stdout={:?}",
+        String::from_utf8_lossy(&o.stdout)
+    );
+    assert_eq!(
+        status_str(&o.status, "status"),
+        "Failure",
+        "stderr={:?} {:?}",
+        String::from_utf8_lossy(&o.stderr),
+        o.status
+    );
+    // ブラケット: 否定の時点で待ち受けが生きていた。
+    round_trip_until_match(c, &cli_p).await;
+
+    {
+        use std::io::Write as _;
+        let mut e = std::io::stderr();
+        let _ = writeln!(e, "{POD_NET_OK_ROUND_TRIP}");
+        let _ = writeln!(e, "{POD_NET_OK_ISOLATED}");
+    }
+    remove_pod(c, ledger, &sb_p, &[&srv, &cli_p]).await;
+    remove_pod(c, ledger, &sb_q, &[&cli_q]).await;
+}
 /// 試験本体（sandbox の作成から exec の照合・後始末まで）。`inject` が真なら StartContainer と Running の確認の直後に
 /// 固定文言で panic する（失敗後の回収の自己照合。#4142）。作った ID は台帳へ登録し、Remove が成功したら外す。
 async fn scenario(
@@ -653,6 +959,9 @@ async fn scenario(
     assert_eq!(exec_st.get("Seccomp").map(String::as_str), Some("2"));
     assert_eq!(hex_field(&exec_st, "CapInh"), 0);
     assert_eq!(hex_field(&exec_st, "CapAmb"), 0);
+
+    // 段 P（#4405）: POD ネットワークの pod 内往復。
+    pod_network_stage(&mut c, &id, &token, &ledger).await;
 
     // 4. 要求元の異常終了（SUP-6・SEC-1・REPAIR-5・#4167）: 終わらない exec を開いたまま plugin-cri を SIGKILL すると、
     //    helper が 2 秒以内に終わり、exec のコマンドが残らない。helper の期限は 60 秒以上で、期限や hold_grace では説明できない。
@@ -1009,4 +1318,17 @@ fn sec1_3762_status_parser_reads_cap_and_seccomp() {
     assert_eq!(hex_field(&m, "CapEff"), 0xa804_25fb);
     assert_eq!(hex_field(&m, "CapInh"), 0);
     assert_eq!(m.get("Seccomp").map(String::as_str), Some("2"));
+}
+
+/// 段 P の command が固定リテラルとポート・ペイロードの定数だけから作られることを具体値で固定する（#4405・REPAIR-12）。
+#[test]
+fn repair12_4405_pod_net_commands_are_fixed() {
+    assert_eq!(
+        pod_net_server_script(),
+        "while :; do /bin/nc -l -p 18181 -e /bin/cat; done"
+    );
+    assert_eq!(
+        pod_net_client_script(),
+        "printf 'fandhe-pod-net-4405\\n' | /bin/nc -w 2 127.0.0.1 18181"
+    );
 }

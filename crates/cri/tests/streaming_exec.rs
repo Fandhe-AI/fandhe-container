@@ -22,8 +22,8 @@ use fandhe_container_cri::error::CriError;
 use fandhe_container_cri::instrument::{CriOpKind, CriOpRecorder, CriOpSample};
 use fandhe_container_cri::runtime::v1;
 use fandhe_container_cri::streaming::exec::{
-    ExecLaunch, ExecObserver, ExecSession, ExecStreamConfig, ExecStreamHandler, ExecStreamLauncher,
-    ExecStreamOutcome, MSG_EXEC_INSTANCE_CHANGED, TerminalResizer,
+    ExecLaunch, ExecLaunchFailure, ExecObserver, ExecSession, ExecStreamConfig, ExecStreamHandler,
+    ExecStreamLauncher, ExecStreamOutcome, MSG_EXEC_INSTANCE_CHANGED, TerminalResizer,
 };
 use fandhe_container_cri::streaming::remotecommand::TerminalSize;
 use fandhe_container_cri::streaming::spdy::{
@@ -310,8 +310,25 @@ impl ExecStreamLauncher for FakeLauncher {
             if program == "fail-launch" {
                 return Err(CriError::internal("secret-path /var/lib/fandhe/x"));
             }
+            if program == "launch-hang" {
+                // 返らない起動（`launch_timeout` で drop される。#4381）。
+                std::future::pending::<()>().await;
+            }
             let (stdin_p, stdout_p, stderr_p) = (Pipe::default(), Pipe::default(), Pipe::default());
             let cell = ExitCell::default();
+            if program == "stdio-mismatch" {
+                // 要求された stdout を持たないセッション（食い違い。#4381）。
+                return Ok(ExecSession {
+                    stdin: None,
+                    stdout: None,
+                    stderr: None,
+                    exit: Box::pin(ExitWait {
+                        cell,
+                        dropped: Arc::clone(&self.dropped),
+                    }),
+                    resize: None,
+                });
+            }
             match program.as_str() {
                 "echo-exit" => {
                     let code = req
@@ -1145,13 +1162,23 @@ async fn cri6_exec_launch_failure_hides_details() {
     assert_eq!(c.goaway, Some(goaway_status::OK));
     assert_eq!(
         fx.wait_outcomes(1).await,
-        vec![ExecStreamOutcome::LaunchFailed]
+        vec![ExecStreamOutcome::LaunchFailed {
+            cause: ExecLaunchFailure::LauncherError
+        }]
     );
 }
 
 /// 起動失敗を 1 件起こして Status と記録を集める補助。
 async fn run_launch_failure(cmd: &str) -> (String, Vec<ExecStreamOutcome>, Vec<(CriOpKind, Code)>) {
-    let fx = Fixture::new(fast_config(), 8).await;
+    run_launch_failure_with(cmd, fast_config()).await
+}
+
+/// `run_launch_failure` の設定指定版（期限切れの試験は `launch_timeout` を短くする。#4381）。
+async fn run_launch_failure_with(
+    cmd: &str,
+    config: ExecStreamConfig,
+) -> (String, Vec<ExecStreamOutcome>, Vec<(CriOpKind, Code)>) {
+    let fx = Fixture::new(config, 8).await;
     let path = fx.exec_path(&[cmd], false, false, true, false);
     let addr = fx.addr();
     let c = tokio::task::spawn_blocking(move || {
@@ -1195,7 +1222,13 @@ async fn cri6_repair4_4324_instance_changed_is_distinct_outcome() {
 async fn cri6_repair4_4324_other_launch_failures_stay_launch_failed() {
     for cmd in ["fail-launch", "not-running"] {
         let (_, outcomes, recorded) = run_launch_failure(cmd).await;
-        assert_eq!(outcomes, vec![ExecStreamOutcome::LaunchFailed], "{cmd}");
+        assert_eq!(
+            outcomes,
+            vec![ExecStreamOutcome::LaunchFailed {
+                cause: ExecLaunchFailure::LauncherError
+            }],
+            "{cmd}"
+        );
         assert!(
             recorded.contains(&(CriOpKind::ExecSession, Code::Unavailable)),
             "{cmd}: {recorded:?}"
@@ -1207,6 +1240,88 @@ async fn cri6_repair4_4324_other_launch_failures_stay_launch_failed() {
             "{cmd}: {recorded:?}"
         );
     }
+}
+
+/// 起動失敗の 3 原因の試験表（プログラム・原因・原因別の操作名・記録するコード）。
+fn launch_failure_cases() -> [(&'static str, ExecLaunchFailure, CriOpKind, Code); 3] {
+    [
+        (
+            "launch-hang",
+            ExecLaunchFailure::TimedOut,
+            CriOpKind::ExecLaunchTimeout,
+            Code::DeadlineExceeded,
+        ),
+        (
+            "stdio-mismatch",
+            ExecLaunchFailure::StdioMismatch,
+            CriOpKind::ExecStdioMismatch,
+            Code::Internal,
+        ),
+        (
+            "fail-launch",
+            ExecLaunchFailure::LauncherError,
+            CriOpKind::ExecLaunchError,
+            Code::Unavailable,
+        ),
+    ]
+}
+
+/// CRI-6・REPAIR-4・#4381: 起動失敗の 3 原因は対応する操作名だけがちょうど 1 増え、
+/// `cri.exec.session` の失敗も従来どおり 1 件残る。
+#[tokio::test]
+async fn cri6_repair4_4381_launch_failure_causes_are_counted_separately() {
+    let own = [
+        CriOpKind::ExecLaunchTimeout,
+        CriOpKind::ExecStdioMismatch,
+        CriOpKind::ExecLaunchError,
+    ];
+    for (cmd, cause, kind, code) in launch_failure_cases() {
+        let mut config = fast_config();
+        config.launch_timeout = Duration::from_millis(300);
+        let (_, outcomes, recorded) = run_launch_failure_with(cmd, config).await;
+        assert_eq!(
+            outcomes,
+            vec![ExecStreamOutcome::LaunchFailed { cause }],
+            "{cmd}"
+        );
+        let count = |k, c| recorded.iter().filter(|r| **r == (k, c)).count();
+        assert_eq!(count(CriOpKind::ExecSession, Code::Unavailable), 1, "{cmd}");
+        assert_eq!(count(kind, code), 1, "{cmd}: {recorded:?}");
+        for other in own.iter().filter(|o| **o != kind) {
+            assert_eq!(
+                recorded.iter().filter(|r| r.0 == *other).count(),
+                0,
+                "{cmd}: {recorded:?}"
+            );
+        }
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|r| r.0 == CriOpKind::ExecInstanceChanged)
+                .count(),
+            0,
+            "{cmd}"
+        );
+    }
+}
+
+/// CRI-6・REPAIR-4・#4381: どの原因でもクライアントへの Status は同じ内部エラーで、詳細を含まない。
+#[tokio::test]
+async fn cri6_repair4_4381_launch_failure_status_is_unchanged_internal_error() {
+    let mut statuses = Vec::new();
+    for (cmd, _, _, _) in launch_failure_cases() {
+        let mut config = fast_config();
+        config.launch_timeout = Duration::from_millis(300);
+        let (status, _, _) = run_launch_failure_with(cmd, config).await;
+        assert!(
+            status.contains(r#""reason":"InternalError""#) && status.contains(r#""code":500"#),
+            "{cmd}: {status}"
+        );
+        assert!(!status.contains("secret-path"), "{cmd}: {status}");
+        assert!(!status.contains("/var/lib"), "{cmd}: {status}");
+        statuses.push(status);
+    }
+    assert!(statuses.windows(2).all(|w| w[0] == w[1]), "{statuses:?}");
 }
 
 /// CRI-6・REPAIR-3・#3753: 握手の失敗（版ヘッダ無しは 400、対応しないサブプロトコルは 403）と、

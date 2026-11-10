@@ -142,7 +142,7 @@ pub struct CriPluginBackends {
     state: Arc<dyn StateStore>,
     network: Arc<dyn NetworkPlugin>,
     /// CRI 側の記録器（`cri.*`。`CriOpKind` の全種・記録ストア 3 種・ストリーミングの接続観測 4 種・
-    /// `image_pull_recovery`。名前は最悪 45 種で、`MAX_TRACKED_OPS` に 8 の余裕を残すことを試験で固定する。
+    /// `image_pull_recovery`。名前は最悪 48 種で、`MAX_TRACKED_OPS` に 8 の余裕を残すことを試験で固定する。
     /// REPAIR-4・CRI-6・#4380）。注入（`with_recorder`）では実行層もここへ書く。
     recorder: Arc<OpRecorder>,
     /// 本番（`production()`）だけが持つライフサイクル記録器（core の `oci_runtime`・コンテナログ・net の bridge / netsetup の
@@ -1116,7 +1116,7 @@ impl AuditSink for ObservedCreateAudit {
 /// （`RegistryHttpClass`）を `cri.pull_image.registry_http.<区分>` の失敗として受ける（#2966・REPAIR-4・CRI-3）。
 /// CRI 記録器の `MAX_TRACKED_OPS` を区分の 8 種で圧迫しないため分ける。pull 用記録器の名前数は
 /// oci 22 種 + 区分 8 種 = 30 種で上限（64）に収まる。CRI 記録器・ライフサイクル記録器の最悪数
-/// （45 種・53 種）は試験 `repair4_4380_*` が固定する（#4380）。
+/// （48 種・53 種）は試験 `repair4_4380_*` が固定する（#4380）。
 /// `cri.pull_image`（共有）の失敗 1 件と区分側の 1 件は同じ失敗を別の切り口で数えたもの（二重計上）。
 /// 生の HTTP 状態・URL・資格情報は記録しない。
 struct CoreCriRecorder {
@@ -2801,7 +2801,7 @@ mod tests {
     #[cfg(unix)]
     const NAME_HEADROOM: usize = 8;
 
-    /// REPAIR-4・CRI-6（#4380）: CRI 記録器（本番の `recorder`）へ届きうる操作名の最悪数は 45 種で、
+    /// REPAIR-4・CRI-6（#4380）: CRI 記録器（本番の `recorder`）へ届きうる操作名の最悪数は 48 種で、
     /// `MAX_TRACKED_OPS - 8` 以下。`CriOpKind` の全種（`CriOpKind::ALL`）を数えるので、種別を足すと本試験が落ちて列挙の見直しを求める。
     #[cfg(unix)]
     #[test]
@@ -2834,7 +2834,7 @@ mod tests {
         }
         assert_eq!(rec.dropped_records(), 0);
         let total = rec.snapshot().len();
-        assert_eq!(total, 37 + 8, "CriOpKind::ALL.len() = 37 + 8 fixed names");
+        assert_eq!(total, 40 + 8, "CriOpKind::ALL.len() = 40 + 8 fixed names");
         assert!(
             total <= fandhe_container_core::observability::MAX_TRACKED_OPS - NAME_HEADROOM,
             "{total} names leave less than {NAME_HEADROOM} of headroom"
@@ -3055,6 +3055,42 @@ mod tests {
         assert_eq!(session.len(), 1, "{text}");
         assert!(changed[0].contains(r#""failure":1"#), "{}", changed[0]);
         assert!(session[0].contains(r#""failure":2"#), "{}", session[0]);
+    }
+
+    /// CRI-6・REPAIR-4・#4381: Exec の起動失敗の 3 原因は、それぞれ別の `op_stats` 行（failure:1）として出る。
+    #[test]
+    fn cri6_repair4_4381_launch_failure_causes_are_separate_op_stats_lines() {
+        let shared = Arc::new(OpRecorder::new());
+        let pull = Arc::new(OpRecorder::new());
+        let bridge = CoreCriRecorder::new(Arc::clone(&shared), Arc::clone(&pull));
+        for kind in [
+            CriOpKind::ExecLaunchTimeout,
+            CriOpKind::ExecStdioMismatch,
+            CriOpKind::ExecLaunchError,
+        ] {
+            bridge.record_cri_op(&CriOpSample::new(
+                kind,
+                tonic::Code::Unavailable,
+                Duration::from_millis(2),
+            ));
+        }
+        let mut out: Vec<u8> = Vec::new();
+        shared.export_json_lines(Some(&mut out)).expect("export");
+        let text = String::from_utf8(out).expect("utf8");
+        for name in [
+            "cri.exec.launch_timeout",
+            "cri.exec.stdio_mismatch",
+            "cri.exec.launch_error",
+        ] {
+            let lines: Vec<&str> = text
+                .lines()
+                .filter(|l| l.contains(&format!(r#""op":"{name}""#)))
+                .collect();
+            assert_eq!(lines.len(), 1, "{name}: {text}");
+            assert!(lines[0].contains(r#""failure":1"#), "{}", lines[0]);
+        }
+        assert_eq!(pull.snapshot().len(), 0);
+        assert_eq!(shared.dropped_records(), 0);
     }
 
     /// 22 種すべての `OciOpKind` の名前（REPAIR-4・OCI-1・#2900 の写像の固定用）。

@@ -64,6 +64,10 @@ pub enum HelperStage {
     CgroupNotify,
     /// `Started` の送信。
     StartedSend,
+    /// tty の exec で `PtyMaster` の送信に失敗した（#4416）。
+    PtyMasterSend,
+    /// tty の exec なのに pty の master を送れなかった・受け取れなかった（拒否・未着。#4416）。
+    PtyMaster,
     /// exec の通し（上記以外の失敗）。
     Exec,
     /// `Result` の送信。
@@ -72,7 +76,7 @@ pub enum HelperStage {
 
 impl HelperStage {
     /// 全語彙（出力・試験の網羅の基準）。
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 19] = [
         Self::Channel,
         Self::Dumpable,
         Self::Args,
@@ -88,6 +92,8 @@ impl HelperStage {
         Self::Deadline,
         Self::CgroupNotify,
         Self::StartedSend,
+        Self::PtyMasterSend,
+        Self::PtyMaster,
         Self::Exec,
         Self::ResultSend,
     ];
@@ -110,6 +116,8 @@ impl HelperStage {
             Self::Deadline => "helper_deadline",
             Self::CgroupNotify => "helper_cgroup_notify",
             Self::StartedSend => "helper_started_send",
+            Self::PtyMasterSend => "helper_pty_master_send",
+            Self::PtyMaster => "helper_pty_master",
             Self::Exec => "helper_exec",
             Self::ResultSend => "helper_result_send",
         }
@@ -167,7 +175,7 @@ mod tests {
             assert!(stage.as_str().starts_with("helper_"));
             assert!(seen.insert(stage.as_str()), "duplicate {}", stage.as_str());
         }
-        assert_eq!(seen.len(), 17);
+        assert_eq!(seen.len(), 19);
         assert_eq!(HelperStage::from_token("cgroup_join"), None);
     }
 

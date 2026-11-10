@@ -147,6 +147,15 @@ name = "exec_seccomp_listener"
 path = "tests/exec_seccomp_listener.rs"
 harness = false
 
+# tty の exec で worker が割り当てた pty の master を、親が応答者の刻みで非ブロッキングに受けてフックへ渡す経路
+# （実カーネルでの受け渡し・fail-closed。SUP-6・SEC-1・CRI-6・#4416）の結合試験。fork は単一スレッドの呼び出し元を要求する
+# ため harness = false。root・実コンテナ不要で既定のテスト集合で実行する（依存は不変。exec-test-support は自己参照の
+# dev-dependency で有効になる）。
+[[test]]
+name = "exec_pty_handover"
+path = "tests/exec_pty_handover.rs"
+harness = false
+
 # exec の対象の拒否が層 exec_target の監査レコードとして 1 拒否 1 件記録されることの結合試験（SEC-4・SUP-6・
 # TASK-163 追補・#1465）。fork は単一スレッドの呼び出し元を要求するため harness = false。root・実コンテナ不要で、
 # 既定のテスト集合で実行する（依存は不変）。worker の rootfs_is_host_root の拒否が層 mount に 1 件記録される

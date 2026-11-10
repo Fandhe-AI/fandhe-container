@@ -62,6 +62,9 @@ const POLL_STEP: Duration = Duration::from_millis(10);
 const MSG_TOO_MANY: &str = "too many pod holders are tracked";
 const MSG_ROOTFUL: &str = "the pod namespace holder requires a non-root plugin process";
 const MSG_UNTRUSTED_EXE: &str = "pod holder executable is not trusted or not readable";
+/// `sys::O_NONBLOCK` が無い組で bin の open を拒否するときの固定文言（パス・errno・アーキ名を含めない。REPAIR-4）。
+const MSG_NONBLOCK_UNSUPPORTED: &str =
+    "pod holder executable cannot be opened without blocking on this platform";
 const MSG_DUPLICATE: &str = "a pod holder already exists for this sandbox";
 const MSG_PID_MISMATCH: &str = "the pod holder reported an unexpected process";
 const MSG_NS_MISMATCH: &str = "the pod holder namespaces do not match the report";
@@ -499,13 +502,32 @@ fn kill_and_reap(mut child: Child) -> Option<Child> {
 
 /// bin を一度だけ開き、開いた fd に対して検査する（検査と exec の間でパスが差し替わっても、検証した実体を使う。PLUG-11）。
 /// 通常ファイル・所有者が root か `euid`・group / other に書き込み不可・読み取り専用で開ける、を満たすときだけ返す。
+/// `resolve_command` から呼ばれ、`O_NONBLOCK` の値は `sys` の 1 か所の宣言を使う（MVM-4・REPAIR-1・#4441）。
 fn open_trusted_executable(path: &Path, euid: u32) -> Result<File, TraitError> {
+    open_trusted_executable_with(path, euid, crate::sys::O_NONBLOCK)
+}
+
+/// `open_trusted_executable` の本体。`nonblock` を注入できるのは、`None` の組の拒否を x86_64 でも試験するため。
+fn open_trusted_executable_with(
+    path: &Path,
+    euid: u32,
+    nonblock: Option<i32>,
+) -> Result<File, TraitError> {
     let bad = || TraitError::new(ErrorCode::FailedPrecondition, MSG_UNTRUSTED_EXE);
+    // `sys::O_NONBLOCK` が `None` の組（Linux の x86_64・aarch64 以外）では、O_NONBLOCK なしで開くと書き手の居ない
+    // FIFO の open が無期限に戻らないため（REPAIR-5）、open せず `FAILED_PRECONDITION` と固定文言で拒否する
+    // （fail-closed）。値の宣言は `sys` の 1 か所に寄せる（MVM-4・REPAIR-1・#4441）。
+    let Some(flag) = nonblock else {
+        return Err(TraitError::new(
+            ErrorCode::FailedPrecondition,
+            MSG_NONBLOCK_UNSUPPORTED,
+        ));
+    };
     // 保持役は自分の実体を開き直すため、読めない bin では成り立たない（`would_dump` の MAY_READ の代理）。
-    // FIFO 等で open が無期限にブロックしないよう O_NONBLOCK で開き、同じ fd の種別を fstat で検証する（REPAIR-5）。
+    // FIFO 等で open が無期限にブロックしないよう `sys::O_NONBLOCK` で開き、同じ fd の種別を fstat で検証する（REPAIR-5）。
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc_o_nonblock())
+        .custom_flags(flag)
         .open(path)
         .map_err(|_| bad())?;
     let meta = file.metadata().map_err(|_| bad())?;
@@ -533,11 +555,6 @@ fn check_ancestors_trust(path: &Path, euid: u32) -> Result<(), TraitError> {
         }
     }
     Ok(())
-}
-
-/// `O_NONBLOCK`（Linux の値。本モジュールは Linux 限定）。
-const fn libc_o_nonblock() -> i32 {
-    0o4000
 }
 
 /// 実効 uid（`/proc/self/status`）。root（real か effective が 0）なら 0 を返す。読めなければ `Err`。

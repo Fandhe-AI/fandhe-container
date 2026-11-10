@@ -296,3 +296,137 @@ async fn cri2_repair4_broken_files_are_counted_and_left_in_place() {
     assert!(fs::metadata(dir.join(&isdir)).unwrap().is_dir());
     fs::remove_dir_all(&root).unwrap();
 }
+/// 再採用試験用: `namespace_options` を持つ `linux.security_context` つきの要求を作る（CRI-2・#4413）。
+fn run_req_with_ns(name: &str, opts: v1::NamespaceOption) -> v1::RunPodSandboxRequest {
+    let mut req = run_req(name);
+    if let Some(cfg) = req.config.as_mut() {
+        cfg.linux = Some(v1::LinuxPodSandboxConfig {
+            security_context: Some(v1::LinuxSandboxSecurityContext {
+                namespace_options: Some(opts),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+    }
+    req
+}
+
+/// CRI-1・CRI-2・#4413: 再採用の後の `PodSandboxStatus.linux.namespaces.options` が、作成時の
+/// `namespace_options`（NODE・CONTAINER・POD・target_id・userns_options）と無改変で一致する。
+/// kubelet の `PodSandboxChanged` が再起動後に sandbox を作り直さないための前提。
+#[tokio::test]
+async fn cri2_4413_readopt_status_linux_keeps_namespace_options() {
+    let root = temp_root("linux-ns");
+    let map = v1::IdMapping {
+        host_id: 65536,
+        container_id: 0,
+        length: 65536,
+    };
+    let opts = v1::NamespaceOption {
+        network: v1::NamespaceMode::Node as i32,
+        pid: v1::NamespaceMode::Container as i32,
+        ipc: v1::NamespaceMode::Pod as i32,
+        target_id: "target-1".into(),
+        userns_options: Some(v1::UserNamespace {
+            mode: v1::NamespaceMode::Pod as i32,
+            uids: vec![map],
+            gids: vec![map],
+        }),
+    };
+    let expected = v1::LinuxPodSandboxStatus {
+        namespaces: Some(v1::Namespace {
+            options: Some(opts.clone()),
+        }),
+    };
+
+    let a = service(&root);
+    let id =
+        RuntimeService::run_pod_sandbox(&a, Request::new(run_req_with_ns("pod-ns", opts.clone())))
+            .await
+            .unwrap()
+            .into_inner()
+            .pod_sandbox_id;
+    assert_eq!(status(&a, &id).await.linux, Some(expected.clone()));
+    drop(a);
+
+    let b = service(&root);
+    let r = b.readopt_sandboxes(ListBudget::default()).unwrap();
+    assert_eq!(
+        (r.adopted, r.pending_unresolved, r.broken.total()),
+        (1, 0, 0)
+    );
+    let got = status(&b, &id).await;
+    assert_eq!(got.state, PodSandboxState::SandboxNotready as i32);
+    let o = got
+        .linux
+        .clone()
+        .unwrap()
+        .namespaces
+        .unwrap()
+        .options
+        .unwrap();
+    assert_eq!(o.network, v1::NamespaceMode::Node as i32);
+    assert_eq!(o.pid, v1::NamespaceMode::Container as i32);
+    assert_eq!(o.ipc, v1::NamespaceMode::Pod as i32);
+    assert_eq!(o.target_id, "target-1");
+    let u = o.userns_options.clone().unwrap();
+    assert_eq!(u.mode, v1::NamespaceMode::Pod as i32);
+    assert_eq!(u.uids, vec![map]);
+    assert_eq!(u.gids, vec![map]);
+    assert_eq!(got.linux, Some(expected.clone()));
+
+    stop(&b, &id).await.unwrap();
+    assert_eq!(status(&b, &id).await.linux, Some(expected));
+
+    remove(&b, &id).await.unwrap();
+    assert!(rec_files(&root).is_empty());
+    fs::remove_dir_all(&root).unwrap();
+}
+
+/// CRI-1・CRI-2・#4413: `namespace_options` を指定しない sandbox は、再採用の後も `linux`・`namespaces`
+/// があり `options` は `None`（既定値を補わない）。
+#[tokio::test]
+async fn cri2_4413_readopt_status_linux_unspecified_has_no_options() {
+    let root = temp_root("linux-ns-none");
+    let a = service(&root);
+    let mut ids = Vec::new();
+    // (a) linux なし
+    ids.push(run(&a, "pod-a").await.unwrap());
+    // (b) linux あり・security_context なし
+    let mut rb = run_req("pod-b");
+    rb.config.as_mut().unwrap().linux = Some(v1::LinuxPodSandboxConfig::default());
+    // (c) security_context あり・namespace_options なし
+    let mut rc = run_req("pod-c");
+    rc.config.as_mut().unwrap().linux = Some(v1::LinuxPodSandboxConfig {
+        security_context: Some(v1::LinuxSandboxSecurityContext::default()),
+        ..Default::default()
+    });
+    for req in [rb, rc] {
+        ids.push(
+            RuntimeService::run_pod_sandbox(&a, Request::new(req))
+                .await
+                .unwrap()
+                .into_inner()
+                .pod_sandbox_id,
+        );
+    }
+    drop(a);
+
+    let b = service(&root);
+    let r = b.readopt_sandboxes(ListBudget::default()).unwrap();
+    assert_eq!(
+        (r.adopted, r.pending_unresolved, r.broken.total()),
+        (3, 0, 0)
+    );
+    for id in &ids {
+        assert_eq!(
+            status(&b, id).await.linux,
+            Some(v1::LinuxPodSandboxStatus {
+                namespaces: Some(v1::Namespace { options: None }),
+            })
+        );
+        remove(&b, id).await.unwrap();
+    }
+    assert!(rec_files(&root).is_empty());
+    fs::remove_dir_all(&root).unwrap();
+}

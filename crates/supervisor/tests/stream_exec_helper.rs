@@ -24,7 +24,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use fandhe_container_core::audit_log::{AuditRecord, AuditSink, AuditedRejection};
-use fandhe_container_core::exec::{ChildExit, ExecCgroupName, ExecExit};
+use fandhe_container_core::exec::{
+    ChildExit, ExecCgroupName, ExecExit, WindowSize, open_host_pty_for_test,
+};
 use fandhe_container_core::state_store::{FileStateStore, StateRoot};
 use fandhe_container_core::traits::{
     ContainerId, ContainerStatus, CreateStateRequest, ErrorCode, StateStore as _, TraitError,
@@ -219,6 +221,21 @@ struct Scenario {
     runner_pid: Option<u32>,
     /// 偽の signaler の `command_pid` が返す pid（刻みで `Spawned` を送る経路の照合。#4316）。
     signaler_pid: Option<u32>,
+    /// tty の exec（`io.pty` が `Some`）のとき、偽の実行役が pty の master をどう渡すか（#4416）。
+    pty: PtyBehavior,
+    /// `Some` なら偽の実行役が成功ではなくこの分類の拒否を返す（exec 層の失敗の模擬。#4416）。
+    runner_error: Option<ErrorCode>,
+}
+
+/// 偽の実行役が `io.pty` のフックへ master を渡す振る舞い（#4416）。
+#[derive(Clone, Copy)]
+enum PtyBehavior {
+    /// ホストの pty の master を 1 回だけ渡す。
+    Deliver,
+    /// 渡さない（master を受け取れなかった exec の模擬）。
+    Skip,
+    /// 2 回渡す（2 回目の拒否を `Counts::events` の `second-pty-rejected` に記録する）。
+    DeliverTwice,
 }
 
 /// 偽の [`CommandSignaler`]（呼ばれた番号を `Counts::signals` に記録し、決めた列で結果を返す。#4282）。
@@ -266,6 +283,8 @@ impl Default for Scenario {
             deliveries: Vec::new(),
             runner_pid: None,
             signaler_pid: None,
+            pty: PtyBehavior::Deliver,
+            runner_error: None,
         }
     }
 }
@@ -339,6 +358,28 @@ fn drive_reporting(
             let name = ExecCgroupName::new("exec-4242-0").expect("name");
             if let Err(e) = hook(&name) {
                 return Err(AuditedRejection::not_applicable(e));
+            }
+        }
+        if let Some(err) = sc.runner_error {
+            return Err(AuditedRejection::not_applicable(TraitError::new(
+                err,
+                "exec failed",
+            )));
+        }
+        if let Some(pty_hook) = io.pty {
+            let deliveries = match sc.pty {
+                PtyBehavior::Deliver => 1,
+                PtyBehavior::Skip => 0,
+                PtyBehavior::DeliverTwice => 2,
+            };
+            for i in 0..deliveries {
+                let (master, _slave) =
+                    open_host_pty_for_test(WindowSize::new(24, 80)).expect("host pty");
+                match pty_hook(master) {
+                    Ok(()) => counts.event("pty-delivered"),
+                    Err(_) if i > 0 => counts.event("second-pty-rejected"),
+                    Err(e) => return Err(AuditedRejection::not_applicable(e)),
+                }
             }
         }
         if let Some(span) = sc.watch_cancel {
@@ -1164,6 +1205,7 @@ fn collect_events(plugin: &UnixStream) -> Vec<String> {
         match recv_from_helper(plugin, Instant::now() + Duration::from_millis(150)) {
             Ok(HelperMessage::Started(_)) => events.push("started".to_owned()),
             Ok(HelperMessage::Spawned { pid }) => events.push(format!("spawned:{}", pid.get())),
+            Ok(HelperMessage::PtyMaster(_)) => events.push("pty_master".to_owned()),
             Ok(HelperMessage::SignalAck { signal, code }) => {
                 events.push(format!("ack:{}:{code:?}", signal.get()));
             }
@@ -1255,5 +1297,137 @@ fn sup6_4316_spawned_precedes_signal_ack() {
     assert_eq!(
         collect_events(&plugin),
         vec!["started", "spawned:4242", "ack:15:Delivered"]
+    );
+}
+
+/// tty の exec の引数（`--stdio 0` と `--tty`。#4416）。
+fn args_tty(base: &Tmp, name: &str) -> StreamExecArgs {
+    args_for(base, name, PID, 0).with_tty().expect("tty args")
+}
+
+/// CRI-6・SUP-6・SEC-1（#4416）: tty の exec の frame の並びは `Started` → `PtyMaster` → `Spawned`（`Result` の前）で、
+/// `PtyMaster` はちょうど 1 回。
+#[test]
+fn sup6_4416_tty_frames_are_started_pty_master_spawned() {
+    let base = Tmp::new("tty1");
+    let store = open(&base);
+    seed(&base, &store, "run1", Some(PID));
+    let sc = Scenario {
+        exit: ExecExit::Command(ChildExit::Exited(0)),
+        runner_pid: Some(4242),
+        ..Scenario::default()
+    };
+    let (out, counts, plugin) = drive(&store, &args_tty(&base, "run1"), &StdioSend::default(), &sc);
+    assert_eq!(out, StreamExecOutcome::Exited(0));
+    assert_eq!(
+        collect_events(&plugin),
+        vec!["started", "pty_master", "spawned:4242"]
+    );
+    assert_eq!(counts.run.load(Ordering::SeqCst), 1);
+}
+
+/// CRI-6・SUP-6・REPAIR-2（#4416）: 刻みで pid が届く経路でも、`PtyMaster` の前に `Spawned` は出ない。
+#[test]
+fn sup6_4416_tick_spawned_still_follows_pty_master() {
+    let base = Tmp::new("tty2");
+    let store = open(&base);
+    seed(&base, &store, "run1", Some(PID));
+    let mut sc = signal_scenario(vec![], vec![]);
+    sc.exit = ExecExit::Command(ChildExit::Exited(0));
+    sc.signaler_pid = Some(4242);
+    sc.runner_pid = Some(4242);
+    let (out, _counts, plugin) =
+        drive(&store, &args_tty(&base, "run1"), &StdioSend::default(), &sc);
+    assert_eq!(out, StreamExecOutcome::Exited(0));
+    assert_eq!(
+        collect_events(&plugin),
+        vec!["started", "pty_master", "spawned:4242"]
+    );
+}
+
+/// CRI-6・SUP-6・SEC-1（#4416）: master を受け取れなかった exec は `Spawned` を送らず、コマンドの結果ではなく失敗
+/// （`Failed(Internal)`・段 `helper_pty_master`）で終える。
+#[test]
+fn sup6_4416_tty_without_master_sends_no_spawned_and_fails() {
+    let base = Tmp::new("tty3");
+    let store = open(&base);
+    seed(&base, &store, "run1", Some(PID));
+    let sc = Scenario {
+        exit: ExecExit::Command(ChildExit::Exited(0)),
+        runner_pid: Some(4242),
+        pty: PtyBehavior::Skip,
+        ..Scenario::default()
+    };
+    let (report, _counts, plugin) =
+        drive_reporting(&store, &args_tty(&base, "run1"), &StdioSend::default(), &sc);
+    assert_eq!(
+        report.outcome,
+        StreamExecOutcome::Failed(ErrorCode::Internal)
+    );
+    let failure = report.failure.expect("failure");
+    assert_eq!(failure.stage, HelperStage::PtyMaster);
+    assert_eq!(failure.code, ErrorCode::Internal);
+    assert_eq!(collect_events(&plugin), vec!["started"]);
+}
+
+/// SUP-6（#4416）: exec 層の失敗（実行役が拒否を返す）でも `Spawned`・`PtyMaster` は出ない。
+#[test]
+fn sup6_4416_tty_exec_failure_sends_no_spawned() {
+    let base = Tmp::new("tty4");
+    let store = open(&base);
+    seed(&base, &store, "run1", Some(PID));
+    let sc = Scenario {
+        runner_error: Some(ErrorCode::Internal),
+        runner_pid: Some(4242),
+        ..Scenario::default()
+    };
+    let (out, _counts, plugin) =
+        drive(&store, &args_tty(&base, "run1"), &StdioSend::default(), &sc);
+    assert_eq!(out, StreamExecOutcome::Failed(ErrorCode::Internal));
+    assert_eq!(collect_events(&plugin), vec!["started"]);
+}
+
+/// SEC-1・REPAIR-2（#4416）: tty の exec で plugin が stdio の fd を送ると、mask の不一致で exec せず `InvalidArgument`。
+#[test]
+fn sec1_4416_tty_rejects_stdio_fds() {
+    let base = Tmp::new("tty5");
+    let store = open(&base);
+    seed(&base, &store, "run1", Some(PID));
+    let (sock, _peer) = UnixStream::pair().expect("pair");
+    let stdio = StdioSend {
+        stdout: Some(sock.as_fd()),
+        ..StdioSend::default()
+    };
+    let (out, counts, _p) = drive(
+        &store,
+        &args_tty(&base, "run1"),
+        &stdio,
+        &Scenario::default(),
+    );
+    assert_eq!(out, StreamExecOutcome::Failed(ErrorCode::InvalidArgument));
+    assert_nothing_ran(&counts, 1);
+}
+
+/// SEC-1・REPAIR-2（#4416）: `PtyMaster` は高々 1 回。2 回目の受け渡しは拒否され、frame は 1 本だけ届く。
+#[test]
+fn sec1_4416_pty_master_is_sent_at_most_once() {
+    let base = Tmp::new("tty6");
+    let store = open(&base);
+    seed(&base, &store, "run1", Some(PID));
+    let sc = Scenario {
+        exit: ExecExit::Command(ChildExit::Exited(0)),
+        pty: PtyBehavior::DeliverTwice,
+        ..Scenario::default()
+    };
+    let (_out, counts, plugin) =
+        drive(&store, &args_tty(&base, "run1"), &StdioSend::default(), &sc);
+    let events = counts.events.lock().expect("lock").clone();
+    assert!(events.contains(&"second-pty-rejected"), "{events:?}");
+    assert_eq!(
+        collect_events(&plugin)
+            .iter()
+            .filter(|e| *e == "pty_master")
+            .count(),
+        1
     );
 }

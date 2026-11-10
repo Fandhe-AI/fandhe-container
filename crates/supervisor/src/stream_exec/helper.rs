@@ -45,7 +45,12 @@
 //!
 //! # 未実装・残余（REPAIR-3）
 //!
-//! - tty（pty の割り当てと `PtyMaster` の送信）は後続 issue（#3761 では本番で fail-closed）で、本 helper は `--tty` を受けない。
+//! - tty（`--tty`。#4416）: helper は引数 `--tty` を受け、stdio の fd を受けずに（`--stdio 0`。併用は `InvalidArgument`）
+//!   exec の `ExecLaunchIo::pty` を渡す。worker が再適用の後にコンテナの devpts で pty を割り当て、親の応答者の刻みで受けた
+//!   master を channel の `PtyMaster` で要求元へ送る。送信順は `Started` → `PtyMaster` → `Spawned` → `SignalAck` → `Result`
+//!   で、master を送れなかった exec は `Spawned` を送らず `Result` の失敗で終える（段 `helper_pty_master`・`helper_pty_master_send`）。
+//!   plugin-cri 側の有効化（`HelperCapabilities.tty`・`without_tty` の撤去）は #4417 で、本番の CRI の Exec の tty はそれまで fail-closed。
+//!   初期の端末サイズは 0 行 0 列で、kubelet の最初の resize で決まる。
 //! - 受け取る stdio の fd は socket か FIFO に限る（`require_stdio_kinds`。#3761・SEC-1）。plugin-cri 側の結線は #3761 で実装済み。
 //! - 要求元（plugin-cri）の異常終了の検知（#4166・SUP-6・SEC-1・REPAIR-5）: exec の間、supervisor の serve ループの刻みごとに
 //!   fd 0 を `poll(timeout = 0)` で見て（[`channel::requester_gone`]。読まない・消費しない）、`POLLHUP`・`POLLERR`・
@@ -73,7 +78,7 @@ use std::time::{Duration, Instant};
 
 use fandhe_container_core::audit_log::{AuditSink, AuditedRejection};
 use fandhe_container_core::exec::{
-    ChildExit, ENTRYPOINT_MAX_ARGS, ExecCgroupName, ExecExit, emit_diagnostic_line_to,
+    ChildExit, ENTRYPOINT_MAX_ARGS, ExecCgroupName, ExecExit, PtyMaster, emit_diagnostic_line_to,
 };
 use fandhe_container_core::traits::{
     ContainerId, ContainerState, ErrorCode, GetStateRequest, StateRecord, StateStore, TraitError,
@@ -88,7 +93,8 @@ use super::wire::{
 use crate::control::protocol::MAX_EXEC_HOLD_SECS;
 use crate::control::{ControlExecHandover, ExecControlFailure, ExecPidfdSource};
 use crate::exec::{
-    CommandSignaler, ExecLaunchIo, ExecRequest, ExecSignalDelivery, ExecStdio, default_audit_sink,
+    CommandSignaler, ExecLaunchIo, ExecPtyHook, ExecRequest, ExecSignalDelivery, ExecStdio,
+    default_audit_sink,
 };
 
 /// helper を起動するサブコマンド名（bin の第 1 引数）。
@@ -111,7 +117,8 @@ pub fn is_stream_exec_invocation(first: Option<&OsStr>) -> bool {
 
 /// helper の引数（検証済み）。
 ///
-/// 形式: `--root <絶対パス> --id <ContainerId> --expect-pid <n> --timeout-ms <n> --stdio <0..7> -- <argv0> [<arg>...]`。
+/// 形式: `--root <絶対パス> --id <ContainerId> --expect-pid <n> --timeout-ms <n> --stdio <0..7> [--tty] -- <argv0> [<arg>...]`。
+/// `--tty` は値を持たない flag で、指定時は stdio の fd を受けない（`--stdio 0` のみ。併用は拒否。#4416）。
 /// 各オプションはちょうど 1 回。未知（`--env` を含む）・重複・欠落・`--` の欠落・空のコマンドは拒否する。コマンドは
 /// シェルを通さない argv の配列で、先頭は絶対パスのみ。件数は `ENTRYPOINT_MAX_ARGS`（CLI の exec と同じ上限。CRI の
 /// Exec の cmd も利用者の任意コマンドのため）を超えた時点で集めるのをやめて拒否し、1 要素と合計のサイズ・NUL は
@@ -123,6 +130,8 @@ pub struct StreamExecArgs {
     expect_pid: NonZeroU32,
     timeout: Duration,
     stdio: StdioMask,
+    /// tty の exec か（#4416）。`true` のとき `stdio` の mask は 0。
+    tty: bool,
     command: Vec<String>,
 }
 
@@ -168,8 +177,24 @@ impl StreamExecArgs {
             expect_pid,
             timeout,
             stdio,
+            tty: false,
             command,
         })
+    }
+
+    /// tty の exec にする（`--tty`。#4416・CRI-6）。stdio の fd を 1 本でも受ける組（mask が 0 でない）は `InvalidArgument`
+    /// （コマンドの fd 0〜2 は pty の slave になるため。`parse` も同じ規則を通す）。
+    pub fn with_tty(mut self) -> Result<Self, TraitError> {
+        if self.stdio.bits() != 0 {
+            return Err(invalid());
+        }
+        self.tty = true;
+        Ok(self)
+    }
+
+    /// tty の exec か。
+    pub fn tty(&self) -> bool {
+        self.tty
     }
 
     /// サブコマンド名を除いた引数列に直す（`Command::args` へ渡す）。
@@ -185,8 +210,11 @@ impl StreamExecArgs {
             self.timeout.as_millis().to_string().into(),
             "--stdio".into(),
             self.stdio.bits().to_string().into(),
-            "--".into(),
         ];
+        if self.tty {
+            out.push("--tty".into());
+        }
+        out.push("--".into());
         out.extend(self.command.iter().map(OsString::from));
         out
     }
@@ -203,6 +231,7 @@ impl StreamExecArgs {
         let mut timeout_ms: Option<String> = None;
         let mut stdio: Option<String> = None;
         let mut command: Vec<String> = Vec::new();
+        let mut tty = false;
         let mut separated = false;
         while let Some(arg) = iter.next() {
             if arg == OsStr::new("--") {
@@ -215,6 +244,14 @@ impl StreamExecArgs {
                     command.push(rest.into_string().map_err(|_| invalid())?);
                 }
                 break;
+            }
+            // `--tty` だけは値を取らない flag（重複は拒否する。値を付けた形は後続の未知の引数として拒否される）。
+            if arg == OsStr::new("--tty") {
+                if tty {
+                    return Err(invalid());
+                }
+                tty = true;
+                continue;
             }
             let value = iter.next().ok_or_else(invalid)?;
             let text = |v: OsString| v.into_string().map_err(|_| invalid());
@@ -248,14 +285,15 @@ impl StreamExecArgs {
             .and_then(StdioMask::new)
             .ok_or_else(invalid)?;
         let id = ContainerId::new(id.as_deref().ok_or_else(invalid)?)?;
-        Self::new(
+        let args = Self::new(
             PathBuf::from(root.ok_or_else(invalid)?),
             id,
             expect_pid,
             Duration::from_millis(timeout_ms),
             stdio,
             command,
-        )
+        )?;
+        if tty { args.with_tty() } else { Ok(args) }
     }
 
     /// 状態ルート。
@@ -504,6 +542,7 @@ pub fn serve_reporting(
         Err(e) => return early_control(HelperStage::PidfdHandover, &e),
     };
 
+    let tty = args.tty();
     let stdio_deadline = total_deadline.min(Instant::now() + STDIO_BUDGET);
     let fds = match channel::recv_stdio_handover(channel, args.stdio(), stdio_deadline) {
         Ok(fds) => fds,
@@ -558,7 +597,42 @@ pub fn serve_reporting(
         gone
     };
     // コマンドへのシグナル（#4282）。exec の刻みごとに fd 0 の `Signal` を受け、コマンドの pidfd へ送って `SignalAck` を返す。
-    let signal_state = SignalState::default();
+    let signal_state = SignalState {
+        tty,
+        ..SignalState::default()
+    };
+    // tty の exec の pty master の受け取り（#4416）。親が応答者の刻みで受けた検証済みの master を、`Started` の後・`Spawned` の前に
+    // 1 回だけ `PtyMaster` として送る。送信後は master を drop して helper に複製を残さない。送信の失敗は段を覚えて exec を止める。
+    let pty_failure: std::cell::Cell<Option<HelperFailure>> = std::cell::Cell::new(None);
+    let pty_hook = |master: PtyMaster| -> Result<(), TraitError> {
+        if signal_state.pty_sent.get() {
+            return Err(TraitError::new(
+                ErrorCode::Internal,
+                "the pty master was delivered more than once",
+            ));
+        }
+        match channel::send_pty_master(
+            channel,
+            master.as_fd(),
+            started_send_deadline(Instant::now(), total_deadline),
+        ) {
+            Ok(()) => {
+                signal_state.pty_sent.set(true);
+                Ok(())
+            }
+            Err(e) => {
+                pty_failure.set(Some(HelperFailure::new(
+                    HelperStage::PtyMasterSend,
+                    e.code(),
+                    e.errno(),
+                )));
+                Err(TraitError::new(
+                    e.code(),
+                    "failed to send the pty master to the caller",
+                ))
+            }
+        }
+    };
     let signal_hook =
         |signaler: &dyn CommandSignaler| signal_tick(channel, &signal_state, signaler);
     let io = ExecLaunchIo {
@@ -571,6 +645,7 @@ pub fn serve_reporting(
         on_created: Some(&on_created),
         cancel: Some(&cancel),
         signal: Some(&signal_hook),
+        pty: tty.then_some(&pty_hook as &ExecPtyHook<'_>),
     };
     let result = (deps.run)(
         &record,
@@ -589,7 +664,19 @@ pub fn serve_reporting(
     }
     // 短命なコマンドが刻みの中継より先に終わったときのため、起動したコマンドの pid を結果から控える（#4316）。
     let runner_pid = result.as_ref().ok().and_then(|r| r.command_pid);
-    let outcome = outcome_from_result(result.map(|r| r.exit));
+    let mut outcome = outcome_from_result(result.map(|r| r.exit));
+    // tty なのに master を送れていないのに、コマンドの結果だけが届いた exec は成功にしない（`Spawned` も送らない。fail-closed）。
+    let pty_missing = tty
+        && !signal_state.pty_sent.get()
+        && matches!(
+            outcome,
+            StreamExecOutcome::Exited(_)
+                | StreamExecOutcome::Signaled(_)
+                | StreamExecOutcome::NotStarted { .. }
+        );
+    if pty_missing {
+        outcome = StreamExecOutcome::Failed(ErrorCode::Internal);
+    }
     // 刻みで送れていなければ、保留の ack と `Result` より前に `Spawned` を送る（`Spawned` は常に `Result` の前。#4316）。
     if let Some(pid) = runner_pid {
         send_spawned_once(channel, &signal_state, pid);
@@ -605,8 +692,13 @@ pub fn serve_reporting(
     }
     // 失敗の段: 通知・`Started` の送信で覚えたものを優先し、無ければ実行役の失敗（`Failed`）を `helper_exec` とする。
     // 取り消し（要求元の消滅）は従来の行があるので足さない。
-    let failure = match created_failure.take() {
+    let failure = match created_failure.take().or_else(|| pty_failure.take()) {
         Some(f) => Some(f),
+        None if pty_missing => Some(HelperFailure::new(
+            HelperStage::PtyMaster,
+            ErrorCode::Internal,
+            None,
+        )),
         None if cancelled.get() => None,
         None => match outcome {
             StreamExecOutcome::Failed(code) => {
@@ -632,11 +724,19 @@ struct SignalState {
     dead: std::cell::Cell<bool>,
     /// `Spawned` を送る試行を済ませた（成功・失敗を問わず再送しない。#4316）。
     spawned_sent: std::cell::Cell<bool>,
+    /// tty の exec か（#4416）。`true` の間は `PtyMaster` を送るまで `Spawned` を送らない（順序の契約。REPAIR-2）。
+    tty: bool,
+    /// `PtyMaster` を送り終えた（高々 1 回。#4416）。
+    pty_sent: std::cell::Cell<bool>,
 }
 
 /// `Spawned` を高々 1 回だけ best-effort で送る（#4316・SUP-6）。送信の失敗は握りつぶす（pid は表示用で、`Result` と exec は
 /// 止めない）。部分書き込みで後続の frame の境界が崩れる窓は `SignalAck` と同じ残余（期限は [`SIGNAL_ACK_BUDGET`]）。
 fn send_spawned_once(channel: &UnixStream, state: &SignalState, pid: NonZeroU32) {
+    // tty の exec は `PtyMaster` の後でなければ `Spawned` を送らない（送れていなければ送らず、試行も済ませない）。
+    if state.tty && !state.pty_sent.get() {
+        return;
+    }
     if state.spawned_sent.replace(true) {
         return;
     }
@@ -1056,5 +1156,68 @@ mod tests {
             )))),
             StreamExecOutcome::Failed(ErrorCode::Timeout)
         );
+    }
+
+    /// `--stdio <mask>` を差し替え、`--tty` を `--` の直前に足した引数列（#4416 の試験用）。
+    fn tty_args(stdio: &str, tty_flags: &[&str]) -> Vec<OsString> {
+        let mut out = os(&[
+            "--root",
+            "/run/fandhe",
+            "--id",
+            "web1",
+            "--expect-pid",
+            "4242",
+            "--timeout-ms",
+            "28000",
+            "--stdio",
+            stdio,
+        ]);
+        out.extend(tty_flags.iter().map(OsString::from));
+        out.extend(os(&["--", "/bin/sh", "-c", "tty"]));
+        out
+    }
+
+    /// CRI-6・SUP-6（#4416）: `--tty` は `--stdio 0` と組になり、`parse` と `to_args` が往復する（`--` の直前に 1 個）。
+    #[test]
+    fn sup6_4416_tty_flag_roundtrips_with_stdio_zero() {
+        let parsed = StreamExecArgs::parse(tty_args("0", &["--tty"])).unwrap();
+        assert!(parsed.tty());
+        assert_eq!(parsed.stdio().bits(), 0);
+        assert_eq!(parsed.to_args(), tty_args("0", &["--tty"]));
+        // tty でない既存の形は変わらない。
+        let plain = StreamExecArgs::parse(good()).unwrap();
+        assert!(!plain.tty());
+        assert!(!plain.to_args().iter().any(|a| a == "--tty"));
+    }
+
+    /// SEC-1・REPAIR-2（#4416）: `--tty` と mask が 0 でない組・重複・値つきの形は `InvalidArgument` で拒否する。
+    #[test]
+    fn sec1_4416_tty_rejects_stdio_mask_duplicates_and_values() {
+        for bad in [
+            tty_args("7", &["--tty"]),
+            tty_args("1", &["--tty"]),
+            tty_args("0", &["--tty", "--tty"]),
+            tty_args("0", &["--tty", "x"]),
+        ] {
+            let err = StreamExecArgs::parse(bad.clone()).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::InvalidArgument, "{bad:?}");
+        }
+        // `with_tty` も同じ規則（mask 7 は拒否、mask 0 は受理）。
+        let build = |mask: u8| {
+            StreamExecArgs::new(
+                PathBuf::from("/run/fandhe"),
+                ContainerId::new("web1").unwrap(),
+                NonZeroU32::new(4242).unwrap(),
+                Duration::from_secs(5),
+                StdioMask::new(mask).unwrap(),
+                vec!["/bin/echo".to_string()],
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            build(7).with_tty().unwrap_err().code(),
+            ErrorCode::InvalidArgument
+        );
+        assert!(build(0).with_tty().unwrap().tty());
     }
 }

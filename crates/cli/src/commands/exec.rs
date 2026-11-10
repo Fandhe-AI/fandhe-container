@@ -173,6 +173,7 @@ mod linux {
                 on_created: Some(ctx.on_created),
                 cancel: None,
                 signal: None,
+                pty: None,
             },
         )
         .map(|AuditedOutcome { outcome, .. }| outcome.exit)

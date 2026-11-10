@@ -240,7 +240,7 @@
 //!   行う（記録が済むまで rootless での通しは未確認）
 //! - コマンドの標準入出力の受け渡し。stdin・stdout・stderr の個別指定は実装済み（[`ExecStdio`]。#3757・SUP-6・CRI-6）で、
 //!   healthcheck の出力取得は stdout / stderr を結合した 1 本の fd へ付け替える形（[`run_command_with_pidfd_output`]。#2441）。
-//!   指定のない番号は `/dev/null`。未対応: CLI の exec の stdio の配線（#2712）・pty（#3758）。cwd の指定も未対応（cwd はコンテナの rootfs の根）。ユーザーは `config.json` の
+//!   指定のない番号は `/dev/null`。pty（tty=true）は [`ExecLaunchIo::pty`] で対応（#4416。worker が再適用の後にコンテナの devpts から割り当て、親は応答者の刻みで master を非ブロッキングに受ける）。未対応: CLI の exec の stdio の配線（#2712）。cwd の指定も未対応（cwd はコンテナの rootfs の根）。ユーザーは `config.json` の
 //!   `process.user`（非 root と `additionalGids` を含む）を対象の写像と照合して受ける（#2770）。exec 要求ごとの
 //!   ユーザーの上書き（CLI の `--user`・CRI の Exec。#2712・#680）は未対応
 //! - **コマンドの SIGSYS 終了の補助記録**（SEC-4・ESC-06・REPAIR-5・#2236）: コマンドが SIGSYS で終了した
@@ -296,14 +296,16 @@ use fandhe_container_core::exec::{
     ENTRYPOINT_MAX_ENV, ENTRYPOINT_MAX_STRING_BYTES, ENTRYPOINT_MAX_TOTAL_BYTES,
     EntrypointExecMode, ExecCgroupJoin, ExecCgroupJoinReport, ExecCgroupName, ExecCgroupSweep,
     ExecChildCgroup, ExecChildStep, ExecCommand, ExecError, ExecExit, ExecListenerSender,
-    ExecReady, ExecRestrictionReport, ExecRestrictions, ExecWorkerProof, IsolationStage,
-    ListenerReceipt, NamespaceJoinReport, Pid1Target, SealedCopyUnavailable, SupplementaryGroups,
-    ViolationReason, emit_diagnostic_line_to, join_cgroup as core_join_cgroup, join_namespaces,
+    ExecPtyReceiver, ExecPtySender, ExecReady, ExecRestrictionReport, ExecRestrictions,
+    ExecWorkerProof, IsolationStage, ListenerReceipt, NamespaceJoinReport, Pid1Target, PtyMaster,
+    PtyReceipt, SealedCopyUnavailable, SupplementaryGroups, ViolationReason, WindowSize,
+    emit_diagnostic_line_to, join_cgroup as core_join_cgroup, join_namespaces,
     prepare_cgroup_join as core_prepare_cgroup_join,
     prepare_exec_restrictions as core_prepare_exec_restrictions,
     reapply_restrictions as core_reapply_restrictions, record_entrypoint_rejection_at,
     record_exec_worker_rejection_at, remove_exec_child_cgroup, spawn_exec_command_with_stdio,
-    spawn_exec_worker_with_listener, sweep_stale_exec_child_cgroups,
+    spawn_exec_worker_with_listener, spawn_exec_worker_with_listener_and_pty,
+    sweep_stale_exec_child_cgroups,
 };
 // `None` の入口（試験専用）だけが使う。無効の単独ビルドの unused_imports を避ける（#2640）。
 #[cfg(feature = "exec-test-support")]
@@ -921,9 +923,10 @@ pub fn run_command(
         deadline,
         exec_responder(record, audit),
         None,
+        None,
         || create_child_cgroup(record, &name),
         || cleanup_child_cgroup(record, &name),
-        |proof, child, sender| {
+        |proof, child, sender, pty_sender| {
             let target = identify_pid1_staged(record)?;
             run_with_target(
                 proof,
@@ -931,10 +934,11 @@ pub fn run_command(
                 request,
                 deadline,
                 child,
-                sender,
+                (sender, pty_sender),
                 WorkerIo {
                     stdio: ExecStdio::NONE,
                     signal_tx: None,
+                    tty: false,
                 },
             )
         },
@@ -1099,6 +1103,7 @@ pub fn run_command_with_pidfd_env(
             on_created: None,
             cancel: None,
             signal: None,
+            pty: None,
         },
     )
 }
@@ -1133,6 +1138,7 @@ pub fn run_command_with_pidfd_output(
             on_created: None,
             cancel: None,
             signal: None,
+            pty: None,
         },
     )
 }
@@ -1172,6 +1178,15 @@ impl<'a> ExecStdio<'a> {
 
 /// exec 子 cgroup の作成通知のフック型（[`ExecLaunchIo::on_created`]）。
 pub type ExecCreatedHook<'a> = dyn Fn(&ExecCgroupName) -> Result<(), TraitError> + 'a;
+
+/// tty の exec で、worker が割り当てた pty の master を受け取るフックの型（[`ExecLaunchIo::pty`]。#4416・SUP-6・CRI-6）。
+///
+/// 親が応答者の刻みの中で 1 回だけ呼ぶ。`Err` は exec の失敗として扱う（worker を止めて回収し、その構造化エラーで終える）。
+pub type ExecPtyHook<'a> = dyn Fn(PtyMaster) -> Result<(), TraitError> + 'a;
+
+/// tty の exec の初期の端末サイズ（0 行 0 列）。CRI の最初の resize（kubelet が送る）で決まる前提の既定値で、
+/// launch の init の pty の初期値（core の `LAUNCH_PTY_INITIAL_SIZE`）と揃える（`docs/design/cri-streaming-server.md` D6）。
+const EXEC_PTY_INITIAL_SIZE: WindowSize = WindowSize::new(0, 0);
 
 /// 要求元の取り消し判定のフック型（[`ExecLaunchIo::cancel`]）。真を返したら「要求元はもう exec を必要としていない」
 /// （要求元の異常終了。#4166・SUP-6）。非ブロッキングで速く返ること（刻みごとに呼ばれる）。
@@ -1321,6 +1336,13 @@ pub struct ExecLaunchIo<'a> {
     /// 期限・`WORKER_GRACE`・取り消しの意味は変えない。`None` なら従来の経路をそのまま通る（helper 以外の呼び出し元の既定。
     /// CLI の exec・healthcheck はこの口に入れない）。
     pub signal: Option<&'a ExecSignalHook<'a>>,
+    /// tty の exec（stream-exec の helper が `--tty` のときだけ渡す。#4416・CRI-6・SUP-6・SEC-1）。`Some` のとき、worker は
+    /// 再適用（capability 削減・NNP・Landlock・seccomp）の **後** にコンテナの devpts から pty を割り当て、master をコマンドの
+    /// fork **前** に親へ `SCM_RIGHTS` で送って閉じ、slave をコマンドの fd 0〜2 と制御端末にする。親は応答者を回す刻みの中で
+    /// master を非ブロッキングに受け取り（応答者を止めない）、検証したうえでこのフックへ 1 回だけ渡す。master を受け取れない・
+    /// フックが `Err` の exec は worker を止めて回収し、その失敗で終える（縮退しない）。[`ExecLaunchIo::stdio`] の fd とは
+    /// 併用できない（指定があれば cgroup の作成・fork より前に `InvalidArgument`）。`None` なら従来の経路をそのまま通る。
+    pub pty: Option<&'a ExecPtyHook<'a>>,
 }
 
 /// [`run_command_with_pidfd_output`] に、exec 子 cgroup の **作成成功の通知** `on_created` を足した入口
@@ -1357,8 +1379,18 @@ fn run_command_with_pidfd_inner(
         on_created,
         cancel,
         signal,
+        pty,
     } = io;
+    let tty = pty.is_some();
     let deadline = Deadline::after(timeout);
+    // pty と stdio の fd の併用は不正な組（コマンドの fd 0〜2 は slave になる）。cgroup の作成・fork より前に拒否する
+    // （fail-closed。#4416・REPAIR-2）。
+    if tty && stdio_has_fd(&stdio) {
+        return Err(AuditedRejection::not_applicable(TraitError::new(
+            ErrorCode::InvalidArgument,
+            "exec stage Spawn: a tty exec cannot take stdio fds",
+        )));
+    }
     running_pid(record).map_err(AuditedRejection::not_applicable)?;
     // シグナルのフックがあるときだけ、worker がコマンドの pidfd を親へ渡す socketpair を fork 前に作る（#4282）。
     // 親は受信側（非ブロッキング）、worker は送信側を持つ。
@@ -1401,6 +1433,7 @@ fn run_command_with_pidfd_inner(
         deadline,
         exec_responder(record, audit),
         tick_hook,
+        pty,
         || {
             let created = create_child_cgroup(record, &name)?;
             // 排他作成に成功した（所有を確定した）直後にだけ通知する。通知に失敗したら、所有している cgroup を
@@ -1416,7 +1449,7 @@ fn run_command_with_pidfd_inner(
         },
         || cleanup_child_cgroup(record, &name),
         // `move`: 送信側 `signal_tx` を worker だけが持つ（親は fork 後にこのクロージャごと drop して閉じる）。
-        move |proof, child, sender| {
+        move |proof, child, sender, pty_sender| {
             let target = identify_pid1_with_pidfd_staged(record, pidfd)?
                 .with_launch_env(launch_env.to_vec());
             run_with_target(
@@ -1425,10 +1458,11 @@ fn run_command_with_pidfd_inner(
                 request,
                 deadline,
                 child,
-                sender,
+                (sender, pty_sender),
                 WorkerIo {
                     stdio,
                     signal_tx: signal_tx.as_ref().map(|s| s.as_fd()),
+                    tty,
                 },
             )
         },
@@ -1461,6 +1495,7 @@ pub fn run_command_in(
         deadline,
         exec_responder(record, audit),
         None,
+        None,
         || {
             ExecChildCgroup::create_in_path_for_test(expected_cgroup_path, &name)
                 .map(Some)
@@ -1475,7 +1510,7 @@ pub fn run_command_in(
             .map(|_| ())
             .map_err(from_exec_error)
         },
-        |proof, child, sender| {
+        |proof, child, sender, pty_sender| {
             let target = identify_pid1_in_staged(record, expected_cgroup_path)?;
             run_with_target(
                 proof,
@@ -1483,10 +1518,11 @@ pub fn run_command_in(
                 request,
                 deadline,
                 child,
-                sender,
+                (sender, pty_sender),
                 WorkerIo {
                     stdio: ExecStdio::NONE,
                     signal_tx: None,
+                    tty: false,
                 },
             )
         },
@@ -1660,6 +1696,7 @@ impl ListenerPolicy<'_> {
 /// listener の送信口を受け取り、親は worker の終了を待つ **前** に listener を期限つきで受信・検証して ACK を返す
 /// （`work` が ACK を待つため、先に終了を待つと相互待ちになる）。受け渡しの結果ごとの扱いは
 /// [`reject_unacknowledged_exit`]・[`listener_failure`]。
+#[cfg(feature = "exec-test-support")]
 fn run_in_worker_with(
     deadline: Deadline,
     grace: Duration,
@@ -1667,6 +1704,122 @@ fn run_in_worker_with(
     listener: ListenerPolicy<'_>,
     cancel: Option<&ExecCancelHook<'_>>,
     work: impl FnOnce(&ExecWorkerProof, Option<ExecListenerSender>) -> Result<ExecOutcome, WorkerError>,
+) -> Result<ExecOutcome, WorkerFailure> {
+    run_in_worker_with_pty(
+        deadline,
+        grace,
+        cleanup,
+        listener,
+        cancel,
+        None,
+        |proof, sender, _| work(proof, sender),
+    )
+}
+
+/// tty の exec で、親が応答者の刻みの中で追う pty の受け渡しの状態（#4416・SUP-6・SEC-1）。
+enum PtyState {
+    /// まだ届いていない（worker が割り当て中、またはコマンドを起動していない）。
+    Pending,
+    /// 検証済みの master をフックへ渡し終えた（高々 1 回）。
+    Delivered,
+    /// 何も届かないまま worker 側の端が閉じた（tty を割り当てる前に worker が終わった）。
+    Closed,
+    /// 受信の拒否・期限切れ・フックの `Err`。exec を止めて回収し、この失敗で終える（縮退しない）。
+    Failed(TraitError),
+}
+
+/// `Pending` のときだけ、届いていれば pty の master を **待たずに** 受け、検証済みならフックへ渡す（応答者の刻みごとに
+/// 呼ばれる。ブロッキングで待つと、worker の `allocate_pty` 中の syscall が通知に掛かったとき応答者が回れず、期限まで
+/// 互いに待つため。SEC-4・REPAIR-5）。終端の結果を得た後は何もしない。
+fn poll_pty(
+    receiver: &ExecPtyReceiver,
+    child: &fandhe_container_core::exec::ContainerChild,
+    hook: &ExecPtyHook<'_>,
+    state: &std::cell::RefCell<PtyState>,
+) {
+    if !matches!(*state.borrow(), PtyState::Pending) {
+        return;
+    }
+    let Some(receipt) = receiver.try_receive(child) else {
+        return;
+    };
+    let next = match receipt {
+        PtyReceipt::Received(master) => match hook(master) {
+            Ok(()) => PtyState::Delivered,
+            Err(e) => PtyState::Failed(e),
+        },
+        PtyReceipt::SenderClosed => PtyState::Closed,
+        PtyReceipt::Rejected(e) | PtyReceipt::TimedOut(e) => PtyState::Failed(from_exec_error(e)),
+        // `PtyReceipt` は将来拡張される。未知の結果は受け取りを確認できないものとして拒否する（fail-closed）。
+        _ => PtyState::Failed(TraitError::new(
+            ErrorCode::Internal,
+            "exec stage Spawn: the pty master handover ended in an unknown state",
+        )),
+    };
+    *state.borrow_mut() = next;
+}
+
+/// worker の回収後に pty の受け渡しの状態で結果を確定する（#4416）。
+///
+/// - `Failed(e)`: 取り消しの固定メッセージ（`Unavailable`）の結果は `e` で置き換える（回収の失敗は "cleanup also failed" の
+///   形で添える）。worker 自身の失敗（違反・期限切れ）はそのまま返す。worker が成功を返していたら `e` で失敗にする
+/// - `Delivered`: 結果をそのまま返す
+/// - それ以外で worker が成功を返した: master を受け取らずにコマンドが終わったことになるため `Internal`（fail-closed）
+fn finish_pty(
+    result: Result<ExecOutcome, WorkerFailure>,
+    receiver: &ExecPtyReceiver,
+    child: &fandhe_container_core::exec::ContainerChild,
+    hook: &ExecPtyHook<'_>,
+    state: &std::cell::RefCell<PtyState>,
+) -> Result<ExecOutcome, WorkerFailure> {
+    // worker の終了後も SEQPACKET の積み残しは読める。刻みで拾えなかった分をここで 1 回だけ拾う。
+    poll_pty(receiver, child, hook, state);
+    let taken = std::mem::replace(&mut *state.borrow_mut(), PtyState::Closed);
+    match (taken, result) {
+        (PtyState::Failed(e), Err(f)) => {
+            let cancelled = f.error.code() == ErrorCode::Unavailable
+                && f.error.message().starts_with("exec cancelled");
+            if !cancelled {
+                return Err(f);
+            }
+            let error = match f.error.message().split_once("; cleanup also failed: ") {
+                Some((_, reap)) => TraitError::new(
+                    e.code(),
+                    format!("{}; cleanup also failed: {reap}", e.message()),
+                ),
+                None => e,
+            };
+            Err(WorkerFailure {
+                error,
+                violation: None,
+                stage: None,
+            })
+        }
+        (PtyState::Failed(e), Ok(_)) => Err(e.into()),
+        (PtyState::Delivered, result) => result,
+        (_, Ok(_)) => Err(TraitError::new(
+            ErrorCode::Internal,
+            "exec stage Spawn: the exec worker finished without handing over the pty master",
+        )
+        .into()),
+        (_, Err(f)) => Err(f),
+    }
+}
+
+/// [`run_in_worker_with`] の pty 対応版（`pty` が `Some` のとき tty の exec。#4416）。worker は pty の送信口も受け取り、親は
+/// listener を受けて応答者を回す間の刻みで master を非ブロッキングに受けてフックへ渡す（[`poll_pty`]）。
+fn run_in_worker_with_pty(
+    deadline: Deadline,
+    grace: Duration,
+    cleanup: impl FnOnce() -> Result<(), TraitError>,
+    listener: ListenerPolicy<'_>,
+    cancel: Option<&ExecCancelHook<'_>>,
+    pty: Option<&ExecPtyHook<'_>>,
+    work: impl FnOnce(
+        &ExecWorkerProof,
+        Option<ExecListenerSender>,
+        Option<ExecPtySender>,
+    ) -> Result<ExecOutcome, WorkerError>,
 ) -> Result<ExecOutcome, WorkerFailure> {
     // fork 前に期限を確かめる（切れていれば worker を作らない。fork 後の早期 return で worker を残さないため）。
     deadline.remaining("starting the exec worker")?;
@@ -1676,39 +1829,81 @@ fn run_in_worker_with(
             format!("exec stage Spawn: pipe failed: {}", e.kind()),
         )
     })?;
-    let body = |proof: ExecWorkerProof, sender: Option<ExecListenerSender>| {
-        let line = encode_worker_result(&work(&proof, sender));
+    let body = |proof: ExecWorkerProof,
+                sender: Option<ExecListenerSender>,
+                pty_sender: Option<ExecPtySender>| {
+        let line = encode_worker_result(&work(&proof, sender, pty_sender));
         // 書けなければ親は「結果なし」として失敗扱いにする（fail-closed）。
         let _ = (&writer).write_all(&line);
         0
     };
     // `None` は試験専用なので、無効の単独ビルドでは分岐ごと消す（match が `_` だけになる lint を避ける。#2640）。
     #[cfg(feature = "exec-test-support")]
-    let (child, receiver) = match &listener {
-        ListenerPolicy::None => (
-            spawn_exec_worker(|proof| body(proof, None)).map_err(from_exec_error)?,
+    let (child, receiver, pty_receiver) = match (&listener, pty.is_some()) {
+        (ListenerPolicy::None, false) => (
+            spawn_exec_worker(|proof| body(proof, None, None)).map_err(from_exec_error)?,
+            None,
             None,
         ),
-        _ => {
+        (ListenerPolicy::None, true) => {
+            return Err(TraitError::new(
+                ErrorCode::Internal,
+                "exec stage Spawn: a pty exec needs the seccomp listener channel",
+            )
+            .into());
+        }
+        (_, true) => {
+            let (child, receiver, pty_receiver) = spawn_exec_worker_with_listener_and_pty(
+                listener.delivery(),
+                |proof, sender, ps| body(proof, Some(sender), Some(ps)),
+            )
+            .map_err(from_exec_error)?;
+            (child, Some(receiver), Some(pty_receiver))
+        }
+        (_, false) => {
             let (child, receiver) =
                 spawn_exec_worker_with_listener(listener.delivery(), |proof, sender| {
-                    body(proof, Some(sender))
+                    body(proof, Some(sender), None)
                 })
                 .map_err(from_exec_error)?;
-            (child, Some(receiver))
+            (child, Some(receiver), None)
         }
     };
     #[cfg(not(feature = "exec-test-support"))]
-    let (child, receiver) = {
-        let (child, receiver) =
-            spawn_exec_worker_with_listener(listener.delivery(), |proof, sender| {
-                body(proof, Some(sender))
+    let (child, receiver, pty_receiver) = if pty.is_some() {
+        let (child, receiver, pty_receiver) =
+            spawn_exec_worker_with_listener_and_pty(listener.delivery(), |proof, sender, ps| {
+                body(proof, Some(sender), Some(ps))
             })
             .map_err(from_exec_error)?;
-        (child, Some(receiver))
+        (child, Some(receiver), Some(pty_receiver))
+    } else {
+        let (child, receiver) =
+            spawn_exec_worker_with_listener(listener.delivery(), |proof, sender| {
+                body(proof, Some(sender), None)
+            })
+            .map_err(from_exec_error)?;
+        (child, Some(receiver), None)
     };
     // 親は書き込み側を閉じる（worker の終了後に読み取りが EOF で終わるようにする）。
     drop(writer);
+    // tty の exec: 応答者の刻みごとに pty の master を非ブロッキングに受ける。拒否・フックの失敗は取り消しと同じく
+    // worker を止めて回収させる（真を返す）。pty の確認は内側の刻み（signal・`Spawned` の送信点）より **前** に置く。
+    let pty_state = std::cell::RefCell::new(PtyState::Pending);
+    let pty_tick = || -> bool {
+        if let (Some(receiver), Some(hook)) = (pty_receiver.as_ref(), pty) {
+            poll_pty(receiver, &child, hook, &pty_state);
+        }
+        if matches!(*pty_state.borrow(), PtyState::Failed(_)) {
+            return true;
+        }
+        cancel.is_some_and(|c| c())
+    };
+    let cancel: Option<&ExecCancelHook<'_>> = if pty_receiver.is_some() {
+        Some(&pty_tick)
+    } else {
+        cancel
+    };
     // worker を fork した後は、結果の取得がどう終わっても（正常・期限切れ・異常終了・結果行の不正）worker の
     // 停止・回収の後に exec 用の子 cgroup の後始末を必ず行う（cgroup は呼び出しプロセスが fork 前に作って
     // 所有しており、削除は制限の掛かっていないここでしかできない。作成できなかった場合は呼ばれない。#1466）。
@@ -1753,6 +1948,10 @@ fn run_in_worker_with(
                 ))
             }
         },
+    };
+    let result = match (pty_receiver.as_ref(), pty) {
+        (Some(receiver), Some(hook)) => finish_pty(result, receiver, &child, hook, &pty_state),
+        _ => result,
     };
     let cleaned = cleanup();
     match (result, cleaned) {
@@ -2021,18 +2220,20 @@ fn run_owning_child_cgroup(
     deadline: Deadline,
     responder: ExecResponder<'_>,
     cancel: Option<&ExecCancelHook<'_>>,
+    pty: Option<&ExecPtyHook<'_>>,
     create: impl FnOnce() -> Result<Option<ExecChildCgroup>, TraitError>,
     remove: impl Fn() -> Result<(), TraitError>,
     work: impl FnOnce(
         &ExecWorkerProof,
         Option<&ExecChildCgroup>,
         ExecListenerSender,
+        Option<ExecPtySender>,
     ) -> Result<ExecOutcome, WorkerError>,
 ) -> Result<ExecOutcome, WorkerFailure> {
     let child = create()?;
     let owned = child.is_some();
     let cleanup_ran = std::cell::Cell::new(false);
-    let result = run_in_worker_with(
+    let result = run_in_worker_with_pty(
         deadline,
         WORKER_GRACE,
         || {
@@ -2041,8 +2242,9 @@ fn run_owning_child_cgroup(
         },
         ListenerPolicy::Respond(responder),
         cancel,
-        |proof, sender| match sender {
-            Some(sender) => work(proof, child.as_ref(), sender),
+        pty,
+        |proof, sender, pty_sender| match sender {
+            Some(sender) => work(proof, child.as_ref(), sender, pty_sender),
             // `Respond` では必ず `Some`。無ければ fail-closed（listener 無しで進まない）。
             None => Err(TraitError::new(
                 ErrorCode::Internal,
@@ -2146,6 +2348,49 @@ pub fn run_in_worker_for_test(
         ListenerPolicy::None,
         None,
         |_, _| work().map_err(WorkerError::from),
+    )
+    .map_err(|f| f.error)
+}
+
+/// 結合試験専用の入口: 本番と同じ worker・listener・pty の受け渡しと応答者で `work` を実行する（tty の exec の親側の受信。
+/// #4416・SUP-6・SEC-1。`tests/exec_pty_handover.rs`）。`on_pty` が本番の [`ExecLaunchIo::pty`] のフックに当たる。
+///
+/// `work` は listener と pty の送信口を受け取る。順序は **pty → listener**: pty の子の端は fork 前に作るため、先に listener を
+/// 適用するとその後の socket の残りの検査で漏れとして数えられる（`hand_over` は端を drop で閉じる。送らない場合は
+/// `drop(sender)` してから listener を適用する）。`Ok(())` を返したとき worker の結果は固定の見本になる。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub fn run_in_worker_with_pty_for_test(
+    timeout: Duration,
+    grace: Duration,
+    cleanup: impl FnOnce() -> Result<(), TraitError>,
+    on_pty: &ExecPtyHook<'_>,
+    work: impl FnOnce(ExecListenerSender, ExecPtySender) -> Result<(), TraitError>,
+) -> Result<ExecOutcome, TraitError> {
+    run_in_worker_with_pty(
+        Deadline::after(timeout),
+        grace,
+        cleanup,
+        ListenerPolicy::Respond(ExecResponder::new(
+            &DiscardSink,
+            None,
+            NotifyConfig::default(),
+        )),
+        None,
+        Some(on_pty),
+        |_, sender, pty_sender| {
+            let sender = sender.ok_or_else(|| {
+                TraitError::new(ErrorCode::Internal, "the listener channel was not provided")
+            })?;
+            let pty_sender = pty_sender.ok_or_else(|| {
+                TraitError::new(ErrorCode::Internal, "the pty channel was not provided")
+            })?;
+            work(sender, pty_sender)?;
+            decode_worker_result(
+                b"ok command - - - exited 0 15 1 23 3 120 cleared 4 sealed_copy - 4321\n",
+            )
+            .map_err(|f| WorkerError::from(f.error))
+        },
     )
     .map_err(|f| f.error)
 }
@@ -2660,6 +2905,13 @@ struct WorkerIo<'a> {
     stdio: ExecStdio<'a>,
     /// コマンドの pidfd を親（stream-exec の helper）へ渡す socketpair の送信側（`signal` のフックがあるときだけ。#4282）。
     signal_tx: Option<BorrowedFd<'a>>,
+    /// tty の exec か（`pty` のフックがある呼び出し。worker は pty を割り当てて master を親へ送り、slave を stdio にする。#4416）。
+    tty: bool,
+}
+
+/// stdio の fd が 1 本でも指定されているか（tty との併用の検査用。#4416）。
+fn stdio_has_fd(stdio: &ExecStdio<'_>) -> bool {
+    stdio.stdin.is_some() || stdio.stdout.is_some() || stdio.stderr.is_some()
 }
 
 /// 特定済みの対象に対して、参加 → 制限の再適用 → 実行 → 待機を順に行う（[`run_command_with_pidfd`] の本体）。
@@ -2669,9 +2921,10 @@ fn run_with_target(
     request: &ExecRequest,
     deadline: Deadline,
     child_cgroup: Option<&ExecChildCgroup>,
-    listener: ExecListenerSender,
+    senders: (ExecListenerSender, Option<ExecPtySender>),
     io: WorkerIo<'_>,
 ) -> Result<ExecOutcome, WorkerError> {
+    let (listener, pty_sender) = senders;
     // コマンドだけを入れる子 cgroup は、呼び出しプロセスが fork 前に作って所有する（worker は fd を継承して使う。
     // 同名の既存を後始末で止めないため。#1466）。配置の記録が無ければ `identify_pid1` が先に拒否しここへ来ない。
     let child_cgroup = child_cgroup.ok_or_else(|| {
@@ -2680,7 +2933,15 @@ fn run_with_target(
             "exec stage CgroupJoin: the exec child cgroup was not created",
         )
     })?;
-    let result = run_in_child_cgroup(proof, target, request, deadline, child_cgroup, listener, io);
+    let result = run_in_child_cgroup(
+        proof,
+        target,
+        request,
+        deadline,
+        child_cgroup,
+        (listener, pty_sender),
+        io,
+    );
     // 成否によらず、コマンドの子孫を子 cgroup ごと止める（exec の終了後に子孫を残さない。削除は呼び出しプロセスが行う）。
     // 失敗しても呼び出しプロセスの後始末が改めて `cgroup.kill` する。
     let _ = child_cgroup.kill_all();
@@ -2694,9 +2955,10 @@ fn run_in_child_cgroup(
     request: &ExecRequest,
     deadline: Deadline,
     child_cgroup: &ExecChildCgroup,
-    listener: ExecListenerSender,
+    senders: (ExecListenerSender, Option<ExecPtySender>),
     io: WorkerIo<'_>,
 ) -> Result<ExecOutcome, WorkerError> {
+    let (listener, pty_sender) = senders;
     // 参加する cgroup の準備（参加の前に済ませる。失敗しても呼び出し側が子 cgroup の後始末を行う）。
     let cgroup = prepare_cgroup_join_staged(target)?;
     // `config.json` は 1 回だけ読み、制限の準備とコマンドの環境の両方に使う（同じ定義から導く）。
@@ -2751,9 +3013,26 @@ fn run_in_child_cgroup(
     })?;
     let ready = require_exec_ready_staged(report)?;
     deadline.remaining("starting the command")?;
-    // 指定された番号があれば、worker が継承した fd の複製（close-on-exec）をコマンドの子の stdin / stdout / stderr にする。
-    let dup =
-        |fd: Option<BorrowedFd<'_>>, msg: &'static str| -> Result<Option<OwnedFd>, WorkerError> {
+    let stdio = if io.tty {
+        // tty の exec: 再適用の後に、コマンドと同じ権利でコンテナの devpts から pty を割り当てる（ホストの devpts は
+        // 使わない。SEC-1）。master はコマンドの fork **前** に親へ送って閉じる（コマンドとその子孫に master を継承させない）。
+        // 送信は ACK を待たない（SEQPACKET の buffer に積むだけ）。親が拒否しても、親の取り消しで worker ごと止められる。
+        let sender = pty_sender.ok_or_else(|| {
+            TraitError::new(
+                ErrorCode::Internal,
+                "exec stage Spawn: the pty channel was not provided",
+            )
+        })?;
+        let (master, slave) = ready
+            .allocate_pty(EXEC_PTY_INITIAL_SIZE)
+            .map_err(from_exec_error_staged)?;
+        sender.hand_over(master).map_err(from_exec_error_staged)?;
+        ChildStdio::from_pty_slave(slave).map_err(from_exec_error_staged)?
+    } else {
+        // 指定された番号があれば、worker が継承した fd の複製（close-on-exec）をコマンドの子の stdin / stdout / stderr にする。
+        let dup = |fd: Option<BorrowedFd<'_>>,
+                   msg: &'static str|
+         -> Result<Option<OwnedFd>, WorkerError> {
             fd.map(|fd| {
                 fd.try_clone_to_owned()
                     .map_err(|_| TraitError::new(ErrorCode::Internal, msg))
@@ -2761,21 +3040,22 @@ fn run_in_child_cgroup(
             .transpose()
             .map_err(Into::into)
         };
-    let stdio = ChildStdio::from_fds(
-        dup(
-            io.stdio.stdin,
-            "exec stage Spawn: failed to duplicate the exec stdin",
-        )?,
-        dup(
-            io.stdio.stdout,
-            "exec stage Spawn: failed to duplicate the exec stdout",
-        )?,
-        dup(
-            io.stdio.stderr,
-            "exec stage Spawn: failed to duplicate the exec stderr",
-        )?,
-    )
-    .map_err(from_exec_error_staged)?;
+        ChildStdio::from_fds(
+            dup(
+                io.stdio.stdin,
+                "exec stage Spawn: failed to duplicate the exec stdin",
+            )?,
+            dup(
+                io.stdio.stdout,
+                "exec stage Spawn: failed to duplicate the exec stdout",
+            )?,
+            dup(
+                io.stdio.stderr,
+                "exec stage Spawn: failed to duplicate the exec stderr",
+            )?,
+        )
+        .map_err(from_exec_error_staged)?
+    };
     let child = spawn_exec_command_with_stdio(ready, &command, child_cgroup, stdio)
         .map_err(from_exec_error_staged)?;
     // コマンドの pid（4 バイト）と pidfd を親（stream-exec の helper）へ 1 回で渡す（pidfd は SIGKILL 以外のシグナルの宛先。
@@ -4009,12 +4289,67 @@ mod tests {
             Deadline::after(Duration::from_secs(5)),
             ExecResponder::new(&NoRecordSink, None, NotifyConfig::default()),
             None,
+            None,
             || Err(TraitError::new(ErrorCode::AlreadyExists, "exists")),
             || panic!("cleanup must not run for a cgroup we did not create"),
-            |_, _, _| panic!("worker must not run"),
+            |_, _, _, _| panic!("worker must not run"),
         )
         .unwrap_err();
         assert_eq!(err.error.code(), ErrorCode::AlreadyExists);
+    }
+
+    /// SEC-1・REPAIR-2（#4416）: tty の exec（`ExecLaunchIo::pty`）と stdio の fd の併用は、cgroup の作成・fork より前に
+    /// `InvalidArgument` で拒否される（コマンドの fd 0〜2 は slave になるため。pidfd や記録の中身は見ない）。
+    #[test]
+    fn sec1_4416_pty_with_stdio_fds_is_rejected_before_any_work() {
+        let (sock, _peer) = UnixStream::pair().unwrap();
+        let pty_hook = |_master: PtyMaster| -> Result<(), TraitError> {
+            panic!("the pty hook must not run when the combination is rejected")
+        };
+        let rec = record(ContainerStatus::created(cid(), None));
+        let request = ExecRequest::new("/bin/echo", ["/bin/echo".to_string()]).unwrap();
+        let null = std::fs::File::open("/dev/null").unwrap();
+        for (label, stdio) in [
+            (
+                "stdin",
+                ExecStdio {
+                    stdin: Some(sock.as_fd()),
+                    ..ExecStdio::NONE
+                },
+            ),
+            (
+                "stdout",
+                ExecStdio {
+                    stdout: Some(sock.as_fd()),
+                    ..ExecStdio::NONE
+                },
+            ),
+            ("combined", ExecStdio::combined(sock.as_fd())),
+        ] {
+            let err = run_command_with_pidfd_output_notify(
+                &rec,
+                null.as_fd(),
+                &request,
+                Duration::from_secs(5),
+                &NoRecordSink,
+                ExecLaunchIo {
+                    launch_env: &[],
+                    stdio,
+                    on_created: None,
+                    cancel: None,
+                    signal: None,
+                    pty: Some(&pty_hook),
+                },
+            )
+            .unwrap_err();
+            assert_eq!(err.error.code(), ErrorCode::InvalidArgument, "{label}");
+            assert_eq!(
+                err.error.message(),
+                "exec stage Spawn: a tty exec cannot take stdio fds",
+                "{label}"
+            );
+        }
+        assert!(!stdio_has_fd(&ExecStdio::NONE));
     }
 
     /// 記録を捨てる記録先（応答者を作る試験の入力）。

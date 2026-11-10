@@ -397,6 +397,7 @@ fn execute(args: &HealthExecArgs) -> HealthExecLine {
             on_created: Some(&notify),
             cancel: None,
             signal: None,
+            pty: None,
         },
     );
     line_from_result(result)

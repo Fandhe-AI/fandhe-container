@@ -226,6 +226,7 @@ mod linux {
         stdio_is_routed_per_stream(&work.0);
         pty_slave_becomes_the_controlling_terminal(&work.0);
         pty_master_is_handed_over_and_validated();
+        pty_try_receive_is_nonblocking_and_validates();
         println!("exec_child_setup: all scenarios passed");
     }
 
@@ -1087,6 +1088,81 @@ exec "$2" "$3" "$1""#;
             PtyReceipt::SenderClosed
         ));
         let _ = child.wait_timeout(timeout());
+    }
+
+    /// SUP-6・SEC-1・REPAIR-5（#4416）: `try_receive` は待たずに受信する。届く前は `None`、届けば検証して `Received`、
+    /// master でない fd は `Rejected`、何も送らず閉じた worker は `SenderClosed`。
+    fn pty_try_receive_is_nonblocking_and_validates() {
+        use fandhe_container_core::seccomp::ErrnoDelivery;
+        // (a) 正しい master: worker が送るまで `None`、送った後の最初の `Some` が `Received`。
+        let (child, _listener, pty) =
+            spawn_exec_worker_with_listener_and_pty(ErrnoDelivery::Errno, |_proof, _l, sender| {
+                std::thread::sleep(Duration::from_millis(300));
+                let Ok((master, _slave)) = open_host_pty_for_test(WindowSize::new(24, 80)) else {
+                    return 1;
+                };
+                i32::from(sender.hand_over(master).is_err())
+            })
+            .expect("spawn the worker");
+        let started = Instant::now();
+        assert!(
+            pty.try_receive(&child).is_none(),
+            "nothing is delivered before the worker sends"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "try_receive must not block"
+        );
+        let poll_deadline = Instant::now() + timeout();
+        let receipt = loop {
+            if let Some(r) = pty.try_receive(&child) {
+                break r;
+            }
+            assert!(Instant::now() < poll_deadline, "the master never arrived");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        match receipt {
+            PtyReceipt::Received(master) => {
+                assert_eq!(master.window_size().expect("size"), WindowSize::new(24, 80));
+            }
+            other => panic!("expected a master, got {other:?}"),
+        }
+        assert_eq!(
+            child.wait_timeout(timeout()).expect("wait"),
+            ChildExit::Exited(0)
+        );
+        // (b) master でない fd は拒否する。
+        let (child, _listener, pty) =
+            spawn_exec_worker_with_listener_and_pty(ErrnoDelivery::Errno, |_proof, _l, sender| {
+                let Ok(null) = fs::File::open("/dev/null") else {
+                    return 1;
+                };
+                use std::os::fd::AsFd as _;
+                i32::from(sender.hand_over_non_pty_for_test(null.as_fd()).is_err())
+            })
+            .expect("spawn the worker");
+        let poll_deadline = Instant::now() + timeout();
+        let receipt = loop {
+            if let Some(r) = pty.try_receive(&child) {
+                break r;
+            }
+            assert!(Instant::now() < poll_deadline, "no message arrived");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        match receipt {
+            PtyReceipt::Rejected(e) => assert_eq!(e.code, ErrorCode::InvalidArgument),
+            other => panic!("expected a rejection, got {other:?}"),
+        }
+        let _ = child.wait_timeout(timeout());
+        // (c) 何も送らずに終わった worker は閉鎖として区別される。
+        let (child, _listener, pty) =
+            spawn_exec_worker_with_listener_and_pty(ErrnoDelivery::Errno, |_proof, _l, _s| 0)
+                .expect("spawn the worker");
+        let _ = child.wait_timeout(timeout());
+        assert!(matches!(
+            pty.try_receive(&child),
+            Some(PtyReceipt::SenderClosed)
+        ));
     }
 
     /// SUP-6・SEC-1・TASK-163.4 / 追補（#1460）: 子は呼び出し側から継承した fd 3 以上をすべて閉じ、残るのは

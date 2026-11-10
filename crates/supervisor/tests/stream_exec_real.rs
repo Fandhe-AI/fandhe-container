@@ -10,6 +10,12 @@
 //! - `echo`: `Started` の後に `Result(Exited(0))`。stdout は `se-stdout-line\n`、stderr は `se-stderr-line\n` と別々に一致する。
 //! - `exit3`: `Result(Exited(3))`。
 //! - `stdin`: 渡した stdin のバイト列（`se-stdin-payload\n`）がコマンドの stdout に戻る。
+//! - `tty`（CRI-6・SUP-6・SEC-1・REPAIR-12・#4416）: `--tty` の helper が、最初の 3 frame を `Started`・`PtyMaster`・`Spawned`（pid > 0）の
+//!   順で返す。受け取った master へ書いた行がコンテナ内のコマンドへ届いて応答が返る（canonical モードの echo と `ONLCR` により
+//!   `se-tty-pong\r\n`）。コマンドの fd 0 は `/dev/pts/N`（コンテナの devpts）で制御端末（`tty_nr` が 0 でない）を持つ。master を
+//!   `TIOCSWINSZ` で 30 行 100 列に resize すると、コマンドの端末サイズの読み取り（`stty size` と同じ形式 `<rows> <cols>`）が `30 100` になる。
+//!   `stty size` の代わりにコマンド自身が `TIOCGWINSZ` を読む理由: 最小 rootfs に `stty` もシェルも無く、ホストの `stty`（uutils）は共有ライブラリを
+//!   引くためコピーが不安定なため（試験専用入口 `terminal_window_size_for_test`）。終了は `exit` 行で `Result(Exited(0))`。
 //! - `mask_mismatch`（SUP-6・SEC-1・REPAIR-12・#4327）: helper の期待 mask と送る fd の組が食い違う 2 方向（余分な stdin・足りない stdin）で、
 //!   最初のメッセージが `Result(Failed(InvalidArgument))`（`Started`・`Spawned` 無し）、helper は終了コード 0、fd 2（socketpair）の診断行が
 //!   `{"component":"supervisor.stream_exec","stage":"helper_stdio_handover","code":"INVALID_ARGUMENT","errno":"none"}` に完全一致し、
@@ -41,7 +47,7 @@
 //! 各シナリオは `DelegatedCgroup::prepare` が自プロセスを退避リーフへ移すため、試験自身が
 //! `systemd-run --user --scope -p Delegate=yes` の子プロセス（`--scenario`）で実行する（外側を包まない）。
 //!
-//! 成功時の最終行: `stream_exec_real: real stream-exec helper ran commands in a rootless container and reported exit codes, separate stdio, stdin and the disconnect stop (root=false)`。
+//! 成功時の最終行: `stream_exec_real: real stream-exec helper ran commands in a rootless container and reported exit codes, separate stdio, stdin, tty and the disconnect stop (root=false)`。
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
@@ -289,6 +295,53 @@ mod linux {
                 }
                 std::process::exit(8);
             }
+            Some("tty") => {
+                // 制御端末つきの対話コマンド（tty の照合用。#4416）。stdin の行を読んで 1 行で応答する。
+                use std::io::BufRead as _;
+                use std::os::fd::AsFd as _;
+                let stdin = std::io::stdin();
+                let mut out = std::io::stdout();
+                let deadline = Instant::now() + PROBE_LIFETIME;
+                let mut line = String::new();
+                while Instant::now() < deadline {
+                    line.clear();
+                    match stdin.lock().read_line(&mut line) {
+                        Ok(0) | Err(_) => std::process::exit(5),
+                        Ok(_) => {}
+                    }
+                    let reply = match line.trim_end() {
+                        "ping" => "se-tty-pong".to_owned(),
+                        "ident" => {
+                            let fd0 = std::fs::read_link("/proc/self/fd/0")
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_default();
+                            // tty_nr は /proc/self/stat の第 7 欄（コマンド名の `)` の後の 5 番目）。
+                            let tty_nr = std::fs::read_to_string("/proc/self/stat")
+                                .ok()
+                                .and_then(|t| {
+                                    t.rsplit_once(')').and_then(|(_, rest)| {
+                                        rest.split_whitespace().nth(4).map(str::to_owned)
+                                    })
+                                })
+                                .unwrap_or_default();
+                            format!("ident {fd0} tty_nr={tty_nr}")
+                        }
+                        "size" => {
+                            match fandhe_container_core::exec::terminal_window_size_for_test(
+                                stdin.as_fd(),
+                            ) {
+                                Ok(sz) => format!("{} {}", sz.rows(), sz.cols()),
+                                Err(_) => std::process::exit(7),
+                            }
+                        }
+                        "exit" => std::process::exit(0),
+                        _ => std::process::exit(6),
+                    };
+                    let _ = writeln!(out, "{reply}");
+                    let _ = out.flush();
+                }
+                std::process::exit(8);
+            }
             Some("ready-sleep") => {
                 // 終わらないコマンド（要求元の消滅の照合用）。最初に 1 回だけ READY を書き、あとは静かに待つ。
                 // 書き続けない理由: 目標の 2 秒は「消滅の時点で seccomp の通知を処理中でない」ことが条件のため。
@@ -424,7 +477,7 @@ mod linux {
         };
         assert!(status.success(), "the scenario failed: {status}");
         println!(
-            "stream_exec_real: real stream-exec helper ran commands in a rootless container and reported exit codes, separate stdio, stdin and the disconnect stop (root=false)"
+            "stream_exec_real: real stream-exec helper ran commands in a rootless container and reported exit codes, separate stdio, stdin, tty and the disconnect stop (root=false)"
         );
         ExitCode::SUCCESS
     }
@@ -610,8 +663,18 @@ mod linux {
             vec!["/probe".into(), "--se-cmd".into(), mode.into()],
         )
         .expect("stream-exec args");
+        spawn_args(ctx, &args, send, helper_stderr)
+    }
+
+    /// 組み立て済みの引数で helper を起動し、`send` の fd を渡す（`spawn_with` と tty の試験の共通部）。
+    fn spawn_args(
+        ctx: &Ctx,
+        args: &StreamExecArgs,
+        send: &StdioSend<'_>,
+        helper_stderr: HelperStderr,
+    ) -> RawSpawned {
         let (plugin, helper_end) = UnixStream::pair().expect("socketpair");
-        let mut command = stream_exec_command(&ctx.exe, &args);
+        let mut command = stream_exec_command(&ctx.exe, args);
         let mut diag_parent: Option<UnixStream> = None;
         command
             .stdin(Stdio::from(OwnedFd::from(helper_end)))
@@ -1028,6 +1091,124 @@ mod linux {
         );
     }
 
+    /// master の複製を読み続け、読んだバイト列を共有バッファへ積む（別スレッド。slave が閉じれば `EIO` で終わる）。
+    fn pump_master(master: &fandhe_container_core::exec::PtyMaster) -> Arc<Mutex<Vec<u8>>> {
+        let dup = master.as_fd().try_clone_to_owned().expect("dup the master");
+        let mut file = File::from(dup);
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let shared = Arc::clone(&buf);
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 512];
+            while let Ok(n) = file.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                shared
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(&chunk[..n]);
+            }
+        });
+        buf
+    }
+
+    /// 共有バッファが `needle` を含むまで待つ（期限つき）。含んだ時点の全内容を返す。
+    fn wait_for(buf: &Arc<Mutex<Vec<u8>>>, needle: &str) -> String {
+        let deadline = Instant::now() + timeout();
+        loop {
+            let text = String::from_utf8_lossy(
+                &buf.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )
+            .into_owned();
+            if text.contains(needle) {
+                return text;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {needle:?}; got {text:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// tty: `--tty` の helper が `Started`・`PtyMaster`・`Spawned` の順に返し、master 経由の往復・制御端末・resize が効く
+    /// （CRI-6・SUP-6・SEC-1・#4416）。
+    fn tty(ctx: &Ctx) {
+        use fandhe_container_core::exec::WindowSize;
+        let args = StreamExecArgs::new(
+            ctx.state_root.clone(),
+            ctx.id.clone(),
+            ctx.pid,
+            Duration::from_millis(60_000),
+            StdioMask::from_presence(false, false, false),
+            vec!["/probe".into(), "--se-cmd".into(), "tty".into()],
+        )
+        .expect("stream-exec args")
+        .with_tty()
+        .expect("tty args");
+        let mut sp = spawn_args(ctx, &args, &StdioSend::default(), HelperStderr::Inherit);
+        let first = recv_from_helper(&sp.plugin, Instant::now() + timeout()).expect("started");
+        assert!(matches!(first, HelperMessage::Started(_)), "{first:?}");
+        let second = recv_from_helper(&sp.plugin, Instant::now() + timeout()).expect("pty master");
+        let HelperMessage::PtyMaster(master) = second else {
+            panic!("PtyMaster must follow Started, got {second:?}");
+        };
+        let third = recv_from_helper(&sp.plugin, Instant::now() + timeout()).expect("spawned");
+        let HelperMessage::Spawned { pid } = third else {
+            panic!("Spawned must follow PtyMaster, got {third:?}");
+        };
+        assert!(pid.get() > 0);
+        let buf = pump_master(&master);
+        let mut writer = File::from(master.as_fd().try_clone_to_owned().expect("dup master"));
+        // 往復: canonical モードの echo と ONLCR で応答は `\r\n` で終わる。
+        writer.write_all(b"ping\n").expect("write ping");
+        wait_for(&buf, "se-tty-pong\r\n");
+        // 制御端末: fd 0 はコンテナの devpts の slave で、tty_nr が 0 でない。
+        writer.write_all(b"ident\n").expect("write ident");
+        let text = wait_for(&buf, "tty_nr=");
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("ident "))
+            .expect("ident line")
+            .trim_end()
+            .to_owned();
+        let mut parts = line.split_whitespace();
+        let (_, path, nr) = (
+            parts.next(),
+            parts.next().expect("path"),
+            parts.next().expect("tty_nr"),
+        );
+        assert!(
+            path.starts_with("/dev/pts/"),
+            "fd 0 must be a container devpts slave: {line}"
+        );
+        assert!(
+            nr.strip_prefix("tty_nr=")
+                .is_some_and(|n| !n.is_empty() && n != "0"),
+            "the command must have a controlling terminal: {line}"
+        );
+        // resize の反映: `stty size` 相当の出力が送った行・列と一致する。
+        master.resize(WindowSize::new(30, 100)).expect("resize");
+        writer.write_all(b"size\n").expect("write size");
+        wait_for(&buf, "30 100\r\n");
+        writer.write_all(b"exit\n").expect("write exit");
+        match recv_from_helper(&sp.plugin, Instant::now() + timeout()).expect("result") {
+            HelperMessage::Result(o) => assert_eq!(o, StreamExecOutcome::Exited(0)),
+            other => panic!("expected Result, got {other:?}"),
+        }
+        assert_eq!(wait_child(&mut sp.child), Some(0), "the helper must exit 0");
+        assert_eq!(
+            live_pids_with_argv(&["/probe", "--se-cmd", "tty"]),
+            Vec::<(u32, u64)>::new(),
+            "no tty command may remain"
+        );
+        drop(master);
+        println!(
+            "stream_exec_real: scenario=tty frames were started, pty_master, spawned in order; the echo round trip, the controlling terminal on the container devpts and the stty-size output 30 100 after the resize matched"
+        );
+    }
+
     /// 拒否された起動の観測結果。
     struct Rejected {
         first: HelperMessage,
@@ -1261,6 +1442,8 @@ mod linux {
         assert!(f.spawned.is_some(), "Spawned must precede the result");
         assert_eq!(f.stdout, b"se-stdin-payload\n".to_vec());
         println!("stream_exec_real: scenario=stdin payload echoed back");
+
+        tty(ctx);
 
         // 拒否の経路（kind 6 の後の段のため、supervisor が居る間に回す。orphan より前）。
         mask_mismatch(ctx, hostdata);

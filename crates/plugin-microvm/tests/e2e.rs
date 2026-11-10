@@ -234,6 +234,7 @@ mod mock_core {
                     reason: "requested",
                     ioevent: r.stop_ioevent,
                     unmap_failures: r.stop_unmap,
+                    vm_unmap_failures: None,
                 }),
             }
         }
@@ -335,6 +336,7 @@ mod mock_core {
                 reason: "requested",
                 ioevent: None,
                 unmap_failures: None,
+                vm_unmap_failures: None,
             })
         }
 
@@ -477,7 +479,8 @@ fn task117_plug1_repair5_shutdown_flag_stops_running_vm_and_ignores_later_reques
             failed: 0,
             remaining: 0,
             ioevent: None,
-            unmap_failures: None
+            unmap_failures: None,
+            vm_unmap_failures: None
         }
     );
     let r = record.lock().expect("lock");
@@ -527,7 +530,8 @@ fn task117_4_plug1_mvm1_ping_start_stop_roundtrip_via_uds() {
             failed: 0,
             remaining: 0,
             ioevent: None,
-            unmap_failures: None
+            unmap_failures: None,
+            vm_unmap_failures: None
         }
     );
 }
@@ -704,7 +708,8 @@ fn task117_4_mvm1_disconnect_with_running_vm_is_reclaimed_by_stop_all() {
             failed: 0,
             remaining: 0,
             ioevent: None,
-            unmap_failures: None
+            unmap_failures: None,
+            vm_unmap_failures: None
         }
     );
     let stops = record.lock().expect("lock").stops.clone();
@@ -744,7 +749,8 @@ fn mvm1_repair4_4438_disconnect_stop_all_sums_counts_into_result_line() {
             failed: 0,
             remaining: 0,
             ioevent: Some(IoEventCounts::new(4, 2)),
-            unmap_failures: Some(6)
+            unmap_failures: Some(6),
+            vm_unmap_failures: None
         }
     );
     assert_eq!(
@@ -1446,10 +1452,11 @@ mod real_hvf {
             !us.is_empty() && us.bytes().all(|b| b.is_ascii_digit()),
             "{line}"
         );
+        // 末尾の ` vm_unmap_failures=0` は #4455（adapter が `None` のままなら不一致になる）。
         assert_eq!(
             line,
             format!(
-                "level=info op=plugin.microvm.stop outcome=ok elapsed_us={us} vms=0 unmap_failures=0"
+                "level=info op=plugin.microvm.stop outcome=ok elapsed_us={us} vms=0 unmap_failures=0 vm_unmap_failures=0"
             ),
             "{err}"
         );

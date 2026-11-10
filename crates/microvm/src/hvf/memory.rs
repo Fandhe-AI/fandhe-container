@@ -32,7 +32,7 @@
 //! - `Sync`: 不要（共有は `Arc<Mutex<..>>`。`Send` は #4024 で導入済み）。
 //! - 期限切れで切り離したスレッドの資源の回収: #4032 で実装済み（vCPU スレッドの終了時に最後の `Arc` で回収。実機での確認は #4034。成功は vCPU スレッドでの遅延回収時に `op=hvf.deferred_reclaim` の行で出る・#4146）。
 //! - IPA の上限の値は既定の 36 ビット（実機の値は #3997）。`register` はレイアウトの上限を、`HvVm::map` は既定の上限を検査する（#3844）。
-//! - 解除失敗の記録は `sys::hvf::GuestMapping` の drop が 1 行出す（`op=hvf.vm_unmap`。#4032）。その後の munmap の失敗は `HostMapping` の drop が 1 行出す（`op=hvf.host_unmap`。#4292）。構造化ログ基盤は未導入。 件数は `HvfStopReport::unmap_failures` と停止の集約行（`op=hvf.microvm.stop` / `drop`）の `unmap_failures=` にも載る（#4411）。
+//! - 解除失敗の記録は `sys::hvf::GuestMapping` の drop が 1 行出す（`op=hvf.vm_unmap`。#4032）。その後の munmap の失敗は `HostMapping` の drop が 1 行出す（`op=hvf.host_unmap`。#4292）。構造化ログ基盤は未導入。 件数は `HvfStopReport::unmap_failures` と停止の集約行（`op=hvf.microvm.stop` / `drop`）の `unmap_failures=` にも載る（#4411）。`hv_vm_unmap` の失敗件数は別カウンタで `HvfStopReport::vm_unmap_failures` と集約行の ` vm_unmap_failures=` に載り、`op=hvf.vm_unmap` の行数と一致する（#4439）。
 
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::guest_memory::{GuestAddress, GuestMemory, GuestMemoryBacking};

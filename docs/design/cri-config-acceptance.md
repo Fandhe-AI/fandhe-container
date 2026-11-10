@@ -308,7 +308,7 @@ CRI の `namespace_options.network` は既定が `POD` で、netns は sandbox �
 | -- | ---- |
 | net | `create_container_netns`（作成と pin だけを切り出した入口。安全性の検査は `attach_container` と同じ関数）・`attach_prepared_container`（事前作成の netns へ接続。失敗時は veth・IPAM・受け口を戻すが netns は unpin せず返す）・`release_container_netns` |
 | plugin-cri `netsetup` | `LinuxNetsetup::create_netns` が事前作成してハンドルを保持し、`attach` が使う。`detach`（未 attach）・`delete_network` が未 attach の netns を解放する。解放に失敗したら記録を残す |
-| plugin-cri `pod_network` | `set_up_sandbox`（`create_network` → `create_netns` → `attach`。失敗は逆順に戻す）・`NetsetupPodNetwork`（cri の `PodNetworkProvider` の実装）・`PodSubnetPool`（pod ごとのサブネットの払い出し。上限つき） |
+| plugin-cri `pod_network` | `set_up_sandbox`（`create_network` → `create_netns` → `attach`。失敗は逆順に戻す。成功時は `attach` の応答も返す）・`NetsetupPodNetwork`（cri の `PodNetworkProvider` の実装。割り当てアドレスを `with_ips` で報告する。#4384）・`PodSubnetPool`（pod ごとのサブネットの払い出し。上限つき） |
 | cri | `PodNetworkProvider`（注入点）。`RunPodSandbox`（`POD`）が `set_up`、`StopPodSandbox`・`RemovePodSandbox` が `tear_down`、`CreateContainer` が `BundleRequest::pod_netns_path` で bundle へ渡す。`POD` でパスがあるときだけ `{"type":"network","path":…}` を出す |
 
 | CRI の要求 | 結果 |
@@ -327,7 +327,7 @@ CRI の `namespace_options.network` は既定が `POD` で、netns は sandbox �
 - 本番の plugin-cri は rootless で、bridge・veth の pin は初期 user namespace の `CAP_NET_ADMIN`・`CAP_SYS_ADMIN` を要するため作れない。rootless の pod netns は pasta 構成（NET-9。#1935 系）の領域で、rootful は #2241 のオーナー承認待ち
 - net にコンテナ単位の切り離しが無いため、pod ごとにネットワーク（bridge と nft テーブル）を作って `delete_network` で一括解放する。共有ネットワークと per-container の detach への移行は後続（CORE-9 の資源効率）
 - 未 attach の事前作成 netns は route ソケットの fd を 1 本保持する（件数は `MAX_NETWORKS` × `MAX_CONTAINERS_PER_NETWORK` で有界）。状態はプロセスのメモリだけで、plugin の再起動で失われる
-- `port_mappings` は下記「port_mappings の受け入れ方式」（#2676）。`PodSandboxStatus` の `network` は `PodNetworkProvider::set_up` が `PodNetns::with_ips` で報告した IP だけを返す（#2873・CRI-2・NET-3。推測しない。provider が無い・NODE・無報告・Stop の tear_down 成功後・plugin-cri の再起動後の再採用では空。報告は射影形の正規化・禁止範囲・重複・追加 8 件の上限で検証し、違反は INTERNAL）。本番の plugin-cri は provider 未注入のため実際には空
+- `port_mappings` は下記「port_mappings の受け入れ方式」（#2676）。`PodSandboxStatus` の `network` は `PodNetworkProvider::set_up` が `PodNetns::with_ips` で報告した IP だけを返す（#2873・CRI-2・NET-3。推測しない。provider が無い・NODE・無報告・Stop の tear_down 成功後・plugin-cri の再起動後の再採用では空。報告は射影形の正規化・禁止範囲・重複・追加 8 件の上限で検証し、違反は INTERNAL）。本番の plugin-cri は provider 未注入のため実際には空。`NetsetupPodNetwork` を注入した場合は `attach` の割り当てアドレスを報告し、応答が sandbox と一致しなければ空、cri が拒否する値なら INTERNAL で巻き戻す（#4384。下記「pod の IP の報告」）
 - `PodSandboxStatus.linux` は、記録した config の `linux.security_context.namespace_options`（network・pid・ipc・target_id・userns_options）を無改変で `linux.namespaces.options` に返す（#4383・CRI-2。containerd と同じ）。未指定でも `linux` と `namespaces` は常にあり、`options` は空（既定値の `POD` などは補わない）。kubelet の `PodSandboxChanged` が network のモードを pod の期待値と比べ、食い違うと sandbox を作り直すため、hostNetwork（`NODE`）の pod の作り直しの繰り返しを防ぐ。記録の config から作るので plugin-cri の再起動後の再採用でも返り、Stop の後も変わらない。保持役の pid や ns のパスなど実行時の内部状態は載せない
 - 実機（root）の試験は `crates/net/tests/network_attach_privileged.rs` に準備したが、本変更では未実行
 
@@ -531,6 +531,25 @@ CreateContainer の時点で `ImageRootfsSource` が在庫（`ImageStore`）で�
 - コンテナの記録は create 時のスナップショットなので読み替えない
 
 残る差（意図的）: 補助 digest の併記による件数の差、タグのスナップショット（上記）。
+
+## pod の IP の報告（kubelet・containerd。CRI-2・NET-3・REPAIR-3。#4384）
+
+`NetsetupPodNetwork::set_up` は `attach` の応答（`AttachResponse`。アドレスは必須で、Option ではない）の `address()` を、cri の `PodNetns::with_ips(addr, vec![])` で報告する。IPv4 のプールだけなので主 IP 1 件・追加 IP 0 件になる。
+
+- 応答の `network()`・`container()` が sandbox ID と一致しないときは報告しない（`PodSandboxStatus.network` は空。リースのサブネットから推測しない）
+- 一致しても `with_ips` が拒否する値（未指定・loopback・multicast・0/8・240/4）は `INTERNAL`（固定文言）で失敗させ、`delete_network` で巻き戻す。巻き戻しを確認できたときだけ今回払い出した枠を返す。巻き戻しに失敗したら枠は保持し、cri の `tear_down` で再試行する
+- サブネット包含・prefix 長は `NetworkPlugin` の契約 10 で plugin 実装側の責務のため、ここでは再検査しない
+
+### 外部の事実の照合（2026-11-10 確認。kubernetes `v1.37.1`〔`f78e722310e50bcaca9276be22276d9e91d91308`〕・containerd `v2.4.2`〔`b7a25261e029d68978bbf290df0a62fc819b3c51`〕）
+
+| 事実 | 出典 | 結果 |
+| ---- | ---- | ---- |
+| kubelet は `network.ip` が空でなければ解析し、解析できなければ追加 IP を含め全体を捨てる（`nil`）。`additional_ips` も同様に解析する | kubernetes `pkg/kubelet/kuberuntime/kuberuntime_sandbox.go` の `determinePodSandboxIPs`（L289〜） | 本実装は解析できる正規化済みの値だけを報告するため、全体が捨てられる事態にならない |
+| kubelet は並びを信用せず、ノード IP と同じファミリーの最初の 1 件、次に反対ファミリーの最初の 1 件だけを使う（最大 2 件） | kubernetes `pkg/kubelet/kubelet_pods.go` の `sortPodIPs`（L2064〜） | 主 IP 1 件のみの報告で足りる。`MAX_POD_ADDITIONAL_IPS`（8）は kubelet の意味論ではなくメモリを有界にする値で、kubelet は 8 件まで読んでも使わない |
+| containerd は CNI 結果が 1 件ならそれを主 IP とする。複数なら `ip_pref`（既定 ipv4）のファミリーの最初を主 IP、それ以外を追加 IP にする | containerd `internal/cri/server/sandbox_run.go` の `selectPodIPs`（L629〜） | 主 IP を先頭に置く点と整合。IPv4 のみの報告は既定の ipv4 優先と同じ結果 |
+| containerd の Status は `sandbox.IP` を `network.ip`、`AdditionalIPs` を `additional_ips` に写す。値の検証はしない | containerd `internal/cri/server/sandbox_status.go`（L113・L154〜163） | 本実装の検証（loopback 等の拒否）のほうが厳しい |
+
+結論: kubelet・containerd が要求する形（主 IP は解析可能、追加 IP は主 IP の後）に対し、現行の `with_ips` の検証に違反はなく、cri のコードは変更しない。既知の差は、(1) loopback・未指定・multicast・0/8・240/4 を拒否する（containerd は通す）、(2) 追加 IP の上限 8 件（kubelet が使うのは最大 2 件）の 2 点で、いずれも安全側。再起動後の IP の永続は #2941、本番への注入は未決のまま。
 
 ### PodSandboxStatus.linux（containerd・kubelet。CRI-2・#4383）
 

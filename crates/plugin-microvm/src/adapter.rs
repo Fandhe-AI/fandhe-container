@@ -37,7 +37,9 @@
 //! KVM は `StopReport::unmap_failures` の VM ごとの値で、`op=microvm.vcpus_stopped` の `unmap_failures=` と同じ。ホストのメモリのリークの兆候。
 //! HVF は `HvfStopReport::unmap_failures`（ゲスト RAM の backing の munmap のみ。`hv_vm_unmap` の失敗は含まない）の VM ごとの値で、
 //! `op=hvf.microvm.stop` の `unmap_failures=` と同じ。#4411・#4437）。
-//! ioeventfd の件数と独立に出し（順序は ioevent → unmap）、持たない backend〔試験の偽 backend 等。`UnsupportedBackend` は VM を作れず該当しない〕は従来の行。
+//! HVF はさらに続けて ` vm_unmap_failures=K` を 0 件でも足す（`hv_vm_unmap` の失敗。`HvfStopReport::vm_unmap_failures` の VM ごとの値で、
+//! `op=hvf.microvm.stop` の同名キー・`op=hvf.vm_unmap` の行数と同じ。`unmap_failures` とは互いに素。#4455・MVM-5・REPAIR-4）。KVM・偽 backend は `None` で出さない。
+//! ioeventfd の件数と独立に出し（順序は ioevent → unmap → vm_unmap）、持たない backend〔試験の偽 backend 等。`UnsupportedBackend` は VM を作れず該当しない〕は従来の行。
 //! 終了時の一括停止の行（`op=plugin.microvm.stop_all`）には、止めた VM の件数を同じ固定キーと順序で合算して末尾に足す（#4438・MVM-1・REPAIR-4。[`StopAllReport::result_line`]）。
 //! 合算は項目ごとに独立で、`Some` を返した VM だけを足し、全 VM が `None`（0 台を含む）の項目は出さない。予算切れで切り離した VM も `stop` が `Ok` なら含め、
 //! `Err`（`failed`）の VM は件数を持たないため含めない（`failed` や切り離しがあるとき合算は下限）。MMIO exit 経路で捨てた通知の件数は未実装。
@@ -199,6 +201,9 @@ pub struct StopOutcome {
     /// munmap の失敗件数。KVM は `kvm_run` とゲスト RAM の合計（#4410）、HVF はゲスト RAM の backing のみ
     /// （`hv_vm_unmap` の失敗は含まない。#4437）。持たない backend は `None`（0 と偽らない）。
     pub unmap_failures: Option<u64>,
+    /// `hv_vm_unmap` の失敗件数（HVF の `HvfStopReport::vm_unmap_failures`。`unmap_failures` とは互いに素。#4455・MVM-5・REPAIR-4）。
+    /// 期限切れ・遅延回収で後から回収する分は含まない（`op=hvf.deferred_reclaim`）。持たない backend は `None`（0 と偽らない）。
+    pub vm_unmap_failures: Option<u64>,
 }
 
 /// stop の結果行に載せる backend の件数（観測専用。応答や成否には影響しない。#4161・#4410）。
@@ -207,6 +212,7 @@ pub struct StopOutcome {
 struct StopLineCounts {
     ioevent: Option<IoEventCounts>,
     unmap_failures: Option<u64>,
+    vm_unmap_failures: Option<u64>,
 }
 
 /// microVM 本体への委譲境界。3 OS でビルドでき、KVM なしの試験で差し替えられる。
@@ -285,6 +291,8 @@ impl MicrovmBackend for KvmBackend {
             reason: r.reason.as_str(),
             ioevent: Some(r.ioevent),
             unmap_failures: Some(r.unmap_failures),
+            // KVM の `StopReport` は `hv_vm_unmap` に相当する件数を持たない。
+            vm_unmap_failures: None,
         })
     }
 
@@ -356,6 +364,9 @@ impl MicrovmBackend for HvfBackend {
             // `hv_vm_unmap` の失敗は含まず、`op=hvf.vm_unmap` の行が別にある）。集約行 `op=hvf.microvm.stop` の
             // `unmap_failures=` と同じ値（#4411・#4437・MVM-5・REPAIR-4）。
             unmap_failures: Some(r.unmap_failures),
+            // `HvfStopReport::vm_unmap_failures`（`hv_vm_unmap` の失敗）。集約行 `op=hvf.microvm.stop` の同名キーと同じ値。
+            // 期限切れ・遅延回収の失敗は含まない（`op=hvf.deferred_reclaim`。#4439・#4455・MVM-5・REPAIR-4）。
+            vm_unmap_failures: Some(r.vm_unmap_failures),
         })
     }
 
@@ -712,6 +723,8 @@ pub struct StopAllReport {
     pub ioevent: Option<IoEventCounts>,
     /// 止めた VM の munmap の失敗件数の合算（#4438）。含める VM と `None` の扱いは `ioevent` と同じ。
     pub unmap_failures: Option<u64>,
+    /// 止めた VM の `hv_vm_unmap` の失敗件数の合算（#4455）。含める VM と `None` の扱いは `ioevent` と同じ。
+    pub vm_unmap_failures: Option<u64>,
 }
 
 impl StopAllReport {
@@ -728,6 +741,9 @@ impl StopAllReport {
         }
         if let Some(n) = o.unmap_failures {
             self.unmap_failures = Some(self.unmap_failures.unwrap_or(0).saturating_add(n));
+        }
+        if let Some(n) = o.vm_unmap_failures {
+            self.vm_unmap_failures = Some(self.vm_unmap_failures.unwrap_or(0).saturating_add(n));
         }
     }
 
@@ -749,18 +765,25 @@ impl StopAllReport {
             self.stopped,
             self.failed,
             self.remaining,
-            count_suffix(self.ioevent, self.unmap_failures)
+            count_suffix(self.ioevent, self.unmap_failures, self.vm_unmap_failures)
         )
     }
 }
 
-/// stop / stop_all の結果行の件数の接尾辞（` ignored=N unbind_failed=M`、続けて ` unmap_failures=K`。`None` の項目は出さない）。
-fn count_suffix(ioevent: Option<IoEventCounts>, unmap_failures: Option<u64>) -> String {
+/// stop / stop_all の結果行の件数の接尾辞（` ignored=N unbind_failed=M`、続けて ` unmap_failures=K`、` vm_unmap_failures=K`。`None` の項目は出さない）。
+fn count_suffix(
+    ioevent: Option<IoEventCounts>,
+    unmap_failures: Option<u64>,
+    vm_unmap_failures: Option<u64>,
+) -> String {
     let mut extra = ioevent
         .map(|c| format!(" ignored={} unbind_failed={}", c.ignored, c.unbind_failed))
         .unwrap_or_default();
     if let Some(n) = unmap_failures {
         extra.push_str(&format!(" unmap_failures={n}"));
+    }
+    if let Some(n) = vm_unmap_failures {
+        extra.push_str(&format!(" vm_unmap_failures={n}"));
     }
     extra
 }
@@ -831,6 +854,7 @@ impl<B: MicrovmBackend> MicrovmRuntimeAdapter<B> {
             remaining: 0,
             ioevent: None,
             unmap_failures: None,
+            vm_unmap_failures: None,
         };
         let ids: Vec<String> = self.vms.keys().cloned().collect();
         for id in ids {
@@ -949,6 +973,7 @@ impl<B: MicrovmBackend> MicrovmRuntimeAdapter<B> {
                 StopLineCounts {
                     ioevent: o.ioevent,
                     unmap_failures: o.unmap_failures,
+                    vm_unmap_failures: o.vm_unmap_failures,
                 },
             ),
             Err(e) => {
@@ -961,7 +986,8 @@ impl<B: MicrovmBackend> MicrovmRuntimeAdapter<B> {
     /// 結果行 1 行を組む（id・パス・cmdline は載せない。REPAIR-4）。
     ///
     /// 成功で `ioevent` が `Some` のときだけ、末尾に ` ignored=N unbind_failed=M`（数値と固定キーのみ。0 件でも出す）を足し、
-    /// 続けて `unmap_failures` が `Some` のときだけ ` unmap_failures=K`（0 件でも出す。#4410）を足す。
+    /// 続けて `unmap_failures` が `Some` のときだけ ` unmap_failures=K`（0 件でも出す。#4410）を足し、
+    /// さらに `vm_unmap_failures` が `Some` のときだけ ` vm_unmap_failures=K`（0 件でも出す。#4455）を足す。
     /// すべて `None`（件数を持たない backend・start・エラー）は従来の行と同一。`ignored` は `op=microvm.ioevent` の経路、
     /// `unbind_failed` は `op=kvm.ioeventfd.deassign` の件数と同じ事象の VM ごとの値（個々の失敗はそちらの行に出る）。
     fn result_line(
@@ -973,7 +999,11 @@ impl<B: MicrovmBackend> MicrovmRuntimeAdapter<B> {
     ) -> String {
         match result {
             Ok(_) => {
-                let extra = count_suffix(counts.ioevent, counts.unmap_failures);
+                let extra = count_suffix(
+                    counts.ioevent,
+                    counts.unmap_failures,
+                    counts.vm_unmap_failures,
+                );
                 format!(
                     "level=info op=plugin.microvm.{op} outcome=ok elapsed_us={elapsed_us} vms={vms}{extra}"
                 )
@@ -1186,6 +1216,10 @@ mod tests {
         ioevent: Option<IoEventCounts>,
         /// stop が返す munmap の失敗件数（#4410）。
         unmap_failures: Option<u64>,
+        /// stop が返す `hv_vm_unmap` の失敗件数（#4455）。
+        vm_unmap_failures: Option<u64>,
+        /// VM（起動順の番号）ごとの `vm_unmap_failures` の台本。無い VM は `vm_unmap_failures` を使う（#4455）。
+        per_vm_vm_unmap: std::collections::BTreeMap<u32, Option<u64>>,
         /// VM（起動順の番号）ごとの件数の台本。あればその VM だけ `ioevent` / `unmap_failures` を差し替える（#4438）。
         per_vm: std::collections::BTreeMap<u32, (Option<IoEventCounts>, Option<u64>)>,
         /// 失敗させる VM の番号（`stop_err` と独立。#4438）。
@@ -1218,6 +1252,11 @@ mod tests {
                 .get(&vm)
                 .copied()
                 .unwrap_or((self.ioevent, self.unmap_failures));
+            let vm_unmap_failures = self
+                .per_vm_vm_unmap
+                .get(&vm)
+                .copied()
+                .unwrap_or(self.vm_unmap_failures);
             if self.fail_vm.contains(&vm) {
                 return Err(MicrovmError::new(MicrovmErrorCode::Internal, "fake"));
             }
@@ -1231,6 +1270,7 @@ mod tests {
                     },
                     ioevent,
                     unmap_failures,
+                    vm_unmap_failures,
                 }),
             }
         }
@@ -1329,6 +1369,7 @@ mod tests {
         StopLineCounts {
             ioevent: ioevent.map(|(i, u)| IoEventCounts::new(i, u)),
             unmap_failures: unmap,
+            vm_unmap_failures: None,
         }
     }
 
@@ -1908,7 +1949,8 @@ mod tests {
                 failed: 0,
                 remaining: 2,
                 ioevent: None,
-                unmap_failures: None
+                unmap_failures: None,
+                vm_unmap_failures: None
             }
         );
         // 予算切れの VM も登録簿から外して停止要求を出す（Drop の待ちを残さない）。
@@ -1921,7 +1963,8 @@ mod tests {
                 failed: 0,
                 remaining: 0,
                 ioevent: None,
-                unmap_failures: None
+                unmap_failures: None,
+                vm_unmap_failures: None
             }
         );
     }
@@ -1951,6 +1994,142 @@ mod tests {
         (r, a.detached())
     }
 
+    /// MVM-5・REPAIR-4・#4455: stop の結果行は `vm_unmap_failures` を `unmap_failures` の後ろに足す。0 件でも出し、`None` と エラーでは出さない。
+    #[test]
+    fn mvm5_repair4_4455_stop_result_line_carries_vm_unmap_failures() {
+        for n in [0u64, 2] {
+            let t = Tmp::new("vmunmap");
+            let k = t.file("k", b"K");
+            let mut a = adapter();
+            a.backend.unmap_failures = Some(0);
+            a.backend.vm_unmap_failures = Some(n);
+            a.handle(&start_req("vm", &k)).expect("start");
+            let (r, counts) = a.do_stop(&s(&["stop", "vm"]));
+            assert_eq!(r.as_ref().expect("stop"), &s(&["stopped", "requested"]));
+            let line = MicrovmRuntimeAdapter::<FakeBackend>::result_line("stop", 7, 0, &r, counts);
+            assert_eq!(
+                line,
+                format!(
+                    "level=info op=plugin.microvm.stop outcome=ok elapsed_us=7 vms=0 unmap_failures=0 vm_unmap_failures={n}"
+                )
+            );
+        }
+        let full = StopLineCounts {
+            ioevent: Some(IoEventCounts::new(2, 1)),
+            unmap_failures: Some(3),
+            vm_unmap_failures: Some(4),
+        };
+        let ok: Result<Vec<String>, PluginError> = Ok(Vec::new());
+        assert_eq!(
+            MicrovmRuntimeAdapter::<FakeBackend>::result_line("stop", 7, 0, &ok, full),
+            "level=info op=plugin.microvm.stop outcome=ok elapsed_us=7 vms=0 ignored=2 unbind_failed=1 unmap_failures=3 vm_unmap_failures=4"
+        );
+        let only = StopLineCounts {
+            vm_unmap_failures: Some(2),
+            ..StopLineCounts::default()
+        };
+        assert_eq!(
+            MicrovmRuntimeAdapter::<FakeBackend>::result_line("stop", 7, 0, &ok, only),
+            "level=info op=plugin.microvm.stop outcome=ok elapsed_us=7 vms=0 vm_unmap_failures=2"
+        );
+        let err: Result<Vec<String>, PluginError> =
+            Err(perr(PluginErrorCode::NotFound, MSG_NOT_FOUND));
+        let line = MicrovmRuntimeAdapter::<FakeBackend>::result_line("stop", 7, 0, &err, full);
+        assert!(!line.contains(" vm_unmap_failures="), "{line}");
+    }
+
+    /// MVM-5・REPAIR-4・#4455: stop_all は `Ok` の VM の `vm_unmap_failures` だけを項目ごとに独立に飽和加算し、全 `None` なら出さない。
+    #[test]
+    fn mvm5_repair4_4455_stop_all_sums_vm_unmap_failures() {
+        let run = |tag: &str,
+                   vm: &[(u32, Option<u64>)],
+                   un: &[(u32, Option<u64>)],
+                   fail: &[u32],
+                   budget: Duration| {
+            let t = Tmp::new(tag);
+            let k = t.file("k", b"K");
+            let mut a = adapter();
+            for (v, n) in vm {
+                a.backend.per_vm_vm_unmap.insert(*v, *n);
+            }
+            for (v, n) in un {
+                a.backend.per_vm.insert(*v, (None, *n));
+            }
+            a.backend.fail_vm.extend(fail.iter().copied());
+            for id in ["a", "b"] {
+                a.handle(&start_req(id, &k)).expect("start");
+            }
+            a.stop_all(budget)
+        };
+        let r = run(
+            "vu1",
+            &[(1, Some(0)), (2, Some(2))],
+            &[],
+            &[],
+            Duration::from_secs(5),
+        );
+        assert_eq!((r.vm_unmap_failures, r.unmap_failures), (Some(2), None));
+        assert_eq!(
+            r.result_line(0),
+            "level=info op=plugin.microvm.stop_all stopped=2 failed=0 remaining=0 detached=0 vm_unmap_failures=2"
+        );
+        // 失敗した VM は含めない。
+        let r = run(
+            "vu2",
+            &[(1, Some(3)), (2, Some(5))],
+            &[],
+            &[2],
+            Duration::from_secs(5),
+        );
+        assert_eq!((r.failed, r.vm_unmap_failures), (1, Some(3)));
+        // 全台失敗は None。
+        let r = run(
+            "vu3",
+            &[(1, Some(3)), (2, Some(5))],
+            &[],
+            &[1, 2],
+            Duration::from_secs(5),
+        );
+        assert_eq!(r.vm_unmap_failures, None);
+        // 予算 0 でも Ok なら合算に入る。
+        let r = run(
+            "vu4",
+            &[(1, Some(1)), (2, Some(1))],
+            &[],
+            &[],
+            Duration::ZERO,
+        );
+        assert_eq!(r.vm_unmap_failures, Some(2));
+        // 全 None は出さない（先頭の空白込みで照合）。
+        let r = run("vu5", &[], &[], &[], Duration::from_secs(5));
+        assert_eq!(r.vm_unmap_failures, None);
+        assert!(!r.result_line(0).contains(" vm_unmap_failures="));
+        // 項目ごとに独立。
+        let r = run(
+            "vu6",
+            &[(2, Some(4))],
+            &[(1, Some(6))],
+            &[],
+            Duration::from_secs(5),
+        );
+        assert_eq!((r.unmap_failures, r.vm_unmap_failures), (Some(6), Some(4)));
+        assert_eq!(
+            r.result_line(0),
+            "level=info op=plugin.microvm.stop_all stopped=2 failed=0 remaining=0 detached=0 unmap_failures=6 vm_unmap_failures=4"
+        );
+        // 飽和。
+        let r = run(
+            "vu7",
+            &[(1, Some(u64::MAX)), (2, Some(1))],
+            &[],
+            &[],
+            Duration::from_secs(5),
+        );
+        assert_eq!(r.vm_unmap_failures, Some(u64::MAX));
+        // 件数は完了判定に影響しない。
+        assert!(!r.is_incomplete(0));
+    }
+
     /// MVM-1・REPAIR-4・#4438: 件数を持つ 2 台の合算、`None` の無視、全 `None` と 0 台は `None`。
     #[test]
     fn mvm1_repair4_4438_stop_all_sums_counts() {
@@ -1967,7 +2146,8 @@ mod tests {
                 failed: 0,
                 remaining: 0,
                 ioevent: Some(IoEventCounts::new(3, 1)),
-                unmap_failures: Some(2)
+                unmap_failures: Some(2),
+                vm_unmap_failures: None
             }
         );
         assert_eq!(
@@ -1996,7 +2176,8 @@ mod tests {
                 failed: 1,
                 remaining: 0,
                 ioevent: None,
-                unmap_failures: None
+                unmap_failures: None,
+                vm_unmap_failures: None
             }
             .result_line(1),
             "level=warn op=plugin.microvm.stop_all stopped=0 failed=1 remaining=0 detached=1"
@@ -2012,6 +2193,7 @@ mod tests {
             remaining: 0,
             ioevent: io,
             unmap_failures: un,
+            vm_unmap_failures: None,
         };
         assert_eq!(
             mk(Some(IoEventCounts::new(0, 0)), Some(0)).result_line(0),
@@ -2039,7 +2221,8 @@ mod tests {
                 failed: 0,
                 remaining: 2,
                 ioevent: Some(IoEventCounts::new(3, 1)),
-                unmap_failures: Some(2)
+                unmap_failures: Some(2),
+                vm_unmap_failures: None
             }
         );
         let (r, _) = stop_all_with("c4438-6", &script, &[2], STOP_ALL_BUDGET);
@@ -2050,7 +2233,8 @@ mod tests {
                 failed: 1,
                 remaining: 0,
                 ioevent: Some(IoEventCounts::new(2, 1)),
-                unmap_failures: Some(0)
+                unmap_failures: Some(0),
+                vm_unmap_failures: None
             }
         );
         let (r, _) = stop_all_with("c4438-7", &script, &[1, 2], STOP_ALL_BUDGET);
@@ -2066,6 +2250,7 @@ mod tests {
             remaining: 0,
             ioevent: Some(IoEventCounts::new(9, 9)),
             unmap_failures: Some(9),
+            vm_unmap_failures: None,
         };
         assert!(!r.is_incomplete(0));
         assert!(r.is_incomplete(1));

@@ -365,6 +365,32 @@ pub trait VirtioDevice {
     fn reset(&mut self);
 }
 
+/// MMIO exit 経路で受理判定に落ちて捨てた `QUEUE_NOTIFY` 書き込みの件数（VM ごと。観測専用。#4459・MVM-1・MVM-5・REPAIR-4）。
+///
+/// 書き手は [`VirtioMmioTransport`] の `write_reg` の `QUEUE_NOTIFY` の分岐だけで、`accept_queue_notify` が `Err` の回を 1 件と数える。
+/// KVM の datamatch に合わない書き込み（範囲外のキュー番号等）と HVF（ioeventfd が無く常に MMIO exit）がこの経路を通る。
+/// ioeventfd の通知スレッドの無視は `crate::interrupt::IoEventTally` の `ignored` が数え、`write_reg` を通らないため二重計上しない。
+/// 4 バイト以外の幅の書き込みは `write` が受理判定の前に `UnalignedOrBadWidth` で返すため数えない。
+/// 停止の合否には使わない（`StopReport::mmio_ignored` 等へ写すだけ）。
+#[derive(Debug, Default)]
+pub struct QueueNotifyTally {
+    mmio_ignored: std::sync::atomic::AtomicU64,
+}
+
+impl QueueNotifyTally {
+    /// 受理判定で捨てた `QUEUE_NOTIFY` 1 回分を数える。
+    fn record_mmio_ignored(&self) {
+        // 観測専用なので順序は Relaxed で足りる。
+        self.mmio_ignored
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// これまでに数えた件数。
+    pub fn mmio_ignored(&self) -> u64 {
+        self.mmio_ignored.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 /// virtio-mmio modern トランスポート。
 #[derive(Debug)]
 pub struct VirtioMmioTransport<D: VirtioDevice> {
@@ -378,6 +404,8 @@ pub struct VirtioMmioTransport<D: VirtioDevice> {
     queues: Vec<QueueConfig>,
     interrupt_status: u32,
     config_generation: u32,
+    /// MMIO exit 経路で捨てた `QUEUE_NOTIFY` の件数。`reset` では戻さない（#4459）。
+    queue_notify: std::sync::Arc<QueueNotifyTally>,
 }
 
 fn invalid(message: &'static str) -> MicrovmError {
@@ -414,7 +442,19 @@ impl<D: VirtioDevice> VirtioMmioTransport<D> {
             queues,
             interrupt_status: 0,
             config_generation: 0,
+            queue_notify: std::sync::Arc::default(),
         })
+    }
+
+    /// 捨てた `QUEUE_NOTIFY` の計数を VM ごとの共有の計数へ差し替える（`DeviceBus` が全デバイスで 1 つを共有する。#4459）。
+    pub fn with_queue_notify_tally(mut self, tally: std::sync::Arc<QueueNotifyTally>) -> Self {
+        self.queue_notify = tally;
+        self
+    }
+
+    /// 共有の計数に数えた、MMIO exit 経路で捨てた `QUEUE_NOTIFY` の件数（VM 全体の合算。#4459）。
+    pub fn mmio_ignored_notifies(&self) -> u64 {
+        self.queue_notify.mmio_ignored()
     }
 
     /// 現在の Device Status。
@@ -591,6 +631,7 @@ impl<D: VirtioDevice> VirtioMmioTransport<D> {
     /// MMIO の `QUEUE_NOTIFY` 書き込み（`write_reg`）と、ioeventfd の通知スレッド（`microvm::IoEventPoller`）の
     /// 両方がこの 1 か所を通る。KVM の ioeventfd はデバイスの状態に関係なく発火するため、通知の意味が 2 経路でずれないよう受理条件を共有する。
     /// 異常状態（FAILED / DEVICE_NEEDS_RESET）では DRIVER_OK が残っていても配送しない。範囲外のキューと ready でないキューも無視する。
+    /// 無視した件数は呼び出し側が数える。MMIO 経路（`write_reg`）は [`QueueNotifyTally`]、ioeventfd 経路は `IoEventTally` で、本関数自身は数えない（#4459）。
     pub fn accept_queue_notify(&self, value: u64) -> Result<u16, IgnoredAccess> {
         if !self.status.contains(DeviceStatus::DRIVER_OK)
             || self.status.contains(DeviceStatus::FAILED)
@@ -656,7 +697,8 @@ impl<D: VirtioDevice> VirtioMmioTransport<D> {
             reg::QUEUE_DEVICE_HIGH => self.write_addr(value, |q| &mut q.device_area, true),
             reg::QUEUE_NOTIFY => self
                 .accept_queue_notify(u64::from(value))
-                .map(MmioWriteOutcome::QueueNotify),
+                .map(MmioWriteOutcome::QueueNotify)
+                .inspect_err(|_| self.queue_notify.record_mmio_ignored()),
             reg::INTERRUPT_ACK => {
                 self.interrupt_status &= !value;
                 Ok(MmioWriteOutcome::InterruptAcknowledged)
@@ -1225,6 +1267,71 @@ mod tests {
         assert_eq!(wr(&mut t, reg::STATUS, 0), MmioWriteOutcome::DeviceReset);
         assert_eq!(t.device().resets, 1);
         assert!(t.device().stopped.is_empty());
+    }
+
+    /// MVM-1・MVM-5・REPAIR-4・#4459: MMIO 経路で受理判定に落ちた QUEUE_NOTIFY（4 バイト幅）だけが数えられる。
+    #[test]
+    fn mvm1_4459_mmio_queue_notify_ignored_counts_only_accept_rejections() {
+        let mut t = net();
+        assert_eq!(t.mmio_ignored_notifies(), 0);
+        // DRIVER_OK 前の QUEUE_NOTIFY を 3 回。
+        for _ in 0..3 {
+            assert_eq!(
+                wr(&mut t, reg::QUEUE_NOTIFY, 0),
+                ign(IgnoredAccess::WrongDeviceState)
+            );
+        }
+        assert_eq!(t.mmio_ignored_notifies(), 3);
+        // 対照: 他レジスタの Ignored（読み取り専用・FEATURES_OK 前の QUEUE_NUM・未知）は数えない。
+        assert_eq!(
+            wr(&mut t, reg::MAGIC, 0),
+            ign(IgnoredAccess::ReadOnlyRegister)
+        );
+        assert_eq!(
+            wr(&mut t, reg::QUEUE_NUM, 16),
+            ign(IgnoredAccess::WrongDeviceState)
+        );
+        assert_eq!(wr(&mut t, 0x0f8, 0), ign(IgnoredAccess::UnknownRegister));
+        // 対照: 4 バイト以外の幅は受理判定に届かないため数えない（判断は QueueNotifyTally の doc）。
+        assert_eq!(
+            t.write(reg::QUEUE_NOTIFY, &[0, 0]),
+            ign(IgnoredAccess::UnalignedOrBadWidth)
+        );
+        assert_eq!(t.mmio_ignored_notifies(), 3);
+        negotiate_ok(&mut t);
+        setup_queue(&mut t, 0, 16);
+        wr(&mut t, reg::STATUS, 15);
+        // 対照: 受理された通知は数えない。範囲外のキュー番号は数える。
+        assert_eq!(
+            wr(&mut t, reg::QUEUE_NOTIFY, 0),
+            MmioWriteOutcome::QueueNotify(0)
+        );
+        assert_eq!(t.mmio_ignored_notifies(), 3);
+        assert_eq!(
+            wr(&mut t, reg::QUEUE_NOTIFY, 9),
+            ign(IgnoredAccess::InvalidSelector)
+        );
+        assert_eq!(t.mmio_ignored_notifies(), 4);
+        // 対照: accept_queue_notify の直接呼び出し（ioeventfd 経路）は数えない。
+        assert!(t.accept_queue_notify(9).is_err());
+        assert_eq!(t.mmio_ignored_notifies(), 4);
+        // Status=0 のリセット後も値は保たれる。
+        wr(&mut t, reg::STATUS, 0);
+        assert_eq!(t.mmio_ignored_notifies(), 4);
+    }
+
+    /// MVM-1・#4459: 計数を共有した 2 つのトランスポートの件数は VM 全体で合算される。
+    #[test]
+    fn mvm1_4459_shared_tally_sums_across_transports() {
+        let tally = std::sync::Arc::new(QueueNotifyTally::default());
+        let mut a = block().with_queue_notify_tally(std::sync::Arc::clone(&tally));
+        let mut b = net().with_queue_notify_tally(std::sync::Arc::clone(&tally));
+        wr(&mut a, reg::QUEUE_NOTIFY, 0);
+        wr(&mut b, reg::QUEUE_NOTIFY, 0);
+        wr(&mut b, reg::QUEUE_NOTIFY, 1);
+        assert_eq!(tally.mmio_ignored(), 3);
+        assert_eq!(a.mmio_ignored_notifies(), 3);
+        assert_eq!(b.mmio_ignored_notifies(), 3);
     }
 
     #[test]

@@ -171,6 +171,7 @@ use crate::smp_x86::{MpState, plan_vcpus, sipi_startup_range};
 use crate::sys::{self, GuestRamMap, SysError};
 use crate::uart::{COM1_BASE, SerialConsole, UART_PORT_LEN};
 use crate::virtio_block::{BlockBackend, VirtioBlock};
+use crate::virtio_mmio::QueueNotifyTally;
 use crate::virtio_mmio::{
     CONFIG_SPACE_SIZE, MmioWriteOutcome, SharedTransport, VirtioDevice, VirtioMmioTransport,
 };
@@ -1185,6 +1186,15 @@ struct DeviceBus<B: BlockBackend, N: NetBackend, L, Q = ()> {
     block: Vec<BoundDevice<VirtioBlock<B>, L, Q>>,
     net: Vec<BoundDevice<VirtioNet<N>, L, Q>>,
     serial: SerialConsole,
+    /// 全 virtio デバイスのトランスポートが共有する、MMIO exit 経路で捨てた QUEUE_NOTIFY の件数（VM ごと。#4459）。
+    queue_notify: Arc<QueueNotifyTally>,
+}
+
+impl<B: BlockBackend, N: NetBackend, L, Q> DeviceBus<B, N, L, Q> {
+    /// MMIO exit 経路で捨てた QUEUE_NOTIFY の共有の計数（`start_inner` が停止の報告の集約先として取る。#4459）。
+    fn queue_notify_tally(&self) -> Arc<QueueNotifyTally> {
+        Arc::clone(&self.queue_notify)
+    }
 }
 
 /// デバイスのキューごとに `make_notifier` を呼ぶ（キュー番号の昇順）。途中で失敗したら作成済みの通知器は戻る前に drop される。
@@ -1284,6 +1294,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static, L, Q> Dev
             block: Vec::with_capacity(block.len()),
             net: Vec::with_capacity(net.len()),
             serial: SerialConsole::new(),
+            queue_notify: Arc::default(),
         };
         // PIO と MMIO は別の表なので virtio の窓とは衝突しない。
         // 線ありは x86_64 の KVM（`KVM_IRQ_LINE` の GSI 4。#3918）。線なしは IIR が常に「保留なし」の従来の経路。
@@ -1305,9 +1316,10 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static, L, Q> Dev
             let slot = *slots_iter
                 .next()
                 .ok_or_else(|| invalid("device layout does not match the configuration"))?;
-            let transport = Arc::new(Mutex::new(VirtioMmioTransport::new(VirtioBlock::new(
-                backend,
-            ))?));
+            let transport = Arc::new(Mutex::new(
+                VirtioMmioTransport::new(VirtioBlock::new(backend))?
+                    .with_queue_notify_tally(Arc::clone(&bus.queue_notify)),
+            ));
             let id = bus.dispatcher.register_mmio(
                 slot.mmio_base,
                 slot.mmio_len,
@@ -1327,10 +1339,10 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static, L, Q> Dev
             let slot = *slots_iter
                 .next()
                 .ok_or_else(|| invalid("device layout does not match the configuration"))?;
-            let transport = Arc::new(Mutex::new(VirtioMmioTransport::new(VirtioNet::new(
-                cfg.backend,
-                cfg.mac,
-            ))?));
+            let transport = Arc::new(Mutex::new(
+                VirtioMmioTransport::new(VirtioNet::new(cfg.backend, cfg.mac))?
+                    .with_queue_notify_tally(Arc::clone(&bus.queue_notify)),
+            ));
             let id = bus.dispatcher.register_mmio(
                 slot.mmio_base,
                 slot.mmio_len,
@@ -2063,6 +2075,9 @@ pub struct StopReport {
     /// munmap の失敗件数（VM ごと。観測専用。#4382・MVM-1・REPAIR-4）。最後のスレッドが共有部を落とした後の最終値。
     /// map の失敗経路の munmap の失敗は VM が決まる前のため含まない（固定行だけで観測する）。
     pub unmap_failures: u64,
+    /// MMIO exit 経路で受理判定に落ちて捨てた `QUEUE_NOTIFY` の件数（VM ごと。観測専用。#4459・MVM-1・MVM-5・REPAIR-4）。
+    /// ioeventfd 経路の無視（`ioevent.ignored`）とは互いに素で、4 バイト以外の幅の書き込みは含まない。
+    pub mmio_ignored: u64,
 }
 
 /// 1 回の `run_once` の結果の分類（純粋関数 [`classify_run`] の戻り値）。
@@ -2656,6 +2671,8 @@ struct StopAggregate {
     ioevent: Arc<IoEventTally>,
     /// munmap の失敗件数。`ioevent` と同じく確定時に読む（#4382）。
     unmap: Arc<sys::UnmapTally>,
+    /// MMIO exit 経路で捨てた `QUEUE_NOTIFY` の件数。確定時に読む（#4459）。
+    mmio: Arc<QueueNotifyTally>,
 }
 
 fn add_stats(a: &mut RunStats, b: &RunStats) {
@@ -2741,6 +2758,7 @@ impl StopAggregate {
             origin_vcpu,
             ioevent: self.ioevent.snapshot(),
             unmap_failures,
+            mmio_ignored: self.mmio.mmio_ignored(),
         };
         self.exit.complete(report);
         // 受け手（RunningMicroVm）が既に無ければ送信は失敗するが、解放は済んでいるので捨てる。
@@ -2936,7 +2954,15 @@ fn spawn_loops<T: VcpuLoopBody>(
     started: Instant,
     serial: SerialConsole,
 ) -> Result<RunningMicroVm, MicrovmError> {
-    spawn_loops_observed(bodies, aux, started, serial, Arc::default(), Arc::default())
+    spawn_loops_observed(
+        bodies,
+        aux,
+        started,
+        serial,
+        Arc::default(),
+        Arc::default(),
+        Arc::default(),
+    )
 }
 
 /// [`spawn_loops_gated`] を本番のゲート待ち上限と実スレッド生成で呼ぶ本番の入口。`ioevent` は VM ごとの件数（`start_inner` が渡す。#4161）。
@@ -2947,6 +2973,7 @@ fn spawn_loops_observed<T: VcpuLoopBody>(
     serial: SerialConsole,
     ioevent: Arc<IoEventTally>,
     unmap: Arc<sys::UnmapTally>,
+    mmio: Arc<QueueNotifyTally>,
 ) -> Result<RunningMicroVm, MicrovmError> {
     spawn_loops_gated(
         bodies,
@@ -2955,6 +2982,7 @@ fn spawn_loops_observed<T: VcpuLoopBody>(
         serial,
         ioevent,
         unmap,
+        mmio,
         START_GATE_WAIT,
         |name, job| thread::Builder::new().name(name).spawn(job),
     )
@@ -2977,6 +3005,7 @@ where
         Vec::new(),
         started,
         serial,
+        Arc::default(),
         Arc::default(),
         Arc::default(),
         START_GATE_WAIT,
@@ -3004,6 +3033,7 @@ where
         serial,
         Arc::default(),
         Arc::default(),
+        Arc::default(),
         START_GATE_WAIT,
         spawn,
     )
@@ -3016,7 +3046,7 @@ where
 ///
 /// 数を検証してから確保する。k 本目の生成が失敗したら、全台へ停止を要求し、生成済みを 1 つの期限（[`DROP_STOP_WAIT`]）で
 /// 回収してから失敗を返す。未生成の `body` と失敗した job は drop される（fd・mmap は解放される。#887）。
-#[allow(clippy::too_many_arguments)] // 件数の集約先（ioevent・unmap）は VM ごとの観測値で、束ねる型を増やさない。
+#[allow(clippy::too_many_arguments)] // 件数の集約先（ioevent・unmap・mmio）は VM ごとの観測値で、束ねる型を増やさない。
 fn spawn_loops_gated<T, S>(
     bodies: Vec<T>,
     aux: Vec<AuxThread>,
@@ -3024,6 +3054,7 @@ fn spawn_loops_gated<T, S>(
     serial: SerialConsole,
     ioevent: Arc<IoEventTally>,
     unmap: Arc<sys::UnmapTally>,
+    mmio: Arc<QueueNotifyTally>,
     gate_wait: Duration,
     mut spawn: S,
 ) -> Result<RunningMicroVm, MicrovmError>
@@ -3049,6 +3080,7 @@ where
         vcpu_count: count,
         ioevent: Arc::clone(&ioevent),
         unmap,
+        mmio,
     });
     let gate = Arc::new(StartGate::new(gate_wait));
     let mut release = GateRelease {
@@ -3470,6 +3502,8 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
             ..
         } = self;
         let has_net = !devices.net.is_empty();
+        // デバイスを共有部へ移す前に、MMIO exit 経路で捨てた QUEUE_NOTIFY の件数の集約先を取る（#4459）。
+        let mmio_tally = devices.queue_notify_tally();
         // 分解して `vm` を共有部へ移す前に、munmap 失敗件数の集約先を取る（#4382）。
         let unmap_tally = vm.unmap_tally();
         // ioeventfd の通知スレッドが待つ対象（結んだ全キュー）。QueueNotify は VM exit しなくなるため、待つ側は必ず起動する（#3698）。
@@ -3510,7 +3544,15 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
             });
         }
         drop(shared);
-        spawn_loops_observed(workers, aux, started, serial, ioevent_tally, unmap_tally)
+        spawn_loops_observed(
+            workers,
+            aux,
+            started,
+            serial,
+            ioevent_tally,
+            unmap_tally,
+            mmio_tally,
+        )
     }
 }
 
@@ -4003,6 +4045,7 @@ mod lifecycle_tests {
             origin_vcpu: None,
             ioevent: IoEventCounts::default(),
             unmap_failures: 0,
+            mmio_ignored: 0,
         };
         cell.complete(report);
         cell.mark_abnormal_if_running();
@@ -4343,6 +4386,7 @@ mod lifecycle_tests {
             Vec::new(),
             Instant::now(),
             SerialConsole::new(),
+            Arc::default(),
             Arc::default(),
             Arc::default(),
             Duration::from_millis(100),
@@ -5377,6 +5421,38 @@ mod assemble_tests {
         })
     }
 
+    /// MVM-1・MVM-5・REPAIR-4・#4459: DRIVER_OK 前の QUEUE_NOTIFY を MMIO exit 経路（`dispatch_exit_with`）で流した回数が、
+    /// VM ごとの計数に具体値で数えられる。QUEUE_NOTIFY 以外の無視と ioeventfd 経路（`complete_ioevent`）は数えない。
+    #[test]
+    fn mvm1_4459_dispatch_exit_counts_mmio_ignored_queue_notify() {
+        let (mut b, mut mem) = bus(1, 1);
+        let tally = b.queue_notify_tally();
+        let bases: Vec<u64> = b.infos().iter().map(|i| i.slot.mmio_base).collect();
+        let ids: Vec<DeviceId> = b.infos().iter().map(|i| i.id).collect();
+        let mut out = Vec::new();
+        // block に 3 回・net に 1 回（VM 全体で 4 回）。
+        for base in [bases[0], bases[0], bases[0], bases[1]] {
+            let step = flow(&mut b, &mut mem, &mut out, base + reg::QUEUE_NOTIFY, 0);
+            assert!(matches!(step, LoopStep::Continue), "{step:?}");
+            assert_eq!(
+                last_write(&out),
+                MmioWriteOutcome::Ignored(IgnoredAccess::WrongDeviceState)
+            );
+        }
+        assert_eq!(tally.mmio_ignored(), 4);
+        // 対照: QUEUE_NOTIFY 以外の Ignored（FEATURES_OK 前の QUEUE_NUM・読み取り専用の MAGIC）は増えない。
+        for off in [reg::QUEUE_NUM, reg::MAGIC] {
+            flow(&mut b, &mut mem, &mut out, bases[0] + off, 16);
+            assert!(matches!(last_write(&out), MmioWriteOutcome::Ignored(_)));
+        }
+        assert_eq!(tally.mmio_ignored(), 4);
+        // 対照: ioeventfd 経路の無視は IoEventTally 側で、本計数には入らない。
+        for id in &ids {
+            assert!(b.complete_ioevent(*id, 0, &mut mem).unwrap().is_none());
+        }
+        assert_eq!(tally.mmio_ignored(), 4);
+    }
+
     fn stopped_count(outcomes: &[DispatchOutcome], queue: u16) -> usize {
         outcomes
             .iter()
@@ -6318,6 +6394,7 @@ mod ioevent_tests {
             SerialConsole::new(),
             Arc::clone(&tally),
             Arc::default(),
+            Arc::default(),
         )
         .unwrap();
         a.ev.signal().unwrap();
@@ -6356,6 +6433,37 @@ mod ioevent_tests {
         }
     }
 
+    /// MVM-1・MVM-5・REPAIR-4・#4459: 数えた件数が `StopReport::mmio_ignored` に届く（ioeventfd 側の `ignored` とは独立）。
+    #[test]
+    fn mvm1_4459_mmio_ignored_reaches_stop_report() {
+        let mmio = Arc::new(QueueNotifyTally::default());
+        // 計数を共有したトランスポートへ MMIO で 5 回書く。
+        let mut t = VirtioMmioTransport::new(VirtioBlock::new(
+            crate::virtio_block::MemoryBlockBackend::new(16 * 512, false).unwrap(),
+        ))
+        .unwrap()
+        .with_queue_notify_tally(Arc::clone(&mmio));
+        for _ in 0..5 {
+            assert_eq!(
+                t.write(crate::virtio_mmio::reg::QUEUE_NOTIFY, &0u32.to_le_bytes()),
+                MmioWriteOutcome::Ignored(IgnoredAccess::WrongDeviceState)
+            );
+        }
+        let running = spawn_loops_observed(
+            vec![Idle(Arc::new(AtomicUsize::new(0)))],
+            Vec::new(),
+            Instant::now(),
+            SerialConsole::new(),
+            Arc::default(),
+            Arc::default(),
+            Arc::clone(&mmio),
+        )
+        .unwrap();
+        let report = running.stop(Duration::from_secs(5)).unwrap();
+        assert_eq!(report.mmio_ignored, 5);
+        assert_eq!(report.ioevent, IoEventCounts::new(0, 0));
+    }
+
     /// MVM-1・REPAIR-4・#4382: 解放で数えた munmap の失敗が `StopReport::unmap_failures` に届く（失敗なしの対照は 0）。
     #[test]
     fn mvm1_4382_unmap_failures_reach_stop_report() {
@@ -6371,6 +6479,7 @@ mod ioevent_tests {
                 SerialConsole::new(),
                 Arc::default(),
                 Arc::clone(&tally),
+                Arc::default(),
             )
             .unwrap();
             let report = running.stop(Duration::from_secs(5)).unwrap();

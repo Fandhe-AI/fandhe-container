@@ -18,7 +18,8 @@
 //!
 //! libc との機械照合: plugin-cri は dev-dependencies に `libc` を持たないため未導入（依存の追加は承認事項。
 //! 番号の出典は Linux `include/uapi/asm-generic/signal.h`〔SIGINT=2・SIGTERM=15。x86_64・aarch64 とも同じ〕と
-//! macOS `sys/signal.h`〔同値〕）。導入は後続（#1837 の子として起票候補）。
+//! macOS `sys/signal.h`〔同値〕）。導入の承認は #3290 で追う。waitid・poll・`O_NONBLOCK` の値は
+//! 末尾の `abi_values`（const assert と `#[test]`。#4415）で具体値として固定する（libc との照合ではない）。
 //!
 //! # fork した子への継承（#3300）
 //! 登録したハンドラは exec しない `fork` の子へ引き継がれ、そうした子は停止シグナルでは死なない（atomic を立てるだけ）。
@@ -236,7 +237,8 @@ pub fn poll_writable(
 
 /// `open(2)` の `O_NONBLOCK`（CRI-6・REPAIR-5・#4287）。`/proc/self/fd/N` の開き直し（Linux のみ）で使う。
 /// 値は Linux の `include/uapi/asm-generic/fcntl.h`（x86_64・aarch64 とも 0o4000）。他の組は `None`
-/// （開き直さず従来の共有記述の経路を使う）。`libc` の機械照合は plugin-cri には未導入。
+/// （開き直さず従来の共有記述の経路を使う）。`libc` の機械照合は plugin-cri には未導入（#3290）で、
+/// 値は `abi_values` で具体値として固定する（#4415）。
 #[cfg(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
@@ -261,25 +263,26 @@ mod poll_imp {
 
     use super::WritePoll;
 
+    // 以下の項目は `sys` の中の具体値の固定試験（`abi_values`）が参照するため `pub(super)`。`sys` の外へは出さない。
     // 値は Linux の `include/uapi/asm-generic/poll.h`（x86_64・aarch64 とも同じ）と macOS の `sys/poll.h` で同じ。
-    const POLLOUT: i16 = 0x0004;
-    const POLLERR: i16 = 0x0008;
-    const POLLHUP: i16 = 0x0010;
-    const POLLNVAL: i16 = 0x0020;
+    pub(super) const POLLOUT: i16 = 0x0004;
+    pub(super) const POLLERR: i16 = 0x0008;
+    pub(super) const POLLHUP: i16 = 0x0010;
+    pub(super) const POLLNVAL: i16 = 0x0020;
 
     /// `struct pollfd`（`int fd; short events; short revents;`。Linux・macOS 共通のレイアウト）。
     #[repr(C)]
-    struct PollFd {
-        fd: i32,
-        events: i16,
-        revents: i16,
+    pub(super) struct PollFd {
+        pub(super) fd: i32,
+        pub(super) events: i16,
+        pub(super) revents: i16,
     }
 
     /// `nfds_t`: Linux は `unsigned long`、macOS は `unsigned int`。
     #[cfg(target_os = "linux")]
-    type NfdsT = std::ffi::c_ulong;
+    pub(super) type NfdsT = std::ffi::c_ulong;
     #[cfg(target_os = "macos")]
-    type NfdsT = std::ffi::c_uint;
+    pub(super) type NfdsT = std::ffi::c_uint;
 
     unsafe extern "C" {
         // SAFETY（宣言そのものの妥当性）: POSIX の `int poll(struct pollfd *fds, nfds_t nfds, int timeout)`。
@@ -338,6 +341,30 @@ mod poll_imp {
     }
 }
 
+/// `waitid` の定数と `siginfo_t` の受け皿。`child_exit_observed` が使い、`abi_values` が具体値を固定する（#4415）。
+/// 値は Linux の x86_64・aarch64 で共通（`include/uapi/linux/wait.h`・`include/uapi/asm-generic/siginfo.h`）。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod waitid_abi {
+    /// `idtype_t` の `P_PID`（`include/uapi/linux/wait.h`）。
+    pub(super) const P_PID: i32 = 1;
+    /// `WEXITED`（同上）。
+    pub(super) const WEXITED: i32 = 4;
+    /// `WNOHANG`（同上）。
+    pub(super) const WNOHANG: i32 = 1;
+    /// `WNOWAIT`（同上）。回収せず状態だけ見るために付ける。
+    pub(super) const WNOWAIT: i32 = 0x0100_0000;
+    /// `si_pid` の位置。64 ビットの `__ARCH_SI_PREAMBLE_SIZE = 4 * sizeof(int)` により 16 の `int`
+    /// （`include/uapi/asm-generic/siginfo.h`）。
+    pub(super) const SI_PID_OFFSET: usize = 16;
+
+    /// `siginfo_t`（128 バイト）の受け皿。0 で初期化して渡す。
+    #[repr(C, align(8))]
+    pub(super) struct SigInfoBuf(pub(super) [u8; 128]);
+}
+
 /// 自分の子が終了済みかを、回収せずに確かめる（Linux の x86_64・aarch64 のみ。H6・#2877・CRI-2・SEC-5・REPAIR-5）。
 ///
 /// 呼び出し元は本番の保持役 provider（`crate::pod_holder`）。sandbox の記録が残る間は子を `wait` せず、pid を zombie のまま
@@ -345,7 +372,7 @@ mod poll_imp {
 /// `Ok(true)` は終了済み（未回収のまま）、`Ok(false)` は未終了。自分の子でない pid・回収済みの pid などは `Err`
 /// （呼び出し側は判定不能として fail-closed に扱う）。
 ///
-/// 番号とレイアウトの出典（plugin-cri は `libc` の dev-dependency を持たず機械照合は未導入。導入は #1837 の子の後続）:
+/// 番号とレイアウトの出典（plugin-cri は `libc` の dev-dependency を持たず機械照合は未導入。承認の判断は #3290、値は `abi_values` で具体値として固定。#4415）:
 /// `P_PID=1`・`WEXITED=4`・`WNOHANG=1`・`WNOWAIT=0x0100_0000` は Linux `include/uapi/linux/wait.h`。`siginfo_t` は 128 バイトで、
 /// `si_pid` は `include/uapi/asm-generic/siginfo.h` の 64 ビット（`__ARCH_SI_PREAMBLE_SIZE = 4 * sizeof(int)`）でオフセット 16 の
 /// `int`（x86_64・aarch64 とも同じ）。
@@ -354,15 +381,7 @@ mod poll_imp {
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 pub fn child_exit_observed(pid: std::num::NonZeroU32) -> std::io::Result<bool> {
-    const P_PID: i32 = 1;
-    const WEXITED: i32 = 4;
-    const WNOHANG: i32 = 1;
-    const WNOWAIT: i32 = 0x0100_0000;
-    const SI_PID_OFFSET: usize = 16;
-
-    /// `siginfo_t`（128 バイト）の受け皿。0 で初期化して渡す。
-    #[repr(C, align(8))]
-    struct SigInfoBuf([u8; 128]);
+    use waitid_abi::{P_PID, SI_PID_OFFSET, SigInfoBuf, WEXITED, WNOHANG, WNOWAIT};
 
     unsafe extern "C" {
         // SAFETY（宣言そのものの妥当性）: POSIX / Linux の `int waitid(idtype_t, id_t, siginfo_t *, int)`。
@@ -531,5 +550,79 @@ mod tests {
         use std::os::fd::AsFd as _;
         let (a, _b) = std::os::unix::net::UnixStream::pair().expect("pair");
         assert_eq!(poll_writable(a.as_fd(), 0).expect("poll"), WritePoll::Ready);
+    }
+}
+
+/// waitid・poll・`O_NONBLOCK` の ABI 値の具体値の固定（MVM-4・REPAIR-12・CRI-2・#4415）。
+///
+/// plugin-cri は dev-dependency の `libc` を持たない（承認は #3290）ため libc との照合ではなく、カーネル / libc の
+/// ヘッダ由来の値を具体値で固定する。`const _` の assert は `cargo check --all-targets` でも評価されるので、
+/// `cross-target-check` の aarch64-unknown-linux-gnu でも値が照合される。
+#[cfg(test)]
+mod abi_values {
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    mod linux {
+        use crate::sys::O_NONBLOCK;
+        use crate::sys::waitid_abi::{P_PID, SI_PID_OFFSET, SigInfoBuf, WEXITED, WNOHANG, WNOWAIT};
+
+        const _: () = assert!(P_PID == 1);
+        const _: () = assert!(WEXITED == 4);
+        const _: () = assert!(WNOHANG == 1);
+        const _: () = assert!(WNOWAIT == 0x0100_0000);
+        const _: () = assert!(SI_PID_OFFSET == 16);
+        const _: () = assert!(size_of::<SigInfoBuf>() == 128);
+        const _: () = assert!(align_of::<SigInfoBuf>() == 8);
+        // 本体の `.get(SI_PID_OFFSET..SI_PID_OFFSET + 4)` が `None` にならないことを型検査の時点で保証する。
+        const _: () = assert!(SI_PID_OFFSET + size_of::<i32>() <= size_of::<SigInfoBuf>());
+
+        #[test]
+        fn mvm4_repair12_4415_waitid_and_nonblock_values_are_fixed() {
+            assert_eq!(P_PID, 1);
+            assert_eq!(WEXITED, 4);
+            assert_eq!(WNOHANG, 1);
+            assert_eq!(WNOWAIT, 0x0100_0000);
+            assert_eq!(SI_PID_OFFSET, 16);
+            assert_eq!(size_of::<SigInfoBuf>(), 128);
+            assert_eq!(align_of::<SigInfoBuf>(), 8);
+            assert_eq!(O_NONBLOCK, Some(0o4000));
+        }
+    }
+
+    #[cfg(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))]
+    mod poll {
+        use crate::sys::poll_imp::{NfdsT, POLLERR, POLLHUP, POLLNVAL, POLLOUT, PollFd};
+
+        const _: () = assert!(POLLOUT == 0x0004);
+        const _: () = assert!(POLLERR == 0x0008);
+        const _: () = assert!(POLLHUP == 0x0010);
+        const _: () = assert!(POLLNVAL == 0x0020);
+        const _: () = assert!(size_of::<PollFd>() == 8);
+        const _: () = assert!(align_of::<PollFd>() == 4);
+        const _: () = assert!(std::mem::offset_of!(PollFd, fd) == 0);
+        const _: () = assert!(std::mem::offset_of!(PollFd, events) == 4);
+        const _: () = assert!(std::mem::offset_of!(PollFd, revents) == 6);
+
+        #[test]
+        fn mvm4_repair12_4415_poll_values_are_fixed() {
+            assert_eq!(POLLOUT, 0x0004);
+            assert_eq!(POLLERR, 0x0008);
+            assert_eq!(POLLHUP, 0x0010);
+            assert_eq!(POLLNVAL, 0x0020);
+            assert_eq!(size_of::<PollFd>(), 8);
+            assert_eq!(align_of::<PollFd>(), 4);
+            #[cfg(target_os = "linux")]
+            assert_eq!(size_of::<NfdsT>(), 8);
+            #[cfg(target_os = "macos")]
+            assert_eq!(size_of::<NfdsT>(), 4);
+        }
     }
 }

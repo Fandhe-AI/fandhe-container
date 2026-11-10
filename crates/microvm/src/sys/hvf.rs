@@ -549,6 +549,11 @@ impl Drop for HostMapping {
         // 試験の失敗注入では ptr をページ境界からずらすが、munmap は引数を参照外しせず不正なら EINVAL を返すだけ。
         // 失敗は固定の 1 行（`op=hvf.host_unmap`。#4292）で観測し、それ以外は何もしない（リークを受け入れる・panic しない）。
         let rc = unsafe { munmap(self.ptr, self.len) };
+        // VM へ対応付けた backing（`unmap_tally` あり）だけ、遅延回収の記録へ結果を載せる（`op=hvf.deferred_reclaim` の `host_ram`。
+        // #4440）。対応付け前の backing は回収ではないので載せない。試験専用の明示 `unmap()` の経路では `guest_ram` なしで載る。
+        if self.unmap_tally.is_some() {
+            crate::hvf_lifecycle::record_host_ram_unmap(crate::hvf_abi::host_unmap_result(rc));
+        }
         if let Some(line) = crate::hvf_abi::host_unmap_failure_line(rc) {
             crate::hvf_loop::log_line(format_args!("{line}"));
             // 失敗は VM ごとの件数にも数える（停止の報告と集約行へ届く。#4411）。
@@ -1361,6 +1366,46 @@ mod tests {
         let ((), lines) = crate::hvf_loop::capture_log_lines(|| drop(ok));
         assert!(lines.is_empty());
         assert_eq!(ok_tally.count(), 0);
+    }
+
+    /// munmap の結果が、対応付けた backing（`unmap_tally` あり）の drop でだけスレッドの回収記録の `host_ram` に載る
+    /// （MVM-5・REPAIR-4・#4440）。対応付け前（`None`）は載らない。
+    #[test]
+    fn mvm5_4440_host_unmap_records_thread_reclaim() {
+        use crate::hvf_lifecycle::{ThreadReclaim, take_thread_reclaim};
+        let page = HostMapping::page_size().expect("page size");
+        let _ = take_thread_reclaim();
+        let m = HostMapping::new(page).expect("mmap");
+        let fake = HostMapping {
+            ptr: m.ptr.wrapping_byte_add(1),
+            len: m.len,
+            page_size: m.page_size,
+            unmap_tally: Some(Arc::new(UnmapTally::default())),
+        };
+        let ((), _) = crate::hvf_loop::capture_log_lines(|| drop(fake));
+        assert_eq!(
+            take_thread_reclaim(),
+            ThreadReclaim {
+                guest_ram: None,
+                host_ram: Some(Err(MicrovmErrorCode::Internal)),
+                vm: None,
+            }
+        );
+        drop(m);
+        let mut ok = HostMapping::new(page).expect("mmap");
+        ok.unmap_tally = Some(Arc::new(UnmapTally::default()));
+        drop(ok);
+        assert_eq!(
+            take_thread_reclaim(),
+            ThreadReclaim {
+                guest_ram: None,
+                host_ram: Some(Ok(())),
+                vm: None,
+            }
+        );
+        // 対応付け前の backing は記録しない。
+        drop(HostMapping::new(page).expect("mmap"));
+        assert_eq!(take_thread_reclaim(), ThreadReclaim::default());
     }
 
     /// 成功した munmap は行を出さない（#4292）。

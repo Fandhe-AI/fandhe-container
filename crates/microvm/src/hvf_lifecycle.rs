@@ -337,7 +337,7 @@ where
         }
     };
     // 全経路の drop を終えた後の値。期限切れ・遅延回収の経路では、切り離した vCPU スレッドが後で回収する RAM の失敗は
-    // 含まない（後からの回収は `op=hvf.deferred_reclaim` と `op=hvf.host_unmap` で観測。#4411）。
+    // 含まない（後からの回収は `op=hvf.deferred_reclaim`（munmap の失敗は `failed=host_ram`。#4440）と `op=hvf.host_unmap` で観測。#4411）。
     let unmap_failures = unmap.count();
     let vm_unmap_failures = vm_unmap.count();
     let mut outcome = outcome;
@@ -397,13 +397,17 @@ pub fn drop_vcpu_thread_state<H, M, V>(handlers: H, memory: M, vm: V) {
 pub struct ThreadReclaim {
     /// このスレッドで実行した `hv_vm_unmap` の結果。
     pub guest_ram: Option<Result<(), MicrovmErrorCode>>,
+    /// このスレッドで実行した backing の munmap の結果（#4440）。書き手は `sys::hvf::HostMapping` の drop で、VM へ対応付けた
+    /// backing だけを記録する（`hv_vm_unmap` が成功した後に走るため、`guest_ram` の `Ok` と対になる。対応付け前の backing は対象外）。
+    /// 試験専用の明示 `GuestMapping::unmap()` の経路では `guest_ram` は記録されず `host_ram` だけが記録される（製品の vCPU スレッドでは使わない）。
+    pub host_ram: Option<Result<(), MicrovmErrorCode>>,
     /// このスレッドで実行した `hv_vm_destroy` の結果。
     pub vm: Option<Result<(), MicrovmErrorCode>>,
 }
 
 thread_local! {
     static THREAD_RECLAIM: std::cell::Cell<ThreadReclaim> = const {
-        std::cell::Cell::new(ThreadReclaim { guest_ram: None, vm: None })
+        std::cell::Cell::new(ThreadReclaim { guest_ram: None, host_ram: None, vm: None })
     };
 }
 
@@ -427,6 +431,16 @@ pub fn record_guest_ram_unmap(r: Result<(), MicrovmErrorCode>) {
     });
 }
 
+/// 呼び出しスレッドで backing の munmap を実行した結果を記録する（`sys::hvf::HostMapping` の drop から。#4440・MVM-5・REPAIR-4）。
+/// スレッドローカルの破棄中は何も記録しない（drop の中で panic させない）。
+pub fn record_host_ram_unmap(r: Result<(), MicrovmErrorCode>) {
+    let _ = THREAD_RECLAIM.try_with(|c| {
+        let mut v = c.get();
+        v.host_ram = merge_result(v.host_ram, r);
+        c.set(v);
+    });
+}
+
 /// 呼び出しスレッドで `hv_vm_destroy` を実行した結果を記録する（`sys::hvf::HvVm` の drop から。#4146）。
 pub fn record_vm_destroy(r: Result<(), MicrovmErrorCode>) {
     let _ = THREAD_RECLAIM.try_with(|c| {
@@ -445,17 +459,22 @@ pub fn take_thread_reclaim() -> ThreadReclaim {
 
 /// 遅延回収の記録を 1 行にする（#4146・MVM-5・REPAIR-4）。記録が空なら `None`（行を出さない）。
 ///
-/// 成功は `level=info op=hvf.deferred_reclaim outcome=ok thread=<name> released=guest_ram,vm`（実行した分だけ並べる）。
+/// 成功は `level=info op=hvf.deferred_reclaim outcome=ok thread=<name> released=guest_ram,host_ram,vm`（実行した分だけ並べる）。
 /// 1 つでも失敗していれば `level=error ... outcome=error` で、成功した名前を `released=`、失敗した名前を `failed=`、最初の失敗の
-/// コードを `code=` に出す。名前の並びは常に `guest_ram`、`vm` の順。
+/// コードを `code=` に出す。名前の並びは常に `guest_ram`、`host_ram`、`vm` の順（実際の解放順 `hv_vm_unmap` → munmap → `hv_vm_destroy`。#4440）。
+/// `hv_vm_unmap` が失敗すると munmap は走らないため、`guest_ram` と `host_ram` の失敗は同時には起きない。
 pub fn deferred_reclaim_line(thread: &str, r: ThreadReclaim) -> Option<String> {
-    if r.guest_ram.is_none() && r.vm.is_none() {
+    if r.guest_ram.is_none() && r.host_ram.is_none() && r.vm.is_none() {
         return None;
     }
     let mut released: Vec<&str> = Vec::new();
     let mut failed: Vec<&str> = Vec::new();
     let mut code: Option<MicrovmErrorCode> = None;
-    for (name, res) in [("guest_ram", r.guest_ram), ("vm", r.vm)] {
+    for (name, res) in [
+        ("guest_ram", r.guest_ram),
+        ("host_ram", r.host_ram),
+        ("vm", r.vm),
+    ] {
         match res {
             Some(Ok(())) => released.push(name),
             Some(Err(e)) => {
@@ -576,6 +595,14 @@ mod tests {
         fn new(log: &Arc<Mutex<Vec<&'static str>>>) -> Self {
             Self(Arc::new(Mutex::new(Some(Rec("memory", Arc::clone(log))))))
         }
+
+        /// 解放時に munmap だけ失敗する模擬（#4440）。
+        fn with_munmap_failure(log: &Arc<Mutex<Vec<&'static str>>>) -> Self {
+            Self(Arc::new(Mutex::new(Some(Rec(
+                "memory_munmap_fails",
+                Arc::clone(log),
+            )))))
+        }
     }
 
     impl ReleaseMemory for SharedRam {
@@ -636,7 +663,15 @@ mod tests {
             }
             // 実際の drop で起きる解放の記録の模擬（`sys::hvf` の drop と同じ呼び出し。#4146）。
             match self.0 {
-                "memory" => record_guest_ram_unmap(Ok(())),
+                "memory" => {
+                    record_guest_ram_unmap(Ok(()));
+                    record_host_ram_unmap(Ok(()));
+                }
+                // munmap だけ失敗する場合の注入（#4440）。
+                "memory_munmap_fails" => {
+                    record_guest_ram_unmap(Ok(()));
+                    record_host_ram_unmap(Err(MicrovmErrorCode::Internal));
+                }
                 "vm" => record_vm_destroy(Ok(())),
                 _ => {}
             }
@@ -832,11 +867,41 @@ mod tests {
                 "hvf-vcpu-0",
                 ThreadReclaim {
                     guest_ram: g,
+                    host_ram: None,
+                    vm: v,
+                },
+            )
+        };
+        let line3 = |g, h, v| {
+            deferred_reclaim_line(
+                "hvf-vcpu-0",
+                ThreadReclaim {
+                    guest_ram: g,
+                    host_ram: h,
                     vm: v,
                 },
             )
         };
         assert_eq!(line(None, None), None);
+        assert_eq!(line3(None, None, None), None);
+        assert_eq!(
+            line3(ok, ok, ok).as_deref(),
+            Some(
+                "level=info op=hvf.deferred_reclaim outcome=ok thread=hvf-vcpu-0 released=guest_ram,host_ram,vm"
+            )
+        );
+        assert_eq!(
+            line3(None, ok, None).as_deref(),
+            Some(
+                "level=info op=hvf.deferred_reclaim outcome=ok thread=hvf-vcpu-0 released=host_ram"
+            )
+        );
+        assert_eq!(
+            line3(ok, Some(Err(MicrovmErrorCode::Internal)), ok).as_deref(),
+            Some(
+                "level=error op=hvf.deferred_reclaim outcome=error thread=hvf-vcpu-0 released=guest_ram,vm failed=host_ram code=INTERNAL"
+            )
+        );
         assert_eq!(
             line(ok, ok).as_deref(),
             Some(
@@ -874,11 +939,15 @@ mod tests {
         record_guest_ram_unmap(Ok(()));
         record_guest_ram_unmap(Err(MicrovmErrorCode::Internal));
         record_guest_ram_unmap(Ok(()));
+        record_host_ram_unmap(Ok(()));
+        record_host_ram_unmap(Err(MicrovmErrorCode::Internal));
+        record_host_ram_unmap(Ok(()));
         record_vm_destroy(Ok(()));
         assert_eq!(
             take_thread_reclaim(),
             ThreadReclaim {
                 guest_ram: Some(Err(MicrovmErrorCode::Internal)),
+                host_ram: Some(Err(MicrovmErrorCode::Internal)),
                 vm: Some(Ok(())),
             }
         );
@@ -921,13 +990,61 @@ mod tests {
             rec,
             ThreadReclaim {
                 guest_ram: Some(Ok(())),
+                host_ram: Some(Ok(())),
                 vm: Some(Ok(())),
             }
         );
         assert_eq!(
             deferred_reclaim_line("hvf-test", rec).as_deref(),
             Some(
-                "level=info op=hvf.deferred_reclaim outcome=ok thread=hvf-test released=guest_ram,vm"
+                "level=info op=hvf.deferred_reclaim outcome=ok thread=hvf-test released=guest_ram,host_ram,vm"
+            )
+        );
+    }
+
+    /// MVM-5・REPAIR-4・#4440: 遅延回収で munmap が失敗すると、vCPU スレッドの記録に `host_ram` の `Err` が残り、
+    /// 行が `outcome=error`・`failed=host_ram` になる。親のスレッドは何も記録しない。
+    #[test]
+    fn mvm5_repair4_4440_deferred_reclaim_reports_munmap_failure() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let ram = SharedRam::with_munmap_failure(&log);
+        let vm = Arc::new(Rec("vm", Arc::clone(&log)));
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (rec_tx, rec_rx) = mpsc::channel::<ThreadReclaim>();
+        let (ram_t, vm_t, log_t) = (ram.clone(), Arc::clone(&vm), Arc::clone(&log));
+        let h = spawn_loop::<FakeKick, _>("hvf-test", LONG, move |start: LoopStart<FakeKick>| {
+            let _stop = start.ready(FakeKick);
+            let _ = release_rx.recv();
+            drop_vcpu_thread_state(Rec("handlers", log_t), ram_t, vm_t);
+            let _ = rec_tx.send(take_thread_reclaim());
+            (StopReason::Requested, HvRunStats::default())
+        })
+        .unwrap();
+        let r = Resources {
+            devices: Rec("devices", Arc::clone(&log)),
+            memory: ram,
+            vm,
+            unmap: Arc::default(),
+            vm_unmap: Arc::default(),
+        };
+        let _ = take_thread_reclaim();
+        let e = stop_and_release("hvf.microvm.stop", h, Duration::from_millis(50), r).unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::DeadlineExceeded);
+        assert_eq!(take_thread_reclaim(), ThreadReclaim::default());
+        release_tx.send(()).unwrap();
+        let rec = rec_rx.recv_timeout(LONG).unwrap();
+        assert_eq!(
+            rec,
+            ThreadReclaim {
+                guest_ram: Some(Ok(())),
+                host_ram: Some(Err(MicrovmErrorCode::Internal)),
+                vm: Some(Ok(())),
+            }
+        );
+        assert_eq!(
+            deferred_reclaim_line("hvf-test", rec).as_deref(),
+            Some(
+                "level=error op=hvf.deferred_reclaim outcome=error thread=hvf-test released=guest_ram,vm failed=host_ram code=INTERNAL"
             )
         );
     }
@@ -966,6 +1083,7 @@ mod tests {
             take_thread_reclaim(),
             ThreadReclaim {
                 guest_ram: Some(Ok(())),
+                host_ram: Some(Ok(())),
                 vm: Some(Ok(())),
             }
         );

@@ -6,6 +6,8 @@
 //! `NetworkName`（`/`・NUL・`..` を作れない）・定数・`read_dir` の項目だけで、外部入力を直接連結しない。
 
 use std::fs::{self, DirBuilder, File, OpenOptions};
+
+use crate::flock_release::ExplicitUnlockFile;
 use std::io::{self, Read};
 use std::marker::PhantomData;
 use std::os::fd::AsRawFd;
@@ -309,11 +311,11 @@ impl std::fmt::Debug for NetworkStore {
     }
 }
 
-/// 全体のロックのガード。解放はドロップ時。
+/// 全体のロックのガード。解放はドロップ時（明示 unlock してから閉じる。複製 fd が残っても外れる。#4514）。
 #[derive(Debug)]
 pub struct GlobalLockGuard<'a> {
     store: &'a NetworkStore,
-    file: File,
+    file: ExplicitUnlockFile,
     /// 共有ロックか。定義の削除は排他ロックでだけ許す（#3550）。
     shared: bool,
 }
@@ -328,7 +330,7 @@ pub struct NetworkLockGuard<'g> {
     /// ストアの状態ルート（[`NetworkStore::state_root`] と同じ）。
     state_root: PathBuf,
     dir: Dir,
-    file: File,
+    file: ExplicitUnlockFile,
 }
 
 impl NetworkLockGuard<'_> {
@@ -510,6 +512,8 @@ impl NetworkStore {
             self.lock_timeout,
             "timed out waiting for the network store lock",
         )?;
+        // 取得直後に包む（以降の失敗経路でも明示 unlock で外す。#4514）。
+        let file = ExplicitUnlockFile::new(file);
         // 取得までに差し替えられていないか、パスの inode と掴んだ fd を照合する。
         let on_disk = fs::symlink_metadata(self.dir.path(LOCK_FILE))
             .map_err(|e| map_io(&e, "failed to stat network store lock file"))?;
@@ -829,6 +833,7 @@ impl GlobalLockGuard<'_> {
             self.store.lock_timeout,
             "timed out waiting for the network lock",
         )?;
+        let file = ExplicitUnlockFile::new(file);
         // 取得までに削除・作り直しされていないか、パスの inode と掴んだ fd を照合する。
         let on_disk = fs::symlink_metadata(dir.path(LOCK_FILE))
             .map_err(|e| map_io(&e, "failed to stat network lock file"))?;
@@ -968,6 +973,59 @@ mod tests {
         };
         assert!(sync_init(&root, &bad).is_err());
         assert!(sync_init(&bad, &nets).is_err());
+    }
+
+    /// 複製 fd を残したまま guard を drop したとき、別 OFD の取得が通ることを照合する（陽性対照つき）。
+    fn assert_drop_releases_despite_dup(lock_path: &Path, dup: File, drop_guard: impl FnOnce()) {
+        let probe = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .unwrap();
+        assert!(matches!(
+            probe.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        drop_guard();
+        assert!(probe.try_lock().is_ok());
+        probe.unlock().unwrap();
+        // 陽性対照: 包まない File は close だけでは複製がある間外れない。
+        let plain = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .unwrap();
+        plain.try_lock().unwrap();
+        let plain_dup = plain.try_clone().unwrap();
+        drop(plain);
+        assert!(matches!(
+            probe.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        drop(plain_dup);
+        drop(dup);
+    }
+
+    /// OCI-5・REPAIR-5・#4514: 全体ロックの guard は複製 fd が残っても drop で外れる。
+    #[test]
+    fn oci5_repair5_4514_global_lock_guard_drop_releases_lock_despite_duplicate_fd() {
+        let t = Tmp::new("g4514");
+        let s = NetworkStore::open(&t.0).unwrap();
+        let g = s.lock_global_exclusive().unwrap();
+        let dup = g.file.clone_file_for_test().unwrap();
+        assert_drop_releases_despite_dup(&t.0.join("@networks/@lock"), dup, || drop(g));
+    }
+
+    /// OCI-5・REPAIR-5・#4514: ネットワークロックの guard も複製 fd が残っても drop で外れる。
+    #[test]
+    fn oci5_repair5_4514_network_lock_guard_drop_releases_lock_despite_duplicate_fd() {
+        let t = Tmp::new("n4514");
+        let s = NetworkStore::open(&t.0).unwrap();
+        s.create(&pasta("n1")).unwrap();
+        let g = s.lock_global_exclusive().unwrap();
+        let ng = g.lock_network(&nn("n1")).unwrap();
+        let dup = ng.file.clone_file_for_test().unwrap();
+        assert_drop_releases_despite_dup(&t.nets().join("n1/@lock"), dup, || drop(ng));
     }
 
     fn nn(s: &str) -> NetworkName {

@@ -91,6 +91,8 @@ pub mod add_host_dns;
 pub mod dns_helper;
 pub mod error;
 pub mod etc_hosts;
+/// flock を drop で明示 unlock する RAII（#4514）。
+mod flock_release;
 pub mod instrument;
 pub mod netlink;
 pub mod netlink_route;

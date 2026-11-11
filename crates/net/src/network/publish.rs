@@ -45,6 +45,7 @@ use std::time::{Duration, Instant};
 
 use super::{EndpointId, NetworkName};
 use crate::error::{NetError, NetErrorCode};
+use crate::flock_release::ExplicitUnlockFile;
 use crate::nftables_rules::{
     NftCmp, NftDataValue, NftImmediate, NftNat, NftPayload, NftRegister, NftRuleExprs,
 };
@@ -335,15 +336,16 @@ fn open_verified(path: &Path, create: bool) -> Result<Option<File>, NetError> {
 /// 共有ファイルのロックファイル（`<path>.lock`）を開いて排他ロックする（期限付き）。
 ///
 /// データファイルは原子的な rename で置き換えるため inode が変わる。ロックはデータファイルではなく
-/// 置き換えない専用ロックファイルに掛ける。返す `File` を保持している間がロック区間。
-fn open_locked(path: &Path) -> Result<File, NetError> {
+/// 置き換えない専用ロックファイルに掛ける。返す guard を保持している間がロック区間。drop で明示 unlock して閉じるため、
+/// 他スレッドの spawn が複製 fd を持っても外れる（#4514・OCI-5・REPAIR-5）。
+fn open_locked(path: &Path) -> Result<ExplicitUnlockFile, NetError> {
     let lock_path = with_suffix(path, ".lock");
     let file = open_verified(&lock_path, true)?
         .ok_or_else(|| shared_err("failed to open shared port registry"))?;
     let deadline = Instant::now() + SHARED_LOCK_TIMEOUT;
     loop {
         match file.try_lock() {
-            Ok(()) => return Ok(file),
+            Ok(()) => return Ok(ExplicitUnlockFile::new(file)),
             Err(std::fs::TryLockError::WouldBlock) => {
                 if Instant::now() >= deadline {
                     return Err(NetError::new(
@@ -788,6 +790,39 @@ impl PortRegistry {
 mod tests {
     use super::*;
     use crate::nftables_rules::NatType;
+
+    /// OCI-5・REPAIR-5・#4514: 共有ポート登録のロックは複製 fd が残っても drop で外れる（陽性対照つき）。
+    #[cfg(unix)]
+    #[test]
+    fn oci5_repair5_4514_shared_port_registry_lock_releases_despite_duplicate_fd() {
+        use std::fs::TryLockError;
+        let root = crate::test_root::test_root("fc-portreg-4514", "dup");
+        let path = root.join("ports.reg");
+        let lock_path = with_suffix(&path, ".lock");
+        let guard = open_locked(&path).unwrap();
+        let dup = guard.clone_file_for_test().unwrap();
+        let probe = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        assert!(matches!(probe.try_lock(), Err(TryLockError::WouldBlock)));
+        drop(guard);
+        assert!(probe.try_lock().is_ok());
+        probe.unlock().unwrap();
+        // 陽性対照: 包まない File は close だけでは複製がある間外れない。
+        let plain = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        plain.try_lock().unwrap();
+        let plain_dup = plain.try_clone().unwrap();
+        drop(plain);
+        assert!(matches!(probe.try_lock(), Err(TryLockError::WouldBlock)));
+        drop(plain_dup);
+        drop(dup);
+    }
 
     fn a(x: [u8; 4]) -> Ipv4Addr {
         Ipv4Addr::from(x)

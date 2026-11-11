@@ -33,9 +33,9 @@
 | oci `image_management/store.rs` | `ImageStoreGuard._file` | (b) | あり | 期限つき | 該当（#4513） |
 | oci `image_management/pull.rs` | `@pull.lock` | (b) | あり | GC が `Live` と見て残す（次回回収） | 無害（余分に残す側に倒れ、無期限にならない） |
 | oci `image_management/pull_recovery.rs` | 回収側の `Absent(Some(file))` | (b) | あり | ファイルを消した後は待つ側が無い | 無害 |
-| net `network_store/imp.rs` | `GlobalLockGuard` / `NetworkLockGuard`（`Drop` は `note_release()` のみ） | (b) | あり（pasta 等を spawn） | 期限つき | 該当（#4514） |
-| net `network/publish.rs` | 共有ポート登録のロック | (b) | あり | 期限つき（`Timeout`） | 該当（#4514） |
-| net `add_host_dns/hosts_file.rs` | hosts のロック | (b) | あり | 期限つき（`Timeout`） | 該当（#4514） |
+| net `network_store/imp.rs` | `GlobalLockGuard` / `NetworkLockGuard`（`Drop` は `note_release()` のみ） | (a)（`ExplicitUnlockFile`） | あり（pasta 等を spawn） | 期限つき | 修正済み（#4514。`oci5_repair5_4514_global_lock_guard_drop_releases_lock_despite_duplicate_fd` ほか） |
+| net `network/publish.rs` | 共有ポート登録のロック | (a)（`ExplicitUnlockFile`） | あり | 期限つき（`Timeout`） | 修正済み（#4514。`oci5_repair5_4514_shared_port_registry_lock_releases_despite_duplicate_fd`） |
+| net `add_host_dns/hosts_file.rs` | hosts のロック | (a)（`ExplicitUnlockFile`） | あり | 期限つき（`Timeout`） | 修正済み（#4514。`oci5_repair5_4514_hosts_lock_releases_despite_duplicate_fd`） |
 | cri `shim_v2/bootstrap.rs` | `IdLock`・ops.log・daemon log のロック | (b) | あり（daemon の spawn・監査 relay の fork） | 期限つき | 該当（#4515） |
 | cri `runtime_service/record_store/file.rs` | 記録ストアの `.lock` | (b) | あり | 期限つき（`LockTimeout`） | 該当（#4515） |
 | plugin-cri `netsetup/reclaim_store.rs` | 回収待ち記録の `.lock` | (b) | あり | 期限つき | 該当（#4516） |
@@ -55,6 +55,8 @@
 ## fork 子による誤解放の確認
 
 `LOCK_UN` は OFD 単位で効くため、fork した子で guard の `Drop` が走ると親のロックまで外れる。core の fork 子（`sys::fork_single_threaded*`）は `_exit` で終わり親のスタックを巻き戻さない。`remove_tree_in_userns`・孤児回収の子の body は、親の `Backing`・局所ロックをムーブしていない（子が自分で `lock_and_recheck` を呼ぶ）。確認日: #4492 実装時。
+
+net の子プロセスは `Command::spawn`（exec 経路）だけで、exec しない fork を持たない。`pre_exec` の closure は `prctl`・`getppid` のみで guard を捕捉しない。guard の外部利用者（cli・supervisor）も子の body へムーブしていない。確認日: #4514 実装時。
 
 ## 範囲外
 

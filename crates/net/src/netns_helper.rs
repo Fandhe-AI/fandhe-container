@@ -1,6 +1,8 @@
 //! netns holder と netns-dial helper が共有する下位処理（Linux のみ。REPAIR-1・REPAIR-5・NET-9・CRI-6・SEC-1・#4510）。
 //!
-//! 呼び出し元は `crate::netns_holder::holder`（NET-9）と `crate::netns_dial::helper`（CRI-6）の 2 つの helper プロセス本体。
+//! 呼び出し元は `crate::netns_holder::holder`（NET-9）と `crate::netns_dial::helper`（CRI-6）の 2 つの helper プロセス本体と、
+//! 親側の `crate::netns_holder::channel`（supervisor）・`crate::netns_dial::channel`（plugin-cri）の期限つき受信と識別の
+//! 取得（#4533。親側は多スレッドのプロセスで動く。期限つき受信と識別の取得はスレッド数を前提にしない）。
 //! 両者は `setns(CLONE_NEWUSER)` の前に単一スレッドで動くため、親の照合・期限つき受信・fd と参加後の ns の識別の
 //! 取得を別々に持つと、片方だけ直して欠陥が残る（#4498 の受信の修正が例）。本モジュールはその 4 つの本体を
 //! 失敗の型に依存しない形で 1 か所に置き、失敗の `Fail` / `DialErrorCode` への写像は各 helper が持つ。
@@ -64,13 +66,23 @@ pub(crate) fn recv_before_deadline(
     buf: &mut [u8],
     max_fds: usize,
 ) -> Result<sysh::Received, RecvError> {
+    recv_loop_before_deadline(fd, deadline, || sysh::recv_with_fds(fd, buf, max_fds))
+}
+
+/// 期限つき受信のループ本体（helper と親側 channel の唯一の実装。#4533）。受信そのものは `recv` が行う。
+/// fd の受信上限（dial は 1、holder の READY は 0）は呼び出し側が `recv` の中で決める（SEC-1）。
+pub(crate) fn recv_loop_before_deadline(
+    fd: BorrowedFd<'_>,
+    deadline: &Deadline,
+    mut recv: impl FnMut() -> Result<sysh::Received, SysError>,
+) -> Result<sysh::Received, RecvError> {
     loop {
         match sys::wait_readable(fd, deadline) {
             Err(e) => return Err(RecvError::Wait(e)),
             Ok(Readiness::TimedOut) => return Err(RecvError::TimedOut),
             Ok(Readiness::Readable | Readiness::Exceptional) => {}
         }
-        match sysh::recv_with_fds(fd, buf, max_fds) {
+        match recv() {
             Ok(r) => return Ok(r),
             // poll の後に消えた・シグナル中断。残り時間で待ち直す。
             Err(SysError::Os(n)) if n == sys::EAGAIN || n == sys::EINTR => {
@@ -244,5 +256,85 @@ mod tests {
             let m = std::fs::metadata(path).unwrap();
             assert_eq!(self_ns_identity(ns), Ok((m.dev(), m.ino())));
         }
+    }
+
+    fn ready_pair() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
+        let (a, b) = sysh::socketpair_seqpacket().unwrap();
+        // 1 通置いたままにして readable を続けさせる（偽の recv は読まない）。
+        sysh::send_with_fds(b.as_fd(), b"x", &[], true).unwrap();
+        (a, b)
+    }
+
+    fn ok_recv() -> Result<sysh::Received, SysError> {
+        Ok(sysh::Received {
+            len: 4,
+            data_truncated: false,
+            ctrl_truncated: false,
+            fds: vec![],
+        })
+    }
+
+    /// REPAIR-5・#4533: EAGAIN / EINTR は待ち直して次の recv の成功を返す。
+    #[test]
+    fn repair5_4533_recv_loop_retries_eagain_and_eintr_then_succeeds() {
+        let (a, _b) = ready_pair();
+        let mut calls = 0u32;
+        let started = Instant::now();
+        let r =
+            recv_loop_before_deadline(a.as_fd(), &Deadline::after(Duration::from_secs(2)), || {
+                calls += 1;
+                match calls {
+                    1 | 3 => Err(SysError::Os(sys::EAGAIN)),
+                    2 => Err(SysError::Os(sys::EINTR)),
+                    _ => ok_recv(),
+                }
+            })
+            .unwrap();
+        assert_eq!((calls, r.len), (4, 4));
+        let e = started.elapsed();
+        assert!(
+            e >= 3 * RECV_RETRY_INTERVAL && e < Duration::from_secs(2),
+            "{e:?}"
+        );
+    }
+
+    /// REPAIR-5・#4533: EAGAIN が続くと期限で TimedOut。
+    #[test]
+    fn repair5_4533_recv_loop_eagain_until_deadline_is_timed_out() {
+        let (a, _b) = ready_pair();
+        let mut calls = 0u32;
+        let started = Instant::now();
+        let r = recv_loop_before_deadline(
+            a.as_fd(),
+            &Deadline::after(Duration::from_millis(100)),
+            || {
+                calls += 1;
+                Err(SysError::Os(sys::EAGAIN))
+            },
+        );
+        assert!(matches!(r, Err(RecvError::TimedOut)), "{r:?}");
+        let e = started.elapsed();
+        assert!(
+            e >= Duration::from_millis(100) && e < Duration::from_secs(2),
+            "{e:?}"
+        );
+        assert!(calls >= 1);
+    }
+
+    /// REPAIR-5・#4533: その他の errno は待ち直さず Recv。
+    #[test]
+    fn repair5_4533_recv_loop_other_errno_is_recv_error() {
+        let (a, _b) = ready_pair();
+        let mut calls = 0u32;
+        let r =
+            recv_loop_before_deadline(a.as_fd(), &Deadline::after(Duration::from_secs(2)), || {
+                calls += 1;
+                Err(SysError::Os(sys::EINVAL))
+            });
+        assert!(
+            matches!(r, Err(RecvError::Recv(SysError::Os(n))) if n == sys::EINVAL),
+            "{r:?}"
+        );
+        assert_eq!(calls, 1);
     }
 }

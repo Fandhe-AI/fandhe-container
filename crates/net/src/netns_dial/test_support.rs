@@ -1,7 +1,7 @@
 //! 試験専用: `netns-dial` helper の実プロセス経路を結合試験で駆動するための入口（feature
 //! `netns-dial-test-support`。CRI-6・NET-3・SEC-1・REPAIR-12・#4479）。
 //!
-//! 本番の親側 channel は #4480 で、それまでの間、試験が helper の stdin になる `SOCK_SEQPACKET` 対を作り、任意の
+//! 本番の親側 channel は `netns_dial::channel`（#4480）。本入口は負の場面（任意のバイト列・fd）を作るために、試験が helper の stdin になる `SOCK_SEQPACKET` 対を作り、任意の
 //! バイト列と fd を送り、応答を期限つきで受けるために使う。リリースビルドでは feature ごとコンパイルを止める（`lib.rs`）。
 //! `unsafe` は持たず、`crate::sys::holder` の安全なラッパーだけを使う。
 

@@ -284,7 +284,7 @@ pub(super) fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
 #[cfg(test)]
 mod tests {
     //! `RealJoiner`（setns・capset・NNP・non-dumpable）は不可逆でプロセス全体に効くため、ここでは呼ばない。
-    //! 実際の setns の成功経路は #4480 の実機前提試験 `netns_dial_userns` が担う。`run` も `close_range` が
+    //! 実際の setns の成功経路は実機前提試験 `netns_dial_userns` が担う。`run` も `close_range` が
     //! 試験ハーネスの fd を閉じるため呼ばない（argv の検査だけ `check_args` で試験する）。
     use super::*;
     use crate::netns_dial::frame::ConnectTimeout;

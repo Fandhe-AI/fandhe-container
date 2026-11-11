@@ -524,8 +524,7 @@ pub(crate) fn send_one_fd(
 
 /// fd を最大 1 本だけ受ける入口（`netns-dial` の親側。SEC-1・NET-3・#4478）。制御バッファは `CMSG_LEN(4)` で、
 /// 2 本目以降はカーネルが閉じて `ctrl_truncated` が立つ。本数が 1 本ちょうどか・`ctrl_truncated` が偽かの検査は
-/// 呼び出し側の channel（#4480）が行う（0 本の応答もここでは `Ok` で返る）。
-#[allow(dead_code)] // 親側の channel（#4480）が使うまでは試験のみ。
+/// `netns_dial::channel`（#4480）が行う（0 本の応答もここでは `Ok` で返る）。
 pub(crate) fn recv_one_fd(fd: BorrowedFd<'_>, buf: &mut [u8]) -> Result<Received, SysError> {
     recv_with_fds(fd, buf, 1)
 }

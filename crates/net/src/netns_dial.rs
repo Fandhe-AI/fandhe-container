@@ -5,8 +5,8 @@
 //! `127.0.0.1:<port>` へ connect し、接続済みの fd を `SCM_RIGHTS` で返す。本モジュールの現状は両者の間を行き来する
 //! 固定長 frame（[`frame`]。OS 非依存の純関数）、受け取った fd の検証 `verify`
 //! （`verify_dialed_socket`。#4478。SEC-1 の多層防御。`NsId` が Linux 限定のため Linux のみ）、helper 本体
-//! `run_netns_dial_main`（#4479。Linux のみ。それ以外は終了コード 1）。親側の channel（#4480）は
-//! 未実装（REPAIR-3。未実装のものを実装済みとして扱わない）。
+//! `run_netns_dial_main`（#4479。Linux のみ。それ以外は終了コード 1）。親側の channel `channel`
+//! （`NetnsDialChannel`。#4480。Linux のみ）が socketpair・要求の送信・応答の期限つき受信・fd の検証を担う。
 //!
 //! # helper の手順（順序は変えない。失敗の固定語彙への対応表は `helper` モジュールの `//!`）
 //! 1. argv が空であることを確かめる（非空は応答なしで終了コード 2）
@@ -44,6 +44,8 @@ pub fn run_netns_dial_main(args: impl Iterator<Item = OsString>) -> ExitCode {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub mod channel;
 pub mod frame;
 #[cfg(target_os = "linux")]
 mod helper;
@@ -58,6 +60,11 @@ pub use frame::{
     FRAME_LEN, MAX_CONNECT_TIMEOUT_MS, MIN_CONNECT_TIMEOUT_MS,
 };
 
+#[cfg(target_os = "linux")]
+pub use channel::{
+    MAX_RESPONSE_TIMEOUT, NetnsDialChannel, NetnsDialError, NetnsDialFailure, NetnsDialFds,
+    SentDial,
+};
 #[cfg(target_os = "linux")]
 pub use verify::{
     DialExpectation, DialedSocketError, DialedSocketRejection, NsId, verify_dialed_socket,

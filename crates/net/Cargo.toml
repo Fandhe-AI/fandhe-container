@@ -27,7 +27,7 @@ netns-holder-test-support = []
 dns-helper-test-support = []
 # 試験専用: netns-dial helper の stdin 側の seqpacket 対の作成と、任意のバイト列・fd の送受信の入口
 # （`netns_dial::test_support`。helper の実プロセス経路の結合試験用。CRI-6・NET-3・SEC-1・REPAIR-12・#4479）。
-# 親側の本番 channel は #4480。リリースビルドで有効なら lib.rs の compile_error! で止める。依存は増えない。
+# 親側の本番 channel は `netns_dial::channel`（#4480）。リリースビルドで有効なら lib.rs の compile_error! で止める。依存は増えない。
 netns-dial-test-support = []
 
 [dev-dependencies]

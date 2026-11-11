@@ -3008,6 +3008,12 @@ jobs:
             --src crates/plugin-cri/tests/cri_exec_real.rs --log "${log}" \
             --select '^production_binary_exec_real: pod-net ok: ' --min 2 \
             --forbid 'PRECONDITION FAILED' --forbid 'pod-net FAILED' --summary
+          # 段 F（#4487・CRI-6・NET-3・SEC-1）: POD の port-forward（netns-dial helper 経由）の往復・取り違えの否定・host への
+          # 非縮退の成功行 5 行を試験ソースから導出して照合する。pull・ステップ数・期限・PROBE_MIN_REMAINING=4 は変えない。
+          scripts/check-success-lines.sh --name production_binary_exec_real_pod_forward \
+            --src crates/plugin-cri/tests/cri_exec_real.rs --log "${log}" \
+            --select '^production_binary_exec_real: port-forward ok: ' --min 5 \
+            --forbid 'PRECONDITION FAILED' --forbid 'port-forward FAILED' --summary
 
       # production_binary_attach_real（`crates/plugin-cri/tests/cri_attach_real.rs`。libtest の `#[ignore]`。
       # CRI-6・SUP-4・SEC-1・REPAIR-12・#4079）: 本番バイナリ越しに実コンテナ（busybox）へ完全版 Attach を通し、

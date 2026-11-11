@@ -25,6 +25,12 @@
 //!   pod ごとに異なり保持役（`pod-holder`）の netns と一致することを具体値で照合する。pull は増やさない。
 //!   成功行 2 行（`pod-net ok:`）を CI が試験ソースから導出して照合する。
 //!
+//! - 段 F（#4487・CRI-6・NET-3・SEC-1・REPAIR-5・REPAIR-12。設計 #3766）: 段 P の pod A（18181）と pod B（18182）の待ち受けへ、
+//!   CRI の PortForward（本番の `PodNetnsDialer` → `netns-dial` helper）で往復できること、A の URL は B へ・B の URL は A へ届かないこと、
+//!   どちらの URL も host の `127.0.0.1` の listener へ縮退しないこと（受理数の不変）を具体値で照合する。否定は dial 失敗の種類が
+//!   区別できないため、前後の正の往復と host への直接接続を括弧とする。各セッションの後に helper が残らないことも確かめる。
+//!   成功行 5 行（`port-forward ok:`）を CI が試験ソースから導出して照合する。pull は増やさない。
+//!
 //! 失敗後の残骸の回収（#4142）: 本体を 2 回走らせる（1 回目は StartContainer の直後に注入した失敗、回収、2 回目は同じ metadata で通す）。
 //! 注入では plugin-cri を SIGKILL してから panic させ、外側の回収が死活を判定して起動し直して回収する（#4326。共有部品 `reclaim_restarting`）。
 //! 回収の部品は `support/cri_real_reclaim.rs`（トークンのラベルと台帳の ID だけを期限つきで Stop / Remove する）。
@@ -827,6 +833,323 @@ async fn remove_pod(
     reclaim::forget_sandbox(ledger, sb);
 }
 
+// ---- 段 F（#4487）: POD ネットワークの port-forward（netns-dial helper 経由）----
+
+/// 段 F の pod B の待ち受けポート（pod A は段 P の 18181）。
+const POD_FORWARD_PORT_B: u16 = 18182;
+/// 段 F で往復させるバイト列（固定リテラル）。
+const POD_FORWARD_PAYLOAD: &str = "fandhe-pod-forward-4487\n";
+/// host の listener が返す印。pod の URL 経由でこれが返ったら host の loopback へ縮退している。
+const POD_FORWARD_HOST_MARK: &str = "fandhe-host-4487\n";
+/// PortForward の SPDY 版。
+const PF_VERSION: &str = "portforward.k8s.io";
+/// 往復の再試行の上限（nc のループの受理の合間を吸収する。REPAIR-5）。
+const PF_RETRY_DEADLINE: Duration = Duration::from_secs(20);
+
+/// 段 F の成功行 5 行（`check-success-lines.sh` が試験ソースから導出して照合する。プレースホルダは使わない）。
+const PF_OK_POD_A: &str = "production_binary_exec_real: port-forward ok: pod A listener echoed the payload through the netns-dial helper";
+const PF_OK_POD_B: &str = "production_binary_exec_real: port-forward ok: pod B listener echoed the payload only through the pod B url";
+const PF_OK_A_TO_B: &str = "production_binary_exec_real: port-forward ok: the pod A url could not reach the pod B listener on 127.0.0.1:18182";
+const PF_OK_B_TO_A: &str = "production_binary_exec_real: port-forward ok: the pod B url could not reach the pod A listener on 127.0.0.1:18181";
+const PF_OK_HOST: &str = "production_binary_exec_real: port-forward ok: pod urls could not reach the host 127.0.0.1 listener";
+
+/// 否定時に cri が error ストリームへ書く文言（dial 失敗の種類は区別されない）。固定リテラルで持つ。
+const PF_ERR_PORT_A: &str = "error forwarding port 18181: connection failed";
+const PF_ERR_PORT_B: &str = "error forwarding port 18182: connection failed";
+
+/// pod B の待ち受けの command（固定リテラル。実行時の値を入れない）。
+fn pod_forward_server_script_b() -> &'static str {
+    "while :; do /bin/nc -l -p 18182 -e /bin/cat; done"
+}
+
+/// 1 回の port-forward の結果。
+struct PfOutcome {
+    data: Vec<u8>,
+    error: Vec<u8>,
+    rsts: usize,
+    goaway: Option<u32>,
+}
+
+/// `PortForward` RPC で `sb` の URL を得る。URL・トークンの値は出力しない。
+async fn pf_url(c: &mut RuntimeServiceClient<Channel>, sb: &str, port: u16) -> String {
+    let url = call_with_deadline(
+        c.port_forward(cri::PortForwardRequest {
+            pod_sandbox_id: sb.into(),
+            port: vec![i32::from(port)],
+        }),
+        RPC_DEADLINE,
+    )
+    .await
+    .expect("port-forward rpc must return a url")
+    .into_inner()
+    .url;
+    assert!(url.starts_with("http://127.0.0.1:"), "url must be loopback");
+    assert!(
+        url.contains("/portforward/"),
+        "url must be a portforward path"
+    );
+    url
+}
+
+/// URL を取り直して SPDY で `port` へ接続し、`payload` を送って data・error を FIN まで読む（ブロッキングは spawn_blocking）。
+async fn pf_round_trip(
+    c: &mut RuntimeServiceClient<Channel>,
+    sb: &str,
+    port: u16,
+    payload: &[u8],
+) -> PfOutcome {
+    let url = pf_url(c, sb, port).await;
+    let (authority, path) = split_url(&url);
+    let addr: SocketAddr = authority.parse().expect("authority");
+    let payload = payload.to_vec();
+    let join = tokio::task::spawn_blocking(move || {
+        let mut s = Spdy::connect(addr, &path, &[PF_VERSION], PF_VERSION);
+        s.tcp
+            .set_read_timeout(Some(SPDY_READ_TIMEOUT))
+            .expect("read timeout");
+        let (error, data) = spdy_client::open_pf_pair(&mut s, &port.to_string(), "0");
+        s.send_data(data, &payload, false);
+        s.send_data(data, b"", true);
+        let data_bytes = s.read_until_fin(data);
+        let error_bytes = s.read_until_fin(error);
+        PfOutcome {
+            data: data_bytes,
+            error: error_bytes,
+            rsts: s.rsts.len(),
+            goaway: s.goaway,
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(90), join)
+        .await
+        .expect("port-forward deadline")
+        .expect("join")
+}
+
+/// 正: 応答が `payload` と一致するまで期限つきで繰り返す。一致時は error が空・RST・異常 GOAWAY が無いことも確かめる。
+async fn pf_round_trip_until_match(
+    c: &mut RuntimeServiceClient<Channel>,
+    sb: &str,
+    port: u16,
+    payload: &str,
+) {
+    let start = Instant::now();
+    loop {
+        let o = pf_round_trip(c, sb, port, payload.as_bytes()).await;
+        if o.data == payload.as_bytes() {
+            assert!(o.error.is_empty(), "error stream must be empty");
+            assert_eq!(o.rsts, 0, "no RST_STREAM expected");
+            assert!(
+                matches!(o.goaway, None | Some(0)),
+                "no abnormal GOAWAY expected"
+            );
+            return;
+        }
+        assert!(
+            start.elapsed() < PF_RETRY_DEADLINE,
+            "no echo through port-forward within 20s: data={:?} error={:?}",
+            String::from_utf8_lossy(&o.data),
+            String::from_utf8_lossy(&o.error)
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// 否定: error ストリームが `expected_error` に完全一致し、data が空で終わる。
+async fn pf_expect_refused(
+    c: &mut RuntimeServiceClient<Channel>,
+    sb: &str,
+    port: u16,
+    expected_error: &str,
+) {
+    let o = pf_round_trip(c, sb, port, POD_FORWARD_PAYLOAD.as_bytes()).await;
+    assert!(
+        o.data.is_empty(),
+        "the url must not reach port {port}: data={:?}",
+        String::from_utf8_lossy(&o.data)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&o.error),
+        expected_error,
+        "dial must fail with the fixed error text"
+    );
+}
+
+/// host loopback の listener（試験プロセス＝NODE の netns）。受理数を数え、固定の印を返して閉じる。
+/// Drop で停止フラグを立てて join する（REPAIR-5）。
+struct HostListener {
+    port: u16,
+    accepted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl HostListener {
+    fn start() -> Self {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind host listener");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let port = listener.local_addr().expect("addr").port();
+        let accepted = std::sync::Arc::new(AtomicUsize::new(0));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (a, s) = (accepted.clone(), stop.clone());
+        let thread = std::thread::spawn(move || {
+            use std::io::Write as _;
+            while !s.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut conn, _)) => {
+                        a.fetch_add(1, Ordering::SeqCst);
+                        let _ = conn.set_write_timeout(Some(Duration::from_secs(2)));
+                        let _ = conn.write_all(POD_FORWARD_HOST_MARK.as_bytes());
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(20)),
+                }
+            }
+        });
+        Self {
+            port,
+            accepted,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn accepted(&self) -> usize {
+        self.accepted.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// 試験プロセスから直接つなぎ、印を受け取る（listener が生きていることのブラケット）。
+    fn connect_directly(&self) {
+        use std::io::Read as _;
+        let addr: SocketAddr = ([127, 0, 0, 1], self.port).into();
+        let mut conn = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+            .expect("connect host listener directly");
+        conn.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let mut buf = Vec::new();
+        let _ = conn.read_to_end(&mut buf);
+        assert_eq!(buf, POD_FORWARD_HOST_MARK.as_bytes(), "host mark");
+    }
+}
+
+impl Drop for HostListener {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// `parent` の子のうち第 1 引数が `netns-dial` のもの（helper）の (pid, 開始時刻)。
+fn netns_dial_helpers_of(parent: u32) -> Vec<(u32, u64)> {
+    let mut found = Vec::new();
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{parent}/task")) else {
+        return found;
+    };
+    for t in tasks.flatten() {
+        let Ok(children) = std::fs::read_to_string(t.path().join("children")) else {
+            continue;
+        };
+        for pid in children
+            .split_whitespace()
+            .filter_map(|v| v.parse::<u32>().ok())
+        {
+            if cmdline_args(pid).is_some_and(|a| a.get(1).map(String::as_str) == Some("netns-dial"))
+                && let Some((state, start)) = proc_state_and_start(pid)
+                && state != 'Z'
+                && state != 'X'
+            {
+                found.push((pid, start));
+            }
+        }
+    }
+    found
+}
+
+/// netns-dial helper が 2 秒以内に残らなくなることを確かめる（REPAIR-5）。
+fn assert_no_netns_dial_helpers(plugin_pid: u32) {
+    let start = Instant::now();
+    loop {
+        let left = netns_dial_helpers_of(plugin_pid);
+        if left.is_empty() {
+            return;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "netns-dial helpers remain after the session: {} left",
+            left.len()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// 段 F（#4487・CRI-6・NET-3・SEC-1・REPAIR-5・REPAIR-12。設計 #3766）。本番の `PodNetnsDialer`（dial ごとの
+/// `netns-dial` helper）で、pod A・B の URL が自分の pod の `127.0.0.1` だけへつながり（取り違えが無い）、
+/// host の `127.0.0.1` へ縮退しないことを 2x2 と host の否定で照合する。否定は dial 失敗の種類が区別できないため、
+/// 前後の正の往復と host への直接接続を括弧として置く。pull は増やさない。`sb_p`:18181 は段 P の待ち受けを使う。
+async fn pod_forward_stage(
+    c: &mut RuntimeServiceClient<Channel>,
+    sb_p: &str,
+    sb_q: &str,
+    plugin_pid: u32,
+) {
+    let started = Instant::now();
+    let host = HostListener::start();
+    assert!(
+        host.port != POD_NET_PORT && host.port != POD_FORWARD_PORT_B,
+        "host listener port collides with a pod port"
+    );
+
+    // 正（前）: 各 pod の URL は自分の pod の待ち受けへ往復する。
+    pf_round_trip_until_match(c, sb_p, POD_NET_PORT, POD_FORWARD_PAYLOAD).await;
+    assert_no_netns_dial_helpers(plugin_pid);
+    pf_round_trip_until_match(c, sb_q, POD_FORWARD_PORT_B, POD_FORWARD_PAYLOAD).await;
+    assert_no_netns_dial_helpers(plugin_pid);
+
+    // host の listener の生存（括弧の前）。以降の URL 経由の受理数はこの値から増えないことで比べる。
+    host.connect_directly();
+    let before = host.accepted();
+    assert_eq!(before, 1, "only the direct connection must be accepted");
+
+    // 否定: 取り違え（A→B・B→A）と host への縮退（A・B の両方）。
+    pf_expect_refused(c, sb_p, POD_FORWARD_PORT_B, PF_ERR_PORT_B).await;
+    assert_no_netns_dial_helpers(plugin_pid);
+    pf_expect_refused(c, sb_q, POD_NET_PORT, PF_ERR_PORT_A).await;
+    assert_no_netns_dial_helpers(plugin_pid);
+    let host_err = format!("error forwarding port {}: connection failed", host.port);
+    pf_expect_refused(c, sb_p, host.port, &host_err).await;
+    assert_no_netns_dial_helpers(plugin_pid);
+    pf_expect_refused(c, sb_q, host.port, &host_err).await;
+    assert_no_netns_dial_helpers(plugin_pid);
+    assert_eq!(
+        host.accepted(),
+        before,
+        "a pod url must not reach the host loopback listener"
+    );
+
+    // 括弧（後）: 否定の時点で pod の待ち受けも host の待ち受けも生きていた。
+    pf_round_trip_until_match(c, sb_p, POD_NET_PORT, POD_FORWARD_PAYLOAD).await;
+    pf_round_trip_until_match(c, sb_q, POD_FORWARD_PORT_B, POD_FORWARD_PAYLOAD).await;
+    host.connect_directly();
+    assert_eq!(host.accepted(), before + 1);
+    assert_no_netns_dial_helpers(plugin_pid);
+
+    {
+        use std::io::Write as _;
+        let mut e = std::io::stderr();
+        let _ = writeln!(e, "{PF_OK_POD_A}");
+        let _ = writeln!(e, "{PF_OK_POD_B}");
+        let _ = writeln!(e, "{PF_OK_A_TO_B}");
+        let _ = writeln!(e, "{PF_OK_B_TO_A}");
+        let _ = writeln!(e, "{PF_OK_HOST}");
+        let _ = writeln!(
+            e,
+            "production_binary_exec_real: info pod_forward_elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
+    }
+}
+
 /// 段 P（#4405・CRI-2・CORE-3・NET-3・REPAIR-12）。pod network provider の無い本番構成で、`POD` の network を持つ
 /// 同じ pod の 2 コンテナが保持役の netns 内で `127.0.0.1` を往復し、別の pod からは届かないことを照合する。
 /// pull は増やさない（既存の busybox を使う）。
@@ -835,6 +1158,7 @@ async fn pod_network_stage(
     node_id: &str,
     token: &str,
     ledger: &reclaim::Ledger,
+    plugin_pid: u32,
 ) {
     // image の前提確認: nc の applet があること。
     let o = exec_once(c, node_id, &["/bin/busybox", "--list"]).await;
@@ -858,6 +1182,16 @@ async fn pod_network_stage(
     .await;
     let cli_p = create_started(c, &sb_p, "cli", &["/bin/sleep", "300"], token, ledger).await;
     let cli_q = create_started(c, &sb_q, "cli", &["/bin/sleep", "300"], token, ledger).await;
+    // 段 F 用: pod B の待ち受け（18182）。段 P の否定（18181）の照合には影響しない。
+    let srv_q = create_started(
+        c,
+        &sb_q,
+        "srv",
+        &["/bin/sh", "-c", pod_forward_server_script_b()],
+        token,
+        ledger,
+    )
+    .await;
 
     // netns の素性: 同じ pod は同じ、別の pod は別、NODE（試験プロセス）とも別。保持役の netns と一致する。
     let (ns_srv, ns_p, ns_q) = (
@@ -904,8 +1238,10 @@ async fn pod_network_stage(
         let _ = writeln!(e, "{POD_NET_OK_ROUND_TRIP}");
         let _ = writeln!(e, "{POD_NET_OK_ISOLATED}");
     }
+    // 段 F（#4487）: pod の後始末と段 4 の plugin-cri の SIGKILL の前に置く。
+    pod_forward_stage(c, &sb_p, &sb_q, plugin_pid).await;
     remove_pod(c, ledger, &sb_p, &[&srv, &cli_p]).await;
-    remove_pod(c, ledger, &sb_q, &[&cli_q]).await;
+    remove_pod(c, ledger, &sb_q, &[&cli_q, &srv_q]).await;
 }
 /// 試験本体（sandbox の作成から exec の照合・後始末まで）。`inject` が真なら StartContainer と Running の確認の直後に
 /// 固定文言で panic する（失敗後の回収の自己照合。#4142）。作った ID は台帳へ登録し、Remove が成功したら外す。
@@ -1062,7 +1398,8 @@ async fn scenario(
     }
 
     // 段 P（#4405）: POD ネットワークの pod 内往復。
-    pod_network_stage(&mut c, &id, &token, &ledger).await;
+    let plugin_pid = lock_srv(&srv).guard.0.id();
+    pod_network_stage(&mut c, &id, &token, &ledger, plugin_pid).await;
 
     // 4. 要求元の異常終了（SUP-6・SEC-1・REPAIR-5・#4167）: 終わらない exec を開いたまま plugin-cri を SIGKILL すると、
     //    helper が 2 秒以内に終わり、exec のコマンドが残らない。helper の期限は 60 秒以上で、期限や hold_grace では説明できない。
@@ -1448,4 +1785,37 @@ fn cri6_4417_contains_helper_matches_tty_output() {
 #[test]
 fn cri6_4417_resize_json_literal() {
     assert_eq!(resize_json(100, 30), br#"{"Width":100,"Height":30}"#);
+}
+
+/// 段 F の command・期待文・成功行が固定リテラルで、実行時の値（`{}`）を含まないことを具体値で固定する（#4487・REPAIR-12）。
+#[test]
+fn repair12_4487_pod_forward_literals_are_fixed() {
+    assert_eq!(
+        pod_forward_server_script_b(),
+        "while :; do /bin/nc -l -p 18182 -e /bin/cat; done"
+    );
+    assert_eq!(POD_FORWARD_PORT_B, 18182);
+    for line in [
+        PF_OK_POD_A,
+        PF_OK_POD_B,
+        PF_OK_A_TO_B,
+        PF_OK_B_TO_A,
+        PF_OK_HOST,
+    ] {
+        assert!(
+            line.starts_with("production_binary_exec_real: port-forward ok: "),
+            "{line}"
+        );
+        assert!(!line.contains('{') && !line.contains('}'), "{line}");
+    }
+    assert!(PF_OK_A_TO_B.ends_with("127.0.0.1:18182"));
+    assert!(PF_OK_B_TO_A.ends_with("127.0.0.1:18181"));
+}
+
+/// 否定の期待文が cri の `error forwarding port {port}: connection failed` の書式と一致すること（CRI-6・#4487）。
+#[test]
+fn cri6_4487_pf_error_text_matches_cri_format() {
+    let fmt = |port: u16| format!("error forwarding port {port}: connection failed");
+    assert_eq!(PF_ERR_PORT_A, fmt(POD_NET_PORT));
+    assert_eq!(PF_ERR_PORT_B, fmt(POD_FORWARD_PORT_B));
 }

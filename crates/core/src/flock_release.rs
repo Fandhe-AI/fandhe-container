@@ -93,8 +93,8 @@ mod tests {
     /// 包まない `File` は close だけでは外れない。
     #[test]
     fn oci5_repair5_4492_explicit_unlock_file_releases_despite_duplicate_fd() {
-        let dir = std::env::temp_dir().join(format!("fc-4492-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        // pid だけの名前を使わず、排他作成の `ScratchDir` の子を使う（#3434・REPAIR-12）。
+        let (_scratch, dir) = crate::test_support::scratch_child("fandhe-flock-release-4492", "d");
         let path = dir.join("lock");
         let open = || {
             std::fs::OpenOptions::new()
@@ -121,6 +121,5 @@ mod tests {
         drop(ExplicitUnlockFile::new(file));
         assert!(open().try_lock().is_ok());
         drop(dup);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

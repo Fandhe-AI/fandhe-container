@@ -213,7 +213,7 @@ impl CriPluginBackends {
     /// pod の namespace の保持役 provider を差す（試験と別実装への差し替え。H6・#2877・PLUG-1）。
     /// 本番の provider は `production()` が Linux・非 root の構成で自動的に差す。
     ///
-    /// Linux では具象の保持役の記憶を消す（[`Self::pod_namespace_source`] が `None` に戻り、PortForward の POD は
+    /// Linux では具象の保持役の記憶を消す（`Self::pod_namespace_source` が `None` に戻り、PortForward の POD は
     /// `UNIMPLEMENTED` のまま。古い表を dialer が引く乖離を作らない。#4486）。
     pub fn with_pod_holder_provider(
         mut self,

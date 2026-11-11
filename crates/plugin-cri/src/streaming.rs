@@ -9,7 +9,7 @@
 //! stdin・tty・resize を扱い、RPC 時の整合検査は cri の `attach_impl`〔D7。#4078〕。実機の通しは `tests/cri_attach_real.rs`（#4079）。非 Linux は
 //! 読み取り専用の [`log_attach::LogFollowAttachBackend`]〔回転ログの follow。#3763〕で、stdin・tty は RPC 時に `INVALID_ARGUMENT`）と、PortForward の NODE ネットワーク（hostNetwork）の pod
 //! （#3755。[`NodeLoopbackDialer`]）。POD ネットワークの pod は、Linux・非 root で保持役を注入した構成だけ結線済み
-//! （[`ProductionPortForward::pod_network`] の `PodNetnsDialer`。保持役の fd と `netns-dial` helper で pod の netns 内へ接続。#4484・#4486。
+//! （`ProductionPortForward::pod_network` の `PodNetnsDialer`。保持役の fd と `netns-dial` helper で pod の netns 内へ接続。#4484・#4486。
 //! 実 helper を通す実機の段は #4487）。保持役が無い構成（rootful・注入なし・別 provider）は [`ProductionPortForward::node_only`] で、
 //! RPC 時（cri）に `UNIMPLEMENTED` のまま（host loopback へは縮退しない）。
 //! Exec は Linux で結線済み（`exec_launcher::SupervisorExecLauncher`。
@@ -152,7 +152,7 @@ impl ProductionAttach {
 
 /// 本番の PortForward の dialer と、POD ネットワークに対応するかの宣言（#4486・CRI-6・NET-3・SEC-1）。
 ///
-/// 保持役（[`PodNamespaceSource`]）が無いと POD 対応の dialer を作れないよう、構築口を絞る。`main.rs` が
+/// 保持役（`PodNamespaceSource`）が無いと POD 対応の dialer を作れないよう、構築口を絞る。`main.rs` が
 /// `CriPluginBackends::pod_namespace_source` の有無で選ぶ。`node_only` の構成では POD の PortForward は RPC 時（cri）に
 /// `UNIMPLEMENTED` のままで、host loopback へは縮退しない。
 pub struct ProductionPortForward {

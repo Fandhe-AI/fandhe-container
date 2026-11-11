@@ -577,3 +577,75 @@ fn cri6_4484_supports_pod_network() {
     let (d, _src) = dialer(FakeSource::new(s.path(), &[]), &sp);
     assert!(d.supports_pod_network());
 }
+
+/// 起動した `true` が zombie（終了済み・未回収）になるまで待つ。`try_wait` を呼ばず `/proc` で観測する。
+fn zombie_child() -> Child {
+    let c = Command::new("true")
+        .stdin(Stdio::null())
+        .spawn()
+        .expect("spawn");
+    let stat = format!("/proc/{}/stat", c.id());
+    assert!(wait_until(T5, || {
+        std::fs::read_to_string(&stat).is_ok_and(|s| s.contains(") Z"))
+    }));
+    c
+}
+
+/// REPAIR-5・#4525: 保持一覧へ入れる直前に掃除し、回収済みの子は数え直しで外れる。
+#[test]
+fn repair5_4525_retain_sweeps_reaped_helpers_before_push() {
+    let s = Scratch::new("retain");
+    let sp = std::sync::Arc::new(FakeSpawner::new(Reply::Silent));
+    let (d, _src) = dialer(FakeSource::new(s.path(), &[]), &sp);
+    let zs: Vec<Child> = (0..3).map(|_| zombie_child()).collect();
+    let pids: Vec<u32> = zs.iter().map(Child::id).collect();
+    for z in zs {
+        d.push_retained_for_test(z);
+    }
+    d.retain(sleeper().stdin(Stdio::null()).spawn().expect("spawn"));
+    assert_eq!(d.retained_len_for_test(), 1);
+    for pid in pids {
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+    }
+    for c in d.lock_retained().iter_mut() {
+        let _ = c.kill();
+    }
+    assert!(wait_until(T5, || d.sweep_retained() == 0));
+}
+
+/// REPAIR-5・#4525: dial の出口（`DialHelper::finish`）でも保持一覧を掃除する。
+#[test]
+fn repair5_4525_dial_exit_sweeps_reaped_retained_helpers() {
+    let s = Scratch::new("exit");
+    let sp = std::sync::Arc::new(FakeSpawner::new(Reply::Silent));
+    let (d, _src) = dialer(FakeSource::new(s.path(), &[]), &sp);
+    let zs: Vec<Child> = (0..2).map(|_| zombie_child()).collect();
+    let pids: Vec<u32> = zs.iter().map(Child::id).collect();
+    for z in zs {
+        d.push_retained_for_test(z);
+    }
+    assert_eq!(d.retained_len_for_test(), 2);
+    let own = Command::new("true")
+        .stdin(Stdio::null())
+        .spawn()
+        .expect("spawn");
+    let mut h = DialHelper::new(&d, own);
+    h.finish();
+    assert_eq!(d.retained_len_for_test(), 0);
+    for pid in pids {
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+    }
+}
+
+/// REPAIR-5・#4525: dialer の drop は、既に終了した保持中の子を回収する。
+#[test]
+fn repair5_4525_drop_reaps_exited_retained_helpers() {
+    let s = Scratch::new("drop");
+    let sp = std::sync::Arc::new(FakeSpawner::new(Reply::Silent));
+    let (d, _src) = dialer(FakeSource::new(s.path(), &[]), &sp);
+    let z = zombie_child();
+    let pid = z.id();
+    d.push_retained_for_test(z);
+    drop(d);
+    assert!(!Path::new(&format!("/proc/{pid}")).exists());
+}

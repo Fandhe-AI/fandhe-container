@@ -25,10 +25,16 @@
 //! # 後始末と上限（REPAIR-5）
 //! helper は `DialHelper` の RAII ガードで必ず回収を試みる。`SIGKILL` の後も回収できない helper は `retained` に保持し、
 //! `MAX_RETAINED_DIAL_HELPERS` 件に達したら新しい dial を `RESOURCE_EXHAUSTED` で断る。
+//! 保持一覧は dial の入口・各 dial の出口（`DialHelper::finish`）・一覧へ入れる直前（`retain`）・dialer の drop で、
+//! 非ブロッキングの `try_wait` により掃除する（回収済みの子は数え直しで外れる。#4525）。
 //!
 //! # 残余
-//! - 保持数の上限は dial の入口で検査するため、並行する dial が同時に回収に失敗すると一時的に上限を超えうる。超過は並行数
-//!   （cri の `max_inflight_dials`）で有界。
+//! - 保持数の上限は dial の入口で検査するため、並行する dial が同時に回収に失敗すると一時的に上限を超えうる。入れる側は
+//!   断ると `Child` を落として追えない zombie を作るため断らない。超過は 8 + (`max_inflight_dials` − 1) で有界
+//!   （既定 32 なら 39、許容範囲の最大 256 なら 263。#4525）。値は暫定で #4116 の確認対象（承認済みではない）。
+//! - 掃除は dial の入口・出口と drop だけで、定期の掃除は採らない（常駐スレッドを増やさない。CORE-7〜9）。dial が来ない間は、
+//!   `SIGKILL` の後に遅れて終了した子が zombie のまま残りうる（件数は上記の上限内。pid の枠とわずかなカーネルメモリを占め、
+//!   次の dial か plugin-cri の終了で解消する）。drop の時点でまだ終了していない子は回収されない（#4525）。
 //! - StopPodSandbox と並行した dial は、fd を開いた後に保持役が解放されても helper が既に開いた fd の ns へ入る窓が残る
 //!   （最大でも dial の期限で有界）。
 //! - エラーは固定の英文で、port・pid・パス・errno を含めない（REPAIR-4）。
@@ -202,8 +208,21 @@ impl PodNetnsDialer {
     /// 回収できた helper を一覧から外し、残りの件数を返す。
     fn sweep_retained(&self) -> usize {
         let mut r = self.lock_retained();
-        r.retain_mut(|c| matches!(c.try_wait(), Ok(None)));
+        Self::sweep_locked(&mut r);
         r.len()
+    }
+
+    /// ロック済みの一覧から、終了（回収）済みの子を外す。`try_wait` のみで待たない。
+    fn sweep_locked(v: &mut Vec<Child>) {
+        v.retain_mut(|c| matches!(c.try_wait(), Ok(None)));
+    }
+
+    /// 回収できなかった helper を保持一覧へ入れる。入れる前に掃除して数え直す。
+    /// 上限を超えても断らない（`Child` を落とすと追えない zombie が残るため。超過は並行 dial 数で有界。#4525）。
+    fn retain(&self, child: Child) {
+        let mut r = self.lock_retained();
+        Self::sweep_locked(&mut r);
+        r.push(child);
     }
 
     fn dial_pod(
@@ -333,13 +352,16 @@ impl<'a> DialHelper<'a> {
         };
         let t = &self.owner.timings;
         if wait_exit(&mut child, t.exit_wait) {
+            self.owner.sweep_retained();
             return;
         }
         let _ = child.kill();
         if wait_exit(&mut child, t.reap_wait) {
+            self.owner.sweep_retained();
             return;
         }
-        self.owner.lock_retained().push(child);
+        // 入れる側で掃除するため、出口の掃除はこの分岐では不要。
+        self.owner.retain(child);
     }
 }
 
@@ -372,9 +394,12 @@ fn wait_exit(child: &mut Child, within: Duration) -> bool {
 impl Drop for PodNetnsDialer {
     fn drop(&mut self) {
         // 保持中の helper へ SIGKILL を送るだけで待たない（プロセス終了時の後始末）。
-        for c in self.lock_retained().iter_mut() {
+        // 既に終了した子は非ブロッキングで回収する（待たない。#4525）。
+        let mut r = self.lock_retained();
+        for c in r.iter_mut() {
             let _ = c.kill();
         }
+        Self::sweep_locked(&mut r);
     }
 }
 

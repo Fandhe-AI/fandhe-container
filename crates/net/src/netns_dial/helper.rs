@@ -8,8 +8,8 @@
 //! unsafe は持たず、syscall は `crate::sys::holder` の安全なラッパーだけを使う。
 //!
 //! holder（`crate::netns_holder`）との差: (1) 診断を stderr に出さない、(2) 参加後は dumpable を 0 にする、
-//! (3) 副作用の前に argv を検査し、継承 fd の整理は stdin の素性確認の後に行う。補助関数の共有は波及を避けて
-//! 行わない（REPAIR-1。将来の refactor 候補）。
+//! (3) 副作用の前に argv を検査し、継承 fd の整理は stdin の素性確認の後に行う。親の照合・期限つき受信・ns の識別の取得の本体は
+//! `crate::netns_helper` と共有し（REPAIR-1・#4510）、ここは固定語彙 `DialErrorCode` への写像だけを持つ。
 //!
 //! # 失敗から固定語彙への対応（Agent が安全側に倒して記録した判断。オーナーの承認は得ていない）
 //! | 段 | 失敗 | 応答 | 終了コード |
@@ -33,7 +33,6 @@ use std::fs::File;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
-use std::os::unix::fs::MetadataExt as _;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -41,8 +40,9 @@ use super::REQUEST_RECV_TIMEOUT;
 use super::frame::{
     DialErrorCode, DialRequest, DialRequestFrame, DialResponse, DialResponseFrame, FRAME_LEN,
 };
+use crate::netns_helper as helper;
+use crate::sys::Deadline;
 use crate::sys::holder as sysh;
-use crate::sys::{self, Deadline, Readiness, SysError};
 
 /// 受けた 2 本または参加後の ns の識別（`fstat` / `/proc/self/ns` の dev・ino）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,14 +102,11 @@ pub(super) trait Joiner {
 struct RealJoiner;
 
 fn identity_of(file: &File) -> Result<(u64, u64), DialErrorCode> {
-    let m = file.metadata().map_err(|_| DialErrorCode::InvalidRequest)?;
-    Ok((m.dev(), m.ino()))
+    helper::fd_identity(file).map_err(|_| DialErrorCode::InvalidRequest)
 }
 
-fn observed_identity(name: &str) -> Result<(u64, u64), DialErrorCode> {
-    let f = File::open(format!("/proc/self/ns/{name}")).map_err(|_| DialErrorCode::JoinFailed)?;
-    let m = f.metadata().map_err(|_| DialErrorCode::JoinFailed)?;
-    Ok((m.dev(), m.ino()))
+fn observed_identity(ns: helper::JoinedNs) -> Result<(u64, u64), DialErrorCode> {
+    helper::self_ns_identity(ns).map_err(|_| DialErrorCode::JoinFailed)
 }
 
 impl Joiner for RealJoiner {
@@ -119,8 +116,8 @@ impl Joiner for RealJoiner {
         sysh::join_namespace(net.as_fd(), sysh::CLONE_NEWNET)
             .map_err(|_| DialErrorCode::JoinFailed)?;
         let observed = NsPair {
-            user: observed_identity("user")?,
-            net: observed_identity("net")?,
+            user: observed_identity(helper::JoinedNs::User)?,
+            net: observed_identity(helper::JoinedNs::Net)?,
         };
         check_joined_identity(received, observed)?;
         drop(user);
@@ -172,22 +169,9 @@ fn receive_request(
     deadline: &Deadline,
 ) -> Result<(DialRequest, OwnedFd, OwnedFd), DialErrorCode> {
     let mut buf = [0u8; FRAME_LEN];
-    let got = loop {
-        match sys::wait_readable(fd, deadline) {
-            Err(_) | Ok(Readiness::TimedOut) => return Err(DialErrorCode::InvalidRequest),
-            Ok(Readiness::Readable | Readiness::Exceptional) => {}
-        }
-        match sysh::recv_with_fds(fd, &mut buf, sysh::MAX_FDS) {
-            Ok(r) => break r,
-            Err(SysError::Os(n)) if n == sys::EAGAIN || n == sys::EINTR => {
-                if deadline.remaining().is_zero() {
-                    return Err(DialErrorCode::InvalidRequest);
-                }
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            Err(_) => return Err(DialErrorCode::InvalidRequest),
-        }
-    };
+    // 受信の失敗は期限切れを含めてすべて `InvalidRequest`（`TimedOut` は connect 専用）。
+    let got = helper::recv_before_deadline(fd, deadline, &mut buf, sysh::MAX_FDS)
+        .map_err(|_| DialErrorCode::InvalidRequest)?;
     if got.ctrl_truncated || got.data_truncated {
         return Err(DialErrorCode::InvalidRequest);
     }
@@ -266,14 +250,8 @@ pub(super) fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
         Ok(t) if t == sysh::SOCK_SEQPACKET => {}
         _ => return ExitCode::from(1),
     }
-    match sysh::peer_pid(fd) {
-        Ok(peer) => {
-            let parent = std::os::unix::process::parent_id();
-            if parent == 1 || parent != peer {
-                return ExitCode::from(1);
-            }
-        }
-        Err(_) => return ExitCode::from(1),
+    if helper::check_parent_is_creator(fd).is_err() {
+        return ExitCode::from(1);
     }
     if sysh::close_inherited_fds().is_err() {
         return respond_error(fd, DialErrorCode::JoinFailed).exit_code();

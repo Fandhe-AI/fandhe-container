@@ -88,6 +88,7 @@ pub fn check_file_meta(
 
 #[cfg(target_os = "linux")]
 mod imp {
+    use crate::flock_release::ExplicitUnlockFile;
     use std::fs::{File, OpenOptions};
     use std::io::{Read as _, Write as _};
     use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _};
@@ -173,18 +174,25 @@ mod imp {
     }
 
     /// ID 単位の排他ロック(`<dir>/@locks/<id>`)。
-    /// drop で解放する。ロックファイルは [`OptionsLock::remove_lock_file`] で消す(消さなければ残る)。
+    /// drop で明示 unlock して閉じる(fork 子・spawn の複製 fd が残っても外れる。#4517)。ロックファイルは [`OptionsLock::remove_lock_file`] で消す(消さなければ残る)。
     #[derive(Debug)]
     pub struct OptionsLock {
-        /// 保持するだけ(drop で flock が解放される)。
-        _file: File,
+        /// 保持するだけ(drop で `File::unlock` してから閉じる。OCI-5・REPAIR-5・#4517)。
+        _file: ExplicitUnlockFile,
         path: PathBuf,
     }
 
     impl OptionsLock {
         /// ロックを保持したままロックファイルを消す(取得側は取得後に実体の一致を確かめるので、孤立 inode を掴んだ側は再取得する)。
+        /// 解放は unlink の後、`self` の drop での明示 unlock(順序を保つ)。
         pub fn remove_lock_file(self) {
             let _ = std::fs::remove_file(&self.path);
+        }
+
+        /// 試験用: 同じ OFD を指す複製 fd(fork した子が持つ fd の代役。#4517)。
+        #[cfg(test)]
+        pub(super) fn lock_file_clone_for_test(&self) -> File {
+            self._file.clone_file_for_test()
         }
     }
 
@@ -216,12 +224,18 @@ mod imp {
                 .map_err(io_failed)?;
             match file.try_lock() {
                 Ok(()) => {
+                    // 取得直後に包む。以後どの経路で落ちても drop が明示 unlock する(#4517)。
+                    let lock = ExplicitUnlockFile::new(file);
                     let current = std::fs::symlink_metadata(&path).ok();
-                    let held = file.metadata().map_err(io_failed)?;
+                    let held = lock
+                        .as_file()
+                        .ok_or_else(|| err(ErrorCode::Internal, "the options lock file is gone"))?
+                        .metadata()
+                        .map_err(io_failed)?;
                     if current.is_some_and(|m| m.dev() == held.dev() && m.ino() == held.ino()) {
-                        return Ok(OptionsLock { _file: file, path });
+                        return Ok(OptionsLock { _file: lock, path });
                     }
-                    // 孤立した inode を掴んだ。取り直す。
+                    // 孤立した inode を掴んだ。取り直す(`lock` の drop で明示 unlock)。
                 }
                 Err(std::fs::TryLockError::WouldBlock) => {}
                 Err(std::fs::TryLockError::Error(e)) => return Err(io_failed(e)),
@@ -627,6 +641,42 @@ mod tests {
         };
         remove_if_same(&root, &id("c1"), &same).expect("remove");
         assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// OCI-5・REPAIR-5(#4517): 複製 fd が残っていても `OptionsLock` の drop で明示 unlock され、同じ ID を取り直せる。
+    /// 陽性対照の包まない `File` は close だけでは外れない。
+    #[test]
+    fn oci5_repair5_4517_options_lock_drop_releases_despite_duplicate_fd() {
+        let root = tmp("dupfd");
+        let short = std::time::Duration::from_millis(50);
+        let open = |p: &std::path::Path| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(p)
+                .expect("open")
+        };
+
+        let plain_path = root.join("plain-lock");
+        let plain = open(&plain_path);
+        plain.try_lock().expect("lock");
+        let plain_dup = plain.try_clone().expect("dup");
+        drop(plain);
+        assert!(matches!(
+            open(&plain_path).try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        drop(plain_dup);
+
+        let lock = acquire_lock(&root, &id("c1"), short).expect("lock");
+        let dup = lock.lock_file_clone_for_test();
+        let lock_path = options_dir(&root).join(LOCKS_DIR_NAME).join("c1");
+        drop(lock);
+        open(&lock_path).try_lock().expect("released despite dup");
+        acquire_lock(&root, &id("c1"), short).expect("reacquire despite dup");
+        drop(dup);
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -1803,7 +1803,9 @@ fn repair12_4487_pod_forward_literals_are_fixed() {
         PF_OK_HOST,
     ] {
         assert!(
-            line.starts_with("production_binary_exec_real: port-forward ok: "),
+            // 接頭辞の文字列リテラルは CI の導出が期待行として拾うため、定数の先頭 3 つの語で照合する
+            // （check-success-lines.sh の導出対象にしない。#4487）。
+            line.starts_with(&["production_binary_exec_real:", "port-forward", "ok:"].join(" ")),
             "{line}"
         );
         assert!(!line.contains('{') && !line.contains('}'), "{line}");

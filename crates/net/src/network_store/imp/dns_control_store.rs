@@ -5,7 +5,8 @@
 //! `dns_helper::control` が使う。形式（フレーム）は `dns_helper::control::frame`、ここは置き場の検査だけを担う。
 //! - 経路は検査済みのネットワークのディレクトリの fd 起点（`/proc/self/fd/<fd>/dns.ctl`）で組む。`sun_path` の
 //!   108 バイト制限を避け、状態ルートの途中の差し替えを受けない
-//! - 送り手は connect の前に lstat で検査する（socket・所有者・0600・nlink 1。[`check_socket_meta`]）
+//! - 送り手は connect の前に lstat で検査する（socket・所有者・0600・nlink 1。[`check_socket_meta`]）。掃除経路も
+//!   connect の前に lstat で種別と所有者だけを検査する（権限を見ない理由は `remove_dns_control_socket_if_no_listener`。#3573）
 //! - ソケットファイルの削除は排他ロックを持つ側（停止・起動・回収・`network rm`）だけが行う。ヘルパー自身は
 //!   消さない（新しいヘルパーの socket を古いヘルパーの終了処理が誤って消さないため）。socket でないもの・
 //!   他の所有者のものは消さず `FailedPrecondition` / `PermissionDenied`
@@ -41,6 +42,23 @@ pub(crate) fn peer_cred_errno_word(e: &SysError) -> String {
         SysError::Unsupported => "unsupported".to_owned(),
         _ => "other".to_owned(),
     }
+}
+
+/// 掃除対象の `dns.ctl` の lstat 結果の述語（種別が先、所有者が次。connect 前の検査と削除前の再検査で共有。#3573）。
+fn check_cleanup_target_meta(is_socket: bool, uid: u32, expected_uid: u32) -> Result<(), NetError> {
+    if !is_socket {
+        return Err(err(
+            NetErrorCode::FailedPrecondition,
+            "dns control socket path is not a socket",
+        ));
+    }
+    if uid != expected_uid {
+        return Err(err(
+            NetErrorCode::PermissionDenied,
+            "dns control socket owner mismatch",
+        ));
+    }
+    Ok(())
 }
 
 /// 掃除経路: 生きた listener の uid が自分と違うときの監査行（値は数値だけ。SEC-4・PLUG-12・#3551）。
@@ -79,8 +97,9 @@ impl Dir {
     ///
     /// 書き手は 2 つ（ヘルパーはロックなし、送り手は排他ロックの下）なので `O_APPEND` で開き、1 行を 1 回の
     /// write で書く（行どうしが上書きされない）。上限に達したら書かない（無制限の増加を防ぐ）。記録の失敗は
-    /// 拒否を妨げない（呼び出し側は結果を無視してよい）。上位の監査経路（core の `@audit.log`）への中継は
-    /// 依存方向（net は core に依存しない）のため行わない。
+    /// 拒否を妨げない（呼び出し側は結果を無視してよい）。上位の監査経路（core の `@audit.log`）へは中継しない
+    /// （#3552 のオーナー判断の案 A・#3573。net は core に依存しない。再評価条件は D13 の承認で bridge が本番に入ったとき、
+    /// net に監査 sink のトレイトを置き呼び出し側が core の `FileAuditSink` へ写す案 C）。
     fn append_control_audit(&self, line: &str) -> Result<(), NetError> {
         use std::io::Write as _;
         let mut f = self.open_regular_append(CONTROL_AUDIT_FILE, CONTROL_AUDIT_MAX_BYTES * 2)?;
@@ -201,18 +220,7 @@ impl NetworkLockGuard<'_> {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(e) => return Err(map_io(&e, "failed to stat dns control socket")),
         };
-        if !m.file_type().is_socket() {
-            return Err(err(
-                NetErrorCode::FailedPrecondition,
-                "dns control socket path is not a socket",
-            ));
-        }
-        if m.uid() != sys::effective_uid() {
-            return Err(err(
-                NetErrorCode::PermissionDenied,
-                "dns control socket owner mismatch",
-            ));
-        }
+        check_cleanup_target_meta(m.file_type().is_socket(), m.uid(), sys::effective_uid())?;
         match fs::remove_file(&path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -228,6 +236,14 @@ impl NetworkLockGuard<'_> {
     /// socket を残す）。そこで connect を試み、`ECONNREFUSED` / `ENOENT`（listener 不在）のときだけ消す。接続できた
     /// （生存）・backlog 満杯・その他（判定不能）は消さず `FailedPrecondition` を返す（fail-closed。NET-5・SEC-1・
     /// REPAIR-5）。接続は即座に閉じ、フレームは送らない（相手は読めず切断するだけ）。
+    ///
+    /// connect の前に lstat で種別（socket）と所有者だけを検査する（#3573）。symlink・通常ファイル・他人所有は
+    /// connect も監査行の書き込みもせず拒否する（`remove_dns_control_socket` と同じ固定文言）。権限 0600・nlink は
+    /// 見ない: `bind_control` は bind の後で 0600 に直すため、その間にヘルパーが死ぬと umask 由来の権限の残骸が
+    /// 残り、送り手と同じ検査では消せず `spawn_inner` が失敗し続ける。事前拒否は監査しない（送り手側の
+    /// `check_control_socket` の失敗と同じ。置けるのは 0700 の自分のディレクトリに書ける同 uid か root だけで、
+    /// 別 uid からの接続の痕跡ではない）。残余: lstat から connect までの差し替え（TOCTOU）は同 uid か root に
+    /// 限られ脅威モデルの外。削除の直前に `remove_dns_control_socket` が再検査する。
     ///
     /// 接続できた相手は `SO_PEERCRED` の uid だけを自分の実効 uid と照合し、違う場合と取得に失敗した場合は
     /// `dns.audit` へ 1 行残す（`event=dns_control_cleanup_peer_uid_mismatch`・
@@ -245,6 +261,14 @@ impl NetworkLockGuard<'_> {
         peer_cred: PeerCredFn,
     ) -> Result<bool, NetError> {
         self.require_exclusive()?;
+        // connect(2) は最後の要素の symlink をたどるため、先に lstat で種別と所有者を見る（#3573）。
+        match fs::symlink_metadata(self.dir.control_path()) {
+            Ok(m) => {
+                check_cleanup_target_meta(m.file_type().is_socket(), m.uid(), sys::effective_uid())?
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(map_io(&e, "failed to stat dns control socket")),
+        }
         match sys::unix_socket::connect_unix_nonblocking(&self.control_socket_path()) {
             Ok(fd) => {
                 let expected_uid = sys::effective_uid();
@@ -290,5 +314,22 @@ impl NetworkLockGuard<'_> {
         }
         // listener の不在を確認できたときだけ消す（生存・判定不能なら残す。`network rm` の既知項目検査が拒否する）。
         let _ = self.remove_dns_control_socket_if_no_listener();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// PLUG-12・#3573: 掃除対象の述語（種別が先、所有者が次）。
+    #[test]
+    fn plug12_3573_cleanup_target_meta_predicate() {
+        assert!(check_cleanup_target_meta(true, 5, 5).is_ok());
+        let e = check_cleanup_target_meta(false, 5, 5).expect_err("not socket");
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        let e = check_cleanup_target_meta(true, 6, 5).expect_err("owner");
+        assert_eq!(e.code(), NetErrorCode::PermissionDenied);
+        let e = check_cleanup_target_meta(false, 6, 5).expect_err("both");
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
     }
 }

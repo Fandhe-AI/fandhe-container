@@ -117,6 +117,7 @@ pub mod dev_mounts;
 pub mod etc_files;
 #[cfg(target_os = "linux")]
 pub mod exec;
+mod flock_release;
 pub mod injected_files;
 #[cfg(target_os = "linux")]
 pub mod landlock;

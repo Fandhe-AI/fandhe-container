@@ -104,6 +104,11 @@ use serde::{Deserialize, Serialize};
 use crate::audit_log::{AuditCoverage, AuditCoveragePolicy, CoverageLayer, KernelAuditLayerStatus};
 use crate::capabilities::{Capability, CapabilitySet, ContainerCapabilities};
 use crate::dev_mounts::ImplicitDevMount;
+#[cfg(any(target_os = "linux", all(test, unix)))]
+use crate::flock_release::LockRelease;
+use crate::flock_release::release_lock_file;
+#[cfg(all(test, unix))]
+use crate::flock_release::release_lock_file_with;
 use crate::launch_isolation::{
     AuditCoverageRecordOutcome, LaunchIsolationRecord, MAX_RECORDED_ID_EXTENTS, MAX_RECORDED_RULES,
     RecordedAuditCoverage, RecordedIdExtent, RecordedIdMapping, RecordedIdModel, RecordedLandlock,
@@ -427,34 +432,6 @@ struct StoreGuard<'a> {
     gate: Arc<RootGate>,
     /// drop で最初に明示 unlock して閉じる（`@lock` の解放）。`Option` なのは `Drop` で取り出すため。
     file: Option<File>,
-}
-
-/// `@lock` の解放結果。unlock の失敗は close を止めず、呼び出し側のログ判断にだけ使う。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LockRelease {
-    /// unlock に成功して閉じた。
-    Unlocked,
-    /// unlock に失敗したが閉じた（OS はプロセス終了か最後の close でロックを解放する）。
-    UnlockFailed,
-}
-
-/// `unlock` を 1 回呼び、結果によらず `file` を閉じる。panic しない（`StoreGuard::drop` から呼ばれる）。
-/// 製品は [`release_lock_file`]、試験は失敗を注入するためこちらを使う（`LOCK_UN` は実環境でほぼ失敗しない）。
-fn release_lock_file_with(
-    file: File,
-    unlock: impl FnOnce(&File) -> std::io::Result<()>,
-) -> LockRelease {
-    let outcome = match unlock(&file) {
-        Ok(()) => LockRelease::Unlocked,
-        Err(_) => LockRelease::UnlockFailed,
-    };
-    drop(file);
-    outcome
-}
-
-/// `File::unlock` で解放する製品用の入口。
-fn release_lock_file(file: File) -> LockRelease {
-    release_lock_file_with(file, File::unlock)
 }
 
 /// unlock 失敗の固定ログ行（改行なし）。パス・errno・OS 由来の文字列は含めない。Linux 限定（#4493）。

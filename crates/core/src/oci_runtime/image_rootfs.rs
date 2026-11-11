@@ -755,6 +755,8 @@ mod imp {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Instant;
 
+    use crate::flock_release::ExplicitUnlockFile;
+
     use super::{
         CLEANUP_MAX_DEPTH, CLEANUP_MAX_ENTRIES, ImageRootfsRecord, MARKER_MAX_BYTES,
         ORPHAN_SCAN_MAX_PAGES, ORPHAN_SCAN_PAGE_SIZE, OrphanReap, RecordedRootfsRemoval,
@@ -807,9 +809,9 @@ mod imp {
         token: Option<String>,
         /// 展開先（子）のディレクトリ自体への排他の `flock`。公開後も状態作成まで保持し、孤児の回収から
         /// 「持ち主あり」に見せる。プロセスが落ちれば OS が外す（#2379・OCI-7）。
-        _lock: File,
+        _lock: ExplicitUnlockFile,
         /// ラッパーへの排他の `flock`。展開途中の回収から「持ち主あり」に見せる。
-        _wrapper_lock: File,
+        _wrapper_lock: ExplicitUnlockFile,
     }
 
     /// 削除時に照合する所有トークンの扱い。
@@ -1638,6 +1640,8 @@ mod imp {
             Err(std::fs::TryLockError::WouldBlock) => return Reap::Alive,
             Err(_) => return Reap::Unverified(UnverifiedReason::LockError),
         }
+        // close だけでは複製 fd が残る間ロックが外れないため、関数を出るとき明示 unlock する（#4492）。
+        let _lock = ExplicitUnlockFile::new(lock);
         // ロックを保持したまま名前から開き直し、検査した実体と同じことを確かめる（差し替え・別の回収側の
         // 取り直しを弾く）。ロックはこの関数を出るまで保持する。
         match sys::open_dir_path_nofollow(Some(cur), &cname) {
@@ -1691,7 +1695,7 @@ mod imp {
     struct Orphan {
         identity: (u64, u64),
         token: String,
-        _lock: File,
+        _lock: ExplicitUnlockFile,
     }
 
     /// [`check_marker`] が証拠として認めなかった理由。
@@ -1760,6 +1764,8 @@ mod imp {
             Err(std::fs::TryLockError::WouldBlock) => return Probe::Alive,
             Err(_) => return Probe::Unverified,
         }
+        // 取得後は明示 unlock の RAII で持つ（#4492）。
+        let lock = ExplicitUnlockFile::new(lock);
         match sys::open_dir_path_nofollow(Some(cur), cname) {
             Ok(again) => match fstat(again.as_fd()) {
                 Ok((dev, ino, true, _)) if (dev, ino) == identity => {}
@@ -2127,7 +2133,7 @@ mod imp {
     }
 
     /// 固定したディレクトリ自体に排他の `flock` を取って返す（`try_lock` だけで待たない）。
-    fn lock_dir(dir: BorrowedFd<'_>) -> Result<File, TraitError> {
+    fn lock_dir(dir: BorrowedFd<'_>) -> Result<ExplicitUnlockFile, TraitError> {
         let lock = File::open(format!("/proc/self/fd/{}", dir.as_raw_fd()))
             .map_err(|_| TraitError::new(ErrorCode::Internal, "failed to lock rootfs staging"))?;
         lock.try_lock().map_err(|_| {
@@ -2136,7 +2142,7 @@ mod imp {
                 "rootfs staging was reclaimed concurrently",
             )
         })?;
-        Ok(lock)
+        Ok(ExplicitUnlockFile::new(lock))
     }
 
     /// `parent` の下の `name` を今開き直した実体が、`identity` のディレクトリのままか。
@@ -2149,6 +2155,16 @@ mod imp {
 
     pub(super) fn identity(b: &Backing) -> Result<(u64, u64), TraitError> {
         Ok(b.identity)
+    }
+
+    /// 試験用: 保持中の 2 本のロック（子・ラッパー）の OFD を `try_clone` で複製する。fork した子や他スレッドの
+    /// `Command::spawn` が持つ複製 fd の代役（#4492）。
+    #[cfg(test)]
+    pub(super) fn duplicate_lock_files_for_test(b: &Backing) -> (File, File) {
+        (
+            b._lock.clone_file_for_test(),
+            b._wrapper_lock.clone_file_for_test(),
+        )
     }
 
     pub(super) fn remove(
@@ -3096,6 +3112,37 @@ mod tests {
         std::fs::rename(b.join("p"), b.join("moved")).expect("rename");
         std::fs::create_dir_all(b.join("p/rootfs")).expect("new");
         assert!(!c.is_unpacked_at(&b.join("p/rootfs")));
+    }
+
+    /// OCI-7・REPAIR-5（#4492）: `CreatedRootfs` を drop すると、複製 fd（fork した子の代役）が残っていても
+    /// 子とラッパーの `flock` が外れる。複製が残る間は、別の OFD の `try_lock` が `WouldBlock` になる陽性対照も固定する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oci7_repair5_4492_created_rootfs_drop_releases_flock_despite_inherited_fd() {
+        use std::os::fd::AsRawFd as _;
+        let (_scratch, b) = tmp("drop4492");
+        let c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
+        let (dup_child, dup_wrapper) = imp::duplicate_lock_files_for_test(&c.backing);
+        // 複製 fd は同じ OFD。/proc/self/fd 経由の開き直しは別の OFD になる（回収側の見え方）。
+        let probe = |f: &std::fs::File| {
+            std::fs::File::open(format!("/proc/self/fd/{}", f.as_raw_fd())).expect("probe")
+        };
+        let (p_child, p_wrapper) = (probe(&dup_child), probe(&dup_wrapper));
+        assert!(matches!(
+            p_child.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        assert!(matches!(
+            p_wrapper.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        drop(c);
+        assert!(p_child.try_lock().is_ok(), "child lock must be released");
+        assert!(
+            p_wrapper.try_lock().is_ok(),
+            "wrapper lock must be released"
+        );
+        drop((dup_child, dup_wrapper));
     }
 
     /// OCI-7: 空の rootfs を作り、展開先の経路へ書いて公開し、remove で消せる。

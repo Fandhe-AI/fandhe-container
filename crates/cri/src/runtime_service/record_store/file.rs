@@ -20,6 +20,7 @@ use super::{
     RecordStoreOpRecorder, RecordStoreOpSample, RecordStoreOutcome, run_listing,
 };
 use crate::error::CriError;
+use crate::flock_release::ExplicitUnlockFile;
 
 const REC_EXT: &str = ".rec";
 const LOCK_NAME: &str = ".lock";
@@ -114,7 +115,7 @@ impl FileRecordStore {
         self
     }
 
-    fn lock(&self) -> Result<File, Failed> {
+    fn lock(&self) -> Result<ExplicitUnlockFile, Failed> {
         lock_file(&self.lock_path, self.lock_timeout)
     }
 
@@ -385,9 +386,10 @@ fn read_one(
     Ok(Ok(buf))
 }
 
-/// `.lock` を期限つきで取る。**決して unlink しない**（消えた inode をロックして二重取得になるのを防ぐ。
+/// `.lock` を期限つきで取り、drop で明示 unlock する（#4515。複製 fd が残っても外れる。本 crate は fork せず、
+/// 複数スレッドの呼び出し元の `spawn` の窓だけが対象）。**決して unlink しない**（消えた inode をロックして二重取得になるのを防ぐ。
 /// plugin-cri の `InstanceLock`・`ReclaimStore` と同じ）。
-fn lock_file(path: &Path, timeout: Duration) -> Result<File, Failed> {
+fn lock_file(path: &Path, timeout: Duration) -> Result<ExplicitUnlockFile, Failed> {
     if let Ok(m) = fs::symlink_metadata(path)
         && !m.file_type().is_file()
     {
@@ -408,7 +410,7 @@ fn lock_file(path: &Path, timeout: Duration) -> Result<File, Failed> {
     let deadline = Instant::now() + timeout;
     loop {
         match file.try_lock() {
-            Ok(()) => return Ok(file),
+            Ok(()) => return Ok(ExplicitUnlockFile::new(file)),
             Err(std::fs::TryLockError::WouldBlock) => {
                 if Instant::now() >= deadline {
                     return Err(Failed::new(
@@ -1221,5 +1223,25 @@ mod tests {
         assert_eq!(RecordStoreOutcome::LockTimeout.as_str(), "lock_timeout");
         assert_eq!(RecordStoreOutcome::ListTimeout.as_str(), "list_timeout");
         assert_eq!(RecordStoreOutcome::TooLong.as_str(), "too_long");
+    }
+
+    /// OCI-5・REPAIR-5（#4515）: 記録ストアの `.lock` は guard の drop で、複製 fd が残っていても外れる。
+    #[test]
+    fn oci5_repair5_4515_record_store_lock_drop_releases_flock_despite_duplicate_fd() {
+        let root = temp_root("lock-4515");
+        let path = root.join(LOCK_NAME);
+        let Ok(guard) = lock_file(&path, Duration::from_secs(1)) else {
+            panic!("lock must be acquired");
+        };
+        let dup = guard.clone_file_for_test();
+        drop(guard);
+        let other = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        assert!(other.try_lock().is_ok());
+        drop(dup);
+        let _ = fs::remove_dir_all(&root);
     }
 }

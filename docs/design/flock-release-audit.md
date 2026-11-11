@@ -36,8 +36,8 @@
 | net `network_store/imp.rs` | `GlobalLockGuard` / `NetworkLockGuard`（`Drop` は `note_release()` のみ） | (b) | あり（pasta 等を spawn） | 期限つき | 該当（#4514） |
 | net `network/publish.rs` | 共有ポート登録のロック | (b) | あり | 期限つき（`Timeout`） | 該当（#4514） |
 | net `add_host_dns/hosts_file.rs` | hosts のロック | (b) | あり | 期限つき（`Timeout`） | 該当（#4514） |
-| cri `shim_v2/bootstrap.rs` | `IdLock`・ops.log・daemon log のロック | (b) | あり（daemon の spawn・監査 relay の fork） | 期限つき | 該当（#4515） |
-| cri `runtime_service/record_store/file.rs` | 記録ストアの `.lock` | (b) | あり | 期限つき（`LockTimeout`） | 該当（#4515） |
+| cri `shim_v2/bootstrap.rs` | `IdLock`・ops.log・daemon log のロック | (a)（#4515 で `ExplicitUnlockFile`） | あり（daemon の spawn・監査 relay の fork） | 期限つき | 修正済み（#4515。`oci5_repair5_4515_id_lock_*`・`_ops_log_lock_*`・`_daemon_log_lock_*`） |
+| cri `runtime_service/record_store/file.rs` | 記録ストアの `.lock` | (a)（#4515 で `ExplicitUnlockFile`） | あり | 期限つき（`LockTimeout`） | 修正済み（#4515。`oci5_repair5_4515_record_store_lock_*`） |
 | plugin-cri `netsetup/reclaim_store.rs` | 回収待ち記録の `.lock` | (b) | あり | 期限つき | 該当（#4516） |
 | plugin-cri `instance_lock.rs` | `InstanceLock._file` | (b) | あり（モジュール doc に exec しない fork の残余） | 期限つき | 該当（#4516。判断できないため安全側） |
 | supervisor `container_options/store.rs` | `OptionsLock._file` | (a)（`ExplicitUnlockFile`） | あり | 期限つき | 修正済み（#4517。`oci5_repair5_4517_options_lock_drop_releases_despite_duplicate_fd`） |

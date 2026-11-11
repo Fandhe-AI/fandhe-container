@@ -13,9 +13,9 @@ CRI の `Exec`・`Attach`・`PortForward` は、RPC 自体ではデータを流�
 | 3 RPC の入力検証と存在照合 | 浅い検証まで実装済み | #679 |
 | Exec の SPDY/3.1・Upgrade 後のストリーム | 実装済み（`ExecStreamHandler`。#681 の codec・交渉・`SessionLimits` を再利用。本番の起動役は plugin-cri の `SupervisorExecLauncher` で結線済み〔Linux のみ。stdin・stdout・stderr と tty〔stdin・stdout・resize。stderr は RPC 時に `INVALID_ARGUMENT`。#4417〕を扱い、相対 argv[0] は RPC 時に `INVALID_ARGUMENT`、非 Linux は未結線の `UNIMPLEMENTED`〕。注入が無ければ Exec は結線済みと答えず、RPC は `UNIMPLEMENTED`） | #680（TASK-63.2）・#3761 |
 | Attach の SPDY/3.1・remotecommand・Upgrade 後のセッション | 実装済み（fake backend での結合試験）。本番の backend は読み取り専用〔`LogFollowAttachBackend`。回転ログの follow〕で結線済み。非 Linux ではこの読み取り専用が本番で、stdin・tty は RPC 時と接続時に `INVALID_ARGUMENT`。Linux の本番は完全版（#4077・#4078）。backend が無ければ Attach は結線済みと答えず、RPC は `UNIMPLEMENTED`） | #681（TASK-63.3）・#3763 |
-| PortForward | `PortForwardHandler` は実装済み。NODE の dialer で結線済み。POD は RPC 時と dialer の両方で `UNIMPLEMENTED` | #682（TASK-63.4）・#3755 |
+| PortForward | `PortForwardHandler` は実装済み。NODE の dialer で結線済み。POD は設計済み（#3766。実装は子 issue #4477〜#4488）で、実装までは RPC 時と dialer の両方で `UNIMPLEMENTED` | #682（TASK-63.4）・#3755 |
 | plugin-cri からのサーバー起動と `with_streaming` での注入 | 実装済み（loopback で起動し `StreamDispatcher` で注入。結線済みは PortForward〔NODE のみ。#3755〕・Attach〔読み取り専用。#3763〕・Exec〔Linux のみ。#3761〕。非 Linux の Exec は「not wired」の `UNIMPLEMENTED`） | #3754 |
-| 本番 backend（Exec の helper・Attach・PortForward の dialer） | PortForward の NODE の dialer は実装済み（#3755）。Exec の stream-exec helper は実装済み（#3760）、plugin-cri 側の本番 launcher と結線も実装済み（#3761。tty も #4417 で結線済み）。Attach は段階 1（読み取り専用）が実装済み（#3763）で、完全版も Linux で実装済み（#4077・#4078）で、実機前提試験 `production_binary_attach_real` も済み（#4079。往復・EOF・resize を照合。platform-ci の ubuntu）。POD の PortForward は未実装。設計は「本番 backend の設計」の節 | #3753〜#3766 |
+| 本番 backend（Exec の helper・Attach・PortForward の dialer） | PortForward の NODE の dialer は実装済み（#3755）。Exec の stream-exec helper は実装済み（#3760）、plugin-cri 側の本番 launcher と結線も実装済み（#3761。tty も #4417 で結線済み）。Attach は段階 1（読み取り専用）が実装済み（#3763）で、完全版も Linux で実装済み（#4077・#4078）で、実機前提試験 `production_binary_attach_real` も済み（#4079。往復・EOF・resize を照合。platform-ci の ubuntu）。POD の PortForward は設計済み（#3766。実装は #4477〜#4488）。設計は「本番 backend の設計」の節 | #3753〜#3766 |
 
 ## バインドの方針
 
@@ -452,7 +452,93 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 - 実装（#3755）: `runtime_service::port_forward_network` が `namespace_options.network` がちょうど `NODE` のときだけ `Node` とし、未指定・POD・CONTAINER・TARGET・未知の値は `Pod`（fail-closed。`wants_pod_network` は CONTAINER・TARGET を「POD でない」と扱うので流用しない）。`port_forward_impl` の順序は 結線 → 入力検証 → sandbox の照合（`NOT_FOUND`）→ POD の拒否（`UNIMPLEMENTED "port-forward for pod network is not implemented"`。トークン枠を消費しない）→ 発行。dialer は port 0・期限 0 を `INVALID_ARGUMENT`、期限切れを `TIMEOUT`、その他を `UNAVAILABLE` の固定文で返し、成功後に `peer_addr` が loopback であることを確かめる。`PortForwardDialer::supports_pod_network`（既定は偽）を真にした dialer を注入すると結線情報の POD 対応が立ち、RPC 時の拒否が外れる（#3766 が使う）
 - 残余: URL 発行後に sandbox が消えても dialer は記録を照合しない（トークン TTL 60 秒とセッションの idle の期限で有界）。停止時の Upgrade 後のセッションはドレインの期限の後に強制クローズする（「停止時のセッションの扱い」）。実行中の blocking の dial（最長 10 秒）は abort できず、ランタイムの `shutdown_timeout`（1 秒）が打ち切り、待ちは増えない
 
-**POD（#3766）**: #2877（pod の namespace 保持役）が入るまで `UNIMPLEMENTED` とする。URL の発行前に断るのが望ましく、#3753 の結線情報で扱う。dialer 側でも `CriError::unimplemented` を返す（多層防御）。候補は、単一スレッドの helper が保持役の fd で pod の userns・netns へ入って connect し接続済みの fd を SCM_RIGHTS で返す案と、保持役に connect を頼む案（保持役の攻撃面が広がるので劣後）で、最終判断は #3766 に置く。
+### POD ネットワークの PortForward の設計（#3766・CRI-6・NET-3・SEC-1・REPAIR-5）
+
+保持役 provider（#2877）は実装済みで、plugin-cri は Linux・非 root で `ProductionPodHolder` を注入し、POD のコンテナは保持役の user・ipc・net に join する。本節は、その netns の `127.0.0.1:<port>` へ接続する本番 `PortForwardDialer` の設計である。**自動運転で Agent が安全側に倒して記録した判断であり、オーナーの承認を得たものではない**。確認が要る点は末尾の「確認事項」に置く。実装は子 issue（#4477〜#4488）で、本 PR は設計と分解だけである（REPAIR-3）。
+
+#### 方式（採用案 A: dial ごとの単一スレッド helper）
+
+1. plugin-cri の dialer（`PodNetnsDialer`）が `target.pod_sandbox_id()` で `ProductionPodHolder` の自分の表を引く。CRI の要求・URL・cri の記録の pid からは作らない（#2776）。表のロックを取った区間は非ブロッキングの syscall だけで、entry の存在・`child_exit_observed` が偽であること・`/proc/<pid>/ns/{user,net}` の `O_RDONLY|O_CLOEXEC` での open・`fstat` の (dev, ino) が READY のときに保存した `NsId` と一致することを確かめる。不一致・不在は fail-closed で失敗し、host loopback へは縮退しない
+2. supervisor の bin（`holder_executable_beside` と同じ解決・検査。解決処理は共通化して再利用）を第 1 引数 `netns-dial` で起動する。`env_clear`・cwd `/`・stdin は `SOCK_SEQPACKET` の socketpair の子側・stdout と stderr は null（診断は応答 frame の固定語彙で返す）・argv に可変値を載せない
+3. plugin-cri は channel で要求 frame（port・connect の期限）と fd 2 本（user, net）を SCM_RIGHTS で送る
+4. helper（crates/net の `netns_dial`。`netns_holder` の兄弟）は PDEATHSIG=SIGKILL → stdin の種別と `SO_PEERCRED` の pid が親であることの確認 → `close_range(3..)` → 要求と fd ちょうど 2 本の期限つき受信（`MSG_CTRUNC`・本数違いは拒否）→ `setns(user)`・`setns(net)` → `/proc/self/ns/{user,net}` と受けた fd の (dev, ino) の照合 → capability を空にし NNP・non-dumpable → `TcpStream::connect_timeout(127.0.0.1:port, C)`（std でスレッドを作らない）→ 応答 `Connected` に接続済み fd 1 本を添えるか `Error{code}`（固定語彙: refused・timed_out・unreachable・join_failed・identity_mismatch・invalid_request）を送って終了する
+5. plugin-cri は受けた fd を net の安全な公開 API `verify_dialed_socket` で検証してから `TcpStream` にする。socket・`SO_TYPE` が `SOCK_STREAM`・`peer_addr` が `127.0.0.1:<要求した port>`・`local_addr` が IPv4 loopback、かつ `SIOCGSKNS` で得た socket の netns の (dev, ino) が保持役の net の `NsId` と一致すること。最後の項目は、helper の不具合で host netns の socket が返り host loopback が露出する事態を plugin-cri 側で塞ぐ多層防御である
+6. データ経路はカーネルの socket を cri の `PortForwardHandler` が直接読み書きする。中継のプロセスは無く、NET-3 の往復に上乗せは無い。上乗せは接続確立時の helper の起動だけ
+
+PDEATHSIG の正当化: helper を起動するのは dial を実行して完了まで待つ blocking スレッドで、dial が返る前に helper は終了または回収されている。スレッドの終了で届く PDEATHSIG は意図どおりに働く（plugin-cri の SIGKILL でも即座に止まる）。pod-holder が PDEATHSIG を使わない理由（spawn したスレッドより長く生きる）は当てはまらない。channel の EOF と helper 自身の期限も重ねる。
+
+helper が要る理由（カーネルの要件）: `setns(CLONE_NEWUSER)` は多スレッドのプロセスでは `EINVAL` になり、netns の `setns` は netns の所有 userns での `CAP_SYS_ADMIN` に加え呼び出し側の現在の userns での `CAP_SYS_ADMIN` も要る。非特権の plugin-cri は初期 userns でこれを持たないため、plugin-cri のスレッドが直接入る案は成り立たない。カーネルの該当箇所（`userns_install`・`netns_install`・`SIOCGSKNS` の `ns_capable`）の行番号による一次情報の確認は**未確認**（実装 issue で確かめる）。実現可能性の根拠は実機前提試験 `netns_holder_userns` で、非 root の CI で同じ手順が成り立つ。
+
+#### 方式の比較
+
+| 案 | 内容 | 判断 |
+| -- | ---- | ---- |
+| A | dial ごとの単一スレッド helper | 採用。保持役は待機だけのまま。`netns_holder` の部品と Exec の helper の前例を再利用でき、新しい crate の辺も外部依存も無い |
+| B | 保持役に connect を頼む | 不採用。保持役は pod の userns で権限を持つ長寿命のプロセスで、要求の解析・並行の connect・fd の返送を足すと攻撃面が広がり、stdin の EOF で解放する契約も変わる。1 件の不具合が pod 全体に及ぶ |
+| C | plugin-cri のスレッドで `setns(net)` | 不採用。上記のカーネル要件で成り立たない |
+| D | plugin-cri から fork して子で setns | 不採用。多スレッドからの fork は既存の設計で却下済みで、sys の外に unsafe が要る |
+| E | pod ごと・セッションごとの常駐 dial 役 | 不採用（当面）。常駐メモリ（CORE-7〜9）と寿命管理が増える。再評価条件は確立の遅れの実測 |
+| F | helper が未接続の socket を返し plugin-cri が connect | 不採用。std に既存の fd へ connect する API が無く、`connect`・`poll`・`SO_ERROR` の新しい FFI が要る |
+| G | 外部の `nsenter`・`socat` | 不採用。PATH 探索と外部バイナリへの依存で検証できない（PLUG-11） |
+| H | helper が `/proc/<pid>/ns/*` を自分で開く | 不採用。素性の照合と pid の固定は回収しない親にしかできないため fd を渡す |
+
+#### SEC-1（接続先の制限）
+
+- channel を越える可変値は port（`NonZeroU16`）と期限だけ。アドレスは helper が `127.0.0.1` 固定で書く。`::1` は試さない
+- netns の出所は自 sandbox の保持役の fd だけ。保持役が無い・死んだ・plugin-cri の再起動で表が空、のいずれも `UNAVAILABLE` の固定文で失敗し、`NodeLoopbackDialer` へは縮退しない
+- cri の対応表を締める（F9）。現状の `port_forward_network` は NODE 以外をすべて `Pod` にするが、bundle は network の `CONTAINER` を「コンテナごとの新しい netns」、`TARGET` を未対応と扱うため、POD を有効にすると `CONTAINER` の pod まで保持役の netns へつながる。`POD` か未指定（proto の既定 0 は POD）だけを `Pod` とし、`CONTAINER`・`TARGET`・未知の値は RPC 時に `UNIMPLEMENTED`（固定文）、`Pod` で記録に保持役が無ければ `FAILED_PRECONDITION` にする
+- pod A / B の取り違えが無いことを試験で必須にする（単体は固定プログラムの保持役 2 つ、実機は段 F）
+- helper は setns の後、接続の前に capability を空にし NNP・non-dumpable にし `close_range` する。コンテナのコードは実行しない。受けた fd は本数・`MSG_CTRUNC`・種別・peer・netns の不一致をすべて拒否し、drop で閉じる
+- エラー文・ログに port・pid・パス・トークンを含めない（REPAIR-4）
+
+#### 期限と上限（REPAIR-5。暫定値で #4116 の確認の対象）
+
+| 待ち | 値 |
+| ---- | -- |
+| dial 全体（cri から与えられる `timeout`） | 既定 10 秒 |
+| helper の応答待ち W | `timeout` − 1 秒（kill・回収の予算を残す） |
+| helper の connect の期限 C | W − 500 ms（frame の範囲は 1..=10000 ms。0 以下なら helper を起動せず `TIMEOUT`） |
+| helper の要求・fd の受信 | 2 秒（`FDS_RECV_TIMEOUT` と同じ） |
+| 応答後の終了待ち / SIGKILL 後の回収 | 200 ms / 800 ms |
+| 回収できない helper の保持 | 上限 8（満杯なら新しい dial を `RESOURCE_EXHAUSTED`） |
+| 同時の helper 数 | cri の `max_inflight_dials`（32）で有界 |
+
+残余: StopPodSandbox と並行した dial で、fd を開いた後に解放が走ると、fd が netns を生かしたまま最大 10 秒つながりうる（有界）。URL 発行後の sandbox の消失は NODE と同じく TTL と idle の期限で有界。
+
+#### crate の担当（PLUG-1）
+
+- net: `netns_dial` の frame・helper・親側の channel・`verify_dialed_socket`・sys の追加
+- supervisor: `main.rs` の `netns-dial` の振り分けだけ（`netns-holder` と同じ位置・理由）
+- plugin-cri: 表の `NsId` の保存と fd を開く口・`PodNetnsDialer`・結線
+- cri: 対応表の締めと保持役の有無の検査
+
+#### 子 issue（すべて 2h 以下・phase:7・#3766 の sub-issue）
+
+| issue | 内容 | 担当 | 依存 |
+| ----- | ---- | ---- | ---- |
+| #4477 | `netns_dial` の frame codec | net | なし |
+| #4478 | sys の追加と `verify_dialed_socket` | net | #4477 |
+| #4479 | helper 本体 `run_netns_dial_main` | net | #4477・#4478 |
+| #4480 | 親側の `NetnsDialChannel` と実機前提試験 `netns_dial_userns` | net | #4479 |
+| #4481 | `netns_dial_userns` の platform-ci への組み込み | infra | #4480 |
+| #4482 | supervisor の `main.rs` の振り分け | supervisor | #4479 |
+| #4483 | `ProductionPodHolder` の `NsId` の保存と fd を開く口 | plugin-cri | なし |
+| #4484 | `PodNetnsDialer` | plugin-cri | #4480・#4482・#4483 |
+| #4485 | cri の `port_forward_network` を締める | cri | なし |
+| #4486 | plugin-cri の結線 | plugin-cri | #4484・#4485 |
+| #4487 | `production_binary_exec_real` の段 F | plugin-cri | #4486・#4481 |
+| #4488 | docs の更新 | docs | #4487 |
+
+sys に新しい unsafe を足す子（#4478・#4479・#4483）は、PR 本文に unsafe 箇所の一覧・security-auditor 観点のレビューの記録・#4 の事前承認コメントへのリンクを記載し、libc 照合を同じ PR で足す。依存 crate は追加しない。
+
+#### 確認事項（決定扱いにしない）
+
+1. `::1` は POD でも試さない（containerd の挙動は一次情報で未確認）
+2. dial ごとに helper を起動する費用。再評価条件は確立の p95 の実測が問題になったとき（案 E）
+3. `SIOCGSKNS` を必須にすること。CI で拒否されたら検査を緩めず、オーナー判断に上げる
+4. `CONTAINER` の pod の port-forward を `UNIMPLEMENTED` にすること（containerd との差は未確認）
+5. 上の期限・上限の暫定値（#4116）
+6. 実 crictl・kubectl での確認は人間担当（#3730）
 
 ### 期限の一覧（REPAIR-5）
 
@@ -474,6 +560,7 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 | follow のポーリング / 上限 | 200 ms / 24 時間 |
 | attach の follow スレッドの書き込みの刻み（取り消しの確認） | 200 ms |
 | PortForward の dial / 対の揃い / 書き込みの stall | 10 秒 / 30 秒 / 30 秒 |
+| POD の PortForward の helper（#3766 の設計。未実装） | 応答待ち `timeout` − 1 秒・connect `W` − 500 ms・受信 2 秒・応答後の終了待ち 200 ms・SIGKILL 後の回収 800 ms（上の「POD ネットワークの PortForward の設計」。暫定値で #4116 の対象） |
 | `StreamingServer` の SIGTERM での停止 | 受信の検知（100 ms 周期）で待ち受けを閉じる（待ちなし。#3754）。受け付け済みのセッションはシグナルから 5 秒（`STREAMING_DRAIN_WAIT`）ドレインし、期限で exec を止めて 1 秒（`STREAMING_CLOSE_WAIT`）待ち、残りを強制クローズする。gRPC の猶予 10 秒以内に収まり、streaming は全体の上限を延ばさない（全体は #4340 で op-stats の最後の書き出し 1 秒が別に足されて 14.7 秒）（#4164。暫定値で #4116 の対象） |
 | helper の fd 2 の読み手（#4171） | 読み取りの刻み 100 ms / 停止後の drain 50 ms / 終了時の待ち 500 ms / 絶対期限 25 秒 + 3600 秒 + 30 秒 |
 | 要求元の切断の検知（helper の serve の刻み）/ 検知から helper の終了まで | 20 ms / 合否値 2 秒（通知処理のない通常ケース。遅延・回収失敗ケースは検知最大 5 秒・回収込み 約 15 秒。期限と `hold_grace` は不変）。#4165。実装済み（#4166）。実機前提試験は `stream_exec_real` の `requester_killed` と `production_binary_exec_real` の段 4（#4167） |
@@ -495,7 +582,7 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 | #3763 | plugin-cri の読み取り専用 attach | 実装済み（supervisor の reader の取り消しの口・`FollowEnd`・`RecordDemux` を含む） |
 | #3764 | docs の更新 | 実装済み（冒頭の表と「残るもの」） |
 | #3765 | 完全版 attach（A1 を本命として設計と分解） | 設計済み。子 issue は「完全版 Attach の設計（#3765）」を参照 |
-| #3766 | POD の port-forward の設計と分解 | — |
+| #3766 | POD の port-forward の設計と分解 | 設計済み。子 issue は「POD ネットワークの PortForward の設計（#3766）」の表（#4477〜#4488） |
 | #4165 | 要求元の異常終了の検知方式の選定 | 設計済み（Exec 節の「要求元の異常終了の検知」） |
 | #4166 | 検知の実装（sys の `poll`・`ExecLaunchIo` の取り消し口・helper） | 実装済み |
 | #4167 | 検知の実機前提試験 | 実装済み（`stream_exec_real` の `requester_killed`・`production_binary_exec_real` の段 4） |
@@ -518,7 +605,7 @@ CRI の `ExecSync`（現状 `UNIMPLEMENTED`）も本設計の helper を再利�
 実装済みは Exec の本番 launcher（#3761。Linux のみ）、読み取り専用の Attach（#3763）、NODE の PortForward（#3755）。未実装の組は次のとおり（REPAIR-3）。
 
 - 完全な Attach（stdin・stdin_once・tty・resize）: 実装済み（#4077・#4078。dispatcher の `read_only` と bundle の拒否は解除済み）。実機前提試験・手順・CI も済み（#4079）。残るのは実 crictl・kubectl での確認（人間担当）。#3765（設計のみ・closed）の子 issue で追う。個別の状態は「完全版 Attach の設計（#3765）」の子 issue 表を正とする
-- POD ネットワークの PortForward: 設計と分解は #3766、前提は保持役 provider の #2877。RPC 時と dialer の両方で `UNIMPLEMENTED`
+- POD ネットワークの PortForward: 設計と分解は #3766（設計済み・closed 予定）、前提の保持役 provider は #2877 で実装済み。実装は子 issue #4477〜#4488 で、それまで RPC 時と dialer の両方で `UNIMPLEMENTED`
 - Exec の tty: 実装済み（#4416・#4417。実機前提試験の段 T）。残りは実 crictl / kubectl での `exec -it` の確認（人間担当）
 - Exec の相対 argv[0]（PATH 解決）: #2439 の判断待ち。RPC 時に `INVALID_ARGUMENT`
 - Exec の実機前提試験: #3762。完全版 Attach の実機前提試験は #4079（`production_binary_attach_real`）で実装済み

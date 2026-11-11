@@ -400,18 +400,54 @@ mod imp {
         wait_single_threaded();
     }
 
+    /// `record_until` が絶対期限を過ぎてから戻るまでに許す超過分（REPAIR-5・SEC-4・#4536）。
+    ///
+    /// 根拠は 3 つ。(1) 実装側: この試験の経路（主経路が止まり、期限が尽きる）では、期限後に残る待ちは
+    /// 回収待ちが `hard`（期限）へ絞られて 0 回になり、代替経路・失敗通知・出し直しスレッドの join にも
+    /// 到達しない（`seen` が空であることで確定的に照合する）。実装が持つ有界の待ちは `POLL_INTERVAL`
+    /// （5 ms）の端数だけである。(2) 残りは実装が上限を課せないスケジューリングの遅れで、最後の `sleep` の
+    /// 起床遅れ・期限をまたぐ fork / kill / waitpid / poll / read の中断できない syscall・戻り後の
+    /// `Instant::now()` までの遅れからなる。(3) 検出したい退行は「主経路の待ちが期限へ絞られず
+    /// `GENEROUS_LIMIT`（5 秒）まで待つ」ことで、許容差がそれより十分小さいことを下の `const` で固定する。
+    ///
+    /// Linux は 400 ms のまま緩めない。macOS はホステッドランナーの CPU 競合と timer coalescing で
+    /// 5 ms の sleep が数百 ms 遅れうる。main の push の CI（run 43062088322）で 300 ms の期限に対し
+    /// 721 ms（超過 421 ms）を観測したため、観測の約 3.5 倍の 1500 ms とする。値は macOS での繰り返し
+    /// 実行の分布で見直す（実行ごとに超過 ms を `record_until overshoot_ms=` の行へ出す）。
+    #[cfg(target_os = "linux")]
+    const UNTIL_SLACK: Duration = Duration::from_millis(400);
+    #[cfg(target_os = "macos")]
+    const UNTIL_SLACK: Duration = Duration::from_millis(1500);
+
+    /// 許容差が、期限へ絞られなくなる退行（主経路の上限 `GENEROUS_LIMIT` まで待つ）より十分小さいこと。
+    const _: () = assert!(
+        (300 + UNTIL_SLACK.as_millis()) * 2 < GENEROUS_LIMIT.as_millis(),
+        "UNTIL_SLACK must stay well below GENEROUS_LIMIT so a missing deadline clamp is detected"
+    );
+
     /// REPAIR-5・SEC-4: 主経路が止まり通知先も詰まっていても、`record_until` は絶対期限 + 許容差以内に
     /// `Timeout` で戻り(主経路の上限は 5 秒だが期限へ絞られる)、親にスレッドを残さない。
+    /// 期限が尽きた後は代替経路を呼ばない（許容差の前提。`UNTIL_SLACK` の doc）。
     fn record_until_returns_within_the_deadline() {
         let primary: Primary = Arc::new(|_, _| hang());
-        let (sink, _seen) = sink(primary, false, Notify::Stuck, tmp_marker("until"));
+        let (sink, seen) = sink(primary, false, Notify::Stuck, tmp_marker("until"));
         let budget = Duration::from_millis(300);
         let start = Instant::now();
         let e = sink.record_until(&record(), start + budget).unwrap_err();
         let took = start.elapsed();
         assert_eq!(e.code(), ErrorCode::Timeout);
         assert!(took >= budget, "{took:?}");
-        assert!(took < budget + Duration::from_millis(400), "{took:?}");
+        println!(
+            "audit_sink_isolation: record_until overshoot_ms={} slack_ms={}",
+            took.saturating_sub(budget).as_millis(),
+            UNTIL_SLACK.as_millis()
+        );
+        assert!(
+            took < budget + UNTIL_SLACK,
+            "record_until overshoot too large: took={took:?} overshoot={:?} slack={UNTIL_SLACK:?}",
+            took.saturating_sub(budget)
+        );
+        assert_eq!(*seen.lock().unwrap(), vec![]);
         wait_unreaped_cleared();
         wait_single_threaded();
     }

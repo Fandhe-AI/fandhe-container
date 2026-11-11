@@ -32,6 +32,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::error::{NetError, NetErrorCode};
+use crate::flock_release::ExplicitUnlockFile;
 use crate::sys::{self, SysError};
 
 /// 追記先 hosts ファイルの最大バイト数（実装上限。これを超える既存ファイルへは追記しない）。
@@ -326,10 +327,11 @@ fn write_all_counted(file: &mut File, buf: &[u8]) -> (usize, std::io::Result<()>
 /// hosts ファイルの排他ロックを期限つきで取得する（プロセス間の直列化。REPAIR-5）。
 ///
 /// `deadline` は呼び出し側が決めた全体の期限で、同一プロセス内ミューテックス待ちと共有する。
-fn lock_exclusive_bounded(file: &File, deadline: Instant) -> Result<(), NetError> {
+/// 成功すると返す guard の drop で明示 unlock してから閉じる（複製 fd が残っても外れる。#4514）。
+fn lock_exclusive_bounded(file: File, deadline: Instant) -> Result<ExplicitUnlockFile, NetError> {
     loop {
         match file.try_lock() {
-            Ok(()) => return Ok(()),
+            Ok(()) => return Ok(ExplicitUnlockFile::new(file)),
             Err(std::fs::TryLockError::WouldBlock) => {
                 if Instant::now() >= deadline {
                     return Err(NetError::new(
@@ -372,7 +374,8 @@ fn lock_guard_bounded(deadline: Instant) -> Result<std::sync::MutexGuard<'static
 /// 長さ取得・末尾改行判定・上限判定・追記を 1 つの排他区間（プロセス内ミューテックス + flock）にし、
 /// 既存内容の末尾が改行でなければ先頭に改行を補って `O_APPEND` の 1 回の `write_all` にまとめる。
 /// 追記後に [`MAX_HOSTS_FILE_BYTES`] を超えるなら書かない。書き込み・fsync の失敗時は同じロック下で
-/// 書き込み前の長さへ戻す（[`rollback_after_failure`]）。ロックは `file` の Drop で解放される。
+/// 書き込み前の長さへ戻す（[`rollback_after_failure`]）。ロックは `ExplicitUnlockFile` の Drop で明示 unlock される
+/// （他スレッドの spawn が複製 fd を持っても外れる。#4514・OCI-5・REPAIR-5）。
 ///
 /// 前提: 管理ルートはローカルファイルシステム上にあること。`flock` による直列化・`O_APPEND` の追記位置・
 /// `/proc/self/fdinfo` の `mnt_id` 照合はローカル FS の意味論に依存し、NFS 等のネットワーク FS では
@@ -383,11 +386,12 @@ pub(super) fn append_lines(
     lines: &str,
 ) -> Result<(), NetError> {
     let (root, target) = open_in_root(managed_root, hosts_rel)?;
-    let mut file = reopen_verified(&root, &target)?;
+    let file = reopen_verified(&root, &target)?;
     drop(target);
     let deadline = Instant::now() + HOSTS_LOCK_TIMEOUT;
     let _guard = lock_guard_bounded(deadline)?;
-    lock_exclusive_bounded(&file, deadline)?;
+    // 宣言の逆順で drop されるため、flock の明示 unlock → プロセス内ミューテックスの順に外れる。
+    let mut file = lock_exclusive_bounded(file, deadline)?;
     // サイズ・リンク数はロック取得までに変わりうるため、排他区間内で開き直した fd に対して再確認する。
     verify_hosts_file(&file)?;
     verify_same_mount(&root, &file)?;
@@ -458,6 +462,36 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);
         }
+    }
+
+    /// OCI-5・REPAIR-5・#4514: hosts ファイルのロックは複製 fd が残っても drop で外れる（陽性対照つき）。
+    #[test]
+    fn oci5_repair5_4514_hosts_lock_releases_despite_duplicate_fd() {
+        use std::fs::TryLockError;
+        let f = TmpFile::new("lock4514", Some("127.0.0.1\tlocalhost\n"));
+        let open = || {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&f.path)
+                .unwrap()
+        };
+        let guard =
+            lock_exclusive_bounded(open(), Instant::now() + Duration::from_secs(1)).unwrap();
+        let dup = guard.clone_file_for_test().unwrap();
+        let probe = open();
+        assert!(matches!(probe.try_lock(), Err(TryLockError::WouldBlock)));
+        drop(guard);
+        assert!(probe.try_lock().is_ok());
+        probe.unlock().unwrap();
+        // 陽性対照: 包まない File は close だけでは複製がある間外れない。
+        let plain = open();
+        plain.try_lock().unwrap();
+        let plain_dup = plain.try_clone().unwrap();
+        drop(plain);
+        assert!(matches!(probe.try_lock(), Err(TryLockError::WouldBlock)));
+        drop(plain_dup);
+        drop(dup);
     }
 
     fn run<'a>(f: &TmpFile, raw: impl IntoIterator<Item = &'a str>) -> Result<(), NetError> {

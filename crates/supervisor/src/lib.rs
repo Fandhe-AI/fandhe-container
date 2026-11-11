@@ -75,6 +75,7 @@ pub mod control;
 mod deadline_store;
 #[cfg(target_os = "linux")]
 pub mod exec;
+mod flock_release;
 pub mod health;
 pub mod healthcheck;
 #[cfg(any(target_os = "linux", test))]

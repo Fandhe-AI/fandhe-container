@@ -13,7 +13,7 @@
 //!   ため。sink は失敗状態にしない）。それ以外の内容は不透明バイト列のまま書き、解釈・エスケープをしない。
 //!   書き込み失敗で失敗状態になった sink のファイルは、末尾レコードが途中で切れていることがある。
 //! - 同じ ID のログは同時に 1 つの sink だけが開ける。[`RotatingFileSink::open`] は `<id>.log.lock` への排他
-//!   ロック（unix は flock、Windows は LockFileEx 相当。sink の生存中保持し、プロセス終了で OS が解放する）を
+//!   ロック（unix は flock、Windows は LockFileEx 相当。sink の生存中保持し、sink の drop で明示 unlock して閉じる。複製 fd が残っても外れる。#4517）を
 //!   取り、取れなければ（別の sink が使用中）既存ログを動かさず `FailedPrecondition` で拒否する。
 //!   ロックファイルは空のままで、sink を閉じただけでは残る。消すのは次の 2 経路だけで、どちらもロックを
 //!   取得した状態で行う（SUP-7・TASK-164 追補・#1469）: (1) [`RotatingFileSink::open`] がロック取得後の検査・
@@ -106,6 +106,7 @@ use std::time::{Duration, Instant};
 use fandhe_container_core::traits::{ContainerId, ErrorCode, TraitError};
 
 use super::{LogSink, MAX_LINE_BYTES, StreamKind};
+use crate::flock_release::ExplicitUnlockFile;
 
 /// 既定の 1 ファイルあたり上限（1MiB。SUP-7）。
 pub const DEFAULT_LOG_FILE_BYTES: u64 = 1024 * 1024;
@@ -201,10 +202,11 @@ struct Inner {
 
 /// ファイルへ追記し、上限超過の前に世代を送る [`LogSink`]。
 pub struct RotatingFileSink {
-    /// 同一 ID の同時使用を排他するロックファイル（生存中保持。ドロップで解放。SUP-7）。
+    /// 同一 ID の同時使用を排他するロックファイル（生存中保持。drop で明示 unlock して閉じる。fork 子・spawn の
+    /// 複製 fd が残っても外れる。SUP-7・OCI-5・REPAIR-5・#4517）。
     /// `Option` なのは、`open` が取得後の検査で失敗したときに取り出してロックファイルを消すため
     /// （TASK-164 追補・#1469）。`open` が成功して返した sink では常に `Some`。
-    lock: Option<File>,
+    lock: Option<ExplicitUnlockFile>,
     dir: PathBuf,
     base: String,
     config: RotationConfig,
@@ -396,6 +398,15 @@ fn internal(msg: &'static str) -> TraitError {
 }
 
 impl RotatingFileSink {
+    /// 試験用: ログロックと同じ OFD を指す複製 fd（fork した子が持つ fd の代役。#4517）。
+    #[cfg(all(test, unix))]
+    fn lock_file_clone_for_test(&self) -> File {
+        self.lock
+            .as_ref()
+            .expect("lock present")
+            .clone_file_for_test()
+    }
+
     /// `dir` 直下に `<id>.log` を作って sink を開く。
     ///
     /// `dir` は絶対パスで指す既存のディレクトリで、symlink でなく（unix では）group / other 書き込み不可で
@@ -768,7 +779,7 @@ const LOCK_SUFFIX: &str = ".lock";
 /// ロックファイルは内容を持たず、書き込みもしない。新規作成は `create_new`（symlink を辿らない）、
 /// 既存は通常ファイル（symlink・FIFO 等は拒否）のときだけ読み取りで開く。開いた実体が検査したものと同じ通常ファイルであることを開いた後にも確かめる
 /// （検査と open の間の差し替え対策。unix は dev / inode も照合する）。
-fn acquire_lock(dir: &Path, base: &str) -> Result<File, TraitError> {
+fn acquire_lock(dir: &Path, base: &str) -> Result<ExplicitUnlockFile, TraitError> {
     acquire_lock_with(dir, base, LOCK_RETRY, || {
         std::thread::sleep(LOCK_RETRY.interval)
     })
@@ -784,7 +795,7 @@ fn acquire_lock_with(
     base: &str,
     retry: RenameRetry,
     mut sleep: impl FnMut(),
-) -> Result<File, TraitError> {
+) -> Result<ExplicitUnlockFile, TraitError> {
     let path = lock_path(dir, base);
     let mut create = OpenOptions::new();
     create.write(true).create_new(true);
@@ -829,8 +840,13 @@ fn acquire_lock_with(
             // ロックを取れた実体が、いまのパスの実体と同じであることを確かめる（unix）。別の掃除が
             // 取得の前後でロックファイルを消し、別の sink が作り直していた場合、孤立した inode の
             // ロックを持っても排他にならない（TASK-164 追補・#1469）。
-            verify_lock_is_current(&file, &path)?;
-            Ok(file)
+            // 取得直後に包む。検査が失敗しても drop が明示 unlock する（#4517）。
+            let lock = ExplicitUnlockFile::new(file);
+            let held = lock
+                .as_file()
+                .ok_or_else(|| internal("log lock open failed"))?;
+            verify_lock_is_current(held, &path)?;
+            Ok(lock)
         }
         Err(std::fs::TryLockError::WouldBlock) => Err(TraitError::new(
             ErrorCode::FailedPrecondition,
@@ -1136,13 +1152,13 @@ fn verify_lock_is_current(_file: &File, _path: &Path) -> Result<(), TraitError> 
     Ok(())
 }
 
-/// 保持中のロックファイルを消して解放する（`NotFound` は成功扱い）。
+/// 保持中のロックファイルを消して、明示 unlock して閉じる（`NotFound` は成功扱い）。
 ///
 /// unix は排他ロックを保持したまま unlink する（削除する側は全員ロック保持者なので、取得時の同一性照合
 /// と合わせ、孤立 inode への二重ロックを防ぐ）。その後ディレクトリを fsync してから解放する。
 /// 他 OS は自分のハンドルが削除を拒むため、閉じてから消す。閉じてから消すまでの間に別の sink が
 /// 開いた場合、削除は共有違反で失敗するだけで、その sink の排他は保たれる（ロックファイルが残る）。
-fn remove_lock_file(lock: File, path: &Path, dir: &Path) -> std::io::Result<()> {
+fn remove_lock_file(lock: ExplicitUnlockFile, path: &Path, dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         let res = match fs::remove_file(path) {

@@ -8,8 +8,8 @@
 //!
 //! # 契約
 //! - 親 `sys` と同じ（`unsafe fn` を公開しない・`SAFETY:` の明記・arch ごとの定数・戻り値 -1 は直後に errno を確保）
-//! - 受け取った fd はすべて `OwnedFd` で所有する（拒否時は drop で閉じる）。制御バッファはちょうど 2 本分
-//!   （`MAX_FDS`）で、3 本目以降はカーネルが閉じて `MSG_CTRUNC` を立てる
+//! - 受け取った fd はすべて `OwnedFd` で所有する（拒否時は drop で閉じる）。受信上限は `CMSG_LEN` で切り（`cmsg_len`）、2 本分
+//!   （`MAX_FDS`）なら 3 本目以降、1 本（`recv_one_fd`）なら 2 本目以降をカーネルが閉じて `MSG_CTRUNC` を立てる
 //! - 待ちは持たない（`MSG_DONTWAIT`）。期限つきの待ちは親の `wait_readable` と `Deadline` が担う（REPAIR-5）
 //!
 //! # `libc` 照合について
@@ -34,6 +34,8 @@ mod consts {
     pub const SOCK_SEQPACKET: i32 = 5;
     pub const SOL_SOCKET: i32 = 1;
     pub const SO_TYPE: i32 = 3;
+    pub const SO_PROTOCOL: i32 = 38;
+    pub const SO_DOMAIN: i32 = 39;
     pub const SO_PEERCRED: i32 = 17;
     pub const SCM_RIGHTS: i32 = 1;
     pub const MSG_CTRUNC: i32 = 0x8;
@@ -62,6 +64,8 @@ mod consts {
     pub const SOCK_SEQPACKET: i32 = 5;
     pub const SOL_SOCKET: i32 = 1;
     pub const SO_TYPE: i32 = 3;
+    pub const SO_PROTOCOL: i32 = 38;
+    pub const SO_DOMAIN: i32 = 39;
     pub const SO_PEERCRED: i32 = 17;
     pub const SCM_RIGHTS: i32 = 1;
     pub const MSG_CTRUNC: i32 = 0x8;
@@ -93,6 +97,8 @@ mod consts {
     pub const SOCK_SEQPACKET: i32 = 0;
     pub const SOL_SOCKET: i32 = 0;
     pub const SO_TYPE: i32 = 0;
+    pub const SO_PROTOCOL: i32 = 0;
+    pub const SO_DOMAIN: i32 = 0;
     pub const SO_PEERCRED: i32 = 0;
     pub const SCM_RIGHTS: i32 = 0;
     pub const MSG_CTRUNC: i32 = 0;
@@ -173,6 +179,15 @@ const fn cmsg_space(data_len: usize) -> usize {
     CMSG_HDR_LEN + cmsg_align(data_len)
 }
 
+/// `CMSG_LEN(data_len)`（整列の詰め物を含まない長さ）。
+///
+/// 受信側の制御バッファ長に `CMSG_SPACE` を渡すと、カーネルの `scm_max_fds`
+/// （`(controllen - sizeof(cmsghdr)) / sizeof(int)`。v6.12 `net/core/scm.c:313`）は fd 1 本分の 24 バイトで 2 本と数え、
+/// 2 本目を `MSG_CTRUNC` なしで受け取ってしまう。受信上限は `CMSG_LEN` で切る（0 本・2 本では値が変わらない）。
+const fn cmsg_len(data_len: usize) -> usize {
+    CMSG_HDR_LEN + data_len
+}
+
 /// 制御バッファの容量（`MAX_FDS` 本ちょうど。余裕を持たせると 3 本目以降が入ってしまう）。
 const CONTROL_CAP: usize = cmsg_space(MAX_FDS * 4);
 
@@ -240,18 +255,36 @@ pub(crate) fn socketpair_seqpacket() -> Result<(OwnedFd, OwnedFd), SysError> {
 
 /// ソケットの種別（`SO_TYPE`）。ソケットでなければ `Os(ENOTSOCK)`。
 pub(crate) fn socket_type(fd: BorrowedFd<'_>) -> Result<i32, SysError> {
+    getsockopt_int(fd, consts::SOL_SOCKET, consts::SO_TYPE)
+}
+
+/// ソケットのアドレスファミリ（`SO_DOMAIN`。`AF_INET` 等）。`netns_dial::verify` が IPv4 であることの照合に使う
+/// （SEC-1・NET-3・#4478）。ソケットでなければ `Os(ENOTSOCK)`。
+pub(crate) fn socket_domain(fd: BorrowedFd<'_>) -> Result<i32, SysError> {
+    getsockopt_int(fd, consts::SOL_SOCKET, consts::SO_DOMAIN)
+}
+
+/// ソケットのプロトコル（`SO_PROTOCOL`。`IPPROTO_TCP` 等）。`SOCK_STREAM` でも SCTP 等がありうるため、
+/// `netns_dial::verify` が TCP であることの照合に使う（SEC-1・NET-3・#4478）。ソケットでなければ `Os(ENOTSOCK)`。
+pub(crate) fn socket_protocol(fd: BorrowedFd<'_>) -> Result<i32, SysError> {
+    getsockopt_int(fd, consts::SOL_SOCKET, consts::SO_PROTOCOL)
+}
+
+/// `int` 値の `getsockopt(2)`（`SO_TYPE`・`SO_DOMAIN`・`SO_PROTOCOL` の共通部）。
+fn getsockopt_int(fd: BorrowedFd<'_>, level: i32, opt: i32) -> Result<i32, SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
     }
     let mut val: i32 = 0;
     let mut len = core::mem::size_of::<i32>() as u32;
     // SAFETY: `val`・`len` はスタック上の初期化済みローカルで、入力の `len` は `val` の確保サイズ（4）。カーネルは
-    // それを超えて書かない。`fd` は生存中の `BorrowedFd`。
+    // それを超えて書かない。`fd` は生存中の `BorrowedFd`。`level`・`opt` は本モジュールの定数で、いずれも
+    // `int` を返すオプション。
     let rc = unsafe {
         getsockopt(
             fd.as_raw_fd(),
-            consts::SOL_SOCKET,
-            consts::SO_TYPE,
+            level,
+            opt,
             (&raw mut val).cast(),
             &raw mut len,
         )
@@ -311,7 +344,7 @@ pub(crate) struct Received {
     pub len: usize,
     /// データが `buf` に収まらず切り詰められた（`MSG_TRUNC`）。
     pub data_truncated: bool,
-    /// 制御データが収まらず fd が捨てられた（`MSG_CTRUNC`。3 本目以降・許可していない fd）。
+    /// 制御データが収まらず fd が捨てられた（`MSG_CTRUNC`。上限を超える本数・許可していない fd）。
     pub ctrl_truncated: bool,
     /// 受け取った fd（`SCM_RIGHTS`。`MAX_FDS` 以下）。drop で閉じる。
     pub fds: Vec<OwnedFd>,
@@ -347,8 +380,8 @@ fn parse_scm_rights(ctrl: &[u8]) -> Option<Vec<RawFd>> {
 
 /// 1 通を待たずに受信する（`MSG_CMSG_CLOEXEC | MSG_DONTWAIT`）。通常は `wait_readable` の後に呼ぶ。
 ///
-/// `max_fds` は受け取る fd の上限（0 から `MAX_FDS`）。制御バッファはその本数ちょうどで、超過分はカーネルが
-/// 閉じて `ctrl_truncated` が立つ。待機中のメッセージが無ければ `Os(EAGAIN)`。
+/// `max_fds` は受け取る fd の上限（0 から `MAX_FDS`）。制御バッファ長は `CMSG_LEN` で切るため（[`cmsg_len`]）
+/// その本数ちょうどで、超過分はカーネルが閉じて `ctrl_truncated` が立つ。待機中のメッセージが無ければ `Os(EAGAIN)`。
 pub(crate) fn recv_with_fds(
     fd: BorrowedFd<'_>,
     buf: &mut [u8],
@@ -368,7 +401,7 @@ pub(crate) fn recv_with_fds(
     let ctl_len = if max_fds == 0 {
         0
     } else {
-        cmsg_space(max_fds * 4)
+        cmsg_len(max_fds * 4)
     };
     let mut msg = MsgHdr {
         name: core::ptr::null_mut(),
@@ -473,6 +506,26 @@ pub(crate) fn send_with_fds(
     // `BorrowedFd` のため fd 番号は開いている。`fd` も生存中の `BorrowedFd`。
     let n = unsafe { sendmsg(fd.as_raw_fd(), &raw const msg, flags) };
     usize::try_from(n).map_err(|_| last_error())
+}
+
+/// 接続済みソケットの fd を 1 本だけ送る入口（`netns-dial` helper の応答。SEC-1・NET-3・#4478）。
+/// 契約は [`send_with_fds`] と同じ。
+#[allow(dead_code)] // 親側の channel（#4480）が使うまでは試験のみ。
+pub(crate) fn send_one_fd(
+    fd: BorrowedFd<'_>,
+    data: &[u8],
+    one: BorrowedFd<'_>,
+    dontwait: bool,
+) -> Result<usize, SysError> {
+    send_with_fds(fd, data, &[one], dontwait)
+}
+
+/// fd を最大 1 本だけ受ける入口（`netns-dial` の親側。SEC-1・NET-3・#4478）。制御バッファは `CMSG_LEN(4)` で、
+/// 2 本目以降はカーネルが閉じて `ctrl_truncated` が立つ。本数が 1 本ちょうどか・`ctrl_truncated` が偽かの検査は
+/// 呼び出し側の channel（#4480）が行う（0 本の応答もここでは `Ok` で返る）。
+#[allow(dead_code)] // 親側の channel（#4480）が使うまでは試験のみ。
+pub(crate) fn recv_one_fd(fd: BorrowedFd<'_>, buf: &mut [u8]) -> Result<Received, SysError> {
+    recv_with_fds(fd, buf, 1)
 }
 
 /// 呼び出しスレッドを `fd` の namespace へ参加させる（`setns(2)`）。`nstype` は `CLONE_NEWUSER` / `CLONE_NEWNET`。
@@ -656,6 +709,39 @@ mod tests {
         assert_eq!(CONTROL_CAP, 24);
         assert_eq!(cmsg_space(4), 24);
         assert_eq!(cmsg_space(8), 24);
+        // 受信上限の制御長は `CMSG_LEN`（0 本・2 本は `CMSG_SPACE` と同値、1 本は 20）。
+        assert_eq!(cmsg_len(0), 16);
+        assert_eq!(cmsg_len(4), 20);
+        assert_eq!(cmsg_len(8), 24);
+    }
+
+    /// SEC-1・NET-3・#4478: fd 1 本の送受信。1 本はそのまま受け、2 本送られたら 2 本目は閉じられて `MSG_CTRUNC`。
+    #[test]
+    fn sec1_net3_4478_recv_one_fd_accepts_one_and_truncates_second() {
+        let (a, b) = socketpair_seqpacket().expect("pair");
+        let x = std::fs::File::open("/dev/null").expect("open");
+        let y = std::fs::File::open("/dev/null").expect("open");
+        send_one_fd(a.as_fd(), b"one", x.as_fd(), true).expect("send");
+        let mut buf = [0u8; 16];
+        let got = recv_one_fd(b.as_fd(), &mut buf).expect("recv");
+        assert_eq!((got.len, got.ctrl_truncated, got.fds.len()), (3, false, 1));
+        send_with_fds(a.as_fd(), b"two", &[x.as_fd(), y.as_fd()], true).expect("send");
+        let got = recv_one_fd(b.as_fd(), &mut buf).expect("recv");
+        assert_eq!((got.len, got.ctrl_truncated, got.fds.len()), (3, true, 1));
+    }
+
+    /// SEC-1・NET-3・#4478: ドメインとプロトコル（TCP は (2, 6)、UDP は (2, 17)、AF_UNIX は (1, 0)）。
+    #[test]
+    fn sec1_net3_4478_socket_domain_and_protocol_values() {
+        let t = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        assert_eq!(socket_domain(t.as_fd()), Ok(2));
+        assert_eq!(socket_protocol(t.as_fd()), Ok(6));
+        let u = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+        assert_eq!(socket_domain(u.as_fd()), Ok(2));
+        assert_eq!(socket_protocol(u.as_fd()), Ok(17));
+        let (a, _b) = socketpair_seqpacket().expect("pair");
+        assert_eq!(socket_domain(a.as_fd()), Ok(1));
+        assert_eq!(socket_protocol(a.as_fd()), Ok(0));
     }
 
     /// socketpair の往復と fd 受け渡し（具体値）。範囲外の fd 本数は拒否し、上限 0 で受けると fd は閉じられる。
@@ -724,6 +810,8 @@ mod libc_abi {
         assert!(consts::SOCK_SEQPACKET == libc::SOCK_SEQPACKET);
         assert!(consts::SOL_SOCKET == libc::SOL_SOCKET);
         assert!(consts::SO_TYPE == libc::SO_TYPE);
+        assert!(consts::SO_PROTOCOL == libc::SO_PROTOCOL);
+        assert!(consts::SO_DOMAIN == libc::SO_DOMAIN);
         assert!(consts::SO_PEERCRED == libc::SO_PEERCRED);
         assert!(consts::SCM_RIGHTS == libc::SCM_RIGHTS);
         assert!(consts::MSG_CTRUNC == libc::MSG_CTRUNC);

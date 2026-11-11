@@ -47,6 +47,7 @@ use std::io;
 use std::os::fd::{AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd};
 use std::time::{Duration, Instant};
 
+pub(crate) mod dial;
 pub(crate) mod holder;
 pub(crate) mod pasta;
 pub(crate) mod process;

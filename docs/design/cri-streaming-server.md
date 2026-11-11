@@ -489,6 +489,7 @@ helper が要る理由（カーネルの要件）: `setns(CLONE_NEWUSER)` は多
 - cri の対応表を締める（F9。#4485 で実装済み）。#4485 より前の `port_forward_network` は NODE 以外をすべて `Pod` にしていたが、bundle は network の `CONTAINER` を「コンテナごとの新しい netns」、`TARGET` を未対応と扱うため、POD を有効にすると `CONTAINER` の pod まで保持役の netns へつながる。`POD` か未指定（proto の既定 0 は POD）だけを `Pod` とし、`CONTAINER`・`TARGET`・未知の値は RPC 時に `UNIMPLEMENTED`（固定文）、`Pod` で記録に保持役が無ければ `FAILED_PRECONDITION` にする
 - pod A / B の取り違えが無いことを試験で必須にする（単体は固定プログラムの保持役 2 つ、実機は段 F）
 - helper は setns の後、接続の前に capability を空にし NNP・non-dumpable にし `close_range` する。コンテナのコードは実行しない。受けた fd は本数・`MSG_CTRUNC`・種別・peer・netns の不一致をすべて拒否し、drop で閉じる
+- helper が `setns(user)` してから non-dumpable にするまでの窓は dumpable のままだが、到達できない（#4525）。pod のコンテナ内のプロセス（pod の userns で capability を持ちうる唯一の主体）は、helper が pod の pid namespace に参加せず（`setns` は user と net だけ）、CRI の検証で pid の `NODE` / `TARGET` は `UNIMPLEMENTED`（pid の共有は未実装 #2903）のため helper の pid を名指しできない。OCI 既定に `CAP_SYS_PTRACE` も無い（SEC-1）。host 側の同 uid は pod の userns の所有者として初めから全 capability を持つため権限は上がらず、non-dumpable の後は exec 時の namespace での `CAP_SYS_PTRACE` が要る。再評価条件は pid の共有（#2903）や pid の `NODE` の受理。カーネル原文（`__ptrace_may_access`）の行番号での再確認は未実施
 - エラー文・ログに port・pid・パス・トークンを含めない（REPAIR-4）
 
 #### 期限と上限（REPAIR-5。暫定値で #4116 の確認の対象）
@@ -500,10 +501,10 @@ helper が要る理由（カーネルの要件）: `setns(CLONE_NEWUSER)` は多
 | helper の connect の期限 C | W − 500 ms（frame の範囲は 1..=10000 ms。0 以下なら helper を起動せず `TIMEOUT`） |
 | helper の要求・fd の受信 | 2 秒（`FDS_RECV_TIMEOUT` と同じ） |
 | 応答後の終了待ち / SIGKILL 後の回収 | 200 ms / 800 ms |
-| 回収できない helper の保持 | 上限 8（満杯なら新しい dial を `RESOURCE_EXHAUSTED`） |
+| 回収できない helper の保持 | 上限 8（入口で検査し、満杯なら新しい dial を `RESOURCE_EXHAUSTED`。並行 dial が同時に入れる分だけ超えうるが、断ると追えない zombie が残るため入れる側は断らない。超過の上限は 8 + `max_inflight_dials` − 1、既定で 39。#4525） |
 | 同時の helper 数 | cri の `max_inflight_dials`（32）で有界 |
 
-残余: StopPodSandbox と並行した dial で、fd を開いた後に解放が走ると、fd が netns を生かしたまま最大 10 秒つながりうる（有界）。URL 発行後の sandbox の消失は NODE と同じく TTL と idle の期限で有界。
+残余: 保持一覧の掃除は dial の入口・出口・一覧へ入れる直前と dialer の drop で行い、定期の掃除は採らない（常駐スレッドを増やさない）。dial が来ない間は SIGKILL 後に遅れて終了した子が zombie で残りうる（上限内。次の dial か plugin-cri の終了で解消。#4525）。StopPodSandbox と並行した dial で、fd を開いた後に解放が走ると、fd が netns を生かしたまま最大 10 秒つながりうる（有界）。URL 発行後の sandbox の消失は NODE と同じく TTL と idle の期限で有界。
 
 #### crate の担当（PLUG-1）
 

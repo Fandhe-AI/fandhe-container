@@ -7,15 +7,15 @@
 
 use std::fs::File;
 use std::os::fd::{AsFd as _, OwnedFd};
-use std::os::unix::fs::MetadataExt as _;
 use std::time::{Duration, Instant};
 
 use super::READY_TIMEOUT;
 use super::frame::{FRAME_LEN, HolderFrame, HolderMessage, NsIdentity};
 use super::holder::classify;
 use crate::error::{NetError, NetErrorCode};
+use crate::netns_helper::{RecvError, fd_identity, recv_before_deadline};
 use crate::sys::holder as sysh;
-use crate::sys::{self, Deadline, Readiness, SysError};
+use crate::sys::{Deadline, SysError};
 
 fn sys_err(e: SysError, message: &'static str) -> NetError {
     NetError::new(classify(e), message)
@@ -42,7 +42,7 @@ impl NetnsHolderFds {
         let user = File::from(user);
         let net = File::from(net);
         let stat = |f: &File| {
-            f.metadata().map(|m| (m.dev(), m.ino())).map_err(|_| {
+            fd_identity(f).map_err(|_| {
                 NetError::new(NetErrorCode::Internal, "cannot stat a namespace descriptor")
             })
         };
@@ -142,31 +142,16 @@ impl NetnsHolderChannel {
         let started = Instant::now();
         let deadline = Deadline::after(timeout);
         let mut buf = [0u8; FRAME_LEN];
-        let got = loop {
-            match sys::wait_readable(self.fd.as_fd(), &deadline) {
-                Err(e) => return Err(sys_err(e, "cannot wait for the holder")),
-                Ok(Readiness::TimedOut) => {
-                    return Err(NetError::new(
-                        NetErrorCode::Timeout,
-                        "timed out waiting for the holder READY",
-                    ));
-                }
-                Ok(Readiness::Readable | Readiness::Exceptional) => {}
-            }
-            match sysh::recv_with_fds(self.fd.as_fd(), &mut buf, 0) {
-                Ok(r) => break r,
-                Err(SysError::Os(n)) if n == sys::EAGAIN || n == sys::EINTR => {
-                    if deadline.remaining().is_zero() {
-                        return Err(NetError::new(
-                            NetErrorCode::Timeout,
-                            "timed out waiting for the holder READY",
-                        ));
-                    }
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                Err(e) => return Err(sys_err(e, "cannot receive from the holder")),
-            }
-        };
+        // 期限つき受信のループは helper と共有（#4533）。READY に fd は添わないため上限は 0 本。
+        let got =
+            recv_before_deadline(self.fd.as_fd(), &deadline, &mut buf, 0).map_err(|e| match e {
+                RecvError::Wait(e) => sys_err(e, "cannot wait for the holder"),
+                RecvError::TimedOut => NetError::new(
+                    NetErrorCode::Timeout,
+                    "timed out waiting for the holder READY",
+                ),
+                RecvError::Recv(e) => sys_err(e, "cannot receive from the holder"),
+            })?;
         if got.len == 0 && !got.ctrl_truncated {
             return Err(precondition("the holder exited before READY"));
         }

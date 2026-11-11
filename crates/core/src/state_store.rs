@@ -457,7 +457,7 @@ fn release_lock_file(file: File) -> LockRelease {
     release_lock_file_with(file, File::unlock)
 }
 
-/// unlock 失敗の固定ログ行（改行なし）。パス・errno・OS 由来の文字列は含めない。
+/// unlock 失敗の固定ログ行（改行なし）。パス・errno・OS 由来の文字列は含めない。Linux 限定（#4493）。
 #[cfg(target_os = "linux")]
 const UNLOCK_FAILED_LINE: &str = "{\"level\":\"warn\",\"event\":\"state_lock_unlock_failed\",\"lock\":\"@lock\",\"action\":\"closed\"}";
 
@@ -465,7 +465,25 @@ const UNLOCK_FAILED_LINE: &str = "{\"level\":\"warn\",\"event\":\"state_lock_unl
 ///
 /// gate を握ったまま呼ばれるため、止まる出力先へ書かない `exec::emit_diagnostic_line_to`
 /// （AF_UNIX の socket にだけ `MSG_DONTWAIT` で 1 回送る）に限る。stderr が socket でなければ捨てられる。
-/// 非 Linux には待たない出力経路が無いため、ログは出さず捨てる（実装済みを装わない。REPAIR-3）。
+///
+/// # 非 Linux（macOS）では記録しない（Agent の記録した判断。#4493・OCI-5・REPAIR-3・REPAIR-4・REPAIR-5）
+///
+/// 方式は (B)「macOS では記録しないことを確定し、理由を残す」。延期の記録（件数）を core に置き終了時に
+/// 期限つきで出す (A)（plugin 側の PR #1757 相当）は採らない。理由は次のとおり。
+///
+/// - macOS では unlock が失敗しても close でロックがすぐ外れる。`@lock` は std の `OpenOptions` で開き
+///   `O_CLOEXEC` が付くため exec で引き継がれず、macOS の core で exec せずに fork する 2 経路
+///   （`audit_log/file_sink.rs` の `run_isolated_until`・`audit_log/control_relay.rs` の `spawn_inner`）は
+///   fork 直後に fd 3 以上を閉じる。fd の複製が残らず、Linux の行が説明する「遅れて外れる」事象（#3471）が
+///   起きない。根拠の挙動は `oci5_repair5_3471_release_continues_close_when_unlock_fails` が固定している
+/// - Linux でも stderr が端末・pipe・通常ファイルならこの行は捨てられる（`exec/diagnostic.rs` の表）。
+///   macOS にだけ延期記録を足すと Linux の端末より手厚くなり、扱いが揃わない
+/// - Windows は `FileStateStore::open` が恒久的に拒否する（#2428 の案 C）ため `StoreGuard` が作られない
+/// - (A) は終了時の期限つき出力が CLI の `main.rs` の `plugin` feature の内側にしか無く、3 OS 共通の公開 API・
+///   CLI の終了経路への配線・drop への試験用の継ぎ目が要り、core と cli にまたがって見合わない
+///
+/// 再評価の条件: macOS の core に `@lock` の fd の複製を閉じずに残す fork / spawn の経路が入ったとき、
+/// macOS で unlock の失敗を実測したとき、core に終了時の延期出力の経路（PR #1757 と同等）が入ったとき。
 #[cfg(target_os = "linux")]
 fn report_lock_release_to(
     outcome: LockRelease,
@@ -492,6 +510,7 @@ impl Drop for StoreGuard<'_> {
                 use std::os::fd::AsFd as _;
                 let _ = report_lock_release_to(outcome, std::io::stderr().as_fd());
             }
+            // 非 Linux では記録しない判断（#4493 の方式 (B)。理由は `report_lock_release_to` の doc）。
             #[cfg(not(target_os = "linux"))]
             let _ = outcome;
         }

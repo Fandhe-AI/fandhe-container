@@ -72,6 +72,7 @@
 pub mod auth;
 pub mod config;
 pub mod error;
+mod flock_release;
 pub mod image_management;
 pub mod instrument;
 pub mod layer;

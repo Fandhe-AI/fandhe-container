@@ -68,12 +68,13 @@ const MAX_ROUNDS: usize = 64;
 /// 転送先の pod のネットワーク種別（CRI-6・SEC-1・#3755）。
 ///
 /// `runtime_service` が RPC 時に sandbox の記録（`namespace_options.network`）から決め、発行時の要求に
-/// 保存する。NODE（hostNetwork）と判定できたときだけ `Node` で、それ以外はすべて `Pod`（fail-closed）。
+/// 保存する。`NODE`（hostNetwork）は `Node`、`POD` と未指定だけが `Pod`。`CONTAINER`・`TARGET`・未知の値は
+/// RPC の時点で `UNIMPLEMENTED` にし、この型には現れない（#4485・SEC-1・fail-closed）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PortForwardNetwork {
     /// host の network namespace を使う pod。host の loopback へ接続する。
     Node,
-    /// pod 専用の network namespace を使う pod。保持役（#2877）が入るまで未実装（#3766）。
+    /// pod 専用の network namespace を使う pod。保持役の記録（`pod_holder`）が無ければ `FAILED_PRECONDITION`。plugin-cri の結線（#4486）まで未結線は `UNIMPLEMENTED`（#3766）。
     Pod,
 }
 

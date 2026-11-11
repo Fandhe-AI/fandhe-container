@@ -1059,3 +1059,146 @@ async fn cri6_repair5_4164_close_all_cuts_pre_upgrade_connections() {
     }
     assert!(started.elapsed() < Duration::from_secs(4));
 }
+/// 指定の `namespace_options.network`（`None` は未指定）の sandbox を作って ID を返す。
+#[cfg(unix)]
+async fn run_sandbox_with_network(
+    service: &CriRuntimeService,
+    name: &str,
+    network: Option<i32>,
+) -> String {
+    let linux = network.map(|n| v1::LinuxPodSandboxConfig {
+        security_context: Some(v1::LinuxSandboxSecurityContext {
+            namespace_options: Some(v1::NamespaceOption {
+                network: n,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    service
+        .run_pod_sandbox(Request::new(v1::RunPodSandboxRequest {
+            config: Some(PodSandboxConfig {
+                metadata: Some(PodSandboxMetadata {
+                    name: name.into(),
+                    uid: format!("uid-{name}"),
+                    namespace: "ns".into(),
+                    attempt: 0,
+                }),
+                linux,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+        .await
+        .expect("run pod sandbox")
+        .into_inner()
+        .pod_sandbox_id
+}
+
+#[cfg(unix)]
+async fn port_forward_of(
+    service: &CriRuntimeService,
+    sandbox: String,
+) -> Result<String, tonic::Status> {
+    service
+        .port_forward(Request::new(v1::PortForwardRequest {
+            pod_sandbox_id: sandbox,
+            port: vec![80],
+        }))
+        .await
+        .map(|r| r.into_inner().url)
+}
+
+/// 保持役を起動するだけのフェイク provider（pid 4242。release は成功し、liveness は Alive）。
+#[cfg(unix)]
+struct AliveHolder;
+
+#[cfg(unix)]
+impl fandhe_container_cri::adapter::PodNamespaceHolderProvider for AliveHolder {
+    fn spawn(
+        &self,
+        _req: &fandhe_container_cri::adapter::PodHolderRequest<'_>,
+    ) -> Result<fandhe_container_cri::adapter::PodHolder, fandhe_container_cri::error::CriError>
+    {
+        Ok(fandhe_container_cri::adapter::PodHolder::new(
+            std::num::NonZeroU32::new(4242).expect("nonzero"),
+        ))
+    }
+    fn release(
+        &self,
+        _sandbox_id: &str,
+        _timeout: Duration,
+    ) -> Result<(), fandhe_container_cri::error::CriError> {
+        Ok(())
+    }
+    fn liveness(
+        &self,
+        _sandbox_id: &str,
+    ) -> Result<
+        fandhe_container_cri::adapter::PodHolderLiveness,
+        fandhe_container_cri::error::CriError,
+    > {
+        Ok(fandhe_container_cri::adapter::PodHolderLiveness::Alive)
+    }
+}
+
+/// CRI-6・SEC-1・REPAIR-3・#4485: CONTAINER・TARGET・未知の network は POD の結線の有無に依らず固定文の
+/// `UNIMPLEMENTED`（POD 未結線の文とは別）。
+#[cfg(unix)]
+#[tokio::test]
+async fn cri6_sec1_4485_port_forward_container_target_unknown_are_unimplemented() {
+    let partial = StreamingServer::bind_with_handler(
+        StreamingConfig::default(),
+        partial_dispatcher(&[StreamKind::PortForward]),
+    )
+    .await
+    .expect("bind partial");
+    let wired = StreamingServer::bind_with_handler(StreamingConfig::default(), all_wired())
+        .await
+        .expect("bind wired");
+    for server in [&partial, &wired] {
+        let service = CriRuntimeService::new().with_streaming(server.issuer());
+        for (name, mode) in [
+            ("container", v1::NamespaceMode::Container as i32),
+            ("target", v1::NamespaceMode::Target as i32),
+            ("unknown", 99),
+        ] {
+            let id = run_sandbox_with_network(&service, name, Some(mode)).await;
+            let err = port_forward_of(&service, id).await.expect_err(name);
+            assert_eq!(err.code(), Code::Unimplemented, "{name}");
+            assert_eq!(
+                err.message(),
+                "port-forward for this pod network mode is not implemented",
+                "{name}"
+            );
+        }
+    }
+}
+
+/// CRI-6・SEC-1・#4485: POD 結線済みで保持役の記録が無い POD・未指定の sandbox は `FAILED_PRECONDITION`
+/// （NODE へ縮退しない）。保持役があれば URL を返す。
+#[cfg(unix)]
+#[tokio::test]
+async fn cri6_sec1_4485_port_forward_pod_requires_holder_record() {
+    let server = StreamingServer::bind_with_handler(StreamingConfig::default(), all_wired())
+        .await
+        .expect("bind");
+    let no_holder = CriRuntimeService::new().with_streaming(server.issuer());
+    for (name, mode) in [
+        ("pod", Some(v1::NamespaceMode::Pod as i32)),
+        ("unset", None),
+    ] {
+        let id = run_sandbox_with_network(&no_holder, name, mode).await;
+        let err = port_forward_of(&no_holder, id).await.expect_err(name);
+        assert_eq!(err.code(), Code::FailedPrecondition, "{name}");
+        assert_eq!(err.message(), "sandbox holder is unavailable", "{name}");
+    }
+    let with_holder = CriRuntimeService::new()
+        .with_streaming(server.issuer())
+        .with_pod_holder(Arc::new(AliveHolder));
+    let id =
+        run_sandbox_with_network(&with_holder, "pod", Some(v1::NamespaceMode::Pod as i32)).await;
+    let url = port_forward_of(&with_holder, id).await.expect("url");
+    assert!(url.contains("/portforward/"), "url={url}");
+}

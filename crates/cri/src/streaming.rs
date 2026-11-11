@@ -649,6 +649,7 @@ impl StreamingUrlIssuer {
     /// PortForward の `network` が POD で未対応なら `UNIMPLEMENTED` を返す（REPAIR-3・#3755）。
     ///
     /// `runtime_service` が sandbox の照合の後、URL の発行の前に呼ぶ。固定の英語文で、ID を含めない。
+    /// 保持役の記録の有無は、この後に `runtime_service` が検査する（#4485）。
     pub fn require_port_forward_network(
         &self,
         network: port_forward::PortForwardNetwork,

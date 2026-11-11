@@ -1455,22 +1455,31 @@ fn wants_pod_network(config: Option<&PodSandboxConfig>) -> bool {
     mode == v1::NamespaceMode::Pod as i32
 }
 
-/// PortForward の転送先のネットワーク種別を sandbox の保存済み設定から決める（CRI-6・SEC-1・#3755）。
+/// `CONTAINER`・`TARGET`・未知の `namespace_options.network` の PortForward を断る固定文（#4485・SEC-1）。
+/// 値・ID は含めない。`POD` 未結線の文（`streaming.rs`）とは別の文にして区別できるようにする。
+const PORT_FORWARD_NETWORK_MODE_UNSUPPORTED: &str =
+    "port-forward for this pod network mode is not implemented";
+
+/// PortForward の転送先のネットワーク種別を sandbox の保存済み設定から決める（CRI-6・SEC-1・REPAIR-3・#3755・#4485）。
 ///
-/// `namespace_options.network` がちょうど `NODE` のときだけ `Node`。未指定（既定 `POD`）・`POD`・`CONTAINER`・
-/// `TARGET`・未知の値はすべて `Pod` に倒す（fail-closed。`Pod` は未実装で接続しない）。
+/// `NODE` は `Node`。未指定（`linux`・`security_context`・`namespace_options` のいずれかが無い。既定 `POD`）と
+/// `POD` だけが `Pod`。`CONTAINER`・`TARGET`・未知の値は `Pod` へ倒さず `UNIMPLEMENTED`（fail-closed。
+/// `CONTAINER` の pod を保持役の netns へつなげない。`PortForwardNetwork` に未対応の値は届かない）。
 /// `wants_pod_network` は `CONTAINER`・`TARGET` を「POD でない」と扱うため流用しない。
-fn port_forward_network(config: &PodSandboxConfig) -> PortForwardNetwork {
+fn port_forward_network(config: &PodSandboxConfig) -> Result<PortForwardNetwork, CriError> {
     let mode = config
         .linux
         .as_ref()
         .and_then(|l| l.security_context.as_ref())
         .and_then(|s| s.namespace_options.as_ref())
         .map(|o| o.network);
-    if mode == Some(v1::NamespaceMode::Node as i32) {
-        PortForwardNetwork::Node
-    } else {
-        PortForwardNetwork::Pod
+    match mode {
+        None => Ok(PortForwardNetwork::Pod),
+        Some(m) if m == v1::NamespaceMode::Pod as i32 => Ok(PortForwardNetwork::Pod),
+        Some(m) if m == v1::NamespaceMode::Node as i32 => Ok(PortForwardNetwork::Node),
+        Some(_) => Err(CriError::unimplemented(
+            PORT_FORWARD_NETWORK_MODE_UNSUPPORTED,
+        )),
     }
 }
 
@@ -4205,6 +4214,10 @@ impl CriRuntimeService {
     }
 
     /// `PortForward` の本体（CRI-6・TASK-63.1）。
+    ///
+    /// 検査順（#4485・SEC-1）: issuer 未結線は `UNIMPLEMENTED` → 引数 → 未知 ID は `NOT_FOUND` →
+    /// `CONTAINER`・`TARGET`・未知の network は `UNIMPLEMENTED` → POD 未結線は `UNIMPLEMENTED` →
+    /// `Pod` で保持役の記録が無ければ `FAILED_PRECONDITION`（`Node` へ縮退しない）。
     fn port_forward_impl(
         &self,
         req: v1::PortForwardRequest,
@@ -4220,9 +4233,18 @@ impl CriRuntimeService {
                 .records
                 .get(&req.pod_sandbox_id)
                 .ok_or_else(|| CriError::not_found("pod sandbox not found"))?;
-            port_forward_network(&record.config)
+            (
+                port_forward_network(&record.config)?,
+                record.pod_holder.is_some(),
+            )
         };
+        let (network, has_holder) = network;
         issuer.require_port_forward_network(network)?;
+        if network == PortForwardNetwork::Pod && !has_holder {
+            return Err(CriError::failed_precondition(
+                "sandbox holder is unavailable",
+            ));
+        }
         let url = issuer.issue(StreamRequest::PortForward {
             request: req,
             network,
@@ -5137,9 +5159,9 @@ mod tests {
         }
     }
 
-    /// CRI-6・SEC-1・#3755: NODE だけが `Node` で、未指定・POD・CONTAINER・TARGET・未知の値は `Pod`（fail-closed）。
+    /// CRI-6・SEC-1・REPAIR-3・#4485: NODE は `Node`、未指定・POD だけが `Pod`、CONTAINER・TARGET・未知は `UNIMPLEMENTED`。
     #[test]
-    fn cri6_3755_port_forward_network_only_node_is_node() {
+    fn cri6_sec1_4485_port_forward_network_maps_only_pod_and_unset_to_pod() {
         fn config(network: Option<i32>) -> PodSandboxConfig {
             PodSandboxConfig {
                 linux: network.map(|n| v1::LinuxPodSandboxConfig {
@@ -5155,24 +5177,40 @@ mod tests {
                 ..Default::default()
             }
         }
+        let linux_without_ctx = PodSandboxConfig {
+            linux: Some(v1::LinuxPodSandboxConfig::default()),
+            ..Default::default()
+        };
+        let ctx_without_ns = PodSandboxConfig {
+            linux: Some(v1::LinuxPodSandboxConfig {
+                security_context: Some(v1::LinuxSandboxSecurityContext::default()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
         assert_eq!(
-            port_forward_network(&config(Some(v1::NamespaceMode::Node as i32))),
+            port_forward_network(&config(Some(v1::NamespaceMode::Node as i32))).unwrap(),
             PortForwardNetwork::Node
         );
-        assert_eq!(
-            port_forward_network(&PodSandboxConfig::default()),
-            PortForwardNetwork::Pod
-        );
-        assert_eq!(port_forward_network(&config(None)), PortForwardNetwork::Pod);
+        for c in [
+            PodSandboxConfig::default(),
+            linux_without_ctx,
+            ctx_without_ns,
+            config(None),
+            config(Some(v1::NamespaceMode::Pod as i32)),
+        ] {
+            assert_eq!(port_forward_network(&c).unwrap(), PortForwardNetwork::Pod);
+        }
         for mode in [
-            v1::NamespaceMode::Pod as i32,
             v1::NamespaceMode::Container as i32,
             v1::NamespaceMode::Target as i32,
             99,
         ] {
+            let err = port_forward_network(&config(Some(mode))).unwrap_err();
+            assert_eq!(err.code(), CriErrorCode::Unimplemented, "mode {mode}");
             assert_eq!(
-                port_forward_network(&config(Some(mode))),
-                PortForwardNetwork::Pod,
+                err.message(),
+                "port-forward for this pod network mode is not implemented",
                 "mode {mode}"
             );
         }

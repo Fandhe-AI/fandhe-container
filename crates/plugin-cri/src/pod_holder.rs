@@ -767,17 +767,23 @@ pub(crate) mod bin_fixture {
         pub(crate) dir: PathBuf,
         pub(crate) exe: PathBuf,
         pub(crate) sup: PathBuf,
+        /// 排他作成（残骸を消さず別名へ退避）したディレクトリの所有。Drop で自分の分だけ消す（#4499）。
+        _guard: crate::test_root::TestRoot,
     }
 
     impl BinFixture {
         pub(crate) fn new(tag: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!("fc-bin4499-{}-{tag}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).expect("mkdir");
+            let guard = crate::test_root::test_root("fc-bin4499", tag);
+            let dir: PathBuf = guard.to_path_buf();
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod");
             let exe = dir.join("plugin");
             let sup = holder_executable_beside(&exe).expect("beside");
-            Self { dir, exe, sup }
+            Self {
+                dir,
+                exe,
+                sup,
+                _guard: guard,
+            }
         }
 
         /// 隣の固定名へ ELF（`true`）の複製を `mode` で置く（`/proc/self/fd/N` の exec は `#!` を実行できないため ELF）。
@@ -810,12 +816,6 @@ pub(crate) mod bin_fixture {
         /// 祖先（一時ディレクトリの上位）が検査を通る環境か。通らない環境では成功系を要求しない。
         pub(crate) fn ancestors_ok(&self, euid: u32) -> bool {
             super::check_ancestors_trust(&self.sup, euid).is_ok()
-        }
-    }
-
-    impl Drop for BinFixture {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
 

@@ -809,9 +809,23 @@ jobs:
 
       - name: crash_safety の存在確認（IO-3・TASK-18.3.1。glob による無言除外の検出）
         if: steps.count.outputs.count != '0' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
         run: |
           set -euo pipefail
-          listed="$(cargo test --workspace --test '*' --features "${INTEGRATION_TEST_FEATURES}" -- --list)"
+          # glob 全体の `--list` は `harness = false` の結合試験が --list を無視して全件を実行し約 70 秒を使うため、
+          # 除外の検出は --no-run の JSON の成果物で行い、--list は crash_safety 1 本だけに絞る（#4475）
+          artifacts="${RUNNER_TEMP}/crash-safety-artifacts.json"
+          cargo test --workspace --test '*' --features "${INTEGRATION_TEST_FEATURES}" \
+            --no-run --message-format=json > "${artifacts}"
+          sel='select(.reason == "compiler-artifact" and .profile.test == true'
+          sel="${sel} and .target.name == \"crash_safety\") | .target.name"
+          found="$(jq -r "${sel}" "${artifacts}" | wc -l | tr -d ' ')"
+          rm -f "${artifacts}"
+          if [ "${found}" != "1" ]; then
+            echo "::error::crash_safety test target count is ${found} (expected 1); glob may have excluded it" >&2
+            exit 1
+          fi
+          listed="$(cargo test --workspace --test crash_safety --features "${INTEGRATION_TEST_FEATURES}" -- --list)"
           case "${RUNNER_OS}" in
             Linux|macOS)
               expected=(
@@ -1138,8 +1152,10 @@ jobs:
       # scripts/lib.sh の workspace 判定（has_members 等）の回帰テスト（PR #1756 の指摘）。一時ディレクトリだけを
       # 使う。Makefile の cargo 系ターゲットの skip 判定を担うため、macOS（/bin/bash 3.2 も回す）・Windows の
       # Git Bash でも確かめる。既存ジョブのステップ（check-run 件数は不変）
-      - name: scripts/lib.sh の判定の回帰テスト（ubuntu・macos・windows）
-        if: env.HANG_PROBE != 'true'
+      # ubuntu の実行は bench-regression ジョブ（run-parallel の並列グループ）へ移した: 待ちが大半で約 60 秒
+      # クリティカルパスだったため（#4475）。macOS の /bin/bash 3.2 での確認は従来どおり本ステップで行う
+      - name: scripts/lib.sh の判定の回帰テスト（macos・windows。ubuntu は bench-regression）
+        if: env.HANG_PROBE != 'true' && runner.os != 'Linux'
         timeout-minutes: 5
         run: make lib-selftest
 
@@ -1175,8 +1191,9 @@ jobs:
 
       # 試験の繰り返し実行スクリプトの自己テスト（REPAIR-12・#2538）。スタブの cargo だけを使う。
       # 既存ジョブのステップ（check-run 件数は不変）
-      - name: 試験の繰り返し実行スクリプトの自己テスト（#2538・REPAIR-12。ubuntu・macos・windows）
-        if: env.HANG_PROBE != 'true'
+      # ubuntu の実行は待ちが大半で約 87 秒クリティカルパスだったため bench-regression へ移した（#4475）
+      - name: 試験の繰り返し実行スクリプトの自己テスト（#2538・#4475・REPAIR-12。macos・windows。ubuntu は bench-regression）
+        if: env.HANG_PROBE != 'true' && runner.os != 'Linux'
         timeout-minutes: 5
         run: make repeat-test-selftest
 
@@ -3111,17 +3128,20 @@ jobs:
       # crictl-smoke（TASK-60・CRI-1。スタブの crictl のみ。実機は #442）
       # small-files-compare（TASK-24.1・IO-7。スタブのハーネスのみ。実測は #107、評価は #110）
       # mac-small-files（TASK-70 準備・#1880・MAC-3。スタブの docker のみ。実測は #381・#354）
-      # install-launcher（TASK-171 追補・#1721・SUP-14。スタブのみ）・cli-parity の期限・回収（#1688・REPAIR-5。platform-ci の ubuntu 分を移した）
+      # install-launcher（TASK-171 追補・#1721・SUP-14。スタブのみ）・cli-parity の期限・回収（#1688・REPAIR-5。platform-ci の ubuntu 分を移した）・
+      # repeat-test（#2538・REPAIR-12）・lib（PR #1756。いずれも #4475 で platform-ci の ubuntu 分を移した）
       - name: 計測スクリプト群の自己テスト（並列 3。REPAIR-12）
         run: >-
           scripts/run-parallel.sh 3
           concurrent-memory-selftest
           cli-parity-native-reclaim-selftest
+          repeat-test-selftest
           supervisor-independence-selftest
           startup-latency-selftest
           restart-latency-selftest
           crictl-smoke-selftest
           install-launcher-selftest
+          lib-selftest
           idle-memory-selftest
           idle-memory-supervised-selftest
           supervisor-pss-selftest

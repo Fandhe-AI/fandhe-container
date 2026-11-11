@@ -116,11 +116,12 @@ crates/net の対象外（理由は照合モジュール `libc_abi` のコメン
 | ファイル | 定数 | 構造体 | 関数 | 補足 |
 | -------- | ---- | ------ | ---- | ---- |
 | `sys.rs`（#1841・#3045） | 45（`AF_NETLINK` は `u16` に範囲検査） | 2（`sockaddr_nl`・`pollfd`） | 12 | 上記の対象外のとおり |
-| `sys/holder.rs`（#3249） | 20 | 3（`iovec`・`ucred`・`msghdr`。`msghdr` は gnu のみ） | 7 | `CapUserHeader`・`CapUserData` は `libc` に無く対象外。`sendmsg`・`recvmsg` の `msghdr` 引数は型を別々に書く |
+| `sys/holder.rs`（#3249・#4478） | 22 | 3（`iovec`・`ucred`・`msghdr`。`msghdr` は gnu のみ） | 7 | `CapUserHeader`・`CapUserData` は `libc` に無く対象外。`sendmsg`・`recvmsg` の `msghdr` 引数は型を別々に書く |
 | `sys/pasta.rs`（#3319） | 3 | 0 | 1（`kill`） | なし |
 | `sys/process.rs`（#3320） | 9 | 0 | 3（`syscall`・`waitid`・`setsid_raw` と `setsid`） | `waitid` の `infop` と idtype の型は別々に書く |
+| `sys/dial.rs`（#4478） | 1（`SIOCGSKNS`） | 0 | 1（`ioctl`。gnu のみ） | musl では定数を広げて比べ、関数型は照合しない |
 | `sys/unix_socket.rs`（#3517・#3071） | 4（`AF_UNIX` は `u16` に範囲検査） | 1（`sockaddr_un`） | 2（`socket`・`connect`） | `connect` の `sockaddr` 引数は型を別々に書く |
-| 合計 | 81 | 6 | 25 | |
+| 合計 | 84 | 6 | 26 | |
 
 crates/net の uapi 定数（`sys.rs` の外にある netlink・rtnetlink・nfnetlink・nf_tables の定数。#3102・NET-1・MVM-4・REPAIR-12）は、宣言の隣の `libc_abi`（`#[cfg(all(test, target_os = "linux"))]`。uapi の値はアーキに依らないため arch の cfg は付けない）で照合する。`cfg(test)` だけにすると macOS・Windows の `cross-target-check` で `libc::` が解決できず落ちるため、Linux 限定にする。対象は `netlink.rs`・`netlink_route/link.rs`・`netlink_route/addr_route.rs`・`nftables_batch.rs`・`nftables_batch/table_chain.rs`・`nftables_batch/ack.rs`・`nftables_rules/{rule,nat,masq,payload,cmp,data,meta}.rs`（`nftables_rules/bitwise.rs` の `NFTA_BITWISE_*`・`NFT_BITWISE_*` は libc 0.2.189 に対応物が無く照合なし。#3060）・`network/publish.rs`。マクロ `libc_const_eq!` は `lib.rs` の `pub mod` 列より前に置く（core の同名マクロの複製。`macro_rules` はテキスト順にしか見えないため）。
 

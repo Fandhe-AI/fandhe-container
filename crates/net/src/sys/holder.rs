@@ -724,15 +724,18 @@ pub(crate) fn set_non_dumpable() -> Result<(), SysError> {
     prctl_value(consts::PR_SET_DUMPABLE, 0).map(|_| ())
 }
 
-/// 継承した fd 3 以上をすべて閉じる（`close_range(3, u32::MAX, 0)`）。dumpable な holder に親から継承した
-/// fd が残ると、同じ uid が `/proc/<holder>/fd` 経由で触れてしまうため（SEC-1・NET-9）。失敗（`ENOSYS` を含む）は
+/// 継承した fd 3 以上をすべて閉じる（`close_range(3, u32::MAX, 0)`）。dumpable な間に親から継承した fd が
+/// 残ると、同じ uid が `/proc/<pid>/fd` 経由で触れてしまうため（SEC-1・NET-9・CRI-6）。呼び出し元は
+/// `netns_holder::holder::run`（先頭）と `netns_dial::helper::run`（要求の受信前）の 2 つ。失敗（`ENOSYS` を含む）は
 /// 呼び出し側が起動拒否にする。stdin / stdout / stderr（0〜2）は閉じない。
 pub(crate) fn close_inherited_fds() -> Result<(), SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
     }
     // SAFETY: `close_range(first, last, flags)` は整数引数のみを取りメモリを参照しない。fd 3 以上を閉じるだけで、
-    // この関数の呼び出し時点で holder は他の fd を所有していない（呼び出しは起動直後の run の先頭）。
+    // 呼び出し元は `netns_holder::holder::run` の先頭と、`netns_dial::helper::run` の stdin・peer の確認の後かつ
+    // 要求（SCM_RIGHTS の fd）の受信より前の 2 か所で、どちらも閉じる範囲（fd 3 以上）に自分が所有する fd を持たない
+    // （fd 0〜2 は範囲外）。新しい呼び出し元を足すときは、同じ不変条件が成り立つ時点で呼ぶこと。
     let rc = unsafe {
         syscall(
             consts::SYS_CLOSE_RANGE,

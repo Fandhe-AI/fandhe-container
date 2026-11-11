@@ -25,12 +25,16 @@ netns-holder-test-support = []
 # `override_recover_timeout_for_test`（期限切れの Timeout と意図記録の保持の照合のため。#3559）。
 # リリースビルドで有効なら lib.rs の compile_error! で止める。結合試験 dns_helper_process が使う。依存は増えない。
 dns-helper-test-support = []
+# 試験専用: netns-dial helper の stdin 側の seqpacket 対の作成と、任意のバイト列・fd の送受信の入口
+# （`netns_dial::test_support`。helper の実プロセス経路の結合試験用。CRI-6・NET-3・SEC-1・REPAIR-12・#4479）。
+# 親側の本番 channel は #4480。リリースビルドで有効なら lib.rs の compile_error! で止める。依存は増えない。
+netns-dial-test-support = []
 
 [dev-dependencies]
 # core・supervisor・cli と同じ方式の自己参照（外部クレートの追加ではない）。dev-dependency は通常のビルドでは
 # 解決されないため、製品の既定ビルドでは feature は無効のまま。`required-features` は使わない（既定の
 # `cargo test` から結合試験が外れないようにするため）。
-fandhe-container-net = { path = ".", features = ["attach-fault-test-support", "pasta-test-support", "netns-holder-test-support", "dns-helper-test-support"] }
+fandhe-container-net = { path = ".", features = ["attach-fault-test-support", "pasta-test-support", "netns-holder-test-support", "dns-helper-test-support", "netns-dial-test-support"] }
 
 # pasta のバイナリの検証（パスの表・偽の pasta を子として実行する --version の振る舞い。NET-9・PLUG-11・#1936）。
 # 自身を偽の pasta として再実行するため harness = false。root 不要で 3 OS の既定集合で実行する。
@@ -241,6 +245,22 @@ path = "tests/network_store_process.rs"
 # 方式は docs/design/ffi-libc-check.md。
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 libc.workspace = true
+
+# netns-dial helper の実プロセス経路（run の argv 検査・stdin の素性確認・peer 検証・継承 fd の整理・受信の期限・
+# 前検査・参加の失敗の固定語彙）の結合試験（CRI-6・NET-3・SEC-1・REPAIR-5・REPAIR-12・#4479）。自身を `netns-dial`
+# で再実行するため harness = false。root も user namespace も不要で 3 OS の既定集合に含める（非 Linux は not applicable）。
+[[test]]
+name = "netns_dial_process"
+path = "tests/netns_dial_process.rs"
+harness = false
+
+# netns-dial helper が実際の非特権 user + network namespace へ参加し、その中から connect することの実機前提テスト
+# （CRI-6・NET-3・SEC-1・REPAIR-5・REPAIR-12・#4479）。子の再入のため harness = false。非特権 user namespace が要るため
+# `-- --ignored` 指定時のみ実行する。CI では platform-ci（ubuntu）が AppArmor 緩和ステップの後に実行し、成功行を照合する。
+[[test]]
+name = "netns_dial_userns"
+path = "tests/netns_dial_userns.rs"
+harness = false
 
 # workspace の lint 設定を継承する（ルート Cargo.toml の [workspace.lints]。#1138）。
 [lints]

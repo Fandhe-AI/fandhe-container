@@ -3,11 +3,53 @@
 //!
 //! plugin-cri は dial ごとに単一スレッドの helper を立て、helper は保持役の user / net namespace へ `setns` して
 //! `127.0.0.1:<port>` へ connect し、接続済みの fd を `SCM_RIGHTS` で返す。本モジュールの現状は両者の間を行き来する
-//! 固定長 frame（[`frame`]。OS 非依存の純関数）と、受け取った fd の検証 `verify`
-//! （`verify_dialed_socket`。#4478。SEC-1 の多層防御。`NsId` が Linux 限定のため Linux のみ）。helper 本体（#4479）と親側の channel（#4480）は
+//! 固定長 frame（[`frame`]。OS 非依存の純関数）、受け取った fd の検証 `verify`
+//! （`verify_dialed_socket`。#4478。SEC-1 の多層防御。`NsId` が Linux 限定のため Linux のみ）、helper 本体
+//! `run_netns_dial_main`（#4479。Linux のみ。それ以外は終了コード 1）。親側の channel（#4480）は
 //! 未実装（REPAIR-3。未実装のものを実装済みとして扱わない）。
+//!
+//! # helper の手順（順序は変えない。失敗の固定語彙への対応表は `helper` モジュールの `//!`）
+//! 1. argv が空であることを確かめる（非空は応答なしで終了コード 2）
+//! 2. `PR_SET_PDEATHSIG=SIGKILL`、stdin が `SOCK_SEQPACKET` で `SO_PEERCRED` の pid が親であることを確かめる
+//!    （違えば応答せず終了コード 1）、`close_range(3..)`
+//! 3. 要求 frame と `SCM_RIGHTS` の fd ちょうど 2 本（user、net の順）を期限（`REQUEST_RECV_TIMEOUT`）つきで受ける
+//! 4. 各 fd の (dev, ino) を記録し、`setns(user)` → `setns(net)` の順に参加して `/proc/self/ns` の識別を照合する
+//!    （カーネル v6.12 の `userns_install` は多スレッド・fs 共有で `EINVAL`、`CAP_SYS_ADMIN` 不足で `EPERM`。
+//!    `netns_install` は対象 netns の所有 userns と現 cred の userns の両方に `CAP_SYS_ADMIN` を要求する）
+//! 5. capability を空にし、NNP・PDEATHSIG の再武装・non-dumpable にする
+//! 6. `127.0.0.1:<port>` へ要求の期限つきで connect し、接続済み fd 1 本を添えた `Connected` か `Error{code}` を返す
+//!
+//! 終了コードは `Connected` を送れたら 0、それ以外の失敗は 1、argv の誤りは 2。
+
+use std::ffi::OsString;
+use std::process::ExitCode;
+use std::time::Duration;
+
+/// supervisor の main が第 1 引数で helper へ振り分けるための名前（振り分けは #4482）。
+pub const NETNS_DIAL_SUBCOMMAND: &str = "netns-dial";
+
+/// 要求 frame と fd の受信期限（`netns_holder::FDS_RECV_TIMEOUT` と同値。REPAIR-5）。
+pub const REQUEST_RECV_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// `netns-dial` helper プロセスの本体。引数は空でなければならない。Linux 以外では何もせず終了コード 1。
+pub fn run_netns_dial_main(args: impl Iterator<Item = OsString>) -> ExitCode {
+    #[cfg(target_os = "linux")]
+    {
+        helper::run(args)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = args;
+        ExitCode::from(1)
+    }
+}
 
 pub mod frame;
+#[cfg(target_os = "linux")]
+mod helper;
+#[cfg(all(target_os = "linux", feature = "netns-dial-test-support"))]
+#[doc(hidden)]
+pub mod test_support;
 #[cfg(target_os = "linux")]
 pub mod verify;
 

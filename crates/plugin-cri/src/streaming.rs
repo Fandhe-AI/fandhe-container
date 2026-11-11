@@ -10,7 +10,7 @@
 //! 読み取り専用の [`log_attach::LogFollowAttachBackend`]〔回転ログの follow。#3763〕で、stdin・tty は RPC 時に `INVALID_ARGUMENT`）と、PortForward の NODE ネットワーク（hostNetwork）の pod
 //! （#3755。[`NodeLoopbackDialer`]）。POD ネットワークの pod は、Linux・非 root で保持役を注入した構成だけ結線済み
 //! （`ProductionPortForward::pod_network` の `PodNetnsDialer`。保持役の fd と `netns-dial` helper で pod の netns 内へ接続。#4484・#4486。
-//! 実 helper を通す実機の段は #4487）。保持役が無い構成（rootful・注入なし・別 provider）は [`ProductionPortForward::node_only`] で、
+//! 実 helper を通す実機の段は `tests/cri_exec_real.rs` の段 F で照合済み。#4487）。保持役が無い構成（rootful・注入なし・別 provider）は [`ProductionPortForward::node_only`] で、
 //! RPC 時（cri）に `UNIMPLEMENTED` のまま（host loopback へは縮退しない）。
 //! Exec は Linux で結線済み（`exec_launcher::SupervisorExecLauncher`。
 //! supervisor の `stream-exec` helper 経由。stdin・stdout・stderr と、tty（stdin・stdout・resize。stderr は RPC 時に `INVALID_ARGUMENT`。#4417）を扱い、相対 `argv[0]` は RPC 時に `INVALID_ARGUMENT`。#3761）で、

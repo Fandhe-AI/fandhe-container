@@ -7,8 +7,8 @@
 //! echo へつなぐ往復を、バイト列の完全一致と期限内の終了で照合する。プロセス内で `with_streaming` を足す試験では
 //! `main.rs` の注入が消えても検出できないため、本番バイナリを使う。
 //!
-//! Exec は結線済みと検証の順序を照合する（#3761。URL の発行と実コンテナへの exec は `cri_exec_real.rs` の実機前提試験が照合する。#3762）。Attach の URL の照合は #3763 が足す。POD ネットワークは #3766 まで `UNIMPLEMENTED`
-//! （単体試験で照合済み）。root・特権・外部プロセスは不要で、既定のテスト集合で走る。待ちはすべて期限つき。
+//! Exec は結線済みと検証の順序を照合する（#3761。URL の発行と実コンテナへの exec は `cri_exec_real.rs` の実機前提試験が照合する。#3762）。Attach の URL の照合は #3763 が足す。POD ネットワークは、この試験の本番バイナリが保持役を注入しない構成（`FANDHE_CONTAINER_TEST_POD_HOLDER=off`）のため `UNIMPLEMENTED` のまま
+//! （単体試験で照合済み）。保持役を注入した構成の POD の往復は `cri_exec_real.rs` の段 F が照合する（#4487）。root・特権・外部プロセスは不要で、既定のテスト集合で走る。待ちはすべて期限つき。
 //!
 //! Linux 限定の理由: `CriPluginBackends::production()` の既定の状態ルートは Linux でだけ定義される
 //! （`pod_sandbox_grpc.rs` と同じ扱い）。

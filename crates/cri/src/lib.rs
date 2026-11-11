@@ -7,7 +7,7 @@
 //! CRI の設定から OCI bundle（`config.json` と bundle の寿命）を作る層は `bundle`（#2395。image 展開は #2433 の `ImageRootfsSource`）。
 //! 統一エラー型 `error`（ERR-3・TASK-97.1）をハンドラへ適用済み（TASK-97.2・#450）。
 //! shim v2 の ttrpc サーバーの骨格と空の Task サービスと Create / Start は `shim_v2`（TASK-62.1・TASK-62.2・CRI-5・MS-7。ワイヤー形式は自作）。
-//! `Exec`・`Attach`・`PortForward` は `streaming`（TASK-63.1・#679・CRI-6）のストリーミングサーバー基盤と URL 発行まで実装済みで、`CriRuntimeService::with_streaming` で注入したときだけ、結線済みの種別の URL を返す（未結線の種別は `UNIMPLEMENTED`。REPAIR-3・#3753）。Exec（#680）・Attach（#681）・PortForward（#682）のプロトコル本体（SPDY/3.1）は共通の codec で実装済み。Exec の stdio を持つ起動役・Attach の backend・PortForward の転送先接続は NODE ネットワークの pod だけ plugin-cri が本番実装を注入する（#3755。POD は #3766 まで `UNIMPLEMENTED`）。
+//! `Exec`・`Attach`・`PortForward` は `streaming`（TASK-63.1・#679・CRI-6）のストリーミングサーバー基盤と URL 発行まで実装済みで、`CriRuntimeService::with_streaming` で注入したときだけ、結線済みの種別の URL を返す（未結線の種別は `UNIMPLEMENTED`。REPAIR-3・#3753）。Exec（#680）・Attach（#681）・PortForward（#682）のプロトコル本体（SPDY/3.1）は共通の codec で実装済み。Exec の stdio を持つ起動役・Attach の backend・PortForward の転送先接続は NODE ネットワークの pod と、`supports_pod_network` が真の dialer を注入した構成の POD だけ結線する（本番は plugin-cri の #3755 の `NodeLoopbackDialer` と、Linux・非 root で保持役を注入した構成の `PodNetnsDialer`〔#3766 の子 issue・#4486〕。POD 対応の dialer が無い構成の POD は `UNIMPLEMENTED`）。
 //! 他の RPC は `Unimplemented`、状態管理はメモリ上のスタブ（TASK-59 で置換。REPAIR-3）。
 //! RPC の結果と所要時間は `instrument` の記録先へ渡す（REPAIR-4。core の記録器への接続は plugin-cri。TASK-108）。
 //! 本体は G4（TASK-56〜63）で実装する。実行時は `fandhe-container-plugin-cri`（TASK-114）が

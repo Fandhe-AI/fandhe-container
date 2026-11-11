@@ -67,7 +67,7 @@ fn pod_config() -> PodSandboxConfig {
             namespace: "ns".into(),
             attempt: 0,
         }),
-        // PortForward は NODE の pod だけ結線済み（POD は #3766 まで UNIMPLEMENTED。#3755）。
+        // この試験の dialer は NODE だけで、POD は `supports_pod_network` の dialer を注入したときだけ結線される（未注入のため UNIMPLEMENTED。#3755・#4486）。
         linux: Some(v1::LinuxPodSandboxConfig {
             security_context: Some(v1::LinuxSandboxSecurityContext {
                 namespace_options: Some(v1::NamespaceOption {

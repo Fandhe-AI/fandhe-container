@@ -12,21 +12,26 @@
 //! - ロックは空ファイル 1 つの `File::try_lock`（OS の排他ロック）を期限つき（[`INSTANCE_LOCK_TIMEOUT`]）で再試行して取る。
 //!   常駐のスレッド・プロセスは増やさない（CORE-1）。pid などは書かない。
 //! - **ロックファイルは消さない**（終了時もエラー時も）。unlink すると、並行して open した側が消えた inode をロックして
-//!   二重に取れてしまう。OS のロックは fd の close で外れるので、残ったファイルは無害で手動回収は要らない。
+//!   二重に取れてしまう。OS のロックは unlock か fd の close で外れるので、残ったファイルは無害で手動回収は要らない。
 //!   「後始末」として削除を足さないこと。
 //! - `.cri` は 0700・同じ所有者・symlink でないことを確かめ、違反は消さずに拒否する（fail-closed）。
 //!   ロックファイルは 0600 で、open の前後に通常ファイル・所有者・権限を照合する。
 //! - エラー文言は固定で、パス・OS のエラー文字列を含めない（REPAIR-4）。
 //!
-//! fd の継承: std の `O_CLOEXEC` により exec した子（supervisor・保持役）へは渡らない。監査 relay の fork はロック取得より
-//! 前に行う。残余として、exec しない fork を伴う処理（rootless のレイヤー展開の子など）は子が生きている間だけ fd を共有し得る
-//! （期限つきなので再取得が遅れるだけ）。
+//! fd の継承と解放: std の `O_CLOEXEC` により exec した子（supervisor・保持役）へは渡らない。監査 relay の fork はロック取得より
+//! 前に行う。解放は drop での明示 unlock（`File::unlock`）なので、最後の `Arc<InstanceLock>` が drop される経路（正常停止・
+//! 試験・起動失敗の巻き戻し）では、exec しない fork の子や `Command::spawn` の fork〜exec の窓が複製 fd を持っていても
+//! 即座に外れ、次のインスタンスの取得は遅れない（#4516）。残余は Drop を経ない終了（SIGKILL・abort など）で、OS が
+//! プロセス終了で fd を閉じるため、複製 fd を持つ子が生きている間だけ再取得が遅れる（期限つきなので `Timeout` で終わり
+//! 無期限にはならない）。plugin-cri 自身には fork の原始が無い。
 
 use std::fs::{self, File, OpenOptions};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use fandhe_container_core::traits::{ErrorCode, TraitError};
+
+use crate::flock_release::ExplicitUnlockFile;
 
 /// ロックファイル名（`.cri` 直下。`@` 始まりは core の `@lock` 等と同じ流儀）。
 pub const INSTANCE_LOCK_NAME: &str = "@instance.lock";
@@ -39,10 +44,18 @@ const MSG_LOCK: &str = "failed to lock the instance lock";
 const RETRY: Duration = Duration::from_millis(5);
 const CRI_DIR: &str = ".cri";
 
-/// インスタンスロックの保持の証明。値を持っている間ロックが続き、drop（fd の close）で外れる。
+/// インスタンスロックの保持の証明。値を持っている間ロックが続き、drop で明示 unlock してから閉じる（#4516）。
 /// 取得関数以外から作れない。
 pub struct InstanceLock {
-    _file: File,
+    _file: ExplicitUnlockFile,
+}
+
+#[cfg(all(test, unix))]
+impl InstanceLock {
+    /// 試験用: 同じ OFD を指す複製 fd を作る（exec しない fork の子が持つ fd の代役。#4516）。
+    fn clone_file_for_test(&self) -> File {
+        self._file.clone_file_for_test()
+    }
 }
 
 impl std::fmt::Debug for InstanceLock {
@@ -88,7 +101,11 @@ pub fn acquire_instance_lock_in(
     let deadline = Instant::now() + timeout;
     loop {
         match file.try_lock() {
-            Ok(()) => return Ok(InstanceLock { _file: file }),
+            Ok(()) => {
+                return Ok(InstanceLock {
+                    _file: ExplicitUnlockFile::new(file),
+                });
+            }
             Err(std::fs::TryLockError::WouldBlock) => {
                 if Instant::now() >= deadline {
                     return Err(TraitError::new(ErrorCode::Timeout, MSG_INSTANCE_LOCK_BUSY));
@@ -270,6 +287,36 @@ mod tests {
     fn cri2_instance_lock_zero_timeout_tries_once() {
         let t = Tmp::new();
         let _l = acquire_instance_lock_in(&t.0, Duration::ZERO).expect("acquire");
+    }
+
+    /// CRI-2・REPAIR-5（#4516）: 複製 fd が残っていても drop で外れ、次の取得が通る。陽性対照は包まない `File`
+    /// （close だけでは複製がある間、取得は `Timeout`）。
+    #[cfg(unix)]
+    #[test]
+    fn cri2_repair5_4516_instance_lock_drop_releases_despite_duplicate_fd() {
+        let t = Tmp::new();
+        drop(acquire_instance_lock_in(&t.0, SHORT).expect("prepare"));
+        let path = t.0.join(".cri").join(INSTANCE_LOCK_NAME);
+
+        let plain = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open");
+        plain.try_lock().expect("plain lock");
+        let dup = plain.try_clone().expect("dup");
+        drop(plain);
+        let e = acquire_instance_lock_in(&t.0, Duration::ZERO).expect_err("busy");
+        assert_eq!(e.code(), ErrorCode::Timeout);
+        assert_eq!(e.message(), MSG_INSTANCE_LOCK_BUSY);
+        drop(dup);
+
+        let l = acquire_instance_lock_in(&t.0, Duration::ZERO).expect("acquire");
+        let dup = l.clone_file_for_test();
+        drop(l);
+        let again = acquire_instance_lock_in(&t.0, Duration::ZERO).expect("reacquire despite dup");
+        drop(again);
+        drop(dup);
     }
 
     #[cfg(unix)]

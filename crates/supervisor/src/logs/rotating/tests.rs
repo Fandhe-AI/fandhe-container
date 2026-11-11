@@ -1668,3 +1668,58 @@ fn sup7_3143_guard_declined_is_distinguished_from_nothing_to_remove() {
     assert_eq!(none.log_files(), 0);
     assert!(!none.guard_declined());
 }
+
+/// ロックファイルを開く（作成のみ。試験の陽性対照・別 OFD の取得確認用）。
+#[cfg(unix)]
+fn open_lock_for_test(path: &Path) -> File {
+    OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .unwrap()
+}
+
+/// SUP-7・OCI-5・REPAIR-5（#4517）: 複製 fd が残っていても sink の drop でログロックが外れ、
+/// `sink_is_active` は `false`、再 open は `Ok`。陽性対照の包まない `File` は close だけでは外れない。
+#[cfg(unix)]
+#[test]
+fn oci5_repair5_4517_sink_drop_releases_log_lock_despite_duplicate_fd() {
+    let t = TmpDir::new("4517-sink");
+    let plain_path = t.0.join("plain.log.lock");
+    let plain = open_lock_for_test(&plain_path);
+    plain.try_lock().unwrap();
+    let plain_dup = plain.try_clone().unwrap();
+    drop(plain);
+    assert!(matches!(
+        open_lock_for_test(&plain_path).try_lock(),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
+    drop(plain_dup);
+
+    let sink = RotatingFileSink::open(&t.0, &id(), small()).unwrap();
+    let dup = sink.lock_file_clone_for_test();
+    drop(sink);
+    assert!(matches!(sink_is_active(&t.0, &id()), Ok(false)));
+    let again = RotatingFileSink::open(&t.0, &id(), small());
+    assert!(again.is_ok());
+    drop(again);
+    drop(dup);
+}
+
+/// SUP-7・REPAIR-5（#4517）: `remove_lock_file` も複製 fd が残っていれば明示 unlock で外す
+/// （パスは消え、同じ inode を別名で開き直しても取れる）。
+#[cfg(unix)]
+#[test]
+fn oci5_repair5_4517_remove_lock_file_unlocks_despite_duplicate_fd() {
+    let t = TmpDir::new("4517-remove");
+    let lock = acquire_lock(&t.0, "c1.log").unwrap();
+    let dup = lock.clone_file_for_test();
+    let path = lock_path(&t.0, "c1.log");
+    let keep = t.0.join("keep-lock-inode");
+    fs::hard_link(&path, &keep).unwrap();
+    remove_lock_file(lock, &path, &t.0).unwrap();
+    assert!(!path.exists());
+    open_lock_for_test(&keep).try_lock().unwrap();
+    drop(dup);
+}

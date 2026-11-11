@@ -686,6 +686,7 @@ mod unix_impl {
         socket_file_name,
     };
     use crate::error::{CriError, CriErrorCode};
+    use crate::flock_release::ExplicitUnlockFile;
     use crate::instrument::{CriOpKind, CriOpRecorder, CriOpSample};
     use crate::shim_v2::server::{ServerConfig, TtrpcServer};
     use crate::shim_v2::service::ServiceRegistry;
@@ -958,9 +959,14 @@ mod unix_impl {
         Ok(())
     }
 
-    /// 同一 id の排他ロック。Drop で解放する。
+    /// 同一 id の排他ロック。Drop で明示 unlock してから閉じる（#4515）。
+    ///
+    /// fork 子へ値をムーブしない（`LOCK_UN` は OFD 単位で、子の Drop が親のロックまで外すため）。保持中の
+    /// `spawn_daemon` の `Command::spawn` と Shutdown の gate 中の publisher の spawn は、いずれも子が exec する
+    /// ので Drop は走らず、fork から exec の窓の複製は明示 unlock で無害になる。監査 relay の fork の時点では
+    /// daemon log の guard は `open_daemon_log` の中で解放済みで、本ロックは未取得。
     struct IdLock {
-        _file: File,
+        _file: ExplicitUnlockFile,
         path: PathBuf,
     }
 
@@ -1001,7 +1007,10 @@ mod unix_impl {
                     let same = fs::symlink_metadata(&path)
                         .is_ok_and(|m| (m.dev(), m.ino()) == (meta.dev(), meta.ino()));
                     if same {
-                        return Ok(IdLock { _file: file, path });
+                        return Ok(IdLock {
+                            _file: ExplicitUnlockFile::new(file),
+                            path,
+                        });
                     }
                 }
                 Err(TryLockError::WouldBlock) => {}
@@ -1068,7 +1077,7 @@ mod unix_impl {
         }
 
         /// `ops.log.lock` への `flock`（期限つきの `try_lock` 再試行。REPAIR-5）。取れなければ記録を諦める。
-        fn lock(&self) -> std::io::Result<File> {
+        fn lock(&self) -> std::io::Result<ExplicitUnlockFile> {
             let mut name = self.path.clone().into_os_string();
             name.push(".lock");
             let file = OpenOptions::new()
@@ -1088,7 +1097,7 @@ mod unix_impl {
             }
             loop {
                 match file.try_lock() {
-                    Ok(()) => return Ok(file),
+                    Ok(()) => return Ok(ExplicitUnlockFile::new(file)),
                     Err(TryLockError::WouldBlock) => {}
                     Err(TryLockError::Error(e)) => return Err(e),
                 }
@@ -1431,7 +1440,7 @@ mod unix_impl {
     /// `daemon.log.lock` の期限つき排他ロックを取る(`daemon.log` の回転とオープンの直列化。P3-3・PLUG-12・#3663)。
     /// ロックファイル自体も symlink でない(`O_NOFOLLOW|O_NONBLOCK`)・通常ファイル・自分の所有・単一リンク・
     /// グループ/その他の権限なしを確かめる。期限は `OPS_LOG_LOCK_TIMEOUT`(REPAIR-5)で、超えたら `Timeout`。
-    fn lock_daemon_log(dir: &Path, euid: u32) -> Result<File, CriError> {
+    fn lock_daemon_log(dir: &Path, euid: u32) -> Result<ExplicitUnlockFile, CriError> {
         let flags = crate::sys::OPEN_NOFOLLOW_NONBLOCK
             .ok_or_else(|| failed("daemon log is not supported on this platform"))?;
         let file = OpenOptions::new()
@@ -1452,7 +1461,7 @@ mod unix_impl {
         let deadline = Instant::now() + OPS_LOG_LOCK_TIMEOUT;
         loop {
             match file.try_lock() {
-                Ok(()) => return Ok(file),
+                Ok(()) => return Ok(ExplicitUnlockFile::new(file)),
                 Err(TryLockError::WouldBlock) => {}
                 Err(TryLockError::Error(_)) => return Err(internal("cannot lock daemon log")),
             }
@@ -1720,6 +1729,64 @@ mod unix_impl {
         // 有界時間で排出してから抜ける（runc shim と同じ順序。socket の消失で抜けた場合も同じ。結果の 1 行は publisher が出す。#4222）。
         let _ = drains.drain_all();
         result
+    }
+
+    /// 明示 unlock の試験（#4515・OCI-5・REPAIR-5）。ロックの guard を drop した後、複製 fd（fork 子の代役）が
+    /// 残っていても別の OFD の `try_lock` が取れることを、各取得関数を通して照合する。
+    #[cfg(test)]
+    mod flock_release_tests {
+        use super::*;
+
+        fn assert_free_after_guard_drop(lock_path: &Path, guard: ExplicitUnlockFile) {
+            let dup = guard.clone_file_for_test();
+            drop(guard);
+            let other = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(lock_path)
+                .unwrap();
+            assert!(
+                other.try_lock().is_ok(),
+                "lock must be released despite dup fd"
+            );
+            drop(dup);
+        }
+
+        fn test_dir(tag: &str) -> crate::test_root::TestRoot {
+            crate::test_root::test_root("fandhe-cri-4515", tag)
+        }
+
+        #[test]
+        fn oci5_repair5_4515_id_lock_drop_releases_flock_despite_duplicate_fd() {
+            let dir = test_dir("id");
+            let inv = super::super::parse_args(
+                ["-namespace", "n", "-id", "i", "-address", "/s", "start"]
+                    .iter()
+                    .map(std::ffi::OsString::from),
+            )
+            .unwrap();
+            let lock = acquire_lock(&dir, &inv).unwrap();
+            let path = lock.path.clone();
+            let IdLock { _file, .. } = lock;
+            assert_free_after_guard_drop(&path, _file);
+        }
+
+        #[test]
+        fn oci5_repair5_4515_ops_log_lock_drop_releases_flock_despite_duplicate_fd() {
+            let dir = test_dir("ops");
+            let rec = OpLogRecorder::new(&dir);
+            let guard = rec.lock().unwrap();
+            let mut name = rec.path.clone().into_os_string();
+            name.push(".lock");
+            assert_free_after_guard_drop(Path::new(&name), guard);
+        }
+
+        #[test]
+        fn oci5_repair5_4515_daemon_log_lock_drop_releases_flock_despite_duplicate_fd() {
+            let dir = test_dir("daemon");
+            let guard = lock_daemon_log(&dir, crate::sys::effective_uid()).unwrap();
+            assert_free_after_guard_drop(&dir.join(DAEMON_LOG_LOCK_NAME), guard);
+        }
     }
 }
 

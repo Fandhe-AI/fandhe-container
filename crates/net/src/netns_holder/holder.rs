@@ -2,21 +2,22 @@
 //! `crate::netns_holder` の `//!` を参照。supervisor の bin の main が `run_netns_holder_main` 経由で呼ぶ。
 //!
 //! 単一スレッドで同期的に動く（`setns(CLONE_NEWUSER)` が多スレッドで `EINVAL` になるため。待ちは `poll(2)` だけ）。
-//! unsafe は持たず、syscall は `crate::sys::holder` の安全なラッパーだけを使う。
+//! unsafe は持たず、syscall は `crate::sys::holder` の安全なラッパーだけを使う。親の照合・期限つき受信・ns の識別の
+//! 取得は `crate::netns_helper` と共有し（netns-dial helper と同じ本体。#4510）、ここは失敗の `Fail` への写像を持つ。
 
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::Write as _;
 use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
-use std::os::unix::fs::MetadataExt as _;
 use std::process::ExitCode;
 use std::time::Duration;
 
 use super::frame::{FRAME_LEN, HolderFrame, HolderMessage, NsIdentity};
 use super::{FDS_RECV_TIMEOUT, NETNS_HOLDER_SUBCOMMAND};
 use crate::error::NetErrorCode;
+use crate::netns_helper as helper;
 use crate::sys::holder as sysh;
-use crate::sys::{self, Deadline, Readiness, SysError};
+use crate::sys::{self, Deadline, SysError};
 
 /// 失敗の分類と固定の英文（パス・入力値を含めない。12.9・ERR-1）。
 struct Fail {
@@ -69,67 +70,52 @@ fn fail_line(code: NetErrorCode, message: &str) {
 const FAIL_LINE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// 親が存在し、stdin の socketpair の作成者（`SO_PEERCRED` の pid）と一致することを確かめる。
-/// 親が先に死ぬと `getppid` は 1 かサブリーパーに変わり不一致になる（PDEATHSIG の設定前に死んだ場合の備え）。
+/// 本体は `crate::netns_helper`（#4510）。ここは `Fail` への写像だけを持つ。
 fn check_parent(fd: BorrowedFd<'_>) -> Result<(), Fail> {
-    let peer = sysh::peer_pid(fd).map_err(|e| sys_fail(e, "cannot read the peer credentials"))?;
-    let parent = std::os::unix::process::parent_id();
-    if parent == 1 || parent != peer {
-        return Err(Fail::new(
+    helper::check_parent_is_creator(fd).map_err(|e| match e {
+        helper::ParentCheckError::PeerCred(e) => sys_fail(e, "cannot read the peer credentials"),
+        helper::ParentCheckError::NotCreator => Fail::new(
             NetErrorCode::FailedPrecondition,
             "the parent process is not the creator of the socket",
-        ));
-    }
-    Ok(())
+        ),
+    })
 }
 
 /// 期限つきで 1 通受ける。`Exceptional`（HUP 等）でも recv を試み、EOF は長さ 0 として返る。
+/// ループは `crate::netns_helper::recv_before_deadline`（#4510）で、ここは `Fail` への写像だけを持つ。
 fn recv_one(
     fd: BorrowedFd<'_>,
     deadline: &Deadline,
     max_fds: usize,
 ) -> Result<(sysh::Received, [u8; FRAME_LEN]), Fail> {
     let mut buf = [0u8; FRAME_LEN];
-    loop {
-        match sys::wait_readable(fd, deadline) {
-            Err(e) => return Err(sys_fail(e, "cannot wait for the supervisor")),
-            Ok(Readiness::TimedOut) => {
-                return Err(Fail::new(
-                    NetErrorCode::Timeout,
-                    "timed out waiting for the supervisor",
-                ));
-            }
-            Ok(Readiness::Readable | Readiness::Exceptional) => {}
-        }
-        match sysh::recv_with_fds(fd, &mut buf, max_fds) {
-            Ok(r) => return Ok((r, buf)),
-            // poll の後に消えた・シグナル中断。残り時間で待ち直す（HUP だけの場合に空回りしないよう短く休む）。
-            Err(SysError::Os(n)) if n == sys::EAGAIN || n == sys::EINTR => {
-                if deadline.remaining().is_zero() {
-                    return Err(Fail::new(
-                        NetErrorCode::Timeout,
-                        "timed out waiting for the supervisor",
-                    ));
-                }
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            Err(e) => return Err(sys_fail(e, "cannot receive from the supervisor")),
-        }
+    match helper::recv_before_deadline(fd, deadline, &mut buf, max_fds) {
+        Ok(r) => Ok((r, buf)),
+        Err(helper::RecvError::Wait(e)) => Err(sys_fail(e, "cannot wait for the supervisor")),
+        Err(helper::RecvError::TimedOut) => Err(Fail::new(
+            NetErrorCode::Timeout,
+            "timed out waiting for the supervisor",
+        )),
+        Err(helper::RecvError::Recv(e)) => Err(sys_fail(e, "cannot receive from the supervisor")),
     }
 }
 
 /// fd の識別（`fstat` の dev・ino）。
 fn identity_of(file: &File) -> Result<(u64, u64), Fail> {
-    let m = file
-        .metadata()
-        .map_err(|_| Fail::new(NetErrorCode::Internal, "cannot stat a namespace descriptor"))?;
-    Ok((m.dev(), m.ino()))
+    helper::fd_identity(file)
+        .map_err(|_| Fail::new(NetErrorCode::Internal, "cannot stat a namespace descriptor"))
 }
 
 /// 参加後の自分の ns の識別（`/proc/self/ns/<name>` の dev・ino）。
-fn self_ns_identity(name: &str) -> Result<(u64, u64), Fail> {
-    let f = File::open(format!("/proc/self/ns/{name}"))
-        .map_err(|_| Fail::new(NetErrorCode::Internal, "cannot open the joined namespace"))?;
-    identity_of(&f)
+fn self_ns_identity(ns: helper::JoinedNs) -> Result<(u64, u64), Fail> {
+    helper::self_ns_identity(ns).map_err(|e| match e {
+        helper::SelfNsError::Open => {
+            Fail::new(NetErrorCode::Internal, "cannot open the joined namespace")
+        }
+        helper::SelfNsError::Stat => {
+            Fail::new(NetErrorCode::Internal, "cannot stat a namespace descriptor")
+        }
+    })
 }
 
 /// 手順 1〜4: 親の確認・fd の受信・参加・検証・特権の破棄。成功なら READY に載せる識別を返す。
@@ -194,8 +180,8 @@ fn join_and_verify(user_fd: OwnedFd, net_fd: OwnedFd) -> Result<NsIdentity, Fail
         .map_err(|e| sys_fail(e, "cannot join the user namespace"))?;
     sysh::join_namespace(net.as_fd(), sysh::CLONE_NEWNET)
         .map_err(|e| sys_fail(e, "cannot join the network namespace"))?;
-    if self_ns_identity("net")? != (net_dev, net_ino)
-        || self_ns_identity("user")? != (user_dev, user_ino)
+    if self_ns_identity(helper::JoinedNs::Net)? != (net_dev, net_ino)
+        || self_ns_identity(helper::JoinedNs::User)? != (user_dev, user_ino)
     {
         return Err(Fail::new(
             NetErrorCode::FailedPrecondition,

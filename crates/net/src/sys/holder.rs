@@ -4,7 +4,8 @@
 //! # 呼び出し文脈
 //! - supervisor 側の `NetnsHolderChannel`（`socketpair`・`SCM_RIGHTS` つき `sendmsg`・`recvmsg`）
 //! - holder プロセス側の `run_netns_holder_main`（stdin のソケット種別・`SO_PEERCRED`・`recvmsg`・`setns(2)`・
-//!   `prctl(2)`・`capset(2)`）
+//!   `prctl(2)`・`capset(2)`）。`SO_PEERCRED`・`recvmsg` は共通部品 `crate::netns_helper` 経由で
+//!   netns-dial helper（`run_netns_dial_main`）からも呼ばれる（#4510）
 //!
 //! # 契約
 //! - 親 `sys` と同じ（`unsafe fn` を公開しない・`SAFETY:` の明記・arch ごとの定数・戻り値 -1 は直後に errno を確保）
@@ -174,8 +175,19 @@ const _: () = assert!(core::mem::size_of::<CapUserData>() == 12);
 const CMSG_HDR_LEN: usize = 16;
 
 /// `CMSG_ALIGN`（`size_t` の境界へ切り上げ）。
+///
+/// `len + 7` は検査しない。定数（小さい固定長）か、`len <= ctrl.len() <= CONTROL_CAP` を確認済みの値だけを渡す
+/// （桁あふれしない）。カーネル由来の `cmsg_len` の解析では [`checked_cmsg_align`] を使う（#4521・SEC-1）。
 const fn cmsg_align(len: usize) -> usize {
     (len + 7) & !7
+}
+
+/// `cmsg_align` の checked 版。外部入力（カーネルの `cmsg_len`）の次オフセット計算用（#4521・SEC-1・REPAIR-5）。
+const fn checked_cmsg_align(len: usize) -> Option<usize> {
+    match len.checked_add(7) {
+        Some(v) => Some(v & !7),
+        None => None,
+    }
 }
 
 /// `CMSG_SPACE(data_len)`。
@@ -194,6 +206,10 @@ const fn cmsg_len(data_len: usize) -> usize {
 
 /// 制御バッファの容量（`MAX_FDS` 本ちょうど。余裕を持たせると 3 本目以降が入ってしまう）。
 const CONTROL_CAP: usize = cmsg_space(MAX_FDS * 4);
+
+// 受信の `ctl_len`（`cmsg_len(max_fds * 4)`、`max_fds <= MAX_FDS`）が制御バッファに収まることを固定する。
+// `recv_with_fds` の `control.0.get(..ctl_used)` が `None` にならない根拠（#4521）。
+const _: () = assert!(cmsg_len(MAX_FDS * 4) <= CONTROL_CAP);
 
 /// `cmsghdr` の整列を満たす固定長の制御バッファ。
 #[repr(C, align(8))]
@@ -419,7 +435,8 @@ fn parse_scm_rights(ctrl: &[u8]) -> ScmRights {
         if bad.is_some() {
             break bad;
         }
-        match off.checked_add(cmsg_align(len)) {
+        // `len` は直前に `off + len <= ctrl.len()` を確かめ済みで桁あふれしないが、外部入力のため checked で進める（#4521）。
+        match checked_cmsg_align(len).and_then(|a| off.checked_add(a)) {
             Some(next) => off = next,
             None => break Some(ScmMalformed::LengthMismatch),
         }
@@ -444,14 +461,23 @@ fn split_valid_fds(raw: &[RawFd]) -> ValidFds {
 }
 
 /// 解析結果の fd を所有し、形式違反・不正値があれば閉じてから `Os(EINVAL)` を返す（#4498・SEC-1・REPAIR-5）。
-/// `OwnedFd::from_raw_fd` を呼ぶ唯一の箇所。`recvmsg` の制御データの解析結果以外を渡さない（試験は所有を放棄した番号だけ）。
-fn adopt_scm_rights(parsed: ScmRights) -> Result<Vec<OwnedFd>, SysError> {
+/// `SCM_RIGHTS` の受信経路で `OwnedFd::from_raw_fd` を呼ぶ唯一の箇所。`recv_with_fds` から呼ばれる。
+///
+/// # Safety
+/// - `parsed.fds` の 0 以上の番号は、呼び出し時点で開いている fd で、他に所有者がおらず、呼び出し側が所有をこの関数へ
+///   譲ったもの。呼び出し後にその番号を使わない・閉じない。
+/// - 0 以上の番号は互いに重複しない（重複すると 2 重 close になる）。
+/// - 成功時も、形式違反で閉じて `EINVAL` を返す失敗時も、契約は同じ。
+/// - 負値は契約の対象外（本関数が除いて数えるだけで `from_raw_fd` へ渡さない）。
+///
+/// private のまま置き、`unsafe fn` を `sys` の外へ公開しない（#4521・SEC-1・REPAIR-5）。
+unsafe fn adopt_scm_rights(parsed: ScmRights) -> Result<Vec<OwnedFd>, SysError> {
     let valid = split_valid_fds(&parsed.fds);
     let owned: Vec<OwnedFd> = valid
         .fds
         .into_iter()
-        // SAFETY: 0 以上であることを `split_valid_fds` で検査済み。本番では `SCM_RIGHTS` の fd は `recvmsg` がこの呼び出しで
-        // 受信側に新規に割り当てたもので他に所有者がいない。呼び出し側は所有を譲った番号だけを渡す（試験は `into_raw_fd` 後の番号）。
+        // SAFETY: 0 以上であることは `split_valid_fds` で検査済み。開いている・所有者が他にいない・重複しないことは
+        // 本関数の `# Safety` の契約で呼び出し側が保証する。
         .map(|raw| unsafe { OwnedFd::from_raw_fd(raw) })
         .collect();
     if parsed.malformed.is_some() || valid.invalid_count > 0 {
@@ -518,12 +544,18 @@ pub(crate) fn recv_with_fds(
     };
     let n = usize::try_from(n).map_err(|_| last_error())?;
     let ctl_used = msg.controllen.min(ctl_len);
+    debug_assert!(ctl_used <= CONTROL_CAP);
     let Some(ctrl) = control.0.get(..ctl_used) else {
-        // 切り出せないと fd 番号を読めない（「残余」）。`ctl_used <= ctl_len <= CONTROL_CAP` のため通常は起こらない。
+        // 切り出せないと fd 番号を読めない（「残余」）。`max_fds <= MAX_FDS` を検査済みで
+        // `ctl_used <= ctl_len <= cmsg_len(MAX_FDS * 4) <= CONTROL_CAP`（上の const assert）のため通常は起こらない。
         return Err(SysError::Os(super::EINVAL));
     };
     // 形式違反・負値でも、読めた fd は `adopt_scm_rights` が所有して閉じてから `EINVAL` を返す（#4498）。
-    let fds = adopt_scm_rights(parse_scm_rights(ctrl))?;
+    // SAFETY: `recvmsg` は成功済み。`MSG_CMSG_CLOEXEC` つきで受けた `SCM_RIGHTS` の fd は、カーネルがこの呼び出しで受信
+    // プロセスに新規に割り当てたもので、他に所有者がおらず互いに重複しない。`control` は 0 初期化済みで `ctrl` は
+    // カーネルが書いた範囲（`controllen` と `ctl_len` の小さい方）に切ってあるため、`parse_scm_rights` が読む番号は
+    // カーネルが書いた値だけ。以降 `ctrl` 由来の番号は他で使わず、所有は戻り値か失敗時の drop へ移る。
+    let fds = unsafe { adopt_scm_rights(parse_scm_rights(ctrl))? };
     Ok(Received {
         len: n.min(buf.len()),
         data_truncated: msg.flags & super::consts::MSG_TRUNC != 0,
@@ -881,9 +913,9 @@ mod tests {
         assert_eq!(peer_state(&a), eagain);
         let mut ctrl = cmsg_bytes(1, 1, &fd_bytes(&[raw]), None);
         ctrl.extend(cmsg_bytes(1, 1, &[0; 8], Some(1000)));
-        assert!(
-            matches!(adopt_scm_rights(parse_scm_rights(&ctrl)), Err(e) if Err::<usize, _>(e) == einval)
-        );
+        // SAFETY: `abandoned_end` が `into_raw_fd` で所有を放棄した、この試験の番号 `raw` だけを渡す（重複なし・以後未使用）。
+        let r = unsafe { adopt_scm_rights(parse_scm_rights(&ctrl)) };
+        assert!(matches!(r, Err(e) if Err::<usize, _>(e) == einval));
         assert_eq!(peer_state(&a), Ok(0));
 
         // データ長が 4 の倍数でない。
@@ -891,19 +923,24 @@ mod tests {
         let mut p = fd_bytes(&[raw]);
         p.extend_from_slice(&[0, 0]);
         let ctrl = cmsg_bytes(1, 1, &p, None);
-        assert!(adopt_scm_rights(parse_scm_rights(&ctrl)).is_err());
+        // SAFETY: 所有を放棄した `raw` だけを渡す（重複なし・以後未使用）。
+        let r = unsafe { adopt_scm_rights(parse_scm_rights(&ctrl)) };
+        assert!(r.is_err());
         assert_eq!(peer_state(&a), Ok(0));
 
         // 負値の混入（構造は正常）。panic せず、有効な方は閉じる。
         let (a, raw) = abandoned_end();
         let ctrl = cmsg_bytes(1, 1, &fd_bytes(&[-1, raw]), None);
-        assert!(adopt_scm_rights(parse_scm_rights(&ctrl)).is_err());
+        // SAFETY: 0 以上は所有を放棄した `raw` だけ（負値は関数が除く）。重複なし・以後未使用。
+        let r = unsafe { adopt_scm_rights(parse_scm_rights(&ctrl)) };
+        assert!(r.is_err());
         assert_eq!(peer_state(&a), Ok(0));
 
         // 正常: 所有が移り、drop するまで閉じない。
         let (a, raw) = abandoned_end();
         let ctrl = cmsg_bytes(1, 1, &fd_bytes(&[raw]), None);
-        let owned = adopt_scm_rights(parse_scm_rights(&ctrl)).expect("adopt");
+        // SAFETY: 所有を放棄した `raw` だけを渡す（重複なし・以後未使用）。
+        let owned = unsafe { adopt_scm_rights(parse_scm_rights(&ctrl)) }.expect("adopt");
         assert_eq!(owned.len(), 1);
         assert_eq!(peer_state(&a), eagain);
         drop(owned);
@@ -920,6 +957,54 @@ mod tests {
         assert_eq!(cmsg_len(0), 16);
         assert_eq!(cmsg_len(4), 20);
         assert_eq!(cmsg_len(8), 24);
+        // 受信の制御長は常にバッファに収まる（`get(..ctl_used)` が `None` にならない前提。#4521）。
+        for n in 0..=MAX_FDS {
+            assert!(cmsg_len(n * 4) <= CONTROL_CAP, "n={n}");
+        }
+    }
+
+    /// SEC-1・REPAIR-5・#4521: checked 版の整列は桁あふれで `None`、通常値は `cmsg_align` と同じ。
+    #[test]
+    fn sec1_repair5_4521_checked_cmsg_align_and_huge_len() {
+        assert_eq!(checked_cmsg_align(usize::MAX), None);
+        assert_eq!(checked_cmsg_align(usize::MAX - 7), Some(usize::MAX - 7));
+        assert_eq!(checked_cmsg_align(20), Some(24));
+        assert_eq!(checked_cmsg_align(20), Some(cmsg_align(20)));
+        // 巨大な `cmsg_len` は panic せず形式違反（`LengthMismatch`）になる。
+        assert_eq!(
+            parse_scm_rights(&cmsg_bytes(1, 1, &[0; 8], Some(usize::MAX))),
+            rights(&[], Some(ScmMalformed::LengthMismatch))
+        );
+    }
+
+    /// SEC-1・REPAIR-5・#4521: 3 本送って 2 本受けると、3 本目は受信側に残らずカーネルが閉じる（相手端の EOF で観測）。
+    #[test]
+    fn sec1_repair5_4521_recv_with_fds_closes_third_fd_on_ctrunc() {
+        let (a, b) = socketpair_seqpacket().expect("pair");
+        let x = std::fs::File::open("/dev/null").expect("open");
+        let (obs2, sent2) = socketpair_seqpacket().expect("pair");
+        let (obs3, sent3) = socketpair_seqpacket().expect("pair");
+        send_with_fds(
+            a.as_fd(),
+            b"x",
+            &[x.as_fd(), sent2.as_fd(), sent3.as_fd()],
+            true,
+        )
+        .expect("send");
+        drop(sent2);
+        drop(sent3);
+        // 対照: 送信中の参照が端を開いたままにしている。
+        let eagain = Err(SysError::Os(super::super::EAGAIN));
+        assert_eq!(peer_state(&obs2), eagain);
+        assert_eq!(peer_state(&obs3), eagain);
+        let mut buf = [0u8; 4];
+        let got = recv_with_fds(b.as_fd(), &mut buf, MAX_FDS).expect("recv");
+        assert_eq!((got.len, got.ctrl_truncated, got.fds.len()), (1, true, 2));
+        // 3 本目はカーネルが閉じた。2 本目は `got` が所有しているので開いたまま。
+        assert_eq!(peer_state(&obs3), Ok(0));
+        assert_eq!(peer_state(&obs2), eagain);
+        drop(got);
+        assert_eq!(peer_state(&obs2), Ok(0));
     }
 
     /// SEC-1・NET-3・#4478: fd 1 本の送受信。1 本はそのまま受け、2 本送られたら 2 本目は閉じられて `MSG_CTRUNC`。

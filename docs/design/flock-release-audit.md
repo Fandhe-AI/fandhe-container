@@ -29,19 +29,19 @@
 | core `image_rootfs.rs` | `reap_one` / `inspect_published` の局所ロック・`Orphan._lock` | (a)（本 PR） | あり（保持中に userns の子を fork） | 回収同士の `Alive` | 修正済み（#4492。同じ型） |
 | core `image_rootfs.rs` | `ChildLocked._lock`（userns の子の中） | (b) | 無し（子の中。`_exit` で OS が外す。親は子を回収してから進む） | - | 無害（親が回収してから進む） |
 | core `state_store.rs` `lock_file_until` | 取得の補助 | - | - | - | 対象外（保持は `StoreGuard`） |
-| oci `image_management/create_gate.rs` | `ContainerCreatePass` / `CreateQuiescence` | (b) | あり（create 中に supervisor を spawn） | 期限つき（`Timeout` / `Ok(None)`） | 該当（#4513） |
-| oci `image_management/store.rs` | `ImageStoreGuard._file` | (b) | あり | 期限つき | 該当（#4513） |
+| oci `image_management/create_gate.rs` | `ContainerCreatePass` / `CreateQuiescence` | (a)（`ExplicitUnlockFile`） | あり（create 中に supervisor を spawn） | 期限つき（`Timeout` / `Ok(None)`） | 修正済み（#4513。`oci5_repair5_4513_create_pass_drop_releases_gate_despite_duplicate_fd`・`oci5_repair5_4513_quiescence_drop_releases_gate_despite_duplicate_fd`。guard は参照で渡され fork 子へムーブしない） |
+| oci `image_management/store.rs` | `ImageStoreGuard._file` | (a)（`ExplicitUnlockFile`） | あり | 期限つき | 修正済み（#4513。`oci5_repair5_4513_image_store_guard_drop_releases_lock_despite_duplicate_fd`） |
 | oci `image_management/pull.rs` | `@pull.lock` | (b) | あり | GC が `Live` と見て残す（次回回収） | 無害（余分に残す側に倒れ、無期限にならない） |
 | oci `image_management/pull_recovery.rs` | 回収側の `Absent(Some(file))` | (b) | あり | ファイルを消した後は待つ側が無い | 無害 |
 | net `network_store/imp.rs` | `GlobalLockGuard` / `NetworkLockGuard`（`Drop` は `note_release()` のみ） | (a)（`ExplicitUnlockFile`） | あり（pasta 等を spawn） | 期限つき | 修正済み（#4514。`oci5_repair5_4514_global_lock_guard_drop_releases_lock_despite_duplicate_fd` ほか） |
 | net `network/publish.rs` | 共有ポート登録のロック | (a)（`ExplicitUnlockFile`） | あり | 期限つき（`Timeout`） | 修正済み（#4514。`oci5_repair5_4514_shared_port_registry_lock_releases_despite_duplicate_fd`） |
 | net `add_host_dns/hosts_file.rs` | hosts のロック | (a)（`ExplicitUnlockFile`） | あり | 期限つき（`Timeout`） | 修正済み（#4514。`oci5_repair5_4514_hosts_lock_releases_despite_duplicate_fd`） |
-| cri `shim_v2/bootstrap.rs` | `IdLock`・ops.log・daemon log のロック | (b) | あり（daemon の spawn・監査 relay の fork） | 期限つき | 該当（#4515） |
-| cri `runtime_service/record_store/file.rs` | 記録ストアの `.lock` | (b) | あり | 期限つき（`LockTimeout`） | 該当（#4515） |
-| plugin-cri `netsetup/reclaim_store.rs` | 回収待ち記録の `.lock` | (b) | あり | 期限つき | 該当（#4516） |
-| plugin-cri `instance_lock.rs` | `InstanceLock._file` | (b) | あり（モジュール doc に exec しない fork の残余） | 期限つき | 該当（#4516。判断できないため安全側） |
-| supervisor `container_options/store.rs` | `OptionsLock._file` | (b) | あり | 期限つき | 該当（#4517） |
-| supervisor `logs/rotating.rs` | sink のログロック | (b) | あり | 待たず拒否（40ms 程度の再試行） | 該当（#4517） |
+| cri `shim_v2/bootstrap.rs` | `IdLock`・ops.log・daemon log のロック | (a)（#4515 で `ExplicitUnlockFile`） | あり（daemon の spawn・監査 relay の fork） | 期限つき | 修正済み（#4515。`oci5_repair5_4515_id_lock_*`・`_ops_log_lock_*`・`_daemon_log_lock_*`） |
+| cri `runtime_service/record_store/file.rs` | 記録ストアの `.lock` | (a)（#4515 で `ExplicitUnlockFile`） | あり | 期限つき（`LockTimeout`） | 修正済み（#4515。`oci5_repair5_4515_record_store_lock_*`） |
+| plugin-cri `netsetup/reclaim_store.rs` | 回収待ち記録の `.lock` | (b) | あり | 期限つき | 修正済み（#4516。`net1_repair5_4516_reclaim_store_lock_drop_releases_despite_duplicate_fd`） |
+| plugin-cri `instance_lock.rs` | `InstanceLock._file` | (b) | あり（モジュール doc に exec しない fork の残余） | 期限つき | 修正済み（#4516。`cri2_repair5_4516_instance_lock_drop_releases_despite_duplicate_fd`）。残余: Drop を経ない終了（SIGKILL 等）では複製 fd を持つ子が生きている間だけ再取得が遅れる（期限つき） |
+| supervisor `container_options/store.rs` | `OptionsLock._file` | (a)（`ExplicitUnlockFile`） | あり | 期限つき | 修正済み（#4517。`oci5_repair5_4517_options_lock_drop_releases_despite_duplicate_fd`） |
+| supervisor `logs/rotating.rs` | sink のログロック | (a)（`ExplicitUnlockFile`） | あり | 待たず拒否（40ms 程度の再試行） | 修正済み（#4517。`oci5_repair5_4517_sink_drop_releases_log_lock_despite_duplicate_fd`・`oci5_repair5_4517_remove_lock_file_unlocks_despite_duplicate_fd`） |
 | supervisor `logs/rotating.rs` の読み手 | 共有ロックの一時保持 | (a) | - | - | 無害（明示 unlock） |
 | supervisor `logs/cri.rs` | `try_lock_with_grace` | (c) | あり | 猶予（`LOCK_GRACE`）つき再試行 | 無害（fork の窓を猶予で覆う設計） |
 | platform-macos `console_log.rs` | コンソールログのロック | (c) | あり | 猶予つき再試行 | 無害（同上） |
@@ -54,7 +54,9 @@
 
 ## fork 子による誤解放の確認
 
-`LOCK_UN` は OFD 単位で効くため、fork した子で guard の `Drop` が走ると親のロックまで外れる。core の fork 子（`sys::fork_single_threaded*`）は `_exit` で終わり親のスタックを巻き戻さない。`remove_tree_in_userns`・孤児回収の子の body は、親の `Backing`・局所ロックをムーブしていない（子が自分で `lock_and_recheck` を呼ぶ）。確認日: #4492 実装時。
+`LOCK_UN` は OFD 単位で効くため、fork した子で guard の `Drop` が走ると親のロックまで外れる。core の fork 子（`sys::fork_single_threaded*`）は `_exit` で終わり親のスタックを巻き戻さない。`remove_tree_in_userns`・孤児回収の子の body は、親の `Backing`・局所ロックをムーブしていない（子が自分で `lock_and_recheck` を呼ぶ）。確認日: #4492 実装時。plugin-cri（#4516）は fork の原始を持たず、`ExplicitUnlockFile`・`ReclaimStore` の guard・`Arc<InstanceLock>` を core の `fork_single_threaded*` のクロージャへ渡す箇所が無いことを `git grep` で確認した。
+
+supervisor（#4517）: supervisor 自身の `sys` に fork は無く、core の `sys::fork_single_threaded` を呼ぶ `exec.rs` の `spawn_exec_worker` の子 body は `RotatingFileSink`・`OptionsLock`・`ExplicitUnlockFile` を所有・ムーブしていない（子は exec か `_exit` で終わる）。確認日: #4517 実装時。
 
 net の子プロセスは `Command::spawn`（exec 経路）だけで、exec しない fork を持たない。`pre_exec` の closure は `prctl`・`getppid` のみで guard を捕捉しない。guard の外部利用者（cli・supervisor）も子の body へムーブしていない。確認日: #4514 実装時。
 

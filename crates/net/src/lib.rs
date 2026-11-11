@@ -99,6 +99,8 @@ pub mod netlink_route;
 #[cfg(target_os = "linux")]
 pub mod netns;
 pub mod netns_dial;
+#[cfg(target_os = "linux")]
+mod netns_helper;
 pub mod netns_holder;
 pub mod network;
 pub mod network_mode;

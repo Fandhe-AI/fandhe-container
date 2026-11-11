@@ -48,6 +48,7 @@
 //!   `usage` の読み取りと `pull` の staging・公開はパス起点のまま（根拠は同 doc の論点 3）。
 //!   Linux 5.6 未満など `openat2` が使えない環境では `open` が `Unimplemented` で拒否する。
 
+use crate::flock_release::ExplicitUnlockFile;
 #[cfg(any(unix, test))]
 use std::fs;
 use std::fs::{File, TryLockError};
@@ -229,7 +230,7 @@ impl ImageStore {
         let file = open_lock_file(&self.handle)?;
         lock_file_until(&file, deadline)?;
         let mut guard = ImageStoreGuard {
-            _file: file,
+            _file: ExplicitUnlockFile::new(file),
             table,
             recovered: None,
         };
@@ -280,7 +281,8 @@ impl ImageStore {
 /// フィールド順は drop 順を決める（OS ロック → プロセス内 `Mutex` の順で解放する。取得の逆順）。
 #[derive(Debug)]
 pub struct ImageStoreGuard<'a> {
-    _file: File,
+    /// `@lock` の OS ロック。drop で明示 unlock して閉じ、複製 fd が残っても外れる（#4513）。
+    _file: ExplicitUnlockFile,
     table: MutexGuard<'a, ReferenceTable>,
     /// この取得時に行った中断削除の復旧結果（無ければ `None`）。`Abandoned` で孤児として残った blob
     /// （`undeleted_blobs`）や `Pending` の状態を、呼び出し側が構造化された形で受け取るために保持する
@@ -289,6 +291,12 @@ pub struct ImageStoreGuard<'a> {
 }
 
 impl ImageStoreGuard<'_> {
+    /// 試験用: `@lock` の OFD の複製（fork 子の代役。#4513）。
+    #[cfg(all(test, unix))]
+    fn lock_file_clone_for_test(&self) -> File {
+        self._file.clone_file_for_test()
+    }
+
     /// この取得時に行った中断削除の復旧結果。ジャーナルが無かったときは `None`。
     pub fn recovery(&self) -> Option<&PendingDeletionRecovery> {
         self.recovered.as_ref()
@@ -700,6 +708,31 @@ mod tests {
         assert_eq!(seen.expect("added tag visible"), d(0xa0));
         // 残りは keep タグとコンテナ c1 の 2 件。
         assert_eq!(count, 2);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// OCI-5・REPAIR-5（#4513）: guard は複製 fd が残っても drop で `@lock` を外す（陽性対照: 包まない File は残る）。
+    #[test]
+    fn oci5_repair5_4513_image_store_guard_drop_releases_lock_despite_duplicate_fd() {
+        let (root, store) = seeded_store("dup4513", SHORT);
+        let handle = RootHandle::open_unchecked(&root).expect("handle");
+        let guard = store.lock().expect("lock");
+        let dup = guard.lock_file_clone_for_test();
+        let probe = open_lock_file(&handle).expect("open");
+        assert!(matches!(probe.try_lock(), Err(TryLockError::WouldBlock)));
+        drop(guard);
+        assert!(probe.try_lock().is_ok());
+        probe.unlock().expect("unlock probe");
+        drop(dup);
+        store.lock().expect("reacquire");
+
+        let plain = open_lock_file(&handle).expect("open");
+        plain.try_lock().expect("plain lock");
+        let plain_dup = plain.try_clone().expect("dup");
+        drop(plain);
+        let other = open_lock_file(&handle).expect("open");
+        assert!(matches!(other.try_lock(), Err(TryLockError::WouldBlock)));
+        drop(plain_dup);
         let _ = fs::remove_dir_all(&root);
     }
 

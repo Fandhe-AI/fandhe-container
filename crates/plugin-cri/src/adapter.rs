@@ -163,6 +163,11 @@ pub struct CriPluginBackends {
     /// pod の namespace の保持役 provider（H6・#2877・CRI-2）。`production()` の Linux・非 root の構成だけが差し、注入で組んだ
     /// ときは `None`（[`Self::with_pod_holder_provider`] で差せる）。`runtime_service` が `with_pod_holder` へ渡す。
     pod_holder: Option<Arc<dyn PodNamespaceHolderProvider>>,
+    /// 本番の保持役の具象（Linux のみ）。`pod_holder` と必ず同じ割り当て（同じ表）を指す。PortForward の `PodNetnsDialer` が
+    /// 同じ表から netns の fd を開くため、別インスタンスにすると URL は返るのに dial がすべて `UNAVAILABLE` になる（CRI-6・NET-3・#4486）。
+    /// 差すのは [`Self::with_production_pod_holder`] だけで、別の provider へ差し替えたら `None` に戻る（fail-closed）。
+    #[cfg(target_os = "linux")]
+    production_pod_holder: Option<Arc<crate::pod_holder::ProductionPodHolder>>,
 }
 
 impl fmt::Debug for CriPluginBackends {
@@ -200,17 +205,46 @@ impl CriPluginBackends {
             _instance_lock: None,
             images: Arc::new(InMemoryImageStore::new()),
             pod_holder: None,
+            #[cfg(target_os = "linux")]
+            production_pod_holder: None,
         }
     }
 
     /// pod の namespace の保持役 provider を差す（試験と別実装への差し替え。H6・#2877・PLUG-1）。
     /// 本番の provider は `production()` が Linux・非 root の構成で自動的に差す。
+    ///
+    /// Linux では具象の保持役の記憶を消す（`Self::pod_namespace_source` が `None` に戻り、PortForward の POD は
+    /// `UNIMPLEMENTED` のまま。古い表を dialer が引く乖離を作らない。#4486）。
     pub fn with_pod_holder_provider(
         mut self,
         provider: Arc<dyn PodNamespaceHolderProvider>,
     ) -> Self {
         self.pod_holder = Some(provider);
+        #[cfg(target_os = "linux")]
+        {
+            self.production_pod_holder = None;
+        }
         self
+    }
+
+    /// 本番の保持役を差す（Linux のみ）。cri へ渡す provider と PortForward の netns の出所を同じ割り当てから作る（#4486・CRI-6・PLUG-1）。
+    #[cfg(target_os = "linux")]
+    pub fn with_production_pod_holder(
+        mut self,
+        holder: Arc<crate::pod_holder::ProductionPodHolder>,
+    ) -> Self {
+        self.pod_holder = Some(Arc::clone(&holder) as Arc<dyn PodNamespaceHolderProvider>);
+        self.production_pod_holder = Some(holder);
+        self
+    }
+
+    /// PortForward の POD ネットワーク用に、保持役の netns を開く口を返す（Linux のみ）。本番の保持役があるときだけ `Some`。
+    /// `main.rs` がこれで `ProductionPortForward::pod_network` を選ぶ。`None`（rootful・注入なし・別 provider）は POD が `UNIMPLEMENTED`（#4486）。
+    #[cfg(target_os = "linux")]
+    pub fn pod_namespace_source(&self) -> Option<Arc<dyn crate::streaming::PodNamespaceSource>> {
+        self.production_pod_holder
+            .as_ref()
+            .map(|h| Arc::clone(h) as Arc<dyn crate::streaming::PodNamespaceSource>)
     }
 
     /// 既定の組み合わせを作る（`FileStateStore`・[`CoreLifecycleRuntime`]・`NetworkPlugin` は Linux で
@@ -290,7 +324,7 @@ impl CriPluginBackends {
         // 試験ビルドでは環境変数で止められる（既定の集合の試験が AppArmor の緩和・supervisor の bin なしで動くように）。
         #[cfg(target_os = "linux")]
         if pod_holder_injection_enabled() {
-            backends.pod_holder = Some(Arc::new(
+            backends = backends.with_production_pod_holder(Arc::new(
                 crate::pod_holder::ProductionPodHolder::production(),
             ));
         }
@@ -3531,5 +3565,51 @@ mod tests {
         let meta = std::fs::symlink_metadata(state.join(".cri").join(INSTANCE_LOCK_NAME))
             .expect("lock file");
         assert!(meta.is_file());
+    }
+
+    /// テスト用の保持役（偽の実行ファイル。spawn はしない）。
+    #[cfg(target_os = "linux")]
+    fn fixed_holder() -> Arc<crate::pod_holder::ProductionPodHolder> {
+        Arc::new(crate::pod_holder::ProductionPodHolder::with_fixed_program(
+            PathBuf::from("/bin/sh"),
+            Vec::new(),
+            false,
+            2,
+        ))
+    }
+
+    /// CRI-6・PLUG-1・#4486: cri へ渡す provider と PortForward の netns の出所は同じ割り当て（同じ表）を指す。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn plug1_4486_production_pod_holder_is_shared_with_namespace_source() {
+        let holder = fixed_holder();
+        let backends = backends_for_pod_holder().with_production_pod_holder(Arc::clone(&holder));
+        let source = backends.pod_namespace_source().expect("source");
+        let provider = backends.pod_holder.as_ref().expect("provider");
+        let want = Arc::as_ptr(&holder) as *const ();
+        assert_eq!(Arc::as_ptr(&source) as *const (), want);
+        assert_eq!(Arc::as_ptr(provider) as *const (), want);
+    }
+
+    /// CRI-6・PLUG-1・#4486: 別の provider へ差し替えたら netns の出所は消える（POD は node-only のまま）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn plug1_4486_dyn_provider_injection_clears_namespace_source() {
+        let backends = backends_for_pod_holder().with_production_pod_holder(fixed_holder());
+        assert!(backends.pod_namespace_source().is_some());
+        let backends = backends.with_pod_holder_provider(fixed_holder());
+        assert!(backends.pod_namespace_source().is_none());
+        assert!(backends.pod_holder.is_some());
+    }
+
+    /// 保持役を差さない状態の backends（注入の試験用）。
+    #[cfg(target_os = "linux")]
+    fn backends_for_pod_holder() -> CriPluginBackends {
+        let store: Arc<dyn StateStore> = Arc::new(OneRecord::new(record(false)));
+        let rt = Arc::new(CoreLifecycleRuntime::with_recorder(
+            Arc::clone(&store),
+            Arc::new(OpRecorder::new()),
+        ));
+        CriPluginBackends::new(rt, store, Arc::new(UnimplementedNetwork))
     }
 }

@@ -6,8 +6,6 @@
 //! `NetworkName`（`/`・NUL・`..` を作れない）・定数・`read_dir` の項目だけで、外部入力を直接連結しない。
 
 use std::fs::{self, DirBuilder, File, OpenOptions};
-
-use crate::flock_release::ExplicitUnlockFile;
 use std::io::{self, Read};
 use std::marker::PhantomData;
 use std::os::fd::AsRawFd;
@@ -25,6 +23,7 @@ use super::{
     NetworkListing, check_dir_meta, check_file_meta,
 };
 use crate::error::{NetError, NetErrorCode};
+use crate::flock_release::ExplicitUnlockFile;
 use crate::instrument::{NetOpKind, NetOpRecorder, NoopNetOpRecorder, record_net_op};
 use crate::network::NetworkName;
 use crate::sys;

@@ -17,7 +17,7 @@ use std::fs::File;
 use std::ops::{Deref, DerefMut};
 
 /// unlock を試みてから閉じる。unlock が失敗しても close は止めない（失敗注入の試験用に結果を返す）。
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn release_with(
     file: File,
     unlock: impl FnOnce(&File) -> std::io::Result<()>,

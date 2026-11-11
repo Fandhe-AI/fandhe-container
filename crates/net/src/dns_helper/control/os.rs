@@ -1432,6 +1432,67 @@ mod tests {
         assert!(!root.0.join("@networks/web/dns.audit").exists());
     }
 
+    /// PLUG-12・SEC-1・#3573: 掃除経路は connect の前に lstat し、symlink は先へつながず拒否する。
+    #[test]
+    fn plug12_3573_cleanup_rejects_symlink_without_connecting() {
+        let root = Root::new("clean-sym");
+        let (store, net, _dir, listener) = audited_network(&root);
+        let g = store.lock_global_exclusive().expect("global");
+        let n = g.lock_network(&net).expect("network");
+        drop(listener);
+        let ctl = n.control_socket_path();
+        std::fs::remove_file(&ctl).expect("rm");
+        let outside = Root::new("clean-sym-out");
+        let target = outside.0.join("t.sock");
+        let live = UnixListener::bind(&target).expect("bind outside");
+        live.set_nonblocking(true).expect("nb");
+        std::os::unix::fs::symlink(&target, &ctl).expect("symlink");
+        let e = n
+            .remove_dns_control_socket_if_no_listener_with(|_| Ok((1, sys::effective_uid() + 1)))
+            .expect_err("symlink");
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        assert!(std::fs::symlink_metadata(&ctl).is_ok());
+        assert!(!root.0.join("@networks/web/dns.audit").exists());
+        assert_eq!(
+            live.accept().expect_err("no connect").kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    /// NET-5・#3573: 通常ファイルは消さず、監査も書かない。
+    #[test]
+    fn net5_3573_cleanup_rejects_regular_file_and_keeps_it() {
+        let root = Root::new("clean-reg");
+        let (store, net, _dir, listener) = audited_network(&root);
+        let g = store.lock_global_exclusive().expect("global");
+        let n = g.lock_network(&net).expect("network");
+        drop(listener);
+        let ctl = n.control_socket_path();
+        std::fs::remove_file(&ctl).expect("rm");
+        std::fs::write(&ctl, b"x").expect("write");
+        let e = n
+            .remove_dns_control_socket_if_no_listener()
+            .expect_err("regular");
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        assert!(ctl.exists());
+        assert!(!root.0.join("@networks/web/dns.audit").exists());
+    }
+
+    /// NET-5・#3573: 権限が 0600 でない残骸（bind 直後にヘルパーが死んだ場合）も消せる。
+    #[test]
+    fn net5_3573_cleanup_removes_stale_socket_with_non_0600_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = Root::new("clean-mode");
+        let (store, net, _dir, listener) = audited_network(&root);
+        let g = store.lock_global_exclusive().expect("global");
+        let n = g.lock_network(&net).expect("network");
+        drop(listener);
+        let ctl = n.control_socket_path();
+        std::fs::set_permissions(&ctl, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        assert!(n.remove_dns_control_socket_if_no_listener().expect("stale"));
+        assert!(!ctl.exists());
+    }
+
     /// SEC-4・#3534: 2 つの書き手（ヘルパー側のロックなしの口と送り手側のガード）の追記が `O_APPEND` で
     /// 順に揃って残る。
     #[test]

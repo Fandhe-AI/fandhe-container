@@ -32,7 +32,8 @@
 //!   listener があり消さないとき）は `event=dns_control_cleanup_peer_uid_mismatch`・
 //!   `event=dns_control_cleanup_peer_cred_unavailable errno=<...>`（uid だけ照合し削除の判断は変えない。#3551）。
 //!   値は数値と固定の語だけで、uid・pid はこのファイルにだけ載せる。net は core に依存しないため core の `@audit.log` には書かない
-//!   （上位の監査経路への中継は未実装）
+//!   （上位の監査経路へは中継しない。#3552 のオーナー判断の案 A・#3573。再評価条件は D13 の承認で bridge が本番に入ったとき）
+//!   掃除経路も connect の前に lstat で種別と所有者を検査し、symlink・通常ファイル・他人所有は connect せず拒否する（#3573）
 //!
 //! # 未実装（REPAIR-3）
 //! detach の後の `Reload` は送らない（古い名前は次の attach の `Reload` か 1→0 の停止で消える。残余は

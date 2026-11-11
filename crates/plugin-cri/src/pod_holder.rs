@@ -28,7 +28,7 @@
 //! - supervisor の bin の解決・検査は `open_supervisor_beside` に共通化し、後続の netns-dial helper（#4484）が共有する。
 //!
 //! # 未実装・簡易実装（REPAIR-3）
-//! `open_pod_namespaces` の利用側（`PodNetnsDialer`）は実装済み（#4484）で、cri への結線は #4486。
+//! `open_pod_namespaces` の利用側（`PodNetnsDialer`）は実装済み（#4484）で、PortForward への結線は #4486 で済み（`ProductionPortForward::pod_network`）。
 //! 保持役の pid から `PodNamespacePaths` を作って bundle へ渡す配線（H5・#2876）は配線済み（user・ipc の join）。保持役の
 //! netns の bundle への受け渡しは H8（#2878）で実装済み。pod ネットワークの本番 provider（rootless の pasta）は H10（#2879）で未実装。素性（pid・
 //! starttime・ns）の永続化と再起動後の再採用は R11（#2940）。rootful（uid 0）は `UNIMPLEMENTED`（#2241・#2442 の判断まで）。

@@ -346,9 +346,19 @@ fn serve(
             );
         }
     };
+    // PortForward の POD ネットワークは、cri へ渡す保持役と同じ表を持つ Linux・非 root の構成だけ結線する（#4486）。
+    // 保持役が無い構成（rootful・注入なし）は node-only で、POD は RPC 時に `UNIMPLEMENTED` のまま（host loopback へ縮退しない）。
+    #[cfg(target_os = "linux")]
+    let port_forward = match backends.pod_namespace_source() {
+        Some(source) => streaming::ProductionPortForward::pod_network(source),
+        None => streaming::ProductionPortForward::node_only(),
+    };
+    #[cfg(not(target_os = "linux"))]
+    let port_forward = streaming::ProductionPortForward::node_only();
     let streaming = match rt.block_on(streaming::bind_production_streaming(
         streaming_config.clone(),
         attach_backend,
+        port_forward,
         exec_dyn,
         backends.streaming_op_recorder(),
         conn_observer,

@@ -8,9 +8,11 @@
 //! 結線済みは Attach（Linux は完全版〔`supervisor_attach::SupervisorAttachBackend`。kind 9 の tap と fd の受け取り。#4077〕で、
 //! stdin・tty・resize を扱い、RPC 時の整合検査は cri の `attach_impl`〔D7。#4078〕。実機の通しは `tests/cri_attach_real.rs`（#4079）。非 Linux は
 //! 読み取り専用の [`log_attach::LogFollowAttachBackend`]〔回転ログの follow。#3763〕で、stdin・tty は RPC 時に `INVALID_ARGUMENT`）と、PortForward の NODE ネットワーク（hostNetwork）の pod
-//! （#3755。[`NodeLoopbackDialer`]）。POD ネットワークの pod は RPC 時（cri）と [`NodeLoopbackDialer`] の両方で `UNIMPLEMENTED` のまま。
-//! POD 向けの本体 `PodNetnsDialer`（Linux。保持役の fd と `netns-dial` helper で pod の netns 内へ接続。#4484）は実装済みだが、
-//! `production_stream_dispatcher` への結線と `supports_pod_network` の有効化は #4486。Exec は Linux で結線済み（`exec_launcher::SupervisorExecLauncher`。
+//! （#3755。[`NodeLoopbackDialer`]）。POD ネットワークの pod は、Linux・非 root で保持役を注入した構成だけ結線済み
+//! （[`ProductionPortForward::pod_network`] の `PodNetnsDialer`。保持役の fd と `netns-dial` helper で pod の netns 内へ接続。#4484・#4486。
+//! 実 helper を通す実機の段は #4487）。保持役が無い構成（rootful・注入なし・別 provider）は [`ProductionPortForward::node_only`] で、
+//! RPC 時（cri）に `UNIMPLEMENTED` のまま（host loopback へは縮退しない）。
+//! Exec は Linux で結線済み（`exec_launcher::SupervisorExecLauncher`。
 //! supervisor の `stream-exec` helper 経由。stdin・stdout・stderr と、tty（stdin・stdout・resize。stderr は RPC 時に `INVALID_ARGUMENT`。#4417）を扱い、相対 `argv[0]` は RPC 時に `INVALID_ARGUMENT`。#3761）で、
 //! 非 Linux は「exec streaming is not wired」の `UNIMPLEMENTED`。`wiring` は bind 時に 1 回だけ取られるため、
 //! ハンドラは必ず bind より前に足す（[`bind_production_streaming`] が順序を固定する）。
@@ -77,7 +79,9 @@ use fandhe_container_cri::streaming::attach::{AttachBackend, AttachHandler};
 use fandhe_container_cri::streaming::exec::{
     ExecStreamConfig, ExecStreamHandler, ExecStreamLauncher,
 };
-use fandhe_container_cri::streaming::port_forward::{PortForwardConfig, PortForwardHandler};
+use fandhe_container_cri::streaming::port_forward::{
+    PortForwardConfig, PortForwardDialer, PortForwardHandler,
+};
 use fandhe_container_cri::streaming::{
     ConnectionObserver, StreamDispatcher, StreamingConfig, StreamingServer, StreamingSessions,
 };
@@ -146,13 +150,41 @@ impl ProductionAttach {
     }
 }
 
-/// 本番の `StreamDispatcher`。Attach（Linux は対話可能な完全版、非 Linux は読み取り専用。#3763・#4078）・PortForward（NODE ネットワークの pod だけ。#3755）・
+/// 本番の PortForward の dialer と、POD ネットワークに対応するかの宣言（#4486・CRI-6・NET-3・SEC-1）。
+///
+/// 保持役（[`PodNamespaceSource`]）が無いと POD 対応の dialer を作れないよう、構築口を絞る。`main.rs` が
+/// `CriPluginBackends::pod_namespace_source` の有無で選ぶ。`node_only` の構成では POD の PortForward は RPC 時（cri）に
+/// `UNIMPLEMENTED` のままで、host loopback へは縮退しない。
+pub struct ProductionPortForward {
+    dialer: Arc<dyn PortForwardDialer>,
+}
+
+impl ProductionPortForward {
+    /// NODE ネットワーク（hostNetwork）の pod だけ（[`NodeLoopbackDialer`]。`supports_pod_network` は偽）。
+    pub fn node_only() -> Self {
+        Self {
+            dialer: Arc::new(NodeLoopbackDialer::new()),
+        }
+    }
+
+    /// POD ネットワークにも対応する（Linux のみ。[`PodNetnsDialer`]。`supports_pod_network` は真）。
+    /// `source` は cri へ渡す保持役 provider と同じ表を指すこと（`CriPluginBackends::pod_namespace_source` が保証する）。
+    #[cfg(target_os = "linux")]
+    pub fn pod_network(source: Arc<dyn PodNamespaceSource>) -> Self {
+        Self {
+            dialer: Arc::new(PodNetnsDialer::new(source)),
+        }
+    }
+}
+
+/// 本番の `StreamDispatcher`。Attach（Linux は対話可能な完全版、非 Linux は読み取り専用。#3763・#4078）・PortForward（NODE ネットワークの pod と、保持役がある Linux 構成の POD ネットワーク。#3755・#4486）・
 /// Exec（`exec` が `Some` のとき。stdin・stdout・stderr と tty、絶対パスの `argv[0]` のみ。#3761・#4417）を結線する。
 ///
 /// 期限は本番の設定（[`production_streaming_config`]）の
 /// `session_limits()`。ハンドラの構築失敗（設定検証。既定では起きない）は `Internal` の固定文言に写す。
 pub fn production_stream_dispatcher(
     attach: ProductionAttach,
+    port_forward: ProductionPortForward,
     exec: Option<Arc<dyn ExecStreamLauncher>>,
     recorder: Arc<dyn CriOpRecorder>,
 ) -> Result<StreamDispatcher, PluginError> {
@@ -166,11 +198,9 @@ pub fn production_stream_dispatcher(
     } else {
         attach_handler.read_only()
     };
-    let port_forward = PortForwardHandler::new(
-        Arc::new(NodeLoopbackDialer::new()),
-        PortForwardConfig::default(),
-    )
-    .map_err(|_| PluginError::new(PluginErrorCode::Internal, MSG_STREAMING_START_FAILED))?;
+    let port_forward =
+        PortForwardHandler::new(port_forward.dialer, PortForwardConfig::default())
+            .map_err(|_| PluginError::new(PluginErrorCode::Internal, MSG_STREAMING_START_FAILED))?;
     let mut dispatcher = StreamDispatcher::new()
         .with_attach(Arc::new(attach_handler))
         .with_port_forward(Arc::new(port_forward));
@@ -198,11 +228,12 @@ pub fn production_stream_dispatcher(
 pub async fn bind_production_streaming(
     config: StreamingConfig,
     attach: ProductionAttach,
+    port_forward: ProductionPortForward,
     exec: Option<Arc<dyn ExecStreamLauncher>>,
     recorder: Arc<dyn CriOpRecorder>,
     observer: Arc<dyn ConnectionObserver>,
 ) -> Result<StreamingServer, PluginError> {
-    let dispatcher = production_stream_dispatcher(attach, exec, recorder)?;
+    let dispatcher = production_stream_dispatcher(attach, port_forward, exec, recorder)?;
     StreamingServer::bind_with_observer(config, Arc::new(dispatcher), observer)
         .await
         .map_err(|e| {
@@ -498,6 +529,7 @@ mod tests {
         let server = bind_production_streaming(
             config.clone(),
             fake_attach(),
+            ProductionPortForward::node_only(),
             None,
             noop_recorder(),
             noop_observer(),
@@ -545,6 +577,7 @@ mod tests {
         let server = bind_production_streaming(
             production_streaming_config(),
             ProductionAttach::interactive(backend),
+            ProductionPortForward::node_only(),
             None,
             noop_recorder(),
             noop_observer(),
@@ -559,6 +592,7 @@ mod tests {
         let server = bind_production_streaming(
             production_streaming_config(),
             fake_attach(),
+            ProductionPortForward::node_only(),
             None,
             noop_recorder(),
             noop_observer(),
@@ -589,6 +623,7 @@ mod tests {
         let server = bind_production_streaming(
             production_streaming_config(),
             fake_attach(),
+            ProductionPortForward::node_only(),
             None,
             noop_recorder(),
             noop_observer(),
@@ -633,6 +668,7 @@ mod tests {
         let server = bind_production_streaming(
             production_streaming_config(),
             fake_attach(),
+            ProductionPortForward::node_only(),
             None,
             noop_recorder(),
             noop_observer(),
@@ -702,6 +738,171 @@ mod tests {
         );
     }
 
+    /// 偽の保持役 provider（#4486 の試験用。spawn は pid を返すだけ）。
+    #[cfg(target_os = "linux")]
+    struct FakeProvider;
+
+    #[cfg(target_os = "linux")]
+    impl fandhe_container_cri::adapter::PodNamespaceHolderProvider for FakeProvider {
+        fn spawn(
+            &self,
+            _req: &fandhe_container_cri::adapter::PodHolderRequest<'_>,
+        ) -> Result<fandhe_container_cri::adapter::PodHolder, fandhe_container_cri::error::CriError>
+        {
+            Ok(fandhe_container_cri::adapter::PodHolder::new(
+                std::num::NonZeroU32::new(4242).expect("pid"),
+            ))
+        }
+        fn release(
+            &self,
+            _sandbox_id: &str,
+            _timeout: Duration,
+        ) -> Result<(), fandhe_container_cri::error::CriError> {
+            Ok(())
+        }
+        fn liveness(
+            &self,
+            _sandbox_id: &str,
+        ) -> Result<
+            fandhe_container_cri::adapter::PodHolderLiveness,
+            fandhe_container_cri::error::CriError,
+        > {
+            Ok(fandhe_container_cri::adapter::PodHolderLiveness::Alive)
+        }
+    }
+
+    /// `open_pod_namespaces` を呼ばれたら `Unavailable`（URL の発行では呼ばれない）。
+    #[cfg(target_os = "linux")]
+    struct UnusedSource;
+
+    #[cfg(target_os = "linux")]
+    impl PodNamespaceSource for UnusedSource {
+        fn open_pod_namespaces(
+            &self,
+            _sandbox_id: &str,
+        ) -> Result<
+            crate::pod_holder::PodNamespaceFds,
+            fandhe_container_core::traits::types::TraitError,
+        > {
+            Err(fandhe_container_core::traits::types::TraitError::new(
+                fandhe_container_core::traits::types::ErrorCode::Unavailable,
+                "unused",
+            ))
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn run_sandbox(
+        svc: &CriRuntimeService,
+        name: &str,
+        network: Option<cri::NamespaceMode>,
+    ) -> String {
+        let linux = network.map(|n| cri::LinuxPodSandboxConfig {
+            security_context: Some(cri::LinuxSandboxSecurityContext {
+                namespace_options: Some(cri::NamespaceOption {
+                    network: n as i32,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        svc.run_pod_sandbox(Request::new(cri::RunPodSandboxRequest {
+            config: Some(cri::PodSandboxConfig {
+                metadata: Some(cri::PodSandboxMetadata {
+                    name: name.into(),
+                    uid: format!("uid-{name}"),
+                    namespace: "ns".into(),
+                    attempt: 0,
+                }),
+                linux,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+        .await
+        .expect("run")
+        .into_inner()
+        .pod_sandbox_id
+    }
+
+    /// CRI-6・NET-3・PLUG-1・#4486: 保持役がある構成（`pod_network`）では POD の sandbox も NODE も URL を返す。
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn cri6_4486_production_port_forward_pod_with_holder_returns_url() {
+        let server = bind_production_streaming(
+            production_streaming_config(),
+            fake_attach(),
+            ProductionPortForward::pod_network(Arc::new(UnusedSource)),
+            None,
+            noop_recorder(),
+            noop_observer(),
+        )
+        .await
+        .expect("bind");
+        assert!(server.issuer().wiring().port_forward_pod_network());
+        let svc = CriRuntimeService::new()
+            .with_pod_holder(Arc::new(FakeProvider))
+            .with_streaming(server.issuer());
+        let prefix = format!("{}/portforward/", server.issuer().base_url());
+        for (name, network) in [("p", None), ("n", Some(cri::NamespaceMode::Node))] {
+            let id = run_sandbox(&svc, name, network).await;
+            let url = svc
+                .port_forward(Request::new(cri::PortForwardRequest {
+                    pod_sandbox_id: id,
+                    port: vec![80],
+                }))
+                .await
+                .unwrap_or_else(|e| panic!("{name}: {e}"))
+                .into_inner()
+                .url;
+            assert!(url.starts_with(&prefix), "{name}: unexpected url");
+        }
+    }
+
+    /// CRI-6・#4485・#4486: `pod_network` の構成でも、記録に保持役が無い POD の sandbox は `FAILED_PRECONDITION`。
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn cri6_4486_pod_network_without_holder_record_is_failed_precondition() {
+        let server = bind_production_streaming(
+            production_streaming_config(),
+            fake_attach(),
+            ProductionPortForward::pod_network(Arc::new(UnusedSource)),
+            None,
+            noop_recorder(),
+            noop_observer(),
+        )
+        .await
+        .expect("bind");
+        let svc = CriRuntimeService::new().with_streaming(server.issuer());
+        let id = run_sandbox(&svc, "p", None).await;
+        let e = svc
+            .port_forward(Request::new(cri::PortForwardRequest {
+                pod_sandbox_id: id,
+                port: vec![80],
+            }))
+            .await
+            .expect_err("no holder");
+        assert_eq!(e.code(), Code::FailedPrecondition);
+        assert_eq!(e.message(), "sandbox holder is unavailable");
+    }
+
+    /// CRI-6・#4486: `supports_pod_network` は構築口に従う（`node_only` は偽、`pod_network` は真）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cri6_4486_supports_pod_network_follows_constructor() {
+        assert!(
+            !ProductionPortForward::node_only()
+                .dialer
+                .supports_pod_network()
+        );
+        assert!(
+            ProductionPortForward::pod_network(Arc::new(UnusedSource))
+                .dialer
+                .supports_pod_network()
+        );
+    }
+
     /// REPAIR-5・#3761・#4164: `finish` されないまま `StreamingStop` が drop されても `on_stop` が 1 回呼ばれる。
     /// shutdown future だけが先に drop されても、`StreamingStop` が生きている間は呼ばれない。
     #[tokio::test]
@@ -709,6 +910,7 @@ mod tests {
         let server = bind_production_streaming(
             production_streaming_config(),
             fake_attach(),
+            ProductionPortForward::node_only(),
             None,
             noop_recorder(),
             noop_observer(),
@@ -740,6 +942,7 @@ mod tests {
         let server = bind_production_streaming(
             production_streaming_config(),
             fake_attach(),
+            ProductionPortForward::node_only(),
             None,
             noop_recorder(),
             noop_observer(),
@@ -829,6 +1032,7 @@ mod tests {
         let server = bind_production_streaming(
             production_streaming_config(),
             fake_attach(),
+            ProductionPortForward::node_only(),
             None,
             noop_recorder(),
             noop_observer(),
@@ -889,6 +1093,7 @@ mod tests {
         let server = bind_production_streaming(
             production_streaming_config(),
             fake_attach(),
+            ProductionPortForward::node_only(),
             None,
             noop_recorder(),
             noop_observer(),
@@ -940,6 +1145,7 @@ mod tests {
         let server = bind_production_streaming(
             production_streaming_config(),
             fake_attach(),
+            ProductionPortForward::node_only(),
             None,
             noop_recorder(),
             noop_observer(),
@@ -974,6 +1180,7 @@ mod tests {
         let server = bind_production_streaming(
             production_streaming_config(),
             fake_attach(),
+            ProductionPortForward::node_only(),
             None,
             noop_recorder(),
             noop_observer(),
@@ -1016,6 +1223,7 @@ mod tests {
         let server = bind_production_streaming(
             production_streaming_config(),
             fake_attach(),
+            ProductionPortForward::node_only(),
             None,
             noop_recorder(),
             noop_observer(),
@@ -1104,6 +1312,7 @@ mod tests {
         let e = bind_production_streaming(
             production_streaming_config().with_bind(busy),
             fake_attach(),
+            ProductionPortForward::node_only(),
             None,
             noop_recorder(),
             noop_observer(),
@@ -1116,6 +1325,7 @@ mod tests {
         let e = bind_production_streaming(
             production_streaming_config().with_bind(ext),
             fake_attach(),
+            ProductionPortForward::node_only(),
             None,
             noop_recorder(),
             noop_observer(),
@@ -1135,6 +1345,7 @@ mod tests {
         let server = bind_production_streaming(
             production_streaming_config(),
             ProductionAttach::interactive(backend),
+            ProductionPortForward::node_only(),
             None,
             noop_recorder(),
             noop_observer(),
@@ -1225,6 +1436,7 @@ mod tests {
         let server = bind_production_streaming(
             production_streaming_config(),
             fake_attach(),
+            ProductionPortForward::node_only(),
             None,
             noop_recorder(),
             noop_observer(),
@@ -1341,6 +1553,7 @@ mod tests {
         let server = bind_production_streaming(
             production_streaming_config(),
             fake_attach(),
+            ProductionPortForward::node_only(),
             Some(launcher),
             noop_recorder(),
             noop_observer(),
@@ -1495,6 +1708,7 @@ mod tests {
         let server = bind_production_streaming(
             production_streaming_config(),
             fake_attach(),
+            ProductionPortForward::node_only(),
             None,
             noop_recorder(),
             obs,
@@ -1558,6 +1772,7 @@ mod tests {
                 .with_max_connections(1)
                 .with_header_read_timeout(Duration::from_secs(2)),
             fake_attach(),
+            ProductionPortForward::node_only(),
             None,
             noop_recorder(),
             obs,
@@ -1603,6 +1818,7 @@ mod tests {
                 .with_max_connections(1)
                 .with_header_read_timeout(Duration::from_secs(2)),
             fake_attach(),
+            ProductionPortForward::node_only(),
             None,
             noop_recorder(),
             obs,

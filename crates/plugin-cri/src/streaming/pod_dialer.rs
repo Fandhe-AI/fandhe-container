@@ -1,9 +1,10 @@
 //! POD ネットワークの pod 向け `PortForwardDialer` の本番実装 `PodNetnsDialer`（Linux のみ。CRI-6・NET-3・SEC-1・REPAIR-5・
 //! TASK-63.4・#4484。設計は `docs/design/cri-streaming-server.md`「POD ネットワークの PortForward の設計（#3766）」）。
 //!
-//! 呼び出し元: cri の `PortForwardHandler` が `spawn_blocking` 上で `dial` を呼ぶ。`production_stream_dispatcher` への結線と
-//! `supports_pod_network` の有効化は #4486、実 helper を通す実機の段 F は #4487（本 issue は dialer 本体まで。結線されるまで
-//! POD の pod の PortForward は RPC 時に `UNIMPLEMENTED` のまま）。NODE の target は `NodeLoopbackDialer` へ委ねる。
+//! 呼び出し元: cri の `PortForwardHandler` が `spawn_blocking` 上で `dial` を呼ぶ。`streaming::ProductionPortForward::pod_network` が
+//! 保持役がある構成（Linux・非 root）だけで結線し（#4486。`supports_pod_network` は真）、保持役が無い構成は結線されず POD の PortForward は
+//! RPC 時に `UNIMPLEMENTED` のまま。実 helper を通す実機の段 F は #4487。
+//! NODE の target は `NodeLoopbackDialer` へ委ねる。
 //!
 //! # 手順（POD。順序は変えない）
 //! 1. 入力検査（port 0・timeout 0 は `INVALID_ARGUMENT`）。保持一覧を掃除し、満杯なら `RESOURCE_EXHAUSTED`（ns も開かない）。

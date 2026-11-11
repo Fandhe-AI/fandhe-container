@@ -26,14 +26,19 @@ use std::time::Duration;
 
 use super::frame::{
     DialErrorCode, DialRequest, DialRequestFrame, DialResponse, DialResponseFrame, FRAME_LEN,
+    MAX_CONNECT_TIMEOUT_MS,
 };
 use super::verify::{DialExpectation, DialedSocketError, NsId, verify_dialed_socket};
 use crate::error::{NetError, NetErrorCode};
 use crate::sys::holder as sysh;
 use crate::sys::{self, Deadline, Readiness, SysError};
 
-/// 応答を待つ期限の上限（helper の connect 期限の上限 `MAX_CONNECT_TIMEOUT_MS` に余裕を足した値。REPAIR-5）。
-pub const MAX_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+/// helper の recv・setns・harden に見込む余裕（REPAIR-5）。応答待ちは helper がこれらを終えた後の connect から始まる。
+const RESPONSE_MARGIN: Duration = Duration::from_secs(5);
+
+/// 応答を待つ期限の上限（helper の connect 期限の上限 `MAX_CONNECT_TIMEOUT_MS` に `RESPONSE_MARGIN`（5 秒）を足した値。REPAIR-5）。
+pub const MAX_RESPONSE_TIMEOUT: Duration =
+    Duration::from_millis(MAX_CONNECT_TIMEOUT_MS as u64).saturating_add(RESPONSE_MARGIN);
 
 /// errno の分類。`netns_holder::holder::classify` と同じ写像（あちらは `pub(super)` で別モジュールのため、
 /// 2 か所の写像を共有する下位モジュールを作らず複製する。差が出たら両方を直す）。
@@ -474,6 +479,13 @@ mod tests {
         drop(child);
         let e = failure_of(&ch, 1, Duration::from_secs(2)).unwrap_err();
         assert_eq!(e.failure(), NetnsDialFailure::HelperExited);
+    }
+
+    /// REPAIR-5(#4480): 応答待ちの上限は helper の connect 上限より大きい（親が先に TimedOut にならない）。
+    #[test]
+    fn repair5_4480_response_timeout_exceeds_connect_max() {
+        assert_eq!(MAX_RESPONSE_TIMEOUT, Duration::from_secs(15));
+        assert!(MAX_RESPONSE_TIMEOUT > Duration::from_millis(u64::from(MAX_CONNECT_TIMEOUT_MS)));
     }
 
     /// REPAIR-5(#4480): 期限は `(0, MAX_RESPONSE_TIMEOUT]` に限る。

@@ -18,7 +18,7 @@
 //! 注入しない構成では 501 のまま。Exec は #680（TASK-63.2）の [`exec::ExecStreamHandler`] が同じ SPDY codec・
 //! 交渉を使って実装済みだが、stdio を持つ起動役 [`exec::ExecStreamLauncher`] の本番の実装は無く、
 //! plugin-cri からの注入も後続である。PortForward は #682（TASK-63.4）が実装し、NODE ネットワークの pod だけ plugin-cri が
-//! 本番の dialer を注入する（#3755）。POD ネットワークの pod は `UNIMPLEMENTED`（#3766）。
+//! 本番の dialer を注入する（#3755）。POD ネットワークの pod は、`supports_pod_network` が真の dialer を注入した構成（本番は plugin-cri の保持役のある構成の `PodNetnsDialer`。#3766・#4486）だけ結線し、それ以外は `UNIMPLEMENTED`。
 //!
 //! ## 安全側の既定
 //!
@@ -462,7 +462,7 @@ impl TokenCache {
 /// 既定（[`Default`]）はどの種別も未結線で、宣言していない種別は出ない（fail-closed）。
 ///
 /// 種別ごとの結線の有無に加え、attach が stdin・tty を受けるか（`attach_interactive`。#3763）と、PortForward が
-/// POD ネットワークの pod にも対応するか（`port_forward_pod_network`。既定は偽で POD は `UNIMPLEMENTED`。#3755・#3766）を持つ。
+/// POD ネットワークの pod にも対応するか（`port_forward_pod_network`。既定は偽で POD は `UNIMPLEMENTED`。#3755・#3766・#4486）を持つ。
 /// exec が tty・相対 `argv[0]` を受けるか（`exec_tty`・`exec_relative_command`。いずれも既定 `false`。#3761）も持ち、
 /// 受けないものは RPC 時に `INVALID_ARGUMENT` で断る（URL を返してから失敗させない。CRI-6・REPAIR-3）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

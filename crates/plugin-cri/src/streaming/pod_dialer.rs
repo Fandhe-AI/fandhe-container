@@ -3,7 +3,7 @@
 //!
 //! 呼び出し元: cri の `PortForwardHandler` が `spawn_blocking` 上で `dial` を呼ぶ。`streaming::ProductionPortForward::pod_network` が
 //! 保持役がある構成（Linux・非 root）だけで結線し（#4486。`supports_pod_network` は真）、保持役が無い構成は結線されず POD の PortForward は
-//! RPC 時に `UNIMPLEMENTED` のまま。実 helper を通す実機の段 F は #4487。
+//! RPC 時に `UNIMPLEMENTED` のまま。実 helper を通す実機の段 F は `tests/cri_exec_real.rs` で照合済み（#4487）。
 //! NODE の target は `NodeLoopbackDialer` へ委ねる。
 //!
 //! # 手順（POD。順序は変えない）

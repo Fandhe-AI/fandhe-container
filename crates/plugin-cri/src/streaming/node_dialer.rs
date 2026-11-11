@@ -11,7 +11,7 @@
 //!
 //! # POD ネットワーク（REPAIR-3）
 //! 本 dialer は POD の target を `UNIMPLEMENTED` で断る（RPC 時にも cri が断る多層防御）。pod の netns 内の loopback への
-//! 接続は `PodNetnsDialer`（#4484。保持役の fd と `netns-dial` helper）が担い、結線は #4486 で済み（`ProductionPortForward::pod_network`）。
+//! 接続は `PodNetnsDialer`（#4484。保持役の fd と `netns-dial` helper）が担い、結線は #4486 で済み（`ProductionPortForward::pod_network`）、実機の通しは `tests/cri_exec_real.rs` の段 F で照合済み（#4487）。
 //!
 //! # 残余
 //! hostNetwork の pod の port-forward はホストの loopback 上の任意のサービスへ届く。これは hostNetwork の性質で、

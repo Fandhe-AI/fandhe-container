@@ -12,7 +12,7 @@
 //! 転送先（サンドボックスのネットワーク名前空間内のポート）への TCP 接続は [`PortForwardDialer`] に切り出した。
 //! cri は名前空間の具象（setns・pod ネットワークの保持役）を知らない層のため、cri は接続の注入点と中継までを
 //! 持つ。本番の dialer は NODE ネットワーク（hostNetwork）の pod だけ plugin-cri が実装する（#3755）。
-//! POD ネットワークの pod は保持役（#2877）と helper 方式（#3766）まで `UNIMPLEMENTED` である（REPAIR-3）。
+//! POD ネットワークの pod は、`supports_pod_network` が真の dialer を注入した構成だけ結線する。本番は plugin-cri の `PodNetnsDialer`（保持役〔#2877〕の fd と helper 方式。#3766 の子 issue・#4484・#4486）で、Linux・非 root で保持役を注入した構成に限る。注入しない構成の POD は `UNIMPLEMENTED` のまま（REPAIR-3）。
 //! 既定でホストの `127.0.0.1` へつなぐ実装は cri には置かない（URL を知る者にホストのローカルサービスを
 //! 晒す経路になるため。NODE に限って plugin-cri だけが置く）。
 //!
@@ -74,7 +74,7 @@ const MAX_ROUNDS: usize = 64;
 pub enum PortForwardNetwork {
     /// host の network namespace を使う pod。host の loopback へ接続する。
     Node,
-    /// pod 専用の network namespace を使う pod。保持役の記録（`pod_holder`）が無ければ `FAILED_PRECONDITION`。plugin-cri の結線（#4486）まで未結線は `UNIMPLEMENTED`（#3766）。
+    /// pod 専用の network namespace を使う pod。保持役の記録（`pod_holder`）が無ければ `FAILED_PRECONDITION`。POD 対応の dialer（`supports_pod_network` が真。本番は plugin-cri の `PodNetnsDialer`。#4486）を注入しない構成は `UNIMPLEMENTED`（#3766）。
     Pod,
 }
 

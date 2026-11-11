@@ -90,7 +90,8 @@ pub(super) fn classify_connect_error(e: &io::Error) -> DialErrorCode {
 }
 
 /// 参加と特権の破棄の継ぎ目。本番は [`RealJoiner`]。不可逆な操作（setns・capset・NNP・non-dumpable）を
-/// libtest の試験バイナリで実行しないために分ける（実機の経路は #4480 の `netns_dial_userns` が担う）。
+/// libtest の試験バイナリで実行しないために分ける（実プロセスの経路は結合試験 `netns_dial_process`、実 namespace への
+/// 参加は実機前提の `netns_dial_userns` が担う）。
 pub(super) trait Joiner {
     /// `setns(user)` → `setns(net)` の順に参加し、参加後の識別を `received` と照合し、fd を閉じる。
     fn join(&mut self, user: OwnedFd, net: OwnedFd, received: NsPair) -> Result<(), DialErrorCode>;

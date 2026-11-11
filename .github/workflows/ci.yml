@@ -1562,6 +1562,27 @@ jobs:
             --log "${log}" --select '^netns_holder_userns: holder joined' \
             --forbid 'netns_holder_userns: ignored' --forbid 'not applicable' --forbid 'FAILED' --summary
 
+      # netns_dial_userns（`crates/net/tests/netns_dial_userns.rs`。CRI-6・NET-3・SEC-1・REPAIR-5・REPAIR-12・#4479）:
+      # netns-dial helper が非特権の user + network namespace へ参加して特権を捨て、その中から connect する（親の
+      # listener へは繋がらない）ことを照合する実機前提テスト（harness = false）。上で緩和した sysctl を使い回し、
+      # 新しい check-run・sudo・permissions は追加しない（rootless のみ）。成功行は試験ソースから導出して照合する。
+      - name: netns_dial_userns のビルド（実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: cargo test -p fandhe-container-net --test netns_dial_userns --no-run
+
+      - name: netns_dial_userns の実行（実機前提テスト・--ignored。CRI-6・NET-3・SEC-1・#4479）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/netns_dial_userns.log"
+          scripts/run-with-deadline.sh --name netns_dial_userns --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-net --test netns_dial_userns -- --ignored
+          scripts/check-success-lines.sh --name netns_dial_userns --src crates/net/tests/netns_dial_userns.rs \
+            --log "${log}" --select '^netns_dial_userns: helper joined' \
+            --forbid 'netns_dial_userns: ignored' --forbid 'not applicable' --forbid 'FAILED' --summary
+
       # netns_holder_launch_userns（`crates/supervisor/tests/netns_holder_launch_userns.rs`。NET-9・CORE-1・CORE-6・SUP-12・SEC-5・
       # REPAIR-5・#3198）: supervisor の本番の spawn（`netns_holder::spawn_netns_holder`）で起動した holder が非特権の
       # user + network namespace へ参加し、fd・環境・capability が最小で、supervisor のメモリを継承せず（陽性対照つき）、

@@ -52,6 +52,13 @@ compile_error!(
     "the `netns-holder-test-support` feature exposes raw frame injection and must not be enabled in release builds"
 );
 
+// 試験専用の入口（netns-dial helper へ任意のバイト列・fd を送る `netns_dial::test_support`）を製品のリリースビルドへ
+// 入れない（CRI-6・NET-3・SEC-1・#4479）。
+#[cfg(all(feature = "netns-dial-test-support", not(debug_assertions)))]
+compile_error!(
+    "the `netns-dial-test-support` feature exposes raw frame injection and must not be enabled in release builds"
+);
+
 // dns-helper の後始末・回収の期限を短縮する試験専用の入口（NET-5・REPAIR-5・#3508・#3559）。
 #[cfg(all(feature = "dns-helper-test-support", not(debug_assertions)))]
 compile_error!(

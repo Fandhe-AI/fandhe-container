@@ -47,6 +47,9 @@ pub fn run_netns_dial_main(args: impl Iterator<Item = OsString>) -> ExitCode {
 pub mod frame;
 #[cfg(target_os = "linux")]
 mod helper;
+#[cfg(all(target_os = "linux", feature = "netns-dial-test-support"))]
+#[doc(hidden)]
+pub mod test_support;
 #[cfg(target_os = "linux")]
 pub mod verify;
 

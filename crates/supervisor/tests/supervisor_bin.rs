@@ -332,3 +332,22 @@ fn sup1_repair4_bin_saves_structured_log_under_state_root() {
     let _ = run_with_pipe(bin().args(args(&env.root, "nope")).stderr(Stdio::null()));
     assert!(!dir.join("nope.log").exists());
 }
+
+/// CRI-6・SEC-1・#4482: bin の第 1 引数 `netns-dial` が net の helper へ振り分けられる（`main.rs` の結線を実プロセスで
+/// 確かめる）。余分な引数は helper の argv 検査で終了コード 2。`run_main` へ回っていれば stdout に `FCSUP1 ERR` が出る。
+#[test]
+fn cri6_bin_dispatches_netns_dial_and_rejects_extra_args() {
+    let (code, stdout, stderr) = run_with_pipe(bin().args(["netns-dial", "extra"]));
+    assert_eq!(code, Some(2), "stdout={stdout:?} stderr={stderr:?}");
+    assert!(stdout.is_empty(), "stdout={stdout:?}");
+    assert!(stderr.is_empty(), "stderr={stderr:?}");
+}
+
+/// CRI-6・SEC-1・#4482: stdin が `SOCK_SEQPACKET` でなければ、helper は応答せず終了コード 1 で終わる。
+#[test]
+fn cri6_bin_dispatches_netns_dial_and_refuses_non_seqpacket_stdin() {
+    let (code, stdout, stderr) = run_with_pipe(bin().arg("netns-dial"));
+    assert_eq!(code, Some(1), "stdout={stdout:?} stderr={stderr:?}");
+    assert!(stdout.is_empty(), "stdout={stdout:?}");
+    assert!(stderr.is_empty(), "stderr={stderr:?}");
+}

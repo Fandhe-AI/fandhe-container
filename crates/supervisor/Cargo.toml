@@ -1,6 +1,7 @@
 # コンテナごとの軽量監視プロセス（restart・healthcheck・exec・logs・stats。crate-naming.md の表 #3）。
 # 雛形は TASK-1.3（#11・REPAIR-1・MS-0）。本体は G12（TASK-157〜171）で実装する。
 # version は未指定（Cargo の既定で 0.0.0）。公開方針は未決定のため publish = false を明記する。
+# #4482 で bin の netns-dial の振り分け（src/netns_dial.rs）を追加した（依存は不変）。
 # #3760 で stream-exec helper の本体（src/stream_exec/helper.rs）と実機前提の結合試験 stream_exec_real を追加した（依存は不変）。
 # #4100 で stream-exec の channel の `PtyMaster` の受信を core の `PtyMaster::from_received` で検証するようにした（依存は不変）。
 # #3759 で stream-exec の channel の codec（src/stream_exec）と sys の複数 fd 送信を追加した（依存は不変）。

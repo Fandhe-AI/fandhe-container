@@ -42,6 +42,13 @@ fn main() -> std::process::ExitCode {
     if fandhe_container_supervisor::pod_holder::is_pod_holder_invocation(first.as_deref()) {
         return fandhe_container_supervisor::pod_holder::run_pod_holder_main(args);
     }
+    // 第 1 引数が `netns-dial` なら POD の PortForward 用 helper へ振り分ける（CRI-6・NET-3・SEC-1・#4482）。
+    // 同じ位置・同じ理由（結果を fd 0 の `SOCK_SEQPACKET` の固定長 frame で返すため `run_main` の fd 検証・結果チャネルを
+    // 通さない）。`setns(user)` は単一スレッドが要るので、スレッドを作る処理より前に置く。
+    // 特権ランチャーは `StartArgs::parse` を通った argv だけを転送するので、この分岐の入口にはならない。
+    if fandhe_container_supervisor::netns_dial::is_netns_dial_invocation(first.as_deref()) {
+        return fandhe_container_net::netns_dial::run_netns_dial_main(args);
+    }
     fandhe_container_supervisor::start_entry::run_main(first.into_iter().chain(args))
 }
 

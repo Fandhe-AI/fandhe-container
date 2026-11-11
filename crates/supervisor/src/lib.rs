@@ -86,6 +86,7 @@ pub mod launcher_probe;
 pub mod log_pipeline;
 pub mod logs;
 pub mod net_error;
+pub mod netns_dial;
 #[cfg(target_os = "linux")]
 pub mod netns_holder;
 #[cfg(target_os = "linux")]

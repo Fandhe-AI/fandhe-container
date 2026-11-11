@@ -29,25 +29,23 @@ fn nsid(f: &File) -> NsId {
     }
 }
 
-/// 一意な一時ディレクトリ（drop で削除）。
-struct Scratch(PathBuf);
+// 期限つき回収の正本（排他作成の 0700 親＋共有 flock。#2840・#2887・REPAIR-12）を core の試験補助から取り込む。
+#[path = "../../../../core/tests/support/scratch_root.rs"]
+mod scratch_root;
+
+/// 一意な一時ディレクトリ。排他作成した保護済みの親を `ScratchDir` が持ち、作成した pid でだけ drop で消す。
+struct Scratch(scratch_root::ScratchDir);
 
 impl Scratch {
     fn new(tag: &str) -> Self {
-        static N: AtomicUsize = AtomicUsize::new(0);
-        let p = std::env::temp_dir().join(format!(
-            "fc-poddialer-{tag}-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::SeqCst)
-        ));
-        std::fs::create_dir_all(&p).expect("mkdir");
-        Self(p)
+        Self(scratch_root::ScratchDir::new(
+            &format!("fc-poddialer-{tag}"),
+            Duration::from_secs(10),
+        ))
     }
-}
 
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+    fn path(&self) -> &Path {
+        self.0.path()
     }
 }
 
@@ -252,7 +250,7 @@ fn wait_until(d: Duration, mut f: impl FnMut() -> bool) -> bool {
 fn cri6_4484_node_target_delegates_to_loopback() {
     let s = Scratch::new("node");
     let sp = std::sync::Arc::new(FakeSpawner::new(Reply::Silent));
-    let (d, src) = dialer(FakeSource::new(&s.0, &[]), &sp);
+    let (d, src) = dialer(FakeSource::new(s.path(), &[]), &sp);
     let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
     let port = l.local_addr().expect("addr").port();
     let c = d
@@ -272,7 +270,7 @@ fn cri6_4484_node_target_delegates_to_loopback() {
 fn cri6_4484_invalid_port_and_timeout_do_not_spawn() {
     let s = Scratch::new("inval");
     let sp = std::sync::Arc::new(FakeSpawner::new(Reply::Silent));
-    let (d, src) = dialer(FakeSource::new(&s.0, &["a"]), &sp);
+    let (d, src) = dialer(FakeSource::new(s.path(), &["a"]), &sp);
     assert_eq!(
         err_of(d.dial(&pod("a"), 0, T5)),
         (CriErrorCode::InvalidArgument, MSG_PORT_RANGE.to_owned())
@@ -321,7 +319,7 @@ fn cri6_sec1_4484_missing_holder_is_unavailable_without_fallback() {
 fn sec1_net3_4484_own_namespace_is_rejected_before_spawn() {
     let s = Scratch::new("own");
     let sp = std::sync::Arc::new(FakeSpawner::new(Reply::Silent));
-    let mut src = FakeSource::new(&s.0, &["n", "u"]);
+    let mut src = FakeSource::new(s.path(), &["n", "u"]);
     src.own_net = vec!["n".into()];
     src.own_user = vec!["u".into()];
     let (d, _src) = dialer(src, &sp);
@@ -340,7 +338,7 @@ fn sec1_net3_4484_own_namespace_is_rejected_before_spawn() {
 fn sec1_4484_recorded_identity_mismatch_is_rejected() {
     let s = Scratch::new("skew");
     let sp = std::sync::Arc::new(FakeSpawner::new(Reply::Silent));
-    let mut src = FakeSource::new(&s.0, &["a"]);
+    let mut src = FakeSource::new(s.path(), &["a"]);
     src.skew_net = vec!["a".into()];
     let (d, _src) = dialer(src, &sp);
     assert_eq!(
@@ -355,7 +353,7 @@ fn sec1_4484_recorded_identity_mismatch_is_rejected() {
 fn repair5_4484_insufficient_budget_times_out_without_spawn() {
     let s = Scratch::new("budget");
     let sp = std::sync::Arc::new(FakeSpawner::new(Reply::Silent));
-    let (d, src) = dialer(FakeSource::new(&s.0, &["a"]), &sp);
+    let (d, src) = dialer(FakeSource::new(s.path(), &["a"]), &sp);
     assert_eq!(
         err_of(d.dial(&pod("a"), 80, Duration::from_millis(1500))),
         (CriErrorCode::Timeout, MSG_TIMED_OUT.to_owned())
@@ -369,7 +367,7 @@ fn repair5_4484_insufficient_budget_times_out_without_spawn() {
 fn repair5_4484_silent_helper_times_out_and_is_reaped() {
     let s = Scratch::new("silent");
     let sp = std::sync::Arc::new(FakeSpawner::new(Reply::Silent));
-    let (d, _src) = dialer(FakeSource::new(&s.0, &["a"]), &sp);
+    let (d, _src) = dialer(FakeSource::new(s.path(), &["a"]), &sp);
     let started = Instant::now();
     assert_eq!(
         err_of(d.dial(&pod("a"), 80, Duration::from_millis(1600))),
@@ -390,7 +388,7 @@ fn repair5_4484_silent_helper_times_out_and_is_reaped() {
 fn sec1_net3_4484_host_netns_socket_is_rejected() {
     let s = Scratch::new("host");
     let sp = std::sync::Arc::new(FakeSpawner::new(Reply::ConnectedHost));
-    let (d, _src) = dialer(FakeSource::new(&s.0, &["a"]), &sp);
+    let (d, _src) = dialer(FakeSource::new(s.path(), &["a"]), &sp);
     let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
     let port = l.local_addr().expect("addr").port();
     assert_eq!(
@@ -413,7 +411,7 @@ fn sec1_sec5_4484_pod_a_and_b_send_their_own_namespaces() {
     let sp = std::sync::Arc::new(FakeSpawner::new(Reply::Frame(DialResponse::Error(
         DialErrorCode::Refused,
     ))));
-    let (d, src) = dialer(FakeSource::new(&s.0, &["a", "b"]), &sp);
+    let (d, src) = dialer(FakeSource::new(s.path(), &["a", "b"]), &sp);
     for (id, port) in [("a", 8080u16), ("b", 9090u16)] {
         assert_eq!(
             err_of(d.dial(&pod(id), port, T5)),
@@ -474,7 +472,7 @@ fn cri6_repair4_4484_helper_failures_map_to_fixed_errors() {
     for (reply, code, msg) in cases {
         let s = Scratch::new("map");
         let sp = std::sync::Arc::new(FakeSpawner::new(reply));
-        let (d, _src) = dialer(FakeSource::new(&s.0, &["a"]), &sp);
+        let (d, _src) = dialer(FakeSource::new(s.path(), &["a"]), &sp);
         assert_eq!(err_of(d.dial(&pod("a"), 80, T5)), (code, msg.to_owned()));
     }
 }
@@ -486,7 +484,7 @@ fn repair5_4484_retained_limit_returns_resource_exhausted() {
     let sp = std::sync::Arc::new(FakeSpawner::new(Reply::Frame(DialResponse::Error(
         DialErrorCode::Refused,
     ))));
-    let (d, src) = dialer(FakeSource::new(&s.0, &["a"]), &sp);
+    let (d, src) = dialer(FakeSource::new(s.path(), &["a"]), &sp);
     for _ in 0..MAX_RETAINED_DIAL_HELPERS {
         d.push_retained_for_test(sleeper().stdin(Stdio::null()).spawn().expect("spawn"));
     }
@@ -556,6 +554,6 @@ fn cri6_4484_netns_dial_command_has_fixed_argv_and_cwd() {
 fn cri6_4484_supports_pod_network() {
     let s = Scratch::new("supports");
     let sp = std::sync::Arc::new(FakeSpawner::new(Reply::Silent));
-    let (d, _src) = dialer(FakeSource::new(&s.0, &[]), &sp);
+    let (d, _src) = dialer(FakeSource::new(s.path(), &[]), &sp);
     assert!(d.supports_pod_network());
 }

@@ -82,6 +82,10 @@
 - rootful の pod netns（#2241）
 - 再起動をまたぐ sandbox の再採用（TASK-59。設計は [cri-record-readoption.md](cri-record-readoption.md)・#2902）
 
+## PortForward との関係（#3766）
+
+保持役は変えない（待機だけのまま）。POD の PortForward は、plugin-cri が自分の表の保持役の pid から user・net の fd を開き、単一スレッドの helper（`netns-dial`）へ渡して `127.0.0.1:<port>` へ接続させる。設計は [cri-streaming-server.md](cri-streaming-server.md) の「POD ネットワークの PortForward の設計（#3766）」。
+
 ## セキュリティ上の要点
 
 - 別 pod の userns の受理: core の認可だけでは防げない（#2776）。パスは自 sandbox の記録の pid からだけ作り、CRI リクエストの値（annotations・config の文字列）からは作らない。pod A / B の取り違えが無い結合試験を必須にする

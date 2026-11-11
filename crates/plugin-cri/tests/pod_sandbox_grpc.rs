@@ -289,7 +289,7 @@ async fn cri2_h6_injected_pod_holder_fails_closed_without_supervisor_bin() {
             .expect_err("holder cannot start without the supervisor bin");
         assert!(
             st.message()
-                .contains("pod holder executable is not trusted or not readable"),
+                .contains("supervisor executable is not trusted or not readable"),
             "{}",
             st.message()
         );

@@ -6,7 +6,10 @@
 //! （spawn から `wait_timeout` までの経路で止まるとハンドル返却と期限管理が効かない。PR #1683 の P0）。
 //! そのため `crate::sys::send_nonblocking_unix`（`MSG_DONTWAIT | MSG_NOSIGNAL` の `send(2)` 1 回）で、待たないと
 //! 保証できる出力先にだけ書き、それ以外は書かずに捨てる（fail-closed）。方式は plugin の `write_nonblocking`
-//! （#1605）と揃えた。出力先を広げる課題は #1673（plugin 側の方針）と同じ判断に従う。
+//! （#1605）と揃えた。出力先を広げる課題は #1673（plugin 側の方針。
+//! 延期表は PR #1757 で入り closed）の前例に倣うが、core の本経路は延期表を持たず、待たない保証の無い出力先では
+//! 捨てる方針を続ける（#4493）。`state_store` の `@lock` の unlock 失敗を非 Linux で記録しない判断（方式 (B)）の
+//! 詳細は `state_store` の `report_lock_release_to` の doc を参照。
 //!
 //! 呼び出し元: `devices.rs` の `emit_devpts_gid_omitted`（fork した子の `create_default_devices`）、
 //! `process.rs` の `ContainerChild::spawned`（fork 直後の親）。supervisor の `log_entrypoint_mode` の載せ替えは

@@ -25,7 +25,7 @@
 //! - READY の内容（pid・user / ipc / net の `NsId`）は表に保存する。`open_pod_namespaces`（#4483・SEC-5・SEC-1）は
 //!   1 回のロック区間で死活確認・`/proc/<pid>/ns/{user,net}` の open・開いた fd の (dev, ino) と記録の照合を行い、
 //!   不在・解放中・終了済み・不一致は `UNAVAILABLE` で fail-closed。区間内は非ブロッキングの syscall だけで、子は回収しない。
-//! - supervisor の bin の解決・検査は `open_supervisor_beside` に共通化し、後続の netns-dial helper（#4484）が共有する。
+//! - supervisor の bin の解決・検査は `open_supervisor_beside` に共通化し、保持役・netns-dial helper（#4484）・stream-exec helper と supervisor の直接起動（#4499）が共有する。
 //!
 //! # 未実装・簡易実装（REPAIR-3）
 //! `open_pod_namespaces` の利用側（`PodNetnsDialer`）は実装済み（#4484）で、PortForward への結線は #4486 で済み（`ProductionPortForward::pod_network`）。
@@ -37,9 +37,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
-use std::path::Path;
-#[cfg(any(test, feature = "pod-holder-test-support"))]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -67,10 +65,13 @@ const POLL_STEP: Duration = Duration::from_millis(10);
 
 const MSG_TOO_MANY: &str = "too many pod holders are tracked";
 const MSG_ROOTFUL: &str = "the pod namespace holder requires a non-root plugin process";
-const MSG_UNTRUSTED_EXE: &str = "pod holder executable is not trusted or not readable";
+/// supervisor の bin の検査に落ちたときの固定文言（保持役・netns-dial・stream-exec・直接起動で共通。パス・uid を含めない）。
+pub(crate) const MSG_UNTRUSTED_EXE: &str = "supervisor executable is not trusted or not readable";
 /// `sys::O_NONBLOCK` が無い組で bin の open を拒否するときの固定文言（パス・errno・アーキ名を含めない。REPAIR-4）。
-const MSG_NONBLOCK_UNSUPPORTED: &str =
-    "pod holder executable cannot be opened without blocking on this platform";
+pub(crate) const MSG_NONBLOCK_UNSUPPORTED: &str =
+    "supervisor executable cannot be opened without blocking on this platform";
+/// plugin の実体の親が解決できないときの固定文言。
+pub(crate) const MSG_UNRESOLVED_EXE: &str = "cannot resolve the supervisor executable path";
 const MSG_DUPLICATE: &str = "a pod holder already exists for this sandbox";
 const MSG_PID_MISMATCH: &str = "the pod holder reported an unexpected process";
 const MSG_NS_MISMATCH: &str = "the pod holder namespaces do not match the report";
@@ -167,7 +168,12 @@ pub(crate) struct VerifiedSupervisorExe {
 impl VerifiedSupervisorExe {
     /// 検証した fd を `/proc/self/fd/N` として exec する Command（検証後のパス再解決を避ける）。
     pub(crate) fn command(&self) -> Command {
-        Command::new(format!("/proc/self/fd/{}", self.file.as_raw_fd()))
+        Command::new(self.exec_path())
+    }
+
+    /// 検証した fd の `/proc/self/fd/N`（呼び出し側は exec が終わるまでこのガードを保持する）。
+    pub(crate) fn exec_path(&self) -> PathBuf {
+        PathBuf::from(format!("/proc/self/fd/{}", self.file.as_raw_fd()))
     }
 }
 
@@ -190,8 +196,12 @@ pub(crate) fn open_supervisor_beside() -> Result<VerifiedSupervisorExe, TraitErr
 }
 
 /// [`open_supervisor_beside`] の本体（試験で exe と euid を注入する）。
-fn open_supervisor_beside_at(exe: &Path, euid: u32) -> Result<VerifiedSupervisorExe, TraitError> {
-    let program = holder_executable_beside(exe)?;
+pub(crate) fn open_supervisor_beside_at(
+    exe: &Path,
+    euid: u32,
+) -> Result<VerifiedSupervisorExe, TraitError> {
+    let program = holder_executable_beside(exe)
+        .map_err(|_| TraitError::new(ErrorCode::FailedPrecondition, MSG_UNRESOLVED_EXE))?;
     check_ancestors_trust(&program, euid)?;
     let file = open_trusted_executable(&program, euid)?;
     Ok(VerifiedSupervisorExe { file })
@@ -698,7 +708,7 @@ fn open_trusted_executable_with(
 
 /// bin の祖先ディレクトリの検査: すべて所有者が root か `euid`で group / other に書き込み不可（別ユーザーが
 /// 祖先を書き換えて bin を差し替えられないこと。PLUG-11）。symlink は辿った先を見る。
-fn check_ancestors_trust(path: &Path, euid: u32) -> Result<(), TraitError> {
+pub(crate) fn check_ancestors_trust(path: &Path, euid: u32) -> Result<(), TraitError> {
     let bad = || TraitError::new(ErrorCode::FailedPrecondition, MSG_UNTRUSTED_EXE);
     let real = std::fs::canonicalize(path).map_err(|_| bad())?;
     for dir in real.ancestors().skip(1) {
@@ -717,7 +727,7 @@ fn check_ancestors_trust(path: &Path, euid: u32) -> Result<(), TraitError> {
 }
 
 /// 実効 uid（`/proc/self/status`）。root（real か effective が 0）なら 0 を返す。読めなければ `Err`。
-fn current_euid() -> Result<u32, ()> {
+pub(crate) fn current_euid() -> Result<u32, ()> {
     use std::io::Read as _;
     let mut text = String::new();
     std::fs::File::open("/proc/self/status")
@@ -743,3 +753,75 @@ pub(crate) fn inject_for_current_process() -> bool {
 
 #[cfg(test)]
 mod tests;
+/// supervisor の bin の検査を試験する共通の足場（stream-exec helper の起動と supervisor の直接起動の単体試験が使う。#4499）。
+#[cfg(test)]
+pub(crate) mod bin_fixture {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::path::PathBuf;
+
+    use fandhe_container_core::traits::ErrorCode;
+    use fandhe_container_supervisor::pod_holder::holder_executable_beside;
+
+    /// 一時ディレクトリ（0755）と、その中の plugin の実体のパス・隣の supervisor のパス。
+    pub(crate) struct BinFixture {
+        pub(crate) dir: PathBuf,
+        pub(crate) exe: PathBuf,
+        pub(crate) sup: PathBuf,
+        /// 排他作成（残骸を消さず別名へ退避）したディレクトリの所有。Drop で自分の分だけ消す（#4499）。
+        _guard: crate::test_root::TestRoot,
+    }
+
+    impl BinFixture {
+        pub(crate) fn new(tag: &str) -> Self {
+            let guard = crate::test_root::test_root("fc-bin4499", tag);
+            let dir: PathBuf = guard.to_path_buf();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+            let exe = dir.join("plugin");
+            let sup = holder_executable_beside(&exe).expect("beside");
+            Self {
+                dir,
+                exe,
+                sup,
+                _guard: guard,
+            }
+        }
+
+        /// 隣の固定名へ ELF（`true`）の複製を `mode` で置く（`/proc/self/fd/N` の exec は `#!` を実行できないため ELF）。
+        pub(crate) fn place_elf(&self, mode: u32) {
+            let src = std::fs::canonicalize("/usr/bin/true").expect("true");
+            let _ = std::fs::remove_file(&self.sup);
+            std::fs::copy(src, &self.sup).expect("copy");
+            std::fs::set_permissions(&self.sup, std::fs::Permissions::from_mode(mode))
+                .expect("chmod");
+        }
+
+        /// 隣の固定名へ FIFO（open がブロックし得る種別）を置く。
+        pub(crate) fn place_fifo(&self) {
+            let _ = std::fs::remove_file(&self.sup);
+            let ok = std::process::Command::new("mkfifo")
+                .arg(&self.sup)
+                .status()
+                .expect("mkfifo")
+                .success();
+            assert!(ok);
+            std::fs::set_permissions(&self.sup, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+
+        pub(crate) fn set_dir_mode(&self, mode: u32) {
+            std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(mode))
+                .expect("chmod");
+        }
+
+        /// 祖先（一時ディレクトリの上位）が検査を通る環境か。通らない環境では成功系を要求しない。
+        pub(crate) fn ancestors_ok(&self, euid: u32) -> bool {
+            super::check_ancestors_trust(&self.sup, euid).is_ok()
+        }
+    }
+
+    /// 拒否の区分と固定文言を照合する。
+    pub(crate) fn assert_untrusted(code: ErrorCode, msg: &str) {
+        assert_eq!(code, ErrorCode::FailedPrecondition);
+        assert_eq!(msg, super::MSG_UNTRUSTED_EXE);
+    }
+}

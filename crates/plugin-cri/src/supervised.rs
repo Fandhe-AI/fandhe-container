@@ -40,6 +40,12 @@
 //! # 未実装・簡易実装（REPAIR-3）
 //! - supervisor の実行ファイルは plugin-cri の実体パス（`current_exe()`）と同じディレクトリの固定名から解決する
 //!   （`PATH` 探索・環境変数・引数による上書きは作らない。`docs/setup/linux.md`）。
+//! - 直接経路（ランチャー無し）では、spawn の前に保持役・Exec と同じ基準（所有者が root か利用者・group / other 書き込み不可・
+//!   祖先の書き込み不可・通常ファイル・読み取り・`O_NONBLOCK` で open）で supervisor の bin を検査する（#4499・PLUG-11）。
+//!   残余: `systemd-run` が引数のパスで exec するため、検査から exec までに差し替えの窓が残る（Exec の helper は検証済み fd で
+//!   exec するので窓が無い）。差し替えられるのは同じ uid か root に限られ、どちらも信頼境界の内側にいる。検証済み fd を
+//!   `systemd-run` 越しに引き継ぐ方式は、安全な fd 継承の API が std に無く（`pre_exec` は事前承認の範囲外の `unsafe`）、
+//!   supervisor crate の `SupervisorLaunch` の変更も要るため採らなかった。ランチャー経由はランチャーが検証する（#1719）。
 //! - 権限モデルは CLI と同じ共有クライアントの規則: 実体の隣に信頼できるランチャーがあればランチャー経由、無ければ直接経路。
 //!   uid 0 は spawn の前に `UNIMPLEMENTED`（#2442・#2241）。
 //! - `XDG_RUNTIME_DIR` が plugin の環境に必要（将来の plugin proxy が環境を空にすると `FAILED_PRECONDITION`。#1869）。
@@ -52,6 +58,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use crate::pod_holder::{current_euid, open_supervisor_beside_at};
 use fandhe_container_core::observability::OpRecorder;
 use fandhe_container_core::oci_runtime::{
     KillTimeout, LAUNCHER_REPLY_GRACE, LifecycleOp, OciRuntimeError, ProcessSignaler, kill,
@@ -143,11 +150,51 @@ impl SupervisorStarter for ProductionStarter {
                 );
             }
         };
-        match SupervisorLaunch::resolve_beside(&exe) {
-            Ok(launch) => start_with_options(&launch, root, opts, id, production_deadline()),
-            Err(e) => (Err(e), None),
+        start_checked(
+            &exe,
+            current_euid,
+            SupervisorLaunch::resolve_beside,
+            |launch| start_with_options(launch, root, opts, id, production_deadline()),
+        )
+    }
+}
+
+/// [`ProductionStarter::start`] の本体（試験で解決・euid・起動を注入する）。
+///
+/// 順序: (1) `resolve`（`not installed`・rootful の `UNIMPLEMENTED`・ランチャーの信頼の順位と文言は従来どおり）→
+/// (2) 直接経路（ランチャーを使わない）のときだけ、spawn の前に共通口 `pod_holder::open_supervisor_beside_at` と同じ基準で
+/// 実体の隣の bin を検査する → (3) `run`。経路の判定は `resolve` が実際に選んだ結果（`uses_launcher`）に拠る。事前に別途
+/// 分類すると、分類と resolve の間でランチャーが出入りしたときに検査を飛ばす窓ができるため。ランチャー経由は
+/// ランチャーが信頼の連鎖を自分で検証する（#1719）ので足さない。検査用の fd は `run` の前に閉じる（#4499・PLUG-11・SEC-1）。
+fn start_checked(
+    exe: &Path,
+    euid: impl FnOnce() -> Result<u32, ()>,
+    resolve: impl FnOnce(&Path) -> Result<SupervisorLaunch, OciRuntimeError>,
+    run: impl FnOnce(&SupervisorLaunch) -> (Result<NonZeroU32, OciRuntimeError>, Option<Child>),
+) -> (Result<NonZeroU32, OciRuntimeError>, Option<Child>) {
+    let launch = match resolve(exe) {
+        Ok(launch) => launch,
+        Err(e) => return (Err(e), None),
+    };
+    if !launch.uses_launcher() {
+        let fail = |code, message: &str| {
+            (
+                Err(OciRuntimeError::new(LifecycleOp::Start, code, message)),
+                None,
+            )
+        };
+        let Ok(euid) = euid() else {
+            return fail(
+                ErrorCode::FailedPrecondition,
+                "cannot determine the plugin process credentials",
+            );
+        };
+        match open_supervisor_beside_at(exe, euid) {
+            Ok(verified) => drop(verified),
+            Err(e) => return fail(e.code(), e.message()),
         }
     }
+    run(&launch)
 }
 
 /// 解決済みの起動依存と受信期限を固定した起動（結合試験が偽の systemd-run・supervisor を注入する口。D11）。
@@ -656,3 +703,6 @@ fn wait_stopped(
         std::thread::sleep(remaining.min(STOP_POLL_INTERVAL));
     }
 }
+
+#[cfg(test)]
+mod tests;

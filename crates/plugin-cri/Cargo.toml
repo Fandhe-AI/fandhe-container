@@ -60,6 +60,10 @@ tokio = { workspace = true, features = ["rt", "macros", "net", "time"] }
 # 既定で無効・workspace 内 path 依存の feature 追加のみで外部依存の追加ではない）を使う。本番の依存では有効にしない。
 fandhe-container-plugin = { workspace = true, features = ["grpc", "test-support"] }
 
+# #4484: `PodNetnsDialer` の単体試験が偽の helper で SCM_RIGHTS の応答と fd を送受信するため、net の試験専用入口
+# （`netns-dial-test-support`。workspace 内 path 依存の feature 追加のみで外部依存の追加ではない。本番の依存では有効にしない）を使う。
+fandhe-container-net = { path = "../net", features = ["netns-dial-test-support"] }
+
 [[test]]
 name = "peer_auth_audit_delivery"
 path = "tests/peer_auth_audit_delivery.rs"

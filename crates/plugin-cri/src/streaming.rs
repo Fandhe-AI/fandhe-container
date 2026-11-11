@@ -8,8 +8,9 @@
 //! 結線済みは Attach（Linux は完全版〔`supervisor_attach::SupervisorAttachBackend`。kind 9 の tap と fd の受け取り。#4077〕で、
 //! stdin・tty・resize を扱い、RPC 時の整合検査は cri の `attach_impl`〔D7。#4078〕。実機の通しは `tests/cri_attach_real.rs`（#4079）。非 Linux は
 //! 読み取り専用の [`log_attach::LogFollowAttachBackend`]〔回転ログの follow。#3763〕で、stdin・tty は RPC 時に `INVALID_ARGUMENT`）と、PortForward の NODE ネットワーク（hostNetwork）の pod
-//! （#3755。[`NodeLoopbackDialer`]）。POD ネットワークの pod は RPC 時（cri）と dialer の両方で `UNIMPLEMENTED` で、
-//! 保持役（#2877）と helper 方式（#3766）まで続く。Exec は Linux で結線済み（`exec_launcher::SupervisorExecLauncher`。
+//! （#3755。[`NodeLoopbackDialer`]）。POD ネットワークの pod は RPC 時（cri）と [`NodeLoopbackDialer`] の両方で `UNIMPLEMENTED` のまま。
+//! POD 向けの本体 `PodNetnsDialer`（Linux。保持役の fd と `netns-dial` helper で pod の netns 内へ接続。#4484）は実装済みだが、
+//! `production_stream_dispatcher` への結線と `supports_pod_network` の有効化は #4486。Exec は Linux で結線済み（`exec_launcher::SupervisorExecLauncher`。
 //! supervisor の `stream-exec` helper 経由。stdin・stdout・stderr と、tty（stdin・stdout・resize。stderr は RPC 時に `INVALID_ARGUMENT`。#4417）を扱い、相対 `argv[0]` は RPC 時に `INVALID_ARGUMENT`。#3761）で、
 //! 非 Linux は「exec streaming is not wired」の `UNIMPLEMENTED`。`wiring` は bind 時に 1 回だけ取られるため、
 //! ハンドラは必ず bind より前に足す（[`bind_production_streaming`] が順序を固定する）。
@@ -49,6 +50,9 @@ pub mod exec_launcher;
 #[cfg(target_os = "linux")]
 pub mod supervisor_attach;
 
+#[cfg(target_os = "linux")]
+mod pod_dialer;
+
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -59,6 +63,13 @@ use crate::startup::StreamingOptions;
 mod node_dialer;
 
 pub use node_dialer::NodeLoopbackDialer;
+
+#[cfg(target_os = "linux")]
+pub use pod_dialer::{
+    CONNECT_MARGIN, HELPER_EXIT_WAIT, HELPER_REAP_WAIT, KILL_REAP_RESERVE,
+    MAX_RETAINED_DIAL_HELPERS, NetnsDialSpawner, PodNamespaceSource, PodNetnsDialer,
+    SupervisorNetnsDialSpawner,
+};
 
 use fandhe_container_cri::error::CriErrorCode;
 use fandhe_container_cri::instrument::CriOpRecorder;

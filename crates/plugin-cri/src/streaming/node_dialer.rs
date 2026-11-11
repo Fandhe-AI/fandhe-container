@@ -10,8 +10,8 @@
 //! あることを多層防御として確かめる。
 //!
 //! # POD ネットワーク（REPAIR-3）
-//! pod 専用の netns へ入る保持役（#2877）と helper 方式（#3766）が入るまで `UNIMPLEMENTED`（RPC 時にも cri が
-//! 断る。ここは多層防御）。将来は pod の netns 内の loopback へ接続する。
+//! 本 dialer は POD の target を `UNIMPLEMENTED` で断る（RPC 時にも cri が断る多層防御）。pod の netns 内の loopback への
+//! 接続は `PodNetnsDialer`（#4484。保持役の fd と `netns-dial` helper）が担い、結線は #4486。
 //!
 //! # 残余
 //! hostNetwork の pod の port-forward はホストの loopback 上の任意のサービスへ届く。これは hostNetwork の性質で、

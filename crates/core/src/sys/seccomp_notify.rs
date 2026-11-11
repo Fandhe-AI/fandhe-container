@@ -278,8 +278,20 @@ const CMSG_HDR_LEN: usize = core::mem::size_of::<CmsgHdr>();
 const UCRED_LEN: usize = core::mem::size_of::<Ucred>();
 
 /// `CMSG_ALIGN`（`size_t` の境界へ切り上げ）。
+///
+/// `len + 7` は桁あふれを検査しない。使ってよいのは定数か上限つきの小さな値
+/// （`cmsg_space` の引数・`CONTROL_CAP` の計算）だけで、カーネル由来の `cmsg_len` の
+/// 解析には [`checked_cmsg_align`] を使う（#4534・#4521・SEC-1）。
 const fn cmsg_align(len: usize) -> usize {
     (len + 7) & !7
+}
+
+/// `cmsg_align` の checked 版。外部入力（カーネルの `cmsg_len`）の次オフセット計算用（#4534・SEC-1・REPAIR-5）。
+const fn checked_cmsg_align(len: usize) -> Option<usize> {
+    match len.checked_add(7) {
+        Some(v) => Some(v & !7),
+        None => None,
+    }
 }
 /// `CMSG_SPACE(data_len)`。
 const fn cmsg_space(data_len: usize) -> usize {
@@ -575,7 +587,9 @@ fn parse_control_into(
                 });
             }
         }
-        off = off.checked_add(cmsg_align(clen))?;
+        // `clen` は直前の `buf.get(..)` で受信バッファ長以下と確認済みで桁あふれしないが、
+        // カーネル由来の外部入力のため整列も checked で行う（#4534・SEC-1・REPAIR-5）。
+        off = off.checked_add(checked_cmsg_align(clen)?)?;
     }
     Some(())
 }
@@ -970,6 +984,30 @@ mod tests {
         short.extend_from_slice(&consts::SOL_SOCKET.to_ne_bytes());
         short.extend_from_slice(&SCM_RIGHTS.to_ne_bytes());
         assert!(!parse_control(&short, 16).well_formed);
+    }
+
+    /// checked 版の整列が桁あふれで `None` になり、通常値では `cmsg_align` と一致する（#4534・SEC-1・REPAIR-5）。
+    /// parse 経路は上流の範囲検査で先に止まるため、整列の checked 化は関数単体で照合する。
+    #[test]
+    fn sec1_repair5_4534_checked_cmsg_align_and_huge_len() {
+        assert_eq!(checked_cmsg_align(usize::MAX), None);
+        assert_eq!(checked_cmsg_align(usize::MAX - 7), Some(usize::MAX - 7));
+        assert_eq!(checked_cmsg_align(usize::MAX - 6), None);
+        assert_eq!(checked_cmsg_align(0), Some(0));
+        assert_eq!(checked_cmsg_align(20), Some(24));
+        assert_eq!(checked_cmsg_align(24), Some(24));
+        for len in 0..=CONTROL_CAP {
+            assert_eq!(checked_cmsg_align(len), Some(cmsg_align(len)), "len={len}");
+        }
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&usize::MAX.to_ne_bytes());
+        buf.extend_from_slice(&consts::SOL_SOCKET.to_ne_bytes());
+        buf.extend_from_slice(&SCM_RIGHTS.to_ne_bytes());
+        buf.extend_from_slice(&[0u8; 8]);
+        let p = parse_control(&buf, 24);
+        assert!(p.fds.is_empty());
+        assert!(p.creds.is_none());
+        assert!(!p.well_formed);
     }
 
     /// 実 socketpair で fd と資格情報が往復する（pid・uid は自分のもの）。余分な fd は受け取り側で閉じられる。

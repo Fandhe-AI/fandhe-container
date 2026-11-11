@@ -46,8 +46,10 @@ pub(crate) fn release_lock_file(file: File) -> LockRelease {
 /// ロックを取得済みの `File` を包み、drop で [`release_lock_file`] を呼ぶ RAII。
 ///
 /// 取得（`try_lock` の成功）の後に [`Self::new`] で包む。取得に失敗した `File` はロックを持たないので包まない。
+#[cfg(target_os = "linux")]
 pub(crate) struct ExplicitUnlockFile(Option<File>);
 
+#[cfg(target_os = "linux")]
 impl ExplicitUnlockFile {
     /// `file`（ロック取得済み）を包む。
     pub(crate) fn new(file: File) -> Self {
@@ -65,12 +67,14 @@ impl ExplicitUnlockFile {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl std::fmt::Debug for ExplicitUnlockFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("ExplicitUnlockFile")
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Drop for ExplicitUnlockFile {
     /// 明示 unlock して閉じる。失敗は close を続ける（OS が最後の close かプロセス終了で外す）。
     fn drop(&mut self) {
@@ -80,7 +84,7 @@ impl Drop for ExplicitUnlockFile {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use std::fs::TryLockError;

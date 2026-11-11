@@ -104,9 +104,11 @@ use serde::{Deserialize, Serialize};
 use crate::audit_log::{AuditCoverage, AuditCoveragePolicy, CoverageLayer, KernelAuditLayerStatus};
 use crate::capabilities::{Capability, CapabilitySet, ContainerCapabilities};
 use crate::dev_mounts::ImplicitDevMount;
-#[cfg(test)]
+#[cfg(any(target_os = "linux", all(test, unix)))]
+use crate::flock_release::LockRelease;
+use crate::flock_release::release_lock_file;
+#[cfg(all(test, unix))]
 use crate::flock_release::release_lock_file_with;
-use crate::flock_release::{LockRelease, release_lock_file};
 use crate::launch_isolation::{
     AuditCoverageRecordOutcome, LaunchIsolationRecord, MAX_RECORDED_ID_EXTENTS, MAX_RECORDED_RULES,
     RecordedAuditCoverage, RecordedIdExtent, RecordedIdMapping, RecordedIdModel, RecordedLandlock,

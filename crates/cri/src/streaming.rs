@@ -14,10 +14,15 @@
 //! HTTP の 501 にする形にはしない（#3753・REPAIR-3）。多層防御として、有効なトークンへの要求でハンドラが
 //! 無い種別は [`NotImplementedHandler`] が `501 Not Implemented` を返す（issuer を経る通常の経路では到達しない）。
 //! Attach は #681（TASK-63.3）が SPDY/3.1 の codec（[`spdy`]）・remotecommand の交渉（[`remotecommand`]）・
-//! セッション（[`attach`]）を実装済みだが、実行中コンテナの stdio を渡す本番の `attach::AttachBackend` は未接続で、
-//! 注入しない構成では 501 のまま。Exec は #680（TASK-63.2）の [`exec::ExecStreamHandler`] が同じ SPDY codec・
-//! 交渉を使って実装済みだが、stdio を持つ起動役 [`exec::ExecStreamLauncher`] の本番の実装は無く、
-//! plugin-cri からの注入も後続である。PortForward は #682（TASK-63.4）が実装し、NODE ネットワークの pod だけ plugin-cri が
+//! セッション（[`attach`]）を実装済みで、実行中コンテナの stdio を渡す本番の `attach::AttachBackend` は
+//! plugin-cri が注入した構成だけ結線する（Linux は完全版の `streaming::supervisor_attach`〔kind 9 の tap と fd。
+//! #4077・#4078〕、非 Linux は読み取り専用の `streaming::log_attach`〔回転ログの follow。#3763〕。実機の通しは
+//! plugin-cri の `tests/cri_attach_real.rs`〔#4079〕）。Exec は #680（TASK-63.2）の [`exec::ExecStreamHandler`] が
+//! 同じ SPDY codec・交渉を使って実装済みで、stdio を持つ起動役 [`exec::ExecStreamLauncher`] の本番の実装は
+//! plugin-cri の `streaming::exec_launcher`（supervisor の `stream-exec` helper 経由。#3761）にあり、Linux で
+//! 注入した構成だけ結線する（実機の通しは plugin-cri の `tests/cri_exec_real.rs`〔#3762〕）。backend・起動役を
+//! 注入しない構成（`with_streaming` の無い構成・非 Linux の Exec など）では、RPC は URL を返さず `UNIMPLEMENTED` のまま。
+//! PortForward は #682（TASK-63.4）が実装し、NODE ネットワークの pod だけ plugin-cri が
 //! 本番の dialer を注入する（#3755）。POD ネットワークの pod は、`supports_pod_network` が真の dialer を注入した構成（本番は plugin-cri の保持役のある構成の `PodNetnsDialer`。#3766・#4486）だけ結線し、それ以外は `UNIMPLEMENTED`。
 //!
 //! ## 安全側の既定

@@ -6,7 +6,8 @@
 //!
 //! # 方式（設計は `docs/design/cri-streaming-server.md`「本番 backend の設計」・案 α）
 //! Exec ごとに supervisor の実行ファイル（plugin-cri の実体と同じディレクトリの固定名。`PATH` 探索なし）を
-//! `stream-exec` で起動して単一スレッドの helper にし、パスを持たない socketpair（helper の fd 0）で次をやり取りする。
+//! `stream-exec` で起動して単一スレッドの helper にし、bin は保持役と同じ共通口（`pod_holder::open_supervisor_beside`）で
+//! 検査し検証済み fd で exec する（#4499・PLUG-11）。パスを持たない socketpair（helper の fd 0）で次をやり取りする。
 //! 1. 要求された stdio の端（`UnixStream::pair` の片側）を `SCM_RIGHTS` で渡す（`send_stdio_handover`）
 //! 2. helper が `Started` を返す（exec の子 cgroup の通知後）。tty のときは続けて `PtyMaster`（ちょうど 1 回）、
 //!    その後 `Spawned`（高々 1 回）、最後に `Result`。順序違反（`Started` 前の `PtyMaster`・`Spawned`、tty で `Started` の
@@ -71,7 +72,6 @@ use fandhe_container_cri::streaming::exec::{
 };
 use fandhe_container_cri::streaming::remotecommand::TerminalSize;
 use fandhe_container_supervisor::control::protocol::MAX_EXEC_HOLD_SECS;
-use fandhe_container_supervisor::launcher::SUPERVISOR_FILE_NAME;
 use fandhe_container_supervisor::stream_exec::channel::{
     ChannelError, HelperMessage, StdioSend, recv_from_helper, send_stdio_handover,
 };
@@ -79,6 +79,7 @@ use fandhe_container_supervisor::stream_exec::helper::{StreamExecArgs, stream_ex
 use fandhe_container_supervisor::stream_exec::wire::{ChildStatus, StdioMask, StreamExecOutcome};
 use tokio::io::{AsyncRead, AsyncWrite};
 
+use crate::pod_holder::{VerifiedSupervisorExe, open_supervisor_beside};
 use crate::telemetry::LineSink;
 
 pub mod diagnostics;
@@ -139,27 +140,23 @@ pub struct ProductionHelperSpawner;
 
 impl HelperSpawner for ProductionHelperSpawner {
     fn spawn(&self, args: &StreamExecArgs) -> Result<SpawnedHelper, CriError> {
-        let exe = std::env::current_exe().map_err(|_| {
-            CriError::failed_precondition("cannot resolve the plugin executable path")
-        })?;
-        let supervisor = exe
-            .parent()
-            .filter(|d| d.has_root())
-            .map(|d| d.join(SUPERVISOR_FILE_NAME))
-            .ok_or_else(|| {
-                CriError::failed_precondition("cannot resolve the plugin executable path")
-            })?;
-        if !supervisor.metadata().map(|m| m.is_file()).unwrap_or(false) {
-            return Err(CriError::failed_precondition(
-                "supervisor executable is not installed",
-            ));
-        }
-        spawn_helper_command(stream_exec_command(&supervisor, args))
+        // 保持役・netns-dial と同じ共通口で解決・検査する（所有者・g/o 書き込み・祖先・通常ファイル・読み取り。PLUG-11・#4499）。
+        let exe = open_supervisor_beside().map_err(|e| CriError::from(&e))?;
+        spawn_verified(&exe, args)
     }
 
     fn capabilities(&self) -> HelperCapabilities {
         HelperCapabilities { tty: true }
     }
+}
+
+/// 検証済みの fd（`/proc/self/fd/N`）を exec して helper を起動する。`exe` は起動が終わるまで呼び出し側が保持する
+/// （検査から exec までのパス再解決による差し替えの窓を作らない。`argv[0]` は `stream_exec_command` の固定値のまま。#4499）。
+fn spawn_verified(
+    exe: &VerifiedSupervisorExe,
+    args: &StreamExecArgs,
+) -> Result<SpawnedHelper, CriError> {
+    spawn_helper_command(stream_exec_command(&exe.exec_path(), args))
 }
 
 /// helper の `Command` に fd 0（channel の socketpair）と fd 2（診断の socketpair）を結線して起動する。

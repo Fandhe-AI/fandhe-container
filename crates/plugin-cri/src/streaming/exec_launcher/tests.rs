@@ -1210,3 +1210,107 @@ async fn cri5_4286_unreported_instance_on_both_sides_is_not_protected() {
     let _session = launcher.launch(issued).await.expect("launch");
     assert_eq!(pids.lock().expect("lock").len(), 1);
 }
+// ---- #4499: 本番の spawner の bin 検査（共通口 `open_supervisor_beside_at` を exe と euid の注入で通す） ----
+
+mod bin_check_4499 {
+    use std::path::Path;
+
+    use fandhe_container_core::traits::ErrorCode as TraitCode;
+
+    use super::*;
+    use crate::pod_holder::bin_fixture::{BinFixture, assert_untrusted};
+    use crate::pod_holder::{current_euid, open_supervisor_beside_at};
+
+    fn args() -> StreamExecArgs {
+        StreamExecArgs::new(
+            PathBuf::from("/tmp"),
+            ContainerId::new("c1").expect("id"),
+            NonZeroU32::new(PID).expect("pid"),
+            Duration::from_secs(5),
+            StdioMask::from_presence(false, false, false),
+            vec!["/bin/true".to_owned()],
+        )
+        .expect("args")
+    }
+
+    /// 本番の `spawn` と同じ組み合わせ（検査 → 検証済み fd で起動）に、exe と euid を注入した版。
+    fn spawn_at(exe: &Path, euid: u32) -> Result<SpawnedHelper, CriError> {
+        let verified = open_supervisor_beside_at(exe, euid).map_err(|e| CriError::from(&e))?;
+        spawn_verified(&verified, &args())
+    }
+
+    fn expect_untrusted(r: Result<SpawnedHelper, CriError>) {
+        let e = r.err().expect("rejected");
+        assert_eq!(e.code(), CriErrorCode::FailedPrecondition);
+        assert_untrusted(TraitCode::FailedPrecondition, e.message());
+    }
+
+    /// 所有者違い（euid を root でも自分でもない値へずらす）は拒否する。euid 0 では root 所有が常に許されるため飛ばす。
+    #[test]
+    fn cri6_plug11_4499_helper_spawner_rejects_foreign_owner() {
+        let euid = current_euid().expect("euid");
+        if euid == 0 {
+            return;
+        }
+        let fx = BinFixture::new("exec-owner");
+        fx.place_elf(0o755);
+        expect_untrusted(spawn_at(&fx.exe, euid + 1));
+    }
+
+    #[test]
+    fn cri6_plug11_4499_helper_spawner_rejects_group_writable_bin() {
+        let euid = current_euid().expect("euid");
+        let fx = BinFixture::new("exec-gw");
+        fx.place_elf(0o775);
+        expect_untrusted(spawn_at(&fx.exe, euid));
+    }
+
+    #[test]
+    fn cri6_plug11_4499_helper_spawner_rejects_writable_ancestor() {
+        let euid = current_euid().expect("euid");
+        let fx = BinFixture::new("exec-anc");
+        fx.place_elf(0o755);
+        fx.set_dir_mode(0o775);
+        expect_untrusted(spawn_at(&fx.exe, euid));
+    }
+
+    /// FIFO は open でブロックしない（`O_NONBLOCK`）ため、別スレッドでも 10 秒以内に拒否が返る。
+    #[test]
+    fn cri6_plug11_4499_helper_spawner_rejects_fifo_without_blocking() {
+        let euid = current_euid().expect("euid");
+        let fx = BinFixture::new("exec-fifo");
+        fx.place_fifo();
+        let exe = fx.exe.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(spawn_at(&exe, euid));
+        });
+        expect_untrusted(
+            rx.recv_timeout(Duration::from_secs(10))
+                .expect("did not block"),
+        );
+    }
+
+    /// 成功系: 検証済み fd 経由で ELF が実際に起動し、終了コード 0 で終わる。
+    #[test]
+    fn cri6_plug11_4499_helper_spawner_execs_verified_fd() {
+        let euid = current_euid().expect("euid");
+        let fx = BinFixture::new("exec-ok");
+        fx.place_elf(0o755);
+        let r = spawn_at(&fx.exe, euid);
+        if !fx.ancestors_ok(euid) {
+            assert!(r.is_err());
+            return;
+        }
+        let mut helper = r.expect("spawned");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(st) = helper.child.try_wait().expect("try_wait") {
+                break st;
+            }
+            assert!(Instant::now() < deadline, "helper did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(status.code(), Some(0));
+    }
+}

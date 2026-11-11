@@ -662,6 +662,11 @@ fn plug11_4483_supervisor_beside_resolution_is_shared() {
             .map(|e| e.message().to_owned()),
         Some(MSG_UNTRUSTED_EXE.to_owned())
     );
-    assert!(open_supervisor_beside_at(Path::new("plugin"), euid).is_err());
+    assert_eq!(
+        open_supervisor_beside_at(Path::new("plugin"), euid)
+            .err()
+            .map(|e| e.message().to_owned()),
+        Some(MSG_UNRESOLVED_EXE.to_owned())
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

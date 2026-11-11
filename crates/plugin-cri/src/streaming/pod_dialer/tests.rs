@@ -208,8 +208,11 @@ impl NetnsDialSpawner for FakeSpawner {
                     let _ = send_raw(channel_end.as_fd(), &b, &[]);
                 }
                 Reply::ConnectedHost => {
-                    let s = std::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port))
-                        .expect("connect host");
+                    let s = std::net::TcpStream::connect_timeout(
+                        &std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+                        Duration::from_secs(5),
+                    )
+                    .expect("connect host");
                     send_raw(channel_end.as_fd(), &connected, &[s.as_fd()]).expect("send fd");
                 }
             }
@@ -396,7 +399,20 @@ fn sec1_net3_4484_host_netns_socket_is_rejected() {
         (CriErrorCode::Unavailable, MSG_POD_DIAL_FAILED.to_owned())
     );
     // dialer が受けた fd と偽 helper の複製が閉じていれば、listener 側は EOF を読む。
-    let (mut peer, _) = l.accept().expect("accept");
+    // accept に期限が無いと接続前の失敗で無期限に止まるため、nonblocking＋締切付きで待つ（REPAIR-5）。
+    l.set_nonblocking(true).expect("nb");
+    let deadline = std::time::Instant::now() + T5;
+    let mut peer = loop {
+        match l.accept() {
+            Ok((p, _)) => break p,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(std::time::Instant::now() < deadline, "accept timed out");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => panic!("accept failed: {e}"),
+        }
+    };
+    peer.set_nonblocking(false).expect("blocking");
     peer.set_read_timeout(Some(T5)).expect("timeout");
     let mut b = [0u8; 1];
     assert_eq!(peer.read(&mut b).expect("eof"), 0);

@@ -21,7 +21,6 @@ use std::fs::File;
 use std::net::TcpStream;
 use std::num::NonZeroU16;
 use std::os::fd::{AsFd as _, OwnedFd};
-use std::os::unix::fs::MetadataExt as _;
 use std::time::Duration;
 
 use super::frame::{
@@ -30,8 +29,11 @@ use super::frame::{
 };
 use super::verify::{DialExpectation, DialedSocketError, NsId, verify_dialed_socket};
 use crate::error::{NetError, NetErrorCode};
+use crate::netns_helper::{
+    JoinedNs, RecvError, fd_identity, recv_loop_before_deadline, self_ns_identity,
+};
 use crate::sys::holder as sysh;
-use crate::sys::{self, Deadline, Readiness, SysError};
+use crate::sys::{self, Deadline, SysError};
 
 /// helper の recv・setns・harden に見込む余裕（REPAIR-5）。応答待ちは helper がこれらを終えた後の connect から始まる。
 const RESPONSE_MARGIN: Duration = Duration::from_secs(5);
@@ -64,15 +66,19 @@ fn precondition(message: &'static str) -> NetError {
     NetError::new(NetErrorCode::FailedPrecondition, message)
 }
 
-fn stat_fd(f: &File) -> Result<NsId, NetError> {
-    f.metadata()
-        .map(|m| NsId::new(m.dev(), m.ino()))
+/// fd の識別を [`NsId`] で返す。取得は `netns_helper::fd_identity` の共有実装で、ここは型と失敗の写像だけを持つ
+/// （#4533）。
+fn ns_id_of(f: &File) -> Result<NsId, NetError> {
+    fd_identity(f)
+        .map(|(dev, ino)| NsId::new(dev, ino))
         .map_err(|_| NetError::new(NetErrorCode::Internal, "cannot stat a namespace descriptor"))
 }
 
-fn stat_path(path: &str) -> Result<NsId, NetError> {
-    std::fs::metadata(path)
-        .map(|m| NsId::new(m.dev(), m.ino()))
+/// 自プロセスの ns の識別を [`NsId`] で返す。取得は `netns_helper::self_ns_identity` の共有実装で、ここは型と
+/// 失敗の写像だけを持つ（#4533）。
+fn own_ns_id(ns: JoinedNs) -> Result<NsId, NetError> {
+    self_ns_identity(ns)
+        .map(|(dev, ino)| NsId::new(dev, ino))
         .map_err(|_| NetError::new(NetErrorCode::Internal, "cannot stat an own namespace"))
 }
 
@@ -88,8 +94,8 @@ impl NetnsDialFds {
     /// 自プロセスの user / net namespace でないことを確かめる（違えば `FailedPrecondition`）。
     pub fn new(user: OwnedFd, net: OwnedFd) -> Result<Self, NetError> {
         let fds = Self::distinct(user, net)?;
-        if stat_fd(&fds.user)? == stat_path("/proc/self/ns/user")?
-            || stat_fd(&fds.net)? == stat_path("/proc/self/ns/net")?
+        if ns_id_of(&fds.user)? == own_ns_id(JoinedNs::User)?
+            || ns_id_of(&fds.net)? == own_ns_id(JoinedNs::Net)?
         {
             return Err(precondition(
                 "the namespace descriptors refer to a namespace of this process",
@@ -102,7 +108,7 @@ impl NetnsDialFds {
     fn distinct(user: OwnedFd, net: OwnedFd) -> Result<Self, NetError> {
         let user = File::from(user);
         let net = File::from(net);
-        let (u, n) = (stat_fd(&user)?, stat_fd(&net)?);
+        let (u, n) = (ns_id_of(&user)?, ns_id_of(&net)?);
         if u.dev() != n.dev() || u.ino() == n.ino() {
             return Err(precondition(
                 "the namespace descriptors are not distinct namespaces on one filesystem",
@@ -115,7 +121,7 @@ impl NetnsDialFds {
     pub fn net_id(&self) -> NsId {
         // `new` / `distinct` が stat 済みだが、fd は保持しているため再度取る。失敗は到達しない想定で 0 を返さず
         // 呼び出し側が不一致で拒否する値（最大値）にする。
-        stat_fd(&self.net).unwrap_or(NsId::new(u64::MAX, u64::MAX))
+        ns_id_of(&self.net).unwrap_or(NsId::new(u64::MAX, u64::MAX))
     }
 }
 
@@ -305,30 +311,21 @@ impl NetnsDialChannel {
             return Err(fail(NetnsDialFailure::InvalidTimeout));
         }
         // 自プロセスの netns が期待値なら、受信の前に拒否する（取れなければ fail-closed）。
-        match stat_path("/proc/self/ns/net") {
+        match own_ns_id(JoinedNs::Net) {
             Ok(own) if own == expected_netns => return Err(fail(NetnsDialFailure::OwnNetns)),
             Ok(_) => {}
             Err(_) => return Err(fail(NetnsDialFailure::Io)),
         }
         let deadline = Deadline::after(timeout);
         let mut buf = [0u8; FRAME_LEN];
-        let got = loop {
-            match sys::wait_readable(self.fd.as_fd(), &deadline) {
-                Err(e) => return Err(io_err(e)),
-                Ok(Readiness::TimedOut) => return Err(fail(NetnsDialFailure::TimedOut)),
-                Ok(Readiness::Readable | Readiness::Exceptional) => {}
-            }
-            match sysh::recv_one_fd(self.fd.as_fd(), &mut buf) {
-                Ok(r) => break r,
-                Err(SysError::Os(n)) if n == sys::EAGAIN || n == sys::EINTR => {
-                    if deadline.remaining().is_zero() {
-                        return Err(fail(NetnsDialFailure::TimedOut));
-                    }
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                Err(e) => return Err(io_err(e)),
-            }
-        };
+        // 期限つき受信のループは helper と共有（#4533）。fd は最大 1 本（SEC-1）のため `recv_one_fd` を渡す。
+        let got = recv_loop_before_deadline(self.fd.as_fd(), &deadline, || {
+            sysh::recv_one_fd(self.fd.as_fd(), &mut buf)
+        })
+        .map_err(|e| match e {
+            RecvError::Wait(e) | RecvError::Recv(e) => io_err(e),
+            RecvError::TimedOut => fail(NetnsDialFailure::TimedOut),
+        })?;
         let mut fds = got.fds;
         if got.len == 0 && fds.is_empty() && !got.ctrl_truncated {
             return Err(fail(NetnsDialFailure::HelperExited));
@@ -373,6 +370,14 @@ fn io_err(e: SysError) -> NetnsDialError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::MetadataExt as _;
+
+    /// 試験専用: パスを辿った metadata から識別を作る（製品の `own_ns_id` とは独立した照合元）。
+    fn stat_path(path: &str) -> Result<NsId, NetError> {
+        std::fs::metadata(path)
+            .map(|m| NsId::new(m.dev(), m.ino()))
+            .map_err(|_| NetError::new(NetErrorCode::Internal, "cannot stat an own namespace"))
+    }
     use crate::netns_dial::frame::ConnectTimeout;
     use crate::netns_dial::verify::DialedSocketRejection;
     use std::net::{Ipv4Addr, TcpListener};

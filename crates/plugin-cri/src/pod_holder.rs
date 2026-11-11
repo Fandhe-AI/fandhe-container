@@ -28,7 +28,7 @@
 //! - supervisor の bin の解決・検査は `open_supervisor_beside` に共通化し、後続の netns-dial helper（#4484）が共有する。
 //!
 //! # 未実装・簡易実装（REPAIR-3）
-//! `open_pod_namespaces` の利用側（`PodNetnsDialer`）は #4484、cri への結線は #4486。
+//! `open_pod_namespaces` の利用側（`PodNetnsDialer`）は実装済み（#4484）で、cri への結線は #4486。
 //! 保持役の pid から `PodNamespacePaths` を作って bundle へ渡す配線（H5・#2876）は配線済み（user・ipc の join）。保持役の
 //! netns の bundle への受け渡しは H8（#2878）で実装済み。pod ネットワークの本番 provider（rootless の pasta）は H10（#2879）で未実装。素性（pid・
 //! starttime・ns）の永続化と再起動後の再採用は R11（#2940）。rootful（uid 0）は `UNIMPLEMENTED`（#2241・#2442 の判断まで）。
@@ -140,6 +140,17 @@ impl PodNamespaceFds {
     /// READY が記録し、fd と一致を確認済みの net namespace の素性。
     pub fn net_id(&self) -> NsId {
         self.net_id
+    }
+
+    /// 試験専用: 任意の fd と素性から組む（`PodNamespaceSource` の偽実装用）。
+    #[cfg(test)]
+    pub(crate) fn for_test(user: OwnedFd, net: OwnedFd, user_id: NsId, net_id: NsId) -> Self {
+        Self {
+            user,
+            net,
+            user_id,
+            net_id,
+        }
     }
 
     /// (user, net) の fd を取り出す（helper へ SCM_RIGHTS で渡す側が所有する）。

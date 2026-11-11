@@ -38,8 +38,8 @@
 | net `add_host_dns/hosts_file.rs` | hosts のロック | (b) | あり | 期限つき（`Timeout`） | 該当（#4514） |
 | cri `shim_v2/bootstrap.rs` | `IdLock`・ops.log・daemon log のロック | (b) | あり（daemon の spawn・監査 relay の fork） | 期限つき | 該当（#4515） |
 | cri `runtime_service/record_store/file.rs` | 記録ストアの `.lock` | (b) | あり | 期限つき（`LockTimeout`） | 該当（#4515） |
-| plugin-cri `netsetup/reclaim_store.rs` | 回収待ち記録の `.lock` | (b) | あり | 期限つき | 該当（#4516） |
-| plugin-cri `instance_lock.rs` | `InstanceLock._file` | (b) | あり（モジュール doc に exec しない fork の残余） | 期限つき | 該当（#4516。判断できないため安全側） |
+| plugin-cri `netsetup/reclaim_store.rs` | 回収待ち記録の `.lock` | (b) | あり | 期限つき | 修正済み（#4516。`net1_repair5_4516_reclaim_store_lock_drop_releases_despite_duplicate_fd`） |
+| plugin-cri `instance_lock.rs` | `InstanceLock._file` | (b) | あり（モジュール doc に exec しない fork の残余） | 期限つき | 修正済み（#4516。`cri2_repair5_4516_instance_lock_drop_releases_despite_duplicate_fd`）。残余: Drop を経ない終了（SIGKILL 等）では複製 fd を持つ子が生きている間だけ再取得が遅れる（期限つき） |
 | supervisor `container_options/store.rs` | `OptionsLock._file` | (b) | あり | 期限つき | 該当（#4517） |
 | supervisor `logs/rotating.rs` | sink のログロック | (b) | あり | 待たず拒否（40ms 程度の再試行） | 該当（#4517） |
 | supervisor `logs/rotating.rs` の読み手 | 共有ロックの一時保持 | (a) | - | - | 無害（明示 unlock） |
@@ -54,7 +54,7 @@
 
 ## fork 子による誤解放の確認
 
-`LOCK_UN` は OFD 単位で効くため、fork した子で guard の `Drop` が走ると親のロックまで外れる。core の fork 子（`sys::fork_single_threaded*`）は `_exit` で終わり親のスタックを巻き戻さない。`remove_tree_in_userns`・孤児回収の子の body は、親の `Backing`・局所ロックをムーブしていない（子が自分で `lock_and_recheck` を呼ぶ）。確認日: #4492 実装時。
+`LOCK_UN` は OFD 単位で効くため、fork した子で guard の `Drop` が走ると親のロックまで外れる。core の fork 子（`sys::fork_single_threaded*`）は `_exit` で終わり親のスタックを巻き戻さない。`remove_tree_in_userns`・孤児回収の子の body は、親の `Backing`・局所ロックをムーブしていない（子が自分で `lock_and_recheck` を呼ぶ）。確認日: #4492 実装時。plugin-cri（#4516）は fork の原始を持たず、`ExplicitUnlockFile`・`ReclaimStore` の guard・`Arc<InstanceLock>` を core の `fork_single_threaded*` のクロージャへ渡す箇所が無いことを `git grep` で確認した。
 
 ## 範囲外
 

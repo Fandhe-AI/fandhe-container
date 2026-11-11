@@ -16,7 +16,7 @@
 //! - ファイルは同じディレクトリの一時ファイル（`O_EXCL`・0600）へ書いて `fsync` してから `rename` し、ディレクトリも
 //!   `fsync` する。読み込みは通常ファイルであることと長さの上限を先に確かめる（ディレクトリが 0700 で自分の所有のため、
 //!   確認と open の間に差し替えられる窓は同じユーザーにしか無い）
-//! - プロセス間の排他は `.lock` の `File::try_lock` を期限つきで取る（REPAIR-5）。ロックは各操作の間だけ持つ
+//! - プロセス間の排他は `.lock` の `File::try_lock` を期限つきで取る（REPAIR-5）。ロックは各操作の間だけ持ち、解放は drop で明示 unlock してから閉じる（複製 fd が残っても外れる。#4516）
 //! - エラー文言は固定で、パスや OS の文字列を含めない
 
 use std::fs::{self, File, OpenOptions};
@@ -29,6 +29,7 @@ use fandhe_container_core::traits::{ErrorCode, TraitError};
 use fandhe_container_net::network::{CLAIM_RECORD_MAX_LEN, EndpointId, NetworkName as NetName};
 
 use super::{MAX_CONTAINERS_PER_NETWORK, MAX_NETWORKS};
+use crate::flock_release::ExplicitUnlockFile;
 
 /// 置き場の状態ルートからの相対位置（先頭が `.` のため `ContainerId` の状態ディレクトリと衝突しない）。
 pub const RECLAIM_DIR: &str = ".cri/net/pending-reclaim";
@@ -349,8 +350,8 @@ impl ReclaimStore {
         Ok(self.dir.join(format!("{name}{EXT}")))
     }
 
-    /// プロセス間の排他を期限つきで取る。戻り値を落とすと解放される。
-    fn lock(&self) -> Result<File, TraitError> {
+    /// プロセス間の排他を期限つきで取る。戻り値を落とすと明示 unlock してから閉じる（#4516）。
+    fn lock(&self) -> Result<ExplicitUnlockFile, TraitError> {
         let path = self.dir.join(LOCK_NAME);
         if let Ok(m) = fs::symlink_metadata(&path)
             && !m.file_type().is_file()
@@ -366,7 +367,7 @@ impl ReclaimStore {
         let deadline = Instant::now() + LOCK_TIMEOUT;
         loop {
             match file.try_lock() {
-                Ok(()) => return Ok(file),
+                Ok(()) => return Ok(ExplicitUnlockFile::new(file)),
                 Err(std::fs::TryLockError::WouldBlock) => {
                     if Instant::now() >= deadline {
                         return Err(TraitError::new(
@@ -527,6 +528,44 @@ mod tests {
             fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).expect("mode");
         }
         p
+    }
+
+    /// NET-1・REPAIR-5（#4516）: `lock()` の guard を落とせば、複製 fd が残っていても別 OFD から取得できる。
+    /// 陽性対照は包まない `File`（close だけでは複製がある間 `WouldBlock`）。
+    #[cfg(unix)]
+    #[test]
+    fn net1_repair5_4516_reclaim_store_lock_drop_releases_despite_duplicate_fd() {
+        use std::fs::TryLockError;
+        let root = temp_root("unlock4516");
+        let s = ReclaimStore::open(&root).expect("open");
+        let path = s.dir.join(LOCK_NAME);
+        let open = || {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+                .expect("open lock")
+        };
+
+        let plain = open();
+        plain.try_lock().expect("plain lock");
+        let dup = plain.try_clone().expect("dup");
+        drop(plain);
+        assert!(matches!(open().try_lock(), Err(TryLockError::WouldBlock)));
+        drop(dup);
+
+        let guard = s.lock().expect("lock");
+        let dup = guard.clone_file_for_test();
+        drop(guard);
+        let other = open();
+        assert!(other.try_lock().is_ok());
+        drop(other);
+        let start = Instant::now();
+        drop(s.lock().expect("relock"));
+        assert!(start.elapsed() < Duration::from_secs(1));
+        drop(dup);
     }
 
     /// NET-1・REPAIR-3・#2604・REPAIR-12: RECLAIM_DIR 配下に残った同名の一時ファイルと実際に衝突しても、

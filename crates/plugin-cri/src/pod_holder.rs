@@ -22,14 +22,20 @@
 //! - 解放は stdin を閉じる → 期限つきで待つ → SIGKILL → 回収の順。READY・解放・回収の待ちはすべて期限つきで、ロックは
 //!   待ちの間は保たない（ブロックしない syscall の間だけ保つ）。エラー文言は固定の英文でパス・pid・errno を含めない（REPAIR-4）。
 //!
+//! - READY の内容（pid・user / ipc / net の `NsId`）は表に保存する。`open_pod_namespaces`（#4483・SEC-5・SEC-1）は
+//!   1 回のロック区間で死活確認・`/proc/<pid>/ns/{user,net}` の open・開いた fd の (dev, ino) と記録の照合を行い、
+//!   不在・解放中・終了済み・不一致は `UNAVAILABLE` で fail-closed。区間内は非ブロッキングの syscall だけで、子は回収しない。
+//! - supervisor の bin の解決・検査は `open_supervisor_beside` に共通化し、後続の netns-dial helper（#4484）が共有する。
+//!
 //! # 未実装・簡易実装（REPAIR-3）
+//! `open_pod_namespaces` の利用側（`PodNetnsDialer`）は #4484、cri への結線は #4486。
 //! 保持役の pid から `PodNamespacePaths` を作って bundle へ渡す配線（H5・#2876）は配線済み（user・ipc の join）。保持役の
 //! netns の bundle への受け渡しは H8（#2878）で実装済み。pod ネットワークの本番 provider（rootless の pasta）は H10（#2879）で未実装。素性（pid・
 //! starttime・ns）の永続化と再起動後の再採用は R11（#2940）。rootful（uid 0）は `UNIMPLEMENTED`（#2241・#2442 の判断まで）。
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::os::fd::{AsFd as _, AsRawFd as _};
+use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::Path;
 #[cfg(any(test, feature = "pod-holder-test-support"))]
@@ -73,6 +79,13 @@ const MSG_POISONED: &str = "pod holder table is unavailable";
 const MSG_RELEASE_TIMEOUT: &str = "timed out releasing the pod holder";
 const MSG_UNKNOWN: &str = "no pod holder is tracked for this sandbox";
 const MSG_LIVENESS: &str = "failed to observe the pod holder";
+/// 保持役が無い・解放中・終了済み・pid 不一致（#4483。`UNAVAILABLE` の固定文）。
+const MSG_NS_HOLDER_UNAVAILABLE: &str = "the pod holder is not available for this sandbox";
+/// 保持役の namespace の open・fstat の失敗（#4483）。
+const MSG_NS_OPEN_FAILED: &str = "the pod holder namespaces cannot be opened";
+/// 開いた namespace の (dev, ino) が READY の記録と違う（#4483）。
+const MSG_NS_IDENTITY_MISMATCH: &str =
+    "the pod holder namespaces do not match the recorded identity";
 
 /// 保持役として exec する対象の決め方。
 #[derive(Debug, Clone)]
@@ -93,6 +106,84 @@ struct HolderEntry {
     child: Child,
     /// 閉じると保持役が EOF で終わる。`release` が `take` して drop する。
     stdin: Option<ChildStdin>,
+    /// READY で受け `verify_ready` を通した内容（pid・user / ipc / net の素性）。`open_pod_namespaces` が開いた fd の
+    /// 照合に使う（#4483・SEC-5・SEC-1）。
+    ready: PodHolderReady,
+}
+
+/// 保持役の user・net namespace の fd と、READY 時に記録した素性（#4483・SEC-5・SEC-1）。
+/// `ProductionPodHolder::open_pod_namespaces` が、開いた fd の (dev, ino) を記録と照合してから返す。
+#[derive(Debug)]
+pub struct PodNamespaceFds {
+    user: OwnedFd,
+    net: OwnedFd,
+    user_id: NsId,
+    net_id: NsId,
+}
+
+impl PodNamespaceFds {
+    /// user namespace の fd。
+    pub fn user(&self) -> BorrowedFd<'_> {
+        self.user.as_fd()
+    }
+
+    /// net namespace の fd。
+    pub fn net(&self) -> BorrowedFd<'_> {
+        self.net.as_fd()
+    }
+
+    /// READY が記録し、fd と一致を確認済みの user namespace の素性。
+    pub fn user_id(&self) -> NsId {
+        self.user_id
+    }
+
+    /// READY が記録し、fd と一致を確認済みの net namespace の素性。
+    pub fn net_id(&self) -> NsId {
+        self.net_id
+    }
+
+    /// (user, net) の fd を取り出す（helper へ SCM_RIGHTS で渡す側が所有する）。
+    pub fn into_fds(self) -> (OwnedFd, OwnedFd) {
+        (self.user, self.net)
+    }
+}
+
+/// 検証済みの supervisor の bin（fd を保つガード。spawn が終わるまで保持する。PLUG-11）。
+pub(crate) struct VerifiedSupervisorExe {
+    file: File,
+}
+
+impl VerifiedSupervisorExe {
+    /// 検証した fd を `/proc/self/fd/N` として exec する Command（検証後のパス再解決を避ける）。
+    pub(crate) fn command(&self) -> Command {
+        Command::new(format!("/proc/self/fd/{}", self.file.as_raw_fd()))
+    }
+}
+
+/// plugin-cri の実体の隣の固定名の supervisor の bin を解決・検査する。保持役の起動と、後続の netns-dial helper
+/// （#4484）の起動が同じ検査を共有する（`PATH`・環境変数・引数による上書きは作らない。PLUG-11）。
+pub(crate) fn open_supervisor_beside() -> Result<VerifiedSupervisorExe, TraitError> {
+    let exe = std::env::current_exe().map_err(|_| {
+        TraitError::new(
+            ErrorCode::FailedPrecondition,
+            "cannot resolve the plugin executable path",
+        )
+    })?;
+    let euid = current_euid().map_err(|()| {
+        TraitError::new(
+            ErrorCode::FailedPrecondition,
+            "cannot determine the plugin process credentials",
+        )
+    })?;
+    open_supervisor_beside_at(&exe, euid)
+}
+
+/// [`open_supervisor_beside`] の本体（試験で exe と euid を注入する）。
+fn open_supervisor_beside_at(exe: &Path, euid: u32) -> Result<VerifiedSupervisorExe, TraitError> {
+    let program = holder_executable_beside(exe)?;
+    check_ancestors_trust(&program, euid)?;
+    let file = open_trusted_executable(&program, euid)?;
+    Ok(VerifiedSupervisorExe { file })
 }
 
 #[derive(Default)]
@@ -170,26 +261,12 @@ impl ProductionPodHolder {
 
     /// 起動する Command を決め、bin を検査する。本番は検証済みの fd を返し、Command はその fd を
     /// `/proc/self/fd/N` として exec する（呼び出し側は spawn が終わるまで返された `File` を保つ）。
-    fn resolve_command(&self) -> Result<(Command, Option<File>), TraitError> {
+    fn resolve_command(&self) -> Result<(Command, Option<VerifiedSupervisorExe>), TraitError> {
         match &self.exe {
             ExeSource::Beside => {
-                let exe = std::env::current_exe().map_err(|_| {
-                    TraitError::new(
-                        ErrorCode::FailedPrecondition,
-                        "cannot resolve the plugin executable path",
-                    )
-                })?;
-                let program = holder_executable_beside(&exe)?;
-                let euid = current_euid().map_err(|()| {
-                    TraitError::new(
-                        ErrorCode::FailedPrecondition,
-                        "cannot determine the plugin process credentials",
-                    )
-                })?;
-                check_ancestors_trust(&program, euid)?;
-                let file = open_trusted_executable(&program, euid)?;
-                let cmd = Command::new(format!("/proc/self/fd/{}", file.as_raw_fd()));
-                Ok((cmd, Some(file)))
+                let verified = open_supervisor_beside()?;
+                let cmd = verified.command();
+                Ok((cmd, Some(verified)))
             }
             #[cfg(any(test, feature = "pod-holder-test-support"))]
             ExeSource::Fixed {
@@ -218,7 +295,7 @@ impl ProductionPodHolder {
     fn start_child(
         &self,
         ready_timeout: Duration,
-    ) -> Result<(Child, ChildStdin), (TraitError, Option<Child>)> {
+    ) -> Result<(Child, ChildStdin, PodHolderReady), (TraitError, Option<Child>)> {
         let (mut cmd, exe_fd) = self.resolve_command().map_err(|e| (e, None))?;
         cmd.arg(POD_HOLDER_SUBCOMMAND)
             .env_clear()
@@ -254,7 +331,7 @@ impl ProductionPodHolder {
             drop(stdin);
             return Err((e, kill_and_reap(child)));
         }
-        Ok((child, stdin))
+        Ok((child, stdin, ready))
     }
 
     /// READY の pid が spawn した子と一致し、`/proc/<pid>/ns/{user,ipc,net}` の素性が READY と一致することを確かめる。
@@ -322,7 +399,7 @@ impl ProductionPodHolder {
         let mut t = self.lock().map_err(|e| (e, false))?;
         t.spawning.remove(&id);
         match started {
-            Ok((child, stdin)) => {
+            Ok((child, stdin, ready)) => {
                 let Some(pid) = std::num::NonZeroU32::new(child.id()) else {
                     drop(stdin);
                     if let Some(left) = kill_and_reap(child) {
@@ -339,6 +416,7 @@ impl ProductionPodHolder {
                     HolderEntry {
                         child,
                         stdin: Some(stdin),
+                        ready,
                     },
                 );
                 Ok(PodHolder::new(pid))
@@ -447,14 +525,84 @@ impl ProductionPodHolder {
         }
     }
 
+    /// sandbox の保持役の `/proc/<pid>/ns/{user,net}` を開き、READY の `NsId` と照合して返す（#4483・SEC-5・SEC-1。
+    /// 呼び出し元は #4484 の `PodNetnsDialer`）。
+    ///
+    /// 1 回のロック区間で、非ブロッキングの syscall（`waitid(WNOHANG)`・nsfs の open・fstat）だけを使う。照合はパスでは
+    /// なく開いた fd に対して行う。表に無い・解放中・終了済み・不一致・open の失敗はすべて `UNAVAILABLE` で fail-closed
+    /// にし、host の namespace へは縮退しない。子は回収しない（pid の再利用を避ける。回収は同じロックの中の `release`）。
+    pub fn open_pod_namespaces(&self, sandbox_id: &str) -> Result<PodNamespaceFds, TraitError> {
+        self.open_pod_namespaces_at(sandbox_id, Path::new("/proc"))
+    }
+
+    /// [`Self::open_pod_namespaces`] の本体。`proc_root` を `/proc` 以外にできるのは試験だけ。
+    fn open_pod_namespaces_at(
+        &self,
+        sandbox_id: &str,
+        proc_root: &Path,
+    ) -> Result<PodNamespaceFds, TraitError> {
+        let unavailable = || TraitError::new(ErrorCode::Unavailable, MSG_NS_HOLDER_UNAVAILABLE);
+        let t = self.lock()?;
+        let e = t.entries.get(sandbox_id).ok_or_else(unavailable)?;
+        if e.stdin.is_none() {
+            return Err(unavailable());
+        }
+        let pid = std::num::NonZeroU32::new(e.child.id())
+            .filter(|p| p.get() == e.ready.pid())
+            .ok_or_else(unavailable)?;
+        if !matches!(child_exit_observed(pid), Ok(false)) {
+            return Err(unavailable());
+        }
+        let ns_dir = proc_root.join(pid.get().to_string()).join("ns");
+        let open = |name: &str| -> Result<(File, NsId), TraitError> {
+            let failed = || TraitError::new(ErrorCode::Unavailable, MSG_NS_OPEN_FAILED);
+            let f = File::open(ns_dir.join(name)).map_err(|_| failed())?;
+            let m = f.metadata().map_err(|_| failed())?;
+            Ok((
+                f,
+                NsId {
+                    dev: m.dev(),
+                    ino: m.ino(),
+                },
+            ))
+        };
+        let (user, user_id) = open("user")?;
+        let (net, net_id) = open("net")?;
+        if user_id != e.ready.user() || net_id != e.ready.net() {
+            return Err(TraitError::new(
+                ErrorCode::Unavailable,
+                MSG_NS_IDENTITY_MISMATCH,
+            ));
+        }
+        // open と照合の間に終わった場合の多層防御。
+        if !matches!(child_exit_observed(pid), Ok(false)) {
+            return Err(unavailable());
+        }
+        Ok(PodNamespaceFds {
+            user: user.into(),
+            net: net.into(),
+            user_id,
+            net_id,
+        })
+    }
+
     /// 試験専用: 起動済みの子を表に入れる。
     #[cfg(test)]
-    fn insert_for_test(&self, id: &str, child: Child, stdin: Option<ChildStdin>) {
-        self.table
-            .lock()
-            .unwrap()
-            .entries
-            .insert(id.to_owned(), HolderEntry { child, stdin });
+    fn insert_for_test(
+        &self,
+        id: &str,
+        child: Child,
+        stdin: Option<ChildStdin>,
+        ready: PodHolderReady,
+    ) {
+        self.table.lock().unwrap().entries.insert(
+            id.to_owned(),
+            HolderEntry {
+                child,
+                stdin,
+                ready,
+            },
+        );
     }
 }
 

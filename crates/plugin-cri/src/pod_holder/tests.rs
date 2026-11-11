@@ -69,7 +69,9 @@ fn insert_child(p: &ProductionPodHolder, id: &str, script: &str) -> u32 {
         .unwrap();
     let pid = c.id();
     let stdin = c.stdin.take();
-    p.insert_for_test(id, c, stdin);
+    let ns = |i| NsId { dev: 4, ino: i };
+    let ready = PodHolderReady::new(pid, ns(10), ns(11), ns(12)).unwrap();
+    p.insert_for_test(id, c, stdin, ready);
     pid
 }
 
@@ -377,4 +379,289 @@ fn cri2_inject_decision() {
     assert!(!should_inject_pod_holder::<()>(Ok(0)));
     assert!(should_inject_pod_holder::<()>(Ok(1000)));
     assert!(should_inject_pod_holder(Err(())));
+}
+// ---- #4483: READY の保存と ns の fd を開く口（SEC-5・SEC-1・REPAIR-5・PLUG-11） ----
+
+/// 偽の proc root の 1 pod 分の素材。`stage` の通常ファイルの (dev, ino) を READY の NsId にし、spawn 後に
+/// `<root>/<pid>/ns/` へ rename（inode は保たれる）で置く。
+struct Staged {
+    stage: PathBuf,
+    user: NsId,
+    ipc: NsId,
+    net: NsId,
+}
+
+fn nsid_of(path: &Path) -> NsId {
+    let m = std::fs::metadata(path).unwrap();
+    NsId {
+        dev: m.dev(),
+        ino: m.ino(),
+    }
+}
+
+impl Staged {
+    fn new(dir: &Path, tag: &str) -> Self {
+        let stage = dir.join(format!("stage-{tag}"));
+        std::fs::create_dir_all(&stage).unwrap();
+        for n in ["user", "ipc", "net"] {
+            std::fs::write(stage.join(n), tag).unwrap();
+        }
+        Self {
+            user: nsid_of(&stage.join("user")),
+            ipc: nsid_of(&stage.join("ipc")),
+            net: nsid_of(&stage.join("net")),
+            stage,
+        }
+    }
+
+    /// 自分の pid を READY に入れる偽の保持役（`$$` を欄 A に出し、`tail` の後に stdin の EOF まで生きる）。
+    fn script(&self, tail: &str) -> String {
+        let f =
+            PodHolderFrame::ready(&PodHolderReady::new(1, self.user, self.ipc, self.net).unwrap());
+        let b = f.as_bytes();
+        let (head, rest) = (octal(&b[..8]), octal(&b[16..]));
+        format!(
+            "printf '{head}'; p=$$; i=0; while [ $i -lt 8 ]; do printf \"\\\\$(printf '%03o' $(( (p >> (i*8)) & 255 )))\"; i=$((i+1)); done; printf '{rest}'; {tail}"
+        )
+    }
+
+    fn provider(&self, tail: &str) -> ProductionPodHolder {
+        sh(&self.script(tail), 8)
+    }
+
+    /// spawn 後の pid の ns ディレクトリへ stage を置く。
+    fn place(&self, root: &Path, pid: u32) {
+        let ns = root.join(pid.to_string()).join("ns");
+        std::fs::create_dir_all(&ns).unwrap();
+        for n in ["user", "ipc", "net"] {
+            std::fs::rename(self.stage.join(n), ns.join(n)).unwrap();
+        }
+    }
+}
+
+fn spawn_at(p: &ProductionPodHolder, id: &str) -> u32 {
+    let cfg = config();
+    p.spawn(&req(id, &cfg, 5000)).unwrap().pid().get()
+}
+
+fn fd_id(fd: BorrowedFd<'_>) -> NsId {
+    let f = File::from(fd.try_clone_to_owned().unwrap());
+    let m = f.metadata().unwrap();
+    NsId {
+        dev: m.dev(),
+        ino: m.ino(),
+    }
+}
+
+fn unavail(e: &TraitError, msg: &str) {
+    assert_eq!(e.code(), ErrorCode::Unavailable);
+    assert_eq!(e.message(), msg);
+}
+
+/// 固定プログラムの保持役 2 つで、pod A と pod B の fd を取り違えない（受け入れ基準。SEC-5・SEC-1・#4483）。
+#[test]
+fn sec5_sec1_4483_two_fixed_holders_open_their_own_namespaces() {
+    let root = scratch("4483-two");
+    std::fs::create_dir_all(&root).unwrap();
+    let (a, b) = (Staged::new(&root, "a"), Staged::new(&root, "b"));
+    let (pa, pb) = (
+        a.provider("exec cat >/dev/null"),
+        b.provider("exec cat >/dev/null"),
+    );
+    let (ida, idb) = (spawn_at(&pa, "a"), spawn_at(&pb, "b"));
+    a.place(&root, ida);
+    b.place(&root, idb);
+    assert_ne!(a.net, b.net);
+    let fa = pa.open_pod_namespaces_at("a", &root).unwrap();
+    assert_eq!((fa.user_id(), fa.net_id()), (a.user, a.net));
+    assert_eq!((fd_id(fa.user()), fd_id(fa.net())), (a.user, a.net));
+    let fb = pb.open_pod_namespaces_at("b", &root).unwrap();
+    assert_eq!((fd_id(fb.user()), fd_id(fb.net())), (b.user, b.net));
+    let (u, n) = fb.into_fds();
+    assert_eq!(fd_id(u.as_fd()), b.user);
+    assert_eq!(fd_id(n.as_fd()), b.net);
+    pa.release("a", Duration::from_secs(2)).unwrap();
+    pb.release("b", Duration::from_secs(2)).unwrap();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 別 pod の実体へ差し替えられた ns は (dev, ino) の不一致で拒否する。
+#[test]
+fn sec5_sec1_4483_swapped_namespace_is_rejected() {
+    let root = scratch("4483-swap");
+    std::fs::create_dir_all(&root).unwrap();
+    let (a, b) = (Staged::new(&root, "a"), Staged::new(&root, "b"));
+    let p = a.provider("exec cat >/dev/null");
+    let pid = spawn_at(&p, "a");
+    a.place(&root, pid);
+    let ns = root.join(pid.to_string()).join("ns");
+    std::fs::rename(b.stage.join("net"), ns.join("net")).unwrap();
+    unavail(
+        &p.open_pod_namespaces_at("a", &root).unwrap_err(),
+        MSG_NS_IDENTITY_MISMATCH,
+    );
+    std::fs::rename(b.stage.join("user"), ns.join("user")).unwrap();
+    unavail(
+        &p.open_pod_namespaces_at("a", &root).unwrap_err(),
+        MSG_NS_IDENTITY_MISMATCH,
+    );
+    p.release("a", Duration::from_secs(2)).unwrap();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// ns のファイルが無ければ open の失敗で fail-closed。
+#[test]
+fn sec5_4483_missing_namespace_file_fails_closed() {
+    let root = scratch("4483-missing");
+    std::fs::create_dir_all(&root).unwrap();
+    let a = Staged::new(&root, "a");
+    let p = a.provider("exec cat >/dev/null");
+    let pid = spawn_at(&p, "a");
+    a.place(&root, pid);
+    std::fs::remove_file(root.join(pid.to_string()).join("ns").join("net")).unwrap();
+    unavail(
+        &p.open_pod_namespaces_at("a", &root).unwrap_err(),
+        MSG_NS_OPEN_FAILED,
+    );
+    p.release("a", Duration::from_secs(2)).unwrap();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 終了済みの保持役は、ファイルが残っていても拒否し、回収はしない（REPAIR-5・SEC-5）。
+#[test]
+fn sec5_repair5_4483_exited_holder_is_rejected_without_reaping() {
+    let root = scratch("4483-exited");
+    std::fs::create_dir_all(&root).unwrap();
+    let a = Staged::new(&root, "a");
+    let p = a.provider("exit 0");
+    let pid = spawn_at(&p, "a");
+    a.place(&root, pid);
+    let mut seen = false;
+    for _ in 0..500 {
+        if p.liveness("a").unwrap() == PodHolderLiveness::Exited {
+            seen = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(seen);
+    unavail(
+        &p.open_pod_namespaces_at("a", &root).unwrap_err(),
+        MSG_NS_HOLDER_UNAVAILABLE,
+    );
+    assert!(!proc_gone(pid));
+    p.release("a", Duration::from_secs(2)).unwrap();
+    assert!(proc_gone(pid));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 未知・release 済み・解放中・orphans だけにある ID は不在扱い。
+#[test]
+fn sec5_4483_unknown_released_and_releasing_ids_fail_closed() {
+    let root = scratch("4483-absent");
+    std::fs::create_dir_all(&root).unwrap();
+    let a = Staged::new(&root, "a");
+    let p = a.provider("exec cat >/dev/null");
+    unavail(
+        &p.open_pod_namespaces_at("nope", &root).unwrap_err(),
+        MSG_NS_HOLDER_UNAVAILABLE,
+    );
+    let pid = spawn_at(&p, "a");
+    a.place(&root, pid);
+    assert!(p.open_pod_namespaces_at("a", &root).is_ok());
+    // 解放中（stdin を take 済み）を再現する。
+    let taken = p
+        .table
+        .lock()
+        .unwrap()
+        .entries
+        .get_mut("a")
+        .unwrap()
+        .stdin
+        .take();
+    drop(taken);
+    unavail(
+        &p.open_pod_namespaces_at("a", &root).unwrap_err(),
+        MSG_NS_HOLDER_UNAVAILABLE,
+    );
+    p.release("a", Duration::from_secs(2)).unwrap();
+    unavail(
+        &p.open_pod_namespaces_at("a", &root).unwrap_err(),
+        MSG_NS_HOLDER_UNAVAILABLE,
+    );
+    let orphan = Command::new("sh")
+        .args(["-c", "exec sleep 600"])
+        .spawn()
+        .unwrap();
+    p.table.lock().unwrap().orphans.insert("o".into(), orphan);
+    unavail(
+        &p.open_pod_namespaces_at("o", &root).unwrap_err(),
+        MSG_NS_HOLDER_UNAVAILABLE,
+    );
+    let _ = p.release("o", Duration::from_secs(2));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 実 `/proc` の公開口: 自プロセスの ns の素性を READY に入れた偽の保持役（unshare しない子）で成功し、
+/// 偽の NsId では不一致になる。
+#[test]
+fn sec5_4483_real_proc_open_matches_recorded_identity() {
+    let own = |n: &str| nsid_of(Path::new(&format!("/proc/self/ns/{n}")));
+    let (user, ipc, net) = (own("user"), own("ipc"), own("net"));
+    let st = Staged {
+        stage: PathBuf::new(),
+        user,
+        ipc,
+        net,
+    };
+    let p = st.provider("exec cat >/dev/null");
+    spawn_at(&p, "x");
+    let f = p.open_pod_namespaces("x").unwrap();
+    assert_eq!((f.user_id(), f.net_id()), (user, net));
+    assert_eq!((fd_id(f.user()), fd_id(f.net())), (user, net));
+    p.release("x", Duration::from_secs(2)).unwrap();
+
+    let q = sh("exec cat >/dev/null", 8);
+    insert_child(&q, "fake", "exec cat >/dev/null");
+    unavail(
+        &q.open_pod_namespaces("fake").unwrap_err(),
+        MSG_NS_IDENTITY_MISMATCH,
+    );
+    q.release("fake", Duration::from_secs(2)).unwrap();
+}
+
+/// supervisor の bin の解決の共通口: 隣の固定名・0755 で成功し、0775・不在・親なしは拒否する（PLUG-11・#4483）。
+#[test]
+fn plug11_4483_supervisor_beside_resolution_is_shared() {
+    let euid = current_euid().unwrap();
+    let dir = scratch("4483-beside");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let exe = dir.join("plugin");
+    let sup = holder_executable_beside(&exe).unwrap();
+    assert_eq!(
+        open_supervisor_beside_at(&exe, euid)
+            .err()
+            .map(|e| e.code()),
+        Some(ErrorCode::FailedPrecondition)
+    );
+    std::fs::write(&sup, b"#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&sup, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // 祖先（temp_dir）が検査を通らない環境では成功を要求しない（環境依存の部分だけを分ける）。
+    let tmp_ok = check_ancestors_trust(&sup, euid).is_ok();
+    let r = open_supervisor_beside_at(&exe, euid);
+    assert_eq!(r.is_ok(), tmp_ok);
+    if let Ok(v) = r {
+        let prog = v.command().get_program().to_string_lossy().into_owned();
+        assert!(prog.starts_with("/proc/self/fd/"), "{prog}");
+    }
+    std::fs::set_permissions(&sup, std::fs::Permissions::from_mode(0o775)).unwrap();
+    assert_eq!(
+        open_supervisor_beside_at(&exe, euid)
+            .err()
+            .map(|e| e.message().to_owned()),
+        Some(MSG_UNTRUSTED_EXE.to_owned())
+    );
+    assert!(open_supervisor_beside_at(Path::new("plugin"), euid).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
 }

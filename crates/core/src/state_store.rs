@@ -418,18 +418,83 @@ struct LockedState {
 }
 
 /// ロックの RAII ガード。drop でファイルロックとミューテックスが解放される。
+///
+/// `@lock` は drop で明示 unlock してから閉じる。`flock` は open file description（OFD）に付くため、
+/// ロック保持中に fork した子が fd の複製を持つと、close だけでは子が exec・終了するまで解放されず、
+/// 別の取得側が `STATE_LOCK_TIMEOUT` まで待って `Timeout` になる（#3471・#3470 の判断・OCI-5・REPAIR-5）。
 struct StoreGuard<'a> {
     process: MutexGuard<'a, LockedState>,
     gate: Arc<RootGate>,
-    /// drop で最初に閉じる（`@lock` の解放）。`Option` なのは `Drop` で取り出すため。
+    /// drop で最初に明示 unlock して閉じる（`@lock` の解放）。`Option` なのは `Drop` で取り出すため。
     file: Option<File>,
 }
 
+/// `@lock` の解放結果。unlock の失敗は close を止めず、呼び出し側のログ判断にだけ使う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockRelease {
+    /// unlock に成功して閉じた。
+    Unlocked,
+    /// unlock に失敗したが閉じた（OS はプロセス終了か最後の close でロックを解放する）。
+    UnlockFailed,
+}
+
+/// `unlock` を 1 回呼び、結果によらず `file` を閉じる。panic しない（`StoreGuard::drop` から呼ばれる）。
+/// 製品は [`release_lock_file`]、試験は失敗を注入するためこちらを使う（`LOCK_UN` は実環境でほぼ失敗しない）。
+fn release_lock_file_with(
+    file: File,
+    unlock: impl FnOnce(&File) -> std::io::Result<()>,
+) -> LockRelease {
+    let outcome = match unlock(&file) {
+        Ok(()) => LockRelease::Unlocked,
+        Err(_) => LockRelease::UnlockFailed,
+    };
+    drop(file);
+    outcome
+}
+
+/// `File::unlock` で解放する製品用の入口。
+fn release_lock_file(file: File) -> LockRelease {
+    release_lock_file_with(file, File::unlock)
+}
+
+/// unlock 失敗の固定ログ行（改行なし）。パス・errno・OS 由来の文字列は含めない。
+#[cfg(target_os = "linux")]
+const UNLOCK_FAILED_LINE: &str = "{\"level\":\"warn\",\"event\":\"state_lock_unlock_failed\",\"lock\":\"@lock\",\"action\":\"closed\"}";
+
+/// `UnlockFailed` のときだけ `out` へ固定行を待たずに出す（REPAIR-5）。`Unlocked` は何も出さず `None`。
+///
+/// gate を握ったまま呼ばれるため、止まる出力先へ書かない `exec::emit_diagnostic_line_to`
+/// （AF_UNIX の socket にだけ `MSG_DONTWAIT` で 1 回送る）に限る。stderr が socket でなければ捨てられる。
+/// 非 Linux には待たない出力経路が無いため、ログは出さず捨てる（実装済みを装わない。REPAIR-3）。
+#[cfg(target_os = "linux")]
+fn report_lock_release_to(
+    outcome: LockRelease,
+    out: std::os::fd::BorrowedFd<'_>,
+) -> Option<crate::exec::DiagnosticDelivery> {
+    match outcome {
+        LockRelease::Unlocked => None,
+        LockRelease::UnlockFailed => Some(crate::exec::emit_diagnostic_line_to(
+            out,
+            UNLOCK_FAILED_LINE,
+        )),
+    }
+}
+
 impl Drop for StoreGuard<'_> {
-    /// 解放の順序: `@lock` を閉じる -> 共有ゲートを解放して時刻を記録する -> （フィールド drop で）
+    /// 解放の順序: `@lock` を明示 unlock して閉じる（失敗は固定ログを出して close を続ける。panic しない。
+    /// macOS ではログを出さない）-> 共有ゲートを解放して時刻を記録する -> （フィールド drop で）
     /// プロセス内 `Mutex` を解放する。次の取得側が `LOCK_HANDOFF_GAP` を空けられるようにする（#2229）。
     fn drop(&mut self) {
-        drop(self.file.take());
+        if let Some(file) = self.file.take() {
+            let outcome = release_lock_file(file);
+            #[cfg(target_os = "linux")]
+            {
+                use std::os::fd::AsFd as _;
+                let _ = report_lock_release_to(outcome, std::io::stderr().as_fd());
+            }
+            #[cfg(not(target_os = "linux"))]
+            let _ = outcome;
+        }
         self.gate.release();
     }
 }
@@ -2438,7 +2503,7 @@ impl StateDto {
 ///
 /// `FileStateStore::lock` から呼ばれ、`@lock` を別プロセス（CLI・supervisor。TASK-157.9・SUP-1）が
 /// 保持している間は [`LOCK_RETRY_INTERVAL`]（1ms）間隔で再試行し、`deadline` を過ぎたら `Timeout` で失敗する（無期限に待たない）。
-/// std の `File::try_lock` のみを使うため追加依存なしで 3 OS で動く。ロックは `file` を閉じると解放され、
+/// std の `File::try_lock` のみを使うため追加依存なしで 3 OS で動く。ロックは `StoreGuard` の drop の明示 unlock で解放され、
 /// 保持プロセスが死んでも OS が解放する。待ち順は保証しない（公平性は解放側の
 /// `LOCK_HANDOFF_GAP` で補う。期限は変わらない。#2229）。
 fn lock_file_until(file: &File, deadline: Instant) -> Result<(), TraitError> {
@@ -2626,6 +2691,98 @@ mod platform_tests {
             .truncate(false)
             .open(path)
             .unwrap()
+    }
+
+    /// 子プロセスを kill して期限つきで回収する RAII（REPAIR-5。assert 失敗でも `sleep` を残さない）。
+    #[cfg(unix)]
+    struct SleepChild(std::process::Child);
+
+    #[cfg(unix)]
+    impl SleepChild {
+        /// `dup`（同じ OFD の複製）を stdin として持つ `sleep` 子を起動する。
+        fn spawn_holding(dup: File) -> Self {
+            let child = std::process::Command::new("sleep")
+                .arg("30")
+                .stdin(std::process::Stdio::from(dup))
+                .spawn()
+                .unwrap();
+            Self(child)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for SleepChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let end = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < end {
+                if !matches!(self.0.try_wait(), Ok(None)) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    /// OCI-5・REPAIR-5（#3471）: fork 子が `@lock` の fd 複製を持って待機していても、`StoreGuard` の drop の
+    /// 直後に別の取得が期限内に通る。陽性対照として、close だけでは子の持つ OFD のロックが残ることも固定する。
+    #[cfg(unix)]
+    #[test]
+    fn oci5_repair5_3471_store_guard_drop_releases_lock_despite_inherited_fd() {
+        let (_scratch, path) = scratch_lock_file("inherit3471");
+        let file = open_lock(&path);
+        file.try_lock().unwrap();
+        let process_state = Mutex::new(LockedState::default());
+        let gate = Arc::new(RootGate::default());
+        gate.acquire(Instant::now() + Duration::from_secs(2))
+            .unwrap();
+        let guard = StoreGuard {
+            process: process_state.lock().unwrap(),
+            gate: Arc::clone(&gate),
+            file: Some(file),
+        };
+        let dup = guard.file.as_ref().unwrap().try_clone().unwrap();
+        let mut child = SleepChild::spawn_holding(dup);
+        let probe = open_lock(&path);
+        let held = probe.try_lock();
+        drop(guard);
+        let waiter = open_lock(&path);
+        let started = Instant::now();
+        let acquired = lock_file_until(&waiter, started + Duration::from_secs(2));
+        let elapsed = started.elapsed();
+        let child_alive = matches!(child.0.try_wait(), Ok(None));
+
+        // 陽性対照: unlock せず close しただけでは、子が複製を持つ間ロックが残る。
+        let (_scratch2, path2) = scratch_lock_file("inherit3471ctl");
+        let plain = open_lock(&path2);
+        plain.try_lock().unwrap();
+        let _child2 = SleepChild::spawn_holding(plain.try_clone().unwrap());
+        drop(plain);
+        let control = open_lock(&path2).try_lock();
+
+        assert!(matches!(held, Err(std::fs::TryLockError::WouldBlock)));
+        assert!(acquired.is_ok(), "{acquired:?}");
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+        assert!(child_alive);
+        assert!(matches!(control, Err(std::fs::TryLockError::WouldBlock)));
+    }
+
+    /// OCI-5・REPAIR-5（#3471）: unlock が失敗しても close は続き、panic せず `UnlockFailed` を返す。
+    #[cfg(unix)]
+    #[test]
+    fn oci5_repair5_3471_release_continues_close_when_unlock_fails() {
+        let (_scratch, path) = scratch_lock_file("unlockfail3471");
+        let file = open_lock(&path);
+        file.try_lock().unwrap();
+        let outcome = release_lock_file_with(file, |_| Err(std::io::Error::other("injected")));
+        assert_eq!(outcome, LockRelease::UnlockFailed);
+        let waiter = open_lock(&path);
+        lock_file_until(&waiter, Instant::now() + Duration::from_secs(2)).unwrap();
+        waiter.unlock().unwrap();
+
+        let ok = open_lock(&path);
+        ok.try_lock().unwrap();
+        assert_eq!(release_lock_file(ok), LockRelease::Unlocked);
     }
 
     /// REPAIR-5・TASK-157.9: 別の記述子が保持するロックは期限で打ち切り、`Timeout` で失敗する（3 OS）。
@@ -2951,6 +3108,26 @@ mod tests {
     use std::num::NonZeroU32;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// OCI-5・REPAIR-5（#3471）: unlock 失敗の固定行は 1 行の JSON で、`UnlockFailed` のときだけ socket へ出る。
+    #[test]
+    fn oci5_repair5_3471_unlock_failure_line_is_fixed_json() {
+        use std::os::fd::AsFd as _;
+        use std::os::unix::net::UnixStream;
+        assert!(!UNLOCK_FAILED_LINE.contains('\n'));
+        let v: serde_json::Value = serde_json::from_str(UNLOCK_FAILED_LINE).unwrap();
+        assert_eq!(v["event"], "state_lock_unlock_failed");
+        assert_eq!(v["level"], "warn");
+
+        let (a, mut b) = UnixStream::pair().unwrap();
+        b.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        assert!(report_lock_release_to(LockRelease::Unlocked, a.as_fd()).is_none());
+        let sent = report_lock_release_to(LockRelease::UnlockFailed, a.as_fd());
+        assert!(matches!(sent, Some(crate::exec::DiagnosticDelivery::Sent)));
+        let mut buf = vec![0u8; UNLOCK_FAILED_LINE.len() + 1];
+        Read::read_exact(&mut b, &mut buf).unwrap();
+        assert_eq!(buf, format!("{UNLOCK_FAILED_LINE}\n").into_bytes());
+    }
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);
 

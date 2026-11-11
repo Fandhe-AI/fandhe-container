@@ -229,7 +229,7 @@ pub(crate) fn check_netns(observed: NsId, expected: NsId) -> Result<(), DialedSo
 ///
 /// fd は所有権ごと受け取り、拒否なら drop で閉じる。検査の内容と順序はモジュール doc を参照。
 /// 成功経路（pod の netns の socket が `Ok`）と別 netns の socket の `NetnsMismatch` の実機での照合は
-/// #4480 の実機前提試験が担う。
+/// 実機前提試験 `netns_dial_userns`（#4480）が担う。
 pub fn verify_dialed_socket(
     fd: std::os::fd::OwnedFd,
     expected: DialExpectation,

@@ -4,7 +4,8 @@
 //! # 呼び出し文脈
 //! - supervisor 側の `NetnsHolderChannel`（`socketpair`・`SCM_RIGHTS` つき `sendmsg`・`recvmsg`）
 //! - holder プロセス側の `run_netns_holder_main`（stdin のソケット種別・`SO_PEERCRED`・`recvmsg`・`setns(2)`・
-//!   `prctl(2)`・`capset(2)`）
+//!   `prctl(2)`・`capset(2)`）。`SO_PEERCRED`・`recvmsg` は共通部品 `crate::netns_helper` 経由で
+//!   netns-dial helper（`run_netns_dial_main`）からも呼ばれる（#4510）
 //!
 //! # 契約
 //! - 親 `sys` と同じ（`unsafe fn` を公開しない・`SAFETY:` の明記・arch ごとの定数・戻り値 -1 は直後に errno を確保）

@@ -28,25 +28,26 @@ use super::{
     ContainerStatePresence, ImageStore,
 };
 use crate::error::{OciError, OciErrorCode};
-use std::fs::{File, TryLockError};
+use crate::flock_release::ExplicitUnlockFile;
+use std::fs::TryLockError;
 use std::time::Instant;
 
 /// create ゲートのロックファイル名（ストア root 直下）。
 pub const IMAGE_STORE_CREATE_GATE_FILE_NAME: &str = "@create-gate";
 
-/// イメージつき create の進行中を示す共有ロックの保持証（Drop で解放）。
+/// イメージつき create の進行中を示す共有ロックの保持証（Drop で明示 unlock して閉じる。複製 fd が残っても外れる。#4513）。
 #[derive(Debug)]
 pub struct ContainerCreatePass<'a> {
-    _file: File,
+    _file: ExplicitUnlockFile,
     _store: &'a ImageStore,
 }
 
-/// 進行中のイメージつき create が無いことを示す排他ロックの保持証（Drop で解放）。
+/// 進行中のイメージつき create が無いことを示す排他ロックの保持証（Drop で明示 unlock して閉じる。#4513）。
 ///
 /// 未確定参照の回収入口（`*_quiesced`）はこの型を要求する。
 #[derive(Debug)]
 pub struct CreateQuiescence<'a> {
-    _file: File,
+    _file: ExplicitUnlockFile,
     store: &'a ImageStore,
 }
 
@@ -55,6 +56,22 @@ fn gate_error() -> OciError {
         OciErrorCode::Internal,
         "failed to lock the container create gate",
     )
+}
+
+impl ContainerCreatePass<'_> {
+    /// 試験用: ゲートファイルの OFD の複製（fork 子の代役。#4513）。
+    #[cfg(all(test, unix))]
+    fn lock_file_clone_for_test(&self) -> std::fs::File {
+        self._file.clone_file_for_test()
+    }
+}
+
+impl CreateQuiescence<'_> {
+    /// 試験用: ゲートファイルの OFD の複製（fork 子の代役。#4513）。
+    #[cfg(all(test, unix))]
+    fn lock_file_clone_for_test(&self) -> std::fs::File {
+        self._file.clone_file_for_test()
+    }
 }
 
 impl ImageStore {
@@ -68,7 +85,7 @@ impl ImageStore {
             match file.try_lock_shared() {
                 Ok(()) => {
                     return Ok(ContainerCreatePass {
-                        _file: file,
+                        _file: ExplicitUnlockFile::new(file),
                         _store: self,
                     });
                 }
@@ -95,7 +112,7 @@ impl ImageStore {
             match file.try_lock() {
                 Ok(()) => {
                     return Ok(Some(CreateQuiescence {
-                        _file: file,
+                        _file: ExplicitUnlockFile::new(file),
                         store: self,
                     }));
                 }
@@ -336,6 +353,72 @@ mod tests {
             ContainerRefRelease::Released(d(0xa0))
         );
         assert_eq!(store.lock().expect("lock").unbound_containers().count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn gate_file(dir: &Path) -> std::fs::File {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join(IMAGE_STORE_CREATE_GATE_FILE_NAME))
+            .expect("open gate file")
+    }
+
+    /// OCI-5・REPAIR-5（#4513）: 共有 pass は複製 fd が残っても drop で外れる（陽性対照: 包まない File は残る）。
+    #[test]
+    fn oci5_repair5_4513_create_pass_drop_releases_gate_despite_duplicate_fd() {
+        let dir = open_dir("pass-dup");
+        let store = open(&dir);
+        let pass = store.enter_container_create().expect("pass");
+        let dup = pass.lock_file_clone_for_test();
+        assert!(matches!(
+            gate_file(&dir).try_lock(),
+            Err(TryLockError::WouldBlock)
+        ));
+        drop(pass);
+        let probe = gate_file(&dir);
+        assert!(probe.try_lock().is_ok());
+        probe.unlock().expect("unlock probe");
+        drop(dup);
+
+        // 陽性対照: 包まない File は close だけでは複製がある間ロックが残る。
+        let plain = gate_file(&dir);
+        plain.try_lock_shared().expect("plain shared");
+        let plain_dup = plain.try_clone().expect("dup");
+        drop(plain);
+        assert!(matches!(
+            gate_file(&dir).try_lock(),
+            Err(TryLockError::WouldBlock)
+        ));
+        drop(plain_dup);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// OCI-5・REPAIR-5（#4513）: 排他 quiescence も複製 fd が残っても drop で外れる。
+    #[test]
+    fn oci5_repair5_4513_quiescence_drop_releases_gate_despite_duplicate_fd() {
+        let dir = open_dir("quiesce-dup");
+        let store = open(&dir);
+        let q = store.quiesce_container_creates().expect("q").expect("some");
+        let dup = q.lock_file_clone_for_test();
+        assert!(matches!(
+            gate_file(&dir).try_lock_shared(),
+            Err(TryLockError::WouldBlock)
+        ));
+        drop(q);
+        let probe = gate_file(&dir);
+        assert!(probe.try_lock_shared().is_ok());
+        probe.unlock().expect("unlock probe");
+        drop(dup);
+
+        let plain = gate_file(&dir);
+        plain.try_lock().expect("plain exclusive");
+        let plain_dup = plain.try_clone().expect("dup");
+        drop(plain);
+        assert!(matches!(
+            gate_file(&dir).try_lock_shared(),
+            Err(TryLockError::WouldBlock)
+        ));
+        drop(plain_dup);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -285,6 +285,10 @@ fn cri6_4484_invalid_port_and_timeout_do_not_spawn() {
             MSG_TIMEOUT_POSITIVE.to_owned()
         )
     );
+    assert_eq!(
+        err_of(d.dial(&pod("a"), 80, Duration::MAX)),
+        (CriErrorCode::InvalidArgument, MSG_TIMEOUT_RANGE.to_owned())
+    );
     assert_eq!(sp.spawns.load(Ordering::SeqCst), 0);
     assert_eq!(src.calls.load(Ordering::SeqCst), 0);
 }

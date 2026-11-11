@@ -66,6 +66,7 @@ pub const CONNECT_MARGIN: Duration = Duration::from_millis(500);
 const REAP_POLL: Duration = Duration::from_millis(10);
 
 const MSG_PORT_RANGE: &str = "port forward port is out of range";
+const MSG_TIMEOUT_RANGE: &str = "port forward dial timeout is out of range";
 const MSG_TIMEOUT_POSITIVE: &str = "port forward dial timeout must be positive";
 const MSG_RETAINED_FULL: &str = "too many netns-dial helpers are retained";
 const MSG_TIMED_OUT: &str = "port forward dial timed out";
@@ -210,7 +211,10 @@ impl PodNetnsDialer {
         port: u16,
         timeout: Duration,
     ) -> Result<TcpStream, CriError> {
-        let deadline = Instant::now() + timeout;
+        // Instant で表現できない巨大な timeout（`Duration::MAX` 等）は panic させず拒否する（REPAIR-5）。
+        let Some(deadline) = Instant::now().checked_add(timeout) else {
+            return Err(CriError::invalid_argument(MSG_TIMEOUT_RANGE));
+        };
         let Some(port) = NonZeroU16::new(port) else {
             return Err(CriError::invalid_argument(MSG_PORT_RANGE));
         };
@@ -346,7 +350,12 @@ impl Drop for DialHelper<'_> {
 
 /// `within` の間 `try_wait` で終了（回収）を待つ。回収できたら true。
 fn wait_exit(child: &mut Child, within: Duration) -> bool {
-    let end = Instant::now() + within;
+    // 加算できない（巨大な）待ちは、表現できる最大の先の時刻として扱い panic させない。
+    let now0 = Instant::now();
+    let end = now0
+        .checked_add(within)
+        .or_else(|| now0.checked_add(Duration::from_secs(86_400 * 365)))
+        .unwrap_or(now0);
     loop {
         if matches!(child.try_wait(), Ok(Some(_))) {
             return true;

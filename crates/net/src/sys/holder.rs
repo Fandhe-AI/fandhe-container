@@ -8,7 +8,8 @@
 //!
 //! # 契約
 //! - 親 `sys` と同じ（`unsafe fn` を公開しない・`SAFETY:` の明記・arch ごとの定数・戻り値 -1 は直後に errno を確保）
-//! - 受け取った fd はすべて `OwnedFd` で所有する（拒否時は drop で閉じる）。受信上限は `CMSG_LEN` で切り（`cmsg_len`）、2 本分
+//! - 受け取った fd はすべて `OwnedFd` で所有する（拒否時は drop で閉じる）。制御メッセージの形式違反・負値の fd でも、
+//!   読めた fd は閉じてから `EINVAL` を返す（#4498。位置を特定できない fd は閉じられない。`recv_with_fds` の「残余」）。受信上限は `CMSG_LEN` で切り（`cmsg_len`）、2 本分
 //!   （`MAX_FDS`）なら 3 本目以降、1 本（`recv_one_fd`）なら 2 本目以降をカーネルが閉じて `MSG_CTRUNC` を立てる
 //! - 待ちは持たない（`MSG_DONTWAIT`）。期限つきの待ちは親の `wait_readable` と `Deadline` が担う（REPAIR-5）
 //!
@@ -353,38 +354,124 @@ pub(crate) struct Received {
     pub fds: Vec<OwnedFd>,
 }
 
+/// 制御データの解析結果。形式違反があっても、そこまでに読めた fd 番号を失わない（#4498・SEC-1・REPAIR-5）。
+#[derive(Debug, PartialEq, Eq)]
+struct ScmRights {
+    /// 形式違反を見つけた時点までに読めた `SCM_RIGHTS` の fd 番号（負値も含めてそのまま）。
+    fds: Vec<RawFd>,
+    /// 最初に見つけた形式違反（無ければ `None`）。
+    malformed: Option<ScmMalformed>,
+}
+
+/// 制御データの形式違反の種別。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScmMalformed {
+    /// 残りが `cmsghdr`（16 バイト）に満たない。以降の位置を特定できない。
+    HeaderTruncated,
+    /// `cmsg_len` が 16 未満、またはバッファの終端を越える（桁あふれを含む）。以降の位置を特定できない。
+    LengthMismatch,
+    /// `SCM_RIGHTS` のデータ長が 4 の倍数でない（先頭の完全な 4 バイトは fd として読む）。
+    DataNotFdAligned,
+}
+
 /// 制御データのバイト列から `SCM_RIGHTS` の fd 番号を取り出す（純関数。境界はすべて checked）。
-/// 形式違反（長さの矛盾）は `None`。他の level / type の cmsg は読み飛ばす。
-fn parse_scm_rights(ctrl: &[u8]) -> Option<Vec<RawFd>> {
+/// 形式違反は `malformed` に記録して止まり、それまでに読めた fd 番号は `fds` に残す。他の level / type の cmsg は読み飛ばす。
+fn parse_scm_rights(ctrl: &[u8]) -> ScmRights {
     let mut fds = Vec::new();
     let mut off = 0usize;
-    while off < ctrl.len() {
-        let hdr = ctrl.get(off..off.checked_add(CMSG_HDR_LEN)?)?;
-        let len = usize::from_ne_bytes(hdr.get(0..8)?.try_into().ok()?);
-        let level = i32::from_ne_bytes(hdr.get(8..12)?.try_into().ok()?);
-        let kind = i32::from_ne_bytes(hdr.get(12..16)?.try_into().ok()?);
-        if len < CMSG_HDR_LEN {
-            return None;
+    let malformed = loop {
+        if off >= ctrl.len() {
+            break None;
         }
-        let end = off.checked_add(len)?;
-        let data = ctrl.get(off.checked_add(CMSG_HDR_LEN)?..end)?;
+        let Some(hdr) = off.checked_add(CMSG_HDR_LEN).and_then(|e| ctrl.get(off..e)) else {
+            break Some(ScmMalformed::HeaderTruncated);
+        };
+        let fields = (
+            hdr.get(0..8).and_then(|b| <[u8; 8]>::try_from(b).ok()),
+            hdr.get(8..12).and_then(|b| <[u8; 4]>::try_from(b).ok()),
+            hdr.get(12..16).and_then(|b| <[u8; 4]>::try_from(b).ok()),
+        );
+        let (Some(len_b), Some(lvl_b), Some(kind_b)) = fields else {
+            break Some(ScmMalformed::HeaderTruncated);
+        };
+        let len = usize::from_ne_bytes(len_b);
+        let level = i32::from_ne_bytes(lvl_b);
+        let kind = i32::from_ne_bytes(kind_b);
+        if len < CMSG_HDR_LEN {
+            break Some(ScmMalformed::LengthMismatch);
+        }
+        let Some(data) = off
+            .checked_add(len)
+            .and_then(|end| ctrl.get(off.checked_add(CMSG_HDR_LEN)?..end))
+        else {
+            break Some(ScmMalformed::LengthMismatch);
+        };
+        let mut bad = None;
         if level == consts::SOL_SOCKET && kind == consts::SCM_RIGHTS {
-            if data.len() % 4 != 0 {
-                return None;
-            }
+            // データ長が 4 の倍数でなくても、ヘッダーの範囲は収まっているので完全な 4 バイトの塊は読む。
             for c in data.as_chunks::<4>().0 {
                 fds.push(i32::from_ne_bytes(*c));
             }
+            if data.len() % 4 != 0 {
+                bad = Some(ScmMalformed::DataNotFdAligned);
+            }
         }
-        off = off.checked_add(cmsg_align(len))?;
+        if bad.is_some() {
+            break bad;
+        }
+        match off.checked_add(cmsg_align(len)) {
+            Some(next) => off = next,
+            None => break Some(ScmMalformed::LengthMismatch),
+        }
+    };
+    ScmRights { fds, malformed }
+}
+
+/// `fd` 番号の分類結果。`OwnedFd` にできる値（0 以上）と、捨てた不正値の件数。
+#[derive(Debug, PartialEq, Eq)]
+struct ValidFds {
+    fds: Vec<RawFd>,
+    invalid_count: usize,
+}
+
+/// fd 番号を、`OwnedFd` にできる値（0 以上）と不正値（負値）に分ける（純関数）。負値は `from_raw_fd` へ渡さない。
+fn split_valid_fds(raw: &[RawFd]) -> ValidFds {
+    let fds: Vec<RawFd> = raw.iter().copied().filter(|fd| *fd >= 0).collect();
+    ValidFds {
+        invalid_count: raw.len() - fds.len(),
+        fds,
     }
-    Some(fds)
+}
+
+/// 解析結果の fd を所有し、形式違反・不正値があれば閉じてから `Os(EINVAL)` を返す（#4498・SEC-1・REPAIR-5）。
+/// `OwnedFd::from_raw_fd` を呼ぶ唯一の箇所。`recvmsg` の制御データの解析結果以外を渡さない（試験は所有を放棄した番号だけ）。
+fn adopt_scm_rights(parsed: ScmRights) -> Result<Vec<OwnedFd>, SysError> {
+    let valid = split_valid_fds(&parsed.fds);
+    let owned: Vec<OwnedFd> = valid
+        .fds
+        .into_iter()
+        // SAFETY: 0 以上であることを `split_valid_fds` で検査済み。本番では `SCM_RIGHTS` の fd は `recvmsg` がこの呼び出しで
+        // 受信側に新規に割り当てたもので他に所有者がいない。呼び出し側は所有を譲った番号だけを渡す（試験は `into_raw_fd` 後の番号）。
+        .map(|raw| unsafe { OwnedFd::from_raw_fd(raw) })
+        .collect();
+    if parsed.malformed.is_some() || valid.invalid_count > 0 {
+        drop(owned);
+        return Err(SysError::Os(super::EINVAL));
+    }
+    Ok(owned)
 }
 
 /// 1 通を待たずに受信する（`MSG_CMSG_CLOEXEC | MSG_DONTWAIT`）。通常は `wait_readable` の後に呼ぶ。
 ///
 /// `max_fds` は受け取る fd の上限（0 から `MAX_FDS`）。制御バッファ長は `CMSG_LEN` で切るため（[`cmsg_len`]）
 /// その本数ちょうどで、超過分はカーネルが閉じて `ctrl_truncated` が立つ。待機中のメッセージが無ければ `Os(EAGAIN)`。
+///
+/// 制御メッセージの形式違反・負値の fd は `Os(EINVAL)` だが、読めた fd は閉じてから返す（#4498・SEC-1・REPAIR-5）。
+///
+/// # 残余
+/// `cmsg_len` が壊れている（16 未満・終端越え・ヘッダー切れ）と、以降の cmsg の位置と fd 番号を特定できない。
+/// 無関係な fd を誤って閉じないよう推測では閉じないため、その分の fd は漏れうる。制御データの切り出しに失敗した
+/// 場合も同じ。カーネルの出力では通常起こらない。同型の supervisor 側は #2717 で追う。
 pub(crate) fn recv_with_fds(
     fd: BorrowedFd<'_>,
     buf: &mut [u8],
@@ -431,16 +518,12 @@ pub(crate) fn recv_with_fds(
     };
     let n = usize::try_from(n).map_err(|_| last_error())?;
     let ctl_used = msg.controllen.min(ctl_len);
-    let parsed = control.0.get(..ctl_used).and_then(parse_scm_rights);
-    let Some(raw_fds) = parsed else {
-        // 形式違反は起こりえない（カーネルの出力）。拾えない fd 番号は所有できないため、エラーにするだけ。
+    let Some(ctrl) = control.0.get(..ctl_used) else {
+        // 切り出せないと fd 番号を読めない（「残余」）。`ctl_used <= ctl_len <= CONTROL_CAP` のため通常は起こらない。
         return Err(SysError::Os(super::EINVAL));
     };
-    let fds = raw_fds
-        .into_iter()
-        // SAFETY: `SCM_RIGHTS` の fd は `recvmsg` がこの呼び出しで受信側に新規に割り当てたもので、他に所有者がいない。
-        .map(|raw| unsafe { OwnedFd::from_raw_fd(raw) })
-        .collect();
+    // 形式違反・負値でも、読めた fd は `adopt_scm_rights` が所有して閉じてから `EINVAL` を返す（#4498）。
+    let fds = adopt_scm_rights(parse_scm_rights(ctrl))?;
     Ok(Received {
         len: n.min(buf.len()),
         data_truncated: msg.flags & super::consts::MSG_TRUNC != 0,
@@ -683,13 +766,22 @@ mod tests {
         v
     }
 
+    fn fd_bytes(fds: &[i32]) -> Vec<u8> {
+        fds.iter().flat_map(|f| f.to_ne_bytes()).collect()
+    }
+
+    fn rights(fds: &[i32], malformed: Option<ScmMalformed>) -> ScmRights {
+        ScmRights {
+            fds: fds.to_vec(),
+            malformed,
+        }
+    }
+
     /// NET-9・REPAIR-2: `SCM_RIGHTS` 2 本を具体値で取り出す。
     #[test]
     fn parse_scm_rights_two_fds() {
-        let mut p = 7i32.to_ne_bytes().to_vec();
-        p.extend_from_slice(&9i32.to_ne_bytes());
-        let ctrl = cmsg_bytes(1, 1, &p, None);
-        assert_eq!(parse_scm_rights(&ctrl), Some(vec![7, 9]));
+        let ctrl = cmsg_bytes(1, 1, &fd_bytes(&[7, 9]), None);
+        assert_eq!(parse_scm_rights(&ctrl), rights(&[7, 9], None));
     }
 
     /// 他の level / type の cmsg は読み飛ばす。
@@ -697,20 +789,125 @@ mod tests {
     fn parse_scm_rights_skips_other_cmsg() {
         let mut ctrl = cmsg_bytes(1, 2, &[0; 12], None);
         ctrl.extend(cmsg_bytes(1, 1, &5i32.to_ne_bytes(), None));
-        assert_eq!(parse_scm_rights(&ctrl), Some(vec![5]));
+        assert_eq!(parse_scm_rights(&ctrl), rights(&[5], None));
     }
 
-    /// 長さの矛盾・fd 幅に満たないデータ・ヘッダー切れは拒否する（外部入力の境界。REPAIR-2）。
+    /// SEC-1・REPAIR-5・#4498: 形式違反でも、そこまでに読めた fd 番号と違反の種別を具体値で返す。
     #[test]
-    fn parse_scm_rights_rejects_malformed() {
-        assert_eq!(parse_scm_rights(&cmsg_bytes(1, 1, &[0; 8], Some(8))), None);
+    fn sec1_repair5_4498_parse_reports_fds_read_before_malformed() {
+        use ScmMalformed::*;
+        assert_eq!(parse_scm_rights(&[]), rights(&[], None));
+        assert_eq!(
+            parse_scm_rights(&[0u8; 5]),
+            rights(&[], Some(HeaderTruncated))
+        );
+        let ok7 = cmsg_bytes(1, 1, &fd_bytes(&[7]), None);
+        let mut tail = ok7.clone();
+        tail.extend_from_slice(&[0u8; 5]);
+        assert_eq!(parse_scm_rights(&tail), rights(&[7], Some(HeaderTruncated)));
+        assert_eq!(
+            parse_scm_rights(&cmsg_bytes(1, 1, &[0; 8], Some(8))),
+            rights(&[], Some(LengthMismatch))
+        );
         assert_eq!(
             parse_scm_rights(&cmsg_bytes(1, 1, &[0; 8], Some(1000))),
-            None
+            rights(&[], Some(LengthMismatch))
         );
-        assert_eq!(parse_scm_rights(&cmsg_bytes(1, 1, &[0; 6], None)), None);
-        assert_eq!(parse_scm_rights(&[0u8; 5]), None);
-        assert_eq!(parse_scm_rights(&[]), Some(vec![]));
+        let mut tail = ok7.clone();
+        tail.extend(cmsg_bytes(1, 1, &[0; 8], Some(1000)));
+        assert_eq!(parse_scm_rights(&tail), rights(&[7], Some(LengthMismatch)));
+        let mut six = fd_bytes(&[7]);
+        six.extend_from_slice(&[0, 0]);
+        assert_eq!(
+            parse_scm_rights(&cmsg_bytes(1, 1, &six, None)),
+            rights(&[7], Some(DataNotFdAligned))
+        );
+        assert_eq!(
+            parse_scm_rights(&cmsg_bytes(1, 1, &[0; 3], None)),
+            rights(&[], Some(DataNotFdAligned))
+        );
+        assert_eq!(
+            parse_scm_rights(&cmsg_bytes(1, 1, &fd_bytes(&[-1, 7]), None)),
+            rights(&[-1, 7], None)
+        );
+    }
+
+    /// SEC-1・#4498: 負値は `OwnedFd` にできる値から除かれる（`from_raw_fd` へ渡らない）。
+    #[test]
+    fn sec1_repair5_4498_split_valid_fds_drops_negative() {
+        assert_eq!(
+            split_valid_fds(&[3, -1, 4, i32::MIN]),
+            ValidFds {
+                fds: vec![3, 4],
+                invalid_count: 2
+            }
+        );
+        assert_eq!(
+            split_valid_fds(&[0, 5]),
+            ValidFds {
+                fds: vec![0, 5],
+                invalid_count: 0
+            }
+        );
+        assert_eq!(
+            split_valid_fds(&[]),
+            ValidFds {
+                fds: vec![],
+                invalid_count: 0
+            }
+        );
+    }
+
+    /// 試験自身の socketpair の片端の所有を放棄した番号と、その相手端を返す。相手端の EOF が閉鎖の観測になる。
+    fn abandoned_end() -> (OwnedFd, RawFd) {
+        use std::os::fd::IntoRawFd as _;
+        let (a, b) = socketpair_seqpacket().expect("pair");
+        (a, b.into_raw_fd())
+    }
+
+    fn peer_state(a: &OwnedFd) -> Result<usize, SysError> {
+        let mut buf = [0u8; 4];
+        recv_with_fds(a.as_fd(), &mut buf, 0).map(|r| r.len)
+    }
+
+    /// SEC-1・REPAIR-5・#4498: 形式違反・不正値・非整列でも読めた fd は閉じて `EINVAL`。正常なら所有が移る。
+    #[test]
+    fn sec1_repair5_4498_adopt_closes_fds_on_malformed_or_invalid() {
+        let einval = Err(SysError::Os(super::super::EINVAL));
+        let eagain = Err(SysError::Os(super::super::EAGAIN));
+
+        // 形式違反（後続の cmsg_len が壊れている）。
+        let (a, raw) = abandoned_end();
+        assert_eq!(peer_state(&a), eagain);
+        let mut ctrl = cmsg_bytes(1, 1, &fd_bytes(&[raw]), None);
+        ctrl.extend(cmsg_bytes(1, 1, &[0; 8], Some(1000)));
+        assert!(
+            matches!(adopt_scm_rights(parse_scm_rights(&ctrl)), Err(e) if Err::<usize, _>(e) == einval)
+        );
+        assert_eq!(peer_state(&a), Ok(0));
+
+        // データ長が 4 の倍数でない。
+        let (a, raw) = abandoned_end();
+        let mut p = fd_bytes(&[raw]);
+        p.extend_from_slice(&[0, 0]);
+        let ctrl = cmsg_bytes(1, 1, &p, None);
+        assert!(adopt_scm_rights(parse_scm_rights(&ctrl)).is_err());
+        assert_eq!(peer_state(&a), Ok(0));
+
+        // 負値の混入（構造は正常）。panic せず、有効な方は閉じる。
+        let (a, raw) = abandoned_end();
+        let ctrl = cmsg_bytes(1, 1, &fd_bytes(&[-1, raw]), None);
+        assert!(adopt_scm_rights(parse_scm_rights(&ctrl)).is_err());
+        assert_eq!(peer_state(&a), Ok(0));
+
+        // 正常: 所有が移り、drop するまで閉じない。
+        let (a, raw) = abandoned_end();
+        let ctrl = cmsg_bytes(1, 1, &fd_bytes(&[raw]), None);
+        let owned = adopt_scm_rights(parse_scm_rights(&ctrl)).expect("adopt");
+        assert_eq!(owned.len(), 1);
+        assert_eq!(peer_state(&a), eagain);
+        drop(owned);
+        assert_eq!(peer_state(&a), Ok(0));
     }
 
     /// 制御バッファはちょうど 2 本分（24 バイト）。

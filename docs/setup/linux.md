@@ -68,7 +68,7 @@ ln -sf ~/.local/libexec/fandhe-container/fandhe-container ~/.local/bin/fandhe-co
 
 plugin-cri は rootless（非 root）で `RunPodSandbox` のたびに、supervisor の bin の `pod-holder` モードを pod の namespace の保持役として起動する。前提は次のとおり。
 
-- supervisor の bin が plugin-cri の実体と同じディレクトリにあり、利用者（か root）所有・group / other 書き込み不可・利用者に読めること（0755 など）。満たさないと `RunPodSandbox` は `FAILED_PRECONDITION`（`pod holder executable is not trusted or not readable`）で失敗する
+- supervisor の bin が plugin-cri の実体と同じディレクトリにあり、利用者（か root）所有・group / other 書き込み不可・利用者に読めること（0755 など）。満たさないと `RunPodSandbox` は `FAILED_PRECONDITION`（`supervisor executable is not trusted or not readable`）で失敗する
 - 非特権 user namespace を作れること（Ubuntu 24.04 以降の `kernel.apparmor_restrict_unprivileged_userns=1` では `PermissionDenied` で失敗するため緩和が要る。subuid / subgid の範囲写像は次節）
 - uid 0 の plugin-cri には保持役を注入せず、従来どおり（start は `UNIMPLEMENTED`）
 
@@ -87,6 +87,7 @@ install -m 0755 target/release/fandhe-container-supervisor ~/.local/libexec/fand
 - 対応は rootless だけである。uid 0 の shim（rootful の containerd と、rootlesskit 配下で euid が 0 になる構成）では Create は通るが Start が `UNIMPLEMENTED` になる（#2442・#2241 の判断待ち）
 - 動く構成は、非 root で直接起動した containerd 2.x を、委譲 scope（`systemd-run --user --scope -p Delegate=yes`）の中で動かす構成である。shim は containerd の環境（`XDG_RUNTIME_DIR`・user manager）と cgroup を継ぐ。実機での通しは `crates/plugin-cri/tests/shim_v2_containerd_real.rs`（手順は [real-machine-tests.md](../verification/real-machine-tests.md)。CI の platform-ci〔ubuntu〕で実行（#4104）。ランナー以外の実機での記録は #3685）
 - `delete` action（containerd が shim の死後に呼ぶ。#4151・#4152・#4153）は、残ったコンテナを止めて回収し、終了状態を返す。記録が無い・回収済みのときは固定の応答で冪等に成功する。Creating の記録と supervisor が居ない Running の記録は回収せずエラーを返す（クラッシュ復旧の GC・手動回収に任せる）。非 Linux は引数の検証だけ。詳細は [shim-v2-production-binary.md](../design/shim-v2-production-binary.md) D6
+- shim の隣の supervisor の bin は、`RunPodSandbox` の保持役と同じ基準で検査される（利用者か root の所有・group / other 書き込み不可・利用者に読める通常ファイル・置き場所の祖先も他の利用者が書けないこと）。exec は検証済み fd で起動する。満たさないと exec は `FAILED_PRECONDITION`（`supervisor executable is not trusted or not readable`）で失敗する。上の `install -m 0755` の手順どおりなら通る（CRI-5・SEC-1・PLUG-11・#4499）
 - exec（`Exec`・`Start(exec_id)`）は rootless で supervisor の stream-exec helper 経由で動く（#4149）。ただし env・cwd（`/` 以外）・user・stdio の FIFO・terminal は `UNIMPLEMENTED` のため、containerd の CRI が作る stdio つきの exec はまだ通らない（REPAIR-3）
 - 未実装（REPAIR-3）: `-publish-binary` によるイベントの publish。macOS・Windows では Shutdown だけを処理する縮退（[shim-v2-production-binary.md](../design/shim-v2-production-binary.md)）
 
@@ -134,6 +135,7 @@ fandhe-container doctor
 CRI plugin の `start`・`kill`・`stop`・`delete` は CLI と同じ経路で supervisor を使う（#2434・CRI-2）。
 
 - `fandhe-container-supervisor` を plugin の実体（`fandhe-container-plugin-cri`）と同じディレクトリにも置く。CLI の `start` と同じ規則で、`PATH` 探索・環境変数・引数による上書きは無い。見つからなければ `FAILED_PRECONDITION`
+- 前項の bin は、`RunPodSandbox` の保持役・CRI の Exec の helper・`start`（ランチャーを使わない直接経路）が同じ基準で検査する（利用者か root の所有・group / other 書き込み不可・祖先も他の利用者が書けない・利用者に読める通常ファイル）。満たさないと `FAILED_PRECONDITION`（`supervisor executable is not trusted or not readable`）で失敗する。`start` の直接経路は `systemd-run` がパスで exec するため、検査から exec までに差し替えの窓が残る（同じ uid か root のみ。CRI-6・SEC-1・PLUG-11・#4499）
 - plugin のプロセスの環境に `XDG_RUNTIME_DIR` が必要（user マネージャへの到達に使う）。上の「起動の前提」を同じく満たすこと
 - cgroup の配置を記録したコンテナの `delete` は、plugin プロセス自身の cgroup が委譲されている必要がある（CLI の `delete` と同じ検出で、検出に失敗すると記録を残したまま失敗する）。plugin を委譲されたスコープの中（例: `systemd-run --user --scope -p Delegate=yes -- fandhe-container-plugin-cri ...`）で動かす
 - `start` の権限モデルは CLI と同じ規則（plugin の実体の隣に信頼できるランチャーがあればランチャー経由。uid 0 は `UNIMPLEMENTED`。#2442）。インストールスクリプトは plugin を置かない。実機での通しは未確認（#850・#2062）

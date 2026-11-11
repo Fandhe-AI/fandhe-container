@@ -838,6 +838,9 @@ mod linux {
         let dir: PathBuf = (*work).to_path_buf();
         let bin = dir.join("bin");
         std::fs::create_dir(&bin).map_err(|e| format!("mkdir bin: {e}"))?;
+        // umask に依らず 0755 にする（supervisor の bin の祖先検査は group / other 書き込み可を拒否する。#4499）。
+        std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .map_err(|e| format!("chmod bin: {e}"))?;
         install_exe(Path::new(SHIM_SRC), &bin.join(SHIM_NAME))?;
         install_exe(&sup_src, &bin.join(SUPERVISOR_NAME))?;
         let namespace = format!("fckillall{}", shim_unique::run_tag());

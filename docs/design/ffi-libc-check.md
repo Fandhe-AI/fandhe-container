@@ -111,7 +111,7 @@ crates/plugin-macos（#1845）は適用済み。照合は `sys.rs` の `imp::lib
 
 crates/plugin-windows（#1846）も適用済み。`sys` の `imp` にある `signal(3)` の宣言・`SIG_ERR`・`SIGTERM`（cfg 3 定義）・ハンドラ `on_sigterm` の引数型を `const` 検査で照合した（4 種すべて。対象外は FFI でない `SIGTERM_RECEIVED` と安全なラッパー群。理由は照合モジュールのコメント）。
 
-crates/net の対象外（理由は照合モジュール `libc_abi` のコメント）: 対応外アーキテクチャの `consts`（カーネルへ渡さないプレースホルダ）・`SUPPORTED`・FFI でない項目、`SockaddrNl::nl_pad` のオフセット（`libc::sockaddr_nl` で非公開のため自前側のオフセットと `nl_family`・`nl_pid` の一致で代替）。`sockaddr` を取る 4 関数は自前が `SockaddrNl` を指すため、ポインタ型を別々に書いて照合する。照合は `sys.rs` と `sys/` 配下の 4 ファイルの `libc_abi` で行う（数え方: 定数は `consts::X == libc::X` の比較 1 件、構造体は `size_of`・`align_of`・`offset_of!` で照合する `#[repr(C)]` の型 1 件、関数は自前と `libc` の対 1 件。`sa_family_t`・`SUN_PATH_LEN`・`id_t`・`idtype_t` 等の型の幅だけの確認は件数に入れない）。
+crates/net の対象外（理由は照合モジュール `libc_abi` のコメント）: 対応外アーキテクチャの `consts`（カーネルへ渡さないプレースホルダ）・`SUPPORTED`・FFI でない項目、`SockaddrNl::nl_pad` のオフセット（`libc::sockaddr_nl` で非公開のため自前側のオフセットと `nl_family`・`nl_pid` の一致で代替）。`sockaddr` を取る 4 関数は自前が `SockaddrNl` を指すため、ポインタ型を別々に書いて照合する。照合は `sys.rs` と `sys/` 配下の 5 ファイルの `libc_abi` で行う（`sys/dial.rs` は `SIOCGSKNS` の値と `ioctl` の関数型。関数型は第 2 引数が gnu では `c_ulong`・musl では `c_int` のため gnu に限る。#4478。`sys/holder.rs` は `SO_DOMAIN`・`SO_PROTOCOL` を足した）（数え方: 定数は `consts::X == libc::X` の比較 1 件、構造体は `size_of`・`align_of`・`offset_of!` で照合する `#[repr(C)]` の型 1 件、関数は自前と `libc` の対 1 件。`sa_family_t`・`SUN_PATH_LEN`・`id_t`・`idtype_t` 等の型の幅だけの確認は件数に入れない）。
 
 | ファイル | 定数 | 構造体 | 関数 | 補足 |
 | -------- | ---- | ------ | ---- | ---- |

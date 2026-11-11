@@ -494,6 +494,13 @@ unsafe fn adopt_scm_rights(parsed: ScmRights) -> Result<Vec<OwnedFd>, SysError> 
 ///
 /// 制御メッセージの形式違反・負値の fd は `Os(EINVAL)` だが、読めた fd は閉じてから返す（#4498・SEC-1・REPAIR-5）。
 ///
+/// # 前提（受信ソケット）
+/// 受信ソケットで `SCM_RIGHTS` 以外に fd を運ぶ cmsg（例: `SO_PASSPIDFD` で届く `SCM_PIDFD`）を有効にしない。
+/// `parse_scm_rights` は `SCM_RIGHTS` 以外を読み飛ばすため、その fd は所有されず閉じられないまま漏れる。
+/// 有効にする場合は `parse_scm_rights`（解析）と `adopt_scm_rights`（所有と回収）も同じ変更で直し、その fd も閉じる。
+/// `SO_PASSCRED` の `SCM_CREDENTIALS` は fd を運ばないので対象外だが、制御バッファは `cmsg_len` で切るため
+/// cmsg を足すと寸法の前提も変わる。現状 net crate はこれらのオプションを有効にしていない（SEC-1・REPAIR-5・#4531）。
+///
 /// # 残余
 /// `cmsg_len` が壊れている（16 未満・終端越え・ヘッダー切れ）と、以降の cmsg の位置と fd 番号を特定できない。
 /// 無関係な fd を誤って閉じないよう推測では閉じないため、その分の fd は漏れうる。制御データの切り出しに失敗した
@@ -551,11 +558,12 @@ pub(crate) fn recv_with_fds(
         return Err(SysError::Os(super::EINVAL));
     };
     // 形式違反・負値でも、読めた fd は `adopt_scm_rights` が所有して閉じてから `EINVAL` を返す（#4498）。
+    let parsed = parse_scm_rights(ctrl);
     // SAFETY: `recvmsg` は成功済み。`MSG_CMSG_CLOEXEC` つきで受けた `SCM_RIGHTS` の fd は、カーネルがこの呼び出しで受信
     // プロセスに新規に割り当てたもので、他に所有者がおらず互いに重複しない。`control` は 0 初期化済みで `ctrl` は
     // カーネルが書いた範囲（`controllen` と `ctl_len` の小さい方）に切ってあるため、`parse_scm_rights` が読む番号は
     // カーネルが書いた値だけ。以降 `ctrl` 由来の番号は他で使わず、所有は戻り値か失敗時の drop へ移る。
-    let fds = unsafe { adopt_scm_rights(parse_scm_rights(ctrl))? };
+    let fds = unsafe { adopt_scm_rights(parsed) }?;
     Ok(Received {
         len: n.min(buf.len()),
         data_truncated: msg.flags & super::consts::MSG_TRUNC != 0,

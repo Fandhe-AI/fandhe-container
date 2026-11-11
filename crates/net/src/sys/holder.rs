@@ -46,6 +46,7 @@ mod consts {
     pub const PR_SET_PDEATHSIG: i32 = 1;
     pub const PR_GET_PDEATHSIG: i32 = 2;
     pub const PR_GET_DUMPABLE: i32 = 3;
+    pub const PR_SET_DUMPABLE: i32 = 4;
     pub const PR_SET_NO_NEW_PRIVS: i32 = 38;
     pub const PR_SIGKILL: i32 = 9;
     pub const ENOTSOCK: i32 = 88;
@@ -76,6 +77,7 @@ mod consts {
     pub const PR_SET_PDEATHSIG: i32 = 1;
     pub const PR_GET_PDEATHSIG: i32 = 2;
     pub const PR_GET_DUMPABLE: i32 = 3;
+    pub const PR_SET_DUMPABLE: i32 = 4;
     pub const PR_SET_NO_NEW_PRIVS: i32 = 38;
     pub const PR_SIGKILL: i32 = 9;
     pub const ENOTSOCK: i32 = 88;
@@ -109,6 +111,7 @@ mod consts {
     pub const PR_SET_PDEATHSIG: i32 = 0;
     pub const PR_GET_PDEATHSIG: i32 = 0;
     pub const PR_GET_DUMPABLE: i32 = 0;
+    pub const PR_SET_DUMPABLE: i32 = 0;
     pub const PR_SET_NO_NEW_PRIVS: i32 = 0;
     pub const PR_SIGKILL: i32 = 0;
     pub const ENOTSOCK: i32 = -1;
@@ -510,7 +513,6 @@ pub(crate) fn send_with_fds(
 
 /// 接続済みソケットの fd を 1 本だけ送る入口（`netns-dial` helper の応答。SEC-1・NET-3・#4478）。
 /// 契約は [`send_with_fds`] と同じ。
-#[allow(dead_code)] // 親側の channel（#4480）が使うまでは試験のみ。
 pub(crate) fn send_one_fd(
     fd: BorrowedFd<'_>,
     data: &[u8],
@@ -544,7 +546,7 @@ pub(crate) fn join_namespace(fd: BorrowedFd<'_>, nstype: i32) -> Result<(), SysE
 /// ポインタを取らない `prctl(option, arg2, 0, 0, 0)` の薄い入口（失敗は errno、成功は戻り値）。
 fn prctl_value(option: i32, arg2: core::ffi::c_ulong) -> Result<i32, SysError> {
     // SAFETY: 可変長引数に `unsigned long` を 4 個渡す（`prctl(2)` は使わない引数を無視する）。呼び出し元の option は
-    // `PR_SET_PDEATHSIG`・`PR_GET_DUMPABLE`・`PR_SET_NO_NEW_PRIVS` に限り、いずれもユーザーメモリを読み書きしない。
+    // `PR_SET_PDEATHSIG`・`PR_GET_DUMPABLE`・`PR_SET_DUMPABLE`・`PR_SET_NO_NEW_PRIVS` に限り、いずれもユーザーメモリを読み書きしない。
     let rc = unsafe {
         prctl(
             option,
@@ -597,6 +599,15 @@ pub(crate) fn get_dumpable() -> Result<i32, SysError> {
         return Err(SysError::Unsupported);
     }
     prctl_value(consts::PR_GET_DUMPABLE, 0)
+}
+
+/// dumpable を 0（non-dumpable）にする（`PR_SET_DUMPABLE`）。`netns-dial` helper が参加後に同じ uid からの
+/// `/proc/<pid>/{mem,fd,ns}` 経由の観測・ptrace を塞ぐために使う（SEC-1・CRI-6・#4479）。値は整数のみ渡す。
+pub(crate) fn set_non_dumpable() -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    prctl_value(consts::PR_SET_DUMPABLE, 0).map(|_| ())
 }
 
 /// 継承した fd 3 以上をすべて閉じる（`close_range(3, u32::MAX, 0)`）。dumpable な holder に親から継承した
@@ -822,6 +833,7 @@ mod libc_abi {
         assert!(consts::PR_SET_PDEATHSIG == libc::PR_SET_PDEATHSIG);
         assert!(consts::PR_GET_PDEATHSIG == libc::PR_GET_PDEATHSIG);
         assert!(consts::PR_GET_DUMPABLE == libc::PR_GET_DUMPABLE);
+        assert!(consts::PR_SET_DUMPABLE == libc::PR_SET_DUMPABLE);
         assert!(consts::PR_SET_NO_NEW_PRIVS == libc::PR_SET_NO_NEW_PRIVS);
         assert!(consts::PR_SIGKILL == libc::SIGKILL);
         assert!(consts::ENOTSOCK == libc::ENOTSOCK);

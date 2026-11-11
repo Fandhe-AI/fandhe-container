@@ -27,7 +27,7 @@
 //! pasta 構成の netns holder（`netns_holder`。supervisor が `/proc/self/exe netns-holder` として exec し直す専用プロセスの本体
 //! `run_netns_holder_main`・supervisor 側の端 `NetnsHolderChannel`・固定長フレーム。Linux 以外は本体が `UNIMPLEMENTED`。
 //! NET-9・CORE-6・#3197。supervisor の振り分けと launch への組み込みは後続）も持つ。
-//! POD の PortForward の netns-dial helper の固定長 frame（`netns_dial`。OS 非依存。CRI-6・REPAIR-2・#4477。helper・channel・sys は後続）も持つ。
+//! POD の PortForward の netns-dial helper の固定長 frame（`netns_dial`。OS 非依存。CRI-6・REPAIR-2・#4477）と helper 本体（`run_netns_dial_main`。Linux のみ。#4479）、fd の検証（#4478）も持つ。親側の channel は後続（#4480）。
 //! pasta の起動・監視・回収は supervisor（core 側）が `crates/net` の関数で行う。DNS ヘルパー（NET-5）は
 //! plugin 側の `NetworkPlugin` の実装が起動する（PLUG-1 の区分。2026-10-12 のオーナー決定・#4。`docs/design/rootless-network.md` 12 章）。
 

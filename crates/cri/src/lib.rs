@@ -19,6 +19,8 @@
 pub mod adapter;
 pub mod bundle;
 pub mod error;
+#[cfg(unix)]
+mod flock_release;
 pub mod image_pull;
 pub mod image_service;
 pub mod instrument;

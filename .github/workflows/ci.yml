@@ -175,6 +175,20 @@ on:
           ビルド秒を除く 55 分に収まるよう repeat-count を分けて dispatch する
         type: string
         default: '600'
+      repeat-parallel:
+        description: >-
+          true にすると libtest の並列度を保ったまま繰り返す（`--exact` も `--test-threads` も付けない。
+          同じ試験バイナリの別の試験が並列に fork したときだけ起きる競合の再現用。#4560・REPAIR-12）。
+          repeat-package と組で指定し、repeat-test-bin 空なら lib 全体、指定ありならその libtest ハーネスの結合試験が
+          対象。repeat-filter 空ならバイナリ全体。repeat-test・repeat-user-scope とは併用できない
+        type: boolean
+        default: false
+      repeat-filter:
+        description: >-
+          repeat-parallel=true のときの試験名の部分一致（libtest の位置引数。`[A-Za-z0-9_:]`、256 文字以下。
+          例 streaming::exec_launcher）。空ならバイナリ全体（#4560）
+        type: string
+        default: ''
       repeat-count:
         description: 繰り返し回数（1〜1000）
         type: string
@@ -482,7 +496,7 @@ jobs:
     # ubuntu ではランナー VM ごと止まる間欠事象があり、止まるとステップの timeout-minutes が効かず
     # ジョブ上限まで動き続けて PR の CI を詰まらせるため、ubuntu だけ上限を下げる。成功した ubuntu の
     # ジョブは 20〜26 分（2026-10-30 時点の直近 110 件）で、35 分なら約 9 分の余裕がある。
-    # 例外として、workflow_dispatch で繰り返し（repeat-test・repeat-test-bin・repeat-user-scope）か
+    # 例外として、workflow_dispatch で繰り返し（repeat-test・repeat-test-bin・repeat-parallel・repeat-user-scope）か
     # ハングプローブ（hang-probe・reclaim-hang-probe・scope-hang-probe）を指定したときは ubuntu も 60 分を
     # 保つ（プローブは止まり方の観測が従来の上限を前提にするため）。
     # 委譲スコープの繰り返し（repeat-user-scope）の ubuntu だけは 90 分にする（#3528）。そのステップは
@@ -502,7 +516,7 @@ jobs:
       && 90
       || (matrix.os == 'ubuntu-latest'
       && !(github.event_name == 'workflow_dispatch'
-      && (inputs.repeat-test != '' || inputs.repeat-test-bin != '' || inputs.repeat-user-scope
+      && (inputs.repeat-test != '' || inputs.repeat-test-bin != '' || inputs.repeat-parallel || inputs.repeat-user-scope
       || inputs.hang-probe || inputs.reclaim-hang-probe != 'none' || inputs.scope-hang-probe != 'none'))
       && 35 || 60) }}
     permissions:
@@ -629,7 +643,8 @@ jobs:
       - name: 繰り返し入力の整合確認（workflow_dispatch のみ）
         if: >-
           github.event_name == 'workflow_dispatch' &&
-          (inputs.repeat-test != '' || inputs.repeat-test-bin != '' || inputs.repeat-user-scope) &&
+          (inputs.repeat-test != '' || inputs.repeat-test-bin != '' || inputs.repeat-parallel ||
+          inputs.repeat-filter != '' || inputs.repeat-user-scope) &&
           matrix.os == 'ubuntu-latest'
         shell: bash
         timeout-minutes: 2
@@ -639,7 +654,22 @@ jobs:
           USER_SCOPE: ${{ inputs.repeat-user-scope && '1' || '' }}
           LIB_TEST: ${{ inputs.repeat-test }}
           TEST_BIN_IN: ${{ inputs.repeat-test-bin }}
+          PARALLEL: ${{ inputs.repeat-parallel && '1' || '' }}
+          FILTER: ${{ inputs.repeat-filter }}
         run: |
+          # repeat-parallel（#4560）: filter だけの指定、lib 試験（repeat-test は --exact 用）・委譲スコープとの併用は失敗にする。
+          if [ -n "${FILTER}" ] && [ -z "${PARALLEL}" ]; then
+            echo "::error::repeat-filter requires repeat-parallel=true" >&2
+            exit 1
+          fi
+          if [ -n "${PARALLEL}" ] && [ -n "${LIB_TEST}" ]; then
+            echo "::error::repeat-parallel=true cannot be combined with repeat-test (use repeat-filter)" >&2
+            exit 1
+          fi
+          if [ -n "${PARALLEL}" ] && [ -n "${USER_SCOPE}" ]; then
+            echo "::error::repeat-parallel=true cannot be combined with repeat-user-scope" >&2
+            exit 1
+          fi
           if [ -n "${LINUX_ONLY}" ] && [ "${REPEAT_OS}" != "all" ] && [ "${REPEAT_OS}" != "ubuntu-latest" ]; then
             echo "::error::repeat-linux-only=true conflicts with repeat-os=${REPEAT_OS} (nothing would run)" >&2
             exit 1
@@ -661,7 +691,7 @@ jobs:
       - name: 指定した試験の繰り返し（workflow_dispatch のみ）
         if: >-
           github.event_name == 'workflow_dispatch' &&
-          (inputs.repeat-test != '' || inputs.repeat-test-bin != '') &&
+          (inputs.repeat-test != '' || inputs.repeat-test-bin != '' || inputs.repeat-parallel) &&
           !inputs.repeat-user-scope &&
           (!inputs.repeat-linux-only || runner.os == 'Linux') &&
           (inputs.repeat-os == 'all' || inputs.repeat-os == matrix.os)
@@ -677,6 +707,8 @@ jobs:
           FORBIDDEN_LINE: ${{ inputs.repeat-forbidden-line }}
           INFO_PREFIX: ${{ inputs.repeat-info-prefix }}
           TEST_IGNORED: ${{ inputs.repeat-test-ignored && '1' || '' }}
+          PARALLEL: ${{ inputs.repeat-parallel && '1' || '' }}
+          FILTER: ${{ inputs.repeat-filter }}
           FEATURES: ${{ inputs.repeat-features }}
           COUNT: ${{ inputs.repeat-count }}
         run: make repeat-test

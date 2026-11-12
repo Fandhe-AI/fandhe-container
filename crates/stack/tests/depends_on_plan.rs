@@ -46,3 +46,56 @@ fn stack_2_acyclic_fixture_orders_and_keeps_conditions() {
         ]
     );
 }
+
+/// STACK-2・ERR-1: 制御文字を含むサービス名の循環でも、公開 API の Display は固定文言で名前を漏らさず、
+/// 元の名前は構造化フィールドにそのまま残る。
+#[test]
+fn stack_2_cycle_display_is_fixed_and_path_keeps_raw_names() {
+    let toml_src = r#"
+[services."a\u001b[31m"]
+image = "example/a:1"
+[services."a\u001b[31m".depends_on]
+"b\n" = "started"
+
+[services."b\n"]
+image = "example/b:1"
+[services."b\n".depends_on]
+"a\u001b[31m" = "started"
+"#;
+    let parsed: ComposeToml = toml::from_str(toml_src).unwrap();
+    let err = plan_startup(&parsed.services).unwrap_err();
+    assert_eq!(err.code(), "DEPENDENCY_CYCLE");
+    assert_eq!(err.to_string(), "depends_on contains a cycle");
+    assert!(!err.to_string().contains('\u{1b}'));
+    assert_eq!(
+        err,
+        DependsOnError::Cycle {
+            path: vec!["a\u{1b}[31m".into(), "b\n".into(), "a\u{1b}[31m".into()]
+        }
+    );
+}
+
+/// STACK-2・ERR-1: 制御文字を含む未定義依存でも Display は固定文言で、名前はフィールドに残る。
+#[test]
+fn stack_2_unknown_dependency_display_is_fixed_and_fields_keep_raw_names() {
+    let toml_src = r#"
+[services."web\u001b[2J"]
+image = "example/web:1"
+[services."web\u001b[2J".depends_on]
+"ghost\r\nX" = "started"
+"#;
+    let parsed: ComposeToml = toml::from_str(toml_src).unwrap();
+    let err = plan_startup(&parsed.services).unwrap_err();
+    assert_eq!(err.code(), "UNKNOWN_DEPENDENCY");
+    assert_eq!(
+        err.to_string(),
+        "depends_on references an undefined service"
+    );
+    assert_eq!(
+        err,
+        DependsOnError::UnknownDependency {
+            service: "web\u{1b}[2J".into(),
+            dependency: "ghost\r\nX".into()
+        }
+    );
+}

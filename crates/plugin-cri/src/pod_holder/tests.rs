@@ -670,3 +670,63 @@ fn plug11_4483_supervisor_beside_resolution_is_shared() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+// ---- #2940: 素性の収集と再採用した記録の観測（R11・CRI-2・SEC-5） ----
+
+/// READY と starttime から作る素性は、具体値のまま `PodHolder` に載る。
+#[test]
+fn cri2_sec5_2940_holder_from_ready_carries_exact_identity() {
+    let ns = |i| NsId { dev: 4, ino: i };
+    let ready = PodHolderReady::new(4242, ns(10), ns(11), ns(12)).unwrap();
+    let holder = holder_from_ready(&ready, 123456).unwrap();
+    let id = holder.identity().unwrap();
+    assert_eq!(holder.pid().get(), 4242);
+    assert_eq!(id.pid().get(), 4242);
+    assert_eq!(id.start_time_ticks(), 123456);
+    assert_eq!((id.user().dev, id.user().ino), (4, 10));
+    assert_eq!((id.ipc().dev, id.ipc().ino), (4, 11));
+    assert_eq!((id.net().dev, id.net().ino), (4, 12));
+}
+
+/// ns の照合が無効な試験用の構成は素性を持たない（記録では `holder=-`）。
+#[test]
+fn cri2_sec5_2940_unverified_fixed_holder_has_no_identity() {
+    let dir = std::env::temp_dir().join(format!("fc-podholder-2940-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let staged = Staged::new(&dir, "a");
+    let p = staged.provider("cat >/dev/null");
+    let cfg = config();
+    let holder = p.spawn(&req("x", &cfg, 5000)).unwrap();
+    assert!(holder.identity().is_none());
+    p.release("x", Duration::from_secs(2)).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 観測は `/proc/<pid>/stat` の starttime（22 番目）を返し、回収済みの pid は `Absent`。表は見ず、回収もしない。
+#[test]
+fn cri2_sec5_2940_observe_process_start_reports_starttime_then_absent() {
+    let p = sh("exit 3", 8);
+    let pid = insert_child(&p, "live", "cat >/dev/null");
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    let after_comm = &stat[stat.rfind(')').unwrap() + 1..];
+    let want: u64 = after_comm
+        .split_whitespace()
+        .nth(19)
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        p.observe_process_start(pid).unwrap(),
+        ProcessStartObservation::Present {
+            start_time_ticks: want
+        }
+    );
+    // 観測は子を回収しない（release が回収するまで /proc/<pid> が残る）。
+    assert!(!proc_gone(pid));
+    p.release("live", Duration::from_secs(2)).unwrap();
+    assert!(proc_gone(pid));
+    assert_eq!(
+        p.observe_process_start(pid).unwrap(),
+        ProcessStartObservation::Absent
+    );
+}

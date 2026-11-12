@@ -200,7 +200,7 @@ fn repair4_broken_records_are_counted_and_orphans_reclaimed() {
     let line = out.summary_line();
     assert_eq!(
         line,
-        "cri record readoption: kind=sandbox adopted=0 pending_unresolved=0 broken=1 malformed=1 not_regular_file=0 too_long=0 unreadable=0 unrecognized=0 duplicate_metadata=0 | cri record readoption: kind=container adopted=0 present=0 absent_exited=0 remove_pending=0 undetermined=0 stale_create=0 broken=1 malformed=1 not_regular_file=0 too_long=0 unreadable=0 unrecognized=0 duplicate_metadata=0 parentless=0 | cri stale create release: released=0 kept=0 release_failed=0 record_remove_failed=0 not_attempted=0 skipped=0 | cri orphan bundle reclamation: scan=completed scanned=1 reclaimed=1 kept_has_record=0 kept_present=0 kept_undetermined=0 release_failed=0 release_timed_out=0 skipped_unrecognized=0 skipped_not_dir=0 not_attempted=0"
+        "cri record readoption: kind=sandbox adopted=0 pending_unresolved=0 broken=1 malformed=1 not_regular_file=0 too_long=0 unreadable=0 unrecognized=0 duplicate_metadata=0 holder_recorded=0 holder_gone=0 holder_pid_reused=0 holder_start_time_match=0 holder_unobserved=0 | cri record readoption: kind=container adopted=0 present=0 absent_exited=0 remove_pending=0 undetermined=0 stale_create=0 broken=1 malformed=1 not_regular_file=0 too_long=0 unreadable=0 unrecognized=0 duplicate_metadata=0 parentless=0 | cri stale create release: released=0 kept=0 release_failed=0 record_remove_failed=0 not_attempted=0 skipped=0 | cri orphan bundle reclamation: scan=completed scanned=1 reclaimed=1 kept_has_record=0 kept_present=0 kept_undetermined=0 release_failed=0 release_timed_out=0 skipped_unrecognized=0 skipped_not_dir=0 not_attempted=0"
     );
 }
 

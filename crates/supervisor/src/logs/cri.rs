@@ -44,6 +44,10 @@ use super::{LogSink, MAX_LINE_BYTES, StreamKind};
 /// 1 レコードに載せる内容の最大バイト数（containerd の `max_container_log_line_size` の既定値）。
 pub const CRI_LOG_CHUNK_BYTES: usize = 16 * 1024;
 
+// 捕捉側の断片（`MAX_LINE_BYTES`）の境界と CRI のチャンクの境界を揃えるため（#4580・CRI-2）。
+const _: () =
+    assert!(CRI_LOG_CHUNK_BYTES > 0 && MAX_LINE_BYTES.is_multiple_of(CRI_LOG_CHUNK_BYTES));
+
 /// タイムスタンプ（`2016-10-06T00:17:09.669794202Z`）のバイト数。
 pub const CRI_TIMESTAMP_LEN: usize = 30;
 

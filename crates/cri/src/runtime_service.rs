@@ -125,6 +125,7 @@
 
 mod config_limits;
 mod container;
+mod holder_identity;
 mod pod_holder;
 mod readopt;
 mod record;
@@ -307,9 +308,13 @@ struct SandboxRecord {
     network_teardown: bool,
     /// set_up が返した、結線済みの pod network namespace。配下のコンテナの bundle へ渡す。
     pod_netns: Option<PodNetns>,
-    /// 保持役（`PodNamespaceHolderProvider::spawn` の結果。#2871・CRI-2）。メモリ上のみで、記録ファイルには
-    /// 書かない（永続化と素性は R11〔#2940〕）。再採用した記録は常に `None`（保持役は再起動をまたがない）。
+    /// 保持役（`PodNamespaceHolderProvider::spawn` の結果。#2871・CRI-2）。メモリ上のみ。再採用した記録は
+    /// 常に `None`（保持役は再起動をまたがない）。bundle への namespace のパスはこの値からだけ作る。
     pod_holder: Option<PodHolder>,
+    /// 記録ファイルに残す保持役の素性（診断用。R11・#2940・CRI-2・SEC-5）。spawn 成功時に `pod_holder` と同じ
+    /// ロック区間で設定し、`release` では消さない（最後の保持役の診断として Remove まで残す）。再採用した記録では
+    /// 記録ファイルから設定する。**この値から `PodHolder`・namespace のパス・シグナルを作らない**（型が変換口を持たない）。
+    recorded_holder: Option<holder_identity::RecordedHolderIdentity>,
     /// 保持役を `spawn` している最中。真の間は配下の作成と Stop・Remove を拒否する（`network_pending` と同じ）。
     holder_pending: bool,
     /// 保持役が残りうる（spawn の成功、または結果不明）。Stop・Remove が `release` で解放し、成功したら偽に戻す。
@@ -2209,6 +2214,7 @@ impl CriRuntimeService {
                 network_teardown: false,
                 pod_netns: None,
                 pod_holder: None,
+                recorded_holder: None,
                 // 保持役を注入しているときは予約と同じロック内で印を立てる（record store が無くても、
                 // spawn の前に並行する Stop・Remove が成功して Run が保持役を起動する窓を作らない。
                 // `spawn_pod_holder` の結果の受領、または失敗・手放しの後始末が解除する。#2871・CRI-2・REPAIR-5）。

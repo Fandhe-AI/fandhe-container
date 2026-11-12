@@ -8,7 +8,12 @@
 //!
 //! # 形式
 //!
-//! sandbox 記録は v1。コンテナ記録は v2（`stop_signal=` の直後に `instance=<u64 の正準形 | ->` を持つ。#4322）で、
+//! sandbox 記録は v2（`network_pending=` の直後に `holder=<保持役の素性 | ->` を持つ。R11・#2940）で、符号化は常に v2。
+//! 復号は v1（`holder=` 行なし。素性は `None`）と v2 を受け、版と行の組の不一致（v1 に `holder=` がある・v2 に無い・
+//! 未知の版）は拒否する。旧バイナリが v2 を読むと `malformed` に数えられ、記録は消されずに残る（#4322 と同じ）。
+//! `holder=` は 1 行で全部か無しか（`-`）で、部分的な欠けは形式上表現できない。値の形式と検証は
+//! [`super::holder_identity::RecordedHolderIdentity`]。
+//! コンテナ記録は v2（`stop_signal=` の直後に `instance=<u64 の正準形 | ->` を持つ。#4322）で、
 //! 符号化は常に v2。復号は v1（`instance=` 行なし。インスタンスは `None`）と v2 を受け、版と行の組の不一致
 //! （v1 に `instance=` がある・v2 に無い・未知の版）は拒否する。
 //!
@@ -16,8 +21,8 @@
 //! 「長さちょうどの prost 符号化した `PodSandboxConfig` / `ContainerConfig`」から成る。ヘッダは ASCII の
 //! キーと、LF 以外の制御文字を含まない UTF-8 の値で、`log_path` など非 ASCII を許す値があるため値は ASCII に
 //! 限らない。`ContainerConfig.envs` は記録に書かない（秘密値を状態ルートへ残さない。符号化で消し、復号で非空を拒否）。
-//! 版は完全一致のみを受ける。保持役の素性（R11）や `pod_netns`（R12）の鍵を足すときは `v3`（コンテナ記録）とし、
-//! 旧版の扱いはそれぞれの issue で決める。
+//! 版は一覧の完全一致のみを受ける。`pod_netns`（R12 #2941）の鍵を足すときは sandbox 記録を `v3`、コンテナ記録を `v3` とし、
+//! 旧版の扱いはその issue で決める。
 //!
 //! 復号は次のどれかに反する入力を、固定文言の `INVALID_ARGUMENT` で拒否する（メッセージに入力値・長さ・鍵名を
 //! 載せない。REPAIR-4）: 版の完全一致・キー順固定・重複キーなし・未知キーなし・余分な行なし・CRLF なし・
@@ -34,6 +39,7 @@ use prost::Message;
 
 use super::config_limits::MAX_CONFIG_ENCODED_BYTES;
 use super::container::{ContainerState, validate_container_config};
+use super::holder_identity::{LINE_MAX_HOLDER, RecordedHolderIdentity};
 use super::{
     ContainerRecord, InFlightKind, SUPPORTED_RUNTIME_HANDLERS, SandboxRecord, SandboxState,
     validate_sandbox_config,
@@ -48,7 +54,10 @@ use crate::runtime::v1::{ContainerConfig, PodSandboxConfig, Signal};
 use fandhe_container_core::traits::{CONTAINER_LOG_PATH_MAX_BYTES, ContainerLogPath};
 use fandhe_container_oci::reference::Digest;
 
-const SANDBOX_VERSION_LINE: &str = "fandhe-cri-sandbox-record v1";
+/// sandbox 記録の現行の版の行（符号化は常にこちら。`holder=` 行を持つ。R11・#2940）。
+const SANDBOX_VERSION_LINE: &str = "fandhe-cri-sandbox-record v2";
+/// 旧版の行（`holder=` 行が無い。復号だけ受け、素性は `None` とする。R11・#2940）。
+const SANDBOX_VERSION_LINE_V1: &str = "fandhe-cri-sandbox-record v1";
 /// コンテナ記録の現行の版の行（符号化は常にこちら。`instance=` 行を持つ。#4322）。
 const CONTAINER_VERSION_LINE: &str = "fandhe-cri-container-record v2";
 /// 旧版の行（`instance=` 行が無い。復号だけ受け、インスタンスは `None` とする。#4322）。
@@ -64,8 +73,8 @@ const LINE_MAX_LOG_PATH: usize = 9 + CONTAINER_LOG_PATH_MAX_BYTES;
 const LINE_MAX_IMAGE_FIELD: usize = 10 + MAX_IMAGE_FIELD_BYTES;
 
 /// sandbox 記録のヘッダ部（`config=` 行を含む）の予算: 版・id・state・created_at・runtime_handler・pending・
-/// network_owned・network_pending・config の 9 行（各 LF 込み）。
-pub(super) const SANDBOX_HEADER_BUDGET: usize = 9 * (LINE_MAX_SCALAR + 1);
+/// network_owned・network_pending・config の 9 行（各 LF 込み）と、v2 の `holder=` 行（R11・#2940）。
+pub(super) const SANDBOX_HEADER_BUDGET: usize = 9 * (LINE_MAX_SCALAR + 1) + (LINE_MAX_HOLDER + 1);
 /// コンテナ記録のヘッダ部の予算。スカラー行 14（版・id・pod_sandbox_id・state・in_flight・created_at・
 /// started_at・finished_at・exit_code・termination・stop_signal・instance・config の 13 行と余裕 1）と
 /// `user`・`log_path`・`image_id`・`image_ref`・`image_tag` の可変行（image_id は digest 文字列で 64 バイトを超える）。
@@ -100,6 +109,8 @@ pub(super) struct SandboxRecordData {
     pub(super) pending: bool,
     pub(super) network_owned: bool,
     pub(super) network_pending: bool,
+    /// 起動時に記録した保持役の素性（v1 の記録・素性なしの保持役は `None`）。診断と終了済みの確認にだけ使う（R11・#2940）。
+    pub(super) holder: Option<RecordedHolderIdentity>,
 }
 
 /// コンテナ記録 1 件分の内容（registry の `ContainerRecord` との変換は R5 #2934）。
@@ -248,6 +259,11 @@ fn parse_canonical_u64(s: &str) -> R<u64> {
     s.parse::<u64>().map_err(|_| Bad)
 }
 
+/// [`parse_canonical_u64`] の公開口（`holder_identity` が `holder=` の値の復号に使う。`Bad` を外へ出さない）。
+pub(super) fn canonical_u64(s: &str) -> Option<u64> {
+    parse_canonical_u64(s).ok()
+}
+
 /// 10 進の符号つき整数の正準形（先頭の `-` を 1 つだけ許す。`-0`・`+` は拒否）。
 fn parse_canonical_i64(s: &str) -> R<i64> {
     match s.strip_prefix('-') {
@@ -342,15 +358,6 @@ impl<'a> Lines<'a> {
         candidates.iter().copied().find(|c| *c == line).ok_or(Bad)
     }
 
-    /// 版の行の完全一致。
-    fn version(&mut self, expected: &str) -> R<()> {
-        if self.line(LINE_MAX_SCALAR)? == expected {
-            Ok(())
-        } else {
-            Err(Bad)
-        }
-    }
-
     /// `config=<長さ>` の行を読み、残りがちょうどその長さであることを確かめて config 部を返す。
     /// prost の復号はこの後にだけ行う（長さを確認する前に確保しない）。
     fn config_payload(mut self) -> R<&'a [u8]> {
@@ -380,6 +387,7 @@ impl SandboxRecordData {
             pending,
             network_owned: record.network_owned,
             network_pending: record.network_pending,
+            holder: record.recorded_holder,
         }
     }
 
@@ -398,7 +406,7 @@ impl SandboxRecordData {
         }
         let payload = self.config.encode_to_vec();
         let header = format!(
-            "{SANDBOX_VERSION_LINE}\nid={}\nstate={}\ncreated_at={}\nruntime_handler={}\npending={}\nnetwork_owned={}\nnetwork_pending={}\nconfig={}\n",
+            "{SANDBOX_VERSION_LINE}\nid={}\nstate={}\ncreated_at={}\nruntime_handler={}\npending={}\nnetwork_owned={}\nnetwork_pending={}\nholder={}\nconfig={}\n",
             self.id,
             sandbox_state_token(self.state),
             self.created_at_nanos,
@@ -406,6 +414,7 @@ impl SandboxRecordData {
             bool_token(self.pending),
             bool_token(self.network_owned),
             bool_token(self.network_pending),
+            RecordedHolderIdentity::encode_value(self.holder.as_ref()),
             payload.len(),
         );
         assemble(header, &payload, MAX_SANDBOX_RECORD_BYTES).ok_or_else(fail)
@@ -424,7 +433,8 @@ impl SandboxRecordData {
 
 fn decode_sandbox(bytes: &[u8], expect_id: &str) -> R<DecodedSandbox> {
     let mut l = Lines::new(bytes);
-    l.version(SANDBOX_VERSION_LINE)?;
+    let has_holder =
+        l.version_of(&[SANDBOX_VERSION_LINE_V1, SANDBOX_VERSION_LINE])? == SANDBOX_VERSION_LINE;
     let id = parse_record_id(l.key("id", LINE_MAX_SCALAR)?)?;
     if id != expect_id {
         return Err(Bad);
@@ -440,6 +450,12 @@ fn decode_sandbox(bytes: &[u8], expect_id: &str) -> R<DecodedSandbox> {
     let pending = parse_bool(l.key("pending", LINE_MAX_SCALAR)?)?;
     let network_owned = parse_bool(l.key("network_owned", LINE_MAX_SCALAR)?)?;
     let network_pending = parse_bool(l.key("network_pending", LINE_MAX_SCALAR)?)?;
+    // v2 だけが `holder=` を持つ。v1 は行が無く `None`。
+    let holder = if has_holder {
+        RecordedHolderIdentity::parse_value(l.key("holder", LINE_MAX_HOLDER)?).map_err(|()| Bad)?
+    } else {
+        None
+    };
     let payload = l.config_payload()?;
 
     let config = PodSandboxConfig::decode(payload).map_err(|_| Bad)?;
@@ -462,6 +478,7 @@ fn decode_sandbox(bytes: &[u8], expect_id: &str) -> R<DecodedSandbox> {
             pending,
             network_owned,
             network_pending,
+            holder,
         },
         retained_bytes,
     })
@@ -787,6 +804,7 @@ mod tests {
             pending: true,
             network_owned: true,
             network_pending: false,
+            holder: None,
         }
     }
 
@@ -919,10 +937,44 @@ mod tests {
         let n = payload_len(&bytes);
         let head = std::str::from_utf8(&bytes[..bytes.len() - n]).unwrap();
         let expected = format!(
-            "fandhe-cri-sandbox-record v1\nid={}\nstate=notready\ncreated_at=1700000000123456789\nruntime_handler=\npending=1\nnetwork_owned=1\nnetwork_pending=0\nconfig={n}\n",
+            "fandhe-cri-sandbox-record v2\nid={}\nstate=notready\ncreated_at=1700000000123456789\nruntime_handler=\npending=1\nnetwork_owned=1\nnetwork_pending=0\nholder=-\nconfig={n}\n",
             id('a')
         );
         assert_eq!(head, expected);
+    }
+
+    /// #2940: v2 の `holder=` は素性ありと `-` の両方で往復し、符号化は固定文言になる。
+    #[test]
+    fn cri2_sec5_2940_sandbox_holder_roundtrips() {
+        let mut data = sandbox_data();
+        data.holder = RecordedHolderIdentity::parse_value(
+            "4242,123456,4:4026531837,4:4026531839,4:4026531840",
+        )
+        .unwrap();
+        assert!(data.holder.is_some());
+        let bytes = data.encode().unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains(
+            "network_pending=0\nholder=4242,123456,4:4026531837,4:4026531839,4:4026531840\nconfig="
+        ));
+        let got = SandboxRecordData::decode(&bytes, &data.id).unwrap();
+        assert_eq!(got.data, data);
+    }
+
+    /// #2940: v1 の記録（`holder=` 行なし）は復号でき、素性は `None`、ほかの項目は一致する。
+    #[test]
+    fn cri2_sec5_2940_v1_sandbox_decodes_with_no_holder() {
+        let data = sandbox_data();
+        let bytes = data.encode().unwrap();
+        let n = payload_len(&bytes);
+        let head = String::from_utf8_lossy(&bytes[..bytes.len() - n])
+            .replacen("record v2\n", "record v1\n", 1)
+            .replacen("holder=-\n", "", 1);
+        let mut v1 = head.into_bytes();
+        v1.extend_from_slice(&bytes[bytes.len() - n..]);
+        let got = SandboxRecordData::decode(&v1, &data.id).unwrap();
+        assert_eq!(got.data, data);
+        assert_eq!(got.data.holder, None);
     }
 
     #[test]
@@ -1038,8 +1090,18 @@ mod tests {
     fn cri1_repair2_sandbox_rejects_header_violations() {
         let secret = "SECRETMARK";
         for (from, to) in [
-            ("record v1\n", "record v2\n"),
-            ("record v1\n", "record v1 \n"),
+            ("record v2\n", "record v3\n"),
+            ("record v2\n", "record v2 \n"),
+            // v1 に `holder=` 行があれば拒否する。
+            ("record v2\n", "record v1\n"),
+            // v2 に `holder=` 行が無ければ拒否する。
+            ("holder=-\n", ""),
+            ("holder=-\n", "holder=\n"),
+            ("holder=-", "holder=4242,1,4:1,4:1,4:3"),
+            (
+                "network_pending=0\nholder=-\n",
+                "holder=-\nnetwork_pending=0\n",
+            ),
             ("state=notready\n", "state=NOTREADY\n"),
             ("state=notready\n", "state=bogus\n"),
             ("pending=1\n", "pending=2\n"),

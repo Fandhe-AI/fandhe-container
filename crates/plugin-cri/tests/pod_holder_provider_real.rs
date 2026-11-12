@@ -55,7 +55,7 @@ mod linux {
     use std::time::{Duration, Instant};
 
     use fandhe_container_cri::adapter::{
-        PodHolderLiveness, PodHolderRequest, PodNamespaceHolderProvider,
+        PodHolderLiveness, PodHolderRequest, PodNamespaceHolderProvider, ProcessStartObservation,
     };
     use fandhe_container_cri::error::CriErrorCode;
     use fandhe_container_cri::runtime::v1::PodSandboxConfig;
@@ -158,6 +158,27 @@ mod linux {
         }
         if provider.liveness("sb-a").ok() != Some(PodHolderLiveness::Alive) {
             fail("holder a is not alive");
+        }
+        // 素性(R11・#2940): spawn が返した pid・ns の dev:ino・starttime が /proc の実値と一致する。
+        let Some(identity) = a.identity() else {
+            fail("holder a has no identity");
+        };
+        if identity.pid().get() != a_pid {
+            fail("identity pid differs from the holder pid");
+        }
+        for (name, got) in [
+            ("user", identity.user()),
+            ("ipc", identity.ipc()),
+            ("net", identity.net()),
+        ] {
+            if (got.dev, got.ino) != ns_id(Some(a_pid), name) {
+                fail(&format!("identity {name} namespace differs from /proc"));
+            }
+        }
+        match provider.observe_process_start(a_pid) {
+            Ok(ProcessStartObservation::Present { start_time_ticks })
+                if start_time_ticks == identity.start_time_ticks() => {}
+            _ => fail("identity starttime differs from the observed starttime"),
         }
         println!(
             "pod_holder_provider_real: scenario A ok: spawn verified READY and the holder namespaces differ from ours (root=false)"

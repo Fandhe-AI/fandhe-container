@@ -62,7 +62,7 @@ use fandhe_container_gpu::cdi_spec::{DeviceNode, read_cdi_spec_file};
 // 層 B の検証器（`tests/symlink_coverage.rs` と共有。#4589）。
 #[path = "support/symlink_coverage_check.rs"]
 mod symlink_coverage_check;
-use symlink_coverage_check::{HookWindowCoverage, per_hook_expected};
+use symlink_coverage_check::{HookWindowCoverage, per_hook_expected, per_hook_repeated};
 
 const TEST_NAME: &str = "gpu2_cuda_workload_five_trials_with_namespace_isolation";
 const TRIALS: u32 = 5;
@@ -982,7 +982,9 @@ fn inner_main() {
     let layout = detect_usr_merge_layout(&rootfs).expect("rootfs layout");
     let per_hook = per_hook_expected(&hooks, &layout)
         .unwrap_or_else(|e| panic!("cannot extract create-symlinks links: {e:?}"));
-    let coverage = HookWindowCoverage::new(&rootfs, per_hook);
+    let repeated = per_hook_repeated(&hooks, &layout)
+        .unwrap_or_else(|e| panic!("cannot extract repeated create-symlinks links: {e:?}"));
+    let coverage = HookWindowCoverage::new(&rootfs, per_hook).with_repeated(repeated);
     let work = open_hook_work_dir(&hooks_work).unwrap_or_else(|e| panic!("open hook work: {e}"));
     coverage.begin();
     let done = run_create_container_hooks_with_recorder(

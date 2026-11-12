@@ -14,7 +14,6 @@
 //! # フックごとの窓（層 B）
 //! `update-ldcache` 等の他フックは期待リンクと同じ親に別の symlink を作りうる。そこで `HookWindowCoverage`
 //! は `create-symlinks` フック 1 件ごとの直前・直後のスナップショットだけで照合する。
-#![allow(dead_code)] // 取り込む試験ごとに使う項目が異なるため。
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -141,11 +140,17 @@ pub struct SymlinkCoverageReport {
 }
 
 impl SymlinkCoverageReport {
+    // 層 A（tests/symlink_coverage.rs）だけが使う。層 B（tests/cuda_workload.rs）は LayerBReport を使うため、
+    // そちらの取り込みでは未使用になる（項目単位で許可する）。
+    #[allow(dead_code)]
     pub fn is_pass(&self) -> bool {
         self.created_symlinks == self.expected_links && self.mismatches.is_empty()
     }
 
     /// 不合格なら全件を並べて panic する（どのリンクが落ちたかを 1 回で分かるようにする。REPAIR-4）。
+    // 層 A（tests/symlink_coverage.rs）だけが使う。層 B（tests/cuda_workload.rs）は LayerBReport を使うため、
+    // そちらの取り込みでは未使用になる（項目単位で許可する）。
+    #[allow(dead_code)]
     pub fn assert_pass(&self) {
         assert!(
             self.is_pass(),
@@ -295,14 +300,11 @@ pub fn is_create_symlinks(h: &CdiCreateContainerHook) -> bool {
     h.args().get(1).map(String::as_str) == Some("create-symlinks")
 }
 
-/// フックの添字ごとの期待集合。`create-symlinks` 以外は `None`。
-///
-/// 別フックが同じ（正規化後の）link を挙げたら最初のフックだけに割り当てる（層 A の一意件数への畳み込みと同じ）。
-/// 別フック間で向き先が違えば `ConflictingTargets`。全体の一意件数は各要素の `len` の和。
-pub fn per_hook_expected(
+/// フックごとの割り当て: 初出のリンク（`owned`。件数に数える）と、先行フックが既に挙げた同じ向き先のリンク（`repeated`）。
+fn split_per_hook(
     hooks: &[CdiCreateContainerHook],
     layout: &UsrMergeLayout,
-) -> Result<Vec<Option<Expected>>, ExtractError> {
+) -> Result<Vec<Option<(Expected, Expected)>>, ExtractError> {
     let mut seen = Expected::new();
     let mut out = Vec::with_capacity(hooks.len());
     for h in hooks {
@@ -311,20 +313,74 @@ pub fn per_hook_expected(
             continue;
         }
         let own = normalize_expected(&expected_links(std::slice::from_ref(h))?, layout)?;
-        let mut mine = Expected::new();
+        let mut owned = Expected::new();
+        let mut repeated = Expected::new();
         for (link, target) in own {
             match seen.get(&link) {
                 Some(t) if *t != target => return Err(ExtractError::ConflictingTargets(link)),
-                Some(_) => {}
+                Some(_) => {
+                    repeated.insert(link, target);
+                }
                 None => {
                     seen.insert(link.clone(), target.clone());
-                    mine.insert(link, target);
+                    owned.insert(link, target);
                 }
             }
         }
-        out.push(Some(mine));
+        out.push(Some((owned, repeated)));
     }
     Ok(out)
+}
+
+/// フックの添字ごとの期待集合（初出のリンクだけ）。`create-symlinks` 以外は `None`。
+///
+/// 別フックが同じ（正規化後の）link を挙げたら最初のフックだけに割り当てる（層 A の一意件数への畳み込みと同じ）。
+/// 別フック間で向き先が違えば `ConflictingTargets`。全体の一意件数は各要素の `len` の和。
+/// 後続フックの重複リンクは [`per_hook_repeated`] で取り出し、存在と向き先を別に検証する。
+pub fn per_hook_expected(
+    hooks: &[CdiCreateContainerHook],
+    layout: &UsrMergeLayout,
+) -> Result<Vec<Option<Expected>>, ExtractError> {
+    Ok(split_per_hook(hooks, layout)?
+        .into_iter()
+        .map(|o| o.map(|(owned, _)| owned))
+        .collect())
+}
+
+/// フックの添字ごとの、先行フックが既に挙げた同じ向き先のリンク。件数には数えず、後続フックの終了後に
+/// 存在と向き先だけを照合する（先行が作ったリンクを後続が消す・付け替える破損を見逃さない。GPU-2）。
+pub fn per_hook_repeated(
+    hooks: &[CdiCreateContainerHook],
+    layout: &UsrMergeLayout,
+) -> Result<Vec<Option<Expected>>, ExtractError> {
+    Ok(split_per_hook(hooks, layout)?
+        .into_iter()
+        .map(|o| o.map(|(_, repeated)| repeated))
+        .collect())
+}
+
+/// 重複リンクが終了後のスナップショットに期待どおり残っているかを照合する。
+fn verify_repeated(expected: &Expected, after: &Snapshot) -> Vec<SymlinkMismatch> {
+    let mut out = Vec::new();
+    for (link, target) in expected {
+        let parent = link.rsplit_once('/').map_or("", |(p, _)| p);
+        if after.bad_parents.contains(parent) {
+            out.push(SymlinkMismatch::BadParent { link: link.clone() });
+        } else if let Some(actual) = after.symlinks.get(link) {
+            if actual != target {
+                out.push(SymlinkMismatch::WrongTarget {
+                    link: link.clone(),
+                    expected: target.clone(),
+                    actual: actual.clone(),
+                });
+            }
+        } else if after.non_symlinks.contains(link) {
+            out.push(SymlinkMismatch::NotSymlink { link: link.clone() });
+        } else {
+            out.push(SymlinkMismatch::Missing { link: link.clone() });
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------- 層 B: フックごとの窓
@@ -382,6 +438,8 @@ struct WindowState {
 pub struct HookWindowCoverage {
     rootfs: PathBuf,
     per_hook: Vec<Option<Expected>>,
+    /// 先行フックと重複するリンク（件数に数えず、存在と向き先だけ照合する）。
+    repeated: Vec<Option<Expected>>,
     state: RefCell<WindowState>,
 }
 
@@ -394,12 +452,19 @@ impl HookWindowCoverage {
         Self {
             rootfs: rootfs.to_path_buf(),
             per_hook,
+            repeated: Vec::new(),
             state: RefCell::new(WindowState {
                 next_index: 0,
                 before: None,
                 report,
             }),
         }
+    }
+
+    /// 先行フックと重複するリンク（[`per_hook_repeated`]）を渡す。各フックの終了後に存在と向き先を照合する。
+    pub fn with_repeated(mut self, repeated: Vec<Option<Expected>>) -> Self {
+        self.repeated = repeated;
+        self
     }
 
     fn open_window(&self, st: &mut WindowState, index: usize) {
@@ -447,6 +512,20 @@ impl HookWindowCoverage {
                     .errors
                     .push(format!("hook {index}: no snapshot before the hook")),
                 (_, Err(e)) => st.report.errors.push(format!("hook {index} after: {e}")),
+            }
+        }
+        if let Some(Some(rep)) = self.repeated.get(index)
+            && !rep.is_empty()
+        {
+            match snapshot(&self.rootfs, rep) {
+                Ok(after) => st
+                    .report
+                    .mismatches
+                    .extend(verify_repeated(rep, &after).into_iter().map(|m| (index, m))),
+                Err(e) => st
+                    .report
+                    .errors
+                    .push(format!("hook {index} repeated after: {e}")),
             }
         }
         let next = st.next_index;

@@ -437,7 +437,7 @@ fn gpu2_usr_merge_link_path_is_normalized() {
 
 // ---------------------------------------------------------------- 層 B の接着部（偽フックで駆動。既定の集合）
 
-use symlink_coverage_check::{HookWindowCoverage, per_hook_expected};
+use symlink_coverage_check::{HookWindowCoverage, per_hook_expected, per_hook_repeated};
 
 /// PoC-14 の実機相当の 7 フック（添字 0・1・6 が create-symlinks）の窓を、偽の実行で駆動する。
 /// `others` が真なら、間のフック（添字 3 の ldconfig 役）が期待リンクと同じ親に別の symlink を足す。
@@ -609,5 +609,85 @@ fn gpu2_per_hook_assignment_folds_duplicates_across_hooks() {
     assert_eq!(
         per_hook_expected(&bad, &layout),
         Err(ExtractError::ConflictingTargets("/x/l".into()))
+    );
+}
+
+/// 2 番目も `a::/x/l` を挙げる（ほかに `b::/x/m`）2 フックを窓で駆動し、2 番目のフックの終了前に `after_second` で破損を注入する。
+/// 戻りは (集計, 重複リンクの割り当て)。1 番目のフックは正しく作る。
+fn drive_duplicate_hooks(
+    after_second: impl Fn(&TempRoot),
+) -> (symlink_coverage_check::LayerBReport, Vec<Option<Expected>>) {
+    let layout = detect_usr_merge_layout(Path::new("/")).unwrap();
+    let h = synth_hooks(&[
+        &["--link", "a::/x/l"],
+        &["--link", "a::/x/l", "--link", "b::/x/m"],
+    ]);
+    let per_hook = per_hook_expected(&h, &layout).unwrap();
+    let repeated = per_hook_repeated(&h, &layout).unwrap();
+    let root = TempRoot::new();
+    let cov = HookWindowCoverage::new(root.path(), per_hook).with_repeated(repeated.clone());
+    cov.begin();
+    root.link("a", "/x/l");
+    cov.on_hook_done(0, true);
+    root.link("b", "/x/m");
+    after_second(&root);
+    cov.on_hook_done(1, true);
+    (cov.finish(), repeated)
+}
+
+/// GPU-2・REPAIR-12: 重複リンクは件数に数えず（一意 2 件）、2 番目のフックの後も残っていれば合格する。
+#[test]
+fn gpu2_duplicate_link_in_later_hook_passes_when_intact() {
+    let (r, repeated) = drive_duplicate_hooks(|_| {});
+    let want: Expected = [("/x/l".to_string(), "a".to_string())].into();
+    assert_eq!(repeated, [Some(Expected::new()), Some(want)]);
+    assert_eq!(
+        (
+            r.target_hooks,
+            r.verified_hooks,
+            r.expected_links,
+            r.created_symlinks
+        ),
+        (2, 2, 2, 2)
+    );
+    r.assert_pass();
+}
+
+/// GPU-2・REPAIR-12: 後続フックが先行フックの作ったリンクを削除したら Missing で不合格（終了コード 0 でも）。
+#[test]
+fn gpu2_duplicate_link_removed_by_later_hook_is_missing() {
+    let (r, _) = drive_duplicate_hooks(|root| {
+        std::fs::remove_file(root.path().join("x/l")).unwrap();
+    });
+    assert!(!r.is_pass());
+    assert_eq!(
+        r.mismatches,
+        [(
+            1,
+            SymlinkMismatch::Missing {
+                link: "/x/l".into()
+            }
+        )]
+    );
+}
+
+/// GPU-2・REPAIR-12: 後続フックが先行フックのリンクを別の向き先へ付け替えたら WrongTarget で不合格。
+#[test]
+fn gpu2_duplicate_link_retargeted_by_later_hook_is_wrong_target() {
+    let (r, _) = drive_duplicate_hooks(|root| {
+        std::fs::remove_file(root.path().join("x/l")).unwrap();
+        root.link("evil", "/x/l");
+    });
+    assert!(!r.is_pass());
+    assert_eq!(
+        r.mismatches,
+        [(
+            1,
+            SymlinkMismatch::WrongTarget {
+                link: "/x/l".into(),
+                expected: "a".into(),
+                actual: "evil".into()
+            }
+        )]
     );
 }

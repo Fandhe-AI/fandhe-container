@@ -9,8 +9,10 @@
 //! - 層 A（本ファイル。既定テスト集合・CI で実行）: 検証器と、フックの役を `std::os::unix::fs::symlink`
 //!   で代わりに務める一時 rootfs 上の結合試験。検証器はリンクの作られ方に依らず前後のスナップショットだけを
 //!   比べるため、欠落・向き先違い・余分・既存リンクの取り違えを陰性ケースで検出できることも示す。
-//! - 層 B（本 issue の範囲外）: 実 GPU ホストで本物の `nvidia-cdi-hook` を走らせての照合。core の
-//!   pre-pivot 段への配線（#2774）が済むまで実行できず、実機（人間担当）の作業になる。
+//! - 層 B（実機前提。#4589）: 本物の `nvidia-cdi-hook` を走らせての照合。検証器は共有モジュール
+//!   `support/symlink_coverage_check.rs` に置き、`tests/cuda_workload.rs` の実機前提試験がフックごとの窓
+//!   （`HookWindowCoverage`）で呼ぶ。core の pre-pivot 段への配線（#2774）が済むまでは同試験が rootfs を
+//!   自分で組む。本ファイルの末尾の試験は窓の接着部を偽フックで既定の集合として照合する。実機の記録は #3001。
 //!
 //! # 前提
 //! 期待集合は実行される値と同じ経路（`parse_cdi_spec` → `aggregate_container_edits` →
@@ -22,7 +24,6 @@
 #[path = "../../oci/tests/support/test_root.rs"]
 mod test_root;
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -31,84 +32,23 @@ use fandhe_container_gpu::cdi_apply::hooks::{
     CdiCreateContainerHook, validate_create_container_hooks,
 };
 use fandhe_container_gpu::cdi_edits::aggregate_container_edits;
-use fandhe_container_gpu::cdi_paths::{detect_usr_merge_layout, normalize_usr_merge_path};
+use fandhe_container_gpu::cdi_paths::detect_usr_merge_layout;
 use fandhe_container_gpu::cdi_spec::parse_cdi_spec;
 
 const DEVBOX02: &str = include_str!("fixtures/poc14-devbox02.json");
 const NODE4: &str = include_str!("fixtures/poc14-node4.json");
 
-/// 1 ディレクトリあたりの列挙件数の上限（無制限確保の防止）。
-const MAX_DIR_ENTRIES: usize = 65536;
+// 検証器（層 A・層 B 共通。#4589）。
+#[path = "support/symlink_coverage_check.rs"]
+mod symlink_coverage_check;
+use symlink_coverage_check::{
+    Expected, ExtractError, Snapshot, SymlinkMismatch, expected_links, normalize_expected,
+    snapshot as snapshot_checked, verify,
+};
 
-// ---------------------------------------------------------------- 期待リンクの抽出
-
-/// 期待リンク集合の抽出失敗の種類（spec の `--link` 引数が不正）。
-#[derive(Debug, PartialEq, Eq)]
-enum ExtractError {
-    /// 最後の `--link` に値が無い。
-    MissingLinkValue,
-    /// `--link` 以外の引数（`--link=...` や未知のフラグを含む）。
-    UnexpectedArg(String),
-    /// `::` が無い、2 個以上ある、または片側が空。
-    BadPair(String),
-    /// リンク側が正規化済みの絶対パスでない。
-    BadLinkPath(String),
-    /// 同じリンクに別々のターゲットがある。
-    ConflictingTargets(String),
-}
-
-/// 期待リンク（link パス -> target 文字列）。
-type Expected = BTreeMap<String, String>;
-
-/// 集計済みフックから `create-symlinks` の `--link` を全件取り出す。同一 (target, link) は 1 件に畳む。
-///
-/// 比べる件数は畳んだ後の一意な件数。ターゲットは文字列のまま（相対ターゲットを解決しない）。
-fn expected_links(hooks: &[CdiCreateContainerHook]) -> Result<Expected, ExtractError> {
-    let mut out = Expected::new();
-    for h in hooks {
-        if h.args().get(1).map(String::as_str) != Some("create-symlinks") {
-            continue;
-        }
-        let mut it = h.args().iter().skip(2);
-        while let Some(flag) = it.next() {
-            if flag != "--link" {
-                return Err(ExtractError::UnexpectedArg(flag.clone()));
-            }
-            let value = it.next().ok_or(ExtractError::MissingLinkValue)?;
-            let parts: Vec<&str> = value.split("::").collect();
-            let [target, link] = parts.as_slice() else {
-                return Err(ExtractError::BadPair(value.clone()));
-            };
-            if target.is_empty() || link.is_empty() {
-                return Err(ExtractError::BadPair(value.clone()));
-            }
-            if !is_clean_absolute(link) {
-                return Err(ExtractError::BadLinkPath((*link).to_string()));
-            }
-            match out.get(*link) {
-                Some(t) if t != target => {
-                    return Err(ExtractError::ConflictingTargets((*link).to_string()));
-                }
-                Some(_) => {}
-                None => {
-                    out.insert((*link).to_string(), (*target).to_string());
-                }
-            }
-        }
-    }
-    Ok(out)
-}
-
-/// `/` 始まりで、空要素・`.`・`..`・`\` を含まないパスか。
-fn is_clean_absolute(p: &str) -> bool {
-    let Some(rest) = p.strip_prefix('/') else {
-        return false;
-    };
-    !rest.is_empty()
-        && !p.contains('\\')
-        && rest
-            .split('/')
-            .all(|c| !c.is_empty() && c != "." && c != "..")
+/// 層 A の呼び出し側では走査の I/O 失敗を panic にする（検証器は `Result` を返す）。
+fn snapshot(rootfs: &Path, expected: &Expected) -> Snapshot {
+    snapshot_checked(rootfs, expected).unwrap()
 }
 
 fn hooks_of(spec_json: &str, devices: &[&str]) -> Vec<CdiCreateContainerHook> {
@@ -123,175 +63,6 @@ fn link_counts(hooks: &[CdiCreateContainerHook]) -> Vec<usize> {
         .filter(|h| h.args().get(1).map(String::as_str) == Some("create-symlinks"))
         .map(|h| h.args().iter().filter(|a| *a == "--link").count())
         .collect()
-}
-
-// ---------------------------------------------------------------- スナップショットと照合
-
-/// 期待リンクの親ディレクトリ（rootfs 相対の絶対表記）ごとの列挙結果。
-#[derive(Debug, Default)]
-struct Snapshot {
-    symlinks: BTreeMap<String, String>,
-    non_symlinks: BTreeSet<String>,
-    bad_parents: BTreeSet<String>,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum SymlinkMismatch {
-    Missing {
-        link: String,
-    },
-    WrongTarget {
-        link: String,
-        expected: String,
-        actual: String,
-    },
-    Unexpected {
-        link: String,
-        target: String,
-    },
-    NotSymlink {
-        link: String,
-    },
-    PreExisting {
-        link: String,
-        target: String,
-    },
-    BadParent {
-        link: String,
-    },
-}
-
-#[derive(Debug)]
-struct SymlinkCoverageReport {
-    expected_links: usize,
-    created_symlinks: usize,
-    mismatches: Vec<SymlinkMismatch>,
-}
-
-impl SymlinkCoverageReport {
-    fn is_pass(&self) -> bool {
-        self.created_symlinks == self.expected_links && self.mismatches.is_empty()
-    }
-
-    /// 不合格なら全件を並べて panic する（どのリンクが落ちたかを 1 回で分かるようにする。REPAIR-4）。
-    fn assert_pass(&self) {
-        assert!(
-            self.is_pass(),
-            "symlink coverage failed: expected={} created={} mismatches={:#?}",
-            self.expected_links,
-            self.created_symlinks,
-            self.mismatches
-        );
-    }
-}
-
-/// 期待リンクの親ディレクトリだけを 1 段（再帰しない）列挙する。
-///
-/// 親は rootfs から 1 要素ずつ `symlink_metadata` で辿り、途中が symlink・ディレクトリ以外なら
-/// 不正な親として記録して列挙しない（rootfs の外へ出ない）。親が無いのは空の列挙。
-/// エントリは辿らず `read_link` のみ使う。
-fn snapshot(rootfs: &Path, expected: &Expected) -> Snapshot {
-    let mut snap = Snapshot::default();
-    let parents: BTreeSet<&str> = expected
-        .keys()
-        .filter_map(|l| l.rsplit_once('/').map(|(p, _)| p))
-        .collect();
-    for parent in parents {
-        let mut dir = rootfs.to_path_buf();
-        let mut bad = false;
-        let mut absent = false;
-        for comp in parent.split('/').filter(|c| !c.is_empty()) {
-            dir.push(comp);
-            match std::fs::symlink_metadata(&dir) {
-                Ok(m) if m.is_dir() => {}
-                Ok(_) => {
-                    bad = true;
-                    break;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    absent = true;
-                    break;
-                }
-                Err(e) => panic!("cannot inspect link parent: {e}"),
-            }
-        }
-        if bad {
-            snap.bad_parents.insert(parent.to_string());
-            continue;
-        }
-        if absent {
-            continue;
-        }
-        for (n, ent) in std::fs::read_dir(&dir).unwrap().enumerate() {
-            assert!(
-                n < MAX_DIR_ENTRIES,
-                "too many entries in a link parent directory"
-            );
-            let ent = ent.unwrap();
-            let name = ent.file_name().into_string().expect("non UTF-8 entry name");
-            let full = format!("{parent}/{name}");
-            if std::fs::symlink_metadata(ent.path())
-                .unwrap()
-                .file_type()
-                .is_symlink()
-            {
-                let t = std::fs::read_link(ent.path()).unwrap();
-                snap.symlinks.insert(
-                    full,
-                    t.into_os_string().into_string().expect("non UTF-8 target"),
-                );
-            } else {
-                snap.non_symlinks.insert(full);
-            }
-        }
-    }
-    snap
-}
-
-/// 実行前後のスナップショットを期待集合と照合する。
-fn verify(expected: &Expected, before: &Snapshot, after: &Snapshot) -> SymlinkCoverageReport {
-    let mut mismatches = Vec::new();
-    let created: BTreeMap<&String, &String> = after
-        .symlinks
-        .iter()
-        .filter(|(k, _)| !before.symlinks.contains_key(*k))
-        .collect();
-    for (link, target) in expected {
-        let parent = link.rsplit_once('/').map_or("", |(p, _)| p);
-        if after.bad_parents.contains(parent) {
-            mismatches.push(SymlinkMismatch::BadParent { link: link.clone() });
-        } else if let Some(t) = before.symlinks.get(link) {
-            mismatches.push(SymlinkMismatch::PreExisting {
-                link: link.clone(),
-                target: t.clone(),
-            });
-        } else if let Some(actual) = after.symlinks.get(link) {
-            if actual != target {
-                mismatches.push(SymlinkMismatch::WrongTarget {
-                    link: link.clone(),
-                    expected: target.clone(),
-                    actual: actual.clone(),
-                });
-            }
-        } else if after.non_symlinks.contains(link) {
-            mismatches.push(SymlinkMismatch::NotSymlink { link: link.clone() });
-        } else {
-            mismatches.push(SymlinkMismatch::Missing { link: link.clone() });
-        }
-    }
-    for (link, target) in &created {
-        if !expected.contains_key(*link) {
-            mismatches.push(SymlinkMismatch::Unexpected {
-                link: (*link).clone(),
-                target: (*target).clone(),
-            });
-        }
-    }
-    SymlinkCoverageReport {
-        expected_links: expected.len(),
-        created_symlinks: created.len(),
-        mismatches,
-    }
 }
 
 // ---------------------------------------------------------------- 試験の補助
@@ -656,13 +427,187 @@ fn gpu2_usr_merge_link_path_is_normalized() {
     let root = TempRoot::new();
     root.link("usr/lib", "/lib");
     let layout = detect_usr_merge_layout(root.path()).unwrap();
-    let expected: Expected = raw
-        .iter()
-        .map(|(l, t)| (normalize_usr_merge_path(l, &layout).into_owned(), t.clone()))
-        .collect();
+    let expected = normalize_expected(&raw, &layout).unwrap();
     assert!(expected.contains_key("/usr/lib/libfoo.so"));
     std::fs::create_dir_all(root.path().join("usr/lib")).unwrap();
     let before = snapshot(root.path(), &expected);
     root.link("libfoo.so.1", "/usr/lib/libfoo.so");
     verify(&expected, &before, &snapshot(root.path(), &expected)).assert_pass();
+}
+
+// ---------------------------------------------------------------- 層 B の接着部（偽フックで駆動。既定の集合）
+
+use symlink_coverage_check::{HookWindowCoverage, per_hook_expected};
+
+/// dev-box02 相当の 7 フック（添字 0・1・6 が create-symlinks）の窓を、偽の実行で駆動する。
+/// `others` が真なら、間のフック（添字 3 の ldconfig 役）が期待リンクと同じ親に別の symlink を足す。
+fn drive_windows(
+    json: &str,
+    others: bool,
+    tamper: impl Fn(&TempRoot, usize, &Expected),
+) -> symlink_coverage_check::LayerBReport {
+    let hooks = hooks_of(json, &["all"]);
+    let root = TempRoot::new();
+    root.link("usr/lib", "/lib");
+    std::fs::create_dir_all(root.path().join("usr/lib/x86_64-linux-gnu")).unwrap();
+    let layout = detect_usr_merge_layout(root.path()).unwrap();
+    let per_hook = per_hook_expected(&hooks, &layout).unwrap();
+    let cov = HookWindowCoverage::new(root.path(), per_hook.clone());
+    cov.begin();
+    for (i, exp) in per_hook.iter().enumerate() {
+        if let Some(exp) = exp {
+            run_fake_hook(&root, exp);
+            tamper(&root, i, exp);
+        } else if others && i == 3 {
+            root.link("libfoo.so.1", "/usr/lib/x86_64-linux-gnu/libfoo.so");
+        }
+        cov.on_hook_done(i, true);
+    }
+    cov.finish()
+}
+
+/// GPU-2・REPAIR-12: 窓の外の他フックが同じ親に作る symlink は数えず、dev-box02 の 3 フック・37 件で合格する。
+#[test]
+fn gpu2_window_ignores_symlinks_made_by_other_hooks() {
+    let r = drive_windows(DEVBOX02, true, |_, _, _| {});
+    assert_eq!(
+        (
+            r.target_hooks,
+            r.verified_hooks,
+            r.expected_links,
+            r.created_symlinks
+        ),
+        (3, 3, 37, 37)
+    );
+    r.assert_pass();
+}
+
+/// GPU-2: create-symlinks の窓の中で余分な symlink が作られたら Unexpected で不合格。
+#[test]
+fn gpu2_window_detects_unexpected_link_inside_window() {
+    let r = drive_windows(DEVBOX02, false, |root, i, _| {
+        if i == 1 {
+            root.link("x", "/usr/lib/x86_64-linux-gnu/extra-link");
+        }
+    });
+    assert!(!r.is_pass());
+    assert_eq!(
+        r.mismatches,
+        [(
+            1,
+            SymlinkMismatch::Unexpected {
+                link: "/usr/lib/x86_64-linux-gnu/extra-link".into(),
+                target: "x".into()
+            }
+        )]
+    );
+}
+
+/// GPU-2: 窓の中で 1 件作られなければ Missing、向き先違いなら WrongTarget（フックの添字つき）。
+#[test]
+fn gpu2_window_detects_missing_and_wrong_target() {
+    let skip = "/usr/lib/x86_64-linux-gnu/libcuda.so";
+    let hooks = hooks_of(DEVBOX02, &["all"]);
+    let root = TempRoot::new();
+    std::fs::create_dir_all(root.path().join("usr/lib/x86_64-linux-gnu")).unwrap();
+    let layout = detect_usr_merge_layout(root.path()).unwrap();
+    let per_hook = per_hook_expected(&hooks, &layout).unwrap();
+    let cov = HookWindowCoverage::new(root.path(), per_hook.clone());
+    cov.begin();
+    for (i, exp) in per_hook.iter().enumerate() {
+        if let Some(exp) = exp {
+            for (l, t) in exp {
+                if l == skip {
+                    continue;
+                }
+                root.link(
+                    if l.ends_with("libEGL_nvidia.so.0") {
+                        "bad"
+                    } else {
+                        t
+                    },
+                    l,
+                );
+            }
+        }
+        cov.on_hook_done(i, true);
+    }
+    let r = cov.finish();
+    assert!(!r.is_pass());
+    assert!(
+        r.mismatches
+            .iter()
+            .any(|(_, m)| *m == SymlinkMismatch::Missing { link: skip.into() })
+    );
+    assert!(
+        r.mismatches.iter().any(
+            |(_, m)| matches!(m, SymlinkMismatch::WrongTarget { actual, .. } if actual == "bad")
+        )
+    );
+}
+
+/// GPU-2: フック失敗の通知・添字の飛びは不合格にする。
+#[test]
+fn gpu2_window_rejects_failed_or_out_of_order_hooks() {
+    let h = synth_hooks(&[&["--link", "a::/x/l"]]);
+    let per_hook =
+        per_hook_expected(&h, &detect_usr_merge_layout(Path::new("/")).unwrap()).unwrap();
+    let root = TempRoot::new();
+    let cov = HookWindowCoverage::new(root.path(), per_hook.clone());
+    cov.begin();
+    root.link("a", "/x/l");
+    cov.on_hook_done(0, false);
+    assert!(!cov.finish().is_pass());
+
+    let cov = HookWindowCoverage::new(root.path(), per_hook);
+    cov.begin();
+    cov.on_hook_done(2, true);
+    let r = cov.finish();
+    assert!(!r.is_pass());
+    assert!(r.errors.iter().any(|e| e.contains("out of order")));
+}
+
+/// GPU-2・REPAIR-12: 対象フックが 0 件（期待 0 件）の空振りは合格にしない。
+#[test]
+fn gpu2_window_with_no_target_hooks_is_not_a_pass() {
+    let root = TempRoot::new();
+    let cov = HookWindowCoverage::new(root.path(), vec![None, None]);
+    cov.begin();
+    cov.on_hook_done(0, true);
+    cov.on_hook_done(1, true);
+    assert!(!cov.finish().is_pass());
+}
+
+/// GPU-2: 窓の途中で止まり、対象フックの後ろの通知が来なければ不合格（窓が閉じていない）。
+#[test]
+fn gpu2_window_not_closed_is_not_a_pass() {
+    let h = synth_hooks(&[&["--link", "a::/x/l"]]);
+    let per_hook =
+        per_hook_expected(&h, &detect_usr_merge_layout(Path::new("/")).unwrap()).unwrap();
+    let root = TempRoot::new();
+    let cov = HookWindowCoverage::new(root.path(), per_hook);
+    cov.begin();
+    assert!(!cov.finish().is_pass());
+}
+
+/// GPU-2: 2 つの create-symlinks が同じ (target, link) を持つとき、後のフックの窓では既存扱いにせず、
+/// 割り当ては最初のフックだけで、全体の一意件数は 2 件。向き先違いは拒否する。
+#[test]
+fn gpu2_per_hook_assignment_folds_duplicates_across_hooks() {
+    let layout = detect_usr_merge_layout(Path::new("/")).unwrap();
+    let h = synth_hooks(&[
+        &["--link", "a::/x/l", "--link", "b::/x/m"],
+        &["--link", "a::/x/l"],
+    ]);
+    let per = per_hook_expected(&h, &layout).unwrap();
+    let sizes: Vec<usize> = per
+        .iter()
+        .map(|e| e.as_ref().map_or(0, |m| m.len()))
+        .collect();
+    assert_eq!(sizes, [2, 0]);
+    let bad = synth_hooks(&[&["--link", "a::/x/l"], &["--link", "b::/x/l"]]);
+    assert_eq!(
+        per_hook_expected(&bad, &layout),
+        Err(ExtractError::ConflictingTargets("/x/l".into()))
+    );
 }

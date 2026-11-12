@@ -364,7 +364,7 @@ REPAIR-7 の 5 段階ゲートのうち、(3) タイムアウト保護された�
 - `network_paths_privileged`・`network_recorded_lifecycle_privileged`・`host_mode_privileged`・`net1_xproc_nsfs_pin_cleanup`・`dns_helper_privileged`・`dns_helper_ondemand_privileged`・`none_mode_privileged`・`add_host_privileged`・`etc_hosts_privileged`・`static_dns_privileged`・`escape_suite`・`vsock`
 - ゲスト資産の用意・`vm_boot`・`vm_cold_start`・`virtiofs_io`・`wsl2_virtiofs`・`wsl2_virtiofs` のコンテナ ID による回収・virtiofs の symlink・ハードリンク挙動の観測・`make fio-bench`・`seccomp_kill_audit`・カーネル監査フォールバックの肯定側送信・plugin 信頼性検証の別 UID 所有ファイル拒否・常駐 plugin の RSS 計測
 - UDS 境界の別 UID 所有ディレクトリ拒否・UDS 境界の別 UID 接続拒否・レイヤー展開の subuid 範囲への chown と rootful の特殊ビット保持・UDS 境界の peer UID 取得の macOS 実機観測・plugin-windows の別 UID listener 拒否・plugin-macos E2E の実 VM 起動・plugin-windows E2E の実 WSL2 起動・plugin-macos の別 UID listener 拒否・plugin-mcp の別 UID listener 拒否・plugin-microvm の別 UID listener 拒否・plugin-microvm E2E の実 KVM（x86_64）・plugin-microvm E2E の実 KVM（Linux aarch64）
-- plugin-microvm E2E の実 Hypervisor.framework・plugin-cri の別 UID connector 拒否・venus 試験治具の capset ログ照合・CDI `deviceNodes` の mknod の root 前提試験・CDI `createContainer` フックの namespace 前提の実機前提試験 2 件・net の nft ソケットの世代が開いたスレッドの netns に従う実機前提試験 1 件・CUDA ワークロード統合テスト
+- plugin-microvm E2E の実 Hypervisor.framework・plugin-cri の別 UID connector 拒否・venus 試験治具の capset ログ照合・CDI `deviceNodes` の mknod の root 前提試験・CDI `createContainer` フックの namespace 前提の実機前提試験 2 件・net の nft ソケットの世代が開いたスレッドの netns に従う実機前提試験 1 件・CUDA ワークロード統合テスト・CDI `create-symlinks` の全リンク網羅の層 B（CUDA ワークロード統合テストに統合）
 
 ### ライセンス検査
 

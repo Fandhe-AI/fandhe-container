@@ -6,6 +6,18 @@
 //! 1e-3 以下であること、および同じ実行の中で 4 種の namespace が分離されていること（独自の hostname・PID 1 が
 //! 自プロセス・独自の mountinfo）を照合する（PoC-14 の dev-box02 実測: 5/5 成功・最大相対誤差 3.556650e-07）。
 //!
+//! # 層 B: create-symlinks の全リンク網羅（TASK-127.5・GPU-2・REPAIR-12・#4589。実機の記録は #3001）
+//! 本物の `nvidia-cdi-hook create-symlinks` が作った symlink を、CDI spec の `--link <target>::<link>` 全件
+//! （同一 link は一意件数に畳み、usr-merge の rootfs では link 側を実位置へ正規化）と照合する。検証器は
+//! `tests/support/symlink_coverage_check.rs`（層 A の `tests/symlink_coverage.rs` と共有）。`update-ldcache`
+//! 等が同じ親に別の symlink を作りうるため、フック全体の前後ではなく `create-symlinks` フック 1 件ごとの
+//! 直前・直後だけで比べる（`run_create_container_hooks_with_recorder` の recorder が各試行の終了後・次の
+//! 起動前に同期で呼ばれる契約に依存する）。欠落・向き先違い・余分・既存・不正な親は 1 件でも不合格。
+//! 雛形の rootfs に期待リンクが既にあると `PreExisting` で落ちる。期待フックが 0 件の spec は前提欠如で失敗する。
+//! 代償: 本試験に統合したため、symlink の不一致があると CUDA 5/5 の試験も落ちる（無効化の手段は置かない。
+//! 弱体化と false-green を避ける）。成功行は既存の `gpu2_cuda_workload: ...` に加えて
+//! `gpu2_symlink_coverage_real: ...` を出す。core の経路（#2774）へ移すときは層 B の照合も同じ経路へ移す。
+//!
 //! # 未実装の宣言（REPAIR-3）
 //! core の pre-pivot 段への CDI 適用の配線は #2774 で未実装のため、本試験は製品の create / start 経路を通らない。
 //! 試験コードが `unshare(1)`・`mount(8)`・`pivot_root(8)` で core の `prepare_rootfs` 相当の順序を自分で組み立て、
@@ -36,7 +48,8 @@ use std::time::{Duration, Instant};
 
 use fandhe_container_gpu::cdi_apply::env::apply_cdi_env;
 use fandhe_container_gpu::cdi_apply::hooks::{
-    CdiHookState, run_create_container_hooks, validate_create_container_hooks, verify_hook_stage,
+    CdiHookRunRecorder, CdiHookRunSample, CdiHookState, open_hook_work_dir,
+    run_create_container_hooks_with_recorder, validate_create_container_hooks, verify_hook_stage,
 };
 use fandhe_container_gpu::cdi_apply::mounts::{CdiBindPropagation, cdi_bind_mounts};
 use fandhe_container_gpu::cdi_apply::{create_device_nodes, resolve_device_nodes};
@@ -45,6 +58,11 @@ use fandhe_container_gpu::cdi_paths::{
     PathLayouts, detect_usr_merge_layout, normalize_cdi_spec_paths,
 };
 use fandhe_container_gpu::cdi_spec::{DeviceNode, read_cdi_spec_file};
+
+// 層 B の検証器（`tests/symlink_coverage.rs` と共有。#4589）。
+#[path = "support/symlink_coverage_check.rs"]
+mod symlink_coverage_check;
+use symlink_coverage_check::{HookWindowCoverage, per_hook_expected};
 
 const TEST_NAME: &str = "gpu2_cuda_workload_five_trials_with_namespace_isolation";
 const TRIALS: u32 = 5;
@@ -227,6 +245,11 @@ struct InnerReport {
     device_nodes: usize,
     binds: usize,
     cuda_device: String,
+    /// 層 B（#4589）: 窓を閉じて照合した `create-symlinks` フック数・期待件数・作成件数・不一致件数。
+    symlink_hooks: usize,
+    symlink_expected: usize,
+    symlink_created: usize,
+    symlink_mismatches: usize,
 }
 
 const REPORT_PREFIX: &str = "FC_GPU_INNER ";
@@ -267,6 +290,10 @@ fn parse_inner_report(out: &str) -> Result<InnerReport, String> {
         device_nodes: num("device_nodes")?,
         binds: num("binds")?,
         cuda_device: get("cuda_device")?.into(),
+        symlink_hooks: num("symlink_hooks")?,
+        symlink_expected: num("symlink_expected")?,
+        symlink_created: num("symlink_created")?,
+        symlink_mismatches: num("symlink_mismatches")?,
     })
 }
 
@@ -428,6 +455,32 @@ struct Spec {
 }
 
 /// CDI spec を読み、usr-merge を正規化して集計する。外側（早期失敗）と内側の両方が呼ぶ。
+/// 層 B の期待（`create-symlinks` フック数, 一意な期待リンク数）。抽出できなければ前提欠如として panic する。
+fn symlink_expectation(sp: &Spec, rootfs: &Path) -> (usize, usize) {
+    let hooks = validate_create_container_hooks(sp.agg.hooks())
+        .unwrap_or_else(|e| panic!("PRECONDITION: invalid createContainer hooks: {e}"));
+    let layout = detect_usr_merge_layout(rootfs).expect("rootfs layout");
+    let per = per_hook_expected(&hooks, &layout)
+        .unwrap_or_else(|e| panic!("PRECONDITION: cannot extract create-symlinks links: {e:?}"));
+    (
+        per.iter().flatten().count(),
+        per.iter().flatten().map(|m| m.len()).sum(),
+    )
+}
+
+/// 実フックの試行が終わるたびに [`HookWindowCoverage`] へ通知する recorder（層 B。#4589）。
+/// `run_create_container_hooks_with_recorder` が各試行の終了後・次の起動前に同期で呼ぶ契約に依存する。
+struct WindowRecorder<'a>(&'a HookWindowCoverage);
+
+impl CdiHookRunRecorder for WindowRecorder<'_> {
+    fn record(&self, sample: CdiHookRunSample) {
+        self.0.on_hook_done(
+            sample.index,
+            sample.error_code.is_none() && sample.exit_code == Some(0),
+        );
+    }
+}
+
 fn load_edits(spec_path: &Path, devices: &str, rootfs: &Path) -> Spec {
     let mut spec = read_cdi_spec_file(spec_path)
         .unwrap_or_else(|e| panic!("PRECONDITION: failed to read CDI spec: {e}"));
@@ -492,6 +545,12 @@ fn gpu2_cuda_workload_five_trials_with_namespace_isolation() {
             && !probe.agg.hooks().is_empty(),
         "PRECONDITION: the CDI spec must provide deviceNodes, mounts and hooks"
     );
+    // 層 B の前提（#4589）: 期待リンクを持つ create-symlinks フックが 1 件以上あること。0 件は空振り合格になる。
+    let (want_symlink_hooks, want_symlink_links) = symlink_expectation(&probe, &rootfs_tpl);
+    assert!(
+        want_symlink_hooks >= 1 && want_symlink_links >= 1,
+        "PRECONDITION: the CDI spec must provide create-symlinks hooks with --link"
+    );
     drop(probe);
 
     let exe = std::env::current_exe().expect("current_exe");
@@ -523,6 +582,8 @@ fn gpu2_cuda_workload_five_trials_with_namespace_isolation() {
                     timeout,
                     host: &host,
                     rows: &rows,
+                    symlink_hooks: want_symlink_hooks,
+                    symlink_links: want_symlink_links,
                 },
             )
         }));
@@ -548,6 +609,10 @@ fn gpu2_cuda_workload_five_trials_with_namespace_isolation() {
     println!(
         "gpu2_cuda_workload: {TRIALS}/{TRIALS} trials passed (max_rel_err={worst:e} <= 1e-3, cuda_device={device_name}, pid/mnt/uts/ipc namespaces isolated)"
     );
+    // 層 B の成功行（#4589）。各試行で作成件数 = 期待件数・不一致 0 を照合済み。
+    println!(
+        "gpu2_symlink_coverage_real: {TRIALS}/{TRIALS} trials matched {want_symlink_links} links created by nvidia-cdi-hook create-symlinks (hooks={want_symlink_hooks}, missing=0 wrong_target=0 unexpected=0 preexisting=0)"
+    );
 }
 
 /// 1 試行の共通設定（引数の数を抑えるためにまとめる）。
@@ -561,6 +626,9 @@ struct TrialCfg<'a> {
     timeout: u64,
     host: &'a HostIdent,
     rows: &'a [usize],
+    /// 層 B: 外側の probe が数えた `create-symlinks` フック数と期待リンク数（内側の報告と突き合わせる）。
+    symlink_hooks: usize,
+    symlink_links: usize,
 }
 
 fn run_trial(trial: u32, work: &Path, cfg: &TrialCfg<'_>) -> (f64, String) {
@@ -574,6 +642,8 @@ fn run_trial(trial: u32, work: &Path, cfg: &TrialCfg<'_>) -> (f64, String) {
         timeout,
         host,
         rows,
+        symlink_hooks,
+        symlink_links,
     } = *cfg;
     let rootfs = work.join("rootfs");
     run_cmd(
@@ -678,6 +748,16 @@ fn run_trial(trial: u32, work: &Path, cfg: &TrialCfg<'_>) -> (f64, String) {
     let rep =
         parse_inner_report(&out).unwrap_or_else(|e| panic!("trial {trial}: {e}\n{}", tail(&out)));
     check_isolation(host, &rep, &want_hostname).unwrap_or_else(|e| panic!("trial {trial}: {e}"));
+    assert_eq!(
+        (
+            rep.symlink_hooks,
+            rep.symlink_expected,
+            rep.symlink_created,
+            rep.symlink_mismatches
+        ),
+        (symlink_hooks, symlink_links, symlink_links, 0),
+        "trial {trial}: create-symlinks coverage (layer B)"
+    );
 
     let c_path = io_dir.join("c.f32");
     let want = (n * n * 4) as u64;
@@ -692,8 +772,13 @@ fn run_trial(trial: u32, work: &Path, cfg: &TrialCfg<'_>) -> (f64, String) {
         "trial {trial}: max relative error {err:e} > 1e-3"
     );
     println!(
-        "trial {trial}: ok max_rel_err={err:e} cuda_device={} hooks={} device_nodes={} binds={}",
-        rep.cuda_device, rep.hooks, rep.device_nodes, rep.binds
+        "trial {trial}: ok max_rel_err={err:e} cuda_device={} hooks={} device_nodes={} binds={} symlinks={}/{}",
+        rep.cuda_device,
+        rep.hooks,
+        rep.device_nodes,
+        rep.binds,
+        rep.symlink_created,
+        rep.symlink_expected
     );
     (err, rep.cuda_device)
 }
@@ -893,14 +978,30 @@ fn inner_main() {
         .unwrap_or_else(|e| panic!("validate hooks: {e}"));
     let stage = verify_hook_stage(&rootfs).unwrap_or_else(|e| panic!("hook stage: {e}"));
     let state = CdiHookState::new(&want_hostname, host_pid).expect("hook state");
-    let done =
-        run_create_container_hooks(&stage, &hooks, &state, &hooks_work).unwrap_or_else(|e| {
-            panic!(
-                "hooks failed at index {}: {}\n{}",
-                e.index, e.error, e.stderr
-            )
-        });
+    // 層 B（#4589）: create-symlinks フックごとの直前・直後だけで symlink を照合する（ldconfig 等は窓の外）。
+    let layout = detect_usr_merge_layout(&rootfs).expect("rootfs layout");
+    let per_hook = per_hook_expected(&hooks, &layout)
+        .unwrap_or_else(|e| panic!("cannot extract create-symlinks links: {e:?}"));
+    let coverage = HookWindowCoverage::new(&rootfs, per_hook);
+    let work = open_hook_work_dir(&hooks_work).unwrap_or_else(|e| panic!("open hook work: {e}"));
+    coverage.begin();
+    let done = run_create_container_hooks_with_recorder(
+        &stage,
+        &hooks,
+        None,
+        &state,
+        &work,
+        &WindowRecorder(&coverage),
+    )
+    .unwrap_or_else(|e| {
+        panic!(
+            "hooks failed at index {}: {}\n{}",
+            e.index, e.error, e.stderr
+        )
+    });
     assert_eq!(done.len(), hooks.len(), "hook count");
+    let layer_b = coverage.finish();
+    layer_b.assert_pass();
 
     let base = vec![
         "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
@@ -1004,6 +1105,10 @@ fn inner_main() {
     emit("device_nodes", report.outcomes.len());
     emit("binds", binds.len());
     emit("cuda_device", cuda_device);
+    emit("symlink_hooks", layer_b.verified_hooks);
+    emit("symlink_expected", layer_b.expected_links);
+    emit("symlink_created", layer_b.created_symlinks);
+    emit("symlink_mismatches", layer_b.mismatches.len());
     emit("done", 1);
     let _ = std::io::stdout().flush();
 }
@@ -1091,6 +1196,10 @@ mod tests {
             "FC_GPU_INNER device_nodes=8",
             "FC_GPU_INNER binds=5",
             "FC_GPU_INNER cuda_device=NVIDIA Test GPU",
+            "FC_GPU_INNER symlink_hooks=3",
+            "FC_GPU_INNER symlink_expected=37",
+            "FC_GPU_INNER symlink_created=37",
+            "FC_GPU_INNER symlink_mismatches=0",
             "FC_GPU_INNER done=1",
         ]
         .join("\n")
@@ -1101,12 +1210,15 @@ mod tests {
     fn gpu2_inner_report_parse_rejects_missing_fields() {
         let rep = parse_inner_report(&sample_out()).unwrap();
         assert_eq!(rep.cuda_device, "NVIDIA Test GPU");
+        assert_eq!((rep.symlink_hooks, rep.symlink_created), (3, 37));
         assert_eq!(rep.mount_ids, BTreeSet::from([100, 101]));
         assert!(parse_inner_report("").is_err());
         let no_done = sample_out().replace("FC_GPU_INNER done=1", "");
         assert!(parse_inner_report(&no_done).is_err());
         let no_host = sample_out().replace("FC_GPU_INNER hostname=fc-gpu-cuda-1\n", "");
         assert!(parse_inner_report(&no_host).is_err());
+        let no_links = sample_out().replace("FC_GPU_INNER symlink_created=37\n", "");
+        assert!(parse_inner_report(&no_links).is_err());
     }
 
     /// GPU-2: namespace・hostname・pid・mount ID のどれか 1 つでも分離されていなければ判定が失敗する。

@@ -691,3 +691,48 @@ fn gpu2_duplicate_link_retargeted_by_later_hook_is_wrong_target() {
         )]
     );
 }
+
+/// GPU-2・REPAIR-12: 重複リンクだけを持つ親でも、窓の中で余分な symlink が作られたら Unexpected で不合格。
+/// 2 フックがともに `a::/x/l` を挙げ、後続が `/x/l` を保ったまま `/x/extra` も作る。
+#[test]
+fn gpu2_extra_link_in_repeated_only_parent_is_unexpected() {
+    let layout = detect_usr_merge_layout(Path::new("/")).unwrap();
+    let h = synth_hooks(&[
+        &["--link", "a::/x/l", "--link", "b::/y/m"],
+        &["--link", "a::/x/l"],
+    ]);
+    let per_hook = per_hook_expected(&h, &layout).unwrap();
+    let repeated = per_hook_repeated(&h, &layout).unwrap();
+    let run = |extra: bool| {
+        let root = TempRoot::new();
+        let cov =
+            HookWindowCoverage::new(root.path(), per_hook.clone()).with_repeated(repeated.clone());
+        cov.begin();
+        root.link("a", "/x/l");
+        root.link("b", "/y/m");
+        cov.on_hook_done(0, true);
+        if extra {
+            root.link("z", "/x/extra");
+        }
+        cov.on_hook_done(1, true);
+        cov.finish()
+    };
+    let bad = run(true);
+    assert!(!bad.is_pass());
+    assert_eq!(
+        bad.mismatches,
+        [(
+            1,
+            SymlinkMismatch::Unexpected {
+                link: "/x/extra".into(),
+                target: "z".into()
+            }
+        )]
+    );
+    let ok = run(false);
+    assert_eq!(
+        (ok.target_hooks, ok.expected_links, ok.created_symlinks),
+        (2, 2, 2)
+    );
+    ok.assert_pass();
+}

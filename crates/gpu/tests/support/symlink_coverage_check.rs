@@ -383,6 +383,30 @@ fn verify_repeated(expected: &Expected, after: &Snapshot) -> Vec<SymlinkMismatch
     out
 }
 
+/// 1 フックの窓の照合。観測対象は `owned` と `repeated` の和集合の親で、作成件数には重複分を数えない。
+///
+/// 初出リンクは [`verify`] と同じ基準（欠落・向き先違い・既存・不正な親）、重複リンクは終了後の存在と
+/// 向き先だけを見る。どちらにも無い新規 symlink は、重複リンクだけの親でも `Unexpected` にする。
+fn verify_window(
+    owned: &Expected,
+    repeated: &Expected,
+    before: &Snapshot,
+    after: &Snapshot,
+) -> SymlinkCoverageReport {
+    let mut r = verify(owned, before, after);
+    r.mismatches.retain(|m| match m {
+        SymlinkMismatch::Unexpected { link, .. } => !repeated.contains_key(link),
+        _ => true,
+    });
+    let dup_created = repeated
+        .keys()
+        .filter(|l| after.symlinks.contains_key(*l) && !before.symlinks.contains_key(*l))
+        .count();
+    r.created_symlinks = r.created_symlinks.saturating_sub(dup_created);
+    r.mismatches.extend(verify_repeated(repeated, after));
+    r
+}
+
 // ---------------------------------------------------------------- 層 B: フックごとの窓
 
 /// 層 B の集計結果。
@@ -467,10 +491,20 @@ impl HookWindowCoverage {
         self
     }
 
+    /// 添字 `index` のフックの観測対象（初出 + 重複リンク）。`create-symlinks` 以外は `None`。
+    fn observed(&self, index: usize) -> Option<(&Expected, Expected)> {
+        let owned = self.per_hook.get(index)?.as_ref()?;
+        let mut union = owned.clone();
+        if let Some(Some(rep)) = self.repeated.get(index) {
+            union.extend(rep.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
+        Some((owned, union))
+    }
+
     fn open_window(&self, st: &mut WindowState, index: usize) {
         st.before = None;
-        if let Some(Some(exp)) = self.per_hook.get(index) {
-            match snapshot(&self.rootfs, exp) {
+        if let Some((_, union)) = self.observed(index) {
+            match snapshot(&self.rootfs, &union) {
                 Ok(s) => st.before = Some(s),
                 Err(e) => st.report.errors.push(format!("hook {index} before: {e}")),
             }
@@ -496,10 +530,16 @@ impl HookWindowCoverage {
         if !succeeded {
             st.report.errors.push(format!("hook {index} failed"));
         }
-        if let Some(Some(exp)) = self.per_hook.get(index) {
-            match (st.before.take(), snapshot(&self.rootfs, exp)) {
+        if let Some((owned, union)) = self.observed(index) {
+            let empty = Expected::new();
+            let rep = self
+                .repeated
+                .get(index)
+                .and_then(|r| r.as_ref())
+                .unwrap_or(&empty);
+            match (st.before.take(), snapshot(&self.rootfs, &union)) {
                 (Some(before), Ok(after)) => {
-                    let r = verify(exp, &before, &after);
+                    let r = verify_window(owned, rep, &before, &after);
                     st.report.verified_hooks += 1;
                     st.report.expected_links += r.expected_links;
                     st.report.created_symlinks += r.created_symlinks;
@@ -512,20 +552,6 @@ impl HookWindowCoverage {
                     .errors
                     .push(format!("hook {index}: no snapshot before the hook")),
                 (_, Err(e)) => st.report.errors.push(format!("hook {index} after: {e}")),
-            }
-        }
-        if let Some(Some(rep)) = self.repeated.get(index)
-            && !rep.is_empty()
-        {
-            match snapshot(&self.rootfs, rep) {
-                Ok(after) => st
-                    .report
-                    .mismatches
-                    .extend(verify_repeated(rep, &after).into_iter().map(|m| (index, m))),
-                Err(e) => st
-                    .report
-                    .errors
-                    .push(format!("hook {index} repeated after: {e}")),
             }
         }
         let next = st.next_index;

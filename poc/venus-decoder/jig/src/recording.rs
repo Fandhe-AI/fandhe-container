@@ -17,7 +17,8 @@
 //! `ctrl::MAX_SUBMIT_3D_PAYLOAD_LEN`（4064 バイト）が上限なので 1 件の上限（`payload_too_large`）には実運用で達せず、
 //! 65,536 件 × (4064 + 16) は 256 MiB を超えるため `recording_too_large` が `too_many_records` より先に効きうる。
 //!
-//! 記録しないもの（未実装。REPAIR-3）: 共有メモリ上のリングの中身（F5.2b の後。設計書 10.4.5）、reply、期待出力。
+//! 共有メモリ上のリングの中身は `ring_record` が差分として同じ記録器へ足す（#1884。kind 1 の 1 レコード）。
+//! 記録しないもの（REPAIR-3）: reply ストリーム、期待出力、extra 領域、間接の cs の shmem、status。
 //! 本体が空の提出（`size=0`）も 1 レコードにする。`validate` は空ペイロードを通すが、`replay` の段で拒否されうる。
 //! 書き出しに失敗したファイルはヘッダの件数と本体が合わず、`validate` が `truncated` 等で拒否する。
 
@@ -188,6 +189,37 @@ impl<W: Write> SubmitRecorder<W> {
                 RecordOutcome::Recorded
             }
             Err(e) => self.stop(StopReason::from_error(&e)),
+        }
+    }
+
+    /// 記録済みの件数（ログの seqno 用）。
+    pub fn record_count(&self) -> u32 {
+        self.records
+    }
+
+    /// 長さ `len` の本体を追記できるかを、本体を確保する前に検査する（リングの差分を読む前の上限検査。#1884）。
+    /// 追記できるなら `None`。できないときは [`Self::record`] と同じ停止・読み捨ての状態遷移を行い、その結果を返す。
+    pub fn precheck(&mut self, len: u64) -> Option<RecordOutcome> {
+        if self.stopped.is_some() {
+            self.skipped = self.skipped.saturating_add(1);
+            return Some(RecordOutcome::Skipped);
+        }
+        if len > u64::from(self.limits.max_record_len) {
+            return Some(self.stop(StopReason::PayloadTooLarge));
+        }
+        if self.records >= self.limits.max_records {
+            return Some(self.stop(StopReason::TooManyRecords));
+        }
+        let framing = (RECORD_HEADER_LEN + RECORD_CHECKSUM_LEN) as u64;
+        let fits = self
+            .total_len
+            .checked_add(framing)
+            .and_then(|t| t.checked_add(len))
+            .is_some_and(|t| t <= self.limits.max_total_len);
+        if fits {
+            None
+        } else {
+            Some(self.stop(StopReason::RecordingTooLarge))
         }
     }
 

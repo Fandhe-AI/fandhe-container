@@ -135,6 +135,13 @@ harness = false
 # 呼び出し元を要求するため、単一スレッドの独自 main（harness = false）で動かす。root・実コンテナは不要で、
 # 既定のテスト集合で実行する（試験専用の入口 `run_in_worker_for_test` は exec-test-support の下にあり、上の
 # 自己参照の dev-dependency で有効になる。TASK-163 追補・#1460）。
+# 期限つき作業スレッドの戻りで Threads: が 1 に戻ることの照合（SEC-4・SUP-6・REPAIR-5・#2766）。
+# スレッド数を測るため libtest ではなく単一スレッドの独自 main が要る。
+[[test]]
+name = "bounded_worker_thread_settle"
+path = "tests/bounded_worker_thread_settle.rs"
+harness = false
+
 [[test]]
 name = "exec_timeout"
 path = "tests/exec_timeout.rs"

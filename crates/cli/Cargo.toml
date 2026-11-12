@@ -98,3 +98,8 @@ harness = false
 [[test]]
 name = "network_modes_real"
 harness = false
+
+# 実機前提の結合試験（#663・OCI-7・TASK-184.1）。`harness = false` の単一 main で、`-- --ignored` のときだけ実機シナリオを動かす。
+[[test]]
+name = "local_image_gc"
+harness = false

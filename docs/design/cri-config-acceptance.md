@@ -17,7 +17,7 @@
 | 9 | log_path / log_directory | core / supervisor の CRI ログ形式の書き出し | core・supervisor → cri | #2671（実装済み。下の節。ランチャー経由と ReopenContainerLog は未対応。総量は上限つき） |
 | 10 | cgroup_parent | core の `linux.cgroupsPath`（#2010 の方針で拒否。再判断が要る。判断材料は [cri-cgroup-parent.md](cri-cgroup-parent.md)。オーナー承認待ちで、それまで `UNIMPLEMENTED`） | core → cri | #2672 |
 | 11 | devices・CDI | core の `linux.devices`（UnappliedField）・gpu の CDI 適用（判断材料は [cri-devices-cdi.md](cri-devices-cdi.md)。gpu の TASK-127・128・129 の完了とオーナー判断まで `UNIMPLEMENTED`。一般デバイスは GPU-9 が検討中） | gpu・core → cri | #2673 |
-| 12 | pod の pid / ipc の共有（join） | core は user＋ipc の path の組だけ受理済み（#2674）。cri は変換と、保持役の pid から `for_holder_pid` で作ったパスを `CreateContainer` が bundle へ渡す配線まで実装済み（#2876。provider を注入した構成で ipc が `POD` のコンテナは保持役の user＋ipc へ join する）。本番（plugin-cri）は Linux・非 root で `ProductionPodHolder` を注入済み（H6・#2877）で、ipc が `POD` のコンテナは保持役へ join する（rootful は注入せず `UNIMPLEMENTED`）。netns のパスは #2878（H8）で実装済み（`PodNamespacePaths::net`）。構築口は #2776 で保持役の pid からの `PodNamespacePaths::for_holder_pid`（`/proc/<pid>/ns/{user,ipc,net}`）に限った。保持役の設計は [pod-namespace-holder.md](pod-namespace-holder.md)（#2838）で、実装は #2870〜#2880（保持役の配線は #2871・#2876・#2877）。pid の共有は未対応 | core → cri | #2674・#2776・#2838・#2876 |
+| 12 | pod の pid / ipc の共有（join） | core は user＋ipc の path の組だけ受理済み（#2674）。cri は変換と、保持役の pid から `for_holder_pid` で作ったパスを `CreateContainer` が bundle へ渡す配線まで実装済み（#2876。provider を注入した構成で ipc が `POD` のコンテナは保持役の user＋ipc へ join する）。本番（plugin-cri）は Linux・非 root で `ProductionPodHolder` を注入済み（H6・#2877）で、ipc が `POD` のコンテナは保持役へ join する（rootful は注入せず `UNIMPLEMENTED`）。netns のパスは #2878（H8）で実装済み（`PodNamespacePaths::net`）。構築口は #2776 で保持役の pid からの `PodNamespacePaths::for_holder_pid`（`/proc/<pid>/ns/{user,ipc,net}`）に限った。保持役の設計は [pod-namespace-holder.md](pod-namespace-holder.md)（#2838）で、実装は #2870〜#2880（保持役の配線は #2871・#2876・#2877）。pid の共有は未対応（設計は pod-namespace-holder.md の #2903 の節。判断待ちは #4607。uts の共有は #4608〜#4612） | core → cri | #2674・#2776・#2838・#2876 |
 | 13 | pod netns の作成・結線 | net・plugin-cri・cri の結線と注入点は本変更で実装済み。core の network namespace の join（user＋ipc＋net。#2872）と、cri が保持役の netns の path を bundle に出す側・`PodNetworkRequest` の保持役の欄（`holder_namespaces`。provider は新しい netns を作らず渡された netns を結線し、返すパスは `net()` と完全一致させる）は実装済み（#2878）。provider が無い `POD` は保持役の netns（`lo` のみ）へ join し、`NetworkReady=false` は保つ。`NetsetupPodNetwork` は保持役のある構成を資源を作らずに `UNIMPLEMENTED` で拒否する。本番の provider の注入は後続（設計は [pod-namespace-holder.md](pod-namespace-holder.md)・#2838。実装は #2879） | net・core・cri | #2675・#2838 |
 | 14 | port_mappings | plugin-cri `netsetup` の `publish_port`（本変更で実装済み。provider を注入した構成の `POD` だけ。本番は順 13 と同じく未注入のため `UNIMPLEMENTED`。下記「port_mappings の受け入れ方式」） | net・plugin-cri・cri | #2676 |
 | 15 | userns の uids / gids の写像 | オーナー判断待ち | core → cri | #2240 |
@@ -294,14 +294,14 @@ path は 1 回だけ開いて fd に固定する（pid の再利用で別 pod �
 | ipc `POD` | 無し | 新しい namespace |
 | ipc `CONTAINER` | 問わない | 新しい namespace |
 | ipc `POD` ＋ userns `CONTAINER` | あり | `UNIMPLEMENTED` |
-| pid（全モード） | 問わない | 新しい namespace（`NODE` / `TARGET` は `UNIMPLEMENTED`） |
+| pid（全モード） | 問わない | 新しい namespace（`NODE` / `TARGET` は `UNIMPLEMENTED`。pod での共有と pid の `TARGET` は #2903 の設計・判断待ち #4607） |
 
 `/proc/<pid>` を Create の時点で書く方式は pid の再利用で別 pod の namespace に入り得るため採らない。
 
 ### 既知の差と残り
 
 - `/dev/shm`（POSIX shm）は共有されない（コンテナごとの tmpfs）。SysV IPC と POSIX mqueue は共有される。userns が pod 単位になり、共有者は同じ userns の root になる（capability は既定の 14 個、seccomp が `setns`・`unshare` を禁じ、pid namespace は別）。
-- 残り（後続 issue）: pod の保持役（#2675 の netns と共有する設計。[pod-namespace-holder.md](pod-namespace-holder.md)・#2838。実装は #2870・#2871・#2874・#2876・#2877）と cri へのパスの供給、pid の共有（PID 1 の証跡・`Pid1Target` の見直しが要る）、pod 内の `/dev/shm` の共有、`NamespaceMode::TARGET`。
+- 残り（後続 issue）: pod の保持役（#2675 の netns と共有する設計。[pod-namespace-holder.md](pod-namespace-holder.md)・#2838。実装は #2870・#2871・#2874・#2876・#2877）と cri へのパスの供給、pid の共有（PID 1 の証跡・`Pid1Target` の見直しが要る）、pod 内の `/dev/shm` の共有、pid の `NamespaceMode::TARGET` は設計済みでオーナー判断待ち（#4607。それまで `UNIMPLEMENTED`／共有しない）。uts の共有は #4608〜#4612 で起票済み。ipc・network・userns の `TARGET` は `UNIMPLEMENTED` のまま（kubelet が送らない・userns は proto 上 `POD` と `NODE` だけ・network と ipc は core が単独の join を受けない。設計は [pod-namespace-holder.md](pod-namespace-holder.md) の #2903 の節）。
 
 ## pod netns の作成・結線（CRI-2・NET-1・PLUG-1。#2675）
 

@@ -4,7 +4,9 @@
 //! [`crate::input_scan::load_input_dir`] → [`crate::compose_convert::parse_compose_yaml`] →
 //! [`crate::key_scan::collect_key_occurrences`] ＋ [`crate::convert::convert_top_level`] →
 //! [`crate::report::FileConversionReport`] の順に処理し、[`crate::report_json`] で 1 行 JSON にして
-//! stderr 用の文字列として返す。純粋に文字列を組み立てるだけで、書き込みは [`crate::run`] が期限つきで行う。
+//! stderr 用の文字列として返す。入力がちょうど 1 件で対象（`error_free`。`--downgrade` ありなら
+//! `error_free_with_downgrade`）のときは、変換結果を `fandhe_container_stack::toml_output` で往復検証して
+//! stdout 用の文字列にも入れる。純粋に文字列を組み立てるだけで、書き込みは [`crate::run`] が期限つきで行う。
 //!
 //! # 引数
 //!
@@ -33,9 +35,13 @@
 //! `summary` 行の `conversion_rate` は出現数ベースの変換可率の計測で、算出は [`crate::conversion_rate`]。
 //! 80% 未満・判定不能でも終了コードは 0（レポートするだけでゲートにしない。判定は #607）。
 //!
-//! # 未実装（REPAIR-3）
+//! # TOML の書き出し（#3613・STACK-3・STACK-5）
 //!
-//! TOML の書き出し（stdout は空けたまま。集計行に `toml_output:"unimplemented"`）。
+//! stdout は 1 本なので、TOML 文書を複数連結すると読み戻せない。そのため書くのは「入力が 1 件で、その
+//! ファイルが対象」のときだけで、集計行の `toml_output` が結果の固定語彙（[`TomlOutputStatus`]）を持つ。
+//! 入力が 0 件は `skipped-no-inputs`、2 件以上は `skipped-multiple-files`、1 件で対象外は `skipped-not-error-free`（どちらも stdout は空・終了コード 0）。
+//! 直列化・往復検証の失敗は stdout を空にして終了コード 1（fail-closed）。格下げしたキーはスキーマに行き先が無く
+//! 変換されないため TOML に現れない（TASK-182）。複数ファイルの一括書き出し（出力先の指定）は未実装（REPAIR-3）。
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
@@ -48,7 +54,9 @@ use crate::downgrade::{DowngradeArgError, DowngradeSet, parse_downgrade_value};
 use crate::input_scan::load_input_dir;
 use crate::key_scan::collect_key_occurrences;
 use crate::report::FileConversionReport;
-use crate::report_json::{error_line, file_line, summary_line};
+use crate::report_json::{TomlOutputStatus, error_line, file_line, summary_line};
+use fandhe_container_stack::schema::ComposeToml;
+use fandhe_container_stack::toml_output::to_verified_toml_string;
 
 /// 引数の誤りの usage（値は含めない）。
 const USAGE: &str =
@@ -57,13 +65,15 @@ const USAGE: &str =
 /// 未実装の終了コード（ERR-2 の慣行で 8）。
 pub const UNIMPLEMENTED_EXIT_CODE: u8 = 8;
 
-/// 実行結果。`stderr` は書き出す全文（末尾改行つき）。
+/// 実行結果。`stderr`・`stdout` は書き出す全文（`stderr` は末尾改行つき。`stdout` は空なら書かない）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outcome {
     /// 終了コード。
     pub exit_code: u8,
     /// stderr に出す文字列。
     pub stderr: String,
+    /// stdout に出す TOML（書き出さないときは空）。
+    pub stdout: String,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -133,10 +143,12 @@ pub fn run_args(args: &[OsString]) -> Outcome {
         Parsed::Help => Outcome {
             exit_code: 0,
             stderr: format!("{USAGE}\n"),
+            stdout: String::new(),
         },
         Parsed::Invalid => Outcome {
             exit_code: 2,
             stderr: error_line("INVALID_ARGUMENT", USAGE, &[]),
+            stdout: String::new(),
         },
         Parsed::DowngradeRejected(e) => {
             let index = match e {
@@ -161,6 +173,7 @@ pub fn run_args(args: &[OsString]) -> Outcome {
             Outcome {
                 exit_code: 2,
                 stderr: error_line(e.code(), e.message(), &extra),
+                stdout: String::new(),
             }
         }
         Parsed::Run { dir, downgrade } => run_dir(&dir, downgrade.as_ref()),
@@ -177,6 +190,7 @@ fn run_dir(dir: &Path, downgrade: Option<&DowngradeSet>) -> Outcome {
             return Outcome {
                 exit_code: e.exit_code().get(),
                 stderr: error_line(e.code.as_str(), e.message, &extra),
+                stdout: String::new(),
             };
         }
     };
@@ -193,6 +207,7 @@ fn run_dir(dir: &Path, downgrade: Option<&DowngradeSet>) -> Outcome {
                     "duplicate file_id in input directory",
                     &[("file_id", id)],
                 ),
+                stdout: String::new(),
             };
         }
     }
@@ -201,14 +216,16 @@ fn run_dir(dir: &Path, downgrade: Option<&DowngradeSet>) -> Outcome {
     let mut tally = ConversionRateTally::new();
     let (mut error_free_files, mut parse_failed_files, mut downgrade_free_files) =
         (0u64, 0u64, 0u64);
+    // 書き出し候補: 最後に処理したファイルの変換結果（対象のときだけ Some）。入力 1 件のときだけ使う。
+    let mut candidate: Option<ComposeToml> = None;
     for (input, id) in inputs.iter().zip(&ids) {
+        let mut converted: Option<ComposeToml> = None;
         let report = match parse_compose_yaml(input.text()) {
             Err(e) => FileConversionReport::parse_failed(e.code),
             Ok(doc) => {
                 let occ = collect_key_occurrences(&doc);
                 let mut drops = ValueDrops::new();
-                // TOML の書き出しは未実装（REPAIR-3）。value_drops を集めるために変換だけ行う。
-                let _toml = convert_top_level(&doc, &mut drops);
+                converted = Some(convert_top_level(&doc, &mut drops));
                 FileConversionReport::from_parsed(occ, drops)
             }
         };
@@ -229,6 +246,12 @@ fn run_dir(dir: &Path, downgrade: Option<&DowngradeSet>) -> Outcome {
         if dg.as_ref().is_some_and(|(_, v)| v.is_error_free()) {
             downgrade_free_files += 1;
         }
+        // 対象: `--downgrade` なしは error_free、ありは error_free_with_downgrade。
+        let eligible = match &dg {
+            Some((_, v)) => v.is_error_free(),
+            None => verdict.is_error_free(),
+        };
+        candidate = converted.filter(|_| eligible);
         out.push_str(&file_line(
             id,
             &report,
@@ -236,16 +259,42 @@ fn run_dir(dir: &Path, downgrade: Option<&DowngradeSet>) -> Outcome {
             dg.as_ref().map(|(d, v)| (d.as_slice(), v)),
         ));
     }
+    let (status, stdout) = match (inputs.len(), candidate) {
+        (1, Some(toml)) => match to_verified_toml_string(&toml) {
+            Ok(text) => (TomlOutputStatus::Stdout, text),
+            Err(e) => (
+                match e.code() {
+                    "reparse-failed" => TomlOutputStatus::ReparseFailed,
+                    "roundtrip-mismatch" => TomlOutputStatus::RoundtripMismatch,
+                    "too-large" => TomlOutputStatus::TooLarge,
+                    _ => TomlOutputStatus::SerializeFailed,
+                },
+                String::new(),
+            ),
+        },
+        (0, _) => (TomlOutputStatus::SkippedNoInputs, String::new()),
+        (1, None) => (TomlOutputStatus::SkippedNotErrorFree, String::new()),
+        _ => (TomlOutputStatus::SkippedMultipleFiles, String::new()),
+    };
     out.push_str(&summary_line(
         inputs.len() as u64,
         error_free_files,
         downgrade.map(|_| downgrade_free_files),
         parse_failed_files,
+        status,
         &tally.finish(),
     ));
+    let failed = !matches!(
+        status,
+        TomlOutputStatus::Stdout
+            | TomlOutputStatus::SkippedMultipleFiles
+            | TomlOutputStatus::SkippedNoInputs
+            | TomlOutputStatus::SkippedNotErrorFree
+    );
     Outcome {
-        exit_code: 0,
+        exit_code: u8::from(failed),
         stderr: out,
+        stdout,
     }
 }
 

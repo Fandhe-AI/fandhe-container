@@ -88,6 +88,7 @@ fandhe-container/
 │   │   │   ├── idle-memory-local.md  # アイドル時常駐メモリのローカル実測レポート（TASK-45.2・CORE-7。root 権限での確定計測は TASK-47）
 │   │   │   ├── state-lock-contention.md  # 状態ストア `@lock` の取り直しによる飢えの計測と対策（#2229・SUP-1・REPAIR-5）
 │   │   │   ├── oci-pull-e2e-local.md  # pull_e2e の公開イメージ 5 種での実行記録（TASK-55.2・OCI-1・#421。run 段の終了コード 0 は人間へ引き継ぎ・#2313）
+│   │   │   ├── sec4-2480-thread-count-lag.md  # sec4_2480 の間欠失敗の原因（join 後の `Threads:` 減算の遅れ）と修正・回帰試験・300 回の記録（#2766・SEC-4・SUP-6・SUP-8・REPAIR-5・REPAIR-12）
 │   │   │   ├── production-launcher-tmpfiles-flock.md  # production_launcher の create が間欠的に「start is in progress in another process」で失敗した原因（systemd-tmpfiles の aging 走査の flock との競合）と対策の記録。他の実機前提試験への展開と共通補助 `crates/core/tests/support/scratch_root.rs`、既定のテスト集合への展開〔試験ごとの `ScratchDir`〕（#2840・#2887・#2958・#3026・#3141・CORE-2・CORE-5・REPAIR-12）
 │   │   │   └── plugin-stderr-reader-stop-macos.md  # one-shot の stderr 読み手停止（#3003 の修正後）を macOS で 100 回以上繰り返す照合の手順と結果欄。結果は dispatch 後に記入（#3138・REPAIR-5・PLUG-7・PLUG-12・REPAIR-12）
 │   │   ├── io-power-loss-verification.md  # 電源断・カーネルクラッシュ後の媒体永続化（IO-2）の検証方式の比較と推奨（dm-flakey。#1965・オーナー承認待ち）。実機前提試験 crates/io/tests/power_loss.rs
@@ -143,7 +144,7 @@ fandhe-container/
 │   │   ├── cri-status-rpc.md      # CRI の Status・Version・UpdateRuntimeConfig RPC（#2896 を併記。RuntimeReady・NetworkReady の判定材料と待ちが無い設計・runtime_handlers・features・verbose で info を出さない方針・kubelet / containerd の一次情報・本番で NetworkReady=false になる帰結・死活確認を足さない判断と再評価条件。#2830・#2897・CRI-1・CRI-2・PLUG-1・PLUG-4・REPAIR-3・REPAIR-5）
 │   │   ├── cri-streaming-server.md  # CRI ストリーミングサーバー基盤と URL 発行（POD の PortForward の helper 方式の設計は #3766）（loopback 既定・外部は opt-in・トークン 32 バイト単回使用・TTL 60 秒・接続の上限と期限・SPDY/3.1 は #680〜#682・本番 backend の設計〔Exec の helper と kind 6/7 の再利用・Attach の段階方式・PortForward の NODE / POD。#3752〕。TASK-63.1・#679・#678・CRI-6・REPAIR-5）
 │   │   ├── fdinfo-mnt-id-parsing.md  # core・net・gpu の fdinfo `mnt_id` 解析を共有せず、共有 fixture `crates/core/testdata/fdinfo_mnt_id_cases.txt` の照合試験で一致を担保する判断記録（共有下位 crate の案 B はオーナー承認待ち。#3140・GPU-2・SEC-1・REPAIR-1）
-│   │   ├── pod-namespace-holder.md  # pod の namespace 保持役・netns の共有・本番の PodNetworkProvider 注入の設計と実装単位（#2838・CRI-2・CORE-3・SEC-5・NET-3）
+│   │   ├── pod-namespace-holder.md  # pod の namespace 保持役・netns の共有・本番の PodNetworkProvider 注入の設計と実装単位（pid・uts・/dev/shm・TARGET の方式は #2903・#2838・CRI-2・CORE-3・SEC-5・NET-3）
 │   │   ├── restart-relaunch-single-thread.md  # restart の再 launch を単一スレッドを要求する本番 launcher で成り立たせる設計記録（常駐スレッドの停止と監視スレッドでの直接 launch・比較した方式・制御チャネルの扱い・残余。#2043・SUP-3・CORE-1）
 │   │   ├── cri-record-readoption.md  # plugin-cri の再起動をまたぐ sandbox・コンテナ記録の再採用の設計と実装単位（#2902・CRI-1・CRI-2・OCI-7・CORE-1）・自然終了の取り込み方式（照会時の読み取り。#4173）
 │   │   ├── cri-op-stats-export.md  # plugin-cri の操作統計を stderr 以外へ出す方式の比較と採用案（原子的に置き換えるスナップショットファイル・opt-in。2026-11-09 にオーナー承認・#4295）・作業単位 W1〜W5（#4335〜#4341。実装済み）（#4228・CRI-6・REPAIR-4）

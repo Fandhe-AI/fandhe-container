@@ -4,7 +4,9 @@
 //! 要求する（fork 時点で他スレッドがロックや fd を握っていない前提。CORE-5・SEC-1）。`pthread_join` はカーネルが
 //! スレッド ID を消した時点で返り、スレッド数の減算はそれより少し後になり得るため、restart の再 launch の直前に
 //! `LauncherRelauncher` が止めた常駐スレッド（捕捉・seccomp 通知・stderr の専用スレッド・制御チャネル）の消滅を
-//! 有界に待つ。呼び出し元: `restart::LauncherRelauncher::relaunch`（`with_single_thread_launch` のとき）。
+//! 有界に待つ。呼び出し元: `restart::LauncherRelauncher::relaunch`（`with_single_thread_launch` のとき）と、
+//! `supervisor_log::run_bounded_with_slot`（作業スレッドの join 後。起動前が単一スレッドだった呼び出しだけ。
+//! CLI の create が core の監査 sink の fork へ進む直前の窓を閉じる。SEC-4・SUP-6・REPAIR-5・#2766）。
 //! 待ちの中ではログを出さない（`stderr_sink` の専用スレッドを作ると前提を壊すため）。
 //!
 //! 拒否の判断そのものは launcher が行う。本補助は「落ち着かなかった」ことを返すだけで、呼び出し側は launch せずに
@@ -25,6 +27,18 @@ fn thread_count() -> Option<u64> {
         .lines()
         .find_map(|l| l.strip_prefix("Threads:"))
         .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
+/// 自プロセスが今、単一スレッドか（Linux 以外は常に `false`で、待ちを無効にする）。
+pub(crate) fn is_single_threaded() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        thread_count() == Some(1)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
 }
 
 /// 自プロセスのスレッドが 1 本（呼び出しスレッドだけ）になるのを `limit` まで待つ。なれば `true`。

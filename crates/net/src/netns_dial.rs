@@ -10,13 +10,14 @@
 //!
 //! # helper の手順（順序は変えない。失敗の固定語彙への対応表は `helper` モジュールの `//!`）
 //! 1. argv が空であることを確かめる（非空は応答なしで終了コード 2）
-//! 2. `PR_SET_PDEATHSIG=SIGKILL`、stdin が `SOCK_SEQPACKET` で `SO_PEERCRED` の pid が親であることを確かめる
+//! 2. `PR_SET_DUMPABLE=0` にして 0 を確かめる（失敗は応答なしで終了コード 1。#4558）、`PR_SET_PDEATHSIG=SIGKILL`、stdin が `SOCK_SEQPACKET` で `SO_PEERCRED` の pid が親であることを確かめる
 //!    （違えば応答せず終了コード 1）、`close_range(3..)`
 //! 3. 要求 frame と `SCM_RIGHTS` の fd ちょうど 2 本（user、net の順）を期限（`REQUEST_RECV_TIMEOUT`）つきで受ける
 //! 4. 各 fd の (dev, ino) を記録し、`setns(user)` → `setns(net)` の順に参加して `/proc/self/ns` の識別を照合する
 //!    （カーネル v6.12 の `userns_install` は多スレッド・fs 共有で `EINVAL`、`CAP_SYS_ADMIN` 不足で `EPERM`。
-//!    `netns_install` は対象 netns の所有 userns と現 cred の userns の両方に `CAP_SYS_ADMIN` を要求する）
-//! 5. capability を空にし、NNP・PDEATHSIG の再武装・non-dumpable にする
+//!    `netns_install` は対象 netns の所有 userns と現 cred の userns の両方に `CAP_SYS_ADMIN` を要求する）。
+//!    参加後に dumpable が 0 のままであることを確かめる（0 でなければ `JoinFailed`。#4558）
+//! 5. capability を空にし、NNP・PDEATHSIG の再武装・non-dumpable の再設定と確認を行う
 //! 6. `127.0.0.1:<port>` へ要求の期限つきで connect し、接続済み fd 1 本を添えた `Connected` か `Error{code}` を返す
 //!
 //! 終了コードは `Connected` を送れたら 0、それ以外の失敗は 1、argv の誤りは 2。

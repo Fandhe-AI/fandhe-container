@@ -11,6 +11,9 @@
 //!   listener は接続を受けない。helper の終了コードは 0、stderr は空。
 //! - 場面 M（netns の不一致）: A の fd を送り、期待する netns に別の対象 B のものを渡すと、`Rejected(NetnsMismatch)`
 //!   で拒否される（非 root でも、試験の euid は A の user namespace の所有者なので `SIOCGSKNS` は成功し、識別の比較で落ちる）。
+//! - 場面 D（non-dumpable）: 試験専用の入口 `netns-dial-traced`（本番と同じ本体。#4558）で `lo` が down の対象へ dial し、
+//!   helper が終了前に stdout へ書く 1 行で、参加の直前・直後・特権の破棄の後の `PR_GET_DUMPABLE` がすべて 0 であることを
+//!   具体値で照合する（起動直後に設定した non-dumpable が `setns` と capset の `commit_creds` で戻らない証拠）。
 //!
 //! # 前提
 //! 非特権 user namespace（AppArmor の `kernel.apparmor_restrict_unprivileged_userns=1` がない環境）と util-linux の
@@ -30,6 +33,9 @@ fn main() -> std::process::ExitCode {
     match args.next() {
         Some(a) if a == fandhe_container_net::netns_dial::NETNS_DIAL_SUBCOMMAND => {
             fandhe_container_net::netns_dial::run_netns_dial_main(args)
+        }
+        Some(a) if a == "netns-dial-traced" => {
+            fandhe_container_net::netns_dial::test_support::run_netns_dial_traced_main(args)
         }
         Some(a) if a == "--ignored" => linux::run(),
         Some(a) if a == "--target" => linux::target(args.next()),
@@ -69,6 +75,9 @@ mod linux {
     const LINE_ROUND_TRIP: &str = "netns_dial_userns: helper joined the target and the channel returned a verified socket whose echo round trip matched";
     const LINE_PARENT_QUIET: &str = "netns_dial_userns: helper joined the target and the same-port listener in the parent namespace saw no connection";
     const LINE_MISMATCH: &str = "netns_dial_userns: helper joined the target and the channel rejected the socket expected in another target netns with netns_mismatch";
+    const LINE_DUMPABLE: &str = "netns_dial_userns: helper joined the target with PR_GET_DUMPABLE 0 before the join, right after the join and after hardening";
+    const WANT_TRACE: &str =
+        "netns-dial-trace dumpable before_join=0 after_join=0 after_harden=0\n";
     const TARGET_READY: &str = "netns_dial_userns: target ready";
     const PAYLOAD: &[u8] = b"ping-4480";
     const REPLY_PREFIX: &[u8] = b"target:";
@@ -238,10 +247,22 @@ mod linux {
         result: Result<TcpStream, NetnsDialError>,
         status: ExitStatus,
         stderr: String,
+        /// helper の stdout 全体（traced の入口のときだけ pipe。本番の入口では空）。
+        stdout: String,
     }
 
     /// `dial_pid` の user / net の fd を送り、`expect_pid` の netns を期待として helper に dial させる。
     fn dial(dial_pid: u32, expect_pid: u32, port: u16) -> Result<Dialed, String> {
+        dial_with(dial_pid, expect_pid, port, false)
+    }
+
+    /// `traced` なら再入口 `netns-dial-traced`（本番と同じ本体 + dumpable の trace 行）で helper を起動する。
+    fn dial_with(
+        dial_pid: u32,
+        expect_pid: u32,
+        port: u16,
+        traced: bool,
+    ) -> Result<Dialed, String> {
         let open = |ns: &str| -> Result<OwnedFd, String> {
             File::open(format!("/proc/{dial_pid}/ns/{ns}"))
                 .map(OwnedFd::from)
@@ -251,15 +272,24 @@ mod linux {
         let expected = net_id(expect_pid)?;
         let (channel, child_end) = NetnsDialChannel::pair().map_err(|e| e.to_string())?;
         let mut child = Command::new(std::env::current_exe().map_err(|e| e.to_string())?)
-            .arg("netns-dial")
+            .arg(if traced {
+                "netns-dial-traced"
+            } else {
+                "netns-dial"
+            })
             .env_clear()
             .stdin(Stdio::from(child_end))
-            .stdout(Stdio::null())
+            .stdout(if traced {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| format!("spawn helper: {e}"))?;
         let outcome = (|| -> Result<Dialed, String> {
             let mut stderr = child.stderr.take().ok_or("stderr")?;
+            let mut stdout = child.stdout.take();
             let req = DialRequest::new(
                 NonZeroU16::new(port).ok_or("port 0")?,
                 ConnectTimeout::new(3000).map_err(|e| format!("{e:?}"))?,
@@ -278,10 +308,15 @@ mod linux {
             };
             let mut text = String::new();
             let _ = stderr.read_to_string(&mut text);
+            let mut out = String::new();
+            if let Some(o) = stdout.as_mut() {
+                let _ = o.read_to_string(&mut out);
+            }
             Ok(Dialed {
                 result,
                 status,
                 stderr: text,
+                stdout: out,
             })
         })();
         let reaped = reap::reap(&mut child, limit());
@@ -359,6 +394,29 @@ mod linux {
         parent_quiet(listener)
     }
 
+    /// 場面 D（#4558・SEC-1）: trace 入口で `lo` が down の対象へ dial し、3 時点の dumpable がすべて 0 であることを見る。
+    fn scenario_d(sleeper: &Child, port: u16, listener: &TcpListener) -> Result<(), String> {
+        let d = dial_with(sleeper.id(), sleeper.id(), port, true)?;
+        check(d.stderr.is_empty(), || {
+            format!("helper stderr {:?}", d.stderr)
+        })?;
+        match d.result {
+            Err(e)
+                if matches!(
+                    e.failure(),
+                    NetnsDialFailure::Helper(DialErrorCode::Unreachable | DialErrorCode::Refused)
+                ) => {}
+            other => return Err(format!("D: {other:?}, want Helper(Unreachable or Refused)")),
+        }
+        check(d.status.code() == Some(1), || {
+            format!("D: helper exit {}, want code 1", d.status)
+        })?;
+        check(d.stdout == WANT_TRACE, || {
+            format!("D: trace {:?}, want {WANT_TRACE:?}", d.stdout)
+        })?;
+        parent_quiet(listener)
+    }
+
     pub fn run() -> ExitCode {
         let mut targets: Vec<Child> = Vec::new();
         let result = run_inner(&mut targets);
@@ -380,7 +438,7 @@ mod linux {
         }
     }
 
-    fn run_inner(targets: &mut Vec<Child>) -> Result<[&'static str; 4], String> {
+    fn run_inner(targets: &mut Vec<Child>) -> Result<[&'static str; 5], String> {
         // 親（init）の network namespace の 127.0.0.1 で待ち受ける。対象も同じ番号を自分の namespace で使う。
         // helper が対象へ参加していなければ、ここへ繋がる。
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).map_err(|e| e.to_string())?;
@@ -398,6 +456,13 @@ mod linux {
         scenario_l(s, port, &listener)?;
         scenario_r(a, port, &listener)?;
         scenario_m(a, b, port, &listener)?;
-        Ok([LINE_L, LINE_ROUND_TRIP, LINE_PARENT_QUIET, LINE_MISMATCH])
+        scenario_d(s, port, &listener)?;
+        Ok([
+            LINE_L,
+            LINE_ROUND_TRIP,
+            LINE_PARENT_QUIET,
+            LINE_MISMATCH,
+            LINE_DUMPABLE,
+        ])
     }
 }

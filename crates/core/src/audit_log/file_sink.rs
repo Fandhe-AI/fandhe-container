@@ -1353,8 +1353,34 @@ mod tests {
         drop(hold_tx);
     }
 
-    /// REPAIR-5・SEC-4: 通知先が詰まり、代替経路も失敗しても、`record_until` は渡された絶対期限 + 小さな許容差
-    /// 以内に `Timeout` で戻る(通知の出し直しの待ち `wait` が 5 秒でも期限へ絞られる)。
+    /// `record_until` の期限超過の許容差(macOS)。観測した超過は 372 ms(main の macOS run 42429536166)で、
+    /// 結合試験 `audit_sink_isolation` の `UNTIL_SLACK`(macOS 1500 ms・超過 421 ms を観測)と値を揃える。
+    #[cfg(target_os = "macos")]
+    const STUCK_NOTIFY_SLACK: Duration = Duration::from_millis(1500);
+    /// `record_until` の期限超過の許容差(Linux・Windows)。失敗の実績が無いため緩めない。
+    #[cfg(not(target_os = "macos"))]
+    const STUCK_NOTIFY_SLACK: Duration = Duration::from_millis(250);
+    /// 試験の絶対期限。
+    const STUCK_NOTIFY_BUDGET: Duration = Duration::from_millis(150);
+    /// 通知の出し直しの待ち `wait`。期限へ絞られない退行ではこの値がそのまま超過になる。
+    const STUCK_NOTIFY_RETRY_WAIT: Duration = Duration::from_secs(5);
+
+    // 許容差が「期限へ絞られず wait を丸ごと待つ」退行より十分小さいことを固定する(検出力の保証)。
+    const _: () = assert!(
+        (STUCK_NOTIFY_BUDGET.as_millis() + STUCK_NOTIFY_SLACK.as_millis()) * 2
+            < STUCK_NOTIFY_RETRY_WAIT.as_millis(),
+        "slack must stay well below the unclamped retry wait"
+    );
+
+    /// REPAIR-5・SEC-4・REPAIR-12(#4549・#4536): 通知先が詰まり、代替経路も失敗しても、`record_until` は
+    /// 渡された絶対期限 + 許容差以内に `Timeout` で戻る。
+    ///
+    /// 許容差の根拠: この経路で期限後に実装が持つ待ちは 0 である。主経路は存在しないパスで即失敗し、
+    /// 代替経路は `NoAuditFallback` で即失敗し、通知は `recv_timeout` が期限の残りへ絞られ、ack が
+    /// 来ないため join にも `wait_thread_released` にも進まない。超過は `recv_timeout` の起床遅れと
+    /// 戻り後のスケジューリング遅れだけで、実装は上限を課せないため OS 別の値を置く
+    /// (macOS 1500 ms、他 250 ms。観測は上の定数の doc)。検出したい退行は 5 秒の `wait` が期限へ
+    /// 絞られないことで、上の const assert がこれを固定する。値の見直しは超過の分布(`overshoot_ms=` の行・#4548)で行う。
     #[test]
     fn repair5_sec4_record_until_returns_within_deadline_with_stuck_notifier() {
         let (hold_tx, hold_rx) = mpsc::channel::<()>();
@@ -1362,17 +1388,27 @@ mod tests {
         let notify = notifier_to(
             move || Box::new(Stuck(Arc::clone(&hold_rx))),
             2,
-            Duration::from_secs(5),
+            STUCK_NOTIFY_RETRY_WAIT,
         );
         let f: FallbackFactory = Arc::new(|| Box::new(NoAuditFallback));
         let sink = FileAuditSink::with_parts(missing_path(), f, notify);
-        let budget = Duration::from_millis(150);
+        let budget = STUCK_NOTIFY_BUDGET;
         let start = Instant::now();
         let e = sink.record_until(&sample(), start + budget).unwrap_err();
         let took = start.elapsed();
+        // 失敗した回にも値が残るよう、照合の前に出す。
+        eprintln!(
+            "file_sink: record_until overshoot_ms={} slack_ms={}",
+            took.saturating_sub(budget).as_millis(),
+            STUCK_NOTIFY_SLACK.as_millis()
+        );
         assert_eq!(e.code(), ErrorCode::Timeout);
         assert!(took >= budget, "{took:?}");
-        assert!(took < budget + Duration::from_millis(250), "{took:?}");
+        assert!(
+            took < budget + STUCK_NOTIFY_SLACK,
+            "record_until overshoot too large: took={took:?} overshoot={:?} slack={STUCK_NOTIFY_SLACK:?}",
+            took.saturating_sub(budget)
+        );
         drop(hold_tx);
     }
 

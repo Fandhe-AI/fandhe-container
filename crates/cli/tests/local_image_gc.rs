@@ -29,7 +29,14 @@
 //!
 //! 50 並行（#868・TASK-184.4.1）は別の起動モード `--ignored --scenario concurrent`（実体は `tests/linux/concurrent.rs`）。
 //! pull・create・start・container delete・image rm を 50 回ずつ prune と並行させ、受け入れ条件 (i)〜(iii) を照合する。
-//! (iv)〜(vi) は #869 が同じハーネスに足す。`--ignored` なしでは pull × prune の自己検証を小さい件数で回す。
+//! (iv)〜(vi)（#869・TASK-184.4.2）は同じハーネスに足した（実体は `tests/linux/concurrent/races.rs`）。
+//! - (iv): 作成途中のコンテナ（参照は未確定で登録済み・状態作成前）の参照するイメージとレイヤーは、他の参照が無くなった窓の中で
+//!   prune が完了しても消えない。CLI の実 create の内部の窓は外から止められないため、同じ手順を oci の公開 API でなぞる模擬である。
+//! - (v): 同じ blob を共有する 3 本の pull で、先頭が公開してリースを解放しても、残りは成功し blob は欠けない。
+//! - (vi): `image tag`（実機は CLI の実バイナリ）と prune の競合は「tag 成功で中身が全部ある」か「NOT_FOUND で何も無い」の一方だけ。
+//!   偶数の回は prune が必ず先に回収する（決定的）。奇数の回の勝敗は観測値で、情報行に出すだけである（妥当性は #668）。
+//!
+//! `--ignored` なしでは、pull × prune に加えて (iv)〜(vi) も小さい件数で自己検証する（コンテナと CLI は使わない）。
 //!
 //! `image prune` は CLI に未配線（#2384）のため、E・F・G・H は oci の公開 API（`execute_image_prune`）をプロセス内で呼ぶ。
 //! 配線後は CLI 経由へ切り替える。
@@ -280,6 +287,15 @@ mod linux {
                 );
                 println!(
                     "local_image_gc: concurrent (iii): 50/50 pulls racing image prune succeeded; every published image had all its manifest, config and layer blobs and a container created from it started"
+                );
+                println!(
+                    "local_image_gc: concurrent (iv): 50/50 in-progress creates (container reference registered, state not yet created) kept their image and layers through at least one image prune each"
+                );
+                println!(
+                    "local_image_gc: concurrent (v): 50/50 groups of three pulls sharing a blob succeeded after the first pull completed and released its lease; the shared blob was kept by the remaining leases and never lost"
+                );
+                println!(
+                    "local_image_gc: concurrent (vi): 50/50 image tag runs racing image prune either tagged an image whose manifest and blobs were all present or failed with NOT_FOUND leaving no tag; no tag without content remained"
                 );
                 println!("local_image_gc: concurrent scenario ok");
                 ExitCode::SUCCESS

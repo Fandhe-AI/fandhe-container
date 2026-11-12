@@ -7,7 +7,7 @@
 //!
 //! 呼び出し元は `shim_v2::bootstrap` の 3 種のロック（id・`ops.log.lock`・`daemon.log.lock`）と
 //! `runtime_service::record_store::file` の `.lock`。core の `flock_release`・oci の同名モジュールと同じ形を
-//! crate ごとに独立して置いている（共有の下位 crate へまとめるかは別途判断）。点検表は
+//! crate ごとに独立して置いている（複製は残し、本体の一致は共有の試験ケース（`crates/core/tests/support/flock_release_cases.rs`・`flock_release_with_cases.rs`）で照合する。判断は #4532・#4566）。点検表は
 //! `docs/design/flock-release-audit.md`（#4492・#4515・OCI-5・CORE-2・REPAIR-5）。`unsafe` は使わない。
 //!
 //! 注意: `LOCK_UN` は OFD 単位で効くため、fork した子が [`ExplicitUnlockFile`] の `Drop` を実行すると親のロックまで
@@ -80,55 +80,12 @@ impl Drop for ExplicitUnlockFile {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs::TryLockError;
-
-    fn open(path: &std::path::Path) -> File {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(path)
-            .unwrap()
-    }
-
-    /// OCI-5・REPAIR-5（#4515）: 複製 fd が残っていても drop で明示 unlock され、陽性対照の包まない `File` は
-    /// close だけでは外れない。
-    #[test]
-    fn oci5_repair5_4515_explicit_unlock_file_releases_despite_duplicate_fd() {
-        let dir = crate::test_root::test_root("fandhe-cri-flock-release", "dup");
-        let path = dir.join("lock");
-
-        let plain = open(&path);
-        plain.try_lock().unwrap();
-        let dup = plain.try_clone().unwrap();
-        drop(plain);
-        assert!(matches!(
-            open(&path).try_lock(),
-            Err(TryLockError::WouldBlock)
-        ));
-        drop(dup);
-        open(&path).try_lock().unwrap();
-
-        let file = open(&path);
-        file.try_lock().unwrap();
-        let dup = file.try_clone().unwrap();
-        drop(ExplicitUnlockFile::new(file));
-        assert!(open(&path).try_lock().is_ok());
-        drop(dup);
-    }
-
-    /// OCI-5・REPAIR-5（#4515）: unlock が失敗しても close は続き、panic しない。
-    #[test]
-    fn oci5_repair5_4515_release_continues_close_when_unlock_fails() {
-        let dir = crate::test_root::test_root("fandhe-cri-flock-release", "fail");
-        let path = dir.join("lock");
-        let file = open(&path);
-        file.try_lock().unwrap();
-        let r = release_lock_file_with(file, |_| Err(std::io::Error::other("injected")));
-        assert_eq!(r, LockRelease::UnlockFailed);
-        assert!(open(&path).try_lock().is_ok());
-    }
+/// 共有の試験ケース（`crates/core/tests/support/flock_release*_cases.rs`。#4566）が使う一時ディレクトリ。
+/// 戻り値の 1 つ目は後始末を持つ guard で、呼び出し側が試験の終わりまで生かす。一時ディレクトリの作り方が
+/// crate ごとに違うため、共有ファイルの外のここに置く。
+#[cfg(all(test, unix))]
+pub(crate) fn shared_case_dir(tag: &str) -> (Box<dyn std::any::Any>, std::path::PathBuf) {
+    let root = crate::test_root::test_root("fandhe-cri-flock-release-4566", tag);
+    let path = root.to_path_buf();
+    (Box::new(root), path)
 }

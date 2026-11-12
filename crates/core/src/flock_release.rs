@@ -84,42 +84,11 @@ impl Drop for ExplicitUnlockFile {
     }
 }
 
+/// 共有の試験ケース（`crates/core/tests/support/flock_release*_cases.rs`。#4566）が使う一時ディレクトリ。
+/// 戻り値の 1 つ目は後始末を持つ guard で、呼び出し側が試験の終わりまで生かす。排他作成の `ScratchDir` の子を使う
+/// （#3434・REPAIR-12）。
 #[cfg(all(test, target_os = "linux"))]
-mod tests {
-    use super::*;
-    use std::fs::TryLockError;
-
-    /// OCI-5・CORE-2・REPAIR-5（#4492）: 複製 fd が残っていても drop で明示 unlock され、陽性対照の
-    /// 包まない `File` は close だけでは外れない。
-    #[test]
-    fn oci5_repair5_4492_explicit_unlock_file_releases_despite_duplicate_fd() {
-        // pid だけの名前を使わず、排他作成の `ScratchDir` の子を使う（#3434・REPAIR-12）。
-        let (_scratch, dir) = crate::test_support::scratch_child("fandhe-flock-release-4492", "d");
-        let path = dir.join("lock");
-        let open = || {
-            std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .write(true)
-                .open(&path)
-                .unwrap()
-        };
-
-        // 陽性対照: close だけでは複製がある間ロックが残る。
-        let plain = open();
-        plain.try_lock().unwrap();
-        let dup = plain.try_clone().unwrap();
-        drop(plain);
-        assert!(matches!(open().try_lock(), Err(TryLockError::WouldBlock)));
-        drop(dup);
-        open().try_lock().unwrap();
-
-        // 対象: 包んで drop すれば、複製が残っていても外れる。
-        let file = open();
-        file.try_lock().unwrap();
-        let dup = file.try_clone().unwrap();
-        drop(ExplicitUnlockFile::new(file));
-        assert!(open().try_lock().is_ok());
-        drop(dup);
-    }
+pub(crate) fn shared_case_dir(tag: &str) -> (Box<dyn std::any::Any>, std::path::PathBuf) {
+    let (scratch, dir) = crate::test_support::scratch_child("fandhe-flock-release-4566", tag);
+    (Box::new(scratch), dir)
 }

@@ -180,20 +180,25 @@ fn gpu6_repair2_1885_verify_mode_rejects_symlink_and_fifo_without_blocking() {
     );
 
     let fifo = s.path("fifo.bin");
-    let made = Command::new("mkfifo")
+    // FIFO の作成成功を必須とする（作れないまま検証を省略して成功させない）。
+    // この試験は cfg(unix) 限定で、Windows は対象外（FIFO の概念が無い）。
+    let st = Command::new("mkfifo")
         .arg(&fifo)
         .status()
-        .map(|st| st.success())
-        .unwrap_or(false);
-    if made {
-        // open がブロックすれば timeout（60 秒）まで返らない。通常は即時に拒否される。
-        let o = run(&[flag, &fifo]);
-        expect_line(
-            &o,
-            1,
-            "{\"result\":\"venus_replay.not_regular_file\",\"records\":null,\"bytes\":null}",
-        );
+        .expect("mkfifo must be runnable to verify FIFO rejection");
+    assert!(st.success(), "mkfifo failed: {st:?}");
+    {
+        use std::os::unix::fs::FileTypeExt;
+        let ft = fs::symlink_metadata(&fifo).expect("stat fifo").file_type();
+        assert!(ft.is_fifo(), "created path is not a FIFO");
     }
+    // open がブロックすれば timeout（60 秒）まで返らない。通常は即時に拒否される。
+    let o = run(&[flag, &fifo]);
+    expect_line(
+        &o,
+        1,
+        "{\"result\":\"venus_replay.not_regular_file\",\"records\":null,\"bytes\":null}",
+    );
 }
 
 #[test]

@@ -23,6 +23,10 @@ pub use ps::{
     ServiceStatus, ServiceStatusSource, ps,
 };
 pub use up::{
+    CreateArgsError, CreateArgvContext, IdentityError, ProjectName, ServiceContainerId,
+    create_argv, start_argv,
+};
+pub use up::{
     LaunchError, LaunchRequest, LaunchedService, NetworkAttachment, NetworkDriver, NetworkPlan,
     NetworkPlanError, NetworkProvisionError, NetworkProvisioner, NetworkRequest, ProvisionOutcome,
     ProvisionedNetwork, ServiceLauncher, UpClock, UpError, UpFailure, UpPolicy, UpProject,

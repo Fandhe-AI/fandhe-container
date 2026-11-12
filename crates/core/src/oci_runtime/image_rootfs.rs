@@ -64,8 +64,10 @@
 //! のときは、子プロセスの user namespace の中で（固定済みの親の fd を継承して）消す。delete・create 失敗の後始末・
 //! 展開途中の回収・孤児の回収が共有する。印は最後に消すので、途中で失敗しても次の回収が木を見分けられる。
 //!
-//! 本番の展開器（manifest からレイヤーの blob・mediaType・diff_id を引いて oci へ渡すアダプタ）と
-//! CLI / plugin の配線は未実装である（REPAIR-3。#2315 の配線で扱う）。
+//! 本番の展開器（manifest からレイヤーの blob・mediaType・diff_id を引いて oci へ渡すアダプタ）は cli の
+//! `image_unpack`（`create --unpack`。#2377）にある。展開の所有者は `Keep`（実効 uid）で、後始末・回収の権限は
+//! 既定の `HostEffectiveIds` と一致する。rootless の user namespace 内の展開（`SubordinateIds`）と CRI・plugin の配線は
+//! 未実装である（REPAIR-3。#482・#2792・#2791）。
 
 use std::path::{Component, Path, PathBuf};
 

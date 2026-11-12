@@ -248,12 +248,12 @@ pub async fn bind_production_streaming(
 }
 
 /// ドレインの待ち時間（シグナルの受信から）。kubelet の idle 4 時間・作成 30 秒より十分短く、cri の
-/// `SessionLimits::default().drain_timeout`（終了後の流し切りの予算）と同じ 5 秒。暫定値で、オーナー確認は #4116 の対象
-/// （承認は得ていない。#4164・REPAIR-5）。
+/// `SessionLimits::default().drain_timeout`（終了後の流し切りの予算）と同じ 5 秒。暫定値のまま承認（#4116 の項目 9・2026-11-12。
+/// #4164・REPAIR-5）。
 pub const STREAMING_DRAIN_WAIT: Duration = Duration::from_secs(5);
 
 /// `on_stop`（helper の kill）の後に、exec が終了を観測して閉じるのを待つ時間。`RUNTIME_SHUTDOWN_WAIT` と同じ 1 秒。
-/// 暫定値で #4116 の対象（#4164・REPAIR-5）。
+/// 暫定値のまま承認（#4116 の項目 9・2026-11-12。#4164・REPAIR-5）。
 pub const STREAMING_CLOSE_WAIT: Duration = Duration::from_secs(1);
 
 /// 強制クローズ（abort）の後に、タスクの破棄で枠が返るのを確かめる上限。

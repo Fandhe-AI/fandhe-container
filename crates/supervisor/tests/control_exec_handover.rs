@@ -302,6 +302,12 @@ fn repair5_handover_with_expired_deadline_times_out_without_connecting() {
     assert_eq!(e.code(), ErrorCode::Timeout);
 }
 
+/// この試験プロセスの pid を持つ exec 子 cgroup の名前（`exec-<pid>-<seq>`）。作成通知の名前は接続の所有と結びつく
+/// （通知の名前の pid が `SO_PEERCRED` の pid と一致すること。SEC-1・#3808）ため、固定の偽名は使えない。
+fn own_name(seq: u32) -> String {
+    format!("exec-{}-{seq}", std::process::id())
+}
+
 /// SUP-6・SUP-8・SEC-1・SEC-4・#2766: supervisor 不在（制御ソケットが無い・残骸だけ・Hello 前に切断）は、
 /// 本物の取得元で固定文言の `Unavailable` になり、fd は届かない（`state.json` の pid からの `pidfd_open` へ縮退しない。
 /// 縮退の否定は cli の `sup6_sup8_sec4_2766_*` が生きている pid で照合する）。
@@ -367,7 +373,7 @@ fn sup6_repair5_guard_reclaims_notified_name_when_connection_drops() {
     let rig = Rig::start("reclaim", true, true);
     let handover = rig.obtain(PID, Duration::from_secs(2)).unwrap();
     handover
-        .notify_created(&name("exec-1234-0"), hold_in(60.0))
+        .notify_created(&name(&own_name(1234)), hold_in(60.0))
         .unwrap();
     // 接続を保持している間は回収されない。
     std::thread::sleep(Duration::from_millis(200));
@@ -375,7 +381,7 @@ fn sup6_repair5_guard_reclaims_notified_name_when_connection_drops() {
     drop(handover);
     assert_eq!(
         rig.reclaimer.wait_for(1, Duration::from_secs(3)),
-        vec!["exec-1234-0".to_owned()]
+        vec![own_name(1234)]
     );
     // 追加の呼び出しは起きない（1 回だけ）。
     std::thread::sleep(Duration::from_millis(200));
@@ -391,7 +397,7 @@ fn repair4_sup6_guard_records_actual_reclaim_latency() {
     *rig.reclaimer.delay.lock().unwrap() = delay;
     let handover = rig.obtain(PID, Duration::from_secs(2)).unwrap();
     handover
-        .notify_created(&name("exec-1234-0"), hold_in(60.0))
+        .notify_created(&name(&own_name(1234)), hold_in(60.0))
         .unwrap();
     drop(handover);
     assert_eq!(rig.reclaimer.wait_for(1, Duration::from_secs(3)).len(), 1);
@@ -436,11 +442,11 @@ fn repair5_sup6_guard_reclaims_at_hold_deadline() {
     let rig = Rig::start("holddl", true, true);
     let handover = rig.obtain(PID, Duration::from_secs(2)).unwrap();
     handover
-        .notify_created(&name("exec-77-3"), hold_in(0.5))
+        .notify_created(&name(&own_name(77)), hold_in(0.5))
         .unwrap();
     assert_eq!(
         rig.reclaimer.wait_for(1, Duration::from_secs(5)),
-        vec!["exec-77-3".to_owned()]
+        vec![own_name(77)]
     );
     drop(handover);
     std::thread::sleep(Duration::from_millis(200));
@@ -642,7 +648,10 @@ fn notify_bytes(head: [u8; HEADER_LEN], hold: u64, name: &[u8]) -> Vec<u8> {
 fn sup6_sec1_repair12_4328_notify_rejections_carry_no_scm_rights() {
     let rig = Rig::start_with("nf-reject", true, true, Some(test_limits(32)));
     let h = |version: u8, kind: u8, len: u8| [b'F', b'C', b'S', b'C', version, kind, 0, len];
-    let name = b"exec-12-34";
+    // 所有の照合（#3808）のため、名前の pid は接続する本人（この試験プロセス）の pid にする。
+    let own = own_name(34);
+    let name = own.as_bytes();
+    let nlen = u8::try_from(8 + name.len()).unwrap();
     let cases: Vec<(&str, Vec<u8>, ControlReason)> = vec![
         (
             "bad magic",
@@ -659,7 +668,7 @@ fn sup6_sec1_repair12_4328_notify_rejections_carry_no_scm_rights() {
         ("too short", h(1, 7, 8).to_vec(), ControlReason::Malformed),
         (
             "hold zero",
-            notify_bytes(h(1, 7, 18), 0, name),
+            notify_bytes(h(1, 7, nlen), 0, name),
             ControlReason::Malformed,
         ),
         (
@@ -679,12 +688,12 @@ fn sup6_sec1_repair12_4328_notify_rejections_carry_no_scm_rights() {
         ),
         (
             "hold in the past",
-            notify_bytes(h(1, 7, 18), 1, name),
+            notify_bytes(h(1, 7, nlen), 1, name),
             ControlReason::Timeout,
         ),
         (
             "hold beyond cap",
-            notify_bytes(h(1, 7, 18), u64::MAX, name),
+            notify_bytes(h(1, 7, nlen), u64::MAX, name),
             ControlReason::Malformed,
         ),
     ];
@@ -707,7 +716,7 @@ fn sup6_sec1_repair12_4328_notify_rejections_carry_no_scm_rights() {
     }
 
     // 受け付け前（kind 6 の無い新しい接続）の kind 7。
-    let frame = notify_bytes(h(1, 7, 18), u64::MAX, name);
+    let frame = notify_bytes(h(1, 7, nlen), u64::MAX, name);
     let (reason, fds, truncated, _s) = raw_handover_with_fds(&rig, &frame);
     assert_eq!(
         (reason, fds.len(), truncated),
@@ -720,17 +729,14 @@ fn sup6_sec1_repair12_4328_notify_rejections_carry_no_scm_rights() {
         .as_nanos();
     let mut s = raw_handover(&rig);
     assert_eq!(
-        raw_notify_with_fds(&mut s, &notify_bytes(h(1, 7, 18), hold, name)),
+        raw_notify_with_fds(&mut s, &notify_bytes(h(1, 7, nlen), hold, name)),
         (ControlReason::Ok, 0, false),
         "ack"
     );
     drop(s);
 
     // 拒否では回収せず、ack の接続を閉じたときだけ 1 回回収する。ガードの枠は全て戻る。
-    assert_eq!(
-        rig.reclaimer.wait_for(1, Duration::from_secs(3)),
-        vec!["exec-12-34".to_owned()]
-    );
+    assert_eq!(rig.reclaimer.wait_for(1, Duration::from_secs(3)), vec![own]);
     let pool = rig.pool.as_ref().unwrap();
     let until = Instant::now() + Duration::from_secs(3);
     while pool.active() != 0 && Instant::now() < until {
@@ -767,9 +773,19 @@ fn sec1_repair2_guard_rejects_invalid_name_without_reclaim() {
 fn repair5_guard_rejects_expired_hold_deadline() {
     let rig = Rig::start("expiredhold", true, true);
     let mut stream = raw_handover(&rig);
-    let mut frame = vec![b'F', b'C', b'S', b'C', 1, 7, 0, 8 + 10];
+    let own = own_name(34);
+    let mut frame = vec![
+        b'F',
+        b'C',
+        b'S',
+        b'C',
+        1,
+        7,
+        0,
+        u8::try_from(8 + own.len()).unwrap(),
+    ];
     frame.extend_from_slice(&1u64.to_be_bytes());
-    frame.extend_from_slice(b"exec-12-34");
+    frame.extend_from_slice(own.as_bytes());
     stream.write_all(&frame).unwrap();
     let mut resp = [0u8; RESPONSE_LEN];
     stream.read_exact(&mut resp).unwrap();
@@ -818,7 +834,7 @@ fn sup6_repair5_guard_limit_refuses_handover_without_descriptor() {
 fn sup6_repair5_held_guard_does_not_block_other_requests() {
     let rig = Rig::start("noblock", true, true);
     let held = rig.obtain(PID, Duration::from_secs(2)).unwrap();
-    held.notify_created(&name("exec-9-9"), hold_in(60.0))
+    held.notify_created(&name(&own_name(99)), hold_in(60.0))
         .unwrap();
     let started = Instant::now();
     let e = rig
@@ -897,4 +913,75 @@ fn repair4_sup6_4573_exec_refusal_without_reclaimer_is_counted_as_control_exec_f
     assert_eq!(e.code(), ErrorCode::FailedPrecondition);
     wait_op_counts(&rig, "control_exec", (0, 1));
     assert_no_control_signal(&rig);
+}
+
+/// SUP-6・SEC-1・#3808: 同じ名前を別の接続が二重に通知すると、2 本目は ack の前に `Malformed` で拒否され、
+/// 拒否された接続の切断では回収されない。名前を持つ 1 本目が切断されたときだけ 1 回回収する。
+#[test]
+fn sup6_sec1_3808_duplicate_name_is_rejected_and_not_reclaimed() {
+    let rig = Rig::start("dupname", true, true);
+    let first = rig.obtain(PID, Duration::from_secs(2)).unwrap();
+    first
+        .notify_created(&name(&own_name(1)), hold_in(60.0))
+        .unwrap();
+    let second = rig.obtain(PID, Duration::from_secs(2)).unwrap();
+    assert!(
+        second
+            .notify_created(&name(&own_name(1)), hold_in(60.0))
+            .is_err(),
+        "a second notification of a live name must be refused"
+    );
+    drop(second);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(rig.reclaimer.calls(), Vec::<String>::new());
+    drop(first);
+    assert_eq!(
+        rig.reclaimer.wait_for(1, Duration::from_secs(3)),
+        vec![own_name(1)]
+    );
+}
+
+/// SUP-6・SEC-1・#3808: 回収を終えたガードの名前は手放され、同じ名前を再び通知できる。
+#[test]
+fn sup6_sec1_3808_name_is_released_after_reclaim() {
+    let rig = Rig::start("namerelease", true, true);
+    let first = rig.obtain(PID, Duration::from_secs(2)).unwrap();
+    first
+        .notify_created(&name(&own_name(2)), hold_in(60.0))
+        .unwrap();
+    drop(first);
+    assert_eq!(
+        rig.reclaimer.wait_for(1, Duration::from_secs(3)),
+        vec![own_name(2)]
+    );
+    // 枠が戻る（ガードのスレッドが名前も手放して終わる）まで待つ。
+    let pool = rig.pool.as_ref().unwrap();
+    let until = Instant::now() + Duration::from_secs(3);
+    while pool.active() != 0 && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let again = rig.obtain(PID, Duration::from_secs(2)).unwrap();
+    again
+        .notify_created(&name(&own_name(2)), hold_in(60.0))
+        .unwrap();
+    drop(again);
+    assert_eq!(
+        rig.reclaimer.wait_for(2, Duration::from_secs(3)),
+        vec![own_name(2), own_name(2)]
+    );
+}
+
+/// SUP-6・SEC-1・#3808: 名前の pid が接続の本人（`SO_PEERCRED` の pid）と違う通知は拒否され、回収されない。
+#[test]
+fn sup6_sec1_3808_name_with_foreign_pid_is_rejected() {
+    let rig = Rig::start("foreignpid", true, true);
+    let foreign = format!("exec-{}-0", std::process::id().wrapping_add(1));
+    let h = rig.obtain(PID, Duration::from_secs(2)).unwrap();
+    assert!(
+        h.notify_created(&name(&foreign), hold_in(60.0)).is_err(),
+        "a name carrying another pid must be refused"
+    );
+    drop(h);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(rig.reclaimer.calls(), Vec::<String>::new());
 }

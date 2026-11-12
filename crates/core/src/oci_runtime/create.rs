@@ -63,8 +63,9 @@
 //!
 //! - プロセス起動（TASK-29.3 start）・namespace 分離・mount 適用（bind は start と本番 launcher が適用する〔#1915〕。bind 以外の種類は未対応）
 //! - mounts の rootfs 内 symlink 解決（mount を適用する側の担当）
-//! - 本番のレイヤー展開器（oci の展開を呼ぶアダプタ。未実装。REPAIR-3）。[`create_with_image`] は
-//!   [`ImageRootfsUnpacker`] を受けて展開の位置・展開先の作成・後始末だけを担う（下記）
+//! - 本番のレイヤー展開器（oci の展開を呼ぶアダプタ）は core に置かない（core は oci に依存しない）。cli の
+//!   `image_unpack`（`create --unpack`。#2377）にあり、CRI・plugin 経由の配線は未実装（#2791。REPAIR-3）。
+//!   [`create_with_image`] は [`ImageRootfsUnpacker`] を受けて展開の位置・展開先の作成・後始末だけを担う（下記）
 //! - OCI-7 の参照テーブル登録は [`create_with_image`] が担う（TASK-183.8.1）。bundle を直に指定する
 //!   [`create`] は参照を登録しない
 //! - ファイルベースの状態保存（TASK-31・OCI-5）

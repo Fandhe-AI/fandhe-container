@@ -21,7 +21,7 @@
 //! 欠けていれば skip せず失敗する（opt-in にしない。`rootless_image_rootfs_remove` と同じ扱い）。
 //!
 //! 未検証の範囲: 本番の展開器が user namespace へ入って `ImageRootfsUnpacker::unpack` から展開する配線は
-//! 本試験の対象外（#2377・#2315・#482）。root で走る分岐は CI では回さない（#1621）。
+//! 本試験の対象外（配線先は #482・#2792。cli の本番の展開器〔#2377〕は `Keep` の展開で、範囲写像は未配線）。root で走る分岐は CI では回さない（#1621）。
 
 #[cfg(not(target_os = "linux"))]
 fn main() {

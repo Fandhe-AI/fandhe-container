@@ -26,6 +26,12 @@
 //!   `Internal`（受け取った直後の dup・fstat の失敗は実環境で決定的に起こせない）。どちらもユニット試験で担保する。
 //! - `disconnect`（接続断での停止。REPAIR-5）: `Started` の後に helper を SIGKILL すると、supervisor のガードが exec 子 cgroup
 //!   を回収し、コマンドの心拍ファイルが増えなくなる。`Result` は届かず channel は EOF（`Closed`）になる。
+//! - `descendant_reclaim`（子孫の回収。SUP-6・REPAIR-5・REPAIR-12・#3808）: コマンド（`spawn-descendant`）が子孫（`descendant-sleep`。
+//!   `PR_SET_PDEATHSIG` を継承しない）を作って終わらない状態で、`Started` の名前が `exec-<helper の pid>-0` で、コマンドと子孫が
+//!   host の `/proc` で同じ `exec-*` 子 cgroup に居て `cgroup.procs` に両方が載り、子孫の `PPid` がコマンドであることを確かめる。
+//!   helper を SIGKILL すると、10 秒以内に子孫・コマンドが消え（ゾンビ・開始時刻違いも「消えた」）`exec-*` ディレクトリも無くなる。
+//!   経過 ms は情報行 `descendant_reclaim_ms=` に出す。`disconnect` は直接のコマンドしか見ておらず PDEATHSIG でも止まるため、ガードの証拠にならない。
+//!   対象外: `fandhe-container exec` の実バイナリ（`systemd-run` での再実行と内側の CLI）を SIGKILL する通し（CLI と supervisor の実バイナリの組。人間担当）。
 //! - `signal_term`（SIGKILL 以外のシグナル。SUP-6・SEC-1・CRI-5・#4282）: 終わらないコマンド（`ready-sleep`）が起動した後に `Signal(SIGTERM)` を送ると、
 //!   `SignalAck(delivered, 15)` の後に `Result(Signaled(15))` が返り、helper は終了コード 0、コマンドは `/proc` に残らない。
 //! - `requester_killed`（要求元の異常終了。SUP-6・SEC-1・REPAIR-5・#4167）: 終わらないコマンド（`ready-sleep`）を exec の期限 120 秒で
@@ -215,6 +221,11 @@ mod linux {
     /// fd 2 に出る診断行の期待値（`HelperFailure::diagnostic_line` + 改行。errno は OS 由来でないため `"none"`。#4284）。
     const DIAG_MASK_MISMATCH: &str = "{\"component\":\"supervisor.stream_exec\",\"stage\":\"helper_stdio_handover\",\"code\":\"INVALID_ARGUMENT\",\"errno\":\"none\"}\n";
     const DIAG_STDIO_KIND: &str = "{\"component\":\"supervisor.stream_exec\",\"stage\":\"helper_stdio_kind\",\"code\":\"INVALID_ARGUMENT\",\"errno\":\"none\"}\n";
+    /// `spawn-descendant` が子孫の起動を知らせるファイル名（`descendant_reclaim` 用。#3808）。
+    const DESCENDANT_READY_FILE: &str = "se-descendant-ready";
+    /// helper を SIGKILL してから、子孫と exec 子 cgroup が消えるまでの合格の上限（#3808）。回収の待ち
+    /// （本番の回収役の `RECLAIM_TIMEOUT` 2 秒）に余裕を足した値で、exec の期限（120 秒）・寿命（60 秒）より十分短い。
+    const DESCENDANT_RECLAIM_BUDGET: Duration = Duration::from_secs(10);
     /// pid1 とコマンドの寿命の上限（取り残し防止。REPAIR-5）。
     const PROBE_LIFETIME: Duration = Duration::from_secs(60);
 
@@ -339,6 +350,37 @@ mod linux {
                     };
                     let _ = writeln!(out, "{reply}");
                     let _ = out.flush();
+                }
+                std::process::exit(8);
+            }
+            Some("spawn-descendant") => {
+                // 子孫を作って自分も終わらない（`descendant_reclaim` 用。#3808）。子孫は `PR_SET_PDEATHSIG` を継承しないため、
+                // 直接のコマンドが死んでも自力では止まらない。止められるのは exec 子 cgroup の回収（`cgroup.kill`）だけである。
+                // 直接のコマンドが先に終わると helper の通常の後始末が cgroup を消してしまい、ガードを試せない。
+                let child = std::process::Command::new("/probe")
+                    .args(["--se-cmd", "descendant-sleep"])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn();
+                if child.is_err() {
+                    std::process::exit(10);
+                }
+                let path = format!("{DATA_DEST}/{DESCENDANT_READY_FILE}");
+                if std::fs::write(&path, READY_CONTENT).is_err() {
+                    std::process::exit(9);
+                }
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
+                let deadline = Instant::now() + PROBE_LIFETIME;
+                while Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                std::process::exit(8);
+            }
+            Some("descendant-sleep") => {
+                let deadline = Instant::now() + PROBE_LIFETIME;
+                while Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(100));
                 }
                 std::process::exit(8);
             }
@@ -1026,6 +1068,115 @@ mod linux {
         );
     }
 
+    /// descendant_reclaim: コマンドが作った子孫（`PR_SET_PDEATHSIG` が届かない）を、helper の SIGKILL の後に生きている
+    /// supervisor のガードが `exec-*` 子 cgroup ごと回収する（SUP-6・REPAIR-5・REPAIR-12・#3808）。
+    /// `disconnect` は直接のコマンドの停止しか見ておらず、それは PDEATHSIG でも止まるため、ガードが効いた証拠にならない。
+    /// 子孫の host pid・`exec-*` の実在と所属を確かめてから helper を殺し、期限内に子孫と cgroup が消えることを照合する。
+    fn descendant_reclaim(ctx: &Ctx, hostdata: &Path) {
+        // 期限による回収・PDEATHSIG と区別するため、exec の期限は長めに取る。
+        const HELPER_TIMEOUT_MS: u64 = 120_000;
+        let mut sp = spawn_exec(
+            ctx,
+            "spawn-descendant",
+            None,
+            HELPER_TIMEOUT_MS,
+            HelperStderr::Inherit,
+        );
+        let first = recv_from_helper(&sp.plugin, Instant::now() + timeout()).expect("started");
+        let HelperMessage::Started(name) = first else {
+            panic!("the first message must be Started: {first:?}");
+        };
+        // 名前は helper プロセス自身の pid と連番から作られる（所有の照合と同じ形式。#3808）。
+        let want_name = format!("exec-{}-0", sp.child.id());
+        assert_eq!(name.as_str(), want_name, "the exec cgroup name");
+        let ready = hostdata.join(DESCENDANT_READY_FILE);
+        assert!(
+            eventually(|| std::fs::read_to_string(&ready).is_ok_and(|s| s == READY_CONTENT)),
+            "the spawn-descendant command must have started its descendant"
+        );
+        let cmd_argv = ["/probe", "--se-cmd", "spawn-descendant"];
+        let desc_argv = ["/probe", "--se-cmd", "descendant-sleep"];
+        let cmds = live_pids_with_argv(&cmd_argv);
+        assert_eq!(cmds.len(), 1, "exactly one live command: {cmds:?}");
+        let descs = live_pids_with_argv(&desc_argv);
+        assert_eq!(descs.len(), 1, "exactly one live descendant: {descs:?}");
+        let (cmd_pid, cmd_start) = cmds[0];
+        let (desc_pid, desc_start) = descs[0];
+        // 子孫の親は直接のコマンド。
+        assert_eq!(
+            status_field(&format!("/proc/{desc_pid}/status"), "PPid:"),
+            Some(cmd_pid.to_string()),
+            "the descendant's parent must be the command"
+        );
+        // 両方が同じ `exec-*` 子 cgroup に居る（cgroup v2 の `0::<path>`。host の /proc は host の cgroup 名前空間で読む）。
+        let cg_path = |pid: u32| -> String {
+            let text = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap_or_default();
+            text.lines()
+                .find_map(|l| l.strip_prefix("0::"))
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let cmd_cg = cg_path(cmd_pid);
+        assert_eq!(
+            cg_path(desc_pid),
+            cmd_cg,
+            "command and descendant share a cgroup"
+        );
+        assert_eq!(
+            cmd_cg.rsplit('/').next(),
+            Some(want_name.as_str()),
+            "the cgroup leaf must be the notified exec child: {cmd_cg}"
+        );
+        let cg_dir = Path::new("/sys/fs/cgroup").join(cmd_cg.trim_start_matches('/'));
+        let procs = std::fs::read_to_string(cg_dir.join("cgroup.procs")).unwrap_or_default();
+        let members: Vec<u32> = procs
+            .split_whitespace()
+            .filter_map(|v| v.parse().ok())
+            .collect();
+        assert!(
+            members.contains(&cmd_pid) && members.contains(&desc_pid),
+            "cgroup.procs must list the command {cmd_pid} and the descendant {desc_pid}: {members:?}"
+        );
+
+        let t0 = Instant::now();
+        sp.child.kill().expect("kill the helper");
+        crate::reap::reap_or_report(&mut sp.child, crate::reap::reap_within());
+        // 死ぬ前に送られた `Spawned` が残っていることがある。読み捨ててから EOF と結果が無いことを確かめる（#4316）。
+        let err = loop {
+            match recv_from_helper(&sp.plugin, Instant::now() + timeout()) {
+                Ok(HelperMessage::Spawned { .. }) => {}
+                Ok(other) => panic!("unexpected {other:?} after the helper died"),
+                Err(e) => break e,
+            }
+        };
+        assert_eq!(err, ChannelError::Closed, "no result after the helper died");
+        // 子孫はコンテナの pid 1（子を回収しない）へ付け替わりゾンビで残りうるため、`/proc/<pid>` の消滅ではなく
+        // 「stat が無い・開始時刻が違う・Z / X」で判定する（`is_gone`）。cgroup は削除までを見る。
+        let done = loop {
+            let gone =
+                is_gone(cmd_pid, cmd_start) && is_gone(desc_pid, desc_start) && !cg_dir.exists();
+            if gone {
+                break t0.elapsed();
+            }
+            assert!(
+                t0.elapsed() < DESCENDANT_RECLAIM_BUDGET,
+                "the guard did not reclaim within {DESCENDANT_RECLAIM_BUDGET:?}: command gone={} descendant gone={} cgroup exists={}",
+                is_gone(cmd_pid, cmd_start),
+                is_gone(desc_pid, desc_start),
+                cg_dir.exists()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        println!(
+            "stream_exec_real: info descendant_reclaim_ms={} budget_ms={}",
+            done.as_millis(),
+            DESCENDANT_RECLAIM_BUDGET.as_millis()
+        );
+        println!(
+            "stream_exec_real: scenario=descendant_reclaim descendant and exec cgroup were gone after the helper was killed"
+        );
+    }
+
     /// signal_term: `Signal(SIGTERM)` がコマンド本体へ届き、`SignalAck(delivered)` の後に `Result(Signaled(15))` が返る
     /// （SUP-6・SEC-1・CRI-5・#4282）。コマンドは `/proc` に残らず、helper は終了コード 0 で終わる。
     fn signal_term(ctx: &Ctx, hostdata: &Path) {
@@ -1482,6 +1633,8 @@ mod linux {
         println!(
             "stream_exec_real: scenario=disconnect command stopped after the helper was killed"
         );
+
+        descendant_reclaim(ctx, hostdata);
 
         signal_term(ctx, hostdata);
 

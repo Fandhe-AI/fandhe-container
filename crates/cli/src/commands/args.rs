@@ -3,7 +3,7 @@
 //! `commands::run` が先頭のグローバルオプション（`--root`・`--plugin-path-search`・`--pasta-path`・`--pasta-path-search`。順不同）とサブコマンド名の後ろを渡して呼ぶ純粋関数群。
 //! ファイルシステムにも環境にも触れず、値の意味検証（絶対パス・ID の文字種）は core の型
 //! （`ContainerId`・`CreateRequest`・`StateRoot`）に委ねる（検査の二重実装を避ける。SEC-1）。
-//! 構文は runc 互換: `fandhe-container [--root <dir>] create [--image-root <dir> --image <sha256:digest|name[:tag]>] --bundle <dir> <id>` / `... start [--audit-policy <best-effort|strict>] <id>` / `... stop [--signal <名前|番号>] <id>` / `... kill <id> [<signal>]` / `... inspect <id>` / `... state <id>` / `... delete [--force] [--image-root <dir>] <id>` / `... list` / `... logs [--follow] [--tail <N>] [--stream <stdout|stderr>] [--escape] <id>`。
+//! 構文は runc 互換: `fandhe-container [--root <dir>] create [--image-root <dir> --image <sha256:digest|name[:tag]> [--unpack]] --bundle <dir> <id>` / `... start [--audit-policy <best-effort|strict>] <id>` / `... stop [--signal <名前|番号>] <id>` / `... kill <id> [<signal>]` / `... inspect <id>` / `... state <id>` / `... delete [--force] [--image-root <dir>] <id>` / `... list` / `... logs [--follow] [--tail <N>] [--stream <stdout|stderr>] [--escape] <id>`。
 //! `exec`（SUP-6・#2626）は `... exec [--env KEY=VALUE]... [--timeout <秒>] <id> <path> [<arg>...]`（オプションは `<id>` の前だけ）。
 //! イメージ管理（#2221）は `image ls --image-root <dir>` / `image rm [--force] --image-root <dir> <ref>` / `image tag --image-root <dir> <source> <target>` / `system df --image-root <dir>`（`--image-root` は必須の絶対パス）。
 //! ユーザー定義ネットワーク（#3066・NET-6）は `network create <name>` / `network rm <name>` / `network ls`（オプションなし）。
@@ -107,6 +107,9 @@ pub(super) struct CreateImageArgs {
     pub(super) image_root: PathBuf,
     /// 使うイメージの指定（未検証の文字列。manifest digest かタグ参照。判別は `image_refs::classify_create_image`）。
     pub(super) reference: String,
+    /// `--unpack`: イメージのレイヤーを bundle の rootfs へ展開する（opt-in。省略時は bundle の rootfs が展開済みの前提。
+    /// 既存の rootfs があると `ALREADY_EXISTS`。OCI-7・OCI-1・#2377）。
+    pub(super) unpack: bool,
 }
 
 /// `start` の引数。
@@ -337,6 +340,7 @@ pub(super) fn parse_create(args: Vec<OsString>) -> Result<CreateArgs, UsageError
     let mut bundle: Option<PathBuf> = None;
     let mut image_root: Option<PathBuf> = None;
     let mut reference: Option<String> = None;
+    let mut unpack = false;
     let mut options = CreateOptionArgs::default();
     let mut positional: Vec<OsString> = Vec::new();
     let mut it = args.into_iter();
@@ -344,6 +348,12 @@ pub(super) fn parse_create(args: Vec<OsString>) -> Result<CreateArgs, UsageError
         if a == "--" {
             positional.extend(it.by_ref());
             break;
+        } else if a == "--unpack" {
+            // 値を取らない。重複は使い方エラー（`--image-root` と `--image` が揃わない指定は下で拒否する）。
+            if unpack {
+                return Err(UsageError);
+            }
+            unpack = true;
         } else if let Some(kind) = repeatable_option(&a) {
             let value = it.next().ok_or(UsageError)?;
             push_option(&mut options, kind, value)?;
@@ -400,6 +410,7 @@ pub(super) fn parse_create(args: Vec<OsString>) -> Result<CreateArgs, UsageError
     }
     let id = single_id(positional)?;
     let image = match (image_root, reference) {
+        (None, None) if unpack => return Err(UsageError),
         (None, None) => None,
         (Some(image_root), Some(reference)) => {
             // 相対パスは作業ディレクトリ依存で 3 OS の挙動がぶれるため拒否する（`parse_image_options` と同じ）。
@@ -409,6 +420,7 @@ pub(super) fn parse_create(args: Vec<OsString>) -> Result<CreateArgs, UsageError
             Some(CreateImageArgs {
                 image_root,
                 reference,
+                unpack,
             })
         }
         _ => return Err(UsageError),
@@ -1071,6 +1083,77 @@ mod tests {
         );
     }
 
+    /// OCI-7・OCI-1・CLI-1・#2377: `--unpack` は `--image-root` と `--image` が揃ったときだけ受け、値は取らず、重複は使い方エラー。
+    #[test]
+    fn oci7_oci1_2377_parse_create_unpack_option() {
+        let root = std::env::temp_dir();
+        let r = root.to_str().unwrap();
+        let d = format!("sha256:{}", "a".repeat(64));
+        let ok = parse_create(v(&[
+            "--unpack",
+            "--image-root",
+            r,
+            "--image",
+            &d,
+            "--bundle",
+            "/b",
+            "c1",
+        ]))
+        .expect("unpack with image");
+        assert_eq!(
+            ok.image,
+            Some(CreateImageArgs {
+                image_root: root.clone(),
+                reference: d.clone(),
+                unpack: true,
+            })
+        );
+        // 位置は順不同（末尾でもよい）。
+        let tail = parse_create(v(&[
+            "--image-root",
+            r,
+            "--image",
+            &d,
+            "--bundle",
+            "/b",
+            "--unpack",
+            "c1",
+        ]))
+        .expect("unpack at the tail");
+        assert_eq!(tail.image.map(|i| i.unpack), Some(true));
+        for bad in [
+            // イメージの指定なし・片方だけ。
+            v(&["--unpack", "--bundle", "/b", "c1"]),
+            v(&["--unpack", "--bundle", "/b", "--image", &d, "c1"]),
+            v(&["--unpack", "--bundle", "/b", "--image-root", r, "c1"]),
+            // 重複。
+            v(&[
+                "--unpack",
+                "--unpack",
+                "--bundle",
+                "/b",
+                "--image-root",
+                r,
+                "--image",
+                &d,
+                "c1",
+            ]),
+            // 値を取らない（`--unpack=true` は未知のオプション）。
+            v(&[
+                "--unpack=true",
+                "--bundle",
+                "/b",
+                "--image-root",
+                r,
+                "--image",
+                &d,
+                "c1",
+            ]),
+        ] {
+            assert_eq!(parse_create(bad.clone()), Err(UsageError), "{bad:?}");
+        }
+    }
+
     /// OCI-7・CLI-1: create の `--image-root` と `--image` は両方そろったときだけ受け、順不同・各 1 回。
     #[test]
     fn oci7_parse_create_image_options() {
@@ -1084,6 +1167,7 @@ mod tests {
             image: Some(CreateImageArgs {
                 image_root: root.clone(),
                 reference: d.clone(),
+                unpack: false,
             }),
         });
         assert_eq!(

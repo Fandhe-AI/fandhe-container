@@ -224,6 +224,11 @@ impl Drop for Rig {
     }
 }
 
+/// この試験プロセスの pid を持つ exec 子 cgroup の名前。作成通知の名前は接続の所有と結びつく（SEC-1・#3808）。
+fn own_name(seq: u32) -> String {
+    format!("exec-{}-{seq}", std::process::id())
+}
+
 fn name(s: &str) -> ExecCgroupName {
     ExecCgroupName::new(s).unwrap()
 }
@@ -240,7 +245,7 @@ fn sup3_sup6_repair5_pause_reclaims_notified_guard_and_joins_threads() {
     let rig = Rig::start("held");
     let handover = rig.obtain();
     handover
-        .notify_created(&name("exec-100-0"), hold())
+        .notify_created(&name(&own_name(10000)), hold())
         .unwrap();
     assert_eq!(wait_threads_named(GUARD_COMM, 1), 1);
     assert_eq!(rig.pool.active(), 1);
@@ -251,7 +256,7 @@ fn sup3_sup6_repair5_pause_reclaims_notified_guard_and_joins_threads() {
         "{:?}",
         started.elapsed()
     );
-    assert_eq!(rig.calls(), vec!["exec-100-0".to_owned()]);
+    assert_eq!(rig.calls(), vec![own_name(10000)]);
     assert_eq!(wait_threads_gone(GUARD_COMM), 0);
     assert_eq!(wait_threads_gone(ACCEPT_COMM), 0);
     assert_eq!(rig.pool.active(), 0);
@@ -280,19 +285,16 @@ fn sup3_sup6_resume_accepts_new_guards_after_pause() {
     let _s = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let rig = Rig::start("resume");
     let old = rig.obtain();
-    old.notify_created(&name("exec-1-1"), hold()).unwrap();
+    old.notify_created(&name(&own_name(101)), hold()).unwrap();
     rig.server.pause(Duration::from_secs(5)).unwrap();
-    assert_eq!(rig.calls(), vec!["exec-1-1".to_owned()]);
+    assert_eq!(rig.calls(), vec![own_name(101)]);
     drop(old);
     rig.server.resume().unwrap();
     let fresh = rig.obtain();
-    fresh.notify_created(&name("exec-2-2"), hold()).unwrap();
+    fresh.notify_created(&name(&own_name(202)), hold()).unwrap();
     assert_eq!(wait_threads_named(GUARD_COMM, 1), 1);
     drop(fresh);
-    assert_eq!(
-        rig.wait_calls(2),
-        vec!["exec-1-1".to_owned(), "exec-2-2".to_owned()]
-    );
+    assert_eq!(rig.wait_calls(2), vec![own_name(101), own_name(202)]);
 }
 
 /// 再 launch の直前に見えるスレッドを記録する偽の relauncher。
@@ -320,7 +322,9 @@ fn sup3_sup6_repair12_relaunch_sees_no_guard_threads_and_resume_reopens() {
     let _s = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let rig = Rig::start("relaunch");
     let handover = rig.obtain();
-    handover.notify_created(&name("exec-9-9"), hold()).unwrap();
+    handover
+        .notify_created(&name(&own_name(909)), hold())
+        .unwrap();
     let probe = Arc::new(Probe {
         seen: Mutex::new(Vec::new()),
     });
@@ -329,10 +333,12 @@ fn sup3_sup6_repair12_relaunch_sees_no_guard_threads_and_resume_reopens() {
             .with_pause(Arc::clone(&rig.server) as Arc<_>);
     let _ = relauncher.relaunch(Duration::from_secs(10));
     assert_eq!(*probe.seen.lock().unwrap(), vec![(0, 0)]);
-    assert_eq!(rig.calls(), vec!["exec-9-9".to_owned()]);
+    assert_eq!(rig.calls(), vec![own_name(909)]);
     drop(handover);
     let again = rig.obtain();
-    again.notify_created(&name("exec-9-10"), hold()).unwrap();
+    again
+        .notify_created(&name(&own_name(9010)), hold())
+        .unwrap();
     drop(again);
     assert_eq!(rig.wait_calls(2).len(), 2);
 }
@@ -345,12 +351,14 @@ fn sup3_sup6_repair5_pause_timeout_keeps_stuck_guard_and_next_pause_joins_it() {
     let rig = Rig::start("stuck");
     rig.reclaimer.delay_ms.store(30_000, Ordering::SeqCst);
     let handover = rig.obtain();
-    handover.notify_created(&name("exec-5-5"), hold()).unwrap();
+    handover
+        .notify_created(&name(&own_name(505)), hold())
+        .unwrap();
     // 合計 1.5 秒 → ガードの予算は 0.75 秒。回収が終わらないので Timeout。
     let e = rig.server.pause(Duration::from_millis(1500)).unwrap_err();
     assert_eq!(e.code(), fandhe_container_core::traits::ErrorCode::Timeout);
     assert_eq!(e.message(), "exec guards did not stop in time");
-    assert_eq!(rig.calls(), vec!["exec-5-5".to_owned()]);
+    assert_eq!(rig.calls(), vec![own_name(505)]);
     assert_eq!(wait_threads_named(GUARD_COMM, 1), 1);
     assert_eq!(wait_threads_gone(ACCEPT_COMM), 0);
     // 回収が終われば、accept が止まったままでも次の pause が残ったガードを join する。
@@ -369,7 +377,9 @@ fn sup3_repair5_failed_pause_does_not_relaunch_and_restores_control_channel() {
     let rig = Rig::start("restore");
     rig.reclaimer.delay_ms.store(30_000, Ordering::SeqCst);
     let handover = rig.obtain();
-    handover.notify_created(&name("exec-6-6"), hold()).unwrap();
+    handover
+        .notify_created(&name(&own_name(606)), hold())
+        .unwrap();
     let probe = Arc::new(Probe {
         seen: Mutex::new(Vec::new()),
     });
@@ -383,7 +393,7 @@ fn sup3_repair5_failed_pause_does_not_relaunch_and_restores_control_channel() {
     // 復旧した accept が新しい handover を受ける。
     rig.reclaimer.release.store(true, Ordering::SeqCst);
     let again = rig.obtain();
-    again.notify_created(&name("exec-6-7"), hold()).unwrap();
+    again.notify_created(&name(&own_name(607)), hold()).unwrap();
     drop((again, handover));
 }
 
@@ -401,7 +411,9 @@ fn sup3_repair5_guard_budget_survives_slow_accept_stop() {
     );
     rig.reclaimer.delay_ms.store(300, Ordering::SeqCst);
     let handover = rig.obtain();
-    handover.notify_created(&name("exec-7-7"), hold()).unwrap();
+    handover
+        .notify_created(&name(&own_name(707)), hold())
+        .unwrap();
     let started = Instant::now();
     rig.server.pause(Duration::from_secs(2)).unwrap();
     assert!(
@@ -409,7 +421,7 @@ fn sup3_repair5_guard_budget_survives_slow_accept_stop() {
         "{:?}",
         started.elapsed()
     );
-    assert_eq!(rig.calls(), vec!["exec-7-7".to_owned()]);
+    assert_eq!(rig.calls(), vec![own_name(707)]);
     // 契約（join 済みで返る）は /proc を介さず即時に照合する。下の待ちは (b) を隠さない（#4588）。
     assert_eq!(rig.pool.active(), 0);
     assert_eq!(wait_threads_gone(GUARD_COMM), 0);

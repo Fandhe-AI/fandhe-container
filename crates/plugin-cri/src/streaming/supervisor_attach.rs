@@ -39,7 +39,7 @@
 //! - resize の失敗は `AttachSession::resize` が `()` を返す契約のため捨てる
 //! - 非対応の Linux のアーキテクチャ（x86_64・aarch64 以外）では `poll_writable` が `Unsupported` を返すため attach の stdin が効かない。
 //!   入力スレッドは資源を返して終わり、固定行 `POLL_UNSUPPORTED_LINE` を stderr へプロセスで一度だけ出す（REPAIR-4・#4135）
-//! - 同時セッション 64 は暫定値（#4116 のオーナー確認待ち）
+//! - 同時セッション 64 は暫定値（#4116 の範囲外で未判断。判断の窓口は #4586）
 
 use std::fs::File;
 use std::future::Future;
@@ -68,7 +68,7 @@ use fandhe_container_supervisor::control::{
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-/// 同時に持つ attach セッションの上限（`log_attach::MAX_ATTACH_FOLLOWERS` と同値。暫定。#4116）。
+/// 同時に持つ attach セッションの上限（`log_attach::MAX_ATTACH_FOLLOWERS` と同値。暫定値で、判断は #4586）。
 pub const MAX_ATTACH_SESSIONS: usize = 64;
 
 /// kind 9 の取得に渡す期限（supervisor 側でも 5 秒以内に抑えられる）。

@@ -2068,6 +2068,17 @@ fn worker_finished(child: &fandhe_container_core::exec::ContainerChild) -> bool 
     !matches!(child.wait_for_exit(Duration::ZERO), Ok(None))
 }
 
+/// 応答者の集計を固定語彙の構造化ログとして `out` へ出す（SEC-4・SUP-6・REPAIR-4・#2544・#2632）。
+///
+/// `respond_and_collect` が本番の出力先 fd 2 で呼ぶ。出力先を引数にしたのは、`unrecorded`（応答期限で記録を打ち切った
+/// 件数。後追いの記録はしない。`audit-delivery.md` 9.4）が実際に行として届くことを試験で照合するため。0 件の項目は出さない。
+/// 出口は待たない `emit_diagnostic_line_to` で、出力先が AF_UNIX socket でなければ書かれない（欠落は許す。REPAIR-5）。
+fn emit_seccomp_report_to(out: std::os::fd::BorrowedFd<'_>, counts: CounterSnapshot) {
+    for line in report_lines(counts) {
+        let _ = emit_diagnostic_line_to(out, &line);
+    }
+}
+
 /// 受け取った listener で応答者を回し、worker の結果を回収する（SEC-4・SUP-6・REPAIR-5・#2544）。
 ///
 /// 応答者は worker の終了・利用者の消滅・`deadline`（exec の全体期限）のいずれかまで通知に応答する。応答者を続けられなく
@@ -2110,9 +2121,7 @@ fn respond_and_collect(
             });
             // 集計の構造化ログ（固定語彙と数値のみ）。待たない出口で出す（共有の出力口は専用スレッドを作り、
             // 以後の監査記録〔`FileAuditSink` の主経路は `Threads: 1` を要する〕を壊すため使えない）。
-            for line in report_lines(report.counts) {
-                let _ = emit_diagnostic_line_to(std::io::stderr().as_fd(), &line);
-            }
+            emit_seccomp_report_to(std::io::stderr().as_fd(), report.counts);
             let lost = report.end == ServeEnd::Lost;
             audit = ExecSeccompAudit {
                 responder: if lost {
@@ -3342,6 +3351,28 @@ mod tests {
         assert_eq!(signaler.command_pid(), Some(pid));
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    /// SEC-4・SUP-6・#2632: 応答期限で打ち切った記録の件数が、固定語彙の 1 行として出力先へ届く。0 件の集計は何も書かない。
+    #[test]
+    fn sec4_2632_exec_responder_report_reaches_fd2_as_unrecorded_line() {
+        let (tx, rx) = UnixStream::pair().unwrap();
+        emit_seccomp_report_to(
+            tx.as_fd(),
+            CounterSnapshot {
+                recorded: 1,
+                unrecorded: 2,
+                ..CounterSnapshot::default()
+            },
+        );
+        emit_seccomp_report_to(tx.as_fd(), CounterSnapshot::default());
+        drop(tx);
+        let mut got = String::new();
+        std::io::Read::read_to_string(&mut &rx, &mut got).unwrap();
+        assert_eq!(
+            got,
+            "{\"component\":\"supervisor\",\"event\":\"seccomp_audit_unrecorded\",\"count\":2}\n"
+        );
     }
 
     /// SUP-6・#4316: fd が無い・4 バイトに満たない中継では pid は None のまま（pidfd の扱いは従来どおり）。

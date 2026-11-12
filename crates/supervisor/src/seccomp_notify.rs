@@ -34,9 +34,9 @@
 //!
 //! 記録先を作れないときの起動拒否は入口（`start_entry::require_seccomp_audit_sink`。#2027）が行い、本モジュールは
 //! 起動した後に記録に失敗した分の `unrecorded` の集計とログまで。exec 経路（SUP-6）の
-//! listener 受け渡しは #2385、応答者は #2544 で実装済み（下の [`ExecResponder`]。exec の親が単一スレッドで同期に応答する。
-//! 方式の判断と残余は `audit-delivery.md` 9.4）。ハブ（本モジュールの [`SeccompNotifyHub`]）への exec の listener の
-//! 2 段目の受け渡しは未実装（供給元の複数化と exec の本番配線〔healthcheck #2441・CLI の exec #2626〕の後）。restart の再 launch は #2043 で成立し、本モジュールの差し替えは
+//! listener 受け渡しは #2385、応答者は #2544 で実装済み（下の [`ExecResponder`]。exec の親が単一スレッドで同期に応答する）。
+//! ハブ（本モジュールの [`SeccompNotifyHub`]）への exec の listener の 2 段目の受け渡し（案 A）は、本番の呼び出し元の配線
+//! （#2626 ほか）が済んだ後も採らない判断（#2632。`audit-delivery.md` 9.4。再評価の条件も同所）。restart の再 launch は #2043 で成立し、本モジュールの差し替えは
 //! `supervisor_bin_real` のシナリオ C が本番 launcher で照合する。
 
 use std::collections::VecDeque;
@@ -909,7 +909,10 @@ pub struct ServeReport {
 /// [`Self::serve`] を回す。exec の親は fork と `FileAuditSink` の主経路のため単一スレッドでなければならず、
 /// [`SeccompNotifyHub`] のスレッドを持てない。そのため通知ごとに「pid 変換 → cookie 検証 → トークンバケット →
 /// 期限つき記録 → `-EPERM` 応答」を呼び出しスレッドで直列に行う。応答は `-EPERM` の 1 種類だけで、記録の可否に関わらず
-/// 必ず応答する。記録は `min(応答期限, 全体期限)` で打ち切る（打ち切った分は `unrecorded`。ハブの `late` 相当の後追いはしない）。
+/// 必ず応答する。記録は `min(応答期限, 全体期限)` で打ち切る（打ち切った分は `unrecorded`。ハブの `late` 相当の後追いはしない。
+/// 打ち切った記録が実は書けていた場合に二重に記録して「1 拒否 1 件」を破るため。#2632・9.4）。
+/// 直列処理の待ちの上限: 記録先が詰まったとき、キューの k 件目の応答は `k × 応答期限` 以内（既定 1 秒、最大 5 秒）で、
+/// 全体は exec の全体期限で頭打ち（超えた分は listener を閉じて `ENOSYS`）。試験 `repair5_2632_*` が照合する。
 /// `audit` は `record_until` を期限どおりに実装すること（既定実装は期限切れでなければ `record` に委ねる）。
 pub struct ExecResponder<'a> {
     sink: &'a dyn AuditSink,
@@ -1750,6 +1753,156 @@ mod tests {
                 ..CounterSnapshot::default()
             }
         );
+    }
+
+    /// `record_until` に渡された期限を残して直ちに `Timeout` を返す記録先。
+    struct DeadlineProbe(Mutex<Vec<Instant>>);
+
+    impl AuditSink for DeadlineProbe {
+        fn record(&self, _record: &AuditRecord) -> Result<(), TraitError> {
+            Err(TraitError::new(ErrorCode::Internal, "must not be called"))
+        }
+        fn record_until(&self, _record: &AuditRecord, deadline: Instant) -> Result<(), TraitError> {
+            self.0.lock().unwrap().push(deadline);
+            Err(TraitError::new(ErrorCode::Timeout, "probe"))
+        }
+    }
+
+    /// REPAIR-5・SEC-4・#2632: 記録の期限は `min(応答期限, 全体期限)`。遠い全体期限なら応答期限、近ければ全体期限そのもの。
+    #[test]
+    fn repair5_2632_record_deadline_is_the_response_deadline_clamped_to_the_overall_deadline() {
+        let d = Duration::from_millis(200);
+        let config = NotifyConfig::default().with_response_deadline(d).unwrap();
+        let id = ContainerId::new("web-1").unwrap();
+
+        // (a) 全体期限が遠い。
+        let probe = DeadlineProbe(Mutex::new(Vec::new()));
+        let (fake, _) = Fake::new(vec![Some((1, n(10)))]);
+        let before = Instant::now();
+        let report = ExecResponder::new(&probe, Some(&id), config).serve_with(
+            &fake,
+            &Some,
+            far(),
+            &mut || false,
+        );
+        let after = Instant::now();
+        let seen = probe.0.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0] >= before + d && seen[0] <= after + d, "{seen:?}");
+        assert_eq!(report.counts.unrecorded, 1);
+
+        // (b) 全体期限が応答期限より近い。
+        let probe = DeadlineProbe(Mutex::new(Vec::new()));
+        let (fake, _) = Fake::new(vec![Some((1, n(10)))]);
+        let overall = Instant::now() + Duration::from_millis(50);
+        let report = ExecResponder::new(&probe, Some(&id), config).serve_with(
+            &fake,
+            &Some,
+            overall,
+            &mut || false,
+        );
+        assert_eq!(probe.0.lock().unwrap().as_slice(), &[overall]);
+        assert_eq!(report.counts.unrecorded, 1);
+    }
+
+    /// 応答の時刻を残す供給元の包み（直列処理の待ちの照合用）。
+    struct TimedSource {
+        inner: Fake,
+        times: Arc<Mutex<Vec<Instant>>>,
+    }
+
+    impl NotifySource for TimedSource {
+        type Id = u64;
+        fn wait(&self, t: Duration) -> Result<Ready, SourceError> {
+            self.inner.wait(t)
+        }
+        fn receive(&self) -> Result<Option<(u64, Notified)>, SourceError> {
+            self.inner.receive()
+        }
+        fn is_pending(&self, id: u64) -> Result<bool, SourceError> {
+            self.inner.is_pending(id)
+        }
+        fn deny_eperm(&self, id: u64) -> Result<Responded, SourceError> {
+            let r = self.inner.deny_eperm(id);
+            self.times.lock().unwrap().push(Instant::now());
+            r
+        }
+    }
+
+    fn many_notifications(count: u64) -> Fake {
+        let items = (0..count).map(|i| Some((i, n(100 + i as u32)))).collect();
+        Fake::new(items).0
+    }
+
+    /// REPAIR-5・SEC-4・#2632: 記録先が詰まっても、k 件目（1 始まり）の応答は `k × 応答期限` 以上かつ余裕を足した範囲内。
+    /// バケットは補充（20 件/秒）が処理（1 件/応答期限）を上回るため尽きず、間引き（`suppressed`）は 0。
+    #[test]
+    fn repair5_2632_serial_wait_with_a_stuck_sink_is_bounded_by_position_times_the_response_deadline()
+     {
+        let d = Duration::from_millis(50);
+        let config = NotifyConfig::default().with_response_deadline(d).unwrap();
+        let fake = many_notifications(4);
+        let times: Arc<Mutex<Vec<Instant>>> = Arc::new(Mutex::new(Vec::new()));
+        let wrapped = TimedSource {
+            inner: fake,
+            times: Arc::clone(&times),
+        };
+        let id = ContainerId::new("web-1").unwrap();
+        let started = Instant::now();
+        let report = ExecResponder::new(&StuckUntilDeadline, Some(&id), config).serve_with(
+            &wrapped,
+            &Some,
+            far(),
+            &mut || false,
+        );
+        let times = times.lock().unwrap().clone();
+        assert_eq!(times.len(), 4);
+        for (i, at) in times.iter().enumerate() {
+            let k = u32::try_from(i + 1).unwrap();
+            let took = at.duration_since(started);
+            assert!(took >= d * k, "k={k} took={took:?}");
+            assert!(
+                took < d * k + Duration::from_millis(500),
+                "k={k} took={took:?}"
+            );
+        }
+        assert_eq!(
+            report.counts,
+            CounterSnapshot {
+                unrecorded: 4,
+                ..CounterSnapshot::default()
+            }
+        );
+    }
+
+    /// REPAIR-5・SEC-4・#2632: exec の全体期限が直列の待ちの上限。期限に達したら `DeadlineReached` で戻り、残りは応答しない
+    /// （本番では listener を閉じてカーネルが `ENOSYS` で解く。実カーネルの照合は `exec_seccomp_listener`）。
+    #[test]
+    fn repair5_2632_overall_deadline_caps_the_serial_wait() {
+        let d = Duration::from_millis(100);
+        let config = NotifyConfig::default().with_response_deadline(d).unwrap();
+        let fake = many_notifications(10);
+        let times: Arc<Mutex<Vec<Instant>>> = Arc::new(Mutex::new(Vec::new()));
+        let wrapped = TimedSource {
+            inner: fake,
+            times: Arc::clone(&times),
+        };
+        let id = ContainerId::new("web-1").unwrap();
+        let started = Instant::now();
+        let overall = started + Duration::from_millis(250);
+        let report = ExecResponder::new(&StuckUntilDeadline, Some(&id), config).serve_with(
+            &wrapped,
+            &Some,
+            overall,
+            &mut || false,
+        );
+        let took = started.elapsed();
+        assert_eq!(report.end, ServeEnd::DeadlineReached);
+        // 1・2 件目は 100ms・200ms で応答し、3 件目は 250ms の全体期限で打ち切って応答する。4 件目以降は処理しない。
+        assert_eq!(times.lock().unwrap().len(), 3);
+        assert_eq!(report.counts.unrecorded, 3);
+        assert!(took >= Duration::from_millis(250), "{took:?}");
+        assert!(took < Duration::from_millis(750), "{took:?}");
     }
 
     /// cookie が無効なら記録も応答もしない（`target_gone` は 1）。

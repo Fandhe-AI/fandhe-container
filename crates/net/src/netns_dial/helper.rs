@@ -527,13 +527,21 @@ mod tests {
     /// CRI-6: 誰も listen していない port への connect は Refused。
     #[test]
     fn cri6_4479_connect_refused() {
-        let port = {
-            let l = TcpListener::bind("127.0.0.1:0").unwrap();
-            l.local_addr().unwrap().port()
-        };
+        // IPv4 失敗後に `[::1]` へつなぎ直すため、同じ番号を両アドレスで確保し、ダイヤル直前に同時に閉じる。
+        // `[::1]` を bind できない環境は前提不成立として失敗させる（skip しない）。
+        let (v4l, v6l) = (0..20)
+            .find_map(|_| {
+                let v4l = TcpListener::bind("127.0.0.1:0").unwrap();
+                let p = v4l.local_addr().unwrap().port();
+                TcpListener::bind(("::1", p)).ok().map(|v6l| (v4l, v6l))
+            })
+            .expect("precondition: could not bind 127.0.0.1 and [::1] on the same port");
+        let port = v4l.local_addr().unwrap().port();
         let (a, b) = two_fds();
         let mut j = FakeJoiner::ok();
-        let (out, resp, got) = drive(req_frame(port).as_bytes(), &[a.as_fd(), b.as_fd()], &mut j);
+        let frame = req_frame(port);
+        drop((v4l, v6l));
+        let (out, resp, got) = drive(frame.as_bytes(), &[a.as_fd(), b.as_fd()], &mut j);
         assert_eq!(out, Outcome::Responded(DialErrorCode::Refused));
         assert_eq!(resp, DialResponse::Error(DialErrorCode::Refused));
         assert_eq!(got.len(), 0);
@@ -632,6 +640,7 @@ mod tests {
     }
 
     /// `::1` と同じ番号の IPv4 listener を drop 済みにして `[::1]` だけで待ち受ける（番号の揺れを数回やり直す）。
+    /// `[::1]` 側は保持したまま返す。IPv4 を手放してからダイヤルまでの窓は std では塞げない（bind のみの socket を作れない）ため残る。
     fn ipv6_only_listener() -> TcpListener {
         for _ in 0..20 {
             let v4l = TcpListener::bind("127.0.0.1:0").unwrap();

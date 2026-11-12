@@ -504,6 +504,16 @@ helper が要る理由（カーネルの要件）: `setns(CLONE_NEWUSER)` は多
 | 回収できない helper の保持 | 上限 8（入口で検査し、満杯なら新しい dial を `RESOURCE_EXHAUSTED`。並行 dial が同時に入れる分だけ超えうるが、断ると追えない zombie が残るため入れる側は断らない。超過の上限は 8 + `max_inflight_dials` − 1、既定で 39。#4525） |
 | 同時の helper 数 | cri の `max_inflight_dials`（32）で有界 |
 
+回収できない helper の観測（#4546・CRI-6・REPAIR-4・REPAIR-5。操作名と reason は暫定で、語彙の確定は #4116 の項目 3）: `PodDialTelemetry`（共有 `OpRecorder` と `stderr_sink()`。`main.rs` が組み立て、作れなければ起動しない。`ProductionPortForward::pod_network` へ渡す）が次の 3 つを出す。件数は `OpRecorder`（失敗として計上）、異常行は出来事ごとの累計が 2 のべき乗（1, 2, 4, …）の時だけ（共有 sink の監査行を押し出さない間引き。SEC-4）。
+
+| 出来事 | 操作名 | 異常行の reason |
+| --- | --- | --- |
+| 回収できず保持した | `cri.port_forward.helper_retained` | `helper_unreaped` |
+| 保持数が上限（8）を超えた（保持の回も数える） | `cri.port_forward.retained_over_limit` | `retained_over_limit` |
+| 満杯で `RESOURCE_EXHAUSTED` を返した | `cri.port_forward.retained_full` | `retained_full` |
+
+行の形は `{"event":"cri_port_forward_helper","op":…,"outcome":"error","reason":…,"count":<累計>}`。記録は保持一覧の lock の外で行い、`OpRecorder::record` と `LineSink::submit`（`try_send`）だけを使う。pid・port・パス・errno は出さない。保持中の helper が後で回収されたことは記録しない。
+
 残余: 保持一覧の掃除は dial の入口・出口・一覧へ入れる直前と dialer の drop で行い、定期の掃除は採らない（常駐スレッドを増やさない）。dial が来ない間は SIGKILL 後に遅れて終了した子が zombie で残りうる（上限内。次の dial か plugin-cri の終了で解消。#4525）。StopPodSandbox と並行した dial で、fd を開いた後に解放が走ると、fd が netns を生かしたまま最大 10 秒つながりうる（有界）。URL 発行後の sandbox の消失は NODE と同じく TTL と idle の期限で有界。
 
 #### crate の担当（PLUG-1）

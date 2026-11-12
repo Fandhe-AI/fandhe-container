@@ -30,10 +30,10 @@ use super::frame::{
 use super::verify::{DialExpectation, DialedSocketError, NsId, verify_dialed_socket};
 use crate::error::{NetError, NetErrorCode};
 use crate::netns_helper::{
-    JoinedNs, RecvError, fd_identity, recv_loop_before_deadline, self_ns_identity,
+    JoinedNs, RecvError, classify, fd_identity, recv_loop_before_deadline, self_ns_identity,
 };
 use crate::sys::holder as sysh;
-use crate::sys::{self, Deadline, SysError};
+use crate::sys::{Deadline, SysError};
 
 /// helper の recv・setns・harden に見込む余裕（REPAIR-5）。応答待ちは helper がこれらを終えた後の connect から始まる。
 const RESPONSE_MARGIN: Duration = Duration::from_secs(5);
@@ -41,22 +41,6 @@ const RESPONSE_MARGIN: Duration = Duration::from_secs(5);
 /// 応答を待つ期限の上限（helper の connect 期限の上限 `MAX_CONNECT_TIMEOUT_MS` に `RESPONSE_MARGIN`（5 秒）を足した値。REPAIR-5）。
 pub const MAX_RESPONSE_TIMEOUT: Duration =
     Duration::from_millis(MAX_CONNECT_TIMEOUT_MS as u64).saturating_add(RESPONSE_MARGIN);
-
-/// errno の分類。`netns_holder::holder::classify` と同じ写像（あちらは `pub(super)` で別モジュールのため、
-/// 2 か所の写像を共有する下位モジュールを作らず複製する。差が出たら両方を直す）。
-fn classify(e: SysError) -> NetErrorCode {
-    match e {
-        SysError::Unsupported => NetErrorCode::Unimplemented,
-        SysError::Os(n) if n == sys::EPERM || n == sys::EACCES => NetErrorCode::PermissionDenied,
-        SysError::Os(n) if n == sys::EINVAL || n == sysh::ENOTSOCK || n == sysh::EPIPE => {
-            NetErrorCode::FailedPrecondition
-        }
-        SysError::Os(n) if n == sys::EMFILE || n == sys::ENFILE || n == sys::ENOMEM => {
-            NetErrorCode::ResourceExhausted
-        }
-        _ => NetErrorCode::Internal,
-    }
-}
 
 fn sys_err(e: SysError, message: &'static str) -> NetError {
     NetError::new(classify(e), message)

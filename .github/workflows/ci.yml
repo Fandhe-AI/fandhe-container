@@ -1628,7 +1628,8 @@ jobs:
       # netns_mismatch で拒否される（場面 M）ことと、参加の前後・特権の破棄の後の PR_GET_DUMPABLE が 0 であること（場面 D。#4558）を照合する
       # 実機前提テスト（harness = false）。上で緩和した sysctl を使い回し、
       # 新しい check-run・sudo・permissions は追加しない（rootless のみ）。`--ignored` が届かなくても exit 0 になるため、
-      # 成功行 5 行を試験ソースから導出して双方向に照合し（--min 5）、件数減を fail-closed にする（#2825・REPAIR-12）。
+      # 場面 V6（#4572）として、IPv4 の失敗の後に [::1] でつなぎ直して [::1] だけで待ち受ける対象へ届くことも照合する。
+      # 成功行 6 行を試験ソースから導出して双方向に照合し（--min 6）、件数減を fail-closed にする（#2825・REPAIR-12）。
       - name: netns_dial_userns のビルド（実行タイムアウトの時間枠を消費しないよう分離）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
@@ -1643,7 +1644,7 @@ jobs:
           scripts/run-with-deadline.sh --name netns_dial_userns --deadline 240 --log "${log}" -- \
             cargo test -p fandhe-container-net --test netns_dial_userns -- --ignored
           scripts/check-success-lines.sh --name netns_dial_userns --src crates/net/tests/netns_dial_userns.rs \
-            --log "${log}" --select '^netns_dial_userns: helper joined' --min 5 \
+            --log "${log}" --select '^netns_dial_userns: helper joined' --min 6 \
             --forbid 'netns_dial_userns: ignored' --forbid 'not applicable' --forbid 'FAILED' --summary
 
       # netns_holder_launch_userns（`crates/supervisor/tests/netns_holder_launch_userns.rs`。NET-9・CORE-1・CORE-6・SUP-12・SEC-5・

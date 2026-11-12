@@ -293,7 +293,8 @@ pub fn is_docker_socket_source(source: &str) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum IncompatibleGuidance {
-    /// `services.*.build`。イメージのビルドは外部ツールで行う。
+    /// `services.*.build`。イメージのビルドは外部ツールで行う。案内する経路は registry のみで、
+    /// ローカル取り込み（OCI レイアウト・tar）は未実装のため文言で未対応と明示する。入ったら文言を更新する（REPAIR-3・#3615）。
     ExternalBuild,
     /// Docker ソケットの bind mount（`services.*.volumes`）。
     DockerSocket,
@@ -312,7 +313,7 @@ impl IncompatibleGuidance {
     pub fn message(self) -> &'static str {
         match self {
             Self::ExternalBuild => {
-                "build is not supported because the Docker Engine build API is not provided (D-16); build the image with an external tool (for example docker build, podman build or buildah) as a separate step, push it to a registry or load it locally, and reference it with image"
+                "build is not supported because the Docker Engine build API is not provided (D-16); build the image with an external tool (for example docker build, podman build or buildah) as a separate step, push it to a registry (importing a locally built image is not supported yet), and reference it with image"
             }
             Self::DockerSocket => {
                 "bind-mounting the Docker Engine socket is not supported because the Docker Engine API is not provided (D-16); run jobs that need the Docker API (for example CI runners or docker-in-docker builds) on a host with Docker Engine, or build images externally and reference them with image"
@@ -629,6 +630,9 @@ mod tests {
         assert_eq!(b.code(), "external-build");
         assert!(b.message().contains("external tool"));
         assert!(b.message().contains("reference it with image"));
+        assert!(!b.message().contains("load it locally"));
+        assert!(b.message().contains("push it to a registry"));
+        assert!(b.message().contains("not supported yet"));
         let d = incompatible_guidance("services.*.volumes").expect("socket");
         assert_eq!(d.code(), "docker-socket");
         for p in [

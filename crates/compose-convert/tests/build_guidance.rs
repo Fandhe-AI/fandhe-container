@@ -41,6 +41,12 @@ fn stack7_build_fixture_errors_with_guidance() {
     assert_eq!(g.code(), "external-build");
     assert!(g.message().contains("image"));
     assert!(g.message().contains("external tool"));
+    // #3615・REPAIR-3: 実在しないローカル取り込みの経路を案内せず、未対応を明示する。
+    assert!(!g.message().contains("load it locally"));
+    assert_eq!(
+        g.message(),
+        "build is not supported because the Docker Engine build API is not provided (D-16); build the image with an external tool (for example docker build, podman build or buildah) as a separate step, push it to a registry (importing a locally built image is not supported yet), and reference it with image"
+    );
 }
 
 /// STACK-7・D-16: short / long のソケット bind はどちらも案内つき。

@@ -62,8 +62,10 @@ use crate::logs::TapStreams;
 /// 1 要求の種類（計測の操作名を分けるため。REPAIR-4）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestOp {
-    /// シグナル・stop・再起動の取り消し・exec の pidfd の受け渡し。
+    /// シグナル・stop・再起動の取り消し。kind を判別できない失敗（ヘッダの読み取り失敗など）も含む。
     Signal,
+    /// exec 用 pidfd の受け渡し（kind 6。#4573・SUP-6）。kind 7 は別接続のガードが読むため数えない。
+    Exec,
     /// 終了の購読（kind 8）。
     ExitWatch,
     /// Attach の fd の受け渡し（kind 9）。
@@ -202,6 +204,7 @@ pub fn serve_connection_with_guards(
     match op {
         RequestOp::ExitWatch => observer.record_exit_watch(ok, started.elapsed()),
         RequestOp::Attach => observer.record_attach(ok, started.elapsed()),
+        RequestOp::Exec => observer.record_exec(ok, started.elapsed()),
         RequestOp::Signal => observer.record_request(ok, started.elapsed()),
     }
 }
@@ -243,7 +246,7 @@ fn handle_request(
         Ok(RequestHeader::ExecHandover) => {
             return (
                 handle_exec_handover(stream, slot, read_deadline, guards),
-                RequestOp::Signal,
+                RequestOp::Exec,
             );
         }
         Ok(RequestHeader::ExitWatch) => {

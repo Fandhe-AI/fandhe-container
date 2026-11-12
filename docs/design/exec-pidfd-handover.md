@@ -2,7 +2,7 @@
 
 CLI の `exec` コマンドが `run_command_with_pidfd` を呼ぶために必要な「起動時 pidfd」を、どの経路で CLI プロセスへ渡すかを記録する。
 
-> 位置づけ: **判断記録（案 A はオーナー承認済み）**。#2626 の実装で案 A を採用し（既存の uid 照合・同一性照合を保ち、プロトコルの作り直しや専用 bin を足さない安全側）、2026-11-03 にオーナーが案 A を承認した（[#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6595741383) の 4 番目の項。SUP-6・SEC-4）。同じコメントで、CRI の exec（#3726 の分解、#3752〜#3761）の設計記録 #3752 は、この経路を再利用できるかを先に確かめることとされた。§6 の 2 点目（観測名の語彙）は未決定のまま残る。
+> 位置づけ: **判断記録（案 A はオーナー承認済み）**。#2626 の実装で案 A を採用し（既存の uid 照合・同一性照合を保ち、プロトコルの作り直しや専用 bin を足さない安全側）、2026-11-03 にオーナーが案 A を承認した（[#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6595741383) の 4 番目の項。SUP-6・SEC-4）。同じコメントで、CRI の exec（#3726 の分解、#3752〜#3761）の設計記録 #3752 は、この経路を再利用できるかを先に確かめることとされた。§6 の 2 点目（観測名の語彙）は 2026-11-12 に決定済み（kind 6 は `control_exec`。#4573）。
 
 - CRI の exec（ストリーミング）での再利用の確認結果は [cri-streaming-server.md](cri-streaming-server.md) の「本番 backend の設計」にあり、kind 6 / 7 は変更なしで再利用する（#3752）
 - 対象ビヘイビア: SUP-6・SEC-4・CLI-1（関連: SEC-1・CORE-1・REPAIR-2・REPAIR-5・REPAIR-3）
@@ -104,4 +104,4 @@ CLI の `exec` コマンドが `run_command_with_pidfd` を呼ぶために必要
 ## 6. 確認が必要な点（オーナー判断）
 
 - ~~案 A の採否（不採用なら案 B の可変長プロトコルと helper bin の設計から）。~~ **決定済み**: 2026-11-03 にオーナーが案 A を承認した（[#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6595741383) の 4 番目の項）。
-- 制御チャネルの観測名 `control_signal` を exec の受け渡しにも使っている点（集計の語彙を分けるか）。**未決定**。
+- ~~制御チャネルの観測名 `control_signal` を exec の受け渡しにも使っている点（集計の語彙を分けるか）~~。**決定済み**: 2026-11-12 のオーナー判断（[#4116 の項目 3](https://github.com/Fandhe-AI/fandhe-container/issues/4116#issuecomment-6818265484)）で、kind 6 は `control_exec` で数える。kind 7 は数えず、回収の結果は `exec_cgroup_reclaim` に数える（#4573）。

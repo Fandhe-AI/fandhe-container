@@ -499,11 +499,14 @@ count_lines info-lib 0 "info: run 1/1 x: overshoot_ms=3" 1 gen "${P}" "${T}" "${
 rm -f "${work}/args" "${work}/counter"
 env PATH="${work}/bin:${PATH}" STUB_MODE=gen STUB_LOG='ok sec1_x\n' STUB_COUNTER="${work}/counter" STUB_ARGS_LOG="${work}/args" \
   "${P}" "${B}" "${LN}" "${IP}" "FORBIDDEN_LINE=zzz" COUNT=1 "${target}" >/dev/null 2>&1
-if [ "$(grep -o -- '--no-capture' "${work}/args" | wc -l | tr -d ' ')" -eq 2 ] && ! grep -qE -- '--no-capture.*--no-capture' "${work}/args" ; then
+# ビルド(--no-run)と preflight(--list)を除いた本番呼び出しの引数行は COUNT=1 で 1 行、その行の --no-capture はちょうど 1 回。
+prod_lines="$(grep -vF -e ' --list ' -e ' --no-run' "${work}/args" || true)"
+prod_n="$(printf '%s\n' "${prod_lines}" | grep -c . || true)"
+nc_n="$(printf '%s\n' "${prod_lines}" | grep -o -- '--no-capture' | wc -l | tr -d ' ')"
+if [ "${prod_n}" -eq 1 ] && [ "${nc_n}" -eq 1 ]; then
   echo "OK: info-no-capture-once-per-invocation"
 else
-  # preflight(--list) と本番で 2 行に 1 回ずつなら行数 = 1。ここでは 1 行に 2 回出ないことだけを見る。
-  if ! grep -qE -- '--no-capture.*--no-capture' "${work}/args"; then echo "OK: info-no-capture-once-per-invocation"; else echo "NG: info-no-capture-once-per-invocation" >&2; cat "${work}/args" >&2; fails=$((fails + 1)); fi
+  echo "NG: info-no-capture-once-per-invocation (production lines=${prod_n} no-capture=${nc_n}; expected 1 and 1)" >&2; cat "${work}/args" >&2; fails=$((fails + 1))
 fi
 # USER_SCOPE。
 count_lines info-scope 0 "info: run 1/1 x: overshoot_ms=4" 1 scope-gen "${P}" "${B}" "${LN}" "${SB}" USER_SCOPE=1 "${IP}" 'STUB_NC_STDOUT=x: overshoot_ms=4\n' 'STUB_LOG=ok sec1_x\n' COUNT=1

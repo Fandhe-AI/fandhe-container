@@ -5,8 +5,6 @@
 //! 在庫へ公開するので、layers の mediaType も本番の cri の pull と同じ形で載る。
 //! cli の in-crate 試験（`image_unpack/tests.rs`）と結合試験（`binary_entry.rs`）が `#[path]` で共有する。
 
-#![allow(dead_code)]
-
 use std::io::Write as _;
 
 use fandhe_container_oci::image_management::{
@@ -71,6 +69,8 @@ pub fn tar_of(entries: &[Entry<'_>]) -> Vec<u8> {
 }
 
 /// 公開済みのイメージ。
+// `config`・`layers` は `#[path]` の共有先の一部（結合試験 `binary_entry.rs`）が読まない。
+#[allow(dead_code)]
 pub struct SeededImage {
     pub manifest: Digest,
     pub config: Digest,

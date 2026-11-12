@@ -28,6 +28,7 @@ use std::path::PathBuf;
 use super::{IMAGE_STORE_BLOB_DIR, ImageStore};
 use crate::config::{MAX_CONFIG_BYTES, parse_image_config_rootfs};
 use crate::error::{OciError, OciErrorCode};
+use crate::instrument::{NoopOciOpRecorder, OciOpRecorder};
 use crate::layer::{BlobFileFacts, VerifiedLayerBlob, check_blob_trust, verify_bytes_digest};
 use crate::reference::Digest;
 
@@ -165,13 +166,33 @@ impl ImageStore {
         &self,
         layer: &StoredImageLayer,
     ) -> Result<VerifiedLayerBlob, OciError> {
+        self.open_verified_layer_bounded(&NoopOciOpRecorder, layer, u64::MAX)
+    }
+
+    /// [`ImageStore::open_verified_layer`] に読み取り前のサイズ上限 `max_bytes` を課す版（OCI-1・OCI-7・REPAIR-5・#2377）。
+    ///
+    /// 開いた同じハンドルの fstat のサイズが `max_bytes` を超えたら、blob を 1 バイトも読む前に `ResourceExhausted` で
+    /// 拒否する（合計サイズの上限を全量の digest 計算より前に課すための口）。検査と記録は `recorder` へ
+    /// `VerifyBlobDigest` として 1 回だけ残す。
+    pub fn open_verified_layer_bounded(
+        &self,
+        recorder: &dyn OciOpRecorder,
+        layer: &StoredImageLayer,
+        max_bytes: u64,
+    ) -> Result<VerifiedLayerBlob, OciError> {
         let owner = self.root_owner()?;
         let file = self.open_cached_blob(layer.digest())?;
         let size = file
             .metadata()
             .map_err(|_| err(OciErrorCode::DataLoss, "layer blob could not be inspected"))?
             .len();
-        VerifiedLayerBlob::from_file(file, layer.digest(), size, owner)
+        if size > max_bytes {
+            return Err(err(
+                OciErrorCode::ResourceExhausted,
+                "image layers exceed the size limit",
+            ));
+        }
+        VerifiedLayerBlob::from_file_with(recorder, file, layer.digest(), size, owner)
     }
 
     /// config blob を信頼条件つきで上限まで 1 回だけ読み、読んだ本文の digest を照合してから `diff_ids` を解析する。

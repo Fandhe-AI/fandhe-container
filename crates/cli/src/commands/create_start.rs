@@ -140,7 +140,7 @@ pub(super) fn create_container_with_image(
     _pass: &ContainerCreatePass<'_>,
 ) -> Result<StateRecord, OciRuntimeError> {
     let refs = StoreImageRefs::new(&image.store, &image.scope);
-    let unpacker = StoreImageRootfsUnpacker::new(&image.store);
+    let unpacker = StoreImageRootfsUnpacker::new(&image.store, &rt.recorder);
     let container_image = ContainerImage::new(&refs, &image.manifest);
     let container_image = if image.unpack {
         container_image.with_unpacker(&unpacker)

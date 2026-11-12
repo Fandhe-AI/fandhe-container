@@ -194,7 +194,8 @@ mod linux {
         );
 
         // 展開器の戻り値（展開した層の数）。
-        let unpacker = StoreImageRootfsUnpacker::new(&image.store);
+        let unpack_rec = OpRecorder::new();
+        let unpacker = StoreImageRootfsUnpacker::new(&image.store, &unpack_rec);
         let dir = base.0.join("direct");
         std::fs::create_dir(&dir).expect("dir");
         let link = open_dir_link(&dir);
@@ -203,6 +204,14 @@ mod linux {
             .expect("unpack");
         assert_eq!(unpacked.layers, 3);
         drop(link);
+        // 検証は層ごとに 1 回、oci の計装が CLI の記録先へ届く（REPAIR-4）。
+        let verify = unpack_rec
+            .snapshot_op(
+                &fandhe_container_core::observability::OpName::new("oci.blob.verify")
+                    .expect("name"),
+            )
+            .expect("verify op recorded");
+        assert_eq!((verify.success(), verify.failure()), (3, 0));
 
         let refs = crate::commands::image_refs::StoreImageRefs::new(&image.store, &image.scope);
         let del = DeleteRequest::new(id("c1"));
@@ -273,6 +282,31 @@ mod linux {
         assert_eq!(refs_of(&image.store, &seeded.manifest), 0);
     }
 
+    /// 残りの許容サイズを超える blob は、読む前に ResourceExhausted で拒否する（OCI-1・REPAIR-5）。
+    #[test]
+    fn oci1_2377_layer_over_remaining_budget_is_rejected_before_reading() {
+        use fandhe_container_oci::error::OciErrorCode;
+        use fandhe_container_oci::instrument::NoopOciOpRecorder;
+        let base = TmpDir::new("budget");
+        let images = base.images();
+        let seeded = seed_image(
+            &images,
+            "p7",
+            &[tar_of(&[Entry::File("a", b"a")])],
+            None,
+            true,
+        );
+        let layers = images.image_layers(&seeded.manifest).expect("layers");
+        let layer = layers.layers().first().expect("layer");
+        let e = images
+            .open_verified_layer_bounded(&NoopOciOpRecorder, layer, 1)
+            .expect_err("over budget");
+        assert_eq!(e.code(), OciErrorCode::ResourceExhausted);
+        images
+            .open_verified_layer_bounded(&NoopOciOpRecorder, layer, u64::MAX)
+            .expect("within budget");
+    }
+
     /// `/proc/self/fd/N` 以外の展開先は InvalidArgument（パスで開き直さない）。
     #[test]
     fn sec1_2377_unpack_rejects_non_fd_destination() {
@@ -285,7 +319,8 @@ mod linux {
             None,
             true,
         );
-        let unpacker = StoreImageRootfsUnpacker::new(&images);
+        let rec = OpRecorder::new();
+        let unpacker = StoreImageRootfsUnpacker::new(&images, &rec);
         let manifest = ImageManifestDigest::new(seeded.manifest.as_str()).expect("manifest");
         let e = unpacker.unpack(&manifest, &base.0).expect_err("plain path");
         assert_eq!(e.code(), ErrorCode::InvalidArgument);
@@ -304,7 +339,7 @@ mod linux {
 }
 
 /// Linux 以外では、展開器つきの create は core が作成の前に Unimplemented で拒否し、何も作られない。
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 #[test]
 fn oci7_2377_unpack_is_unimplemented_off_linux_and_creates_nothing() {
     let base = TmpDir::new("nonlinux");
@@ -325,4 +360,19 @@ fn oci7_2377_unpack_is_unimplemented_off_linux_and_creates_nothing() {
     assert_eq!(e.code(), ErrorCode::Unimplemented);
     assert_eq!(refs_of(&image.store, &seeded.manifest), 0);
     assert_eq!(leftover_staging(&bundle), Vec::<String>::new());
+}
+
+/// Windows では `ImageStore::open` 自体が `Unimplemented` で拒否するため、展開器つきの create に到達する前に
+/// ストアを開けない（入口の拒否契約。OCI-7・3 OS 対応）。
+#[cfg(not(unix))]
+#[test]
+fn oci7_2377_image_store_open_is_unimplemented_on_non_unix() {
+    let base = TmpDir::new("windows");
+    let root = base.0.join("images");
+    std::fs::create_dir_all(root.join("blobs").join("sha256")).expect("images");
+    let e = ImageStore::open(&root).expect_err("must fail");
+    assert_eq!(
+        e.code(),
+        fandhe_container_oci::error::OciErrorCode::Unimplemented
+    );
 }

@@ -13,8 +13,9 @@
 //! 1. `ImageManifestDigest` を oci の `Digest` にする
 //! 2. [`ImageStore::image_layers`] で下位から順のレイヤー（blob・mediaType・diff_id）を引く。ストアの排他は
 //!    この呼び出しの内側で取って返す前に解放する（展開の全体にわたって保持しない。REPAIR-5）
-//! 3. 各 blob を [`ImageStore::open_verified_layer`] で fd 起点に開き、同じハンドルで信頼条件・digest・サイズを確かめる。
-//!    合計サイズが [`MAX_IMAGE_BYTES`] を超えたら展開の前に `ResourceExhausted`
+//! 3. 各 blob を [`ImageStore::open_verified_layer_bounded`] で fd 起点に開く。残りの許容サイズ（[`MAX_IMAGE_BYTES`] から
+//!    ここまでの合計を引いた値）を渡し、同じハンドルの fstat のサイズが超えていれば blob を読む前に `ResourceExhausted`。
+//!    超えなければ同じハンドルで信頼条件・digest・サイズを確かめる
 //! 4. 展開先の `/proc/self/fd/N` を [`ExtractRoot::open_proc_fd_link`] で開く（core の契約どおり最後の要素の symlink を辿り、
 //!    以降は fd 起点・リンク非追従）
 //! 5. `extract_image_layers_bounded_in` で重ねて展開する。展開後 tar の sha256 を `diff_ids` と突合し、期限
@@ -35,8 +36,6 @@
 //!   `ImageRootfsPrivilege::SubordinateIds` の配線は未実装（#482・#2792）。subuid 範囲の写像が要るイメージ
 //!   （root 以外の所有者を持つ層）を、イメージ由来の所有者のまま展開する経路は無い
 //! - overlay の下位層による展開の省略は未実装（`mount(2)` の `unsafe` が要る。create ごとに展開のコストがかかる）
-//! - oci の `OciOpRecorder` による計装は未配線（`NoopOciOpRecorder`）。CLI の `OpRecorder` への橋渡し
-//!   （`oci_recorder::CliOciRecorder`）は `Arc<OpRecorder>` が要り、イメージつき create の `Runtime` は所有で持つため
 //! - 置き場所は暫定。#2315 の判断（`docs/design/image-store-adapter-placement.md` の論点 2。オーナー承認待ち）が出たら、
 //!   `image_refs::StoreImageRefs` と同じくこの module をそのまま移せる（外部へ公開する型は無い）
 //! - CRI・plugin 経由の create への配線は #2791
@@ -44,13 +43,13 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use fandhe_container_core::observability::OpRecorder;
 use fandhe_container_core::oci_runtime::{
     ImageManifestDigest, ImageRootfsUnpacked, ImageRootfsUnpacker,
 };
 use fandhe_container_core::traits::TraitError;
-use fandhe_container_oci::error::{OciError, OciErrorCode};
+use fandhe_container_oci::error::OciError;
 use fandhe_container_oci::image_management::ImageStore;
-use fandhe_container_oci::instrument::NoopOciOpRecorder;
 use fandhe_container_oci::layer::DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES;
 use fandhe_container_oci::layer::extract::{
     ExtractBudget, ExtractLimits, ExtractOptions, ExtractRoot, ImageLayer,
@@ -59,6 +58,7 @@ use fandhe_container_oci::layer::extract::{
 use fandhe_container_oci::reference::Digest;
 
 use super::image::{Stage, trait_failure};
+use super::oci_recorder::BorrowedOciRecorder;
 
 /// 圧縮 blob の合計サイズの上限（cri の `DEFAULT_MAX_IMAGE_BYTES` と同値の 16 GiB）。
 pub(super) const MAX_IMAGE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
@@ -67,13 +67,19 @@ pub(super) const MAX_IMAGE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 pub(super) const UNPACK_DEADLINE: Duration = Duration::from_secs(10 * 60);
 
 /// `ImageStore` を借りて `ImageRootfsUnpacker` を満たすアダプタ。
+///
+/// 展開・検証の計装は借りた `OpRecorder` へ `oci.*` の名前で記録する（REPAIR-4）。
 pub(super) struct StoreImageRootfsUnpacker<'a> {
     store: &'a ImageStore,
+    recorder: BorrowedOciRecorder<'a>,
 }
 
 impl<'a> StoreImageRootfsUnpacker<'a> {
-    pub(super) fn new(store: &'a ImageStore) -> Self {
-        Self { store }
+    pub(super) fn new(store: &'a ImageStore, recorder: &'a OpRecorder) -> Self {
+        Self {
+            store,
+            recorder: BorrowedOciRecorder::new(recorder),
+        }
     }
 
     fn unpack_inner(
@@ -87,14 +93,12 @@ impl<'a> StoreImageRootfsUnpacker<'a> {
         let mut total: u64 = 0;
         let mut verified = Vec::with_capacity(layers.layers().len());
         for layer in layers.layers() {
-            let blob = self.store.open_verified_layer(layer)?;
+            // 残りの許容サイズを渡し、上限超過の blob は読む前に拒否する。
+            let remaining = MAX_IMAGE_BYTES.saturating_sub(total);
+            let blob = self
+                .store
+                .open_verified_layer_bounded(&self.recorder, layer, remaining)?;
             total = total.saturating_add(blob.size());
-            if total > MAX_IMAGE_BYTES {
-                return Err(OciError::new(
-                    OciErrorCode::ResourceExhausted,
-                    "image layers exceed the size limit",
-                ));
-            }
             verified.push(blob);
         }
         let root = ExtractRoot::open_proc_fd_link(rootfs)?;
@@ -108,7 +112,7 @@ impl<'a> StoreImageRootfsUnpacker<'a> {
             budget = budget.with_deadline(deadline);
         }
         let extracted = extract_image_layers_bounded_in(
-            &NoopOciOpRecorder,
+            &self.recorder,
             &image_layers,
             &root,
             DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES,

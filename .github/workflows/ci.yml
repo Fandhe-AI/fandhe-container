@@ -119,6 +119,13 @@ on:
           （REPAIR-12・#2962）
         type: string
         default: ''
+      repeat-info-prefix:
+        description: >-
+          成功した回の stdout・stderr から、この固定文字列で始まる行を `info: run i/N <行>` として残す
+          （1 回 16 行・1 行 512 バイトまで。許可文字は repeat-success-line と同じ。
+          例 `audit_sink_isolation: record_until`。REPAIR-12・#4548）
+        type: string
+        default: ''
       repeat-test-ignored:
         description: true にすると repeat-test-bin を -- --ignored 付きで実行する
         type: boolean
@@ -668,6 +675,7 @@ jobs:
           SUCCESS_LINE: ${{ inputs.repeat-success-line }}
           LIBTEST_NAME: ${{ inputs.repeat-libtest-name }}
           FORBIDDEN_LINE: ${{ inputs.repeat-forbidden-line }}
+          INFO_PREFIX: ${{ inputs.repeat-info-prefix }}
           TEST_IGNORED: ${{ inputs.repeat-test-ignored && '1' || '' }}
           FEATURES: ${{ inputs.repeat-features }}
           COUNT: ${{ inputs.repeat-count }}
@@ -1969,6 +1977,7 @@ jobs:
           SUCCESS_LINE: ${{ inputs.repeat-success-line }}
           LIBTEST_NAME: ${{ inputs.repeat-libtest-name }}
           FORBIDDEN_LINE: ${{ inputs.repeat-forbidden-line }}
+          INFO_PREFIX: ${{ inputs.repeat-info-prefix }}
           TEST_IGNORED: ${{ inputs.repeat-test-ignored && '1' || '' }}
           FEATURES: ${{ inputs.repeat-features }}
           COUNT: ${{ inputs.repeat-count }}

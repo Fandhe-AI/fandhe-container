@@ -55,6 +55,12 @@
 #            全体 1024 文字以下。許可文字は SUCCESS_LINE と同じ。ただし `|` は区切り）。stdout・stderr・ログファイルの
 #            いずれかに部分一致（grep -F）した回は、成功行が出ていても失敗に数える（reason=forbidden-line）。
 #            SUCCESS_LINE や `ok <LIBTEST_NAME>` と同一の要素は設定の誤りとして拒否する
+#   INFO_PREFIX  任意（全モード）。成功した回の stdout・stderr から、この固定文字列で始まる行を `info: run i/N <行>` として
+#            残す（許容差を実測の分布で決める試験の値の採取。#4548・REPAIR-12）。許可文字は SUCCESS_LINE と同じ（`;` 可）、
+#            1〜512 文字。1 回あたり 16 行・1 行 512 バイトまで（超過は `info: run i/N info_lines_dropped=<件数>`）。
+#            lib・LIBTEST_NAME では成功した試験の出力もキャプチャされないよう `--no-capture` を付ける。失敗した回は
+#            既存のダンプに全文が出るので残さない。未指定時は出力を 1 行も増やさない。
+#            集計例: `grep -o 'overshoot_ms=[0-9]*' <log> | cut -d= -f2 | sort -n`
 #   TEST_IGNORED  TEST_BIN のみ任意。1 で `-- --ignored` を付ける
 #   USER_SCOPE   TEST_BIN のみ任意。1 で委譲スコープモード（上記）。TEST との併用は不可
 #   TEST_ENV     任意。試験の子プロセスにだけ渡す `NAME=VALUE` の空白区切り（8 個以下・全体 512 文字以下）。
@@ -80,7 +86,7 @@ source "${DIR}/../lib.sh"
 usage() {
   echo "usage: make repeat-test PACKAGE=fandhe-container-<name> TEST=<module::path::test> [FEATURES=<a,b>] [COUNT=300] [RUN_TIMEOUT=120]" >&2
   echo "       make repeat-test PACKAGE=fandhe-container-<name> TEST_BIN=<name> (SUCCESS_LINE=<line> | LIBTEST_NAME=<name>) [TEST_IGNORED=1] [USER_SCOPE=1] [TEST_ENV='FANDHE_CONTAINER_X=1 ...'] [FEATURES=<a,b>] [COUNT=300] [RUN_TIMEOUT=120]" >&2
-  echo "       (any mode) [FORBIDDEN_LINE='a|b']" >&2
+  echo "       (any mode) [FORBIDDEN_LINE='a|b'] [INFO_PREFIX=<prefix>]" >&2
   exit 2
 }
 
@@ -90,6 +96,7 @@ TEST_BIN="${TEST_BIN:-}"
 SUCCESS_LINE="${SUCCESS_LINE:-}"
 LIBTEST_NAME="${LIBTEST_NAME:-}"
 FORBIDDEN_LINE="${FORBIDDEN_LINE:-}"
+INFO_PREFIX="${INFO_PREFIX:-}"
 TEST_IGNORED="${TEST_IGNORED:-}"
 USER_SCOPE="${USER_SCOPE:-}"
 TEST_ENV="${TEST_ENV:-}"
@@ -137,6 +144,11 @@ if [ -n "${FORBIDDEN_LINE}" ]; then
     [ -z "${LIBTEST_NAME}" ] || [ "${item}" != "ok ${LIBTEST_NAME}" ] || usage
     [ -z "${TEST}" ] || [ "${item}" != "ok ${TEST}" ] || usage
   done
+fi
+# INFO_PREFIX: awk の index() の固定文字列オペランドにだけ使う（ENVIRON 経由。正規表現・シェル解釈・cargo の引数には使わない）。
+if [ -n "${INFO_PREFIX}" ]; then
+  [ "${#INFO_PREFIX}" -le 512 ] || usage
+  case "${INFO_PREFIX}" in *[!A-Za-z0-9\ _:.,\;\(\)=/+-]*) usage ;; esac
 fi
 # 後方互換: libtest の結果行を SUCCESS_LINE に渡すと並列出力の割り込みで偽の失敗になりうる（#2962）。拒否はせず警告する。
 libtest_line_re='^test [^ ]+ \.\.\. ok$'
@@ -199,7 +211,8 @@ if [ -n "${TEST}" ] || [ -n "${LIBTEST_NAME}" ]; then
   LOGARGS=(--logfile "${log_arg}")
   # 成功した試験の println!/eprintln! は既定でキャプチャされ、禁止行の照合に届かない。FORBIDDEN_LINE 指定時は
   # --no-capture で出力を stdout/stderr へ流す（lib・LIBTEST_NAME・USER_SCOPE のすべてで LOGARGS が `--` 以降に渡る。P1）。
-  if [ "${#FORBIDDEN_ITEMS[@]}" -gt 0 ]; then LOGARGS+=(--no-capture); fi
+  # INFO_PREFIX 指定時も同じ理由で必要（#4548）。2 条件のどちらでも 1 回だけ足す。
+  if [ "${#FORBIDDEN_ITEMS[@]}" -gt 0 ] || [ -n "${INFO_PREFIX}" ]; then LOGARGS+=(--no-capture); fi
 fi
 
 # ビルドは 1 回だけ（以降は同じバイナリを繰り返す）。結合試験の名前誤り・required-features 不足もここで落ちる。
@@ -327,6 +340,17 @@ forbidden_hit() {
   return 1
 }
 
+# 成功した回の情報行を残す（INFO_PREFIX。#4548）。行頭の固定文字列一致のみ・2 本合計 16 行・1 行 512 バイト。
+# `| head` は使わず awk 内で数える（上流の SIGPIPE を pipefail が失敗にするのを避ける）。
+# `info: run i/N ` を前置するので、試験の出力が行頭の `::` でワークフローコマンドになることはない。
+emit_info_lines() {
+  { crless "${out_o}"; crless "${out_e}"; } | INFO_PREFIX="${INFO_PREFIX}" LC_ALL=C awk -v max=16 -v width=512 -v tag="info: run $1/$2" '
+    BEGIN { p = ENVIRON["INFO_PREFIX"]; n = 0; drop = 0 }
+    index($0, p) == 1 { if (n < max) { n++; print tag " " substr($0, 1, width) } else { drop++ } }
+    END { if (drop > 0) print tag " info_lines_dropped=" drop }
+  '
+}
+
 passed=0
 failed=0
 i=1
@@ -351,6 +375,7 @@ while [ "${i}" -le "${COUNT}" ]; do
   fi
   if [ -z "${reason}" ]; then
     passed=$((passed + 1))
+    [ -z "${INFO_PREFIX}" ] || emit_info_lines "${i}" "${COUNT}"
   else
     failed=$((failed + 1))
     echo "FAIL: run ${i}/${COUNT} rc=${rc} reason=${reason}" >&2

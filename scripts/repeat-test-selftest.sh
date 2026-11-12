@@ -451,6 +451,72 @@ deadline_case deadline-cap-3600 3600 1 "" "${P}" "${B}" "${S}" COUNT=1 RUN_TIMEO
 deadline_case deadline-overrides-caller 150 1 off "${P}" "${B}" "${S}" COUNT=1
 deadline_case deadline-lib-mode 150 1 "" "${P}" "${T}" COUNT=1
 check deadline-scope-mode 0 "passed=1 failed=0" scope-ok "${P}" "${B}" "SUCCESS_LINE=deadline-seen: 150" "${SB}" USER_SCOPE=1 COUNT=1
+# --- INFO_PREFIX: 成功した回の情報行を残す（#4548）---
+# count_lines <名前> <期待rc> <stdout の中で数える固定文字列（部分一致）> <期待件数> <STUB_MODE> <env...>
+count_lines() {
+  local name="$1" want_rc="$2" needle="$3" want_n="$4" mode="$5"
+  shift 5
+  rm -f "${work}/counter"
+  local out rc=0 n
+  out="$(env PATH="${work}/bin:${PATH}" STUB_MODE="${mode}" STUB_COUNTER="${work}/counter" "$@" "${target}" 2>/dev/null)" || rc=$?
+  n="$(printf '%s\n' "${out}" | grep -cF -- "${needle}" || true)"
+  if [ "${rc}" -eq "${want_rc}" ] && [ "${n}" -eq "${want_n}" ]; then
+    echo "OK: ${name}"
+  else
+    echo "NG: ${name}: rc=${rc} (want ${want_rc}) count=${n} (want ${want_n})" >&2
+    printf '%s\n' "${out}" >&2
+    fails=$((fails + 1))
+  fi
+}
+IP="INFO_PREFIX=x: overshoot_ms="
+OUT_X='exec_x: all scenarios passed\nx: overshoot_ms=12 slack_ms=1500\n'
+count_lines info-run1 0 "info: run 1/3 x: overshoot_ms=12 slack_ms=1500" 1 gen "${P}" "${B}" "${S}" "${IP}" "STUB_STDOUT=${OUT_X}" COUNT=3
+count_lines info-run3 0 "info: run 3/3 x: overshoot_ms=12 slack_ms=1500" 1 gen "${P}" "${B}" "${S}" "${IP}" "STUB_STDOUT=${OUT_X}" COUNT=3
+count_lines info-total 0 "info: run " 3 gen "${P}" "${B}" "${S}" "${IP}" "STUB_STDOUT=${OUT_X}" COUNT=3
+count_lines info-stderr 0 "info: run 1/1 x: overshoot_ms=7" 1 gen "${P}" "${B}" "${S}" "${IP}" 'STUB_STDOUT=exec_x: all scenarios passed\n' 'STUB_STDERR=x: overshoot_ms=7\n' COUNT=1
+count_lines info-not-midline 0 "info: run " 0 gen "${P}" "${B}" "${S}" "${IP}" 'STUB_STDOUT=exec_x: all scenarios passed\nyy x: overshoot_ms=1\n' COUNT=1
+count_lines info-crlf 0 "info: run 1/1 x: overshoot_ms=5" 1 gen "${P}" "${B}" "${S}" "${IP}" 'STUB_STDOUT=exec_x: all scenarios passed\r\nx: overshoot_ms=5\r\n' COUNT=1
+# 上限: 20 行のうち 16 行だけ残し、捨てた 4 件を数える。
+LINES20="$(for n in $(seq 1 20); do printf 'x: overshoot_ms=%s\\n' "${n}"; done)"
+count_lines info-cap-16 0 "info: run 1/1 x: overshoot_ms=" 16 gen "${P}" "${B}" "${S}" "${IP}" "STUB_STDOUT=exec_x: all scenarios passed\\n${LINES20}" COUNT=1
+count_lines info-cap-dropped 0 "info: run 1/1 info_lines_dropped=4" 1 gen "${P}" "${B}" "${S}" "${IP}" "STUB_STDOUT=exec_x: all scenarios passed\\n${LINES20}" COUNT=1
+count_lines info-cap-17th-absent 0 "x: overshoot_ms=17" 0 gen "${P}" "${B}" "${S}" "${IP}" "STUB_STDOUT=exec_x: all scenarios passed\\n${LINES20}" COUNT=1
+# 1 行 512 バイトで切り詰める（接頭辞 12 文字 + 600 文字 → "info: run 1/1 " の後ろが 512 文字）。
+LONG600="$(printf 'z%.0s' $(seq 1 600))"
+count_lines info-truncate-512 0 "info: run 1/1 x: overshoot_ms=$(printf 'z%.0s' $(seq 1 $((512 - 16))))" 1 gen "${P}" "${B}" "${S}" "${IP}" "STUB_STDOUT=exec_x: all scenarios passed\\nx: overshoot_ms=${LONG600}\\n" COUNT=1
+count_lines info-truncate-not-513 0 "x: overshoot_ms=$(printf 'z%.0s' $(seq 1 $((513 - 16))))" 0 gen "${P}" "${B}" "${S}" "${IP}" "STUB_STDOUT=exec_x: all scenarios passed\\nx: overshoot_ms=${LONG600}\\n" COUNT=1
+# 失敗した回は情報行を残さない（2 回目だけ失敗）。
+count_lines info-failed-run-silent 1 "info: run 2/" 0 bin-fail2 "${P}" "${B}" "${S}" "${IP}" COUNT=3
+# 未指定時は info: run 行も --no-capture も出ない。
+count_lines info-unset-silent 0 "info: run " 0 gen "${P}" "${B}" "${S}" 'STUB_STDOUT=exec_x: all scenarios passed\nx: overshoot_ms=1\n' COUNT=2
+rm -f "${work}/args" "${work}/counter"
+env PATH="${work}/bin:${PATH}" STUB_MODE=gen STUB_LOG='ok sec1_x\n' STUB_COUNTER="${work}/counter" STUB_ARGS_LOG="${work}/args" \
+  "${P}" "${B}" "${LN}" COUNT=1 "${target}" >/dev/null 2>&1
+if ! grep -qF -- "--no-capture" "${work}/args"; then echo "OK: info-unset-no-capture-absent"; else echo "NG: info-unset-no-capture-absent" >&2; fails=$((fails + 1)); fi
+# libtest モード: INFO_PREFIX で --no-capture が 1 回だけ付き、キャプチャされない行が残る。FORBIDDEN_LINE との併用でも 1 回。
+count_lines info-libtest-name 0 "info: run 1/1 x: overshoot_ms=3" 1 gen "${P}" "${B}" "${LN}" "${IP}" 'STUB_NC_STDOUT=x: overshoot_ms=3\n' 'STUB_LOG=ok sec1_x\n' COUNT=1
+count_lines info-lib 0 "info: run 1/1 x: overshoot_ms=3" 1 gen "${P}" "${T}" "${IP}" 'STUB_NC_STDOUT=x: overshoot_ms=3\n' 'STUB_LOG=ok a::b::c\n' COUNT=1
+rm -f "${work}/args" "${work}/counter"
+env PATH="${work}/bin:${PATH}" STUB_MODE=gen STUB_LOG='ok sec1_x\n' STUB_COUNTER="${work}/counter" STUB_ARGS_LOG="${work}/args" \
+  "${P}" "${B}" "${LN}" "${IP}" "FORBIDDEN_LINE=zzz" COUNT=1 "${target}" >/dev/null 2>&1
+if [ "$(grep -o -- '--no-capture' "${work}/args" | wc -l | tr -d ' ')" -eq 2 ] && ! grep -qE -- '--no-capture.*--no-capture' "${work}/args" ; then
+  echo "OK: info-no-capture-once-per-invocation"
+else
+  # preflight(--list) と本番で 2 行に 1 回ずつなら行数 = 1。ここでは 1 行に 2 回出ないことだけを見る。
+  if ! grep -qE -- '--no-capture.*--no-capture' "${work}/args"; then echo "OK: info-no-capture-once-per-invocation"; else echo "NG: info-no-capture-once-per-invocation" >&2; cat "${work}/args" >&2; fails=$((fails + 1)); fi
+fi
+# USER_SCOPE。
+count_lines info-scope 0 "info: run 1/1 x: overshoot_ms=4" 1 scope-gen "${P}" "${B}" "${LN}" "${SB}" USER_SCOPE=1 "${IP}" 'STUB_NC_STDOUT=x: overshoot_ms=4\n' 'STUB_LOG=ok sec1_x\n' COUNT=1
+# 入力不正。
+# shellcheck disable=SC2016
+check info-bad-dollar 2 "usage:" ok "${P}" "${T}" 'INFO_PREFIX=a$b'
+# shellcheck disable=SC2016
+check info-bad-backtick 2 "usage:" ok "${P}" "${T}" 'INFO_PREFIX=a`b'
+check info-bad-star 2 "usage:" ok "${P}" "${T}" 'INFO_PREFIX=a*b'
+check info-bad-pipe 2 "usage:" ok "${P}" "${T}" 'INFO_PREFIX=a|b'
+check info-bad-quote 2 "usage:" ok "${P}" "${T}" 'INFO_PREFIX=a"b'
+check info-513 2 "usage:" ok "${P}" "${T}" "INFO_PREFIX=$(printf 'a%.0s' $(seq 1 513))"
+check info-512-accepted 0 "passed=1 failed=0" ok "${P}" "${T}" "INFO_PREFIX=$(printf 'a%.0s' $(seq 1 512))" COUNT=1
 check count-zero 2 "usage:" ok "${P}" "${T}" COUNT=0
 check count-over 2 "usage:" ok "${P}" "${T}" COUNT=1001
 

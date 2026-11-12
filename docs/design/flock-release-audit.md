@@ -49,9 +49,58 @@
 | plugin `sys.rs` | listener のロック | (b) | あり | - | 無害（fork した子も listener を持つので、ロック保持と listener 生存の対応が崩れない設計。`sys.rs` 1592 行付近の doc） |
 | core `oci_runtime/image_rootfs.rs` の `#[cfg(test)]`（`oci7_lock_held_by_other_is_reported_as_alive_not_deleted`） | 素の `File`（試験の保持者） | (a)（#4541 で `File::unlock`） | あり（core の lib 試験バイナリの他の試験が `sys::fork_single_threaded*`・`Command::spawn` を行う） | 待たない再取得（`kept_alive` に倒れる） | 修正済み（#4541。試験の保持者を明示 unlock。製品の誤判定ではなかった） |
 
+## 複製の一致の照合（#4532 の判断・#4566）
+
+`ExplicitUnlockFile` は core・oci・cri・plugin-cri・supervisor・net の 6 か所に別々に置かれている（OCI-5・CORE-2・REPAIR-1・REPAIR-5）。片方だけ直す漏れを防ぐ方式は、#4532 の 2026-11-12 のオーナーコメントで案 C に決まった。
+
+### 結論
+
+- 複製は残す。新しい crate も Cargo の依存の辺も足さない。
+- 本体の振る舞いの一致は、共有の試験ケースで照合する。ケースは `crates/core/tests/support/flock_release_cases.rs`（群 A）と `flock_release_with_cases.rs`（群 B）に置き、各 crate の `lib.rs` が `#[path]` で `#[cfg(test)]` のモジュールとして取り込む。試験専用で製品バイナリ・rlib には入らない。
+- 新しく書く試験コードのロックも、その crate の `ExplicitUnlockFile` を使う。
+
+### 採らない案
+
+| 案 | 理由 |
+| -- | ---- |
+| A1: core に `pub` で集約 | oci・net が参加できない。`oci → core`・`net → core` の製品の辺が新設になり、net の「core に依存しない」と食い違う。core の変更が PLUG-4 の判定に響くおそれもある |
+| A2: cri から plugin-cri へ | 減るのは 1 か所だけで、cri の責務の外の部品を公開することになる |
+| A3: io に置く | 6 本の新しい辺が要り、io の責務の外（fdinfo の前例でも不可とした） |
+| B: 新しい下位 crate | 約 50 行の部品に対し、crate 境界の変更と CI・`deny`・`about` の対象の追加が重い |
+
+### 照合の方式
+
+| 群 | 内容 | 参加する crate | 件数 |
+| -- | ---- | -------------- | ---- |
+| A | `new` と `Drop`（陽性対照・`new` が生きている間は保持・複製 fd が残っても `Drop` で外れる） | 6 crate すべて | 3 件 × 6 |
+| B | `release_lock_file_with`（unlock は close の前に 1 回・失敗しても close）と `release_lock_file`（実際に unlock） | net 以外の 5 crate | 3 件 × 5 |
+
+- 試験名は `repair1_oci5_4566_*`。件数は `cargo test -p <パッケージ名> --lib flock_release_cases -- --list`（群 A）と `flock_release_with_cases -- --list`（群 B）で確かめる。
+- 一時ディレクトリの作り方は crate ごとに違うため、各 `flock_release.rs` が試験専用の `shared_case_dir(tag)` を持つ（共有ファイルの外）。
+- 規則を変えるときは、共有ケースと 6 か所を同じ PR で直す。
+
+### 許容する差（共有ケースの外）
+
+- core の `ExplicitUnlockFile` は `cfg(target_os = "linux")`。
+- supervisor の `as_file()`。
+- oci・supervisor の `LockRelease` の `allow(dead_code)`。
+- 試験用補助 `clone_file_for_test` の cfg と戻り値（net は `Result`）。
+- net は形が違う。`Deref`/`DerefMut`、名前つきフィールド、その場で unlock する `Drop` を持ち、製品に `release_lock_file_with`・`LockRelease` が無い（`cfg(all(test, unix))` の `release_with` は試験専用）。そのため群 A だけに参加する。
+
+### 残余
+
+- net を他の 5 crate の形（`Option<File>`・`release_lock_file*`）へ寄せるかは未判断。オーナー判断の候補とする。
+- net の試験専用 `release_with` と、その試験 `oci5_repair5_4514_release_continues_close_when_unlock_fails` の整理の要否。
+
+### 再評価の条件
+
+- 7 つ目の複製が現れたとき。
+- 複数の crate で同じ修正が要る不具合が出たとき。
+- 下位 crate の新設が別の理由で承認されたとき。
+
 ## 試験コード
 
-対象は `tests/`・`src/**/tests.rs`・`#[cfg(test)]` の素の `File` のロック。判定の単位は**試験バイナリ**（判定基準 2 のホストプロセス単位）で、lib 試験なら crate 全体の `#[cfg(test)]` と、そこから届く製品経路の fork・spawn を数える。「そのファイルに spawn が無い」は理由にしない。並列の試験の fork で解放が遅れうるため、新しく書く試験は `ExplicitUnlockFile` か `File::unlock` を使う（#3292・#3420 の流儀）。
+対象は `tests/`・`src/**/tests.rs`・`#[cfg(test)]` の素の `File` のロック。判定の単位は**試験バイナリ**（判定基準 2 のホストプロセス単位）で、lib 試験なら crate 全体の `#[cfg(test)]` と、そこから届く製品経路の fork・spawn を数える。「そのファイルに spawn が無い」は理由にしない。並列の試験の fork で解放が遅れうるため、新しく書く試験コードのロックも、その crate の `ExplicitUnlockFile` を使う（#4532 の判断 3。#3292・#3420 の流儀）。
 
 次のいずれかに当たるものは表に載せない（確認日: #4535 実装時）。共通の理由は、影響が試験プロセスの中に閉じ、製品の `Alive` / 拒否の誤判定につながらない（起こりうるのは試験の間欠失敗だけ）こと。
 

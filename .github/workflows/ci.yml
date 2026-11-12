@@ -168,13 +168,14 @@ on:
         default: ''
       repeat-run-timeout:
         description: >-
-          repeat-user-scope=true のときの 1 回あたりの上限秒（1〜3600。既定 600。production_launcher は 1 回に
-          CI 上で最大 10 分の予算を使うため、既定の 120 秒では reason=timeout で打ち切られる。#2886）。
-          ステップ全体は 55 分で打ち切られる（ジョブ上限は repeat-user-scope の dispatch の ubuntu が 90 分。
-          ステップの開始はジョブ開始から約 20〜25 分。#3528）ため、遅い試験は repeat-count × 1 回の所要秒が
-          ビルド秒を除く 55 分に収まるよう repeat-count を分けて dispatch する
+          すべての繰り返しのステップで効く 1 回あたりの上限秒（1〜3600。#4565）。空（未指定）のときは通常の
+          ステップがスクリプト既定の 120 秒、repeat-user-scope=true のステップが 600 秒（production_launcher は
+          1 回に CI 上で最大 10 分の予算を使うため。#2886）。通常のステップは 30 分、委譲スコープのステップは
+          55 分で打ち切られる（ジョブ上限は repeat-user-scope の dispatch の ubuntu が 90 分。ステップの開始は
+          ジョブ開始から約 20〜25 分。#3528）ため、遅い試験は repeat-count × 1 回の所要秒がビルド秒を除く
+          その範囲に収まるよう repeat-count を分けて dispatch する
         type: string
-        default: '600'
+        default: ''
       repeat-parallel:
         description: >-
           true にすると libtest の並列度を保ったまま繰り返す（`--exact` も `--test-threads` も付けない。
@@ -711,6 +712,8 @@ jobs:
           FILTER: ${{ inputs.repeat-filter }}
           FEATURES: ${{ inputs.repeat-features }}
           COUNT: ${{ inputs.repeat-count }}
+          # 空ならスクリプト既定の 120 秒（#4565）。値の範囲検査はスクリプト側。
+          RUN_TIMEOUT: ${{ inputs.repeat-run-timeout }}
         run: make repeat-test
       # 上の cargo doc と下の 2 ステップは、hang-probe 時にハング検出のステップへ早く着くよう check-launch-target・
       # 自己テスト群と同じく HANG_PROBE で飛ばす（ステージ 1・2 の build / clippy / test は従来どおり無条件。#2533）。
@@ -2015,7 +2018,8 @@ jobs:
           FEATURES: ${{ inputs.repeat-features }}
           COUNT: ${{ inputs.repeat-count }}
           TEST_ENV: ${{ inputs.repeat-env }}
-          RUN_TIMEOUT: ${{ inputs.repeat-run-timeout }}
+          # 入力の既定を空にしたため、未指定でも委譲スコープでは従来の 600 秒を保つ（#4565）。
+          RUN_TIMEOUT: ${{ inputs.repeat-run-timeout || '600' }}
           USER_SCOPE: '1'
         run: make repeat-test
 

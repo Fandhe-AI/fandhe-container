@@ -48,7 +48,9 @@ use std::time::{Duration, Instant};
 pub use error::{Cause, SessionError, SessionErrorCode};
 
 use crate::adapter::{CtrlAdapter, ShmemOp, ShmemOpKind, Submit3d};
-use crate::ctrl::{CtrlResponse, RESP_ERR_INVALID_PARAMETER};
+use crate::ctrl::{
+    CMD_CTX_DESTROY, CtrlHeader, CtrlResponse, RESP_ERR_INVALID_PARAMETER, RESP_OK_NODATA,
+};
 use crate::device;
 use crate::log::{self, QueryResult};
 use crate::resource::MAX_RESOURCES;
@@ -164,6 +166,10 @@ pub trait SessionHooks {
         _sink: &mut dyn FnMut(&str),
     ) {
     }
+    /// 成功した `CTX_DESTROY` の応答を used ring へ公開する**前**に呼ぶ（応答を捨てる要求は呼ばない）。
+    /// ゲストが `DestroyRingMESA` なしに context を破棄しても、その ctx のリング登録を解放して ID の再利用に備える（#1884）。
+    fn on_ctx_destroy(&mut self, _ctx_id: u32, _blobs: &dyn BlobRead, _sink: &mut dyn FnMut(&str)) {
+    }
     /// ctrl の kick を 1 回処理して `SUBMIT_3D` を 1 件以上受理し、call で通知した**後**に呼ぶ。
     /// `blobs` は保持中の blob の読み取り口（リングの中身を `read_exact_at` で読む）。
     fn after_notify(&mut self, _blobs: &dyn BlobRead, _sink: &mut dyn FnMut(&str)) {}
@@ -196,6 +202,9 @@ impl<W: std::io::Write> SessionHooks for RecordingHooks<W> {
         sink: &mut dyn FnMut(&str),
     ) {
         RecordingHooks::before_response(self, submit, blobs, sink);
+    }
+    fn on_ctx_destroy(&mut self, ctx_id: u32, blobs: &dyn BlobRead, sink: &mut dyn FnMut(&str)) {
+        RecordingHooks::release_context(self, ctx_id, blobs, sink);
     }
     fn after_notify(&mut self, blobs: &dyn BlobRead, sink: &mut dyn FnMut(&str)) {
         self.snapshot_all(blobs, sink);
@@ -412,6 +421,8 @@ struct Processed {
     response: CtrlResponse,
     log_line: String,
     submit: Option<Submit3d>,
+    /// 成功した `CTX_DESTROY` の ctx_id（それ以外は `None`）。
+    ctx_destroyed: Option<u32>,
     /// frontend へ渡した map / unmap があったか（あれば応答の書き戻し失敗は巻き戻せない）。
     had_shmem: bool,
     /// 応答を書き戻せない要求として捨てる（adapter は巻き戻し済み）。
@@ -831,6 +842,9 @@ impl Session {
             if let (false, Some(s)) = (dropped, &p.submit) {
                 hooks.before_response(s, &self.blobs, sink);
             }
+            if let (false, Some(ctx_id)) = (dropped, p.ctx_destroyed) {
+                hooks.on_ctx_destroy(ctx_id, &self.blobs, sink);
+            }
             ring.queue.add_used(mem, chain, len).map_err(vq)?;
             // 応答が確定した（巻き戻しが無い）ので、`UNREF` 済み resource の実メモリをここで閉じる。
             if !dropped {
@@ -881,12 +895,16 @@ impl Session {
                 response: CtrlResponse::new(None, RESP_ERR_INVALID_PARAMETER, &[]),
                 log_line: log::rejected_line(None, QueryResult::InvalidParameter),
                 submit: None,
+                ctx_destroyed: None,
                 had_shmem: false,
                 dropped: false,
                 adapter_before,
             };
         };
         let h = self.adapter.handle_ctrl(req);
+        let ctx_destroyed = CtrlHeader::parse(req)
+            .filter(|c| c.cmd_type == CMD_CTX_DESTROY && h.response.resp_type() == RESP_OK_NODATA)
+            .map(|c| c.ctx_id);
         let Some(op) = h.shmem else {
             // `h.submit`（受理した SUBMIT_3D の受け渡し点）は、応答を書き戻せた場合だけフックへ渡す
             // （`dropped` で adapter を巻き戻した要求の提出は、ゲストが ACK を見ていないので捨てる。#1602）。
@@ -894,6 +912,7 @@ impl Session {
                 response: h.response,
                 log_line: h.log_line,
                 submit: h.submit,
+                ctx_destroyed,
                 had_shmem: false,
                 dropped: false,
                 adapter_before,
@@ -906,6 +925,7 @@ impl Session {
                 response: h.response,
                 log_line: h.log_line,
                 submit: None,
+                ctx_destroyed: None,
                 had_shmem: false,
                 dropped: true,
                 adapter_before,
@@ -919,6 +939,7 @@ impl Session {
             response: op.response(result),
             log_line: op.log_line(result),
             submit: None,
+            ctx_destroyed: None,
             had_shmem: true,
             dropped: false,
             adapter_before,

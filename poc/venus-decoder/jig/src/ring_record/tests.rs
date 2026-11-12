@@ -466,3 +466,47 @@ fn gpu6_1884_destroy_then_blob_release_keeps_final_snapshot() {
     let p = payloads(h);
     assert_eq!(p.last().unwrap(), &vec![7, 8]);
 }
+
+/// GPU-6・REPAIR-12（#1884）: `DestroyRingMESA` なしの `CTX_DESTROY` でその ctx のリングを解放し、同じ ID を再登録でき、
+/// 古い登録が溜まって `table_full` にならない。
+#[test]
+fn gpu6_1884_ctx_destroy_without_destroy_ring_releases_rings() {
+    let mut blobs = FakeBlobs::with(5, 256);
+    let mut h = hooks();
+    let mut out = Vec::new();
+    h.on_submit(
+        &submit_ctx(1, create_payload(1, std_spec(), &[MON])),
+        &mut |l| out.push(l.to_string()),
+    );
+    blobs.put(5, 192, &[4, 5]);
+    blobs.put_u32(5, 64, 2);
+    // 他 ctx の破棄は影響しない。
+    h.release_context(2, &blobs, &mut |_| {});
+    h.release_context(1, &blobs, &mut |_| {});
+    // 最終読み取りは済み、表は空。
+    assert!(snap(&mut h, &blobs).is_empty());
+    // 同じ ctx_id・ring_id を再登録できる。
+    for _ in 0..(MAX_RINGS * 2) {
+        h.on_submit(
+            &submit_ctx(1, create_payload(1, std_spec(), &[MON])),
+            &mut |l| out.push(l.to_string()),
+        );
+        h.release_context(1, &blobs, &mut |_| {});
+    }
+    assert!(
+        out.iter()
+            .all(|l| !l.contains("duplicate_ring") && !l.contains("table_full")),
+        "{out:?}"
+    );
+    // ID を変えて ctx を作っては破棄しても table_full に達しない。
+    for ctx in 10..(10 + 2 * MAX_RINGS as u32) {
+        h.on_submit(
+            &submit_ctx(ctx, create_payload(ctx as u64, std_spec(), &[MON])),
+            &mut |l| out.push(l.to_string()),
+        );
+        h.release_context(ctx, &blobs, &mut |_| {});
+    }
+    assert!(out.iter().all(|l| !l.contains("table_full")), "{out:?}");
+    let p = payloads(h);
+    assert!(p.iter().any(|x| x == &vec![4, 5]));
+}

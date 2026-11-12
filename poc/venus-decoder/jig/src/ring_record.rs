@@ -414,6 +414,26 @@ impl<W: Write> RecordingHooks<W> {
         }
     }
 
+    /// 成功した `CTX_DESTROY` の応答の公開前に呼ぶ。その ctx のリングを最後に 1 回読んで表から外す。
+    ///
+    /// ゲストが `DestroyRingMESA` を出さずに context を破棄しても、同じ (ctx_id, ring_id) の再登録（`duplicate_ring`）や
+    /// 古い登録の滞留による `table_full` を起こさないための解放（adapter が ctx_id を再利用できる寿命に合わせる。#1884）。
+    pub fn release_context(
+        &mut self,
+        ctx_id: u32,
+        blobs: &dyn BlobRead,
+        sink: &mut dyn FnMut(&str),
+    ) {
+        for slot in self.rings.iter_mut() {
+            if slot.as_ref().is_some_and(|e| e.ctx_id == ctx_id) {
+                if let Some(entry) = slot.as_mut() {
+                    Self::snapshot_entry(&mut self.recorder, entry, blobs, sink);
+                }
+                *slot = None;
+            }
+        }
+    }
+
     fn snapshot_entry(
         recorder: &mut SubmitRecorder<W>,
         entry: &mut RingEntry,

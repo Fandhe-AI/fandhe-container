@@ -25,6 +25,16 @@
 # 取得・展開・ビルドは独立したプロセスグループで起動し、期限超過時はグループごと
 # TERM → 猶予後 KILL する（REPAIR-5）。
 #
+# ビルド識別情報の固定（#4590・MAC-1・REPAIR-3）: kbuild は既定でビルド環境の `whoami`・`uname -n`・
+# ビルド時刻を `Linux version ... (<user>@<host>) ... <時刻>` に埋め込む。この行はゲストの
+# コンソールログに出るため、public の issue へ貼ると環境の名前が漏れる。そこで中立の固定値
+# （KBUILD_BUILD_USER・KBUILD_BUILD_HOST・KBUILD_BUILD_TIMESTAMP）を make のコマンドライン変数として
+# 常に渡す。コマンドライン変数は環境変数より優先されるので、呼び出し元の環境の同名変数は効かない
+# （設定されていれば警告して無視する。値は出力しない）。上書き口は設けない。値を変えるときは
+# このスクリプトの定数を直す。値は kbuild が shell の二重引用符の中へ展開するため、
+# `"`・`$`・バッククォート・`\` を含めない。時刻は `date -d` で解釈できる文字列である必要がある。
+# macOS の BSD date では `usr/gen_initramfs.sh` の mtime 固定だけが効かない（UTS_VERSION は固定される）。
+#
 # 前提ツール: make・tar（xz 対応）・xz・curl（--tarball 無指定時）・sha256sum または shasum・
 #   gcc（aarch64 ネイティブまたはクロス）または clang/lld（--llvm）・flex・bison・bc・perl
 #
@@ -379,7 +389,13 @@ src="$extract_dir/$prefix"
 # --- 設定とビルド ---
 fragment="$script_dir/arm64-guest.config"
 [ -f "$fragment" ] || { err_code bad-environment "arm64-guest.config not found"; exit 2; }
-make_args=(-C "$src" ARCH=arm64)
+kbuild_user="fandhe-container"
+kbuild_host="build"
+kbuild_timestamp="1970-01-01 00:00:00 UTC"
+for v in KBUILD_BUILD_USER KBUILD_BUILD_HOST KBUILD_BUILD_TIMESTAMP; do
+    [ -z "${!v:-}" ] || info_msg "warning: ignoring $v from the environment; the build always uses a fixed neutral value"
+done
+make_args=(-C "$src" ARCH=arm64 "KBUILD_BUILD_USER=$kbuild_user" "KBUILD_BUILD_HOST=$kbuild_host" "KBUILD_BUILD_TIMESTAMP=$kbuild_timestamp")
 [ -z "$cross_compile" ] || make_args+=("CROSS_COMPILE=$cross_compile")
 [ "$use_llvm" -eq 0 ] || make_args+=("LLVM=1")
 
@@ -449,6 +465,9 @@ if ! {
     printf 'kernel_sha256=%s\n' "$lock_sha"
     printf 'toolchain=%s\n' "${tc_line:-unknown}"
     printf 'host=%s\n' "$host_os $host_arch"
+    printf 'kbuild_build_user=%s\n' "$kbuild_user"
+    printf 'kbuild_build_host=%s\n' "$kbuild_host"
+    printf 'kbuild_build_timestamp=%s\n' "$kbuild_timestamp"
     } >"$output_dir/.build-info.tmp" 2>/dev/null \
         && cp "$image" "$output_dir/.Image.tmp" 2>/dev/null \
         && cp "$src/.config" "$output_dir/.config.tmp" 2>/dev/null

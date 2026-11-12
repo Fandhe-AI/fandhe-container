@@ -64,6 +64,7 @@ TAB>echo called >> "$(CALL_MARK)"
 olddefconfig:
 TAB>@:
 Image:
+TAB>if [ -n "$(BUILD_ID_MARK)" ]; then printf 'user=%s\nhost=%s\ntimestamp=%s\norigin_user=%s\norigin_host=%s\norigin_timestamp=%s\nenv_user=%s\nenv_host=%s\nenv_timestamp=%s\n' '$(KBUILD_BUILD_USER)' '$(KBUILD_BUILD_HOST)' '$(KBUILD_BUILD_TIMESTAMP)' '$(origin KBUILD_BUILD_USER)' '$(origin KBUILD_BUILD_HOST)' '$(origin KBUILD_BUILD_TIMESTAMP)' "$$KBUILD_BUILD_USER" "$$KBUILD_BUILD_HOST" "$$KBUILD_BUILD_TIMESTAMP" > "$(BUILD_ID_MARK)"; fi
 TAB>mkdir -p arch/arm64/boot
 TAB>$(CROSS_COMPILE)gcc -o arch/arm64/boot/Image
 EOF
@@ -133,14 +134,38 @@ cc="$stubs/aarch64-stub-"
 
 # 1. 成功（取得経路・スタブ curl）
 out1="$sandbox/out1"
-run_build "${std_env[@]}" "CALL_MARK=$sandbox/calls" -- --output-dir "$out1" --cross-compile "$cc" --jobs 2
+run_build "${std_env[@]}" "CALL_MARK=$sandbox/calls" "BUILD_ID_MARK=$sandbox/build-id.1" -- --output-dir "$out1" --cross-compile "$cc" --jobs 2
 expect_eq "success: exit code" "0" "$(rc_of)"
 expect_eq "success: stdout" "$out1/Image" "$(cat "$sandbox/out.stdout")"
 expect_eq "success: Image content" "STUB-IMAGE-1" "$(cat "$out1/Image" 2>/dev/null)"
 [ -s "$out1/config" ] && ok || ng "success: config missing"
 expect_eq "success: build-info version" "kernel_version=$ver" "$(sed -n 1p "$out1/build-info.txt" 2>/dev/null)"
 expect_eq "success: build-info sha" "kernel_sha256=$good_sha" "$(sed -n 3p "$out1/build-info.txt" 2>/dev/null)"
+expected_id="user=fandhe-container
+host=build
+timestamp=1970-01-01 00:00:00 UTC
+origin_user=command line
+origin_host=command line
+origin_timestamp=command line
+env_user=fandhe-container
+env_host=build
+env_timestamp=1970-01-01 00:00:00 UTC"
+expect_eq "build identity: fixed neutral values" "$expected_id" "$(cat "$sandbox/build-id.1" 2>/dev/null)"
+expect_eq "build identity: build-info user" "kbuild_build_user=fandhe-container" "$(sed -n 6p "$out1/build-info.txt" 2>/dev/null)"
+expect_eq "build identity: build-info host" "kbuild_build_host=build" "$(sed -n 7p "$out1/build-info.txt" 2>/dev/null)"
+expect_eq "build identity: build-info timestamp" "kbuild_build_timestamp=1970-01-01 00:00:00 UTC" "$(sed -n 8p "$out1/build-info.txt" 2>/dev/null)"
+expect_eq "build identity: no env warning by default" "0" "$(grep -c 'ignoring KBUILD_BUILD_' "$sandbox/out.stderr")"
 expect_eq "success: no leftover tmp files" "" "$(find "$out1" -name '.*' -type f | head -n 1)"
+
+# 1b. 環境の KBUILD_BUILD_* は無視され、固定値が勝つ（#4590）
+out1b="$sandbox/out1b"
+run_build "${std_env[@]}" "CALL_MARK=$sandbox/calls" "KBUILD_BUILD_USER=leak-user-4590" "KBUILD_BUILD_HOST=leak-host-4590" \
+    "KBUILD_BUILD_TIMESTAMP=leak-ts-4590" "BUILD_ID_MARK=$sandbox/build-id.env" -- \
+    --output-dir "$out1b" --cross-compile "$cc" --tarball "$good_tar"
+expect_eq "env override: exit code" "0" "$(rc_of)"
+expect_eq "env override: fixed values win" "$expected_id" "$(cat "$sandbox/build-id.env" 2>/dev/null)"
+expect_eq "env override: warnings" "3" "$(grep -c 'warning: ignoring KBUILD_BUILD_' "$sandbox/out.stderr")"
+expect_eq "env override: no leak" "0" "$(cat "$sandbox/out.stdout" "$sandbox/out.stderr" "$sandbox/build-id.env" "$out1b/build-info.txt" "$out1b/config" 2>/dev/null | grep -c 'leak-')"
 
 # 2. --tarball 経路でも成功
 out2="$sandbox/out2"

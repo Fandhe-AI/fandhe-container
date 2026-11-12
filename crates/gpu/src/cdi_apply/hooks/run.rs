@@ -707,6 +707,9 @@ fn open_trusted_executable(path: &str) -> Result<File, CdiApplyError> {
 }
 
 const REAP_GRACE: Duration = Duration::from_secs(5);
+/// 子の正常終了後に stderr の EOF を待つ猶予。並列 spawn の子が close-on-exec 前に写しを持つ時間は
+/// 実測で最大約 1ms のため大きな余裕をとる。持続する孫の検出（数秒の sleep）は妨げない値（#2999）。
+const STDERR_EOF_GRACE: Duration = Duration::from_secs(1);
 /// 1 回の `pump` で読む最大チャンク数（読み続けて期限を超えないための上限）。
 const PUMP_MAX_CHUNKS: usize = 64;
 /// 子の終了後の最終回収で読む最大チャンク数。これで EOF に達しなければ孫が pipe を保持しているとみなす。
@@ -799,11 +802,23 @@ impl ChildIo {
     }
 
     /// 子の終了後に呼ぶ最終回収。(stderr の先頭, 全 pipe が閉じたか)。閉じていなければ孫が保持している。
-    fn finish(&mut self) -> (String, bool) {
-        self.pump(FINAL_DRAIN_CHUNKS);
-        let closed = self.stderr.is_none();
+    ///
+    /// `grace` の間は stderr の EOF を待つ。同じプロセスの別スレッドが並列に起動した子は、exec の
+    /// close-on-exec が効くまでこちらの pipe の書き込み端の写しを一時的に持つため、終了直後の
+    /// 1 回の読み取りだけで「孫が保持している」と判定すると誤検出する（#2999・GPU-2・REPAIR-5）。
+    /// 猶予を超えて保持する者は従来どおり孫とみなす（残余: 猶予未満だけ保持して終わる孫は成功扱い）。
+    fn finish(&mut self, grace: Duration) -> (String, bool) {
         // 子が終わった後は state を読む者がいない。stdin を閉じて残りを捨てる。
         self.stdin = None;
+        let until = Instant::now() + grace;
+        loop {
+            self.pump(FINAL_DRAIN_CHUNKS);
+            if self.stderr.is_none() || Instant::now() >= until {
+                break;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        let closed = self.stderr.is_none();
         (String::from_utf8_lossy(&self.buf).into_owned(), closed)
     }
 }
@@ -971,7 +986,7 @@ fn run_in_bundle(
             Ok(None) => {
                 if started.elapsed() >= deadline {
                     let reaped = kill_and_reap(&mut child);
-                    let (tail, _) = io.finish();
+                    let (tail, _) = io.finish(Duration::ZERO);
                     return Err(match reaped {
                         Ok(()) => rf(e(Code::Timeout, "hook timed out"), tail, None),
                         Err(err) => rf(err, tail, Some(pid)),
@@ -985,13 +1000,13 @@ fn run_in_bundle(
                     e(Code::Internal, "failed to wait for hook"),
                     String::new(),
                 );
-                let _ = io.finish();
+                let _ = io.finish(Duration::ZERO);
                 return Err(r);
             }
         }
     };
     let elapsed = started.elapsed();
-    let (stderr, io_closed) = io.finish();
+    let (stderr, io_closed) = io.finish(STDERR_EOF_GRACE);
     if !io_closed {
         return Err(rf(
             e(
@@ -1590,6 +1605,37 @@ mod tests {
         assert_eq!(fs::read_dir(t.work()).unwrap().count(), 0);
     }
 
+    /// GPU-2・REPAIR-5（#2999）: 猶予未満だけ stderr を持って終わる孫がいても、フックの終了コードを
+    /// 失わない（並列 spawn の一時的な保持と同じ形を決定的に再現する）。
+    #[test]
+    fn gpu2_repair5_2999_short_lived_descendant_within_grace_keeps_exit_code() {
+        let t = Tmp::new("grace-exit");
+        let hooks =
+            validate_create_container_hooks(&[mk_sh("sleep 0.2 & exit 7", &["g"], &[], Some(5))])
+                .unwrap();
+        let stage = CdiHookStage::for_test(&t.0);
+        let err = run_create_container_hooks(&stage, &hooks, &state(), &t.work()).unwrap_err();
+        assert_eq!(err.index, 0, "{err:?}");
+        assert_eq!(err.error.code(), Code::FailedPrecondition, "{err:?}");
+        assert_eq!(err.error.message(), "hook exited with failure", "{err:?}");
+        assert_eq!(err.exit, Some(CdiHookExit::Code(7)), "{err:?}");
+        assert_eq!(fs::read_dir(t.work()).unwrap().count(), 0);
+    }
+
+    /// GPU-2・REPAIR-5（#2999）: 同上の成功側。猶予内に閉じる孫は成功を妨げない。
+    #[test]
+    fn gpu2_repair5_2999_short_lived_descendant_within_grace_succeeds() {
+        let t = Tmp::new("grace-ok");
+        let hooks =
+            validate_create_container_hooks(&[mk_sh("sleep 0.2 & exit 0", &["g"], &[], Some(5))])
+                .unwrap();
+        let stage = CdiHookStage::for_test(&t.0);
+        let reports = run_create_container_hooks(&stage, &hooks, &state(), &t.work())
+            .unwrap_or_else(|err| panic!("hook run failed: {err:?}"));
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].exit_code, 0);
+    }
+
     /// JSON エスケープを具体文字列で照合する。
     #[test]
     fn json_escape() {
@@ -1724,8 +1770,8 @@ mod tests {
         .unwrap();
         assert_eq!(run(&other).unwrap_err().error.code(), Code::InvalidArgument);
         let err = run(&a).unwrap_err();
-        assert_eq!(err.index, 1);
-        assert_eq!(err.error.code(), Code::FailedPrecondition);
+        assert_eq!(err.index, 1, "{err:?}");
+        assert_eq!(err.error.code(), Code::FailedPrecondition, "{err:?}");
         assert_eq!(fs::read_dir(t.work()).unwrap().count(), 0);
     }
 
@@ -2139,7 +2185,7 @@ mod tests {
                 &rec,
             )
             .unwrap_err();
-            assert_eq!(err.exit, Some(want), "{body}");
+            assert_eq!(err.exit, Some(want), "{body}: {err:?}");
             let got = rec.0.lock().unwrap();
             assert_eq!((got[0].exit_code, got[0].signal), (code, sig), "{body}");
         }
@@ -2222,9 +2268,9 @@ mod tests {
             &rec,
         )
         .unwrap_err();
-        assert_eq!(err.index, 1);
+        assert_eq!(err.index, 1, "{err:?}");
         let got = rec.0.lock().unwrap();
-        assert_eq!(got.len(), 2);
+        assert_eq!(got.len(), 2, "{err:?} {got:?}");
         assert_eq!(
             (got[0].index, got[0].error_code, got[0].exit_code),
             (0, None, Some(0))

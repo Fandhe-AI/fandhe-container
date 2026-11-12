@@ -4,6 +4,11 @@
 //! イメージは oci の公開 API（`begin_pull` → `open_staged_blob` → `commit` → `verify_staged_blob` → `publish`）で
 //! 在庫へ公開するので、layers の mediaType も本番の cri の pull と同じ形で載る。
 //! cli の in-crate 試験（`image_unpack/tests.rs`）と結合試験（`binary_entry.rs`）が `#[path]` で共有する。
+//!
+//! 共有先ごとに使う項目が違い、macOS 向けの lib test では Linux 専用の試験だけが使う項目が未使用になるため、
+//! 項目単位ではなくモジュール全体で `dead_code` を許す（REPAIR-12）。
+
+#![allow(dead_code)]
 
 use std::io::Write as _;
 

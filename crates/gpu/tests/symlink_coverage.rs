@@ -439,7 +439,7 @@ fn gpu2_usr_merge_link_path_is_normalized() {
 
 use symlink_coverage_check::{HookWindowCoverage, per_hook_expected};
 
-/// dev-box02 相当の 7 フック（添字 0・1・6 が create-symlinks）の窓を、偽の実行で駆動する。
+/// PoC-14 の実機相当の 7 フック（添字 0・1・6 が create-symlinks）の窓を、偽の実行で駆動する。
 /// `others` が真なら、間のフック（添字 3 の ldconfig 役）が期待リンクと同じ親に別の symlink を足す。
 fn drive_windows(
     json: &str,
@@ -466,7 +466,7 @@ fn drive_windows(
     cov.finish()
 }
 
-/// GPU-2・REPAIR-12: 窓の外の他フックが同じ親に作る symlink は数えず、dev-box02 の 3 フック・37 件で合格する。
+/// GPU-2・REPAIR-12: 窓の外の他フックが同じ親に作る symlink は数えず、PoC-14 の実機の 3 フック・37 件で合格する。
 #[test]
 fn gpu2_window_ignores_symlinks_made_by_other_hooks() {
     let r = drive_windows(DEVBOX02, true, |_, _, _| {});

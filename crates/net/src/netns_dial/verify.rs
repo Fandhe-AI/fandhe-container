@@ -572,15 +572,16 @@ mod tests {
         }
 
         /// v4-mapped（`::ffff:127.0.0.1` への AF_INET6 の接続）は peer の段で拒否する（#4572）。
-        /// v4-mapped の接続が作れない環境（`ipv6.disable` 等）では作れた場合だけ確かめる。
+        /// 受け側は IPv4 の listener にして `bindv6only` に依らず接続を成立させる。接続できない環境
+        /// （`ipv6.disable` 等）では黙って省略せず、前提不成立として失敗させる。
         #[test]
         fn sec1_net3_4572_v4_mapped_peer_rejected() {
-            let l = TcpListener::bind("[::]:0").expect("bind dual-stack");
+            let l = TcpListener::bind("127.0.0.1:0").expect("bind ipv4");
             let p = l.local_addr().expect("addr").port();
             let mapped: SocketAddr = format!("[::ffff:127.0.0.1]:{p}").parse().expect("addr");
-            let Ok(c) = TcpStream::connect(mapped) else {
-                return;
-            };
+            let c = TcpStream::connect(mapped)
+                .expect("v4-mapped connect must succeed (precondition: IPv6 enabled)");
+            let _accepted = l.accept().expect("accept");
             let e = reject(OwnedFd::from(c), exp(p));
             assert_eq!(e.reason(), Some(DialedSocketRejection::PeerMismatch));
         }

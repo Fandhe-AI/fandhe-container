@@ -19,7 +19,9 @@
 //!
 //! 未実装・簡易実装（REPAIR-3）:
 //! - `--image-root <abs> --image <sha256:digest|name[:tag]>` つきの `create` は core の `create_with_image` を呼び、イメージ参照（OCI-7）を
-//!   `image_refs::StoreImageRefs` で登録・確定する（#2315）。レイヤーの展開はしない（本番の展開器は #2377。bundle の rootfs は展開済みの前提）。
+//!   `image_refs::StoreImageRefs` で登録・確定する（#2315）。レイヤーの展開は `--unpack` のときだけ行う（opt-in。本番の展開器は
+//!   `image_unpack::StoreImageRootfsUnpacker`・#2377。付けないときは bundle の rootfs が展開済みの前提。`--unpack` で既存の rootfs が
+//!   あれば `ALREADY_EXISTS`）。rootless の user namespace 内の展開は #482・#2792、CRI・plugin 経由の配線は #2791 で未実装。
 //!   manifest の在庫は永続化済み（#2380）だが、在庫を埋める経路は cri の `OciImagePuller::pull` に配線済み（#2539）で、同じ root を
 //!   `--image-root` に渡せば `register` が成功する。本番の `PullImage` へは plugin-cri の ImageService（#2592）から届く。
 //!   pull していない root では在庫が空のため `register` は `NOT_FOUND` になる。
@@ -59,6 +61,7 @@ use super::image_refs::{
     StoreImageRefs, attach_image_root, classify_create_image, legacy_scope, resolve_create_image,
     state_scope,
 };
+use super::image_unpack::StoreImageRootfsUnpacker;
 use super::ref_reconcile::reclaim_stale_ref_recorded;
 use super::stop_delete::{
     WARNING_WRITE_TIMEOUT, emit_warning_bounded, options_removal_warning, write_warning_to_stderr,
@@ -92,6 +95,8 @@ pub(super) struct CreateImage {
     pub(super) scope: String,
     /// 旧版の scope（`--root` の字面から決めたもの。新 scope と同じなら `None`）。残骸の回収だけに使う（#2499・OCI-7）。
     pub(super) legacy_scope: Option<String>,
+    /// `--unpack`: 本番の展開器（`image_unpack::StoreImageRootfsUnpacker`）を付けて bundle の rootfs へ展開する（#2377）。
+    pub(super) unpack: bool,
 }
 
 /// 状態ストアを開く前の段階のイメージつき create の入力（`scope` が未確定）。
@@ -104,6 +109,8 @@ pub(super) struct PendingImage {
     pub(super) manifest: ImageManifestDigest,
     /// グローバル引数の `--root`（旧 scope の算出用）。
     pub(super) root_override: Option<std::path::PathBuf>,
+    /// `--unpack`（`CreateImage::unpack` へ引き継ぐ）。
+    pub(super) unpack: bool,
 }
 
 impl PendingImage {
@@ -115,14 +122,16 @@ impl PendingImage {
             scope,
             store: self.store,
             manifest: self.manifest,
+            unpack: self.unpack,
         })
     }
 }
 
 /// 構築済みの要求で core の `create_with_image` を呼ぶ（OCI-7・#2315）。
 ///
-/// 参照の登録・確定・失敗時の巻き戻しは core が行う。展開器は付けない（本番の展開器は #2377 で、
-/// bundle の rootfs は展開済みの前提）。`_pass`（create ゲートの共有）を要求し、未確定参照の回収側が
+/// 参照の登録・確定・失敗時の巻き戻しは core が行う。展開器は `--unpack` のときだけ付ける（#2377。本番の展開器は
+/// `image_unpack::StoreImageRootfsUnpacker`）。付けないときは bundle の rootfs が展開済みの前提（従来の契約）。
+/// 展開器を付けると既存の rootfs は core が `ALREADY_EXISTS` で拒否する。`_pass`（create ゲートの共有）を要求し、未確定参照の回収側が
 /// 進行中の create を見分けられない呼び出しを型で防ぐ（#2495）。
 pub(super) fn create_container_with_image(
     rt: &Runtime,
@@ -131,10 +140,17 @@ pub(super) fn create_container_with_image(
     _pass: &ContainerCreatePass<'_>,
 ) -> Result<StateRecord, OciRuntimeError> {
     let refs = StoreImageRefs::new(&image.store, &image.scope);
+    let unpacker = StoreImageRootfsUnpacker::new(&image.store);
+    let container_image = ContainerImage::new(&refs, &image.manifest);
+    let container_image = if image.unpack {
+        container_image.with_unpacker(&unpacker)
+    } else {
+        container_image
+    };
     create_with_image_audited(
         rt.store.as_ref(),
         &rt.recorder,
-        ContainerImage::new(&refs, &image.manifest),
+        container_image,
         req,
         rt.audit.as_ref(),
     )
@@ -208,6 +224,7 @@ fn build_create(
                 store,
                 manifest,
                 root_override: global.root.clone(),
+                unpack: i.unpack,
             })
         }
     };
@@ -1766,6 +1783,7 @@ mod tests {
             image: Some(crate::commands::args::CreateImageArgs {
                 image_root: root,
                 reference: manifest.into(),
+                unpack: false,
             }),
         }
     }
@@ -2168,6 +2186,7 @@ mod tests {
                 manifest: ImageManifestDigest::new(IMG_DIGEST).expect("digest"),
                 scope: "scope".into(),
                 legacy_scope: None,
+                unpack: false,
             }
         }
 

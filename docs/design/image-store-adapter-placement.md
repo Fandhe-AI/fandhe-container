@@ -23,7 +23,7 @@ core が定義する `ContainerImageRefs`・`ImageRootfsUnpacker` を満たす�
 
 判断を待つ後続:
 
-- #2377: 本番の `ImageRootfsUnpacker`。依存欄に #2315 がある
+- #2377: 本番の `ImageRootfsUnpacker`。依存欄に #2315 がある。置き場所の判断は出ていないため、`StoreImageRefs` と同じく cli に暫定で置いた（`crates/cli/src/commands/image_unpack.rs`。`create --unpack` のときだけ付ける opt-in。依存辺は足していない）。判断が出たらこの module も移す
 - #2791: plugin-cri の create / delete での参照の登録・解除。依存欄に #2315 がある
 
 問題は、plugin-cri が cli に依存しないため、cli にある `StoreImageRefs` を使えないことである。置き場所が決まらないと、CRI 側で複製するか移設するかを決められない。
@@ -73,7 +73,7 @@ cli → cri の辺も plugin-cri → cli の辺も無い。core は oci に依�
 | 項目 | 扱い・行き先 |
 | ---- | ------------ |
 | 起動時の照合から `reap_stale_unpacks` を呼ぶ配線（PR #2519） | [container-ref-reconcile.md](container-ref-reconcile.md) の決定 5 で解消済み。起動時の照合は無く、同じ bundle への次の create と、bundle を知る呼び出し元が回収する |
-| CLI からの `ImageRootfsPrivilege` / `DeleteOptions` / `ReapOptions`（PR #2611） | CLI は展開器を付けず、core 所有の rootfs が生じないため今は効き目が無い。CLI の create に本番の展開器を付けるとき（#2377）に同時に配線する |
+| CLI からの `ImageRootfsPrivilege` / `DeleteOptions` / `ReapOptions`（PR #2611） | #2377 で CLI の create に本番の展開器（`--unpack`）を付けたが、展開の所有者は `Keep`（実効 uid）で木が実効 uid 所有になるため、既定の `HostEffectiveIds` のままで後始末・回収の権限が一致する。`SubordinateIds` の配線は、rootless の user namespace 内の展開（`ChownInUserNamespace`）を入れる #482・#2792 の範囲 |
 | CRI / tokio 経路の子プロセス方式、`ChownInUserNamespace`（PR #2522・#2611） | CRI が `create_with_image` を使う配線（#2791）と本番の `ExtractOptions`（#2792）の範囲 |
 | `image_ownership.rs` の最終的な置き場所（PR #2528） | 論点 2 に含める |
 | plugin 経由のイメージつき create / delete | #2791（create ゲートの共有で包む規約も同じ） |
@@ -83,7 +83,7 @@ cli → cri の辺も plugin-cri → cli の辺も無い。core は oci に依�
 1. 結果を #2315 にコメントで記録してから close する
 2. cli 以外に決まった場合は該当 module を移す実装 issue を起こす（外部へ公開している型は無く、そのまま移せる）
 3. 本書の位置づけ欄を「決定」へ更新する
-4. #2377 と #2791 の依存を解く
+4. #2377（実装済み。暫定で cli に配置）と #2791 の依存を解く
 
 ## 8. 不採用・保留の記録
 

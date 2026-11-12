@@ -1,0 +1,328 @@
+//! `StoreImageRootfsUnpacker` と `create --unpack` の配線の試験（OCI-7・OCI-1・OCI-2・SEC-1・#2377）。
+//!
+//! 実際の `ImageStore`（pull の公開経路で種入れ）・`FileStateStore`・`StoreImageRefs` を使い、core の
+//! `create_with_image` を通す。期待値は具体値で書く。
+
+// 本物の pull 経路で多層イメージを作る共有 fixture（結合試験 `binary_entry.rs` と共有）。
+#[path = "../../../tests/support/image_fixture.rs"]
+mod image_fixture;
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use fandhe_container_core::audit_log::FileAuditSink;
+use fandhe_container_core::observability::OpRecorder;
+use fandhe_container_core::state_store::{FileStateStore, StateRoot};
+use fandhe_container_core::traits::{ContainerId, CreateRequest, ErrorCode};
+use fandhe_container_oci::image_management::ImageStore;
+
+use super::*;
+use crate::commands::create_start::{CreateImage, Runtime, create_container_with_image_reclaiming};
+use crate::commands::image_refs::state_scope;
+use image_fixture::{Entry, seed_image, tar_of};
+
+/// テスト用の一意な一時ディレクトリ（Drop で削除）。
+struct TmpDir(
+    PathBuf,
+    // 保持が目的（drop で親を消す。tmpfiles の flock 走査から守る共有部品は Linux の試験用）。
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
+    crate::scratch_root::ScratchDir,
+);
+
+impl TmpDir {
+    fn new(tag: &str) -> Self {
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, Ordering::SeqCst);
+        #[cfg(target_os = "linux")]
+        let scratch = crate::scratch_root::ScratchDir::new(
+            "fc-cli-unpack",
+            std::time::Duration::from_secs(10),
+        );
+        #[cfg(target_os = "linux")]
+        let base = scratch.path().to_path_buf();
+        #[cfg(not(target_os = "linux"))]
+        let base = std::env::temp_dir();
+        let p = base.join(format!("fc-cli-unpack-{tag}-{}-{n}", std::process::id()));
+        std::fs::create_dir(&p).expect("mkdir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        }
+        #[cfg(target_os = "linux")]
+        return Self(p, scratch);
+        #[cfg(not(target_os = "linux"))]
+        Self(p)
+    }
+
+    fn images(&self) -> ImageStore {
+        let root = self.0.join("images");
+        std::fs::create_dir_all(root.join("blobs").join("sha256")).expect("images");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        }
+        ImageStore::open(&root).expect("open images")
+    }
+
+    /// `rootfs/` の無い bundle（展開器が作る）。
+    fn bundle(&self) -> PathBuf {
+        let b = self.0.join("bundle");
+        std::fs::create_dir_all(&b).expect("bundle");
+        std::fs::write(
+            b.join("config.json"),
+            r#"{"ociVersion":"1.2.0","root":{"path":"rootfs"},"process":{"user":{"uid":0,"gid":0},"args":["/bin/echo","it"],"cwd":"/"},"linux":{"namespaces":[{"type":"pid"},{"type":"mount"},{"type":"user"},{"type":"uts"},{"type":"ipc"}]}}"#,
+        )
+        .expect("config");
+        b
+    }
+
+    fn state(&self) -> FileStateStore {
+        let root = StateRoot::from_override(self.0.join("state")).expect("root");
+        FileStateStore::open(root).expect("open state")
+    }
+}
+
+impl Drop for TmpDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn id(s: &str) -> ContainerId {
+    ContainerId::new(s).expect("id")
+}
+
+fn runtime(st: FileStateStore) -> Runtime {
+    Runtime {
+        audit: Box::new(FileAuditSink::in_state_store(&st)),
+        store: Box::new(st),
+        recorder: OpRecorder::new(),
+    }
+}
+
+fn create_image(
+    _base: &TmpDir,
+    rt: &Runtime,
+    images: ImageStore,
+    manifest: &Digest,
+) -> CreateImage {
+    CreateImage {
+        store: images,
+        manifest: ImageManifestDigest::new(manifest.as_str()).expect("manifest"),
+        scope: state_scope(rt.store.as_ref()).expect("scope"),
+        legacy_scope: None,
+        unpack: true,
+    }
+}
+
+fn refs_of(images: &ImageStore, manifest: &Digest) -> usize {
+    images
+        .lock()
+        .expect("lock")
+        .manifest_references(manifest)
+        .count()
+}
+
+fn leftover_staging(bundle: &Path) -> Vec<String> {
+    std::fs::read_dir(bundle)
+        .expect("read bundle")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".fandhe-unpack-") || n == "rootfs")
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+mod linux {
+    use super::image_fixture::three_layer_tars;
+    use super::*;
+    use fandhe_container_core::oci_runtime::{
+        CgroupRemoval, ContainerCgroupRemover, delete_releasing_image_ref,
+    };
+    use fandhe_container_core::traits::{
+        CgroupScope, DeleteRequest, GetStateRequest, StateRevision, TraitError,
+    };
+
+    /// 状態ストアを持たない cgroup 削除役（Created のコンテナは配置を持たないため呼ばれない）。
+    struct NoCgroup;
+
+    impl ContainerCgroupRemover for NoCgroup {
+        fn scope(&self) -> Result<CgroupScope, TraitError> {
+            Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+        }
+
+        fn remove(
+            &self,
+            _id: &ContainerId,
+            _instance: StateRevision,
+        ) -> Result<CgroupRemoval, TraitError> {
+            Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+        }
+    }
+
+    /// 3 層（上位が下位を上書きし、whiteout を含む）の展開結果を具体値で照合し、delete で rootfs と参照が消える。
+    #[test]
+    fn oci7_oci1_2377_multi_layer_unpack_creates_rootfs_and_delete_removes_it() {
+        let base = TmpDir::new("multi");
+        let images = base.images();
+        let seeded = seed_image(&images, "p1", &three_layer_tars(), None, true);
+        let rt = runtime(base.state());
+        let image = create_image(&base, &rt, images, &seeded.manifest);
+        let bundle = base.bundle();
+        let req = CreateRequest::new(id("c1"), bundle.clone()).expect("req");
+        create_container_with_image_reclaiming(&rt, &image, &req).expect("create");
+
+        let rootfs = bundle.join("rootfs");
+        assert_eq!(std::fs::read(rootfs.join("etc/os")).expect("os"), b"upper");
+        assert_eq!(std::fs::read(rootfs.join("app.txt")).expect("app"), b"app");
+        assert_eq!(
+            std::fs::read(rootfs.join("old/keep.txt")).expect("keep"),
+            b"keep"
+        );
+        assert!(!rootfs.join("old/gone.txt").exists(), "whiteout は効く");
+        assert!(!rootfs.join("old/.wh.gone.txt").exists());
+        assert_eq!(refs_of(&image.store, &seeded.manifest), 1);
+        let state = rt
+            .store
+            .get(&GetStateRequest::new(id("c1")))
+            .expect("state");
+        assert_eq!(
+            state.status().state(),
+            fandhe_container_core::traits::ContainerState::Created
+        );
+
+        // 展開器の戻り値（展開した層の数）。
+        let unpacker = StoreImageRootfsUnpacker::new(&image.store);
+        let dir = base.0.join("direct");
+        std::fs::create_dir(&dir).expect("dir");
+        let link = open_dir_link(&dir);
+        let unpacked = unpacker
+            .unpack(&image.manifest, Path::new(&link.1))
+            .expect("unpack");
+        assert_eq!(unpacked.layers, 3);
+        drop(link);
+
+        let refs = crate::commands::image_refs::StoreImageRefs::new(&image.store, &image.scope);
+        let del = DeleteRequest::new(id("c1"));
+        delete_releasing_image_ref(rt.store.as_ref(), &rt.recorder, &NoCgroup, &refs, &del)
+            .expect("delete");
+        assert!(!rootfs.exists(), "delete は core 所有の rootfs を消す");
+        assert_eq!(refs_of(&image.store, &seeded.manifest), 0);
+    }
+
+    /// 2 層目の diff_id が食い違う（1 層目は展開済み）と DataLoss で失敗し、参照 0 件・rootfs と staging が残らない。
+    #[test]
+    fn oci7_2377_mid_layer_failure_rolls_back_ref_and_rootfs() {
+        let base = TmpDir::new("midfail");
+        let images = base.images();
+        let seeded = seed_image(&images, "p2", &three_layer_tars(), Some(1), true);
+        let rt = runtime(base.state());
+        let image = create_image(&base, &rt, images, &seeded.manifest);
+        let bundle = base.bundle();
+        let req = CreateRequest::new(id("c1"), bundle.clone()).expect("req");
+        let e = create_container_with_image_reclaiming(&rt, &image, &req).expect_err("must fail");
+        assert_eq!(e.message(), "image layer failed verification");
+        assert_eq!(refs_of(&image.store, &seeded.manifest), 0);
+        assert_eq!(leftover_staging(&bundle), Vec::<String>::new());
+        let got = rt.store.get(&GetStateRequest::new(id("c1")));
+        assert_eq!(got.expect_err("no state").code(), ErrorCode::NotFound);
+    }
+
+    /// mediaType が未記録の在庫は FailedPrecondition で失敗し、参照 0 件に戻る。
+    #[test]
+    fn oci7_2377_unrecorded_media_types_fail_and_roll_back() {
+        let base = TmpDir::new("nomt");
+        let images = base.images();
+        let seeded = seed_image(&images, "p3", &three_layer_tars(), None, false);
+        let rt = runtime(base.state());
+        let image = create_image(&base, &rt, images, &seeded.manifest);
+        let bundle = base.bundle();
+        let req = CreateRequest::new(id("c1"), bundle.clone()).expect("req");
+        let e = create_container_with_image_reclaiming(&rt, &image, &req).expect_err("must fail");
+        assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+        assert!(
+            e.message().contains("pull the image again"),
+            "{}",
+            e.message()
+        );
+        assert_eq!(refs_of(&image.store, &seeded.manifest), 0);
+        assert_eq!(leftover_staging(&bundle), Vec::<String>::new());
+    }
+
+    /// 既存の rootfs がある bundle では、展開器つきの create は ALREADY_EXISTS で失敗する。
+    #[test]
+    fn oci7_2377_unpack_refuses_existing_rootfs() {
+        let base = TmpDir::new("exists");
+        let images = base.images();
+        let seeded = seed_image(
+            &images,
+            "p4",
+            &[tar_of(&[Entry::File("a", b"a")])],
+            None,
+            true,
+        );
+        let rt = runtime(base.state());
+        let image = create_image(&base, &rt, images, &seeded.manifest);
+        let bundle = base.bundle();
+        std::fs::create_dir(bundle.join("rootfs")).expect("rootfs");
+        let req = CreateRequest::new(id("c1"), bundle.clone()).expect("req");
+        let e = create_container_with_image_reclaiming(&rt, &image, &req).expect_err("must fail");
+        assert_eq!(e.code(), ErrorCode::AlreadyExists);
+        assert_eq!(refs_of(&image.store, &seeded.manifest), 0);
+    }
+
+    /// `/proc/self/fd/N` 以外の展開先は InvalidArgument（パスで開き直さない）。
+    #[test]
+    fn sec1_2377_unpack_rejects_non_fd_destination() {
+        let base = TmpDir::new("path");
+        let images = base.images();
+        let seeded = seed_image(
+            &images,
+            "p5",
+            &[tar_of(&[Entry::File("a", b"a")])],
+            None,
+            true,
+        );
+        let unpacker = StoreImageRootfsUnpacker::new(&images);
+        let manifest = ImageManifestDigest::new(seeded.manifest.as_str()).expect("manifest");
+        let e = unpacker.unpack(&manifest, &base.0).expect_err("plain path");
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        let unknown = ImageManifestDigest::new(Digest::sha256_of(b"nope").as_str()).expect("m");
+        let e = unpacker.unpack(&unknown, &base.0).expect_err("unknown");
+        assert_eq!(e.code(), ErrorCode::NotFound);
+    }
+
+    /// 開いたディレクトリの fd と、その `/proc/self/fd/N` の経路（fd は返した値の drop で閉じる）。
+    fn open_dir_link(dir: &Path) -> (std::fs::File, String) {
+        use std::os::fd::AsRawFd as _;
+        let f = std::fs::File::open(dir).expect("open dir");
+        let link = format!("/proc/self/fd/{}", f.as_raw_fd());
+        (f, link)
+    }
+}
+
+/// Linux 以外では、展開器つきの create は core が作成の前に Unimplemented で拒否し、何も作られない。
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn oci7_2377_unpack_is_unimplemented_off_linux_and_creates_nothing() {
+    let base = TmpDir::new("nonlinux");
+    let images = base.images();
+    let seeded = seed_image(
+        &images,
+        "p6",
+        &[tar_of(&[Entry::File("a", b"a")])],
+        None,
+        true,
+    );
+    let rt = runtime(base.state());
+    let image = create_image(&base, &rt, images, &seeded.manifest);
+    let bundle = base.bundle();
+    let req = CreateRequest::new(id("c1"), bundle.clone()).expect("req");
+    let e: fandhe_container_core::oci_runtime::OciRuntimeError =
+        create_container_with_image_reclaiming(&rt, &image, &req).expect_err("must fail");
+    assert_eq!(e.code(), ErrorCode::Unimplemented);
+    assert_eq!(refs_of(&image.store, &seeded.manifest), 0);
+    assert_eq!(leftover_staging(&bundle), Vec::<String>::new());
+}

@@ -396,6 +396,145 @@ fn cli1_exec_rejections_on_linux() {
     assert!(line.starts_with("{\"code\":\"INVALID_ARGUMENT\""), "{line}");
 }
 
+// 本物の pull 経路で多層イメージを作る共有 fixture（in-crate 試験 `image_unpack/tests.rs` と共有。#2377）。
+#[cfg(target_os = "linux")]
+#[path = "support/image_fixture.rs"]
+mod image_fixture;
+
+/// OCI-7・OCI-1・CLI-1・#2377: 実バイナリの `create --unpack` が多層イメージを bundle の `rootfs/` へ展開し、
+/// `delete` が rootfs と参照を消す。`--unpack` なしは従来どおり bundle の rootfs が展開済みの前提で、
+/// `--unpack` と既存の rootfs の組は `ALREADY_EXISTS`。
+#[cfg(target_os = "linux")]
+#[test]
+fn oci7_oci1_2377_create_unpack_through_the_real_entry() {
+    use fandhe_container_oci::image_management::ImageStore;
+
+    let tmp = TmpDir::new("unpack");
+    let images_dir = tmp.0.join("images");
+    std::fs::create_dir_all(images_dir.join("blobs").join("sha256")).expect("images");
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&images_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod");
+    }
+    let seeded = {
+        let store = ImageStore::open(&images_dir).expect("open images");
+        image_fixture::seed_image(
+            &store,
+            "bin-1",
+            &image_fixture::three_layer_tars(),
+            None,
+            true,
+        )
+    };
+    let manifest = seeded.manifest.as_str().to_owned();
+    let root_s = tmp.0.join("state").to_str().expect("utf8").to_owned();
+    let images_s = images_dir.to_str().expect("utf8").to_owned();
+    let config = r#"{"ociVersion":"1.2.0","root":{"path":"rootfs"},"process":{"user":{"uid":0,"gid":0},"args":["/bin/echo","it"],"cwd":"/"},"linux":{"namespaces":[{"type":"pid"},{"type":"mount"},{"type":"user"},{"type":"uts"},{"type":"ipc"}]}}"#;
+    let bundle_of = |name: &str, with_rootfs: bool| {
+        let b = tmp.0.join(name);
+        std::fs::create_dir(&b).expect("bundle");
+        std::fs::write(b.join("config.json"), config).expect("config");
+        if with_rootfs {
+            std::fs::create_dir(b.join("rootfs")).expect("rootfs");
+        }
+        b
+    };
+
+    // 展開あり: rootfs が無い bundle に多層イメージが重なって展開される。
+    let b1 = bundle_of("b1", false);
+    let b1_s = b1.to_str().expect("utf8");
+    let out = run(&[
+        "--root",
+        &root_s,
+        "create",
+        "--image-root",
+        &images_s,
+        "--image",
+        &manifest,
+        "--unpack",
+        "--bundle",
+        b1_s,
+        "c1",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stdout.is_empty());
+    assert_eq!(
+        std::fs::read(b1.join("rootfs/etc/os")).expect("os"),
+        b"upper"
+    );
+    assert_eq!(
+        std::fs::read(b1.join("rootfs/app.txt")).expect("app"),
+        b"app"
+    );
+    assert!(!b1.join("rootfs/old/gone.txt").exists());
+
+    // delete は core 所有の rootfs と参照を消す（記録した --image-root を使う）。
+    let out = run(&["--root", &root_s, "delete", "c1"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!b1.join("rootfs").exists());
+    {
+        let store = ImageStore::open(&images_dir).expect("reopen");
+        let refs = store
+            .lock()
+            .expect("lock")
+            .manifest_references(&seeded.manifest)
+            .count();
+        assert_eq!(refs, 0);
+    }
+
+    // 既存の rootfs と --unpack の組は ALREADY_EXISTS（上書きしない）。
+    let b2 = bundle_of("b2", true);
+    let b2_s = b2.to_str().expect("utf8");
+    let out = run(&[
+        "--root",
+        &root_s,
+        "create",
+        "--image-root",
+        &images_s,
+        "--image",
+        &manifest,
+        "--unpack",
+        "--bundle",
+        b2_s,
+        "c2",
+    ]);
+    assert_eq!(
+        op_and_code(&out),
+        ("create".to_owned(), "ALREADY_EXISTS".to_owned())
+    );
+
+    // --unpack なしは従来どおり（展開済みの rootfs を前提に検証だけ行う）成功する。
+    let out = run(&[
+        "--root",
+        &root_s,
+        "create",
+        "--image-root",
+        &images_s,
+        "--image",
+        &manifest,
+        "--bundle",
+        b2_s,
+        "c3",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// exec の再実行経路の結合試験が使う、偽の systemd-run の本体（SUP-6・REPAIR-12）。先頭 6 引数（`USER_SCOPE_WRAPPER_ARGS`）を
 /// 落として、同じディレクトリの `scenario`（sh）を source する。シナリオは再実行された子の代役で、残りの引数
 /// （自分の実行ファイルと元の argv）を `"$@"` として受け取る。
@@ -2814,6 +2953,20 @@ fn oci7_image_option_usage_errors() {
             "c1",
         ],
         vec!["delete", "--image-root"],
+        // --unpack はイメージの指定が揃ったときだけ受ける・重複不可。
+        vec!["create", "--bundle", "/b", "--unpack", "c1"],
+        vec![
+            "create",
+            "--bundle",
+            "/b",
+            "--unpack",
+            "--unpack",
+            "--image-root",
+            &root_s,
+            "--image",
+            &digest,
+            "c1",
+        ],
     ] {
         let out = run(&args);
         assert_eq!(out.status.code(), Some(2), "{args:?}");

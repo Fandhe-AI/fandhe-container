@@ -127,6 +127,10 @@ const MSG_SCAN_LIMIT: &str = "image store scan limit exceeded";
 const MSG_TAG_LIMIT: &str = "image tag limit exceeded";
 const MSG_REF_LIMIT: &str = "container reference limit exceeded";
 pub(super) const MSG_TAG_NOT_FOUND: &str = "image tag not found";
+const MSG_UNPACK_PRECONDITION: &str = "image layers cannot be unpacked; the image layer information may be missing, pull the image again";
+const MSG_UNPACK_DATA_LOSS: &str = "image layer failed verification";
+const MSG_UNPACK_LIMIT: &str = "image layers exceed the size limit";
+const MSG_UNPACK_TIMEOUT: &str = "image unpack timed out";
 /// digest に見えるが `sha256:<小文字 hex 64 桁>` でない入力の固定文言（core の `ImageManifestDigest::new` と同一。試験で照合）。
 const MSG_BAD_DIGEST: &str = "manifest digest must be sha256:<64 lowercase hex>";
 const MSG_TAG_TARGET: &str = "target must be a tag reference";
@@ -148,6 +152,8 @@ pub(super) enum Stage {
     Refs,
     /// create の `--image` のタグ参照の解決（`image_refs::resolve_create_image`。#2496・OCI-7・CLI-1）。
     Resolve,
+    /// create `--unpack` のレイヤー展開（`image_unpack::StoreImageRootfsUnpacker`。#2377・OCI-7・OCI-1）。
+    Unpack,
 }
 
 /// oci の分類を core の `ErrorCode` へ写す。`OciErrorCode` も `#[non_exhaustive]` で `_` 腕が要り、
@@ -183,6 +189,12 @@ pub(super) fn failure_message(code: OciErrorCode, stage: Stage) -> &'static str 
         (Stage::Refs, OciErrorCode::NotFound) => MSG_IMAGE_NOT_FOUND,
         (Stage::Refs, OciErrorCode::Timeout) => MSG_LOCKED,
         (Stage::Refs, OciErrorCode::ResourceExhausted) => MSG_REF_LIMIT,
+        // 展開は在庫の mediaType 未記録・信頼条件違反・検査後の差し替え検出が FailedPrecondition に集まる。
+        (Stage::Unpack, OciErrorCode::NotFound) => MSG_IMAGE_NOT_FOUND,
+        (Stage::Unpack, OciErrorCode::FailedPrecondition) => MSG_UNPACK_PRECONDITION,
+        (Stage::Unpack, OciErrorCode::DataLoss) => MSG_UNPACK_DATA_LOSS,
+        (Stage::Unpack, OciErrorCode::ResourceExhausted) => MSG_UNPACK_LIMIT,
+        (Stage::Unpack, OciErrorCode::Timeout) => MSG_UNPACK_TIMEOUT,
         (Stage::Read | Stage::Remove, OciErrorCode::FailedPrecondition) => MSG_BLOB_DIR,
         (Stage::Read | Stage::Remove, OciErrorCode::ResourceExhausted) => MSG_SCAN_LIMIT,
         (_, OciErrorCode::InvalidArgument) => "invalid argument",

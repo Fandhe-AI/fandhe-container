@@ -16,8 +16,8 @@
 //! 使うと root になってしまう。このため uid / gid は引数で受け、`/proc/self` を読まない。
 //!
 //! # 未配線（REPAIR-3）
-//! 本番の呼び出し元はまだ無い。`PullImage` / create 経路の展開器（#2377）、rootless の user namespace へ入る配線
-//! （#2315・#482）、rootful の start の判断（#2241）が済んでから配線する。今は両者が食い違わないことを
+//! 本番の呼び出し元はまだ無い。create 経路の本番の展開器（`image_unpack`。#2377）は所有者を `Keep` で展開し、この変換を
+//! 使わない。rootless の user namespace へ入る配線（#482・#2792）、rootful の start の判断（#2241）が済んでから配線する。今は両者が食い違わないことを
 //! `tests/image_ownership_parity.rs` が照合する。
 //!
 //! エラー文言は固定の英語で、パス・ユーザー名・errno を含めない。

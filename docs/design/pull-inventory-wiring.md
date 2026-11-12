@@ -59,9 +59,32 @@ PR #2520（#2380）で manifest の在庫・タグ・pull リースを `@image-i
 
 - CLI の `pull` サブコマンド（crate 境界の判断。起票の要否はオーナー確認）
 - `InMemoryImageStore` の置き換え（TASK-183）。plugin-cri の ImageService と本番の `PullConfig` は #2592 で配線済み
-- #2377（本番の `ImageRootfsUnpacker`）には、在庫に layer の mediaType・`diff_ids` が要る。`@image-inventory.json` のスキーマは広げていない
+- 本番の `ImageRootfsUnpacker`（#2377）の入力は、下の「在庫のスキーマ v2」で解消した（実装済み）。残りの配線は #2791（plugin-cri）・#482 / #2792（rootless の user namespace 内の展開）
 - 展開済み `rootfs/sha256/<hex>` の GC と `image rm` / `prune` への接続（#2315・#471）
 - Windows ホストは `ImageStore::open` の恒久拒否（#2428 案 C・#4333。#4181 は not planned）で到達しないため対象外。公開先 `rootfs/sha256`・create 経路の読み取りは #4283、`unpack/` は #4180、検証後のステージング blob の読み取りは #2893、リース済み blob の読み取りは #4179 で fd 起点に移した
+
+## 在庫のスキーマ v2（layer の mediaType。#2377・OCI-7・OCI-1）
+
+本番の `ImageRootfsUnpacker`（cli の `image_unpack`）は、manifest digest から下位順のレイヤー（blob・mediaType・diff_id）を `ImageStore::image_layers` で引く。
+pull は manifest の本文を blob として保存せず、GC の参照計算にも manifest は入らないため、「登録済みの manifest blob を読み直す」方式は採れない
+（保存するように変えると pull・prune・GC の参照計算まで変わる）。そこで次のハイブリッドにした。
+
+- **mediaType は在庫が持つ**: `ManifestComposition` に layers と同じ並びの任意の `layer_media_types` を足し、`@image-inventory.json` を version 2 にした。
+  cri の pull の公開（`stage_and_unpack`）が manifest の descriptor から載せる。受理は展開側の閉じた集合（`layer::LAYER_MEDIA_TYPES` の 6 種）に限り、
+  登録時と読み込み時の両方で検証する（件数の不一致・集合外・255 バイト超は拒否。読み込みは `DataLoss`）
+- **diff_ids は在庫に持たない**: 登録済みの config blob を、検査済み root の fd 起点で開き、信頼条件の確認 → 上限（1 MiB）つきの 1 回読み →
+  読んだバイト列そのものの sha256 を config digest と照合 → `rootfs.diff_ids` を解析、の順で得る（cri の `read_verified_config_file` と同じ規律）。
+  真実源を config の 1 か所に保ち、在庫の肥大化と二重管理を避ける。layers・mediaType・diff_ids の件数が一致しなければ `DataLoss`
+- **v1 からの移行**: 読み込みは version 1 と 2 を受け、v1（または項目なし）の manifest は mediaType が未記録（`None`）になる。未記録のイメージは
+  `image_layers` が `FailedPrecondition`（「pull the image again」）で拒否し、同じイメージの再 pull の公開（`reconcile_with`）が未記録の mediaType を埋める
+  （既に記録済みで値が違えば `AlreadyExists`、再登録が未記録でも記録済みは落とさない）。書き込みは常に version 2
+- **旧バイナリ**: version 2 のファイルを旧バイナリは `unsupported image inventory file version` で拒否する（fail-closed）。新旧のバイナリで同じ root を共有しない前提
+- **サイズの見積り**: `BYTES_PER_MANIFEST` は v1 の 10,240 に、受理表で最長の mediaType（const 評価で導出）× 128 層の分を足した値。`MAX_IMAGE_INVENTORY_FILE_BYTES` はそれに従う
+  （最長の mediaType を 128 層並べた構成が収まることを試験が固定）
+
+展開自体の排他は `image_layers` の内側（期限つき）で構成を複製して手放し、展開の全体にわたって保持しない（REPAIR-5）。blob は `open_verified_layer` が fd 起点で開き、
+同じハンドルで信頼条件・digest・サイズを確かめる（返す `blob_path` は情報用で開くのには使わない）。展開先の `/proc/self/fd/N` は `ExtractRoot::open_proc_fd_link` が字句を
+厳密に検査して開く。
 
 ## 起動時の pull 回収 GC の配線（#2819・OCI-7・OCI-1・REPAIR-3・REPAIR-4・REPAIR-5）
 

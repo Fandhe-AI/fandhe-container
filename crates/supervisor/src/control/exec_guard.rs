@@ -23,10 +23,24 @@
 //!   通知済みのガードは旧世代の exec 子 cgroup を回収してから終わり、resume の後に [`ExecGuardPool::reopen`] で新しいガードを受ける。
 //!   プールは [`super::server::PausableServer`] が保持する
 //!
+//! - 通知の名前は接続の所有と結びつける（SEC-1・#3808）: (1) 名前 `exec-<pid>-<seq>` の pid が、接続の `SO_PEERCRED` の
+//!   pid と一致すること（名前を作るのは接続した本人のプロセスだけ。`ExecCgroupName::unique` は呼び出しプロセスの pid を使い、
+//!   通知する CLI の内側・stream-exec helper は接続と名前の生成が同じプロセスで間に fork が無い。supervisor と同じ pid
+//!   namespace の前提）。(2) 生きている別のガードが同じ名前を既に通知済みなら拒否する（二重登録で他者の cgroup を取らせない）。
+//!   拒否は ack の前に `Malformed` で返し、何も回収しない（fail-closed。wire の理由コードは増やさず、区別は固定語彙のログで付ける）
+//!
 //! # 残余
 //!
 //! - 通知の ack より前に CLI が消えた窓（作成から通知まで）は回収されない: 空なら既存の掃除に任せる
 //! - supervisor 自身が消えた場合は回収されない（コンテナの cgroup ごと delete 前の `KillAll` が回収する）
+//! - 同じ UID のクライアントはガードの枠（既定 16）を最大で保持期限 + 猶予のあいだ占有でき、その間ほかの exec は
+//!   `ExecGuardExhausted` で断られる（REPAIR-5・#3808 P2-2）。同じ UID は元からコンテナのプロセスへシグナルを送れる同じ
+//!   信頼境界の中にいるため許容する
+//! - 回収の結果が `Failed` のときは構造化ログと集計のみで再試行しない（#3808 P2-3）。残骸は次の exec の開始時の掃除か
+//!   delete 前の `KillAll` が回収する
+//! - worker が接続の複製を閉じる前（`close_range` を経て exec するまで）に CLI が SIGKILL された場合、切断の検出は worker の
+//!   exec か終了まで遅れる（#3808 P2-4）。遅れは保持期限 + 猶予で有界
+//! - pid の照合は pid namespace が supervisor と同じ前提。別 namespace の呼び出し元は名前の pid がずれて拒否される（fail-closed）
 
 use std::io::{self, Read as _, Write as _};
 use std::os::unix::net::UnixStream;
@@ -158,6 +172,8 @@ struct GuardEntry {
     id: u64,
     /// 接続の複製（close-on-exec）。停止要求で `shutdown(Both)` して、待機中の読み取りを EOF で起こす。
     stream: Option<UnixStream>,
+    /// 通知済みの exec 子 cgroup の名前（所有の照合用。回収が終わるまで保持し、他のガードの同名の通知を拒否する）。
+    name: Option<ExecCgroupName>,
     handle: JoinHandle<()>,
 }
 
@@ -179,6 +195,23 @@ impl ExecGuardPool {
                 entries: Vec::new(),
             }),
         })
+    }
+
+    /// ガード `id` の通知済みの名前として `name` を登録する。生きている別のガードが同名を持っていれば `false`
+    /// （判定と登録を 1 つの lock の中で行う）。名前はそのガードが回収を終えて手放すまで保持される。
+    fn claim_name(&self, id: u64, name: &ExecCgroupName) -> bool {
+        let mut st = self.lock_state();
+        if st.entries.iter().any(|e| e.name.as_ref() == Some(name)) {
+            return false;
+        }
+        match st.entries.iter_mut().find(|e| e.id == id) {
+            Some(e) => {
+                e.name = Some(name.clone());
+                true
+            }
+            // 停止要求で追跡から外された後は登録できない（回収もさせない）。
+            None => false,
+        }
     }
 
     fn lock_state(&self) -> std::sync::MutexGuard<'_, PoolState> {
@@ -277,7 +310,7 @@ impl ExecGuardPool {
         if self.is_stopping() {
             return Err(ControlReason::ExecGuardExhausted);
         }
-        let (tx, rx) = channel::<UnixStream>();
+        let (tx, rx) = channel::<(UnixStream, u32)>();
         let pool = Arc::clone(self);
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let handle = std::thread::Builder::new()
@@ -297,6 +330,7 @@ impl ExecGuardPool {
             st.entries.push(GuardEntry {
                 id,
                 stream: None,
+                name: None,
                 handle,
             });
         }
@@ -322,7 +356,7 @@ impl Drop for GuardPermit {
 /// 確保済みのガード（スレッドは接続を待っている）。`start` で接続を渡して見張りを始める。
 /// 渡さずに drop するとスレッドは終了し、枠が戻る。
 pub(super) struct GuardSlot {
-    tx: std::sync::mpsc::Sender<UnixStream>,
+    tx: std::sync::mpsc::Sender<(UnixStream, u32)>,
     pool: Arc<ExecGuardPool>,
     id: u64,
 }
@@ -330,7 +364,7 @@ pub(super) struct GuardSlot {
 impl GuardSlot {
     /// pidfd を送り終えた接続をガードへ渡す。停止要求の後・複製できないときは渡さずに終える（ガードは接続を持たずに
     /// 終わり、クライアントの作成通知は失敗する。fail-closed）。
-    pub(super) fn start(self, stream: UnixStream) {
+    pub(super) fn start(self, stream: UnixStream, peer_pid: u32) {
         let Ok(copy) = stream.try_clone() else {
             return;
         };
@@ -344,12 +378,17 @@ impl GuardSlot {
                 None => return,
             }
         }
-        let _ = self.tx.send(stream);
+        let _ = self.tx.send((stream, peer_pid));
     }
 }
 
 /// ガードのスレッド本体: 通知 → ack → 切断か期限まで待つ → 回収。
-fn run_guard(pool: &ExecGuardPool, id: u64, _permit: GuardPermit, rx: &Receiver<UnixStream>) {
+fn run_guard(
+    pool: &ExecGuardPool,
+    id: u64,
+    _permit: GuardPermit,
+    rx: &Receiver<(UnixStream, u32)>,
+) {
     // 終わるとき（どの経路でも）停止用の接続の複製を手放す（複製が残ると fd が閉じない）。
     struct Release<'a>(&'a ExecGuardPool, u64);
     impl Drop for Release<'_> {
@@ -362,14 +401,15 @@ fn run_guard(pool: &ExecGuardPool, id: u64, _permit: GuardPermit, rx: &Receiver<
                 .find(|e| e.id == self.1)
             {
                 e.stream = None;
+                e.name = None;
             }
         }
     }
     let _release = Release(pool, id);
-    let Ok(mut stream) = rx.recv() else {
+    let Ok((mut stream, peer_pid)) = rx.recv() else {
         return;
     };
-    let Some(frame) = await_notify(&mut stream, &pool.limits) else {
+    let Some(frame) = await_notify(&mut stream, pool, id, peer_pid) else {
         return;
     };
     let mut trigger = hold(&mut stream, &frame, &pool.limits);
@@ -388,8 +428,11 @@ fn run_guard(pool: &ExecGuardPool, id: u64, _permit: GuardPermit, rx: &Receiver<
 /// ack を書けなくても、検証済みの名前は返す（相手が閉じたなら直後の待ちが切断として扱い回収する）。
 fn await_notify(
     stream: &mut UnixStream,
-    limits: &ExecGuardLimits,
+    pool: &ExecGuardPool,
+    id: u64,
+    peer_pid: u32,
 ) -> Option<ExecCgroupNotifyFrame> {
+    let limits = &pool.limits;
     let deadline = Instant::now().checked_add(limits.notify_wait)?;
     stream.set_write_timeout(Some(limits.write_timeout)).ok()?;
     let mut head = [0u8; HEADER_LEN];
@@ -412,11 +455,31 @@ fn await_notify(
     if let Err(reason) = frame.hold.remaining_from(now_ns) {
         return reject(stream, reason);
     }
+    // 名前を接続の所有と結びつける（SEC-1・#3808）。ack の前に判定し、拒否なら何も回収しない。
+    if name_pid(&frame.name) != Some(peer_pid) || peer_pid == 0 {
+        super::log_control_event("exec_notify_peer_pid_mismatch", None);
+        return reject(stream, ControlReason::Malformed);
+    }
+    if !pool.claim_name(id, &frame.name) {
+        super::log_control_event("exec_notify_duplicate_name", None);
+        return reject(stream, ControlReason::Malformed);
+    }
     let ack = ResponseFrame {
         reason: ControlReason::Ok,
     };
     let _ = stream.write_all(&ack.encode());
     Some(frame)
+}
+
+/// 名前 `exec-<pid>-<seq>` の pid（正規の 10 進の `u32` のみ。先頭 0・符号・空は `None`）。
+fn name_pid(name: &ExecCgroupName) -> Option<u32> {
+    let rest = name.as_str().strip_prefix("exec-")?;
+    let (pid_s, seq_s) = rest.split_once('-')?;
+    if seq_s.is_empty() || !seq_s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let pid: u32 = pid_s.parse().ok()?;
+    (pid.to_string() == pid_s).then_some(pid)
 }
 
 /// 拒否の応答を返して `None`（回収しない。名前を信用できない）。
@@ -493,5 +556,29 @@ mod tests {
         assert_eq!(reclaimer.reclaim(&name), ReclaimOutcome::Failed);
         assert_eq!(ReclaimOutcome::Failed.name(), "failed");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SUP-6・SEC-1・#3808: 名前の pid は正規の 10 進の `u32` だけを受ける。
+    #[test]
+    fn sup6_sec1_3808_name_pid_parses_canonical_decimal_only() {
+        let pid = |n: &str| name_pid(&ExecCgroupName::new(n).unwrap());
+        assert_eq!(pid("exec-123-0"), Some(123));
+        assert_eq!(pid("exec-4294967295-17"), Some(4_294_967_295));
+        assert_eq!(pid("exec-0123-0"), None);
+        assert_eq!(pid("exec-4294967296-0"), None);
+        assert_eq!(pid("exec-123"), None);
+        assert_eq!(pid("exec-123-"), None);
+        assert_eq!(pid("exec--5"), None);
+        assert_eq!(pid("exec-12a-0"), None);
+        assert_eq!(pid("exec-123-0x"), None);
+    }
+
+    /// SUP-6・SEC-1・#3808: core の名前の形式が変わったら、所有の照合が黙って全拒否にならないようここで検出する。
+    #[test]
+    fn sup6_sec1_3808_unique_name_carries_own_pid() {
+        assert_eq!(
+            name_pid(&ExecCgroupName::unique()),
+            Some(std::process::id())
+        );
     }
 }

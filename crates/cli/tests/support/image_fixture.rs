@@ -5,10 +5,7 @@
 //! 在庫へ公開するので、layers の mediaType も本番の cri の pull と同じ形で載る。
 //! cli の in-crate 試験（`image_unpack/tests.rs`）と結合試験（`binary_entry.rs`）が `#[path]` で共有する。
 //!
-//! 共有先ごとに使う項目が違い、macOS 向けの lib test では Linux 専用の試験だけが使う項目が未使用になるため、
-//! 項目単位ではなくモジュール全体で `dead_code` を許す（REPAIR-12）。
-
-#![allow(dead_code)]
+//! 共有先ごとに使う項目が違う（Linux 専用の試験だけが使う項目は `cfg(target_os = "linux")` で限定する。REPAIR-12）。
 
 use std::io::Write as _;
 
@@ -25,6 +22,8 @@ pub enum Entry<'a> {
     /// 通常ファイル（パス・内容）。`.wh.<name>` の名前で whiteout になる。
     File(&'a str, &'a [u8]),
     /// ディレクトリ（パス）。
+    // Dir を作るのは Linux 専用の `three_layer_tars` だけ（macOS 向けの lib test では未構築になる）。
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Dir(&'a str),
 }
 
@@ -144,6 +143,7 @@ pub fn seed_image(
 }
 
 /// 3 層の標準イメージの tar。下位の `etc/os` を 2 層目が上書きし、3 層目が `old/gone.txt` を whiteout で消す。
+#[cfg(target_os = "linux")]
 pub fn three_layer_tars() -> Vec<Vec<u8>> {
     vec![
         tar_of(&[

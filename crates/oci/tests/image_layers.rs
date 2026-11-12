@@ -9,7 +9,10 @@
 
 use std::fs;
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+#[path = "support/test_root.rs"]
+mod test_root;
 
 use fandhe_container_oci::error::OciErrorCode;
 use fandhe_container_oci::image_management::{
@@ -33,26 +36,22 @@ fn hex(d: &Digest) -> String {
     d.as_str().trim_start_matches("sha256:").to_string()
 }
 
-struct Root(PathBuf);
+struct Root(test_root::TestRoot);
 
 impl Root {
     fn new(tag: &str) -> Self {
-        let p = std::env::temp_dir().join(format!("fc-oci-layers-{tag}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&p);
-        fs::create_dir_all(p.join("blobs").join("sha256")).expect("mkdir");
-        use std::os::unix::fs::PermissionsExt as _;
-        fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).expect("chmod");
-        Root(p)
+        // 排他作成（0700）の共有部品。既存の名前は消さず辿らない。Drop は自分が作ったパスだけを消す。
+        let r = test_root::test_root("fc-oci-layers", tag);
+        fs::create_dir_all(r.join("blobs").join("sha256")).expect("mkdir");
+        Root(r)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
     }
 
     fn blob(&self, d: &Digest) -> PathBuf {
         self.0.join("blobs").join("sha256").join(hex(d))
-    }
-}
-
-impl Drop for Root {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
     }
 }
 
@@ -147,7 +146,7 @@ fn seed(
 #[test]
 fn oci7_oci1_2377_image_layers_returns_ordered_layers() {
     let root = Root::new("ok");
-    let store = ImageStore::open(&root.0).expect("open");
+    let store = ImageStore::open(root.path()).expect("open");
     let f = seed(&store, "l-1", Some(vec![TAR, TAR, TAR_GZIP]), None);
     let got = store.image_layers(&f.manifest).expect("layers");
     assert_eq!(got.manifest(), &f.manifest);
@@ -168,7 +167,7 @@ fn oci7_oci1_2377_image_layers_returns_ordered_layers() {
 #[test]
 fn oci7_2377_image_layers_unknown_manifest_is_not_found() {
     let root = Root::new("nf");
-    let store = ImageStore::open(&root.0).expect("open");
+    let store = ImageStore::open(root.path()).expect("open");
     let e = store.image_layers(&sha_of(b"nope")).expect_err("missing");
     assert_eq!(e.code(), OciErrorCode::NotFound);
 }
@@ -177,7 +176,7 @@ fn oci7_2377_image_layers_unknown_manifest_is_not_found() {
 #[test]
 fn oci7_2377_image_layers_without_media_types_is_failed_precondition() {
     let root = Root::new("nomt");
-    let store = ImageStore::open(&root.0).expect("open");
+    let store = ImageStore::open(root.path()).expect("open");
     let f = seed(&store, "l-2", None, None);
     let e = store.image_layers(&f.manifest).expect_err("unrecorded");
     assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
@@ -187,7 +186,7 @@ fn oci7_2377_image_layers_without_media_types_is_failed_precondition() {
 #[test]
 fn oci1_2377_image_layers_tampered_config_is_data_loss() {
     let root = Root::new("cfgdig");
-    let store = ImageStore::open(&root.0).expect("open");
+    let store = ImageStore::open(root.path()).expect("open");
     let f = seed(&store, "l-3", Some(vec![TAR, TAR, TAR_GZIP]), None);
     let p = root.blob(&f.config);
     let mut body = fs::read(&p).expect("read");
@@ -201,7 +200,7 @@ fn oci1_2377_image_layers_tampered_config_is_data_loss() {
 #[test]
 fn oci1_2377_image_layers_diff_id_count_mismatch_is_data_loss() {
     let root = Root::new("cnt");
-    let store = ImageStore::open(&root.0).expect("open");
+    let store = ImageStore::open(root.path()).expect("open");
     let two = vec![sha_of(b"x"), sha_of(b"y")];
     let f = seed(&store, "l-4", Some(vec![TAR, TAR, TAR_GZIP]), Some(two));
     let e = store.image_layers(&f.manifest).expect_err("mismatch");
@@ -213,7 +212,7 @@ fn oci1_2377_image_layers_diff_id_count_mismatch_is_data_loss() {
 fn sec1_2377_image_layers_untrusted_config_is_rejected() {
     use std::os::unix::fs::PermissionsExt as _;
     let root = Root::new("trust");
-    let store = ImageStore::open(&root.0).expect("open");
+    let store = ImageStore::open(root.path()).expect("open");
     let f = seed(&store, "l-5", Some(vec![TAR, TAR, TAR_GZIP]), None);
     fs::set_permissions(root.blob(&f.config), fs::Permissions::from_mode(0o666)).expect("chmod");
     let e = store.image_layers(&f.manifest).expect_err("untrusted");
@@ -224,7 +223,7 @@ fn sec1_2377_image_layers_untrusted_config_is_rejected() {
 #[test]
 fn oci7_2377_open_verified_layer_detects_tampering() {
     let root = Root::new("blob");
-    let store = ImageStore::open(&root.0).expect("open");
+    let store = ImageStore::open(root.path()).expect("open");
     let f = seed(&store, "l-6", Some(vec![TAR, TAR, TAR_GZIP]), None);
     let got = store.image_layers(&f.manifest).expect("layers");
     let ok = store

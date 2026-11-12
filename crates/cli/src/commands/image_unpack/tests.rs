@@ -4,21 +4,33 @@
 //! `create_with_image` を通す。期待値は具体値で書く。
 
 // 本物の pull 経路で多層イメージを作る共有 fixture（結合試験 `binary_entry.rs` と共有）。
+// Windows は `ImageStore` を開けない（入口で拒否）ため、fixture を使う試験は unix だけにある。
+#[cfg(unix)]
 #[path = "../../../tests/support/image_fixture.rs"]
 mod image_fixture;
 
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[cfg(unix)]
 use fandhe_container_core::audit_log::FileAuditSink;
+#[cfg(unix)]
 use fandhe_container_core::observability::OpRecorder;
+#[cfg(unix)]
 use fandhe_container_core::state_store::{FileStateStore, StateRoot};
+#[cfg(unix)]
 use fandhe_container_core::traits::{ContainerId, CreateRequest, ErrorCode};
 use fandhe_container_oci::image_management::ImageStore;
 
+#[cfg(unix)]
 use super::*;
+#[cfg(unix)]
 use crate::commands::create_start::{CreateImage, Runtime, create_container_with_image_reclaiming};
+#[cfg(unix)]
 use crate::commands::image_refs::state_scope;
+#[cfg(unix)]
 use image_fixture::{Entry, seed_image, tar_of};
 
 /// テスト用の一意な一時ディレクトリ（Drop で削除）。
@@ -56,6 +68,7 @@ impl TmpDir {
         Self(p)
     }
 
+    #[cfg(unix)]
     fn images(&self) -> ImageStore {
         let root = self.0.join("images");
         std::fs::create_dir_all(root.join("blobs").join("sha256")).expect("images");
@@ -67,6 +80,7 @@ impl TmpDir {
         ImageStore::open(&root).expect("open images")
     }
 
+    #[cfg(unix)]
     /// `rootfs/` の無い bundle（展開器が作る）。
     fn bundle(&self) -> PathBuf {
         let b = self.0.join("bundle");
@@ -79,6 +93,7 @@ impl TmpDir {
         b
     }
 
+    #[cfg(unix)]
     fn state(&self) -> FileStateStore {
         let root = StateRoot::from_override(self.0.join("state")).expect("root");
         FileStateStore::open(root).expect("open state")
@@ -91,10 +106,12 @@ impl Drop for TmpDir {
     }
 }
 
+#[cfg(unix)]
 fn id(s: &str) -> ContainerId {
     ContainerId::new(s).expect("id")
 }
 
+#[cfg(unix)]
 fn runtime(st: FileStateStore) -> Runtime {
     Runtime {
         audit: Box::new(FileAuditSink::in_state_store(&st)),
@@ -103,6 +120,7 @@ fn runtime(st: FileStateStore) -> Runtime {
     }
 }
 
+#[cfg(unix)]
 fn create_image(
     _base: &TmpDir,
     rt: &Runtime,
@@ -118,6 +136,7 @@ fn create_image(
     }
 }
 
+#[cfg(unix)]
 fn refs_of(images: &ImageStore, manifest: &Digest) -> usize {
     images
         .lock()
@@ -126,6 +145,7 @@ fn refs_of(images: &ImageStore, manifest: &Digest) -> usize {
         .count()
 }
 
+#[cfg(unix)]
 fn leftover_staging(bundle: &Path) -> Vec<String> {
     std::fs::read_dir(bundle)
         .expect("read bundle")

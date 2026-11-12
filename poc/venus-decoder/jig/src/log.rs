@@ -12,6 +12,7 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 
 use crate::recording::{RecordSummary, StopReason};
+use crate::ring_record::RingErrorCode;
 
 /// ログ全体の上限（バイト）。
 pub const MAX_LOG_BYTES: usize = 4 * 1024 * 1024;
@@ -305,6 +306,74 @@ pub fn record_stopped_line(reason: StopReason, records: u32) -> String {
     )
 }
 
+/// `CreateRingMESA` を受理したログ行（#1884）。`err` が `Some` なら記録対象にできなかった（`result=err code=<語彙>`）。
+/// 数値と固定語彙だけを出す。
+pub fn ring_create_line(
+    ring_id: u64,
+    res_id: u32,
+    buffer_size: u32,
+    err: Option<RingErrorCode>,
+) -> String {
+    match err {
+        None => format!(
+            "venus_jig event=ring_create ring={ring_id} res_id={res_id} buffer_size={buffer_size} result=ok"
+        ),
+        Some(c) => format!(
+            "venus_jig event=ring_create ring={ring_id} res_id={res_id} buffer_size={buffer_size} result=err code={}",
+            c.as_str()
+        ),
+    }
+}
+
+/// `CreateRingMESA` の本体を解析できなかったログ行（ring id が信頼できないため出さない）。
+pub fn ring_create_failed_line(code: RingErrorCode) -> String {
+    format!(
+        "venus_jig event=ring_create result=err code={}",
+        code.as_str()
+    )
+}
+
+/// リングの差分を 1 レコードとして記録したログ行。`seqno` は記録器の件数（`SUBMIT_3D` の本体のレコードと突き合わせる）。
+pub fn ring_record_line(
+    ring_id: u64,
+    res_id: u32,
+    from: u32,
+    to: u32,
+    len: u32,
+    seqno: u32,
+) -> String {
+    format!(
+        "venus_jig event=ring_record ring={ring_id} res_id={res_id} from={from} to={to} len={len} seqno={seqno} outcome=recorded"
+    )
+}
+
+/// リングの記録を止めたログ行（リングごとに 1 回だけ）。
+pub fn ring_error_line(ring_id: u64, code: RingErrorCode) -> String {
+    format!(
+        "venus_jig event=ring_error ring={ring_id} code={}",
+        code.as_str()
+    )
+}
+
+/// リングのスナップショットの集計行（セッション終了時に 1 回。REPAIR-4）。`result=read_failed` は読み取り失敗が 1 件以上あったこと。
+pub fn ring_summary_line(s: &crate::ring_record::RingStats) -> String {
+    let [b0, b1, b2, b3] = s.buckets;
+    format!(
+        "venus_jig event=ring_summary recorded={} empty={} rejected={} read_failed={} total_us={} max_us={} lt100us={b0} lt1ms={b1} lt10ms={b2} ge10ms={b3} result={}",
+        s.recorded,
+        s.empty,
+        s.rejected,
+        s.read_failed,
+        s.total_us,
+        s.max_us,
+        if s.read_failed == 0 {
+            "ok"
+        } else {
+            "read_failed"
+        }
+    )
+}
+
 /// 打ち切り後も [`LogSink::write_priority`] で書く行か（記録の停止通知・集計・起動エラー）。`event=` の値が固定語彙と
 /// 完全一致するときだけ真（`record_stopped_x` のような接頭辞一致は優先しない）。
 pub fn is_priority_line(line: &str) -> bool {
@@ -312,7 +381,10 @@ pub fn is_priority_line(line: &str) -> bool {
         return false;
     };
     let event = rest.split(' ').next().unwrap_or_default();
-    matches!(event, "record_stopped" | "record_summary" | "launch_error")
+    matches!(
+        event,
+        "record_stopped" | "record_summary" | "ring_summary" | "launch_error"
+    )
 }
 
 /// 終了時の記録の集計行。`write_ok` が偽なら `result=write_failed`（書き出しの失敗を成功と装わない）。

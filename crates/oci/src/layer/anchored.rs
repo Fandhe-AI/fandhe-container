@@ -239,6 +239,46 @@ mod imp {
             Ok(Self { fd })
         }
 
+        /// core が固定したディレクトリ fd を指す `/proc/self/fd/<10 進>` を、最後の要素の magic link を辿って開く
+        /// （`ImageRootfsUnpacker` の契約。core は展開先を `/proc/self/fd/N` で渡し、展開器が最終要素の symlink を
+        /// 辿ることを求める。OCI-7・SEC-1・#2377）。
+        ///
+        /// 受けるのは字句がちょうど `/proc/self/fd/<10 進>` のパスだけで、それ以外（追加の要素・別のプロセス・
+        /// 別の場所・符号や空の番号）は `InvalidArgument`。既存の入口は `O_NOFOLLOW` 付き、または
+        /// `RESOLVE_NO_MAGICLINKS` 付きでこのパスを開けないため別に設ける。`O_DIRECTORY` で開くので、
+        /// ディレクトリ以外の fd を指すものは拒否される。`openat2` が使えないカーネルは `Unimplemented`
+        /// （パス起点へ縮退しない）。
+        pub fn open_proc_fd_link(path: &Path) -> Result<Self, OciError> {
+            let invalid = || {
+                err(
+                    OciErrorCode::InvalidArgument,
+                    "extraction root is not a /proc/self/fd link",
+                )
+            };
+            let bytes = path.as_os_str().as_bytes();
+            let number = bytes.strip_prefix(b"/proc/self/fd/").ok_or_else(invalid)?;
+            if number.is_empty() || number.len() > 10 || !number.iter().all(u8::is_ascii_digit) {
+                return Err(invalid());
+            }
+            let c = std::ffi::CString::new(bytes).map_err(|_| invalid())?;
+            let fd = at::openat2(
+                None,
+                &c,
+                at::O_RDONLY | at::O_DIRECTORY | at::O_CLOEXEC,
+                0,
+                0,
+            )
+            .map_err(|e| match e.raw_os_error() {
+                Some(at::ENOSYS | at::E2BIG | at::EINVAL) => err(
+                    OciErrorCode::Unimplemented,
+                    "openat2 is not available on this kernel",
+                ),
+                Some(at::ENOTDIR) => not_a_directory(),
+                _ => map_fs_err(&e),
+            })?;
+            Ok(Self { fd })
+        }
+
         /// 開いた fd の (dev, ino)。構築時の検査結果との照合に使う。
         pub fn identity(&self) -> Result<(u64, u64), OciError> {
             use std::os::unix::fs::MetadataExt as _;
@@ -1014,6 +1054,14 @@ mod imp {
                 return Err(not_a_directory());
             }
             Ok(Self::from_path(path.to_path_buf()))
+        }
+
+        /// `/proc/self/fd/N` を開く入口は Linux の x86_64 / aarch64 だけ（パス起点へ縮退せず `Unimplemented`。#2377）。
+        pub fn open_proc_fd_link(_path: &Path) -> Result<Self, OciError> {
+            Err(err(
+                OciErrorCode::Unimplemented,
+                "opening a /proc/self/fd link is not supported on this platform",
+            ))
         }
 
         /// 保持するディレクトリの (dev, ino)（unix 以外は `(0, 0)`）。

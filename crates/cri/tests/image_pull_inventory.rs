@@ -341,6 +341,15 @@ fn oci7_pull_in_another_process_is_listed_and_registrable() {
     assert!(entry.missing_blobs.is_empty(), "{:?}", entry.missing_blobs);
     assert!(entry.size_bytes >= SIZE_LAYER1);
 
+    // pull の公開が layers の mediaType も在庫へ載せる（本番のレイヤー展開の入力。OCI-7・OCI-1・#2377）。
+    {
+        let guard = store.lock().expect("lock");
+        let comp = guard
+            .composition(&digest(SHA_MANIFEST))
+            .expect("composition");
+        assert_eq!(comp.layer_media_types(), Some(&[MEDIA_TAR.to_owned()][..]));
+    }
+
     // CLI の `create --image-root --image <digest>` が呼ぶ API。
     let id = ContainerRefId::new("c1").expect("id");
     assert_eq!(

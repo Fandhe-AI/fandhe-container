@@ -346,6 +346,8 @@ fn run_bounded_with_slot<T: Send + 'static>(
     job: impl FnOnce() -> T + Send + 'static,
     timeout: std::time::Duration,
 ) -> BoundedOutcome<T> {
+    // 起動前が単一スレッドなら、戻る時点でも単一スレッドであることを保証する（join_worker_bounded の doc）。
+    let settle = crate::thread_settle::is_single_threaded();
     let (tx, rx) = std::sync::mpsc::channel();
     let spawned = std::thread::Builder::new()
         .name("supervisor-log-remove".to_string())
@@ -361,7 +363,7 @@ fn run_bounded_with_slot<T: Send + 'static>(
             // 結果送信後の作業スレッドが生きたまま戻ると、呼び出し元が単一スレッド前提の処理
             // （`FileAuditSink` の fork。SEC-4）へ進めなくなる。終了を有限時間だけ確かめ、確認できなければ
             // 結果を捨てて期限切れ扱いにする（fail-closed。REPAIR-5）。
-            if join_worker_bounded(handle) {
+            if join_worker_bounded(handle, settle) {
                 BoundedOutcome::Done(v)
             } else {
                 BoundedOutcome::TimedOut
@@ -370,7 +372,7 @@ fn run_bounded_with_slot<T: Send + 'static>(
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => BoundedOutcome::TimedOut,
         // job の panic（結果を送らず終了）。従来どおり「終わった」扱いだが、値は無い。
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            let _ = join_worker_bounded(handle);
+            let _ = join_worker_bounded(handle, settle);
             BoundedOutcome::NoResult
         }
     }
@@ -380,7 +382,13 @@ fn run_bounded_with_slot<T: Send + 'static>(
 const WORKER_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// 作業スレッドが `WORKER_EXIT_GRACE` 内に終了したら join して `true`。終わらなければ join せず `false`。
-fn join_worker_bounded(handle: std::thread::JoinHandle<()>) -> bool {
+///
+/// `settle` が真（起動前が単一スレッドだった）なら、join の後に `/proc/self/status` の `Threads:` が 1 に戻るのも
+/// 同じ締切までで待つ。`pthread_join` はスレッド終了の通知で戻り、カーネルのスレッド数の減算はそれより少し後に
+/// なり得る。その窓で呼び出し元が core の監査 sink（単一スレッド前提の fork）へ進むと `isolation_unavailable` に
+/// なり監査が落ちるため（SEC-4・SUP-6・REPAIR-5・#2766）。戻らなければ `false`（期限切れ扱い。fail-closed）。
+/// 起動前から多スレッドの呼び出し元（plugin-cri 等）は待たない。
+fn join_worker_bounded(handle: std::thread::JoinHandle<()>, settle: bool) -> bool {
     let deadline = std::time::Instant::now() + WORKER_EXIT_GRACE;
     while !handle.is_finished() {
         if std::time::Instant::now() >= deadline {
@@ -389,6 +397,10 @@ fn join_worker_bounded(handle: std::thread::JoinHandle<()>) -> bool {
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
     let _ = handle.join();
+    if settle {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        return crate::thread_settle::wait_single_threaded(remaining);
+    }
     true
 }
 

@@ -452,6 +452,10 @@ deadline_case deadline-cap-3590 3600 1 "" "${P}" "${B}" "${S}" COUNT=1 RUN_TIMEO
 deadline_case deadline-cap-3600 3600 1 "" "${P}" "${B}" "${S}" COUNT=1 RUN_TIMEOUT=3600
 deadline_case deadline-overrides-caller 150 1 off "${P}" "${B}" "${S}" COUNT=1
 deadline_case deadline-lib-mode 150 1 "" "${P}" "${T}" COUNT=1
+# 通常のステップは RUN_TIMEOUT を空文字で渡しうる（#4565）。空は既定 120 秒、明示値はそのまま効く
+deadline_case deadline-empty-run-timeout-bin 150 1 "" "${P}" "${B}" "${S}" COUNT=1 RUN_TIMEOUT=
+deadline_case deadline-empty-run-timeout-lib 150 1 "" "${P}" "${T}" COUNT=1 RUN_TIMEOUT=
+deadline_case deadline-explicit-600-lib 630 1 "" "${P}" "${T}" COUNT=1 RUN_TIMEOUT=600
 check deadline-scope-mode 0 "passed=1 failed=0" scope-ok "${P}" "${B}" "SUCCESS_LINE=deadline-seen: 150" "${SB}" USER_SCOPE=1 COUNT=1
 # --- INFO_PREFIX: 成功した回の情報行を残す（#4548）---
 # count_lines <名前> <期待rc> <stdout の中で数える固定文字列（部分一致）> <期待件数> <STUB_MODE> <env...>

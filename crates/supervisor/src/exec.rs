@@ -611,13 +611,27 @@ pub fn default_audit_sink(
 /// CLI の `-e KEY=VALUE` 相当）だけで、検証済みの [`EnvVar`]（値なしの `-e KEY` によるホスト環境の継承を拒否する型。
 /// `container_options::env`）でしか受け取らない。exec を起動したプロセスの環境は、exec されたコマンドへ
 /// 1 つも渡らない（core の `exec/container_env.rs`）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ExecRequest {
     path: std::path::PathBuf,
     args: Vec<String>,
     env: Vec<EnvVar>,
     /// `env` の `KEY=VALUE` と NUL 終端ぶんの合計バイト数（上限検証用）。
     env_bytes: usize,
+}
+
+/// env の値は秘密を含み得るため Debug にはキーだけを出す（`EnvVar` の Debug に依存しない多層の防御。SEC-4・#3805）。
+/// argv は cmdline・監査の文脈に元から現れるので出す。
+impl std::fmt::Debug for ExecRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let keys: Vec<&str> = self.env.iter().map(EnvVar::key).collect();
+        f.debug_struct("ExecRequest")
+            .field("path", &self.path)
+            .field("args", &self.args)
+            .field("env_keys", &keys)
+            .field("env_bytes", &self.env_bytes)
+            .finish()
+    }
 }
 
 impl ExecRequest {
@@ -3279,6 +3293,20 @@ fn from_exec_error_staged(err: ExecError) -> WorkerError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sec4_3805_exec_request_debug_redacts_env_values() {
+        let req = ExecRequest::new("/bin/echo", ["echo", "hi"])
+            .unwrap()
+            .with_env(&[EnvVar::parse("TOKEN=s3cr3t-value").unwrap()])
+            .unwrap();
+        let dbg = format!("{req:?}");
+        assert!(!dbg.contains("s3cr3t-value"), "{dbg}");
+        assert_eq!(
+            dbg,
+            "ExecRequest { path: \"/bin/echo\", args: [\"echo\", \"hi\"], env_keys: [\"TOKEN\"], env_bytes: 19 }"
+        );
+    }
+
     use super::*;
     use fandhe_container_core::audit_log::{AuditDelivery, AuditLayer, AuditRecord};
 

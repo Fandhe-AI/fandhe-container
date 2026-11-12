@@ -79,6 +79,18 @@ fn seed_with_generation(
     running: bool,
     generation: Option<&str>,
 ) {
+    seed_with_pid(base, store, name, running, generation, PID);
+}
+
+/// [`seed_with_generation`] に、Running の記録の pid を指定できるようにしたもの（#2766）。
+fn seed_with_pid(
+    base: &TmpDir,
+    store: &FileStateStore,
+    name: &str,
+    running: bool,
+    generation: Option<&str>,
+    pid: u32,
+) {
     let bundle = base.0.join("bundle");
     std::fs::create_dir_all(bundle.join("rootfs")).expect("rootfs");
     std::fs::write(bundle.join("config.json"), "{}").expect("config");
@@ -93,7 +105,7 @@ fn seed_with_generation(
     if running {
         store
             .update(&UpdateStateRequest::new(
-                ContainerStatus::running(id(name), NonZeroU32::new(PID)),
+                ContainerStatus::running(id(name), NonZeroU32::new(pid)),
                 created.revision(),
             ))
             .expect("running");
@@ -452,6 +464,69 @@ fn sec1_handover_failure_stops_before_run() {
     assert!(fake.seen.lock().unwrap().is_empty());
     // 取得の失敗では監査に何も書かない（拒否の記録は run_command_with_pidfd の責務）。
     assert_eq!(probe.records.load(Ordering::SeqCst), 0);
+}
+
+/// SUP-6・SUP-8・SEC-1・SEC-4・#2766: supervisor 不在（制御ソケットが無い・残骸だけ・Hello 前に切断）のとき、
+/// 本物の取得元（`production_exec_pidfd_source`）が `Unavailable` を返し、記録の pid（ここでは生きている自プロセス）
+/// からの `pidfd_open` へ縮退しない。縮退があれば実行役が呼ばれる。`sec1_handover_failure_stops_before_run`
+/// （偽の取得元）を補う。
+#[test]
+fn sup6_sup8_sec4_2766_absent_supervisor_is_unavailable_without_pidfd_fallback() {
+    use std::os::unix::net::UnixListener;
+    let live_pid = std::process::id();
+    for scenario in ["no-socket", "stale-socket", "closes-before-hello"] {
+        let base = TmpDir::new("absent-sup");
+        let store = open(&base);
+        seed_with_pid(&base, &store, "c1", true, None, live_pid);
+        let sock_dir = base.state_root().join("c1");
+        let hold = match scenario {
+            "no-socket" => None,
+            "stale-socket" => {
+                // bind して閉じ、ソケットファイルの残骸だけを残す（接続拒否）。
+                let l = UnixListener::bind(sock_dir.join("supervisor.sock")).expect("bind");
+                drop(l);
+                None
+            }
+            _ => {
+                let l = UnixListener::bind(sock_dir.join("supervisor.sock")).expect("bind");
+                let l2 = l.try_clone().expect("clone");
+                let t = std::thread::spawn(move || {
+                    // 受け付けてすぐ閉じる（Hello を返さずに切れる）。
+                    if let Ok((s, _)) = l2.accept() {
+                        drop(s);
+                    }
+                });
+                Some((l, t))
+            }
+        };
+        let probe = Probe::default();
+        let fake = FakeRun::must_not_run();
+        let source = fandhe_container_supervisor::control::production_exec_pidfd_source(&store);
+        let e = exec_in_container(
+            &store,
+            &*source,
+            &|root| probe.make(root),
+            &runner(&fake),
+            &id("c1"),
+            &req(),
+            Duration::from_secs(30),
+        )
+        .unwrap_err();
+        assert_eq!(e.code(), ErrorCode::Unavailable, "{scenario}");
+        assert_eq!(
+            e.message(),
+            "the supervisor control channel is unavailable",
+            "{scenario}"
+        );
+        assert!(fake.seen.lock().unwrap().is_empty(), "{scenario}");
+        assert_eq!(probe.records.load(Ordering::SeqCst), 0, "{scenario}");
+        if let Some((l, t)) = hold {
+            // 接続は 1 回で accept が済む。済まなければ自分で 1 回つないで解除する。
+            let _ = std::os::unix::net::UnixStream::connect(sock_dir.join("supervisor.sock"));
+            let _ = t.join();
+            drop(l);
+        }
+    }
 }
 
 /// REPAIR-5: 全体の期限が尽きていれば（pidfd の受け渡しの後に残りが無い）exec せず Timeout。

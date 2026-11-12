@@ -308,6 +308,56 @@ fn own_name(seq: u32) -> String {
     format!("exec-{}-{seq}", std::process::id())
 }
 
+/// SUP-6・SUP-8・SEC-1・SEC-4・#2766: supervisor 不在（制御ソケットが無い・残骸だけ・Hello 前に切断）は、
+/// 本物の取得元で固定文言の `Unavailable` になり、fd は届かない（`state.json` の pid からの `pidfd_open` へ縮退しない。
+/// 縮退の否定は cli の `sup6_sup8_sec4_2766_*` が生きている pid で照合する）。
+#[test]
+fn sup6_sup8_sec4_2766_absent_supervisor_is_unavailable() {
+    use std::os::unix::net::UnixListener;
+    for scenario in ["no-socket", "stale-socket", "closes-before-hello"] {
+        let root = TempRoot::new("absent");
+        let id = ContainerId::new("absent").unwrap();
+        let dir = root.0.join("absent");
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        }
+        let sock = dir.join("supervisor.sock");
+        let mut hold = None;
+        match scenario {
+            "stale-socket" => drop(UnixListener::bind(&sock).unwrap()),
+            "closes-before-hello" => {
+                let l = UnixListener::bind(&sock).unwrap();
+                let t = std::thread::spawn(move || {
+                    if let Ok((s, _)) = l.accept() {
+                        drop(s);
+                    }
+                });
+                hold = Some(t);
+            }
+            _ => {}
+        }
+        let started = Instant::now();
+        let e = ControlExecHandover::new(root.0.clone())
+            .obtain(
+                &id,
+                NonZeroU32::new(std::process::id()).unwrap(),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap_err();
+        assert_eq!(e.code(), ErrorCode::Unavailable, "{scenario}");
+        assert_eq!(
+            e.message(),
+            "the supervisor control channel is unavailable",
+            "{scenario}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(3), "{scenario}");
+        if let Some(t) = hold {
+            t.join().unwrap();
+        }
+    }
+}
+
 fn name(s: &str) -> ExecCgroupName {
     ExecCgroupName::new(s).unwrap()
 }

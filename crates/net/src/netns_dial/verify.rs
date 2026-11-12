@@ -7,10 +7,12 @@
 //!
 //! # 検査（安い順。1 つでも外れたら拒否し、fd は drop で閉じる）
 //! 1. socket であること（`SO_TYPE` が `ENOTSOCK` でない）かつ `SOCK_STREAM`
-//! 2. `AF_INET`（AF_UNIX・AF_INET6・v4-mapped を拒否）かつ `IPPROTO_TCP`（SCTP 等を拒否）
-//! 3. peer が `127.0.0.1:<要求した port>` と完全一致
-//! 4. local が IPv4 loopback（127/8）
-//! 5. `SIOCGSKNS` で得た netns の (dev, ino) が保持役の素性と一致。`SIOCGSKNS` が失敗したら照合を飛ばさず拒否する
+//! 2. `AF_INET` か `AF_INET6`（AF_UNIX 等を拒否）かつ `IPPROTO_TCP`（SCTP 等を拒否）。ファミリは以降の 3・4 の
+//!    アドレスの型と結びつける（#4572: helper は `127.0.0.1` を試し、失敗したら `::1` でつなぎ直す）
+//! 3. peer が `127.0.0.1:<要求した port>` か `[::1]:<要求した port>`（scope 0）と完全一致。ファミリと食い違う型、
+//!    v4-mapped（`::ffff:127.0.0.1`）・IPv4 互換形・`::1` 以外の IPv6 は正規化せずに拒否する
+//! 4. local が IPv4 なら loopback（127/8）、IPv6 なら `::1` だけ
+//! 5. `SIOCGSKNS`（IPv6 でも必須）で得た netns の (dev, ino) が保持役の素性と一致。`SIOCGSKNS` が失敗したら照合を飛ばさず拒否する
 //!    （fail-closed。#4491 の判断 1〔2026-11-12〕で必須と決定。拒否されても緩めない）。非 root の plugin-cri では host netns の socket は
 //!    ioctl の `EPERM` で拒否され、これが主な拒否経路になる（`sys/dial.rs` の「カーネルの要求」）
 //!
@@ -21,7 +23,7 @@
 //! ブロッキング状態・timeout は変えない（設定は呼び出し側 #4484 が行う。REPAIR-5）。待ちは持たない。
 //! 非 Linux ではモジュールごと提供しない（`netns_holder` の channel と同じ扱い）。
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::num::NonZeroU16;
 
 use crate::error::{NetError, NetErrorCode};
@@ -57,15 +59,15 @@ pub enum DialedSocketRejection {
     NotSocket,
     /// `SOCK_STREAM` ではない。
     NotStream,
-    /// `AF_INET` ではない。
+    /// `AF_INET` でも `AF_INET6` でもない。
     NotInet,
     /// `IPPROTO_TCP` ではない。
     NotTcp,
     /// 接続済みではない（`ENOTCONN`）。
     NotConnected,
-    /// peer が `127.0.0.1:<要求した port>` でない。
+    /// peer が `127.0.0.1:<要求した port>` でも `[::1]:<要求した port>` でもない（ファミリと型の食い違いを含む）。
     PeerMismatch,
-    /// local が IPv4 loopback でない。
+    /// local が IPv4 loopback（127/8）でも `::1` でもない（ファミリと型の食い違いを含む）。
     LocalNotLoopback,
     /// `SIOCGSKNS` が失敗した（権限不足を含む。fail-closed）。
     NetnsUnavailable,
@@ -146,7 +148,7 @@ impl From<DialedSocketError> for NetError {
         let msg = match e.reason {
             Some(DialedSocketRejection::NotSocket) => "dialed fd is not a socket",
             Some(DialedSocketRejection::NotStream) => "dialed socket is not a stream socket",
-            Some(DialedSocketRejection::NotInet) => "dialed socket is not an IPv4 socket",
+            Some(DialedSocketRejection::NotInet) => "dialed socket is not an IPv4 or IPv6 socket",
             Some(DialedSocketRejection::NotTcp) => "dialed socket is not a TCP socket",
             Some(DialedSocketRejection::NotConnected) => "dialed socket is not connected",
             Some(DialedSocketRejection::PeerMismatch) => {
@@ -172,6 +174,7 @@ impl From<DialedSocketError> for NetError {
 
 const SOCK_STREAM: i32 = 1;
 const AF_INET: i32 = 2;
+const AF_INET6: i32 = 10;
 const IPPROTO_TCP: i32 = 6;
 
 // 定数の `libc` 照合（coding-rust.md「unsafe・FFI・syscall」。Linux の値と比べる。他 OS の値は同じ ABI 値のため対象外）。
@@ -179,39 +182,71 @@ const IPPROTO_TCP: i32 = 6;
 const _: () = {
     assert!(SOCK_STREAM == libc::SOCK_STREAM);
     assert!(AF_INET == libc::AF_INET);
+    assert!(AF_INET6 == libc::AF_INET6);
     assert!(IPPROTO_TCP == libc::IPPROTO_TCP);
 };
 
-/// socket の種別・ファミリ・プロトコルの照合（検査 1・2）。
+/// 接続済み socket のアドレスファミリ（検査 2 の結果。3・4 のアドレスの型と結びつける）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DialFamily {
+    /// `AF_INET`。
+    V4,
+    /// `AF_INET6`。
+    V6,
+}
+
+/// socket の種別・ファミリ・プロトコルの照合（検査 1・2）。ファミリを返す。
 pub(crate) fn check_kind(
     so_type: i32,
     domain: i32,
     protocol: i32,
-) -> Result<(), DialedSocketRejection> {
+) -> Result<DialFamily, DialedSocketRejection> {
     if so_type != SOCK_STREAM {
         return Err(DialedSocketRejection::NotStream);
     }
-    if domain != AF_INET {
-        return Err(DialedSocketRejection::NotInet);
-    }
+    let family = match domain {
+        AF_INET => DialFamily::V4,
+        AF_INET6 => DialFamily::V6,
+        _ => return Err(DialedSocketRejection::NotInet),
+    };
     if protocol != IPPROTO_TCP {
         return Err(DialedSocketRejection::NotTcp);
     }
-    Ok(())
+    Ok(family)
 }
 
-/// peer が `127.0.0.1:<port>` と完全一致するかの照合（検査 3）。
-pub(crate) fn check_peer(peer: SocketAddr, port: NonZeroU16) -> Result<(), DialedSocketRejection> {
-    match peer {
-        SocketAddr::V4(a) if *a.ip() == Ipv4Addr::LOCALHOST && a.port() == port.get() => Ok(()),
+/// peer が `127.0.0.1:<port>` か `[::1]:<port>`（scope 0）と、ファミリに合う側で完全一致するかの照合（検査 3）。
+///
+/// 正規化（`to_canonical` 等）はしない。正規化すると v4-mapped（`::ffff:127.0.0.1`）が通ってしまうため。
+/// flowinfo は見ない（宛先を固定で組む helper は 0 で接続する）。
+pub(crate) fn check_peer(
+    peer: SocketAddr,
+    port: NonZeroU16,
+    family: DialFamily,
+) -> Result<(), DialedSocketRejection> {
+    match (family, peer) {
+        (DialFamily::V4, SocketAddr::V4(a))
+            if *a.ip() == Ipv4Addr::LOCALHOST && a.port() == port.get() =>
+        {
+            Ok(())
+        }
+        (DialFamily::V6, SocketAddr::V6(a))
+            if *a.ip() == Ipv6Addr::LOCALHOST && a.scope_id() == 0 && a.port() == port.get() =>
+        {
+            Ok(())
+        }
         _ => Err(DialedSocketRejection::PeerMismatch),
     }
 }
 
-/// local が IPv4 loopback（127/8）かの照合（検査 4）。
-pub(crate) fn check_local(local: SocketAddr) -> Result<(), DialedSocketRejection> {
-    match local {
-        SocketAddr::V4(a) if a.ip().is_loopback() => Ok(()),
+/// local が IPv4 なら loopback（127/8）、IPv6 なら `::1` だけかの照合（検査 4）。
+pub(crate) fn check_local(
+    local: SocketAddr,
+    family: DialFamily,
+) -> Result<(), DialedSocketRejection> {
+    match (family, local) {
+        (DialFamily::V4, SocketAddr::V4(a)) if a.ip().is_loopback() => Ok(()),
+        (DialFamily::V6, SocketAddr::V6(a)) if *a.ip() == Ipv6Addr::LOCALHOST => Ok(()),
         _ => Err(DialedSocketRejection::LocalNotLoopback),
     }
 }
@@ -257,7 +292,8 @@ pub fn verify_dialed_socket(
     };
     let domain = holder::socket_domain(fd.as_fd()).map_err(sys_fail)?;
     let protocol = holder::socket_protocol(fd.as_fd()).map_err(sys_fail)?;
-    check_kind(so_type, domain, protocol).map_err(|r| DialedSocketError::rejected(r, None))?;
+    let family =
+        check_kind(so_type, domain, protocol).map_err(|r| DialedSocketError::rejected(r, None))?;
 
     let stream = std::net::TcpStream::from(fd);
     let peer = stream.peer_addr().map_err(|e| {
@@ -267,11 +303,11 @@ pub fn verify_dialed_socket(
             DialedSocketError::unexpected(NetErrorCode::Internal, e.raw_os_error())
         }
     })?;
-    check_peer(peer, expected.port).map_err(|r| DialedSocketError::rejected(r, None))?;
+    check_peer(peer, expected.port, family).map_err(|r| DialedSocketError::rejected(r, None))?;
     let local = stream
         .local_addr()
         .map_err(|e| DialedSocketError::unexpected(NetErrorCode::Internal, e.raw_os_error()))?;
-    check_local(local).map_err(|r| DialedSocketError::rejected(r, None))?;
+    check_local(local, family).map_err(|r| DialedSocketError::rejected(r, None))?;
 
     // netns の照合は必須（fail-closed）。ioctl の失敗（EPERM・ENOTTY 等）で飛ばさない。
     let nsfd = match dial::socket_netns(stream.as_fd()) {
@@ -317,14 +353,16 @@ mod tests {
     fn sec1_net3_4478_check_kind_rejects_each_mismatch() {
         assert_eq!(check_kind(2, 2, 17), Err(DialedSocketRejection::NotStream));
         assert_eq!(check_kind(1, 1, 0), Err(DialedSocketRejection::NotInet));
-        assert_eq!(check_kind(1, 10, 6), Err(DialedSocketRejection::NotInet));
+        assert_eq!(check_kind(1, 10, 6), Ok(DialFamily::V6));
+        assert_eq!(check_kind(1, 10, 132), Err(DialedSocketRejection::NotTcp));
         assert_eq!(check_kind(1, 2, 132), Err(DialedSocketRejection::NotTcp));
-        assert_eq!(check_kind(1, 2, 6), Ok(()));
+        assert_eq!(check_kind(1, 2, 6), Ok(DialFamily::V4));
     }
 
-    /// peer は `127.0.0.1` と port の完全一致だけを受ける。
+    /// peer はファミリに合う `127.0.0.1` / `[::1]` と port の完全一致だけを受ける（#4572）。
     #[test]
-    fn sec1_net3_4478_check_peer_requires_exact_loopback_and_port() {
+    fn sec1_net3_4572_check_peer_requires_exact_loopback_and_port() {
+        use std::net::SocketAddrV6;
         let want = port(8080);
         for bad in [
             "127.0.0.1:8081",
@@ -335,30 +373,70 @@ mod tests {
         ] {
             let a: SocketAddr = bad.parse().expect("addr");
             assert_eq!(
-                check_peer(a, want),
+                check_peer(a, want, DialFamily::V4),
                 Err(DialedSocketRejection::PeerMismatch),
-                "{bad}"
+                "v4 {bad}"
             );
         }
-        let ok: SocketAddr = "127.0.0.1:8080".parse().expect("addr");
-        assert_eq!(check_peer(ok, want), Ok(()));
+        let ok4: SocketAddr = "127.0.0.1:8080".parse().expect("addr");
+        assert_eq!(check_peer(ok4, want, DialFamily::V4), Ok(()));
+
+        for bad in [
+            "[::1]:8081",
+            "[::ffff:127.0.0.1]:8080",
+            "[::127.0.0.1]:8080",
+            "[::2]:8080",
+            "[::]:8080",
+            "[fe80::1]:8080",
+            "127.0.0.1:8080",
+        ] {
+            let a: SocketAddr = bad.parse().expect("addr");
+            assert_eq!(
+                check_peer(a, want, DialFamily::V6),
+                Err(DialedSocketRejection::PeerMismatch),
+                "v6 {bad}"
+            );
+        }
+        let scoped = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 8080, 0, 3));
+        assert_eq!(
+            check_peer(scoped, want, DialFamily::V6),
+            Err(DialedSocketRejection::PeerMismatch)
+        );
+        let ok6: SocketAddr = "[::1]:8080".parse().expect("addr");
+        assert_eq!(check_peer(ok6, want, DialFamily::V6), Ok(()));
     }
 
-    /// local は IPv4 の 127/8 だけを受ける。
+    /// local は IPv4 なら 127/8、IPv6 なら `::1` だけを受ける（#4572）。
     #[test]
-    fn sec1_net3_4478_check_local_requires_ipv4_loopback() {
+    fn sec1_net3_4572_check_local_requires_family_loopback() {
         for bad in ["10.0.0.2:5000", "[::1]:5000"] {
             let a: SocketAddr = bad.parse().expect("addr");
             assert_eq!(
-                check_local(a),
+                check_local(a, DialFamily::V4),
                 Err(DialedSocketRejection::LocalNotLoopback),
-                "{bad}"
+                "v4 {bad}"
             );
         }
         for ok in ["127.0.0.1:5000", "127.1.2.3:5000"] {
             let a: SocketAddr = ok.parse().expect("addr");
-            assert_eq!(check_local(a), Ok(()), "{ok}");
+            assert_eq!(check_local(a, DialFamily::V4), Ok(()), "{ok}");
         }
+        for bad in [
+            "[::ffff:127.0.0.1]:5000",
+            "[::]:5000",
+            "[::2]:5000",
+            "[fe80::1]:5000",
+            "127.0.0.1:5000",
+        ] {
+            let a: SocketAddr = bad.parse().expect("addr");
+            assert_eq!(
+                check_local(a, DialFamily::V6),
+                Err(DialedSocketRejection::LocalNotLoopback),
+                "v6 {bad}"
+            );
+        }
+        let ok: SocketAddr = "[::1]:5000".parse().expect("addr");
+        assert_eq!(check_local(ok, DialFamily::V6), Ok(()));
     }
 
     /// dev・ino のどちらが違っても `NetnsMismatch`。
@@ -447,6 +525,63 @@ mod tests {
             let wrong = real.checked_add(1).unwrap_or(real - 1);
             let c = TcpStream::connect(("127.0.0.1", real)).expect("connect");
             let e = reject(OwnedFd::from(c), exp(wrong));
+            assert_eq!(e.reason(), Some(DialedSocketRejection::PeerMismatch));
+        }
+
+        /// IPv6 の stream は netns の段まで進む（#4572）。`Ok` か `EPERM`（`NetnsUnavailable`）、1 ずらせば
+        /// `NetnsMismatch` か `EPERM`。
+        #[test]
+        fn sec1_net3_4572_ipv6_stream_reaches_netns_stage() {
+            let l = TcpListener::bind("[::1]:0").expect("bind ::1");
+            let p = l.local_addr().expect("addr").port();
+            let cur = current();
+            let run = |ns: NsId| {
+                let c = TcpStream::connect(("::1", p)).expect("connect");
+                let _accepted = l.accept().expect("accept");
+                verify_dialed_socket(OwnedFd::from(c), DialExpectation::new(port(p), ns))
+            };
+            let same = run(cur);
+            let shifted = run(NsId::new(cur.dev(), cur.ino() + 1));
+            match (same, shifted) {
+                (Ok(s), Err(e)) => {
+                    assert_eq!(
+                        s.peer_addr().expect("peer").to_string(),
+                        format!("[::1]:{p}")
+                    );
+                    assert_eq!(e.reason(), Some(DialedSocketRejection::NetnsMismatch));
+                }
+                (Err(a), Err(b)) => {
+                    for e in [a, b] {
+                        assert_eq!(e.reason(), Some(DialedSocketRejection::NetnsUnavailable));
+                        assert_eq!(e.errno(), Some(1));
+                    }
+                }
+                (a, b) => panic!("unexpected: {:?} / {:?}", a.map(|_| ()), b.map(|_| ())),
+            }
+        }
+
+        /// IPv6 で port が違えば `PeerMismatch`（#4572）。
+        #[test]
+        fn sec1_net3_4572_ipv6_peer_port_mismatch_rejected() {
+            let l = TcpListener::bind("[::1]:0").expect("bind ::1");
+            let real = l.local_addr().expect("addr").port();
+            let wrong = real.checked_add(1).unwrap_or(real - 1);
+            let c = TcpStream::connect(("::1", real)).expect("connect");
+            let e = reject(OwnedFd::from(c), exp(wrong));
+            assert_eq!(e.reason(), Some(DialedSocketRejection::PeerMismatch));
+        }
+
+        /// v4-mapped（`::ffff:127.0.0.1` への AF_INET6 の接続）は peer の段で拒否する（#4572）。
+        /// v4-mapped の接続が作れない環境（`ipv6.disable` 等）では作れた場合だけ確かめる。
+        #[test]
+        fn sec1_net3_4572_v4_mapped_peer_rejected() {
+            let l = TcpListener::bind("[::]:0").expect("bind dual-stack");
+            let p = l.local_addr().expect("addr").port();
+            let mapped: SocketAddr = format!("[::ffff:127.0.0.1]:{p}").parse().expect("addr");
+            let Ok(c) = TcpStream::connect(mapped) else {
+                return;
+            };
+            let e = reject(OwnedFd::from(c), exp(p));
             assert_eq!(e.reason(), Some(DialedSocketRejection::PeerMismatch));
         }
 

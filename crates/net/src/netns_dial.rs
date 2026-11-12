@@ -2,7 +2,7 @@
 //! 設計は `docs/design/cri-streaming-server.md`「POD ネットワークの PortForward の設計（#3766）」）。
 //!
 //! plugin-cri は dial ごとに単一スレッドの helper を立て、helper は保持役の user / net namespace へ `setns` して
-//! `127.0.0.1:<port>` へ connect し、接続済みの fd を `SCM_RIGHTS` で返す。本モジュールの現状は両者の間を行き来する
+//! `127.0.0.1:<port>`（失敗したら `[::1]:<port>`）へ connect し、接続済みの fd を `SCM_RIGHTS` で返す。本モジュールの現状は両者の間を行き来する
 //! 固定長 frame（[`frame`]。OS 非依存の純関数）、受け取った fd の検証 `verify`
 //! （`verify_dialed_socket`。#4478。SEC-1 の多層防御。`NsId` が Linux 限定のため Linux のみ）、helper 本体
 //! `run_netns_dial_main`（#4479。Linux のみ。それ以外は終了コード 1）。親側の channel `channel`
@@ -18,7 +18,7 @@
 //!    `netns_install` は対象 netns の所有 userns と現 cred の userns の両方に `CAP_SYS_ADMIN` を要求する）。
 //!    参加後に dumpable が 0 のままであることを確かめる（0 でなければ `JoinFailed`。#4558）
 //! 5. capability を空にし、NNP・PDEATHSIG の再武装・non-dumpable の再設定と確認を行う
-//! 6. `127.0.0.1:<port>` へ要求の期限つきで connect し、接続済み fd 1 本を添えた `Connected` か `Error{code}` を返す
+//! 6. `127.0.0.1:<port>`、失敗したら残り時間で `[::1]:<port>` へ要求の期限つき（合計で延ばさない）で connect し、接続済み fd 1 本を添えた `Connected` か `Error{code}` を返す
 //!
 //! 終了コードは `Connected` を送れたら 0、それ以外の失敗は 1、argv の誤りは 2。
 

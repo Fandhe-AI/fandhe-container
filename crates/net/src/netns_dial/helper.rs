@@ -24,8 +24,13 @@
 //! | 参加 | `setns` の失敗・`/proc/self/ns` を開けない・参加後に dumpable が 0 でない | `JoinFailed` | 1 |
 //! | 照合 | 参加後の (dev, ino) が受けた fd と違う | `IdentityMismatch` | 1 |
 //! | 特権の破棄 | capset・NNP・PDEATHSIG・non-dumpable の失敗 | `JoinFailed` | 1 |
-//! | connect | 拒否 / 期限切れ / その他（未知は fail-closed で寄せる） | `Refused` / `TimedOut` / `Unreachable` | 1 |
+//! | connect | `127.0.0.1` と `::1` の両方が失敗。IPv4 の理由を返す。どちらかが期限切れ、または IPv4 の後に残りが 0 なら `TimedOut`（未知は fail-closed で `Unreachable`） | `Refused` / `TimedOut` / `Unreachable` | 1 |
 //! | 応答 | `Connected` + fd 1 本を送れた | `Connected` | 0 |
+//!
+//! connect は固定の 2 宛先を順に試す（#4572。containerd の `sandbox_portforward_linux.go` が `tcp4` の後に `tcp6` を
+//! 試すのに合わせた。オーナーが決めたのは「IPv4 で失敗したら `::1` でつなぎ直す・宛先は 2 つに固定・期限は延ばさない」
+//! まで）。両方失敗したときの理由の選び方（IPv4 の理由を返し、期限切れは `TimedOut` で区別する）は Agent が安全側に
+//! 倒して記録した判断で、オーナーの承認は得ていない。要求の期限 C は `Deadline` 1 つで共有し、IPv6 には残り時間だけを渡す。
 //!
 //! 受信の期限切れを `TimedOut` にしないのは、`TimedOut` を connect の期限切れ専用にして、親側（#4480）が
 //! 区別できるようにするため。
@@ -33,7 +38,7 @@
 use std::ffi::OsString;
 use std::fs::File;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
 use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -196,11 +201,56 @@ fn receive_request(
     Ok((req, user, net))
 }
 
-/// 宛先は `127.0.0.1` 固定（`::1` は試さない）。スレッドを作らず、期限は要求の値（上限 10 秒）。
+/// helper が試す宛先（固定。要求から組み立てない）。順序が優先順位で、IPv4 を先に試す。
+const LOOPBACK_ADDRS: [std::net::IpAddr; 2] = [
+    std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
+    std::net::IpAddr::V6(Ipv6Addr::LOCALHOST),
+];
+
+/// つなぎ直しの判断（純関数。接続と残り時間を注入して試験する。#4572）。
+///
+/// 1. `127.0.0.1:port` へ `remaining()` の期間で接続し、成功ならそれを返す。
+/// 2. 失敗が期限切れなら `TimedOut` を返し、IPv6 は試さない。
+/// 3. 改めて `remaining()` を読み、0 なら `TimedOut`（`TcpStream::connect_timeout` は 0 の期間を `InvalidInput` で
+///    拒否し、それが `Unreachable` に化けるため分ける）。
+/// 4. 残り時間で `[::1]:port` へ接続し、成功ならそれを返す。失敗が期限切れなら `TimedOut`、それ以外は IPv4 の理由。
+///
+/// 合計の待ちは `remaining()` が基づく期限 C を超えない（延ばさない）。
+fn dial_loopback_with<T>(
+    port: u16,
+    mut connect: impl FnMut(SocketAddr, Duration) -> io::Result<T>,
+    mut remaining: impl FnMut() -> Duration,
+) -> Result<T, DialErrorCode> {
+    let [first, second] = LOOPBACK_ADDRS;
+    let first_err = match connect(SocketAddr::new(first, port), remaining()) {
+        Ok(v) => return Ok(v),
+        Err(e) => classify_connect_error(&e),
+    };
+    if first_err == DialErrorCode::TimedOut {
+        return Err(DialErrorCode::TimedOut);
+    }
+    let left = remaining();
+    if left.is_zero() {
+        return Err(DialErrorCode::TimedOut);
+    }
+    match connect(SocketAddr::new(second, port), left) {
+        Ok(v) => Ok(v),
+        Err(e) if classify_connect_error(&e) == DialErrorCode::TimedOut => {
+            Err(DialErrorCode::TimedOut)
+        }
+        Err(_) => Err(first_err),
+    }
+}
+
+/// 宛先は `127.0.0.1`、失敗したら `::1` の固定（[`dial_loopback_with`]）。スレッドを作らず、期限は要求の値
+/// （上限 10 秒）を IPv4 の試行の直前から数える `Deadline` 1 つで両方の試行が共有する。
 fn connect_loopback(req: &DialRequest) -> Result<TcpStream, DialErrorCode> {
-    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, req.port().get()));
-    TcpStream::connect_timeout(&addr, req.connect_timeout().as_duration())
-        .map_err(|e| classify_connect_error(&e))
+    let deadline = Deadline::after(req.connect_timeout().as_duration());
+    dial_loopback_with(
+        req.port().get(),
+        |addr, timeout| TcpStream::connect_timeout(&addr, timeout),
+        || deadline.remaining(),
+    )
 }
 
 fn respond_error(fd: BorrowedFd<'_>, code: DialErrorCode) -> Outcome {
@@ -488,6 +538,152 @@ mod tests {
         assert_eq!(resp, DialResponse::Error(DialErrorCode::Refused));
         assert_eq!(got.len(), 0);
         assert!(j.joined && j.hardened);
+    }
+
+    /// 偽の接続と時計で `dial_loopback_with` を駆動する。呼び出しの記録（宛先と期間）を返す。
+    fn drive_dial(
+        results: Vec<io::Result<()>>,
+        remaining: Vec<Duration>,
+    ) -> (Result<(), DialErrorCode>, Vec<(SocketAddr, Duration)>) {
+        let mut calls = Vec::new();
+        let mut res = results.into_iter();
+        let mut rem = remaining.into_iter();
+        let out = dial_loopback_with(
+            8080,
+            |a, t| {
+                calls.push((a, t));
+                res.next().expect("unexpected extra connect")
+            },
+            || rem.next().expect("unexpected extra remaining"),
+        );
+        (out, calls)
+    }
+
+    fn v4() -> SocketAddr {
+        "127.0.0.1:8080".parse().unwrap()
+    }
+    fn v6() -> SocketAddr {
+        "[::1]:8080".parse().unwrap()
+    }
+    fn refused() -> io::Error {
+        io::Error::from(io::ErrorKind::ConnectionRefused)
+    }
+    fn unreachable_err() -> io::Error {
+        io::Error::from(io::ErrorKind::NetworkUnreachable)
+    }
+    fn timed_out() -> io::Error {
+        io::Error::from(io::ErrorKind::TimedOut)
+    }
+
+    /// CRI-6・NET-3・#4572: IPv4 が成功したら IPv6 を呼ばない。
+    #[test]
+    fn cri6_net3_4572_ipv4_success_does_not_try_ipv6() {
+        let c = Duration::from_millis(1000);
+        let (out, calls) = drive_dial(vec![Ok(())], vec![c]);
+        assert_eq!(out, Ok(()));
+        assert_eq!(calls, vec![(v4(), c)]);
+    }
+
+    /// CRI-6・NET-3・#4572: IPv4 が Refused で IPv6 が成功なら 2 回目は `[::1]` で、残り時間だけを渡す。
+    #[test]
+    fn cri6_net3_4572_ipv4_refused_then_ipv6_success_uses_remaining() {
+        let c = Duration::from_millis(1000);
+        let left = Duration::from_millis(990);
+        let (out, calls) = drive_dial(vec![Err(refused()), Ok(())], vec![c, left]);
+        assert_eq!(out, Ok(()));
+        assert_eq!(calls, vec![(v4(), c), (v6(), left)]);
+        assert!(calls[1].1 <= c);
+        assert_eq!(v6().ip().to_string(), "::1");
+    }
+
+    /// REPAIR-5・#4572: IPv4 の期限切れは IPv6 を試さず `TimedOut`。
+    #[test]
+    fn cri6_net3_4572_ipv4_timeout_does_not_try_ipv6() {
+        let c = Duration::from_millis(1000);
+        let (out, calls) = drive_dial(vec![Err(timed_out())], vec![c]);
+        assert_eq!(out, Err(DialErrorCode::TimedOut));
+        assert_eq!(calls, vec![(v4(), c)]);
+    }
+
+    /// REPAIR-5・#4572: IPv4 が Refused でも残りが 0 なら IPv6 を試さず `TimedOut`（0 の期間を connect へ渡さない）。
+    #[test]
+    fn cri6_net3_4572_zero_remaining_skips_ipv6() {
+        let c = Duration::from_millis(1000);
+        let (out, calls) = drive_dial(vec![Err(refused())], vec![c, Duration::ZERO]);
+        assert_eq!(out, Err(DialErrorCode::TimedOut));
+        assert_eq!(calls, vec![(v4(), c)]);
+    }
+
+    /// CRI-6・#4572: 両方失敗したときは IPv4 の理由。どちらかが期限切れなら `TimedOut`。
+    #[test]
+    fn cri6_net3_4572_both_fail_returns_ipv4_reason_or_timeout() {
+        let t = Duration::from_millis(500);
+        let cases = [
+            (refused(), refused(), DialErrorCode::Refused),
+            (unreachable_err(), refused(), DialErrorCode::Unreachable),
+            (refused(), unreachable_err(), DialErrorCode::Refused),
+            (refused(), timed_out(), DialErrorCode::TimedOut),
+        ];
+        for (a, b, want) in cases {
+            let (out, calls) = drive_dial(vec![Err(a), Err(b)], vec![t, t]);
+            assert_eq!(out, Err(want));
+            assert_eq!(calls.len(), 2);
+        }
+    }
+
+    /// `::1` と同じ番号の IPv4 listener を drop 済みにして `[::1]` だけで待ち受ける（番号の揺れを数回やり直す）。
+    fn ipv6_only_listener() -> TcpListener {
+        for _ in 0..20 {
+            let v4l = TcpListener::bind("127.0.0.1:0").unwrap();
+            let p = v4l.local_addr().unwrap().port();
+            if let Ok(l) = TcpListener::bind(("::1", p)) {
+                drop(v4l);
+                return l;
+            }
+        }
+        panic!("could not bind an IPv6-only loopback listener");
+    }
+
+    /// CRI-6・NET-3・#4572: `::1` だけで待ち受ける listener へつなぎ直して Connected（実ソケット）。
+    #[test]
+    fn cri6_net3_4572_falls_back_to_ipv6_loopback() {
+        let l = ipv6_only_listener();
+        let port = l.local_addr().unwrap().port();
+        let (a, b) = two_fds();
+        let mut j = FakeJoiner::ok();
+        let (out, resp, got) = drive(req_frame(port).as_bytes(), &[a.as_fd(), b.as_fd()], &mut j);
+        assert_eq!(out, Outcome::Connected);
+        assert_eq!(resp, DialResponse::Connected);
+        assert_eq!(got.len(), 1);
+        let s = TcpStream::from(got.into_iter().next().unwrap());
+        assert_eq!(s.peer_addr().unwrap().to_string(), format!("[::1]:{port}"));
+        assert_eq!(s.local_addr().unwrap().ip().to_string(), "::1");
+        let (_acc, peer) = l.accept().unwrap();
+        assert_eq!(peer, s.local_addr().unwrap());
+    }
+
+    /// CRI-6・#4572: 両方で待ち受けるときは IPv4 を優先する。
+    #[test]
+    fn cri6_net3_4572_prefers_ipv4_when_both_listen() {
+        let (v4l, v6l) = (0..20)
+            .find_map(|_| {
+                let v4l = TcpListener::bind("127.0.0.1:0").unwrap();
+                let p = v4l.local_addr().unwrap().port();
+                TcpListener::bind(("::1", p)).ok().map(|v6l| (v4l, v6l))
+            })
+            .expect("bind both");
+        let port = v4l.local_addr().unwrap().port();
+        let (a, b) = two_fds();
+        let mut j = FakeJoiner::ok();
+        let (out, _, got) = drive(req_frame(port).as_bytes(), &[a.as_fd(), b.as_fd()], &mut j);
+        assert_eq!(out, Outcome::Connected);
+        let s = TcpStream::from(got.into_iter().next().unwrap());
+        assert_eq!(
+            s.peer_addr().unwrap(),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, port))
+        );
+        v4l.accept().unwrap();
+        drop(v6l);
     }
 
     /// CRI-6・NET-3: 成功時は Connected と接続済み fd がちょうど 1 本。

@@ -3,7 +3,7 @@
 //! helper の本体は net crate の `fandhe_container_net::netns_dial::run_netns_dial_main`（#4479）にあり、
 //! 本モジュールは bin の main の振り分けの判定だけを持つ。呼び出し元は plugin-cri の `PodNetnsDialer`
 //! （#4484）が dial のたびに起動する supervisor の bin で、保持役の namespace へ参加して
-//! `127.0.0.1:<port>` への接続済み fd を返す単一スレッドの helper になる。
+//! `127.0.0.1:<port>`（失敗したら `[::1]:<port>`）への接続済み fd を返す単一スレッドの helper になる。
 //!
 //! 判定は `run_main` の継承 fd の整理・結果チャネルの検証・スレッド生成より前に行う。`setns(CLONE_NEWUSER)` は
 //! 多スレッドのプロセスでは `EINVAL` になり、結果も固定長 frame で返すため。特権ランチャーは

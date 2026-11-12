@@ -38,6 +38,13 @@
 //!
 //! `--ignored` なしでは、pull × prune に加えて (iv)〜(vi) も小さい件数で自己検証する（コンテナと CLI は使わない）。
 //!
+//! 削除処理中のクラッシュ復旧（#667・TASK-184.5）は別の起動モード `--ignored --scenario crash`（実体は `tests/linux/crash.rs`）。
+//! `image rm`（CLI の実バイナリ）と `image prune`（試験バイナリ自身の再入口 `--gc-crash-child prune`。CLI 未配線のため。#2384）の
+//! 削除の途中で SIGKILL し、別プロセスの新しい `ImageStore::lock` による回復後の状態が「削除前」か「削除後」の一方と完全に
+//! 一致すること、中間状態（ジャーナル無しで blob が一部だけ消えた）が無いこと、参照中の blob が残ることを照合する。コンテナ参照は
+//! 実機層が CLI の `create --image`、`--ignored` なしの自己検証が oci の公開 API で付ける。SIGKILL は電源断ではなく、
+//! 媒体への永続化（IO-2）は #1965 の範囲。
+//!
 //! `image prune` は CLI に未配線（#2384）のため、E・F・G・H は oci の公開 API（`execute_image_prune`）をプロセス内で呼ぶ。
 //! 配線後は CLI 経由へ切り替える。
 //!
@@ -97,6 +104,13 @@ fn main() {
 fn main() -> std::process::ExitCode {
     if std::env::args().any(|a| a == "--container-probe") {
         linux::probe();
+    }
+    // 試験専用の再入口（削除処理中クラッシュ復旧の子。#667）。
+    if std::env::args()
+        .nth(1)
+        .is_some_and(|a| a == "--gc-crash-child")
+    {
+        linux::crash_child();
     }
     linux::main()
 }
@@ -246,6 +260,11 @@ mod linux {
         std::process::exit(8);
     }
 
+    /// 削除処理中クラッシュ復旧の試験の子（`image prune` の本体をプロセス内で実行する。#667・OCI-7）。
+    pub fn crash_child() -> ! {
+        crash::child()
+    }
+
     pub fn main() -> ExitCode {
         super::precondition::self_check();
         let args: Vec<String> = std::env::args().skip(1).collect();
@@ -254,23 +273,36 @@ mod linux {
                 "local_image_gc: skipped (real-host scenario; run with `-- --ignored` inside a delegated cgroup, e.g. `systemd-run --user --scope -p Delegate=yes`)"
             );
             // 既定のテスト集合で、50 並行の pull と prune の照合そのものを小さい件数で検証する（#868）。
-            return match concurrent::offline_self_check() {
-                Ok(()) => {
-                    println!("local_image_gc: offline pull and prune self-check ok");
-                    ExitCode::SUCCESS
-                }
+            // 作業領域の親ディレクトリは最後の自己検証が消すため、削除処理中クラッシュ復旧（#667）を先に回す。
+            let crash_ok = match crash::offline_self_check() {
+                Ok(()) => true,
                 Err(e) => {
-                    eprintln!("local_image_gc: FAILED: offline pull and prune self-check: {e}");
-                    ExitCode::FAILURE
+                    eprintln!("local_image_gc: FAILED: offline crash recovery self-check: {e}");
+                    false
                 }
             };
+            if !crash_ok {
+                return ExitCode::FAILURE;
+            }
+            println!("local_image_gc: offline crash recovery self-check ok");
+            if let Err(e) = concurrent::offline_self_check() {
+                eprintln!("local_image_gc: FAILED: offline pull and prune self-check: {e}");
+                return ExitCode::FAILURE;
+            }
+            println!("local_image_gc: offline pull and prune self-check ok");
+            return ExitCode::SUCCESS;
         }
         // 50 並行は別の起動モード（既存の通しシナリオの期限を食わず、失敗の切り分けを容易にする）。
         let concurrent_mode = args
             .windows(2)
             .any(|w| w[0] == "--scenario" && w[1] == "concurrent");
+        let crash_mode = args
+            .windows(2)
+            .any(|w| w[0] == "--scenario" && w[1] == "crash");
         let result = if concurrent_mode {
             concurrent_scenario()
+        } else if crash_mode {
+            crash_scenario()
         } else {
             scenario()
         };
@@ -298,6 +330,19 @@ mod linux {
                     "local_image_gc: concurrent (vi): 50/50 image tag runs racing image prune either tagged an image whose manifest and blobs were all present or failed with NOT_FOUND leaving no tag; no tag without content remained"
                 );
                 println!("local_image_gc: concurrent scenario ok");
+                ExitCode::SUCCESS
+            }
+            Ok(()) if crash_mode => {
+                println!(
+                    "local_image_gc: crash (rm): image rm killed with SIGKILL during deletion recovered after restart to exactly the pre-delete or post-delete state; no journal, temporary file or partial blob set remained"
+                );
+                println!(
+                    "local_image_gc: crash (prune): image prune killed with SIGKILL during deletion recovered after restart to exactly the pre-delete or post-delete state; no journal, temporary file or partial blob set remained"
+                );
+                println!(
+                    "local_image_gc: crash (referenced): manifests, configs and layers referenced by another tag or a container were present at every kill point and after recovery"
+                );
+                println!("local_image_gc: crash scenario ok");
                 ExitCode::SUCCESS
             }
             Ok(()) => {
@@ -466,9 +511,19 @@ mod linux {
         concurrent::scenario_real(&env, &mut cleanup).map_err(super::precondition::Failure::Other)
     }
 
+    /// 削除処理中クラッシュ復旧（#667）。前提の検査は通しシナリオと同じ。
+    fn crash_scenario() -> Result<(), super::precondition::Failure> {
+        check_prerequisites()?;
+        let (env, mut cleanup) = setup_env().map_err(super::precondition::Failure::Other)?;
+        crash::scenario_real(&env, &mut cleanup).map_err(super::precondition::Failure::Other)
+    }
+
     /// 実体は `tests/linux/concurrent.rs`（インライン `mod linux` の子モジュールは `tests/linux/` 基準で解決される。
     /// サブディレクトリの `.rs` は試験ターゲットとして自動検出されない）。
     mod concurrent;
+
+    /// 実体は `tests/linux/crash.rs`（`concurrent` の兄弟。#667）。
+    mod crash;
 
     /// シナリオが共有する環境。
     struct Env {

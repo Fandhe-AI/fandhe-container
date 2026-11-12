@@ -2773,6 +2773,30 @@ jobs:
             --forbid 'local_image_gc: skipped' --forbid 'local_image_gc: FAILED' \
             --forbid 'PRECONDITION FAILED' --forbid 'not applicable' --summary
 
+      # local_image_gc の削除処理中クラッシュ復旧（#667・TASK-184.5・OCI-7・REPAIR-5・REPAIR-12）: 同じ試験バイナリを
+      # `--ignored --scenario crash` で起動する別モード。`image rm` と `image prune` の削除処理の途中で SIGKILL し、再起動後の
+      # GC で状態が「削除前」か「削除後」の一方と完全に一致することを照合する（SIGKILL は電源断ではない。媒体の永続化は #1965）。
+      # コンテナ参照は CLI の実 `create --image` で付けるため委譲スコープが要る。ビルドは上の `LIG_BIN` を使い回す。
+      # 新しい check-run・sudo・permissions は追加しない。
+      - name: local_image_gc のクラッシュ復旧の実行（実機前提テスト・--ignored --scenario crash・委譲スコープ。OCI-7・#667）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/local_image_gc_crash.log"
+          USER="$(id -un)" \
+            scripts/run-in-user-scope.sh --name local_image_gc_crash --deadline 540 --log "${log}" -- \
+              "${LIG_BIN}" --ignored --scenario crash
+          # 成功行 4 件（rm・prune・参照中データの残存・末尾の ok。接頭辞 `local_image_gc: crash`）をソースから導出して照合する。
+          # 情報行（段階の度数分布）は stderr に `info: crash` で出る
+          scripts/check-success-lines.sh --name local_image_gc_crash \
+            --src crates/cli/tests/local_image_gc.rs \
+            --log "${log}" \
+            --select '^local_image_gc: crash' \
+            --min 4 \
+            --forbid 'local_image_gc: skipped' --forbid 'local_image_gc: FAILED' \
+            --forbid 'PRECONDITION FAILED' --forbid 'not applicable' --summary
+
       # start_scope_real・delete_cgroup_real・start_recover_real（`crates/cli/tests/`。CORE-2・CORE-3・CORE-4・CORE-6・SUP-1・CLI-1・
       # SEC-1・OCI-6・REPAIR-7・#2081・#2061・#2011・#3105）: 委譲 cgroup の CLI 実機前提テスト。前提（非 root・user manager の
       # private ソケット・cgroup v2・Landlock ABI 6 以上）は上の前提確認ステップが fail-closed で確かめる。root の分岐は無い

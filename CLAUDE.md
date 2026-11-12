@@ -146,6 +146,7 @@ fandhe-container/
 │   │   ├── restart-relaunch-single-thread.md  # restart の再 launch を単一スレッドを要求する本番 launcher で成り立たせる設計記録（常駐スレッドの停止と監視スレッドでの直接 launch・比較した方式・制御チャネルの扱い・残余。#2043・SUP-3・CORE-1）
 │   │   ├── cri-record-readoption.md  # plugin-cri の再起動をまたぐ sandbox・コンテナ記録の再採用の設計と実装単位（#2902・CRI-1・CRI-2・OCI-7・CORE-1）・自然終了の取り込み方式（照会時の読み取り。#4173）
 │   │   ├── cri-op-stats-export.md  # plugin-cri の操作統計を stderr 以外へ出す方式の比較と採用案（原子的に置き換えるスナップショットファイル・opt-in。2026-11-09 にオーナー承認・#4295）・作業単位 W1〜W5（#4335〜#4341。実装済み）（#4228・CRI-6・REPAIR-4）
+│   │   ├── cri-log-partial-lines.md  # CRI ログの部分行 `P` の方式（64 KiB 超の行を捕捉側の断片で渡し CRI ログへ P / F で書く・期限での書き出しは採らない・containerd v2.1.0 の一次情報との差。実装 #4580・#4582、`fandhe logs` の判断 #4581。#4574・CRI-2・SUP-7・REPAIR-3）
 │   │   ├── cri-config-acceptance.md  # CRI の未受理項目の受け入れ順序と担当、イメージ User の名前解決の方式（fd 起点の passwd / group 読み取り。#2606・CRI-2・CRI-7・SEC-1・SEC-5）
 │   │   └── plugin-hash-allowlist.md  # plugin の許可済みハッシュ一覧の置き場所・読み込み経路・一覧ファイル自体の検証の設計案（TASK-122 追補・#1868・PLUG-11。オーナー承認待ち）
 │   ├── setup/                     # 利用者向けセットアップ手順

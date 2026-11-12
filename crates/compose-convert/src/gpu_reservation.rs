@@ -15,9 +15,9 @@
 //! - 検証（TASK-156.3・#626）: `mod tests` の合成フィクスチャで、`count` 数値指定の drop 記録と
 //!   TOML 往復（stack の型へ載せて書き出し・再パース）を照合する。実運用コーパス（PoC-16）に GPU 予約を含む
 //!   実ファイルが 0 件のため、検証は合成フィクスチャに限る。
-//! - 範囲外: 変換結果の stack への書き込みの本体と `value_drops` への加算は #598・#599。`deploy` / `resources` / `reservations` が
-//!   マッピングでない場合の記録は変換器本体（#598・#599）が担う。
-//! - パーサーに依存しない: YAML 値への [`ComposeNode`] の実装は #595 の結線で行う（依存を増やさない）。
+//! - 結線済み（#3612）: stack への書き込みと `value_drops` への加算、`deploy` / `resources` / `reservations` が
+//!   マッピングでない場合の記録は `convert/deploy.rs` が担う。
+//! - パーサーに依存しない: YAML 値への [`ComposeNode`] の実装は `convert/deploy.rs` にある（本モジュールは依存しない）。
 //! - 入力の大きさ: 再帰しない一段の走査。確保・複製の前に [`MAX_DEVICES`]・[`MAX_DEVICE_IDS`]・
 //!   [`MAX_DEVICE_ID_BYTES`]・[`MAX_DEVICE_IDS_TOTAL_BYTES`] を検証し、超過は構造化された
 //!   [`GpuDropReason`] で対象外にする（パーサーの `Budget`〔#595〕に依存しない）。

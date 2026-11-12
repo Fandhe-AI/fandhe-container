@@ -1,0 +1,108 @@
+# #3614（TASK-151 追補・STACK-3・STACK-10）の合成フィクスチャ。
+# compose-spec の既知キーのうち分類表へ足した 57 キーを 1 回ずつ含む。値はすべてダミー。
+# マッピング値の子（*marker）は「走査器が葉の行から先へ降りない」ことの確認用の目印。
+jobs:
+  jobmarker:
+    image: example.invalid/job:1
+
+models:
+  mdlmarker:
+    model: example.invalid/model:1
+
+services:
+  svcmarker:
+    image: example.invalid/web:1
+    annotations:
+      annomarker: dummy
+    attach: false
+    cgroup: private
+    cpu_count: 2
+    cpu_percent: 50
+    cpu_period: 100000
+    cpu_quota: 50000
+    cpu_rt_period: 1000000
+    cpu_rt_runtime: 950000
+    cpuset: "0-1"
+    credential_spec:
+      file: credmarker
+    develop:
+      watch:
+        - path: ./watchmarker
+          action: sync
+    gpus: all
+    label_file: ./labelsfile
+    mem_swappiness: 10
+    memswap_limit: 1g
+    models:
+      - mdlmarker
+    pids_limit: 100
+    post_start:
+      - command: ["true"]
+    pre_start:
+      - command: ["true"]
+    pre_stop:
+      - command: ["true"]
+    provider:
+      type: provmarker
+    pull_refresh_after: 1d
+    runtime: runc
+    storage_opt:
+      size: 1g
+    umask: "022"
+    use_api_socket: false
+    userns_mode: host
+    deploy:
+      mode: replicated
+      rollback_config:
+        parallelism: 1
+      resources:
+        reservations:
+          cpus: "0.5"
+          memory: 64M
+          generic_resources:
+            - discrete_resource_spec:
+                kind: gpu
+                value: 1
+
+networks:
+  netmarker:
+    attachable: true
+    driver_opts:
+      optmarker: dummy
+    enable_ipv4: true
+    enable_ipv6: false
+    internal: true
+    ipam:
+      config:
+        - subnet: 192.0.2.0/24
+    labels:
+      lblmarker: dummy
+    name: netnamemarker
+
+volumes:
+  volmarker:
+    driver_opts:
+      optmarker: dummy
+    labels:
+      lblmarker: dummy
+    name: volnamemarker
+
+secrets:
+  secmarker:
+    driver: drvmarker
+    driver_opts:
+      optmarker: dummy
+    environment: SECRET_ENV_DUMMY
+    labels:
+      lblmarker: dummy
+    name: secnamemarker
+    template_driver: tmplmarker
+
+configs:
+  cfgmarker:
+    content: contentmarker
+    environment: CONFIG_ENV_DUMMY
+    labels:
+      lblmarker: dummy
+    name: cfgnamemarker
+    template_driver: tmplmarker

@@ -14,6 +14,8 @@
 //! (`O_NONBLOCK`)。開いた fd を fstat し、通常ファイル・所有者が実効 uid・group / other のビットなし・サイズが上限以下で
 //! あることを確かめてから、上限つき(`take`)で読む。エラーの文言は固定の英語で、パス・errno を含めない。
 //! 上限なしの待ち(FUSE 上の状態ルート等)は呼び出し側(`start_entry`)が期限つきの作業スレッドで包む(REPAIR-5)。
+//! 単一スレッドを保つ必要がある呼び出し元(CLI の `exec`・healthcheck の exec 専用 helper。`setns` が多スレッドを拒否する)
+//! は包まず、プロセス単位の外側の期限(CLI の exec は委譲スコープの親の `--timeout` + 猶予と SIGKILL)を最後の歯止めにする。
 //!
 //! # 残余(REPAIR-3)
 //!
@@ -514,6 +516,7 @@ pub fn select_document(
 ///
 /// exec(healthcheck を含む)が launch と同じ env を使うための入口(`exec::run_command_with_pidfd_env` の
 /// `launch_env`)。文書の I/O は止まりうるため、呼び出し側は期限つきの作業スレッドで包む(REPAIR-5)。
+/// ただし単一スレッドを要する呼び出し元(CLI の exec・healthcheck の exec 専用 helper)は包まず、外側のプロセスの期限に任せる。
 pub fn launch_env_for(
     root: &Path,
     record: &fandhe_container_core::traits::StateRecord,

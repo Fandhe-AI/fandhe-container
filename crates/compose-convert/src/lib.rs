@@ -19,7 +19,7 @@
 //! （`entry`・stack の `toml_output`。#3613・STACK-3・STACK-5）。複数ファイルの一括書き出しは未実装（REPAIR-3）。
 //! `--downgrade=<key>[,...]` の解析と格下げ許可の判定は `downgrade`（TASK-182.1・#627・STACK-3）で実装済み。
 //! 不可のキーの指定は変換せず `INVALID_ARGUMENT`（2）で止める。
-//! depends_on・ulimits・healthcheck・deploy の変換は未実装（`ServiceConversion::unhandled` に載る。REPAIR-3）。
+//! depends_on・ulimits・healthcheck・deploy.resources と GPU 予約の変換は実装済み（#3612・STACK-3・STACK-9）。
 //! `fandhe-container-stack` への一方向の path 依存は配線済み。YAML パーサーの依存は本 crate に限り、
 //! `fandhe-container-cli`・`fandhe-container-stack` の依存木には現れない（TASK-155 の経路へリンクしない）。
 //! 本体は G11（TASK-151 が変換器本体、TASK-152・153・154・156・182）で実装する。

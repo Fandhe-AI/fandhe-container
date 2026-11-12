@@ -15,10 +15,17 @@ fn gpu6_repair2_1885_json_line_is_exact() {
         result: "ok",
         records: Some(3),
         bytes: Some(80),
+        elapsed_ms: 7,
+        read_ms: Some(2),
+        read_stage: Some("done"),
     };
     assert_eq!(
         ok.to_json_line(),
         "{\"result\":\"ok\",\"records\":3,\"bytes\":80}"
+    );
+    assert_eq!(
+        ok.to_log_line(),
+        "{\"event\":\"venus_verify\",\"result\":\"ok\",\"elapsed_ms\":7,\"read_ms\":2,\"read_stage\":\"done\"}"
     );
     assert_eq!(ok.exit_code(), 0);
     let bad = VerifyReport::failure("venus_replay.io", None);
@@ -60,18 +67,17 @@ fn gpu6_repair2_1885_timeout_is_reported() {
     let r = verify_with(
         move || {
             let _ = rx.recv();
-            Ok(Vec::new())
+            (Ok(Vec::new()), None)
         },
         Duration::from_millis(50),
     );
+    assert_eq!(r.result, "venus_verify.timeout");
     assert_eq!(
-        r,
-        VerifyReport {
-            result: "venus_verify.timeout",
-            records: None,
-            bytes: None
-        }
+        (r.records, r.bytes, r.read_ms, r.read_stage),
+        (None, None, None, None)
     );
+    // 待ちの上限（50 ms）以上の所要時間が記録される（REPAIR-4）。
+    assert!(r.elapsed_ms >= 50, "elapsed_ms={}", r.elapsed_ms);
     drop(tx);
 }
 
@@ -81,4 +87,17 @@ fn gpu6_repair2_1885_verify_bytes_failure_keeps_total_length() {
     assert_eq!(r.result, "venus_replay.truncated");
     assert_eq!(r.bytes, Some(5));
     assert_eq!(r.records, None);
+}
+
+#[test]
+fn gpu6_repair4_1885_file_verification_records_elapsed_and_read_stage() {
+    let missing = std::env::temp_dir().join(format!("fc-venus-missing-{}", std::process::id()));
+    let r = verify_recording_file(&missing, Duration::from_secs(10));
+    assert_ne!(r.result, "ok");
+    let read_ms = r.read_ms.expect("read observation must be kept");
+    assert!(r.read_stage.is_some());
+    assert!(r.elapsed_ms >= read_ms);
+    let log = r.to_log_line();
+    assert!(log.contains("\"event\":\"venus_verify\""), "{log}");
+    assert!(!log.contains("fc-venus-missing"), "path leaked: {log}");
 }

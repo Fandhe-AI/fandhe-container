@@ -10,6 +10,10 @@
 //! （読み込めたときのみ）の 3 項目だけ。パス・payload・`VenusReplayError::message()`（CRC 値や seqno を含む）は
 //! 出さない。実機のワークロード由来のデータをログへ漏らさないため。
 //!
+//! 可観測性（REPAIR-4）: 検証全体（タイムアウト待ちを含む）の所要時間 `elapsed_ms` と、読み込み段の観測
+//! （`read_recording_file_observed` の所要時間・終了段階）を [`VerifyReport`] に保持し、成功・失敗・タイムアウトの
+//! いずれでも stderr へ構造化 1 行（[`VerifyReport::to_log_line`]）を出す。stdout の契約は変えない。
+//!
 //! 待ちの上限（REPAIR-5）: 読み込みと検証は補助スレッドで行い、[`READ_TIMEOUT`] で打ち切る。
 //!
 //! 残存リスク: フラグ値が未確認の OS（Windows 等）では `read_recording_file` が通常の open にフォールバックし、
@@ -18,10 +22,10 @@
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fandhe_container_plugin_macos::gpu::venus::replay::{
-    VenusReplayError, read_recording_file, validate,
+    ReadObservation, ReadStage, VenusReplayError, read_recording_file_observed, validate,
 };
 
 /// 読み込みと検証の待ちの上限（REPAIR-5）。
@@ -36,6 +40,22 @@ pub struct VerifyReport {
     pub result: &'static str,
     pub records: Option<usize>,
     pub bytes: Option<u64>,
+    /// 検証全体の所要時間（ミリ秒。タイムアウト待ちを含む）。
+    pub elapsed_ms: u64,
+    /// 読み込み段の所要時間（ミリ秒）。読み込みが終わらなかったタイムアウト等では `None`。
+    pub read_ms: Option<u64>,
+    /// 読み込み段の終了段階（固定語彙）。`read_ms` と同じく観測できたときのみ。
+    pub read_stage: Option<&'static str>,
+}
+
+fn stage_name(s: ReadStage) -> &'static str {
+    match s {
+        ReadStage::Metadata => "metadata",
+        ReadStage::Open => "open",
+        ReadStage::FdMetadata => "fd_metadata",
+        ReadStage::Read => "read",
+        ReadStage::Done => "done",
+    }
 }
 
 fn opt<T: std::fmt::Display>(v: Option<T>) -> String {
@@ -53,6 +73,18 @@ impl VerifyReport {
         )
     }
 
+    /// stderr に出す構造化ログ 1 行（パス・payload を含まない。値は固定語彙と整数だけ）。
+    pub fn to_log_line(&self) -> String {
+        format!(
+            "{{\"event\":\"venus_verify\",\"result\":\"{}\",\"elapsed_ms\":{},\"read_ms\":{},\"read_stage\":{}}}",
+            self.result,
+            self.elapsed_ms,
+            opt(self.read_ms),
+            self.read_stage
+                .map_or_else(|| "null".to_string(), |x| format!("\"{x}\""))
+        )
+    }
+
     /// 成功は 0、検証失敗は 1。
     pub fn exit_code(&self) -> i32 {
         if self.result == "ok" { 0 } else { 1 }
@@ -63,6 +95,9 @@ impl VerifyReport {
             result,
             records: None,
             bytes,
+            elapsed_ms: 0,
+            read_ms: None,
+            read_stage: None,
         }
     }
 }
@@ -75,6 +110,9 @@ pub fn verify_bytes(bytes: &[u8]) -> VerifyReport {
             result: "ok",
             records: Some(v.records().len()),
             bytes: Some(len),
+            elapsed_ms: 0,
+            read_ms: None,
+            read_stage: None,
         },
         Err(e) => VerifyReport::failure(e.code(), Some(len)),
     }
@@ -83,29 +121,46 @@ pub fn verify_bytes(bytes: &[u8]) -> VerifyReport {
 /// 読み込み関数を差し込める本体。補助スレッドで読み込みと検証を行い `timeout` で待つ。
 pub(crate) fn verify_with<F>(read: F, timeout: Duration) -> VerifyReport
 where
-    F: FnOnce() -> Result<Vec<u8>, VenusReplayError> + Send + 'static,
+    F: FnOnce() -> (Result<Vec<u8>, VenusReplayError>, Option<ReadObservation>) + Send + 'static,
 {
+    let start = Instant::now();
     let (tx, rx) = mpsc::channel();
     let spawned = std::thread::Builder::new()
         .name("venus-verify".to_string())
         .spawn(move || {
-            let report = match read() {
+            let (result, obs) = read();
+            let mut report = match result {
                 Ok(buf) => verify_bytes(&buf),
                 Err(e) => VerifyReport::failure(e.code(), None),
             };
+            report.read_ms = obs.as_ref().map(|o| millis(o.elapsed));
+            report.read_stage = obs.as_ref().map(|o| stage_name(o.stage));
             let _ = tx.send(report);
         });
-    if spawned.is_err() {
-        return VerifyReport::failure("venus_verify.thread_spawn_failed", None);
-    }
-    rx.recv_timeout(timeout)
-        .unwrap_or_else(|_| VerifyReport::failure("venus_verify.timeout", None))
+    let mut report = if spawned.is_err() {
+        VerifyReport::failure("venus_verify.thread_spawn_failed", None)
+    } else {
+        rx.recv_timeout(timeout)
+            .unwrap_or_else(|_| VerifyReport::failure("venus_verify.timeout", None))
+    };
+    report.elapsed_ms = millis(start.elapsed());
+    report
+}
+
+fn millis(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// 実ファイルを検証する。
 pub fn verify_recording_file(path: &Path, timeout: Duration) -> VerifyReport {
     let path = path.to_path_buf();
-    verify_with(move || read_recording_file(&path), timeout)
+    verify_with(
+        move || {
+            let (r, obs) = read_recording_file_observed(&path);
+            (r, Some(obs))
+        },
+        timeout,
+    )
 }
 
 /// 引数エラー（終了コード 2。stderr に JSON 1 行）。message にパスは含めない。
@@ -156,6 +211,7 @@ pub fn run_verify_mode(args: &[OsString]) -> Option<i32> {
         Ok(path) => {
             let report = verify_recording_file(&path, READ_TIMEOUT);
             println!("{}", report.to_json_line());
+            eprintln!("{}", report.to_log_line());
             Some(report.exit_code())
         }
         Err(e) => {

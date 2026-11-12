@@ -129,7 +129,13 @@ fn assert_no_leak(o: &Output) {
 fn expect_line(o: &Output, code: i32, line: &str) {
     assert_eq!(o.status.code(), Some(code), "stderr={:?}", o.stderr);
     assert_eq!(stdout_of(o), format!("{line}\n"));
-    assert!(o.stderr.is_empty(), "stderr={:?}", o.stderr);
+    // stderr は構造化ログ 1 行（所要時間つき。REPAIR-4）。
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        err.starts_with("{\"event\":\"venus_verify\"") && err.contains("\"elapsed_ms\":"),
+        "stderr={err:?}"
+    );
+    assert_eq!(err.lines().count(), 1, "stderr={err:?}");
     assert_no_leak(o);
 }
 

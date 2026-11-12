@@ -73,7 +73,7 @@
 | 群 | 内容 | 参加する crate | 件数 |
 | -- | ---- | -------------- | ---- |
 | A | `new` と `Drop`（陽性対照・`new` が生きている間は保持・複製 fd が残っても `Drop` で外れる） | 6 crate すべて | 3 件 × 6 |
-| B | `release_lock_file_with`（unlock は close の前に 1 回・失敗しても close）と `release_lock_file`（実際に unlock） | net 以外の 5 crate | 3 件 × 5 |
+| B | `release_lock_file_with`（unlock は close の前に 1 回・失敗しても close）と `release_lock_file`（実際に unlock） | 6 crate すべて | 3 件 × 6 |
 
 - 試験名は `repair1_oci5_4566_*`。件数は `cargo test -p <パッケージ名> --lib flock_release_cases -- --list`（群 A）と `flock_release_with_cases -- --list`（群 B）で確かめる。
 - 一時ディレクトリの作り方は crate ごとに違うため、各 `flock_release.rs` が試験専用の `shared_case_dir(tag)` を持つ（共有ファイルの外）。
@@ -82,15 +82,13 @@
 ### 許容する差（共有ケースの外）
 
 - core の `ExplicitUnlockFile` は `cfg(target_os = "linux")`。
-- supervisor の `as_file()`。
+- supervisor・net の `as_file()`、net の `as_file_mut()`（hosts ファイルの書き込み用。net の 2 つは Linux のみ。`Deref` は panic 経路を要するため net でも持たない。#4571）。
 - oci・supervisor の `LockRelease` の `allow(dead_code)`。
-- 試験用補助 `clone_file_for_test` の cfg と戻り値（net は `Result`）。
-- net は形が違う。`Deref`/`DerefMut`、名前つきフィールド、その場で unlock する `Drop` を持ち、製品に `release_lock_file_with`・`LockRelease` が無い（`cfg(all(test, unix))` の `release_with` は試験専用）。そのため群 A だけに参加する。
+- 試験用補助 `clone_file_for_test` の cfg。
 
 ### 残余
 
-- net を他の 5 crate の形（`Option<File>`・`release_lock_file*`）へ寄せるかは未判断。オーナー判断の候補とする。
-- net の試験専用 `release_with` と、その試験 `oci5_repair5_4514_release_continues_close_when_unlock_fails` の整理の要否。
+なし。net も他の 5 crate の形（`Option<File>`・`release_lock_file*`・`LockRelease`）へ寄せ、群 A・B の両方を製品の経路へ当てた（#4571）。試験専用の `release_with` と試験 `oci5_repair5_4514_release_continues_close_when_unlock_fails` は、群 B の `repair1_oci5_4566_release_with_unlock_failure_still_closes` に寄せて削除した。
 
 ### 再評価の条件
 

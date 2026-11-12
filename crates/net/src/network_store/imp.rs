@@ -517,6 +517,13 @@ impl NetworkStore {
         let on_disk = fs::symlink_metadata(self.dir.path(LOCK_FILE))
             .map_err(|e| map_io(&e, "failed to stat network store lock file"))?;
         let held = file
+            .as_file()
+            .ok_or_else(|| {
+                err(
+                    NetErrorCode::Internal,
+                    "network store lock file is not held",
+                )
+            })?
             .metadata()
             .map_err(|e| map_io(&e, "failed to stat network store lock file"))?;
         if !same_inode(&on_disk, &held) {
@@ -837,6 +844,8 @@ impl GlobalLockGuard<'_> {
         let on_disk = fs::symlink_metadata(dir.path(LOCK_FILE))
             .map_err(|e| map_io(&e, "failed to stat network lock file"))?;
         let held = file
+            .as_file()
+            .ok_or_else(|| err(NetErrorCode::Internal, "network lock file is not held"))?
             .metadata()
             .map_err(|e| map_io(&e, "failed to stat network lock file"))?;
         if !same_inode(&on_disk, &held) {
@@ -908,7 +917,7 @@ mod records;
 impl NetworkLockGuard<'_> {
     /// ロックを保持している fd（保持の証跡。ドロップで解放される）。
     pub fn is_held(&self) -> bool {
-        self.file.as_raw_fd() >= 0
+        self.file.as_file().is_some_and(|f| f.as_raw_fd() >= 0)
     }
 }
 
@@ -1011,7 +1020,7 @@ mod tests {
         let t = Tmp::new("g4514");
         let s = NetworkStore::open(&t.0).unwrap();
         let g = s.lock_global_exclusive().unwrap();
-        let dup = g.file.clone_file_for_test().unwrap();
+        let dup = g.file.clone_file_for_test();
         assert_drop_releases_despite_dup(&t.0.join("@networks/@lock"), dup, || drop(g));
     }
 
@@ -1023,7 +1032,7 @@ mod tests {
         s.create(&pasta("n1")).unwrap();
         let g = s.lock_global_exclusive().unwrap();
         let ng = g.lock_network(&nn("n1")).unwrap();
-        let dup = ng.file.clone_file_for_test().unwrap();
+        let dup = ng.file.clone_file_for_test();
         assert_drop_releases_despite_dup(&t.nets().join("n1/@lock"), dup, || drop(ng));
     }
 

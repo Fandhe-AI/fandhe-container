@@ -7,101 +7,94 @@
 //!
 //! 呼び出し元: `network_store::imp` の 2 つのガード、`network::publish` の共有ポート登録ロック、
 //! `add_host_dns::hosts_file` の hosts ファイルロック。点検表は `docs/design/flock-release-audit.md`。
-//! core・oci の同名部品と同じ形を net に独立して置く（複製は残し、本体の一致は共有の試験ケース（`crates/core/tests/support/flock_release_cases.rs`・`flock_release_with_cases.rs`）の群 A（`new`・`Drop`）だけで照合する（本体の形が違うため）。判断は #4532・#4566）。`unsafe` は使わない。
+//! core・oci・cri・plugin-cri・supervisor の同名部品と同じ形を net に独立して置く（複製は残し、本体の一致は共有の試験ケース（`crates/core/tests/support/flock_release_cases.rs`・`flock_release_with_cases.rs`）の群 A（`new`・`Drop`）と群 B（`release_lock_file_with`・`release_lock_file`・`LockRelease`）で照合する。判断は #4532・#4566・#4571）。`unsafe` は使わない。
 //!
 //! 注意: `LOCK_UN` は OFD 単位で効くため、fork した子の body へ本型の値をムーブしてはならない
 //! （子で Drop が走ると親のロックまで外れる）。net の子は `Command::spawn` の exec 経路だけで、
 //! `pre_exec` の closure はこの型を捕捉しない。
 
 use std::fs::File;
-use std::ops::{Deref, DerefMut};
 
-/// unlock を試みてから閉じる。unlock が失敗しても close は止めない（失敗注入の試験用に結果を返す）。
-#[cfg(all(test, unix))]
-fn release_with(
+/// ロックの解放結果。unlock の失敗は close を止めず、呼び出し側のログ判断にだけ使う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LockRelease {
+    /// unlock に成功して閉じた。
+    Unlocked,
+    /// unlock に失敗したが閉じた（OS はプロセス終了か最後の close でロックを解放する）。
+    UnlockFailed,
+}
+
+/// `unlock` を 1 回呼び、結果によらず `file` を閉じる。panic しない（`Drop` から呼ばれる）。
+/// 製品は [`release_lock_file`]、試験は失敗を注入するためこちらを使う。
+pub(crate) fn release_lock_file_with(
     file: File,
     unlock: impl FnOnce(&File) -> std::io::Result<()>,
-) -> std::io::Result<()> {
-    let res = unlock(&file);
+) -> LockRelease {
+    let outcome = match unlock(&file) {
+        Ok(()) => LockRelease::Unlocked,
+        Err(_) => LockRelease::UnlockFailed,
+    };
     drop(file);
-    res
+    outcome
 }
 
-/// drop で明示 unlock してから閉じるロック保持用の `File`。
-///
-/// 取得直後に包む。`Deref`/`DerefMut` で `File` として読み書き・メタデータ参照ができる。
-pub(crate) struct ExplicitUnlockFile {
-    file: File,
+/// `File::unlock` で解放する製品用の入口。
+pub(crate) fn release_lock_file(file: File) -> LockRelease {
+    release_lock_file_with(file, File::unlock)
 }
+
+/// ロックを取得済みの `File` を包み、drop で [`release_lock_file`] を呼ぶ RAII。
+///
+/// 取得（`try_lock` の成功）の後に [`Self::new`] で包む。取得に失敗した `File` はロックを持たないので包まない。
+/// `File` へは [`Self::as_file`]・[`Self::as_file_mut`] で触る（`Deref` は panic 経路を要するため持たない。#4571）。
+pub(crate) struct ExplicitUnlockFile(Option<File>);
 
 impl ExplicitUnlockFile {
-    /// ロックを取得済みの `File` を包む。
+    /// `file`（ロック取得済み）を包む。
     pub(crate) fn new(file: File) -> Self {
-        Self { file }
+        Self(Some(file))
     }
 
-    /// 同じ OFD を指す複製 fd を作る（fork した子が持つ fd の代役。試験用）。
+    /// 保持している `File` の参照（metadata・fd 参照用）。`None` は drop の後にしか起きない。
+    /// 呼び出し元は `network_store::imp` と `add_host_dns::hosts_file`（どちらも Linux のみ）。
+    #[cfg(target_os = "linux")]
+    pub(crate) fn as_file(&self) -> Option<&File> {
+        self.0.as_ref()
+    }
+
+    /// 保持している `File` の可変参照（hosts ファイルの seek・追記用）。`None` は drop の後にしか起きない。
+    #[cfg(target_os = "linux")]
+    pub(crate) fn as_file_mut(&mut self) -> Option<&mut File> {
+        self.0.as_mut()
+    }
+
+    /// 試験用: 同じ OFD を指す複製 fd を作る（fork した子が持つ fd の代役。#4515）。
     #[cfg(all(test, unix))]
-    pub(crate) fn clone_file_for_test(&self) -> std::io::Result<File> {
-        self.file.try_clone()
-    }
-}
-
-impl Deref for ExplicitUnlockFile {
-    type Target = File;
-    fn deref(&self) -> &File {
-        &self.file
-    }
-}
-
-impl DerefMut for ExplicitUnlockFile {
-    fn deref_mut(&mut self) -> &mut File {
-        &mut self.file
-    }
-}
-
-impl Drop for ExplicitUnlockFile {
-    fn drop(&mut self) {
-        // 失敗しても close（フィールドの drop）は止めず、panic もしない。
-        let _ = self.file.unlock();
+    pub(crate) fn clone_file_for_test(&self) -> File {
+        self.0
+            .as_ref()
+            .expect("lock file present")
+            .try_clone()
+            .expect("dup lock fd")
     }
 }
 
 impl std::fmt::Debug for ExplicitUnlockFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("ExplicitUnlockFile(..)")
+        f.write_str("ExplicitUnlockFile")
     }
 }
 
-#[cfg(all(test, unix))]
-mod tests {
-    use super::*;
-    use std::fs::OpenOptions;
-
-    fn open(path: &std::path::Path) -> File {
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)
-            .unwrap()
-    }
-
-    /// REPAIR-5・#4514: unlock が失敗しても close は止まらず、close でロックが外れる。
-    #[test]
-    fn oci5_repair5_4514_release_continues_close_when_unlock_fails() {
-        let dir = crate::test_root::test_root("fc-net-flock-release", "fail");
-        let path = dir.join("lock");
-        let f = open(&path);
-        f.try_lock().unwrap();
-        let res = release_with(f, |_| Err(std::io::Error::other("injected")));
-        assert!(res.is_err());
-        assert!(open(&path).try_lock().is_ok());
+impl Drop for ExplicitUnlockFile {
+    /// 明示 unlock して閉じる。失敗は close を続ける（OS が最後の close かプロセス終了で外す）。
+    fn drop(&mut self) {
+        if let Some(file) = self.0.take() {
+            let _ = release_lock_file(file);
+        }
     }
 }
 
-/// 共有の試験ケース（`crates/core/tests/support/flock_release_cases.rs`。群 A のみ。#4566）が使う一時ディレクトリ。
+/// 共有の試験ケース（`crates/core/tests/support/flock_release*_cases.rs`。群 A・B。#4566・#4571）が使う一時ディレクトリ。
 /// 戻り値の 1 つ目は後始末を持つ guard で、呼び出し側が試験の終わりまで生かす。
 #[cfg(all(test, unix))]
 pub(crate) fn shared_case_dir(tag: &str) -> (Box<dyn std::any::Any>, std::path::PathBuf) {

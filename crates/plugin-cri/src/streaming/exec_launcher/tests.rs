@@ -1239,6 +1239,27 @@ mod bin_check_4499 {
         spawn_verified(&verified, &args())
     }
 
+    /// `spawn_at` の元の errno を保つ版（成功系の失敗原因を出力で確かめる。#4550）。
+    fn spawn_at_raw(exe: &Path, euid: u32) -> Result<SpawnedHelper, String> {
+        let verified = open_supervisor_beside_at(exe, euid)
+            .map_err(|e| format!("open: {:?}", CriError::from(&e)))?;
+        try_spawn_verified(&verified, &args())
+            .map_err(|f| format!("{f:?} errno={:?}", f.raw_os_error()))
+    }
+
+    /// 起動失敗の写像は従来の固定文言のまま（CRI-6・REPAIR-4・#4550）。
+    #[test]
+    fn cri6_repair4_4550_spawn_failure_maps_to_fixed_messages() {
+        let f = HelperSpawnFailure::Spawn(std::io::Error::from_raw_os_error(26));
+        assert_eq!(f.raw_os_error(), Some(26));
+        let e = f.into_cri();
+        assert_eq!(e.code(), CriErrorCode::Unavailable);
+        assert_eq!(e.message(), "failed to start the exec helper");
+        let e = HelperSpawnFailure::ChannelSetup(std::io::Error::from_raw_os_error(24)).into_cri();
+        assert_eq!(e.code(), CriErrorCode::Unavailable);
+        assert_eq!(e.message(), "exec channel setup failed");
+    }
+
     fn expect_untrusted(r: Result<SpawnedHelper, CriError>) {
         let e = r.err().expect("rejected");
         assert_eq!(e.code(), CriErrorCode::FailedPrecondition);
@@ -1297,12 +1318,12 @@ mod bin_check_4499 {
         let euid = current_euid().expect("euid");
         let fx = BinFixture::new("exec-ok");
         fx.place_elf(0o755);
-        let r = spawn_at(&fx.exe, euid);
+        let r = spawn_at_raw(&fx.exe, euid);
         if !fx.ancestors_ok(euid) {
             assert!(r.is_err());
             return;
         }
-        let mut helper = r.expect("spawned");
+        let mut helper = r.unwrap_or_else(|f| panic!("spawned: {f}"));
         let deadline = Instant::now() + Duration::from_secs(10);
         let status = loop {
             if let Some(st) = helper.child.try_wait().expect("try_wait") {

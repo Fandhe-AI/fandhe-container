@@ -15,7 +15,7 @@ Linux カーネルは GPL-2.0 です。ソース提供の義務は、次の材�
 | 設定 | [`arm64-guest.config`](arm64-guest.config)（Kconfig フラグメント）と、ビルドが出力する完全な `config` |
 | ビルドスクリプト | [`build.sh`](build.sh) |
 
-- ビルドが出力する `config`（生成された `.config`）と `build-info.txt`（版・URL・sha256・ツールチェーン・ホスト）を、カーネルの Image と一緒に配布物へ添えます
+- ビルドが出力する `config`（生成された `.config`）と `build-info.txt`（版・URL・sha256・ツールチェーン・ホスト・ビルド識別情報の固定値）を、カーネルの Image と一緒に配布物へ添えます
 - release への添付とアセット説明の文言（「Linux kernel（GPL-2.0）」）は人間担当です
 - Kata Containers・apple/containerization の設定行は写していません。必要なオプションは自前で列挙しています（#1823）
 
@@ -102,3 +102,13 @@ init（#1875）への申し送り: `DEVTMPFS_MOUNT` は initramfs 起動には�
 ## 実ビルドの記録
 
 実ビルドの結果（Image のサイズ・所要時間・ホストの OS）は #1628 に記録します。Agent は実ビルドを実行していません。
+
+## ビルド識別情報（#4590・MAC-1・REPAIR-3）
+
+- kbuild は既定でビルド環境のユーザー名・ホスト名・ビルド時刻を `Linux version ...` の行と `/proc/version` に埋め込みます。この行はゲストのコンソールログに出るため、public の issue へ貼ると環境の名前が漏れます
+- `build.sh` は `KBUILD_BUILD_USER=fandhe-container`・`KBUILD_BUILD_HOST=build`・`KBUILD_BUILD_TIMESTAMP=1970-01-01 00:00:00 UTC` を常に make へ渡します。呼び出し元の環境に同名の変数があっても使わず（警告を出して無視）、上書きの引数もありません。値を変えるときはスクリプトの定数を直します
+- 固定値は `build-info.txt` の末尾 3 行（`kbuild_build_user`・`kbuild_build_host`・`kbuild_build_timestamp`）に残ります
+- この変更より前にビルドした Image には実際の名前が残っています。ログを貼る前に作り直してください。`strings Image | grep 'Linux version'` で確認できます
+- 本スクリプト以外の方法でビルドした Image も、上の 3 変数を指定しなければ名前が入ります
+- macOS の BSD `date` では、initramfs の mtime の固定だけが効きません（`Linux version` の行の固定は効きます）
+- 実カーネルのビルドでの確認は未検証です（#1628）

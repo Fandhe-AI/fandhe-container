@@ -88,6 +88,7 @@ fandhe-container/
 │   │   │   ├── idle-memory-local.md  # アイドル時常駐メモリのローカル実測レポート（TASK-45.2・CORE-7。root 権限での確定計測は TASK-47）
 │   │   │   ├── state-lock-contention.md  # 状態ストア `@lock` の取り直しによる飢えの計測と対策（#2229・SUP-1・REPAIR-5）
 │   │   │   ├── oci-pull-e2e-local.md  # pull_e2e の公開イメージ 5 種での実行記録（TASK-55.2・OCI-1・#421。run 段の終了コード 0 は人間へ引き継ぎ・#2313）
+│   │   │   ├── sec4-2480-thread-count-lag.md  # sec4_2480 の間欠失敗の原因（join 後の `Threads:` 減算の遅れ）と修正・回帰試験・300 回の記録（#2766・SEC-4・SUP-6・SUP-8・REPAIR-5・REPAIR-12）
 │   │   │   ├── production-launcher-tmpfiles-flock.md  # production_launcher の create が間欠的に「start is in progress in another process」で失敗した原因（systemd-tmpfiles の aging 走査の flock との競合）と対策の記録。他の実機前提試験への展開と共通補助 `crates/core/tests/support/scratch_root.rs`、既定のテスト集合への展開〔試験ごとの `ScratchDir`〕（#2840・#2887・#2958・#3026・#3141・CORE-2・CORE-5・REPAIR-12）
 │   │   │   └── plugin-stderr-reader-stop-macos.md  # one-shot の stderr 読み手停止（#3003 の修正後）を macOS で 100 回以上繰り返す照合の手順と結果欄。結果は dispatch 後に記入（#3138・REPAIR-5・PLUG-7・PLUG-12・REPAIR-12）
 │   │   ├── io-power-loss-verification.md  # 電源断・カーネルクラッシュ後の媒体永続化（IO-2）の検証方式の比較と推奨（dm-flakey。#1965・オーナー承認待ち）。実機前提試験 crates/io/tests/power_loss.rs

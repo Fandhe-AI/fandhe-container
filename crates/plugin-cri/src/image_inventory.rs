@@ -9,7 +9,11 @@
 //! - 保存先は pull と同じ root（`<state_root>/.cri/images`）直下の `@cri-image-records.json`。oci の在庫
 //!   （`@image-inventory.json`）から導出しないのは、`repo_digests` の top-level（multi-arch の index digest）と
 //!   タグ無し pull の repo 名が oci の在庫に残らないため（`docs/design/pull-inventory-wiring.md`）
-//! - `remove`（`RemoveImage`。#4177）も同じ排他区間で読み直し、cri の `InMemoryImageStore::remove`（記録ごと外す）で
+//! - `remove`（`RemoveImage`。#4177）は、使用中のイメージを拒否する（#2791・OCI-7・CRI-2）。同じ排他区間の中で、対象の image ID
+//!   （config digest）を持つ manifest のどれかをコンテナが参照していれば `ImageStoreError::InUse` を返し、記録を外さない
+//!   （`register_container_ref` と同じ `@lock` の下なので判定と登録は原子的。タグだけの参照は数えない。確定前の参照も数える）。
+//!   これは #4264（記録と oci の在庫の突き合わせ）とは別物。blob は消さないため、判定と create の競合でもデータは失われない。
+//!   そのうえで、同じ排他区間で読み直し、cri の `InMemoryImageStore::remove`（記録ごと外す）で
 //!   組み直して同じ手順で書く。該当が無ければファイルを書かず、読み直した永続側の内容へメモリ表示だけ揃える
 //!   （冪等）。blob・展開済み rootfs には触れない（回収は #471 系）
 //! - 書き込みと起動時の読み込みは oci の `ImageStore::lock()` の排他区間の中で行う（root の再検査とプロセス間の
@@ -53,7 +57,9 @@ use fandhe_container_cri::image_service::{
     RemoveOutcome, decode_image_records, encode_image_records,
 };
 use fandhe_container_oci::image_management::ImageStore as OciImageStore;
+use fandhe_container_oci::image_management::ReferenceTable;
 use fandhe_container_oci::instrument::OciOpRecorder;
+use fandhe_container_oci::reference::Digest;
 
 /// 記録ファイル名（oci の `blobs/`・`staging/` の走査と `STALE_TMP_PREFIXES` に当たらないよう `@` で始める）。
 pub const CRI_IMAGE_RECORDS_FILE_NAME: &str = "@cri-image-records.json";
@@ -178,7 +184,7 @@ enum Change<T> {
 impl PersistentImageStore {
     /// [`ImageStore::upsert`] の本体。書き込みの失敗注入点を差し替えられる（試験用）。
     fn upsert_with(&self, record: ImageRecord, ops: WriteOps) -> Result<(), ImageStoreError> {
-        self.commit_with(ops, |mem| {
+        self.commit_with(ops, |mem, _table| {
             mem.upsert(record)?;
             Ok(Change::Write(()))
         })
@@ -192,7 +198,20 @@ impl PersistentImageStore {
         ops: WriteOps,
     ) -> Result<RemoveOutcome, ImageStoreError> {
         // 1 回目の Absent と 2 回目（正規化形）を同じ排他区間で行う（PullImage の割り込みで新規 pull を消さない）。
-        self.commit_with(ops, |mem| {
+        // 使用中の判定も同じ区間で行う。`register_container_ref` が取るのと同じ `@lock` の下なので、判定と登録は原子的になる。
+        self.commit_with(ops, |mem, table| {
+            let target = match mem.get(reference)? {
+                Some(r) => Some(r),
+                None => match canonical {
+                    Some(c) if c != reference => mem.get(c)?,
+                    _ => None,
+                },
+            };
+            if let Some(record) = &target
+                && image_in_use(table, record.id())
+            {
+                return Err(ImageStoreError::InUse);
+            }
             let mut outcome = mem.remove(reference)?;
             if let (RemoveOutcome::Absent, Some(c)) = (&outcome, canonical)
                 && c != reference
@@ -213,14 +232,14 @@ impl PersistentImageStore {
     fn commit_with<T>(
         &self,
         ops: WriteOps,
-        apply: impl FnOnce(&InMemoryImageStore) -> Result<Change<T>, ImageStoreError>,
+        apply: impl FnOnce(&InMemoryImageStore, &ReferenceTable) -> Result<Change<T>, ImageStoreError>,
     ) -> Result<T, ImageStoreError> {
         // 壊れた状態で開いたストアは書かない（壊れたファイルを上書きしない）。
         self.ready()?;
         // 排他区間の中で永続側を読み直して適用し、書けたときだけメモリ表示を差し替える。
         let _guard = self.oci.lock().map_err(|_| ImageStoreError::Io)?;
         let mem = build_memory(read_records(self.oci.root())?)?;
-        let (value, needs_write) = match apply(&mem)? {
+        let (value, needs_write) = match apply(&mem, &_guard)? {
             Change::Write(v) => (v, true),
             Change::Keep(v) => (v, false),
         };
@@ -248,6 +267,21 @@ impl PersistentImageStore {
         *self.view.lock().map_err(|_| ImageStoreError::Poisoned)? = View::Ready(Arc::new(mem));
         Ok(value)
     }
+}
+
+/// image ID（config digest）を持つ manifest のどれかを、コンテナが参照しているか（OCI-7・CRI-2・#2791）。
+///
+/// 数えるのはコンテナ参照だけで、タグは数えない（`RemoveImage` はタグを含む記録ごと外す操作のため）。確定前の参照
+/// （進行中の create）も使用中として数える（保護側に倒す）。image ID が digest として読めなければ、どの manifest の
+/// config とも一致しないので使用中ではない。
+fn image_in_use(table: &ReferenceTable, image_id: &str) -> bool {
+    let Ok(id) = Digest::parse(image_id) else {
+        return false;
+    };
+    table
+        .manifests()
+        .filter(|(_, c)| c.config() == &id)
+        .any(|(d, _)| !table.manifest_references(d).containers.is_empty())
 }
 
 fn build_memory(records: Vec<ImageRecord>) -> Result<InMemoryImageStore, ImageStoreError> {

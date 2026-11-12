@@ -44,6 +44,8 @@ pub mod audit_relay;
 mod flock_release;
 #[cfg(unix)]
 pub mod image_inventory;
+#[cfg(unix)]
+pub(crate) mod image_refs;
 pub mod instance_lock;
 pub mod netsetup;
 #[cfg(unix)]

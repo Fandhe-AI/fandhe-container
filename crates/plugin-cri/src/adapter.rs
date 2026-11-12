@@ -47,6 +47,13 @@
 //!   supervisor ログと合わせて 20 秒（共有の待ち 10 + 各最後の試行 5 + 5）。失敗は `container_log_remove.<code>`（`failed_precondition`・`timeout`・`invalid_argument`・
 //!   `internal`・`other`）の操作名でも計上する（REPAIR-4）。待ち切れなかった失敗（`FailedPrecondition`）は警告行に `reason: sink_open_after_wait` を足して他の失敗と区別する（#2760。terminate を設定する経路が無く、待ちを伸ばさない判断は `docs/design/container-log-removal-wait.md`）。待ちを超えて残ったログは、plugin の起動時の走査（[`sweep_leftover_container_logs`]）と同じ ID の `create` の前の回収（`reclaim_before_create`）で消える（生きている sink・状態がある ID・帰属できない名前は残り、手動で消す。docs/setup/container-log-recovery.md）。
 //!   core の `delete` の成功後には起動オプション文書（`<root>/@container-options/<id>`）の残骸も、記録の無い ID に限りロックの下で期限つきに消す（失敗は `container_options_remove` の Failure と `target: container_options` の警告行。`create` の前にも同じ掃除をする。SUP-12・#2760）
+//! - OCI-7 のイメージ参照（#2791）: 本番は `with_image_store_root(<state_root>/.cri/images)` で在庫 root を持ち、`CreateRequest` の
+//!   annotations の予約キー `CRI_IMAGE_ID_ANNOTATION`（`CreateContainer` が bundle の image ID を載せる）があるとき、`create` が create ゲートの
+//!   共有の下で config digest から manifest を解決して参照を登録・確定し（`create_with_image`）、image root を状態記録に残す。`delete` は
+//!   記録した root の参照を外す（`delete_releasing_image_ref`。失敗は `image_ref` の `Kept` と警告行）。`RemoveImage` は `PersistentImageStore`
+//!   が使用中を `FAILED_PRECONDITION` で拒否する。アダプタは `crate::image_refs`（CLI と同式の暫定の 2 つ目。置き場所は #2315 の判断待ち）。
+//!   未実装（REPAIR-3）: register 後 bind 前のクラッシュで残る未確定の参照と、`Kept` で残った確定済みの参照の後追いの回収（CLI の
+//!   `ref_reconcile` 相当）は CRI 側に無く、残ると `RemoveImage` が拒否され続けうる（守る側に倒れる）。非 unix は在庫 root を使わず従来のまま
 //! - bundle 供給: 本番は `CriPluginBackends::production_bundle_provider`（unix のみ）（pull 済みイメージの再展開と
 //!   ContainerConfig → config.json 変換。#2433）。`ImageService` は同じ UDS でサーブし（`CriPluginBackends::image_service`。#2592）、
 //!   `PullImage` が登録したタグ・digest・image ID を同じ在庫から解決する（未知の参照は `NOT_FOUND`）。
@@ -94,6 +101,8 @@ use fandhe_container_core::traits::{
     PublishPortRequest, StartRequest, StateRecord, StateRequest, StateStore, StopRequest,
     TraitError,
 };
+#[cfg(unix)]
+use fandhe_container_cri::adapter::CRI_IMAGE_ID_ANNOTATION;
 use fandhe_container_cri::adapter::{
     BundleProvider, BundleRequest, PodNamespaceHolderProvider, PreparedBundle, RuntimeAdapter,
 };
@@ -298,7 +307,8 @@ impl CriPluginBackends {
         let mut runtime = CoreLifecycleRuntime::with_recorder(
             Arc::clone(&state),
             Arc::clone(&lifecycle_recorder),
-        );
+        )
+        .with_image_store_root(state_root.join(IMAGES_DIR));
         if let Some(sink) = create_audit {
             runtime = runtime.with_create_audit_sink(sink);
         }
@@ -994,6 +1004,9 @@ pub struct CoreLifecycleRuntime {
     core_delete_deadline: Option<Instant>,
     /// `delete` の後始末で残した資源の構造化ログ 1 行の出力先（本番は stderr の `LineSink`。試験で差し替える。#2633）。
     cleanup_warn: Arc<dyn Fn(String) + Send + Sync>,
+    /// OCI-7 のイメージ参照の登録・解除に使う在庫 root（oci の `ImageStore` の root。本番は `<state_root>/.cri/images`）。
+    /// `None` の間は参照の登録も解除もしない（従来の create / delete。#2791・REPAIR-3）。
+    image_store_root: Option<PathBuf>,
     #[cfg(target_os = "linux")]
     supervised: SupervisedLifecycle,
 }
@@ -1344,6 +1357,7 @@ impl CoreLifecycleRuntime {
             cleanup_warn: Arc::new(|line| {
                 let _ = crate::telemetry::stderr_sink().submit(line);
             }),
+            image_store_root: None,
             #[cfg(target_os = "linux")]
             supervised: SupervisedLifecycle::production(),
         }
@@ -1397,6 +1411,18 @@ impl CoreLifecycleRuntime {
     #[must_use]
     pub fn with_create_audit_sink(mut self, sink: Arc<dyn AuditSink>) -> Self {
         self.create_audit = Some(Arc::new(ObservedCreateAudit { inner: sink }));
+        self
+    }
+
+    /// OCI-7 のイメージ参照の登録・解除に使う在庫 root を設定する（#2791・CRI-2）。
+    ///
+    /// 設定すると、`CreateRequest` の annotations に `CRI_IMAGE_ID_ANNOTATION` があるイメージつきの `create` が
+    /// コンテナ参照を登録・確定し、`delete` が create 時に状態記録へ残した root の参照を外す。`RemoveImage` が見る在庫
+    /// （`PersistentImageStore`）と同じ root を渡すこと（本番は `<state_root>/.cri/images`）。unix のみ有効で、
+    /// 非 unix では設定しても従来の create / delete のまま（REPAIR-3）。
+    #[must_use]
+    pub fn with_image_store_root(mut self, root: PathBuf) -> Self {
+        self.image_store_root = Some(root);
         self
     }
 
@@ -1880,6 +1906,164 @@ pub(crate) fn to_trait_error(e: OciRuntimeError) -> TraitError {
     TraitError::new(e.code(), e.message())
 }
 
+/// イメージ参照の操作が排他の取得を待つ上限（create 側の個別上限。実際の値は [`image_ref_create_lock_timeout`] が残り時間から決める）。
+///
+/// create の予算（REPAIR-5・#2791）: 事前回収 20 秒・状態作成 5 秒・監査記録 `CREATE_AUDIT_BUDGET`（22.9 秒）の計 47.9 秒に、
+/// イメージ参照の排他待ち 5 回（create ゲート・manifest 解決・register・bind または release・bind 後の `StateStore::get`）が
+/// 各 2 秒で 10 秒加わり、計 57.9 秒で `PLUGIN_RUNTIME_TIMEOUT`（60.9 秒）に収まる。
+#[cfg(unix)]
+const IMAGE_REF_CREATE_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// create 内のイメージ参照の排他待ちの最大回数（上記の 5 回）。
+#[cfg(unix)]
+const IMAGE_REF_CREATE_LOCK_STAGES: u32 = 5;
+
+/// 既存経路（状態作成）の最悪の待ち。
+#[cfg(unix)]
+const CREATE_STATE_BUDGET: Duration = Duration::from_secs(5);
+
+/// create の入口で決めた絶対期限 `deadline` までの残りから、イメージ参照の排他待ちの 1 回分の上限を決める。
+///
+/// 後続の状態作成と監査記録の最悪分を先に差し引き、残りを段数で割って `IMAGE_REF_CREATE_LOCK_TIMEOUT` で頭打ちにする。
+/// 残りが無ければ `None`（呼び出し側は何も作らず `Timeout` で失敗する）。
+#[cfg(unix)]
+fn image_ref_create_lock_timeout(deadline: Instant, now: Instant) -> Option<Duration> {
+    let remaining = deadline.saturating_duration_since(now);
+    let reserved = CREATE_STATE_BUDGET + CREATE_AUDIT_BUDGET;
+    let per_stage = remaining.checked_sub(reserved)? / IMAGE_REF_CREATE_LOCK_STAGES;
+    if per_stage.is_zero() {
+        return None;
+    }
+    Some(per_stage.min(IMAGE_REF_CREATE_LOCK_TIMEOUT))
+}
+
+/// delete 側の上限。delete は `PLUGIN_FORCE_DELETE_DEADLINE`（47 秒）の中で stop の予算とログの後始末（最悪 20 秒）を
+/// 残す必要があるため短くする。解除は lookup と release の 2 回で、最悪 2 秒 × 2 = 4 秒（REPAIR-5）。
+#[cfg(unix)]
+const IMAGE_REF_DELETE_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// 記録した在庫 root が設定済みの root と食い違うときの固定文言（状態を消さずに失敗する）。
+#[cfg(unix)]
+const MSG_IMAGE_ROOT_MISMATCH: &str = "recorded image store root does not match the configured one";
+/// 記録はあるが在庫 root が設定されていないときの固定文言。
+#[cfg(unix)]
+const MSG_IMAGE_ROOT_UNCONFIGURED: &str = "image store root is not configured for this container";
+
+#[cfg(unix)]
+impl CoreLifecycleRuntime {
+    /// イメージつき create（OCI-7・CRI-2・#2791）。
+    ///
+    /// 手順: image ID の検証 → 在庫を開く → 状態ルートの scope → create ゲートの共有 → manifest の解決 →
+    /// image root を状態記録の annotations へ追加 → `create_with_image[_audited]`。呼び出し全体をゲートの共有で包む
+    /// （`ImageStore::quiesce_container_creates` が進行中の create を待てるようにする規約。ロック順序は ゲート > `@lock` > StateStore）。
+    /// rootfs は `BundleProvider` が展開済みの前提で、展開器は付けない（core は検証だけを行う）。
+    /// manifest が在庫に無ければ `NotFound` で、状態も参照も作らない（fail-closed）。
+    fn create_with_image_refs(
+        &self,
+        req: &CreateRequest,
+        root: &std::path::Path,
+        image_id: &str,
+        deadline: Instant,
+    ) -> Result<StateRecord, TraitError> {
+        use crate::image_refs::{
+            StoreImageRefs, attach_image_root, oci_failure, open_image_store, parse_image_id,
+            resolve_manifest, state_scope,
+        };
+        use fandhe_container_core::oci_runtime::ContainerImage;
+        let image_id = parse_image_id(image_id)?;
+        let lock_timeout = image_ref_create_lock_timeout(deadline, Instant::now())
+            .ok_or_else(|| TraitError::new(ErrorCode::Timeout, "create deadline exhausted"))?;
+        let images = open_image_store(root, lock_timeout)?;
+        let scope = state_scope(&*self.store)?;
+        let _pass = images
+            .enter_container_create()
+            .map_err(|e| oci_failure(&e))?;
+        let manifest = resolve_manifest(&images, &image_id)?;
+        let req = attach_image_root(req, &images)?;
+        let refs = StoreImageRefs::new(&images, &scope);
+        let image = ContainerImage::new(&refs, &manifest);
+        match &self.create_audit {
+            Some(sink) => oci_runtime::create_with_image_audited(
+                &*self.store,
+                &self.recorder,
+                image,
+                &req,
+                sink.as_ref(),
+            ),
+            None => oci_runtime::create_with_image(&*self.store, &self.recorder, image, &req),
+        }
+        .map_err(to_trait_error)
+    }
+
+    /// core の delete に、記録した在庫 root があればイメージ参照の解除を後置する（OCI-7・#2791）。
+    ///
+    /// create が状態記録へ残した image root を読み、設定済みの root を開いて一致を確かめる（値は信頼しない）。
+    /// 記録が無ければ従来の delete（`image_ref` は `NotApplicable`）。開けない・食い違う・root 未設定のときは
+    /// 状態を消さずに失敗する（fail-closed。CLI の `delete_with_recorded_image_root` と同じ方針）。
+    /// 解除の失敗は `DeleteResponse::image_ref` の `Kept { code }` になり、delete の成否は変えない。
+    fn delete_releasing_refs(
+        &self,
+        req: &DeleteRequest,
+        options: &oci_runtime::DeleteOptions,
+    ) -> Result<DeleteResponse, TraitError> {
+        use crate::image_refs::{
+            IMAGE_ROOT_ANNOTATION, StoreImageRefs, open_image_store, state_scope,
+        };
+        let recorded = match self.store.get(&GetStateRequest::new(req.id().clone())) {
+            Ok(r) => r
+                .annotations()
+                .get(IMAGE_ROOT_ANNOTATION)
+                .map(str::to_owned),
+            Err(e) if e.code() == ErrorCode::NotFound => None,
+            Err(e) => return Err(e),
+        };
+        let Some(recorded) = recorded else {
+            return oci_runtime::delete_with_options(
+                &*self.store,
+                &self.recorder,
+                &*self.cgroups,
+                req,
+                options,
+            )
+            .map_err(to_trait_error);
+        };
+        let configured = self.image_store_root.as_deref().ok_or_else(|| {
+            TraitError::new(ErrorCode::FailedPrecondition, MSG_IMAGE_ROOT_UNCONFIGURED)
+        })?;
+        let images = open_image_store(configured, IMAGE_REF_DELETE_LOCK_TIMEOUT)?;
+        if images.root() != std::path::Path::new(&recorded) {
+            return Err(TraitError::new(
+                ErrorCode::FailedPrecondition,
+                MSG_IMAGE_ROOT_MISMATCH,
+            ));
+        }
+        let scope = state_scope(&*self.store)?;
+        let refs = StoreImageRefs::new(&images, &scope);
+        oci_runtime::delete_releasing_image_ref_with_options(
+            &*self.store,
+            &self.recorder,
+            &*self.cgroups,
+            &refs,
+            req,
+            options,
+        )
+        .map_err(to_trait_error)
+    }
+}
+
+#[cfg(not(unix))]
+impl CoreLifecycleRuntime {
+    /// 非 unix は在庫 root を使わず、従来の delete のまま（REPAIR-3）。
+    fn delete_releasing_refs(
+        &self,
+        req: &DeleteRequest,
+        options: &oci_runtime::DeleteOptions,
+    ) -> Result<DeleteResponse, TraitError> {
+        oci_runtime::delete_with_options(&*self.store, &self.recorder, &*self.cgroups, req, options)
+            .map_err(to_trait_error)
+    }
+}
+
 impl CoreLifecycleRuntime {
     /// force 削除の前に、生きている（Running・pid あり、または pid あり Created）コンテナを停止して終了を確認する。
     ///
@@ -1919,7 +2103,19 @@ fn launch_unavailable() -> TraitError {
 
 impl ContainerRuntime for CoreLifecycleRuntime {
     fn create(&self, req: &CreateRequest) -> Result<ContainerStatus, TraitError> {
+        // create 全体の絶対期限（`PLUGIN_RUNTIME_TIMEOUT` 未満。REPAIR-5）。イメージ参照の排他待ちはここからの残りで割り当てる。
+        #[cfg(unix)]
+        let deadline = Instant::now() + PLUGIN_RUNTIME_TIMEOUT;
         self.reclaim_before_create(req.id())?;
+        #[cfg(unix)]
+        if let (Some(root), Some(image_id)) = (
+            self.image_store_root.as_deref(),
+            req.annotations().get(CRI_IMAGE_ID_ANNOTATION),
+        ) {
+            return self
+                .create_with_image_refs(req, root, image_id, deadline)
+                .map(|r| status_with_instance(&r));
+        }
         let created = match &self.create_audit {
             Some(sink) => {
                 oci_runtime::create_audited(&*self.store, &self.recorder, req, sink.as_ref())
@@ -1987,14 +2183,7 @@ impl ContainerRuntime for CoreLifecycleRuntime {
         if let Some(d) = self.core_delete_deadline {
             options = options.with_deadline(d);
         }
-        let response = oci_runtime::delete_with_options(
-            &*self.store,
-            &self.recorder,
-            &*self.cgroups,
-            req,
-            &options,
-        )
-        .map_err(to_trait_error)?;
+        let response = self.delete_releasing_refs(req, &options)?;
         // 2 つのログで待ちを共有する（最悪 10 + 5 + 5 = 20 秒。独立に待つと 30 秒で `PLUGIN_RUNTIME_TIMEOUT` の余裕が尽きる。#2964）。
         // 順序の根拠: コンテナログの sink は drain の終わりに閉じ、supervisor ログの flock はプロセス終了で外れる。
         // supervisor ログが解放されればコンテナログはほぼ即座に消せるため、先に supervisor ログを待つ。
@@ -2092,7 +2281,7 @@ impl NetworkPlugin for UnimplementedNetwork {
 #[cfg(unix)]
 const BUNDLES_DIR: &str = ".cri/bundles";
 /// pull 済みイメージのキャッシュの置き場（`ImageService` の pull が使うキャッシュと同じ位置を想定する）。
-#[cfg(unix)]
+/// 非 unix でも `with_image_store_root` の引数に使うため cfg を付けない。
 const IMAGES_DIR: &str = ".cri/images";
 
 /// 状態ルート `state_root` 配下に bundle の置き場とイメージキャッシュを用意し、本番の [`BundleProvider`] を作る
@@ -3302,6 +3491,37 @@ mod tests {
         assert_eq!(seen.len(), 1);
         assert!(seen[0] > before && seen[0] <= Instant::now() + CREATE_AUDIT_BUDGET);
         assert_eq!(CREATE_AUDIT_BUDGET, RECORD_WAIT_LIMIT * 2);
+    }
+
+    /// create の期限予算（OCI-7・CRI-2・REPAIR-5・#2791）。最悪の合計が `PLUGIN_RUNTIME_TIMEOUT` に収まることを具体値で固定する。
+    #[cfg(unix)]
+    #[test]
+    fn create_image_ref_budget_fits_runtime_timeout() {
+        // 事前回収 20 秒 + 状態作成 5 秒 + 監査 22.9 秒 + 排他待ち 5 回 x 2 秒 = 57.9 秒 < 60.9 秒。
+        let worst = Duration::from_secs(20)
+            + CREATE_STATE_BUDGET
+            + CREATE_AUDIT_BUDGET
+            + IMAGE_REF_CREATE_LOCK_TIMEOUT * IMAGE_REF_CREATE_LOCK_STAGES;
+        assert_eq!(worst, Duration::from_millis(57_900));
+        assert!(worst <= PLUGIN_RUNTIME_TIMEOUT);
+
+        let now = Instant::now();
+        // 事前回収が 20 秒を使い切った後でも 2 秒が割り当たる。
+        let after_reclaim = now + PLUGIN_RUNTIME_TIMEOUT - Duration::from_secs(20);
+        assert_eq!(
+            image_ref_create_lock_timeout(after_reclaim, now),
+            Some(Duration::from_secs(2))
+        );
+        // 残りが予約分 + 5 x 1 秒ちょうどなら 1 秒。
+        let tight = now + CREATE_STATE_BUDGET + CREATE_AUDIT_BUDGET + Duration::from_secs(5);
+        assert_eq!(
+            image_ref_create_lock_timeout(tight, now),
+            Some(Duration::from_secs(1))
+        );
+        // 予約分しか残っていなければ何も始めない。
+        let none = now + CREATE_STATE_BUDGET + CREATE_AUDIT_BUDGET;
+        assert_eq!(image_ref_create_lock_timeout(none, now), None);
+        assert_eq!(image_ref_create_lock_timeout(now, now), None);
     }
 
     /// SEC-4・#2594: 常に失敗する sink でも `create` の拒否の `code`・`message` は変わらない（fail-closed）。

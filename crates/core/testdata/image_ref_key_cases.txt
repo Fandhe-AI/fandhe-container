@@ -1,0 +1,20 @@
+# OCI-7・CRI-2・#2791: コンテナ参照キー導出の共有 fixture。
+#
+# cli の `commands/image_refs.rs` と plugin-cri の `image_refs.rs` は、同じ式を各 crate に持つ（置き場所の判断待ち。
+# docs/design/image-store-adapter-placement.md）。キーが食い違うと一方が他方のコンテナの参照を外せなくなるため、
+# 両 crate の単体試験がこの表を `include_str!` で読み、同じ値になることを照合する。
+#
+# 形式（タブ区切り・LF・`#` 始まりと空行は無視）。`@rep:<1 文字>:<回数>` は、その文字の繰り返しに展開する。
+#   scope<TAB><状態ルートの正規パス><TAB><期待する scope（パスの SHA-256 の先頭 32 桁）>
+#   key<TAB><scope><TAB><コンテナ ID><TAB><期待する参照キー>
+#   annotation<TAB><image root を状態記録に残す予約キー>
+#
+# 期待値は `printf '%s' <path> | sha256sum | cut -c1-32` と、長い ID の畳み込み
+# `<scope>-<sha256(id) の 64 桁>` を独立に計算した値。
+scope	/home/u/.local/state/fandhe	f5145bcd0958142c2edeb524ede72409
+scope	/var/lib/fandhe-container	b9246886bbb5910be7e1d21f34528fac
+scope	/tmp/a b	f5b673de85cff1a8f1084fde0dcfc208
+key	b9246886bbb5910be7e1d21f34528fac	c1	b9246886bbb5910be7e1d21f34528fac.c1
+key	b9246886bbb5910be7e1d21f34528fac	@rep:a:222	b9246886bbb5910be7e1d21f34528fac.@rep:a:222
+key	b9246886bbb5910be7e1d21f34528fac	@rep:a:223	b9246886bbb5910be7e1d21f34528fac-298b3d8c466dd48d0249826d014574077e7d25c8901132c85760670f01b4a92b
+annotation	io.fandhe.container.image-root

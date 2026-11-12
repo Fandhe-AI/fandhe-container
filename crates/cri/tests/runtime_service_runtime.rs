@@ -102,6 +102,8 @@ struct FakeRuntime {
     create_instance: Mutex<Option<u64>>,
     /// start が受けた `StartRequest::stdin()`（CRI-6・#4076 の検証用）。
     start_stdin_modes: Mutex<Vec<fandhe_container_core::traits::StdinMode>>,
+    /// create が受けた予約 annotation `CRI_IMAGE_ID_ANNOTATION` の値（OCI-7・#2791 の検証用）。
+    create_image_ids: Mutex<Vec<Option<String>>>,
 }
 
 impl FakeRuntime {
@@ -114,6 +116,11 @@ struct Shared(Arc<FakeRuntime>);
 
 impl ContainerRuntime for Shared {
     fn create(&self, r: &CreateRequest) -> Result<ContainerStatus, TraitError> {
+        self.0.create_image_ids.lock().unwrap().push(
+            r.annotations()
+                .get(fandhe_container_cri::adapter::CRI_IMAGE_ID_ANNOTATION)
+                .map(str::to_owned),
+        );
         self.0.calls.lock().unwrap().push(format!(
             "create {} {}",
             r.id().as_str(),
@@ -2063,6 +2070,30 @@ async fn cri2_status_and_list_report_resolved_image() {
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].image_ref, format!("sha256:{hex}"));
     assert_eq!(list[0].image_id, format!("sha256:{hex}"));
+}
+
+/// OCI-7・CRI-2（#2791）: bundle が報告したイメージの ID が、実行層への `CreateRequest` の予約 annotation として
+/// 届く。報告の無い bundle では annotation を付けない。
+#[tokio::test]
+async fn oci7_cri2_2791_create_passes_resolved_image_id_to_runtime() {
+    use fandhe_container_cri::bundle::ResolvedImage;
+    let hex = "a".repeat(64);
+    let h = harness();
+    *h.bundles.report_image.lock().unwrap() = Some(ResolvedImage::new(
+        Digest::parse(&format!("sha256:{hex}")).unwrap(),
+        None,
+    ));
+    let sb = run_sandbox(&h.service).await;
+    create(&h.service, &sb, "a").await.expect("create");
+    assert_eq!(
+        *h.runtime.create_image_ids.lock().unwrap(),
+        vec![Some(format!("sha256:{hex}"))]
+    );
+
+    let h2 = harness();
+    let sb2 = run_sandbox(&h2.service).await;
+    create(&h2.service, &sb2, "b").await.expect("create");
+    assert_eq!(*h2.runtime.create_image_ids.lock().unwrap(), vec![None]);
 }
 
 /// CRI-2・OCI-1（#2831）: digest 参照が無い解決結果は image_ref も image ID。報告が無い経路は空。

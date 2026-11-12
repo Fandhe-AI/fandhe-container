@@ -3394,7 +3394,11 @@ impl CriRuntimeService {
                 }
                 // 以後は実行層に資源が残りうる。確定失敗または削除完了を確認できた場合だけ解放する（fail-closed）。
                 guard.mark_dispatched();
-                let status = match adapter.create(&id, bundle.path().to_path_buf()) {
+                let status = match adapter.create_with_image_id(
+                    &id,
+                    bundle.path().to_path_buf(),
+                    bundle.image().map(ResolvedImage::id_str),
+                ) {
                     Ok(status) => status,
                     Err(status) => {
                         if is_definite_failure(status.code())

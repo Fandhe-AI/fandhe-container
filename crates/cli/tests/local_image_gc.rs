@@ -21,8 +21,19 @@
 //! - C（補助）: タグの外れた digest から prune の前に create だけしたコンテナを、prune の後に start できる。
 //! - F（#664）: 参照するコンテナを delete すると、次の prune でタグなしのイメージが消え、タグ付きは残る。
 //!
-//! `image prune` は CLI に未配線（#2384）のため、E・F は oci の公開 API（`execute_image_prune`）をプロセス内で呼ぶ。
-//! 配線後は CLI 経由へ切り替える。共有レイヤーの保持と `system df` は #665（TASK-184.3）の範囲。
+//! - G（#665・TASK-184.3）: 複数のイメージが共有するレイヤー S は、参照が 1 つでも残る限り `image rm` でも `image prune` でも
+//!   消えず（他のタグ付きイメージ・stopped のコンテナのどちらが守る場合も）、最後の参照が外れた prune で初めて消える。
+//! - H（#665）: `system df` の `images.bytes` / `cache.bytes` は、共有レイヤーを 1 回だけ数えた blob の見かけの大きさの和集合に
+//!   完全一致し、`blobs/sha256` の実ディスク使用量（各ファイルの `st_blocks * 512` の合計）との差が 5% 以内に収まる。
+//!   `image prune` の前後で、減る量は prune の `reclaimed_bytes` にちょうど一致する。
+//!
+//! `image prune` は CLI に未配線（#2384）のため、E・F・G・H は oci の公開 API（`execute_image_prune`）をプロセス内で呼ぶ。
+//! 配線後は CLI 経由へ切り替える。
+//!
+//! # 「実ディスク使用量」の解釈（H）
+//! 見かけのサイズ同士の比較は独立した基準にならないため、基準は割り当て済みブロック数（`st_blocks * 512`）とする。
+//! blob は 4 KiB の倍数・圧縮されない決定的な擬似乱数・`sync_all` 済みにして、遅延割り当てや圧縮で値が揺れないようにする。
+//! この解釈と 5% の妥当性の確認は人間担当の #668（TASK-184.h1）で行う。
 //!
 //! # 未充足の受け入れ条件（要オーナー判断）
 //! 「`--force` 後に参照元の停止中コンテナを `start` できる」は現行の契約では観測できない。core の `start` は `Created` 以外を
@@ -154,6 +165,10 @@ mod linux {
     const TAG_STOP: &str = "registry.example/fandhe/gc-stopped:v1";
     /// 無参照（参照するコンテナが無い）イメージのタグ。シナリオ D が `--force` なしの `image rm` で消す。
     const TAG_ORPHAN: &str = "registry.example/fandhe/gc-orphan:v1";
+    /// G・H（#665）の共有レイヤーを持つイメージのタグ。
+    const TAG_SA: &str = "registry.example/fandhe/gc-shared-a:v1";
+    const TAG_SB: &str = "registry.example/fandhe/gc-shared-b:v1";
+    const TAG_KEEP: &str = "registry.example/fandhe/gc-keep:v1";
     /// `image ls` の REPOSITORY 列と TAG 列。
     const LS_RUN: &str = "registry.example/fandhe/gc-run\tv1";
     const LS_STOP: &str = "registry.example/fandhe/gc-stopped\tv1";
@@ -173,6 +188,19 @@ mod linux {
         /// 先頭 1 つが config、残りが layer。
         fn new(manifest: char, names: [char; 3], sizes: [usize; 3]) -> Self {
             let hex = |k: char| std::iter::repeat_n(k, 64).collect::<String>();
+            Self {
+                manifest_hex: hex(manifest),
+                blobs: [
+                    (hex(names[0]), sizes[0]),
+                    (hex(names[1]), sizes[1]),
+                    (hex(names[2]), sizes[2]),
+                ],
+            }
+        }
+        /// 2 文字のパターンを 32 回並べた 64 桁の 16 進名で組む（1 文字の名前は既存の fixture が使い切っている）。
+        /// 共有レイヤーは複数の fixture が同じパターンと同じ大きさで持つ。
+        fn from_patterns(manifest: &str, names: [&str; 3], sizes: [usize; 3]) -> Self {
+            let hex = |p: &str| p.repeat(32);
             Self {
                 manifest_hex: hex(manifest),
                 blobs: [
@@ -240,6 +268,18 @@ mod linux {
                 );
                 println!(
                     "local_image_gc: after the referencing containers were deleted, image prune removed the untagged image and its config and layer blobs"
+                );
+                println!(
+                    "local_image_gc: a shared layer was kept while another tagged image or a stopped container still referenced it; image rm and image prune deleted only the unshared blobs"
+                );
+                println!(
+                    "local_image_gc: once the last reference was gone, image prune deleted the shared layer"
+                );
+                println!(
+                    "local_image_gc: system df images.bytes and cache.bytes matched the blob sizes with the shared layer counted once and stayed within 5% of the allocated disk usage"
+                );
+                println!(
+                    "local_image_gc: system df usage dropped by exactly the reclaimed bytes after image prune"
                 );
                 println!("local_image_gc: scenario ok");
                 ExitCode::SUCCESS
@@ -456,6 +496,7 @@ mod linux {
         let id_run = format!("gcrun{pid}");
         let id_stop = format!("gcstop{pid}");
         let id_new = format!("gcnew{pid}");
+        let id_shared = format!("gcshared{pid}");
 
         // 参照 Display の表記は oci の TagKey から導く（正規化後の表記を推測で書かない）。
         expect(
@@ -668,9 +709,441 @@ mod linux {
             ls == format!("{LS_HEADER}{want_run_row}"),
             &format!("image ls after the second prune: {ls:?}"),
         )?;
+        shared_layer_and_df(&env, &mut cleanup, &id_shared, &fx_run)?;
         Ok(())
     }
 
+    const KIB: usize = 1024;
+    /// 共有レイヤー S の名前と大きさ。全体（約 2.6 MiB）の 5% を大きく超え、df が二重に数えると 5% の照合も落ちる。
+    const SHARED_LAYER: &str = "f3";
+    const SHARED_LAYER_LEN: usize = 1024 * KIB;
+
+    /// 共有レイヤー S を持つ fixture。`config` は config の名前、`layer` は固有 layer の名前の 16 進パターン。
+    fn shared_fixture(manifest: &str, config: &str, layer: &str, layer_len: usize) -> Fixture {
+        Fixture::from_patterns(
+            manifest,
+            [config, SHARED_LAYER, layer],
+            [64 * KIB, SHARED_LAYER_LEN, layer_len],
+        )
+    }
+
+    /// blob の内容は名前を種にした決定的な擬似乱数（圧縮されない）。書いた後に `sync_all` で割り当てを確定させる。
+    fn write_blob(path: &Path, name: &str, len: usize) -> Result<(), String> {
+        let mut x: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in name.bytes() {
+            x = (x ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        if x == 0 {
+            x = 1;
+        }
+        let mut buf = Vec::with_capacity(len);
+        while buf.len() < len {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let take = (len - buf.len()).min(8);
+            buf.extend_from_slice(x.to_le_bytes().get(..take).unwrap_or(&[]));
+        }
+        let mut f = fs::File::create(path).map_err(|e| format!("create blob: {e}"))?;
+        f.write_all(&buf).map_err(|e| format!("write blob: {e}"))?;
+        f.sync_all().map_err(|e| format!("sync blob: {e}"))
+    }
+
+    /// `system df` の 9 項目。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct Df {
+        images_count: u64,
+        images_bytes: u64,
+        reclaimable: u64,
+        missing: u64,
+        blob_count: u64,
+        cache_bytes: u64,
+        unregistered_count: u64,
+        unregistered_bytes: u64,
+        foreign: u64,
+    }
+
+    /// CLI の `system df --image-root` を実行して固定ヘッダと固定順 9 行を解析する。
+    fn system_df(env: &Env) -> Result<Df, String> {
+        let out = run_cli(
+            &env.cli,
+            &[
+                "--root",
+                &env.root_s,
+                "system",
+                "df",
+                "--image-root",
+                &env.images_s,
+            ],
+            CLI_TIMEOUT,
+        )?;
+        if out.code != Some(0) || !out.stderr.is_empty() {
+            return Err(format!(
+                "system df: got {:?} stdout={:?} stderr={:?}",
+                out.code, out.stdout, out.stderr
+            ));
+        }
+        const KEYS: [&str; 9] = [
+            "images.count",
+            "images.bytes",
+            "images.reclaimable_bytes",
+            "images.missing_blobs",
+            "cache.blob_count",
+            "cache.bytes",
+            "cache.unregistered_count",
+            "cache.unregistered_bytes",
+            "cache.foreign_entries",
+        ];
+        let mut lines = out.stdout.lines();
+        expect(
+            lines.next() == Some("KEY\tVALUE"),
+            &format!("system df header: {:?}", out.stdout),
+        )?;
+        let mut v = [0u64; 9];
+        for (key, slot) in KEYS.iter().zip(v.iter_mut()) {
+            let line = lines.next().ok_or(format!("system df lacks {key}"))?;
+            let (k, val) = line
+                .split_once('\t')
+                .ok_or(format!("system df line {line:?}"))?;
+            expect(k == *key, &format!("system df key: want {key}, got {k}"))?;
+            *slot = val
+                .parse::<u64>()
+                .map_err(|e| format!("system df {key}={val:?}: {e}"))?;
+        }
+        expect(
+            lines.next().is_none(),
+            &format!("system df has extra lines: {:?}", out.stdout),
+        )?;
+        let [
+            images_count,
+            images_bytes,
+            reclaimable,
+            missing,
+            blob_count,
+            cache_bytes,
+            unregistered_count,
+            unregistered_bytes,
+            foreign,
+        ] = v;
+        Ok(Df {
+            images_count,
+            images_bytes,
+            reclaimable,
+            missing,
+            blob_count,
+            cache_bytes,
+            unregistered_count,
+            unregistered_bytes,
+            foreign,
+        })
+    }
+
+    /// `blobs/sha256` の通常ファイルの件数と割り当て済みバイト数（`st_blocks * 512` の合計）。ディレクトリが無ければ (0, 0)。
+    fn allocated_blob_bytes(env: &Env) -> Result<(u64, u64), String> {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = env.images.join("blobs").join("sha256");
+        let rd = match fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
+            Err(e) => return Err(format!("read_dir blobs: {e}")),
+        };
+        let (mut count, mut bytes) = (0u64, 0u64);
+        for ent in rd {
+            let ent = ent.map_err(|e| format!("blobs entry: {e}"))?;
+            let md = fs::symlink_metadata(ent.path()).map_err(|e| format!("blob metadata: {e}"))?;
+            if !md.is_file() {
+                continue;
+            }
+            count += 1;
+            bytes = md
+                .blocks()
+                .checked_mul(512)
+                .and_then(|b| bytes.checked_add(b))
+                .ok_or("allocated bytes overflow")?;
+        }
+        Ok((count, bytes))
+    }
+
+    /// 割り当て済みバイト数 `alloc` に対する `df` の差が 5% 以内か（整数演算。`alloc` が 0 は失敗）。
+    fn expect_within_5pct(df: u64, alloc: u64, what: &str) -> Result<(), String> {
+        let diff = u128::from(df.abs_diff(alloc));
+        expect(
+            alloc > 0 && diff * 100 <= 5 * u128::from(alloc),
+            &format!("{what}: df={df} allocated={alloc} differs by more than 5%"),
+        )
+    }
+
+    /// fixture 群の blob の和集合の件数と見かけの大きさ（共有 blob は 1 回だけ数える）。
+    fn union_size(fxs: &[&Fixture]) -> (u64, u64) {
+        let mut m = std::collections::BTreeMap::new();
+        for fx in fxs {
+            for (name, len) in &fx.blobs {
+                m.insert(name.clone(), *len as u64);
+            }
+        }
+        (m.len() as u64, m.values().sum())
+    }
+
+    /// `system df` が和集合に完全一致し（未登録・外来・欠落は 0）、実ディスク使用量と 5% 以内であること。
+    fn expect_df(env: &Env, fxs: &[&Fixture], reclaimable: u64, what: &str) -> Result<Df, String> {
+        let df = system_df(env)?;
+        let (n, bytes) = union_size(fxs);
+        expect(
+            df.images_count == fxs.len() as u64
+                && df.images_bytes == bytes
+                && df.reclaimable == reclaimable
+                && df.missing == 0
+                && df.blob_count == n
+                && df.cache_bytes == bytes
+                && df.unregistered_count == 0
+                && df.unregistered_bytes == 0
+                && df.foreign == 0,
+            &format!(
+                "{what}: system df {df:?}, want count={} bytes={bytes} reclaimable={reclaimable} blobs={n}",
+                fxs.len()
+            ),
+        )?;
+        let (alloc_n, alloc) = allocated_blob_bytes(env)?;
+        expect(
+            alloc_n == n,
+            &format!("{what}: {alloc_n} blob files on disk, want {n}"),
+        )?;
+        expect_within_5pct(df.images_bytes, alloc, &format!("{what}: images.bytes"))?;
+        expect_within_5pct(df.cache_bytes, alloc, &format!("{what}: cache.bytes"))?;
+        Ok(df)
+    }
+
+    /// `image rm [--force] <tag>` を実行して終了コード 0・空の stderr を確かめ、stdout を返す。
+    fn image_rm(env: &Env, force: bool, tag: &str) -> Result<String, String> {
+        let mut args = vec!["--root", env.root_s.as_str(), "image", "rm"];
+        if force {
+            args.push("--force");
+        }
+        args.extend(["--image-root", env.images_s.as_str(), tag]);
+        let out = run_cli(&env.cli, &args, CLI_TIMEOUT)?;
+        if out.code != Some(0) || !out.stderr.is_empty() {
+            return Err(format!(
+                "image rm {tag} (force={force}): got {:?} stdout={:?} stderr={:?}",
+                out.code, out.stdout, out.stderr
+            ));
+        }
+        Ok(out.stdout)
+    }
+
+    /// `image ls` の SIZE 列（4 列目）の合計。共有レイヤーは行ごとに数えられる。
+    fn ls_size_sum(ls: &str) -> Result<u64, String> {
+        let mut sum = 0u64;
+        for line in ls.lines().skip(1) {
+            let col = line
+                .split('\t')
+                .nth(3)
+                .ok_or(format!("image ls row {line:?}"))?;
+            let n = col
+                .parse::<u64>()
+                .map_err(|e| format!("SIZE {col:?}: {e}"))?;
+            sum = sum.checked_add(n).ok_or("SIZE sum overflow")?;
+        }
+        Ok(sum)
+    }
+
+    /// prune の結果が「`removed` の manifest だけが消え、`deleted` の blob が消え、`kept_shared` が共有のため残った」ことの照合。
+    fn expect_prune(
+        out: &ImagePruneOutcome,
+        removed: &Fixture,
+        deleted: &[String],
+        kept_shared: &[String],
+        reclaimed: u64,
+        what: &str,
+    ) -> Result<(), String> {
+        let got_removed: Vec<String> = out
+            .removed_manifests
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let got_deleted: Vec<String> = out.deleted_blobs.iter().map(ToString::to_string).collect();
+        let got_kept: Vec<String> = out
+            .kept_shared_blobs
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        expect(
+            got_removed == [removed.digest()]
+                && got_deleted == deleted
+                && got_kept == kept_shared
+                && out.reclaimed_bytes == reclaimed
+                && out.absent_blobs.is_empty()
+                && out.kept_leased_blobs.is_empty()
+                && out.undeleted_blobs.is_empty(),
+            &format!(
+                "{what}: prune outcome {out:?}, want deleted={deleted:?} kept_shared={kept_shared:?} reclaimed={reclaimed}"
+            ),
+        )
+    }
+
+    /// G・H（#665・TASK-184.3）。F の後の在庫（`fx_run` だけ）から始める。
+    fn shared_layer_and_df(
+        env: &Env,
+        cleanup: &mut Cleanup,
+        id_shared: &str,
+        fx_run: &Fixture,
+    ) -> Result<(), String> {
+        // 前片づけ: 10〜30 バイトの小さな blob を基準から外し、5% の照合を濁らせない。
+        image_rm(env, false, TAG_RUN)?;
+        expect(
+            image_ls(env)? == LS_HEADER,
+            "image ls is not empty after removing the last image",
+        )?;
+        expect_blobs_gone(env, fx_run)?;
+        expect(
+            allocated_blob_bytes(env)? == (0, 0),
+            "blobs remain after removing the last image",
+        )?;
+
+        let fx_sa = shared_fixture("a1", "a2", "a3", 256 * KIB);
+        let fx_sb = shared_fixture("b1", "b2", "b3", 192 * KIB);
+        let fx_sc = shared_fixture("c1", "c2", "c3", 128 * KIB);
+        let fx_keep =
+            Fixture::from_patterns("d1", ["d2", "d3", "d4"], [64 * KIB, 128 * KIB, 96 * KIB]);
+        seed_inventory(&env.images, &fx_sa, Some(TAG_SA))?;
+        seed_inventory(&env.images, &fx_sb, Some(TAG_SB))?;
+        seed_inventory(&env.images, &fx_keep, Some(TAG_KEEP))?;
+        seed_untagged(&env.images, &fx_sc)?;
+        let shared_hex = SHARED_LAYER.repeat(32);
+        let shared_digest = format!("sha256:{shared_hex}");
+        let unshared = |fx: &Fixture| -> Vec<String> {
+            let mut v: Vec<String> = fx
+                .blobs
+                .iter()
+                .filter(|b| b.0 != shared_hex)
+                .map(|b| format!("sha256:{}", b.0))
+                .collect();
+            v.sort();
+            v
+        };
+        let unref_c = (fx_sc.size() - SHARED_LAYER_LEN) as u64;
+
+        // H-1: 共有レイヤーを二重に数えない。reclaimable は参照の無い C の固有 blob だけ（S は A・B が守る）。
+        let all = [&fx_sa, &fx_sb, &fx_sc, &fx_keep];
+        expect_df(env, &all, unref_c, "H-1")?;
+        let ls_sum = ls_size_sum(&image_ls(env)?)?;
+        let (_, union) = union_size(&all);
+        expect(
+            ls_sum.checked_sub(union) == Some(2 * SHARED_LAYER_LEN as u64),
+            &format!(
+                "image ls SIZE sum {ls_sum} minus images.bytes {union} is not twice the shared layer"
+            ),
+        )?;
+
+        // B を stopped のコンテナで参照する。
+        let run = launch(env, cleanup, id_shared, "bundle-shared", TAG_SB)?;
+        stop_container(env, &run)?;
+
+        // G-1: 他のイメージ（B）が S を守る。A の固有 blob だけが消える。
+        let stdout = image_rm(env, false, TAG_SA)?;
+        let mut lines = stdout.lines();
+        let got_head: Vec<&str> = lines.by_ref().take(2).collect();
+        let want_head = [
+            format!("untagged\t{TAG_SA}"),
+            format!("deleted\t{}", fx_sa.digest()),
+        ];
+        expect(
+            got_head == want_head,
+            &format!("image rm A head lines: {got_head:?}"),
+        )?;
+        let mut got_blobs: Vec<String> = lines.map(str::to_string).collect();
+        got_blobs.sort();
+        let want_blobs: Vec<String> = unshared(&fx_sa)
+            .iter()
+            .map(|d| format!("deleted-blob\t{d}"))
+            .collect();
+        expect(
+            got_blobs == want_blobs,
+            &format!("image rm A blob lines: want {want_blobs:?}, got {got_blobs:?}"),
+        )?;
+        for (name, _) in &fx_sa.blobs {
+            let exists = env.images.join("blobs").join("sha256").join(name).exists();
+            expect(
+                exists == (*name == shared_hex),
+                &format!("blob {name} presence after image rm A: {exists}"),
+            )?;
+        }
+        expect_blobs(env, &fx_sb)?;
+
+        // B のタグを外す。以後 B を守るのは stopped のコンテナだけ。
+        let stdout = image_rm(env, true, TAG_SB)?;
+        expect(
+            stdout == format!("untagged\t{TAG_SB}\n"),
+            &format!("image rm --force B stdout: {stdout:?}"),
+        )?;
+
+        // H-2: prune の前。
+        let before = expect_df(env, &[&fx_sb, &fx_sc, &fx_keep], unref_c, "H-2")?;
+
+        // G-2: C だけが消え、S は B（stopped のコンテナ）が守る。
+        let out = prune(env)?;
+        expect_prune(
+            &out,
+            &fx_sc,
+            &unshared(&fx_sc),
+            std::slice::from_ref(&shared_digest),
+            unref_c,
+            "G-2",
+        )?;
+        expect_blobs(env, &fx_sb)?;
+        expect_blobs(env, &fx_keep)?;
+        let (containers, tags) = references(env, &fx_sb)?;
+        expect(
+            containers.len() == 1 && tags.is_empty(),
+            &format!("references of B after prune: {containers:?} {tags:?}"),
+        )?;
+
+        // H-3: prune の後に減る量は reclaimed_bytes にちょうど一致する。
+        let after = expect_df(env, &[&fx_sb, &fx_keep], 0, "H-3")?;
+        expect(
+            before.images_bytes.checked_sub(after.images_bytes) == Some(out.reclaimed_bytes)
+                && before.cache_bytes.checked_sub(after.cache_bytes) == Some(out.reclaimed_bytes),
+            &format!(
+                "df drop {before:?} -> {after:?} differs from reclaimed {}",
+                out.reclaimed_bytes
+            ),
+        )?;
+
+        // 最後の参照（コンテナ）を外すと B と S が回収対象になる。
+        delete_container(env, cleanup, &run)?;
+        expect_df(env, &[&fx_sb, &fx_keep], fx_sb.size() as u64, "H-4")?;
+
+        // G-3: 最後の参照が外れたので S も消える。
+        let out = prune(env)?;
+        let mut want_deleted: Vec<String> = fx_sb
+            .blobs
+            .iter()
+            .map(|b| format!("sha256:{}", b.0))
+            .collect();
+        want_deleted.sort();
+        expect_prune(&out, &fx_sb, &want_deleted, &[], fx_sb.size() as u64, "G-3")?;
+        expect_blobs_gone(env, &fx_sb)?;
+
+        // H-5
+        let last = expect_df(env, &[&fx_keep], 0, "H-5")?;
+        expect(
+            after.images_bytes.checked_sub(last.images_bytes) == Some(out.reclaimed_bytes)
+                && last.images_bytes == fx_keep.size() as u64
+                && last.cache_bytes == fx_keep.size() as u64,
+            &format!(
+                "df drop {after:?} -> {last:?} differs from reclaimed {}",
+                out.reclaimed_bytes
+            ),
+        )?;
+        expect_blobs(env, &fx_keep)?;
+        let ls = image_ls(env)?;
+        let want = format!(
+            "{LS_HEADER}registry.example/fandhe/gc-keep\tv1\t{}\t{}\t0\n",
+            fx_keep.digest(),
+            fx_keep.size()
+        );
+        expect(ls == want, &format!("image ls at the end: {ls:?}"))?;
+        Ok(())
+    }
     /// blob の digest（`sha256:<hex>`）の昇順。prune の `deleted_blobs`（digest の昇順）の期待値に使う。
     fn sorted_blob_digests(fx: &Fixture) -> Vec<String> {
         let mut v: Vec<String> = fx.blobs.iter().map(|b| format!("sha256:{}", b.0)).collect();
@@ -714,8 +1187,7 @@ mod linux {
         let blobs = images.join("blobs").join("sha256");
         fs::create_dir_all(&blobs).map_err(|e| format!("mkdir blobs: {e}"))?;
         for (name, len) in &fx.blobs {
-            fs::write(blobs.join(name), vec![b'x'; *len])
-                .map_err(|e| format!("write blob: {e}"))?;
+            write_blob(&blobs.join(name), name, *len)?;
         }
         let digest = |hex: &str| {
             Digest::parse(&format!("sha256:{hex}")).map_err(|e| format!("digest: {e:?}"))

@@ -2707,7 +2707,8 @@ jobs:
             --forbid 'PRECONDITION FAILED' --forbid 'not applicable' --summary
 
       # local_image_gc（`crates/cli/tests/`。OCI-7・CLI-1・TASK-184.1・REPAIR-12・#663。
-      # TASK-184.2・#664 で rm による完全削除と prune の保持・回収を追加）:
+      # TASK-184.2・#664 で rm による完全削除と prune の保持・回収を、TASK-184.3・#665 で共有レイヤーの保持と
+      # `system df` の容量表示（実ディスク使用量との差 5% 以内）を追加）:
       # 本物の running / stopped のコンテナを参照元にして、`image rm` の既定の拒否と `--force` の境界
       # （running は `--force` でも拒否、stopped だけならタグだけ外す）を確かめる。
       # 前提・実行方法は network_modes_real と同じ（supervisor の bin を先にビルドして置き、試験バイナリを委譲スコープの中で
@@ -2737,12 +2738,12 @@ jobs:
           USER="$(id -un)" \
             scripts/run-in-user-scope.sh --name local_image_gc --deadline 540 --log "${log}" -- \
               "${LIG_BIN}" --ignored
-          # 成功行 9 件をソースから導出して照合する。失敗の 1 行目は前提欠如が `PRECONDITION FAILED`、それ以外が `local_image_gc: FAILED`
+          # 成功行 13 件をソースから導出して照合する。失敗の 1 行目は前提欠如が `PRECONDITION FAILED`、それ以外が `local_image_gc: FAILED`
           scripts/check-success-lines.sh --name local_image_gc \
             --src crates/cli/tests/local_image_gc.rs \
             --log "${log}" \
-            --select '^local_image_gc: (image rm |image prune |after the referencing |a new container |scenario ok)' \
-            --min 9 \
+            --select '^local_image_gc: (image rm |image prune |after the referencing |a new container |a shared layer |once the last reference |system df |scenario ok)' \
+            --min 13 \
             --forbid 'local_image_gc: skipped' --forbid 'local_image_gc: FAILED' \
             --forbid 'PRECONDITION FAILED' --forbid 'not applicable' --summary
 

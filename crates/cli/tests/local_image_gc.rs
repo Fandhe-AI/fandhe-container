@@ -130,7 +130,8 @@ mod linux {
     use fandhe_container_core::state_store::{FileStateStore, StateRoot};
     use fandhe_container_core::traits::{ContainerId, GetStateRequest, StateStore};
     use fandhe_container_oci::image_management::{
-        ImagePruneOutcome, ImageStore, ImageTagSource, ManifestComposition, TagKey,
+        ImagePruneOutcome, ImageRmOptions, ImageRmTarget, ImageStore, ImageTagSource,
+        ManifestComposition, StoppedContainers, TagKey,
     };
     use fandhe_container_oci::reference::{Digest, ImageReference, Reference};
 
@@ -582,7 +583,12 @@ mod linux {
         create_container(&env, &mut cleanup, &id_new, "bundle-new", &fx_stop.digest())?;
         // タグもコンテナ参照も無く、blob も共有しない manifest。prune が空振りでないことを示す。
         let fx_dangling = Fixture::new('4', ['8', '9', '0'], [13, 23, 33]);
-        seed_inventory(&env.images, &fx_dangling, None)?;
+        seed_untagged(&env.images, &fx_dangling)?;
+        // 別プロセスの store（新規 open）から見えること。永続化されていなければ prune は空振りする。
+        expect(
+            manifest_in_inventory(&env, &fx_dangling)?,
+            "untagged seed was not persisted to the inventory",
+        )?;
         let out = prune(&env)?;
         let got_removed: Vec<String> = out
             .removed_manifests
@@ -734,6 +740,37 @@ mod linux {
                 )
                 .map_err(|e| format!("tag: {e:?}"))?;
         }
+        Ok(())
+    }
+
+    /// タグなしの無参照イメージを永続化した在庫へ置く。
+    ///
+    /// `register_manifest` だけでは保存されず、新しい store の `lock()` の再読込で消える。そこで
+    /// 一時タグ付きで seed（保存される）→ 同じ排他区間で一時タグを外し、使い捨ての運び屋イメージを
+    /// 完全削除する `image rm` の保存に便乗して、タグなしの状態をディスクへ書く。
+    fn seed_untagged(images: &Path, fx: &Fixture) -> Result<(), String> {
+        const TAG_TMP: &str = "registry.example/fandhe/gc-tmp:v1";
+        const TAG_CARRIER: &str = "registry.example/fandhe/gc-carrier:v1";
+        let pat = |p: &str| p.repeat(32);
+        let carrier = Fixture {
+            manifest_hex: pat("5a"),
+            blobs: [(pat("5b"), 1), (pat("5c"), 1), (pat("5d"), 1)],
+        };
+        seed_inventory(images, fx, Some(TAG_TMP))?;
+        seed_inventory(images, &carrier, Some(TAG_CARRIER))?;
+        let store = ImageStore::open(images).map_err(|e| format!("open store: {e:?}"))?;
+        let mut guard = store.lock().map_err(|e| format!("lock: {e:?}"))?;
+        guard
+            .unregister_tag(&tag_key(TAG_TMP)?)
+            .map_err(|e| format!("untag: {e:?}"))?;
+        guard
+            .execute_image_rm(
+                store.root(),
+                &ImageRmTarget::Tag(tag_key(TAG_CARRIER)?),
+                &ImageRmOptions::default(),
+                &StoppedContainers::new(),
+            )
+            .map_err(|e| format!("rm carrier: {e:?}"))?;
         Ok(())
     }
 

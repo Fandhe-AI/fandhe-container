@@ -11,7 +11,10 @@
 //!   （途中で欠けた内容を正常な行として残さない）。破棄は [`StreamSummary::discarded_lines`] に数える。
 //! - 行の内容は `read` の戻りサイズ・チャンク境界の位置に依らず同一（行の分断・結合・欠落なし）。
 //!   行単位捕捉は TASK-164.1（#505・SUP-7）で境界跨ぎを機械照合済み。
-//! - 1 行は [`MAX_LINE_BYTES`] で切り捨てる（超過ぶんは捨て、[`StreamSummary::truncated_lines`] へ数える。無制限確保の防止）。
+//! - [`MAX_LINE_BYTES`] を超える行は [`LogSink::append_part`] へ断片（[`LinePart`]）として順に渡す（捨てない。#4580・SUP-7・CRI-2）。
+//!   既定実装は従来どおり先頭 [`MAX_LINE_BYTES`] だけを [`LogSink::append`] へ渡し、超過ぶんは捨てて
+//!   [`StreamSummary::truncated_lines`] へ数える。メモリは作業バッファ + 先頭断片（最大 [`MAX_LINE_BYTES`]）で有界
+//!   （無制限確保の防止。先頭断片は行の終端か破棄で解放する）。
 //! - [`LogSink::append`] が失敗したら、そのストリームでは以後 sink を呼ばない（故障した sink へ出力行数ぶんの
 //!   失敗処理を繰り返さない）。読み取りは EOF まで続けて破棄する（読みを止めるとパイプが詰まり、コンテナ側の write が
 //!   ブロックするため）。失敗コードを [`StreamSummary::error_code`] に、sink へ届かなかった行数（失敗した行を含む）を
@@ -84,6 +87,9 @@ pub mod tap;
 
 #[cfg(all(test, unix))]
 mod sweep_tests;
+
+#[cfg(test)]
+mod part_tests;
 
 pub use reader::{
     ContainerActivity, FOLLOW_OUTRAN_MESSAGE, FOLLOW_POLL_INTERVAL, FollowEnd, FollowHooks,
@@ -711,6 +717,30 @@ impl OutputStreams {
     }
 }
 
+/// 断片の終わり方（SUP-7・CRI-2。#4580）。
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartEnd {
+    /// この断片の後に同じ行が続く（読み取りエラーで終わった行は終端が来ない）。
+    Continued,
+    /// LF で終わった（行の最後の断片）。
+    Lf,
+    /// LF なしの EOF で終わった（行の最後の断片）。
+    Eof,
+}
+
+/// 1 行の断片の位置情報（SUP-7・CRI-2。#4580）。捕捉リーダーが [`LogSink::append_part`] へ渡す。
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinePart<'a> {
+    /// その行で何番目の断片か（0 始まり）。
+    pub index: u64,
+    /// この断片の後に行が続くか、LF で終わったか、EOF で終わったか。
+    pub end: PartEnd,
+    /// その行の先頭断片（`index == 0` の断片）のバイト列。`index == 0` では空。
+    pub head: &'a [u8],
+}
+
 /// 捕捉した行の記録先の拡張点。ファイル・ローテーション実装は [`rotating::RotatingFileSink`]（SUP-7・TASK-164.2）。
 pub trait LogSink: Send + Sync {
     /// 1 行（LF 抜き・[`MAX_LINE_BYTES`] 以下）を追記する。失敗は構造化エラーで返す（panic しない）。
@@ -718,7 +748,29 @@ pub trait LogSink: Send + Sync {
     ///
     /// 有限時間で戻ること。戻らない `append` はリーダースレッドとその枠（[`ReaderBudget`]）を占有し続け、
     /// パイプが詰まってコンテナ側の write を止める。[`LogCapture::drain`] は `append` の完了を期限を超えて待たない。
+    ///
+    /// 捕捉リーダーは [`Self::append_part`] 経由で呼ぶ（既定実装が本メソッドへ渡す）。
     fn append(&self, stream: StreamKind, line: &[u8]) -> Result<(), TraitError>;
+
+    /// 行の断片を追記する（SUP-7・CRI-2。#4580）。`bytes` は LF を含まず長さは [`MAX_LINE_BYTES`] 以下。
+    /// 1 行の断片は `index` が 0 から 1 ずつ増えて届き、終端（[`PartEnd::Lf`]・[`PartEnd::Eof`]）の前は必ず
+    /// [`PartEnd::Continued`]。読み取りエラーで終わった行は `Continued` しか届かず終端は来ない。
+    ///
+    /// 既定実装は行の終端まで追記を遅延し、現行の切り詰めと同じバイト列を [`Self::append`] へ渡す
+    /// （`Continued` では何もしない。終端で `index == 0` なら `bytes`、そうでなければ先頭断片 `part.head`）。
+    /// `Err` の扱いと有限時間で戻ることは [`Self::append`] と同じ。
+    fn append_part(
+        &self,
+        stream: StreamKind,
+        bytes: &[u8],
+        part: LinePart<'_>,
+    ) -> Result<(), TraitError> {
+        match part.end {
+            PartEnd::Continued => Ok(()),
+            _ if part.index == 0 => self.append(stream, bytes),
+            _ => self.append(stream, part.head),
+        }
+    }
 
     /// `append` が `Ok` を返した行を記録先へ書き出す（TASK-164.3・SUP-7）。既定は何もしない（バッファを持たない sink 用）。
     ///
@@ -863,7 +915,7 @@ impl StreamSummary {
     pub fn bytes(&self) -> u64 {
         self.bytes
     }
-    /// [`MAX_LINE_BYTES`] で切り捨てた行数。
+    /// `@container-logs`（既定の [`LogSink::append_part`]）で切り詰めた行数。[`MAX_LINE_BYTES`] を超えて断片が 2 つ以上になった行の数。
     pub fn truncated_lines(&self) -> u64 {
         self.truncated_lines
     }
@@ -1240,7 +1292,10 @@ struct LineSplitter<'a> {
     /// sink の追記が失敗した（以後は sink を呼ばず、読み捨てる）。
     sink_failed: bool,
     buf: Vec<u8>,
-    cut: bool,
+    /// 現在の行の断片の通し番号（次に渡す断片の `index`）。
+    index: u64,
+    /// 現在の行の先頭断片（`index > 0` の間だけ保持。行の終端・破棄・取消しで解放する）。
+    head: Vec<u8>,
     summary: StreamSummary,
 }
 
@@ -1248,35 +1303,47 @@ impl LineSplitter<'_> {
     fn feed(&mut self, chunk: &[u8]) {
         let mut segs = chunk.split(|b| *b == b'\n').peekable();
         while let Some(seg) = segs.next() {
+            let mut rest = seg;
+            while !rest.is_empty() {
+                if self.cancelled {
+                    return;
+                }
+                // 満杯の状態で LF 以外の次のバイトが来て初めて Continued を渡す（ちょうど上限の行は 1 断片）。
+                if self.buf.len() >= MAX_LINE_BYTES {
+                    self.emit_part(PartEnd::Continued);
+                    if self.cancelled {
+                        return;
+                    }
+                }
+                let room = MAX_LINE_BYTES.saturating_sub(self.buf.len());
+                let (now, later) = rest
+                    .split_at_checked(room.min(rest.len()))
+                    .unwrap_or((rest, &[]));
+                self.buf.extend_from_slice(now);
+                rest = later;
+            }
             if self.cancelled {
                 return;
             }
-            let room = MAX_LINE_BYTES.saturating_sub(self.buf.len());
-            let take = room.min(seg.len());
-            if let Some(head) = seg.get(..take) {
-                self.buf.extend_from_slice(head);
-            }
-            if take < seg.len() {
-                self.cut = true;
-            }
             if segs.peek().is_some() {
-                self.emit();
+                self.emit_part(PartEnd::Lf);
             }
         }
     }
 
     /// 未完了の行バッファを sink へ渡さずに破棄する（読み取りエラー時）。行としては数え、届かなかった行数に計上する。
     fn discard_partial(&mut self) {
-        if self.buf.is_empty() && !self.cut {
+        if self.buf.is_empty() && self.index == 0 {
             return;
         }
         self.summary.lines = self.summary.lines.saturating_add(1);
         self.summary.discarded_lines = self.summary.discarded_lines.saturating_add(1);
-        if self.cut {
+        if self.index > 0 {
             self.summary.truncated_lines = self.summary.truncated_lines.saturating_add(1);
         }
         self.buf.clear();
-        self.cut = false;
+        self.head = Vec::new();
+        self.index = 0;
     }
 
     /// sink のバッファを書き出す。取消し・失敗の扱いは [`Self::emit`] と同じ（取消し後・失敗後は呼ばない）。
@@ -1295,33 +1362,52 @@ impl LineSplitter<'_> {
         }
     }
 
-    fn emit(&mut self) {
-        if self.sink_failed {
-            // 故障した sink は再度呼ばない。行としては数え、届かなかった行数に計上する。
-            self.summary.discarded_lines = self.summary.discarded_lines.saturating_add(1);
-        } else {
+    /// 作業バッファを 1 断片として [`LogSink::append_part`] へ渡す。取消し・失敗の扱いは従来の 1 行追記と同じ。
+    /// 終端（`Lf`・`Eof`）で行を集計し、状態を初期化する（`Continued` は先頭断片を保持して次へ進む）。
+    fn emit_part(&mut self, end: PartEnd) {
+        if !self.sink_failed {
+            let part = LinePart {
+                index: self.index,
+                end,
+                head: if self.index == 0 { &[] } else { &self.head },
+            };
             // 取消しの確認と「実行中」の計上を不可分にする（要求後に新しい追記を始めない）。
             let Some(appended) = self
                 .cancel
-                .run_unless_cancelled(|| self.sink.append(self.kind, &self.buf))
+                .run_unless_cancelled(|| self.sink.append_part(self.kind, &self.buf, part))
             else {
                 self.cancelled = true;
                 self.buf.clear();
+                self.head = Vec::new();
                 return;
             };
             if let Err(e) = appended {
                 // 読み取りは続ける（パイプを詰まらせない）が、以後このストリームでは sink を呼ばない。
                 self.summary.error_code.get_or_insert(e.code());
-                self.summary.discarded_lines = self.summary.discarded_lines.saturating_add(1);
                 self.sink_failed = true;
             }
         }
+        if end == PartEnd::Continued {
+            if self.index == 0 {
+                let mut head = Vec::new();
+                head.reserve_exact(self.buf.len());
+                head.extend_from_slice(&self.buf);
+                self.head = head;
+            }
+            self.buf.clear();
+            self.index = self.index.saturating_add(1);
+            return;
+        }
+        if self.sink_failed {
+            self.summary.discarded_lines = self.summary.discarded_lines.saturating_add(1);
+        }
         self.summary.lines = self.summary.lines.saturating_add(1);
-        if self.cut {
+        if self.index > 0 {
             self.summary.truncated_lines = self.summary.truncated_lines.saturating_add(1);
         }
         self.buf.clear();
-        self.cut = false;
+        self.head = Vec::new();
+        self.index = 0;
     }
 }
 
@@ -1399,7 +1485,8 @@ fn pump(
         cancelled: false,
         sink_failed: false,
         buf: Vec::new(),
-        cut: false,
+        index: 0,
+        head: Vec::new(),
         summary: StreamSummary::default(),
     };
     let mut chunk = [0u8; READ_CHUNK_BYTES];
@@ -1443,8 +1530,8 @@ fn pump(
             }
         }
     }
-    if !sp.buf.is_empty() && !sp.cancelled {
-        sp.emit();
+    if (!sp.buf.is_empty() || sp.index > 0) && !sp.cancelled {
+        sp.emit_part(PartEnd::Eof);
     }
     // EOF・読み取りエラーの単一出口。summary を返す（＝ drain 側が完了を観測する）前に書き出す。
     sp.flush_sink();

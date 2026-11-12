@@ -47,21 +47,22 @@ fn find_forbidden(src: &str) -> Vec<(usize, &'static str)> {
 }
 
 /// `dir` 配下の `.rs` を再帰的に集める（symlink は辿らない）。
-fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in rd.flatten() {
+/// 列挙・エントリ取得・metadata 取得の失敗は対象パス付きのエラーで返す（検査漏れを許さない）。
+fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    let rd =
+        std::fs::read_dir(dir).map_err(|e| format!("cannot read dir {}: {e}", dir.display()))?;
+    for entry in rd {
+        let entry = entry.map_err(|e| format!("cannot read entry under {}: {e}", dir.display()))?;
         let path = entry.path();
-        let Ok(meta) = std::fs::symlink_metadata(&path) else {
-            continue;
-        };
+        let meta = std::fs::symlink_metadata(&path)
+            .map_err(|e| format!("cannot stat {}: {e}", path.display()))?;
         if meta.is_dir() {
-            collect_rs_files(&path, out);
+            collect_rs_files(&path, out)?;
         } else if meta.is_file() && path.extension().is_some_and(|e| e == "rs") {
             out.push(path);
         }
     }
+    Ok(())
 }
 
 #[test]
@@ -104,7 +105,7 @@ fn sec1_4544_find_forbidden_synthetic_cases() {
 fn sec1_4544_net_src_does_not_enable_fd_carrying_cmsg_options() {
     let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();
-    collect_rs_files(&src_dir, &mut files);
+    collect_rs_files(&src_dir, &mut files).unwrap_or_else(|e| panic!("scan failed: {e}"));
     files.sort();
     assert!(
         files.len() >= 10,

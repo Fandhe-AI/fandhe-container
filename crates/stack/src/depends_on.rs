@@ -16,8 +16,22 @@
 //! 決定性: `BTreeMap` のキー順で DFS を始め、依存先もキー順にたどる。結果は「依存先が先、
 //! 互いに独立なものは名前順の DFS 後行順」で、同じ入力なら常に同じ出力になる。
 //! DFS は明示スタックの反復で、サービス数・依存の深さ（外部入力）で stack overflow しない
-//! （O(V+E)）。入力サイズの上限検証は parse の入口が担う。エラーにはサービス名だけを入れ、
-//! `Service`（`env` に資格情報を含みうる）の内容は出さない。
+//! （O(V+E)）。入力サイズの上限検証は parse の入口が担う。
+//!
+//! エラーの扱い（ERR-1・SEC-1・REPAIR-4）: [`DependsOnError`] の `Display` は名前を出さず、
+//! 固定の英語 `message()` だけを出す。サービス名（循環の経路・参照元・参照先）は untrusted で、
+//! 文字種をスキーマで検証しておらず ESC・改行・bidi 制御文字を含みうること、循環経路の長さに
+//! 上限がないこと、が理由。名前は各バリアントのフィールドで構造化して渡す。`profile_filter`
+//! （STACK-10・#3647）の `ServiceSelectError::DisabledDependency` と同じ方針である。
+//! `Service`（`env` に資格情報を含みうる）の内容も出さない。
+//!
+//! 無害化の責務: 名前を利用者へ表示する CLI の `up` / `down` 結線（#3639）が、フィールドから
+//! 名前を取り出し、制御文字（Cc）と表示を乱す書式文字（bidi 制御・ゼロ幅など）をエスケープし、
+//! 経路の件数・長さに上限を置いてから出す（先例は `cli/ps.rs` の `sanitize`）。
+//!
+//! 未揃いの箇所（REPAIR-3）: `UpError::{Launch, NetworkProvision, Internal}`、
+//! `DownError::{Stop, Internal}`、`DependencyWaitError::{WaitTimeout, UnsupportedCondition, Observe}`、
+//! `HealthyWaitError::Source` は `Display` に名前をそのまま出す。この 4 型は本変更では直していない。
 
 use std::collections::BTreeMap;
 use std::collections::btree_map;
@@ -107,6 +121,9 @@ impl StartupPlan {
 }
 
 /// `depends_on` の計画作成エラー（STACK-2）。
+///
+/// `Display` は untrusted な名前を出さない（端末の偽装と巨大な出力を避ける。ERR-1・SEC-1）。
+/// 名前は各バリアントのフィールドで得る。表示するときは結線側（#3639）が無害化する。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DependsOnError {
@@ -125,7 +142,7 @@ impl DependsOnError {
         }
     }
 
-    /// 固定の英語メッセージ（サービス名は含めない。名前は `Display` と各フィールドで得る）。
+    /// 固定の英語メッセージ（サービス名は含めない。名前は各フィールドで得る。`Display` には出さない）。
     pub fn message(&self) -> &'static str {
         match self {
             Self::Cycle { .. } => "depends_on contains a cycle",
@@ -136,13 +153,7 @@ impl DependsOnError {
 
 impl fmt::Display for DependsOnError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Cycle { path } => write!(f, "{}: {}", self.message(), path.join(" -> ")),
-            Self::UnknownDependency {
-                service,
-                dependency,
-            } => write!(f, "{}: {} -> {}", self.message(), service, dependency),
-        }
+        f.write_str(self.message())
     }
 }
 
@@ -430,22 +441,67 @@ mod tests {
         assert_eq!(plan.steps()[N - 1].service(), "s000000");
     }
 
-    /// STACK-2・TASK-150.1: エラーの code / message / Display は英語でサービス名のみ。
+    /// STACK-2・ERR-1: Display は固定の英語で、名前（制御文字入りでも）を出さない。
     #[test]
-    fn stack_2_error_text() {
+    fn stack_2_error_display_hides_names() {
+        let names = ["a\u{1b}[31m", "b\n", "\u{202e}c"];
         let c = DependsOnError::Cycle {
-            path: vec!["a".into(), "b".into(), "a".into()],
+            path: vec![
+                names[0].into(),
+                names[1].into(),
+                names[2].into(),
+                names[0].into(),
+            ],
         };
+        assert_eq!(c.code(), "DEPENDENCY_CYCLE");
         assert_eq!(c.message(), "depends_on contains a cycle");
-        assert_eq!(c.to_string(), "depends_on contains a cycle: a -> b -> a");
+        assert_eq!(c.to_string(), "depends_on contains a cycle");
         let u = DependsOnError::UnknownDependency {
-            service: "a".into(),
-            dependency: "g".into(),
+            service: "a\u{1b}[2J".into(),
+            dependency: "g\r\nX".into(),
         };
+        assert_eq!(u.code(), "UNKNOWN_DEPENDENCY");
         assert_eq!(u.message(), "depends_on references an undefined service");
+        assert_eq!(u.to_string(), "depends_on references an undefined service");
+        match u {
+            DependsOnError::UnknownDependency {
+                service,
+                dependency,
+            } => {
+                assert_eq!(service, "a\u{1b}[2J");
+                assert_eq!(dependency, "g\r\nX");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// STACK-2・ERR-1: plan_startup が返した実エラーでも Display は固定長。
+    #[test]
+    fn stack_2_plan_error_display_fixed() {
+        let err = plan_startup(&svcs(&[("x\u{1b}", &[("ghost\n", Started)])])).unwrap_err();
         assert_eq!(
-            u.to_string(),
-            "depends_on references an undefined service: a -> g"
+            err.to_string(),
+            "depends_on references an undefined service"
         );
+        match err {
+            DependsOnError::UnknownDependency {
+                service,
+                dependency,
+            } => {
+                assert_eq!(service, "x\u{1b}");
+                assert_eq!(dependency, "ghost\n");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        let cyc = plan_startup(&svcs(&[
+            ("a\u{202e}", &[("b", Started)]),
+            ("b", &[("a\u{202e}", Started)]),
+        ]))
+        .unwrap_err();
+        assert_eq!(cyc.to_string(), "depends_on contains a cycle");
+        match cyc {
+            DependsOnError::Cycle { path } => assert_eq!(path.len(), 3),
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 }

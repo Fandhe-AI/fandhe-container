@@ -494,7 +494,9 @@ impl PodNetns {
 /// **未実装・簡易実装（REPAIR-3）**: 本番の実装（supervisor の `pod-holder` モードを exec する provider）は plugin-cri の
 /// `ProductionPodHolder`（H6・#2877。Linux・非 root の本番構成で注入）。pid から namespace のパスを作って bundle へ渡す配線は
 /// H5（#2876）で `CriRuntimeService` に実装済み。本 trait は
-/// 注入点と sandbox 記録への pid の保持（メモリ上のみ。記録ファイルへの永続化は R11〔#2940〕）だけを定める。
+/// 注入点と sandbox 記録への pid の保持（メモリ上）に加え、保持役の素性（[`HolderIdentity`]）の記録と、再採用した記録の
+/// 終了済み確認（[`PodNamespaceHolderProvider::observe_process_start`]。R11・#2940）を定める。再採用した記録の pid は
+/// namespace のパス・シグナルの根拠にしない（診断と終了済みの確認だけ。SEC-5・SEC-1）。
 /// エラー文言に config の値・パス・pid を含めないこと。
 pub trait PodNamespaceHolderProvider: Send + Sync {
     /// 保持役を起動し、READY を受けて pid を返す。`req.ready_timeout()` 以内に戻ること（REPAIR-5）。
@@ -511,6 +513,123 @@ pub trait PodNamespaceHolderProvider: Send + Sync {
     /// 記録が残る間は実装が回収しない契約）。cri のロックを保ったまま呼ばれることはない。
     /// `Err` は判定不能で、呼び出し側は fail-closed に not ready として扱う。
     fn liveness(&self, sandbox_id: &str) -> Result<PodHolderLiveness, CriError>;
+
+    /// 再採用した記録の保持役 pid の `/proc/<pid>/stat` を読むだけの観測（R11・#2940・CRI-2・SEC-5）。
+    ///
+    /// `readopt_sandboxes` が、素性を持つ記録 1 件につき 1 回、registry のロックの外で呼ぶ。結果は診断と「終了済み」の
+    /// 確認にだけ使い、Ready・namespace のパス・シグナルの根拠にしない。契約: ブロックしない・pidfd を開かない・
+    /// シグナルを送らない・回収しない・`/proc/<pid>/ns/*` に触れない。エラー文言に pid・パスを含めない。
+    /// 既定実装は観測できない（`UNIMPLEMENTED`。呼び出し側は「観測できず」として数える）。
+    fn observe_process_start(&self, _pid: u32) -> Result<ProcessStartObservation, CriError> {
+        Err(CriError::unimplemented(
+            "observing a recorded pod holder is not supported",
+        ))
+    }
+}
+
+/// [`PodNamespaceHolderProvider::observe_process_start`] の結果。将来の項目追加に備えて `#[non_exhaustive]`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ProcessStartObservation {
+    /// `/proc/<pid>` が無い（終了済み）。
+    Absent,
+    /// pid のプロセスが居る。`/proc/<pid>/stat` の starttime（22 番目のフィールド。クロック数）。
+    Present {
+        /// starttime。
+        start_time_ticks: u64,
+    },
+}
+
+/// nsfs 上の namespace の素性（`st_dev`・`st_ino`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NamespaceIdentity {
+    /// `st_dev`。
+    pub dev: u64,
+    /// `st_ino`。
+    pub ino: u64,
+}
+
+/// 起動中の保持役の素性（pid・starttime・user / ipc / net の namespace）。R11・#2940・CRI-2・SEC-5。
+///
+/// provider が READY の検証後に集めて [`PodHolder::from_identity`] で返す。`CriRuntimeService` は記録ファイルへ
+/// 診断用に書き写すが、再採用した記録の素性から [`PodHolder`] を作る口は無い（再採用した pid から namespace の
+/// パスやシグナルを作らない。型で分ける）。将来の項目追加に備えて `#[non_exhaustive]`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct HolderIdentity {
+    pid: std::num::NonZeroU32,
+    start_time_ticks: u64,
+    user: NamespaceIdentity,
+    ipc: NamespaceIdentity,
+    net: NamespaceIdentity,
+}
+
+/// 素性の項目の整合性（supervisor の `PodHolderReady::new` と同じ不変条件）。pid は `1..=i32::MAX`、ino は非 0 で
+/// 互いに異なり、dev は 3 つで一致（nsfs は 1 つの superblock）。
+pub(crate) fn holder_fields_consistent(
+    pid: u32,
+    user: NamespaceIdentity,
+    ipc: NamespaceIdentity,
+    net: NamespaceIdentity,
+) -> bool {
+    let pid_ok = (1..=i32::MAX as u32).contains(&pid);
+    let ino_ok = user.ino != 0
+        && ipc.ino != 0
+        && net.ino != 0
+        && user.ino != ipc.ino
+        && user.ino != net.ino
+        && ipc.ino != net.ino;
+    let dev_ok = user.dev == ipc.dev && user.dev == net.dev;
+    pid_ok && ino_ok && dev_ok
+}
+
+impl HolderIdentity {
+    /// 検証つきで作る。不変条件を満たさなければ `INVALID_ARGUMENT`（固定文言。値を載せない）。
+    pub fn new(
+        pid: u32,
+        start_time_ticks: u64,
+        user: NamespaceIdentity,
+        ipc: NamespaceIdentity,
+        net: NamespaceIdentity,
+    ) -> Result<Self, CriError> {
+        let bad = || CriError::invalid_argument("pod holder identity is inconsistent");
+        if !holder_fields_consistent(pid, user, ipc, net) {
+            return Err(bad());
+        }
+        let pid = std::num::NonZeroU32::new(pid).ok_or_else(bad)?;
+        Ok(Self {
+            pid,
+            start_time_ticks,
+            user,
+            ipc,
+            net,
+        })
+    }
+
+    /// 保持役の pid。
+    pub fn pid(&self) -> std::num::NonZeroU32 {
+        self.pid
+    }
+
+    /// `/proc/<pid>/stat` の starttime（クロック数）。
+    pub fn start_time_ticks(&self) -> u64 {
+        self.start_time_ticks
+    }
+
+    /// user namespace の素性。
+    pub fn user(&self) -> NamespaceIdentity {
+        self.user
+    }
+
+    /// ipc namespace の素性。
+    pub fn ipc(&self) -> NamespaceIdentity {
+        self.ipc
+    }
+
+    /// net namespace の素性。
+    pub fn net(&self) -> NamespaceIdentity {
+        self.net
+    }
 }
 
 /// [`PodNamespaceHolderProvider::spawn`] への入力。将来の項目追加に備えて `#[non_exhaustive]`。
@@ -540,17 +659,35 @@ impl<'a> PodHolderRequest<'a> {
     }
 }
 
-/// [`PodNamespaceHolderProvider::spawn`] の結果（保持役の pid）。将来の項目追加に備えて `#[non_exhaustive]`。
+/// [`PodNamespaceHolderProvider::spawn`] の結果（保持役の pid と、あれば素性）。将来の項目追加に備えて `#[non_exhaustive]`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct PodHolder {
     pid: std::num::NonZeroU32,
+    identity: Option<HolderIdentity>,
 }
 
 impl PodHolder {
     /// 保持役の pid から作る（0 は表現できない）。
     pub fn new(pid: std::num::NonZeroU32) -> Self {
-        Self { pid }
+        Self {
+            pid,
+            identity: None,
+        }
+    }
+
+    /// 素性つきで作る（pid は素性から導くので食い違いを表現できない。R11・#2940）。
+    pub fn from_identity(identity: HolderIdentity) -> Self {
+        Self {
+            pid: identity.pid(),
+            identity: Some(identity),
+        }
+    }
+
+    /// 起動時に集めた素性。`new` で作った保持役（検証が無効な構成・試験用の偽 provider）は `None`
+    /// （記録ファイルでは `holder=-`）。
+    pub fn identity(&self) -> Option<&HolderIdentity> {
+        self.identity.as_ref()
     }
 
     /// 保持役の pid（`/proc/<pid>/ns/*` の入力。パスへの変換は `CriRuntimeService` が H5〔#2876〕で行う）。

@@ -7,7 +7,8 @@
 //! network の `set_up` / `tear_down` の段（`SetUpSettlement`・`NetworkTearDownGuard`）と同じ形にそろえてある。
 //!
 //! 契約: provider の呼び出しはレジストリのロックを保ったまま行わない。保持役の pid は sandbox 記録の
-//! メモリ上にだけ置く（記録ファイルへの永続化と素性の照合は R11〔#2940〕）。
+//! メモリ上にだけ置き、namespace のパスの根拠にする。provider が素性（`HolderIdentity`）を返したときは、診断用に
+//! `recorded_holder` として確定版の記録ファイルへ書く（R11・#2940。再採用した記録の素性からパス・シグナルは作らない）。
 //!
 //! **未実装・簡易実装（REPAIR-3）**: 本番の provider は plugin-cri の `ProductionPodHolder`（H6〔#2877〕。実装済み・Linux・非 root で注入）。pid から namespace のパスを作って
 //! bundle へ渡す配線は H5〔#2876〕で `reserve_container` に実装済み。ここは注入点と記録の保持、解放の冪等・再試行、死活の反映まで。
@@ -19,6 +20,7 @@ use std::time::Duration;
 use crate::adapter::{PodHolderLiveness, PodHolderRequest, PodNamespaceHolderProvider};
 use crate::error::CriError;
 
+use super::holder_identity::RecordedHolderIdentity;
 use super::{
     CriRuntimeService, OpDeadline, SandboxRegistry, SandboxState, SetUpSettlement, run_bounded,
     step_within,
@@ -207,6 +209,8 @@ impl CriRuntimeService {
                 let settled = worker_settlement.settle_by_worker();
                 if let Ok(holder) = &result {
                     record.pod_holder = Some(*holder);
+                    // 記録ファイルへ残す素性は `pod_holder` と同じロック区間で設定する（R11・#2940）。`release` では消さない。
+                    record.recorded_holder = holder.identity().map(RecordedHolderIdentity::from);
                     record.holder_owned = true;
                 } else if let Err(e) = &result
                     && e.resource_retained()

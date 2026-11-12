@@ -13,7 +13,11 @@
 //!   [`format_timestamp`] が日付を計算する。エポックより前の時刻は 1970-01-01 に丸め、9999 年を超える時刻は 9999-12-31 に丸める。
 //! - 1 行は [`CRI_LOG_CHUNK_BYTES`]（containerd の `max_container_log_line_size` の既定値 16384 に合わせる）ごとに分け、
 //!   最後の断片を `F`（full）、それより前を `P`（partial）にする。空行は内容なしの `F` 1 件（`<ts> stdout F \n`）。
-//! - 捕捉側は 1 行を [`super::MAX_LINE_BYTES`] で切り詰めて渡す。切り詰めで落ちた分は P 断片として残らない（既知の制限。REPAIR-3）。
+//! - 捕捉側の断片（[`LogSink::append_part`]。#4582）は containerd v2.1.0 の `redirectLogs` に合わせ、`Continued` と `Eof` の
+//!   全チャンクを `P`、`Lf` の最後のチャンクだけを `F` で書く。[`super::MAX_LINE_BYTES`] を超える行も欠落せず、
+//!   kubelet 規則（`P` は内容だけ・`F` は内容 + LF）で連結すると元のバイト列に戻る。LF の無い EOF の末尾は `P` で終わる。
+//!   読み取りエラーで終わった未完了の末尾は書かない。総量の上限に達すると `F` の無い `P` で終わりうる。
+//!   直接の [`LogSink::append`] は従来どおり [`super::MAX_LINE_BYTES`] で切り詰めて `F` で書く。
 //!
 //! # 安全性
 //! - 開くとき最終要素は `O_NOFOLLOW`（symlink を辿らない）・`O_NONBLOCK`（FIFO で止まらない）・`O_NOCTTY` で、開いた後に通常ファイル
@@ -39,7 +43,7 @@ use std::time::Duration;
 
 use fandhe_container_core::traits::{ErrorCode, TraitError};
 
-use super::{LogSink, MAX_LINE_BYTES, StreamKind};
+use super::{LinePart, LogSink, MAX_LINE_BYTES, PartEnd, StreamKind};
 
 /// 1 レコードに載せる内容の最大バイト数（containerd の `max_container_log_line_size` の既定値）。
 pub const CRI_LOG_CHUNK_BYTES: usize = 16 * 1024;
@@ -132,6 +136,24 @@ fn now_timestamp() -> [u8; CRI_TIMESTAMP_LEN] {
     format_timestamp(since)
 }
 
+/// 1 レコード（`<ts> <stream> <tag> <chunk>\n`）を `out` へ追記する。
+fn push_record(
+    stream: StreamKind,
+    tag: u8,
+    chunk: &[u8],
+    timestamp: &[u8; CRI_TIMESTAMP_LEN],
+    out: &mut Vec<u8>,
+) {
+    out.extend_from_slice(timestamp);
+    out.push(b' ');
+    out.extend_from_slice(stream.as_str().as_bytes());
+    out.push(b' ');
+    out.push(tag);
+    out.push(b' ');
+    out.extend_from_slice(chunk);
+    out.push(b'\n');
+}
+
 /// 1 行（LF 抜き）を CRI のレコード列へ符号化して `out` へ追記する（純関数）。
 ///
 /// [`CRI_LOG_CHUNK_BYTES`] ごとに分け、最後の断片だけ `F`、それより前は `P`。空行は内容なしの `F` 1 件。
@@ -142,23 +164,42 @@ pub fn encode_records(
     timestamp: &[u8; CRI_TIMESTAMP_LEN],
     out: &mut Vec<u8>,
 ) {
-    let mut push = |tag: u8, chunk: &[u8]| {
-        out.extend_from_slice(timestamp);
-        out.push(b' ');
-        out.extend_from_slice(stream.as_str().as_bytes());
-        out.push(b' ');
-        out.push(tag);
-        out.push(b' ');
-        out.extend_from_slice(chunk);
-        out.push(b'\n');
+    encode_part_records(stream, line, PartEnd::Lf, timestamp, out);
+}
+
+/// 捕捉側の 1 断片（[`LogSink::append_part`] の `bytes`。LF 抜き）を CRI のレコード列へ符号化して `out` へ追記する
+/// （純関数。containerd v2.1.0 の `redirectLogs` と同じ規則。CRI-2・SUP-7・#4582）。
+///
+/// [`CRI_LOG_CHUNK_BYTES`] ごとに分け、`end` が [`PartEnd::Lf`] のときだけ最後のチャンクを `F`、それ以外
+/// （[`PartEnd::Continued`]・[`PartEnd::Eof`]・将来の変種）は全チャンクを `P` にする。空の `bytes` は `Lf` なら
+/// 内容なしの `F` 1 件（空行）、それ以外は何も書かない（空の `P` は雑音になるため。捕捉側は渡さない入力への防御）。
+/// 呼び出し側が LF を含む入力を弾いておくこと（[`CriFileSink`] の `append_part` が拒否する）。
+pub fn encode_part_records(
+    stream: StreamKind,
+    bytes: &[u8],
+    end: PartEnd,
+    timestamp: &[u8; CRI_TIMESTAMP_LEN],
+    out: &mut Vec<u8>,
+) {
+    // `PartEnd` は non_exhaustive: 未知の変種は行の終端と見なさず `P`（続きがあるものとして扱う）にする。
+    let last_tag = match end {
+        PartEnd::Lf => b'F',
+        _ => b'P',
     };
-    if line.is_empty() {
-        push(b'F', line);
+    if bytes.is_empty() {
+        if end == PartEnd::Lf {
+            push_record(stream, b'F', bytes, timestamp, out);
+        }
         return;
     }
-    let mut chunks = line.chunks(CRI_LOG_CHUNK_BYTES).peekable();
+    let mut chunks = bytes.chunks(CRI_LOG_CHUNK_BYTES).peekable();
     while let Some(chunk) = chunks.next() {
-        push(if chunks.peek().is_some() { b'P' } else { b'F' }, chunk);
+        let tag = if chunks.peek().is_some() {
+            b'P'
+        } else {
+            last_tag
+        };
+        push_record(stream, tag, chunk, timestamp, out);
     }
 }
 
@@ -340,6 +381,35 @@ impl CriFileSink {
         })
     }
 
+    /// 符号化済みのレコード列を上限検査つきで書く（`append`・`append_part` の共通の書き込み口。CRI-2・SUP-4・#4582）。
+    /// 上限（既存サイズ込み）を超える場合は 1 バイトも書かず、溜めた分だけ書き出して失敗状態に固定し `ResourceExhausted`。
+    /// 書き込み失敗は `Internal` で失敗状態に固定する（再書き込みで重複を作らない）。
+    fn write_records(&self, records: &[u8]) -> Result<(), TraitError> {
+        let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        match &mut *guard {
+            #[cfg(unix)]
+            Inner::Active { writer, remaining } => {
+                let need = u64::try_from(records.len()).unwrap_or(u64::MAX);
+                if need > *remaining {
+                    // 上限に達した: 溜めた分だけ書き出して止める（回転が無いため以後は書かない。REPAIR-3）。
+                    let _ = writer.flush();
+                    *guard = Inner::Failed;
+                    return Err(TraitError::new(
+                        ErrorCode::ResourceExhausted,
+                        "cri log size limit reached",
+                    ));
+                }
+                if writer.write_all(records).is_err() {
+                    *guard = Inner::Failed;
+                    return Err(internal("cri log write failed"));
+                }
+                *remaining -= need;
+                Ok(())
+            }
+            Inner::Failed => Err(internal("cri log sink is in failed state")),
+        }
+    }
+
     /// 非 unix では開けない（`Unimplemented`。形式の純関数だけを 3 OS で提供する）。
     #[cfg(not(unix))]
     pub fn open(
@@ -362,29 +432,31 @@ impl LogSink for CriFileSink {
         }
         let mut records = Vec::with_capacity(line.len() + CRI_TIMESTAMP_LEN + 8);
         encode_records(stream, line, &now_timestamp(), &mut records);
-        let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        match &mut *guard {
-            #[cfg(unix)]
-            Inner::Active { writer, remaining } => {
-                let need = u64::try_from(records.len()).unwrap_or(u64::MAX);
-                if need > *remaining {
-                    // 上限に達した: 溜めた分だけ書き出して止める（回転が無いため以後は書かない。REPAIR-3）。
-                    let _ = writer.flush();
-                    *guard = Inner::Failed;
-                    return Err(TraitError::new(
-                        ErrorCode::ResourceExhausted,
-                        "cri log size limit reached",
-                    ));
-                }
-                if writer.write_all(&records).is_err() {
-                    *guard = Inner::Failed;
-                    return Err(internal("cri log write failed"));
-                }
-                *remaining -= need;
-                Ok(())
-            }
-            Inner::Failed => Err(internal("cri log sink is in failed state")),
+        self.write_records(&records)
+    }
+
+    /// 捕捉リーダーが渡す断片を `P` / `F` で書く（#4582・CRI-2・SUP-7）。LF を含む入力と [`MAX_LINE_BYTES`] を超える入力は
+    /// 確保の前に `InvalidArgument` で拒否する（契約違反を黙って欠落させない。文言は固定で入力を含めない。ERR-1）。
+    /// 総量の上限・失敗状態の扱いは [`Self::append`] と同じ（1 断片分の全部か無しか）。
+    fn append_part(
+        &self,
+        stream: StreamKind,
+        bytes: &[u8],
+        part: LinePart<'_>,
+    ) -> Result<(), TraitError> {
+        if bytes.len() > MAX_LINE_BYTES {
+            return Err(invalid("log line part exceeds the maximum length"));
         }
+        if bytes.contains(&b'\n') {
+            return Err(invalid("log line must not contain a line feed"));
+        }
+        let mut records = Vec::with_capacity(bytes.len() + CRI_TIMESTAMP_LEN + 8);
+        // 1 断片に 1 時刻（containerd と同じ）。
+        encode_part_records(stream, bytes, part.end, &now_timestamp(), &mut records);
+        if records.is_empty() {
+            return Ok(());
+        }
+        self.write_records(&records)
     }
 
     fn flush(&self) -> Result<(), TraitError> {
@@ -499,10 +571,24 @@ impl LogSink for TeeLogSink {
         self.each(|s| s.append(stream, line))
     }
 
+    /// 断片を両方の出力先へ渡す。上書きしないと既定実装が先頭断片を `append` へ渡し、CRI ログも切り詰めになる（#4582）。
+    /// 主（`RotatingFileSink`）は既定の `append_part` のまま行の終端まで遅延するため、`@container-logs` は切り詰めのまま。
+    fn append_part(
+        &self,
+        stream: StreamKind,
+        bytes: &[u8],
+        part: LinePart<'_>,
+    ) -> Result<(), TraitError> {
+        self.each(|s| s.append_part(stream, bytes, part))
+    }
+
     fn flush(&self) -> Result<(), TraitError> {
         self.each(|s| s.flush())
     }
 }
+
+#[cfg(all(test, unix))]
+mod part_tests;
 
 #[cfg(test)]
 mod tests {

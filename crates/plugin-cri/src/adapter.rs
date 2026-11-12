@@ -1906,12 +1906,36 @@ pub(crate) fn to_trait_error(e: OciRuntimeError) -> TraitError {
     TraitError::new(e.code(), e.message())
 }
 
-/// イメージ参照の操作が排他の取得を待つ上限（create 側）。
+/// イメージ参照の操作が排他の取得を待つ上限（create 側の個別上限。実際の値は [`image_ref_create_lock_timeout`] が残り時間から決める）。
 ///
-/// create の最悪は、create ゲート・manifest の解決・register・bind（失敗時の release）で各 1 回、計 5 秒 × 4〜5 回の
-/// 25 秒以内で、`PLUGIN_RUNTIME_TIMEOUT`（60.9 秒）に収まる（REPAIR-5）。
+/// create の予算（REPAIR-5・#2791）: 事前回収 20 秒・状態作成 5 秒・監査記録 `CREATE_AUDIT_BUDGET`（22.9 秒）の計 47.9 秒に、
+/// イメージ参照の排他待ち 5 回（create ゲート・manifest 解決・register・bind または release・bind 後の `StateStore::get`）が
+/// 各 2 秒で 10 秒加わり、計 57.9 秒で `PLUGIN_RUNTIME_TIMEOUT`（60.9 秒）に収まる。
 #[cfg(unix)]
-const IMAGE_REF_CREATE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+const IMAGE_REF_CREATE_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// create 内のイメージ参照の排他待ちの最大回数（上記の 5 回）。
+#[cfg(unix)]
+const IMAGE_REF_CREATE_LOCK_STAGES: u32 = 5;
+
+/// 既存経路（状態作成）の最悪の待ち。
+#[cfg(unix)]
+const CREATE_STATE_BUDGET: Duration = Duration::from_secs(5);
+
+/// create の入口で決めた絶対期限 `deadline` までの残りから、イメージ参照の排他待ちの 1 回分の上限を決める。
+///
+/// 後続の状態作成と監査記録の最悪分を先に差し引き、残りを段数で割って `IMAGE_REF_CREATE_LOCK_TIMEOUT` で頭打ちにする。
+/// 残りが無ければ `None`（呼び出し側は何も作らず `Timeout` で失敗する）。
+#[cfg(unix)]
+fn image_ref_create_lock_timeout(deadline: Instant, now: Instant) -> Option<Duration> {
+    let remaining = deadline.saturating_duration_since(now);
+    let reserved = CREATE_STATE_BUDGET + CREATE_AUDIT_BUDGET;
+    let per_stage = remaining.checked_sub(reserved)? / IMAGE_REF_CREATE_LOCK_STAGES;
+    if per_stage.is_zero() {
+        return None;
+    }
+    Some(per_stage.min(IMAGE_REF_CREATE_LOCK_TIMEOUT))
+}
 
 /// delete 側の上限。delete は `PLUGIN_FORCE_DELETE_DEADLINE`（47 秒）の中で stop の予算とログの後始末（最悪 20 秒）を
 /// 残す必要があるため短くする。解除は lookup と release の 2 回で、最悪 2 秒 × 2 = 4 秒（REPAIR-5）。
@@ -1939,6 +1963,7 @@ impl CoreLifecycleRuntime {
         req: &CreateRequest,
         root: &std::path::Path,
         image_id: &str,
+        deadline: Instant,
     ) -> Result<StateRecord, TraitError> {
         use crate::image_refs::{
             StoreImageRefs, attach_image_root, oci_failure, open_image_store, parse_image_id,
@@ -1946,7 +1971,9 @@ impl CoreLifecycleRuntime {
         };
         use fandhe_container_core::oci_runtime::ContainerImage;
         let image_id = parse_image_id(image_id)?;
-        let images = open_image_store(root, IMAGE_REF_CREATE_LOCK_TIMEOUT)?;
+        let lock_timeout = image_ref_create_lock_timeout(deadline, Instant::now())
+            .ok_or_else(|| TraitError::new(ErrorCode::Timeout, "create deadline exhausted"))?;
+        let images = open_image_store(root, lock_timeout)?;
         let scope = state_scope(&*self.store)?;
         let _pass = images
             .enter_container_create()
@@ -2076,6 +2103,9 @@ fn launch_unavailable() -> TraitError {
 
 impl ContainerRuntime for CoreLifecycleRuntime {
     fn create(&self, req: &CreateRequest) -> Result<ContainerStatus, TraitError> {
+        // create 全体の絶対期限（`PLUGIN_RUNTIME_TIMEOUT` 未満。REPAIR-5）。イメージ参照の排他待ちはここからの残りで割り当てる。
+        #[cfg(unix)]
+        let deadline = Instant::now() + PLUGIN_RUNTIME_TIMEOUT;
         self.reclaim_before_create(req.id())?;
         #[cfg(unix)]
         if let (Some(root), Some(image_id)) = (
@@ -2083,7 +2113,7 @@ impl ContainerRuntime for CoreLifecycleRuntime {
             req.annotations().get(CRI_IMAGE_ID_ANNOTATION),
         ) {
             return self
-                .create_with_image_refs(req, root, image_id)
+                .create_with_image_refs(req, root, image_id, deadline)
                 .map(|r| status_with_instance(&r));
         }
         let created = match &self.create_audit {
@@ -3461,6 +3491,37 @@ mod tests {
         assert_eq!(seen.len(), 1);
         assert!(seen[0] > before && seen[0] <= Instant::now() + CREATE_AUDIT_BUDGET);
         assert_eq!(CREATE_AUDIT_BUDGET, RECORD_WAIT_LIMIT * 2);
+    }
+
+    /// create の期限予算（OCI-7・CRI-2・REPAIR-5・#2791）。最悪の合計が `PLUGIN_RUNTIME_TIMEOUT` に収まることを具体値で固定する。
+    #[cfg(unix)]
+    #[test]
+    fn create_image_ref_budget_fits_runtime_timeout() {
+        // 事前回収 20 秒 + 状態作成 5 秒 + 監査 22.9 秒 + 排他待ち 5 回 x 2 秒 = 57.9 秒 < 60.9 秒。
+        let worst = Duration::from_secs(20)
+            + CREATE_STATE_BUDGET
+            + CREATE_AUDIT_BUDGET
+            + IMAGE_REF_CREATE_LOCK_TIMEOUT * IMAGE_REF_CREATE_LOCK_STAGES;
+        assert_eq!(worst, Duration::from_millis(57_900));
+        assert!(worst <= PLUGIN_RUNTIME_TIMEOUT);
+
+        let now = Instant::now();
+        // 事前回収が 20 秒を使い切った後でも 2 秒が割り当たる。
+        let after_reclaim = now + PLUGIN_RUNTIME_TIMEOUT - Duration::from_secs(20);
+        assert_eq!(
+            image_ref_create_lock_timeout(after_reclaim, now),
+            Some(Duration::from_secs(2))
+        );
+        // 残りが予約分 + 5 x 1 秒ちょうどなら 1 秒。
+        let tight = now + CREATE_STATE_BUDGET + CREATE_AUDIT_BUDGET + Duration::from_secs(5);
+        assert_eq!(
+            image_ref_create_lock_timeout(tight, now),
+            Some(Duration::from_secs(1))
+        );
+        // 予約分しか残っていなければ何も始めない。
+        let none = now + CREATE_STATE_BUDGET + CREATE_AUDIT_BUDGET;
+        assert_eq!(image_ref_create_lock_timeout(none, now), None);
+        assert_eq!(image_ref_create_lock_timeout(now, now), None);
     }
 
     /// SEC-4・#2594: 常に失敗する sink でも `create` の拒否の `code`・`message` は変わらない（fail-closed）。

@@ -27,6 +27,10 @@
 //!   完全一致し、`blobs/sha256` の実ディスク使用量（各ファイルの `st_blocks * 512` の合計）との差が 5% 以内に収まる。
 //!   `image prune` の前後で、減る量は prune の `reclaimed_bytes` にちょうど一致する。
 //!
+//! 50 並行（#868・TASK-184.4.1）は別の起動モード `--ignored --scenario concurrent`（実体は `tests/linux/concurrent.rs`）。
+//! pull・create・start・container delete・image rm を 50 回ずつ prune と並行させ、受け入れ条件 (i)〜(iii) を照合する。
+//! (iv)〜(vi) は #869 が同じハーネスに足す。`--ignored` なしでは pull × prune の自己検証を小さい件数で回す。
+//!
 //! `image prune` は CLI に未配線（#2384）のため、E・F・G・H は oci の公開 API（`execute_image_prune`）をプロセス内で呼ぶ。
 //! 配線後は CLI 経由へ切り替える。
 //!
@@ -237,13 +241,49 @@ mod linux {
 
     pub fn main() -> ExitCode {
         super::precondition::self_check();
-        if !std::env::args().skip(1).any(|a| a == "--ignored") {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        if !args.iter().any(|a| a == "--ignored") {
             println!(
                 "local_image_gc: skipped (real-host scenario; run with `-- --ignored` inside a delegated cgroup, e.g. `systemd-run --user --scope -p Delegate=yes`)"
             );
-            return ExitCode::SUCCESS;
+            // 既定のテスト集合で、50 並行の pull と prune の照合そのものを小さい件数で検証する（#868）。
+            return match concurrent::offline_self_check() {
+                Ok(()) => {
+                    println!("local_image_gc: offline pull and prune self-check ok");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("local_image_gc: FAILED: offline pull and prune self-check: {e}");
+                    ExitCode::FAILURE
+                }
+            };
         }
-        match scenario() {
+        // 50 並行は別の起動モード（既存の通しシナリオの期限を食わず、失敗の切り分けを容易にする）。
+        let concurrent_mode = args
+            .windows(2)
+            .any(|w| w[0] == "--scenario" && w[1] == "concurrent");
+        let result = if concurrent_mode {
+            concurrent_scenario()
+        } else {
+            scenario()
+        };
+        match result {
+            Ok(()) if concurrent_mode => {
+                println!(
+                    "local_image_gc: concurrent: 50 runs each of pull, create, start, container delete and image rm ran in parallel with at least 50 image prune runs, and every pull and create saw a prune complete while holding its reference"
+                );
+                println!(
+                    "local_image_gc: concurrent (i): no manifest, config or layer referenced by a running or stopped container, a tag or an in-progress pull lease was deleted at any point"
+                );
+                println!(
+                    "local_image_gc: concurrent (ii): 50/50 creates and starts of containers referencing in-use images succeeded"
+                );
+                println!(
+                    "local_image_gc: concurrent (iii): 50/50 pulls racing image prune succeeded; every published image had all its manifest, config and layer blobs and a container created from it started"
+                );
+                println!("local_image_gc: concurrent scenario ok");
+                ExitCode::SUCCESS
+            }
             Ok(()) => {
                 println!(
                     "local_image_gc: image rm --force on an image used by a running container was refused with FAILED_PRECONDITION; tag, container reference and blobs were kept"
@@ -403,6 +443,17 @@ mod linux {
         scenario_body().map_err(super::precondition::Failure::Other)
     }
 
+    /// 50 並行（#868）。前提の検査は通しシナリオと同じ。
+    fn concurrent_scenario() -> Result<(), super::precondition::Failure> {
+        check_prerequisites()?;
+        let (env, mut cleanup) = setup_env().map_err(super::precondition::Failure::Other)?;
+        concurrent::scenario_real(&env, &mut cleanup).map_err(super::precondition::Failure::Other)
+    }
+
+    /// 実体は `tests/linux/concurrent.rs`（インライン `mod linux` の子モジュールは `tests/linux/` 基準で解決される。
+    /// サブディレクトリの `.rs` は試験ターゲットとして自動検出されない）。
+    mod concurrent;
+
     /// シナリオが共有する環境。
     struct Env {
         cli: PathBuf,
@@ -422,8 +473,9 @@ mod linux {
         pid: u32,
     }
 
-    /// 前提の検査を終えた後の本体。ここでの失敗は回帰として扱う。
-    fn scenario_body() -> Result<(), String> {
+    /// 作業ディレクトリ・bin（CLI と supervisor の 0755 コピー）・状態ルート・空のイメージルートを作る。
+    /// 通しシナリオ（A〜H）と 50 並行（`--scenario concurrent`）が共有する。特権ランチャーは置かない。
+    fn setup_env() -> Result<(Env, Cleanup), String> {
         let cli_src = PathBuf::from(env!("CARGO_BIN_EXE_fandhe-container"));
         let sup_src = cli_src
             .parent()
@@ -473,14 +525,8 @@ mod linux {
         cleanup.cli = cli.clone();
         fs::create_dir(&root).map_err(|e| format!("mkdir state root: {e}"))?;
         set_mode(&root, 0o700)?;
-
-        // 在庫: manifest 2 件（共有する blob は無い）と、それぞれにタグ 1 件。
-        let fx_run = Fixture::new('1', ['a', 'b', 'c'], [10, 20, 30]);
-        let fx_stop = Fixture::new('2', ['d', 'e', 'f'], [11, 21, 31]);
         fs::create_dir(&images).map_err(|e| format!("mkdir images: {e}"))?;
         set_mode(&images, 0o700)?;
-        seed_inventory(&images, &fx_run, Some(TAG_RUN))?;
-        seed_inventory(&images, &fx_stop, Some(TAG_STOP))?;
 
         let env = Env {
             cli,
@@ -492,6 +538,19 @@ mod linux {
             sup_needle: supervisor.to_string_lossy().into_owned().into_bytes(),
             root_needle: root_s.into_bytes(),
         };
+        Ok((env, cleanup))
+    }
+
+    /// 前提の検査を終えた後の本体。ここでの失敗は回帰として扱う。
+    fn scenario_body() -> Result<(), String> {
+        let (env, mut cleanup) = setup_env()?;
+
+        // 在庫: manifest 2 件（共有する blob は無い）と、それぞれにタグ 1 件。
+        let fx_run = Fixture::new('1', ['a', 'b', 'c'], [10, 20, 30]);
+        let fx_stop = Fixture::new('2', ['d', 'e', 'f'], [11, 21, 31]);
+        seed_inventory(&env.images, &fx_run, Some(TAG_RUN))?;
+        seed_inventory(&env.images, &fx_stop, Some(TAG_STOP))?;
+
         let pid = std::process::id();
         let id_run = format!("gcrun{pid}");
         let id_stop = format!("gcstop{pid}");

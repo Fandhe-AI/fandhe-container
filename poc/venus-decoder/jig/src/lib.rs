@@ -20,6 +20,8 @@
 //! 共有メモリ上のリングの中身（`ring_record`。`CreateRingMESA` で作られたリングの差分を kind 1 で足す）も記録する（#1884。
 //! `unsafe` は足さず、memfd は `read_exact_at` で読む）。reply・extra・間接 cs の shmem は記録しない。
 //!
+//! 記録ファイル（FCVNSREC）を実ファイルに対して検証する入口（#1885）は `verify` と bin の `--verify-record`（3 OS）。
+//!
 //! 共有メモリの前提（F5.2b.2・#1641）: protocol feature `SHMEM`・`BACKEND_REQ` の広告と、`GET_SHMEM_CONFIG`・`SET_BACKEND_REQ_FD` の受け付けは
 //! `session` / `vhost_user` に実装済み。backend 要求（`SHMEM_MAP` / `SHMEM_UNMAP`）の期限つき送信は F5.2b.3（#1642）で `session` に実装済み。
 //! ctrl の `RESOURCE_MAP_BLOB` / `UNMAP_BLOB` は F5.2b.4a（#1643）で実装済み（adapter が検証、`session` が memfd を作って frontend へ `SHMEM_MAP` / `SHMEM_UNMAP`。
@@ -44,6 +46,7 @@ pub mod resource;
 pub mod ring_record;
 #[cfg(target_os = "linux")]
 pub mod session;
+pub mod verify;
 pub mod vhost_user;
 pub mod virtqueue;
 

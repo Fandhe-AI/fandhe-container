@@ -3,15 +3,25 @@
 //! 役割: 引数を集めて `launch` を呼び、エラーを stderr に 1 行の JSON（`code` / `message`）で出して終了コードを返すだけ。
 //! 処理の本体は lib の `launch`（UDS の bind・期限つき accept・ログのファイル出力）。治具 VMM（crosvm 等の
 //! vhost-user frontend）が `--socket` のパスへ接続する。`--record <絶対パス>` を付けると、受理した `SUBMIT_3D` の本体を
-//! 記録ファイル（`create_new` + `0600`）へ書く（#1602。実機で採取したストリームはコミットしない）。Linux 限定で、他 OS では `UNSUPPORTED` を出して非ゼロで終わる。
+//! 記録ファイル（`create_new` + `0600`）へ書く（#1602。実機で採取したストリームはコミットしない）。起動は Linux 限定で、他 OS では `UNSUPPORTED` を出して非ゼロで終わる。
+//! `--verify-record <絶対パス>` は記録ファイルの検証モード（#1885。3 OS。起動より前に判定し、結果を 1 行の JSON で出す）。
 //! 実機での疎通は #725（人間担当）。
 
 // lib.rs の属性は bin には効かないため、ここにも付ける（unsafe は `sys` にだけ置く）。
 #![deny(unsafe_code)]
 
+/// 検証モードなら出力して終了する（cfg の両側の `main` が最初に呼ぶ）。
+fn exit_if_verify_mode() {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    if let Some(code) = fandhe_container_poc_venus_jig::verify::run_verify_mode(&args) {
+        std::process::exit(code);
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn main() {
     use fandhe_container_poc_venus_jig::launch;
+    exit_if_verify_mode();
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     let result = launch::parse_args(&args).and_then(|c| launch::run(&c));
     if let Err(e) = result {
@@ -22,6 +32,7 @@ fn main() {
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
+    exit_if_verify_mode();
     eprintln!("{{\"code\":\"UNSUPPORTED\",\"message\":\"venus-jig requires Linux\"}}");
     std::process::exit(1);
 }

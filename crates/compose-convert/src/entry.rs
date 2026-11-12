@@ -266,6 +266,7 @@ fn run_dir(dir: &Path, downgrade: Option<&DowngradeSet>) -> Outcome {
                 match e.code() {
                     "reparse-failed" => TomlOutputStatus::ReparseFailed,
                     "roundtrip-mismatch" => TomlOutputStatus::RoundtripMismatch,
+                    "too-large" => TomlOutputStatus::TooLarge,
                     _ => TomlOutputStatus::SerializeFailed,
                 },
                 String::new(),

@@ -199,3 +199,21 @@ fn stack5_3613_output_is_deterministic_lf() {
     assert_eq!(first, second);
     assert!(!first.contains('\r'));
 }
+
+/// STACK-5: 3 MiB の値をアンカーで 2 サービスから参照し、TOML が stack の入力上限（4 MiB）を超える場合は
+/// 書き出さず `too-large` で終了コード 1 にする（読み込み側の契約と往復検証の一致。値は stderr に出ない）。
+#[test]
+fn stack5_3613_output_over_stack_limit_is_rejected() {
+    let big = "x".repeat(3 * 1024 * 1024);
+    let yaml = format!(
+        "x-v: &v \"{big}\"\nservices:\n  a:\n    image: busybox\n    environment:\n      K: *v\n  b:\n    image: busybox\n    environment:\n      K: *v\n"
+    );
+    assert!(yaml.len() < fandhe_container_stack::toml_input::MAX_STACK_TOML_BYTES);
+    let s = Scratch::new();
+    s.write("compose.yaml", &yaml);
+    let (code, out, err) = run(&[], &s);
+    assert_eq!(code, Some(1), "{}", &err[..err.len().min(500)]);
+    assert!(out.is_empty());
+    assert!(err.contains("\"toml_output\":\"too-large\""));
+    assert!(!err.contains("xxxxxxxx"));
+}

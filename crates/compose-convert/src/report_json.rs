@@ -229,6 +229,8 @@ pub enum TomlOutputStatus {
     ReparseFailed,
     /// 往復が不一致だった（fail-closed。終了コード 1）。
     RoundtripMismatch,
+    /// 出力が stack の入力上限を超えた（fail-closed。終了コード 1）。
+    TooLarge,
 }
 
 impl TomlOutputStatus {
@@ -242,6 +244,7 @@ impl TomlOutputStatus {
             Self::SerializeFailed => "serialize-failed",
             Self::ReparseFailed => "reparse-failed",
             Self::RoundtripMismatch => "roundtrip-mismatch",
+            Self::TooLarge => "too-large",
         }
     }
 }

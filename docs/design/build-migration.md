@@ -10,7 +10,7 @@
 - compose 変換器（`crates/compose-convert`）は `services.*.build` と、Docker ソケット（`/var/run/docker.sock`・`/run/docker.sock` の完全一致。short / long syntax）の bind mount を `error-incompatible` に分類し、blocker に `guidance` を付ける（TASK-154.1・STACK-7）
 - `guidance.code` は `external-build`（`build:`）と `docker-socket`（ソケット bind）の 2 種。案内文は固定の英語で、サービス名や build context を含まない。文言の正は `classify.rs` の `IncompatibleGuidance`
 - `--downgrade` が格下げできるのは `error-unsupported-yet` だけで、`build:`・ソケット bind は格下げできない（TASK-182.1）
-- TOML の書き出し（#3613・STACK-3・STACK-5）: 入力ディレクトリのファイルがちょうど 1 件で、対象（`--downgrade` なしは `error_free`、ありは `error_free_with_downgrade`）のときだけ、往復検証済みの TOML を stdout へ書く。集計行の `toml_output` は `stdout`・`skipped-multiple-files`・`skipped-not-error-free`、失敗時（終了コード 1）は `serialize-failed`・`reparse-failed`・`roundtrip-mismatch`。複数ファイルの一括書き出しは未実装
+- TOML の書き出し（#3613・STACK-3・STACK-5）: 入力ディレクトリのファイルがちょうど 1 件で、対象（`--downgrade` なしは `error_free`、ありは `error_free_with_downgrade`）のときだけ、往復検証済みの TOML を stdout へ書く。集計行の `toml_output` は `stdout`・`skipped-multiple-files`・`skipped-not-error-free`、失敗時（終了コード 1）は `serialize-failed`・`reparse-failed`・`roundtrip-mismatch`・`too-large`（出力が stack の入力上限 4 MiB を超えた）。複数ファイルの一括書き出しは未実装
 - 未実装（REPAIR-3）: `up` / `down` / `ps` / `logs`（TASK-155）、CLI の `pull`、ローカルからのイメージ取り込み（OCI レイアウト・tar）
 - 案内文 `external-build` は registry への push だけを案内し、ローカル取り込みが未対応であることを明示する（#3615・REPAIR-3）。現行で動く経路は registry 経由だけである
 

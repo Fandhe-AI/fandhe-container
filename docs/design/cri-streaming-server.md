@@ -131,7 +131,7 @@ core の `ContainerRuntime` に exec は無く、shim v2 の `TaskExecLauncher` 
 
 | 項目 | 既定値 | 設定 |
 | ---- | ------ | ---- |
-| 転送先への接続の期限 | 10 秒 | `PortForwardConfig::dial_timeout` |
+| 転送先への接続の期限 | 10 秒 | `PortForwardConfig::dial_timeout`（NODE は `127.0.0.1` と `::1` の 2 回の試行で共有し延ばさない。#4575） |
 | 対が揃うまでの期限 | 30 秒（kubelet の stream creation timeout 相当） | `pair_timeout` |
 | Upgrade 後の idle の期限 | 4 時間（kubelet の stream idle timeout 相当） | `idle_timeout` |
 | 同時ストリーム数 | 128 | `max_streams` |
@@ -445,11 +445,11 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 
 **NODE（#3755）**:
 
-- host netns の `127.0.0.1:<port>` だけへ `dial_timeout`（10 秒）で接続する。接続先は要求から組み立てず loopback に固定する（SEC-1）。`::1` は試さない（fail-closed）。NODE は #4575 で別途扱う（POD は #4572 で `::1` へつなぎ直す）
+- host netns の `127.0.0.1:<port>` へ `dial_timeout`（10 秒）で接続し、失敗したら同じ期限の残りで `[::1]:<port>` へ接続する（#4575）。接続先は要求から組み立てず、この 2 宛先の固定とする（SEC-1）。期限は 2 回の試行で 1 つを共有し延ばさない。IPv4 の失敗が期限切れ、または残りが 0 のときは IPv6 を試さず `TIMEOUT "port forward dial timed out"`。両方失敗したときは理由を問わず `UNAVAILABLE "port forward dial failed"`、どちらかが期限切れなら `TIMEOUT`（POD の helper と同じ写像）。成功後の `peer_addr` は接続した宛先との完全一致で照合し、写像アドレスは正規化しない。経緯: #4116 の項目 2 を 2026-11-12 にオーナーが見直した（containerd が `tcp4` の次に `tcp6` を試す挙動に合わせる）。オーナーが決めたのは「IPv4 で失敗したら `::1` でつなぎ直す・宛先は 2 つに固定・期限は延ばさない」まで。両方失敗したときの理由の選び方、peer の完全一致への締め込み、net の内部関数を公開せず plugin-cri に小さく持つことは Agent が安全側に倒した判断で、オーナーの承認は得ていない。残余: `::1` だけで待ち受けるホストのサービスにも届くようになる（hostNetwork の性質で containerd と同じ。認可は単回トークンの URL と kubelet / apiserver が担う）
 - NODE が先に成り立つ理由: NODE ネットワークでは network namespace の要素を作らず（host netns）、本番の `NetworkReady` は false なので、現状 kubelet が受ける Pod は hostNetwork だけである
 - NODE か POD かは、cri が RPC の時点で sandbox の記録（保存済みの `config` の `namespace_options.network`）から決め、発行時の要求に保存して dialer へ渡す。#3755 で `PortForwardDialer` の引数に対象の型（例: `PortForwardTarget { pod_sandbox_id, network: Node | Pod }`）を足す。URL やヘッダから組み立て直さず、plugin-cri に記録の解析を複製しない（REPAIR-1）
 - hostNetwork の Pod の port-forward はホストの loopback 上の任意のサービスへ届く。これは hostNetwork の性質で、認可は単回トークンの URL と kubelet / apiserver 側が担う
-- 実装（#3755）: `runtime_service::port_forward_network` が `namespace_options.network` がちょうど `NODE` のときだけ `Node` とし、未指定・POD・CONTAINER・TARGET・未知の値は `Pod` とした（#3755 時点。fail-closed。#4485 で `CONTAINER`・`TARGET`・未知を RPC 時の `UNIMPLEMENTED` に締めた。下の「cri の対応表を締める（F9）」と、現行の検査順は `port_forward_impl` の doc を参照。`wants_pod_network` は CONTAINER・TARGET を「POD でない」と扱うので流用しない）。`port_forward_impl` の順序は 結線 → 入力検証 → sandbox の照合（`NOT_FOUND`）→ POD の拒否（`UNIMPLEMENTED "port-forward for pod network is not implemented"`。トークン枠を消費しない）→ 発行。dialer は port 0・期限 0 を `INVALID_ARGUMENT`、期限切れを `TIMEOUT`、その他を `UNAVAILABLE` の固定文で返し、成功後に `peer_addr` が loopback であることを確かめる。`PortForwardDialer::supports_pod_network`（既定は偽）を真にした dialer を注入すると結線情報の POD 対応が立ち、RPC 時の拒否が外れる（#3766 が使う）
+- 実装（#3755）: `runtime_service::port_forward_network` が `namespace_options.network` がちょうど `NODE` のときだけ `Node` とし、未指定・POD・CONTAINER・TARGET・未知の値は `Pod` とした（#3755 時点。fail-closed。#4485 で `CONTAINER`・`TARGET`・未知を RPC 時の `UNIMPLEMENTED` に締めた。下の「cri の対応表を締める（F9）」と、現行の検査順は `port_forward_impl` の doc を参照。`wants_pod_network` は CONTAINER・TARGET を「POD でない」と扱うので流用しない）。`port_forward_impl` の順序は 結線 → 入力検証 → sandbox の照合（`NOT_FOUND`）→ POD の拒否（`UNIMPLEMENTED "port-forward for pod network is not implemented"`。トークン枠を消費しない）→ 発行。dialer は port 0・期限 0 を `INVALID_ARGUMENT`、期限切れを `TIMEOUT`、その他を `UNAVAILABLE` の固定文で返し、成功後に `peer_addr` が接続した宛先と完全一致することを確かめる（#4575）。`PortForwardDialer::supports_pod_network`（既定は偽）を真にした dialer を注入すると結線情報の POD 対応が立ち、RPC 時の拒否が外れる（#3766 が使う）
 - 残余: URL 発行後に sandbox が消えても dialer は記録を照合しない（トークン TTL 60 秒とセッションの idle の期限で有界）。停止時の Upgrade 後のセッションはドレインの期限の後に強制クローズする（「停止時のセッションの扱い」）。実行中の blocking の dial（最長 10 秒）は abort できず、ランタイムの `shutdown_timeout`（1 秒）が打ち切り、待ちは増えない
 
 ### POD ネットワークの PortForward の設計（#3766・CRI-6・NET-3・SEC-1・REPAIR-5）
@@ -599,7 +599,7 @@ sys に新しい unsafe を足す子（#4478・#4479・#4483）は、PR 本文�
 | kind 9 の attach の fd の受け渡し（往復） | 5 秒 |
 | follow のポーリング / 上限 | 200 ms / 24 時間 |
 | attach の follow スレッドの書き込みの刻み（取り消しの確認） | 200 ms |
-| PortForward の dial / 対の揃い / 書き込みの stall | 10 秒 / 30 秒 / 30 秒 |
+| PortForward の dial / 対の揃い / 書き込みの stall | 10 秒（NODE は IPv4 と IPv6 で共有し延ばさない。#4575） / 30 秒 / 30 秒 |
 | POD の PortForward の helper（#3766。実装済み。値は plugin-cri の `streaming/pod_dialer.rs` の定数〔`KILL_REAP_RESERVE`・`CONNECT_MARGIN`・`HELPER_EXIT_WAIT`・`HELPER_REAP_WAIT`・`MAX_RETAINED_DIAL_HELPERS`〕） | 応答待ち `timeout` − 1 秒・connect `W` − 500 ms・受信 2 秒・応答後の終了待ち 200 ms・SIGKILL 後の回収 800 ms（上の「POD ネットワークの PortForward の設計」。暫定値のまま承認。#4116 の項目 11・2026-11-12） |
 | `StreamingServer` の SIGTERM での停止 | 受信の検知（100 ms 周期）で待ち受けを閉じる（待ちなし。#3754）。受け付け済みのセッションはシグナルから 5 秒（`STREAMING_DRAIN_WAIT`）ドレインし、期限で exec を止めて 1 秒（`STREAMING_CLOSE_WAIT`）待ち、残りを強制クローズする。gRPC の猶予 10 秒以内に収まり、streaming は全体の上限を延ばさない（全体は #4340 で op-stats の最後の書き出し 1 秒が別に足されて 14.7 秒）（#4164。暫定値で #4116 の対象） |
 | helper の fd 2 の読み手（#4171） | 読み取りの刻み 100 ms / 停止後の drain 50 ms / 終了時の待ち 500 ms / 絶対期限 25 秒 + 3600 秒 + 30 秒 |

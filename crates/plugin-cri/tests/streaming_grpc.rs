@@ -465,3 +465,107 @@ async fn cri6_4110_production_binary_opt_in_binds_wildcard_and_advertises() {
     .await
     .expect("watchdog");
 }
+
+/// `127.0.0.1` を手放し `[::1]` だけで待ち受ける echo を起こして port を返す。IPv6 の loopback が無い環境では
+/// 黙って return せず前提の失敗として panic する（偽陽性にしない）。IPv4 を手放してから接続までの窓は残余。
+fn spawn_ipv6_only_echo() -> u16 {
+    use std::io::{Read, Write};
+    use std::net::{Shutdown, TcpListener};
+    for _ in 0..20 {
+        let v4l = TcpListener::bind("127.0.0.1:0").expect("bind v4");
+        let p = v4l.local_addr().expect("addr").port();
+        let Ok(listener) = TcpListener::bind(("::1", p)) else {
+            continue;
+        };
+        drop(v4l);
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { continue };
+                std::thread::spawn(move || {
+                    let _ = conn.set_read_timeout(Some(Duration::from_secs(30)));
+                    let _ = conn.set_write_timeout(Some(Duration::from_secs(10)));
+                    let mut buf = [0u8; 4096];
+                    while let Ok(n) = conn.read(&mut buf) {
+                        if n == 0 || conn.write_all(buf.get(..n).unwrap_or_default()).is_err() {
+                            break;
+                        }
+                    }
+                    let _ = conn.shutdown(Shutdown::Write);
+                });
+            }
+        });
+        return p;
+    }
+    panic!("precondition: could not bind an IPv6-only loopback listener");
+}
+
+/// CRI-6・NET-3・SEC-1・REPAIR-5・REPAIR-12・#4575: 本番構成で NODE の PortForward の転送先が `[::1]` だけで
+/// 待ち受けていても、URL の発行から SPDY 経由の往復まで通り、バイト列が完全一致する（IPv4 失敗後の `::1` への
+/// つなぎ直しを本番バイナリ越しに通す）。
+#[tokio::test]
+async fn cri6_net3_4575_production_binary_node_port_forward_falls_back_to_ipv6() {
+    tokio::time::timeout(WATCHDOG, async {
+        let dir = TempDir::new("pf6sock");
+        let xdg = TempDir::new("pf6xdg");
+        let sock = dir.0.join("s.sock");
+        let mut guard = spawn_server(&sock, &xdg.0);
+        let ch = connect_when_ready(&sock, &mut guard).await;
+        let mut c = RuntimeServiceClient::new(ch.clone());
+        let sandbox = call_with_deadline(c.run_pod_sandbox(run_node_req("pf6-node")), RPC_DEADLINE)
+            .await
+            .expect("run node sandbox")
+            .into_inner()
+            .pod_sandbox_id;
+
+        let target_port = spawn_ipv6_only_echo();
+        let url = call_with_deadline(
+            c.port_forward(cri::PortForwardRequest {
+                pod_sandbox_id: sandbox.clone(),
+                port: vec![i32::from(target_port)],
+            }),
+            RPC_DEADLINE,
+        )
+        .await
+        .expect("port-forward url")
+        .into_inner()
+        .url;
+        assert!(url.starts_with("http://127.0.0.1:"), "url must be loopback");
+        let (authority, path) = spdy_client::split_url(&url);
+        let addr: SocketAddr = authority.parse().expect("authority is a socket address");
+
+        let want = payload();
+        let got = tokio::time::timeout(
+            ROUND_TRIP_DEADLINE,
+            tokio::task::spawn_blocking({
+                let want = want.clone();
+                move || round_trip(addr, &path, target_port, &want)
+            }),
+        )
+        .await
+        .expect("round trip deadline")
+        .expect("round trip task");
+        assert_eq!(got.len(), want.len(), "echoed length");
+        assert!(got == want, "echoed bytes must match exactly");
+
+        call_with_deadline(
+            c.stop_pod_sandbox(cri::StopPodSandboxRequest {
+                pod_sandbox_id: sandbox.clone(),
+            }),
+            RPC_DEADLINE,
+        )
+        .await
+        .expect("stop");
+        call_with_deadline(
+            c.remove_pod_sandbox(cri::RemovePodSandboxRequest {
+                pod_sandbox_id: sandbox,
+            }),
+            RPC_DEADLINE,
+        )
+        .await
+        .expect("remove");
+        drop((c, ch));
+        assert!(guard.exited().is_none(), "server must still be running");
+    })
+    .await
+    .expect("watchdog");
+}

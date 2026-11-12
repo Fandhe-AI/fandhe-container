@@ -1,4 +1,4 @@
-//! 50 並行の実行基盤と、受け入れ条件 (i)〜(iii) の照合（#868・TASK-184.4.1・OCI-7・CLI-1・REPAIR-5・REPAIR-12。MS-6）。
+//! 50 並行の実行基盤と、受け入れ条件 (i)〜(vi) の照合（#868・#869・TASK-184.4.1・TASK-184.4.2・OCI-7・CLI-1・REPAIR-5・REPAIR-12。MS-6）。
 //!
 //! # 役割と呼び出し元
 //! `local_image_gc.rs` の `linux` モジュールの子（`#[path]`）。親の非公開ヘルパー（`run_cli`・`make_bundle`・`start_created`・
@@ -8,9 +8,10 @@
 //!   小さい件数で通し、同じ照合関数を使う。実機前提の部分を手元で回せなくても、ハーネスの照合自体はここで検証できる。
 //!
 //! # 操作の種類（拡張点）
-//! [`OpKind`] とワーカープール [`pool`] が拡張点で、(iv)〜(vi) は #869 が操作の種類を足す。種類ごとに専用のワーカーを
-//! 立て、共有の原子カウンタから回の番号を取り、合計 [`ITERATIONS`] 回を処理する。コンテナの `rm` は CreateStart の各回の
-//! `stop` → `delete` で 50 回数える。
+//! [`OpKind`] とワーカープール [`pool`] が拡張点で、(iv)〜(vi) は #869 が操作の種類（`CreatingRef`・`SharedPull`・`TagRace`）
+//! を足した。種類ごとに専用のワーカーを立て、共有の原子カウンタから回の番号を取り、合計 [`ITERATIONS`] 回を処理する。
+//! コンテナの `rm` は CreateStart の各回の `stop` → `delete` で 50 回数える。(iv)〜(vi) の 1 回分の本体は子モジュール
+//! `races`（`concurrent/races.rs`）に分ける（改修の波及を小さく保つ。REPAIR-1）。
 //!
 //! # 照合の概要
 //! - (i): 保護集合（参照中の manifest・config・レイヤー）を監視スレッドが [`POLL`] ごとに調べ、一度でも欠けたら失敗にする。
@@ -18,6 +19,18 @@
 //! - (ii): 参照中のイメージ（タグ・running / stopped のコンテナが参照するもの）から 50 回 create → start できる。
 //! - (iii): prune と並行する pull 50 回が成功し、公開されたイメージの全 blob が揃い（内容の sha256 を digest と照合）、
 //!   そのタグから create → start できる。pull はリースを取ってから prune の完了を待つので、リースだけが守る blob の経路を通る。
+//! - (iv): 作成途中のコンテナ（参照テーブルへの登録は済み〔未確定〕、状態作成と確定はまだ）の参照するイメージとレイヤーは、
+//!   タグも他の参照も無くなった窓の中で prune が完了しても消えない（prune は `manifest_references` で未確定参照も数える）。
+//!   CLI の実 create の内部の窓は外から止められないため、同じ手順（ゲート共有 → 登録 → 状態作成の代役 → 確定）を oci の
+//!   公開 API でなぞる模擬である（実 CLI の create は (ii) が同じゲートと `@lock` を取り合いながら並走する）。
+//!   create ゲートを排他で握る reconcile の役者は足さない（(ii) の CLI create が共有を待って Timeout しうるため）。
+//! - (v): 同じ blob X を共有する 3 本の pull が全員リースを取った後、X を持つ種イメージを `image rm` し、先頭の pull が
+//!   公開して自分のリースを解放しても、残りの 2 本は prune の完了を待った後に成功し、X は欠けない（pull ID ごとの個別リース）。
+//!   prune が X を「リースだけが守った blob」として報告した回数を数え、1 回以上を必須にする（空振り防止）。
+//! - (vi): 無参照で公開した T に `image tag` と prune を競わせる。結果は「tag 成功で manifest・blob が全部ある」か
+//!   「NOT_FOUND でタグも manifest も blob も無い」のどちらかだけで、タグだけあって中身が無い状態は残らない。
+//!   偶数の回は prune の完了を待ってから tag するので NOT_FOUND は決定的（件数を必須にする）。奇数の回は待たずに競わせる
+//!   ため勝敗は観測値で、件数は情報行（`tag_won=`・`prune_won=`）に出すだけにして必須にしない（妥当性は #668 で判断）。
 //!
 //! # 方針
 //! - Timeout は再試行しない（50/50 の基準を弱めない）。失敗は 1 回の失敗として数える。
@@ -31,9 +44,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use fandhe_container_oci::image_management::{BlobReuse, PullPublishRequest, PullSession};
+use fandhe_container_oci::error::OciErrorCode;
+use fandhe_container_oci::image_management::{
+    BlobReuse, ContainerRefId, ContainerRefRegistration, ContainerRefRelease, ImageRmKind,
+    PullPublishRequest, PullSession,
+};
 
 use super::*;
+
+mod races;
 
 /// 操作の種類ごとの回数（受け入れ条件の「50 回」）。
 const ITERATIONS: usize = 50;
@@ -46,6 +65,13 @@ const PRUNE_IN_FLIGHT: usize = 2;
 /// 自己検証の件数とワーカー数。
 const OFFLINE_ITERATIONS: usize = 8;
 const OFFLINE_PULL_IN_FLIGHT: usize = 4;
+/// (iv)〜(vi) のワーカー数。(v) は 1 回で 3 本の pull を走らせる。
+const CREATING_IN_FLIGHT: usize = 4;
+const SHARED_PULL_IN_FLIGHT: usize = 2;
+const TAG_IN_FLIGHT: usize = 4;
+const OFFLINE_CREATING_IN_FLIGHT: usize = 2;
+const OFFLINE_SHARED_PULL_IN_FLIGHT: usize = 2;
+const OFFLINE_TAG_IN_FLIGHT: usize = 2;
 /// 並行フェーズ全体の期限。
 const PHASE_DEADLINE: Duration = Duration::from_secs(300);
 /// 「リースや参照を持つ間に prune が 1 回完了する」のを待つ上限。
@@ -56,12 +82,18 @@ const BLOB_LEN: usize = 4 * KIB;
 const SHARED_LEN: usize = 16 * KIB;
 const TAG_PREFIX: &str = "registry.example/fandhe/";
 
-/// 操作の種類。#869 が (iv)〜(vi) の種類を足す。
+/// 操作の種類。(iv)〜(vi) は #869 が足した。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OpKind {
     Pull,
     CreateStart,
     ImageRm,
+    /// (iv) 作成途中の参照。
+    CreatingRef,
+    /// (v) 同じ blob を共有する 3 本の pull。
+    SharedPull,
+    /// (vi) `image tag` と prune の競合。
+    TagRace,
 }
 
 /// 1 回の操作の成功の付加情報。
@@ -70,6 +102,12 @@ enum Detail {
     Pull,
     CreateStart,
     ImageRm,
+    CreatingRef,
+    SharedPull,
+    /// `won` は tag が成功した（prune に消されなかった）こと。
+    TagRace {
+        won: bool,
+    },
 }
 
 struct OpRecord {
@@ -91,6 +129,9 @@ struct Params {
     start_workers: usize,
     rm_workers: usize,
     prune_workers: usize,
+    creating_workers: usize,
+    shared_workers: usize,
+    tag_workers: usize,
 }
 
 fn lk<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -199,6 +240,16 @@ struct World {
     d: Vec<Image>,
     /// pull で公開するイメージ。layer は [S, d_i のリースの的, 固有]。
     pulls: Vec<Image>,
+    /// (iv) 作成途中の参照が守るイメージ。タグ付きで種入れし、窓の中でタグを外す。固有 layer 1 枚（他と blob を共有しない）。
+    creating: Vec<Image>,
+    /// (v) グループ g の共有 blob X_g（固有の決定的な内容）。
+    x: Vec<Blob>,
+    /// (v) X_g だけを持つ種イメージ Y_g。タグ付きで種入れし、3 本がリースを取った後に `image rm` する。
+    y: Vec<Image>,
+    /// (v) グループ g の 3 本の pull の公開物。0 は先頭（タグなし）、1・2 は後続（タグ付き）。layer は [X_g, 固有]。
+    sp: Vec<[Image; 3]>,
+    /// (vi) 無参照で公開する T_k（固有 layer 1 枚）。
+    t: Vec<Image>,
 }
 
 impl World {
@@ -244,6 +295,36 @@ impl World {
                 )
             })
             .collect();
+        let own_one = |prefix: &str, k: usize| {
+            Image::new(
+                &format!("{prefix}{k}"),
+                vec![Blob::new(&format!("{prefix}{k}/own"), BLOB_LEN)],
+            )
+        };
+        let creating = (0..n).map(|k| own_one("w", k)).collect();
+        let t = (0..n).map(|k| own_one("t", k)).collect();
+        let x: Vec<Blob> = (0..n)
+            .map(|g| Blob::new(&format!("x{g}"), BLOB_LEN))
+            .collect();
+        let y = x
+            .iter()
+            .enumerate()
+            .map(|(g, xg)| Image::new(&format!("y{g}"), vec![xg.clone()]))
+            .collect();
+        let sp = x
+            .iter()
+            .enumerate()
+            .map(|(g, xg)| {
+                let member = |role: &str| {
+                    let name = format!("sp{g}{role}");
+                    Image::new(
+                        &name,
+                        vec![xg.clone(), Blob::new(&format!("{name}/own"), BLOB_LEN)],
+                    )
+                };
+                [member("l"), member("f1"), member("f2")]
+            })
+            .collect();
         Self {
             resident_tagged,
             shared,
@@ -254,7 +335,28 @@ impl World {
             v,
             d,
             pulls,
+            creating,
+            x,
+            y,
+            sp,
+            t,
         }
+    }
+
+    fn creating_tag(k: usize) -> String {
+        tag_of(&format!("gc-c-w{k}"))
+    }
+
+    fn y_tag(g: usize) -> String {
+        tag_of(&format!("gc-c-y{g}"))
+    }
+
+    fn follower_tag(g: usize, role: usize) -> String {
+        tag_of(&format!("gc-c-sp{g}-{role}"))
+    }
+
+    fn t_tag(k: usize) -> String {
+        tag_of(&format!("gc-c-t{k}"))
     }
 
     fn pull_tag(i: usize) -> String {
@@ -262,20 +364,32 @@ impl World {
     }
 
     /// フェーズの終わりに `blobs/sha256` にあるべき blob（名前 → 大きさ）。V と D の blob は含まない。
-    fn expected_blobs(&self) -> BTreeMap<String, usize> {
-        [&self.p, &self.r, &self.rr, &self.rs]
+    /// (v) の後続 pull（タグ付きで残る）と、tag が勝った T は含む。W・先頭の pull・Y の config・負けた T は含まない。
+    fn expected_blobs(&self, won: &BTreeSet<usize>) -> BTreeMap<String, usize> {
+        self.survivors(won)
             .into_iter()
-            .chain(self.pulls.iter())
             .flat_map(Image::blobs)
             .map(|b| (b.hex.clone(), b.data.len()))
             .collect()
     }
 
+    /// フェーズの終わりに在庫に残るイメージ（`image ls` の行になるもの。常駐の Rr・Rs を含む）。
+    fn survivors(&self, won: &BTreeSet<usize>) -> Vec<&Image> {
+        [&self.p, &self.r, &self.rr, &self.rs]
+            .into_iter()
+            .chain(self.pulls.iter())
+            .chain(self.sp.iter().flat_map(|g| &g[1..]))
+            .chain(won.iter().filter_map(|k| self.t.get(*k)))
+            .collect()
+    }
+
     /// `image ls` の期待行（整列済み）。`T|digest|size` はタグ付き、`U|...` はタグなし。
-    fn expected_rows(&self) -> Vec<String> {
+    fn expected_rows(&self, won: &BTreeSet<usize>) -> Vec<String> {
         let mut rows: Vec<String> = [&self.p, &self.r]
             .into_iter()
             .chain(self.pulls.iter())
+            .chain(self.sp.iter().flat_map(|g| &g[1..]))
+            .chain(won.iter().filter_map(|k| self.t.get(*k)))
             .map(|im| format!("T|{}|{}", im.manifest, im.size()))
             .chain([&self.rr, &self.rs].into_iter().map(|im| {
                 format!(
@@ -293,22 +407,54 @@ impl World {
 
 /// prune の結果を照合する集合。
 struct Sets {
+    /// prune が消してよい manifest（D・W・(v) の先頭の pull・T）。W は窓の後、T は tag が負けたときだけ実際に消える。
     d_manifests: BTreeSet<String>,
     d_blobs: BTreeSet<String>,
+    /// prune が「リースだけが守った」と報告してよい blob（D のリースの的と (v) の X_g）。
     lease_targets: BTreeSet<String>,
+    /// (v) の X_g（`kept_leased_blobs` に出た回数を数える対象）。
+    x_blobs: BTreeSet<String>,
+    /// 常に消える（W と (v) の先頭の pull の manifest）。D もここに含める。
+    always_removed: BTreeSet<String>,
+    /// T_k の manifest（添字が k）。tag が負けた k のものだけ消える。
+    t_manifests: Vec<String>,
 }
 
 impl Sets {
     fn of(w: &World) -> Self {
+        // 先頭の pull の固有 blob だけを数える（X_g は後続の pull とリースが守るため消えてはならない）。
+        let leaders: Vec<&Image> = w.sp.iter().map(|g| &g[0]).collect();
+        let removable: Vec<&Image> =
+            w.d.iter()
+                .chain(w.creating.iter())
+                .chain(w.t.iter())
+                .chain(leaders.iter().copied())
+                .collect();
+        let x_blobs: BTreeSet<String> = w.x.iter().map(|b| b.digest.to_string()).collect();
+        let x_hex: BTreeSet<&String> = w.x.iter().map(|b| &b.hex).collect();
         Self {
-            d_manifests: w.d.iter().map(|i| i.manifest.to_string()).collect(),
-            d_blobs: w
-                .d
+            d_manifests: removable.iter().map(|i| i.manifest.to_string()).collect(),
+            d_blobs: removable
                 .iter()
-                .flat_map(Image::blobs)
+                .flat_map(|i| i.blobs())
+                .filter(|b| !x_hex.contains(&b.hex))
                 .map(|b| b.digest.to_string())
                 .collect(),
-            lease_targets: w.d.iter().map(|i| i.layers[1].digest.to_string()).collect(),
+            lease_targets: w
+                .d
+                .iter()
+                .map(|i| i.layers[1].digest.to_string())
+                .chain(x_blobs.iter().cloned())
+                .collect(),
+            x_blobs,
+            always_removed: w
+                .d
+                .iter()
+                .chain(w.creating.iter())
+                .chain(leaders.iter().copied())
+                .map(|i| i.manifest.to_string())
+                .collect(),
+            t_manifests: w.t.iter().map(|i| i.manifest.to_string()).collect(),
         }
     }
 }
@@ -318,6 +464,10 @@ struct Shared {
     images: PathBuf,
     iterations: usize,
     gate_leases: usize,
+    /// prune ワーカー数。「窓の後に始まった prune が 1 回以上完了した」ことの判定に使う（[`Shared::wait_prune_after`]）。
+    prune_workers: usize,
+    /// (iv) の未確定参照の ID。
+    create_ids: Vec<String>,
     pull_ids: Vec<String>,
     start_ids: Vec<String>,
     start: AtomicBool,
@@ -330,6 +480,8 @@ struct Shared {
     absent_hits: AtomicUsize,
     monitor_polls: AtomicUsize,
     monitor_lock_errors: AtomicUsize,
+    /// prune が X_g を「リースだけが守った blob」として報告した延べ回数（(v) の空振り防止）。
+    shared_lease_kept: AtomicUsize,
     protected_blobs: Mutex<BTreeMap<String, u64>>,
     protected_manifests: Mutex<BTreeSet<String>>,
     violation: Mutex<Option<String>>,
@@ -360,6 +512,42 @@ impl Shared {
             }
             thread::sleep(POLL);
         }
+    }
+
+    /// `seen`（呼び出し時点の完了数）より後に **始まった** prune が 1 回以上完了するのを待つ。
+    ///
+    /// `seen` の時点で走っている prune は高々 `prune_workers` 本で、その完了は `seen` を超える数に含まれうる。
+    /// 完了数が `seen + prune_workers` を超えれば、少なくとも 1 本は `seen` の後に始まったと言える。
+    fn wait_prune_after(&self, seen: usize, what: &str) -> Result<(), String> {
+        self.wait_prune_progress(seen.saturating_add(self.prune_workers), what)
+    }
+
+    fn protect_blob(&self, b: &Blob) {
+        lk(&self.protected_blobs).insert(b.hex.clone(), b.data.len() as u64);
+    }
+
+    /// 保護集合から外す（W のように、後で prune に消されてよくなるイメージ）。
+    ///
+    /// 監視スレッドは保護集合の複製を取って 1 周する。外した直後に参照を解いて prune が消すと、古い複製で調べ終える前の
+    /// 周回が正しい削除を違反と誤検出しうる。そのため、外した後に監視が **1 周まるごと** 回り終わるのを待ってから返す。
+    /// 外す blob は他のイメージと共有しない（名前から決まる固有の内容）。
+    fn unprotect_image(&self, im: &Image) -> Result<(), String> {
+        {
+            let mut blobs = lk(&self.protected_blobs);
+            for b in im.blobs() {
+                blobs.remove(&b.hex);
+            }
+        }
+        lk(&self.protected_manifests).remove(&im.manifest.to_string());
+        let start = self.monitor_polls.load(Ordering::SeqCst);
+        let deadline = Instant::now() + OVERLAP_WAIT;
+        while self.monitor_polls.load(Ordering::SeqCst) < start.saturating_add(2) {
+            if Instant::now() >= deadline {
+                return Err("monitor did not complete a full pass after unprotecting".to_string());
+            }
+            thread::sleep(POLL);
+        }
+        Ok(())
     }
 
     fn protect_image(&self, im: &Image) {
@@ -648,6 +836,8 @@ fn prune_once(sh: &Shared, sets: &Sets) -> Result<PruneRec, String> {
             out.undeleted_blobs
         ));
     }
+    let x_kept = kept.iter().filter(|b| sets.x_blobs.contains(*b)).count();
+    sh.shared_lease_kept.fetch_add(x_kept, Ordering::SeqCst);
     Ok(PruneRec { removed })
 }
 
@@ -804,6 +994,16 @@ fn run_phase(
     let pull_counter = AtomicUsize::new(0);
     let start_counter = AtomicUsize::new(0);
     let rm_counter = AtomicUsize::new(0);
+    let creating_counter = AtomicUsize::new(0);
+    let shared_counter = AtomicUsize::new(0);
+    let tag_counter = AtomicUsize::new(0);
+    let creating_op =
+        |_slot: usize, k: usize| races::creating_ref_once(sh, w, k).map(|()| Detail::CreatingRef);
+    let shared_op =
+        |_slot: usize, g: usize| races::shared_pull_once(sh, w, g).map(|()| Detail::SharedPull);
+    let tag_op = |_slot: usize, k: usize| {
+        races::tag_race_once(sh, w, env, k).map(|won| Detail::TagRace { won })
+    };
     let pull_op = |slot: usize, i: usize| pull_once(sh, w, env, slot, i).map(|()| Detail::Pull);
     let start_op = |slot: usize, k: usize| match env {
         Some(e) => start_once(sh, w, e, slot, k).map(|()| Detail::CreateStart),
@@ -813,7 +1013,8 @@ fn run_phase(
         Some(e) => rm_once(w, e, j).map(|()| Detail::ImageRm),
         None => Err("no environment".to_string()),
     };
-    let mut expected = p.iterations;
+    // pull に加えて (iv)〜(vi) の 3 種が、実機・自己検証のどちらでも各 `iterations` 回走る。
+    let mut expected = 4 * p.iterations;
     thread::scope(|scope| {
         let mon = scope.spawn(|| monitor(sh));
         pool(
@@ -825,6 +1026,36 @@ fn run_phase(
             p.iterations,
             &tx,
             &pull_op,
+        );
+        pool(
+            scope,
+            sh,
+            &creating_counter,
+            OpKind::CreatingRef,
+            p.creating_workers,
+            p.iterations,
+            &tx,
+            &creating_op,
+        );
+        pool(
+            scope,
+            sh,
+            &shared_counter,
+            OpKind::SharedPull,
+            p.shared_workers,
+            p.iterations,
+            &tx,
+            &shared_op,
+        );
+        pool(
+            scope,
+            sh,
+            &tag_counter,
+            OpKind::TagRace,
+            p.tag_workers,
+            p.iterations,
+            &tx,
+            &tag_op,
         );
         if env.is_some() {
             pool(
@@ -1025,6 +1256,37 @@ fn refs_of(images: &Path, d: &Digest) -> Result<(Vec<String>, Vec<String>), Stri
     ))
 }
 
+/// (vi) の中核と (iv)・(v) の後始末の照合。タグだけあって中身（manifest）が無いイメージが無く、未確定参照が残らず、
+/// 種イメージ Y が消えている。
+fn verify_inventory(sh: &Shared, w: &World) -> Result<(), String> {
+    let store = ImageStore::open(&sh.images).map_err(|e| format!("open store: {e:?}"))?;
+    let g = store.lock().map_err(|e| format!("lock: {e:?}"))?;
+    let manifests: BTreeSet<Digest> = g.manifests().map(|(d, _)| d.clone()).collect();
+    if let Some((tag, d)) = g.tags().find(|(_, d)| !manifests.contains(*d)) {
+        return Err(format!(
+            "tag {tag} points to {d}, which is not in the inventory"
+        ));
+    }
+    if let Some((id, generation, d)) = g.unbound_containers().next() {
+        return Err(format!(
+            "unbound container reference left behind: {id} (generation {generation:?}) -> {d}"
+        ));
+    }
+    for im in w.creating.iter().chain(w.y.iter()) {
+        let refs = g.manifest_references(&im.manifest);
+        if refs.count() != 0 {
+            return Err(format!(
+                "{} still has references: containers={:?} tags={:?}",
+                im.manifest, refs.containers, refs.tags
+            ));
+        }
+    }
+    if let Some(y) = w.y.iter().find(|y| manifests.contains(&y.manifest)) {
+        return Err(format!("seed image {} was not removed", y.manifest));
+    }
+    Ok(())
+}
+
 /// フェーズ後の最終照合。
 fn verify_final(
     sh: &Shared,
@@ -1033,6 +1295,7 @@ fn verify_final(
     sets: &Sets,
     out: &mut Outcome,
     resident: Option<(&str, &str)>,
+    won: &BTreeSet<usize>,
 ) -> Result<(), String> {
     // 取り残しの回収のため、prune をもう 1 回実行する。
     out.prunes.push(prune_once(sh, sets)?);
@@ -1044,17 +1307,27 @@ fn verify_final(
             count += 1;
         }
     }
+    // 常に消えるもの（D・W・(v) の先頭の pull）に、tag が負けた T だけを足した集合に、各 manifest がちょうど 1 回ずつ一致する。
+    let mut want_removed = sets.always_removed.clone();
+    want_removed.extend(
+        sets.t_manifests
+            .iter()
+            .enumerate()
+            .filter(|(k, _)| !won.contains(k))
+            .map(|(_, m)| m.clone()),
+    );
     expect(
-        removed == sets.d_manifests && count == sets.d_manifests.len(),
+        removed == want_removed && count == want_removed.len(),
         &format!(
             "prune removed {count} manifests ({} distinct); want exactly the {} unreferenced ones",
             removed.len(),
-            sets.d_manifests.len()
+            want_removed.len()
         ),
     )?;
-    verify_blob_set(&sh.images, &w.expected_blobs())?;
+    verify_blob_set(&sh.images, &w.expected_blobs(won))?;
+    verify_inventory(sh, w)?;
     let got = listed_rows(&sh.images, env)?;
-    let want = w.expected_rows();
+    let want = w.expected_rows(won);
     expect(
         got == want,
         &format!("image rows differ: {}", rows_diff(&want, &got)),
@@ -1085,7 +1358,7 @@ fn verify_final(
     }
     if let Some(env) = env {
         let df = system_df(env)?;
-        let expected = w.expected_blobs();
+        let expected = w.expected_blobs(won);
         let bytes: u64 = expected.values().map(|l| *l as u64).sum();
         expect(
             df.missing == 0
@@ -1118,6 +1391,10 @@ fn execute(
         images: images.to_path_buf(),
         iterations: p.iterations,
         gate_leases: p.pull_workers.min(p.iterations),
+        prune_workers: p.prune_workers,
+        create_ids: (0..p.iterations)
+            .map(|k| format!("gciv{pid}x{k:04}"))
+            .collect(),
         pull_ids: (0..p.iterations)
             .map(|i| format!("gcp{pid}x{i:04}"))
             .collect(),
@@ -1134,6 +1411,7 @@ fn execute(
         absent_hits: AtomicUsize::new(0),
         monitor_polls: AtomicUsize::new(0),
         monitor_lock_errors: AtomicUsize::new(0),
+        shared_lease_kept: AtomicUsize::new(0),
         protected_blobs: Mutex::new(BTreeMap::new()),
         protected_manifests: Mutex::new(BTreeSet::new()),
         violation: Mutex::new(None),
@@ -1149,6 +1427,12 @@ fn execute(
     }
     for d in &w.d {
         seed(images, d, None)?;
+    }
+    for (k, im) in w.creating.iter().enumerate() {
+        seed(images, im, Some(&World::creating_tag(k)))?;
+    }
+    for (g, im) in w.y.iter().enumerate() {
+        seed(images, im, Some(&World::y_tag(g)))?;
     }
     for im in [&w.p, &w.r, &w.rr, &w.rs] {
         sh.protect_image(im);
@@ -1176,6 +1460,13 @@ fn execute(
     let t0 = Instant::now();
     let mut out = run_phase(&sh, &w, env, p, &sets)?;
     let phase_ms = t0.elapsed().as_millis();
+    // (vi) の勝敗（tag が成功した k）。期待する在庫は、この実行時の記録から組み立てる。
+    let won: BTreeSet<usize> = out
+        .records
+        .iter()
+        .filter(|r| matches!(r.result, Ok(Detail::TagRace { won: true })))
+        .map(|r| r.index)
+        .collect();
     verify_final(
         &sh,
         &w,
@@ -1183,6 +1474,7 @@ fn execute(
         &sets,
         &mut out,
         env.map(|_| (id_rr.as_str(), id_rs.as_str())),
+        &won,
     )?;
 
     let leased = sh.leased_hits.load(Ordering::SeqCst);
@@ -1196,8 +1488,27 @@ fn execute(
         prunes >= p.iterations,
         &format!("only {prunes} image prune runs"),
     )?;
+    // 決定的な部分: (v) は X_g が「リースだけが守った blob」として 1 回以上報告される。
+    // (vi) は偶数の回で prune が必ず先に回収する。奇数の回の勝敗は観測値で、件数は情報行にだけ出す。
+    let lease_kept = sh.shared_lease_kept.load(Ordering::SeqCst);
+    expect(
+        lease_kept >= 1,
+        "(v): prune never reported a shared blob as kept only by the remaining pull leases",
+    )?;
+    let tag_won = won.len();
+    let prune_won = p.iterations - tag_won;
+    expect(
+        prune_won >= p.iterations.div_ceil(2),
+        &format!(
+            "(vi): only {prune_won} of {} tag runs lost to image prune; the even runs wait for a prune and must lose",
+            p.iterations
+        ),
+    )?;
     for (kind, name, want) in [
         (OpKind::Pull, "pull", p.iterations),
+        (OpKind::CreatingRef, "creating_ref", p.iterations),
+        (OpKind::SharedPull, "shared_pull", p.iterations),
+        (OpKind::TagRace, "tag_race", p.iterations),
         (
             OpKind::CreateStart,
             "create_start",
@@ -1214,10 +1525,13 @@ fn execute(
         eprintln!("info: local_image_gc concurrent {name}: ok={n} max_ms={max} median_ms={med}");
     }
     eprintln!(
-        "info: local_image_gc concurrent in_flight pull={} create_start={} image_rm={} prune={} prune_runs={prunes} lease_reused={leased} lease_absent={absent} monitor_polls={} monitor_lock_errors={} phase_ms={phase_ms}",
+        "info: local_image_gc concurrent in_flight pull={} create_start={} image_rm={} creating_ref={} shared_pull={} tag_race={} prune={} prune_runs={prunes} lease_reused={leased} lease_absent={absent} shared_lease_kept={lease_kept} tag_won={tag_won} prune_won={prune_won} monitor_polls={} monitor_lock_errors={} phase_ms={phase_ms}",
         p.pull_workers,
         if env.is_some() { p.start_workers } else { 0 },
         if env.is_some() { p.rm_workers } else { 0 },
+        p.creating_workers,
+        p.shared_workers * 3,
+        p.tag_workers,
         p.prune_workers,
         sh.monitor_polls.load(Ordering::SeqCst),
         sh.monitor_lock_errors.load(Ordering::SeqCst),
@@ -1242,6 +1556,9 @@ pub(super) fn scenario_real(env: &Env, cleanup: &mut Cleanup) -> Result<(), Stri
         start_workers: START_IN_FLIGHT,
         rm_workers: RM_IN_FLIGHT,
         prune_workers: PRUNE_IN_FLIGHT,
+        creating_workers: CREATING_IN_FLIGHT,
+        shared_workers: SHARED_PULL_IN_FLIGHT,
+        tag_workers: TAG_IN_FLIGHT,
     };
     execute(&env.images, Some(env), Some(cleanup), &p)
 }
@@ -1265,6 +1582,9 @@ pub(super) fn offline_self_check() -> Result<(), String> {
         start_workers: 0,
         rm_workers: 0,
         prune_workers: PRUNE_IN_FLIGHT,
+        creating_workers: OFFLINE_CREATING_IN_FLIGHT,
+        shared_workers: OFFLINE_SHARED_PULL_IN_FLIGHT,
+        tag_workers: OFFLINE_TAG_IN_FLIGHT,
     };
     let r = execute(&images, None, None, &p);
     if r.is_ok() {

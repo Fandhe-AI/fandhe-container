@@ -724,7 +724,7 @@ pub(crate) fn get_dumpable() -> Result<i32, SysError> {
     prctl_value(consts::PR_GET_DUMPABLE, 0)
 }
 
-/// dumpable を 0（non-dumpable）にする（`PR_SET_DUMPABLE`）。`netns-dial` helper が参加後に同じ uid からの
+/// dumpable を 0（non-dumpable）にする（`PR_SET_DUMPABLE`）。`netns-dial` helper が起動直後と参加後に同じ uid からの
 /// `/proc/<pid>/{mem,fd,ns}` 経由の観測・ptrace を塞ぐために使う（SEC-1・CRI-6・#4479）。値は整数のみ渡す。
 pub(crate) fn set_non_dumpable() -> Result<(), SysError> {
     if !consts::SUPPORTED {

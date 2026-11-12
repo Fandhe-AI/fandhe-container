@@ -385,6 +385,9 @@ impl CriFileSink {
     /// 上限（既存サイズ込み）を超える場合は 1 バイトも書かず、溜めた分だけ書き出して失敗状態に固定し `ResourceExhausted`。
     /// 書き込み失敗は `Internal` で失敗状態に固定する（再書き込みで重複を作らない）。
     fn write_records(&self, records: &[u8]) -> Result<(), TraitError> {
+        // 非 unix では Active 腕が無く records を使わないため、未使用警告を避ける。
+        #[cfg(not(unix))]
+        let _ = records;
         let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         match &mut *guard {
             #[cfg(unix)]

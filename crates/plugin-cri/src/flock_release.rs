@@ -6,7 +6,7 @@
 //!
 //! 呼び出し元: [`crate::instance_lock::InstanceLock`]（状態ルートのインスタンス排他。CRI-2・CORE-1）と
 //! `netsetup::reclaim_store::ReclaimStore::lock`（回収待ち記録の `.lock`。NET-1）。core の `flock_release`（#4492）と
-//! 同じ形を crate ごとに独立して置く（下位 crate への共有化は別途判断）。点検表は `docs/design/flock-release-audit.md`
+//! 同じ形を crate ごとに独立して置く（複製は残し、本体の一致は共有の試験ケース（`crates/core/tests/support/flock_release_cases.rs`・`flock_release_with_cases.rs`）で照合する。判断は #4532・#4566）。点検表は `docs/design/flock-release-audit.md`
 //! （#4492・#4516・OCI-5・REPAIR-5）。`unsafe` は使わない（std の `File::unlock`）。
 //!
 //! 注意: `LOCK_UN` は OFD 単位で効くため、fork した子が [`ExplicitUnlockFile`] の `Drop` を実行すると親のロックまで
@@ -80,57 +80,12 @@ impl Drop for ExplicitUnlockFile {
     }
 }
 
+/// 共有の試験ケース（`crates/core/tests/support/flock_release*_cases.rs`。#4566）が使う一時ディレクトリ。
+/// 戻り値の 1 つ目は後始末を持つ guard で、呼び出し側が試験の終わりまで生かす。一時ディレクトリの作り方が
+/// crate ごとに違うため、共有ファイルの外のここに置く。
 #[cfg(all(test, unix))]
-// 照合するのは flock の OFD 単位の意味論で、Windows の `LockFileEx` は複製ハンドルと close の関係が異なり
-// 陽性対照の前提が成り立たないため unix に限る。
-mod tests {
-    use super::*;
-    use std::fs::TryLockError;
-
-    fn open_at(path: &std::path::Path) -> File {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(path)
-            .unwrap()
-    }
-
-    /// OCI-5・REPAIR-5（#4516）: 複製 fd が残っていても drop で明示 unlock され、陽性対照の
-    /// 包まない `File` は close だけでは外れない。
-    #[test]
-    fn oci5_repair5_4516_explicit_unlock_file_releases_despite_duplicate_fd() {
-        let root = crate::test_root::test_root("fandhe-plugin-cri-flock-release", "dup");
-        let path = root.to_path_buf().join("lock");
-
-        let plain = open_at(&path);
-        plain.try_lock().unwrap();
-        let dup = plain.try_clone().unwrap();
-        drop(plain);
-        assert!(matches!(
-            open_at(&path).try_lock(),
-            Err(TryLockError::WouldBlock)
-        ));
-        drop(dup);
-        open_at(&path).try_lock().unwrap();
-
-        let file = open_at(&path);
-        file.try_lock().unwrap();
-        let dup = file.try_clone().unwrap();
-        drop(ExplicitUnlockFile::new(file));
-        assert!(open_at(&path).try_lock().is_ok());
-        drop(dup);
-    }
-
-    /// REPAIR-5（#4516）: unlock が失敗しても close は続き、`UnlockFailed` を返して panic しない。
-    #[test]
-    fn oci5_repair5_4516_release_continues_close_when_unlock_fails() {
-        let root = crate::test_root::test_root("fandhe-plugin-cri-flock-release", "fail");
-        let path = root.to_path_buf().join("lock");
-        let file = open_at(&path);
-        file.try_lock().unwrap();
-        let out = release_lock_file_with(file, |_| Err(std::io::Error::other("injected")));
-        assert_eq!(out, LockRelease::UnlockFailed);
-        assert!(open_at(&path).try_lock().is_ok());
-    }
+pub(crate) fn shared_case_dir(tag: &str) -> (Box<dyn std::any::Any>, std::path::PathBuf) {
+    let root = crate::test_root::test_root("fandhe-plugin-cri-flock-release-4566", tag);
+    let path = root.to_path_buf();
+    (Box::new(root), path)
 }

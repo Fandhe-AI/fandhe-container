@@ -127,3 +127,11 @@ mod scratch_root;
 #[cfg(test)]
 #[path = "../../oci/tests/support/test_root.rs"]
 mod test_root;
+// flock_release の複製間で本体の振る舞いを同じ試験ケースで照合する共有部品（REPAIR-1・OCI-5・CORE-2・#4566・#4532）。
+// 試験専用で製品・rlib に影響しない。flock の OFD 単位の意味論を見るため unix に限る。
+#[cfg(all(test, unix))]
+#[path = "../../core/tests/support/flock_release_cases.rs"]
+mod flock_release_cases;
+#[cfg(all(test, unix))]
+#[path = "../../core/tests/support/flock_release_with_cases.rs"]
+mod flock_release_with_cases;

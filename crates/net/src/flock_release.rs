@@ -7,7 +7,7 @@
 //!
 //! 呼び出し元: `network_store::imp` の 2 つのガード、`network::publish` の共有ポート登録ロック、
 //! `add_host_dns::hosts_file` の hosts ファイルロック。点検表は `docs/design/flock-release-audit.md`。
-//! core・oci の同名部品と同じ形を net に独立して置く（crate 間の共有化は別途判断）。`unsafe` は使わない。
+//! core・oci の同名部品と同じ形を net に独立して置く（複製は残し、本体の一致は共有の試験ケース（`crates/core/tests/support/flock_release_cases.rs`・`flock_release_with_cases.rs`）の群 A（`new`・`Drop`）だけで照合する（本体の形が違うため）。判断は #4532・#4566）。`unsafe` は使わない。
 //!
 //! 注意: `LOCK_UN` は OFD 単位で効くため、fork した子の body へ本型の値をムーブしてはならない
 //! （子で Drop が走ると親のロックまで外れる）。net の子は `Command::spawn` の exec 経路だけで、
@@ -76,7 +76,7 @@ impl std::fmt::Debug for ExplicitUnlockFile {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::fs::{OpenOptions, TryLockError};
+    use std::fs::OpenOptions;
 
     fn open(path: &std::path::Path) -> File {
         OpenOptions::new()
@@ -86,32 +86,6 @@ mod tests {
             .truncate(false)
             .open(path)
             .unwrap()
-    }
-
-    /// OCI-5・REPAIR-5・#4514: 複製 fd が残っても drop で外れ、包まない File は外れない（陽性対照）。
-    #[test]
-    fn oci5_repair5_4514_explicit_unlock_file_releases_despite_duplicate_fd() {
-        let dir = crate::test_root::test_root("fc-net-flock-release", "dup");
-        let path = dir.join("lock");
-        // 陽性対照。
-        let plain = open(&path);
-        plain.try_lock().unwrap();
-        let dup = plain.try_clone().unwrap();
-        drop(plain);
-        assert!(matches!(
-            open(&path).try_lock(),
-            Err(TryLockError::WouldBlock)
-        ));
-        drop(dup);
-        // 対象。
-        let f = open(&path);
-        f.try_lock().unwrap();
-        let guard = ExplicitUnlockFile::new(f);
-        let dup = guard.clone_file_for_test().unwrap();
-        drop(guard);
-        let probe = open(&path);
-        assert!(probe.try_lock().is_ok());
-        drop(dup);
     }
 
     /// REPAIR-5・#4514: unlock が失敗しても close は止まらず、close でロックが外れる。
@@ -125,4 +99,13 @@ mod tests {
         assert!(res.is_err());
         assert!(open(&path).try_lock().is_ok());
     }
+}
+
+/// 共有の試験ケース（`crates/core/tests/support/flock_release_cases.rs`。群 A のみ。#4566）が使う一時ディレクトリ。
+/// 戻り値の 1 つ目は後始末を持つ guard で、呼び出し側が試験の終わりまで生かす。
+#[cfg(all(test, unix))]
+pub(crate) fn shared_case_dir(tag: &str) -> (Box<dyn std::any::Any>, std::path::PathBuf) {
+    let root = crate::test_root::test_root("fandhe-net-flock-release-4566", tag);
+    let path = root.to_path_buf();
+    (Box::new(root), path)
 }

@@ -4,9 +4,12 @@
 //! 具体値で照合する。出力にパスと payload が含まれないことも全ケースで確かめる。
 
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use fandhe_container_plugin_macos::gpu::venus::replay::{MAX_RECORDING_LEN, RecordingWriter};
 
@@ -50,11 +53,65 @@ fn good_bytes() -> Vec<u8> {
     w.finish().expect("finish")
 }
 
+/// 親側の期限（子の 60 秒制限より長い。REPAIR-5）。超過したら子を kill・wait で回収して試験を失敗させる。
+const PARENT_DEADLINE: Duration = Duration::from_secs(90);
+
+/// 子を起動し、出力は別スレッドで読み（pipe の詰まりによる停止を防ぐ）、期限つきで終了を待つ。
+fn output_with_deadline(mut cmd: Command) -> Output {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn child");
+    let mut out = child.stdout.take().expect("stdout pipe");
+    let mut err = child.stderr.take().expect("stderr pipe");
+    let t_out = thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = out.read_to_end(&mut v);
+        v
+    });
+    let t_err = thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = err.read_to_end(&mut v);
+        v
+    });
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait().expect("try_wait") {
+            Some(st) => break st,
+            None if start.elapsed() >= PARENT_DEADLINE => {
+                let _ = child.kill();
+                let _ = child.wait();
+                // 子孫が pipe を持ち続けても読み手の join で待たない（スレッドは切り離す）。
+                panic!("deadline_exceeded: child did not exit within {PARENT_DEADLINE:?}");
+            }
+            None => thread::sleep(Duration::from_millis(20)),
+        }
+    };
+    // 子が終了済みなら EOF は即時に来る。孫が書き込み端を持つ場合に備え期限内で待つ。
+    let join = |t: thread::JoinHandle<Vec<u8>>| {
+        let limit = Instant::now() + Duration::from_secs(10);
+        while !t.is_finished() {
+            assert!(
+                Instant::now() < limit,
+                "deadline_exceeded: output pipe not closed"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        t.join().expect("reader thread")
+    };
+    Output {
+        status,
+        stdout: join(t_out),
+        stderr: join(t_err),
+    }
+}
+
 fn run(args: &[&Path]) -> Output {
-    Command::new(BIN)
-        .args(args)
-        .output()
-        .expect("run venus-jig")
+    let mut cmd = Command::new(BIN);
+    cmd.args(args);
+    output_with_deadline(cmd)
 }
 
 fn stdout_of(o: &Output) -> String {
@@ -182,11 +239,10 @@ fn gpu6_repair2_1885_verify_mode_rejects_symlink_and_fifo_without_blocking() {
     let fifo = s.path("fifo.bin");
     // FIFO の作成成功を必須とする（作れないまま検証を省略して成功させない）。
     // この試験は cfg(unix) 限定で、Windows は対象外（FIFO の概念が無い）。
-    let st = Command::new("mkfifo")
-        .arg(&fifo)
-        .status()
-        .expect("mkfifo must be runnable to verify FIFO rejection");
-    assert!(st.success(), "mkfifo failed: {st:?}");
+    let mut mk = Command::new("mkfifo");
+    mk.arg(&fifo);
+    let mko = output_with_deadline(mk);
+    assert!(mko.status.success(), "mkfifo failed: {:?}", mko.status);
     {
         use std::os::unix::fs::FileTypeExt;
         let ft = fs::symlink_metadata(&fifo).expect("stat fifo").file_type();

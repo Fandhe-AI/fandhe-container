@@ -1,7 +1,7 @@
 # STACK-5・TASK-152.1・#605 の既定モード用の合成フィクスチャ（PoC-16 の合成フィクスチャが元）。
-# 今の変換器で convert / warning になるキーだけで組む（error_free になる）。depends_on・ulimits・
-# healthcheck・deploy（GPU 予約を含む）・トップレベル profiles・ホストパス形の devices・マッピング形の
-# restart は value_drops または error になるため除く（REPAIR-3。変換器へ結線されたら足す）。値はダミーのみ。
+# 変換器で convert / warning になるキーだけで組む（error_free になる）。depends_on・ulimits・healthcheck・
+# deploy（GPU 予約を含む）を含む（#3612）。トップレベル profiles・ホストパス形の devices・マッピング形の
+# restart・GPU の count 指定は value_drops または error になるため除く（REPAIR-3）。値はダミーのみ。
 version: "3.9"
 name: roundtrip-sample
 
@@ -44,10 +44,37 @@ services:
     shm_size: 64m
     cap_drop: [NET_RAW]
     security_opt: ["no-new-privileges:true"]
+    depends_on:
+      worker:
+        condition: service_healthy
+        required: true
+    ulimits:
+      nofile:
+        soft: 1024
+        hard: 2048
+      nproc: 512
+    healthcheck:
+      test: ["CMD", "/bin/true"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 512M
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
     x-foo: ignored
   worker:
     image: example.invalid/worker:2
     command: ""
+    healthcheck:
+      test: "pg_isready"
     networks:
       front:
     restart: "no"

@@ -1,0 +1,56 @@
+# #3614（STACK-3・STACK-10）の合成フィクスチャ。実際の compose で出やすい形
+# （アンカー・named volume の name/labels・ネットワークの ipam/internal・secrets の name 等）を模す。
+# 識別子・値はすべてダミーで、実コーパスの内容は写していない。実コーパスでの実測は #607。
+x-common: &common
+  restart: unless-stopped
+  pull_policy: missing
+
+services:
+  appmarker:
+    <<: *common
+    image: example.invalid/app:1
+    build:
+      context: .
+    profiles: [dev]
+    depends_on:
+      dbmarker:
+        condition: service_healthy
+    networks: [backmarker]
+    volumes:
+      - pgdata:/var/lib/data
+    secrets: [tokenmarker]
+    ports: ["8080:80"]
+  dbmarker:
+    <<: *common
+    image: example.invalid/db:1
+    environment:
+      DB_ENVMARKER: dummy
+    volumes:
+      - pgdata:/var/lib/data
+    networks: [backmarker]
+
+networks:
+  backmarker:
+    name: backnetmarker
+    driver: bridge
+    driver_opts:
+      optmarker: dummy
+    internal: true
+    attachable: true
+    enable_ipv6: false
+    ipam:
+      config:
+        - subnet: 192.0.2.0/24
+    labels:
+      lblmarker: dummy
+
+volumes:
+  pgdata:
+    name: pgdatanamemarker
+    labels:
+      lblmarker: dummy
+
+secrets:
+  tokenmarker:
+    name: tokennamemarker
+    file: ./token.txt

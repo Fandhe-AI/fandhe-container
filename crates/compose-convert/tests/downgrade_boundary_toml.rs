@@ -209,7 +209,7 @@ fn stack3_629_downgrade_does_not_clear_fail_closed_blockers() {
 }
 
 /// 格下げ可能な全キーが、値つきで書かれても TOML へ出ない（表から実行時に導出する）。
-/// `services.*.deploy.*` は deploy 自体が未変換で ValueDrops に載り error_free にならないため対象外。
+/// `services.*.deploy.*` は deploy の変換が resources 以外の子を無視する（key_scan 側の責務）ため対象外。
 /// STACK-3・TASK-182.3・#629・SEC-1。
 #[test]
 fn stack3_629_downgradable_keys_never_reach_toml() {

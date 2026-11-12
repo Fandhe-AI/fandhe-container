@@ -56,6 +56,7 @@ A3 の設計:
 
 - `LogSink` に `append_part(stream, bytes, part: LinePart)` を足す。`LinePart` は `#[non_exhaustive]` で、`index`（何番目の断片か）・`end`（`Continued` / `Lf` / `Eof`）・`head`（その行の先頭断片のバイト列。`index == 0` では空）を持つ
 - `LineSplitter` は、バッファが `MAX_LINE_BYTES` に達しても LF が無ければ、そこまでを `Continued` で渡して読み続ける。ただし先頭断片（64 KiB）は `head` として splitter 側に保持し続け、行が終わる（`Lf` / `Eof`）か破棄（`discard_partial`）されるまで手放さない。メモリは従来の 1 ストリーム 64 KiB 以下から、先頭断片 + 作業バッファの 128 KiB 以下に増える（有界。CORE-7 の常駐メモリへの影響は実装 issue で計測する）
+  - 実装での補足（#4580）: `Continued` は満杯の状態で LF 以外の次のバイトが来た時点で渡す（ちょうど 64 KiB で終わる行は 1 断片）。長い行の処理中だけストリームあたり約 +64 KiB で、行の終端で解放するためアイドル時は不変（実測は未実施）
 - **トレイトの既定実装で現行の挙動を残す**（既存 sink への追記を行の終端まで遅延させる）: `Continued` では何もしない。`end` が `Lf` / `Eof` なら、`index == 0` はその `bytes`、`index > 0` は `head` を `append(stream, ...)` する（現行の切り詰めと同じバイト列）。読み取りエラーで終わった行は `Continued` しか渡っておらず、`discard_partial` が `head` ごと破棄するので、既定実装の sink には何も追記されない。LF の無い 64 KiB の出力が `@container-logs` に完全なレコードとして残ったり、`--follow` に終端前に表示されたりする退行は起きない。`RotatingFileSink`・`MemoryLogSink`・`DiscardLogSink` と試験用の sink は変更不要で、`@container-logs` のレコード形式・`Scanner` の検証・CLI の `logs` の全オプション・既存ログファイルの読み取りは変わらない（R2 の互換）
 - `CriFileSink` は上書きする: `Continued` は全チャンク `P`、`Lf` は最後のチャンクだけ `F`、`Eof` は全チャンク `P`（containerd と同じ）
 - `MAX_LINE_BYTES`（64 KiB）は `CRI_LOG_CHUNK_BYTES`（16 KiB）の倍数なので、断片の境界と CRI のチャンクの境界が揃う。`const` の表明で固定する

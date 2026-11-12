@@ -11,7 +11,7 @@
 //! 3. peer が `127.0.0.1:<要求した port>` と完全一致
 //! 4. local が IPv4 loopback（127/8）
 //! 5. `SIOCGSKNS` で得た netns の (dev, ino) が保持役の素性と一致。`SIOCGSKNS` が失敗したら照合を飛ばさず拒否する
-//!    （fail-closed。#4491 が未決のため暫定の既定に従う）。非 root の plugin-cri では host netns の socket は
+//!    （fail-closed。#4491 の判断 1〔2026-11-12〕で必須と決定。拒否されても緩めない）。非 root の plugin-cri では host netns の socket は
 //!    ioctl の `EPERM` で拒否され、これが主な拒否経路になる（`sys/dial.rs` の「カーネルの要求」）
 //!
 //! 判定は syscall を含まない純関数（`check_*`）に分け、具体値の試験を置く。

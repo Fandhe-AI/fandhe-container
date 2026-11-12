@@ -355,6 +355,25 @@ pub fn ring_error_line(ring_id: u64, code: RingErrorCode) -> String {
     )
 }
 
+/// リングのスナップショットの集計行（セッション終了時に 1 回。REPAIR-4）。`result=read_failed` は読み取り失敗が 1 件以上あったこと。
+pub fn ring_summary_line(s: &crate::ring_record::RingStats) -> String {
+    let [b0, b1, b2, b3] = s.buckets;
+    format!(
+        "venus_jig event=ring_summary recorded={} empty={} rejected={} read_failed={} total_us={} max_us={} lt100us={b0} lt1ms={b1} lt10ms={b2} ge10ms={b3} result={}",
+        s.recorded,
+        s.empty,
+        s.rejected,
+        s.read_failed,
+        s.total_us,
+        s.max_us,
+        if s.read_failed == 0 {
+            "ok"
+        } else {
+            "read_failed"
+        }
+    )
+}
+
 /// 打ち切り後も [`LogSink::write_priority`] で書く行か（記録の停止通知・集計・起動エラー）。`event=` の値が固定語彙と
 /// 完全一致するときだけ真（`record_stopped_x` のような接頭辞一致は優先しない）。
 pub fn is_priority_line(line: &str) -> bool {
@@ -362,7 +381,10 @@ pub fn is_priority_line(line: &str) -> bool {
         return false;
     };
     let event = rest.split(' ').next().unwrap_or_default();
-    matches!(event, "record_stopped" | "record_summary" | "launch_error")
+    matches!(
+        event,
+        "record_stopped" | "record_summary" | "ring_summary" | "launch_error"
+    )
 }
 
 /// 終了時の記録の集計行。`write_ok` が偽なら `result=write_failed`（書き出しの失敗を成功と装わない）。

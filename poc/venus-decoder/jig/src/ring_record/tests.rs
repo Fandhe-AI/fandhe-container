@@ -510,3 +510,40 @@ fn gpu6_1884_ctx_destroy_without_destroy_ring_releases_rings() {
     let p = payloads(h);
     assert!(p.iter().any(|x| x == &vec![4, 5]));
 }
+
+/// GPU-6・REPAIR-4（#1884）: スナップショットの結果（記録・空・拒否・読み取り失敗）を件数で集計し、
+/// 終了時の `ring_summary` 行に出す。`before_release` 経路（`snapshot_all`）も数える。
+#[test]
+fn gpu6_1884_stats_count_outcomes_and_emit_summary_line() {
+    let mut blobs = FakeBlobs::with(5, 256);
+    let mut h = hooks();
+    create(&mut h, 1, std_spec(), &[MON]);
+    // 初回は差分 0（空）。
+    snap(&mut h, &blobs);
+    blobs.put(5, 192, &[1, 2]);
+    blobs.put_u32(5, 64, 2);
+    snap(&mut h, &blobs);
+    let st = h.stats();
+    assert_eq!(
+        (st.recorded, st.empty, st.rejected, st.read_failed),
+        (1, 1, 0, 0)
+    );
+    assert_eq!(st.buckets.iter().sum::<u32>(), 2);
+    // 読み取り失敗はリングを止め、read_failed に数える。
+    blobs.fail_reads.set(true);
+    snap(&mut h, &blobs);
+    let st = h.stats();
+    assert_eq!(
+        (st.recorded, st.empty, st.rejected, st.read_failed),
+        (1, 1, 0, 1)
+    );
+    let line = crate::log::ring_summary_line(&st);
+    assert!(
+        line.starts_with(
+            "venus_jig event=ring_summary recorded=1 empty=1 rejected=0 read_failed=1 total_us="
+        ),
+        "{line}"
+    );
+    assert!(line.ends_with(" result=read_failed"), "{line}");
+    assert!(crate::log::is_priority_line(&line));
+}

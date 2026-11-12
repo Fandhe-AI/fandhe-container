@@ -470,11 +470,13 @@ fn run_logged(
     let Some(hooks) = hooks else {
         return result;
     };
+    let ring_stats = hooks.stats();
     let (finished, summary) = hooks.into_recorder().finish();
     let write_ok = match finished {
         Ok(file) => file.sync_all().is_ok(),
         Err(_) => false,
     };
+    sink.write_priority(&log::ring_summary_line(&ring_stats));
     sink.write_priority(&log::record_summary_line(&summary, write_ok));
     match result {
         Ok(_) if !write_ok => Err(LaunchError::new(LaunchErrorCode::RecordWriteFailed)),

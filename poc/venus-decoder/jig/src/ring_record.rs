@@ -25,6 +25,7 @@
 //! `src/virtio/venus-protocol/vn_protocol_driver_{transport,types,defines}.h`（設計書 10.4.1）。
 
 use std::io::Write;
+use std::time::Instant;
 
 use fandhe_container_plugin_macos::gpu::venus::replay::MAX_RECORD_PAYLOAD_LEN;
 use fandhe_container_plugin_macos::gpu::venus::{
@@ -301,10 +302,50 @@ struct RingEntry {
     dead: bool,
 }
 
+/// スナップショット（`snapshot_one`）の結果の件数と所要時間の分布（REPAIR-4）。
+///
+/// 全契機（応答前・応答後・context 破棄・セッション終了時の `before_release`）が `snapshot_entry` を通るため、
+/// 本構造体への集計だけで `before_release` 経路も漏れなく数える。終了時に `ring_summary` 行として出す。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RingStats {
+    /// 差分を記録した回数。
+    pub recorded: u32,
+    /// 差分が 0 で何も記録しなかった回数。
+    pub empty: u32,
+    /// 検証・上限で拒否した回数（`read_failed` 以外の失敗）。
+    pub rejected: u32,
+    /// 共有メモリの読み取りに失敗した回数（セッションの失敗件数に相当する扱いで別掲する）。
+    pub read_failed: u32,
+    /// 所要時間の合計（マイクロ秒）。
+    pub total_us: u64,
+    /// 所要時間の最大（マイクロ秒）。
+    pub max_us: u64,
+    /// 所要時間の分布: 100us 未満・1ms 未満・10ms 未満・10ms 以上。
+    pub buckets: [u32; 4],
+}
+
+impl RingStats {
+    fn observe(&mut self, elapsed: std::time::Duration) {
+        let us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        self.total_us = self.total_us.saturating_add(us);
+        self.max_us = self.max_us.max(us);
+        let idx = match us {
+            0..=99 => 0,
+            100..=999 => 1,
+            1000..=9999 => 2,
+            _ => 3,
+        };
+        if let Some(b) = self.buckets.get_mut(idx) {
+            *b = b.saturating_add(1);
+        }
+    }
+}
+
 /// 受理した提出を記録し、契機ごとにリングの差分も足す記録フック。
 #[derive(Debug)]
 pub struct RecordingHooks<W: Write> {
     recorder: SubmitRecorder<W>,
+    stats: RingStats,
     rings: [Option<RingEntry>; MAX_RINGS],
 }
 
@@ -313,8 +354,14 @@ impl<W: Write> RecordingHooks<W> {
     pub fn new(recorder: SubmitRecorder<W>) -> Self {
         Self {
             recorder,
+            stats: RingStats::default(),
             rings: std::array::from_fn(|_| None),
         }
+    }
+
+    /// これまでのスナップショットの集計。
+    pub fn stats(&self) -> RingStats {
+        self.stats
     }
 
     /// 記録器を取り出す（`finish` 用）。
@@ -407,7 +454,7 @@ impl<W: Write> RecordingHooks<W> {
                 .is_some_and(|e| e.ctx_id == s.ctx_id && e.ring_id == ring_id);
             if matched {
                 if let Some(entry) = slot.as_mut() {
-                    Self::snapshot_entry(&mut self.recorder, entry, blobs, sink);
+                    Self::snapshot_entry(&mut self.recorder, &mut self.stats, entry, blobs, sink);
                 }
                 *slot = None;
             }
@@ -427,7 +474,7 @@ impl<W: Write> RecordingHooks<W> {
         for slot in self.rings.iter_mut() {
             if slot.as_ref().is_some_and(|e| e.ctx_id == ctx_id) {
                 if let Some(entry) = slot.as_mut() {
-                    Self::snapshot_entry(&mut self.recorder, entry, blobs, sink);
+                    Self::snapshot_entry(&mut self.recorder, &mut self.stats, entry, blobs, sink);
                 }
                 *slot = None;
             }
@@ -436,6 +483,7 @@ impl<W: Write> RecordingHooks<W> {
 
     fn snapshot_entry(
         recorder: &mut SubmitRecorder<W>,
+        stats: &mut RingStats,
         entry: &mut RingEntry,
         blobs: &dyn BlobRead,
         sink: &mut dyn FnMut(&str),
@@ -443,10 +491,21 @@ impl<W: Write> RecordingHooks<W> {
         if entry.dead {
             return;
         }
-        match snapshot_one(entry, blobs, recorder) {
-            Ok(Some(line)) => sink(&line),
-            Ok(None) => {}
+        let started = Instant::now();
+        let result = snapshot_one(entry, blobs, recorder);
+        stats.observe(started.elapsed());
+        match result {
+            Ok(Some(line)) => {
+                stats.recorded = stats.recorded.saturating_add(1);
+                sink(&line);
+            }
+            Ok(None) => stats.empty = stats.empty.saturating_add(1),
             Err((code, stop_line)) => {
+                if code == RingErrorCode::ReadFailed {
+                    stats.read_failed = stats.read_failed.saturating_add(1);
+                } else {
+                    stats.rejected = stats.rejected.saturating_add(1);
+                }
                 entry.dead = true;
                 if let Some(l) = stop_line {
                     sink(&l);
@@ -459,7 +518,7 @@ impl<W: Write> RecordingHooks<W> {
     /// 全リングを 1 回ずつスナップショットする。
     pub fn snapshot_all(&mut self, blobs: &dyn BlobRead, sink: &mut dyn FnMut(&str)) {
         for entry in self.rings.iter_mut().flatten() {
-            Self::snapshot_entry(&mut self.recorder, entry, blobs, sink);
+            Self::snapshot_entry(&mut self.recorder, &mut self.stats, entry, blobs, sink);
         }
     }
 }

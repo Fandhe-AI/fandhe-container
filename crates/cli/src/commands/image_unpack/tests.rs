@@ -404,17 +404,17 @@ fn oci7_2377_unpack_is_unimplemented_off_linux_and_creates_nothing() {
     assert_eq!(leftover_staging(&bundle), Vec::<String>::new());
 }
 
-/// Windows では `ImageStore::open` 自体が `Unimplemented` で拒否するため、展開器つきの create に到達する前に
-/// ストアを開けない（入口の拒否契約。OCI-7・3 OS 対応）。
+/// Windows では `ImageStore::open` 自体が Windows ホストの恒久拒否（`FailedPrecondition`。#4333・#4377）を
+/// 返すため、展開器つきの create に到達する前にストアを開けない（入口の拒否契約。OCI-7・3 OS 対応）。
 #[cfg(not(unix))]
 #[test]
-fn oci7_2377_image_store_open_is_unimplemented_on_non_unix() {
+fn oci7_2377_image_store_open_is_rejected_on_non_unix() {
     let base = TmpDir::new("windows");
     let root = base.0.join("images");
     std::fs::create_dir_all(root.join("blobs").join("sha256")).expect("images");
     let e = ImageStore::open(&root).expect_err("must fail");
     assert_eq!(
         e.code(),
-        fandhe_container_oci::error::OciErrorCode::Unimplemented
+        fandhe_container_oci::error::OciErrorCode::FailedPrecondition
     );
 }

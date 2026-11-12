@@ -149,6 +149,7 @@ fn oci7_oci1_2377_image_layers_returns_ordered_layers() {
     let store = ImageStore::open(root.path()).expect("open");
     let f = seed(&store, "l-1", Some(vec![TAR, TAR, TAR_GZIP]), None);
     let got = store.image_layers(&f.manifest).expect("layers");
+    let canonical_root = fs::canonicalize(root.path()).expect("canonicalize root");
     assert_eq!(got.manifest(), &f.manifest);
     assert_eq!(got.config(), &f.config);
     assert_eq!(got.layers().len(), 3);
@@ -157,7 +158,15 @@ fn oci7_oci1_2377_image_layers_returns_ordered_layers() {
     for (i, l) in got.layers().iter().enumerate() {
         assert_eq!(l.digest(), &f.layers[i]);
         assert_eq!(l.diff_id(), &f.diff_ids[i]);
-        assert_eq!(l.blob_path(), root.blob(&f.layers[i]));
+        // ストアは root を正規化して持つ（macOS の一時ディレクトリは `/var` -> `/private/var` の symlink）ため、
+        // 期待値も正規化した root から組み立てる。
+        assert_eq!(
+            l.blob_path(),
+            canonical_root
+                .join("blobs")
+                .join("sha256")
+                .join(hex(&f.layers[i]))
+        );
     }
     // 排他を保持して返さない（直後に別の lock が取れる）。
     drop(store.lock().expect("lock after image_layers"));

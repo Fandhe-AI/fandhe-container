@@ -60,7 +60,9 @@
 //! - rootful の起動（`start` が `UNIMPLEMENTED`）は対象外。healthcheck の配線は #2441。
 //! - 非 Linux は plugin 経由（#1869 の設計・TASK-125）。現状は他のコマンドと同じく fail-closed で失敗する。
 //! - 2 の起動オプション文書の読み取りは期限つきの作業スレッドで包まない（5 の単一スレッドの前提を保つため。healthcheck の exec 専用
-//!   helper と同じ残余。REPAIR-5）。全体の期限は委譲スコープの親が `--timeout` と猶予で縛る。
+//!   helper と同じ残余。REPAIR-5）。全体の期限は委譲スコープの親が `--timeout` と猶予（`PARENT_GRACE`）で縛る（前提と残余は呼び出し箇所のコメント）。
+//! - `--env KEY=VALUE` の値は CLI 自身の argv と委譲スコープの再実行（`systemd-run`）の argv に載り、同じホストの他プロセスから
+//!   `/proc/<pid>/cmdline` で読める。秘密は `--env` で渡さない（値を argv に載せない `--env-file` は未実装。SEC-1・#3805）。
 
 #[cfg(target_os = "linux")]
 pub(super) use linux::run_exec;
@@ -230,6 +232,11 @@ mod linux {
             )
         })?;
         // launch 時の env 上書きを状態記録の世代と照合して読む（欠落・世代不一致は exec しない。SUP-12・#2713）。
+        // 期限の前提(REPAIR-5・#3805): 作業スレッドでは包まない。後段の `run_command_with_pidfd_output_notify` が単一スレッドを
+        // 要求しスレッドを残せないため。open は nofollow・nonblock、読み取りは上限つきで、止まるのは状態ルートがハングした
+        // ネットワーク FS / FUSE 上の場合に限る。その最後の歯止めは委譲スコープの親の期限（`--timeout` + `PARENT_GRACE`。
+        // 超えると `kill_and_reap` の SIGKILL で、子は PDEATHSIG で連動する）。残余: D 状態で SIGKILL が届かない場合と、
+        // 目印の環境変数を手で与えて内側を直接走らせた場合は外側の期限が効かない（同じ uid の利用者自身のプロセスで権限は増えない）。
         let launch_env = launch_env_for(root, &record)?;
         let sink = make_sink(root)?;
 

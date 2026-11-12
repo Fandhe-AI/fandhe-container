@@ -89,6 +89,7 @@ CLI の `exec` コマンドが `run_command_with_pidfd` を呼ぶために必要
 - 渡すのは複製（close-on-exec）で、受け取った CLI は `OwnedFd` で持ち、関数を抜けると閉じる。コマンドへは core が `execveat` の前に `close_range` で閉じて渡らない。
 - fd の漏れ: クライアントは `recvmsg` の制御バッファを fd 4 本分に限り、溢れた分はカーネルが閉じる。想定外の本数はすべて drop で閉じる。拒否の応答に fd が添えられていても閉じる。
 - 新しい `unsafe` は `crates/supervisor/src/sys/linux.rs` の `sendmsg` / `recvmsg` の薄いラッパーだけ（coding-rust.md の事前承認の範囲）。cmsg の解析は純関数（`parse_rights`）に分け、添字アクセスをしない。構造体の大きさと定数は単体テストとコンパイル時の `assert!` で固定する。
+- `--env KEY=VALUE` の値の argv 露出（SEC-1・#3805）: 値は元の CLI の argv に載り、委譲スコープでの再実行でさらに `systemd-run` とその子の argv にも載る（`/proc/<pid>/cmdline` で見えるプロセスが 1 つ増える）。露出の範囲は元の CLI の argv と同じで、生存期間が重なるだけ（docker の `exec -e` と同じ性質）。秘密は `--env` で渡さない。再実行の argv だけを stdin や 0600 の一時ファイルに替えても、元の argv が同じ値を持つため露出は実質的に減らず、その恒久策は採らない。実質的な対策は値を argv に載せない入力経路（`create` と同じ `exec --env-file <path>`）で、機能追加にあたるため後続の候補とする（§5）。
 
 ## 5. 範囲外（未実装。REPAIR-3）
 
@@ -96,6 +97,7 @@ CLI の `exec` コマンドが `run_command_with_pidfd` を呼ぶために必要
 | ---- | ---- |
 | コマンドの標準入出力の受け渡し（現状 `/dev/null` 固定）・cwd・ユーザーの指定 | 未起票（`exec.rs` のモジュール doc「未実装」） |
 | supervisor 不在（孤児化・再起動後）の exec | #2688 |
+| `exec --env-file`（値を argv に載せない入力経路。SEC-1・#3805 の P2-3） | 未起票（後続 issue の候補） |
 | healthcheck の sink の配線 | #2441 で実装済み（exec 専用 helper が `FileAuditSink` を直接使い、pidfd の複製は helper の stdin へ execve 越しに渡す） |
 | 非 Linux の exec（plugin 経由） | #1869 の設計・TASK-125 |
 | CLI の exec での execve 越しの継承（supervisor が専用の exec プロセスを起動する方式） | 採らない（healthcheck は supervisor 自身が呼び出し元のため、この方式で #2441 が実装済み） |

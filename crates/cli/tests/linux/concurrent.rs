@@ -739,6 +739,8 @@ fn monitor(sh: &Shared) {
 }
 
 /// 種類ごとのワーカープール。共有カウンタから回の番号を取り、結果を `tx` へ送る。
+// 抑止の理由: 3 種のワーカーが共有する値（scope・共有状態・カウンタ・種類・人数・総数・送信口・操作）を
+// 呼び出し側ごとに束ねる構造体を作ると、各呼び出しの組み立てが増えるだけで読みやすくならない試験専用の補助のため。
 #[allow(clippy::too_many_arguments)]
 fn pool<'scope, 'env, F>(
     scope: &'scope thread::Scope<'scope, 'env>,
@@ -1116,9 +1118,11 @@ fn execute(
         images: images.to_path_buf(),
         iterations: p.iterations,
         gate_leases: p.pull_workers.min(p.iterations),
-        pull_ids: (0..p.iterations).map(|i| format!("gcp{pid}x{i}")).collect(),
+        pull_ids: (0..p.iterations)
+            .map(|i| format!("gcp{pid}x{i:04}"))
+            .collect(),
         start_ids: (0..if env.is_some() { p.iterations } else { 0 })
-            .map(|k| format!("gck{pid}x{k}"))
+            .map(|k| format!("gck{pid}x{k:04}"))
             .collect(),
         start: AtomicBool::new(false),
         abort: AtomicBool::new(false),

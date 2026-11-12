@@ -11,7 +11,7 @@
 - `guidance.code` は `external-build`（`build:`）と `docker-socket`（ソケット bind）の 2 種。案内文は固定の英語で、サービス名や build context を含まない。文言の正は `classify.rs` の `IncompatibleGuidance`
 - `--downgrade` が格下げできるのは `error-unsupported-yet` だけで、`build:`・ソケット bind は格下げできない（TASK-182.1）
 - 未実装（REPAIR-3）: TOML の書き出し（集計行に `toml_output:"unimplemented"` が出る）、`up` / `down` / `ps` / `logs`（TASK-155）、CLI の `pull`、ローカルからのイメージ取り込み（OCI レイアウト・tar）
-- 案内文 `external-build` は「push it to a registry or load it locally」と言うが、ローカル取り込みの経路は存在しない。現行で動く経路は registry 経由だけである
+- 案内文 `external-build` は registry への push だけを案内し、ローカル取り込みが未対応であることを明示する（#3615・REPAIR-3）。現行で動く経路は registry 経由だけである
 
 ## D-16 で変換しない理由
 
@@ -47,7 +47,6 @@ CI ランナー等の既存構成を移行する方針は、spec で未解決疑
 
 ## 残る作業・再評価条件
 
-- TOML の書き出し・`up`（TASK-155）・CLI の pull / ローカル取り込みが入ったら、手順の節を更新する
+- TOML の書き出し・`up`（TASK-155）・CLI の pull / ローカル取り込みが入ったら、手順の節と案内文 `external-build` の文言を同じ PR で更新する
 - オーナーが 13・15 を決めたら、判断記録を確定に移し、[architecture.md](../architecture.md) の項目を「確定済み設計判断」の表へ移す
 - 自前のビルド・push の扱い（13 の後半）は将来（Could）
-- `external-build` の案内文の "load it locally" と実装の食い違いは別途追跡する

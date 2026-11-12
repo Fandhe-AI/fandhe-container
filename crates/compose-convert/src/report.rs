@@ -8,7 +8,7 @@
 //!
 //! 未実装の範囲（REPAIR-3）: 文書を走査して [`KeyOccurrences`] を埋める走査器は `crate::key_scan`（#601）で、
 //! 本モジュールは集計の型と判定だけを持つ。`deploy` の変換と GPU 予約の実加算
-//! の結線も未実装。`--downgrade` の格下げ集計（`downgraded`・`error_free_with_downgrade`。TASK-182.1・#627）は別集計で、
+//! の結線は `convert/deploy.rs`（#3612）で済み。`--downgrade` の格下げ集計（`downgraded`・`error_free_with_downgrade`。TASK-182.1・#627）は別集計で、
 //! 本型の `error_free` の定義は変えない。
 //!
 //! 判定結果・blocker には値・環境変数名・サービス名を載せない（`environment` に資格情報が入りうるため）。

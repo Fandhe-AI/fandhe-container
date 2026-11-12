@@ -7,11 +7,17 @@
 //!
 //! long syntax のマッピング要素（ports・volumes・secrets・configs・tmpfs・devices）は
 //! [`crate::long_syntax`]（#865）の変換へ回し、表せない要素は要素ごと drop として記録する（結線は #599）。
-//! スタブの範囲（REPAIR-3）: `depends_on`・`ulimits`・`healthcheck`・`deploy` は本 issue で変換せず、
-//! [`ServiceConversion::unhandled`] に分類表のパスで載せる（呼び出し側が黙って通さないため。担当は後続）。
-//! `Float` は元の書き方を復元できないため文字列へ直さず drop する。
+//! `depends_on`・`ulimits`・`healthcheck` は `convert/nested.rs`、`deploy.resources` と GPU 予約は
+//! `convert/deploy.rs` が変換する（#3612・STACK-3・STACK-9）。
+//! `Float` は元の書き方を復元できないため文字列へ直さず drop する（例外: `deploy.resources.limits.cpus` の
+//! 有限の Float は数値の意味だけが重要なので文字列へ写す）。
+//! 制限（REPAIR-3）: `key_scan` が降りない段（`healthcheck`・`depends_on` の long 形・`ulimits`・`limits`）の
+//! 未知の子キーは `x-*` も含めて drop として数え、`error_free` を妨げる。
 
 use std::collections::BTreeMap;
+
+mod deploy;
+mod nested;
 
 use fandhe_container_stack::schema::{
     ComposeToml, Config, Network, Project, Secret, Service, Volume,
@@ -48,6 +54,13 @@ const P_SHM_SIZE: &str = "services.*.shm_size";
 const P_TMPFS: &str = "services.*.tmpfs";
 const P_DEVICES: &str = "services.*.devices";
 const P_PROFILES: &str = "services.*.profiles";
+const P_DEPENDS_ON: &str = "services.*.depends_on";
+const P_ULIMITS: &str = "services.*.ulimits";
+const P_HEALTHCHECK: &str = "services.*.healthcheck";
+const P_DEPLOY: &str = "services.*.deploy";
+const P_DEPLOY_RESOURCES: &str = "services.*.deploy.resources";
+const P_DEPLOY_LIMITS: &str = "services.*.deploy.resources.limits";
+const P_DEPLOY_RESERVATIONS: &str = "services.*.deploy.resources.reservations";
 const P_TOP_NETWORK: &str = "networks.*";
 const P_TOP_NETWORK_DRIVER: &str = "networks.*.driver";
 const P_TOP_NETWORK_EXTERNAL: &str = "networks.*.external";
@@ -87,6 +100,14 @@ pub const DROP_KEY_PATHS: &[&str] = &[
     P_TMPFS,
     P_DEVICES,
     P_PROFILES,
+    P_DEPENDS_ON,
+    P_ULIMITS,
+    P_HEALTHCHECK,
+    P_DEPLOY,
+    P_DEPLOY_RESOURCES,
+    P_DEPLOY_LIMITS,
+    P_DEPLOY_RESERVATIONS,
+    crate::gpu_reservation::DEVICES_KEY_PATH,
     P_TOP_NETWORK,
     P_TOP_NETWORK_DRIVER,
     P_TOP_NETWORK_EXTERNAL,
@@ -125,7 +146,7 @@ impl ValueDrops {
     /// `key_path` の drop を `n` 件まとめて足す（加算は飽和。`n == 0` は記録を作らない）。
     ///
     /// GPU 予約の `GpuReservationConversion::drop_count()` を `gpu_reservation::DEVICES_KEY_PATH` へ
-    /// 足す統合点（STACK-3・STACK-9）。`deploy` の変換と GPU 予約の実加算の結線は未実装（REPAIR-3）。
+    /// 足す統合点（STACK-3・STACK-9）。結線は `convert/deploy.rs`（#3612）。
     pub fn note_many(&mut self, key_path: &'static str, n: u64) {
         if n == 0 {
             return;
@@ -161,7 +182,8 @@ impl ValueDrops {
 pub struct ServiceConversion {
     /// 変換したサービス。定義がマッピングでなければ `None`。
     pub service: Option<Service>,
-    /// 本 issue では変換せず見送った convert キー（分類表のパス）。呼び出し側が黙って通さないこと。
+    /// 変換を見送った convert キー（分類表のパス）。現在は常に空で、将来見送るキーが出たときの記録先。
+    /// 呼び出し側が黙って通さないこと。
     pub unhandled: Vec<&'static str>,
 }
 
@@ -496,7 +518,7 @@ pub fn convert_service(service: &ComposeValue, drops: &mut ValueDrops) -> Servic
         };
     };
     let mut out = Service::default();
-    let mut unhandled = Vec::new();
+    let unhandled = Vec::new();
     for (key, v) in map.iter() {
         match key {
             "image" => out.image = convert_nonempty_string(v, P_IMAGE, drops),
@@ -523,10 +545,10 @@ pub fn convert_service(service: &ComposeValue, drops: &mut ValueDrops) -> Servic
             "networks" => out.networks = convert_service_networks(v, drops),
             "restart" => out.restart = convert_nonempty_string(v, P_RESTART, drops),
             "shm_size" => out.shm_size = convert_shm_size(v, drops),
-            "depends_on" => unhandled.push("services.*.depends_on"),
-            "ulimits" => unhandled.push("services.*.ulimits"),
-            "healthcheck" => unhandled.push("services.*.healthcheck"),
-            "deploy" => unhandled.push("services.*.deploy"),
+            "depends_on" => out.depends_on = nested::convert_depends_on(v, drops),
+            "ulimits" => out.ulimits = nested::convert_ulimits(v, drops),
+            "healthcheck" => out.healthcheck = nested::convert_healthcheck(v, drops),
+            "deploy" => out.deploy = deploy::convert_deploy(v, drops),
             _ => {}
         }
     }
@@ -685,6 +707,7 @@ mod tests {
     use super::*;
     use crate::classify::{KeyClass, classify_key_path};
     use crate::compose_convert::parse_compose_yaml;
+    use fandhe_container_stack::schema::DependsOnCondition;
 
     fn svc(yaml: &str) -> (Service, ValueDrops, Vec<&'static str>) {
         let doc = parse_compose_yaml(&format!("services:\n  s:\n{yaml}")).unwrap();
@@ -1089,22 +1112,21 @@ mod tests {
         assert_eq!(d.get(P_COMMAND), 1);
     }
 
-    /// STACK-3: 見送った convert キーは unhandled に載り TOML に出ない。
+    /// STACK-3: 4 キーは変換され unhandled は空。
     #[test]
-    fn stack3_unhandled_keys_are_reported() {
-        let (s, _, u) = svc(
+    fn stack3_nested_keys_are_converted_not_unhandled() {
+        let (s, d, u) = svc(
             "    depends_on: [a]\n    ulimits: {nofile: 1}\n    healthcheck: {test: x}\n    deploy: {}\n",
         );
+        assert!(u.is_empty());
+        assert!(d.is_empty());
+        assert_eq!(s.depends_on.get("a"), Some(&DependsOnCondition::Started));
+        assert_eq!(s.ulimits.get("nofile").map(String::as_str), Some("1"));
         assert_eq!(
-            u,
-            vec![
-                "services.*.depends_on",
-                "services.*.ulimits",
-                "services.*.healthcheck",
-                "services.*.deploy"
-            ]
+            s.healthcheck.unwrap().test,
+            Some(vec!["/bin/sh".into(), "-c".into(), "x".into()])
         );
-        assert_eq!(s, Service::default());
+        assert_eq!(s.deploy, None);
     }
 
     /// STACK-3・REPAIR-12: drop のパスはすべて分類表の Convert 行。
@@ -1150,9 +1172,9 @@ mod tests {
         assert_eq!(d.get(P_TOP_NETWORK_DRIVER), 1);
     }
 
-    /// STACK-3: 見送った convert キーはトップレベル変換でも drops に残る。
+    /// STACK-3: 変換できた 4 キーはトップレベル変換でも drops に残らない。
     #[test]
-    fn stack3_top_level_records_unhandled() {
+    fn stack3_top_level_converts_nested() {
         let doc = parse_compose_yaml(
             "services:\n  a:\n    image: x\n    depends_on: [b]\n    deploy:\n      resources:\n        limits: {cpus: '1'}\n",
         )
@@ -1160,9 +1182,19 @@ mod tests {
         let mut d = ValueDrops::new();
         let t = convert_top_level(&doc, &mut d);
         assert_eq!(t.services["a"].image.as_deref(), Some("x"));
-        assert_eq!(d.get("services.*.depends_on"), 1);
-        assert_eq!(d.get("services.*.deploy"), 1);
-        assert_eq!(d.total(), 2);
+        assert_eq!(
+            t.services["a"].depends_on.get("b"),
+            Some(&DependsOnCondition::Started)
+        );
+        let l = t.services["a"]
+            .deploy
+            .clone()
+            .unwrap()
+            .resources
+            .unwrap()
+            .limits;
+        assert_eq!(l.unwrap().cpus.as_deref(), Some("1"));
+        assert!(d.is_empty());
     }
 
     /// STACK-3: 空文字列の command / entrypoint は `Some([])`（既定の打ち消し）で、drop ではない。

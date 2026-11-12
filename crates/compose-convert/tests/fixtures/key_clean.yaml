@@ -1,5 +1,5 @@
 # STACK-3・TASK-151.6・#601 の合成フィクスチャ。convert と warning のキーだけで、
-# 現状 value_drops に載る depends_on・ulimits・healthcheck・deploy を含まない（error_free になる）。
+# convert と warning のキーだけで value_drops が空（error_free になる）。
 version: "3.9"
 name: clean-sample
 

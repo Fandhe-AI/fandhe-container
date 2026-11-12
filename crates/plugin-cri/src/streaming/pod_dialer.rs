@@ -20,7 +20,7 @@
 //! # 期限（REPAIR-5。すべて入口の締切 `now + timeout` から導く。cri の外側の `timeout` を内側の合計が超えない）
 //! 締切の末尾に `KILL_REAP_RESERVE`（helper の自然終了待ち + SIGKILL 後の回収待ち）を確保し、応答待ちはその手前までとする。
 //! helper の connect 期限はさらに `CONNECT_MARGIN` 手前に置く（helper 側の `TimedOut` が親側の待ちより先に届くように）。
-//! 定数はすべて暫定値で、オーナー確認（#4116）の対象。承認済みの値ではない。
+//! 定数はすべて暫定値のまま承認された（#4116 の項目 11・2026-11-12）。
 //!
 //! # 後始末と上限（REPAIR-5）
 //! helper は `DialHelper` の RAII ガードで必ず回収を試みる。`SIGKILL` の後も回収できない helper は `retained` に保持し、
@@ -36,7 +36,7 @@
 //! # 残余
 //! - 保持数の上限は dial の入口で検査するため、並行する dial が同時に回収に失敗すると一時的に上限を超えうる。入れる側は
 //!   断ると `Child` を落として追えない zombie を作るため断らない。超過は 8 + (`max_inflight_dials` − 1) で有界
-//!   （既定 32 なら 39、許容範囲の最大 256 なら 263。#4525）。値は暫定で #4116 の確認対象（承認済みではない）。
+//!   （既定 32 なら 39、許容範囲の最大 256 なら 263。#4525）。この超過は許容と判断済みで、入口の検査に並行数を含めない（#4116 の項目 11・2026-11-12）。
 //! - 掃除は dial の入口・出口と drop だけで、定期の掃除は採らない（常駐スレッドを増やさない。CORE-7〜9）。dial が来ない間は、
 //!   `SIGKILL` の後に遅れて終了した子が zombie のまま残りうる（件数は上記の上限内。pid の枠とわずかなカーネルメモリを占め、
 //!   次の dial か plugin-cri の終了で解消する）。drop の時点でまだ終了していない子は回収されない（#4525）。
@@ -68,15 +68,15 @@ use super::NodeLoopbackDialer;
 use crate::pod_holder::{PodNamespaceFds, ProductionPodHolder, open_supervisor_beside};
 use crate::telemetry::LineSink;
 
-/// 回収できず保持する helper の上限（暫定値。#4116 の確認待ち）。
+/// 回収できず保持する helper の上限（暫定値のまま承認。#4116 の項目 11）。
 pub const MAX_RETAINED_DIAL_HELPERS: usize = 8;
-/// 応答（または channel の EOF）の後に helper が自分で終わるのを待つ時間（暫定値。#4116）。
+/// 応答（または channel の EOF）の後に helper が自分で終わるのを待つ時間（暫定値のまま承認。#4116 の項目 11）。
 pub const HELPER_EXIT_WAIT: Duration = Duration::from_millis(200);
-/// `SIGKILL` の後に回収を待つ時間（暫定値。#4116）。
+/// `SIGKILL` の後に回収を待つ時間（暫定値のまま承認。#4116 の項目 11）。
 pub const HELPER_REAP_WAIT: Duration = Duration::from_millis(800);
 /// 締切の末尾に確保する後始末の予約（[`HELPER_EXIT_WAIT`] + [`HELPER_REAP_WAIT`]）。
 pub const KILL_REAP_RESERVE: Duration = Duration::from_millis(1000);
-/// helper の connect 期限を応答待ちより手前に置く余裕（暫定値。#4116）。
+/// helper の connect 期限を応答待ちより手前に置く余裕（暫定値のまま承認。#4116 の項目 11）。
 pub const CONNECT_MARGIN: Duration = Duration::from_millis(500);
 const REAP_POLL: Duration = Duration::from_millis(10);
 

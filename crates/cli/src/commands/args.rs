@@ -175,6 +175,9 @@ pub(super) const EXEC_MAX_TIMEOUT_SECS: u64 = 3600;
 pub(super) struct ExecArgs {
     pub(super) id: String,
     /// `--env KEY=VALUE`（その exec に対して明示した環境変数。指定順で後勝ち。ホスト環境は継承しない）。
+    ///
+    /// 注意（SEC-1・#3805）: 値は CLI の argv と委譲スコープ再実行の `systemd-run` の argv に載り、同じホストの他プロセスから
+    /// `/proc/<pid>/cmdline` で読める。秘密は渡さない。
     pub(super) env: Vec<EnvVar>,
     /// `--timeout <秒>`（準備から終了待ちまでの全体の期限。`1..=EXEC_MAX_TIMEOUT_SECS`）。
     pub(super) timeout: Duration,

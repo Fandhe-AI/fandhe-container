@@ -39,7 +39,7 @@
 //!
 //! stdout は 1 本なので、TOML 文書を複数連結すると読み戻せない。そのため書くのは「入力が 1 件で、その
 //! ファイルが対象」のときだけで、集計行の `toml_output` が結果の固定語彙（[`TomlOutputStatus`]）を持つ。
-//! 入力が 2 件以上は `skipped-multiple-files`、1 件で対象外は `skipped-not-error-free`（どちらも stdout は空・終了コード 0）。
+//! 入力が 0 件は `skipped-no-inputs`、2 件以上は `skipped-multiple-files`、1 件で対象外は `skipped-not-error-free`（どちらも stdout は空・終了コード 0）。
 //! 直列化・往復検証の失敗は stdout を空にして終了コード 1（fail-closed）。格下げしたキーはスキーマに行き先が無く
 //! 変換されないため TOML に現れない（TASK-182）。複数ファイルの一括書き出し（出力先の指定）は未実装（REPAIR-3）。
 
@@ -271,6 +271,7 @@ fn run_dir(dir: &Path, downgrade: Option<&DowngradeSet>) -> Outcome {
                 String::new(),
             ),
         },
+        (0, _) => (TomlOutputStatus::SkippedNoInputs, String::new()),
         (1, None) => (TomlOutputStatus::SkippedNotErrorFree, String::new()),
         _ => (TomlOutputStatus::SkippedMultipleFiles, String::new()),
     };
@@ -286,6 +287,7 @@ fn run_dir(dir: &Path, downgrade: Option<&DowngradeSet>) -> Outcome {
         status,
         TomlOutputStatus::Stdout
             | TomlOutputStatus::SkippedMultipleFiles
+            | TomlOutputStatus::SkippedNoInputs
             | TomlOutputStatus::SkippedNotErrorFree
     );
     Outcome {

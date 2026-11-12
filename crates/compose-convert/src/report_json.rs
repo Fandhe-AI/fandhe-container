@@ -219,6 +219,8 @@ pub enum TomlOutputStatus {
     Stdout,
     /// 入力が 2 件以上で、TOML は書かなかった。
     SkippedMultipleFiles,
+    /// 入力が 0 件（yml / yaml が無いディレクトリ等）で、TOML は書かなかった。
+    SkippedNoInputs,
     /// 入力 1 件だが対象（`error_free`）でなく、TOML は書かなかった。
     SkippedNotErrorFree,
     /// 直列化に失敗した（fail-closed。終了コード 1）。
@@ -235,6 +237,7 @@ impl TomlOutputStatus {
         match self {
             Self::Stdout => "stdout",
             Self::SkippedMultipleFiles => "skipped-multiple-files",
+            Self::SkippedNoInputs => "skipped-no-inputs",
             Self::SkippedNotErrorFree => "skipped-not-error-free",
             Self::SerializeFailed => "serialize-failed",
             Self::ReparseFailed => "reparse-failed",

@@ -153,6 +153,22 @@ fn stack3_3613_multiple_files_write_nothing() {
     );
 }
 
+/// 入力が 0 件（yml / yaml が無いディレクトリ）のときは `skipped-no-inputs`（複数件ではない）。
+#[test]
+fn stack3_3613_empty_directory_reports_no_inputs() {
+    let s = Scratch::new();
+    s.write("readme.txt", "not compose\n");
+    let (code, out, err) = run(&[], &s);
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(out, "");
+    assert!(err.contains("\"files\":0"), "{err}");
+    assert!(
+        err.contains("\"toml_output\":\"skipped-no-inputs\""),
+        "{err}"
+    );
+    assert!(!err.contains("skipped-multiple-files"), "{err}");
+}
+
 /// 対象外（build: とマーカー値つき env）は書かず、値は stderr に出ない（SEC-1）。
 #[test]
 fn stack3_3613_not_eligible_writes_nothing_and_leaks_nothing() {

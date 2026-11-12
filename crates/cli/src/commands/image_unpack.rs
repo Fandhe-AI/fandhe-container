@@ -48,7 +48,7 @@ use fandhe_container_core::oci_runtime::{
     ImageManifestDigest, ImageRootfsUnpacked, ImageRootfsUnpacker,
 };
 use fandhe_container_core::traits::TraitError;
-use fandhe_container_oci::error::OciError;
+use fandhe_container_oci::error::{OciError, OciErrorCode};
 use fandhe_container_oci::image_management::ImageStore;
 use fandhe_container_oci::layer::DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES;
 use fandhe_container_oci::layer::extract::{
@@ -87,12 +87,35 @@ impl<'a> StoreImageRootfsUnpacker<'a> {
         manifest: &ImageManifestDigest,
         rootfs: &Path,
     ) -> Result<ImageRootfsUnpacked, OciError> {
+        self.unpack_within(manifest, rootfs, UNPACK_DEADLINE)
+    }
+
+    /// `limit` を「展開全体の期限」として、blob の検証から展開までを通して課す（REPAIR-5）。
+    ///
+    /// 期限は開始時に一度だけ絶対時刻（`Instant`）で作り、各 blob の検証の前後で確かめ、
+    /// 検証後に作り直さず同じ値を `ExtractBudget` へ渡す。検証（SHA-256 の全読み）も期限に含まれる。
+    fn unpack_within(
+        &self,
+        manifest: &ImageManifestDigest,
+        rootfs: &Path,
+        limit: Duration,
+    ) -> Result<ImageRootfsUnpacked, OciError> {
+        let deadline = Instant::now().checked_add(limit);
+        let check = || match deadline {
+            Some(d) if Instant::now() >= d => Err(OciError::new(
+                OciErrorCode::Timeout,
+                "image unpack deadline exceeded",
+            )),
+            _ => Ok(()),
+        };
+        check()?;
         let digest = Digest::parse(manifest.as_str())?;
         let layers = self.store.image_layers(&digest)?;
         // 展開の前に全レイヤーを開いて検証する（合計サイズの上限は I/O より前に課す）。
         let mut total: u64 = 0;
         let mut verified = Vec::with_capacity(layers.layers().len());
         for layer in layers.layers() {
+            check()?;
             // 残りの許容サイズを渡し、上限超過の blob は読む前に拒否する。
             let remaining = MAX_IMAGE_BYTES.saturating_sub(total);
             let blob = self
@@ -100,6 +123,7 @@ impl<'a> StoreImageRootfsUnpacker<'a> {
                 .open_verified_layer_bounded(&self.recorder, layer, remaining)?;
             total = total.saturating_add(blob.size());
             verified.push(blob);
+            check()?;
         }
         let root = ExtractRoot::open_proc_fd_link(rootfs)?;
         let image_layers: Vec<ImageLayer<'_>> = verified
@@ -108,7 +132,7 @@ impl<'a> StoreImageRootfsUnpacker<'a> {
             .map(|(blob, l)| ImageLayer::new(blob, l.media_type(), l.diff_id()))
             .collect();
         let mut budget = ExtractBudget::new();
-        if let Some(deadline) = Instant::now().checked_add(UNPACK_DEADLINE) {
+        if let Some(deadline) = deadline {
             budget = budget.with_deadline(deadline);
         }
         let extracted = extract_image_layers_bounded_in(

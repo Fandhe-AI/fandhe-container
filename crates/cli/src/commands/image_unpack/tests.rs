@@ -307,6 +307,28 @@ mod linux {
             .expect("within budget");
     }
 
+    /// 期限は blob の検証より前から数える。期限 0 では検証（blob の open）に進まず Timeout（REPAIR-5）。
+    #[test]
+    fn repair5_2377_deadline_covers_blob_verification() {
+        let base = TmpDir::new("deadline");
+        let images = base.images();
+        let seeded = seed_image(
+            &images,
+            "p8",
+            &[tar_of(&[Entry::File("a", b"a")])],
+            None,
+            true,
+        );
+        let rec = OpRecorder::new();
+        let unpacker = StoreImageRootfsUnpacker::new(&images, &rec);
+        let manifest = ImageManifestDigest::new(seeded.manifest.as_str()).expect("manifest");
+        let e = unpacker
+            .unpack_within(&manifest, &base.0, Duration::ZERO)
+            .expect_err("expired");
+        assert_eq!(e.code(), OciErrorCode::Timeout);
+        assert_eq!(e.message(), "image unpack deadline exceeded");
+    }
+
     /// `/proc/self/fd/N` 以外の展開先は InvalidArgument（パスで開き直さない）。
     #[test]
     fn sec1_2377_unpack_rejects_non_fd_destination() {

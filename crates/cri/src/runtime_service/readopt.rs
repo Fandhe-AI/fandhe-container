@@ -4,7 +4,8 @@
 //! 役割: plugin-cri の再起動で失われた `SandboxRegistry` を、記録ストア（`with_record_store` で注入）の
 //! sandbox 記録から復元する。呼び出し元は plugin-cri の `serve` が受付を始める前に 1 回だけ呼ぶ想定
 //! （本番の配線と stderr への要約行の出力は plugin-cri の `serve`。R9 #2938。実装済み）。呼び先は [`RecordStore::list`] と `record` の
-//! 厳密な復号だけで、実行層・`PodNetworkProvider` は呼ばない。
+//! 厳密な復号、および保持役 provider の読み取り専用の観測（素性を持つ記録 1 件につき 1 回。R11）だけで、
+//! 実行層・`PodNetworkProvider` は呼ばない。
 //!
 //! 契約:
 //! - **副作用なし**: 記録のファイルを書き換えず、消さない（壊れた記録も残す。手動回収は R10）。次の Stop・Remove が
@@ -27,7 +28,22 @@
 //! 破棄せず回収待ちへ倒す（fail-closed）。`pending=1` だけの記録は保持役の起動だけが理由で、保持役は plugin-cri の
 //! 終了（stdin の EOF）で消えるため、ネットワーク資源の所有とは数えない。数えると本番（pod network provider 未注入）で
 //! Stop・Remove が `FAILED_PRECONDITION` から抜けられなくなる（H6・#2877）。どちらも `pending_unresolved` には数える。
-//! 再採用した記録の pid から namespace のパスを作らず、シグナルも送らない（SEC-5・#2776。v1 の記録に pid の鍵は無い）。
+//! 再採用した記録の pid から namespace のパスを作らず、シグナルも送らない（SEC-5・#2776）。
+//!
+//! # 保持役の素性（R11 #2940。CRI-2・SEC-5・SEC-1）
+//!
+//! sandbox 記録 v2 は保持役の素性（pid・starttime・user / ipc / net の dev:ino）を `holder=` 行に持つ。再採用は素性を
+//! `SandboxRecord::recorded_holder` へ戻すが、`pod_holder` は常に `None` のまま、`holder_owned`・`holder_pending` も偽、
+//! 状態は `NotReady` で、値は素性の観測結果で変えない。素性は診断と「終了済み」の確認にだけ使う。
+//! - 観測は `PodNamespaceHolderProvider::observe_process_start`（`/proc/<pid>/stat` を読むだけ。pidfd・シグナル・回収・
+//!   `/proc/<pid>/ns/*` の参照をしない）を、素性を持つ記録 1 件につき 1 回、registry のロックの外で呼ぶ。件数は
+//!   `max_sandboxes` で有界で、全体期限の再確認の前に行う。provider 未注入・観測の失敗は `holder_unobserved`。
+//! - 分類（[`super::holder_identity::classify_recorded_holder`]）: 不在は `holder_gone`、starttime の不一致は
+//!   `holder_pid_reused`（どちらも記録の保持役は終了済み）、一致は `holder_start_time_match`（終了を確認できない）。
+//! - 残余: boot id を記録しないので、`holder_start_time_match` は再起動をまたぐ偶然の一致を否定できず、Ready・
+//!   パス・シグナルの根拠にしない。保持役を再起動後も生かし pidfd で照合して再採用する案（要確認事項 1 の (a)）は
+//!   採らない（オーナー判断待ち）。`pending=1` の記録は spawn の前に書かれるため素性を持たず、素性と `pod_netns` による
+//!   pending の分岐の精緻化は R12 #2941 に残す（上の表は変えない）。
 //!
 //! # コンテナ記録の再採用と core の状態との照合（R7 #2936。CRI-1・OCI-7・CORE-1）
 //!
@@ -71,8 +87,8 @@
 //! 呼び出し順（R9 #2938 が plugin-cri の `serve` で受付の開始前に配線済み）: `readopt_sandboxes` → `readopt_containers` → `release_stale_creates`
 //! → 孤児 bundle の回収。解放に失敗した `stale_create` の記録が残る間はその bundle が孤児扱いにならないため、この順が要る。
 //!
-//! 未実装（REPAIR-3）: 保持役の素性による pending の解決は R11 #2940、`pod_netns`・provider 識別子の永続と再起動後の
-//! `tear_down` は R12 #2941、手動回収の手順は R10 #2939。
+//! 未実装（REPAIR-3）: 素性と `pod_netns` による pending の精緻化、`pod_netns`・provider 識別子の永続と再起動後の
+//! `tear_down` は R12 #2941（手動回収の手順は R10 #2939 で整備済み）。
 //! `pod_netns` に載る報告済み IP（`PodSandboxStatus.network`。#2873）も記録に無いため再起動で失われ、再採用後の network は空。
 
 use std::collections::HashSet;
@@ -82,6 +98,9 @@ use std::time::{Duration, Instant};
 use tonic::Code;
 
 use super::container::{ContainerRecord, ContainerState, ExitReport, apply_exit};
+use super::holder_identity::{
+    RecordedHolderIdentity, RecordedHolderStatus, classify_recorded_holder,
+};
 use super::record::{ContainerRecordData, SandboxRecordData};
 use super::{
     CriRuntimeService, InFlightKind, ListBudget, ListLimits, ListedRecord, RecordId, RecordKind,
@@ -132,6 +151,16 @@ pub struct SandboxReadoption {
     pub adopted: usize,
     /// 作成途中・pod network 設定中の印があり、回収待ち（`network_owned=true`）へ倒した件数。
     pub pending_unresolved: usize,
+    /// 保持役の素性（`holder=`）を持つ記録の件数（R11 #2940）。以下の 4 件の合計に等しい。
+    pub holder_recorded: usize,
+    /// 素性の pid が `/proc` に無い（記録の保持役は終了済み）件数。
+    pub holder_gone: usize,
+    /// 同じ pid に starttime の違うプロセスが居る（pid の再利用。記録の保持役は終了済み）件数。
+    pub holder_pid_reused: usize,
+    /// starttime が一致した（終了を確認できない。Ready・パス・シグナルの根拠にしない）件数。
+    pub holder_start_time_match: usize,
+    /// 観測できなかった（provider 未注入・観測の失敗）件数。
+    pub holder_unobserved: usize,
     /// 登録しなかった壊れた記録の内訳。
     pub broken: BrokenRecordCounts,
 }
@@ -140,7 +169,7 @@ impl SandboxReadoption {
     /// 固定語彙の 1 行要約（ID・パス・config を含めない）。stderr への出力は plugin-cri の `serve`（R9 #2938）が行う。
     pub fn summary_line(&self) -> String {
         format!(
-            "cri record readoption: kind=sandbox adopted={} pending_unresolved={} broken={} malformed={} not_regular_file={} too_long={} unreadable={} unrecognized={} duplicate_metadata={}",
+            "cri record readoption: kind=sandbox adopted={} pending_unresolved={} broken={} malformed={} not_regular_file={} too_long={} unreadable={} unrecognized={} duplicate_metadata={} holder_recorded={} holder_gone={} holder_pid_reused={} holder_start_time_match={} holder_unobserved={}",
             self.adopted,
             self.pending_unresolved,
             self.broken.total(),
@@ -150,6 +179,11 @@ impl SandboxReadoption {
             self.broken.unreadable,
             self.broken.unrecognized,
             self.broken.duplicate_metadata,
+            self.holder_recorded,
+            self.holder_gone,
+            self.holder_pid_reused,
+            self.holder_start_time_match,
+            self.holder_unobserved,
         )
     }
 }
@@ -423,8 +457,10 @@ impl CriRuntimeService {
                 network_owned: data.network_owned || data.network_pending,
                 network_teardown: false,
                 pod_netns: None,
-                // 保持役は plugin-cri と同じ寿命で、再起動をまたがない（#2871。素性の永続化は R11〔#2940〕）。
+                // 保持役は plugin-cri と同じ寿命で、再起動をまたがない（#2871）。素性は診断用に戻すだけで、
+                // `pod_holder`（パスの根拠）は作らない（R11・#2940・SEC-5）。
                 pod_holder: None,
+                recorded_holder: data.holder,
                 holder_pending: false,
                 holder_owned: false,
                 holder_release: false,
@@ -437,6 +473,10 @@ impl CriRuntimeService {
             }
             if unresolved {
                 result.pending_unresolved += 1;
+            }
+            if let Some(recorded) = record.recorded_holder {
+                // registry のロックを持たずに、読み取り専用の観測を 1 件 1 回だけ行う（R11・#2940）。
+                self.count_recorded_holder(&mut result, &recorded);
             }
             accepted.push((id.as_str().to_owned(), record));
             self.record_load(Code::Ok, one);
@@ -472,6 +512,26 @@ impl CriRuntimeService {
             registry.records.extend(accepted);
         }
         Ok(result)
+    }
+
+    /// 記録の保持役を provider に観測させて分類し、件数へ数える（R11 #2940）。登録する値は変えない。
+    /// provider 未注入・観測の失敗は `holder_unobserved`。
+    fn count_recorded_holder(
+        &self,
+        result: &mut SandboxReadoption,
+        recorded: &RecordedHolderIdentity,
+    ) {
+        let observation = self
+            .pod_holder
+            .as_ref()
+            .and_then(|p| p.observe_process_start(recorded.pid()).ok());
+        result.holder_recorded += 1;
+        match classify_recorded_holder(recorded.start_time_ticks(), observation) {
+            RecordedHolderStatus::Gone => result.holder_gone += 1,
+            RecordedHolderStatus::PidReused => result.holder_pid_reused += 1,
+            RecordedHolderStatus::StartTimeMatches => result.holder_start_time_match += 1,
+            RecordedHolderStatus::Unobserved => result.holder_unobserved += 1,
+        }
     }
 
     /// 記録ストアのコンテナ記録を registry へ戻し、core の状態で照合する（R7 #2936。CRI-1・OCI-7・CORE-1）。
@@ -835,6 +895,7 @@ mod tests {
             pending: false,
             network_owned: false,
             network_pending: false,
+            holder: None,
         }
     }
 
@@ -1188,9 +1249,182 @@ mod tests {
         let line = r.summary_line();
         assert_eq!(
             line,
-            "cri record readoption: kind=sandbox adopted=1 pending_unresolved=0 broken=1 malformed=0 not_regular_file=0 too_long=0 unreadable=0 unrecognized=1 duplicate_metadata=0"
+            "cri record readoption: kind=sandbox adopted=1 pending_unresolved=0 broken=1 malformed=0 not_regular_file=0 too_long=0 unreadable=0 unrecognized=1 duplicate_metadata=0 holder_recorded=0 holder_gone=0 holder_pid_reused=0 holder_start_time_match=0 holder_unobserved=0"
         );
         assert!(!line.contains(&id('a')));
+    }
+    // ---- 保持役の素性（R11 #2940。CRI-2・SEC-5・SEC-1） ----
+
+    use super::super::holder_identity::RecordedHolderIdentity;
+    use crate::adapter::{
+        PodHolder, PodHolderLiveness, PodHolderRequest, PodNamespaceHolderProvider,
+        ProcessStartObservation,
+    };
+    use crate::error::CriErrorCode;
+    use crate::runtime::v1 as v1_rt;
+
+    const HOLDER_VALUE: &str = "4242,123456,4:4026531837,4:4026531839,4:4026531840";
+
+    /// 観測だけに応答する偽の provider。spawn・release・liveness が呼ばれた回数と、観測した pid を残す。
+    #[derive(Default)]
+    struct ObsHolder {
+        script: Mutex<std::collections::HashMap<u32, ProcessStartObservation>>,
+        observed: Mutex<Vec<u32>>,
+        other_calls: Mutex<usize>,
+    }
+
+    impl PodNamespaceHolderProvider for ObsHolder {
+        fn spawn(&self, _: &PodHolderRequest<'_>) -> Result<PodHolder, CriError> {
+            *self.other_calls.lock().unwrap() += 1;
+            Err(CriError::unavailable("not used"))
+        }
+        fn release(&self, _: &str, _: Duration) -> Result<(), CriError> {
+            *self.other_calls.lock().unwrap() += 1;
+            Ok(())
+        }
+        fn liveness(&self, _: &str) -> Result<PodHolderLiveness, CriError> {
+            *self.other_calls.lock().unwrap() += 1;
+            Ok(PodHolderLiveness::Alive)
+        }
+        fn observe_process_start(&self, pid: u32) -> Result<ProcessStartObservation, CriError> {
+            self.observed.lock().unwrap().push(pid);
+            self.script
+                .lock()
+                .unwrap()
+                .get(&pid)
+                .copied()
+                .ok_or_else(|| CriError::unavailable("not observable"))
+        }
+    }
+
+    fn data_with_holder(c: char, name: &str, pid: u32, start: u64) -> SandboxRecordData {
+        let mut d = data(c, name);
+        d.holder = RecordedHolderIdentity::parse_value(&format!(
+            "{pid},{start},4:4026531837,4:4026531839,4:4026531840"
+        ))
+        .unwrap();
+        assert!(d.holder.is_some());
+        d
+    }
+
+    /// AC1・#2940: 再採用した記録の素性の pid から、namespace のパスを作らない（生きている自プロセスの pid でも）。
+    #[test]
+    fn cri2_sec5_2940_readopted_holder_pid_never_builds_namespace_paths() {
+        let live_pid = std::process::id();
+        let d = data_with_holder('a', "p", live_pid, 123456);
+        let holder = Arc::new(ObsHolder::default());
+        holder.script.lock().unwrap().insert(
+            live_pid,
+            ProcessStartObservation::Present {
+                start_time_ticks: 123456,
+            },
+        );
+        let s = svc(Fake::with(vec![ok(&d)], 0), Arc::default()).with_pod_holder(holder.clone());
+        let r = s.readopt_sandboxes(ListBudget::default()).unwrap();
+        assert_eq!(r.holder_start_time_match, 1);
+        {
+            let mut reg = s.registry.lock().unwrap();
+            let rec = reg.records.get_mut(&id('a')).unwrap();
+            assert!(rec.pod_holder.is_none());
+            assert!(!rec.holder_owned);
+            assert!(!rec.holder_pending);
+            assert_eq!(rec.state, SandboxState::NotReady);
+            assert_eq!(rec.recorded_holder.map(|h| h.pid()), Some(live_pid));
+            // 状態を強制的に Ready にしても、記録の pid からパスは作られない。
+            rec.state = SandboxState::Ready;
+        }
+        let req = v1_rt::CreateContainerRequest {
+            pod_sandbox_id: id('a'),
+            config: Some(v1_rt::ContainerConfig {
+                metadata: Some(v1_rt::ContainerMetadata {
+                    name: "c".into(),
+                    attempt: 0,
+                }),
+                image: Some(v1_rt::ImageSpec {
+                    image: "busybox:1.36".into(),
+                    ..Default::default()
+                }),
+                command: vec!["/bin/sh".into()],
+                ..Default::default()
+            }),
+            sandbox_config: None,
+        };
+        let err = s.reserve_container(req.clone(), true).err().unwrap();
+        assert_eq!(err.code(), CriErrorCode::FailedPrecondition);
+        assert_eq!(err.message(), "sandbox holder is unavailable");
+        assert_eq!(s.container_count(), 0);
+        // provider 未注入の構成でも、記録の pid からパスは作られない。
+        let s2 = svc(Fake::with(vec![ok(&d)], 0), Arc::default());
+        let r2 = s2.readopt_sandboxes(ListBudget::default()).unwrap();
+        assert_eq!((r2.holder_recorded, r2.holder_unobserved), (1, 1));
+        s2.registry
+            .lock()
+            .unwrap()
+            .records
+            .get_mut(&id('a'))
+            .unwrap()
+            .state = SandboxState::Ready;
+        let reserved = s2.reserve_container(req, true).unwrap();
+        assert!(reserved.provider_pod_namespaces.is_none());
+        // 観測以外の provider 呼び出し（spawn・release・liveness）はしない。
+        assert_eq!(*holder.other_calls.lock().unwrap(), 0);
+        assert_eq!(*holder.observed.lock().unwrap(), vec![live_pid]);
+    }
+
+    /// AC2・#2940: 計数と要約行（Gone / PidReused / 素性なし）を具体値で固定する。
+    #[test]
+    fn cri2_sec5_2940_readopt_counts_and_summary_line() {
+        let gone = data_with_holder('a', "a", 4242, 123456);
+        let reused = data_with_holder('b', "b", 4343, 123456);
+        let none = data('c', "c");
+        let holder = Arc::new(ObsHolder::default());
+        {
+            let mut sc = holder.script.lock().unwrap();
+            sc.insert(4242, ProcessStartObservation::Absent);
+            sc.insert(
+                4343,
+                ProcessStartObservation::Present {
+                    start_time_ticks: 987654,
+                },
+            );
+        }
+        let s = svc(
+            Fake::with(vec![ok(&gone), ok(&reused), ok(&none)], 0),
+            Arc::default(),
+        )
+        .with_pod_holder(holder.clone());
+        let r = s.readopt_sandboxes(ListBudget::default()).unwrap();
+        assert_eq!(r.adopted, 3);
+        assert_eq!(
+            r.summary_line(),
+            "cri record readoption: kind=sandbox adopted=3 pending_unresolved=0 broken=0 malformed=0 not_regular_file=0 too_long=0 unreadable=0 unrecognized=0 duplicate_metadata=0 holder_recorded=2 holder_gone=1 holder_pid_reused=1 holder_start_time_match=0 holder_unobserved=0"
+        );
+        // 登録する値は観測結果で変わらない。
+        assert!(
+            s.registry
+                .lock()
+                .unwrap()
+                .records
+                .values()
+                .all(|r| r.state == SandboxState::NotReady && r.pod_holder.is_none())
+        );
+        // 観測は素性を持つ記録 1 件につき 1 回（ID の昇順）。
+        assert_eq!(*holder.observed.lock().unwrap(), vec![4242, 4343]);
+    }
+
+    /// #2940: 観測の失敗は `holder_unobserved`。素性の値は読み書きの往復で変わらない。
+    #[test]
+    fn cri2_sec5_2940_observe_failure_is_unobserved() {
+        let d = data_with_holder('a', "a", 4242, 123456);
+        let s = svc(Fake::with(vec![ok(&d)], 0), Arc::default())
+            .with_pod_holder(Arc::new(ObsHolder::default()));
+        let r = s.readopt_sandboxes(ListBudget::default()).unwrap();
+        assert_eq!((r.holder_recorded, r.holder_unobserved), (1, 1));
+        let got = s.registry.lock().unwrap().records[&id('a')].recorded_holder;
+        assert_eq!(
+            RecordedHolderIdentity::encode_value(got.as_ref()),
+            HOLDER_VALUE
+        );
     }
     // ---- コンテナ記録の再採用と core の状態との照合（R7 #2936。CRI-1・OCI-7・CORE-1） ----
 

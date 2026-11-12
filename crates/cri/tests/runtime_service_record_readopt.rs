@@ -430,3 +430,141 @@ async fn cri2_4413_readopt_status_linux_unspecified_has_no_options() {
     assert!(rec_files(&root).is_empty());
     fs::remove_dir_all(&root).unwrap();
 }
+// ---- 保持役の素性の記録と再採用時の扱い（R11 #2940。CRI-2・SEC-5・SEC-1） ----
+
+use std::time::Duration;
+
+use fandhe_container_cri::adapter::{
+    HolderIdentity, NamespaceIdentity, PodHolder, PodHolderLiveness, PodHolderRequest,
+    PodNamespaceHolderProvider, ProcessStartObservation,
+};
+
+const HOLDER_LINE: &str = "holder=4242,123456,4:4026531837,4:4026531839,4:4026531840\n";
+
+fn ns(ino: u64) -> NamespaceIdentity {
+    NamespaceIdentity { dev: 4, ino }
+}
+
+/// 起動した保持役の素性（pid=4242・starttime=123456）を返し、解放・死活・観測の呼び出しを数える偽の provider。
+struct IdentityHolder {
+    with_identity: bool,
+    observation: ProcessStartObservation,
+    spawns: Mutex<usize>,
+    releases: Mutex<usize>,
+    liveness: Mutex<usize>,
+    observed: Mutex<Vec<u32>>,
+}
+
+impl IdentityHolder {
+    fn new(with_identity: bool, observation: ProcessStartObservation) -> Arc<Self> {
+        Arc::new(Self {
+            with_identity,
+            observation,
+            spawns: Mutex::new(0),
+            releases: Mutex::new(0),
+            liveness: Mutex::new(0),
+            observed: Mutex::new(Vec::new()),
+        })
+    }
+}
+
+impl PodNamespaceHolderProvider for IdentityHolder {
+    fn spawn(&self, _req: &PodHolderRequest<'_>) -> Result<PodHolder, CriError> {
+        *self.spawns.lock().unwrap() += 1;
+        if self.with_identity {
+            let id =
+                HolderIdentity::new(4242, 123456, ns(4026531837), ns(4026531839), ns(4026531840))?;
+            Ok(PodHolder::from_identity(id))
+        } else {
+            Ok(PodHolder::new(4242.try_into().unwrap()))
+        }
+    }
+    fn release(&self, _id: &str, _t: Duration) -> Result<(), CriError> {
+        *self.releases.lock().unwrap() += 1;
+        Ok(())
+    }
+    fn liveness(&self, _id: &str) -> Result<PodHolderLiveness, CriError> {
+        *self.liveness.lock().unwrap() += 1;
+        Ok(PodHolderLiveness::Alive)
+    }
+    fn observe_process_start(&self, pid: u32) -> Result<ProcessStartObservation, CriError> {
+        self.observed.lock().unwrap().push(pid);
+        Ok(self.observation)
+    }
+}
+
+fn read_rec(root: &Path, id: &str) -> String {
+    String::from_utf8_lossy(&fs::read(sandboxes_dir(root).join(format!("{id}.rec"))).unwrap())
+        .into_owned()
+}
+
+/// #2940: spawn が返した素性が確定版の記録に `holder=` として書かれ、素性なしの保持役は `holder=-` になる。
+#[tokio::test]
+async fn cri2_sec5_2940_spawn_identity_is_written_to_the_record() {
+    for (with_identity, expected) in [(true, HOLDER_LINE), (false, "holder=-\n")] {
+        let root = temp_root("holder-write");
+        let provider = IdentityHolder::new(with_identity, ProcessStartObservation::Absent);
+        let svc = service(&root).with_pod_holder(provider.clone());
+        let id = run(&svc, "pod").await.unwrap();
+        assert_eq!(*provider.spawns.lock().unwrap(), 1);
+        let text = read_rec(&root, &id);
+        assert!(
+            text.starts_with("fandhe-cri-sandbox-record v2\n"),
+            "{text:?}"
+        );
+        assert!(text.contains(expected), "{text:?}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+}
+
+/// #2940・AC2: 再起動後に pid が別のプロセスに再利用されていても（starttime の不一致）、シグナルも解放も spawn も
+/// せず、記録を NotReady で戻す。観測は記録の pid に対して 1 回だけで、Stop・Remove は成功し、記録の `holder=` は
+/// Stop の後も残り Remove で消える。
+#[tokio::test]
+async fn cri2_sec5_2940_readopt_with_reused_pid_never_signals_or_releases() {
+    let root = temp_root("holder-reused");
+    let first = IdentityHolder::new(true, ProcessStartObservation::Absent);
+    let a = service(&root).with_pod_holder(first.clone());
+    let id = run(&a, "pod").await.unwrap();
+    drop(a);
+
+    let second = IdentityHolder::new(
+        true,
+        ProcessStartObservation::Present {
+            start_time_ticks: 987654,
+        },
+    );
+    let b = service(&root).with_pod_holder(second.clone());
+    let r = b.readopt_sandboxes(ListBudget::default()).unwrap();
+    assert_eq!(
+        (r.adopted, r.holder_recorded, r.holder_pid_reused),
+        (1, 1, 1)
+    );
+    assert_eq!(
+        (
+            r.holder_gone,
+            r.holder_start_time_match,
+            r.holder_unobserved
+        ),
+        (0, 0, 0)
+    );
+    assert!(
+        r.summary_line()
+            .ends_with("holder_recorded=1 holder_gone=0 holder_pid_reused=1 holder_start_time_match=0 holder_unobserved=0")
+    );
+    assert_eq!(
+        status(&b, &id).await.state,
+        PodSandboxState::SandboxNotready as i32
+    );
+
+    stop(&b, &id).await.unwrap();
+    assert!(read_rec(&root, &id).contains(HOLDER_LINE));
+    remove(&b, &id).await.unwrap();
+    assert!(rec_files(&root).is_empty());
+
+    assert_eq!(*second.spawns.lock().unwrap(), 0);
+    assert_eq!(*second.releases.lock().unwrap(), 0);
+    assert_eq!(*second.liveness.lock().unwrap(), 0);
+    assert_eq!(*second.observed.lock().unwrap(), vec![4242]);
+    fs::remove_dir_all(&root).unwrap();
+}

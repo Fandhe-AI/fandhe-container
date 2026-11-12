@@ -30,8 +30,11 @@
 //! # 未実装・簡易実装（REPAIR-3）
 //! `open_pod_namespaces` の利用側（`PodNetnsDialer`）は実装済み（#4484）で、PortForward への結線は #4486 で済み（`ProductionPortForward::pod_network`）。
 //! 保持役の pid から `PodNamespacePaths` を作って bundle へ渡す配線（H5・#2876）は配線済み（user・ipc の join）。保持役の
-//! netns の bundle への受け渡しは H8（#2878）で実装済み。pod ネットワークの本番 provider（rootless の pasta）は H10（#2879）で未実装。素性（pid・
-//! starttime・ns）の永続化と再起動後の再採用は R11（#2940）。rootful（uid 0）は `UNIMPLEMENTED`（#2241・#2442 の判断まで）。
+//! netns の bundle への受け渡しは H8（#2878）で実装済み。pod ネットワークの本番 provider（rootless の pasta）は H10（#2879）で未実装。
+//! 素性（pid・starttime・user / ipc / net の dev:ino）は READY の検証後に集めて `PodHolder::from_identity` で返し（R11・#2940。
+//! starttime を読めなければ fail-closed で子を回収して失敗）、記録ファイルへの書き込みは cri が行う。再起動後に再採用した記録の
+//! 保持役は `observe_process_start`（`/proc/<pid>/stat` の読み取りだけ）で終了済みを確かめるに留め、再採用はしない（要確認事項 1 の
+//! (a) は未採用）。rootful（uid 0）は `UNIMPLEMENTED`（#2241・#2442 の判断まで）。
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -44,9 +47,12 @@ use std::time::{Duration, Instant};
 
 use fandhe_container_core::traits::types::{ErrorCode, TraitError};
 use fandhe_container_cri::adapter::{
-    PodHolder, PodHolderLiveness, PodHolderRequest, PodNamespaceHolderProvider,
+    HolderIdentity, NamespaceIdentity, PodHolder, PodHolderLiveness, PodHolderRequest,
+    PodNamespaceHolderProvider, ProcessStartObservation,
 };
 use fandhe_container_cri::error::CriError;
+use fandhe_container_net::dns_helper::identity::read_start_time;
+use fandhe_container_net::error::NetErrorCode;
 use fandhe_container_supervisor::pod_holder::{
     NsId, POD_HOLDER_SUBCOMMAND, PodHolderReady, READY_TIMEOUT, holder_executable_beside,
     read_ready,
@@ -74,6 +80,8 @@ pub(crate) const MSG_NONBLOCK_UNSUPPORTED: &str =
 pub(crate) const MSG_UNRESOLVED_EXE: &str = "cannot resolve the supervisor executable path";
 const MSG_DUPLICATE: &str = "a pod holder already exists for this sandbox";
 const MSG_PID_MISMATCH: &str = "the pod holder reported an unexpected process";
+const MSG_IDENTITY_UNAVAILABLE: &str = "the pod holder identity cannot be recorded";
+const MSG_OBSERVE_FAILED: &str = "failed to observe the recorded pod holder";
 const MSG_NS_MISMATCH: &str = "the pod holder namespaces do not match the report";
 const MSG_SPAWN_FAILED: &str = "failed to start the pod holder";
 const MSG_POISONED: &str = "pod holder table is unavailable";
@@ -101,6 +109,9 @@ enum ExeSource {
         verify_namespaces: bool,
     },
 }
+
+/// 起動と READY の検証を終えた保持役（子・stdin・検証済みの READY・cri へ返す [`PodHolder`]）。
+type StartedHolder = (Child, ChildStdin, PodHolderReady, PodHolder);
 
 /// 追跡中の保持役 1 件。
 struct HolderEntry {
@@ -316,7 +327,7 @@ impl ProductionPodHolder {
     fn start_child(
         &self,
         ready_timeout: Duration,
-    ) -> Result<(Child, ChildStdin, PodHolderReady), (TraitError, Option<Child>)> {
+    ) -> Result<StartedHolder, (TraitError, Option<Child>)> {
         let (mut cmd, exe_fd) = self.resolve_command().map_err(|e| (e, None))?;
         cmd.arg(POD_HOLDER_SUBCOMMAND)
             .env_clear()
@@ -352,7 +363,29 @@ impl ProductionPodHolder {
             drop(stdin);
             return Err((e, kill_and_reap(child)));
         }
-        Ok((child, stdin, ready))
+        // 素性は検証した READY と /proc の starttime から集める（子はまだ回収していないので pid は固定される。R11・#2940）。
+        let holder = match self.collect_holder(&ready) {
+            Ok(h) => h,
+            Err(e) => {
+                drop(stdin);
+                return Err((e, kill_and_reap(child)));
+            }
+        };
+        Ok((child, stdin, ready, holder))
+    }
+
+    /// 検証済みの READY から [`PodHolder`] を作る。照合が有効な構成（本番）では starttime を読んで素性つきにし、読めなければ
+    /// 失敗（fail-closed）。照合が無効な試験用の構成は素性なし（記録では `holder=-`）。
+    fn collect_holder(&self, ready: &PodHolderReady) -> Result<PodHolder, TraitError> {
+        let pid = std::num::NonZeroU32::new(ready.pid())
+            .ok_or_else(|| TraitError::new(ErrorCode::Internal, MSG_PID_MISMATCH))?;
+        if !self.verify_namespaces() {
+            return Ok(PodHolder::new(pid));
+        }
+        let start = read_start_time(ready.pid()).map_err(|_| {
+            TraitError::new(ErrorCode::FailedPrecondition, MSG_IDENTITY_UNAVAILABLE)
+        })?;
+        holder_from_ready(ready, start)
     }
 
     /// READY の pid が spawn した子と一致し、`/proc/<pid>/ns/{user,ipc,net}` の素性が READY と一致することを確かめる。
@@ -420,8 +453,8 @@ impl ProductionPodHolder {
         let mut t = self.lock().map_err(|e| (e, false))?;
         t.spawning.remove(&id);
         match started {
-            Ok((child, stdin, ready)) => {
-                let Some(pid) = std::num::NonZeroU32::new(child.id()) else {
+            Ok((child, stdin, ready, holder)) => {
+                let Some(_) = std::num::NonZeroU32::new(child.id()) else {
                     drop(stdin);
                     if let Some(left) = kill_and_reap(child) {
                         t.orphans.insert(id, left);
@@ -440,7 +473,7 @@ impl ProductionPodHolder {
                         ready,
                     },
                 );
-                Ok(PodHolder::new(pid))
+                Ok(holder)
             }
             Err((e, left)) => {
                 let retained = left.is_some();
@@ -648,6 +681,39 @@ impl PodNamespaceHolderProvider for ProductionPodHolder {
         self.liveness_inner(sandbox_id)
             .map_err(|e| CriError::from(&e))
     }
+
+    /// 再採用した記録の pid の `/proc/<pid>/stat` の starttime を読むだけ（R11・#2940・SEC-5）。pidfd・シグナル・回収・
+    /// `/proc/<pid>/ns/*` の参照をせず、自分の表（`table`）も見ない。`NotFound` は `Absent`。
+    fn observe_process_start(&self, pid: u32) -> Result<ProcessStartObservation, CriError> {
+        match read_start_time(pid) {
+            Ok(start_time_ticks) => Ok(ProcessStartObservation::Present { start_time_ticks }),
+            Err(e) if e.code() == NetErrorCode::NotFound => Ok(ProcessStartObservation::Absent),
+            Err(_) => Err(CriError::from(&TraitError::new(
+                ErrorCode::Internal,
+                MSG_OBSERVE_FAILED,
+            ))),
+        }
+    }
+}
+
+/// READY と starttime から素性つきの [`PodHolder`] を作る（`HolderIdentity::new` が不変条件を再検証する）。
+fn holder_from_ready(
+    ready: &PodHolderReady,
+    start_time_ticks: u64,
+) -> Result<PodHolder, TraitError> {
+    let ns = |id: NsId| NamespaceIdentity {
+        dev: id.dev,
+        ino: id.ino,
+    };
+    let identity = HolderIdentity::new(
+        ready.pid(),
+        start_time_ticks,
+        ns(ready.user()),
+        ns(ready.ipc()),
+        ns(ready.net()),
+    )
+    .map_err(|_| TraitError::new(ErrorCode::FailedPrecondition, MSG_IDENTITY_UNAVAILABLE))?;
+    Ok(PodHolder::from_identity(identity))
 }
 
 /// SIGKILL を送り、[`POD_HOLDER_KILL_REAP_WAIT`] まで回収を待つ。回収できなければ子を返す（呼び出し側が orphan として数える）。

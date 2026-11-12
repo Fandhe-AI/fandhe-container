@@ -17,7 +17,7 @@ CLI を使う手順では plugin-cri と同じ状態ルートを指すこと（`
 1. 起動時の要約行（stderr。JSON ではなく 1 行のテキスト）。何かを再採用・回収したときだけ出る。次の 4 段を ` | ` でつないだ 1 行になる:
 
    ```text
-   cri record readoption: kind=sandbox adopted= pending_unresolved= broken= malformed= not_regular_file= too_long= unreadable= unrecognized= duplicate_metadata=
+   cri record readoption: kind=sandbox adopted= pending_unresolved= broken= malformed= not_regular_file= too_long= unreadable= unrecognized= duplicate_metadata= holder_recorded= holder_gone= holder_pid_reused= holder_start_time_match= holder_unobserved=
    cri record readoption: kind=container adopted= present= absent_exited= remove_pending= undetermined= stale_create= broken= malformed= not_regular_file= too_long= unreadable= unrecognized= duplicate_metadata= parentless=
    cri stale create release: released= kept= release_failed= record_remove_failed= not_attempted= skipped=
    cri orphan bundle reclamation: scan=<completed|list_failed:<CODE>|timed_out> scanned= reclaimed= kept_has_record= kept_present= kept_undetermined= release_failed= release_timed_out= skipped_unrecognized= skipped_not_dir= not_attempted=
@@ -34,6 +34,17 @@ CLI を使う手順では plugin-cri と同じ状態ルートを指すこと（`
    | `unrecognized` | `.rec` で終わるが名前が ID の形でない（非 UTF-8 の名前を含む） |
    | `duplicate_metadata` | name・namespace・uid・attempt が重複した。ID の小さい方だけを採る |
    | `parentless` | コンテナ記録の所属 sandbox が再採用されていない |
+
+   sandbox の行の末尾 `holder_*` は壊れた記録の内訳ではなく、記録に残した保持役の素性（pid・starttime・namespace。`#2940`・R11）を再採用時に `/proc/<pid>/stat` の読み取りだけで確かめた結果の件数である（`holder_recorded` は素性を持つ記録の件数で、残り 4 件の合計に等しい）:
+
+   | キー | 意味 |
+   | ---- | ---- |
+   | `holder_gone` | 記録の pid が `/proc` に無い。保持役は終了済み |
+   | `holder_pid_reused` | 同じ pid に starttime の違うプロセスが居る。記録の保持役は終了済みで、pid が再利用された |
+   | `holder_start_time_match` | starttime が一致する。終了を確認できない（boot id を記録しないため、再起動をまたぐ偶然の一致を否定できない）。plugin-cri は何もせず、シグナルも送らない |
+   | `holder_unobserved` | 観測できなかった（provider 未注入・観測の失敗） |
+
+   `holder_start_time_match` が 0 でなければ、保持役が残っている可能性がある。手で見分けるには、記録ファイル（`<state_root>/.cri/records/sandboxes/<id>.rec`）の `holder=<pid>,<starttime>,...` の行の pid について、`ps -o pid,lstart,cmd -p <pid>` の中身が supervisor の `pod-holder`（plugin-cri の実体と同じディレクトリの supervisor の bin）であることを確かめる。該当すれば、そのプロセスは手動で止める（止める前に pid の持ち主を再度確かめる）。判断に迷うときは何もしない。plugin-cri は再採用した記録の保持役を自動では止めない（#2940・SEC-5）。
 
 2. 記録器: 60 秒ごとに `{"event":"op_stats","op":"cri.record_store_load","success":…,"failure":…,…}` が出る。
    `success` は採用の件数（コンテナの `stale_create` を含む）、`failure` は壊れた記録の件数。内訳の区分は出ない。
@@ -77,7 +88,7 @@ CLI を使う手順では plugin-cri と同じ状態ルートを指すこと（`
 - `broken` の内訳のすべて（`malformed`・`not_regular_file`・`too_long`・`unreadable`・`unrecognized`・`duplicate_metadata`・`parentless`）
 - `.tmp-<pid>-<連番>`。`.rec` 以外は読み飛ばされるので件数には出ないが、走査数の上限は消費する
 
-対象外: `pending_unresolved` の sandbox のネットワーク資源と保持役の素性は #2940・#2941 と `docs/setup/network-reclaim-recovery.md` を参照する。現在の本番は `PodNetworkProvider` を注入していないので該当しない。
+対象外: `pending_unresolved` の sandbox のネットワーク資源と、素性と `pod_netns` による pending の精緻化は #2941 と `docs/setup/network-reclaim-recovery.md` を参照する。現在の本番は `PodNetworkProvider` を注入していないので該当しない。
 
 ## 実機前提試験が残した記録（#4142）
 

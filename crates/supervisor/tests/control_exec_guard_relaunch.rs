@@ -99,6 +99,27 @@ fn wait_threads_named(prefix: &str, want: usize) -> usize {
     }
 }
 
+/// join 後のスレッド消滅を待つ上限。本番の再 launch 前の `thread_settle::SETTLE_LIMIT`（1 秒）に合わせる。
+/// `wait_threads_named`（5 秒）より短くするのは、ガードが回収後に自然に終わり得る本試験で、
+/// 長い待ちが「pause が join しきらない」不具合（#4588 の (b)）を隠さないため。
+const JOIN_SETTLE_LIMIT: Duration = Duration::from_secs(1);
+
+/// `pause` が join して戻った後、名前が `prefix` のスレッドが 0 本になるまで `JOIN_SETTLE_LIMIT` まで待ち、
+/// 最後に数えた値を返す（SUP-3・REPAIR-5・REPAIR-12・#4588）。`pthread_join` が戻っても `/proc/self/task` から
+/// 消えるのはカーネルの解放の少し後で（`thread_settle.rs` と同じ窓）、また初回の `stderr_sink` のスレッドは
+/// 名前を付けるまで生成元（ガード）の comm を引き継ぐため、join 直後の 1 回の数え上げは偽陽性になる。
+/// 照合する値 0 は弱めない。上限を過ぎたら残った値で失敗する。
+fn wait_threads_gone(prefix: &str) -> usize {
+    let deadline = Instant::now() + JOIN_SETTLE_LIMIT;
+    loop {
+        let n = threads_named(prefix);
+        if n == 0 || Instant::now() >= deadline {
+            return n;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 const GUARD_COMM: &str = "control-exec-gu";
 const ACCEPT_COMM: &str = "control-channel";
 
@@ -120,6 +141,9 @@ impl Rig {
 
     fn start_with(tag: &str, config: ServeConfig) -> Self {
         use std::os::unix::fs::DirBuilderExt as _;
+        // stderr の専用スレッドを試験スレッドから先に作る。初回の生成がガードの回収通知になると、
+        // 名前を付けるまでの間 `control-exec-gu` の comm を引き継いで数えられるため（#4588・REPAIR-12）。
+        let _ = fandhe_container_supervisor::stderr_sink::stderr();
         let root = std::env::temp_dir().join(format!("fc-guardrl-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::DirBuilder::new()
@@ -233,8 +257,8 @@ fn sup3_sup6_repair5_pause_reclaims_notified_guard_and_joins_threads() {
         started.elapsed()
     );
     assert_eq!(rig.calls(), vec![own_name(10000)]);
-    assert_eq!(threads_named(GUARD_COMM), 0);
-    assert_eq!(threads_named(ACCEPT_COMM), 0);
+    assert_eq!(wait_threads_gone(GUARD_COMM), 0);
+    assert_eq!(wait_threads_gone(ACCEPT_COMM), 0);
     assert_eq!(rig.pool.active(), 0);
     drop(handover);
     rig.server.resume().unwrap();
@@ -249,7 +273,7 @@ fn sup3_sup6_pause_ends_unnotified_guard_without_reclaim() {
     assert_eq!(wait_threads_named(GUARD_COMM, 1), 1);
     rig.server.pause(Duration::from_secs(5)).unwrap();
     assert_eq!(rig.calls(), Vec::<String>::new());
-    assert_eq!(threads_named(GUARD_COMM), 0);
+    assert_eq!(wait_threads_gone(GUARD_COMM), 0);
     assert_eq!(rig.pool.active(), 0);
     drop(handover);
     rig.server.resume().unwrap();
@@ -280,10 +304,10 @@ struct Probe {
 
 impl Relauncher for Probe {
     fn relaunch(&self, _timeout: Duration) -> Result<Box<dyn LaunchedProcess>, TraitError> {
-        self.seen
-            .lock()
-            .unwrap()
-            .push((threads_named(GUARD_COMM), threads_named(ACCEPT_COMM)));
+        self.seen.lock().unwrap().push((
+            wait_threads_gone(GUARD_COMM),
+            wait_threads_gone(ACCEPT_COMM),
+        ));
         Err(TraitError::new(
             fandhe_container_core::traits::ErrorCode::Internal,
             "probe relaunch",
@@ -336,11 +360,11 @@ fn sup3_sup6_repair5_pause_timeout_keeps_stuck_guard_and_next_pause_joins_it() {
     assert_eq!(e.message(), "exec guards did not stop in time");
     assert_eq!(rig.calls(), vec![own_name(505)]);
     assert_eq!(wait_threads_named(GUARD_COMM, 1), 1);
-    assert_eq!(threads_named(ACCEPT_COMM), 0);
+    assert_eq!(wait_threads_gone(ACCEPT_COMM), 0);
     // 回収が終われば、accept が止まったままでも次の pause が残ったガードを join する。
     rig.reclaimer.release.store(true, Ordering::SeqCst);
     rig.server.pause(Duration::from_secs(5)).unwrap();
-    assert_eq!(threads_named(GUARD_COMM), 0);
+    assert_eq!(wait_threads_gone(GUARD_COMM), 0);
     assert_eq!(rig.pool.active(), 0);
     drop(handover);
 }
@@ -398,6 +422,8 @@ fn sup3_repair5_guard_budget_survives_slow_accept_stop() {
         started.elapsed()
     );
     assert_eq!(rig.calls(), vec![own_name(707)]);
-    assert_eq!(threads_named(GUARD_COMM), 0);
+    // 契約（join 済みで返る）は /proc を介さず即時に照合する。下の待ちは (b) を隠さない（#4588）。
+    assert_eq!(rig.pool.active(), 0);
+    assert_eq!(wait_threads_gone(GUARD_COMM), 0);
     drop(handover);
 }

@@ -758,9 +758,53 @@ mod tests;
 pub(crate) mod bin_fixture {
     use std::os::unix::fs::PermissionsExt as _;
     use std::path::PathBuf;
+    use std::process::{Child, Command, ExitStatus, Stdio};
+    use std::time::{Duration, Instant};
 
     use fandhe_container_core::traits::ErrorCode;
     use fandhe_container_supervisor::pod_holder::holder_executable_beside;
+
+    /// fixture が起動する子プロセス（cp・chmod・mkfifo）の待ちの期限（REPAIR-5・#4550・#4559）。
+    const BIN_FIXTURE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+    /// 期限切れで kill した後に回収を待つ猶予。
+    const BIN_FIXTURE_REAP_GRACE: Duration = Duration::from_secs(5);
+    const BIN_FIXTURE_POLL: Duration = Duration::from_millis(10);
+
+    /// 子を `timeout` まで待つ。期限切れなら kill して猶予の間回収を試み、理由つきの Err を返す（REPAIR-5・CRI-6）。
+    fn wait_child_until(
+        child: &mut Child,
+        timeout: Duration,
+        label: &str,
+    ) -> Result<ExitStatus, String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match child.try_wait() {
+                Ok(Some(st)) => return Ok(st),
+                Ok(None) => {}
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.try_wait();
+                    return Err(format!("{label}: try_wait failed: {e}"));
+                }
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let grace = Instant::now() + BIN_FIXTURE_REAP_GRACE;
+                let mut reaped = false;
+                while Instant::now() < grace {
+                    if matches!(child.try_wait(), Ok(Some(_))) {
+                        reaped = true;
+                        break;
+                    }
+                    std::thread::sleep(BIN_FIXTURE_POLL);
+                }
+                return Err(format!(
+                    "{label} timed out after {timeout:?} (REPAIR-5); reaped={reaped}"
+                ));
+            }
+            std::thread::sleep(BIN_FIXTURE_POLL);
+        }
+    }
 
     /// 一時ディレクトリ（0755）と、その中の plugin の実体のパス・隣の supervisor のパス。
     pub(crate) struct BinFixture {
@@ -793,9 +837,6 @@ pub(crate) mod bin_fixture {
         /// `ETXTBSY` で失敗するため（#4550。手本は #3358・#1686 の `install_fake_exe`）。
         /// なお `place_fifo` は書き込み用 fd を開かないため対象外。
         pub(crate) fn place_elf(&self, mode: u32) {
-            use std::process::{Command, Stdio};
-            use std::time::{Duration, Instant};
-
             let src = std::fs::canonicalize("/usr/bin/true").expect("true");
             let _ = std::fs::remove_file(&self.sup);
             let mut child = Command::new("/bin/sh")
@@ -810,37 +851,27 @@ pub(crate) mod bin_fixture {
                 .stderr(Stdio::null())
                 .spawn()
                 .expect("spawn place-elf");
-            // REPAIR-5: 無期限の wait を避け、期限つきで回収する。
-            let deadline = Instant::now() + Duration::from_secs(30);
-            let status = loop {
-                if let Some(st) = child.try_wait().expect("try_wait") {
-                    break st;
-                }
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let grace = Instant::now() + Duration::from_secs(5);
-                    while Instant::now() < grace && child.try_wait().ok().flatten().is_none() {
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    panic!("place-elf timed out (REPAIR-5)");
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            };
+            let status = wait_child_until(&mut child, BIN_FIXTURE_WAIT_TIMEOUT, "place-elf")
+                .unwrap_or_else(|msg| panic!("{msg}"));
             assert!(status.success(), "place-elf failed: {status:?}");
             let meta = std::fs::symlink_metadata(&self.sup).expect("stat");
             assert!(meta.is_file());
             assert_eq!(meta.permissions().mode() & 0o7777, mode);
         }
 
-        /// 隣の固定名へ FIFO（open がブロックし得る種別）を置く。
+        /// 隣の固定名へ FIFO（open がブロックし得る種別）を置く。`mkfifo` の待ちは期限つき（REPAIR-5・#4559）。
         pub(crate) fn place_fifo(&self) {
             let _ = std::fs::remove_file(&self.sup);
-            let ok = std::process::Command::new("mkfifo")
+            let mut child = Command::new("mkfifo")
                 .arg(&self.sup)
-                .status()
-                .expect("mkfifo")
-                .success();
-            assert!(ok);
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn mkfifo");
+            let status = wait_child_until(&mut child, BIN_FIXTURE_WAIT_TIMEOUT, "mkfifo")
+                .unwrap_or_else(|msg| panic!("{msg}"));
+            assert!(status.success(), "mkfifo failed: {status:?}");
             std::fs::set_permissions(&self.sup, std::fs::Permissions::from_mode(0o755))
                 .expect("chmod");
         }
@@ -860,5 +891,39 @@ pub(crate) mod bin_fixture {
     pub(crate) fn assert_untrusted(code: ErrorCode, msg: &str) {
         assert_eq!(code, ErrorCode::FailedPrecondition);
         assert_eq!(msg, super::MSG_UNTRUSTED_EXE);
+    }
+
+    /// REPAIR-5・CRI-6・#4559: 止まった子は期限で kill・回収され、理由つきの Err になる。
+    #[test]
+    fn repair5_4559_bin_fixture_wait_times_out_and_reaps_stuck_child() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let start = Instant::now();
+        let err = wait_child_until(&mut child, Duration::from_millis(200), "sleep")
+            .expect_err("must time out");
+        let elapsed = start.elapsed();
+        assert!(err.contains("sleep timed out"), "{err}");
+        assert!(err.contains("REPAIR-5"), "{err}");
+        assert!(err.contains("reaped=true"), "{err}");
+        assert!(elapsed >= Duration::from_millis(200), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
+        let st = child.try_wait().expect("try_wait").expect("already reaped");
+        assert_eq!(st.signal(), Some(9));
+    }
+
+    /// REPAIR-5・CRI-6・#4559: 期限内に終わる子の終了コードはそのまま返る。
+    #[test]
+    fn repair5_4559_bin_fixture_wait_returns_exit_status_within_deadline() {
+        for (cmd, code) in [("true", 0), ("false", 1)] {
+            let mut child = Command::new(cmd).spawn().expect("spawn");
+            let st = wait_child_until(&mut child, Duration::from_secs(30), cmd).expect("ok");
+            assert_eq!(st.code(), Some(code), "{cmd}");
+        }
     }
 }

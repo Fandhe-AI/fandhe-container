@@ -154,6 +154,16 @@ pub type SubmitHook<'a> = &'a mut dyn FnMut(&Submit3d) -> Option<String>;
 pub trait SessionHooks {
     /// 応答を used ring へ書き戻せた `SUBMIT_3D` ごとに呼ぶ（応答を捨てて adapter を巻き戻した提出は呼ばない）。
     fn on_submit(&mut self, _submit: &Submit3d, _sink: &mut dyn FnMut(&str)) {}
+    /// 応答を used ring へ公開する**前**に、受理した `SUBMIT_3D` ごとに呼ぶ（応答を捨てる提出は呼ばない）。
+    /// `blobs` は保持中の blob の読み取り口。`DestroyRingMESA` の最終読み取りを、後続の `UNMAP_BLOB` / `RESOURCE_UNREF` による
+    /// memfd の解放より前に済ませるために使う（#1884）。
+    fn before_response(
+        &mut self,
+        _submit: &Submit3d,
+        _blobs: &dyn BlobRead,
+        _sink: &mut dyn FnMut(&str),
+    ) {
+    }
     /// ctrl の kick を 1 回処理して `SUBMIT_3D` を 1 件以上受理し、call で通知した**後**に呼ぶ。
     /// `blobs` は保持中の blob の読み取り口（リングの中身を `read_exact_at` で読む）。
     fn after_notify(&mut self, _blobs: &dyn BlobRead, _sink: &mut dyn FnMut(&str)) {}
@@ -178,6 +188,14 @@ impl SessionHooks for ClosureHooks<'_> {
 impl<W: std::io::Write> SessionHooks for RecordingHooks<W> {
     fn on_submit(&mut self, submit: &Submit3d, sink: &mut dyn FnMut(&str)) {
         RecordingHooks::on_submit(self, submit, sink);
+    }
+    fn before_response(
+        &mut self,
+        submit: &Submit3d,
+        blobs: &dyn BlobRead,
+        sink: &mut dyn FnMut(&str),
+    ) {
+        RecordingHooks::before_response(self, submit, blobs, sink);
     }
     fn after_notify(&mut self, blobs: &dyn BlobRead, sink: &mut dyn FnMut(&str)) {
         self.snapshot_all(blobs, sink);
@@ -810,6 +828,9 @@ impl Session {
                     Err(e) => return Err(vq(e)),
                 }
             };
+            if let (false, Some(s)) = (dropped, &p.submit) {
+                hooks.before_response(s, &self.blobs, sink);
+            }
             ring.queue.add_used(mem, chain, len).map_err(vq)?;
             // 応答が確定した（巻き戻しが無い）ので、`UNREF` 済み resource の実メモリをここで閉じる。
             if !dropped {

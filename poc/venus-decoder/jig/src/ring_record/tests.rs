@@ -403,11 +403,66 @@ fn gpu6_1884_destroy_takes_final_snapshot_then_drops_ring() {
     create(&mut h, 1, std_spec(), &[MON]);
     blobs.put(5, 192, &[1, 2, 3, 4]);
     blobs.put_u32(5, 64, 4);
+    h.before_response(&submit(destroy_payload(1)), &blobs, &mut |_| {});
     h.on_submit(&submit(destroy_payload(1)), &mut |_| {});
-    assert_eq!(snap(&mut h, &blobs).len(), 1);
+    // 応答の公開前に最終読み取りが済み、表から外れている。
     blobs.put_u32(5, 64, 8);
     assert!(snap(&mut h, &blobs).is_empty());
     let p = payloads(h);
     assert_eq!(p.len(), 3);
-    assert_eq!(p[2], vec![1, 2, 3, 4]);
+    // リングの最終読み取りは Destroy 本体の記録より前（応答の公開前）に入る。
+    assert_eq!(p[1], vec![1, 2, 3, 4]);
+}
+
+fn submit_ctx(ctx_id: u32, payload: Vec<u8>) -> Submit3d {
+    Submit3d {
+        ctx_id,
+        ..submit(payload)
+    }
+}
+
+#[test]
+fn gpu6_1884_same_ring_id_in_two_contexts_is_distinct() {
+    let mut blobs = FakeBlobs::with(5, 256);
+    blobs.blobs.insert(6, vec![0u8; 256]);
+    let mut h = hooks();
+    let mut out = Vec::new();
+    h.on_submit(
+        &submit_ctx(1, create_payload(1, std_spec(), &[MON])),
+        &mut |l| out.push(l.to_string()),
+    );
+    let mut sp2 = std_spec();
+    sp2.res_id = 6;
+    h.on_submit(&submit_ctx(2, create_payload(1, sp2, &[MON])), &mut |l| {
+        out.push(l.to_string())
+    });
+    assert!(out.iter().all(|l| !l.contains("duplicate_ring")), "{out:?}");
+    // ctx 2 の破棄は ctx 1 のリングに影響しない。
+    blobs.put(6, 192, &[9, 9]);
+    blobs.put_u32(6, 64, 2);
+    h.before_response(&submit_ctx(2, destroy_payload(1)), &blobs, &mut |_| {});
+    blobs.put(5, 192, &[1, 2, 3]);
+    blobs.put_u32(5, 64, 3);
+    assert_eq!(snap(&mut h, &blobs).len(), 1);
+    let p = payloads(h);
+    assert_eq!(p.len(), 4);
+    assert_eq!(p[2], vec![9, 9]);
+    assert_eq!(p[3], vec![1, 2, 3]);
+}
+
+#[test]
+fn gpu6_1884_destroy_then_blob_release_keeps_final_snapshot() {
+    let mut blobs = FakeBlobs::with(5, 256);
+    let mut h = hooks();
+    create(&mut h, 1, std_spec(), &[MON]);
+    blobs.put(5, 192, &[7, 8]);
+    blobs.put_u32(5, 64, 2);
+    // 応答の公開前に最終読み取りを済ませてから blob が解放される（Destroy → UNMAP → UNREF の並び）。
+    h.before_response(&submit(destroy_payload(1)), &blobs, &mut |_| {});
+    blobs.blobs.remove(&5);
+    let mut out = Vec::new();
+    h.snapshot_all(&blobs, &mut |l| out.push(l.to_string()));
+    assert!(out.is_empty(), "{out:?}");
+    let p = payloads(h);
+    assert_eq!(p.last().unwrap(), &vec![7, 8]);
 }

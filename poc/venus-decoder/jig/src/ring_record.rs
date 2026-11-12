@@ -291,14 +291,14 @@ fn read_pnext_chain(
 /// リング 1 本分の状態。
 #[derive(Debug)]
 struct RingEntry {
+    /// 作成した ctx。ring_id は ctx ごとに採番されるため、識別は (ctx_id, ring_id) の組で行う。
+    ctx_id: u32,
     ring_id: u64,
     layout: RingLayout,
     /// 次に読む位置（最初のスナップショットの head で初期化）。
     cursor: Option<u32>,
     /// 異常で記録を止めた。以後は読まない。
     dead: bool,
-    /// `DestroyRingMESA` を受けた。次のスナップショットの後に表から外す。
-    destroy_pending: bool,
 }
 
 /// 受理した提出を記録し、契機ごとにリングの差分も足す記録フック。
@@ -332,7 +332,7 @@ impl<W: Write> RecordingHooks<W> {
         };
         match header.command {
             CommandType::CreateRingMESA => match RingLayout::parse_create(&s.payload) {
-                Ok((ring_id, layout)) => match self.insert_ring(ring_id, layout) {
+                Ok((ring_id, layout)) => match self.insert_ring(s.ctx_id, ring_id, layout) {
                     Ok(()) => sink(&log::ring_create_line(
                         ring_id,
                         layout.res_id(),
@@ -348,21 +348,24 @@ impl<W: Write> RecordingHooks<W> {
                 },
                 Err(code) => sink(&log::ring_create_failed_line(code)),
             },
-            CommandType::DestroyRingMESA => {
-                if let Ok(ring_id) = RingLayout::parse_destroy(&s.payload) {
-                    for e in self.rings.iter_mut().flatten() {
-                        if e.ring_id == ring_id {
-                            e.destroy_pending = true;
-                        }
-                    }
-                }
-            }
+            // 破棄は応答の公開前に `before_response` が最終読み取りを済ませて表から外す（ここでは何もしない）。
+            CommandType::DestroyRingMESA => {}
             _ => {}
         }
     }
 
-    fn insert_ring(&mut self, ring_id: u64, layout: RingLayout) -> Result<(), RingErrorCode> {
-        if self.rings.iter().flatten().any(|e| e.ring_id == ring_id) {
+    fn insert_ring(
+        &mut self,
+        ctx_id: u32,
+        ring_id: u64,
+        layout: RingLayout,
+    ) -> Result<(), RingErrorCode> {
+        if self
+            .rings
+            .iter()
+            .flatten()
+            .any(|e| e.ctx_id == ctx_id && e.ring_id == ring_id)
+        {
             return Err(RingErrorCode::DuplicateRing);
         }
         let slot = self
@@ -371,37 +374,72 @@ impl<W: Write> RecordingHooks<W> {
             .find(|s| s.is_none())
             .ok_or(RingErrorCode::TableFull)?;
         *slot = Some(RingEntry {
+            ctx_id,
             ring_id,
             layout,
             cursor: None,
             dead: false,
-            destroy_pending: false,
         });
         Ok(())
     }
 
-    /// 全リングを 1 回ずつスナップショットし、破棄待ちのリングを表から外す。
-    pub fn snapshot_all(&mut self, blobs: &dyn BlobRead, sink: &mut dyn FnMut(&str)) {
+    /// `DestroyRingMESA` の応答を used ring へ公開する**前**に呼ぶ。該当 (ctx_id, ring_id) のリングを最後に 1 回読み、表から外す。
+    ///
+    /// 公開後は後続の `UNMAP_BLOB` / `RESOURCE_UNREF` で memfd が閉じられ、ゲストが領域を再利用できるため、ここで読み切る（設計書 10.4.5）。
+    pub fn before_response(
+        &mut self,
+        s: &Submit3d,
+        blobs: &dyn BlobRead,
+        sink: &mut dyn FnMut(&str),
+    ) {
+        let Some(Ok(header)) = &s.header else {
+            return;
+        };
+        if header.command != CommandType::DestroyRingMESA {
+            return;
+        }
+        let Ok(ring_id) = RingLayout::parse_destroy(&s.payload) else {
+            return;
+        };
         for slot in self.rings.iter_mut() {
-            let Some(entry) = slot.as_mut() else {
-                continue;
-            };
-            if !entry.dead {
-                match snapshot_one(entry, blobs, &mut self.recorder) {
-                    Ok(Some(line)) => sink(&line),
-                    Ok(None) => {}
-                    Err((code, stop_line)) => {
-                        entry.dead = true;
-                        if let Some(l) = stop_line {
-                            sink(&l);
-                        }
-                        sink(&log::ring_error_line(entry.ring_id, code));
-                    }
+            let matched = slot
+                .as_ref()
+                .is_some_and(|e| e.ctx_id == s.ctx_id && e.ring_id == ring_id);
+            if matched {
+                if let Some(entry) = slot.as_mut() {
+                    Self::snapshot_entry(&mut self.recorder, entry, blobs, sink);
                 }
-            }
-            if entry.destroy_pending {
                 *slot = None;
             }
+        }
+    }
+
+    fn snapshot_entry(
+        recorder: &mut SubmitRecorder<W>,
+        entry: &mut RingEntry,
+        blobs: &dyn BlobRead,
+        sink: &mut dyn FnMut(&str),
+    ) {
+        if entry.dead {
+            return;
+        }
+        match snapshot_one(entry, blobs, recorder) {
+            Ok(Some(line)) => sink(&line),
+            Ok(None) => {}
+            Err((code, stop_line)) => {
+                entry.dead = true;
+                if let Some(l) = stop_line {
+                    sink(&l);
+                }
+                sink(&log::ring_error_line(entry.ring_id, code));
+            }
+        }
+    }
+
+    /// 全リングを 1 回ずつスナップショットする。
+    pub fn snapshot_all(&mut self, blobs: &dyn BlobRead, sink: &mut dyn FnMut(&str)) {
+        for entry in self.rings.iter_mut().flatten() {
+            Self::snapshot_entry(&mut self.recorder, entry, blobs, sink);
         }
     }
 }

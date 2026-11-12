@@ -156,7 +156,46 @@ fn spawn_verified(
     exe: &VerifiedSupervisorExe,
     args: &StreamExecArgs,
 ) -> Result<SpawnedHelper, CriError> {
-    spawn_helper_command(stream_exec_command(&exe.exec_path(), args))
+    try_spawn_verified(exe, args).map_err(HelperSpawnFailure::into_cri)
+}
+
+/// `spawn_verified` の元の `io::Error` を保つ版。試験が失敗の errno を確かめるための継ぎ目（#4550）。
+fn try_spawn_verified(
+    exe: &VerifiedSupervisorExe,
+    args: &StreamExecArgs,
+) -> Result<SpawnedHelper, HelperSpawnFailure> {
+    try_spawn_helper_command(stream_exec_command(&exe.exec_path(), args))
+}
+
+/// helper の起動の失敗。元の `io::Error` を保つ（試験で errno を見るため。#4550）。
+///
+/// 外へ出す `CriError` の文言は `into_cri` の固定文字列のままで、元のエラーを応答へ漏らさない（PLUG-11・CRI-6）。
+// 元の `io::Error` は試験（`raw_os_error`）だけが読むため、試験でない構成では dead_code を許す。
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug)]
+pub(crate) enum HelperSpawnFailure {
+    /// channel / 診断の socketpair の作成に失敗した。
+    ChannelSetup(std::io::Error),
+    /// `Command::spawn`（fork・exec）に失敗した。
+    Spawn(std::io::Error),
+}
+
+impl HelperSpawnFailure {
+    /// 従来どおりの固定文言の `Unavailable` へ写す。
+    pub(crate) fn into_cri(self) -> CriError {
+        match self {
+            Self::ChannelSetup(_) => CriError::unavailable("exec channel setup failed"),
+            Self::Spawn(_) => CriError::unavailable("failed to start the exec helper"),
+        }
+    }
+
+    /// 元の `io::Error` の errno（試験の診断用）。
+    #[cfg(test)]
+    pub(crate) fn raw_os_error(&self) -> Option<i32> {
+        match self {
+            Self::ChannelSetup(e) | Self::Spawn(e) => e.raw_os_error(),
+        }
+    }
 }
 
 /// helper の `Command` に fd 0（channel の socketpair）と fd 2（診断の socketpair）を結線して起動する。
@@ -164,11 +203,17 @@ fn spawn_verified(
 /// 本番の spawner と結合試験（`tests/exec_helper_diag_real.rs`。#4171）が共有する。fd 2 は AF_UNIX の socketpair
 /// （core の診断出力は socket にしか書かないため pipe にしない）で、親に残る helper 側の端は起動後に閉じる
 /// （helper の終了で読み手が EOF を観測できるようにするため。CRI-6・SUP-6・REPAIR-5）。
-pub fn spawn_helper_command(mut command: Command) -> Result<SpawnedHelper, CriError> {
+pub fn spawn_helper_command(command: Command) -> Result<SpawnedHelper, CriError> {
+    try_spawn_helper_command(command).map_err(HelperSpawnFailure::into_cri)
+}
+
+/// `spawn_helper_command` の本体。失敗の `io::Error` を保って返す（#4550）。
+pub(crate) fn try_spawn_helper_command(
+    mut command: Command,
+) -> Result<SpawnedHelper, HelperSpawnFailure> {
     let (plugin_end, helper_end) =
-        StdUnixStream::pair().map_err(|_| CriError::unavailable("exec channel setup failed"))?;
-    let (diag_end, helper_err) =
-        StdUnixStream::pair().map_err(|_| CriError::unavailable("exec channel setup failed"))?;
+        StdUnixStream::pair().map_err(HelperSpawnFailure::ChannelSetup)?;
+    let (diag_end, helper_err) = StdUnixStream::pair().map_err(HelperSpawnFailure::ChannelSetup)?;
     command
         .stdin(Stdio::from(OwnedFd::from(helper_end)))
         .stdout(Stdio::null())
@@ -176,7 +221,7 @@ pub fn spawn_helper_command(mut command: Command) -> Result<SpawnedHelper, CriEr
     let spawned = command.spawn();
     // 親に残る helper 側の端（`Command` が保持する fd）を閉じる。
     drop(command);
-    let child = spawned.map_err(|_| CriError::unavailable("failed to start the exec helper"))?;
+    let child = spawned.map_err(HelperSpawnFailure::Spawn)?;
     Ok(SpawnedHelper {
         child,
         channel: plugin_end,

@@ -787,12 +787,49 @@ pub(crate) mod bin_fixture {
         }
 
         /// 隣の固定名へ ELF（`true`）の複製を `mode` で置く（`/proc/self/fd/N` の exec は `#!` を実行できないため ELF）。
+        ///
+        /// 複製と chmod は子プロセスで行い、試験のプロセスに配置先への書き込み用 fd を一切開かない。
+        /// 並列の試験が fork すると、子は exec までその fd の複製を持ち、直後の検証済み fd の exec が
+        /// `ETXTBSY` で失敗するため（#4550。手本は #3358・#1686 の `install_fake_exe`）。
+        /// なお `place_fifo` は書き込み用 fd を開かないため対象外。
         pub(crate) fn place_elf(&self, mode: u32) {
+            use std::process::{Command, Stdio};
+            use std::time::{Duration, Instant};
+
             let src = std::fs::canonicalize("/usr/bin/true").expect("true");
             let _ = std::fs::remove_file(&self.sup);
-            std::fs::copy(src, &self.sup).expect("copy");
-            std::fs::set_permissions(&self.sup, std::fs::Permissions::from_mode(mode))
-                .expect("chmod");
+            let mut child = Command::new("/bin/sh")
+                .arg("-c")
+                .arg("cp -- \"$1\" \"$2\" && chmod \"$3\" \"$2\"")
+                .arg("place-elf")
+                .arg(&src)
+                .arg(&self.sup)
+                .arg(format!("{mode:o}"))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn place-elf");
+            // REPAIR-5: 無期限の wait を避け、期限つきで回収する。
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let status = loop {
+                if let Some(st) = child.try_wait().expect("try_wait") {
+                    break st;
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let grace = Instant::now() + Duration::from_secs(5);
+                    while Instant::now() < grace && child.try_wait().ok().flatten().is_none() {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    panic!("place-elf timed out (REPAIR-5)");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            assert!(status.success(), "place-elf failed: {status:?}");
+            let meta = std::fs::symlink_metadata(&self.sup).expect("stat");
+            assert!(meta.is_file());
+            assert_eq!(meta.permissions().mode() & 0o7777, mode);
         }
 
         /// 隣の固定名へ FIFO（open がブロックし得る種別）を置く。

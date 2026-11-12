@@ -69,7 +69,8 @@ pub use node_dialer::NodeLoopbackDialer;
 #[cfg(target_os = "linux")]
 pub use pod_dialer::{
     CONNECT_MARGIN, HELPER_EXIT_WAIT, HELPER_REAP_WAIT, KILL_REAP_RESERVE,
-    MAX_RETAINED_DIAL_HELPERS, NetnsDialSpawner, PodNamespaceSource, PodNetnsDialer,
+    MAX_RETAINED_DIAL_HELPERS, NetnsDialSpawner, OP_PF_HELPER_RETAINED, OP_PF_RETAINED_FULL,
+    OP_PF_RETAINED_OVER_LIMIT, PodDialTelemetry, PodNamespaceSource, PodNetnsDialer,
     SupervisorNetnsDialSpawner,
 };
 
@@ -170,9 +171,10 @@ impl ProductionPortForward {
     /// POD ネットワークにも対応する（Linux のみ。[`PodNetnsDialer`]。`supports_pod_network` は真）。
     /// `source` は cri へ渡す保持役 provider と同じ表を指すこと（`CriPluginBackends::pod_namespace_source` が保証する）。
     #[cfg(target_os = "linux")]
-    pub fn pod_network(source: Arc<dyn PodNamespaceSource>) -> Self {
+    /// `telemetry` は回収できない helper の保持・上限超過・満杯の拒否の観測（#4546。省けない）。
+    pub fn pod_network(source: Arc<dyn PodNamespaceSource>, telemetry: PodDialTelemetry) -> Self {
         Self {
-            dialer: Arc::new(PodNetnsDialer::new(source)),
+            dialer: Arc::new(PodNetnsDialer::new(source, telemetry)),
         }
     }
 }
@@ -826,6 +828,16 @@ mod tests {
         .pod_sandbox_id
     }
 
+    /// `pod_network` に渡す観測（#4546。試験では出力先を捨てる）。
+    #[cfg(target_os = "linux")]
+    fn test_pod_telemetry() -> PodDialTelemetry {
+        PodDialTelemetry::new(
+            Arc::new(fandhe_container_core::observability::OpRecorder::new()),
+            crate::telemetry::LineSink::spawn(Box::new(std::io::sink()), 2),
+        )
+        .expect("telemetry")
+    }
+
     /// CRI-6・NET-3・PLUG-1・#4486: 保持役がある構成（`pod_network`）では POD の sandbox も NODE も URL を返す。
     #[cfg(target_os = "linux")]
     #[tokio::test]
@@ -833,7 +845,7 @@ mod tests {
         let server = bind_production_streaming(
             production_streaming_config(),
             fake_attach(),
-            ProductionPortForward::pod_network(Arc::new(UnusedSource)),
+            ProductionPortForward::pod_network(Arc::new(UnusedSource), test_pod_telemetry()),
             None,
             noop_recorder(),
             noop_observer(),
@@ -867,7 +879,7 @@ mod tests {
         let server = bind_production_streaming(
             production_streaming_config(),
             fake_attach(),
-            ProductionPortForward::pod_network(Arc::new(UnusedSource)),
+            ProductionPortForward::pod_network(Arc::new(UnusedSource), test_pod_telemetry()),
             None,
             noop_recorder(),
             noop_observer(),
@@ -897,7 +909,7 @@ mod tests {
                 .supports_pod_network()
         );
         assert!(
-            ProductionPortForward::pod_network(Arc::new(UnusedSource))
+            ProductionPortForward::pod_network(Arc::new(UnusedSource), test_pod_telemetry())
                 .dialer
                 .supports_pod_network()
         );

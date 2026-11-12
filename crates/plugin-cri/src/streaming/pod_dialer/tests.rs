@@ -649,3 +649,155 @@ fn repair5_4525_drop_reaps_exited_retained_helpers() {
     drop(d);
     assert!(!Path::new(&format!("/proc/{pid}")).exists());
 }
+
+// ---- #4546: 回収できない helper の保持・上限超過・満杯の拒否の観測（CRI-6・REPAIR-4・REPAIR-5）----
+
+use crate::streaming::connection_observer::tests::Collect;
+use fandhe_container_core::observability::{OpName, OpRecorder};
+
+fn tele_dialer(
+    s: &Scratch,
+    ids: &[&str],
+) -> (
+    PodNetnsDialer,
+    std::sync::Arc<FakeSpawner>,
+    std::sync::Arc<FakeSource>,
+    std::sync::Arc<OpRecorder>,
+    Collect,
+) {
+    let sp = std::sync::Arc::new(FakeSpawner::new(Reply::Silent));
+    let (d, src) = dialer(FakeSource::new(s.path(), ids), &sp);
+    let rec = std::sync::Arc::new(OpRecorder::new());
+    let out = Collect::default();
+    let sink = LineSink::spawn(Box::new(out.clone()), 64);
+    let t = PodDialTelemetry::new(std::sync::Arc::clone(&rec), sink).expect("telemetry");
+    (d.with_telemetry(t), sp, src, rec, out)
+}
+
+fn pf_line(op: &str, reason: &str, count: u64) -> String {
+    format!(
+        "{{\"event\":\"cri_port_forward_helper\",\"op\":\"{op}\",\"outcome\":\"error\",\"reason\":\"{reason}\",\"count\":{count}}}"
+    )
+}
+
+fn counts(rec: &OpRecorder, op: &str) -> Option<(u64, u64)> {
+    rec.snapshot_op(&OpName::new(op).expect("name"))
+        .map(|s| (s.success(), s.failure()))
+}
+
+fn kill_all(d: &PodNetnsDialer) {
+    for c in d.lock_retained().iter_mut() {
+        let _ = c.kill();
+    }
+    assert!(wait_until(T5, || d.sweep_retained() == 0));
+}
+
+/// CRI-6・REPAIR-4・#4546: 保持 4 回で件数が 4、行は累計 1・2・4 の 3 本だけ（3 回目は出ない）で pid を含まない。
+#[test]
+fn cri6_repair4_4546_retain_records_and_log_scales_lines() {
+    let s = Scratch::new("tele-retain");
+    let (d, _sp, _src, rec, out) = tele_dialer(&s, &[]);
+    let mut pids = Vec::new();
+    for _ in 0..4 {
+        let c = sleeper().stdin(Stdio::null()).spawn().expect("spawn");
+        pids.push(c.id().to_string());
+        d.retain(c);
+    }
+    assert_eq!(counts(&rec, OP_PF_HELPER_RETAINED), Some((0, 4)));
+    assert_eq!(counts(&rec, OP_PF_RETAINED_OVER_LIMIT), None);
+    assert_eq!(counts(&rec, OP_PF_RETAINED_FULL), None);
+    out.wait_lines(3);
+    assert_eq!(
+        out.lines(),
+        vec![
+            pf_line(OP_PF_HELPER_RETAINED, REASON_HELPER_UNREAPED, 1),
+            pf_line(OP_PF_HELPER_RETAINED, REASON_HELPER_UNREAPED, 2),
+            pf_line(OP_PF_HELPER_RETAINED, REASON_HELPER_UNREAPED, 4),
+        ]
+    );
+    for l in out.lines() {
+        for pid in &pids {
+            assert!(!l.contains(&format!(":{pid}")) && !l.contains(&format!("\"{pid}\"")));
+        }
+    }
+    kill_all(&d);
+}
+
+/// REPAIR-5・#4546: 保持数が上限を超えた回は、保持と上限超過の両方に数える。
+#[test]
+fn repair5_4546_over_limit_counts_when_retained_exceeds_max() {
+    let s = Scratch::new("tele-over");
+    let (d, _sp, _src, rec, out) = tele_dialer(&s, &[]);
+    for _ in 0..MAX_RETAINED_DIAL_HELPERS {
+        d.push_retained_for_test(sleeper().stdin(Stdio::null()).spawn().expect("spawn"));
+    }
+    d.retain(sleeper().stdin(Stdio::null()).spawn().expect("spawn"));
+    assert_eq!(d.retained_len_for_test(), MAX_RETAINED_DIAL_HELPERS + 1);
+    assert_eq!(counts(&rec, OP_PF_HELPER_RETAINED), Some((0, 1)));
+    assert_eq!(counts(&rec, OP_PF_RETAINED_OVER_LIMIT), Some((0, 1)));
+    out.wait_lines(2);
+    assert_eq!(
+        out.lines(),
+        vec![
+            pf_line(OP_PF_HELPER_RETAINED, REASON_HELPER_UNREAPED, 1),
+            pf_line(OP_PF_RETAINED_OVER_LIMIT, REASON_RETAINED_OVER_LIMIT, 1),
+        ]
+    );
+    kill_all(&d);
+}
+
+/// CRI-6・REPAIR-4・#4546: 満杯の拒否 4 回で件数が 4、行は累計 1・2・4 の 3 本で port・pid を含まない。
+#[test]
+fn cri6_repair4_4546_full_rejection_records_and_lines_have_no_port() {
+    let s = Scratch::new("tele-full");
+    let (d, sp, src, rec, out) = tele_dialer(&s, &["a"]);
+    for _ in 0..MAX_RETAINED_DIAL_HELPERS {
+        d.push_retained_for_test(sleeper().stdin(Stdio::null()).spawn().expect("spawn"));
+    }
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    for _ in 0..4 {
+        assert_eq!(
+            err_of(d.dial(&pod("a"), port, T5)),
+            (
+                CriErrorCode::ResourceExhausted,
+                MSG_RETAINED_FULL.to_owned()
+            )
+        );
+    }
+    assert_eq!(counts(&rec, OP_PF_RETAINED_FULL), Some((0, 4)));
+    assert_eq!(counts(&rec, OP_PF_HELPER_RETAINED), None);
+    assert_eq!(sp.spawns.load(Ordering::SeqCst), 0);
+    assert_eq!(src.calls.load(Ordering::SeqCst), 0);
+    out.wait_lines(3);
+    assert_eq!(
+        out.lines(),
+        vec![
+            pf_line(OP_PF_RETAINED_FULL, REASON_RETAINED_FULL, 1),
+            pf_line(OP_PF_RETAINED_FULL, REASON_RETAINED_FULL, 2),
+            pf_line(OP_PF_RETAINED_FULL, REASON_RETAINED_FULL, 4),
+        ]
+    );
+    for l in out.lines() {
+        assert!(!l.contains(&port.to_string()), "{l}");
+    }
+    kill_all(&d);
+}
+
+/// REPAIR-4・#4546: 操作名は検証を通り、観測なしの dialer でも保持は panic しない。
+#[test]
+fn repair4_4546_op_names_are_valid_and_no_telemetry_is_noop() {
+    for n in [
+        OP_PF_HELPER_RETAINED,
+        OP_PF_RETAINED_OVER_LIMIT,
+        OP_PF_RETAINED_FULL,
+    ] {
+        assert!(OpName::new(n).is_ok(), "{n}");
+    }
+    let s = Scratch::new("tele-none");
+    let sp = std::sync::Arc::new(FakeSpawner::new(Reply::Silent));
+    let (d, _src) = dialer(FakeSource::new(s.path(), &[]), &sp);
+    d.retain(sleeper().stdin(Stdio::null()).spawn().expect("spawn"));
+    assert_eq!(d.retained_len_for_test(), 1);
+    kill_all(&d);
+}

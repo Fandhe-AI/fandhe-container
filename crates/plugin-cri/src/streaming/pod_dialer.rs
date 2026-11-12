@@ -28,6 +28,11 @@
 //! 保持一覧は dial の入口・各 dial の出口（`DialHelper::finish`）・一覧へ入れる直前（`retain`）・dialer の drop で、
 //! 非ブロッキングの `try_wait` により掃除する（回収済みの子は数え直しで外れる。#4525）。
 //!
+//! # 観測（CRI-6・REPAIR-4・REPAIR-5・#4546。操作名と reason は暫定で、語彙の確定は #4116 の項目 3）
+//! 回収できず保持した・保持数が上限を超えた・満杯で拒否した、の 3 つを [`PodDialTelemetry`] が共有 `OpRecorder` の件数と、
+//! 累計が 2 のべき乗の時だけの構造化行で出す。記録は保持一覧の lock の外で行い（`retain` はガードを落としてから記録する）、
+//! `OpRecorder::record` と `LineSink::submit`（`try_send`）だけを使う。行に pid・port・パス・errno は入れない。
+//!
 //! # 残余
 //! - 保持数の上限は dial の入口で検査するため、並行する dial が同時に回収に失敗すると一時的に上限を超えうる。入れる側は
 //!   断ると `Child` を落として追えない zombie を作るため断らない。超過は 8 + (`max_inflight_dials` − 1) で有界
@@ -44,9 +49,11 @@ use std::num::NonZeroU16;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::MetadataExt as _;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use fandhe_container_core::observability::{OpName, OpOutcome, OpRecorder};
 use fandhe_container_core::traits::types::{ErrorCode, TraitError};
 use fandhe_container_cri::error::CriError;
 use fandhe_container_cri::streaming::port_forward::{
@@ -59,6 +66,7 @@ use fandhe_container_net::netns_dial::{
 
 use super::NodeLoopbackDialer;
 use crate::pod_holder::{PodNamespaceFds, ProductionPodHolder, open_supervisor_beside};
+use crate::telemetry::LineSink;
 
 /// 回収できず保持する helper の上限（暫定値。#4116 の確認待ち）。
 pub const MAX_RETAINED_DIAL_HELPERS: usize = 8;
@@ -156,6 +164,94 @@ impl DialTimings {
     }
 }
 
+/// 回収できず保持した helper の操作名（暫定。#4116 の項目 3）。
+pub const OP_PF_HELPER_RETAINED: &str = "cri.port_forward.helper_retained";
+/// 保持数が [`MAX_RETAINED_DIAL_HELPERS`] を超えた操作名（暫定）。
+pub const OP_PF_RETAINED_OVER_LIMIT: &str = "cri.port_forward.retained_over_limit";
+/// 満杯で dial を断った操作名（暫定）。
+pub const OP_PF_RETAINED_FULL: &str = "cri.port_forward.retained_full";
+/// 異常行の `event` 名。
+pub const PF_EVENT_NAME: &str = "cri_port_forward_helper";
+/// 回収できず保持した理由（固定語彙）。
+pub const REASON_HELPER_UNREAPED: &str = "helper_unreaped";
+/// 保持数が上限を超えた理由。
+pub const REASON_RETAINED_OVER_LIMIT: &str = "retained_over_limit";
+/// 満杯で拒否した理由。
+pub const REASON_RETAINED_FULL: &str = "retained_full";
+
+/// 回収できない helper の保持・上限超過・満杯の拒否を telemetry へ出す口（CRI-6・REPAIR-4・REPAIR-5・#4546）。
+///
+/// 呼び出し元は [`PodNetnsDialer`] の `retain` と `dial_pod` の入口だけ。`main.rs` が共有 `OpRecorder` と
+/// `telemetry::stderr_sink()` で組み立てて `ProductionPortForward::pod_network` へ渡す。件数は `OpRecorder`、
+/// 異常行は出来事ごとの累計が 2 のべき乗の時だけ（共有 sink の監査行を押し出さない間引き。SEC-4）。
+/// ブロックせず I/O もしない。行には `&'static str` と累計 `u64` だけを埋める（pid・port・パス・errno は出さない）。
+pub struct PodDialTelemetry {
+    recorder: Arc<OpRecorder>,
+    sink: LineSink,
+    retained: OpName,
+    over_limit: OpName,
+    full: OpName,
+    retained_total: AtomicU64,
+    over_limit_total: AtomicU64,
+    full_total: AtomicU64,
+}
+
+impl PodDialTelemetry {
+    /// 操作名を検証して作る。失敗は呼び出し側（`main.rs`）が起動中止にする（観測なしで動き続けない）。
+    pub fn new(recorder: Arc<OpRecorder>, sink: LineSink) -> Result<Self, TraitError> {
+        Ok(Self {
+            recorder,
+            sink,
+            retained: OpName::new(OP_PF_HELPER_RETAINED)?,
+            over_limit: OpName::new(OP_PF_RETAINED_OVER_LIMIT)?,
+            full: OpName::new(OP_PF_RETAINED_FULL)?,
+            retained_total: AtomicU64::new(0),
+            over_limit_total: AtomicU64::new(0),
+            full_total: AtomicU64::new(0),
+        })
+    }
+
+    fn note(&self, name: &OpName, total: &AtomicU64, op: &'static str, reason: &'static str) {
+        // record の失敗（名前数の上限など）は記録器側の dropped_records に計上されるため無視する。
+        let _ = self
+            .recorder
+            .record(name, OpOutcome::Failure, Duration::ZERO);
+        let n = total.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        if n.is_power_of_two() {
+            self.sink.submit(format!(
+                "{{\"event\":\"{PF_EVENT_NAME}\",\"op\":\"{op}\",\"outcome\":\"error\",\"reason\":\"{reason}\",\"count\":{n}}}"
+            ));
+        }
+    }
+
+    fn helper_retained(&self) {
+        self.note(
+            &self.retained,
+            &self.retained_total,
+            OP_PF_HELPER_RETAINED,
+            REASON_HELPER_UNREAPED,
+        );
+    }
+
+    fn retained_over_limit(&self) {
+        self.note(
+            &self.over_limit,
+            &self.over_limit_total,
+            OP_PF_RETAINED_OVER_LIMIT,
+            REASON_RETAINED_OVER_LIMIT,
+        );
+    }
+
+    fn retained_full(&self) {
+        self.note(
+            &self.full,
+            &self.full_total,
+            OP_PF_RETAINED_FULL,
+            REASON_RETAINED_FULL,
+        );
+    }
+}
+
 /// POD ネットワークの pod の PortForward 用 dialer。
 pub struct PodNetnsDialer {
     node: NodeLoopbackDialer,
@@ -163,6 +259,8 @@ pub struct PodNetnsDialer {
     spawner: Arc<dyn NetnsDialSpawner>,
     retained: Mutex<Vec<Child>>,
     timings: DialTimings,
+    /// 保持・上限超過・満杯の観測（`None` は観測なし。試験用の `with_spawner` の既定）。
+    telemetry: Option<PodDialTelemetry>,
 }
 
 impl std::fmt::Debug for PodNetnsDialer {
@@ -173,8 +271,15 @@ impl std::fmt::Debug for PodNetnsDialer {
 
 impl PodNetnsDialer {
     /// 本番の dialer（helper は plugin-cri の隣の supervisor の bin）。
-    pub fn new(source: Arc<dyn PodNamespaceSource>) -> Self {
-        Self::with_spawner(source, Arc::new(SupervisorNetnsDialSpawner))
+    pub fn new(source: Arc<dyn PodNamespaceSource>, telemetry: PodDialTelemetry) -> Self {
+        Self::with_spawner(source, Arc::new(SupervisorNetnsDialSpawner)).with_telemetry(telemetry)
+    }
+
+    /// 観測の口を付ける（本番は [`Self::new`]。試験は `with_spawner` の後に付ける）。
+    #[must_use]
+    pub fn with_telemetry(mut self, telemetry: PodDialTelemetry) -> Self {
+        self.telemetry = Some(telemetry);
+        self
     }
 
     /// 起動口を差し替えた dialer（試験用の入口。本番の結線は [`Self::new`]）。
@@ -188,6 +293,7 @@ impl PodNetnsDialer {
             spawner,
             retained: Mutex::new(Vec::new()),
             timings: DialTimings::production(),
+            telemetry: None,
         }
     }
 
@@ -223,6 +329,15 @@ impl PodNetnsDialer {
         let mut r = self.lock_retained();
         Self::sweep_locked(&mut r);
         r.push(child);
+        let len = r.len();
+        // 記録は lock の外で行う（I/O は無いが、保持一覧の lock を長く持たない。#4546）。
+        drop(r);
+        if let Some(t) = &self.telemetry {
+            t.helper_retained();
+            if len > MAX_RETAINED_DIAL_HELPERS {
+                t.retained_over_limit();
+            }
+        }
     }
 
     fn dial_pod(
@@ -242,6 +357,9 @@ impl PodNetnsDialer {
             return Err(CriError::invalid_argument(MSG_TIMEOUT_POSITIVE));
         }
         if self.sweep_retained() >= MAX_RETAINED_DIAL_HELPERS {
+            if let Some(t) = &self.telemetry {
+                t.retained_full();
+            }
             return Err(CriError::resource_exhausted(MSG_RETAINED_FULL));
         }
         let t = &self.timings;

@@ -500,6 +500,7 @@ unsafe fn adopt_scm_rights(parsed: ScmRights) -> Result<Vec<OwnedFd>, SysError> 
 /// 有効にする場合は `parse_scm_rights`（解析）と `adopt_scm_rights`（所有と回収）も同じ変更で直し、その fd も閉じる。
 /// `SO_PASSCRED` の `SCM_CREDENTIALS` は fd を運ばないので対象外だが、制御バッファは `cmsg_len` で切るため
 /// cmsg を足すと寸法の前提も変わる。現状 net crate はこれらのオプションを有効にしていない（SEC-1・REPAIR-5・#4531）。
+/// `SO_PASSPIDFD`・`SO_PASSRIGHTS`・`SO_PASSSEC` が `src/` に現れないことは `tests/recv_cmsg_options_absent.rs` が確かめる（#4544）。
 ///
 /// # 残余
 /// `cmsg_len` が壊れている（16 未満・終端越え・ヘッダー切れ）と、以降の cmsg の位置と fd 番号を特定できない。

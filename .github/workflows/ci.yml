@@ -1582,7 +1582,8 @@ jobs:
       # netns_dial_userns（`crates/net/tests/netns_dial_userns.rs`。CRI-6・NET-3・SEC-1・REPAIR-5・REPAIR-12・#4479・#4480・#4481）:
       # netns-dial helper と親側 NetnsDialChannel が非特権の user + network namespace の中の listener と往復し（場面 R）、
       # lo が down の対象では到達不能（場面 L）、親の同 port の listener へは届かず、別 netns の socket は
-      # netns_mismatch で拒否される（場面 M）ことと、参加の前後・特権の破棄の後の PR_GET_DUMPABLE が 0 であること（場面 D。#4558）を照合する実機前提テスト（harness = false）。上で緩和した sysctl を使い回し、
+      # netns_mismatch で拒否される（場面 M）ことと、参加の前後・特権の破棄の後の PR_GET_DUMPABLE が 0 であること（場面 D。#4558）を照合する
+      # 実機前提テスト（harness = false）。上で緩和した sysctl を使い回し、
       # 新しい check-run・sudo・permissions は追加しない（rootless のみ）。`--ignored` が届かなくても exit 0 になるため、
       # 成功行 5 行を試験ソースから導出して双方向に照合し（--min 5）、件数減を fail-closed にする（#2825・REPAIR-12）。
       - name: netns_dial_userns のビルド（実行タイムアウトの時間枠を消費しないよう分離）

@@ -722,7 +722,7 @@ CRI の `ExecSync`（現状 `UNIMPLEMENTED`）も本設計の helper を再利�
 - `StreamWiring` は後から項目を足せる構造体で、種別ごとの結線の有無と、attach が stdin・tty を扱えるか（`attach_interactive`。#3763）を持つ。既定は全未結線かつ非対話（fail-closed）。`StreamDispatcher::wiring()` は Attach の子の `attach_interactive` を伝える
 - `StreamWiring::port_forward_pod_network`（#3755）は PortForward が POD ネットワークの pod にも対応するかを表し、既定は偽（fail-closed）。`only`・`with` では立たず、`all()`（試験用の全機能）と `with_port_forward_pod_network` で立つ。`StreamDispatcher` は子ハンドラの宣言を引き継ぐ
 
-#### 脚注: #4558 の結果（non-dumpable を参加の前へ移す。SEC-1・CRI-6・NET-3）
+### 脚注: #4558 の結果（non-dumpable を参加の前へ移す。SEC-1・CRI-6・NET-3）
 
 Agent が安全側に倒して記録した判断で、オーナーの承認は得ていない。一次情報は Linux v6.12 の tag（上の脚注と同じ取得方法）。
 

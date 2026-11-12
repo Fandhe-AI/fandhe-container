@@ -14,6 +14,8 @@
 //! `SCM_RIGHTS` 0 本・`MSG_CTRUNC` なしを照合する（成功の ack も 0 本）。応答を書かない分岐（途中までの送信・読み取り期限切れ）
 //! と到達できない分岐（名前の長さ超過・`get_mut` の `None`）は観測できないため対象外。
 //!
+//! 追加（#4573・SUP-6・REPAIR-4）: kind 6 の結果は `control_signal` ではなく `control_exec` に数える。
+//!
 //! 追加（#2626 の codex P1）: pidfd を渡した接続を supervisor のガードが預かり、CLI の作成通知（ExecCgroupNotify）の後に
 //! 接続が切れる（CLI の消滅を含む）か保持期限が来たら、偽の回収役が通知された名前で 1 回だけ呼ばれることを照合する
 //! （SUP-6・REPAIR-5・REPAIR-4）。実 cgroup の回収は実機前提の試験が担う。
@@ -794,4 +796,55 @@ fn sec1_sup6_handover_without_reclaimer_is_refused() {
         .unwrap_err();
     assert_eq!(e.code(), ErrorCode::FailedPrecondition);
     assert_eq!(e.message(), "the supervisor cannot reclaim exec cgroups");
+}
+
+/// 記録は応答を書いた後なので、`op` の (success, failure) が期待値になるまで 3 秒を上限に待つ。
+fn wait_op_counts(rig: &Rig, op: &str, want: (u64, u64)) {
+    let op = fandhe_container_core::observability::OpName::new(op).unwrap();
+    let until = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(s) = rig.observer.recorder().snapshot_op(&op)
+            && (s.success(), s.failure()) == want
+        {
+            assert!(s.latency().is_some());
+            return;
+        }
+        assert!(
+            Instant::now() < until,
+            "control_exec did not reach {want:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn assert_no_control_signal(rig: &Rig) {
+    let sig = fandhe_container_core::observability::OpName::new("control_signal").unwrap();
+    assert!(rig.observer.recorder().snapshot_op(&sig).is_none());
+}
+
+/// SUP-6・REPAIR-4・#4573: exec の受け渡しの成功と失敗は `control_exec` に数え、`control_signal` には入れない。
+#[test]
+fn repair4_sup6_4573_exec_handover_is_counted_as_control_exec() {
+    let rig = Rig::start("opname", true, true);
+    let _ok = rig.obtain(PID, Duration::from_secs(2)).unwrap();
+    let e = rig
+        .obtain(PID + 1, Duration::from_secs(2))
+        .map(|_| ())
+        .unwrap_err();
+    assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+    wait_op_counts(&rig, "control_exec", (1, 1));
+    assert_no_control_signal(&rig);
+}
+
+/// SUP-6・REPAIR-4・#4573: payload を読んだ後の拒否（回収役なし）も `control_exec` の失敗に数える。
+#[test]
+fn repair4_sup6_4573_exec_refusal_without_reclaimer_is_counted_as_control_exec_failure() {
+    let rig = Rig::start_with("opnorec", true, true, None);
+    let e = rig
+        .obtain(PID, Duration::from_secs(2))
+        .map(|_| ())
+        .unwrap_err();
+    assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+    wait_op_counts(&rig, "control_exec", (0, 1));
+    assert_no_control_signal(&rig);
 }

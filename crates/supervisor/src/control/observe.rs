@@ -28,6 +28,10 @@ const EXIT_WATCH_OP_NAME: &str = "control_exit_watch";
 /// Attach 要求（ExecHandover 同様 fd を返す 1 往復）の計測に使う操作名（#4075・REPAIR-4）。
 const ATTACH_OP_NAME: &str = "control_attach";
 
+/// exec 用 pidfd の受け渡し（ExecHandoverRequest。kind 6）の計測に使う操作名。signal 配送の集計と分ける
+/// （#4573・#4116 項目 3・SUP-6・REPAIR-4）。
+const EXEC_OP_NAME: &str = "control_exec";
+
 /// 監査の記録先と計測の集計器を束ねた観測の口。サーバが共有で持つ。
 pub struct ControlObserver {
     audit: Option<Arc<dyn AuditSink>>,
@@ -107,6 +111,14 @@ impl ControlObserver {
     /// Attach 要求（kind 9）1 件の結果とレイテンシを集計する（#4075・REPAIR-4）。
     pub fn record_attach(&self, success: bool, elapsed: Duration) {
         self.record_op(ATTACH_OP_NAME, success, elapsed);
+    }
+
+    /// exec 用 pidfd の受け渡し（kind 6）1 件の結果とレイテンシを集計する（SUP-6・REPAIR-4・#4116 項目 3・#4573）。
+    /// レイテンシは pidfd を送るまでで、ガードが接続を預かる時間は含まない。ヘッダで kind 6 と分かった後の失敗は
+    /// すべてここの失敗に数える。kind 7（ExecCgroupNotify）はガードのスレッドが読む 2 つ目の要求で、この口を通らず
+    /// 数えない。その後の回収の結果は `exec_cgroup_reclaim` に数える。
+    pub fn record_exec(&self, success: bool, elapsed: Duration) {
+        self.record_op(EXEC_OP_NAME, success, elapsed);
     }
 
     fn record_op(&self, op: &'static str, success: bool, elapsed: Duration) {

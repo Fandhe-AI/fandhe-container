@@ -8,8 +8,8 @@
 //! `classify.rs` の `stack10_service_reference_keys_are_unsupported_yet` はキーパス単位の表の照合で、
 //! 本ファイルは 1 ファイル 1 キーで、そのキーだけが関門を止めることまで固定する。
 //!
-//! 「TOML 未生成」の定義: TOML の書き出しは未実装（REPAIR-3）で stdout は常に空のため、空であることは
-//! 証拠にしない。代わりに (a) `error_free` が偽、(b) blocker が対象キーの 1 件だけ、
+//! 「TOML 未生成」の定義: 実バイナリは入力が 1 件で対象のときだけ stdout へ TOML を書く（#3613）。本ファイルは
+//! 5 件入りのディレクトリを通すため stdout が空であることは証拠にならない（`skipped-multiple-files`）。代わりに (a) `error_free` が偽、(b) blocker が対象キーの 1 件だけ、
 //! (c) 変換結果の TOML に対象キー名と参照先のマーカーが現れない（スキーマに行き先が無い）、を照合する。
 //!
 //! 配置: issue は `crates/stack/tests/` を挙げるが、対象の API は本 crate にあり、依存は

@@ -391,10 +391,13 @@ pub(super) fn append_lines(
     let deadline = Instant::now() + HOSTS_LOCK_TIMEOUT;
     let _guard = lock_guard_bounded(deadline)?;
     // 宣言の逆順で drop されるため、flock の明示 unlock → プロセス内ミューテックスの順に外れる。
-    let mut file = lock_exclusive_bounded(file, deadline)?;
+    let mut lock = lock_exclusive_bounded(file, deadline)?;
+    let file = lock
+        .as_file_mut()
+        .ok_or_else(|| io_err("hosts file lock is not held"))?;
     // サイズ・リンク数はロック取得までに変わりうるため、排他区間内で開き直した fd に対して再確認する。
-    verify_hosts_file(&file)?;
-    verify_same_mount(&root, &file)?;
+    verify_hosts_file(file)?;
+    verify_same_mount(&root, file)?;
 
     let len = file
         .metadata()
@@ -423,9 +426,9 @@ pub(super) fn append_lines(
     }
     // 容量不足等で途中まで書いて失敗すると不完全な行が残り、再試行でその後ろへ追記されてしまう。
     // 排他ロックを保持したまま書き込み前の長さへ戻し、失敗後のファイルを元の状態に保つ。
-    let (written, res) = write_all_counted(&mut file, payload.as_bytes());
+    let (written, res) = write_all_counted(file, payload.as_bytes());
     if res.and_then(|_| file.sync_all()).is_err() {
-        return Err(rollback_after_failure(&file, len, written));
+        return Err(rollback_after_failure(file, len, written));
     }
     Ok(())
 }
@@ -478,7 +481,7 @@ mod tests {
         };
         let guard =
             lock_exclusive_bounded(open(), Instant::now() + Duration::from_secs(1)).unwrap();
-        let dup = guard.clone_file_for_test().unwrap();
+        let dup = guard.clone_file_for_test();
         let probe = open();
         assert!(matches!(probe.try_lock(), Err(TryLockError::WouldBlock)));
         drop(guard);

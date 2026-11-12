@@ -800,7 +800,7 @@ mod tests {
         let path = root.join("ports.reg");
         let lock_path = with_suffix(&path, ".lock");
         let guard = open_locked(&path).unwrap();
-        let dup = guard.clone_file_for_test().unwrap();
+        let dup = guard.clone_file_for_test();
         let probe = OpenOptions::new()
             .read(true)
             .write(true)

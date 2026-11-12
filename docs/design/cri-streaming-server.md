@@ -445,7 +445,7 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 
 **NODE（#3755）**:
 
-- host netns の `127.0.0.1:<port>` だけへ `dial_timeout`（10 秒）で接続する。接続先は要求から組み立てず loopback に固定する（SEC-1）。`::1` は試さない（fail-closed）
+- host netns の `127.0.0.1:<port>` だけへ `dial_timeout`（10 秒）で接続する。接続先は要求から組み立てず loopback に固定する（SEC-1）。`::1` は試さない（fail-closed）。NODE は #4575 で別途扱う（POD は #4572 で `::1` へつなぎ直す）
 - NODE が先に成り立つ理由: NODE ネットワークでは network namespace の要素を作らず（host netns）、本番の `NetworkReady` は false なので、現状 kubelet が受ける Pod は hostNetwork だけである
 - NODE か POD かは、cri が RPC の時点で sandbox の記録（保存済みの `config` の `namespace_options.network`）から決め、発行時の要求に保存して dialer へ渡す。#3755 で `PortForwardDialer` の引数に対象の型（例: `PortForwardTarget { pod_sandbox_id, network: Node | Pod }`）を足す。URL やヘッダから組み立て直さず、plugin-cri に記録の解析を複製しない（REPAIR-1）
 - hostNetwork の Pod の port-forward はホストの loopback 上の任意のサービスへ届く。これは hostNetwork の性質で、認可は単回トークンの URL と kubelet / apiserver 側が担う
@@ -461,8 +461,8 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 1. plugin-cri の dialer（`PodNetnsDialer`）が `target.pod_sandbox_id()` で `ProductionPodHolder` の自分の表を引く。CRI の要求・URL・cri の記録の pid からは作らない（#2776）。表のロックを取った区間は非ブロッキングの syscall だけで、entry の存在・`child_exit_observed` が偽であること・`/proc/<pid>/ns/{user,net}` の `O_RDONLY|O_CLOEXEC` での open・`fstat` の (dev, ino) が READY のときに保存した `NsId` と一致することを確かめる。不一致・不在は fail-closed で失敗し、host loopback へは縮退しない
 2. supervisor の bin（`holder_executable_beside` と同じ解決・検査。解決処理は共通化して再利用）を第 1 引数 `netns-dial` で起動する。`env_clear`・cwd `/`・stdin は `SOCK_SEQPACKET` の socketpair の子側・stdout と stderr は null（診断は応答 frame の固定語彙で返す）・argv に可変値を載せない
 3. plugin-cri は channel で要求 frame（port・connect の期限）と fd 2 本（user, net）を SCM_RIGHTS で送る
-4. helper（crates/net の `netns_dial`。`netns_holder` の兄弟）は argv の検査 → non-dumpable（起動直後。#4558）→ PDEATHSIG=SIGKILL → stdin の種別と `SO_PEERCRED` の pid が親であることの確認 → `close_range(3..)` → 要求と fd ちょうど 2 本の期限つき受信（`MSG_CTRUNC`・本数違いは拒否）→ `setns(user)`・`setns(net)` → `/proc/self/ns/{user,net}` と受けた fd の (dev, ino) の照合 → 参加後も dumpable が 0 であることの確認 → capability を空にし NNP・non-dumpable の再設定 → `TcpStream::connect_timeout(127.0.0.1:port, C)`（std でスレッドを作らない）→ 応答 `Connected` に接続済み fd 1 本を添えるか `Error{code}`（固定語彙: refused・timed_out・unreachable・join_failed・identity_mismatch・invalid_request）を送って終了する
-5. plugin-cri は受けた fd を net の安全な公開 API `verify_dialed_socket` で検証してから `TcpStream` にする。socket・`SO_TYPE` が `SOCK_STREAM`・`peer_addr` が `127.0.0.1:<要求した port>`・`local_addr` が IPv4 loopback、かつ `SIOCGSKNS` で得た socket の netns の (dev, ino) が保持役の net の `NsId` と一致すること。最後の項目は、helper の不具合で host netns の socket が返り host loopback が露出する事態を plugin-cri 側で塞ぐ多層防御である
+4. helper（crates/net の `netns_dial`。`netns_holder` の兄弟）は argv の検査 → non-dumpable（起動直後。#4558）→ PDEATHSIG=SIGKILL → stdin の種別と `SO_PEERCRED` の pid が親であることの確認 → `close_range(3..)` → 要求と fd ちょうど 2 本の期限つき受信（`MSG_CTRUNC`・本数違いは拒否）→ `setns(user)`・`setns(net)` → `/proc/self/ns/{user,net}` と受けた fd の (dev, ino) の照合 → 参加後も dumpable が 0 であることの確認 → capability を空にし NNP・non-dumpable の再設定 → `TcpStream::connect_timeout(127.0.0.1:port, C)`、失敗したら（期限切れ・残り 0 を除き）同じ C の残り時間で `[::1]:port`（#4572。std でスレッドを作らない）→ 応答 `Connected` に接続済み fd 1 本を添えるか `Error{code}`（固定語彙: refused・timed_out・unreachable・join_failed・identity_mismatch・invalid_request）を送って終了する
+5. plugin-cri は受けた fd を net の安全な公開 API `verify_dialed_socket` で検証してから `TcpStream` にする。socket・`SO_TYPE` が `SOCK_STREAM`・`AF_INET` か `AF_INET6`、`peer_addr` が `127.0.0.1:<要求した port>` か `[::1]:<要求した port>`（scope 0）と完全一致（v4-mapped・IPv4 互換形・`::1` 以外の IPv6 は正規化せず拒否）、`local_addr` が IPv4 なら loopback（127/8）・IPv6 なら `::1` だけ、かつ `SIOCGSKNS` で得た socket の netns の (dev, ino) が保持役の net の `NsId` と一致すること。最後の項目は、helper の不具合で host netns の socket が返り host loopback が露出する事態を plugin-cri 側で塞ぐ多層防御である
 6. データ経路はカーネルの socket を cri の `PortForwardHandler` が直接読み書きする。中継のプロセスは無く、NET-3 の往復に上乗せは無い。上乗せは接続確立時の helper の起動だけ
 
 PDEATHSIG の正当化: helper を起動するのは dial を実行して完了まで待つ blocking スレッドで、dial が返る前に helper は終了または回収されている。スレッドの終了で届く PDEATHSIG は意図どおりに働く（plugin-cri の SIGKILL でも即座に止まる）。pod-holder が PDEATHSIG を使わない理由（spawn したスレッドより長く生きる）は当てはまらない。channel の EOF と helper 自身の期限も重ねる。
@@ -484,7 +484,7 @@ helper が要る理由（カーネルの要件）: `setns(CLONE_NEWUSER)` は多
 
 #### SEC-1（接続先の制限）
 
-- channel を越える可変値は port（`NonZeroU16`）と期限だけ。アドレスは helper が `127.0.0.1` 固定で書く。`::1` は試さない（POD では #4116 の項目 10 で承認・2026-11-12。再評価条件は下の「オーナー判断」）
+- channel を越える可変値は port（`NonZeroU16`）と期限だけ。アドレスは helper が `127.0.0.1`、失敗したら `::1` の固定の 2 つで書く（POD では #4116 の項目 10 を 2026-11-12 に見直して承認。#4572。期限は C を延ばさない。下の「オーナー判断」）
 - netns の出所は自 sandbox の保持役の fd だけ。保持役が無い・死んだ・plugin-cri の再起動で表が空、のいずれも `UNAVAILABLE` の固定文で失敗し、`NodeLoopbackDialer` へは縮退しない
 - cri の対応表を締める（F9。#4485 で実装済み）。#4485 より前の `port_forward_network` は NODE 以外をすべて `Pod` にしていたが、bundle は network の `CONTAINER` を「コンテナごとの新しい netns」、`TARGET` を未対応と扱うため、POD を有効にすると `CONTAINER` の pod まで保持役の netns へつながる。`POD` か未指定（proto の既定 0 は POD）だけを `Pod` とし、`CONTAINER`・`TARGET`・未知の値は RPC 時に `UNIMPLEMENTED`（固定文。#4491 の判断 2・2026-11-12 で承認）、`Pod` で記録に保持役が無ければ `FAILED_PRECONDITION` にする
 - pod A / B の取り違えが無いことを試験で必須にする（単体は固定プログラムの保持役 2 つ、実機は段 F）
@@ -548,7 +548,7 @@ sys に新しい unsafe を足す子（#4478・#4479・#4483）は、PR 本文�
 
 1. `SIOCGSKNS` による socket の netns の照合は必須（#4491 の判断 1）。失敗（非対応・権限不足）したら dial を fail-closed で失敗させる。理由: 親が期待する netns との結び付きを担うのはこの照合だけで、helper 側の照合は受けた fd との自己整合しか見ない（#4508 の P3-A）。再評価条件: CI・実機で拒否されても検査は緩めず、改めてオーナー判断に上げる。緩める案を採るなら、代わりの結び付き（期待値を helper へ渡して helper でも照合する等）が要る
 2. network が `CONTAINER`・`TARGET`・未知の値の pod の port-forward は、RPC 時に固定文の `UNIMPLEMENTED` を返す。`POD` と未指定だけを `Pod` とする（#4491 の判断 2）。再評価条件: `CONTAINER` の pod の port-forward が必要になったとき、またはコンテナの netns へつなぐ案を採るとき。どちらも containerd の挙動を一次情報で確かめてから決める
-3. POD でも `::1` は試さず、helper は `127.0.0.1` だけに接続する（#4116 の項目 10）。再評価条件: IPv4 で失敗したとき containerd が IPv6（`::1`）でも試すと一次情報で分かったら、NODE（項目 2）とあわせて見直す
+3. POD の helper は `127.0.0.1` だけに接続する（#4116 の項目 10）としていたが、再評価条件（containerd が IPv4 で失敗したとき IPv6 でも試すと一次情報で分かったら見直す）に当たり、2026-11-12 に見直された（#4116 の 08:07 のオーナーコメント・#4572）。containerd の `internal/cri/server/sandbox_portforward_linux.go`（main）は `tcp4` で `localhost:<port>` に失敗したとき `tcp6` でつなぎ直す。オーナーが決めたのは「IPv4 で失敗したら `::1` でつなぎ直す・宛先は 127.0.0.1 と ::1 の 2 つに固定・期限は延ばさない」まで。親側の照合は IPv6 の loopback も完全一致で受け、`SIOCGSKNS` は IPv6 でも必須とする。両方失敗したときの理由（IPv4 の理由を返し、期限切れは `TimedOut`）は Agent が安全側に倒して記録した判断で、オーナーの承認は得ていない。NODE（項目 2）は #4575
 4. 期限と上限の表は暫定値のまま承認する（#4116 の項目 11）。保持の上限 8 を並行する dial が超えること（既定で最大 39、`max_inflight_dials` が上限の 256 なら最大 263）は許容し、入口の検査に並行数を含める案は採らない。理由: 超えても有界で止まり、保持・上限超過・満杯は #4555 で telemetry に出る。並行数を含めると、回収の失敗が重なったときに正常な dial まで断ってしまう。保持の解消は記録しない。再評価条件: 項目 3（語彙）を確定するときに見直す
 
 #### 確認事項（決定扱いにしない）
@@ -653,7 +653,7 @@ CRI の `ExecSync`（現状 `UNIMPLEMENTED`）も本設計の helper を再利�
 - Exec の残余（診断）: 生成側は #4284 で入った。状態ストア等 core の `TraitError` 起因の段は errno が `none`（`TraitError` へ errno を持たせる案と、`require_stdio_kinds`・mask の不一致の実機前提の照合は #4327 で `stream_exec_real` に追加済み）
 - Attach の残余: 入力の書き込みは、書き込み先の記述（`fstat` の `st_dev`・`st_ino`）ごとの排他で調停する。表は backend が持ち、生きた項目は入力スレッド数以下（上限 `MAX_ATTACH_SESSIONS`。満杯は共有へ縮退せず `RESOURCE_EXHAUSTED`）。pipe・socket は記述ごとに固有の inode、pty master は本番ではコンテナごとの devpts の inode のため、衝突は同じコンテナ内に限る。plugin 外の書き手が空きを使い切ると保持者は `write` で止まり、その間は同じ記述（同じコンテナ）の入力だけが進まない（別コンテナは進む）。同じ記述の他セッションの排他の待ちは取り消しで抜け、スレッド・fd・枠を返す（#4134・#4232・CRI-6・REPAIR-5）
 - Attach の保持者本人の blocking write の取り消し（#4232 の残余を #4287 で pipe について解消。CRI-6・REPAIR-5・REPAIR-3）。比較: (A) スレッド宛てシグナルで `EINTR` にする案は、`sys::signal(3)` が BSD セマンティクス（`SA_RESTART`）で `write` が再開されるため `sigaction`（アーキごとの `struct sigaction`）・`pthread_self`・`pthread_kill` の新しい FFI 宣言とプロセス全体のシグナル配置の変更・`libc` の機械照合が要り、承認待ちで未実装。(B) `/proc/self/fd/N` を `O_WRONLY|O_NONBLOCK` で開き直して plugin-cri 専用の open file description にする案は pipe（FIFO）だけに採用した（`reopen_pipe_nonblocking`）: 記述が自分専用なので supervisor 側へ `O_NONBLOCK` が漏れず、`write` は `EAGAIN` で即戻って保持が有限になる。開く前に FIFO であることを `fstat` で確かめ、開いた後も FIFO と (dev, ino) の一致を照合し、元の記述はすぐ閉じる（唯一の書き込み端が閉じたときの EOF を保つ）。失敗・非対応のアーキ（`O_NONBLOCK` の定数は Linux の x86_64・aarch64 のみ）は従来の共有記述の経路へ戻る。pty master は開くと新しい pty が割り当てられて入力が別の端末へ流れ、socket は `ENXIO` のため開き直さない。(C) `send(MSG_DONTWAIT)`・`pwritev2(RWF_NOWAIT)` は pty に効かず版数依存。(D) fd の close・dup2 は blocking 中の `write` を戻さない。残余: pty・socket は共有記述のままで、plugin 外の書き手に空きを使い切られると保持者は `write` の中で止まる。ただし本番の stdin は pipe で、pty master へ書くのは plugin-cri の attach だけ（同じ排他で直列化され、supervisor の捕捉は読むだけ）のため、`poll` が Ready を返した後の書き込みは止まらず、この残余は本番では起きない見込み。同じ devpts instance の複数の pty master は同じキー（ptmx の dev/ino）に畳まれ、将来 attach がコンテナ内の別 pty を対象にするときは pty 番号をキーに足す必要がある（core の `PtyMaster` に番号の取得口が要る）。コンテナの終了で読み手が閉じれば pipe は `EPIPE`、pty は `EIO` で保持者は抜ける。再評価条件: plugin-cri への `libc` の dev-dependency 追加の承認（#3290・#1837 の子）・plugin 外の書き手が同じ stdin・pty master へ実際に書く経路の追加・止まった保持者による枠の枯渇の観測・attach が別の pty を対象にするとき
-- 暫定値・設計の確認事項（exec の全体上限・同時セッション数・NODE の `::1`・終了コード・観測名など）: 上の「未確認・オーナー確認事項」と #4116（オーナー判断）。POD の `::1`（項目 10）と POD dial の期限・上限（項目 11）は判断済み
+- 暫定値・設計の確認事項（exec の全体上限・同時セッション数・NODE の `::1`・終了コード・観測名など）: 上の「未確認・オーナー確認事項」と #4116（オーナー判断）。POD の `::1`（項目 10。2026-11-12 に見直し済み・#4572）と POD dial の期限・上限（項目 11）は判断済み
 - rootful: plugin-cri の start が uid 0 を `UNIMPLEMENTED` にするため、rootful のコンテナは無く 3 RPC とも使えない（uid 0 の拒否は #2442、rootful を許すかは #2241 の判断待ち）
 - 非 Linux: Exec は未結線の `UNIMPLEMENTED`。コンテナの start 自体も未実装（macOS の状態ルートは #2431）
 - `ExecSync`: `UNIMPLEMENTED` のまま。追跡 issue 未起票。実装するときは Exec と同じインスタンスの記録と起動時の照合を入れる義務がある（#4286）

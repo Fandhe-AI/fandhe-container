@@ -3,7 +3,7 @@
 //! 生の `Vec<u8>` を手で組まず、型付きの [`DialRequest`] / [`DialResponse`] から 16 バイトの newtype
 //! （[`DialRequestFrame`] / [`DialResponseFrame`]）を作り、受信側は `decode` で全項目を検証する。
 //! 要求と応答は別の型で、方向の取り違え（応答のバイト列を要求として読む等）は decode が拒否する。
-//! 宛先は helper が `127.0.0.1` 固定で書くため、アドレス欄は持たない（channel を越える可変値は port と期限だけ）。
+//! 宛先は helper が `127.0.0.1`、失敗したら `::1` の固定で書くため、アドレス欄は持たない（channel を越える可変値は port と期限だけ）。
 //! OS 非依存の純関数だけで、送受信は後続（#4478〜#4480）が担う。
 //!
 //! # レイアウト（16 バイト・整数は LE）
@@ -98,7 +98,7 @@ impl DialRequest {
         }
     }
 
-    /// 接続先の port（宛先アドレスは helper が `127.0.0.1` 固定）。
+    /// 接続先の port（宛先アドレスは helper が `127.0.0.1`、次に `::1` の固定）。
     pub fn port(&self) -> NonZeroU16 {
         self.port
     }

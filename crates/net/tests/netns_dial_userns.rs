@@ -2,13 +2,17 @@
 //! 別の namespace の socket を拒否することを照合する実機前提テスト（CRI-6・NET-3・SEC-1・REPAIR-5・REPAIR-12・#4479・#4480）。
 //!
 //! # 流れ
-//! 親（`-- --ignored`）は同じ番号 P の TCP port を、自分の（init の）network namespace の `127.0.0.1` で listen したまま、
-//! 次の場面を順に回す。対象は `unshare --user --map-root-user --net <自身> --target <P>`（試験専用の再入口。
-//! `lo` を up にして `127.0.0.1:P` で 1 接続を受け、受けた内容に `target:` を前置して返す）か、`lo` が down の `sleep`。
+//! 親（`-- --ignored`）は同じ番号 P の TCP port を、自分の（init の）network namespace の `127.0.0.1` と `[::1]` で
+//! listen したまま、次の場面を順に回す。対象は `unshare --user --map-root-user --net <自身> --target <P> [v6]`
+//! （試験専用の再入口。`lo` を up にして `127.0.0.1:P`（`v6` なら `[::1]:P` だけ）で 1 接続を受け、受けた内容に
+//! `target:`（`v6` なら `target6:`）を前置して返す）か、`lo` が down の `sleep`。
 //! - 場面 L（到達不能）: `lo` が down で listener も無い対象へは `Helper(Unreachable | Refused)`。終了コード 1、stderr は空。
 //! - 場面 R（往復）: 対象 A の user / net の fd を `NetnsDialChannel` で helper へ送り、応答の fd が検証を通って
 //!   `TcpStream` になり、書いた内容に `target:` を前置した内容が返る（A の中の listener に届いた証拠）。親の P の
-//!   listener は接続を受けない。helper の終了コードは 0、stderr は空。
+//!   listener は接続を受けない。helper の終了コードは 0、stderr は空。応答の fd の peer は `127.0.0.1:P`（IPv4 を優先）。
+//! - 場面 V6（`::1` へのつなぎ直し。#4572）: `[::1]:P` だけで待ち受ける対象 C へ dial すると、helper は `127.0.0.1` で
+//!   失敗した後に `[::1]` でつなぎ直し、応答の fd が検証を通る（peer は `[::1]:P`、local は `::1`）。書いた内容に
+//!   `target6:` を前置した内容が返り、親の 2 つの listener は接続を受けない。
 //! - 場面 M（netns の不一致）: A の fd を送り、期待する netns に別の対象 B のものを渡すと、`Rejected(NetnsMismatch)`
 //!   で拒否される（非 root でも、試験の euid は A の user namespace の所有者なので `SIOCGSKNS` は成功し、識別の比較で落ちる）。
 //! - 場面 D（non-dumpable）: 試験専用の入口 `netns-dial-traced`（本番と同じ本体。#4558）で `lo` が down の対象へ dial し、
@@ -38,7 +42,7 @@ fn main() -> std::process::ExitCode {
             fandhe_container_net::netns_dial::test_support::run_netns_dial_traced_main(args)
         }
         Some(a) if a == "--ignored" => linux::run(),
-        Some(a) if a == "--target" => linux::target(args.next()),
+        Some(a) if a == "--target" => linux::target(args),
         _ => {
             println!(
                 "netns_dial_userns: ignored (real-machine test; run with `-- --ignored`, see AGENTS.md)"
@@ -57,7 +61,7 @@ mod linux {
     use super::reap;
     use std::fs::File;
     use std::io::{BufRead as _, BufReader, Read as _, Write as _};
-    use std::net::{Ipv4Addr, TcpListener, TcpStream};
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
     use std::num::NonZeroU16;
     use std::os::fd::OwnedFd;
     use std::os::unix::fs::MetadataExt as _;
@@ -75,12 +79,14 @@ mod linux {
     const LINE_ROUND_TRIP: &str = "netns_dial_userns: helper joined the target and the channel returned a verified socket whose echo round trip matched";
     const LINE_PARENT_QUIET: &str = "netns_dial_userns: helper joined the target and the same-port listener in the parent namespace saw no connection";
     const LINE_MISMATCH: &str = "netns_dial_userns: helper joined the target and the channel rejected the socket expected in another target netns with netns_mismatch";
+    const LINE_V6: &str = "netns_dial_userns: helper joined the target and fell back to [::1] after 127.0.0.1 failed, and the verified socket's echo round trip matched";
     const LINE_DUMPABLE: &str = "netns_dial_userns: helper joined the target with PR_GET_DUMPABLE 0 before the join, right after the join and after hardening";
     const WANT_TRACE: &str =
         "netns-dial-trace dumpable before_join=0 after_join=0 after_harden=0\n";
     const TARGET_READY: &str = "netns_dial_userns: target ready";
     const PAYLOAD: &[u8] = b"ping-4480";
     const REPLY_PREFIX: &[u8] = b"target:";
+    const REPLY_PREFIX_V6: &[u8] = b"target6:";
 
     fn limit() -> Duration {
         let secs = std::env::var("FANDHE_CONTAINER_TEST_TIMEOUT_SECS")
@@ -107,7 +113,9 @@ mod linux {
 
     /// 対象（試験専用の再入口）: 新しい user + network namespace の中で `lo` を up にし、`127.0.0.1:port` で 1 接続を受けて
     /// `target:` + 受けた内容を返す。接続後の失敗（場面 M は相手が先に閉じる）は握りつぶして待機に入る。
-    pub fn target(port: Option<std::ffi::OsString>) -> ExitCode {
+    pub fn target(mut rest: impl Iterator<Item = std::ffi::OsString>) -> ExitCode {
+        let port = rest.next();
+        let v6 = rest.next().is_some_and(|m| m == "v6");
         let fail = |e: String| {
             eprintln!("netns_dial_userns: FAILED: target: {e}");
             ExitCode::from(1)
@@ -121,8 +129,12 @@ mod linux {
             let lo = LinkIndex::new(1).map_err(|e| format!("link index: {e}"))?;
             sock.set_link(&LinkSet::up(LinkRef::Index(lo)), t)
                 .map_err(|e| format!("lo up: {e}"))?;
-            let l =
-                TcpListener::bind((Ipv4Addr::LOCALHOST, port)).map_err(|e| format!("bind: {e}"))?;
+            let l = if v6 {
+                TcpListener::bind((Ipv6Addr::LOCALHOST, port))
+            } else {
+                TcpListener::bind((Ipv4Addr::LOCALHOST, port))
+            }
+            .map_err(|e| format!("bind: {e}"))?;
             l.set_nonblocking(true).map_err(|e| e.to_string())?;
             Ok(l)
         };
@@ -149,7 +161,7 @@ mod linux {
             let _ = s.set_read_timeout(Some(t));
             let mut buf = [0u8; 64];
             if let Ok(n) = s.read(&mut buf) {
-                let mut reply = REPLY_PREFIX.to_vec();
+                let mut reply = if v6 { REPLY_PREFIX_V6 } else { REPLY_PREFIX }.to_vec();
                 reply.extend_from_slice(buf.get(..n).unwrap_or(&[]));
                 let _ = s.write_all(&reply);
             }
@@ -204,14 +216,18 @@ mod linux {
     }
 
     /// listener を持つ対象（場面 R・M）。ready の行を待つ。早期終了は前提不足として失敗させる。
-    fn spawn_listening_target(port: u16) -> Result<Child, String> {
+    fn spawn_listening_target(port: u16, v6: bool) -> Result<Child, String> {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
         let exe = exe
             .to_str()
             .ok_or("non-UTF-8 test executable path")?
             .to_owned();
         let port_s = port.to_string();
-        let mut child = spawn_unshared(&[&exe, "--target", &port_s], true)?;
+        let mut args = vec![exe.as_str(), "--target", port_s.as_str()];
+        if v6 {
+            args.push("v6");
+        }
+        let mut child = spawn_unshared(&args, true)?;
         let stdout = child.stdout.take().ok_or("target stdout")?;
         let (tx, rx) = mpsc::channel::<String>();
         std::thread::spawn(move || {
@@ -325,14 +341,23 @@ mod linux {
         Ok(dialed)
     }
 
-    fn parent_quiet(listener: &TcpListener) -> Result<(), String> {
-        match listener.accept() {
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
-            other => Err(format!("parent listener saw a connection: {other:?}")),
-        }
+    /// 親（init）の network namespace で待ち受ける 2 つの listener（同じ番号 P の `127.0.0.1` と `[::1]`）。
+    struct ParentListeners {
+        v4: TcpListener,
+        v6: TcpListener,
     }
 
-    fn scenario_l(sleeper: &Child, port: u16, listener: &TcpListener) -> Result<(), String> {
+    fn parent_quiet(listeners: &ParentListeners) -> Result<(), String> {
+        for l in [&listeners.v4, &listeners.v6] {
+            match l.accept() {
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                other => return Err(format!("parent listener saw a connection: {other:?}")),
+            }
+        }
+        Ok(())
+    }
+
+    fn scenario_l(sleeper: &Child, port: u16, listener: &ParentListeners) -> Result<(), String> {
         let d = dial(sleeper.id(), sleeper.id(), port)?;
         check(d.stderr.is_empty(), || {
             format!("helper stderr {:?}", d.stderr)
@@ -351,7 +376,7 @@ mod linux {
         parent_quiet(listener)
     }
 
-    fn scenario_r(a: &Child, port: u16, listener: &TcpListener) -> Result<(), String> {
+    fn scenario_r(a: &Child, port: u16, listener: &ParentListeners) -> Result<(), String> {
         let d = dial(a.id(), a.id(), port)?;
         check(d.stderr.is_empty(), || {
             format!("helper stderr {:?}", d.stderr)
@@ -360,6 +385,11 @@ mod linux {
             format!("R: helper exit {}, want code 0", d.status)
         })?;
         let mut stream = d.result.map_err(|e| format!("R: dial failed: {e:?}"))?;
+        let want_peer = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        let got_peer = stream.peer_addr().map_err(|e| e.to_string())?;
+        check(got_peer == want_peer, || {
+            format!("R: peer {got_peer}, want {want_peer} (IPv4 preferred)")
+        })?;
         stream
             .set_read_timeout(Some(limit()))
             .and_then(|()| stream.set_write_timeout(Some(limit())))
@@ -375,7 +405,46 @@ mod linux {
         parent_quiet(listener)
     }
 
-    fn scenario_m(a: &Child, b: &Child, port: u16, listener: &TcpListener) -> Result<(), String> {
+    /// 場面 V6（#4572・CRI-6・NET-3・SEC-1）: `[::1]` だけで待ち受ける対象へ、IPv4 の失敗の後のつなぎ直しで届く。
+    fn scenario_v6(c: &Child, port: u16, listener: &ParentListeners) -> Result<(), String> {
+        let d = dial(c.id(), c.id(), port)?;
+        check(d.stderr.is_empty(), || {
+            format!("helper stderr {:?}", d.stderr)
+        })?;
+        check(d.status.code() == Some(0), || {
+            format!("V6: helper exit {}, want code 0", d.status)
+        })?;
+        let mut stream = d.result.map_err(|e| format!("V6: dial failed: {e:?}"))?;
+        let want_peer = SocketAddr::from((Ipv6Addr::LOCALHOST, port));
+        let got_peer = stream.peer_addr().map_err(|e| e.to_string())?;
+        check(got_peer == want_peer, || {
+            format!("V6: peer {got_peer}, want {want_peer}")
+        })?;
+        let got_local = stream.local_addr().map_err(|e| e.to_string())?;
+        check(got_local.ip() == Ipv6Addr::LOCALHOST, || {
+            format!("V6: local {got_local}, want ::1")
+        })?;
+        stream
+            .set_read_timeout(Some(limit()))
+            .and_then(|()| stream.set_write_timeout(Some(limit())))
+            .map_err(|e| e.to_string())?;
+        stream.write_all(PAYLOAD).map_err(|e| e.to_string())?;
+        let mut want = REPLY_PREFIX_V6.to_vec();
+        want.extend_from_slice(PAYLOAD);
+        let mut got = vec![0u8; want.len()];
+        stream
+            .read_exact(&mut got)
+            .map_err(|e| format!("V6: read reply: {e}"))?;
+        check(got == want, || format!("V6: reply {got:?}, want {want:?}"))?;
+        parent_quiet(listener)
+    }
+
+    fn scenario_m(
+        a: &Child,
+        b: &Child,
+        port: u16,
+        listener: &ParentListeners,
+    ) -> Result<(), String> {
         let d = dial(a.id(), b.id(), port)?;
         check(d.stderr.is_empty(), || {
             format!("helper stderr {:?}", d.stderr)
@@ -395,7 +464,7 @@ mod linux {
     }
 
     /// 場面 D（#4558・SEC-1）: trace 入口で `lo` が down の対象へ dial し、3 時点の dumpable がすべて 0 であることを見る。
-    fn scenario_d(sleeper: &Child, port: u16, listener: &TcpListener) -> Result<(), String> {
+    fn scenario_d(sleeper: &Child, port: u16, listener: &ParentListeners) -> Result<(), String> {
         let d = dial_with(sleeper.id(), sleeper.id(), port, true)?;
         check(d.stderr.is_empty(), || {
             format!("helper stderr {:?}", d.stderr)
@@ -438,30 +507,45 @@ mod linux {
         }
     }
 
-    fn run_inner(targets: &mut Vec<Child>) -> Result<[&'static str; 5], String> {
+    fn run_inner(targets: &mut Vec<Child>) -> Result<[&'static str; 6], String> {
         // 親（init）の network namespace の 127.0.0.1 で待ち受ける。対象も同じ番号を自分の namespace で使う。
         // helper が対象へ参加していなければ、ここへ繋がる。
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).map_err(|e| e.to_string())?;
-        listener.set_nonblocking(true).map_err(|e| e.to_string())?;
-        let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+        // 同じ番号を IPv4 と IPv6 の両方で取る（番号が IPv6 側で使用中なら取り直す）。
+        let mut bound = None;
+        for _ in 0..20 {
+            let v4 = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).map_err(|e| e.to_string())?;
+            let p = v4.local_addr().map_err(|e| e.to_string())?.port();
+            if let Ok(v6) = TcpListener::bind((Ipv6Addr::LOCALHOST, p)) {
+                bound = Some((v4, v6, p));
+                break;
+            }
+        }
+        let (v4, v6, port) = bound.ok_or("could not bind the same port on 127.0.0.1 and [::1]")?;
+        v4.set_nonblocking(true).map_err(|e| e.to_string())?;
+        v6.set_nonblocking(true).map_err(|e| e.to_string())?;
+        let listener = ParentListeners { v4, v6 };
 
         targets.push(spawn_sleep_target()?);
-        targets.push(spawn_listening_target(port)?);
-        targets.push(spawn_listening_target(port)?);
-        let (s, a, b) = (
+        targets.push(spawn_listening_target(port, false)?);
+        targets.push(spawn_listening_target(port, false)?);
+        targets.push(spawn_listening_target(port, true)?);
+        let (s, a, b, c) = (
             targets.first().ok_or("sleep target")?,
             targets.get(1).ok_or("target A")?,
             targets.get(2).ok_or("target B")?,
+            targets.get(3).ok_or("target C")?,
         );
         scenario_l(s, port, &listener)?;
         scenario_r(a, port, &listener)?;
         scenario_m(a, b, port, &listener)?;
+        scenario_v6(c, port, &listener)?;
         scenario_d(s, port, &listener)?;
         Ok([
             LINE_L,
             LINE_ROUND_TRIP,
             LINE_PARENT_QUIET,
             LINE_MISMATCH,
+            LINE_V6,
             LINE_DUMPABLE,
         ])
     }

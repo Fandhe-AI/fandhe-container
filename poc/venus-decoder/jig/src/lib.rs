@@ -17,7 +17,8 @@
 //! 起動入口（UDS の bind・期限つき accept・ログのファイル出力。F4・#1598）は `launch` と bin `venus-jig` に実装済み（Linux 限定）。
 //!
 //! 受理した `SUBMIT_3D` の本体の記録（`recording`。`--record` で記録ファイルへ書き出す。F6・#1602）は実装済み。
-//! 記録するのは提出の本体だけで、共有メモリ上のリングの中身は記録しない（F5.2b の後）。
+//! 共有メモリ上のリングの中身（`ring_record`。`CreateRingMESA` で作られたリングの差分を kind 1 で足す）も記録する（#1884。
+//! `unsafe` は足さず、memfd は `read_exact_at` で読む）。reply・extra・間接 cs の shmem は記録しない。
 //!
 //! 共有メモリの前提（F5.2b.2・#1641）: protocol feature `SHMEM`・`BACKEND_REQ` の広告と、`GET_SHMEM_CONFIG`・`SET_BACKEND_REQ_FD` の受け付けは
 //! `session` / `vhost_user` に実装済み。backend 要求（`SHMEM_MAP` / `SHMEM_UNMAP`）の期限つき送信は F5.2b.3（#1642）で `session` に実装済み。
@@ -40,6 +41,7 @@ pub mod launch;
 pub mod log;
 pub mod recording;
 pub mod resource;
+pub mod ring_record;
 #[cfg(target_os = "linux")]
 pub mod session;
 pub mod vhost_user;

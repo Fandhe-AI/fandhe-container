@@ -148,7 +148,7 @@ core の `ContainerRuntime` に exec は無く、shim v2 の `TaskExecLauncher` 
 
 ## 本番 backend の設計（#3752）
 
-2026-11-03 に main が決めた要点（Attach は段階方式、Exec は制御チャネルの exec 要求と fd 渡しで孤児時に縮退しない、PortForward は NODE を先に入れ POD は #2877 の後、依存は plugin-cri から supervisor への一方向で cri に実装を入れない）を詳しくした設計記録である。後続の兄弟 issue（#3753〜#3766。親 #3726・TASK-63・MS-7）はこの記録を正として実装する。オーナーの確認が要る点は末尾の「未確認・オーナー確認事項」にまとめ、それ以外は確定扱いとする。**本節は設計記録であり、実装の状況は冒頭の表と各小節の「実装」の記述を正とする。Exec（#3761）・Attach（#3763 の読み取り専用と、Linux の完全版 #4077・#4078。実機前提試験は #4079 で実装済み）・NODE の PortForward（#3755）は実装済みで、POD の PortForward も実装済みである（#4477〜#4487。ただし Linux・非 root で保持役を注入した構成だけ結線され、他の構成は `UNIMPLEMENTED`。REPAIR-3）**。
+2026-11-03 に main が決めた要点（Attach は段階方式、Exec は制御チャネルの exec 要求と fd 渡しで孤児時に縮退しない、PortForward は NODE を先に入れ POD は #2877 の後、依存は plugin-cri から supervisor への一方向で cri に実装を入れない）を詳しくした設計記録である。後続の兄弟 issue（#3753〜#3766。親 #3726・TASK-63・MS-7）はこの記録を正として実装する。オーナーの判断（2026-11-12・#4116）は末尾の「オーナー判断（#4116・2026-11-12）と残る確認事項」にまとめ、それ以外は確定扱いとする。**本節は設計記録であり、実装の状況は冒頭の表と各小節の「実装」の記述を正とする。Exec（#3761）・Attach（#3763 の読み取り専用と、Linux の完全版 #4077・#4078。実機前提試験は #4079 で実装済み）・NODE の PortForward（#3755）は実装済みで、POD の PortForward も実装済みである（#4477〜#4487。ただし Linux・非 root で保持役を注入した構成だけ結線され、他の構成は `UNIMPLEMENTED`。REPAIR-3）**。
 
 対象ビヘイビア: CRI-6・PLUG-1・SUP-4・SUP-6・SEC-1・REPAIR-2・REPAIR-3・REPAIR-5（関連: CORE-1・CORE-5・SUP-3・SUP-5・SUP-7・NET-3）。
 
@@ -213,7 +213,7 @@ helper を supervisor の bin に置く理由は、exec の領域（healthcheck 
 - argv[0] が相対パス（例: `sh`）の要求は、PATH の解決（#2439）が決まるまで `INVALID_ARGUMENT` で拒否する。URL の発行前（RPC 時）に断るのが望ましく、#3761 で `StreamWiring` の `exec_relative_command`（既定 false）と `StreamingUrlIssuer::require_exec_options` として実装した（`exec_impl` が URL の発行前に呼び、launch 時にも `StreamExecArgs::new` が拒否する）
 - helper と plugin-cri の channel はパスを持たない socketpair で、第三者は接続できない。supervisor の実行ファイルは PATH を探さず固定名で解決し、受け取った pidfd は `identify_pid1_with_pidfd` で照合する。トークン・argv・パスはログやエラーに出さない
 
-**終了コードの写像**: `Exited(n)` は n、`Signaled(s)` は 128 + s（`metav1.Status` の NonZeroExitCode）。`SetupFailed` は子の終了状態（通常 125 / 126 / 127）で、CLI の exec と同じ（exec-pidfd-handover.md §3.4）。拒否・期限・到達不能は launch の失敗にし、handler が `InternalError` の固定文にする。
+**終了コードの写像**: `Exited(n)` は n、`Signaled(s)` は 128 + s（`metav1.Status` の NonZeroExitCode）。`SetupFailed` は子の終了状態（通常 125 / 126 / 127）で、CLI の exec と同じ（exec-pidfd-handover.md §3.4）。この写像は #4116 の項目 4 で承認された（2026-11-12。機械が判別しやすく CLI の exec・`docker exec` と揃う）。containerd は終了コードではなくエラー `failed to start exec` を返し、kubectl の表示は Internal error になる。この差はオーナーの判断コメントにある事実で、本書では一次情報を確かめていない。拒否・期限・到達不能は launch の失敗にし、handler が `InternalError` の固定文にする。
 
 **drop・restart・孤児**:
 
@@ -224,7 +224,7 @@ helper を supervisor の bin に置く理由は、exec の領域（healthcheck 
 
 **SCM_RIGHTS の再利用判断**: core（`sys/seccomp_notify.rs`）・net（`sys/holder.rs`）・supervisor（`sys/linux.rs` の `send_with_fd` / `recv_with_fds`）の自前ラッパーは、crate ごとの sys に置いたまま共有しない。いずれも `pub(crate)` で意味も違い（core は token と資格情報、net は holder の frame、supervisor は制御チャネル）、前例は [fdinfo-mnt-id-parsing.md](fdinfo-mnt-id-parsing.md) の「共有下位 crate を作らない」判断である。本設計で足りないのは supervisor の「複数 fd の送信」だけで、既存の `send_with_fd` を N 本（上限 3〜4。`recv_with_fds` の 4 本と揃える）へ一般化し、plugin-cri が使える安全な公開 API として出す。sys の事前承認の範囲内（coding-rust.md）。plugin-cri の sys には SCM_RIGHTS を新しく足さず、重複を作らない。
 
-**上限**: 同時の exec は supervisor 側がコンテナごとに 16（`ExecGuardLimits::max_guards`）。plugin-cri 側にも全体の上限を設けた（#3761。同時セッション 64・回収できない helper の保持 8。いずれも暫定値で、#4116 のオーナー確認待ち）。channel の受信長は固定で、fd は最大 3 本受け、tty のときは master を 1 本返す。
+**上限**: 同時の exec は supervisor 側がコンテナごとに 16（`ExecGuardLimits::max_guards`）。plugin-cri 側にも全体の上限を設けた（#3761。同時セッション 64・回収できない helper の保持 8。いずれも暫定値。#4116 の項目 1〜11 に入っておらず、判断の窓口は無い）。channel の受信長は固定で、fd は最大 3 本受け、tty のときは master を 1 本返す。
 
 **本番 launcher の実装（#3761・CRI-6・SEC-1・REPAIR-3・REPAIR-5）**:
 
@@ -232,7 +232,7 @@ helper を supervisor の bin に置く理由は、exec の領域（healthcheck 
 - stdio は要求された分だけ `UnixStream::pair` を作り、片側を `send_stdio_handover` で渡す。`Started` を待ってから tokio 側の読み書き口に変換し、`Result` を待つ専用 std スレッドの結果を std の socketpair で tokio 側へ渡す（tokio の `sync`・`io-util`・`process` feature は使わない）。`ExecSession` の `exit` future を drop すると持ち主の `HelperGuard` が helper を SIGKILL して回収する
 - **tty は本番で結線済み（#4416・#4417）**: 本番の spawner は能力 `HelperCapabilities.tty = true` を返し、tty の要求に `StreamExecArgs::with_tty()` で `--tty` を付けて helper を起動する。stdio の mask は 0 が契約で（コマンドの fd 0〜2 は pty の slave になり、`with_tty()` と helper の引数解析が強制する。ホストの fd をコンテナへ渡さない。SEC-1）、`without_tty` は本番では使わない。tty と stderr の併用は Attach と同じ検査で RPC 時に `INVALID_ARGUMENT`（「stderr must be false when tty is set」）、launcher も二重に断る。受け側は送信順 `Started` → `PtyMaster`（ちょうど 1 回）→ `Spawned`（高々 1 回）→ `Result` を検査し、順序違反は helper を kill して拒否する（偽の helper の試験で固定）。`PtyMaster::from_received` による検証・resize の `TIOCSWINSZ` 転送・pty と tokio の橋渡しは実装済みで、実機前提試験 `production_binary_exec_real` の段 T が往復と resize（`stty size`）を本番の経路で照合する（pull は増やさない）。`WindowSize` の 0 行・0 列はそのまま渡す
 - **stdio の fd 種別（SUP-6・SEC-1）**: helper は受け取った stdin・stdout・stderr が AF_UNIX の socket か FIFO のときだけ受け、通常ファイル・ディレクトリ・文字デバイス（tty・pty・`/dev/null` を含む）・ブロックデバイスは exec も kind 7 の通知もせず `InvalidArgument`（`require_stdio_kinds`）。ホストの端末 fd をコンテナのコマンドへ渡して境界を越えさせないため
-- 期限: helper の `--timeout-ms` は supervisor の上限 `MAX_EXEC_HOLD_SECS`（1 時間）なので、exec のセッションは最長 1 時間で止まる（kubelet の idle 4 時間より短い。#4116 の確認事項）。`Started` までは 25 秒（cri の `launch_timeout` 30 秒より短い）、stdio の受け渡しは 5 秒、kill 後の回収は 10 秒（`REAP_BUDGET`）で、回収できなければ保持一覧（上限 8）に入れる
+- 期限: helper の `--timeout-ms` は supervisor の上限 `MAX_EXEC_HOLD_SECS`（1 時間）なので、exec のセッションは最長 1 時間で止まる（kubelet の idle 4 時間より短い。暫定値のまま承認。#4116 の項目 1・2026-11-12。再評価条件は 1 時間を超える exec の利用場面が出たとき。保持の更新〔heartbeat〕を検討する）。`Started` までは 25 秒（cri の `launch_timeout` 30 秒より短い）、stdio の受け渡しは 5 秒、kill 後の回収は 10 秒（`REAP_BUDGET`）で、回収できなければ保持一覧（上限 8）に入れる
 - 停止: ドレインの期限（シグナルから 5 秒）で `stop_streaming_on` の `on_stop` が `shutdown_all` を呼び、追跡中の helper を kill する（「停止時のセッションの扱い」）。plugin-cri が SIGKILL された場合も、helper が fd 0 の切断を検知して通常 2 秒以内に終わる（下の「要求元の異常終了の検知」。実装は #4166、実機の照合は #4167 の `stream_exec_real` の `requester_killed` と `production_binary_exec_real` の段 4）。残る窓は listener の受け渡し前・通知処理中の最大 5 秒の遅れ・channel の端の漏れ
 - helper の fd 1 は `/dev/null`。fd 2 は AF_UNIX の socketpair で受け、固定語彙の構造化ログへ転送する（下の「helper の fd 2 の診断の転送」。#4171）。結果は `Result` frame の固定語彙で返る
 - 終了コード: `Exited(n)`→n、`Signaled(s)`→128+s、`NotStarted`→子の終了状態、`Failed(code)`→コード別の固定英文の `CriError`
@@ -329,7 +329,7 @@ plugin-cri が helper を kill せずに異常終了（SIGKILL 等）すると�
 - stdin・tty の要求は backend が `INVALID_ARGUMENT` で拒否する（必須）。URL の発行前（RPC 時）にも拒否するのが望ましく、#3753 の結線情報に「attach は読み取り専用」を載せる形で #3763 が判断する
 - follow は blocking のポーリング（`FOLLOW_POLL_INTERVAL` 200 ms）なので、セッションごとに専用スレッド（または `spawn_blocking`）で回し、`exited` の future へ橋渡しする。終了は既存の終了条件（sink のロックの解放かつ Running でない）を `exited` に写す。期限は follow の上限 24 時間（`MAX_FOLLOW_DURATION`）とセッションの idle 4 時間
 - follow には取り消しの口が無く、期限と書き込みの失敗でしか終わらない。drop の後も期限まで残らないよう、reader に取り消し（停止フラグ）を足す。これは supervisor の変更で、#3763 の範囲に含める
-- 制限: 遅延は最大 200 ms とポーリングの読み取りの時間。LF の無い行は出ない（1 行の上限は 64 KiB）。restart の再 launch の間も追従が続く（完全版との違い）。世代数 1 の設定は拒否される（既定は 1 MiB × 3 世代）
+- 制限: 遅延は最大 200 ms とポーリングの読み取りの時間。LF の無い行は出ない（1 行の上限は 64 KiB `MAX_LINE_BYTES`。超える 1 行は途中から失われる。containerd は CRI ログの部分行 `P` に分けて残すため差がある。追跡は #4574）。restart の再 launch の間も追従が続く（完全版との違い）。世代数 1 の設定は拒否される（既定は 1 MiB × 3 世代）
 
 **段階 1 の実装（#3763。実装済み）**:
 
@@ -367,7 +367,7 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 
 - ログの follow は LF までの完全な行しか出さず（`sup7_follow_waits_for_lf`）、ポーリングは 200 ms なので、LF の無い対話シェルのプロンプトが attach に届かない。そこで完全版の出力は、既存の捕捉のリーダーが sink へ書いた後に、購読者ごとの非ブロッキング socketpair へ生のバイト列を複製（tap）して渡す。tty と非 tty の両方に適用する
 - tap は既存のリーダースレッドの中で動くので新しいスレッドが要らず、再 launch の前の `quiesce` の範囲に収まる
-- 契約: sink への書き込みを常に優先する。`EAGAIN` や書き込み失敗の購読者はその場で切断し op ログに残し、背圧はかけない（SUP-7 のログを止めない）。購読者数にコンテナごとの上限を置く（初期案 8）。購読した時点より後の出力だけを流す。capture の EOF と世代交代で tap を閉じ、これが attach の終わりになる
+- 契約: sink への書き込みを常に優先する。`EAGAIN` や書き込み失敗の購読者はその場で切断し op ログに残し、背圧はかけない（SUP-7 のログを止めない）。購読者数にコンテナごとの上限を置く（8。#4116 の項目 6 で承認・2026-11-12）。購読した時点より後の出力だけを流す。capture の EOF と世代交代で tap を閉じ、これが attach の終わりになる
 - 却下: follow のまま部分行を出す案（レコード形式に部分行の印が要り CLI の logs にも波及し、遅延も残る）、非 tty だけ follow を残す案（出力の経路が 2 本になり終了の意味も揃わない）。段階 1（#3763）の follow は完全版の結線で置き換え、reader の取り消しの口は残す
 
 **D3. init の stdin / pty を作り保持する主体**
@@ -390,7 +390,7 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 **D5. `stdin_once`**
 
 - 非 tty で `stdin_once` のとき、最初に stdin を要求した attach へ複製ではなく元の書き込み端を渡し、supervisor は自分の端を閉じる（所有の移転）。セッションの stdin が終端になると plugin-cri が drop し、コンテナは EOF を受ける。その後の stdin の要求は `StdinClosed` で断る
-- tty の `stdin_once` は閉じない。containerd の `container_io.go` の `Attach` は `StdinOnce && !Tty` のときだけ stdin を閉じ、コードの上のコメントは tty も閉じると読めるが挙動はコードに従っているため、本設計もコードに従う
+- tty の `stdin_once` は閉じない。containerd の `container_io.go` の `Attach` は `StdinOnce && !Tty` のときだけ stdin を閉じ、コードの上のコメントは tty も閉じると読めるが挙動はコードに従っているため、本設計もコードに従う（#4116 の項目 7 で承認・2026-11-12）
 - （C6〔#4075〕で実装済み）`Once` の元の端は、送信に成功したら supervisor が drop する。**送れなかったときは、同じ世代がまだ `Active` で`stdin` が空のときだけ端をスロットへ戻し、消費済みを取り消す**（戻さないと失敗した attach がコンテナの stdin を閉じてしまう）。fd がカーネルに受理された後の失敗は戻さない（端は相手にある）。残る問題: `sendmsg` が成功した直後にクライアントが期限切れで接続を閉じると、`Once` の端は渡った後にカーネルが閉じ、コンテナは EOF を受ける。絶対期限とクライアントの余裕で窓を小さくするが、なくせない
 - `stdin_once` でないときは毎回複製を渡し、supervisor が自分の端を持ち続けるのでセッションが終わってもコンテナは EOF を受けない。再 launch で世代が変わると新しい pipe を作り、消費済みの状態も初期化する
 
@@ -402,7 +402,7 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 
 **D7. RPC 時の整合検査（cri）**
 
-- stdin を開いていないコンテナへの stdin の要求、およびコンテナの tty の実体と要求の tty が違う場合は `FAILED_PRECONDITION`（固定の英語文）で断る（fail-closed）。containerd は stdin を黙って無視するので差がある
+- stdin を開いていないコンテナへの stdin の要求、およびコンテナの tty の実体と要求の tty が違う場合は `FAILED_PRECONDITION`（固定の英語文）で断る（fail-closed）。containerd は stdin を黙って無視するので差がある。#4116 の項目 5 で承認（2026-11-12）。再評価条件: 実機確認（#3730）で `kubectl attach -i` の使い勝手に問題が出たとき
 
 **D8. 拒否を外す順序（fail-closed の段階）**
 
@@ -416,12 +416,12 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 - 新しい `unsafe` は各 crate の `sys` の事前承認の範囲に限り、`sys` の外には作らない。トークン・コンテナ ID・入出力の内容はログやエラーに出さない
 - 無制限確保をしない（payload は固定長、購読者数に上限、tap は溢れたら切断）。kind 9 の往復は 5 秒（REPAIR-5）。セッションの期限は既存の attach のものを使う
 
-**D10. オーナー確認事項（決定扱いにしない）**
+**D10. オーナー判断（2026-11-12・[#4116](https://github.com/Fandhe-AI/fandhe-container/issues/4116#issuecomment-6818265484) の項目 5〜8）**
 
-1. D7 の containerd との差（黙って無視せず断る）
-2. tap の購読者の上限の値
-3. tty の `stdin_once` で閉じないこと（containerd のコードとコメントの食い違い）
-4. tty の CRI ログで LF の無い出力が遅れて出ること（CRI ログの部分行 `P` は範囲外。#4116 の項目 8 で追跡すると決定・方式は [cri-log-partial-lines.md](cri-log-partial-lines.md)・#4574）
+1. D7 の containerd との差（黙って無視せず断る）: 承認。再評価条件は実機確認（#3730）で `kubectl attach -i` の使い勝手に問題が出たとき
+2. tap の購読者の上限 8: 承認
+3. tty の `stdin_once` で閉じないこと: 承認（containerd のコードの挙動に合わせる）
+4. tty の CRI ログで LF の無い出力が遅れて出ること、64 KiB 超の行の切り捨て: CRI ログの部分行 `P` として追跡する（方式は [cri-log-partial-lines.md](cri-log-partial-lines.md)・#4574）
 
 **範囲外**: CLI の `create -i -t`（CLI-1）、shim v2 の terminal、CRI ログの部分行 `P`（#4116 の項目 8 で追跡すると決定・[cri-log-partial-lines.md](cri-log-partial-lines.md)・#4574）。
 
@@ -433,12 +433,12 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 | C2 | #4070 | core: init の pty と master の返却（実装済み。受信は exec 前の 2 行目の判定の後。stdout / stderr の pipe は起動前の診断のため残す。supervisor の opt-in は C4） | #3758 |
 | C3 | #4071 | core: slave を `/dev/console` へ bind（実装済み。割り当てと bind は bind の特権要件から pivot 後・ステージ列の前。D3 の補足） | C2 |
 | C4 | #4074 | supervisor: stdin 端・master の保持、tty 捕捉、`--stdin`（実装済み: `attach_io::AttachIoProcess`・`SlotState::Active` の `GenerationIo`・`SignalSlot::with_stdin_option` / `with_generation_io`・argv `--stdin <open\|once>`。kind 9 は C6） | C1・C2 |
-| C5 | #4072 | supervisor: 捕捉からの出力の tap（実装済み。sink 優先・背圧なし・溢れたら切断・購読者数の上限 8 は初期案。購読 API は `CaptureHub::subscribe_output`、kind 9 での受け渡しは C6） | なし |
+| C5 | #4072 | supervisor: 捕捉からの出力の tap（実装済み。sink 優先・背圧なし・溢れたら切断・購読者数の上限 8 は #4116 の項目 6 で承認。購読 API は `CaptureHub::subscribe_output`、kind 9 での受け渡しは C6） | なし |
 | C6 | #4075 | supervisor: kind 9 `AttachRequest` と fd 応答（実装済み: `control::protocol` の `AttachRequestFrame`・`control::server` の `handle_attach`・クライアント入口 `AttachIoSource` / `ControlAttach`。結線は C9） | C4・C5・#3759 |
 | C7 | #4073 | core: `StartRequest` の `StdinMode`（実装済み。`StartRequest::with_stdin` / `stdin`、既定 `Closed`。値の参照は C4・C8） | なし |
 | C8 | #4076 | cri: 記録への保存と StartContainer での運搬（実装済み: 記録の config〔永続記録 v1 のまま〕から `start_stdin_mode` で導き、`RuntimeAdapter::start_with_options` が `StartRequest::with_stdin` に載せる。plugin-cri の `supervised.rs` が `StartOptions::with_stdin` で argv `--stdin <open\|once>` へ写す。`bundle/spec.rs` の `tty/stdin` の拒否は C8 の時点では C10 まで残していたが、#4078 で解除済み） | C7・C4 |
 | C9 | #4077 | plugin-cri: 完全版 `AttachBackend`（実装済み: Linux の `streaming::supervisor_attach::SupervisorAttachBackend`。状態確認 → kind 9 の `AttachIoSource::obtain` → `validate_attach_io` で形を再照合 → 入力は専用スレッド＋socketpair、tap は tokio 化、resize は `PtyMaster::resize`、`exited` は tap の EOF と kind 8 の購読。`CriPluginBackends::supervisor_attach_backend` が組み `main.rs` が Linux で使う。C10 の前の状態の記述。現在は #4078 で `ProductionAttach::interactive` により `read_only` を外し、Linux の本番で届く） | C6・C8・#3763・#3754・#3761 |
-| C10 | #4078 | cri: 拒否の解除と整合検査（実装済み: `bundle/spec.rs` の拒否を外し tty を `process.terminal` へ写す。`attach_impl` が URL の発行前に記録から 1 回のロックで状態・`config.tty`・`config.stdin` を読み、未知 ID は `NOT_FOUND`、running でない・tty の不一致〔どちらの向きも〕・stdin 未開への stdin 要求は `FAILED_PRECONDITION`〔固定文 `MSG_ATTACH_*`〕。stdin は `start_stdin_mode` でなく `config.stdin` を直接見る〔tty のコンテナでは常に `Closed` で、supervisor は tty に master を渡すため、stdin なしの tty コンテナへの入力の注入を断れるのはここだけ〕。plugin-cri の `ProductionAttach::interactive` で `read_only` を外す。containerd との差は設計の既定のままで D10-1 はオーナー確認事項） | C3・C9 |
+| C10 | #4078 | cri: 拒否の解除と整合検査（実装済み: `bundle/spec.rs` の拒否を外し tty を `process.terminal` へ写す。`attach_impl` が URL の発行前に記録から 1 回のロックで状態・`config.tty`・`config.stdin` を読み、未知 ID は `NOT_FOUND`、running でない・tty の不一致〔どちらの向きも〕・stdin 未開への stdin 要求は `FAILED_PRECONDITION`〔固定文 `MSG_ATTACH_*`〕。stdin は `start_stdin_mode` でなく `config.stdin` を直接見る〔tty のコンテナでは常に `Closed` で、supervisor は tty に master を渡すため、stdin なしの tty コンテナへの入力の注入を断れるのはここだけ〕。plugin-cri の `ProductionAttach::interactive` で `read_only` を外す。containerd との差は設計の既定のままで、D10-1 は #4116 の項目 5 で承認） | C3・C9 |
 | C11 | #4079 | 実機前提試験・手順・CI の追記 | C10。実装済み: `crates/plugin-cri/tests/cri_attach_real.rs` の `production_binary_attach_real`（非 tty・stdin_once の往復と EOF、tty の往復と resize の `stty size`、tty 不一致の拒否）。platform-ci の ubuntu に 2 ステップ。実 crictl・kubectl での確認は人間担当（#3730 の子） |
 
 ### PortForward（NET-3・SEC-1）
@@ -454,7 +454,7 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 
 ### POD ネットワークの PortForward の設計（#3766・CRI-6・NET-3・SEC-1・REPAIR-5）
 
-保持役 provider（#2877）は実装済みで、plugin-cri は Linux・非 root で `ProductionPodHolder` を注入し、POD のコンテナは保持役の user・ipc・net に join する。本節は、その netns の `127.0.0.1:<port>` へ接続する本番 `PortForwardDialer` の設計である。**自動運転で Agent が安全側に倒して記録した判断であり、オーナーが承認したのは 2026-11-12 の 4 点（末尾の「オーナー判断（2026-11-12）」）だけである。方式 A の採用や helper の固定語彙など、それ以外はオーナーの承認を得ていない**。確認が要る点は末尾の「確認事項」に置く。実装は子 issue（#4477〜#4488）で、#4477〜#4487 は実装済み（`PodNetnsDialer`〔#4484〕を Linux・非 root で保持役を注入した構成だけ結線〔#4486〕。実機の根拠は `netns_dial_userns`〔#4480・#4481〕と `production_binary_exec_real` の段 F〔#4487〕で、どちらも platform-ci の ubuntu）。#4488 が本書の更新である。本節の設計の記述は設計時点のものとして残す。実 crictl・kubectl での確認は人間担当（#3730）で、4 点は下の「オーナー判断（2026-11-12）」へ移し、「確認事項」に残る点は未決のままである（REPAIR-3）。
+保持役 provider（#2877）は実装済みで、plugin-cri は Linux・非 root で `ProductionPodHolder` を注入し、POD のコンテナは保持役の user・ipc・net に join する。本節は、その netns の `127.0.0.1:<port>` へ接続する（失敗したら `::1`。#4572）本番 `PortForwardDialer` の設計である。**自動運転で Agent が安全側に倒して記録した判断であり、オーナーが承認したのは 2026-11-12 の 4 点（末尾の「オーナー判断（2026-11-12）」）だけである。方式 A の採用や helper の固定語彙など、それ以外はオーナーの承認を得ていない**。確認が要る点は末尾の「確認事項」に置く。実装は子 issue（#4477〜#4488）で、#4477〜#4487 は実装済み（`PodNetnsDialer`〔#4484〕を Linux・非 root で保持役を注入した構成だけ結線〔#4486〕。実機の根拠は `netns_dial_userns`〔#4480・#4481〕と `production_binary_exec_real` の段 F〔#4487〕で、どちらも platform-ci の ubuntu）。#4488 が本書の更新である。本節の設計の記述は設計時点のものとして残す。実 crictl・kubectl での確認は人間担当（#3730）で、4 点は下の「オーナー判断（2026-11-12）」へ移し、「確認事項」に残る点は未決のままである（REPAIR-3）。
 
 #### 方式（採用案 A: dial ごとの単一スレッド helper）
 
@@ -504,7 +504,7 @@ helper が要る理由（カーネルの要件）: `setns(CLONE_NEWUSER)` は多
 | 回収できない helper の保持 | 上限 8（入口で検査し、満杯なら新しい dial を `RESOURCE_EXHAUSTED`。並行 dial が同時に入れる分だけ超えうるが、断ると追えない zombie が残るため入れる側は断らない。超過の上限は 8 + `max_inflight_dials` − 1、既定で 39。#4525。この超過は許容と判断済みで、入口の検査に並行数を含める案は採らない。超えても有界で止まり、保持・上限超過・満杯は telemetry に出る〔#4555〕。並行数を含めると回収の失敗が重なったとき正常な dial まで断るため。#4116 の項目 11・2026-11-12） |
 | 同時の helper 数 | cri の `max_inflight_dials`（32）で有界 |
 
-回収できない helper の観測（#4546・CRI-6・REPAIR-4・REPAIR-5。操作名と reason は暫定で、語彙の確定は #4116 の項目 3）: `PodDialTelemetry`（共有 `OpRecorder` と `stderr_sink()`。`main.rs` が組み立て、作れなければ起動しない。`ProductionPortForward::pod_network` へ渡す）が次の 3 つを出す。件数は `OpRecorder`（失敗として計上）、異常行は出来事ごとの累計が 2 のべき乗（1, 2, 4, …）の時だけ（共有 sink の監査行を押し出さない間引き。SEC-4）。
+回収できない helper の観測（#4546・CRI-6・REPAIR-4・REPAIR-5。`cri.port_forward.*` の操作名と reason は #4116 の項目 3 で確定・2026-11-12）: `PodDialTelemetry`（共有 `OpRecorder` と `stderr_sink()`。`main.rs` が組み立て、作れなければ起動しない。`ProductionPortForward::pod_network` へ渡す）が次の 3 つを出す。件数は `OpRecorder`（失敗として計上）、異常行は出来事ごとの累計が 2 のべき乗（1, 2, 4, …）の時だけ（共有 sink の監査行を押し出さない間引き。SEC-4）。
 
 | 出来事 | 操作名 | 異常行の reason |
 | --- | --- | --- |
@@ -512,7 +512,7 @@ helper が要る理由（カーネルの要件）: `setns(CLONE_NEWUSER)` は多
 | 保持数が上限（8）を超えた（保持の回も数える） | `cri.port_forward.retained_over_limit` | `retained_over_limit` |
 | 満杯で `RESOURCE_EXHAUSTED` を返した | `cri.port_forward.retained_full` | `retained_full` |
 
-行の形は `{"event":"cri_port_forward_helper","op":…,"outcome":"error","reason":…,"count":<累計>}`。記録は保持一覧の lock の外で行い、`OpRecorder::record` と `LineSink::submit`（`try_send`）だけを使う。pid・port・パス・errno は出さない。保持中の helper が後で回収されたことは記録しない（#4116 の項目 11 での判断・2026-11-12。必要になったら項目 3 の語彙を確定するときに見直す）。
+行の形は `{"event":"cri_port_forward_helper","op":…,"outcome":"error","reason":…,"count":<累計>}`。記録は保持一覧の lock の外で行い、`OpRecorder::record` と `LineSink::submit`（`try_send`）だけを使う。pid・port・パス・errno は出さない。保持中の helper が後で回収されたことは記録しない（#4116 の項目 11 での判断・2026-11-12。項目 3 でも記録しないと確定した）。
 
 残余: 保持一覧の掃除は dial の入口・出口・一覧へ入れる直前と dialer の drop で行い、定期の掃除は採らない（常駐スレッドを増やさない）。dial が来ない間は SIGKILL 後に遅れて終了した子が zombie で残りうる（上限内。次の dial か plugin-cri の終了で解消。#4525）。StopPodSandbox と並行した dial で、fd を開いた後に解放が走ると、fd が netns を生かしたまま最大 10 秒つながりうる（有界）。URL 発行後の sandbox の消失は NODE と同じく TTL と idle の期限で有界。
 
@@ -544,12 +544,12 @@ sys に新しい unsafe を足す子（#4478・#4479・#4483）は、PR 本文�
 
 #### オーナー判断（2026-11-12）
 
-次の 4 点はオーナーが推奨どおりに承認した（コメントは要約）。いずれも実装の変更は無い（#4478・#4484・#4485・#4539 のまま）。#4116 の項目 1〜9 は未判断で、決定扱いにしない。
+次の 4 点はオーナーが推奨どおりに承認した（コメントは要約）。項目 3 の `::1` を除き実装の変更は無い（#4478・#4484・#4485・#4539 のまま。項目 3 は #4572 で実装）。項目 1〜9 は同日に判断済み（末尾の「オーナー判断（#4116・2026-11-12）と残る確認事項」）。
 
 1. `SIOCGSKNS` による socket の netns の照合は必須（#4491 の判断 1）。失敗（非対応・権限不足）したら dial を fail-closed で失敗させる。理由: 親が期待する netns との結び付きを担うのはこの照合だけで、helper 側の照合は受けた fd との自己整合しか見ない（#4508 の P3-A）。再評価条件: CI・実機で拒否されても検査は緩めず、改めてオーナー判断に上げる。緩める案を採るなら、代わりの結び付き（期待値を helper へ渡して helper でも照合する等）が要る
 2. network が `CONTAINER`・`TARGET`・未知の値の pod の port-forward は、RPC 時に固定文の `UNIMPLEMENTED` を返す。`POD` と未指定だけを `Pod` とする（#4491 の判断 2）。再評価条件: `CONTAINER` の pod の port-forward が必要になったとき、またはコンテナの netns へつなぐ案を採るとき。どちらも containerd の挙動を一次情報で確かめてから決める
 3. POD の helper は `127.0.0.1` だけに接続する（#4116 の項目 10）としていたが、再評価条件（containerd が IPv4 で失敗したとき IPv6 でも試すと一次情報で分かったら見直す）に当たり、2026-11-12 に見直された（#4116 の 08:07 のオーナーコメント・#4572）。containerd の `internal/cri/server/sandbox_portforward_linux.go`（main）は `tcp4` で `localhost:<port>` に失敗したとき `tcp6` でつなぎ直す。オーナーが決めたのは「IPv4 で失敗したら `::1` でつなぎ直す・宛先は 127.0.0.1 と ::1 の 2 つに固定・期限は延ばさない」まで。親側の照合は IPv6 の loopback も完全一致で受け、`SIOCGSKNS` は IPv6 でも必須とする。両方失敗したときの理由（IPv4 の理由を返し、期限切れは `TimedOut`）は Agent が安全側に倒して記録した判断で、オーナーの承認は得ていない。NODE（項目 2）は #4575
-4. 期限と上限の表は暫定値のまま承認する（#4116 の項目 11）。保持の上限 8 を並行する dial が超えること（既定で最大 39、`max_inflight_dials` が上限の 256 なら最大 263）は許容し、入口の検査に並行数を含める案は採らない。理由: 超えても有界で止まり、保持・上限超過・満杯は #4555 で telemetry に出る。並行数を含めると、回収の失敗が重なったときに正常な dial まで断ってしまう。保持の解消は記録しない。再評価条件: 項目 3（語彙）を確定するときに見直す
+4. 期限と上限の表は暫定値のまま承認する（#4116 の項目 11）。保持の上限 8 を並行する dial が超えること（既定で最大 39、`max_inflight_dials` が上限の 256 なら最大 263）は許容し、入口の検査に並行数を含める案は採らない。理由: 超えても有界で止まり、保持・上限超過・満杯は #4555 で telemetry に出る。並行数を含めると、回収の失敗が重なったときに正常な dial まで断ってしまう。保持の解消は記録しない。項目 3 でも記録しないと確定（2026-11-12）
 
 #### 確認事項（決定扱いにしない）
 
@@ -588,7 +588,7 @@ sys に新しい unsafe を足す子（#4478・#4479・#4483）は、PR 本文�
 | kind 6 の pidfd の受け渡し | 5 秒（全体の内側） |
 | kind 7 の ack | 10 秒 |
 | `launch_timeout`（helper の起動から `Started` まで） | 30 秒 |
-| exec の全体の上限 | 3600 秒（`MAX_EXEC_HOLD_SECS`。CLI の `--timeout` の上限。確認事項 1） |
+| exec の全体の上限 | 3600 秒（`MAX_EXEC_HOLD_SECS`。CLI の `--timeout` の上限。暫定値のまま承認。#4116 の項目 1） |
 | ガードの保持 | 期限 + 30 秒 |
 | helper の回収 | 5 秒 |
 | stdin の stall | 60 秒 |
@@ -601,7 +601,7 @@ sys に新しい unsafe を足す子（#4478・#4479・#4483）は、PR 本文�
 | attach の follow スレッドの書き込みの刻み（取り消しの確認） | 200 ms |
 | PortForward の dial / 対の揃い / 書き込みの stall | 10 秒（NODE は IPv4 と IPv6 で共有し延ばさない。#4575） / 30 秒 / 30 秒 |
 | POD の PortForward の helper（#3766。実装済み。値は plugin-cri の `streaming/pod_dialer.rs` の定数〔`KILL_REAP_RESERVE`・`CONNECT_MARGIN`・`HELPER_EXIT_WAIT`・`HELPER_REAP_WAIT`・`MAX_RETAINED_DIAL_HELPERS`〕） | 応答待ち `timeout` − 1 秒・connect `W` − 500 ms・受信 2 秒・応答後の終了待ち 200 ms・SIGKILL 後の回収 800 ms（上の「POD ネットワークの PortForward の設計」。暫定値のまま承認。#4116 の項目 11・2026-11-12） |
-| `StreamingServer` の SIGTERM での停止 | 受信の検知（100 ms 周期）で待ち受けを閉じる（待ちなし。#3754）。受け付け済みのセッションはシグナルから 5 秒（`STREAMING_DRAIN_WAIT`）ドレインし、期限で exec を止めて 1 秒（`STREAMING_CLOSE_WAIT`）待ち、残りを強制クローズする。gRPC の猶予 10 秒以内に収まり、streaming は全体の上限を延ばさない（全体は #4340 で op-stats の最後の書き出し 1 秒が別に足されて 14.7 秒）（#4164。暫定値で #4116 の対象） |
+| `StreamingServer` の SIGTERM での停止 | 受信の検知（100 ms 周期）で待ち受けを閉じる（待ちなし。#3754）。受け付け済みのセッションはシグナルから 5 秒（`STREAMING_DRAIN_WAIT`）ドレインし、期限で exec を止めて 1 秒（`STREAMING_CLOSE_WAIT`）待ち、残りを強制クローズする。gRPC の猶予 10 秒以内に収まり、streaming は全体の上限を延ばさない（全体は #4340 で op-stats の最後の書き出し 1 秒が別に足されて 14.7 秒）（#4164。暫定値のまま承認。#4116 の項目 9・2026-11-12） |
 | helper の fd 2 の読み手（#4171） | 読み取りの刻み 100 ms / 停止後の drain 50 ms / 終了時の待ち 500 ms / 絶対期限 25 秒 + 3600 秒 + 30 秒 |
 | 要求元の切断の検知（helper の serve の刻み）/ 検知から helper の終了まで | 20 ms / 合否値 2 秒（通知処理のない通常ケース。遅延・回収失敗ケースは検知最大 5 秒・回収込み 約 15 秒。期限と `hold_grace` は不変）。#4165。実装済み（#4166）。実機前提試験は `stream_exec_real` の `requester_killed` と `production_binary_exec_real` の段 4（#4167） |
 
@@ -611,7 +611,7 @@ sys に新しい unsafe を足す子（#4478・#4479・#4483）は、PR 本文�
 | ----- | ---- | ------------------------------------ |
 | #3753 | 結線済みの種別だけ URL を発行する | 実装済み（種別単位の結線情報 `StreamWiring` のみ。下の「結線情報（#3753・REPAIR-3）」）。attach の読み取り専用（#3763。`attach_interactive` として実装済み）・POD は `port_forward_pod_network` として #4486 で結線・exec の相対 argv[0]（#3761）を RPC 時に断る情報は、`StreamWiring` に項目を足して各 issue が入れる |
 | #3754 | `StreamingServer` の起動・注入 | 実装済み（plugin-cri の `streaming`。下の「plugin-cri での起動と停止（#3754）」） |
-| #3755 | NODE の dialer | 実装済み。cri の `PortForwardDialer::dial` の引数を `PortForwardTarget { pod_sandbox_id, network: PortForwardNetwork }` にし、`StreamRequest::PortForward { request, network }` と `StreamWiring::port_forward_pod_network`（既定は偽）を足した。plugin-cri の `NodeLoopbackDialer`（`streaming/node_dialer.rs`）が `127.0.0.1:<port>` へ接続する |
+| #3755 | NODE の dialer | 実装済み。cri の `PortForwardDialer::dial` の引数を `PortForwardTarget { pod_sandbox_id, network: PortForwardNetwork }` にし、`StreamRequest::PortForward { request, network }` と `StreamWiring::port_forward_pod_network`（既定は偽）を足した。plugin-cri の `NodeLoopbackDialer`（`streaming/node_dialer.rs`）が `127.0.0.1:<port>` へ接続する（失敗したら `[::1]:<port>`。#4575） |
 | #3756 | 試験 | — |
 | #3757 | `ExecLaunchIo` と core の stdio 拡張 | — |
 | #3758 | core の pty | コンテナの devpts で worker が開き、master は core の既存の worker から親への SCM_RIGHTS で返す |
@@ -627,16 +627,20 @@ sys に新しい unsafe を足す子（#4478・#4479・#4483）は、PR 本文�
 | #4166 | 検知の実装（sys の `poll`・`ExecLaunchIo` の取り消し口・helper） | 実装済み |
 | #4167 | 検知の実機前提試験 | 実装済み（`stream_exec_real` の `requester_killed`・`production_binary_exec_real` の段 4） |
 
-### 未確認・オーナー確認事項
+### オーナー判断（#4116・2026-11-12）と残る確認事項
 
-決定扱いにしない。
+オーナーは [#4116](https://github.com/Fandhe-AI/fandhe-container/issues/4116#issuecomment-6818265484) の項目 1〜9 を 2026-11-12 に判断した（項目 10 の見直しを含む。項目 10・11 は先の判断が前節）。
 
-1. CRI のストリーミング exec の全体の上限を、当面 3600 秒（kind 7 の保持の上限）とする。kubelet の idle 4 時間より短く、長い対話セッションは 1 時間で止まる。代案は保持の更新（heartbeat）や上限の分離で、オーナー判断
-2. `::1` を接続先に足すか（containerd の挙動は一次情報で未確認）
-3. pty をホストの devpts で代わりに割り当てる方式は採らない（変えるならオーナー判断）
-4. argv[0] の PATH の解決（#2439）が出るまでは、相対パスを拒否する
-5. 観測名の語彙（exec-pidfd-handover.md §6 の未決事項が CRI の exec にも及ぶ）
-6. `SetupFailed` の終了コードの扱いと containerd との比較（未確認）
+1. Exec の全体の上限は 3600 秒（kind 7 の保持の上限）で承認。上限があれば残ったセッションも必ず止まり、CLI の `--timeout` の上限と同値。再評価条件: 1 時間を超える exec の利用場面が出たとき（保持の更新〔heartbeat〕を検討）
+2. NODE・POD とも IPv4 で失敗したら `::1` でつなぎ直す（NODE は #4575、POD は #4572）。宛先は 127.0.0.1 と ::1 の 2 つに固定、期限は延ばさず、SEC-1 の照合（`SIOCGSKNS` を含む）は弱めない
+3. 観測名: kind 6 は `control_exec` で数える（#4573。詳細は [exec-pidfd-handover.md](exec-pidfd-handover.md) §6）。`cri.port_forward.*` は今の名前で確定。保持の解消は記録しない
+4. `SetupFailed` の終了コードは 125 / 126 / 127 を返す今の形で承認。containerd との差は「終了コードの写像」を参照
+5. 項目 5〜8（Attach の整合検査・購読者の上限・tty の `stdin_once`・部分行 `P`）は「D10」、項目 9（停止時のドレイン）は「停止時のセッションの扱い」を参照
+
+#### 残る確認事項（決定扱いにしない。#4116 の項目ではない）
+
+1. pty をホストの devpts で代わりに割り当てる方式は採らない（変えるならオーナー判断）
+2. argv[0] の PATH の解決（#2439）が出るまでは、相対パスを拒否する
 
 CRI の `ExecSync`（現状 `UNIMPLEMENTED`）も本設計の helper を再利用できる見込みだが、本件の対象外である。
 
@@ -653,7 +657,7 @@ CRI の `ExecSync`（現状 `UNIMPLEMENTED`）も本設計の helper を再利�
 - Exec の残余（診断）: 生成側は #4284 で入った。状態ストア等 core の `TraitError` 起因の段は errno が `none`（`TraitError` へ errno を持たせる案と、`require_stdio_kinds`・mask の不一致の実機前提の照合は #4327 で `stream_exec_real` に追加済み）
 - Attach の残余: 入力の書き込みは、書き込み先の記述（`fstat` の `st_dev`・`st_ino`）ごとの排他で調停する。表は backend が持ち、生きた項目は入力スレッド数以下（上限 `MAX_ATTACH_SESSIONS`。満杯は共有へ縮退せず `RESOURCE_EXHAUSTED`）。pipe・socket は記述ごとに固有の inode、pty master は本番ではコンテナごとの devpts の inode のため、衝突は同じコンテナ内に限る。plugin 外の書き手が空きを使い切ると保持者は `write` で止まり、その間は同じ記述（同じコンテナ）の入力だけが進まない（別コンテナは進む）。同じ記述の他セッションの排他の待ちは取り消しで抜け、スレッド・fd・枠を返す（#4134・#4232・CRI-6・REPAIR-5）
 - Attach の保持者本人の blocking write の取り消し（#4232 の残余を #4287 で pipe について解消。CRI-6・REPAIR-5・REPAIR-3）。比較: (A) スレッド宛てシグナルで `EINTR` にする案は、`sys::signal(3)` が BSD セマンティクス（`SA_RESTART`）で `write` が再開されるため `sigaction`（アーキごとの `struct sigaction`）・`pthread_self`・`pthread_kill` の新しい FFI 宣言とプロセス全体のシグナル配置の変更・`libc` の機械照合が要り、承認待ちで未実装。(B) `/proc/self/fd/N` を `O_WRONLY|O_NONBLOCK` で開き直して plugin-cri 専用の open file description にする案は pipe（FIFO）だけに採用した（`reopen_pipe_nonblocking`）: 記述が自分専用なので supervisor 側へ `O_NONBLOCK` が漏れず、`write` は `EAGAIN` で即戻って保持が有限になる。開く前に FIFO であることを `fstat` で確かめ、開いた後も FIFO と (dev, ino) の一致を照合し、元の記述はすぐ閉じる（唯一の書き込み端が閉じたときの EOF を保つ）。失敗・非対応のアーキ（`O_NONBLOCK` の定数は Linux の x86_64・aarch64 のみ）は従来の共有記述の経路へ戻る。pty master は開くと新しい pty が割り当てられて入力が別の端末へ流れ、socket は `ENXIO` のため開き直さない。(C) `send(MSG_DONTWAIT)`・`pwritev2(RWF_NOWAIT)` は pty に効かず版数依存。(D) fd の close・dup2 は blocking 中の `write` を戻さない。残余: pty・socket は共有記述のままで、plugin 外の書き手に空きを使い切られると保持者は `write` の中で止まる。ただし本番の stdin は pipe で、pty master へ書くのは plugin-cri の attach だけ（同じ排他で直列化され、supervisor の捕捉は読むだけ）のため、`poll` が Ready を返した後の書き込みは止まらず、この残余は本番では起きない見込み。同じ devpts instance の複数の pty master は同じキー（ptmx の dev/ino）に畳まれ、将来 attach がコンテナ内の別 pty を対象にするときは pty 番号をキーに足す必要がある（core の `PtyMaster` に番号の取得口が要る）。コンテナの終了で読み手が閉じれば pipe は `EPIPE`、pty は `EIO` で保持者は抜ける。再評価条件: plugin-cri への `libc` の dev-dependency 追加の承認（#3290・#1837 の子）・plugin 外の書き手が同じ stdin・pty master へ実際に書く経路の追加・止まった保持者による枠の枯渇の観測・attach が別の pty を対象にするとき
-- 暫定値・設計の確認事項（exec の全体上限・同時セッション数・NODE の `::1`・終了コード・観測名など）: 上の「未確認・オーナー確認事項」と #4116（オーナー判断）。POD の `::1`（項目 10。2026-11-12 に見直し済み・#4572）と POD dial の期限・上限（項目 11）は判断済み
+- #4116 の項目 1〜11 はすべて判断済み（2026-11-12。上の「オーナー判断（#4116・2026-11-12）と残る確認事項」）。残る暫定値は #4116 の範囲外の、Exec の同時セッション 64・回収できない helper の保持 8、Attach の同時セッション 64 で、判断の窓口は無い。CRI ログの部分行 `P` は #4574 で追跡する。再評価条件は項目 1（1 時間超の exec）・項目 5（#3730）
 - rootful: plugin-cri の start が uid 0 を `UNIMPLEMENTED` にするため、rootful のコンテナは無く 3 RPC とも使えない（uid 0 の拒否は #2442、rootful を許すかは #2241 の判断待ち）
 - 非 Linux: Exec は未結線の `UNIMPLEMENTED`。コンテナの start 自体も未実装（macOS の状態ルートは #2431）
 - `ExecSync`: `UNIMPLEMENTED` のまま。追跡 issue 未起票。実装するときは Exec と同じインスタンスの記録と起動時の照合を入れる義務がある（#4286）
@@ -699,7 +703,7 @@ CRI の `ExecSync`（現状 `UNIMPLEMENTED`）も本設計の helper を再利�
 - 順序の理由: exec のプロセスを先に止めてから接続を閉じる。クライアントに「切れた」と見えた後もコマンドが動き続ける窓をなくし、終了コード（Status）をできるだけ届けるため。強制クローズでも `ExecSession` の drop が helper を kill する（二重の経路）
 - 上限の不変性: 5 秒 + 1 秒 = 6 秒 ≤ `PLUGIN_SHUTDOWN_GRACE` 10 秒。期限は T からの絶対時刻なので、serve が期限より後に戻ったときは待たずに段 3 へ進み、停止全体は serve の戻りと 6 秒 + 100 ms の大きい方で終わる。streaming 由来では延びない（`repair5_4164_stop_waits_fit_within_grpc_grace_and_total_bound` で固定）
 - シグナルが記録されないまま `finish` したとき（serve が先にエラーで戻った）、`finish` を呼ばず drop したときも、待たずに `on_stop` と強制クローズを行う
-- 暫定値: 5 秒は cri の `SessionLimits` の `drain_timeout`（終了後の流し切りの予算）と同じ、1 秒は `RUNTIME_SHUTDOWN_WAIT` と同じ。どちらも暫定値で、オーナー確認は #4116 の対象。承認は得ていない
+- 暫定値: 5 秒は cri の `SessionLimits` の `drain_timeout`（終了後の流し切りの予算）と同じ、1 秒は `RUNTIME_SHUTDOWN_WAIT` と同じ。どちらも暫定値のまま承認（#4116 の項目 9・2026-11-12）。5 秒 + 1 秒は gRPC の猶予 10 秒に収まり、停止全体の上限を延ばさない
 
 ### 残余
 

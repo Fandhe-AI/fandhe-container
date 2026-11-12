@@ -8,8 +8,8 @@
 //! 呼び出す公開 API の流れは `entry` と同じ: `load_input_dir` → `parse_compose_yaml` →
 //! `collect_key_occurrences` / `convert_top_level` → `FileConversionReport`。ディレクトリ単位で回すので、
 //! フィクスチャを置き換えれば同じ判定を流用できる。実コーパス（14 件）での実行と妥当性判断は #607（人間担当）。
-//! 既定フィクスチャは `depends_on`・`ulimits`・`healthcheck`・`deploy`（GPU 予約）が変換器へ未結線のため
-//! 「全対象キー＋GPU」を網羅していない（REPAIR-3。結線後に足す）。
+//! 既定フィクスチャは `depends_on`・`ulimits`・`healthcheck`・`deploy`（GPU 予約を含む）を含む（#3612で結線）。
+//! 残る除外はトップレベル profiles・ホストパス形の devices・マッピング形の restart 等（REPAIR-3）。
 //! 失敗メッセージには TOML 本文・値を出さない（env の値が入りうるため。SEC-1）。
 
 use std::path::PathBuf;
@@ -127,6 +127,40 @@ fn stack5_605_default_mode_synthetic_fixture_roundtrip() {
     assert_eq!(web.volumes.len(), 2);
     assert_eq!(web.devices, vec!["nvidia.com/gpu=0".to_string()]);
     assert_eq!(out.services["worker"].command.as_deref(), Some(&[][..]));
+    assert_eq!(
+        web.depends_on.get("worker"),
+        Some(&fandhe_container_stack::schema::DependsOnCondition::Healthy)
+    );
+    assert_eq!(
+        web.ulimits.get("nofile").map(String::as_str),
+        Some("1024:2048")
+    );
+    assert_eq!(web.ulimits.get("nproc").map(String::as_str), Some("512"));
+    let hc = web.healthcheck.as_ref().unwrap();
+    assert_eq!(hc.test, Some(vec!["/bin/true".to_string()]));
+    assert_eq!(
+        (hc.interval.as_deref(), hc.timeout.as_deref(), hc.retries),
+        (Some("30s"), Some("5s"), Some(3))
+    );
+    assert_eq!(hc.start_period.as_deref(), Some("10s"));
+    assert_eq!(
+        out.services["worker"].healthcheck.as_ref().unwrap().test,
+        Some(vec![
+            "/bin/sh".to_string(),
+            "-c".into(),
+            "pg_isready".into()
+        ])
+    );
+    let res = web.deploy.as_ref().unwrap().resources.as_ref().unwrap();
+    let lim = res.limits.as_ref().unwrap();
+    assert_eq!(
+        (lim.cpus.as_deref(), lim.memory.as_deref()),
+        (Some("1.5"), Some("512M"))
+    );
+    assert_eq!(
+        res.reservations.as_ref().unwrap().devices,
+        vec!["nvidia.com/gpu=0".to_string()]
+    );
     assert_eq!(out.networks.len(), 1);
     assert_eq!(out.volumes.len(), 2);
     assert_eq!(out.secrets.len(), 1);

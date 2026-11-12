@@ -3850,6 +3850,8 @@ mod tests {
 
     /// OCI-7・#2379: 別のプロセス（ここでは別の open file description）がロックを持つ木は生きていると
     /// 見なして消さず、ロックが外れたら次の回収で消える。
+    /// 保持者は明示 unlock で外す（#4541・REPAIR-12）。close だけでは、同じ試験バイナリの他の試験の
+    /// fork・spawn の窓に複製 fd が残ると OFD のロックが外れず、待たない回収が `kept_alive` に倒れうる。
     #[cfg(target_os = "linux")]
     #[test]
     fn oci7_lock_held_by_other_is_reported_as_alive_not_deleted() {
@@ -3863,9 +3865,15 @@ mod tests {
             vec![std::ffi::OsString::from(".fandhe-unpack-6-6")]
         );
         assert!(t.join("sub/f").exists());
+        holder.unlock().expect("unlock");
         drop(holder);
         let r = reap_stale_unpacks(&b, Path::new("rootfs")).expect("reap");
-        assert_eq!(r.reclaimed.len(), 1);
+        assert_eq!(
+            r.reclaimed,
+            vec![std::ffi::OsString::from(".fandhe-unpack-6-6")]
+        );
+        assert!(r.kept_alive.is_empty());
+        assert!(!t.exists());
     }
 
     /// REPAIR-4・#2379: 親が書込・探索可能だが読めない（走査できない）とき、create は成功するが回収は

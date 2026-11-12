@@ -2619,6 +2619,7 @@ mod tests {
                 manifest: ref_digest(),
                 scope: scope_of(base),
                 legacy_scope: None,
+                unpack: false,
             };
             let req = CreateRequest::new(id(name), make_bundle(base)).expect("req");
             create_container_with_image(rt, &image, &req).map(|_| image)
@@ -2782,6 +2783,7 @@ mod tests {
                 manifest: ref_digest(),
                 scope: legacy.to_owned(),
                 legacy_scope: None,
+                unpack: false,
             };
             let req = CreateRequest::new(id("c1"), make_bundle(&base)).expect("req");
             crate::commands::create_start::create_container_with_image_reclaiming(
@@ -3010,6 +3012,7 @@ mod tests {
                 manifest: ref_digest(),
                 scope: scope_of(base),
                 legacy_scope: None,
+                unpack: false,
             }
         }
 

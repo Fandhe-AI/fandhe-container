@@ -69,6 +69,7 @@ mod create_start;
 mod exec;
 mod image;
 mod image_refs;
+mod image_unpack;
 mod kill_signal;
 mod list_logs;
 mod net_recorder;

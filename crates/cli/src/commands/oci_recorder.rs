@@ -51,6 +51,38 @@ impl OciOpRecorder for CliOciRecorder {
     }
 }
 
+/// 借りた `OpRecorder` へ書き込む `OciOpRecorder`（`Arc` を持てない呼び出し元用。REPAIR-4・OCI-1・#2377）。
+///
+/// イメージつき create の `Runtime` は `OpRecorder` を所有で持つため、`create --unpack` の展開器はこの借用版で
+/// [`CliOciRecorder`] と同じ写像を使う。
+pub(super) struct BorrowedOciRecorder<'a>(&'a OpRecorder);
+
+impl<'a> BorrowedOciRecorder<'a> {
+    pub(super) fn new(recorder: &'a OpRecorder) -> Self {
+        Self(recorder)
+    }
+}
+
+impl fmt::Debug for BorrowedOciRecorder<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BorrowedOciRecorder")
+            .finish_non_exhaustive()
+    }
+}
+
+impl OciOpRecorder for BorrowedOciRecorder<'_> {
+    fn record_oci_op(&self, sample: &OciOpSample) {
+        let Ok(name) = OpName::new(sample.kind().as_str()) else {
+            return;
+        };
+        let outcome = match sample.outcome() {
+            OciOpOutcome::Success => OpOutcome::Success,
+            _ => OpOutcome::Failure,
+        };
+        let _ = self.0.record(&name, outcome, sample.latency());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

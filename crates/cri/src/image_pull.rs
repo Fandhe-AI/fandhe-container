@@ -958,10 +958,22 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
         )?;
         self.ensure_rootfs(session, &paths, blobs.owner, manifest, &rootfs_cfg, budget)?;
         budget.check()?;
+        // layers の mediaType も在庫へ載せる。本番のレイヤー展開（oci の `ImageStore::image_layers`、cli の
+        // `create --unpack`）が展開方式（gzip / 非圧縮）の選択に使う。pull が受理する gzip の 2 種は展開側の
+        // 閉じた集合に入る（OCI-7・OCI-1・#2377）。
         ManifestComposition::new(
             manifest.config.digest.clone(),
             manifest.layers.iter().map(|d| d.digest.clone()).collect(),
         )
+        .and_then(|c| {
+            c.with_layer_media_types(
+                manifest
+                    .layers
+                    .iter()
+                    .map(|d| d.media_type.clone())
+                    .collect(),
+            )
+        })
         .map_err(|e| PullError::from_oci(&e))
     }
 }

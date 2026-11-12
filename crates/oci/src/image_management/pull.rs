@@ -1473,7 +1473,7 @@ impl PullSession<'_> {
         handle.ensure_linked()?;
         if guard
             .manifests()
-            .any(|(d, c)| d == &req.manifest && c != &req.composition)
+            .any(|(d, c)| d == &req.manifest && c.reconcile_with(&req.composition).is_err())
         {
             return Err(err(
                 OciErrorCode::AlreadyExists,

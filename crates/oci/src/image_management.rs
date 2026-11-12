@@ -107,6 +107,9 @@ pub use pull_recovery::StalePullRecovery;
 mod tag;
 pub use tag::{ImageTagChange, ImageTagOutcome, ImageTagSource, MAX_TAG_REFS};
 
+mod layers;
+pub use layers::{StoredImageLayer, StoredImageLayers};
+
 mod root_handle;
 #[cfg(test)]
 mod root_swap_tests;
@@ -139,6 +142,17 @@ pub const MAX_COMPOSITION_LAYERS: usize = crate::manifest::MAX_LAYERS;
 
 fn err(code: OciErrorCode, msg: impl Into<String>) -> OciError {
     OciError::new(code, msg)
+}
+
+/// レイヤー `mediaType` 1 件の検証（長さの上限 → 展開が受理する閉じた集合）。永続化の読み込みも同じ関数を使う。
+pub(crate) fn check_layer_media_type(media_type: &str) -> Result<(), OciError> {
+    if media_type.len() > MAX_LAYER_MEDIA_TYPE_BYTES {
+        return Err(err(
+            OciErrorCode::InvalidArgument,
+            "layer media type is too long",
+        ));
+    }
+    crate::layer::LayerMediaType::parse(media_type).map(|_| ())
 }
 
 /// 識別子の共通検証（空・`.`・`..`・文字種・長さ）。永続化時にパス要素になっても安全な形に限る。
@@ -256,15 +270,32 @@ impl fmt::Display for TagKey {
     }
 }
 
+/// レイヤーの `mediaType` 文字列の最大バイト数（外部入力を検索する前の長さの上限。受理表の最長より十分大きい）。
+pub const MAX_LAYER_MEDIA_TYPE_BYTES: usize = 255;
+
 /// manifest が使う blob の構成（config と layers）。
+///
+/// `layer_media_types` は layers と同じ並びの descriptor `mediaType`（任意）。`None` は「未記録」で、v1 の在庫ファイルと
+/// 記録しない旧経路の登録がこれになる。本番のレイヤー展開（`ImageStore::image_layers`）は `Some` のときだけ受ける
+/// （OCI-7・OCI-1・#2377）。GC の参照計算（`blobs`・`contains`）には使わない。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManifestComposition {
     config: Digest,
     layers: Vec<Digest>,
+    layer_media_types: Option<Vec<String>>,
+}
+
+/// 同じ manifest の再登録で、既存の構成と新しい構成をどう扱うか（`ManifestComposition::reconcile_with`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CompositionMerge {
+    /// 既存のままでよい（変更なし）。
+    Keep,
+    /// 既存の未記録の mediaType を新しい構成で埋める。
+    Upgrade(ManifestComposition),
 }
 
 impl ManifestComposition {
-    /// 構成を作る。layers が `MAX_COMPOSITION_LAYERS` を超えると `ResourceExhausted`。
+    /// 構成を作る（mediaType は未記録）。layers が `MAX_COMPOSITION_LAYERS` を超えると `ResourceExhausted`。
     pub fn new(config: Digest, layers: Vec<Digest>) -> Result<Self, OciError> {
         if layers.len() > MAX_COMPOSITION_LAYERS {
             return Err(err(
@@ -272,7 +303,52 @@ impl ManifestComposition {
                 "too many layers in composition",
             ));
         }
-        Ok(Self { config, layers })
+        Ok(Self {
+            config,
+            layers,
+            layer_media_types: None,
+        })
+    }
+
+    /// layers と同じ並びの `mediaType` を記録する。件数が layers と違う・長すぎる・展開が受理する閉じた集合
+    /// （`layer::LAYER_MEDIA_TYPES`）に無いものは拒否する（外部入力。在庫に入れる時点で fail-closed にする）。
+    pub fn with_layer_media_types(mut self, media_types: Vec<String>) -> Result<Self, OciError> {
+        if media_types.len() != self.layers.len() {
+            return Err(err(
+                OciErrorCode::InvalidArgument,
+                "layer media type count does not match the layers",
+            ));
+        }
+        for m in &media_types {
+            check_layer_media_type(m)?;
+        }
+        self.layer_media_types = Some(media_types);
+        Ok(self)
+    }
+
+    /// layers と同じ並びの `mediaType`。未記録なら `None`。
+    pub fn layer_media_types(&self) -> Option<&[String]> {
+        self.layer_media_types.as_deref()
+    }
+
+    /// 既存の構成 `self` と再登録の構成 `incoming` の突き合わせ。config・layers が違う、または両方が記録済みで
+    /// mediaType が違うなら `AlreadyExists`。既存が未記録で新規が記録済みなら埋める（再 pull による v1 在庫の解消）。
+    /// 新規が未記録なら既存を保つ（記録を落とさない）。
+    pub(crate) fn reconcile_with(&self, incoming: &Self) -> Result<CompositionMerge, OciError> {
+        let conflict = || {
+            err(
+                OciErrorCode::AlreadyExists,
+                "manifest is already registered with a different composition",
+            )
+        };
+        if self.config != incoming.config || self.layers != incoming.layers {
+            return Err(conflict());
+        }
+        match (&self.layer_media_types, &incoming.layer_media_types) {
+            (Some(a), Some(b)) if a != b => Err(conflict()),
+            (None, Some(_)) => Ok(CompositionMerge::Upgrade(incoming.clone())),
+            _ => Ok(CompositionMerge::Keep),
+        }
     }
 
     /// config blob の digest。
@@ -427,6 +503,11 @@ impl ReferenceTable {
         self.manifests.iter()
     }
 
+    /// 登録済み manifest の構成（無ければ `None`）。
+    pub fn composition(&self, digest: &Digest) -> Option<&ManifestComposition> {
+        self.manifests.get(digest)
+    }
+
     /// 登録済みタグと指す manifest を `TagKey` 昇順で返す（`image ls` の読み取り口）。
     pub fn tags(&self) -> impl Iterator<Item = (&TagKey, &Digest)> {
         self.tag_refs.iter()
@@ -440,11 +521,18 @@ impl ReferenceTable {
     ) -> Result<(), OciError> {
         self.ensure_no_pending_deletion()?;
         match self.manifests.get(&digest) {
-            Some(existing) if existing == &composition => Ok(()),
-            Some(_) => Err(err(
-                OciErrorCode::AlreadyExists,
-                format!("manifest {digest} already registered with a different composition"),
-            )),
+            Some(existing) => match existing.reconcile_with(&composition).map_err(|_| {
+                err(
+                    OciErrorCode::AlreadyExists,
+                    format!("manifest {digest} already registered with a different composition"),
+                )
+            })? {
+                CompositionMerge::Keep => Ok(()),
+                CompositionMerge::Upgrade(upgraded) => {
+                    self.manifests.insert(digest, upgraded);
+                    Ok(())
+                }
+            },
             None => {
                 // 永続化できる件数を超える新規登録は拒否する（保存できない状態を作らない。#2380）。
                 if self.manifests.len() >= MAX_IMAGE_MANIFESTS {
@@ -925,6 +1013,83 @@ mod tests {
         assert_eq!(
             code(ManifestComposition::new(d(2), too_many).unwrap_err()),
             OciErrorCode::ResourceExhausted
+        );
+    }
+
+    const TAR: &str = "application/vnd.oci.image.layer.v1.tar";
+    const TAR_GZIP: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
+
+    /// OCI-7・OCI-1・#2377: mediaType は layers と同じ件数・閉じた集合・長さ上限を満たすものだけ記録できる。
+    #[test]
+    fn oci7_oci1_2377_composition_media_types_are_validated() {
+        let base = || ManifestComposition::new(d(0xc1), vec![d(1), d(2)]).unwrap();
+        assert_eq!(base().layer_media_types(), None);
+        let ok = base()
+            .with_layer_media_types(vec![TAR.to_owned(), TAR_GZIP.to_owned()])
+            .unwrap();
+        assert_eq!(
+            ok.layer_media_types(),
+            Some(&[TAR.to_owned(), TAR_GZIP.to_owned()][..])
+        );
+        assert_eq!(
+            code(
+                base()
+                    .with_layer_media_types(vec![TAR.to_owned()])
+                    .unwrap_err()
+            ),
+            OciErrorCode::InvalidArgument
+        );
+        assert_eq!(
+            code(
+                base()
+                    .with_layer_media_types(vec![
+                        TAR.to_owned(),
+                        "application/vnd.oci.image.layer.v1.tar+zstd".to_owned()
+                    ])
+                    .unwrap_err()
+            ),
+            OciErrorCode::Unimplemented
+        );
+        assert_eq!(
+            code(
+                base()
+                    .with_layer_media_types(vec![TAR.to_owned(), "a".repeat(256)])
+                    .unwrap_err()
+            ),
+            OciErrorCode::InvalidArgument
+        );
+    }
+
+    /// OCI-7・#2377: 再登録で未記録の mediaType を埋め、記録済みは落とさず、食い違いは AlreadyExists。
+    #[test]
+    fn oci7_2377_register_manifest_reconciles_media_types() {
+        let plain = ManifestComposition::new(d(0xc1), vec![d(1)]).unwrap();
+        let typed = plain
+            .clone()
+            .with_layer_media_types(vec![TAR.to_owned()])
+            .unwrap();
+        let other = plain
+            .clone()
+            .with_layer_media_types(vec![TAR_GZIP.to_owned()])
+            .unwrap();
+        let mut t = ReferenceTable::new();
+        t.register_manifest(d(0xa), plain.clone()).unwrap();
+        // 未記録 -> 記録済みへ埋める。
+        t.register_manifest(d(0xa), typed.clone()).unwrap();
+        assert_eq!(t.composition(&d(0xa)), Some(&typed));
+        // 記録済みに対する未記録の再登録は既存を保つ。
+        t.register_manifest(d(0xa), plain).unwrap();
+        assert_eq!(t.composition(&d(0xa)), Some(&typed));
+        // 両方記録済みで値が違うなら衝突。
+        assert_eq!(
+            code(t.register_manifest(d(0xa), other).unwrap_err()),
+            OciErrorCode::AlreadyExists
+        );
+        // layers が違えば従来どおり衝突。
+        let diff = ManifestComposition::new(d(0xc1), vec![d(9)]).unwrap();
+        assert_eq!(
+            code(t.register_manifest(d(0xa), diff).unwrap_err()),
+            OciErrorCode::AlreadyExists
         );
     }
 }

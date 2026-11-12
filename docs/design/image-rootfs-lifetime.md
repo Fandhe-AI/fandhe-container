@@ -34,6 +34,8 @@ spec では、OCI-6 の delete が消すのは状態ファイルと cgroup、OCI
 
 ## 前提・制約
 
+- CLI の `create --image-root <dir> --image <ref> --unpack`（#2377）で、本番の展開器（cli の `image_unpack`）つきの `create_with_image` が使われ、core 所有の rootfs が生じる。`delete`（記録した `--image-root` か明示指定）が状態削除の後にこの rootfs と参照を消す。`--unpack` なしの create は従来どおり利用者の rootfs（core は消さない）。展開の所有者は `Keep`（実効 uid）のため、権限は既定の `HostEffectiveIds` で足りる
+
 - 既定の削除は展開と同じ実効 ID で走る。rootless の userns 内での展開が作る subuid 所有の木は、`ImageRootfsPrivilege::SubordinateIds` を渡したときだけ userns の中で消せる（決定 C）。CLI / CRI / supervisor からの権限の受け渡しは #2315・#2243 の配線の範囲で未実装（REPAIR-3）。マルチスレッドの呼び出し元（CRI の tokio 等）は fork の検査で拒否されるため、子プロセス方式の配線が別途要る
 - 状態ルートの既定は tmpfs（`/run`・`$XDG_RUNTIME_DIR`）なので、記録は同じブート内のもの。`--root` で永続ストレージを使い再起動を挟むと、`st_dev` が変わるファイルシステムでは同一性が不一致になり、消さずに残す（安全側）
 - 件数（100 万）と深さ（256）の上限を超える木は、消し切らずに失敗として記録して残す（無限にかからない。REPAIR-5）

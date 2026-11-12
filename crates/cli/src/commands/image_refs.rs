@@ -40,7 +40,8 @@
 //!
 //! # 未実装（実装済みを装わない。REPAIR-3）
 //!
-//! - レイヤーの展開（本番の展開器）は #2377。展開器なしの `ContainerImage` を使うため、bundle の rootfs は展開済みの前提
+//! - レイヤーの展開（本番の展開器）は `image_unpack` にあり、`create --unpack` のときだけ付ける（#2377）。付けない
+//!   `ContainerImage` では、bundle の rootfs は展開済みの前提
 //! - manifest の在庫の永続化は #2380 で oci 側に実装済み（`ImageStore::lock` が読み直す）。在庫を埋める経路は cri の
 //!   `OciImagePuller::pull` に配線済み（#2539）で、本番の `PullImage` へも plugin-cri の ImageService（#2592）から届く。pull していない root では在庫が空で、`register` は `NOT_FOUND`
 //! - `name@digest` 形式は受けない（在庫は manifest と repository を対応づけず、name を検証できないため fail-closed。#2496）

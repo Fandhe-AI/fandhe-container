@@ -40,6 +40,16 @@
 //! 読み書きは検査済み root のハンドル（`root_handle::RootHandle`）起点で、Linux の x86_64 / aarch64 では
 //! 検査後に root が差し替えられても差し替え後のディレクトリへ届かない（#2638）。
 //!
+//! # 版（v2・#2377）
+//!
+//! 書き込みは常に version 2。manifest ごとに任意の `layer_media_types`（layers と同じ並びの descriptor `mediaType`。
+//! 受理表 `layer::LAYER_MEDIA_TYPES` の閉じた集合）を持てる。読み込みは 1 と 2 を受け、v1（または項目なし）の
+//! manifest は mediaType が未記録（`None`）になる。未記録のイメージは本番のレイヤー展開（`ImageStore::image_layers`）が
+//! `FailedPrecondition` で拒否し、同じイメージの再 pull（公開時の再登録）で埋まる。v1 のファイルに `layer_media_types` が
+//! あるもの・件数の不一致・受理表の外の値は `DataLoss`。旧バイナリは version 2 を `unsupported image inventory file version`
+//! で拒否する（fail-closed。新旧のバイナリで同じ root を共有しない前提）。`BYTES_PER_MANIFEST` は受理表の最長の
+//! mediaType から導く。`rootfs.diff_ids` は在庫に持たず、登録済みの config blob を読み直して得る（`layers.rs`）。
+//!
 //! # 既知の残り（実装済みを装わない。REPAIR-3）
 //!
 //! `staging/<pull-id>` が無いのに残った永続化済みのリース（保存の順序「リース解放を保存してからステージングを
@@ -75,8 +85,25 @@ pub const MAX_IMAGE_MANIFESTS: usize = 2_048;
 /// 永続化できる pull リース（blob と pull ID の組）の総数の上限（読み込みでも書き込みでも守る）。
 pub const MAX_PULL_LEASES: usize = 16_384;
 
-/// manifest 1 件の最大バイト数の見積り（config と layers 128 件の digest に、キー・区切りの余裕を足した値）。
-const BYTES_PER_MANIFEST: u64 = 10_240;
+/// 受理表（`layer::LAYER_MEDIA_TYPES`）で最長の `mediaType` のバイト数（const 評価で導く）。
+const LONGEST_LAYER_MEDIA_TYPE: usize = {
+    let mut max = 0;
+    let mut i = 0;
+    while i < crate::layer::LAYER_MEDIA_TYPES.len() {
+        let n = crate::layer::LAYER_MEDIA_TYPES[i].media_type.len();
+        if n > max {
+            max = n;
+        }
+        i += 1;
+    }
+    max
+};
+
+/// manifest 1 件の最大バイト数の見積り。v1 の見積り 10,240（config と layers 128 件の digest に、キー・区切りの余裕を
+/// 足した値）に、v2 の `layer_media_types`（受理表で最長の `mediaType` × layers の上限 + 引用符と区切り 3 バイト + キー 64）を足す
+/// （#2377。読み込みは受理表の外の値を拒否するため、これが実際の最大になる）。
+const BYTES_PER_MANIFEST: u64 =
+    10_240 + (crate::manifest::MAX_LAYERS * (LONGEST_LAYER_MEDIA_TYPE + 3)) as u64 + 64;
 /// タグ 1 件の最大バイト数の見積り（host 259・repository 255・tag 128・manifest 71 に、キー等の余裕を足した値）。
 const BYTES_PER_TAG: u64 = 1_024;
 /// リース 1 組の最大バイト数の見積り（blob 71・pull ID 128 に、キー・区切りの余裕を足した値）。
@@ -88,7 +115,10 @@ pub const MAX_IMAGE_INVENTORY_FILE_BYTES: u64 = MAX_IMAGE_MANIFESTS as u64 * BYT
     + MAX_PULL_LEASES as u64 * BYTES_PER_LEASE
     + 4096;
 
-const FORMAT_VERSION: u32 = 1;
+/// 書き込む形式の版。2 は manifest ごとの任意の `layer_media_types` を足した形（#2377）。
+const FORMAT_VERSION: u32 = 2;
+/// 読み込みで受ける最小の版（1 は `layer_media_types` を持たない旧形式。読むと mediaType は未記録になる）。
+const MIN_READ_FORMAT_VERSION: u32 = 1;
 
 fn e(code: OciErrorCode, msg: &'static str) -> OciError {
     OciError::new(code, msg)
@@ -109,6 +139,8 @@ struct RawManifestOut<'a> {
     digest: &'a str,
     config: &'a str,
     layers: Vec<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    layer_media_types: Option<Vec<&'a str>>,
 }
 
 #[derive(Serialize)]
@@ -140,6 +172,8 @@ struct RawManifestIn {
     digest: String,
     config: String,
     layers: Vec<String>,
+    /// v2 だけが持つ任意の項目（v1 のファイルに現れたら拒否する）。
+    layer_media_types: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -395,13 +429,21 @@ impl<'de> DeserializeSeed<'de> for ManifestSeed<'_> {
                 f.write_str("an image inventory manifest entry")
             }
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-                let (mut digest, mut config, mut layers) = (None, None, None);
+                let (mut digest, mut config, mut layers, mut media_types) =
+                    (None, None, None, None);
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
                         "digest" if digest.is_none() => digest = Some(map.next_value()?),
                         "config" if config.is_none() => config = Some(map.next_value()?),
                         "layers" if layers.is_none() => {
                             layers = Some(map.next_value_seed(CappedSeq {
+                                max: crate::manifest::MAX_LAYERS,
+                                exceeded: self.0,
+                                make: || std::marker::PhantomData::<String>,
+                            })?);
+                        }
+                        "layer_media_types" if media_types.is_none() => {
+                            media_types = Some(map.next_value_seed(CappedSeq {
                                 max: crate::manifest::MAX_LAYERS,
                                 exceeded: self.0,
                                 make: || std::marker::PhantomData::<String>,
@@ -415,6 +457,7 @@ impl<'de> DeserializeSeed<'de> for ManifestSeed<'_> {
                         digest,
                         config,
                         layers,
+                        layer_media_types: media_types,
                     }),
                     _ => Err(de::Error::custom("missing field")),
                 }
@@ -556,7 +599,7 @@ fn parse(buf: &[u8], limits: Limits) -> Result<InventoryPortion, OciError> {
             return Err(bad("image inventory file is not valid JSON"));
         }
     };
-    if raw.version != FORMAT_VERSION {
+    if !(MIN_READ_FORMAT_VERSION..=FORMAT_VERSION).contains(&raw.version) {
         return Err(e(
             OciErrorCode::FailedPrecondition,
             "unsupported image inventory file version",
@@ -571,7 +614,16 @@ fn parse(buf: &[u8], limits: Limits) -> Result<InventoryPortion, OciError> {
             .iter()
             .map(|s| digest(s))
             .collect::<Result<Vec<_>, _>>()?;
-        let composition = ManifestComposition::new(digest(&m.config)?, layers)?;
+        let mut composition = ManifestComposition::new(digest(&m.config)?, layers)?;
+        if let Some(types) = &m.layer_media_types {
+            // v1 に無い項目・件数の不一致・受理表の外の値は、読み込みでも外部入力として fail-closed にする。
+            if raw.version < 2 {
+                return Err(bad("layer media types in a version 1 image inventory"));
+            }
+            composition = composition
+                .with_layer_media_types(types.clone())
+                .map_err(|_| bad("invalid layer media types in image inventory"))?;
+        }
         if manifests.insert(digest(&m.digest)?, composition).is_some() {
             return Err(bad("duplicate manifest in image inventory"));
         }
@@ -684,6 +736,9 @@ fn save_with_limits(
                 digest: d.as_str(),
                 config: c.config().as_str(),
                 layers: c.layers().iter().map(Digest::as_str).collect(),
+                layer_media_types: c
+                    .layer_media_types()
+                    .map(|v| v.iter().map(String::as_str).collect()),
             })
             .collect(),
         tags: table
@@ -1036,7 +1091,7 @@ mod tests {
         let a = d(0xa0).to_string();
         let cases: Vec<(String, OciErrorCode, &str)> = vec![
             (
-                doc(2, "", "", ""),
+                doc(FORMAT_VERSION + 1, "", "", ""),
                 OciErrorCode::FailedPrecondition,
                 "version",
             ),
@@ -1323,5 +1378,125 @@ mod tests {
         set_fail_save(false);
         assert!(res.is_ok());
         assert!(!r.join(IMAGE_INVENTORY_FILE_NAME).exists());
+    }
+    const TAR_GZIP: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
+    const TAR: &str = "application/vnd.oci.image.layer.v1.tar";
+
+    fn manifest_json(version_doc: u32, extra: &str) -> String {
+        format!(
+            r#"{{"version":{version_doc},"manifests":[{{"digest":"{}","config":"{}","layers":["{}","{}"]{extra}}}],"tags":[],"leases":[]}}"#,
+            d(0xa0),
+            d(0xc0),
+            d(0x10),
+            d(0x11)
+        )
+    }
+
+    /// OCI-7・OCI-1・#2377: v2 の mediaType 付きの構成が保存と読み込みで往復する。
+    #[test]
+    fn oci7_oci1_2377_v2_media_types_round_trip() {
+        let r = root("mt-rt");
+        let mut table = ReferenceTable::new();
+        let comp = ManifestComposition::new(d(0xc0), vec![d(0x10), d(0x11)])
+            .expect("comp")
+            .with_layer_media_types(vec![TAR.to_owned(), TAR_GZIP.to_owned()])
+            .expect("media types");
+        table.register_manifest(d(0xa0), comp.clone()).expect("reg");
+        save_image_inventory(&rh(&r), &table).expect("save");
+        let text = fs::read_to_string(r.join(IMAGE_INVENTORY_FILE_NAME)).expect("read");
+        assert!(text.starts_with(r#"{"version":2,"#), "{text}");
+        let loaded = load_image_inventory(&rh(&r)).expect("load").expect("some");
+        assert_eq!(loaded.manifests.get(&d(0xa0)), Some(&comp));
+        assert_eq!(
+            loaded.manifests[&d(0xa0)].layer_media_types(),
+            Some(&[TAR.to_owned(), TAR_GZIP.to_owned()][..])
+        );
+    }
+
+    /// OCI-7・#2377: mediaType を持たない構成は項目を書かず、v1 と同じ形で読め、未記録（`None`）になる。
+    #[test]
+    fn oci7_2377_v1_file_loads_with_unrecorded_media_types() {
+        let r = root("mt-v1");
+        write_raw(&r, &manifest_json(1, ""));
+        let loaded = load_image_inventory(&rh(&r)).expect("load").expect("some");
+        assert_eq!(loaded.manifests[&d(0xa0)].layer_media_types(), None);
+        // v2 でも項目が無ければ未記録。
+        write_raw(&r, &manifest_json(2, ""));
+        let loaded = load_image_inventory(&rh(&r)).expect("load").expect("some");
+        assert_eq!(loaded.manifests[&d(0xa0)].layer_media_types(), None);
+    }
+
+    /// OCI-7・#2377: v1 のファイルに mediaType があるもの・件数不一致・未知の型・長すぎる値は DataLoss。
+    #[test]
+    fn oci7_2377_load_rejects_invalid_media_types() {
+        let ok = format!(r#","layer_media_types":["{TAR}","{TAR_GZIP}"]"#);
+        let cases = [
+            (1, ok.clone(), "media types in v1"),
+            (
+                2,
+                format!(r#","layer_media_types":["{TAR}"]"#),
+                "count mismatch",
+            ),
+            (
+                2,
+                r#","layer_media_types":["application/x-unknown","application/x-unknown"]"#
+                    .to_owned(),
+                "unknown type",
+            ),
+            (
+                2,
+                format!(r#","layer_media_types":["{}","{TAR}"]"#, "a".repeat(300)),
+                "too long",
+            ),
+            (
+                2,
+                format!(r#","layer_media_types":["{TAR}","{TAR}"],"layer_media_types":[]"#),
+                "duplicate field",
+            ),
+        ];
+        for (v, extra, why) in cases {
+            let r = root("mt-bad");
+            write_raw(&r, &manifest_json(v, &extra));
+            assert_eq!(
+                code(load_image_inventory(&rh(&r))),
+                OciErrorCode::DataLoss,
+                "{why}"
+            );
+        }
+        // 件数の上限（MAX_LAYERS 超）は確保前に ResourceExhausted。
+        let r = root("mt-many");
+        let many = vec![format!("\"{TAR}\""); crate::manifest::MAX_LAYERS + 1].join(",");
+        write_raw(
+            &r,
+            &manifest_json(2, &format!(r#","layer_media_types":[{many}]"#)),
+        );
+        assert_eq!(
+            code(load_image_inventory(&rh(&r))),
+            OciErrorCode::ResourceExhausted
+        );
+    }
+
+    /// OCI-7・#2377: 1 件あたりの見積りは、受理表で最長の mediaType を layers の上限まで並べた最大の構成を収める。
+    #[test]
+    fn oci7_2377_bytes_per_manifest_covers_longest_media_types() {
+        let longest = crate::layer::LAYER_MEDIA_TYPES
+            .iter()
+            .map(|e| e.media_type)
+            .max_by_key(|m| m.len())
+            .expect("table");
+        assert_eq!(longest.len(), LONGEST_LAYER_MEDIA_TYPE);
+        let layers = vec![d(0x10); crate::manifest::MAX_LAYERS];
+        let comp = ManifestComposition::new(d(0xc0), layers)
+            .expect("comp")
+            .with_layer_media_types(vec![longest.to_owned(); crate::manifest::MAX_LAYERS])
+            .expect("media types");
+        let mut table = ReferenceTable::new();
+        table.register_manifest(d(0xa0), comp).expect("reg");
+        let r = root("mt-size");
+        save_image_inventory(&rh(&r), &table).expect("save");
+        let len = fs::metadata(r.join(IMAGE_INVENTORY_FILE_NAME))
+            .expect("meta")
+            .len();
+        assert!(len <= BYTES_PER_MANIFEST, "{len} > {BYTES_PER_MANIFEST}");
     }
 }

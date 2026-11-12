@@ -101,9 +101,10 @@ use fandhe_container_core::traits::{
     PublishPortRequest, StartRequest, StateRecord, StateRequest, StateStore, StopRequest,
     TraitError,
 };
+#[cfg(unix)]
+use fandhe_container_cri::adapter::CRI_IMAGE_ID_ANNOTATION;
 use fandhe_container_cri::adapter::{
-    BundleProvider, BundleRequest, CRI_IMAGE_ID_ANNOTATION, PodNamespaceHolderProvider,
-    PreparedBundle, RuntimeAdapter,
+    BundleProvider, BundleRequest, PodNamespaceHolderProvider, PreparedBundle, RuntimeAdapter,
 };
 use fandhe_container_cri::error::CriError;
 #[cfg(unix)]
@@ -1415,7 +1416,7 @@ impl CoreLifecycleRuntime {
 
     /// OCI-7 のイメージ参照の登録・解除に使う在庫 root を設定する（#2791・CRI-2）。
     ///
-    /// 設定すると、`CreateRequest` の annotations に [`CRI_IMAGE_ID_ANNOTATION`] があるイメージつきの `create` が
+    /// 設定すると、`CreateRequest` の annotations に `CRI_IMAGE_ID_ANNOTATION` があるイメージつきの `create` が
     /// コンテナ参照を登録・確定し、`delete` が create 時に状態記録へ残した root の参照を外す。`RemoveImage` が見る在庫
     /// （`PersistentImageStore`）と同じ root を渡すこと（本番は `<state_root>/.cri/images`）。unix のみ有効で、
     /// 非 unix では設定しても従来の create / delete のまま（REPAIR-3）。
@@ -2250,7 +2251,7 @@ impl NetworkPlugin for UnimplementedNetwork {
 #[cfg(unix)]
 const BUNDLES_DIR: &str = ".cri/bundles";
 /// pull 済みイメージのキャッシュの置き場（`ImageService` の pull が使うキャッシュと同じ位置を想定する）。
-#[cfg(unix)]
+/// 非 unix でも `with_image_store_root` の引数に使うため cfg を付けない。
 const IMAGES_DIR: &str = ".cri/images";
 
 /// 状態ルート `state_root` 配下に bundle の置き場とイメージキャッシュを用意し、本番の [`BundleProvider`] を作る

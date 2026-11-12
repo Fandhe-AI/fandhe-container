@@ -1879,7 +1879,7 @@ mod tests {
     /// （本番では listener を閉じてカーネルが `ENOSYS` で解く。実カーネルの照合は `exec_seccomp_listener`）。
     #[test]
     fn repair5_2632_overall_deadline_caps_the_serial_wait() {
-        let d = Duration::from_millis(100);
+        let d = Duration::from_millis(400);
         let config = NotifyConfig::default().with_response_deadline(d).unwrap();
         let fake = many_notifications(10);
         let times: Arc<Mutex<Vec<Instant>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1889,7 +1889,9 @@ mod tests {
         };
         let id = ContainerId::new("web-1").unwrap();
         let started = Instant::now();
-        let overall = started + Duration::from_millis(250);
+        // 3 件目の開始（2d = 800ms）から全体期限までの余裕を 200ms 取る。macOS の runner では応答の
+        // 待ちが数十 ms 以上延び、余裕 50ms（d = 100ms・期限 250ms）では 3 件目の開始前に期限を過ぎた。
+        let overall = started + Duration::from_millis(1000);
         let report = ExecResponder::new(&StuckUntilDeadline, Some(&id), config).serve_with(
             &wrapped,
             &Some,
@@ -1898,11 +1900,11 @@ mod tests {
         );
         let took = started.elapsed();
         assert_eq!(report.end, ServeEnd::DeadlineReached);
-        // 1・2 件目は 100ms・200ms で応答し、3 件目は 250ms の全体期限で打ち切って応答する。4 件目以降は処理しない。
+        // 1・2 件目は 400ms・800ms で応答し、3 件目は 1000ms の全体期限で打ち切って応答する。4 件目以降は処理しない。
         assert_eq!(times.lock().unwrap().len(), 3);
         assert_eq!(report.counts.unrecorded, 3);
-        assert!(took >= Duration::from_millis(250), "{took:?}");
-        assert!(took < Duration::from_millis(750), "{took:?}");
+        assert!(took >= Duration::from_millis(1000), "{took:?}");
+        assert!(took < Duration::from_millis(2000), "{took:?}");
     }
 
     /// cookie が無効なら記録も応答もしない（`target_gone` は 1）。

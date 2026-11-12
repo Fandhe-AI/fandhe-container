@@ -35,6 +35,13 @@
 # stdout と stderr は別ファイルに取り、成功行・禁止行はストリームごとに照合する（試験自身の println と子の stderr が
 # 互いに割り込まない）。失敗時のダンプは見出しつきで 2 本を別に出すため、時系列の並びは失われる。
 # 残余: 同じストリームの別プロセスの書き込みが SUCCESS_LINE の途中に入る場合は救えない（libtest ハーネスは LIBTEST_NAME へ）。
+# 並列モード（PARALLEL=1。#4560・REPAIR-12・REPAIR-7）: 上の 2 モードは `--exact` で 1 件だけ動かすため、同じ試験バイナリの
+# 別の試験が並列に fork したときだけ起きる競合（#4550 の ETXTBSY 型）を再現できない。PARALLEL=1 は `--exact` も
+# `--test-threads` も渡さず libtest の既定の並列度のまま、位置引数の部分一致 FILTER（空ならバイナリ全体）で N 回繰り返す。
+# 対象は TEST_BIN なしなら lib、TEST_BIN ありなら libtest ハーネスの結合試験（TEST_IGNORED=1 で `--ignored`）。判定は `--logfile` で、
+# ループの前のプリフライト（同じ filter の `--list`）の件数 E を期待値にして、毎回 `ok` + `ignored` の行数 = E・`failed` 行なし・
+# 未知の行なしを要求する（E=0 は `reason=no-matching-tests` で止め、0 件実行の false-green を防ぐ）。USER_SCOPE・TEST・
+# SUCCESS_LINE・LIBTEST_NAME とは併用できない（usage）。RUST_TEST_THREADS は上書きしない。
 # 委譲スコープモード（USER_SCOPE=1。#2886）: production_launcher のように、cargo を同じ cgroup に入れると
 # prepare が失敗する試験用。ビルドは `--no-run --message-format=json` で 1 回だけ行い、jq で試験バイナリを
 # 一意に特定して、毎回 `systemd-run --user --scope --quiet -p Delegate=yes` の中で直接実行する
@@ -68,11 +75,15 @@
 #            VALUE は `[A-Za-z0-9_.,:/+-]` で 128 文字以下。ビルドには渡さない。出力には名前だけを出す
 #   FEATURES 任意。`--features` に渡す feature 名（カンマ区切り。`[a-z0-9_,-]`、先頭 - 不可、128 文字以下）。
 #            既定 feature で有効にならない試験（例: crates/plugin の `grpc` 配下）を回すのに使う（#2711）
+#   PARALLEL 任意。1 で並列モード（上記。TEST_BIN は任意）。TEST・SUCCESS_LINE・LIBTEST_NAME・USER_SCOPE と排他
+#   FILTER   PARALLEL=1 のみ任意。libtest の位置引数（部分一致。`--exact` なし）。`[A-Za-z0-9_:]`、256 文字以下、先頭 - 不可
 #   COUNT    繰り返し回数（既定 300、1..=1000）
 #   RUN_TIMEOUT  1 回あたりの上限秒（既定 120。REPAIR-5）
 # 出力: 最終行（stdout）は lib が `passed=N failed=M count=C test=<TEST>`、結合試験が
 #   `passed=N failed=M count=C test_bin=<TEST_BIN>`。結合試験の失敗行は stderr に
 #   `FAIL: run i/N rc=R reason=<timeout|exit|missing-success-line|missing-libtest-ok|forbidden-line>`
+#   （並列モードは failed-in-log・unexpected-log-line・result-count-mismatch want=E got=K も。最終行は
+#   `passed=N failed=M count=C mode=parallel target=<lib|test_bin:NAME> filter=<F|(none)> tests_per_run=E` で、passed・failed は回数）
 #   （lib も reason を出す。forbidden-line は `forbidden='<要素>'` を併記）。lib・LIBTEST_NAME はループの前に
 #   `--list --logfile` のプリフライトを行い、通れば `info: libtest_logfile=accepted`、失敗なら
 #   `FAIL: preflight rc=R reason=<logfile-unsupported|preflight-failed>` と stdout・stderr のダンプ、集計行
@@ -86,6 +97,7 @@ source "${DIR}/../lib.sh"
 usage() {
   echo "usage: make repeat-test PACKAGE=fandhe-container-<name> TEST=<module::path::test> [FEATURES=<a,b>] [COUNT=300] [RUN_TIMEOUT=120]" >&2
   echo "       make repeat-test PACKAGE=fandhe-container-<name> TEST_BIN=<name> (SUCCESS_LINE=<line> | LIBTEST_NAME=<name>) [TEST_IGNORED=1] [USER_SCOPE=1] [TEST_ENV='FANDHE_CONTAINER_X=1 ...'] [FEATURES=<a,b>] [COUNT=300] [RUN_TIMEOUT=120]" >&2
+  echo "       make repeat-test PACKAGE=fandhe-container-<name> PARALLEL=1 [FILTER=<substring>] [TEST_BIN=<name> [TEST_IGNORED=1]] [FEATURES=<a,b>] [COUNT=300] [RUN_TIMEOUT=120]" >&2
   echo "       (any mode) [FORBIDDEN_LINE='a|b'] [INFO_PREFIX=<prefix>]" >&2
   exit 2
 }
@@ -97,6 +109,8 @@ SUCCESS_LINE="${SUCCESS_LINE:-}"
 LIBTEST_NAME="${LIBTEST_NAME:-}"
 FORBIDDEN_LINE="${FORBIDDEN_LINE:-}"
 INFO_PREFIX="${INFO_PREFIX:-}"
+PARALLEL="${PARALLEL:-}"
+FILTER="${FILTER:-}"
 TEST_IGNORED="${TEST_IGNORED:-}"
 USER_SCOPE="${USER_SCOPE:-}"
 TEST_ENV="${TEST_ENV:-}"
@@ -106,11 +120,26 @@ RUN_TIMEOUT="${RUN_TIMEOUT:-120}"
 [ -n "${PACKAGE}" ] || usage
 # TEST（lib）と TEST_BIN（結合試験）はちょうど一方だけ。
 if [ -n "${TEST}" ] && [ -n "${TEST_BIN}" ]; then usage; fi
-if [ -z "${TEST}" ] && [ -z "${TEST_BIN}" ]; then usage; fi
+if [ -z "${TEST}" ] && [ -z "${TEST_BIN}" ] && [ "${PARALLEL}" != 1 ]; then usage; fi
 # 入力は cargo の引数（SUCCESS_LINE を除く）にだけ使う。許可する文字を絞り、フラグ（先頭 -）の混入も防ぐ。
 case "${PACKAGE}" in fandhe-container-*) ;; *) usage ;; esac
 case "${PACKAGE}" in *[!a-z0-9-]*) usage ;; esac
-if [ -n "${TEST}" ]; then
+case "${PARALLEL}" in '' | 1) ;; *) usage ;; esac
+if [ -n "${FILTER}" ] && [ "${PARALLEL}" != 1 ]; then usage; fi
+if [ "${PARALLEL}" = 1 ]; then
+  # 並列モード（#4560）: 他モードの入力は黙って無視せず拒否する。FILTER は cargo と試験バイナリの引数になるため文字を絞る。
+  if [ -n "${TEST}" ] || [ -n "${SUCCESS_LINE}" ] || [ -n "${LIBTEST_NAME}" ] || [ -n "${USER_SCOPE}" ]; then usage; fi
+  case "${FILTER}" in -* | *[!A-Za-z0-9_:]*) usage ;; esac
+  [ "${#FILTER}" -le 256 ] || usage
+  case "${TEST_IGNORED}" in '' | 1) ;; *) usage ;; esac
+  if [ -n "${TEST_BIN}" ]; then
+    case "${TEST_BIN}" in -* | *[!A-Za-z0-9_-]*) usage ;; esac
+    [ "${#TEST_BIN}" -le 128 ] || usage
+  else
+    # lib 対象に --ignored は付けない（lib モードと同じ扱い）。
+    [ -z "${TEST_IGNORED}" ] || usage
+  fi
+elif [ -n "${TEST}" ]; then
   # lib モードに結合試験用の入力があれば黙って無視せず拒否する。
   if [ -n "${SUCCESS_LINE}" ] || [ -n "${LIBTEST_NAME}" ] || [ -n "${TEST_IGNORED}" ] || [ -n "${USER_SCOPE}" ]; then usage; fi
   case "${TEST}" in *[!A-Za-z0-9_:]*) usage ;; esac
@@ -184,6 +213,15 @@ fi
 int_in_range "${COUNT}" 1 1000 || usage
 int_in_range "${RUN_TIMEOUT}" 1 3600 || usage
 
+# 内部フラグ。IS_LIB は lib 対象（TEST、または TEST_BIN なしの並列モード）、USES_LOGFILE は libtest の --logfile で判定するモード。
+IS_LIB=""
+if [ -n "${TEST}" ] || { [ "${PARALLEL}" = 1 ] && [ -z "${TEST_BIN}" ]; }; then IS_LIB=1; fi
+USES_LOGFILE=""
+if [ -n "${IS_LIB}" ] || [ -n "${LIBTEST_NAME}" ] || [ "${PARALLEL}" = 1 ]; then USES_LOGFILE=1; fi
+PAR_TARGET="lib"
+[ -z "${TEST_BIN}" ] || PAR_TARGET="test_bin:${TEST_BIN}"
+EXPECTED="unknown"
+
 skip_unless_workspace repeat-test
 
 if [ -r /proc/sys/kernel/core_pattern ]; then
@@ -191,6 +229,14 @@ if [ -r /proc/sys/kernel/core_pattern ]; then
   [ ! -r /proc/sys/kernel/core_pipe_limit ] || echo "info: core_pipe_limit=$(cat /proc/sys/kernel/core_pipe_limit)"
 fi
 echo "info: forbidden_count=${#FORBIDDEN_ITEMS[@]}"
+if [ "${PARALLEL}" = 1 ]; then
+  # RUST_TEST_THREADS は上書きしない。値そのものは出さず、並列度の条件が記録で分かるようにする。
+  rtt="default"
+  if [ -n "${RUST_TEST_THREADS:-}" ]; then
+    case "${RUST_TEST_THREADS}" in *[!0-9]*) rtt="set" ;; *) rtt="${RUST_TEST_THREADS}" ;; esac
+  fi
+  echo "info: parallel=1 filter=${FILTER:-(none)} rust_test_threads=${rtt}"
+fi
 
 # 試験バイナリ単位の watchdog（.cargo/config.toml の runner。#3504）が、外側の 1 回の期限より先に発火しないようにする。
 FANDHE_CONTAINER_TEST_BIN_DEADLINE_SECS="$((RUN_TIMEOUT + 30))"
@@ -205,7 +251,7 @@ logf="${RUN_LIMITED_DIR}/libtest.log"
 # libtest の結果を読むモード（lib・LIBTEST_NAME）だけ --logfile を渡す。harness = false のバイナリには渡さない。
 # Git Bash では cygpath で Windows 形式にする（別の引数として渡すので MSYS のパス変換も効く）。
 LOGARGS=()
-if [ -n "${TEST}" ] || [ -n "${LIBTEST_NAME}" ]; then
+if [ -n "${USES_LOGFILE}" ]; then
   log_arg="${logf}"
   if command -v cygpath >/dev/null 2>&1; then log_arg="$(cygpath -m "${logf}")"; fi
   LOGARGS=(--logfile "${log_arg}")
@@ -219,7 +265,7 @@ fi
 SCOPE_BIN=""
 SCOPE_USER=""
 RUN_INDEX=0
-if [ -n "${TEST}" ]; then
+if [ -n "${IS_LIB}" ]; then
   run cargo test -p "${PACKAGE}" --lib ${FEATURES:+--features "${FEATURES}"} --no-run
 elif [ "${USER_SCOPE}" = 1 ]; then
   # 委譲スコープモード: cargo を毎回は通さず、特定した試験バイナリを scope の中で直接実行する（#2886）。
@@ -244,14 +290,50 @@ fi
 # プリフライト（#3036）: libtest が `--logfile` を受理するかをループの前に 1 回だけ確かめる。`--list` は試験を走らせない
 # （委譲スコープも TEST_ENV も不要）。削除後は未知のオプションで rc≠0 になるため、COUNT 回の汎用 `reason=exit` ではなく
 # 原因の分かる固定行で fail-closed に止める。ラベルは文言で決めるだけで、失敗にするかは rc だけで決める（`--list` でも logfile は作られうる〔1.99.0 の実測では 0 件で空ファイル〕が中身は見ず、成功後に消す。ログの照合は各回の成功判定が担う）。
+PRE_EXTRA=()
+if [ "${PARALLEL}" = 1 ]; then
+  [ "${TEST_IGNORED}" != 1 ] || PRE_EXTRA+=(--ignored)
+  [ -z "${FILTER}" ] || PRE_EXTRA+=("${FILTER}")
+fi
 preflight_run() {
   if [ -n "${SCOPE_BIN}" ]; then
     "${SCOPE_BIN}" --list --logfile "${log_arg}" >"${pre_o}" 2>"${pre_e}"
-  elif [ -n "${TEST}" ]; then
-    cargo test -p "${PACKAGE}" --lib ${FEATURES:+--features "${FEATURES}"} -- --list --logfile "${log_arg}" >"${pre_o}" 2>"${pre_e}"
+  elif [ -n "${IS_LIB}" ]; then
+    cargo test -p "${PACKAGE}" --lib ${FEATURES:+--features "${FEATURES}"} -- ${PRE_EXTRA[@]+"${PRE_EXTRA[@]}"} --list --logfile "${log_arg}" >"${pre_o}" 2>"${pre_e}"
   else
-    cargo test -p "${PACKAGE}" --test "${TEST_BIN}" ${FEATURES:+--features "${FEATURES}"} -- --list --logfile "${log_arg}" >"${pre_o}" 2>"${pre_e}"
+    cargo test -p "${PACKAGE}" --test "${TEST_BIN}" ${FEATURES:+--features "${FEATURES}"} -- ${PRE_EXTRA[@]+"${PRE_EXTRA[@]}"} --list --logfile "${log_arg}" >"${pre_o}" 2>"${pre_e}"
   fi
+}
+
+# 最終の集計行（stdout）。passed・failed は回数。並列モードは 1 回あたりの試験数も併記する（#4560）。
+summary_line() {
+  if [ "${PARALLEL}" = 1 ]; then
+    echo "passed=$1 failed=$2 count=${COUNT} mode=parallel target=${PAR_TARGET} filter=${FILTER:-(none)} tests_per_run=${EXPECTED}"
+  elif [ -n "${TEST}" ]; then
+    echo "passed=$1 failed=$2 count=${COUNT} test=${TEST}"
+  else
+    echo "passed=$1 failed=$2 count=${COUNT} test_bin=${TEST_BIN}"
+  fi
+}
+
+# 並列モードのプリフライト後処理: `--list` の stdout から期待件数 E を数える（0 件・要約不一致・benchmark は固定 reason で止める）。
+parallel_preflight_stop() {
+  echo "FAIL: preflight rc=0 reason=$1" >&2
+  echo "--- preflight stdout ---" >&2
+  cat "${pre_o}" >&2 2>/dev/null || true
+  summary_line 0 "${COUNT}"
+  exit 1
+}
+parallel_expected_count() {
+  local list n bench summary
+  list="$(tr -d '\r' <"${pre_o}")"
+  n="$(printf '%s\n' "${list}" | grep -c ': test$' || true)"
+  bench="$(printf '%s\n' "${list}" | grep -c ': benchmark$' || true)"
+  [ "${bench}" -eq 0 ] || parallel_preflight_stop "list-has-benchmarks"
+  summary="$(printf '%s\n' "${list}" | grep -E '^[0-9]+ tests?, [0-9]+ benchmarks?$' | tail -n 1 | sed 's/ test.*//' || true)"
+  if [ -n "${summary}" ] && [ "${summary}" -ne "${n}" ]; then parallel_preflight_stop "list-summary-mismatch"; fi
+  [ "${n}" -gt 0 ] || parallel_preflight_stop "no-matching-tests"
+  EXPECTED="${n}"
 }
 if [ "${#LOGARGS[@]}" -gt 0 ]; then
   pre_o="${RUN_LIMITED_DIR}/preflight.out"
@@ -262,6 +344,10 @@ if [ "${#LOGARGS[@]}" -gt 0 ]; then
   if [ "${pre_rc}" -eq 0 ]; then
     echo "info: libtest_logfile=accepted"
     rm -f "${logf}"
+    if [ "${PARALLEL}" = 1 ]; then
+      parallel_expected_count
+      echo "info: parallel_expected_tests=${EXPECTED}"
+    fi
   else
     pre_reason="preflight-failed"
     if cat "${pre_o}" "${pre_e}" 2>/dev/null | grep -F -- "Unrecognized option: 'logfile'" >/dev/null; then
@@ -272,11 +358,7 @@ if [ "${#LOGARGS[@]}" -gt 0 ]; then
     cat "${pre_o}" >&2 2>/dev/null || true
     echo "--- preflight stderr ---" >&2
     cat "${pre_e}" >&2 2>/dev/null || true
-    if [ -n "${TEST}" ]; then
-      echo "passed=0 failed=${COUNT} count=${COUNT} test=${TEST}"
-    else
-      echo "passed=0 failed=${COUNT} count=${COUNT} test_bin=${TEST_BIN}"
-    fi
+    summary_line 0 "${COUNT}"
     exit 1
   fi
 fi
@@ -285,13 +367,18 @@ fi
 # TEST_ENV は env で子にだけ付ける（bash 3.2 の空配列展開に備え `${a[@]+...}` で書く）。
 one_run() {
   local extra=()
-  if [ -n "${TEST}" ]; then
-    env ${TEST_ENV_ARGS[@]+"${TEST_ENV_ARGS[@]}"} cargo test -p "${PACKAGE}" --lib ${FEATURES:+--features "${FEATURES}"} -- --exact "${TEST}" "${LOGARGS[@]}" >"${out_o}" 2>"${out_e}"
+  if [ -n "${IS_LIB}" ]; then
+    # 並列モードは --exact も --test-threads も渡さない（#4560）。位置引数の FILTER だけ。
+    local la=()
+    [ -z "${TEST}" ] || la+=(--exact "${TEST}")
+    [ -z "${FILTER}" ] || la+=("${FILTER}")
+    env ${TEST_ENV_ARGS[@]+"${TEST_ENV_ARGS[@]}"} cargo test -p "${PACKAGE}" --lib ${FEATURES:+--features "${FEATURES}"} -- ${la[@]+"${la[@]}"} "${LOGARGS[@]}" >"${out_o}" 2>"${out_e}"
     return
   fi
   [ "${TEST_IGNORED}" != 1 ] || extra+=(--ignored)
   # LIBTEST_NAME は --exact で単独の試験へ絞る（#3037）。SUCCESS_LINE（harness = false）には --exact を渡さない。
   [ -z "${LIBTEST_NAME}" ] || extra+=(--exact "${LIBTEST_NAME}")
+  [ -z "${FILTER}" ] || extra+=("${FILTER}")
   extra+=(${LOGARGS[@]+"${LOGARGS[@]}"})
   if [ -n "${SCOPE_BIN}" ]; then
     env ${TEST_ENV_ARGS[@]+"${TEST_ENV_ARGS[@]}"} USER="${SCOPE_USER}" \
@@ -323,6 +410,22 @@ output_ok() {
   else
     crless "${out_o}" | grep -xF -- "${SUCCESS_LINE}" >/dev/null || crless "${out_e}" | grep -xF -- "${SUCCESS_LINE}" >/dev/null
   fi
+}
+
+# 並列モードの合格判定（#4560）。合格なら何も出さず、不合格なら reason を 1 行出す。
+# 期待件数 E（プリフライトの `--list`）に対し ok + ignored が一致することを要求する。grep -c は一致 0 件で rc=1 になるため || true。
+parallel_output_reason() {
+  [ -f "${logf}" ] || { echo "missing-libtest-ok"; return 0; }
+  local ok ign bad unk
+  ok="$(crless "${logf}" | grep -c '^ok [^ ][^ ]*$' || true)"
+  ign="$(crless "${logf}" | grep -c -E '^(ignored [^ ]+|ignored: .* [^ ]+)$' || true)"
+  bad="$(crless "${logf}" | grep -c '^failed' || true)"
+  unk="$(crless "${logf}" | grep -c -v -E '^(ok [^ ]+|ignored [^ ]+|ignored: .* [^ ]+|failed.*)$' || true)"
+  if [ "${bad}" -gt 0 ]; then echo "failed-in-log"; return 0; fi
+  if [ "${unk}" -gt 0 ]; then echo "unexpected-log-line"; return 0; fi
+  if [ "${ok}" -eq 0 ]; then echo "missing-libtest-ok"; return 0; fi
+  if [ $((ok + ign)) -ne "${EXPECTED}" ]; then echo "result-count-mismatch want=${EXPECTED} got=$((ok + ign))"; return 0; fi
+  return 0
 }
 
 # 禁止行の判定。当たった要素を FORBID_HIT に入れて 0 を返す（無ければ 1）。
@@ -362,13 +465,17 @@ while [ "${i}" -le "${COUNT}" ]; do
   run_limited "${RUN_TIMEOUT}" one_run || rc=$?
   reason=""
   FORBID_HIT=""
+  par_reason=""
+  if [ "${PARALLEL}" = 1 ] && [ "${rc}" -eq 0 ]; then par_reason="$(parallel_output_reason)"; fi
   if [ "${rc}" -eq 124 ]; then
     reason="timeout"
     # 残った scope を best-effort で止める（REPAIR-5。失敗しても判定は変えない）。
     [ -z "${SCOPE_BIN}" ] || systemctl --user stop "fandhe-repeat-$$-${RUN_INDEX}.scope" >/dev/null 2>&1 || true
   elif [ "${rc}" -ne 0 ]; then
     reason="exit"
-  elif ! output_ok; then
+  elif [ -n "${par_reason}" ]; then
+    reason="${par_reason}"
+  elif [ "${PARALLEL}" != 1 ] && ! output_ok; then
     if [ -n "${SUCCESS_LINE}" ]; then reason="missing-success-line"; else reason="missing-libtest-ok"; fi
   elif forbidden_hit; then
     reason="forbidden-line forbidden='${FORBID_HIT}'"
@@ -396,9 +503,5 @@ if [ -n "${SCOPE_BIN}" ]; then
   echo "info: uptime=$(cut -d' ' -f1 /proc/uptime 2>/dev/null || true)"
   { systemctl show systemd-tmpfiles-clean.service -p ExecMainStartTimestamp 2>/dev/null | sed 's/^/info: /'; } || true
 fi
-if [ -n "${TEST}" ]; then
-  echo "passed=${passed} failed=${failed} count=${COUNT} test=${TEST}"
-else
-  echo "passed=${passed} failed=${failed} count=${COUNT} test_bin=${TEST_BIN}"
-fi
+summary_line "${passed}" "${failed}"
 [ "${failed}" -eq 0 ]

@@ -36,6 +36,8 @@ case " $* " in
     for a in "$@"; do [ "${prev}" = --logfile ] && lf="${a}"; prev="${a}"; done
     if [ -n "${STUB_NO_LOGFILE:-}" ] && [ -n "${lf}" ]; then echo "error: Unrecognized option: 'logfile'" >&2; exit 101; fi
     [ -z "${STUB_PREFLIGHT_RC:-}" ] || exit "${STUB_PREFLIGHT_RC}"
+    # 並列モードの期待件数の元（`--list` の stdout。#4560）。未指定なら何も出さない（従来どおり）。
+    [ -z "${STUB_LIST:-}" ] || printf '%b' "${STUB_LIST}"
     exit 0 ;;
 esac
 case " $* " in
@@ -522,6 +524,64 @@ check info-513 2 "usage:" ok "${P}" "${T}" "INFO_PREFIX=$(printf 'a%.0s' $(seq 1
 check info-512-accepted 0 "passed=1 failed=0" ok "${P}" "${T}" "INFO_PREFIX=$(printf 'a%.0s' $(seq 1 512))" COUNT=1
 check count-zero 2 "usage:" ok "${P}" "${T}" COUNT=0
 check count-over 2 "usage:" ok "${P}" "${T}" COUNT=1001
+
+# --- PARALLEL=1: 並列の条件を保つ繰り返し（#4560・REPAIR-12）---
+PL="PARALLEL=1"
+LIST3='a::t1: test\na::t2: test\na::t3: test\n\n3 tests, 0 benchmarks\n'
+LOG3='ok a::t1\nok a::t2\nignored a::t3\n'
+check par-lib-filter 0 "passed=3 failed=0 count=3 mode=parallel target=lib filter=exec_launcher tests_per_run=3" gen "${P}" "${PL}" FILTER=exec_launcher "STUB_LIST=${LIST3}" "STUB_LOG=${LOG3}" COUNT=3
+check par-lib-no-filter 0 "filter=(none) tests_per_run=3" gen "${P}" "${PL}" "STUB_LIST=${LIST3}" "STUB_LOG=${LOG3}" COUNT=1
+check par-bin 0 "target=test_bin:exec_x filter=f tests_per_run=3" gen "${P}" "${PL}" "${B}" FILTER=f "STUB_LIST=${LIST3}" "STUB_LOG=${LOG3}" COUNT=1
+check par-ignored-msg-form 0 "passed=1 failed=0" gen "${P}" "${PL}" "STUB_LIST=a::t1: test\na::t2: test\n" 'STUB_LOG=ok a::t1\nignored: why a::t2\n' COUNT=1
+check par-info-line 0 "info: parallel=1 filter=zz rust_test_threads=default" gen "${P}" "${PL}" FILTER=zz "STUB_LIST=${LIST3}" "STUB_LOG=${LOG3}" COUNT=1
+check par-expected-info 0 "info: parallel_expected_tests=3" gen "${P}" "${PL}" "STUB_LIST=${LIST3}" "STUB_LOG=${LOG3}" COUNT=1
+check par-failed-rc 1 "reason=exit" gen "${P}" "${PL}" "STUB_LIST=${LIST3}" 'STUB_LOG=ok a::t1\nfailed a::t2\n' STUB_RC=101 COUNT=1
+check par-failed-in-log-rc0 1 "reason=failed-in-log" gen "${P}" "${PL}" "STUB_LIST=${LIST3}" 'STUB_LOG=ok a::t1\nok a::t2\nfailed a::t3\n' COUNT=1
+check par-count-mismatch 1 "reason=result-count-mismatch want=3 got=2" gen "${P}" "${PL}" "STUB_LIST=${LIST3}" 'STUB_LOG=ok a::t1\nok a::t2\n' COUNT=1
+check par-empty-log 1 "reason=missing-libtest-ok" gen "${P}" "${PL}" "STUB_LIST=${LIST3}" 'STUB_LOG=' COUNT=1
+check par-ignored-only 1 "reason=missing-libtest-ok" gen "${P}" "${PL}" "STUB_LIST=${LIST3}" 'STUB_LOG=ignored a::t1\nignored a::t2\nignored a::t3\n' COUNT=1
+check par-unknown-line 1 "reason=unexpected-log-line" gen "${P}" "${PL}" "STUB_LIST=${LIST3}" 'STUB_LOG=ok a::t1\nok a::t2\nweird\n' COUNT=1
+check par-log-missing-second-run 1 "passed=1 failed=1 count=2 mode=parallel" gen "${P}" "${PL}" "STUB_LIST=${LIST3}" "STUB_LOG=${LOG3}" STUB_LOG_FIRST_ONLY=1 COUNT=2
+check par-zero-matching 1 "reason=no-matching-tests" gen "${P}" "${PL}" FILTER=nomatch 'STUB_LIST=\n0 tests, 0 benchmarks\n' COUNT=2
+check par-zero-summary 1 "passed=0 failed=2 count=2 mode=parallel target=lib filter=nomatch tests_per_run=unknown" gen "${P}" "${PL}" FILTER=nomatch 'STUB_LIST=' COUNT=2
+check par-summary-mismatch 1 "reason=list-summary-mismatch" gen "${P}" "${PL}" 'STUB_LIST=a: test\n\n5 tests, 0 benchmarks\n' COUNT=1
+check par-benchmark-line 1 "reason=list-has-benchmarks" gen "${P}" "${PL}" 'STUB_LIST=a: test\nb: benchmark\n' COUNT=1
+check par-forbidden 1 "reason=forbidden-line" gen "${P}" "${PL}" "STUB_LIST=${LIST3}" "STUB_LOG=${LOG3}" 'STUB_STDOUT=BOOM here\n' 'FORBIDDEN_LINE=BOOM' 'STUB_NC_STDOUT=BOOM\n' COUNT=1
+check par-no-logfile 1 "reason=logfile-unsupported" gen "${P}" "${PL}" STUB_NO_LOGFILE=1 COUNT=1
+check par-timeout 1 "reason=timeout" bin-hang "${P}" "${PL}" "STUB_LIST=${LIST3}" COUNT=1 RUN_TIMEOUT=1
+# ループが 1 回も回らない（カウンタが作られない）こと。
+rm -f "${work}/counter"
+env PATH="${work}/bin:${PATH}" STUB_MODE=gen STUB_COUNTER="${work}/counter" "${P}" "${PL}" STUB_LIST= COUNT=3 "${target}" >/dev/null 2>&1
+if [ ! -f "${work}/counter" ]; then echo "OK: par-zero-no-loop"; else echo "NG: par-zero-no-loop" >&2; fails=$((fails + 1)); fi
+# 引数: --exact / --test-threads が無く、filter は -- の後ろの位置引数。
+par_args() {
+  local name="$1" want="$2"
+  shift 2
+  rm -f "${work}/args" "${work}/counter"
+  env PATH="${work}/bin:${PATH}" STUB_MODE=gen STUB_LIST="${LIST3}" STUB_LOG="${LOG3}" STUB_COUNTER="${work}/counter" STUB_ARGS_LOG="${work}/args" \
+    "${P}" "${PL}" "$@" COUNT=1 "${target}" >/dev/null 2>&1
+  if grep -qE -- "${want}" "${work}/args" && ! grep -qE -- "--exact|--test-threads" "${work}/args"; then
+    echo "OK: ${name}"
+  else
+    echo "NG: ${name}" >&2; cat "${work}/args" >&2; fails=$((fails + 1))
+  fi
+}
+par_args par-args-lib-filter '--lib -- exec_launcher --logfile .*libtest\.log$' FILTER=exec_launcher
+par_args par-args-lib-nofilter '--lib -- --logfile .*libtest\.log$'
+par_args par-args-bin-ignored '--test exec_x -- --ignored exec_launcher --logfile .*libtest\.log$' "${B}" TEST_IGNORED=1 FILTER=exec_launcher
+par_args par-args-preflight '-- exec_launcher --list --logfile .*libtest\.log$' FILTER=exec_launcher
+# 入力不正。
+check par-with-test 2 "usage:" gen "${P}" "${PL}" "${T}"
+check par-with-success-line 2 "usage:" gen "${P}" "${PL}" "${B}" "${S}"
+check par-with-libtest-name 2 "usage:" gen "${P}" "${PL}" "${B}" "${LN}"
+check par-with-user-scope 2 "usage:" gen "${P}" "${PL}" "${B}" USER_SCOPE=1
+check par-lib-ignored 2 "usage:" gen "${P}" "${PL}" TEST_IGNORED=1
+check par-filter-alone 2 "usage:" gen "${P}" FILTER=x "${T}"
+check par-yes 2 "usage:" gen "${P}" PARALLEL=yes
+check par-filter-flag 2 "usage:" gen "${P}" "${PL}" FILTER=-x
+check par-filter-slash 2 "usage:" gen "${P}" "${PL}" FILTER=a/b
+check par-filter-space 2 "usage:" gen "${P}" "${PL}" "FILTER=a b"
+check par-filter-257 2 "usage:" gen "${P}" "${PL}" "FILTER=$(printf 'a%.0s' $(seq 1 257))"
 
 [ "${fails}" -eq 0 ] || { echo "repeat-test-selftest: ${fails} failure(s)" >&2; exit 1; }
 echo "repeat-test-selftest: all passed"

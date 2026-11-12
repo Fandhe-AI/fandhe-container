@@ -28,7 +28,7 @@
 //! 保持一覧は dial の入口・各 dial の出口（`DialHelper::finish`）・一覧へ入れる直前（`retain`）・dialer の drop で、
 //! 非ブロッキングの `try_wait` により掃除する（回収済みの子は数え直しで外れる。#4525）。
 //!
-//! # 観測（CRI-6・REPAIR-4・REPAIR-5・#4546。操作名と reason は暫定で、語彙の確定は #4116 の項目 3）
+//! # 観測（CRI-6・REPAIR-4・REPAIR-5・#4546。`cri.port_forward.*` の操作名と reason は今の名前で確定。#4116 の項目 3・2026-11-12）
 //! 回収できず保持した・保持数が上限を超えた・満杯で拒否した、の 3 つを [`PodDialTelemetry`] が共有 `OpRecorder` の件数と、
 //! 累計が 2 のべき乗の時だけの構造化行で出す。記録は保持一覧の lock の外で行い（`retain` はガードを落としてから記録する）、
 //! `OpRecorder::record` と `LineSink::submit`（`try_send`）だけを使う。行に pid・port・パス・errno は入れない。
@@ -164,11 +164,11 @@ impl DialTimings {
     }
 }
 
-/// 回収できず保持した helper の操作名（暫定。#4116 の項目 3）。
+/// 回収できず保持した helper の操作名（確定。#4116 の項目 3）。
 pub const OP_PF_HELPER_RETAINED: &str = "cri.port_forward.helper_retained";
-/// 保持数が [`MAX_RETAINED_DIAL_HELPERS`] を超えた操作名（暫定）。
+/// 保持数が [`MAX_RETAINED_DIAL_HELPERS`] を超えた操作名（確定。#4116 の項目 3）。
 pub const OP_PF_RETAINED_OVER_LIMIT: &str = "cri.port_forward.retained_over_limit";
-/// 満杯で dial を断った操作名（暫定）。
+/// 満杯で dial を断った操作名（確定。#4116 の項目 3）。
 pub const OP_PF_RETAINED_FULL: &str = "cri.port_forward.retained_full";
 /// 異常行の `event` 名。
 pub const PF_EVENT_NAME: &str = "cri_port_forward_helper";

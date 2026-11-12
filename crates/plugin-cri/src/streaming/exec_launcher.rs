@@ -43,7 +43,7 @@
 //! - helper の fd 1 は `/dev/null`。fd 2 は AF_UNIX の socketpair で受け、上限つきで固定語彙の構造化ログへ転送する
 //!   （[`diagnostics`]。上限・転送の規則・停止・残余は同モジュールの doc。#4171・REPAIR-4・REPAIR-5）。
 //! - セッションは最長 `MAX_EXEC_HOLD_SECS`（1 時間）で helper が止める（kubelet の idle 4 時間より短い）。
-//! - 同時セッション 64・回収できない helper の保持 8 は暫定値（#4116 のオーナー確認待ち）。
+//! - 同時セッション 64・回収できない helper の保持 8 は暫定値（#4116 の範囲外で未判断。判断の窓口は #4586）。
 //! - plugin-cri が SIGKILL された場合も helper は channel の切断を検知して通常 2 秒以内に終わる（#4166。実機照合は #4167 の
 //!   `production_binary_exec_real` の段 4）。残る窓: listener の受け渡し前・通知処理中の最大 5 秒の遅れ・channel の端の漏れ（helper の doc を参照）。
 //! - `WindowSize` の 0 行・0 列はそのまま渡す（カーネルは受け付け、害が無い）。
@@ -85,10 +85,10 @@ use crate::telemetry::LineSink;
 pub mod diagnostics;
 use diagnostics::DiagTracker;
 
-/// 同時に走らせる exec セッションの上限（`StreamingConfig::max_connections` の既定と同じ。暫定。#4116）。
+/// 同時に走らせる exec セッションの上限（`StreamingConfig::max_connections` の既定と同じ。暫定値で、判断は #4586）。
 pub const MAX_EXEC_SESSIONS: usize = 64;
 
-/// kill 後に回収できず保持する helper の上限（暫定。#4116）。
+/// kill 後に回収できず保持する helper の上限（暫定値で、判断は #4586）。
 pub const MAX_STUCK_HELPERS: usize = 8;
 
 /// stdio の fd を helper へ渡す期限。

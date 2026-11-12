@@ -350,7 +350,22 @@ fn serve(
     // 保持役が無い構成（rootful・注入なし）は node-only で、POD は RPC 時に `UNIMPLEMENTED` のまま（host loopback へ縮退しない）。
     #[cfg(target_os = "linux")]
     let port_forward = match backends.pod_namespace_source() {
-        Some(source) => streaming::ProductionPortForward::pod_network(source),
+        Some(source) => {
+            // 回収できない helper の保持・上限超過・満杯の拒否を telemetry へ出す（CRI-6・REPAIR-4・#4546）。
+            let pod_telemetry = match streaming::PodDialTelemetry::new(
+                std::sync::Arc::clone(&recorder),
+                telemetry::stderr_sink().clone(),
+            ) {
+                Ok(t) => t,
+                Err(_) => {
+                    return fail(
+                        PluginErrorCode::Internal,
+                        "failed to prepare the port forward observer",
+                    );
+                }
+            };
+            streaming::ProductionPortForward::pod_network(source, pod_telemetry)
+        }
         None => streaming::ProductionPortForward::node_only(),
     };
     #[cfg(not(target_os = "linux"))]

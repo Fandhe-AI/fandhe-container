@@ -81,6 +81,29 @@ fn convert_limits(v: &ComposeValue, drops: &mut ValueDrops) -> Option<ResourceLi
     (out != ResourceLimits::default()).then_some(out)
 }
 
+/// 変換器が参照する GPU 予約の属性（これ以外は TOML に表せないため drop に数える）。
+const GPU_ATTRS: [&str; 4] = ["driver", "capabilities", "count", "device_ids"];
+
+/// 各予約エントリの未対応属性（`options`・未知キー）を 1 キー 1 件で `DEVICES_KEY_PATH` へ数える
+/// （STACK-3 の fail-closed。検出器は参照しないキーを見ないため、ここで補う）。
+fn note_unsupported_device_attrs(devices: &ComposeValue, drops: &mut ValueDrops) {
+    let Some(items) = devices.as_sequence() else {
+        return;
+    };
+    if items.len() > MAX_LIST_ITEMS {
+        return;
+    }
+    for item in items {
+        if let ComposeValue::Mapping(m) = item {
+            for (k, _) in m.iter() {
+                if !GPU_ATTRS.contains(&k) {
+                    drops.note(DEVICES_KEY_PATH);
+                }
+            }
+        }
+    }
+}
+
 fn convert_reservations(v: &ComposeValue, drops: &mut ValueDrops) -> Option<ResourceReservations> {
     let m = match v {
         ComposeValue::Null => return None,
@@ -96,6 +119,7 @@ fn convert_reservations(v: &ComposeValue, drops: &mut ValueDrops) -> Option<Reso
     }
     let conv = convert_gpu_reservations(devices);
     drops.note_many(DEVICES_KEY_PATH, conv.drop_count());
+    note_unsupported_device_attrs(devices, drops);
     let mut seen = BTreeSet::new();
     let mut names = Vec::new();
     for name in conv.devices() {
@@ -208,14 +232,15 @@ mod tests {
         assert!(o.is_none() && d.is_empty());
     }
 
+    fn gpu(extra: &str) -> (Option<Deploy>, ValueDrops) {
+        conv(&format!(
+            "{{resources: {{reservations: {{devices: [{{driver: nvidia, capabilities: [gpu]{extra}}}]}}}}}}"
+        ))
+    }
+
     /// STACK-9: GPU 予約の変換と drop。
     #[test]
     fn stack9_gpu_reservations() {
-        let gpu = |extra: &str| {
-            conv(&format!(
-                "{{resources: {{reservations: {{devices: [{{driver: nvidia, capabilities: [gpu]{extra}}}]}}}}}}"
-            ))
-        };
         let names = |o: Option<Deploy>| o.unwrap().resources.unwrap().reservations.unwrap().devices;
         let (o, d) = gpu(", device_ids: ['0', '1']");
         assert_eq!(names(o), strs(&["nvidia.com/gpu=0", "nvidia.com/gpu=1"]));
@@ -227,6 +252,16 @@ mod tests {
         assert_eq!(d.get(DEVICES_KEY_PATH), 1);
         let (o, d) = conv("{resources: {reservations: {devices: ~}}}");
         assert!(o.is_none() && d.is_empty());
+    }
+
+    /// STACK-3・STACK-9: `options` や未知キーは黙って捨てず drop に数える。
+    #[test]
+    fn stack9_unsupported_device_attrs_are_dropped() {
+        let (o, d) = gpu(", options: {foo: bar}");
+        assert_eq!(d.get(DEVICES_KEY_PATH), 1);
+        assert!(o.is_some());
+        let (_, d) = gpu(", options: {a: b}, unknown: 1");
+        assert_eq!(d.get(DEVICES_KEY_PATH), 2);
     }
 
     /// STACK-9: 予約をまたぐ重複は先の 1 件を残して drop。

@@ -156,3 +156,25 @@ commit above, reproduced verbatim):
     (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
     OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+
+--------------------------------------------------------------------
+Third-party attribution: compose-spec/compose-spec (Apache License 2.0)
+--------------------------------------------------------------------
+
+Source:  https://github.com/compose-spec/compose-spec
+File:    schema/compose-spec.json
+Commit:  3a4a6995e4a971f6173dff9130cb3e38e6738651
+
+What was derived: only the key names (property names) of the Compose
+Specification at the levels the compose-convert key scanner descends
+(top level, services, networks, volumes, secrets, configs, deploy and
+deploy.resources.reservations), used for the classification table rows
+added in issue #3614 and the list of known key paths in the test. No
+logic was copied. The corresponding files in this repository are
+crates/compose-convert/src/classify.rs and
+crates/compose-convert/tests/key_scan_coverage.rs.
+
+The attribution lines of the compose-spec NOTICE file at that commit:
+
+    The Compose Specification
+    Copyright 2020 The Compose Specification Authors

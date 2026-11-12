@@ -26,6 +26,8 @@
 //!   （PoC README は error-incompatible としており、spec 側の食い違い）。
 //! - 分類の重さは `Ord` の宣言順ではなく [`KeyClass::severity`] で明示する。
 //! - `x-` は最後のセグメントが `x-` で始まるときだけ Warning（非正規パスを Warning に化けさせない）。
+//! - PoC が未走査にした `networks.*`・`volumes.*`・`secrets.*`・`configs.*` 等の compose-spec 既知キー
+//!   （57 キー）は、本リポの走査器が降りるため葉の行として ErrorUnsupportedYet に分類した（#3614・STACK-3）。
 
 use std::fmt;
 
@@ -226,9 +228,96 @@ pub const KEY_CLASS_TABLE: &[(&str, KeyClass)] = &[
         KeyClass::ErrorUnsupportedYet,
     ),
     ("services.*.volumes_from", KeyClass::ErrorUnsupportedYet),
+    // #3614（TASK-151 追補・STACK-3・STACK-10）: key_scan が降りる段の compose-spec 既知キーのうち、
+    // 表に無く Unrecognized になっていた 57 キー。spec に分類の規定が無いため、黙って落とさない
+    // 安全側の ErrorUnsupportedYet に統一した（出典 compose-spec/compose-spec の schema/compose-spec.json、
+    // commit 3a4a6995e4a971f6173dff9130cb3e38e6738651。NOTICE 参照）。葉の行だけを置き、中身へは降りない。
+    // トップレベル（子へ降りない葉。ユーザー定義名をパスへ入れない）
+    ("jobs", KeyClass::ErrorUnsupportedYet),
+    ("models", KeyClass::ErrorUnsupportedYet),
+    // services.*（葉のみ。develop・post_start 等の中身へは降りない）
+    ("services.*.annotations", KeyClass::ErrorUnsupportedYet),
+    ("services.*.attach", KeyClass::ErrorUnsupportedYet),
+    ("services.*.cgroup", KeyClass::ErrorUnsupportedYet),
+    ("services.*.cpu_count", KeyClass::ErrorUnsupportedYet),
+    ("services.*.cpu_percent", KeyClass::ErrorUnsupportedYet),
+    ("services.*.cpu_period", KeyClass::ErrorUnsupportedYet),
+    ("services.*.cpu_quota", KeyClass::ErrorUnsupportedYet),
+    ("services.*.cpu_rt_period", KeyClass::ErrorUnsupportedYet),
+    ("services.*.cpu_rt_runtime", KeyClass::ErrorUnsupportedYet),
+    ("services.*.cpuset", KeyClass::ErrorUnsupportedYet),
+    ("services.*.credential_spec", KeyClass::ErrorUnsupportedYet),
+    ("services.*.develop", KeyClass::ErrorUnsupportedYet),
+    ("services.*.gpus", KeyClass::ErrorUnsupportedYet),
+    ("services.*.label_file", KeyClass::ErrorUnsupportedYet),
+    ("services.*.mem_swappiness", KeyClass::ErrorUnsupportedYet),
+    ("services.*.memswap_limit", KeyClass::ErrorUnsupportedYet),
+    ("services.*.models", KeyClass::ErrorUnsupportedYet),
+    ("services.*.pids_limit", KeyClass::ErrorUnsupportedYet),
+    ("services.*.post_start", KeyClass::ErrorUnsupportedYet),
+    ("services.*.pre_start", KeyClass::ErrorUnsupportedYet),
+    ("services.*.pre_stop", KeyClass::ErrorUnsupportedYet),
+    ("services.*.provider", KeyClass::ErrorUnsupportedYet),
+    (
+        "services.*.pull_refresh_after",
+        KeyClass::ErrorUnsupportedYet,
+    ),
+    ("services.*.runtime", KeyClass::ErrorUnsupportedYet),
+    ("services.*.storage_opt", KeyClass::ErrorUnsupportedYet),
+    ("services.*.umask", KeyClass::ErrorUnsupportedYet),
+    ("services.*.use_api_socket", KeyClass::ErrorUnsupportedYet),
+    ("services.*.userns_mode", KeyClass::ErrorUnsupportedYet),
+    // services.*.deploy
+    ("services.*.deploy.mode", KeyClass::ErrorUnsupportedYet),
+    (
+        "services.*.deploy.rollback_config",
+        KeyClass::ErrorUnsupportedYet,
+    ),
+    // services.*.deploy.resources.reservations
+    (
+        "services.*.deploy.resources.reservations.cpus",
+        KeyClass::ErrorUnsupportedYet,
+    ),
+    (
+        "services.*.deploy.resources.reservations.generic_resources",
+        KeyClass::ErrorUnsupportedYet,
+    ),
+    (
+        "services.*.deploy.resources.reservations.memory",
+        KeyClass::ErrorUnsupportedYet,
+    ),
+    // networks.*
+    ("networks.*.attachable", KeyClass::ErrorUnsupportedYet),
+    ("networks.*.driver_opts", KeyClass::ErrorUnsupportedYet),
+    ("networks.*.enable_ipv4", KeyClass::ErrorUnsupportedYet),
+    ("networks.*.enable_ipv6", KeyClass::ErrorUnsupportedYet),
+    ("networks.*.internal", KeyClass::ErrorUnsupportedYet),
+    ("networks.*.ipam", KeyClass::ErrorUnsupportedYet),
+    ("networks.*.labels", KeyClass::ErrorUnsupportedYet),
+    ("networks.*.name", KeyClass::ErrorUnsupportedYet),
+    // volumes.*
+    ("volumes.*.driver_opts", KeyClass::ErrorUnsupportedYet),
+    ("volumes.*.labels", KeyClass::ErrorUnsupportedYet),
+    ("volumes.*.name", KeyClass::ErrorUnsupportedYet),
+    // secrets.*
+    ("secrets.*.driver", KeyClass::ErrorUnsupportedYet),
+    ("secrets.*.driver_opts", KeyClass::ErrorUnsupportedYet),
+    ("secrets.*.environment", KeyClass::ErrorUnsupportedYet),
+    ("secrets.*.labels", KeyClass::ErrorUnsupportedYet),
+    ("secrets.*.name", KeyClass::ErrorUnsupportedYet),
+    ("secrets.*.template_driver", KeyClass::ErrorUnsupportedYet),
+    // configs.*
+    ("configs.*.content", KeyClass::ErrorUnsupportedYet),
+    ("configs.*.environment", KeyClass::ErrorUnsupportedYet),
+    ("configs.*.labels", KeyClass::ErrorUnsupportedYet),
+    ("configs.*.name", KeyClass::ErrorUnsupportedYet),
+    ("configs.*.template_driver", KeyClass::ErrorUnsupportedYet),
 ];
 
 /// 分類表が子キーへ降りないと宣言するキーパスの接頭辞（未走査の明示）。
+///
+/// Convert の入れ物で子を型で変換するものだけを置く。#3614 で足した ErrorUnsupportedYet の葉の行
+/// （`networks.*.ipam`・`services.*.develop` 等）は、キー自体がエラー分類で子を列挙する意味が無いため置かない。
 pub const UNSCANNED_KEY_PREFIXES: &[&str] = &[
     "services.*.healthcheck",
     "services.*.deploy.resources",
@@ -554,12 +643,51 @@ mod tests {
         for p in [
             "",
             "unknown",
-            "services.*.models",
+            "services.*.no_such_key",
+            "services.*.log_driver",
             "services.*.healthcheck.test",
+            "networks.*.ipam.config",
+            "models.*",
         ] {
             assert_eq!(classify_key_path(p), KeyClass::Unrecognized, "{p:?}");
         }
         assert_eq!(classify_key_path("profiles"), KeyClass::ErrorUnsupportedYet);
+    }
+
+    /// #3614・STACK-3: 追加した compose-spec 既知キーは葉の ErrorUnsupportedYet で、子の行を持たない。
+    #[test]
+    fn stack3_3614_added_rows_are_unsupported_yet() {
+        let added = [
+            "jobs",
+            "models",
+            "services.*.develop",
+            "services.*.post_start",
+            "services.*.models",
+            "services.*.gpus",
+            "networks.*.ipam",
+            "networks.*.name",
+            "volumes.*.labels",
+            "secrets.*.name",
+            "configs.*.content",
+            "services.*.deploy.mode",
+            "services.*.deploy.rollback_config",
+            "services.*.deploy.resources.reservations.cpus",
+        ];
+        for p in added {
+            assert_eq!(
+                KEY_CLASS_TABLE.iter().filter(|(t, _)| *t == p).count(),
+                1,
+                "{p}"
+            );
+            let c = classify_key_path(p);
+            assert_eq!(c, KeyClass::ErrorUnsupportedYet, "{p}");
+            assert!(c.is_error(), "{p}");
+            let child = format!("{p}.");
+            assert!(
+                KEY_CLASS_TABLE.iter().all(|(t, _)| !t.starts_with(&child)),
+                "{p} must stay a leaf row"
+            );
+        }
     }
 
     /// REPAIR-12: 表の整合（重複なし・往復一致・Unrecognized/x-/空セグメントの行なし）。

@@ -10,7 +10,7 @@
 //! - すべての構造体は `deny_unknown_fields` で未知キー・typo を拒否する（fail-closed）。
 //! - 本モジュールの型は値を検証しない。`file` のパス正規化・`driver` の許可判断・
 //!   入力サイズの上限検証は、読み込み側（parse の入口・`up` 等）の責務である。
-//! - parse の公開入口は `crate::toml_input`（入力サイズの上限つき。STACK-1・CLI-4）。serialize の公開入口はまだ無い。
+//! - parse の公開入口は `crate::toml_input`（入力サイズの上限つき。STACK-1・CLI-4）。serialize の入口は `crate::toml_output`（往復検証つき。#3613）。
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;

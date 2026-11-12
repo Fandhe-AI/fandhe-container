@@ -22,7 +22,7 @@ use fandhe_container_compose_convert::key_scan::collect_key_occurrences;
 use fandhe_container_compose_convert::report::{
     ErrorFreeBlocker, FileConversionReport, KeyOccurrences, MAX_KEY_PATHS,
 };
-use fandhe_container_compose_convert::report_json::{file_line, summary_line};
+use fandhe_container_compose_convert::report_json::{TomlOutputStatus, file_line, summary_line};
 use fandhe_container_stack::schema::ComposeToml;
 
 const HOSTNAME: &str = "services.*.hostname";
@@ -336,8 +336,15 @@ fn stack3_629_file_line_downgraded_json_exact() {
     );
 
     assert_eq!(
-        summary_line(2, 0, Some(1), 0, &ConversionRateTally::new().finish()),
-        "{\"kind\":\"summary\",\"files\":2,\"error_free_files\":0,\"error_free_with_downgrade_files\":1,\"parse_failed_files\":0,\"toml_output\":\"unimplemented\",\"conversion_rate\":{\"basis\":\"occurrences-excluding-warning\",\"convert_occurrences\":0,\"warning_occurrences\":0,\"error_incompatible_occurrences\":0,\"error_unsupported_yet_occurrences\":0,\"unrecognized_occurrences\":0,\"total_occurrences\":0,\"rate_percent\":null,\"threshold_percent\":80,\"verdict\":\"indeterminate\",\"lower_bound_convert_occurrences\":0,\"lower_bound_rate_percent\":null,\"lower_bound_verdict\":\"indeterminate\",\"indeterminate_reasons\":[\"no-key-occurrences\"]}}\n"
+        summary_line(
+            2,
+            0,
+            Some(1),
+            0,
+            TomlOutputStatus::SkippedMultipleFiles,
+            &ConversionRateTally::new().finish()
+        ),
+        "{\"kind\":\"summary\",\"files\":2,\"error_free_files\":0,\"error_free_with_downgrade_files\":1,\"parse_failed_files\":0,\"toml_output\":\"skipped-multiple-files\",\"conversion_rate\":{\"basis\":\"occurrences-excluding-warning\",\"convert_occurrences\":0,\"warning_occurrences\":0,\"error_incompatible_occurrences\":0,\"error_unsupported_yet_occurrences\":0,\"unrecognized_occurrences\":0,\"total_occurrences\":0,\"rate_percent\":null,\"threshold_percent\":80,\"verdict\":\"indeterminate\",\"lower_bound_convert_occurrences\":0,\"lower_bound_rate_percent\":null,\"lower_bound_verdict\":\"indeterminate\",\"indeterminate_reasons\":[\"no-key-occurrences\"]}}\n"
     );
     for l in [&l1, &l2] {
         assert!(!l.contains("secretsvc-629") && !l.contains("leak-sentinel"));

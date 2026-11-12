@@ -105,7 +105,7 @@ fn report_lines_for_mixed_directory() {
     );
     assert_eq!(
         lines[2],
-        "{\"kind\":\"summary\",\"files\":2,\"error_free_files\":0,\"error_free_with_downgrade_files\":null,\"parse_failed_files\":1,\"toml_output\":\"unimplemented\",\"conversion_rate\":{\"basis\":\"occurrences-excluding-warning\",\"convert_occurrences\":4,\"warning_occurrences\":0,\"error_incompatible_occurrences\":1,\"error_unsupported_yet_occurrences\":0,\"unrecognized_occurrences\":0,\"total_occurrences\":5,\"rate_percent\":\"80.00\",\"threshold_percent\":80,\"verdict\":\"indeterminate\",\"lower_bound_convert_occurrences\":4,\"lower_bound_rate_percent\":\"80.00\",\"lower_bound_verdict\":\"indeterminate\",\"indeterminate_reasons\":[\"parse-failed-files\"]}}"
+        "{\"kind\":\"summary\",\"files\":2,\"error_free_files\":0,\"error_free_with_downgrade_files\":null,\"parse_failed_files\":1,\"toml_output\":\"skipped-multiple-files\",\"conversion_rate\":{\"basis\":\"occurrences-excluding-warning\",\"convert_occurrences\":4,\"warning_occurrences\":0,\"error_incompatible_occurrences\":1,\"error_unsupported_yet_occurrences\":0,\"unrecognized_occurrences\":0,\"total_occurrences\":5,\"rate_percent\":\"80.00\",\"threshold_percent\":80,\"verdict\":\"indeterminate\",\"lower_bound_convert_occurrences\":4,\"lower_bound_rate_percent\":\"80.00\",\"lower_bound_verdict\":\"indeterminate\",\"indeterminate_reasons\":[\"parse-failed-files\"]}}"
     );
     for marker in ["value-marker-9c1d", "SECRET", "web"] {
         assert!(!err.contains(marker), "{marker} leaked: {err}");
@@ -126,6 +126,10 @@ fn build_key_reports_guidance() {
     assert_eq!(out, "");
     assert!(err.contains("\"error_free\":false"), "{err}");
     assert!(
+        err.contains("\"toml_output\":\"skipped-not-error-free\""),
+        "{err}"
+    );
+    assert!(
         err.contains("\"guidance\":{\"code\":\"external-build\",\"message\":\""),
         "{err}"
     );
@@ -142,7 +146,9 @@ fn clean_file_is_error_free() {
     s.write("compose.yaml", "services:\n  web:\n    image: busybox\n");
     let (code, out, err) = run_dir(s.path());
     assert_eq!(code, Some(0));
-    assert_eq!(out, "");
+    // 入力 1 件で対象のため、往復検証済みの TOML が stdout に出る（#3613・STACK-5）。
+    assert_eq!(out, "[services.web]\nimage = \"busybox\"\n");
+    assert!(err.contains("\"toml_output\":\"stdout\""), "{err}");
     let first = err.lines().next().expect("file line");
     assert!(
         first.contains(
@@ -296,7 +302,7 @@ fn downgrade_of_unsupported_key_is_reported() {
     assert!(lines[1].contains("\"downgraded\":{\"services.*.hostname\":1}"));
     assert_eq!(
         lines[2],
-        "{\"kind\":\"summary\",\"files\":2,\"error_free_files\":0,\"error_free_with_downgrade_files\":1,\"parse_failed_files\":0,\"toml_output\":\"unimplemented\",\"conversion_rate\":{\"basis\":\"occurrences-excluding-warning\",\"convert_occurrences\":6,\"warning_occurrences\":0,\"error_incompatible_occurrences\":1,\"error_unsupported_yet_occurrences\":2,\"unrecognized_occurrences\":0,\"total_occurrences\":9,\"rate_percent\":\"66.66\",\"threshold_percent\":80,\"verdict\":\"below\",\"lower_bound_convert_occurrences\":6,\"lower_bound_rate_percent\":\"66.66\",\"lower_bound_verdict\":\"below\",\"indeterminate_reasons\":[]}}"
+        "{\"kind\":\"summary\",\"files\":2,\"error_free_files\":0,\"error_free_with_downgrade_files\":1,\"parse_failed_files\":0,\"toml_output\":\"skipped-multiple-files\",\"conversion_rate\":{\"basis\":\"occurrences-excluding-warning\",\"convert_occurrences\":6,\"warning_occurrences\":0,\"error_incompatible_occurrences\":1,\"error_unsupported_yet_occurrences\":2,\"unrecognized_occurrences\":0,\"total_occurrences\":9,\"rate_percent\":\"66.66\",\"threshold_percent\":80,\"verdict\":\"below\",\"lower_bound_convert_occurrences\":6,\"lower_bound_rate_percent\":\"66.66\",\"lower_bound_verdict\":\"below\",\"indeterminate_reasons\":[]}}"
     );
 }
 

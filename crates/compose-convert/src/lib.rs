@@ -15,7 +15,8 @@
 //! 出現数ベースの変換可率の集計と `summary` 行の `conversion_rate`（`conversion_rate`。TASK-152.2・#606・STACK-4）も実装済み。
 //! 引数解析とレポート出力（`entry`・`report_json`）、bin の結線は TASK-151.7（#602・STACK-3）で実装済み。
 //! bin は入力ディレクトリを受け取り、キー単位の変換レポート（4 分類・unrecognized の件数・`value_drops`・`downgraded`）を
-//! stderr へ 1 行 JSON で出す。stdout は将来 TOML を出す経路として空けてあり、TOML の書き出しは未実装（REPAIR-3）。
+//! stderr へ 1 行 JSON で出す。入力が 1 件で対象（`error_free`）のときは、往復検証済みの TOML を stdout へ書く
+//! （`entry`・stack の `toml_output`。#3613・STACK-3・STACK-5）。複数ファイルの一括書き出しは未実装（REPAIR-3）。
 //! `--downgrade=<key>[,...]` の解析と格下げ許可の判定は `downgrade`（TASK-182.1・#627・STACK-3）で実装済み。
 //! 不可のキーの指定は変換せず `INVALID_ARGUMENT`（2）で止める。
 //! depends_on・ulimits・healthcheck・deploy.resources と GPU 予約の変換は実装済み（#3612・STACK-3・STACK-9）。
@@ -64,13 +65,25 @@ fn write_timeout_for(len: usize) -> Duration {
         .min(STDERR_WRITE_MAX_TIMEOUT)
 }
 
-/// bin の入口から呼ばれる。引数を [`entry::run_args`] で処理し、レポートを stderr へ書いて終了コードを返す。
-/// stdout は将来 TOML を出す経路のため何も書かない。書き込みが失敗・期限切れのときは、レポートが届いていないため
-/// 成功を返さず終了コード 1（INTERNAL）にする。stderr が満杯で読み手が止まっていても、書き込みは別スレッドで行い
+/// bin の入口から呼ばれる。引数を [`entry::run_args`] で処理し、TOML（あれば）を stdout へ、レポートを stderr へ
+/// 書いて終了コードを返す。stdout の TOML は全文を検証済みの状態で受け取り、一括で書く（途中までの TOML を出さない）。
+/// どちらかの書き込みが失敗・期限切れのときは、成果物が届いていないため成功を返さず終了コード 1（INTERNAL）にする。
+/// stdout が失敗しても stderr のレポートは書こうとする。読み手が止まっていても、書き込みは別スレッドで行い
 /// 有限の期限で待つため戻れる（REPAIR-5）。
 pub fn run() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let outcome = entry::run_args(&args);
+    let out_ok = if outcome.stdout.is_empty() {
+        true
+    } else {
+        let timeout = write_timeout_for(outcome.stdout.len());
+        let text = outcome.stdout;
+        write_with_deadline(timeout, move || {
+            let mut out = std::io::stdout().lock();
+            out.write_all(text.as_bytes())?;
+            out.flush()
+        })
+    };
     let timeout = write_timeout_for(outcome.stderr.len());
     let text = outcome.stderr;
     let delivered = write_with_deadline(timeout, move || {
@@ -78,7 +91,7 @@ pub fn run() -> ExitCode {
         err.write_all(text.as_bytes())?;
         err.flush()
     });
-    if delivered {
+    if delivered && out_ok {
         ExitCode::from(outcome.exit_code)
     } else {
         ExitCode::from(1)

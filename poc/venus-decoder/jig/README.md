@@ -44,6 +44,20 @@ cargo run --manifest-path poc/venus-decoder/jig/Cargo.toml --bin venus-jig -- \
 - 接続元は accept 直後に `SO_PEERCRED` で取得した UID と実行ユーザーの effective UID を照合する（取得失敗は `PEER_CRED_UNAVAILABLE`、不一致は `PEER_UID_MISMATCH` で拒否。実行ユーザーの euid が overflowuid〔既定 65534〕ならマッピング外の接続元と区別できないので `PEER_UID_UNVERIFIABLE` で拒否）。受理するのは実行ユーザーと同じ UID のみ（同じ UID の別プロセスは接続できる）。終了時のソケット削除に失敗した場合は `SOCKET_REMOVE_FAILED` で失敗する。ソケットディレクトリは `/` までの祖先も検査する（存在しない祖先・symlink・他 UID 所有・sticky なしの書き込み可は `SOCKET_DIR_ANCESTOR_UNSAFE`。新規作成を許すのは検証済みの親の直下のソケットディレクトリ 1 段だけ）。限界と承認事項は設計書 10.9。
 - ログを読む側（`log::read_log_file`）は通常ファイル以外（FIFO・symlink）を open 前に拒否し、Unix では open 後に `dev` / `ino` を open 前の値と比べて差し替えを拒否する（`Replaced`）。
 
+## 記録ファイルの検証（3 OS。#1885）
+
+```bash
+cargo run --manifest-path poc/venus-decoder/jig/Cargo.toml --bin venus-jig -- --verify-record /home/me/venus-jig.fcvns
+```
+
+- 実機で `--record` が採った記録が壊れていないかを、2 段目の再生の前に確かめる入口（#725 の確認手順の一部）。`read_recording_file`（通常ファイルのみ・256 MiB 上限・`O_NOFOLLOW | O_NONBLOCK`）と `validate`（全レコードのチェックサム・seqno 連続・余剰バイト無し）をそのまま呼ぶ。起動（Linux 限定）より前に判定するため Linux 以外でも動く。
+- 引数は `--verify-record <絶対パス>` の 2 個だけ（他の引数との併用は不可）。
+- 出力は stdout に 1 行の JSON だけで、パスと payload は出さない。成功は `{"result":"ok","records":<件数>,"bytes":<全体バイト数>}`（終了コード 0）。失敗は `{"result":"<コード>","records":null,"bytes":<全体バイト数|null>}`（終了コード 1）。`bytes` はファイルを読み切れたときだけ入り、読み込み段の拒否では `null`。
+- `result` の主な値: `venus_replay.bad_magic`（magic 不一致）・`venus_replay.record_checksum`（payload 等の破損）・`venus_replay.sequence_mismatch`（seqno の不連続）・`venus_replay.trailing_bytes`（余剰バイト）・`venus_replay.truncated`（途中で切れている）・`venus_replay.not_regular_file`（ディレクトリ・symlink・FIFO）・`venus_replay.recording_too_large`（256 MiB 超）・`venus_replay.io`（open・read の失敗）・`venus_verify.timeout`（60 秒で読めない）。その他の `venus_replay.*` は `VenusReplayError::code()` の語彙。
+- 引数エラーは stderr に 1 行の JSON（`code` は `INVALID_ARGUMENT` / `PATH_NOT_ABSOLUTE`）、終了コード 2、stdout は空。
+- 成功時の `records` は、採取時のログの `record_summary records=<n>` と一致するはず。記録形式が変わっても検証は `validate` に委ねるため、この入口の改修は要らない（#1884）。
+- CRC-32C は偶発的な破損の検出用で、改ざん耐性はない。フラグ値が未確認の OS では検査と open の間の差し替えは塞がらない（設計書 7 章）。
+
 ## 共有メモリを使う起動の前提（Linux 限定）
 
 ゲストの Mesa venus は host-visible な共有メモリ（virtio の共有メモリ領域 id 1）を必須にする。治具に共有メモリを使わせるには、frontend（VMM）が次を行う。
@@ -69,3 +83,4 @@ FANDHE_VENUS_JIG_LOG=<ログファイル> cargo test --manifest-path poc/venus-d
 - `RESOURCE_MAP_BLOB` / `UNMAP_BLOB` と解放の確定は実装済み（F5.2b.4a・F5.2b.4b。#1643・#1645）。残りは実機（#725）
 - F4: 起動入口（実装済み。#1598）。記録ファイル（`--record`）は #1602 で実装済み。capset より後の ctrl 応答は #1599
 - F3: 実機での疎通実行（#725）
+- F6: 記録ファイルの検証入口 `--verify-record` は実装済み（#1885）

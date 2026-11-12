@@ -212,7 +212,38 @@ fn write_blockers(s: &mut String, verdict: &ErrorFreeVerdict) {
     }
 }
 
-/// 最後の集計行（末尾改行つき）。`toml_output` は TOML の書き出しが未実装であることの明示（REPAIR-3）。
+/// 集計行 `toml_output` の固定語彙（#3613・STACK-3・STACK-5）。入力由来の文字列は含まない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TomlOutputStatus {
+    /// stdout へ TOML を書いた。
+    Stdout,
+    /// 入力が 2 件以上で、TOML は書かなかった。
+    SkippedMultipleFiles,
+    /// 入力 1 件だが対象（`error_free`）でなく、TOML は書かなかった。
+    SkippedNotErrorFree,
+    /// 直列化に失敗した（fail-closed。終了コード 1）。
+    SerializeFailed,
+    /// 読み戻しに失敗した（fail-closed。終了コード 1）。
+    ReparseFailed,
+    /// 往復が不一致だった（fail-closed。終了コード 1）。
+    RoundtripMismatch,
+}
+
+impl TomlOutputStatus {
+    /// 集計行に載せる固定の語彙。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stdout => "stdout",
+            Self::SkippedMultipleFiles => "skipped-multiple-files",
+            Self::SkippedNotErrorFree => "skipped-not-error-free",
+            Self::SerializeFailed => "serialize-failed",
+            Self::ReparseFailed => "reparse-failed",
+            Self::RoundtripMismatch => "roundtrip-mismatch",
+        }
+    }
+}
+
+/// 最後の集計行（末尾改行つき）。`toml_output` は TOML の書き出しの結果の固定語彙（[`TomlOutputStatus`]）。
 /// `error_free_with_downgrade_files` は `--downgrade` 指定時のみ `Some`（別集計。なければ `null`）。
 /// `rate` は STACK-4 の出現数ベース変換可率（TASK-152.2・#606）で、`conversion_rate` に固定順で載る。
 pub fn summary_line(
@@ -220,11 +251,13 @@ pub fn summary_line(
     error_free_files: u64,
     error_free_with_downgrade_files: Option<u64>,
     parse_failed_files: u64,
+    toml_output: TomlOutputStatus,
     rate: &ConversionRate,
 ) -> String {
     let dg = error_free_with_downgrade_files.map_or("null".to_string(), |n| n.to_string());
     format!(
-        "{{\"kind\":\"summary\",\"files\":{files},\"error_free_files\":{error_free_files},\"error_free_with_downgrade_files\":{dg},\"parse_failed_files\":{parse_failed_files},\"toml_output\":\"unimplemented\",\"conversion_rate\":{}}}\n",
+        "{{\"kind\":\"summary\",\"files\":{files},\"error_free_files\":{error_free_files},\"error_free_with_downgrade_files\":{dg},\"parse_failed_files\":{parse_failed_files},\"toml_output\":\"{}\",\"conversion_rate\":{}}}\n",
+        toml_output.as_str(),
         conversion_rate_json(rate)
     )
 }
@@ -362,11 +395,12 @@ mod tests {
             false,
         );
         assert_eq!(
-            summary_line(3, 1, None, 1, &r),
-            "{\"kind\":\"summary\",\"files\":3,\"error_free_files\":1,\"error_free_with_downgrade_files\":null,\"parse_failed_files\":1,\"toml_output\":\"unimplemented\",\"conversion_rate\":{\"basis\":\"occurrences-excluding-warning\",\"convert_occurrences\":4,\"warning_occurrences\":1,\"error_incompatible_occurrences\":0,\"error_unsupported_yet_occurrences\":0,\"unrecognized_occurrences\":0,\"total_occurrences\":5,\"rate_percent\":\"80.00\",\"threshold_percent\":80,\"verdict\":\"meets\",\"lower_bound_convert_occurrences\":4,\"lower_bound_rate_percent\":\"80.00\",\"lower_bound_verdict\":\"meets\",\"indeterminate_reasons\":[]}}\n"
+            summary_line(3, 1, None, 1, TomlOutputStatus::SkippedMultipleFiles, &r),
+            "{\"kind\":\"summary\",\"files\":3,\"error_free_files\":1,\"error_free_with_downgrade_files\":null,\"parse_failed_files\":1,\"toml_output\":\"skipped-multiple-files\",\"conversion_rate\":{\"basis\":\"occurrences-excluding-warning\",\"convert_occurrences\":4,\"warning_occurrences\":1,\"error_incompatible_occurrences\":0,\"error_unsupported_yet_occurrences\":0,\"unrecognized_occurrences\":0,\"total_occurrences\":5,\"rate_percent\":\"80.00\",\"threshold_percent\":80,\"verdict\":\"meets\",\"lower_bound_convert_occurrences\":4,\"lower_bound_rate_percent\":\"80.00\",\"lower_bound_verdict\":\"meets\",\"indeterminate_reasons\":[]}}\n"
         );
         assert!(
-            summary_line(3, 1, Some(2), 1, &r).contains("\"error_free_with_downgrade_files\":2,")
+            summary_line(3, 1, Some(2), 1, TomlOutputStatus::SkippedMultipleFiles, &r)
+                .contains("\"error_free_with_downgrade_files\":2,")
         );
     }
 
@@ -375,8 +409,8 @@ mod tests {
     fn summary_line_indeterminate_exact() {
         let r = rate_of(&[], true);
         assert_eq!(
-            summary_line(1, 0, None, 1, &r),
-            "{\"kind\":\"summary\",\"files\":1,\"error_free_files\":0,\"error_free_with_downgrade_files\":null,\"parse_failed_files\":1,\"toml_output\":\"unimplemented\",\"conversion_rate\":{\"basis\":\"occurrences-excluding-warning\",\"convert_occurrences\":0,\"warning_occurrences\":0,\"error_incompatible_occurrences\":0,\"error_unsupported_yet_occurrences\":0,\"unrecognized_occurrences\":0,\"total_occurrences\":0,\"rate_percent\":null,\"threshold_percent\":80,\"verdict\":\"indeterminate\",\"lower_bound_convert_occurrences\":0,\"lower_bound_rate_percent\":null,\"lower_bound_verdict\":\"indeterminate\",\"indeterminate_reasons\":[\"parse-failed-files\",\"no-key-occurrences\"]}}\n"
+            summary_line(1, 0, None, 1, TomlOutputStatus::SkippedNotErrorFree, &r),
+            "{\"kind\":\"summary\",\"files\":1,\"error_free_files\":0,\"error_free_with_downgrade_files\":null,\"parse_failed_files\":1,\"toml_output\":\"skipped-not-error-free\",\"conversion_rate\":{\"basis\":\"occurrences-excluding-warning\",\"convert_occurrences\":0,\"warning_occurrences\":0,\"error_incompatible_occurrences\":0,\"error_unsupported_yet_occurrences\":0,\"unrecognized_occurrences\":0,\"total_occurrences\":0,\"rate_percent\":null,\"threshold_percent\":80,\"verdict\":\"indeterminate\",\"lower_bound_convert_occurrences\":0,\"lower_bound_rate_percent\":null,\"lower_bound_verdict\":\"indeterminate\",\"indeterminate_reasons\":[\"parse-failed-files\",\"no-key-occurrences\"]}}\n"
         );
     }
 }

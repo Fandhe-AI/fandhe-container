@@ -3,12 +3,13 @@
 //! 使い方: `fandhe-container-compose-convert [--] <input_dir>`。入力ディレクトリ直下の `yml` / `yaml` を全件読み、
 //! ファイルごとのキー単位の変換レポート（4 分類・unrecognized の件数・`value_drops`・`downgraded`・`error_free`）を
 //! stderr へ 1 ファイル 1 行の JSON で出し、最後に集計行を出す（TASK-151.7・#602・STACK-3）。
-//! stdout は将来 TOML を出す経路として空けてあり、何も書かない（TOML の書き出しは未実装。REPAIR-3）。
+//! stdout には、入力が 1 件で対象（`error_free`。`--downgrade` ありなら格下げ後の判定）のときだけ、往復検証済みの
+//! TOML を書く（#3613・STACK-3・STACK-5）。それ以外は何も書かない（集計行の `toml_output` が理由を示す）。
 //! `--downgrade=<key>[,...]` は `error-unsupported-yet` のキーだけを受け、他の分類のキーは変換せず 2 で拒否する
 //! （TASK-182.1・TASK-182.2・STACK-3）。
 //!
 //! 終了コード: 0 = レポートを出し終えた（`error_free` でないファイルがあっても 0。判断はレポートの `error_free` で行う）、
-//! 2 = 引数の誤り・`--downgrade` の格下げ不可のキー・同名 `file_id` の重複、3 = 入力が無い、6 = 権限不足、10 = 上限超過、1 = 内部エラー・書き込み失敗、
+//! 2 = 引数の誤り・`--downgrade` の格下げ不可のキー・同名 `file_id` の重複、3 = 入力が無い、6 = 権限不足、10 = 上限超過、1 = 内部エラー・書き込み失敗・TOML の直列化 / 往復検証の失敗、
 //! 8 = 未実装（ERR-2 の慣行）。
 #![deny(unsafe_code)]
 

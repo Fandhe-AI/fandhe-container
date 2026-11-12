@@ -53,7 +53,8 @@
 //! 責務境界（将来仕様。REPAIR-3）:
 //! - 本モジュールは構文・型・未知フィールド・重複キー・資源上限の検査までを行う。
 //!   `kind` / `name` の形式と `deviceNodes[].permissions` の値は本モジュールが検査する（#2984。下の節）。
-//!   パスの絶対性・正規形（#2978・#2979）、`type` の値（#2979）、`hookName` の許可値などの意味検証は行わない
+//!   パスの絶対性・正規形（#2978・#2979）、`type` の値（#2979。`cdi_apply/device_nodes.rs` の `parse_type`）、
+//!   `hookName` の許可値（#2980。`cdi_apply/hooks.rs` の `validate_create_container_hooks`）などの意味検証は行わない
 //!   （適用層・TASK-127 の責務）。値は保持するだけで、パスやコマンドの組み立てはしない。
 //! - `/var/run/cdi` の所有者・権限の検証、ディレクトリ走査、名前から spec への解決は後続タスクで扱う。解決済みの
 //!   (spec, 名前) の列の集計は `cdi_edits::aggregate_container_edits_across_specs`（TASK-126.2・GPU-1）が担う。
@@ -330,7 +331,9 @@ pub struct DeviceNode {
     /// ホスト側パス。
     #[serde(default)]
     pub host_path: Option<String>,
-    /// ノード種別（`c` / `b` / `u` / `p`。許可値の検証は後続）。
+    /// ノード種別（`c` / `b` / `u` / `p`）。本モジュール（解析層）は値を保持するだけで検証しない。
+    /// 許可値の検証は適用層の `cdi_apply/device_nodes.rs` の `parse_type`（`resolve_device_nodes` から呼ぶ。#2979）が行い、
+    /// 省略・空文字は未指定としてホストの `lstat` で補い、`c` / `u` / `b` / `p` 以外は `InvalidArgument` で拒否する。
     #[serde(default, rename = "type")]
     pub r#type: Option<String>,
     /// メジャー番号。
@@ -358,7 +361,9 @@ pub struct DeviceNode {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Hook {
-    /// フック名（許可値の検証は後続）。
+    /// フック名。本モジュール（解析層）は値を保持するだけで検証しない。
+    /// 許可値の検証は適用層の `cdi_apply/hooks.rs` の `validate_create_container_hooks`（内部の `validate_one`。#2980）が行い、
+    /// `createContainer` だけを受ける。他の OCI フック名（`prestart` 等）は `Unimplemented`、未知の名前は `InvalidArgument` で拒否する。
     pub hook_name: String,
     /// 実行ファイルのパス。
     pub path: String,

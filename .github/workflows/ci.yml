@@ -607,8 +607,8 @@ jobs:
         if: runner.os == 'Linux' && always()
         timeout-minutes: 5
         run: |
-          df -h /
-          du -sh target/debug target/debug/deps 2>/dev/null
+          df -h / || true
+          du -sh target/debug target/debug/deps 2>/dev/null || true
       # macOS・Windows の `--all-features` の clippy / test（2026-10-10 の再構成で rust-ci〔reusable
       # rust-base-ci.yml の clippy / test ジョブ〕から移したもの）。コマンドは reusable と同一
       # （`--locked` なし）。Linux は rust-ci (ubuntu-latest) が実行するため重複させない。

@@ -1842,10 +1842,16 @@ mod tests {
         assert_eq!(got.fds.len(), 1);
         let received = got.fds.into_iter().next().unwrap();
         assert_ne!(received.as_raw_fd(), write_end.as_raw_fd());
-        // FD_CLOEXEC（F_GETFD = 1, FD_CLOEXEC = 1）。
-        // SAFETY: テスト用。開いている fd に対する `fcntl(F_GETFD)` は整数のみを返す。
-        let flags = unsafe { fcntl(received.as_raw_fd(), F_GETFD) };
-        assert_eq!(flags & 1, 1);
+        // close-on-exec が付いている。unsafe を使わず fdinfo の flags（8 進。O_CLOEXEC = 0o2_000_000。
+        // x86_64 / aarch64 共通）で見る（control/target.rs の試験と同じ形。#3805）。
+        let info =
+            std::fs::read_to_string(format!("/proc/self/fdinfo/{}", received.as_raw_fd())).unwrap();
+        let flags = info
+            .lines()
+            .find_map(|l| l.strip_prefix("flags:"))
+            .map(|v| u32::from_str_radix(v.trim(), 8).unwrap())
+            .unwrap();
+        assert_eq!(flags & 0o2_000_000, 0o2_000_000);
         let mut w = std::fs::File::from(received);
         w.write_all(b"x").unwrap();
         drop(w);

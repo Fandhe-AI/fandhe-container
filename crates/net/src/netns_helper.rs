@@ -6,6 +6,9 @@
 //! 両者は `setns(CLONE_NEWUSER)` の前に単一スレッドで動くため、親の照合・期限つき受信・fd と参加後の ns の識別の
 //! 取得を別々に持つと、片方だけ直して欠陥が残る（#4498 の受信の修正が例）。本モジュールはその 4 つの本体を
 //! 失敗の型に依存しない形で 1 か所に置き、失敗の `Fail` / `DialErrorCode` への写像は各 helper が持つ。
+//! 例外として errno から `NetErrorCode` への分類（[`classify`]）も置く。`NetErrorCode` は crate 共通の分類で、holder 本体・
+//! holder の親側 channel・dial の親側 channel の 3 か所が同じ写像を使い、複製すると片方だけ直す事故になるため（#4545）。
+//! dial helper 本体は `DialErrorCode` への写像を持ち続け、`classify` は使わない。
 //!
 //! 契約: `unsafe` を持たない（syscall は `crate::sys` の安全なラッパーだけ）。スレッドを作らない。stderr・stdout へ
 //! 書かない（dial は stderr null の契約）。ログを出さない。
@@ -15,6 +18,7 @@ use std::os::fd::BorrowedFd;
 use std::os::unix::fs::MetadataExt as _;
 use std::time::Duration;
 
+use crate::error::NetErrorCode;
 use crate::sys::holder as sysh;
 use crate::sys::{self, Deadline, Readiness, SysError};
 
@@ -41,6 +45,23 @@ pub(crate) fn check_parent_is_creator(fd: BorrowedFd<'_>) -> Result<(), ParentCh
         Ok(())
     } else {
         Err(ParentCheckError::NotCreator)
+    }
+}
+
+/// errno の分類（12.9。REPAIR-1・NET-9・CRI-6・#4545）。`setns` の `EPERM` は PermissionDenied、`EINVAL`（型違い・自身の
+/// userns を含む）とソケットでない stdin は FailedPrecondition。呼び出し元は holder 本体の `sys_fail`、holder の親側
+/// channel の `sys_err`、dial の親側 channel の `sys_err`。未知の errno は Internal（fail-closed）。
+pub(crate) fn classify(e: SysError) -> NetErrorCode {
+    match e {
+        SysError::Unsupported => NetErrorCode::Unimplemented,
+        SysError::Os(n) if n == sys::EPERM || n == sys::EACCES => NetErrorCode::PermissionDenied,
+        SysError::Os(n) if n == sys::EINVAL || n == sysh::ENOTSOCK || n == sysh::EPIPE => {
+            NetErrorCode::FailedPrecondition
+        }
+        SysError::Os(n) if n == sys::EMFILE || n == sys::ENFILE || n == sys::ENOMEM => {
+            NetErrorCode::ResourceExhausted
+        }
+        _ => NetErrorCode::Internal,
     }
 }
 
@@ -133,6 +154,24 @@ pub(crate) fn self_ns_identity(ns: JoinedNs) -> Result<(u64, u64), SelfNsError> 
 
 #[cfg(test)]
 mod tests {
+    /// 12.9: errno の分類（具体値。REPAIR-1・#4545）。
+    #[test]
+    fn repair1_4545_classify_maps_errno_to_codes() {
+        for n in [sys::EPERM, sys::EACCES] {
+            assert_eq!(classify(SysError::Os(n)), NetErrorCode::PermissionDenied);
+        }
+        for n in [sys::EINVAL, sysh::ENOTSOCK, sysh::EPIPE] {
+            assert_eq!(classify(SysError::Os(n)), NetErrorCode::FailedPrecondition);
+        }
+        for n in [sys::EMFILE, sys::ENFILE, sys::ENOMEM] {
+            assert_eq!(classify(SysError::Os(n)), NetErrorCode::ResourceExhausted);
+        }
+        assert_eq!(classify(SysError::Os(sys::ENOENT)), NetErrorCode::Internal);
+        assert_eq!(classify(SysError::BadSenderAddress), NetErrorCode::Internal);
+        assert_eq!(classify(SysError::BadLocalAddress), NetErrorCode::Internal);
+        assert_eq!(classify(SysError::Unsupported), NetErrorCode::Unimplemented);
+    }
+
     use super::*;
     use std::os::fd::AsFd as _;
     use std::time::Instant;

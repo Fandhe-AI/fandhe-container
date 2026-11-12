@@ -454,7 +454,6 @@ struct Spec {
     agg: AggregatedEdits,
 }
 
-/// CDI spec を読み、usr-merge を正規化して集計する。外側（早期失敗）と内側の両方が呼ぶ。
 /// 層 B の期待（`create-symlinks` フック数, 一意な期待リンク数）。抽出できなければ前提欠如として panic する。
 fn symlink_expectation(sp: &Spec, rootfs: &Path) -> (usize, usize) {
     let hooks = validate_create_container_hooks(sp.agg.hooks())
@@ -481,6 +480,7 @@ impl CdiHookRunRecorder for WindowRecorder<'_> {
     }
 }
 
+/// CDI spec を読み、usr-merge を正規化して集計する。外側（早期失敗）と内側の両方が呼ぶ。
 fn load_edits(spec_path: &Path, devices: &str, rootfs: &Path) -> Spec {
     let mut spec = read_cdi_spec_file(spec_path)
         .unwrap_or_else(|e| panic!("PRECONDITION: failed to read CDI spec: {e}"));

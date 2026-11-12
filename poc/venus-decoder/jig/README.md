@@ -15,7 +15,7 @@ virtio-gpu 外部バックエンドの仕組みへ、自前の最小 venus デ�
 - 実装済み（F1.4・#1519。Linux 限定）: vhost-user のセッションと ctrl キューの応答ループ（`session`。ネゴシエーションの状態遷移と順序違反の拒否・kick の待機・要求の取り出し・`adapter` への受け渡し・used への書き戻し・call での通知。待機はすべて期限つき）。設計は `docs/design/venus-decoder-poc.md` 10.8。
 - 実装済み（F4・#1598。Linux 限定）: 起動入口（`launch` と bin `venus-jig`。UDS の bind・ソケットディレクトリの検証・期限つき accept・ログのファイル出力）。設計は `docs/design/venus-decoder-poc.md` 10.9。
 - 実装済み: accept 直後の peer credential（`SO_PEERCRED`）による接続元 UID の照合（PLUG-12。不一致・取得失敗は拒否。`sys::peer_uid`＝U11）。
-- 実装済み（F6・#1602。Linux 限定）: 受理した `SUBMIT_3D` の本体（32 バイトの ctrl 固定部より後ろ）を 1 提出 1 レコードで記録ファイル（FCVNSREC 形式。`replay::validate` で検証できる）へ書き出す `--record`（`recording`）。リングの中身（共有メモリ）は記録しない（F5.2b の後）。reply・期待出力も記録しない。
+- 実装済み（F6・#1602。Linux 限定）: 受理した `SUBMIT_3D` の本体（32 バイトの ctrl 固定部より後ろ）を 1 提出 1 レコードで記録ファイル（FCVNSREC 形式。`replay::validate` で検証できる）へ書き出す `--record`（`recording`）。リングの中身（共有メモリ）は #1884 で記録する（`ring_record`。`CreateRingMESA` で作られたリングの差分を `read_at` で読み、kind 1 の 1 レコードにする。`unsafe` は足さず、リングは消費しない）。reply・期待出力・extra 領域・間接 cs の shmem は記録しない。
 - 実装済み（F5.2b.3・#1642。Linux 限定）: backend 要求 `SHMEM_MAP` / `SHMEM_UNMAP` を NEED_REPLY つき・期限つきで送り、frontend の u64 応答を検査する部品（失敗後は channel を閉じる。10.4.4 節）
 - 実装済み（F5.2b.1・#1639）: `REPLY_ACK` の確定と、NEED_REPLY つきの要求への ack。
 - 実装済み（F5.2b.4a・#1643。Linux 限定）: ctrl の `RESOURCE_MAP_BLOB` / `RESOURCE_UNMAP_BLOB`。blob ごとに memfd を作り、`SHMEM_MAP` で frontend へ渡す（治具自身は mmap しない）。
@@ -36,6 +36,7 @@ cargo run --manifest-path poc/venus-decoder/jig/Cargo.toml --bin venus-jig -- \
 - `--socket`・`--log` は絶対パス（必須）。ソケットの親ディレクトリは自分の UID 所有・モード `0700`・symlink でないこと（無ければ 1 段だけ `0700` で作る）。ソケットパスは 107 バイト以下。既存のソケット・ログは消さず上書きもせず、`SOCKET_PATH_EXISTS` / `LOG_PATH_EXISTS` で終わる（手で消す）。
 - `--record <絶対パス>`（任意）: 受理して ACK を返した `SUBMIT_3D` の本体を、`create_new` かつ `0600` のファイルへ書く。既存のパスは上書きせず `RECORD_PATH_EXISTS`（終了コード 2）で終わる。親から `/` までの祖先はログと同じ規則で検査し、違反は `RECORD_DIR_UNSAFE`。他の 2 つのパスと同一なら `PATH_INVALID`。ファイルを作れなければ `RECORD_OPEN_FAILED`、書き出し・同期に失敗すれば `RECORD_WRITE_FAILED`（どちらも 1）。
   - 上限は 1 レコード 16 MiB・65,536 件・全体 256 MiB。本体はメモリに溜めて終了時に書くため、ホストのメモリは最大 256 MiB まで増えうる。上限に達すると記録だけ止まり（以降は記録しない）、セッションは続く。ログに `venus_jig event=record_stopped reason=<理由> records=<件数>` を 1 回出す。
+  - リングの記録（#1884）: ログに `venus_jig event=ring_create ring=<id> res_id=<n> buffer_size=<n> result=ok|err [code=<語彙>]`、差分ごとに `event=ring_record ring=<id> res_id=<n> from=<cursor> to=<tail> len=<n> seqno=<n> outcome=recorded`、異常でそのリングの記録を止めたとき 1 回だけ `event=ring_error ring=<id> code=<語彙>` を出す。契機は、`SUBMIT_3D` を受理した kick の call の後と、セッション終了時（memfd を閉じる前）。実機ではゲストが最初の reply 待ちで止まり、記録はコマンド 1〜数件になる見込み（未実測。#725 で、ゲストが mmap で書いた内容が `read_at` で見えること・Notify が来ないことを確かめる）。実機で採取した記録はワークロード由来のデータを含みうるのでコミットしない。
   - セッションが正常・エラーのどちらで終わっても記録をファイルへ書き、終了時に `venus_jig event=record_summary records=<n> skipped=<k> stopped=<理由|none> result=<ok|write_failed>` を出す。
   - **実機で採取したストリームにはワークロード由来のデータが含まれうるため、リポジトリにコミットしない。**
 - 任意: `--message-timeout-ms`（既定 5000）・`--idle-timeout-ms`（既定 60000）・`--poll-slice-ms`・`--accept-timeout-ms`（既定 60000）。

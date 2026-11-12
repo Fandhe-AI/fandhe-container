@@ -52,6 +52,7 @@ use crate::ctrl::{CtrlResponse, RESP_ERR_INVALID_PARAMETER};
 use crate::device;
 use crate::log::{self, QueryResult};
 use crate::resource::MAX_RESOURCES;
+use crate::ring_record::{BlobRead, BlobReadError, RecordingHooks};
 use crate::sys;
 use crate::vhost_user::backend_req::{
     BackendRequest, BackendRequestCode, ShmemMapRequest, ShmemMapping,
@@ -140,22 +141,70 @@ pub fn run(
     limits: &SessionLimits,
     sink: &mut dyn FnMut(&str),
 ) -> Result<SessionEnd, SessionError> {
-    run_with_submit_hook(sock, limits, sink, &mut |_| None)
+    run_with_hooks(sock, limits, sink, &mut NoHooks)
 }
 
 /// 受理した `SUBMIT_3D` の受け渡し点を受けるフック。返した行は `sink` へそのまま流す（停止の通知など）。
 pub type SubmitHook<'a> = &'a mut dyn FnMut(&Submit3d) -> Option<String>;
 
-/// [`run`] に、受理した `SUBMIT_3D` ごとに呼ぶフックを足したもの（`--record` の記録。GPU-6・TASK-172 F6・#1602）。
+/// セッションの途中に差し込む記録用フック（GPU-6・TASK-172 F6・#1602、リングの記録は #1884）。
 ///
-/// 呼び出し元は `launch`（`recording::SubmitRecorder::on_submit` を渡す）と結合試験。フックを呼ぶのは、応答を used ring へ
-/// 書き戻せた提出だけで、応答を捨てて adapter を巻き戻した提出（ゲストが ACK を見ていない）は呼ばない。ファイルや記録器の
-/// 後始末は呼び出し側が行い、session はファイルに触れない。
+/// 呼び出し元は `launch`（`--record`）と結合試験。session はファイルに触れず、フックの後始末は呼び出し側が行う。
+/// 各メソッドは既定で何もしない。フックは ctrl の応答（used ring への書き戻しと call）を変えない。
+pub trait SessionHooks {
+    /// 応答を used ring へ書き戻せた `SUBMIT_3D` ごとに呼ぶ（応答を捨てて adapter を巻き戻した提出は呼ばない）。
+    fn on_submit(&mut self, _submit: &Submit3d, _sink: &mut dyn FnMut(&str)) {}
+    /// ctrl の kick を 1 回処理して `SUBMIT_3D` を 1 件以上受理し、call で通知した**後**に呼ぶ。
+    /// `blobs` は保持中の blob の読み取り口（リングの中身を `read_exact_at` で読む）。
+    fn after_notify(&mut self, _blobs: &dyn BlobRead, _sink: &mut dyn FnMut(&str)) {}
+    /// セッション終了時、blob の memfd を閉じる**前**に 1 回呼ぶ。
+    fn before_release(&mut self, _blobs: &dyn BlobRead, _sink: &mut dyn FnMut(&str)) {}
+}
+
+/// 何もしないフック。
+struct NoHooks;
+impl SessionHooks for NoHooks {}
+
+/// 従来の提出フック（クロージャ）を [`SessionHooks`] に合わせる。
+struct ClosureHooks<'b>(SubmitHook<'b>);
+impl SessionHooks for ClosureHooks<'_> {
+    fn on_submit(&mut self, submit: &Submit3d, sink: &mut dyn FnMut(&str)) {
+        if let Some(line) = (self.0)(submit) {
+            sink(&line);
+        }
+    }
+}
+
+impl<W: std::io::Write> SessionHooks for RecordingHooks<W> {
+    fn on_submit(&mut self, submit: &Submit3d, sink: &mut dyn FnMut(&str)) {
+        RecordingHooks::on_submit(self, submit, sink);
+    }
+    fn after_notify(&mut self, blobs: &dyn BlobRead, sink: &mut dyn FnMut(&str)) {
+        self.snapshot_all(blobs, sink);
+    }
+    fn before_release(&mut self, blobs: &dyn BlobRead, sink: &mut dyn FnMut(&str)) {
+        self.snapshot_all(blobs, sink);
+    }
+}
+
+/// [`run`] に、受理した `SUBMIT_3D` ごとに呼ぶクロージャを足したもの。呼び出し元は結合試験。
 pub fn run_with_submit_hook(
     sock: &UnixStream,
     limits: &SessionLimits,
     sink: &mut dyn FnMut(&str),
     on_submit: SubmitHook<'_>,
+) -> Result<SessionEnd, SessionError> {
+    run_with_hooks(sock, limits, sink, &mut ClosureHooks(on_submit))
+}
+
+/// [`run`] に [`SessionHooks`] を足したもの（`--record` の提出本体とリングの記録。GPU-6・#1602・#1884）。
+///
+/// フックを呼ぶ提出は、応答を used ring へ書き戻せたものだけ。どの経路でも保持する fd と mmap は `Drop` で解放される。
+pub fn run_with_hooks(
+    sock: &UnixStream,
+    limits: &SessionLimits,
+    sink: &mut dyn FnMut(&str),
+    hooks: &mut dyn SessionHooks,
 ) -> Result<SessionEnd, SessionError> {
     let mut session = Session {
         state: State::new(),
@@ -164,7 +213,7 @@ pub fn run_with_submit_hook(
         metrics: SessionMetrics::default(),
         blobs: BlobMemTable::default(),
     };
-    let result = session.serve(sock, sink, on_submit);
+    let result = session.serve(sock, sink, hooks);
     // #1641: host-visible 共有メモリが成立したか（しない場合は理由）。#725 の実機確認でログから直接読めるようにする。
     // 成立の意味（セッション中に成立したか）を保つため、片づけで channel が壊れる前に出す。
     sink(&log::host_visible_line(
@@ -172,6 +221,8 @@ pub fn run_with_submit_hook(
     ));
     // #1645: map が残ったままの終了では、frontend の map の表を治具の状態と食い違わせないよう SHMEM_UNMAP を送ってから
     // memfd を閉じる。片づけの成否は上のセッションの結果を変えない。
+    // #1884: memfd を閉じる前にリングの中身を 1 回記録する（ゲストは最初の reply 待ちで止まる見込みで、実機の本命の契機）。
+    hooks.before_release(&session.blobs, sink);
     session.release_blobs_at_end(sink);
     // REPAIR-4: 操作ごとの成功 / 失敗件数と所要時間、fd 受け渡し・ゲストメモリ I/O の集計を終了時に出す。
     for line in session
@@ -226,6 +277,35 @@ impl Default for BlobMemTable {
         Self {
             slots: std::array::from_fn(|_| None),
         }
+    }
+}
+
+/// リングの中身を読む口（#1884）。memfd は map せず `FileExt::read_exact_at`（safe）で読む。範囲は自前で長さと照合する。
+impl BlobRead for BlobMemTable {
+    fn blob_len(&self, res_id: u32) -> Option<u64> {
+        let b = self.slots.iter().flatten().find(|b| b.res_id == res_id)?;
+        let mapped = b.mapping.len();
+        let actual = b.memfd.metadata().ok()?.len();
+        Some(mapped.min(actual))
+    }
+
+    fn read_exact_at(&self, res_id: u32, offset: u64, buf: &mut [u8]) -> Result<(), BlobReadError> {
+        use std::os::unix::fs::FileExt;
+        let len = self.blob_len(res_id).ok_or(BlobReadError::NotHeld)?;
+        let want = u64::try_from(buf.len()).map_err(|_| BlobReadError::OutOfRange)?;
+        let end = offset.checked_add(want).ok_or(BlobReadError::OutOfRange)?;
+        if end > len {
+            return Err(BlobReadError::OutOfRange);
+        }
+        let b = self
+            .slots
+            .iter()
+            .flatten()
+            .find(|b| b.res_id == res_id)
+            .ok_or(BlobReadError::NotHeld)?;
+        b.memfd
+            .read_exact_at(buf, offset)
+            .map_err(|_| BlobReadError::ReadFailed)
     }
 }
 
@@ -487,7 +567,7 @@ impl Session {
         &mut self,
         sock: &UnixStream,
         sink: &mut dyn FnMut(&str),
-        on_submit: SubmitHook<'_>,
+        hooks: &mut dyn SessionHooks,
     ) -> Result<SessionEnd, SessionError> {
         let mut last_activity = Instant::now();
         loop {
@@ -511,7 +591,7 @@ impl Session {
                 last_activity = Instant::now();
             }
             let started = Instant::now();
-            let serviced = self.service_ctrl(sink, on_submit);
+            let serviced = self.service_ctrl(sink, hooks);
             if !matches!(serviced, Ok(false)) {
                 self.metrics
                     .record(SessionOp::CtrlKick, serviced.is_ok(), started.elapsed());
@@ -658,7 +738,7 @@ impl Session {
     fn service_ctrl(
         &mut self,
         sink: &mut dyn FnMut(&str),
-        on_submit: SubmitHook<'_>,
+        hooks: &mut dyn SessionHooks,
     ) -> Result<bool, SessionError> {
         let poll_slice = self.limits.poll_slice;
         let message_timeout = self.limits.message_timeout;
@@ -676,6 +756,7 @@ impl Session {
         let depth = ring.depth();
         let vq = |e| SessionError::virtqueue(e, None);
         let mut done = 0usize;
+        let mut submitted = 0usize;
         for _ in 0..depth {
             // (a) 取り出しと読み取り。
             let mut buf = [0u8; MAX_CTRL_REQ_LEN];
@@ -737,10 +818,9 @@ impl Session {
             sink(&p.log_line);
             if dropped {
                 sink(&log::response_dropped_line());
-            } else if let Some(s) = p.submit
-                && let Some(line) = on_submit(&s)
-            {
-                sink(&line);
+            } else if let Some(s) = p.submit {
+                submitted += 1;
+                hooks.on_submit(&s, sink);
             }
             done += 1;
         }
@@ -753,6 +833,10 @@ impl Session {
             self.metrics
                 .record(SessionOp::Notify, notified.is_ok(), started.elapsed());
             notified?;
+            // call の後に読むので、ゲストへの応答の内容とタイミングは変わらない（#1884）。
+            if submitted > 0 {
+                hooks.after_notify(&self.blobs, sink);
+            }
         }
         // `Lost` では kick を読めたか不明なので ring は走査済み。処理が無ければ偽。
         Ok(done > 0 || kick == KickRead::Read)

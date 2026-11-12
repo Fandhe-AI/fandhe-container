@@ -607,8 +607,8 @@ jobs:
         if: runner.os == 'Linux' && always()
         timeout-minutes: 5
         run: |
-          df -h /
-          du -sh target/debug target/debug/deps 2>/dev/null
+          df -h / || true
+          du -sh target/debug target/debug/deps 2>/dev/null || true
       # macOS・Windows の `--all-features` の clippy / test（2026-10-10 の再構成で rust-ci〔reusable
       # rust-base-ci.yml の clippy / test ジョブ〕から移したもの）。コマンドは reusable と同一
       # （`--locked` なし）。Linux は rust-ci (ubuntu-latest) が実行するため重複させない。
@@ -2746,6 +2746,28 @@ jobs:
             --log "${log}" \
             --select "${select}" \
             --min 13 \
+            --forbid 'local_image_gc: skipped' --forbid 'local_image_gc: FAILED' \
+            --forbid 'PRECONDITION FAILED' --forbid 'not applicable' --summary
+
+      # local_image_gc の 50 並行（#868・TASK-184.4.1・OCI-7・REPAIR-5・REPAIR-12）: 同じ試験バイナリを
+      # `--ignored --scenario concurrent` で起動する別モード。pull・create・start・container delete・image rm を 50 回ずつ
+      # prune と並行させ、受け入れ条件 (i)〜(iii) を照合する。上の通しシナリオの期限（540 秒）を食わないよう別ステップにする。
+      # ビルドは上の `LIG_BIN` を使い回す。新しい check-run・sudo・permissions は追加しない。
+      - name: local_image_gc の 50 並行の実行（実機前提テスト・--ignored --scenario concurrent・委譲スコープ。OCI-7・#868）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/local_image_gc_concurrent.log"
+          USER="$(id -un)" \
+            scripts/run-in-user-scope.sh --name local_image_gc_concurrent --deadline 540 --log "${log}" -- \
+              "${LIG_BIN}" --ignored --scenario concurrent
+          # 成功行 5 件（接頭辞 `local_image_gc: concurrent`）をソースから導出して照合する。情報行は stderr に `info:` で出る
+          scripts/check-success-lines.sh --name local_image_gc_concurrent \
+            --src crates/cli/tests/local_image_gc.rs \
+            --log "${log}" \
+            --select '^local_image_gc: concurrent' \
+            --min 5 \
             --forbid 'local_image_gc: skipped' --forbid 'local_image_gc: FAILED' \
             --forbid 'PRECONDITION FAILED' --forbid 'not applicable' --summary
 

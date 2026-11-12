@@ -94,9 +94,13 @@ mod linux {
     /// 試験バイナリ（`target/<profile>/deps/<name>-<hash>`）の隣の `target/<profile>/` から supervisor の bin を探す。
     fn supervisor_bin() -> Option<PathBuf> {
         let exe = std::env::current_exe().ok()?;
-        let profile_dir = exe.parent()?.parent()?;
-        let bin = profile_dir.join("fandhe-container-supervisor");
-        bin.is_file().then_some(bin)
+        // 試験バイナリの置き場は cargo の版で変わる（旧: target/<profile>/deps/、新レイアウト:
+        // target/<profile>/build/<pkg>/<hash>/out/）ため、祖先を上へたどって supervisor の bin を探す。
+        exe.ancestors()
+            .skip(1)
+            .take(6)
+            .map(|dir| dir.join("fandhe-container-supervisor"))
+            .find(|bin| bin.is_file())
     }
 
     fn ns_id(pid: Option<u32>, name: &str) -> (u64, u64) {

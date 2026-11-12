@@ -707,18 +707,17 @@ pub(super) fn check_rootfs(bundle: &Path, root_path: &Path) -> Result<PathBuf, T
 /// junction は `FileType::is_symlink()` が false を返すため、属性の `FILE_ATTRIBUTE_REPARSE_POINT`
 /// で検出する。他 OS では symlink 判定のみ。
 pub(super) fn is_link_like(meta: &std::fs::Metadata) -> bool {
-    if meta.file_type().is_symlink() {
-        return true;
-    }
+    let symlink = meta.file_type().is_symlink();
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return true;
-        }
+        symlink || meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
     }
-    false
+    #[cfg(not(windows))]
+    {
+        symlink
+    }
 }
 
 pub(super) fn inspect(path: &Path) -> Result<std::fs::Metadata, TraitError> {

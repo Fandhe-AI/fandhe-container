@@ -48,25 +48,26 @@ size_of() {
 }
 exe_def="$(size_of "${root}/default/release/fandhe-container")"
 exe_np="$(size_of "${root}/no-plugin/release/fandhe-container")"
+# rlib の置き場は cargo の版で変わる（旧: release/deps/、新レイアウト: release/build/<pkg>/<hash>/out/）ため、
+# release 配下を find で探す（`libfandhe_container_plugin-` はハイフン込みで plugin-cri 等を拾わない）。
 plugin_def=""
-for f in "${root}"/default/release/deps/libfandhe_container_plugin-*.rlib; do
-  [ -e "${f}" ] || continue
+while IFS= read -r f; do
+  [ -n "${f}" ] || continue
   [ -z "${plugin_def}" ] || {
     echo "NG: multiple plugin rlibs in default build" >&2
     exit 1
   }
   plugin_def="$(size_of "${f}")"
-done
+done < <(find "${root}/default/release" -name 'libfandhe_container_plugin-*.rlib' 2>/dev/null)
 [ -n "${plugin_def}" ] || {
   echo "NG: plugin rlib not found in default build" >&2
   exit 1
 }
-for f in "${root}"/no-plugin/release/deps/libfandhe_container_plugin-*.rlib; do
-  [ ! -e "${f}" ] || {
-    echo "NG: plugin rlib exists in no-default-features build: ${f}" >&2
-    exit 1
-  }
-done
+stray="$(find "${root}/no-plugin/release" -name 'libfandhe_container_plugin-*.rlib' 2>/dev/null | head -n 1)"
+[ -z "${stray}" ] || {
+  echo "NG: plugin rlib exists in no-default-features build: ${stray}" >&2
+  exit 1
+}
 diff=$((exe_def - exe_np))
 pct="$(awk -v d="${diff}" -v t="${exe_def}" 'BEGIN { printf "%.2f", d * 100 / t }')"
 echo "### plugin feature size record (PLUG-3, TASK-111.2, #3204)"

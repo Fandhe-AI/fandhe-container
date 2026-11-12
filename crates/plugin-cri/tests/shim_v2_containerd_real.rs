@@ -218,7 +218,7 @@ mod linux {
         let found = exe
             .ancestors()
             .skip(1)
-            .take(3)
+            .take(6)
             .map(|d| d.join(name))
             .find(|p| p.is_file());
         found.unwrap_or_else(|| {

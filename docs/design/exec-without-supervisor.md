@@ -11,7 +11,7 @@ supervisor が不在のとき（孤児化・再起動後）に、稼働中コン
 | `crates/supervisor/src/exec.rs` | 本番の通しの入口は `run_command_with_pidfd` だけ。起動時（fork 直後・回収前）から supervisor が保持する pidfd（`LaunchedProcess::launch_pidfd`）を引数の型で必須にする |
 | 縮退経路 | 記録 pid から開く入口 `run_command` は `exec-test-support` feature の試験専用で、既定ビルドには無い（#1617） |
 | `crates/supervisor/src/control/target.rs` | 起動時 pidfd を持つのは稼働中 supervisor の `ControlledProcess` だけ |
-| `crates/supervisor/src/control/client.rs` | ソケットが無い・接続拒否のとき `Unavailable` を返す。CLI の exec は `state.json` の記録 pid からの `pidfd_open` へ縮退しない（#2626 の設計） |
+| `crates/supervisor/src/control/client.rs` | ソケットが無い・接続拒否のとき `Unavailable` を返す。CLI の exec は `state.json` の記録 pid からの `pidfd_open` へ縮退しない（#2626 の設計）。回帰試験は #2766 で追加（`control_exec_handover` の `sup6_sup8_sec4_2766_*` と cli の同名試験。`docs/design/measurements/sec4-2480-thread-count-lag.md`） |
 | `crates/core/src/exec/setns.rs` | `Pid1Target::open`（記録 pid から開き cgroup パスの完全一致で照合）は「コンテナから cgroupfs に書けない」前提の間だけの縮退経路。`open_with_launch_pidfd` は渡された pidfd の `Pid:` と記録 pid の一致を同一性の根拠にする |
 | spec | SUP-5: 孤児化したコンテナは稼働を続けるが restart・healthcheck・ログ捕捉は失われる。SUP-8: re-adopt か終了かを決める。SUP-4: healthcheck は exec と同じ関数で動く |
 

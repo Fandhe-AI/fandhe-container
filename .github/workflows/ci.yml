@@ -2704,6 +2704,43 @@ jobs:
             --forbid 'network_modes_real: skipped' --forbid 'network_modes_real: FAILED' \
             --forbid 'PRECONDITION FAILED' --forbid 'not applicable' --summary
 
+      # local_image_gc（`crates/cli/tests/`。OCI-7・CLI-1・TASK-184.1・REPAIR-12・#663）:
+      # 本物の running / stopped のコンテナを参照元にして、`image rm` の既定の拒否と `--force` の境界
+      # （running は `--force` でも拒否、stopped だけならタグだけ外す）を確かめる。
+      # 前提・実行方法は network_modes_real と同じ（supervisor の bin を先にビルドして置き、試験バイナリを委譲スコープの中で
+      # 直接実行する）。新しい check-run・sudo・permissions は追加しない。
+      - name: local_image_gc のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          cargo build -p fandhe-container-supervisor
+          json="${RUNNER_TEMP}/lig-build.json"
+          cargo test -p fandhe-container-cli --test local_image_gc --no-run --message-format=json > "${json}"
+          sel='select(.profile.test == true and .target.name == "local_image_gc") | .executable'
+          bins="$(jq -r "${sel}" "${json}" | grep -v '^null$' | sort -u)"
+          if [ -z "${bins}" ] || [ "$(printf '%s\n' "${bins}" | wc -l)" -ne 1 ]; then
+            echo "::error::local_image_gc test binary not uniquely identified" >&2
+            exit 1
+          fi
+          echo "LIG_BIN=${bins}" >> "$GITHUB_ENV"
+
+      - name: local_image_gc の実行（実機前提テスト・--ignored・委譲スコープ。OCI-7・CLI-1・#663）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/local_image_gc.log"
+          USER="$(id -un)" \
+            scripts/run-in-user-scope.sh --name local_image_gc --deadline 540 --log "${log}" -- \
+              "${LIG_BIN}" --ignored
+          # 成功行 5 件をソースから導出して照合する。失敗の 1 行目は前提欠如が `PRECONDITION FAILED`、それ以外が `local_image_gc: FAILED`
+          scripts/check-success-lines.sh --name local_image_gc \
+            --src crates/cli/tests/local_image_gc.rs \
+            --log "${log}" --select '^local_image_gc: (image rm |a new container |scenario ok)' --min 5 \
+            --forbid 'local_image_gc: skipped' --forbid 'local_image_gc: FAILED' \
+            --forbid 'PRECONDITION FAILED' --forbid 'not applicable' --summary
+
       # start_scope_real・delete_cgroup_real・start_recover_real（`crates/cli/tests/`。CORE-2・CORE-3・CORE-4・CORE-6・SUP-1・CLI-1・
       # SEC-1・OCI-6・REPAIR-7・#2081・#2061・#2011・#3105）: 委譲 cgroup の CLI 実機前提テスト。前提（非 root・user manager の
       # private ソケット・cgroup v2・Landlock ABI 6 以上）は上の前提確認ステップが fail-closed で確かめる。root の分岐は無い

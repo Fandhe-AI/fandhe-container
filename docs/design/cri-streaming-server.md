@@ -421,9 +421,9 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 1. D7 の containerd との差（黙って無視せず断る）
 2. tap の購読者の上限の値
 3. tty の `stdin_once` で閉じないこと（containerd のコードとコメントの食い違い）
-4. tty の CRI ログで LF の無い出力が遅れて出ること（CRI ログの部分行 `P` は範囲外）
+4. tty の CRI ログで LF の無い出力が遅れて出ること（CRI ログの部分行 `P` は範囲外。#4116 の項目 8 で追跡すると決定・方式は [cri-log-partial-lines.md](cri-log-partial-lines.md)・#4574）
 
-**範囲外**: CLI の `create -i -t`（CLI-1）、shim v2 の terminal、CRI ログの部分行 `P`。追跡の issue が要るかは C11 の時点で判断する。
+**範囲外**: CLI の `create -i -t`（CLI-1）、shim v2 の terminal、CRI ログの部分行 `P`（#4116 の項目 8 で追跡すると決定・[cri-log-partial-lines.md](cri-log-partial-lines.md)・#4574）。
 
 **子 issue（いずれも #3765 の sub-issue、2h 以下）**
 

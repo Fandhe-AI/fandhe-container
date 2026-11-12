@@ -193,7 +193,7 @@ impl fmt::Display for LogsError {
 impl std::error::Error for LogsError {}
 
 /// 1〜255 バイトの `[A-Za-z0-9._-]` だけを許す（compose-spec のサービス名規則に合わせる）。
-fn is_valid_service_name(name: &str) -> bool {
+pub(crate) fn is_valid_service_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= MAX_SERVICE_NAME_LEN
         && name

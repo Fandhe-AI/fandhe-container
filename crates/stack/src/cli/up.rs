@@ -13,13 +13,20 @@
 //! `down`〔#620〕の責務）。[`UpFailure::launched`] に起動済みのサービス名を起動順で、
 //! [`UpFailure::networks`] に用意済みのネットワークを返す。
 //!
+//! 実装済み（#3639 の stack 側の部品）: コンテナ ID の規則（[`ServiceContainerId`]・[`ProjectName`]）、
+//! `create` / `start` の argv の組み立てと拒否規則（[`create_argv`]・[`start_argv`]）、
+//! TOML の parse 入口（`crate::toml_input`。入力サイズの上限つき）。
+//!
 //! 実装済みを装わない（REPAIR-3）。未実装（#3639 で追跡）:
-//! - 本番の [`ServiceLauncher`]（CLI の create → start を子プロセスで呼ぶ。`Service::create_option_args` を使う。
-//!   TASK-157・SUP-1）。ネットワークの契約は [`ServiceLauncher`] の (e)
+//! - 本番の [`ServiceLauncher`]（[`create_argv`] / [`start_argv`] を使い CLI の create → start を子プロセスで呼ぶ。
+//!   期限・pasta フラグの通過・`up <service>` の閉包・profile の読み取りを含む。TASK-157・SUP-1）。
+//!   ネットワークの契約は [`ServiceLauncher`] の (e)
 //! - 本番の [`NetworkProvisioner`]（`network create` と存在確認）、実 netns への接続の実機確認
-//! - 本番の `DependencyObserver` / `HealthSource`（core の state.json 読み取り）
-//! - CLI 結線（`cli -> stack` の依存辺はユーザー承認事項）、TOML parse の入口と入力サイズの上限検証
-//! - `completed` 条件の待機（未対応として止める）、`logs`（#622）
+//! - 本番の `DependencyObserver` / `HealthSource`（core の state.json 読み取り）。推奨設計: cli 側に置き
+//!   （`stack -> core` の辺を張らない）、launcher と台帳（サービス名 → 今回 create した ID）を共有して
+//!   「今回の up が作ったものに限る」契約を満たす
+//! - CLI 結線（`cli -> stack` の依存辺はユーザー承認事項。未承認のため `Cargo.toml` は未変更）
+//! - `completed` 条件の待機（未対応として止める）、`logs`（#622）の logs フラグ
 //! - 1 サービスの複数ネットワーク（CLI の `--network` が 1 回までのため拒否）、rootful（D13 待ち）
 //!
 //! 外部入力の扱い: サービス名と `Service` は TOML 由来。本モジュールはシェルもパスも組み立てず
@@ -41,8 +48,12 @@ use crate::depends_on::{
 };
 use crate::schema::{DependsOnCondition, Network, Service};
 
+mod create_args;
+mod identity;
 mod network;
 
+pub use create_args::{CreateArgsError, CreateArgvContext, create_argv, start_argv};
+pub use identity::{IdentityError, ProjectName, ServiceContainerId};
 pub use network::{
     NetworkAttachment, NetworkDriver, NetworkPlan, NetworkPlanError, NetworkProvisionError,
     NetworkProvisioner, NetworkRequest, ProvisionOutcome, ProvisionedNetwork, plan_networks,
@@ -155,6 +166,7 @@ impl<'a> LaunchRequest<'a> {
 ///
 /// 実装の契約:
 /// - (a) `service` は TOML 由来の外部入力。ID・パス要素にする前に実装側で検証する（パストラバーサル防止）。
+///   ID は [`ServiceContainerId::derive`] で作る。
 /// - (b) 返すのは今回の `up` が作ったものだけ（前回の実行の記録を返さない）。
 /// - (c) ブロックする実装は短い上限を持つ（REPAIR-5）。
 /// - (d) `spec` は資格情報（`env`）を含みうる。ログ・エラーへ `{:?}` で出さない。

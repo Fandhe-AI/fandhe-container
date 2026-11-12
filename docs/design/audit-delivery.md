@@ -212,6 +212,25 @@ Landlock には USER_NOTIF に相当するユーザー空間への通知経路�
 
 **残余（REPAIR-3。実装済みを装わない）**:
 
+- **ESC-06（`KILL_PROCESS` の 3 件）は `Deferred`**: `USER_NOTIF` に載らず、補助の `exit_signal` は本番 launcher の回収点が出して試験の入口（`spawn_container_probe`）では作られず、正の記録はカーネルの `AUDIT_SECCOMP`（読み手が無い。#2237）。`Required` への切り替えは #2237（`AUDIT_SECCOMP` の読み手と `CAP_AUDIT_READ`）の結論の後に行う。#2236 の側は、複数スレッド・rootless での `exit_signal` の配送と exec コマンドの記録を実装した（9.1。実機の照合は `production_launcher` のシナリオ Q〔#1621 で人間が実行〕）。子孫の SIGSYS 終了は親から観測できず未達のまま
+- **`create` のパース時の destination 拒否（遡り・`/`・相対 `..`）は、CLI の create だけ本番で監査される（#2480）**: `create_audited` / `create_with_image_audited` が `audit_mount_config_error` を通し、`FileAuditSink`（`<状態ルート>/@audit.log`）へ mount 層で 1 件記録する（`esc-08-config-destination` と、start の TOCTOU の `esc-08-start-destination-rewrite`〔#2641〕は `Required` で 3 行を照合。結合試験は `tests/create_mount_audit_delivery.rs`・`crates/cli/tests/binary_entry.rs`）。plugin-cri の `CoreLifecycleRuntime::create` と start の TOCTOU 再検証（create 後に書き換えられた destination の拒否）も #2594 で配線した。新しい中継は作らず、既存の `ControlAuditRelay` が理由なし・`path` なしの `Mount` を運ぶ（plugin-cri は `main.rs` が単一スレッドの間に作った relay を create の記録先として共有する。tokio のマルチスレッドでは `FileAuditSink` の fork 隔離が使えず、rootless では `SinkFailed` になるため）。start は手順 5 の `load_resource_limits_audited` と手順 8 の `build_spec` が supervisor の `rejection_audit` へ記録し、手順 5 で拒否されれば手順 8 へ進まないので 1 回の start で高々 1 件。CLI と plugin-cri の start は同じ supervisor を通るため両方に効く。残余（REPAIR-3）: 非 Linux は記録先が無い（#2430 の判断待ち）。plugin-cri の bin から実 supervisor を通した照合は実機前提（#850・#2062・#1621）で未実施で、本番の `prepare_cgroup` の結線はソース構造の単体試験で固定している
+- **supervisor の `start` 経由の bind の元の拒否の監査は、結合試験までを照合済み（#2481）**: supervisor は launcher の launch の時点の監査 sink に `FileAuditSink`（`build_audit_sink`）を渡し、start の検証の拒否の記録先（`rejection_audit_sink`）・回収点の `exit_signal` 専用の記録先（`exit_audit_sink`）・seccomp ハブ・制御チャネルには `ControlAuditRelay` を渡す。`crates/supervisor/tests/start_bind_audit_relay.rs` が、公開の `run_start`（作業スレッドで `claim_start`）から relay 経由で `@audit.log` に mount 層 3 行が届くことを照合する（relay を使わず `FileAuditSink` のままだと 0 行になることも確認済み）。残余: 本番の `ProductionStartDeps::build_launcher` の結線は core の単体試験とソース構造の試験で固定しており、本番 bin から実コンテナまでの通し（委譲 cgroup 等の実機前提。人間担当の #1621 の範囲）での照合は未実施
+- カーネル監査の段の実機での実行と記録は人間担当の #206。この環境（AppArmor が非特権 user namespace を制限）では、分離を要するケースを含め実機部は実行できていない
+
+### 9.4 exec 経路の応答者（#2544。SEC-4・SUP-6・REPAIR-5）
+
+exec で起動したコマンドの ERRNO 側 40 件の拒否を記録先へ届けるため、exec の filter を `USER_NOTIF` で載せる。通知に誰が応答するかを次の 2 案から選んだ（なお #2524 は同じスコープの起票で、本 issue が実装した）。
+
+| 案 | 内容 | 判断 |
+| -- | ---- | ---- |
+| A | supervisor の `SeccompNotifyHub` へ exec の listener を 2 段目の `SCM_RIGHTS` で転送する | **後続**。ハブは供給元を 1 本しか持たず（`attach_with` が先頭で `quiesce()` して直前の監視を畳む）、複数 listener の同時監視への再設計が要る。supervisor から exec 専用プロセスへの経路が本番に無い（`run_command_with_pidfd` の本番の呼び出し元〔healthcheck #2441・CLI の exec #2626〕が未配線）。転送先の UDS の所有者・peer credential 検証の設計も要る |
+| B | exec の親に per-exec の `SeccompNotifyHub` を持たせ、記録先に単一スレッドのうちに fork した `ControlAuditRelay` を渡す | 不採用。`ControlAuditRelay::spawn` は具体型 `FileAuditSink` を取り `&dyn AuditSink` と噛み合わない。exec ごとに helper を fork する。ハブのスレッド 2 本を `audit_worker_result`（`Threads: 1` 必須）より前に必ず畳む生存期間管理が要り、畳めなければ rootless で記録に失敗する |
+| **C（採用）** | exec の親が単一スレッドで、worker の終了待ちと listener の待ちを交互に回して同期に応答する | exec の親は fork と `FileAuditSink` の主経路の 2 か所で `Threads: 1` を要するため、スレッドを作らずに済む。期限つきの記録 API（`AuditSink::record_until`）が既にあり、`FileAuditSink` は主経路・代替経路・失敗通知の全段を絶対期限で切る。exec の既存の監査（`exec_target`・`entrypoint`・`exit_signal`）も「worker の結果を受けた親」が同じ `audit` に記録しており、listener の寿命（exec の寿命）とも一致する |
+
+**fail-closed の 2 段**: (1) fork 前: 本番の `ListenerPolicy::Respond` は応答者の構成を値で持ち、filter の届け方（`UserNotif`）もそこから決まる。 (2) 稼働中: `wait` / `receive` の失敗、応答の送信不能（上限つき再送の後）では listener を即座に drop してカーネルに `ENOSYS` で解かせる。worker の回収は通常どおり続け、`ExecOutcome::seccomp_audit` に `Lost` と集計を載せる（start 経路の「起動後の喪失で停止しない」と揃える）。受け渡し自体の失敗は #2385 の fail-closed のまま（worker を止めて回収し exec を拒否）。期限（REPAIR-5）: 記録は応答期限（既定 1 秒・最大 5 秒）で打ち切って必ず応答し、ループは反復ごとに worker の終了と exec の全体期限を確認する。
+
+**残余（REPAIR-3。実装済みを装わない）**:
+
 - ハブは期限超過で応答した後も recorder が記録を続ける（`late`）が、この応答者は応答期限で記録を打ち切る（`unrecorded`）。「記録 → 応答」の順序は保つ。後追いの記録をしない判断は下の「#2632 の判断」
 - 通知は直列に処理するため、記録先が詰まると 1 件ごとに最大で応答期限だけ後続の通知が待つ。待ちの上限は下の「#2632 の判断」の具体値。なお洪水のトークンバケット（20 件/秒・バースト 64）は詰まりの上限にならない（詰まると 1 件が約 1 秒かかる間に 20 トークンが補充され、バケットは尽きず間引きは起きない。間引きは記録先が速いのに通知が毎秒 20 件を超えて届くときの歯止め）
 - 期限の保証は `audit` が `record_until` を期限どおりに実装することに依存する（trait の既定実装は期限切れでなければ `record` に委ねる）。`run_command_with_pidfd` の `audit` の契約に反映した

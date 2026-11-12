@@ -113,7 +113,7 @@ fn binary_summary_reports_conversion_rate() {
     assert_eq!(status.code(), Some(0), "{err}");
     let summary = err.lines().last().expect("summary line");
     let tail = summary
-        .split("\"toml_output\":\"unimplemented\",")
+        .split("\"toml_output\":\"skipped-not-error-free\",")
         .nth(1)
         .expect("conversion_rate tail");
     assert_eq!(

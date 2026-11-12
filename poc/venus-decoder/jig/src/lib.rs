@@ -17,7 +17,8 @@
 //! 起動入口（UDS の bind・期限つき accept・ログのファイル出力。F4・#1598）は `launch` と bin `venus-jig` に実装済み（Linux 限定）。
 //!
 //! 受理した `SUBMIT_3D` の本体の記録（`recording`。`--record` で記録ファイルへ書き出す。F6・#1602）は実装済み。
-//! 記録するのは提出の本体だけで、共有メモリ上のリングの中身は記録しない（F5.2b の後）。
+//! 共有メモリ上のリングの中身（`ring_record`。`CreateRingMESA` で作られたリングの差分を kind 1 で足す）も記録する（#1884。
+//! `unsafe` は足さず、memfd は `read_exact_at` で読む）。reply・extra・間接 cs の shmem は記録しない。
 //!
 //! 記録ファイル（FCVNSREC）を実ファイルに対して検証する入口（#1885）は `verify` と bin の `--verify-record`（3 OS）。
 //!
@@ -42,6 +43,7 @@ pub mod launch;
 pub mod log;
 pub mod recording;
 pub mod resource;
+pub mod ring_record;
 #[cfg(target_os = "linux")]
 pub mod session;
 pub mod verify;

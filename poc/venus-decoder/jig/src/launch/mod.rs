@@ -5,10 +5,10 @@
 //! 実機での疎通（治具 VMM = crosvm 等の vhost-user frontend との接続）は #725（人間担当）。
 //!
 //! 処理の順序: 引数解析 → パス検証 → UID 取得 → ソケットディレクトリの検証・作成 → 既存パスの検査 → ログファイル作成 →
-//! 記録ファイル作成（`--record` 指定時） → bind → 期限つき accept → `session::run_with_submit_hook` → 記録の書き出し →
+//! 記録ファイル作成（`--record` 指定時） → bind → 期限つき accept → `session::run_with_hooks` → 記録の書き出し →
 //! 後始末。検証で拒否した場合はログファイルも記録ファイルも作らず、既存のパスは消さない。
 //!
-//! 記録（`--record`。GPU-6・TASK-172 F6・#1602）: 受理した `SUBMIT_3D` の本体を `recording::SubmitRecorder` で
+//! 記録（`--record`。GPU-6・TASK-172 F6・#1602、リングの中身は #1884 の `ring_record::RecordingHooks`）: 受理した `SUBMIT_3D` の本体を `recording::SubmitRecorder` で
 //! `create_new` + `0600` のファイルへ書く。セッションが正常・エラーのどちらで終わっても `finish` と `sync_all` を行い、
 //! 集計行（`record_summary`）を残す。書き出しに失敗したら `RECORD_WRITE_FAILED`（セッションが先に失敗していればそちらを優先）。
 //! 上限による停止はセッションの失敗ではなく、終了コードは 0 のまま。記録先の親〜`/` はログと同じ規則で検査する。限界は
@@ -46,7 +46,8 @@ pub use error::{LaunchError, LaunchErrorCode};
 
 use crate::log::{self, LogSink};
 use crate::recording::{RecorderLimits, SubmitRecorder};
-use crate::session::{SessionEnd, SessionLimits, run_with_submit_hook};
+use crate::ring_record::RecordingHooks;
+use crate::session::{SessionEnd, SessionHooks, SessionLimits, run_with_hooks};
 use crate::sys;
 
 /// `sun_path` に入るバイト数の上限（`UNIX_PATH_MAX` = 108 から終端 NUL を除いた値）。
@@ -458,19 +459,24 @@ fn run_logged(
     uid: u32,
     sink: &mut LogSink<File>,
 ) -> Result<SessionEnd, LaunchError> {
-    let mut recorder = match &config.record {
-        Some(p) => Some(SubmitRecorder::new(open_record(p)?, config.record_limits)),
+    let mut hooks = match &config.record {
+        Some(p) => Some(RecordingHooks::new(SubmitRecorder::new(
+            open_record(p)?,
+            config.record_limits,
+        ))),
         None => None,
     };
-    let result = serve(config, uid, sink, recorder.as_mut());
-    let Some(recorder) = recorder else {
+    let result = serve(config, uid, sink, hooks.as_mut());
+    let Some(hooks) = hooks else {
         return result;
     };
-    let (finished, summary) = recorder.finish();
+    let ring_stats = hooks.stats();
+    let (finished, summary) = hooks.into_recorder().finish();
     let write_ok = match finished {
         Ok(file) => file.sync_all().is_ok(),
         Err(_) => false,
     };
+    sink.write_priority(&log::ring_summary_line(&ring_stats));
     sink.write_priority(&log::record_summary_line(&summary, write_ok));
     match result {
         Ok(_) if !write_ok => Err(LaunchError::new(LaunchErrorCode::RecordWriteFailed)),
@@ -478,11 +484,15 @@ fn run_logged(
     }
 }
 
+/// `--record` なしのときの何もしないフック。
+struct NoHooksLaunch;
+impl SessionHooks for NoHooksLaunch {}
+
 fn serve(
     config: &Config,
     uid: u32,
     sink: &mut LogSink<File>,
-    mut recorder: Option<&mut SubmitRecorder<File>>,
+    hooks: Option<&mut RecordingHooks<File>>,
 ) -> Result<SessionEnd, LaunchError> {
     let listener = UnixListener::bind(&config.socket)
         .map_err(|_| LaunchError::new(LaunchErrorCode::BindFailed))?;
@@ -499,7 +509,12 @@ fn serve(
         .set_nonblocking(false)
         .map_err(|_| LaunchError::new(LaunchErrorCode::AcceptFailed))?;
     sink.write_line("venus_jig event=accepted");
-    let outcome = run_with_submit_hook(
+    let mut none = NoHooksLaunch;
+    let hooks: &mut dyn SessionHooks = match hooks {
+        Some(h) => h,
+        None => &mut none,
+    };
+    let outcome = run_with_hooks(
         &stream,
         &config.limits,
         &mut |l| {
@@ -509,7 +524,7 @@ fn serve(
                 sink.write_line(l);
             }
         },
-        &mut |s| recorder.as_mut().and_then(|r| r.on_submit(s)),
+        hooks,
     );
     outcome.map_err(|e| LaunchError {
         code: LaunchErrorCode::SessionFailed,

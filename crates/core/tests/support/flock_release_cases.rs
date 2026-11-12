@@ -7,8 +7,8 @@
 //! 試験を走らせる。試験専用で製品バイナリ・rlib には入らない。Cargo の依存の辺も増やさない。
 //!
 //! 取り込み元（6 crate）: `crates/{core,oci,cri,plugin-cri,supervisor,net}/src/lib.rs`
-//! （grep: `flock_release_cases`）。`release_lock_file*` を持つ 5 crate は `flock_release_with_cases.rs`（群 B）も
-//! 取り込む。net は本体の形が違い（`Deref` と名前つきフィールド、製品に `release_lock_file_with` が無い）群 A だけ。
+//! （grep: `flock_release_cases`）。6 crate すべてが `flock_release_with_cases.rs`（群 B）も
+//! 取り込む（net も #4571 で同じ形になった）。
 //!
 //! 各 crate は `crate::flock_release::shared_case_dir(tag)` を試験専用で用意する（一時ディレクトリの作り方が
 //! crate ごとに違うため、本ファイルの外に置く）。規則を変えるときは本ファイルと 6 か所を同じ PR で直す。

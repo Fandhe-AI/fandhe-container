@@ -121,3 +121,6 @@ mod test_root;
 #[cfg(all(test, unix))]
 #[path = "../../core/tests/support/flock_release_cases.rs"]
 mod flock_release_cases;
+#[cfg(all(test, unix))]
+#[path = "../../core/tests/support/flock_release_with_cases.rs"]
+mod flock_release_with_cases;

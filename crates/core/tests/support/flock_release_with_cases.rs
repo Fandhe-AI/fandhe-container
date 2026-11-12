@@ -1,8 +1,8 @@
-//! `flock_release::release_lock_file_with`・`release_lock_file` の振る舞いを、製品にこれらを持つ 5 crate で同じ
+//! `flock_release::release_lock_file_with`・`release_lock_file` の振る舞いを、6 crate で同じ
 //! 試験ケースにより照合する共有部品（群 B。REPAIR-1・REPAIR-5・OCI-5・CORE-2・#4566。判断は #4532 の案 C）。
 //!
-//! 取り込み元（5 crate）: `crates/{core,oci,cri,plugin-cri,supervisor}/src/lib.rs`
-//! （grep: `flock_release_with_cases`）。net は製品にこれらが無い（形が違う）ため取り込まない。
+//! 取り込み元（6 crate）: `crates/{core,oci,cri,plugin-cri,supervisor,net}/src/lib.rs`
+//! （grep: `flock_release_with_cases`）。net も #4571 で他の 5 crate と同じ形になり取り込む。
 //! 取り込み方・一時ディレクトリの用意・変更時の規則は `flock_release_cases.rs`（群 A）と同じ。
 //! 試験専用で製品バイナリ・rlib には入らない。
 

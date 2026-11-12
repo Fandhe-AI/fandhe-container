@@ -47,7 +47,7 @@
 | platform-macos `console_log.rs` | コンソールログのロック | (c) | あり | 猶予つき再試行 | 無害（同上） |
 | plugin `uds_security.rs` | `BindLock` | (a) | - | - | 無害（明示 unlock） |
 | plugin `sys.rs` | listener のロック | (b) | あり | - | 無害（fork した子も listener を持つので、ロック保持と listener 生存の対応が崩れない設計。`sys.rs` 1592 行付近の doc） |
-| core `oci_runtime/image_rootfs.rs` の `#[cfg(test)]`（`oci7_lock_held_by_other_is_reported_as_alive_not_deleted`） | 素の `File`（試験の保持者） | (b) | あり（core の lib 試験バイナリの他の試験が `sys::fork_single_threaded*`・`Command::spawn` を行う） | 待たない再取得（`kept_alive` に倒れる） | 該当（試験の間欠失敗の余地。製品の誤判定ではない。追跡 #4541） |
+| core `oci_runtime/image_rootfs.rs` の `#[cfg(test)]`（`oci7_lock_held_by_other_is_reported_as_alive_not_deleted`） | 素の `File`（試験の保持者） | (a)（#4541 で `File::unlock`） | あり（core の lib 試験バイナリの他の試験が `sys::fork_single_threaded*`・`Command::spawn` を行う） | 待たない再取得（`kept_alive` に倒れる） | 修正済み（#4541。試験の保持者を明示 unlock。製品の誤判定ではなかった） |
 
 ## 試験コード
 

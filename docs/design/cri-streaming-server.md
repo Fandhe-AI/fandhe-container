@@ -489,7 +489,7 @@ helper が要る理由（カーネルの要件）: `setns(CLONE_NEWUSER)` は多
 - cri の対応表を締める（F9。#4485 で実装済み）。#4485 より前の `port_forward_network` は NODE 以外をすべて `Pod` にしていたが、bundle は network の `CONTAINER` を「コンテナごとの新しい netns」、`TARGET` を未対応と扱うため、POD を有効にすると `CONTAINER` の pod まで保持役の netns へつながる。`POD` か未指定（proto の既定 0 は POD）だけを `Pod` とし、`CONTAINER`・`TARGET`・未知の値は RPC 時に `UNIMPLEMENTED`（固定文）、`Pod` で記録に保持役が無ければ `FAILED_PRECONDITION` にする
 - pod A / B の取り違えが無いことを試験で必須にする（単体は固定プログラムの保持役 2 つ、実機は段 F）
 - helper は setns の後、接続の前に capability を空にし NNP・non-dumpable にし `close_range` する。コンテナのコードは実行しない。受けた fd は本数・`MSG_CTRUNC`・種別・peer・netns の不一致をすべて拒否し、drop で閉じる
-- helper が `setns(user)` してから non-dumpable にするまでの窓は dumpable のままだが、到達できない（#4525）。pod のコンテナ内のプロセス（pod の userns で capability を持ちうる唯一の主体）は、helper が pod の pid namespace に参加せず（`setns` は user と net だけ）、CRI の検証で pid の `NODE` / `TARGET` は `UNIMPLEMENTED`（pid の共有は未実装 #2903）のため helper の pid を名指しできない。OCI 既定に `CAP_SYS_PTRACE` も無い（SEC-1）。host 側の同 uid は pod の userns の所有者として初めから全 capability を持つため権限は上がらず、non-dumpable の後は exec 時の namespace での `CAP_SYS_PTRACE` が要る。再評価条件は pid の共有（#2903）や pid の `NODE` の受理。カーネル原文（`__ptrace_may_access`）の行番号での再確認は未実施
+- helper の dumpable の窓（exec から `set_non_dumpable` まで。`setns(user)` では dumpable は変わらない）には到達できない（#4525・#4547）。主な根拠は pid の可視性で、helper は user と net にしか `setns` せず plugin-cri と同じ host の pid namespace にいる一方、コンテナは常に新しい子の pid namespace に居て（`crates/cri/src/bundle/spec.rs`。pid の `NODE` / `TARGET` は `UNIMPLEMENTED`、共有は未実装 #2903）、helper の pid は子の pid namespace に番号を持たない（Linux v6.12 `kernel/pid.c` 194 行 `alloc_pid`）。`ptrace(2)` は 1269 行の `find_get_task_by_vpid`、`pidfd_open` は 640 行の `find_get_pid`、`/proc/<pid>` は `fs/proc/base.c` 3514〜3516 行（mount 時の pid namespace、`fs/proc/root.c` 252 行）で、いずれも呼び出し側の pid namespace で解決するため `ESRCH` になる。資格情報・能力の検査は補助にすぎず、`drop_all_capabilities` の後から non-dumpable までの区間では障壁にならない（`kernel/ptrace.c` 317〜323 行の uid・gid 一致、`security/commoncap.c` 148〜150 行の部分集合。詳細は下の脚注）。host 側の同 uid は pod の userns の所有者として初めから全 capability を持つため権限は上がらず、non-dumpable の後は初期 userns での `CAP_SYS_PTRACE` が要る（`kernel/ptrace.c` 341〜344 行）。再評価条件は pid の共有（#2903）・pid の `NODE` の受理・疑似 FS の bind 拒否（#2098）の緩和。カーネル原文での確認は下の脚注
 - エラー文・ログに port・pid・パス・トークンを含めない（REPAIR-4）
 
 #### 期限と上限（REPAIR-5。暫定値で #4116 の確認の対象）
@@ -540,6 +540,30 @@ sys に新しい unsafe を足す子（#4478・#4479・#4483）は、PR 本文�
 4. `CONTAINER` の pod の port-forward を `UNIMPLEMENTED` にすること（containerd との差は未確認）
 5. 上の期限・上限の暫定値（#4116）
 6. 実 crictl・kubectl での確認は人間担当（#3730）
+
+#### 脚注: netns-dial helper の dumpable の窓の根拠と確認結果（#4547・SEC-1・CRI-6・NET-3）
+
+一次情報は Linux v6.12 の tag（`gh api -H "Accept: application/vnd.github.raw" "repos/torvalds/linux/contents/<path>?ref=v6.12"` で取得し、行番号を照合した）。`__ptrace_may_access` の行番号は [pod-namespace-holder.md](./pod-namespace-holder.md) の脚注（H2・#2874）と同じ値を引く。ただしその脚注は保持役（`unshare(USER)` の後に再 exec する）の条件で、helper は exec の後に `setns(CLONE_NEWUSER)` し再 exec しない。条件が違うため、次の 3 点を helper の手順（`crates/net/src/netns_dial/helper.rs`: `setns(user)`・`setns(net)` → `drop_all_capabilities` → `set_no_new_privs` → PDEATHSIG の再武装 → `set_non_dumpable`）に当てはめ直した。
+
+窓の範囲: helper は supervisor の bin を exec したもので、exec は dumpable を `SUID_DUMP_USER` に戻す（`fs/exec.c` 1347 行）。`setns(user)` の `commit_creds`（`kernel/nsproxy.c` 512〜520 行）は、euid・egid・fsuid・fsgid が変わるか `!cred_cap_issubset` のときだけ dumpable を変える（`kernel/cred.c` 405〜412 行）。rootless の pod の userns は親が初期 userns で owner が同じ host uid のため dumpable は変わらず、窓は exec から `set_non_dumpable` までの全区間になる。
+
+1. 資格情報の検査（障壁にならない）
+   - `kernel/ptrace.c` 317〜323 行は、呼び出し側の uid・gid が対象の euid / suid / uid・egid / sgid / gid と一致すれば `ok` へ飛び、324 行の `ptrace_has_cap(tcred->user_ns, mode)` を評価しない。rootless で pod の root が host の同じ uid に写る構成では一致する
+   - 窓の間は dumpable のため 341〜344 行（`get_dumpable(mm) != SUID_DUMP_USER` かつ `!ptrace_has_cap(mm->user_ns, mode)` で `-EPERM`）も素通りし、残るのは 346 行の `security_ptrace_access_check` だけになる
+   - `security/commoncap.c` の `cap_ptrace_access_check`（135〜157 行）は、呼び出し側（コンテナ内のプロセス）と対象（helper）の `user_ns` が同じで、対象の `cap_permitted` が呼び出し側の能力の部分集合なら許可し（148〜150 行）、そうでなければ対象の `user_ns` での `CAP_SYS_PTRACE` を要する（151 行）。helper の状態ごとの結論: `setns(user)` の前は userns が異なり初期 userns での `CAP_SYS_PTRACE` が要る（拒否）。`setns(user)` の後で capset の前は pod の userns で全 capability を持つため部分集合にならず、pod の userns での `CAP_SYS_PTRACE` が要る（OCI 既定に無く拒否）。`drop_all_capabilities` の後は `cap_permitted` が空のため同じ userns なら部分集合が成り立ち、許可される
+   - 結論: 「OCI 既定に `CAP_SYS_PTRACE` も無い」は capset の前までしか効かない補助の根拠で、capset の後から non-dumpable までの短い区間では資格情報・能力の検査は障壁にならない。この区間の障壁は 2 の pid の可視性だけである
+2. pid の名指し（到達できない。無条件の根拠）
+   - helper は user と net にしか `setns` しないため plugin-cri と同じ host の pid namespace にいる。コンテナは pid の `POD` / `CONTAINER` のいずれでもコンテナごとの新しい pid namespace（path なし）になり、`NODE` / `TARGET` は `UNIMPLEMENTED`（`crates/cri/src/bundle/spec.rs`）
+   - `alloc_pid`（`kernel/pid.c` 166 行）は pid 番号を 194 行の `for (i = ns->level; i >= 0; i--)` で自分の pid namespace と祖先にだけ割り当てる。子の pid namespace には helper の番号が無い
+   - `ptrace(2)` の対象は 1269 行の `find_get_task_by_vpid(pid)`、`pidfd_open` は 640 行の `find_get_pid` で解決する。どちらも `find_vpid`（`kernel/pid.c` 324〜327 行）で `task_active_pid_ns(current)` を引くため、コンテナからは `ESRCH` になる
+   - `/proc/<pid>` は `proc_pid_lookup`（`fs/proc/base.c` 3501 行）が procfs の mount 時の pid namespace（`fs/proc/root.c` 252 行）で解決する（3514〜3516 行）。コンテナの procfs は新しい pid namespace の PID 1 が載せ（`crates/core/src/exec.rs`）、コンテナ内からは seccomp の mount 拒否と `CAP_SYS_ADMIN` の除去で新たに載せられない。host の `/proc` は疑似 FS を bind の元にする指定の拒否（#2098。`crates/core/src/exec/bind_mounts.rs`）で持ち込めない
+   - helper の channel は plugin-cri との socketpair だけで、fd・pidfd をコンテナ側から受け取る経路は無い
+   - 結論: 到達できない。再評価条件は pid の共有（#2903）・pid の `NODE` の受理・疑似 FS の bind 拒否の緩和・コンテナ内の mount 拒否の緩和
+3. non-dumpable の後の能力検査（同じ uid でも開けない）
+   - `mm->user_ns` は `mm_alloc` → `mm_init(mm, current, current_user_ns())`（`kernel/fork.c` 1336 行）で exec 時の userns に決まり（`fs/exec.c` 383 行の `bprm_mm_init`）、`setns` は cred だけを変え `mm` に触らない（`kernel/user_namespace.c` の `userns_install`、1364 行の `set_cred_user_ns`）。helper の `mm->user_ns` は初期 userns のまま
+   - したがって 341〜344 行は初期 userns での `CAP_SYS_PTRACE` を要し、pod のコンテナにも host の同じ uid の非特権プロセスにも無い。host 側の同じ uid は窓の間に helper へ届いても、pod の userns の所有者として初めから全 capability を持つ plugin-cri 自身を同じ uid で観測できるため権限は上がらない
+
+全体の結論: 窓には到達できる主体がいない（主因は 2）。PDEATHSIG は上の条件では `setns(user)` で消えない（dumpable が変わらない）が、helper は多層防御として再武装し確認している。窓そのものを閉じる多層防御の案として `set_non_dumpable` を `setns` の前（helper の起動直後）へ移す案があるが、本変更は文書のみのためコードは変えず、別 issue で追跡する（保持役と異なり `/proc/self/ns` の自分自身の参照は `kernel/ptrace.c` 298〜299 行の `same_thread_group` で許可されるため影響しない見込み）。
 
 ### 期限の一覧（REPAIR-5）
 

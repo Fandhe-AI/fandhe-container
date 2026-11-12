@@ -2546,8 +2546,9 @@ jobs:
       # CRI の Exec 用 stream-exec helper の本番の経路（制御チャネルの kind 6 / 7 → 実コマンド）を rootless の稼働中コンテナで通す。
       # 試験自身が `systemd-run --user --scope` で `--scenario` を起動するため、試験バイナリは外側を包まず scope を作らない補助で
       # 期限だけ持つ。helper は試験バイナリ自身の再実行のため supervisor の bin は要らない。範囲写像は使わない。
-      # 新しいジョブ・check-run・sudo・permissions は増やさない。成功行は 11 行
-      # （#4416 で tty を追加: `--tty` の helper が Started・PtyMaster・Spawned の順に返し、
+      # 新しいジョブ・check-run・sudo・permissions は増やさない。成功行は 12 行
+      # （#3808 で descendant_reclaim を追加: コマンドの子孫〔PDEATHSIG が届かない〕と exec 子 cgroup が、helper の SIGKILL の後に
+      # ガードの回収で期限内に消えること。経過 ms は情報行 `descendant_reclaim_ms=`。#4416 で tty を追加: `--tty` の helper が Started・PtyMaster・Spawned の順に返し、
       # master 経由の往復・コンテナの devpts の制御端末・resize 後の端末サイズ 30 100 が一致すること。#4167 で requester_killed を追加: 要求元を SIGKILL して
       # helper が 2 秒以内に終わり、exec のコマンドが残らないこと。経過 ms・カーネル版は情報行 `stream_exec_real: info` で出る。
       # #4327 で mask_mismatch・stdio_kind を追加: mask 不一致・fd 種別不正の拒否の診断行〔段名・分類・errno〕と exec が起きないこと）。
@@ -2578,7 +2579,7 @@ jobs:
             "${SER_BIN}" --ignored
           scripts/check-success-lines.sh --name stream_exec_real \
             --src crates/supervisor/tests/stream_exec_real.rs --log "${log}" \
-            --select '^stream_exec_real: (scenario=|real stream-exec helper ran)' --min 11 \
+            --select '^stream_exec_real: (scenario=|real stream-exec helper ran)' --min 12 \
             --forbid 'stream_exec_real: ignored' --forbid 'not verified' --forbid 'not applicable' \
             --forbid 'skipped' --forbid 'FAILED' --forbid 'PRECONDITION FAILED' --forbid 'root=true' --summary
 

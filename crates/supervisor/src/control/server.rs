@@ -199,7 +199,7 @@ pub fn serve_connection_with_guards(
         return;
     }
     let started = Instant::now();
-    let (reason, op) = handle_request(stream, slot, config, guards);
+    let (reason, op) = handle_request(stream, peer.pid, slot, config, guards);
     let ok = reason == ControlReason::Ok;
     match op {
         RequestOp::ExitWatch => observer.record_exit_watch(ok, started.elapsed()),
@@ -213,6 +213,7 @@ pub fn serve_connection_with_guards(
 /// （`Ok` が成功。応答を書けなかった場合も処理結果を返す。種類は計測の操作名を分けるため）。
 fn handle_request(
     mut stream: UnixStream,
+    peer_pid: u32,
     slot: &SignalSlot,
     config: &ServeConfig,
     guards: Option<&Arc<ExecGuardPool>>,
@@ -245,7 +246,7 @@ fn handle_request(
         }
         Ok(RequestHeader::ExecHandover) => {
             return (
-                handle_exec_handover(stream, slot, read_deadline, guards),
+                handle_exec_handover(stream, peer_pid, slot, read_deadline, guards),
                 RequestOp::Exec,
             );
         }
@@ -356,6 +357,7 @@ fn handle_cancel_restart(
 /// シグナルも送らない）。成功は `Response(Ok)` と pidfd 1 本を 1 回の `sendmsg` で送り、拒否は fd なしの通常の応答。
 fn handle_exec_handover(
     mut stream: UnixStream,
+    peer_pid: u32,
     slot: &SignalSlot,
     read_deadline: Instant,
     guards: Option<&Arc<ExecGuardPool>>,
@@ -392,7 +394,7 @@ fn handle_exec_handover(
     let reason = respond_with_fd(&mut stream, pidfd.as_fd(), deadline);
     if reason == ControlReason::Ok {
         // 接続を閉じずにガードへ預ける。以後の通知・切断の監視は専用スレッドが行い、accept ループは先へ進む。
-        guard.start(stream);
+        guard.start(stream, peer_pid);
     }
     reason
 }

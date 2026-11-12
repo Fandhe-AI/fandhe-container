@@ -11,9 +11,8 @@ use std::time::{Duration, Instant};
 
 use super::READY_TIMEOUT;
 use super::frame::{FRAME_LEN, HolderFrame, HolderMessage, NsIdentity};
-use super::holder::classify;
 use crate::error::{NetError, NetErrorCode};
-use crate::netns_helper::{RecvError, fd_identity, recv_before_deadline};
+use crate::netns_helper::{RecvError, classify, fd_identity, recv_before_deadline};
 use crate::sys::holder as sysh;
 use crate::sys::{Deadline, SysError};
 

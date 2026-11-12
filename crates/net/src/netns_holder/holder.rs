@@ -17,7 +17,7 @@ use super::{FDS_RECV_TIMEOUT, NETNS_HOLDER_SUBCOMMAND};
 use crate::error::NetErrorCode;
 use crate::netns_helper as helper;
 use crate::sys::holder as sysh;
-use crate::sys::{self, Deadline, SysError};
+use crate::sys::{Deadline, SysError};
 
 /// 失敗の分類と固定の英文（パス・入力値を含めない。12.9・ERR-1）。
 struct Fail {
@@ -31,24 +31,8 @@ impl Fail {
     }
 }
 
-/// errno の分類（12.9）。`setns` の `EPERM` は PermissionDenied、`EINVAL`（型違い・自身の userns を含む）と
-/// ソケットでない stdin は FailedPrecondition。
-pub(super) fn classify(e: SysError) -> NetErrorCode {
-    match e {
-        SysError::Unsupported => NetErrorCode::Unimplemented,
-        SysError::Os(n) if n == sys::EPERM || n == sys::EACCES => NetErrorCode::PermissionDenied,
-        SysError::Os(n) if n == sys::EINVAL || n == sysh::ENOTSOCK || n == sysh::EPIPE => {
-            NetErrorCode::FailedPrecondition
-        }
-        SysError::Os(n) if n == sys::EMFILE || n == sys::ENFILE || n == sys::ENOMEM => {
-            NetErrorCode::ResourceExhausted
-        }
-        _ => NetErrorCode::Internal,
-    }
-}
-
 fn sys_fail(e: SysError, message: &'static str) -> Fail {
-    Fail::new(classify(e), message)
+    Fail::new(helper::classify(e), message)
 }
 
 /// 失敗行を stderr へ出す。読み手が止まって pipe が満杯でも終了を妨げないよう、書き込みは別スレッドで行い
@@ -250,7 +234,7 @@ fn wait_for_stop(fd: BorrowedFd<'_>) -> Result<(), Fail> {
 pub(super) fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
     // 継承 fd（3 以上）を最初に閉じる。dumpable な holder に残さない（SEC-1）。閉じられなければ起動を拒否する。
     if let Err(e) = sysh::close_inherited_fds() {
-        fail_line(classify(e), "cannot close inherited descriptors");
+        fail_line(helper::classify(e), "cannot close inherited descriptors");
         return ExitCode::from(1);
     }
     if args.count() != 0 {
@@ -284,33 +268,5 @@ pub(super) fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
             fail_line(f.code, f.message);
             ExitCode::from(1)
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 12.9: errno の分類（具体値）。
-    #[test]
-    fn classify_maps_errno_to_codes() {
-        assert_eq!(
-            classify(SysError::Os(sys::EPERM)),
-            NetErrorCode::PermissionDenied
-        );
-        assert_eq!(
-            classify(SysError::Os(sys::EINVAL)),
-            NetErrorCode::FailedPrecondition
-        );
-        assert_eq!(
-            classify(SysError::Os(sysh::ENOTSOCK)),
-            NetErrorCode::FailedPrecondition
-        );
-        assert_eq!(
-            classify(SysError::Os(sys::EMFILE)),
-            NetErrorCode::ResourceExhausted
-        );
-        assert_eq!(classify(SysError::Os(sys::ENOENT)), NetErrorCode::Internal);
-        assert_eq!(classify(SysError::Unsupported), NetErrorCode::Unimplemented);
     }
 }

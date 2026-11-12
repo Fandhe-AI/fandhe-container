@@ -77,10 +77,67 @@
 
 ## 範囲外
 
-- pid の共有（`shareProcessNamespace`。`Pid1Target` の見直しが要る）
-- `/dev/shm` の共有、uts の共有、`NamespaceMode::TARGET`
+- pid の共有（`shareProcessNamespace`）・`/dev/shm` の共有・uts の共有・`NamespaceMode::TARGET`: 下の「pid・uts・/dev/shm の共有と TARGET（#2903）」で設計した。uts は実装単位 U1〜U5 を起票済み。pid・`TARGET`・`/dev/shm` はオーナー判断待ち（#4607）で、判断が出るまで `UNIMPLEMENTED`（`/dev/shm` は共有しない現状のまま）
 - rootful の pod netns（#2241）
 - 再起動をまたぐ sandbox の再採用（TASK-59。設計は [cri-record-readoption.md](cri-record-readoption.md)・#2902）
+
+## pid・uts・/dev/shm の共有と TARGET（#2903）
+
+保持役（user → ipc → net）の上で、残り 4 項目をどう受けるかの設計。コードは変えない。ビヘイビア: CRI-2・CORE-3・SEC-5・SEC-1。Agent が決められない点は末尾の O1〜O6（人間担当 #4607）。
+
+### uts の共有（受ける）
+
+- 保持役が net の後に `unshare(CLONE_NEWUTS)` し、検証済みの sandbox の hostname で `sethostname` してから READY を返す。hostname は argv で渡し、cri の `check_hostname` と同じ規則で保持役の側でも上限つきに再検査する
+- core の `NamespaceJoin` は uts を「user＋ipc の組に足す形」でだけ受ける。所有する userns が join する user と同じであることを照合する。`setns` の順は user → ipc → net → uts → 残りの `unshare`
+- uts の path と config の `hostname` の併用は `InvalidArgument`（pod 共有の uts をコンテナの起動が書き換えないため。fail-closed）。cri は join するとき hostname を出さない
+- cri は保持役がいて ipc を join するとき常に uts の path を出す（containerd は pod 内を常に共有）。network が `NODE` の pod でも保持役の uts を共有する。containerd との差: ホストの uts ではない（rootless では init userns 所有の uts へ入れないため）
+- `kernel.hostname`・`kernel.domainname` の sysctl は `UNIMPLEMENTED` のまま（pod 共有の uts をコンテナから書き換える経路になるため）
+- 攻撃面: コンテナは既定で `CAP_SYS_ADMIN` を持たず、seccomp が `setns`・`unshare` を禁じる。共有で増える面は無い
+- 実装単位: U1〜U5（下の表）
+
+### pid の共有（方式を設計。受けるかは O1・オーナー判断待ち）
+
+現状は pid が `POD`／`CONTAINER` のどちらでもコンテナごとの新しい pid namespace で、`NODE` は `UNIMPLEMENTED`。core は pid の path を `Unimplemented` にしている。理由は、init が PID 1 である証跡（`check_establish_preconditions`・`Pid1Target`・`reapply` の pid ns 照合）と、「init の終了で pid ns ごと回収される」という前提が共有と両立しないため。
+
+- pod の PID 1: 保持役が段 2 で `unshare(CLONE_NEWPID)` の後に 1 回だけ fork した子 pod-init。単一スレッド・capability なし・non-dumpable で孤児の回収だけを行い、root は空の tmpfs へ `pivot_root` する（mount ns は保持役が pod の userns で作る。`/dev/shm` の案 A と共用）。pod-init が死ぬとその pid ns では fork できなくなる想定のため、保持役は pod-init を監視して死んだら終了し、plugin-cri は `SANDBOX_NOTREADY` にする（fail-closed）。カーネルの挙動（`unshare` 後の最初の fork が init になること、init の死後の fork 失敗）は Linux v6.12 の一次情報で確かめる前提で、本節の時点では未検証の見込み
+- パス: 保持役の pid からだけ `/proc/<holder>/ns/pid_for_children` を作る（#2776 の契約）。READY に pid ns の素性を載せ、plugin-cri が照合する
+- core の join の検査: pid は user＋ipc の組に足す形でだけ受ける。`NS_GET_NSTYPE` が `CLONE_NEWPID`、所有 userns が join する user と同じ、`NS_GET_PARENT` が呼び出し側の pid ns。`setns(pid)` は中間プロセスで行い、効くのは以後に fork した init だけ
+- PID 1 の証跡: 「joined pid ns の init」の種別を足す。`getpid() != 1` を許すのは、`/proc/thread-self/ns/pid` が launch で固定した pod の pid ns の素性と一致するときだけ。初期 pid ns でないこと・単一スレッドの検査は保つ。`check_evidence` も同じ素性で照合する
+- `Pid1Target`（exec・healthcheck）: pid を共有するコンテナでは `NSpid` の末尾が 1 でない対象を受ける。ただし launch pidfd の経路（#1461）で、記録した pod の pid ns の素性と一致するときだけ。記録 pid から開く縮退経路は拒否し、監査の語彙を足す（SEC-4）
+- 停止と終了: init が終了しても子孫は pod-init へ付け替わって残るため、init の終了時と停止時にコンテナの cgroup へ `cgroup.kill` を書く（O4）。containerd の shim が pid ns 共有時に init の終了で全プロセスを止める挙動に当たる見込みだが、containerd v2.1.0 の該当箇所は未検証
+- containerd との差: PID 1 はコンテナではない（rootfs・seccomp・cgroup の一式を持たない。CORE-7〜9）。兄弟コンテナの `/proc/<pid>/root`・`environ`・`fd` は Landlock の ptrace の境界で開けない（k8s では見える）。同じ uid の signal は届く。pod-init の `/proc/1/root` は空の root
+- 既定値: CRI の enum の 0 は `POD`。sandbox の pid が `POD`（未指定を含む）のときだけ保持役が pid ns を作る。食い違いは O3
+
+### `NamespaceMode::TARGET`
+
+- pid の `TARGET`（方式を設計。受けるかは O5）: 対象コンテナの init の pid ns へ入る。保持役の「回収しないことで pid を固定する」保証は対象に及ばないため、core が状態ストアから `target_id` を解決し、supervisor の launch pidfd（#2626 の制御チャネル kind 6・`SCM_RIGHTS`）で対象を固定して未終了を確かめ、ns の fd を固定する。CRI の文字列からパスを作らない。証跡は「joined pid ns の init」を流用する。cri は同じ pod であること・対象の pid が `CONTAINER` であること・対象が存在することを検証する。対象の init が終了すると pid ns ごと止まる（k8s と同じ）
+- ipc・network・userns の `TARGET` は `UNIMPLEMENTED` のまま: kubelet が送らない（proto の注記は pid だけ `TARGET` を送る）、userns は proto 上 `POD` と `NODE` だけ、network と ipc は core が単独の join を受けない
+
+### `/dev/shm` の共有（方式の比較。採否は O6）
+
+- 案 A（推奨候補）: 保持役が pod の userns で mount ns を作り tmpfs（64 MiB・`nosuid,nodev,noexec,mode=1777`）を載せる。コンテナの init は `pivot_root` の前に保持役の mnt ns の fd へ `setns` して `open_tree(OPEN_TREE_CLONE)` で複製を取り、自分の mnt ns に戻って `move_mount` で rootfs の `/dev/shm` に載せる。カーネルの条件（`may_copy_tree`・anon ns の `move_mount`・`mntns_install` の権限）の一次情報と実機の PoC が前提で、現時点は未検証
+- 案 B: plugin-cri の状態ルート下の pod ごとのディレクトリを bind する。簡単だがサイズ上限が無く、利用者のセッションの tmpfs を埋める DoS になる
+- 案 C: 共有しない（現状）。SysV IPC と mqueue は共有される
+- 採否が決まるまで、cri-config-acceptance.md の「既知の差」に現状を明記したままにする
+
+### オーナー確認事項（#4607）
+
+| 記号 | 確認事項 | 推奨 |
+| ---- | -------- | ---- |
+| O1 | pid の共有を受けるか（可視性・同じ uid の signal） | 受ける。Landlock による遮断は差として明記 |
+| O2 | pod の PID 1 の実体 | 保持役の子 pod-init（pause コンテナは #2838 で却下済み） |
+| O3 | pid の既定値と食い違い（sandbox が `CONTAINER`・コンテナが `POD`） | コンテナごとの新しい ns にし差として明記。代案は `UNIMPLEMENTED` |
+| O4 | init 終了時の kill-all を既定にするか | 既定にする |
+| O5 | pid の `TARGET` を受けるか。対象の固定手段 | launch pidfd の経路だけ。縮退経路は拒否 |
+| O6 | `/dev/shm` の方式（A / B / C）と既定サイズ | A（PoC が通れば）、64 MiB |
+
+### セキュリティ上の要点
+
+- パスは自 sandbox の保持役の pid からだけ作る。`TARGET` は状態ストアと launch pidfd で固定する
+- ns は 1 回だけ開いて fd に固定し、素性を READY と launch の記録で照合する（TOCTOU）
+- pod-init は空の root・capability なし・non-dumpable。兄弟と pod-init の `/proc/<pid>/root` を開けないことを実機試験で必須にする
+- pid 共有は「init の終了で pid ns ごと回収される」前提を崩すため、縮退経路の拒否と kill-all を必須にする。判断が出るまでは `UNIMPLEMENTED` で fail-closed（REPAIR-3）
+- hostname は cri と保持役の両方で上限つきに検査し、エラー文言は固定文言にする（REPAIR-4）
 
 ## PortForward との関係（#3766）
 
@@ -135,7 +192,7 @@ plugin-cri の `ProductionPodHolder`（`crates/plugin-cri/src/pod_holder.rs`）�
 
 あわせて readopt の不具合を直した（H4 の残り）: 保持役の注入下では起動の前に `pending=1`（`network_pending=0`）を書くため、クラッシュ後の再採用が `network_owned=true` に倒すと、pod network provider を差さない本番で Stop・Remove が回収待ちから抜けられなくなる。`network_owned` は `network_pending` だけから導く（`pending_unresolved` には従来どおり数える）。R11（#2940）は #2877 に依存しており循環するため、ここで直した。
 
-未実装（REPAIR-3）: 保持役の pid から `PodNamespacePaths` を作って bundle へ渡す配線（H5・#2876）は配線済みで、POD のコンテナは user・ipc に join する。保持役の netns の bundle への受け渡しも H8（#2878）で実装済み。未実装は、素性の永続化と再起動後の再採用（R11・#2940）・pod ネットワークの本番 provider（H10・#2879）・pid の共有（#2903）。
+未実装（REPAIR-3）: 保持役の pid から `PodNamespacePaths` を作って bundle へ渡す配線（H5・#2876）は配線済みで、POD のコンテナは user・ipc に join する。保持役の netns の bundle への受け渡しも H8（#2878）で実装済み。未実装は、素性の永続化と再起動後の再採用（R11・#2940）・pod ネットワークの本番 provider（H10・#2879）・pid の共有・`TARGET`・`/dev/shm` の共有（設計は下の #2903 の節、判断待ちは #4607）と uts の共有（U1〜U5。#4608〜#4612）。
 
 ## 実装単位
 
@@ -156,3 +213,18 @@ plugin-cri の `ProductionPodHolder`（`crates/plugin-cri/src/pod_holder.rs`）�
 | H11 | #2880 | 実機確認（人間担当） | 人間 | H6・H8 |
 
 rootful の netns は #2241 のオーナー判断に紐づけ、新規起票しない。
+
+### 共有拡張の単位（#2903）
+
+uts は #4334 の配下に起票済み。pid・`TARGET`・`/dev/shm` はオーナー判断（#4607）で形が変わりうるため未起票で、判断後に #4334 の配下へ起票する。
+
+| 記号 | issue | 内容 | 担当 | 依存 |
+| ---- | ----- | ---- | ---- | ---- |
+| U1 | #4608 | core: 保持役の namespace 確立に uts を足す | runtime-builder | なし |
+| U2 | #4610 | supervisor: `pod-holder` の hostname と READY の uts の素性 | runtime-builder | U1 |
+| U3 | #4611 | plugin-cri: hostname の受け渡しと uts の素性の照合 | oci-cri-builder | U2 |
+| U4 | #4609 | core: `NamespaceJoin` の uts | runtime-builder | なし |
+| U5 | #4612 | cri: uts の path と hostname の抑止・実機試験の段 | oci-cri-builder | U3・U4 |
+| 判断 | #4607 | pid・`TARGET`・`/dev/shm` の受け入れ判断（O1〜O6。人間担当、#816 の配下） | 人間 | なし |
+
+判断後に起票する単位（未起票）: P1 core: join の pid の検査／P2 core: joined pid ns の init の証跡／P3 core: `Pid1Target`・reapply／P4 supervisor: init 終了時の `cgroup.kill`／M1 core＋supervisor: 保持役の mount ns と空の root／P5 core＋supervisor: pod-init と pid ns／P6 plugin-cri: pid の素性の照合と NOTREADY／P7 cri: bundle の pid の path と既定値／P8 ci: 実機試験／T1 core: target の pid ns の解決／T2 cri: `target_id` の検証／S0: 案 A の一次情報と PoC／S1: 保持役の shm の tmpfs／S2 core: `setns` の往復による clone と載せる処理／S3 cri: 受け渡し。

@@ -421,9 +421,9 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 1. D7 の containerd との差（黙って無視せず断る）: 承認。再評価条件は実機確認（#3730）で `kubectl attach -i` の使い勝手に問題が出たとき
 2. tap の購読者の上限 8: 承認
 3. tty の `stdin_once` で閉じないこと: 承認（containerd のコードの挙動に合わせる）
-4. tty の CRI ログで LF の無い出力が遅れて出ること、64 KiB 超の行の切り捨て: CRI ログの部分行 `P` として追跡する（#4574）
+4. tty の CRI ログで LF の無い出力が遅れて出ること、64 KiB 超の行の切り捨て: CRI ログの部分行 `P` として追跡する（方式は [cri-log-partial-lines.md](cri-log-partial-lines.md)・#4574）
 
-**範囲外**: CLI の `create -i -t`（CLI-1）、shim v2 の terminal、CRI ログの部分行 `P`（#4116 の項目 8 で追跡すると決定。#4574）。
+**範囲外**: CLI の `create -i -t`（CLI-1）、shim v2 の terminal、CRI ログの部分行 `P`（#4116 の項目 8 で追跡すると決定・[cri-log-partial-lines.md](cri-log-partial-lines.md)・#4574）。
 
 **子 issue（いずれも #3765 の sub-issue、2h 以下）**
 

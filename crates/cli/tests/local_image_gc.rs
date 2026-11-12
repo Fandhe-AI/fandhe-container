@@ -135,8 +135,8 @@ mod linux {
     /// 状態・ハンドラ登録の待ちの上限（REPAIR-5）。
     const STATE_TIMEOUT: Duration = Duration::from_secs(30);
     const POLL: Duration = Duration::from_millis(20);
-    /// プローブの寿命の上限。これを過ぎたら終了コード 8 で終わる（寿命切れを停止と取り違えないための目印）。
-    const PROBE_LIFETIME: Duration = Duration::from_secs(60);
+    /// プローブの寿命の上限（シナリオ全体の最悪所要時間より十分長く取る。短いと高負荷 runner で A の probe が先に終了コード 8 で抜け、stop の 43 を取り違える）。
+    const PROBE_LIFETIME: Duration = Duration::from_secs(600);
     /// `/proc/<pid>/status` の `SigCgt` で SIGTERM（15）に当たるビット（1 << 14）。
     const SIGTERM_CAUGHT_BIT: u64 = 1 << 14;
 
@@ -525,12 +525,13 @@ mod linux {
         )
         .map_err(|e| format!("composition: {e:?}"))?;
         let store = ImageStore::open(images).map_err(|e| format!("open store: {e:?}"))?;
-        store
-            .lock()
-            .map_err(|e| format!("lock: {e:?}"))?
+        // 登録と tag は同じ排他区間（ガード）で行う。別々に lock すると 2 回目の lock が
+        // 永続化済みの在庫を読み直し、未保存の登録が見えず NotFound になる。
+        let mut guard = store.lock().map_err(|e| format!("lock: {e:?}"))?;
+        guard
             .register_manifest(digest(&fx.manifest_hex)?, comp)
             .map_err(|e| format!("register: {e:?}"))?;
-        store
+        guard
             .tag_image(
                 &ImageTagSource::Manifest(digest(&fx.manifest_hex)?),
                 tag_key(tag)?,

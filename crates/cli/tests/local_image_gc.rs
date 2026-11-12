@@ -14,13 +14,21 @@
 //!   タグ・コンテナ参照・blob は変わらない。
 //! - B: stopped のコンテナだけが参照するイメージへの `--force` なしの `image rm` は拒否される。`--force` ありはタグだけを外し
 //!   （`untagged` の 1 行のみ）、config / layer の blob・在庫の manifest・コンテナ参照は残る。
-//! - C（補助）: タグの外れた digest から新しいコンテナを create → start できる。
+//! - D（#664・TASK-184.2）: 参照するコンテナが無いイメージは `--force` なしの `image rm` で消え、manifest の在庫・config・
+//!   非共有レイヤーの blob もディスクから消える。
+//! - E（#664）: タグなしで stopped / created のコンテナだけが参照するイメージと blob は `image prune` の後も残り、
+//!   タグもコンテナ参照も無い別のイメージは prune で消える（空振りでないことの対照）。
+//! - C（補助）: タグの外れた digest から prune の前に create だけしたコンテナを、prune の後に start できる。
+//! - F（#664）: 参照するコンテナを delete すると、次の prune でタグなしのイメージが消え、タグ付きは残る。
+//!
+//! `image prune` は CLI に未配線（#2384）のため、E・F は oci の公開 API（`execute_image_prune`）をプロセス内で呼ぶ。
+//! 配線後は CLI 経由へ切り替える。共有レイヤーの保持と `system df` は #665（TASK-184.3）の範囲。
 //!
 //! # 未充足の受け入れ条件（要オーナー判断）
 //! 「`--force` 後に参照元の停止中コンテナを `start` できる」は現行の契約では観測できない。core の `start` は `Created` 以外を
 //! `FAILED_PRECONDITION` で拒否し、CLI に停止したコンテナを再起動する経路が無い。本試験はこの拒否を期待値として固定しない
 //! （B のコンテナには `start` を送らない）。C は残った manifest が参照の登録と起動に使えることの観測で、停止したコンテナ自身の
-//! 再起動ではない。また `create --image` は展開器なしで、`start` はストアの blob を読まない（#2377）ため、C の成否は
+//! 再起動ではない（#664 の「prune 後に停止中コンテナ自身を start できる」も同じ理由で未充足）。また `create --image` は展開器なしで、`start` はストアの blob を読まない（#2377）ため、C の成否は
 //! レイヤーが残った証拠にならない。レイヤーの残存は blob ファイルの大きさで直接照合する。
 //!
 //! # 必要環境
@@ -122,7 +130,7 @@ mod linux {
     use fandhe_container_core::state_store::{FileStateStore, StateRoot};
     use fandhe_container_core::traits::{ContainerId, GetStateRequest, StateStore};
     use fandhe_container_oci::image_management::{
-        ImageStore, ImageTagSource, ManifestComposition, TagKey,
+        ImagePruneOutcome, ImageStore, ImageTagSource, ManifestComposition, TagKey,
     };
     use fandhe_container_oci::reference::{Digest, ImageReference, Reference};
 
@@ -143,6 +151,8 @@ mod linux {
     /// 在庫のタグ（ダミーのレジストリ名。資格情報は含まない）。
     const TAG_RUN: &str = "registry.example/fandhe/gc-run:v1";
     const TAG_STOP: &str = "registry.example/fandhe/gc-stopped:v1";
+    /// 無参照（参照するコンテナが無い）イメージのタグ。シナリオ D が `--force` なしの `image rm` で消す。
+    const TAG_ORPHAN: &str = "registry.example/fandhe/gc-orphan:v1";
     /// `image ls` の REPOSITORY 列と TAG 列。
     const LS_RUN: &str = "registry.example/fandhe/gc-run\tv1";
     const LS_STOP: &str = "registry.example/fandhe/gc-stopped\tv1";
@@ -216,7 +226,19 @@ mod linux {
                     "local_image_gc: image rm --force on an image used only by a stopped container removed only the tag; config and layer blobs, the manifest entry and the container reference were kept"
                 );
                 println!(
-                    "local_image_gc: a new container created from the untagged manifest digest started; restarting the stopped container itself is out of scope (start accepts only created)"
+                    "local_image_gc: a new container created from the untagged manifest digest started after image prune; restarting the stopped container itself is out of scope (start accepts only created)"
+                );
+                println!(
+                    "local_image_gc: image rm without --force on an image with no referencing container deleted the manifest entry and its config and layer blobs"
+                );
+                println!(
+                    "local_image_gc: image prune kept the untagged image referenced only by stopped or created containers; config and layer blobs, the manifest entry and both container references were kept"
+                );
+                println!(
+                    "local_image_gc: image prune removed the untagged image with no tag and no container reference and deleted its config and layer blobs"
+                );
+                println!(
+                    "local_image_gc: after the referencing containers were deleted, image prune removed the untagged image and its config and layer blobs"
                 );
                 println!("local_image_gc: scenario ok");
                 ExitCode::SUCCESS
@@ -416,8 +438,8 @@ mod linux {
         let fx_stop = Fixture::new('2', ['d', 'e', 'f'], [11, 21, 31]);
         fs::create_dir(&images).map_err(|e| format!("mkdir images: {e}"))?;
         set_mode(&images, 0o700)?;
-        seed_inventory(&images, &fx_run, TAG_RUN)?;
-        seed_inventory(&images, &fx_stop, TAG_STOP)?;
+        seed_inventory(&images, &fx_run, Some(TAG_RUN))?;
+        seed_inventory(&images, &fx_stop, Some(TAG_STOP))?;
 
         let env = Env {
             cli,
@@ -495,9 +517,121 @@ mod linux {
             &format!("running image changed: {containers:?} {tags:?}"),
         )?;
 
-        // C（補助）: タグの外れた digest から新しいコンテナを作って動かす。停止したコンテナ自身の再起動ではない
-        // （start は Created だけを受ける）。展開器（#2377）が入るまでレイヤーの使用は観測できない。
-        let fresh = launch(&env, &mut cleanup, &id_new, "bundle-new", &fx_stop.digest())?;
+        // D（#664・受け入れ条件 1）: 参照するコンテナが無いイメージは `--force` なしで消え、
+        // manifest・config・非共有レイヤーもディスクから消える。
+        let fx_orphan = Fixture::new('3', ['5', '6', '7'], [12, 22, 32]);
+        seed_inventory(&env.images, &fx_orphan, Some(TAG_ORPHAN))?;
+        expect_blobs(&env, &fx_orphan)?;
+        let out = run_cli(
+            &env.cli,
+            &[
+                "--root",
+                &env.root_s,
+                "image",
+                "rm",
+                "--image-root",
+                &env.images_s,
+                TAG_ORPHAN,
+            ],
+            CLI_TIMEOUT,
+        )?;
+        if out.code != Some(0) || !out.stderr.is_empty() {
+            return Err(format!(
+                "image rm (orphan): want exit 0, got {:?} stdout={:?} stderr={:?}",
+                out.code, out.stdout, out.stderr
+            ));
+        }
+        // 先頭 2 行は固定順（untagged → deleted）。blob の行の並びは契約に無いため整列して照合する。
+        let mut lines = out.stdout.lines();
+        let want_head = [
+            format!("untagged\t{TAG_ORPHAN}"),
+            format!("deleted\t{}", fx_orphan.digest()),
+        ];
+        let got_head: Vec<&str> = lines.by_ref().take(2).collect();
+        expect(
+            got_head == want_head,
+            &format!("image rm (orphan) head lines: {got_head:?}"),
+        )?;
+        let mut got_blobs: Vec<String> = lines.map(str::to_string).collect();
+        got_blobs.sort();
+        let want_blobs: Vec<String> = sorted_blob_digests(&fx_orphan)
+            .iter()
+            .map(|d| format!("deleted-blob\t{d}"))
+            .collect();
+        expect(
+            got_blobs == want_blobs,
+            &format!("image rm (orphan) blob lines: want {want_blobs:?}, got {got_blobs:?}"),
+        )?;
+        expect_blobs_gone(&env, &fx_orphan)?;
+        expect(
+            !manifest_in_inventory(&env, &fx_orphan)?,
+            "orphan manifest entry is still in the inventory",
+        )?;
+        let want_ls = format!("{LS_HEADER}{want_run_row}{want_dangling}");
+        let ls = image_ls(&env)?;
+        expect(
+            ls == want_ls,
+            &format!("image ls after removing the orphan image: {ls:?}"),
+        )?;
+        expect_blobs(&env, &fx_stop)?;
+        expect_blobs(&env, &fx_run)?;
+
+        // E（#664・受け入れ条件 2）: タグの外れた digest から、prune の前に create だけして Created のまま残す。
+        // 停止中コンテナ自身の再起動は観測できない（start は Created だけを受ける）ため、最も近い観測として
+        // prune の後にこの Created のコンテナを start する。
+        create_container(&env, &mut cleanup, &id_new, "bundle-new", &fx_stop.digest())?;
+        // タグもコンテナ参照も無く、blob も共有しない manifest。prune が空振りでないことを示す。
+        let fx_dangling = Fixture::new('4', ['8', '9', '0'], [13, 23, 33]);
+        seed_inventory(&env.images, &fx_dangling, None)?;
+        let out = prune(&env)?;
+        let got_removed: Vec<String> = out
+            .removed_manifests
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let got_deleted: Vec<String> = out.deleted_blobs.iter().map(ToString::to_string).collect();
+        expect(
+            got_removed == [fx_dangling.digest()]
+                && got_deleted == sorted_blob_digests(&fx_dangling)
+                && out.reclaimed_bytes == fx_dangling.size() as u64
+                && out.absent_blobs.is_empty()
+                && out.kept_shared_blobs.is_empty()
+                && out.kept_leased_blobs.is_empty()
+                && out.undeleted_blobs.is_empty(),
+            &format!("prune outcome: {out:?}"),
+        )?;
+        expect_blobs_gone(&env, &fx_dangling)?;
+        expect(
+            !manifest_in_inventory(&env, &fx_dangling)?,
+            "dangling manifest entry is still in the inventory",
+        )?;
+        // タグなしで stopped / created のコンテナだけが参照するイメージは残る。
+        expect_blobs(&env, &fx_stop)?;
+        expect(
+            manifest_in_inventory(&env, &fx_stop)?,
+            "referenced manifest entry was removed by prune",
+        )?;
+        let (containers, tags) = references(&env, &fx_stop)?;
+        expect(
+            containers.len() == 2
+                && containers
+                    .iter()
+                    .any(|c| c.ends_with(&format!(".{id_stop}")))
+                && containers
+                    .iter()
+                    .any(|c| c.ends_with(&format!(".{id_new}")))
+                && tags.is_empty(),
+            &format!("references after prune: {containers:?} {tags:?}"),
+        )?;
+        expect_unchanged(&env, &fx_run, LS_RUN, &id_run)?;
+        let ls = image_ls(&env)?;
+        expect(
+            ls == want_ls,
+            &format!("image ls after image prune: {ls:?}"),
+        )?;
+        // C（補助）: prune の後に Created のコンテナを start できる。展開器（#2377）が入るまで
+        // start はストアの blob を読まないため、レイヤーの残存は上の blob の大きさで直接照合している。
+        let fresh = start_created(&env, &id_new)?;
         stop_container(&env, &fresh)?;
         delete_container(&env, &mut cleanup, &fresh)?;
 
@@ -505,11 +639,72 @@ mod linux {
         stop_container(&env, &run)?;
         delete_container(&env, &mut cleanup, &run)?;
         delete_container(&env, &mut cleanup, &stopped)?;
+
+        // F: 参照するコンテナが無くなり、タグも無いイメージは次の prune で消える。タグ付きは残る。
+        let out = prune(&env)?;
+        let got_removed: Vec<String> = out
+            .removed_manifests
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let got_deleted: Vec<String> = out.deleted_blobs.iter().map(ToString::to_string).collect();
+        expect(
+            got_removed == [fx_stop.digest()]
+                && got_deleted == sorted_blob_digests(&fx_stop)
+                && out.reclaimed_bytes == fx_stop.size() as u64
+                && out.undeleted_blobs.is_empty(),
+            &format!("second prune outcome: {out:?}"),
+        )?;
+        expect_blobs_gone(&env, &fx_stop)?;
+        expect_blobs(&env, &fx_run)?;
+        let ls = image_ls(&env)?;
+        expect(
+            ls == format!("{LS_HEADER}{want_run_row}"),
+            &format!("image ls after the second prune: {ls:?}"),
+        )?;
         Ok(())
     }
 
-    /// 在庫へ manifest 1 件と blob ファイルを置き、タグを付ける。ストアとガードはこの関数の中で手放す。
-    fn seed_inventory(images: &Path, fx: &Fixture, tag: &str) -> Result<(), String> {
+    /// blob の digest（`sha256:<hex>`）の昇順。prune の `deleted_blobs`（digest の昇順）の期待値に使う。
+    fn sorted_blob_digests(fx: &Fixture) -> Vec<String> {
+        let mut v: Vec<String> = fx.blobs.iter().map(|b| format!("sha256:{}", b.0)).collect();
+        v.sort();
+        v
+    }
+
+    /// 在庫に manifest があるか（永続化された在庫から読む）。
+    fn manifest_in_inventory(env: &Env, fx: &Fixture) -> Result<bool, String> {
+        let store = ImageStore::open(&env.images).map_err(|e| format!("open store: {e:?}"))?;
+        let guard = store.lock().map_err(|e| format!("lock: {e:?}"))?;
+        let want = fx.digest();
+        Ok(guard.manifests().any(|(d, _)| d.to_string() == want))
+    }
+
+    /// blob ファイルが全部ディスクから消えていること（symlink を辿らず、NotFound だけを消えた扱いにする）。
+    fn expect_blobs_gone(env: &Env, fx: &Fixture) -> Result<(), String> {
+        for (name, _) in &fx.blobs {
+            let path = env.images.join("blobs").join("sha256").join(name);
+            match fs::symlink_metadata(&path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("blob {name}: unexpected error: {e}")),
+                Ok(_) => return Err(format!("blob {name} still exists")),
+            }
+        }
+        Ok(())
+    }
+
+    /// 無参照イメージの prune をプロセス内で実行する（CLI に `image prune` は未配線。#2384 で CLI 経由へ切り替える）。
+    /// ストアとガードはこの関数の中で手放す（保持したまま CLI を呼ぶと CLI 側の lock が期限切れになる）。
+    fn prune(env: &Env) -> Result<ImagePruneOutcome, String> {
+        let store = ImageStore::open(&env.images).map_err(|e| format!("open store: {e:?}"))?;
+        let mut guard = store.lock().map_err(|e| format!("lock: {e:?}"))?;
+        guard
+            .execute_image_prune(store.root())
+            .map_err(|e| format!("prune: {e:?}"))
+    }
+
+    /// 在庫へ manifest 1 件と blob ファイルを置き、`tag` があれば付ける（`None` はタグなしの無参照イメージ）。ストアとガードはこの関数の中で手放す。
+    fn seed_inventory(images: &Path, fx: &Fixture, tag: Option<&str>) -> Result<(), String> {
         let blobs = images.join("blobs").join("sha256");
         fs::create_dir_all(&blobs).map_err(|e| format!("mkdir blobs: {e}"))?;
         for (name, len) in &fx.blobs {
@@ -531,12 +726,14 @@ mod linux {
         guard
             .register_manifest(digest(&fx.manifest_hex)?, comp)
             .map_err(|e| format!("register: {e:?}"))?;
-        guard
-            .tag_image(
-                &ImageTagSource::Manifest(digest(&fx.manifest_hex)?),
-                tag_key(tag)?,
-            )
-            .map_err(|e| format!("tag: {e:?}"))?;
+        if let Some(tag) = tag {
+            guard
+                .tag_image(
+                    &ImageTagSource::Manifest(digest(&fx.manifest_hex)?),
+                    tag_key(tag)?,
+                )
+                .map_err(|e| format!("tag: {e:?}"))?;
+        }
         Ok(())
     }
 
@@ -654,6 +851,18 @@ mod linux {
         bundle_name: &str,
         image: &str,
     ) -> Result<Running, String> {
+        create_container(env, cleanup, id_s, bundle_name, image)?;
+        start_created(env, id_s)
+    }
+
+    /// create（`--image`）だけ行い、後始末の対象（`cleanup.live`）に積む。
+    fn create_container(
+        env: &Env,
+        cleanup: &mut Cleanup,
+        id_s: &str,
+        bundle_name: &str,
+        image: &str,
+    ) -> Result<(), String> {
         let bundle = env.work.join(bundle_name);
         make_bundle(&bundle)?;
         let bundle_s = bundle.to_str().ok_or("bundle path is not UTF-8")?;
@@ -675,6 +884,11 @@ mod linux {
         )?;
         expect_ok(&out, "create")?;
         cleanup.live.push(id_s.to_string());
+        Ok(())
+    }
+
+    /// Created のコンテナを start → list が running → SIGTERM のハンドラ登録まで進める。
+    fn start_created(env: &Env, id_s: &str) -> Result<Running, String> {
         let out = run_cli(
             &env.cli,
             &["--root", &env.root_s, "start", id_s],

@@ -20,6 +20,10 @@ fn main() -> std::process::ExitCode {
         Some(a) if a == fandhe_container_net::netns_dial::NETNS_DIAL_SUBCOMMAND => {
             fandhe_container_net::netns_dial::run_netns_dial_main(args)
         }
+        // 試験専用の再入口（#4558）: 本番と同じ本体を実行し、終了前に 3 時点の PR_GET_DUMPABLE を stdout へ 1 行書く。
+        Some(a) if a == "netns-dial-traced" => {
+            fandhe_container_net::netns_dial::test_support::run_netns_dial_traced_main(args)
+        }
         _ => linux::run(),
     }
 }
@@ -274,7 +278,47 @@ mod linux {
             &req,
             &[&user, &net],
             DialErrorCode::JoinFailed,
-        )
+        )?;
+
+        // 起動直後の non-dumpable（#4558・SEC-1）: 同じ失敗の場面を trace 入口で実行し、参加の直前の PR_GET_DUMPABLE が
+        // 0 であること（起動直後に設定済み）を具体値で照合する。参加に届かないので after_join / after_harden は none。
+        // 旧実装（参加後にだけ設定）では before_join=1 になり、ここで落ちる。
+        traced_setns_denied(&req, &user, &net)
+    }
+
+    fn traced_setns_denied(req: &[u8], user: &File, net: &File) -> Result<(), String> {
+        let (parent, child_end) = seqpacket_pair().map_err(|e| e.to_string())?;
+        let mut child = Command::new(exe())
+            .arg("netns-dial-traced")
+            .env_clear()
+            .stdin(Stdio::from(child_end))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("spawn traced helper: {e}"))?;
+        let mut stdout = child.stdout.take().ok_or("stdout")?;
+        let stderr_rx = drain(&mut child);
+        let (tx, out_rx) = mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            let mut s = String::new();
+            let _ = stdout.read_to_string(&mut s);
+            let _ = tx.send(s);
+        });
+        let borrowed = [user.as_fd(), net.as_fd()];
+        send_raw(parent.as_fd(), req, &borrowed).map_err(|e| e.to_string())?;
+        let exit = wait_child(&mut child)?;
+        check(exit == 1, || format!("traced: exit {exit}, want 1"))?;
+        let text = out_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap_or_default();
+        let want = "netns-dial-trace dumpable before_join=0 after_join=none after_harden=none\n";
+        check(text == want, || {
+            format!("traced: stdout {text:?}, want {want:?}")
+        })?;
+        let err = stderr_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap_or_default();
+        check(err.is_empty(), || format!("traced: stderr {err:?}"))
     }
 
     fn wait_child(child: &mut Child) -> Result<i32, String> {

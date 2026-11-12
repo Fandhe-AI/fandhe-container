@@ -7,7 +7,8 @@
 //! 作らない）だけ。stderr は null の契約のため何も書かず、診断は固定語彙の応答 frame だけで返す。
 //! unsafe は持たず、syscall は `crate::sys::holder` の安全なラッパーだけを使う。
 //!
-//! holder（`crate::netns_holder`）との差: (1) 診断を stderr に出さない、(2) 参加後は dumpable を 0 にする、
+//! holder（`crate::netns_holder`）との差: (1) 診断を stderr に出さない、(2) dumpable を起動直後に 0 にし、参加後と
+//! 特権の破棄の後にも 0 であることを確かめる（窓は exec から最初の `PR_SET_DUMPABLE` までに縮む。#4558）、
 //! (3) 副作用の前に argv を検査し、継承 fd の整理は stdin の素性確認の後に行う。親の照合・期限つき受信・ns の識別の取得の本体は
 //! `crate::netns_helper` と共有し（REPAIR-1・#4510）、ここは固定語彙 `DialErrorCode` への写像だけを持つ。
 //!
@@ -15,11 +16,12 @@
 //! | 段 | 失敗 | 応答 | 終了コード |
 //! | -- | ---- | ---- | ---------- |
 //! | argv | 引数が空でない | なし | 2 |
+//! | 起動直後の non-dumpable | prctl の失敗・値が 0 でない | なし（素性を確かめる前なので書かない） | 1 |
 //! | stdin / peer | seqpacket でない・親が作成者でない | なし（素性の知れない相手へ書かない） | 1 |
 //! | 準備 | `close_range` の失敗 | `JoinFailed` | 1 |
 //! | 受信 | 期限切れ・EOF・切り詰め・decode 失敗・kind 違い・fd が 2 本でない | `InvalidRequest` | 1 |
 //! | 前検査 | 2 本が同一 fs 上の別の ns でない | `InvalidRequest` | 1 |
-//! | 参加 | `setns` の失敗・`/proc/self/ns` を開けない | `JoinFailed` | 1 |
+//! | 参加 | `setns` の失敗・`/proc/self/ns` を開けない・参加後に dumpable が 0 でない | `JoinFailed` | 1 |
 //! | 照合 | 参加後の (dev, ino) が受けた fd と違う | `IdentityMismatch` | 1 |
 //! | 特権の破棄 | capset・NNP・PDEATHSIG・non-dumpable の失敗 | `JoinFailed` | 1 |
 //! | connect | 拒否 / 期限切れ / その他（未知は fail-closed で寄せる） | `Refused` / `TimedOut` / `Unreachable` | 1 |
@@ -99,7 +101,9 @@ pub(super) trait Joiner {
     fn harden(&mut self) -> Result<(), DialErrorCode>;
 }
 
-struct RealJoiner;
+/// 本番の [`Joiner`]。試験専用の入口（`test_support`、feature `netns-dial-test-support`）が包んで 3 時点の
+/// dumpable を記録するため `pub(super)` にしている。
+pub(super) struct RealJoiner;
 
 fn identity_of(file: &File) -> Result<(u64, u64), DialErrorCode> {
     helper::fd_identity(file).map_err(|_| DialErrorCode::InvalidRequest)
@@ -120,6 +124,13 @@ impl Joiner for RealJoiner {
             net: observed_identity(helper::JoinedNs::Net)?,
         };
         check_joined_identity(received, observed)?;
+        // 起動直後に 0 にした dumpable が、参加（`commit_creds`）で `suid_dumpable` へ戻っていないことを確かめる。
+        // 現在受ける構成（rootless・保持役が同じ euid で作った userns）では戻らない（v6.12 `kernel/cred.c`
+        // `commit_creds` は euid 等の変更か `!cred_cap_issubset` のときだけ戻す）。戻ったら想定外なので fail-closed。
+        match sysh::get_dumpable() {
+            Ok(0) => {}
+            _ => return Err(DialErrorCode::JoinFailed),
+        }
         drop(user);
         drop(net);
         Ok(())
@@ -135,6 +146,7 @@ impl Joiner for RealJoiner {
             _ => return Err(DialErrorCode::JoinFailed),
         }
         // holder（pasta が /proc を開ける前提で dumpable）と違い、dial helper は同じ uid からの観測を塞ぐ。
+        // 起動直後に設定済みだが、capset の後の最後の層として設定し直して確かめる。
         sysh::set_non_dumpable().map_err(|_| DialErrorCode::JoinFailed)?;
         match sysh::get_dumpable() {
             Ok(0) => Ok(()),
@@ -237,8 +249,19 @@ pub(super) fn serve(
 /// `run_netns_dial_main` の本体（`crate::netns_dial` から委譲される）。終了コードは `Connected` を送れたら 0、
 /// それ以外の失敗は 1、argv の誤りは 2。
 pub(super) fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
+    run_with(args, &mut RealJoiner)
+}
+
+/// [`run`] の本体。`joiner` を差し替えられるのは試験専用の入口（`test_support`）が 3 時点の dumpable を記録するため
+/// （本番は常に [`RealJoiner`]）。dumpable は argv の検査の直後、副作用（PDEATHSIG・stdin の確認・参加）の前に 0 にする。
+/// exec で dumpable は戻るので親側から先に設定することはできず、窓は exec からここまで（#4558・SEC-1）。
+pub(super) fn run_with(args: impl Iterator<Item = OsString>, joiner: &mut impl Joiner) -> ExitCode {
     if let Err(c) = check_args(args) {
         return ExitCode::from(c);
+    }
+    // 素性を確かめる前なので失敗しても応答は書かない。
+    if sysh::set_non_dumpable().is_err() || !matches!(sysh::get_dumpable(), Ok(0)) {
+        return ExitCode::from(1);
     }
     if sysh::set_pdeathsig_sigkill().is_err() {
         return ExitCode::from(1);
@@ -256,7 +279,7 @@ pub(super) fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
     if sysh::close_inherited_fds().is_err() {
         return respond_error(fd, DialErrorCode::JoinFailed).exit_code();
     }
-    serve(fd, REQUEST_RECV_TIMEOUT, &mut RealJoiner).exit_code()
+    serve(fd, REQUEST_RECV_TIMEOUT, joiner).exit_code()
 }
 
 #[cfg(test)]

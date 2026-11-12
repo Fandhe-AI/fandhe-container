@@ -9,6 +9,8 @@
 //!
 //! # 置き場所
 //!
+//! CRI 側の対のアダプタは plugin-cri の `image_refs` にある（#2791。キー導出は共有 fixture
+//! `crates/core/testdata/image_ref_key_cases.txt` で照合する）。
 //! 置き場所のオーナー判断は #2315 で未取得で、既存の依存辺（`cli → oci`・`cli → core`）だけで足りる cli に
 //! 暫定で置いた。判断で別 crate に決まったら、この module をそのまま移せる（外部へ公開する型は無い）。
 //!
@@ -23,8 +25,8 @@
 //! `ref_reconcile` module が担う（契機 A: イメージつき create の core 呼び出し前に同じキー 1 件、契機 B: `image rm` が
 //! 使用中で拒否したとき）。未確定参照の回収の前提「進行中の create が無いこと」は、oci の create ゲート
 //! （`ImageStore::quiesce_container_creates`）で保証する。イメージつき create は `create_with_image` の呼び出し全体を
-//! ゲートの共有（`ImageStore::enter_container_create`）で包む。本アダプタをゲートなしで `create_with_image` に渡す新しい
-//! 呼び出し元（plugin 経由の配線等）を作るときは、同じ規約を守る。
+//! ゲートの共有（`ImageStore::enter_container_create`）で包む。plugin-cri の `CoreLifecycleRuntime::create` も同じ規約でゲートを取る（#2791）。
+//! 本アダプタをゲートなしで `create_with_image` に渡す新しい呼び出し元を作るときは、同じ規約を守る。
 //!
 //! # 参照キーの形式と旧形式の扱い（#2500）
 //!
@@ -346,6 +348,50 @@ impl ContainerImageRefs for StoreImageRefs<'_> {
 // Windows ホストは設計上 `ImageStore` を開けない（#4333）ため、ストアを使う試験とその補助は個別に unix に限る。
 #[cfg(test)]
 mod tests {
+    /// `@rep:<1 文字>:<回数>` を繰り返しに展開する（共有 fixture の表記。plugin-cri の試験と同じ規則）。
+    fn expand_rep(field: &str) -> String {
+        match field.split_once("@rep:") {
+            None => field.to_owned(),
+            Some((head, rest)) => {
+                let (c, tail) = rest.split_once(':').expect("rep char");
+                let digits: String = tail.chars().take_while(char::is_ascii_digit).collect();
+                let n: usize = digits.parse().expect("rep count");
+                let after = &tail[digits.len()..];
+                format!("{head}{}{}", c.repeat(n), expand_rep(after))
+            }
+        }
+    }
+
+    /// OCI-7・CRI-2（#2791）: 参照キーの導出が共有 fixture（plugin-cri の同名の試験と同じ表）の期待値と一致する。
+    /// plugin-cri 側のアダプタと式がずれると、CLI と CRI が互いのコンテナの参照を外せなくなる。
+    #[test]
+    fn oci7_cri2_2791_ref_key_matches_shared_fixture() {
+        let table = include_str!("../../../core/testdata/image_ref_key_cases.txt");
+        let (mut scopes, mut keys, mut anns) = (0, 0, 0);
+        for line in table
+            .lines()
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        {
+            let f: Vec<String> = line.split('\t').map(expand_rep).collect();
+            match f.first().map(String::as_str) {
+                Some("scope") => {
+                    assert_eq!(state_hash(f[1].as_bytes()), f[2], "{line}");
+                    scopes += 1;
+                }
+                Some("key") => {
+                    assert_eq!(ref_key(&f[1], &f[2]), f[3], "{line}");
+                    keys += 1;
+                }
+                Some("annotation") => {
+                    assert_eq!(IMAGE_ROOT_ANNOTATION, f[1], "{line}");
+                    anns += 1;
+                }
+                other => panic!("unknown fixture row {other:?}"),
+            }
+        }
+        assert_eq!((scopes, keys, anns), (3, 3, 1));
+    }
+
     /// OCI-7・CLI-1（#2600）: digest 風入力の述語（create と rm / tag が共有）。
     #[test]
     fn oci7_is_bare_digest_form() {

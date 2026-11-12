@@ -84,6 +84,8 @@ pub enum ImageStoreError {
     Corrupt,
     /// 永続された在庫記録の読み書きに失敗した（#4176）。
     Io,
+    /// イメージをコンテナが使用中で、記録を外せない（`RemoveImage` が `FAILED_PRECONDITION` に写す。OCI-7・#2791）。
+    InUse,
 }
 
 impl fmt::Display for ImageStoreError {
@@ -99,6 +101,7 @@ impl fmt::Display for ImageStoreError {
             ImageStoreError::ReadOnly => "image store is read-only",
             ImageStoreError::Corrupt => "image store data is corrupt",
             ImageStoreError::Io => "image store i/o failed",
+            ImageStoreError::InUse => "image is in use by a container",
         })
     }
 }
@@ -673,7 +676,13 @@ impl CriImageService {
             let canonical = canonical_reference(&reference);
             store
                 .remove_resolving(&reference, canonical.as_deref())
-                .map_err(|_: ImageStoreError| CriError::internal("image store failure"))
+                .map_err(|e: ImageStoreError| match e {
+                    // 使用中の拒否だけを前提条件違反にする（kubelet が再試行・報告できる）。文言にイメージ・コンテナ ID を含めない。
+                    ImageStoreError::InUse => {
+                        CriError::failed_precondition("image is in use by a container")
+                    }
+                    _ => CriError::internal("image store failure"),
+                })
         })
         .await;
         joined.map_err(|_| CriError::internal("image remove task failed"))??;

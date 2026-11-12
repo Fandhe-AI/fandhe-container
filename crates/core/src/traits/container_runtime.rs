@@ -1070,7 +1070,13 @@ impl CleanupTarget {
 /// - `supervisor_log`・`container_log`: ログを消す層（`fandhe-container-plugin-cri`・CLI の `delete`）。
 ///   CLI も `finish_delete` で埋める（警告の 1 行 JSON は CLI 自前の形式。#2698）
 ///
-/// 後始末の失敗は `Err` にせず `Kept` として載せる。RPC 境界（#1869 の設計。承認と実装 issue の起票は #2232）の DTO への追加は未実装。
+/// 後始末の失敗は `Err` にせず `Kept` として載せる。
+///
+/// RPC 境界の DTO（#1869 の設計）には `image_ref` 欄を足さない（#2791 の判断）。参照の登録・解除はイメージストアを持つ層が
+/// `ContainerRuntime::delete` を包んで行い、それはプロセス内の CLI と plugin-cri である。CRI の経路は gRPC（cri-api）の受付側の
+/// plugin-cri がプロセス内で `CoreLifecycleRuntime` を持つため長さ接頭辞フレームの DTO をまたがず、バックエンド plugin
+/// （macOS 等）はイメージストアに触れない。将来 DTO を作っても、`Deleted` が `image_ref` を運ぶ必要は無く、値を埋めるのは
+/// proxy を呼ぶ側である（OCI-7・CRI-2・PLUG-1）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct DeleteResponse {

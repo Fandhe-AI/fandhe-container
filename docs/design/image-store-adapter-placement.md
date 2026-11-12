@@ -76,7 +76,7 @@ cli → cri の辺も plugin-cri → cli の辺も無い。core は oci に依�
 | CLI からの `ImageRootfsPrivilege` / `DeleteOptions` / `ReapOptions`（PR #2611） | CLI は展開器を付けず、core 所有の rootfs が生じないため今は効き目が無い。CLI の create に本番の展開器を付けるとき（#2377）に同時に配線する |
 | CRI / tokio 経路の子プロセス方式、`ChownInUserNamespace`（PR #2522・#2611） | CRI が `create_with_image` を使う配線（#2791）と本番の `ExtractOptions`（#2792）の範囲 |
 | `image_ownership.rs` の最終的な置き場所（PR #2528） | 論点 2 に含める |
-| plugin 経由のイメージつき create / delete | #2791（create ゲートの共有で包む規約も同じ） |
+| plugin 経由のイメージつき create / delete | #2791 で plugin-cri に暫定で配線済み（案 A 相当の 2 つ目のアダプタ `plugin-cri` の `image_refs`。オーナー判断は未取得で、置き場所の決定を先取りしない）。キー導出の食い違いは共有 fixture `crates/core/testdata/image_ref_key_cases.txt` を cli と plugin-cri の単体試験が照合して抑える。判断で案 A' / B などに決まったら `StoreImageRefs` を移して重複をなくす。create ゲートの共有で包む規約は同じ |
 
 ## 7. 判断が出た後の作業
 

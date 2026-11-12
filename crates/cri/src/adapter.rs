@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fandhe_container_core::traits::{
-    CleanupOutcome, ContainerId, ContainerLogPath, ContainerRuntime, ContainerState,
+    Annotations, CleanupOutcome, ContainerId, ContainerLogPath, ContainerRuntime, ContainerState,
     ContainerStatus, CreateRequest, DeleteRequest, DeleteResponse, KillRequest, Signal,
     StartRequest, StateRequest, StdinMode, StopRequest, TerminationReason, TraitError,
     WaitExitRequest,
@@ -157,6 +157,12 @@ impl From<&ContainerStatus> for RuntimeContainerStatus {
     }
 }
 
+/// CRI の `CreateContainer` が実行層へイメージ ID を渡す `CreateRequest` の annotations の予約キー（OCI-7・CRI-2・#2791）。
+///
+/// 値は [`crate::bundle::ResolvedImage::id_str`]（image ID = config digest）。状態記録の annotations は
+/// `CreateRequest` からしか入らず、CRI 利用者の annotations や config.json の値は混ざらない。
+pub const CRI_IMAGE_ID_ANNOTATION: &str = "io.fandhe.container.cri.image-id";
+
 /// delete の後始末 1 件の結果を CRI 側の語彙へ写した値（core の `CleanupOutcome` を写す。
 /// OCI-7・CRI-2・SUP-7・REPAIR-4・#2633）。
 ///
@@ -202,7 +208,7 @@ impl RuntimeCleanupOutcome {
 /// `ContainerRuntime::delete` の結果を CRI 側の語彙へ写した値（CRI-2）。
 ///
 /// core の `DeleteResponse` を公開 API へ漏らさず、将来の拡張に備えて `#[non_exhaustive]` とする。
-/// 後始末（rootfs・ログ）の結果を載せる。cri-api の `RemoveContainerResponse` にはフィールドが無い
+/// 後始末（rootfs・ログ・イメージ参照）の結果を載せる。cri-api の `RemoveContainerResponse` にはフィールドが無い
 /// （無改変。CRI-3）ため、`runtime_service` は結果を応答へ載せない。残した資源は後始末をした層
 /// （`fandhe-container-plugin-cri`）が構造化ログで出す。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -214,6 +220,8 @@ pub struct RuntimeDeleteResult {
     pub supervisor_log: RuntimeCleanupOutcome,
     /// コンテナログの後始末の結果。
     pub container_log: RuntimeCleanupOutcome,
+    /// イメージ参照（OCI-7）の解除の結果。実行層がイメージ参照つきで作ったコンテナだけ `Removed` 等になる。
+    pub image_ref: RuntimeCleanupOutcome,
 }
 
 impl From<&DeleteResponse> for RuntimeDeleteResult {
@@ -222,6 +230,7 @@ impl From<&DeleteResponse> for RuntimeDeleteResult {
             image_rootfs: RuntimeCleanupOutcome::from_core(resp.image_rootfs()),
             supervisor_log: RuntimeCleanupOutcome::from_core(resp.supervisor_log()),
             container_log: RuntimeCleanupOutcome::from_core(resp.container_log()),
+            image_ref: RuntimeCleanupOutcome::from_core(resp.image_ref()),
         }
     }
 }
@@ -758,7 +767,28 @@ impl RuntimeAdapter {
 
     /// OCI bundle（絶対パス）からコンテナを作成する。
     pub fn create(&self, id: &str, bundle: PathBuf) -> Result<RuntimeContainerStatus, CriError> {
-        let req = CreateRequest::new(Self::id(id)?, bundle).map_err(|e| CriError::from(&e))?;
+        self.create_with_image_id(id, bundle, None)
+    }
+
+    /// [`Self::create`] に、bundle が使うイメージの ID（config digest。`sha256:<64 桁>`）を添えて作成する
+    /// （OCI-7・CRI-2・#2791）。`None` は [`Self::create`] と同じ。
+    ///
+    /// cri は `core::traits` しか参照しない（CRI-7）ため、イメージの受け渡しは `CreateRequest` の annotations の
+    /// 予約キー [`CRI_IMAGE_ID_ANNOTATION`] で行う。実行層（plugin-cri の `CoreLifecycleRuntime`）が値を検証して
+    /// 在庫の manifest に解決し、コンテナ参照を登録する。値は信頼せず、不正なら実行層が `INVALID_ARGUMENT` で拒否する。
+    pub fn create_with_image_id(
+        &self,
+        id: &str,
+        bundle: PathBuf,
+        image_id: Option<&str>,
+    ) -> Result<RuntimeContainerStatus, CriError> {
+        let mut req = CreateRequest::new(Self::id(id)?, bundle).map_err(|e| CriError::from(&e))?;
+        if let Some(image_id) = image_id {
+            let annotations =
+                Annotations::new([(CRI_IMAGE_ID_ANNOTATION.to_owned(), image_id.to_owned())])
+                    .map_err(|e| CriError::from(&e))?;
+            req = req.with_annotations(annotations);
+        }
         Self::finish(id, self.runtime.create(&req))
     }
 
@@ -1048,6 +1078,25 @@ mod tests {
             got.container_log,
             RuntimeCleanupOutcome::Kept {
                 code: CriErrorCode::FailedPrecondition
+            }
+        );
+    }
+
+    /// OCI-7・CRI-2（#2791）: イメージ参照の解除結果（成功・残した理由）を CRI の語彙へ具体値で写す。
+    #[test]
+    fn oci7_cri2_2791_delete_result_maps_image_ref() {
+        let removed = DeleteResponse::new().with_image_ref(CleanupOutcome::Removed);
+        assert_eq!(
+            RuntimeDeleteResult::from(&removed).image_ref,
+            RuntimeCleanupOutcome::Removed
+        );
+        let kept = DeleteResponse::new().with_image_ref(CleanupOutcome::Kept {
+            code: ErrorCode::Timeout,
+        });
+        assert_eq!(
+            RuntimeDeleteResult::from(&kept).image_ref,
+            RuntimeCleanupOutcome::Kept {
+                code: CriErrorCode::Timeout
             }
         );
     }

@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
 use fandhe_container_cri::image_service::{
-    CriImageService, ImageRecord, InMemoryImageStore, MAX_FILTER_BYTES,
+    CriImageService, ImageRecord, ImageStore, ImageStoreError, InMemoryImageStore,
+    MAX_FILTER_BYTES, RemoveOutcome,
 };
 use fandhe_container_cri::instrument::{CriOpRecorder, CriOpSample, code_name};
 use fandhe_container_cri::runtime::v1::{
@@ -266,6 +267,50 @@ fn remove(svc: &CriImageService, reference: Option<&str>) -> Result<(), Code> {
     rt.block_on(ImageService::remove_image(svc, Request::new(request)))
         .map(|_| ())
         .map_err(|s| s.code())
+}
+
+/// 使用中を返す `ImageStore`（OCI-7・#2791 の検証用）。`remove` だけが失敗の種類を注入できる。
+struct FailingRemove(ImageStoreError);
+
+impl ImageStore for FailingRemove {
+    fn list(&self) -> Result<Vec<ImageRecord>, ImageStoreError> {
+        Ok(Vec::new())
+    }
+    fn get(&self, _: &str) -> Result<Option<ImageRecord>, ImageStoreError> {
+        Ok(None)
+    }
+    fn remove(&self, _: &str) -> Result<RemoveOutcome, ImageStoreError> {
+        Err(self.0)
+    }
+}
+
+fn remove_status(err: ImageStoreError) -> tonic::Status {
+    let svc = CriImageService::with_store(Arc::new(FailingRemove(err)));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    rt.block_on(ImageService::remove_image(
+        &svc,
+        Request::new(v1::RemoveImageRequest {
+            image: Some(v1::ImageSpec {
+                image: "reg/secret:1".into(),
+                ..Default::default()
+            }),
+        }),
+    ))
+    .expect_err("must fail")
+}
+
+/// OCI-7・CRI-2（#2791）: 使用中の拒否だけが FAILED_PRECONDITION（固定文言。参照を含めない）になり、
+/// 他の在庫の失敗は従来どおり INTERNAL のまま。
+#[test]
+fn oci7_cri2_2791_remove_image_maps_in_use_to_failed_precondition() {
+    let in_use = remove_status(ImageStoreError::InUse);
+    assert_eq!(in_use.code(), Code::FailedPrecondition);
+    assert_eq!(in_use.message(), "image is in use by a container");
+    let io = remove_status(ImageStoreError::Io);
+    assert_eq!(io.code(), Code::Internal);
+    assert_eq!(io.message(), "image store failure");
 }
 
 /// CRI-1・CRI-2・#4177: id・タグ・digest のどの参照で消しても記録ごと消え、他は残る。再度の削除は成功（冪等）。

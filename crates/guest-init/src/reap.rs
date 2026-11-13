@@ -128,8 +128,13 @@ pub fn step<W: ChildWaiter>(w: &mut W, on_reaped: &mut dyn FnMut(i32, ChildStatu
         }
     }
     if reaped >= MAX_REAP_BATCH {
-        // まだ回収できる子が残っているかもしれない。待たずに次のステップで続ける。
-        return Flow::Continue;
+        // まだ回収できる子が残っているかもしれない。待たずに次のステップで続ける。ただし停止要求の確認
+        // （`wait_event` だけが扱う）を飛ばすと、子が出続ける間は SIGTERM・SIGPWR が保留されたままになるため、
+        // 待ち時間ゼロで確認する（MAC-4・#2270）。
+        return match w.wait_event(Duration::ZERO) {
+            Event::Stop => Flow::StopRequested,
+            _ => Flow::Continue,
+        };
     }
     match w.wait_event(NO_CHILD_PAUSE) {
         Event::Stop => Flow::StopRequested,
@@ -293,7 +298,19 @@ mod tests {
         let f = step(&mut w, &mut |_, _| n += 1);
         assert_eq!(f, Flow::Continue);
         assert_eq!(n, MAX_REAP_BATCH);
-        assert!(w.waits.is_empty());
+        // 待たない（時間ゼロの確認だけ）。
+        assert_eq!(w.waits, vec![Duration::ZERO]);
+    }
+
+    /// 回収が上限に達し続けても（子が出続ける）、保留中の停止要求を時間ゼロの確認で拾って戻る。
+    #[test]
+    fn mac4_2270_stop_is_seen_when_reap_limit_is_hit() {
+        let mut w =
+            Fake::new(&[], r(1, 0)).with_events(&[Event::Timeout, Event::Stop], Event::Stop);
+        let mut n = 0usize;
+        reap_until_stop(&mut w, |_, _| n += 1);
+        assert_eq!(n, MAX_REAP_BATCH * 2);
+        assert_eq!(w.waits, vec![Duration::ZERO, Duration::ZERO]);
     }
 
     /// 停止要求で `reap_until_stop` が戻る。それまでの子の回収は続ける。

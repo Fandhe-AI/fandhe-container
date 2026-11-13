@@ -341,9 +341,35 @@ pub(crate) fn run_graceful_stop(
             state: VmState::Stopped,
             ..
         }) => Ok(ShutdownOutcome::GuestStopped),
+        // 猶予の終わりにゲストが電源断の途中（`Stopping`）だと VZ の `stop` は `canStop` が偽で拒否される。
+        // 停止は進行中なので、有限の追加時間で `Stopped` を待ち、止まれば協調停止の成功として扱う。
+        Err(VmError::InvalidState {
+            state: VmState::Stopping,
+            op,
+        }) => {
+            let began = elapsed();
+            loop {
+                let spent = elapsed().saturating_sub(began);
+                if spent >= STOPPING_SETTLE {
+                    return Err(VmError::InvalidState {
+                        state: VmState::Stopping,
+                        op,
+                    });
+                }
+                let remaining = STOPPING_SETTLE - spent;
+                if poll_state(remaining) == Some(VmState::Stopped) {
+                    return Ok(ShutdownOutcome::GuestStopped);
+                }
+                sleep(poll_interval.min(remaining));
+            }
+        }
         Err(e) => Err(e),
     }
 }
+
+/// 協調停止の猶予の後、VM が `Stopping`（電源断の途中）のまま強制停止を拒否されたときに `Stopped` を
+/// 待つ追加の上限（MAC-4・REPAIR-5・#2270）。
+pub(crate) const STOPPING_SETTLE: Duration = Duration::from_secs(5);
 
 /// VM の状態（`VZVirtualMachineState` に対応）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2161,6 +2187,34 @@ mod tests {
             Duration::from_millis(100),
         );
         assert_eq!(res, Err(running));
+    }
+
+    /// MAC-4・REPAIR-5・#2270: 強制停止が `Stopping`（ゲストが電源断の途中）で拒否されたら、有限の追加時間
+    /// `Stopped` を待ち、止まれば成功、止まらなければ元のエラーを返す。
+    #[test]
+    fn mac4_2270_shutdown_stopping_waits_for_stopped() {
+        let stopping = VmError::InvalidState {
+            op: VmOp::Stop,
+            state: VmState::Stopping,
+        };
+        let (res, polls, forced, _) = drive_graceful(
+            RequestOutcome::Requested,
+            &[VmState::Running, VmState::Stopping, VmState::Stopped],
+            Err(stopping.clone()),
+            Duration::from_millis(100),
+        );
+        assert_eq!(res, Ok(ShutdownOutcome::GuestStopped));
+        assert_eq!((polls, forced), (3, 1));
+        let (res, _, forced, waited) = drive_graceful(
+            RequestOutcome::Requested,
+            &[],
+            Err(stopping.clone()),
+            Duration::from_millis(100),
+        );
+        assert_eq!(res, Err(stopping));
+        assert_eq!(forced, 1);
+        assert!(waited >= STOPPING_SETTLE);
+        assert!(waited <= STOPPING_SETTLE + Duration::from_millis(100) + GRACEFUL_POLL_INTERVAL);
     }
 
     /// MAC-4・#2270: 猶予の既定と範囲検証。

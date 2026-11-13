@@ -207,7 +207,11 @@ fn check_bundle_residue(
     id: &fandhe_container_stack::cli::up::ServiceContainerId,
     name: &str,
 ) -> Result<(), CliError> {
-    if super::bundle::rootfs_residue(state_root, id.as_str())? {
+    let (root, idc) = (state_root.to_path_buf(), id.as_str().to_owned());
+    let residue = super::bundle::bounded_io(PREPARE_TIMEOUT, move || {
+        super::bundle::rootfs_residue(&root, &idc)
+    })?;
+    if residue {
         return Err(CliError::new(
             ErrorCode::FailedPrecondition,
             format!(
@@ -481,7 +485,11 @@ pub(super) fn run_up(global: &GlobalArgs, args: &UpArgs, stdout: &mut dyn Write)
     // 同じプロジェクトの並行する `up` を排他する。ロックファイルは状態ルートに `.stack` を作るため、拒否経路（事前検査）が
     // すべて済んでから取る（拒否は副作用ゼロ。STACK-8・SEC-1・#4734）。取った後に、待っていた間に別の `up` が
     // 記録を作っていないかを再確認する。create / start の完了（この関数の終わり）まで保持する。
-    let _project_lock = match ProjectLock::acquire(&state_root, project.as_str()) {
+    let lock_root = state_root.clone();
+    let lock_project = project.as_str().to_owned();
+    let _project_lock = match super::bundle::bounded_io(PREPARE_TIMEOUT, move || {
+        ProjectLock::acquire(&lock_root, &lock_project)
+    }) {
         Ok(l) => l,
         Err(e) => return CliExit::Error(e),
     };

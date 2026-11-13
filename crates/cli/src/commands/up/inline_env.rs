@@ -19,6 +19,9 @@ use fandhe_container_supervisor::container_options::env::EnvFile;
 use super::bundle::write_private;
 use crate::error::CliError;
 
+/// 生成ファイルの削除に許す時間（REPAIR-5）。
+const CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// 生成する env ファイルの名前（bundle の `env/` 直下。利用者の `<n>.env` の複製とは重ならない）。
 pub(super) const INLINE_ENV_NAME: &str = "inline.env";
 
@@ -67,9 +70,14 @@ pub(super) struct InlineEnvGuard {
 
 impl Drop for InlineEnvGuard {
     fn drop(&mut self) {
-        if let Ok(root) = ExtractRoot::open_existing_dir(&self.env_dir) {
-            let _ = root.unlink_child_file(INLINE_ENV_NAME);
-        }
+        // 削除も応答しない FS で止まりうるため期限つきで行う（失敗は握りつぶす。残りはロック保持でプロセス終了まで排他される）。
+        let dir = self.env_dir.clone();
+        let _ = super::bundle::bounded_io(CLEANUP_TIMEOUT, move || {
+            if let Ok(root) = ExtractRoot::open_existing_dir(&dir) {
+                let _ = root.unlink_child_file(INLINE_ENV_NAME);
+            }
+            Ok(())
+        });
     }
 }
 

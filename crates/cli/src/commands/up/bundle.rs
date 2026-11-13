@@ -104,7 +104,47 @@ pub(super) fn write_private(dir: &ExtractRoot, name: &str, body: &[u8]) -> Resul
 /// drop（プロセス終了を含む）で解放される。
 #[derive(Debug)]
 pub(super) struct ProjectLock {
-    _file: std::fs::File,
+    file: Option<std::fs::File>,
+}
+
+/// 期限切れで置き去りにした作業スレッドがある（[`bounded_io`]）。真の間は [`ProjectLock`] を解放せず、プロセス終了まで
+/// 排他を保つ（残った作業が次回の `up` の bundle と競合しない。STACK-8・REPAIR-5）。
+static ABANDONED_WORK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+impl Drop for ProjectLock {
+    fn drop(&mut self) {
+        if let Some(f) = self.file.take()
+            && ABANDONED_WORK.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            // fd を閉じない（flock を保つ）。CLI の終了で OS が解放する。
+            std::mem::forget(f);
+        }
+    }
+}
+
+/// 状態ルート配下のブロックしうる I/O を期限つきの作業スレッドで行う（REPAIR-5）。
+///
+/// 期限切れは `TIMEOUT`、同時実行枠の満杯は `RESOURCE_EXHAUSTED`。期限切れの作業は止められないため、
+/// [`ABANDONED_WORK`] を立ててプロジェクトのロックを手放さない。
+pub(super) fn bounded_io<T: Send + 'static>(
+    timeout: std::time::Duration,
+    f: impl FnOnce() -> Result<T, CliError> + Send + 'static,
+) -> Result<T, CliError> {
+    use fandhe_container_supervisor::supervisor_log::{BoundedFailure, run_bounded_waiting};
+    match run_bounded_waiting(f, timeout) {
+        Ok(r) => r,
+        Err(BoundedFailure::Busy) => Err(CliError::new(
+            ErrorCode::ResourceExhausted,
+            "bundle workers are busy",
+        )),
+        Err(BoundedFailure::Unfinished) => {
+            ABANDONED_WORK.store(true, std::sync::atomic::Ordering::SeqCst);
+            Err(CliError::new(
+                ErrorCode::Timeout,
+                "a state root operation did not finish within the deadline",
+            ))
+        }
+    }
 }
 
 impl ProjectLock {
@@ -127,7 +167,7 @@ impl ProjectLock {
             return Err(fail());
         }
         match file.try_lock() {
-            Ok(()) => Ok(Self { _file: file }),
+            Ok(()) => Ok(Self { file: Some(file) }),
             Err(std::fs::TryLockError::WouldBlock) => Err(CliError::new(
                 ErrorCode::FailedPrecondition,
                 "another up for the project is in progress",

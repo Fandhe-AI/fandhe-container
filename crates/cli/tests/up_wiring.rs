@@ -315,6 +315,37 @@ fn stack8_4638_pasta_flag_without_user_network_is_rejected() {
     d.assert_no_side_effects();
 }
 
+/// STACK-8・NET-9・REPAIR-5・#4638: 存在しない pasta の実行ファイルは、依存サービスの起動より前（副作用ゼロ）に拒否する。
+#[cfg(target_os = "linux")]
+#[test]
+fn stack8_4638_missing_pasta_binary_is_rejected_before_any_side_effect() {
+    let d = Dirs::new("pasta-bin");
+    let toml = d.write_toml(
+        "[networks.n]\n[services.db]\nimage = \"example/none:1\"\n\
+         [services.web]\nimage = \"example/none:1\"\nnetworks = [\"n\"]\n[services.web.depends_on]\ndb = \"started\"\n",
+    );
+    let out = output_bounded(
+        Command::new(env!("CARGO_BIN_EXE_fandhe-container"))
+            .arg("--root")
+            .arg(&d.state)
+            .args(["--pasta-path", "/nonexistent-dir/pasta"])
+            .arg("up")
+            .arg("--file")
+            .arg(&toml)
+            .arg("--image-root")
+            .arg(&d.images)
+            .args(["--project-name", "shop"]),
+    );
+    assert_ne!(out.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.to_lowercase().contains("pasta"), "{stderr}");
+    assert!(
+        !stderr.contains("info:"),
+        "no service may have started: {stderr}"
+    );
+    d.assert_no_side_effects();
+}
+
 /// CLI-1・ERR-1・#4638: 使い方エラー（必須オプションの欠落・重複・相対の `--image-root`・未知のオプション）は 2。
 #[test]
 fn cli1_4638_usage_errors_exit_2() {

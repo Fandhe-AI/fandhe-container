@@ -37,7 +37,7 @@ use fandhe_container_stack::toml_input::read_compose_toml;
 use super::super::CliExit;
 use super::super::args::{CreateNetworkArgs, GlobalArgs, PastaSource, UpArgs};
 use super::super::create_network::{check_network_options, resolve_publish_privilege};
-use super::super::create_pasta::{decide as decide_pasta, detect_install};
+use super::super::create_pasta::{decide as decide_pasta, detect_install, resolve_source};
 use super::super::create_start::open_store;
 use super::super::image::open_image_store_for_lifecycle;
 use super::super::list_logs::store_open_failure;
@@ -356,8 +356,15 @@ pub(super) fn run_up(global: &GlobalArgs, args: &UpArgs, stdout: &mut dyn Write)
             Ok(i) => i,
             Err(e) => return from_trait(&e),
         };
-        if let Err(e) = decide_pasta(global.pasta.as_ref(), true, install) {
-            return from_trait(&e);
+        match decide_pasta(global.pasta.as_ref(), true, install) {
+            Err(e) => return from_trait(&e),
+            // 実行ファイルの存在・権限・版数も副作用の前に確かめる（子の `create` の再検証は維持する。警告の出力は子に任せる）。
+            Ok(Some(source)) => {
+                if let Err(e) = resolve_source(source, std::env::var_os("PATH").as_deref()) {
+                    return from_trait(&e);
+                }
+            }
+            Ok(None) => {}
         }
     }
 

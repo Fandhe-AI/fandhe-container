@@ -35,8 +35,6 @@ pub const ENSURE_RUNNING_TIMEOUT_MAX: Duration = Duration::from_secs(60);
 const CALL_BUDGET: Duration = Duration::from_secs(5);
 /// 残り時間が尽きかけでも 0 の待ちを作らないための下限。
 const MIN_STEP: Duration = Duration::from_millis(1);
-/// 期限切れ後に子を SIGKILL してから回収を待つ上限。
-const REAP_TIMEOUT: Duration = Duration::from_secs(2);
 /// 起動後のポーリング間隔。
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
@@ -133,7 +131,9 @@ impl KeeperClient {
     ///
     /// すでに居れば `spawn` を呼ばない（戻り値の `Child` は `None`）。居なければ `spawn` で 1 回起動し、`deadline` まで
     /// 照会をポーリングする。起動した子が先に終わっても（二重起動で負けた等）待ちは続ける。期限切れは `Timeout` で、
-    /// 起動した子が残っていれば SIGKILL して期限つきで回収し、回収できなければ `Internal` を返す。peer 拒否（`PermissionDenied`）は待たずに返す。
+    /// 起動した子は SIGKILL しない（子は応答を始めた時点で他クライアントの登録を受け付ける共有の保持役になりうるため。MAC-4）。
+    /// すでに終了していれば回収するだけで、生きていれば保持役自身のロック競合による終了または猶予後の終了に任せる。
+    /// peer 拒否（`PermissionDenied`）も同様に待たずに返し、子は kill しない。
     /// 戻り値の `Child` は呼び出し側が回収する。
     pub fn ensure_running(
         &self,
@@ -166,13 +166,13 @@ impl KeeperClient {
                 // 期限直後でも応答済みの保持役は採用する（kill しない）。
                 Ok(resp) => return Ok((resp, Some(child))),
                 Err(e) if e.code() == ErrorCode::PermissionDenied => {
-                    return Err(stop_child(&mut child, e));
+                    return Err(release_child(&mut child, e));
                 }
                 Err(_) => {}
             }
             let now = Instant::now();
             if now >= limit {
-                return Err(stop_child(&mut child, deadline_error()));
+                return Err(release_child(&mut child, deadline_error()));
             }
             std::thread::sleep(POLL_INTERVAL.min(limit - now));
         }
@@ -195,33 +195,28 @@ fn deadline_error() -> TraitError {
     )
 }
 
-/// 子を SIGKILL して期限つきで回収し、`primary` を返す。回収できなければ構造化エラー（`Internal`）に替える
-/// （`wait` を無期限に呼ばない。REPAIR-5）。
-fn stop_child(child: &mut Child, primary: TraitError) -> TraitError {
-    // すでに終了していれば kill は失敗するが、その場合は下の try_wait が回収する。
-    let _ = child.kill();
-    let reap_deadline = Instant::now().checked_add(REAP_TIMEOUT);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return primary,
-            Ok(None) => {}
-            Err(_) => break,
-        }
-        match reap_deadline {
-            Some(d) if Instant::now() < d => std::thread::sleep(POLL_INTERVAL),
-            _ => break,
-        }
-    }
-    TraitError::new(
-        ErrorCode::Internal,
-        "the vm keeper child could not be reaped after the failure",
-    )
+/// 起動した子を kill せずに手放し、`primary` を返す。すでに終了していれば非ブロッキングで回収する（`wait` は呼ばない。REPAIR-5）。
+///
+/// 子は応答の開始後は他クライアントの登録を受け付けるため、起動元の待機失敗だけで SIGKILL すると共有の保持役と登録簿を失う
+/// （MAC-4）。公開前の子はロック競合で自ら終了し、公開後の子は無登録の猶予後に自ら終了する。
+fn release_child(child: &mut Child, primary: TraitError) -> TraitError {
+    let _ = child.try_wait();
+    primary
 }
 
 /// 保持役の実行ファイル `exe` を `--base <base>` で、CLI の終了に巻き込まれないよう別プロセスグループで起動する
 /// （stdin / stdout / stderr は null。`PATH` 探索・シェルは使わない）。
+///
+/// `exe` は絶対パスに限る。相対パス・単なる実行ファイル名は `PATH` 探索で意図しないバイナリを起動しうるため、
+/// 起動前に `InvalidInput` で拒否する。
 pub fn spawn_keeper(exe: &Path, base: &Path) -> io::Result<Child> {
     use std::os::unix::process::CommandExt;
+    if !exe.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the vm keeper executable path must be absolute",
+        ));
+    }
     Command::new(exe)
         .arg("--base")
         .arg(base)
@@ -230,4 +225,54 @@ pub fn spawn_keeper(exe: &Path, base: &Path) -> io::Result<Child> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// 相対パス・単なる名前は spawn 前に `InvalidInput` で拒否される（PATH 探索をしない契約）。
+    #[test]
+    fn spawn_keeper_rejects_non_absolute_exe() {
+        for exe in ["fandhe-container-vm-keeper", "./keeper", "bin/keeper"] {
+            let e = spawn_keeper(Path::new(exe), Path::new("/tmp"))
+                .expect_err("non-absolute exe must be rejected");
+            assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{exe}");
+        }
+    }
+
+    /// 期限切れでも、起動した子（公開済みの保持役でありうる）を kill しない（MAC-4）。
+    #[test]
+    fn ensure_running_timeout_does_not_kill_spawned_child() {
+        let dir = std::env::temp_dir().join(format!("vmk-client-nokill-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        }
+        let client = KeeperClient::new(&dir).expect("client");
+        let mut pid = 0u32;
+        let r = client.ensure_running(
+            || {
+                let c = Command::new("sleep").arg("30").spawn()?;
+                pid = c.id();
+                Ok(c)
+            },
+            Duration::from_millis(200),
+        );
+        let e = r.expect_err("must time out");
+        assert_eq!(e.code(), ErrorCode::Timeout);
+        let alive = Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .status()
+            .expect("kill -0")
+            .success();
+        let _ = Command::new("kill").arg(pid.to_string()).status();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            alive,
+            "spawned child {pid} must stay alive after the timeout"
+        );
+    }
 }

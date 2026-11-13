@@ -96,6 +96,20 @@ fn write_private(dir: &ExtractRoot, name: &str, body: &[u8]) -> Result<(), CliEr
         .map_err(|_| CliError::new(ErrorCode::Internal, "failed to write the service bundle"))
 }
 
+/// 合成した `config.json` を core の検証に通す（副作用なし）。`up` の事前検査が全サービスに対して呼び、
+/// 後続サービスの入力不正を先行サービスの起動後に初めて見つける事態を防ぐ（STACK-8・SEC-1・#4734）。
+/// 不合格は入力起因として `INVALID_ARGUMENT`（メッセージは固定文言で値を含めない）。
+pub(super) fn validate_config(p: &Prepared) -> Result<(), CliError> {
+    parse_config_bytes(config_json(p).as_bytes())
+        .map(|_| ())
+        .map_err(|_| {
+            CliError::new(
+                ErrorCode::InvalidArgument,
+                "the service command, environment or working directory was rejected by config validation",
+            )
+        })
+}
+
 /// `state_root` 配下に `p` の bundle を用意する。`state_root` は開いた状態ストアの正規パス。
 pub(super) fn write_bundle(state_root: &Path, p: &Prepared) -> Result<BundlePaths, CliError> {
     // 書く前に core の検証へ通す（手組みの誤りを fail-closed にする）。
@@ -238,6 +252,18 @@ mod tests {
         let e = write_bundle(&s.0, &p).expect_err("rejected");
         assert_eq!(e.code(), ErrorCode::Internal);
         assert!(!s.0.join(".stack").exists());
+    }
+
+    /// STACK-8・SEC-1・#4734: 事前検査用の検証は core が拒否する内容を `INVALID_ARGUMENT` で返し、正常な内容は通す。
+    #[test]
+    fn stack8_4734_validate_config_is_invalid_argument_not_internal() {
+        let e = validate_config(&prepared(&[], &[], "/", vec![])).expect_err("empty args");
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        // 上限（CONFIG_MAX_STRING_BYTES）を超える command 要素。
+        let huge = "a".repeat(1 << 20);
+        let e = validate_config(&prepared(&[huge.as_str()], &[], "/", vec![])).expect_err("huge");
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        validate_config(&prepared(&["/bin/true"], &[], "/", vec![])).expect("valid");
     }
 
     /// STACK-8・SEC-1・#4638: bundle は 0700 のディレクトリ、config.json と env は 0600 で作られ、

@@ -167,7 +167,7 @@ impl Preparer<'_> {
         let mut rewritten = spec.clone();
         rewritten.image = Some(manifest.as_str().to_owned());
         rewritten.env_files = (0..env_files.len()).map(env_file_name).collect();
-        Ok(Prepared {
+        let prepared = Prepared {
             id,
             spec: rewritten,
             args,
@@ -176,7 +176,10 @@ impl Preparer<'_> {
             uid,
             gid,
             env_files,
-        })
+        };
+        // 4. 合成した config.json を core の検証に通す（起動後に初めて INTERNAL で見つかる事態を防ぐ。#4734）。
+        super::bundle::validate_config(&prepared)?;
+        Ok(prepared)
     }
 }
 

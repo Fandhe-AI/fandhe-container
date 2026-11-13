@@ -427,6 +427,9 @@ struct RealIntermediateOps<'a> {
     plan: IntermediatePlan<'a>,
     /// pod の user・ipc namespace への join(あれば `isolate` は作成ではなく参加する。#2674)。
     join: Option<&'a crate::oci_runtime::NamespaceJoin>,
+    /// init user namespace 所有の pin 済み netns への参加先(あれば `isolate` が user namespace の作成より前に `setns` する。
+    /// `join` とは併用しない。D12・NET-1・SEC-1・CORE-3・#3069)。
+    pinned_net: Option<&'a crate::oci_runtime::PinnedNetnsJoin>,
     rootfs: &'a Path,
     entry: &'a Entrypoint,
     stages: Option<StagePipeline>,
@@ -454,6 +457,19 @@ impl IntermediateOps for RealIntermediateOps<'_> {
         // 作らずに失敗させる(fail-closed)。
         sys::set_process_comm(self.tag.comm_bytes())
             .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "set the launch tag"))?;
+        // init 所有の pin 済み netns への参加は、user namespace の作成・参加(下の各分岐)より**前**に行う。作った後では
+        // 参加先の所有者(init)で `CAP_SYS_ADMIN` を持てず `EPERM` になる(D12。NET-1・SEC-1・#3069)。pod の join と
+        // 併用しない(pod の user namespace へ参加した後は同じ理由で参加できない)。
+        if let Some(pinned) = self.pinned_net {
+            if self.join.is_some() {
+                return Err(ExecError::new(
+                    ErrorCode::Internal,
+                    IsolationStage::SetNs,
+                    "a pod namespace join and a pinned network join cannot be combined",
+                ));
+            }
+            super::join_pinned_netns(pinned.fd(), pinned.identity())?;
+        }
         // pod の namespace へ join する起動は mapper・holder を使わず、参加先の写像を計画と照合する(#2674)。
         if let Some(join) = self.join {
             return super::isolate_join(self.plan, join);
@@ -563,6 +579,9 @@ pub(crate) struct IntermediateSpec<'a> {
     pub(crate) plan: IntermediatePlan<'a>,
     /// pod の user・ipc namespace への join(`None` なら新しく作る。CRI-2・CORE-3。#2674)。
     pub(crate) join: Option<&'a crate::oci_runtime::NamespaceJoin>,
+    /// init user namespace 所有の pin 済み netns への参加先(`None` なら参加しない。`join` と併用しない。
+    /// D12・NET-1・SEC-1・CORE-3・#3069)。
+    pub(crate) pinned_net: Option<&'a crate::oci_runtime::PinnedNetnsJoin>,
     /// rootfs のパス(使用は `setup.pinned_rootfs` の固定 fd との照合を通る)。
     pub(crate) rootfs: &'a Path,
     /// exec するエントリポイント。
@@ -612,6 +631,7 @@ pub(crate) fn spawn_container_via_intermediate(
     let IntermediateSpec {
         plan,
         join,
+        pinned_net,
         rootfs,
         entry,
         setup,
@@ -670,6 +690,7 @@ pub(crate) fn spawn_container_via_intermediate(
             let mut ops = RealIntermediateOps {
                 plan,
                 join,
+                pinned_net,
                 rootfs,
                 entry,
                 stages: Some(stages),

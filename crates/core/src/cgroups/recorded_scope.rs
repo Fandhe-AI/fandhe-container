@@ -56,24 +56,11 @@ use super::{
     sys_error, validate_component, verify_delegated_scope,
 };
 use crate::observability::OpRecorder;
-use crate::oci_runtime::CgroupRemoval;
+use crate::oci_runtime::{CgroupRemoval, RecordedCgroupOutcome};
 use crate::sys;
 use crate::traits::{
     CgroupPlacement, CgroupScope, ContainerId, ErrorCode, StateRevision, TraitError,
 };
-
-/// 記録された配置のコンテナ cgroup について、プロセスが居ないことを確かめた結果（#2011・CORE-2）。
-///
-/// 真偽値にせず列挙型にして、観測（REPAIR-4）や将来の分岐に備える。いずれも「居ない状態に到達済み」を表す。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RecordedCgroupOutcome {
-    /// スコープまたはコンテナ cgroup が無い（空でない cgroup は消えないので、プロセスも居ない）。
-    AlreadyAbsent,
-    /// コンテナ cgroup は在り、`populated 0`（子孫を含めて空）だった。何も kill していない。
-    WasEmpty,
-    /// プロセスが居たため `cgroup.kill` で止め、期限内に `populated 0` を確かめた。
-    Killed,
-}
 
 /// 子ディレクトリを開く関数（本番は [`open_cgroup_dir`]。テストだけが tmpfs 向けに差し替える）。
 type OpenDir<'a> = &'a dyn Fn(CgroupStep, BorrowedFd<'_>, &str) -> Result<OwnedFd, CgroupError>;

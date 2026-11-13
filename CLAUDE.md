@@ -148,6 +148,7 @@ fandhe-container/
 │   │   ├── cri-streaming-server.md  # CRI ストリーミングサーバー基盤と URL 発行（POD の PortForward の helper 方式の設計は #3766）（loopback 既定・外部は opt-in・トークン 32 バイト単回使用・TTL 60 秒・接続の上限と期限・SPDY/3.1 は #680〜#682・本番 backend の設計〔Exec の helper と kind 6/7 の再利用・Attach の段階方式・PortForward の NODE / POD。#3752〕。TASK-63.1・#679・#678・CRI-6・REPAIR-5）
 │   │   ├── fdinfo-mnt-id-parsing.md  # core・net・gpu の fdinfo `mnt_id` 解析を共有せず、共有 fixture `crates/core/testdata/fdinfo_mnt_id_cases.txt` の照合試験で一致を担保する判断記録（共有下位 crate の案 B はオーナー承認待ち。#3140・GPU-2・SEC-1・REPAIR-1）
 │   │   ├── pod-namespace-holder.md  # pod の namespace 保持役・netns の共有・本番の PodNetworkProvider 注入の設計と実装単位（pid・uts・/dev/shm・TARGET の方式は #2903・#2838・CRI-2・CORE-3・SEC-5・NET-3）
+│   │   ├── start-chain-resume.md  # 回復後に記録済み cgroup の配置から start の連鎖を再開する API〔`resume_recorded_scope`〕と回復結果の構造化ログ〔`NoProcessEvidence`〕の判断記録・CLI 経路で再開できない理由と選択肢（オーナー判断待ち）。#2245・CORE-2・OCI-6・REPAIR-4
 │   │   ├── restart-relaunch-single-thread.md  # restart の再 launch を単一スレッドを要求する本番 launcher で成り立たせる設計記録（常駐スレッドの停止と監視スレッドでの直接 launch・比較した方式・制御チャネルの扱い・残余。#2043・SUP-3・CORE-1）
 │   │   ├── cri-record-readoption.md  # plugin-cri の再起動をまたぐ sandbox・コンテナ記録の再採用の設計と実装単位（#2902・CRI-1・CRI-2・OCI-7・CORE-1）・自然終了の取り込み方式（照会時の読み取り。#4173）
 │   │   ├── cri-op-stats-export.md  # plugin-cri の操作統計を stderr 以外へ出す方式の比較と採用案（原子的に置き換えるスナップショットファイル・opt-in。2026-11-09 にオーナー承認・#4295）・作業単位 W1〜W5（#4335〜#4341。実装済み）（#4228・CRI-6・REPAIR-4）

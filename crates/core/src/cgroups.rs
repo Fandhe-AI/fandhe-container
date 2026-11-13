@@ -164,9 +164,11 @@ pub(crate) use exec_kill::{
     validate_exec_child_name,
 };
 pub use recorded_scope::{
-    RecordedCgroupKill, RecordedCgroupOutcome, RecordedCgroupScope, ensure_no_process_in_recorded,
+    RecordedCgroupKill, RecordedCgroupScope, ensure_no_process_in_recorded,
     kill_recorded_container_cgroup,
 };
+// 結果型は 3 OS 共通の `ProcessLauncher` の戻り値に使うため oci_runtime 側が定義し、既存の公開パスを保つ。
+pub use crate::oci_runtime::RecordedCgroupOutcome;
 
 /// 退避リーフ cgroup の名前。自プロセスの移動先（レイアウトは本モジュール冒頭を参照）。
 const EVACUATION_LEAF: &str = "fc-runtime";
@@ -248,11 +250,13 @@ pub enum CgroupStep {
     AttachDeviceProgram,
     /// アタッチ後の問い合わせと照合（プログラム数 1・attach flags 0。#1680・SEC-1）。
     VerifyDeviceProgram,
+    /// 回復後に記録済みの配置から start の連鎖を再開する段（`resume_recorded_scope`。#2245・CORE-2・OCI-6）。
+    ResumeScope,
 }
 
 impl CgroupStep {
     /// 全変種（試験での網羅確認用）。変種を足したら `as_str` とあわせてここも更新する。
-    pub const ALL: [Self; 26] = [
+    pub const ALL: [Self; 27] = [
         Self::ReadSelfCgroup,
         Self::OpenRoot,
         Self::VerifyCgroup2,
@@ -279,6 +283,7 @@ impl CgroupStep {
         Self::LoadDeviceProgram,
         Self::AttachDeviceProgram,
         Self::VerifyDeviceProgram,
+        Self::ResumeScope,
     ];
 
     /// 段名の snake_case 表現（`Display` と構造化ログで使う安定した語彙。ERR-1・ERR-4・REPAIR-4）。
@@ -312,6 +317,7 @@ impl CgroupStep {
             Self::LoadDeviceProgram => "load_device_program",
             Self::AttachDeviceProgram => "attach_device_program",
             Self::VerifyDeviceProgram => "verify_device_program",
+            Self::ResumeScope => "resume_scope",
         }
     }
 }
@@ -2080,13 +2086,14 @@ mod tests {
             CgroupStep::LoadDeviceProgram => 23,
             CgroupStep::AttachDeviceProgram => 24,
             CgroupStep::VerifyDeviceProgram => 25,
+            CgroupStep::ResumeScope => 26,
         }
     }
 
     /// ERR-1・ERR-4・#3118: `ALL` が全変種を重複なく持ち、`as_str` が `{:?}` の snake_case と一致する。
     #[test]
     fn err1_cgroup_step_as_str_is_snake_case_of_variant_name() {
-        let mut seen = [false; 26];
+        let mut seen = [false; 27];
         for s in CgroupStep::ALL {
             let i = step_index(s);
             assert!(!seen[i], "duplicate {s:?}");

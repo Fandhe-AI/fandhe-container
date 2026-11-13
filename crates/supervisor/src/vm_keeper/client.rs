@@ -35,6 +35,8 @@ pub const ENSURE_RUNNING_TIMEOUT_MAX: Duration = Duration::from_secs(60);
 const CALL_BUDGET: Duration = Duration::from_secs(5);
 /// 残り時間が尽きかけでも 0 の待ちを作らないための下限。
 const MIN_STEP: Duration = Duration::from_millis(1);
+/// 書き込み後に総期限を過ぎた場合でも応答の読み取りに与える下限（応答を捨てない。有界）。
+const READ_GRACE: Duration = Duration::from_millis(50);
 /// 起動後のポーリング間隔。
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
@@ -92,9 +94,12 @@ impl KeeperClient {
         let timeout = RpcTimeout::new(io_timeout).map_err(from_plugin)?;
         let frame = Frame::new(request.encode()).map_err(from_plugin)?;
         stream.write_frame(&frame, timeout).map_err(from_plugin)?;
+        // 書き込み後に総期限を過ぎていても、届いている応答を捨てないよう読み取りを短い下限つきで試みる
+        // （読み取りは有界。期限切れ後の上乗せは `READ_GRACE` まで）。
+        let read_budget = remaining_until(deadline).unwrap_or(Duration::ZERO);
         let timeout = RpcTimeout::new(
             REQUEST_IO_TIMEOUT
-                .min(remaining_until(deadline)?)
+                .min(read_budget.max(READ_GRACE))
                 .max(MIN_STEP),
         )
         .map_err(from_plugin)?;
@@ -199,30 +204,69 @@ fn deadline_error() -> TraitError {
 ///
 /// 子は応答の開始後は他クライアントの登録を受け付けるため、起動元の待機失敗だけで SIGKILL すると共有の保持役と登録簿を失う
 /// （MAC-4）。公開前の子はロック競合で自ら終了し、公開後の子は無登録の猶予後に自ら終了する。生きている子の `Child` を
-/// そのまま drop すると終了後に回収されずゾンビになるため、専用スレッドが `wait` で回収する（呼び出し元は待たない）。
+/// そのまま drop すると終了後に回収されずゾンビになるため、上限つきの共有の回収簿へ渡す。
 fn release_child(child: Child, primary: TraitError) -> TraitError {
     reap_in_background(child);
     primary
 }
 
-/// `child` の終了を別スレッドで待って回収する。起動役が CLI のように先に終わる場合は、子が init に付け替わって回収される。
-/// スレッドを作れない場合は非ブロッキングで回収を試みるだけに縮退する。
+/// 回収簿に載せる子の上限（超えたら古い順に諦めて drop する。無制限に溜めない）。
+const REAP_MAX_CHILDREN: usize = 16;
+/// 回収スレッドが 1 回の起動で子を見張る上限（保持役の無登録猶予 30 秒 + VM 停止 30 秒に余裕を足す）。
+const REAP_WINDOW: Duration = Duration::from_secs(90);
+/// 回収スレッドの走査間隔。
+const REAP_INTERVAL: Duration = Duration::from_millis(200);
+
+static REAP_LEDGER: std::sync::Mutex<Vec<Child>> = std::sync::Mutex::new(Vec::new());
+static REAPER_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 回収簿の終了済みの子を `try_wait` で回収し、残りの件数を返す（待たない）。
+fn sweep_ledger() -> usize {
+    let mut g = REAP_LEDGER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    g.retain_mut(|c| matches!(c.try_wait(), Ok(None)));
+    g.len()
+}
+
+/// `child` を回収簿へ載せ、期限つきの回収スレッドで `try_wait` により回収する。スレッドは `REAP_WINDOW` で必ず終わり、
+/// 期限後も子の所有権は回収簿に残って次の呼び出しの走査で回収される（`Child::wait` で無期限に待たない。REPAIR-5）。
+/// 起動役が CLI のように先に終わる場合は、子が init に付け替わって回収される。
 fn reap_in_background(child: Child) {
-    let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(child)));
-    let thread_slot = std::sync::Arc::clone(&slot);
+    {
+        let mut g = REAP_LEDGER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if g.len() >= REAP_MAX_CHILDREN {
+            g.retain_mut(|c| matches!(c.try_wait(), Ok(None)));
+        }
+        if g.len() >= REAP_MAX_CHILDREN {
+            // 上限超過は最古を回収簿から外す（drop は kill しない。終了後は init が回収する）。
+            #[allow(clippy::zombie_processes)]
+            // 上限超過の最古は諦める（終了後は init へ付け替わり回収される）
+            let _ = g.remove(0);
+        }
+        g.push(child);
+    }
+    use std::sync::atomic::Ordering;
+    if REAPER_RUNNING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
     let spawned = std::thread::Builder::new()
         .name("vm-keeper-reaper".to_owned())
-        .spawn(move || {
-            let taken = thread_slot.lock().ok().and_then(|mut g| g.take());
-            if let Some(mut c) = taken {
-                let _ = c.wait();
+        .spawn(|| {
+            let end = Instant::now() + REAP_WINDOW;
+            while Instant::now() < end && sweep_ledger() > 0 {
+                std::thread::sleep(REAP_INTERVAL);
             }
+            REAPER_RUNNING.store(false, Ordering::Release);
         });
-    if spawned.is_err()
-        && let Ok(mut g) = slot.lock()
-        && let Some(c) = g.as_mut()
-    {
-        let _ = c.try_wait();
+    if spawned.is_err() {
+        REAPER_RUNNING.store(false, Ordering::Release);
+        let _ = sweep_ledger();
     }
 }
 
@@ -299,12 +343,7 @@ mod tests {
     /// 期限切れでも、起動した子（公開済みの保持役でありうる）を kill しない（MAC-4）。
     #[test]
     fn ensure_running_timeout_does_not_kill_spawned_child() {
-        let dir = std::env::temp_dir().join(format!("vmk-client-nokill-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
-        }
+        let dir = crate::test_root::test_root("vmk-client", "nokill");
         let client = KeeperClient::new(&dir).expect("client");
         let mut pid = 0u32;
         let r = client.ensure_running(
@@ -324,20 +363,30 @@ mod tests {
             .expect("kill -0")
             .success();
         let _ = Command::new("kill").arg(pid.to_string()).status();
-        let _ = std::fs::remove_dir_all(&dir);
         assert!(
             alive,
             "spawned child {pid} must stay alive after the timeout"
         );
     }
 
+    /// 終了済みの子は回収簿から `try_wait` で回収され、無期限の `wait` を使わない（REPAIR-5）。
+    #[test]
+    fn released_child_is_reaped_without_blocking_wait() {
+        let child = Command::new("true").spawn().expect("spawn true");
+        let e = release_child(child, deadline_error());
+        assert_eq!(e.code(), ErrorCode::Timeout);
+        let end = Instant::now() + Duration::from_secs(10);
+        while sweep_ledger() > 0 {
+            assert!(Instant::now() < end, "ledger must drain after child exit");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// 保持役の stderr の出力先は配置ディレクトリ直下の 0600 の通常ファイルで、symlink は追従しない（REPAIR-4）。
     #[test]
     fn open_keeper_log_creates_private_file_and_rejects_symlink() {
-        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-        let base = std::env::temp_dir().join(format!("vmk-client-log-{}", std::process::id()));
-        std::fs::create_dir_all(&base).expect("mkdir");
-        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        use std::os::unix::fs::MetadataExt as _;
+        let base = crate::test_root::test_root("vmk-client", "log");
         let f = open_keeper_log(&base).expect("open log");
         assert_eq!(f.metadata().expect("meta").mode() & 0o777, 0o600);
         let dir = RuntimeDir::ensure_under(&base).expect("dir");
@@ -345,6 +394,5 @@ mod tests {
         std::fs::remove_file(&log).expect("rm");
         std::os::unix::fs::symlink(base.join("elsewhere"), &log).expect("symlink");
         assert!(open_keeper_log(&base).is_err());
-        let _ = std::fs::remove_dir_all(&base);
     }
 }

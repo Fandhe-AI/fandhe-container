@@ -145,10 +145,17 @@ pub(crate) fn from_plugin(e: PluginError) -> TraitError {
 /// bin の入口の本体。引数は `--base <絶対パス>` だけ（環境変数・既定パスは使わない）。成功は終了コード 0、
 /// 失敗は構造化エラーを stderr へ出して非 0（ロックを取れなかった場合は `FAILED_PRECONDITION`）。
 pub fn run_main(args: impl Iterator<Item = OsString>) -> ExitCode {
-    let result = parse_base(args).and_then(|base| {
-        let mut vm = UnwiredVm;
-        run(&KeeperConfig::default(), &base, &mut vm)
-    });
+    // 継承 fd の整理が最初（Linux。macOS の sys は unsafe を持たないため閉じず、stdio の開放だけ確かめる）。
+    #[cfg(target_os = "linux")]
+    let _ = crate::sys::close_fds_from(3);
+    let result = ensure_stdio_open()
+        .and_then(|()| parse_base(args))
+        .and_then(|base| {
+            // 稼働中の stderr（操作別カウント・レイテンシ）は回転する上限つきログへ向ける（REPAIR-4）。
+            install_rotating_log(&base)?;
+            let mut vm = UnwiredVm;
+            run(&KeeperConfig::default(), &base, &mut vm)
+        });
     match result {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
@@ -161,6 +168,37 @@ pub fn run_main(args: impl Iterator<Item = OsString>) -> ExitCode {
             ExitCode::from(err.exit_code().get())
         }
     }
+}
+
+/// 保持役の回転ログの名前（`client::KEEPER_LOG_NAME` の起動直後用ファイルとは別名）。
+const ROTATING_LOG_ID: &str = "vm-keeper-events";
+
+/// 稼働中の構造化ログを、配置ディレクトリ直下の回転ログ（1 MiB × 3 世代）へ向ける。
+/// ロック競合で負ける保持役はここで `FAILED_PRECONDITION` になりうる（勝った側が開いている間。意味は同じ）。
+fn install_rotating_log(base: &std::path::Path) -> Result<(), TraitError> {
+    use std::sync::Arc;
+    let dir = fandhe_container_plugin::RuntimeDir::ensure_under(base).map_err(from_plugin)?;
+    let id = fandhe_container_core::traits::ContainerId::new(ROTATING_LOG_ID)?;
+    let config = crate::logs::RotationConfig::new(
+        crate::supervisor_log::SUPERVISOR_LOG_FILE_BYTES,
+        crate::supervisor_log::SUPERVISOR_LOG_GENERATIONS,
+    )?;
+    let sink = crate::logs::RotatingFileSink::open(dir.path(), &id, config)?;
+    let writer = crate::supervisor_log::SupervisorLogWriter::new(Arc::new(sink));
+    crate::stderr_sink::install_stderr_writer(Box::new(writer))
+}
+
+/// fd 0〜2 が開いていることを確かめる（閉じていると以後の open が fd 0〜2 を取り、ログ・socket と取り違える）。
+fn ensure_stdio_open() -> Result<(), TraitError> {
+    for fd in 0..3 {
+        if std::fs::metadata(format!("/dev/fd/{fd}")).is_err() {
+            return Err(TraitError::new(
+                ErrorCode::FailedPrecondition,
+                "the vm keeper requires stdin, stdout and stderr to be open",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn parse_base(mut args: impl Iterator<Item = OsString>) -> Result<PathBuf, TraitError> {

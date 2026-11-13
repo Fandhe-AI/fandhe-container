@@ -117,7 +117,7 @@ fandhe-container/
 │   │   ├── volume-provider-implementation.md  # VolumeProvider の core 側実装（named volume の実体化）の担当 TASK と時期の判断記録（#2451・CRI-7・PLUG-1・IO-7。オーナー承認待ち）
 │   │   ├── image-store-adapter-placement.md  # ImageStore 系アダプタ（ContainerImageRefs ほか）の置き場所の判断材料（#2315・OCI-7・OCI-5。オーナー承認待ち）
 │   │   ├── image-store-root-trust.md  # イメージストア root の検査の基準（権限ビット・所有者）と ACL・再検査・libc 照合の採否の判断記録（#2547・OCI-7・SEC-1。基準はオーナー承認待ち）
-│   │   ├── macos-state-root.md    # macOS の既定の状態ルート（`StateRoot::resolve(None)`）の判断記録（#2431・OCI-5・SEC-4。オーナー承認待ち）
+│   │   ├── macos-state-root.md    # macOS の既定の状態ルート（`StateRoot::resolve(None)`）の判断記録（#2431・#4665・OCI-5・SEC-4。案 A 承認済み: 既定なし・`--root` 必須）
 │   │   ├── windows-execution-layout.md  # Windows の実行構成（WSL2 ゲスト内の core とホストの起動役）の設計ドラフト（#1415・#1539 の決定以外はオーナー承認待ち。TASK-116 追補・#1862・WIN-1）
 │   │   ├── audit-non-linux.md     # 非 Linux の監査の記録経路（Windows の主経路の隔離・代替経路）の設計ドラフト・判断シート（#2430・SEC-4・オーナー承認待ち）
 │   │   ├── audit-delivery.md      # seccomp・Landlock の拒否を監査の記録先へ届ける配送経路の設計（2026-10-15 に方式を採用・#2018。実装は #2023〜#2028・#2004。TASK-41 追補・#1835・SEC-4）

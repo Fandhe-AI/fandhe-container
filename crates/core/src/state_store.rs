@@ -74,8 +74,9 @@
 //!   付いていたら中身を解釈せずに拒否する（ACL は mode bits を迂回して他者に書き込みを許せるため。#1539 と
 //!   同じ方針）。実効 UID・`O_NOFOLLOW | O_NONBLOCK`・ACL の検出は `sys/macos.rs` の薄いラッパー。
 //!   制約: 既定で deny の ACL が付いた場所（ホームディレクトリ等）の下には状態ルートを置けない。既定の
-//!   状態ルート（[`StateRoot::resolve`]）は Linux のみで、macOS では上書き指定が必須
-//!   （macOS の既定はオーナー判断待ち。#2431・`docs/design/macos-state-root.md`）
+//!   状態ルート（[`StateRoot::resolve`]）は Linux のみで、macOS ホストは既定を持たない恒久の拒否
+//!   （案 A・2026-11-13 のオーナー承認。上書き指定が必須で、無ければ `FailedPrecondition`。
+//!   #2431・#4665・OCI-5・SEC-4・`docs/design/macos-state-root.md`）
 //! - Windows ホスト: [`FileStateStore::open`] は何も作らずに `FailedPrecondition` で**設計上恒久的に**拒否する
 //!   （#2428 の案 C・2026-11-09 のオーナー判断。OCI-5 (4)・WIN-1）。macOS / Windows の状態はゲスト VM 内の
 //!   Linux パスに置く構成で（core・CLI・supervisor は WSL2 ゲスト内で動く。#1415・
@@ -309,26 +310,25 @@ impl StateRoot {
     /// 上書き指定があればそれを、なければ既定（root: `/run/fandhe-container`、rootless:
     /// `$XDG_RUNTIME_DIR/fandhe-container`）を使う。
     ///
-    /// 既定の解決は Linux のみ（macOS / Windows ではゲスト VM 内の Linux パスとして同じ規則を
-    /// 使う。OCI-5）。Linux 以外で上書き指定がなければ `Unimplemented`（fail-closed）。
-    /// macOS の既定の置き場はオーナー判断待ち（#2431・`docs/design/macos-state-root.md`）。
+    /// 既定の解決は Linux のみ（ゲスト VM 内の Linux パスとして同じ規則を使う。OCI-5）。
+    /// - macOS ホスト: 既定を持たない恒久の拒否（#2431 案 A・#4665。OCI-5・SEC-4）。上書き指定（`--root`）
+    ///   が無ければ、環境変数も uid も見ずに `FailedPrecondition` と固定文言で拒否する
+    ///   （`/tmp` 等への推測のフォールバックはしない。ERR-2）。
+    /// - その他（Windows）: 従来どおり `Unimplemented`（fail-closed）。
     pub fn resolve(override_root: Option<PathBuf>) -> Result<Self, TraitError> {
         if let Some(path) = override_root {
             return Self::from_override(path);
         }
+        let host = DefaultRootHost::current();
         #[cfg(target_os = "linux")]
-        {
-            let is_root = crate::sys::effective_uid() == 0;
-            let xdg = std::env::var_os("XDG_RUNTIME_DIR");
-            resolve_default(is_root, xdg).map(Self)
-        }
+        let (is_root, xdg) = (
+            crate::sys::effective_uid() == 0,
+            std::env::var_os("XDG_RUNTIME_DIR"),
+        );
+        // Linux 以外は uid も環境変数も読まない（環境由来の値に依存しない）。
         #[cfg(not(target_os = "linux"))]
-        {
-            Err(err(
-                ErrorCode::Unimplemented,
-                "default state root is defined only inside a Linux guest",
-            ))
-        }
+        let (is_root, xdg) = (false, None);
+        resolve_default_for_host(host, is_root, xdg).map(Self)
     }
 
     /// 状態ルートのパスを返す。
@@ -341,7 +341,6 @@ impl StateRoot {
 ///
 /// `XDG_RUNTIME_DIR` が未設定・空・相対パスの rootless は `/tmp` 等へ落とさず
 /// `FailedPrecondition` にする（fail-closed。ERR-2）。
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn resolve_default(
     is_root: bool,
     xdg_runtime_dir: Option<OsString>,
@@ -354,6 +353,52 @@ fn resolve_default(
         _ => Err(err(
             ErrorCode::FailedPrecondition,
             "XDG_RUNTIME_DIR must be set to an absolute path for rootless state",
+        )),
+    }
+}
+
+/// macOS ホストで既定の状態ルートを拒否するときの固定文言（`--root` が要ると分かる形。#4665・OCI-5）。
+const MSG_MACOS_HOST_DEFAULT_ROOT_REFUSED: &str = "default state root is not defined on a macOS host by design; pass --root or use the Linux guest path";
+
+/// 既定の状態ルートを解決するときのホストの種類（`cfg` の値を引数にして 3 OS で試験できるようにする）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DefaultRootHost {
+    /// Linux（ホストまたはゲスト内）。既定は [`resolve_default`]。
+    LinuxGuest,
+    /// macOS ホスト。既定を持たない恒久の拒否（#2431 案 A・#4665）。
+    MacosHost,
+    /// その他（Windows）。従来どおり `Unimplemented`。
+    OtherHost,
+}
+
+impl DefaultRootHost {
+    /// ビルド対象の値。`cfg(target_os)` の分岐はここに局所化する（CLI-1）。
+    const fn current() -> Self {
+        if cfg!(target_os = "linux") {
+            Self::LinuxGuest
+        } else if cfg!(target_os = "macos") {
+            Self::MacosHost
+        } else {
+            Self::OtherHost
+        }
+    }
+}
+
+/// ホストの種類ごとに既定の状態ルートを決める純粋関数（[`StateRoot::resolve`] から呼ぶ。OCI-5・SEC-4）。
+fn resolve_default_for_host(
+    host: DefaultRootHost,
+    is_root: bool,
+    xdg_runtime_dir: Option<OsString>,
+) -> Result<PathBuf, TraitError> {
+    match host {
+        DefaultRootHost::LinuxGuest => resolve_default(is_root, xdg_runtime_dir),
+        DefaultRootHost::MacosHost => Err(err(
+            ErrorCode::FailedPrecondition,
+            MSG_MACOS_HOST_DEFAULT_ROOT_REFUSED,
+        )),
+        DefaultRootHost::OtherHost => Err(err(
+            ErrorCode::Unimplemented,
+            "default state root is defined only inside a Linux guest",
         )),
     }
 }
@@ -1274,7 +1319,8 @@ fn ensure_supported_platform() -> Result<(), TraitError> {
 /// 恒久的に拒否する（fail-closed。#2428 の案 C・2026-11-09 のオーナー判断。OCI-5 (4)・WIN-1）。
 /// 状態はゲスト内の Linux パスに置き、Windows ホストの起動役は状態を持たない（#1415）。「未実装」ではない
 /// ため `Unimplemented` ではなく、前提（Linux ゲスト内で動く）の不成立を表す `FailedPrecondition` を返す。
-/// `StateRoot::resolve` の `Unimplemented`（macOS の既定の置き場。#2431）とは別の判断。
+/// macOS の `resolve(None)` は #2431 案 A（#4665）で同じく `FailedPrecondition` の恒久拒否。Windows の
+/// `resolve(None)` は `Unimplemented` のまま。
 /// `open` の先頭（副作用の前）から呼ぶ。`docs/design/windows-state-store-acl.md`。
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn ensure_supported_platform() -> Result<(), TraitError> {
@@ -2845,6 +2891,79 @@ mod platform_tests {
     }
 
     #[test]
+    fn oci5_sec4_4665_macos_host_default_root_is_refused_by_design() {
+        let abs = std::env::temp_dir().into_os_string();
+        for is_root in [true, false] {
+            for xdg in [
+                None,
+                Some(OsString::new()),
+                Some(OsString::from("run/user")),
+                Some(abs.clone()),
+            ] {
+                let e =
+                    resolve_default_for_host(DefaultRootHost::MacosHost, is_root, xdg).unwrap_err();
+                assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+                assert_eq!(e.code().as_str(), "FAILED_PRECONDITION");
+                assert_eq!(e.message(), MSG_MACOS_HOST_DEFAULT_ROOT_REFUSED);
+                assert!(e.message().contains("--root"));
+                assert!(!e.message_truncated());
+            }
+        }
+    }
+
+    #[test]
+    fn oci5_4665_linux_guest_default_is_unchanged() {
+        assert_eq!(
+            resolve_default_for_host(DefaultRootHost::LinuxGuest, true, None).unwrap(),
+            PathBuf::from("/run/fandhe-container")
+        );
+        let xdg = std::env::temp_dir();
+        assert_eq!(
+            resolve_default_for_host(
+                DefaultRootHost::LinuxGuest,
+                false,
+                Some(xdg.clone().into_os_string())
+            )
+            .unwrap(),
+            xdg.join("fandhe-container")
+        );
+        for bad in [
+            None,
+            Some(OsString::new()),
+            Some(OsString::from("run/user")),
+        ] {
+            assert_eq!(
+                code(resolve_default_for_host(
+                    DefaultRootHost::LinuxGuest,
+                    false,
+                    bad
+                )),
+                "FAILED_PRECONDITION"
+            );
+        }
+    }
+
+    #[test]
+    fn oci5_4665_other_host_default_stays_unimplemented() {
+        let e = resolve_default_for_host(DefaultRootHost::OtherHost, false, None).unwrap_err();
+        assert_eq!(e.code().as_str(), "UNIMPLEMENTED");
+        assert_eq!(
+            e.message(),
+            "default state root is defined only inside a Linux guest"
+        );
+    }
+
+    #[test]
+    fn oci5_4665_current_host_matches_target_os() {
+        #[cfg(target_os = "linux")]
+        assert_eq!(DefaultRootHost::current(), DefaultRootHost::LinuxGuest);
+        #[cfg(target_os = "macos")]
+        assert_eq!(DefaultRootHost::current(), DefaultRootHost::MacosHost);
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        assert_eq!(DefaultRootHost::current(), DefaultRootHost::OtherHost);
+    }
+
+    #[test]
     fn oci5_override_must_be_absolute() {
         assert_eq!(
             code(StateRoot::from_override(PathBuf::from("relative/root"))),
@@ -2914,6 +3033,27 @@ mod macos_tests {
         #[allow(dead_code)] // drop で後始末するための guard（#3434・REPAIR-12）。
         crate::scratch_root::ScratchDir,
     );
+
+    #[test]
+    fn oci5_sec4_4665_resolve_none_is_refused_on_macos_host() {
+        let e = StateRoot::resolve(None).unwrap_err();
+        assert_eq!(e.code().as_str(), "FAILED_PRECONDITION");
+        assert_eq!(e.message(), MSG_MACOS_HOST_DEFAULT_ROOT_REFUSED);
+    }
+
+    #[test]
+    fn oci5_4665_resolve_override_still_works_on_macos_host() {
+        let base = fs::canonicalize(std::env::temp_dir()).expect("temp dir");
+        let given = base.join("x-4665");
+        let root = StateRoot::resolve(Some(given.clone())).unwrap();
+        assert_eq!(root.path(), given.as_path());
+        for bad in [PathBuf::from("rel"), base.join("..").join("x")] {
+            assert_eq!(
+                StateRoot::resolve(Some(bad)).unwrap_err().code().as_str(),
+                "INVALID_ARGUMENT"
+            );
+        }
+    }
 
     impl Dir {
         fn new(tag: &str) -> Self {

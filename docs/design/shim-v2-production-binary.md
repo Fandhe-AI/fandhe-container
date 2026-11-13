@@ -21,7 +21,7 @@ CRI-5・CRI-7・PLUG-1・PLUG-4・REPAIR-3・TASK-62.6 の判断記録。配布�
 
 - Linux: `StateRoot::resolve(None)` の `FileStateStore` の上に `CoreLifecycleRuntime::with_recorder` を作り、`RuntimeAdapter` で包んだ `TaskService`（v2・v3。`with_shared_created` で共有）を登録する
 - インスタンスロック（`.cri/@instance.lock`）は取らず、`CriPluginBackends::production()` も使わない。shim は pod（コンテナ）ごとに 1 プロセスで plugin-cri とも状態ルートを共有するため、ロックを取ると 2 つ目の shim と plugin-cri を締め出す。shim は回収記録・CRI 記録・在庫を持たないのでロックが守る対象も無い。並行の制御は core の `StateStore` の `@lock` に任せる（CLI と同じ前提）
-- 非 Linux（macOS は既定の状態ルートが未決定で #2431、`start`・`kill`・`stop` も plugin-cri では `Unimplemented`）は、従来どおり Shutdown だけの `EmptyTaskService` を登録する（REPAIR-3）
+- 非 Linux（macOS は既定の状態ルートを持たないと確定（#2431 案 A・#4665）、`start`・`kill`・`stop` も plugin-cri では `Unimplemented`）は、従来どおり Shutdown だけの `EmptyTaskService` を登録する（REPAIR-3）
 
 ### D3 監査の記録先の共有（SEC-4）
 
@@ -45,7 +45,7 @@ containerd は shim が死んだ後や start が失敗した後に `-id <id> -bu
 - 読み取り専用での開き方: 階層のどれかが無ければ記録なし。各階層は `ensure_private_dir` と同じ基準（ディレクトリ・symlink でない・group/other に権限なし）を fail-closed で検査する。`@lock` が無いとき、`@` で始まらないエントリ（コンテナの階層）が無ければ記録なし（一度もロックつきの操作が無い）、あれば不整合として拒否する。`@lock` があるときは `FileStateStore::open` を使う。既にエントリがあるルートでは `open` は作成も初期化も `sync_dir` もせず、`get` は既存の `@lock` の flock だけで、木（内容・mtime・mode）が前後で変わらないことを試験（`cri5_4151_*`）で照合する
 - 分類（`DeleteRecordMatch`）: `NotRecorded`（階層なし、または一度もロックつきの操作が無い）・`Recorded`（Creating・Created・Running・Stopped のいずれの記録も、id と bundle が対象と一致するとき）・`AlreadyReclaimed`（ストアはあるが id の記録が無い）。`StateStore` に tombstone が無く `get` は「一度も作られなかった」と「削除済み」を共に `NotFound` で返すため、ストアはあるが一度も作られなかった id も `AlreadyReclaimed` に入る（区別できるように装わない）。`NotRecorded` は副作用 0 回（状態ルートも作らない）。`AlreadyReclaimed` は状態記録・cgroup・プロセスに触れず、ID 単位の残骸 3 種（supervisor ログ・コンテナログ・起動オプション文書）の guard つき削除だけを行う（D7・#4279）。一度も作られなかった id は残骸が無いので何も起きない。応答はどちらも固定
 - 記録の bundle との照合: create が受けた bundle は正規化されず絶対パスのまま記録されるため、`Path` の比較（区切りの重複・末尾の区切りを無視）で `-bundle` と比べる。食い違いは `FAILED_PRECONDITION`、記録の id の食い違いは `INTERNAL`（ストアの不整合）、読み取りの期限切れは `DEADLINE_EXCEEDED`、その他の読み取り失敗は固定文言の `INTERNAL`
-- 非 Linux: 既定の状態ルートが未決定（#2431）のため、引数の検証だけを行い照合は縮退する
+- 非 Linux: 既定の状態ルートを持たない（macOS は #2431 案 A で恒久。Windows は未対応）ため、引数の検証だけを行い照合は縮退する
 - 前段の戻り値は #4151 の時点では `Result<(), CriError>` にとどめ、照合結果を捨てていた。#4152 で `Result<Option<ShimDeleteExit>, CriError>` へ広げた（D6）
 - 実機確認: 実際の containerd の bundle の形（`<state>/<ns>/<id>`）で delete が拒否されないことは #3685（人間担当）の記録項目に足す
 
@@ -434,4 +434,4 @@ TaskService は期限を足さず、実装側が持つ（トレイトの契約�
 ## 再評価条件
 
 - cri から plugin-cri への依存を許す判断が出たとき（bin を cri へ戻せる）
-- 非 Linux の状態ルートが決まったとき（#2431。縮退を外せる）
+- 非 Linux で状態ルートの中継などが入ったとき（macOS の既定は #2431 案 A で持たないと確定。縮退を外せる）

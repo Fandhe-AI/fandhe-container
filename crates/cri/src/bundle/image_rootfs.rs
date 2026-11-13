@@ -62,9 +62,10 @@
 //!   [`ImageDefaults::resolved_run_as_username`] へ返す（#2664・CRI-2・SEC-5）。見つからない・passwd が無い場合は
 //!   `INVALID_ARGUMENT`、安全に読めない場合は `FAILED_PRECONDITION`、読む手段が無い場合は `UNIMPLEMENTED`。
 //!   数字だけの名前は拒否する（数値は `run_as_user`。containerd は uid 扱いの既知の差）
-//! - **展開設定**: 所有者・特殊ビットの本番の値は現状も既定の `Keep` + `Strip`。`ChownMapped` 等の配線は #2241
-//!   （rootful の可否）・#2315・#482（core の user namespace 配線）が前提で（pull の呼び出し元の配線は #2592 で済み）、
-//!   それまで据え置く（#2534・SEC-5。`docs/design/oci-layer-special-bits.md`）。pull と create の設定は
+//! - **展開設定**: 所有者・特殊ビットの本番の値は plugin-cri が start と同じ権限モデルの解決から選ぶ（#2792）が、
+//!   現状はどの権限モデルでも既定の `Keep` + `Strip`。特殊ビットを保持する `PreserveIfOwnerMapped` は、展開後に
+//!   `open_rootfs_for_search` が rootfs を 0755 にするため「root を使い終わるまで 0700 に保つ」契約と両立せず保持しない。
+//!   `ChownInUserNamespace` は後続 issue（#2534・SEC-5。`docs/design/oci-layer-special-bits.md`）。pull と create の設定は
 //!   [`ImageExtractConfig`] で 1 か所にまとめる
 //! - 展開は `extract_image_layers_bounded_in` でエントリ単位に期限（この `prepare` の開始からの `deadline`）と取り消しの
 //!   旗（`prepare_cancellable`）を確かめ、超過・取り消しは `Timeout`（`DEADLINE_EXCEEDED`）で止めて rootfs を消す

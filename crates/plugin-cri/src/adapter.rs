@@ -144,6 +144,11 @@ pub const MSG_NETWORK_UNAVAILABLE: &str = "network plugin is not available in th
 pub const MSG_BUNDLE_UNAVAILABLE: &str =
     "bundle provisioning is not available in the CRI plugin yet";
 
+/// 権限モデルの解決器（[`crate::extract_identity::ExtractIdentity`] を返す）。
+#[cfg(unix)]
+type ExtractResolver =
+    Arc<dyn Fn() -> Result<crate::extract_identity::ExtractIdentity, CriError> + Send + Sync>;
+
 /// plugin プロセスが core のトレイト境界へ差す実装の組（trait object だけを持つ。CRI-7）。
 #[derive(Clone)]
 pub struct CriPluginBackends {
@@ -160,6 +165,14 @@ pub struct CriPluginBackends {
     lifecycle_recorder: Option<Arc<OpRecorder>>,
     /// oci の pull・展開・回収の操作統計（`oci.*`）と `cri.pull_image.registry_http.*`（#2966）専用の記録器。共有記録器とは枠を分ける（`MAX_TRACKED_OPS`。REPAIR-4・#2900）。
     oci_recorder: Arc<OpRecorder>,
+    /// pull と create の展開設定（`ExtractOptions`）を選ぶ権限モデルの解決器（本番は start と同じ解決。試験で差し替える。
+    /// SEC-5・OCI-1・#2792）。
+    #[cfg(unix)]
+    extract_resolver: ExtractResolver,
+    /// 解決結果の共有キャッシュ。`image_service` と `production_bundle_provider` が同じ値を使う（pull と create の
+    /// 展開設定を食い違わせない）。失敗は保持せず、毎回同じ解決器で再試行する（縮退しない）。
+    #[cfg(unix)]
+    extract_options: Arc<std::sync::OnceLock<fandhe_container_oci::layer::extract::ExtractOptions>>,
     /// `production()` が解決した状態ルート（bundle とイメージキャッシュの置き場の親。注入で組んだときは `None`）。
     state_root: Option<PathBuf>,
     /// `production()` が取った状態ルートのインスタンスロック（`.cri/@instance.lock`。注入で組んだときは `None`）。
@@ -210,6 +223,10 @@ impl CriPluginBackends {
             recorder,
             lifecycle_recorder: None,
             oci_recorder: Arc::new(OpRecorder::new()),
+            #[cfg(unix)]
+            extract_resolver: Arc::new(crate::extract_identity::resolve_extract_identity),
+            #[cfg(unix)]
+            extract_options: Arc::new(std::sync::OnceLock::new()),
             state_root: None,
             _instance_lock: None,
             images: Arc::new(InMemoryImageStore::new()),
@@ -347,6 +364,35 @@ impl CriPluginBackends {
         self._instance_lock.as_ref()
     }
 
+    /// 展開設定の権限モデルの解決器を差し替える（試験用。SEC-5・OCI-1・#2792）。キャッシュは作り直す。
+    #[cfg(unix)]
+    #[must_use]
+    pub fn with_extract_identity_resolver(
+        mut self,
+        resolver: impl Fn() -> Result<crate::extract_identity::ExtractIdentity, CriError>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        self.extract_resolver = Arc::new(resolver);
+        self.extract_options = Arc::new(std::sync::OnceLock::new());
+        self
+    }
+
+    /// pull と create が共有する展開設定。初回に 1 度だけ権限モデルを解決して保持する（start と同じ解決。
+    /// 失敗は縮退せずエラー。SEC-5・OCI-1・#2792）。
+    #[cfg(unix)]
+    fn extract_options(
+        &self,
+    ) -> Result<fandhe_container_oci::layer::extract::ExtractOptions, CriError> {
+        if let Some(cached) = self.extract_options.get() {
+            return Ok(cached.clone());
+        }
+        let identity = (self.extract_resolver)()?;
+        let options = crate::extract_identity::extract_options_for(&identity);
+        Ok(self.extract_options.get_or_init(|| options).clone())
+    }
+
     /// 本番の bundle 供給を作る（状態ルート配下の固定位置。要求の入力から受けない。#2433）。
     ///
     /// `production()` で組んだときだけ使え、注入で組んだときは `FAILED_PRECONDITION`。詳細は `bundle_provider_in`。
@@ -355,10 +401,11 @@ impl CriPluginBackends {
         &self,
     ) -> Result<Arc<fandhe_container_cri::bundle::SpecBundleProvider>, CriError> {
         match &self.state_root {
-            Some(root) => bundle_provider_with(
+            Some(root) => bundle_provider_with_options(
                 root,
                 Some(Arc::clone(&self.images)),
                 Some(self.oci_adapter()),
+                &self.extract_options()?,
             ),
             None => Err(CriError::failed_precondition(
                 "state root is not configured",
@@ -461,7 +508,7 @@ impl CriPluginBackends {
                 "state root is not configured",
             ));
         };
-        let pull = production_pull_config(root)?;
+        let pull = production_pull_config(root, &self.extract_options()?)?;
         let client = OciRegistryClient::new(&production_registry_config())
             .map_err(|_| CriError::failed_precondition("failed to prepare the registry client"))?
             .with_recorder(self.oci_adapter());
@@ -651,8 +698,9 @@ pub const PLUGIN_ROOTFS_DEADLINE: Duration = fandhe_container_cri::bundle::DEFAU
 #[cfg(unix)]
 fn production_extract_config(
     state_root: &std::path::Path,
+    options: &fandhe_container_oci::layer::extract::ExtractOptions,
 ) -> Result<fandhe_container_cri::bundle::ImageExtractConfig, CriError> {
-    let pull = production_pull_config(state_root)?;
+    let pull = production_pull_config(state_root, options)?;
     let mut cfg = fandhe_container_cri::bundle::ImageExtractConfig::from_pull_config(&pull);
     cfg.deadline = PLUGIN_ROOTFS_DEADLINE;
     Ok(cfg)
@@ -968,10 +1016,15 @@ pub const PLUGIN_PULL_DEADLINE: Duration = Duration::from_secs(540);
 
 /// 本番の `PullConfig`（キャッシュは `<state_root>/.cri/images`。pull と create の展開設定の単一の出所）。
 ///
-/// 所有者・特殊ビットは既定の `Keep` + `Strip` のまま（`ChownMapped` 等の本番値は #2241・#2315・#482 が前提。REPAIR-3）。
+/// 所有者・特殊ビットは呼び出し元が `crate::extract_identity::extract_options_for` で選んだ値を渡す
+/// （start と同じ権限モデルの解決から。現状はどの行も `Keep` + `Strip`。本来の値の配線は後続 issue。SEC-5・OCI-1・#2792・REPAIR-3）。
 #[cfg(unix)]
-fn production_pull_config(state_root: &std::path::Path) -> Result<PullConfig, CriError> {
+fn production_pull_config(
+    state_root: &std::path::Path,
+    options: &fandhe_container_oci::layer::extract::ExtractOptions,
+) -> Result<PullConfig, CriError> {
     let mut pull = PullConfig::new(state_root.join(IMAGES_DIR))?;
+    pull.extract_options = options.clone();
     pull.pull_deadline = PLUGIN_PULL_DEADLINE;
     Ok(pull)
 }
@@ -2291,8 +2344,8 @@ const IMAGES_DIR: &str = ".cri/images";
 /// 状態ルートと同じ所有者で、group / other の権限が無いことを確かめ、反すれば消さずに拒否する（fail-closed）。
 /// 失敗の文言は固定で、パスや OS の文字列を含めない。
 ///
-/// 展開設定（所有者・特殊ビット）は既定（`Keep` + `Strip`）のままで、`ChownMapped` 等の
-/// 本番の値は渡さない。配線の前提は #2241・#2315・#482（#2534・SEC-5。`fandhe_container_cri::image_pull` の
+/// 展開設定（所有者・特殊ビット）は既定（`Keep` + `Strip`）を明示して渡す。本番の `production_bundle_provider` は
+/// 権限モデルの解決結果を [`bundle_provider_with_options`] で渡す（#2792。`fandhe_container_cri::image_pull` の
 /// 「未実装範囲」を参照）。
 #[cfg(unix)]
 pub fn bundle_provider_in(
@@ -2312,6 +2365,22 @@ pub fn bundle_provider_with(
     store: Option<Arc<dyn ImageStore>>,
     recorder: Option<Arc<dyn OciOpRecorder>>,
 ) -> Result<Arc<fandhe_container_cri::bundle::SpecBundleProvider>, CriError> {
+    bundle_provider_with_options(
+        state_root,
+        store,
+        recorder,
+        &fandhe_container_oci::layer::extract::ExtractOptions::new(),
+    )
+}
+
+/// [`bundle_provider_with`] に展開設定 `options`（pull と同じ値）を足した形（SEC-5・OCI-1・#2792）。
+#[cfg(unix)]
+pub fn bundle_provider_with_options(
+    state_root: &std::path::Path,
+    store: Option<Arc<dyn ImageStore>>,
+    recorder: Option<Arc<dyn OciOpRecorder>>,
+    options: &fandhe_container_oci::layer::extract::ExtractOptions,
+) -> Result<Arc<fandhe_container_cri::bundle::SpecBundleProvider>, CriError> {
     use fandhe_container_cri::bundle::{ImageRootfsSource, SpecBundleProvider};
 
     let fail = || CriError::failed_precondition("failed to prepare the bundle store");
@@ -2319,7 +2388,7 @@ pub fn bundle_provider_with(
     prepare_private_dir(state_root, IMAGES_DIR).map_err(|_| fail())?;
     // SpecBundleProvider は root の正規化済みパスを要求する（途中の symlink を拒否する）。
     let bundles = std::fs::canonicalize(bundles).map_err(|_| fail())?;
-    let mut source = ImageRootfsSource::new(production_extract_config(state_root)?);
+    let mut source = ImageRootfsSource::new(production_extract_config(state_root, options)?);
     if let Some(store) = store {
         source = source.with_image_store(store);
     }
@@ -2452,9 +2521,71 @@ mod tests {
     #[test]
     fn repair5_production_extract_config_uses_plugin_rootfs_deadline() {
         let dir = std::env::temp_dir().join(format!("fcpc-extract-cfg-{}", std::process::id()));
-        let cfg = production_extract_config(&dir).expect("config");
+        let cfg = production_extract_config(
+            &dir,
+            &fandhe_container_oci::layer::extract::ExtractOptions::new(),
+        )
+        .expect("config");
         assert_eq!(cfg.deadline, PLUGIN_ROOTFS_DEADLINE);
         assert_eq!(cfg.deadline, Duration::from_secs(600));
+    }
+
+    /// SEC-5・OCI-1・#2792: pull と create の展開設定は同じ `ExtractOptions` から作られ、一致する。
+    #[cfg(unix)]
+    #[test]
+    fn sec5_oci1_2792_pull_and_create_extract_options_match() {
+        let dir = std::env::temp_dir().join(format!("fcpc-2792-match-{}", std::process::id()));
+        let opts = crate::extract_identity::extract_options_for(
+            &crate::extract_identity::ExtractIdentity::RootlessSingleId,
+        );
+        let pull = production_pull_config(&dir, &opts).expect("pull");
+        let create = production_extract_config(&dir, &opts).expect("create");
+        assert_eq!(pull.extract_options, opts);
+        assert_eq!(create.extract_options, pull.extract_options);
+        assert_eq!(
+            fandhe_container_cri::bundle::ImageExtractConfig::from_pull_config(&pull)
+                .extract_options,
+            create.extract_options
+        );
+    }
+
+    /// SEC-5・OCI-1・#2792: 解決は 1 回だけで pull / create が共有し、失敗は既定値へ縮退せず毎回同じ区分で失敗する。
+    #[cfg(unix)]
+    #[test]
+    fn sec5_oci1_2792_resolution_is_shared_and_fails_closed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let store: Arc<dyn StateStore> = Arc::new(OneRecord::new(record(false)));
+        let rt = Arc::new(CoreLifecycleRuntime::with_recorder(
+            Arc::clone(&store),
+            Arc::new(OpRecorder::new()),
+        ));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&calls);
+        let ok = CriPluginBackends::new(
+            rt.clone(),
+            Arc::clone(&store),
+            Arc::new(UnimplementedNetwork),
+        )
+        .with_extract_identity_resolver(move || {
+            c.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::extract_identity::ExtractIdentity::RootlessSingleId)
+        });
+        let a = ok.extract_options().expect("first");
+        let b = ok.extract_options().expect("second");
+        assert_eq!(a, b);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let bad = CriPluginBackends::new(rt, store, Arc::new(UnimplementedNetwork))
+            .with_extract_identity_resolver(|| {
+                Err(CriError::failed_precondition("failed to resolve"))
+            });
+        let e1 = bad.extract_options().expect_err("fails");
+        let e2 = bad.extract_options().expect_err("fails again");
+        assert_eq!(
+            e1.code(),
+            fandhe_container_cri::error::CriErrorCode::FailedPrecondition
+        );
+        assert_eq!(e2.code(), e1.code());
     }
 
     /// CRI-2・REPAIR-12(#3506): 前回の残骸（古い `.cri/@instance.lock`）があっても消さず、別名の空のディレクトリを

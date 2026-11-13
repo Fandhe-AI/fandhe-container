@@ -141,7 +141,7 @@ macOS cold start 上乗せ確認（TASK-113.4・PLUG-6・MAC-2）は `benches/te
 14. `make install-launcher-selftest`（特権ランチャーのインストールスクリプト `scripts/install-privileged-launcher.sh` の自己テスト。スタブ・一時ディレクトリのみで root 不要。TASK-171 追補・#1721・SUP-14）
 14a. `make crictl-smoke-selftest`（crictl 疎通確認スクリプト `scripts/cri/crictl-smoke.sh` の自己テスト。スタブの crictl と一時ディレクトリの UNIX ソケットのみ。python3 が必要。実機は #442 で人間が行う。TASK-60・CRI-1）
 14b. `make small-files-compare-selftest`（bind / named volume の 2 構成比較スクリプト `scripts/bench/small_files_compare.sh` の自己テスト。スタブのハーネスと fixture のみ。実測は #107、評価は #110。TASK-24.1・IO-7）
-14c. `make mac-small-files-selftest`（MAC-3 小ファイル多数計測スクリプト `scripts/bench/mac_small_files.sh` の自己テスト。スタブの docker と一時ディレクトリのみ。bash 3.2 以上・perl（`Time::HiRes`）が必要で、`/bin/bash` が別にあればそれでも回す。macOS では `/usr/bin/perl` の経路も回し、使えなければ失敗にする（Linux では PATH の perl と同じ実体なら飛ばす。#3354）。ubuntu の `/bin/bash` は 5.x のため、3.2 の実行は `platform-ci` の macOS のステップが担う。実測は #381・#354 で人間が行う。TASK-70 準備・#1880・MAC-3）
+14c. `make mac-small-files-selftest`（MAC-3 小ファイル多数計測スクリプト `scripts/bench/mac_small_files.sh` の自己テスト。スタブの docker・自前 CLI と一時ディレクトリのみ。bash 3.2 以上・perl（`Time::HiRes`）が必要で、`/bin/bash` が別にあればそれでも回す。macOS では `/usr/bin/perl` の経路も回し、使えなければ失敗にする（Linux では PATH の perl と同じ実体なら飛ばす。#3354）。ubuntu の `/bin/bash` は 5.x のため、3.2 の実行は `platform-ci` の macOS のステップが担う。実測は #381・#354 で人間が行う。TASK-70 準備・#1880・MAC-3）
 14d. `make net-throughput-rtt-selftest`（iperf3 スループットと 1 バイト TCP 往復の計測・Docker 比スクリプト `scripts/bench/net_throughput_rtt.sh` の自己テスト。スタブの保持入口・nsenter・iperf3・probe・docker のみ。実測は #319 で人間が行う。TASK-140 準備・#1882・NET-2・NET-3）
 15. `make bench-check`（ベンチ実行・基準値比較。現状はプレースホルダの配線確認のみ）
 16. `make bench-plugin-boundary`（plugin 境界ベンチの計測と CORE-10 比のログ出力のみ。基準値比較なし。TASK-113.3）

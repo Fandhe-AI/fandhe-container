@@ -15,16 +15,22 @@
 #   メタデータ p95 の取り方は spec に無く、バッチ境界のタイムスタンプによる暫定方式（method に provisional。
 #   オーナー確認待ち。docs/design/mac-small-files-bench.md「オーナー確認待ち」）。
 #
-# 自前側（--mode own）は未実装。実バックエンドの配線（#2232 TASK-115 の W1〜W13）と macOS 既定方式の設計承認（#1906）の
-# 後続実装が済むまで測れない（REPAIR-3: 実装済みを装わない）。差し替え点は「バックエンド差し替え点」の関数群だけ。
+# 自前側（--mode own）は CLI の契約（create / start / state / logs / inspect / delete。CLI-1 の 3 OS 同一構文）で
+# 計測する（#3106）。bind は #1906 項目 2 の共有ルート構成（--shared-root 配下の --host-dir と --bundle）に従い、
+# 起動の口は #2232 の cli 1 本。ただし macOS の実経路（cli の置き換え #4705・共有ルートの構成 #2280・保持役の中継
+# #2281 ほか）は未実装のため、それが入るまで実機では最初の create / start が構造化エラーを返し、終了コード 1
+# （measurement-failed）で止まる（REPAIR-3: 実装済みを装わない）。差し替え点は「バックエンド差し替え点」の関数群。
 #
 # 使い方:
 #   mac_small_files.sh --mode docker --runtime <abs docker CLI> --host-dir <abs dir> [--image REF] [--count N]
 #     [--trials N] [--batch N] [--label NAME] [--trial-timeout-secs N] [--timeout-secs N] [--output <abs new file>]
-#   mac_small_files.sh --mode own ...                       （未実装。終了コード 5）
+#   mac_small_files.sh --mode own --runtime <abs fandhe CLI> --shared-root <abs dir> --host-dir <abs dir under it>
+#     --bundle <abs dir under it> --image-id sha256:<64 hex> [--image REF] [--count N] [--trials N] [--batch N]
+#     [--label NAME] [--trial-timeout-secs N] [--timeout-secs N] [--output <abs new file>]
 #   mac_small_files.sh --mode report --own-result <file> --baseline-result <file> [--output <abs new file>]
 #   --count 2000〜50000（既定 2000）・--trials 5〜20（既定 5）・--batch 1〜4096（既定 20。count を割り切れること）。
 #   docker モードは bash 3.2 以上・perl（Time::HiRes）・jq で動く（macOS 標準の /bin/bash と /usr/bin/perl。#3104）。--host-dir は symlink を含まない実体の絶対パス（bind mount 元）。
+#   own モードは同じ依存に加え、--runtime に自前 CLI（create / start / state / logs / inspect / kill / delete）を取る。--shared-root は VM に構成済みの共有ルートの申告で、--host-dir と --bundle はその配下（互いに祖先・子孫でない）。--bundle は rootfs/ を含み config.json を含まない実体ディレクトリ（試行ごとに config.json を書き、終了時に消す）。--image-id は bundle の rootfs の元のイメージ ID の申告（検証しない。image_id_source=declared）。
 #
 # 出力 JSON: schema "fandhe-container.mac-small-files/v1"（report は ".../mac-small-files-report/v1"）。
 #   絶対パス・ホスト名・ユーザー名は含めない。
@@ -35,7 +41,7 @@
 #   2: 入力エラー（副作用の前に検出）
 #   3: 前提ツール欠如（jq・mktemp・perl〔Time::HiRes〕・timeout 相当）
 #   4: 後始末失敗（ラベル付きのコンテナが残る）
-#   5: own 側が未実装
+#   （5 は使わない。own は #3106 で実装した）
 
 set -euo pipefail
 umask 077
@@ -59,6 +65,9 @@ usage_error() {
 mode=""
 runtime=""
 host_dir=""
+shared_root=""
+bundle=""
+declared_image_id=""
 image="alpine:3.20"
 count=2000
 trials=5
@@ -73,7 +82,7 @@ seen=" "
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --mode | --runtime | --host-dir | --image | --count | --trials | --batch | --label | --trial-timeout-secs | --timeout-secs | --output | --own-result | --baseline-result)
+    --mode | --runtime | --host-dir | --shared-root | --bundle | --image-id | --image | --count | --trials | --batch | --label | --trial-timeout-secs | --timeout-secs | --output | --own-result | --baseline-result)
       [ $# -ge 2 ] || usage_error "missing value for $1"
       case "$seen" in *" $1 "*) usage_error "duplicate argument: $1" ;; esac
       seen="${seen}$1 "
@@ -81,6 +90,9 @@ while [ $# -gt 0 ]; do
         --mode) mode="$2" ;;
         --runtime) runtime="$2" ;;
         --host-dir) host_dir="$2" ;;
+        --shared-root) shared_root="$2" ;;
+        --bundle) bundle="$2" ;;
+        --image-id) declared_image_id="$2" ;;
         --image) image="$2" ;;
         --count) count="$2" ;;
         --trials) trials="$2" ;;
@@ -175,6 +187,12 @@ run_tag=""
 cleanup_needed=0
 trial_dirs_file=""
 cleanup_failed=0
+own_config_written=0
+own_ids_file=""
+own_cli_ok=0
+own_stage=""
+own_fail=""
+own_extra="{}"
 run_image=""
 # 公開待ちの結果。後始末が成功した後にだけ公開する。
 pending_result=""
@@ -233,6 +251,8 @@ backend_run_once() {
 read_trial_clock() {
   local f="$1" line="" a="" b="" extra="" size=0
   wall_us=0
+  clock_t0=0
+  clock_t1=0
   [ -f "$f" ] && [ ! -L "$f" ] || return 1
   # ファイル全体の大きさを先に検証する（read -n は改行か上限で止まり、続きの不正データを見逃すため）。
   # BSD の wc は桁寄せの空白を付けるため算術展開で数値化する。
@@ -250,6 +270,8 @@ read_trial_clock() {
   b=$((10#$b))
   [ "$b" -ge "$a" ] || return 1
   wall_us=$((b - a))
+  clock_t0=$a
+  clock_t1=$b
 }
 
 # 完全一致のラベルで所有を証明できたコンテナ ID（停止中を含む）を stdout へ出す。--filter name= は部分一致のため使わない。
@@ -261,6 +283,10 @@ backend_remove() { run_limited "$CLEANUP_TIMEOUT_SECS" "$runtime" rm -f "$1" >/d
 
 # 所有を証明した ID（cidfile の 64 桁 16 進と、今回のラベルで一覧に出たもの）だけを消し、一覧が空になることを確かめる。
 backend_cleanup() {
+  if [ "$mode" = own ]; then own_cleanup; return; fi
+  docker_cleanup
+}
+docker_cleanup() {
   local f id ids="" listed rc=0
   for f in "${work}"/cid.*; do
     [ -f "$f" ] || continue
@@ -285,6 +311,235 @@ backend_cleanup() {
 }
 
 # ---------------------------------------------------------------------------
+# own 側のバックエンド（#3106・MAC-3）。自前 CLI の契約（CLI-1 の 3 OS 同一構文）で 1 試行を
+# create → start → state（stopped まで）→ logs → inspect → delete の順に動かす。CLI に `run` は無い。
+# --root は付けない: macOS の状態はゲスト側にあり（#1906 項目 3）、専用ルートが効く前提を置かない。
+# 他のコンテナに触れないことは、乱数 tag の ID（fms-<tag>-<n>）と ID ごとの後始末で担保する。
+# 区間: wall = (create の t0 から stopped を返した state の t1) + (delete の t0 から t1)。logs・inspect は含めない
+# （docker では出力の転送が実行と並行するため）。state のポーリング間隔ぶんは own に不利な向きの偏り。
+# ---------------------------------------------------------------------------
+
+# CLI の stderr（1 行 JSON）から code だけを取り出す。^[A-Z_]{1,64}$ に合わなければ unknown（message・パスは出さない）。
+own_json_code() { # <err file>
+  local c=""
+  c="$(dd if="$1" bs=4096 count=1 2>/dev/null | jq -R -r 'fromjson? | .code? // empty | select(type == "string")' 2>/dev/null | head -n 1)" || c=""
+  case "$c" in '' | *[!A-Z_]*) c=unknown ;; esac
+  [ "${#c}" -le 64 ] || c=unknown
+  printf '%s' "$c"
+}
+
+# state の stdout（1 行 JSON）から status を取り出す。固定語彙以外は空。
+own_status_of() { # <out file>
+  local st=""
+  st="$(dd if="$1" bs=65536 count=1 2>/dev/null | jq -r '.status? // empty | select(type == "string")' 2>/dev/null | head -n 1)" || st=""
+  case "$st" in created | running | stopped) printf '%s' "$st" ;; esac
+}
+
+# 残り時間を $own_limit へ入れる。尽きていれば 1 を返す。
+own_lim() {
+  local left=$((own_deadline - SECONDS))
+  [ "$left" -gt 0 ] || return 1
+  own_limit="$left"
+}
+
+# 時刻つきの CLI 呼び出し。引数: <ts タグ> <stdout> <stderr> <CLI の引数...>。成功時は clock_t0 / clock_t1 が入る。
+# 戻り値: CLI の終了コード、期限切れは 124、時刻の記録が不正なら 98。
+own_call() {
+  local tag="$1" out="$2" errf="$3" rc=0
+  shift 3
+  own_cli_ok=0
+  own_lim || return 124
+  run_limited "$own_limit" "$perl_bin" -e "$TIMED_EXEC_PL" "${work}/ts.${tag}" "$runtime" "$@" >"$out" 2>"$errf" || rc=$?
+  [ "$rc" -eq 0 ] || return "$rc"
+  # CLI 自体の成功は計時の成否と分けて覚える（create 成功後の計時不正で作成済みコンテナを漏らさないため）。
+  own_cli_ok=1
+  read_trial_clock "${work}/ts.${tag}" || return 98
+  return 0
+}
+
+# own_call の失敗を own_fail へ記録する。期限切れは 124、それ以外は 1 を返す。
+own_rc_fail() { # <rc>
+  if [ "$1" -eq 124 ]; then
+    own_fail="${own_stage} exceeded the trial deadline"
+    return 124
+  fi
+  if [ "$1" -eq 98 ]; then
+    own_fail="${own_stage} produced an invalid timing record"
+    return 1
+  fi
+  own_fail="${own_stage} failed (cli code=$(own_json_code "${work}/o.err"))"
+  return 1
+}
+
+# 試行の config.json を jq で組んで bundle に新規作成する（noclobber。利用者の文字列を連結しない）。
+own_write_config() { # <host の作業ディレクトリ> <script>
+  local cfg
+  cfg="$(jq -n --arg script "$2" --arg src "$1" '{
+    ociVersion: "1.2.0",
+    root: { path: "rootfs", readonly: true },
+    hostname: "fandhe-msf",
+    process: { user: { uid: 0, gid: 0 }, args: ["sh", "-c", $script],
+               env: ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "TERM=dumb"], cwd: "/" },
+    mounts: [{ destination: "/data", type: "bind", source: $src, options: ["rbind", "rw"] }],
+    linux: { namespaces: [{ type: "pid" }, { type: "mount" }, { type: "uts" }, { type: "ipc" }, { type: "user" }] }
+  }')" || return 1
+  (set -o noclobber; printf '%s\n' "$cfg" >"${bundle}/config.json") 2>/dev/null || return 1
+  own_config_written=1
+}
+
+# 1 ID の best-effort 回収（kill してから delete）。結果の確認は own_cleanup が行う。
+own_reap() { # <id>
+  run_limited 30 "$runtime" kill "$1" KILL >/dev/null 2>&1 || true
+  run_limited 30 "$runtime" delete "$1" >/dev/null 2>&1 || true
+}
+
+# 1 試行の本体。引数: <probe|trial> <limit秒> <n> <host の作業ディレクトリ> <script> <logs の出力先>。
+# 成功時は $wall_us と $own_extra（区間の内訳の JSON）を設定する。失敗は $own_fail に理由を入れて 1、期限切れは 124。
+own_trial_body() {
+  local kind="$1" limit="$2" n="$3" tdir="$4" script="$5" outf="$6" id rc st polls=0 size
+  local c0 c1 s0 s1 w1 d0 d1 prev_t1
+  own_deadline=$((SECONDS + limit))
+  own_fail=""
+  id="fms-${run_tag}-${n}"
+  own_stage=config
+  own_write_config "$tdir" "$script" || { own_fail="cannot write the bundle config"; return 1; }
+  own_stage=create
+  # 所有を証明できない ID には何も送らない（AGENTS.md の回収方針）。ID は create の成功後にだけ回収対象へ記録する。
+  # create が失敗（ALREADY_EXISTS を含む）しても kill・delete は送らず、後始末の gone 確認の対象にもしない。
+  # 期限切れ（成否不明）のときだけ、作られている可能性を警告して手動確認を促す。
+  own_cli_ok=0
+  own_call create "${work}/o.out" "${work}/o.err" create --bundle "$bundle" --label "${LABEL_KEY}=${run_tag}" "$id" || {
+    rc=$?
+    # CLI の create が成功していれば（計時の記録が不正で 98 のときも）、計時の検証より先に回収台帳へ記録する。
+    if [ "$own_cli_ok" -eq 1 ]; then
+      echo "$id" >>"$own_ids_file"
+      own_cur_id="$id"
+    fi
+    if [ "$rc" -eq 124 ]; then
+      echo "warning: create of ${id} timed out and its outcome is unknown; no kill or delete was sent. Inspect it manually (label ${LABEL_KEY}=${run_tag})" >&2
+    fi
+    own_rc_fail "$rc"
+    return $?
+  }
+  echo "$id" >>"$own_ids_file"
+  own_cur_id="$id"
+  c0="$clock_t0"
+  c1="$clock_t1"
+  prev_t1="$c1"
+  own_stage=start
+  own_call start "${work}/o.out" "${work}/o.err" start "$id" || { own_rc_fail $?; return $?; }
+  [ "$clock_t0" -ge "$prev_t1" ] || { own_fail="timing records are not monotonic"; return 1; }
+  s0="$clock_t0"
+  s1="$clock_t1"
+  prev_t1="$s1"
+  own_stage=state
+  while :; do
+    own_call state "${work}/o.out" "${work}/o.err" state "$id" || { own_rc_fail $?; return $?; }
+    [ "$clock_t0" -ge "$prev_t1" ] || { own_fail="timing records are not monotonic"; return 1; }
+    prev_t1="$clock_t1"
+    polls=$((polls + 1))
+    st="$(own_status_of "${work}/o.out")"
+    case "$st" in
+      stopped) w1="$clock_t1"; break ;;
+      created | running) sleep 0.1 ;;
+      *) own_fail="state returned an unexpected status"; return 1 ;;
+    esac
+  done
+  if [ "$kind" = trial ]; then
+    own_stage=logs
+    own_lim || { own_fail="logs exceeded the trial deadline"; return 124; }
+    rc=0
+    # state の stopped は supervisor の最終 flush より先に記録されるため、非追従の logs は末尾を取りこぼし得る。
+    # `--follow` は書き手（<id>.log.lock）の終了まで待って出し切り 0 で終わる。計測区間外なので待ちは値に入らず、
+    # 期限は own_limit（試行の残り時間）が持つ。
+    run_limited "$own_limit" "$runtime" logs --follow --stream stdout "$id" >"${work}/logs.raw" 2>"${work}/o.err" || rc=$?
+    if [ "$rc" -ne 0 ]; then own_rc_fail "$rc"; return $?; fi
+    size="$(wc -c <"${work}/logs.raw" | tr -d ' ')"
+    [ "$size" -le 4194304 ] || { own_fail="logs output is too large"; return 1; }
+    # 全レコードが `stdout ` の接頭辞を持つこと。回転で欠けた分は parse_trial の件数の照合で失敗に落ちる。
+    [ "$(grep -c '' "${work}/logs.raw")" -eq "$(grep -c '^stdout ' "${work}/logs.raw")" ] \
+      || { own_fail="logs contain records other than stdout"; return 1; }
+    sed 's/^stdout //' "${work}/logs.raw" >"$outf"
+  fi
+  own_stage=inspect
+  own_lim || { own_fail="inspect exceeded the trial deadline"; return 124; }
+  rc=0
+  run_limited "$own_limit" "$runtime" inspect "$id" >"${work}/o.out" 2>"${work}/o.err" || rc=$?
+  if [ "$rc" -ne 0 ]; then own_rc_fail "$rc"; return $?; fi
+  # exitCode は inspect の 1 行 JSON のキー（crates/supervisor/src/inspect.rs）。0 以外・欠落は失敗。
+  dd if="${work}/o.out" bs=65536 count=1 2>/dev/null | jq -e '.status == "stopped" and .exitCode == 0' >/dev/null 2>&1 \
+    || { own_fail="the container did not exit with code 0"; return 1; }
+  own_stage=delete
+  own_call delete "${work}/o.out" "${work}/o.err" delete "$id" || { own_rc_fail $?; return $?; }
+  [ "$clock_t0" -ge "$prev_t1" ] || { own_fail="timing records are not monotonic"; return 1; }
+  d0="$clock_t0"
+  d1="$clock_t1"
+  wall_us=$(((w1 - c0) + (d1 - d0)))
+  own_extra="$(printf '{"create_us":%s,"start_us":%s,"wait_us":%s,"state_polls":%s,"delete_us":%s}' \
+    "$((c1 - c0))" "$((s1 - s0))" "$((w1 - s1))" "$polls" "$((d1 - d0))")"
+  return 0
+}
+
+# 1 試行（失敗時は ID を best-effort で回収し、書いた config.json を消す）。
+own_run_once() {
+  local rc=0
+  own_cur_id=""
+  own_trial_body "$@" || rc=$?
+  if [ "$rc" -ne 0 ] && [ -n "$own_cur_id" ]; then own_reap "$own_cur_id"; fi
+  if [ "$own_config_written" -eq 1 ]; then
+    rm -f "${bundle}/config.json" || cleanup_failed=1
+    own_config_written=0
+  fi
+  return "$rc"
+}
+
+# ID が存在しない（終了コード 3 かつ code=NOT_FOUND）ことの確認。$cl_deadline までの残りで打ち切る。
+own_gone() { # <id>
+  local left rc=0
+  left=$((cl_deadline - SECONDS))
+  [ "$left" -gt 0 ] || return 1
+  [ "$left" -le 30 ] || left=30
+  run_limited "$left" "$runtime" state "$1" >"${work}/cl.out" 2>"${work}/cl.err" || rc=$?
+  [ "$rc" -eq 3 ] && [ "$(own_json_code "${work}/cl.err")" = NOT_FOUND ]
+}
+
+# 記録した ID を 1 件ずつ、不存在 → (running なら kill → stopped を待つ) → delete → 不存在の確認の順で片づける。
+# 1 件でも不存在を確かめられなければ失敗（終了コード 4）。全体で CLEANUP_TIMEOUT_SECS 以内。
+own_cleanup() {
+  local id st k left rc=0
+  [ -n "$own_ids_file" ] && [ -f "$own_ids_file" ] || return 0
+  cl_deadline=$((SECONDS + CLEANUP_TIMEOUT_SECS))
+  while IFS= read -r id; do
+    case "$id" in "fms-${run_tag}-"*) ;; *) continue ;; esac
+    if own_gone "$id"; then continue; fi
+    st="$(own_status_of "${work}/cl.out")"
+    if [ "$st" = running ]; then
+      left=$((cl_deadline - SECONDS))
+      if [ "$left" -gt 0 ]; then
+        [ "$left" -le 30 ] || left=30
+        run_limited "$left" "$runtime" kill "$id" KILL >/dev/null 2>&1 || true
+      fi
+      k=0
+      while [ "$k" -lt 20 ] && [ $((cl_deadline - SECONDS)) -gt 0 ]; do
+        k=$((k + 1))
+        left=$((cl_deadline - SECONDS))
+        [ "$left" -le 30 ] || left=30
+        run_limited "$left" "$runtime" state "$id" >"${work}/cl.out" 2>/dev/null || true
+        [ "$(own_status_of "${work}/cl.out")" != running ] && break
+        sleep 0.5
+      done
+    fi
+    left=$((cl_deadline - SECONDS))
+    if [ "$left" -gt 0 ]; then
+      [ "$left" -le 30 ] || left=30
+      run_limited "$left" "$runtime" delete "$id" >/dev/null 2>&1 || true
+    fi
+    own_gone "$id" || rc=1
+  done <"$own_ids_file"
+  return "$rc"
+}
+
+# ---------------------------------------------------------------------------
 
 cleanup() {
   local rc=$?
@@ -292,6 +547,11 @@ cleanup() {
   run_limited_abort || true
   if [ "$cleanup_needed" -eq 1 ] && [ -n "$run_tag" ] && [ -d "$work" ]; then
     backend_cleanup || cleanup_failed=1
+  fi
+  # own: 自分が書いた bundle の config.json だけを消す（記録したものに限る）。
+  if [ "$own_config_written" -eq 1 ] && [ -n "$bundle" ]; then
+    rm -f "${bundle}/config.json" || cleanup_failed=1
+    own_config_written=0
   fi
   # 自分が作った試行ディレクトリだけを消す（trial_dirs_file に記録したもの）。
   if [ -n "$trial_dirs_file" ] && [ -f "$trial_dirs_file" ]; then
@@ -323,7 +583,7 @@ fail_measure() {
 # report モード
 # ---------------------------------------------------------------------------
 run_report() {
-  reject_opts --runtime --host-dir --image --count --trials --batch --label --trial-timeout-secs --timeout-secs
+  reject_opts --runtime --host-dir --shared-root --bundle --image-id --image --count --trials --batch --label --trial-timeout-secs --timeout-secs
   [ -n "$own_result" ] || usage_error "--own-result is required"
   [ -n "$baseline_result" ] || usage_error "--baseline-result is required"
   validate_output
@@ -364,7 +624,9 @@ run_report() {
   jq -n --slurpfile o "$own_result" --slurpfile b "$baseline_result" --arg schema "$REPORT_SCHEMA" '
     ($o[0]) as $own | ($b[0]) as $base
     | (($own.workload == $base.workload) and ($own.image == $base.image) and ($own.image_id == $base.image_id) and ($own.mount_kind == $base.mount_kind)) as $same_wl
-    | def rate($k): if $same_wl and ($own.metrics[$k].method == $base.metrics[$k].method) and ($own.metrics[$k].unit == $base.metrics[$k].unit)
+    # 暫定の対応表（オーナー確認待ち。#3106）: 壁時計の own "cli-create-start-wait-delete-total" と docker "docker-run-rm-total" の 1 組だけを同等扱いにする。
+    | def pair_ok($k): $k == "wall_clock_median_ms" and ($own.metrics[$k].method == "cli-create-start-wait-delete-total") and ($base.metrics[$k].method == "docker-run-rm-total");
+    def rate($k): if $same_wl and (($own.metrics[$k].method == $base.metrics[$k].method) or pair_ok($k)) and ($own.metrics[$k].unit == $base.metrics[$k].unit)
         and ($base.metrics[$k].value > 0)
         then ((1 - ($own.metrics[$k].value / $base.metrics[$k].value)) * 1000000 | round / 1000000) else null end;
     {
@@ -374,22 +636,14 @@ run_report() {
       own: { label: $own.label, metrics: $own.metrics, trials_ok: $own.trials_ok },
       baseline: { label: $base.label, metrics: $base.metrics, trials_ok: $base.trials_ok },
       wall_clock_reduction_ratio: rate("wall_clock_median_ms"),
+      wall_clock_method_match: (if $own.metrics.wall_clock_median_ms.method == $base.metrics.wall_clock_median_ms.method then "exact" elif pair_ok("wall_clock_median_ms") then "provisional-pair" else null end),
       metadata_p95_reduction_ratio: rate("metadata_p95_us"),
       methods_differ: ((rate("wall_clock_median_ms") == null) or ((rate("metadata_p95_us") == null) and ($base.metrics.metadata_p95_us.value > 0))),
-      note: "ratios are 1 - own/baseline (positive means own is faster); null when workload, image (tag or digest), mount kind, method or unit differ. No pass/fail here: the MAC-3 thresholds (wall clock >= 15% shorter, or metadata p95 >= 20% lower than Docker Desktop VirtioFS) are judged by a human in TASK-70 (#381). The p95 method is provisional (owner confirmation pending)"
+      note: "ratios are 1 - own/baseline (positive means own is faster); null when workload, image (tag or digest), mount kind, method or unit differ. No pass/fail here: the MAC-3 thresholds (wall clock >= 15% shorter, or metadata p95 >= 20% lower than Docker Desktop VirtioFS) are judged by a human in TASK-70 (#381). The p95 method is provisional (owner confirmation pending). wall_clock_method_match=provisional-pair means the wall clock intervals are defined differently (own is the sum of 4 CLI stages, docker is the whole run) and are treated as equivalent only provisionally"
     }' >"$tmp" 2>/dev/null || fail_measure "cannot build the report"
   emit_result "$tmp"
   rm -f "$tmp"
   trap - EXIT
-}
-
-# ---------------------------------------------------------------------------
-# own モード（未実装）
-# ---------------------------------------------------------------------------
-run_own() {
-  # 副作用の前に拒否する。測れるように装わない（REPAIR-3）。
-  err_code unimplemented "own backend measurement is not wired yet (see #2232 / #1906)"
-  exit 5
 }
 
 # ---------------------------------------------------------------------------
@@ -424,20 +678,58 @@ parse_trial() { # <stdout file> <intervals out>
   return 0
 }
 
-run_docker() {
+# 絶対パスの実体ディレクトリ（symlink・. / .. 要素・特殊文字なし）の検査。正規化（末尾 / の除去）した値を $norm_path へ入れる。
+validate_real_dir() { # <オプション名> <値>
+  local opt="$1" v="$2"
+  case "$v" in /*) ;; *) usage_error "$opt must be an absolute path" ;; esac
+  case "$v" in *[!A-Za-z0-9_./-]*) usage_error "$opt contains characters outside [A-Za-z0-9_./-]" ;; esac
+  case "/$v/" in */../* | */./*) usage_error "$opt must not contain . or .. components" ;; esac
+  while [ "${#v}" -gt 1 ] && [ "${v%/}" != "$v" ]; do v="${v%/}"; done
+  [ -d "$v" ] && [ ! -L "$v" ] || usage_error "$opt must be an existing directory (not a symlink)"
+  [ "$(cd "$v" && pwd -P)" = "$v" ] || usage_error "$opt must be a real path without symlink components"
+  norm_path="$v"
+}
+
+# own の入力検査（副作用の前。#1906 項目 2 の共有ルート構成）: --shared-root 配下に --host-dir と --bundle があり、
+# 互いに祖先・子孫でない。共有ルートの実際の構成は VM 側（#2280）で、本スクリプトは申告されたパスの包含だけを確かめる。
+validate_own_inputs() {
+  [ -n "$shared_root" ] || usage_error "--shared-root is required for --mode own"
+  [ -n "$bundle" ] || usage_error "--bundle is required for --mode own"
+  [ -n "$declared_image_id" ] || usage_error "--image-id is required for --mode own"
+  validate_real_dir --shared-root "$shared_root"
+  shared_root="$norm_path"
+  [ "$shared_root" != "/" ] || usage_error "--shared-root must not be /"
+  validate_real_dir --bundle "$bundle"
+  bundle="$norm_path"
+  case "$host_dir" in "$shared_root"/*) ;; *) usage_error "--host-dir must be under --shared-root" ;; esac
+  case "$bundle" in "$shared_root"/*) ;; *) usage_error "--bundle must be under --shared-root" ;; esac
+  case "$host_dir/" in "$bundle"/*) usage_error "--host-dir must not be inside --bundle" ;; esac
+  case "$bundle/" in "$host_dir"/*) usage_error "--bundle must not be inside --host-dir" ;; esac
+  [ -d "${bundle}/rootfs" ] && [ ! -L "${bundle}/rootfs" ] || usage_error "--bundle must contain a rootfs directory (not a symlink)"
+  if [ -e "${bundle}/config.json" ] || [ -L "${bundle}/config.json" ]; then
+    usage_error "--bundle already contains config.json (refusing to overwrite)"
+  fi
+  case "$declared_image_id" in
+    sha256:*) ;;
+    *) usage_error "--image-id must be sha256:<64 hex digits>" ;;
+  esac
+  case "${declared_image_id#sha256:}" in *[!0-9a-f]* | '') usage_error "--image-id must be sha256:<64 hex digits>" ;; esac
+  [ "${#declared_image_id}" -eq 71 ] || usage_error "--image-id must be sha256:<64 hex digits>"
+}
+
+# docker / own 共通の計測本体（#3106 で run_docker から改名。docker モードの引数・出力・文言は変えない）。
+run_measure() {
   reject_opts --own-result --baseline-result
+  if [ "$mode" = docker ]; then reject_opts --shared-root --bundle --image-id; fi
   [ -n "$runtime" ] || usage_error "--runtime is required"
   [ -n "$host_dir" ] || usage_error "--host-dir is required"
   case "$runtime" in /*) ;; *) usage_error "--runtime must be an absolute path" ;; esac
   if [ ! -f "$runtime" ] || [ ! -x "$runtime" ]; then
     usage_error "--runtime must be an executable regular file"
   fi
-  case "$host_dir" in /*) ;; *) usage_error "--host-dir must be an absolute path" ;; esac
-  case "$host_dir" in *[!A-Za-z0-9_./-]*) usage_error "--host-dir contains characters outside [A-Za-z0-9_./-]" ;; esac
-  case "/$host_dir/" in */../* | */./*) usage_error "--host-dir must not contain . or .. components" ;; esac
-  while [ "${#host_dir}" -gt 1 ] && [ "${host_dir%/}" != "$host_dir" ]; do host_dir="${host_dir%/}"; done
-  [ -d "$host_dir" ] && [ ! -L "$host_dir" ] || usage_error "--host-dir must be an existing directory (not a symlink)"
-  [ "$(cd "$host_dir" && pwd -P)" = "$host_dir" ] || usage_error "--host-dir must be a real path without symlink components"
+  validate_real_dir --host-dir "$host_dir"
+  host_dir="$norm_path"
+  if [ "$mode" = own ]; then validate_own_inputs; fi
   case "$image" in
     '' | -* | *[!A-Za-z0-9_./:@-]*) usage_error "--image has characters outside [A-Za-z0-9_./:@-] or starts with -" ;;
   esac
@@ -450,7 +742,7 @@ run_docker() {
   count=$((10#$count)); trials=$((10#$trials)); batch=$((10#$batch))
   trial_timeout=$((10#$trial_timeout)); total_timeout=$((10#$total_timeout))
   [ $((count % batch)) -eq 0 ] || usage_error "--count must be a multiple of --batch"
-  if [ -z "$label" ]; then label="docker"; fi
+  if [ -z "$label" ]; then label="$mode"; fi
   case "$label" in *[!A-Za-z0-9_.-]* | '') usage_error "--label has characters outside [A-Za-z0-9_.-]" ;; esac
   [ "${#label}" -le 64 ] || usage_error "--label is too long"
   validate_output
@@ -459,6 +751,8 @@ run_docker() {
   RUN_LIMITED_DIR="$work"
   trial_dirs_file="${work}/trial-dirs"
   : >"$trial_dirs_file"
+  own_ids_file="${work}/own-ids"
+  : >"$own_ids_file"
   run_tag="$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
   case "$run_tag" in '' | *[!0-9a-f]*) fail_measure "cannot generate a run token" ;; esac
   trap cleanup EXIT
@@ -489,19 +783,26 @@ run_docker() {
     cap_secs="$want"
     [ "$rem" -ge "$cap_secs" ] || cap_secs="$rem"
   }
-  cap_for "$CLEANUP_TIMEOUT_SECS"
-  image_id="$(backend_image_id "${work}/image.err")" || rc=$?
-  [ "$rc" -eq 0 ] || fail_measure "image is not available locally (pull it first; --pull never is used)"
-  case "$image_id" in sha256:*) ;; *) fail_measure "unexpected image id" ;; esac
-  case "${image_id#sha256:}" in *[!0-9a-f]* | '') fail_measure "unexpected image id" ;; esac
-  # 計測の各 run は事前確認した ID を起動する（可変タグの差し替えで別イメージを測らない）。タグは表示用に残す。
-  run_image="$image_id"
-  rc=0
-  cap_for "$CLEANUP_TIMEOUT_SECS"
-  backend_ver="$(backend_version)" || rc=$?
-  [ "$rc" -eq 0 ] || fail_measure "cannot read the docker server version"
-  case "$backend_ver" in '' | *[!A-Za-z0-9._+-]*) fail_measure "unexpected docker server version" ;; esac
-  [ "${#backend_ver}" -le 64 ] || fail_measure "unexpected docker server version"
+  if [ "$mode" = own ]; then
+    # 自前側: bundle の rootfs の元のイメージは操作者の申告（検証しない。image_id_source=declared）。
+    # CLI に版の表示は無いため unknown（新しいサブコマンドは足さない）。
+    image_id="$declared_image_id"
+    backend_ver="unknown"
+  else
+    cap_for "$CLEANUP_TIMEOUT_SECS"
+    image_id="$(backend_image_id "${work}/image.err")" || rc=$?
+    [ "$rc" -eq 0 ] || fail_measure "image is not available locally (pull it first; --pull never is used)"
+    case "$image_id" in sha256:*) ;; *) fail_measure "unexpected image id" ;; esac
+    case "${image_id#sha256:}" in *[!0-9a-f]* | '') fail_measure "unexpected image id" ;; esac
+    # 計測の各 run は事前確認した ID を起動する（可変タグの差し替えで別イメージを測らない）。タグは表示用に残す。
+    run_image="$image_id"
+    rc=0
+    cap_for "$CLEANUP_TIMEOUT_SECS"
+    backend_ver="$(backend_version)" || rc=$?
+    [ "$rc" -eq 0 ] || fail_measure "cannot read the docker server version"
+    case "$backend_ver" in '' | *[!A-Za-z0-9._+-]*) fail_measure "unexpected docker server version" ;; esac
+    [ "${#backend_ver}" -le 64 ] || fail_measure "unexpected docker server version"
+  fi
 
   # 1 試行ぶんの作業ディレクトリ（ホスト側。bind mount 元）を作る。引数: <n>。パスは $trial_dir に入れる。
   local trial_dir=""
@@ -515,8 +816,13 @@ run_docker() {
   new_trial_dir probe
   rc=0
   cap_for "$trial_timeout"
-  backend_run_once "$cap_secs" "${work}/cid.probe" "$trial_dir" "$(probe_script)" "${work}/probe.out" "${work}/probe.err" "${work}/ts.probe" || rc=$?
-  [ "$rc" -eq 0 ] || fail_measure "the bind probe run failed (exit ${rc})"
+  if [ "$mode" = own ]; then
+    own_run_once probe "$cap_secs" p "$trial_dir" "$(probe_script)" "${work}/probe.out" || rc=$?
+    [ "$rc" -eq 0 ] || fail_measure "the bind probe run failed: ${own_fail}"
+  else
+    backend_run_once "$cap_secs" "${work}/cid.probe" "$trial_dir" "$(probe_script)" "${work}/probe.out" "${work}/probe.err" "${work}/ts.probe" || rc=$?
+    [ "$rc" -eq 0 ] || fail_measure "the bind probe run failed (exit ${rc})"
+  fi
   [ -f "${trial_dir}/probe" ] && [ "$(tr -d '\n' <"${trial_dir}/probe")" = "probe" ] \
     || fail_measure "bind mount is not effective: a file written in the container is not visible on the host"
 
@@ -533,17 +839,31 @@ run_docker() {
     [ "$remaining" -ge "$limit" ] || limit="$remaining"
     new_trial_dir "$n"
     rc=0
-    backend_run_once "$limit" "${work}/cid.${n}" "$trial_dir" "$script" "${work}/out.${n}" "${work}/err.${n}" "${work}/ts.${n}" || rc=$?
-    if [ "$rc" -eq 124 ]; then
-      fail_measure "trial ${n} exceeded its deadline (${limit}s)"
+    trial_extra="{}"
+    if [ "$mode" = own ]; then
+      own_run_once trial "$limit" "$n" "$trial_dir" "$script" "${work}/out.${n}" || rc=$?
+      if [ "$rc" -eq 124 ]; then
+        fail_measure "trial ${n} exceeded its deadline (${limit}s)"
+      fi
+      if [ "$rc" -ne 0 ]; then
+        echo "warning: trial ${n} failed: ${own_fail}" >&2
+        failed=$((failed + 1))
+        continue
+      fi
+      trial_extra="$own_extra"
+    else
+      backend_run_once "$limit" "${work}/cid.${n}" "$trial_dir" "$script" "${work}/out.${n}" "${work}/err.${n}" "${work}/ts.${n}" || rc=$?
+      if [ "$rc" -eq 124 ]; then
+        fail_measure "trial ${n} exceeded its deadline (${limit}s)"
+      fi
+      if [ "$rc" -ne 0 ]; then
+        echo "warning: trial ${n} failed: docker run exited with ${rc}" >&2
+        failed=$((failed + 1))
+        continue
+      fi
+      # 時刻ファイルは rc が 0 のときだけ読む（TERM で殺された試行には無い）。不正なら試行を失敗にする。
+      read_trial_clock "${work}/ts.${n}" || { echo "warning: trial ${n} failed: invalid timing record" >&2; failed=$((failed + 1)); continue; }
     fi
-    if [ "$rc" -ne 0 ]; then
-      echo "warning: trial ${n} failed: docker run exited with ${rc}" >&2
-      failed=$((failed + 1))
-      continue
-    fi
-    # 時刻ファイルは rc が 0 のときだけ読む（TERM で殺された試行には無い）。不正なら試行を失敗にする。
-    read_trial_clock "${work}/ts.${n}" || { echo "warning: trial ${n} failed: invalid timing record" >&2; failed=$((failed + 1)); continue; }
     local why=""
     why="$(parse_trial "${work}/out.${n}" "${work}/int.${n}")" || {
       echo "warning: trial ${n} failed: ${why}" >&2
@@ -556,37 +876,44 @@ run_docker() {
     # p95 の母集団には検証を通った試行の区間だけを足す（失敗試行の区間を混ぜない）。
     cat "${work}/int.${n}" >>"${work}/pooled"
     echo "$wall_us" >>"${work}/walls"
-    jq -Rn --argjson t "$n" --argjson w "$wall_us" '
+    jq -Rn --argjson t "$n" --argjson w "$wall_us" --argjson x "$trial_extra" '
       [inputs | tonumber] | sort
       | { trial: $t, wall_us: $w, intervals: length, interval_ns_per_op_min: .[0],
           interval_ns_per_op_median: .[(length / 2 | floor)], interval_ns_per_op_max: .[-1],
-          interval_ns_per_op_p95: .[((length * 0.95 | ceil) - 1)] }' <"${work}/int.${n}" >>"${work}/samples.jsonl"
+          interval_ns_per_op_p95: .[((length * 0.95 | ceil) - 1)] } + $x' <"${work}/int.${n}" >>"${work}/samples.jsonl"
   done
   # 有効な試行が下限（5）未満なら中央値を歪めるため失敗にする。
   [ "$ok" -ge 5 ] || fail_measure "only ${ok} valid trials (at least 5 required; ${failed} failed)"
 
   local pooled="${work}/pooled"
   local final="${work}/final.json"
+  local wall_method="docker-run-rm-total" result_note
+  result_note="wall clock is the whole \`docker run --rm\` (VM crossing and container start included, as in PoC-1/PoC-11). metadata_p95_us is PROVISIONAL: the p95 over per-batch average ns/op (pooled across trials), not a per-operation p95; the method is pending owner confirmation. No pass/fail here (TASK-70, #381)."
+  if [ "$mode" = own ]; then
+    wall_method="cli-create-start-wait-delete-total"
+    result_note="wall clock is the own CLI sequence: (create start to the state call that first reports stopped) + (delete); logs and inspect are excluded, and the 0.1 s state polling interval adds a bias against own. image_id is DECLARED by the operator, not verified against the bundle rootfs. metadata_p95_us is PROVISIONAL: the p95 over per-batch average ns/op (pooled across trials), not a per-operation p95; the method is pending owner confirmation. No pass/fail here (TASK-70, #381)."
+  fi
   jq -n --slurpfile samples "${work}/samples.jsonl" \
     --slurpfile pool <(jq -Rn '[inputs | tonumber] | sort | .[((length * 0.95 | ceil) - 1)]' <"$pooled") \
     --slurpfile walls <(jq -Rn '[inputs | tonumber] | sort' <"${work}/walls") \
     --arg schema "$SCHEMA" --arg label "$label" --arg image "$image" --arg image_id "$image_id" --arg ver "$backend_ver" \
+    --arg mode "$mode" --arg wm "$wall_method" --arg note "$result_note" \
     --argjson count "$count" --argjson batch "$batch" --argjson trials "$trials" --argjson ok "$ok" --argjson fb "$FILE_BYTES" '
     ($walls[0]) as $w
     | (if ($w | length) % 2 == 1 then $w[(($w | length) - 1) / 2] else (($w[($w | length) / 2 - 1] + $w[($w | length) / 2]) / 2) end) as $median_us
     | {
-        schema: $schema, mode: "docker", target: "docker", label: $label,
+        schema: $schema, mode: $mode, target: $mode, label: $label,
         image: $image, image_id: $image_id, mount_kind: "bind", backend_version: $ver,
         workload: { count: $count, file_bytes: $fb, batch: $batch,
                     ops: "mkdir, create N files with shell builtin echo, ls | wc -l, rm -rf" },
         trials_requested: $trials, trials_ok: $ok,
         metrics: {
-          wall_clock_median_ms: { value: ($median_us / 1000), unit: "ms", method: "docker-run-rm-total" },
+          wall_clock_median_ms: { value: ($median_us / 1000), unit: "ms", method: $wm },
           metadata_p95_us: { value: ($pool[0] / 1000), unit: "us", method: "batch-boundary-provisional" }
         },
         samples: $samples,
-        note: "wall clock is the whole `docker run --rm` (VM crossing and container start included, as in PoC-1/PoC-11). metadata_p95_us is PROVISIONAL: the p95 over per-batch average ns/op (pooled across trials), not a per-operation p95; the method is pending owner confirmation. No pass/fail here (TASK-70, #381)."
-      }' >"$final" 2>/dev/null || fail_measure "cannot build the result"
+        note: $note
+      } + (if $mode == "own" then { image_id_source: "declared", shared_root_checked: true } else {} end)' >"$final" 2>/dev/null || fail_measure "cannot build the result"
   jq -e '.trials_ok >= 5 and (.metrics.wall_clock_median_ms.value > 0) and (.metrics.metadata_p95_us.value >= 0)' "$final" >/dev/null 2>&1 \
     || fail_measure "result failed validation"
   [ "$(wc -c <"$final" | tr -d ' ')" -le "$MAX_RESULT_BYTES" ] || fail_measure "result is too large"
@@ -594,7 +921,6 @@ run_docker() {
 }
 
 case "$mode" in
-  docker) reject_opts --own-result --baseline-result; run_docker ;;
-  own) run_own ;;
+  docker | own) run_measure ;;
   report) run_report ;;
 esac

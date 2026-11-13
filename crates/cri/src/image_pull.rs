@@ -101,14 +101,16 @@
 //! # 未実装範囲（REPAIR-3）
 //!
 //! - レイヤーの展開と diff_id の突合は配線済み（#2323）。残りは次のとおり。
-//!   - 所有者・特殊ビットの選択肢は [`PullConfig::extract_options`] の受け口までで、既定は安全側（`Keep` + `Strip`）。
-//!     本番の呼び出し元が渡す値も現状は既定の `Keep` + `Strip` で、rootless / rootful ごとの値（`ChownMapped`・
-//!     `PreserveIfOwnerMapped`・`ChownInUserNamespace`）の配線は次の前提が済んでからになる（#2534・SEC-5・SEC-1。
-//!     `docs/design/oci-layer-special-bits.md`）。`ChownMapped` は初期 user namespace の `CAP_CHOWN` が要り、
-//!     rootful の可否が未決（#2241）。`ChownInUserNamespace` は core が user namespace へ入る配線が要る（#2315・#482）。
-//!     本モジュールの `PullConfig` を組む本番の呼び出し元は plugin-cri の `CriPluginBackends`（#2592）で、既定値（`Keep` + `Strip`）を
-//!     pull と create の両方へ同じ値で渡す（本番の値への切り替えは上記の前提待ち）。
-//!     所有者の解決の部品（#2389 の `image_ownership`）は cli crate にあり、置き場所の判断も要る。
+//!   - 所有者・特殊ビットの選択肢は [`PullConfig::extract_options`] で受ける。本番の呼び出し元（plugin-cri の
+//!     `CriPluginBackends`。#2592）は、start と同じ権限モデルの解決（supervisor の `resolve_self_launch_privilege`）から
+//!     `extract_identity::extract_options_for` の対応表で値を選び、pull と create の両方へ 1 回の解決結果を渡す（#2792。
+//!     解決の失敗は縮退せず失敗）。対応表の値は現状どの権限モデルでも既定の `Keep` + `Strip`: ホスト root は本番の start が
+//!     無く（#2241 D1:A）、SingleId は `Keep` が正しく、特殊ビットは `open_rootfs_for_search` の 0755 化が
+//!     `PreserveIfOwnerMapped` の 0700 契約と両立しない間は保持しない。範囲写像（SubordinateIds）の本来の値
+//!     `ChownInUserNamespace` は tokio のマルチスレッドのプロセス内では user namespace に入れず（core の
+//!     `MultiThreaded` 拒否）、記録の符号化も受けないため未配線（後続 issue・要起票）。pull 時と start 時の subuid の
+//!     ずれの照合も `ChownInUserNamespace` と同時に足す（`Keep` では所有者が subuid に依らず検出対象が無い）。
+//!     所有者の写像の変換部品 `image_ownership`（#2389）は cli crate にあり、置き場所の判断は未取得（依存辺が増えない形を採用）。
 //!     pull と create は [`crate::bundle::ImageExtractConfig`] の 1 か所から同じ値を配る（食い違うと記録の照合で
 //!     `FAILED_PRECONDITION` になる）
 //!   - 展開済み rootfs の GC と `image rm` / `image prune` への接続は TASK-183（OCI-7）の担当。それまで削除しても
@@ -544,8 +546,8 @@ pub struct PullConfig {
     /// レイヤー展開の上限（エントリ数・展開バイト数・入力バイト数・索引件数。全レイヤーで共有して累積する）。
     pub extract_limits: ExtractLimits,
     /// レイヤー展開の所有者・特殊ビットの選択肢。既定は `chown` しない（`Keep`）・特殊ビットは落とす（`Strip`）。
-    /// rootless / rootful ごとの値（`ChownMapped`・`PreserveIfOwnerMapped` 等）は呼び出し元が決めるが、本番の値は
-    /// 現状も既定のまま（配線の前提は #2241・#2315・#482。呼び出し元の配線は #2592 で済み。モジュール doc「未実装範囲」と
+    /// 値は呼び出し元が決める。本番（plugin-cri）は start と同じ権限モデルの解決から選び（#2792）、現状はどの権限モデルでも
+    /// 既定のまま（`ChownInUserNamespace` 等は後続。モジュール doc「未実装範囲」と
     /// `docs/design/oci-layer-special-bits.md`。#2534・SEC-5・SEC-1）。
     pub extract_options: ExtractOptions,
 }

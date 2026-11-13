@@ -338,7 +338,7 @@ fn err4_2245_interrupted_start_recovered_line() {
     use crate::traits::{ContainerStatus, StateRecord, StateRevision};
     let rec = StateRecord::new(
         ContainerStatus::created(ContainerId::new("web").unwrap(), None),
-        PathBuf::from("/b"),
+        std::env::temp_dir().join("b"),
         StateRevision::from_raw(1),
     )
     .unwrap();

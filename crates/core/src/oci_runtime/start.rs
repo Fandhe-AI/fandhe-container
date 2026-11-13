@@ -138,7 +138,8 @@ use super::config::{NamespaceKind, OciConfig};
 use super::create::{ConfigAudit, validate_bundle_audited};
 use super::error::{LifecycleOp, OciRuntimeError};
 use super::launch::{
-    BundleLock, LaunchMode, LaunchSpec, LaunchedProcess, ProcessLauncher, RootfsDir, StartTimeouts,
+    BundleLock, LaunchMode, LaunchSpec, LaunchedProcess, NoProcessEvidence, ProcessLauncher,
+    RecordedCgroupOutcome, RootfsDir, StartTimeouts,
 };
 use super::mountinfo_identity::{
     FsIdentity, MountinfoReadError, dir_identity_chain, fs_identity, mounts_under, parse_mountinfo,
@@ -148,6 +149,7 @@ use super::namespace_join::{NamespaceJoin, NetnsJoinTarget, PinnedNetnsJoin};
 use super::network_mode::{EffectiveNetwork, reconcile_network};
 use super::sysfs_mount::{SysfsMountSpec, audit_sysfs_mount_error};
 use super::working_dir::ContainerWorkingDir;
+use crate::logging::{LogEvent, LogLevel, LogLine, LogLineError, encode_json_line};
 use crate::observability::{OpName, OpRecorder};
 use crate::sysctl::SysctlNamespace;
 use crate::traits::{
@@ -397,6 +399,86 @@ pub fn recover_interrupted_start(
     id: &ContainerId,
     timeouts: &StartTimeouts,
 ) -> Result<StateRecord, TraitError> {
+    recover_interrupted_start_reported(store, launcher, id, timeouts)
+        .map(RecoveredStart::into_record)
+}
+
+/// [`recover_interrupted_start`] の結果に、生存プロセスが居ないと確かめた根拠を添えたもの（#2245・REPAIR-4）。
+///
+/// 呼び出し元（supervisor の start 入口）が [`Self::encode_log_line`] で構造化ログへ写す。回復後の配置は
+/// 記録済みのまま残るため、start の連鎖を続けるには `DelegatedCgroup::resume_recorded_scope`
+/// （`crate::cgroups`。CORE-2・OCI-6）で入る。
+#[derive(Debug)]
+pub struct RecoveredStart {
+    record: StateRecord,
+    evidence: NoProcessEvidence,
+}
+
+/// 回復結果の構造化ログ行の本体（`level`・`event` は封筒 [`LogLine`] が持つ。値は固定語彙だけ）。
+#[derive(serde::Serialize)]
+struct RecoveryLogBody {
+    outcome: &'static str,
+}
+
+/// 回復結果の行のイベント名。規則に合わなければ const 評価でコンパイルが失敗する。
+const RECOVERY_EVENT: LogEvent = match LogEvent::from_static("interrupted_start_recovered") {
+    Some(e) => e,
+    None => panic!("invalid log event name"),
+};
+
+impl RecoveredStart {
+    /// 試験用の構築口(ログ行の横断照合が、回復を走らせずに行を組むため)。製品コードでは作れない。
+    #[cfg(test)]
+    pub(crate) fn for_test(record: StateRecord, evidence: NoProcessEvidence) -> Self {
+        Self { record, evidence }
+    }
+
+    /// 回復後のレコード（Created・pid なし）。
+    pub fn record(&self) -> &StateRecord {
+        &self.record
+    }
+
+    /// 生存プロセスが居ないと確かめた根拠。
+    pub fn evidence(&self) -> NoProcessEvidence {
+        self.evidence
+    }
+
+    /// レコードだけを取り出す。
+    pub fn into_record(self) -> StateRecord {
+        self.record
+    }
+
+    /// 回復結果の語彙（`already_absent`・`was_empty`・`killed`・`launch_ledger`・`unreported`）。
+    fn outcome_word(&self) -> &'static str {
+        match self.evidence {
+            NoProcessEvidence::LaunchLedger => "launch_ledger",
+            NoProcessEvidence::RecordedCgroup(RecordedCgroupOutcome::AlreadyAbsent) => {
+                "already_absent"
+            }
+            NoProcessEvidence::RecordedCgroup(RecordedCgroupOutcome::WasEmpty) => "was_empty",
+            NoProcessEvidence::RecordedCgroup(RecordedCgroupOutcome::Killed) => "killed",
+            NoProcessEvidence::Unreported => "unreported",
+        }
+    }
+
+    /// 回復結果を共通ログ型 [`LogLine`]（level `info`・event `interrupted_start_recovered`）の JSON Lines
+    /// 1 行（末尾 LF つき）にする（REPAIR-4・ERR-4）。パス・errno・pid・ID は載せない。
+    pub fn encode_log_line(&self) -> Result<Vec<u8>, LogLineError> {
+        let body = RecoveryLogBody {
+            outcome: self.outcome_word(),
+        };
+        encode_json_line(&LogLine::new(RECOVERY_EVENT, &body).with_level(LogLevel::Info))
+    }
+}
+
+/// [`recover_interrupted_start`] の本体。確認は [`ProcessLauncher::confirm_no_process_recorded_detailed`] で行い、
+/// 成功した根拠を [`RecoveredStart`] で返す（期限・所有ロック・読み直しの順序は変えない）。
+pub fn recover_interrupted_start_reported(
+    store: &dyn StateStore,
+    launcher: &Arc<dyn ProcessLauncher>,
+    id: &ContainerId,
+    timeouts: &StartTimeouts,
+) -> Result<RecoveredStart, TraitError> {
     let reservation = Arc::new(StartReservation::acquire(id)?);
     let record = store.get(&GetStateRequest::new(id.clone()))?;
     if record.status().state() != ContainerState::Running || record.status().pid().is_some() {
@@ -432,10 +514,11 @@ pub fn recover_interrupted_start(
     // 確認が終わるまでプロセス内の予約を保持する（回復の再試行・新しい start が先に進み、その後に
     // 遅れた確認が新しいプロセスを終了させることを防ぐ。CORE-2）。
     let hold = Arc::clone(&reservation);
-    match call_bounded(
+    let evidence = match call_bounded(
         confirm,
         move || {
-            let result = l.confirm_no_process_recorded(&target, recorded.as_ref(), confirm);
+            let result =
+                l.confirm_no_process_recorded_detailed(&target, recorded.as_ref(), confirm);
             drop(hold);
             result
         },
@@ -454,11 +537,12 @@ pub fn recover_interrupted_start(
                 "failed to run the launcher confirmation",
             ));
         }
-    }
-    store.update(&UpdateStateRequest::new(
+    };
+    let record = store.update(&UpdateStateRequest::new(
         ContainerStatus::created(id.clone(), None),
         record.revision(),
-    ))
+    ))?;
+    Ok(RecoveredStart { record, evidence })
 }
 
 fn start_inner(
@@ -4390,6 +4474,69 @@ mod tests {
         launcher.confirms_no_process.store(true, Ordering::SeqCst);
         recover(&store, &launcher, &id).expect("recover");
         assert_eq!(launcher.recorded.lock().unwrap().clone(), vec![None]);
+    }
+
+    /// REPAIR-4・CORE-2（#2245）: 内訳を返さない launcher（既定の detailed 実装）の回復は `Unreported` を返し、
+    /// 状態は Created・配置は不変になる。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repair4_2245_default_launcher_reports_unreported_evidence() {
+        let placement = crate::traits::CgroupPlacement::new(
+            crate::traits::CgroupScope::new("/user.slice/x.scope").expect("scope"),
+            crate::traits::StateRevision::from_raw(3),
+        );
+        let (_b, store, id) = claimed_with_cgroup("rec-unreported", Some(placement));
+        let launcher = RecordingLauncher::new(false);
+        launcher.confirms_no_process.store(true, Ordering::SeqCst);
+        let got = recover_interrupted_start_reported(
+            &store,
+            &dynl(&launcher),
+            &id,
+            &StartTimeouts::default(),
+        )
+        .expect("recover");
+        assert_eq!(got.evidence(), NoProcessEvidence::Unreported);
+        assert_eq!(got.record().status().state(), ContainerState::Created);
+    }
+
+    /// REPAIR-4・ERR-4（#2245）: 回復結果の行は、根拠 5 種それぞれ固定語彙の 1 行（level `info`・末尾 LF）で、
+    /// パス・errno・ID を含まない。
+    #[test]
+    fn repair4_2245_recovery_log_line_bytes() {
+        let rec = StateRecord::new(
+            ContainerStatus::created(ContainerId::new("web").expect("id"), None),
+            std::path::PathBuf::from("/b"),
+            crate::traits::StateRevision::from_raw(1),
+        )
+        .expect("record");
+        let cases = [
+            (NoProcessEvidence::LaunchLedger, "launch_ledger"),
+            (
+                NoProcessEvidence::RecordedCgroup(RecordedCgroupOutcome::AlreadyAbsent),
+                "already_absent",
+            ),
+            (
+                NoProcessEvidence::RecordedCgroup(RecordedCgroupOutcome::WasEmpty),
+                "was_empty",
+            ),
+            (
+                NoProcessEvidence::RecordedCgroup(RecordedCgroupOutcome::Killed),
+                "killed",
+            ),
+            (NoProcessEvidence::Unreported, "unreported"),
+        ];
+        for (evidence, word) in cases {
+            let r = RecoveredStart {
+                record: rec.clone(),
+                evidence,
+            };
+            assert_eq!(
+                String::from_utf8(r.encode_log_line().expect("line")).expect("utf8"),
+                format!(
+                    "{{\"level\":\"info\",\"event\":\"interrupted_start_recovered\",\"outcome\":\"{word}\"}}\n"
+                )
+            );
+        }
     }
 
     /// REPAIR-5・CORE-2: 生存確認が上限内に戻らなければ回復は Timeout を返して予約を残す。確認が終わる

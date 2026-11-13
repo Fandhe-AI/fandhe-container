@@ -323,7 +323,7 @@ core を参照しない crate（`io`・`net`・`oci`・`cri`・`platform-windows
 現状の当てはめ（詳細の正は各 crate の `instrument` モジュールの doc）:
 
 - plugin-cri: `CoreCriRecorder`（cri）・`CoreNetRecorder`（net）・`CoreOciRecorder`（oci）
-- cli: `CliOciRecorder`（oci の `image ls` / `rm` / `tag`・`system df`）
+- cli: `CliOciRecorder`（oci の `image ls` / `rm` / `tag` / `prune`・`system df`、`create --unpack` の展開）
 - io: 本番で io の write 経路を呼ぶ crate が無く、未配線
 - platform-windows: 本番の呼び出し元は plugin-windows だが core に依存せず、`OpRecorder` へは未接続（stderr の JSON 行に出している）
 

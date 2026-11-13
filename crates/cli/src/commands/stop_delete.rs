@@ -2722,7 +2722,7 @@ mod tests {
                     fandhe_container_core::audit_log::FileAuditSink::in_state_store(&st),
                 ),
                 store: Box::new(st),
-                recorder: OpRecorder::new(),
+                recorder: Arc::new(OpRecorder::new()),
             }
         }
 

@@ -56,7 +56,7 @@
 //!   launch はしない。作業スレッドが後から準備を終えたら、launch せずに作った cgroup を消す。
 //! - 期限超過の後も、後始末を確かめられなければ・作業スレッドを放棄したときの終了コードは `INTERNAL`（報告は `TIMEOUT` のまま）。
 //! - 後始末を確かめられなければ終了コードは `INTERNAL`。後始末自体の失敗は元のエラーを隠さず、構造化ログ（stderr）に出す。
-//! - 失敗した start の後もスコープは記録されたまま残る（core に記録済みの配置から連鎖を再開する API が無い）。
+//! - 失敗した start の後もスコープは記録されたまま残る（core に `DelegatedCgroup::resume_recorded_scope` があるが、入口は未結線。CLI の start は毎回新しい一時 scope を使い記録済みのスコープと一致しないため。`docs/design/start-chain-resume.md`・#2245）。
 //!   同じコンテナの再 start は手順 3 で `FailedPrecondition` になる。
 //! - 別プロセスの supervisor が落ちて予約（Running・pid なし）だけが残った場合、次の `start` は手順 3 で
 //!   [`StartDeps::recover_interrupted`] を呼ぶ（core が記録済みの cgroup 配置から残存を確かめ、居れば止めて Created へ戻す。
@@ -219,7 +219,7 @@ pub trait StartDeps {
     /// 手順 3: 前の supervisor が start の途中で落ち、起動権の予約（Running・pid なし）だけが残っているコンテナを、
     /// Created へ戻す（別プロセスからの回復。`oci_runtime::recover_interrupted_start`。#2011・CORE-2・SEC-1）。
     ///
-    /// 成功しても入口はその start を続けない（記録済みの配置から連鎖を再開する API が無いため。モジュール doc）。
+    /// 成功しても入口はその start を続けない（`resume_recorded_scope` の結線は未実施のため。モジュール doc）。
     /// 既定実装は回復の手段を持たないため fail-closed で `Unimplemented`（フェイクの [`StartDeps`] は上書きしなくてよい）。
     /// cgroup の連鎖には触れない（スコープは記録済みで、`prepare_cgroup` / `release_cgroup` は呼ばれない）。
     fn recover_interrupted(
@@ -1382,7 +1382,7 @@ fn prepare_start(
     };
     let status = observed.status();
     // 前の supervisor が落ちて残った起動権の予約(Running・pid なし)は、記録済みの cgroup 配置で残存を確かめて
-    // Created へ戻す(#2011)。戻した後もこの start は続けない: 配置は記録済みで連鎖を再開できないため、
+    // Created へ戻す(#2011)。戻した後もこの start は続けない: 配置は記録済みで、入口は連鎖の再開（`resume_recorded_scope`）を結線していないため、
     // `delete` と再作成を促す(下の「スコープ記録済み」の拒否と同じ理由)。cgroup には触れない。
     if status.state() == ContainerState::Running && status.pid().is_none() {
         return match deps.recover_interrupted(store, req.id(), timeouts) {
@@ -2271,8 +2271,9 @@ mod linux {
     use fandhe_container_core::exec::IsolationPrivilege;
     use fandhe_container_core::landlock::detect_landlock_abi;
     use fandhe_container_core::oci_runtime::{
-        LinuxResourceLimits, ProductionLauncher, ProductionLauncherBuilder, SubordinateIdSource,
-        load_resource_limits, load_resource_limits_audited,
+        LinuxResourceLimits, ProductionLauncher, ProductionLauncherBuilder, RecoveredStart,
+        SubordinateIdSource, load_resource_limits, load_resource_limits_audited,
+        recover_interrupted_start_reported,
     };
     use fandhe_container_core::traits::ContainerLogPath;
 
@@ -2342,6 +2343,14 @@ mod linux {
         ) -> Result<(), TraitError> {
             Self::observe(self.inner.record_until(record, deadline), log_event)
         }
+    }
+
+    /// 回復結果を遅延バッファに積む 1 行(末尾の LF を除く)にする。符号化・UTF-8 化できなければ `None`
+    /// (ログの欠落は許し、回復の成否は変えない。#2245・REPAIR-4)。
+    pub(super) fn recovery_log_line(recovered: &RecoveredStart) -> Option<String> {
+        let bytes = recovered.encode_log_line().ok()?;
+        let text = String::from_utf8(bytes).ok()?;
+        text.strip_suffix('\n').map(str::to_owned)
     }
 
     /// 本番の [`StartDeps`]。core の本番 `ProcessLauncher`（`oci_runtime::ProductionLauncher`）へ結線する
@@ -3022,7 +3031,13 @@ mod linux {
                     .audit_sink(Arc::new(audit))
                     .build()?,
             );
-            recover_interrupted_start(store, &launcher, id, timeouts).map(drop)
+            let recovered = recover_interrupted_start_reported(store, &launcher, id, timeouts)?;
+            // 回復結果(根拠の内訳)は遅延バッファへ積み、報告の後に出す(単一スレッドの区間では直接出さない。
+            // 符号化できなくても回復の成否は変えない。#2245・REPAIR-4)。
+            if let Some(line) = recovery_log_line(&recovered) {
+                self.pasta_logs.push(line);
+            }
+            Ok(())
         }
 
         fn prepare_network(&mut self, id: &ContainerId) -> Result<(), TraitError> {
@@ -4975,7 +4990,7 @@ mod linux {
                 .find("self.launcher_builder(false)?")
                 .expect("recover_interrupted builds the recovery launcher");
             let recover_end = production[recover..]
-                .find("recover_interrupted_start(store")
+                .find("recover_interrupted_start_reported(store")
                 .map(|p| p + recover)
                 .expect("recovery call follows the builder");
             assert!(!production[recover..recover_end].contains("exit_audit_sink("));
@@ -5007,7 +5022,7 @@ mod linux {
                 .find("self.launcher_builder(false)?")
                 .expect("recover_interrupted builds the recovery launcher");
             let recover_end = production[recover..]
-                .find("recover_interrupted_start(store")
+                .find("recover_interrupted_start_reported(store")
                 .map(|p| p + recover)
                 .expect("recovery call follows the builder");
             assert!(!production[recover..recover_end].contains("rejection_audit_sink("));

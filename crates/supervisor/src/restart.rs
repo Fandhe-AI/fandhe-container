@@ -1482,6 +1482,17 @@ impl ProcessLauncher for SpecCapturingLauncher {
         self.inner
             .confirm_no_process_recorded(id, recorded, timeout)
     }
+
+    /// 内訳つきの確認も内側へ転送する(転送しないと `Unreported` へ縮退し、回復結果が観測に残らない。#2245・REPAIR-4)。
+    fn confirm_no_process_recorded_detailed(
+        &self,
+        id: &ContainerId,
+        recorded: Option<&fandhe_container_core::traits::CgroupPlacement>,
+        timeout: Duration,
+    ) -> Result<fandhe_container_core::oci_runtime::NoProcessEvidence, TraitError> {
+        self.inner
+            .confirm_no_process_recorded_detailed(id, recorded, timeout)
+    }
 }
 
 /// 再 launch の区間で止めた stderr の専用スレッドを、ガードの破棄で再開する（早期 return を含む全経路で再開する。#2043）。

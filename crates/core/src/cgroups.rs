@@ -164,9 +164,11 @@ pub(crate) use exec_kill::{
     validate_exec_child_name,
 };
 pub use recorded_scope::{
-    RecordedCgroupKill, RecordedCgroupOutcome, RecordedCgroupScope, ensure_no_process_in_recorded,
+    RecordedCgroupKill, RecordedCgroupScope, ensure_no_process_in_recorded,
     kill_recorded_container_cgroup,
 };
+// 結果型は 3 OS 共通の `ProcessLauncher` の戻り値に使うため oci_runtime 側が定義し、既存の公開パスを保つ。
+pub use crate::oci_runtime::RecordedCgroupOutcome;
 
 /// 退避リーフ cgroup の名前。自プロセスの移動先（レイアウトは本モジュール冒頭を参照）。
 const EVACUATION_LEAF: &str = "fc-runtime";
@@ -248,11 +250,13 @@ pub enum CgroupStep {
     AttachDeviceProgram,
     /// アタッチ後の問い合わせと照合（プログラム数 1・attach flags 0。#1680・SEC-1）。
     VerifyDeviceProgram,
+    /// 回復後に記録済みの配置から start の連鎖を再開する段（`resume_recorded_scope`。#2245・CORE-2・OCI-6）。
+    ResumeScope,
 }
 
 impl CgroupStep {
     /// 全変種（試験での網羅確認用）。変種を足したら `as_str` とあわせてここも更新する。
-    pub const ALL: [Self; 26] = [
+    pub const ALL: [Self; 27] = [
         Self::ReadSelfCgroup,
         Self::OpenRoot,
         Self::VerifyCgroup2,
@@ -279,6 +283,7 @@ impl CgroupStep {
         Self::LoadDeviceProgram,
         Self::AttachDeviceProgram,
         Self::VerifyDeviceProgram,
+        Self::ResumeScope,
     ];
 
     /// 段名の snake_case 表現（`Display` と構造化ログで使う安定した語彙。ERR-1・ERR-4・REPAIR-4）。
@@ -312,6 +317,7 @@ impl CgroupStep {
             Self::LoadDeviceProgram => "load_device_program",
             Self::AttachDeviceProgram => "attach_device_program",
             Self::VerifyDeviceProgram => "verify_device_program",
+            Self::ResumeScope => "resume_scope",
         }
     }
 }
@@ -1598,6 +1604,27 @@ impl DelegatedCgroup {
             id,
             instance,
             recorder,
+            SweepMode::KillAll,
+            sys::effective_uid(),
+            &open_cgroup_dir,
+        )
+    }
+
+    /// `cgroup.kill` を一切書かずにコンテナ cgroup を削除する（回復後の再開用。#2245・CORE-2・OCI-6）。
+    ///
+    /// コンテナ cgroup 自身や子孫の `exec-*` にプロセスが居る（または持ち主が生きている）ときは、
+    /// 何も止めずに `FailedPrecondition` を返す。空の `exec-*` だけを消す。
+    pub(crate) fn remove_container_cgroup_without_kill(
+        &self,
+        id: &ContainerId,
+        instance: StateRevision,
+    ) -> Result<CgroupRemoval, TraitError> {
+        remove_container_cgroup_with(
+            self.fd.as_fd(),
+            id,
+            instance,
+            None,
+            SweepMode::UnpopulatedOnly,
             sys::effective_uid(),
             &open_cgroup_dir,
         )
@@ -1613,6 +1640,7 @@ fn remove_container_cgroup_with(
     id: &ContainerId,
     instance: StateRevision,
     recorder: Option<&OpRecorder>,
+    mode: SweepMode,
     euid: u32,
     open_dir: &dyn Fn(CgroupStep, BorrowedFd<'_>, &str) -> Result<OwnedFd, CgroupError>,
 ) -> Result<CgroupRemoval, TraitError> {
@@ -1628,11 +1656,20 @@ fn remove_container_cgroup_with(
             // `rmdir` が EBUSY になり、何度再試行しても成功しない。停止済みでない（コンテナ cgroup 自身に
             // プロセスが居る）ときは掃除が何も kill せず `FailedPrecondition` を返す。
             let deadline = std::time::Instant::now() + EXEC_SWEEP_DELETE_TIMEOUT;
-            let swept =
-                sweep_exec_children_at(child.fd.as_fd(), SweepMode::KillAll, deadline, recorder)
-                    .map_err(removal_error)?;
+            let swept = sweep_exec_children_at(child.fd.as_fd(), mode, deadline, recorder)
+                .map_err(removal_error)?;
             if swept.failed > 0 || swept.truncated {
                 return Err(sweep_removal_error(&swept));
+            }
+            // kill しない方式では、プロセスが居る・持ち主が生きている子を残したまま親を消せない。
+            // 何も止めずに失敗にする（`rmdir` の EBUSY に任せない）。
+            if mode == SweepMode::UnpopulatedOnly
+                && (swept.left_populated > 0 || swept.left_owner_alive > 0)
+            {
+                return Err(TraitError::new(
+                    ErrorCode::FailedPrecondition,
+                    "container cgroup still has processes; nothing was killed",
+                ));
             }
             match remove_child_at(parent, &child) {
                 Ok(()) => Ok(CgroupRemoval::Removed),
@@ -2080,13 +2117,14 @@ mod tests {
             CgroupStep::LoadDeviceProgram => 23,
             CgroupStep::AttachDeviceProgram => 24,
             CgroupStep::VerifyDeviceProgram => 25,
+            CgroupStep::ResumeScope => 26,
         }
     }
 
     /// ERR-1・ERR-4・#3118: `ALL` が全変種を重複なく持ち、`as_str` が `{:?}` の snake_case と一致する。
     #[test]
     fn err1_cgroup_step_as_str_is_snake_case_of_variant_name() {
-        let mut seen = [false; 26];
+        let mut seen = [false; 27];
         for s in CgroupStep::ALL {
             let i = step_index(s);
             assert!(!seen[i], "duplicate {s:?}");

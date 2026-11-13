@@ -330,6 +330,30 @@ fn err4_3122_legacy_tiocsti_line() {
     assert_eq!(f.str_of("sysctl"), Some("dev.tty.legacy_tiocsti"));
 }
 
+/// ERR-4・REPAIR-4・#2245: 中断された start の回復結果の行は共有検査器を通り、level `info`・
+/// 本体は `outcome` の固定語彙だけ（キー順 `level, event, outcome`）。
+#[test]
+fn err4_2245_interrupted_start_recovered_line() {
+    use crate::oci_runtime::{NoProcessEvidence, RecordedCgroupOutcome, RecoveredStart};
+    use crate::traits::{ContainerStatus, StateRecord, StateRevision};
+    let rec = StateRecord::new(
+        ContainerStatus::created(ContainerId::new("web").unwrap(), None),
+        PathBuf::from("/b"),
+        StateRevision::from_raw(1),
+    )
+    .unwrap();
+    let bytes = RecoveredStart::for_test(
+        rec,
+        NoProcessEvidence::RecordedCgroup(RecordedCgroupOutcome::Killed),
+    )
+    .encode_log_line()
+    .unwrap();
+    let f = &stream(&bytes)[0];
+    assert_eq!(f.level.as_deref(), Some("info"));
+    assert_eq!(f.event, "interrupted_start_recovered");
+    assert_eq!(f.str_of("outcome"), Some("killed"));
+}
+
 /// ERR-4・#3122: PATH 警告は敵対的・最大長のパスでも 1 行で、警告が先・エラーが最終行（#3114 (d)）。
 #[test]
 fn err4_3122_path_warning_hostile_and_ordering() {

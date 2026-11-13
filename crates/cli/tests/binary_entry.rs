@@ -261,10 +261,12 @@ fn cli1_unknown_command_is_usage_error() {
 }
 
 /// ERR-4・#3122: 実バイナリの stderr の全行が「1 行 1 JSON」の契約を満たす。敵対的で長い引数
-/// （改行・制御文字・引用符・32 KiB 超）は行へ埋め込まれず、使い方エラーの固定の 1 行のままである。
+/// （改行・制御文字・引用符・巨大な長さ。Windows 以外は 32 KiB 超、Windows は起動上限内の約 30,000 文字）は行へ埋め込まれず、使い方エラーの固定の 1 行のままである。
 #[test]
 fn err4_3122_real_binary_stderr_is_one_json_line() {
-    let long = "x".repeat(40_000);
+    // Windows の CreateProcessW はコマンドライン全体で 32,767 UTF-16 単位が上限のため、起動できる長さに分ける。
+    let long_len = if cfg!(windows) { 30_000 } else { 40_000 };
+    let long = "x".repeat(long_len);
     // argv は NUL を持てないため除く。
     let hostile = json_lines_contract::HOSTILE_TEXT.replace('\0', "");
     let args = [hostile.as_str(), long.as_str(), "\n{\"event\":\"forged\"}"];

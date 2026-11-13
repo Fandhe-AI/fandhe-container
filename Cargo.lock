@@ -345,6 +345,7 @@ dependencies = [
 name = "fandhe-container-gpu"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "serde",
  "serde-saphyr",
 ]

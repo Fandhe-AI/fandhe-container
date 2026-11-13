@@ -4,7 +4,9 @@
 //! 3 は対象なし、8 は未実装など。
 //! `setup`（CLI-2）は OS 固有設定の要求ステップを stdout へ出す（Linux は rootful のときだけ要る特権ランチャーのインストール手順を 1 行表示して 0。表示のみで実行しない。#1454・#1722）。`start` は同じディレクトリの supervisor を起動して結果を受け取る（#1718）。supervisor は core の本番 launcher で起動する（実体の隣に `fandhe-container-launcher` があれば rootful のインストールとしてランチャー経由〔#2442〕。uid 0 の起動は `UNIMPLEMENTED`（8））。
 //! unix では起動時に SIGINT・SIGTERM・SIGHUP のハンドラを登録し、起動中の plugin へ転送してから終了する（#1513・PLUG-7）。
-//! 失敗時は stderr へ英語 1 行 JSON（`code` / `message`。core 由来は `op` も）を出す。
+//! 失敗時のエラー行は stderr の最終行の英語 1 行 JSON（ERR-1 の `code` / `message`。core 由来は `op` も）。
+//! `--plugin-path-search` で opt-in したときは、その前に PATH 候補ごとの警告行（共通ログ型。`level`・`event` つき。
+//! #3119）が先行する。エラー行のキー構成は警告行とは別に移行中（#3118・#3120）で、ここでは固定しない。
 //! 終了時に、plugin の後始末の失敗のうち `Drop` で即時に書けなかった記録（`fandhe_container_plugin::take_pending_child_cleanup_failures`）を
 //! コマンド結果の行の後に stderr へ 1 行ずつ出す。記録であって失敗の判定ではないため終了コードは変えない（#1673・REPAIR-4・PLUG-7）。
 

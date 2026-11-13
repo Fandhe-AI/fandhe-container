@@ -192,3 +192,7 @@ mod test_root;
 // 試験用の一時ファイルを先行削除・上書きなしで排他作成する補助（REPAIR-12・#3479）。
 #[cfg(test)]
 mod test_temp_file;
+
+// 「1 行 1 JSON」の共有検査器による観測ログの横断照合（ERR-4・#3122・#3114 の判断 (f)）。試験専用。
+#[cfg(test)]
+mod err4_cross_check;

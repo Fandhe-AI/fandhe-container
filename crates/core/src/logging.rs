@@ -23,7 +23,7 @@
 //!   そのうえで LF / CR のバイトが無いことを防御として確かめ、末尾に LF をちょうど 1 つ付け、
 //!   `write_all` 1 回で書く。オブジェクトでない本体は flatten が失敗し `Encode` になる。
 //! - **予約キー**: 本体は `level` / `event` を持たない契約とする。持つと重複キーになる
-//!   （検出は各 DTO の試験の責務。監査は file_writer の試験で検出済み〔#3115〕、op_stats は `observability` の試験で照合済み〔#3116〕、OCI エラー行は `oci_runtime::error` の試験で照合済み〔#3118〕、残りは TASK-98.2）。
+//!   （検出は各 DTO の試験の責務。監査は file_writer の試験で検出済み〔#3115〕、op_stats は `observability` の試験で照合済み〔#3116〕、OCI エラー行は `oci_runtime::error` の試験で照合済み〔#3118〕、移行は完了。3 系統の横断照合は `err4_cross_check`・#3122）。
 //! - **表示を乱す文字**（Cf・Zl・Zp 等）の置換は封筒の責務ではなく、各本体が前処理する。
 //! - 資格情報・ホストの機密値をフィールドに入れない。出力先の権限は呼び出し元が決める。
 //!
@@ -31,6 +31,8 @@
 //!
 //! `io`（観測ログ）と `plugin` は core より下の層にあるため本型を使えない。core への辺を足す
 //! ことはオーナーの承認事項である。cli は core への既存の辺で本型を使う（#3120）。
+//! io・plugin は辺を足さず、plugin 配下の共有検査器 `tests/support/json_lines_contract.rs` を
+//! 試験で取り込んで同じ形式を保つ（#3114 の判断 (f)・#3122）。
 
 use std::fmt;
 use std::io::Write;
@@ -374,6 +376,9 @@ pub fn write_json_line<F: Serialize>(
     out.write_all(&bytes)
         .map_err(|_| LogLineError::of(LogLineErrorKind::Io))
 }
+
+#[cfg(test)]
+mod err4_cross_check;
 
 #[cfg(test)]
 mod tests {

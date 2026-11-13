@@ -61,3 +61,12 @@ mod scratch_root;
 #[cfg(test)]
 #[path = "../../oci/tests/support/test_root.rs"]
 mod test_root;
+
+// 「1 行 1 JSON」の共有検査器（ERR-4・#3122。plugin 配下の `MIT OR Apache-2.0` の試験部品を取り込む）。
+// 試験専用で製品・rlib に影響しない。cli は serde_json を持たないため std のみの検査器を使う。
+#[cfg(test)]
+#[path = "../../plugin/tests/support/json_lines_contract.rs"]
+mod json_lines_contract;
+
+#[cfg(test)]
+mod err4_cross_check;

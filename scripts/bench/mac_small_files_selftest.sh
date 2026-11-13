@@ -458,14 +458,18 @@ own_clean() { [ ! -e "${BUNDLE}/config.json" ] && dir_empty "$OWNHOST" && [ "$(o
 # 入力エラー（副作用の前。CLI の呼び出し 0 回・終了コード 2）
 reset_stub ok
 mkdir -p "${TMP}/outside" "${BUNDLE}/sub" "${SHARED}/outer/b/rootfs"
-runown --host-dir "${TMP}/outside"
+runit --mode own --runtime "$FANDHE" --shared-root "$SHARED" --host-dir "${TMP}/outside" --bundle "$BUNDLE" --image-id "$IMGID"
 check "own: --host-dir outside --shared-root is rejected with 2" rc_is 2
+check "own: --host-dir outside reason is reported" err_has "--host-dir must be under --shared-root"
 runit --mode own --runtime "$FANDHE" --shared-root "$SHARED" --host-dir "$OWNHOST" --bundle "${TMP}/outside" --image-id "$IMGID"
 check "own: --bundle outside --shared-root is rejected with 2" rc_is 2
-runown --host-dir "${BUNDLE}/sub"
+check "own: --bundle outside reason is reported" err_has "--bundle must be under --shared-root"
+runit --mode own --runtime "$FANDHE" --shared-root "$SHARED" --host-dir "${BUNDLE}/sub" --bundle "$BUNDLE" --image-id "$IMGID"
 check "own: --host-dir inside --bundle is rejected with 2" rc_is 2
+check "own: --host-dir inside --bundle reason is reported" err_has "--host-dir must not be inside --bundle"
 runit --mode own --runtime "$FANDHE" --shared-root "$SHARED" --host-dir "${SHARED}/outer" --bundle "${SHARED}/outer/b" --image-id "$IMGID"
 check "own: --bundle inside --host-dir is rejected with 2" rc_is 2
+check "own: --bundle inside --host-dir reason is reported" err_has "--bundle must not be inside --host-dir"
 runit --mode own --runtime "$FANDHE" --shared-root "$SHARED" --host-dir "$SHARED" --bundle "$BUNDLE" --image-id "$IMGID"
 check "own: --host-dir equal to --shared-root is rejected with 2" rc_is 2
 : >"${BUNDLE}/config.json"
@@ -473,10 +477,12 @@ runown
 check "own: an existing bundle config.json is rejected with 2" rc_is 2
 check "own: the existing config.json is left untouched" test -e "${BUNDLE}/config.json"
 rm -f "${BUNDLE}/config.json"
-runown --image-id "sha256:abc"
+runit --mode own --runtime "$FANDHE" --shared-root "$SHARED" --host-dir "$OWNHOST" --bundle "$BUNDLE" --image-id "sha256:abc"
 check "own: a short --image-id is rejected with 2" rc_is 2
-runown --image-id "abc"
+check "own: a short --image-id reason is reported" err_has "--image-id must be sha256"
+runit --mode own --runtime "$FANDHE" --shared-root "$SHARED" --host-dir "$OWNHOST" --bundle "$BUNDLE" --image-id "abc"
 check "own: an --image-id without sha256: is rejected with 2" rc_is 2
+check "own: an --image-id without sha256: reason is reported" err_has "--image-id must be sha256"
 ln -s "$SHARED" "${TMP}/shared-link"
 runit --mode own --runtime "$FANDHE" --shared-root "${TMP}/shared-link" --host-dir "$OWNHOST" --bundle "$BUNDLE" --image-id "$IMGID"
 check "own: a symlinked --shared-root is rejected with 2" rc_is 2

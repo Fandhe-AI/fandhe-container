@@ -59,8 +59,8 @@ PoC-11 の本文は「4KB ファイル 2000 個」と書くが、実測したス
 起動契約（1 試行）: `create --bundle <bundle> --label fandhe.mac-small-files.run=<tag> <id>` → `start <id>` →
 `state <id>`（`stopped` まで 0.1 秒間隔で繰り返す）→ `logs --stream stdout <id>` → `inspect <id>`（`status=stopped` かつ `exitCode=0`）→
 `delete <id>`。ID は `fms-<16 桁 16 進の tag>-<n>`。`--root` は付けない（macOS の状態はゲスト側にあり、#1906 項目 3 と
-#2431 が未了のため専用ルートが効く前提を置かない）。他のコンテナには触れず、記録した自分の ID だけを後始末で `state`（NOT_FOUND を確認）→
-必要なら `kill KILL` → `delete` → `state` の順に片づける。確認できない ID があれば終了コード 4。
+Issue #2431 が未了のため専用ルートが効く前提を置かない）。他のコンテナには触れず、記録した自分の ID だけを後始末で `state`（NOT_FOUND を確認）→
+必要なら `kill KILL` → `delete` → `state` の順に片づける。確認できない ID があれば終了コード 4。回収対象に記録するのは create が成功した ID だけで、create が失敗（`ALREADY_EXISTS` を含む）した ID には kill・delete・state を送らない（所有を証明できないため）。create の期限切れ（成否不明）は警告で手動確認を促す。
 
 区間（method `cli-create-start-wait-delete-total`）: `(create の開始から stopped を返した state の終了まで) + (delete の開始から終了まで)`。
 logs・inspect の時間は含めない。偏りの向きは own に不利: CLI のプロセス起動を呼び出し回数ぶん払い、state のポーリング間隔（0.1 秒）が

@@ -400,10 +400,19 @@ own_trial_body() {
   own_stage=config
   own_write_config "$tdir" "$script" || { own_fail="cannot write the bundle config"; return 1; }
   own_stage=create
-  # create を試みる前に ID を記録する（途中で失敗・中断しても cleanup が不存在を確認する）。
+  # 所有を証明できない ID には何も送らない（AGENTS.md の回収方針）。ID は create の成功後にだけ回収対象へ記録する。
+  # create が失敗（ALREADY_EXISTS を含む）しても kill・delete は送らず、後始末の gone 確認の対象にもしない。
+  # 期限切れ（成否不明）のときだけ、作られている可能性を警告して手動確認を促す。
+  own_call create "${work}/o.out" "${work}/o.err" create --bundle "$bundle" --label "${LABEL_KEY}=${run_tag}" "$id" || {
+    rc=$?
+    if [ "$rc" -eq 124 ]; then
+      echo "warning: create of ${id} timed out and its outcome is unknown; no kill or delete was sent. Inspect it manually (label ${LABEL_KEY}=${run_tag})" >&2
+    fi
+    own_rc_fail "$rc"
+    return $?
+  }
   echo "$id" >>"$own_ids_file"
   own_cur_id="$id"
-  own_call create "${work}/o.out" "${work}/o.err" create --bundle "$bundle" --label "${LABEL_KEY}=${run_tag}" "$id" || { own_rc_fail $?; return $?; }
   c0="$clock_t0"
   c1="$clock_t1"
   prev_t1="$c1"

@@ -200,6 +200,11 @@ case "$cmd" in
       echo '{"code":"UNIMPLEMENTED","message":"secret detail /private/path"}' >&2
       exit 12
     fi
+    if [ "${STUB_MODE:-ok}" = exists ]; then
+      echo foreign >"$od/$id.status"
+      echo '{"code":"ALREADY_EXISTS","message":"container exists"}' >&2
+      exit 6
+    fi
     [ -f "$bundle/config.json" ] || exit 1
     [ "${STUB_MODE:-ok}" = slow ] && sleep 0.2
     jq -r '.mounts[0].source' "$bundle/config.json" >"$od/$id.src"
@@ -508,6 +513,13 @@ check "own: the CLI error code is reported" err_has 'cli code=UNIMPLEMENTED'
 if ! grep -q 'secret' "${TMP}/err" && ! grep -q "$TMP" "${TMP}/err"; then pass "own: the CLI message and paths are not echoed"; else fail "own: the CLI message and paths are not echoed"; fi
 check "own: a failed run publishes no result" test ! -e "${TMP}/own-fail.json"
 check "own: a failed run leaves no config.json behind" test ! -e "${BUNDLE}/config.json"
+check "own: a failed create sends no kill, delete or state" test "$(grep -c '^kill\|^delete\|^state' "${STUB_DIR}/calls" || true)" -eq 0
+reset_stub exists
+runown --output "${TMP}/own-exists.json"
+check "own: ALREADY_EXISTS exits 1 (not cleanup-failed)" rc_is 1
+check "own: ALREADY_EXISTS sends no kill, delete or state" test "$(grep -c '^kill\|^delete\|^state' "${STUB_DIR}/calls" || true)" -eq 0
+check "own: ALREADY_EXISTS leaves the existing container untouched" test "$(cat "${STUB_DIR}"/own/*.status)" = foreign
+check "own: ALREADY_EXISTS does not report cleanup-failed" test "$(grep -c 'cleanup-failed' "${TMP}/err" || true)" -eq 0
 reset_stub nonzero
 runown
 check "own: a non-zero container exit code exits 1" rc_is 1

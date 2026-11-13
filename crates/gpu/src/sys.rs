@@ -18,9 +18,11 @@
 //! - 名前は 1 要素（`/` を含まない・空 / `.` / `..` でない）だけを受け、途中要素の symlink を辿らせない
 //!
 //! # `libc` との機械照合について
-//! 本 crate は #1837 の当初の対象に入っておらず、`libc` 照合は未導入。導入は #1837 の子 issue（#2989。
-//! `docs/design/ffi-libc-check.md`「適用状況」）で行う。dev-dependency の追加は oci（#2590）と同様に
-//! crate ごとの承認を経る。
+//! 試験専用モジュール `libc_abi`（#2989・#1837・MVM-4・REPAIR-12。方式は `docs/design/ffi-libc-check.md`）が、
+//! 自前の定数と `extern "C"` 宣言を `libc`（dev-dependencies のみ。`=0.2.189`。#3290 で crate ごとに承認済み）
+//! と `const` 評価で照合する。食い違えばビルドが E0080 / E0308 で落ちる。この `sys` に宣言を足す PR は
+//! 同じ PR で照合も足す（coding-rust.md）。評価ターゲットは x86_64 のネイティブと、aarch64 の
+//! `cross-target-check` の型検査。
 
 #![cfg(target_os = "linux")]
 
@@ -237,6 +239,83 @@ pub(crate) fn unshare_mount_ns() -> Result<(), SysError> {
     // SAFETY: 引数は値渡しのフラグ（`CLONE_NEWNS` = 0x20000。x86_64・aarch64 共通）だけでポインタを含まない。
     let r = unsafe { unshare(0x0002_0000) };
     if r < 0 { Err(last_error()) } else { Ok(()) }
+}
+
+/// 自前の定数・FFI 宣言と `libc` のコンパイル時照合（試験専用。#2989・#1837・MVM-4・REPAIR-12・GPU-2・SEC-1）。
+///
+/// `cdi_apply` の `deviceNodes` 作成とフック実行が使う `openat` 系の定数・宣言の取り違え（例: aarch64 の
+/// `O_NOFOLLOW`）は symlink を辿る分離欠陥になりうるため、値と関数の型を `libc` と突き合わせる。
+/// 値のずれは E0080、型のずれは E0308 でビルドが落ちる。`cdi_apply` 側の `SysError::Os(<errno>)` の
+/// リテラル（`device_nodes.rs`・`hooks/run.rs`）は項目として参照できないため、`libc` 側の値を固定する。
+///
+/// 対象外: `SUPPORTED`（cfg の判定値で FFI でない）、対応外 arch の `consts`（呼ばれないプレースホルダ）、
+/// 安全なラッパー群。構造体の FFI は持たない。libc 0.2.189 では宣言も値も gnu と musl で同一のため
+/// `target_env` では分けない。`c_geteuid` は `link_name = "geteuid"` で、Rust 名と C シンボル名が違うため
+/// 型で照合する（シンボル名は `geteuid`）。`openat`・`fcntl` は `libc` も可変長で、同じ可変長の型へ代入する。
+#[cfg(all(
+    test,
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    target_pointer_width = "64"
+))]
+mod libc_abi {
+    use super::consts;
+    use libc::{c_char, c_int, dev_t, mode_t, uid_t};
+
+    const _: () = {
+        let _: c_int = consts::O_DIRECTORY;
+        let _: c_int = consts::O_NOFOLLOW;
+        let _: c_int = consts::O_CLOEXEC;
+        let _: c_int = consts::O_PATH;
+        let _: c_int = consts::AT_REMOVEDIR;
+        let _: mode_t = consts::S_IFCHR;
+        let _: mode_t = consts::S_IFBLK;
+        let _: mode_t = consts::S_IFIFO;
+        let _: c_int = consts::F_GETFL;
+        let _: c_int = consts::F_SETFL;
+        let _: c_int = consts::O_NONBLOCK;
+        let _: c_int = consts::O_NOCTTY;
+        assert!(consts::O_DIRECTORY == libc::O_DIRECTORY);
+        assert!(consts::O_NOFOLLOW == libc::O_NOFOLLOW);
+        assert!(consts::O_CLOEXEC == libc::O_CLOEXEC);
+        assert!(consts::O_PATH == libc::O_PATH);
+        assert!(consts::AT_REMOVEDIR == libc::AT_REMOVEDIR);
+        assert!(consts::S_IFCHR == libc::S_IFCHR);
+        assert!(consts::S_IFBLK == libc::S_IFBLK);
+        assert!(consts::S_IFIFO == libc::S_IFIFO);
+        assert!(consts::F_GETFL == libc::F_GETFL);
+        assert!(consts::F_SETFL == libc::F_SETFL);
+        assert!(consts::O_NONBLOCK == libc::O_NONBLOCK);
+        assert!(consts::O_NOCTTY == libc::O_NOCTTY);
+
+        // `sys` 内のリテラル。`check_single_component` の `Os(22)`、`unshare_mount_ns` の `0x0002_0000`、
+        // 試験 `mkdir_open_and_nofollow` の 17・40・20。
+        assert!(libc::EINVAL == 22);
+        assert!(libc::CLONE_NEWNS == 0x0002_0000);
+        assert!(libc::EEXIST == 17);
+        assert!(libc::ELOOP == 40);
+        assert!(libc::ENOTDIR == 20);
+        // `sys` の外（`cdi_apply/device_nodes.rs` の 2・17、`cdi_apply/hooks/run.rs` の 110・5・18・22・39）。
+        assert!(libc::ENOENT == 2);
+        assert!(libc::ETIMEDOUT == 110);
+        assert!(libc::EIO == 5);
+        assert!(libc::EXDEV == 18);
+        assert!(libc::ENOTEMPTY == 39);
+
+        let _: unsafe extern "C" fn(c_int, *const c_char, c_int, ...) -> c_int = super::openat;
+        let _: unsafe extern "C" fn(c_int, *const c_char, c_int, ...) -> c_int = libc::openat;
+        let _: unsafe extern "C" fn(c_int, *const c_char, mode_t) -> c_int = super::mkdirat;
+        let _: unsafe extern "C" fn(c_int, *const c_char, mode_t) -> c_int = libc::mkdirat;
+        let _: unsafe extern "C" fn(c_int, *const c_char, mode_t, dev_t) -> c_int = super::mknodat;
+        let _: unsafe extern "C" fn(c_int, *const c_char, mode_t, dev_t) -> c_int = libc::mknodat;
+        let _: unsafe extern "C" fn(c_int, *const c_char, c_int) -> c_int = super::unlinkat;
+        let _: unsafe extern "C" fn(c_int, *const c_char, c_int) -> c_int = libc::unlinkat;
+        let _: unsafe extern "C" fn(c_int, c_int, ...) -> c_int = super::fcntl;
+        let _: unsafe extern "C" fn(c_int, c_int, ...) -> c_int = libc::fcntl;
+        let _: unsafe extern "C" fn() -> uid_t = super::c_geteuid;
+        let _: unsafe extern "C" fn() -> uid_t = libc::geteuid;
+        let _: unsafe extern "C" fn(c_int) -> c_int = super::unshare;
+        let _: unsafe extern "C" fn(c_int) -> c_int = libc::unshare;
+    };
 }
 
 #[cfg(test)]

@@ -12,7 +12,7 @@
 //! 祖先の symlink を `openat(O_NOFOLLOW)` の要素ごとの解決で拒否する（SEC-1。#3748）。
 //! core 自身の終了要求は SIGTERM ではなく接続切断（EOF）で伝わる。
 //!
-//! 製品の依存に `libc` は入れず、`nix` は不採用（dependency-policy）で、std にシグナル API が無いため、
+//! 製品の依存に `libc` は入れず（dev-dependencies で照合にだけ使う。#4726）、`nix` は不採用（dependency-policy）で、std にシグナル API が無いため、
 //! 最小限の `extern "C"` 宣言を自前で持つ。`struct sigaction` は OS・アーキテクチャでレイアウトが異なるため
 //! 使わず、番号とハンドラのアドレスだけを取る `signal(3)`（glibc・musl・macOS とも BSD セマンティクスで、
 //! ハンドラは解除されず再設定も不要）を使う。
@@ -53,10 +53,10 @@
 //! 3 つ目になったら共有の下位 crate を検討する（`docs/design/fdinfo-mnt-id-parsing.md` と同じ形）。
 //! 対象は macOS と Linux の x86_64 / aarch64 で、他の unix は `Unsupported`、Windows は対象外（未検査）。
 //!
-//! # libc との機械照合（未導入）
-//! 本 crate は dev-dependencies に `libc` を持たないため照合は入れていない。dev-dependency の追加は crate ごとの
-//! オーナー承認事項で、#1837 の子として扱う（判断のまとめは #3290。`docs/design/ffi-libc-check.md`「適用状況」）。
-//! 代わりに番号（`SIGTERM`・`O_*`・`AT_FDCWD`・`ELOOP`・`ENOTDIR`）を具体値で固定する試験を置く。出典は
+//! # libc との機械照合
+//! dev-dependencies の `libc`（#3290 の承認・#4726）と、`imp::libc_abi`・`nofollow::libc_abi` で `const` 評価により
+//! 照合する（方式は `docs/design/ffi-libc-check.md`。MVM-4・REPAIR-12）。あわせて番号（`SIGTERM`・`O_*`・`AT_FDCWD`・
+//! `ELOOP`・`ENOTDIR`）を具体値で固定する試験も併置して残す。出典は
 //! `O_*` / `AT_FDCWD` が Linux の `include/uapi/asm-generic/fcntl.h`・`arch/arm64/include/uapi/asm/fcntl.h`・
 //! macOS の `sys/fcntl.h`。`ELOOP` / `ENOTDIR` は Linux の `include/uapi/asm-generic/errno.h`・`errno-base.h` と macOS の `sys/errno.h`（#3841）。`SIGTERM` の出典は Linux `include/uapi/asm-generic/signal.h`
 //! （SIGTERM=15。x86_64・aarch64 とも同じ）と macOS `sys/signal.h`（同値）、`SIG_ERR` は `(sighandler_t)-1`
@@ -118,6 +118,33 @@ mod imp {
         // ハンドラは解除されないため、2 回目以降の SIGTERM もフラグを再度立てるだけでプロセスを殺さない。
         let prev = unsafe { signal(SIGTERM, handler as usize) };
         prev != SIG_ERR
+    }
+    /// 自前の FFI 宣言を dev-dependencies の `libc` とコンパイル時に照合する（#4726・MVM-4・REPAIR-12。
+    /// 方式は `docs/design/ffi-libc-check.md`）。`const` の評価なので食い違えばビルドが落ちる。
+    /// 関数は呼ばず型だけを比べる（`unsafe` は足さない）。
+    ///
+    /// 対象外: 構造体は無い（`struct sigaction` は使わない）。`install` は FFI でない安全なラッパー。
+    /// 宣言側に gnu / musl の分岐は無く、`target_env` では分けない。
+    #[cfg(test)]
+    mod libc_abi {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        const _: () = assert!(super::SIGTERM == libc::SIGTERM);
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        const _: () = assert!(super::SIGTERM == libc::SIGTERM);
+        #[cfg(target_os = "macos")]
+        const _: () = assert!(super::SIGTERM == libc::SIGTERM);
+
+        // `sighandler_t` は `libc` で整数。自前は `usize`（`as` で合わせず値と幅を直接比べる）。
+        const _: () = assert!(super::SIG_ERR == libc::SIG_ERR);
+        const _: () = assert!(size_of::<usize>() == size_of::<libc::sighandler_t>());
+
+        const _: unsafe extern "C" fn(libc::c_int, libc::sighandler_t) -> libc::sighandler_t =
+            super::signal;
+        const _: unsafe extern "C" fn(libc::c_int, libc::sighandler_t) -> libc::sighandler_t =
+            libc::signal;
+
+        // `libc` に型付きのハンドラ型は無い（`sighandler_t` は整数）ため、引数型だけを確かめる。
+        const _: extern "C" fn(libc::c_int) = super::on_sigterm;
     }
 }
 
@@ -317,6 +344,62 @@ mod nofollow {
         }
         openat_raw(cur.as_raw_fd(), leaf, LEAF_FLAGS).map_err(NoFollowOpenError::Leaf)
     }
+
+    /// 自前の FFI 宣言を dev-dependencies の `libc` とコンパイル時に照合する（#4726・MVM-4・REPAIR-12。
+    /// 方式は `docs/design/ffi-libc-check.md`）。評価されるのは x86_64 Linux のネイティブと、
+    /// cross-target-check の `aarch64-unknown-linux-gnu`・`aarch64-apple-darwin`。
+    ///
+    /// 対象外: macOS の `O_PATH = 0`（macOS に `O_PATH` は無く、0 は本 crate で決めた値。出典は macOS `sys/fcntl.h`）、
+    /// `DIR_FLAGS`・`LEAF_FLAGS`（方針で組み合わせた値で、構成要素は照合済み。組み合わせは `sec1_3748_constants_*` が見る）、
+    /// `openat_raw`・`open`・`is_not_real_entry` 等の安全なラッパー。
+    #[cfg(test)]
+    mod libc_abi {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        const _: () = assert!(super::O_DIRECTORY == libc::O_DIRECTORY);
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        const _: () = assert!(super::O_NOFOLLOW == libc::O_NOFOLLOW);
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        const _: () = assert!(super::O_DIRECTORY == libc::O_DIRECTORY);
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        const _: () = assert!(super::O_NOFOLLOW == libc::O_NOFOLLOW);
+        #[cfg(target_os = "linux")]
+        const _: () = assert!(super::O_CLOEXEC == libc::O_CLOEXEC);
+        #[cfg(target_os = "linux")]
+        const _: () = assert!(super::O_NONBLOCK == libc::O_NONBLOCK);
+        #[cfg(target_os = "linux")]
+        const _: () = assert!(super::O_NOCTTY == libc::O_NOCTTY);
+        #[cfg(target_os = "linux")]
+        const _: () = assert!(super::AT_FDCWD == libc::AT_FDCWD);
+        #[cfg(target_os = "linux")]
+        const _: () = assert!(super::ELOOP == libc::ELOOP);
+        #[cfg(target_os = "linux")]
+        const _: () = assert!(super::O_PATH == libc::O_PATH);
+
+        #[cfg(target_os = "macos")]
+        const _: () = assert!(super::O_DIRECTORY == libc::O_DIRECTORY);
+        #[cfg(target_os = "macos")]
+        const _: () = assert!(super::O_NOFOLLOW == libc::O_NOFOLLOW);
+        #[cfg(target_os = "macos")]
+        const _: () = assert!(super::O_CLOEXEC == libc::O_CLOEXEC);
+        #[cfg(target_os = "macos")]
+        const _: () = assert!(super::O_NONBLOCK == libc::O_NONBLOCK);
+        #[cfg(target_os = "macos")]
+        const _: () = assert!(super::O_NOCTTY == libc::O_NOCTTY);
+        #[cfg(target_os = "macos")]
+        const _: () = assert!(super::ELOOP == libc::ELOOP);
+        #[cfg(target_os = "macos")]
+        const _: () = assert!(super::AT_FDCWD == libc::AT_FDCWD);
+
+        const _: () = assert!(super::ENOTDIR == libc::ENOTDIR);
+
+        // `openat` は可変長。`libc` も可変長のため、同じ関数ポインタ型へ両方を代入して照合する
+        // （可変長の有無が食い違うと Apple arm64 で ABI が不一致になる）。自前名 `c_openat` は
+        // `link_name = "openat"` で同じシンボルを指す。
+        type OpenatFn =
+            unsafe extern "C" fn(libc::c_int, *const libc::c_char, libc::c_int, ...) -> libc::c_int;
+        const _: OpenatFn = super::c_openat;
+        const _: OpenatFn = libc::openat;
+    }
 }
 
 /// open の失敗が「実体ではない」（`ELOOP` / `ENOTDIR`）か。`adapter::map_nofollow_error` が入力不正
@@ -387,7 +470,7 @@ pub(crate) fn open_regular_nofollow(
 mod tests {
     use super::*;
 
-    /// 対応済みの組の番号を具体値で固定する（libc 照合の代わり。PLUG-1）。
+    /// 対応済みの組の番号を具体値で固定する（libc 照合と併置する具体値の固定。PLUG-1）。
     #[cfg(any(
         target_os = "macos",
         all(
@@ -553,7 +636,7 @@ mod tests {
         assert!(!flag.load(Ordering::SeqCst));
     }
 
-    /// 定数を具体値で固定する（libc 照合の代わり。SEC-1）。
+    /// 定数を具体値で固定する（libc 照合と併置する具体値の固定。SEC-1）。
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn sec1_3748_constants_linux_x86_64() {
@@ -603,6 +686,20 @@ mod tests {
         assert_eq!(DIR_FLAGS, 0x0010_0000 | 0x0100 | 0x0100_0000 | 0x0002_0000);
         assert_eq!((ELOOP, ENOTDIR), (62, 20));
     }
+
+    // `sec1_3841_is_not_real_entry_by_errno` の errno リテラルを `libc` と照合する（#4726）。
+    #[cfg(target_os = "linux")]
+    const _: () = {
+        assert!(libc::ELOOP == 40 && libc::ENAMETOOLONG == 36 && libc::ETIMEDOUT == 110);
+        assert!(libc::ENOTDIR == 20 && libc::EMFILE == 24 && libc::EIO == 5);
+        assert!(libc::ENOENT == 2 && libc::EACCES == 13 && libc::EPERM == 1);
+    };
+    #[cfg(target_os = "macos")]
+    const _: () = {
+        assert!(libc::ELOOP == 62 && libc::ENAMETOOLONG == 63 && libc::ETIMEDOUT == 60);
+        assert!(libc::ENOTDIR == 20 && libc::EMFILE == 24 && libc::EIO == 5);
+        assert!(libc::ENOENT == 2 && libc::EACCES == 13 && libc::EPERM == 1);
+    };
 
     /// errno の分類（ERR-1・SEC-1・#3841）。ELOOP / ENOTDIR だけが「実体ではない」。
     #[cfg(any(
@@ -673,6 +770,12 @@ mod tests {
         /// macOS の値は dispatch の run 41746560647（`platform-ci (macos-latest)`）で実測した（ELOOP ではない。#3870）。
         /// 祖先が通常ファイルのときと同じ errno のため、両者は errno では区別できない（REPAIR-3）。
         const EXP_ANCESTOR_SYMLINK: i32 = EXP_ENOTDIR;
+
+        // 上の期待値を `libc` の errno と照合する（#4726。`sec1_3842_*` 系の試験が使う）。
+        const _: () = assert!(EXP_ENOENT == libc::ENOENT);
+        const _: () = assert!(EXP_ENOTDIR == libc::ENOTDIR);
+        const _: () = assert!(EXP_ELOOP == libc::ELOOP);
+        // `EXP_ANCESTOR_SYMLINK` は `EXP_ENOTDIR` の別名なので対象外。
 
         fn assert_raw(e: &std::io::Error, want: i32, ctx: &str) {
             assert_eq!(e.raw_os_error(), Some(want), "{ctx}: {e:?}");

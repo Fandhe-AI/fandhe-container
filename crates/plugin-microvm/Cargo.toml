@@ -6,6 +6,7 @@
 # version は未指定（Cargo の既定で 0.0.0）。公開方針は未決定のため publish = false を明記する。
 # 依存の追加は =x.y.z 完全固定・ユーザー承認制（.claude/rules/dependency-policy.md）。
 # rust-vmm 系クレートは禁止（MVM-4・.claude/rules/dependency-policy.md）。
+# #4726: sys.rs の自前 FFI 宣言を libc と照合するため dev-dependencies（unix）に libc を追加した（#3290 の承認・MVM-4・REPAIR-12）。
 
 [package]
 name = "fandhe-container-plugin-microvm"
@@ -19,6 +20,11 @@ publish = false
 fandhe-container-plugin = { workspace = true }
 # TASK-117.2（#711）: microVM 本体（start / stop の委譲先）。外部クレートの追加ではない。
 fandhe-container-microvm = { path = "../microvm" }
+
+# `sys.rs` の自前 FFI 宣言を libc と照合する試験専用の依存（#4726・#3290・MVM-4・REPAIR-12）。製品の依存には入れない
+# （cargo tree -e normal,build に現れない）。`sys.rs` の照合対象は unix のみ。方式は docs/design/ffi-libc-check.md。
+[target.'cfg(unix)'.dev-dependencies]
+libc.workspace = true
 
 [[bin]]
 name = "fandhe-container-plugin-microvm"

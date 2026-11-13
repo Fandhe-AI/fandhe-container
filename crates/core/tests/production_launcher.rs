@@ -1325,6 +1325,7 @@ mod linux {
         scenario_stdin_pipe(&env, tag);
         scenario_w_pod_ipc_join(&env, tag);
         scenario_w_net_pod_network_join(&env, tag);
+        scenario_pinned_netns_join(&env, tag);
         scenario_l_working_dir(&env, tag);
         scenario_m_n_working_dir_refused(&env, tag);
         scenario_o_user_outside_mapping_refused(&env, tag);
@@ -3003,6 +3004,115 @@ mod linux {
         assert!(
             children_of_self().is_empty(),
             "no child may remain after terminate"
+        );
+    }
+
+    /// シナリオ pinned-netns の opt-in 環境変数。値は `<置き場>:<pin のパス>`（init user namespace 所有の netns を
+    /// 人間担当の準備手順が `unshare --net=<pin>` で pin したもの。docs/verification/real-machine-tests.md）。
+    const PINNED_NETNS_ENV: &str = "FANDHE_CONTAINER_TEST_PINNED_NETNS";
+
+    /// シナリオ pinned-netns(NET-1・SEC-1・CORE-3・REPAIR-12・#3069): 供給側(#3074)とは独立に
+    /// `LaunchOptions::with_netns_join` で参加先を直接注入し、本番 launcher の中間プロセスが user namespace の作成前に
+    /// pin 済み netns へ `setns` して PID 1 を exec するまでの結線を通す。起動後に、コンテナの `/proc/<pid>/ns/net` が
+    /// pin の inode と一致し、uid が非特権 UID(ホストの自 uid)に写像されていることを具体値で照合する。
+    ///
+    /// 前提(人間担当・root での準備): 試験プロセスは非 root で ambient に `CAP_SYS_ADMIN` を持つ
+    /// (`setpriv --ambient-caps +sys_admin` 等)。前提が欠けるときは `PRECONDITION FAILED` で落とす。
+    /// 環境変数が未設定のときは明示の行を出して実行しない(CI の ubuntu では init 所有の netns を作れないため)。
+    fn scenario_pinned_netns_join(env: &Env, tag: u32) {
+        let Ok(spec) = std::env::var(PINNED_NETNS_ENV) else {
+            println!(
+                "production_launcher: pinned netns join case not requested (set {PINNED_NETNS_ENV}=<root>:<pin>)"
+            );
+            return;
+        };
+        let (pin_root, pin_path) = spec.split_once(':').unwrap_or_else(|| {
+            panic!("PRECONDITION FAILED: {PINNED_NETNS_ENV} must be <root>:<pin>")
+        });
+        let (euid, _) = own_ids();
+        assert_ne!(
+            euid, 0,
+            "PRECONDITION FAILED: the pinned netns scenario needs an unprivileged uid"
+        );
+        let cap_amb = status_field("/proc/self/status", "CapAmb:")
+            .map(|v| cap_value(&v))
+            .expect("CapAmb");
+        assert_ne!(
+            cap_amb & (1 << 21),
+            0,
+            "PRECONDITION FAILED: ambient CAP_SYS_ADMIN is required (CapAmb={cap_amb:#x})"
+        );
+        let meta = std::fs::metadata(pin_path)
+            .unwrap_or_else(|e| panic!("PRECONDITION FAILED: stat pin: {e}"));
+        let pin_ino = meta.ino();
+        let target = fandhe_container_core::oci_runtime::NetnsJoinTarget::new(
+            pin_root.into(),
+            pin_path.into(),
+            meta.dev(),
+            pin_ino,
+        )
+        .expect("join target");
+        let mut tmpfs = TmpfsMountSet::new();
+        tmpfs.ensure_default_dev_shm().expect("default dev shm");
+        let options = LaunchOptions::new(tmpfs, InjectedFileSet::new(), LaunchIpcMode::Private)
+            .expect("launch options")
+            .with_netns_join(target);
+        let launcher: Arc<dyn ProcessLauncher> = Arc::new(
+            ProductionLauncher::builder()
+                .privilege(IsolationPrivilege::RootlessSingleId)
+                .audit_sink(Arc::new(MemSink(std::sync::Mutex::new(Vec::new()))))
+                .launch_options(options)
+                .build()
+                .expect("build launcher for pinned netns join"),
+        );
+        let want_net = format!("net:[{pin_ino}]");
+        let host_user = ns_link("self", "user");
+        let bundle = Bundle::new("pinned");
+        let ld = make_rootfs(&bundle.rootfs(), true);
+        write_config(&bundle, &ld, &["--net-loopback"], json!([]));
+        let id = ContainerId::new(format!("plpin{tag}")).expect("id");
+        do_create(env, &bundle, &id);
+
+        wait_single_thread();
+        let started = start(
+            &env.store,
+            &env.recorder,
+            &launcher,
+            &StartRequest::new(id.clone()),
+            &timeouts(),
+        )
+        .unwrap_or_else(|e| panic!("start failed: {:?} {}", e.code(), e.message()));
+        let mut reader_slot: Option<(mpsc::Receiver<String>, std::thread::JoinHandle<()>)> = None;
+        let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let pid = started.process().pid();
+            let output = started.process().take_output().expect("container output");
+            reader_slot = Some(spawn_reader(output.stdout.expect("container stdout")));
+            let lines = collect_probe(&reader_slot.as_ref().expect("reader slot").0);
+            assert_eq!(value_of(&lines, "NETNS"), want_net, "in-container netns");
+            assert_eq!(ns_link(pid, "net"), want_net, "host view of the netns");
+            assert_ne!(
+                ns_link(pid, "user"),
+                host_user,
+                "the container must have its own user namespace"
+            );
+            let uid_map = std::fs::read_to_string(format!("/proc/{pid}/uid_map")).expect("uid_map");
+            let fields: Vec<&str> = uid_map.split_whitespace().collect();
+            assert_eq!(
+                fields,
+                ["0".to_string(), euid.to_string(), "1".to_string()],
+                "container root must map to the unprivileged host uid"
+            );
+        }));
+        finish_started(started, verified);
+        let (rx, reader) = reader_slot.take().expect("reader slot");
+        reader.join().expect("join reader");
+        drop(rx);
+        assert!(
+            children_of_self().is_empty(),
+            "no child may remain after terminate"
+        );
+        println!(
+            "production_launcher: pinned netns joined before user namespace creation, uid mapped to unprivileged host uid (scenario=pinned-netns)"
         );
     }
 

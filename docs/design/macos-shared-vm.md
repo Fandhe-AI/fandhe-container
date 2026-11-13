@@ -96,7 +96,7 @@ TASK-191 の着手前に確定が要る未決事項 4 点と計測対象を、�
   - 実装課題として、(1) guest-init の cgroup 委譲と非特権ユーザーへの降格、(2) ゲスト向け supervisor 起動モード（cli）、(3) ゲスト内の subordinate ID の供給を新規に起票する（起票は #1906 の承認後。G6・G9 の依存に加える）
 - ホストとゲストの制御経路: vsock（`VZVirtioSocketDevice`）。**接続の方向はホスト開始・ゲスト受け側に統一する**。guest-init がゲスト内の固定ポート（案: 1024。実装 issue で確定）で `listen` し、保持役配下の plugin-macos が `VZVirtioSocketDevice` の `connectToPort` で接続する（VM のデバイスに触れるのは plugin-macos だけ）。ゲストからホストへ接続する経路は作らない（ホスト側にゲスト由来の待受を持たない）。シリアルコンソール（hvc0）は起動時の報告と ready マーカー専用で、制御には使わない
 - **承認事項**: `objc2-virtualization` に vsock 関連の feature（`VZVirtioSocketDevice*` など）を足す必要がある。依存の更新にあたるため [dependency-policy](../../.claude/rules/dependency-policy.md) に従いユーザー承認を要する
-- 接続元の確認: ゲスト側の受け口（G6）は accept した peer の CID が `VMADDR_CID_HOST`（2）であることを検証し、それ以外は即切断する。ホスト側の接続（G5）は固定ポートへ接続するだけで、待受（listen）を持たない。network namespace は vsock を分離しないため、コンテナから `socket(AF_VSOCK, …)` を使わせないよう seccomp で拒否し、結合試験で確かめる。ホスト側の CLI・plugin と保持役の間は UDS の peer UID 照合で守る（PLUG-12）
+- 接続元の確認: ゲスト側の受け口（G6）は accept した peer の CID が `VMADDR_CID_HOST`（2）であることを検証し、それ以外は即切断する。ホスト側の接続（G5）は固定ポートへ接続するだけで、待受（listen）を持たない。network namespace は vsock を分離しないため、コンテナから `socket(AF_VSOCK, …)` を使わせないよう seccomp で拒否し、結合試験で確かめる（実装済み・#2277・CORE-5・SEC-1。`socket` の第 1 引数の下位 32 bit が 40 のとき `EPERM`。カーネルの `int` への切り詰めに合わせ上位 32 bit は見ない。残余: `io_uring` の `IORING_OP_SOCKET`〔Linux 5.19 以降〕は `socket(2)` を通らず止められない。`io_uring_*` を既定で拒否するかは #4751 でオーナー判断待ち）。ホスト側の CLI・plugin と保持役の間は UDS の peer UID 照合で守る（PLUG-12）
 - 中継の契約: Windows の起動役の中継（[windows-execution-layout.md](windows-execution-layout.md)）と同じ形にする。引数の配列・標準入出力・終了コードを中継し、シェルを経由させない。ゲスト内のバイナリは固定の絶対パスで呼び、`PATH` を探さない。フレームは長さの上限とチェックサムつき（REPAIR-2）。plugin のフレーム（PLUG-2）を再利用するかは実装 issue で決める
 - rootfs とイメージ: 推奨は、イメージとコンテナの rootfs をゲスト側の永続ディスク（virtio-blk のデータディスク）に置くこと。bundle をホストで作る経路（#1869 4.3 の (a)）では共有ルート経由でゲストへ渡す。MVP は「共有ルート経由の bundle」とし、ゲスト内の pull（VZ の NAT のネットワークと feature 追加が要る）は後続とする（判断事項）
 - 状態ファイル: ゲスト内の `/run/fandhe-container/<id>/state.json`（OCI-5 の (1)。上記の非特権ユーザーが書ける `/run` 配下の所有で用意する）。ホストに置くのは項目 1 の所属記録だけ
@@ -160,7 +160,7 @@ PLUG-1 の境界表の macOS の行は「plugin（常駐。保持役が持つ）
 ## セキュリティ（OWASP の観点）
 
 - インジェクション: 中継は引数の配列でシェルを経由させない。ゲスト内のパスは固定。共有パスは正規化と検証をしてから使う
-- アクセス制御: UDS は 0700 と peer UID の照合。ゲストの vsock の受け口は CID 2 のホストからの接続だけを受ける（接続はホスト開始）。コンテナからの AF_VSOCK は seccomp で拒否する。共有ルートの露出範囲は trade-off として明記済み
+- アクセス制御: UDS は 0700 と peer UID の照合。ゲストの vsock の受け口は CID 2 のホストからの接続だけを受ける（接続はホスト開始）。コンテナからの AF_VSOCK は seccomp で拒否する（実装済み・#2277。io_uring 経由の残余は #4751）。共有ルートの露出範囲は trade-off として明記済み
 - 不安全な設計: すべての待ちに期限を付ける。件数・長さに上限を設ける。異常時は VM・plugin・mount・ゲスト内プロセスを回収する。二重起動はロックで防ぎ、取れなければ fail-closed
 - 完全性: plugin-macos は検証済みの fd で起動する（#1869 4.2）。ゲスト向けバイナリは initrd に梱包し、ゲストの `PATH` は探さない。版の不一致の照合を実装 issue にする
 - 情報漏えい: エラーは英語の固定文言だけにし、ホストのパスや plugin 由来の文字列は出さない

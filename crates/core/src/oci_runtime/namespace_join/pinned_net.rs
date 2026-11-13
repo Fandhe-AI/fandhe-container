@@ -23,7 +23,7 @@
 //! | 順 | 検査 | 不合格 |
 //! | -- | ---- | ------ |
 //! | 0 | 置き場・pin が絶対・`..` なし・4096 バイト以内・pin が置き場の直下の 1 要素 | `InvalidArgument` |
-//! | 0 | 置き場を symlink 非追従のディレクトリとして固定し、その fd 起点で pin を `O_NOFOLLOW|O_NONBLOCK` で 1 回だけ開く | symlink は `InvalidArgument`、権限不足は `PermissionDenied`、不在は `FailedPrecondition`（監査しない） |
+//! | 0 | 置き場を symlink 非追従のディレクトリとして固定し、その fd 起点で pin を `O_NOFOLLOW` / `O_NONBLOCK` で 1 回だけ開く | symlink は `InvalidArgument`、権限不足は `PermissionDenied`、不在は `FailedPrecondition`（監査しない） |
 //! | 1 | `fstatfs` が nsfs | `InvalidArgument` |
 //! | 2 | `NS_GET_NSTYPE` が net | `InvalidArgument` |
 //! | 3 | 開いた fd の (dev, ino) が指定と一致 | `PermissionDenied` |
@@ -536,11 +536,8 @@ mod tests {
             "netns-pin-fifo",
             std::time::Duration::from_secs(10),
         );
-        let status = std::process::Command::new("mkfifo")
-            .arg(scratch.path().join("fifo"))
-            .status()
-            .expect("mkfifo");
-        assert!(status.success());
+        let fifo = scratch.path().join("fifo");
+        run_bounded("mkfifo", &[fifo.as_os_str()]).expect("mkfifo");
         let r = pin_in(&scratch, "fifo").expect_err("fifo");
         assert_eq!(r.outcome, Some(NetnsJoinOutcome::NotNamespaceFile));
     }
@@ -553,14 +550,41 @@ mod tests {
         (meta.dev(), meta.ino())
     }
 
+    /// 実機前提の補助: 外部コマンドを期限つきで実行する(REPAIR-5)。超過したら kill して回収し、`Err` を返す。
+    #[cfg(target_os = "linux")]
+    fn run_bounded(program: &str, args: &[&std::ffi::OsStr]) -> Result<(), String> {
+        let mut child = std::process::Command::new(program)
+            .args(args)
+            .spawn()
+            .map_err(|e| format!("cannot run {program}: {e}"))?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) if status.success() => return Ok(()),
+                Ok(Some(status)) => return Err(format!("{program} failed: {status}")),
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("{program} timed out"));
+                }
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("{program} wait failed: {e}"));
+                }
+            }
+        }
+    }
+
     /// 実機前提の補助: 外部コマンドを実行し、失敗したら `PRECONDITION FAILED` で落とす(skip しない)。
     #[cfg(target_os = "linux")]
     fn run_precondition(program: &str, args: &[&std::ffi::OsStr]) {
-        let status = std::process::Command::new(program)
-            .args(args)
-            .status()
-            .unwrap_or_else(|e| panic!("PRECONDITION FAILED: cannot run {program}: {e}"));
-        assert!(status.success(), "PRECONDITION FAILED: {program} failed");
+        if let Err(e) = run_bounded(program, args) {
+            panic!("PRECONDITION FAILED: {e}");
+        }
     }
 
     /// NET-1・SEC-1・CORE-3(#3069)。実機前提(非 root。非特権 user + mount + network namespace と util-linux の
@@ -641,6 +665,8 @@ mod tests {
             std::time::Duration::from_secs(10),
         );
         let pin = scratch.path().join("pin");
+        // unshare は既存ファイルへ bind mount するため、先に空の通常ファイルを作る。
+        std::fs::write(&pin, b"").expect("create pin file");
         run_precondition(
             "unshare",
             &[

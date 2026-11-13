@@ -158,7 +158,7 @@ impl KeeperClient {
         if Instant::now() >= limit {
             return Err(deadline_error());
         }
-        let mut child = spawn().map_err(|_| {
+        let child = spawn().map_err(|_| {
             TraitError::new(ErrorCode::Internal, "the vm keeper could not be spawned")
         })?;
         loop {
@@ -166,13 +166,13 @@ impl KeeperClient {
                 // 期限直後でも応答済みの保持役は採用する（kill しない）。
                 Ok(resp) => return Ok((resp, Some(child))),
                 Err(e) if e.code() == ErrorCode::PermissionDenied => {
-                    return Err(release_child(&mut child, e));
+                    return Err(release_child(child, e));
                 }
                 Err(_) => {}
             }
             let now = Instant::now();
             if now >= limit {
-                return Err(release_child(&mut child, deadline_error()));
+                return Err(release_child(child, deadline_error()));
             }
             std::thread::sleep(POLL_INTERVAL.min(limit - now));
         }
@@ -195,17 +195,71 @@ fn deadline_error() -> TraitError {
     )
 }
 
-/// 起動した子を kill せずに手放し、`primary` を返す。すでに終了していれば非ブロッキングで回収する（`wait` は呼ばない。REPAIR-5）。
+/// 起動した子を kill せずに回収担当へ渡し、`primary` を返す（REPAIR-5）。
 ///
 /// 子は応答の開始後は他クライアントの登録を受け付けるため、起動元の待機失敗だけで SIGKILL すると共有の保持役と登録簿を失う
-/// （MAC-4）。公開前の子はロック競合で自ら終了し、公開後の子は無登録の猶予後に自ら終了する。
-fn release_child(child: &mut Child, primary: TraitError) -> TraitError {
-    let _ = child.try_wait();
+/// （MAC-4）。公開前の子はロック競合で自ら終了し、公開後の子は無登録の猶予後に自ら終了する。生きている子の `Child` を
+/// そのまま drop すると終了後に回収されずゾンビになるため、専用スレッドが `wait` で回収する（呼び出し元は待たない）。
+fn release_child(child: Child, primary: TraitError) -> TraitError {
+    reap_in_background(child);
     primary
 }
 
+/// `child` の終了を別スレッドで待って回収する。起動役が CLI のように先に終わる場合は、子が init に付け替わって回収される。
+/// スレッドを作れない場合は非ブロッキングで回収を試みるだけに縮退する。
+fn reap_in_background(child: Child) {
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(child)));
+    let thread_slot = std::sync::Arc::clone(&slot);
+    let spawned = std::thread::Builder::new()
+        .name("vm-keeper-reaper".to_owned())
+        .spawn(move || {
+            let taken = thread_slot.lock().ok().and_then(|mut g| g.take());
+            if let Some(mut c) = taken {
+                let _ = c.wait();
+            }
+        });
+    if spawned.is_err()
+        && let Ok(mut g) = slot.lock()
+        && let Some(c) = g.as_mut()
+    {
+        let _ = c.try_wait();
+    }
+}
+
+/// 保持役のログファイル名（配置ディレクトリ直下。保持役の stderr の出力先。REPAIR-4）。
+pub const KEEPER_LOG_NAME: &str = "vm-keeper.log";
+/// ログファイルの大きさの上限。超えていれば起動時に切り詰める（無制限の増加を避ける）。
+const KEEPER_LOG_MAX_BYTES: u64 = 1 << 20;
+
+/// 保持役の stderr の出力先を開く。検証済みの配置ディレクトリ直下の通常ファイルに限り、symlink は追従せず、
+/// 所有者がディレクトリと同じで group / other の権限が無いことを確かめる（満たさなければ起動しない）。
+fn open_keeper_log(base: &Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    let denied = |m: &'static str| io::Error::new(io::ErrorKind::PermissionDenied, m);
+    let dir = RuntimeDir::ensure_under(base)
+        .map_err(|_| denied("the vm keeper runtime directory is not usable"))?;
+    let dir_uid = std::fs::metadata(dir.path())?.uid();
+    let file = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(crate::logs::rotating::LOG_READ_FLAGS)
+        .open(dir.path().join(KEEPER_LOG_NAME))?;
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.uid() != dir_uid || meta.mode() & 0o077 != 0 {
+        return Err(denied(
+            "the vm keeper log file has an unexpected type, owner or mode",
+        ));
+    }
+    if meta.len() > KEEPER_LOG_MAX_BYTES {
+        file.set_len(0)?;
+    }
+    Ok(file)
+}
+
 /// 保持役の実行ファイル `exe` を `--base <base>` で、CLI の終了に巻き込まれないよう別プロセスグループで起動する
-/// （stdin / stdout / stderr は null。`PATH` 探索・シェルは使わない）。
+/// （stdin / stdout は null。stderr は配置ディレクトリ直下の検証済みログ [`KEEPER_LOG_NAME`] へ追記し、操作別カウント・
+/// レイテンシ・起動失敗理由を CLI の終了後も残す。REPAIR-4。`PATH` 探索・シェルは使わない）。
 ///
 /// `exe` は絶対パスに限る。相対パス・単なる実行ファイル名は `PATH` 探索で意図しないバイナリを起動しうるため、
 /// 起動前に `InvalidInput` で拒否する。
@@ -217,13 +271,14 @@ pub fn spawn_keeper(exe: &Path, base: &Path) -> io::Result<Child> {
             "the vm keeper executable path must be absolute",
         ));
     }
+    let log = open_keeper_log(base)?;
     Command::new(exe)
         .arg("--base")
         .arg(base)
         .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::from(log))
         .spawn()
 }
 
@@ -274,5 +329,22 @@ mod tests {
             alive,
             "spawned child {pid} must stay alive after the timeout"
         );
+    }
+
+    /// 保持役の stderr の出力先は配置ディレクトリ直下の 0600 の通常ファイルで、symlink は追従しない（REPAIR-4）。
+    #[test]
+    fn open_keeper_log_creates_private_file_and_rejects_symlink() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let base = std::env::temp_dir().join(format!("vmk-client-log-{}", std::process::id()));
+        std::fs::create_dir_all(&base).expect("mkdir");
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        let f = open_keeper_log(&base).expect("open log");
+        assert_eq!(f.metadata().expect("meta").mode() & 0o777, 0o600);
+        let dir = RuntimeDir::ensure_under(&base).expect("dir");
+        let log = dir.path().join(KEEPER_LOG_NAME);
+        std::fs::remove_file(&log).expect("rm");
+        std::os::unix::fs::symlink(base.join("elsewhere"), &log).expect("symlink");
+        assert!(open_keeper_log(&base).is_err());
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

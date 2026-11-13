@@ -2535,8 +2535,22 @@ mod tests {
     #[test]
     fn sec5_oci1_2792_pull_and_create_extract_options_match() {
         let dir = std::env::temp_dir().join(format!("fcpc-2792-match-{}", std::process::id()));
-        let opts = crate::extract_identity::extract_options_for(
-            &crate::extract_identity::ExtractIdentity::RootlessSingleId,
+        // 補助関数へ既定値を渡さず、解決器の返した値が `extract_options()` 経由で使われることを確かめる。
+        let store: Arc<dyn StateStore> = Arc::new(OneRecord::new(record(false)));
+        let rt = Arc::new(CoreLifecycleRuntime::with_recorder(
+            Arc::clone(&store),
+            Arc::new(OpRecorder::new()),
+        ));
+        let backends = CriPluginBackends::new(rt, store, Arc::new(UnimplementedNetwork))
+            .with_extract_identity_resolver(|| {
+                Ok(crate::extract_identity::ExtractIdentity::RootlessSingleId)
+            });
+        let opts = backends.extract_options().expect("resolved");
+        assert_eq!(
+            opts,
+            crate::extract_identity::extract_options_for(
+                &crate::extract_identity::ExtractIdentity::RootlessSingleId
+            )
         );
         let pull = production_pull_config(&dir, &opts).expect("pull");
         let create = production_extract_config(&dir, &opts).expect("create");

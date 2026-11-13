@@ -2188,7 +2188,7 @@ fn launch_error(e: &ExecError, unconfirmed: bool) -> TraitError {
 fn to_trait_error(e: &ExecError) -> TraitError {
     let message = match e.code {
         ErrorCode::Timeout => "container launch did not complete within the timeout".to_owned(),
-        _ => format!("container launch failed in the {:?} stage", e.stage),
+        _ => format!("container launch failed in the {} stage", e.stage.as_str()),
     };
     TraitError::new(e.code, message)
 }
@@ -2490,7 +2490,27 @@ mod tests {
             );
             let t = launch_error(&e, false);
             assert_eq!(t.code(), code);
-            assert_eq!(t.message(), "container launch failed in the Exec stage");
+            assert_eq!(t.message(), "container launch failed in the exec stage");
+        }
+    }
+
+    /// ERR-1・ERR-4・#3118: 全段で `to_trait_error` の文言が `as_str` の snake_case 語彙に完全一致し、
+    /// 大文字（`{:?}` の変種名）を含まない。`Timeout` は段に依らない固定文言。
+    #[test]
+    fn err1_err4_3118_launch_failure_message_uses_snake_case_stage_for_all_stages() {
+        for stage in IsolationStage::ALL {
+            let e = ExecError::new(ErrorCode::Internal, stage, "detail");
+            let t = to_trait_error(&e);
+            assert_eq!(
+                t.message(),
+                format!("container launch failed in the {} stage", stage.as_str())
+            );
+            assert!(!t.message().chars().any(|c| c.is_ascii_uppercase()));
+            let timeout = to_trait_error(&ExecError::new(ErrorCode::Timeout, stage, "detail"));
+            assert_eq!(
+                timeout.message(),
+                "container launch did not complete within the timeout"
+            );
         }
     }
 
@@ -3098,7 +3118,7 @@ mod tests {
         assert_eq!(err.code(), ErrorCode::FailedPrecondition);
         assert_eq!(
             err.message(),
-            "container launch failed in the Landlock stage"
+            "container launch failed in the landlock stage"
         );
         assert!(
             !ev.lock().unwrap().iter().any(|e| e.starts_with("spawn")),
@@ -3248,7 +3268,7 @@ mod tests {
         assert_eq!(err.code(), ErrorCode::Internal);
         assert_eq!(
             err.message(),
-            "container launch failed in the Validate stage"
+            "container launch failed in the validate stage"
         );
         assert!(
             !ev.lock().unwrap().iter().any(|e| e.starts_with("spawn")),
@@ -3971,7 +3991,7 @@ mod tests {
             .expect("launch must fail")
     }
 
-    const CLEAN_MESSAGE: &str = "container launch failed in the Spawn stage";
+    const CLEAN_MESSAGE: &str = "container launch failed in the spawn stage";
 
     /// セキュリティ規約・CORE-2: 失敗の文言は固定で、パス・errno を含めない。子が残らない失敗には接尾辞を付けず、
     /// 起動予約を保持させず、`confirm_no_process` が `Ok` になる(消滅を確かめ済み)。

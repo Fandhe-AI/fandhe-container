@@ -251,21 +251,18 @@ impl ShutdownOps for LinuxShutdownOps<'_> {
 /// 任せる。デバイス数・スレッド数は [`MAX_INPUT_DEVICES`] まで。
 fn start_power_button_watchers() {
     let mut opened = [false; MAX_INPUT_DEVICES];
-    let found = scan_power_buttons(&mut opened);
-    if found == 0 {
-        // ドライバの遅延 probe で ready 直後にノードが無いことがある。短い間隔で上限つきに再探索する
-        // （無ければ停止はホストの期限つき強制停止になるだけ。REPAIR-5・MAC-4）。
-        let _ = std::thread::Builder::new()
-            .name("power-button-rescan".into())
-            .spawn(move || {
-                for _ in 0..POWER_BUTTON_RESCAN_TRIES {
-                    std::thread::sleep(POWER_BUTTON_RESCAN_INTERVAL);
-                    if scan_power_buttons(&mut opened) > 0 {
-                        return;
-                    }
-                }
-            });
-    }
+    scan_power_buttons(&mut opened);
+    // ドライバの遅延 probe でノードが後から現れることがある。開けたデバイスが電源ボタン対応かは
+    // ここで判別できない（別の入力デバイスが先にあると gpio-keys を取りこぼす）ため、見つかった数に
+    // 関わらず既定の探索期間中は未オープンのノードを上限つきで探索し続ける（REPAIR-5・MAC-4）。
+    let _ = std::thread::Builder::new()
+        .name("power-button-rescan".into())
+        .spawn(move || {
+            for _ in 0..POWER_BUTTON_RESCAN_TRIES {
+                std::thread::sleep(POWER_BUTTON_RESCAN_INTERVAL);
+                scan_power_buttons(&mut opened);
+            }
+        });
 }
 
 /// 再探索の間隔と回数の上限（合計 30 秒）。
@@ -362,6 +359,9 @@ pub fn run() -> ! {
         Err(e) => fatal(&mut ops, InitStage::Cmdline, e.errno()),
     };
     let outcome = process_directives(&cmdline, &mut ops);
+    // ホストは ready 直後に requestStop を出しうるため、入力デバイスを開いて監視を始めてから ready を出す
+    // （取りこぼすと協調停止せず強制停止になる。MAC-4・#2270）。
+    start_power_button_watchers();
     emit_ready(&mut ops);
     // 試験用プローブは ready の後（init 自身の責務の完了を遅らせない）。起動条件を満たさない本番の起動では何もしない。
     let mode = decode_test_mode(&cmdline);
@@ -374,7 +374,6 @@ pub fn run() -> ! {
             ops.write_line(&ReportLine::from_link(l));
         });
     }
-    start_power_button_watchers();
     // ready の後の通常経路だけが回収ループに入る。以後の子の終了は `Child::wait` ではなくここで受ける
     // （唯一の waiter。契約は `reap` のモジュール doc）。終了コードの中継は G6（#2273）で配線する。
     // 停止要求で戻り、停止の手順へ進む。電源断が成功すれば戻らない。

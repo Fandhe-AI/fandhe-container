@@ -29,9 +29,10 @@
 //! 名前を取り出し、制御文字（Cc）と表示を乱す書式文字（bidi 制御・ゼロ幅など）をエスケープし、
 //! 経路の件数・長さに上限を置いてから出す（先例は `cli/ps.rs` の `sanitize`）。
 //!
-//! 未揃いの箇所（REPAIR-3）: `UpError::{Launch, NetworkProvision, Internal}`、
-//! `DownError::{Stop, Internal}`、`DependencyWaitError::{WaitTimeout, UnsupportedCondition, Observe}`、
-//! `HealthyWaitError::Source` は `Display` に名前をそのまま出す。この 4 型は本変更では直していない。
+//! `UpError::{Launch, NetworkProvision, Internal}`・`DownError::{Stop, Internal}`・
+//! `DependencyWaitError`・`HealthyWaitError` も同じ方針で、`Display` は固定文と静的な code だけを出す
+//! （#4640）。未揃いの箇所（REPAIR-3）: `UpError::Network`（`NetworkPlanError`）は `Display` に
+//! 名前を出す。
 
 use std::collections::BTreeMap;
 use std::collections::btree_map;

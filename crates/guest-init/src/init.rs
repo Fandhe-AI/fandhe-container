@@ -20,6 +20,7 @@ use crate::link_probe::{RO_MOUNT, RW_MOUNT, link_plan, run_virtiofs_link};
 use crate::mountinfo::{MAX_MOUNTINFO_BYTES, check_dev_hardened};
 use crate::probe::{GUEST_MOUNT, decode_test_mode, probe_plan, run_virtiofs_io};
 use crate::process::{GuestOps, emit_ready, process_directives};
+use crate::reap::{ChildWaiter, WaitResult, decode_wait_status, reap_forever};
 use crate::report::{Errno, InitStage, ReportLine};
 use crate::sys;
 
@@ -156,6 +157,32 @@ fn init_filesystems() -> Result<(), (InitStage, Errno)> {
     Ok(())
 }
 
+/// [`ChildWaiter`] の本番実装。`waitpid(-1)` は `sys` の安全なラッパー、待ちは `std::thread::sleep`。
+struct LinuxWaiter;
+
+impl ChildWaiter for LinuxWaiter {
+    fn wait_any(&mut self, nohang: bool) -> WaitResult {
+        match sys::wait_any_child(nohang) {
+            Ok(Some((pid, raw))) => WaitResult::Reaped {
+                pid,
+                status: decode_wait_status(raw),
+            },
+            Ok(None) => WaitResult::NothingReady,
+            Err(e) => match e.raw_os_error() {
+                Some(sys::ECHILD) => WaitResult::NoChildren,
+                Some(sys::EINTR) => WaitResult::Interrupted,
+                _ => WaitResult::Failed(Errno::from_io(&e)),
+            },
+        }
+    }
+
+    fn pause(&mut self, d: Duration) {
+        std::thread::sleep(d);
+    }
+}
+
+/// 待機（回収しない）。致命的な初期化失敗（子を作る前）と panic hook（中での二重 panic を避ける）の
+/// 行き先で、回収ループには入らない。
 fn idle() -> ! {
     // PID 1 は終了しない。停止はホストの VZ の強制停止に任せる（協調停止は TASK-115 で未実装。REPAIR-3）。
     loop {
@@ -217,7 +244,9 @@ pub fn run() -> ! {
             ops.write_line(&ReportLine::from_link(l));
         });
     }
-    idle()
+    // ready の後の通常経路だけが回収ループに入る。以後の子の終了は `Child::wait` ではなくここで受ける
+    // （唯一の waiter。契約は `reap` のモジュール doc）。終了コードの中継は G6（#2273）で配線する。
+    reap_forever(&mut LinuxWaiter, |_pid, _status| {})
 }
 
 #[cfg(test)]
@@ -239,6 +268,120 @@ mod tests {
     }
 
     use std::os::unix::fs::{MetadataExt, symlink};
+    use std::process::{Command, Stdio};
+
+    use crate::reap::{ChildStatus, drain};
+    use crate::test_reap::{output_within, reap_within};
+
+    const REEXEC_ENV: &str = "FANDHE_GUEST_INIT_REAP_REEXEC";
+    const REEXEC_OK_LINE: &str = "guest-init reap: ok direct=3 signaled=9 orphan=5 echild";
+
+    /// `/proc/<pid>/stat` の (状態, ppid)。`comm` に `)` を含みうるので最後の `)` の後ろを見る。
+    fn proc_state(pid: i32) -> Option<(char, i32)> {
+        let s = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let rest = s.get(s.rfind(')')? + 2..)?;
+        let mut it = rest.split(' ');
+        let state = it.next()?.chars().next()?;
+        let ppid = it.next()?.parse().ok()?;
+        Some((state, ppid))
+    }
+
+    fn wait_zombie(pid: i32, ppid: i32, until: std::time::Instant) {
+        loop {
+            if proc_state(pid) == Some(('Z', ppid)) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < until,
+                "pid {pid} did not become a zombie of {ppid}: {:?}",
+                proc_state(pid)
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// MAC-4・CORE-1・REPAIR-5・#2269: 直接の子・シグナルで終わる子・孤児（subreaper で再親付け）の
+    /// ゾンビが回収ループで残らず回収される。subreaper と `waitpid(-1)` はプロセス全体に効くため、
+    /// 共有の libtest プロセスではなく試験バイナリの再起動した子（`mac4_2269_reexec_entry`）で実行する。
+    #[test]
+    fn mac4_2269_reaper_collects_zombies_and_orphans() {
+        let exe = std::env::current_exe().unwrap();
+        let mut cmd = Command::new(exe);
+        cmd.args([
+            "--exact",
+            "init::tests::mac4_2269_reexec_entry",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env(REEXEC_ENV, "1")
+        .stdin(Stdio::null());
+        let out = output_within(&mut cmd, reap_within() * 2).unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{:?}\n{stdout}", out.status);
+        assert!(stdout.contains(REEXEC_OK_LINE), "{stdout}");
+        assert!(stdout.contains("1 passed"), "{stdout}");
+    }
+
+    /// 上の試験の再起動先。環境変数が無ければ何もしない（共有プロセスで subreaper を立てない）。
+    #[test]
+    #[ignore = "re-exec entry for mac4_2269_reaper_collects_zombies_and_orphans"]
+    #[allow(
+        clippy::zombie_processes,
+        reason = "回収ループ（drain）が唯一の waiter であることの検証のため、Child は意図して wait しない"
+    )]
+    fn mac4_2269_reexec_entry() {
+        if std::env::var_os(REEXEC_ENV).is_none() {
+            return;
+        }
+        sys::set_child_subreaper().unwrap();
+        let me = i32::try_from(std::process::id()).unwrap();
+        let until = std::time::Instant::now() + reap_within();
+        let spawn = |script: &str| {
+            Command::new("sh")
+                .args(["-c", script])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap()
+        };
+        let direct = spawn("exit 3");
+        let signaled = spawn("kill -9 $$");
+        let mut mid =
+            spawn("sh -c 'sleep 0.2; exit 5' </dev/null >/dev/null 2>&1 & echo $!; exit 0");
+        let mut line = String::new();
+        std::io::Read::read_to_string(mid.stdout.as_mut().unwrap(), &mut line).unwrap();
+        let orphan: i32 = line.trim().parse().unwrap();
+        let ids = [
+            i32::try_from(direct.id()).unwrap(),
+            i32::try_from(signaled.id()).unwrap(),
+            i32::try_from(mid.id()).unwrap(),
+        ];
+        // どの Child にも wait は呼ばない。ゾンビが実在することを前提として確かめる。
+        for pid in ids.into_iter().chain([orphan]) {
+            wait_zombie(pid, me, until);
+        }
+        let mut got = drain(&mut LinuxWaiter, 16);
+        got.sort_by_key(|(pid, _)| *pid);
+        let mut want = vec![
+            (ids[0], ChildStatus::Exited(3)),
+            (ids[1], ChildStatus::Signaled(9)),
+            (ids[2], ChildStatus::Exited(0)),
+            (orphan, ChildStatus::Exited(5)),
+        ];
+        want.sort_by_key(|(pid, _)| *pid);
+        assert_eq!(got, want);
+        let e = sys::wait_any_child(true).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(sys::ECHILD));
+        for (pid, _) in want {
+            assert!(
+                proc_state(pid).is_none_or(|(_, ppid)| ppid != me),
+                "pid {pid} still a child"
+            );
+        }
+        println!("{REEXEC_OK_LINE}");
+    }
 
     fn tmp_root(tag: &str) -> crate::test_root::TestRoot {
         crate::test_root::test_root("fandhe-guest-init", tag)

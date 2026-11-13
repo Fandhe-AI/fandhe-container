@@ -181,11 +181,13 @@ pub const LAUNCH_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 /// [`LAUNCH_STATE_QUERY_TIMEOUT`]）+ 猶予 + 強制停止が、10 秒の RPC 期限に収まる固定値で、ゲスト init の最悪
 /// （約 4 秒）より長い。`Vm::shutdown` の既定 30 秒は共用 VM の経路（G14・#2281）で使う。
 pub const PLUGIN_STOP_GRACE: Duration = Duration::from_secs(5);
-// 要求の発行 + 猶予 + 強制停止の最悪が、10 秒の RPC 期限に 1 秒以上の余裕を残して収まる。
+// 要求の発行 + 猶予 + 強制停止 + Stopping の追加待ちの最悪が、10 秒の RPC 期限に 1 秒以上の余裕を残して収まる。
 const _: () = assert!(
     LAUNCH_STATE_QUERY_TIMEOUT.as_millis()
         + PLUGIN_STOP_GRACE.as_millis()
         + LAUNCH_STOP_TIMEOUT.as_millis()
+        // Stopping で強制停止を拒否された後の追加待ち（`Vm::shutdown` は状態照会の期限に絞る）
+        + LAUNCH_STATE_QUERY_TIMEOUT.as_millis()
         <= 9_000
 );
 /// 同 状態照会の応答待ち。
@@ -1317,7 +1319,7 @@ mod tests {
         assert!(f.0.borrow().graceful.is_empty());
         assert_eq!(PLUGIN_STOP_GRACE, Duration::from_secs(5));
         assert!(
-            LAUNCH_STATE_QUERY_TIMEOUT + PLUGIN_STOP_GRACE + LAUNCH_STOP_TIMEOUT
+            LAUNCH_STATE_QUERY_TIMEOUT * 2 + PLUGIN_STOP_GRACE + LAUNCH_STOP_TIMEOUT
                 < Duration::from_secs(10)
         );
     }

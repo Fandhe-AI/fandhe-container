@@ -309,11 +309,13 @@ pub(crate) enum RequestOutcome {
 /// を返したときは、遅れて自ら止まったものとして `GuestStopped` にする。経過時間と待ちは `elapsed`・`sleep`
 /// として差し込む（試験は仮想時計）。待ちの回数は `grace / poll_interval` で有限。
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[allow(clippy::too_many_arguments)] // 段階ごとの差し込み（時計・待ち・期限）を試験で差し替えるため
 pub(crate) fn run_graceful_stop(
     request: impl FnOnce() -> RequestOutcome,
     mut poll_state: impl FnMut(Duration) -> Option<VmState>,
     force: impl FnOnce() -> Result<(), VmError>,
     grace: Duration,
+    settle: Duration,
     poll_interval: Duration,
     mut elapsed: impl FnMut() -> Duration,
     mut sleep: impl FnMut(Duration),
@@ -323,17 +325,21 @@ pub(crate) fn run_graceful_stop(
         RequestOutcome::NotRequestable(state) => ForceReason::NotRequestable { state },
         RequestOutcome::Failed { domain, code } => ForceReason::RequestFailed { domain, code },
         RequestOutcome::Unresponsive => ForceReason::RequestUnresponsive,
-        RequestOutcome::Requested => loop {
-            let spent = elapsed();
-            if spent >= grace {
-                break ForceReason::Deadline;
+        RequestOutcome::Requested => {
+            // 猶予は要求の発行が返った時点から数える（要求の発行時間は別枠。呼び出し元の予算で上限づけ済み）。
+            let base = elapsed();
+            loop {
+                let spent = elapsed().saturating_sub(base);
+                if spent >= grace {
+                    break ForceReason::Deadline;
+                }
+                let remaining = grace - spent;
+                if poll_state(remaining) == Some(VmState::Stopped) {
+                    return Ok(ShutdownOutcome::GuestStopped);
+                }
+                sleep(poll_interval.min(remaining));
             }
-            let remaining = grace - spent;
-            if poll_state(remaining) == Some(VmState::Stopped) {
-                return Ok(ShutdownOutcome::GuestStopped);
-            }
-            sleep(poll_interval.min(remaining));
-        },
+        }
     };
     match force() {
         Ok(()) => Ok(ShutdownOutcome::Forced { reason }),
@@ -342,7 +348,7 @@ pub(crate) fn run_graceful_stop(
             ..
         }) => Ok(ShutdownOutcome::GuestStopped),
         // 猶予の終わりにゲストが電源断の途中（`Stopping`）だと VZ の `stop` は `canStop` が偽で拒否される。
-        // 停止は進行中なので、有限の追加時間で `Stopped` を待ち、止まれば協調停止の成功として扱う。
+        // 停止は進行中なので、呼び出し元が予算内に収めた有限の追加時間 `settle` で `Stopped` を待ち、止まれば協調停止の成功として扱う。
         Err(VmError::InvalidState {
             state: VmState::Stopping,
             op,
@@ -350,13 +356,13 @@ pub(crate) fn run_graceful_stop(
             let began = elapsed();
             loop {
                 let spent = elapsed().saturating_sub(began);
-                if spent >= STOPPING_SETTLE {
+                if spent >= settle {
                     return Err(VmError::InvalidState {
                         state: VmState::Stopping,
                         op,
                     });
                 }
-                let remaining = STOPPING_SETTLE - spent;
+                let remaining = settle - spent;
                 if poll_state(remaining) == Some(VmState::Stopped) {
                     return Ok(ShutdownOutcome::GuestStopped);
                 }
@@ -368,7 +374,8 @@ pub(crate) fn run_graceful_stop(
 }
 
 /// 協調停止の猶予の後、VM が `Stopping`（電源断の途中）のまま強制停止を拒否されたときに `Stopped` を
-/// 待つ追加の上限（MAC-4・REPAIR-5・#2270）。
+/// 待つ追加の上限の最大値（実際の待ちは呼び出し元が RPC 期限の残りに収めた `settle` で、これ以下。MAC-4・REPAIR-5・#2270）。
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
 pub(crate) const STOPPING_SETTLE: Duration = Duration::from_secs(5);
 
 /// VM の状態（`VZVirtualMachineState` に対応）。
@@ -1118,6 +1125,8 @@ mod mac {
                 |remaining| self.state_within(remaining),
                 || self.stop(),
                 self.timeouts.graceful_stop(),
+                // Stopping の追加待ちは状態照会 1 回分の期限までに絞る（呼び出し元の応答期限の予算に収める）。
+                STOPPING_SETTLE.min(self.timeouts.state_query()),
                 GRACEFUL_POLL_INTERVAL,
                 || started.elapsed(),
                 std::thread::sleep,
@@ -2036,6 +2045,7 @@ mod tests {
                 force_result
             },
             grace,
+            STOPPING_SETTLE,
             GRACEFUL_POLL_INTERVAL,
             || now.get(),
             |d| now.set(now.get() + d),

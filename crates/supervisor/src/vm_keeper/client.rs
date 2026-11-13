@@ -56,18 +56,22 @@ impl KeeperClient {
 
     /// 1 要求を送る。接続・送受信・やり直しのすべてを `deadline` までに収める（REPAIR-5）。サーバーが期限直前の接続を
     /// 閉じる窓（`server::ACCEPT_SLICE` の doc）に当たると `Unavailable` になるため、残り時間があれば 1 回だけ新しい
-    /// 接続でやり直す。その接続は要求を処理していないので重複適用にはならないが、応答の読み取りで切れた場合は処理済みの
-    /// 可能性があり、やり直しの応答が `AlreadyRegistered` / `NotRegistered` になりうる（呼び出し側はこれを
-    /// 「すでにその状態」と読む）。
+    /// 接続でやり直す。やり直しは冪等な `Status` と、要求の送信が完了する前の失敗（接続・書き込み）に限る。
+    /// `Register` / `Unregister` は要求を書き終えた後の失敗（応答の読み取りで切れた等）では適用済みの可能性があり、
+    /// 別クライアントの更新を挟んだ再送が新しい登録を消すため、再送せず `Unavailable` を返す（MAC-4 の参照管理）。
     fn call(
         &self,
         request: &Request,
         connect_timeout: Duration,
         deadline: Instant,
     ) -> Result<Response, TraitError> {
-        match self.call_once(request, connect_timeout, deadline) {
-            Err(e) if e.code() == ErrorCode::Unavailable => {
-                self.call_once(request, connect_timeout, deadline)
+        let mut sent = false;
+        match self.call_once(request, connect_timeout, deadline, &mut sent) {
+            Err(e)
+                if e.code() == ErrorCode::Unavailable
+                    && (!sent || matches!(request, Request::Status)) =>
+            {
+                self.call_once(request, connect_timeout, deadline, &mut sent)
             }
             other => other,
         }
@@ -78,6 +82,7 @@ impl KeeperClient {
         request: &Request,
         connect_timeout: Duration,
         deadline: Instant,
+        sent: &mut bool,
     ) -> Result<Response, TraitError> {
         let remaining = remaining_until(deadline)?;
         // 起動役側の peer 拒否はエラーとして返すため、観測用の受け手は捨てる。
@@ -94,6 +99,8 @@ impl KeeperClient {
         let timeout = RpcTimeout::new(io_timeout).map_err(from_plugin)?;
         let frame = Frame::new(request.encode()).map_err(from_plugin)?;
         stream.write_frame(&frame, timeout).map_err(from_plugin)?;
+        // 以後の失敗は、サーバーが要求を適用した後かもしれない。
+        *sent = true;
         // 書き込み後に総期限を過ぎていても、届いている応答を捨てないよう読み取りを短い下限つきで試みる
         // （読み取りは有界。期限切れ後の上乗せは `READ_GRACE` まで）。
         let read_budget = remaining_until(deadline).unwrap_or(Duration::ZERO);
@@ -453,6 +460,41 @@ mod tests {
             assert!(Instant::now() < end, "ledger must drain after child exit");
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// 要求を読んだ後に応答なしで切れた場合、`Register` / `Unregister` は再送せず（適用済みの可能性）、`Status` は
+    /// 新しい接続で 1 回やり直す（MAC-4）。
+    #[test]
+    fn mutating_requests_are_not_resent_after_request_was_written() {
+        use std::io::Read as _;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = crate::test_root::test_root("vmk-client", "noresend");
+        let client = KeeperClient::new(&dir).expect("client");
+        let _ = std::fs::remove_file(&client.socket);
+        let listener = std::os::unix::net::UnixListener::bind(&client.socket).expect("bind");
+        let conns = std::sync::Arc::new(AtomicUsize::new(0));
+        let seen = std::sync::Arc::clone(&conns);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                seen.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 256];
+                let _ = s.read(&mut buf);
+                // 応答せずに閉じる。
+            }
+        });
+        let id = ContainerId::new("c1").expect("id");
+        for (name, r) in [
+            ("register", client.register(&id)),
+            ("unregister", client.unregister(&id)),
+        ] {
+            let e = r.expect_err(name);
+            assert_eq!(e.code(), ErrorCode::Unavailable, "{name}");
+        }
+        assert_eq!(conns.load(Ordering::SeqCst), 2, "one connection each");
+        let e = client.status().expect_err("status");
+        assert_eq!(e.code(), ErrorCode::Unavailable);
+        assert_eq!(conns.load(Ordering::SeqCst), 4, "status retried once");
     }
 
     /// 並行する予約が上限を超えず、解放・回収完了で枠が戻る（MAC-4・REPAIR-5）。

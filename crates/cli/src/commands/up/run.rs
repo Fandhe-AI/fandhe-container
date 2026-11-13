@@ -51,8 +51,6 @@ use crate::error::CliError;
 
 /// `O_NONBLOCK`（Linux の x86_64 / aarch64 とも 0o4000）。FIFO を開いて止まらないために使う。
 const O_NONBLOCK: i32 = 0o4000;
-/// 成功出力の書き込みを待つ上限（`main.rs` の `DEFERRED_REPORT_TIMEOUT` と同じ値。REPAIR-5）。
-const STDOUT_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 /// 失敗時に `info:` の行へ出す起動済みサービス名の最大件数。
 const MAX_INFO_NAMES: usize = 8;
 
@@ -62,32 +60,6 @@ fn err(code: ErrorCode, msg: impl AsRef<str>) -> CliExit {
 
 fn from_trait(e: &TraitError) -> CliExit {
     err(e.code(), e.message())
-}
-
-/// 成功出力を別スレッドで process の stdout へ書き、`timeout` までだけ待つ（REPAIR-5・#4734）。
-///
-/// `commands::run` は main スレッドで動くため、読み進められない pipe / socket への `write_all` は無期限に止まり得る。
-/// 出力サイズの上限では書き込み待ちを制限できないので、書き込みを作業スレッドへ出す。期限切れのスレッドは置き去りにする
-/// （main の return でプロセスごと破棄される）。起動失敗・書き込み失敗は `INTERNAL`、期限切れは `TIMEOUT`。
-fn write_stdout_bounded(bytes: Vec<u8>, timeout: std::time::Duration) -> Result<(), ErrorCode> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    let spawned = std::thread::Builder::new()
-        .name("up-stdout".to_owned())
-        .spawn(move || {
-            let mut out = std::io::stdout().lock();
-            let r = out.write_all(&bytes).and_then(|()| out.flush());
-            let _ = tx.send(r.is_ok());
-        });
-    if spawned.is_err() {
-        return Err(ErrorCode::Internal);
-    }
-    match rx.recv_timeout(timeout) {
-        Ok(true) => Ok(()),
-        Ok(false) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            Err(ErrorCode::Internal)
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(ErrorCode::Timeout),
-    }
 }
 
 /// 無害化して長さを制限した表示用の名前。
@@ -279,8 +251,9 @@ fn child_globals(global: &GlobalArgs) -> Vec<OsString> {
     v
 }
 
-/// `up` の本体。成功出力は注入された書き込み先ではなく process の stdout へ期限つきで書く（[`write_stdout_bounded`]）。
-pub(super) fn run_up(global: &GlobalArgs, args: &UpArgs, _stdout: &mut dyn Write) -> CliExit {
+/// `up` の本体。成功出力は注入された書き込み先 `stdout` へ書く。`commands::run` が渡す process の stdout は期限つきの
+/// 書き手（`BoundedStdout`）で、満杯の pipe / socket での無期限停止を防ぐ（REPAIR-5・#4734）。
+pub(super) fn run_up(global: &GlobalArgs, args: &UpArgs, stdout: &mut dyn Write) -> CliExit {
     // 1. 入力。
     let file: PathBuf = match std::path::absolute(&args.file) {
         Ok(p) => p,
@@ -459,9 +432,16 @@ pub(super) fn run_up(global: &GlobalArgs, args: &UpArgs, _stdout: &mut dyn Write
         &UpPolicy::default(),
     ) {
         Ok(report) => {
-            match write_stdout_bounded(render_success(&report).into_bytes(), STDOUT_WRITE_TIMEOUT) {
+            let out = render_success(&report);
+            match stdout
+                .write_all(out.as_bytes())
+                .and_then(|()| stdout.flush())
+            {
                 Ok(()) => CliExit::Success,
-                Err(code) => CliExit::failed(code),
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                    CliExit::failed(ErrorCode::Timeout)
+                }
+                Err(_) => CliExit::failed(ErrorCode::Internal),
             }
         }
         Err(f) => failure_exit(&f),

@@ -283,7 +283,21 @@ fn validate_options(spec: &Service, env_files: &[Vec<u8>]) -> Result<(), CliErro
         .map(|(k, v)| Label::parse(&format!("{k}={v}")))
         .collect::<Result<Vec<_>, _>>()
         .map_err(opt)?;
-    Labels::resolve(labels).map_err(opt)?;
+    let resolved = Labels::resolve(labels).map_err(opt)?;
+    // 予約キーは既存 create の `labels_of` と同じ規則で、全サービスの起動前に拒否する。
+    let annotations = resolved.annotations();
+    if annotations
+        .get(fandhe_container_supervisor::container_options::store::GENERATION_ANNOTATION)
+        .is_some()
+        || annotations
+            .get(super::super::image_refs::IMAGE_ROOT_ANNOTATION)
+            .is_some()
+    {
+        return Err(CliError::new(
+            ErrorCode::InvalidArgument,
+            "the label key is reserved",
+        ));
+    }
     Ok(())
 }
 

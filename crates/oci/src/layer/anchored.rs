@@ -402,12 +402,25 @@ mod imp {
             at::openat2(
                 Some(self.fd.as_fd()),
                 &name_c,
-                at::O_WRONLY | at::O_CREAT | at::O_NOFOLLOW | at::O_CLOEXEC,
+                at::O_WRONLY | at::O_CREAT | at::O_NOFOLLOW | at::O_NONBLOCK | at::O_CLOEXEC,
                 u64::from(mode),
                 RESOLVE,
             )
-            .map(File::from)
             .map_err(|e| map_at_err(&e))
+            .and_then(|fd| {
+                // 読み手のいない FIFO でも `O_NONBLOCK` により ENXIO で即失敗する（REPAIR-5）。
+                // 通常ファイル以外（FIFO・デバイス）は flock の対象にしない。
+                let file = File::from(fd);
+                let meta = file.metadata().map_err(|e| map_fs_err(&e))?;
+                if meta.is_file() {
+                    Ok(file)
+                } else {
+                    Err(err(
+                        OciErrorCode::FailedPrecondition,
+                        "the lock file is not a regular file",
+                    ))
+                }
+            })
         }
 
         /// 直下の `name` を通常の `unlinkat`（`AT_REMOVEDIR` なし）で 1 エントリだけ消す（不在は成功）。
@@ -1820,6 +1833,21 @@ mod tests {
         assert!(root.child_matches("b", &child));
         assert!(!root.child_matches("link", &child));
         assert!(!root.child_matches("absent", &child));
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// STACK-8・SEC-1・REPAIR-5・#4734: ロックファイルの位置が FIFO でも `open_or_create_file` は止まらず拒否する。
+    #[test]
+    fn stack8_4734_open_or_create_file_rejects_fifo_without_blocking() {
+        let base = tmp("lockfifo");
+        let root = ExtractRoot::open_existing_dir(&base).unwrap();
+        let st = std::process::Command::new("mkfifo")
+            .arg(base.join("l"))
+            .status()
+            .unwrap();
+        assert!(st.success());
+        assert!(root.open_or_create_file("l", 0o600).is_err());
+        drop(root.open_or_create_file("regular", 0o600).unwrap());
         fs::remove_dir_all(&base).unwrap();
     }
 

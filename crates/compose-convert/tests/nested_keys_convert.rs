@@ -56,6 +56,64 @@ fn stack3_nested_keys_keep_file_error_free() {
     assert!(out.convert > 0);
 }
 
+/// STACK-9・STACK-3: GPU 予約の `options` は変換したうえで drop 1 件を残し、`error_free` にならない。
+#[test]
+fn stack9_device_options_blocks_error_free() {
+    let text = CLEAN.replace(
+        "              device_ids: [\"0\"]\n",
+        "              device_ids: [\"0\"]\n              options:\n                foo: bar\n",
+    );
+    let r = report_of(&text);
+    assert_eq!(
+        r.value_drops
+            .get("services.*.deploy.resources.reservations.devices"),
+        1
+    );
+    assert!(!r.error_free().is_error_free());
+}
+
+/// STACK-3・#4637: 降りない 5 か所の `x-*` は drop に数えず `error_free` を保ち、Warning として記録する。
+/// 変換可率では warning が分母にだけ入る（下限は convert と一致のまま）。
+#[test]
+fn stack3_extension_keys_in_unscanned_levels_keep_error_free() {
+    let text = CLEAN
+        .replace("      interval: 5s\n", "      interval: 5s\n      x-h: 1\n")
+        .replace(
+            "        condition: service_healthy\n",
+            "        condition: service_healthy\n        x-d: 1\n",
+        )
+        .replace(
+            "      nofile: 1024\n",
+            "      nofile:\n        soft: 1024\n        hard: 2048\n        x-u: 1\n",
+        )
+        .replace(
+            "          memory: 64M\n",
+            "          memory: 64M\n          x-l: 1\n",
+        )
+        .replace(
+            "              device_ids: [\"0\"]\n",
+            "              device_ids: [\"0\"]\n              x-g: 1\n",
+        );
+    let r = report_of(&text);
+    assert!(r.value_drops.is_empty(), "{:?}", r.value_drops);
+    assert!(r.error_free().is_error_free());
+    for p in [
+        "services.*.healthcheck.x-h",
+        "services.*.depends_on.*.x-d",
+        "services.*.ulimits.*.x-u",
+        "services.*.deploy.resources.limits.x-l",
+        "services.*.deploy.resources.reservations.devices.x-g",
+    ] {
+        let e = r.key_occurrences.get(p).unwrap_or_else(|| panic!("{p}"));
+        assert_eq!(e.occurrences, 1, "{p}");
+    }
+    let mut t = ConversionRateTally::new();
+    t.add(&r);
+    let out = t.finish();
+    assert_eq!(out.warning, 5);
+    assert_eq!(out.lower_bound_convert, out.convert);
+}
+
 /// 陰性対照: `NONE` の healthcheck は drop 1 件で `error_free` にならず、下限は 1 出現分だけ減る。
 #[test]
 fn stack3_unconvertible_healthcheck_lowers_bound() {

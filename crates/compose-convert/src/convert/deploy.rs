@@ -69,6 +69,10 @@ fn convert_limits(v: &ComposeValue, drops: &mut ValueDrops) -> Option<ResourceLi
     };
     let mut out = ResourceLimits::default();
     for (k, val) in m.iter() {
+        // compose-spec が許す拡張キー。無視してよいので drop に数えず、key_scan が Warning で記録する。
+        if k.starts_with("x-") {
+            continue;
+        }
         let ok = match k {
             "cpus" => cpus(val).map(|s| out.cpus = Some(s)).is_some(),
             "memory" => memory(val).map(|s| out.memory = Some(s)).is_some(),
@@ -85,7 +89,15 @@ fn convert_limits(v: &ComposeValue, drops: &mut ValueDrops) -> Option<ResourceLi
 const GPU_ATTRS: [&str; 4] = ["driver", "capabilities", "count", "device_ids"];
 
 /// 各予約エントリの未対応属性（`options`・未知キー）を 1 キー 1 件で `DEVICES_KEY_PATH` へ数える
-/// （STACK-3 の fail-closed。検出器は参照しないキーを見ないため、ここで補う）。
+/// （STACK-3 の fail-closed。検出器は参照しないキーを見ないため、ここで補う）。`x-*` は無視してよい
+/// 拡張キーなので数えず、`key_scan` が Warning で記録する（#4637）。
+///
+/// 判断（Agent の記録）: 未知フィールドの検査を検出段（`gpu_reservation`）へ移さないのは、公開トレイト
+/// `ComposeNode` にキーの列挙が無く、移すにはトレイトの変更が要るため。`options` 付きの予約は変換したまま
+/// drop を 1 件残す。`value_drops` が空でなくなり `error_free` が false になるので TOML は出力されず、
+/// `--downgrade` でも blocker に残るため、`options` を黙って落とした設定が使われることはない。検出段で
+/// 対象外になった要素（例 `driver: amd`）の未知キーは、要素の理由 1 件と属性 1 件で二重に数える。
+/// 再評価の条件: `ComposeNode` にキー列挙を足す変更が入るとき、予約ごと対象外にする案も併せて見直す。
 fn note_unsupported_device_attrs(devices: &ComposeValue, drops: &mut ValueDrops) {
     let Some(items) = devices.as_sequence() else {
         return;
@@ -96,7 +108,7 @@ fn note_unsupported_device_attrs(devices: &ComposeValue, drops: &mut ValueDrops)
     for item in items {
         if let ComposeValue::Mapping(m) = item {
             for (k, _) in m.iter() {
-                if !GPU_ATTRS.contains(&k) {
+                if !GPU_ATTRS.contains(&k) && !k.starts_with("x-") {
                     drops.note(DEVICES_KEY_PATH);
                 }
             }
@@ -212,6 +224,11 @@ mod tests {
         let (o, d) = conv("{resources: {limits: {cpus: [1], pids: 5, memory: 1.5}}}");
         assert!(o.is_none());
         assert_eq!(d.get(P_DEPLOY_LIMITS), 3);
+        // x-* は数えない。x- でない未知キーは従来どおり数える。
+        let (o, d) = conv("{resources: {limits: {cpus: 1, x-n: 1}}}");
+        assert!(o.is_some() && d.is_empty());
+        let (_, d) = conv("{resources: {limits: {cpus: 1, pids: 1}}}");
+        assert_eq!(d.get(P_DEPLOY_LIMITS), 1);
     }
 
     /// STACK-3: 型不一致は各パスで drop。非 resources の子は key_scan の責務で数えない。
@@ -261,6 +278,15 @@ mod tests {
         assert_eq!(d.get(DEVICES_KEY_PATH), 1);
         assert!(o.is_some());
         let (_, d) = gpu(", options: {a: b}, unknown: 1");
+        assert_eq!(d.get(DEVICES_KEY_PATH), 2);
+        // x-* は数えない（変更前は 1 件）。
+        let (o, d) = gpu(", x-note: 1");
+        assert!(o.is_some() && d.is_empty());
+        // 検出段で対象外の要素（driver: amd）は要素の理由 1 件 + 未知キー 1 件で 2 件。
+        let (o, d) = conv(
+            "{resources: {reservations: {devices: [{driver: amd, capabilities: [gpu], options: {a: b}}]}}}",
+        );
+        assert!(o.is_none());
         assert_eq!(d.get(DEVICES_KEY_PATH), 2);
     }
 

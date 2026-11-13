@@ -14,7 +14,7 @@ TASK-191 の着手前に確定が要る未決事項 4 点と計測対象を、�
 
 - `Vm::launch` は 1 回で 1 VM を構成・起動する。virtiofs 共有は構成時に固定される（`MAX_VIRTIOFS_SHARES` = 8）
 - plugin-macos は 1 コンテナ = 1 VM で、状態はメモリだけに持つ。kill・delete・state は `UNIMPLEMENTED`。要求本体は `Vec<String>` の暫定ワイヤー契約
-- macOS の VZ vsock は `Unimplemented`。ゲスト init は mount・報告・ready マーカーまでで、子を作らず、協調停止も無く、mount にパス由来の TOCTOU が残る（#2080 の P2-4）
+- macOS の VZ vsock は `Unimplemented`。ゲスト init は mount・報告・ready マーカーまでで、子を作らず、協調停止も無く、mount にパス由来の TOCTOU が残る（#2080 の P2-4。#2268 で fd 起点の mount へ移行済み）
 - 詳細は [macos-vm-strategy.md](macos-vm-strategy.md) の「現状の事実」を参照
 
 ## 設計上の制約

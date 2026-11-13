@@ -101,6 +101,7 @@ fandhe-container/
 │   │   ├── channel-send-resource-audit.md  # supervisor と plugin 4 crate のチャネル send 後の資源保持の点検表（該当は logs.rs のリーダー〔#3507〕と plugin-macos isolate.rs の作業枠〔#3549〕・期限切れ直後の送信値〔#3574〕の 2 件で、いずれも修正済み。PLUG-2・REPAIR-5・SUP-1・SUP-7）
 │   │   ├── flock-release-audit.md  # close だけで flock を外す RAII の点検表（core の image_rootfs を明示 unlock に修正・他 crate は修正 issue #4513〜#4517。#4492・OCI-5・CORE-2・REPAIR-5）
 │   │   ├── stack-up-wiring.md     # `up` の本番配線（cli 側アダプタ・bundle・env_files の fd 起点検査・フィールド判断表・残余。#4638・STACK-8・#4630）
+│   │   ├── child-exit-pipe-eof-audit.md  # 子の終了直後に pipe の EOF を即時に要求する判定の点検表（gpu は修正済み・core の read_exec_status は Threads: 1 の fork のため無害。修正箇所なし。#4641・REPAIR-5・REPAIR-12・GPU-2）
 │   │   ├── crate-naming.md        # crate 短縮名・plugin crate 配置の確定内容（TASK-1・REPAIR-1）
 │   │   ├── network-wiring.md      # CLI・起動経路への network 結線の設計（`--network` / `--add-host` / `--dns` の受け渡し・none / host・hosts / resolv.conf・ネットワーク定義の状態ストア・プロセスをまたぐ状態・実装 issue の一覧・create の op ログ 2 組の契約〔D17・#3558〕。rootful の実行主体〔D13〕はオーナー承認待ち。#1870・NET-6・NET-12）
 │   │   ├── bridge-create-echo.md  # bridge・veth の作成要求に `NLM_F_ECHO` を付け、作成通知の ifindex を使う判断記録（採用・下限の版・戻し経路・残る窓・実機での確認状況・版ごとの一次情報の確認と `netns_link_index` を echo で置き換えない判断。#1972・#3205・#3293・TASK-139 追補・NET-1）
@@ -118,7 +119,7 @@ fandhe-container/
 │   │   ├── volume-provider-implementation.md  # VolumeProvider の core 側実装（named volume の実体化）の担当 TASK と時期の判断記録（#2451・CRI-7・PLUG-1・IO-7。オーナー承認待ち）
 │   │   ├── image-store-adapter-placement.md  # ImageStore 系アダプタ（ContainerImageRefs ほか）の置き場所の判断材料（#2315・OCI-7・OCI-5。オーナー承認待ち）
 │   │   ├── image-store-root-trust.md  # イメージストア root の検査の基準（権限ビット・所有者）と ACL・再検査・libc 照合の採否の判断記録（#2547・OCI-7・SEC-1。基準はオーナー承認待ち）
-│   │   ├── macos-state-root.md    # macOS の既定の状態ルート（`StateRoot::resolve(None)`）の判断記録（#2431・OCI-5・SEC-4。オーナー承認待ち）
+│   │   ├── macos-state-root.md    # macOS の既定の状態ルート（`StateRoot::resolve(None)`）の判断記録（#2431・#4665・OCI-5・SEC-4。案 A 承認済み: 既定なし・`--root` 必須）
 │   │   ├── windows-execution-layout.md  # Windows の実行構成（WSL2 ゲスト内の core とホストの起動役）の設計ドラフト（#1415・#1539 の決定以外はオーナー承認待ち。TASK-116 追補・#1862・WIN-1）
 │   │   ├── audit-non-linux.md     # 非 Linux の監査の記録経路（Windows の主経路の隔離・代替経路）の設計ドラフト・判断シート（#2430・SEC-4・オーナー承認待ち）
 │   │   ├── audit-delivery.md      # seccomp・Landlock の拒否を監査の記録先へ届ける配送経路の設計（2026-10-15 に方式を採用・#2018。実装は #2023〜#2028・#2004。TASK-41 追補・#1835・SEC-4）

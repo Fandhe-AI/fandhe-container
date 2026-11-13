@@ -28,6 +28,7 @@
 //! 外部入力の扱い: サービス名と `Service` は TOML 由来。本モジュールはシェルもパスも組み立てず
 //! ポートへ渡すだけで、検証は実装側の責務（契約は [`ServiceLauncher`]）。エラーと報告には
 //! `Service` の内容（`env` に資格情報を含みうる）を入れない。
+//! `UpError::{Launch, NetworkProvision, Internal}` の `Display` は名前を出さず、名前はフィールドで得る。
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -365,13 +366,13 @@ impl fmt::Display for UpError {
             Self::Plan(e) => e.fmt(f),
             Self::Wait(e) => e.fmt(f),
             Self::Network(e) => e.fmt(f),
-            Self::NetworkProvision { network, source } => {
-                write!(f, "{}: {} ({})", self.message(), network, source.code())
+            // 名前（ネットワーク名・サービス名）は TOML 由来で untrusted のため出さない
+            // （ERR-1・SEC-1）。フィールドに生のまま残す。表示側の無害化は #3639 の結線が担う。
+            Self::NetworkProvision { source, .. } => {
+                write!(f, "{} ({})", self.message(), source.code())
             }
-            Self::Launch { service, source } => {
-                write!(f, "{}: {} ({})", self.message(), service, source.code())
-            }
-            Self::Internal { service } => write!(f, "{}: {}", self.message(), service),
+            Self::Launch { source, .. } => write!(f, "{} ({})", self.message(), source.code()),
+            Self::Internal { .. } => f.write_str(self.message()),
         }
     }
 }
@@ -534,4 +535,43 @@ where
         });
     }
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// STACK-8・ERR-1・SEC-1: 制御文字・改行・bidi 制御を含む名前でも `Display` は固定文になり、
+    /// 名前は構造化フィールドに生のまま残る。
+    #[test]
+    fn stack_8_up_error_display_hides_names() {
+        let evil = "a\u{1b}[31m\n\u{202e}c";
+        let np = UpError::NetworkProvision {
+            network: evil.into(),
+            source: NetworkProvisionError::new("NET_X", "y"),
+        };
+        assert_eq!(np.to_string(), "failed to provision a network (NET_X)");
+        let l = UpError::Launch {
+            service: evil.into(),
+            source: LaunchError::new("LAUNCH_X", "y"),
+        };
+        assert_eq!(l.to_string(), "failed to launch a service (LAUNCH_X)");
+        let i = UpError::Internal {
+            service: evil.into(),
+        };
+        assert_eq!(i.to_string(), "internal inconsistency in the startup plan");
+
+        match np {
+            UpError::NetworkProvision { network, .. } => assert_eq!(network, evil),
+            other => panic!("unexpected: {other:?}"),
+        }
+        match l {
+            UpError::Launch { service, .. } => assert_eq!(service, evil),
+            other => panic!("unexpected: {other:?}"),
+        }
+        match i {
+            UpError::Internal { service } => assert_eq!(service, evil),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
 }

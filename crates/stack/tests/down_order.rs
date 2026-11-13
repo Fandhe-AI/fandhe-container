@@ -216,7 +216,7 @@ fn stack8_down_does_not_leak_service_contents() {
     let f = down(&services, &mut r).unwrap_err();
     assert_eq!(
         f.to_string(),
-        "failed to stop a service: b (TEST_STOP_FAILED) (failed: 1, stopped: 1)"
+        "failed to stop a service (TEST_STOP_FAILED) (failed: 1, stopped: 1)"
     );
     for text in [format!("{f}"), format!("{f:?}")] {
         assert!(!text.contains("DUMMY_SECRET_VALUE"));

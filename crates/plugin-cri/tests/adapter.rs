@@ -240,12 +240,22 @@ fn cri2_bundle_provider_stub() {
     p.release("c1").expect("release");
 }
 
-/// 非対応 OS では既定構成の組み立てが `Unimplemented` で fail-closed（CRI-2）。
-#[cfg(not(target_os = "linux"))]
+/// Windows では既定構成の組み立てが `Unimplemented` で fail-closed（CRI-2）。
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[test]
 fn cri2_production_unimplemented_off_linux() {
     let e = CriPluginBackends::production().expect_err("non-linux");
     assert_eq!(e.code(), ErrorCode::Unimplemented);
+}
+
+/// macOS ホストは既定の状態ルートを持たない恒久の拒否で、`production()` は `FailedPrecondition` で
+/// fail-closed（#2431 案 A・#4665。CRI-2・OCI-5・SEC-4）。
+#[cfg(target_os = "macos")]
+#[test]
+fn cri2_oci5_4665_production_refused_on_macos_host() {
+    let e = CriPluginBackends::production().expect_err("macos host");
+    assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+    assert!(e.message().contains("--root"), "{}", e.message());
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]

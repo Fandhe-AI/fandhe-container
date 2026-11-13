@@ -5,7 +5,7 @@
 //! 子プロセスとして 2 回（pull 段・再起動後の確認段）起動し、同じ一時の `XDG_RUNTIME_DIR` を渡す。
 //! pull はレジストリへ出ない固定の puller で行い、在庫の永続化と共有の配線だけを見る。root では既定の状態ルートが
 //! 実機のパスになるため非 root を前提として明示検証し、満たさなければ失敗させる（skip で成功扱いにしない）。
-//! 子の実行は期限つきで回収する（REPAIR-5）。`production()` の状態ルートは Linux 以外では `Unimplemented` のため
+//! 子の実行は期限つきで回収する（REPAIR-5）。`production()` の状態ルートは Linux 以外では解決できない（macOS は `FailedPrecondition`・Windows は `Unimplemented`）ため
 //! Linux 限定（永続ストア自体の Unix 共通の検証は oci 側）。
 #![cfg(target_os = "linux")]
 

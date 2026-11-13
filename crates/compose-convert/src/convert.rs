@@ -12,7 +12,9 @@
 //! `Float` は元の書き方を復元できないため文字列へ直さず drop する（例外: `deploy.resources.limits.cpus` の
 //! 有限の Float は数値の意味だけが重要なので文字列へ写す）。
 //! 制限（REPAIR-3）: `key_scan` が降りない段（`healthcheck`・`depends_on` の long 形・`ulimits`・`limits`）の
-//! 未知の子キーは `x-*` も含めて drop として数え、`error_free` を妨げる。
+//! `x-` でない未知の子キーは drop として数え、`error_free` を妨げる。`x-*` は
+//! 無視してよい拡張キーのため drop に数えず、`key_scan` が `EXTENSION_KEY_PARENTS` の位置に限って
+//! Warning として記録する（#4637）。
 
 use std::collections::BTreeMap;
 

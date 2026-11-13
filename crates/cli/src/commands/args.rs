@@ -1113,7 +1113,10 @@ mod tests {
     #[test]
     fn stack8_parse_up_caps_services_after_double_dash() {
         use fandhe_container_stack::profile_filter::MAX_TARGET_SERVICES;
-        let base = ["--file", "/p.toml", "--image-root", "/i", "--"];
+        // Windows では `/i` が絶対パスにならないため、一時ディレクトリで絶対パスを作る。
+        let root = std::env::temp_dir().join("i");
+        let r = root.to_str().expect("utf-8 temp dir");
+        let base = ["--file", "/p.toml", "--image-root", r, "--"];
         let build = |n: usize| {
             let mut a = v(&base);
             a.extend((0..n).map(|i| OsString::from(format!("s{i}"))));
@@ -1316,9 +1319,9 @@ mod tests {
                 "--bundle",
                 "/b",
                 "--image-root",
-                "/i",
+                r,
                 "--image-root",
-                "/i",
+                r,
                 "--image",
                 &d,
                 "c1",
@@ -1327,14 +1330,14 @@ mod tests {
                 "--bundle",
                 "/b",
                 "--image-root",
-                "/i",
+                r,
                 "--image",
                 &d,
                 "--image",
                 &d,
                 "c1",
             ]),
-            v(&["--bundle", "/b", "--image-root", "/i", "--image"]),
+            v(&["--bundle", "/b", "--image-root", r, "--image"]),
             v(&["--bundle", "/b", "--", "--image", "c1"]),
         ] {
             assert_eq!(parse_create(bad.clone()), Err(UsageError), "{bad:?}");
@@ -1356,7 +1359,7 @@ mod tests {
         );
         for bad in [
             v(&["--image-root", "rel", "c1"]),
-            v(&["--image-root", "/a", "--image-root", "/b", "c1"]),
+            v(&["--image-root", r, "--image-root", r, "c1"]),
             v(&["--image-root"]),
         ] {
             assert_eq!(parse_delete(bad.clone()), Err(UsageError), "{bad:?}");

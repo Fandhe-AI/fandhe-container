@@ -60,7 +60,9 @@
 //!   **別の** user namespace にいるとき（既定の rootless。コンテナが user namespace を持つ）だけ、pid / mnt /
 //!   uts / ipc / net より **先に** user namespace へ参加する（1 回の `setns(pidfd, CLONE_NEWUSER | 5 種)`。カーネルは
 //!   user namespace を先に取り付けて残りの権限を参加先の全 capability で検証し、全体を all-or-nothing で反映する
-//!   ため、途中まで参加した状態を作らない）。**同じ** user namespace（rootful 相当）なら参加しない（同じ
+//!   ため、途中まで参加した状態を作らない。ただし init 所有の network namespace だけは user namespace の前に単独で
+//!   参加する #3069 の 2 回構成で、2 回目の失敗では参加前の netns へ戻し、戻せなければ `partially joined` を
+//!   明記して失敗する〔呼び出し側はプロセスを終了すること〕）。**同じ** user namespace（rootful 相当）なら参加しない（同じ
 //!   namespace への再参加は `EINVAL`）。この関係は [`Pid1Target::open`] が副作用の前に判定して対象に記録し
 //!   （`UserNsRelation`）、[`join_namespaces`] が `setns` の直前に再照合する。再照合は「対象の `ns/user` が
 //!   `open` 時と同じ」「呼び出し側の `ns/user` が `open` 時と同じ」を確かめ、ずれていれば違反記録
@@ -781,7 +783,8 @@ pub struct NamespaceJoinReport {
     /// 参加した対象の pid（呼び出し側の PID namespace から見た値）。
     pub target_pid: NonZeroU32,
     /// 参加した namespace を **参加した順** に並べたもの（user namespace に参加したときは [`JoinNamespace::User`] が
-    /// 先頭、続いて [`JoinNamespace::SUP6_SET`] の順）。
+    /// 先頭、続いて [`JoinNamespace::SUP6_SET`] の順。ただし init 所有の network namespace を先に単独で参加した
+    /// ときは [`JoinNamespace::Net`] が先頭）。
     pub joined: Vec<JoinNamespace>,
     /// 別の user namespace へ参加したか（`joined` に [`JoinNamespace::User`] を含むことと同じ）。`false` は対象が
     /// 呼び出し側と同じ user namespace にいて参加しなかったこと（rootful 相当）。
@@ -797,6 +800,8 @@ pub struct NamespaceJoinReport {
 /// 識別子が `open` 時と同じであること）を再確認し、終了済み・別 cgroup へ移動済み・user namespace が変化して
 /// いれば `FailedPrecondition`。
 /// 呼び出しスレッドの namespace を不可逆に変える。単一スレッドでなければ `FailedPrecondition`。
+/// init 所有の netns を先に単独で参加する場合に限り 2 回に分かれるため、2 回目の失敗では参加前の netns へ戻す。
+/// 戻せなかったときは `partially joined` を含む `FailedPrecondition` を返し、呼び出し側はプロセスを終了すること。
 /// 契約全体はモジュール doc を参照（SUP-6・TASK-163.1）。
 pub fn join_namespaces(target: &Pid1Target) -> Result<NamespaceJoinReport, ExecError> {
     let stage = IsolationStage::SetNs;
@@ -835,18 +840,63 @@ pub fn join_namespaces(target: &Pid1Target) -> Result<NamespaceJoinReport, ExecE
     let early_net = target.user_ns.is_distinct()
         && joined.contains(&JoinNamespace::Net)
         && net_owned_by_init_userns(target);
-    if early_net {
+    // 先に単独で参加する場合に備え、失敗時に戻せるよう参加前の network namespace を開いておく（開けなければ拒否）。
+    let original_net = if early_net {
+        Some(
+            fs::File::open("/proc/self/ns/net")
+                .map_err(|e| ExecError::from_io(&e, stage, "open own network namespace"))?,
+        )
+    } else {
+        None
+    };
+    if let Some(orig) = &original_net {
         sys::setns_pidfd(target.pidfd.as_fd(), &[NsFlag::Net])
             .map_err(|e| setns_error(e, "setns(net before user)"))?;
-        ensure_not_exited(target, "refusing to setns")?;
+        if let Err(e) = ensure_not_exited(target, "refusing to setns") {
+            return Err(restore_net_after_failure(orig, e));
+        }
     }
     let flags = combined_join_flags(&joined, early_net);
-    sys::setns_pidfd(target.pidfd.as_fd(), &flags).map_err(|e| setns_error(e, "setns"))?;
+    if let Err(e) = sys::setns_pidfd(target.pidfd.as_fd(), &flags) {
+        let err = setns_error(e, "setns");
+        return Err(match &original_net {
+            Some(orig) => restore_net_after_failure(orig, err),
+            None => err,
+        });
+    }
     Ok(NamespaceJoinReport {
         target_pid: target.pid,
         user_namespace_joined: target.user_ns.is_distinct(),
-        joined,
+        joined: actual_join_order(joined, early_net),
     })
+}
+
+/// 先に network namespace へ単独参加したあとの失敗で、参加前の network namespace へ戻す（呼び出し側は user namespace に
+/// 未参加なので参加前の権限で戻せる）。戻せた場合は元のエラーをそのまま返し、戻せなかった場合は「部分参加のまま」
+/// であることをメッセージに明記した `FailedPrecondition` を返す（呼び出し側はプロセスを終了させること。SEC-1）。
+fn restore_net_after_failure(original: &fs::File, cause: ExecError) -> ExecError {
+    match sys::setns_fd(original.as_fd(), NsFlag::Net) {
+        Ok(()) => cause,
+        Err(restore) => ExecError::new(
+            ErrorCode::FailedPrecondition,
+            IsolationStage::SetNs,
+            format!(
+                "partially joined: network namespace was joined but could not be restored ({restore:?}) after: {}; \
+                 the caller must terminate",
+                cause.message
+            ),
+        ),
+    }
+}
+
+/// 実際の参加順。`early_net` のときは network namespace が先頭（user namespace より前に単独で参加するため）。
+fn actual_join_order(joined: Vec<JoinNamespace>, early_net: bool) -> Vec<JoinNamespace> {
+    if !early_net {
+        return joined;
+    }
+    let mut out = vec![JoinNamespace::Net];
+    out.extend(joined.into_iter().filter(|n| *n != JoinNamespace::Net));
+    out
 }
 
 /// init user namespace の固定 inode（`PROC_USER_INIT_INO` = `0xEFFFFFFD`。3.8 以降の ABI）。
@@ -1541,6 +1591,38 @@ mod tests {
 
     /// NET-1・SEC-1・CORE-3・#3069: init 所有 netns を先に単独で参加したときだけ、1 回の `setns` の集合から net を除く
     /// （user は先頭のまま）。除かないと user 取り付け後の再参加が `EPERM` になる。
+    #[test]
+    fn net1_3069_actual_join_order_puts_net_first_when_early() {
+        use JoinNamespace::{Ipc, Mount, Net, Pid, User, Uts};
+        let all = vec![User, Pid, Mount, Uts, Ipc, Net];
+        assert_eq!(actual_join_order(all.clone(), false), all);
+        assert_eq!(
+            actual_join_order(all, true),
+            vec![Net, User, Pid, Mount, Uts, Ipc]
+        );
+    }
+
+    /// NET-1・SEC-1・#3069: 先に net へ参加したあと戻せなければ、部分参加を明記した `FailedPrecondition`。
+    /// 戻せるとき（自分の netns への再参加）は元のエラーをそのまま返す。
+    #[test]
+    fn net1_3069_restore_failure_reports_partial_join() {
+        let cause = ExecError::new(
+            ErrorCode::PermissionDenied,
+            IsolationStage::SetNs,
+            "setns: boom",
+        );
+        // 通常ファイル（namespace fd ではない）への再参加は失敗する。
+        let bogus = fs::File::open("/proc/self/status").unwrap();
+        let e = restore_net_after_failure(&bogus, cause.clone());
+        assert_eq!(e.code, ErrorCode::FailedPrecondition);
+        assert!(
+            e.message
+                .starts_with("partially joined: network namespace was joined")
+        );
+        assert!(e.message.ends_with("the caller must terminate"));
+        assert!(e.message.contains("setns: boom"));
+    }
+
     #[test]
     fn net1_3069_combined_flags_drop_net_only_when_joined_early() {
         use JoinNamespace::{Ipc, Mount, Net, Pid, User, Uts};

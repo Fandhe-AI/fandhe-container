@@ -511,6 +511,8 @@ macro_rules! libc_consts_checks {
             libc_const_eq!(SOL_SOCKET, i32, c_int);
             libc_const_eq!(SO_DOMAIN, i32, c_int);
             libc_const_eq!(AF_UNIX, i32, c_int);
+            libc_const_eq!(AF_VSOCK, i32, c_int);
+            libc_const_eq!(SOCK_STREAM, i32, c_int);
             libc_const_eq!(MSG_NOSIGNAL, i32, c_int);
             libc_const_eq!(EAGAIN, i32, c_int);
             libc_const_eq!(EPIPE, i32, c_int);
@@ -887,6 +889,8 @@ mod consts {
     pub const KEXEC_SEGMENT_MAX: i64 = 16;
     // `kcmp`（x86_64 は syscall_64.tbl の 312）と `KCMP_VM`（include/uapi/linux/kcmp.h）。
     pub const SYS_KCMP: ArchSysNo = ArchSysNo::new(312);
+    // `socket`（x86_64 は syscall_64.tbl の 41）。seccomp の AF_VSOCK 拒否の観測用（#2277）。
+    pub const SYS_SOCKET: ArchSysNo = ArchSysNo::new(41);
     pub const KCMP_VM: i64 = 1;
     // include/uapi/linux/capability.h の `_LINUX_CAPABILITY_VERSION_3`（2 語・64 bit 形式）。
     pub const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
@@ -920,6 +924,10 @@ mod consts {
     pub const SOL_SOCKET: i32 = 1;
     pub const SO_DOMAIN: i32 = 39;
     pub const AF_UNIX: i32 = 1;
+    // include/linux/socket.h の `AF_VSOCK`（40）と uapi/asm-generic/socket.h の `SOCK_STREAM`（1）。seccomp の
+    // AF_VSOCK 拒否の観測用（#2277）。
+    pub const AF_VSOCK: i32 = 40;
+    pub const SOCK_STREAM: i32 = 1;
     pub const MSG_NOSIGNAL: i32 = 0x4000;
     pub const EAGAIN: i32 = 11;
     pub const EPIPE: i32 = 32;
@@ -978,6 +986,7 @@ mod consts {
             assert!(nr(super::SYS_PTRACE) == libc::SYS_ptrace);
             assert!(nr(super::SYS_KEXEC_LOAD) == libc::SYS_kexec_load);
             assert!(nr(super::SYS_KCMP) == libc::SYS_kcmp);
+            assert!(nr(super::SYS_SOCKET) == libc::SYS_socket);
         };
 
         libc_consts_checks!();
@@ -1314,6 +1323,8 @@ mod consts {
     pub const KEXEC_SEGMENT_MAX: i64 = 16;
     // `kcmp`（aarch64 は asm-generic/unistd.h の 272）と `KCMP_VM`（include/uapi/linux/kcmp.h）。
     pub const SYS_KCMP: ArchSysNo = ArchSysNo::new(272);
+    // `socket`（arm64 は include/uapi/asm-generic/unistd.h の 198）。seccomp の AF_VSOCK 拒否の観測用（#2277）。
+    pub const SYS_SOCKET: ArchSysNo = ArchSysNo::new(198);
     pub const KCMP_VM: i64 = 1;
     // include/uapi/linux/capability.h の `_LINUX_CAPABILITY_VERSION_3`（2 語・64 bit 形式）。
     pub const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
@@ -1347,6 +1358,10 @@ mod consts {
     pub const SOL_SOCKET: i32 = 1;
     pub const SO_DOMAIN: i32 = 39;
     pub const AF_UNIX: i32 = 1;
+    // include/linux/socket.h の `AF_VSOCK`（40）と uapi/asm-generic/socket.h の `SOCK_STREAM`（1）。seccomp の
+    // AF_VSOCK 拒否の観測用（#2277）。
+    pub const AF_VSOCK: i32 = 40;
+    pub const SOCK_STREAM: i32 = 1;
     pub const MSG_NOSIGNAL: i32 = 0x4000;
     pub const EAGAIN: i32 = 11;
     pub const EPIPE: i32 = 32;
@@ -1405,6 +1420,7 @@ mod consts {
             assert!(nr(super::SYS_PTRACE) == libc::SYS_ptrace);
             assert!(nr(super::SYS_KEXEC_LOAD) == libc::SYS_kexec_load);
             assert!(nr(super::SYS_KCMP) == libc::SYS_kcmp);
+            assert!(nr(super::SYS_SOCKET) == libc::SYS_socket);
         };
 
         libc_consts_checks!();
@@ -1637,6 +1653,7 @@ mod consts {
     pub const PTRACE_CONT: i64 = 0;
     pub const KEXEC_SEGMENT_MAX: i64 = 0;
     pub const SYS_KCMP: ArchSysNo = ArchSysNo::UNSUPPORTED;
+    pub const SYS_SOCKET: ArchSysNo = ArchSysNo::UNSUPPORTED;
     pub const KCMP_VM: i64 = 0;
     // include/uapi/linux/capability.h の `_LINUX_CAPABILITY_VERSION_3`（2 語・64 bit 形式）。
     pub const LINUX_CAPABILITY_VERSION_3: u32 = 0;
@@ -1662,6 +1679,8 @@ mod consts {
     pub const SOL_SOCKET: i32 = 0;
     pub const SO_DOMAIN: i32 = 0;
     pub const AF_UNIX: i32 = 0;
+    pub const AF_VSOCK: i32 = 0;
+    pub const SOCK_STREAM: i32 = 0;
     pub const MSG_NOSIGNAL: i32 = 0;
     pub const EAGAIN: i32 = -25;
     pub const EPIPE: i32 = -26;
@@ -6843,6 +6862,58 @@ pub(crate) fn kcmp_self_probe() -> Result<(), SysError> {
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
+/// `socket(family, SOCK_STREAM|SOCK_CLOEXEC, 0)` を生の syscall で 1 回発行し、成功した fd は直ちに閉じる。
+///
+/// 生の syscall にする理由は、libc の `socket` が family を `int` に切り詰めてから渡すため、上位 32 bit に
+/// 値を持つ引数（seccomp が下位 32 bit だけを見ていることの観測）を作れないこと。bind / connect はしない。
+fn socket_family_probe(family: i64) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let nr = consts::SYS_SOCKET.get()?;
+    let ty = i64::from(consts::SOCK_STREAM | consts::SOCK_CLOEXEC);
+    // SAFETY: 引数はすべて値渡しの整数でポインタを渡さない。成功時の戻り値は新規 fd で、直後に
+    // `OwnedFd` が唯一の所有者となり drop で閉じる（二重 close なし）。
+    let rc = unsafe { ffi_syscall!(nr, family, ty, 0_i64) };
+    if rc < 0 {
+        return Err(last_error());
+    }
+    let Ok(fd) = RawFd::try_from(rc) else {
+        return Err(SysError::Unsupported);
+    };
+    // SAFETY: `fd` は上で成功した socket が返した、他に所有者のいない有効な fd。
+    drop(unsafe { OwnedFd::from_raw_fd(fd) });
+    Ok(())
+}
+
+/// `socket(AF_VSOCK, SOCK_STREAM, 0)` を試す結合試験用プローブ（CORE-5・SEC-1・MAC-4・#2277）。
+///
+/// 既定の seccomp フィルタ適用後は `EPERM` で失敗するはず。適用前には呼ばない: フィルタが無い状態で呼ぶと
+/// カーネルが `net-pf-40`（vsock）のモジュール自動ロードを起こしうる（ホストの非特権ユーザーが socket を
+/// 1 回呼ぶのと同等で特権の昇格は無いが、「フィルタが無くてもホストへ副作用が出ない」契約から外れるため、
+/// 識別は適用前の kcmp 対照・適用後の `EPERM`・`AF_UNIX` の成功で行う）。
+// 結合試験専用。テストビルドの単体テストは呼ばないため dead_code を許可する。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn vsock_socket_probe() -> Result<(), SysError> {
+    socket_family_probe(i64::from(consts::AF_VSOCK))
+}
+
+/// [`vsock_socket_probe`] の family の上位 32 bit にゴミ（`1 << 32`）を足した版。カーネルは family を `int` に
+/// 切り詰めるため、フィルタも下位 32 bit だけを見て拒否する（上位ビットでの回避が効かない）ことを観測する。
+// 結合試験専用。テストビルドの単体テストは呼ばないため dead_code を許可する。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn vsock_socket_high_bits_probe() -> Result<(), SysError> {
+    socket_family_probe((1_i64 << 32) | i64::from(consts::AF_VSOCK))
+}
+
+/// `socket(AF_UNIX, SOCK_STREAM, 0)` を試す結合試験用プローブ。AF_VSOCK 拒否の陽性対照で、
+/// フィルタが socket 全体を拒否していないことを示す（成功が期待値）。
+// 結合試験専用。テストビルドの単体テストは呼ばないため dead_code を許可する。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn unix_socket_probe() -> Result<(), SysError> {
+    socket_family_probe(i64::from(consts::AF_UNIX))
+}
+
 /// `kexec_load(0, KEXEC_SEGMENT_MAX + 1, NULL, 0xffff_ffff)` を発行して errno を返す結合試験用プローブ
 /// （CORE-5・TASK-38.4・#179）。
 ///
@@ -7143,6 +7214,9 @@ mod tests {
         );
         assert_eq!(consts::PTRACE_CONT, 7);
         assert_eq!(consts::SYS_KCMP.get().map(SyscallNumber::raw), Ok(312));
+        assert_eq!(consts::SYS_SOCKET.get().map(SyscallNumber::raw), Ok(41));
+        assert_eq!(consts::AF_VSOCK, 40);
+        assert_eq!(consts::SOCK_STREAM, 1);
         assert_eq!(consts::KCMP_VM, 1);
         assert_eq!(consts::KEXEC_SEGMENT_MAX, 16);
     }
@@ -7158,6 +7232,9 @@ mod tests {
         );
         assert_eq!(consts::PTRACE_CONT, 7);
         assert_eq!(consts::SYS_KCMP.get().map(SyscallNumber::raw), Ok(272));
+        assert_eq!(consts::SYS_SOCKET.get().map(SyscallNumber::raw), Ok(198));
+        assert_eq!(consts::AF_VSOCK, 40);
+        assert_eq!(consts::SOCK_STREAM, 1);
         assert_eq!(consts::KCMP_VM, 1);
         assert_eq!(consts::KEXEC_SEGMENT_MAX, 16);
     }

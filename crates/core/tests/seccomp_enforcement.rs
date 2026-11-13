@@ -2,7 +2,7 @@
 //!
 //! 本番の適用経路（`apply_default_seccomp`＝既定 deny フィルタの構築と `prctl(PR_SET_SECCOMP)`）を、
 //! 使い捨ての子プロセス（テストバイナリ自身を `--child` で再実行）の中で適用し、適用前の対照
-//! （`kcmp` が成功）と適用後の遮断（`kcmp`・`mount`・`pivot_root`・`umount2` が `EPERM`）を
+//! （`kcmp` が成功）と適用後の遮断（`kcmp`・`mount`・`pivot_root`・`umount2` が `EPERM`。`socket(AF_VSOCK)` も `EPERM` で、`AF_UNIX` は通る。MAC-4・SEC-1・#2277）を
 //! 具体値で照合する。`unshare`・`ptrace`・`kexec_load` は `SECCOMP_RET_KILL_PROCESS`（ESC-06・
 //! SEC-2）で戻らないため、1 件ずつ別の子（`--child-kill <name>`）で発行し、親が終了シグナル
 //! SIGSYS（31）を照合する。適用は不可逆・スレッド単位で単一スレッドを要するため、libtest ではなく
@@ -204,6 +204,14 @@ fn main() {
         assert_eq!(o.mount_after, Some(EPERM), "mount blocked");
         assert_eq!(o.pivot_root_after, Some(EPERM), "pivot_root blocked");
         assert_eq!(o.umount_after, Some(EPERM), "umount2 blocked");
+        // 引数つきルール（MAC-4・SEC-1・#2277）。AF_UNIX は陽性対照で、socket 全体を拒否していないことを示す。
+        assert_eq!(o.vsock_after, Some(EPERM), "socket(AF_VSOCK) blocked");
+        assert_eq!(
+            o.vsock_high_bits_after,
+            Some(EPERM),
+            "socket(AF_VSOCK | 1<<32) blocked"
+        );
+        assert_eq!(o.unix_socket_after, None, "socket(AF_UNIX) allowed");
         println!("seccomp_enforcement child: ok");
         return;
     }

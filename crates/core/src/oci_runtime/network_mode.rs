@@ -18,6 +18,8 @@
 //! | `Attachable` | path 付き / 重複 | `InvalidArgument` |
 //! | `Host` | 無し、または path 無し | `HostShared`(config のエントリより起動オプションを優先。`--ipc host` と同じ) |
 //! | `Host` | path 付き / 重複 | `InvalidArgument` |
+//! | `JoinPinned` | 無し、または path 無し | `PinnedJoined`(init user namespace 所有の pin 済み netns へ、user namespace の作成前に参加する。D12・#3069) |
+//! | `JoinPinned` | path 付き / 重複 | `InvalidArgument` |
 //!
 //! # 実体と未実装(REPAIR-3)
 //!
@@ -42,6 +44,11 @@ pub enum LaunchNetworkMode {
     /// 準備処理(`NetnsAttachHook`。holder の保持と pasta の起動は supervisor が #1940 で担う)が成功してから合図を受けて
     /// exec する点だけ。rootless の権限モデルに限り、ビルドの時点で他は拒否される(`ProductionLauncherBuilder::build`)。
     Attachable,
+    /// rootful のユーザー定義ネットワークの netns(init user namespace 所有。`NetworkPlugin::create_netns` が作り置き場へ pin
+    /// したもの)へ参加する(`docs/design/network-wiring.md` D12。NET-1・SEC-1・CORE-3・#3069)。パスと (dev, ino) は
+    /// `LaunchOptions::with_netns_join` で対にして渡す。core が 1 回だけ開いて fd に固定し、user namespace を作る**前**に
+    /// `setns(CLONE_NEWNET)` する。pod の join(`FromConfig` の path 付き。#2872)とは別の入口。
+    JoinPinned,
 }
 
 /// 突き合わせの結果(実効の network の扱い)。
@@ -55,6 +62,9 @@ pub enum EffectiveNetwork {
     /// pod の保持役が作った network namespace へ、固定した fd で参加する(pod の user・ipc・net の join。
     /// CORE-3・SEC-5・NET-3・#2872。設計 #2838 の H7)。netns は作らず `lo` も触らない(保持役の責務)。
     PodJoined,
+    /// 起動オプションで指定した init user namespace 所有の pin 済み netns へ、固定した fd で参加する(D12。
+    /// NET-1・SEC-1・CORE-3・#3069)。netns は作らず `lo` も触らない(plugin の責務)。
+    PinnedJoined,
 }
 
 /// D7 の表で config と起動オプションを突き合わせる(モジュール doc)。
@@ -83,7 +93,10 @@ pub(super) fn reconcile_network(
                 "start does not support yet: network / cgroup / time namespace",
             )),
         },
-        LaunchNetworkMode::Loopback | LaunchNetworkMode::Attachable | LaunchNetworkMode::Host => {
+        LaunchNetworkMode::Loopback
+        | LaunchNetworkMode::Attachable
+        | LaunchNetworkMode::Host
+        | LaunchNetworkMode::JoinPinned => {
             if has_second {
                 return Err(TraitError::new(
                     ErrorCode::InvalidArgument,
@@ -96,10 +109,10 @@ pub(super) fn reconcile_network(
                     "the network mode conflicts with a linux.namespaces network path",
                 ));
             }
-            Ok(if mode == LaunchNetworkMode::Host {
-                EffectiveNetwork::HostShared
-            } else {
-                EffectiveNetwork::NewLoopback
+            Ok(match mode {
+                LaunchNetworkMode::Host => EffectiveNetwork::HostShared,
+                LaunchNetworkMode::JoinPinned => EffectiveNetwork::PinnedJoined,
+                _ => EffectiveNetwork::NewLoopback,
             })
         }
     }
@@ -213,6 +226,30 @@ mod tests {
                 EffectiveNetwork::NewLoopback
             );
         }
+    }
+
+    /// NET-1・SEC-1・CORE-3(#3069): `JoinPinned` はエントリ無し・path 無しで `PinnedJoined`、path 付き・重複は
+    /// `InvalidArgument`(既存の固定文言)。
+    #[test]
+    fn net1_sec1_3069_join_pinned_accepts_only_pathless_entries() {
+        for ns in [NONE, NET] {
+            assert_eq!(
+                run(ns, LaunchNetworkMode::JoinPinned).unwrap(),
+                EffectiveNetwork::PinnedJoined
+            );
+        }
+        let err = run(NET_PATH, LaunchNetworkMode::JoinPinned).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            err.message(),
+            "the network mode conflicts with a linux.namespaces network path"
+        );
+        let err = run(NET_TWICE, LaunchNetworkMode::JoinPinned).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            err.message(),
+            "linux.namespaces has a duplicate network entry"
+        );
     }
 
     #[test]

@@ -141,7 +141,7 @@ pub use launcher::{ProductionLauncher, ProductionLauncherBuilder};
 #[cfg(target_os = "linux")]
 pub use launcher::{SubordinateIdMaps, SubordinateIdSource};
 pub use mount_destination::{MountDestination, audit_mount_config_error};
-pub use namespace_join::NamespaceJoin;
+pub use namespace_join::{NamespaceJoin, NetnsJoinTarget, PinnedNetnsJoin};
 #[cfg(target_os = "linux")]
 pub use netns_attach::{AttachableNamespaces, NetnsAttachHook};
 pub use network_mode::{EffectiveNetwork, LaunchNetworkMode};

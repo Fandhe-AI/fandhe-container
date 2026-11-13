@@ -1,6 +1,6 @@
 //! oci の `OciOpRecorder` を CLI の `OpRecorder` へ橋渡しするアダプタ（REPAIR-4・OCI-1・CLI-1・#2968）。
 //!
-//! 呼び出し元は `image.rs` の `image ls` / `image rm` / `image tag` / `system df`。`ImageStore::with_recorder` へ
+//! 呼び出し元は `image.rs` の `image ls` / `image rm` / `image tag` / `image prune` / `system df` と `image_unpack.rs`。`ImageStore::with_recorder` へ
 //! 渡し、oci 内の操作（イメージストアの排他取得・一覧・df・rm・tag など）を、CLI の `with_ops` が 1 回のコマンドごとに
 //! 作る `OpRecorder` へ `oci.*` の名前で記録する。記録は `with_ops` の `export_ops` が構造化ログへ出す。
 //!
@@ -12,10 +12,13 @@
 //! （操作名の種類数が掛け算で増え、`OpRecorder` の `MAX_TRACKED_OPS` を圧迫するため。分類は CLI のエラー出力に残る）。
 //! 記録の失敗は無視し、操作の結果は変えない。
 //!
-//! # 未実装・前提
+//! # 配線の範囲・未実装
 //!
-//! CLI に `pull` サブコマンドは無く（pull は plugin-cri の `PullImage` 経由）、展開も CLI は呼ばない。pull・展開の
-//! 経路が CLI に入った時点で、同じアダプタを `ImageRootfsSource::with_recorder` 等へ渡す（OCI-1）。
+//! CLI に `pull` サブコマンドは無い（pull は plugin-cri の `PullImage` だけが受け持つ。#3255 のオーナー判断）。
+//! 展開は `create --image --unpack` の経路（`image_unpack::StoreImageRootfsUnpacker`。#2377・#3042）が同じアダプタを
+//! 通して `oci.blob.verify` / `oci.layer.extract` 等を create の `Runtime` の `OpRecorder` へ記録する。
+//! 未実装: create / delete が開く `ImageStore` への `ImageStore::with_recorder`（`oci.store.lock` 等の store 階層の
+//! 計装）は未配線で、`Runtime` が `Arc<OpRecorder>` を持つため `PendingImage::bind` に足せば済む（OCI-1）。
 
 use std::fmt;
 use std::sync::Arc;
@@ -39,38 +42,6 @@ impl fmt::Debug for CliOciRecorder {
 }
 
 impl OciOpRecorder for CliOciRecorder {
-    fn record_oci_op(&self, sample: &OciOpSample) {
-        let Ok(name) = OpName::new(sample.kind().as_str()) else {
-            return;
-        };
-        let outcome = match sample.outcome() {
-            OciOpOutcome::Success => OpOutcome::Success,
-            _ => OpOutcome::Failure,
-        };
-        let _ = self.0.record(&name, outcome, sample.latency());
-    }
-}
-
-/// 借りた `OpRecorder` へ書き込む `OciOpRecorder`（`Arc` を持てない呼び出し元用。REPAIR-4・OCI-1・#2377）。
-///
-/// イメージつき create の `Runtime` は `OpRecorder` を所有で持つため、`create --unpack` の展開器はこの借用版で
-/// [`CliOciRecorder`] と同じ写像を使う。
-pub(super) struct BorrowedOciRecorder<'a>(&'a OpRecorder);
-
-impl<'a> BorrowedOciRecorder<'a> {
-    pub(super) fn new(recorder: &'a OpRecorder) -> Self {
-        Self(recorder)
-    }
-}
-
-impl fmt::Debug for BorrowedOciRecorder<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BorrowedOciRecorder")
-            .finish_non_exhaustive()
-    }
-}
-
-impl OciOpRecorder for BorrowedOciRecorder<'_> {
     fn record_oci_op(&self, sample: &OciOpSample) {
         let Ok(name) = OpName::new(sample.kind().as_str()) else {
             return;

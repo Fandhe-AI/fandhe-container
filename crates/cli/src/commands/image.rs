@@ -84,7 +84,7 @@
 //!   他コマンドと同じ plugin 解決の失敗（`list_logs::store_open_failure`）で fail-closed に失敗する。
 //! - `system df` の containers・staging・展開後サイズは oci が未計測のため出さない（#2222）。
 //! - oci の `OciOpRecorder` は `oci_recorder::CliOciRecorder` で CLI の `OpRecorder` へ橋渡しし、`image ls` / `image rm` / `image tag` / `image prune` / `system df` の
-//!   `ImageStore` に付ける（`oci.*` の名前で記録。#2968・REPAIR-4・OCI-1）。CLI に pull・展開の経路は無いため、それらの計装は経路が入った時点で同じアダプタを渡す。
+//!   `ImageStore` に付ける（`oci.*` の名前で記録。#2968・REPAIR-4・OCI-1）。CLI に pull は無く（plugin-cri の `PullImage`。#3255）、展開は `create --unpack` の `image_unpack` が同じアダプタを使う（#3042）。
 
 use std::io::Write;
 use std::num::NonZeroU32;

@@ -409,6 +409,16 @@ pub fn spawn_keeper(exe: &Path, base: &Path) -> io::Result<Child> {
 mod tests {
     use super::*;
 
+    /// socket を置く試験用の短い配置ベース（MAC-4・REPAIR-12）。
+    /// macOS の `$TMPDIR` は長く、配下の socket が sun_path の上限（104 バイト）を超えるため、
+    /// `/tmp` 直下の短い名前で排他作成する（Drop で消える）。
+    fn short_root(tag: &str) -> crate::test_root::TestRoot {
+        crate::test_root::test_root_at(std::path::PathBuf::from(format!(
+            "/tmp/vmk-{}-{tag}",
+            std::process::id()
+        )))
+    }
+
     /// 相対パス・単なる名前は spawn 前に `InvalidInput` で拒否される（PATH 探索をしない契約）。
     #[test]
     fn spawn_keeper_rejects_non_absolute_exe() {
@@ -422,7 +432,7 @@ mod tests {
     /// 期限切れでも、起動した子（公開済みの保持役でありうる）を kill しない（MAC-4）。
     #[test]
     fn ensure_running_timeout_does_not_kill_spawned_child() {
-        let dir = crate::test_root::test_root("vmk-client", "nokill");
+        let dir = short_root("nokill");
         let client = KeeperClient::new(&dir).expect("client");
         let mut pid = 0u32;
         let r = client.ensure_running(
@@ -468,7 +478,7 @@ mod tests {
     fn mutating_requests_are_not_resent_after_request_was_written() {
         use std::io::Read as _;
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let dir = crate::test_root::test_root("vmk-client", "noresend");
+        let dir = short_root("noresend");
         let client = KeeperClient::new(&dir).expect("client");
         let _ = std::fs::remove_file(&client.socket);
         let listener = std::os::unix::net::UnixListener::bind(&client.socket).expect("bind");

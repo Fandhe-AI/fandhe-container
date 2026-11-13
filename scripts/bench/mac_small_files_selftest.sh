@@ -495,7 +495,7 @@ if [ "$rc" -ne 0 ]; then cat "${TMP}/err"; fi
 check "own: ok run exits 0" rc_is 0
 check "own: create passes --bundle and the exact run label" calls_has '^create --bundle .* --label fandhe.mac-small-files.run=[0-9a-f]\{16\} fms-[0-9a-f]\{16\}-1$'
 check "own: 5 trials plus 1 probe each create, start and delete once" test "$(calls_count 'create ')" -eq 6 -a "$(calls_count 'start ')" -eq 6 -a "$(calls_count 'delete ')" -eq 6
-check "own: logs are read with --stream stdout" calls_has '^logs --stream stdout fms-'
+check "own: logs are read with --follow --stream stdout" calls_has '^logs --follow --stream stdout fms-'
 check "own: no --root is passed" test "$(grep -c -- '--root' "${STUB_DIR}/calls" || true)" -eq 0
 check "own: result schema, target, mode and declared image id" jq_ok '.schema == "fandhe-container.mac-small-files/v1" and .target == "own" and .mode == "own" and .label == "ownstub" and .mount_kind == "bind" and .trials_ok == 5 and .image_id == "'"$IMGID"'" and .image_id_source == "declared" and .shared_root_checked == true and .backend_version == "unknown" and (.samples | length) == 5' "${TMP}/own-res.json"
 check "own: metric methods" jq_ok '.metrics.wall_clock_median_ms.method == "cli-create-start-wait-delete-total" and .metrics.metadata_p95_us.method == "batch-boundary-provisional" and .metrics.metadata_p95_us.value == 9.5 and .metrics.wall_clock_median_ms.value > 0' "${TMP}/own-res.json"

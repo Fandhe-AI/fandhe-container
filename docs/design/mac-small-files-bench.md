@@ -79,7 +79,9 @@ bundle の作り方: `--bundle` は `rootfs/` を含み `config.json` を含ま�
 ImageStore を開く経路は作らない（#1906 項目 3）。ログの回転（既定 1 MiB × 3 世代）で `TS` 行が欠けた試行は件数の照合で失敗になる
 （count 50000・batch 1 の最悪でも約 1.5 MB で 3 世代に収まる見込み）。自前 CLI に版の表示は無く `backend_version` は `unknown`。
 
-不採用の案: `logs --follow` の終了で待つ案（追従のポーリング 200 ms と出力時間が区間に入るため）、専用の `--root` を使う案（上記）。
+logs の取得: `state` が stopped でも supervisor の最終 flush は終わっていない（`Stopped` の記録が先。crates/cli の list_logs の契約）ため、計測区間の外で `logs --follow --stream stdout` を使い、書き手の終了まで待って出し切る（期限は試行の残り時間）。非追従の取得は末尾の `TS`・`FILES_CREATED`・`DONE` を落とし得る。
+
+不採用の案: 区間内で `logs --follow` の終了を待つ案（追従のポーリング 200 ms が区間に入るため。logs は区間外なので取得には使う）、専用の `--root` を使う案（上記）。
 
 ## 時刻源（壁時計。#3104・MAC-3・REPAIR-5）
 

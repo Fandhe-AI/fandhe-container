@@ -189,6 +189,7 @@ trial_dirs_file=""
 cleanup_failed=0
 own_config_written=0
 own_ids_file=""
+own_cli_ok=0
 own_stage=""
 own_fail=""
 own_extra="{}"
@@ -346,9 +347,12 @@ own_lim() {
 own_call() {
   local tag="$1" out="$2" errf="$3" rc=0
   shift 3
+  own_cli_ok=0
   own_lim || return 124
   run_limited "$own_limit" "$perl_bin" -e "$TIMED_EXEC_PL" "${work}/ts.${tag}" "$runtime" "$@" >"$out" 2>"$errf" || rc=$?
   [ "$rc" -eq 0 ] || return "$rc"
+  # CLI 自体の成功は計時の成否と分けて覚える（create 成功後の計時不正で作成済みコンテナを漏らさないため）。
+  own_cli_ok=1
   read_trial_clock "${work}/ts.${tag}" || return 98
   return 0
 }
@@ -403,8 +407,14 @@ own_trial_body() {
   # 所有を証明できない ID には何も送らない（AGENTS.md の回収方針）。ID は create の成功後にだけ回収対象へ記録する。
   # create が失敗（ALREADY_EXISTS を含む）しても kill・delete は送らず、後始末の gone 確認の対象にもしない。
   # 期限切れ（成否不明）のときだけ、作られている可能性を警告して手動確認を促す。
+  own_cli_ok=0
   own_call create "${work}/o.out" "${work}/o.err" create --bundle "$bundle" --label "${LABEL_KEY}=${run_tag}" "$id" || {
     rc=$?
+    # CLI の create が成功していれば（計時の記録が不正で 98 のときも）、計時の検証より先に回収台帳へ記録する。
+    if [ "$own_cli_ok" -eq 1 ]; then
+      echo "$id" >>"$own_ids_file"
+      own_cur_id="$id"
+    fi
     if [ "$rc" -eq 124 ]; then
       echo "warning: create of ${id} timed out and its outcome is unknown; no kill or delete was sent. Inspect it manually (label ${LABEL_KEY}=${run_tag})" >&2
     fi
@@ -439,7 +449,10 @@ own_trial_body() {
     own_stage=logs
     own_lim || { own_fail="logs exceeded the trial deadline"; return 124; }
     rc=0
-    run_limited "$own_limit" "$runtime" logs --stream stdout "$id" >"${work}/logs.raw" 2>"${work}/o.err" || rc=$?
+    # state の stopped は supervisor の最終 flush より先に記録されるため、非追従の logs は末尾を取りこぼし得る。
+    # `--follow` は書き手（<id>.log.lock）の終了まで待って出し切り 0 で終わる。計測区間外なので待ちは値に入らず、
+    # 期限は own_limit（試行の残り時間）が持つ。
+    run_limited "$own_limit" "$runtime" logs --follow --stream stdout "$id" >"${work}/logs.raw" 2>"${work}/o.err" || rc=$?
     if [ "$rc" -ne 0 ]; then own_rc_fail "$rc"; return $?; fi
     size="$(wc -c <"${work}/logs.raw" | tr -d ' ')"
     [ "$size" -le 4194304 ] || { own_fail="logs output is too large"; return 1; }

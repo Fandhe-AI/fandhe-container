@@ -335,7 +335,7 @@ case "$cmd" in
     [ -e "$m.created" ] || not_exist
     [ "$mode" = cleanup-hang ] && exec sleep 30
     if [ "$mode" = kill-not-running ]; then
-      echo '{"op":"kill","code":"FAILED_PRECONDITION","message":"container is not running"}' >&2
+      echo '{"level":"error","event":"oci_runtime_error","op":"kill","code":"FAILED_PRECONDITION","message":"container is not running"}' >&2
       exit 5
     fi
     touch "$m.killed"
@@ -353,18 +353,18 @@ case "$cmd" in
         n=$(($(cat "$m.delete-n" 2>/dev/null || echo 0) + 1))
         echo "$n" >"$m.delete-n"
         if [ "$n" -le 2 ]; then
-          echo '{"op":"delete","code":"FAILED_PRECONDITION","message":"container is not running"}' >&2
+          echo '{"level":"error","event":"oci_runtime_error","op":"delete","code":"FAILED_PRECONDITION","message":"container is not running"}' >&2
           exit 5
         fi
         ;;
       delete-fail | holder-long | create-fail-delete-fail) echo "stub: delete failed" >&2; exit 1 ;;
-      never-stops) [ -e "$m.started" ] && { printf '{"op":"delete","code":"FAILED_PRECONDITION","message":"container is still running"}\n' >&2; exit 5; } ;;
+      never-stops) [ -e "$m.started" ] && { printf '{"level":"error","event":"oci_runtime_error","op":"delete","code":"FAILED_PRECONDITION","message":"container is still running"}\n' >&2; exit 5; } ;;
       running-race)
         if [ -e "$m.started" ]; then
-          [ -e "$m.killed" ] || { printf '{"op":"delete","code":"FAILED_PRECONDITION","message":"container is still running"}\n' >&2; exit 5; }
+          [ -e "$m.killed" ] || { printf '{"level":"error","event":"oci_runtime_error","op":"delete","code":"FAILED_PRECONDITION","message":"container is still running"}\n' >&2; exit 5; }
           n=$(($(cat "$m.delete-after-kill" 2>/dev/null || echo 0) + 1))
           echo "$n" >"$m.delete-after-kill"
-          [ "$n" -le 2 ] && { printf '{"op":"delete","code":"FAILED_PRECONDITION","message":"container is still running"}\n' >&2; exit 5; }
+          [ "$n" -le 2 ] && { printf '{"level":"error","event":"oci_runtime_error","op":"delete","code":"FAILED_PRECONDITION","message":"container is still running"}\n' >&2; exit 5; }
         fi
         ;;
     esac

@@ -73,7 +73,7 @@ expect_eq() {
 # stderr の形は製品 CLI に合わせる（crates/cli/src/commands.rs の CliExit::write_stderr）:
 #   固定文言（使い方エラー・list の状態ルート不在・logs）= {"code":..,"message":..}
 #   core 由来（create / start / stop / delete の失敗。OciRuntimeError::write_json_line）
-#     = {"op":..,"code":..,"message":..}。stop の op は kill。
+#     = {"level":"error","event":"oci_runtime_error","op":..,"code":..,"message":..}。stop の op は kill。
 # --------------------------------------------------
 stub="$work/stub-cli"
 cat >"$stub" <<'STUB'
@@ -109,7 +109,7 @@ bad() {
 }
 fail_with() { printf '{"code":"%s","message":"x"}\n' "$2" >&2; exit "$1"; }
 # core 由来の失敗（op 付き）。<終了コード> <code> <op>
-fail_op() { printf '{"op":"%s","code":"%s","message":"x"}\n' "$3" "$2" >&2; exit "$1"; }
+fail_op() { printf '{"level":"error","event":"oci_runtime_error","op":"%s","code":"%s","message":"x"}\n' "$3" "$2" >&2; exit "$1"; }
 # 成功時の stdout を fixture で差し替える。差し替えたら 0、しなければ 1 を返す。
 out_override() {
   [ -n "${STUB_OUT_DIR:-}" ] || return 1
@@ -340,13 +340,13 @@ add_err() { # <期待する code 欄> <printf の書式（stderr の全バイト
 }
 # 受理（A01〜A06）: 固定文言形・op 付き形・エスケープ・非 ASCII（UTF-8）・空 message・DEL
 add_err INVALID_ARGUMENT '{"code":"INVALID_ARGUMENT","message":"usage: fandhe-container <create|start>"}\n'
-add_err ALREADY_EXISTS '{"op":"create","code":"ALREADY_EXISTS","message":"container already exists"}\n'
-add_err NOT_FOUND '{"op":"kill","code":"NOT_FOUND","message":"a\\"b\\\\c \\u0041 \\/ \\n"}\n'
-add_err NOT_FOUND '{"op":"start","code":"NOT_FOUND","message":"\343\201\202 \303\251"}\n'
+add_err ALREADY_EXISTS '{"level":"error","event":"oci_runtime_error","op":"create","code":"ALREADY_EXISTS","message":"container already exists"}\n'
+add_err NOT_FOUND '{"level":"error","event":"oci_runtime_error","op":"kill","code":"NOT_FOUND","message":"a\\"b\\\\c \\u0041 \\/ \\n"}\n'
+add_err NOT_FOUND '{"level":"error","event":"oci_runtime_error","op":"start","code":"NOT_FOUND","message":"\343\201\202 \303\251"}\n'
 add_err FAILED_PRECONDITION '{"code":"FAILED_PRECONDITION","message":""}\n'
-add_err INTERNAL '{"op":"delete","code":"INTERNAL","message":"del \177 ok"}\n'
+add_err INTERNAL '{"level":"error","event":"oci_runtime_error","op":"delete","code":"INTERNAL","message":"del \177 ok"}\n'
 # 拒否（A07〜A18）: code らしき文字列を含んでいても <unparsed>
-add_err '<unparsed>' '{"op":"create","message":"x"}\n'
+add_err '<unparsed>' '{"level":"error","event":"oci_runtime_error","op":"create","message":"x"}\n'
 add_err '<unparsed>' '{"code":"INVALID_ARGUMENT","message":"a"b"}\n'
 add_err '<unparsed>' '{"code":"INVALID_ARGUMENT","message":"a \001 b"}\n'
 add_err '<unparsed>' 'error: INVALID_ARGUMENT "code":"INVALID_ARGUMENT"\n'
@@ -358,7 +358,13 @@ add_err '<unparsed>' '{"code":"NOT_FOUND","message":"bad escape \\x"}\n'
 add_err '<unparsed>' '{"code":"NOT_FOUND","op":"start","message":"key order"}\n'
 add_err '<unparsed>' '{"code":"NOT_FOUND","message":"short \\u12"}\n'
 add_err '<unparsed>' '{"code":"NOT_FOUND","message":"crlf"}\r\n'
-expect_eq "errtable has 18 fixtures" 18 "${#want_codes[@]}"
+add_err '<unparsed>' '{"op":"create","code":"ALREADY_EXISTS","message":"old form"}\n'
+add_err ALREADY_EXISTS '{"level":"error","event":"oci_runtime_error","op":"create","code":"ALREADY_EXISTS","message":"m","truncated":true}\n'
+add_err '<unparsed>' '{"level":"error","event":"oci_runtime_error","op":"create","code":"ALREADY_EXISTS","message":"m","truncated":false}\n'
+add_err '<unparsed>' '{"level":"error","event":"other","op":"create","code":"ALREADY_EXISTS","message":"m"}\n'
+add_err '<unparsed>' '{"level":"warn","event":"oci_runtime_error","op":"create","code":"ALREADY_EXISTS","message":"m"}\n'
+add_err '<unparsed>' '{"event":"oci_runtime_error","level":"error","op":"create","code":"ALREADY_EXISTS","message":"m"}\n'
+expect_eq "errtable has 24 fixtures" 24 "${#want_codes[@]}"
 
 # stderr fixture その 2（上限と、過去に検出した壊れ方）。
 #   err.1 = core の message 上限（4096 バイト）が全バイト 2 バイトへエスケープされた正規の出力（受理）
@@ -374,16 +380,16 @@ while [ "$i" -lt 64 ]; do
   i=$((i + 1))
 done
 expect_eq "escaped max message is 8192 bytes" 8192 "${#q4096}"
-printf '{"op":"create","code":"INVALID_ARGUMENT","message":"%s"}\n' "$q4096" >"$errmax/err.1"
+printf '{"level":"error","event":"oci_runtime_error","op":"create","code":"INVALID_ARGUMENT","message":"%s"}\n' "$q4096" >"$errmax/err.1"
 printf '{"code":"INVALID_ARGUMENT","message":"%s%s%s"}\n' "$q4096" "$q4096" "$q4096" >"$errmax/err.2"
 printf '{"code":"INVALID_ARGUMENT"\n' >"$errmax/err.3"
 printf '{"code":"INVALID_ARGUMENT","message":"a"}\n{"code":"INVALID_ARGUMENT","message":"b"}\n' >"$errmax/err.4"
 printf '{"code":"INVALID_ARGUMENT","message":"a\000b"}\n' >"$errmax/err.5"
 # err.6 / err.7 = op / code に非 ASCII（UTF-8 として妥当）を含む。message 以外の非 ASCII は受理しない。
-printf '{"op":"cr\303\251ate","code":"NOT_FOUND","message":"m"}\n' >"$errmax/err.6"
+printf '{"level":"error","event":"oci_runtime_error","op":"cr\303\251ate","code":"NOT_FOUND","message":"m"}\n' >"$errmax/err.6"
 printf '{"code":"NOT_\303\251FOUND","message":"m"}\n' >"$errmax/err.7"
 # err.8 = 同じ非 ASCII が message にあれば受理する（対照）。
-printf '{"op":"create","code":"NOT_FOUND","message":"cr\303\251ate"}\n' >"$errmax/err.8"
+printf '{"level":"error","event":"oci_runtime_error","op":"create","code":"NOT_FOUND","message":"cr\303\251ate"}\n' >"$errmax/err.8"
 # 同じ capture の stdout fixture: PID 列が数値の list 行（<pid> へ置換されること）。
 # カウンタ（count）が stderr fixture と混ざらないよう別ディレクトリに置く。
 pidout="$work/pidout"

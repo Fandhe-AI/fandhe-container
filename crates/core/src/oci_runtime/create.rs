@@ -1146,7 +1146,7 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).expect("utf8"),
             format!(
-                "{{\"op\":\"create\",\"code\":\"ALREADY_EXISTS\",\"message\":{}}}\n",
+                "{{\"level\":\"error\",\"event\":\"oci_runtime_error\",\"op\":\"create\",\"code\":\"ALREADY_EXISTS\",\"message\":{}}}\n",
                 serde_json::to_string(err.message()).expect("json")
             )
         );

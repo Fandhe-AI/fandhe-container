@@ -358,7 +358,7 @@ fn delete_unit(id_str: &str) -> String {
 /// CLI の stderr から読む最大バイト数（外部入力の上限。先頭だけを見る）。
 const DELETE_STDERR_MAX: u64 = 4096;
 
-/// CLI の `delete` が stderr へ出す 1 行 JSON（`{"code":"..","message":".."}` か ERR-2 の `op` 付き形式）から `code` だけを
+/// CLI の `delete` が stderr へ出す 1 行 JSON（`{"code":"..","message":".."}` か ERR-4 の共通ログ形式 `{"level":"error","event":"oci_runtime_error","op":..,"code":..,"message":..}`〔切り詰め時は末尾に `"truncated":true`〕）から `code` だけを
 /// 取り出し、既知のコード（`ErrorCode::as_str`）なら固定文字列で返す。読めない・未知なら `UNPARSED`。
 /// message・パス・errno は返さない（出力へ載せない。外部入力は信頼しない）。
 fn delete_error_code(bytes: &[u8]) -> &'static str {
@@ -1367,6 +1367,13 @@ mod tests {
         assert_eq!(
             delete_error_code(b"{\"code\":\"FAILED_PRECONDITION\",\"message\":\"x\"}\n"),
             "FAILED_PRECONDITION"
+        );
+        // ERR-4 の共通ログ形式（level / event 付き、truncated 付きを含む）。
+        assert_eq!(
+            delete_error_code(
+                b"{\"level\":\"error\",\"event\":\"oci_runtime_error\",\"op\":\"delete\",\"code\":\"NOT_FOUND\",\"message\":\"m\",\"truncated\":true}\n"
+            ),
+            "NOT_FOUND"
         );
         // ERR-2 の op 付き形式。
         assert_eq!(

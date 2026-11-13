@@ -394,6 +394,22 @@ mod imp {
             .map_err(|e| map_at_err(&e))
         }
 
+        /// 直下に `name` を（無ければ `mode` で作って）書き込み用に開く（`O_CREAT | O_NOFOLLOW`、排他ではない）。
+        /// fd 起点（`openat2`・`RESOLVE_IN_ROOT`）のため、祖先が symlink に差し替えられても根の外へ出ない。
+        /// `flock` の対象になる排他ロックファイル用（STACK-8・SEC-1・#4734）。
+        pub fn open_or_create_file(&self, name: &str, mode: u32) -> Result<File, OciError> {
+            let name_c = child_cstring(OsStr::new(name))?;
+            at::openat2(
+                Some(self.fd.as_fd()),
+                &name_c,
+                at::O_WRONLY | at::O_CREAT | at::O_NOFOLLOW | at::O_CLOEXEC,
+                u64::from(mode),
+                RESOLVE,
+            )
+            .map(File::from)
+            .map_err(|e| map_at_err(&e))
+        }
+
         /// 直下の `name` を通常の `unlinkat`（`AT_REMOVEDIR` なし）で 1 エントリだけ消す（不在は成功）。
         /// ディレクトリには触れず `FailedPrecondition` で拒否する（再帰削除・権限変更をしない。#4378）。
         pub fn unlink_child_file(&self, name: &str) -> Result<(), OciError> {
@@ -1143,6 +1159,21 @@ mod imp {
             let p = self.path.join(checked_child(name)?);
             let mut o = fs::OpenOptions::new();
             o.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                o.mode(mode);
+            }
+            #[cfg(not(unix))]
+            let _ = mode;
+            o.open(&p).map_err(|e| map_fs_err(&e))
+        }
+
+        /// 直下に `name` を（無ければ作って）書き込み用に開く（パス起点）。
+        pub fn open_or_create_file(&self, name: &str, mode: u32) -> Result<File, OciError> {
+            let p = self.path.join(checked_child(name)?);
+            let mut o = fs::OpenOptions::new();
+            o.write(true).create(true).truncate(false);
             #[cfg(unix)]
             {
                 use std::os::unix::fs::OpenOptionsExt as _;

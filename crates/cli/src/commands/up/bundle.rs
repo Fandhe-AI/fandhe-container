@@ -110,24 +110,19 @@ pub(super) struct ProjectLock {
 impl ProjectLock {
     /// `state_root` 配下で `project` のロックを取る。他の `up` が保持していれば `FAILED_PRECONDITION`。
     pub(super) fn acquire(state_root: &Path, project: &str) -> Result<Self, CliError> {
-        use std::os::unix::fs::OpenOptionsExt as _;
         let fail = || CliError::new(ErrorCode::Internal, "failed to lock the project");
         let root = ExtractRoot::open_existing_dir(state_root).map_err(|e| oci_failure(&e))?;
         root.ensure_child_dir(STACK_DIR, 0o700)
             .map_err(|e| oci_failure(&e))?;
-        // 最後の要素が symlink なら辿らず拒否する（O_NOFOLLOW）。`.stack` は 0700 の状態ルート直下。
-        let path = state_root
-            .join(STACK_DIR)
-            .join(format!("up-{project}.lock"));
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(0o400_000) // O_NOFOLLOW（Linux の x86_64 / aarch64 とも 0o400000）
-            .open(path)
-            .map_err(|_| fail())?;
+        // ロックファイルは `.stack` の fd 起点（openat2・NOFOLLOW）で開く。パスを組み直して開かないので、`.stack` が
+        // symlink に差し替えられても状態ルートの外のファイルには flock しない（SEC-1・#4734）。
+        let stack = root
+            .open_child_dir(STACK_DIR)
+            .map_err(|e| oci_failure(&e))?
+            .ok_or_else(fail)?;
+        let file = stack
+            .open_or_create_file(&format!("up-{project}.lock"), 0o600)
+            .map_err(|e| oci_failure(&e))?;
         if !file.metadata().map_err(|_| fail())?.is_file() {
             return Err(fail());
         }
@@ -361,5 +356,23 @@ mod tests {
         let p = prepared(&["/bin/true"], &[], "/", vec![]);
         assert!(write_bundle(&s.0, &p).is_err());
         assert!(!outside.0.join("bundles").exists());
+    }
+
+    /// SEC-1・STACK-8・#4734: `.stack` が symlink なら、ロックは辿らず拒否し、外側にロックファイルを作らない。
+    /// 通常は 2 回目の取得が `FAILED_PRECONDITION`。
+    #[test]
+    fn sec1_4734_project_lock_is_fd_anchored_and_exclusive() {
+        let s = Scratch::new("lock");
+        let first = ProjectLock::acquire(&s.0, "shop").expect("lock");
+        let e = ProjectLock::acquire(&s.0, "shop").expect_err("second");
+        assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+        drop(first);
+        ProjectLock::acquire(&s.0, "shop").expect("released");
+
+        let s2 = Scratch::new("lock-link");
+        let outside = Scratch::new("lock-outside");
+        std::os::unix::fs::symlink(&outside.0, s2.0.join(".stack")).expect("symlink");
+        assert!(ProjectLock::acquire(&s2.0, "shop").is_err());
+        assert!(!outside.0.join("up-shop.lock").exists());
     }
 }

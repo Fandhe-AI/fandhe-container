@@ -286,8 +286,22 @@ pub(super) fn run_up(global: &GlobalArgs, args: &UpArgs, _stdout: &mut dyn Write
         Ok(p) => p,
         Err(_) => return err(ErrorCode::InvalidArgument, "project file path is invalid"),
     };
-    let Some(project_dir) = file.parent().map(Path::to_path_buf) else {
+    let Some(parent_dir) = file.parent().map(Path::to_path_buf) else {
         return err(ErrorCode::InvalidArgument, "project file path is invalid");
+    };
+    // `..` や symlink を解決した実体のディレクトリを起点にする（`--file ../stack.toml` でも名前の導出が壊れない。CLI-1）。
+    // env_files は symlink を辿らず読むため、この実体のパスを読み取りの起点にも使う。
+    let project_dir = match std::fs::canonicalize(&parent_dir) {
+        Ok(p) => p,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return err(ErrorCode::NotFound, "project file was not found");
+        }
+        Err(_) => {
+            return err(
+                ErrorCode::InvalidArgument,
+                "project directory is not usable",
+            );
+        }
     };
     let toml = match read_project_file(&file) {
         Ok(t) => t,
@@ -339,25 +353,9 @@ pub(super) fn run_up(global: &GlobalArgs, args: &UpArgs, _stdout: &mut dyn Write
     let Some(state_root) = store.host_state_root().map(Path::to_path_buf) else {
         return err(ErrorCode::Internal, "state root is unavailable");
     };
-    // 同じプロジェクトの並行する `up` を排他する。事前検査から create / start の完了（この関数の終わり）まで保持する
-    // （共有 bundle の更新と利用の競合を防ぐ。STACK-8・SEC-1・#4734）。
-    let _project_lock = match ProjectLock::acquire(&state_root, project.as_str()) {
-        Ok(l) => l,
-        Err(e) => return CliExit::Error(e),
-    };
-    // env_files は symlink を辿らず読むため、起点は実体のパスにする（名前の決定には使わない）。
-    let read_dir = match std::fs::canonicalize(&project_dir) {
-        Ok(p) => p,
-        Err(_) => {
-            return err(
-                ErrorCode::InvalidArgument,
-                "project directory is not usable",
-            );
-        }
-    };
     let preparer = Preparer {
         project: &project,
-        project_dir: &read_dir,
+        project_dir: &project_dir,
         image_root: &args.image_root,
         store: &image_store,
         env_budget: EnvReadBudget::new(),
@@ -391,6 +389,32 @@ pub(super) fn run_up(global: &GlobalArgs, args: &UpArgs, _stdout: &mut dyn Write
     // 子の `create` が同じ検証でネットワーク作成後に拒否する事態を防ぐ（STACK-8・NET-9・SEC-1・#4734）。
     if let Err(e) = check_ports(&services, &toml.networks) {
         return CliExit::Error(e);
+    }
+
+    // 同じプロジェクトの並行する `up` を排他する。ロックファイルは状態ルートに `.stack` を作るため、拒否経路（事前検査）が
+    // すべて済んでから取る（拒否は副作用ゼロ。STACK-8・SEC-1・#4734）。取った後に、待っていた間に別の `up` が
+    // 記録を作っていないかを再確認する。create / start の完了（この関数の終わり）まで保持する。
+    let _project_lock = match ProjectLock::acquire(&state_root, project.as_str()) {
+        Ok(l) => l,
+        Err(e) => return CliExit::Error(e),
+    };
+    for (name, p) in &prepared {
+        match read_status(&store, &p.id) {
+            Ok(o)
+                if o.state
+                    != fandhe_container_stack::depends_on::wait::DependencyObservation::Absent =>
+            {
+                return err(
+                    ErrorCode::AlreadyExists,
+                    format!(
+                        "a container for the service already exists ({})",
+                        display_name(name)
+                    ),
+                );
+            }
+            Ok(_) => {}
+            Err(_) => return err(ErrorCode::Internal, "container state could not be read"),
+        }
     }
 
     // 4. 副作用はここから。

@@ -14,6 +14,51 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// 子の上限（実行が止まっても試験が無期限に待たない。REPAIR-5）。
+const RUN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// 子を起動し、期限までに終わらなければ kill して回収し、出力を集めて返す（`Command::output` の期限つき版）。
+/// stdout・stderr は別スレッドで読み、満杯の pipe で子が止まらないようにする。
+fn output_bounded(cmd: &mut Command) -> std::process::Output {
+    use std::io::Read as _;
+    use std::process::Stdio;
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    let mut so = child.stdout.take().expect("stdout");
+    let mut se = child.stderr.take().expect("stderr");
+    let ho = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = so.read_to_end(&mut v);
+        v
+    });
+    let he = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = se.read_to_end(&mut v);
+        v
+    });
+    let start = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait().expect("try_wait") {
+            Some(st) => break st,
+            None if start.elapsed() >= RUN_DEADLINE => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("up did not finish within {RUN_DEADLINE:?}");
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    };
+    std::process::Output {
+        status,
+        stdout: ho.join().expect("stdout reader"),
+        stderr: he.join().expect("stderr reader"),
+    }
+}
+
 #[cfg(target_os = "linux")]
 struct Dirs {
     base: PathBuf,
@@ -50,17 +95,17 @@ impl Dirs {
 
     /// `up` を実行し (終了コード, stdout, stderr) を返す。
     fn up(&self, file: &Path, extra: &[&str]) -> (i32, String, String) {
-        let out = Command::new(env!("CARGO_BIN_EXE_fandhe-container"))
-            .arg("--root")
-            .arg(&self.state)
-            .arg("up")
-            .arg("--file")
-            .arg(file)
-            .arg("--image-root")
-            .arg(&self.images)
-            .args(extra)
-            .output()
-            .expect("run");
+        let out = output_bounded(
+            Command::new(env!("CARGO_BIN_EXE_fandhe-container"))
+                .arg("--root")
+                .arg(&self.state)
+                .arg("up")
+                .arg("--file")
+                .arg(file)
+                .arg("--image-root")
+                .arg(&self.images)
+                .args(extra),
+        );
         (
             out.status.code().unwrap_or(-1),
             String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -233,18 +278,18 @@ fn stack10_4638_unknown_target_bad_toml_and_missing_file_are_rejected() {
 fn stack8_4638_pasta_flag_without_user_network_is_rejected() {
     let d = Dirs::new("pasta");
     let toml = d.write_toml("[services.web]\nimage = \"example/none:1\"\n");
-    let out = Command::new(env!("CARGO_BIN_EXE_fandhe-container"))
-        .arg("--root")
-        .arg(&d.state)
-        .arg("--pasta-path-search")
-        .arg("up")
-        .arg("--file")
-        .arg(&toml)
-        .arg("--image-root")
-        .arg(&d.images)
-        .args(["--project-name", "shop"])
-        .output()
-        .expect("run");
+    let out = output_bounded(
+        Command::new(env!("CARGO_BIN_EXE_fandhe-container"))
+            .arg("--root")
+            .arg(&d.state)
+            .arg("--pasta-path-search")
+            .arg("up")
+            .arg("--file")
+            .arg(&toml)
+            .arg("--image-root")
+            .arg(&d.images)
+            .args(["--project-name", "shop"]),
+    );
     assert_eq!(out.status.code(), Some(2));
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
@@ -268,7 +313,7 @@ fn cli1_4638_usage_errors_exit_2() {
         vec!["up", "--file", "a", "--image-root", "rel"],
         vec!["up", "--file", "a", "--image-root", "/abs", "--bogus"],
     ] {
-        let out = Command::new(bin).args(&argv).output().expect("run");
+        let out = output_bounded(Command::new(bin).args(&argv));
         assert_eq!(out.status.code(), Some(2), "{argv:?}");
         assert!(
             String::from_utf8_lossy(&out.stderr).contains("\"code\":\"INVALID_ARGUMENT\""),

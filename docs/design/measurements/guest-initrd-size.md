@@ -32,7 +32,7 @@ rust-lld: error: undefined symbol: renameat2
 ```
 
 - 原因: `crates/core/src/sys.rs` が `renameat2` を `extern "C"` で宣言して直接呼んでいるが、この toolchain 同梱の musl の `libc.a` には `renameat2` のラッパーが無い。CLI と supervisor の両方が core を経由して参照する。#2274 の `cross-target-check` は型検査だけでリンクしないため検出できなかった
-- 本 issue の範囲は梱包スクリプトで、core の `sys` は変えない（別 issue で扱う。`syscall(2)` 経由に直す等）。解消後に同じコマンドで測定し、本節へ貼る
+- 本 issue の範囲は梱包スクリプトで、core の `sys` は変えない（別 issue で扱う。`syscall(2)` 経由に直す等。追跡先の issue 番号は未起票で、オーナー承認後の起票を待つ）。解消後に同じコマンドで測定し、本節へ貼る
 - 測定手順（解消後）: リポ外の容量のある一時領域を `TMPDIR` に向け、`GUEST_INITRD_WITH_RUNTIME=1 scripts/build-guest-initrd.sh --output-dir <新規ディレクトリ>` を実行する。`build-info.txt` の `init_bytes`・`cli_bytes`・`supervisor_bytes`・`cpio_bytes`・`initrd_bytes`（gzip）と、`file` / `od` による ET_EXEC・静的の確認結果、rustc の版、所要時間を記録する
 
 | 項目 | bytes |

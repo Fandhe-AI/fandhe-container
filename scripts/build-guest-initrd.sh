@@ -678,7 +678,8 @@ write_info() {
         printf 'supervisor_path=/%s/fandhe-container-supervisor\n' "$guest_runtime_dir"
         printf 'supervisor_sha256=%s\n' "$sup_sha"
         printf 'supervisor_bytes=%s\n' "$sup_size"
-        printf 'features=default\n'
+        # 作成済みバイナリ（--cli / --supervisor）の feature は不明なため推測しない。
+        if [ -n "$cli_arg" ]; then printf 'features=unknown\n'; else printf 'features=default\n'; fi
     fi
 }
 # 一時ファイルは mktemp（O_EXCL・推測できない名前）で排他的に作る。固定名だと、空確認から書き込みまでに

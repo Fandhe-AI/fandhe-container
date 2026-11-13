@@ -492,7 +492,7 @@ cli_bytes=$cli_size
 supervisor_path=/$rt/fandhe-container-supervisor
 supervisor_sha256=$(sha_of "$sup_f")
 supervisor_bytes=$sup_size
-features=default" "$(tail -n +9 "$out/build-info.txt")"
+features=unknown" "$(tail -n +9 "$out/build-info.txt")"
 if grep -q "initrd sha256=.* bytes=$gz_bytes (cpio $rt_cpio_bytes)" "$sb/o.err"; then ok "12 stderr reports sizes"; else ng "12 stderr sizes missing"; fi
 
 # 13: スタブ cargo 経由（bin の選択と launcher の非梱包）
@@ -502,6 +502,7 @@ run env GUEST_INITRD_CARGO="$sb/cargo-rt" "$target" --with-runtime --compress no
 check "13 exit code" 0 "$rc"
 entries="$(list_newc "$out/initrd.cpio" | grep -v '^ok' | cut -d' ' -f1 | tr '\n' ' ' | sed 's/ $//')"
 check "13 launcher is not packed" "init usr usr/libexec $rt $rt/fandhe-container $rt/fandhe-container-supervisor TRAILER!!!" "$entries"
+check "13 features recorded for a cargo build" "features=default" "$(grep "^features=" "$out/build-info.txt")"
 args="$(tr '\n' ' ' <"$sb/cargo-args")"
 for want in "build --release" "--locked" "--target aarch64-unknown-linux-musl" "-p fandhe-container-cli --bin fandhe-container" "-p fandhe-container-supervisor --bin fandhe-container-supervisor" "-p fandhe-container-guest-init --bin fandhe-container-guest-init"; do
     case "$args" in *"$want"*) ok "13 cargo args have '$want'" ;; *) ng "13 cargo args lack '$want': $args" ;; esac

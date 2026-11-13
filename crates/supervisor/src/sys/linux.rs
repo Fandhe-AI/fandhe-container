@@ -1142,7 +1142,6 @@ mod control_ffi {
             assert!(align_of::<Timespec>() == align_of::<libc::timespec>());
             assert!(offset_of!(Timespec, tv_sec) == offset_of!(libc::timespec, tv_sec));
             assert!(offset_of!(Timespec, tv_nsec) == offset_of!(libc::timespec, tv_nsec));
-            assert!(size_of::<i64>() == size_of::<libc::time_t>());
             assert!(size_of::<i64>() == size_of::<libc::c_long>());
             // SockaddrUn。自前の sun_path は u8 で、x86_64 の c_char（i8）と符号が違う。バイト列としてしか使わないため
             // 大きさとオフセットで照合する。
@@ -1154,6 +1153,13 @@ mod control_ffi {
             assert!(offset_of!(SockaddrUn, sun_path) == offset_of!(libc::sockaddr_un, sun_path));
             assert!(size_of::<u16>() == size_of::<libc::sa_family_t>());
             assert!(size_of::<[u8; 108]>() == size_of::<[libc::c_char; 108]>());
+        };
+
+        // libc 0.2.189 の musl では `time_t` が非推奨(32 bit musl の 64 bit 化の予告)。LP64 の aarch64 では
+        // i64 のままなので照合は残し、警告だけ許す(#2274。ゲスト向け aarch64 musl の型検査)。
+        #[cfg_attr(target_env = "musl", allow(deprecated))]
+        const _: () = {
+            assert!(size_of::<i64>() == size_of::<libc::time_t>());
         };
 
         const _: unsafe extern "C" fn(libc::c_int, libc::c_int, libc::c_int) -> libc::c_int =

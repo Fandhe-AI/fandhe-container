@@ -2007,6 +2007,33 @@ pub(crate) fn isolate_join(
     Ok(())
 }
 
+/// init user namespace 所有の pin 済み netns（固定済みの fd）へ、**user namespace を作る前に** `setns(CLONE_NEWNET)` で
+/// 参加する（D12。NET-1・SEC-1・CORE-3・#3069）。
+///
+/// カーネルは参加先の netns を所有する user namespace（init）と呼び出し側の現在の user namespace の両方で `CAP_SYS_ADMIN`
+/// を要求するため、コンテナの user namespace を作った後では `EPERM` になる。呼び出し元（中間プロセス I の `isolate`）は、
+/// user namespace の作成・参加より前に本関数を呼ぶ。`CAP_SYS_ADMIN` を持たない構成（権限不足）は `EPERM` で
+/// `PermissionDenied` となり、fail-closed に起動が失敗する。参加の直後に `/proc/thread-self/ns/net` の (dev, ino) が
+/// `expected`（pin 時に固定した素性）と一致することを確かめる（取り違えの多重防御）。
+///
+/// 前提: 単一スレッドの fork 子から呼ぶ（`setns` は呼び出しスレッドの所属を変える）。失敗したらプロセスを破棄すること。
+pub(crate) fn join_pinned_netns(
+    fd: std::os::fd::BorrowedFd<'_>,
+    expected: NetnsIdentity,
+) -> Result<(), ExecError> {
+    sys::setns_fd(fd, NsFlag::Net)
+        .map_err(|e| ExecError::from_sys(e, IsolationStage::SetNs, "setns(pinned net)"))?;
+    let joined = netns_sync::capture_baseline()?;
+    if joined != expected {
+        return Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            IsolationStage::SetNs,
+            "the joined network namespace does not match the pinned one",
+        ));
+    }
+    Ok(())
+}
+
 /// 参加した user namespace の写像(`read` が返す `/proc/self/{uid,gid}_map` の内容)が、計画の期待値と完全一致する
 /// ことを確かめる(SEC-5。pod の userns が別の権限モデル・別の範囲で作られていれば起動しない)。
 fn verify_joined_id_maps(

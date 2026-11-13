@@ -425,6 +425,7 @@ fn audit_line_dto(record: &AuditRecord) -> AuditLineDto<'_> {
         | AuditEvent::Entrypoint { .. }
         | AuditEvent::PastaVerify { .. }
         | AuditEvent::PodNamespaceJoin { .. }
+        | AuditEvent::NetnsJoin { .. }
         | AuditEvent::ControlPeer { .. }
         | AuditEvent::ExitSignal { .. }
         | AuditEvent::AuditCoverageDegraded { .. } => (None, None),
@@ -2128,6 +2129,7 @@ mod tests {
                     AuditEvent::Entrypoint { .. } => "entrypoint",
                     AuditEvent::PastaVerify { .. } => "pasta_verify",
                     AuditEvent::PodNamespaceJoin { .. } => "pod_namespace_join",
+                    AuditEvent::NetnsJoin { .. } => "netns_join",
                     AuditEvent::ControlPeer { .. } => "control_peer",
                     AuditEvent::ExitSignal { .. } => "exit_signal",
                     AuditEvent::AuditCoverageDegraded { .. } => "audit_coverage",

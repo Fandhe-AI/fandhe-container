@@ -105,6 +105,7 @@ fandhe-container/
 │   │   ├── crate-naming.md        # crate 短縮名・plugin crate 配置の確定内容（TASK-1・REPAIR-1）
 │   │   ├── network-wiring.md      # CLI・起動経路への network 結線の設計（`--network` / `--add-host` / `--dns` の受け渡し・none / host・hosts / resolv.conf・ネットワーク定義の状態ストア・プロセスをまたぐ状態・実装 issue の一覧・create の op ログ 2 組の契約〔D17・#3558〕。rootful の実行主体〔D13〕はオーナー承認待ち。#1870・NET-6・NET-12）
 │   │   ├── bridge-create-echo.md  # bridge・veth の作成要求に `NLM_F_ECHO` を付け、作成通知の ifindex を使う判断記録（採用・下限の版・戻し経路・残る窓・実機での確認状況・版ごとの一次情報の確認と `netns_link_index` を echo で置き換えない判断。#1972・#3205・#3293・TASK-139 追補・NET-1）
+│   │   ├── image-root-default.md  # `--image-root` を省いたときの既定の位置（Linux は `<状態ルート>/.cri/images`・macOS ホストは既定なし〔#2431 案 A〕・Windows ホストは `UNIMPLEMENTED`）と `image prune` の配線の判断記録（Linux・Windows はオーナー確認待ち。#2384・OCI-7・CLI-1・MAC-4・WIN-1）
 │   │   ├── rootless-network.md    # rootless ネットワーク外部ヘルパーの判断記録（TASK-147・NET-9。pasta を採用〔#340〕。実装・実証は #341）
 │   │   ├── privilege-separation.md  # 権限分離方式の比較と必要最小権限の設計書（TASK-171.1.1・SUP-14。方式承認済み〔#1454〕）
 │   │   ├── user-manager-connect-precheck.md  # start の事前検査への実 connect と connect 先の SO_PEERCRED 照合を足すかの判断記録（#2448・CORE-3・SUP-14。オーナー承認待ち）

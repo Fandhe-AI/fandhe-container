@@ -60,7 +60,7 @@ OCI-5 (4) の字面ではホストの既定は不要だが、上の呼び出し�
 
 - 実装（#4665）: macOS の `StateRoot::resolve(None)` は uid も環境変数も読まず、`FailedPrecondition` と固定文言（`--root` が要る旨）で拒否する。従来の `Unimplemented` は「未実装」を意味するため改め、Windows ホストの恒久拒否（#2428 案 C）と同じ前提不成立の表現にした。`/tmp` 等への推測のフォールバックはしない（ERR-2）。Windows の `resolve(None)` は `Unimplemented` のまま（別判断）
 - ホスト側の呼び出し元は `--root` を必須にするか、ゲスト内のパスへ中継する。保持役のロックは #1906 どおり `getpwuid` の home 配下の固定パスで、`resolve(None)` は使わない
-- #2384（`--image-root` の macOS 既定）も同じく「既定なし」
+- #2384（`--image-root` の macOS 既定）も同じく「既定なし」。#2384 で実装済み（`--root` の有無によらず `FAILED_PRECONDITION` と固定文言で拒否。[image-root-default.md](image-root-default.md)）
 - 残る課題: `--root` が無いとき plugin 信頼検証の拒否（PLUG-11・SEC-4）の記録先は `UnavailableAuditSink` のまま。ホストに記録を残すかは OCI-5 (4) の明確化として spec リポ側の課題
 - 再評価条件: ホストに状態を置く必要が確定したとき（案 C の `confstr` を実機確認の上で検討）
 

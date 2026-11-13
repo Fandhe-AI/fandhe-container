@@ -322,7 +322,7 @@ docker_cleanup() {
 # CLI の stderr（1 行 JSON）から code だけを取り出す。^[A-Z_]{1,64}$ に合わなければ unknown（message・パスは出さない）。
 own_json_code() { # <err file>
   local c=""
-  c="$(head -c 4096 "$1" 2>/dev/null | jq -R -r 'fromjson? | .code? // empty | select(type == "string")' 2>/dev/null | head -n 1)" || c=""
+  c="$(dd if="$1" bs=4096 count=1 2>/dev/null | jq -R -r 'fromjson? | .code? // empty | select(type == "string")' 2>/dev/null | head -n 1)" || c=""
   case "$c" in '' | *[!A-Z_]*) c=unknown ;; esac
   [ "${#c}" -le 64 ] || c=unknown
   printf '%s' "$c"
@@ -331,7 +331,7 @@ own_json_code() { # <err file>
 # state の stdout（1 行 JSON）から status を取り出す。固定語彙以外は空。
 own_status_of() { # <out file>
   local st=""
-  st="$(head -c 65536 "$1" 2>/dev/null | jq -r '.status? // empty | select(type == "string")' 2>/dev/null | head -n 1)" || st=""
+  st="$(dd if="$1" bs=65536 count=1 2>/dev/null | jq -r '.status? // empty | select(type == "string")' 2>/dev/null | head -n 1)" || st=""
   case "$st" in created | running | stopped) printf '%s' "$st" ;; esac
 }
 
@@ -467,7 +467,7 @@ own_trial_body() {
   run_limited "$own_limit" "$runtime" inspect "$id" >"${work}/o.out" 2>"${work}/o.err" || rc=$?
   if [ "$rc" -ne 0 ]; then own_rc_fail "$rc"; return $?; fi
   # exitCode は inspect の 1 行 JSON のキー（crates/supervisor/src/inspect.rs）。0 以外・欠落は失敗。
-  head -c 65536 "${work}/o.out" | jq -e '.status == "stopped" and .exitCode == 0' >/dev/null 2>&1 \
+  dd if="${work}/o.out" bs=65536 count=1 2>/dev/null | jq -e '.status == "stopped" and .exitCode == 0' >/dev/null 2>&1 \
     || { own_fail="the container did not exit with code 0"; return 1; }
   own_stage=delete
   own_call delete "${work}/o.out" "${work}/o.err" delete "$id" || { own_rc_fail $?; return $?; }

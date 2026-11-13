@@ -1324,6 +1324,36 @@ impl LaunchedProcess for ContainerChildProcess {
     }
 }
 
+/// 記録された配置のコンテナ cgroup について、プロセスが居ないことを確かめた結果（#2011・CORE-2）。
+///
+/// 真偽値にせず列挙型にして、観測（REPAIR-4）や将来の分岐に備える。いずれも「居ない状態に到達済み」を表す。
+/// cgroup の検査自体は Linux 限定だが、[`ProcessLauncher`] の戻り値に使うため 3 OS 共通の本モジュールに置く
+/// （`cgroups::RecordedCgroupOutcome` は再 export。#2245）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordedCgroupOutcome {
+    /// スコープまたはコンテナ cgroup が無い（空でない cgroup は消えないので、プロセスも居ない）。
+    AlreadyAbsent,
+    /// コンテナ cgroup は在り、`populated 0`（子孫を含めて空）だった。何も kill していない。
+    WasEmpty,
+    /// プロセスが居たため `cgroup.kill` で止め、期限内に `populated 0` を確かめた。
+    Killed,
+}
+
+/// 中断された start の回復で、「生存プロセスが居ない」と確かめた根拠（#2245・CORE-2・OCI-6・REPAIR-4）。
+///
+/// [`ProcessLauncher::confirm_no_process_recorded_detailed`] の成功値。`recover_interrupted_start_reported` が
+/// 構造化ログ（`RecoveredStart::encode_log_line`）へ写す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum NoProcessEvidence {
+    /// launcher の起動台帳で確かめた（このプロセスが起動した範囲）。
+    LaunchLedger,
+    /// 状態記録の cgroup 配置から確かめた（別プロセスで起動した残存の確認）。
+    RecordedCgroup(RecordedCgroupOutcome),
+    /// 内訳を返さない launcher（既定実装・内側へ転送しないラッパー）。
+    Unreported,
+}
+
 /// [`LaunchSpec`] からコンテナプロセスを起動する境界。
 ///
 /// # 契約
@@ -1449,6 +1479,24 @@ pub trait ProcessLauncher: Send + Sync {
     ) -> Result<(), TraitError> {
         let _ = recorded;
         self.confirm_no_process(id, timeout)
+    }
+
+    /// [`Self::confirm_no_process_recorded`] に、何で「居ない」と確かめたかの内訳を添えたもの（回復結果の観測。
+    /// #2245・CORE-2・OCI-6・REPAIR-4）。
+    ///
+    /// `recover_interrupted_start_reported` が呼ぶ。既定実装は [`Self::confirm_no_process_recorded`] へ転送し、
+    /// 内訳を持たないため [`NoProcessEvidence::Unreported`] を返す（確認そのものは省かない）。内訳を返せる実装
+    /// （`ProductionLauncher`）は上書きし、`confirm_no_process_recorded` を本メソッドの結果の捨て先にして判定の経路を
+    /// 1 本に保つこと。ラッパー実装は必ず内側へ転送すること（転送しないと `Unreported` へ黙って縮退し、回復結果が
+    /// 観測に残らなくなる。安全性は `confirm_no_process_recorded` が担保するため、欠落するのは観測だけ）。
+    fn confirm_no_process_recorded_detailed(
+        &self,
+        id: &ContainerId,
+        recorded: Option<&CgroupPlacement>,
+        timeout: Duration,
+    ) -> Result<NoProcessEvidence, TraitError> {
+        self.confirm_no_process_recorded(id, recorded, timeout)
+            .map(|()| NoProcessEvidence::Unreported)
     }
 }
 

@@ -132,9 +132,9 @@ pub use launch::ContainerStdin;
 #[doc(hidden)]
 pub use launch::pin_bundle_rootfs_with_swap_for_test;
 pub use launch::{
-    ContainerOutput, LaunchMode, LaunchSpec, LaunchedProcess, ProcessExit, ProcessLauncher,
-    RootfsDir, RootfsPinError, START_TIMEOUT_MAX, StartTimeouts, pin_bundle_rootfs,
-    pin_bundle_rootfs_audited,
+    ContainerOutput, LaunchMode, LaunchSpec, LaunchedProcess, NoProcessEvidence, ProcessExit,
+    ProcessLauncher, RecordedCgroupOutcome, RootfsDir, RootfsPinError, START_TIMEOUT_MAX,
+    StartTimeouts, pin_bundle_rootfs, pin_bundle_rootfs_audited,
 };
 pub use launch_options::{LaunchIpcMode, LaunchOptions, LaunchStdinMode};
 pub use launcher::{ProductionLauncher, ProductionLauncherBuilder};
@@ -152,8 +152,9 @@ pub use resources::{ByteLimit, CgroupsPath, IoThrottle, LinuxResourceLimits};
 #[doc(hidden)]
 pub use start::claim_start_with_pin_swap_for_test;
 pub use start::{
-    ClaimedStart, LAUNCHER_REPLY_GRACE, StartedContainer, claim_start, launch_claimed,
-    recover_interrupted_start, start, take_unreaped_processes,
+    ClaimedStart, LAUNCHER_REPLY_GRACE, RecoveredStart, StartedContainer, claim_start,
+    launch_claimed, recover_interrupted_start, recover_interrupted_start_reported, start,
+    take_unreaped_processes,
 };
 #[cfg(target_os = "linux")]
 pub(crate) use sysfs_mount::OciMountKind;

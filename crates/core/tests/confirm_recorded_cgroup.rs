@@ -8,6 +8,13 @@
 //! - シナリオ B: 記録のコンテナ cgroup が空 → `Ok`・Created
 //! - シナリオ C: 記録のスコープが既に無い → `Ok`・Created
 //! - シナリオ D: 配置の記録が無いレコード → `FailedPrecondition`・Running のまま
+//! - 回復結果の内訳（#2245・REPAIR-4）: A は `Killed`・B は `WasEmpty`・C は `AlreadyAbsent`
+//! - シナリオ C の再開: 記録のスコープと検出スコープが違うため `resume_recorded_scope` は `FailedPrecondition`
+//!   （revision 不変）
+//! - シナリオ E（最後に 1 回だけ。`prepare` は自プロセスを退避リーフへ移すため）: 記録のスコープが検出スコープ
+//!   自身のコンテナ cgroup に `sleep` が居る → `Killed` で回復 → `resume_recorded_scope` が空の cgroup を消す →
+//!   `create_cgroup` が同じ `fc-<id>@<instance>` を作り直し、空で、レコードは Created・配置は不変
+//!   （delete なしの再 start。CORE-2・OCI-6）
 //!
 //! # 実機前提テストとしての分離
 //! 一時領域は `support/scratch_root.rs` の `ScratchDir` の子に作る（#3026・tmpfiles の flock 走査から守るため）。
@@ -20,7 +27,7 @@
 //! systemd-run --user --scope -p Delegate=yes <target/debug/deps/confirm_recorded_cgroup-XXXX> --ignored
 //! ```
 //!
-//! 作成時は未実行（ホストに cgroup を作るため Agent は実行しない）。
+//! 作成時は未実行（ホストに cgroup を作るため Agent は実行しない。結果の記録先は #1477・人間担当）。
 
 // 前提欠如を `PRECONDITION FAILED` の 1 行目で失敗させる共有部品（#2888・#2956・REPAIR-12）。
 #[cfg(target_os = "linux")]
@@ -46,7 +53,8 @@ mod linux {
     use fandhe_container_core::cgroups::{CgroupName, DelegatedCgroup};
     use fandhe_container_core::exec::IsolationPrivilege;
     use fandhe_container_core::oci_runtime::{
-        ProcessLauncher, ProductionLauncher, StartTimeouts, recover_interrupted_start,
+        NoProcessEvidence, ProcessLauncher, ProductionLauncher, RecordedCgroupOutcome,
+        StartTimeouts, recover_interrupted_start_reported,
     };
     use fandhe_container_core::state_store::{FileStateStore, StateRoot};
     use fandhe_container_core::traits::{
@@ -185,7 +193,7 @@ mod linux {
     #[test]
     #[ignore = "requires a delegated cgroup v2 subtree (systemd-run --user --scope -p Delegate=yes)"]
     fn core2_issue2011_recovers_from_recorded_cgroup_in_another_process() {
-        let (_delegated, recorded, scope_dir, _guard) = delegated_scope();
+        let (delegated, recorded, scope_dir, _guard) = delegated_scope();
 
         // A: 孤児の sleep が居る。
         let a = Case::new("ca", Some(&recorded), &scope_dir);
@@ -200,7 +208,13 @@ mod linux {
             .expect("spawn sleep");
         fs::write(a_dir.join("cgroup.procs"), sleeper.id().to_string()).expect("move sleep");
         assert!(populated(&a_dir));
-        recover_interrupted_start(&a.store, &launcher(), &a.id, &timeouts()).expect("recover A");
+        let recovered_a =
+            recover_interrupted_start_reported(&a.store, &launcher(), &a.id, &timeouts())
+                .expect("recover A");
+        assert_eq!(
+            recovered_a.evidence(),
+            NoProcessEvidence::RecordedCgroup(RecordedCgroupOutcome::Killed)
+        );
         assert_eq!(a.state(), ContainerState::Created);
         assert!(!populated(&a_dir));
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -212,7 +226,13 @@ mod linux {
         // B: 空のコンテナ cgroup。
         let b = Case::new("cb", Some(&recorded), &scope_dir);
         fs::create_dir(b.cgroup_dir.as_ref().expect("placement")).expect("mkdir");
-        recover_interrupted_start(&b.store, &launcher(), &b.id, &timeouts()).expect("recover B");
+        let recovered_b =
+            recover_interrupted_start_reported(&b.store, &launcher(), &b.id, &timeouts())
+                .expect("recover B");
+        assert_eq!(
+            recovered_b.evidence(),
+            NoProcessEvidence::RecordedCgroup(RecordedCgroupOutcome::WasEmpty)
+        );
         assert_eq!(b.state(), ContainerState::Created);
 
         // C: 記録のスコープが既に無い。
@@ -222,14 +242,76 @@ mod linux {
             std::process::id()
         );
         let c = Case::new("cc", Some(&gone), &scope_dir.join("gone"));
-        recover_interrupted_start(&c.store, &launcher(), &c.id, &timeouts()).expect("recover C");
+        let recovered_c =
+            recover_interrupted_start_reported(&c.store, &launcher(), &c.id, &timeouts())
+                .expect("recover C");
+        assert_eq!(
+            recovered_c.evidence(),
+            NoProcessEvidence::RecordedCgroup(RecordedCgroupOutcome::AlreadyAbsent)
+        );
         assert_eq!(c.state(), ContainerState::Created);
+        // 記録のスコープが検出スコープと違うため、再開は拒否され revision も変わらない。
+        let after_c = recovered_c.into_record();
+        let e = delegated
+            .resume_recorded_scope(&c.store, &after_c)
+            .expect_err("scope mismatch");
+        assert_eq!(e.code, ErrorCode::FailedPrecondition);
+        assert_eq!(
+            c.store
+                .get(&GetStateRequest::new(c.id.clone()))
+                .expect("get")
+                .revision(),
+            after_c.revision()
+        );
 
         // D: 配置の記録が無い。
         let d = Case::new("cd", None, &scope_dir);
-        let err = recover_interrupted_start(&d.store, &launcher(), &d.id, &timeouts())
+        let err = recover_interrupted_start_reported(&d.store, &launcher(), &d.id, &timeouts())
             .expect_err("no placement");
         assert_eq!(err.code(), ErrorCode::FailedPrecondition);
         assert_eq!(d.state(), ContainerState::Running);
+
+        // E: 記録のスコープが検出スコープ自身。回復の後に delete なしで連鎖を再開する（#2245）。
+        let own_scope = delegated.path().to_owned();
+        let own_dir = PathBuf::from("/sys/fs/cgroup").join(own_scope.trim_start_matches('/'));
+        let e = Case::new("ce", Some(&own_scope), &own_dir);
+        let e_dir = e.cgroup_dir.clone().expect("placement");
+        fs::create_dir(&e_dir).expect("mkdir container cgroup");
+        let mut sleeper_e = Command::new("/bin/sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        fs::write(e_dir.join("cgroup.procs"), sleeper_e.id().to_string()).expect("move sleep");
+        let recovered_e =
+            recover_interrupted_start_reported(&e.store, &launcher(), &e.id, &timeouts())
+                .expect("recover E");
+        assert_eq!(
+            recovered_e.evidence(),
+            NoProcessEvidence::RecordedCgroup(RecordedCgroupOutcome::Killed)
+        );
+        let _ = sleeper_e.wait();
+        let after_e = recovered_e.into_record();
+        let placement = after_e.cgroup().cloned().expect("placement kept");
+        assert!(e_dir.exists(), "killed cgroup leaves an empty directory");
+        let resumed = delegated
+            .resume_recorded_scope(&e.store, &after_e)
+            .expect("resume");
+        assert_eq!(resumed.placement(), &placement);
+        assert!(!e_dir.exists(), "leftover cgroup is removed on resume");
+        let prepared = resumed.create_cgroup().expect("recreate cgroup");
+        assert!(e_dir.exists(), "same fc-<id>@<instance> is recreated");
+        assert!(!populated(&e_dir));
+        let stored = e
+            .store
+            .get(&GetStateRequest::new(e.id.clone()))
+            .expect("get");
+        assert_eq!(stored.status().state(), ContainerState::Created);
+        assert_eq!(stored.cgroup(), Some(&placement));
+        delegated
+            .remove_child(prepared.cgroup())
+            .expect("remove recreated cgroup");
     }
 }

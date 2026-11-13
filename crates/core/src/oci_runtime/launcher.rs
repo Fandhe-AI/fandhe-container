@@ -160,7 +160,7 @@ use super::bind_mounts::{BindMountSet, audit_bind_mount_error};
 use super::cgroup_requirement::{CgroupJoinMeans, launch_after_cgroup_check};
 #[cfg(target_os = "linux")]
 use super::config::NamespaceKind;
-use super::launch::{LaunchMode, LaunchSpec, LaunchedProcess, ProcessLauncher};
+use super::launch::{LaunchMode, LaunchSpec, LaunchedProcess, NoProcessEvidence, ProcessLauncher};
 #[cfg(target_os = "linux")]
 use super::launch_options::{LaunchIpcMode, LaunchOptions, LaunchStdinMode};
 #[cfg(target_os = "linux")]
@@ -1088,6 +1088,25 @@ impl ProcessLauncher for ProductionLauncher {
         {
             self.inner
                 .confirm_no_process_recorded(id, recorded, timeout)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (id, recorded, timeout);
+            match self.never {}
+        }
+    }
+
+    /// [`Self::confirm_no_process_recorded`] の内訳つき版(#2245・REPAIR-4)。
+    fn confirm_no_process_recorded_detailed(
+        &self,
+        id: &ContainerId,
+        recorded: Option<&CgroupPlacement>,
+        timeout: Duration,
+    ) -> Result<NoProcessEvidence, TraitError> {
+        #[cfg(target_os = "linux")]
+        {
+            self.inner
+                .confirm_no_process_recorded_detailed(id, recorded, timeout)
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -2159,25 +2178,38 @@ impl Inner {
     /// launch と排他される)ので、残存は別プロセス(クラッシュした supervisor)が起動したものである。`recorded` が
     /// 無ければ従来どおり `FailedPrecondition`。cgroup の問い合わせの失敗は code だけを保った固定文言にする
     /// (パス・errno を載せない)。待ちは `timeout`(上限つき)から作る単一の期限で打ち切る(REPAIR-5)。
-    /// 成功の内訳(`RecordedCgroupOutcome`)の観測記録は未実装(REPAIR-4 の将来課題)。
+    /// 成功の内訳は [`Self::confirm_no_process_recorded_detailed`] が返す(回復の構造化ログへ載せる。#2245・REPAIR-4)。
+    /// 本メソッドは内訳を捨てるだけで、判定の経路は detailed に 1 本化している。
     fn confirm_no_process_recorded(
         &self,
         id: &ContainerId,
         recorded: Option<&CgroupPlacement>,
         timeout: Duration,
     ) -> Result<(), TraitError> {
+        self.confirm_no_process_recorded_detailed(id, recorded, timeout)
+            .map(|_| ())
+    }
+
+    /// 台帳にある ID は台帳で判定し(`LaunchLedger`)、台帳に無い ID だけ記録済みの cgroup で確かめる
+    /// (`RecordedCgroup`。#2011・#2245)。
+    fn confirm_no_process_recorded_detailed(
+        &self,
+        id: &ContainerId,
+        recorded: Option<&CgroupPlacement>,
+        timeout: Duration,
+    ) -> Result<NoProcessEvidence, TraitError> {
         let in_ledger = self.ledger().position(id).is_some();
         let Some(placement) = recorded.filter(|_| !in_ledger) else {
-            return self.confirm_no_process(id, timeout);
+            return self
+                .confirm_no_process(id, timeout)
+                .map(|()| NoProcessEvidence::LaunchLedger);
         };
         let deadline = Instant::now() + timeout.min(CONFIRM_TIMEOUT_MAX);
         match self
             .ops
             .ensure_no_process_in_recorded(id, placement, deadline)
         {
-            Ok(RecordedCgroupOutcome::AlreadyAbsent)
-            | Ok(RecordedCgroupOutcome::WasEmpty)
-            | Ok(RecordedCgroupOutcome::Killed) => Ok(()),
+            Ok(outcome) => Ok(NoProcessEvidence::RecordedCgroup(outcome)),
             Err(ErrorCode::Timeout) => Err(TraitError::new(
                 ErrorCode::Timeout,
                 "timed out confirming that no process remains in the recorded cgroup",
@@ -4287,6 +4319,30 @@ mod tests {
             l.confirm_no_process_recorded(&id, Some(&p), Duration::from_secs(1))
                 .unwrap_or_else(|e| panic!("{outcome:?}: {e:?}"));
             assert_eq!(calls.lock().unwrap().clone(), vec![(id, p)]);
+        }
+    }
+
+    /// CORE-2・OCI-6・REPAIR-4(#2245): 内訳つきの確認は、3 種の結果をそのまま `RecordedCgroup` で返す。
+    #[test]
+    fn core2_2245_detailed_confirmation_reports_each_recorded_outcome() {
+        for outcome in [
+            RecordedCgroupOutcome::AlreadyAbsent,
+            RecordedCgroupOutcome::WasEmpty,
+            RecordedCgroupOutcome::Killed,
+        ] {
+            let ev = events();
+            let ops = FakeOps::new(&ev);
+            ops.recorded_script.lock().unwrap().push_back(Ok(outcome));
+            let l = launcher(ops, rootless(), None);
+            let id = ContainerId::new("dt").unwrap();
+            let got = l
+                .confirm_no_process_recorded_detailed(
+                    &id,
+                    Some(&placement()),
+                    Duration::from_secs(1),
+                )
+                .unwrap_or_else(|e| panic!("{outcome:?}: {e:?}"));
+            assert_eq!(got, NoProcessEvidence::RecordedCgroup(outcome));
         }
     }
 

@@ -75,7 +75,7 @@ Windows で `FileStateStore` の状態ルートを信頼境界として検査す
 - コード: `FailedPrecondition`（ERR-2 の終了コード 5）。「実行環境（Linux ゲスト内）という前提を満たさない」ことを表し、「いつか実装する」と読める `Unimplemented`（8）と区別する。`PermissionDenied`（権限不足）・`Unavailable`（再試行で回復し得る）は意味が合わない。新しい `ErrorCode` は足さない
 - 文言（固定・英語）: `file state store is not supported on a Windows host by design; the state root belongs in the Linux guest`。#4333（oci の `ImageStore` の恒久拒否）はこの流儀に合わせる
 - 影響: Windows の CLI で表に出るのは `plugin_backend` の `UnavailableAuditSink` が出す stderr 1 行（`audit_sink_unavailable` の `code`）だけで、`UNIMPLEMENTED` から `FAILED_PRECONDITION` に変わる。CLI コマンドの終了コードは変わらない（非 Linux の `open_store` は `FileStateStore::open` を呼ばない）
-- `StateRoot::resolve` の非 Linux の `Unimplemented`（macOS の既定の置き場。#2431）は別の判断で、変えていない
+- macOS の `StateRoot::resolve(None)` は #2431 案 A で `FailedPrecondition` の恒久拒否に確定（#4665）。Windows の `resolve(None)` は `Unimplemented` のまま（別の判断）
 - 試験: core 単体・core 結合・oci 結合（`cfg(not(any(linux, macos)))`）が上記の具体値と「状態ルートを作らない」ことを照合する。Windows の実行は main の `platform-ci` で行われる
 
 ## 呼び出しの棚卸し（Windows ホストでの到達）

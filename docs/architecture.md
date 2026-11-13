@@ -331,7 +331,7 @@ core を参照しない crate（`io`・`net`・`oci`・`cri`・`platform-windows
 - rootful の CLI 経路のユーザー定義ネットワークの実行主体（NET-1・PLUG-1・SUP-14）: [network-wiring.md](design/network-wiring.md) D13（#1870。判断シートあり・オーナー承認待ち。判断は #3057。決まるまで rootful の bridge の結線〔#3069・#3074〕は着手しない）
 - `VolumeProvider` の core 側実装の担当 TASK と時期（CRI-7・PLUG-1・IO-7）: [volume-provider-implementation.md](design/volume-provider-implementation.md)（#2451。オーナー承認待ち。決まるまで core に実装は無い）
 - イメージストア root の検査の基準（OCI-7・SEC-1）: [image-store-root-trust.md](design/image-store-root-trust.md)（#2547。権限ビットと所有者の基準はオーナー承認待ち。決まるまで現行を保つ）
-- macOS の既定の状態ルート（OCI-5・SEC-4）: [macos-state-root.md](design/macos-state-root.md)（#2431。オーナー承認待ち。決まるまで `resolve(None)` は `Unimplemented`）
+- macOS の既定の状態ルート（OCI-5・SEC-4）: [macos-state-root.md](design/macos-state-root.md)（#2431・#4665。案 A 承認済み。macOS の `resolve(None)` は `FailedPrecondition` の恒久拒否で `--root` 必須）
 - Windows の実行構成（ゲスト内の core とホストの起動役。WIN-1・TASK-116 追補）: [windows-execution-layout.md](design/windows-execution-layout.md)（#1862。#1415・#1539 の決定部分以外はオーナー承認待ち）
 - 非 Linux の監査の記録経路（Windows の主経路の隔離・代替経路。SEC-4・REPAIR-3）: [audit-non-linux.md](design/audit-non-linux.md)（#2430。判断シートあり・オーナー承認待ち）
 - 電源断・カーネルクラッシュ後の媒体永続化の検証方式（IO-2・IO-3）: [io-power-loss-verification.md](design/io-power-loss-verification.md)（#1965。オーナー承認待ち。実機前提の試験 `power_loss` は用意済みで実行は人間）

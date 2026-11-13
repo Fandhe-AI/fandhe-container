@@ -14,8 +14,12 @@
 //!    `configs`）は、子キーをユーザー定義名とみなして `<P>.*` で記録し、その値へ降りる。名前はパスに入れない。
 //! 3. それ以外のマッピングは、表に `<P>.` で始まる行があるときだけ子 `<P>.<key>` を記録して降りる。
 //!    表に行のある段より下には降りない（`healthcheck`・`environment`・`labels`・`ulimits`・`depends_on`・
-//!    `deploy.resources.limits` の中身・`x-*` の中身。[`crate::classify::UNSCANNED_KEY_PREFIXES`] と整合）。
+//!    `deploy.resources.limits`・`deploy.resources.reservations.devices` の中身・`x-*` の中身。
+//!    [`crate::classify::UNSCANNED_KEY_PREFIXES`] と整合し、試験で機械照合する）。
 //!    表に無い子（例 `deploy.resources.foo`）は記録して Unrecognized になる（fail-closed）。
+//!    降りない段のうち compose-spec が `^x-` を許す位置（[`crate::classify::EXTENSION_KEY_PARENTS`]）だけは、
+//!    直下の `x-*` に限って `<親>.<x-キー>` を記録する（利用者定義の名前の段は `*`。値の中へは降りない）。
+//!    変換器はこれらを drop に数えない（無視してよいキー。Warning）。
 //! 4. シーケンスとスカラーには降りない（要素の変換は `convert` の担当）。型が想定と違っても panic しない。
 //! 5. `services.*.network_mode` は値で分類を重くする（`host`・`container:` は error-incompatible）。
 //! 6. `services.*.volumes` の要素が Docker ソケットの bind なら、`services.*.volumes` を
@@ -25,10 +29,11 @@
 //! 再帰の深さはパーサーの深さ予算に、異なるパスの数は [`crate::report::MAX_KEY_PATHS`] に縛られる。
 
 use crate::classify::{
-    KEY_CLASS_TABLE, KeyClass, classify_key_path, classify_network_mode_value,
-    is_docker_socket_bind, is_docker_socket_source,
+    EXTENSION_KEY_PARENTS, KEY_CLASS_TABLE, KeyClass, classify_key_path,
+    classify_network_mode_value, is_docker_socket_bind, is_docker_socket_source,
 };
 use crate::compose_convert::{ComposeDocument, ComposeMapping, ComposeValue};
+use crate::gpu_reservation::DEVICES_KEY_PATH;
 use crate::report::KeyOccurrences;
 
 const NETWORK_MODE: &str = "services.*.network_mode";
@@ -81,10 +86,54 @@ fn scan_mapping(map: &ComposeMapping, parent: Option<&str>, occ: &mut KeyOccurre
             (Some(p), false) => format!("{p}.{}", escape_segment(key)),
         };
         record_entry(&path, value, occ);
+        record_extension_keys(&path, value, occ);
         if let ComposeValue::Mapping(child) = value
             && table_has_prefix(&path)
         {
             scan_mapping(child, Some(&path), occ);
+        }
+    }
+}
+
+/// `x-` で始まる子キーだけを `<parent>.<key>` で Warning として記録する。値の中へは降りない。
+fn record_extension_children(parent: &str, map: &ComposeMapping, occ: &mut KeyOccurrences) {
+    for (key, value) in map.iter() {
+        if key.starts_with("x-") {
+            record_entry(&format!("{parent}.{}", escape_segment(key)), value, occ);
+        }
+    }
+}
+
+/// 降りない段のうち compose-spec が `^x-` を許す位置（[`EXTENSION_KEY_PARENTS`]）の `x-*` を限定して記録する
+/// （STACK-3・#4637）。変換器は同じキーを drop に数えないため、レポートに痕跡を残す役を担う。
+/// 型が想定と違えば何も記録しない。さらに下へは降りない。
+fn record_extension_keys(path: &str, value: &ComposeValue, occ: &mut KeyOccurrences) {
+    if EXTENSION_KEY_PARENTS.contains(&path) {
+        match value {
+            // `devices` 自体はシーケンス。マッピングなら要素ではないので親として扱わない。
+            ComposeValue::Mapping(m) if path != DEVICES_KEY_PATH => {
+                record_extension_children(path, m, occ);
+            }
+            // シーケンスは GPU 予約の要素だけ（healthcheck 等がシーケンスなら親ではない）。
+            ComposeValue::Sequence(items) if path == DEVICES_KEY_PATH => {
+                for item in items {
+                    if let ComposeValue::Mapping(m) = item {
+                        record_extension_children(path, m, occ);
+                    }
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+    let named = format!("{path}.*");
+    if EXTENSION_KEY_PARENTS.contains(&named.as_str())
+        && let ComposeValue::Mapping(m) = value
+    {
+        for (_, child) in m.iter() {
+            if let ComposeValue::Mapping(c) = child {
+                record_extension_children(&named, c, occ);
+            }
         }
     }
 }
@@ -160,6 +209,78 @@ mod tests {
         assert_eq!(o.unrecognized_count(), 0);
         let o = scan("services:\n  a:\n    deploy:\n      resources:\n        foo: 1\n");
         assert_eq!(o.unrecognized_count(), 1);
+    }
+
+    /// STACK-3・#4637: `deploy.resources` の子の分類と、降りない段の下を記録しないこと。
+    #[test]
+    fn stack3_deploy_resources_children_classified() {
+        let o = scan(
+            "services:\n  a:\n    deploy:\n      resources:\n        foo: 1\n        limits: {cpus: '1', bar: 2}\n        reservations:\n          cpus: 1\n          devices: [{driver: nvidia, qux: 1}]\n",
+        );
+        let class = |p: &str| o.get(p).map(|e| e.class);
+        assert_eq!(
+            class("services.*.deploy.resources.limits"),
+            Some(KeyClass::Convert)
+        );
+        assert_eq!(
+            class("services.*.deploy.resources.reservations"),
+            Some(KeyClass::Convert)
+        );
+        assert_eq!(
+            class("services.*.deploy.resources.reservations.devices"),
+            Some(KeyClass::Convert)
+        );
+        assert_eq!(
+            class("services.*.deploy.resources.reservations.cpus"),
+            Some(KeyClass::ErrorUnsupportedYet)
+        );
+        assert_eq!(
+            class("services.*.deploy.resources.foo"),
+            Some(KeyClass::Unrecognized)
+        );
+        assert!(o.get("services.*.deploy.resources.limits.cpus").is_none());
+        assert!(o.get("services.*.deploy.resources.limits.bar").is_none());
+        assert!(
+            o.get("services.*.deploy.resources.reservations.devices.qux")
+                .is_none()
+        );
+    }
+
+    /// STACK-3・#4637: 降りない段の `x-*` は Warning で記録する。名前の段は `*`、値の中へは降りない。
+    #[test]
+    fn stack3_extension_keys_recorded_as_warning() {
+        let o = scan(
+            "services:\n  a:\n    healthcheck: {test: [CMD, a], x-a: {inner: 1}}\n    depends_on:\n      db: {condition: service_started, x-c: 1}\n    ulimits:\n      nofile: {soft: 1, hard: 2, x-d: 1}\n    deploy:\n      resources:\n        limits: {x-b: 1}\n        reservations:\n          devices: [{driver: nvidia, x-e: 1}]\n",
+        );
+        for p in [
+            "services.*.healthcheck.x-a",
+            "services.*.deploy.resources.limits.x-b",
+            "services.*.depends_on.*.x-c",
+            "services.*.ulimits.*.x-d",
+            "services.*.deploy.resources.reservations.devices.x-e",
+        ] {
+            let e = o.get(p).unwrap_or_else(|| panic!("missing {p}"));
+            assert_eq!((e.class, e.occurrences), (KeyClass::Warning, 1), "{p}");
+        }
+        assert!(o.get("services.*.healthcheck.x-a.inner").is_none());
+        assert!(
+            o.iter()
+                .all(|(p, _)| !p.contains("nofile") && !p.contains("db"))
+        );
+        assert_eq!(o.unrecognized_count(), 0);
+    }
+
+    /// STACK-3・#4637 陰性対照: 利用者のデータ側の `x-` や想定外の型では記録しない。
+    #[test]
+    fn stack3_extension_keys_not_recorded_for_user_data() {
+        let o = scan(
+            "services:\n  a:\n    environment: {x-foo: v}\n    labels: {x-l: v}\n    depends_on: {x-db: {condition: service_started}}\n    ulimits: {x-n: 1}\n",
+        );
+        assert!(o.iter().all(|(p, _)| !p.contains("x-")));
+        let o = scan(
+            "services:\n  a:\n    depends_on: [x-db]\n    ulimits: {nofile: 1}\n    healthcheck: [x-a]\n    deploy: {resources: {reservations: {devices: {x-e: 1}}}}\n",
+        );
+        assert!(o.iter().all(|(p, _)| !p.contains("x-")));
     }
 
     /// STACK-3: キー内の `.`・`*` を階層として解釈させて fail-closed を回避できない。

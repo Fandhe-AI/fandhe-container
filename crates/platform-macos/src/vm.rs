@@ -945,8 +945,8 @@ mod mac {
     use super::{
         AbandonOutcome, BeginOutcome, Core, EVENT_CHANNEL_CAPACITY, ErrInfo,
         GRACEFUL_POLL_INTERVAL, LifecycleInput, OpTicket, OpTimeouts, RequestOutcome,
-        ShutdownOutcome, VmError, VmEvent, VmOp, VmState, await_op_result, event_channel,
-        run_graceful_stop,
+        STOPPING_SETTLE, ShutdownOutcome, VmError, VmEvent, VmOp, VmState, await_op_result,
+        event_channel, run_graceful_stop,
     };
     use crate::config::{
         VmConfigSpec, VzVmConfiguration, build_vz_configuration, build_vz_configuration_within,

@@ -78,6 +78,10 @@ Kconfig は依存が満たされない記号を黙って落とすので、`build
 | モジュール | `MODULES` 無効 | init（#1875）はモジュールをロードせず、initrd（#1878）は init だけを梱包するため、すべて組み込みにする |
 | initramfs | `BLK_DEV_INITRD`・`RD_GZIP` | `FANDHE_CONTAINER_MACOS_VM_INITRD` で渡す initramfs（圧縮形式は gzip の newc。`scripts/build-guest-initrd.sh`〔#1878〕が `init` 1 個だけの gzip 圧縮 cpio を作るため前提どおり） |
 | /dev | `DEVTMPFS`・`DEVTMPFS_MOUNT` | `/dev` の供給 |
+| namespace | `NAMESPACES`・`USER_NS`・`PID_NS`・`NET_NS`・`UTS_NS`・`IPC_NS`（`SYSVIPC`・`POSIX_MQUEUE`） | ゲスト内のコンテナ分離（MAC-4・TASK-191・#2276）。rootless は `USER_NS`（SEC-5・CORE-6） |
+| cgroup v2 | `CGROUPS`・`MEMCG`・`CGROUP_SCHED`・`FAIR_GROUP_SCHED`・`CFS_BANDWIDTH`・`CGROUP_PIDS`・`BLK_CGROUP`・`BLK_DEV_THROTTLING`・`BLK_CGROUP_IOCOST` | memory・cpu・pids・io の 4 controller（`memory.max`・`cpu.weight`/`cpu.max`・`pids.max`・`io.max`/`io.weight`。#4658 の委譲対象。CORE-4） |
+| seccomp | `SECCOMP`・`SECCOMP_FILTER` | CORE-5。user notification も使える |
+| Landlock | `SECURITY`・`SECURITY_LANDLOCK`・`CONFIG_LSM="landlock"` | core は ABI 6 以上を要し、6.18 で満たす。`CONFIG_LSM` に名前が無いと起動時に無効になるため明示する（文字列の記号は残存照合の対象外で、自己テストの静的検査で守る） |
 | 転送 | `PCI`・`PCI_HOST_GENERIC`・`VIRTIO_PCI`・`VIRTIO_MMIO` | VZ の arm64 が virtio を PCI と MMIO のどちらで出すかが未確認のため両方 |
 | コンソール | `VIRTIO_CONSOLE` | `console=hvc0`、`vm_boot` のブートマーカー |
 | ブロック | `BLOCK`・`VIRTIO_BLK` | `FANDHE_CONTAINER_MACOS_VM_DISK_IMAGE` |
@@ -85,6 +89,8 @@ Kconfig は依存が満たされない記号を黙って落とすので、`build
 | vsock | `NET`・`VSOCKETS`・`VIRTIO_VSOCKETS` | ホストとゲストの制御経路（MAC-1） |
 | virtio-gpu | `DRM`・`DRM_VIRTIO_GPU` | GPU-6 と `poc/vz-custom-virtio-gpu/guest/check-virtio-gpu.sh` |
 | 乱数 | `HW_RANDOM`・`HW_RANDOM_VIRTIO` | VZ のエントロピーデバイス。不要と判断したら外す |
+
+意図して入れない記号（#2276）: `MEMCG_V1`・`CPUSETS_V1`（cgroups v2 単独。CORE-4・SEC-6。自己テストで =y が無いことを照合）、`CPUSETS`（委譲対象の 4 controller に無い）、`TIME_NS`（core が `CLONE_NEWTIME` を使わない）、`BPF_SYSCALL`・`CGROUP_BPF`（rootless ではデバイス cgroup の eBPF を適用しない。攻撃面を増やさない）、`SWAP`（ゲストに swap デバイスが無い。`memory.swap.max` は無ければ fail-closed）。
 
 init（#1875）への申し送り: `DEVTMPFS_MOUNT` は initramfs 起動には効かないため、init が自分で `/dev` を mount する必要があります。
 `DEVTMPFS_MOUNT` が効く起動（initramfs の `/init` を使わずディスクの root から起動し、カーネルが `/dev` を先に mount する場合）でも、既存のマウントポイントへの重ね掛けは許されるため、init の devtmpfs の mount は通常 `EBUSY` にならず、新規 mount として成功します（`classify_dev_mount` は Fresh を返し、既存 mount の検査は通りません）。init の mount が実際に `EBUSY` を受けた場合に限り、init は `/proc` の mount 後に mountinfo で `/dev` が `devtmpfs` かつ `nosuid`・`noexec` であることを確かめ、満たさなければ `stage=dev errno=16` を出して `READY_MARKER` を出さずに止まります（[`init.rs`](../../crates/guest-init/src/init.rs) の `classify_dev_mount`・`verify_existing_dev`、検査は [`mountinfo.rs`](../../crates/guest-init/src/mountinfo.rs) の `check_dev_hardened`。#2139）。本構成は `DEVTMPFS_SAFE` を有効にしておらずカーネルの自動 mount に `nosuid`・`noexec` が付かないため、`EBUSY` を受けた場合のこの経路では止まります（自動 mount 済みでも重ね掛けが成功すれば止まりません。現行の initramfs 起動では `EBUSY` の分岐に入りません）。
@@ -97,7 +103,8 @@ init（#1875）への申し送り: `DEVTMPFS_MOUNT` は initramfs 起動には�
 - macOS ホストでのビルド
 - `sha256sums.asc` の署名検証の実施有無（上記）
 - 設定フラグメントがこの版で全記号を残すか（実ビルドで確認。結果は #1628 へ）
-- コンテナ実行に要る namespace・cgroups・seccomp・overlayfs の記号は含めていない（ゲスト側の実行方式を実装するときに追加する。`docs/design/macos-vm-strategy.md`）
+- namespace・cgroup v2・seccomp・Landlock の記号は #2276 で足した。実ビルドで全記号が残るか、実 VM で動くかは未検証（#1628・#2282 で確かめる）
+- ゲスト内のコンテナ実行に要る残りの記号（`OVERLAY_FS`・`UNIX`・`INET`・`AUDIT`）は未追加（#4749 で扱う。`docs/design/macos-vm-strategy.md`）
 
 ## 実ビルドの記録
 

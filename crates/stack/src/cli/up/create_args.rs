@@ -223,7 +223,7 @@ pub fn create_argv(
 /// image の Entrypoint・Cmd とサービスの `entrypoint`・`command` から `process.args` を合成する（compose の意味論）。
 ///
 /// `entrypoint` を指定すると image の Entrypoint を置き換え、image の Cmd も捨てる。`command` は image の Cmd を置き換える。
-/// 結果が空なら起動できないため `Invalid { field: "command" }`。要素に NUL を含むものも拒否する。
+/// 結果が空、または先頭が空文字なら起動できないため `Invalid { field: "command" }`。要素に NUL を含むものも拒否する。
 pub fn process_args(
     spec: &Service,
     image_entrypoint: &[String],
@@ -236,7 +236,8 @@ pub fn process_args(
         (None, None) => image_cmd,
     };
     let args: Vec<String> = entrypoint.iter().chain(cmd).cloned().collect();
-    if args.is_empty() || args.iter().any(|a| a.contains('\0')) {
+    // 先頭（実行ファイル）が空文字なら core の `build_spec_with_swap` が start で拒否するため、ここで拒否する。
+    if args.first().is_none_or(String::is_empty) || args.iter().any(|a| a.contains('\0')) {
         return Err(CreateArgsError::Invalid { field: "command" });
     }
     Ok(args)
@@ -567,6 +568,10 @@ mod tests {
         let mut s = base();
         s.command = Some(v(&["a\0b"]));
         assert!(process_args(&s, &ie, &ic).is_err());
+        // 先頭が空文字（entrypoint = [""]）も拒否する。
+        let mut empty_head = base();
+        empty_head.entrypoint = Some(vec![String::new()]);
+        assert!(process_args(&empty_head, &ie, &ic).is_err());
     }
 
     /// STACK-8・#4638: process.cwd は working_dir ＞ image の WorkingDir ＞ `/`。相対パスは拒否する。

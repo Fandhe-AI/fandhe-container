@@ -19,7 +19,7 @@
 //! 有界性（REPAIR-5）: 待ちは必ず期限で終わる。間隔・期限は 0 を拒否し上限を持つ。
 //! 外部入力（health の文字列）は完全一致で解釈し、未知の値は healthy とみなさない
 //! （fail-closed）。残余: 監視権を取る前に古い世代の `healthy` を読む窓は、新しいコンテナを
-//! 作る `up` では前の世代が無いため生じない。エラーにはサービス名と固定の英語文だけを入れる。
+//! 作る `up` では前の世代が無いため生じない。エラーの `Display` には名前を出さず固定の英語文だけを出す（名前はフィールドに持つ。ERR-1・SEC-1）。
 
 use std::fmt;
 use std::time::{Duration, Instant};
@@ -281,8 +281,9 @@ impl HealthyWaitError {
 impl fmt::Display for HealthyWaitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Source { service, error } => {
-                write!(f, "{}: {} ({})", self.message(), service, error)
+            // サービス名は untrusted のため Display に出さない（ERR-1・SEC-1）。
+            Self::Source { error, .. } => {
+                write!(f, "{} ({})", self.message(), error.code())
             }
         }
     }
@@ -756,7 +757,7 @@ image = "x"
             assert_eq!(e.exit_code().get(), 7);
             assert_eq!(
                 e.to_string(),
-                "timed out waiting for a dependency condition: app -> a (healthy)"
+                "timed out waiting for a dependency condition (healthy)"
             );
             assert!(!s.1.iter().any(|n| n == "b"));
         }
@@ -829,5 +830,22 @@ image = "x"
             polls: 3,
         });
         assert_eq!(b.into_result("app").unwrap_err().exit_code().get(), 7);
+    }
+
+    /// STACK-2・ERR-1・SEC-1: 悪意ある名前でも `Display` は固定文と source の code だけ。
+    #[test]
+    fn stack_2_healthy_wait_error_display_hides_names() {
+        let evil = "a\u{1b}[31m\n\u{202e}c";
+        let e = HealthyWaitError::Source {
+            service: evil.into(),
+            error: HealthSourceError::new("STATE_CORRUPT", "state is corrupt"),
+        };
+        assert_eq!(
+            e.to_string(),
+            "failed to observe dependency health (STATE_CORRUPT)"
+        );
+        match e {
+            HealthyWaitError::Source { service, .. } => assert_eq!(service, evil),
+        }
     }
 }

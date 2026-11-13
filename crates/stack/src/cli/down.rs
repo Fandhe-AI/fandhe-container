@@ -17,7 +17,7 @@
 //! - 本番の [`ServiceStopper`]（CLI の `stop` を子プロセスで呼ぶ）、CLI 結線、TOML parse の入口
 //! - コンテナ・ネットワークの削除、`UpFailure::launched` を使った部分集合の停止
 //!
-//! エラーと報告にはサービス名と固定文字列だけを入れ、`Service` の内容（`env` に資格情報を含みうる）は入れない。
+//! エラーの `Display` には名前を出さず（フィールドに構造化して持つ。ERR-1・SEC-1）、`Service` の内容（`env` に資格情報を含みうる）は入れない。
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -161,10 +161,11 @@ impl fmt::Display for DownError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Plan(e) => e.fmt(f),
-            Self::Stop { service, source } => {
-                write!(f, "{}: {} ({})", self.message(), service, source.code())
+            // サービス名は untrusted のため Display に出さない（ERR-1・SEC-1）。フィールドで得る。
+            Self::Stop { source, .. } => {
+                write!(f, "{} ({})", self.message(), source.code())
             }
-            Self::Internal { service } => write!(f, "{}: {}", self.message(), service),
+            Self::Internal { .. } => f.write_str(self.message()),
         }
     }
 }
@@ -278,7 +279,7 @@ mod tests {
         assert_eq!(stop.code(), "SERVICE_STOP_FAILED");
         assert_eq!(stop.message(), "failed to stop a service");
         assert_eq!(stop.exit_code().get(), 1);
-        assert_eq!(stop.to_string(), "failed to stop a service: b (X)");
+        assert_eq!(stop.to_string(), "failed to stop a service (X)");
         let internal = DownError::Internal {
             service: "b".into(),
         };
@@ -295,5 +296,31 @@ mod tests {
         });
         assert_eq!(unknown.code(), "UNKNOWN_DEPENDENCY");
         assert_eq!(unknown.exit_code().get(), 2);
+    }
+
+    /// STACK-8・ERR-1・SEC-1: 悪意ある名前でも `Display` は固定文で、名前はフィールドに残る。
+    #[test]
+    fn stack_8_down_error_display_hides_names() {
+        let evil = "a\u{1b}[31m\n\u{202e}c";
+        let stop = DownError::Stop {
+            service: evil.into(),
+            source: StopError::new("STOP_X", "y"),
+        };
+        assert_eq!(stop.to_string(), "failed to stop a service (STOP_X)");
+        let internal = DownError::Internal {
+            service: evil.into(),
+        };
+        assert_eq!(
+            internal.to_string(),
+            "internal inconsistency in the shutdown plan"
+        );
+        match stop {
+            DownError::Stop { service, .. } => assert_eq!(service, evil),
+            other => panic!("unexpected: {other:?}"),
+        }
+        match internal {
+            DownError::Internal { service } => assert_eq!(service, evil),
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 }

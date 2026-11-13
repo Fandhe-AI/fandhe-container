@@ -9,7 +9,7 @@
 //! 常駐デーモンの無い CLI（CORE-1）に「起動時に 1 回」は無いため、起動点は次の 2 つ。
 //!
 //! - 契機 A: `create --image-root --image` の core 呼び出し前（[`reclaim_stale_ref_for_create`]）。同じ参照キー 1 件
-//! - 契機 B: `image rm` が使用中で拒否したとき（[`reconcile_in_use`]）。拒否に載った参照のうち現在の状態ルートのもの
+//! - 契機 B: `image rm` が使用中で拒否したとき、および `image prune` の実行前（[`reconcile_in_use`]）。候補に載った参照のうち現在の状態ルートのもの
 //!
 //! 未確定参照の回収は create ゲートの排他の下（`ImageStore::quiesce_container_creates`）に限る。排他が取れない
 //! （進行中の create がある・期限切れ）ときは回収せず、余分に残す側に誤る（OCI-7）。設計は
@@ -24,7 +24,7 @@
 //!
 //! - 畳んだ参照キー（223 バイト以上の ID の `<scope>-<hash>`）は元の ID を復元できないため、契機 B では回収しない
 //!   （契機 A は元の ID を知っているので回収できる。キー形式は #2500）
-//! - `image prune` の CLI は未配線。配線時に同じ契機 B のヘルパーを呼ぶ
+//! - `image prune` は #2384 で配線済みで、実行前にタグ無し manifest のコンテナ参照を候補として同じ契機 B のヘルパーを呼ぶ
 //! - 結果は stderr へ出さない（OCI create / delete 互換の無出力を保つ）。計測（REPAIR-4）へ記録する
 
 use std::collections::BTreeSet;
@@ -210,6 +210,15 @@ pub(super) fn reclaim_stale_ref_recorded(
 ///
 /// 状態ストアを開けない・解決できないときは何もしない（従来どおり拒否に進む）。
 pub(super) fn reconcile_for_image_rm(
+    global: &GlobalArgs,
+    images: &ImageStore,
+    candidates: &[ContainerRefId],
+) {
+    reconcile_for_image_gc(global, images, candidates);
+}
+
+/// `image rm` の拒否時と `image prune` の実行前に共有する契機 B の本体（#2495・#2384。計測名は `image_ref_reconcile`）。
+pub(super) fn reconcile_for_image_gc(
     global: &GlobalArgs,
     images: &ImageStore,
     candidates: &[ContainerRefId],

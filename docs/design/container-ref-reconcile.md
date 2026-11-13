@@ -53,8 +53,8 @@ CLI の表面・3 OS の parity スクリプトへの波及を避けるため。
 | B: `image rm` が使用中で拒否したとき | 拒否に載った参照のうち現在の状態ルートのもの（上限 256 件） | ガードを手放した状態でゲート排他 → `reconcile_container_refs_quiesced`。その後に同じ判定をやり直す。排他が取れない・状態ストアが開けないときは照合を飛ばし従来どおり拒否 |
 
 契機 A が「同じ ID の恒久的な `ALREADY_EXISTS`」と「delete が解除できずに残した確定済み参照」を解く（照合は後追いの回収役）。
-契機 B が「manifest が使用中のまま GC から守られ続ける」を解く。`image prune` の CLI は未配線（#2384）で、配線時に同じヘルパー
-（`ref_reconcile::reconcile_in_use`）を呼ぶ。
+契機 B が「manifest が使用中のまま GC から守られ続ける」を解く。`image prune` も実行前に同じヘルパー
+（`ref_reconcile::reconcile_for_image_gc` → `reconcile_in_use`）を呼ぶ（#2384）。候補はタグが 0 件でコンテナ参照のある manifest の参照で、ガードを手放した状態で照合し、もう一度ガードを取って prune を実行する。
 
 ## 決定 3: probe と状態ルートのスコープ
 
@@ -95,7 +95,7 @@ bundle の意図の記録（journal）を入れても、それを読んで掃引
 - 旧形式（FNV）のキーは移行しない。本番では在庫を埋める経路が無く `register` が常に `NOT_FOUND` のため本番のストアに参照は無い。開発・試験環境に旧キーが残ると別の状態ルートのキーとして扱われ、delete は外さず契機 B は回収しない（守りすぎの側）。回復はそのストアの `@container-refs.json` を消すかストアを作り直す
 - 契機 B はゲート排他を取れない（進行中の create がある）間は何もしない。次の `image rm` の再実行で回収される
 - ゲートを使わない `create_with_image` の呼び出し元（plugin 経由の配線等）を新設するときは、同じ規約（共有を保持して包む）を守る
-- `image prune` の CLI 配線は #2384
+- `image prune` の CLI 配線は #2384 で実施済み（契機 B を実行前に呼ぶ）
 
 ## delete 自身の解除（#2499・OCI-7・OCI-5・CLI-1）
 

@@ -89,7 +89,7 @@ use std::fmt;
 // ハンドラ経由の `SeccompDenialReport::from_sigsys` は使えない。正の記録（syscall・arch・pid）は
 // カーネルの `AUDIT_SECCOMP`、補助は本番 launcher の回収点が出す `exit_signal` レコード（#2004。
 // syscall は推測しない）。ESC-06 の `AuditExpectation::Deferred`（`escape_suite`）から `Required` への
-// 切り替えは、読み手の設計と複数スレッド・rootless・子孫での確実な記録の結論（#2236・#2237）の後に行う（#2028）。
+// 切り替えは行わない。#2237 の決定（D1 A・D2 A。2026-11-13）で `Deferred` のまま確定した。残りは #4720（#2028）。
 //
 // 強制終了の範囲を広げる候補（既定は変えない。判断はオーナーが行う）: `kexec_file_load`
 // （`kexec_load` と同じ脅威）・`setns`（namespace 脱出。ランタイムの exec 経路は seccomp 適用前に

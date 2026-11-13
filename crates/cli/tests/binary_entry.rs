@@ -2,6 +2,10 @@
 //!
 //! 実バイナリを起動し、終了コード・stderr の 1 行 JSON・stdout が空であることを具体値で照合する。
 
+// 「1 行 1 JSON」の共有検査器（ERR-4・#3122。plugin 配下の試験部品。cli は serde_json を持たない）。
+#[path = "../../plugin/tests/support/json_lines_contract.rs"]
+mod json_lines_contract;
+
 use std::io::Read;
 use std::process::{Command, Output, Stdio};
 use std::sync::mpsc;
@@ -253,6 +257,32 @@ fn cli1_no_args_is_usage_error() {
 fn cli1_unknown_command_is_usage_error() {
     for a in ["run", "Create", "", "--help", "a\"b\\c"] {
         assert_failure(&run(&[a]), 2, USAGE_JSON);
+    }
+}
+
+/// ERR-4・#3122: 実バイナリの stderr の全行が「1 行 1 JSON」の契約を満たす。敵対的で長い引数
+/// （改行・制御文字・引用符・巨大な長さ。Windows 以外は 32 KiB 超、Windows は起動上限内の約 30,000 文字）は行へ埋め込まれず、使い方エラーの固定の 1 行のままである。
+#[test]
+fn err4_3122_real_binary_stderr_is_one_json_line() {
+    // Windows の CreateProcessW はコマンドライン全体で 32,767 UTF-16 単位が上限のため、起動できる長さに分ける。
+    let long_len = if cfg!(windows) { 30_000 } else { 40_000 };
+    let long = "x".repeat(long_len);
+    // argv は NUL を持てないため除く。
+    let hostile = json_lines_contract::HOSTILE_TEXT.replace('\0', "");
+    let args = [hostile.as_str(), long.as_str(), "\n{\"event\":\"forged\"}"];
+    for a in args {
+        let out = run(&[a]);
+        let facts = json_lines_contract::check_stream(
+            &out.stderr,
+            json_lines_contract::SHARED_MAX_LOG_LINE_BYTES,
+        )
+        .expect("stderr must be one JSON object per line");
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].event, "cli_error");
+        assert_eq!(facts[0].level.as_deref(), Some("error"));
+        assert_eq!(facts[0].str_of("code"), Some("INVALID_ARGUMENT"));
+        assert_eq!(out.stderr, USAGE_JSON.as_bytes());
+        assert!(out.stdout.is_empty());
     }
 }
 
@@ -2749,7 +2779,7 @@ fn doctor_rejects_extra_arguments() {
 }
 
 /// `image` 系の stderr 1 行 JSON（op なし）を組み立てる。
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn image_err(code: &str, message: &str) -> String {
     format!(
         "{{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"{code}\",\"message\":\"{message}\"}}\n"
@@ -4509,4 +4539,177 @@ fn repair4_net6_cli1_3577_create_named_network_success_records_two_groups() {
     );
     assert_op_log_groups(&log, &[&[("create", 0, 1)], store_group]);
     let _ = std::fs::remove_dir_all(dir);
+}
+/// `image` 系の試験用に、0700 の image root（`blobs/sha256` つき）を作る。
+#[cfg(target_os = "linux")]
+fn make_image_root(root: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::create_dir_all(root.join("blobs").join("sha256")).expect("mkdir image root");
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+}
+
+/// CLI-1・OCI-7（#2384）: `image prune` の位置引数・`--force`・相対パスは INVALID_ARGUMENT（終了コード 2）。
+/// 引数の解析は OS 分岐より先なので 3 OS 共通。stdout は空。
+#[test]
+fn cli1_image_prune_rejects_bad_args() {
+    for args in [
+        vec!["image", "prune", "extra"],
+        vec!["image", "prune", "--force"],
+        vec!["image", "prune", "--image-root", "rel"],
+    ] {
+        let out = run(&args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(out.stdout.is_empty(), "{args:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("\"code\":\"INVALID_ARGUMENT\""),
+            "{args:?}"
+        );
+    }
+}
+
+/// CLI-1・OCI-7（#2384）: 空のイメージストアの `image prune` は `reclaimed-bytes\t0` だけで終了コード 0。
+#[cfg(target_os = "linux")]
+#[test]
+fn cli1_oci7_image_prune_empty_store_on_linux() {
+    let tmp = TmpDir::new("prune-empty");
+    let root = tmp.0.join("images");
+    make_image_root(&root);
+    let out = run(&[
+        "image",
+        "prune",
+        "--image-root",
+        root.to_str().expect("utf8"),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "reclaimed-bytes\t0\n");
+    assert!(out.stderr.is_empty(), "stderr must be empty");
+}
+
+/// CLI-1・OCI-7（#2384）: タグもコンテナ参照も無い公開済みイメージは `image prune` で manifest と blob が消える。
+#[cfg(target_os = "linux")]
+#[test]
+fn cli1_oci7_image_prune_removes_seeded_untagged_image_on_linux() {
+    use fandhe_container_oci::image_management::ImageStore;
+    let tmp = TmpDir::new("prune-seeded");
+    let root = tmp.0.join("images");
+    make_image_root(&root);
+    let seeded = {
+        let store = ImageStore::open(&root).expect("open images");
+        image_fixture::seed_image(
+            &store,
+            "prune-1",
+            &image_fixture::three_layer_tars(),
+            None,
+            true,
+        )
+    };
+    let blobs = root.join("blobs").join("sha256");
+    let blob_path = |d: &fandhe_container_oci::reference::Digest| {
+        blobs.join(d.as_str().strip_prefix("sha256:").expect("sha256"))
+    };
+    assert!(blob_path(&seeded.config).exists());
+    let out = run(&[
+        "image",
+        "prune",
+        "--image-root",
+        root.to_str().expect("utf8"),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        stdout.starts_with(&format!("deleted\t{}\n", seeded.manifest.as_str())),
+        "{stdout}"
+    );
+    let mut expected_blobs: Vec<String> = std::iter::once(&seeded.config)
+        .chain(seeded.layers.iter())
+        .map(|d| d.as_str().to_owned())
+        .collect();
+    expected_blobs.sort();
+    expected_blobs.dedup();
+    let got: Vec<String> = stdout
+        .lines()
+        .filter_map(|l| l.strip_prefix("deleted-blob\t").map(str::to_owned))
+        .collect();
+    assert_eq!(got, expected_blobs, "{stdout}");
+    assert!(
+        stdout
+            .lines()
+            .last()
+            .is_some_and(|l| l.starts_with("reclaimed-bytes\t")),
+        "{stdout}"
+    );
+    assert!(!blob_path(&seeded.config).exists());
+    for l in &seeded.layers {
+        assert!(!blob_path(l).exists());
+    }
+    assert!(out.stderr.is_empty(), "stderr must be empty");
+}
+
+/// CLI-1・OCI-7・OCI-5（#2384）: Linux で `--image-root` を省いた `image ls` は `<--root>/.cri/images` を読む。
+#[cfg(target_os = "linux")]
+#[test]
+fn cli1_oci7_image_ls_defaults_to_state_root_cri_images_on_linux() {
+    let tmp = TmpDir::new("ls-default");
+    let state = tmp.0.join("state");
+    make_image_root(&state.join(".cri").join("images"));
+    {
+        // 祖先は group / other 書き込み不可でなければならない（umask に依存せず 0700 に固定。#2547）。
+        use std::os::unix::fs::PermissionsExt as _;
+        for d in [state.clone(), state.join(".cri")] {
+            std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        }
+    }
+    let out = run(&["--root", state.to_str().expect("utf8"), "image", "ls"]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "REPOSITORY\tTAG\tDIGEST\tSIZE\tMISSING\n"
+    );
+    assert!(out.stderr.is_empty(), "stderr must be empty");
+}
+
+/// CLI-1・OCI-7（#2384）: 既定の位置が無ければ NOT_FOUND（終了コード 3）で、何も作らない。
+#[cfg(target_os = "linux")]
+#[test]
+fn cli1_oci7_image_ls_default_root_missing_is_not_found_on_linux() {
+    let tmp = TmpDir::new("ls-default-missing");
+    let state = tmp.0.join("state");
+    let out = run(&["--root", state.to_str().expect("utf8"), "image", "ls"]);
+    assert_eq!(out.status.code(), Some(3), "{out:?}");
+    assert!(out.stdout.is_empty(), "stdout must be empty");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        image_err("NOT_FOUND", "image store root not found")
+    );
+    assert!(!state.exists(), "default resolution must not create dirs");
+}
+
+/// CLI-1・MAC-4（#2384・#2431 案 A）: macOS ホストは `--root` があっても既定の image root を持たず、固定文言で拒否する。
+#[cfg(target_os = "macos")]
+#[test]
+fn mac4_image_ls_without_image_root_is_failed_precondition() {
+    let tmp = TmpDir::new("ls-mac-default");
+    let out = run(&["--root", tmp.0.to_str().expect("utf8"), "image", "ls"]);
+    assert_failure(
+        &out,
+        5,
+        &image_err(
+            "FAILED_PRECONDITION",
+            "default image root is not defined on a macOS host by design; pass --image-root or use the Linux guest path",
+        ),
+    );
+}
+
+/// CLI-1・WIN-1（#2384）: Windows ホストは既定の image root を持たず `UNIMPLEMENTED` で拒否する。
+#[cfg(windows)]
+#[test]
+fn win1_image_ls_without_image_root_is_unimplemented() {
+    let out = run(&["image", "ls"]);
+    assert!(out.stdout.is_empty(), "stdout must be empty");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("\"code\":\"UNIMPLEMENTED\""), "{stderr}");
+    assert!(
+        stderr.contains("default image root is defined only inside a Linux guest"),
+        "{stderr}"
+    );
 }

@@ -464,6 +464,16 @@ pub struct PathSearchWarning {
 }
 
 impl PathSearchWarning {
+    /// 試験専用: 任意の名前・パスで警告を組む（ERR-4 の横断照合〔#3122〕が、敵対的なパスを
+    /// 実際の書き出し口 [`Self::write_line`] へ通すため。製品の rlib には入らない）。
+    #[cfg(test)]
+    pub(crate) fn for_test(name: &str, path: PathBuf) -> Self {
+        Self {
+            name: name.to_owned(),
+            path,
+        }
+    }
+
     /// 候補の plugin 名を返す。
     pub fn name(&self) -> &str {
         &self.name

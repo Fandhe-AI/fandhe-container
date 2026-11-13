@@ -101,3 +101,7 @@ pub use uds_security::{
 #[cfg(test)]
 #[path = "../../oci/tests/support/test_root.rs"]
 mod test_root;
+
+// 「1 行 1 JSON」の共有検査器による構造化ログの横断照合（ERR-4・#3122・#3114 の判断 (f)）。試験専用。
+#[cfg(test)]
+mod err4_cross_check;

@@ -330,6 +330,23 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Mutex;
 
+    /// ERR-4・#3122: 監査 sink の作成失敗通知は level なしの固定スキーマ 1 行 1 JSON。
+    #[test]
+    fn err4_3122_audit_sink_unavailable_line() {
+        use crate::json_lines_contract::{SHARED_MAX_LOG_LINE_BYTES, check_stream};
+        let sink = UnavailableAuditSink(TraitError::new(ErrorCode::Internal, "a\nb"));
+        let mut buf = Vec::new();
+        sink.write_json_line(&mut buf).unwrap();
+        let f = &check_stream(&buf, SHARED_MAX_LOG_LINE_BYTES).unwrap()[0];
+        assert_eq!(f.event, "audit_sink_unavailable");
+        assert_eq!(f.level, None);
+        assert_eq!(f.keys_vec(), ["event", "code", "message"]);
+        assert_eq!(
+            f.str_of("message"),
+            Some("audit record sink could not be created")
+        );
+    }
+
     /// 記録を集めるだけの sink（件数に上限を置く）。
     struct CollectSink(Mutex<Vec<AuditRecord>>);
     impl CollectSink {

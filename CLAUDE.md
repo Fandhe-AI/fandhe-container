@@ -44,7 +44,7 @@ fandhe-container/
 │   │   └── cri/proto/             #     cri-api の .proto（kubernetes/cri-api v0.37.1 無改変）と出典 README（TASK-56.2・CRI-3）
 │   ├── platform-macos/ / platform-windows/ / microvm/  # プラットフォーム層
 │   ├── gpu/ / net/                #   GPU パススルー（CDI）/ network
-│   ├── plugin/                    #   plugin 境界機構（UDS＋長さ接頭辞フレーム。fandhe-container-plugin。plugin 側の共通受信ループ `frame_loop` を含む。#3774・#3773。plugin-microvm・plugin-windows が利用済み〔#3776〕）
+│   ├── plugin/                    #   plugin 境界機構（UDS＋長さ接頭辞フレーム。fandhe-container-plugin。plugin 側の共通受信ループ `frame_loop` を含む。#3774・#3773。plugin-microvm・plugin-windows が利用済み〔#3776〕。tests/support/json_lines_contract.rs は「1 行 1 JSON」の共有検査器で core・cli・io・plugin の試験が `#[path]` で取り込む。ERR-4・#3122）
 │   ├── cli/ / stack/              #   統一 CLI / 複数コンテナ定義（TOML スキーマ・起動順）
 │   ├── compose-convert/           #   compose.yaml → TOML 片方向変換ツール（fandhe-container-compose-convert）
 │   └── plugin-*/                  #   fandhe-container-plugin-cri / -macos / -windows / -microvm / -mcp
@@ -105,6 +105,7 @@ fandhe-container/
 │   │   ├── crate-naming.md        # crate 短縮名・plugin crate 配置の確定内容（TASK-1・REPAIR-1）
 │   │   ├── network-wiring.md      # CLI・起動経路への network 結線の設計（`--network` / `--add-host` / `--dns` の受け渡し・none / host・hosts / resolv.conf・ネットワーク定義の状態ストア・プロセスをまたぐ状態・実装 issue の一覧・create の op ログ 2 組の契約〔D17・#3558〕。rootful の実行主体〔D13〕はオーナー承認待ち。#1870・NET-6・NET-12）
 │   │   ├── bridge-create-echo.md  # bridge・veth の作成要求に `NLM_F_ECHO` を付け、作成通知の ifindex を使う判断記録（採用・下限の版・戻し経路・残る窓・実機での確認状況・版ごとの一次情報の確認と `netns_link_index` を echo で置き換えない判断。#1972・#3205・#3293・TASK-139 追補・NET-1）
+│   │   ├── image-root-default.md  # `--image-root` を省いたときの既定の位置（Linux は `<状態ルート>/.cri/images`・macOS ホストは既定なし〔#2431 案 A〕・Windows ホストは `UNIMPLEMENTED`）と `image prune` の配線の判断記録（Linux・Windows はオーナー確認待ち。#2384・OCI-7・CLI-1・MAC-4・WIN-1）
 │   │   ├── rootless-network.md    # rootless ネットワーク外部ヘルパーの判断記録（TASK-147・NET-9。pasta を採用〔#340〕。実装・実証は #341）
 │   │   ├── privilege-separation.md  # 権限分離方式の比較と必要最小権限の設計書（TASK-171.1.1・SUP-14。方式承認済み〔#1454〕）
 │   │   ├── user-manager-connect-precheck.md  # start の事前検査への実 connect と connect 先の SO_PEERCRED 照合を足すかの判断記録（#2448・CORE-3・SUP-14。オーナー承認待ち）
@@ -123,7 +124,7 @@ fandhe-container/
 │   │   ├── windows-execution-layout.md  # Windows の実行構成（WSL2 ゲスト内の core とホストの起動役）の設計ドラフト（#1415・#1539 の決定以外はオーナー承認待ち。TASK-116 追補・#1862・WIN-1）
 │   │   ├── audit-non-linux.md     # 非 Linux の監査の記録経路（Windows の主経路の隔離・代替経路）の設計ドラフト・判断シート（#2430・SEC-4・オーナー承認待ち）
 │   │   ├── audit-delivery.md      # seccomp・Landlock の拒否を監査の記録先へ届ける配送経路の設計（2026-10-15 に方式を採用・#2018。実装は #2023〜#2028・#2004。TASK-41 追補・#1835・SEC-4）
-│   │   ├── audit-seccomp-reader.md  # AUDIT_SECCOMP の読み手と CAP_AUDIT_READ の付与の判断記録（v6.12 の原文での確認結果を含む。#2237・SEC-4・SUP-14。オーナー承認待ち）
+│   │   ├── audit-seccomp-reader.md  # AUDIT_SECCOMP の読み手と CAP_AUDIT_READ の付与の判断記録（v6.12 の原文での確認結果を含む。#2237・SEC-4・SUP-14。2026-11-13 決定〔D1 A・D2 A〕）
 │   │   ├── plugin-backend-wiring.md  # バックエンド plugin の検証後の起動と RPC の配線の設計案（#1869・TASK-115・TASK-79 追補・PLUG-1・PLUG-7。承認待ち）
 │   │   ├── mcp-2026-07-28-migration.md  # MCP 2025-06-18 から 2026-07-28 への差分と plugin-mcp の対応方針（TASK-119.1・#715・MCP-3。決定 D1〜D7 は #720 で承認済み）
 │   │   ├── rootless-id-map-holder.md  # 範囲写像の書き込み先を専用の holder プロセスへ分け、中間プロセスが dumpable になる窓をなくす設計（#2374・CORE-6・SEC-5・SEC-1）

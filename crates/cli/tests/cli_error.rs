@@ -15,7 +15,7 @@ fn err1_from_trait_error_to_json_and_exit_code() {
     assert_eq!(e.code(), ErrorCode::NotFound);
     assert_eq!(
         e.to_json_line(),
-        "{\"code\":\"NOT_FOUND\",\"message\":\"container \\\"c1\\\" missing\"}\n"
+        "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"NOT_FOUND\",\"message\":\"container \\\"c1\\\" missing\"}\n"
     );
     assert_eq!(e.exit_code().get(), 3);
 }
@@ -26,7 +26,7 @@ fn err1_from_oci_runtime_error_drops_op() {
     let e = CliError::from(&o);
     assert_eq!(
         e.to_json_line(),
-        "{\"code\":\"TIMEOUT\",\"message\":\"slow\"}\n"
+        "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"TIMEOUT\",\"message\":\"slow\"}\n"
     );
     assert_eq!(e.exit_code().get(), 7);
 }
@@ -61,7 +61,7 @@ fn err1_write_stderr_emits_exact_line() {
     e.write_stderr(&mut out).unwrap();
     assert_eq!(
         String::from_utf8(out).unwrap(),
-        "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"bad value\"}\n"
+        "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"INVALID_ARGUMENT\",\"message\":\"bad value\"}\n"
     );
 }
 
@@ -76,7 +76,7 @@ fn err1_bidi_control_is_replaced_in_output() {
     e.write_stderr(&mut out).unwrap();
     assert_eq!(
         String::from_utf8(out).unwrap(),
-        "{\"code\":\"PERMISSION_DENIED\",\"message\":\"open  txt.exe  denied\"}\n"
+        "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"PERMISSION_DENIED\",\"message\":\"open  txt.exe  denied\"}\n"
     );
     assert_eq!(e.exit_code().get(), 6);
 }

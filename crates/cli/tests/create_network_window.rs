@@ -29,7 +29,7 @@ mod scratch_root;
 use fandhe_container_cli::commands::run_to;
 
 const PASTA: &str = "/usr/bin/pasta";
-const IN_USE: &str = "{\"code\":\"FAILED_PRECONDITION\",\"message\":\"network is in use by a container; delete the containers that use it first\"}\n";
+const IN_USE: &str = "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"FAILED_PRECONDITION\",\"message\":\"network is in use by a container; delete the containers that use it first\"}\n";
 const LS_N1: &str = "NAME\tMODE\tSUBNET\nn1\tpasta\t-\n";
 const LS_EMPTY: &str = "NAME\tMODE\tSUBNET\n";
 

@@ -52,7 +52,7 @@ TASK-125（共同タスク）の確認記録の雛形。実機での実行・結
 
 スクリプトが `code` として受理する stderr は次の 2 形式だけで、どちらも 1 行・LF 終端・キー順固定とする。
 
-- 固定文言の失敗（使い方エラー・未実装・状態ルート不在など）: `{"code":"<CODE>","message":"<文字列>"}`
+- 固定文言の失敗（使い方エラー・未実装・状態ルート不在など）: `{"level":"error","event":"cli_error","code":"<CODE>","message":"<文字列>"}`（`message` を切り詰めたときだけ末尾に `,"truncated":true`。旧形式の `{"code":..,"message":..}`（level / event なし）は `<unparsed>`。#3120・ERR-4）
 - core 由来の失敗（`create` / `start` / `stop` / `kill` / `delete`）: `{"level":"error","event":"oci_runtime_error","op":"<操作>","code":"<CODE>","message":"<文字列>"}`（`stop` の `op` は `kill`。`message` を切り詰めたときだけ末尾に `,"truncated":true`。旧形式の `{"op":..}` は `<unparsed>`。#3118・ERR-4）
 
 `message` は JSON 文字列として検証する（未エスケープの `"`・`\`・制御文字、不正なエスケープ、不正な UTF-8 は拒否）。記録と比較の対象は `code` だけで、`op` の有無と値・`truncated`・`message` の内容は記録しない。上記以外の出力（キーの追加・欠落・順序違い、複数行、LF 終端なし、NUL、16384 バイト超）は `<unparsed>` と記録し、compare は同じ `<unparsed>` 同士でも一致扱いにしない（UNVERIFIED）。

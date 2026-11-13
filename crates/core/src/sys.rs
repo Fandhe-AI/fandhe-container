@@ -5828,14 +5828,22 @@ mod libc_abi {
         assert!(size_of::<super::StatFs>() == size_of::<libc::statfs>());
         assert!(align_of::<super::StatFs>() == align_of::<libc::statfs>());
         assert!(offset_of!(super::StatFs, f_type) == offset_of!(libc::statfs, f_type));
-        assert!(size_of::<i64>() == size_of::<libc::__fsword_t>());
     };
+    // gnu の `libc::statfs` は `f_flags` が非公開の `f_spare` に含まれ、語の幅は `__fsword_t` で表す。
     #[cfg(target_env = "gnu")]
     const _: () = {
+        assert!(size_of::<i64>() == size_of::<libc::__fsword_t>());
         assert!(
             offset_of!(super::StatFs, f_flags)
                 == offset_of!(libc::statfs, f_frsize) + size_of::<libc::__fsword_t>()
         );
+    };
+    // musl の `libc` には `__fsword_t` が無く(#2274。ゲスト向け aarch64 musl の型検査)、`f_flags` は
+    // `c_ulong` の公開フィールドなので直接照合する。
+    #[cfg(target_env = "musl")]
+    const _: () = {
+        assert!(size_of::<i64>() == size_of::<libc::c_ulong>());
+        assert!(offset_of!(super::StatFs, f_flags) == offset_of!(libc::statfs, f_flags));
     };
 
     // `MountAttr`: `libc::mount_attr`(uapi 版)。

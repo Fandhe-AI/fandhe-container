@@ -8,7 +8,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-const USAGE_JSON: &str = "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|kill|delete|list|logs|exec|inspect|state|image|system|network|setup|doctor>\"}\n";
+const USAGE_JSON: &str = "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|kill|delete|list|logs|exec|inspect|state|image|system|network|setup|doctor>\"}\n";
 
 /// 子プロセスの終了を待つ上限（REPAIR-5）。超過時は kill して失敗させる。
 const CHILD_TIMEOUT: Duration = Duration::from_secs(30);
@@ -178,7 +178,7 @@ fn repair5_signal_install_failure_reports_via_deferred_path() {
     assert_failure(
         &out,
         1,
-        "{\"code\":\"INTERNAL\",\"message\":\"failed to install the signal handler for plugin forwarding\"}\n",
+        "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"INTERNAL\",\"message\":\"failed to install the signal handler for plugin forwarding\"}\n",
     );
 }
 
@@ -374,7 +374,10 @@ fn cli1_exec_rejections_on_linux() {
     assert_eq!(out.status.code(), Some(3));
     assert!(out.stdout.is_empty());
     let line = String::from_utf8(out.stderr).expect("utf8");
-    assert!(line.starts_with("{\"code\":\"NOT_FOUND\""), "{line}");
+    assert!(
+        line.starts_with("{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"NOT_FOUND\""),
+        "{line}"
+    );
 
     assert_eq!(
         run(&["--root", root_s, "create", "--bundle", bundle_s, "c1"])
@@ -386,14 +389,21 @@ fn cli1_exec_rejections_on_linux() {
     assert_eq!(out.status.code(), Some(5));
     let line = String::from_utf8(out.stderr).expect("utf8");
     assert!(
-        line.starts_with("{\"code\":\"FAILED_PRECONDITION\""),
+        line.starts_with(
+            "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"FAILED_PRECONDITION\""
+        ),
         "{line}"
     );
 
     let out = run(&["--root", root_s, "exec", "c1", "relative/path"]);
     assert_eq!(out.status.code(), Some(2));
     let line = String::from_utf8(out.stderr).expect("utf8");
-    assert!(line.starts_with("{\"code\":\"INVALID_ARGUMENT\""), "{line}");
+    assert!(
+        line.starts_with(
+            "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"INVALID_ARGUMENT\""
+        ),
+        "{line}"
+    );
 }
 
 // 本物の pull 経路で多層イメージを作る共有 fixture（in-crate 試験 `image_unpack/tests.rs` と共有。#2377）。
@@ -640,7 +650,8 @@ fn sup6_cli1_rerun_passes_through_child_exit_code() {
 #[test]
 fn sup6_err1_rerun_forwards_structured_error_after_start_line() {
     let t = ExecRerun::new("rr-json");
-    let line = "{\"code\":\"NOT_FOUND\",\"message\":\"gone\"}";
+    let line =
+        "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"NOT_FOUND\",\"message\":\"gone\"}";
     let out = t.run(
         &format!("noise; start; printf '%s\\n' '{line}' >&2; marker; exit 3"),
         "30",
@@ -660,7 +671,7 @@ fn sup6_err2_rerun_distinguishes_wrapper_failure_from_command_exit() {
     assert_eq!(out.status.code(), Some(9));
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
-        "{\"code\":\"UNAVAILABLE\",\"message\":\"the user scope wrapper failed before running the command\"}\n"
+        "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"UNAVAILABLE\",\"message\":\"the user scope wrapper failed before running the command\"}\n"
     );
     assert!(out.stdout.is_empty());
     // 開始行はあるが目印が無い（子が最後まで走っていない）場合も wrapper の失敗として扱う。
@@ -688,7 +699,7 @@ fn sup6_repair5_rerun_kills_and_reaps_child_after_deadline() {
     assert_eq!(out.status.code(), Some(7));
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
-        "{\"code\":\"TIMEOUT\",\"message\":\"exec timed out waiting for the user scope command\"}\n"
+        "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"TIMEOUT\",\"message\":\"exec timed out waiting for the user scope command\"}\n"
     );
     assert!(started.elapsed() < Duration::from_secs(20), "bounded wait");
     let pid: u32 = std::fs::read_to_string(&pidfile)
@@ -713,7 +724,7 @@ fn sup6_cli1_rerun_real_child_fails_closed_when_parent_pid_mismatches() {
     assert_eq!(out.status.code(), Some(9));
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
-        "{\"code\":\"UNAVAILABLE\",\"message\":\"the exec parent is gone\"}\n"
+        "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"UNAVAILABLE\",\"message\":\"the exec parent is gone\"}\n"
     );
     assert!(out.stdout.is_empty());
 }
@@ -1667,7 +1678,7 @@ fn sup7_delete_warns_when_container_log_is_locked() {
     assert!(out.stdout.is_empty());
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
-        "{\"level\":\"warn\",\"code\":\"FAILED_PRECONDITION\",\"reason\":\"sink_open_after_wait\",\"message\":\"container log removal failed; leftover logs may remain\"}\n"
+        "{\"level\":\"warn\",\"event\":\"container_log_removal_failed\",\"code\":\"FAILED_PRECONDITION\",\"reason\":\"sink_open_after_wait\",\"message\":\"container log removal failed; leftover logs may remain\"}\n"
     );
     assert_eq!(sorted_dir_names(&logs), ["c1.log", "c1.log.lock"]);
     let listed = run(&["--root", root_s, "list"]);
@@ -1904,7 +1915,7 @@ fn cli1_list_logs_flow_on_linux() {
     assert_failure(
         &run(&["--root", root_s, "logs", "missing"]),
         3,
-        "{\"code\":\"NOT_FOUND\",\"message\":\"container not found\"}\n",
+        "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"NOT_FOUND\",\"message\":\"container not found\"}\n",
     );
     let out = run(&["--root", root_s, "logs", "a1"]);
     assert_eq!(out.status.code(), Some(0));
@@ -1926,7 +1937,7 @@ fn cli1_list_logs_flow_on_linux() {
     assert_failure(
         &run(&["--root", root_s, "logs", "a/b"]),
         2,
-        "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"invalid argument\"}\n",
+        "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"INVALID_ARGUMENT\",\"message\":\"invalid argument\"}\n",
     );
 }
 
@@ -1989,7 +2000,7 @@ fn cli1_logs_tail_stream_escape_outputs() {
     assert_failure(
         &out,
         3,
-        "{\"code\":\"NOT_FOUND\",\"message\":\"container not found\"}\n",
+        "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"NOT_FOUND\",\"message\":\"container not found\"}\n",
     );
 }
 
@@ -2233,7 +2244,7 @@ fn sec1_list_logs_fail_closed_off_linux() {
         assert_eq!(out.status.code(), Some(5));
         assert_eq!(
             String::from_utf8_lossy(&out.stderr),
-            "{\"code\":\"FAILED_PRECONDITION\",\"message\":\"platform backend plugin is not installed\"}\n"
+            "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"FAILED_PRECONDITION\",\"message\":\"platform backend plugin is not installed\"}\n"
         );
         assert!(out.stdout.is_empty());
     }
@@ -2286,7 +2297,7 @@ fn plug11_path_search_is_off_by_default_off_linux() {
     assert_eq!(path_warning_lines(&out), 0);
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
-        "{\"code\":\"FAILED_PRECONDITION\",\"message\":\"platform backend plugin is not installed\"}\n"
+        "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"FAILED_PRECONDITION\",\"message\":\"platform backend plugin is not installed\"}\n"
     );
     assert!(out.stdout.is_empty());
 }
@@ -2298,12 +2309,12 @@ fn path_search_rejection() -> (i32, &'static str) {
     if cfg!(target_os = "macos") {
         (
             6,
-            "{\"code\":\"PERMISSION_DENIED\",\"message\":\"platform backend plugin failed trust verification\"}",
+            "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"PERMISSION_DENIED\",\"message\":\"platform backend plugin failed trust verification\"}",
         )
     } else {
         (
             8,
-            "{\"code\":\"UNIMPLEMENTED\",\"message\":\"plugin trust verification is not performed on this host\"}",
+            "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"UNIMPLEMENTED\",\"message\":\"plugin trust verification is not performed on this host\"}",
         )
     }
 }
@@ -2396,7 +2407,7 @@ fn cli1_cli2_setup_on_macos_prints_steps_with_instructions() {
     );
     assert_eq!(
         String::from_utf8(out.stderr).expect("utf8"),
-        "{\"code\":\"UNIMPLEMENTED\",\"message\":\"not implemented on this platform\"}\n"
+        "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"UNIMPLEMENTED\",\"message\":\"not implemented on this platform\"}\n"
     );
 }
 
@@ -2416,7 +2427,7 @@ fn cli1_cli2_setup_on_windows_prints_steps_with_instructions() {
     );
     assert_eq!(
         String::from_utf8(out.stderr).expect("utf8"),
-        "{\"code\":\"UNIMPLEMENTED\",\"message\":\"not implemented on this platform\"}\n"
+        "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"UNIMPLEMENTED\",\"message\":\"not implemented on this platform\"}\n"
     );
 }
 
@@ -2740,7 +2751,9 @@ fn doctor_rejects_extra_arguments() {
 /// `image` 系の stderr 1 行 JSON（op なし）を組み立てる。
 #[cfg(target_os = "linux")]
 fn image_err(code: &str, message: &str) -> String {
-    format!("{{\"code\":\"{code}\",\"message\":\"{message}\"}}\n")
+    format!(
+        "{{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"{code}\",\"message\":\"{message}\"}}\n"
+    )
 }
 
 /// CLI-1・OCI-7・SEC-1（#2547）: Linux の `image ls` は、`--image-root` が group / other に書き込めれば
@@ -2907,7 +2920,9 @@ fn cli1_image_tag_fails_closed_off_linux() {
     assert_eq!(out.status.code(), Some(5));
     assert!(out.stdout.is_empty(), "stdout must be empty");
     assert!(
-        String::from_utf8_lossy(&out.stderr).starts_with("{\"code\":\"FAILED_PRECONDITION\""),
+        String::from_utf8_lossy(&out.stderr).starts_with(
+            "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"FAILED_PRECONDITION\""
+        ),
         "{:?}",
         String::from_utf8_lossy(&out.stderr)
     );
@@ -4040,7 +4055,7 @@ fn net6_network_create_ls_rm_flow_on_linux() {
         assert_failure(
             &out,
             8,
-            "{\"code\":\"UNIMPLEMENTED\",\"message\":\"user-defined networks on rootful installations are not supported yet\"}\n",
+            "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"UNIMPLEMENTED\",\"message\":\"user-defined networks on rootful installations are not supported yet\"}\n",
         );
         let _ = std::fs::remove_dir_all(dir);
         return;
@@ -4060,7 +4075,7 @@ fn net6_network_create_ls_rm_flow_on_linux() {
     assert_failure(
         &out,
         4,
-        "{\"code\":\"ALREADY_EXISTS\",\"message\":\"network already exists\"}\n",
+        "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"ALREADY_EXISTS\",\"message\":\"network already exists\"}\n",
     );
     let out = run_isolated(&cli, &["--root", root_s, "network", "ls"]);
     assert_eq!(
@@ -4073,7 +4088,7 @@ fn net6_network_create_ls_rm_flow_on_linux() {
     assert_failure(
         &out,
         3,
-        "{\"code\":\"NOT_FOUND\",\"message\":\"network not found\"}\n",
+        "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"NOT_FOUND\",\"message\":\"network not found\"}\n",
     );
     let out = run_isolated(&cli, &["--root", root_s, "network", "ls"]);
     assert_eq!(
@@ -4150,7 +4165,7 @@ fn net6_net9_cli1_3529_network_rm_refused_while_referenced_then_succeeds() {
     assert_failure(
         &out,
         5,
-        "{\"code\":\"FAILED_PRECONDITION\",\"message\":\"network is in use by a container; delete the containers that use it first\"}\n",
+        "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"FAILED_PRECONDITION\",\"message\":\"network is in use by a container; delete the containers that use it first\"}\n",
     );
     let out = run_isolated(&cli, &["--root", root_s, "network", "ls"]);
     assert_eq!(
@@ -4249,7 +4264,7 @@ fn repair4_net6_cli1_3558_create_named_network_records_store_ops_in_second_group
         assert_failure(
             &out,
             8,
-            "{\"code\":\"UNIMPLEMENTED\",\"message\":\"user-defined networks on rootful installations are not supported yet\"}\n",
+            "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"UNIMPLEMENTED\",\"message\":\"user-defined networks on rootful installations are not supported yet\"}\n",
         );
         let _ = std::fs::remove_dir_all(dir);
         return;
@@ -4427,7 +4442,7 @@ fn repair4_net6_cli1_3577_create_named_network_success_records_two_groups() {
         assert_failure(
             &out,
             8,
-            "{\"code\":\"UNIMPLEMENTED\",\"message\":\"user-defined networks on rootful installations are not supported yet\"}\n",
+            "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"UNIMPLEMENTED\",\"message\":\"user-defined networks on rootful installations are not supported yet\"}\n",
         );
         let _ = std::fs::remove_dir_all(dir);
         return;
@@ -4481,7 +4496,7 @@ fn repair4_net6_cli1_3577_create_named_network_success_records_two_groups() {
     assert_failure(
         &out,
         5,
-        "{\"code\":\"FAILED_PRECONDITION\",\"message\":\"network is in use by a container; delete the containers that use it first\"}\n",
+        "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"FAILED_PRECONDITION\",\"message\":\"network is in use by a container; delete the containers that use it first\"}\n",
     );
 
     // (f) 保持区間の中での失敗: core の create が失敗しても 2 回目の照合は走り、2 組目に入る。

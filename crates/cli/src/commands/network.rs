@@ -351,7 +351,9 @@ mod tests {
     }
 
     fn json(code: &str, msg: &str) -> String {
-        format!("{{\"code\":\"{code}\",\"message\":\"{msg}\"}}\n")
+        format!(
+            "{{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"{code}\",\"message\":\"{msg}\"}}\n"
+        )
     }
 
     /// ERR-1・NET-6: 全 `NetErrorCode` の写像が表どおりで、文言が JSON 安全な定数であること。

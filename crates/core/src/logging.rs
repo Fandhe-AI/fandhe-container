@@ -7,7 +7,7 @@
 //! # 位置づけと呼び出し元
 //!
 //! 本モジュールは型と書き出しの仕組みだけを持つ。`audit_log` の `AuditLineDto`（#3115）・`audit_write_failure` の行（#3209）と `observability` の op_stats は移行済み。
-//! core 内の既存出力の移行は完了している（cli の採否は TASK-98.2〔#653〕で決める。REPAIR-3）。
+//! core 内の既存出力の移行は完了している。cli の stderr のエラー行・警告行は serde を持たない cli 向けの [`LogFields`] 経由で移行済み（#3120。event は `cli_error` ほか）。
 //! `legacy_tiocsti` の警告行は移行済み（#3117）。`oci_runtime::error` の OCI エラー行も移行済み（#3118。`level` = `error`・`event` = `oci_runtime_error`）。`plugin_discovery` の PATH 警告行も移行済み（#3119。level `warn`・event `plugin_path_candidate`）。`observability` の op_stats の行も移行済み（#3116）。
 //!
 //! # 確定した設計判断
@@ -30,11 +30,12 @@
 //! # 依存方向の制約
 //!
 //! `io`（観測ログ）と `plugin` は core より下の層にあるため本型を使えない。core への辺を足す
-//! ことはオーナーの承認事項である。cli が本型を採用するかも TASK-98.2 で決める。
+//! ことはオーナーの承認事項である。cli は core への既存の辺で本型を使う（#3120）。
 
 use std::fmt;
 use std::io::Write;
 
+use serde::ser::SerializeMap;
 use serde::{Serialize, Serializer};
 
 use crate::traits::{ErrorCode, TraitError};
@@ -178,6 +179,87 @@ impl<'a, F: Serialize> LogLine<'a, F> {
     pub fn with_level(mut self, level: LogLevel) -> Self {
         self.level = Some(level);
         self
+    }
+}
+
+/// [`LogFields`] の値。serde を持たない crate（cli）が本体を組むための閉じた値型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LogValue<'a> {
+    /// 文字列（エスケープは JSON 出力側が行う。表示を乱す文字の置換は呼び出し側の責務）。
+    Str(&'a str),
+    /// 真偽値。
+    Bool(bool),
+    /// 符号なし整数。
+    U64(u64),
+}
+
+impl Serialize for LogValue<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match *self {
+            Self::Str(v) => s.serialize_str(v),
+            Self::Bool(v) => s.serialize_bool(v),
+            Self::U64(v) => s.serialize_u64(v),
+        }
+    }
+}
+
+/// [`LogFields`] の最大件数（無制限の本体を作らせない。REPAIR-5）。
+pub const LOG_FIELDS_MAX_ENTRIES: usize = 16;
+
+/// キーの最大バイト数。
+const LOG_FIELD_KEY_MAX_LEN: usize = 64;
+
+/// 順序つきの本体（キーと値の並びがそのまま出力のキー順になる）。
+///
+/// cli は `serde` を直接依存に持たないため、`#[derive(Serialize)]` の DTO を作れない。
+/// その呼び出し側が [`LogLine`] の本体を渡すための汎用の形で、cli の語彙は core へ持ち込まない。
+/// 省略できる項目は呼び出し側がスライスの長さで出し分ける（#3120・ERR-4）。
+///
+/// Serialize 時に fail-closed で検査し、違反すると [`encode_json_line`] は何も書かずに
+/// [`LogLineErrorKind::Encode`] を返す: キーは `[a-z0-9_]{1,64}`、予約キー `level` / `event` と
+/// 重複キーは拒否、件数は [`LOG_FIELDS_MAX_ENTRIES`] 以下（重複キーの JSON は解析器ごとに
+/// 解釈が分かれ、判定の取り違えになるため）。
+#[derive(Debug, Clone, Copy)]
+pub struct LogFields<'a> {
+    entries: &'a [(&'static str, LogValue<'a>)],
+}
+
+impl<'a> LogFields<'a> {
+    /// 並びから作る。検査は Serialize 時に行う。
+    pub fn new(entries: &'a [(&'static str, LogValue<'a>)]) -> Self {
+        Self { entries }
+    }
+}
+
+fn field_key_is_valid(k: &str) -> bool {
+    !k.is_empty()
+        && k.len() <= LOG_FIELD_KEY_MAX_LEN
+        && k.bytes()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
+        && k != "level"
+        && k != "event"
+}
+
+impl Serialize for LogFields<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::Error;
+        if self.entries.len() > LOG_FIELDS_MAX_ENTRIES {
+            return Err(S::Error::custom("too many log fields"));
+        }
+        for (i, (k, _)) in self.entries.iter().enumerate() {
+            if !field_key_is_valid(k) {
+                return Err(S::Error::custom("invalid log field key"));
+            }
+            if self.entries[..i].iter().any(|(p, _)| p == k) {
+                return Err(S::Error::custom("duplicate log field key"));
+            }
+        }
+        let mut m = s.serialize_map(Some(self.entries.len()))?;
+        for (k, v) in self.entries {
+            m.serialize_entry(k, v)?;
+        }
+        m.end()
     }
 }
 
@@ -335,6 +417,54 @@ mod tests {
 
     fn enc<F: Serialize>(line: &LogLine<'_, F>) -> String {
         String::from_utf8(encode_json_line(line).expect("encode")).expect("utf8")
+    }
+
+    #[test]
+    fn err4_3120_log_fields_exact_bytes_and_order() {
+        let e = [
+            ("code", LogValue::Str("NOT_FOUND")),
+            ("message", LogValue::Str("a\"b\\c")),
+            ("truncated", LogValue::Bool(true)),
+            ("n", LogValue::U64(7)),
+        ];
+        let f = LogFields::new(&e);
+        let l = LogLine::new(ev("cli_error"), &f).with_level(LogLevel::Error);
+        assert_eq!(
+            enc(&l),
+            "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"NOT_FOUND\",\"message\":\"a\\\"b\\\\c\",\"truncated\":true,\"n\":7}\n"
+        );
+    }
+
+    #[test]
+    fn err4_3120_log_fields_rejects_bad_bodies() {
+        let bad: [&[(&'static str, LogValue<'_>)]; 5] = [
+            &[("level", LogValue::Bool(true))],
+            &[("event", LogValue::Bool(true))],
+            &[("a", LogValue::U64(1)), ("a", LogValue::U64(2))],
+            &[("Bad-Key", LogValue::U64(1))],
+            &[("", LogValue::U64(1))],
+        ];
+        for e in bad {
+            let f = LogFields::new(e);
+            let r = encode_json_line(&LogLine::new(ev("x"), &f));
+            assert_eq!(r.unwrap_err().kind(), LogLineErrorKind::Encode);
+        }
+        let keys = [
+            "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7", "k8", "k9", "k10", "k11", "k12", "k13",
+            "k14", "k15", "k16",
+        ];
+        let many: Vec<(&'static str, LogValue<'_>)> =
+            keys.iter().map(|k| (*k, LogValue::U64(1))).collect();
+        assert_eq!(many.len(), LOG_FIELDS_MAX_ENTRIES + 1);
+        let f = LogFields::new(&many);
+        let r = encode_json_line(&LogLine::new(ev("x"), &f));
+        assert_eq!(r.unwrap_err().kind(), LogLineErrorKind::Encode);
+    }
+
+    #[test]
+    fn err4_3120_log_fields_empty_is_object() {
+        let f = LogFields::new(&[]);
+        assert_eq!(enc(&LogLine::new(ev("x"), &f)), "{\"event\":\"x\"}\n");
     }
 
     #[test]

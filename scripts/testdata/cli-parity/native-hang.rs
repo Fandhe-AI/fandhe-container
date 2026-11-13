@@ -38,7 +38,9 @@ fn main() {
     let dir = match std::env::var("STUB_NATIVE_DIR") {
         Ok(d) => d,
         Err(_) => {
-            println!("{{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage\"}}");
+            println!(
+                "{{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage\"}}"
+            );
             std::process::exit(2);
         }
     };
@@ -59,6 +61,8 @@ fn main() {
         tick_loop(&dir, "parent");
         return;
     }
-    eprintln!("{{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage\"}}");
+    eprintln!(
+        "{{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage\"}}"
+    );
     std::process::exit(2);
 }

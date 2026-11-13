@@ -3696,6 +3696,7 @@ mod tests {
         (err, sink)
     }
 
+    #[cfg(target_os = "linux")]
     fn pinned_target(dir: &Path, name: &str) -> super::super::NetnsJoinTarget {
         super::super::NetnsJoinTarget::new(dir.to_path_buf(), dir.join(name), 5, 4_026_532_008)
             .expect("target")
@@ -3717,12 +3718,16 @@ mod tests {
         b.write_config(&cfg);
         let launcher = RecordingLauncher::new(false);
         launcher.set_network_mode(LaunchNetworkMode::FromConfig);
-        assert!(
-            launcher
-                .netns_target
-                .set(pinned_target(&b.dir, "pin"))
-                .is_ok()
-        );
+        // 参加先は Linux のパス(`/` 区切り)で検査されるため、ホストの一時ディレクトリではなく固定のリテラルにする
+        // (Windows の `C:\...` は字句検査で落ちる)。拒否は参加先の実在より前なので実在は要らない。
+        let target = super::super::NetnsJoinTarget::new(
+            "/run/n".into(),
+            "/run/n/pin".into(),
+            5,
+            4_026_532_008,
+        )
+        .expect("target");
+        assert!(launcher.netns_target.set(target).is_ok());
         let err = run(&store, &launcher, "pinned-target-only").expect_err("must fail");
         assert_eq!(err.code(), ErrorCode::InvalidArgument);
         assert_eq!(err.message(), message);
@@ -4505,7 +4510,7 @@ mod tests {
     fn repair4_2245_recovery_log_line_bytes() {
         let rec = StateRecord::new(
             ContainerStatus::created(ContainerId::new("web").expect("id"), None),
-            std::path::PathBuf::from("/b"),
+            std::env::temp_dir().join("b"),
             crate::traits::StateRevision::from_raw(1),
         )
         .expect("record");

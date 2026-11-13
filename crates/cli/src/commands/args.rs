@@ -7,6 +7,7 @@
 //! `exec`（SUP-6・#2626）は `... exec [--env KEY=VALUE]... [--timeout <秒>] <id> <path> [<arg>...]`（オプションは `<id>` の前だけ）。
 //! イメージ管理（#2221）は `image ls [--image-root <dir>]` / `image rm [--force] [--image-root <dir>] <ref>` / `image tag [--image-root <dir>] <source> <target>` / `image prune [--image-root <dir>]`（#2384）/ `system df [--image-root <dir>]`（`--image-root` は任意の絶対パス。省略時の既定は `image_root` module）。
 //! ユーザー定義ネットワーク（#3066・NET-6）は `network create <name>` / `network rm <name>` / `network ls`（オプションなし）。
+//! プロジェクト起動（#4638・STACK-8）は `up --file <toml> --image-root <abs> [--project-name <n>] [--profile <p>]... [<service>...]`。
 //! 解析失敗の理由は呼び出し元で固定文言に落とし、引数値を出力へ埋め込まない（インジェクション回避）。
 
 use std::ffi::OsString;
@@ -935,6 +936,88 @@ pub(super) fn parse_system(args: Vec<OsString>) -> Result<SystemArgs, UsageError
     Ok(SystemArgs::Df(SystemDfArgs { image_root }))
 }
 
+/// `up` の引数（#4638・STACK-8・STACK-10）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct UpArgs {
+    /// `--file`: プロジェクト定義の TOML（必須・1 回。相対パスは実行側が絶対化する）。
+    pub(super) file: PathBuf,
+    /// `--image-root`: イメージストアの root（必須・1 回・絶対パス）。`up` は pull しない（pull 済みが前提）。
+    pub(super) image_root: PathBuf,
+    /// `--project-name`: プロジェクト名（任意・1 回。優先順は stack の `resolve_project_name`）。
+    pub(super) project_name: Option<String>,
+    /// `--profile`（複数可。上限は stack の `MAX_ACTIVE_PROFILES`。意味検証は stack）。
+    pub(super) profiles: Vec<OsString>,
+    /// 明示対象のサービス名（位置引数。上限は stack の `MAX_TARGET_SERVICES`。空なら有効な全サービス）。
+    pub(super) services: Vec<String>,
+}
+
+/// `up --file <path> --image-root <abs> [--project-name <n>] [--profile <p>]... [--] [<service>...]` を解析する。
+///
+/// 値の意味検証（TOML の中身・名前の文字種・profile 名）は実行側が stack の型に委ねる。ここでは形・重複・件数だけを見る。
+pub(super) fn parse_up(args: Vec<OsString>) -> Result<UpArgs, UsageError> {
+    use fandhe_container_stack::profile_filter::{MAX_ACTIVE_PROFILES, MAX_TARGET_SERVICES};
+    let mut file: Option<PathBuf> = None;
+    let mut image_root: Option<PathBuf> = None;
+    let mut project_name: Option<String> = None;
+    let mut profiles: Vec<OsString> = Vec::new();
+    let mut services: Vec<String> = Vec::new();
+    let mut it = args.into_iter();
+    while let Some(a) = it.next() {
+        if a == "--" {
+            for rest in it.by_ref() {
+                // 上限は確保の前に見る（残りの名前を無制限に抱えない。REPAIR-5）。
+                if services.len() >= MAX_TARGET_SERVICES {
+                    return Err(UsageError);
+                }
+                services.push(rest.into_string().map_err(|_| UsageError)?);
+            }
+            break;
+        } else if a == "--file" {
+            let value = it.next().ok_or(UsageError)?;
+            if file.is_some() || value.is_empty() {
+                return Err(UsageError);
+            }
+            file = Some(PathBuf::from(value));
+        } else if a == "--image-root" {
+            let value = PathBuf::from(it.next().ok_or(UsageError)?);
+            if image_root.is_some() || !value.is_absolute() {
+                return Err(UsageError);
+            }
+            image_root = Some(value);
+        } else if a == "--project-name" {
+            let value = it
+                .next()
+                .ok_or(UsageError)?
+                .into_string()
+                .map_err(|_| UsageError)?;
+            if project_name.is_some() {
+                return Err(UsageError);
+            }
+            project_name = Some(value);
+        } else if a == "--profile" {
+            let value = it.next().ok_or(UsageError)?;
+            if profiles.len() >= MAX_ACTIVE_PROFILES {
+                return Err(UsageError);
+            }
+            profiles.push(value);
+        } else if is_option_like(&a) {
+            return Err(UsageError);
+        } else {
+            services.push(a.into_string().map_err(|_| UsageError)?);
+        }
+        if services.len() > MAX_TARGET_SERVICES {
+            return Err(UsageError);
+        }
+    }
+    Ok(UpArgs {
+        file: file.ok_or(UsageError)?,
+        image_root: image_root.ok_or(UsageError)?,
+        project_name,
+        profiles,
+        services,
+    })
+}
+
 /// image 系サブコマンド共通のオプション解析。`--image-root <dir>`（任意・1 回・絶対パスのみ）と、
 /// `allow_force` のときの `--force`（1 回）を読み、残りの位置引数を返す。`--` 以降は位置引数。
 /// 値の意味検証（存在・ディレクトリか）は oci の `ImageStore::open` に委ね、ここでは作らない・辿らない。
@@ -1024,6 +1107,21 @@ mod tests {
 
     fn v(a: &[&str]) -> Vec<OsString> {
         a.iter().map(OsString::from).collect()
+    }
+
+    /// STACK-8・REPAIR-5: `--` 以降の名前も `MAX_TARGET_SERVICES` を超えたら確保を続けず使い方エラー（#4638）。
+    #[test]
+    fn stack8_parse_up_caps_services_after_double_dash() {
+        use fandhe_container_stack::profile_filter::MAX_TARGET_SERVICES;
+        let base = ["--file", "/p.toml", "--image-root", "/i", "--"];
+        let build = |n: usize| {
+            let mut a = v(&base);
+            a.extend((0..n).map(|i| OsString::from(format!("s{i}"))));
+            a
+        };
+        let ok = parse_up(build(MAX_TARGET_SERVICES)).expect("at cap");
+        assert_eq!(ok.services.len(), MAX_TARGET_SERVICES);
+        assert!(parse_up(build(MAX_TARGET_SERVICES + 1)).is_err());
     }
 
     /// CLI-1: グローバル `--root` は先頭のみ読み、残りを返す。

@@ -394,6 +394,35 @@ mod imp {
             .map_err(|e| map_at_err(&e))
         }
 
+        /// 直下に `name` を（無ければ `mode` で作って）書き込み用に開く（`O_CREAT | O_NOFOLLOW`、排他ではない）。
+        /// fd 起点（`openat2`・`RESOLVE_IN_ROOT`）のため、祖先が symlink に差し替えられても根の外へ出ない。
+        /// `flock` の対象になる排他ロックファイル用（STACK-8・SEC-1・#4734）。
+        pub fn open_or_create_file(&self, name: &str, mode: u32) -> Result<File, OciError> {
+            let name_c = child_cstring(OsStr::new(name))?;
+            at::openat2(
+                Some(self.fd.as_fd()),
+                &name_c,
+                at::O_WRONLY | at::O_CREAT | at::O_NOFOLLOW | at::O_NONBLOCK | at::O_CLOEXEC,
+                u64::from(mode),
+                RESOLVE,
+            )
+            .map_err(|e| map_at_err(&e))
+            .and_then(|fd| {
+                // 読み手のいない FIFO でも `O_NONBLOCK` により ENXIO で即失敗する（REPAIR-5）。
+                // 通常ファイル以外（FIFO・デバイス）は flock の対象にしない。
+                let file = File::from(fd);
+                let meta = file.metadata().map_err(|e| map_fs_err(&e))?;
+                if meta.is_file() {
+                    Ok(file)
+                } else {
+                    Err(err(
+                        OciErrorCode::FailedPrecondition,
+                        "the lock file is not a regular file",
+                    ))
+                }
+            })
+        }
+
         /// 直下の `name` を通常の `unlinkat`（`AT_REMOVEDIR` なし）で 1 エントリだけ消す（不在は成功）。
         /// ディレクトリには触れず `FailedPrecondition` で拒否する（再帰削除・権限変更をしない。#4378）。
         pub fn unlink_child_file(&self, name: &str) -> Result<(), OciError> {
@@ -1153,6 +1182,21 @@ mod imp {
             o.open(&p).map_err(|e| map_fs_err(&e))
         }
 
+        /// 直下に `name` を（無ければ作って）書き込み用に開く（パス起点）。
+        pub fn open_or_create_file(&self, name: &str, mode: u32) -> Result<File, OciError> {
+            let p = self.path.join(checked_child(name)?);
+            let mut o = fs::OpenOptions::new();
+            o.write(true).create(true).truncate(false);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                o.mode(mode);
+            }
+            #[cfg(not(unix))]
+            let _ = mode;
+            o.open(&p).map_err(|e| map_fs_err(&e))
+        }
+
         /// 直下の `name` を `remove_file` で 1 エントリだけ消す（不在は成功。ディレクトリは拒否。#4378）。
         pub fn unlink_child_file(&self, name: &str) -> Result<(), OciError> {
             let p = self.path.join(checked_child(name)?);
@@ -1789,6 +1833,21 @@ mod tests {
         assert!(root.child_matches("b", &child));
         assert!(!root.child_matches("link", &child));
         assert!(!root.child_matches("absent", &child));
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// STACK-8・SEC-1・REPAIR-5・#4734: ロックファイルの位置が FIFO でも `open_or_create_file` は止まらず拒否する。
+    #[test]
+    fn stack8_4734_open_or_create_file_rejects_fifo_without_blocking() {
+        let base = tmp("lockfifo");
+        let root = ExtractRoot::open_existing_dir(&base).unwrap();
+        let st = std::process::Command::new("mkfifo")
+            .arg(base.join("l"))
+            .status()
+            .unwrap();
+        assert!(st.success());
+        assert!(root.open_or_create_file("l", 0o600).is_err());
+        drop(root.open_or_create_file("regular", 0o600).unwrap());
         fs::remove_dir_all(&base).unwrap();
     }
 

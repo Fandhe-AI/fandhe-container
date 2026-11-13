@@ -176,7 +176,7 @@ pub(super) fn resolve_source(
 }
 
 #[cfg(target_os = "linux")]
-fn detect_install() -> Result<InstallKind, TraitError> {
+pub(super) fn detect_install() -> Result<InstallKind, TraitError> {
     use fandhe_container_supervisor::control::listener::effective_uid;
     use fandhe_container_supervisor::start_client::{LauncherPresence, classify_launcher_beside};
     let euid = effective_uid()?;
@@ -194,7 +194,7 @@ fn detect_install() -> Result<InstallKind, TraitError> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn detect_install() -> Result<InstallKind, TraitError> {
+pub(super) fn detect_install() -> Result<InstallKind, TraitError> {
     Ok(InstallKind::NonLinux)
 }
 

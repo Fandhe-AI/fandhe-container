@@ -773,6 +773,32 @@ pub(crate) use imp::{
 };
 pub(crate) use imp::{install_forwarding_handler, reset_child_signal_if_ignored};
 
+/// `cmd` の子が、親（呼び出しプロセス）の終了で `SIGKILL` を受けるようにする（`PR_SET_PDEATHSIG`。
+/// `up` の `create` / `start` の子が親の終了後に残らないため。REPAIR-5・#4734）。
+///
+/// 子は exec の前に `prctl` を呼び、続けて実際の親が spawn 時の親のままであることを確かめる（設定前に親が
+/// 終わっていた競合では exec せず失敗させ、`spawn` が `Err` になる。fail-closed）。`PR_SET_PDEATHSIG` は
+/// 「親を生成したスレッド」の終了に結びつくため、呼び出しはプロセスの存続中に居続けるスレッド（`up` では main）で行うこと。
+/// 確認していない libc では `prctl` の設定が `Unsupported` となり、`spawn` は失敗する。
+#[cfg(target_os = "linux")]
+pub(crate) fn bind_child_to_parent_lifetime(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt as _;
+    let parent = std::process::id();
+    // SAFETY: `pre_exec` のクロージャは fork 後・exec 前の子で動く。ここでは `prctl`（整数引数のみ。async-signal-safe）と
+    // `getppid`（`parent_id`。割り当て・ロックなし）と整数比較だけを行い、メモリ・fd には触れない。
+    // `parent`（Copy の u32）以外の状態を捕捉しない。
+    unsafe {
+        cmd.pre_exec(move || {
+            set_parent_death_sigkill()?;
+            if std::os::unix::process::parent_id() == parent {
+                Ok(())
+            } else {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+        });
+    }
+}
+
 // 対象は構造体レイアウトを確認済みの `imp`（実装側）と同じ cfg に揃える（musl 等の fail-closed 側を
 // 実装側の試験で検証したことにしない。PR #1572 事後監査の P3）。
 #[cfg(all(

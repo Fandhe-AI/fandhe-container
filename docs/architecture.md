@@ -153,7 +153,7 @@ flowchart LR
     core -.->|想定| io
     cli -->|確定| core
     cli -->|確定| oci
-    cli -.->|想定| stack
+    cli -->|確定 #4630| stack
     cli -->|確定| net
     cli -->|確定| supervisor
     cli -->|確定| plugin
@@ -161,7 +161,7 @@ flowchart LR
     plugin_star["plugin-*（バイナリ群）"] -.->|想定| core
     plugin_mcp["plugin-mcp"] -->|確定| core
     core -.->|optional・plugin feature| plugin["plugin（境界基盤）"]
-    stack -.->|想定| core
+    stack -.->|不採用 #4630| core
 ```
 
 | 依存元 → 依存先 | 根拠 | 状態 |
@@ -186,12 +186,12 @@ flowchart LR
 | `platform-macos` → `io` | virtiofs 共有の I/O 共有プロトコルクライアント（`PipelineClient`）を使う（MAC-1・TASK-65.2。workspace 内 path 依存で実装済み。外部クレートの追加ではない）。向きはバックエンド → core 側で、規則 2 の逆向きのため抵触しない | 確定 |
 | `cli` → `net` | `doctor` が br_netfilter・ホストの `ip filter FORWARD` policy の判定材料を net の読み取り照会（GETCHAIN）で取得する（NET-10・TASK-148.1。workspace 内 path 依存で実装済み。組み合わせ判定・警告・DOCKER-USER 案内・終了コードの評価層は TASK-148.2 で実装済み。CLI 配線は TASK-79） | 確定 |
 | `cli` → `plugin`（境界基盤） | バイナリ `fandhe-container` が受けた SIGINT・SIGTERM・SIGHUP を、起動中の plugin へ転送する API（`signal_forward`）を呼ぶ。シグナルハンドラの登録はバイナリの責務（PLUG-7・#1513・#1403。workspace 内 path 依存で実装済み。外部クレートの追加ではない）。`plugin` は境界基盤で `plugin-*` バイナリ crate ではないため規則 2 に抵触しない | 確定 |
-| `cli` → `stack` | 統一 CLI が TOML スキーマを呼ぶ想定（G6・TASK-155） | 想定 |
+| `cli` → `stack` | 統一 CLI が TOML スキーマを呼ぶ想定（G6・TASK-155） | 確定（#4630。2026-11-13 承認。`up` の結線は #4638） |
 | `plugin-mcp` → `core` | `tools/call` の `list_containers` が core の `FileStateStore`（OCI-5）を読む（MCP-2・TASK-118.3・#466。workspace 内 path 依存で実装済み。外部クレートの追加ではない）。向きはバックエンド → core で、規則 2 の逆向きのため抵触しない。他の `plugin-*` は個別に確定するまで下行の想定のまま | 確定 |
 | `plugin-mcp` → `plugin`（境界基盤） | core が bind した UDS へ peer 認証つき（`UdsStream::connect`）で接続して JSON-RPC を処理する（PLUG-12・MCP-1・TASK-118.4・#467。workspace 内 path 依存で実装済み。外部クレートの追加ではない。core 側 proxy との結線とフレーミングの確定は TASK-114） | 確定 |
 | `plugin-*`（バイナリ群） → `core` | トレイト型（`ContainerRuntime` 等の共通型）を参照する想定（TASK-114〜118） | 想定 |
 | `core` → `plugin`（境界基盤） | core の `plugin` feature（既定で有効）で optional 依存。`--no-default-features` で除外できる（PLUG-3・TASK-111.1・#262）。plugin 候補の探索は core 側の `crates/core/src/plugin_discovery.rs` に実装済み。登録の成果物も core 側に置く想定（TASK-109） | 確定（optional 辺。探索は実装済み・登録は未実装） |
-| `stack` → `core` | `up` コマンドが core の CLI／ライブラリ API を呼ぶ想定（PLUG-1 境界表の stack 行・TASK-155） | 想定 |
+| `stack` → `core` | `up` コマンドが core の CLI／ライブラリ API を呼ぶ想定（PLUG-1 境界表の stack 行・TASK-155） | 不採用（#4630。状態の読み取りの本番アダプタは cli 側。`make check-stack-deps` が機械判定） |
 | `supervisor` → `net` | rootless ネットワーク転送の pasta の起動・監視・回収をコンテナごとの supervisor が行う（NET-9・CORE-1・#1940。`net` は core 側のライブラリに確定〔2026-10-12 オーナー決定、[#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6129145225)〕。辺は #3065 で `Cargo.toml` に追加した。依存の向きは feature を切らない通常の依存に確定〔#1870・[network-wiring.md](design/network-wiring.md) D5〕。起動オプション文書 FCOPT1 の network・add-host・dns を復号のたびに net で再検証する用途も同じ辺を使う〔#3065・NET-6・NET-12〕。外部クレートの追加なし） | 確定 |
 | `supervisor` → `plugin` | macOS の VM 保持役（bin `fandhe-container-vm-keeper`）の peer UID 照合つき UDS に `UdsListener` / `UdsStream` を使う（#2278・MAC-4・PLUG-12）。**feature `vm-keeper` の下のみ**の optional な unix 限定の依存で、既定では無効。cli は supervisor を既定 feature で引くため cli の依存木には入らない（`make check-cli-no-plugin`）。core の `plugin` feature は有効にしない（PLUG-3・#3204）。workspace 内 path 依存で外部クレートの追加なし。plugin は supervisor に依存しないため循環しない | 確定 |
 | `plugin-cri` → `oci`（イメージ参照） | `CoreLifecycleRuntime` の `create` が OCI-7 のコンテナ参照を `ImageStore` へ登録・確定し、`delete` が解除する（`image_refs` の `StoreImageRefs`。CLI の `StoreImageRefs` と同じ式の暫定の 2 つ目のアダプタで、置き場所の判断は [image-store-adapter-placement.md](design/image-store-adapter-placement.md) の承認待ち。キー導出は共有 fixture で照合）。`RemoveImage` は `PersistentImageStore` が同じ `@lock` の区間で使用中を判定して `FAILED_PRECONDITION` にする。既存の辺（plugin-cri → oci・core）のみで依存の追加なし（#2791・OCI-7・CRI-2） | 確定 |

@@ -249,6 +249,53 @@ pub fn plan_startup(services: &BTreeMap<String, Service>) -> Result<StartupPlan,
     Ok(StartupPlan { steps })
 }
 
+/// `up <service>...` の対象に、その `depends_on` の推移閉包を加えたサービスだけを返す（STACK-8・STACK-2・TASK-155・#4638）。
+///
+/// `targets` が空なら全サービスを返す（明示対象なし）。存在しない対象は呼び出し側の `select_enabled_services` が
+/// 先に拒否するが、ここでも無視せず `UnknownDependency`（参照元は空文字）で返す（fail-closed）。
+/// 未定義の依存先は辿らずに残し、後続の [`plan_startup`] が拒否する（起動ゼロ）。
+/// 走査は明示スタックの反復で、各サービスを高々 1 回だけ訪れる（O(V+E)。外部入力の深さで stack overflow しない）。
+pub fn dependency_closure<'a, I>(
+    services: &BTreeMap<String, Service>,
+    targets: I,
+) -> Result<BTreeMap<String, Service>, DependsOnError>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut roots: Vec<&str> = Vec::new();
+    for t in targets {
+        if !services.contains_key(t) {
+            return Err(DependsOnError::UnknownDependency {
+                service: String::new(),
+                dependency: t.to_owned(),
+            });
+        }
+        roots.push(t);
+    }
+    if roots.is_empty() {
+        return Ok(services.clone());
+    }
+    let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    let mut stack = roots;
+    while let Some(name) = stack.pop() {
+        if !seen.insert(name) {
+            continue;
+        }
+        if let Some(svc) = services.get(name) {
+            for dep in svc.depends_on.keys() {
+                if services.contains_key(dep.as_str()) && !seen.contains(dep.as_str()) {
+                    stack.push(dep);
+                }
+            }
+        }
+    }
+    Ok(services
+        .iter()
+        .filter(|(n, _)| seen.contains(n.as_str()))
+        .map(|(n, s)| (n.clone(), s.clone()))
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,5 +551,47 @@ mod tests {
             DependsOnError::Cycle { path } => assert_eq!(path.len(), 3),
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    /// STACK-8・#4638: `up web` は db を含み、無関係の worker を含まない。推移閉包・空の対象・未知の対象も照合する。
+    #[test]
+    fn stack8_4638_dependency_closure_follows_depends_on_transitively() {
+        let m = svcs(&[
+            ("web", &[("api", Started)]),
+            ("api", &[("db", Healthy)]),
+            ("db", &[]),
+            ("worker", &[]),
+        ]);
+        let got = dependency_closure(&m, ["web"]).expect("closure");
+        let names: Vec<&str> = got.keys().map(String::as_str).collect();
+        assert_eq!(names, vec!["api", "db", "web"]);
+        let got = dependency_closure(&m, ["db"]).expect("closure");
+        assert_eq!(
+            got.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["db"]
+        );
+        let all = dependency_closure(&m, std::iter::empty::<&str>()).expect("all");
+        assert_eq!(all.len(), 4);
+        let e = dependency_closure(&m, ["nope"]).expect_err("unknown");
+        assert_eq!(
+            e.code(),
+            DependsOnError::UnknownDependency {
+                service: String::new(),
+                dependency: String::new(),
+            }
+            .code()
+        );
+        // 未定義の依存先は残して plan_startup に拒否させる。
+        let dangling = svcs(&[("web", &[("ghost", Started)])]);
+        let got = dependency_closure(&dangling, ["web"]).expect("closure");
+        assert!(plan_startup(&got).is_err());
+    }
+
+    /// STACK-8・#4638: 循環があっても閉包の走査は止まる。
+    #[test]
+    fn stack8_4638_dependency_closure_terminates_on_cycle() {
+        let m = svcs(&[("a", &[("b", Started)]), ("b", &[("a", Started)])]);
+        let got = dependency_closure(&m, ["a"]).expect("closure");
+        assert_eq!(got.len(), 2);
     }
 }

@@ -37,7 +37,9 @@
 //! - 供給側（`NetworkPlugin::create_netns` の結果を supervisor がこの型へ詰めて渡す配線）は #3074・#4724 の範囲。
 //! - 非 Linux では固定できず `Unimplemented`（fail-closed。CLI-1）。
 
-use std::path::{Component, Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::path::Component;
+use std::path::{Path, PathBuf};
 
 use crate::audit_log::NetnsJoinOutcome;
 use crate::traits::{ErrorCode, TraitError};
@@ -63,29 +65,36 @@ fn malformed_path() -> TraitError {
 }
 
 /// 絶対パスで、`.`・`..` を含まず、上限以内で NUL を含まないこと。
+///
+/// 対象は Linux のパス（`/` 区切り）で、ホスト OS に依存せず文字列で検査する（`Path::is_absolute` は Windows で
+/// `/run/n` を絶対と見なさず、`Component::Prefix` の拒否も OS 依存のため使わない。3 OS 対応）。空要素（`//`・末尾の
+/// `/`）はカーネルの解決と同じく畳んで許す。
 fn check_lexical(path: &Path) -> Result<(), TraitError> {
+    let text = path.to_string_lossy();
     let bad = path.as_os_str().len() > PATH_MAX_BYTES
-        || !path.is_absolute()
-        || path.to_string_lossy().contains('\0')
-        // `Path::components` は途中の `.` を畳むため、文字列の要素でも確かめる。
-        || path.to_string_lossy().split('/').any(|seg| seg == ".")
-        || path
-            .components()
-            .any(|c| !matches!(c, Component::RootDir | Component::Normal(_)));
+        || text.contains('\0')
+        || !text.starts_with('/')
+        || text.split('/').any(|seg| seg == "." || seg == "..");
     if bad { Err(malformed_path()) } else { Ok(()) }
 }
 
-/// 置き場の直下の 1 要素の名前（`path.parent() == Some(root)` かつ最終要素が通常の名前）を返す。
-fn entry_name<'a>(root: &Path, path: &'a Path) -> Result<&'a std::ffi::OsStr, TraitError> {
-    if path.parent() != Some(root) {
-        return Err(TraitError::new(
+/// パスの空でない要素（OS 非依存。`check_lexical` 済みの前提）。
+fn segments(path: &Path) -> Result<Vec<&str>, TraitError> {
+    let text = path.to_str().ok_or_else(malformed_path)?;
+    Ok(text.split('/').filter(|s| !s.is_empty()).collect())
+}
+
+/// 置き場の直下の 1 要素の名前（`path` の要素が `root` の要素 + ちょうど 1 要素）を返す。文字列で OS 非依存に判定する。
+fn entry_name<'a>(root: &Path, path: &'a Path) -> Result<&'a str, TraitError> {
+    let root_segs = segments(root)?;
+    let mut path_segs = segments(path)?;
+    let direct = path_segs.len() == root_segs.len() + 1 && path_segs.starts_with(&root_segs);
+    match path_segs.pop() {
+        Some(name) if direct => Ok(name),
+        _ => Err(TraitError::new(
             ErrorCode::InvalidArgument,
             "the netns join path must be a single entry directly under the netns join root",
-        ));
-    }
-    match path.components().next_back() {
-        Some(Component::Normal(name)) => Ok(name),
-        _ => Err(malformed_path()),
+        )),
     }
 }
 
@@ -284,7 +293,7 @@ impl PinnedNetnsJoin {
         check_lexical(&target.root).map_err(malformed)?;
         check_lexical(&target.path).map_err(malformed)?;
         let name = entry_name(&target.root, &target.path).map_err(malformed)?;
-        let name_c = std::ffi::CString::new(name.as_bytes())
+        let name_c = std::ffi::CString::new(name)
             .map_err(|_| NetnsPinRejection::audited(NetnsJoinOutcome::PathMalformed))?;
         let classify_open = |e: SysError, what: &'static str| match e {
             SysError::Os(errno) if errno == sys::ENOTDIR || errno == sys::ELOOP => {

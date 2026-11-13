@@ -828,13 +828,52 @@ pub fn join_namespaces(target: &Pid1Target) -> Result<NamespaceJoinReport, ExecE
         }
     });
     ensure_not_exited(target, "refusing to setns")?;
-    let flags: Vec<NsFlag> = joined.iter().map(|n| n.flag()).collect();
+    // 対象の network namespace が init user namespace 所有（rootful の bridge の pin 済み netns。#3069）なら、
+    // user namespace へ参加する前に単独で参加する。カーネルは `User` を含む `setns` で user namespace を先に取り付け、
+    // 以降の権限検査を参加先の user namespace で行うため、init 所有の netns は `CAP_SYS_ADMIN` 不足で `EPERM`
+    // になる。参加前の呼び出し側（init の `CAP_SYS_ADMIN` を持つ）なら両方の検査を満たす。
+    let early_net = target.user_ns.is_distinct()
+        && joined.contains(&JoinNamespace::Net)
+        && net_owned_by_init_userns(target);
+    if early_net {
+        sys::setns_pidfd(target.pidfd.as_fd(), &[NsFlag::Net])
+            .map_err(|e| setns_error(e, "setns(net before user)"))?;
+        ensure_not_exited(target, "refusing to setns")?;
+    }
+    let flags = combined_join_flags(&joined, early_net);
     sys::setns_pidfd(target.pidfd.as_fd(), &flags).map_err(|e| setns_error(e, "setns"))?;
     Ok(NamespaceJoinReport {
         target_pid: target.pid,
         user_namespace_joined: target.user_ns.is_distinct(),
         joined,
     })
+}
+
+/// init user namespace の固定 inode（`PROC_USER_INIT_INO` = `0xEFFFFFFD`。3.8 以降の ABI）。
+const PROC_USER_INIT_INO: u64 = 0xEFFF_FFFD;
+
+/// 対象の network namespace を所有するのが init user namespace か（読めない・判定できないときは `false`。
+/// `false` なら従来どおり 1 回の `setns` に含めるだけで、権限が足りなければカーネルが拒否する）。
+fn net_owned_by_init_userns(target: &Pid1Target) -> bool {
+    let Ok(net) = fs::File::open(format!("/proc/{}/ns/net", target.pid)) else {
+        return false;
+    };
+    let Ok(owner) = sys::ns_owner_userns(net.as_fd()) else {
+        return false;
+    };
+    let (Ok(net_meta), Ok(owner_meta)) = (net.metadata(), fs::File::from(owner).metadata()) else {
+        return false;
+    };
+    owner_meta.dev() == net_meta.dev() && owner_meta.ino() == PROC_USER_INIT_INO
+}
+
+/// 1 回の `setns` に渡す集合。`early_net`（先に単独で参加済み）なら network namespace を除く。
+fn combined_join_flags(joined: &[JoinNamespace], early_net: bool) -> Vec<NsFlag> {
+    joined
+        .iter()
+        .filter(|n| !(early_net && **n == JoinNamespace::Net))
+        .map(|n| n.flag())
+        .collect()
 }
 
 /// syscall 失敗を `SetNs` 段の `ExecError` にする。`ESRCH`（対象の終了）は `NotFound`。
@@ -1498,6 +1537,20 @@ mod tests {
             Ok(m) => assert!(m.uid.host_id_of(0).is_some()),
             Err(e) => assert_eq!(e.stage, IsolationStage::Validate),
         }
+    }
+
+    /// NET-1・SEC-1・CORE-3・#3069: init 所有 netns を先に単独で参加したときだけ、1 回の `setns` の集合から net を除く
+    /// （user は先頭のまま）。除かないと user 取り付け後の再参加が `EPERM` になる。
+    #[test]
+    fn net1_3069_combined_flags_drop_net_only_when_joined_early() {
+        use JoinNamespace::{Ipc, Mount, Net, Pid, User, Uts};
+        let all = [User, Pid, Mount, Uts, Ipc, Net];
+        let with = combined_join_flags(&all, false);
+        let without = combined_join_flags(&all, true);
+        assert_eq!(with.len(), 6);
+        assert_eq!(without.len(), 5);
+        assert!(!without.contains(&Net.flag()));
+        assert_eq!(without[0], User.flag());
     }
 
     /// SUP-6・SEC-5・TASK-163.h2・#1462: `/proc/<pid>/status` の `Uid:` から実効 uid（2 番目）を取る。行なし・

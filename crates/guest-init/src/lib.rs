@@ -45,13 +45,19 @@
 //! lib のルートで `unsafe_code` を deny にし、`sys` だけを allow にする。`sys` の外に `unsafe` が入ると
 //! コンパイルで落ちる（workspace の `undocumented_unsafe_blocks` が見ない `unsafe extern` ブロックも対象）。
 //!
+//! # mount 先の固定（MAC-1・SEC-1・#2268・#2080 P2-4）
+//!
+//! virtiofs の mount 先は文字列パスで検査・mount せず、`/` から要素ごとに `openat(O_PATH|O_DIRECTORY|
+//! O_NOFOLLOW|O_CLOEXEC)` で辿った fd を `/proc/self/fd/<n>` として `mount(2)` に渡す（欠けた要素は
+//! `mkdirat`、mode 0o755）。検査と mount が同じ fd を指すので、ゲスト内で子プロセスを動かしても差し替えで
+//! mount 先はずれない。`/proc/self/fd` の解決は PID 1 自身が先に mount した proc に依る。
+//!
+//! 残る範囲: `/proc`・`/sys`・`/dev`・基底ディレクトリの作成と mount は他のプロセスが生まれる前に固定パスで
+//! 行う。mount 後に試験専用プローブ（`probe`・`link_probe`）が文字列パスで共有へ触れる（本番の起動では
+//! 走らない）。mount 後のディレクトリの rename は対象外。実 VM・aarch64 での確認は #1628。
+//!
 //! # 未実装（REPAIR-3）
 //!
-//! - mount 先の検査（`ensure_real_dir`）と文字列パスの `mount(2)` の間には TOCTOU の余地がある。mount 時に
-//!   ゲスト内で動くのは PID 1 だけなので差し替える主体がいない。この前提はゲスト内で子プロセス（コンテナ）を
-//!   動かした時点で崩れるため、その変更の前に fd 起点の mount（要素ごとの `openat`＋`O_NOFOLLOW` から
-//!   `/proc/self/fd/<n>` へ mount、または `open_tree`／`move_mount`）へ移すことを前提条件とする
-//!   （#2080・#1905）。`/proc`・`/sys`・`/dev` は他のプロセスが生まれる前に固定パスへ mount する。
 //! - EBUSY の分岐（実カーネルでの devtmpfs の二重 mount）と panic hook が PID 1 で待機へ落ちる挙動は CI では
 //!   動かせない。単体テストは解析・分類・診断行だけを覆い、実機の VM での確認は #1628 に委ねる（#2139）。
 //! - 協調停止: `reboot(2)` 等は呼ばない。VM の停止はホストの VZ の強制停止に任せる（TASK-115）。

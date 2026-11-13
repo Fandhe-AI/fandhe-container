@@ -10,10 +10,19 @@ use crate::report::{Errno, ReportLine};
 
 /// ゲスト固有の副作用の差し替え口。
 pub trait GuestOps {
-    /// mount point を `/mnt/fandhe` 配下に作る。各要素が実ディレクトリ（symlink でない）であることを保証する。
-    fn ensure_mount_point(&mut self, mount_point: &MountPoint) -> Result<(), Errno>;
-    /// virtiofs を mount する（tag が source。`ro` は必ず読み取り専用）。
-    fn mount_virtiofs(&mut self, directive: &Directive) -> Result<(), Errno>;
+    /// 検査済みの mount 先を固定した値（Linux では開いた fd）。`ensure_mount_point` が返し、`mount_virtiofs` が
+    /// 受け取る。OS 非依存を保つため具体型は実装側が決める。
+    type MountTarget;
+    /// mount point を `/mnt/fandhe` 配下に作り、各要素が実ディレクトリ（symlink でない）であることを保証して、
+    /// その mount 先を固定した値を返す（#2268）。
+    fn ensure_mount_point(&mut self, mount_point: &MountPoint) -> Result<Self::MountTarget, Errno>;
+    /// virtiofs を `target` へ mount する（tag が source。`ro` は必ず読み取り専用）。mount 先は `target` だけで、
+    /// パスを引き直さない（検査と mount の間の差し替えを防ぐ）。
+    fn mount_virtiofs(
+        &mut self,
+        target: Self::MountTarget,
+        directive: &Directive,
+    ) -> Result<(), Errno>;
     /// 1 行を hvc0 へ出す。失敗は無視してよい（報告先が無く、ホストはタイムアウトで fail-closed になる）。
     fn write_line(&mut self, line: &ReportLine);
 }
@@ -47,7 +56,7 @@ pub fn process_directives<O: GuestOps>(cmdline: &str, ops: &mut O) -> ProcessOut
             for d in &directives {
                 let result = ops
                     .ensure_mount_point(&d.mount_point)
-                    .and_then(|()| ops.mount_virtiofs(d));
+                    .and_then(|target| ops.mount_virtiofs(target, d));
                 match result {
                     Ok(()) => {
                         outcome.mounted += 1;
@@ -91,14 +100,17 @@ mod tests {
         events: Vec<String>,
         lines: Vec<String>,
         mount_errno: Option<i32>,
+        targets: Vec<String>,
     }
 
     impl GuestOps for Fake {
-        fn ensure_mount_point(&mut self, mp: &MountPoint) -> Result<(), Errno> {
+        type MountTarget = String;
+        fn ensure_mount_point(&mut self, mp: &MountPoint) -> Result<String, Errno> {
             self.events.push(format!("mkdir {}", mp.as_str()));
-            Ok(())
+            Ok(format!("target:{}", mp.as_str()))
         }
-        fn mount_virtiofs(&mut self, d: &Directive) -> Result<(), Errno> {
+        fn mount_virtiofs(&mut self, target: String, d: &Directive) -> Result<(), Errno> {
+            self.targets.push(target);
             let mode = if d.access == Access::ReadOnly {
                 "ro"
             } else {
@@ -153,6 +165,20 @@ mod tests {
         assert_eq!(
             f.lines.last().map(String::as_str),
             Some("fandhe-guest: init ready v1")
+        );
+    }
+
+    /// MAC-1・#2268: mount は直前の ensure_mount_point が返した値だけを受け取る。
+    #[test]
+    fn mac1_2268_mount_receives_target_from_ensure() {
+        let mut f = Fake::default();
+        process_directives(
+            "fandhe.virtiofs=a:/mnt/fandhe/a:ro fandhe.virtiofs=b:/mnt/fandhe/b:rw",
+            &mut f,
+        );
+        assert_eq!(
+            f.targets,
+            vec!["target:/mnt/fandhe/a", "target:/mnt/fandhe/b"]
         );
     }
 

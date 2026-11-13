@@ -19,17 +19,19 @@
 //! 無い単一の JSON オブジェクトとして読め、キーが重複せず、`event` を持つ。キー順は
 //! `event` が先頭、または `level` → `event`。
 
-#![allow(dead_code)]
-
 /// core の `logging::MAX_LOG_LINE_BYTES` の写し（一致は core の試験で照合する）。
+#[allow(dead_code)] // #[path] で取り込む利用側ごとに使う項目が異なる（共有検査器）
 pub const SHARED_MAX_LOG_LINE_BYTES: usize = 32 * 1024;
 /// journald の `LineMax` の既定値。超えた行は分割され 1 行 1 JSON が壊れる。
+#[allow(dead_code)] // #[path] で取り込む利用側ごとに使う項目が異なる（共有検査器）
 pub const JOURNALD_LINE_MAX_DEFAULT: usize = 48 * 1024;
 
 /// 表示を乱す文字・制御文字・エスケープが要る文字をまとめた敵対的な入力。
+#[allow(dead_code)] // #[path] で取り込む利用側ごとに使う項目が異なる（共有検査器）
 pub const HOSTILE_TEXT: &str = "a\nb\rc\u{0}d\u{7}e\u{1b}[31mf\u{7f}g\u{85}h\u{2028}i\u{2029}j\u{202e}k\u{200b}l\u{feff}m\"n\\o\u{3042}";
 
 /// 契約違反の種類。`usize` は 0 始まりの行番号。
+#[allow(dead_code)] // #[path] で取り込む利用側ごとに使う項目が異なる（共有検査器）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Violation {
     Empty,
@@ -51,6 +53,7 @@ pub enum Violation {
 }
 
 /// 1 行から取り出した事実。
+#[allow(dead_code)] // #[path] で取り込む利用側ごとに使う項目が異なる（共有検査器）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineFacts {
     pub level: Option<String>,
@@ -62,6 +65,7 @@ pub struct LineFacts {
     pub bools: Vec<(String, bool)>,
 }
 
+#[allow(dead_code)] // #[path] で取り込む利用側ごとに使う項目が異なる（共有検査器）
 impl LineFacts {
     pub fn str_of(&self, key: &str) -> Option<&str> {
         self.strings
@@ -78,6 +82,7 @@ impl LineFacts {
 }
 
 /// LF 区切りのバイト列全体（出力の全量）を検査する。
+#[allow(dead_code)] // #[path] で取り込む利用側ごとに使う項目が異なる（共有検査器）
 pub fn check_stream(bytes: &[u8], max_line: usize) -> Result<Vec<LineFacts>, Violation> {
     if bytes.is_empty() {
         return Err(Violation::Empty);
@@ -94,6 +99,7 @@ pub fn check_stream(bytes: &[u8], max_line: usize) -> Result<Vec<LineFacts>, Vio
 }
 
 /// LF を含まない 1 行分の本体（`drain_lines` の戻り値等）を検査する。
+#[allow(dead_code)] // #[path] で取り込む利用側ごとに使う項目が異なる（共有検査器）
 pub fn check_body(body: &str, max_line: usize) -> Result<LineFacts, Violation> {
     if body.contains('\n') {
         return Err(Violation::EmbeddedLf);
@@ -156,11 +162,16 @@ fn finish(idx: usize, f: Raw) -> Result<LineFacts, Violation> {
     if !ok_name {
         return Err(Violation::BadEventName(idx));
     }
+    let level_present = f.keys.iter().any(|k| k == "level");
     let level = f
         .strings
         .iter()
         .find(|(k, _)| k == "level")
         .map(|(_, v)| v.clone());
+    // level キーがあるのに文字列でない値（1・null 等）は level なしとして通さない。
+    if level_present && level.is_none() {
+        return Err(Violation::BadLevel(idx));
+    }
     match (&level, pos) {
         (None, 0) => {}
         (Some(l), 1) => {

@@ -135,7 +135,10 @@ fn err4_3122_checker_agrees_with_serde_json() {
             "{\"level\":\"loud\",\"event\":\"x\"}\n",
             Violation::BadLevel(0),
         ),
-        ("{\"level\":1,\"event\":\"x\"}\n", Violation::BadKeyOrder(0)),
+        ("{\"level\":1,\"event\":\"x\"}\n", Violation::BadLevel(0)),
+        ("{\"level\":null,\"event\":\"x\"}\n", Violation::BadLevel(0)),
+        ("{\"event\":\"x\",\"level\":1}\n", Violation::BadLevel(0)),
+        ("{\"event\":\"x\",\"level\":null}\n", Violation::BadLevel(0)),
         (
             "{\"event\":\"x\",\"k\":\"\u{3042}\"}\n",
             Violation::TooLong { line: 0, len: 23 },

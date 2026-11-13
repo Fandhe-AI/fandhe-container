@@ -23,6 +23,9 @@ use crate::flock_release::ExplicitUnlockFile;
 /// ロックファイル名（VM 名は今回は固定の `default`。共用 VM は 1 つ。オプション方式で名前を足すときは検証つきの型にする）。
 pub(crate) const LOCK_FILE_NAME: &str = "vm-keeper-default.lock";
 
+/// 期限つき取得の `timeout` の上限（これを超える値は `InvalidArgument`。無期限相当の待ちを作らない）。
+pub const ACQUIRE_TIMEOUT_MAX: Duration = Duration::from_secs(3600);
+
 /// 期限つき取得の再試行間隔。
 const POLL: Duration = Duration::from_millis(10);
 
@@ -51,7 +54,16 @@ impl KeeperLock {
     /// `timeout` まで取得を繰り返す。期限切れは `Timeout`（無期限に待たない。REPAIR-5）。
     pub fn acquire_within(dir: &Path, timeout: Duration) -> Result<Self, TraitError> {
         let path = dir.join(LOCK_FILE_NAME);
-        let deadline = Instant::now() + timeout;
+        // `Duration::MAX` 等で `Instant` が溢れても panic させない（REPAIR-5）。
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .filter(|_| timeout <= ACQUIRE_TIMEOUT_MAX)
+            .ok_or_else(|| {
+                err(
+                    ErrorCode::InvalidArgument,
+                    "the vm keeper lock timeout is out of range",
+                )
+            })?;
         loop {
             if let Some(lock) = Self::attempt(dir, &path)? {
                 return Ok(lock);
@@ -75,6 +87,9 @@ impl KeeperLock {
                 .create(true)
                 .truncate(false)
                 .mode(0o600)
+                // 読み手のいない FIFO や symlink の追従で open が止まらないよう、非ブロッキング・symlink 非追従で
+                // 開く（REPAIR-5）。種別は取得前に fd で検査する。
+                .custom_flags(crate::logs::rotating::LOG_READ_FLAGS)
                 .open(path)
                 .map_err(|_| {
                     err(
@@ -82,6 +97,12 @@ impl KeeperLock {
                         "the vm keeper lock file cannot be opened",
                     )
                 })?;
+            if !file.metadata().is_ok_and(|m| m.is_file()) {
+                return Err(err(
+                    ErrorCode::PermissionDenied,
+                    "the vm keeper lock file has an unexpected type, owner or mode",
+                ));
+            }
             match file.try_lock() {
                 Ok(()) => {
                     // 取得直後に包む。以後どの経路で落ちても drop が明示 unlock する。
@@ -193,6 +214,31 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).expect("chmod");
         let e = KeeperLock::try_acquire(&d).expect_err("wide mode");
         assert_eq!(e.code(), ErrorCode::PermissionDenied);
+    }
+
+    #[test]
+    fn mac4_acquire_within_rejects_out_of_range_timeout() {
+        let (_g, d) = dir("range");
+        for t in [Duration::MAX, ACQUIRE_TIMEOUT_MAX + Duration::from_secs(1)] {
+            let e = KeeperLock::acquire_within(&d, t).expect_err("out of range");
+            assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        }
+    }
+
+    #[test]
+    fn mac4_fifo_lock_path_does_not_block() {
+        let (_g, d) = dir("fifo");
+        let path = d.join(LOCK_FILE_NAME);
+        // unsafe を避け、標準の mkfifo コマンドで FIFO を作る。
+        let ok = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .is_ok_and(|s| s.success());
+        assert!(ok, "mkfifo");
+        let start = Instant::now();
+        let e = KeeperLock::acquire_within(&d, Duration::from_millis(300)).expect_err("fifo");
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert_eq!(e.code(), ErrorCode::Internal);
     }
 
     #[test]

@@ -1040,7 +1040,7 @@ pub(super) const O_NOFOLLOW: i32 = 0;
 
 /// ログ読み取り open の `custom_flags`（非ブロッキング・symlink 非追従・`O_NOCTTY`。SUP-14・#2426）。
 #[cfg(unix)]
-const LOG_READ_FLAGS: i32 = crate::container_options::env::O_NONBLOCK
+pub(crate) const LOG_READ_FLAGS: i32 = crate::container_options::env::O_NONBLOCK
     | O_NOFOLLOW
     | crate::container_options::env::O_NOCTTY;
 

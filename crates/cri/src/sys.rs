@@ -155,14 +155,25 @@ struct Ucred {
     gid: u32,
 }
 
+/// `getsockopt` の level（Linux の `SOL_SOCKET`）。libc 照合から参照するためモジュールスコープに置く。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub(crate) const SOL_SOCKET: i32 = 1;
+/// `getsockopt` の optname（Linux の `SO_PEERCRED`）。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub(crate) const SO_PEERCRED: i32 = 17;
+
 /// 接続元の実効 uid（Linux は `SO_PEERCRED`）。
 #[cfg(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 pub(crate) fn peer_uid(stream: &UnixStream) -> Result<u32, ()> {
-    const SOL_SOCKET: i32 = 1;
-    const SO_PEERCRED: i32 = 17;
     let mut cred = Ucred {
         pid: 0,
         uid: 0,
@@ -321,10 +332,9 @@ mod libc_abi {
         const _: GetsockoptFn = super::super::getsockopt;
         const _: GetsockoptFn = libc::getsockopt;
 
-        // `peer_uid` の関数内ローカル定数 `SOL_SOCKET`・`SO_PEERCRED` は項目として参照できないため、
-        // `libc` 側の値をここで固定する（本体の値と同じ 1・17）。
-        const _: () = assert!(libc::SOL_SOCKET == 1);
-        const _: () = assert!(libc::SO_PEERCRED == 17);
+        // `peer_uid` が実際に使うモジュールスコープ定数を `libc` と比べる。
+        const _: () = assert!(super::super::SOL_SOCKET == libc::SOL_SOCKET);
+        const _: () = assert!(super::super::SO_PEERCRED == libc::SO_PEERCRED);
 
         use super::super::Ucred;
         const _: () = assert!(size_of::<Ucred>() == size_of::<libc::ucred>());

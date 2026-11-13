@@ -403,13 +403,31 @@ fn usage() -> CliExit {
 /// `create` / `start` / `stop` / `delete` / `list` / `logs` は core を呼ぶ（TASK-79.2.1・TASK-79.2.2・TASK-79.3）。
 /// `list` の一覧は process の stdout へ出す。引数値は出力へ埋め込まない（インジェクション回避）。
 pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> CliExit {
-    run_to(args, &mut BoundedStdout)
+    let args: Vec<OsString> = args.into_iter().collect();
+    // 期限つき書き込みは `up` だけに使う。`list | less` や `logs --follow | less` のようにページャが読みを止める
+    // 通常の経路は、書き込みの待ちが正当なため期限を掛けない（#4638・REPAIR-5・CLI-1）。
+    if invokes_up(&args) {
+        run_to(args, &mut BoundedStdout)
+    } else {
+        run_to(args, &mut std::io::stdout())
+    }
 }
 
-/// process の stdout へ書く書き手。1 回の書き込みを別スレッドで行い、[`STDOUT_WRITE_TIMEOUT`] までだけ待つ。
+/// グローバルオプションの後の最初の語が `up` か（引数を消費しない先読み）。
+fn invokes_up(args: &[OsString]) -> bool {
+    parse_global(args.to_vec()).is_ok_and(|(_, rest)| {
+        rest.first()
+            .and_then(|a| a.to_str())
+            .and_then(Command::parse)
+            .is_some_and(|c| matches!(c, Command::Up))
+    })
+}
+
+/// `up` 専用の stdout の書き手（他のサブコマンドには使わない）。1 回の書き込みを別スレッドで行い、[`STDOUT_WRITE_TIMEOUT`] までだけ待つ。
 ///
 /// 満杯の pipe / socket への `write_all` が main スレッドを無期限に止めるのを防ぐ（REPAIR-5）。期限切れは
-/// `TimedOut`。期限切れのスレッドは置き去りにする（main の return でプロセスごと破棄される）。
+/// `TimedOut`。期限切れのスレッドは置き去りにし stdout のロックを保持したままになるが、`up` は期限切れを
+/// 失敗として返して終了するため、以後 stdout へ書く経路は無い（main の return でプロセスごと破棄される）。
 struct BoundedStdout;
 
 /// [`BoundedStdout`] の 1 回の書き込みを待つ上限。
@@ -547,6 +565,17 @@ fn run_doctor(tail: Vec<OsString>, stdout: &mut dyn Write) -> CliExit {
 
 #[cfg(test)]
 mod tests {
+    /// STACK-8・REPAIR-5・CLI-1: 期限つき stdout は `up` だけ（`list | less` 等を 2 秒で打ち切らない）。
+    #[test]
+    fn stack8_bounded_stdout_only_for_up() {
+        let a = |v: &[&str]| v.iter().map(OsString::from).collect::<Vec<_>>();
+        assert!(invokes_up(&a(&["up", "--file", "/p"])));
+        assert!(invokes_up(&a(&["--root", "/r", "up"])));
+        assert!(!invokes_up(&a(&["list"])));
+        assert!(!invokes_up(&a(&["logs", "up"])));
+        assert!(!invokes_up(&a(&[])));
+    }
+
     use super::*;
 
     fn args(v: &[&str]) -> Vec<OsString> {

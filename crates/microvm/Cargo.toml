@@ -1,3 +1,4 @@
+# #3664 で sys の FFI 宣言と libc の機械照合を追加（dev-dependencies の libc のみ。#3290 で承認。製品の依存・unsafe は増やさない）。
 # #4225 で KVM_GET_DIRTY_LOG のラッパーと dirty_log（dirty bitmap の取得 API）を追加（依存は増やさない。unsafe は src/sys.rs のみ）。
 # #4159 で hugepage での確保を採らない判断を記録し、モジュール doc を合わせる（依存は増やさない。unsafe 追加なし）。
 # #4042 で WFI の起床のスロットの束と停止の kick の包み（呼び出し元なし）と VmWithGic の保持を削除した（依存は増やさない。unsafe 追加なし）。
@@ -86,3 +87,9 @@ publish = false
 # workspace の lint 設定を継承する（ルート Cargo.toml の [workspace.lints]。#1138）。
 [lints]
 workspace = true
+
+# `sys` の自前 FFI 宣言を libc と照合する試験専用の依存（#3664・#3290・MVM-4・REPAIR-12）。製品の依存には入れない
+# （cargo tree -e normal,build に現れない）。`sys.rs`（Linux）と `sys/hvf.rs`（macOS）は unix のため unix に限る。
+# 方式は docs/design/ffi-libc-check.md。
+[target.'cfg(unix)'.dev-dependencies]
+libc.workspace = true

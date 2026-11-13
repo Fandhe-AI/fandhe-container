@@ -40,9 +40,9 @@
 //! - `hv_vcpu_set_pending_interrupt` は GIC（#3789）を使う本ツリーの既定経路では使わない（GIC 無しとの比較用）。
 //!
 //! # `libc` との機械照合について
-//! `hv_*` は Hypervisor.framework の宣言で `libc` の範囲外。`mmap`・`munmap`・`sysconf` と下の定数は
-//! `libc` に対応物があり、本 crate は dev-dependency に `libc` を持たず照合は未導入（#3664 の導入後に
-//! 照合の対象）。定数は macOS の値で、Linux の値を流用しない。`hv_vm_config_t`・`hv_vcpu_config_t` は
+//! `hv_*` は Hypervisor.framework の宣言で `libc` の範囲外。`mmap`・`munmap`・`sysconf`・`dlsym`・`sysctlbyname` と
+//! 下の定数は `libc` に対応物があり、試験専用の `libc_abi` で `const` 評価により照合済み（#3664・MVM-4。
+//! dev-dependencies の `libc` は #3290 で承認）。定数は macOS の値で、Linux の値を流用しない。`hv_vm_config_t`・`hv_vcpu_config_t` は
 //! 不透明なポインタで NULL を渡す。`hv_*` と `HvVcpuExitRaw`（Hypervisor.framework の構造体）は `libc` に
 //! 対応物が無く、レイアウトは `hvf_abi` の const assert で固定する。
 //!
@@ -138,7 +138,7 @@ unsafe extern "C" {
 
 // SAFETY: 宣言は macOS（LP64）の libSystem の C ABI に一致させている（`dlsym` は `<dlfcn.h>`、
 // `sysctlbyname` は `<sys/sysctl.h>`、`os_release` は `<os/object.h>` の宣言。`size_t` = usize）。
-// `dlsym`・`sysctlbyname` は libc に対応物があり #3664 で照合する。`os_release` は libc に無い。
+// `dlsym`・`sysctlbyname` は libc に対応物があり `libc_abi` で照合済み（#3664）。`os_release` は libc に無い。
 unsafe extern "C" {
     fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
     fn sysctlbyname(
@@ -1317,6 +1317,74 @@ impl Drop for GicConfig {
         // （`create` は config を消費するが解放しない）。`hv_gic_create` は retain しないが、`create` の後に解放しても
         // 以後の `hv_gic_*`・`hv_vcpu_create`・`hv_vm_destroy` は成功した（実機のプローブ。#3803）。
         unsafe { os_release(self.raw) };
+    }
+}
+
+/// 自前の FFI 宣言と `libc` の機械照合（`const` 評価のみ。関数は呼ばず、新しい `unsafe` も足さない。
+/// MVM-4・REPAIR-12・#3664。方式は `docs/design/ffi-libc-check.md`）。
+///
+/// 対象外: `hv_*`（Hypervisor.framework。`libc` に無く、出典は Apple の文書と SDK 27.2 のヘッダ。#3803）、
+/// `os_release`（`<os/object.h>`）、`dlsym` で解決する `hv_gic_*` ほかの関数ポインタ型。
+/// `RTLD_DEFAULT` は生ポインタで `const` 評価では比べられないため値の `#[test]` で照合する
+/// （PR の `cross-target-check` では型検査のみ。値の照合は main の `platform-ci (macos-latest)` で実行される）。
+#[cfg(test)]
+mod libc_abi {
+    use super::{
+        ENOMEM, MAP_ANON, MAP_PRIVATE, PROT_READ, PROT_WRITE, RTLD_DEFAULT, SC_PAGESIZE, dlsym,
+        mmap, munmap, sysconf, sysctlbyname,
+    };
+    use std::ffi::{c_char, c_int, c_long, c_void};
+
+    const _: () = {
+        assert!(PROT_READ == libc::PROT_READ);
+        assert!(PROT_WRITE == libc::PROT_WRITE);
+        assert!(MAP_PRIVATE == libc::MAP_PRIVATE);
+        assert!(MAP_ANON == libc::MAP_ANON);
+        assert!(SC_PAGESIZE == libc::_SC_PAGESIZE);
+        assert!(ENOMEM == libc::ENOMEM);
+    };
+
+    const _: unsafe extern "C" fn(
+        *mut c_void,
+        usize,
+        c_int,
+        c_int,
+        c_int,
+        libc::off_t,
+    ) -> *mut c_void = mmap;
+    const _: unsafe extern "C" fn(
+        *mut c_void,
+        usize,
+        c_int,
+        c_int,
+        c_int,
+        libc::off_t,
+    ) -> *mut c_void = libc::mmap;
+    const _: unsafe extern "C" fn(*mut c_void, usize) -> c_int = munmap;
+    const _: unsafe extern "C" fn(*mut c_void, usize) -> c_int = libc::munmap;
+    const _: unsafe extern "C" fn(c_int) -> c_long = sysconf;
+    const _: unsafe extern "C" fn(c_int) -> c_long = libc::sysconf;
+    const _: unsafe extern "C" fn(*mut c_void, *const c_char) -> *mut c_void = dlsym;
+    const _: unsafe extern "C" fn(*mut c_void, *const c_char) -> *mut c_void = libc::dlsym;
+    const _: unsafe extern "C" fn(
+        *const c_char,
+        *mut c_void,
+        *mut usize,
+        *mut c_void,
+        usize,
+    ) -> c_int = sysctlbyname;
+    const _: unsafe extern "C" fn(
+        *const c_char,
+        *mut c_void,
+        *mut libc::size_t,
+        *mut c_void,
+        libc::size_t,
+    ) -> c_int = libc::sysctlbyname;
+
+    /// `RTLD_DEFAULT`（`(void *)-2`）が `libc` と一致する（MVM-4・#3664）。
+    #[test]
+    fn mvm4_hvf_rtld_default_matches_libc() {
+        assert_eq!(RTLD_DEFAULT, libc::RTLD_DEFAULT);
     }
 }
 

@@ -524,21 +524,21 @@ mod tests {
         for (code, line) in [
             (
                 ErrorCode::NotFound,
-                "FCSUP1 ERR NOT_FOUND 3 container launch failed in the Exec stage\n",
+                "FCSUP1 ERR NOT_FOUND 3 container launch failed in the exec stage\n",
             ),
             (
                 ErrorCode::PermissionDenied,
-                "FCSUP1 ERR PERMISSION_DENIED 6 container launch failed in the Exec stage\n",
+                "FCSUP1 ERR PERMISSION_DENIED 6 container launch failed in the exec stage\n",
             ),
             (
                 ErrorCode::InvalidArgument,
-                "FCSUP1 ERR INVALID_ARGUMENT 2 container launch failed in the Exec stage\n",
+                "FCSUP1 ERR INVALID_ARGUMENT 2 container launch failed in the exec stage\n",
             ),
         ] {
             let err = OciRuntimeError::new(
                 fandhe_container_core::oci_runtime::LifecycleOp::Start,
                 code,
-                "container launch failed in the Exec stage",
+                "container launch failed in the exec stage",
             );
             let r = StartReport::failed(&err);
             assert_eq!(r.encode(), line);

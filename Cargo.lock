@@ -470,6 +470,7 @@ version = "0.0.0"
 dependencies = [
  "fandhe-container-microvm",
  "fandhe-container-plugin",
+ "libc",
 ]
 
 [[package]]

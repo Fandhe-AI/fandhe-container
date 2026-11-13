@@ -23,7 +23,7 @@
 //! | 順 | 検査 | 不合格 |
 //! | -- | ---- | ------ |
 //! | 0 | 置き場・pin が絶対・`..` なし・4096 バイト以内・pin が置き場の直下の 1 要素 | `InvalidArgument` |
-//! | 0 | 置き場を symlink 非追従のディレクトリとして固定し、その fd 起点で pin を `O_NOFOLLOW` / `O_NONBLOCK` で 1 回だけ開く | symlink は `InvalidArgument`、権限不足は `PermissionDenied`、不在は `FailedPrecondition`（監査しない） |
+//! | 0 | 置き場を "/" から全要素 symlink 非追従で 1 要素ずつ辿ってディレクトリとして固定し、その fd 起点で pin を `O_NOFOLLOW` / `O_NONBLOCK` で 1 回だけ開く | symlink は `InvalidArgument`、権限不足は `PermissionDenied`、不在は `FailedPrecondition`（監査しない） |
 //! | 1 | `fstatfs` が nsfs | `InvalidArgument` |
 //! | 2 | `NS_GET_NSTYPE` が net | `InvalidArgument` |
 //! | 3 | 開いた fd の (dev, ino) が指定と一致 | `PermissionDenied` |
@@ -284,8 +284,6 @@ impl PinnedNetnsJoin {
         check_lexical(&target.root).map_err(malformed)?;
         check_lexical(&target.path).map_err(malformed)?;
         let name = entry_name(&target.root, &target.path).map_err(malformed)?;
-        let root_c = std::ffi::CString::new(target.root.as_os_str().as_bytes())
-            .map_err(|_| NetnsPinRejection::audited(NetnsJoinOutcome::PathMalformed))?;
         let name_c = std::ffi::CString::new(name.as_bytes())
             .map_err(|_| NetnsPinRejection::audited(NetnsJoinOutcome::PathMalformed))?;
         let classify_open = |e: SysError, what: &'static str| match e {
@@ -302,8 +300,21 @@ impl PinnedNetnsJoin {
         };
         // 置き場を symlink 非追従で固定し、その fd 起点で pin の単一要素だけを開く（配下性が構造的に閉じる）。
         // `O_NONBLOCK` により FIFO への差し替えでも止まらない（REPAIR-5）。
-        let root = sys::open_dir_path_nofollow(None, &root_c)
+        // 絶対パスの全要素を "/" から 1 要素ずつ `O_NOFOLLOW` で辿る（途中の symlink も辿らない。末尾の `/` は
+        // `components` が畳むため、`/run/link/` で symlink を辿らせる迂回も閉じる）。
+        let slash = std::ffi::CString::new("/")
+            .map_err(|_| NetnsPinRejection::audited(NetnsJoinOutcome::PathMalformed))?;
+        let mut root = sys::open_dir_path_nofollow(None, &slash)
             .map_err(|e| classify_open(e, "the netns join root cannot be opened"))?;
+        for comp in target.root.components() {
+            let Component::Normal(seg) = comp else {
+                continue;
+            };
+            let seg_c = std::ffi::CString::new(seg.as_bytes())
+                .map_err(|_| NetnsPinRejection::audited(NetnsJoinOutcome::PathMalformed))?;
+            root = sys::open_dir_path_nofollow(Some(root.as_fd()), &seg_c)
+                .map_err(|e| classify_open(e, "the netns join root cannot be opened"))?;
+        }
         let fd = sys::open_read_nonblock_at(root.as_fd(), &name_c)
             .map_err(|e| classify_open(e, "the netns join path cannot be opened"))?;
 
@@ -520,6 +531,20 @@ mod tests {
         assert_eq!(r.outcome, Some(NetnsJoinOutcome::PathSymlink));
         assert_eq!(r.error.code(), ErrorCode::InvalidArgument);
 
+        // 置き場の末尾が `/` でも symlink を辿らない(components が畳み、各要素を O_NOFOLLOW で開く)。
+        let slashed = std::path::PathBuf::from(format!("{}/", linked.display()));
+        let target =
+            NetnsJoinTarget::new(slashed.clone(), slashed.join("x"), 0, 0).expect("target");
+        let r = PinnedNetnsJoin::pin(&target).expect_err("trailing slash symlink root");
+        assert_eq!(r.outcome, Some(NetnsJoinOutcome::PathSymlink));
+
+        // 置き場の途中の要素が symlink。
+        let nested = linked.join("sub");
+        std::fs::create_dir(real.join("sub")).expect("mkdir sub");
+        let target = NetnsJoinTarget::new(nested.clone(), nested.join("x"), 0, 0).expect("target");
+        let r = PinnedNetnsJoin::pin(&target).expect_err("intermediate symlink");
+        assert_eq!(r.outcome, Some(NetnsJoinOutcome::PathSymlink));
+
         // 置き場が通常ファイル。
         let file_root = scratch.path().join("plain");
         let target =
@@ -550,6 +575,33 @@ mod tests {
         (meta.dev(), meta.ino())
     }
 
+    /// 実機前提の補助: 子を kill し、有限の猶予(5 秒)の間だけ回収を待つ(REPAIR-5)。kill の失敗と
+    /// 回収できなかったこと(D 状態など)は戻り値の文言に残し、無期限には待たない。
+    #[cfg(target_os = "linux")]
+    fn kill_and_reap(child: &mut std::process::Child) -> String {
+        let mut note = String::new();
+        if let Err(e) = child.kill() {
+            note.push_str(&format!("; kill failed: {e}"));
+        }
+        let grace = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return note,
+                Ok(None) if std::time::Instant::now() < grace => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Ok(None) => {
+                    note.push_str("; child not reaped within the grace period");
+                    return note;
+                }
+                Err(e) => {
+                    note.push_str(&format!("; reap failed: {e}"));
+                    return note;
+                }
+            }
+        }
+    }
+
     /// 実機前提の補助: 外部コマンドを期限つきで実行する(REPAIR-5)。超過したら kill して回収し、`Err` を返す。
     #[cfg(target_os = "linux")]
     fn run_bounded(program: &str, args: &[&std::ffi::OsStr]) -> Result<(), String> {
@@ -566,15 +618,28 @@ mod tests {
                     std::thread::sleep(std::time::Duration::from_millis(20));
                 }
                 Ok(None) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(format!("{program} timed out"));
+                    return Err(format!("{program} timed out{}", kill_and_reap(&mut child)));
                 }
                 Err(e) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(format!("{program} wait failed: {e}"));
+                    return Err(format!(
+                        "{program} wait failed: {e}{}",
+                        kill_and_reap(&mut child)
+                    ));
                 }
+            }
+        }
+    }
+
+    /// 実機前提の補助: 作った bind mount を panic でも必ず外す guard(特権操作の後始末)。
+    /// `umount` の失敗は Drop 内では panic せず stderr に残す。
+    #[cfg(target_os = "linux")]
+    struct MountGuard(std::path::PathBuf);
+
+    #[cfg(target_os = "linux")]
+    impl Drop for MountGuard {
+        fn drop(&mut self) {
+            if let Err(e) = run_bounded("umount", &[self.0.as_os_str()]) {
+                eprintln!("cleanup: umount {} failed: {e}", self.0.display());
             }
         }
     }
@@ -609,6 +674,7 @@ mod tests {
         );
         let net_pin = scratch.path().join("net");
         let ipc_pin = scratch.path().join("ipc");
+        let mut guards = Vec::new();
         for (pin, src) in [
             (&net_pin, "/proc/self/ns/net"),
             (&ipc_pin, "/proc/self/ns/ipc"),
@@ -618,6 +684,8 @@ mod tests {
                 "mount",
                 &[OsStr::new("--bind"), OsStr::new(src), pin.as_os_str()],
             );
+            // mount の直後に guard を置く(以降の panic でも umount される)。
+            guards.push(MountGuard(pin.clone()));
         }
         let net_id = stat_identity("/proc/self/ns/net");
         let ipc_id = stat_identity("/proc/self/ns/ipc");
@@ -634,9 +702,7 @@ mod tests {
         let ipc = PinnedNetnsJoin::pin(&target(&ipc_pin, ipc_id)).expect_err("ipc");
         assert_eq!(ipc.outcome, Some(NetnsJoinOutcome::NotNetworkNamespace));
         assert_eq!(ipc.error.code(), ErrorCode::InvalidArgument);
-        for pin in [&net_pin, &ipc_pin] {
-            run_precondition("umount", &[pin.as_os_str()]);
-        }
+        drop(guards);
         println!("net1_3069_real_child_owned_netns_rejected: ok");
     }
 
@@ -667,6 +733,8 @@ mod tests {
         let pin = scratch.path().join("pin");
         // unshare は既存ファイルへ bind mount するため、先に空の通常ファイルを作る。
         std::fs::write(&pin, b"").expect("create pin file");
+        // unshare が mount した後に失敗しても外れるよう、実行の前に guard を置く(未 mount なら失敗を表示するだけ)。
+        let _guard = MountGuard(pin.clone());
         run_precondition(
             "unshare",
             &[
@@ -689,7 +757,6 @@ mod tests {
             .expect("thread")
         });
         assert_eq!(joined.expect("join"), id);
-        run_precondition("umount", &[pin.as_os_str()]);
         println!("net1_3069_real_init_netns_join_before_userns: ok");
     }
 }

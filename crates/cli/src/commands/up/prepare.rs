@@ -163,6 +163,7 @@ impl Preparer<'_> {
         let args = process_args(spec, cfg.entrypoint(), cfg.cmd()).map_err(from_args)?;
         let cwd = process_cwd(spec, cfg.working_dir()).map_err(from_args)?;
         let (uid, gid) = parse_numeric_user(cfg.user())?;
+        validate_start_limits(spec, &env_files, cfg.env(), &args, &cwd)?;
 
         let mut rewritten = spec.clone();
         rewritten.image = Some(manifest.as_str().to_owned());
@@ -184,6 +185,49 @@ impl Preparer<'_> {
         validate_create_argv(&prepared)?;
         Ok(prepared)
     }
+}
+
+/// `start` が config.json から組む起動の制限を、後続サービスで初めて見つけないよう副作用の前に検証する（STACK-8・SEC-1）。
+///
+/// - `process.cwd` は core の `ContainerWorkingDir::parse`（`..` や相対を拒否）と同じ字句検証。
+/// - イメージ Env にサービスの env_files・env を重ねた最終 env とパス・argv の合計が `Entrypoint` の上限に収まること。
+fn validate_start_limits(
+    spec: &Service,
+    env_files: &[Vec<u8>],
+    image_env: &[String],
+    args: &[String],
+    cwd: &str,
+) -> Result<(), CliError> {
+    let opt = |e: TraitError| CliError::new(e.code(), e.message());
+    if fandhe_container_core::oci_runtime::ContainerWorkingDir::parse(Path::new(cwd)).is_none() {
+        return Err(CliError::new(
+            ErrorCode::InvalidArgument,
+            "working directory is invalid (working_dir)",
+        ));
+    }
+    let base = image_env
+        .iter()
+        .map(|e| EnvVar::parse(e))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(opt)?;
+    let files = env_files
+        .iter()
+        .map(|b| {
+            std::str::from_utf8(b)
+                .map_err(|_| TraitError::new(ErrorCode::InvalidArgument, "env file must be UTF-8"))
+                .and_then(EnvFile::parse)
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(opt)?;
+    let vars = spec
+        .env
+        .iter()
+        .map(|(k, v)| EnvVar::parse(&format!("{k}={v}")))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(opt)?;
+    let set = EnvSet::resolve(&base, &files, &vars).map_err(opt)?;
+    let path = args.first().map_or("", String::as_str);
+    set.check_entrypoint_budget(path, args).map_err(opt)
 }
 
 /// 子の `create` の argv を組み、`create` の引数解析に通す（サービスの env は生成ファイル経由の形で検証する）。
@@ -428,6 +472,21 @@ mod tests {
             image: Some("x".to_owned()),
             ..Service::default()
         }
+    }
+
+    /// STACK-8・SEC-1: start が拒否する cwd・合計サイズ超過を事前検査で拒否する。
+    #[test]
+    fn stack8_sec1_validate_start_limits_matches_start() {
+        let spec = service();
+        let args = vec!["/bin/sh".to_owned()];
+        validate_start_limits(&spec, &[], &["A=b".to_owned()], &args, "/a/b").expect("ok");
+        for bad in ["/a/../b", "rel", "/a\\b"] {
+            let e = validate_start_limits(&spec, &[], &[], &args, bad).expect_err(bad);
+            assert_eq!(e.code(), ErrorCode::InvalidArgument, "{bad}");
+        }
+        let huge = vec!["x".repeat(ENV_MAX_TOTAL_BYTES)];
+        let e = validate_start_limits(&spec, &[], &[], &huge, "/").expect_err("budget");
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
     }
 
     /// STACK-8・SEC-1: Labels は 64 件まで通るが、子の `create` は 63 件まで。事前検査で拒否する。

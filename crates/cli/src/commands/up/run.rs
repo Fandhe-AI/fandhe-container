@@ -154,6 +154,71 @@ fn read_project_file_blocking(
     read_compose_toml(f).map_err(|e| err(error_code_for_exit(e.exit_code()), e.message()))
 }
 
+/// 事前検査の全体に許す時間（イメージストアの open・参照解決・config の読み取り・env_files）。
+const PREPARE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// 全サービスの事前検査（[`Preparer::prepare`]）を期限つきの作業スレッドで行う（REPAIR-5・STACK-8）。
+fn prepare_all_bounded(
+    project: &fandhe_container_stack::cli::up::ProjectName,
+    project_dir: &Path,
+    image_root: &Path,
+    services: &BTreeMap<String, Service>,
+) -> Result<Vec<(String, Prepared)>, CliError> {
+    use fandhe_container_supervisor::supervisor_log::{BoundedFailure, run_bounded_waiting};
+    let (project, project_dir, image_root, services) = (
+        project.clone(),
+        project_dir.to_path_buf(),
+        image_root.to_path_buf(),
+        services.clone(),
+    );
+    match run_bounded_waiting(
+        move || {
+            let image_store = open_image_store_for_lifecycle(&image_root)
+                .map_err(|e| CliError::new(e.code(), e.message()))?;
+            let preparer = Preparer {
+                project: &project,
+                project_dir: &project_dir,
+                image_root: &image_root,
+                store: &image_store,
+                env_budget: EnvReadBudget::new(),
+            };
+            services
+                .iter()
+                .map(|(name, spec)| Ok((name.clone(), preparer.prepare(name, spec)?)))
+                .collect::<Result<Vec<_>, CliError>>()
+        },
+        PREPARE_TIMEOUT,
+    ) {
+        Ok(r) => r,
+        Err(BoundedFailure::Busy) => Err(CliError::new(
+            ErrorCode::ResourceExhausted,
+            "preparation workers are busy",
+        )),
+        Err(BoundedFailure::Unfinished) => Err(CliError::new(
+            ErrorCode::Timeout,
+            "preparing the services did not finish within the deadline",
+        )),
+    }
+}
+
+/// 前回の bundle の `rootfs/` が残っていれば、副作用の前に拒否する（`write_bundle` の拒否を前倒しする。STACK-8・SEC-1）。
+fn check_bundle_residue(
+    state_root: &Path,
+    id: &fandhe_container_stack::cli::up::ServiceContainerId,
+    name: &str,
+) -> Result<(), CliError> {
+    if super::bundle::rootfs_residue(state_root, id.as_str())? {
+        return Err(CliError::new(
+            ErrorCode::FailedPrecondition,
+            format!(
+                "a previous bundle rootfs remains for the service ({}); see docs/design/stack-up-wiring.md",
+                display_name(name)
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// 有効なサービスと依存閉包を決める（STACK-10・STACK-2）。
 fn select_services(
     toml: &fandhe_container_stack::schema::ComposeToml,
@@ -373,26 +438,21 @@ pub(super) fn run_up(global: &GlobalArgs, args: &UpArgs, stdout: &mut dyn Write)
         Ok(s) => s,
         Err(e) => return store_open_failure(&e),
     };
-    let image_store = match open_image_store_for_lifecycle(&args.image_root) {
-        Ok(s) => s,
-        Err(e) => return from_trait(&e),
-    };
     let Some(state_root) = store.host_state_root().map(Path::to_path_buf) else {
         return err(ErrorCode::Internal, "state root is unavailable");
     };
-    let preparer = Preparer {
-        project: &project,
-        project_dir: &project_dir,
-        image_root: &args.image_root,
-        store: &image_store,
-        env_budget: EnvReadBudget::new(),
-    };
-    let mut prepared: BTreeMap<String, Prepared> = BTreeMap::new();
-    for (name, spec) in &services {
-        let p = match preparer.prepare(name, spec) {
-            Ok(p) => p,
+    // イメージストアの open・参照解決・config の読み取りと env_files の読み取りは、応答しない FS で main が止まらないよう
+    // 全体を期限つきの作業スレッドで行う（REPAIR-5・STACK-8）。期限切れの作業は CLI の終了で破棄される。
+    let prepared_all =
+        match prepare_all_bounded(&project, &project_dir, &args.image_root, &services) {
+            Ok(v) => v,
             Err(e) => return CliExit::Error(e),
         };
+    let mut prepared: BTreeMap<String, Prepared> = BTreeMap::new();
+    for (name, p) in prepared_all {
+        if let Err(e) = check_bundle_residue(&state_root, &p.id, &name) {
+            return CliExit::Error(e);
+        }
         match read_status(&store, &p.id) {
             Ok(o)
                 if o.state
@@ -402,7 +462,7 @@ pub(super) fn run_up(global: &GlobalArgs, args: &UpArgs, stdout: &mut dyn Write)
                     ErrorCode::AlreadyExists,
                     format!(
                         "a container for the service already exists ({})",
-                        display_name(name)
+                        display_name(&name)
                     ),
                 );
             }
@@ -426,6 +486,9 @@ pub(super) fn run_up(global: &GlobalArgs, args: &UpArgs, stdout: &mut dyn Write)
         Err(e) => return CliExit::Error(e),
     };
     for (name, p) in &prepared {
+        if let Err(e) = check_bundle_residue(&state_root, &p.id, name) {
+            return CliExit::Error(e);
+        }
         match read_status(&store, &p.id) {
             Ok(o)
                 if o.state

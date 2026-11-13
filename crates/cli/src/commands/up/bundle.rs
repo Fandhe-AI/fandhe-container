@@ -151,6 +151,19 @@ pub(super) fn validate_config(p: &Prepared) -> Result<(), CliError> {
         })
 }
 
+/// `<state_root>/.stack/bundles/<id>/rootfs` が残っているか（何も作らず、symlink を辿らず読むだけ）。
+pub(super) fn rootfs_residue(state_root: &Path, id: &str) -> Result<bool, CliError> {
+    let root = ExtractRoot::open_existing_dir(state_root).map_err(|e| oci_failure(&e))?;
+    let mut dir = root;
+    for name in [STACK_DIR, BUNDLES_DIR, id] {
+        match dir.open_child_dir(name).map_err(|e| oci_failure(&e))? {
+            Some(d) => dir = d,
+            None => return Ok(false),
+        }
+    }
+    dir.child_dir_exists("rootfs").map_err(|e| oci_failure(&e))
+}
+
 /// `state_root` 配下に `p` の bundle を用意する。`state_root` は開いた状態ストアの正規パス。
 pub(super) fn write_bundle(state_root: &Path, p: &Prepared) -> Result<BundlePaths, CliError> {
     // 書く前に core の検証へ通す（手組みの誤りを fail-closed にする）。
@@ -218,6 +231,22 @@ pub(super) fn write_bundle(state_root: &Path, p: &Prepared) -> Result<BundlePath
 
 #[cfg(test)]
 mod tests {
+    /// STACK-8・SEC-1: 残った rootfs は何も作らずに検出し、bundle が無ければ false。
+    #[test]
+    fn stack8_sec1_rootfs_residue_is_detected_without_creating() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = std::env::temp_dir().join(format!("fc-residue-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("base");
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        assert!(!rootfs_residue(&base, "p.s").expect("none"));
+        assert!(!base.join(".stack").exists());
+        std::fs::create_dir_all(base.join(".stack/bundles/p.s/rootfs")).expect("rootfs");
+        assert!(rootfs_residue(&base, "p.s").expect("some"));
+        assert!(!rootfs_residue(&base, "p.t").expect("other"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     use super::*;
     use fandhe_container_stack::cli::up::{ProjectName, ServiceContainerId};
     use fandhe_container_stack::schema::Service;

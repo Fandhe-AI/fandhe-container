@@ -161,6 +161,9 @@ impl ProductionServiceLauncher {
     }
 }
 
+/// bundle の書き込みに許す時間（REPAIR-5）。
+const BUNDLE_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// kill 後の回収を待つ上限（REPAIR-5・#4734）。割り込み不能な I/O 待ち（D 状態）の子は kill が効かず、無期限の
 /// `wait` では TIMEOUT 経路自体が止まる。
 const REAP_DEADLINE: Duration = Duration::from_secs(5);
@@ -212,7 +215,24 @@ impl ServiceLauncher for ProductionServiceLauncher {
         let Some(p) = self.prepared.get(service) else {
             return Err(Phase::Bundle.failure(ErrorCode::Internal, None));
         };
-        let paths = write_bundle(&self.state_root, p).map_err(|e| from_cli(&e))?;
+        // bundle の書き込み・fsync は応答しない状態ルートで無期限に止まりうるため、期限つきの作業スレッドで行う
+        // （REPAIR-5）。期限切れの作業は CLI の終了で破棄され、プロジェクトのロックも同時に解放される。
+        let paths = {
+            use fandhe_container_supervisor::supervisor_log::{
+                BoundedFailure, run_bounded_waiting,
+            };
+            let (root, prepared) = (self.state_root.clone(), p.clone());
+            match run_bounded_waiting(move || write_bundle(&root, &prepared), BUNDLE_WRITE_TIMEOUT)
+            {
+                Ok(r) => r.map_err(|e| from_cli(&e))?,
+                Err(BoundedFailure::Busy) => {
+                    return Err(Phase::Bundle.failure(ErrorCode::ResourceExhausted, None));
+                }
+                Err(BoundedFailure::Unfinished) => {
+                    return Err(Phase::Bundle.failure(ErrorCode::Timeout, None));
+                }
+            }
+        };
         let ctx = CreateArgvContext {
             id: &p.id,
             project_dir: &paths.env_dir,

@@ -182,7 +182,7 @@ guest-kernel-build: ## macOS ゲストカーネル（arm64）を取得・sha256 
 guest-kernel-build-selftest: ## ゲストカーネルのビルドスクリプトの自己テスト（#1874・MAC-1・REPAIR-12。スタブのみ）
 	@guest/kernel/build-selftest.sh
 
-guest-initrd-build: ## macOS ゲスト init を静的リンクでビルドし /init だけの initrd（newc・gzip）を作る（TASK-64 追補・#1878・MAC-1。ローカルの実ビルド。make ci には含めない）
+guest-initrd-build: ## macOS ゲスト init を静的リンクでビルドし /init だけの initrd（newc・gzip）を作る。GUEST_INITRD_WITH_RUNTIME=1 で cli・supervisor も入れる（TASK-64 追補・#1878・#2275・MAC-1・MAC-4。ローカルの実ビルド。make ci には含めない）
 	@scripts/build-guest-initrd.sh
 
 guest-initrd-build-selftest: ## ゲスト initrd 梱包スクリプトの自己テスト（#1878・MAC-1・REPAIR-12。スタブ・fixture のみ）

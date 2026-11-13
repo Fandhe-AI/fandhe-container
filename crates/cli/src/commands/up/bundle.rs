@@ -133,6 +133,19 @@ impl Drop for ProjectLock {
     }
 }
 
+/// 戻り値を先に破棄してから完了フラグを立てる入れ物（[`bounded_io`]）。
+struct Finished<T> {
+    value: Option<T>,
+    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl<T> Drop for Finished<T> {
+    fn drop(&mut self) {
+        drop(self.value.take());
+        self.done.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// 状態ルート配下のブロックしうる I/O を期限つきの作業スレッドで行う（REPAIR-5）。
 ///
 /// 期限切れは `TIMEOUT`、同時実行枠の満杯は `RESOURCE_EXHAUSTED`。期限切れの作業は止められないため、
@@ -142,16 +155,22 @@ pub(super) fn bounded_io<T: Send + 'static>(
     f: impl FnOnce() -> Result<T, CliError> + Send + 'static,
 ) -> Result<T, CliError> {
     use fandhe_container_supervisor::supervisor_log::{BoundedFailure, run_bounded_waiting};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicBool;
     let done = std::sync::Arc::new(AtomicBool::new(false));
     let done_in = std::sync::Arc::clone(&done);
-    let job = move || {
-        let r = f();
-        done_in.store(true, Ordering::SeqCst);
-        r
+    // 完了の印は、戻り値（例: `InlineEnvGuard`）の Drop まで済んでから立てる。期限切れで受け手が居ない戻り値は
+    // 作業スレッド側で破棄されるため、その後始末の I/O も「作業」に含める。
+    let job = move || Finished {
+        value: Some(f()),
+        done: done_in,
     };
     match run_bounded_waiting(job, timeout) {
-        Ok(r) => r,
+        Ok(mut fin) => fin.value.take().unwrap_or_else(|| {
+            Err(CliError::new(
+                ErrorCode::Internal,
+                "bounded work lost its result",
+            ))
+        }),
         Err(BoundedFailure::Busy) => Err(CliError::new(
             ErrorCode::ResourceExhausted,
             "bundle workers are busy",

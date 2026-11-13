@@ -3,8 +3,14 @@
 #
 # 役割: ゲスト init（crates/guest-init。#1875）を aarch64-unknown-linux-musl で静的リンクして
 # ビルドし、`/init` 1 個だけを含む cpio（newc 形式）を作る。busybox 等の GPL ユーザーランドは
-# 入れない（#362）。ディレクトリ・デバイスノードも入れず、/proc・/sys・/dev・mount point は
-# init が自分で作る（crates/guest-init/src/init.rs）。呼び出し元は Makefile の
+# 入れない（#362）。既定ではディレクトリ・デバイスノードも入れず、/proc・/sys・/dev・mount point は
+# init が自分で作る（crates/guest-init/src/init.rs）。
+# opt-in の `--with-runtime`（#2275・MAC-4・TASK-191）では、共用ゲスト VM の中で動かす CLI
+# （bin: fandhe-container）と supervisor を同じ静的リンクで作り（または --cli / --supervisor で渡し）、
+# 固定の絶対パス /usr/libexec/fandhe-container/ 配下へ root 所有・0755 で入れる（呼ぶ側は #2273 /
+# #4658）。CLI は current_exe() と同じディレクトリの固定名 supervisor を起動するため 2 つは同じ
+# ディレクトリに置く。特権ランチャー fandhe-container-launcher は入れない（CLI が隣にあると rootful
+# 扱いでランチャー経由になるため。ゲスト内の要否は #4660）。呼び出し元は Makefile の
 # `guest-initrd-build` と自己テスト（scripts/build-guest-initrd-selftest.sh）。
 # CI と `make ci` では実ビルドしない（実機での起動確認は人間が行う。#1628）。
 # カーネル側のビルドは guest/kernel/build.sh（#1874）。圧縮は guest/kernel/arm64-guest.config の
@@ -13,15 +19,22 @@
 #
 # 使い方:
 #   build-guest-initrd.sh [--output-dir <dir>] [--init <path>] [--compress gzip|none] [--linker <cmd>]
+#                         [--with-runtime [--cli <path> --supervisor <path>]]
 #                         [--build-timeout S] [--pack-timeout S]
 #   各引数は同名の環境変数（GUEST_INITRD_OUTPUT_DIR・GUEST_INITRD_INIT・GUEST_INITRD_COMPRESS・
-#   GUEST_INITRD_LINKER）でも渡せる。CLI の引数が優先。
+#   GUEST_INITRD_LINKER・GUEST_INITRD_WITH_RUNTIME=1・GUEST_INITRD_CLI・GUEST_INITRD_SUPERVISOR）でも
+#   渡せる。CLI の引数が優先。
+#   --with-runtime  cli・supervisor も入れる（既定は従来どおり /init だけ。出力のバイト列は不変）
+#   --cli / --supervisor  作成済みの静的リンク aarch64 を使う（--with-runtime が必要。両方指定か両方省略）
 #   --output-dir    既定: <repo>/target/guest-initrd/aarch64（空または未存在のディレクトリのみ）
 #   --init          作成済みの静的リンク aarch64 の init を使う（ビルドしない）
 #   --compress      gzip（既定。initrd.cpio.gz）または none（initrd.cpio）
 #   --linker        cargo の子プロセスだけに渡すリンカ（既定 rust-lld。文字種 [A-Za-z0-9._/+-]）
 #   --build-timeout cargo build の上限秒（既定 1800。1〜7200）
 #   --pack-timeout  gzip の上限秒（既定 60。1〜600）
+#
+# サイズ: 入力 1 個 64 MiB、--with-runtime では 3 個の合計 192 MiB が上限。実測は
+# docs/design/measurements/guest-initrd-size.md。build-info.txt の末尾に runtime・各 bytes を追記する。
 #
 # 安全性: root・sudo を要求しない。入力は symlink・通常ファイル以外・空・上限（64 MiB）超・
 # 他者所有・group/other 書き込み可を拒否する。検査と複製は開いた 1 本の fd に対して行い、以降は
@@ -48,6 +61,7 @@ set -euo pipefail
 usage() {
     cat >&2 <<'USAGE'
 usage: build-guest-initrd.sh [--output-dir <dir>] [--init <path>] [--compress gzip|none] [--linker <cmd>]
+                             [--with-runtime [--cli <path> --supervisor <path>]]
                              [--build-timeout S] [--pack-timeout S]
 USAGE
 }
@@ -68,6 +82,11 @@ linker="${GUEST_INITRD_LINKER:-rust-lld}"
 build_timeout=1800
 pack_timeout=60
 max_init_bytes=67108864
+max_total_bytes=201326592
+with_runtime=0
+[ "${GUEST_INITRD_WITH_RUNTIME:-}" != "1" ] || with_runtime=1
+cli_arg="${GUEST_INITRD_CLI:-}"
+sup_arg="${GUEST_INITRD_SUPERVISOR:-}"
 
 check_int() {
     if ! int_in_range "$2" "$3" "$4"; then
@@ -87,6 +106,9 @@ while [ $# -gt 0 ]; do
         --init) need_value $# "$1"; init_arg="$2"; shift 2 ;;
         --compress) need_value $# "$1"; compress="$2"; shift 2 ;;
         --linker) need_value $# "$1"; linker="$2"; shift 2 ;;
+        --with-runtime) with_runtime=1; shift ;;
+        --cli) need_value $# "$1"; cli_arg="$2"; shift 2 ;;
+        --supervisor) need_value $# "$1"; sup_arg="$2"; shift 2 ;;
         --build-timeout) need_value $# "$1"; check_int "$1" "$2" 1 7200; build_timeout="$2"; shift 2 ;;
         --pack-timeout) need_value $# "$1"; check_int "$1" "$2" 1 600; pack_timeout="$2"; shift 2 ;;
         *) err_code bad-argument "unknown argument: $1"; usage; exit 2 ;;
@@ -101,9 +123,17 @@ if ! [[ "$linker" =~ ^[A-Za-z0-9._/+-]+$ ]]; then
     err_code bad-argument "--linker contains characters outside [A-Za-z0-9._/+-]"
     exit 2
 fi
-case "$output_dir$init_arg" in
+case "$output_dir$init_arg$cli_arg$sup_arg" in
     *[[:cntrl:]]*) err_code bad-argument "paths must not contain control characters"; exit 2 ;;
 esac
+if [ "$with_runtime" -eq 0 ] && { [ -n "$cli_arg" ] || [ -n "$sup_arg" ]; }; then
+    err_code bad-argument "--cli and --supervisor require --with-runtime"
+    exit 2
+fi
+if { [ -n "$cli_arg" ] && [ -z "$sup_arg" ]; } || { [ -z "$cli_arg" ] && [ -n "$sup_arg" ]; }; then
+    err_code bad-argument "--cli and --supervisor must be given together"
+    exit 2
+fi
 
 # --- テスト用の差し替え口（自己テスト専用。サンドボックスの外では拒否する） ---
 cargo_cmd="cargo"
@@ -112,7 +142,7 @@ expect_uid=""
 private_group_seam=""
 sandbox="${GUEST_INITRD_TEST_SANDBOX:-}"
 seam_requested=0
-for v in GUEST_INITRD_CARGO GUEST_INITRD_UNAME_S GUEST_INITRD_EXPECT_UID GUEST_INITRD_PRIVATE_GROUP; do
+for v in GUEST_INITRD_CARGO GUEST_INITRD_UNAME_S GUEST_INITRD_EXPECT_UID GUEST_INITRD_PRIVATE_GROUP GUEST_INITRD_MAX_TOTAL_BYTES; do
     [ -z "${!v:-}" ] || seam_requested=1
 done
 if [ "$seam_requested" -eq 1 ]; then
@@ -131,6 +161,11 @@ if [ "$seam_requested" -eq 1 ]; then
         "" | yes | no) private_group_seam="${GUEST_INITRD_PRIVATE_GROUP:-}" ;;
         *) err_code test-seam-refused "GUEST_INITRD_PRIVATE_GROUP must be yes or no"; exit 2 ;;
     esac
+    if [ -n "${GUEST_INITRD_MAX_TOTAL_BYTES:-}" ]; then
+        [[ "$GUEST_INITRD_MAX_TOTAL_BYTES" =~ ^[0-9]{1,10}$ ]] \
+            || { err_code test-seam-refused "GUEST_INITRD_MAX_TOTAL_BYTES must be numeric"; exit 2; }
+        max_total_bytes="$GUEST_INITRD_MAX_TOTAL_BYTES"
+    fi
     if [ -n "$expect_uid" ] && ! [[ "$expect_uid" =~ ^[0-9]{1,10}$ ]]; then
         err_code test-seam-refused "GUEST_INITRD_EXPECT_UID must be numeric"
         exit 2
@@ -282,7 +317,7 @@ command -v find >/dev/null 2>&1 || { err_code tool-missing "find is required"; e
 if [ "$compress" = "gzip" ]; then
     command -v gzip >/dev/null 2>&1 || { err_code tool-missing "gzip is required"; exit 2; }
 fi
-if [ -z "$init_arg" ]; then
+if [ -z "$init_arg" ] || { [ "$with_runtime" -eq 1 ] && [ -z "$cli_arg" ]; }; then
     command -v "$cargo_cmd" >/dev/null 2>&1 || { err_code tool-missing "cargo is required"; exit 2; }
 fi
 
@@ -359,13 +394,23 @@ cargo_build() {
     umask 077
     env "CARGO_TARGET_DIR=$work_dir/target" \
         "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=$linker" \
-        "$cargo_cmd" build --release --locked -p fandhe-container-guest-init \
+        "$cargo_cmd" build --release --locked "${build_pkgs[@]}" \
         --target aarch64-unknown-linux-musl --manifest-path "$root/Cargo.toml" >&2
 }
+# ビルドする bin は固定名で明示する（launcher を作らない・利用者入力から組み立てない）。
+build_pkgs=()
+[ -n "$init_arg" ] || build_pkgs+=(-p fandhe-container-guest-init --bin fandhe-container-guest-init)
+if [ "$with_runtime" -eq 1 ] && [ -z "$cli_arg" ]; then
+    build_pkgs+=(-p fandhe-container-cli --bin fandhe-container
+        -p fandhe-container-supervisor --bin fandhe-container-supervisor)
+fi
 
 # --- 入力の取得 ---
-if [ -z "$init_arg" ]; then
-    info_msg "building fandhe-container-guest-init (aarch64-unknown-linux-musl)"
+need_build=0
+{ [ -n "$init_arg" ] && { [ "$with_runtime" -eq 0 ] || [ -n "$cli_arg" ]; }; } || need_build=1
+built_dir="$work_dir/target/aarch64-unknown-linux-musl/release"
+if [ "$need_build" -eq 1 ]; then
+    info_msg "building ${build_pkgs[*]} (aarch64-unknown-linux-musl)"
     rc=0
     run_limited "$build_timeout" cargo_build || rc=$?
     if [ "$rc" -eq 124 ]; then
@@ -375,10 +420,10 @@ if [ -z "$init_arg" ]; then
         err_code build-failed "cargo build failed with exit code $rc (is the aarch64-unknown-linux-musl target installed and the linker available?)"
         exit 1
     fi
-    init_src="$work_dir/target/aarch64-unknown-linux-musl/release/fandhe-container-guest-init"
-else
-    init_src="$init_arg"
 fi
+if [ -n "$init_arg" ]; then init_src="$init_arg"; else init_src="$built_dir/fandhe-container-guest-init"; fi
+if [ -n "$cli_arg" ]; then cli_src="$cli_arg"; else cli_src="$built_dir/fandhe-container"; fi
+if [ -n "$sup_arg" ]; then sup_src="$sup_arg"; else sup_src="$built_dir/fandhe-container-supervisor"; fi
 
 # --- 入力の検査と複製（開いた 1 本のファイル記述子だけを使う） ---
 # 入力の open を含む検査と複製の全体を、期限つきの子プロセス（run_limited）で行う。書き手のいない
@@ -388,75 +433,44 @@ fi
 # （パスの再解決による検査後の差し替えを避ける）。検査は /dev/fd/9 を `find -L` で辿り、fd の指す
 # inode に対して行う。-L のパス検査は早期の分かりやすい拒否のためだけで安全性の根拠にしない。
 # 親ディレクトリが他者に書き換え可能な場合に「どのファイルを開くか」自体を差し替えられる点は
-# 防げないため、--init には自分の管理下のパスを渡すこと。
+# 防げないため、--init・--cli・--supervisor には自分の管理下のパスを渡すこと。
+# init・cli・supervisor は同じ関数（stage_input）で検査する。$label はエラー文に入る。
 input_timeout=30
-if [ -L "$init_src" ]; then
-    err_code bad-input "init must not be a symlink"
-    exit 2
-fi
-if [ ! -f "$init_src" ]; then
-    err_code bad-input "init is not a regular file"
-    exit 2
-fi
-init_copy="$work_dir/init"
 # 上限 +1 バイトまで読んでサイズ超過を検出し、複製は private な work_dir へ書く。以降は複製だけを使う。
-copy_input() {
+copy_input() { # グローバル: cur_label cur_src cur_copy
     umask 077
-    if ! exec 9<"$init_src"; then
-        err_code bad-input "cannot open init"
+    if ! exec 9<"$cur_src"; then
+        err_code bad-input "cannot open $cur_label"
         exit 2
     fi
     local fd_path="/dev/fd/9"
     if [ -z "$(find -L "$fd_path" -prune -type f -print 2>/dev/null)" ]; then
-        err_code bad-input "init is not a regular file"
+        err_code bad-input "$cur_label is not a regular file"
         exit 2
     fi
     if [ -z "$(find -L "$fd_path" -prune \( -user "$expect_uid" -o -user 0 \) -print 2>/dev/null)" ]; then
-        err_code bad-input "init must be owned by the current user or root"
+        err_code bad-input "$cur_label must be owned by the current user or root"
         exit 2
     fi
     if [ -n "$(find -L "$fd_path" -prune \( -perm -0020 -o -perm -0002 \) -print 2>/dev/null)" ]; then
-        err_code bad-input "init must not be group or other writable"
+        err_code bad-input "$cur_label must not be group or other writable"
         exit 2
     fi
     # macOS の /dev/fd/N（fdesc）では上の fd 経由の権限検査が効かないことがあるため、パス側でも同じ検査を
     # 重ねる（早期拒否。パスの検査は安全性の根拠にしない。fd 検査は Linux で有効、macOS では未確認で #2088）。
-    if [ -n "$(find "$init_src" -prune \( -perm -0020 -o -perm -0002 \) -print 2>/dev/null)" ]; then
-        err_code bad-input "init must not be group or other writable"
+    if [ -n "$(find "$cur_src" -prune \( -perm -0020 -o -perm -0002 \) -print 2>/dev/null)" ]; then
+        err_code bad-input "$cur_label must not be group or other writable"
         exit 2
     fi
-    if [ -z "$(find "$init_src" -prune -type f \( -user "$expect_uid" -o -user 0 \) -print 2>/dev/null)" ]; then
-        err_code bad-input "init must be a regular file owned by the current user or root"
+    if [ -z "$(find "$cur_src" -prune -type f \( -user "$expect_uid" -o -user 0 \) -print 2>/dev/null)" ]; then
+        err_code bad-input "$cur_label must be a regular file owned by the current user or root"
         exit 2
     fi
-    if ! head -c $((max_init_bytes + 1)) <&9 >"$init_copy" 2>/dev/null; then
-        err_code bad-input "cannot read init"
+    if ! head -c $((max_init_bytes + 1)) <&9 >"$cur_copy" 2>/dev/null; then
+        err_code bad-input "cannot read $cur_label"
         exit 2
     fi
 }
-rc=0
-run_limited "$input_timeout" copy_input || rc=$?
-if [ "$rc" -eq 124 ]; then
-    err_code input-timeout "reading init exceeded ${input_timeout}s (is it a FIFO or a stalled file?)"
-    exit 3
-elif [ "$rc" -ne 0 ]; then
-    exit "$rc"
-fi
-init_size="$(wc -c <"$init_copy" | tr -d ' ')"
-if ! [[ "$init_size" =~ ^[0-9]+$ ]] || [ "$init_size" -eq 0 ]; then
-    err_code bad-input "init is empty or unreadable"
-    exit 2
-fi
-if [ "$init_size" -gt "$max_init_bytes" ]; then
-    err_code bad-input "init is larger than $max_init_bytes bytes"
-    exit 2
-fi
-chmod 0700 "$init_copy"
-copy_size="$(wc -c <"$init_copy" | tr -d ' ')"
-if [ "$copy_size" != "$init_size" ]; then
-    err_code bad-input "init changed while being copied"
-    exit 2
-fi
 
 # --- ELF の検査（readelf・file は macOS に無いため od だけで読む） ---
 # $1=ファイル $2=オフセット $3=バイト数 → little-endian の整数値を標準出力へ
@@ -477,32 +491,99 @@ elf_fail() {
     err_code "$1" "$2"
     exit 2
 }
-magic="$(od -An -tx1 -v -N 4 "$init_copy" | tr -d ' \n')"
-[ "$magic" = "7f454c46" ] || elf_fail not-elf "init is not an ELF file"
-# BSD od は列幅の空白と末尾の空白を付けるため、語分割で正規化してから比較する。
-# shellcheck disable=SC2046
-set -- $(od -An -tu1 -v -j 4 -N 2 "$init_copy")
-ident="${1:-} ${2:-}"
-[ "$ident" = "2 1" ] || elf_fail bad-elf "init must be a 64-bit little-endian ELF"
-e_type="$(rd_le "$init_copy" 16 2)" || elf_fail bad-elf "cannot read the ELF header"
-e_machine="$(rd_le "$init_copy" 18 2)" || elf_fail bad-elf "cannot read the ELF header"
-[ "$e_machine" -eq 183 ] || elf_fail wrong-arch "init is not an aarch64 ELF (e_machine=$e_machine)"
-[ "$e_type" -eq 2 ] || elf_fail bad-elf "init must be ET_EXEC (e_type=$e_type); position-independent executables are refused"
-e_phoff="$(rd_le "$init_copy" 32 8)" || elf_fail bad-elf "cannot read the ELF header"
-e_phentsize="$(rd_le "$init_copy" 54 2)" || elf_fail bad-elf "cannot read the ELF header"
-e_phnum="$(rd_le "$init_copy" 56 2)" || elf_fail bad-elf "cannot read the ELF header"
-[ "$e_phentsize" -eq 56 ] || elf_fail bad-elf "unexpected program header entry size"
-{ [ "$e_phnum" -ge 1 ] && [ "$e_phnum" -le 64 ]; } || elf_fail bad-elf "unexpected program header count"
-{ [ "$e_phoff" -ge 64 ] && [ "$e_phoff" -le "$copy_size" ] && [ "$((e_phoff + e_phnum * 56))" -le "$copy_size" ]; } \
-    || elf_fail bad-elf "program headers are outside the file"
-i=0
-while [ "$i" -lt "$e_phnum" ]; do
-    p_type="$(rd_le "$init_copy" $((e_phoff + i * 56)) 4)" || elf_fail bad-elf "cannot read a program header"
-    [ "$p_type" -ne 3 ] || elf_fail not-static "init has PT_INTERP (dynamically linked)"
-    i=$((i + 1))
-done
+check_elf() { # $1=ファイル $2=ラベル $3=サイズ
+    local f="$1" label="$2" size="$3" magic ident e_type e_machine e_phoff e_phentsize e_phnum i p_type
+    magic="$(od -An -tx1 -v -N 4 "$f" | tr -d ' \n')"
+    [ "$magic" = "7f454c46" ] || elf_fail not-elf "$label is not an ELF file"
+    # BSD od は列幅の空白と末尾の空白を付けるため、語分割で正規化してから比較する。
+    # shellcheck disable=SC2046
+    set -- $(od -An -tu1 -v -j 4 -N 2 "$f")
+    ident="${1:-} ${2:-}"
+    [ "$ident" = "2 1" ] || elf_fail bad-elf "$label must be a 64-bit little-endian ELF"
+    e_type="$(rd_le "$f" 16 2)" || elf_fail bad-elf "cannot read the ELF header of $label"
+    e_machine="$(rd_le "$f" 18 2)" || elf_fail bad-elf "cannot read the ELF header of $label"
+    [ "$e_machine" -eq 183 ] || elf_fail wrong-arch "$label is not an aarch64 ELF (e_machine=$e_machine)"
+    [ "$e_type" -eq 2 ] || elf_fail bad-elf "$label must be ET_EXEC (e_type=$e_type); position-independent executables are refused"
+    e_phoff="$(rd_le "$f" 32 8)" || elf_fail bad-elf "cannot read the ELF header of $label"
+    e_phentsize="$(rd_le "$f" 54 2)" || elf_fail bad-elf "cannot read the ELF header of $label"
+    e_phnum="$(rd_le "$f" 56 2)" || elf_fail bad-elf "cannot read the ELF header of $label"
+    [ "$e_phentsize" -eq 56 ] || elf_fail bad-elf "unexpected program header entry size in $label"
+    { [ "$e_phnum" -ge 1 ] && [ "$e_phnum" -le 64 ]; } || elf_fail bad-elf "unexpected program header count in $label"
+    { [ "$e_phoff" -ge 64 ] && [ "$e_phoff" -le "$size" ] && [ "$((e_phoff + e_phnum * 56))" -le "$size" ]; } \
+        || elf_fail bad-elf "program headers are outside the file in $label"
+    i=0
+    while [ "$i" -lt "$e_phnum" ]; do
+        p_type="$(rd_le "$f" $((e_phoff + i * 56)) 4)" || elf_fail bad-elf "cannot read a program header of $label"
+        [ "$p_type" -ne 3 ] || elf_fail not-static "$label has PT_INTERP (dynamically linked)"
+        i=$((i + 1))
+    done
+}
 
-# --- newc 形式の cpio を書く（`init` と TRAILER!!! の 2 エントリだけ） ---
+# $1=ラベル $2=入力パス $3=複製先 → 検査して複製し、サイズを stage_size に入れる
+stage_input() {
+    local label="$1" src="$2" dest="$3" rc=0 size copy_size
+    if [ -L "$src" ]; then
+        err_code bad-input "$label must not be a symlink"
+        exit 2
+    fi
+    if [ ! -f "$src" ]; then
+        err_code bad-input "$label is not a regular file"
+        exit 2
+    fi
+    cur_label="$label"
+    cur_src="$src"
+    cur_copy="$dest"
+    run_limited "$input_timeout" copy_input || rc=$?
+    if [ "$rc" -eq 124 ]; then
+        err_code input-timeout "reading $label exceeded ${input_timeout}s (is it a FIFO or a stalled file?)"
+        exit 3
+    elif [ "$rc" -ne 0 ]; then
+        exit "$rc"
+    fi
+    size="$(wc -c <"$dest" | tr -d ' ')"
+    if ! [[ "$size" =~ ^[0-9]+$ ]] || [ "$size" -eq 0 ]; then
+        err_code bad-input "$label is empty or unreadable"
+        exit 2
+    fi
+    if [ "$size" -gt "$max_init_bytes" ]; then
+        err_code bad-input "$label is larger than $max_init_bytes bytes"
+        exit 2
+    fi
+    chmod 0700 "$dest"
+    copy_size="$(wc -c <"$dest" | tr -d ' ')"
+    if [ "$copy_size" != "$size" ]; then
+        err_code bad-input "$label changed while being copied"
+        exit 2
+    fi
+    check_elf "$dest" "$label" "$copy_size"
+    stage_size="$copy_size"
+}
+
+init_copy="$work_dir/init"
+stage_input init "$init_src" "$init_copy"
+copy_size="$stage_size"
+total_size="$copy_size"
+cli_copy="$work_dir/cli"
+sup_copy="$work_dir/supervisor"
+cli_size=0
+sup_size=0
+if [ "$with_runtime" -eq 1 ]; then
+    stage_input cli "$cli_src" "$cli_copy"
+    cli_size="$stage_size"
+    stage_input supervisor "$sup_src" "$sup_copy"
+    sup_size="$stage_size"
+    total_size=$((copy_size + cli_size + sup_size))
+    if [ "$total_size" -gt "$max_total_bytes" ]; then
+        err_code bad-input "total size of init, cli and supervisor ($total_size) is larger than $max_total_bytes bytes"
+        exit 2
+    fi
+fi
+
+# --- newc 形式の cpio を書く ---
+# 既定: `init` と TRAILER!!! の 2 エントリだけ。--with-runtime: 親ディレクトリ → ファイルの順で
+# usr/libexec/fandhe-container/ 配下に cli・supervisor を足す（カーネルの initramfs 展開は親の
+# エントリが無いファイルを落とすため、ディレクトリを先に置く）。所有者は root・mode 0755。
+guest_runtime_dir="usr/libexec/fandhe-container"
 pad4() {
     local n=$((($1 + 3) / 4 * 4 - $1))
     while [ "$n" -gt 0 ]; do
@@ -510,22 +591,38 @@ pad4() {
         n=$((n - 1))
     done
 }
-# $1=ino $2=mode $3=filesize $4=namesize（uid・gid・mtime・dev 等は 0、nlink は 1）
+# $1=ino $2=mode $3=filesize $4=namesize $5=nlink（uid・gid・mtime・dev 等は 0）
 newc_header() {
     printf '070701%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x' \
-        "$1" "$2" 0 0 1 0 "$3" 0 0 0 0 "$4" 0
+        "$1" "$2" 0 0 "$5" 0 "$3" 0 0 0 0 "$4" 0
+}
+newc_dir() { # $1=ino $2=name
+    newc_header "$1" $((8#40755)) 0 $((${#2} + 1)) 2
+    printf '%s\0' "$2"
+    pad4 $((110 + ${#2} + 1))
+}
+newc_file() { # $1=ino $2=name $3=本体ファイル $4=サイズ
+    newc_header "$1" $((8#100755)) "$4" $((${#2} + 1)) 1
+    printf '%s\0' "$2"
+    pad4 $((110 + ${#2} + 1))
+    cat "$3"
+    pad4 "$4"
 }
 cpio_file="$work_dir/initrd.cpio"
 {
-    newc_header 1 $((8#100755)) "$copy_size" 5
-    printf 'init\0'
-    pad4 $((110 + 5))
-    cat "$init_copy"
-    pad4 "$copy_size"
-    newc_header 0 0 0 11
+    newc_file 1 init "$init_copy" "$copy_size"
+    if [ "$with_runtime" -eq 1 ]; then
+        newc_dir 2 usr
+        newc_dir 3 usr/libexec
+        newc_dir 4 "$guest_runtime_dir"
+        newc_file 5 "$guest_runtime_dir/fandhe-container" "$cli_copy" "$cli_size"
+        newc_file 6 "$guest_runtime_dir/fandhe-container-supervisor" "$sup_copy" "$sup_size"
+    fi
+    newc_header 0 0 0 11 1
     printf 'TRAILER!!!\0'
     pad4 $((110 + 11))
 } >"$cpio_file"
+cpio_bytes="$(wc -c <"$cpio_file" | tr -d ' ')"
 
 final_file="$cpio_file"
 final_name="initrd.cpio"
@@ -545,6 +642,13 @@ fi
 
 init_sha="$($sha_cmd "$init_copy" | awk '{print $1}')"
 initrd_sha="$($sha_cmd "$final_file" | awk '{print $1}')"
+initrd_bytes="$(wc -c <"$final_file" | tr -d ' ')"
+cli_sha=""
+sup_sha=""
+if [ "$with_runtime" -eq 1 ]; then
+    cli_sha="$($sha_cmd "$cli_copy" | awk '{print $1}')"
+    sup_sha="$($sha_cmd "$sup_copy" | awk '{print $1}')"
+fi
 rustc_line="unknown"
 if command -v rustc >/dev/null 2>&1; then
     rustc_line="$(rustc -V 2>/dev/null | head -n 1 || true)"
@@ -563,6 +667,19 @@ write_info() {
     printf 'target=aarch64-unknown-linux-musl\n'
     printf 'rustc=%s\n' "$rustc_line"
     printf 'host=%s\n' "$host_os $(uname -m)"
+    # 既存の 8 行の後ろへ追記する（既存の読み手を壊さない）。
+    if [ "$with_runtime" -eq 1 ]; then printf 'runtime=yes\n'; else printf 'runtime=no\n'; fi
+    printf 'cpio_bytes=%s\n' "$cpio_bytes"
+    printf 'initrd_bytes=%s\n' "$initrd_bytes"
+    if [ "$with_runtime" -eq 1 ]; then
+        printf 'cli_path=/%s/fandhe-container\n' "$guest_runtime_dir"
+        printf 'cli_sha256=%s\n' "$cli_sha"
+        printf 'cli_bytes=%s\n' "$cli_size"
+        printf 'supervisor_path=/%s/fandhe-container-supervisor\n' "$guest_runtime_dir"
+        printf 'supervisor_sha256=%s\n' "$sup_sha"
+        printf 'supervisor_bytes=%s\n' "$sup_size"
+        printf 'features=default\n'
+    fi
 }
 # 一時ファイルは mktemp（O_EXCL・推測できない名前）で排他的に作る。固定名だと、空確認から書き込みまでに
 # 他者が置いた symlink の参照先を上書きしうる。確定は ln（既存・symlink があれば失敗）。
@@ -610,5 +727,9 @@ done
 publishing=0
 out_created=0
 info_msg "init sha256=$init_sha bytes=$copy_size"
-info_msg "initrd sha256=$initrd_sha"
+if [ "$with_runtime" -eq 1 ]; then
+    info_msg "cli sha256=$cli_sha bytes=$cli_size"
+    info_msg "supervisor sha256=$sup_sha bytes=$sup_size"
+fi
+info_msg "initrd sha256=$initrd_sha bytes=$initrd_bytes (cpio $cpio_bytes)"
 printf '%s\n' "$output_dir/$final_name"

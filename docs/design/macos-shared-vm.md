@@ -101,7 +101,7 @@ TASK-191 の着手前に確定が要る未決事項 4 点と計測対象を、�
 - rootfs とイメージ: 推奨は、イメージとコンテナの rootfs をゲスト側の永続ディスク（virtio-blk のデータディスク）に置くこと。bundle をホストで作る経路（#1869 4.3 の (a)）では共有ルート経由でゲストへ渡す。MVP は「共有ルート経由の bundle」とし、ゲスト内の pull（VZ の NAT のネットワークと feature 追加が要る）は後続とする（判断事項）
 - 状態ファイル: ゲスト内の `/run/fandhe-container/<id>/state.json`（OCI-5 の (1)。上記の非特権ユーザーが書ける `/run` 配下の所有で用意する）。ホストに置くのは項目 1 の所属記録だけ
 - ログ: コンテナと supervisor のログはゲスト内に置く（SUP-7 の回転規則）。ホストの `logs` はゲスト内の CLI を中継して読む。hvc0 のコンソールログは guest-init の診断専用
-- ゲスト向けバイナリ: core・supervisor・CLI を `aarch64-unknown-linux-musl` の静的リンクでビルドし、`scripts/build-guest-initrd.sh` で initrd に入れる（またはデータディスクに置く。サイズで判断）。musl で型検査しているのは guest-init だけなので、`cross-target-check` に CLI・supervisor の musl 型検査を足す
+- ゲスト向けバイナリ: core・supervisor・CLI を `aarch64-unknown-linux-musl` の静的リンクでビルドし、`scripts/build-guest-initrd.sh` で initrd に入れる（またはデータディスクに置く。サイズで判断）。梱包は `scripts/build-guest-initrd.sh --with-runtime`（#2275）で実装済みで、固定パスは `/usr/libexec/fandhe-container/`（root 所有・0755。CLI と supervisor は同じディレクトリ。launcher は入れない）。サイズと実リンクの状況は [guest-initrd-size.md](measurements/guest-initrd-size.md)。musl で型検査しているのは guest-init だけなので、`cross-target-check` に CLI・supervisor の musl 型検査を足す
 - guest-init（#1823・#1875）に足すもの: 子の `waitpid` ループと孤児の回収、協調停止（ホストの停止要求 → ゲスト内のコンテナ停止 → `sync` → `reboot(RB_POWER_OFF)`。期限を過ぎたらホストが VZ の強制停止へ切り替える）、子を動かす前の fd 起点の mount（#2080 の P2-4。`openat`＋`O_NOFOLLOW` → `/proc/self/fd`、または `open_tree` / `move_mount`）、vsock の受け口とゲスト内 CLI の起動、doc の「TASK-115 で未実装」の記述の修正。#1823 の決定（workspace のメンバー crate・musl・arm64 のみ）は変えない
 - 協調停止を先行させるか: 協調停止と回収は 1 コンテナ = 1 VM の現状でも書き込みの損失を減らすので、共用 VM の実装より先に着手できる順序にする。ただし #1906 への依存は付ける
 - 採らなかった案: (ii) は分離機構の二重実装になり、core の試験資産が効かず、REPAIR-1 の波及最小化にも反する

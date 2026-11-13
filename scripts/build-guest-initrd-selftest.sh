@@ -4,7 +4,8 @@
 # 呼び出し元: Makefile の `guest-initrd-build-selftest`（CI の platform-ci から 3 OS で実行）。
 # 疑似 aarch64 静的 ELF の fixture とスタブ cargo だけを使い、ネットワーク・root・secrets・
 # 実 cargo ビルドは使わない。cpio は外部 cpio コマンドに頼らず、本ファイル内の newc パーサで読む。
-# 照合内容: 中身が `init` と `TRAILER!!!` だけであること、入力の拒否、既存出力の非上書き、期限切れ。
+# 照合内容: 既定の中身が `init` と `TRAILER!!!` だけであること、--with-runtime の配置（ディレクトリ・
+# 固定パス・launcher を入れない・合計サイズ上限・build-info の追記）、入力の拒否、既存出力の非上書き、期限切れ。
 # 終了コード: 全件合格で 0、1 件でも失敗すれば 1。
 set -euo pipefail
 
@@ -13,6 +14,7 @@ target="$script_dir/build-guest-initrd.sh"
 
 for v in GUEST_INITRD_OUTPUT_DIR GUEST_INITRD_INIT GUEST_INITRD_COMPRESS GUEST_INITRD_LINKER \
     GUEST_INITRD_CARGO GUEST_INITRD_UNAME_S GUEST_INITRD_EXPECT_UID GUEST_INITRD_PRIVATE_GROUP \
+    GUEST_INITRD_WITH_RUNTIME GUEST_INITRD_CLI GUEST_INITRD_SUPERVISOR GUEST_INITRD_MAX_TOTAL_BYTES \
     GUEST_INITRD_TEST_SANDBOX; do
     unset "$v"
 done
@@ -125,6 +127,10 @@ case "$(uname -s)" in
         run "$target" --init "$good" --output-dir "$out"
         check "win exit code" 2 "$rc"
         check "win error code" unsupported-os "$(errcode)"
+        newout
+        run "$target" --with-runtime --init "$good" --cli "$good" --supervisor "$good" --output-dir "$out"
+        check "win runtime exit code" 2 "$rc"
+        check "win runtime error code" unsupported-os "$(errcode)"
         printf 'pass=%s fail=%s\n' "$pass" "$fail"
         [ "$fail" -eq 0 ]
         exit $?
@@ -414,6 +420,167 @@ newout
 run env GUEST_INITRD_UNAME_S=MINGW64_NT-10.0 "$target" --init "$good" --output-dir "$out"
 check "10 exit code" 2 "$rc"
 check "10 error code" unsupported-os "$(errcode)"
+
+# --- 11〜17: --with-runtime（cli・supervisor の梱包。#2275・MAC-4・TASK-191） ---
+cli_f="$sb/rt-cli"
+sup_f="$sb/rt-sup"
+{ cat "$good"; printf 'CLI-TAIL-xx'; } >"$cli_f"
+{ cat "$good"; printf 'SUPERVISOR-TAIL-y'; } >"$sup_f"
+chmod 755 "$cli_f" "$sup_f"
+cli_size="$(wc -c <"$cli_f" | tr -d ' ')"
+sup_size="$(wc -c <"$sup_f" | tr -d ' ')"
+sha_of() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi; }
+# 独立に組み立てる newc エントリ。$1=ino $2=mode(16 進 8 桁) $3=nlink $4=本体サイズ $5=名前
+exp_entry() {
+    local nm="$5" ns=$((${#5} + 1)) pad
+    printf '%s' "070701" "$(printf '%08x' "$1")" "$2" $z8 $z8 "$(printf '%08x' "$3")" $z8 "$(printf '%08x' "$4")" $z8 $z8 $z8 $z8 "$(printf '%08x' "$ns")" $z8
+    printf '%s\0' "$nm"
+    pad=$(((4 - (110 + ns) % 4) % 4))
+    [ "$pad" -eq 0 ] || head -c "$pad" /dev/zero
+}
+exp_pad() {
+    local pad=$(((4 - $1 % 4) % 4))
+    [ "$pad" -eq 0 ] || head -c "$pad" /dev/zero
+}
+rt="usr/libexec/fandhe-container"
+{
+    exp_entry 1 000081ed 1 "$good_size" init
+    cat "$good"
+    exp_pad "$good_size"
+    exp_entry 2 000041ed 2 0 usr
+    exp_entry 3 000041ed 2 0 usr/libexec
+    exp_entry 4 000041ed 2 0 "$rt"
+    exp_entry 5 000081ed 1 "$cli_size" "$rt/fandhe-container"
+    cat "$cli_f"
+    exp_pad "$cli_size"
+    exp_entry 6 000081ed 1 "$sup_size" "$rt/fandhe-container-supervisor"
+    cat "$sup_f"
+    exp_pad "$sup_size"
+    exp_entry 0 00000000 1 0 'TRAILER!!!'
+} >"$sb/expected-rt.cpio"
+
+# 11: 無圧縮・ビルド済みの 3 入力
+newout
+run "$target" --with-runtime --init "$good" --cli "$cli_f" --supervisor "$sup_f" --compress none --output-dir "$out"
+check "11 exit code" 0 "$rc"
+check "11 stdout is the initrd path" "$(cd -P "$sb" && pwd -P)/${out##*/}/initrd.cpio" "$(cat "$sb/o.out")"
+entries="$(list_newc "$out/initrd.cpio" | grep -v '^ok' || true)"
+check "11 entries in order with root ownership" "init 000081ed 00000000 00000000 $good_size
+usr 000041ed 00000000 00000000 0
+usr/libexec 000041ed 00000000 00000000 0
+$rt 000041ed 00000000 00000000 0
+$rt/fandhe-container 000081ed 00000000 00000000 $cli_size
+$rt/fandhe-container-supervisor 000081ed 00000000 00000000 $sup_size
+TRAILER!!! 00000000 00000000 00000000 0" "$entries"
+if cmp -s "$sb/expected-rt.cpio" "$out/initrd.cpio"; then ok "11 archive equals the independently built bytes"; else ng "11 archive differs from the expected bytes"; fi
+check "11 only expected files in output" "build-info.txt initrd.cpio" "$(find "$out" -mindepth 1 -maxdepth 1 -exec basename {} \; | sort | tr '\n' ' ' | sed 's/ $//')"
+rt_cpio_bytes="$(wc -c <"$out/initrd.cpio" | tr -d ' ')"
+
+# 12: gzip と build-info
+newout
+run "$target" --with-runtime --init "$good" --cli "$cli_f" --supervisor "$sup_f" --output-dir "$out"
+check "12 exit code" 0 "$rc"
+if gzip -dc "$out/initrd.cpio.gz" | cmp -s - "$sb/expected-rt.cpio"; then ok "12 gunzip equals the expected archive"; else ng "12 gunzip differs"; fi
+check "12 build-info first 8 lines keep their keys" "init_sha256 init_bytes initrd_file initrd_sha256 compress target rustc host" "$(head -n 8 "$out/build-info.txt" | cut -d= -f1 | tr '\n' ' ' | sed 's/ $//')"
+gz_bytes="$(wc -c <"$out/initrd.cpio.gz" | tr -d ' ')"
+check "12 build-info appended lines" "runtime=yes
+cpio_bytes=$rt_cpio_bytes
+initrd_bytes=$gz_bytes
+cli_path=/$rt/fandhe-container
+cli_sha256=$(sha_of "$cli_f")
+cli_bytes=$cli_size
+supervisor_path=/$rt/fandhe-container-supervisor
+supervisor_sha256=$(sha_of "$sup_f")
+supervisor_bytes=$sup_size
+features=default" "$(tail -n +9 "$out/build-info.txt")"
+if grep -q "initrd sha256=.* bytes=$gz_bytes (cpio $rt_cpio_bytes)" "$sb/o.err"; then ok "12 stderr reports sizes"; else ng "12 stderr sizes missing"; fi
+
+# 13: スタブ cargo 経由（bin の選択と launcher の非梱包）
+mk_stub cargo-rt "printf '%s\\n' \"\$@\" >'$sb/cargo-args'; mkdir -p \"\$CARGO_TARGET_DIR/$rel\"; for b in fandhe-container-guest-init fandhe-container fandhe-container-supervisor fandhe-container-launcher; do cp '$good' \"\$CARGO_TARGET_DIR/$rel/\$b\"; done"
+newout
+run env GUEST_INITRD_CARGO="$sb/cargo-rt" "$target" --with-runtime --compress none --output-dir "$out"
+check "13 exit code" 0 "$rc"
+entries="$(list_newc "$out/initrd.cpio" | grep -v '^ok' | cut -d' ' -f1 | tr '\n' ' ' | sed 's/ $//')"
+check "13 launcher is not packed" "init usr usr/libexec $rt $rt/fandhe-container $rt/fandhe-container-supervisor TRAILER!!!" "$entries"
+args="$(tr '\n' ' ' <"$sb/cargo-args")"
+for want in "build --release" "--locked" "--target aarch64-unknown-linux-musl" "-p fandhe-container-cli --bin fandhe-container" "-p fandhe-container-supervisor --bin fandhe-container-supervisor" "-p fandhe-container-guest-init --bin fandhe-container-guest-init"; do
+    case "$args" in *"$want"*) ok "13 cargo args have '$want'" ;; *) ng "13 cargo args lack '$want': $args" ;; esac
+done
+case "$args" in *launcher*) ng "13 cargo args mention launcher: $args" ;; *) ok "13 cargo args do not mention launcher" ;; esac
+# --init 指定時は guest-init を要求しない
+newout
+run env GUEST_INITRD_CARGO="$sb/cargo-rt" "$target" --with-runtime --init "$good" --compress none --output-dir "$out"
+check "13 with --init exit code" 0 "$rc"
+case "$(tr '\n' ' ' <"$sb/cargo-args")" in *guest-init*) ng "13 guest-init requested despite --init" ;; *) ok "13 guest-init not requested with --init" ;; esac
+# 既定（--with-runtime なし）は cli・supervisor をビルドしない
+newout
+run env GUEST_INITRD_CARGO="$sb/cargo-rt" "$target" --compress none --output-dir "$out"
+case "$(tr '\n' ' ' <"$sb/cargo-args")" in *fandhe-container-cli*) ng "13 default build requested cli" ;; *) ok "13 default build does not request cli" ;; esac
+
+# 14: 引数の組み合わせ
+rt_bad() { # $1=名前 以降=引数
+    local name="$1"
+    shift
+    newout
+    run "$target" --output-dir "$out" "$@"
+    check "14 $name exit code" 2 "$rc"
+    check "14 $name error code" bad-argument "$(errcode)"
+    if [ ! -e "$out" ]; then ok "14 $name leaves no output"; else ng "14 $name left an output"; fi
+}
+rt_bad cli-only --with-runtime --init "$good" --cli "$cli_f"
+rt_bad supervisor-only --with-runtime --init "$good" --supervisor "$sup_f"
+rt_bad cli-without-runtime --init "$good" --cli "$cli_f" --supervisor "$sup_f"
+rt_bad control-char --with-runtime --init "$good" --cli "$cli_f$(printf '\001')" --supervisor "$sup_f"
+
+# 15: cli・supervisor 側の入力拒否（ラベルがメッセージに入る）
+rt_reject() { # $1=名前 $2=ラベル $3=期待コード $4=cli パス $5=supervisor パス
+    newout
+    run "$target" --with-runtime --init "$good" --cli "$4" --supervisor "$5" --output-dir "$out"
+    check "15 $1 exit code" 2 "$rc"
+    check "15 $1 error code" "$3" "$(errcode)"
+    if grep -q "$2" "$sb/o.err"; then ok "15 $1 message names $2"; else ng "15 $1 message lacks $2"; fi
+    if [ ! -e "$out" ]; then ok "15 $1 leaves no output"; else ng "15 $1 left an output"; fi
+}
+ln -s "$cli_f" "$sb/rt-cli-link"
+rt_reject cli-symlink cli bad-input "$sb/rt-cli-link" "$sup_f"
+rt_reject sup-x86 supervisor wrong-arch "$cli_f" "$sb/init-x86"
+rt_reject cli-interp cli not-static "$sb/elf-interp" "$sup_f"
+rt_reject sup-et-dyn supervisor bad-elf "$cli_f" "$sb/init-dyn"
+cp "$cli_f" "$sb/rt-cli-ow"
+chmod 666 "$sb/rt-cli-ow"
+if [ -n "$(find "$sb/rt-cli-ow" -prune -perm -0002 -print 2>/dev/null)" ]; then
+    rt_reject cli-other-writable cli bad-input "$sb/rt-cli-ow" "$sup_f"
+else
+    skip "15 cli-other-writable (chmod has no effect here)"
+fi
+if [ "$(id -u)" != "0" ]; then
+    newout
+    run env GUEST_INITRD_EXPECT_UID=99999 "$target" --with-runtime --init "$good" --cli "$cli_f" --supervisor "$sup_f" --output-dir "$out"
+    check "15 owner mismatch exit code" 2 "$rc"
+    check "15 owner mismatch error code" bad-input "$(errcode)"
+fi
+
+# 16: 合計サイズの上限（差し替え口はサンドボックス内に限る）
+newout
+run env GUEST_INITRD_MAX_TOTAL_BYTES=$((good_size + cli_size + sup_size - 1)) "$target" --with-runtime --init "$good" --cli "$cli_f" --supervisor "$sup_f" --output-dir "$out"
+check "16 exit code" 2 "$rc"
+check "16 error code" bad-input "$(errcode)"
+if [ ! -e "$out" ]; then ok "16 leaves no output"; else ng "16 left an output"; fi
+newout
+run env GUEST_INITRD_MAX_TOTAL_BYTES=$((good_size + cli_size + sup_size)) "$target" --with-runtime --init "$good" --cli "$cli_f" --supervisor "$sup_f" --output-dir "$out"
+check "16 exact total is accepted" 0 "$rc"
+newout
+run env GUEST_INITRD_TEST_SANDBOX="$sb/none" GUEST_INITRD_MAX_TOTAL_BYTES=1 "$target" --with-runtime --init "$good" --cli "$cli_f" --supervisor "$sup_f" --output-dir "$out"
+check "16 seam outside sandbox exit code" 2 "$rc"
+check "16 seam outside sandbox error code" test-seam-refused "$(errcode)"
+
+# 17: 既定（--with-runtime なし）の追記行
+newout
+run "$target" --init "$good" --compress none --output-dir "$out"
+check "17 exit code" 0 "$rc"
+check "17 default build-info appended lines" "runtime=no
+cpio_bytes=$(wc -c <"$cpio_ref" | tr -d ' ')
+initrd_bytes=$(wc -c <"$cpio_ref" | tr -d ' ')" "$(tail -n +9 "$out/build-info.txt")"
 
 printf 'pass=%s fail=%s\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

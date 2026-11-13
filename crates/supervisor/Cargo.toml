@@ -1,6 +1,7 @@
 # コンテナごとの軽量監視プロセス（restart・healthcheck・exec・logs・stats。crate-naming.md の表 #3）。
 # 雛形は TASK-1.3（#11・REPAIR-1・MS-0）。本体は G12（TASK-157〜171）で実装する。
 # version は未指定（Cargo の既定で 0.0.0）。公開方針は未決定のため publish = false を明記する。
+# #2278（MAC-4）で macOS の VM 保持役（bin fandhe-container-vm-keeper。feature `vm-keeper`、既定は無効）を追加した。workspace 内 path 依存 fandhe-container-plugin を optional で足した（外部クレートの追加ではない）。
 # #4482 で bin の netns-dial の振り分け（src/netns_dial.rs）を追加した（依存は不変）。
 # #3760 で stream-exec helper の本体（src/stream_exec/helper.rs）と実機前提の結合試験 stream_exec_real を追加した（依存は不変）。
 # #4100 で stream-exec の channel の `PtyMaster` の受信を core の `PtyMaster::from_received` で検証するようにした（依存は不変）。
@@ -68,6 +69,14 @@ doc = false
 
 # 特権ランチャーの bin（入口検証 → 権限昇格 → 検証済み fd で supervisor を exec。#1719・SUP-14）。名前は spec（TASK-171 の成果物欄）で確定。
 # doc = false は supervisor の bin と同じ理由（lib の rustdoc の出力名との衝突を避ける）。
+# macOS の VM 保持役（#2278・MAC-4）。plugin 境界基盤（peer 照合つき UDS）を使うため feature `vm-keeper` の下に置き、
+# 既定のビルド・cli の依存木には入れない（PLUG-3・#3204）。
+[[bin]]
+name = "fandhe-container-vm-keeper"
+path = "src/bin/fandhe-container-vm-keeper.rs"
+doc = false
+required-features = ["vm-keeper"]
+
 [[bin]]
 name = "fandhe-container-launcher"
 path = "src/bin/fandhe-container-launcher.rs"
@@ -88,15 +97,22 @@ fandhe-container-net = { path = "../net" }
 # 置く（TASK-163 追補・#1460）。縮退経路の通しの入口 `exec::run_command` も同じ feature の下に置く（#1617。本番の通しの
 # 入口は `run_command_with_pidfd` だけ）。2c の期限超過の拒否後の始末を通す `start_entry::run_start_after_options_worker_for_test`
 # （tests/start_entry.rs。#3473）も同じ feature の下に置く。リリースビルドで有効にするとコンパイルが止まる（src/lib.rs の `compile_error!`）。
+# vm-keeper feature の下でのみ有効（workspace 内 path 依存。MIT OR Apache-2.0。#2278・MAC-4・PLUG-12）。保持役は unix 限定のため、
+# Windows では依存を解決しない（未使用依存の警告を出さない）。
+[target.'cfg(unix)'.dependencies]
+fandhe-container-plugin = { workspace = true, optional = true }
+
 [features]
 exec-test-support = ["fandhe-container-core/exec-test-support"]
+# macOS の VM 保持役（src/vm_keeper.rs）。core の `plugin` feature は有効にしない（#2278・MAC-4・PLUG-3）。
+vm-keeper = ["dep:fandhe-container-plugin"]
 
 # 自己参照の dev-dependency（core の escape-probe と同じ仕組み。外部クレートの追加ではない）: supervisor 自身の
 # テストでは `exec-test-support` を常に有効にし、試験専用の入口を使う結合試験（exec_timeout・exec_setns_join・exec）が
 # `cargo test --workspace`・`make test-integration` の既定のテスト集合から外れないようにする（TASK-163 追補・#1460）。
 # 通常のビルド（`cargo build`・リリース成果物）は dev-dependency を解決しないため、feature は無効のまま。
 [dev-dependencies]
-fandhe-container-supervisor = { path = ".", features = ["exec-test-support"] }
+fandhe-container-supervisor = { path = ".", features = ["exec-test-support", "vm-keeper"] }
 
 # 自前 FFI 宣言と libc のコンパイル時照合（`src/sys/linux.rs` の `libc_abi`。#1840・#1318・MVM-4・REPAIR-12。
 # 方式は docs/design/ffi-libc-check.md）。dev-dependencies のみで製品コードの依存には入れない。sys は Linux 限定。
@@ -202,6 +218,13 @@ harness = false
 # workspace の lint 設定を継承する（ルート Cargo.toml の [workspace.lints]。#1138）。
 [lints]
 workspace = true
+
+# 保持役の受け入れ試験（#2278・MAC-4・CORE-1・REPAIR-12）。unix で動く（macOS は main の platform-ci）。
+[[test]]
+name = "vm_keeper"
+path = "tests/vm_keeper.rs"
+harness = false
+required-features = ["vm-keeper"]
 
 # bin の入口（start_entry::run_main）が継承 fd（fd 3 以降）を閉じること（SEC-1・SUP-14・CORE-1・#2070）。単一スレッドの
 # main で入口の手順 2 を通し、CLOEXEC の無い fd を sh の exec で仕込む自己再実行のため独自 main（harness = false）で動かす。

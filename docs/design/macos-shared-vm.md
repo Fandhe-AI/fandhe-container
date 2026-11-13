@@ -52,6 +52,12 @@ TASK-191 の着手前に確定が要る未決事項 4 点と計測対象を、�
 - 上限: 1 VM あたりのコンテナ数（案 64。実機のメモリで見直す）、VM のメモリ・vCPU（VM 生成時に固定。既存 `VmConfigSpec` の上限）、所属記録の行数と長さ。超えた create は `RESOURCE_EXHAUSTED`（または表に従い `FAILED_PRECONDITION`）で拒否する
 - 採らなかった案: (a) は中央の常駐で CORE-1 に反し、障害がホスト全体に及ぶ。(c) は共用方式では保持の単位が VM なので、コンテナごとに持つと VM の所有者が複数になる。(d) はコマンドをまたいで VM を保てない
 - **#1869 との食い違い**: #1869 4.4 の段階 2 は「コンテナごとの保持役」を推奨するが、本案は「VM ごと」にする。理由は C1 と共用の性質。オプション方式（項目 4）では 1 VM = 1 コンテナなので両者は一致する。#1906 で確認する
+- **実装の記録（#2278・MAC-4・CORE-1。骨格のみ）**: 保持役プロセスの骨格を supervisor crate に入れた（bin `fandhe-container-vm-keeper`、feature `vm-keeper`〔既定は無効〕。本体は `crates/supervisor/src/vm_keeper*`）。承認済みの文言からの差分と未配線の範囲は次のとおり。
+  - ロックは**保持役自身が取る**（上の「保持役がロックを継承して持ち続ける」からの差分）。std の `Command` は fd を子に継承させず、継承には `pre_exec`（`sys` の外の unsafe。事前承認の範囲外）が要るため。また flock は open file description 単位なので、起動役が drop すると保持役のロックまで外れる。排他の正はロックの保持者だけである点は変わらない。起動役は「接続 → 無ければ起動 → 期限まで接続をポーリング」を行い、ロックを取れなかった保持役は `FAILED_PRECONDITION`（`vm keeper is already running`）で即終了する
+  - 置き場所は明示の基底ディレクトリ（`--base <絶対パス>`）配下の `fandhe-container/vm-keeper-default.{lock,sock}`。`getpwuid` による home 配下の既定パスの解決は未実装（新しい unsafe と実機確認が要るため。追跡する issue は PR で起票を提案）。UDS は `fandhe-container-plugin` の `UdsListener` / `UdsStream`（配置ディレクトリの検証・stale socket の検証つき削除・peer UID 照合。PLUG-12）を使う
+  - 猶予 30 秒・協調停止の期限 30 秒・上限 64 は承認値。猶予後の VM の停止は trait `VmLifecycle` の背後にあり、本番の実装 `UnwiredVm` は「停止する VM が無い」を返す。**保持役が plugin-macos を起動して VM を起動・停止する部分は未配線**（W4 #4684・#2281）。上限超過の正式な応答・世代 ID つき所属記録・VM 喪失時の応答は #2279、オプション方式（容量 1）は #2283
+  - `UdsListener::accept` は期限直前の接続を閉じて `Timeout` を返す窓（最大 5ms）があるため、保持役の accept は周回を減らし（30 秒）、クライアントは `Unavailable` のとき 1 回だけやり直す
+  - macOS の実機での確認（CLI 終了後も保持役が生きる・flock の解放）は #2282（人間担当）。結合試験 `crates/supervisor/tests/vm_keeper.rs` は unix 共通実装を ubuntu でも回す
 
 ## 項目 2: VM 生成後にコンテナ単位の bind mount を届ける方法
 

@@ -54,6 +54,13 @@ CI 上の値は PR の `bench-regression` ジョブのサマリを参照する�
 
 申し送り: macOS・Windows でバックエンド plugin を起動する配線（#1869）を入れるときは、cli の `plugin` feature が無効なら構造化エラー（`UNIMPLEMENTED` 等）を返す fail-closed にする。
 
+## supervisor の `vm-keeper` feature（#2278）
+
+supervisor は macOS の VM 保持役（bin `fandhe-container-vm-keeper`）のために、既定で無効の feature `vm-keeper` と、その下だけの
+optional な unix 限定の依存 `fandhe-container-plugin` を持つ。cli は supervisor を既定 feature で引くため `vm-keeper` は cli から
+有効にならず、上の計測（cli の実行ファイル・依存木）は変わらない。`make check-cli-no-plugin` が plugin 無効の cli の依存木に
+`fandhe-container-plugin` が無いことを引き続き検査する。
+
 ## 解釈と限界
 
 - 実行ファイルの差（0.66 %）は僅少で、軽量化効果の実測ではない。ゲート配下が再エクスポートと小さな配線だけのため。切り替えは TASK-109・TASK-110 でゲート配下に実装が入ったときに効果を測るための土台

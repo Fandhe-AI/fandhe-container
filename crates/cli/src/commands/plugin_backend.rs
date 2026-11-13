@@ -271,6 +271,9 @@ fn production_audit_sink(global: &GlobalArgs) -> Box<dyn AuditSink> {
 
 /// 非 Linux の本番経路。`--root` 検証 → 発見（`PATH` 警告は stderr へ）→ 記録先の作成 → [`backend_failure`]。
 ///
+/// 出力順: opt-in 時は `PATH` 警告行（候補ごとに 1 行）を先に stderr へ書き、エラー行は戻り値を受けた
+/// 呼び出し元（`main`）が最後に書く。したがってエラー行は stderr の最終行になる（ERR-1・PLUG-11・#3119）。
+///
 /// Linux では module が単体テスト時だけコンパイルされ、本番経路からは呼ばれないため dead_code を許す。
 #[cfg_attr(target_os = "linux", allow(dead_code))]
 pub(super) fn unavailable(global: &GlobalArgs) -> TraitError {
@@ -576,6 +579,10 @@ mod tests {
         let text = String::from_utf8(out).expect("utf8");
         assert_eq!(text.lines().count(), 2);
         assert!(text.lines().all(|l| l.contains(PATH_WARNING_CODE)));
+        assert!(
+            text.lines()
+                .all(|l| l.starts_with("{\"level\":\"warn\",\"event\":\"plugin_path_candidate\","))
+        );
         // A1 の前提固定（配線時に再評価: この前提を変えたら doc も見直す）。PATH 由来の候補もレジストリに登録される。
         let registered =
             PluginRegistry::from_candidates(report.candidates().iter().cloned()).expect("registry");

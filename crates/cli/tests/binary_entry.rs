@@ -2262,7 +2262,10 @@ fn path_candidate_dir(tag: &str) -> TmpDir {
 fn path_warning_lines(out: &Output) -> usize {
     String::from_utf8_lossy(&out.stderr)
         .lines()
-        .filter(|l| l.contains("\"code\":\"PLUGIN_PATH_CANDIDATE\""))
+        .filter(|l| {
+            l.starts_with("{\"level\":\"warn\",\"event\":\"plugin_path_candidate\",")
+                && l.contains("\"code\":\"PLUGIN_PATH_CANDIDATE\"")
+        })
         .count()
 }
 

@@ -23,6 +23,11 @@
 //! 子の終了コードは ERR-2 の表で `ErrorCode` へ戻し、`LaunchError` に終了コードとして運ぶ（`up` の終了コードに反映される）。
 //! シグナルで終わった子は `INTERNAL`。
 //!
+//! - (f) 親の終了（#4734）: 子は Linux の `PR_SET_PDEATHSIG`（SIGKILL）を `sys::bind_child_to_parent_lifetime` で設定して起動する。
+//!   親 CLI が SIGTERM・SIGHUP・SIGKILL で終わると、待ち中の `create` / `start` の子も止まる（親がシグナルで終わる経路は
+//!   `signals` のハンドラが再送で終了させる）。停止するのは直接の子 1 段で、`start` が起動した supervisor は別
+//!   プロセスグループのため影響を受けず続く。
+//!
 //! 残余: `create` の後に `start` が失敗しても作ったコンテナは消さない（`up` はロールバックしない。`down` の責務）。
 //! 期限で kill した `create` が展開途中の rootfs を残しうる（回収手順は `docs/design/stack-up-wiring.md`）。
 
@@ -116,13 +121,17 @@ impl ProductionServiceLauncher {
         deadline: Duration,
         phase: Phase,
     ) -> Result<(), LaunchError> {
-        let mut child = Command::new(&self.cli_exe)
-            .args(&self.global_args)
+        let mut cmd = Command::new(&self.cli_exe);
+        cmd.args(&self.global_args)
             .args(extra_globals)
             .args(argv)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        // 親（この CLI）が SIGTERM・SIGHUP・SIGKILL 等で終わっても、待ち中の子が残らないようにする（REPAIR-5・#4734）。
+        #[cfg(target_os = "linux")]
+        crate::sys::bind_child_to_parent_lifetime(&mut cmd);
+        let mut child = cmd
             .spawn()
             .map_err(|_| phase.failure(ErrorCode::Unavailable, None))?;
         let limit = Instant::now() + deadline;
@@ -130,14 +139,12 @@ impl ProductionServiceLauncher {
             match child.try_wait() {
                 Ok(Some(s)) => break s,
                 Ok(None) if Instant::now() >= limit => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_and_reap_bounded(&mut child);
                     return Err(phase.failure(ErrorCode::Timeout, None));
                 }
                 Ok(None) => std::thread::sleep(POLL_INTERVAL),
                 Err(_) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_and_reap_bounded(&mut child);
                     return Err(phase.failure(ErrorCode::Internal, None));
                 }
             }
@@ -149,6 +156,23 @@ impl ProductionServiceLauncher {
                 Err(phase.failure(code, std::num::NonZeroU8::new(u8::try_from(n).unwrap_or(1))))
             }
             None => Err(phase.failure(ErrorCode::Internal, None)),
+        }
+    }
+}
+
+/// kill 後の回収を待つ上限（REPAIR-5・#4734）。割り込み不能な I/O 待ち（D 状態）の子は kill が効かず、無期限の
+/// `wait` では TIMEOUT 経路自体が止まる。
+const REAP_DEADLINE: Duration = Duration::from_secs(5);
+
+/// 子を kill し、回収を [`REAP_DEADLINE`] まで待つ。回収できなくても制御を返す（その子は CLI の終了まで残りうる）。
+fn kill_and_reap_bounded(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let limit = Instant::now() + REAP_DEADLINE;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) if Instant::now() >= limit => return,
+            Ok(None) => std::thread::sleep(POLL_INTERVAL),
         }
     }
 }
@@ -447,5 +471,16 @@ image = "example/db:1"
     fn err2_4638_signaled_child_is_internal() {
         let o = drive("kill -KILL $$", Duration::from_secs(20), false);
         assert_eq!(o.result, Err(("SERVICE_LAUNCH_FAILED".to_owned(), 1)));
+    }
+
+    /// REPAIR-5・#4734: 親の終了に追従する設定つきでも子は起動でき、通常の終了コードを返す（設定の失敗は spawn の失敗になる）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repair5_4734_child_bound_to_parent_lifetime_still_runs() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "exit 3"]).stdin(Stdio::null());
+        crate::sys::bind_child_to_parent_lifetime(&mut cmd);
+        let status = cmd.status().expect("spawn");
+        assert_eq!(status.code(), Some(3));
     }
 }

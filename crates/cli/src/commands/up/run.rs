@@ -11,7 +11,7 @@
 //! 5. ここで初めて `up()` を呼び、ネットワークの用意・bundle の作成・子プロセスの起動を行う。
 //!
 //! 出力: 成功時は stdout に `SERVICE\tCONTAINER\tNETWORK` と起動順の行（名前は表示用に無害化し、長さと件数を制限する。#3651）。
-//! 失敗時は ERR-1 の構造化エラー 1 行（stderr の最後の行）で、先に起動済みのサービス名を `info:` の行で stderr に出す。
+//! 失敗時は ERR-1 の構造化エラー 1 行（stderr の最後の行）で、`message` の末尾に先に起動済みのサービス名（最大 8 件）を添える（stderr へ直接書かず main の期限つき出力経路に載せる。#4734）。
 //! 終了コードは `UpError::exit_code`（子の終了コードを運ぶ）を ERR-2 の表で `ErrorCode` に戻したもの。
 
 use std::collections::BTreeMap;
@@ -23,7 +23,8 @@ use std::rc::Rc;
 
 use fandhe_container_core::traits::{ErrorCode, StateStore as _, TraitError};
 use fandhe_container_stack::cli::up::{
-    UpClock, UpError, UpFailure, UpPolicy, UpProject, UpReport, resolve_project_name, up,
+    UpClock, UpError, UpFailure, UpPolicy, UpProject, UpReport, plan_networks,
+    resolve_project_name, up,
 };
 use fandhe_container_stack::cli::{MAX_PS_NAME_BYTES, MAX_PS_SERVICES, sanitize_display};
 use fandhe_container_stack::depends_on::dependency_closure;
@@ -34,22 +35,24 @@ use fandhe_container_stack::schema::Service;
 use fandhe_container_stack::toml_input::read_compose_toml;
 
 use super::super::CliExit;
-use super::super::args::{GlobalArgs, PastaSource, UpArgs};
-use super::super::create_network::resolve_publish_privilege;
+use super::super::args::{CreateNetworkArgs, GlobalArgs, PastaSource, UpArgs};
+use super::super::create_network::{check_network_options, resolve_publish_privilege};
+use super::super::create_pasta::{decide as decide_pasta, detect_install};
 use super::super::create_start::open_store;
 use super::super::image::open_image_store_for_lifecycle;
 use super::super::list_logs::store_open_failure;
+use super::bundle::ProjectLock;
 use super::error_code_for_exit;
 use super::launcher::{LauncherConfig, ProductionServiceLauncher};
 use super::observe::{Ledger, SharedLedger, StateHealth, StateObserver, read_status};
-use super::prepare::{Prepared, Preparer};
+use super::prepare::{EnvReadBudget, Prepared, Preparer};
 use super::provision::ProductionNetworkProvisioner;
 use crate::error::CliError;
 
 /// `O_NONBLOCK`（Linux の x86_64 / aarch64 とも 0o4000）。FIFO を開いて止まらないために使う。
 const O_NONBLOCK: i32 = 0o4000;
 /// 失敗時に `info:` の行へ出す起動済みサービス名の最大件数。
-const MAX_INFO_NAMES: usize = 32;
+const MAX_INFO_NAMES: usize = 8;
 
 fn err(code: ErrorCode, msg: impl AsRef<str>) -> CliExit {
     CliExit::Error(CliError::new(code, msg))
@@ -167,10 +170,20 @@ fn render_success(report: &UpReport) -> String {
     out
 }
 
+/// `NetworkProvisioner` の失敗の `code` 文字列を `ErrorCode` に戻す（未知は `Internal`。fail-closed の既定ではなく分類のみ）。
+fn network_error_code(code: &str) -> ErrorCode {
+    ErrorCode::from_name(code).unwrap_or(ErrorCode::Internal)
+}
+
 /// 失敗を構造化エラーへ写す（`message` は固定文言に、無害化した名前だけを添える）。
 fn failure_exit(f: &UpFailure) -> CliExit {
     let e = f.error();
-    let code = error_code_for_exit(e.exit_code().get());
+    let code = match e {
+        // ネットワーク側の失敗は `source.code()`（ERR-1 の文字列）をそのまま運ぶ。`exit_code` は常に 1 で、
+        // 使うと NOT_FOUND・UNIMPLEMENTED 等が INTERNAL に潰れる（ERR-1・#4734）。未知の文字列は INTERNAL。
+        UpError::NetworkProvision { source, .. } => network_error_code(source.code()),
+        _ => error_code_for_exit(e.exit_code().get()),
+    };
     let message = match e {
         UpError::Launch { service, source } => format!(
             "{}: {} ({})",
@@ -186,13 +199,19 @@ fn failure_exit(f: &UpFailure) -> CliExit {
         ),
         _ => e.message().to_owned(),
     };
-    CliExit::Error(CliError::new(code, message))
+    CliExit::Error(CliError::new(
+        code,
+        format!("{message}{}", launched_suffix(f)),
+    ))
 }
 
-/// 起動済みのサービスを `info:` の行で stderr に出す（件数を制限する）。
-fn print_launched_info(f: &UpFailure) {
+/// 起動済みのサービス名の添え書き（空なら空文字列。件数を制限する）。
+///
+/// stderr へ直接 `eprintln!` せず、エラーの `message` に含めて main の期限つき出力経路で出す（満杯の pipe / socket で
+/// main が止まらないため。REPAIR-5・#4734）。
+fn launched_suffix(f: &UpFailure) -> String {
     if f.launched().is_empty() {
-        return;
+        return String::new();
     }
     let shown: Vec<String> = f
         .launched()
@@ -201,16 +220,41 @@ fn print_launched_info(f: &UpFailure) {
         .map(|n| display_name(n))
         .collect();
     let more = f.launched().len().saturating_sub(MAX_INFO_NAMES);
-    let suffix = if more > 0 {
+    let more = if more > 0 {
         format!(" (+{more} more)")
     } else {
         String::new()
     };
-    eprintln!(
-        "info: launched {} service(s) before the failure: {}{suffix}",
+    format!(
+        "; launched {} service(s) before the failure: {}{more}",
         f.launched().len(),
         shown.join(", ")
-    );
+    )
+}
+
+/// 全サービスの `ports` を、子の `create` と同じ検証関数（`check_network_options`）で副作用の前に検証する。
+/// 接続先は stack の `plan_networks` の決定（サービスごとに高々 1 つ）に従う。計画自体の失敗は `up()` の冒頭が
+/// 同じ分類で報告するため、ここでは検証せず委ねる。
+fn check_ports(
+    services: &BTreeMap<String, Service>,
+    networks: &BTreeMap<String, fandhe_container_stack::schema::Network>,
+) -> Result<(), CliError> {
+    let Ok(plan) = plan_networks(services, networks) else {
+        return Ok(());
+    };
+    for (name, spec) in services {
+        if spec.ports.is_empty() {
+            continue;
+        }
+        let args = CreateNetworkArgs {
+            network: plan.attachment_for(name).map(|a| a.name().to_owned()),
+            publish: spec.ports.clone(),
+            ..CreateNetworkArgs::default()
+        };
+        check_network_options(&args, resolve_publish_privilege)
+            .map_err(|e| CliError::new(e.code(), e.message()))?;
+    }
+    Ok(())
 }
 
 /// pasta のグローバルフラグ（子の `create` の前置き）。
@@ -235,14 +279,30 @@ fn child_globals(global: &GlobalArgs) -> Vec<OsString> {
     v
 }
 
+/// `up` の本体。成功出力は注入された書き込み先 `stdout` へ書く。`commands::run` が渡す process の stdout は期限つきの
+/// 書き手（`BoundedStdout`）で、満杯の pipe / socket での無期限停止を防ぐ（REPAIR-5・#4734）。
 pub(super) fn run_up(global: &GlobalArgs, args: &UpArgs, stdout: &mut dyn Write) -> CliExit {
     // 1. 入力。
     let file: PathBuf = match std::path::absolute(&args.file) {
         Ok(p) => p,
         Err(_) => return err(ErrorCode::InvalidArgument, "project file path is invalid"),
     };
-    let Some(project_dir) = file.parent().map(Path::to_path_buf) else {
+    let Some(parent_dir) = file.parent().map(Path::to_path_buf) else {
         return err(ErrorCode::InvalidArgument, "project file path is invalid");
+    };
+    // `..` や symlink を解決した実体のディレクトリを起点にする（`--file ../stack.toml` でも名前の導出が壊れない。CLI-1）。
+    // env_files は symlink を辿らず読むため、この実体のパスを読み取りの起点にも使う。
+    let project_dir = match std::fs::canonicalize(&parent_dir) {
+        Ok(p) => p,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return err(ErrorCode::NotFound, "project file was not found");
+        }
+        Err(_) => {
+            return err(
+                ErrorCode::InvalidArgument,
+                "project directory is not usable",
+            );
+        }
     };
     let toml = match read_project_file(&file) {
         Ok(t) => t,
@@ -270,6 +330,18 @@ pub(super) fn run_up(global: &GlobalArgs, args: &UpArgs, stdout: &mut dyn Write)
         );
     }
 
+    // pasta の未設定（ユーザー定義ネットワークがあるのに pasta のフラグが無い等）は、子の `create` と同じ判定
+    // （`create_pasta::decide`）で、ネットワーク作成・サービス起動の前に拒否する（STACK-8・NET-9・#4734）。
+    if services.values().any(|s| !s.networks.is_empty()) {
+        let install = match detect_install() {
+            Ok(i) => i,
+            Err(e) => return from_trait(&e),
+        };
+        if let Err(e) = decide_pasta(global.pasta.as_ref(), true, install) {
+            return from_trait(&e);
+        }
+    }
+
     // 3. ストアを開き、全サービスを事前検査する。
     let store = match open_store(global) {
         Ok(s) => s,
@@ -282,21 +354,12 @@ pub(super) fn run_up(global: &GlobalArgs, args: &UpArgs, stdout: &mut dyn Write)
     let Some(state_root) = store.host_state_root().map(Path::to_path_buf) else {
         return err(ErrorCode::Internal, "state root is unavailable");
     };
-    // env_files は symlink を辿らず読むため、起点は実体のパスにする（名前の決定には使わない）。
-    let read_dir = match std::fs::canonicalize(&project_dir) {
-        Ok(p) => p,
-        Err(_) => {
-            return err(
-                ErrorCode::InvalidArgument,
-                "project directory is not usable",
-            );
-        }
-    };
     let preparer = Preparer {
         project: &project,
-        project_dir: &read_dir,
+        project_dir: &project_dir,
         image_root: &args.image_root,
         store: &image_store,
+        env_budget: EnvReadBudget::new(),
     };
     let mut prepared: BTreeMap<String, Prepared> = BTreeMap::new();
     for (name, spec) in &services {
@@ -321,6 +384,38 @@ pub(super) fn run_up(global: &GlobalArgs, args: &UpArgs, stdout: &mut dyn Write)
             Err(_) => return err(ErrorCode::Internal, "container state could not be read"),
         }
         prepared.insert(name.clone(), p);
+    }
+
+    // 3b. `ports`（`--publish`）の意味検証を副作用の前に行う（構文・ユーザー定義ネットワークとの組・rootless のみ）。
+    // 子の `create` が同じ検証でネットワーク作成後に拒否する事態を防ぐ（STACK-8・NET-9・SEC-1・#4734）。
+    if let Err(e) = check_ports(&services, &toml.networks) {
+        return CliExit::Error(e);
+    }
+
+    // 同じプロジェクトの並行する `up` を排他する。ロックファイルは状態ルートに `.stack` を作るため、拒否経路（事前検査）が
+    // すべて済んでから取る（拒否は副作用ゼロ。STACK-8・SEC-1・#4734）。取った後に、待っていた間に別の `up` が
+    // 記録を作っていないかを再確認する。create / start の完了（この関数の終わり）まで保持する。
+    let _project_lock = match ProjectLock::acquire(&state_root, project.as_str()) {
+        Ok(l) => l,
+        Err(e) => return CliExit::Error(e),
+    };
+    for (name, p) in &prepared {
+        match read_status(&store, &p.id) {
+            Ok(o)
+                if o.state
+                    != fandhe_container_stack::depends_on::wait::DependencyObservation::Absent =>
+            {
+                return err(
+                    ErrorCode::AlreadyExists,
+                    format!(
+                        "a container for the service already exists ({})",
+                        display_name(name)
+                    ),
+                );
+            }
+            Ok(_) => {}
+            Err(_) => return err(ErrorCode::Internal, "container state could not be read"),
+        }
     }
 
     // 4. 副作用はここから。
@@ -365,18 +460,19 @@ pub(super) fn run_up(global: &GlobalArgs, args: &UpArgs, stdout: &mut dyn Write)
         &UpPolicy::default(),
     ) {
         Ok(report) => {
-            if stdout
-                .write_all(render_success(&report).as_bytes())
-                .is_err()
+            let out = render_success(&report);
+            match stdout
+                .write_all(out.as_bytes())
+                .and_then(|()| stdout.flush())
             {
-                return CliExit::failed(ErrorCode::Internal);
+                Ok(()) => CliExit::Success,
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                    CliExit::failed(ErrorCode::Timeout)
+                }
+                Err(_) => CliExit::failed(ErrorCode::Internal),
             }
-            CliExit::Success
         }
-        Err(f) => {
-            print_launched_info(&f);
-            failure_exit(&f)
-        }
+        Err(f) => failure_exit(&f),
     }
 }
 
@@ -389,6 +485,41 @@ mod tests {
     #[test]
     fn cli2_4638_up_is_a_daily_command() {
         assert_eq!(super::super::super::Command::Up.kind(), CommandKind::Daily);
+    }
+
+    /// STACK-8・NET-9・SEC-1・#4734: `ports` の不正な構文・ネットワークなしの公開は、副作用の前の検査で
+    /// `INVALID_ARGUMENT` になる（権限の解決より前に拒否されるため環境に依らない）。
+    #[test]
+    fn stack8_4734_check_ports_rejects_before_any_side_effect() {
+        let svc = |ports: &[&str], nets: &[&str]| Service {
+            image: Some("x".to_owned()),
+            ports: ports.iter().map(|s| (*s).to_owned()).collect(),
+            networks: nets.iter().map(|s| (*s).to_owned()).collect(),
+            ..Service::default()
+        };
+        let defs = BTreeMap::from([(
+            "n".to_owned(),
+            fandhe_container_stack::schema::Network::default(),
+        )]);
+        // 構文不正。
+        let bad = BTreeMap::from([("a".to_owned(), svc(&["not a port"], &["n"]))]);
+        let e = check_ports(&bad, &defs).expect_err("syntax");
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        // ネットワークなしの公開。
+        let nonet = BTreeMap::from([("a".to_owned(), svc(&["8080:80"], &[]))]);
+        let e = check_ports(&nonet, &defs).expect_err("no network");
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        // 後ろのサービスの不正も見つける（先頭が正常でも全件を検査する）。
+        let later = BTreeMap::from([
+            ("a".to_owned(), svc(&[], &[])),
+            ("b".to_owned(), svc(&["zzz"], &["n"])),
+        ]);
+        assert_eq!(
+            check_ports(&later, &defs).expect_err("later").code(),
+            ErrorCode::InvalidArgument
+        );
+        // ports なしは何も解決せず通る。
+        check_ports(&BTreeMap::from([("a".to_owned(), svc(&[], &[]))]), &defs).expect("none");
     }
 
     /// STACK-8・SEC-1・#3651・#4638: 表示用の名前は制御文字・bidi 制御を無害化し、長さを制限する。

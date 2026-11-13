@@ -403,7 +403,44 @@ fn usage() -> CliExit {
 /// `create` / `start` / `stop` / `delete` / `list` / `logs` は core を呼ぶ（TASK-79.2.1・TASK-79.2.2・TASK-79.3）。
 /// `list` の一覧は process の stdout へ出す。引数値は出力へ埋め込まない（インジェクション回避）。
 pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> CliExit {
-    run_to(args, &mut std::io::stdout())
+    run_to(args, &mut BoundedStdout)
+}
+
+/// process の stdout へ書く書き手。1 回の書き込みを別スレッドで行い、[`STDOUT_WRITE_TIMEOUT`] までだけ待つ。
+///
+/// 満杯の pipe / socket への `write_all` が main スレッドを無期限に止めるのを防ぐ（REPAIR-5）。期限切れは
+/// `TimedOut`。期限切れのスレッドは置き去りにする（main の return でプロセスごと破棄される）。
+struct BoundedStdout;
+
+/// [`BoundedStdout`] の 1 回の書き込みを待つ上限。
+const STDOUT_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+impl Write for BoundedStdout {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let bytes = buf.to_vec();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("cli-stdout".to_owned())
+            .spawn(move || {
+                let mut out = std::io::stdout().lock();
+                let r = out.write_all(&bytes).and_then(|()| out.flush());
+                let _ = tx.send(r);
+            })?;
+        match rx.recv_timeout(STDOUT_WRITE_TIMEOUT) {
+            Ok(r) => r.map(|()| buf.len()),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "stdout write timed out",
+            )),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err(std::io::Error::other("stdout writer stopped"))
+            }
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// [`run`] と同じだが、`list` の出力先を `stdout` で指定する（テストと将来の出力先切替の入口）。

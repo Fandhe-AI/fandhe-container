@@ -96,6 +96,61 @@ fn write_private(dir: &ExtractRoot, name: &str, body: &[u8]) -> Result<(), CliEr
         .map_err(|_| CliError::new(ErrorCode::Internal, "failed to write the service bundle"))
 }
 
+/// プロジェクト単位の `up` の排他ロック（事前検査から create / start の完了まで保持する。STACK-8・SEC-1・REPAIR-5・#4734）。
+///
+/// 同じプロジェクトを並行して `up` すると、両者が状態記録なしの事前検査を通り、同じ bundle の `config.json` と
+/// `env/` を削除・再作成し合える。`<状態ルート>/.stack/up-<project>.lock` への非ブロッキングの `flock` で、
+/// 後行を待たせずに `ABORTED` 相当の `FAILED_PRECONDITION` で拒否する（待ちが無いため期限は不要）。
+/// drop（プロセス終了を含む）で解放される。
+#[derive(Debug)]
+pub(super) struct ProjectLock {
+    _file: std::fs::File,
+}
+
+impl ProjectLock {
+    /// `state_root` 配下で `project` のロックを取る。他の `up` が保持していれば `FAILED_PRECONDITION`。
+    pub(super) fn acquire(state_root: &Path, project: &str) -> Result<Self, CliError> {
+        let fail = || CliError::new(ErrorCode::Internal, "failed to lock the project");
+        let root = ExtractRoot::open_existing_dir(state_root).map_err(|e| oci_failure(&e))?;
+        root.ensure_child_dir(STACK_DIR, 0o700)
+            .map_err(|e| oci_failure(&e))?;
+        // ロックファイルは `.stack` の fd 起点（openat2・NOFOLLOW）で開く。パスを組み直して開かないので、`.stack` が
+        // symlink に差し替えられても状態ルートの外のファイルには flock しない（SEC-1・#4734）。
+        let stack = root
+            .open_child_dir(STACK_DIR)
+            .map_err(|e| oci_failure(&e))?
+            .ok_or_else(fail)?;
+        let file = stack
+            .open_or_create_file(&format!("up-{project}.lock"), 0o600)
+            .map_err(|e| oci_failure(&e))?;
+        if !file.metadata().map_err(|_| fail())?.is_file() {
+            return Err(fail());
+        }
+        match file.try_lock() {
+            Ok(()) => Ok(Self { _file: file }),
+            Err(std::fs::TryLockError::WouldBlock) => Err(CliError::new(
+                ErrorCode::FailedPrecondition,
+                "another up for the project is in progress",
+            )),
+            Err(_) => Err(fail()),
+        }
+    }
+}
+
+/// 合成した `config.json` を core の検証に通す（副作用なし）。`up` の事前検査が全サービスに対して呼び、
+/// 後続サービスの入力不正を先行サービスの起動後に初めて見つける事態を防ぐ（STACK-8・SEC-1・#4734）。
+/// 不合格は入力起因として `INVALID_ARGUMENT`（メッセージは固定文言で値を含めない）。
+pub(super) fn validate_config(p: &Prepared) -> Result<(), CliError> {
+    parse_config_bytes(config_json(p).as_bytes())
+        .map(|_| ())
+        .map_err(|_| {
+            CliError::new(
+                ErrorCode::InvalidArgument,
+                "the service command, environment or working directory was rejected by config validation",
+            )
+        })
+}
+
 /// `state_root` 配下に `p` の bundle を用意する。`state_root` は開いた状態ストアの正規パス。
 pub(super) fn write_bundle(state_root: &Path, p: &Prepared) -> Result<BundlePaths, CliError> {
     // 書く前に core の検証へ通す（手組みの誤りを fail-closed にする）。
@@ -240,6 +295,18 @@ mod tests {
         assert!(!s.0.join(".stack").exists());
     }
 
+    /// STACK-8・SEC-1・#4734: 事前検査用の検証は core が拒否する内容を `INVALID_ARGUMENT` で返し、正常な内容は通す。
+    #[test]
+    fn stack8_4734_validate_config_is_invalid_argument_not_internal() {
+        let e = validate_config(&prepared(&[], &[], "/", vec![])).expect_err("empty args");
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        // 上限（CONFIG_MAX_STRING_BYTES）を超える command 要素。
+        let huge = "a".repeat(1 << 20);
+        let e = validate_config(&prepared(&[huge.as_str()], &[], "/", vec![])).expect_err("huge");
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        validate_config(&prepared(&["/bin/true"], &[], "/", vec![])).expect("valid");
+    }
+
     /// STACK-8・SEC-1・#4638: bundle は 0700 のディレクトリ、config.json と env は 0600 で作られ、
     /// 2 回目は config.json と env を作り直し、rootfs が残っていれば `FAILED_PRECONDITION`。
     #[test]
@@ -289,5 +356,23 @@ mod tests {
         let p = prepared(&["/bin/true"], &[], "/", vec![]);
         assert!(write_bundle(&s.0, &p).is_err());
         assert!(!outside.0.join("bundles").exists());
+    }
+
+    /// SEC-1・STACK-8・#4734: `.stack` が symlink なら、ロックは辿らず拒否し、外側にロックファイルを作らない。
+    /// 通常は 2 回目の取得が `FAILED_PRECONDITION`。
+    #[test]
+    fn sec1_4734_project_lock_is_fd_anchored_and_exclusive() {
+        let s = Scratch::new("lock");
+        let first = ProjectLock::acquire(&s.0, "shop").expect("lock");
+        let e = ProjectLock::acquire(&s.0, "shop").expect_err("second");
+        assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+        drop(first);
+        ProjectLock::acquire(&s.0, "shop").expect("released");
+
+        let s2 = Scratch::new("lock-link");
+        let outside = Scratch::new("lock-outside");
+        std::os::unix::fs::symlink(&outside.0, s2.0.join(".stack")).expect("symlink");
+        assert!(ProjectLock::acquire(&s2.0, "shop").is_err());
+        assert!(!outside.0.join("up-shop.lock").exists());
     }
 }

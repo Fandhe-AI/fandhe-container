@@ -1273,7 +1273,6 @@ mod tests {
         assert_eq!(out, LogRemoval::Finished);
     }
 
-    /// ERR-1: 期限切れの警告は `code` / `message` を持つ 1 行の JSON。
     /// ERR-4・#3122: delete の後始末の警告は、すべて level `warn` で `event` を持つ 1 行 1 JSON。
     #[test]
     fn err4_3122_cleanup_warnings_are_one_json_line_each() {
@@ -1319,6 +1318,7 @@ mod tests {
         assert_eq!(facts[0].level.as_deref(), Some("warn"));
     }
 
+    /// ERR-1: 期限切れの警告は `code` / `message` を持つ 1 行の JSON。
     #[test]
     fn err1_log_removal_timeout_warning_is_single_line_json() {
         let w = log_removal_timeout_warning();

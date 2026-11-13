@@ -22,7 +22,7 @@
 //! 未実装: `completed`、および `wait_for_step` への `healthy` の統合（TASK-155 の配線）。これらの条件は
 //! 黙って満たしたことにせず [`DependencyWaitError::UnsupportedCondition`] で止める。
 //!
-//! エラーにはサービス名と条件だけを入れ、`Service`（`env` に資格情報を含みうる）の内容は出さない。
+//! エラーの `Display` には名前を出さず固定文と条件名だけを出し（名前はフィールドに持つ。ERR-1・SEC-1）、`Service`（`env` に資格情報を含みうる）の内容は出さない。
 //! 待ちには必ず期限がある（REPAIR-5）。
 
 use std::fmt;
@@ -246,35 +246,14 @@ fn condition_name(c: DependsOnCondition) -> &'static str {
 impl fmt::Display for DependencyWaitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::WaitTimeout {
-                service,
-                dependency,
-                condition,
+            // サービス名・依存先名は untrusted のため Display に出さない（ERR-1・SEC-1）。
+            // 出すのは固定文と静的な条件名・source の code だけ。
+            Self::WaitTimeout { condition, .. } | Self::UnsupportedCondition { condition, .. } => {
+                write!(f, "{} ({})", self.message(), condition_name(*condition))
             }
-            | Self::UnsupportedCondition {
-                service,
-                dependency,
-                condition,
-            } => write!(
-                f,
-                "{}: {} -> {} ({})",
-                self.message(),
-                service,
-                dependency,
-                condition_name(*condition)
-            ),
-            Self::Observe {
-                service,
-                dependency,
-                source,
-            } => write!(
-                f,
-                "{}: {} -> {} ({})",
-                self.message(),
-                service,
-                dependency,
-                source.code()
-            ),
+            Self::Observe { source, .. } => {
+                write!(f, "{} ({})", self.message(), source.code())
+            }
             Self::InvalidPolicy => f.write_str(self.message()),
         }
     }
@@ -704,11 +683,55 @@ mod tests {
         assert_eq!(e.message(), "timed out waiting for a dependency condition");
         assert_eq!(
             e.to_string(),
-            "timed out waiting for a dependency condition: app -> db (started)"
+            "timed out waiting for a dependency condition (started)"
         );
         assert_eq!(
             DependencyWaitError::InvalidPolicy.code(),
             "INVALID_ARGUMENT"
         );
+    }
+
+    /// STACK-2・ERR-1・SEC-1: 悪意ある名前でも `Display` は固定文と静的な条件名・code だけ。
+    #[test]
+    fn stack_2_wait_error_display_hides_names() {
+        let evil = "a\u{1b}[31m\n\u{202e}c";
+        let timeout = DependencyWaitError::WaitTimeout {
+            service: evil.into(),
+            dependency: evil.into(),
+            condition: DependsOnCondition::Healthy,
+        };
+        assert_eq!(
+            timeout.to_string(),
+            "timed out waiting for a dependency condition (healthy)"
+        );
+        let unsupported = DependencyWaitError::UnsupportedCondition {
+            service: evil.into(),
+            dependency: evil.into(),
+            condition: DependsOnCondition::Completed,
+        };
+        assert_eq!(
+            unsupported.to_string(),
+            "dependency condition is not supported yet (completed)"
+        );
+        let observe = DependencyWaitError::Observe {
+            service: evil.into(),
+            dependency: evil.into(),
+            source: ObserveError::new("OBS_X", "y"),
+        };
+        assert_eq!(
+            observe.to_string(),
+            "failed to observe a dependency (OBS_X)"
+        );
+        match observe {
+            DependencyWaitError::Observe {
+                service,
+                dependency,
+                ..
+            } => {
+                assert_eq!(service, evil);
+                assert_eq!(dependency, evil);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 }

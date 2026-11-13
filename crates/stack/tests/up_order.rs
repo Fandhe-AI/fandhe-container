@@ -545,7 +545,7 @@ fn stack_8_failure_does_not_expose_service_env() {
     let f = run(&services, &mut w, &mut clk, &policy(Duration::from_secs(1))).unwrap_err();
     assert_eq!(
         f.to_string(),
-        "failed to launch a service: b (TEST_LAUNCH) (launched: 1)"
+        "failed to launch a service (TEST_LAUNCH) (launched: 1)"
     );
     assert!(!format!("{f}").contains("DUMMY_SECRET_VALUE"));
     assert!(!format!("{f:?}").contains("DUMMY_SECRET_VALUE"));

@@ -16,6 +16,7 @@
 //! | `env` | `--env` の上書き。`process.env` へ `KEY` 単位で重ねて entrypoint へ渡す(#2713) |
 //! | `capability_drop` | `create --cap-drop`。config.json 由来の許可集合から除く(狭める方向のみ。launch の段と分離の記録へ同じ値を渡す。CLI-1・SEC-1・#2775) |
 //! | `network` | start が予約前に config の network エントリと突き合わせ(D7。`network_mode.rs`)、launcher が spec と照合する。`Loopback` と `Attachable` は新しい netns と `lo` の up を伴う(#3064。NET-6・SEC-1・#3058)。`Attachable` は rootless の pasta 構成向けで、`ProductionLauncherBuilder::netns_attach_hook` と対(#1939) |
+//! | `netns_join` | `JoinPinned` と対。init user namespace 所有の pin 済み netns の置き場・パス・(dev, ino)。start が 1 回だけ開いて fd に固定し、user namespace の作成前に参加する(rootful のユーザー定義ネットワーク。D12・NET-1・SEC-1・CORE-3・#3069) |
 //! | `etc_files` | pivot 前段の `mount_etc_files`(管理ルートに生成済みの `/etc/hosts`・`/etc/resolv.conf` を bind。空なら載せない。NET-12・#1872) |
 //! | `stdin` | `Pipe` のときだけ launcher の spawn が stdin 用の pipe を作り、読み取り側を init の fd 0、書き込み側を `LaunchedProcess::take_stdin` で返す。既定 `Null` は従来どおり `/dev/null`(attach の stdin 用。SUP-7・CRI-6・SEC-1・#4069) |
 //! | `root_readonly` | `create --read-only`。config の `root.readonly` と OR(狭める方向のみ)。mount の RDONLY・Landlock の root 規則・分離の記録へ同じ実効値を渡す(CLI-1・SUP-12・CORE-5・SEC-1・#2828) |
@@ -44,6 +45,7 @@ use crate::dev_mounts::ImplicitDevMounts;
 use crate::etc_files::{EtcFileSelection, check_etc_overlaps};
 use crate::injected_files::{InjectedFileSet, overlaps};
 use crate::oci_runtime::config::{CONFIG_MAX_ENV, CONFIG_MAX_STRING_BYTES};
+use crate::oci_runtime::namespace_join::NetnsJoinTarget;
 use crate::oci_runtime::network_mode::LaunchNetworkMode;
 use crate::rlimits::Rlimits;
 use crate::tmpfs::{DEV_SHM_PATH, TmpfsMountSet};
@@ -92,6 +94,9 @@ pub struct LaunchOptions {
     root_readonly: bool,
     /// network namespace の扱い(既定 `FromConfig`。NET-6・SEC-1・#3058)。
     network: LaunchNetworkMode,
+    /// `network` が `JoinPinned` のときの参加先(それ以外では必ず `None`。モードと対で設定し、食い違いを内部に残さない。
+    /// NET-1・SEC-1・#3069)。
+    netns_join: Option<NetnsJoinTarget>,
     /// 管理ルート(`@container-etc/<id>`)の生成物のうち rootfs へ bind する種別(空なら載せない。NET-12・#1872)。
     etc_files: EtcFileSelection,
     /// init の stdin の扱い(既定 `Null`。SUP-7・CRI-6・#4069)。
@@ -110,6 +115,7 @@ impl std::fmt::Debug for LaunchOptions {
             .field("capability_drop", &self.capability_drop)
             .field("root_readonly", &self.root_readonly)
             .field("network", &self.network)
+            .field("netns_join", &self.netns_join)
             .field("etc_files", &self.etc_files)
             .field("stdin", &self.stdin)
             .finish()
@@ -165,6 +171,7 @@ impl LaunchOptions {
             capability_drop: CapabilitySet::empty(),
             root_readonly: false,
             network: LaunchNetworkMode::FromConfig,
+            netns_join: None,
             etc_files: EtcFileSelection::default(),
             stdin: LaunchStdinMode::Null,
         })
@@ -205,7 +212,22 @@ impl LaunchOptions {
     /// `Host` は起動オプションだけで選べる(config.json からは選べない)。
     #[must_use]
     pub fn with_network(mut self, network: LaunchNetworkMode) -> Self {
+        // `JoinPinned` は参加先と対でしか成り立たない。他のモードへ戻したら参加先を消す(食い違いを残さない)。
+        // `JoinPinned` を直接指定した場合の参加先の欠落は、start が `InvalidArgument` で拒否する。
+        if network != LaunchNetworkMode::JoinPinned {
+            self.netns_join = None;
+        }
         self.network = network;
+        self
+    }
+
+    /// init user namespace 所有の pin 済み netns への参加を指定する(モードは `JoinPinned` になる。D12・NET-1・SEC-1・
+    /// CORE-3・#3069)。パスと (dev, ino) は [`NetnsJoinTarget`] が字句を検査済みで、core は start で再検証して 1 回だけ開き、
+    /// fd に固定する。pod の join(`linux.namespaces[].path`)とは別の入口。
+    #[must_use]
+    pub fn with_netns_join(mut self, target: NetnsJoinTarget) -> Self {
+        self.network = LaunchNetworkMode::JoinPinned;
+        self.netns_join = Some(target);
         self
     }
 
@@ -287,6 +309,11 @@ impl LaunchOptions {
         self.network
     }
 
+    /// `JoinPinned` の参加先(それ以外では `None`。#3069)。
+    pub fn netns_join(&self) -> Option<&NetnsJoinTarget> {
+        self.netns_join.as_ref()
+    }
+
     /// rootfs へ bind する管理ルートの生成物の種別(既定は空)。
     pub fn etc_files(&self) -> EtcFileSelection {
         self.etc_files
@@ -350,6 +377,22 @@ mod tests {
         let opts = opts.with_network(LaunchNetworkMode::Host);
         assert_eq!(opts.network(), LaunchNetworkMode::Host);
         assert!(format!("{opts:?}").contains("network: Host"));
+    }
+
+    /// NET-1・SEC-1(#3069): `with_netns_join` は `JoinPinned` と参加先を同時に設定し、他のモードへ戻すと参加先も消える。
+    #[test]
+    fn net1_sec1_3069_netns_join_is_paired_with_the_mode() {
+        let opts = LaunchOptions::try_default().expect("default");
+        assert_eq!(opts.netns_join(), None);
+        let target = NetnsJoinTarget::new("/run/n".into(), "/run/n/web".into(), 5, 4_026_532_008)
+            .expect("target");
+        let opts = opts.with_netns_join(target.clone());
+        assert_eq!(opts.network(), LaunchNetworkMode::JoinPinned);
+        assert_eq!(opts.netns_join(), Some(&target));
+        assert!(format!("{opts:?}").contains("network: JoinPinned"));
+        let opts = opts.with_network(LaunchNetworkMode::Host);
+        assert_eq!(opts.network(), LaunchNetworkMode::Host);
+        assert_eq!(opts.netns_join(), None);
     }
 
     /// SUP-7・CRI-6(#4069): stdin の既定は `Null`、`with_stdin` で往復し、`Debug` に出る。

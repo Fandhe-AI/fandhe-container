@@ -14,7 +14,7 @@ TASK-191 の着手前に確定が要る未決事項 4 点と計測対象を、�
 
 - `Vm::launch` は 1 回で 1 VM を構成・起動する。virtiofs 共有は構成時に固定される（`MAX_VIRTIOFS_SHARES` = 8）
 - plugin-macos は 1 コンテナ = 1 VM で、状態はメモリだけに持つ。kill・delete・state は `UNIMPLEMENTED`。要求本体は `Vec<String>` の暫定ワイヤー契約
-- macOS の VZ vsock は `Unimplemented`。ゲスト init は mount・報告・ready マーカーまでで、子を作らず、協調停止も無く、mount にパス由来の TOCTOU が残る（#2080 の P2-4。#2268 で fd 起点の mount へ移行済み）
+- macOS の VZ vsock は `Unimplemented`。ゲスト init は mount・報告・ready マーカー・子の回収（#2269）・協調停止（#2270。停止要求で全プロセスを止めて `sync` → `reboot(RB_POWER_OFF)`。ホスト側は `Vm::shutdown` が猶予後に強制停止へ切り替える。plugin-macos の `stop` が使う）までで、子は作らない。mount のパス由来の TOCTOU は #2268 で fd 起点の mount へ移行済み（#2080 の P2-4）
 - 詳細は [macos-vm-strategy.md](macos-vm-strategy.md) の「現状の事実」を参照
 
 ## 設計上の制約
@@ -102,7 +102,7 @@ TASK-191 の着手前に確定が要る未決事項 4 点と計測対象を、�
   - 実装課題として、(1) guest-init の cgroup 委譲と非特権ユーザーへの降格、(2) ゲスト向け supervisor 起動モード（cli）、(3) ゲスト内の subordinate ID の供給を新規に起票する（起票は #1906 の承認後。G6・G9 の依存に加える）
 - ホストとゲストの制御経路: vsock（`VZVirtioSocketDevice`）。**接続の方向はホスト開始・ゲスト受け側に統一する**。guest-init がゲスト内の固定ポート（案: 1024。実装 issue で確定）で `listen` し、保持役配下の plugin-macos が `VZVirtioSocketDevice` の `connectToPort` で接続する（VM のデバイスに触れるのは plugin-macos だけ）。ゲストからホストへ接続する経路は作らない（ホスト側にゲスト由来の待受を持たない）。シリアルコンソール（hvc0）は起動時の報告と ready マーカー専用で、制御には使わない
 - **承認事項**: `objc2-virtualization` に vsock 関連の feature（`VZVirtioSocketDevice*` など）を足す必要がある。依存の更新にあたるため [dependency-policy](../../.claude/rules/dependency-policy.md) に従いユーザー承認を要する
-- 接続元の確認: ゲスト側の受け口（G6）は accept した peer の CID が `VMADDR_CID_HOST`（2）であることを検証し、それ以外は即切断する。ホスト側の接続（G5）は固定ポートへ接続するだけで、待受（listen）を持たない。network namespace は vsock を分離しないため、コンテナから `socket(AF_VSOCK, …)` を使わせないよう seccomp で拒否し、結合試験で確かめる。ホスト側の CLI・plugin と保持役の間は UDS の peer UID 照合で守る（PLUG-12）
+- 接続元の確認: ゲスト側の受け口（G6）は accept した peer の CID が `VMADDR_CID_HOST`（2）であることを検証し、それ以外は即切断する。ホスト側の接続（G5）は固定ポートへ接続するだけで、待受（listen）を持たない。network namespace は vsock を分離しないため、コンテナから `socket(AF_VSOCK, …)` を使わせないよう seccomp で拒否し、結合試験で確かめる（実装済み・#2277・CORE-5・SEC-1。`socket` の第 1 引数の下位 32 bit が 40 のとき `EPERM`。カーネルの `int` への切り詰めに合わせ上位 32 bit は見ない。残余: `io_uring` の `IORING_OP_SOCKET`〔Linux 5.19 以降〕は `socket(2)` を通らず止められない。`io_uring_*` を既定で拒否するかは #4751 でオーナー判断待ち）。ホスト側の CLI・plugin と保持役の間は UDS の peer UID 照合で守る（PLUG-12）
 - 中継の契約: Windows の起動役の中継（[windows-execution-layout.md](windows-execution-layout.md)）と同じ形にする。引数の配列・標準入出力・終了コードを中継し、シェルを経由させない。ゲスト内のバイナリは固定の絶対パスで呼び、`PATH` を探さない。フレームは長さの上限とチェックサムつき（REPAIR-2）。plugin のフレーム（PLUG-2）を再利用するかは実装 issue で決める
 - rootfs とイメージ: 推奨は、イメージとコンテナの rootfs をゲスト側の永続ディスク（virtio-blk のデータディスク）に置くこと。bundle をホストで作る経路（#1869 4.3 の (a)）では共有ルート経由でゲストへ渡す。MVP は「共有ルート経由の bundle」とし、ゲスト内の pull（VZ の NAT のネットワークと feature 追加が要る）は後続とする（判断事項）
 - 状態ファイル: ゲスト内の `/run/fandhe-container/<id>/state.json`（OCI-5 の (1)。上記の非特権ユーザーが書ける `/run` 配下の所有で用意する）。ホストに置くのは項目 1 の所属記録だけ
@@ -147,7 +147,7 @@ TASK-191 の着手前に確定が要る未決事項 4 点と計測対象を、�
 | VM の start | 30 秒 | `OpTimeouts::start`（`DEFAULT_START_TIMEOUT`） |
 | ゲストの ready | 60 秒 | `DEFAULT_GUEST_MOUNT_TIMEOUT` |
 | vsock の接続・中継の 1 往復 | 10 秒以内 | `RpcTimeout` の上限（値は案） |
-| 協調停止（ゲスト内停止 → 電源断 → 強制停止） | 案: 30 秒 | 新規（承認待ち） |
+| 協調停止（ゲスト内停止 → 電源断 → 強制停止） | 案: 30 秒 | `OpTimeouts::graceful_stop`（`DEFAULT_GRACEFUL_STOP_TIMEOUT`。#2270 で実装、値は承認待ち）。1 コンテナ = 1 VM の plugin は RPC 期限 10 秒に収めるため 5 秒（`PLUGIN_STOP_GRACE`）。ゲスト内の待ちは SIGTERM 3 秒＋SIGKILL 1 秒（`guest-init` の `shutdown`） |
 | 保持役の終了猶予 | 案: 30 秒 | 新規（承認待ち） |
 
 ## Windows の実行構成との比較と PLUG-1 の変化
@@ -166,7 +166,7 @@ PLUG-1 の境界表の macOS の行は「plugin（常駐。保持役が持つ）
 ## セキュリティ（OWASP の観点）
 
 - インジェクション: 中継は引数の配列でシェルを経由させない。ゲスト内のパスは固定。共有パスは正規化と検証をしてから使う
-- アクセス制御: UDS は 0700 と peer UID の照合。ゲストの vsock の受け口は CID 2 のホストからの接続だけを受ける（接続はホスト開始）。コンテナからの AF_VSOCK は seccomp で拒否する。共有ルートの露出範囲は trade-off として明記済み
+- アクセス制御: UDS は 0700 と peer UID の照合。ゲストの vsock の受け口は CID 2 のホストからの接続だけを受ける（接続はホスト開始）。コンテナからの AF_VSOCK は seccomp で拒否する（実装済み・#2277。io_uring 経由の残余は #4751）。共有ルートの露出範囲は trade-off として明記済み
 - 不安全な設計: すべての待ちに期限を付ける。件数・長さに上限を設ける。異常時は VM・plugin・mount・ゲスト内プロセスを回収する。二重起動はロックで防ぎ、取れなければ fail-closed
 - 完全性: plugin-macos は検証済みの fd で起動する（#1869 4.2）。ゲスト向けバイナリは initrd に梱包し、ゲストの `PATH` は探さない。版の不一致の照合を実装 issue にする
 - 情報漏えい: エラーは英語の固定文言だけにし、ホストのパスや plugin 由来の文字列は出さない
@@ -186,6 +186,7 @@ Apple Silicon の macOS 実機で確かめないと決まらない。すべて�
 - VM のメモリ、コンテナ数の上限の妥当性（CORE-8）
 - ゲストカーネルの cgroup v2・Landlock・user namespace の動作
 - 協調停止（`reboot(RB_POWER_OFF)`）が VZ でどの状態遷移になるか
+- `requestStop` が PL061 GPIO・gpio-keys の `KEY_POWER` としてゲストへ届くか（#2270 は guest-init の power button 監視と Kconfig の `GPIO_PL061`・`KEYBOARD_GPIO`・`INPUT_EVDEV` を足したが、実 VM での到達は未確認。#1628・#2282。届かなければホストが猶予の後に強制停止する）
 
 ## 判断事項・承認事項の一覧（#1906 で確認）
 

@@ -64,7 +64,7 @@ macOS バックエンドの VM 利用方式（既定とオプション）を定�
 
 - 現在の `Vm::launch` は「1 回の呼び出しで 1 VM を構成・起動する」API で、virtiofs 共有はカーネルコマンドラインの mount 指示とともに VM 構成の構築時に固定される。構造上は、既定方式よりオプション方式（1 コンテナ = 1 VM）に近い。複数コンテナで VM を使い回す仕組み（共用 VM の保持・コンテナ単位の追加 / 削除）は未実装である
 - `Vm` の `Drop` は実行中の VM に停止を要求する。「常駐」させるには `Vm` を保持し続ける主体が要る
-- 協調停止・pause / resume / save / restore は未実装である
+- 協調停止（`Vm::shutdown`。ゲストへ `requestStop` を要求し、猶予内に止まらなければ強制停止へ切り替える。#2270）は実装済みで、plugin-macos の `stop` が使う（実 VM でのゲストへの到達は未確認で #1628・#2282）。pause / resume / save / restore は未実装である
 - I/O 共有プロトコル（IO-1）のクライアント側 UDS `connect`（`PipelineClient` の本番結合）は未実装である。plugin 境界の `UdsStream::connect`（`fandhe-container-plugin`。plugin-macos が core へ接続する経路）は実装済みで、別物である。io crate の vsock は Linux では実装済み（#1119）だが、macOS の VZ vsock（`VZVirtioSocketDevice`）は `Unimplemented` である
 - ゲスト init（指示を読んで mount し報告するもの）は `crates/guest-init` のソース（#1875）と initrd の梱包スクリプト（#1878）が済み、実機確認（#1628）が未実施である。mount 指定つきの `Vm::launch` は、実機で報告が届くかが未確認である
 - plugin 境界越しの配線（TASK-115。#384〜#390 は完了）は plugin 側で配線済みである: 起動引数と socket の解決（`startup`）・長さ接頭辞フレームの送受信ループ（`frame_loop`）・peer 認証つき `UdsStream::connect` による core への接続（socket は core が bind する。PLUG-12）・`adapter` による create / start / stop の platform-macos への委譲と `ping`・SIGTERM での `stop_all`・E2E 結合テスト

@@ -280,6 +280,7 @@ fn encode_payload(record: &AuditRecord) -> Result<String, AuditWriteError> {
         | AuditEvent::Entrypoint { .. }
         | AuditEvent::PastaVerify { .. }
         | AuditEvent::PodNamespaceJoin { .. }
+        | AuditEvent::NetnsJoin { .. }
         | AuditEvent::ControlPeer { .. }
         | AuditEvent::ExitSignal { .. }
         | AuditEvent::AuditCoverageDegraded { .. } => None,

@@ -37,7 +37,7 @@ use std::time::Duration;
 use super::bind_mounts::BindMountSet;
 use super::cgroup_requirement::CgroupRequirement;
 use super::config::{NamespaceKind, OciConfig};
-use super::namespace_join::NamespaceJoin;
+use super::namespace_join::{NamespaceJoin, NetnsJoinTarget, PinnedNetnsJoin};
 use super::network_mode::{EffectiveNetwork, LaunchNetworkMode};
 use super::sysfs_mount::SysfsMountSpec;
 use super::working_dir::ContainerWorkingDir;
@@ -497,6 +497,10 @@ pub struct LaunchSpec {
     /// pod の user・ipc namespace への join（`linux.namespaces[].path`。start が fork 前に fd へ固定して検証済み。
     /// 無ければ `None`。CRI-2・CORE-3・SEC-1・SEC-5。#2674）。
     namespace_join: Option<NamespaceJoin>,
+    /// init user namespace 所有の pin 済み netns(rootful のユーザー定義ネットワーク。`JoinPinned`)への参加先。start が
+    /// 起動オプションのパスを 1 回だけ開いて fd に固定し検証済み。無ければ `None`。本番 launcher が中間プロセスで
+    /// user namespace の作成前に `setns` に使う(D12。NET-1・SEC-1・CORE-3・#3069)。
+    pinned_netns: Option<PinnedNetnsJoin>,
     /// start が起動オプションと config を突き合わせた network の実効の扱い(NET-6・SEC-1・#3058)。
     network: EffectiveNetwork,
     /// 突き合わせに使ったモード(launcher が自身のモードと照合し、転送漏れによる縮退を拒否する)。
@@ -544,6 +548,7 @@ impl LaunchSpec {
             user,
             additional_gids: Vec::new(),
             namespace_join: None,
+            pinned_netns: None,
             network: EffectiveNetwork::HostShared,
             network_mode: LaunchNetworkMode::FromConfig,
             state_root: None,
@@ -615,6 +620,18 @@ impl LaunchSpec {
     pub(super) fn with_namespace_join(mut self, join: Option<NamespaceJoin>) -> Self {
         self.namespace_join = join;
         self
+    }
+
+    /// 検証済みの pin 済み netns への参加先を載せる（`start` と launcher の試験が呼ぶ。#3069）。
+    pub(super) fn with_pinned_netns(mut self, pinned: Option<PinnedNetnsJoin>) -> Self {
+        self.pinned_netns = pinned;
+        self
+    }
+
+    /// init user namespace 所有の pin 済み netns への参加先（無ければ `None`。`EffectiveNetwork::PinnedJoined` と対。
+    /// NET-1・SEC-1・CORE-3・#3069）。restart の再 launch でも同じ fd を使う。
+    pub fn pinned_netns(&self) -> Option<&PinnedNetnsJoin> {
+        self.pinned_netns.as_ref()
     }
 
     /// pod の user・ipc namespace への join（無ければ `None`。CRI-2・CORE-3。#2674）。
@@ -1353,6 +1370,15 @@ pub trait ProcessLauncher: Send + Sync {
     /// 本番 launcher は spec のモードと自身のモードの不一致を `FailedPrecondition` で拒否する)。
     fn network_mode(&self) -> LaunchNetworkMode {
         LaunchNetworkMode::FromConfig
+    }
+
+    /// 起動オプションの `JoinPinned` の参加先(NET-1・SEC-1・CORE-3・#3069)。`network_mode()` が `JoinPinned` のときだけ
+    /// `Some`(start が対で検査し、食い違いは `InvalidArgument` で拒否する)。start が開いて fd に固定する。
+    ///
+    /// 既定は `None`。ラッパー実装は必ず内側へ転送すること(転送しないと `JoinPinned` の起動が start で拒否される。
+    /// 拒否側へ倒れるので安全だが、参加が効かない)。
+    fn netns_join_target(&self) -> Option<&NetnsJoinTarget> {
+        None
     }
 
     /// 端末つき起動(`process.terminal: true`)を受けるか(opt-in。CRI-6・SEC-1・CORE-5・#4070)。

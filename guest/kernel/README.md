@@ -88,6 +88,7 @@ Kconfig は依存が満たされない記号を黙って落とすので、`build
 | virtio-fs | `FUSE_FS`・`VIRTIO_FS` | `virtiofs_io`（タグ `fandhe-io`）と #1374 |
 | vsock | `NET`・`VSOCKETS`・`VIRTIO_VSOCKETS` | ホストとゲストの制御経路（MAC-1） |
 | virtio-gpu | `DRM`・`DRM_VIRTIO_GPU` | GPU-6 と `poc/vz-custom-virtio-gpu/guest/check-virtio-gpu.sh` |
+| 協調停止 | `INPUT`・`INPUT_EVDEV`・`INPUT_KEYBOARD`・`KEYBOARD_GPIO`・`GPIOLIB`・`GPIO_PL061` | VZ の `requestStop`（仮想 power button）を evdev の `KEY_POWER` にして guest-init の停止を始める（MAC-4・#2270）。実 VM での到達と実ビルドでの脱落有無は未確認（#1628・#2282） |
 | 乱数 | `HW_RANDOM`・`HW_RANDOM_VIRTIO` | VZ のエントロピーデバイス。不要と判断したら外す |
 
 意図して入れない記号（#2276）: `MEMCG_V1`・`CPUSETS_V1`（cgroups v2 単独。CORE-4・SEC-6。自己テストで =y が無いことを照合）、`CPUSETS`（委譲対象の 4 controller に無い）、`TIME_NS`（core が `CLONE_NEWTIME` を使わない）、`BPF_SYSCALL`・`CGROUP_BPF`（rootless ではデバイス cgroup の eBPF を適用しない。攻撃面を増やさない）、`SWAP`（ゲストに swap デバイスが無い。`memory.swap.max` は無ければ fail-closed）。

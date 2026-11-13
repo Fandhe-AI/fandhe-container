@@ -217,6 +217,15 @@ pub struct SeccompEnforcementObservation {
     pub pivot_root_after: Option<i32>,
     /// 適用後の `umount2` の errno。
     pub umount_after: Option<i32>,
+    /// 適用後の `socket(AF_VSOCK, SOCK_STREAM, 0)` の errno（引数つきルールで `EPERM`。MAC-4・SEC-1・#2277）。
+    ///
+    /// 適用前の対照は置かない（フィルタが無いとホストで `net-pf-40` の自動ロードを起こしうるため）。
+    pub vsock_after: Option<i32>,
+    /// 適用後の `socket` の family の上位 32 bit にゴミ（`1 << 32`）を足した AF_VSOCK の errno（`EPERM`。
+    /// フィルタが下位 32 bit だけを見て、カーネルの `int` への切り詰めと一致することの観測）。
+    pub vsock_high_bits_after: Option<i32>,
+    /// 適用後の `socket(AF_UNIX, SOCK_STREAM, 0)`（陽性対照。成功して `None`）。
+    pub unix_socket_after: Option<i32>,
 }
 
 /// 本番の適用経路（[`apply_default_seccomp`]）を呼び出しスレッドへ適用し、禁止 syscall の遮断を観測する
@@ -256,6 +265,9 @@ pub fn observe_default_seccomp_enforcement() -> Result<SeccompEnforcementObserva
         mount_after: errno(sys::mount_root_private_recursive()),
         pivot_root_after: errno(sys::pivot_root_dot()),
         umount_after: errno(sys::umount_cwd_detach()),
+        vsock_after: errno(sys::vsock_socket_probe()),
+        vsock_high_bits_after: errno(sys::vsock_socket_high_bits_probe()),
+        unix_socket_after: errno(sys::unix_socket_probe()),
     })
 }
 
@@ -371,7 +383,8 @@ impl ProbeOutcome {
 ///
 /// exec 後のエントリポイント（`tests/seccomp.rs` の `/entry`）が `probe_denied_syscalls_for_test`
 /// で作り、pivot 後の `/seccomp-probe` へ `key=value` 行で書く。親（結合試験 `tests/seccomp.rs`）が
-/// [`SeccompProbeRecord::parse`] で読む。識別的な検査は `kcmp`・`seccomp_mode`、網羅確認は
+/// [`SeccompProbeRecord::parse`] で読む。識別的な検査は `kcmp`・`seccomp_mode`・`vsock`（`socket(AF_VSOCK)` の
+/// 引数つきルール。陽性対照は `unix_socket`。#2277）、網羅確認は
 /// `mount`・`pivot_root`・`umount2`（capability 不足でも `EPERM` になり得る）。強制終了対象の
 /// `unshare`・`ptrace`・`kexec_load` は戻らないため記録せず、別のコンテナのエントリポイントで終了シグナルを確認する。
 #[doc(hidden)]
@@ -393,29 +406,41 @@ pub struct SeccompProbeRecord {
     pub pivot_root: ProbeOutcome,
     /// `umount2(".", MNT_DETACH)`（網羅確認）。
     pub umount2: ProbeOutcome,
+    /// `socket(AF_VSOCK, SOCK_STREAM, 0)`。引数つきルールで `EPERM`（MAC-4・SEC-1・#2277）。
+    pub vsock: ProbeOutcome,
+    /// family の上位 32 bit にゴミを足した AF_VSOCK。下位 32 bit だけを見るルールで同じく `EPERM`。
+    pub vsock_high_bits: ProbeOutcome,
+    /// `socket(AF_UNIX, SOCK_STREAM, 0)`（陽性対照。成功）。
+    pub unix_socket: ProbeOutcome,
 }
 
 /// 記録のキー（直列化・解析で共通。増減時は [`SeccompProbeRecord`] と同時に直す）。
-const PROBE_KEYS: [&str; 6] = [
+const PROBE_KEYS: [&str; 9] = [
     "kcmp",
     "seccomp_mode",
     "control",
     "mount",
     "pivot_root",
     "umount2",
+    "vsock",
+    "vsock_high_bits",
+    "unix_socket",
 ];
 
 impl SeccompProbeRecord {
     /// 英語の `key=value` 行（改行区切り）へ直列化する。
     pub fn render(&self) -> String {
         format!(
-            "kcmp={}\nseccomp_mode={}\ncontrol={}\nmount={}\npivot_root={}\numount2={}\n",
+            "kcmp={}\nseccomp_mode={}\ncontrol={}\nmount={}\npivot_root={}\numount2={}\nvsock={}\nvsock_high_bits={}\nunix_socket={}\n",
             self.kcmp.render(),
             self.seccomp_mode,
             self.control.render(),
             self.mount.render(),
             self.pivot_root.render(),
             self.umount2.render(),
+            self.vsock.render(),
+            self.vsock_high_bits.render(),
+            self.unix_socket.render(),
         )
     }
 
@@ -450,6 +475,9 @@ impl SeccompProbeRecord {
             mount: ProbeOutcome::parse(get("mount")?)?,
             pivot_root: ProbeOutcome::parse(get("pivot_root")?)?,
             umount2: ProbeOutcome::parse(get("umount2")?)?,
+            vsock: ProbeOutcome::parse(get("vsock")?)?,
+            vsock_high_bits: ProbeOutcome::parse(get("vsock_high_bits")?)?,
+            unix_socket: ProbeOutcome::parse(get("unix_socket")?)?,
         })
     }
 }
@@ -618,6 +646,9 @@ pub fn probe_denied_syscalls_for_test() -> Result<SeccompProbeRecord, ExecError>
         mount: ProbeOutcome::from_result(sys::mount_root_private_recursive()),
         pivot_root: ProbeOutcome::from_result(sys::pivot_root_dot()),
         umount2: ProbeOutcome::from_result(sys::umount_cwd_detach()),
+        vsock: ProbeOutcome::from_result(sys::vsock_socket_probe()),
+        vsock_high_bits: ProbeOutcome::from_result(sys::vsock_socket_high_bits_probe()),
+        unix_socket: ProbeOutcome::from_result(sys::unix_socket_probe()),
     })
 }
 

@@ -24,7 +24,7 @@ macOS 利用者が fandhe-container を使う前に整えておく前提条件�
 判断待ち:
 
 - 既定方式（常駐 VM の共用）の未決事項: #1906（`docs/design/macos-shared-vm.md`、承認待ち）
-- 状態ルートの既定: #2431（`docs/design/macos-state-root.md`、承認待ち）
+- 状態ルートの既定: #2431（`docs/design/macos-state-root.md`。案 A 承認済み: 既定なし・`--root` 必須で `FAILED_PRECONDITION`。#4665）
 - 許可済みハッシュ一覧の置き場所と作り方: 設計は #1868（`docs/design/plugin-hash-allowlist.md`、承認待ち）、承認の追跡は #2231
 - Intel Mac への対応: ゲストカーネルは arm64 のみ（#1823 で決定済み）
 
@@ -143,7 +143,7 @@ macOS で `fandhe-container setup` を実行すると、次の 3 ステップを
 
 ## 状態ルート
 
-判断待ち。macOS には状態ルートの既定が無く、`--root` の指定が要る（#2431）。`FileStateStore` は所有者・権限（0700）・拡張 ACL の有無を検査する（OCI-5）。
+macOS には状態ルートの既定が無く（案 A 承認済み・恒久）、`--root` の指定が要る。無ければ `FAILED_PRECONDITION`（#2431・#4665）。`FileStateStore` は所有者・権限（0700）・拡張 ACL の有無を検査する（OCI-5）。
 
 ## 判断待ちの一覧
 

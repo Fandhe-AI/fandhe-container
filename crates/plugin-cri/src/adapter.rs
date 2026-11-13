@@ -16,7 +16,7 @@
 //! - `StateStore`: 既定実装 `FileStateStore` は core にある。本モジュールは二つ目の実装を作らず、
 //!   選んで開き注入するだけ（別実装への差し替えは [`CriPluginBackends::new`] の注入口）
 //! - `NetworkPlugin`: Linux では [`crate::netsetup::NetsetupNetwork`]（netsetup の操作単位へ対応づけ、`fandhe-container-net` の
-//!   TASK-139 統合 API を呼ぶ。TASK-114.4・#460・MS-4）。他 OS は `production()` 自体が `Unimplemented` で、
+//!   TASK-139 統合 API を呼ぶ。TASK-114.4・#460・MS-4）。macOS ホストは `production()` 自体が既定の状態ルートを持たない恒久拒否の `FailedPrecondition`（#2431 案 A・#4665）、Windows は `Unimplemented` で、
 //!   注入口では [`UnimplementedNetwork`] を差せる
 //! - `VolumeProvider`: 実装は core 側に置く（データパスに接するため。ここには置かない）
 //!
@@ -257,10 +257,10 @@ impl CriPluginBackends {
     }
 
     /// 既定の組み合わせを作る（`FileStateStore`・[`CoreLifecycleRuntime`]・`NetworkPlugin` は Linux で
-    /// [`crate::netsetup::NetsetupNetwork`]、他 OS では状態ルートの解決が `Unimplemented` で失敗する）。
+    /// [`crate::netsetup::NetsetupNetwork`]、macOS ホストは状態ルートの解決が `FailedPrecondition`、Windows は `Unimplemented` で失敗する）。
     ///
     /// 状態ルートは既定の解決（`StateRoot::resolve(None)`）に固定する。解決できない OS では
-    /// `Unimplemented` をそのまま返す（fail-closed）。
+    /// そのエラー（macOS は #2431 案 A の恒久拒否で `FailedPrecondition`、Windows は `Unimplemented`）をそのまま返す（fail-closed）。
     pub fn production() -> Result<Self, TraitError> {
         Self::production_inner(None)
     }

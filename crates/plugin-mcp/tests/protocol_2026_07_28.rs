@@ -204,13 +204,17 @@ fn assert_list_containers_result(result: &Value) {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        // Linux 以外は core の状態ストアが状態ルートを検査できず UNIMPLEMENTED（fail-closed）。
+        // Linux 以外は既定の状態ルートを解決できず fail-closed。macOS は #2431 案 A（#4665）の恒久拒否で
+        // FAILED_PRECONDITION、Windows は従来どおり UNIMPLEMENTED。
         assert_eq!(result["isError"], json!(true), "{result}");
-        assert_eq!(
-            text_json(result),
-            json!({"code": "UNIMPLEMENTED", "message": "Not implemented"}),
-            "{result}"
-        );
+        #[cfg(target_os = "macos")]
+        let expected = json!({
+            "code": "FAILED_PRECONDITION",
+            "message": "Operation not allowed in the current state"
+        });
+        #[cfg(not(target_os = "macos"))]
+        let expected = json!({"code": "UNIMPLEMENTED", "message": "Not implemented"});
+        assert_eq!(text_json(result), expected, "{result}");
     }
 }
 

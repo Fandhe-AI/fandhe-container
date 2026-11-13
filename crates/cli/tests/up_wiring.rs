@@ -8,10 +8,13 @@
 
 #![cfg(unix)]
 
+#[cfg(target_os = "linux")]
 use std::os::unix::fs::PermissionsExt as _;
+#[cfg(target_os = "linux")]
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[cfg(target_os = "linux")]
 struct Dirs {
     base: PathBuf,
     state: PathBuf,
@@ -19,6 +22,7 @@ struct Dirs {
     project: PathBuf,
 }
 
+#[cfg(target_os = "linux")]
 impl Dirs {
     fn new(tag: &str) -> Self {
         let base = std::env::temp_dir().join(format!("fc-up-wiring-{tag}-{}", std::process::id()));
@@ -84,12 +88,14 @@ impl Dirs {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Drop for Dirs {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.base);
     }
 }
 
+#[cfg(target_os = "linux")]
 fn code_line(code: &str, message: &str) -> String {
     format!("{{\"code\":\"{code}\",\"message\":\"{message}\"}}\n")
 }

@@ -20,7 +20,9 @@
 //!
 //! エラーの `message` は固定文言とフィールド名だけで、値・パス・env の内容を含めない。
 
-use std::path::Path;
+use std::cell::Cell;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use fandhe_container_core::traits::{ErrorCode, TraitError};
 use fandhe_container_oci::error::OciErrorCode;
@@ -32,7 +34,12 @@ use fandhe_container_stack::cli::up::{
     process_cwd,
 };
 use fandhe_container_stack::schema::Service;
-use fandhe_container_supervisor::container_options::env::ENV_FILE_MAX_BYTES;
+use fandhe_container_supervisor::container_options::document::ContainerOptionsDocument;
+use fandhe_container_supervisor::container_options::env::{
+    ENV_FILE_MAX_BYTES, ENV_MAX_TOTAL_BYTES, EnvFile, EnvSet, EnvVar,
+};
+use fandhe_container_supervisor::container_options::{Label, Labels};
+use fandhe_container_supervisor::supervisor_log::{BoundedFailure, run_bounded_waiting};
 
 use super::super::image::{Stage, trait_failure};
 use super::super::image_refs::{classify_create_image, resolve_create_image};
@@ -60,6 +67,28 @@ pub(super) struct Prepared {
     pub(super) env_files: Vec<Vec<u8>>,
 }
 
+/// 1 サービスが持てる `env_files` の件数の上限（無制限確保の防止。SEC-1・#4734）。
+const ENV_FILES_PER_SERVICE_MAX: usize = 16;
+/// プロジェクト全体で `env_files` の本文として保持してよい合計バイト数（副作用より前の確保の上限。#4734）。
+const ENV_FILES_PROJECT_MAX_BYTES: u64 = 8 * 1024 * 1024;
+/// プロジェクト全体の `env_files` の読み取りに許す時間（応答しない FUSE・ネットワーク FS で止まらない。REPAIR-5・#4734）。
+const ENV_FILES_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// `env_files` の読み取りの残り容量と期限（プロジェクト全体で 1 つ）。
+pub(super) struct EnvReadBudget {
+    remaining: Cell<u64>,
+    deadline: Instant,
+}
+
+impl EnvReadBudget {
+    pub(super) fn new() -> Self {
+        Self {
+            remaining: Cell::new(ENV_FILES_PROJECT_MAX_BYTES),
+            deadline: Instant::now() + ENV_FILES_READ_TIMEOUT,
+        }
+    }
+}
+
 /// 事前検査の入力（プロジェクト単位で共通）。
 pub(super) struct Preparer<'a> {
     pub(super) project: &'a ProjectName,
@@ -67,6 +96,8 @@ pub(super) struct Preparer<'a> {
     pub(super) project_dir: &'a Path,
     pub(super) image_root: &'a Path,
     pub(super) store: &'a ImageStore,
+    /// `env_files` の合計容量と読み取り期限（プロジェクト全体で共有）。
+    pub(super) env_budget: EnvReadBudget,
 }
 
 fn invalid(msg: String) -> CliError {
@@ -102,11 +133,11 @@ impl Preparer<'_> {
         };
         create_argv(spec, None, &ctx).map_err(from_args)?;
 
-        // 1b. env_files を fd 起点で読む。
-        let mut env_files = Vec::with_capacity(spec.env_files.len());
-        for rel in &spec.env_files {
-            env_files.push(read_env_file(self.project_dir, rel)?);
-        }
+        // 1b. env_files を fd 起点・件数と合計バイト数の上限つき・期限つきの作業スレッドで読む。
+        let env_files = read_env_files(self.project_dir, &self.env_budget, &spec.env_files)?;
+
+        // 1c. 起動オプションの意味検証（create が後で拒否する内容を、副作用の前に同じ検証関数で拒否する）。
+        validate_options(spec, &env_files)?;
 
         // 2. イメージ参照の解決（digest に固定）。
         let image_ref = spec
@@ -149,8 +180,112 @@ impl Preparer<'_> {
     }
 }
 
-/// `rel`（`project_dir` からの相対。字句の検査は `create_argv` が済ませている）を fd 起点で読む。
-fn read_env_file(project_dir: &Path, rel: &str) -> Result<Vec<u8>, CliError> {
+/// `rels` を順に読む。件数・サービス単位の合計（`ENV_MAX_TOTAL_BYTES`）・プロジェクト全体の合計の上限を、
+/// 追加の確保より前に `read_rootfs_file` の `max_bytes` へ反映する。読み取りは期限つきの作業スレッドで行う。
+fn read_env_files(
+    project_dir: &Path,
+    budget: &EnvReadBudget,
+    rels: &[String],
+) -> Result<Vec<Vec<u8>>, CliError> {
+    if rels.is_empty() {
+        return Ok(Vec::new());
+    }
+    if rels.len() > ENV_FILES_PER_SERVICE_MAX {
+        return Err(CliError::new(
+            ErrorCode::ResourceExhausted,
+            "too many env_files entries (env_files)",
+        ));
+    }
+    let cap = (ENV_MAX_TOTAL_BYTES as u64).min(budget.remaining.get());
+    let timeout = budget.deadline.saturating_duration_since(Instant::now());
+    if timeout.is_zero() {
+        return Err(env_timeout());
+    }
+    let dir: PathBuf = project_dir.to_path_buf();
+    let rels: Vec<String> = rels.to_vec();
+    let worker = move || -> Result<Vec<Vec<u8>>, CliError> {
+        let mut left = cap;
+        let mut out = Vec::with_capacity(rels.len());
+        for rel in &rels {
+            let bytes = read_env_file(&dir, rel, left)?;
+            left = left.saturating_sub(bytes.len() as u64);
+            out.push(bytes);
+        }
+        Ok(out)
+    };
+    let files = match run_bounded_waiting(worker, timeout) {
+        Ok(r) => r?,
+        Err(BoundedFailure::Busy) => {
+            return Err(CliError::new(
+                ErrorCode::ResourceExhausted,
+                "env_files workers are busy (env_files)",
+            ));
+        }
+        Err(BoundedFailure::Unfinished) => return Err(env_timeout()),
+    };
+    let used: u64 = files.iter().map(|f| f.len() as u64).sum();
+    budget
+        .remaining
+        .set(budget.remaining.get().saturating_sub(used));
+    Ok(files)
+}
+
+fn env_timeout() -> CliError {
+    CliError::new(
+        ErrorCode::Timeout,
+        "reading env_files did not finish within the deadline (env_files)",
+    )
+}
+
+/// `create` が検証する起動オプション（env・env_files の本文・ulimits・shm_size・tmpfs・cap_drop・labels）を、
+/// 副作用の前に同じ検証関数（supervisor の `EnvSet` / `ContainerOptionsDocument`・`Labels`）で検証する。
+fn validate_options(spec: &Service, env_files: &[Vec<u8>]) -> Result<(), CliError> {
+    let opt = |e: TraitError| CliError::new(e.code(), e.message());
+    let vars = spec
+        .env
+        .iter()
+        .map(|(k, v)| EnvVar::parse(&format!("{k}={v}")))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(opt)?;
+    let files = env_files
+        .iter()
+        .map(|b| {
+            let text = std::str::from_utf8(b).map_err(|_| {
+                TraitError::new(ErrorCode::InvalidArgument, "env file must be UTF-8")
+            })?;
+            EnvFile::parse(text)
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(opt)?;
+    let env = EnvSet::resolve(&[], &files, &vars)
+        .map_err(opt)?
+        .to_env_strings();
+    let ulimits = spec
+        .ulimits
+        .iter()
+        .map(|(n, v)| format!("{n}={v}"))
+        .collect();
+    ContainerOptionsDocument::new(
+        ulimits,
+        env,
+        None,
+        spec.shm_size.clone(),
+        spec.tmpfs.clone(),
+    )
+    .and_then(|d| d.with_cap_drop(spec.cap_drop.clone()))
+    .map_err(opt)?;
+    let labels = spec
+        .labels
+        .iter()
+        .map(|(k, v)| Label::parse(&format!("{k}={v}")))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(opt)?;
+    Labels::resolve(labels).map_err(opt)?;
+    Ok(())
+}
+
+/// `rel`（`project_dir` からの相対。字句の検査は `create_argv` が済ませている）を fd 起点で最大 `max_bytes` まで読む。
+fn read_env_file(project_dir: &Path, rel: &str, max_bytes: u64) -> Result<Vec<u8>, CliError> {
     let parts: Vec<&str> = rel
         .split('/')
         .filter(|p| !p.is_empty() && *p != ".")
@@ -164,7 +299,11 @@ fn read_env_file(project_dir: &Path, rel: &str) -> Result<Vec<u8>, CliError> {
     if parts.is_empty() {
         return Err(bad());
     }
-    match read_rootfs_file(project_dir, &parts, ENV_FILE_MAX_BYTES as u64) {
+    match read_rootfs_file(
+        project_dir,
+        &parts,
+        max_bytes.min(ENV_FILE_MAX_BYTES as u64),
+    ) {
         Ok(Some(bytes)) => Ok(bytes),
         Ok(None) => Err(CliError::new(
             ErrorCode::NotFound,
@@ -239,6 +378,84 @@ mod tests {
             let e = parse_numeric_user(bad).expect_err(bad);
             assert_eq!(e.code(), ErrorCode::Unimplemented, "{bad}");
         }
+    }
+
+    fn service() -> Service {
+        Service {
+            image: Some("x".to_owned()),
+            ..Service::default()
+        }
+    }
+
+    /// STACK-8・SEC-1・#4734: env_files の本文・env のキー・ulimits・shm_size を副作用の前に意味検証する。
+    #[test]
+    fn stack8_4734_validate_options_rejects_semantic_errors() {
+        let ok = service();
+        validate_options(&ok, &[]).expect("empty");
+        // env ファイルの本文の不正行（値なしの KEY）。
+        let e = validate_options(&ok, &[b"NOEQUALS\n".to_vec()]).expect_err("bad line");
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        // 非 UTF-8。
+        let e = validate_options(&ok, &[vec![0xff, 0xfe]]).expect_err("utf8");
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        // 不正な shm_size・ulimits。
+        let bad_shm = Service {
+            shm_size: Some("abc".to_owned()),
+            ..service()
+        };
+        assert_eq!(
+            validate_options(&bad_shm, &[]).expect_err("shm").code(),
+            ErrorCode::InvalidArgument
+        );
+        let mut bad_ulimit = service();
+        bad_ulimit
+            .ulimits
+            .insert("nofile".to_owned(), "zz".to_owned());
+        assert_eq!(
+            validate_options(&bad_ulimit, &[])
+                .expect_err("ulimit")
+                .code(),
+            ErrorCode::InvalidArgument
+        );
+        // 正常な本文は通る。
+        validate_options(&ok, &[b"# c\nA=b\n".to_vec()]).expect("valid file");
+    }
+
+    /// SEC-1・REPAIR-5・#4734: 件数の上限超過と、合計容量の枯渇・期限切れは読む前に拒否する。
+    #[test]
+    fn sec1_4734_env_read_limits_reject_before_reading() {
+        let dir = std::env::temp_dir().join(format!("fc-prep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(dir.join("a.env"), "A=1\n").expect("write");
+        let store_dir = dir.join("store");
+        std::fs::create_dir_all(&store_dir).expect("store dir");
+        let rels: Vec<String> = (0..=ENV_FILES_PER_SERVICE_MAX)
+            .map(|_| "a.env".to_owned())
+            .collect();
+        let check = |budget: EnvReadBudget, rels: &[String]| {
+            // `Preparer` は ImageStore を要するが、`read_env_files` は触れない。予算だけを直接照合する。
+            read_env_files(&dir, &budget, rels)
+        };
+        let e = check(EnvReadBudget::new(), &rels).expect_err("count");
+        assert_eq!(e.code(), ErrorCode::ResourceExhausted);
+        let one = vec!["a.env".to_owned()];
+        assert_eq!(
+            check(EnvReadBudget::new(), &one).expect("one"),
+            vec![b"A=1\n".to_vec()]
+        );
+        let drained = EnvReadBudget::new();
+        drained.remaining.set(2);
+        let e = check(drained, &one).expect_err("capacity");
+        assert_eq!(e.code(), ErrorCode::ResourceExhausted);
+        let expired = EnvReadBudget::new();
+        let expired = EnvReadBudget {
+            deadline: Instant::now() - Duration::from_secs(1),
+            ..expired
+        };
+        let e = check(expired, &one).expect_err("deadline");
+        assert_eq!(e.code(), ErrorCode::Timeout);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

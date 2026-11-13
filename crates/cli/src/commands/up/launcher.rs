@@ -130,14 +130,12 @@ impl ProductionServiceLauncher {
             match child.try_wait() {
                 Ok(Some(s)) => break s,
                 Ok(None) if Instant::now() >= limit => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_and_reap_bounded(&mut child);
                     return Err(phase.failure(ErrorCode::Timeout, None));
                 }
                 Ok(None) => std::thread::sleep(POLL_INTERVAL),
                 Err(_) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_and_reap_bounded(&mut child);
                     return Err(phase.failure(ErrorCode::Internal, None));
                 }
             }
@@ -149,6 +147,23 @@ impl ProductionServiceLauncher {
                 Err(phase.failure(code, std::num::NonZeroU8::new(u8::try_from(n).unwrap_or(1))))
             }
             None => Err(phase.failure(ErrorCode::Internal, None)),
+        }
+    }
+}
+
+/// kill 後の回収を待つ上限（REPAIR-5・#4734）。割り込み不能な I/O 待ち（D 状態）の子は kill が効かず、無期限の
+/// `wait` では TIMEOUT 経路自体が止まる。
+const REAP_DEADLINE: Duration = Duration::from_secs(5);
+
+/// 子を kill し、回収を [`REAP_DEADLINE`] まで待つ。回収できなくても制御を返す（その子は CLI の終了まで残りうる）。
+fn kill_and_reap_bounded(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let limit = Instant::now() + REAP_DEADLINE;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) if Instant::now() >= limit => return,
+            Ok(None) => std::thread::sleep(POLL_INTERVAL),
         }
     }
 }

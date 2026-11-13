@@ -42,7 +42,7 @@ use super::super::list_logs::store_open_failure;
 use super::error_code_for_exit;
 use super::launcher::{LauncherConfig, ProductionServiceLauncher};
 use super::observe::{Ledger, SharedLedger, StateHealth, StateObserver, read_status};
-use super::prepare::{Prepared, Preparer};
+use super::prepare::{EnvReadBudget, Prepared, Preparer};
 use super::provision::ProductionNetworkProvisioner;
 use crate::error::CliError;
 
@@ -139,10 +139,20 @@ fn render_success(report: &UpReport) -> String {
     out
 }
 
+/// `NetworkProvisioner` の失敗の `code` 文字列を `ErrorCode` に戻す（未知は `Internal`。fail-closed の既定ではなく分類のみ）。
+fn network_error_code(code: &str) -> ErrorCode {
+    ErrorCode::from_name(code).unwrap_or(ErrorCode::Internal)
+}
+
 /// 失敗を構造化エラーへ写す（`message` は固定文言に、無害化した名前だけを添える）。
 fn failure_exit(f: &UpFailure) -> CliExit {
     let e = f.error();
-    let code = error_code_for_exit(e.exit_code().get());
+    let code = match e {
+        // ネットワーク側の失敗は `source.code()`（ERR-1 の文字列）をそのまま運ぶ。`exit_code` は常に 1 で、
+        // 使うと NOT_FOUND・UNIMPLEMENTED 等が INTERNAL に潰れる（ERR-1・#4734）。未知の文字列は INTERNAL。
+        UpError::NetworkProvision { source, .. } => network_error_code(source.code()),
+        _ => error_code_for_exit(e.exit_code().get()),
+    };
     let message = match e {
         UpError::Launch { service, source } => format!(
             "{}: {} ({})",
@@ -269,6 +279,7 @@ pub(super) fn run_up(global: &GlobalArgs, args: &UpArgs, stdout: &mut dyn Write)
         project_dir: &read_dir,
         image_root: &args.image_root,
         store: &image_store,
+        env_budget: EnvReadBudget::new(),
     };
     let mut prepared: BTreeMap<String, Prepared> = BTreeMap::new();
     for (name, spec) in &services {

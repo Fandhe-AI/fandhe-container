@@ -76,7 +76,7 @@ Kconfig は依存が満たされない記号を黙って落とすので、`build
 | 区分 | 記号 | 理由 |
 | ---- | ---- | ---- |
 | モジュール | `MODULES` 無効 | init（#1875）はモジュールをロードせず、initrd（#1878）は init だけを梱包するため、すべて組み込みにする |
-| initramfs | `BLK_DEV_INITRD`・`RD_GZIP` | `FANDHE_CONTAINER_MACOS_VM_INITRD` で渡す initramfs（圧縮形式は gzip の newc。`scripts/build-guest-initrd.sh`〔#1878〕が `init` 1 個だけの gzip 圧縮 cpio を作るため前提どおり） |
+| initramfs | `BLK_DEV_INITRD`・`RD_GZIP` | `FANDHE_CONTAINER_MACOS_VM_INITRD` で渡す initramfs（圧縮形式は gzip の newc。`scripts/build-guest-initrd.sh`〔#1878〕が既定では `init` 1 個だけの gzip 圧縮 cpio を作るため前提どおり。`--with-runtime` で cli・supervisor も入る。#2275） |
 | /dev | `DEVTMPFS`・`DEVTMPFS_MOUNT` | `/dev` の供給 |
 | namespace | `NAMESPACES`・`USER_NS`・`PID_NS`・`NET_NS`・`UTS_NS`・`IPC_NS`（`SYSVIPC`・`POSIX_MQUEUE`） | ゲスト内のコンテナ分離（MAC-4・TASK-191・#2276）。rootless は `USER_NS`（SEC-5・CORE-6） |
 | cgroup v2 | `CGROUPS`・`MEMCG`・`CGROUP_SCHED`・`FAIR_GROUP_SCHED`・`CFS_BANDWIDTH`・`CGROUP_PIDS`・`BLK_CGROUP`・`BLK_DEV_THROTTLING`・`BLK_CGROUP_IOCOST` | memory・cpu・pids・io の 4 controller（`memory.max`・`cpu.weight`/`cpu.max`・`pids.max`・`io.max`/`io.weight`。#4658 の委譲対象。CORE-4） |

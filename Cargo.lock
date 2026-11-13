@@ -367,6 +367,9 @@ dependencies = [
 [[package]]
 name = "fandhe-container-microvm"
 version = "0.0.0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "fandhe-container-net"

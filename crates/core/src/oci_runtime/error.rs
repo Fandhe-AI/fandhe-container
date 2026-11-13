@@ -8,9 +8,12 @@
 //!
 //! create / start（TASK-96.2）・kill / delete（TASK-96.3）の失敗経路への結線は済み（4 操作の公開関数の
 //! 戻り値が [`OciRuntimeError`]）。標準エラー向けの構造化 1 行は
-//! [`OciRuntimeError::write_json_line`] が任意の `Write` へ書く。キーは `op` / `code` / `message` の
-//! 3 つ固定（`code` は [`ErrorCode::as_str`] の文字列で ERR-1 と同一体系）。共通ヘッダ（`event`・
-//! タイムスタンプ等）は付けない（形式統一は TASK-98・ERR-4）。
+//! [`OciRuntimeError::write_json_line`] が任意の `Write` へ書く。行は共通ログ型
+//! [`crate::logging::LogLine`] 経由で、`level`（`error`）→ `event`（`oci_runtime_error`）→ 本体
+//! （`op` / `code` / `message`）の順（`code` は [`ErrorCode::as_str`] の文字列で ERR-1 と同一体系）。
+//! `message` を切り詰めたときだけ本体の末尾に `"truncated":true` が付き、切り詰めない行は `truncated`
+//! キーを持たない（#3114 の判断 (c)・ERR-4・ERR-1・#3118）。共通のタイムスタンプは付けない
+//! （#3114 の判断 (a)。必要な行は本体に持つ）。
 //!
 //! 実際に `stderr` へ書きプロセスを [`OciRuntimeError::exit_code`] で終了させるのは呼び出し元
 //! （CLI〔TASK-79・TASK-95〕・plugin 側 `ContainerRuntime` 実装）の責務で、CLI は現状雛形のため未結線
@@ -43,6 +46,7 @@ use std::num::NonZeroU8;
 
 use serde::Serialize;
 
+use crate::logging::{self, LogEvent, LogLevel, LogLine};
 use crate::sanitize::sanitize_display_bounded;
 use crate::traits::{ErrorCode, TraitError};
 
@@ -139,6 +143,8 @@ pub struct OciRuntimeError {
     op: LifecycleOp,
     code: ErrorCode,
     message: String,
+    /// `message` が [`OCI_ERROR_MESSAGE_MAX_BYTES`] または [`TraitError`] の上限で切り詰められたか。
+    message_truncated: bool,
 }
 
 impl OciRuntimeError {
@@ -146,14 +152,29 @@ impl OciRuntimeError {
     pub fn new(op: LifecycleOp, code: ErrorCode, message: impl AsRef<str>) -> Self {
         // `AsRef<str>` で借用のまま受け取り、入力全体を複製しない。確保量・走査は上限で頭打ち
         // （詳細は `sanitize_display_bounded`。cli の `CliError` も同じ入口を通る）。
-        let message =
-            sanitize_display_bounded(message.as_ref(), OCI_ERROR_MESSAGE_MAX_BYTES).into_string();
-        Self { op, code, message }
+        let sanitized = sanitize_display_bounded(message.as_ref(), OCI_ERROR_MESSAGE_MAX_BYTES);
+        let message_truncated = sanitized.is_truncated();
+        Self {
+            op,
+            code,
+            message: sanitized.into_string(),
+            message_truncated,
+        }
     }
 
     /// 既存の [`TraitError`] の `code` / `message` を引き継いで操作種別を付与する。
+    ///
+    /// `TraitError` 側で既に切り詰められていた場合（[`TraitError::message_truncated`]）も、
+    /// ここでの再サニタイズの切り詰めと合わせて印を引き継ぐ（#1493 C1・#3118）。
     pub fn from_trait_error(op: LifecycleOp, err: TraitError) -> Self {
-        Self::new(op, err.code(), err.message())
+        let mut e = Self::new(op, err.code(), err.message());
+        e.message_truncated |= err.message_truncated();
+        e
+    }
+
+    /// `message` が上限で切り詰められたかを返す。`write_json_line` の `truncated` キーの有無を決める。
+    pub fn message_truncated(&self) -> bool {
+        self.message_truncated
     }
 
     /// 失敗した操作の種別を返す。
@@ -177,31 +198,50 @@ impl OciRuntimeError {
     }
 }
 
-/// 標準エラー向け 1 行 JSON の固定スキーマ（キー順は宣言順。ERR-2・TASK-96.2）。
+/// 標準エラー向け 1 行の本体（`LogLine` の本体 DTO。キー順は宣言順。ERR-2・ERR-4・TASK-96.2）。
+///
+/// 予約キー `level` / `event` は封筒が持つため本体には置かない（試験で検出する）。
 #[derive(Serialize)]
-struct StderrLine<'a> {
+struct OciErrorBody<'a> {
     op: &'static str,
     code: &'static str,
     message: &'a str,
+    /// 切り詰めたときだけ出す。`false` は出さず、切り詰めない行のバイト列を変えない。
+    #[serde(skip_serializing_if = "is_false")]
+    truncated: bool,
 }
 
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// OCI エラー行の `event` 値。コンパイル時に検証する（実行時に panic する経路を作らない）。
+const OCI_RUNTIME_ERROR_EVENT: LogEvent = match LogEvent::from_static("oci_runtime_error") {
+    Some(e) => e,
+    None => panic!("invalid oci_runtime_error log event name"),
+};
+
 impl OciRuntimeError {
-    /// 標準エラー向けの構造化 1 行（`{"op":..,"code":..,"message":..}` + LF）を `out` へ書く（ERR-2）。
+    /// 標準エラー向けの構造化 1 行（`{"level":"error","event":"oci_runtime_error","op":..,"code":..,
+    /// "message":..}` + LF。切り詰めたときだけ末尾に `"truncated":true`）を `out` へ書く（ERR-2・ERR-4）。
     ///
-    /// CLI・plugin 側 `ContainerRuntime` 実装が `stderr` を渡す想定。JSON は `serde_json` で組み、
-    /// `message` 内の `"` と `\` をエスケープする。`message` は構築時にサニタイズ・長さ上限済みのため
-    /// 行は有界で LF は行末の 1 個のみ。行全体を 1 つのバッファにまとめて `write_all` で全量を書こうとする（他プロセスの出力との不可分性は保証しない）。
-    /// 書き込みに失敗しても呼び出し元は [`Self::exit_code`] で終了すること（終了コードを書き込みの
-    /// 成否に依存させない）。
+    /// CLI・plugin 側 `ContainerRuntime` 実装・supervisor が `stderr` を渡す。共通ログ型
+    /// [`LogLine`] 経由で組み、`message` 内の `"` と `\` をエスケープする。`message` は構築時に
+    /// サニタイズ・長さ上限済みのため行は有界で LF は行末の 1 個のみ。全量を `write_all` 1 回で書く
+    /// （他プロセスの出力との不可分性は保証しない）。書き込みに失敗しても呼び出し元は
+    /// [`Self::exit_code`] で終了すること（終了コードを書き込みの成否に依存させない）。
     pub fn write_json_line(&self, out: &mut dyn Write) -> std::io::Result<()> {
-        let line = StderrLine {
+        let body = OciErrorBody {
             op: self.op.as_str(),
             code: self.code.as_str(),
             message: &self.message,
+            truncated: self.message_truncated,
         };
-        let mut buf = serde_json::to_vec(&line).map_err(std::io::Error::other)?;
-        buf.push(b'\n');
-        out.write_all(&buf)
+        logging::write_json_line(
+            out,
+            &LogLine::new(OCI_RUNTIME_ERROR_EVENT, &body).with_level(LogLevel::Error),
+        )
+        .map_err(|e| std::io::Error::other(e.message()))
     }
 }
 
@@ -421,7 +461,7 @@ mod tests {
         e.write_json_line(&mut out).unwrap();
         assert_eq!(
             out,
-            b"{\"op\":\"start\",\"code\":\"FAILED_PRECONDITION\",\"message\":\"x\"}\n"
+            b"{\"level\":\"error\",\"event\":\"oci_runtime_error\",\"op\":\"start\",\"code\":\"FAILED_PRECONDITION\",\"message\":\"x\"}\n"
         );
     }
 
@@ -432,6 +472,8 @@ mod tests {
         let mut out = Vec::new();
         e.write_json_line(&mut out).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["level"], "error");
+        assert_eq!(v["event"], "oci_runtime_error");
         assert_eq!(v["op"], "create");
         assert_eq!(v["code"], "NOT_FOUND");
         assert_eq!(v["message"], "a\"b\\c");
@@ -460,6 +502,76 @@ mod tests {
         assert_eq!(out.iter().filter(|&&b| b == b'\n').count(), 1);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["message"].as_str().unwrap().len(), 4096);
+    }
+
+    /// ERR-4・ERR-1: 切り詰めたときだけ `truncated:true` が末尾に付き、切り詰めない行には出ない（#3118）。
+    #[test]
+    fn err4_truncated_flag_only_when_truncated() {
+        let max = OCI_ERROR_MESSAGE_MAX_BYTES;
+        let line = |e: &OciRuntimeError| {
+            let mut out = Vec::new();
+            e.write_json_line(&mut out).unwrap();
+            out
+        };
+        let over =
+            OciRuntimeError::new(LifecycleOp::Start, ErrorCode::Internal, "a".repeat(max + 1));
+        assert!(over.message_truncated());
+        let out = line(&over);
+        assert!(out.ends_with(b"\",\"truncated\":true}\n"));
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["truncated"], true);
+        assert_eq!(v["message"].as_str().unwrap().len(), max);
+
+        let exact = OciRuntimeError::new(LifecycleOp::Start, ErrorCode::Internal, "a".repeat(max));
+        assert!(!exact.message_truncated());
+        assert!(
+            !String::from_utf8(line(&exact))
+                .unwrap()
+                .contains("truncated")
+        );
+    }
+
+    /// ERR-4・ERR-1: `TraitError` 側の切り詰めの印を引き継ぐ。ちょうど上限なら立たない（#1493 C1・#3118）。
+    #[test]
+    fn err4_from_trait_error_carries_truncation() {
+        let max = OCI_ERROR_MESSAGE_MAX_BYTES;
+        let over = TraitError::new(ErrorCode::Unavailable, "a".repeat(max + 1));
+        let e = OciRuntimeError::from_trait_error(LifecycleOp::Kill, over);
+        assert!(e.message_truncated());
+        let mut out = Vec::new();
+        e.write_json_line(&mut out).unwrap();
+        assert!(out.ends_with(b"\"truncated\":true}\n"));
+
+        let exact = TraitError::new(ErrorCode::Unavailable, "a".repeat(max));
+        let e = OciRuntimeError::from_trait_error(LifecycleOp::Kill, exact);
+        assert!(!e.message_truncated());
+    }
+
+    /// ERR-4: 本体 DTO は予約キー `level` / `event` を持たない（重複キーの防止。#3118）。
+    #[test]
+    fn err4_body_has_no_reserved_keys() {
+        let body = OciErrorBody {
+            op: "create",
+            code: "INTERNAL",
+            message: "m",
+            truncated: true,
+        };
+        let v = serde_json::to_value(&body).unwrap();
+        assert!(v.get("level").is_none() && v.get("event").is_none());
+    }
+
+    /// ERR-4: 4096 個の `"` をエスケープしても 1 行・上限内で書ける（#3118・REPAIR-5）。
+    #[test]
+    fn err4_escaped_max_message_fits_log_line_limit() {
+        let e = OciRuntimeError::new(
+            LifecycleOp::Create,
+            ErrorCode::Internal,
+            "\"".repeat(OCI_ERROR_MESSAGE_MAX_BYTES),
+        );
+        let mut out = Vec::new();
+        e.write_json_line(&mut out).unwrap();
+        assert_eq!(out.iter().filter(|&&b| b == b'\n').count(), 1);
+        assert!(out.len() <= crate::logging::MAX_LOG_LINE_BYTES);
     }
 
     /// ERR-2: 書き込み先が失敗しても `Err` を返し panic しない（終了コードは書き込みに依存しない）。

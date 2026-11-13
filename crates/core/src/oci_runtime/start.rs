@@ -4224,7 +4224,7 @@ mod tests {
         err.write_json_line(&mut out).expect("write");
         let line = String::from_utf8(out).expect("utf8");
         assert!(
-            line.starts_with("{\"op\":\"start\",\"code\":\"NOT_FOUND\",\"message\":"),
+            line.starts_with("{\"level\":\"error\",\"event\":\"oci_runtime_error\",\"op\":\"start\",\"code\":\"NOT_FOUND\",\"message\":"),
             "{line}"
         );
         assert!(line.ends_with("}\n"));

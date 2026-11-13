@@ -6,10 +6,9 @@
 //!
 //! # 位置づけと呼び出し元
 //!
-//! 本モジュールは型と書き出しの仕組みだけを持つ。`audit_log` の `AuditLineDto`（#3115）・`audit_write_failure` の行（#3209）と `observability` の op_stats は移行済み。残りの既存出力（
-//! `oci_runtime::error`）は
-//! まだ本型を使っておらず、移行は TASK-98.2（#653）で行う（REPAIR-3: 実装済みを装わない）。
-//! `legacy_tiocsti` の警告行は移行済み（#3117）。`plugin_discovery` の PATH 警告行も移行済み（#3119。level `warn`・event `plugin_path_candidate`）。`observability` の op_stats の行も移行済み（#3116）。
+//! 本モジュールは型と書き出しの仕組みだけを持つ。`audit_log` の `AuditLineDto`（#3115）・`audit_write_failure` の行（#3209）と `observability` の op_stats は移行済み。
+//! core 内の既存出力の移行は完了している（cli の採否は TASK-98.2〔#653〕で決める。REPAIR-3）。
+//! `legacy_tiocsti` の警告行は移行済み（#3117）。`oci_runtime::error` の OCI エラー行も移行済み（#3118。`level` = `error`・`event` = `oci_runtime_error`）。`plugin_discovery` の PATH 警告行も移行済み（#3119。level `warn`・event `plugin_path_candidate`）。`observability` の op_stats の行も移行済み（#3116）。
 //!
 //! # 確定した設計判断
 //!
@@ -18,13 +17,13 @@
 //!   `{"event":...,<本体>}`（監査・op_stats）と level ありの行
 //!   `{"level":...,"event":...,<本体>}`（legacy_tiocsti）の両方を同じバイト列で出せる。
 //! - **タイムスタンプは封筒に入れない**: 監査は本体に `ts_sec` / `ts_nsec` を持ち、op_stats は
-//!   持たない。共通の ts を持たせるかは TASK-98.2 で決める。
+//!   持たない。共通の ts は持たせない（#3114 の判断 (a)）。
 //! - **行長の上限**: [`MAX_LOG_LINE_BYTES`]。超えた行は何も書かずにエラーにする（REPAIR-5）。
 //! - **1 行の保証**: serde_json の compact 出力は 0x20 未満の文字をすべてエスケープする。
 //!   そのうえで LF / CR のバイトが無いことを防御として確かめ、末尾に LF をちょうど 1 つ付け、
 //!   `write_all` 1 回で書く。オブジェクトでない本体は flatten が失敗し `Encode` になる。
 //! - **予約キー**: 本体は `level` / `event` を持たない契約とする。持つと重複キーになる
-//!   （検出は各 DTO の試験の責務。監査は file_writer の試験で検出済み〔#3115〕、op_stats は `observability` の試験で照合済み〔#3116〕、残りは TASK-98.2）。
+//!   （検出は各 DTO の試験の責務。監査は file_writer の試験で検出済み〔#3115〕、op_stats は `observability` の試験で照合済み〔#3116〕、OCI エラー行は `oci_runtime::error` の試験で照合済み〔#3118〕、残りは TASK-98.2）。
 //! - **表示を乱す文字**（Cf・Zl・Zp 等）の置換は封筒の責務ではなく、各本体が前処理する。
 //! - 資格情報・ホストの機密値をフィールドに入れない。出力先の権限は呼び出し元が決める。
 //!

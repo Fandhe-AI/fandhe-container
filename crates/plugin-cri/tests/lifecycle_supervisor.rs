@@ -73,9 +73,9 @@ case "$4" in
   c-hang) exec sleep 3;;
   c-reported-timeout) printf 'FCSUP1 ERR TIMEOUT 7 launch timed out\n'; sleep 1; touch "$3/cleanup-done"; exit 0;;
   c-quick) printf 'FCSUP1 OK 4242\n'; exit 0;;
-  c-exec-notfound) printf 'FCSUP1 ERR NOT_FOUND 3 container launch failed in the Exec stage\n'; exit 0;;
-  c-exec-denied) printf 'FCSUP1 ERR PERMISSION_DENIED 6 container launch failed in the Exec stage\n'; exit 0;;
-  c-exec-invalid) printf 'FCSUP1 ERR INVALID_ARGUMENT 2 container launch failed in the Exec stage\n'; exit 0;;
+  c-exec-notfound) printf 'FCSUP1 ERR NOT_FOUND 3 container launch failed in the exec stage\n'; exit 0;;
+  c-exec-denied) printf 'FCSUP1 ERR PERMISSION_DENIED 6 container launch failed in the exec stage\n'; exit 0;;
+  c-exec-invalid) printf 'FCSUP1 ERR INVALID_ARGUMENT 2 container launch failed in the exec stage\n'; exit 0;;
   *) printf 'FCSUP1 ERR INTERNAL 1 unexpected id\n'; exit 0;;
 esac
 "#;
@@ -444,12 +444,12 @@ fn sec4_2716_start_exec_stage_failure_maps_to_grpc_status() {
             h.rt.start(&StartRequest::new(cid(id)))
                 .expect_err("exec stage failure");
         assert_eq!(e.code(), code, "{id}");
-        assert_eq!(e.message(), "container launch failed in the Exec stage");
+        assert_eq!(e.message(), "container launch failed in the exec stage");
         let status = tonic::Status::from(CriError::from(&e));
         assert_eq!(status.code(), grpc, "{id}");
         assert_eq!(
             status.message(),
-            "container launch failed in the Exec stage"
+            "container launch failed in the exec stage"
         );
     }
 }

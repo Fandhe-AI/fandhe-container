@@ -800,7 +800,7 @@ mod tests {
         assert_eq!(exit.exit_code(), 3);
         assert_eq!(
             stderr_of(&exit),
-            "{\"op\":\"start\",\"code\":\"NOT_FOUND\",\"message\":\"missing\"}\n"
+            "{\"level\":\"error\",\"event\":\"oci_runtime_error\",\"op\":\"start\",\"code\":\"NOT_FOUND\",\"message\":\"missing\"}\n"
         );
     }
 

@@ -365,7 +365,9 @@ fn kill_cmd(env: &Env, extra: &[&str]) -> (u8, String, String) {
 }
 
 fn err_line(code: &str, message: &str) -> String {
-    format!("{{\"op\":\"kill\",\"code\":\"{code}\",\"message\":\"{message}\"}}\n")
+    format!(
+        "{{\"level\":\"error\",\"event\":\"oci_runtime_error\",\"op\":\"kill\",\"code\":\"{code}\",\"message\":\"{message}\"}}\n"
+    )
 }
 
 /// CLI-1・SEC-1: pid が一致すれば SIGTERM（15）が supervisor の起動ハンドルへ届き、成功（0・出力なし）。

@@ -246,7 +246,9 @@ fn assert_structured(
     let obj = v.as_object().expect("object");
     let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
     keys.sort_unstable();
-    assert_eq!(keys, ["code", "message", "op"]);
+    assert_eq!(keys, ["code", "event", "level", "message", "op"]);
+    assert_eq!(v["level"], "error");
+    assert_eq!(v["event"], "oci_runtime_error");
     assert_eq!(v["op"], op_str);
     assert_eq!(v["code"], code_str);
     assert_eq!(v["message"], err.message());

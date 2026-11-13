@@ -434,7 +434,9 @@ fn err2_create_duplicate_yields_structured_error() {
     assert!(line.ends_with('\n'));
     assert_eq!(line.matches('\n').count(), 1);
     let v: Value = serde_json::from_str(line.trim_end()).expect("json");
-    assert_eq!(v.as_object().expect("obj").len(), 3);
+    assert_eq!(v.as_object().expect("obj").len(), 5);
+    assert_eq!(v["level"], "error");
+    assert_eq!(v["event"], "oci_runtime_error");
     assert_eq!(v["op"], "create");
     assert_eq!(v["code"], "ALREADY_EXISTS");
     assert_eq!(v["message"], err.message());

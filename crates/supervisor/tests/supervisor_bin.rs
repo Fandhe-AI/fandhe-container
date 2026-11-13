@@ -270,7 +270,7 @@ fn sup1_bin_rejects_non_pipe_result_channel() {
     assert_eq!(status.code(), Some(i32::from(n.get())));
     assert_eq!(
         stderr,
-        "{\"op\":\"start\",\"code\":\"INVALID_ARGUMENT\",\"message\":\"stdout must be a pipe for the result channel\"}\n"
+        "{\"level\":\"error\",\"event\":\"oci_runtime_error\",\"op\":\"start\",\"code\":\"INVALID_ARGUMENT\",\"message\":\"stdout must be a pipe for the result channel\"}\n"
     );
     assert_eq!(std::fs::read(env.base.join("out.txt")).unwrap(), b"");
     let rec = env

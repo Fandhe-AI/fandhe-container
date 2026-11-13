@@ -807,7 +807,9 @@ impl Drop for TmpDir {
 
 #[cfg(target_os = "linux")]
 fn code_json(op: &str, code: &str, message: &str) -> String {
-    format!("{{\"op\":\"{op}\",\"code\":\"{code}\",\"message\":\"{message}\"}}\n")
+    format!(
+        "{{\"level\":\"error\",\"event\":\"oci_runtime_error\",\"op\":\"{op}\",\"code\":\"{code}\",\"message\":\"{message}\"}}\n"
+    )
 }
 
 /// stderr の 1 行 JSON の `op` / `code` を取り出す（message は core の文言に依存するため照合しない）。
@@ -1142,7 +1144,7 @@ fn sec4_2716_start_exec_stage_failure_is_shown_with_code_and_fixed_message() {
         install_fake_supervisor(
             &dir,
             &format!(
-                "printf 'FCSUP1 ERR {code} {exit} container launch failed in the Exec stage\\n'"
+                "printf 'FCSUP1 ERR {code} {exit} container launch failed in the exec stage\\n'"
             ),
         );
         let out = scope.run(&cli, &["--root", &root_s, "start", "c1"], &[]);
@@ -1151,7 +1153,7 @@ fn sec4_2716_start_exec_stage_failure_is_shown_with_code_and_fixed_message() {
         assert!(out.stdout.is_empty(), "{code}");
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
-            stderr.contains("\"message\":\"container launch failed in the Exec stage\""),
+            stderr.contains("\"message\":\"container launch failed in the exec stage\""),
             "{stderr}"
         );
     }
@@ -1460,7 +1462,7 @@ fn cli1_stop_delete_flow_on_linux() {
     assert_eq!(out.status.code(), Some(2));
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
-        "{\"op\":\"kill\",\"code\":\"INVALID_ARGUMENT\",\"message\":\"signal is invalid\"}\n"
+        "{\"level\":\"error\",\"event\":\"oci_runtime_error\",\"op\":\"kill\",\"code\":\"INVALID_ARGUMENT\",\"message\":\"signal is invalid\"}\n"
     );
     assert!(root.join("c1").join("state.json").exists());
 
@@ -4488,7 +4490,7 @@ fn repair4_net6_cli1_3577_create_named_network_success_records_two_groups() {
     assert_failure(
         &out,
         3,
-        "{\"op\":\"create\",\"code\":\"NOT_FOUND\",\"message\":\"rootfs directory not found\"}\n",
+        "{\"level\":\"error\",\"event\":\"oci_runtime_error\",\"op\":\"create\",\"code\":\"NOT_FOUND\",\"message\":\"rootfs directory not found\"}\n",
     );
     assert_op_log_groups(&log, &[&[("create", 0, 1)], store_group]);
     let _ = std::fs::remove_dir_all(dir);

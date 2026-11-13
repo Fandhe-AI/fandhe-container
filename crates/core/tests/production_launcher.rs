@@ -152,7 +152,7 @@
 //!
 //! シナリオ Z（Host モードの netns 素性の同期点。NET-6・SEC-1・SEC-4・#3206）は `LaunchNetworkMode::Host` の起動で、exec 直前の
 //! 同期点が受理することと（コンテナ内の netns の識別子がホストと同じ）、試験用に基準を実在しない (dev, ino) へ差し替えた
-//! 起動が `FailedPrecondition`（メッセージは launcher の固定文言 `container launch failed in the NetnsVerify stage`。違反の理由は
+//! 起動が `FailedPrecondition`（メッセージは launcher の固定文言 `container launch failed in the netns_verify stage`。違反の理由は
 //! 監査記録が担う）で拒否され、監査 sink に段 `netns_verify`・理由 `netns_identity_mismatch` の記録が 1 件残り、状態が Created のまま
 //! 子が残らないことを照合する。成功行は `production_launcher: network host netns sync accepted; forged baseline rejected
 //! with audit and no process (scenario=Z)`。Loopback の拒否は実機で作れない（子の netns は起動の時点まで未知）ため、
@@ -164,7 +164,7 @@
 //! いないこと（子の `/proc/<pid>/status` の `Name:` が exec 後のエントリ名 `probe` でない）を確かめ、Ok を返す。受理の後は
 //! コンテナ内プローブの `NETNS` がフックで受けた netns と一致しホストと異なること、`NETDEV_LO=true`・`NETDEV_EXTRA=none`・
 //! `UDP_SELF=ok` を照合する。拒否の側は Err を返すフックで起動し、`start` の code が保たれ、メッセージが launcher の固定文言
-//! `container launch failed in the NetnsAttach stage` で、状態が Created のまま子が残らないことを照合する。成功行は
+//! `container launch failed in the netns_attach stage` で、状態が Created のまま子が残らないことを照合する。成功行は
 //! `production_launcher: network attachable netns handed over before exec; hook failure left no process (scenario=attachable)`。
 //! 範囲写像の経路は `(scenario=attachable-subordinate)`（`FANDHE_CONTAINER_TEST_ID_HELPER=1` の時だけ）。
 //!
@@ -3325,7 +3325,7 @@ mod linux {
         // launcher は ExecError を段名だけの固定文言へ写す(`to_trait_error`)。理由は下の監査記録で照合する。
         assert_eq!(
             err.message(),
-            "container launch failed in the NetnsVerify stage"
+            "container launch failed in the netns_verify stage"
         );
         assert_eq!(state_of(&env.store, &id), ContainerState::Created);
         let records = reject_sink
@@ -3518,7 +3518,7 @@ mod linux {
         assert_eq!(err.code(), ErrorCode::Unavailable, "{}", err.message());
         assert_eq!(
             err.message(),
-            "container launch failed in the NetnsAttach stage"
+            "container launch failed in the netns_attach stage"
         );
         assert_eq!(state_of(&env.store, &id), ContainerState::Created);
         assert!(hook.not_exec_yet.load(Ordering::SeqCst));
@@ -4316,7 +4316,7 @@ mod linux {
         /// 呼び出し側（supervisor / CLI / CRI）へ返るメッセージは、`R` の前の拒否も `R` の後の `execveat` の失敗も
         /// `Exec` 段の固定文言に揃う（パス・errno を載せない。`launch_error`）。経路（`phase`）は公開 API からは
         /// 見分けられないため、設計上の経路を成功行の表示として記す（`R` の後の経路は単体試験が別に固定する）。
-        const EXEC_STAGE_MESSAGE: &str = "container launch failed in the Exec stage";
+        const EXEC_STAGE_MESSAGE: &str = "container launch failed in the exec stage";
 
         // (case, 期待する ErrorCode, 設計上の経路の名前)
         let cases: [(&str, ErrorCode, &str); 3] = [

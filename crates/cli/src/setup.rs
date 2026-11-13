@@ -678,6 +678,18 @@ mod tests {
                     if linux { 0 } else { 8 },
                     if linux { "NAME\tMODE\tSUBNET\n" } else { "" },
                 ),
+                // up は存在しない TOML を副作用の前に NOT_FOUND(3) で拒否する（非 Linux は UNIMPLEMENTED(8)。#4638）。
+                Command::Up => (
+                    vec![
+                        "up",
+                        "--file",
+                        "/nonexistent-dir/stack.toml",
+                        "--image-root",
+                        &ir,
+                    ],
+                    if linux { 3 } else { 8 },
+                    "",
+                ),
                 Command::Setup | Command::Doctor => continue,
             };
             let (code, out, err) = invoke(&root, &argv);
@@ -701,7 +713,7 @@ mod tests {
             seen,
             [
                 "create", "start", "stop", "kill", "delete", "list", "logs", "exec", "inspect",
-                "state", "image", "system", "network"
+                "state", "image", "system", "network", "up"
             ]
         );
         // 日常操作は OS 固有設定を要求しないが、plugin 拒否の監査記録先（`<状態ルート>/@audit.log`。SEC-4）を

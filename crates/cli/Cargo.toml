@@ -30,6 +30,11 @@ fandhe-container-supervisor = { path = "../supervisor" }
 # image ls / system df / image rm が oci の管理 API（`image_management`）を呼ぶ workspace 内 path 依存
 # （#2221・CLI-1・OCI-7。外部クレートの追加ではない。循環なし: oci は cli に依存しない）。
 fandhe-container-oci = { path = "../oci" }
+# `up` がプロジェクト定義の読み取り・依存順の計画・create / start の argv の組み立てを stack の純ロジックに任せる
+# workspace 内 path 依存（TASK-155・STACK-8・#4638。外部クレートの追加ではない）。2026-11-13 のオーナー承認（#4630）の範囲は
+# `cli -> stack` の辺だけで、`stack -> core` の辺は張らない（状態の読み取りの本番アダプタは cli 側に置く）。
+# 循環なし: stack は cli にも core にも依存しない（`make check-stack-deps` が機械判定する）。
+fandhe-container-stack = { path = "../stack" }
 
 # signal-test-support: 結合試験（tests/signal_forward.rs）の plugin 役が使う、固定の記録ハンドラ（受信番号を
 # 原子変数へ store するだけ）の登録と読み出し（`signals::install_recording_handler_for_test`・

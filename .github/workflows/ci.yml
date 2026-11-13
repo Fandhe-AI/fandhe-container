@@ -735,6 +735,12 @@ jobs:
         if: env.HANG_PROBE != 'true'
         shell: bash
         run: make check-cli-backend-deps
+      # stack の依存方向（cli -> stack・stack -> core なし・循環なし。STACK-8・#4638・#4630）。既存ジョブへのステップ追加
+      - name: stack の依存方向の検証（STACK-8・#4638）
+        if: env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        shell: bash
+        run: make check-stack-deps
       # rust-vmm 系禁止クレートの混入なしの検証（MVM-4・TASK-73.1）。既存ジョブへのステップ追加（check-run 件数は不変）
       - name: rust-vmm 系禁止クレートの混入なしの検証（MVM-4・TASK-73.1）
         if: env.HANG_PROBE != 'true'
@@ -1218,6 +1224,13 @@ jobs:
         if: env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: make check-launch-target-selftest
+
+      # stack の依存方向の判定スクリプトの自己テスト（#4638・REPAIR-12）。スタブの cargo と jq・tsort だけを使う。
+      # 既存ジョブのステップ（check-run 件数は不変）
+      - name: stack 依存方向判定の自己テスト（#4638・REPAIR-12）
+        if: env.HANG_PROBE != 'true' && runner.os == 'Linux'
+        timeout-minutes: 5
+        run: make check-stack-deps-selftest
 
       # 単独 clippy の判定スクリプトの自己テスト（#2640・REPAIR-12）。スタブの cargo と jq だけを使う。
       # 既存ジョブのステップ（check-run 件数は不変）

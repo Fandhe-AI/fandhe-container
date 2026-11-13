@@ -1,7 +1,7 @@
 //! `up`: 依存グラフのトポロジカル順でサービスを起動し、宣言したネットワークへ接続する
 //! （STACK-8・STACK-2・TASK-155.1・TASK-155.2・#618・#619）。
 //!
-//! 呼び出し元は CLI の `up` サブコマンド（結線は未実装。#3639）。profiles で絞った
+//! 呼び出し元は CLI の `up` サブコマンド（cli crate の `commands::up`。#4638）。profiles で絞った
 //! `BTreeMap<String, Service>` を受ける（`plan_startup` と同じ理由）。
 //! 流れ: `plan_startup`（循環・未定義の依存先は起動ゼロで失敗）→ `completed` 条件の事前検査
 //! （未対応なので起動ゼロで失敗）→ `plan_networks`（`[networks]` の検証。失敗は起動ゼロ・用意ゼロ）
@@ -13,21 +13,17 @@
 //! `down`〔#620〕の責務）。[`UpFailure::launched`] に起動済みのサービス名を起動順で、
 //! [`UpFailure::networks`] に用意済みのネットワークを返す。
 //!
-//! 実装済み（#3639 の stack 側の部品）: コンテナ ID の規則（[`ServiceContainerId`]・[`ProjectName`]）、
-//! `create` / `start` の argv の組み立てと拒否規則（[`create_argv`]・[`start_argv`]）、
-//! TOML の parse 入口（`crate::toml_input`。入力サイズの上限つき）。
+//! 実装済み（stack 側の部品）: コンテナ ID の規則（[`ServiceContainerId`]・[`ProjectName`]・
+//! [`resolve_project_name`]）、`create` / `start` の argv の組み立てと拒否規則（[`create_argv`]・[`start_argv`]）、
+//! `command` / `entrypoint` / `working_dir` の合成（[`process_args`]・[`process_cwd`]。bundle の `config.json`
+//! 用）、TOML の parse 入口（`crate::toml_input`）、`up <service>` の依存閉包（`crate::depends_on::dependency_closure`）。
 //!
-//! 実装済みを装わない（REPAIR-3）。未実装（#3639 で追跡）:
-//! - 本番の [`ServiceLauncher`]（[`create_argv`] / [`start_argv`] を使い CLI の create → start を子プロセスで呼ぶ。
-//!   期限・pasta フラグの通過・`up <service>` の閉包・profile の読み取りを含む。TASK-157・SUP-1）。
-//!   ネットワークの契約は [`ServiceLauncher`] の (e)
-//! - 本番の [`NetworkProvisioner`]（`network create` と存在確認）、実 netns への接続の実機確認
-//! - 本番の `DependencyObserver` / `HealthSource`（core の state.json 読み取り）。推奨設計: cli 側に置き
-//!   （`stack -> core` の辺を張らない）、launcher と台帳（サービス名 → 今回 create した ID）を共有して
-//!   「今回の up が作ったものに限る」契約を満たす
-//! - CLI 結線（`cli -> stack` の依存辺はユーザー承認事項。未承認のため `Cargo.toml` は未変更）
+//! 本番の 4 ポート（Launcher・DependencyObserver・HealthSource・NetworkProvisioner）は cli crate が持つ
+//! （`stack -> core` の辺を張らない。#4630）。実装済みを装わない（REPAIR-3）。未実装:
 //! - `completed` 条件の待機（未対応として止める）、`logs`（#622）の logs フラグ
 //! - 1 サービスの複数ネットワーク（CLI の `--network` が 1 回までのため拒否）、rootful（D13 待ち）
+//! - `healthcheck`・`volumes`・`deploy`・`restart` 等、`create` に写す先の無いフィールド
+//!   （[`create_argv`] が `UNIMPLEMENTED` で拒否する）
 //!
 //! 外部入力の扱い: サービス名と `Service` は TOML 由来。本モジュールはシェルもパスも組み立てず
 //! ポートへ渡すだけで、検証は実装側の責務（契約は [`ServiceLauncher`]）。エラーと報告には
@@ -52,8 +48,10 @@ mod create_args;
 mod identity;
 mod network;
 
-pub use create_args::{CreateArgsError, CreateArgvContext, create_argv, start_argv};
-pub use identity::{IdentityError, ProjectName, ServiceContainerId};
+pub use create_args::{
+    CreateArgsError, CreateArgvContext, create_argv, process_args, process_cwd, start_argv,
+};
+pub use identity::{IdentityError, ProjectName, ServiceContainerId, resolve_project_name};
 pub use network::{
     NetworkAttachment, NetworkDriver, NetworkPlan, NetworkPlanError, NetworkProvisionError,
     NetworkProvisioner, NetworkRequest, ProvisionOutcome, ProvisionedNetwork, plan_networks,
@@ -64,12 +62,28 @@ pub use network::{
 pub struct LaunchError {
     code: &'static str,
     message: &'static str,
+    exit_code: Option<NonZeroU8>,
 }
 
 impl LaunchError {
     /// 機械可読な `code` と固定の英語 `message` で作る。
     pub fn new(code: &'static str, message: &'static str) -> Self {
-        Self { code, message }
+        Self {
+            code,
+            message,
+            exit_code: None,
+        }
+    }
+
+    /// 子プロセスの終了コード（ERR-2 の表）を運ぶ。指定が無ければ [`UpError::exit_code`] は 1 を使う。
+    pub fn with_exit_code(mut self, exit_code: NonZeroU8) -> Self {
+        self.exit_code = Some(exit_code);
+        self
+    }
+
+    /// 運んでいる終了コード。
+    pub fn exit_code(&self) -> Option<NonZeroU8> {
+        self.exit_code
     }
 
     /// 機械可読なエラーコード。
@@ -339,9 +353,8 @@ impl UpError {
             Self::Plan(_) => NonZeroU8::new(2).unwrap_or(NonZeroU8::MIN),
             Self::Wait(e) => e.exit_code(),
             Self::Network(e) => e.exit_code(),
-            Self::NetworkProvision { .. } | Self::Launch { .. } | Self::Internal { .. } => {
-                NonZeroU8::MIN
-            }
+            Self::Launch { source, .. } => source.exit_code().unwrap_or(NonZeroU8::MIN),
+            Self::NetworkProvision { .. } | Self::Internal { .. } => NonZeroU8::MIN,
         }
     }
 }

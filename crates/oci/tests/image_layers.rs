@@ -228,6 +228,38 @@ fn sec1_2377_image_layers_untrusted_config_is_rejected() {
     assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
 }
 
+/// OCI-7・OCI-1・STACK-8・#4638: `image_process_config` は在庫の config の `config` 節（無ければ空）を返し、
+/// 在庫に無い manifest は NotFound、書き換えた config は DataLoss、group 書き込み可の config は FailedPrecondition。
+#[test]
+fn oci7_4638_image_process_config_reads_verified_config() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = Root::new("proc");
+    let store = ImageStore::open(root.path()).expect("open");
+    let f = seed(&store, "p-1", Some(vec![TAR, TAR, TAR_GZIP]), None);
+    let got = store.image_process_config(&f.manifest).expect("process");
+    assert!(got.entrypoint().is_empty());
+    assert!(got.cmd().is_empty());
+    assert_eq!(got.working_dir(), "");
+    let e = store
+        .image_process_config(&sha_of(b"nope"))
+        .expect_err("missing");
+    assert_eq!(e.code(), OciErrorCode::NotFound);
+    let p = root.blob(&f.config);
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o666)).expect("chmod");
+    let e = store
+        .image_process_config(&f.manifest)
+        .expect_err("untrusted");
+    assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).expect("chmod back");
+    let mut body = fs::read(&p).expect("read");
+    body.push(b' ');
+    fs::write(&p, body).expect("tamper");
+    let e = store
+        .image_process_config(&f.manifest)
+        .expect_err("tampered");
+    assert_eq!(e.code(), OciErrorCode::DataLoss);
+}
+
 /// OCI-7: `open_verified_layer` は正しい blob を開き、書き換えた blob は DataLoss になる。
 #[test]
 fn oci7_2377_open_verified_layer_detects_tampering() {

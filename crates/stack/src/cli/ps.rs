@@ -111,7 +111,9 @@ fn is_display_hazard(c: char) -> bool {
 }
 
 /// 端末へ出す前に制御文字をエスケープする（ANSI 列や改行による表示の乗っ取りを防ぐ）。
-fn sanitize(s: &str) -> String {
+///
+/// `ps` の表と、CLI の `up` の出力（サービス名・ネットワーク名・ID の表示。#4638・#3651）が共有する。
+pub fn sanitize(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         if c.is_control() || is_display_hazard(c) {

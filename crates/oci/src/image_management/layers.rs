@@ -195,8 +195,8 @@ impl ImageStore {
         VerifiedLayerBlob::from_file_with(recorder, file, layer.digest(), size, owner)
     }
 
-    /// config blob を信頼条件つきで上限まで 1 回だけ読み、読んだ本文の digest を照合してから `diff_ids` を解析する。
-    fn read_config_diff_ids(&self, config: &Digest) -> Result<Vec<Digest>, OciError> {
+    /// config blob を信頼条件つきで上限まで 1 回だけ読み、読んだ本文の digest を照合して本文を返す。
+    fn read_verified_config_body(&self, config: &Digest) -> Result<Vec<u8>, OciError> {
         let untrusted = || {
             err(
                 OciErrorCode::FailedPrecondition,
@@ -220,6 +220,32 @@ impl ImageStore {
         }
         verify_bytes_digest(&body, config)
             .map_err(|_| err(OciErrorCode::DataLoss, "image config failed validation"))?;
+        Ok(body)
+    }
+
+    /// 在庫のイメージ（manifest の digest）の config の `config` 節（Entrypoint・Cmd・Env・WorkingDir・User）を返す
+    /// （`stack up` が bundle の `config.json` を組むために呼ぶ。STACK-8・TASK-155・OCI-7・SEC-1・#4638）。
+    ///
+    /// config blob の信頼条件・上限・digest 照合は [`ImageStore::image_layers`] と同じ。エラー: 在庫に無ければ
+    /// `NotFound`、信頼条件違反は `FailedPrecondition`、digest 不一致は `DataLoss`、上限超えは `ResourceExhausted`。
+    pub fn image_process_config(
+        &self,
+        manifest: &Digest,
+    ) -> Result<crate::config::ImageProcessConfig, OciError> {
+        let config = {
+            let guard = self.lock()?;
+            guard
+                .composition(manifest)
+                .map(|c| c.config().clone())
+                .ok_or_else(|| err(OciErrorCode::NotFound, "image not found"))?
+        };
+        let body = self.read_verified_config_body(&config)?;
+        crate::config::parse_image_config_process(&body)
+    }
+
+    /// config blob を読み、`diff_ids` を解析する。
+    fn read_config_diff_ids(&self, config: &Digest) -> Result<Vec<Digest>, OciError> {
+        let body = self.read_verified_config_body(config)?;
         let rootfs = parse_image_config_rootfs(&body)?;
         Ok(rootfs.diff_ids().to_vec())
     }

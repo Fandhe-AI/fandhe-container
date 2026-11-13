@@ -79,6 +79,30 @@ impl ProjectName {
     }
 }
 
+/// プロジェクト名を 3 段で決める（STACK-8・TASK-155・#4638。判断の出典は #4630）。
+///
+/// 優先順は `--project-name`（`flag`）＞ TOML の `[project].name`（`toml_name`）＞ TOML のあるディレクトリ名
+/// （`toml_dir` の最後の要素）。どの段の値も [`ProjectName::new`] の既存規則で検証し、正規化（小文字化・
+/// 記号の置換）はしない。上位の段に値があれば、それが不正でも下位の段へ落とさずに失敗する（fail-closed）。
+/// 呼び出し元は CLI の `up`（down・ps・logs の結線も同じ関数を使い、ID の食い違いを防ぐ）。
+pub fn resolve_project_name(
+    flag: Option<&str>,
+    toml_name: Option<&str>,
+    toml_dir: &std::path::Path,
+) -> Result<ProjectName, IdentityError> {
+    if let Some(name) = flag {
+        return ProjectName::new(name);
+    }
+    if let Some(name) = toml_name {
+        return ProjectName::new(name);
+    }
+    let dir_name = toml_dir
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or(IdentityError::InvalidProject)?;
+    ProjectName::new(dir_name)
+}
+
 /// `<project>.<service>` 形式の検証済みコンテナ ID。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceContainerId(String);
@@ -175,5 +199,40 @@ mod tests {
             let id = ServiceContainerId::derive(&p, svc).unwrap();
             assert!(core_rule(id.as_str()), "{id}");
         }
+    }
+
+    /// STACK-8・#4630: flag ＞ TOML ＞ ディレクトリ名の優先順を具体値で照合する。
+    #[test]
+    fn stack8_4630_project_name_priority() {
+        let dir = std::path::Path::new("/work/dir-x");
+        let n = resolve_project_name(Some("cli-x"), Some("toml-x"), dir).expect("flag");
+        assert_eq!(n.as_str(), "cli-x");
+        let n = resolve_project_name(None, Some("toml-x"), dir).expect("toml");
+        assert_eq!(n.as_str(), "toml-x");
+        let n = resolve_project_name(None, None, dir).expect("dir");
+        assert_eq!(n.as_str(), "dir-x");
+    }
+
+    /// STACK-8・#4630: 不正な値は正規化せず拒否し、上位の段が不正でも下位へ落とさない。
+    #[test]
+    fn stack8_4630_project_name_invalid_is_rejected_without_fallback() {
+        let dir = std::path::Path::new("/work/My App");
+        assert_eq!(
+            resolve_project_name(None, None, dir),
+            Err(IdentityError::InvalidProject)
+        );
+        let ok_dir = std::path::Path::new("/work/dir-x");
+        assert_eq!(
+            resolve_project_name(Some("Bad Name"), Some("toml-x"), ok_dir),
+            Err(IdentityError::InvalidProject)
+        );
+        assert_eq!(
+            resolve_project_name(None, Some("a.b"), ok_dir),
+            Err(IdentityError::InvalidProject)
+        );
+        assert_eq!(
+            resolve_project_name(None, None, std::path::Path::new("/")),
+            Err(IdentityError::InvalidProject)
+        );
     }
 }

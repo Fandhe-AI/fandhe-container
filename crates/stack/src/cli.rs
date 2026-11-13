@@ -3,7 +3,7 @@
 //! 本体はサブモジュールに置き、兄弟 issue が同じファイルを奪い合わないようにする。
 //! 現状は `up`（TASK-155.1・#618、ネットワーク接続の計画と注入ポート TASK-155.2・#619）・
 //! `down`（TASK-155.3・#620）・`ps`（TASK-155.4・#621）・`logs`（TASK-155.5・#622）。
-//! 本番アダプタと CLI のサブコマンドへの結線は #3639 で追う。
+//! 本番アダプタと `up` の CLI への結線は cli crate（#4638）。`down`・`ps`・`logs` の結線は後続 issue で追う。
 
 pub mod down;
 pub mod logs;
@@ -20,11 +20,11 @@ pub use logs::{
 };
 pub use ps::{
     MAX_PS_NAME_BYTES, MAX_PS_OUTPUT_BYTES, MAX_PS_SERVICES, PsError, PsLimit, PsReport, PsRow,
-    ServiceStatus, ServiceStatusSource, ps,
+    ServiceStatus, ServiceStatusSource, ps, sanitize as sanitize_display,
 };
 pub use up::{
     CreateArgsError, CreateArgvContext, IdentityError, ProjectName, ServiceContainerId,
-    create_argv, start_argv,
+    create_argv, process_args, process_cwd, resolve_project_name, start_argv,
 };
 pub use up::{
     LaunchError, LaunchRequest, LaunchedService, NetworkAttachment, NetworkDriver, NetworkPlan,

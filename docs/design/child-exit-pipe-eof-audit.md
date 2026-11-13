@@ -55,6 +55,8 @@
 
 期限の無い読み取り（A）: `supervisor/exec.rs` `collect_worker_result` の結果行なしの場合と `netns_holder.rs` `drain_stderr` は、並行 spawn の子が書き込み端の複製を持つ窓のあいだだけ待つ。複製は exec で閉じるため有界だが、読み取り自体に期限は無い（REPAIR-5）。誤検出ではなく待ちの型なので本 issue では直さない。
 
+追跡 Issue: #4733（`collect_worker_result` の結果行なしの `read_until` と `drain_stderr` の `read_to_end` の両方に期限を付ける。REPAIR-5）。
+
 ## 結論
 
 修正箇所なし。同型の即時判定（E）は gpu（修正済み）と core `read_exec_status` の 2 か所だけで、後者は `Threads: 1` を強制する fork の経路にだけ書き込み端が渡るため本番では起きない。受け入れ条件の「猶予の内側で終わる孫プロセスの試験」は対象なし。他 crate（cri・plugin-cri・oci・cli 等）は範囲外。

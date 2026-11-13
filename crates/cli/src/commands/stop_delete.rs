@@ -1274,6 +1274,51 @@ mod tests {
     }
 
     /// ERR-1: 期限切れの警告は `code` / `message` を持つ 1 行の JSON。
+    /// ERR-4・#3122: delete の後始末の警告は、すべて level `warn` で `event` を持つ 1 行 1 JSON。
+    #[test]
+    fn err4_3122_cleanup_warnings_are_one_json_line_each() {
+        use crate::json_lines_contract::{SHARED_MAX_LOG_LINE_BYTES, check_stream};
+        let lines = [
+            (
+                "image_rootfs_removal_failed",
+                image_rootfs_removal_warning(ErrorCode::Internal),
+            ),
+            (
+                "image_ref_release_failed",
+                image_ref_release_warning(ErrorCode::Internal),
+            ),
+            (
+                "supervisor_log_removal_failed",
+                supervisor_log_removal_warning(ErrorCode::Internal),
+            ),
+            (
+                "container_log_removal_failed",
+                container_log_removal_warning(ErrorCode::Internal),
+            ),
+            (
+                "etc_files_removal_failed",
+                etc_files_removal_warning(ErrorCode::Internal),
+            ),
+            (
+                "pasta_run_dir_removal_failed",
+                pasta_removal_warning(ErrorCode::Internal),
+            ),
+            (
+                "container_options_removal_failed",
+                options_removal_warning(&TraitError::new(ErrorCode::Internal, "x\ny")),
+            ),
+        ];
+        for (event, line) in &lines {
+            let facts = check_stream(line.as_bytes(), SHARED_MAX_LOG_LINE_BYTES).expect(event);
+            assert_eq!(facts.len(), 1, "{event}");
+            assert_eq!(facts[0].event, *event);
+            assert_eq!(facts[0].level.as_deref(), Some("warn"));
+        }
+        let timeout = log_removal_timeout_warning();
+        let facts = check_stream(timeout.as_bytes(), SHARED_MAX_LOG_LINE_BYTES).unwrap();
+        assert_eq!(facts[0].level.as_deref(), Some("warn"));
+    }
+
     #[test]
     fn err1_log_removal_timeout_warning_is_single_line_json() {
         let w = log_removal_timeout_warning();

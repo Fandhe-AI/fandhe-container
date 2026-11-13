@@ -2,6 +2,10 @@
 //!
 //! 実バイナリを起動し、終了コード・stderr の 1 行 JSON・stdout が空であることを具体値で照合する。
 
+// 「1 行 1 JSON」の共有検査器（ERR-4・#3122。plugin 配下の試験部品。cli は serde_json を持たない）。
+#[path = "../../plugin/tests/support/json_lines_contract.rs"]
+mod json_lines_contract;
+
 use std::io::Read;
 use std::process::{Command, Output, Stdio};
 use std::sync::mpsc;
@@ -253,6 +257,30 @@ fn cli1_no_args_is_usage_error() {
 fn cli1_unknown_command_is_usage_error() {
     for a in ["run", "Create", "", "--help", "a\"b\\c"] {
         assert_failure(&run(&[a]), 2, USAGE_JSON);
+    }
+}
+
+/// ERR-4・#3122: 実バイナリの stderr の全行が「1 行 1 JSON」の契約を満たす。敵対的で長い引数
+/// （改行・制御文字・引用符・32 KiB 超）は行へ埋め込まれず、使い方エラーの固定の 1 行のままである。
+#[test]
+fn err4_3122_real_binary_stderr_is_one_json_line() {
+    let long = "x".repeat(40_000);
+    // argv は NUL を持てないため除く。
+    let hostile = json_lines_contract::HOSTILE_TEXT.replace('\0', "");
+    let args = [hostile.as_str(), long.as_str(), "\n{\"event\":\"forged\"}"];
+    for a in args {
+        let out = run(&[a]);
+        let facts = json_lines_contract::check_stream(
+            &out.stderr,
+            json_lines_contract::SHARED_MAX_LOG_LINE_BYTES,
+        )
+        .expect("stderr must be one JSON object per line");
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].event, "cli_error");
+        assert_eq!(facts[0].level.as_deref(), Some("error"));
+        assert_eq!(facts[0].str_of("code"), Some("INVALID_ARGUMENT"));
+        assert_eq!(out.stderr, USAGE_JSON.as_bytes());
+        assert!(out.stdout.is_empty());
     }
 }
 

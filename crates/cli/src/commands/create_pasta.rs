@@ -237,6 +237,25 @@ mod tests {
     use fandhe_container_net::error::{NetError, NetErrorCode};
     use std::path::PathBuf;
 
+    /// ERR-4・#3122: pasta の PATH 警告は敵対的・最大長のパスでも 1 行 1 JSON で、置換後の値と
+    /// `truncated:true` が具体値で一致する。
+    #[test]
+    fn err4_3122_pasta_path_warning_hostile_and_max() {
+        use crate::json_lines_contract::{HOSTILE_TEXT, SHARED_MAX_LOG_LINE_BYTES, check_stream};
+        let hostile = format!("/{HOSTILE_TEXT}{}", "a".repeat(5000));
+        let line = warning_line_for(std::path::Path::new(&hostile));
+        let f = &check_stream(line.as_bytes(), SHARED_MAX_LOG_LINE_BYTES).unwrap()[0];
+        assert_eq!(f.level.as_deref(), Some("warn"));
+        assert_eq!(f.bool_of("truncated"), Some(true));
+        let p = f.str_of("path").unwrap();
+        assert_eq!(p.len(), 4096);
+        assert!(p.starts_with("/a b c d e [31mf g h i j k l m\"n\\o"));
+        let worst = format!("/{}", "\"\\".repeat(2047));
+        let line = warning_line_for(std::path::Path::new(&worst));
+        assert!(line.len() < SHARED_MAX_LOG_LINE_BYTES);
+        check_stream(line.as_bytes(), SHARED_MAX_LOG_LINE_BYTES).unwrap();
+    }
+
     fn path_src() -> PastaSource {
         PastaSource::Path(PathBuf::from("/usr/bin/pasta"))
     }

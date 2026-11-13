@@ -12,7 +12,7 @@
 //! 残りの配線（`ChownInUserNamespace`・subuid のずれの照合・`PreserveIfOwnerMapped`）は後続 issue で、
 //! 各 variant の doc に理由を書く。実装済みを装わない（REPAIR-3）。
 
-use fandhe_container_cri::error::{CriError, CriErrorCode};
+use fandhe_container_cri::error::CriError;
 use fandhe_container_oci::layer::extract::ExtractOptions;
 
 /// 展開設定を選ぶための、自プロセスの権限モデル（start の解決結果の写し）。将来の variant 追加に備え `non_exhaustive`。
@@ -52,6 +52,7 @@ fn identity_from_privilege(
     privilege: fandhe_container_core::exec::IsolationPrivilege,
 ) -> Result<ExtractIdentity, CriError> {
     use fandhe_container_core::exec::IsolationPrivilege;
+    use fandhe_container_cri::error::CriErrorCode;
     match privilege {
         IsolationPrivilege::RootlessSingleId => Ok(ExtractIdentity::RootlessSingleId),
         IsolationPrivilege::RootlessSubordinateIds => Ok(ExtractIdentity::RootlessSubordinateIds),
@@ -110,6 +111,7 @@ mod tests {
     #[test]
     fn sec5_oci1_2792_privilege_mapping_rejects_rootful_host_root() {
         use fandhe_container_core::exec::IsolationPrivilege as P;
+        use fandhe_container_cri::error::CriErrorCode;
         assert_eq!(
             identity_from_privilege(P::RootlessSingleId).expect("single"),
             ExtractIdentity::RootlessSingleId

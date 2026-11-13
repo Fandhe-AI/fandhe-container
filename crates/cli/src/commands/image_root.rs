@@ -85,8 +85,12 @@ mod tests {
     /// OCI-7・CLI-1: Linux は状態ルート直下の `.cri/images`（末尾の区切り文字は正規化される）。
     #[test]
     fn oci7_cli1_default_image_root_linux_is_state_root_cri_images() {
-        let got = resolve_default_image_root(ImageRootHost::Linux, || root("/r/")).unwrap();
-        assert_eq!(got, PathBuf::from("/r/.cri/images"));
+        let base = std::env::temp_dir();
+        let got = resolve_default_image_root(ImageRootHost::Linux, || {
+            root(&format!("{}/", base.display()))
+        })
+        .unwrap();
+        assert_eq!(got, base.join(".cri").join("images"));
     }
 
     /// ERR-2: 状態ルートの解決失敗はそのまま返す（`/tmp` へ落とさない）。
@@ -106,7 +110,7 @@ mod tests {
         let called = Cell::new(false);
         let e = resolve_default_image_root(ImageRootHost::MacosHost, || {
             called.set(true);
-            root("/r")
+            root(&std::env::temp_dir().to_string_lossy())
         })
         .unwrap_err();
         assert!(!called.get());
@@ -117,7 +121,10 @@ mod tests {
     /// WIN-1: Windows ホストは `UNIMPLEMENTED`。
     #[test]
     fn win1_default_image_root_unimplemented_on_windows_host() {
-        let e = resolve_default_image_root(ImageRootHost::OtherHost, || root("/r")).unwrap_err();
+        let e = resolve_default_image_root(ImageRootHost::OtherHost, || {
+            root(&std::env::temp_dir().to_string_lossy())
+        })
+        .unwrap_err();
         assert_eq!(e.code(), ErrorCode::Unimplemented);
         assert_eq!(e.message(), MSG_WINDOWS_NO_DEFAULT);
     }

@@ -616,7 +616,8 @@ fn run_image_prune_with(store: &ImageStore, out: &mut dyn Write) -> CliExit {
 /// タグが 0 件でコンテナ参照がある manifest のコンテナ参照（prune が参照ありとして残す候補）を集める。
 /// 契機 B の照合対象（`docs/design/container-ref-reconcile.md` 決定 2。#2384）。
 fn prune_reconcile_candidates(store: &ImageStore) -> Result<Vec<ContainerRefId>, CliExit> {
-    let guard = store.lock().map_err(|e| oci_failure(&e, Stage::Lock))?;
+    // 削除ジャーナル残存の FailedPrecondition を prune 用の再試行文言へ写すため Stage::Prune で扱う（Timeout は同じ MSG_LOCKED）。
+    let guard = store.lock().map_err(|e| oci_failure(&e, Stage::Prune))?;
     let mut out: Vec<ContainerRefId> = Vec::new();
     for (digest, _) in guard.manifests() {
         let refs = guard.manifest_references(digest);
@@ -648,7 +649,7 @@ fn run_image_prune_reclaiming(
     }
     let result = match store.lock() {
         Ok(mut g) => g.execute_image_prune_with(recorder, store.root()),
-        Err(e) => return oci_failure(&e, Stage::Lock),
+        Err(e) => return oci_failure(&e, Stage::Prune),
     };
     let outcome = match result {
         Ok(o) => o,

@@ -24,7 +24,7 @@
 #   各引数は同名の環境変数（GUEST_INITRD_OUTPUT_DIR・GUEST_INITRD_INIT・GUEST_INITRD_COMPRESS・
 #   GUEST_INITRD_LINKER・GUEST_INITRD_WITH_RUNTIME=1・GUEST_INITRD_CLI・GUEST_INITRD_SUPERVISOR）でも
 #   渡せる。CLI の引数が優先。
-#   --with-runtime  cli・supervisor も入れる（既定は従来どおり /init だけ。出力のバイト列は不変）
+#   --with-runtime  cli・supervisor も入れる（既定は従来どおり /init だけ。cpio のバイト列は不変。build-info.txt には runtime=no・cpio_bytes・initrd_bytes の 3 行が末尾に増える）
 #   --cli / --supervisor  作成済みの静的リンク aarch64 を使う（--with-runtime が必要。両方指定か両方省略）
 #   --output-dir    既定: <repo>/target/guest-initrd/aarch64（空または未存在のディレクトリのみ）
 #   --init          作成済みの静的リンク aarch64 の init を使う（ビルドしない）

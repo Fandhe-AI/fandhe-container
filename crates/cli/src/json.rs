@@ -1,8 +1,9 @@
-//! cli 内で手組みする JSON 文字列のエスケープの唯一の実装（ERR-1・NET-10・REPAIR-1）。
+//! cli 内で手組みする stdout のデータ出力の JSON 文字列エスケープの唯一の実装（ERR-1・NET-10・REPAIR-1）。
 //!
-//! `error` モジュール（`CliError::to_json_line`）と `doctor` モジュール（JSON Lines 出力）が共用する。
-//! 依存を増やさないため cli は JSON を手で組む方針で、エスケープ規則を 1 か所に置いて
-//! 修正の波及先を減らす。crate 外へは公開しない。
+//! `doctor`（診断の JSON Lines）・`setup` のデータ出力が共用する。依存を増やさないため cli は
+//! これらを手で組む方針で、エスケープ規則を 1 か所に置いて修正の波及先を減らす。crate 外へは公開しない。
+//! stderr のログ行（エラー行・警告行）は本モジュールではなく core の `LogLine`（`LogFields` 経由。
+//! ERR-4・#3120）で組む。新しい stderr 行に本モジュールを使わない。
 
 use std::fmt::Write as _;
 

@@ -24,7 +24,7 @@
 //!   記録を残す。非 Linux では `UnavailableCgroupRemover` が `Unimplemented` で失敗する。
 //!
 //! `delete` は core の delete が成功したとき、`DeleteResponse::image_rootfs` が `Kept { code }`（core が作ったイメージ由来
-//! rootfs を消せずに残した。OCI-7・#2633）なら、`code` / `message` の 1 行 JSON の警告を stderr に出す（終了コードは 0 のまま。
+//! rootfs を消せずに残した。OCI-7・#2633）なら、`code` / `message` の 1 行 JSON（`LogLine`。level `warn`・event `image_rootfs_removal_failed`。ERR-4・#3120）の警告を stderr に出す（終了コードは 0 のまま。
 //! bundle のパス・errno は含めない）。消せた・既に無かった・記録が無いときの stderr は空。
 //!
 //! `delete` は core の delete が成功した後に、supervisor の構造化ログ（`<root>/@supervisor-logs/<id>.log*`）を best effort で
@@ -33,7 +33,7 @@
 //! 続けてコンテナログ（`<root>/@container-logs/<id>.log*`・ロックファイル）も消す（`remove_container_log`。#2446・SUP-7・CLI-1）。
 //! 消せなかった（supervisor 生存中でロックが取れない・期限切れ等）ときも delete は成功のまま（状態は削除済みで、再試行は
 //! `NOT_FOUND` になり回復できないため。残りは 1 ID あたり世代数 × 上限に収まり、次の start で世代として回る）、
-//! `code` / `message` の 1 行 JSON の警告を stderr に出す。消せたとき（0 件を含む）の stderr は空（ERR-2）。
+//! `code` / `message`（と、あれば `reason`）の 1 行 JSON（`LogLine`。level `warn`・event `*_removal_failed`。ERR-4・#3120）の警告を stderr に出す。消せたとき（0 件を含む）の stderr は空（ERR-2）。
 //! 削除は supervisor ログ → コンテナログの直列。どちらも `stop` 直後の閉鎖の窓（supervisor の drain とプロセス終了）を
 //! `FailedPrecondition` の間だけ待つが、待ちの期限（`CONTAINER_LOG_LOCK_WAIT` の 10 秒）は 2 つのログで共有する。
 //! 1 回の試行は 5 秒が上限で、最悪 10 + 5 + 5 = 20 秒（#2698・#2892・REPAIR-5）。
@@ -88,6 +88,9 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use fandhe_container_core::logging::{
+    LogEvent, LogFields, LogLevel, LogLine, LogValue, encode_json_line,
+};
 use fandhe_container_core::observability::{OpName, OpOutcome, OpRecorder};
 use fandhe_container_core::oci_runtime::{
     ContainerCgroupRemover, KillTimeout, LifecycleOp, OciRuntimeError, ProcessSignaler, delete,
@@ -586,13 +589,14 @@ fn pre_core_delete_failure(
     OciRuntimeError::from_trait_error(LifecycleOp::Delete, e)
 }
 
-/// イメージ由来 rootfs を残した場合の警告（stderr に 1 行の JSON。ERR-1・OCI-7・#2633）。
+/// イメージ由来 rootfs を残した場合の警告（stderr に 1 行の JSON。ERR-1・ERR-4・OCI-7・#2633）。
 ///
 /// パス・errno・ID は含めず、`code` で理由を見分ける。残った木は手動で消す（`docs/design/image-rootfs-lifetime.md`）。
 fn image_rootfs_removal_warning(code: ErrorCode) -> String {
-    format!(
-        "{{\"level\":\"warn\",\"code\":\"{}\",\"message\":\"image rootfs removal failed; leftover rootfs may remain\"}}",
-        code.as_str()
+    code_message_warning(
+        EVT_IMAGE_ROOTFS_REMOVAL,
+        code,
+        "image rootfs removal failed; leftover rootfs may remain",
     )
 }
 
@@ -600,15 +604,20 @@ fn image_rootfs_removal_warning(code: ErrorCode) -> String {
 ///
 /// パス・ID・errno は含めない。参照が残ったイメージは使用中のままになりうる（回収は次の同じ ID の create か `image rm`）。
 fn image_ref_release_warning(code: ErrorCode) -> String {
-    format!(
-        "{{\"level\":\"warn\",\"code\":\"{}\",\"message\":\"image reference release failed; the image may stay in use\"}}",
-        code.as_str()
+    code_message_warning(
+        EVT_IMAGE_REF_RELEASE,
+        code,
+        "image reference release failed; the image may stay in use",
     )
 }
 
 /// 期限切れの警告（stderr に 1 行の JSON。`code` / `message` は ERR-1 の形）。
-fn log_removal_timeout_warning() -> &'static str {
-    "{\"level\":\"warn\",\"code\":\"TIMEOUT\",\"message\":\"supervisor log removal did not finish within the deadline; leftover logs may remain\"}"
+fn log_removal_timeout_warning() -> String {
+    code_message_warning(
+        EVT_SUPERVISOR_LOG_REMOVAL,
+        ErrorCode::Timeout,
+        "supervisor log removal did not finish within the deadline; leftover logs may remain",
+    )
 }
 
 /// core の `delete` が成功した後の後始末（supervisor ログ → コンテナログ）を行い、結果を `DeleteResponse` の
@@ -681,9 +690,10 @@ fn remove_supervisor_log(
 
 /// 起動オプション文書の削除の失敗の警告(stderr に 1 行の JSON。ERR-1)。パス・errno・内容は含めない。
 pub(super) fn options_removal_warning(e: &TraitError) -> String {
-    format!(
-        "{{\"level\":\"warn\",\"code\":\"{}\",\"message\":\"container options file removal failed; a leftover file may remain\"}}",
-        e.code().as_str()
+    code_message_warning(
+        EVT_OPTIONS_REMOVAL,
+        e.code(),
+        "container options file removal failed; a leftover file may remain",
     )
 }
 
@@ -722,9 +732,10 @@ pub(super) const ETC_FILES_REMOVE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 管理ルートの生成物の削除失敗の警告(stderr に 1 行の JSON。ERR-1)。パス・errno・ID は含めない。
 pub(super) fn etc_files_removal_warning(code: ErrorCode) -> String {
-    format!(
-        "{{\"level\":\"warn\",\"code\":\"{}\",\"message\":\"container etc files removal failed; leftover files may remain\"}}",
-        code.as_str()
+    code_message_warning(
+        EVT_ETC_FILES_REMOVAL,
+        code,
+        "container etc files removal failed; leftover files may remain",
     )
 }
 
@@ -765,9 +776,10 @@ fn remove_etc_files_after_delete(store: &dyn StateStore, req: &DeleteRequest) {
 
 /// pasta の置き場所の削除失敗の警告(stderr に 1 行の JSON。ERR-1)。パス・errno・ID は含めない。
 pub(super) fn pasta_removal_warning(code: ErrorCode) -> String {
-    format!(
-        "{{\"level\":\"warn\",\"code\":\"{}\",\"message\":\"pasta run directory removal failed; leftover files may remain\"}}",
-        code.as_str()
+    code_message_warning(
+        EVT_PASTA_REMOVAL,
+        code,
+        "pasta run directory removal failed; leftover files may remain",
     )
 }
 
@@ -883,15 +895,17 @@ fn remove_etc_files_if_still_deleted(
 /// supervisor ログ削除の警告。期限切れは専用文言、それ以外（ロック保持・権限エラー等）は `code` つきの失敗文言（REPAIR-4）。
 fn supervisor_log_removal_warning(code: ErrorCode) -> String {
     if code == ErrorCode::Timeout {
-        return log_removal_timeout_warning().to_string();
+        return log_removal_timeout_warning();
     }
     // 待ち切れなかった（FailedPrecondition）ときだけ reason を足す。語彙はコンテナログと同じ（#2892・REPAIR-4）。
-    let reason = fandhe_container_supervisor::logs::container_log_removal_reason(code)
-        .map(|r| format!(",\"reason\":\"{r}\""))
-        .unwrap_or_default();
-    format!(
-        "{{\"level\":\"warn\",\"code\":\"{}\"{reason},\"message\":\"supervisor log removal failed; leftover logs may remain\"}}",
-        code.as_str()
+    let reason = fandhe_container_supervisor::logs::container_log_removal_reason(code);
+    warn_line(
+        EVT_SUPERVISOR_LOG_REMOVAL,
+        &code_reason_message(
+            code,
+            reason,
+            "supervisor log removal failed; leftover logs may remain",
+        ),
     )
 }
 
@@ -900,12 +914,14 @@ fn supervisor_log_removal_warning(code: ErrorCode) -> String {
 /// （`FAILED_PRECONDITION`）だけは `reason: "sink_open_after_wait"` を足して、他の失敗と区別する（#2760・REPAIR-4。
 /// 閉じた語彙は supervisor の `container_log_removal_reason`）。
 fn container_log_removal_warning(code: ErrorCode) -> String {
-    let reason = fandhe_container_supervisor::logs::container_log_removal_reason(code)
-        .map(|r| format!(",\"reason\":\"{r}\""))
-        .unwrap_or_default();
-    format!(
-        "{{\"level\":\"warn\",\"code\":\"{}\"{reason},\"message\":\"container log removal failed; leftover logs may remain\"}}",
-        code.as_str()
+    let reason = fandhe_container_supervisor::logs::container_log_removal_reason(code);
+    warn_line(
+        EVT_CONTAINER_LOG_REMOVAL,
+        &code_reason_message(
+            code,
+            reason,
+            "container log removal failed; leftover logs may remain",
+        ),
     )
 }
 
@@ -960,15 +976,74 @@ pub(super) fn id_is_still_deleted(
     )
 }
 
+/// 警告行の event 名を const 文脈で検証して作る（不正な名前はコンパイルエラー）。
+pub(super) const fn warn_event(name: &'static str) -> LogEvent {
+    match LogEvent::from_static(name) {
+        Some(e) => e,
+        None => panic!("invalid log event name"),
+    }
+}
+
+// delete の後始末の警告の event 名（#3120・ERR-4）。plugin-cri の `container_delete_cleanup` と同名にしない:
+// あちらの本体は `id` / `target` を持つが、cli は ID・パスを出さない方針で、同じ event で形が違う行を作らないため。
+const EVT_IMAGE_ROOTFS_REMOVAL: LogEvent = warn_event("image_rootfs_removal_failed");
+const EVT_IMAGE_REF_RELEASE: LogEvent = warn_event("image_ref_release_failed");
+const EVT_SUPERVISOR_LOG_REMOVAL: LogEvent = warn_event("supervisor_log_removal_failed");
+const EVT_CONTAINER_LOG_REMOVAL: LogEvent = warn_event("container_log_removal_failed");
+const EVT_OPTIONS_REMOVAL: LogEvent = warn_event("container_options_removal_failed");
+const EVT_ETC_FILES_REMOVAL: LogEvent = warn_event("etc_files_removal_failed");
+const EVT_PASTA_REMOVAL: LogEvent = warn_event("pasta_run_dir_removal_failed");
+
+/// 警告行（level `warn`）を LF 終端の文字列で組む。符号化に失敗したら空文字列（出さない。delete の成功は変えない）。
+///
+/// stderr のログ行は core の `LogLine` で組む（ERR-4・#3120）。呼び出し元は本モジュールの各警告 builder と
+/// `create_pasta` の PATH 警告で、出力は [`write_warning_to_stderr`] が `write_all` 1 回で行う。
+pub(super) fn warn_line(event: LogEvent, entries: &[(&'static str, LogValue<'_>)]) -> String {
+    let fields = LogFields::new(entries);
+    encode_json_line(&LogLine::new(event, &fields).with_level(LogLevel::Warn))
+        .ok()
+        .and_then(|b| String::from_utf8(b).ok())
+        .unwrap_or_default()
+}
+
+/// `code` と固定 `message` だけの警告行。
+fn code_message_warning(event: LogEvent, code: ErrorCode, message: &'static str) -> String {
+    warn_line(
+        event,
+        &[
+            ("code", LogValue::Str(code.as_str())),
+            ("message", LogValue::Str(message)),
+        ],
+    )
+}
+
+/// `code` → [`reason`] → `message` の本体（reason は `Some` のときだけ）。
+fn code_reason_message<'a>(
+    code: ErrorCode,
+    reason: Option<&'a str>,
+    message: &'static str,
+) -> Vec<(&'static str, LogValue<'a>)> {
+    let mut v = vec![("code", LogValue::Str(code.as_str()))];
+    if let Some(r) = reason {
+        v.push(("reason", LogValue::Str(r)));
+    }
+    v.push(("message", LogValue::Str(message)));
+    v
+}
+
 /// 警告の書き出しを待つ上限（`main.rs` の `DEFERRED_REPORT_TIMEOUT` と同じ値）。
 pub(super) const WARNING_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// 本番の警告出力。`eprintln!` は書き込み失敗で panic するため使わず、エラーは捨てる（delete の成功を保つ）。
+///
+/// `line` は LF 終端の 1 行（[`warn_line`] の出力）で、`write_all` 1 回で書く。空文字列（符号化に失敗した行）は書かない。
 pub(super) fn write_warning_to_stderr(line: &str) {
     use std::io::Write as _;
+    if line.is_empty() {
+        return;
+    }
     let mut err = std::io::stderr();
     let _ = err.write_all(line.as_bytes());
-    let _ = err.write_all(b"\n");
 }
 
 /// 警告 1 行を `write` で作業スレッドから出し、`timeout` までだけ待つ（REPAIR-5）。
@@ -994,11 +1069,11 @@ mod tests {
     fn err1_2894_options_removal_warning_distinguishes_busy_from_timeout() {
         assert_eq!(
             options_removal_warning(&TraitError::new(ErrorCode::ResourceExhausted, "x")),
-            "{\"level\":\"warn\",\"code\":\"RESOURCE_EXHAUSTED\",\"message\":\"container options file removal failed; a leftover file may remain\"}"
+            "{\"level\":\"warn\",\"event\":\"container_options_removal_failed\",\"code\":\"RESOURCE_EXHAUSTED\",\"message\":\"container options file removal failed; a leftover file may remain\"}\n"
         );
         assert_eq!(
             options_removal_warning(&TraitError::new(ErrorCode::Timeout, "x")),
-            "{\"level\":\"warn\",\"code\":\"TIMEOUT\",\"message\":\"container options file removal failed; a leftover file may remain\"}"
+            "{\"level\":\"warn\",\"event\":\"container_options_removal_failed\",\"code\":\"TIMEOUT\",\"message\":\"container options file removal failed; a leftover file may remain\"}\n"
         );
     }
 
@@ -1007,7 +1082,7 @@ mod tests {
     fn repair4_supervisor_log_failure_warning_carries_code() {
         assert_eq!(
             supervisor_log_removal_warning(ErrorCode::Internal),
-            "{\"level\":\"warn\",\"code\":\"INTERNAL\",\"message\":\"supervisor log removal failed; leftover logs may remain\"}"
+            "{\"level\":\"warn\",\"event\":\"supervisor_log_removal_failed\",\"code\":\"INTERNAL\",\"message\":\"supervisor log removal failed; leftover logs may remain\"}\n"
         );
         assert_eq!(
             supervisor_log_removal_warning(ErrorCode::Timeout),
@@ -1016,7 +1091,7 @@ mod tests {
         assert!(!log_removal_timeout_warning().contains("existence"));
         assert_eq!(
             supervisor_log_removal_warning(ErrorCode::FailedPrecondition),
-            "{\"level\":\"warn\",\"code\":\"FAILED_PRECONDITION\",\"reason\":\"sink_open_after_wait\",\"message\":\"supervisor log removal failed; leftover logs may remain\"}"
+            "{\"level\":\"warn\",\"event\":\"supervisor_log_removal_failed\",\"code\":\"FAILED_PRECONDITION\",\"reason\":\"sink_open_after_wait\",\"message\":\"supervisor log removal failed; leftover logs may remain\"}\n"
         );
     }
 
@@ -1079,7 +1154,7 @@ mod tests {
         assert!(state_root.join("@pasta").join("c2").exists());
         assert_eq!(
             pasta_removal_warning(ErrorCode::Timeout),
-            r#"{"level":"warn","code":"TIMEOUT","message":"pasta run directory removal failed; leftover files may remain"}"#
+            "{\"level\":\"warn\",\"event\":\"pasta_run_dir_removal_failed\",\"code\":\"TIMEOUT\",\"message\":\"pasta run directory removal failed; leftover files may remain\"}\n"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1152,7 +1227,7 @@ mod tests {
         assert!(etc_dir(&state_root, &b).exists(), "other ids are kept");
         assert_eq!(
             etc_files_removal_warning(ErrorCode::FailedPrecondition),
-            r#"{"level":"warn","code":"FAILED_PRECONDITION","message":"container etc files removal failed; leftover files may remain"}"#
+            "{\"level\":\"warn\",\"event\":\"etc_files_removal_failed\",\"code\":\"FAILED_PRECONDITION\",\"message\":\"container etc files removal failed; leftover files may remain\"}\n"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1202,7 +1277,8 @@ mod tests {
     #[test]
     fn err1_log_removal_timeout_warning_is_single_line_json() {
         let w = log_removal_timeout_warning();
-        assert!(!w.contains('\n'));
+        assert!(w.ends_with("}\n") && w.matches('\n').count() == 1);
+        assert!(w.starts_with("{\"level\":\"warn\",\"event\":\"supervisor_log_removal_failed\","));
         assert!(w.contains("\"code\":\"TIMEOUT\""));
         assert!(w.contains("\"message\":\"supervisor log removal did not finish"));
     }
@@ -1213,15 +1289,15 @@ mod tests {
         let w = container_log_removal_warning(ErrorCode::FailedPrecondition);
         assert_eq!(
             w,
-            "{\"level\":\"warn\",\"code\":\"FAILED_PRECONDITION\",\"reason\":\"sink_open_after_wait\",\"message\":\"container log removal failed; leftover logs may remain\"}"
+            "{\"level\":\"warn\",\"event\":\"container_log_removal_failed\",\"code\":\"FAILED_PRECONDITION\",\"reason\":\"sink_open_after_wait\",\"message\":\"container log removal failed; leftover logs may remain\"}\n"
         );
         let w = container_log_removal_warning(ErrorCode::Timeout);
         // 試して期限切れになった行は常にこの形で、`existence` を持たない（#3260）。
         assert_eq!(
             w,
-            "{\"level\":\"warn\",\"code\":\"TIMEOUT\",\"message\":\"container log removal failed; leftover logs may remain\"}"
+            "{\"level\":\"warn\",\"event\":\"container_log_removal_failed\",\"code\":\"TIMEOUT\",\"message\":\"container log removal failed; leftover logs may remain\"}\n"
         );
-        assert!(!w.contains("existence") && !w.contains('\n') && !w.contains('/'));
+        assert!(!w.contains("existence") && w.matches('\n').count() == 1 && !w.contains('/'));
     }
 
     /// ERR-1・OCI-7・#2633: rootfs の警告は code ごとに完全一致する 1 行 JSON で、`cleanup_warnings` は残した欄だけを
@@ -1231,7 +1307,7 @@ mod tests {
         let w = image_rootfs_removal_warning(ErrorCode::FailedPrecondition);
         assert_eq!(
             w,
-            "{\"level\":\"warn\",\"code\":\"FAILED_PRECONDITION\",\"message\":\"image rootfs removal failed; leftover rootfs may remain\"}"
+            "{\"level\":\"warn\",\"event\":\"image_rootfs_removal_failed\",\"code\":\"FAILED_PRECONDITION\",\"message\":\"image rootfs removal failed; leftover rootfs may remain\"}\n"
         );
         let quiet = DeleteResponse::new()
             .with_supervisor_log(CleanupOutcome::Removed)
@@ -1297,7 +1373,7 @@ mod tests {
         assert!(lines[0].contains("image rootfs removal failed"));
         assert_eq!(
             lines[1],
-            "{\"level\":\"warn\",\"code\":\"INTERNAL\",\"message\":\"image reference release failed; the image may stay in use\"}"
+            "{\"level\":\"warn\",\"event\":\"image_ref_release_failed\",\"code\":\"INTERNAL\",\"message\":\"image reference release failed; the image may stay in use\"}\n"
         );
     }
 
@@ -1792,7 +1868,7 @@ mod tests {
             assert_eq!(w.len(), 1);
             assert_eq!(
                 w[0],
-                "{\"level\":\"warn\",\"code\":\"FAILED_PRECONDITION\",\"reason\":\"sink_open_after_wait\",\"message\":\"container log removal failed; leftover logs may remain\"}"
+                "{\"level\":\"warn\",\"event\":\"container_log_removal_failed\",\"code\":\"FAILED_PRECONDITION\",\"reason\":\"sink_open_after_wait\",\"message\":\"container log removal failed; leftover logs may remain\"}\n"
             );
         }
 
@@ -1860,7 +1936,7 @@ mod tests {
             assert_eq!(w.len(), 1);
             assert_eq!(
                 w[0],
-                "{\"level\":\"warn\",\"code\":\"FAILED_PRECONDITION\",\"reason\":\"sink_open_after_wait\",\"message\":\"supervisor log removal failed; leftover logs may remain\"}"
+                "{\"level\":\"warn\",\"event\":\"supervisor_log_removal_failed\",\"code\":\"FAILED_PRECONDITION\",\"reason\":\"sink_open_after_wait\",\"message\":\"supervisor log removal failed; leftover logs may remain\"}\n"
             );
         }
 

@@ -46,7 +46,7 @@
 //!   `message` は `plugin_backend` の固定文言表で、「未導入」と「信頼性検証の拒否」を区別できる。create 系はそのまま、
 //!   `list` / `logs` は `list_logs::store_open_failure` が表との完全一致で拾って出す（setup は plugin 解決を通らず対象外。C1）。
 //! - エラー形式: 全コマンドの失敗は [`CliExit`] 経由で構造化エラー（`code` / `message`・非ゼロ終了コード）に統一済み（TASK-95.2・ERR-1）。
-//!   ライフサイクル操作の失敗のみ ERR-2 の `op` 付き形式を保つ。JSON Lines への統一は ERR-4（TASK-98）。
+//!   ライフサイクル操作の失敗のみ ERR-2 の `op` 付き形式（`oci_runtime_error`）を保つ。どちらも core の `LogLine`（ERR-4・TASK-98.2・#3120）で組み、CLI 全般の失敗は `{"level":"error","event":"cli_error","code","message"[,"truncated"]}`。
 
 use std::ffi::OsString;
 use std::io::Write;
@@ -639,7 +639,7 @@ mod tests {
         assert!(line.ends_with("\"}\n"), "{line:?}");
         assert_eq!(line.matches('\n').count(), 1, "{line:?}");
         assert!(
-            line.starts_with(&format!("{{\"code\":\"{expected_code}\",\"message\":\"")),
+            line.starts_with(&format!("{{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"{expected_code}\",\"message\":\"")),
             "{line:?}"
         );
     }
@@ -648,7 +648,7 @@ mod tests {
     /// ワイルドカード無しの match で、コマンド追加時に argv の割り当て漏れをコンパイルエラーにする。
     #[test]
     fn err1_all_commands_error_exit_is_structured_and_nonzero() {
-        let usage_line = "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|kill|delete|list|logs|exec|inspect|state|image|system|network|setup|doctor>\"}\n";
+        let usage_line = "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|kill|delete|list|logs|exec|inspect|state|image|system|network|setup|doctor>\"}\n";
         let mut covered = Vec::new();
         for command in Command::ALL {
             // 状態ストアを開く前（引数解析）で失敗する argv。OS に依存しない。
@@ -744,23 +744,23 @@ mod tests {
         for (exit, line) in [
             (
                 CliExit::usage(),
-                "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|kill|delete|list|logs|exec|inspect|state|image|system|network|setup|doctor>\"}\n",
+                "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|kill|delete|list|logs|exec|inspect|state|image|system|network|setup|doctor>\"}\n",
             ),
             (
                 CliExit::unimplemented(),
-                "{\"code\":\"UNIMPLEMENTED\",\"message\":\"command is not implemented yet\"}\n",
+                "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"UNIMPLEMENTED\",\"message\":\"command is not implemented yet\"}\n",
             ),
             (
                 CliExit::failed(ErrorCode::NotFound),
-                "{\"code\":\"NOT_FOUND\",\"message\":\"container not found\"}\n",
+                "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"NOT_FOUND\",\"message\":\"container not found\"}\n",
             ),
             (
                 CliExit::state_root_parent_not_found(),
-                "{\"code\":\"NOT_FOUND\",\"message\":\"parent of the state root not found\"}\n",
+                "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"NOT_FOUND\",\"message\":\"parent of the state root not found\"}\n",
             ),
             (
                 CliExit::state_store_corrupted(ErrorCode::Internal),
-                "{\"code\":\"INTERNAL\",\"message\":\"state store has a corrupted record; recover it with the purge_corrupted management operation, or if that is refused, ask an administrator to inspect and repair it manually\"}\n",
+                "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"INTERNAL\",\"message\":\"state store has a corrupted record; recover it with the purge_corrupted management operation, or if that is refused, ask an administrator to inspect and repair it manually\"}\n",
             ),
         ] {
             let mut out = Counting(Vec::new());
@@ -776,7 +776,7 @@ mod tests {
         assert_eq!(CliExit::Success.exit_code(), 0);
         assert_eq!(
             stderr_of(&CliExit::unimplemented()),
-            "{\"code\":\"UNIMPLEMENTED\",\"message\":\"command is not implemented yet\"}\n"
+            "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"UNIMPLEMENTED\",\"message\":\"command is not implemented yet\"}\n"
         );
         let e = OciRuntimeError::new(
             fandhe_container_core::oci_runtime::LifecycleOp::Start,
@@ -1133,7 +1133,7 @@ mod tests {
             assert_eq!(o.exit, 3);
             assert_eq!(
                 o.stderr,
-                "{\"code\":\"NOT_FOUND\",\"message\":\"container not found\"}\n"
+                "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"NOT_FOUND\",\"message\":\"container not found\"}\n"
             );
 
             create_ok(&base, "c1");
@@ -1164,14 +1164,14 @@ mod tests {
             assert_eq!(o.stdout, "");
             assert_eq!(
                 o.stderr,
-                "{\"code\":\"INTERNAL\",\"message\":\"container log could not be read\"}\n"
+                "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"INTERNAL\",\"message\":\"container log could not be read\"}\n"
             );
 
             let o = invoke(&root, &["logs", "a/b"]);
             assert_eq!(o.exit, 2);
             assert_eq!(
                 o.stderr,
-                "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"invalid argument\"}\n"
+                "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"INVALID_ARGUMENT\",\"message\":\"invalid argument\"}\n"
             );
         }
 
@@ -1190,7 +1190,7 @@ mod tests {
                 assert_eq!(o.exit, 3, "{argv:?}");
                 assert_eq!(
                     o.stderr,
-                    "{\"code\":\"NOT_FOUND\",\"message\":\"parent of the state root not found\"}\n"
+                    "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"NOT_FOUND\",\"message\":\"parent of the state root not found\"}\n"
                 );
             }
 
@@ -1242,7 +1242,7 @@ mod tests {
             assert_eq!(o.code, Some("INTERNAL"));
             assert_eq!(
                 o.stderr,
-                "{\"code\":\"INTERNAL\",\"message\":\"state store has a corrupted record; recover it with the purge_corrupted management operation, or if that is refused, ask an administrator to inspect and repair it manually\"}\n"
+                "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"INTERNAL\",\"message\":\"state store has a corrupted record; recover it with the purge_corrupted management operation, or if that is refused, ask an administrator to inspect and repair it manually\"}\n"
             );
             assert_eq!(o.stdout, "ID\tSTATUS\tPID\n");
 
@@ -1259,7 +1259,7 @@ mod tests {
             assert_eq!(o.exit, 6);
             assert_eq!(
                 o.stderr,
-                "{\"code\":\"PERMISSION_DENIED\",\"message\":\"state store has a corrupted record; recover it with the purge_corrupted management operation, or if that is refused, ask an administrator to inspect and repair it manually\"}\n"
+                "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"PERMISSION_DENIED\",\"message\":\"state store has a corrupted record; recover it with the purge_corrupted management operation, or if that is refused, ask an administrator to inspect and repair it manually\"}\n"
             );
         }
 
@@ -1329,14 +1329,14 @@ mod tests {
             check(&o, 3, "NOT_FOUND");
             assert_eq!(
                 o.stderr,
-                "{\"code\":\"NOT_FOUND\",\"message\":\"parent of the state root not found\"}\n"
+                "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"NOT_FOUND\",\"message\":\"parent of the state root not found\"}\n"
             );
             // logs: 未作成（固定文言で完全一致）。
             let o = invoke(&root, &["logs", "none"]);
             check(&o, 3, "NOT_FOUND");
             assert_eq!(
                 o.stderr,
-                "{\"code\":\"NOT_FOUND\",\"message\":\"container not found\"}\n"
+                "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"NOT_FOUND\",\"message\":\"container not found\"}\n"
             );
             // setup: 対応外 OS 区分は UNIMPLEMENTED（8）。
             let mut sink = Vec::new();
@@ -1344,7 +1344,7 @@ mod tests {
             assert_structured_failure(&exit, 8, "UNIMPLEMENTED");
             assert_eq!(
                 stderr_of(&exit),
-                "{\"code\":\"UNIMPLEMENTED\",\"message\":\"not implemented on this platform\"}\n"
+                "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"UNIMPLEMENTED\",\"message\":\"not implemented on this platform\"}\n"
             );
         }
 

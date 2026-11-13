@@ -58,6 +58,7 @@
 use std::io::Write;
 
 use fandhe_container_core::audit_log::{AuditRecord, AuditSink, FileAuditSink};
+use fandhe_container_core::logging::{LogEvent, LogFields, LogLine, LogValue, encode_json_line};
 use fandhe_container_core::plugin_discovery::{
     DiscoveryOptions, DiscoveryReport, PathSearchPolicy, PluginRegistry,
     discover_default_with_options, write_path_warnings,
@@ -214,15 +215,29 @@ fn failure_for_trust_kind(kind: PluginTrustErrorKind) -> BackendFailure {
 /// 通知はこの sink が `record` の中で出す。
 struct UnavailableAuditSink(TraitError);
 
+/// 作成失敗通知の event 名（コンパイル時に検証する）。
+const AUDIT_SINK_UNAVAILABLE_EVENT: LogEvent = match LogEvent::from_static("audit_sink_unavailable")
+{
+    Some(e) => e,
+    None => panic!("invalid log event name"),
+};
+
 impl UnavailableAuditSink {
     /// 作成失敗を固定スキーマの 1 行（LF 終端）で `out` へ書く。値は固定トークンで、パス・errno・
     /// 元のメッセージを含めない（ログ注入・情報漏えいの回避）。
     fn write_json_line(&self, out: &mut dyn Write) -> std::io::Result<()> {
-        writeln!(
-            out,
-            "{{\"event\":\"audit_sink_unavailable\",\"code\":\"{}\",\"message\":\"audit record sink could not be created\"}}",
-            self.0.code().as_str(),
-        )
+        // level なし（監査系の通知。core の `audit_write_failure` と同じ流儀）。バイト列は移行前と同一（ERR-4・#3120）。
+        let entries = [
+            ("code", LogValue::Str(self.0.code().as_str())),
+            (
+                "message",
+                LogValue::Str("audit record sink could not be created"),
+            ),
+        ];
+        let fields = LogFields::new(&entries);
+        let bytes = encode_json_line(&LogLine::new(AUDIT_SINK_UNAVAILABLE_EVENT, &fields))
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        out.write_all(&bytes)
     }
 }
 

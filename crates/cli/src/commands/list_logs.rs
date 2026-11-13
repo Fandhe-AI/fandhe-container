@@ -463,14 +463,14 @@ mod tests {
         assert_eq!(e.exit_code(), 3);
         assert_eq!(
             stderr_line(&e),
-            "{\"code\":\"NOT_FOUND\",\"message\":\"parent of the state root not found\"}\n"
+            "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"NOT_FOUND\",\"message\":\"parent of the state root not found\"}\n"
         );
         let inv = TraitError::new(ErrorCode::InvalidArgument, "x");
         let e = store_open_failure(&inv);
         assert_eq!(e.exit_code(), 2);
         assert_eq!(
             stderr_line(&e),
-            "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"invalid argument\"}\n"
+            "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"INVALID_ARGUMENT\",\"message\":\"invalid argument\"}\n"
         );
     }
 
@@ -484,24 +484,24 @@ mod tests {
         assert_eq!(e.exit_code(), 5);
         assert_eq!(
             stderr_line(&e),
-            "{\"code\":\"FAILED_PRECONDITION\",\"message\":\"platform backend plugin is not installed\"}\n"
+            "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"FAILED_PRECONDITION\",\"message\":\"platform backend plugin is not installed\"}\n"
         );
         let e = store_open_failure(&BackendFailure::TrustNotPerformedOnHost.into_error());
         assert_eq!(e.exit_code(), 8);
         assert_eq!(
             stderr_line(&e),
-            "{\"code\":\"UNIMPLEMENTED\",\"message\":\"plugin trust verification is not performed on this host\"}\n"
+            "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"UNIMPLEMENTED\",\"message\":\"plugin trust verification is not performed on this host\"}\n"
         );
         let e = store_open_failure(&BackendFailure::Untrusted.into_error());
         assert_eq!(e.exit_code(), 6);
         assert_eq!(
             stderr_line(&e),
-            "{\"code\":\"PERMISSION_DENIED\",\"message\":\"platform backend plugin failed trust verification\"}\n"
+            "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"PERMISSION_DENIED\",\"message\":\"platform backend plugin failed trust verification\"}\n"
         );
         let e = store_open_failure(&TraitError::new(ErrorCode::FailedPrecondition, "detail"));
         assert_eq!(
             stderr_line(&e),
-            "{\"code\":\"FAILED_PRECONDITION\",\"message\":\"failed precondition\"}\n"
+            "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"FAILED_PRECONDITION\",\"message\":\"failed precondition\"}\n"
         );
     }
 
@@ -634,7 +634,7 @@ mod tests {
             assert_eq!(e.exit_code(), 1);
             assert_eq!(
                 stderr_line(&e),
-                "{\"code\":\"INTERNAL\",\"message\":\"operation failed\"}\n"
+                "{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"INTERNAL\",\"message\":\"operation failed\"}\n"
             );
         }
     }

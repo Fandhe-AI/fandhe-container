@@ -3441,6 +3441,24 @@ jobs:
         run: >-
           cargo clippy -p fandhe-container-guest-init --all-targets
           --target aarch64-unknown-linux-musl -- -D warnings
+      # macOS 既定方式（常駐 VM 共用。MAC-4・TASK-191・#2274）でゲスト VM 内に置く core・supervisor・cli の
+      # 配布ターゲット。型検査のみでリンクはしない（静的リンクの実ビルドは G8 #2275）。net 自身の
+      # --all-targets（libc_abi）と x86_64 musl は対象外（#3216 の判断 3）。
+      - name: core・supervisor・cli の cargo check（aarch64-unknown-linux-musl・MAC-4・#2274）
+        run: >-
+          cargo check -p fandhe-container-core -p fandhe-container-supervisor -p fandhe-container-cli
+          --all-targets --all-features --target aarch64-unknown-linux-musl
+      - name: core・supervisor・cli の cargo clippy（aarch64-unknown-linux-musl・MAC-4・#2274）
+        run: >-
+          cargo clippy -p fandhe-container-core -p fandhe-container-supervisor -p fandhe-container-cli
+          --all-targets --all-features --target aarch64-unknown-linux-musl -- -D warnings
+      # ゲスト向けの実ビルドは試験用 feature なしの lib / bin。-p を並べると feature が統一されるため 1 件ずつ回す。
+      - name: core・supervisor・cli の -p 単独 clippy（aarch64-unknown-linux-musl・MAC-4・#2274）
+        run: |
+          set -euo pipefail
+          for pkg in fandhe-container-core fandhe-container-supervisor fandhe-container-cli; do
+            cargo clippy -p "$pkg" --lib --bins --target aarch64-unknown-linux-musl -- -D warnings
+          done
       - name: cargo check（aarch64-unknown-linux-gnu・クロス型検査）
         run: cargo check --workspace --all-targets --all-features --target aarch64-unknown-linux-gnu
       - name: cargo clippy（aarch64-unknown-linux-gnu）

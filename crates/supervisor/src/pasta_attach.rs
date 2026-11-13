@@ -1369,6 +1369,17 @@ impl ProcessLauncher for PastaAttachingLauncher {
         self.inner
             .confirm_no_process_recorded(id, recorded, timeout)
     }
+
+    /// 内訳つきの確認も内側へ転送する(転送しないと `Unreported` へ縮退し、回復結果が観測に残らない。#2245・REPAIR-4)。
+    fn confirm_no_process_recorded_detailed(
+        &self,
+        id: &ContainerId,
+        recorded: Option<&fandhe_container_core::traits::CgroupPlacement>,
+        timeout: Duration,
+    ) -> Result<fandhe_container_core::oci_runtime::NoProcessEvidence, TraitError> {
+        self.inner
+            .confirm_no_process_recorded_detailed(id, recorded, timeout)
+    }
 }
 
 /// 起動済みの PID 1 と helper をまとめて持つハンドル。PID 1 の回収後に helper を止め、途中死でコンテナを止める。

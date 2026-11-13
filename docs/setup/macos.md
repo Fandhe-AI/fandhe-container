@@ -24,7 +24,7 @@ macOS 利用者が fandhe-container を使う前に整えておく前提条件�
 判断待ち:
 
 - 既定方式（常駐 VM の共用）の未決事項: #1906（`docs/design/macos-shared-vm.md`、承認待ち）
-- 状態ルートの既定: #2431（`docs/design/macos-state-root.md`、承認待ち）
+- 状態ルートの既定: #2431（`docs/design/macos-state-root.md`。案 A 承認済み: 既定なし・`--root` 必須で `FAILED_PRECONDITION`。#4665）
 - 許可済みハッシュ一覧の置き場所と作り方: 設計は #1868（`docs/design/plugin-hash-allowlist.md`、承認待ち）、承認の追跡は #2231
 - Intel Mac への対応: ゲストカーネルは arm64 のみ（#1823 で決定済み）
 
@@ -121,7 +121,7 @@ macOS で `fandhe-container setup` を実行すると、次の 3 ステップを
 ## ゲストカーネルと initrd の用意と配置
 
 - カーネル: `make guest-kernel-build` で作る。出力は `target/guest-kernel/<guest/kernel/source.lock の版>/arm64/Image`（ほかに `config`・`build-info.txt`）。GPL-2.0 で、ソース提供の材料と取得物の sha256 照合は `guest/kernel/README.md` にある。tarball の署名検証は未確認。ビルド環境のユーザー名・ホスト名は中立の固定値で埋め込まれる（#4590）。それ以前にビルドした Image はログを public の issue へ貼る前に作り直す（詳細は同 README）
-- initrd: `make guest-initrd-build` で作る（`rustup target add aarch64-unknown-linux-musl` が要る）。出力は `target/guest-initrd/aarch64/initrd.cpio.gz` と `build-info.txt`
+- initrd: `make guest-initrd-build` で作る（`rustup target add aarch64-unknown-linux-musl` が要る）。出力は `target/guest-initrd/aarch64/initrd.cpio.gz` と `build-info.txt`（`GUEST_INITRD_WITH_RUNTIME=1` で共用 VM 向けの cli・supervisor も入る。#2275）
 - どちらの成果物もコミットしない。macOS ホストでのビルド・リンクと VM での起動は未確認である（#1628）
 - 配置は判断待ちである。製品として kernel・initrd を置く既定の場所は無い。plugin-macos は create 要求ごとにパスを受け取るが、CLI から渡す経路は未実装（設計は #1869、承認と実装 issue の起票は #2232）。共用 VM の保持役とゲスト向けバイナリの配置は #1906 の判断待ち
 - 実機前提テストでは環境変数 `FANDHE_CONTAINER_MACOS_VM_KERNEL` などで渡す（`docs/verification/real-machine-tests.md`の「ゲスト資産の用意」を参照）。試験専用で、製品の設定経路ではない
@@ -143,7 +143,7 @@ macOS で `fandhe-container setup` を実行すると、次の 3 ステップを
 
 ## 状態ルート
 
-判断待ち。macOS には状態ルートの既定が無く、`--root` の指定が要る（#2431）。`FileStateStore` は所有者・権限（0700）・拡張 ACL の有無を検査する（OCI-5）。
+macOS には状態ルートの既定が無く（案 A 承認済み・恒久）、`--root` の指定が要る。無ければ `FAILED_PRECONDITION`（#2431・#4665）。`FileStateStore` は所有者・権限（0700）・拡張 ACL の有無を検査する（OCI-5）。
 
 ## 判断待ちの一覧
 

@@ -1,7 +1,10 @@
 //! `depends_on`・`ulimits`・`healthcheck` の変換（STACK-3・TASK-151 追補・#3612）。
 //!
 //! 呼び出し元は [`super::convert_service`]。いずれも `key_scan` が中身へ降りない段（`UNSCANNED_KEY_PREFIXES`）
-//! のため、表せない値・未知の子キー（`x-*` を含む）はここで分類表のキーパスの drop として数える（fail-closed）。
+//! のため、表せない値・未知の子キーはここで分類表のキーパスの drop として数える（fail-closed）。
+//! ただし compose-spec が `^x-` を許す位置（`healthcheck` 直下・`depends_on` の long 形の条件・`ulimits` の
+//! `{soft, hard}`）の `x-*` は無視してよいキーのため drop に数えない。`key_scan` が Warning として記録する
+//! （`EXTENSION_KEY_PARENTS`。#4637）。
 //! 記録には値・依存先名・ulimit 名・コマンドを載せない（`test` に資格情報が入りうる。SEC-1）。
 //!
 //! 値の実効性の検証は実行側に残す（ulimit は supervisor の `Ulimit::parse`、healthcheck は
@@ -47,6 +50,9 @@ pub(super) fn convert_depends_on(
                 };
                 let mut cond = Some(DependsOnCondition::Started);
                 for (k, val) in def.iter() {
+                    if k.starts_with("x-") {
+                        continue;
+                    }
                     match (k, val) {
                         ("condition", ComposeValue::String(c)) => {
                             cond = match c.as_str() {
@@ -108,7 +114,10 @@ pub(super) fn convert_ulimits(
         ComposeValue::Mapping(m) if m.len() <= MAX_LIST_ITEMS => {
             for (name, val) in m.iter() {
                 let value = match val {
-                    ComposeValue::Mapping(d) if d.len() == 2 => {
+                    // `x-*` は無視してよいキー。除いた残りがちょうど soft・hard の 2 キーのときだけ受ける。
+                    ComposeValue::Mapping(d)
+                        if d.iter().filter(|(k, _)| !k.starts_with("x-")).count() == 2 =>
+                    {
                         match (
                             d.get("soft").and_then(ulimit_item),
                             d.get("hard").and_then(ulimit_item),
@@ -193,6 +202,9 @@ pub(super) fn convert_healthcheck(v: &ComposeValue, drops: &mut ValueDrops) -> O
     let mut hc = Healthcheck::default();
     let mut invalid = false;
     for (k, val) in m.iter() {
+        if k.starts_with("x-") {
+            continue;
+        }
         let ok = match k {
             "test" => match convert_test(val) {
                 Some(t) => {
@@ -281,7 +293,8 @@ mod tests {
             o.keys().cloned().collect::<Vec<_>>(),
             strs(&["a", "b", "c"])
         );
-        assert_eq!(d.get(P_DEPENDS_ON), 5);
+        // `c: {x-y: 1}` の `x-y` は拡張キーのため drop に数えない（変更前は 5 件）。
+        assert_eq!(d.get(P_DEPENDS_ON), 4);
         let mut d = ValueDrops::new();
         assert!(convert_depends_on(&val("3"), &mut d).is_empty());
         assert_eq!(d.get(P_DEPENDS_ON), 1);
@@ -312,6 +325,32 @@ mod tests {
         );
         assert_eq!(o.len(), 1);
         assert_eq!(d.get(P_ULIMITS), 7);
+    }
+
+    /// STACK-3・#4637: 降りない段の `x-*` は drop に数えない。`x-` でない未知キーは従来どおり数える。
+    #[test]
+    fn stack3_extension_keys_are_not_drops() {
+        let (h, d) = hc("{test: [CMD, a], x-note: 1}");
+        assert!(h.is_some() && d.is_empty());
+        let mut d = ValueDrops::new();
+        let o = convert_depends_on(&val("{a: {condition: service_healthy, x-n: 1}}"), &mut d);
+        assert_eq!(o.get("a"), Some(&DependsOnCondition::Healthy));
+        assert!(d.is_empty());
+        // 依存先名が `x-` で始まっても拡張キーではない（サービス名）。
+        let o = convert_depends_on(&val("{x-db: {condition: service_started}}"), &mut d);
+        assert_eq!(o.get("x-db"), Some(&DependsOnCondition::Started));
+        assert!(d.is_empty());
+        let mut d = ValueDrops::new();
+        let o = convert_ulimits(&val("{stack: {soft: 1, hard: 2, x-n: 1}}"), &mut d);
+        assert_eq!(o.get("stack").map(String::as_str), Some("1:2"));
+        assert!(d.is_empty());
+        // 欠けた soft・未知キーは従来どおり drop。ulimit 名の `x-` は名前検証で落ちる。
+        let o = convert_ulimits(
+            &val("{a: {soft: 1, x-n: 1}, b: {soft: 1, hard: 2, foo: 1}, x-c: 3}"),
+            &mut d,
+        );
+        assert!(o.is_empty());
+        assert_eq!(d.get(P_ULIMITS), 3);
     }
 
     fn hc(yaml: &str) -> (Option<Healthcheck>, ValueDrops) {
@@ -380,7 +419,8 @@ mod tests {
             (h.retries, h.interval, h.timeout.as_deref()),
             (None, None, Some("1s"))
         );
-        assert_eq!(d.get(P_HEALTHCHECK), 4);
+        // `x-a` は拡張キーのため数えない（変更前は 4 件）。
+        assert_eq!(d.get(P_HEALTHCHECK), 3);
         let (h, d) = hc("{retries: 3x}");
         assert!(h.unwrap().retries.is_none());
         assert_eq!(d.get(P_HEALTHCHECK), 1);

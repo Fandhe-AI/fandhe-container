@@ -451,7 +451,7 @@ mod tests {
         let mut out = Vec::new();
         err.write_json_line(&mut out).expect("write");
         let line = String::from_utf8(out).expect("utf8");
-        assert!(line.starts_with("{\"op\":\"kill\",\"code\":\"NOT_FOUND\",\"message\":"));
+        assert!(line.starts_with("{\"level\":\"error\",\"event\":\"oci_runtime_error\",\"op\":\"kill\",\"code\":\"NOT_FOUND\",\"message\":"));
         assert!(line.ends_with("}\n"));
         let stats = rec
             .snapshot_op(&OpName::new(KILL_OP_NAME).expect("name"))

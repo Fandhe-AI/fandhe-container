@@ -413,12 +413,16 @@ run_cli() {
 # stderr から機械可読な code だけを取り出す（文言・パス・op は写さない）。
 #
 # 受理する形は製品 CLI が出す次の 2 つだけで、どちらも 1 行・LF 終端・空白なし・キー順固定（ERR-1・ERR-2）:
-#   固定文言: {"code":"X","message":"..."}          （使い方エラー・未実装・状態ルート不在など）
-#   core 由来: {"op":"O","code":"X","message":"..."}  （OciRuntimeError::write_json_line。O は
-#              create / start / kill / delete。stop は kill になる）
-# op の有無と値は記録・比較の対象にしない（機械可読契約は code。op は core の付加情報で、CLI の
-# エラー形式は TASK-95〔ERR 系〕で確定するため、op の有無を OS 差として数えない）。
-# キーの追加など形式が変わった場合は ERR_LINE_RE を追従させる（追従前は <unparsed> になり合格に見えない）。
+#   固定文言: {"level":"error","event":"cli_error","code":"X","message":"..."}
+#              （CliError::write_stderr。共通ログ型 LogLine 経由。使い方エラー・未実装・状態ルート不在など。
+#              message を切り詰めたときだけ末尾に ,"truncated":true が付く。#3120・ERR-4）
+#   core 由来: {"level":"error","event":"oci_runtime_error","op":"O","code":"X","message":"..."}
+#              （OciRuntimeError::write_json_line。共通ログ型 LogLine 経由。O は create / start /
+#              kill / delete。stop は kill になる。message を切り詰めたときだけ末尾に
+#              ,"truncated":true が付く。#3118・ERR-4）
+# 旧形式 {"code":..,"message":..} と {"op":..,"code":..,"message":..}（level / event なし）は <unparsed> にする（形式の後退を検出）。
+# op と truncated の有無・値は記録・比較の対象にしない（機械可読契約は code）。
+# キーの追加など形式が変わった場合は両正規表現を追従させる（追従前は <unparsed> になり合格に見えない）。
 #
 # message は JSON 文字列として検証する: 未エスケープの `"`・`\`・制御文字（U+0000〜U+001F）を拒否し、
 # エスケープは \" \\ \/ \b \f \n \r \t \uXXXX だけを受理する。非 ASCII バイトは UTF-8 として妥当な
@@ -427,10 +431,12 @@ run_cli() {
 # code らしき文字列を含んでいても一致扱いにせず <unparsed> とする。
 #
 # 上限 MAX_ERR_BYTES は core の message 上限（OCI_ERROR_MESSAGE_MAX_BYTES = 4096 バイト）が全バイト
-# 2 バイトへエスケープされた場合（8192）と外枠を収める値にしている（正規の出力を上限で落とさない）。
+# 2 バイトへエスケープされた場合（8192）と外枠（level / event / op / truncated を含む）を収める値にしている
+# （正規の出力を上限で落とさない）。
 readonly MAX_ERR_BYTES=16384
 readonly JSON_STR_BODY='([^"\\[:cntrl:]]|\\["\\/bfnrt]|\\u[0-9a-fA-F]{4})*'
-readonly ERR_LINE_RE='^\{("op":"[a-z_]{1,32}",)?"code":"([A-Z_]{1,40})","message":"'"$JSON_STR_BODY"'"\}$'
+readonly CLI_ERR_LINE_RE='^\{"level":"error","event":"cli_error","code":"([A-Z_]{1,40})","message":"'"$JSON_STR_BODY"'"(,"truncated":true)?\}$'
+readonly OCI_ERR_LINE_RE='^\{"level":"error","event":"oci_runtime_error","op":"[a-z_]{1,32}","code":"([A-Z_]{1,40})","message":"'"$JSON_STR_BODY"'"(,"truncated":true)?\}$'
 # 結果は norm_code_out に入れる（コマンド置換のサブシェルを作らない。Git Bash はプロセス生成が遅い）。
 norm_code_out=""
 norm_code() {
@@ -469,8 +475,9 @@ norm_code() {
     # 区別できなくなる。自己テストの CRLF fixture が windows runner で検出した）。
     e="${e//[! -~]/~}"
   fi
-  if [[ $e =~ $ERR_LINE_RE ]]; then
-    norm_code_out="${BASH_REMATCH[2]}"
+  # code は両正規表現とも最初の捕捉群（JSON_STR_BODY の群より前）。
+  if [[ $e =~ $CLI_ERR_LINE_RE ]] || [[ $e =~ $OCI_ERR_LINE_RE ]]; then
+    norm_code_out="${BASH_REMATCH[1]}"
   fi
   return 0
 }

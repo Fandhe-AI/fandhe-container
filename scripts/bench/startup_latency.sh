@@ -767,7 +767,10 @@ rt_state() { run_rt "$1" "$2" --root "$state_root" state "$3"; }
 # NOT_FOUND（1 行以上）の場合だけ真にする。自由文・不正な JSON・code が文字列でない行・
 # 別の code が 1 行でも混ざれば判定不能として偽にする（runc 等の構造化エラーを持たない
 # ランタイムは常に偽＝不明扱い）。ERR-1 の構造化エラーは確定済み（TASK-95.2）。
-# CLI の state の不存在応答は `{"code":"NOT_FOUND","message":"container not found"}`・終了コード 3
+# CLI の state の不存在応答は `{"level":"error","event":"cli_error","code":"NOT_FOUND","message":"container not found"}`・
+# 終了コード 3（#3120。`event` を持たない旧形式 `{"code":..,"message":..}` と、core 由来の
+# `{"level":"error","event":"oci_runtime_error","op":..,"code":..,"message":..[,"truncated":true]}` も同じく読める。
+# `event` を持つ行は oci_runtime_error または cli_error かつ level error のときだけ受け付ける。#3118）
 # （#1903・#3123 で照合）。ただし状態ルートの親が無いときも同じ NOT_FOUND（message が
 # "parent of the state root not found"）で終了コード 3 になり、これはコンテナの不存在を示さない
 # ため、その行が 1 行でもあれば偽にする（fail-closed）。
@@ -779,6 +782,7 @@ rt_is_not_found() {
         (try fromjson catch null) as $o
         | ($o | type) == "object"
           and ($o.code | type) == "string" and ($o.message | type) == "string"
+          and (if ($o | has("event")) then (($o.event == "oci_runtime_error" or $o.event == "cli_error") and $o.level == "error") else true end)
           and $o.code == "NOT_FOUND"
           and $o.message != "parent of the state root not found")' <"$1" >/dev/null 2>&1
 }

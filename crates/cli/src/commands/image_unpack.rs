@@ -41,6 +41,7 @@
 //! - CRI・plugin 経由の create への配線は #2791
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use fandhe_container_core::observability::OpRecorder;
@@ -58,7 +59,7 @@ use fandhe_container_oci::layer::extract::{
 use fandhe_container_oci::reference::Digest;
 
 use super::image::{Stage, trait_failure};
-use super::oci_recorder::BorrowedOciRecorder;
+use super::oci_recorder::CliOciRecorder;
 
 /// 圧縮 blob の合計サイズの上限（cri の `DEFAULT_MAX_IMAGE_BYTES` と同値の 16 GiB）。
 pub(super) const MAX_IMAGE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
@@ -68,17 +69,18 @@ pub(super) const UNPACK_DEADLINE: Duration = Duration::from_secs(10 * 60);
 
 /// `ImageStore` を借りて `ImageRootfsUnpacker` を満たすアダプタ。
 ///
-/// 展開・検証の計装は借りた `OpRecorder` へ `oci.*` の名前で記録する（REPAIR-4）。
+/// 展開・検証の計装は `CliOciRecorder` で、create の `Runtime` と共有する `Arc<OpRecorder>` へ `oci.*` の名前で記録する
+/// （REPAIR-4・OCI-1・#3042）。
 pub(super) struct StoreImageRootfsUnpacker<'a> {
     store: &'a ImageStore,
-    recorder: BorrowedOciRecorder<'a>,
+    recorder: CliOciRecorder,
 }
 
 impl<'a> StoreImageRootfsUnpacker<'a> {
-    pub(super) fn new(store: &'a ImageStore, recorder: &'a OpRecorder) -> Self {
+    pub(super) fn new(store: &'a ImageStore, recorder: &Arc<OpRecorder>) -> Self {
         Self {
             store,
-            recorder: BorrowedOciRecorder::new(recorder),
+            recorder: CliOciRecorder::new(Arc::clone(recorder)),
         }
     }
 

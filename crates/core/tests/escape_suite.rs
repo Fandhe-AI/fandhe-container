@@ -62,7 +62,8 @@
 //!   照合する。root か audit ログの読み取り権限・auditd・Landlock ABI 7（Linux 6.15 以降）が要る。
 //!   opt-in なしでは攻撃結果だけを照合し、監査は `verdict=audit-not-verified` として出力する（合格に数えない）。
 //!   opt-in で前提が欠けたら skip せず失敗にする
-//! - 残余（実装済みを装わない。REPAIR-3）: ESC-06（`KILL_PROCESS` の 3 件）の監査は `Deferred`（追跡: #2236・#2237）。
+//! - 残余（実装済みを装わない。REPAIR-3）: ESC-06（`KILL_PROCESS` の 3 件）の監査は `Deferred` で確定（#2237 の D1 A・D2 A。2026-11-13。
+//!   読み手を置かず `CAP_AUDIT_READ` も付けない）。子孫と exec の子孫の SIGSYS 終了の残りは #4720。
 //!   `USER_NOTIF` では届かず、補助の `exit_signal` は本番 launcher の回収点が出し、正の記録はカーネルの
 //!   `AUDIT_SECCOMP` で fandhe は自前の読み手を持たない。`create` のパース時の destination 拒否
 //!   （`esc-08-config-destination`）は本番の `create_audited` が `@audit.log` へ記録する（#2480）。start の TOCTOU
@@ -112,13 +113,16 @@
 //! - ESC-06（禁止 syscall の SIGSYS 強制終了＋監査記録）: SIGSYS での強制終了は spec の期待どおり必須とする。
 //!   現行の CORE-5 フィルタは `unshare`・`ptrace`・`kexec_load` を `SECCOMP_RET_KILL_PROCESS` で拒否する
 //!   （`DeniedSyscall::deny_action`。#1834）ため、子は SIGSYS で終了する。戻って終了コード 0 になれば失敗（fail-closed）。
-//! - ESC-06 の監査（SEC-4）は `AuditExpectation::Deferred`（追跡: #2236・#2237）とし、合否に使わない。
+//! - ESC-06 の監査（SEC-4）は `AuditExpectation::Deferred`（#2237 の D1 A・D2 A で確定。2026-11-13）とし、合否に使わない。
 //!   理由: `KILL_PROCESS` の 3 件は `USER_NOTIF` に載らず（ERRNO 側の 40 件だけが載る）、子が SIGSYS で終了すると
 //!   子からは記録を書けない。本番の記録は、本番 launcher の回収点が出す補助の `exit_signal`（この試験の入口
 //!   `spawn_container_probe` では作られない）と、カーネルの `AUDIT_SECCOMP`（fandhe は自前の読み手を持たず、
-//!   読み手の設計と複数スレッド・rootless・子孫でも確実に残す条件が #2236・#2237 の結論待ち）である。
+//!   読み手を置かない決定〔D1 A〕。正の記録は auditd 等の外部の読み手に任せる）である。補助の `exit_signal` も
+//!   この試験の入口では作られず、PID 1 以外の子孫と exec の子孫の SIGSYS 終了は親から観測できない（#4720）。
 //!   親側で記録を推測生成すると監査の偽造になるため行わない。
-//! - 将来仕様（REPAIR-3）: #2236・#2237 の結論が出たら、その本番経路の出力を回収して照合する `Required` へ切り替える
+//! - 再評価の条件（REPAIR-3）: 次のいずれかのときに `Required` 化を検討する。D1 を B に変える、opt-in のカーネル監査の段
+//!   （D2 C）を採る、spec（ESC-06・SEC-4）の受け入れ範囲を見直す。なお spec は ESC-06 の監査記録を要求したままで、
+//!   試験は合否に使っていない（達成とは読まない）
 //!
 //! # ESC-09・ESC-10（TASK-42.5・#203）
 //! - `esc-09-userns-owner`（SEC-5）: コンテナ内 root が作成したファイルの所有者を、ディスパッチャ（分離なし・
@@ -147,8 +151,8 @@
 //! - ESC-03: USER_NOTIF の listener の受け渡しと応答ループ・`@audit.log` の照合を ESC-01〜10 の 1 つのハーネスで扱っており、
 //!   exec 後の対応物は `supervisor_bin_real` のシナリオ E（本番の `SeccompNotifyHub` 経由）と `production_launcher` のシナリオ J
 //! - ESC-06: exec 後の対応物は `seccomp.rs` の `kill-<名前>` と `production_launcher` のシナリオ K
-//! - 移す条件（後続）: 本 suite の `platform-ci` への組み込みは済んだ（#2016）が、移行は ESC-06 の監査の解消
-//!   （#2236・#2237）の結論待ちで、移行時に観測の同等性を CI で確かめる
+//! - 移す条件（後続）: 本 suite の `platform-ci` への組み込みは済んだ（#2016）が、移行する場合は観測の同等性を CI で
+//!   確かめる（ESC-06 の監査は `Deferred` で確定した〔#2237〕ため、監査の結論待ちは外れた）
 
 #[cfg(target_os = "linux")]
 #[path = "support/temp_rootfs.rs"]
@@ -202,14 +206,15 @@ const ESC05_EXPECT: Expectation = Expectation {
 /// 届かず、正の記録はカーネルの `AUDIT_SECCOMP`（fandhe は自前の読み手を持たない）と、補助の `exit_signal` レコード
 /// （本番 launcher の回収点が出す）になる。どちらもこの試験の入口（`spawn_container_probe`）からは駆動できず、
 /// 読み手の設計と複数スレッド・rootless・子孫での確実な記録の結論が出ていないため、監査は
-/// `Deferred`（#2236・#2237）とし合否に使わない（SEC-4・REPAIR-3）。結論が出たら `Required` へ切り替える
+/// `Deferred`（#2237 の D1 A・D2 A で確定。2026-11-13）とし合否に使わない（SEC-4・REPAIR-3）。子孫の SIGSYS 終了の
+/// 残りは #4720。`Required` 化は再評価の条件（D1 を B に変える・D2 C を採る・spec の受け入れ範囲の見直し）のときに検討する
 /// （詳細はモジュール doc の ESC-04〜ESC-06 節）。
 const ESC06_EXPECT: Expectation = Expectation {
     allowed: &[],
     signal: Some(SIGSYS),
     audit: AuditExpectation::Deferred {
         layer: "seccomp",
-        tracking: "#2236, #2237",
+        tracking: "#4720",
     },
 };
 
@@ -267,7 +272,8 @@ enum AuditExpectation {
         source: AuditSource,
     },
     /// 指定レイヤーの監査を spec 上は要求するが、本番の配送経路をこの試験からは駆動できないため合否に使わない
-    /// （REPAIR-3・SEC-4）。`tracking` は追跡先の issue。追跡先の結論が出たら `Required` へ置き換える。
+    /// （REPAIR-3・SEC-4）。`tracking` は残りを追う issue。
+    /// `Deferred` は決定で確定した扱いを含み、置き換えは再評価の条件（ケースごとの doc）が満たされたときに限る。
     Deferred {
         layer: &'static str,
         tracking: &'static str,
@@ -2741,7 +2747,7 @@ mod linux {
 
     /// ESC-06（SEC-2・TASK-42.3・#201・MS-2）: `unshare(0)`（副作用なし）。期待は spec どおり SIGSYS 終了。
     /// 戻ってきた場合（フィルタの退行）は結果を記録し、判定側が失敗にする。seccomp 監査は親側の本番経路が
-    /// 未配線のため `Deferred`（#2236・#2237。SEC-4・REPAIR-3）で、攻撃側で監査レコードを作らない（偽造しない）。
+    /// 未配線のため `Deferred`（#2237 の D1 A・D2 A で確定。残りは #4720。SEC-4・REPAIR-3）で、攻撃側で監査レコードを作らない（偽造しない）。
     fn attack_esc06_unshare(rec: &Recorder, _host_canary: &Path) {
         rec.outcome(probe_to_attack(probe_escape_syscall(
             EscapeSyscallProbe::Unshare,

@@ -9,7 +9,7 @@ PR #2520（#2380）で manifest の在庫・タグ・pull リースを `@image-i
 | 決定 | 内容 |
 | ---- | ---- |
 | 入口 | cri の `OciImagePuller::pull` の 1 か所。`PullConfig::cache_dir` は `ImageStore` の root と同一 |
-| CLI の `pull` サブコマンド | 足さない。cli → cri の通常依存（tonic / prost を CLI に持ち込む）か、pull 手順の oci への移設が要り、crate 境界の判断になるため。同じ root を `--image-root` に渡せば CLI の `image ls` / `create --image` から見える |
+| CLI の `pull` サブコマンド | 足さない。cli → cri の通常依存（tonic / prost を CLI に持ち込む）か、pull 手順の oci への移設が要り、crate 境界の判断になるため。同じ root を `--image-root` に渡せば CLI の `image ls` / `create --image` から見える（`--root` を省けば `image ls` / `image rm` / `image tag` / `image prune` / `system df` の `--image-root` の既定が同じ root になる。#2384・[image-root-default.md](image-root-default.md)） |
 | 本番の到達 | plugin-cri の `CriPluginBackends::image_service`（#2592）が本番の `PullConfig`（キャッシュは `<state_root>/.cri/images`）と `OciImagePuller` を組み、`main.rs` が呼ぶため、本番の `PullImage` から在庫へ登録される。CLI から見るには同じ root を `--image-root` に渡す。plugin-cri の CRI 側のタグ在庫は `InMemoryImageStore`（プロセス内だけ） |
 
 ## 手順と順序

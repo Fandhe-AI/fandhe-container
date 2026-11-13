@@ -58,6 +58,7 @@
 use std::io::Write;
 
 use fandhe_container_core::audit_log::{AuditRecord, AuditSink, FileAuditSink};
+use fandhe_container_core::logging::{LogEvent, LogFields, LogLine, LogValue, encode_json_line};
 use fandhe_container_core::plugin_discovery::{
     DiscoveryOptions, DiscoveryReport, PathSearchPolicy, PluginRegistry,
     discover_default_with_options, write_path_warnings,
@@ -214,15 +215,29 @@ fn failure_for_trust_kind(kind: PluginTrustErrorKind) -> BackendFailure {
 /// 通知はこの sink が `record` の中で出す。
 struct UnavailableAuditSink(TraitError);
 
+/// 作成失敗通知の event 名（コンパイル時に検証する）。
+const AUDIT_SINK_UNAVAILABLE_EVENT: LogEvent = match LogEvent::from_static("audit_sink_unavailable")
+{
+    Some(e) => e,
+    None => panic!("invalid log event name"),
+};
+
 impl UnavailableAuditSink {
     /// 作成失敗を固定スキーマの 1 行（LF 終端）で `out` へ書く。値は固定トークンで、パス・errno・
     /// 元のメッセージを含めない（ログ注入・情報漏えいの回避）。
     fn write_json_line(&self, out: &mut dyn Write) -> std::io::Result<()> {
-        writeln!(
-            out,
-            "{{\"event\":\"audit_sink_unavailable\",\"code\":\"{}\",\"message\":\"audit record sink could not be created\"}}",
-            self.0.code().as_str(),
-        )
+        // level なし（監査系の通知。core の `audit_write_failure` と同じ流儀）。バイト列は移行前と同一（ERR-4・#3120）。
+        let entries = [
+            ("code", LogValue::Str(self.0.code().as_str())),
+            (
+                "message",
+                LogValue::Str("audit record sink could not be created"),
+            ),
+        ];
+        let fields = LogFields::new(&entries);
+        let bytes = encode_json_line(&LogLine::new(AUDIT_SINK_UNAVAILABLE_EVENT, &fields))
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        out.write_all(&bytes)
     }
 }
 
@@ -271,6 +286,9 @@ fn production_audit_sink(global: &GlobalArgs) -> Box<dyn AuditSink> {
 
 /// 非 Linux の本番経路。`--root` 検証 → 発見（`PATH` 警告は stderr へ）→ 記録先の作成 → [`backend_failure`]。
 ///
+/// 出力順: opt-in 時は `PATH` 警告行（候補ごとに 1 行）を先に stderr へ書き、エラー行は戻り値を受けた
+/// 呼び出し元（`main`）が最後に書く。したがってエラー行は stderr の最終行になる（ERR-1・PLUG-11・#3119）。
+///
 /// Linux では module が単体テスト時だけコンパイルされ、本番経路からは呼ばれないため dead_code を許す。
 #[cfg_attr(target_os = "linux", allow(dead_code))]
 pub(super) fn unavailable(global: &GlobalArgs) -> TraitError {
@@ -311,6 +329,23 @@ mod tests {
     };
     use std::path::PathBuf;
     use std::sync::Mutex;
+
+    /// ERR-4・#3122: 監査 sink の作成失敗通知は level なしの固定スキーマ 1 行 1 JSON。
+    #[test]
+    fn err4_3122_audit_sink_unavailable_line() {
+        use crate::json_lines_contract::{SHARED_MAX_LOG_LINE_BYTES, check_stream};
+        let sink = UnavailableAuditSink(TraitError::new(ErrorCode::Internal, "a\nb"));
+        let mut buf = Vec::new();
+        sink.write_json_line(&mut buf).unwrap();
+        let f = &check_stream(&buf, SHARED_MAX_LOG_LINE_BYTES).unwrap()[0];
+        assert_eq!(f.event, "audit_sink_unavailable");
+        assert_eq!(f.level, None);
+        assert_eq!(f.keys_vec(), ["event", "code", "message"]);
+        assert_eq!(
+            f.str_of("message"),
+            Some("audit record sink could not be created")
+        );
+    }
 
     /// 記録を集めるだけの sink（件数に上限を置く）。
     struct CollectSink(Mutex<Vec<AuditRecord>>);
@@ -576,6 +611,10 @@ mod tests {
         let text = String::from_utf8(out).expect("utf8");
         assert_eq!(text.lines().count(), 2);
         assert!(text.lines().all(|l| l.contains(PATH_WARNING_CODE)));
+        assert!(
+            text.lines()
+                .all(|l| l.starts_with("{\"level\":\"warn\",\"event\":\"plugin_path_candidate\","))
+        );
         // A1 の前提固定（配線時に再評価: この前提を変えたら doc も見直す）。PATH 由来の候補もレジストリに登録される。
         let registered =
             PluginRegistry::from_candidates(report.candidates().iter().cloned()).expect("registry");

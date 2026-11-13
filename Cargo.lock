@@ -331,6 +331,7 @@ dependencies = [
  "flate2",
  "hyper",
  "hyper-util",
+ "libc",
  "prost",
  "protox",
  "serde",
@@ -345,6 +346,7 @@ dependencies = [
 name = "fandhe-container-gpu"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "serde",
  "serde-saphyr",
 ]
@@ -368,6 +370,9 @@ dependencies = [
 [[package]]
 name = "fandhe-container-microvm"
 version = "0.0.0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "fandhe-container-net"
@@ -470,6 +475,7 @@ version = "0.0.0"
 dependencies = [
  "fandhe-container-microvm",
  "fandhe-container-plugin",
+ "libc",
 ]
 
 [[package]]

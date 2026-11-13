@@ -138,16 +138,18 @@ use super::config::{NamespaceKind, OciConfig};
 use super::create::{ConfigAudit, validate_bundle_audited};
 use super::error::{LifecycleOp, OciRuntimeError};
 use super::launch::{
-    BundleLock, LaunchMode, LaunchSpec, LaunchedProcess, ProcessLauncher, RootfsDir, StartTimeouts,
+    BundleLock, LaunchMode, LaunchSpec, LaunchedProcess, NoProcessEvidence, ProcessLauncher,
+    RecordedCgroupOutcome, RootfsDir, StartTimeouts,
 };
 use super::mountinfo_identity::{
     FsIdentity, MountinfoReadError, dir_identity_chain, fs_identity, mounts_under, parse_mountinfo,
     path_mount_id, read_mountinfo_bounded, source_contains, source_reaches,
 };
-use super::namespace_join::NamespaceJoin;
+use super::namespace_join::{NamespaceJoin, NetnsJoinTarget, PinnedNetnsJoin};
 use super::network_mode::{EffectiveNetwork, reconcile_network};
 use super::sysfs_mount::{SysfsMountSpec, audit_sysfs_mount_error};
 use super::working_dir::ContainerWorkingDir;
+use crate::logging::{LogEvent, LogLevel, LogLine, LogLineError, encode_json_line};
 use crate::observability::{OpName, OpRecorder};
 use crate::sysctl::SysctlNamespace;
 use crate::traits::{
@@ -397,6 +399,86 @@ pub fn recover_interrupted_start(
     id: &ContainerId,
     timeouts: &StartTimeouts,
 ) -> Result<StateRecord, TraitError> {
+    recover_interrupted_start_reported(store, launcher, id, timeouts)
+        .map(RecoveredStart::into_record)
+}
+
+/// [`recover_interrupted_start`] の結果に、生存プロセスが居ないと確かめた根拠を添えたもの（#2245・REPAIR-4）。
+///
+/// 呼び出し元（supervisor の start 入口）が [`Self::encode_log_line`] で構造化ログへ写す。回復後の配置は
+/// 記録済みのまま残るため、start の連鎖を続けるには `DelegatedCgroup::resume_recorded_scope`
+/// （`crate::cgroups`。CORE-2・OCI-6）で入る。
+#[derive(Debug)]
+pub struct RecoveredStart {
+    record: StateRecord,
+    evidence: NoProcessEvidence,
+}
+
+/// 回復結果の構造化ログ行の本体（`level`・`event` は封筒 [`LogLine`] が持つ。値は固定語彙だけ）。
+#[derive(serde::Serialize)]
+struct RecoveryLogBody {
+    outcome: &'static str,
+}
+
+/// 回復結果の行のイベント名。規則に合わなければ const 評価でコンパイルが失敗する。
+const RECOVERY_EVENT: LogEvent = match LogEvent::from_static("interrupted_start_recovered") {
+    Some(e) => e,
+    None => panic!("invalid log event name"),
+};
+
+impl RecoveredStart {
+    /// 試験用の構築口(ログ行の横断照合が、回復を走らせずに行を組むため)。製品コードでは作れない。
+    #[cfg(test)]
+    pub(crate) fn for_test(record: StateRecord, evidence: NoProcessEvidence) -> Self {
+        Self { record, evidence }
+    }
+
+    /// 回復後のレコード（Created・pid なし）。
+    pub fn record(&self) -> &StateRecord {
+        &self.record
+    }
+
+    /// 生存プロセスが居ないと確かめた根拠。
+    pub fn evidence(&self) -> NoProcessEvidence {
+        self.evidence
+    }
+
+    /// レコードだけを取り出す。
+    pub fn into_record(self) -> StateRecord {
+        self.record
+    }
+
+    /// 回復結果の語彙（`already_absent`・`was_empty`・`killed`・`launch_ledger`・`unreported`）。
+    fn outcome_word(&self) -> &'static str {
+        match self.evidence {
+            NoProcessEvidence::LaunchLedger => "launch_ledger",
+            NoProcessEvidence::RecordedCgroup(RecordedCgroupOutcome::AlreadyAbsent) => {
+                "already_absent"
+            }
+            NoProcessEvidence::RecordedCgroup(RecordedCgroupOutcome::WasEmpty) => "was_empty",
+            NoProcessEvidence::RecordedCgroup(RecordedCgroupOutcome::Killed) => "killed",
+            NoProcessEvidence::Unreported => "unreported",
+        }
+    }
+
+    /// 回復結果を共通ログ型 [`LogLine`]（level `info`・event `interrupted_start_recovered`）の JSON Lines
+    /// 1 行（末尾 LF つき）にする（REPAIR-4・ERR-4）。パス・errno・pid・ID は載せない。
+    pub fn encode_log_line(&self) -> Result<Vec<u8>, LogLineError> {
+        let body = RecoveryLogBody {
+            outcome: self.outcome_word(),
+        };
+        encode_json_line(&LogLine::new(RECOVERY_EVENT, &body).with_level(LogLevel::Info))
+    }
+}
+
+/// [`recover_interrupted_start`] の本体。確認は [`ProcessLauncher::confirm_no_process_recorded_detailed`] で行い、
+/// 成功した根拠を [`RecoveredStart`] で返す（期限・所有ロック・読み直しの順序は変えない）。
+pub fn recover_interrupted_start_reported(
+    store: &dyn StateStore,
+    launcher: &Arc<dyn ProcessLauncher>,
+    id: &ContainerId,
+    timeouts: &StartTimeouts,
+) -> Result<RecoveredStart, TraitError> {
     let reservation = Arc::new(StartReservation::acquire(id)?);
     let record = store.get(&GetStateRequest::new(id.clone()))?;
     if record.status().state() != ContainerState::Running || record.status().pid().is_some() {
@@ -432,10 +514,11 @@ pub fn recover_interrupted_start(
     // 確認が終わるまでプロセス内の予約を保持する（回復の再試行・新しい start が先に進み、その後に
     // 遅れた確認が新しいプロセスを終了させることを防ぐ。CORE-2）。
     let hold = Arc::clone(&reservation);
-    match call_bounded(
+    let evidence = match call_bounded(
         confirm,
         move || {
-            let result = l.confirm_no_process_recorded(&target, recorded.as_ref(), confirm);
+            let result =
+                l.confirm_no_process_recorded_detailed(&target, recorded.as_ref(), confirm);
             drop(hold);
             result
         },
@@ -454,11 +537,12 @@ pub fn recover_interrupted_start(
                 "failed to run the launcher confirmation",
             ));
         }
-    }
-    store.update(&UpdateStateRequest::new(
+    };
+    let record = store.update(&UpdateStateRequest::new(
         ContainerStatus::created(id.clone(), None),
         record.revision(),
-    ))
+    ))?;
+    Ok(RecoveredStart { record, evidence })
 }
 
 fn start_inner(
@@ -887,12 +971,30 @@ fn build_spec_with_swap(
     }
     // 起動オプションの network モードと config の突き合わせ(D7)は予約・fork より前に終える(NET-6・SEC-1・#3058)。
     let network_mode = launcher.network_mode();
+    // `JoinPinned` と参加先は対でしか成り立たない(転送漏れによる黙った縮退を作らない。NET-1・SEC-1・#3069)。
+    let netns_target = launcher.netns_join_target();
+    if (network_mode == super::network_mode::LaunchNetworkMode::JoinPinned)
+        != netns_target.is_some()
+    {
+        return Err(TraitError::new(
+            ErrorCode::InvalidArgument,
+            "the pinned network join mode and its join target must be given together",
+        ));
+    }
     // path の形(pod の user・ipc の組と任意の net)は I/O なしの純粋関数で先に決め、network の突き合わせへ渡す(#2872)。
     // 形の誤りは突き合わせの拒否(従来の `InvalidArgument` / `Unimplemented`)より後に返し、既存の判定順を変えない。
     let join_paths = NamespaceJoin::paths_of(&config);
     let pod_net_join = matches!(&join_paths, Ok(Some(p)) if p.net.is_some());
     let network = reconcile_network(&config, network_mode, pod_net_join)?;
     let join_paths = join_paths?;
+    // pod の user namespace へ参加すると、init 所有の netns へは参加できない(カーネルが両方の user namespace で
+    // CAP_SYS_ADMIN を要求する)。別の入口どうしの併用は拒否する(NET-1・SEC-1・#3069)。
+    if network == EffectiveNetwork::PinnedJoined && join_paths.is_some() {
+        return Err(TraitError::new(
+            ErrorCode::InvalidArgument,
+            "a pod namespace join cannot be combined with a pinned network namespace join",
+        ));
+    }
     reject_unsupported_linux(&config)?;
     reject_net_sysctls_without_network_namespace(&config, network)?;
     reject_protected_paths_over_implicit_dev(&config)?;
@@ -954,6 +1056,9 @@ fn build_spec_with_swap(
     // pod の user・ipc namespace への join（`linux.namespaces[].path`）。path を 1 回だけ開いて fd へ固定し、
     // 所有者・種別・親子関係を fork の前に検証する（失敗してもプロセスのいない Running を残さない。#2674）。
     let namespace_join = pin_namespace_join_audited(join_paths, id, launcher)?;
+    // init user namespace 所有の pin 済み netns(`JoinPinned`)。置き場の fd 起点で 1 回だけ開いて固定し、素性・所有者を
+    // fork の前に検証する(D12。NET-1・SEC-1・CORE-3・#3069)。
+    let pinned_netns = pin_netns_join_audited(netns_target, id, launcher)?;
     Ok(LaunchSpec::new(
         rootfs,
         rootfs_dir,
@@ -971,6 +1076,7 @@ fn build_spec_with_swap(
     .with_sysfs(sysfs)
     .with_additional_gids(additional_gids)
     .with_namespace_join(namespace_join)
+    .with_pinned_netns(pinned_netns)
     .with_network(network, network_mode)
     .with_state_root(state_root.map(Path::to_path_buf))
     .with_terminal(terminal))
@@ -1000,6 +1106,40 @@ fn pin_namespace_join_audited(
         Ok((join, outcome)) => {
             record(outcome);
             Ok(Some(join))
+        }
+        Err(rejection) => {
+            if let Some(outcome) = rejection.outcome {
+                record(outcome);
+            }
+            Err(rejection.error)
+        }
+    }
+}
+
+/// init user namespace 所有の pin 済み netns への参加先を固定し、素性検査の結果（受理と拒否）を launcher の拒否の記録先へ
+/// 記録する（SEC-4・SEC-1・NET-1・CORE-3・#3069）。
+///
+/// 記録は層 `netns_join`・閉じた語彙の結果（[`NetnsJoinOutcome`](crate::audit_log::NetnsJoinOutcome)）で、パス・inode は
+/// 載せない（型で持たない）。受理は素性検査の受理（fork の前）に 1 件。記録の成否で判定は覆さない。不在・I/O の失敗・
+/// 非 Linux の `Unimplemented` は素性検査の結果ではないため記録しない。本番の supervisor では作業スレッドから呼ばれ、
+/// 記録先は制御チャネルの監査 relay（`audit_log::control_relay` の閉じた表で運ぶ）。
+fn pin_netns_join_audited(
+    target: Option<&NetnsJoinTarget>,
+    id: &ContainerId,
+    launcher: &dyn ProcessLauncher,
+) -> Result<Option<PinnedNetnsJoin>, TraitError> {
+    let Some(target) = target else {
+        return Ok(None);
+    };
+    let record = |outcome: crate::audit_log::NetnsJoinOutcome| {
+        if let Some(sink) = launcher.rejection_audit_sink() {
+            let _ = crate::audit_log::mount::deliver(outcome.audit_event(), Some(id), sink);
+        }
+    };
+    match PinnedNetnsJoin::pin(target) {
+        Ok((pinned, outcome)) => {
+            record(outcome);
+            Ok(Some(pinned))
         }
         Err(rejection) => {
             if let Some(outcome) = rejection.outcome {
@@ -1402,6 +1542,16 @@ fn reject_net_sysctls_without_network_namespace(
             "linux.sysctl net.* requires a network namespace",
         ));
     }
+    // init 所有の pin 済み netns(`PinnedJoined`)は plugin が管理するもので、コンテナの設定から変えさせない
+    // (子の user namespace からは書けない見込みでもあり、fail-closed。NET-1・SEC-1・#3069)。
+    if config.sysctls().has_namespace(SysctlNamespace::Net)
+        && network == EffectiveNetwork::PinnedJoined
+    {
+        return Err(TraitError::new(
+            ErrorCode::InvalidArgument,
+            "linux.sysctl net.* cannot be applied to a pinned network namespace",
+        ));
+    }
     Ok(())
 }
 
@@ -1642,6 +1792,8 @@ mod tests {
         network_mode: Mutex<super::super::network_mode::LaunchNetworkMode>,
         /// `supports_terminal` が返す値(既定は偽。CRI-6・#4070)。
         terminal_support: AtomicBool,
+        /// `netns_join_target` が返す参加先(未設定なら `None`。NET-1・#3069)。
+        netns_target: std::sync::OnceLock<super::super::NetnsJoinTarget>,
     }
 
     impl RecordingLauncher {
@@ -1665,6 +1817,7 @@ mod tests {
                 recorded: Mutex::new(Vec::new()),
                 network_mode: Mutex::new(super::super::network_mode::LaunchNetworkMode::FromConfig),
                 terminal_support: AtomicBool::new(false),
+                netns_target: std::sync::OnceLock::new(),
             })
         }
 
@@ -1744,6 +1897,10 @@ mod tests {
 
         fn network_mode(&self) -> super::super::network_mode::LaunchNetworkMode {
             *self.network_mode.lock().unwrap_or_else(|e| e.into_inner())
+        }
+
+        fn netns_join_target(&self) -> Option<&super::super::NetnsJoinTarget> {
+            self.netns_target.get()
         }
 
         fn rejection_audit_sink(&self) -> Option<&dyn crate::audit_log::AuditSink> {
@@ -3511,6 +3668,172 @@ mod tests {
         err
     }
 
+    /// `JoinPinned` と参加先 `target` で start を試み、拒否されたときの誤りと launcher の記録先を返す
+    /// (launcher 0 回・記録は Created のまま)。`target` が `None` なら参加先を持たせない。
+    fn start_rejected_pinned(
+        name: &str,
+        cfg: &Value,
+        target: Option<super::super::NetnsJoinTarget>,
+    ) -> (
+        OciRuntimeError,
+        Arc<crate::audit_log::mount::tests::VecSink>,
+    ) {
+        let (b, store) = created(name);
+        b.write_config(cfg);
+        let launcher = RecordingLauncher::new(false);
+        launcher.set_network_mode(super::super::network_mode::LaunchNetworkMode::JoinPinned);
+        if let Some(target) = target {
+            assert!(launcher.netns_target.set(target).is_ok());
+        }
+        let sink = Arc::new(crate::audit_log::mount::tests::VecSink::new(false));
+        assert!(launcher.audit.set(Arc::clone(&sink)).is_ok());
+        let err = run(&store, &launcher, name).expect_err("must fail");
+        assert_eq!(launcher.calls(), 0);
+        let got = store
+            .get(&GetStateRequest::new(ContainerId::new(name).expect("id")))
+            .expect("stored");
+        assert_eq!(got.status().state(), ContainerState::Created);
+        (err, sink)
+    }
+
+    fn pinned_target(dir: &Path, name: &str) -> super::super::NetnsJoinTarget {
+        super::super::NetnsJoinTarget::new(dir.to_path_buf(), dir.join(name), 5, 4_026_532_008)
+            .expect("target")
+    }
+
+    /// NET-1・SEC-1（#3069）: `JoinPinned` と参加先は対でしか成り立たない。モードだけ・参加先だけは、予約の前に固定文言の
+    /// `InvalidArgument` で拒否する(転送漏れで黙って縮退しない)。
+    #[test]
+    fn net1_sec1_3069_start_rejects_unpaired_pinned_join() {
+        use super::super::network_mode::LaunchNetworkMode;
+        let message = "the pinned network join mode and its join target must be given together";
+        let cfg = valid_config();
+        let (err, sink) = start_rejected_pinned("pinned-no-target", &cfg, None);
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(err.message(), message);
+        assert!(sink.snapshot().is_empty());
+        // 参加先だけ(モードは `FromConfig`)。
+        let (b, store) = created("pinned-target-only");
+        b.write_config(&cfg);
+        let launcher = RecordingLauncher::new(false);
+        launcher.set_network_mode(LaunchNetworkMode::FromConfig);
+        assert!(
+            launcher
+                .netns_target
+                .set(pinned_target(&b.dir, "pin"))
+                .is_ok()
+        );
+        let err = run(&store, &launcher, "pinned-target-only").expect_err("must fail");
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(err.message(), message);
+        assert_eq!(launcher.calls(), 0);
+    }
+
+    /// NET-1・SEC-1（#3069）: pod の namespace join(user・ipc の path)と `JoinPinned` の併用、`JoinPinned` と
+    /// network の path 付きエントリ、`JoinPinned` での `net.*` の sysctl は、pin の前に `InvalidArgument` で拒否する。
+    #[test]
+    fn net1_sec1_3069_start_rejects_conflicting_pinned_join_configs() {
+        let dummy = |name: &str| {
+            super::super::NetnsJoinTarget::new(
+                "/run/n".into(),
+                format!("/run/n/{name}").into(),
+                5,
+                1,
+            )
+            .expect("target")
+        };
+        let mut pod = valid_config();
+        pod["linux"]["namespaces"] = json!([
+            {"type": "pid"}, {"type": "mount"}, {"type": "uts"},
+            {"type": "ipc", "path": "/proc/self/ns/ipc"},
+            {"type": "user", "path": "/proc/self/ns/user"}
+        ]);
+        let (err, sink) = start_rejected_pinned("pinned-pod", &pod, Some(dummy("a")));
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            err.message(),
+            "a pod namespace join cannot be combined with a pinned network namespace join"
+        );
+        assert!(sink.snapshot().is_empty());
+
+        let path_cfg = with_network_entry(json!({"type": "network", "path": "/run/netns/x"}));
+        let (err, _) = start_rejected_pinned("pinned-path", &path_cfg, Some(dummy("b")));
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            err.message(),
+            "the network mode conflicts with a linux.namespaces network path"
+        );
+
+        let mut sysctl = with_network_entry(json!({"type": "network"}));
+        sysctl["linux"]["sysctl"] = json!({"net.ipv4.ip_forward": "1"});
+        let (err, _) = start_rejected_pinned("pinned-sysctl", &sysctl, Some(dummy("c")));
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            err.message(),
+            "linux.sysctl net.* cannot be applied to a pinned network namespace"
+        );
+    }
+
+    /// SEC-4・NET-1・SEC-1（#3069）: 参加先の素性検査による拒否は、launcher の拒否の記録先へ `netns_join` 層・閉じた語彙の
+    /// 結果・コンテナ ID つき 1 件記録され、パスは載らない。不在の参加先は素性検査ではなく記録しない。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn net1_sec1_3069_start_records_pinned_join_rejection_to_audit_sink() {
+        let cfg = valid_config();
+        let name = "pinned-audit";
+        let (b, store) = created(name);
+        b.write_config(&cfg);
+        std::fs::write(b.dir.join("plain-pin"), b"x").expect("write");
+        let launcher = RecordingLauncher::new(false);
+        launcher.set_network_mode(super::super::network_mode::LaunchNetworkMode::JoinPinned);
+        assert!(
+            launcher
+                .netns_target
+                .set(pinned_target(&b.dir, "plain-pin"))
+                .is_ok()
+        );
+        let sink = Arc::new(crate::audit_log::mount::tests::VecSink::new(false));
+        assert!(launcher.audit.set(Arc::clone(&sink)).is_ok());
+        let err = run(&store, &launcher, name).expect_err("must fail");
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(launcher.calls(), 0);
+        let recs = sink.snapshot();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].layer(), crate::audit_log::AuditLayer::NetnsJoin);
+        assert_eq!(
+            recs[0].reason().map(crate::audit_log::AuditReason::as_str),
+            Some("netns_join_not_namespace_file")
+        );
+        assert_eq!(recs[0].path(), None);
+        assert_eq!(recs[0].container_id().map(ContainerId::as_str), Some(name));
+        let line = format!("{:?}", recs[0]);
+        assert!(!line.contains("plain-pin"), "{line}");
+        let got = store
+            .get(&GetStateRequest::new(ContainerId::new(name).expect("id")))
+            .expect("stored");
+        assert_eq!(got.status().state(), ContainerState::Created);
+
+        // 不在は記録しない。
+        let (err, sink) = start_rejected_pinned_in(&b, "pinned-audit-absent", &cfg, "absent");
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert!(sink.snapshot().is_empty());
+    }
+
+    /// `start_rejected_pinned` の、bundle の置き場を参加先の置き場に使う版。
+    #[cfg(target_os = "linux")]
+    fn start_rejected_pinned_in(
+        dir_of: &Bundle,
+        name: &str,
+        cfg: &Value,
+        entry: &str,
+    ) -> (
+        OciRuntimeError,
+        Arc<crate::audit_log::mount::tests::VecSink>,
+    ) {
+        let target = pinned_target(&dir_of.dir, entry);
+        start_rejected_pinned(name, cfg, Some(target))
+    }
+
     fn with_network_entry(entry: Value) -> Value {
         let mut cfg = valid_config();
         cfg["linux"]["namespaces"]
@@ -4153,6 +4476,69 @@ mod tests {
         assert_eq!(launcher.recorded.lock().unwrap().clone(), vec![None]);
     }
 
+    /// REPAIR-4・CORE-2（#2245）: 内訳を返さない launcher（既定の detailed 実装）の回復は `Unreported` を返し、
+    /// 状態は Created・配置は不変になる。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repair4_2245_default_launcher_reports_unreported_evidence() {
+        let placement = crate::traits::CgroupPlacement::new(
+            crate::traits::CgroupScope::new("/user.slice/x.scope").expect("scope"),
+            crate::traits::StateRevision::from_raw(3),
+        );
+        let (_b, store, id) = claimed_with_cgroup("rec-unreported", Some(placement));
+        let launcher = RecordingLauncher::new(false);
+        launcher.confirms_no_process.store(true, Ordering::SeqCst);
+        let got = recover_interrupted_start_reported(
+            &store,
+            &dynl(&launcher),
+            &id,
+            &StartTimeouts::default(),
+        )
+        .expect("recover");
+        assert_eq!(got.evidence(), NoProcessEvidence::Unreported);
+        assert_eq!(got.record().status().state(), ContainerState::Created);
+    }
+
+    /// REPAIR-4・ERR-4（#2245）: 回復結果の行は、根拠 5 種それぞれ固定語彙の 1 行（level `info`・末尾 LF）で、
+    /// パス・errno・ID を含まない。
+    #[test]
+    fn repair4_2245_recovery_log_line_bytes() {
+        let rec = StateRecord::new(
+            ContainerStatus::created(ContainerId::new("web").expect("id"), None),
+            std::path::PathBuf::from("/b"),
+            crate::traits::StateRevision::from_raw(1),
+        )
+        .expect("record");
+        let cases = [
+            (NoProcessEvidence::LaunchLedger, "launch_ledger"),
+            (
+                NoProcessEvidence::RecordedCgroup(RecordedCgroupOutcome::AlreadyAbsent),
+                "already_absent",
+            ),
+            (
+                NoProcessEvidence::RecordedCgroup(RecordedCgroupOutcome::WasEmpty),
+                "was_empty",
+            ),
+            (
+                NoProcessEvidence::RecordedCgroup(RecordedCgroupOutcome::Killed),
+                "killed",
+            ),
+            (NoProcessEvidence::Unreported, "unreported"),
+        ];
+        for (evidence, word) in cases {
+            let r = RecoveredStart {
+                record: rec.clone(),
+                evidence,
+            };
+            assert_eq!(
+                String::from_utf8(r.encode_log_line().expect("line")).expect("utf8"),
+                format!(
+                    "{{\"level\":\"info\",\"event\":\"interrupted_start_recovered\",\"outcome\":\"{word}\"}}\n"
+                )
+            );
+        }
+    }
+
     /// REPAIR-5・CORE-2: 生存確認が上限内に戻らなければ回復は Timeout を返して予約を残す。確認が終わる
     /// までは同一 ID の回復・start を拒否し、確認が戻った後に回復できる。
     #[cfg(target_os = "linux")]
@@ -4224,7 +4610,7 @@ mod tests {
         err.write_json_line(&mut out).expect("write");
         let line = String::from_utf8(out).expect("utf8");
         assert!(
-            line.starts_with("{\"op\":\"start\",\"code\":\"NOT_FOUND\",\"message\":"),
+            line.starts_with("{\"level\":\"error\",\"event\":\"oci_runtime_error\",\"op\":\"start\",\"code\":\"NOT_FOUND\",\"message\":"),
             "{line}"
         );
         assert!(line.ends_with("}\n"));

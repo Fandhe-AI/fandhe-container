@@ -90,6 +90,13 @@
 //!   (`exec::netns_sync`)。`Attachable`(rootless の pasta 構成)は netns と user namespace の fd を子が C へこの順で渡し、
 //!   `ProductionLauncherBuilder::netns_attach_hook` のフックが成功したときだけ C が合図を送る。フックの失敗・期限切れでは
 //!   子を exec させずに回収する。`build` が `Attachable`・フック・権限モデル(rootless のみ)の組を fork の前に検査する
+//! - **init user namespace 所有の pin 済み netns への参加(`JoinPinned`。D12・NET-1・SEC-1・CORE-3・#3069)**:
+//!   `LaunchOptions::with_netns_join` の参加先を start が置き場の fd 起点で 1 回だけ開いて固定し(`PinnedNetnsJoin`。素性・
+//!   所有者〔init〕を検証、受理と拒否は層 `netns_join` で監査)、`LaunchSpec::pinned_netns` に載る。中間プロセス I は **user
+//!   namespace を作る前に** `exec::join_pinned_netns` で `setns(CLONE_NEWNET)` する(順序が逆だと init 所有の netns に対する
+//!   `CAP_SYS_ADMIN` を持てず `EPERM`)。分離の集合に `Net` は入れない。exec 直前の同期点(D8)は pin 時の素性との一致を期待する。
+//!   `build` が `JoinPinned`・参加先・権限モデル(rootless の 2 種。ambient に `CAP_SYS_ADMIN` を持つ非 root を含む)の組を
+//!   fork の前に検査する。pod の join との併用は拒否する。供給側(`NetworkPlugin::create_netns` の結果の配線)は #3074・#4724
 //! - **範囲写像の入力元**: `/etc/subuid`・`/etc/subgid` と `newuidmap` / `newgidmap`(`SubordinateIdSource`)
 //!   だけ。config の `linux.uidMappings` / `gidMappings` は `start` が引き続き拒否する(受理は SEC-5 に関わる
 //!   オーナー判断事項で、#2240 で判断待ち。`docs/design/config-id-mappings.md`)。supervisor が `RootlessSubordinateIds` を選ぶ経路は結線済み(#2243。subuid / subgid の設定の有無で選ぶ)
@@ -153,7 +160,7 @@ use super::bind_mounts::{BindMountSet, audit_bind_mount_error};
 use super::cgroup_requirement::{CgroupJoinMeans, launch_after_cgroup_check};
 #[cfg(target_os = "linux")]
 use super::config::NamespaceKind;
-use super::launch::{LaunchMode, LaunchSpec, LaunchedProcess, ProcessLauncher};
+use super::launch::{LaunchMode, LaunchSpec, LaunchedProcess, NoProcessEvidence, ProcessLauncher};
 #[cfg(target_os = "linux")]
 use super::launch_options::{LaunchIpcMode, LaunchOptions, LaunchStdinMode};
 #[cfg(target_os = "linux")]
@@ -458,6 +465,7 @@ impl ProductionLauncherBuilder {
                 self.launch_options.as_ref(),
                 self.netns_attach_hook.is_some(),
             )?;
+            check_netns_join_pairing(privilege, self.launch_options.as_ref())?;
             let subordinate = resolve_privilege(
                 privilege,
                 self.subordinate_ids,
@@ -540,6 +548,46 @@ fn check_attach_hook_pairing(
     Ok(())
 }
 
+/// `JoinPinned` の起動オプションと参加先と、権限モデルの組を `build` で検査する(fork の前・副作用なし。
+/// D12・NET-1・SEC-1・CORE-3・#3069)。
+///
+/// - `JoinPinned` で参加先が無い: `InvalidArgument`
+/// - 参加先があるのに `JoinPinned` でない: `InvalidArgument`(取り違えを黙って無視しない)
+/// - `JoinPinned` が rootless の 2 種(特権ランチャー経由で ambient に `CAP_SYS_ADMIN` を持つ非 root を含む)以外の権限モデル:
+///   `Unimplemented`(`RootfulHostRoot` は #2241 で恒久拒否のまま。挙動を変えない)
+#[cfg(target_os = "linux")]
+fn check_netns_join_pairing(
+    privilege: IsolationPrivilege,
+    options: Option<&LaunchOptions>,
+) -> Result<(), TraitError> {
+    let pinned = options.is_some_and(|o| o.network() == LaunchNetworkMode::JoinPinned);
+    let has_target = options.is_some_and(|o| o.netns_join().is_some());
+    if pinned && !has_target {
+        return Err(TraitError::new(
+            ErrorCode::InvalidArgument,
+            "the pinned network join mode requires a join target",
+        ));
+    }
+    if !pinned && has_target {
+        return Err(TraitError::new(
+            ErrorCode::InvalidArgument,
+            "a network join target is only valid for the pinned network join mode",
+        ));
+    }
+    if pinned
+        && !matches!(
+            privilege,
+            IsolationPrivilege::RootlessSingleId | IsolationPrivilege::RootlessSubordinateIds
+        )
+    {
+        return Err(TraitError::new(
+            ErrorCode::Unimplemented,
+            "the pinned network join mode requires a rootless privilege model",
+        ));
+    }
+    Ok(())
+}
+
 /// exec 直前の netns の素性の同期点の要求を、起動モードと実効の扱いの組から決める(NET-6・SEC-1・#3206。
 /// `docs/design/network-wiring.md` D8)。
 ///
@@ -569,6 +617,20 @@ fn netns_sync_request(
                 return Err(TraitError::new(
                     ErrorCode::Internal,
                     "the pod network join has no pinned network namespace",
+                ));
+            }
+        },
+        // init 所有の pin 済み netns へ参加する起動は、pin 時に固定した素性との一致を期待して通す(D8 の多重防御。
+        // `setns` は固定した fd で行うため通常は一致する。NET-1・SEC-1・#3069)。
+        (LaunchNetworkMode::JoinPinned, EffectiveNetwork::PinnedJoined) => match pinned {
+            Some(pinned) => (
+                Some(pinned),
+                (NetnsExpectation::SameAsBaseline, NetnsHandover::NetOnly),
+            ),
+            None => {
+                return Err(TraitError::new(
+                    ErrorCode::Internal,
+                    "the pinned network join has no pinned network namespace",
                 ));
             }
         },
@@ -937,6 +999,22 @@ impl ProcessLauncher for ProductionLauncher {
         }
     }
 
+    /// 起動オプションの `JoinPinned` の参加先(start が開いて fd に固定する。D12・NET-1・SEC-1・#3069)。
+    /// `network_mode` と同じ `launch_options` から取る。
+    fn netns_join_target(&self) -> Option<&super::NetnsJoinTarget> {
+        #[cfg(target_os = "linux")]
+        {
+            self.inner
+                .launch_options
+                .as_ref()
+                .and_then(LaunchOptions::netns_join)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            match self.never {}
+        }
+    }
+
     /// start が設定の検証で拒否したときの記録先を貸す(SEC-4・#1915)。`rejection_audit_sink` の指定があればそれ、
     /// 無ければ launcher の監査 sink(#2481)。
     fn rejection_audit_sink(&self) -> Option<&dyn AuditSink> {
@@ -1010,6 +1088,25 @@ impl ProcessLauncher for ProductionLauncher {
         {
             self.inner
                 .confirm_no_process_recorded(id, recorded, timeout)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (id, recorded, timeout);
+            match self.never {}
+        }
+    }
+
+    /// [`Self::confirm_no_process_recorded`] の内訳つき版(#2245・REPAIR-4)。
+    fn confirm_no_process_recorded_detailed(
+        &self,
+        id: &ContainerId,
+        recorded: Option<&CgroupPlacement>,
+        timeout: Duration,
+    ) -> Result<NoProcessEvidence, TraitError> {
+        #[cfg(target_os = "linux")]
+        {
+            self.inner
+                .confirm_no_process_recorded_detailed(id, recorded, timeout)
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -1749,7 +1846,9 @@ impl Inner {
             options.network(),
             spec.network(),
             self.netns_baseline_override(),
-            spec.namespace_join().and_then(|j| j.net_identity()),
+            spec.namespace_join()
+                .and_then(|j| j.net_identity())
+                .or_else(|| spec.pinned_netns().map(|p| p.identity())),
         )?;
         // `Attachable` はフックが要る。無いまま fork して合図を送れない子を作らない(build の組の検査の多重防御。fail-closed)。
         if netns_sync.is_some_and(|r| r.handover == crate::exec::NetnsHandover::NetAndUser)
@@ -2079,25 +2178,38 @@ impl Inner {
     /// launch と排他される)ので、残存は別プロセス(クラッシュした supervisor)が起動したものである。`recorded` が
     /// 無ければ従来どおり `FailedPrecondition`。cgroup の問い合わせの失敗は code だけを保った固定文言にする
     /// (パス・errno を載せない)。待ちは `timeout`(上限つき)から作る単一の期限で打ち切る(REPAIR-5)。
-    /// 成功の内訳(`RecordedCgroupOutcome`)の観測記録は未実装(REPAIR-4 の将来課題)。
+    /// 成功の内訳は [`Self::confirm_no_process_recorded_detailed`] が返す(回復の構造化ログへ載せる。#2245・REPAIR-4)。
+    /// 本メソッドは内訳を捨てるだけで、判定の経路は detailed に 1 本化している。
     fn confirm_no_process_recorded(
         &self,
         id: &ContainerId,
         recorded: Option<&CgroupPlacement>,
         timeout: Duration,
     ) -> Result<(), TraitError> {
+        self.confirm_no_process_recorded_detailed(id, recorded, timeout)
+            .map(|_| ())
+    }
+
+    /// 台帳にある ID は台帳で判定し(`LaunchLedger`)、台帳に無い ID だけ記録済みの cgroup で確かめる
+    /// (`RecordedCgroup`。#2011・#2245)。
+    fn confirm_no_process_recorded_detailed(
+        &self,
+        id: &ContainerId,
+        recorded: Option<&CgroupPlacement>,
+        timeout: Duration,
+    ) -> Result<NoProcessEvidence, TraitError> {
         let in_ledger = self.ledger().position(id).is_some();
         let Some(placement) = recorded.filter(|_| !in_ledger) else {
-            return self.confirm_no_process(id, timeout);
+            return self
+                .confirm_no_process(id, timeout)
+                .map(|()| NoProcessEvidence::LaunchLedger);
         };
         let deadline = Instant::now() + timeout.min(CONFIRM_TIMEOUT_MAX);
         match self
             .ops
             .ensure_no_process_in_recorded(id, placement, deadline)
         {
-            Ok(RecordedCgroupOutcome::AlreadyAbsent)
-            | Ok(RecordedCgroupOutcome::WasEmpty)
-            | Ok(RecordedCgroupOutcome::Killed) => Ok(()),
+            Ok(outcome) => Ok(NoProcessEvidence::RecordedCgroup(outcome)),
             Err(ErrorCode::Timeout) => Err(TraitError::new(
                 ErrorCode::Timeout,
                 "timed out confirming that no process remains in the recorded cgroup",
@@ -2188,7 +2300,7 @@ fn launch_error(e: &ExecError, unconfirmed: bool) -> TraitError {
 fn to_trait_error(e: &ExecError) -> TraitError {
     let message = match e.code {
         ErrorCode::Timeout => "container launch did not complete within the timeout".to_owned(),
-        _ => format!("container launch failed in the {:?} stage", e.stage),
+        _ => format!("container launch failed in the {} stage", e.stage.as_str()),
     };
     TraitError::new(e.code, message)
 }
@@ -2243,6 +2355,22 @@ fn isolation_config_of(
             "the pod network join does not match the pinned namespaces",
         ));
     }
+    // init 所有の pin 済み netns へ参加する(`PinnedJoined`)ことと、`PinnedNetnsJoin` の fd を持つことは対で成り立つ。
+    // 食い違いは start との不整合で、黙って別の netns で動かさない(fail-closed。NET-1・SEC-1・#3069)。
+    if (spec.network() == EffectiveNetwork::PinnedJoined) != spec.pinned_netns().is_some() {
+        return Err(TraitError::new(
+            ErrorCode::Internal,
+            "the pinned network join does not match the pinned namespace",
+        ));
+    }
+    // 別の入口どうし(pod の join と pinned の join)は併用しない(pod の user namespace へ参加した後は init 所有の
+    // netns へ参加できない。多重防御。NET-1・SEC-1・#3069)。
+    if spec.network() == EffectiveNetwork::PinnedJoined && spec.namespace_join().is_some() {
+        return Err(TraitError::new(
+            ErrorCode::InvalidArgument,
+            "a pod namespace join cannot be combined with a pinned network namespace join",
+        ));
+    }
     // join する起動でも `User`・`Ipc` は集合に含める(計画の検証〔user namespace 必須・権限モデルの写像〕を通すため)。
     // 実際には作らず、中間プロセスが `NamespaceJoin` の fd へ参加する(`exec::isolate_join`)。
     let mut namespaces = NamespaceSet::empty();
@@ -2252,6 +2380,9 @@ fn isolation_config_of(
             NamespaceKind::Ipc if ipc == LaunchIpcMode::Host => continue,
             // `Host`(path 無しの network エントリ)は start が `HostShared` と判定済み。新しい netns は作らない(NET-6・#3058)。
             NamespaceKind::Network if spec.network() == EffectiveNetwork::HostShared => continue,
+            // path 無しの network エントリで実効が `PinnedJoined` なら、作らない(中間プロセスが user namespace の作成前に
+            // 固定した fd へ参加する。`Net` を集合に入れると unshare で別の netns を作ってしまう。NET-1・#3069)。
+            NamespaceKind::Network if spec.network() == EffectiveNetwork::PinnedJoined => continue,
             // path 付きの network エントリで実効が `PodJoined` なら、集合には含めるが作らない(中間プロセスが
             // `NamespaceJoin` の fd へ参加する。`User`・`Ipc` と同じ。#2872)。
             // path 無しの network エントリで実効が `NewLoopback` なら、新しい netns を作る(中間プロセスが `lo` を up にする。
@@ -2415,6 +2546,7 @@ impl LaunchOps for RealOps {
             IntermediateSpec {
                 plan: isolation_plan,
                 join: input.spec.namespace_join(),
+                pinned_net: input.spec.pinned_netns(),
                 rootfs: input.spec.rootfs(),
                 entry: input.entry,
                 setup,
@@ -2490,7 +2622,27 @@ mod tests {
             );
             let t = launch_error(&e, false);
             assert_eq!(t.code(), code);
-            assert_eq!(t.message(), "container launch failed in the Exec stage");
+            assert_eq!(t.message(), "container launch failed in the exec stage");
+        }
+    }
+
+    /// ERR-1・ERR-4・#3118: 全段で `to_trait_error` の文言が `as_str` の snake_case 語彙に完全一致し、
+    /// 大文字（`{:?}` の変種名）を含まない。`Timeout` は段に依らない固定文言。
+    #[test]
+    fn err1_err4_3118_launch_failure_message_uses_snake_case_stage_for_all_stages() {
+        for stage in IsolationStage::ALL {
+            let e = ExecError::new(ErrorCode::Internal, stage, "detail");
+            let t = to_trait_error(&e);
+            assert_eq!(
+                t.message(),
+                format!("container launch failed in the {} stage", stage.as_str())
+            );
+            assert!(!t.message().chars().any(|c| c.is_ascii_uppercase()));
+            let timeout = to_trait_error(&ExecError::new(ErrorCode::Timeout, stage, "detail"));
+            assert_eq!(
+                timeout.message(),
+                "container launch did not complete within the timeout"
+            );
         }
     }
 
@@ -3098,7 +3250,7 @@ mod tests {
         assert_eq!(err.code(), ErrorCode::FailedPrecondition);
         assert_eq!(
             err.message(),
-            "container launch failed in the Landlock stage"
+            "container launch failed in the landlock stage"
         );
         assert!(
             !ev.lock().unwrap().iter().any(|e| e.starts_with("spawn")),
@@ -3248,7 +3400,7 @@ mod tests {
         assert_eq!(err.code(), ErrorCode::Internal);
         assert_eq!(
             err.message(),
-            "container launch failed in the Validate stage"
+            "container launch failed in the validate stage"
         );
         assert!(
             !ev.lock().unwrap().iter().any(|e| e.starts_with("spawn")),
@@ -3971,7 +4123,7 @@ mod tests {
             .expect("launch must fail")
     }
 
-    const CLEAN_MESSAGE: &str = "container launch failed in the Spawn stage";
+    const CLEAN_MESSAGE: &str = "container launch failed in the spawn stage";
 
     /// セキュリティ規約・CORE-2: 失敗の文言は固定で、パス・errno を含めない。子が残らない失敗には接尾辞を付けず、
     /// 起動予約を保持させず、`confirm_no_process` が `Ok` になる(消滅を確かめ済み)。
@@ -4167,6 +4319,30 @@ mod tests {
             l.confirm_no_process_recorded(&id, Some(&p), Duration::from_secs(1))
                 .unwrap_or_else(|e| panic!("{outcome:?}: {e:?}"));
             assert_eq!(calls.lock().unwrap().clone(), vec![(id, p)]);
+        }
+    }
+
+    /// CORE-2・OCI-6・REPAIR-4(#2245): 内訳つきの確認は、3 種の結果をそのまま `RecordedCgroup` で返す。
+    #[test]
+    fn core2_2245_detailed_confirmation_reports_each_recorded_outcome() {
+        for outcome in [
+            RecordedCgroupOutcome::AlreadyAbsent,
+            RecordedCgroupOutcome::WasEmpty,
+            RecordedCgroupOutcome::Killed,
+        ] {
+            let ev = events();
+            let ops = FakeOps::new(&ev);
+            ops.recorded_script.lock().unwrap().push_back(Ok(outcome));
+            let l = launcher(ops, rootless(), None);
+            let id = ContainerId::new("dt").unwrap();
+            let got = l
+                .confirm_no_process_recorded_detailed(
+                    &id,
+                    Some(&placement()),
+                    Duration::from_secs(1),
+                )
+                .unwrap_or_else(|e| panic!("{outcome:?}: {e:?}"));
+            assert_eq!(got, NoProcessEvidence::RecordedCgroup(outcome));
         }
     }
 
@@ -4886,6 +5062,145 @@ mod tests {
                 "the pod network join does not match the pinned namespaces"
             );
         }
+    }
+
+    /// NET-1・SEC-1・CORE-3(#3069): `JoinPinned` かつ `PinnedJoined` は、pin 時に固定した素性との一致
+    /// (`SameAsBaseline`・`NetOnly`)を期待して同期点を通す。pinned が無い・他の組は fork の前に `Internal`。
+    #[test]
+    fn net1_3069_pinned_joined_sync_request_expects_the_pinned_identity() {
+        use crate::exec::{NetnsExpectation, NetnsHandover, NetnsIdentity};
+        let pinned = NetnsIdentity::from_parts(5, 4_026_532_008);
+        let request = netns_sync_request(
+            LaunchNetworkMode::JoinPinned,
+            EffectiveNetwork::PinnedJoined,
+            Some(NetnsIdentity::from_parts(1, 1)),
+            Some(pinned),
+        )
+        .unwrap()
+        .expect("a pinned join passes the sync point");
+        assert_eq!(request.expectation, NetnsExpectation::SameAsBaseline);
+        assert_eq!(request.handover, NetnsHandover::NetOnly);
+        assert_eq!(request.baseline, Some(pinned));
+        let err = netns_sync_request(
+            LaunchNetworkMode::JoinPinned,
+            EffectiveNetwork::PinnedJoined,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::Internal);
+        assert_eq!(
+            err.message(),
+            "the pinned network join has no pinned network namespace"
+        );
+        for (m, e) in [
+            (LaunchNetworkMode::JoinPinned, EffectiveNetwork::NewLoopback),
+            (LaunchNetworkMode::JoinPinned, EffectiveNetwork::HostShared),
+            (LaunchNetworkMode::Host, EffectiveNetwork::PinnedJoined),
+            (
+                LaunchNetworkMode::Attachable,
+                EffectiveNetwork::PinnedJoined,
+            ),
+        ] {
+            let err = netns_sync_request(m, e, None, Some(pinned)).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::Internal);
+            assert_eq!(
+                err.message(),
+                "the network mode does not match the reconciled network namespace plan"
+            );
+        }
+    }
+
+    /// NET-1・SEC-1・CORE-3(#3069): `PinnedJoined` の分離の集合に `Net` は入らない(config に network エントリがあっても。
+    /// 入れると unshare で別の netns を作る)。fd の有無との食い違い・pod の join との併用は fail-closed。
+    #[test]
+    fn net1_3069_pinned_joined_isolation_config_never_creates_a_net() {
+        let open =
+            || -> std::os::fd::OwnedFd { std::fs::File::open("/dev/null").expect("open").into() };
+        for ns in [net_namespaces(), serde_json::json!({})] {
+            let spec = spec_for("pinned-net", ns)
+                .with_pinned_netns(Some(super::super::PinnedNetnsJoin::for_test(open())))
+                .with_network(
+                    super::super::EffectiveNetwork::PinnedJoined,
+                    LaunchNetworkMode::JoinPinned,
+                );
+            let cfg = isolation_config_of(&spec, LaunchIpcMode::Private).expect("config");
+            assert!(!cfg.namespaces.contains(Namespace::Net));
+            assert!(cfg.namespaces.contains(Namespace::User));
+        }
+        let no_fd = spec_for("pinned-net-no-fd", net_namespaces()).with_network(
+            super::super::EffectiveNetwork::PinnedJoined,
+            LaunchNetworkMode::JoinPinned,
+        );
+        let fd_but_not_joined = spec_for("pinned-net-host", serde_json::json!({}))
+            .with_pinned_netns(Some(super::super::PinnedNetnsJoin::for_test(open())));
+        for spec in [no_fd, fd_but_not_joined] {
+            let Err(err) = isolation_config_of(&spec, LaunchIpcMode::Private) else {
+                panic!("must be rejected");
+            };
+            assert_eq!(err.code(), ErrorCode::Internal);
+            assert_eq!(
+                err.message(),
+                "the pinned network join does not match the pinned namespace"
+            );
+        }
+        let with_pod = spec_for("pinned-net-pod", net_namespaces())
+            .with_pinned_netns(Some(super::super::PinnedNetnsJoin::for_test(open())))
+            .with_namespace_join(Some(super::super::NamespaceJoin::for_test(open(), open())))
+            .with_network(
+                super::super::EffectiveNetwork::PinnedJoined,
+                LaunchNetworkMode::JoinPinned,
+            );
+        let Err(err) = isolation_config_of(&with_pod, LaunchIpcMode::Private) else {
+            panic!("must be rejected");
+        };
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            err.message(),
+            "a pod namespace join cannot be combined with a pinned network namespace join"
+        );
+    }
+
+    /// NET-1・SEC-1・CORE-3(#3069): `build` の組の検査。`JoinPinned` で参加先が無い・参加先だけ・rootful の `JoinPinned` は
+    /// fork の前に固定文言で拒否し、rootless の組・どちらも無い組は通る。
+    #[test]
+    fn net1_3069_netns_join_pairing_is_checked_before_fork() {
+        let target = super::super::NetnsJoinTarget::new(
+            "/run/n".into(),
+            "/run/n/web".into(),
+            5,
+            4_026_532_008,
+        )
+        .expect("target");
+        let joined = options_with(&[], true, &[], LaunchIpcMode::Private).with_netns_join(target);
+        // モードだけ `JoinPinned`(参加先なし)は `with_network` で作る。
+        let mode_only = options_with(&[], true, &[], LaunchIpcMode::Private)
+            .with_network(LaunchNetworkMode::JoinPinned);
+        let plain = options_with(&[], true, &[], LaunchIpcMode::Private);
+        for p in [
+            IsolationPrivilege::RootlessSingleId,
+            IsolationPrivilege::RootlessSubordinateIds,
+        ] {
+            let e = check_netns_join_pairing(p, Some(&mode_only)).unwrap_err();
+            assert_eq!(e.code(), ErrorCode::InvalidArgument);
+            assert_eq!(
+                e.message(),
+                "the pinned network join mode requires a join target"
+            );
+            assert!(check_netns_join_pairing(p, Some(&joined)).is_ok());
+            assert!(check_netns_join_pairing(p, Some(&plain)).is_ok());
+            assert!(check_netns_join_pairing(p, None).is_ok());
+        }
+        let e = check_netns_join_pairing(IsolationPrivilege::RootfulHostRoot, Some(&joined))
+            .unwrap_err();
+        assert_eq!(e.code(), ErrorCode::Unimplemented);
+        assert_eq!(
+            e.message(),
+            "the pinned network join mode requires a rootless privilege model"
+        );
+        assert!(
+            check_netns_join_pairing(IsolationPrivilege::RootfulHostRoot, Some(&plain)).is_ok()
+        );
     }
 
     /// CRI-2・CORE-3・SEC-1(#2674): pod の namespace への join と `--ipc=host` は併用できず、spawn の前に

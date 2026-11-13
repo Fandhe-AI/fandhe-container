@@ -12,7 +12,9 @@
 //! - 引数のパスは、ユーザー定義名（サービス名・ネットワーク名・環境変数名等）を `*` にした正規形
 //!   （例 `services.*.privileged`）。この関数は正規化しない。識別子を集計に混ぜないための走査側の責務。
 //! - 表と同じ粒度のパスで分類する。Convert の入れ物キー（`healthcheck`・`deploy.resources.limits` 等）の
-//!   子は型で変換するため渡さない（渡すと Unrecognized）。降りない接頭辞は [`UNSCANNED_KEY_PREFIXES`]。
+//!   子は型で変換するため渡さない（渡すと Unrecognized）。降りない接頭辞は [`UNSCANNED_KEY_PREFIXES`]
+//!   （走査器の降下と一致させる。表に `<接頭辞>.` の行を持たない Convert 行）。そこでの `x-*` は
+//!   [`EXTENSION_KEY_PARENTS`] の親に限って走査器が Warning として記録する。
 //! - `deploy` の子（`placement`・`replicas` 等）と `network_mode` の値は走査側が明示的に引く
 //!   （値は [`classify_network_mode_value`]）。
 //! - 同じキーパスで分類が混ざったら [`KeyClass::heavier`] で重い方へ寄せる（fail-closed）。
@@ -320,11 +322,27 @@ pub const KEY_CLASS_TABLE: &[(&str, KeyClass)] = &[
 /// （`networks.*.ipam`・`services.*.develop` 等）は、キー自体がエラー分類で子を列挙する意味が無いため置かない。
 pub const UNSCANNED_KEY_PREFIXES: &[&str] = &[
     "services.*.healthcheck",
-    "services.*.deploy.resources",
+    "services.*.deploy.resources.limits",
+    "services.*.deploy.resources.reservations.devices",
     "services.*.environment",
     "services.*.labels",
     "services.*.ulimits",
     "services.*.depends_on",
+];
+
+/// compose-spec が `^x-` の拡張キーを許す位置のうち、[`UNSCANNED_KEY_PREFIXES`] の段で子へ降りない代わりに
+/// 走査器が `x-*` だけを限定して記録する親パス（STACK-3・#4637）。
+///
+/// 末尾が `.*` のものは、その手前のマッピングの値（ユーザー定義名の段）の中身が親（`depends_on` の long 形の
+/// 条件・`ulimits` の `{soft, hard}`）。`devices` は要素（シーケンス）の中身が親。変換器はこれらの位置の
+/// `x-*` を drop に数えず、ここで Warning として記録する（無視してよいキーであり `error_free` を妨げない）。
+/// `environment`・`labels` のキー、`depends_on` の依存先名、ulimit 名は利用者のデータで拡張キーではないため含めない。
+pub const EXTENSION_KEY_PARENTS: &[&str] = &[
+    "services.*.healthcheck",
+    "services.*.deploy.resources.limits",
+    "services.*.deploy.resources.reservations.devices",
+    "services.*.depends_on.*",
+    "services.*.ulimits.*",
 ];
 
 /// 静的な分類。表 → 最後のセグメントが `x-` なら Warning → それ以外は Unrecognized。
@@ -688,6 +706,38 @@ mod tests {
                 KEY_CLASS_TABLE.iter().all(|(t, _)| !t.starts_with(&child)),
                 "{p} must stay a leaf row"
             );
+        }
+    }
+
+    /// REPAIR-12・#4637: `UNSCANNED_KEY_PREFIXES` は走査器が降りない Convert 行（表に子の行を持たない）だけ。
+    /// 旧値 `services.*.deploy.resources` は子の行（`limits`・`reservations`）があり降りるため載せない。
+    #[test]
+    fn repair12_unscanned_prefixes_match_scan_descent() {
+        for p in UNSCANNED_KEY_PREFIXES {
+            let row = KEY_CLASS_TABLE.iter().find(|(q, _)| q == p);
+            assert_eq!(row.map(|(_, c)| *c), Some(KeyClass::Convert), "{p}");
+            let child = format!("{p}.");
+            assert!(
+                KEY_CLASS_TABLE.iter().all(|(q, _)| !q.starts_with(&child)),
+                "{p} has child rows"
+            );
+        }
+        // 否定側: 子の行がある段は降りるので載せない。
+        let resources = "services.*.deploy.resources";
+        assert!(
+            KEY_CLASS_TABLE
+                .iter()
+                .any(|(q, _)| q.starts_with(&format!("{resources}.")))
+        );
+        assert!(!UNSCANNED_KEY_PREFIXES.contains(&resources));
+    }
+
+    /// #4637: 拡張キーの親は UNSCANNED の段（名前の段 `.*` を除く）に一致する。
+    #[test]
+    fn extension_key_parents_are_unscanned_levels() {
+        for p in EXTENSION_KEY_PARENTS {
+            let base = p.strip_suffix(".*").unwrap_or(p);
+            assert!(UNSCANNED_KEY_PREFIXES.contains(&base), "{p}");
         }
     }
 

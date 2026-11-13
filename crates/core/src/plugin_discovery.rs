@@ -55,6 +55,7 @@ use std::fs;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
+use crate::logging::{LogEvent, LogLevel, LogLine, encode_json_line};
 use crate::oci_runtime::OCI_ERROR_MESSAGE_MAX_BYTES;
 use crate::sanitize::sanitize_display_bounded;
 
@@ -463,6 +464,16 @@ pub struct PathSearchWarning {
 }
 
 impl PathSearchWarning {
+    /// 試験専用: 任意の名前・パスで警告を組む（ERR-4 の横断照合〔#3122〕が、敵対的なパスを
+    /// 実際の書き出し口 [`Self::write_line`] へ通すため。製品の rlib には入らない）。
+    #[cfg(test)]
+    pub(crate) fn for_test(name: &str, path: PathBuf) -> Self {
+        Self {
+            name: name.to_owned(),
+            path,
+        }
+    }
+
     /// 候補の plugin 名を返す。
     pub fn name(&self) -> &str {
         &self.name
@@ -473,24 +484,54 @@ impl PathSearchWarning {
         &self.path
     }
 
-    /// JSON Lines 1 行（末尾 `\n`）で書き出す。`path` は表示を乱す文字（制御・書式・行区切り）を
-    /// 空白へ置換し 4096 バイトで打ち切ってから `serde_json` でエスケープするため、改行・双方向制御
-    /// による行の偽造や表示順の偽装、無制限の出力を防ぐ（ERR-1・PLUG-11・SEC-4）。`name` は
+    /// 共通ログ型 [`LogLine`]（level `warn`・event `plugin_path_candidate`）の JSON Lines 1 行
+    /// （末尾 `\n`）で書き出す。キー順は `level` → `event` → `code` → `message` → `name` → `path`。
+    /// `path` は表示を乱す文字（制御・書式・行区切り）を空白へ置換し 4096 バイトで打ち切ってから
+    /// エスケープするため、改行・双方向制御による行の偽造や表示順の偽装、無制限の出力を防ぐ
+    /// （ERR-1・PLUG-11・SEC-4）。打ち切ったときだけ本体の末尾に `"truncated":true` が付く
+    /// （打ち切らない行にはキーを出さない。#3114 の判断 (c)・REPAIR-4）。`name` は
     /// `plugin_name_from_file_name` が 64 バイト以下の `[a-z0-9-]` に限るためサニタイズしない。
-    /// キーを増やさないため打ち切りの有無は出力しない（構造化ログの統一は #653・TASK-98.2）。
+    /// 行長は `path` が 4096 バイトすべて `"`・`\` でもエスケープ後に約 8 KiB で、
+    /// `MAX_LOG_LINE_BYTES`（32 KiB）に収まる。符号化できなければ何も書かず `InvalidData` を返す。
+    /// 書き込みは `write_all` 1 回で、行が途中で切れる窓を狭める。
     pub fn write_line(&self, out: &mut dyn Write) -> std::io::Result<()> {
         let path =
             sanitize_display_bounded(&self.path.to_string_lossy(), OCI_ERROR_MESSAGE_MAX_BYTES);
-        let line = serde_json::json!({
-            "level": "warn",
-            "code": PATH_WARNING_CODE,
-            "message": PATH_WARNING_MESSAGE,
-            "name": self.name,
-            "path": path.as_str(),
-        });
-        serde_json::to_writer(&mut *out, &line).map_err(std::io::Error::from)?;
-        out.write_all(b"\n")
+        let body = PathWarningBody {
+            code: PATH_WARNING_CODE,
+            message: PATH_WARNING_MESSAGE,
+            name: &self.name,
+            path: path.as_str(),
+            truncated: path.is_truncated(),
+        };
+        let bytes =
+            encode_json_line(&LogLine::new(PATH_WARNING_EVENT, &body).with_level(LogLevel::Warn))
+                .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
+        out.write_all(&bytes)
     }
+}
+
+/// 警告行のイベント名。規則に合わなければ const 評価でコンパイルが失敗し、実行時には panic しない。
+const PATH_WARNING_EVENT: LogEvent = match LogEvent::from_static("plugin_path_candidate") {
+    Some(e) => e,
+    None => panic!("invalid log event name"),
+};
+
+/// `skip_serializing_if` 用。打ち切らない行には `truncated` を出さない。
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// 警告行の本体（`LogLine` が `level`・`event` の後ろへ平坦に埋め込む）。宣言順が出力のキー順で、
+/// `level`・`event` は封筒の予約キーのため持たない。
+#[derive(serde::Serialize)]
+struct PathWarningBody<'a> {
+    code: &'static str,
+    message: &'static str,
+    name: &'a str,
+    path: &'a str,
+    #[serde(skip_serializing_if = "is_false")]
+    truncated: bool,
 }
 
 /// 探索結果（候補と `PATH` 警告）。
@@ -605,6 +646,8 @@ fn discover_default_with_env(
 }
 
 /// `PATH` 警告を 1 件 1 行で書く。呼び出し側（CLI 等）が stderr を渡す（core は直接書かない）。
+/// 警告は候補ごとに 1 行ずつ、エラー行より先に出す。opt-in 時は先行する警告行があり、エラー行は
+/// 最終行になる（呼び出し側が警告を先に書き、エラー行を最後に書く契約。ERR-1・PLUG-11・#3119）。
 pub fn write_path_warnings(report: &DiscoveryReport, out: &mut dyn Write) -> std::io::Result<()> {
     report
         .path_warnings
@@ -635,8 +678,72 @@ mod tests {
         assert!(path.starts_with("/x y z  /aaa"), "{path}");
         assert_eq!(path.len(), 4096);
         assert_eq!(v["level"], "warn");
+        assert_eq!(v["event"], "plugin_path_candidate");
+        assert_eq!(v["truncated"], true);
         assert_eq!(v["code"], PATH_WARNING_CODE);
         assert_eq!(v["name"], "cri");
+    }
+
+    fn line_of(path: &str) -> String {
+        let w = PathSearchWarning {
+            name: "cri".to_owned(),
+            path: PathBuf::from(path),
+        };
+        let mut buf = Vec::new();
+        w.write_line(&mut buf).unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    /// ERR-4・ERR-1: 打ち切らない行の厳密バイト列（`truncated` は出ない）。
+    #[test]
+    fn err4_3119_path_warning_exact_bytes() {
+        assert_eq!(
+            line_of("/p/fandhe-container-plugin-cri"),
+            format!(
+                "{{\"level\":\"warn\",\"event\":\"plugin_path_candidate\",\"code\":\"PLUGIN_PATH_CANDIDATE\",\"message\":\"{PATH_WARNING_MESSAGE}\",\"name\":\"cri\",\"path\":\"/p/fandhe-container-plugin-cri\"}}\n"
+            )
+        );
+    }
+
+    /// ERR-4・REPAIR-4: 打ち切った行は本体の末尾に `"truncated":true` が付く。
+    #[test]
+    fn err4_3119_path_warning_truncated_exact_bytes() {
+        let long = format!("/{}", "a".repeat(5000));
+        assert_eq!(
+            line_of(&long),
+            format!(
+                "{{\"level\":\"warn\",\"event\":\"plugin_path_candidate\",\"code\":\"PLUGIN_PATH_CANDIDATE\",\"message\":\"{PATH_WARNING_MESSAGE}\",\"name\":\"cri\",\"path\":\"/{}\",\"truncated\":true}}\n",
+                "a".repeat(4095)
+            )
+        );
+    }
+
+    /// ERR-4・SEC-4: `"`・`\` だけの最悪ケースでも行長の上限に収まり 1 行で書ける。
+    #[test]
+    fn err4_3119_path_warning_worst_case_escape_fits() {
+        let text = line_of(&format!("/{}", "\"\\".repeat(3000)));
+        assert_eq!(text.matches('\n').count(), 1);
+        assert!(text.len() < 32 * 1024, "{}", text.len());
+        let v: serde_json::Value = serde_json::from_str(text.trim_end()).unwrap();
+        assert_eq!(v["path"].as_str().unwrap().len(), 4096);
+        assert_eq!(v["truncated"], true);
+    }
+
+    /// ERR-4: 本体は封筒の予約キー `level`・`event` を持たない。
+    #[test]
+    fn err4_3119_body_has_no_reserved_keys() {
+        let body = PathWarningBody {
+            code: PATH_WARNING_CODE,
+            message: PATH_WARNING_MESSAGE,
+            name: "cri",
+            path: "/p",
+            truncated: true,
+        };
+        let v = serde_json::to_value(&body).unwrap();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["code", "message", "name", "path", "truncated"]);
+        assert_eq!(PATH_WARNING_EVENT.as_str(), "plugin_path_candidate");
     }
 
     #[test]
@@ -934,6 +1041,8 @@ mod tests {
         assert_eq!(buf.last(), Some(&b'\n'));
         let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
         assert_eq!(v["level"], "warn");
+        assert_eq!(v["event"], "plugin_path_candidate");
+        assert!(v.get("truncated").is_none());
         assert_eq!(v["code"], "PLUGIN_PATH_CANDIDATE");
         assert_eq!(v["name"], "cri");
         assert!(v["message"].as_str().unwrap().contains("not registered"));

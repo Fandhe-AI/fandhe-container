@@ -12,6 +12,8 @@ mod image_fixture;
 #[cfg(unix)]
 use std::path::Path;
 use std::path::PathBuf;
+#[cfg(unix)]
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(unix)]
@@ -116,7 +118,7 @@ fn runtime(st: FileStateStore) -> Runtime {
     Runtime {
         audit: Box::new(FileAuditSink::in_state_store(&st)),
         store: Box::new(st),
-        recorder: OpRecorder::new(),
+        recorder: Arc::new(OpRecorder::new()),
     }
 }
 
@@ -214,7 +216,7 @@ mod linux {
         );
 
         // 展開器の戻り値（展開した層の数）。
-        let unpack_rec = OpRecorder::new();
+        let unpack_rec = Arc::new(OpRecorder::new());
         let unpacker = StoreImageRootfsUnpacker::new(&image.store, &unpack_rec);
         let dir = base.0.join("direct");
         std::fs::create_dir(&dir).expect("dir");
@@ -239,6 +241,45 @@ mod linux {
             .expect("delete");
         assert!(!rootfs.exists(), "delete は core 所有の rootfs を消す");
         assert_eq!(refs_of(&image.store, &seeded.manifest), 0);
+    }
+
+    /// 記録先 `rt.recorder` の操作の (成功, 失敗)。未記録は None。
+    fn op_counts(rt: &Runtime, name: &str) -> Option<(u64, u64)> {
+        let n = fandhe_container_core::observability::OpName::new(name).expect("name");
+        rt.recorder
+            .snapshot_op(&n)
+            .map(|o| (o.success(), o.failure()))
+    }
+
+    /// REPAIR-4・OCI-1・#3042: 本番の create 経路の展開が `Runtime` の記録先へ oci.* を記録する。
+    #[test]
+    fn repair4_oci1_3042_unpack_via_create_records_oci_ops_on_runtime_recorder() {
+        let base = TmpDir::new("rec-ok");
+        let images = base.images();
+        let seeded = seed_image(&images, "r1", &three_layer_tars(), None, true);
+        let rt = runtime(base.state());
+        let image = create_image(&base, &rt, images, &seeded.manifest);
+        let bundle = base.bundle();
+        let req = CreateRequest::new(id("c1"), bundle).expect("req");
+        create_container_with_image_reclaiming(&rt, &image, &req).expect("create");
+        assert_eq!(op_counts(&rt, "oci.blob.verify"), Some((3, 0)));
+        assert_eq!(op_counts(&rt, "oci.layer.extract"), Some((3, 0)));
+        // fixture の層は非圧縮 tar のため展開（decompress）は記録されない。
+        assert_eq!(op_counts(&rt, "oci.layer.decompress"), None);
+    }
+
+    /// REPAIR-4・OCI-1・#3042: 展開の失敗も `Runtime` の記録先に失敗として数える。
+    #[test]
+    fn repair4_oci1_3042_unpack_failure_counts_failure_on_runtime_recorder() {
+        let base = TmpDir::new("rec-fail");
+        let images = base.images();
+        let seeded = seed_image(&images, "r2", &three_layer_tars(), Some(1), true);
+        let rt = runtime(base.state());
+        let image = create_image(&base, &rt, images, &seeded.manifest);
+        let req = CreateRequest::new(id("c1"), base.bundle()).expect("req");
+        create_container_with_image_reclaiming(&rt, &image, &req).expect_err("must fail");
+        assert_eq!(op_counts(&rt, "oci.blob.verify"), Some((3, 0)));
+        assert_eq!(op_counts(&rt, "oci.layer.extract"), Some((1, 1)));
     }
 
     /// 2 層目の diff_id が食い違う（1 層目は展開済み）と DataLoss で失敗し、参照 0 件・rootfs と staging が残らない。
@@ -339,7 +380,7 @@ mod linux {
             None,
             true,
         );
-        let rec = OpRecorder::new();
+        let rec = Arc::new(OpRecorder::new());
         let unpacker = StoreImageRootfsUnpacker::new(&images, &rec);
         let manifest = ImageManifestDigest::new(seeded.manifest.as_str()).expect("manifest");
         let e = unpacker
@@ -361,7 +402,7 @@ mod linux {
             None,
             true,
         );
-        let rec = OpRecorder::new();
+        let rec = Arc::new(OpRecorder::new());
         let unpacker = StoreImageRootfsUnpacker::new(&images, &rec);
         let manifest = ImageManifestDigest::new(seeded.manifest.as_str()).expect("manifest");
         let e = unpacker.unpack(&manifest, &base.0).expect_err("plain path");

@@ -164,9 +164,11 @@ pub(crate) use exec_kill::{
     validate_exec_child_name,
 };
 pub use recorded_scope::{
-    RecordedCgroupKill, RecordedCgroupOutcome, RecordedCgroupScope, ensure_no_process_in_recorded,
+    RecordedCgroupKill, RecordedCgroupScope, ensure_no_process_in_recorded,
     kill_recorded_container_cgroup,
 };
+// 結果型は 3 OS 共通の `ProcessLauncher` の戻り値に使うため oci_runtime 側が定義し、既存の公開パスを保つ。
+pub use crate::oci_runtime::RecordedCgroupOutcome;
 
 /// 退避リーフ cgroup の名前。自プロセスの移動先（レイアウトは本モジュール冒頭を参照）。
 const EVACUATION_LEAF: &str = "fc-runtime";
@@ -248,6 +250,76 @@ pub enum CgroupStep {
     AttachDeviceProgram,
     /// アタッチ後の問い合わせと照合（プログラム数 1・attach flags 0。#1680・SEC-1）。
     VerifyDeviceProgram,
+    /// 回復後に記録済みの配置から start の連鎖を再開する段（`resume_recorded_scope`。#2245・CORE-2・OCI-6）。
+    ResumeScope,
+}
+
+impl CgroupStep {
+    /// 全変種（試験での網羅確認用）。変種を足したら `as_str` とあわせてここも更新する。
+    pub const ALL: [Self; 27] = [
+        Self::ReadSelfCgroup,
+        Self::OpenRoot,
+        Self::VerifyCgroup2,
+        Self::CheckDelegation,
+        Self::ReadControllers,
+        Self::CreateChild,
+        Self::Evacuate,
+        Self::VerifyEvacuation,
+        Self::EnableControllers,
+        Self::Cleanup,
+        Self::RecordScope,
+        Self::SetMemoryLimit,
+        Self::SetCpuMax,
+        Self::SetPidsMax,
+        Self::SetIoMax,
+        Self::SetIoWeight,
+        Self::SetIoBfqWeight,
+        Self::JoinContainer,
+        Self::ReadStats,
+        Self::VerifyIdentity,
+        Self::BuildDeviceProgram,
+        Self::DeviceCgroupPolicy,
+        Self::QueryDeviceProgram,
+        Self::LoadDeviceProgram,
+        Self::AttachDeviceProgram,
+        Self::VerifyDeviceProgram,
+        Self::ResumeScope,
+    ];
+
+    /// 段名の snake_case 表現（`Display` と構造化ログで使う安定した語彙。ERR-1・ERR-4・REPAIR-4）。
+    ///
+    /// `{:?}` の変種名を出力へ漏らさず、`oci_runtime::IsolationStage::as_str` と綴りの流儀を揃える（#3118）。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadSelfCgroup => "read_self_cgroup",
+            Self::OpenRoot => "open_root",
+            Self::VerifyCgroup2 => "verify_cgroup2",
+            Self::CheckDelegation => "check_delegation",
+            Self::ReadControllers => "read_controllers",
+            Self::CreateChild => "create_child",
+            Self::Evacuate => "evacuate",
+            Self::VerifyEvacuation => "verify_evacuation",
+            Self::EnableControllers => "enable_controllers",
+            Self::Cleanup => "cleanup",
+            Self::RecordScope => "record_scope",
+            Self::SetMemoryLimit => "set_memory_limit",
+            Self::SetCpuMax => "set_cpu_max",
+            Self::SetPidsMax => "set_pids_max",
+            Self::SetIoMax => "set_io_max",
+            Self::SetIoWeight => "set_io_weight",
+            Self::SetIoBfqWeight => "set_io_bfq_weight",
+            Self::JoinContainer => "join_container",
+            Self::ReadStats => "read_stats",
+            Self::VerifyIdentity => "verify_identity",
+            Self::BuildDeviceProgram => "build_device_program",
+            Self::DeviceCgroupPolicy => "device_cgroup_policy",
+            Self::QueryDeviceProgram => "query_device_program",
+            Self::LoadDeviceProgram => "load_device_program",
+            Self::AttachDeviceProgram => "attach_device_program",
+            Self::VerifyDeviceProgram => "verify_device_program",
+            Self::ResumeScope => "resume_scope",
+        }
+    }
 }
 
 /// cgroup 操作のエラー。`code` は ERR 系の機械可読コード、`message` は英語の説明。
@@ -311,9 +383,9 @@ impl fmt::Display for CgroupError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{} at {:?}: {}",
+            "{} at {}: {}",
             self.code.as_str(),
-            self.step,
+            self.step.as_str(),
             self.message
         )
     }
@@ -1532,6 +1604,27 @@ impl DelegatedCgroup {
             id,
             instance,
             recorder,
+            SweepMode::KillAll,
+            sys::effective_uid(),
+            &open_cgroup_dir,
+        )
+    }
+
+    /// `cgroup.kill` を一切書かずにコンテナ cgroup を削除する（回復後の再開用。#2245・CORE-2・OCI-6）。
+    ///
+    /// コンテナ cgroup 自身や子孫の `exec-*` にプロセスが居る（または持ち主が生きている）ときは、
+    /// 何も止めずに `FailedPrecondition` を返す。空の `exec-*` だけを消す。
+    pub(crate) fn remove_container_cgroup_without_kill(
+        &self,
+        id: &ContainerId,
+        instance: StateRevision,
+    ) -> Result<CgroupRemoval, TraitError> {
+        remove_container_cgroup_with(
+            self.fd.as_fd(),
+            id,
+            instance,
+            None,
+            SweepMode::UnpopulatedOnly,
             sys::effective_uid(),
             &open_cgroup_dir,
         )
@@ -1547,6 +1640,7 @@ fn remove_container_cgroup_with(
     id: &ContainerId,
     instance: StateRevision,
     recorder: Option<&OpRecorder>,
+    mode: SweepMode,
     euid: u32,
     open_dir: &dyn Fn(CgroupStep, BorrowedFd<'_>, &str) -> Result<OwnedFd, CgroupError>,
 ) -> Result<CgroupRemoval, TraitError> {
@@ -1562,11 +1656,20 @@ fn remove_container_cgroup_with(
             // `rmdir` が EBUSY になり、何度再試行しても成功しない。停止済みでない（コンテナ cgroup 自身に
             // プロセスが居る）ときは掃除が何も kill せず `FailedPrecondition` を返す。
             let deadline = std::time::Instant::now() + EXEC_SWEEP_DELETE_TIMEOUT;
-            let swept =
-                sweep_exec_children_at(child.fd.as_fd(), SweepMode::KillAll, deadline, recorder)
-                    .map_err(removal_error)?;
+            let swept = sweep_exec_children_at(child.fd.as_fd(), mode, deadline, recorder)
+                .map_err(removal_error)?;
             if swept.failed > 0 || swept.truncated {
                 return Err(sweep_removal_error(&swept));
+            }
+            // kill しない方式では、プロセスが居る・持ち主が生きている子を残したまま親を消せない。
+            // 何も止めずに失敗にする（`rmdir` の EBUSY に任せない）。
+            if mode == SweepMode::UnpopulatedOnly
+                && (swept.left_populated > 0 || swept.left_owner_alive > 0)
+            {
+                return Err(TraitError::new(
+                    ErrorCode::FailedPrecondition,
+                    "container cgroup still has processes; nothing was killed",
+                ));
             }
             match remove_child_at(parent, &child) {
                 Ok(()) => Ok(CgroupRemoval::Removed),
@@ -1984,6 +2087,83 @@ fn read_stat_file_at(dir: BorrowedFd<'_>, file: StatFile) -> Result<Option<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 網羅 match: `CgroupStep` に変種を足すとここがコンパイルエラーになり、`ALL` の更新漏れを防ぐ。
+    fn step_index(s: CgroupStep) -> usize {
+        match s {
+            CgroupStep::ReadSelfCgroup => 0,
+            CgroupStep::OpenRoot => 1,
+            CgroupStep::VerifyCgroup2 => 2,
+            CgroupStep::CheckDelegation => 3,
+            CgroupStep::ReadControllers => 4,
+            CgroupStep::CreateChild => 5,
+            CgroupStep::Evacuate => 6,
+            CgroupStep::VerifyEvacuation => 7,
+            CgroupStep::EnableControllers => 8,
+            CgroupStep::Cleanup => 9,
+            CgroupStep::RecordScope => 10,
+            CgroupStep::SetMemoryLimit => 11,
+            CgroupStep::SetCpuMax => 12,
+            CgroupStep::SetPidsMax => 13,
+            CgroupStep::SetIoMax => 14,
+            CgroupStep::SetIoWeight => 15,
+            CgroupStep::SetIoBfqWeight => 16,
+            CgroupStep::JoinContainer => 17,
+            CgroupStep::ReadStats => 18,
+            CgroupStep::VerifyIdentity => 19,
+            CgroupStep::BuildDeviceProgram => 20,
+            CgroupStep::DeviceCgroupPolicy => 21,
+            CgroupStep::QueryDeviceProgram => 22,
+            CgroupStep::LoadDeviceProgram => 23,
+            CgroupStep::AttachDeviceProgram => 24,
+            CgroupStep::VerifyDeviceProgram => 25,
+            CgroupStep::ResumeScope => 26,
+        }
+    }
+
+    /// ERR-1・ERR-4・#3118: `ALL` が全変種を重複なく持ち、`as_str` が `{:?}` の snake_case と一致する。
+    #[test]
+    fn err1_cgroup_step_as_str_is_snake_case_of_variant_name() {
+        let mut seen = [false; 27];
+        for s in CgroupStep::ALL {
+            let i = step_index(s);
+            assert!(!seen[i], "duplicate {s:?}");
+            seen[i] = true;
+            let word = s.as_str();
+            assert!(
+                !word.is_empty()
+                    && word
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+                "{word}"
+            );
+            let mut snake = String::new();
+            let mut prev_lower = false;
+            for c in format!("{s:?}").chars() {
+                if c.is_ascii_uppercase() && prev_lower {
+                    snake.push('_');
+                }
+                prev_lower = c.is_ascii_lowercase() || c.is_ascii_digit();
+                snake.push(c.to_ascii_lowercase());
+            }
+            assert_eq!(word, snake);
+        }
+        assert!(seen.iter().all(|b| *b));
+    }
+
+    /// ERR-1・ERR-4・#3118: `CgroupError` の `Display` は段名を snake_case で出す（バイト列を固定）。
+    #[test]
+    fn err1_cgroup_error_display_uses_snake_case_step() {
+        let e = CgroupError::new_for_test(
+            ErrorCode::PermissionDenied,
+            CgroupStep::CheckDelegation,
+            "denied",
+        );
+        assert_eq!(
+            e.to_string(),
+            "PERMISSION_DENIED at check_delegation: denied"
+        );
+    }
 
     fn path(s: &str) -> Result<CgroupPath, CgroupError> {
         parse_self_cgroup_v2(s)

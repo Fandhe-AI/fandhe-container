@@ -44,11 +44,12 @@
 //!
 //! # 範囲外
 //!
-//! 引数ベースのフィルタ（`clone`・`clone3` の `CLONE_NEW*`、`personality` 等）、moby 既定プロファイルの
+//! 引数ベースのフィルタは `socket` の family（`AF_VSOCK` 1 件。[`DeniedSocketFamily`]）だけで、
+//! `clone`・`clone3` の `CLONE_NEW*`、`personality` 等は扱わない。moby 既定プロファイルの
 //! 許可リスト方式への発展（TASK-128・GPU-3）は扱わない。
 //! 監査ログ連携のうち拒否報告からレコードを作るフックは `audit_log`（TASK-41.2・SEC-4）にある。
 //! ただし `ERRNO(EPERM)` も `KILL_PROCESS` もユーザー空間へ報告しないため、既定（ERRNO 版）では ERRNO 側の記録は残らない。
-//! ERRNO 側 40 件を `SECCOMP_RET_USER_NOTIF` で返すフィルタは、crate 内の `build_deny_filter_with` /
+//! ERRNO 側 40 件（と条件付きの `socket(AF_VSOCK)`）を `SECCOMP_RET_USER_NOTIF` で返すフィルタは、crate 内の `build_deny_filter_with` /
 //! `build_filter_for_target_arch_with`（[`ErrnoDelivery::UserNotif`]）で構築する（#2023・SEC-4。
 //! 方式は `docs/design/audit-delivery.md` 4 章・#2018）。外部からは `ProductionLauncherBuilder::seccomp_errno_delivery` の
 //! opt-in だけが選べる（誤って応答者のいない構成にしないため構築関数は公開しない。#2025）。supervisor の start 経路が
@@ -77,6 +78,7 @@ use std::fmt;
 // - `ERRNO(EPERM)`: 残りの 40 件（`mount`・`pivot_root`・`umount2` を含む）。ESC-03 は `mount` を
 //   EPERM で拒否と定める。他の 39 件は spec が動作を定めておらず、moby 既定プロファイル
 //   （`defaultAction` は ERRNO、KILL 系は使わない）に揃えて現状維持とする
+// - 条件付き `ERRNO(EPERM)`: `socket(2)` の family が `AF_VSOCK` のときだけ（`DeniedSocketFamily`。MAC-4・SEC-1・#2277）
 //
 // 互換性: コンテナ内で `unshare` を試し EPERM なら別手段へ切り替えるソフトウェア（ブラウザの
 // サンドボックスのフォールバック、bubblewrap 等）や `ptrace` を使うデバッガ（gdb・strace）は、
@@ -87,7 +89,7 @@ use std::fmt;
 // ハンドラ経由の `SeccompDenialReport::from_sigsys` は使えない。正の記録（syscall・arch・pid）は
 // カーネルの `AUDIT_SECCOMP`、補助は本番 launcher の回収点が出す `exit_signal` レコード（#2004。
 // syscall は推測しない）。ESC-06 の `AuditExpectation::Deferred`（`escape_suite`）から `Required` への
-// 切り替えは、読み手の設計と複数スレッド・rootless・子孫での確実な記録の結論（#2236・#2237）の後に行う（#2028）。
+// 切り替えは行わない。#2237 の決定（D1 A・D2 A。2026-11-13）で `Deferred` のまま確定した。残りは #4720（#2028）。
 //
 // 強制終了の範囲を広げる候補（既定は変えない。判断はオーナーが行う）: `kexec_file_load`
 // （`kexec_load` と同じ脅威）・`setns`（namespace 脱出。ランタイムの exec 経路は seccomp 適用前に
@@ -386,6 +388,60 @@ impl DeniedSyscall {
     }
 }
 
+/// `socket(2)` の第 1 引数（family）で拒否する対象（引数つきルール。CORE-5・SEC-1・MAC-4・TASK-191・#2277）。
+///
+/// [`DeniedSyscall`]（syscall 全体の拒否）とは意味が違うため別の型にする。`build_deny_filter` が表の各エントリの
+/// 後・末尾の `ALLOW` の前に 4 命令の引数ルールとして出す。
+///
+/// `Vsock` を拒否する理由: network namespace は vsock を分離しないため、コンテナ内のプロセスが
+/// `socket(AF_VSOCK, ...)` を使うと、VM のゲスト内の制御用受け口（macOS の guest-init 等）へ届きうる。
+/// 受け口側の接続元確認とは独立に効く多層防御で、moby の既定プロファイルと同じ挙動（`EPERM`）。
+///
+/// 残余（黙って「完全に拒否」とは言わない）: `io_uring` の `IORING_OP_SOCKET`（Linux 5.19 以降）は
+/// `socket(2)` を通らず、seccomp の引数ルールでは止められない。`io_uring_*` の拒否は既定の挙動を変えるため
+/// オーナー判断待ちで、本ルールの範囲外。`socketpair(AF_VSOCK)` は vsock が非対応（`EOPNOTSUPP`）のため対象にしない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeniedSocketFamily {
+    /// `AF_VSOCK`（40）。
+    Vsock,
+}
+
+impl DeniedSocketFamily {
+    /// 全 family。
+    pub const ALL: [DeniedSocketFamily; 1] = [DeniedSocketFamily::Vsock];
+
+    /// family 名（エラー表示用）。
+    pub const fn name(self) -> &'static str {
+        match self {
+            DeniedSocketFamily::Vsock => "AF_VSOCK",
+        }
+    }
+
+    /// `socket(2)` の family 値（`include/linux/socket.h` の `AF_VSOCK`。全アーキ共通）。
+    pub const fn family(self) -> u32 {
+        match self {
+            DeniedSocketFamily::Vsock => 40,
+        }
+    }
+
+    /// 拒否方針。`ERRNO(EPERM)`（ESC-03 と moby に揃える）。
+    pub const fn deny_action(self) -> DenyAction {
+        match self {
+            DeniedSocketFamily::Vsock => DenyAction::Errno,
+        }
+    }
+
+    /// フィルタに載せる動作（[`DeniedSyscall::filter_action`] と同じ写像。SEC-4）。
+    pub const fn filter_action(self, delivery: ErrnoDelivery) -> DenyAction {
+        match (self.deny_action(), delivery) {
+            (DenyAction::KillProcess, _) => DenyAction::KillProcess,
+            (DenyAction::Errno, ErrnoDelivery::Errno) => DenyAction::Errno,
+            (DenyAction::Errno, ErrnoDelivery::UserNotif) => DenyAction::UserNotif,
+            (DenyAction::UserNotif, _) => DenyAction::UserNotif,
+        }
+    }
+}
+
 /// syscall 番号の newtype。生の整数を公開 API に出さない。
 ///
 /// 幅を `u32` にするのは、#838 の BPF 命令 `sock_filter.k`（`u32`）と `seccomp_data.nr` の
@@ -445,9 +501,17 @@ pub struct ArchSyscallTable {
     audit_arch: AuditArch,
     entries: &'static [(DeniedSyscall, SyscallNr)],
     absent: &'static [DeniedSyscall],
+    /// `socket(2)` の番号。引数つきルール（[`DeniedSocketFamily`]）の対象で、
+    /// [`DeniedSyscall`] の表（syscall 全体の拒否）には含めない。
+    socket: SyscallNr,
 }
 
 impl ArchSyscallTable {
+    /// `socket(2)` の番号。[`DeniedSocketFamily`] の引数ルールが比較対象にする。
+    pub const fn socket_nr(&self) -> SyscallNr {
+        self.socket
+    }
+
     /// `seccomp_data.arch` と比較する値。
     pub const fn audit_arch(&self) -> AuditArch {
         self.audit_arch
@@ -542,6 +606,9 @@ const EPERM: u32 = 1;
 const SECCOMP_DATA_NR_OFFSET: u32 = 0;
 /// `struct seccomp_data` の `arch` オフセット。
 const SECCOMP_DATA_ARCH_OFFSET: u32 = 4;
+/// `struct seccomp_data` の `args[0]` の下位 32 bit のオフセット（`int nr; __u32 arch; __u64 ip; __u64 args[6]`）。
+/// 対応アーキはどちらも LE（BE は arch 検査で KILL）のため下位ワードが 16 にある。
+const SECCOMP_DATA_ARGS0_LO_OFFSET: u32 = 16;
 
 /// x32 ABI の syscall 番号ビット（`arch/x86/include/uapi/asm/unistd.h` の `__X32_SYSCALL_BIT`）。
 const X32_SYSCALL_BIT: u32 = 0x4000_0000;
@@ -679,7 +746,10 @@ impl std::error::Error for SeccompBuildError {}
 ///    （deny-list 型のため、トレース下の挙動は範囲外）
 /// 3. `entries()` の各番号は `DeniedSyscall::deny_action` の動作（`unshare`・`ptrace`・`kexec_load` は
 ///    `KILL_PROCESS`、他は `ERRNO(EPERM)`。`absent()` は命令を出さない）
-/// 4. それ以外は `ALLOW`（許可リスト方式への発展は TASK-128・GPU-3 で範囲外）
+/// 4. `socket(2)` の第 1 引数（family）の下位 32 bit が `AF_VSOCK`（40）なら [`DeniedSocketFamily`] の動作
+///    （`ERRNO(EPERM)`）。カーネルは family を `int` に切り詰めるため、上位 32 bit は比較しない
+///    （上位にゴミを入れても回避できない）。引数のレジスタ値だけを見るので TOCTOU は無い
+/// 5. それ以外は `ALLOW`（許可リスト方式への発展は TASK-128・GPU-3 で範囲外）
 ///
 /// 命令数は checked 演算で事前計算し、上限検証してから確保する。
 pub fn build_deny_filter(table: &ArchSyscallTable) -> Result<SeccompProgram, SeccompBuildError> {
@@ -698,7 +768,8 @@ pub(crate) fn build_deny_filter_with(
     let is_x86_64 = audit_arch == AUDIT_ARCH_X86_64_VALUE;
     let entries = table.entries();
 
-    let fixed: usize = if is_x86_64 { 4 + 2 + 1 } else { 4 + 1 };
+    // 固定部: arch 検査 3 + nr ロード 1 + (x86_64 の x32 拒否 2) + socket の引数ルール 4 + 末尾 ALLOW 1
+    let fixed: usize = if is_x86_64 { 4 + 2 + 4 + 1 } else { 4 + 4 + 1 };
     let total = entries
         .len()
         .checked_mul(2)
@@ -751,6 +822,29 @@ pub(crate) fn build_deny_filter_with(
             d.filter_action(delivery).ret_value(),
         ));
     }
+    // `socket(2)` の引数ルール（A には nr がロード済み）。family が AF_VSOCK の下位 32 bit と
+    // 一致するときだけ拒否し、他は末尾の ALLOW へ抜ける（MAC-4・SEC-1・CORE-5・#2277）。
+    let vsock = DeniedSocketFamily::Vsock;
+    p.push(BpfInstruction::jump(
+        BPF_JMP | BPF_JEQ | BPF_K,
+        table.socket_nr().get(),
+        0,
+        3,
+    ));
+    p.push(BpfInstruction::stmt(
+        BPF_LD | BPF_W | BPF_ABS,
+        SECCOMP_DATA_ARGS0_LO_OFFSET,
+    ));
+    p.push(BpfInstruction::jump(
+        BPF_JMP | BPF_JEQ | BPF_K,
+        vsock.family(),
+        0,
+        1,
+    ));
+    p.push(BpfInstruction::stmt(
+        BPF_RET | BPF_K,
+        vsock.filter_action(delivery).ret_value(),
+    ));
     p.push(BpfInstruction::stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
     SeccompProgram::new(p)
 }
@@ -826,6 +920,7 @@ mod nr {
         audit_arch: AUDIT_ARCH,
         entries: &ENTRIES,
         absent: &ABSENT,
+        socket: N::new(41),
     };
 
     pub(super) const TABLE: Option<&'static ArchSyscallTable> = Some(&ARCH_TABLE);
@@ -888,6 +983,7 @@ mod nr {
         audit_arch: AUDIT_ARCH,
         entries: &ENTRIES,
         absent: &ABSENT,
+        socket: N::new(198),
     };
 
     pub(super) const TABLE: Option<&'static ArchSyscallTable> = Some(&ARCH_TABLE);
@@ -1189,6 +1285,7 @@ mod bpf_tests {
             audit_arch: AuditArch(audit),
             entries: Box::leak(entries.into_boxed_slice()),
             absent,
+            socket: SyscallNr(if audit == 0xC000_003E { 41 } else { 198 }),
         }))
     }
 
@@ -1202,6 +1299,11 @@ mod bpf_tests {
 
     /// テスト専用の cBPF 評価器（LD W ABS・JEQ K・JSET K・RET K のみ）。
     fn eval(p: &SeccompProgram, nr: u32, arch: u32) -> u32 {
+        eval_args(p, nr, arch, 0)
+    }
+
+    /// [`eval`] に `args[0]`（下位ワード = オフセット 16、上位 = 20）を与える版（#2277）。
+    fn eval_args(p: &SeccompProgram, nr: u32, arch: u32, args0: u64) -> u32 {
         let insns = p.instructions();
         let (mut pc, mut a) = (0usize, 0u32);
         loop {
@@ -1211,6 +1313,8 @@ mod bpf_tests {
                     a = match i.k() {
                         0 => nr,
                         4 => arch,
+                        16 => args0 as u32,
+                        20 => (args0 >> 32) as u32,
                         k => panic!("bad offset {k}"),
                     };
                     pc += 1;
@@ -1232,7 +1336,7 @@ mod bpf_tests {
     #[test]
     fn core5_task38_1_2_x86_64_shape() {
         let p = build_deny_filter(x86()).unwrap();
-        assert_eq!(p.len(), 93);
+        assert_eq!(p.len(), 97);
         assert!(!p.is_empty());
         let i = p.instructions();
         let t = |x: &BpfInstruction| (x.code(), x.jt(), x.jf(), x.k());
@@ -1247,19 +1351,30 @@ mod bpf_tests {
         assert_eq!(t(&i[7]), (0x06, 0, 0, KILL));
         assert_eq!(t(&i[8]), (0x15, 0, 1, 308));
         assert_eq!(t(&i[9]), (0x06, 0, 0, ERRNO_EPERM));
-        assert_eq!(t(&i[92]), (0x06, 0, 0, 0x7fff_0000));
+        // socket の引数ルール 4 命令（#2277）の後に末尾の ALLOW。
+        assert_eq!(t(&i[92]), (0x15, 0, 3, 41));
+        assert_eq!(t(&i[93]), (0x20, 0, 0, 16));
+        assert_eq!(t(&i[94]), (0x15, 0, 1, 40));
+        assert_eq!(t(&i[95]), (0x06, 0, 0, ERRNO_EPERM));
+        assert_eq!(t(&i[96]), (0x06, 0, 0, 0x7fff_0000));
     }
 
     #[test]
     fn core5_task38_1_2_aarch64_shape() {
         let p = build_deny_filter(aarch()).unwrap();
-        assert_eq!(p.len(), 87);
+        assert_eq!(p.len(), 91);
         assert!(p.instructions().iter().all(|i| i.code() != 0x45));
         assert!(
             !p.instructions()
                 .iter()
                 .any(|i| { i.code() == 0x15 && (i.k() == 172 || i.k() == 173) })
         );
+        let i = p.instructions();
+        let t = |x: &BpfInstruction| (x.code(), x.jt(), x.jf(), x.k());
+        assert_eq!(t(&i[86]), (0x15, 0, 3, 198));
+        assert_eq!(t(&i[87]), (0x20, 0, 0, 16));
+        assert_eq!(t(&i[88]), (0x15, 0, 1, 40));
+        assert_eq!(t(&i[89]), (0x06, 0, 0, ERRNO_EPERM));
         let last = p.instructions().last().unwrap();
         assert_eq!((last.code(), last.k()), (0x06, 0x7fff_0000));
     }
@@ -1351,11 +1466,11 @@ mod bpf_tests {
         }
     }
 
-    /// SEC-4: x86_64 の USER_NOTIF 版の形（命令数は 93 のまま）。
+    /// SEC-4: x86_64 の USER_NOTIF 版の形（命令数は 97 のまま）。
     #[test]
     fn sec4_user_notif_x86_64_shape() {
         let p = build_deny_filter_with(x86(), ErrnoDelivery::UserNotif).unwrap();
-        assert_eq!(p.len(), 93);
+        assert_eq!(p.len(), 97);
         let i = p.instructions();
         let t = |x: &BpfInstruction| (x.code(), x.jt(), x.jf(), x.k());
         assert_eq!(t(&i[0]), (0x20, 0, 0, 4));
@@ -1368,14 +1483,14 @@ mod bpf_tests {
         assert_eq!(t(&i[7]), (0x06, 0, 0, KILL));
         assert_eq!(t(&i[8]), (0x15, 0, 1, 308));
         assert_eq!(t(&i[9]), (0x06, 0, 0, USER_NOTIF));
-        assert_eq!(t(&i[92]), (0x06, 0, 0, ALLOW));
+        assert_eq!(t(&i[96]), (0x06, 0, 0, ALLOW));
     }
 
-    /// SEC-4: aarch64 の USER_NOTIF 版の形（命令数は 87 のまま）。
+    /// SEC-4: aarch64 の USER_NOTIF 版の形（命令数は 91 のまま）。
     #[test]
     fn sec4_user_notif_aarch64_shape() {
         let p = build_deny_filter_with(aarch(), ErrnoDelivery::UserNotif).unwrap();
-        assert_eq!(p.len(), 87);
+        assert_eq!(p.len(), 91);
         assert!(p.instructions().iter().all(|i| i.code() != 0x45));
         let last = p.instructions().last().unwrap();
         assert_eq!((last.code(), last.k()), (0x06, ALLOW));
@@ -1384,7 +1499,8 @@ mod bpf_tests {
     /// SEC-4: Errno 版との差は ERRNO(EPERM) の RET が USER_NOTIF になる位置だけ。
     #[test]
     fn sec4_user_notif_differs_only_in_errno_returns() {
-        for (t, want) in [(x86(), 40usize), (aarch(), 38usize)] {
+        // 差は表の ERRNO 40 / 38 件に vsock の引数ルール 1 件（#2277）を足した数。
+        for (t, want) in [(x86(), 41usize), (aarch(), 39usize)] {
             let e = build_deny_filter_with(t, ErrnoDelivery::Errno).unwrap();
             let u = build_deny_filter_with(t, ErrnoDelivery::UserNotif).unwrap();
             assert_eq!(e.len(), u.len());
@@ -1473,9 +1589,9 @@ mod bpf_tests {
     fn sec4_native_user_notif_len() {
         let r = build_filter_for_target_arch_with(ErrnoDelivery::UserNotif);
         #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
-        assert_eq!(r.unwrap().len(), 93);
+        assert_eq!(r.unwrap().len(), 97);
         #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
-        assert_eq!(r.unwrap().len(), 87);
+        assert_eq!(r.unwrap().len(), 91);
         #[cfg(not(all(
             any(target_arch = "x86_64", target_arch = "aarch64"),
             target_pointer_width = "64"
@@ -1538,11 +1654,11 @@ mod bpf_tests {
         let t = leak_table(0xC000_00B7, &nrs);
         assert_eq!(
             build_deny_filter(t).unwrap_err(),
-            SeccompBuildError::TooManyInstructions { len: 4205 }
+            SeccompBuildError::TooManyInstructions { len: 4209 }
         );
         assert_eq!(
-            SeccompBuildError::TooManyInstructions { len: 4205 }.to_string(),
-            "seccomp filter needs 4205 instructions, exceeding the limit of 4096"
+            SeccompBuildError::TooManyInstructions { len: 4209 }.to_string(),
+            "seccomp filter needs 4209 instructions, exceeding the limit of 4096"
         );
     }
 
@@ -1561,13 +1677,13 @@ mod bpf_tests {
     #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
     #[test]
     fn core5_task38_1_2_native_x86_64() {
-        assert_eq!(build_filter_for_target_arch().unwrap().len(), 93);
+        assert_eq!(build_filter_for_target_arch().unwrap().len(), 97);
     }
 
     #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
     #[test]
     fn core5_task38_1_2_native_aarch64() {
-        assert_eq!(build_filter_for_target_arch().unwrap().len(), 87);
+        assert_eq!(build_filter_for_target_arch().unwrap().len(), 91);
     }
 
     #[cfg(not(all(
@@ -1626,5 +1742,80 @@ mod bpf_tests {
         // 陽性対照: フィルタが全拒否ではなく、ランタイムの syscall は通す。
         assert_eq!(eval(&errno, EXECVE, audit), ALLOW);
         assert_eq!(eval(&notif, EXECVE, audit), ALLOW);
+    }
+
+    /// MAC-4・SEC-1・CORE-5・#2277: `socket(AF_VSOCK)` だけが拒否され、他の family と他の syscall は通る。
+    #[test]
+    fn core5_sec1_2277_vsock_denied_other_families_allowed() {
+        const SOCKET: [(u32, u32); 2] = [(0xC000_003E, 41), (0xC000_00B7, 198)];
+        for (audit, sock) in SOCKET {
+            let table = if audit == 0xC000_003E { x86() } else { aarch() };
+            assert_eq!(table.socket_nr().get(), sock);
+            let errno = build_deny_filter_with(table, ErrnoDelivery::Errno).unwrap();
+            let notif = build_deny_filter_with(table, ErrnoDelivery::UserNotif).unwrap();
+            // 下位 32 bit が 40 なら上位に何があっても拒否する（カーネルは family を int に切り詰める）。
+            for a0 in [40_u64, 0xFFFF_FFFF_0000_0028, 1_u64 << 32 | 40] {
+                assert_eq!(eval_args(&errno, sock, audit, a0), ERRNO_EPERM, "{a0:#x}");
+                assert_eq!(eval_args(&notif, sock, audit, a0), USER_NOTIF, "{a0:#x}");
+            }
+            // AF_UNIX(1)・AF_INET(2)・AF_INET6(10)・上位だけが 40 の値は通す。
+            for a0 in [0_u64, 1, 2, 10, 39, 41, 0x0000_0028_0000_0001] {
+                assert_eq!(eval_args(&errno, sock, audit, a0), ALLOW, "{a0:#x}");
+                assert_eq!(eval_args(&notif, sock, audit, a0), ALLOW, "{a0:#x}");
+            }
+            // socket 以外の syscall は arg0 = 40 でも影響を受けない（ランタイム用の許可 syscall）。
+            let runtime: &[u32] = if audit == 0xC000_003E {
+                &X86_RUNTIME
+            } else {
+                &AARCH_RUNTIME
+            };
+            for n in runtime {
+                assert_eq!(eval_args(&errno, *n, audit, 40), ALLOW, "nr {n}");
+            }
+        }
+    }
+
+    /// #2277: socket の番号は禁止表のどの番号とも衝突しない（引数ルールが表の動作を隠さない）。
+    #[test]
+    fn core5_sec1_2277_socket_nr_not_in_deny_table() {
+        for (audit, nrs, sock) in [
+            (0xC000_003E_u32, &X86_NRS[..], 41_u32),
+            (0xC000_00B7, &AARCH_NRS[..], 198),
+        ] {
+            assert!(!nrs.contains(&sock), "{audit:#x}");
+        }
+    }
+
+    /// #2277: 型の写像（family・名前・方針・届け方）。
+    #[test]
+    fn core5_sec1_2277_denied_socket_family_mapping() {
+        assert_eq!(DeniedSocketFamily::ALL, [DeniedSocketFamily::Vsock]);
+        let v = DeniedSocketFamily::Vsock;
+        assert_eq!(v.name(), "AF_VSOCK");
+        assert_eq!(v.family(), 40);
+        assert_eq!(v.deny_action(), DenyAction::Errno);
+        assert_eq!(v.filter_action(ErrnoDelivery::Errno), DenyAction::Errno);
+        assert_eq!(
+            v.filter_action(ErrnoDelivery::UserNotif),
+            DenyAction::UserNotif
+        );
+    }
+
+    /// #2277: ネイティブアーキの本番テーブルで AF_VSOCK が EPERM / USER_NOTIF、AF_UNIX が ALLOW。
+    #[test]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    fn core5_sec1_2277_native_table_denies_vsock() {
+        let t = table_for_target_arch().unwrap();
+        let audit = t.audit_arch().get();
+        let sock = t.socket_nr().get();
+        let errno = build_filter_for_target_arch().unwrap();
+        let notif = build_filter_for_target_arch_with(ErrnoDelivery::UserNotif).unwrap();
+        assert_eq!(eval_args(&errno, sock, audit, 40), ERRNO_EPERM);
+        assert_eq!(eval_args(&notif, sock, audit, 40), USER_NOTIF);
+        assert_eq!(eval_args(&errno, sock, audit, 1), ALLOW);
+        assert_eq!(eval_args(&notif, sock, audit, 1), ALLOW);
     }
 }

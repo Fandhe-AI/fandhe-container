@@ -53,8 +53,10 @@ use fandhe_container_net::pasta::binary::{PastaBinary, search_pasta_in_path, ver
 use fandhe_container_net::pasta::record::PastaRecord;
 
 use super::args::{GlobalArgs, PastaSource};
-use super::stop_delete::{WARNING_WRITE_TIMEOUT, emit_warning_bounded, write_warning_to_stderr};
-use crate::json::json_escape;
+use super::stop_delete::{
+    WARNING_WRITE_TIMEOUT, emit_warning_bounded, warn_event, warn_line, write_warning_to_stderr,
+};
+use fandhe_container_core::logging::{LogEvent, LogValue};
 
 /// rootless のユーザー定義ネットワークなのにどちらのフラグも無い（既定のパスは持たない。12.4）。
 pub(super) const MSG_NOT_CONFIGURED: &str = "pasta path is not configured";
@@ -70,6 +72,8 @@ const MSG_UNTRUSTED_LAUNCHER: &str = "privileged launcher is not a trusted execu
 const MSG_EXE_UNRESOLVABLE: &str = "failed to locate the CLI executable";
 /// `PATH` 探索の警告の `code`・`message`（固定）。
 const WARN_CODE: &str = "PASTA_PATH_CANDIDATE";
+/// 警告行の event 名（ERR-4・#3120。コンパイル時に検証する）。
+const WARN_EVENT: LogEvent = warn_event("pasta_path_candidate");
 const WARN_MESSAGE: &str = "pasta was taken from PATH because --pasta-path-search was given; verify it is the intended binary";
 
 /// インストールの種別（`decide` の入力）。
@@ -133,7 +137,8 @@ pub(super) fn decide(
 /// net のエラーをコードを保ったまま写す（実体は supervisor の `net_error`。cli と plugin-cri で共有。REPAIR-1）。
 use fandhe_container_supervisor::net_error::net_error_to_trait_keeping_code as net_error_to_trait;
 
-/// `PATH` 探索の警告 1 行（JSON。`path` は無害化して上限を置く。12.5・PLUG-11）。
+/// `PATH` 探索の警告 1 行（LF 終端の JSON。`LogLine` で組む。`path` は無害化して上限を置き、切り詰めたら
+/// `truncated:true` を付ける。12.5・PLUG-11・ERR-4・#3120）。
 pub(super) fn path_warning_line(bin: &PastaBinary) -> String {
     warning_line_for(bin.path())
 }
@@ -141,10 +146,15 @@ pub(super) fn path_warning_line(bin: &PastaBinary) -> String {
 /// [`path_warning_line`] の本体（`PastaBinary` を作れない試験のためにパスで受ける）。
 fn warning_line_for(path: &std::path::Path) -> String {
     let path = sanitize_display_bounded(&path.to_string_lossy(), OCI_ERROR_MESSAGE_MAX_BYTES);
-    format!(
-        "{{\"level\":\"warn\",\"code\":\"{WARN_CODE}\",\"message\":\"{WARN_MESSAGE}\",\"path\":\"{}\"}}",
-        json_escape(path.as_str())
-    )
+    let mut entries = vec![
+        ("code", LogValue::Str(WARN_CODE)),
+        ("message", LogValue::Str(WARN_MESSAGE)),
+        ("path", LogValue::Str(path.as_str())),
+    ];
+    if path.is_truncated() {
+        entries.push(("truncated", LogValue::Bool(true)));
+    }
+    warn_line(WARN_EVENT, &entries)
 }
 
 /// 指定から pasta を解決・検証する。`PATH` 探索なら警告の行も返す（出力は呼び出し側）。
@@ -226,6 +236,25 @@ mod tests {
     use super::*;
     use fandhe_container_net::error::{NetError, NetErrorCode};
     use std::path::PathBuf;
+
+    /// ERR-4・#3122: pasta の PATH 警告は敵対的・最大長のパスでも 1 行 1 JSON で、置換後の値と
+    /// `truncated:true` が具体値で一致する。
+    #[test]
+    fn err4_3122_pasta_path_warning_hostile_and_max() {
+        use crate::json_lines_contract::{HOSTILE_TEXT, SHARED_MAX_LOG_LINE_BYTES, check_stream};
+        let hostile = format!("/{HOSTILE_TEXT}{}", "a".repeat(5000));
+        let line = warning_line_for(std::path::Path::new(&hostile));
+        let f = &check_stream(line.as_bytes(), SHARED_MAX_LOG_LINE_BYTES).unwrap()[0];
+        assert_eq!(f.level.as_deref(), Some("warn"));
+        assert_eq!(f.bool_of("truncated"), Some(true));
+        let p = f.str_of("path").unwrap();
+        assert_eq!(p.len(), 4096);
+        assert!(p.starts_with("/a b c d e [31mf g h i j k l m\"n\\o"));
+        let worst = format!("/{}", "\"\\".repeat(2047));
+        let line = warning_line_for(std::path::Path::new(&worst));
+        assert!(line.len() < SHARED_MAX_LOG_LINE_BYTES);
+        check_stream(line.as_bytes(), SHARED_MAX_LOG_LINE_BYTES).unwrap();
+    }
 
     fn path_src() -> PastaSource {
         PastaSource::Path(PathBuf::from("/usr/bin/pasta"))
@@ -349,13 +378,13 @@ mod tests {
         assert_eq!(
             line,
             format!(
-                "{{\"level\":\"warn\",\"code\":\"PASTA_PATH_CANDIDATE\",\"message\":\"{WARN_MESSAGE}\",\"path\":\"/a\\\"b\\\\c  /pasta\"}}"
+                "{{\"level\":\"warn\",\"event\":\"pasta_path_candidate\",\"code\":\"PASTA_PATH_CANDIDATE\",\"message\":\"{WARN_MESSAGE}\",\"path\":\"/a\\\"b\\\\c  /pasta\"}}\n"
             )
         );
-        assert!(!line.contains('\n'));
+        assert_eq!(line.matches('\n').count(), 1);
         let long = format!("/{}", "x".repeat(OCI_ERROR_MESSAGE_MAX_BYTES * 2));
-        assert!(
-            warning_line_for(std::path::Path::new(&long)).len() < OCI_ERROR_MESSAGE_MAX_BYTES + 400
-        );
+        let cut = warning_line_for(std::path::Path::new(&long));
+        assert!(cut.len() < OCI_ERROR_MESSAGE_MAX_BYTES + 400);
+        assert!(cut.ends_with("\",\"truncated\":true}\n"));
     }
 }

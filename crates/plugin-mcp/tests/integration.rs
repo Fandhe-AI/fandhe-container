@@ -283,7 +283,8 @@ mod uds {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            // Linux 以外は core の状態ストアが状態ルートを検査できず UNIMPLEMENTED を返す（fail-closed）。
+            // Linux 以外は既定の状態ルートを解決できず fail-closed。macOS は #2431 案 A（#4665）の恒久拒否で
+            // FAILED_PRECONDITION、Windows は従来どおり UNIMPLEMENTED。
             // 業務エラーの result は `structuredContent` を持たず、`{code, message}` を
             // `content[0].text` の JSON 文字列に載せる（server.rs の `tool_error_result`）。
             assert_eq!(call["result"]["isError"], json!(true), "{call}");
@@ -291,11 +292,14 @@ mod uds {
                 .as_str()
                 .unwrap_or_else(|| panic!("content[0].text is a string: {call}"));
             let body: Value = serde_json::from_str(text).expect("content[0].text is JSON");
-            assert_eq!(
-                body,
-                json!({"code": "UNIMPLEMENTED", "message": "Not implemented"}),
-                "{call}"
-            );
+            #[cfg(target_os = "macos")]
+            let expected = json!({
+                "code": "FAILED_PRECONDITION",
+                "message": "Operation not allowed in the current state"
+            });
+            #[cfg(not(target_os = "macos"))]
+            let expected = json!({"code": "UNIMPLEMENTED", "message": "Not implemented"});
+            assert_eq!(body, expected, "{call}");
         }
 
         drop(reader);
@@ -392,7 +396,7 @@ mod uds {
         assert_eq!(call["id"], json!(3));
         assert!(call.get("error").is_none(), "{call}");
         assert_eq!(call["result"]["resultType"], json!("complete"), "{call}");
-        // Linux 以外は core の状態ストアが UNIMPLEMENTED を返す（fail-closed）ため isError になる。
+        // Linux 以外は既定の状態ルートを解決できず fail-closed（macOS は FAILED_PRECONDITION・Windows は UNIMPLEMENTED。#4665）のため isError になる。
         assert_eq!(
             call["result"]["isError"],
             json!(cfg!(not(target_os = "linux"))),

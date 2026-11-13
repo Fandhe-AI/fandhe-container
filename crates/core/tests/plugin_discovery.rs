@@ -269,6 +269,9 @@ fn plug11_path_search_opt_in_warns_once_per_candidate() {
             assert!(l.contains("not registered"));
             let v: serde_json::Value = serde_json::from_str(l).unwrap();
             assert_eq!(v["level"], "warn");
+            assert_eq!(v["event"], "plugin_path_candidate");
+            assert!(v.get("truncated").is_none());
+            assert!(l.starts_with("{\"level\":\"warn\",\"event\":\"plugin_path_candidate\","));
             v["name"].as_str().unwrap().to_owned()
         })
         .collect();
@@ -590,4 +593,6 @@ fn err1_plug11_path_warning_replaces_display_unsafe_chars_in_path() {
     assert_eq!(path, expected);
     assert_eq!(v["name"], "cri");
     assert_eq!(v["level"], "warn");
+    assert_eq!(v["event"], "plugin_path_candidate");
+    assert!(v.get("truncated").is_none());
 }

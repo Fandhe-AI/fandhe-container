@@ -73,7 +73,7 @@ use fandhe_container_supervisor::container_options::store as options_store;
 /// core の操作へ注入する依存の束（`start` は core を呼ばないため、状態ストアの存在確認と計測にだけ使う）。
 pub(super) struct Runtime {
     pub(super) store: Box<dyn StateStore>,
-    pub(super) recorder: OpRecorder,
+    pub(super) recorder: Arc<OpRecorder>,
     /// create の `mounts[].destination` 拒否の記録先（本番は状態ルートの `@audit.log`。SEC-4・OCI-4・#2480）。
     /// start / stop / delete は使わない。
     pub(super) audit: Box<dyn AuditSink>,
@@ -269,7 +269,7 @@ pub(super) fn production_runtime<R>(
                 // 同じ状態ルートの `@audit.log` へ記録する（open 済みの store から作り、二度は開かない）。
                 audit: Box::new(FileAuditSink::in_state_store(&store)),
                 store: Box::new(store),
-                recorder,
+                recorder: Arc::new(recorder),
             },
             req,
         )),
@@ -1898,7 +1898,7 @@ mod tests {
             Runtime {
                 audit: Box::new(FileAuditSink::in_state_store(&store)),
                 store: Box::new(store),
-                recorder: OpRecorder::new(),
+                recorder: Arc::new(OpRecorder::new()),
             }
         }
 

@@ -143,6 +143,8 @@ cat >>"$stub" <<'STUB'
 #   create-fail-plain: create が何も作らず失敗し、不存在エラーが自由文だけ（runc 相当）
 #   create-fail-nf-plus-text / -nf-plus-badjson / -nf-plus-nonstring: create 未作成で失敗し、
 #     以後の state が NOT_FOUND に加えて自由文・不正な JSON・code が文字列でない行を返す
+#   create-fail-nf-warn / -nf-otherevent: create 未作成で失敗し、以後の state が level が warn の
+#     cli_error・未知の event の NOT_FOUND を返す（不存在の確定に使わない。#3120）
 #   create-fail-nf-badmsg: create 未作成で失敗し、以後の state が message が文字列でない
 #     NOT_FOUND を返す
 #   start-fail / start-hang / start-flood: start が失敗 / ハング / 無限の大量出力
@@ -174,14 +176,14 @@ mode="${STUB_MODE:-ok}"
 # CLI のグローバル --root（サブコマンドの前）。絶対パスのディレクトリで、所有者が自分・権限 0700
 # でなければ INVALID_ARGUMENT（終了コード 2）にする（本物の CLI の検査に合わせた回帰検出）。
 if [ "${1:-}" != --root ] || [ "$#" -lt 2 ]; then
-  echo '{"code":"INVALID_ARGUMENT","message":"invalid argument"}' >&2
+  echo '{"level":"error","event":"cli_error","code":"INVALID_ARGUMENT","message":"invalid argument"}' >&2
   exit 2
 fi
 root="$2"
 shift 2
-case "$root" in /*) ;; *) echo '{"code":"INVALID_ARGUMENT","message":"invalid argument"}' >&2; exit 2 ;; esac
+case "$root" in /*) ;; *) echo '{"level":"error","event":"cli_error","code":"INVALID_ARGUMENT","message":"invalid argument"}' >&2; exit 2 ;; esac
 if [ ! -d "$root" ] || [ "$(stat -c %a "$root")" != 700 ] || [ ! -O "$root" ]; then
-  echo '{"code":"INVALID_ARGUMENT","message":"invalid argument"}' >&2
+  echo '{"level":"error","event":"cli_error","code":"INVALID_ARGUMENT","message":"invalid argument"}' >&2
   exit 2
 fi
 echo "$root" >>"$STUB_ROOTS_LOG"
@@ -226,7 +228,7 @@ not_exist() {
   else
     # state は message "container not found"（ERR-1 の 2 フィールド）、他は op 付きの 3 フィールド。
     if [ "$cmd" = state ]; then
-      echo '{"code":"NOT_FOUND","message":"container not found"}' >&2
+      echo '{"level":"error","event":"cli_error","code":"NOT_FOUND","message":"container not found"}' >&2
     else
       printf '{"op":"%s","code":"NOT_FOUND","message":"container state not found"}\n' "$cmd" >&2
     fi
@@ -239,7 +241,7 @@ if [ "$mode" = foreign-perm ] || [ "$mode" = foreign-late ] || [ "$mode" = forei
       if [ "$mode" != foreign-perm ] && [ -e "$m.probed" ]; then state_json created; exit 0; fi
       touch "$m.probed"
       if [ "$mode" = foreign-race ]; then
-        printf '{"code":"NOT_FOUND","message":"container not found"}\n' >&2
+        printf '{"level":"error","event":"cli_error","code":"NOT_FOUND","message":"container not found"}\n' >&2
       else
         echo "stub: open state.json: permission denied" >&2
       fi
@@ -289,16 +291,18 @@ case "$cmd" in
     if [ "$mode" = id-in-use ]; then state_json created; exit 0; fi
     if [ -e "$m.attempted" ] && [ ! -e "$m.created" ]; then
       [ "$mode" = create-fail-slow-state ] && sleep 1.0
-      [ "$mode" = create-fail-root-parent ] && { echo '{"code":"NOT_FOUND","message":"parent of the state root not found"}' >&2; exit 3; }
-      [ "$mode" = create-fail-state-error ] && { echo '{"code":"PERMISSION_DENIED","message":"open state.json: permission denied"}' >&2; exit 1; }
+      [ "$mode" = create-fail-root-parent ] && { echo '{"level":"error","event":"cli_error","code":"NOT_FOUND","message":"parent of the state root not found"}' >&2; exit 3; }
+      [ "$mode" = create-fail-state-error ] && { echo '{"level":"error","event":"cli_error","code":"PERMISSION_DENIED","message":"open state.json: permission denied"}' >&2; exit 1; }
       case "$mode" in
-        create-fail-nf-plus-text) printf '{"code":"NOT_FOUND","message":"x"}\nstub: permission denied\n' >&2; exit 1 ;;
-        create-fail-nf-plus-badjson) printf '{"code":"NOT_FOUND","message":"x"}\n{"code":"PERMISSION_DENIED",\n' >&2; exit 1 ;;
-        create-fail-nf-plus-nonstring) printf '{"code":"NOT_FOUND","message":"x"}\n{"code":13,"message":"y"}\n' >&2; exit 1 ;;
-        create-fail-nf-badmsg) printf '{"code":"NOT_FOUND","message":5}\n' >&2; exit 1 ;;
+        create-fail-nf-plus-text) printf '{"level":"error","event":"cli_error","code":"NOT_FOUND","message":"x"}\nstub: permission denied\n' >&2; exit 1 ;;
+        create-fail-nf-plus-badjson) printf '{"level":"error","event":"cli_error","code":"NOT_FOUND","message":"x"}\n{"level":"error","event":"cli_error","code":"PERMISSION_DENIED",\n' >&2; exit 1 ;;
+        create-fail-nf-plus-nonstring) printf '{"level":"error","event":"cli_error","code":"NOT_FOUND","message":"x"}\n{"level":"error","event":"cli_error","code":13,"message":"y"}\n' >&2; exit 1 ;;
+        create-fail-nf-warn) printf '{"level":"warn","event":"cli_error","code":"NOT_FOUND","message":"x"}\n' >&2; exit 1 ;;
+        create-fail-nf-otherevent) printf '{"level":"error","event":"cli_warning","code":"NOT_FOUND","message":"x"}\n' >&2; exit 1 ;;
+        create-fail-nf-badmsg) printf '{"level":"error","event":"cli_error","code":"NOT_FOUND","message":5}\n' >&2; exit 1 ;;
       esac
       if [ "$mode" = create-fail-mixed-codes ]; then
-        printf '{"code":"NOT_FOUND","message":"x"}\n{"code":"PERMISSION_DENIED","message":"y"}\n' >&2
+        printf '{"level":"error","event":"cli_error","code":"NOT_FOUND","message":"x"}\n{"level":"error","event":"cli_error","code":"PERMISSION_DENIED","message":"y"}\n' >&2
         exit 1
       fi
       [ "$mode" = create-fail-notfound-text ] && { echo "stub: permission denied (state file not found in cache)" >&2; exit 1; }
@@ -335,7 +339,7 @@ case "$cmd" in
     [ -e "$m.created" ] || not_exist
     [ "$mode" = cleanup-hang ] && exec sleep 30
     if [ "$mode" = kill-not-running ]; then
-      echo '{"op":"kill","code":"FAILED_PRECONDITION","message":"container is not running"}' >&2
+      echo '{"level":"error","event":"oci_runtime_error","op":"kill","code":"FAILED_PRECONDITION","message":"container is not running"}' >&2
       exit 5
     fi
     touch "$m.killed"
@@ -353,18 +357,18 @@ case "$cmd" in
         n=$(($(cat "$m.delete-n" 2>/dev/null || echo 0) + 1))
         echo "$n" >"$m.delete-n"
         if [ "$n" -le 2 ]; then
-          echo '{"op":"delete","code":"FAILED_PRECONDITION","message":"container is not running"}' >&2
+          echo '{"level":"error","event":"oci_runtime_error","op":"delete","code":"FAILED_PRECONDITION","message":"container is not running"}' >&2
           exit 5
         fi
         ;;
       delete-fail | holder-long | create-fail-delete-fail) echo "stub: delete failed" >&2; exit 1 ;;
-      never-stops) [ -e "$m.started" ] && { printf '{"op":"delete","code":"FAILED_PRECONDITION","message":"container is still running"}\n' >&2; exit 5; } ;;
+      never-stops) [ -e "$m.started" ] && { printf '{"level":"error","event":"oci_runtime_error","op":"delete","code":"FAILED_PRECONDITION","message":"container is still running"}\n' >&2; exit 5; } ;;
       running-race)
         if [ -e "$m.started" ]; then
-          [ -e "$m.killed" ] || { printf '{"op":"delete","code":"FAILED_PRECONDITION","message":"container is still running"}\n' >&2; exit 5; }
+          [ -e "$m.killed" ] || { printf '{"level":"error","event":"oci_runtime_error","op":"delete","code":"FAILED_PRECONDITION","message":"container is still running"}\n' >&2; exit 5; }
           n=$(($(cat "$m.delete-after-kill" 2>/dev/null || echo 0) + 1))
           echo "$n" >"$m.delete-after-kill"
-          [ "$n" -le 2 ] && { printf '{"op":"delete","code":"FAILED_PRECONDITION","message":"container is still running"}\n' >&2; exit 5; }
+          [ "$n" -le 2 ] && { printf '{"level":"error","event":"oci_runtime_error","op":"delete","code":"FAILED_PRECONDITION","message":"container is still running"}\n' >&2; exit 5; }
         fi
         ;;
     esac
@@ -722,7 +726,7 @@ STUB_MODE=create-fail-mixed-codes expect_rc "create-fail-mixed-codes" 4 --runtim
 if grep -qE '^(delete|kill) ' "$stub_log"; then fail "create-fail-mixed-codes-untouched"; else pass "create-fail-mixed-codes-untouched"; fi
 # NOT_FOUND に自由文・不正な JSON・code が文字列でない行が混ざる応答や、message が文字列で
 # ない NOT_FOUND も判定不能として exit 4（Codex P1: 解析できない行を捨てて不存在と判定しない）。
-for m in nf-plus-text nf-plus-badjson nf-plus-nonstring nf-badmsg; do
+for m in nf-plus-text nf-plus-badjson nf-plus-nonstring nf-badmsg nf-warn nf-otherevent; do
   reset_log
   STUB_MODE="create-fail-$m" expect_rc "create-fail-$m" 4 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0
   if grep -qE '^(delete|kill) ' "$stub_log"; then fail "create-fail-$m-untouched"; else pass "create-fail-$m-untouched"; fi

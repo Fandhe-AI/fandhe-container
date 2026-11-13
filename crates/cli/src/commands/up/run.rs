@@ -68,8 +68,36 @@ fn display_name(s: &str) -> String {
     sanitize_display(&s[..end])
 }
 
-/// `--file` を読んで解析する（FIFO・デバイスで止まらない。上限は stack の入口が持つ）。
+/// `--file` の開く・読む・解析に許す時間（応答しない FUSE・ネットワーク FS で main が止まらないための上限。REPAIR-5）。
+const PROJECT_FILE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `--file` を期限つきの作業スレッドで読んで解析する（REPAIR-5・STACK-8）。
+///
+/// O_NONBLOCK は通常ファイルの読み取り時間を制限しないため、開く・読む処理ごと作業スレッドへ移し、
+/// 期限切れは `TIMEOUT`、同時実行枠の満杯は `RESOURCE_EXHAUSTED` で返す（`env_file` の読み取りと同じ分類）。
 fn read_project_file(file: &Path) -> Result<fandhe_container_stack::schema::ComposeToml, CliExit> {
+    use fandhe_container_supervisor::supervisor_log::{BoundedFailure, run_bounded_waiting};
+    let file = file.to_path_buf();
+    match run_bounded_waiting(
+        move || read_project_file_blocking(&file),
+        PROJECT_FILE_READ_TIMEOUT,
+    ) {
+        Ok(result) => result,
+        Err(BoundedFailure::Busy) => Err(err(
+            ErrorCode::ResourceExhausted,
+            "project file workers are busy",
+        )),
+        Err(BoundedFailure::Unfinished) => Err(err(
+            ErrorCode::Timeout,
+            "reading the project file did not finish within the deadline",
+        )),
+    }
+}
+
+/// [`read_project_file`] の本体（FIFO・デバイスで止まらない。上限は stack の入口が持つ）。ブロックし得るため作業スレッドで呼ぶ。
+fn read_project_file_blocking(
+    file: &Path,
+) -> Result<fandhe_container_stack::schema::ComposeToml, CliExit> {
     let f = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(O_NONBLOCK)

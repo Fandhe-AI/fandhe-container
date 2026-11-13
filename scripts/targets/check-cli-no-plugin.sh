@@ -62,7 +62,7 @@ release_lock() {
   fi
 }
 trap 'release_lock; run_limited_abort; rm -rf "${work}"' EXIT
-usage_json='{"code":"INVALID_ARGUMENT","message":"usage: fandhe-container <create|start|stop|kill|delete|list|logs|exec|inspect|state|image|system|network|up|setup|doctor>"}'
+usage_json='{"level":"error","event":"cli_error","code":"INVALID_ARGUMENT","message":"usage: fandhe-container <create|start|stop|kill|delete|list|logs|exec|inspect|state|image|system|network|up|setup|doctor>"}'
 
 # 1 回起動して終了コード・stdout・stderr を照合する。引数: 名前 期待コード 期待 stderr 引数...
 expect_run() {
@@ -92,7 +92,7 @@ expect_run usage-sigchld-ignored 2 "${usage_json}" \
 # 状態ストアは Linux の open_store の契約（親不在は NOT_FOUND・終了コード 3）。非 Linux は別バックエンドの
 # 構造化エラーになるため、ここでは Linux に限る（CLI-1）。
 if [[ "${os_name}" == "Linux" ]]; then
-  expect_run missing-root 3 '{"code":"NOT_FOUND","message":"parent of the state root not found"}' \
+  expect_run missing-root 3 '{"level":"error","event":"cli_error","code":"NOT_FOUND","message":"parent of the state root not found"}' \
     "${bin}" --root "${work}/absent/root" logs --follow abc
   echo "OK: the plugin-disabled CLI binary reports structured errors with exit codes 2 and 3 (also under an inherited SIGCHLD ignore)"
   command -v flock >/dev/null 2>&1 || {
@@ -125,7 +125,7 @@ if [[ "${os_name}" == "Linux" ]]; then
   # 塞いだままの list は有限時間（CLI 内部の期限）で構造化エラー TIMEOUT・終了コード 7 になる。
   rc=0
   run_limited 30 "${bin}" --root "${lock_root}" list >/dev/null 2>"${work}/err" </dev/null || rc=$?
-  if [[ "${rc}" != 7 || "$(cat "${work}/err")" != '{"code":"TIMEOUT","message":"operation timed out"}' ]]; then
+  if [[ "${rc}" != 7 || "$(cat "${work}/err")" != '{"level":"error","event":"cli_error","code":"TIMEOUT","message":"operation timed out"}' ]]; then
     echo "NG: lock-contention: exit code ${rc}, stderr: $(cat "${work}/err")" >&2
     exit 1
   fi

@@ -480,6 +480,9 @@ pub(super) fn run_up(global: &GlobalArgs, args: &UpArgs, stdout: &mut dyn Write)
                     "container state read did not finish within the deadline",
                 );
             }
+            Err(f) if f.busy => {
+                return err(ErrorCode::ResourceExhausted, "state read workers are busy");
+            }
             Err(_) => return err(ErrorCode::Internal, "container state could not be read"),
         }
         prepared.insert(name.clone(), p);
@@ -525,6 +528,9 @@ pub(super) fn run_up(global: &GlobalArgs, args: &UpArgs, stdout: &mut dyn Write)
                     ErrorCode::Timeout,
                     "container state read did not finish within the deadline",
                 );
+            }
+            Err(f) if f.busy => {
+                return err(ErrorCode::ResourceExhausted, "state read workers are busy");
             }
             Err(_) => return err(ErrorCode::Internal, "container state could not be read"),
         }

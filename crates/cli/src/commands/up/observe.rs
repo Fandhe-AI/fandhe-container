@@ -64,10 +64,26 @@ const STATE_READ_TIMEOUT: Duration = Duration::from_secs(15);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ReadFailure {
     pub(super) timed_out: bool,
+    /// 作業スレッドの枠が満杯（`RESOURCE_EXHAUSTED`）。
+    pub(super) busy: bool,
 }
 
 impl ReadFailure {
-    const OTHER: Self = Self { timed_out: false };
+    const OTHER: Self = Self {
+        timed_out: false,
+        busy: false,
+    };
+
+    /// 観測エラーの `code` 文字列。
+    fn code(self) -> &'static str {
+        if self.timed_out {
+            "TIMEOUT"
+        } else if self.busy {
+            "RESOURCE_EXHAUSTED"
+        } else {
+            "UNAVAILABLE"
+        }
+    }
 }
 
 /// `id` の記録を読み、状態と health を観測値へ写す。記録が無ければ `Absent`・health なし。
@@ -85,6 +101,7 @@ pub(super) fn read_status<S: StateStore + Send + Sync + 'static>(
     })
     .map_err(|e| ReadFailure {
         timed_out: e.code() == ErrorCode::Timeout,
+        busy: e.code() == ErrorCode::ResourceExhausted,
     })?;
     match got {
         Ok(record) => {
@@ -147,16 +164,7 @@ impl<S: StateStore + Send + Sync + 'static> DependencyObserver for StateObserver
     fn observe(&mut self, service: &str) -> Result<DependencyObservation, ObserveError> {
         observe_ledgered(&self.store, &self.ledger, service)
             .map(|o| o.state)
-            .map_err(|e| {
-                ObserveError::new(
-                    if e.timed_out {
-                        "TIMEOUT"
-                    } else {
-                        "UNAVAILABLE"
-                    },
-                    "container state could not be read",
-                )
-            })
+            .map_err(|e| ObserveError::new(e.code(), "container state could not be read"))
     }
 }
 
@@ -176,16 +184,7 @@ impl<S: StateStore + Send + Sync + 'static> HealthSource for StateHealth<S> {
     fn observe(&mut self, service: &str) -> Result<Option<ObservedHealth>, HealthSourceError> {
         observe_ledgered(&self.store, &self.ledger, service)
             .map(|o| o.health)
-            .map_err(|e| {
-                HealthSourceError::new(
-                    if e.timed_out {
-                        "TIMEOUT"
-                    } else {
-                        "UNAVAILABLE"
-                    },
-                    "container state could not be read",
-                )
-            })
+            .map_err(|e| HealthSourceError::new(e.code(), "container state could not be read"))
     }
 }
 

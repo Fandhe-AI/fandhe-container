@@ -107,14 +107,25 @@ pub(super) struct ProjectLock {
     file: Option<std::fs::File>,
 }
 
-/// 期限切れで置き去りにした作業スレッドがある（[`bounded_io`]）。真の間は [`ProjectLock`] を解放せず、プロセス終了まで
-/// 排他を保つ（残った作業が次回の `up` の bundle と競合しない。STACK-8・REPAIR-5）。
-static ABANDONED_WORK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 期限切れで置き去りにした作業の完了フラグ（[`bounded_io`]）。未完了の作業が残る間は [`ProjectLock`] を解放せず、
+/// プロセス終了まで排他を保つ（残った作業が次回の `up` の bundle と競合しない。STACK-8・REPAIR-5）。作業が終わった
+/// 後は（フラグが立つので）通常どおり解放する。
+static ABANDONED_WORK: std::sync::Mutex<Vec<std::sync::Arc<std::sync::atomic::AtomicBool>>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// 置き去りにした作業がまだ動いているか。
+fn abandoned_work_running() -> bool {
+    let Ok(mut v) = ABANDONED_WORK.lock() else {
+        return true;
+    };
+    v.retain(|done| !done.load(std::sync::atomic::Ordering::SeqCst));
+    !v.is_empty()
+}
 
 impl Drop for ProjectLock {
     fn drop(&mut self) {
         if let Some(f) = self.file.take()
-            && ABANDONED_WORK.load(std::sync::atomic::Ordering::SeqCst)
+            && abandoned_work_running()
         {
             // fd を閉じない（flock を保つ）。CLI の終了で OS が解放する。
             std::mem::forget(f);
@@ -131,14 +142,24 @@ pub(super) fn bounded_io<T: Send + 'static>(
     f: impl FnOnce() -> Result<T, CliError> + Send + 'static,
 ) -> Result<T, CliError> {
     use fandhe_container_supervisor::supervisor_log::{BoundedFailure, run_bounded_waiting};
-    match run_bounded_waiting(f, timeout) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let done = std::sync::Arc::new(AtomicBool::new(false));
+    let done_in = std::sync::Arc::clone(&done);
+    let job = move || {
+        let r = f();
+        done_in.store(true, Ordering::SeqCst);
+        r
+    };
+    match run_bounded_waiting(job, timeout) {
         Ok(r) => r,
         Err(BoundedFailure::Busy) => Err(CliError::new(
             ErrorCode::ResourceExhausted,
             "bundle workers are busy",
         )),
         Err(BoundedFailure::Unfinished) => {
-            ABANDONED_WORK.store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Ok(mut v) = ABANDONED_WORK.lock() {
+                v.push(done);
+            }
             Err(CliError::new(
                 ErrorCode::Timeout,
                 "a state root operation did not finish within the deadline",
@@ -282,6 +303,10 @@ mod tests {
         })
         .expect_err("timeout");
         assert_eq!(e.code(), ErrorCode::Timeout);
+        // 置き去りの作業が動いている間だけロックを保持し、終われば通常どおり解放する。
+        assert!(abandoned_work_running());
+        std::thread::sleep(std::time::Duration::from_millis(2500));
+        assert!(!abandoned_work_running());
         let e = bounded_io(d, || -> Result<(), CliError> {
             Err(CliError::new(ErrorCode::NotFound, "x"))
         })

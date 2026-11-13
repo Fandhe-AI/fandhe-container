@@ -38,7 +38,7 @@ fandhe-container/
 ├── crates/                        # crate 名前空間は fandhe-container-*（Cargo.toml・src/lib.rs は TASK-1.3 雛形。本体は各 TASK）
 │   ├── io/                        #   I/O 共有層（バッチ write-back・フラッシュバリア・FS 正規化）
 │   ├── core/                      #   実行層（namespace・cgroups v2・seccomp/Landlock・rootless。testdata/ は net・gpu の試験も読む共有 fixture。tests/support/ の reap.rs〔期限つき回収の正本〕・scratch_root.rs・flock_release_cases.rs・flock_release_with_cases.rs〔flock_release の複製 6 か所の一致の照合。#4566〕等は他 crate の試験も `#[path]` で共有する。#3410）
-│   ├── supervisor/                #   コンテナごとの軽量監視プロセス（bin: fandhe-container-supervisor・特権ランチャー fandhe-container-launcher〔TASK-171 追補・#1719〕）
+│   ├── supervisor/                #   コンテナごとの軽量監視プロセス（bin: fandhe-container-supervisor・特権ランチャー fandhe-container-launcher〔TASK-171 追補・#1719〕・macOS の VM 保持役 fandhe-container-vm-keeper〔feature `vm-keeper`・既定は無効・骨格のみ。#2278・MAC-4〕）
 │   ├── guest-init/                #   macOS ゲスト VM の initrd に入れる Rust 製 PID 1（bin: fandhe-container-guest-init。静的リンクの aarch64-unknown-linux-musl。TASK-64 追補・#1875・MAC-1）
 │   ├── oci/ / cri/                #   OCI イメージ・ライフサイクル / CRI（shim v2 の起動バイナリ containerd-shim-fandhe-container-v2 は本番の ContainerRuntime を持つ plugin-cri の bin。cri は引数解析・start / delete / serve の手順・ttrpc サーバーを提供。#872・#3684・CRI-5）
 │   │   └── cri/proto/             #     cri-api の .proto（kubernetes/cri-api v0.37.1 無改変）と出典 README（TASK-56.2・CRI-3）

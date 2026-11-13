@@ -45,6 +45,7 @@
 //! | #4075 | TASK-63.3 | 制御チャネルの kind 9 `AttachRequest` と fd 応答（[`control`]。入力の fd と出力の tap の端を最大 3 本 `SCM_RIGHTS` で返し、`stdin_once` は所有を移す。クライアント入口 `AttachIoSource` / `ControlAttach`。plugin-cri の結線は #4077。SUP-4・REPAIR-2・SEC-1） |
 //! | #1543 | TASK-79 追補 | `logs` でコンテナログの内容を読み出す（[`logs::reader`]。ディレクトリは `<root>/@container-logs`。CLI-1・SUP-7） |
 //! | #2067 | TASK-79 追補 | supervisor の構造化ログ（stderr）の保存先（[`supervisor_log`]。`<root>/@supervisor-logs/<id>.log*`。REPAIR-4） |
+//! | #2278 | TASK-191 | macOS の VM 保持役の骨格（`vm_keeper`。feature `vm-keeper`・unix のみ。flock のロック・peer 照合つき UDS・参照数・猶予後の終了。VM の起動・停止は未配線〔W4 #4684・#2281〕。MAC-4・CORE-1・PLUG-12・REPAIR-3） |
 //! | #2446 | TASK-164 追補 | CLI の `delete` と plugin-cri の `RemoveContainer`（#2593・CRI-2）でコンテナログ（`<root>/@container-logs/<id>.log*`）を消す入口（[`logs::remove_container_logs`]・期限つきは [`logs::remove_container_logs_bounded`]。SUP-7・CLI-1） |
 //! | #2133 | CORE-3・CORE-4 | systemd user マネージャへの到達検査（`user_scope`。Linux のみ。CLI の start・doctor とベンチが共有） |
 //! | #2243 | TASK-157 追補 | rootless の ID 写像モデルの選択（`RootlessSingleId` か範囲写像 `RootlessSubordinateIds` か。条件と所有者名の取得は `id_model`、結線は `ProductionStartDeps`）。CORE-6・SEC-5。実機での確認は #1621 |
@@ -115,6 +116,8 @@ mod thread_settle;
 pub mod user_db;
 #[cfg(target_os = "linux")]
 pub mod user_scope;
+#[cfg(all(unix, feature = "vm-keeper"))]
+pub mod vm_keeper;
 
 // 単体試験の一時領域の親を tmpfiles の flock 走査から守る共有部品（#3141・CORE-5・REPAIR-12）。
 // 利用者が Linux 限定のため Linux の試験ビルドだけで取り込む。試験専用で製品・rlib に影響しない。

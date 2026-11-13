@@ -1875,11 +1875,35 @@ mod tests {
         );
     }
 
+    /// 呼び出しの `stuck_from` 回目（1 始まり）からだけ期限まで眠る記録先。それより前は待たずに `Timeout` を返す。
+    /// 全体期限での打ち切りを、`thread::sleep` の精度（macOS の runner では数十 ms 以上延びる）に頼らずに再現する。
+    struct StuckFrom {
+        stuck_from: usize,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl AuditSink for StuckFrom {
+        fn record(&self, _record: &AuditRecord) -> Result<(), TraitError> {
+            Err(TraitError::new(ErrorCode::Internal, "must not be called"))
+        }
+        fn record_until(&self, _record: &AuditRecord, deadline: Instant) -> Result<(), TraitError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call >= self.stuck_from {
+                std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+            }
+            Err(TraitError::new(ErrorCode::Timeout, "stuck"))
+        }
+    }
+
     /// REPAIR-5・SEC-4・#2632: exec の全体期限が直列の待ちの上限。期限に達したら `DeadlineReached` で戻り、残りは応答しない
     /// （本番では listener を閉じてカーネルが `ENOSYS` で解く。実カーネルの照合は `exec_seccomp_listener`）。
+    ///
+    /// 1・2 件目の記録は待たずに失敗し、3 件目の記録だけが詰まる。応答期限（上限の 5 秒）より先に全体期限（300ms）が来るため、
+    /// 3 件目の待ちは全体期限で打ち切られて応答し、4 件目以降は処理しない。k 件目が `k × 応答期限` で応答することは
+    /// 直前の試験が照合する。
     #[test]
     fn repair5_2632_overall_deadline_caps_the_serial_wait() {
-        let d = Duration::from_millis(400);
+        let d = Duration::from_secs(5);
         let config = NotifyConfig::default().with_response_deadline(d).unwrap();
         let fake = many_notifications(10);
         let times: Arc<Mutex<Vec<Instant>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1887,12 +1911,14 @@ mod tests {
             inner: fake,
             times: Arc::clone(&times),
         };
+        let sink = StuckFrom {
+            stuck_from: 3,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
         let id = ContainerId::new("web-1").unwrap();
         let started = Instant::now();
-        // 3 件目の開始（2d = 800ms）から全体期限までの余裕を 200ms 取る。macOS の runner では応答の
-        // 待ちが数十 ms 以上延び、余裕 50ms（d = 100ms・期限 250ms）では 3 件目の開始前に期限を過ぎた。
-        let overall = started + Duration::from_millis(1000);
-        let report = ExecResponder::new(&StuckUntilDeadline, Some(&id), config).serve_with(
+        let overall = started + Duration::from_millis(300);
+        let report = ExecResponder::new(&sink, Some(&id), config).serve_with(
             &wrapped,
             &Some,
             overall,
@@ -1900,11 +1926,16 @@ mod tests {
         );
         let took = started.elapsed();
         assert_eq!(report.end, ServeEnd::DeadlineReached);
-        // 1・2 件目は 400ms・800ms で応答し、3 件目は 1000ms の全体期限で打ち切って応答する。4 件目以降は処理しない。
-        assert_eq!(times.lock().unwrap().len(), 3);
+        let times = times.lock().unwrap();
+        assert_eq!(times.len(), 3);
         assert_eq!(report.counts.unrecorded, 3);
-        assert!(took >= Duration::from_millis(1000), "{took:?}");
-        assert!(took < Duration::from_millis(2000), "{took:?}");
+        assert_eq!(sink.calls.load(Ordering::SeqCst), 3);
+        // 3 件目の応答は全体期限の後で、応答期限（5 秒）よりずっと前。
+        let third = times[2].duration_since(started);
+        assert!(third >= Duration::from_millis(300), "{third:?}");
+        assert!(third < Duration::from_millis(2300), "{third:?}");
+        assert!(took >= Duration::from_millis(300), "{took:?}");
+        assert!(took < Duration::from_millis(2300), "{took:?}");
     }
 
     /// cookie が無効なら記録も応答もしない（`target_gone` は 1）。

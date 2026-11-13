@@ -37,9 +37,11 @@ use fandhe_container_stack::toml_input::read_compose_toml;
 use super::super::CliExit;
 use super::super::args::{CreateNetworkArgs, GlobalArgs, PastaSource, UpArgs};
 use super::super::create_network::{check_network_options, resolve_publish_privilege};
+use super::super::create_pasta::{decide as decide_pasta, detect_install};
 use super::super::create_start::open_store;
 use super::super::image::open_image_store_for_lifecycle;
 use super::super::list_logs::store_open_failure;
+use super::bundle::ProjectLock;
 use super::error_code_for_exit;
 use super::launcher::{LauncherConfig, ProductionServiceLauncher};
 use super::observe::{Ledger, SharedLedger, StateHealth, StateObserver, read_status};
@@ -49,6 +51,8 @@ use crate::error::CliError;
 
 /// `O_NONBLOCK`（Linux の x86_64 / aarch64 とも 0o4000）。FIFO を開いて止まらないために使う。
 const O_NONBLOCK: i32 = 0o4000;
+/// 成功出力の書き込みを待つ上限（`main.rs` の `DEFERRED_REPORT_TIMEOUT` と同じ値。REPAIR-5）。
+const STDOUT_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 /// 失敗時に `info:` の行へ出す起動済みサービス名の最大件数。
 const MAX_INFO_NAMES: usize = 8;
 
@@ -58,6 +62,32 @@ fn err(code: ErrorCode, msg: impl AsRef<str>) -> CliExit {
 
 fn from_trait(e: &TraitError) -> CliExit {
     err(e.code(), e.message())
+}
+
+/// 成功出力を別スレッドで process の stdout へ書き、`timeout` までだけ待つ（REPAIR-5・#4734）。
+///
+/// `commands::run` は main スレッドで動くため、読み進められない pipe / socket への `write_all` は無期限に止まり得る。
+/// 出力サイズの上限では書き込み待ちを制限できないので、書き込みを作業スレッドへ出す。期限切れのスレッドは置き去りにする
+/// （main の return でプロセスごと破棄される）。起動失敗・書き込み失敗は `INTERNAL`、期限切れは `TIMEOUT`。
+fn write_stdout_bounded(bytes: Vec<u8>, timeout: std::time::Duration) -> Result<(), ErrorCode> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("up-stdout".to_owned())
+        .spawn(move || {
+            let mut out = std::io::stdout().lock();
+            let r = out.write_all(&bytes).and_then(|()| out.flush());
+            let _ = tx.send(r.is_ok());
+        });
+    if spawned.is_err() {
+        return Err(ErrorCode::Internal);
+    }
+    match rx.recv_timeout(timeout) {
+        Ok(true) => Ok(()),
+        Ok(false) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(ErrorCode::Internal)
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(ErrorCode::Timeout),
+    }
 }
 
 /// 無害化して長さを制限した表示用の名前。
@@ -249,7 +279,8 @@ fn child_globals(global: &GlobalArgs) -> Vec<OsString> {
     v
 }
 
-pub(super) fn run_up(global: &GlobalArgs, args: &UpArgs, stdout: &mut dyn Write) -> CliExit {
+/// `up` の本体。成功出力は注入された書き込み先ではなく process の stdout へ期限つきで書く（[`write_stdout_bounded`]）。
+pub(super) fn run_up(global: &GlobalArgs, args: &UpArgs, _stdout: &mut dyn Write) -> CliExit {
     // 1. 入力。
     let file: PathBuf = match std::path::absolute(&args.file) {
         Ok(p) => p,
@@ -284,6 +315,18 @@ pub(super) fn run_up(global: &GlobalArgs, args: &UpArgs, stdout: &mut dyn Write)
         );
     }
 
+    // pasta の未設定（ユーザー定義ネットワークがあるのに pasta のフラグが無い等）は、子の `create` と同じ判定
+    // （`create_pasta::decide`）で、ネットワーク作成・サービス起動の前に拒否する（STACK-8・NET-9・#4734）。
+    if services.values().any(|s| !s.networks.is_empty()) {
+        let install = match detect_install() {
+            Ok(i) => i,
+            Err(e) => return from_trait(&e),
+        };
+        if let Err(e) = decide_pasta(global.pasta.as_ref(), true, install) {
+            return from_trait(&e);
+        }
+    }
+
     // 3. ストアを開き、全サービスを事前検査する。
     let store = match open_store(global) {
         Ok(s) => s,
@@ -295,6 +338,12 @@ pub(super) fn run_up(global: &GlobalArgs, args: &UpArgs, stdout: &mut dyn Write)
     };
     let Some(state_root) = store.host_state_root().map(Path::to_path_buf) else {
         return err(ErrorCode::Internal, "state root is unavailable");
+    };
+    // 同じプロジェクトの並行する `up` を排他する。事前検査から create / start の完了（この関数の終わり）まで保持する
+    // （共有 bundle の更新と利用の競合を防ぐ。STACK-8・SEC-1・#4734）。
+    let _project_lock = match ProjectLock::acquire(&state_root, project.as_str()) {
+        Ok(l) => l,
+        Err(e) => return CliExit::Error(e),
     };
     // env_files は symlink を辿らず読むため、起点は実体のパスにする（名前の決定には使わない）。
     let read_dir = match std::fs::canonicalize(&project_dir) {
@@ -386,13 +435,10 @@ pub(super) fn run_up(global: &GlobalArgs, args: &UpArgs, stdout: &mut dyn Write)
         &UpPolicy::default(),
     ) {
         Ok(report) => {
-            if stdout
-                .write_all(render_success(&report).as_bytes())
-                .is_err()
-            {
-                return CliExit::failed(ErrorCode::Internal);
+            match write_stdout_bounded(render_success(&report).into_bytes(), STDOUT_WRITE_TIMEOUT) {
+                Ok(()) => CliExit::Success,
+                Err(code) => CliExit::failed(code),
             }
-            CliExit::Success
         }
         Err(f) => failure_exit(&f),
     }

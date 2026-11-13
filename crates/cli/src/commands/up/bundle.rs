@@ -96,6 +96,52 @@ fn write_private(dir: &ExtractRoot, name: &str, body: &[u8]) -> Result<(), CliEr
         .map_err(|_| CliError::new(ErrorCode::Internal, "failed to write the service bundle"))
 }
 
+/// プロジェクト単位の `up` の排他ロック（事前検査から create / start の完了まで保持する。STACK-8・SEC-1・REPAIR-5・#4734）。
+///
+/// 同じプロジェクトを並行して `up` すると、両者が状態記録なしの事前検査を通り、同じ bundle の `config.json` と
+/// `env/` を削除・再作成し合える。`<状態ルート>/.stack/up-<project>.lock` への非ブロッキングの `flock` で、
+/// 後行を待たせずに `ABORTED` 相当の `FAILED_PRECONDITION` で拒否する（待ちが無いため期限は不要）。
+/// drop（プロセス終了を含む）で解放される。
+#[derive(Debug)]
+pub(super) struct ProjectLock {
+    _file: std::fs::File,
+}
+
+impl ProjectLock {
+    /// `state_root` 配下で `project` のロックを取る。他の `up` が保持していれば `FAILED_PRECONDITION`。
+    pub(super) fn acquire(state_root: &Path, project: &str) -> Result<Self, CliError> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let fail = || CliError::new(ErrorCode::Internal, "failed to lock the project");
+        let root = ExtractRoot::open_existing_dir(state_root).map_err(|e| oci_failure(&e))?;
+        root.ensure_child_dir(STACK_DIR, 0o700)
+            .map_err(|e| oci_failure(&e))?;
+        // 最後の要素が symlink なら辿らず拒否する（O_NOFOLLOW）。`.stack` は 0700 の状態ルート直下。
+        let path = state_root
+            .join(STACK_DIR)
+            .join(format!("up-{project}.lock"));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(0o400_000) // O_NOFOLLOW（Linux の x86_64 / aarch64 とも 0o400000）
+            .open(path)
+            .map_err(|_| fail())?;
+        if !file.metadata().map_err(|_| fail())?.is_file() {
+            return Err(fail());
+        }
+        match file.try_lock() {
+            Ok(()) => Ok(Self { _file: file }),
+            Err(std::fs::TryLockError::WouldBlock) => Err(CliError::new(
+                ErrorCode::FailedPrecondition,
+                "another up for the project is in progress",
+            )),
+            Err(_) => Err(fail()),
+        }
+    }
+}
+
 /// 合成した `config.json` を core の検証に通す（副作用なし）。`up` の事前検査が全サービスに対して呼び、
 /// 後続サービスの入力不正を先行サービスの起動後に初めて見つける事態を防ぐ（STACK-8・SEC-1・#4734）。
 /// 不合格は入力起因として `INVALID_ARGUMENT`（メッセージは固定文言で値を含めない）。

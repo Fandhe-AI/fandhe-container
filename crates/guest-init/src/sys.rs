@@ -1,6 +1,7 @@
 //! `mount(2)` の薄いラッパー（`unsafe` はこのモジュールに閉じる。#1823 の事前承認の範囲・MAC-1）。
 //!
-//! ゲスト init が `/proc`・`/sys`・`/dev` と virtiofs の mount に使う。公開するのは用途別の安全な関数
+//! ゲスト init が `/proc`・`/sys`・`/dev` と virtiofs の mount、および子の回収（`waitpid(-1)`。
+//! pid は -1 固定・flags は 0 か `WNOHANG` の 2 値だけ。MAC-4・#2269）に使う。公開するのは用途別の安全な関数
 //! （virtiofs・proc・sysfs・devtmpfs）だけで、任意の flags / data は型の上で渡せない（`MS_BIND`・
 //! `MS_MOVE`・`MS_REMOUNT` を呼び出し側が組めない。REPAIR-2）。`unsafe fn` は外へ出さない。`extern "C"` 宣言は自前（外部クレートを使わない）。`libc` との機械照合
 //! （#1318・#2076）は試験専用モジュール `libc_abi` が const 評価で行い、固定値テストも併用する。
@@ -75,6 +76,18 @@ const MKDIR_MODE: u32 = 0o755;
 const ENOSYS: i32 = 38;
 /// `EINVAL`（Linux 共通）。
 const EINVAL: i32 = 22;
+/// `ECHILD`（Linux 共通。回収できる子がいない）。
+pub const ECHILD: i32 = 10;
+/// `EINTR`（Linux 共通。シグナルで中断された）。
+pub const EINTR: i32 = 4;
+/// `waitpid` の flags。待たずに戻る。
+const WNOHANG: i32 = 1;
+/// `prctl` の option（試験専用）。子孫の孤児の再親付け先を自分にする。
+#[cfg(test)]
+const PR_SET_CHILD_SUBREAPER: i32 = 36;
+/// `prctl` の option（試験専用）。subreaper の設定を読み戻す。
+#[cfg(test)]
+const PR_GET_CHILD_SUBREAPER: i32 = 37;
 
 unsafe extern "C" {
     // SAFETY（宣言そのものの妥当性）: `int mount(const char *source, const char *target,
@@ -95,6 +108,15 @@ unsafe extern "C" {
     // SAFETY（宣言そのものの妥当性）: `int mkdirat(int dirfd, const char *path, mode_t mode)`。
     // `mode_t` は Linux で u32。
     fn mkdirat(dirfd: i32, path: *const core::ffi::c_char, mode: u32) -> i32;
+
+    // SAFETY（宣言そのものの妥当性）: `pid_t waitpid(pid_t pid, int *wstatus, int options)`。
+    // `pid_t` は Linux で i32。
+    fn waitpid(pid: i32, wstatus: *mut i32, options: i32) -> i32;
+
+    // SAFETY（宣言そのものの妥当性）: `int prctl(int option, ...)`。試験専用で、本モジュールは
+    // `PR_SET_CHILD_SUBREAPER`・`PR_GET_CHILD_SUBREAPER` だけを、残りの引数を 4 つの u64 / ポインタで渡す。
+    #[cfg(test)]
+    fn prctl(option: i32, ...) -> i32;
 }
 
 fn cstring(bytes: &[u8]) -> io::Result<CString> {
@@ -156,6 +178,55 @@ pub fn mkdir_child(parent: BorrowedFd<'_>, name: &str) -> io::Result<()> {
         Ok(())
     } else {
         Err(io::Error::last_os_error())
+    }
+}
+
+/// 任意の子（pid -1）を 1 つ回収する（MAC-4・#2269）。PID 1 の回収ループ（`reap`）が `init` の
+/// `LinuxWaiter` 経由で呼ぶ。`nohang` が真なら `WNOHANG` で、回収できる子が今は無ければ `Ok(None)`。
+/// 成功は (pid, 生の wait status)。子がいなければ `ECHILD`、中断なら `EINTR` を `io::Error` で返す。
+/// pid と flags は型の上で固定され、特定の子の指定や `WUNTRACED` 等は渡せない（REPAIR-2）。
+pub fn wait_any_child(nohang: bool) -> io::Result<Option<(i32, i32)>> {
+    if !SUPPORTED {
+        return Err(io::Error::from_raw_os_error(ENOSYS));
+    }
+    let flags = if nohang { WNOHANG } else { 0 };
+    let mut status: i32 = 0;
+    // SAFETY: `&mut status` は有効な `int` で、この呼び出しが戻るまで生存し、waitpid(2) は戻るまでの間だけ
+    // 書き込む。pid は -1 固定、flags は 0 か `WNOHANG` の 2 値だけで、他のプロセスの状態を変える値は
+    // 渡さない。errno は直後に取る。
+    let rc = unsafe { waitpid(-1, &mut status, flags) };
+    match rc {
+        0 => Ok(None),
+        n if n > 0 => Ok(Some((n, status))),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
+/// 自プロセスを子孫の孤児の再親付け先（subreaper）にし、読み戻して確かめる。試験専用（本物の PID 1 でない
+/// 試験プロセスで孤児の再親付けを起こすため。MAC-4・#2269）。プロセス全体に効くので、再起動した子プロセス
+/// の中でだけ呼ぶ。
+#[cfg(test)]
+pub fn set_child_subreaper() -> io::Result<()> {
+    if !SUPPORTED {
+        return Err(io::Error::from_raw_os_error(ENOSYS));
+    }
+    // SAFETY: 可変長引数は 4 つの u64 で、`PR_SET_CHILD_SUBREAPER` は arg2 の値だけを読む。ポインタを
+    // 受け取らず、戻り値だけを見る。errno は直後に取る。
+    let rc = unsafe { prctl(PR_SET_CHILD_SUBREAPER, 1u64, 0u64, 0u64, 0u64) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut v: i32 = 0;
+    // SAFETY: `PR_GET_CHILD_SUBREAPER` は arg2 を `int *` として書き込む。`&mut v` は有効でこの呼び出しが
+    // 戻るまで生存する。残りの引数は無視される 0。errno は直後に取る。
+    let rc = unsafe { prctl(PR_GET_CHILD_SUBREAPER, &raw mut v, 0u64, 0u64, 0u64) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if v == 1 {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(EINVAL))
     }
 }
 
@@ -284,6 +355,11 @@ mod libc_abi {
         assert!(O_CLOEXEC == libc::O_CLOEXEC);
         assert!(AT_FDCWD == libc::AT_FDCWD);
         let _: libc::mode_t = MKDIR_MODE;
+        assert!(ECHILD == libc::ECHILD);
+        assert!(EINTR == libc::EINTR);
+        assert!(WNOHANG == libc::WNOHANG);
+        assert!(PR_SET_CHILD_SUBREAPER == libc::PR_SET_CHILD_SUBREAPER);
+        assert!(PR_GET_CHILD_SUBREAPER == libc::PR_GET_CHILD_SUBREAPER);
     };
 
     // `mount` の型を自前の宣言と `libc` の宣言で同じ関数ポインタ型へ代入して照合する。
@@ -306,6 +382,14 @@ mod libc_abi {
         unsafe extern "C" fn(libc::c_int, *const libc::c_char, libc::mode_t) -> libc::c_int;
     const _: MkdiratFn = mkdirat;
     const _: MkdiratFn = libc::mkdirat;
+    type WaitpidFn =
+        unsafe extern "C" fn(libc::pid_t, *mut libc::c_int, libc::c_int) -> libc::pid_t;
+    const _: WaitpidFn = waitpid;
+    const _: WaitpidFn = libc::waitpid;
+    // `prctl` は可変長（試験専用）。
+    type PrctlFn = unsafe extern "C" fn(libc::c_int, ...) -> libc::c_int;
+    const _: PrctlFn = prctl;
+    const _: PrctlFn = libc::prctl;
 }
 
 #[cfg(test)]
@@ -375,6 +459,15 @@ mod tests {
             let e = mkdir_child(root.as_fd(), bad).unwrap_err();
             assert_eq!(e.raw_os_error(), Some(22), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn mac4_2269_wait_constants() {
+        assert_eq!(WNOHANG, 1);
+        assert_eq!(ECHILD, 10);
+        assert_eq!(EINTR, 4);
+        assert_eq!(PR_SET_CHILD_SUBREAPER, 36);
+        assert_eq!(PR_GET_CHILD_SUBREAPER, 37);
     }
 
     #[test]

@@ -8,7 +8,9 @@
 //! 1. `/proc`・`/sys`・`/dev` を mount する。
 //! 2. カーネルコマンドラインの `fandhe.virtiofs=<tag>:<mountpoint>:<ro|rw>` を untrusted として復号し、
 //!    virtiofs を mount して共有ごとに 1 行を hvc0 へ報告する（[`process::process_directives`]）。
-//! 3. 起動完了マーカー [`READY_MARKER`] を出し、以後は終了しない。
+//! 3. 起動完了マーカー [`READY_MARKER`] を出し、以後は終了しない。ready の後は `waitpid(-1)` の
+//!    ループで直接の子と再親付けされた孤児を回収し続ける（[`reap`]。MAC-4・CORE-1・TASK-191・#2269）。
+//!    回収ループが唯一の waiter で、以後に子を作る呼び出し元は `Child::wait` を使ってはならない。
 //! 4. （試験専用）予約キー `fandhe.guest-test=virtiofs-io` があり、`fandhe-io` の RW mount が成功したときだけ、
 //!    ready の後に共有の read / readdir / write のプローブ行を出す（[`probe`]。MAC-1・IO-5・#1876）。
 //!    キーはホストの `reject_reserved_keys` により利用者指定では注入できず、本番の起動では走らない。
@@ -61,7 +63,10 @@
 //! - EBUSY の分岐（実カーネルでの devtmpfs の二重 mount）と panic hook が PID 1 で待機へ落ちる挙動は CI では
 //!   動かせない。単体テストは解析・分類・診断行だけを覆い、実機の VM での確認は #1628 に委ねる（#2139）。
 //! - 協調停止: `reboot(2)` 等は呼ばない。VM の停止はホストの VZ の強制停止に任せる（TASK-115）。
-//! - 子プロセスの回収（`waitpid`）: 現状は子を作らない。ゲスト内でコンテナを実行する際に実装する。
+//! - 子プロセスの回収（`waitpid`）: 実装済み（#2269）。残余: main スレッド自身の panic の後は回収しない
+//!   （hook の中で回収すると二重 panic の余地が生まれる）、子がいない間に別スレッドが作った子は最大 1 秒
+//!   ゾンビで残る、SIGCHLD 駆動は G6（#2273）で再評価する、実 VM（本物の PID 1・aarch64）での確認は #1628。
+//!   終了コードの中継（`on_reaped` の配線）も G6。
 //! - 静的リンクのビルドと initrd への梱包は `scripts/build-guest-initrd.sh`（`make guest-initrd-build`。#1878）
 //!   で行う（梱包までの確認のみ。実機の VM での起動は未確認で #1628）。
 
@@ -73,6 +78,7 @@ pub mod link_probe;
 pub mod mountinfo;
 pub mod probe;
 pub mod process;
+pub mod reap;
 pub mod report;
 
 #[cfg(target_os = "linux")]
@@ -97,6 +103,12 @@ pub const READY_MARKER: &str = "fandhe-guest: init ready v1";
 #[cfg(test)]
 #[path = "../../oci/tests/support/test_root.rs"]
 mod test_root;
+
+// 試験が起こした子プロセスを期限つきで回収する共有補助（core の正本。REPAIR-5・#3410）。実プロセスの
+// 試験（Linux のみ）で使う。
+#[cfg(all(test, target_os = "linux"))]
+#[path = "../../core/tests/support/reap.rs"]
+mod test_reap;
 
 #[cfg(test)]
 mod tests {

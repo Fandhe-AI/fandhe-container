@@ -51,15 +51,15 @@ crates/cli の対象外: `REAP_LIMIT`（`Duration`。FFI ではない）、`mask
 | ---------- | -------------- | ---- |
 | x86_64-unknown-linux-gnu | `rust-ci`（clippy・test の `--all-features`）・`platform-ci`（ubuntu の `make lint`・`make test`） | コンパイル時検査（試験の実行を含む） |
 | aarch64-unknown-linux-gnu | `cross-target-check`（`cargo check`・`cargo clippy` の `--all-targets --all-features`） | 型検査（const の評価は行われる。試験は実行しない） |
-| aarch64-unknown-linux-musl（製品のゲストのターゲット。guest-init のみ） | `cross-target-check` の `cargo check` / `cargo clippy -p fandhe-container-guest-init --all-targets` | 型検査（`cfg(test)` の const の評価は行われる。試験は実行しない） |
-| x86_64-unknown-linux-musl・aarch64-unknown-linux-musl の core・net | なし（対象外。決定は「musl の扱い（#3103）」） | core・net を musl で使う配布物が無いため評価しない |
+| aarch64-unknown-linux-musl（製品のゲストのターゲット。guest-init と core・supervisor・cli） | `cross-target-check` の `cargo check` / `cargo clippy -p fandhe-container-guest-init --all-targets` と、core・supervisor・cli の `--all-targets --all-features` の check / clippy・`--lib --bins` の単独 clippy（MAC-4・#2274） | 型検査（`cfg(test)` の const の評価は行われる。試験は実行しない） |
+| x86_64-unknown-linux-musl の全部と、net 自身の musl `--all-targets`（`libc_abi`） | なし（対象外。決定は「musl の扱い（#3103）」・#3216 の判断 3） | net を musl で使う配布物が無いため評価しない。net は supervisor・cli の依存 lib として型検査されるのみ |
 | aarch64-apple-darwin | `cross-target-check`（既定 feature の clippy を含む）・main の `platform-ci`（macos。ネイティブ） | PR では型検査、main ではネイティブ |
 | x86_64-apple-darwin | なし | CI の空白。手元で `cargo check --all-targets --target x86_64-apple-darwin` を推奨する |
 | Windows | 対象外 | `sys` は `cfg(unix)`。Windows API の自前宣言は #1837 の範囲外 |
 
 ## musl の扱い（#3103）
 
-決定: crates/core・crates/net の musl（`x86_64-unknown-linux-musl`・`aarch64-unknown-linux-musl`）は libc 照合の対象外とする（MVM-4・REPAIR-7・REPAIR-12・MS-6）。CI で core・net の musl の型検査・照合は行わない（新しいジョブ・check-run も足さない）。
+決定: crates/core・crates/net の musl（`x86_64-unknown-linux-musl`・`aarch64-unknown-linux-musl`）は libc 照合の対象外とする（MVM-4・REPAIR-7・REPAIR-12・MS-6）。core・supervisor・cli の aarch64 musl は #2274（MAC-4）で `cross-target-check` に型検査（`cfg(test)` の const 評価を含む）を足した。net・x86_64 musl・gnu 限定の項目の musl 節は対象外のまま（新しいジョブ・check-run も足さない）。`StatFs` の `__fsword_t` の照合は gnu に移し、musl は公開の `f_flags` を直接照合する。supervisor の `time_t` の照合は musl でも残し、非推奨警告は `cfg_attr` で許す。
 
 根拠:
 
@@ -80,12 +80,12 @@ gnu 限定の分岐を残す理由: 外すと musl では型の違い（`c_int`�
 | ---- | ---- |
 | `cargo check -p fandhe-container-net --all-targets --target aarch64-unknown-linux-musl` | 成功 |
 | `cargo check -p fandhe-container-core --lib --bins --target aarch64-unknown-linux-musl` | 成功 |
-| `cargo check -p fandhe-container-core --all-targets --target aarch64-unknown-linux-musl` | 失敗。`StatFs` の照合の `libc::__fsword_t`（gnu にしか無い）が E0425。名前解決で止まるため、その先の `const` 評価で musl に食い違いがあるかは未確認 |
+| `cargo check -p fandhe-container-core --all-targets --target aarch64-unknown-linux-musl`（#2274 の修正前） | 失敗。`StatFs` の照合の `libc::__fsword_t`（gnu にしか無い）が E0425。名前解決で止まるため、その先の `const` 評価で musl に食い違いがあるかは未確認 |
 
 再検討の条件: musl で core・net をリンクする crate・配布物が加わったとき（`rename_noreplace_at` の doc の条件と同じ）。その場合の作業案（採否・CI の追加はオーナー承認事項で、未実施）:
 
 - `cross-target-check` の既存ジョブにステップとして `cargo check` / `cargo clippy -p fandhe-container-core -p fandhe-container-net --all-targets --all-features --target <musl target>` を足す（新しいジョブ・check-run は増やさない）
-- `__fsword_t` の照合を gnu に限り、musl の `--all-targets` を通す
+- `__fsword_t` の照合を gnu に限り、musl の `--all-targets` を通す（#2274 で実施済み）
 - musl の節を照合に足す（`c_int` の `Ioctl`・`resource`、`renameat2` の musl 1.2.6 前提、`msghdr` の非公開パディング）
 - 製品の宣言（`ioctl` の `request` 型など）を musl に合わせて cfg で分けるかを判断する
 

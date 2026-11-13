@@ -3,18 +3,25 @@
 //! # 役割
 //!
 //! `fandhe-container-platform-macos` の `Vm::launch` が起動したゲストカーネルが最初に実行する。
-//! 責務は次の 3 点に限る（4・5 は試験専用の追加）。
+//! 責務は次の 4 点に限る（5・6 は試験専用の追加）。
 //!
 //! 1. `/proc`・`/sys`・`/dev` を mount する。
 //! 2. カーネルコマンドラインの `fandhe.virtiofs=<tag>:<mountpoint>:<ro|rw>` を untrusted として復号し、
 //!    virtiofs を mount して共有ごとに 1 行を hvc0 へ報告する（[`process::process_directives`]）。
-//! 3. 起動完了マーカー [`READY_MARKER`] を出し、以後は終了しない。ready の後は `waitpid(-1)` の
-//!    ループで直接の子と再親付けされた孤児を回収し続ける（[`reap`]。MAC-4・CORE-1・TASK-191・#2269）。
-//!    回収ループが唯一の waiter で、以後に子を作る呼び出し元は `Child::wait` を使ってはならない。
-//! 4. （試験専用）予約キー `fandhe.guest-test=virtiofs-io` があり、`fandhe-io` の RW mount が成功したときだけ、
+//! 3. 起動完了マーカー [`READY_MARKER`] を出し、以後は停止要求を受けるまで終了しない。ready の後は
+//!    `waitpid(-1)` のループで直接の子と再親付けされた孤児を回収し続ける（[`reap`]。MAC-4・CORE-1・
+//!    TASK-191・#2269）。回収ループが唯一の waiter で、以後に子を作る呼び出し元は `Child::wait` を使っては
+//!    ならない。待ちは `SIGCHLD`・`SIGTERM`・`SIGPWR`（`run` の冒頭でスレッドを作る前にブロック済み）の
+//!    `sigtimedwait` で、将来子を作る呼び出し元は exec の前にこのマスクを戻すこと。
+//! 4. 協調停止（MAC-4・#2270）: 停止要求（ホストの VZ `requestStop` → 仮想 power button の `KEY_POWER` →
+//!    [`power_button`] の監視スレッドが自分へ `SIGPWR`、または `SIGTERM`）で回収ループが戻ると、
+//!    [`shutdown`] の手順（全プロセスへ `SIGTERM` → 猶予 → `SIGKILL` → `sync` → `reboot(RB_POWER_OFF)`）を
+//!    実行する。ホスト側は猶予内に止まらなければ VZ の強制停止へ切り替える
+//!    （`platform-macos::vm::Vm::shutdown`）。
+//! 5. （試験専用）予約キー `fandhe.guest-test=virtiofs-io` があり、`fandhe-io` の RW mount が成功したときだけ、
 //!    ready の後に共有の read / readdir / write のプローブ行を出す（[`probe`]。MAC-1・IO-5・#1876）。
 //!    キーはホストの `reject_reserved_keys` により利用者指定では注入できず、本番の起動では走らない。
-//! 5. （試験専用）予約キー `fandhe.guest-test=virtiofs-link` があり、`ro`（RO）・`rw`（RW）の mount が成功した
+//! 6. （試験専用）予約キー `fandhe.guest-test=virtiofs-link` があり、`ro`（RO）・`rw`（RW）の mount が成功した
 //!    共有ごとに、ready の後に symlink・ハードリンクの観測行を出す（[`link_probe`]。判定はしない。
 //!    MAC-1・SEC-4・#1877・#1374）。
 //!
@@ -62,11 +69,18 @@
 //!
 //! - EBUSY の分岐（実カーネルでの devtmpfs の二重 mount）と panic hook が PID 1 で待機へ落ちる挙動は CI では
 //!   動かせない。単体テストは解析・分類・診断行だけを覆い、実機の VM での確認は #1628 に委ねる（#2139）。
-//! - 協調停止: `reboot(2)` 等は呼ばない。VM の停止はホストの VZ の強制停止に任せる（TASK-115）。
-//! - 子プロセスの回収（`waitpid`）: 実装済み（#2269）。残余: main スレッド自身の panic の後は回収しない
-//!   （hook の中で回収すると二重 panic の余地が生まれる）、子がいない間に別スレッドが作った子は最大 1 秒
-//!   ゾンビで残る、SIGCHLD 駆動は G6（#2273）で再評価する、実 VM（本物の PID 1・aarch64）での確認は #1628。
-//!   終了コードの中継（`on_reaped` の配線）も G6。
+//! - 協調停止: 実装済み（#2270）。残余: 実 VM での `requestStop` の到達（仮想 PL061 GPIO → `gpio-keys` →
+//!   `KEY_POWER`。ゲストカーネルに `GPIO_PL061`・`KEYBOARD_GPIO`・`INPUT_EVDEV` が要る）と電源断は未確認で
+//!   #1628・#2282（届かなければホストが猶予の後に強制停止する）。ゲスト内のコンテナの停止は `kill(-1)` の
+//!   一般手順で、ゲスト内 CLI 経由で supervisor を順に止める手順は G6（#2273）以降。致命的な初期化失敗と
+//!   panic hook の後の待機（`idle`）は停止要求に応じず、ホストの期限つきの強制停止に任せる。電源断が失敗した
+//!   ときは診断行（`stage=poweroff`）を出し、PID 1 は終了せず回収を続ける。ゲスト内のコンテナ（将来）からの
+//!   停止要求の偽装は、ゲスト内の非 root 実行（設計の項目 1）で防ぐ前提（非特権プロセスは PID 1 へ
+//!   シグナルを送れない）。
+//! - 子プロセスの回収（`waitpid`）: 実装済み（#2269）。`SIGCHLD` 駆動（#2270）で、子がいない間に別スレッドが
+//!   作った子も即座に回収する。残余: main スレッド自身の panic の後は回収しない（hook の中で回収すると
+//!   二重 panic の余地が生まれる）、実 VM（本物の PID 1・aarch64）での確認は #1628。終了コードの中継
+//!   （`on_reaped` の配線）は G6（#2273）。
 //! - 静的リンクのビルドと initrd への梱包は `scripts/build-guest-initrd.sh`（`make guest-initrd-build`。#1878）
 //!   で行う（梱包までの確認のみ。実機の VM での起動は未確認で #1628）。
 
@@ -76,10 +90,12 @@ pub mod cmdline;
 pub mod directive;
 pub mod link_probe;
 pub mod mountinfo;
+pub mod power_button;
 pub mod probe;
 pub mod process;
 pub mod reap;
 pub mod report;
+pub mod shutdown;
 
 #[cfg(target_os = "linux")]
 mod init;

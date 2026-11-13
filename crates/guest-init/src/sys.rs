@@ -1,7 +1,9 @@
 //! `mount(2)` の薄いラッパー（`unsafe` はこのモジュールに閉じる。#1823 の事前承認の範囲・MAC-1）。
 //!
 //! ゲスト init が `/proc`・`/sys`・`/dev` と virtiofs の mount、および子の回収（`waitpid(-1)`。
-//! pid は -1 固定・flags は 0 か `WNOHANG` の 2 値だけ。MAC-4・#2269）に使う。公開するのは用途別の安全な関数
+//! pid は -1 固定・flags は 0 か `WNOHANG` の 2 値だけ。MAC-4・#2269）に使う。協調停止（MAC-4・#2270）の
+//! ためのシグナル受信（`sigprocmask`・`sigtimedwait`）・全プロセスへの終了要求（`kill(-1)`）・`sync`・
+//! `reboot(RB_POWER_OFF)` も持つ。ホストを巻き込む `kill(-1)`・`reboot` は PID 1 以外では syscall を呼ばない。公開するのは用途別の安全な関数
 //! （virtiofs・proc・sysfs・devtmpfs）だけで、任意の flags / data は型の上で渡せない（`MS_BIND`・
 //! `MS_MOVE`・`MS_REMOUNT` を呼び出し側が組めない。REPAIR-2）。`unsafe fn` は外へ出さない。`extern "C"` 宣言は自前（外部クレートを使わない）。`libc` との機械照合
 //! （#1318・#2076）は試験専用モジュール `libc_abi` が const 評価で行い、固定値テストも併用する。
@@ -49,7 +51,7 @@ pub const O_NOCTTY: i32 = 0;
 /// パス解決だけに使う fd を開く（読み書きはできない）。
 const O_PATH: i32 = 0o10000000;
 /// exec で子へ引き継がない（将来の子プロセスへ fd を漏らさない）。
-const O_CLOEXEC: i32 = 0o2000000;
+pub const O_CLOEXEC: i32 = 0o2000000;
 /// ディレクトリでなければ失敗する。値はアーキごとに違う（asm-generic と arm64 の uapi）。
 #[cfg(target_arch = "x86_64")]
 const O_DIRECTORY: i32 = 0o200000;
@@ -82,6 +84,24 @@ pub const ECHILD: i32 = 10;
 pub const EINTR: i32 = 4;
 /// `waitpid` の flags。待たずに戻る。
 const WNOHANG: i32 = 1;
+/// `EAGAIN`（Linux 共通。`sigtimedwait` の期限切れ）。
+pub const EAGAIN: i32 = 11;
+/// `ESRCH`（Linux 共通。シグナルの送り先のプロセスが無い）。
+pub const ESRCH: i32 = 3;
+/// `EPERM`（Linux 共通。PID 1 でないときの停止系 syscall の拒否に使う）。
+const EPERM: i32 = 1;
+/// `SIGKILL`（x86_64・aarch64 で同値）。
+const SIGKILL: i32 = 9;
+/// `SIGTERM`（同上）。
+const SIGTERM: i32 = 15;
+/// `SIGCHLD`（x86_64・aarch64 の Linux で 17）。
+const SIGCHLD: i32 = 17;
+/// `SIGPWR`（x86_64・aarch64 の Linux で 30。停止要求として使う。mips・alpha 等では値が違うため流用しない）。
+const SIGPWR: i32 = 30;
+/// `sigprocmask` の how。ブロック集合に加える。
+const SIG_BLOCK: i32 = 0;
+/// `reboot(2)` の cmd。電源断（`LINUX_REBOOT_CMD_POWER_OFF`）。
+const RB_POWER_OFF: u32 = 0x4321_fedc;
 /// `prctl` の option（試験専用）。子孫の孤児の再親付け先を自分にする。
 #[cfg(test)]
 const PR_SET_CHILD_SUBREAPER: i32 = 36;
@@ -113,10 +133,61 @@ unsafe extern "C" {
     // `pid_t` は Linux で i32。
     fn waitpid(pid: i32, wstatus: *mut i32, options: i32) -> i32;
 
+    // SAFETY（宣言そのものの妥当性）: `int kill(pid_t pid, int sig)`。`pid_t` は Linux で i32。
+    fn kill(pid: i32, sig: i32) -> i32;
+
+    // SAFETY（宣言そのものの妥当性）: `int sigprocmask(int how, const sigset_t *set, sigset_t *oldset)`。
+    // `sigset_t` は glibc・musl とも 128 バイト（`SigSet` と同じ配置）。単一スレッド（スレッドを作る前）から
+    // だけ呼ぶ（マルチスレッドの挙動は未規定のため）。
+    fn sigprocmask(how: i32, set: *const SigSet, oldset: *mut SigSet) -> i32;
+
+    // SAFETY（宣言そのものの妥当性）: `int sigtimedwait(const sigset_t *set, siginfo_t *info,
+    // const struct timespec *timeout)`。info は常に null を渡す（情報を受け取らない）ため型は `c_void`。
+    fn sigtimedwait(
+        set: *const SigSet,
+        info: *mut core::ffi::c_void,
+        timeout: *const Timespec,
+    ) -> i32;
+
+    // SAFETY（宣言そのものの妥当性）: `void sync(void)`。
+    fn sync();
+
+    // SAFETY（宣言そのものの妥当性）: glibc / musl の `int reboot(int cmd)`（magic はライブラリが補う）。
+    fn reboot(cmd: i32) -> i32;
+
     // SAFETY（宣言そのものの妥当性）: `int prctl(int option, ...)`。試験専用で、本モジュールは
     // `PR_SET_CHILD_SUBREAPER`・`PR_GET_CHILD_SUBREAPER` だけを、残りの引数を 4 つの u64 / ポインタで渡す。
     #[cfg(test)]
     fn prctl(option: i32, ...) -> i32;
+}
+
+/// カーネルの `sigset_t` を包む glibc・musl の 1024 bit の集合（128 バイト）。
+#[repr(C)]
+struct SigSet([u64; 16]);
+
+impl SigSet {
+    /// 空集合。
+    const fn empty() -> Self {
+        Self([0; 16])
+    }
+
+    /// シグナル番号（1..=64）を加える。範囲外は何もしない。
+    fn add(&mut self, sig: i32) {
+        if (1..=64).contains(&sig) {
+            let idx = usize::try_from((sig - 1) / 64).unwrap_or(0);
+            let bit = u32::try_from((sig - 1) % 64).unwrap_or(0);
+            if let Some(w) = self.0.get_mut(idx) {
+                *w |= 1u64 << bit;
+            }
+        }
+    }
+}
+
+/// `struct timespec`（LP64 の Linux。x86_64・aarch64 の glibc・musl で `{ i64, i64 }`）。
+#[repr(C)]
+struct Timespec {
+    tv_sec: i64,
+    tv_nsec: i64,
 }
 
 fn cstring(bytes: &[u8]) -> io::Result<CString> {
@@ -200,6 +271,218 @@ pub fn wait_any_child(nohang: bool) -> io::Result<Option<(i32, i32)>> {
         n if n > 0 => Ok(Some((n, status))),
         _ => Err(io::Error::last_os_error()),
     }
+}
+
+/// 停止要求として扱うシグナルと `SIGCHLD` を、以後に作るスレッドを含めてブロックする（MAC-4・#2270）。
+///
+/// PID 1 は SIG_DFL のシグナルをカーネルが捨てるが、blocked なら捨てずに保留する。ブロックして
+/// [`wait_signal`] で受けることで、ハンドラ（非同期シグナルの制約）を置かずに停止要求と子の終了で
+/// 起きる。スレッドを作る前の 1 回だけ呼ぶ（スレッドはマスクを継承する）。
+pub fn block_lifecycle_signals() -> io::Result<()> {
+    if !SUPPORTED {
+        return Err(io::Error::from_raw_os_error(ENOSYS));
+    }
+    let mut set = SigSet::empty();
+    for s in [SIGCHLD, SIGTERM, SIGPWR] {
+        set.add(s);
+    }
+    // SAFETY: `&set` は有効な 128 バイトの集合でこの呼び出しが戻るまで生存する。oldset は null（読み出さない）。
+    // how は `SIG_BLOCK` 固定で、呼び出し元は単一スレッドの段階（スレッドを作る前）。errno は直後に取る。
+    let rc = unsafe { sigprocmask(SIG_BLOCK, &raw const set, core::ptr::null_mut()) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// [`wait_signal`] の結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalWait {
+    /// `SIGCHLD`（子が状態を変えた）。
+    Child,
+    /// 停止要求（`SIGTERM` または `SIGPWR`）。
+    Stop,
+    /// 期限切れ（`EAGAIN`）。
+    Timeout,
+    /// シグナルのハンドラに割り込まれた（`EINTR`）。
+    Interrupted,
+    /// 想定外のシグナル番号・失敗（errno。取れなければ 0）。
+    Other(i32),
+}
+
+/// ブロック済みの `SIGCHLD`・`SIGTERM`・`SIGPWR` のいずれかを最大 `timeout` 待つ（MAC-4・#2270）。
+/// 呼び出し元のスレッドは [`block_lifecycle_signals`] の後のスレッドでなければならない。
+pub fn wait_signal(timeout: std::time::Duration) -> SignalWait {
+    if !SUPPORTED {
+        return SignalWait::Other(ENOSYS);
+    }
+    let mut set = SigSet::empty();
+    for s in [SIGCHLD, SIGTERM, SIGPWR] {
+        set.add(s);
+    }
+    let ts = Timespec {
+        tv_sec: i64::try_from(timeout.as_secs()).unwrap_or(i64::MAX),
+        tv_nsec: i64::from(timeout.subsec_nanos()),
+    };
+    // SAFETY: `&set`・`&ts` は有効でこの呼び出しが戻るまで生存し、sigtimedwait(2) は読むだけ。info は null
+    // （受け取らない）。errno は直後に取る。
+    let rc = unsafe { sigtimedwait(&raw const set, core::ptr::null_mut(), &raw const ts) };
+    if rc > 0 {
+        return classify_signal(rc);
+    }
+    match io::Error::last_os_error().raw_os_error() {
+        Some(EAGAIN) => SignalWait::Timeout,
+        Some(EINTR) => SignalWait::Interrupted,
+        Some(n) => SignalWait::Other(n),
+        None => SignalWait::Other(0),
+    }
+}
+
+/// 受け取ったシグナル番号の分類（OS 非依存の判断なので単体で試験する）。
+fn classify_signal(sig: i32) -> SignalWait {
+    match sig {
+        SIGCHLD => SignalWait::Child,
+        SIGTERM | SIGPWR => SignalWait::Stop,
+        other => SignalWait::Other(other),
+    }
+}
+
+/// 自プロセスへ停止要求（`SIGPWR`）を送る。power button の監視スレッドが使う（MAC-4・#2270）。
+/// `SIGPWR` はブロック済みで、メインスレッドの [`wait_signal`] が受ける。
+pub fn request_stop() -> io::Result<()> {
+    if !SUPPORTED {
+        return Err(io::Error::from_raw_os_error(ENOSYS));
+    }
+    let me = i32::try_from(std::process::id()).unwrap_or(-1);
+    if me <= 0 {
+        return Err(io::Error::from_raw_os_error(EINVAL));
+    }
+    // SAFETY: 送り先は自プロセス固定（正の pid）、sig は `SIGPWR` 固定。ポインタを渡さない。
+    let rc = unsafe { kill(me, SIGPWR) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// 終了要求の強さ。型の上で `SIGTERM` と `SIGKILL` の 2 値に限る（REPAIR-2）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Escalation {
+    /// `SIGTERM`（猶予あり）。
+    Term,
+    /// `SIGKILL`。
+    Kill,
+}
+
+/// PID 1 自身と呼び出し元を除く全プロセスへ終了要求を送る（`kill(-1, sig)`。MAC-4・#2270）。
+/// 他にプロセスがなければ `ESRCH`。ホストの全プロセスを殺しうるため、PID 1 でなければ syscall を呼ばず
+/// `EPERM` を返す（開発機・試験での誤実行の防止）。
+pub fn signal_all_others(how: Escalation) -> io::Result<()> {
+    if !SUPPORTED {
+        return Err(io::Error::from_raw_os_error(ENOSYS));
+    }
+    if std::process::id() != 1 {
+        return Err(io::Error::from_raw_os_error(EPERM));
+    }
+    let sig = match how {
+        Escalation::Term => SIGTERM,
+        Escalation::Kill => SIGKILL,
+    };
+    // SAFETY: pid は -1 固定（呼び出し元の PID 1 は対象外）、sig は上の 2 値だけ。PID 1 でなければ上で返っている。
+    // ポインタを渡さない。errno は直後に取る。
+    let rc = unsafe { kill(-1, sig) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// `/proc` を走査して数える対象の上限（無制限に読まない。REPAIR-5）。
+const MAX_PROC_SCAN: usize = 65_536;
+
+/// `/proc/<pid>/stat` の内容が「終了を待つべきユーザープロセス」か。カーネルスレッド（親が `kthreadd`＝PID 2）
+/// と回収待ちのゾンビ（`Z`・`X`）は数えない。`comm` は括弧内に `)` を含みうるので最後の `)` で区切る。
+/// 解釈できなければ安全側（数える）。
+fn stat_is_live_user_process(stat: &str) -> bool {
+    let Some(rest) = stat.rsplit_once(')').map(|(_, r)| r) else {
+        return true;
+    };
+    let mut it = rest.split_ascii_whitespace();
+    let state = it.next();
+    let ppid = it.next().and_then(|p| p.parse::<i64>().ok());
+    !matches!((state, ppid), (Some("Z" | "X"), _) | (_, Some(2)))
+}
+
+/// PID 1 以外にまだ終了を待つべきプロセスが残っているか（MAC-4・#2270）。`kill(-1, 0)` はカーネルスレッドも
+/// 数えて常に真になり猶予を使い切るため、`/proc` を走査してカーネルスレッド（ppid=2、PID 2 自身）とゾンビを
+/// 除く。`/proc` が読めないときだけ `kill(-1, 0)` の存在確認へ縮退する（シグナルは送らない）。
+/// 回収前のゾンビを除くので呼び出し側の回収は必須ではないが、先に回収する。PID 1 でなければ偽。
+pub fn others_alive() -> bool {
+    if !SUPPORTED || std::process::id() != 1 {
+        return false;
+    }
+    match proc_has_user_process() {
+        Some(alive) => alive,
+        None => kill_probe_alive(),
+    }
+}
+
+/// `/proc` の走査。読めなければ `None`。
+fn proc_has_user_process() -> Option<bool> {
+    let dir = std::fs::read_dir("/proc").ok()?;
+    for entry in dir.take(MAX_PROC_SCAN) {
+        let Ok(entry) = entry else { continue };
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().and_then(|n| n.parse::<u32>().ok()) else {
+            continue;
+        };
+        if pid <= 2 {
+            continue;
+        }
+        // 走査中に消えたプロセスは読めないだけで、残っていないものとして扱う。
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        if stat_is_live_user_process(&stat) {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+/// `/proc` が読めないときの縮退（カーネルスレッドも数えるので過大に真になりうる）。
+fn kill_probe_alive() -> bool {
+    // SAFETY: sig 0 は存在確認だけでシグナルを送らない。pid は -1 固定。ポインタを渡さない。errno は直後に取る。
+    let rc = unsafe { kill(-1, 0) };
+    if rc == 0 {
+        return true;
+    }
+    io::Error::last_os_error().raw_os_error() != Some(ESRCH)
+}
+
+/// 書き込みをバッファからデバイスへ流す（`sync(2)`。失敗しない）。
+pub fn sync_all() {
+    // SAFETY: 引数なしで失敗を返さない syscall。
+    unsafe { sync() }
+}
+
+/// `reboot(RB_POWER_OFF)` で電源を落とす（MAC-4・#2270）。成功すると戻らない。戻ったときは失敗の errno。
+/// ホストを落としうるため、PID 1 でなければ syscall を呼ばず `EPERM` を返す。
+pub fn power_off() -> io::Error {
+    if !SUPPORTED {
+        return io::Error::from_raw_os_error(ENOSYS);
+    }
+    if std::process::id() != 1 {
+        return io::Error::from_raw_os_error(EPERM);
+    }
+    // SAFETY: cmd は `RB_POWER_OFF` 固定（`cast_signed` で i32 に写す。値は定義上 0x4321fedc）。PID 1 でなければ
+    // 上で返っている。成功すれば戻らず、失敗なら -1 と errno。ポインタを渡さない。errno は直後に取る。
+    let rc = unsafe { reboot(RB_POWER_OFF.cast_signed()) };
+    let _ = rc;
+    io::Error::last_os_error()
 }
 
 /// 自プロセスを子孫の孤児の再親付け先（subreaper）にし、読み戻して確かめる。試験専用（本物の PID 1 でない
@@ -358,6 +641,21 @@ mod libc_abi {
         assert!(ECHILD == libc::ECHILD);
         assert!(EINTR == libc::EINTR);
         assert!(WNOHANG == libc::WNOHANG);
+        assert!(EAGAIN == libc::EAGAIN);
+        assert!(ESRCH == libc::ESRCH);
+        assert!(EPERM == libc::EPERM);
+        assert!(SIGKILL == libc::SIGKILL);
+        assert!(SIGTERM == libc::SIGTERM);
+        assert!(SIGCHLD == libc::SIGCHLD);
+        assert!(SIGPWR == libc::SIGPWR);
+        assert!(SIG_BLOCK == libc::SIG_BLOCK);
+        // libc の RB_POWER_OFF は c_int。自前は u32 で持ち、cast_signed で渡す値と一致を見る。
+        assert!(RB_POWER_OFF.cast_signed() == libc::RB_POWER_OFF);
+        // sigset_t・timespec は配置（大きさ・アラインメント）で照合する。
+        assert!(core::mem::size_of::<SigSet>() == core::mem::size_of::<libc::sigset_t>());
+        assert!(core::mem::align_of::<SigSet>() == core::mem::align_of::<libc::sigset_t>());
+        assert!(core::mem::size_of::<Timespec>() == core::mem::size_of::<libc::timespec>());
+        assert!(core::mem::align_of::<Timespec>() == core::mem::align_of::<libc::timespec>());
         assert!(PR_SET_CHILD_SUBREAPER == libc::PR_SET_CHILD_SUBREAPER);
         assert!(PR_GET_CHILD_SUBREAPER == libc::PR_GET_CHILD_SUBREAPER);
     };
@@ -386,6 +684,25 @@ mod libc_abi {
         unsafe extern "C" fn(libc::pid_t, *mut libc::c_int, libc::c_int) -> libc::pid_t;
     const _: WaitpidFn = waitpid;
     const _: WaitpidFn = libc::waitpid;
+    // `kill`・`sync`・`reboot` は引数がポインタを含まないので関数型をそのまま照合する。
+    type KillFn = unsafe extern "C" fn(libc::pid_t, libc::c_int) -> libc::c_int;
+    const _: KillFn = kill;
+    const _: KillFn = libc::kill;
+    type SyncFn = unsafe extern "C" fn();
+    const _: SyncFn = sync;
+    const _: SyncFn = libc::sync;
+    type RebootFn = unsafe extern "C" fn(libc::c_int) -> libc::c_int;
+    const _: RebootFn = reboot;
+    const _: RebootFn = libc::reboot;
+    // `sigprocmask`・`sigtimedwait` の集合・時刻のポインタ型は自前の型（`SigSet`・`Timespec`）で、`libc` の型と
+    // 別の名前になるため関数ポインタ型の代入では照合できない。引数の個数・幅は下の型で、型の配置は上の
+    // size / align の const assert で見る（`siginfo_t` は null しか渡さないので `c_void` で宣言している）。
+    type SigprocmaskFn =
+        unsafe extern "C" fn(libc::c_int, *const SigSet, *mut SigSet) -> libc::c_int;
+    const _: SigprocmaskFn = sigprocmask;
+    type SigtimedwaitFn =
+        unsafe extern "C" fn(*const SigSet, *mut core::ffi::c_void, *const Timespec) -> libc::c_int;
+    const _: SigtimedwaitFn = sigtimedwait;
     // `prctl` は可変長（試験専用）。
     type PrctlFn = unsafe extern "C" fn(libc::c_int, ...) -> libc::c_int;
     const _: PrctlFn = prctl;
@@ -468,6 +785,91 @@ mod tests {
         assert_eq!(EINTR, 4);
         assert_eq!(PR_SET_CHILD_SUBREAPER, 36);
         assert_eq!(PR_GET_CHILD_SUBREAPER, 37);
+    }
+
+    /// MAC-4・#2270: 停止系の定数は Linux の ABI の値（x86_64・aarch64）。
+    #[test]
+    fn mac4_2270_shutdown_constants() {
+        assert_eq!(SIGKILL, 9);
+        assert_eq!(SIGTERM, 15);
+        assert_eq!(SIGCHLD, 17);
+        assert_eq!(SIGPWR, 30);
+        assert_eq!(SIG_BLOCK, 0);
+        assert_eq!(RB_POWER_OFF, 0x4321_fedc);
+        assert_eq!(EAGAIN, 11);
+        assert_eq!(ESRCH, 3);
+        assert_eq!(core::mem::size_of::<SigSet>(), 128);
+        assert_eq!(core::mem::size_of::<Timespec>(), 16);
+    }
+
+    #[test]
+    fn mac4_2270_sigset_add_sets_the_right_bits() {
+        let mut s = SigSet::empty();
+        s.add(SIGCHLD);
+        s.add(SIGTERM);
+        s.add(SIGPWR);
+        // シグナル n はビット (n - 1)。
+        assert_eq!(s.0[0], (1u64 << 16) | (1u64 << 14) | (1u64 << 29));
+        assert!(s.0[1..].iter().all(|w| *w == 0));
+        // 範囲外は無視する。
+        s.add(0);
+        s.add(65);
+        s.add(-3);
+        assert_eq!(s.0[0].count_ones(), 3);
+    }
+
+    #[test]
+    fn mac4_2270_classify_signal() {
+        assert_eq!(classify_signal(SIGCHLD), SignalWait::Child);
+        assert_eq!(classify_signal(SIGTERM), SignalWait::Stop);
+        assert_eq!(classify_signal(SIGPWR), SignalWait::Stop);
+        assert_eq!(classify_signal(10), SignalWait::Other(10));
+    }
+
+    /// MAC-4・SEC-1・#2270: PID 1 でなければホストを巻き込む syscall を呼ばない（試験プロセスは PID 1 でない）。
+    #[test]
+    fn mac4_2270_destructive_calls_refuse_when_not_pid1() {
+        assert_ne!(std::process::id(), 1);
+        for how in [Escalation::Term, Escalation::Kill] {
+            let e = signal_all_others(how).unwrap_err();
+            assert_eq!(e.raw_os_error(), Some(EPERM), "{how:?}");
+        }
+        assert_eq!(power_off().raw_os_error(), Some(EPERM));
+        assert!(!others_alive());
+    }
+
+    /// MAC-4・#2270: `/proc/<pid>/stat` の判定。カーネルスレッド（ppid=2）とゾンビは数えず、通常の
+    /// プロセスと `comm` に `)` を含む場合・解釈不能は数える。
+    #[test]
+    fn mac4_2270_stat_filter_skips_kernel_threads_and_zombies() {
+        assert!(stat_is_live_user_process("123 (sh) S 1 123 123 0 -1"));
+        assert!(stat_is_live_user_process("123 (a) b) R 77 1 1"));
+        assert!(!stat_is_live_user_process("9 (kworker/0:1) I 2 0 0"));
+        assert!(!stat_is_live_user_process("55 (defunct) Z 1 55 55"));
+        assert!(stat_is_live_user_process("garbage"));
+    }
+
+    /// MAC-4・#2270: ブロック済みのシグナルを `sigtimedwait` で受ける。マスクは呼び出したスレッドだけに効き
+    /// （libtest は試験ごとにスレッドを作る）、`raise` はそのスレッド宛てなので、他のスレッドや試験へ届かない。
+    /// 本物の PID 1 でなくても、ブロックして受ける経路そのものは同じ。
+    #[test]
+    fn mac4_2270_wait_signal_receives_blocked_signals_and_times_out() {
+        use std::time::Duration;
+        block_lifecycle_signals().unwrap();
+        let short = Duration::from_millis(30);
+        assert_eq!(wait_signal(short), SignalWait::Timeout);
+        for (sig, want) in [
+            (libc::SIGPWR, SignalWait::Stop),
+            (libc::SIGTERM, SignalWait::Stop),
+            (libc::SIGCHLD, SignalWait::Child),
+        ] {
+            // SAFETY: `raise` は呼び出したスレッド自身へシグナルを送る。当該シグナルは直前にこのスレッドで
+            // ブロック済みなので、既定動作（終了）は起きず保留される。
+            assert_eq!(unsafe { libc::raise(sig) }, 0);
+            assert_eq!(wait_signal(Duration::from_secs(5)), want, "signal {sig}");
+        }
+        // 受け取った後は保留が残らない。
+        assert_eq!(wait_signal(short), SignalWait::Timeout);
     }
 
     #[test]

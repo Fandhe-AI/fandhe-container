@@ -2926,6 +2926,22 @@ mod linux {
                 ProbeOutcome::Errno(1),
                 "post-exec umount2 EPERM"
             );
+            // 引数つきルール（MAC-4・SEC-1・#2277）。AF_UNIX は陽性対照。
+            assert_eq!(
+                rec.vsock,
+                ProbeOutcome::Errno(1),
+                "post-exec socket(AF_VSOCK) EPERM"
+            );
+            assert_eq!(
+                rec.vsock_high_bits,
+                ProbeOutcome::Errno(1),
+                "post-exec socket(AF_VSOCK | 1<<32) EPERM"
+            );
+            assert_eq!(
+                rec.unix_socket,
+                ProbeOutcome::Ok,
+                "post-exec socket(AF_UNIX) allowed"
+            );
             println!("production_launcher: scenario=j pid={pid} post-exec caps and seccomp ok");
         }));
         finish_started(started, verified);

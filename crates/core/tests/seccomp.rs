@@ -24,6 +24,9 @@
 //!   テスト集合でも自己照合する。#2234・#2788・SEC-4・REPAIR-12）
 //! - 網羅確認: `mount`・`pivot_root`・`umount2` が `EPERM`。capability 不足でも
 //!   `EPERM` になり得るため、識別的な根拠とは扱わない
+//! - 引数つきルール: `socket(AF_VSOCK)`（上位 32 bit にゴミを足した変種を含む）が `EPERM`、陽性対照の
+//!   `socket(AF_UNIX)` が成功（MAC-4・SEC-1・#2277）。適用前の vsock 対照は置かない（フィルタ欠落時に
+//!   ホストで `net-pf-40` の自動ロードを起こしうるため。識別は kcmp の適用前対照と適用後の `EPERM` で行う）
 //! - 強制終了: `unshare`・`ptrace`・`kexec_load` は別のコンテナのエントリポイントで SIGSYS 終了
 //!   （`ChildExit::Signaled(31)`）。プローブが戻って終了コード 0 で終われば（フィルタ欠落）失敗
 //!
@@ -88,16 +91,25 @@ fn core5_probed_names_are_in_deny_table() {
 #[cfg(target_os = "linux")]
 fn core5_record_parser_selftest() {
     let ok = "kcmp=errno=1\nseccomp_mode=2\ncontrol=ok\nmount=errno=1\n\
-              pivot_root=errno=1\numount2=errno=1\n";
+              pivot_root=errno=1\numount2=errno=1\nvsock=errno=1\nvsock_high_bits=errno=1\n\
+              unix_socket=ok\n";
     let rec = SeccompProbeRecord::parse(ok).expect("well-formed record");
     assert_eq!(rec.kcmp, ProbeOutcome::Errno(1));
     assert_eq!(rec.seccomp_mode, "2");
     assert_eq!(rec.control, ProbeOutcome::Ok);
+    assert_eq!(rec.vsock, ProbeOutcome::Errno(1));
+    assert_eq!(rec.vsock_high_bits, ProbeOutcome::Errno(1));
+    assert_eq!(rec.unix_socket, ProbeOutcome::Ok);
     assert_eq!(rec.render(), ok, "render must round-trip");
     let missing = ok.replace("umount2=errno=1\n", "");
     assert_eq!(
         SeccompProbeRecord::parse(&missing),
         Err("missing key \"umount2\"".to_string())
+    );
+    let missing_vsock = ok.replace("vsock=errno=1\n", "");
+    assert_eq!(
+        SeccompProbeRecord::parse(&missing_vsock),
+        Err("missing key \"vsock\"".to_string())
     );
     let dup = format!("{ok}mount=ok\n");
     assert_eq!(
@@ -712,5 +724,18 @@ mod linux {
             "pivot_root blocked"
         );
         assert_eq!(rec.umount2, ProbeOutcome::Errno(EPERM), "umount2 blocked");
+        // 引数つきルール（MAC-4・SEC-1・#2277）: socket の family が AF_VSOCK なら EPERM。上位 32 bit の
+        // ゴミを足しても同じ（カーネルの int への切り詰めと一致）。AF_UNIX は通る（socket 全体を拒否していない対照）。
+        assert_eq!(
+            rec.vsock,
+            ProbeOutcome::Errno(EPERM),
+            "socket(AF_VSOCK) blocked"
+        );
+        assert_eq!(
+            rec.vsock_high_bits,
+            ProbeOutcome::Errno(EPERM),
+            "socket(AF_VSOCK | 1<<32) blocked"
+        );
+        assert_eq!(rec.unix_socket, ProbeOutcome::Ok, "socket(AF_UNIX) allowed");
     }
 }

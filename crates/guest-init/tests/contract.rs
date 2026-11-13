@@ -191,6 +191,33 @@ fn mac1_marker_and_diagnostics_are_not_reports_for_host() {
     assert!(parse_report_line(ReportLine::ready().as_str().as_bytes()).is_none());
 }
 
+/// MAC-4・#2270: 協調停止の診断行（開始・電源断の失敗・シグナルのブロック失敗）はホストの走査で
+/// 報告行として解釈されない。
+#[test]
+fn mac4_2270_shutdown_diagnostics_are_not_reports_for_host() {
+    for line in [
+        ReportLine::shutdown_begin(),
+        ReportLine::init_error(InitStage::PowerOff, Errno::EIO),
+        ReportLine::init_error(InitStage::Signals, Errno::EINVAL),
+    ] {
+        assert!(
+            parse_report_line(line.as_str().as_bytes()).is_none(),
+            "{}",
+            line.as_str()
+        );
+    }
+}
+
+/// MAC-4・REPAIR-5・#2270: ゲストの最悪の停止時間（SIGTERM の猶予 + SIGKILL の待ち）は、ホストの協調停止の
+/// 既定の猶予より短い（ゲストが自ら止まる前にホストが強制停止へ切り替えない）。
+#[test]
+fn mac4_2270_guest_shutdown_fits_host_graceful_default() {
+    use fandhe_container_guest_init::shutdown::{GUEST_KILL_WAIT, GUEST_TERM_GRACE};
+    let guest = GUEST_TERM_GRACE + GUEST_KILL_WAIT;
+    assert!(guest < fandhe_container_platform_macos::vm::DEFAULT_GRACEFUL_STOP_TIMEOUT);
+    assert!(guest < std::time::Duration::from_secs(5));
+}
+
 // ---- virtiofs_io のプローブ契約（MAC-1・IO-5・#1876）----
 
 #[test]

@@ -58,6 +58,12 @@ prost.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "net", "time"] }
 
+# `sys.rs` の自前 FFI 宣言を libc と照合する試験専用の依存（#3669・#1318・#1837・MVM-4・REPAIR-12）。
+# 承認: #3290 のオーナー判断（2026-11-13。版は workspace の =0.2.189 のまま・用途は照合の試験に限る）。
+# 製品の依存には入れない（cargo tree -e normal,build の直接依存に現れない）。方式は docs/design/ffi-libc-check.md。
+[target.'cfg(unix)'.dev-dependencies]
+libc.workspace = true
+
 # CRI 記録の fsync が RPC のレイテンシ（p50・p95）に与える影響の計測ハーネス（#3224・CORE-10・CRI-1・REPAIR-8）。
 # 自前の main（harness = false）。依存は足さない（既存の normal / dev 依存だけ）。CI では実行せず、
 # metrics.json・BENCH_NAMES・baseline にも登録しない（基準値の確定は #230 の別件）。

@@ -163,6 +163,7 @@ impl KeeperClient {
         if Instant::now() >= limit {
             return Err(deadline_error());
         }
+        admit_spawn()?;
         let child = spawn().map_err(|_| {
             TraitError::new(ErrorCode::Internal, "the vm keeper could not be spawned")
         })?;
@@ -204,16 +205,14 @@ fn deadline_error() -> TraitError {
 ///
 /// 子は応答の開始後は他クライアントの登録を受け付けるため、起動元の待機失敗だけで SIGKILL すると共有の保持役と登録簿を失う
 /// （MAC-4）。公開前の子はロック競合で自ら終了し、公開後の子は無登録の猶予後に自ら終了する。生きている子の `Child` を
-/// そのまま drop すると終了後に回収されずゾンビになるため、上限つきの共有の回収簿へ渡す。
+/// そのまま drop すると親が回収しない限りゾンビとして残るため、共有の回収簿へ渡して終了まで回収する。
 fn release_child(child: Child, primary: TraitError) -> TraitError {
     reap_in_background(child);
     primary
 }
 
-/// 回収簿に載せる子の上限（超えたら古い順に諦めて drop する。無制限に溜めない）。
+/// 回収簿に載せる子の上限。超えると新規の起動を受け付けない（子は drop せず、終了まで必ず回収する）。
 const REAP_MAX_CHILDREN: usize = 16;
-/// 回収スレッドが 1 回の起動で子を見張る上限（保持役の無登録猶予 30 秒 + VM 停止 30 秒に余裕を足す）。
-const REAP_WINDOW: Duration = Duration::from_secs(90);
 /// 回収スレッドの走査間隔。
 const REAP_INTERVAL: Duration = Duration::from_millis(200);
 
@@ -229,25 +228,31 @@ fn sweep_ledger() -> usize {
     g.len()
 }
 
-/// `child` を回収簿へ載せ、期限つきの回収スレッドで `try_wait` により回収する。スレッドは `REAP_WINDOW` で必ず終わり、
-/// 期限後も子の所有権は回収簿に残って次の呼び出しの走査で回収される（`Child::wait` で無期限に待たない。REPAIR-5）。
-/// 起動役が CLI のように先に終わる場合は、子が init に付け替わって回収される。
+/// 起動前の受付制限。回収簿が満杯なら新規起動を拒否する（子を drop して回収責任を失わないための上限の保証。REPAIR-5）。
+fn admit_spawn() -> Result<(), TraitError> {
+    if sweep_ledger() >= REAP_MAX_CHILDREN {
+        return Err(TraitError::new(
+            ErrorCode::Unavailable,
+            "too many vm keeper children are awaiting reaping",
+        ));
+    }
+    Ok(())
+}
+
+/// `child` を回収簿へ載せ、回収スレッドが `try_wait` の走査で終了まで回収する（`Child::wait` で無期限に塞がない。REPAIR-5）。
+/// 子は親（本プロセス）が回収しない限りゾンビとして残るため、回収簿が空になるまで走査を続け、期限で打ち切らない。
+/// 件数の上限は起動前の `admit_spawn` で守る。
 fn reap_in_background(child: Child) {
     {
         let mut g = REAP_LEDGER
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if g.len() >= REAP_MAX_CHILDREN {
-            g.retain_mut(|c| matches!(c.try_wait(), Ok(None)));
-        }
-        if g.len() >= REAP_MAX_CHILDREN {
-            // 上限超過は最古を回収簿から外す（drop は kill しない。終了後は init が回収する）。
-            #[allow(clippy::zombie_processes)]
-            // 上限超過の最古は諦める（終了後は init へ付け替わり回収される）
-            let _ = g.remove(0);
-        }
         g.push(child);
     }
+    spawn_reaper_if_needed();
+}
+
+fn spawn_reaper_if_needed() {
     use std::sync::atomic::Ordering;
     if REAPER_RUNNING
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -258,14 +263,22 @@ fn reap_in_background(child: Child) {
     let spawned = std::thread::Builder::new()
         .name("vm-keeper-reaper".to_owned())
         .spawn(|| {
-            let end = Instant::now() + REAP_WINDOW;
-            while Instant::now() < end && sweep_ledger() > 0 {
+            while sweep_ledger() > 0 {
                 std::thread::sleep(REAP_INTERVAL);
             }
             REAPER_RUNNING.store(false, Ordering::Release);
+            // 停止の判定と store の間に載った子を取りこぼさないよう、空でなければ起動し直す。
+            let pending = !REAP_LEDGER
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty();
+            if pending {
+                spawn_reaper_if_needed();
+            }
         });
     if spawned.is_err() {
         REAPER_RUNNING.store(false, Ordering::Release);
+        // スレッドを作れなくても、呼び出しごとの走査（admit_spawn）で回収される。
         let _ = sweep_ledger();
     }
 }

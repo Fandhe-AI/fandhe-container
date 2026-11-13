@@ -37,18 +37,51 @@ TASK-70 準備（#1880・MAC-3・MS-5）。macOS で小ファイルを多数扱�
 - alpine の busybox `date` は `%N` 非対応のため使わない。時刻が数値でない・非単調な場合は試行を失敗扱いにする（fail-closed）。
   `/proc/uptime` の分解能（10ms）で p95 が意味を持つかは実機でしか確かめられない。足りなければ人間がオーナーへ報告し、取り方を決め直す
 
+- report の壁時計の暫定対応表（#3106）: own の `cli-create-start-wait-delete-total` と docker の `docker-run-rm-total` の 1 組だけを
+  同等扱いにして率を出し、`wall_clock_method_match` に `provisional-pair` を記す（区間の定義は異なる: own は CLI 4 段の和、docker は run 全体）。
+  表以外の組は従来どおり `null` と `methods_differ`。この対応を確定扱いにするかはオーナー確認待ち
+
 ## spec の食い違い（spec 側への報告事項）
 
 PoC-11 の本文は「4KB ファイル 2000 個」と書くが、実測したスクリプトの実体は `echo x`（2 バイト）である。本書は実測済みの
 スクリプト側（2 バイト）に合わせ、spec を勝手に 4KB へ直さない。
 
-## 自前側の計測（未実装）
+## 自前側の計測（#3106・MAC-3）
 
-`--mode own` は未実装で、終了コード 5 と `code=unimplemented` で拒否する（REPAIR-3: 実装済みを装わない）。測れるようになる条件は次の後続実装:
+`--mode own`（`make mac-small-files-own`）は、自前 CLI の契約（CLI-1 の 3 OS 同一構文）で docker 側と同じワークロードを測る。
+`workload_script`・ファイル数・内容 2 バイト・試行数・バッチを共用し、出力は同じ schema（`target=own`・`mode=own`）。
 
-- #2232: plugin 実バックエンド配線（`plugin-backend-wiring.md`・TASK-115）の承認と W1〜W13 の起票・実装
-- #1906: TASK-191.h1。macOS 既定方式（常駐 VM 共用）の設計の承認。MAC-3 は既定方式の共有ルート配下の bind mount の上で測る想定
-  （`macos-shared-vm.md` の項目 5）。共有ルートの構成は #1906 の承認後に本書の手順へ足す（承認前は確定扱いにしない）
+**実機の現状（REPAIR-3）**: macOS の実経路（#4705 cli の置き換え・#2280 共有ルートの構成と bind ソース検証・#2281 plugin-macos の
+保持役の中継・#2275・#2278）は未実装。それが入るまで、実機の最初の probe（create / start）は構造化エラー
+（`UNIMPLEMENTED` / `FAILED_PRECONDITION`）を返し、`error: code=measurement-failed ... (cli code=<CODE>)` と終了コード 1 で止まる。
+値が出るのは後続実装の後で、実測と合否は #381（人間）。
+
+起動契約（1 試行）: `create --bundle <bundle> --label fandhe.mac-small-files.run=<tag> <id>` → `start <id>` →
+`state <id>`（`stopped` まで 0.1 秒間隔で繰り返す）→ `logs --stream stdout <id>` → `inspect <id>`（`status=stopped` かつ `exitCode=0`）→
+`delete <id>`。ID は `fms-<16 桁 16 進の tag>-<n>`。`--root` は付けない（macOS の状態はゲスト側にあり、#1906 項目 3 と
+Issue #2431 が未了のため専用ルートが効く前提を置かない）。他のコンテナには触れず、記録した自分の ID だけを後始末で `state`（NOT_FOUND を確認）→
+必要なら `kill KILL` → `delete` → `state` の順に片づける。確認できない ID があれば終了コード 4。回収対象に記録するのは create が成功した ID だけで、create が失敗（`ALREADY_EXISTS` を含む）した ID には kill・delete・state を送らない（所有を証明できないため）。create の期限切れ（成否不明）は警告で手動確認を促す。
+
+区間（method `cli-create-start-wait-delete-total`）: `(create の開始から stopped を返した state の終了まで) + (delete の開始から終了まで)`。
+logs・inspect の時間は含めない。偏りの向きは own に不利: CLI のプロセス起動を呼び出し回数ぶん払い、state のポーリング間隔（0.1 秒）が
+待ちに入る。`samples` に `create_us`・`start_us`・`wait_us`・`state_polls`・`delete_us` を残す。
+
+共有ルート構成（#1906 項目 2 の A 案）: VM 生成時に構成した共有ルート（既定はホームディレクトリ配下の作業用ルート 1 件）を virtiofs で共有し、
+ゲスト内でサブツリーを bind する。本スクリプトは VM の構成を変えず、操作者が申告した `--shared-root` の配下に `--host-dir`（試行ごとの bind 元）と
+`--bundle` があること、両者が互いに祖先・子孫でないこと、symlink を含まないことだけを副作用の前に確かめる（違反は終了コード 2）。共有ルートの
+実際の構成手段は #2280 の実装後に追記する。bind は `/data`（`rbind,rw`）、bundle の rootfs は `root.readonly=true`。
+
+bundle の作り方: `--bundle` は `rootfs/` を含み `config.json` を含まない実体ディレクトリ（`config.json` は試行ごとに jq で書き、終了時に消す。
+既にあれば拒否する）。rootfs は docker 側と同じイメージから作る: `docker image inspect --format '{{.Id}}' <image>` で ID を取り、その ID で
+`docker create` → `docker export` → `<bundle>/rootfs` へ展開する。その ID を `--image-id`（`IMAGE_ID`）で申告する。
+
+残余: `image_id` は申告値で、rootfs が本当にそのイメージかは検証しない（結果に `image_id_source: "declared"`）。macOS ホストでローカルの
+ImageStore を開く経路は作らない（#1906 項目 3）。ログの回転（既定 1 MiB × 3 世代）で `TS` 行が欠けた試行は件数の照合で失敗になる
+（count 50000・batch 1 の最悪でも約 1.5 MB で 3 世代に収まる見込み）。自前 CLI に版の表示は無く `backend_version` は `unknown`。
+
+logs の取得: `state` が stopped でも supervisor の最終 flush は終わっていない（`Stopped` の記録が先。crates/cli の list_logs の契約）ため、計測区間の外で `logs --follow --stream stdout` を使い、書き手の終了まで待って出し切る（期限は試行の残り時間）。非追従の取得は末尾の `TS`・`FILES_CREATED`・`DONE` を落とし得る。
+
+不採用の案: 区間内で `logs --follow` の終了を待つ案（追従のポーリング 200 ms が区間に入るため。logs は区間外なので取得には使う）、専用の `--root` を使う案（上記）。
 
 ## 時刻源（壁時計。#3104・MAC-3・REPAIR-5）
 
@@ -93,5 +126,5 @@ bash 5 の `EPOCHREALTIME` は使わない。前提ツールは bash 3.2 以上�
 ## 実行
 
 実行コマンド・出力の読み方は `AGENTS.md`「実機前提テスト」の MAC-3 の行を参照。自己テストは `make mac-small-files-selftest`
-（スタブの docker のみ。CI の `bench-regression` の並列グループ。platform-ci の macOS〔main への push と workflow_dispatch〕では
+（スタブの docker と自前 CLI のみ。CI の `bench-regression` の並列グループ。platform-ci の macOS〔main への push と workflow_dispatch〕では
 `/bin/bash` 3.2 と `/usr/bin/perl` でも回す。#3354）。

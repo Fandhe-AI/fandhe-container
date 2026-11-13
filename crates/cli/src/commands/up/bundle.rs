@@ -271,6 +271,24 @@ pub(super) fn write_bundle(state_root: &Path, p: &Prepared) -> Result<BundlePath
 
 #[cfg(test)]
 mod tests {
+    /// STACK-8・REPAIR-5: 応答しない I/O は期限で TIMEOUT になり、完了する I/O の結果はそのまま返る。
+    #[test]
+    fn stack8_repair5_bounded_io_times_out_and_passes_results() {
+        let d = std::time::Duration::from_millis(200);
+        assert_eq!(bounded_io(d, || Ok(7_u8)).expect("ok"), 7);
+        let e = bounded_io(d, || {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            Ok(())
+        })
+        .expect_err("timeout");
+        assert_eq!(e.code(), ErrorCode::Timeout);
+        let e = bounded_io(d, || -> Result<(), CliError> {
+            Err(CliError::new(ErrorCode::NotFound, "x"))
+        })
+        .expect_err("inner");
+        assert_eq!(e.code(), ErrorCode::NotFound);
+    }
+
     /// STACK-8・SEC-1: 残った rootfs は何も作らずに検出し、bundle が無ければ false。
     #[test]
     fn stack8_sec1_rootfs_residue_is_detected_without_creating() {

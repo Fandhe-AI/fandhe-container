@@ -39,9 +39,8 @@ impl<'a> ProductionNetworkProvisioner<'a> {
 
     /// `network ls` の出力から `(名前, モード)` の組を読む。
     fn list(&self) -> Result<Vec<(String, String)>, NetworkProvisionError> {
-        let mut buf = Vec::new();
-        let resolve = self.resolve;
-        match run_network_with(self.global, &NetworkArgs::Ls, &mut buf, resolve) {
+        let (exit, buf) = self.run_bounded(NetworkArgs::Ls, MSG_LIST)?;
+        match exit {
             CliExit::Success => {}
             CliExit::Error(e) => return Err(NetworkProvisionError::new(e.code_str(), MSG_LIST)),
             _ => return Err(NetworkProvisionError::new("INTERNAL", MSG_LIST)),
@@ -56,6 +55,28 @@ impl<'a> ProductionNetworkProvisioner<'a> {
                 Some((cols.next()?.to_owned(), cols.next()?.to_owned()))
             })
             .collect())
+    }
+}
+
+/// ネットワーク定義ストアの 1 操作に許す時間（応答しない FS で止まらない。REPAIR-5・STACK-8）。
+const NETWORK_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+impl ProductionNetworkProvisioner<'_> {
+    /// `run_network_with` を期限つきの作業スレッドで実行し、終了と出力を返す。期限切れは `TIMEOUT`。
+    /// 期限切れの作業が残る間は `bounded_io` がプロジェクトのロックを手放さない。
+    fn run_bounded(
+        &self,
+        args: NetworkArgs,
+        msg: &'static str,
+    ) -> Result<(CliExit, Vec<u8>), NetworkProvisionError> {
+        let global = self.global.clone();
+        let resolve = self.resolve;
+        super::bundle::bounded_io(NETWORK_OP_TIMEOUT, move || {
+            let mut buf = Vec::new();
+            let exit = run_network_with(&global, &args, &mut buf, resolve);
+            Ok((exit, buf))
+        })
+        .map_err(|e| NetworkProvisionError::new(e.code_str(), msg))
     }
 }
 
@@ -100,14 +121,9 @@ impl NetworkProvisioner for ProductionNetworkProvisioner<'_> {
                 MSG_NOT_FOUND,
             ));
         }
-        let resolve = self.resolve;
-        let mut sink = Vec::new();
-        match run_network_with(
-            self.global,
-            &NetworkArgs::Create(name.to_owned()),
-            &mut sink,
-            resolve,
-        ) {
+        let (created, _sink) =
+            self.run_bounded(NetworkArgs::Create(name.to_owned()), MSG_CREATE)?;
+        match created {
             CliExit::Success => Ok(ProvisionedNetwork::new(name, ProvisionOutcome::Created)),
             CliExit::Error(e) if e.code() == ErrorCode::AlreadyExists => {
                 // 確認と作成の間に別プロセスが作った。再確認して互換なら流用する。

@@ -17,6 +17,8 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::time::Duration;
 
 use fandhe_container_core::traits::{
     ContainerId, ContainerState, ErrorCode, GetStateRequest, HealthStatus, StateStore,
@@ -55,33 +57,50 @@ pub(super) struct Observed {
     pub(super) health: Option<ObservedHealth>,
 }
 
-/// 状態の読み取りの失敗（固定文言。値は含めない）。
+/// 状態ストア 1 回の読み取りに許す時間（応答しない FUSE・ネットワーク FS で止まらない。REPAIR-5・STACK-8）。
+const STATE_READ_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// 状態の読み取りの失敗（固定文言。値は含めない）。`timed_out` は期限切れ（`TIMEOUT` に分類する）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct ReadFailure;
+pub(super) struct ReadFailure {
+    pub(super) timed_out: bool,
+}
+
+impl ReadFailure {
+    const OTHER: Self = Self { timed_out: false };
+}
 
 /// `id` の記録を読み、状態と health を観測値へ写す。記録が無ければ `Absent`・health なし。
 ///
 /// 記録が無い（`NotFound`）以外の読み取り失敗は [`ReadFailure`]。
-pub(super) fn read_status(
-    store: &dyn StateStore,
+pub(super) fn read_status<S: StateStore + Send + Sync + 'static>(
+    store: &Arc<S>,
     id: &ServiceContainerId,
 ) -> Result<Observed, ReadFailure> {
-    let cid = ContainerId::new(id.as_str()).map_err(|_| ReadFailure)?;
-    match store.get(&GetStateRequest::new(cid)) {
+    let cid = ContainerId::new(id.as_str()).map_err(|_| ReadFailure::OTHER)?;
+    // `get` はロック待ちだけでなく state.json の読み取りも含む。応答しない FS で main が止まらないよう期限つきで行う。
+    let st = Arc::clone(store);
+    let got = super::bundle::bounded_io(STATE_READ_TIMEOUT, move || {
+        Ok(st.get(&GetStateRequest::new(cid)))
+    })
+    .map_err(|e| ReadFailure {
+        timed_out: e.code() == ErrorCode::Timeout,
+    })?;
+    match got {
         Ok(record) => {
             let state = match record.status().state() {
                 ContainerState::Creating => DependencyObservation::Creating,
                 ContainerState::Created => DependencyObservation::Created,
                 ContainerState::Running => DependencyObservation::Running,
                 ContainerState::Stopped => DependencyObservation::Stopped,
-                _ => return Err(ReadFailure),
+                _ => return Err(ReadFailure::OTHER),
             };
             let health = match record.health() {
                 None => None,
                 Some(HealthStatus::Starting) => Some(ObservedHealth::Starting),
                 Some(HealthStatus::Healthy) => Some(ObservedHealth::Healthy),
                 Some(HealthStatus::Unhealthy) => Some(ObservedHealth::Unhealthy),
-                Some(_) => return Err(ReadFailure),
+                Some(_) => return Err(ReadFailure::OTHER),
             };
             Ok(Observed { state, health })
         }
@@ -89,18 +108,18 @@ pub(super) fn read_status(
             state: DependencyObservation::Absent,
             health: None,
         }),
-        Err(_) => Err(ReadFailure),
+        Err(_) => Err(ReadFailure::OTHER),
     }
 }
 
 /// 台帳にあるサービスの記録を読む（無ければ `Absent` 相当）。
-fn observe_ledgered(
-    store: &dyn StateStore,
+fn observe_ledgered<S: StateStore + Send + Sync + 'static>(
+    store: &Arc<S>,
     ledger: &SharedLedger,
     service: &str,
 ) -> Result<Observed, ReadFailure> {
     let id = {
-        let l = ledger.try_borrow().map_err(|_| ReadFailure)?;
+        let l = ledger.try_borrow().map_err(|_| ReadFailure::OTHER)?;
         l.get(service).cloned()
     };
     match id {
@@ -113,42 +132,60 @@ fn observe_ledgered(
 }
 
 /// 本番の [`DependencyObserver`]。
-pub(super) struct StateObserver<S: StateStore> {
-    store: Rc<S>,
+pub(super) struct StateObserver<S: StateStore + Send + Sync + 'static> {
+    store: Arc<S>,
     ledger: SharedLedger,
 }
 
-impl<S: StateStore> StateObserver<S> {
-    pub(super) fn new(store: Rc<S>, ledger: SharedLedger) -> Self {
+impl<S: StateStore + Send + Sync + 'static> StateObserver<S> {
+    pub(super) fn new(store: Arc<S>, ledger: SharedLedger) -> Self {
         Self { store, ledger }
     }
 }
 
-impl<S: StateStore> DependencyObserver for StateObserver<S> {
+impl<S: StateStore + Send + Sync + 'static> DependencyObserver for StateObserver<S> {
     fn observe(&mut self, service: &str) -> Result<DependencyObservation, ObserveError> {
-        observe_ledgered(self.store.as_ref(), &self.ledger, service)
+        observe_ledgered(&self.store, &self.ledger, service)
             .map(|o| o.state)
-            .map_err(|_| ObserveError::new("UNAVAILABLE", "container state could not be read"))
+            .map_err(|e| {
+                ObserveError::new(
+                    if e.timed_out {
+                        "TIMEOUT"
+                    } else {
+                        "UNAVAILABLE"
+                    },
+                    "container state could not be read",
+                )
+            })
     }
 }
 
 /// 本番の [`HealthSource`]。
-pub(super) struct StateHealth<S: StateStore> {
-    store: Rc<S>,
+pub(super) struct StateHealth<S: StateStore + Send + Sync + 'static> {
+    store: Arc<S>,
     ledger: SharedLedger,
 }
 
-impl<S: StateStore> StateHealth<S> {
-    pub(super) fn new(store: Rc<S>, ledger: SharedLedger) -> Self {
+impl<S: StateStore + Send + Sync + 'static> StateHealth<S> {
+    pub(super) fn new(store: Arc<S>, ledger: SharedLedger) -> Self {
         Self { store, ledger }
     }
 }
 
-impl<S: StateStore> HealthSource for StateHealth<S> {
+impl<S: StateStore + Send + Sync + 'static> HealthSource for StateHealth<S> {
     fn observe(&mut self, service: &str) -> Result<Option<ObservedHealth>, HealthSourceError> {
-        observe_ledgered(self.store.as_ref(), &self.ledger, service)
+        observe_ledgered(&self.store, &self.ledger, service)
             .map(|o| o.health)
-            .map_err(|_| HealthSourceError::new("UNAVAILABLE", "container state could not be read"))
+            .map_err(|e| {
+                HealthSourceError::new(
+                    if e.timed_out {
+                        "TIMEOUT"
+                    } else {
+                        "UNAVAILABLE"
+                    },
+                    "container state could not be read",
+                )
+            })
     }
 }
 
@@ -209,7 +246,7 @@ mod tests {
     #[test]
     fn stack8_4638_unledgered_service_is_absent_even_if_a_record_exists() {
         let s = Scratch::new("absent");
-        let store = Rc::new(open(&s));
+        let store = Arc::new(open(&s));
         let bundle = s.0.join("bundle");
         std::fs::create_dir_all(&bundle).expect("bundle");
         let db = id("db");
@@ -230,7 +267,7 @@ mod tests {
     #[test]
     fn stack8_4638_ledgered_service_reflects_state_and_health() {
         let s = Scratch::new("ledgered");
-        let store = Rc::new(open(&s));
+        let store = Arc::new(open(&s));
         let bundle = s.0.join("bundle");
         std::fs::create_dir_all(&bundle).expect("bundle");
         let db = id("db");
@@ -261,7 +298,7 @@ mod tests {
     #[test]
     fn stack8_4638_borrowed_ledger_is_an_observe_error_not_a_panic() {
         let s = Scratch::new("borrow");
-        let store = Rc::new(open(&s));
+        let store = Arc::new(open(&s));
         let ledger: SharedLedger = Rc::default();
         let mut obs = StateObserver::new(store, ledger.clone());
         let _held = ledger.borrow_mut();

@@ -438,10 +438,13 @@ pub(super) fn run_up(global: &GlobalArgs, args: &UpArgs, stdout: &mut dyn Write)
     }
 
     // 3. ストアを開き、全サービスを事前検査する。
-    let store = match open_store(global) {
-        Ok(s) => s,
-        Err(e) => return store_open_failure(&e),
-    };
+    let open_global = global.clone();
+    let store =
+        match super::bundle::bounded_io(PREPARE_TIMEOUT, move || Ok(open_store(&open_global))) {
+            Ok(Ok(s)) => std::sync::Arc::new(s),
+            Ok(Err(e)) => return store_open_failure(&e),
+            Err(e) => return CliExit::Error(e),
+        };
     let Some(state_root) = store.host_state_root().map(Path::to_path_buf) else {
         return err(ErrorCode::Internal, "state root is unavailable");
     };
@@ -471,6 +474,12 @@ pub(super) fn run_up(global: &GlobalArgs, args: &UpArgs, stdout: &mut dyn Write)
                 );
             }
             Ok(_) => {}
+            Err(f) if f.timed_out => {
+                return err(
+                    ErrorCode::Timeout,
+                    "container state read did not finish within the deadline",
+                );
+            }
             Err(_) => return err(ErrorCode::Internal, "container state could not be read"),
         }
         prepared.insert(name.clone(), p);
@@ -511,13 +520,18 @@ pub(super) fn run_up(global: &GlobalArgs, args: &UpArgs, stdout: &mut dyn Write)
                 );
             }
             Ok(_) => {}
+            Err(f) if f.timed_out => {
+                return err(
+                    ErrorCode::Timeout,
+                    "container state read did not finish within the deadline",
+                );
+            }
             Err(_) => return err(ErrorCode::Internal, "container state could not be read"),
         }
     }
 
     // 4. 副作用はここから。
     let ledger: SharedLedger = Rc::new(std::cell::RefCell::new(Ledger::default()));
-    let store = Rc::new(store);
     let cli_exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(_) => {
@@ -540,8 +554,8 @@ pub(super) fn run_up(global: &GlobalArgs, args: &UpArgs, stdout: &mut dyn Write)
         start_deadline,
     });
     let mut provisioner = ProductionNetworkProvisioner::new(global, resolve_publish_privilege);
-    let mut observer = StateObserver::new(Rc::clone(&store), Rc::clone(&ledger));
-    let mut health = StateHealth::new(Rc::clone(&store), Rc::clone(&ledger));
+    let mut observer = StateObserver::new(std::sync::Arc::clone(&store), Rc::clone(&ledger));
+    let mut health = StateHealth::new(std::sync::Arc::clone(&store), Rc::clone(&ledger));
     let mut clock = UpClock::new();
     let up_project = UpProject {
         services: &services,

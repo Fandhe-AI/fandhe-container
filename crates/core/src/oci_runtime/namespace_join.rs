@@ -61,13 +61,16 @@
 //!
 //! # 未実装・残余（REPAIR-3）
 //!
-//! - init（呼び出し側）の user namespace 所有の netns（rootful・ホストの netns）への join は受けない（`Unimplemented`。
-//!   #2241 の判断待ち）。
+//! - init（呼び出し側）の user namespace 所有の netns（rootful・ホストの netns）への join は、この pod join では受けない
+//!   （`Unimplemented`）。rootful のユーザー定義ネットワークの init 所有 netns は、起動オプションから入る別の入口
+//!   （`pinned_net`。D12・#3069。user namespace の作成前に参加する）で受ける。`RootfulHostRoot` は #2241 で恒久拒否のまま。
 //! - pid の共有（`shareProcessNamespace`）は未対応。コンテナの init が PID 1 であることを制限適用の証跡の前提に
 //!   している（`exec::check_establish_preconditions`・`Pid1Target`）ため、既存の pid namespace への参加と両立しない。
 //! - `/dev/shm`（POSIX shm）は共有されない（core がコンテナごとの tmpfs を載せる）。SysV IPC と POSIX mqueue が
 //!   共有される。
 //! - 周辺の未完: 保持役の素性の永続化と再起動後の再採用は #2940、rootless の本番 PodNetworkProvider（pasta）は #2879。
+
+mod pinned_net;
 
 use std::path::Path;
 #[cfg(target_os = "linux")]
@@ -76,6 +79,8 @@ use std::sync::Arc;
 use super::config::{NamespaceKind, OciConfig};
 use crate::audit_log::PodNamespaceJoinOutcome;
 use crate::traits::{ErrorCode, TraitError};
+
+pub use pinned_net::{NetnsJoinTarget, PinnedNetnsJoin};
 
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};

@@ -14,7 +14,7 @@ TASK-191 の着手前に確定が要る未決事項 4 点と計測対象を、�
 
 - `Vm::launch` は 1 回で 1 VM を構成・起動する。virtiofs 共有は構成時に固定される（`MAX_VIRTIOFS_SHARES` = 8）
 - plugin-macos は 1 コンテナ = 1 VM で、状態はメモリだけに持つ。kill・delete・state は `UNIMPLEMENTED`。要求本体は `Vec<String>` の暫定ワイヤー契約
-- macOS の VZ vsock は `Unimplemented`。ゲスト init は mount・報告・ready マーカーまでで、子を作らず、協調停止も無く、mount にパス由来の TOCTOU が残る（#2080 の P2-4。#2268 で fd 起点の mount へ移行済み）
+- macOS の VZ vsock は `Unimplemented`。ゲスト init は mount・報告・ready マーカー・子の回収（#2269）・協調停止（#2270。停止要求で全プロセスを止めて `sync` → `reboot(RB_POWER_OFF)`。ホスト側は `Vm::shutdown` が猶予後に強制停止へ切り替える。plugin-macos の `stop` が使う）までで、子は作らない。mount のパス由来の TOCTOU は #2268 で fd 起点の mount へ移行済み（#2080 の P2-4）
 - 詳細は [macos-vm-strategy.md](macos-vm-strategy.md) の「現状の事実」を参照
 
 ## 設計上の制約
@@ -141,7 +141,7 @@ TASK-191 の着手前に確定が要る未決事項 4 点と計測対象を、�
 | VM の start | 30 秒 | `OpTimeouts::start`（`DEFAULT_START_TIMEOUT`） |
 | ゲストの ready | 60 秒 | `DEFAULT_GUEST_MOUNT_TIMEOUT` |
 | vsock の接続・中継の 1 往復 | 10 秒以内 | `RpcTimeout` の上限（値は案） |
-| 協調停止（ゲスト内停止 → 電源断 → 強制停止） | 案: 30 秒 | 新規（承認待ち） |
+| 協調停止（ゲスト内停止 → 電源断 → 強制停止） | 案: 30 秒 | `OpTimeouts::graceful_stop`（`DEFAULT_GRACEFUL_STOP_TIMEOUT`。#2270 で実装、値は承認待ち）。1 コンテナ = 1 VM の plugin は RPC 期限 10 秒に収めるため 5 秒（`PLUGIN_STOP_GRACE`）。ゲスト内の待ちは SIGTERM 3 秒＋SIGKILL 1 秒（`guest-init` の `shutdown`） |
 | 保持役の終了猶予 | 案: 30 秒 | 新規（承認待ち） |
 
 ## Windows の実行構成との比較と PLUG-1 の変化
@@ -180,6 +180,7 @@ Apple Silicon の macOS 実機で確かめないと決まらない。すべて�
 - VM のメモリ、コンテナ数の上限の妥当性（CORE-8）
 - ゲストカーネルの cgroup v2・Landlock・user namespace の動作
 - 協調停止（`reboot(RB_POWER_OFF)`）が VZ でどの状態遷移になるか
+- `requestStop` が PL061 GPIO・gpio-keys の `KEY_POWER` としてゲストへ届くか（#2270 は guest-init の power button 監視と Kconfig の `GPIO_PL061`・`KEYBOARD_GPIO`・`INPUT_EVDEV` を足したが、実 VM での到達は未確認。#1628・#2282。届かなければホストが猶予の後に強制停止する）
 
 ## 判断事項・承認事項の一覧（#1906 で確認）
 

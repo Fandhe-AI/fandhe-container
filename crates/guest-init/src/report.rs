@@ -66,6 +66,10 @@ pub enum InitStage {
     Cmdline,
     /// PID 1 の panic（panic hook が出す。原因は載せない）。
     Panic,
+    /// 停止要求シグナルのブロック（`sigprocmask`）の失敗（MAC-4・#2270）。
+    Signals,
+    /// 協調停止の電源断（`reboot(RB_POWER_OFF)`）の失敗（MAC-4・#2270）。
+    PowerOff,
 }
 
 impl InitStage {
@@ -76,6 +80,8 @@ impl InitStage {
             Self::Sys => "sys",
             Self::Cmdline => "cmdline",
             Self::Panic => "panic",
+            Self::Signals => "signals",
+            Self::PowerOff => "poweroff",
         }
     }
 }
@@ -168,6 +174,11 @@ impl ReportLine {
             stage.as_str(),
             errno.get()
         ))
+    }
+
+    /// 協調停止の開始の診断行（固定。errno を持たない。報告行の接頭辞とは重ならない。MAC-4・#2270）。
+    pub fn shutdown_begin() -> Self {
+        Self("fandhe-guest: init shutdown begin".to_string())
     }
 
     /// 起動完了マーカー。
@@ -338,5 +349,23 @@ mod tests {
         assert_eq!(Errno::EBUSY.get(), 16);
         assert!(!p.as_str().starts_with(REPORT_PREFIX));
         assert!(!b.as_str().starts_with(REPORT_PREFIX));
+    }
+
+    /// MAC-4・#2270: 協調停止の診断行は固定の語彙で、報告行・ready・プローブの名前空間と重ならない。
+    #[test]
+    fn mac4_2270_shutdown_diagnostics_are_exact() {
+        let begin = ReportLine::shutdown_begin();
+        assert_eq!(begin.as_str(), "fandhe-guest: init shutdown begin");
+        let off = ReportLine::init_error(InitStage::PowerOff, Errno::new(1));
+        assert_eq!(
+            off.as_str(),
+            "fandhe-guest: init error stage=poweroff errno=1"
+        );
+        for l in [begin.as_str(), off.as_str()] {
+            assert!(!l.starts_with(REPORT_PREFIX));
+            assert!(!l.starts_with(PROBE_NAMESPACE));
+            assert!(!l.starts_with(READY_MARKER));
+            assert!(l.len() <= MAX_REPORT_LINE_BYTES);
+        }
     }
 }

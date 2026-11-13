@@ -20,10 +20,6 @@ fn main() {
 }
 
 #[cfg(unix)]
-#[path = "../../core/tests/support/scratch_root.rs"]
-mod scratch_root;
-
-#[cfg(unix)]
 fn main() -> std::process::ExitCode {
     unix::main()
 }
@@ -43,8 +39,6 @@ mod unix {
     use fandhe_container_supervisor::vm_keeper::lock::KeeperLock;
     use fandhe_container_supervisor::vm_keeper::protocol::Reason;
     use fandhe_container_supervisor::vm_keeper::{KeeperConfig, VmLifecycle, VmStopOutcome, run};
-
-    use super::scratch_root::ScratchDir;
 
     const SOCKET_FILE: &str = "vm-keeper-default.sock";
     const WATCHDOG: Duration = Duration::from_secs(180);
@@ -178,8 +172,35 @@ mod unix {
         }
     }
 
-    fn scratch(tag: &str) -> ScratchDir {
-        ScratchDir::new(&format!("fcvk-{tag}"), Duration::from_secs(10))
+    /// socket を置く短いパスの試験用ディレクトリ（MAC-4・REPAIR-12）。
+    /// macOS の `$TMPDIR` は長く、配下の socket が sun_path の上限（104 バイト）を超えるため、
+    /// `/tmp` 直下に 0700 で排他作成し、Drop で再帰削除する（作成した自分のパスだけ）。
+    struct ShortDir(PathBuf);
+
+    impl ShortDir {
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for ShortDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn scratch(tag: &str) -> ShortDir {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let p = PathBuf::from(format!("/tmp/fcvk-{tag}-{}-{nanos:x}", std::process::id()));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&p)
+            .unwrap_or_else(|e| panic!("exclusively create {}: {e}", p.display()));
+        ShortDir(p)
     }
 
     fn runtime_dir(base: &Path) -> Res<PathBuf> {

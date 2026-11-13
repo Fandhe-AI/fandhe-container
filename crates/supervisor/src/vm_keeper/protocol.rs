@@ -31,6 +31,53 @@ fn invalid(message: &'static str) -> TraitError {
     TraitError::new(ErrorCode::InvalidArgument, message)
 }
 
+/// 要求の固定長ヘッダ（magic・version・kind・id 長）。符号化はこの型だけが行い、壊れたヘッダ値
+/// （magic・version の不一致）を表現できない（REPAIR-2）。
+#[derive(Debug, Clone, Copy)]
+struct RequestHeader {
+    kind: u8,
+    id_len: u16,
+}
+
+impl RequestHeader {
+    fn to_bytes(self) -> [u8; REQUEST_HEADER_LEN] {
+        let len = self.id_len.to_be_bytes();
+        let m = MAGIC;
+        [m[0], m[1], m[2], m[3], VERSION, self.kind, len[0], len[1]]
+    }
+}
+
+/// 応答の固定長 payload。`to_bytes` が唯一の符号化口（REPAIR-2）。
+#[derive(Debug, Clone, Copy)]
+struct ResponseWire {
+    reason: u8,
+    refcount: u16,
+    keeper_pid: u32,
+}
+
+impl ResponseWire {
+    fn to_bytes(self) -> [u8; RESPONSE_LEN] {
+        let m = MAGIC;
+        let c = self.refcount.to_be_bytes();
+        let p = self.keeper_pid.to_be_bytes();
+        [
+            m[0],
+            m[1],
+            m[2],
+            m[3],
+            VERSION,
+            KIND_RESPONSE,
+            self.reason,
+            c[0],
+            c[1],
+            p[0],
+            p[1],
+            p[2],
+            p[3],
+        ]
+    }
+}
+
 /// 起動役から保持役への要求。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
@@ -50,12 +97,13 @@ impl Request {
             Self::Unregister(id) => (KIND_UNREGISTER, id.as_str().as_bytes()),
             Self::Status => (KIND_STATUS, &[]),
         };
+        // `ContainerId` は 255 バイト以下のため u16 に収まる（超過は 0xFFFF に丸めず復号側が拒否する長さになる）。
+        let header = RequestHeader {
+            kind,
+            id_len: u16::try_from(id.len()).unwrap_or(u16::MAX),
+        };
         let mut out = Vec::with_capacity(REQUEST_HEADER_LEN + id.len());
-        out.extend_from_slice(&MAGIC);
-        out.push(VERSION);
-        out.push(kind);
-        // `ContainerId` は 255 バイト以下のため u16 に収まる。
-        out.extend_from_slice(&(id.len() as u16).to_be_bytes());
+        out.extend_from_slice(&header.to_bytes());
         out.extend_from_slice(id);
         out
     }
@@ -155,14 +203,13 @@ pub struct Response {
 impl Response {
     /// payload へ符号化する（固定長 [`RESPONSE_LEN`]）。
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(RESPONSE_LEN);
-        out.extend_from_slice(&MAGIC);
-        out.push(VERSION);
-        out.push(KIND_RESPONSE);
-        out.push(self.reason.code());
-        out.extend_from_slice(&self.refcount.to_be_bytes());
-        out.extend_from_slice(&self.keeper_pid.to_be_bytes());
-        out
+        ResponseWire {
+            reason: self.reason.code(),
+            refcount: self.refcount,
+            keeper_pid: self.keeper_pid,
+        }
+        .to_bytes()
+        .to_vec()
     }
 
     /// payload を復号する。固定長・magic・version・kind・理由コードのいずれかが不正なら `InvalidArgument`。

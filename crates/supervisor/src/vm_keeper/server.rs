@@ -45,6 +45,67 @@ fn log(level: &'static str, message: &'static str) {
     let _ = crate::stderr_sink::stderr().emit(line.into_bytes());
 }
 
+/// 要求種別ごとの結果分類別カウント（REPAIR-4）。保持役のプロセス内だけで持ち、1 要求ごとの構造化ログに現在値を載せる。
+#[derive(Debug, Default)]
+struct OpStats {
+    /// `[種別][結果分類]` の件数。種別は register・unregister・status、結果分類は `reason_index` の 0〜4。
+    counts: [[u64; 5]; 3],
+}
+
+impl OpStats {
+    fn record(&mut self, op: usize, reason: Reason) -> u64 {
+        let cell = self
+            .counts
+            .get_mut(op)
+            .and_then(|row| row.get_mut(reason_index(reason)));
+        match cell {
+            Some(c) => {
+                *c = c.saturating_add(1);
+                *c
+            }
+            None => 0,
+        }
+    }
+}
+
+fn reason_index(reason: Reason) -> usize {
+    match reason {
+        Reason::Ok => 0,
+        Reason::AlreadyRegistered => 1,
+        Reason::NotRegistered => 2,
+        Reason::CapacityExceeded => 3,
+        Reason::ShuttingDown => 4,
+    }
+}
+
+fn reason_name(reason: Reason) -> &'static str {
+    match reason {
+        Reason::Ok => "ok",
+        Reason::AlreadyRegistered => "already_registered",
+        Reason::NotRegistered => "not_registered",
+        Reason::CapacityExceeded => "capacity_exceeded",
+        Reason::ShuttingDown => "shutting_down",
+    }
+}
+
+fn op_of(request: &Request) -> (usize, &'static str) {
+    match request {
+        Request::Register(_) => (0, "register"),
+        Request::Unregister(_) => (1, "unregister"),
+        Request::Status => (2, "status"),
+    }
+}
+
+/// 1 要求の結果を構造化ログ 1 行で出す（英語の固定語彙のみ。ID・パスは含めない）。
+fn log_op(op: &'static str, reason: Reason, count: u64, refcount: u16, elapsed: Duration) {
+    let elapsed_us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+    let result = reason_name(reason);
+    let line = format!(
+        "{{\"level\":\"info\",\"event\":\"vm_keeper_op\",\"op\":\"{op}\",\"result\":\"{result}\",\"count\":{count},\"refcount\":{refcount},\"elapsed_us\":{elapsed_us}}}\n"
+    );
+    let _ = crate::stderr_sink::stderr().emit(line.into_bytes());
+}
+
 fn drain_observer(observer: &mut JsonLinesPeerAuthObserver) {
     for mut line in observer.drain_lines() {
         line.push('\n');
@@ -89,11 +150,26 @@ fn apply(registry: &mut Registry, request: Request, now: Instant, pid: u32) -> R
 }
 
 /// 1 接続の 1 要求を処理する。失敗は呼び出し側が接続を捨てる（受付ループは継続する）。
-fn serve_one(stream: &mut UdsStream, registry: &mut Registry, pid: u32) -> Result<(), TraitError> {
+fn serve_one(
+    stream: &mut UdsStream,
+    registry: &mut Registry,
+    stats: &mut OpStats,
+    pid: u32,
+) -> Result<(), TraitError> {
     let timeout = RpcTimeout::new(REQUEST_IO_TIMEOUT).map_err(from_plugin)?;
     let frame = stream.read_frame(timeout).map_err(from_plugin)?;
     let request = Request::decode(frame.payload())?;
-    let response = apply(registry, request, Instant::now(), pid);
+    let (op, op_name) = op_of(&request);
+    let started = Instant::now();
+    let response = apply(registry, request, started, pid);
+    let count = stats.record(op, response.reason);
+    log_op(
+        op_name,
+        response.reason,
+        count,
+        response.refcount,
+        started.elapsed(),
+    );
     let out = Frame::new(response.encode()).map_err(from_plugin)?;
     stream.write_frame(&out, timeout).map_err(from_plugin)
 }
@@ -118,6 +194,10 @@ pub fn run(
     let mut observer = JsonLinesPeerAuthObserver::new();
     let mut rejections: u32 = 0;
     let mut other_errors: u32 = 0;
+    let mut stats = OpStats::default();
+    // 受付ループの致命的な失敗。停止順（VM stop → listener drop → lock 解放）を飛ばさないため、
+    // ここへ退避して後段の停止手順を必ず通してから返す。
+    let mut fatal: Option<TraitError> = None;
 
     loop {
         let now = Instant::now();
@@ -131,11 +211,15 @@ pub fn run(
             Ok(mut stream) => {
                 rejections = 0;
                 other_errors = 0;
-                if serve_one(&mut stream, &mut registry, pid).is_err() {
+                if serve_one(&mut stream, &mut registry, &mut stats, pid).is_err() {
                     log("warn", "vm keeper request failed");
                 }
             }
-            Err(e) if e.code() == fandhe_container_plugin::PluginErrorCode::Timeout => {}
+            Err(e) if e.code() == fandhe_container_plugin::PluginErrorCode::Timeout => {
+                // 正常な待ち切れは健全な周回。「連続」失敗の数え直しに含める。
+                rejections = 0;
+                other_errors = 0;
+            }
             Err(e) if e.code() == fandhe_container_plugin::PluginErrorCode::PermissionDenied => {
                 rejections = rejections.saturating_add(1);
                 drain_observer(&mut observer);
@@ -144,7 +228,8 @@ pub fn run(
             Err(e) => {
                 other_errors += 1;
                 if other_errors > MAX_CONSECUTIVE_ACCEPT_ERRORS {
-                    return Err(from_plugin(e));
+                    fatal = Some(from_plugin(e));
+                    break;
                 }
                 std::thread::sleep(BACKOFF_START);
             }
@@ -153,7 +238,14 @@ pub fn run(
     }
 
     // 終了の順序: VM の停止 → socket の削除（listener の drop）→ ロックの解放。
-    log("info", "vm keeper idle grace elapsed");
+    log(
+        "info",
+        if fatal.is_some() {
+            "vm keeper stopping after a fatal accept failure"
+        } else {
+            "vm keeper idle grace elapsed"
+        },
+    );
     let vm_stop = match vm.stop(VM_STOP_DEADLINE) {
         Ok(outcome) => outcome,
         Err(_) => {
@@ -164,7 +256,10 @@ pub fn run(
     drain_observer(&mut observer);
     drop(listener);
     drop(lock);
-    Ok(KeeperExit { vm_stop })
+    match fatal {
+        Some(e) => Err(e),
+        None => Ok(KeeperExit { vm_stop }),
+    }
 }
 
 #[cfg(test)]
@@ -185,6 +280,16 @@ mod tests {
         assert_eq!(backoff(9), Duration::from_millis(320));
         assert_eq!(backoff(10), Duration::from_millis(500));
         assert_eq!(backoff(u32::MAX), Duration::from_millis(500));
+    }
+
+    #[test]
+    fn mac4_op_stats_count_per_op_and_result() {
+        let mut s = OpStats::default();
+        assert_eq!(s.record(0, Reason::Ok), 1);
+        assert_eq!(s.record(0, Reason::Ok), 2);
+        assert_eq!(s.record(0, Reason::AlreadyRegistered), 1);
+        assert_eq!(s.record(1, Reason::NotRegistered), 1);
+        assert_eq!(s.record(9, Reason::Ok), 0);
     }
 
     #[test]

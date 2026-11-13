@@ -101,9 +101,8 @@ impl KeeperClient {
         )
         .map_err(from_plugin)?;
         let reply = stream.read_frame(timeout).map_err(from_plugin)?;
-        if Instant::now() > deadline {
-            return Err(deadline_error());
-        }
+        // 期限直後に届いた成功応答も捨てない（読み取り自体は上の期限つきで有界。捨てると準備済みの保持役を
+        // 起動役が SIGKILL しうる）。
         Response::decode(reply.payload())
     }
 
@@ -164,8 +163,8 @@ impl KeeperClient {
         })?;
         loop {
             match self.call(&Request::Status, PROBE_CONNECT_TIMEOUT, limit) {
-                Ok(resp) if Instant::now() <= limit => return Ok((resp, Some(child))),
-                Ok(_) => return Err(stop_child(&mut child, deadline_error())),
+                // 期限直後でも応答済みの保持役は採用する（kill しない）。
+                Ok(resp) => return Ok((resp, Some(child))),
                 Err(e) if e.code() == ErrorCode::PermissionDenied => {
                     return Err(stop_child(&mut child, e));
                 }

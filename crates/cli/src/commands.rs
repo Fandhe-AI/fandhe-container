@@ -20,10 +20,10 @@
 //! 終了コードはコマンド自身の値（`Signaled(s)` は `128 + s`。コマンドが起動できなかった場合は子の 125 / 126 / 127）で、基盤側の失敗だけが
 //! stderr に構造化エラー 1 行を出して ERR-2 の表の終了コードになる（コマンドの 1〜10 と重なるため、見分けは stderr の行の有無）。標準入出力は `/dev/null`
 //! 固定（未実装。REPAIR-3）。Linux のみ（非 Linux は他のコマンドと同じ plugin 解決で fail-closed）。
-//! `image ls` / `system df` / `image rm [--force]` / `image tag` は oci の管理 API（`image_management`）を呼ぶ（#2221・CLI-1・OCI-7。`image` module）。
-//! イメージストアの root は必須オプション `--image-root`。参照テーブルの永続化が oci 側で未実装のため、現状は `image ls` が
-//! 常にヘッダのみ・`image rm` が常に `NOT_FOUND` になる。既定 root・非 Linux の実行経路・`image prune` は未配線
-//! （詳細は `image` module の doc。REPAIR-3）。
+//! `image ls` / `system df` / `image rm [--force]` / `image tag` / `image prune` は oci の管理 API（`image_management`）を呼ぶ
+//! （#2221・#2384・CLI-1・OCI-7。`image` module）。イメージストアの root は任意オプション `--image-root`（絶対パス）で、省略時は
+//! Linux で `<状態ルート>/.cri/images`、macOS ホストは既定なし、Windows ホストは `UNIMPLEMENTED`（`image_root` module・
+//! `docs/design/image-root-default.md`）。非 Linux の実行経路（`--image-root` つき）は未配線（詳細は `image` module の doc。REPAIR-3）。
 //! `setup` は OS 固有設定のステップ提示で `setup` module にのみ委譲する（日常操作コマンドは OS 固有設定を持たない。TASK-80.1・CLI-2）。
 //! 終了コードは core の ERR-2 表（`OCI_EXIT_*`）に揃える。
 //!
@@ -69,6 +69,7 @@ mod create_start;
 mod exec;
 mod image;
 mod image_refs;
+mod image_root;
 mod image_unpack;
 mod kill_signal;
 mod list_logs;
@@ -611,13 +612,13 @@ mod tests {
             args(&["list", "--all"]),
             args(&["image"]),
             args(&["image", "bogus"]),
-            args(&["image", "ls"]),
             args(&["image", "ls", "--image-root", "rel"]),
-            args(&["image", "rm", "x"]),
+            args(&["image", "prune", "extra"]),
+            args(&["image", "prune", "--force"]),
+            args(&["image", "prune", "--image-root", "rel"]),
             args(&["image", "tag", "x"]),
             args(&["system"]),
             args(&["system", "bogus"]),
-            args(&["system", "df"]),
             args(&["setup", "x"]),
             args(&["setup", "--x"]),
             args(&["doctor", "x"]),

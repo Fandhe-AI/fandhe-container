@@ -5,7 +5,7 @@
 //! （`ContainerId`・`CreateRequest`・`StateRoot`）に委ねる（検査の二重実装を避ける。SEC-1）。
 //! 構文は runc 互換: `fandhe-container [--root <dir>] create [--image-root <dir> --image <sha256:digest|name[:tag]> [--unpack]] --bundle <dir> <id>` / `... start [--audit-policy <best-effort|strict>] <id>` / `... stop [--signal <名前|番号>] <id>` / `... kill <id> [<signal>]` / `... inspect <id>` / `... state <id>` / `... delete [--force] [--image-root <dir>] <id>` / `... list` / `... logs [--follow] [--tail <N>] [--stream <stdout|stderr>] [--escape] <id>`。
 //! `exec`（SUP-6・#2626）は `... exec [--env KEY=VALUE]... [--timeout <秒>] <id> <path> [<arg>...]`（オプションは `<id>` の前だけ）。
-//! イメージ管理（#2221）は `image ls --image-root <dir>` / `image rm [--force] --image-root <dir> <ref>` / `image tag --image-root <dir> <source> <target>` / `system df --image-root <dir>`（`--image-root` は必須の絶対パス）。
+//! イメージ管理（#2221）は `image ls [--image-root <dir>]` / `image rm [--force] [--image-root <dir>] <ref>` / `image tag [--image-root <dir>] <source> <target>` / `image prune [--image-root <dir>]`（#2384）/ `system df [--image-root <dir>]`（`--image-root` は任意の絶対パス。省略時の既定は `image_root` module）。
 //! ユーザー定義ネットワーク（#3066・NET-6）は `network create <name>` / `network rm <name>` / `network ls`（オプションなし）。
 //! 解析失敗の理由は呼び出し元で固定文言に落とし、引数値を出力へ埋め込まない（インジェクション回避）。
 
@@ -227,12 +227,21 @@ pub(super) struct LogsArgs {
 /// `image` サブコマンドの引数（#2221・CLI-1・OCI-7）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ImageArgs {
-    /// `image ls --image-root <dir>`。
+    /// `image ls [--image-root <dir>]`。
     Ls(ImageLsArgs),
-    /// `image rm [--force] --image-root <dir> <ref>`。
+    /// `image rm [--force] [--image-root <dir>] <ref>`。
     Rm(ImageRmArgs),
-    /// `image tag --image-root <dir> <source> <target>`（#2316）。
+    /// `image tag [--image-root <dir>] <source> <target>`（#2316）。
     Tag(ImageTagArgs),
+    /// `image prune [--image-root <dir>]`（#2384）。
+    Prune(ImagePruneArgs),
+}
+
+/// `image prune` の引数（位置引数・`--force` は受けない。タグもコンテナ参照も無い manifest だけが対象）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ImagePruneArgs {
+    /// イメージストアの root（絶対パス）。`None` は省略。
+    pub(super) image_root: Option<PathBuf>,
 }
 
 /// `network` サブコマンドの引数（NET-6・CLI-1・#3066。オプションは持たず位置引数だけ）。
@@ -249,8 +258,8 @@ pub(super) enum NetworkArgs {
 /// `image tag` の引数。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ImageTagArgs {
-    /// イメージストアの root（絶対パス）。
-    pub(super) image_root: PathBuf,
+    /// イメージストアの root（絶対パス）。`None` は省略（既定の位置は `image_root` module が決める。#2384）。
+    pub(super) image_root: Option<PathBuf>,
     /// 付け元（既存タグまたは manifest digest。未検証の文字列。意味検証は `image` モジュールが oci に委ねる）。
     pub(super) source: String,
     /// 付けるタグ（未検証の文字列。タグ参照だけを受ける検証は `image` モジュールが行う）。
@@ -260,15 +269,15 @@ pub(super) struct ImageTagArgs {
 /// `image ls` の引数。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ImageLsArgs {
-    /// イメージストアの root（絶対パス）。
-    pub(super) image_root: PathBuf,
+    /// イメージストアの root（絶対パス）。`None` は省略（既定の位置は `image_root` module が決める。#2384）。
+    pub(super) image_root: Option<PathBuf>,
 }
 
 /// `image rm` の引数。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ImageRmArgs {
-    /// イメージストアの root（絶対パス）。
-    pub(super) image_root: PathBuf,
+    /// イメージストアの root（絶対パス）。`None` は省略（既定の位置は `image_root` module が決める。#2384）。
+    pub(super) image_root: Option<PathBuf>,
     /// `--force`（停止中のコンテナだけが参照するイメージを untag だけで通す。OCI-7）。
     pub(super) force: bool,
     /// 対象のイメージ参照（未検証の文字列。意味検証は oci の `ImageReference::parse` に委ねる）。
@@ -278,15 +287,15 @@ pub(super) struct ImageRmArgs {
 /// `system` サブコマンドの引数。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum SystemArgs {
-    /// `system df --image-root <dir>`。
+    /// `system df [--image-root <dir>]`。
     Df(SystemDfArgs),
 }
 
 /// `system df` の引数。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct SystemDfArgs {
-    /// イメージストアの root（絶対パス）。
-    pub(super) image_root: PathBuf,
+    /// イメージストアの root（絶対パス）。`None` は省略（既定の位置は `image_root` module が決める。#2384）。
+    pub(super) image_root: Option<PathBuf>,
 }
 
 /// 解析失敗（使い方エラー）。理由は呼び出し元で固定文言に写す。
@@ -854,7 +863,7 @@ fn parse_tail_count(value: &OsString) -> Result<u32, UsageError> {
     Ok(n)
 }
 
-/// `image <ls|rm|tag> ...` を解析する（サブコマンド無し・未知は使い方エラー）。
+/// `image <ls|rm|tag|prune> ...` を解析する（サブコマンド無し・未知は使い方エラー）。
 pub(super) fn parse_image(args: Vec<OsString>) -> Result<ImageArgs, UsageError> {
     let mut it = args.into_iter();
     let sub = it.next().ok_or(UsageError)?;
@@ -880,6 +889,12 @@ pub(super) fn parse_image(args: Vec<OsString>) -> Result<ImageArgs, UsageError> 
             source,
             target,
         }))
+    } else if sub == "prune" {
+        let (image_root, _, positional) = parse_image_options(rest, false)?;
+        if !positional.is_empty() {
+            return Err(UsageError);
+        }
+        Ok(ImageArgs::Prune(ImagePruneArgs { image_root }))
     } else {
         Err(UsageError)
     }
@@ -906,7 +921,7 @@ pub(super) fn parse_network(args: Vec<OsString>) -> Result<NetworkArgs, UsageErr
     }
 }
 
-/// `system df --image-root <dir>` を解析する。
+/// `system df [--image-root <dir>]` を解析する。
 pub(super) fn parse_system(args: Vec<OsString>) -> Result<SystemArgs, UsageError> {
     let mut it = args.into_iter();
     let sub = it.next().ok_or(UsageError)?;
@@ -920,13 +935,13 @@ pub(super) fn parse_system(args: Vec<OsString>) -> Result<SystemArgs, UsageError
     Ok(SystemArgs::Df(SystemDfArgs { image_root }))
 }
 
-/// image 系サブコマンド共通のオプション解析。`--image-root <dir>`（必須・1 回・絶対パスのみ）と、
+/// image 系サブコマンド共通のオプション解析。`--image-root <dir>`（任意・1 回・絶対パスのみ）と、
 /// `allow_force` のときの `--force`（1 回）を読み、残りの位置引数を返す。`--` 以降は位置引数。
 /// 値の意味検証（存在・ディレクトリか）は oci の `ImageStore::open` に委ね、ここでは作らない・辿らない。
 fn parse_image_options(
     args: Vec<OsString>,
     allow_force: bool,
-) -> Result<(PathBuf, bool, Vec<OsString>), UsageError> {
+) -> Result<(Option<PathBuf>, bool, Vec<OsString>), UsageError> {
     let mut image_root: Option<PathBuf> = None;
     let mut force = false;
     let mut positional: Vec<OsString> = Vec::new();
@@ -952,9 +967,9 @@ fn parse_image_options(
             positional.push(a);
         }
     }
-    let image_root = image_root.ok_or(UsageError)?;
     // 相対パスは作業ディレクトリ依存で 3 OS の挙動がぶれるため、使い方エラーとして拒否する。
-    if !image_root.is_absolute() {
+    // 省略（`None`）は許し、既定の位置は `image_root` module が決める（#2384）。
+    if image_root.as_ref().is_some_and(|p| !p.is_absolute()) {
         return Err(UsageError);
     }
     Ok((image_root, force, positional))
@@ -1844,19 +1859,18 @@ mod tests {
         assert_eq!(
             parse_image(v(&["ls", "--image-root", &r])),
             Ok(ImageArgs::Ls(ImageLsArgs {
-                image_root: root.clone()
+                image_root: Some(root.clone())
             }))
         );
         assert_eq!(
             parse_system(v(&["df", "--image-root", &r])),
             Ok(SystemArgs::Df(SystemDfArgs {
-                image_root: root.clone()
+                image_root: Some(root.clone())
             }))
         );
         for bad in [
             v(&[]),
             v(&["bogus"]),
-            v(&["ls"]),
             v(&["ls", "--image-root"]),
             v(&["ls", "--image-root", "rel/dir"]),
             v(&["ls", "--image-root", &r, "extra"]),
@@ -1869,10 +1883,65 @@ mod tests {
         for bad in [
             v(&[]),
             v(&["bogus"]),
-            v(&["df"]),
             v(&["df", "--image-root", &r, "extra"]),
         ] {
             assert_eq!(parse_system(bad.clone()), Err(UsageError), "{bad:?}");
+        }
+    }
+
+    /// CLI-1・OCI-7・#2384: `--image-root` を省いた構文は `None` で受かる（既定の位置は `image_root` module）。
+    #[test]
+    fn cli1_oci7_parse_image_root_omitted() {
+        assert_eq!(
+            parse_image(v(&["ls"])),
+            Ok(ImageArgs::Ls(ImageLsArgs { image_root: None }))
+        );
+        assert_eq!(
+            parse_system(v(&["df"])),
+            Ok(SystemArgs::Df(SystemDfArgs { image_root: None }))
+        );
+        assert_eq!(
+            parse_image(v(&["rm", "x"])),
+            Ok(ImageArgs::Rm(ImageRmArgs {
+                image_root: None,
+                force: false,
+                reference: "x".into()
+            }))
+        );
+        assert_eq!(
+            parse_image(v(&["tag", "a", "b"])),
+            Ok(ImageArgs::Tag(ImageTagArgs {
+                image_root: None,
+                source: "a".into(),
+                target: "b".into()
+            }))
+        );
+    }
+
+    /// CLI-1・OCI-7・#2384: image prune の構文（省略可・位置引数と --force は拒否）。
+    #[test]
+    fn cli1_oci7_parse_image_prune() {
+        let root = std::env::temp_dir();
+        let r = root.to_str().expect("utf8").to_owned();
+        assert_eq!(
+            parse_image(v(&["prune"])),
+            Ok(ImageArgs::Prune(ImagePruneArgs { image_root: None }))
+        );
+        assert_eq!(
+            parse_image(v(&["prune", "--image-root", &r])),
+            Ok(ImageArgs::Prune(ImagePruneArgs {
+                image_root: Some(root.clone())
+            }))
+        );
+        for bad in [
+            v(&["prune", "extra"]),
+            v(&["prune", "--force"]),
+            v(&["prune", "--image-root"]),
+            v(&["prune", "--image-root", "rel/dir"]),
+            v(&["prune", "--image-root", &r, "--image-root", &r]),
+            v(&["prune", "--", "x"]),
+        ] {
+            assert_eq!(parse_image(bad.clone()), Err(UsageError), "{bad:?}");
         }
     }
 
@@ -1883,7 +1952,7 @@ mod tests {
         let r = root.to_str().expect("utf8").to_owned();
         let expect = |force: bool| {
             Ok(ImageArgs::Rm(ImageRmArgs {
-                image_root: root.clone(),
+                image_root: Some(root.clone()),
                 force,
                 reference: "busybox:latest".into(),
             }))
@@ -1905,7 +1974,6 @@ mod tests {
             v(&["rm", "--image-root", &r, "a", "b"]),
             v(&["rm", "--force", "--force", "--image-root", &r, "x"]),
             v(&["rm", "--bogus", "--image-root", &r, "x"]),
-            v(&["rm", "x"]),
         ] {
             assert_eq!(parse_image(bad.clone()), Err(UsageError), "{bad:?}");
         }
@@ -1917,7 +1985,7 @@ mod tests {
         let root = std::env::temp_dir();
         let r = root.to_str().expect("utf8").to_owned();
         let expect = Ok(ImageArgs::Tag(ImageTagArgs {
-            image_root: root.clone(),
+            image_root: Some(root.clone()),
             source: "busybox".into(),
             target: "busybox:v2".into(),
         }));
@@ -1944,7 +2012,6 @@ mod tests {
             v(&["tag", "--image-root", &r, "a"]),
             v(&["tag", "--image-root", &r, "a", "b", "c"]),
             v(&["tag", "--force", "--image-root", &r, "a", "b"]),
-            v(&["tag", "a", "b"]),
             v(&["tag", "--image-root", "rel/dir", "a", "b"]),
             v(&["tag", "--image-root", &r, "--image-root", &r, "a", "b"]),
             v(&["tag", "--bogus", "--image-root", &r, "a", "b"]),

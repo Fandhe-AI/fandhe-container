@@ -1,4 +1,4 @@
-//! `image ls` / `system df` / `image rm` / `image tag` コマンド本体（oci の管理 API への配線。#2221・#2316・CLI-1・OCI-7・TASK-183）。
+//! `image ls` / `system df` / `image rm` / `image tag` / `image prune` コマンド本体（oci の管理 API への配線。#2221・#2316・CLI-1・OCI-7・TASK-183）。
 //!
 //! `commands::run_to` が argv を解析した後に [`run_image`] / [`run_system`] を呼ぶ。実処理は
 //! `fandhe-container-oci` の `image_management`（`ImageStore`・`ReferenceTable::list_images`・`disk_usage`・
@@ -29,8 +29,10 @@
 //!
 //! # 構文
 //!
-//! `image ls --image-root <abs>` / `system df --image-root <abs>` / `image rm [--force] --image-root <abs> <ref>` / `image tag --image-root <abs> <source> <target>`。
-//! イメージストアの root は必須オプション `--image-root`（絶対パス）で受ける。既定位置は未決のため発明しない（下記「未実装」）。
+//! `image ls [--image-root <abs>]` / `system df [--image-root <abs>]` / `image rm [--force] [--image-root <abs>] <ref>` / `image tag [--image-root <abs>] <source> <target>` /
+//! `image prune [--image-root <abs>]`（#2384。位置引数・`--force` は受けない）。
+//! イメージストアの root は任意オプション `--image-root`（絶対パス）で受ける。省略時は `image_root` module が決める（Linux は `<状態ルート>/.cri/images`、
+//! macOS ホストは既定なしで `FAILED_PRECONDITION`、Windows ホストは `UNIMPLEMENTED`。判断は `docs/design/image-root-default.md`）。
 //! root は作らない（`ImageStore::open` が存在するディレクトリ・非 symlink・所有者・書き込み権限・祖先を検査する。#2381）。
 //!
 //! # 出力形式（stdout・タブ区切り・LF 固定）
@@ -41,6 +43,9 @@
 //! - `image ls`: 固定ヘッダ `REPOSITORY\tTAG\tDIGEST\tSIZE\tMISSING`、1 行 1 エントリ（タグ昇順 → タグなし digest 昇順は oci の順序）。
 //!   タグなしは `REPOSITORY` と `TAG` が `-`。`MISSING` は欠損 blob 数。0 件はヘッダのみ。
 //! - `system df`: 固定ヘッダ `KEY\tVALUE` に続く固定順 9 行（`images.*` 4 行・`cache.*` 5 行）。
+//! - `image prune`（#2384）: `deleted\t<manifest>`・`deleted-blob\t<digest>`・`undeleted-blob\t<digest>` を出し、末尾に必ず
+//!   `reclaimed-bytes\t<n>` を 1 行出す（0 件なら `reclaimed-bytes\t0` のみ）。`undeleted-blob` があれば `INTERNAL`（1）で失敗する。
+//!   実行前にタグ無しでコンテナ参照のある manifest の参照を契機 B（`ref_reconcile`）で照合する（ガードの外。照合に失敗しても残す側に誤る）。
 //! - `image rm`: `untagged\t<ref>`・`deleted\t<manifest>`・`deleted-blob\t<digest>` を 1 行 1 事実で出す。
 //!   blob の削除に失敗したもの（`undeleted_blobs`）があれば `undeleted-blob\t<digest>` を出したうえで `INTERNAL`（1）で失敗する
 //!   （参照テーブルは更新済みのため `Ok` で成功と見せない。REPAIR-4）。
@@ -74,12 +79,11 @@
 //!   空のため、その root では `image ls` がヘッダのみ、`system df` の images 側が 0 件（キャッシュ側は実ファイルを全件「未登録」として数える）、
 //!   `image rm` と `image tag` が `NOT_FOUND` になる（在庫が入れば `image tag` のタグはプロセスをまたいで残る）。create / delete の `--image-root`〔`image_refs`・#2315〕も同じ在庫を使う。
 //! - `--image-root` の経路では `recover_stale_pulls`（残った pull の回収 GC）を呼ばない。CLI は pull を持たず短命のため、同じ root を使う plugin-cri の起動時に回収される（#2819・OCI-7）。
-//! - `--image-root` 省略時の既定位置（Linux の root / rootless、macOS / Windows の置き場。MAC-4・WIN-1）は未決。
+//! - `--image-root` 省略時の既定は plugin-cri のキャッシュと同じ位置（`--root` を省いたとき）。永続の置き場は未決（`docs/design/image-root-default.md`）。
 //! - macOS / Windows ではイメージキャッシュの置き場（ゲスト VM 内かホストか）が未決のため、ローカルの oci を呼ばず
 //!   他コマンドと同じ plugin 解決の失敗（`list_logs::store_open_failure`）で fail-closed に失敗する。
 //! - `system df` の containers・staging・展開後サイズは oci が未計測のため出さない（#2222）。
-//! - `image prune` の CLI 配線（配線時は `image rm` と同じく `ref_reconcile::reconcile_in_use` を呼ぶ）は範囲外。
-//! - oci の `OciOpRecorder` は `oci_recorder::CliOciRecorder` で CLI の `OpRecorder` へ橋渡しし、`image ls` / `image rm` / `image tag` / `system df` の
+//! - oci の `OciOpRecorder` は `oci_recorder::CliOciRecorder` で CLI の `OpRecorder` へ橋渡しし、`image ls` / `image rm` / `image tag` / `image prune` / `system df` の
 //!   `ImageStore` に付ける（`oci.*` の名前で記録。#2968・REPAIR-4・OCI-1）。CLI に pull・展開の経路は無いため、それらの計装は経路が入った時点で同じアダプタを渡す。
 
 use std::io::Write;
@@ -93,9 +97,9 @@ use fandhe_container_core::traits::{
 };
 use fandhe_container_oci::error::{OciError, OciErrorCode};
 use fandhe_container_oci::image_management::{
-    ContainerRefId, DiskUsage, ImageList, ImageRmKind, ImageRmOptions, ImageRmOutcome, ImageRmPlan,
-    ImageRmTarget, ImageStore, ImageTagChange, ImageTagOutcome, ImageTagSource, StoppedContainers,
-    TagKey,
+    ContainerRefId, DiskUsage, ImageList, ImagePruneOutcome, ImageRmKind, ImageRmOptions,
+    ImageRmOutcome, ImageRmPlan, ImageRmTarget, ImageStore, ImageTagChange, ImageTagOutcome,
+    ImageTagSource, StoppedContainers, TagKey,
 };
 use fandhe_container_oci::instrument::OciOpRecorder;
 use fandhe_container_oci::reference::{Digest, ImageReference, Reference};
@@ -104,9 +108,10 @@ use super::CliExit;
 use super::args::{GlobalArgs, ImageArgs, SystemArgs};
 use super::create_start::{OP_LOG_ENV, export_ops, open_store};
 use super::image_refs::{is_bare_digest_form, legacy_scope, ref_key, state_scope};
+use super::image_root::{ImageRootHost, resolve_default_image_root};
 use super::list_logs::{MAX_LIST_PAGES, record_op, store_open_failure};
 use super::oci_recorder::CliOciRecorder;
-use super::ref_reconcile::reconcile_for_image_rm;
+use super::ref_reconcile::{reconcile_for_image_gc, reconcile_for_image_rm};
 use crate::error::CliError;
 
 /// `image ls` の固定ヘッダ行（LF 終端）。
@@ -123,6 +128,9 @@ const MSG_IN_USE_HINT: &str =
     "image is in use by a container; use --force to untag images used only by stopped containers";
 const MSG_UNDELETED: &str = "image record removed but some blob files could not be deleted";
 const MSG_BLOB_DIR: &str = "image store blob directory is invalid";
+/// `image prune` の `FailedPrecondition`。blob ディレクトリの不正と未完了の削除（ジャーナル・テーブル操作）が同じ code で来る。
+const MSG_PRUNE_NOT_READY: &str = "image store is not ready for prune (invalid blob directory or a pending deletion); retry later";
+const MSG_PRUNE_UNDELETED: &str = "images were pruned but some blob files could not be deleted";
 const MSG_SCAN_LIMIT: &str = "image store scan limit exceeded";
 const MSG_TAG_LIMIT: &str = "image tag limit exceeded";
 const MSG_REF_LIMIT: &str = "container reference limit exceeded";
@@ -148,6 +156,8 @@ pub(super) enum Stage {
     Remove,
     /// `image tag` の解決・登録（排他の取得失敗も含む）。
     Tag,
+    /// `image prune` の実行（#2384）。
+    Prune,
     /// create / delete のコンテナ参照の登録・解除（`image_refs::StoreImageRefs`。#2315・OCI-7）。
     Refs,
     /// create の `--image` のタグ参照の解決（`image_refs::resolve_create_image`。#2496・OCI-7・CLI-1）。
@@ -195,8 +205,12 @@ pub(super) fn failure_message(code: OciErrorCode, stage: Stage) -> &'static str 
         (Stage::Unpack, OciErrorCode::DataLoss) => MSG_UNPACK_DATA_LOSS,
         (Stage::Unpack, OciErrorCode::ResourceExhausted) => MSG_UNPACK_LIMIT,
         (Stage::Unpack, OciErrorCode::Timeout) => MSG_UNPACK_TIMEOUT,
+        (Stage::Prune, OciErrorCode::FailedPrecondition) => MSG_PRUNE_NOT_READY,
+        (Stage::Prune, OciErrorCode::Timeout) => MSG_LOCKED,
         (Stage::Read | Stage::Remove, OciErrorCode::FailedPrecondition) => MSG_BLOB_DIR,
-        (Stage::Read | Stage::Remove, OciErrorCode::ResourceExhausted) => MSG_SCAN_LIMIT,
+        (Stage::Read | Stage::Remove | Stage::Prune, OciErrorCode::ResourceExhausted) => {
+            MSG_SCAN_LIMIT
+        }
         (_, OciErrorCode::InvalidArgument) => "invalid argument",
         (_, OciErrorCode::AlreadyExists) => "already exists",
         (_, OciErrorCode::FailedPrecondition) => "failed precondition",
@@ -572,6 +586,84 @@ fn run_image_rm_recorded(
     }
 }
 
+/// `image prune` の結果を 1 行 1 事実で整形する。末尾の `reclaimed-bytes` は 0 件でも必ず出す。
+fn format_prune_outcome(o: &ImagePruneOutcome) -> String {
+    let mut s = String::new();
+    for d in &o.removed_manifests {
+        s.push_str(&format!("deleted\t{d}\n"));
+    }
+    for d in &o.deleted_blobs {
+        s.push_str(&format!("deleted-blob\t{d}\n"));
+    }
+    for d in &o.undeleted_blobs {
+        s.push_str(&format!("undeleted-blob\t{d}\n"));
+    }
+    s.push_str(&format!("reclaimed-bytes\t{}\n", o.reclaimed_bytes));
+    s
+}
+
+/// `image prune` の実処理（計装なし・照合なし。試験用）。
+#[cfg(all(test, unix))]
+fn run_image_prune_with(store: &ImageStore, out: &mut dyn Write) -> CliExit {
+    run_image_prune_reclaiming(
+        store,
+        &fandhe_container_oci::instrument::NoopOciOpRecorder,
+        &|_| {},
+        out,
+    )
+}
+
+/// タグが 0 件でコンテナ参照がある manifest のコンテナ参照（prune が参照ありとして残す候補）を集める。
+/// 契機 B の照合対象（`docs/design/container-ref-reconcile.md` 決定 2。#2384）。
+fn prune_reconcile_candidates(store: &ImageStore) -> Result<Vec<ContainerRefId>, CliExit> {
+    let guard = store.lock().map_err(|e| oci_failure(&e, Stage::Lock))?;
+    let mut out: Vec<ContainerRefId> = Vec::new();
+    for (digest, _) in guard.manifests() {
+        let refs = guard.manifest_references(digest);
+        if refs.tags.is_empty() {
+            out.extend(refs.containers);
+        }
+    }
+    Ok(out)
+}
+
+/// 計装つきの `image prune`。
+///
+/// 1. ガードを取って照合候補（タグ無しでコンテナ参照のある manifest の参照）を集め、**ガードを手放す**。
+/// 2. 候補があれば `reclaim`（状態の無い参照の照合と回収。契機 B・#2495）を呼ぶ。ガードの外で呼ぶのは、照合が状態ストアと
+///    create ゲートの排他を使うため（ロック順序）。照合に失敗・保留しても残す側に誤るだけで prune は続く。
+/// 3. もう一度ガードを取り、`execute_image_prune_with` を呼ぶ。計画は oci が排他区間の内側で数え直す。
+fn run_image_prune_reclaiming(
+    store: &ImageStore,
+    recorder: &dyn OciOpRecorder,
+    reclaim: &dyn Fn(&[ContainerRefId]),
+    out: &mut dyn Write,
+) -> CliExit {
+    let candidates = match prune_reconcile_candidates(store) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    if !candidates.is_empty() {
+        reclaim(&candidates);
+    }
+    let result = match store.lock() {
+        Ok(mut g) => g.execute_image_prune_with(recorder, store.root()),
+        Err(e) => return oci_failure(&e, Stage::Lock),
+    };
+    let outcome = match result {
+        Ok(o) => o,
+        Err(e) => return oci_failure(&e, Stage::Prune),
+    };
+    if let Err(e) = write_out(out, &format_prune_outcome(&outcome)) {
+        return e;
+    }
+    if outcome.undeleted_blobs.is_empty() {
+        CliExit::Success
+    } else {
+        CliExit::Error(CliError::new(ErrorCode::Internal, MSG_PRUNE_UNDELETED))
+    }
+}
+
 /// 使用中の拒否。`--force` を付けていなければ回復手段を添える。
 fn in_use(forced: bool) -> CliExit {
     let msg = if forced { MSG_IN_USE } else { MSG_IN_USE_HINT };
@@ -663,14 +755,39 @@ fn open_image_store_recorded(
         .map(|s| s.with_recorder(Arc::new(CliOciRecorder::new(Arc::clone(recorder)))))
 }
 
+/// `--image-root` を決める。省略時は既定の位置を解決する（解決はディレクトリを作らない。#2384・`image_root` module）。
+/// 非 Linux の plugin 解決の失敗（`non_linux_failure`）より先に呼び、macOS の「既定なし」と Windows の `UNIMPLEMENTED` を観測できるようにする。
+fn image_root_for(
+    global: &GlobalArgs,
+    given: Option<&std::path::PathBuf>,
+) -> Result<std::path::PathBuf, CliExit> {
+    if let Some(p) = given {
+        return Ok(p.clone());
+    }
+    resolve_default_image_root(ImageRootHost::current(), || {
+        fandhe_container_core::state_store::StateRoot::resolve(global.root.clone())
+    })
+    .map_err(|e| CliExit::Error(CliError::from(e)))
+}
+
 /// 本番入口の `image`。
 pub(super) fn run_image(global: &GlobalArgs, args: &ImageArgs, stdout: &mut dyn Write) -> CliExit {
+    let given = match args {
+        ImageArgs::Ls(a) => a.image_root.as_ref(),
+        ImageArgs::Rm(a) => a.image_root.as_ref(),
+        ImageArgs::Tag(a) => a.image_root.as_ref(),
+        ImageArgs::Prune(a) => a.image_root.as_ref(),
+    };
+    let image_root = match image_root_for(global, given) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
     if let Some(e) = non_linux_failure(global) {
         return e;
     }
     match args {
-        ImageArgs::Ls(a) => with_ops("image_ls", |rec| {
-            match open_image_store_recorded(&a.image_root, rec) {
+        ImageArgs::Ls(_) => with_ops("image_ls", |rec| {
+            match open_image_store_recorded(&image_root, rec) {
                 Ok(store) => {
                     run_image_ls_recorded(&store, &CliOciRecorder::new(Arc::clone(rec)), stdout)
                 }
@@ -682,7 +799,7 @@ pub(super) fn run_image(global: &GlobalArgs, args: &ImageArgs, stdout: &mut dyn 
                 Ok(t) => t,
                 Err(e) => return e,
             };
-            match open_image_store_recorded(&a.image_root, rec) {
+            match open_image_store_recorded(&image_root, rec) {
                 Ok(store) => run_image_rm_recorded(
                     &store,
                     &CliOciRecorder::new(Arc::clone(rec)),
@@ -704,8 +821,19 @@ pub(super) fn run_image(global: &GlobalArgs, args: &ImageArgs, stdout: &mut dyn 
                 Ok(t) => t,
                 Err(e) => return e,
             };
-            match open_image_store_recorded(&a.image_root, rec) {
+            match open_image_store_recorded(&image_root, rec) {
                 Ok(store) => run_image_tag_with(&store, &source, target, stdout),
+                Err(e) => e,
+            }
+        }),
+        ImageArgs::Prune(_) => with_ops("image_prune", |rec| {
+            match open_image_store_recorded(&image_root, rec) {
+                Ok(store) => run_image_prune_reclaiming(
+                    &store,
+                    &CliOciRecorder::new(Arc::clone(rec)),
+                    &|candidates| reconcile_for_image_gc(global, &store, candidates),
+                    stdout,
+                ),
                 Err(e) => e,
             }
         }),
@@ -718,19 +846,22 @@ pub(super) fn run_system(
     args: &SystemArgs,
     stdout: &mut dyn Write,
 ) -> CliExit {
+    let SystemArgs::Df(a) = args;
+    let image_root = match image_root_for(global, a.image_root.as_ref()) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
     if let Some(e) = non_linux_failure(global) {
         return e;
     }
-    match args {
-        SystemArgs::Df(a) => with_ops("system_df", |rec| {
-            match open_image_store_recorded(&a.image_root, rec) {
-                Ok(store) => {
-                    run_system_df_recorded(&store, &CliOciRecorder::new(Arc::clone(rec)), stdout)
-                }
-                Err(e) => e,
+    with_ops("system_df", |rec| {
+        match open_image_store_recorded(&image_root, rec) {
+            Ok(store) => {
+                run_system_df_recorded(&store, &CliOciRecorder::new(Arc::clone(rec)), stdout)
             }
-        }),
-    }
+            Err(e) => e,
+        }
+    })
 }
 
 #[cfg(test)]
@@ -1623,6 +1754,200 @@ mod tests {
         }
     }
 
+    /// prune 試験用: manifest 1(a,b)=タグ付き、2(c,d)=無参照、3(e,f)=コンテナ参照のみ。blob の大きさは 1・2・3・5・7・11。
+    #[cfg(unix)]
+    fn prune_store(tmp: &Tmp) -> ImageStore {
+        for (c, n) in [('a', 1), ('b', 2), ('c', 3), ('d', 5), ('e', 7), ('f', 11)] {
+            tmp.put_blob(c, n);
+        }
+        let mut t = ReferenceTable::new();
+        add_manifest(&mut t, '1', 'a', &['b']);
+        add_manifest(&mut t, '2', 'c', &['d']);
+        add_manifest(&mut t, '3', 'e', &['f']);
+        t.register_tag(key("library/busybox", "latest"), &dg('1'))
+            .expect("tag");
+        t.register_container(ContainerRefId::new("c1").expect("cid"), &dg('3'))
+            .expect("container");
+        ImageStore::with_table(tmp.path(), t).expect("open")
+    }
+
+    /// OCI-7・CLI-1: 無参照でタグなしの manifest と専有 blob だけが消え、タグ付き・コンテナ参照つきは残る。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_cli1_image_prune_removes_unreferenced_untagged_and_keeps_tagged_and_container_refs() {
+        let tmp = Tmp::new();
+        let store = prune_store(&tmp);
+        let (e, out) = out_of(|o| run_image_prune_with(&store, o));
+        assert_eq!(e.exit_code(), 0);
+        assert_eq!(
+            out,
+            format!(
+                "deleted\tsha256:{}\ndeleted-blob\tsha256:{}\ndeleted-blob\tsha256:{}\nreclaimed-bytes\t8\n",
+                "2".repeat(64),
+                "c".repeat(64),
+                "d".repeat(64)
+            )
+        );
+        assert!(!tmp.has_blob('c') && !tmp.has_blob('d'));
+        for c in ['a', 'b', 'e', 'f'] {
+            assert!(tmp.has_blob(c), "{c}");
+        }
+    }
+
+    /// OCI-7・CLI-1: 空ストアは `reclaimed-bytes\t0` だけで 0。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_cli1_image_prune_empty_store_prints_zero() {
+        let tmp = Tmp::new();
+        let store = ImageStore::with_table(tmp.path(), ReferenceTable::new()).expect("open");
+        let (e, out) = out_of(|o| run_image_prune_with(&store, o));
+        assert_eq!(e.exit_code(), 0);
+        assert_eq!(out, "reclaimed-bytes\t0\n");
+    }
+
+    /// OCI-7・#2495: 候補はタグなしでコンテナ参照のある manifest の参照だけ（タグ付きの manifest は含めない）。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_cli1_image_prune_candidates_exclude_tagged_manifests() {
+        let tmp = Tmp::new();
+        let mut t = ReferenceTable::new();
+        add_manifest(&mut t, '1', 'a', &['b']);
+        add_manifest(&mut t, '3', 'e', &['f']);
+        t.register_tag(key("library/busybox", "latest"), &dg('1'))
+            .expect("tag");
+        t.register_container(ContainerRefId::new("tagged").expect("cid"), &dg('1'))
+            .expect("container");
+        t.register_container(ContainerRefId::new("untagged").expect("cid"), &dg('3'))
+            .expect("container");
+        let store = ImageStore::with_table(tmp.path(), t).expect("open");
+        let Ok(got) = prune_reconcile_candidates(&store) else {
+            panic!("candidates");
+        };
+        assert_eq!(
+            got.iter()
+                .map(|c| c.as_str().to_owned())
+                .collect::<Vec<_>>(),
+            vec!["untagged".to_owned()]
+        );
+    }
+
+    /// OCI-7・#2495: 照合フックはガードの外で候補を受け、外した参照の manifest がその回の prune で消える。
+    /// 候補が無いときはフックを呼ばない。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_cli1_image_prune_reconciles_stale_refs_before_pruning() {
+        let tmp = Tmp::new();
+        let store = prune_store(&tmp);
+        let seen: Cell<usize> = Cell::new(0);
+        let (e, out) = out_of(|o| {
+            run_image_prune_reclaiming(
+                &store,
+                &fandhe_container_oci::instrument::NoopOciOpRecorder,
+                &|c| {
+                    seen.set(c.len());
+                    // フックの中でガードを取れる（ガードの外で呼ばれている）。
+                    assert!(store.lock().is_ok());
+                    for id in c {
+                        let _ = store.release_container_ref(id);
+                    }
+                },
+                o,
+            )
+        });
+        assert_eq!(e.exit_code(), 0);
+        assert_eq!(seen.get(), 1);
+        assert!(
+            out.contains(&format!("deleted\tsha256:{}\n", "3".repeat(64))),
+            "{out}"
+        );
+        assert!(out.ends_with("reclaimed-bytes\t26\n"), "{out}");
+        assert!(!tmp.has_blob('e') && !tmp.has_blob('f'));
+
+        let tmp2 = Tmp::new();
+        let store2 = ImageStore::with_table(tmp2.path(), ReferenceTable::new()).expect("open");
+        let (e, _) = out_of(|o| {
+            run_image_prune_reclaiming(
+                &store2,
+                &fandhe_container_oci::instrument::NoopOciOpRecorder,
+                &|_| panic!("no candidates"),
+                o,
+            )
+        });
+        assert_eq!(e.exit_code(), 0);
+    }
+
+    /// REPAIR-4: 削除できなかった blob は `undeleted-blob` を出したうえで INTERNAL で失敗する。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_cli1_image_prune_undeleted_blob_is_internal() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = Tmp::new();
+        let store = prune_store(&tmp);
+        let dir = tmp.path().join("blobs").join("sha256");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+        let writable_anyway = std::fs::write(dir.join("probe"), b"").is_ok();
+        let (e, out) = out_of(|o| run_image_prune_with(&store, o));
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        if writable_anyway {
+            assert_eq!(e.exit_code(), 0);
+        } else {
+            assert_eq!(e.exit_code(), 1);
+            assert_eq!(e.code(), Some("INTERNAL"));
+            assert!(out.contains("undeleted-blob\tsha256:"));
+            assert!(stderr_of(&e).contains(MSG_PRUNE_UNDELETED));
+        }
+    }
+
+    /// OCI-7: blob ディレクトリが不正なら何も変えず FAILED_PRECONDITION と prune 用の固定文言。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_cli1_image_prune_bad_blob_dir_is_failed_precondition_with_fixed_message() {
+        let tmp = Tmp::new();
+        let store = prune_store(&tmp);
+        let dir = tmp.path().join("blobs").join("sha256");
+        let moved = tmp.path().join("blobs").join("sha256-moved");
+        std::fs::rename(&dir, &moved).expect("rename");
+        std::fs::write(&dir, b"not a dir").expect("file");
+        let (e, out) = out_of(|o| run_image_prune_with(&store, o));
+        assert_eq!(e.exit_code(), 5);
+        assert_eq!(e.code(), Some("FAILED_PRECONDITION"));
+        assert_eq!(out, "");
+        assert!(stderr_of(&e).contains(MSG_PRUNE_NOT_READY));
+    }
+
+    /// ERR-1: prune 段階の固定文言（pending の削除と blob ディレクトリ不正は同じ code。排他は MSG_LOCKED）。
+    #[test]
+    fn err1_failure_message_prune_stage() {
+        assert_eq!(
+            failure_message(OciErrorCode::FailedPrecondition, Stage::Prune),
+            MSG_PRUNE_NOT_READY
+        );
+        assert_eq!(
+            failure_message(OciErrorCode::Timeout, Stage::Prune),
+            MSG_LOCKED
+        );
+        assert_eq!(
+            failure_message(OciErrorCode::ResourceExhausted, Stage::Prune),
+            MSG_SCAN_LIMIT
+        );
+    }
+
+    /// OCI-7・#2384: 既定の image root は `--root` 配下の `.cri/images`（Linux）。明示指定はそのまま。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oci7_cli1_image_root_for_uses_state_root_cri_images_on_linux() {
+        let g = GlobalArgs {
+            root: Some(PathBuf::from("/tmp/x-root")),
+            ..GlobalArgs::default()
+        };
+        assert_eq!(
+            image_root_for(&g, None).ok(),
+            Some(PathBuf::from("/tmp/x-root/.cri/images"))
+        );
+        let given = PathBuf::from("/tmp/explicit");
+        assert_eq!(image_root_for(&g, Some(&given)).ok(), Some(given));
+    }
+
     /// 固定文言は引用符・バックスラッシュ・制御文字を含まない（JSON を壊さない）。
     #[test]
     fn err1_fixed_messages_are_json_safe() {
@@ -1638,6 +1963,8 @@ mod tests {
             MSG_SCAN_LIMIT,
             MSG_TAG_LIMIT,
             MSG_TAG_TARGET,
+            MSG_PRUNE_NOT_READY,
+            MSG_PRUNE_UNDELETED,
         ] {
             assert!(
                 !m.contains(['"', '\\']) && !m.chars().any(char::is_control),
@@ -1664,6 +1991,7 @@ mod tests {
                 Stage::Read,
                 Stage::Remove,
                 Stage::Tag,
+                Stage::Prune,
                 Stage::Refs,
             ] {
                 let m = failure_message(c, s);

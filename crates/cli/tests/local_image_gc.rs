@@ -39,14 +39,14 @@
 //! `--ignored` なしでは、pull × prune に加えて (iv)〜(vi) も小さい件数で自己検証する（コンテナと CLI は使わない）。
 //!
 //! 削除処理中のクラッシュ復旧（#667・TASK-184.5）は別の起動モード `--ignored --scenario crash`（実体は `tests/linux/crash.rs`）。
-//! `image rm`（CLI の実バイナリ）と `image prune`（試験バイナリ自身の再入口 `--gc-crash-child prune`。CLI 未配線のため。#2384）の
+//! `image rm`（CLI の実バイナリ）と `image prune`（試験バイナリ自身の再入口 `--gc-crash-child prune`。CLI は #2384 で配線済みだが、本試験は oci の API を直接呼ぶまま。CLI 経由への切り替えは別 issue）の
 //! 削除の途中で SIGKILL し、別プロセスの新しい `ImageStore::lock` による回復後の状態が「削除前」か「削除後」の一方と完全に
 //! 一致すること、中間状態（ジャーナル無しで blob が一部だけ消えた）が無いこと、参照中の blob が残ることを照合する。コンテナ参照は
 //! 実機層が CLI の `create --image`、`--ignored` なしの自己検証が oci の公開 API で付ける。SIGKILL は電源断ではなく、
 //! 媒体への永続化（IO-2）は #1965 の範囲。
 //!
-//! `image prune` は CLI に未配線（#2384）のため、E・F・G・H は oci の公開 API（`execute_image_prune`）をプロセス内で呼ぶ。
-//! 配線後は CLI 経由へ切り替える。
+//! `image prune` の CLI は #2384 で配線済みだが、E・F・G・H は oci の公開 API（`execute_image_prune`）をプロセス内で呼ぶまま。
+//! CLI 経由への切り替え（成功行・`ci.yml` の `--min`・`real-machine-tests.md` を同じ PR で更新）は別 issue で追う。
 //!
 //! # 「実ディスク使用量」の解釈（H）
 //! 見かけのサイズ同士の比較は独立した基準にならないため、基準は割り当て済みブロック数（`st_blocks * 512`）とする。
@@ -1302,7 +1302,7 @@ mod linux {
         Ok(())
     }
 
-    /// 無参照イメージの prune をプロセス内で実行する（CLI に `image prune` は未配線。#2384 で CLI 経由へ切り替える）。
+    /// 無参照イメージの prune をプロセス内で実行する（CLI の `image prune` は #2384 で配線済み。CLI 経由への切り替えは別 issue）。
     /// ストアとガードはこの関数の中で手放す（保持したまま CLI を呼ぶと CLI 側の lock が期限切れになる）。
     fn prune(env: &Env) -> Result<ImagePruneOutcome, String> {
         let store = ImageStore::open(&env.images).map_err(|e| format!("open store: {e:?}"))?;

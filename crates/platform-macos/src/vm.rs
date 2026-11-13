@@ -41,8 +41,14 @@
 //!
 //! エラー型は `crate::error` に移動し、本モジュールから `VmError`・`VmOp` を再エクスポートする（ERR-1）。
 //!
-//! 未実装（REPAIR-3）: 協調停止（`requestStop`）・pause / resume / save / restore は範囲外。
-//! plugin 境界のエラー写像は TASK-115。
+//! 協調停止（MAC-4・TASK-191・#2270）: `Vm::shutdown`（macOS）がゲストへ `requestStop` を要求し、
+//! [`OpTimeouts::graceful_stop`]（既定 30 秒）の間ゲストの停止を待つ。期限までに止まらない・要求できない・
+//! 要求が失敗した場合は破壊的な `stop` へ切り替える。段階の決定は OS 非依存の `run_graceful_stop` に切り出し、
+//! Linux 上のテストで検証する。結果は [`ShutdownOutcome`]（どの経路で止まったかを構造化して返す）。
+//! ゲストが要求を受けて電源断まで進む実装は `crates/guest-init`（`shutdown`）。実 VM での到達は未確認
+//! （#1628・#2282）。`Drop` は従来どおり破壊的な停止の要求だけを行い、猶予を待たない。
+//!
+//! 未実装（REPAIR-3）: pause / resume / save / restore は範囲外。plugin 境界のエラー写像は TASK-115。
 
 use std::io::Write;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
@@ -72,6 +78,14 @@ pub const DEFAULT_STATE_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 /// `Vm::launch` がゲスト内 virtiofs mount の報告を待つ既定タイムアウト（MAC-1・REPAIR-5・TASK-65.3）。
 pub const DEFAULT_GUEST_MOUNT_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// 協調停止（`Vm::shutdown`）でゲストの停止を待つ既定の猶予（MAC-4・#2270。値はオーナー確認待ちの案）。
+/// ゲスト init の最悪（`guest-init` の `GUEST_TERM_GRACE` + `GUEST_KILL_WAIT` = 4 秒）より長く、`sync` の
+/// 時間を見込む。超えたら破壊的な `stop` へ切り替える（REPAIR-5）。
+pub const DEFAULT_GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 協調停止の待ちでゲストの状態を照会する間隔。
+pub const GRACEFUL_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 /// 指定できるタイムアウトの下限。0 や極小値で常時失敗させる設定を拒否する。
 pub const MIN_OP_TIMEOUT: Duration = Duration::from_millis(100);
 
@@ -85,6 +99,8 @@ pub struct OpTimeouts {
     stop: Duration,
     state_query: Duration,
     guest_mount: Duration,
+    /// 協調停止でゲストの停止を待つ猶予（MAC-4・#2270）。
+    graceful_stop: Duration,
     /// `Vm::launch` が構成構築時に行う共有配下の走査の期限。`None` は期限なし（件数上限のみ）。
     share_scan: Option<Duration>,
 }
@@ -115,6 +131,7 @@ impl OpTimeouts {
             stop,
             state_query,
             guest_mount: DEFAULT_GUEST_MOUNT_TIMEOUT,
+            graceful_stop: DEFAULT_GRACEFUL_STOP_TIMEOUT,
             share_scan: None,
         })
     }
@@ -157,6 +174,29 @@ impl OpTimeouts {
         Ok(self)
     }
 
+    /// 協調停止の猶予を差し替える（`MIN_OP_TIMEOUT..=MAX_OP_TIMEOUT`。MAC-4・#2270）。
+    ///
+    /// 呼び出し元の応答期限（plugin の RPC など）に収まるよう、強制停止の期限（[`OpTimeouts::stop`]）と
+    /// 状態照会の余裕を足した合計で決める。
+    pub fn with_graceful_stop(mut self, graceful_stop: Duration) -> Result<OpTimeouts, VmError> {
+        if !(MIN_OP_TIMEOUT..=MAX_OP_TIMEOUT).contains(&graceful_stop) {
+            return Err(VmError::InvalidTimeout {
+                field: "graceful_stop",
+                requested: graceful_stop,
+                min: MIN_OP_TIMEOUT,
+                max: MAX_OP_TIMEOUT,
+            });
+        }
+        self.graceful_stop = graceful_stop;
+        Ok(self)
+    }
+
+    /// 協調停止でゲストの停止を待つ猶予。
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn graceful_stop(&self) -> Duration {
+        self.graceful_stop
+    }
+
     /// ゲスト mount 報告の待機時間。
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn guest_mount(&self) -> Duration {
@@ -195,6 +235,7 @@ impl Default for OpTimeouts {
             stop: DEFAULT_STOP_TIMEOUT,
             state_query: DEFAULT_STATE_QUERY_TIMEOUT,
             guest_mount: DEFAULT_GUEST_MOUNT_TIMEOUT,
+            graceful_stop: DEFAULT_GRACEFUL_STOP_TIMEOUT,
             share_scan: None,
         }
     }
@@ -216,6 +257,91 @@ pub(crate) fn await_op_result(
         Ok(result) => result,
         Err(RecvTimeoutError::Timeout) => give_up(VmError::Timeout { op, after: timeout }),
         Err(RecvTimeoutError::Disconnected) => give_up(VmError::CallbackLost { op }),
+    }
+}
+
+/// 協調停止（`Vm::shutdown`）の結果。どの経路で止まったかを構造化して返す（MAC-4・#2270）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ShutdownOutcome {
+    /// 呼び出し時点で既に停止していた。
+    AlreadyStopped,
+    /// ゲストが要求を受けて猶予の間に自ら停止した。
+    GuestStopped,
+    /// 破壊的な停止（VZ の `stop`）へ切り替えて停止した。
+    Forced { reason: ForceReason },
+}
+
+/// 破壊的な停止へ切り替えた理由。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ForceReason {
+    /// ゲストへ停止を要求できなかった（`canRequestStop` が偽。待たずにすぐ切り替える）。
+    NotRequestable { state: VmState },
+    /// 停止の要求が失敗した（NSError の domain / code）。待たずにすぐ切り替える。
+    RequestFailed { domain: String, code: isize },
+    /// 要求の発行が VM キューの詰まりで期限内に決着しなかった。
+    RequestUnresponsive,
+    /// 猶予内にゲストが停止しなかった。
+    Deadline,
+}
+
+/// 停止要求の発行の結果（`run_graceful_stop` の入力）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) enum RequestOutcome {
+    /// 既に停止している。
+    AlreadyStopped,
+    /// 要求した。
+    Requested,
+    /// 要求できない状態。
+    NotRequestable(VmState),
+    /// 要求が失敗した。
+    Failed { domain: String, code: isize },
+    /// VM キューが期限内に応答しなかった。
+    Unresponsive,
+}
+
+/// 協調停止の段階の決定（OS 非依存。MAC-4・REPAIR-5・#2270）。
+///
+/// `request` で停止を要求し、受理されたら `grace` を上限に `poll_state`（残り時間を渡す）で `Stopped` を待つ。
+/// 要求できない・失敗・期限切れは `force`（破壊的な停止）へ進む。`force` が `InvalidState { state: Stopped }`
+/// を返したときは、遅れて自ら止まったものとして `GuestStopped` にする。経過時間と待ちは `elapsed`・`sleep`
+/// として差し込む（試験は仮想時計）。待ちの回数は `grace / poll_interval` で有限。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn run_graceful_stop(
+    request: impl FnOnce() -> RequestOutcome,
+    mut poll_state: impl FnMut(Duration) -> Option<VmState>,
+    force: impl FnOnce() -> Result<(), VmError>,
+    grace: Duration,
+    poll_interval: Duration,
+    mut elapsed: impl FnMut() -> Duration,
+    mut sleep: impl FnMut(Duration),
+) -> Result<ShutdownOutcome, VmError> {
+    let reason = match request() {
+        RequestOutcome::AlreadyStopped => return Ok(ShutdownOutcome::AlreadyStopped),
+        RequestOutcome::NotRequestable(state) => ForceReason::NotRequestable { state },
+        RequestOutcome::Failed { domain, code } => ForceReason::RequestFailed { domain, code },
+        RequestOutcome::Unresponsive => ForceReason::RequestUnresponsive,
+        RequestOutcome::Requested => loop {
+            let spent = elapsed();
+            if spent >= grace {
+                break ForceReason::Deadline;
+            }
+            let remaining = grace - spent;
+            if poll_state(remaining) == Some(VmState::Stopped) {
+                return Ok(ShutdownOutcome::GuestStopped);
+            }
+            sleep(poll_interval.min(remaining));
+        },
+    };
+    match force() {
+        Ok(()) => Ok(ShutdownOutcome::Forced { reason }),
+        Err(VmError::InvalidState {
+            state: VmState::Stopped,
+            ..
+        }) => Ok(ShutdownOutcome::GuestStopped),
+        Err(e) => Err(e),
     }
 }
 
@@ -784,8 +910,10 @@ mod mac {
     use std::time::Duration;
 
     use super::{
-        AbandonOutcome, BeginOutcome, Core, EVENT_CHANNEL_CAPACITY, ErrInfo, LifecycleInput,
-        OpTicket, OpTimeouts, VmError, VmEvent, VmOp, VmState, await_op_result, event_channel,
+        AbandonOutcome, BeginOutcome, Core, EVENT_CHANNEL_CAPACITY, ErrInfo,
+        GRACEFUL_POLL_INTERVAL, LifecycleInput, OpTicket, OpTimeouts, RequestOutcome,
+        ShutdownOutcome, VmError, VmEvent, VmOp, VmState, await_op_result, event_channel,
+        run_graceful_stop,
     };
     use crate::config::{
         VmConfigSpec, VzVmConfiguration, build_vz_configuration, build_vz_configuration_within,
@@ -927,9 +1055,47 @@ mod mac {
             self.run_op(VmOp::Start)
         }
 
-        /// VM を破壊的に停止し、完了まで待つ（協調停止は範囲外）。
+        /// VM を破壊的に停止し、完了まで待つ。ゲストに停止の機会を与えたい呼び出し元は [`Vm::shutdown`]。
         pub fn stop(&self) -> Result<(), VmError> {
             self.run_op(VmOp::Stop)
+        }
+
+        /// ゲストへ停止を要求し（`requestStop`）、`OpTimeouts::graceful_stop` の間ゲストの電源断を待つ。
+        /// 期限までに止まらない・要求できない・要求が失敗した場合は [`Vm::stop`]（破壊的な停止。
+        /// `OpTimeouts::stop` の期限つき）へ切り替える（MAC-4・TASK-191・#2270・REPAIR-5）。
+        ///
+        /// 呼び出し元: `fandhe-container-plugin-macos` の `stop`（1 コンテナ = 1 VM）。最悪の所要は猶予 +
+        /// 強制停止の期限 + 状態照会の余裕で、呼び出し元の応答期限に収まるよう `with_graceful_stop` で
+        /// 猶予を決める。`start` / `stop` / `state` と同様、VM キュー上から呼んではならない。
+        pub fn shutdown(&self) -> Result<ShutdownOutcome, VmError> {
+            let started = std::time::Instant::now();
+            run_graceful_stop(
+                || {
+                    self.host
+                        .run_timeout(self.timeouts.state_query(), |vm| {
+                            let state = actual_state(vm);
+                            if state == VmState::Stopped {
+                                return RequestOutcome::AlreadyStopped;
+                            }
+                            match vm.request_stop() {
+                                Ok(()) => RequestOutcome::Requested,
+                                Err(sys::RequestStopError::NotRequestable) => {
+                                    RequestOutcome::NotRequestable(state)
+                                }
+                                Err(sys::RequestStopError::Failed((domain, code))) => {
+                                    RequestOutcome::Failed { domain, code }
+                                }
+                            }
+                        })
+                        .unwrap_or(RequestOutcome::Unresponsive)
+                },
+                |remaining| self.state_within(remaining),
+                || self.stop(),
+                self.timeouts.graceful_stop(),
+                GRACEFUL_POLL_INTERVAL,
+                || started.elapsed(),
+                std::thread::sleep,
+            )
         }
 
         /// フレームワークが報告する現在の状態。`state_query` タイムアウト内に取得できなければ
@@ -1813,6 +1979,214 @@ mod tests {
             errors[5].to_string(),
             "vm.timeout: stop did not complete within 3s"
         );
+    }
+
+    /// 協調停止の試験用: 仮想時計で `run_graceful_stop` を動かす。`states` は照会ごとに返す状態の台本
+    /// （尽きたら `Running`）。戻り値は (結果, 照会回数, 強制停止の呼び出し回数, 経過した仮想時間)。
+    fn drive_graceful(
+        request: RequestOutcome,
+        states: &[VmState],
+        force_result: Result<(), VmError>,
+        grace: Duration,
+    ) -> (Result<ShutdownOutcome, VmError>, usize, usize, Duration) {
+        use std::cell::{Cell, RefCell};
+        let now = Cell::new(Duration::ZERO);
+        let polls = Cell::new(0usize);
+        let forced = Cell::new(0usize);
+        let script = RefCell::new(
+            states
+                .iter()
+                .copied()
+                .collect::<std::collections::VecDeque<_>>(),
+        );
+        let res = run_graceful_stop(
+            || request,
+            |_remaining| {
+                polls.set(polls.get() + 1);
+                Some(script.borrow_mut().pop_front().unwrap_or(VmState::Running))
+            },
+            || {
+                forced.set(forced.get() + 1);
+                force_result
+            },
+            grace,
+            GRACEFUL_POLL_INTERVAL,
+            || now.get(),
+            |d| now.set(now.get() + d),
+        );
+        (res, polls.get(), forced.get(), now.get())
+    }
+
+    /// MAC-4・#2270: 既に停止していれば要求も強制停止もしない。
+    #[test]
+    fn mac4_2270_shutdown_already_stopped() {
+        let (res, polls, forced, _) = drive_graceful(
+            RequestOutcome::AlreadyStopped,
+            &[],
+            Ok(()),
+            Duration::from_secs(30),
+        );
+        assert_eq!(res, Ok(ShutdownOutcome::AlreadyStopped));
+        assert_eq!((polls, forced), (0, 0));
+    }
+
+    /// MAC-4・#2270: 要求できない構成では猶予を待たずにすぐ強制停止へ進む（毎回の停止が遅くならない）。
+    #[test]
+    fn mac4_2270_shutdown_not_requestable_forces_immediately() {
+        let (res, polls, forced, waited) = drive_graceful(
+            RequestOutcome::NotRequestable(VmState::Running),
+            &[],
+            Ok(()),
+            Duration::from_secs(30),
+        );
+        assert_eq!(
+            res,
+            Ok(ShutdownOutcome::Forced {
+                reason: ForceReason::NotRequestable {
+                    state: VmState::Running
+                }
+            })
+        );
+        assert_eq!((polls, forced, waited), (0, 1, Duration::ZERO));
+    }
+
+    /// MAC-4・#2270: 要求の失敗・キューの無応答も待たずに強制停止へ進む。理由は構造化して返る。
+    #[test]
+    fn mac4_2270_shutdown_request_failure_forces_immediately() {
+        let (res, polls, forced, waited) = drive_graceful(
+            RequestOutcome::Failed {
+                domain: "VZErrorDomain".to_string(),
+                code: 7,
+            },
+            &[],
+            Ok(()),
+            Duration::from_secs(30),
+        );
+        assert_eq!(
+            res,
+            Ok(ShutdownOutcome::Forced {
+                reason: ForceReason::RequestFailed {
+                    domain: "VZErrorDomain".to_string(),
+                    code: 7
+                }
+            })
+        );
+        assert_eq!((polls, forced, waited), (0, 1, Duration::ZERO));
+        let (res, _, forced, _) = drive_graceful(
+            RequestOutcome::Unresponsive,
+            &[],
+            Ok(()),
+            Duration::from_secs(30),
+        );
+        assert_eq!(
+            res,
+            Ok(ShutdownOutcome::Forced {
+                reason: ForceReason::RequestUnresponsive
+            })
+        );
+        assert_eq!(forced, 1);
+    }
+
+    /// MAC-4・#2270: 猶予内に `Stopped` になれば強制停止を呼ばない。
+    #[test]
+    fn mac4_2270_shutdown_guest_stops_within_grace() {
+        let (res, polls, forced, waited) = drive_graceful(
+            RequestOutcome::Requested,
+            &[VmState::Running, VmState::Running, VmState::Stopped],
+            Ok(()),
+            Duration::from_secs(30),
+        );
+        assert_eq!(res, Ok(ShutdownOutcome::GuestStopped));
+        assert_eq!((polls, forced), (3, 0));
+        // 照会の間に刻み 2 回分だけ待った。
+        assert_eq!(waited, GRACEFUL_POLL_INTERVAL * 2);
+    }
+
+    /// MAC-4・REPAIR-5・#2270: 猶予内に止まらなければ猶予ちょうどで強制停止へ切り替える（待ちは有限）。
+    #[test]
+    fn mac4_2270_shutdown_deadline_forces_stop() {
+        let grace = Duration::from_secs(5);
+        let (res, polls, forced, waited) =
+            drive_graceful(RequestOutcome::Requested, &[], Ok(()), grace);
+        assert_eq!(
+            res,
+            Ok(ShutdownOutcome::Forced {
+                reason: ForceReason::Deadline
+            })
+        );
+        assert_eq!(forced, 1);
+        assert_eq!(waited, grace);
+        // 100 ms 刻みで 5 秒 = 50 回の照会。
+        assert_eq!(polls, 50);
+        // 刻みより短い猶予でも、残り時間以上は待たない。
+        let short = Duration::from_millis(150);
+        let (_, _, _, waited) = drive_graceful(RequestOutcome::Requested, &[], Ok(()), short);
+        assert_eq!(waited, short);
+    }
+
+    /// MAC-4・#2270: 強制停止が「既に停止」で拒否されたら、遅れて自ら止まったものとして成功にする。
+    /// それ以外の失敗は返す。
+    #[test]
+    fn mac4_2270_shutdown_force_result_mapping() {
+        let stopped = VmError::InvalidState {
+            op: VmOp::Stop,
+            state: VmState::Stopped,
+        };
+        let (res, ..) = drive_graceful(
+            RequestOutcome::Requested,
+            &[],
+            Err(stopped),
+            Duration::from_millis(100),
+        );
+        assert_eq!(res, Ok(ShutdownOutcome::GuestStopped));
+        let timeout = VmError::Timeout {
+            op: VmOp::Stop,
+            after: Duration::from_secs(15),
+        };
+        let (res, ..) = drive_graceful(
+            RequestOutcome::Requested,
+            &[],
+            Err(timeout.clone()),
+            Duration::from_millis(100),
+        );
+        assert_eq!(res, Err(timeout));
+        let running = VmError::InvalidState {
+            op: VmOp::Stop,
+            state: VmState::Starting,
+        };
+        let (res, ..) = drive_graceful(
+            RequestOutcome::NotRequestable(VmState::Starting),
+            &[],
+            Err(running.clone()),
+            Duration::from_millis(100),
+        );
+        assert_eq!(res, Err(running));
+    }
+
+    /// MAC-4・#2270: 猶予の既定と範囲検証。
+    #[test]
+    fn mac4_2270_graceful_stop_timeout_default_and_bounds() {
+        assert_eq!(DEFAULT_GRACEFUL_STOP_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(
+            OpTimeouts::default().graceful_stop(),
+            DEFAULT_GRACEFUL_STOP_TIMEOUT
+        );
+        let ok = OpTimeouts::default()
+            .with_graceful_stop(Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(ok.graceful_stop(), Duration::from_secs(5));
+        let one_ns = Duration::from_nanos(1);
+        for bad in [MIN_OP_TIMEOUT - one_ns, MAX_OP_TIMEOUT + one_ns] {
+            assert_eq!(
+                OpTimeouts::default().with_graceful_stop(bad),
+                Err(VmError::InvalidTimeout {
+                    field: "graceful_stop",
+                    requested: bad,
+                    min: MIN_OP_TIMEOUT,
+                    max: MAX_OP_TIMEOUT,
+                })
+            );
+        }
     }
 
     /// REPAIR-5・TASK-64.5: 結果が届かないまま期限を過ぎたら `Timeout` を返し、放棄処理に渡る。

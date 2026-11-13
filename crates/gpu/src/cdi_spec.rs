@@ -3,7 +3,7 @@
 //! CDI spec（デバイスの種類を問わない。ベンダーの生成ツールが `/etc/cdi`・`/var/run/cdi` に置くもの。
 //! NVIDIA Container Toolkit の `nvidia.yaml` はその一例）を型付き構造体 [`CdiSpec`] へ
 //! デシリアライズするだけの層で、`fandhe-container-gpu` の他モジュール（TASK-126.2 の集計、
-//! TASK-126.3 の usr-merge パス正規化、TASK-127 以降の edits 適用）から入力として使われる。
+//! TASK-126.3 の usr-merge パス正規化、TASK-127 の edits 適用〔`cdi_apply`〕）から入力として使われる。
 //!
 //! 非 GPU デバイスでの利用は GPU-9（検討中・#571 の判断待ち）の対象で、確定した対応範囲ではない。
 //!
@@ -98,8 +98,8 @@ const CDI_SPEC_ERROR_MESSAGE_MAX_BYTES: usize = 512;
 /// `const` 表＋`find` と表外への明示の倒し先にし、試験で表の網羅を照合する（REPAIR-1・ERR-1）。
 /// 文字列から戻すときは [`CdiSpecErrorCode::from_name`] の `None` を fail-closed で扱う。
 ///
-/// core の `ErrorCode` への写像は持たせない: gpu はワークスペース内の crate に依存せず、消費側（edits の適用。
-/// TASK-127 以降）がまだ無い。写像は消費側を作るときにその crate に `ALL` 由来の表で置く。
+/// core の `ErrorCode` への写像は持たせない: gpu はワークスペース内の crate に依存せず、消費側がまだ無い（edits の適用層 `cdi_apply`
+/// は gpu 内に独自の `CdiApplyErrorCode` を持つ。gpu に依存する core・cri への配線は未実装・REPAIR-3）。写像は消費側を作るときにその crate に `ALL` 由来の表で置く。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum CdiSpecErrorCode {
@@ -282,7 +282,9 @@ pub struct CdiDevice {
     pub container_edits: ContainerEdits,
 }
 
-/// OCI spec への編集内容（適用は TASK-127 以降。本層は保持のみ）。
+/// OCI spec への編集内容（本層は保持のみ）。適用は `cdi_apply` が担い、deviceNodes・mounts・`createContainer`
+/// フック・env は実装済み（TASK-127.1〜127.4）。cgroup device の `permissions` は TASK-129、core の実行フローへの
+/// 配線は未実装（REPAIR-3）。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ContainerEdits {
@@ -326,7 +328,11 @@ pub struct NetDevice {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DeviceNode {
-    /// コンテナ内パス（絶対性の検証は TASK-127 以降）。
+    /// コンテナ内パス。本モジュール（解析層）は値を保持するだけで形式を検証しない。
+    /// 形式の検証は適用層の `cdi_apply/device_nodes.rs` の `parse_dev_path`（`resolve_device_nodes` から呼ぶ。#2979・
+    /// TASK-127.1）が行い、`/dev/` 配下の正規形（空・`.`・`..` の要素なし）だけを受ける。`/dev/` の外・NUL・
+    /// 空 / `.` / `..` の要素は `InvalidArgument`、全体 4096 バイト超・1 要素 255 バイト超・`/dev` からの深さ 16 超は
+    /// `ResourceExhausted` で拒否する。同じ path で内容の違うエントリは集計（`cdi_edits`）が拒否する。
     pub path: String,
     /// ホスト側パス。
     #[serde(default)]

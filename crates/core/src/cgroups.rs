@@ -1604,6 +1604,27 @@ impl DelegatedCgroup {
             id,
             instance,
             recorder,
+            SweepMode::KillAll,
+            sys::effective_uid(),
+            &open_cgroup_dir,
+        )
+    }
+
+    /// `cgroup.kill` を一切書かずにコンテナ cgroup を削除する（回復後の再開用。#2245・CORE-2・OCI-6）。
+    ///
+    /// コンテナ cgroup 自身や子孫の `exec-*` にプロセスが居る（または持ち主が生きている）ときは、
+    /// 何も止めずに `FailedPrecondition` を返す。空の `exec-*` だけを消す。
+    pub(crate) fn remove_container_cgroup_without_kill(
+        &self,
+        id: &ContainerId,
+        instance: StateRevision,
+    ) -> Result<CgroupRemoval, TraitError> {
+        remove_container_cgroup_with(
+            self.fd.as_fd(),
+            id,
+            instance,
+            None,
+            SweepMode::UnpopulatedOnly,
             sys::effective_uid(),
             &open_cgroup_dir,
         )
@@ -1619,6 +1640,7 @@ fn remove_container_cgroup_with(
     id: &ContainerId,
     instance: StateRevision,
     recorder: Option<&OpRecorder>,
+    mode: SweepMode,
     euid: u32,
     open_dir: &dyn Fn(CgroupStep, BorrowedFd<'_>, &str) -> Result<OwnedFd, CgroupError>,
 ) -> Result<CgroupRemoval, TraitError> {
@@ -1634,11 +1656,20 @@ fn remove_container_cgroup_with(
             // `rmdir` が EBUSY になり、何度再試行しても成功しない。停止済みでない（コンテナ cgroup 自身に
             // プロセスが居る）ときは掃除が何も kill せず `FailedPrecondition` を返す。
             let deadline = std::time::Instant::now() + EXEC_SWEEP_DELETE_TIMEOUT;
-            let swept =
-                sweep_exec_children_at(child.fd.as_fd(), SweepMode::KillAll, deadline, recorder)
-                    .map_err(removal_error)?;
+            let swept = sweep_exec_children_at(child.fd.as_fd(), mode, deadline, recorder)
+                .map_err(removal_error)?;
             if swept.failed > 0 || swept.truncated {
                 return Err(sweep_removal_error(&swept));
+            }
+            // kill しない方式では、プロセスが居る・持ち主が生きている子を残したまま親を消せない。
+            // 何も止めずに失敗にする（`rmdir` の EBUSY に任せない）。
+            if mode == SweepMode::UnpopulatedOnly
+                && (swept.left_populated > 0 || swept.left_owner_alive > 0)
+            {
+                return Err(TraitError::new(
+                    ErrorCode::FailedPrecondition,
+                    "container cgroup still has processes; nothing was killed",
+                ));
             }
             match remove_child_at(parent, &child) {
                 Ok(()) => Ok(CgroupRemoval::Removed),

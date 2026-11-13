@@ -1120,6 +1120,25 @@ mod tests {
         assert!(!container_removed(fd.as_fd()));
     }
 
+    /// CORE-2・OCI-6（#2245）: `UnpopulatedOnly` は populated な `exec-*` に `cgroup.kill` を書かず残す
+    /// （回復後の再開が破壊的停止をしない契約の土台）。
+    #[test]
+    fn core2_2245_unpopulated_only_never_writes_cgroup_kill() {
+        let (_scratch, d) = tmp("nokill");
+        std::fs::write(d.join("cgroup.procs"), "").unwrap();
+        let child = d.join("exec-1-1");
+        std::fs::create_dir(&child).unwrap();
+        std::fs::write(child.join("cgroup.events"), "populated 1\n").unwrap();
+        let fd = OwnedFd::from(File::open(&d).unwrap());
+        let deadline = Instant::now() + Duration::from_millis(50);
+        let out =
+            sweep_exec_children_at(fd.as_fd(), SweepMode::UnpopulatedOnly, deadline, None).unwrap();
+        assert_eq!(out.removed, 0);
+        assert_eq!(out.left_populated + out.left_owner_alive + out.failed, 1);
+        assert!(!child.join("cgroup.kill").exists());
+        assert!(child.is_dir());
+    }
+
     /// OCI-6・CORE-2・SUP-6・#1596: `KillAll` はコンテナ cgroup 自身の `cgroup.procs` が空でなければ何も
     /// kill・削除せず `FailedPrecondition` を返す。空なら掃除へ進む（ここでは tmpfs の子が cgroup2 検証で失敗 1）。
     /// `UnpopulatedOnly` はこの前提を持たない。

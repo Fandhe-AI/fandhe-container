@@ -176,7 +176,7 @@ impl DelegatedCgroup {
             ));
         }
         // 前回の中断が残した空のコンテナ cgroup を消す。居るプロセスは kill しない（元の code を保って失敗）。
-        ContainerCgroupRemover::remove(self, observed.id(), placement.instance())
+        self.remove_container_cgroup_without_kill(observed.id(), placement.instance())
             .map_err(|e| remove_error(&e))?;
         Ok(CgroupScopeRecorded {
             delegated: self,

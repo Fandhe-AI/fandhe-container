@@ -49,7 +49,7 @@ use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 
 use std::time::Instant;
 
-use super::exec_kill::{EVENTS_LIMIT, parse_populated, wait_unpopulated, write_kill};
+use super::exec_kill::{EVENTS_LIMIT, SweepMode, parse_populated, wait_unpopulated, write_kill};
 use super::{
     CgroupError, CgroupName, CgroupPath, CgroupStep, MAX_PATH_DEPTH, cstring, open_cgroup_dir,
     open_cgroup_root, open_child_with, read_iface, removal_error, remove_container_cgroup_with,
@@ -108,6 +108,7 @@ impl RecordedCgroupScope {
             id,
             instance,
             recorder,
+            SweepMode::KillAll,
             sys::effective_uid(),
             &open_cgroup_dir,
         )
@@ -306,6 +307,7 @@ pub(super) fn remove_recorded_with(
             id,
             placement.instance(),
             recorder,
+            SweepMode::KillAll,
             euid,
             open_dir,
         ),

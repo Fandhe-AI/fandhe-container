@@ -25,7 +25,7 @@ SHELL := /bin/bash
 
 .PHONY: help setup rustup submodule hooks lint-md lint-yaml lint-editorconfig lint-commits lint-docs \
 	check-workspace-manifest fmt fmt-check lint test doc poc-venus-jig-check check-cli-backend-deps \
-	check-stack-deps check-stack-deps-selftest check-launch-target check-launch-target-selftestcheck-microvm-deps check-microvm-deps-selftest \
+	check-stack-deps check-stack-deps-selftest check-launch-target check-launch-target-selftest check-microvm-deps check-microvm-deps-selftest \
 	check-standalone-clippy check-standalone-clippy-selftest \
 	test-core-no-plugin check-cli-no-plugin plugin-feature-size plug4-core-invariance plug4-core-invariance-selftest \
 	test-integration cli-parity-selftest cli-parity-native-reclaim-check \

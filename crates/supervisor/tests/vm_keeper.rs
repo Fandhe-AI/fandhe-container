@@ -20,6 +20,10 @@ fn main() {
 }
 
 #[cfg(unix)]
+#[path = "../../oci/tests/support/test_root.rs"]
+mod test_root;
+
+#[cfg(unix)]
 fn main() -> std::process::ExitCode {
     unix::main()
 }
@@ -39,6 +43,8 @@ mod unix {
     use fandhe_container_supervisor::vm_keeper::lock::KeeperLock;
     use fandhe_container_supervisor::vm_keeper::protocol::Reason;
     use fandhe_container_supervisor::vm_keeper::{KeeperConfig, VmLifecycle, VmStopOutcome, run};
+
+    use super::test_root::{TestRoot, test_root_at};
 
     const SOCKET_FILE: &str = "vm-keeper-default.sock";
     const WATCHDOG: Duration = Duration::from_secs(180);
@@ -174,33 +180,16 @@ mod unix {
 
     /// socket を置く短いパスの試験用ディレクトリ（MAC-4・REPAIR-12）。
     /// macOS の `$TMPDIR` は長く、配下の socket が sun_path の上限（104 バイト）を超えるため、
-    /// `/tmp` 直下に 0700 で排他作成し、Drop で再帰削除する（作成した自分のパスだけ）。
-    struct ShortDir(PathBuf);
-
-    impl ShortDir {
-        fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for ShortDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn scratch(tag: &str) -> ShortDir {
-        use std::os::unix::fs::DirBuilderExt as _;
+    /// `/tmp` 直下を第 1 候補に共有の `test_root_at` で排他作成する（衝突時は別名で作り直し、Drop で消える）。
+    fn scratch(tag: &str) -> TestRoot {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos())
             .unwrap_or(0);
-        let p = PathBuf::from(format!("/tmp/fcvk-{tag}-{}-{nanos:x}", std::process::id()));
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&p)
-            .unwrap_or_else(|e| panic!("exclusively create {}: {e}", p.display()));
-        ShortDir(p)
+        test_root_at(PathBuf::from(format!(
+            "/tmp/fcvk-{tag}-{}-{nanos:x}",
+            std::process::id()
+        )))
     }
 
     fn runtime_dir(base: &Path) -> Res<PathBuf> {
@@ -215,14 +204,14 @@ mod unix {
 
     fn scenario_a() -> Res {
         let s = scratch("a");
-        let marker = s.path().join("marker");
-        let k1 = spawn_keeper(s.path(), s.path(), DEFAULT_GRACE_MS, &marker, "k1")?;
-        let client = KeeperClient::new(s.path()).map_err(te)?;
+        let marker = s.join("marker");
+        let k1 = spawn_keeper(&s, &s, DEFAULT_GRACE_MS, &marker, "k1")?;
+        let client = KeeperClient::new(&s).map_err(te)?;
         let pid1 = wait_ready(&client, Duration::from_secs(10))?;
         check(pid1 == k1.child.id(), || {
             format!("pid {pid1} != first keeper")
         })?;
-        let mut k2 = spawn_keeper(s.path(), s.path(), DEFAULT_GRACE_MS, &marker, "k2")?;
+        let mut k2 = spawn_keeper(&s, &s, DEFAULT_GRACE_MS, &marker, "k2")?;
         let st = wait_exit(&mut k2.child, Duration::from_secs(10))?;
         check(st.code() == Some(3), || {
             format!("second keeper status {st:?}")
@@ -239,12 +228,12 @@ mod unix {
 
     fn scenario_b() -> Res {
         let s = scratch("b");
-        let marker = s.path().join("marker");
+        let marker = s.join("marker");
         let mut keepers = Vec::new();
         for i in 0..4 {
             keepers.push(spawn_keeper(
-                s.path(),
-                s.path(),
+                &s,
+                &s,
                 DEFAULT_GRACE_MS,
                 &marker,
                 &format!("k{i}"),
@@ -265,7 +254,7 @@ mod unix {
             })?;
             std::thread::sleep(Duration::from_millis(20));
         }
-        let client = KeeperClient::new(s.path()).map_err(te)?;
+        let client = KeeperClient::new(&s).map_err(te)?;
         let pid = wait_ready(&client, Duration::from_secs(10))?;
         let mut alive = 0;
         for k in &mut keepers {
@@ -292,10 +281,10 @@ mod unix {
 
     fn scenario_c() -> Res {
         let s = scratch("c");
-        let marker = s.path().join("marker");
-        let dir = runtime_dir(s.path())?;
-        let mut k1 = spawn_keeper(s.path(), s.path(), DEFAULT_GRACE_MS, &marker, "k1")?;
-        let client = KeeperClient::new(s.path()).map_err(te)?;
+        let marker = s.join("marker");
+        let dir = runtime_dir(&s)?;
+        let mut k1 = spawn_keeper(&s, &s, DEFAULT_GRACE_MS, &marker, "k1")?;
+        let client = KeeperClient::new(&s).map_err(te)?;
         wait_ready(&client, Duration::from_secs(10))?;
         check(
             KeeperLock::try_acquire(&dir)
@@ -315,7 +304,7 @@ mod unix {
             "the killed keeper must leave a stale socket".into()
         })?;
         drop(lock);
-        let k3 = spawn_keeper(s.path(), s.path(), DEFAULT_GRACE_MS, &marker, "k3")?;
+        let k3 = spawn_keeper(&s, &s, DEFAULT_GRACE_MS, &marker, "k3")?;
         let pid3 = wait_ready(&client, Duration::from_secs(10))?;
         check(pid3 == k3.child.id(), || {
             format!("responder {pid3} is not the new keeper")
@@ -326,8 +315,8 @@ mod unix {
 
     fn scenario_d() -> Res {
         let s = scratch("d");
-        let marker = s.path().join("marker");
-        let dir = runtime_dir(s.path())?;
+        let marker = s.join("marker");
+        let dir = runtime_dir(&s)?;
         let held = KeeperLock::try_acquire(&dir).map_err(te)?;
         let t0 = Instant::now();
         let e = KeeperLock::acquire_within(&dir, Duration::from_millis(300))
@@ -342,11 +331,11 @@ mod unix {
             || format!("acquire elapsed {el:?}"),
         )?;
         // ロックだけ握られ socket が無い: 起動役の待ちも期限で切れる（起動した子は already running で終わる）。
-        let client = KeeperClient::new(s.path()).map_err(te)?;
+        let client = KeeperClient::new(&s).map_err(te)?;
         let t1 = Instant::now();
-        let stderr = s.path().join("kd.stderr");
+        let stderr = s.join("kd.stderr");
         let r = client.ensure_running(
-            || spawn_raw(&stderr, s.path(), DEFAULT_GRACE_MS, &marker),
+            || spawn_raw(&stderr, &s, DEFAULT_GRACE_MS, &marker),
             Duration::from_millis(300),
         );
         let el = t1.elapsed();
@@ -365,11 +354,11 @@ mod unix {
 
     fn scenario_e() -> Res {
         let s = scratch("e");
-        let marker = s.path().join("marker");
-        let dir = runtime_dir(s.path())?;
+        let marker = s.join("marker");
+        let dir = runtime_dir(&s)?;
         let grace = Duration::from_millis(2500);
-        let mut k = spawn_keeper(s.path(), s.path(), 2500, &marker, "k")?;
-        let client = KeeperClient::new(s.path()).map_err(te)?;
+        let mut k = spawn_keeper(&s, &s, 2500, &marker, "k")?;
+        let client = KeeperClient::new(&s).map_err(te)?;
         let pid = wait_ready(&client, Duration::from_secs(10))?;
         let r = client.register(&id("c1")?).map_err(te)?;
         check(
@@ -422,11 +411,11 @@ mod unix {
 
     fn scenario_f() -> Res {
         let s = scratch("f");
-        let marker = s.path().join("marker");
+        let marker = s.join("marker");
         let config = KeeperConfig::default();
         let mut vm = RecordingVm(marker.clone());
 
-        let wide = s.path().join("wide");
+        let wide = s.join("wide");
         std::fs::create_dir(&wide).map_err(|e| e.to_string())?;
         std::fs::set_permissions(&wide, std::fs::Permissions::from_mode(0o777))
             .map_err(|e| e.to_string())?;
@@ -437,11 +426,11 @@ mod unix {
             format!("0777 -> {:?}", e.code())
         })?;
 
-        let real = s.path().join("real");
+        let real = s.join("real");
         std::fs::create_dir(&real).map_err(|e| e.to_string())?;
         std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700))
             .map_err(|e| e.to_string())?;
-        let link = s.path().join("link");
+        let link = s.join("link");
         std::os::unix::fs::symlink(&real, &link).map_err(|e| e.to_string())?;
         let e = run(&config, &link, &mut vm)
             .err()

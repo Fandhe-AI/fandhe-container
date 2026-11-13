@@ -1198,5 +1198,7 @@ fn notify(call: &File, timeout: Duration) -> Result<(), SessionError> {
 mod backend_req_tests;
 #[cfg(test)]
 mod map_blob_tests;
+#[cfg(all(test, any(target_arch = "x86_64", target_arch = "aarch64")))]
+mod ring_read_tests;
 #[cfg(test)]
 mod tests;

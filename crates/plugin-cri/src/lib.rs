@@ -41,6 +41,8 @@ compile_error!(
 pub mod adapter;
 #[cfg(target_os = "linux")]
 pub mod audit_relay;
+#[cfg(unix)]
+pub mod extract_identity;
 mod flock_release;
 #[cfg(unix)]
 pub mod image_inventory;

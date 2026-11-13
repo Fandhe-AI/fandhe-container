@@ -73,7 +73,7 @@ uid / gid）で渡す。入れ子の user namespace の中で展開するとき�
 
 | 項目 | 決定 |
 | ---- | ---- |
-| 呼び出し側 | 初期 user namespace で `CAP_CHOWN` を持つプロセス（典型はホスト root）。ホストの非特権ユーザーは subuid 範囲へ `chown` できず、`EPERM` は `PermissionDenied`（fail-closed）。写像はコンテナ起動時の user namespace の写像と同じものを渡す。入手経路は 1 本だけで、cli の `image_ownership`（start の launcher と同じ supervisor `id_model::resolve_rootless_id_source` → core `SubordinateIdSource::resolve_id_maps` を呼ぶ。#2389。本番の呼び出し元は未配線） |
+| 呼び出し側 | 初期 user namespace で `CAP_CHOWN` を持つプロセス（典型はホスト root）。ホストの非特権ユーザーは subuid 範囲へ `chown` できず、`EPERM` は `PermissionDenied`（fail-closed）。写像はコンテナ起動時の user namespace の写像と同じものを渡す。入手経路は 1 本だけで、cli の `image_ownership`（start の launcher と同じ supervisor `id_model::resolve_rootless_id_source` → core `SubordinateIdSource::resolve_id_maps` を呼ぶ。#2389。本番の呼び出し元は plugin-cri の対応表〔#2792〕で、現状は変換を要さない値だけを選ぶため未使用） |
 | 非 Linux | 開始前に `Unimplemented`（黙って飛ばさない）。特殊ビットは従来どおり `UnsupportedHost`（Strip 相当） |
 | 範囲外・不正な ID | 写像に無い ID は `PermissionDenied`、解析できない ID（PAX の不正値を含む）は `InvalidArgument`。パス 1 で書き込み前に拒否 |
 | ホスト ID 0 | `IdMap::new` が `PermissionDenied` で拒否する（コンテナ root をホスト root に写さない。SEC-5） |
@@ -193,12 +193,14 @@ tar のコンテナ内 ID をそのまま `chown` する（namespace の中で�
   fail-closed にしホストでの展開に届かない／Linux の他アーキテクチャは展開が `Unimplemented` で展開物が無く、削除も空の木を
   消すだけ／macOS の `openat` 系・Windows のハンドル起点操作は新しい FFI 宣言・libc 照合（Windows はオーナー判断）が要る。
   ゲストが共有ディレクトリへ書き込みうる設計（`macos-shared-vm.md`）になれば優先度が上がる
-- 本番の呼び出し元（pull → 展開 → 起動の経路）から `ExtractOptions` を渡す配線（#2534）。現状、本番の値は pull・create とも
-  既定の `Keep` + `Strip` で、plugin-cri の `bundle_provider_in` は `ImageExtractConfig::new` の既定を使う。配線の前提:
-  rootful の `ChownMapped` の可否（#2241）、core が user namespace へ入る配線による `ChownInUserNamespace`（#2315・#482。
-  記録の符号化も現状は受けない）、`PullConfig` を組む本番の呼び出し元（plugin-cri の ImageService。#2592）、所有者の解決の
-  部品 `image_ownership`（#2389。cli crate にあり、置き場所の判断が要る）。pull と create は `ImageExtractConfig` の 1 か所から
-  同じ値を配る（食い違うと記録の照合で `FAILED_PRECONDITION`）。配線するときの確認事項: `ChownMapped` で展開した rootfs に、
+- 本番の呼び出し元の配線（#2534・#2792）: plugin-cri の `extract_identity` が start と同じ権限モデルの解決から
+  `ExtractOptions` を選び、pull と create へ 1 回の解決結果を渡す（失敗は縮退せず fail-closed）。対応表は現状すべて
+  `Keep` + `Strip`: ホスト root は本番の start が無く（#2241 D1:A。`ChownMapped` の本番の消費者が無い）、SingleId は `Keep` が正しく、
+  SubordinateIds の `ChownInUserNamespace` は tokio のマルチスレッドから user namespace に入れず未配線。
+  `PreserveIfOwnerMapped` は cri の `open_rootfs_for_search` が展開後に rootfs を 0755 にするため oci の「root を 0700 に保つ」
+  契約と両立せず、有効にしない。残り（後続 issue・要起票）: `ChownInUserNamespace`（再 exec する helper 等）・記録の符号化・
+  subuid 所有の木の削除・pull / start の subuid のずれの照合・`image_ownership` の置き場所・`PreserveIfOwnerMapped` の前提整合。
+  pull と create は `ImageExtractConfig` の 1 か所から同じ値を配る（食い違うと記録の照合で `FAILED_PRECONDITION`）。配線するときの確認事項: `ChownMapped` で展開した rootfs に、
   0700 の bundle 配下から写像先の uid で到達できること（core の launcher 側。SEC-5・CRI-2）の試験を同時に足す
 - `IdMap` と core の `IdMapSet` を下位 crate へ共通化するかどうか（crate 境界の判断）
 

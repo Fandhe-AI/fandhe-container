@@ -157,7 +157,11 @@ pub fn run_main(args: impl Iterator<Item = OsString>) -> ExitCode {
             run(&KeeperConfig::default(), &base, &mut vm)
         });
     match result {
-        Ok(_) => ExitCode::SUCCESS,
+        Ok(_) => {
+            // 終了理由・VM 停止失敗の診断が非同期キューに残ったまま落ちないよう、期限つきで排出を待つ（REPAIR-4・REPAIR-5）。
+            let _ = crate::stderr_sink::flush_stderr(Duration::from_secs(1));
+            ExitCode::SUCCESS
+        }
         Err(e) => {
             let err = OciRuntimeError::from_trait_error(LifecycleOp::Start, e);
             let mut line = Vec::new();

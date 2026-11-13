@@ -142,7 +142,9 @@ impl Drop for Dirs {
 
 #[cfg(target_os = "linux")]
 fn code_line(code: &str, message: &str) -> String {
-    format!("{{\"code\":\"{code}\",\"message\":\"{message}\"}}\n")
+    format!(
+        "{{\"level\":\"error\",\"event\":\"cli_error\",\"code\":\"{code}\",\"message\":\"{message}\"}}\n"
+    )
 }
 
 /// SEC-1・STACK-8・#4638: `env_files` の最後の要素が範囲外を指す symlink なら、イメージにも子プロセスにも触れずに

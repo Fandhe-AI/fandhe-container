@@ -1,6 +1,7 @@
 //! Linux ゲストの PID 1 としての起動シーケンスと [`GuestOps`] の実装（MAC-1・MAC-2・TASK-64 追補）。
 //!
-//! bin の入口（`main.rs`）から [`run`] だけが呼ばれる。mount は `sys` の安全なラッパー経由で、
+//! bin の入口（`main.rs`）から [`run`] だけが呼ばれる。mount は `sys` の安全なラッパー経由で（virtiofs の
+//! mount 先は fd で固定する。#2268）、
 //! 指示の復号・報告は OS 非依存の `directive`・`process`・`report` が、試験用プローブは `probe` が担う。
 //!
 //! どの経路でも終了しない（PID 1 が終了するとカーネルが panic する）。panic も [`install_panic_hook`] の
@@ -8,8 +9,9 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use crate::cmdline::{MAX_CMDLINE_BYTES, read_bounded};
@@ -26,30 +28,23 @@ struct LinuxOps {
 }
 
 impl GuestOps for LinuxOps {
-    fn ensure_mount_point(&mut self, mount_point: &MountPoint) -> Result<(), Errno> {
-        ensure_real_dir(Path::new(GUEST_MOUNT_BASE))?;
-        let mut path = PathBuf::from(GUEST_MOUNT_BASE);
-        for element in mount_point.elements() {
-            path.push(element);
-            match fs::create_dir(&path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(e) => return Err(Errno::from_io(&e)),
-            }
-            ensure_real_dir(&path)?;
-        }
-        Ok(())
+    type MountTarget = OwnedFd;
+
+    fn ensure_mount_point(&mut self, mount_point: &MountPoint) -> Result<OwnedFd, Errno> {
+        let root = sys::open_root_dir().map_err(|e| Errno::from_io(&e))?;
+        open_mount_target(
+            root.as_fd(),
+            GUEST_MOUNT_BASE.split('/').filter(|s| !s.is_empty()),
+            mount_point.elements(),
+        )
     }
 
-    fn mount_virtiofs(&mut self, d: &Directive) -> Result<(), Errno> {
+    fn mount_virtiofs(&mut self, target: OwnedFd, d: &Directive) -> Result<(), Errno> {
         // nosuid・nodev・`ro` なら MS_RDONLY は sys 側の固定値（呼び出し元は外せない）。
-        // 検査から mount までの TOCTOU は PID 1 のみが動く前提で許容（lib.rs「未実装」・#2080・#1905）。
-        sys::mount_virtiofs(
-            d.tag.as_str(),
-            Path::new(d.mount_point.as_str()),
-            d.access == Access::ReadOnly,
-        )
-        .map_err(|e| Errno::from_io(&e))
+        // mount 先は ensure_mount_point が開いた fd で、文字列パスは引き直さない（#2268・#2080 P2-4）。
+        // `target` は mount の後に drop して閉じる。
+        sys::mount_virtiofs_at(d.tag.as_str(), target.as_fd(), d.access == Access::ReadOnly)
+            .map_err(|e| Errno::from_io(&e))
     }
 
     fn write_line(&mut self, line: &ReportLine) {
@@ -63,16 +58,37 @@ fn write_console_line(console: &mut dyn Write, line: &ReportLine) {
     let _ = console.flush();
 }
 
-/// symlink でない実ディレクトリであることを要求する（symlink 経由の mount 先すり替えを防ぐ）。
+/// mount 先を `root` から要素ごとに `openat(O_NOFOLLOW)` で辿って fd で固定する（MAC-1・SEC-1・#2268）。
 ///
-/// 検査後に文字列パスで mount するため TOCTOU の余地がある。mount 時にゲスト内で動くのは PID 1 だけという
-/// 前提で許容しており、子プロセスを動かす前に fd 起点の mount へ移す（lib.rs「未実装」・#2080・#1905）。
-fn ensure_real_dir(path: &Path) -> Result<(), Errno> {
-    let md = fs::symlink_metadata(path).map_err(|e| Errno::from_io(&e))?;
-    if md.is_dir() {
-        Ok(())
-    } else {
-        Err(Errno::ENOTDIR)
+/// `base`（`/mnt/fandhe` の要素）は `init_filesystems` が作成済みなので作らず開くだけにし、`elements`
+/// （指示の mount point の要素）は欠けていれば `mkdirat` で作る。symlink・通常ファイルの要素は
+/// `ENOTDIR` で失敗し、symlink の先には何も作らない。呼び出し元は `LinuxOps::ensure_mount_point`。
+/// 途中の fd はループで置き換わるたびに閉じ、最後の 1 本だけを返す。
+fn open_mount_target<'a>(
+    root: BorrowedFd<'_>,
+    base: impl Iterator<Item = &'a str>,
+    elements: impl Iterator<Item = &'a str>,
+) -> Result<OwnedFd, Errno> {
+    let mut cur: Option<OwnedFd> = None;
+    for name in base {
+        let parent = cur.as_ref().map_or(root, |f| f.as_fd());
+        let next = sys::open_child_dir(parent, name).map_err(|e| Errno::from_io(&e))?;
+        cur = Some(next);
+    }
+    for name in elements {
+        let parent = cur.as_ref().map_or(root, |f| f.as_fd());
+        match sys::mkdir_child(parent, name) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(Errno::from_io(&e)),
+        }
+        let next = sys::open_child_dir(parent, name).map_err(|e| Errno::from_io(&e))?;
+        cur = Some(next);
+    }
+    match cur {
+        Some(f) => Ok(f),
+        // 要素が 0 件（MountPoint の検証上は起きない）。root 自身を mount 先にしない。
+        None => Err(Errno::EINVAL),
     }
 }
 
@@ -220,5 +236,85 @@ mod tests {
             classify_dev_mount(Err(std::io::Error::from_raw_os_error(1))),
             Err(Errno::new(1))
         );
+    }
+
+    use std::os::unix::fs::{MetadataExt, symlink};
+
+    fn tmp_root(tag: &str) -> crate::test_root::TestRoot {
+        crate::test_root::test_root("fandhe-guest-init", tag)
+    }
+
+    fn open_dir(p: &Path) -> File {
+        File::open(p).unwrap()
+    }
+
+    fn fd_ino(fd: &OwnedFd) -> (u64, u64) {
+        let md = fs::metadata(format!(
+            "/proc/self/fd/{}",
+            std::os::fd::AsRawFd::as_raw_fd(fd)
+        ))
+        .unwrap();
+        (md.dev(), md.ino())
+    }
+
+    /// MAC-1・SEC-1・#2268: 欠けた要素を作り、返った fd が作った実ディレクトリを指す。2 回目も成功する。
+    #[test]
+    fn mac1_2268_open_mount_target_creates_and_is_idempotent() {
+        let t = tmp_root("create");
+        let root = t.to_path_buf();
+        fs::create_dir_all(root.join("mnt/fandhe")).unwrap();
+        let rfd = open_dir(&root);
+        let run = || {
+            open_mount_target(
+                rfd.as_fd(),
+                ["mnt", "fandhe"].into_iter(),
+                ["a", "b"].into_iter(),
+            )
+        };
+        let fd = run().unwrap();
+        let md = fs::metadata(root.join("mnt/fandhe/a/b")).unwrap();
+        assert_eq!(fd_ino(&fd), (md.dev(), md.ino()));
+        let fd2 = run().unwrap();
+        assert_eq!(fd_ino(&fd2), (md.dev(), md.ino()));
+    }
+
+    /// MAC-1・SEC-1・#2268: base が symlink なら ENOTDIR で、先には何も作られない。
+    #[test]
+    fn mac1_2268_symlinked_base_is_rejected() {
+        let t = tmp_root("base-link");
+        let root = t.to_path_buf();
+        fs::create_dir_all(root.join("elsewhere/fandhe")).unwrap();
+        symlink("elsewhere", root.join("mnt")).unwrap();
+        let rfd = open_dir(&root);
+        let r = open_mount_target(
+            rfd.as_fd(),
+            ["mnt", "fandhe"].into_iter(),
+            ["a"].into_iter(),
+        );
+        assert_eq!(r.err(), Some(Errno::ENOTDIR));
+        assert!(!root.join("elsewhere/fandhe/a").exists());
+    }
+
+    /// MAC-1・SEC-1・#2268: 指示の要素が symlink・通常ファイルなら ENOTDIR で、symlink の先は作られない。
+    #[test]
+    fn mac1_2268_symlink_or_file_element_is_rejected() {
+        let t = tmp_root("elem-link");
+        let root = t.to_path_buf();
+        fs::create_dir_all(root.join("mnt/fandhe")).unwrap();
+        fs::create_dir_all(root.join("outside")).unwrap();
+        symlink("../../outside", root.join("mnt/fandhe/a")).unwrap();
+        fs::write(root.join("mnt/fandhe/f"), "x").unwrap();
+        let rfd = open_dir(&root);
+        let go = |els: &[&'static str]| {
+            open_mount_target(
+                rfd.as_fd(),
+                ["mnt", "fandhe"].into_iter(),
+                els.iter().copied(),
+            )
+            .err()
+        };
+        assert_eq!(go(&["a", "b"]), Some(Errno::ENOTDIR));
+        assert!(!root.join("outside/b").exists());
+        assert_eq!(go(&["f"]), Some(Errno::ENOTDIR));
     }
 }

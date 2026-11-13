@@ -42,6 +42,8 @@ use crate::error::CliError;
 #[cfg(target_os = "linux")]
 mod bundle;
 #[cfg(target_os = "linux")]
+mod inline_env;
+#[cfg(target_os = "linux")]
 mod launcher;
 #[cfg(target_os = "linux")]
 mod observe;

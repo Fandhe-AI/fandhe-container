@@ -46,6 +46,7 @@ use fandhe_container_stack::cli::up::{
 use super::super::image_unpack::UNPACK_DEADLINE;
 use super::bundle::write_bundle;
 use super::error_code_for_exit;
+use super::inline_env::{argv_spec, write_inline_env};
 use super::observe::SharedLedger;
 use super::prepare::Prepared;
 use crate::error::CliError;
@@ -219,14 +220,19 @@ impl ServiceLauncher for ProductionServiceLauncher {
             image_root: &self.image_root,
             unpack: true,
         };
-        let create =
-            create_argv(&p.spec, request.network(), &ctx).map_err(|e| e.to_launch_error())?;
+        // サービスの env は argv に載せず、非公開の一時 env ファイル経由で渡す。create の終了（成功・失敗・期限切れ）で
+        // ガードの Drop が消す（SEC-1・STACK-8）。
+        let inline = write_inline_env(&paths.env_dir, &p.spec.env).map_err(|e| from_cli(&e))?;
+        let create = create_argv(&argv_spec(&p.spec), request.network(), &ctx)
+            .map_err(|e| e.to_launch_error())?;
         let pasta: &[OsString] = if request.network().is_some() {
             &self.pasta_args
         } else {
             &[]
         };
-        self.run_child(pasta, &create, self.create_deadline, Phase::Create)?;
+        let created = self.run_child(pasta, &create, self.create_deadline, Phase::Create);
+        drop(inline);
+        created?;
         // create に成功した時点で台帳へ記録する（以後 observer / health がこのコンテナを読む）。
         self.ledger
             .try_borrow_mut()

@@ -84,7 +84,7 @@ pub(super) fn config_json(p: &Prepared) -> String {
     )
 }
 
-fn write_private(dir: &ExtractRoot, name: &str, body: &[u8]) -> Result<(), CliError> {
+pub(super) fn write_private(dir: &ExtractRoot, name: &str, body: &[u8]) -> Result<(), CliError> {
     use std::os::unix::fs::PermissionsExt as _;
     let mut f = dir
         .create_new_file(name, 0o600)

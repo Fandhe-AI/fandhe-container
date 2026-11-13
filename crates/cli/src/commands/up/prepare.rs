@@ -179,8 +179,34 @@ impl Preparer<'_> {
         };
         // 4. 合成した config.json を core の検証に通す（起動後に初めて INTERNAL で見つかる事態を防ぐ。#4734）。
         super::bundle::validate_config(&prepared)?;
+        // 子の `create` が受ける argv を、副作用の前に同じ解析（`parse_create`）へ通す（ラベル件数など、
+        // 個別の検証関数が通しても create が拒否する組を後続サービスで初めて見つけない。STACK-8・SEC-1）。
+        validate_create_argv(&prepared)?;
         Ok(prepared)
     }
+}
+
+/// 子の `create` の argv を組み、`create` の引数解析に通す（サービスの env は生成ファイル経由の形で検証する）。
+fn validate_create_argv(p: &Prepared) -> Result<(), CliError> {
+    use fandhe_container_stack::cli::up::{CreateArgvContext, create_argv};
+    let spec = super::inline_env::argv_spec(&p.spec);
+    super::inline_env::render_inline_env(&p.spec.env)?;
+    let root = Path::new("/");
+    let ctx = CreateArgvContext {
+        id: &p.id,
+        project_dir: root,
+        bundle: root,
+        image_root: root,
+        unpack: true,
+    };
+    let argv = create_argv(&spec, None, &ctx).map_err(from_args)?;
+    super::super::args::parse_create(argv.into_iter().skip(1).collect()).map_err(|_| {
+        CliError::new(
+            ErrorCode::InvalidArgument,
+            "service options exceed what create accepts",
+        )
+    })?;
+    Ok(())
 }
 
 /// `rels` を順に読む。件数・サービス単位の合計（`ENV_MAX_TOTAL_BYTES`）・プロジェクト全体の合計の上限を、
@@ -402,6 +428,32 @@ mod tests {
             image: Some("x".to_owned()),
             ..Service::default()
         }
+    }
+
+    /// STACK-8・SEC-1: Labels は 64 件まで通るが、子の `create` は 63 件まで。事前検査で拒否する。
+    #[test]
+    fn stack8_sec1_validate_create_argv_rejects_label_count_create_refuses() {
+        use fandhe_container_stack::cli::up::{ProjectName, ServiceContainerId};
+        let prepared = |n: usize| {
+            let mut spec = service();
+            for i in 0..n {
+                spec.labels.insert(format!("k{i}"), "v".to_owned());
+            }
+            Prepared {
+                id: ServiceContainerId::derive(&ProjectName::new("p").expect("p"), "s")
+                    .expect("id"),
+                spec,
+                args: vec![],
+                cwd: "/".to_owned(),
+                image_env: vec![],
+                uid: 0,
+                gid: 0,
+                env_files: vec![],
+            }
+        };
+        validate_create_argv(&prepared(63)).expect("63 labels");
+        let e = validate_create_argv(&prepared(64)).expect_err("64 labels");
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
     }
 
     /// STACK-8・SEC-1・#4734: env_files の本文・env のキー・ulimits・shm_size を副作用の前に意味検証する。

@@ -2,14 +2,14 @@
 
 seccomp の `KILL_PROCESS`（`unshare`・`ptrace`・`kexec_load` の 3 件）の正の記録であるカーネルの `AUDIT_SECCOMP` を、プロセス内で読む読み手を入れるか、そのために `CAP_AUDIT_READ` を付与するかの判断材料を整理する（SEC-4・ESC-06・SUP-14。参照: CORE-1・CORE-6・CORE-7・CORE-9。#2237・#2004・#2027・#2028）。
 
-> **位置づけ**: **オーナー承認待ち**。本書は決定ではなく判断材料である。決まるまでは、プロセス内の読み手も `CAP_AUDIT_READ` も入れない現状（#2004 の判断）を保ち、権限分離の承認済みの最小権限集合（`privilege-separation.md`。#1454）を変えない。判断の窓口は #2237（open のまま。6 章に判断シート）。
+> **位置づけ**: **決定済み（2026-11-13。#2237）**。オーナーが D1 A・D2 A・D3 A（#4720 を起票）・D4 該当なしを承認した。プロセス内の読み手も `CAP_AUDIT_READ` も入れず、権限分離の承認済みの最小権限集合（`privilege-separation.md`。#1454）は変えない。2 章・3 章の判断材料は記録として残す。
 
 ## 1. 現状
 
 - 正の記録はカーネルの `AUDIT_SECCOMP`。読むのは auditd 等の外部の読み手で、本リポのプロセスは読まない（`audit-delivery.md` 9.1）
 - 補助として、本番 launcher の回収点が SIGSYS の終了を層 `exit_signal` で 1 回記録する。syscall・arch は持たない（コンテナ内の `kill(SIGSYS)` と区別できないため seccomp 由来とは断定しない）
 - カーネル監査を使えない環境の検出と表示は #2027（`audit-delivery.md` 7.1）
-- ESC-06（`KILL_PROCESS` の 3 件）は `Deferred` のまま。`Required` への切り替えは本件の結論の後（#2028）
+- ESC-06（`KILL_PROCESS` の 3 件）は `Deferred` で確定（D2 A）。合否に使わない。残りは #4720
 
 ## 2. 一次資料の確認結果
 
@@ -68,8 +68,16 @@ Linux v6.12 タグの原文で確認した（2026-10-20）。行番号ではな�
 
 ## 4. 決定後の作業
 
-- A: 位置づけを「決定」に変え、`audit-delivery.md` 9.1 の「承認事項として残す」を確定の文言に変える。ESC-06 の扱いは spec（ESC-06・SEC-4 の受け入れ範囲）との整合をオーナーが判断する
-- B: 3 章の「要るもの」を実装 issue に分ける
+- A（採用）: 位置づけを「決定」に変え、`audit-delivery.md` 9.1 を確定の文言にした。ESC-06 は D2 A で `Deferred` を保ち、spec の受け入れ範囲は見直さない（#2486）
+- B（採らなかった）: 3 章の「要るもの」を実装 issue に分ける
+
+### ESC-06 を `Required` にできない理由と再評価の条件
+
+- 理由 1: プロセス内に読み手を置かない（D1 A）ため、正の記録である `AUDIT_SECCOMP`（syscall・arch・pid を持つ）を本リポのプロセスが回収できない
+- 理由 2: 補助の `exit_signal` は syscall を持たず seccomp 由来と断定できない。かつ `escape_suite` の入口（`spawn_container_probe`）では作られない
+- 理由 3: PID 1 以外の子孫と exec コマンドの子孫の SIGSYS 終了は親から観測できない（#4720）
+- 再評価の条件: D1 を B に変える / opt-in のカーネル監査の段（D2 C。auditd が前提。Landlock の `FANDHE_CONTAINER_TEST_KERNEL_AUDIT=1` と同じ形）を採る / spec の ESC-06・SEC-4 の受け入れ範囲を見直す
+- 残余（REPAIR-3）: spec は ESC-06 の監査記録を依然として要求している。試験はそれを合否に使っていない。この差を「達成」とは読まない
 
 ## 5. 未確認事項・再検証条件
 
@@ -83,13 +91,13 @@ Linux v6.12 タグの原文で確認した（2026-10-20）。行番号ではな�
 
 ## 6. 承認事項（判断シート）
 
-承認の窓口は #2237。すべて**未決**（承認済みのものは無い）。返信は「D1: 推奨どおり / D2: …」のように番号で答えられる。
+承認の窓口は #2237。**2026-11-13 に決定**（推奨どおり）。返信は「D1: 推奨どおり / D2: …」のように番号で答えられる。
 
 | 番号 | 判断事項 | 選択肢 | 推奨 | 影響 | 判断 |
 | ---- | -------- | ------ | ---- | ---- | ---- |
-| D1 | プロセス内の読み手と `CAP_AUDIT_READ`（3 章） | A 付与しない / B 付与する | A | A: 最小権限集合は変わらず、残るのは #2027 の縮退表示（`kernel_audit_not_built`・`kernel_audit_disabled_at_boot`・`seccomp_kill_not_logged`・`probe_failed`）と `exit_signal` の補助記録（syscall なし）。B: 3 章の「要るもの」を実装 issue に分ける（親 #2308） | 未決 |
-| D2 | D1 が A のときの ESC-06 の監査の扱い | `Deferred` を保つ / spec の ESC-06・SEC-4 の受け入れ範囲を見直す（spec リポ側の課題）/ opt-in のカーネル監査の段で照合する（auditd が前提。Landlock の `FANDHE_CONTAINER_TEST_KERNEL_AUDIT=1` と同じ形） | なし（spec と関わるためオーナー判断） | #2028 が残した ESC-06 の `Required` 化の可否 | 未決 |
-| D3 | 子孫と exec コマンドの子孫の SIGSYS 終了が親から観測できない残り（`audit-delivery.md` 9.1）を追う issue | 起票する / spec の受け入れ範囲の見直しに含める | なし | 追跡の置き場 | 未決 |
-| D4 | D1 が B のときだけ: READLOG がホスト全体の監査ストリームを各 supervisor に配ること（CORE-1・SUP-1・CORE-7・CORE-9）を受け入れるか | 受け入れる / 受け入れない（= A） | なし（D1 に従属） | 3 章の不利な点 1 | 未決 |
+| D1 | プロセス内の読み手と `CAP_AUDIT_READ`（3 章） | A 付与しない / B 付与する | A | A: 最小権限集合は変わらず、残るのは #2027 の縮退表示（`kernel_audit_not_built`・`kernel_audit_disabled_at_boot`・`seccomp_kill_not_logged`・`probe_failed`）と `exit_signal` の補助記録（syscall なし）。B: 3 章の「要るもの」を実装 issue に分ける（親 #2308） | **A** |
+| D2 | D1 が A のときの ESC-06 の監査の扱い | `Deferred` を保つ / spec の ESC-06・SEC-4 の受け入れ範囲を見直す（spec リポ側の課題）/ opt-in のカーネル監査の段で照合する（auditd が前提。Landlock の `FANDHE_CONTAINER_TEST_KERNEL_AUDIT=1` と同じ形） | なし（spec と関わるためオーナー判断） | #2028 が残した ESC-06 の `Required` 化の可否 | **A**（`Deferred` を保つ） |
+| D3 | 子孫と exec コマンドの子孫の SIGSYS 終了が親から観測できない残り（`audit-delivery.md` 9.1）を追う issue | 起票する / spec の受け入れ範囲の見直しに含める | なし | 追跡の置き場 | **A**（#4720 を起票） |
+| D4 | D1 が B のときだけ: READLOG がホスト全体の監査ストリームを各 supervisor に配ること（CORE-1・SUP-1・CORE-7・CORE-9）を受け入れるか | 受け入れる / 受け入れない（= A） | なし（D1 に従属） | 3 章の不利な点 1 | 該当なし（D1 が A のため） |
 
-決まった後の作業は 4 章のとおり。この文書の更新時点では、起票も ESC-06 の切り替えも行っていない。
+決まった後の作業は 4 章のとおり。#4720 を起票した。ESC-06 は `Deferred` のまま（#2486）。

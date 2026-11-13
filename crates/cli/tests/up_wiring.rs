@@ -30,23 +30,31 @@ fn output_bounded(cmd: &mut Command) -> std::process::Output {
         .expect("spawn");
     let mut so = child.stdout.take().expect("stdout");
     let mut se = child.stderr.take().expect("stderr");
-    let ho = std::thread::spawn(move || {
+    // 読み手は結果をチャネルで返し、待つ側は `recv_timeout` で期限を持つ（子孫が書き込み端を握っても止まらない。REPAIR-5）。
+    let (txo, rxo) = std::sync::mpsc::channel();
+    let (txe, rxe) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut v = Vec::new();
         let _ = so.read_to_end(&mut v);
-        v
+        let _ = txo.send(v);
     });
-    let he = std::thread::spawn(move || {
+    std::thread::spawn(move || {
         let mut v = Vec::new();
         let _ = se.read_to_end(&mut v);
-        v
+        let _ = txe.send(v);
     });
+    let reap = std::time::Duration::from_secs(10);
     let start = std::time::Instant::now();
     let status = loop {
         match child.try_wait().expect("try_wait") {
             Some(st) => break st,
             None if start.elapsed() >= RUN_DEADLINE => {
                 let _ = child.kill();
-                let _ = child.wait();
+                // kill 後の回収も期限つきのポーリング（割り込み不能な子で止まらない）。
+                let k = std::time::Instant::now();
+                while child.try_wait().ok().flatten().is_none() && k.elapsed() < reap {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
                 panic!("up did not finish within {RUN_DEADLINE:?}");
             }
             None => std::thread::sleep(std::time::Duration::from_millis(20)),
@@ -54,8 +62,12 @@ fn output_bounded(cmd: &mut Command) -> std::process::Output {
     };
     std::process::Output {
         status,
-        stdout: ho.join().expect("stdout reader"),
-        stderr: he.join().expect("stderr reader"),
+        stdout: rxo
+            .recv_timeout(reap)
+            .expect("stdout was not collected in time"),
+        stderr: rxe
+            .recv_timeout(reap)
+            .expect("stderr was not collected in time"),
     }
 }
 

@@ -74,6 +74,33 @@ fn display_name(s: &str) -> String {
 /// `--file` の開く・読む・解析に許す時間（応答しない FUSE・ネットワーク FS で main が止まらないための上限。REPAIR-5）。
 const PROJECT_FILE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// 親ディレクトリの実体解決を期限つき作業スレッドで行う（応答しない FS で main が止まらない。REPAIR-5・STACK-8）。
+fn canonicalize_bounded(dir: &Path) -> Result<PathBuf, CliExit> {
+    use fandhe_container_supervisor::supervisor_log::{BoundedFailure, run_bounded_waiting};
+    let dir = dir.to_path_buf();
+    match run_bounded_waiting(
+        move || std::fs::canonicalize(&dir),
+        PROJECT_FILE_READ_TIMEOUT,
+    ) {
+        Ok(Ok(p)) => Ok(p),
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(err(ErrorCode::NotFound, "project file was not found"))
+        }
+        Ok(Err(_)) => Err(err(
+            ErrorCode::InvalidArgument,
+            "project directory is not usable",
+        )),
+        Err(BoundedFailure::Busy) => Err(err(
+            ErrorCode::ResourceExhausted,
+            "project file workers are busy",
+        )),
+        Err(BoundedFailure::Unfinished) => Err(err(
+            ErrorCode::Timeout,
+            "resolving the project directory did not finish within the deadline",
+        )),
+    }
+}
+
 /// `--file` を期限つきの作業スレッドで読んで解析する（REPAIR-5・STACK-8）。
 ///
 /// O_NONBLOCK は通常ファイルの読み取り時間を制限しないため、開く・読む処理ごと作業スレッドへ移し、
@@ -292,17 +319,9 @@ pub(super) fn run_up(global: &GlobalArgs, args: &UpArgs, stdout: &mut dyn Write)
     };
     // `..` や symlink を解決した実体のディレクトリを起点にする（`--file ../stack.toml` でも名前の導出が壊れない。CLI-1）。
     // env_files は symlink を辿らず読むため、この実体のパスを読み取りの起点にも使う。
-    let project_dir = match std::fs::canonicalize(&parent_dir) {
+    let project_dir = match canonicalize_bounded(&parent_dir) {
         Ok(p) => p,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return err(ErrorCode::NotFound, "project file was not found");
-        }
-        Err(_) => {
-            return err(
-                ErrorCode::InvalidArgument,
-                "project directory is not usable",
-            );
-        }
+        Err(e) => return e,
     };
     let toml = match read_project_file(&file) {
         Ok(t) => t,

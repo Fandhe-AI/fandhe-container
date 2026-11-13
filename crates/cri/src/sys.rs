@@ -11,10 +11,11 @@
 //! - 宣言は x86_64 / aarch64 の Linux と macOS で共通の値（`SOL_SOCKET = 1`・`SO_PEERCRED = 17` は Linux 側）
 //!
 //! # `libc` 照合について
-//! crates/cri には `libc` の dev-dependency が無く、自前宣言の機械照合は未導入である（crates/cri への
-//! `libc` の追加はオーナー承認待ち。追跡は #3669・判断は #3290。方式は `docs/design/ffi-libc-check.md`）。
-//! 承認後に同じ PR 方針で照合を足す。Linux の `peer_uid` は LP64 の x86_64 / aarch64 に限り、
-//! それ以外は `Err`（fail-closed）にする。
+//! 自前宣言は試験専用モジュール `libc_abi`（`#[cfg(test)]`）で `libc` と `const` 評価により機械照合する
+//! （MVM-4・REPAIR-12。dev-dependency の `libc` は #3290 の 2026-11-13 のオーナー判断で承認済み。方式は
+//! `docs/design/ffi-libc-check.md`）。対象外（macOS の `acl_*` と `ACL_*` など）は `libc_abi` の doc に列挙する。
+//! `sys` に宣言を足す PR は同じ PR で照合も足す（coding-rust.md）。Linux の `peer_uid` は LP64 の
+//! x86_64 / aarch64 に限り、それ以外は `Err`（fail-closed）にする。
 
 #[cfg(any(
     all(
@@ -154,14 +155,25 @@ struct Ucred {
     gid: u32,
 }
 
+/// `getsockopt` の level（Linux の `SOL_SOCKET`）。libc 照合から参照するためモジュールスコープに置く。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub(crate) const SOL_SOCKET: i32 = 1;
+/// `getsockopt` の optname（Linux の `SO_PEERCRED`）。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub(crate) const SO_PEERCRED: i32 = 17;
+
 /// 接続元の実効 uid（Linux は `SO_PEERCRED`）。
 #[cfg(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 pub(crate) fn peer_uid(stream: &UnixStream) -> Result<u32, ()> {
-    const SOL_SOCKET: i32 = 1;
-    const SO_PEERCRED: i32 = 17;
     let mut cred = Ucred {
         pid: 0,
         uid: 0,
@@ -281,4 +293,86 @@ mod replace_std_tests {
         let stdin = std::io::stdin();
         assert_eq!(replace_std(StdSlot::Stdin, stdin.as_fd()), Err(()));
     }
+}
+
+/// 自前の FFI 宣言を `libc` と `const` 評価で機械照合する試験専用モジュール（MVM-4・REPAIR-7・REPAIR-12・
+/// PLUG-12・SEC-1・#3669）。関数は呼ばず、型・値・レイアウトの食い違いはコンパイルエラーにする。
+/// 各ブロックの cfg は宣言側と同じにする（`libc` の Linux 専用項目を macOS で解決させない）。
+///
+/// 対象外（理由）:
+/// - macOS の `acl_get_link_np`・`acl_get_entry`・`acl_free`・試験専用の `acl_from_text`・`acl_set_file` と
+///   `ACL_TYPE_EXTENDED`・`ACL_FIRST_ENTRY`: `libc` 0.2.189 の apple に宣言が無い（一次情報は Apple SDK の
+///   `sys/acl.h`。core の sys/macos.rs と同じ扱い）
+/// - `OPEN_NOFOLLOW_NONBLOCK` の `None` の腕（対応外ターゲット。FFI に渡さない）、`replace_std` の再試行回数
+///   （方針値）、FFI を持たない安全なラッパー（`effective_uid`・`peer_uid`・`has_extended_acl` 等）
+#[cfg(test)]
+mod libc_abi {
+    // 共通（unix）。`geteuid` は safe fn 宣言のため、fn item から `unsafe extern "C" fn` ポインタへ代入する。
+    const _: unsafe extern "C" fn() -> libc::uid_t = super::geteuid;
+    const _: unsafe extern "C" fn() -> libc::uid_t = libc::geteuid;
+    const _: unsafe extern "C" fn(libc::c_int, libc::c_int) -> libc::c_int = super::dup2;
+    const _: unsafe extern "C" fn(libc::c_int, libc::c_int) -> libc::c_int = libc::dup2;
+    const _: () = assert!(super::StdSlot::Stdin as libc::c_int == libc::STDIN_FILENO);
+    const _: () = assert!(super::StdSlot::Stderr as libc::c_int == libc::STDERR_FILENO);
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    mod linux {
+        use std::mem::{align_of, offset_of, size_of};
+
+        type GetsockoptFn = unsafe extern "C" fn(
+            libc::c_int,
+            libc::c_int,
+            libc::c_int,
+            *mut libc::c_void,
+            *mut libc::socklen_t,
+        ) -> libc::c_int;
+        const _: GetsockoptFn = super::super::getsockopt;
+        const _: GetsockoptFn = libc::getsockopt;
+
+        // `peer_uid` が実際に使うモジュールスコープ定数を `libc` と比べる。
+        const _: () = assert!(super::super::SOL_SOCKET == libc::SOL_SOCKET);
+        const _: () = assert!(super::super::SO_PEERCRED == libc::SO_PEERCRED);
+
+        use super::super::Ucred;
+        const _: () = assert!(size_of::<Ucred>() == size_of::<libc::ucred>());
+        const _: () = assert!(align_of::<Ucred>() == align_of::<libc::ucred>());
+        const _: () = assert!(offset_of!(Ucred, pid) == offset_of!(libc::ucred, pid));
+        const _: () = assert!(offset_of!(Ucred, uid) == offset_of!(libc::ucred, uid));
+        const _: () = assert!(offset_of!(Ucred, gid) == offset_of!(libc::ucred, gid));
+        const _: () = assert!(size_of::<i32>() == size_of::<libc::pid_t>());
+        const _: () = assert!(size_of::<u32>() == size_of::<libc::uid_t>());
+        const _: () = assert!(size_of::<u32>() == size_of::<libc::gid_t>());
+    }
+
+    #[cfg(target_os = "macos")]
+    mod macos {
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            *mut libc::uid_t,
+            *mut libc::gid_t,
+        ) -> libc::c_int = super::super::getpeereid;
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            *mut libc::uid_t,
+            *mut libc::gid_t,
+        ) -> libc::c_int = libc::getpeereid;
+        const _: () = assert!(super::super::ENOENT == libc::ENOENT);
+        const _: () = assert!(super::super::EINVAL == libc::EINVAL);
+    }
+
+    // `open(2)` のフラグ（3 腕）。値は `libc` の `O_NOFOLLOW | O_NONBLOCK` と一致させる。
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        target_os = "macos"
+    ))]
+    const _: () = assert!(matches!(
+        super::OPEN_NOFOLLOW_NONBLOCK,
+        Some(f) if f == libc::O_NOFOLLOW | libc::O_NONBLOCK
+    ));
 }

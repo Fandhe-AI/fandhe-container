@@ -330,6 +330,7 @@ dependencies = [
  "flate2",
  "hyper",
  "hyper-util",
+ "libc",
  "prost",
  "protox",
  "serde",

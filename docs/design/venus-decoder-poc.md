@@ -189,7 +189,7 @@ GPU-6 の決定（ヘッドレス compute のみ・2D スキャンアウト非�
 - 配置の逸脱: issue 記載の `poc/venus-decoder/replay/` ではなく既存骨格の隣に置いた。`poc/` は存在せず、新設には workspace メンバー追加（ルート `Cargo.toml` の変更）が要る。再生器は同モジュールの `parse_command_header` を直接使う
 - 取り扱い: 実機で採取したストリームにはワークロード由来のデータが含まれうる。テストの fixture は合成データのみで、実ストリームはリポジトリにコミットしない
 - **未達（実装済みを装わない。REPAIR-3）**: 受け入れ条件「lavapipe 上で記録を再生し、最小 compute の結果が記録時と一致する」は本書時点で未達。理由は (1) コマンド引数のパース・Vulkan ディスパッチが未実装（TASK-177.x）、(2) lavapipe 実行に Vulkan バインディング（外部クレートまたは自前 FFI。依存追加・`unsafe` の承認が必要）が要る、(3) 実ストリームの採取は #725（人間担当）。再生先は `ReplayBackend` トレイトの差し替え点として定義し、`CollectingBackend`（提出内容を保持する模擬）でのみ検証している
-- 先送り: reply ストリーム・期待出力レコード（kind の番号は未割当。REPAIR-3）。治具側の記録フック配線は #1602 で実装済み（10.4.5・10.9。`SUBMIT_3D` の本体）。リングの中身は #1884 で `read_at` による差分記録を実装済み（10.4.5。kind は 1 のまま）。実機での採取は #725（人間担当）
+- 先送り: reply ストリーム・期待出力レコード（kind の番号は未割当。REPAIR-3）。治具側の記録フック配線は #1602 で実装済み（10.4.5・10.9。`SUBMIT_3D` の本体）。リングの中身は #1884 で `read_at` による差分記録を実装済み（10.4.5。kind は 1 のまま。kind 2 を採らない判断と再評価条件は 10.4.5・#4644）。実機での採取は #725（人間担当）
 
 ## 8. capset 応答（TASK-172.3・#724）
 
@@ -368,14 +368,16 @@ TASK-172 後続 F5（#1599）の一次情報の確認。結論を先に書く。
 
 確認日 2026-10-09。転記したのは値（要求 ID・bit 値・フィールド配置・順序・サイズ）という事実だけで、コードは流用していない（MVM-4・from-scratch-policy）。行番号は下記の版のファイルでの値。
 
+Issue #4644（2026-11-13）で、#1884 が追加した `vn_protocol_driver_transport.h`・`types.h`・`defines.h` の 3 件の SHA-256 を、計画の値の転記ではなく一次情報から再確認した。タグ `mesa-25.0.0` が指すコミット `4fa244fddfebb21378042556862e197284ef65ac`（タグ API の `commit.id`）を指定した raw URL から 3 件を取り直して `sha256sum` を計算し、下表の値と全件一致した（`vn_ring.c` も同じコミットで一致）。不一致は無く、値の修正は無い。
+
 | 出典 | 版 | SHA-256 |
 | ---- | -- | ------- |
 | Mesa `src/virtio/vulkan/vn_renderer_virtgpu.c` | タグ `mesa-25.0.0` | `a7a0f1a395d006bfb1ef4aea4d3b2c6a44c30c50ede855416e1183442e1e03aa` |
 | Mesa `src/virtio/vulkan/vn_instance.c` | 同上 | `b8d3461d9a8b8d740d7c383100ac972e256263d9bd55e663be31f709c4e838a9` |
 | Mesa `src/virtio/vulkan/vn_ring.c` | 同上 | `927d4f1c292dbf4b0bf5cb87c3a0d3b7a2f2144b295b30d94afdd1f8f2cc2103` |
-| Mesa `src/virtio/venus-protocol/vn_protocol_driver_transport.h` | 同上（#1884 で追加） | `f85d5acfaa8fdd604d8af6ca1dc4055e208a405282d350050bc5111287ec1a91` |
-| Mesa `src/virtio/venus-protocol/vn_protocol_driver_types.h` | 同上（#1884 で追加） | `e3fb1954fe91866c4eeedc7fbc6ed2c5451952e16cc8bb95174b70188a5918ff` |
-| Mesa `src/virtio/venus-protocol/vn_protocol_driver_defines.h` | 同上（#1884 で追加） | `b8b9584aa2ecf970b18dd72e43f63c12afa2e81947a3c9d983aab7a537ed90f3` |
+| Mesa `src/virtio/venus-protocol/vn_protocol_driver_transport.h` | 同上（#1884 で追加。#4644 で commit `4fa244fddfeb` から再取得して一致を確認） | `f85d5acfaa8fdd604d8af6ca1dc4055e208a405282d350050bc5111287ec1a91` |
+| Mesa `src/virtio/venus-protocol/vn_protocol_driver_types.h` | 同上（#1884 で追加。#4644 で commit `4fa244fddfeb` から再取得して一致を確認） | `e3fb1954fe91866c4eeedc7fbc6ed2c5451952e16cc8bb95174b70188a5918ff` |
+| Mesa `src/virtio/venus-protocol/vn_protocol_driver_defines.h` | 同上（#1884 で追加。#4644 で commit `4fa244fddfeb` から再取得して一致を確認） | `b8b9584aa2ecf970b18dd72e43f63c12afa2e81947a3c9d983aab7a537ed90f3` |
 | Mesa `src/virtio/vulkan/vn_ring.h` | 同上 | `a56794982b64b94019158e6775f75e4d0e0609a57d69f676fab49f431b98f806` |
 | Mesa `src/virtio/vulkan/vn_renderer.h` | 同上 | `120385cf9a90657184623e07c3ba895e4a31ccdf1a34b6b3d3e0ce65772b7b80` |
 | Mesa `src/virtio/vulkan/vn_cs.c` | 同上 | `e3c66ff11030fdf13d57e0415825a5beae3dbfece121452d64d173023c32c46e` |
@@ -484,6 +486,8 @@ Mesa は 2 層で読む。Mesa は ctrl を直接出さず、DRM ioctl を呼ぶ
   - 検証: bufferSize は 0 でない 2 の冪かつ 16 MiB 以下、各 offset は整列・範囲内、ring が blob の長さ以内、`tail - head` と `tail - cursor` が bufferSize 以内、記録器の上限は確保の前に検査。異常はそのリングの記録だけを止め、ログ（`ring_error`）を 1 回だけ出す。セッションは続く。
   - 契機: (1) ctrl の kick で `SUBMIT_3D` を 1 件以上受理し call で通知した**後**、(2) セッション終了時に memfd を閉じる**前**。`vkNotifyRingMESA` は契機にしない（治具は status の IDLE bit を立てないため、実機では来ない見込み。未実測・#725）。本命は (2) で、ゲストは最初の reply 待ちで止まる見込み。(1) はゲストの書き込みと競合しうるため、リング由来のレコードの位置は直後の本体の前後どちらにもなりうる（内容は同じ）。`vkDestroyRingMESA` を受理したら次のスナップショットで最後に読んでから表から外す。Destroy なしに blob が `UNREF` された場合は直前以降の分を失う（`blob_not_held`）。
   - 形式: FCVNSREC の kind 1（ゲスト提出バッファ）の 1 レコード。kind は足さない（足すと製品 crate の `replay/` と 7 章の表に波及するため）。ログ `ring_create`・`ring_record`（seqno は記録器の件数）・`ring_error` で区別する。
+  - kind 2（リング専用の記録種別）を採らない判断（#4644・GPU-6・TASK-172）: リング由来のレコードは kind 1 のままにし、`crates/plugin-macos` の `replay/` も変えない。根拠は現行の `replay()` が各レコードの先頭のコマンドヘッダを検査して `ReplayBackend::submit(seqno, stream)` に順に渡すだけで、kind も ring id も backend に渡らず、「リング由来か `SUBMIT_3D` 本体か」で処理を変える要件が今の再生先にも将来の差し替え点にも無いこと。venus の wire はリング上も virtqueue 上も同じコマンドヘッダの列で、本体のレコードは先頭が `vkCreateRingMESA` 等のリング制御になるため `ReplaySummary::first_commands` で事後に見分けられる。取得時の文脈（ring id・res_id・seqno）はログの `ring_record` 行が持ち、seqno でレコードと突き合わせられる。kind を足すと `RecordKind`・7 章の表・`validate` / `replay` の試験・製品 crate に波及し、PoC の段階では割に合わない。
+  - kind 2 または ring id のフィールドを再評価する条件（いずれか）: (1) 再生先（TASK-177.x の dispatch、または lavapipe / MoltenVK の backend）がリングの消費経路と ctrl の直接提出の経路を別に扱う必要が生じた。(2) 1 セッションに複数のリング（または ctx）が並び、再生でリングごとの順序や seqno の待ちを再現する必要が生じた（kind 1 のヘッダには ring id / ctx の置き場所が無い）。(3) #725 の実機の記録で、ログとの seqno による突き合わせでは足りない事例（ログとファイルが別に流通する等）が見つかった。(4) reply・期待出力の kind（7 章で未割当）を足すなど format version を上げる機会が来たとき、同じ改版で入れるかを合わせて決める。
   - 消費しない: head・status・reply を書かない（dispatch は TASK-177.x）。記録しないもの: reply・期待出力・extra 領域・間接の cs の shmem・status。
   - 未実測（REPAIR-3）: ゲストが mmap で書いた内容が memfd の `read_at` で見えること（同じ memfd の共有ページなので見える見込み）と、Notify が来ないことは、#725 で確かめる。
 - **#1602 で実装済み**: 治具の `--record` が、ACK を返せた `SUBMIT_3D` の本体（`Submit3d.payload`）を 1 提出 1 レコードで記録ファイルへ書く。応答を捨てて adapter を巻き戻した提出は記録しない。上限（1 レコード 16 MiB・65,536 件・全体 256 MiB）は治具側のラッパー（`recording`）が確保の前に検査し、達したら記録だけを止めて 1 回だけ `record_stopped` を出す（以降は小さい提出も記録しない）。治具の本体上限は 4064 バイトなので 1 件の上限には達せず、全体長の上限が件数の上限より先に効きうる

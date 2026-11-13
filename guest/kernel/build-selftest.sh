@@ -341,6 +341,14 @@ run_build "${std_env[@]}" "CALL_MARK=$sandbox/calls" "DROP_OPTION=ARM_GIC_V3" --
 expect_err "gic missing" 1 config-option-missing
 if grep -q "CONFIG_ARM_GIC_V3" "$sandbox/out.stderr"; then ok; else ng "gic missing: symbol not named"; fi
 
+# 9d. Landlock は select 先の依存で落ちやすい記号。落ちたら 1・config-option-missing（コンテナ実行の記号にも残存照合が効く）
+out9d="$sandbox/out9d"
+run_build "${std_env[@]}" "CALL_MARK=$sandbox/calls" "DROP_OPTION=SECURITY_LANDLOCK" -- \
+    --output-dir "$out9d" --cross-compile "$cc" --tarball "$good_tar"
+expect_err "landlock missing" 1 config-option-missing
+if grep -q "CONFIG_SECURITY_LANDLOCK" "$sandbox/out.stderr"; then ok; else ng "landlock missing: symbol not named"; fi
+[ ! -e "$out9d/Image" ] && ok || ng "landlock missing: Image was output"
+
 # 9c. 出力先の末尾スラッシュ: ロックは出力先の外 (<出力先>.lock) に作り、成功する
 out9c="$sandbox/out9c"
 run_build "${std_env[@]}" "CALL_MARK=$sandbox/calls" -- --output-dir "$out9c/" --cross-compile "$cc" --tarball "$good_tar"
@@ -394,6 +402,17 @@ for sym in ARCH_VIRT; do
 done
 grep -qx '# CONFIG_MODULES is not set' "$frag" && ok || ng "fragment: CONFIG_MODULES is not disabled"
 ! grep -q '^CONFIG_MODULES=' "$frag" && ok || ng "fragment: CONFIG_MODULES enabled"
+# コンテナ実行の記号（MAC-4・TASK-191・#2276）。cgroup v1 は入れない（CORE-4）
+container_syms="NAMESPACES USER_NS PID_NS NET_NS UTS_NS SYSVIPC POSIX_MQUEUE IPC_NS CGROUPS MEMCG CGROUP_SCHED FAIR_GROUP_SCHED CFS_BANDWIDTH CGROUP_PIDS BLK_CGROUP BLK_DEV_THROTTLING BLK_CGROUP_IOCOST SECCOMP SECCOMP_FILTER SECURITY SECURITY_LANDLOCK"
+for sym in $container_syms; do
+    grep -qx "CONFIG_$sym=y" "$frag" && ok || ng "fragment: CONFIG_$sym=y missing (container)"
+done
+expect_eq "fragment: CONFIG_LSM includes landlock" "1" \
+    "$(grep -Ec '^CONFIG_LSM="([^"]*,)?landlock(,[^"]*)?"$' "$frag" || true)"
+expect_eq "fragment: exactly one CONFIG_LSM line" "1" "$(grep -c '^CONFIG_LSM=' "$frag" || true)"
+for sym in MEMCG_V1 CPUSETS_V1; do
+    ! grep -q "^CONFIG_$sym=y" "$frag" && ok || ng "fragment: CONFIG_$sym enabled (cgroup v1)"
+done
 prev=""
 bad_lines=""
 while IFS= read -r line; do

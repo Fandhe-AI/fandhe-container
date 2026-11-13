@@ -163,22 +163,23 @@ impl KeeperClient {
         if Instant::now() >= limit {
             return Err(deadline_error());
         }
-        admit_spawn()?;
+        // 子を作る前に枠と回収担当を確保する。失敗・所有権移譲・回収完了で枠は解放される。
+        let slot = REAP_LEDGER.reserve()?;
         let child = spawn().map_err(|_| {
             TraitError::new(ErrorCode::Internal, "the vm keeper could not be spawned")
         })?;
         loop {
             match self.call(&Request::Status, PROBE_CONNECT_TIMEOUT, limit) {
                 // 期限直後でも応答済みの保持役は採用する（kill しない）。
-                Ok(resp) => return Ok((resp, Some(child))),
+                Ok(resp) => return Ok((resp, Some(child))), // slot は drop で解放（呼び出し側が回収）
                 Err(e) if e.code() == ErrorCode::PermissionDenied => {
-                    return Err(release_child(child, e));
+                    return Err(release_child(slot, child, e));
                 }
                 Err(_) => {}
             }
             let now = Instant::now();
             if now >= limit {
-                return Err(release_child(child, deadline_error()));
+                return Err(release_child(slot, child, deadline_error()));
             }
             std::thread::sleep(POLL_INTERVAL.min(limit - now));
         }
@@ -206,81 +207,139 @@ fn deadline_error() -> TraitError {
 /// 子は応答の開始後は他クライアントの登録を受け付けるため、起動元の待機失敗だけで SIGKILL すると共有の保持役と登録簿を失う
 /// （MAC-4）。公開前の子はロック競合で自ら終了し、公開後の子は無登録の猶予後に自ら終了する。生きている子の `Child` を
 /// そのまま drop すると親が回収しない限りゾンビとして残るため、共有の回収簿へ渡して終了まで回収する。
-fn release_child(child: Child, primary: TraitError) -> TraitError {
-    reap_in_background(child);
+fn release_child(slot: SpawnSlot, child: Child, primary: TraitError) -> TraitError {
+    slot.hand_over(child);
     primary
 }
 
-/// 回収簿に載せる子の上限。超えると新規の起動を受け付けない（子は drop せず、終了まで必ず回収する）。
+/// 回収簿に載せる子の上限（起動中の枠と回収待ちの子の合計）。超えると新規の起動を受け付けない
+/// （子は drop せず、終了まで必ず回収する）。
 const REAP_MAX_CHILDREN: usize = 16;
 /// 回収スレッドの走査間隔。
 const REAP_INTERVAL: Duration = Duration::from_millis(200);
 
-static REAP_LEDGER: std::sync::Mutex<Vec<Child>> = std::sync::Mutex::new(Vec::new());
-static REAPER_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// 回収簿の終了済みの子を `try_wait` で回収し、残りの件数を返す（待たない）。
-fn sweep_ledger() -> usize {
-    let mut g = REAP_LEDGER
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    g.retain_mut(|c| matches!(c.try_wait(), Ok(None)));
-    g.len()
+/// 回収簿の状態。`in_flight` は予約済みでまだ回収簿へ渡っていない枠（起動中の子）。
+struct LedgerState {
+    in_flight: usize,
+    children: Vec<Child>,
+    reaper_started: bool,
 }
 
-/// 起動前の受付制限。回収簿が満杯なら新規起動を拒否する（子を drop して回収責任を失わないための上限の保証。REPAIR-5）。
-fn admit_spawn() -> Result<(), TraitError> {
-    if sweep_ledger() >= REAP_MAX_CHILDREN {
-        return Err(TraitError::new(
-            ErrorCode::Unavailable,
-            "too many vm keeper children are awaiting reaping",
-        ));
+/// 起動中の枠と回収待ちの子を合わせて上限を守り、常駐の回収担当が `try_wait` で終了まで回収する台帳（REPAIR-5）。
+///
+/// 回収担当は最初の予約の時点で確保し（`Child` を作る前）、確保できなければ起動を拒否する。以後は追加の API 呼び出しに
+/// 頼らず担当が走査を続ける。
+struct ReapLedger {
+    state: std::sync::Mutex<LedgerState>,
+    wake: std::sync::Condvar,
+}
+
+/// 起動前に予約した 1 枠。drop で解放し、`hand_over` で子の回収責任を台帳へ移す。
+struct SpawnSlot {
+    ledger: &'static ReapLedger,
+    live: bool,
+}
+
+static REAP_LEDGER: ReapLedger = ReapLedger::new();
+
+impl ReapLedger {
+    const fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new(LedgerState {
+                in_flight: 0,
+                children: Vec::new(),
+                reaper_started: false,
+            }),
+            wake: std::sync::Condvar::new(),
+        }
     }
-    Ok(())
-}
 
-/// `child` を回収簿へ載せ、回収スレッドが `try_wait` の走査で終了まで回収する（`Child::wait` で無期限に塞がない。REPAIR-5）。
-/// 子は親（本プロセス）が回収しない限りゾンビとして残るため、回収簿が空になるまで走査を続け、期限で打ち切らない。
-/// 件数の上限は起動前の `admit_spawn` で守る。
-fn reap_in_background(child: Child) {
-    {
-        let mut g = REAP_LEDGER
+    fn lock(&self) -> std::sync::MutexGuard<'_, LedgerState> {
+        self.state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        g.push(child);
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
-    spawn_reaper_if_needed();
+
+    /// 終了済みの子を回収し、起動中と回収待ちの合計枠数を返す（待たない）。
+    fn sweep(g: &mut LedgerState) -> usize {
+        g.children.retain_mut(|c| matches!(c.try_wait(), Ok(None)));
+        g.children.len() + g.in_flight
+    }
+
+    /// 枠を 1 つ予約する。満杯、または回収担当を確保できなければ `Unavailable`（子はまだ作られない）。
+    fn reserve(&'static self) -> Result<SpawnSlot, TraitError> {
+        let mut g = self.lock();
+        if Self::sweep(&mut g) >= REAP_MAX_CHILDREN {
+            return Err(TraitError::new(
+                ErrorCode::Unavailable,
+                "too many vm keeper children are awaiting reaping",
+            ));
+        }
+        if !g.reaper_started {
+            std::thread::Builder::new()
+                .name("vm-keeper-reaper".to_owned())
+                .spawn(move || self.reaper_loop())
+                .map_err(|_| {
+                    TraitError::new(
+                        ErrorCode::Unavailable,
+                        "the vm keeper reaper could not be started",
+                    )
+                })?;
+            g.reaper_started = true;
+        }
+        g.in_flight += 1;
+        Ok(SpawnSlot {
+            ledger: self,
+            live: true,
+        })
+    }
+
+    /// 常駐の回収担当。回収待ちがあれば一定間隔で走査し、無ければ通知まで眠る（プロセスの存続中動き続ける）。
+    fn reaper_loop(&'static self) {
+        let mut g = self.lock();
+        loop {
+            Self::sweep(&mut g);
+            g = if g.children.is_empty() {
+                self.wake
+                    .wait(g)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            } else {
+                self.wake
+                    .wait_timeout(g, REAP_INTERVAL)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .0
+            };
+        }
+    }
 }
 
-fn spawn_reaper_if_needed() {
-    use std::sync::atomic::Ordering;
-    if REAPER_RUNNING
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return;
+impl SpawnSlot {
+    /// 子の回収責任を台帳へ移す（枠は回収完了まで保たれる）。
+    fn hand_over(mut self, child: Child) {
+        let mut g = self.ledger.lock();
+        g.children.push(child);
+        g.in_flight = g.in_flight.saturating_sub(1);
+        self.live = false;
+        drop(g);
+        self.ledger.wake.notify_all();
     }
-    let spawned = std::thread::Builder::new()
-        .name("vm-keeper-reaper".to_owned())
-        .spawn(|| {
-            while sweep_ledger() > 0 {
-                std::thread::sleep(REAP_INTERVAL);
-            }
-            REAPER_RUNNING.store(false, Ordering::Release);
-            // 停止の判定と store の間に載った子を取りこぼさないよう、空でなければ起動し直す。
-            let pending = !REAP_LEDGER
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_empty();
-            if pending {
-                spawn_reaper_if_needed();
-            }
-        });
-    if spawned.is_err() {
-        REAPER_RUNNING.store(false, Ordering::Release);
-        // スレッドを作れなくても、呼び出しごとの走査（admit_spawn）で回収される。
-        let _ = sweep_ledger();
+}
+
+impl Drop for SpawnSlot {
+    fn drop(&mut self) {
+        if self.live {
+            let mut g = self.ledger.lock();
+            g.in_flight = g.in_flight.saturating_sub(1);
+        }
     }
+}
+
+/// 回収簿の終了済みの子を回収し、残りの件数（回収待ち）を返す（待たない）。
+#[cfg(test)]
+fn sweep_ledger() -> usize {
+    let mut g = REAP_LEDGER.lock();
+    ReapLedger::sweep(&mut g);
+    g.children.len()
 }
 
 /// 保持役のログファイル名（配置ディレクトリ直下。保持役の stderr の出力先。REPAIR-4）。
@@ -385,12 +444,58 @@ mod tests {
     /// 終了済みの子は回収簿から `try_wait` で回収され、無期限の `wait` を使わない（REPAIR-5）。
     #[test]
     fn released_child_is_reaped_without_blocking_wait() {
+        let slot = REAP_LEDGER.reserve().expect("reserve");
         let child = Command::new("true").spawn().expect("spawn true");
-        let e = release_child(child, deadline_error());
+        let e = release_child(slot, child, deadline_error());
         assert_eq!(e.code(), ErrorCode::Timeout);
         let end = Instant::now() + Duration::from_secs(10);
         while sweep_ledger() > 0 {
             assert!(Instant::now() < end, "ledger must drain after child exit");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// 並行する予約が上限を超えず、解放・回収完了で枠が戻る（MAC-4・REPAIR-5）。
+    #[test]
+    fn reservations_never_exceed_cap_under_concurrency() {
+        let ledger: &'static ReapLedger = Box::leak(Box::new(ReapLedger::new()));
+        let granted = std::sync::atomic::AtomicUsize::new(0);
+        let slots = std::sync::Mutex::new(Vec::new());
+        std::thread::scope(|sc| {
+            for _ in 0..(REAP_MAX_CHILDREN * 3) {
+                sc.spawn(|| {
+                    if let Ok(slot) = ledger.reserve() {
+                        granted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        slots.lock().expect("slots").push(slot);
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            granted.load(std::sync::atomic::Ordering::SeqCst),
+            REAP_MAX_CHILDREN
+        );
+        let e = ledger.reserve().err().expect("full");
+        assert_eq!(e.code(), ErrorCode::Unavailable);
+        // 解放すると枠が戻る。
+        slots.lock().expect("slots").pop();
+        let again = ledger.reserve().expect("freed slot");
+        // 回収待ちへ移った子も、終了して回収されるまで枠を占める。
+        let child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        again.hand_over(child);
+        assert!(ledger.reserve().is_err());
+        {
+            let mut g = ledger.lock();
+            for c in g.children.iter_mut() {
+                let _ = c.kill();
+            }
+        }
+        let end = Instant::now() + Duration::from_secs(10);
+        while ledger.reserve().is_err() {
+            assert!(Instant::now() < end, "reaper must free the slot");
             std::thread::sleep(Duration::from_millis(20));
         }
     }

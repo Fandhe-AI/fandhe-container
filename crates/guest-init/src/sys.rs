@@ -400,12 +400,61 @@ pub fn signal_all_others(how: Escalation) -> io::Result<()> {
     }
 }
 
-/// PID 1 以外にまだプロセスが残っているか（`kill(-1, 0)` の存在確認。シグナルは送らない）。
-/// 回収前のゾンビも「残っている」に数えるので、呼び出し側は先に回収する。PID 1 でなければ偽。
+/// `/proc` を走査して数える対象の上限（無制限に読まない。REPAIR-5）。
+const MAX_PROC_SCAN: usize = 65_536;
+
+/// `/proc/<pid>/stat` の内容が「終了を待つべきユーザープロセス」か。カーネルスレッド（親が `kthreadd`＝PID 2）
+/// と回収待ちのゾンビ（`Z`・`X`）は数えない。`comm` は括弧内に `)` を含みうるので最後の `)` で区切る。
+/// 解釈できなければ安全側（数える）。
+fn stat_is_live_user_process(stat: &str) -> bool {
+    let Some(rest) = stat.rsplit_once(')').map(|(_, r)| r) else {
+        return true;
+    };
+    let mut it = rest.split_ascii_whitespace();
+    let state = it.next();
+    let ppid = it.next().and_then(|p| p.parse::<i64>().ok());
+    !matches!((state, ppid), (Some("Z" | "X"), _) | (_, Some(2)))
+}
+
+/// PID 1 以外にまだ終了を待つべきプロセスが残っているか（MAC-4・#2270）。`kill(-1, 0)` はカーネルスレッドも
+/// 数えて常に真になり猶予を使い切るため、`/proc` を走査してカーネルスレッド（ppid=2、PID 2 自身）とゾンビを
+/// 除く。`/proc` が読めないときだけ `kill(-1, 0)` の存在確認へ縮退する（シグナルは送らない）。
+/// 回収前のゾンビを除くので呼び出し側の回収は必須ではないが、先に回収する。PID 1 でなければ偽。
 pub fn others_alive() -> bool {
     if !SUPPORTED || std::process::id() != 1 {
         return false;
     }
+    match proc_has_user_process() {
+        Some(alive) => alive,
+        None => kill_probe_alive(),
+    }
+}
+
+/// `/proc` の走査。読めなければ `None`。
+fn proc_has_user_process() -> Option<bool> {
+    let dir = std::fs::read_dir("/proc").ok()?;
+    for entry in dir.take(MAX_PROC_SCAN) {
+        let Ok(entry) = entry else { continue };
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().and_then(|n| n.parse::<u32>().ok()) else {
+            continue;
+        };
+        if pid <= 2 {
+            continue;
+        }
+        // 走査中に消えたプロセスは読めないだけで、残っていないものとして扱う。
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        if stat_is_live_user_process(&stat) {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+/// `/proc` が読めないときの縮退（カーネルスレッドも数えるので過大に真になりうる）。
+fn kill_probe_alive() -> bool {
     // SAFETY: sig 0 は存在確認だけでシグナルを送らない。pid は -1 固定。ポインタを渡さない。errno は直後に取る。
     let rc = unsafe { kill(-1, 0) };
     if rc == 0 {
@@ -787,6 +836,17 @@ mod tests {
         }
         assert_eq!(power_off().raw_os_error(), Some(EPERM));
         assert!(!others_alive());
+    }
+
+    /// MAC-4・#2270: `/proc/<pid>/stat` の判定。カーネルスレッド（ppid=2）とゾンビは数えず、通常の
+    /// プロセスと `comm` に `)` を含む場合・解釈不能は数える。
+    #[test]
+    fn mac4_2270_stat_filter_skips_kernel_threads_and_zombies() {
+        assert!(stat_is_live_user_process("123 (sh) S 1 123 123 0 -1"));
+        assert!(stat_is_live_user_process("123 (a) b) R 77 1 1"));
+        assert!(!stat_is_live_user_process("9 (kworker/0:1) I 2 0 0"));
+        assert!(!stat_is_live_user_process("55 (defunct) Z 1 55 55"));
+        assert!(stat_is_live_user_process("garbage"));
     }
 
     /// MAC-4・#2270: ブロック済みのシグナルを `sigtimedwait` で受ける。マスクは呼び出したスレッドだけに効き

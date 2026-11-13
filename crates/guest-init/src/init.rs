@@ -250,7 +250,35 @@ impl ShutdownOps for LinuxShutdownOps<'_> {
 /// 到達は未確認（#1628・#2282）。デバイスが無い・開けない場合は何もせず、停止はホストの期限つきの強制停止に
 /// 任せる。デバイス数・スレッド数は [`MAX_INPUT_DEVICES`] まで。
 fn start_power_button_watchers() {
-    for i in 0..MAX_INPUT_DEVICES {
+    let mut opened = [false; MAX_INPUT_DEVICES];
+    let found = scan_power_buttons(&mut opened);
+    if found == 0 {
+        // ドライバの遅延 probe で ready 直後にノードが無いことがある。短い間隔で上限つきに再探索する
+        // （無ければ停止はホストの期限つき強制停止になるだけ。REPAIR-5・MAC-4）。
+        let _ = std::thread::Builder::new()
+            .name("power-button-rescan".into())
+            .spawn(move || {
+                for _ in 0..POWER_BUTTON_RESCAN_TRIES {
+                    std::thread::sleep(POWER_BUTTON_RESCAN_INTERVAL);
+                    if scan_power_buttons(&mut opened) > 0 {
+                        return;
+                    }
+                }
+            });
+    }
+}
+
+/// 再探索の間隔と回数の上限（合計 30 秒）。
+const POWER_BUTTON_RESCAN_INTERVAL: Duration = Duration::from_millis(500);
+const POWER_BUTTON_RESCAN_TRIES: u32 = 60;
+
+/// 未オープンの入力ノードを開いて監視スレッドを立てる。立てた本数を返す。
+fn scan_power_buttons(opened: &mut [bool]) -> usize {
+    let mut started = 0;
+    for (i, slot) in opened.iter_mut().enumerate() {
+        if *slot {
+            continue;
+        }
         let path = power_button::device_path(i);
         let Ok(file) = OpenOptions::new()
             .read(true)
@@ -259,12 +287,17 @@ fn start_power_button_watchers() {
         else {
             continue;
         };
-        let _ = std::thread::Builder::new()
+        *slot = true;
+        let spawned = std::thread::Builder::new()
             .name(format!("power-button-{i}"))
             .spawn(move || {
                 power_button::watch(file, || sys::request_stop().is_ok());
             });
+        if spawned.is_ok() {
+            started += 1;
+        }
     }
+    started
 }
 
 /// 待機（回収しない）。致命的な初期化失敗（子を作る前）と panic hook（中での二重 panic を避ける）の

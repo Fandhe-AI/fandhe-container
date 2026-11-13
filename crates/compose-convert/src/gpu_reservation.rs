@@ -17,6 +17,9 @@
 //!   実ファイルが 0 件のため、検証は合成フィクスチャに限る。
 //! - 結線済み（#3612）: stack への書き込みと `value_drops` への加算、`deploy` / `resources` / `reservations` が
 //!   マッピングでない場合の記録は `convert/deploy.rs` が担う。
+//! - 未知フィールド（`options` など）は検出段では見ない: [`ComposeNode`] にキーの列挙が無く、検出段で見るには
+//!   トレイトの変更が要るため。`convert/deploy.rs` の `note_unsupported_device_attrs` が 1 キー 1 件で
+//!   [`DEVICES_KEY_PATH`] の drop に数える（`x-*` は数えず、`key_scan` が Warning で記録する。#4637）。
 //! - パーサーに依存しない: YAML 値への [`ComposeNode`] の実装は `convert/deploy.rs` にある（本モジュールは依存しない）。
 //! - 入力の大きさ: 再帰しない一段の走査。確保・複製の前に [`MAX_DEVICES`]・[`MAX_DEVICE_IDS`]・
 //!   [`MAX_DEVICE_ID_BYTES`]・[`MAX_DEVICE_IDS_TOTAL_BYTES`] を検証し、超過は構造化された

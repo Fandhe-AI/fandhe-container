@@ -260,6 +260,7 @@ D11 の実装状況（#3346・NET-1・NET-7・REPAIR-4）: 残った `realized.i
   - user namespace を作る前に `setns` する（init user namespace での `CAP_SYS_ADMIN` は特権ランチャー経由の supervisor から引き継ぐ）。拒否と受理は監査に残す（SEC-4）
 - fd の受け渡し（SCM_RIGHTS）は採らない。#460 で未決だった方式をここで決める。**理由**: plugin 境界のフレームを広げる必要があり、パスと (dev, ino) の照合で TOCTOU を閉じられる。
 - CRI の pod の join（#2872。user・ipc・net の組）とは別の入口で、init user namespace 所有の net は #2872 では従来どおり `Unimplemented`。実装は #3069（D13 の承認が前提）。
+- **実装（#3069）**: 入口は `LaunchOptions::with_netns_join(NetnsJoinTarget)`（`LaunchNetworkMode::JoinPinned` と対）。start が `PinnedNetnsJoin::pin` で置き場の fd 起点に pin を 1 回だけ開いて固定し（`crates/core/src/oci_runtime/namespace_join/pinned_net.rs`）、中間プロセス I が user namespace の作成前に `exec::join_pinned_netns` で `setns` する。所有者が init であることは nsfs の固定 inode（`PROC_USER_INIT_INO`）と dev で判定する。受理と拒否は層 `netns_join`（`NetnsJoinOutcome` 8 種。relay の TAG `0x88`）で監査に残す。供給側（`NetnsStatus` への pin パス・(dev, ino) の追加と supervisor の `with_netns_join` の呼び出し）は #3074・#4724 の範囲。
 
 ### D13 rootful のユーザー定義ネットワークの実行主体（オーナー承認待ち）
 
@@ -388,7 +389,7 @@ pasta 構成の期限（`--version` 2 秒・holder の READY 2 秒・準備完�
 | 静的 IPAM の永続化 | `crates/net/src/network/ipam.rs` | #349 条件 2、#319 条件 2〜4 | #3067 |
 | 公開ハンドルの復元 | `crates/net/src/network/recorded.rs`・`unpublish.rs`・`network_store/member.rs` | なし（NET-3 の残余。実装済み） | #3068・#3343 |
 | rootful の実行主体（承認） | — | #349 条件 1（rootful）・2、#319 条件 2〜4 | #3207（判断シートは #3057〔close 済み〕） |
-| init user namespace 所有の netns への参加 | `crates/core/src/oci_runtime/namespace_join.rs` | 同上 | #3069 |
+| init user namespace 所有の netns への参加 | `crates/core/src/oci_runtime/namespace_join/pinned_net.rs` | 同上 | #3069 |
 | plugin の起動と attach / detach の結線 | supervisor | 同上 | #3074 |
 | DNS の参照カウントと切り離し | `crates/net/src/dns_helper/refcount.rs`・`dns_helper.rs` | #349 条件 2 | #3070 |
 | 名前の登録経路 | `crates/net/src/dns_helper.rs` | #349 条件 2 | #3071 |
@@ -438,7 +439,7 @@ pasta 構成の期限（`--version` 2 秒・holder の READY 2 秒・準備完�
 | #3433 | net: `PortRegistry` の組み直しの残余（受け口不明の保持・不完全の印のプロセス間伝播）を決める（D11。#3362 の残り） | net-builder | #3362 | 判断済み（dump に任せる・印は伝えず各プロセスが組み直す。挙動は変えず契約と試験で固定。下の注） |
 | #3477 | net: 組み直す前の `reserve` の拒否と不完全の印の共有（形式 v2）の採否を決めて記録する（#3433 の残り） | net-builder | #3433 | 判断済み（状態での拒否を opt-in の構築口で採る・型と既定は採らない・形式 v2 は却下を維持。下の注） |
 | #3057 | 人間担当: rootful の実行主体の判断シート（D13） | 人間 | なし | 判断シートあり（PR #3186）・判断は #3207 |
-| #3069 | core: init user namespace 所有の netns への参加（D12） | runtime-builder | #3057・#3058 | 未実装 |
+| #3069 | core: init user namespace 所有の netns への参加（D12） | runtime-builder | #3057・#3058 | 実装済み |
 | #3074 | supervisor: rootful の plugin 起動と attach / detach の結線（D13・D14） | runtime-builder | #3057・#3059・#3067・#3069・#3065 | 未実装 |
 | #3070 | net: DNS ヘルパーの切り離し起動と停止（D11） | net-builder | #3059 | 実装済み（切り離し起動・記録・pidfd 経由の停止・起動窓の回収の判定。停止要求の UDS は #3071 で接続済み、`members/*` の件数による起動・停止の配線は #3067・#3074、回収の候補 pid を出す `net-helpers` の cgroup の列挙は #3074 が残る） |
 | #3071 | net: DNS ヘルパーの制御 UDS と記録からの名前の読み込み（D11） | net-builder | #3067・#3070 | 実装済み（制御 UDS `dns.ctl`・`Reload` / `Loaded` / `Stop` / `Error` のフレーム・メンバー記録からの名前の読み込み・attach の `Reload` の ack 待ちと失敗の結線・`Stop` による停止。呼び出し元の配線は #3074・#3075、`--dns` の上流は #3072、別 uid の実機確認は人間担当） |

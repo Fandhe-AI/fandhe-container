@@ -8,7 +8,9 @@
 //! macOS ホスト側の VZ vsock は未実装（REPAIR-3）。ゲスト内 mount（`guest_mount`。TASK-65.3）は
 //! ホスト側（指示の生成・報告の検証・`Vm::launch` での待機）まで実装済みで、指示を実行して報告する
 //! ゲスト init は `crates/guest-init`（#1875）で実装済みで、`virtiofs_io` 用の試験プローブ（#1876）の行の契約と復号は `guest_probe`、symlink・ハードリンクの観測モード（#1877）は `guest_link_probe`。実機での起動確認は #1628（人間担当）。
-//! 協調停止・pause / resume / save / restore と plugin 境界のエラー写像（TASK-115）は未実装（REPAIR-3）。
+//! 協調停止（`vm::Vm::shutdown`。ゲストへ `requestStop` を要求し、猶予内に止まらなければ強制停止へ切り替える。
+//! MAC-4・#2270。実 VM でのゲストへの到達は未確認で #1628・#2282）は実装済み。pause / resume / save / restore と
+//! plugin 境界のエラー写像（TASK-115）は未実装（REPAIR-3）。
 //!
 //! - プラットフォーム対応: OS 非依存の検証ロジックは全 OS でビルドし 3 OS CI でテストする。
 //!   Virtualization.framework 呼び出し（`sys`・構築関数）のみ `cfg(target_os = "macos")` で局所化する（CLI-1）。

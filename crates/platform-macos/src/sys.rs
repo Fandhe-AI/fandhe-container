@@ -374,6 +374,14 @@ pub(crate) struct OpRejected {
     pub(crate) state_raw: isize,
 }
 
+/// `VmRef::request_stop` の失敗（MAC-4・#2270）。
+pub(crate) enum RequestStopError {
+    /// `canRequestStop` が偽（要求できない状態。ゲストが要求を受け付けない構成を含む）。
+    NotRequestable,
+    /// 要求が失敗した（NSError の要約）。
+    Failed(VzErrorInfo),
+}
+
 /// VM 専用キューのラベル（固定文字列。入力から組み立てない）。
 const VM_QUEUE_LABEL: &str = "ai.fandhe.container.platform-macos.vm";
 
@@ -541,6 +549,27 @@ impl VmRef<'_> {
     pub(crate) fn can_stop(&self) -> bool {
         // SAFETY: 同上。
         unsafe { self.objs.0.vm.canStop() }
+    }
+
+    /// ゲストへ停止を要求できるか（`requestStopWithError:` の前提。MAC-4・#2270）。
+    pub(crate) fn can_request_stop(&self) -> bool {
+        // SAFETY: 同上。
+        unsafe { self.objs.0.vm.canRequestStop() }
+    }
+
+    /// `canRequestStop` を確認してから `requestStopWithError:` を呼び、ゲストへ協調停止を要求する
+    /// （MAC-4・TASK-191・#2270）。完了は待たない（ゲストが止まれば delegate の `guestDidStopVirtualMachine:`
+    /// が呼ばれ状態が `Stopped` になる）。要求できない状態なら要求せず `NotRequestable` を返す。要求の失敗は
+    /// NSError の要約を `RequestStopError::Failed` で返す。
+    pub(crate) fn request_stop(&self) -> Result<(), RequestStopError> {
+        if !self.can_request_stop() {
+            return Err(RequestStopError::NotRequestable);
+        }
+        // SAFETY: VM キュー上で呼ばれ（`VmRef` は !Send でキュー上にしか存在しない）、直前に
+        // `canRequestStop` を確認済み。シリアルキュー上のため確認と呼び出しの間に他の操作は入らない。
+        // 失敗は ObjC 例外ではなく NSError として返り、objc2 が `Err` にする（要約は呼び出し中にコピーする）。
+        unsafe { self.objs.0.vm.requestStopWithError() }
+            .map_err(|e| RequestStopError::Failed(summarize_error(&e)))
     }
 
     /// `canStart` を確認してから `startWithCompletionHandler:` を呼ぶ。起動できない状態なら要求せず

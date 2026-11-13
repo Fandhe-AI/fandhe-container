@@ -135,7 +135,11 @@
 //! - 1 コンテナ = 1 VM。MAC-4 は確定（既定は常駐 VM 共用 + 軽量プロセス分離）だが、既定方式は未実装（TASK-191。設計の確定は #1905）。状態はプロセス内メモリのみ（都度起動モードでは引き継げない）。
 //! - VM 操作の期限は core 側 RPC・都度起動の合計期限（10 秒）と終了猶予（5 秒）に収まる固定値
 //!   （[`LAUNCH_START_TIMEOUT`] 等・[`SHUTDOWN_BUDGET`]）。core からの期限伝達（要求本体への期限指定）は #1869 の設計。
-//!   既定の `OpTimeouts`（start 30 秒・guest mount 60 秒・stop 15 秒）は使わない。
+//!   既定の `OpTimeouts`（start 30 秒・guest mount 60 秒・stop 15 秒・協調停止 30 秒）は使わない。
+//! - `stop` 操作は協調停止（[`MacosBackend::stop_graceful`]。ゲストへ停止を要求し [`PLUGIN_STOP_GRACE`] 5 秒待って、
+//!   止まらなければ破壊的な停止へ切り替える。MAC-4・TASK-191・#2270）。`stop_all`（終了時の一括停止）は
+//!   [`SHUTDOWN_BUDGET`] 4 秒と同時実行数の上限（`max_running`）が破壊的な停止の所要を前提にするため、従来どおり
+//!   破壊的な停止だけを行う。共用 VM の 30 秒の経路は G14（#2281）で非同期化と合わせて使う。
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -172,6 +176,20 @@ pub const MAX_CONTAINERS: usize = 64;
 pub const LAUNCH_START_TIMEOUT: Duration = Duration::from_secs(3);
 /// 同 `stop` 完了待ち。停止はゲスト mount 待ちの失敗後始末と終了時停止でも使う。
 pub const LAUNCH_STOP_TIMEOUT: Duration = Duration::from_secs(2);
+/// `stop` 操作の協調停止の猶予（ゲストが電源断するのを待つ上限。MAC-4・TASK-191・#2270）。超えたら破壊的な
+/// 停止（[`LAUNCH_STOP_TIMEOUT`] の期限つき）へ切り替える。停止要求の発行（状態照会の期限
+/// [`LAUNCH_STATE_QUERY_TIMEOUT`]）+ 猶予 + 強制停止が、10 秒の RPC 期限に収まる固定値で、ゲスト init の最悪
+/// （約 4 秒）より長い。`Vm::shutdown` の既定 30 秒は共用 VM の経路（G14・#2281）で使う。
+pub const PLUGIN_STOP_GRACE: Duration = Duration::from_secs(5);
+// 要求の発行 + 猶予 + 強制停止 + Stopping の追加待ちの最悪が、10 秒の RPC 期限に 1 秒以上の余裕を残して収まる。
+const _: () = assert!(
+    LAUNCH_STATE_QUERY_TIMEOUT.as_millis()
+        + PLUGIN_STOP_GRACE.as_millis()
+        + LAUNCH_STOP_TIMEOUT.as_millis()
+        // Stopping で強制停止を拒否された後の追加待ち（`Vm::shutdown` は状態照会の期限に絞る）
+        + LAUNCH_STATE_QUERY_TIMEOUT.as_millis()
+        <= 9_000
+);
 /// 同 状態照会の応答待ち。
 pub const LAUNCH_STATE_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 /// 同 ゲスト内 virtiofs mount 報告の待機。共有走査（[`SHARE_SCAN_TIMEOUT`] 1 秒）・start（3 秒）と合わせた
@@ -221,8 +239,14 @@ pub trait MacosBackend {
     type Handle;
     /// VM を構築して起動する（失敗時の後始末は実装側が担う）。
     fn launch(&self, spec: &VmConfigSpec) -> Result<Self::Handle, BackendError>;
-    /// 期限つきで VM を停止する。
+    /// 期限つきで VM を停止する（破壊的な停止）。
     fn stop(&self, handle: &Self::Handle) -> Result<(), BackendError>;
+    /// ゲストへ協調停止を要求し、[`PLUGIN_STOP_GRACE`] 内に止まらなければ [`MacosBackend::stop`] 相当へ
+    /// 切り替える（MAC-4・#2270）。既定の実装は破壊的な停止だけを行う（協調停止を持たない偽実装向け）。
+    /// 最悪の所要は [`PLUGIN_STOP_GRACE`] + [`LAUNCH_STOP_TIMEOUT`] + 要求の発行。
+    fn stop_graceful(&self, handle: &Self::Handle) -> Result<(), BackendError> {
+        self.stop(handle)
+    }
     /// [`MacosBackend::stop`] が 1 回に最大で待つ時間。一括停止の予算配分に使う。
     fn stop_timeout(&self) -> Duration;
 }
@@ -319,6 +343,7 @@ impl MacosBackend for PlatformBackend {
         )
         .and_then(|t| t.with_guest_mount(LAUNCH_GUEST_MOUNT_TIMEOUT))
         .and_then(|t| t.with_share_scan(SHARE_SCAN_TIMEOUT))
+        .and_then(|t| t.with_graceful_stop(PLUGIN_STOP_GRACE))
         .map_err(PlatformError::Vm)?;
         // 構成構築のファイルシステム操作は取り消せないため、起動全体を作業スレッドへ隔離して期限つきで待つ。
         // 期限後に完成した `Vm` は受け手が無く作業スレッド側で drop され、停止要求が走る（REPAIR-5）。
@@ -351,6 +376,15 @@ impl MacosBackend for PlatformBackend {
 
     fn stop(&self, handle: &Self::Handle) -> Result<(), BackendError> {
         handle.stop().map_err(|e| PlatformError::Vm(e).into())
+    }
+
+    fn stop_graceful(&self, handle: &Self::Handle) -> Result<(), BackendError> {
+        // どの経路で止まったか（`ShutdownOutcome`）は、plugin の応答には載せない（観測は #2282 の実機確認で
+        // 必要になった時点で OpEvent 等へ足す。REPAIR-4）。
+        handle
+            .shutdown()
+            .map(|_| ())
+            .map_err(|e| PlatformError::Vm(e).into())
     }
 }
 
@@ -660,7 +694,7 @@ impl<B: MacosBackend> MacosRuntimeAdapter<B> {
         if let State::Running(h) = &entry.state {
             // 失敗時は登録を残す（再試行可）。
             // 既に停止済み（`Stopped` の InvalidState）なら停止成功として扱い、登録を外す。
-            if let Err(e) = self.backend.stop(h)
+            if let Err(e) = self.backend.stop_graceful(h)
                 && !e.is_already_halted()
             {
                 return Err(backend_to_plugin(&e));
@@ -1010,6 +1044,8 @@ mod tests {
         /// 設定されていれば launch がこの失敗を返す（`PlatformError` を要求どおりに写すかの照合用）。
         launch_error: Option<PlatformError>,
         stopped: Vec<u32>,
+        /// `stop_graceful` を呼ばれた VM（`stop` 操作は協調停止、`stop_all` は破壊的な停止。MAC-4・#2270）。
+        graceful: Vec<u32>,
         fail_launch: bool,
         /// VM 生成前に確定する失敗（非 macOS 相当）を返す。
         unsupported_launch: bool,
@@ -1068,6 +1104,10 @@ mod tests {
         }
         fn stop_timeout(&self) -> Duration {
             self.0.borrow().stop_timeout
+        }
+        fn stop_graceful(&self, h: &u32) -> Result<(), BackendError> {
+            self.0.borrow_mut().graceful.push(*h);
+            self.stop(h)
         }
         fn stop(&self, h: &u32) -> Result<(), BackendError> {
             let mut c = self.0.borrow_mut();
@@ -1251,9 +1291,36 @@ mod tests {
             s(&["stopped"])
         );
         assert_eq!(f.0.borrow().stopped, vec![1]);
+        // `stop` 操作は協調停止を経由する（MAC-4・TASK-191・#2270）。
+        assert_eq!(f.0.borrow().graceful, vec![1]);
         assert_eq!(
             err_of(a.handle(&s(&["start", "c1"]))).0,
             PluginErrorCode::NotFound
+        );
+    }
+
+    /// MAC-4・#2270・REPAIR-5: 終了時の一括停止は協調停止の猶予を使わない（4 秒の予算と同時実行数の上限を
+    /// 保つため、破壊的な停止だけを行う）。協調停止の猶予は 10 秒の RPC 期限に収まる。
+    #[test]
+    fn mac4_2270_stop_all_stays_destructive_and_grace_fits_rpc() {
+        let dir = tmp_dir("stopall-destructive");
+        let k = kernel(&dir);
+        let (mut a, f) = adapter();
+        create_ok(&mut a, "a", &k);
+        a.handle(&s(&["start", "a"])).expect("start");
+        assert_eq!(
+            a.stop_all(),
+            StopAllSummary {
+                stopped: 1,
+                remaining: 0
+            }
+        );
+        assert_eq!(f.0.borrow().stopped, vec![1]);
+        assert!(f.0.borrow().graceful.is_empty());
+        assert_eq!(PLUGIN_STOP_GRACE, Duration::from_secs(5));
+        assert!(
+            LAUNCH_STATE_QUERY_TIMEOUT * 2 + PLUGIN_STOP_GRACE + LAUNCH_STOP_TIMEOUT
+                < Duration::from_secs(10)
         );
     }
 

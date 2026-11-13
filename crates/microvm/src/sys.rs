@@ -31,21 +31,13 @@
 //! - 戻り値が `-1` のときは直後に `std::io::Error::last_os_error()` で errno を確保する
 //!
 //! # `libc` との機械照合について
-//! TASK-75.1 で匿名 mmap のゲスト RAM（`GuestRamMap`）・`madvise(MADV_DONTFORK)`（#3679 で `MADV_DONTDUMP` も）・登録 / 削除のラッパーを足した
-//! （`crate::microvm` の `GuestRam`・`RegisteredGuestRam` が呼ぶ。`madvise` も `libc` 導入後は照合の対象）。
-//! 本 crate は dev-dependency に `libc` を持たず照合は未導入（追加は crate ごとの承認事項。
-//! `docs/design/ffi-libc-check.md`「適用状況」）。なお `KVM_*` の ioctl 番号は `linux/kvm.h` のカーネル ABI で
-//! `libc` に対応物が無く、導入後も `ioctl` 関数の型の照合だけが対象になる（`mmap` / `munmap` も導入後は照合の対象）。
-//! `eventfd` は `libc` に対応物があり、導入後は照合の対象になる（照合の追跡は #3664。`MADV_DONTDUMP` も同じ）。#3698 の `poll` / `struct pollfd` / `POLL*` も `libc` に対応物があり、導入後は照合の対象（#3664）。`kvm_irqfd`・`kvm_ioeventfd` もカーネル ABI で
-//! 対応物が無く、サイズ・オフセットを const assert で固定する。`KVM_MEM_*`（memslot のフラグ）と `KVM_CAP_READONLY_MEM` もカーネル ABI で `libc` に対応物が無く、値を const assert で固定する（#4157）。
-//! `kvm_regs`・`kvm_sregs`（`kvm_segment`・`kvm_dtable` を含む）も `libc` に対応物が無く、サイズ・オフセットを const assert で固定する（照合の追跡は #3664）。
-//! `kvm_cpuid2` / `kvm_cpuid_entry2`・`kvm_msrs` / `kvm_msr_entry`・`kvm_fpu`・`kvm_lapic_state` も `asm/kvm.h` のカーネル ABI で
-//! `libc` に対応物が無く、サイズ・オフセットを const assert で固定する（照合の追跡は #3664）。#3737 で足した `kvm_mp_state`
-//! （`linux/kvm.h` v6.12。`KVM_{GET,SET}_MP_STATE`）も同様に対応物が無く、サイズ・アラインを const assert で固定する。上限の `KVM_MAX_CPUID_ENTRIES`・
-//! `MAX_IO_MSRS` はカーネル内部の値で uapi にも無い。
-//! `kvm_dirty_log`・`KVM_GET_DIRTY_LOG`（#4225）もカーネル ABI で `libc` に対応物が無く、サイズ・オフセット・ioctl 番号を const assert で固定する（導入後も照合の対象は `ioctl` の型だけ。追跡は #3664）。
-//! `kvm_userspace_memory_region` と `kvm_run` もカーネル ABI で `libc` に対応物が無く、サイズ・オフセットを const assert で固定する。aarch64 の `kvm_vcpu_init`
-//! （`asm/kvm.h` のカーネル ABI 構造体）も `libc` に対応物が無く、サイズ・アラインを const assert で固定する。
+//! 導入済み（#3664・MVM-4・REPAIR-12。dev-dependencies の `libc` は #3290 で承認）。試験専用の `libc_abi` が
+//! `mmap`・`munmap`・`madvise`・`sysconf`・`ioctl`（関数の型のみ）・`sigaction`・`pthread_*`・`eventfd`・`poll` の型、
+//! `SigSet`・`SigAction`・`PollFd` のレイアウト、`MAP_*`・`MADV_*`・`EFD_*`・`POLL*` 等の定数と errno のリテラルを
+//! `const` 評価で照合する。`KVM_*` の ioctl 番号・`KVM_CAP_*`・`kvm_run` ほかの KVM uapi 構造体は `linux/kvm.h` /
+//! `asm/kvm.h` のカーネル ABI で `libc` に対応物が無く、サイズ・オフセット・値を各定義の横の const assert（と具体値の試験）で
+//! 固定する（対象外の一覧と出典は `libc_abi` のコメント）。上限の `KVM_MAX_CPUID_ENTRIES`・`MAX_IO_MSRS` は
+//! カーネル内部の値で uapi にも無い。
 
 #![cfg(target_os = "linux")]
 
@@ -632,7 +624,7 @@ pub(crate) struct KvmSregs {
     pub interrupt_bitmap: [u64; 4],
 }
 
-// `asm/kvm.h` のレイアウトと ioctl 番号のサイズ符号を固定する。`libc` に対応物の無いカーネル ABI の構造体（照合の追跡は #3664）。
+// `asm/kvm.h` のレイアウトと ioctl 番号のサイズ符号を固定する。`libc` に対応物の無いカーネル ABI の構造体（対象外の理由は `libc_abi`）。
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 const _: () = {
     use std::mem::{align_of, offset_of, size_of};
@@ -2832,6 +2824,156 @@ pub(crate) fn kvm_set_identity_map_addr(vm: BorrowedFd<'_>, addr: u64) -> Result
     if r < 0 { Err(last_error()) } else { Ok(()) }
 }
 
+/// 自前の FFI 宣言と `libc` の機械照合（`const` 評価のみ。関数は呼ばず、新しい `unsafe` も足さない。
+/// MVM-4・REPAIR-7・REPAIR-12・#3664。方式は `docs/design/ffi-libc-check.md`）。
+///
+/// 対象は gnu の LP64 の x86_64・aarch64 だけ（`consts::SUPPORTED` と同じ。musl は `ioctl` の `request` が
+/// `c_int` で宣言が合わない）。対応外 arch のゼロ値の `consts` は呼ばれないため対象外。食い違いを見つけたら
+/// 照合を宣言に合わせて通さず、宣言の誤りとして報告する。
+///
+/// 対象外（`libc` 0.2.189 に KVM の定義が一切無いカーネル ABI）: `KVM_*` の ioctl 番号・`KVM_CAP_*`・
+/// `KVM_MEM_*`・`KVM_IRQFD_FLAG_*`・`KVM_IOEVENTFD_FLAG_*`・`KVM_ARM_*`・`KVM_REG_*`・`KVM_DEV_*`・
+/// `IMMEDIATE_EXIT_OFFSET` と、構造体 `kvm_run`・`kvm_userspace_memory_region`・`kvm_dirty_log`・`kvm_irqfd`・
+/// `kvm_ioeventfd`・`kvm_irq_level`・`kvm_regs`・`kvm_sregs`（`kvm_segment`・`kvm_dtable`）・`kvm_cpuid2` /
+/// `kvm_cpuid_entry2`・`kvm_msrs` / `kvm_msr_entry`・`kvm_mp_state`・`kvm_fpu`・`kvm_lapic_state`、aarch64 の
+/// `kvm_vcpu_init`・`kvm_create_device`・`kvm_device_attr`・`kvm_one_reg`。出典は
+/// `include/uapi/linux/kvm.h` と `arch/{x86,arm64}/include/uapi/asm/kvm.h`（linux-libc-dev 7.0.0 の x86 側
+/// ヘッダで値を確認。aarch64 の `asm/kvm.h` は手元に無く未確認）。サイズ・オフセットは各定義の横の
+/// const assert で固定済み。上限・方針値（`MAX_CPUID_ENTRIES`・`MAX_MSR_ENTRIES`〔カーネル内部の値で uapi に無い〕・
+/// `GUEST_PAGE_SIZE` ほか）と FFI でない安全なラッパーも対象外。
+#[cfg(all(
+    test,
+    target_env = "gnu",
+    target_pointer_width = "64",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod libc_abi {
+    use super::{PollFd, SigAction, SigSet, consts};
+    use std::ffi::{c_int, c_long, c_short, c_uint, c_ulong, c_void};
+    use std::mem::{align_of, offset_of, size_of};
+
+    // --- 定数（arch ごとの `consts` を、それぞれの cfg の下で比べる）---
+    const _: () = {
+        assert!(consts::PROT_READ == libc::PROT_READ);
+        assert!(consts::PROT_WRITE == libc::PROT_WRITE);
+        assert!(consts::MAP_SHARED == libc::MAP_SHARED);
+        assert!(consts::MAP_PRIVATE == libc::MAP_PRIVATE);
+        assert!(consts::MAP_ANONYMOUS == libc::MAP_ANONYMOUS);
+        assert!(consts::MAP_NORESERVE == libc::MAP_NORESERVE);
+        assert!(consts::MADV_DONTFORK == libc::MADV_DONTFORK);
+        assert!(consts::MADV_DONTDUMP == libc::MADV_DONTDUMP);
+        assert!(consts::EFD_CLOEXEC == libc::EFD_CLOEXEC);
+        assert!(consts::EFD_NONBLOCK == libc::EFD_NONBLOCK);
+        // `POLL*` は自前 `i16`、`libc` は `c_short`。
+        let _: c_short = consts::POLLIN;
+        assert!(consts::POLLIN == libc::POLLIN);
+        assert!(consts::POLLERR == libc::POLLERR);
+        assert!(consts::POLLHUP == libc::POLLHUP);
+        assert!(consts::POLLNVAL == libc::POLLNVAL);
+        // 名前の違う対応: `SC_PAGESIZE` は `_SC_PAGESIZE`、`SIG_VCPU_KICK` は `SIGUSR2`。
+        assert!(super::SC_PAGESIZE == libc::_SC_PAGESIZE);
+        assert!(super::SIG_VCPU_KICK == libc::SIGUSR2);
+        assert!(super::EBUSY == libc::EBUSY);
+        // `SIG_DFL` は自前 `usize`、`libc` は `sighandler_t`（`size_t`）。
+        assert!(super::SIG_DFL == libc::SIG_DFL);
+        assert!(super::SIG_UNBLOCK == libc::SIG_UNBLOCK);
+        assert!(super::SIG_SETMASK == libc::SIG_SETMASK);
+        // `SIG_BLOCK` の宣言は x86_64 だけにあるため、照合も同じ cfg の下に置く。
+        #[cfg(target_arch = "x86_64")]
+        assert!(super::SIG_BLOCK == libc::SIG_BLOCK);
+    };
+
+    // --- errno のリテラル（項目として参照できないため `libc` 側の値を固定し、出現箇所を書く）---
+    // `Os(22)` = EINVAL（`host_page_size`・`dirty_log`・FlexBuf・`msr_result` ほか）、`Os(4)` = EINTR（`poll_readable`）、
+    // `Os(9)` = EBADF（`event_fd` の `fd` 変換・`irqfd` 系）、`Os(12)` = ENOMEM（FlexBuf の確保）、
+    // `Os(7)` = E2BIG（FlexBuf の件数）。`Os(0)` は errno ではなく到達しない分岐の印のため対象外。
+    // `Os(25)`（ENOTTY）は試験の期待値のみ。
+    const _: () = {
+        assert!(libc::EINVAL == 22);
+        assert!(libc::EINTR == 4);
+        assert!(libc::EBADF == 9);
+        assert!(libc::ENOMEM == 12);
+        assert!(libc::E2BIG == 7);
+        assert!(libc::ENOTTY == 25);
+    };
+
+    // 試験関数内のローカル定数（項目として参照できない）: `with_owned_hole`（`mod tests`）の
+    // `PROT_NONE`・`MAP_FIXED`・`MAP_FIXED_NOREPLACE`・`EEXIST`。
+    const _: () = {
+        assert!(libc::PROT_NONE == 0);
+        assert!(libc::MAP_FIXED == 0x10);
+        assert!(libc::MAP_FIXED_NOREPLACE == 0x0010_0000);
+        assert!(libc::EEXIST == 17);
+    };
+
+    // --- 構造体 ---
+    // `sigset_t` の中身は `libc` 側で非公開のため、サイズ・アラインメントだけを照合する。
+    const _: () = {
+        assert!(size_of::<SigSet>() == size_of::<libc::sigset_t>());
+        assert!(align_of::<SigSet>() == align_of::<libc::sigset_t>());
+        assert!(size_of::<SigAction>() == size_of::<libc::sigaction>());
+        assert!(align_of::<SigAction>() == align_of::<libc::sigaction>());
+        assert!(offset_of!(SigAction, handler) == offset_of!(libc::sigaction, sa_sigaction));
+        assert!(offset_of!(SigAction, mask) == offset_of!(libc::sigaction, sa_mask));
+        assert!(offset_of!(SigAction, flags) == offset_of!(libc::sigaction, sa_flags));
+        assert!(offset_of!(SigAction, restorer) == offset_of!(libc::sigaction, sa_restorer));
+        assert!(size_of::<usize>() == size_of::<libc::sighandler_t>());
+        assert!(size_of::<usize>() == size_of::<Option<extern "C" fn()>>());
+        assert!(size_of::<PollFd>() == size_of::<libc::pollfd>());
+        assert!(align_of::<PollFd>() == align_of::<libc::pollfd>());
+        assert!(offset_of!(PollFd, fd) == offset_of!(libc::pollfd, fd));
+        assert!(offset_of!(PollFd, events) == offset_of!(libc::pollfd, events));
+        assert!(offset_of!(PollFd, revents) == offset_of!(libc::pollfd, revents));
+    };
+
+    // --- 関数の型（関数ポインタ型への代入のみ。呼ばない）---
+    // 可変長の `ioctl` は自前と `libc` の両方を同じ可変長の型へ代入する。
+    const _: unsafe extern "C" fn(c_int, c_ulong, ...) -> c_int = super::ioctl;
+    const _: unsafe extern "C" fn(c_int, c_ulong, ...) -> c_int = libc::ioctl;
+    const _: unsafe extern "C" fn(
+        *mut c_void,
+        usize,
+        c_int,
+        c_int,
+        c_int,
+        libc::off_t,
+    ) -> *mut c_void = super::mmap;
+    const _: unsafe extern "C" fn(
+        *mut c_void,
+        usize,
+        c_int,
+        c_int,
+        c_int,
+        libc::off_t,
+    ) -> *mut c_void = libc::mmap;
+    const _: unsafe extern "C" fn(*mut c_void, usize) -> c_int = super::munmap;
+    const _: unsafe extern "C" fn(*mut c_void, usize) -> c_int = libc::munmap;
+    const _: unsafe extern "C" fn(*mut c_void, usize, c_int) -> c_int = super::madvise;
+    const _: unsafe extern "C" fn(*mut c_void, usize, c_int) -> c_int = libc::madvise;
+    const _: unsafe extern "C" fn(c_int) -> c_long = super::sysconf;
+    const _: unsafe extern "C" fn(c_int) -> c_long = libc::sysconf;
+    const _: unsafe extern "C" fn() -> libc::pthread_t = super::pthread_self;
+    const _: unsafe extern "C" fn() -> libc::pthread_t = libc::pthread_self;
+    const _: unsafe extern "C" fn(libc::pthread_t, c_int) -> c_int = super::pthread_kill;
+    const _: unsafe extern "C" fn(libc::pthread_t, c_int) -> c_int = libc::pthread_kill;
+    const _: unsafe extern "C" fn(c_uint, c_int) -> c_int = super::eventfd;
+    const _: unsafe extern "C" fn(c_uint, c_int) -> c_int = libc::eventfd;
+    // 自前の構造体を指すポインタを含む関数は、自前側と `libc` 側を別々の型で書く（構造体の同一性は上の
+    // サイズ・オフセットの照合が保証する）。
+    const _: unsafe extern "C" fn(c_int, *const SigAction, *mut SigAction) -> c_int =
+        super::sigaction;
+    const _: unsafe extern "C" fn(c_int, *const libc::sigaction, *mut libc::sigaction) -> c_int =
+        libc::sigaction;
+    const _: unsafe extern "C" fn(c_int, *const SigSet, *mut SigSet) -> c_int =
+        super::pthread_sigmask;
+    const _: unsafe extern "C" fn(c_int, *const libc::sigset_t, *mut libc::sigset_t) -> c_int =
+        libc::pthread_sigmask;
+    const _: unsafe extern "C" fn(*mut PollFd, libc::nfds_t, c_int) -> c_int = super::poll;
+    const _: unsafe extern "C" fn(*mut libc::pollfd, libc::nfds_t, c_int) -> c_int = libc::poll;
+    // `libc` に型付きのハンドラ型が無い（`sighandler_t` は `size_t`）ため、`kick_handler` は引数の型だけを照合する。
+    const _: extern "C" fn(c_int) = super::kick_handler;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3399,7 +3541,7 @@ mod tests {
     /// (1) 後始末で munmap するのは自分の予約の両端だけで、穴は置き直せた時だけ解除する（他スレッドの領域を巻き込まない）。
     /// (2) 穴を他スレッドに取られて置き直せなかった場合に備え、新しい予約で最大 `ATTEMPTS` 回やり直す。
     ///     本当に解放されない不具合なら毎回失敗するので、1 回も成功しなければ失敗にする。
-    /// libc との機械照合は microvm に未導入（#3664・#3290）。定数は Linux の x86_64・aarch64 共通の ABI 値。
+    /// libc との照合は `libc_abi`（#3664）。定数は Linux の x86_64・aarch64 共通の ABI 値。
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     fn with_owned_hole(pages: usize, mut body: impl FnMut(*mut c_void, usize)) {
         const PROT_NONE: i32 = 0;

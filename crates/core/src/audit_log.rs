@@ -498,6 +498,8 @@ pub enum AuditLayer {
     PastaVerify,
     /// pod の namespace への join（`linux.namespaces[].path`）の受理と拒否の記録（SEC-4・SEC-5・CORE-3・NET-3・#2872）。
     PodNamespaceJoin,
+    /// init user namespace 所有の netns（pin）への参加指定の受理と拒否の記録（SEC-4・NET-1・SEC-1・CORE-3・#3069）。
+    NetnsJoin,
 }
 
 impl AuditLayer {
@@ -516,6 +518,7 @@ impl AuditLayer {
             AuditLayer::AuditCoverage => "audit_coverage",
             AuditLayer::PastaVerify => "pasta_verify",
             AuditLayer::PodNamespaceJoin => "pod_namespace_join",
+            AuditLayer::NetnsJoin => "netns_join",
         }
     }
 }
@@ -611,6 +614,14 @@ pub enum AuditEvent {
     /// 記録の共通部に載る。構築は [`PodNamespaceJoinOutcome::audit_event`] で行う。
     PodNamespaceJoin {
         /// 結果の理由トークン（[`PodNamespaceJoinOutcome::as_str`]）。
+        reason: AuditReason,
+    },
+    /// init user namespace 所有の netns（pin）への参加指定の受理または拒否の記録（SEC-4・NET-1・SEC-1・CORE-3・#3069）。
+    ///
+    /// 理由トークンだけを持ち、**パス・inode は持たない**（型で保証する。REPAIR-2・REPAIR-4）。構築は
+    /// [`NetnsJoinOutcome::audit_event`] で行う。
+    NetnsJoin {
+        /// 結果の理由トークン（[`NetnsJoinOutcome::as_str`]）。
         reason: AuditReason,
     },
     /// supervisor の制御チャネルが接続元を拒否した記録（SEC-4・SEC-1・SUP-1・#2058）。
@@ -749,6 +760,69 @@ impl PodNamespaceJoinOutcome {
     }
 }
 
+/// init user namespace 所有の netns（pin）への参加指定の素性検査の結果（SEC-4・NET-1・SEC-1・CORE-3・#3069）。
+/// 固定語彙で、入力値（パス・inode）を載せない。
+///
+/// 呼び出し元は `oci_runtime::start` の `PinnedNetnsJoin::pin`。受理は素性検査の受理（fork の前）で、後段の launch の
+/// 失敗は別の記録になる。置き場・pin が存在しない場合と I/O の失敗は素性検査の結果ではないため含めない。
+/// 中継（`control_relay`）はこの表の添字で運ぶ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum NetnsJoinOutcome {
+    /// 受理した。
+    Accepted,
+    /// path が相対・`..` を含む・長さ上限超過・置き場の直下の 1 要素でない。
+    PathMalformed,
+    /// 置き場または pin が symlink（辿らない）。
+    PathSymlink,
+    /// 開く権限が無い。
+    OpenDenied,
+    /// namespace ファイルでない。
+    NotNamespaceFile,
+    /// network namespace でない。
+    NotNetworkNamespace,
+    /// 開いた fd の (dev, ino) が指定と違う。
+    IdentityMismatch,
+    /// 所有する user namespace が init でない。
+    OwnerNotInit,
+}
+
+impl NetnsJoinOutcome {
+    /// 中継の閉じた表（添字がワイヤー上の値。増やすときは末尾に足す。中継は Linux 限定）。
+    #[cfg(target_os = "linux")]
+    pub(crate) const ALL: [Self; 8] = [
+        Self::Accepted,
+        Self::PathMalformed,
+        Self::PathSymlink,
+        Self::OpenDenied,
+        Self::NotNamespaceFile,
+        Self::NotNetworkNamespace,
+        Self::IdentityMismatch,
+        Self::OwnerNotInit,
+    ];
+
+    /// 監査レコードに入る静的トークン。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "netns_join_accepted",
+            Self::PathMalformed => "netns_join_path_malformed",
+            Self::PathSymlink => "netns_join_path_symlink",
+            Self::OpenDenied => "netns_join_open_denied",
+            Self::NotNamespaceFile => "netns_join_not_namespace_file",
+            Self::NotNetworkNamespace => "netns_join_not_network_namespace",
+            Self::IdentityMismatch => "netns_join_identity_mismatch",
+            Self::OwnerNotInit => "netns_join_owner_not_init",
+        }
+    }
+
+    /// 対応する監査イベントを返す。
+    pub fn audit_event(self) -> AuditEvent {
+        AuditEvent::NetnsJoin {
+            reason: AuditReason::new(self.as_str()),
+        }
+    }
+}
+
 /// 制御チャネルが接続元を拒否した理由（SEC-4・SEC-1・SUP-1・#2058）。固定語彙で、入力値を載せない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -829,6 +903,7 @@ impl AuditEvent {
             AuditEvent::Entrypoint { .. } => AuditLayer::Entrypoint,
             AuditEvent::PastaVerify { .. } => AuditLayer::PastaVerify,
             AuditEvent::PodNamespaceJoin { .. } => AuditLayer::PodNamespaceJoin,
+            AuditEvent::NetnsJoin { .. } => AuditLayer::NetnsJoin,
             AuditEvent::ControlPeer { .. } => AuditLayer::ControlChannel,
             AuditEvent::ExitSignal { .. } => AuditLayer::ExitSignal,
             AuditEvent::AuditCoverageDegraded { .. } => AuditLayer::AuditCoverage,
@@ -944,6 +1019,7 @@ impl AuditRecord {
             | AuditEvent::Entrypoint { .. }
             | AuditEvent::PastaVerify { .. }
             | AuditEvent::PodNamespaceJoin { .. }
+            | AuditEvent::NetnsJoin { .. }
             | AuditEvent::ControlPeer { .. }
             | AuditEvent::ExitSignal { .. }
             | AuditEvent::AuditCoverageDegraded { .. } => None,
@@ -982,6 +1058,7 @@ impl AuditRecord {
             | AuditEvent::Entrypoint { .. }
             | AuditEvent::PastaVerify { .. }
             | AuditEvent::PodNamespaceJoin { .. }
+            | AuditEvent::NetnsJoin { .. }
             | AuditEvent::ControlPeer { .. }
             | AuditEvent::ExitSignal { .. }
             | AuditEvent::AuditCoverageDegraded { .. } => None,
@@ -1016,6 +1093,7 @@ impl AuditRecord {
             | AuditEvent::Entrypoint { reason }
             | AuditEvent::PastaVerify { reason }
             | AuditEvent::PodNamespaceJoin { reason }
+            | AuditEvent::NetnsJoin { reason }
             | AuditEvent::ControlPeer { reason } => Some(*reason),
             _ => None,
         }
@@ -1208,6 +1286,40 @@ mod tests {
         assert_eq!(
             r.reason().map(AuditReason::as_str),
             Some("pasta_permission_denied")
+        );
+        assert!(r.path().is_none());
+        assert!(r.syscall().is_none());
+    }
+
+    /// SEC-4・NET-1・SEC-1・#3069: netns_join の層トークンと 8 結果のトークン(固定値・重複なし・`netns_join_` 接頭辞)、
+    /// レコードのアクセサ(パスを持たない)。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec4_3069_netns_join_tokens_and_accessors() {
+        assert_eq!(AuditLayer::NetnsJoin.as_str(), "netns_join");
+        let tokens: Vec<&str> = NetnsJoinOutcome::ALL.iter().map(|o| o.as_str()).collect();
+        assert_eq!(
+            tokens,
+            [
+                "netns_join_accepted",
+                "netns_join_path_malformed",
+                "netns_join_path_symlink",
+                "netns_join_open_denied",
+                "netns_join_not_namespace_file",
+                "netns_join_not_network_namespace",
+                "netns_join_identity_mismatch",
+                "netns_join_owner_not_init",
+            ]
+        );
+        let r = AuditRecord::new(
+            AuditTimestamp::from_unix_duration(Duration::new(1_700_000_000, 5)),
+            AuditPid::new(9).unwrap(),
+            NetnsJoinOutcome::OwnerNotInit.audit_event(),
+        );
+        assert_eq!(r.layer(), AuditLayer::NetnsJoin);
+        assert_eq!(
+            r.reason().map(AuditReason::as_str),
+            Some("netns_join_owner_not_init")
         );
         assert!(r.path().is_none());
         assert!(r.syscall().is_none());

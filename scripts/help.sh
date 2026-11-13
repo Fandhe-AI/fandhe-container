@@ -96,7 +96,7 @@ cat <<'EOF'
   guest-kernel-build-selftest         guest/kernel/build-selftest.sh
                                         ゲストカーネルのビルドスクリプトの自己テスト（#1874・MAC-1・REPAIR-12。スタブのみ）
   guest-initrd-build                  scripts/build-guest-initrd.sh
-                                        macOS ゲスト init の静的リンクビルドと /init だけの initrd（newc・gzip）の作成（TASK-64 追補・#1878・MAC-1。ローカルの実ビルド。make ci には含めない）
+                                        macOS ゲスト init の静的リンクビルドと /init だけの initrd（newc・gzip）の作成。GUEST_INITRD_WITH_RUNTIME=1 で cli・supervisor も入れる（TASK-64 追補・#1878・#2275・MAC-1・MAC-4。ローカルの実ビルド。make ci には含めない）
   guest-initrd-build-selftest         scripts/build-guest-initrd-selftest.sh
                                         ゲスト initrd 梱包スクリプトの自己テスト（#1878・MAC-1・REPAIR-12。スタブ・fixture のみ）
   microvm-test-initrd-build           scripts/build-microvm-test-initrd.sh

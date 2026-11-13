@@ -2,7 +2,8 @@
 # mac_small_files.sh の自己テスト（make mac-small-files-selftest。MAC-3・TASK-70 準備・#1880・REPAIR-12）。
 #
 # スタブの docker CLI（bash）と一時ディレクトリのみで、引数検証・起動引数・集計の具体値・件数不一致・期限・
-# 後始末（所有の証明）・own の未実装・report の率を照合する。実 Docker Desktop・実ランタイム・root は使わない。
+# 後始末（所有の証明）・own（スタブの自前 CLI の create / start / state / logs / inspect / delete。#3106）・report の率を
+# 照合する。実 Docker Desktop・実ランタイム・root は使わない。
 # 呼び出し元: Makefile の `mac-small-files-selftest`（CI は bench-regression の並列グループ）。
 # 失敗が 1 件でもあれば非ゼロで終わる。docker モードは bash 3.2 以上・perl（Time::HiRes）・jq が必要（#3104）。
 # 全ケースを PATH の bash と、別にある場合は /bin/bash（macOS では 3.2）の両方で回す（lib-selftest と同じ方式）。
@@ -175,10 +176,113 @@ STUB
 chmod 755 "${STUB_DIR}/docker"
 DOCKER="${STUB_DIR}/docker"
 
+# スタブの自前 CLI（#3106）。STUB_MODE: ok / shortcount / badts / hang（start が戻らない）/ nobind / failcreate / stuck / nonzero / slow
+cat >"${STUB_DIR}/fandhe" <<'STUB'
+#!/usr/bin/env bash
+calls="${STUB_DIR}/calls"
+od="${STUB_DIR}/own"
+mkdir -p "$od"
+cmd="${1:-}"
+echo "$*" >>"$calls"
+nf() { echo '{"code":"NOT_FOUND","message":"container not found"}' >&2; exit 3; }
+case "$cmd" in
+  create)
+    bundle="" lab="" id=""
+    shift
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --bundle) bundle="$2"; shift 2 ;;
+        --label) lab="$2"; shift 2 ;;
+        *) id="$1"; shift ;;
+      esac
+    done
+    if [ "${STUB_MODE:-ok}" = failcreate ]; then
+      echo '{"code":"UNIMPLEMENTED","message":"secret detail /private/path"}' >&2
+      exit 12
+    fi
+    [ -f "$bundle/config.json" ] || exit 1
+    [ "${STUB_MODE:-ok}" = slow ] && sleep 0.2
+    jq -r '.mounts[0].source' "$bundle/config.json" >"$od/$id.src"
+    jq -r '.process.args[2]' "$bundle/config.json" >"$od/$id.script"
+    jq -e '.root.readonly == true and .mounts[0].destination == "/data" and .mounts[0].options == ["rbind","rw"]' "$bundle/config.json" >/dev/null || exit 1
+    echo "$lab" >"$od/$id.label"
+    echo created >"$od/$id.status"
+    echo 0 >"$od/$id.polls"
+    exit 0
+    ;;
+  start)
+    id="$2"
+    [ -f "$od/$id.status" ] || nf
+    [ "${STUB_MODE:-ok}" = hang ] && exec sleep 30
+    echo running >"$od/$id.status"
+    if grep -q 'echo probe' "$od/$id.script" && [ "${STUB_MODE:-ok}" != nobind ]; then
+      echo probe >"$(cat "$od/$id.src")/probe"
+    fi
+    exit 0
+    ;;
+  state)
+    id="$2"
+    [ -f "$od/$id.status" ] || nf
+    st="$(cat "$od/$id.status")"
+    if [ "$st" = running ]; then
+      p=$(( $(cat "$od/$id.polls") + 1 ))
+      echo "$p" >"$od/$id.polls"
+      if [ "$p" -ge 2 ]; then st=stopped; echo stopped >"$od/$id.status"; fi
+    fi
+    printf '{"ociVersion":"1.3.0","id":"%s","status":"%s"}\n' "$id" "$st"
+    exit 0
+    ;;
+  kill)
+    id="$2"
+    [ -f "$od/$id.status" ] || nf
+    echo stopped >"$od/$id.status"
+    exit 0
+    ;;
+  logs)
+    id="${!#}"
+    [ -f "$od/$id.status" ] || nf
+    script="$(cat "$od/$id.script")"
+    count="$(printf '%s' "$script" | sed -n 's/.*-lt \([0-9]*\) .*/\1/p' | head -1)"
+    batch="$(printf '%s' "$script" | sed -n 's/.*% \([0-9]*\)).*/\1/p' | head -1)"
+    ts=1700000000000000000
+    if [ "${STUB_MODE:-ok}" = badts ]; then echo "stdout TS %N"; else echo "stdout TS $ts"; fi
+    k=1
+    while [ "$k" -le $((count / batch)) ]; do
+      ts=$((ts + k * 100 * batch))
+      echo "stdout TS $ts"
+      k=$((k + 1))
+    done
+    if [ "${STUB_MODE:-ok}" = shortcount ]; then echo "stdout FILES_CREATED=$((count - 1))"; else echo "stdout FILES_CREATED=$count"; fi
+    echo "stdout DONE"
+    exit 0
+    ;;
+  inspect)
+    id="$2"
+    [ -f "$od/$id.status" ] || nf
+    ec=0
+    [ "${STUB_MODE:-ok}" = nonzero ] && ec=3
+    printf '{"id":"%s","status":"%s","pid":null,"exitCode":%s}\n' "$id" "$(cat "$od/$id.status")" "$ec"
+    exit 0
+    ;;
+  delete)
+    id="$2"
+    [ -f "$od/$id.status" ] || nf
+    [ "${STUB_MODE:-ok}" = slow ] && sleep 0.1
+    [ "${STUB_MODE:-ok}" = stuck ] || rm -f "$od/$id".*
+    exit 0
+    ;;
+esac
+exit 0
+STUB
+chmod 755 "${STUB_DIR}/fandhe"
+FANDHE="${STUB_DIR}/fandhe"
+
 reset_stub() {
   : >"${STUB_DIR}/calls"
   : >"${STUB_DIR}/ps"
   rm -f "${STUB_DIR}/n"
+  rm -rf "${STUB_DIR}/own"
+  mkdir -p "${STUB_DIR}/own"
   export STUB_MODE="${1:-ok}"
 }
 
@@ -334,13 +438,132 @@ check "cleanup failure: result file is not published" test ! -e "${TMP}/stuck.js
 runit --mode docker --runtime "$DOCKER" --host-dir "$HOST"
 check "cleanup failure: nothing on stdout" empty_file "${TMP}/out"
 
-# --- own は未実装 ---
+# --- own（自前 CLI の契約で計測する。#3106）---
+SHARED="${TMP}/shared"
+BUNDLE="${SHARED}/bundle"
+OWNHOST="${SHARED}/work"
+mkdir -p "${BUNDLE}/rootfs" "$OWNHOST"
+IMGID="sha256:$(printf 'a%.0s' $(seq 1 64))"
+runown() {
+  runit --mode own --runtime "$FANDHE" --shared-root "$SHARED" --host-dir "$OWNHOST" --bundle "$BUNDLE" --image-id "$IMGID" "$@"
+}
+own_left() { find "${STUB_DIR}/own" -type f | grep -c . || true; }
+own_clean() { [ ! -e "${BUNDLE}/config.json" ] && dir_empty "$OWNHOST" && [ "$(own_left)" -eq 0 ]; }
+
+# 入力エラー（副作用の前。CLI の呼び出し 0 回・終了コード 2）
 reset_stub ok
-runit --mode own --runtime "$DOCKER" --host-dir "$HOST" --output "${TMP}/own-out.json"
-check "own exits 5" rc_is 5
-check "own reports code=unimplemented" err_has 'code=unimplemented'
-if [ ! -e "${TMP}/own-out.json" ]; then pass "own creates no output file"; else fail "own creates no output file"; fi
-check "own makes no docker call" empty_file "${STUB_DIR}/calls"
+mkdir -p "${TMP}/outside" "${BUNDLE}/sub" "${SHARED}/outer/b/rootfs"
+runown --host-dir "${TMP}/outside"
+check "own: --host-dir outside --shared-root is rejected with 2" rc_is 2
+runit --mode own --runtime "$FANDHE" --shared-root "$SHARED" --host-dir "$OWNHOST" --bundle "${TMP}/outside" --image-id "$IMGID"
+check "own: --bundle outside --shared-root is rejected with 2" rc_is 2
+runown --host-dir "${BUNDLE}/sub"
+check "own: --host-dir inside --bundle is rejected with 2" rc_is 2
+runit --mode own --runtime "$FANDHE" --shared-root "$SHARED" --host-dir "${SHARED}/outer" --bundle "${SHARED}/outer/b" --image-id "$IMGID"
+check "own: --bundle inside --host-dir is rejected with 2" rc_is 2
+runit --mode own --runtime "$FANDHE" --shared-root "$SHARED" --host-dir "$SHARED" --bundle "$BUNDLE" --image-id "$IMGID"
+check "own: --host-dir equal to --shared-root is rejected with 2" rc_is 2
+: >"${BUNDLE}/config.json"
+runown
+check "own: an existing bundle config.json is rejected with 2" rc_is 2
+check "own: the existing config.json is left untouched" test -e "${BUNDLE}/config.json"
+rm -f "${BUNDLE}/config.json"
+runown --image-id "sha256:abc"
+check "own: a short --image-id is rejected with 2" rc_is 2
+runown --image-id "abc"
+check "own: an --image-id without sha256: is rejected with 2" rc_is 2
+ln -s "$SHARED" "${TMP}/shared-link"
+runit --mode own --runtime "$FANDHE" --shared-root "${TMP}/shared-link" --host-dir "$OWNHOST" --bundle "$BUNDLE" --image-id "$IMGID"
+check "own: a symlinked --shared-root is rejected with 2" rc_is 2
+runit --mode own --runtime "$FANDHE" --host-dir "$OWNHOST" --bundle "$BUNDLE" --image-id "$IMGID"
+check "own: missing --shared-root is rejected with 2" rc_is 2
+runown --own-result "${TMP}/x.json"
+check "own: --own-result is rejected with 2" rc_is 2
+runit --mode docker --runtime "$DOCKER" --host-dir "$HOST" --shared-root "$SHARED"
+check "docker: --shared-root is rejected with 2" rc_is 2
+check "own: no CLI call happened on input errors" empty_file "${STUB_DIR}/calls"
+
+# 正常系: 呼び出しの列・集計の具体値・後始末
+reset_stub ok
+runown --label ownstub --output "${TMP}/own-res.json"
+if [ "$rc" -ne 0 ]; then cat "${TMP}/err"; fi
+check "own: ok run exits 0" rc_is 0
+check "own: create passes --bundle and the exact run label" calls_has '^create --bundle .* --label fandhe.mac-small-files.run=[0-9a-f]\{16\} fms-[0-9a-f]\{16\}-1$'
+check "own: 5 trials plus 1 probe each create, start and delete once" test "$(calls_count 'create ')" -eq 6 -a "$(calls_count 'start ')" -eq 6 -a "$(calls_count 'delete ')" -eq 6
+check "own: logs are read with --stream stdout" calls_has '^logs --stream stdout fms-'
+check "own: no --root is passed" test "$(grep -c -- '--root' "${STUB_DIR}/calls" || true)" -eq 0
+check "own: result schema, target, mode and declared image id" jq_ok '.schema == "fandhe-container.mac-small-files/v1" and .target == "own" and .mode == "own" and .label == "ownstub" and .mount_kind == "bind" and .trials_ok == 5 and .image_id == "'"$IMGID"'" and .image_id_source == "declared" and .shared_root_checked == true and .backend_version == "unknown" and (.samples | length) == 5' "${TMP}/own-res.json"
+check "own: metric methods" jq_ok '.metrics.wall_clock_median_ms.method == "cli-create-start-wait-delete-total" and .metrics.metadata_p95_us.method == "batch-boundary-provisional" and .metrics.metadata_p95_us.value == 9.5 and .metrics.wall_clock_median_ms.value > 0' "${TMP}/own-res.json"
+check "own: samples carry the stage breakdown and 2 state polls" jq_ok 'all(.samples[]; .state_polls == 2 and .create_us >= 0 and .start_us >= 0 and .wait_us >= 0 and .delete_us >= 0 and .wall_us > 0 and .interval_ns_per_op_p95 == 9500)' "${TMP}/own-res.json"
+check "own: workload fields match the docker side" jq_ok '.workload.count == 2000 and .workload.batch == 20 and .workload.file_bytes == 2' "${TMP}/own-res.json"
+check "own: no pass/fail key in the result" no_verdict_key "${TMP}/own-res.json"
+if ! grep -q "$TMP" "${TMP}/own-res.json"; then pass "own: result has no absolute path"; else fail "own: result has no absolute path"; fi
+check "own: config.json, work directories and containers are all removed" own_clean
+
+# 失敗の検出
+reset_stub failcreate
+runown --output "${TMP}/own-fail.json"
+check "own: a CLI failure exits 1" rc_is 1
+check "own: the CLI error code is reported" err_has 'cli code=UNIMPLEMENTED'
+if ! grep -q 'secret' "${TMP}/err" && ! grep -q "$TMP" "${TMP}/err"; then pass "own: the CLI message and paths are not echoed"; else fail "own: the CLI message and paths are not echoed"; fi
+check "own: a failed run publishes no result" test ! -e "${TMP}/own-fail.json"
+check "own: a failed run leaves no config.json behind" test ! -e "${BUNDLE}/config.json"
+reset_stub nonzero
+runown
+check "own: a non-zero container exit code exits 1" rc_is 1
+check "own: the exit code failure is reported" err_has 'did not exit with code 0'
+reset_stub shortcount
+runown
+check "own: file count mismatch exits 1" rc_is 1
+check "own: count mismatch is reported" err_has 'file count mismatch'
+reset_stub badts
+runown
+check "own: unexpanded timestamps exit 1" rc_is 1
+reset_stub nobind
+runown
+check "own: bind not effective exits 1" rc_is 1
+check "own: bind failure is reported" err_has 'bind mount is not effective'
+check "own: bind failure leaves nothing behind" own_clean
+
+# 期限と後始末
+reset_stub hang
+start=$SECONDS
+runown --trial-timeout-secs 1
+elapsed=$((SECONDS - start))
+check "own: a hung start exits 1" rc_is 1
+check "own: a hung start is reported as a deadline" err_has 'deadline'
+if [ "$elapsed" -lt 60 ]; then pass "own: hung start returns within the bound (took ${elapsed}s)"; else fail "own: hung start returns within the bound (took ${elapsed}s)"; fi
+check "own: a hung run is reaped (kill then delete) and nothing remains" own_clean
+reset_stub stuck
+runown --output "${TMP}/own-stuck.json"
+check "own: containers that cannot be removed exit 4" rc_is 4
+check "own: cleanup-failed is reported" err_has 'code=cleanup-failed'
+check "own: cleanup failure publishes no result" test ! -e "${TMP}/own-stuck.json"
+check "own: cleanup failure still removes config.json" test ! -e "${BUNDLE}/config.json"
+rm -rf "${STUB_DIR}/own"
+mkdir -p "${STUB_DIR}/own"
+
+# 区間は呼び出しの前後を挟む（スタブの create が 0.2 秒・delete が 0.1 秒）
+reset_stub slow
+runown --output "${TMP}/own-slow.json"
+check "own: slow run exits 0" rc_is 0
+check "own: each wall clock spans create and delete (>= 0.3s)" jq_ok 'all(.samples[]; .wall_us >= 300000 and .wall_us < 30000000)' "${TMP}/own-slow.json"
+
+# own の結果を report に通す（docker の結果と組む）
+reset_stub ok
+runit --mode docker --runtime "$DOCKER" --host-dir "$HOST" --output "${TMP}/own-dres.json"
+check "own report: docker baseline run exits 0" rc_is 0
+reset_stub ok
+runown --output "${TMP}/own-ores.json"
+check "own report: own run exits 0" rc_is 0
+runit --mode report --own-result "${TMP}/own-ores.json" --baseline-result "${TMP}/own-dres.json"
+check "own report: provisional pair gives numeric ratios" jq_ok '.wall_clock_method_match == "provisional-pair" and (.wall_clock_reduction_ratio | type) == "number" and .metadata_p95_reduction_ratio == 0 and .methods_differ == false' "${TMP}/out"
+jq '.metrics.wall_clock_median_ms.method = "something-else"' "${TMP}/own-ores.json" >"${TMP}/own-ores-bad.json"
+runit --mode report --own-result "${TMP}/own-ores-bad.json" --baseline-result "${TMP}/own-dres.json"
+check "own report: a method outside the pair table gives null and methods_differ" jq_ok '.wall_clock_method_match == null and .wall_clock_reduction_ratio == null and .methods_differ == true' "${TMP}/out"
+jq ".image_id = \"sha256:$(printf 'b%.0s' $(seq 1 64))\"" "${TMP}/own-ores.json" >"${TMP}/own-ores-id.json"
+runit --mode report --own-result "${TMP}/own-ores-id.json" --baseline-result "${TMP}/own-dres.json"
+check "own report: a different declared image id gives null ratios" jq_ok '.wall_clock_reduction_ratio == null and .metadata_p95_reduction_ratio == null' "${TMP}/out"
 
 # --- report ---
 # mkres <target> <wall_ms> <p95_us> [method] [count] [image_id]
@@ -454,7 +677,7 @@ check "each wall clock spans the run (>= 0.3s) and stays far below the deadline"
 banned="EPOCH""REALTIME|EPOCH""SECONDS|BASH""PID|map""file|read""array|declare -""A|declare -""g|local -""n|co""proc|wait -""n"
 banned="${banned}|"'[$]\{[A-Za-z_]*,,\}|[$]\{[A-Za-z_]*\^\^\}|[|]&|;;'"&"
 scan_ok=1
-for f in "$SCRIPT" "${SELF_DIR}/mac_small_files_selftest.sh" "${SELF_DIR}/../targets/mac-small-files-docker.sh" "${SELF_DIR}/../targets/mac-small-files-report.sh"; do
+for f in "$SCRIPT" "${SELF_DIR}/mac_small_files_selftest.sh" "${SELF_DIR}/../targets/mac-small-files-docker.sh" "${SELF_DIR}/../targets/mac-small-files-report.sh" "${SELF_DIR}/../targets/mac-small-files-own.sh"; do
   if grep -n -E -- "$banned" "$f" | grep -v '^[0-9]*:[[:space:]]*#' | grep -q .; then
     echo "bash 4+ construct found in $f"
     scan_ok=0

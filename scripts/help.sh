@@ -205,6 +205,8 @@ cat <<'EOF'
                                         bind / named volume の 2 構成で small_files を回し JSON で出力する（実機前提。BIND_ROOT・VOLUME_ROOT 必須。IO-7・TASK-24.1）
   mac-small-files-docker              scripts/targets/mac-small-files-docker.sh
                                         Docker Desktop 側の小ファイル多数ワークロードを計測する（実機前提。DOCKER=<絶対パス> HOST_DIR=<絶対パス> 必須。MAC-3・#1880）
+  mac-small-files-own                 scripts/targets/mac-small-files-own.sh
+                                        自前側の小ファイル多数ワークロードを計測する（実機前提。FANDHE・SHARED_ROOT・HOST_DIR・BUNDLE・IMAGE_ID 必須。MAC-3・#3106）
   mac-small-files-report              scripts/targets/mac-small-files-report.sh
                                         own と Docker Desktop の小ファイル多数の結果を統合する（OWN_RESULT=<file> BASELINE_RESULT=<file> 必須。合否は出さない。MAC-3・#1880）
   dns-helper-measure                  scripts/targets/dns-helper-measure.sh

@@ -38,7 +38,7 @@ SHELL := /bin/bash
 	supervisor-independence-selftest restart-latency-selftest install-launcher-selftest crictl-smoke-selftest docker-hub-ratelimit-probe-selftest repeat-test repeat-test-selftest run-in-user-scope-selftest run-with-deadline-selftest test-bin-watchdog-selftest check-success-lines-selftest deny deny-poc-venus-jig \
 	third-party-licenses install-cargo-about ci bench-check bench-check-manual bench-baseline-manual bench-plugin-boundary \
 	bench-macos-cold-start bench-baseline cli-parity fio-bench fio-baseline-ratio startup-latency \
-	startup-latency-docker startup-latency-report net-setup-timing net-throughput-rtt net-throughput-rtt-compare small-files-compare mac-small-files-docker mac-small-files-report dns-helper-measure idle-memory \
+	startup-latency-docker startup-latency-report net-setup-timing net-throughput-rtt net-throughput-rtt-compare small-files-compare mac-small-files-docker mac-small-files-own mac-small-files-report dns-helper-measure idle-memory \
 	idle-memory-supervised supervisor-pss concurrent-memory concurrent-memory-docker \
 	concurrent-memory-report supervisor-independence restart-latency crictl-smoke docker-hub-ratelimit-probe docker-build docker-shell \
 	docker-ci
@@ -357,6 +357,9 @@ net-throughput-rtt-compare: ## 2 つの計測結果から Docker 比（%）と p
 
 mac-small-files-docker: ## Docker Desktop 側の小ファイル多数ワークロードを計測する（実機前提。DOCKER=<絶対パス> HOST_DIR=<絶対パス> 必須。MAC-3・TASK-70 準備・#1880）
 	@scripts/targets/mac-small-files-docker.sh
+
+mac-small-files-own: ## 自前側の小ファイル多数ワークロードを計測する（実機前提。FANDHE・SHARED_ROOT・HOST_DIR・BUNDLE・IMAGE_ID 必須。MAC-3・#3106）
+	@scripts/targets/mac-small-files-own.sh
 
 mac-small-files-report: ## own と Docker Desktop の小ファイル多数の結果を統合する（OWN_RESULT=<file> BASELINE_RESULT=<file> 必須。合否は出さない。MAC-3・#1880）
 	@scripts/targets/mac-small-files-report.sh

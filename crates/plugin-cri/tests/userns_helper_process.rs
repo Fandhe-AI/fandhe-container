@@ -27,6 +27,9 @@ use fandhe_container_plugin_cri::userns_helper::{
     USERNS_HELPER_ARG, UsernsHelperLauncher, WorkBudget,
 };
 
+#[path = "../../core/tests/support/reap.rs"]
+mod reap;
+
 const BIN: &str = env!("CARGO_BIN_EXE_fandhe-container-plugin-cri");
 
 fn budget() -> WorkBudget {
@@ -63,7 +66,7 @@ impl Drop for Scratch {
 }
 
 /// 実バイナリを生の socket で起動する（stdin = socket の片端、stdout = `target`）。
-fn spawn_raw(target: OwnedFd) -> (Child, UnixStream) {
+fn spawn_raw(target: OwnedFd) -> (ChildGuard, UnixStream) {
     let (parent, child_end) = UnixStream::pair().expect("pair");
     parent
         .set_read_timeout(Some(Duration::from_secs(20)))
@@ -77,7 +80,16 @@ fn spawn_raw(target: OwnedFd) -> (Child, UnixStream) {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn helper");
-    (child, parent)
+    (ChildGuard(child), parent)
+}
+
+/// panic・期限切れでも子を kill して回収するガード（REPAIR-5）。
+struct ChildGuard(Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        reap::reap_or_report(&mut self.0, reap::reap_within());
+    }
 }
 
 fn read_response(sock: &mut UnixStream) -> Option<Result<Report, HelperErrorCode>> {
@@ -86,8 +98,9 @@ fn read_response(sock: &mut UnixStream) -> Option<Result<Report, HelperErrorCode
     decode_response(&buf)
 }
 
-fn finish(mut child: Child) -> i32 {
-    let status = child.wait().expect("wait");
+/// 期限つきで終了を待つ。期限切れは panic（子は Drop で回収）。
+fn finish(mut child: ChildGuard) -> i32 {
+    let status = reap::wait_within(&mut child.0, Duration::from_secs(30)).expect("helper exit");
     status.code().unwrap_or(-1)
 }
 
@@ -126,15 +139,17 @@ fn sec5_4795_stat_target_reports_the_passed_directory() {
 /// SEC-5・#4795: 隠し引数の後ろの余分な引数（パスの入力）は応答なしで終了コード 2。
 #[test]
 fn sec5_4795_extra_path_argument_is_rejected_with_exit_code_2() {
-    let status = Command::new(BIN)
-        .arg(USERNS_HELPER_ARG)
-        .arg("/tmp")
-        .env_clear()
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .expect("run");
+    let status = reap::run_within(
+        Command::new(BIN)
+            .arg(USERNS_HELPER_ARG)
+            .arg("/tmp")
+            .env_clear()
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+        Duration::from_secs(30),
+    )
+    .expect("run");
     assert_eq!(status.code(), Some(2));
 }
 

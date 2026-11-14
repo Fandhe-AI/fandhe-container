@@ -6,7 +6,8 @@
 //! `crates/plugin-cri/tests/image_ownership_fixture.rs`。両者が同じ本ファイルと fixture を読むので、
 //! 変換規則を片方だけ変えるとその crate の試験が落ちる。規則を変えるときは fixture と 2 か所の変換を同じ PR で直す。
 //! 入力は本番と同じ `SubordinateIdSource::with_id_files` → `resolve_id_maps` の経路に通す（passwd・NSS は通さない）。
-#![allow(dead_code)]
+#[path = "scratch_root.rs"]
+mod scratch_root;
 
 use fandhe_container_core::oci_runtime::SubordinateIdSource;
 use fandhe_container_core::traits::TraitError;
@@ -36,9 +37,9 @@ fn lines_of(s: &str) -> String {
 pub fn run(
     convert: impl Fn(&RootlessIdResolution, u32, u32, bool) -> Result<OwnershipPolicy, TraitError>,
 ) {
-    let dir = std::env::temp_dir().join(format!("fc-imgown-fx-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    // 排他作成・一意名・drop（panic の unwind を含む）で削除する。
+    let scratch = scratch_root::ScratchDir::new("fc-imgown-fx", std::time::Duration::from_secs(10));
+    let dir = scratch.path().to_path_buf();
     let (mut singles, mut subs, mut oks, mut errs) = (0, 0, 0, 0);
     for (n, line) in CASES.lines().enumerate() {
         if line.is_empty() || line.starts_with('#') {
@@ -90,7 +91,6 @@ pub fn run(
             errs += 1
         }
     }
-    let _ = std::fs::remove_dir_all(&dir);
     // 0 件・偏りで通ることを防ぐ。
     assert!(
         singles >= 3 && subs >= 10 && oks >= 5 && errs >= 6,

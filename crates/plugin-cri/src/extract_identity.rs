@@ -9,7 +9,7 @@
 //! 固定文言の `CriError` で失敗させる（fail-closed）。
 //!
 //! 対応表（[`extract_options_for`]）は現状どの行も `Keep` + `Strip` で、unpack-record の `settings` は従来と変わらない。
-//! 残りの配線（`ChownInUserNamespace`・subuid のずれの照合・`PreserveIfOwnerMapped`）は後続 issue で、
+//! subuid のずれの照合は cri 側で実装済み（#4799）。残りの配線（`ChownInUserNamespace`・`PreserveIfOwnerMapped`）は後続 issue で、
 //! 各 variant の doc に理由を書く。実装済みを装わない（REPAIR-3）。
 
 use fandhe_container_cri::error::CriError;
@@ -28,7 +28,7 @@ pub enum ExtractIdentity {
     RootlessSingleId,
     /// 非 root・subuid / subgid の範囲写像あり。本来の値は `ChownInUserNamespace` だが、tokio のマルチスレッドの
     /// プロセス内では user namespace に入れない（core の `MultiThreaded` 拒否）ため暫定で `Keep` + `Strip`
-    /// （後続 issue。pull 時と start 時の subuid のずれの照合も同時に足す）。
+    /// （後続 issue。subuid のずれの照合は cri の `match_recorded_settings` で実装済み・#4799。写像を持たせて配線するのは H6）。
     RootlessSubordinateIds,
     /// 権限モデルを解決できない OS（Linux 以外）。本番の経路には到達しないため `Keep` + `Strip`。
     Unsupported,

@@ -199,7 +199,7 @@ tar のコンテナ内 ID をそのまま `chown` する（namespace の中で�
   SubordinateIds の `ChownInUserNamespace` は tokio のマルチスレッドから user namespace に入れず未配線。
   `PreserveIfOwnerMapped` は cri の `open_rootfs_for_search` が展開後に rootfs を 0755 にするため oci の「root を 0700 に保つ」
   契約と両立せず、有効にしない。残り（後続 issue・要起票）: `ChownInUserNamespace`（再 exec する helper 等）・記録の符号化・
-  subuid 所有の木の削除・pull / start の subuid のずれの照合・`image_ownership` の置き場所・`PreserveIfOwnerMapped` の前提整合。
+  subuid 所有の木の削除・`image_ownership` の置き場所・`PreserveIfOwnerMapped` の前提整合。
   pull と create は `ImageExtractConfig` の 1 か所から同じ値を配る（食い違うと記録の照合で `FAILED_PRECONDITION`）。配線するときの確認事項: `ChownMapped` で展開した rootfs に、
   0700 の bundle 配下から写像先の uid で到達できること（core の launcher 側。SEC-5・CRI-2）の試験を同時に足す
 - `IdMap` と core の `IdMapSet` を下位 crate へ共通化するかどうか（crate 境界の判断）
@@ -262,7 +262,9 @@ pull 時と start 時の subuid / subgid のずれ（#2539・#2528 の事後監�
 依存する（rootfs の所有者は pull 時の `ExtractOptions` で決まる）。pull の後に subuid / subgid の割り当てが変わると、start 時の
 写像と展開済み rootfs の所有者が食い違う。検出は、公開済みエントリの展開設定の記録（`unpack-record` の設定行。
 `encode_extract_options` が id map の行を含む）を正とする。pull と create は `ImageExtractConfig` の 1 か所から同じ値を受け、
-食い違えば既存の `check_unpack_record` が `FAILED_PRECONDITION` で拒否する。start 時の写像（`image_ownership` の解決結果）と
-記録の照合の口は、`ChownMapped` / `ChownInUserNamespace` を本番へ配線するとき（#2592・#2377・#2241・#2315・#482）に足す。
-本番の値が現状 `Keep` + `Strip` で記録の写像が空のため、今は検出は効かない（実装済みを装わない。REPAIR-3）。
+食い違えば照合点 `match_recorded_settings`（pull の `check_unpack_record` と create の `read_layers` が共有）が
+`FAILED_PRECONDITION` で拒否する（#4799。`ownership=` 行の完全一致・固定文言・旧い `keep` の記録も拒否。試験は
+`sec5_match_recorded_settings_distinguishes_id_mapping_mismatch`・`oci1_sec5_pull_rejects_*`・
+`sec5_create_rejects_unpack_record_with_other_id_mapping`）。本番の値が現状 `Keep` + `Strip` で記録の写像が空のため、
+今は食い違いが起きない。`ChownInUserNamespace` の本番配線は H6（#4801。実装済みを装わない。REPAIR-3）。
 詳細は [pull-inventory-wiring.md](pull-inventory-wiring.md)。

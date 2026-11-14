@@ -330,11 +330,9 @@ fn read_layers(
     owner: u32,
 ) -> Result<Vec<RecordedLayer>, CriError> {
     let body = read_entry_record_body(entry, owner).map_err(CriError::from)?;
-    let Some(rest) = body.strip_prefix(expected_settings.as_bytes()) else {
-        return Err(untrusted(
-            "image rootfs cache entry was unpacked with different settings",
-        ));
-    };
+    // pull と同じ照合点。写像の食い違いは固定文言の FAILED_PRECONDITION（#4799）
+    let rest = crate::image_pull::match_recorded_settings(&body, expected_settings)
+        .map_err(CriError::from)?;
     let data_loss = || {
         CriError::new(
             crate::error::CriErrorCode::DataLoss,

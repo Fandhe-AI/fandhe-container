@@ -1581,7 +1581,47 @@ fn oci1_sec5_pull_rejects_rootfs_recorded_with_other_userns_mapping() {
     assert_eq!(err.code(), OciErrorCode::FailedPrecondition);
     assert_eq!(
         err.message(),
-        "image rootfs cache entry was unpacked with different settings"
+        "image rootfs cache entry was unpacked with a different id mapping"
+    );
+    assert_eq!(fs::read(&marker).expect("kept"), b"m");
+}
+
+/// OCI-1・SEC-5・#4799: 旧い展開（`ownership=keep` の記録）は、写像ありの設定での pull で照合対象外にせず拒否する。
+#[test]
+fn oci1_sec5_pull_rejects_keep_recorded_rootfs_when_mapping_is_expected() {
+    use fandhe_container_oci::layer::extract::{
+        IdMap, IdRange, OwnershipPolicy, SpecialBitsPolicy,
+    };
+    let dir = TempDir::new("keep-vs-map");
+    OciImagePuller::new(
+        Arc::new(FakeClient::new(two_layer_manifest())),
+        config(&dir),
+    )
+    .pull(&req("alpine:3.20"))
+    .expect("first");
+    let marker = rootfs_path(&dir, SHA_CONFIG).join("marker");
+    fs::write(&marker, b"m").expect("marker");
+    let map = IdMap::new(vec![IdRange {
+        container_id: 0,
+        host_id: 100_000,
+        count: 65_536,
+    }])
+    .expect("map");
+    let mut mapped = config(&dir);
+    mapped.extract_options = mapped
+        .extract_options
+        .with_ownership(OwnershipPolicy::ChownInUserNamespace {
+            uid: map.clone(),
+            gid: map,
+        })
+        .with_special_bits(SpecialBitsPolicy::PreserveIfChowned);
+    let err = OciImagePuller::new(Arc::new(FakeClient::new(two_layer_manifest())), mapped)
+        .pull(&req("alpine:3.20"))
+        .expect_err("keep record vs mapping");
+    assert_eq!(err.code(), OciErrorCode::FailedPrecondition);
+    assert_eq!(
+        err.message(),
+        "image rootfs cache entry was unpacked with a different id mapping"
     );
     assert_eq!(fs::read(&marker).expect("kept"), b"m");
 }

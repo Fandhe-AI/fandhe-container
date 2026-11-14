@@ -18,7 +18,7 @@ core が定義する `ContainerImageRefs`・`ImageRootfsUnpacker` を満たす�
 | 部品 | 場所 | 役割 |
 | ---- | ---- | ---- |
 | `StoreImageRefs` | `crates/cli/src/commands/image_refs.rs` | `ContainerImageRefs` の本番アダプタ（oci の `ImageStore` ↔ core のトレイト） |
-| 所有者解決の変換 | `crates/cli/src/image_ownership.rs` | #2389・#2528 の変換部品 |
+| 所有者解決の変換 | `crates/cli/src/image_ownership.rs` | #2389・#2528 の変換部品。plugin-cri にも同じ変換の複製（`crates/plugin-cri/src/image_ownership.rs`）を置き、共有 fixture `crates/core/testdata/image_ownership_cases.txt` で一致を照合する（#4798・#4777） |
 | probe の橋渡し | `crates/cli/src/commands/ref_reconcile.rs` | `StateStore::get` を照合の probe へ写す |
 
 判断を待つ後続:

@@ -46,6 +46,8 @@ pub mod extract_identity;
 mod flock_release;
 #[cfg(unix)]
 pub mod image_inventory;
+#[cfg(target_os = "linux")]
+pub mod image_ownership;
 #[cfg(unix)]
 pub(crate) mod image_refs;
 pub mod instance_lock;

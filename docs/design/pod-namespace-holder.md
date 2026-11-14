@@ -151,7 +151,7 @@
 - DoS: 子の一覧は上限つき。READY の受信・解放の待ちはすべて期限つきで、超過したら SIGKILL して回収する（REPAIR-5）
 - 後始末: Run の途中で失敗したら保持役・ネットワークの資源を逆順に戻し、戻せなければ記録を残して Stop・Remove で再試行する
 - エラー文言は固定文言にし、パス・pid・config の値を含めない（REPAIR-4）
-- rootful（uid 0）は #2241 の判断まで `UNIMPLEMENTED`。init userns 所有の netns への join は受けない
+- rootful（uid 0）は #2241 の判断まで `UNIMPLEMENTED`。init userns 所有の netns への join は受けない（保持役を使うかの決定は下の「rootful の扱い」・#4708）
 - 依存は追加しない。追加が必要と分かったら承認事項として報告する
 
 ## オーナー判断（2026-11-09）
@@ -178,6 +178,36 @@
 - 保持役自身が READY の前に `PR_GET_DUMPABLE == 0` を確かめる（fail-closed）
 - 守れないもの: 親 namespace の同じ uid からの ptrace は non-dumpable でも防げない（設計上の前提）。exec から `PR_SET_DUMPABLE 0` までの短い窓があるが、その間の保持役は秘密を持たない（env は空、argv は namespace の番号だけ）
 - 実行記録: ローカル（Linux 7.0.0-34-generic、`kernel.apparmor_restrict_unprivileged_userns=1`、subuid の範囲写像）で 6 シナリオが通った。ubuntu CI の `--ignored` での確認は H3（#2875）で CI に組み込んだ後に行う（それまで CI での確定は未了）
+
+## rootful の扱い（オーナー判断 2026-11-13・#4708・CRI-6・NET-3・SEC-5・CORE-3）
+
+2026-11-13 に #4708 の判断事項 1〜3 がオーナー承認で決着した。以下の (a)〜(d) はコードと文書からの読みで、実機では未確認。
+
+### 決定
+
+1. uid 0 の plugin-cri では保持役 `ProductionPodHolder` を使わない。特権ランチャー経由の非 root の plugin-cri での注入は変えない
+2. POD の PortForward は `UNIMPLEMENTED` のまま持ち越す。恒久的な拒否ではない。host の loopback へは縮退しない
+3. netns-dial helper は変えない（[cri-streaming-server.md](cri-streaming-server.md) の「オーナー判断（2026-11-13・#4708）」）
+4. 実装 issue は起票しない
+
+根拠: rootful の CRI コンテナはまだ起動できず、保持役を使う構成を今設計しても確かめる手段が無い。
+
+判断し直す条件: rootful（uid 0 の plugin-cri、または特権ランチャー経由）の CRI コンテナを起動する経路を設計するとき。
+
+### 読みで確かめた前提（実機では未確認）
+
+- (a) 注入は real / effective のどちらかの uid が 0 と確定しないときだけ（plugin-cri の `adapter.rs` の `pod_holder_injection_enabled`、`pod_holder.rs` の `should_inject_pod_holder`・`current_euid`）。特権ランチャー経由の非 root の plugin-cri では今も注入される。決定文の「実効 uid」より判定は広く、real uid が 0 でも注入しない（決定の趣旨とは矛盾しない。Agent が読みで補った記述でオーナー承認の文言ではない）
+- (b) その構成では pod の user namespace の owner と netns-dial helper の euid が同じになり、参加後に dumpable が戻る条件に当たらない見込み（推論。コードでは直接確認できない）
+- (c) ambient capability を持つ supervisor は CRI ログの書き込みを `UNIMPLEMENTED` で拒否する（`crates/supervisor/src/logs/cri.rs` の `deny_elevated_capabilities`、[cri-config-acceptance.md](cri-config-acceptance.md)）。`log_path` を渡す通常の kubelet ではコンテナが起動しない
+- (d) uid のどれかが 0 の start は `privilege_gate`（`crates/supervisor/src/start_client.rs`）が `UNIMPLEMENTED` で拒否し、provider（`pod_holder.rs` の `rootful_guard`）も uid 0 を `Unimplemented` で拒否する
+
+### 持ち越し: F3 と root 専用 `#[ignore]` 試験
+
+- F3: rootful で `ChownMapped` を使う場合の bundle の所有者の条件（PR #4759 の対象外）
+- 試験: `crates/oci/tests/layer_extract.rs` に足す予定だった root 専用の `#[ignore]` 試験（0700 の bundle 配下から写像先 uid で `ChownMapped` の rootfs に到達できるか。`real-machine-tests.md`・`AGENTS.md` への追記を含む）。現時点で未実装（既存の `sec5_chown_subuid_range_as_root` とは別物）
+- 持ち越し理由: `ChownMapped` の本番の消費者が無く（#2241 D1:A）、試験は root 実行が要る
+- 判断し直す条件: `ChownMapped` の本番の消費者（rootful の CRI コンテナ起動経路）ができたとき。F3 の条件の整理と試験の追加を同時に行う
+- 関連: [oci-layer-special-bits.md](oci-layer-special-bits.md) の「未実装」の「配線するときの確認事項」
 
 ## 実装の現況（H6・#2877）
 

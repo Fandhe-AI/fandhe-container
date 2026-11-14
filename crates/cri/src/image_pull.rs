@@ -108,7 +108,7 @@
 //!     無く（#2241 D1:A）、SingleId は `Keep` が正しく、特殊ビットは `open_rootfs_for_search` の 0755 化が
 //!     `PreserveIfOwnerMapped` の 0700 契約と両立しない間は保持しない。範囲写像（SubordinateIds）の本来の値
 //!     `ChownInUserNamespace` は tokio のマルチスレッドのプロセス内では user namespace に入れず（core の
-//!     `MultiThreaded` 拒否）、記録の符号化も受けないため未配線（後続 issue・要起票）。pull 時と start 時の subuid の
+//!     `MultiThreaded` 拒否）未配線。記録の符号化は済み（#4796・H2）で、残りは helper（H1）・対応表の切り替え（H6）。pull 時と start 時の subuid の
 //!     ずれの照合も `ChownInUserNamespace` と同時に足す（`Keep` では所有者が subuid に依らず検出対象が無い）。
 //!     所有者の写像の変換部品 `image_ownership`（#2389）は cli crate にあり、置き場所の判断は未取得（依存辺が増えない形を採用）。
 //!     pull と create は [`crate::bundle::ImageExtractConfig`] の 1 か所から同じ値を配る（食い違うと記録の照合で
@@ -547,7 +547,7 @@ pub struct PullConfig {
     pub extract_limits: ExtractLimits,
     /// レイヤー展開の所有者・特殊ビットの選択肢。既定は `chown` しない（`Keep`）・特殊ビットは落とす（`Strip`）。
     /// 値は呼び出し元が決める。本番（plugin-cri）は start と同じ権限モデルの解決から選び（#2792）、現状はどの権限モデルでも
-    /// 既定のまま（`ChownInUserNamespace` 等は後続。モジュール doc「未実装範囲」と
+    /// 既定のまま（`ChownInUserNamespace` の対応表への配線は後続 #4777 の H6。モジュール doc「未実装範囲」と
     /// `docs/design/oci-layer-special-bits.md`。#2534・SEC-5・SEC-1）。
     pub extract_options: ExtractOptions,
 }
@@ -1473,6 +1473,7 @@ enum RecordMatch {
 }
 
 /// `ExtractOptions` を固定書式で符号化する。`Debug` 出力は書式が安定しないため使わない（記録の互換性を保つ）。
+/// 所有者の語は `keep` / `chown-mapped` / `chown-in-userns`（既存の語は変えない）。
 /// 未知の選択肢（将来追加された variant）は黙って同一視せず `Unimplemented` で拒否する（fail-closed）。
 pub(crate) fn encode_extract_options(options: &ExtractOptions) -> Result<String, PullError> {
     use fandhe_container_oci::layer::extract::{IdRange, SpecialBitsPolicy};
@@ -1493,6 +1494,14 @@ pub(crate) fn encode_extract_options(options: &ExtractOptions) -> Result<String,
         OwnershipPolicy::ChownMapped { uid, gid } => {
             format!(
                 "chown-mapped uid={} gid={}",
+                map_lines(uid.lines()),
+                map_lines(gid.lines())
+            )
+        }
+        // 範囲写像の user namespace 内で展開する方式（SEC-5・#4796）。語を `chown-mapped` と分け、前方一致の照合で衝突させない
+        OwnershipPolicy::ChownInUserNamespace { uid, gid } => {
+            format!(
+                "chown-in-userns uid={} gid={}",
                 map_lines(uid.lines()),
                 map_lines(gid.lines())
             )
@@ -2215,6 +2224,55 @@ mod tests {
         assert_eq!(
             display_name(other.registry(), other.repository()),
             "registry.example.com:5000/team/app"
+        );
+    }
+
+    /// OCI-1・SEC-5・#4796: `ChownInUserNamespace` + `PreserveIfChowned` は固定書式で符号化され、`ChownMapped` と別の語になる。
+    #[test]
+    fn oci1_sec5_encode_chown_in_userns_is_fixed_and_distinct_from_chown_mapped() {
+        use fandhe_container_oci::layer::extract::{IdMap, IdRange, SpecialBitsPolicy};
+        let map = |host: u32| {
+            IdMap::new(vec![
+                IdRange {
+                    container_id: 0,
+                    host_id: host,
+                    count: 1,
+                },
+                IdRange {
+                    container_id: 1,
+                    host_id: host + 1,
+                    count: 65_535,
+                },
+            ])
+            .expect("map")
+        };
+        let (uid, gid) = (map(100_000), map(100_000));
+        let userns = ExtractOptions::new()
+            .with_ownership(OwnershipPolicy::ChownInUserNamespace {
+                uid: uid.clone(),
+                gid: gid.clone(),
+            })
+            .with_special_bits(SpecialBitsPolicy::PreserveIfChowned);
+        let encoded = encode_extract_options(&userns).expect("encode");
+        assert_eq!(
+            encoded,
+            "ownership=chown-in-userns uid=0:100000:1,1:100001:65535 gid=0:100000:1,1:100001:65535\nspecial-bits=preserve-if-chowned\n"
+        );
+        let mapped = ExtractOptions::new()
+            .with_ownership(OwnershipPolicy::ChownMapped { uid, gid })
+            .with_special_bits(SpecialBitsPolicy::PreserveIfChowned);
+        assert_ne!(encoded, encode_extract_options(&mapped).expect("mapped"));
+        let other = ExtractOptions::new()
+            .with_ownership(OwnershipPolicy::ChownInUserNamespace {
+                uid: map(200_000),
+                gid: map(100_000),
+            })
+            .with_special_bits(SpecialBitsPolicy::PreserveIfChowned);
+        assert_ne!(encoded, encode_extract_options(&other).expect("other"));
+        let keep = ExtractOptions::new().with_special_bits(SpecialBitsPolicy::PreserveIfChowned);
+        assert_eq!(
+            encode_extract_options(&keep).expect("keep"),
+            "ownership=keep\nspecial-bits=preserve-if-chowned\n"
         );
     }
 

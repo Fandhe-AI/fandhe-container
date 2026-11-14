@@ -65,7 +65,8 @@
 //! - **展開設定**: 所有者・特殊ビットの本番の値は plugin-cri が start と同じ権限モデルの解決から選ぶ（#2792）が、
 //!   現状はどの権限モデルでも既定の `Keep` + `Strip`。特殊ビットを保持する `PreserveIfOwnerMapped` は、展開後に
 //!   `open_rootfs_for_search` が rootfs を 0755 にするため「root を使い終わるまで 0700 に保つ」契約と両立せず保持しない。
-//!   `ChownInUserNamespace` は後続 issue（#2534・SEC-5。`docs/design/oci-layer-special-bits.md`）。pull と create の設定は
+//!   `ChownInUserNamespace` は記録の符号化が済み（#4796）、helper の配線は #4777 の H1・H6
+//!   （#2534・SEC-5。`docs/design/oci-layer-special-bits.md`）。pull と create の設定は
 //!   [`ImageExtractConfig`] で 1 か所にまとめる
 //! - 展開は `extract_image_layers_bounded_in` でエントリ単位に期限（この `prepare` の開始からの `deadline`）と取り消しの
 //!   旗（`prepare_cancellable`）を確かめ、超過・取り消しは `Timeout`（`DEADLINE_EXCEEDED`）で止めて rootfs を消す
@@ -329,11 +330,9 @@ fn read_layers(
     owner: u32,
 ) -> Result<Vec<RecordedLayer>, CriError> {
     let body = read_entry_record_body(entry, owner).map_err(CriError::from)?;
-    let Some(rest) = body.strip_prefix(expected_settings.as_bytes()) else {
-        return Err(untrusted(
-            "image rootfs cache entry was unpacked with different settings",
-        ));
-    };
+    // pull と同じ照合点。写像の食い違いは固定文言の FAILED_PRECONDITION（#4799）
+    let rest = crate::image_pull::match_recorded_settings(&body, expected_settings)
+        .map_err(CriError::from)?;
     let data_loss = || {
         CriError::new(
             crate::error::CriErrorCode::DataLoss,

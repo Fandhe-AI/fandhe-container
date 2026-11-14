@@ -46,8 +46,26 @@ PR #2520（#2380）で manifest の在庫・タグ・pull リースを `@image-i
 ## subuid / subgid のずれ（#2528 の事後監査 P3）
 
 展開時の所有者写像の記録（`unpack-record`）で検出する方針。pull と create は同じ `ImageExtractConfig` から値を受け、食い違えば
-`FAILED_PRECONDITION`。start 時の写像との照合は、`ChownMapped` 等の本番配線時に足す。本番の値が `Keep` + `Strip` の間は写像が空で
-検出は効かない。詳細は [oci-layer-special-bits.md](oci-layer-special-bits.md) の末尾。
+`FAILED_PRECONDITION`。照合は #4799（SEC-5・OCI-1・CRI-3）で実装済み。照合点は 1 つ（`image_pull::match_recorded_settings`）で、
+pull の再利用判定（`check_unpack_record`）と create の `read_layers` が共有する。`ownership=` 行（方式の語と id map の全行）が
+完全一致しなければ、縮退も再展開もせず固定文言（値を含めない）で拒否する。
+
+| 食い違い | 文言（`FAILED_PRECONDITION`） |
+| -------- | ----------------------------- |
+| `ownership=` 行（写像・方式の語・`keep` との差） | `image rootfs cache entry was unpacked with a different id mapping` |
+| 特殊ビット・config・書式ヘッダ | `image rootfs cache entry was unpacked with different settings` |
+| 記録ファイルが無い | `image rootfs cache entry has no unpack record` |
+
+- 旧い展開の扱い: 照合対象外にせず拒否する（fail-closed）。`ownership=keep` の記録は写像ありの期待に対し id mapping の文言で、
+  旧い書式ヘッダは different settings の文言で拒否される。現在の本番キャッシュはすべて `keep` だが、本番の値も `Keep` の間は一致して通る
+- 利用者の対処: 食い違った展開物（`<image-root>/rootfs/sha256/<config-hex>`）は消されない。展開済み rootfs の GC は未実装
+  （#471・#2315）で `image rm` でも消えないため、再 pull では直らない。手動削除は subuid 所有の木のため user namespace の中で行う
+  必要があり、手順は subuid 所有の木の削除（H3・#4800）の後に整備する
+- 残余: plugin-cri は権限モデルの解決結果をプロセス内で保持する（`extract_options()`）。稼働中に `/etc/subuid` が変わっても再起動までは
+  create の写像が変わらず、start の launcher が読む最新の写像との差は検出されない。再起動後は記録と照合される。create ごとの再解決に
+  するかは、写像を持たせる H6（#4801）で判断する
+- 本番の値が `Keep` + `Strip` の間は写像が空で食い違いは起きない。`ChownInUserNamespace` の配線（H6）で効く。
+詳細は [oci-layer-special-bits.md](oci-layer-special-bits.md) の末尾。
 
 ## 動作の変更点
 

@@ -108,16 +108,17 @@
 //!     無く（#2241 D1:A）、SingleId は `Keep` が正しく、特殊ビットは `open_rootfs_for_search` の 0755 化が
 //!     `PreserveIfOwnerMapped` の 0700 契約と両立しない間は保持しない。範囲写像（SubordinateIds）の本来の値
 //!     `ChownInUserNamespace` は tokio のマルチスレッドのプロセス内では user namespace に入れず（core の
-//!     `MultiThreaded` 拒否）、記録の符号化も受けないため未配線（後続 issue・要起票）。pull 時と start 時の subuid の
-//!     ずれの照合も `ChownInUserNamespace` と同時に足す（`Keep` では所有者が subuid に依らず検出対象が無い）。
+//!     `MultiThreaded` 拒否）未配線。記録の符号化は済み（#4796・H2）で、残りは helper（H1）・対応表の切り替え（H6）。pull 時と start 時の subuid の
+//!     ずれの照合は `match_recorded_settings` で実装済み（#4799。`ownership=` 行の完全一致。`Keep` では所有者が
+//!     subuid に依らず検出対象が無い）。本番の値の切り替えは H6。
 //!     所有者の写像の変換部品 `image_ownership`（#2389）は cli crate にあり、置き場所の判断は未取得（依存辺が増えない形を採用）。
 //!     pull と create は [`crate::bundle::ImageExtractConfig`] の 1 か所から同じ値を配る（食い違うと記録の照合で
 //!     `FAILED_PRECONDITION` になる）
 //!   - 展開済み rootfs の GC と `image rm` / `image prune` への接続は TASK-183（OCI-7）の担当。それまで削除しても
 //!     `<cache_dir>/rootfs/sha256/<hex>` は残る
 //!   - pull 時と start 時の subuid / subgid のずれは、展開時の所有者写像の記録（`unpack-record`）で検出する方針
-//!     （`docs/design/pull-inventory-wiring.md`）。本番の値が `Keep` + `Strip` の間は写像が空で効かず、
-//!     `ChownMapped` 等の配線時に start 側の写像との照合を足す（#2592・#2377・#2241・#482）
+//!     （`docs/design/pull-inventory-wiring.md`）。照合は `match_recorded_settings`（#4799）。
+//!     本番の値が `Keep` + `Strip` の間は写像が空で効かず、`ChownInUserNamespace` 等の配線（H6）で効く（#2592・#2377・#2241・#482）
 //!   - 異常終了で残ったステージング（展開途中の rootfs を含む）の回収は、blob のステージングと同じく起動時 GC の担当（#2315）
 //!   - 展開は `extract_image_layers_bounded_in` で、期限（[`PullConfig::pull_deadline`] の絶対時刻を pull 全体で共有）と
 //!     取り消しの旗をエントリ単位で確認する。期限超過・取り消しは `Timeout`（gRPC `DEADLINE_EXCEEDED`）で止まり、
@@ -547,7 +548,7 @@ pub struct PullConfig {
     pub extract_limits: ExtractLimits,
     /// レイヤー展開の所有者・特殊ビットの選択肢。既定は `chown` しない（`Keep`）・特殊ビットは落とす（`Strip`）。
     /// 値は呼び出し元が決める。本番（plugin-cri）は start と同じ権限モデルの解決から選び（#2792）、現状はどの権限モデルでも
-    /// 既定のまま（`ChownInUserNamespace` 等は後続。モジュール doc「未実装範囲」と
+    /// 既定のまま（`ChownInUserNamespace` の対応表への配線は後続 #4777 の H6。モジュール doc「未実装範囲」と
     /// `docs/design/oci-layer-special-bits.md`。#2534・SEC-5・SEC-1）。
     pub extract_options: ExtractOptions,
 }
@@ -1473,6 +1474,7 @@ enum RecordMatch {
 }
 
 /// `ExtractOptions` を固定書式で符号化する。`Debug` 出力は書式が安定しないため使わない（記録の互換性を保つ）。
+/// 所有者の語は `keep` / `chown-mapped` / `chown-in-userns`（既存の語は変えない）。
 /// 未知の選択肢（将来追加された variant）は黙って同一視せず `Unimplemented` で拒否する（fail-closed）。
 pub(crate) fn encode_extract_options(options: &ExtractOptions) -> Result<String, PullError> {
     use fandhe_container_oci::layer::extract::{IdRange, SpecialBitsPolicy};
@@ -1493,6 +1495,14 @@ pub(crate) fn encode_extract_options(options: &ExtractOptions) -> Result<String,
         OwnershipPolicy::ChownMapped { uid, gid } => {
             format!(
                 "chown-mapped uid={} gid={}",
+                map_lines(uid.lines()),
+                map_lines(gid.lines())
+            )
+        }
+        // 範囲写像の user namespace 内で展開する方式（SEC-5・#4796）。語を `chown-mapped` と分け、前方一致の照合で衝突させない
+        OwnershipPolicy::ChownInUserNamespace { uid, gid } => {
+            format!(
+                "chown-in-userns uid={} gid={}",
                 map_lines(uid.lines()),
                 map_lines(gid.lines())
             )
@@ -1526,6 +1536,8 @@ pub(crate) fn record_settings(
 }
 
 /// 公開済み rootfs の root が持つべき所有 uid（`ChownMapped` では写像先、それ以外は `owner`）。
+/// `ChownInUserNamespace` も現状は `owner` を返す。写像先の uid を期待する扱いへの切り替えは、配線と同時に
+/// #4777 の H6 で行う（未配線の間は到達しない。配線後に root 所有者の照合が食い違うと `FAILED_PRECONDITION` になる）。
 pub(crate) fn expected_root_owner_for(
     options: &ExtractOptions,
     owner: u32,
@@ -1623,6 +1635,36 @@ pub(crate) fn read_entry_record_body(
     Ok(body)
 }
 
+/// 記録の写像（`ownership=` 行）が start 側の期待と食い違うときの固定文言。値（uid・host_id）は含めない。
+pub(crate) const ID_MAPPING_MISMATCH: &str =
+    "image rootfs cache entry was unpacked with a different id mapping";
+/// 写像以外（特殊ビット・config・書式ヘッダ）が食い違うときの固定文言。
+pub(crate) const SETTINGS_MISMATCH: &str =
+    "image rootfs cache entry was unpacked with different settings";
+
+/// 記録本文が `expected_settings` で始まることを確かめ、残り（`layer=` 行）を返す。pull の再利用判定と create の
+/// `read_layers` が共有する照合点（SEC-5・OCI-1・CRI-3・#4799）。pull 時の所有者の写像と start 時に権限モデルから
+/// 解決した写像が食い違う場合（`/etc/subuid` の変更・旧い `ownership=keep` の展開）は、縮退も再展開もせず
+/// `FAILED_PRECONDITION` で拒否する（所有者がずれた rootfs を黙って使わない。記録の無い展開は別途拒否される）。
+pub(crate) fn match_recorded_settings<'a>(
+    body: &'a [u8],
+    expected_settings: &str,
+) -> Result<&'a [u8], PullError> {
+    if let Some(rest) = body.strip_prefix(expected_settings.as_bytes()) {
+        return Ok(rest);
+    }
+    fn ownership_line(b: &[u8]) -> Option<&[u8]> {
+        b.split(|c| *c == b'\n')
+            .find(|l| l.starts_with(b"ownership="))
+    }
+    let message = if ownership_line(body) != ownership_line(expected_settings.as_bytes()) {
+        ID_MAPPING_MISMATCH
+    } else {
+        SETTINGS_MISMATCH
+    };
+    Err(PullError::new(OciErrorCode::FailedPrecondition, message))
+}
+
 /// 公開済みエントリの記録を `expected` と照合する。記録が無い・信頼できない・上限超過・設定が食い違う場合は再利用せず
 /// 拒否する（既存の展開物は消さない。コンテナの下位層として使われている可能性があるため）。読み取りは
 /// [`read_entry_record_body`]（非ブロッキング・同じハンドル）。
@@ -1632,12 +1674,7 @@ fn check_unpack_record(
     owner: u32,
 ) -> Result<RecordMatch, PullError> {
     let body = read_entry_record_body(entry, owner)?;
-    let Some(rest) = body.strip_prefix(expected.settings.as_bytes()) else {
-        return Err(PullError::new(
-            OciErrorCode::FailedPrecondition,
-            "image rootfs cache entry was unpacked with different settings",
-        ));
-    };
+    let rest = match_recorded_settings(&body, &expected.settings)?;
     if rest == expected.layers.as_bytes() {
         Ok(RecordMatch::Exact)
     } else {
@@ -2216,6 +2253,104 @@ mod tests {
             display_name(other.registry(), other.repository()),
             "registry.example.com:5000/team/app"
         );
+    }
+
+    /// OCI-1・SEC-5・#4796: `ChownInUserNamespace` + `PreserveIfChowned` は固定書式で符号化され、`ChownMapped` と別の語になる。
+    #[test]
+    fn oci1_sec5_encode_chown_in_userns_is_fixed_and_distinct_from_chown_mapped() {
+        use fandhe_container_oci::layer::extract::{IdMap, IdRange, SpecialBitsPolicy};
+        let map = |host: u32| {
+            IdMap::new(vec![
+                IdRange {
+                    container_id: 0,
+                    host_id: host,
+                    count: 1,
+                },
+                IdRange {
+                    container_id: 1,
+                    host_id: host + 1,
+                    count: 65_535,
+                },
+            ])
+            .expect("map")
+        };
+        let (uid, gid) = (map(100_000), map(100_000));
+        let userns = ExtractOptions::new()
+            .with_ownership(OwnershipPolicy::ChownInUserNamespace {
+                uid: uid.clone(),
+                gid: gid.clone(),
+            })
+            .with_special_bits(SpecialBitsPolicy::PreserveIfChowned);
+        let encoded = encode_extract_options(&userns).expect("encode");
+        assert_eq!(
+            encoded,
+            "ownership=chown-in-userns uid=0:100000:1,1:100001:65535 gid=0:100000:1,1:100001:65535\nspecial-bits=preserve-if-chowned\n"
+        );
+        let mapped = ExtractOptions::new()
+            .with_ownership(OwnershipPolicy::ChownMapped { uid, gid })
+            .with_special_bits(SpecialBitsPolicy::PreserveIfChowned);
+        assert_ne!(encoded, encode_extract_options(&mapped).expect("mapped"));
+        let other = ExtractOptions::new()
+            .with_ownership(OwnershipPolicy::ChownInUserNamespace {
+                uid: map(200_000),
+                gid: map(100_000),
+            })
+            .with_special_bits(SpecialBitsPolicy::PreserveIfChowned);
+        assert_ne!(encoded, encode_extract_options(&other).expect("other"));
+        let keep = ExtractOptions::new().with_special_bits(SpecialBitsPolicy::PreserveIfChowned);
+        assert_eq!(
+            encode_extract_options(&keep).expect("keep"),
+            "ownership=keep\nspecial-bits=preserve-if-chowned\n"
+        );
+    }
+
+    /// SEC-5・OCI-1・CRI-3・#4799: 記録の写像と期待の写像の照合。一致は通り、1 行の食い違いは固定文言で拒否する。
+    #[test]
+    fn sec5_match_recorded_settings_distinguishes_id_mapping_mismatch() {
+        let head = "fandhe-rootfs-v2\nconfig=sha256:aaaa\n";
+        let mk = |own: &str, sp: &str| format!("{head}ownership={own}\nspecial-bits={sp}\n");
+        let a = "chown-in-userns uid=0:100000:65536 gid=0:100000:65536";
+        let c = "chown-in-userns uid=0:100000:1,1:100001:65535 gid=0:100000:65536";
+        let sp = "preserve-if-chowned";
+        let expected = mk(a, sp);
+        let body = format!("{expected}layer=x y\n");
+        assert_eq!(
+            match_recorded_settings(body.as_bytes(), &expected).expect("match"),
+            b"layer=x y\n"
+        );
+        let c_exp = mk(c, sp);
+        let c_body = format!("{c_exp}layer=x y\n");
+        assert!(match_recorded_settings(c_body.as_bytes(), &c_exp).is_ok());
+        let id_cases = [
+            mk(&a.replace("0:100000:65536 gid", "0:100001:65536 gid"), sp),
+            mk(&a.replace("gid=0:100000:65536", "gid=0:100000:65535"), sp),
+            mk(c, sp),
+            mk(&a.replace("chown-in-userns", "chown-mapped"), sp),
+            mk("keep", sp),
+        ];
+        for rec in id_cases {
+            let err = match_recorded_settings(rec.as_bytes(), &expected).expect_err("id mapping");
+            assert_eq!(err.code(), OciErrorCode::FailedPrecondition);
+            assert_eq!(err.message(), ID_MAPPING_MISMATCH, "{rec}");
+        }
+        // 記録が写像あり・期待が keep
+        let keep = mk("keep", sp);
+        let err = match_recorded_settings(expected.as_bytes(), &keep).expect_err("keep");
+        assert_eq!(err.message(), ID_MAPPING_MISMATCH);
+        // 写像以外（特殊ビット・config・旧ヘッダ）
+        let others = [
+            mk(a, "strip"),
+            expected.replace("aaaa", "bbbb"),
+            expected.replace("fandhe-rootfs-v2", "fandhe-rootfs-v1"),
+        ];
+        for rec in others {
+            let err = match_recorded_settings(rec.as_bytes(), &expected).expect_err("other");
+            assert_eq!(err.message(), SETTINGS_MISMATCH, "{rec}");
+        }
+        // 文言は値を含まない
+        for m in [ID_MAPPING_MISMATCH, SETTINGS_MISMATCH] {
+            assert!(!m.contains("100000"));
+        }
     }
 
     /// OCI-1・SEC-5・#2534: 記録の最悪値（`ChownMapped` の写像が上限行数・全桁最大に近く、特殊ビットも保持、layer が

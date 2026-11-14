@@ -198,7 +198,9 @@ tar のコンテナ内 ID をそのまま `chown` する（namespace の中で�
   `Keep` + `Strip`: ホスト root は本番の start が無く（#2241 D1:A。`ChownMapped` の本番の消費者が無い）、SingleId は `Keep` が正しく、
   SubordinateIds の `ChownInUserNamespace` は tokio のマルチスレッドから user namespace に入れず未配線。
   `PreserveIfOwnerMapped` は cri の `open_rootfs_for_search` が展開後に rootfs を 0755 にするため oci の「root を 0700 に保つ」
-  契約と両立せず、有効にしない。残り（後続 issue・要起票）: `ChownInUserNamespace`（再 exec する helper 等）・記録の符号化・
+  契約と両立せず、有効にしない。再 exec する helper の入口（隠し引数・親側の起動部品・参加・結果の返却）は #4795 で実装済み
+  （[userns-extract-helper.md](./userns-extract-helper.md)。展開 H2・削除 H3・`image_ownership` H4・ずれの照合 H5・対応表の切り替え H6・CI H7 は未）。
+  残り（後続 issue・要起票）: `ChownInUserNamespace` の展開本体・記録の符号化・
   subuid 所有の木の削除・pull / start の subuid のずれの照合・`image_ownership` の置き場所・`PreserveIfOwnerMapped` の前提整合。
   pull と create は `ImageExtractConfig` の 1 か所から同じ値を配る（食い違うと記録の照合で `FAILED_PRECONDITION`）。配線するときの確認事項: `ChownMapped` で展開した rootfs に、
   0700 の bundle 配下から写像先の uid で到達できること（core の launcher 側。SEC-5・CRI-2）の試験を同時に足す

@@ -28,7 +28,8 @@ pub enum ExtractIdentity {
     RootlessSingleId,
     /// 非 root・subuid / subgid の範囲写像あり。本来の値は `ChownInUserNamespace` だが、tokio のマルチスレッドの
     /// プロセス内では user namespace に入れない（core の `MultiThreaded` 拒否）ため暫定で `Keep` + `Strip`
-    /// （後続 issue。pull 時と start 時の subuid のずれの照合も同時に足す）。
+    /// （後続 issue。pull 時と start 時の subuid のずれの照合も同時に足す）。再 exec する helper の入口は #4795 で実装済み
+    /// （`userns_helper`）だが、展開の本体（H2）と対応表の切り替え（H6）は未で、対応表はこの行でも変えない（実装済みを装わない）。
     RootlessSubordinateIds,
     /// 権限モデルを解決できない OS（Linux 以外）。本番の経路には到達しないため `Keep` + `Strip`。
     Unsupported,

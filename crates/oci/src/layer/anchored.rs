@@ -51,6 +51,10 @@
 //! 親ディレクトリの確認（`lstat`）は `/proc/self/fd/<fd>` 配下のパスで行う（開く時に dev / ino が fd と一致することを
 //! 確かめ、一致しない・`/proc` が無いときはパス起点へ縮退せず `Unimplemented`）。これにより確認も変更も同じ実体を見る。
 //!
+//! 閉じ込めの祖先（#4804・SEC-5・SEC-1）: `PreserveIfOwnerMapped` の閉じ込めを `root` 自身ではなく 0700 の祖先で判定する
+//! ため、祖先も [`ExtractRoot`] で受ける。「`root` が祖先の配下か」は `AnchoredRoot::is_beneath` が `root` の fd から
+//! `..` を `openat2` で辿り (dev, ino) を比べて判定する（パス文字列・`/proc` の readlink を使わない）。
+//!
 //! 展開と `remove_extracted_tree` を（パスを受ける入口で）fd 起点にしない理由（#2598）: macOS・Windows の本番経路は cli の
 //! `non_linux_failure` が先に fail-closed にし、ホストでの展開に届かない（実行はゲストの Linux 側）。macOS の
 //! `openat` 系・Windows のハンドル起点操作には新しい FFI 宣言と libc 照合・オーナー判断が要る。Linux の他
@@ -277,6 +281,11 @@ mod imp {
                 _ => map_fs_err(&e),
             })?;
             Ok(Self { fd })
+        }
+
+        /// 開いた fd の `fstat`（パスを開き直さない）。閉じ込めの祖先の検査が使う（SEC-5・SEC-1・#4804）。
+        pub(in crate::layer) fn meta(&self) -> io::Result<fs::Metadata> {
+            File::from(self.fd.try_clone()?).metadata()
         }
 
         /// 開いた fd の (dev, ino)。構築時の検査結果との照合に使う。
@@ -605,6 +614,38 @@ mod imp {
         /// `root` 自身のメタデータ（fd の `fstat`。パスを開き直さない）。
         pub(in crate::layer) fn root_meta(&self) -> io::Result<fs::Metadata> {
             self.root.metadata()
+        }
+
+        /// `root` が `ancestor`（自身を含む）の配下にあるか。`root` の fd から `..` を fd 起点で辿り、各段の
+        /// (dev, ino) を `ancestor` と比べる（パス文字列・`/proc` の readlink を使わない）。ファイルシステムの根に
+        /// 達する・深さの上限を超える・辿れないときは偽（fail-closed。SEC-5・SEC-1・#4804）。
+        pub(in crate::layer) fn is_beneath(&self, ancestor: &ExtractRoot) -> io::Result<bool> {
+            use std::os::unix::fs::MetadataExt as _;
+            const MAX_ANCESTOR_DEPTH: u32 = 2048;
+            let am = ancestor.meta()?;
+            let want = (am.dev(), am.ino());
+            let dot = std::ffi::CString::new("..").map_err(io::Error::other)?;
+            let mut cur = self.root.try_clone()?;
+            for _ in 0..MAX_ANCESTOR_DEPTH {
+                let m = cur.metadata()?;
+                let here = (m.dev(), m.ino());
+                if here == want {
+                    return Ok(true);
+                }
+                let parent = File::from((self.hooks.openat2)(
+                    Some(cur.as_fd()),
+                    &dot,
+                    DIR_FLAGS,
+                    0,
+                    at::RESOLVE_NO_MAGICLINKS,
+                )?);
+                let pm = parent.metadata()?;
+                if (pm.dev(), pm.ino()) == here {
+                    return Ok(false);
+                }
+                cur = parent;
+            }
+            Ok(false)
         }
 
         /// `root` が空か（fd 経由で列挙する）。
@@ -1093,6 +1134,13 @@ mod imp {
             ))
         }
 
+        /// 閉じ込めの祖先の `fstat`。Linux の他アーキテクチャ・非 Linux では特殊ビット保持の判定に到達しない
+        /// （`UnsupportedHost` / `Unimplemented` が先に決まる）ため呼ばれない。
+        #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+        pub(in crate::layer) fn meta(&self) -> io::Result<fs::Metadata> {
+            fs::metadata(&self.path)
+        }
+
         /// 保持するディレクトリの (dev, ino)（unix 以外は `(0, 0)`）。
         pub fn identity(&self) -> Result<(u64, u64), OciError> {
             #[cfg(unix)]
@@ -1321,6 +1369,12 @@ mod imp {
         #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
         pub(in crate::layer) fn root_meta(&self) -> io::Result<fs::Metadata> {
             fs::symlink_metadata(&self.root)
+        }
+
+        /// 常に偽（上の `meta` と同じ理由で到達しない。偽は fail-closed）。
+        #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+        pub(in crate::layer) fn is_beneath(&self, _ancestor: &ExtractRoot) -> io::Result<bool> {
+            Ok(false)
         }
 
         pub(in crate::layer) fn root_is_empty(&self) -> io::Result<bool> {

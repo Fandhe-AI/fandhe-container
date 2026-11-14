@@ -15,6 +15,12 @@ setuid / setgid / sticky を常に落とし、件数を `ExtractedLayer::files_w
 tar の値のまま適用する。満たさないものは落とす（fail-closed）。既存の入口は `Strip` のままで挙動を変えない。
 新しい入口は `extract_layers_with_policy` / `extract_image_layers_with_policy`（パスで開く旧入口 `extract_layer_blobs_with_*` は #2535 で廃止した）。
 
+閉じ込めを `root` 自身ではなく 0700 の祖先ディレクトリで判定する入口 `extract_image_layers_confined_in`（fd 版）・
+`extract_layers_confined`（パス版）を追加した（#4778 の B 案・#4804・SEC-5・SEC-1・OCI-2）。祖先は開いた fd（`ExtractRoot`）で渡し、
+`root` 自身は 0755 でもよい（cri の `open_rootfs_for_search` が展開後に rootfs を 0755 にするため）。祖先を渡さない従来の入口は
+挙動を変えない。祖先は `PreserveIfOwnerMapped` のときだけ使い、`Strip` では読まず、`PreserveIfChowned` は祖先を無視して
+`root` 自身の 0700 で判定する（#4801 の担当）。
+
 `uid` / `gid` は user namespace の写像（core の `IdMapping` と同じ意味の `container_id host_id count` の 1 行）を
 `IdRange` で渡す。`host_id` は展開するプロセス自身の user namespace から見える ID（そのプロセスの `fstat` が返す
 uid / gid）で渡す。入れ子の user namespace の中で展開するときは、初期 user namespace のホスト ID ではなく展開プロセスの
@@ -28,8 +34,9 @@ uid / gid）で渡す。入れ子の user namespace の中で展開するとき�
 | ---- | -------------- | ---- |
 | ポリシーが `PreserveIfOwnerMapped` | `StripPolicy` | 既定は fail-closed |
 | ホストが Linux | `UnsupportedHost` | macOS は非 root の通常ファイルへの sticky が `EFTYPE`、setgid の継承規則も異なる。Windows には mode が無い |
-| `root` がディレクトリで `mode & 0o077 == 0` | `RootAccessibleByOthers` | 0700 ならほかのユーザーは `root` より下へ入れず、祖先の権限は判定に要らない |
-| （展開中）`root` の所有者と 0700 が開始時のまま | `RootChangedDuringExtraction` | 展開の途中で変えられても、以後のビットを保持しない（#2437。下記「展開中の再確認」） |
+| `root` がディレクトリで `mode & 0o077 == 0`（祖先を渡さないとき） | `RootAccessibleByOthers` | 0700 ならほかのユーザーは `root` より下へ入れず、祖先の権限は判定に要らない |
+| 祖先がディレクトリで `mode & 0o077 == 0`、所有 uid が `root` と同じ、`root` が祖先の配下（自身を含む）（祖先を渡すとき。上の `root` の条件の代わり） | `ConfinementAncestorRejected` | 祖先が 0700 で同じ uid だけが辿れるなら、`root` が 0755 でもほかのユーザーは `root` に届かない。個別の原因は区別しない（#4804） |
+| （展開中）`root`（祖先を渡すときは祖先）の所有者と 0700 が開始時のまま | `RootChangedDuringExtraction` | 展開の途中で変えられても、以後のビットを保持しない（#2437・#4804。下記「展開中の再確認」） |
 
 ファイル単位（`write_file` で書いた後、`fchmod` の前に評価。所有者は書いたファイル自身の metadata から得る）
 
@@ -62,6 +69,8 @@ uid / gid）で渡す。入れ子の user namespace の中で展開するとき�
   setuid / setgid を落とすため、mode を先に適用するとビットが失われるか意図しない所有者の setuid が残る。展開内の `chown`
   （`ChownMapped`）は #2225 でこの順序を実装済み（#2251 P2-5）
 - コンテナ内で setuid が実際に効くかは `process.noNewPrivileges` に依る。本変更はビットの保持までを扱う
+- 祖先を渡す入口では、`root` ではなく祖先を排他的に所有し、`root` を rootfs として使い終わるまで祖先を 0700 に保つ（#4804）。
+  祖先は `root` と同じ uid の所有でなければならない。祖先の条件は #2547（イメージストア root の権限基準）のどの案よりも厳しい側にある
 
 ## 所有者の適用（chown。#2225・SEC-5）
 
@@ -150,6 +159,9 @@ uid / gid）で渡す。入れ子の user namespace の中で展開するとき�
 - 保持済みのビットが 1 件でもある状態で前提が崩れた場合は、遡って外さず、全レイヤーの展開後（`chown_root` の前）に
   `FailedPrecondition`（`the extraction root changed while special mode bits were preserved`）で展開全体を拒否する。`Err` を
   受けた呼び出し側は `root` ごと破棄する（契約）。`chown_root` は `root` の所有者を正当に変えるため、その後は確認しない
+- 祖先を渡したときは、上の「`root` の `fstat`」を祖先の `fstat`（ディレクトリ・0700・所有 uid が `root` と同じ）に置き換える。
+  「`root` が祖先の配下」は全レイヤーの展開後に 1 回だけ、`root` の fd から `..` を `openat2` で辿って (dev, ino) を比べて確かめる
+  （パス文字列・`/proc` の readlink を使わない。根に達する・深さ 2048 超は偽）。同じく `FailedPrecondition` の文言は変えない
 - 残る窓: `fstat` と `fchmod` の間は、事後の確認で縮めるがゼロではない。0700 は `root` の inode の性質なので、`root` のパスを
   rename で動かされても fd 起点の書き込みと配下の保護は保たれる
 
@@ -185,8 +197,8 @@ tar のコンテナ内 ID をそのまま `chown` する（namespace の中で�
 - rootless の user namespace へ入って `ImageRootfsUnpacker::unpack` を呼ぶ core 側の配線（子プロセス方式。tokio の
   マルチスレッドの pull 経路ではプロセス内で入れない）と、subuid 所有の rootfs の削除経路（#2315・#482）。
   `PreserveIfOwnerMapped` の rootless 経路（`chown` しない 1 行の写像）は従来どおり
-- 0700 の祖先ディレクトリで閉じ込めを判定する方式。`root` が 0700 のため、複数範囲の写像でもコンテナ内の非 root ユーザーは
-  `/` を辿れない
+- 0700 の祖先での閉じ込め（#4804）の cri・plugin-cri への結線（S2）。oci 側の入口は実装済みで、本番の呼び出し元はまだ祖先を
+  渡さない（複数範囲の写像でコンテナ内の非 root ユーザーが `/` を辿れるようにするため。結線までは `root` が 0700 でコンテナ root だけが辿れる）
 - macOS・Windows・Linux の他アーキテクチャでの、展開と公開の `remove_extracted_tree` のディレクトリ fd 起点の解決（#2598 で
   広げないと決めた）。パス起点のままで、確認から使用までの TOCTOU と、木の中に残ったマウントの中身の削除を防げない。理由:
   特殊ビットの保持は Linux 限定で SEC-5 の TOCTOU は Linux 固有／macOS・Windows の本番経路は cli の `non_linux_failure` が先に
@@ -198,7 +210,7 @@ tar のコンテナ内 ID をそのまま `chown` する（namespace の中で�
   `Keep` + `Strip`: ホスト root は本番の start が無く（#2241 D1:A。`ChownMapped` の本番の消費者が無い）、SingleId は `Keep` が正しく、
   SubordinateIds の `ChownInUserNamespace` は tokio のマルチスレッドから user namespace に入れず未配線。
   `PreserveIfOwnerMapped` は cri の `open_rootfs_for_search` が展開後に rootfs を 0755 にするため oci の「root を 0700 に保つ」
-  契約と両立せず、有効にしない。残り（後続 issue・要起票）: `ChownInUserNamespace`（再 exec する helper 等）・記録の符号化・
+  契約と両立せず、有効にしない（oci 側は #4804 で祖先を渡せるようにした。cri からの結線は S2）。残り（後続 issue・要起票）: `ChownInUserNamespace`（再 exec する helper 等）・記録の符号化・
   subuid 所有の木の削除・pull / start の subuid のずれの照合・`image_ownership` の置き場所・`PreserveIfOwnerMapped` の前提整合。
   pull と create は `ImageExtractConfig` の 1 か所から同じ値を配る（食い違うと記録の照合で `FAILED_PRECONDITION`）。配線するときの確認事項: `ChownMapped` で展開した rootfs に、
   0700 の bundle 配下から写像先の uid で到達できること（core の launcher 側。SEC-5・CRI-2）の試験を同時に足す
@@ -211,6 +223,12 @@ tar のコンテナ内 ID をそのまま `chown` する（namespace の中で�
 - 拒否の message の使い分け: `layer.rs` の非 unix の `Unimplemented` は固定文言 `verified blob access is not supported on non-unix hosts`（定数 `NON_UNIX_VERIFIED_BLOB_UNSUPPORTED_MESSAGE`）に揃えた。ImageStore 側の stub（`pull.rs`）は `ImageStore::open` の恒久拒否と同じ `windows_host_rejected()`（`FailedPrecondition`）を返す。
 
 ## 試験との対応
+
+祖先での閉じ込め（#4804）: `extract.rs` の `anchored_tests`（`sec5_ancestor_0700_allows_bits_with_root_0755`・
+`sec5_ancestor_equal_to_root_is_beneath`・`sec5_ancestor_0750_is_rejected`・`sec5_ancestor_owner_mismatch_is_rejected`・
+`sec5_ancestor_not_above_root_is_rejected`・`sec5_ancestor_confines_matrix`・`sec5_ancestor_ignored_for_strip_and_chowned`・
+`sec5_ancestor_mode_change_after_preserved_file_fails_closed`・`sec5_ancestor_mode_change_before_special_file_strips_remaining`）と、
+`tests/layer_extract.rs` の `sec5_special_bits_confined_by_ancestor_via_public_api`（実 fstat・実 uid）。
 
 `extract.rs` の単体試験。`sec5_special_bits_preserved_when_owner_mapped`（条件を満たす経路で tar の値どおり）、
 `sec5_special_bits_stripped_when_root_is_accessible_by_others`・`sec5_special_bits_dropped_when_tar_owner_is_not_mapped`・

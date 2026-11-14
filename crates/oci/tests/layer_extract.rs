@@ -268,6 +268,85 @@ fn sec5_special_bits_via_public_api_with_real_owner() {
     assert_eq!(mode("other_gid"), 0o755);
     std::fs::remove_dir_all(&base).unwrap();
 }
+/// SEC-5・SEC-1・OCI-2・#4804: 公開 API（`extract_layers_confined`）で、0700 の祖先を渡すと `root` が 0755 でも
+/// 特殊ビットを保持し、祖先が 0750 なら全ビットを落とす。実際の fstat・所有者で照合する。
+#[cfg(target_os = "linux")]
+#[test]
+fn sec5_special_bits_confined_by_ancestor_via_public_api() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    use fandhe_container_oci::instrument::NoopOciOpRecorder;
+    use fandhe_container_oci::layer::extract::{
+        ExtractBudget, ExtractOptions, ExtractRoot, IdRange, SpecialBitsDecision,
+        SpecialBitsPolicy, extract_layers_confined,
+    };
+
+    let tar_bytes = {
+        let mut b = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Regular);
+        h.set_mode(0o4755);
+        h.set_uid(0);
+        h.set_gid(0);
+        h.set_size(1);
+        h.set_cksum();
+        b.append_data(&mut h, "suid", &b"x"[..]).unwrap();
+        b.into_inner().unwrap()
+    };
+    let run = |anc_mode: u32| {
+        let base = exclusive_base("fc-oci-sec5-anc");
+        let root = base.join("root");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let probe = root.join(".probe");
+        std::fs::write(&probe, b"").unwrap();
+        let md = std::fs::metadata(&probe).unwrap();
+        let (uid, gid) = (md.uid(), md.gid());
+        std::fs::remove_file(&probe).unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(anc_mode)).unwrap();
+        let anc = ExtractRoot::open_existing_dir(&base).unwrap();
+        let range = |h| IdRange {
+            container_id: 0,
+            host_id: h,
+            count: 1,
+        };
+        let options =
+            ExtractOptions::new().with_special_bits(SpecialBitsPolicy::PreserveIfOwnerMapped {
+                uid: range(uid),
+                gid: range(gid),
+            });
+        let r = extract_layers_confined(
+            &NoopOciOpRecorder,
+            [std::io::Cursor::new(tar_bytes.clone())],
+            &root,
+            Some(&anc),
+            ExtractLimits::new(10, 100, 1 << 30, 1 << 20),
+            &options,
+            &ExtractBudget::new(),
+        )
+        .unwrap();
+        let mode = std::fs::metadata(root.join("suid"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_dir_all(&base).unwrap();
+        (r[0].special_bits, mode, uid)
+    };
+    let (kept, mode, uid) = run(0o700);
+    assert_eq!(kept.decision, SpecialBitsDecision::Evaluated);
+    // 所有 uid が host root なら setuid は常に落ちる（SEC-5）。
+    assert_eq!(mode, if uid == 0 { 0o755 } else { 0o4755 });
+    let (rej, mode, _) = run(0o750);
+    assert_eq!(
+        rej.decision,
+        SpecialBitsDecision::ConfinementAncestorRejected
+    );
+    assert_eq!(rej.preserved_files, 0);
+    assert_eq!(mode, 0o755);
+}
+
 /// 公開 API 経由の chown 試験で使う、uid / gid を持つ tar（通常ファイル・ディレクトリ・symlink）。
 #[cfg(target_os = "linux")]
 fn owned_tar(uid: u64, gid: u64, file_mode: u32) -> Vec<u8> {

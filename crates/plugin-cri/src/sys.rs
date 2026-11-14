@@ -428,6 +428,131 @@ pub fn child_exit_observed(_pid: std::num::NonZeroU32) -> std::io::Result<bool> 
     Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
 }
 
+/// userns helper（`userns_helper`。#4795・SEC-5・REPAIR-5）が使う自プロセスの硬化 syscall の薄いラッパー。
+///
+/// 呼び出し元は `userns_helper::helper` だけ。`unsafe` はこのモジュールの中に閉じ、公開するのは安全な関数のみ
+/// （coding-rust.md「事前承認の範囲」）。LP64 の x86_64・aarch64 の Linux だけ実装し、他の組は `Unsupported` を返す
+/// （helper は fail-closed で終了する）。値は net の `sys/holder.rs` の宣言と同じで、`abi_values` で具体値として固定する。
+#[cfg(target_os = "linux")]
+pub(crate) mod hardening {
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    mod imp {
+        pub(super) const PR_GET_DUMPABLE: i32 = 3;
+        pub(super) const PR_SET_DUMPABLE: i32 = 4;
+        /// `close_range(2)` の syscall 番号（x86_64・aarch64 とも 436）。
+        pub(super) const SYS_CLOSE_RANGE: i64 = 436;
+
+        unsafe extern "C" {
+            // SAFETY（宣言の妥当性）: glibc・musl の `int prctl(int option, ...)` と `long syscall(long number, ...)`。
+            // 可変長引数は `u64`（`unsigned long` 幅）だけを渡す。
+            fn prctl(option: i32, ...) -> i32;
+            fn syscall(number: i64, ...) -> i64;
+        }
+
+        pub(super) fn set_non_dumpable() -> std::io::Result<()> {
+            // SAFETY: `PR_SET_DUMPABLE` は整数引数だけを読む自プロセスの属性変更で、ポインタを取らない。
+            // 0 は dumpable の無効化で、メモリ安全性に影響しない。
+            let rc = unsafe { prctl(PR_SET_DUMPABLE, 0u64, 0u64, 0u64, 0u64) };
+            if rc == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        }
+
+        pub(super) fn get_dumpable() -> std::io::Result<i32> {
+            // SAFETY: `PR_GET_DUMPABLE` は引数を読まず、現在値を戻り値で返すだけ。
+            let rc = unsafe { prctl(PR_GET_DUMPABLE, 0u64, 0u64, 0u64, 0u64) };
+            if rc < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(rc)
+            }
+        }
+
+        pub(super) fn close_inherited_fds() -> std::io::Result<()> {
+            // SAFETY: `close_range(3, UINT_MAX, 0)` は fd 3 以上を閉じるだけで、ポインタを取らない。標準入出力（0〜2）は残る。
+            // 呼び出し側（helper の手順 3）は、閉じる fd 番号を保持する Rust の所有型をまだ作っていない（作る前に呼ぶ）ため、
+            // 二重 close は起きない。
+            let rc = unsafe { syscall(SYS_CLOSE_RANGE, 3u64, u64::from(u32::MAX), 0u64) };
+            if rc == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        }
+
+        #[cfg(test)]
+        mod abi_values {
+            use super::{PR_GET_DUMPABLE, PR_SET_DUMPABLE, SYS_CLOSE_RANGE};
+
+            const _: () = assert!(PR_GET_DUMPABLE == 3);
+            const _: () = assert!(PR_SET_DUMPABLE == 4);
+            const _: () = assert!(SYS_CLOSE_RANGE == 436);
+
+            #[test]
+            fn sec5_4795_hardening_values_are_fixed() {
+                assert_eq!(PR_GET_DUMPABLE, 3);
+                assert_eq!(PR_SET_DUMPABLE, 4);
+                assert_eq!(SYS_CLOSE_RANGE, 436);
+            }
+        }
+    }
+
+    #[cfg(not(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )))]
+    mod imp {
+        fn unsupported<T>() -> std::io::Result<T> {
+            Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+        }
+        pub(super) fn set_non_dumpable() -> std::io::Result<()> {
+            unsupported()
+        }
+        pub(super) fn get_dumpable() -> std::io::Result<i32> {
+            unsupported()
+        }
+        pub(super) fn close_inherited_fds() -> std::io::Result<()> {
+            unsupported()
+        }
+    }
+
+    /// 自プロセスを non-dumpable にする（`PR_SET_DUMPABLE` = 0）。
+    pub(crate) fn set_non_dumpable() -> std::io::Result<()> {
+        imp::set_non_dumpable()
+    }
+
+    /// 自プロセスの dumpable の値（`PR_GET_DUMPABLE`。0 = non-dumpable）。
+    pub(crate) fn get_dumpable() -> std::io::Result<i32> {
+        imp::get_dumpable()
+    }
+
+    /// fd 3 以上をすべて閉じる（`close_range(3, !0, 0)`。`ENOSYS` も失敗として返す）。
+    pub(crate) fn close_inherited_fds() -> std::io::Result<()> {
+        imp::close_inherited_fds()
+    }
+
+    #[cfg(all(
+        test,
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    mod tests {
+        use super::*;
+
+        /// dumpable の読み取りは 0 か 1 を返す。設定（`set_non_dumpable`）は libtest のプロセス全体を non-dumpable にして他の試験
+        /// （子の `/proc` の参照など）へ影響するため、ここでは呼ばず、実バイナリ越しの往復は `tests/userns_helper_process.rs` が担う。
+        #[test]
+        fn sec5_4795_get_dumpable_returns_a_flag() {
+            assert!(matches!(get_dumpable(), Ok(0 | 1)));
+        }
+    }
+}
+
 #[cfg(all(
     test,
     any(

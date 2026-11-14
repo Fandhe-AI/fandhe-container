@@ -717,7 +717,7 @@ fn holder_from_ready(
 }
 
 /// SIGKILL を送り、[`POD_HOLDER_KILL_REAP_WAIT`] まで回収を待つ。回収できなければ子を返す（呼び出し側が orphan として数える）。
-fn kill_and_reap(mut child: Child) -> Option<Child> {
+pub(crate) fn kill_and_reap(mut child: Child) -> Option<Child> {
     let _ = child.kill();
     let until = Instant::now() + POD_HOLDER_KILL_REAP_WAIT;
     loop {

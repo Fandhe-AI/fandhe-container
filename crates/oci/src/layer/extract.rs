@@ -8231,15 +8231,14 @@ mod tests {
         #[test]
         fn sec5_ancestor_confines_matrix() {
             let sb = Sandbox::new();
-            let f = sb.base.join("sentinel");
+            let f = sb.base.join("not-a-dir");
+            fs::write(&f, b"x").unwrap();
             let fm = fs::metadata(&f).unwrap();
             assert!(!ancestor_confines(&fm, 1000, owner_1000));
-            let dm = fs::metadata(&sb.base).unwrap();
             fs::set_permissions(&sb.base, fs::Permissions::from_mode(0o700)).unwrap();
             let dm0700 = fs::metadata(&sb.base).unwrap();
             assert!(ancestor_confines(&dm0700, 1000, owner_1000));
             assert!(!ancestor_confines(&dm0700, 1001, owner_1000));
-            let _ = dm;
         }
 
         /// SEC-5・#4804: `Strip` は祖先を渡しても `StripPolicy`、`PreserveIfChowned` は祖先を無視して `root` の 0700 で判定する。

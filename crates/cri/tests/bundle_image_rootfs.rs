@@ -720,6 +720,10 @@ fn oci1_untrusted_cache_entries_are_rejected_without_deleting_them() {
     let p = env.provider_with(ImageRootfsSource::new(cfg));
     let e = prepare(&p, "c1", &container(&env.image_id)).unwrap_err();
     assert_eq!(e.code(), CriErrorCode::FailedPrecondition);
+    assert_eq!(
+        e.message(),
+        "image rootfs cache entry was unpacked with different settings"
+    );
     assert!(env.entry().join("rootfs/world").exists());
     assert_eq!(bundle_count(&env), 0);
 
@@ -741,6 +745,54 @@ fn oci1_untrusted_cache_entries_are_rejected_without_deleting_them() {
     let e = prepare(&env.provider(), "c1", &container(&env.image_id)).unwrap_err();
     assert_eq!(e.code(), CriErrorCode::DataLoss);
     assert_eq!(bundle_count(&env), 0);
+}
+
+/// SEC-5・OCI-1・CRI-3・#4799: pull 時の所有者の写像（記録）と create 時の写像が食い違うと、固定文言の
+/// FAILED_PRECONDITION で拒否する。展開物は消さず、bundle も残さない。旧い展開（`ownership=keep`）も同じ扱い。
+/// 一致して通る側は `image_pull` の単体試験と pull の結合試験で担保する（create で一致させると in-process の
+/// userns 展開の要件が絡むため、ここには置かない）。
+#[test]
+fn sec5_create_rejects_unpack_record_with_other_id_mapping() {
+    use fandhe_container_oci::layer::extract::{IdMap, IdRange, OwnershipPolicy};
+    let map = |host_id| {
+        IdMap::new(vec![IdRange {
+            container_id: 0,
+            host_id,
+            count: 65_536,
+        }])
+        .expect("map")
+    };
+    let userns = |host_id| {
+        ExtractOptions::new()
+            .with_ownership(OwnershipPolicy::ChownInUserNamespace {
+                uid: map(host_id),
+                gid: map(host_id),
+            })
+            .with_special_bits(SpecialBitsPolicy::PreserveIfChowned)
+    };
+    for (tag, rewrite) in [("idmap-other", true), ("idmap-keep", false)] {
+        let env = pulled_env(tag, CONFIG_SECTION);
+        if rewrite {
+            // 記録を写像 A（100000）へ固定リテラルで書き換える。
+            let rec = env.entry().join("unpack-record");
+            let text = fs::read_to_string(&rec).unwrap();
+            let a = "ownership=chown-in-userns uid=0:100000:65536 gid=0:100000:65536\nspecial-bits=preserve-if-chowned\n";
+            let replaced = text.replace("ownership=keep\nspecial-bits=strip\n", a);
+            assert_ne!(replaced, text);
+            fs::write(&rec, replaced).unwrap();
+        }
+        let mut cfg = env.extract_config();
+        cfg.extract_options = userns(200_000);
+        let p = env.provider_with(ImageRootfsSource::new(cfg));
+        let e = prepare(&p, "c1", &container(&env.image_id)).unwrap_err();
+        assert_eq!(e.code(), CriErrorCode::FailedPrecondition);
+        assert_eq!(
+            e.message(),
+            "image rootfs cache entry was unpacked with a different id mapping"
+        );
+        assert!(env.entry().join("rootfs/world").exists());
+        assert_eq!(bundle_count(&env), 0);
+    }
 }
 
 /// OCI-1: config や layer の blob が改ざんされていたら（digest 不一致）DATA_LOSS、config が上限超なら RESOURCE_EXHAUSTED。

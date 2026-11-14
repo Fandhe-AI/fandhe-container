@@ -1535,6 +1535,8 @@ pub(crate) fn record_settings(
 }
 
 /// 公開済み rootfs の root が持つべき所有 uid（`ChownMapped` では写像先、それ以外は `owner`）。
+/// `ChownInUserNamespace` も現状は `owner` を返す。写像先の uid を期待する扱いへの切り替えは、配線と同時に
+/// #4777 の H6 で行う（未配線の間は到達しない。配線後に root 所有者の照合が食い違うと `FAILED_PRECONDITION` になる）。
 pub(crate) fn expected_root_owner_for(
     options: &ExtractOptions,
     owner: u32,

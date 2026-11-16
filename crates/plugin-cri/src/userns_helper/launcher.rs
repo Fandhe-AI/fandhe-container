@@ -310,7 +310,8 @@ fn converse(
                 break;
             }
             Ok(None) => {}
-            Err(_) => return Err(UsernsHelperError::new(ErrorCode::Internal, MSG_PROTOCOL)),
+            // 終了を確かめられないので、生きている前提で kill・回収する（回収漏れを残さない）。
+            Err(_) => return Err(fail(child, ErrorCode::Internal, MSG_PROTOCOL)),
         }
         let now = Instant::now();
         if now >= until {

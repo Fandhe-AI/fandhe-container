@@ -10,8 +10,9 @@
 //! # 契約
 //! - `unsafe` はこのモジュールに閉じ、公開するのは安全な関数のみ（`unsafe fn` を公開しない）。
 //! - 受け取る側は `MSG_CMSG_CLOEXEC` で受け、制御バッファを `CMSG_LEN(期待本数 × 4)` に切る。超えた分はカーネルが閉じて
-//!   `MSG_CTRUNC` が立ち、受けた分も閉じてから `InvalidData` を返す。形式違反・負値の fd も同じく全部閉じて拒否する。
-//!   受けた fd は検証の前にすべて所有型にする（漏らさない）。
+//!   `MSG_CTRUNC` が立ち、受けた分も閉じてから `InvalidData` を返す。負値の fd が混ざる場合も、非負の分を閉じて拒否する。
+//!   制御データの形式違反（カーネルが組むため実際には起きない）は番号を読めないので fd を閉じられず `InvalidData` で返す。
+//!   受け手は短命な helper で、残った fd は終了で回収される。読めた fd は検証の前にすべて所有型にする。
 //! - LP64 の x86_64・aarch64 の Linux だけ実装し、他の組は `Unsupported` を返す（呼び出し側は fail-closed）。
 //!   `msghdr`・`cmsghdr` のレイアウトと定数は両アーキテクチャで同じで、`abi_values` で具体値として固定する
 //!   （plugin-cri は libc を dev-dependency に持たないため照合ではない。#3290）。参考実装は net の `sys/holder.rs`。
@@ -212,7 +213,7 @@ mod imp {
         };
         let used = msg.controllen.min(ctl_len);
         let ctrl = control.0.get(..used).unwrap_or(&[]);
-        // 形式違反でも、読めた番号は所有して閉じてから拒否する（漏らさない）。
+        // 形式違反は `parse_rights` が番号ごと `None` にするため所有できない（カーネルが組むので実際には起きず、短命な helper の終了で回収される）。
         let raw = parse_rights(ctrl);
         let parsed_ok = raw.is_some();
         // SAFETY: `recvmsg` は成功済み。`MSG_CMSG_CLOEXEC` つきで受けた `SCM_RIGHTS` の fd は、カーネルがこの呼び出しで
@@ -312,7 +313,7 @@ pub(crate) fn send_fds(sock: BorrowedFd<'_>, token: u8, fds: &[BorrowedFd<'_>]) 
 }
 
 /// 1 通を受けて、token と fd（最大 `max_fds` 本。`MAX_FDS` 以下）を返す。fd が 0 本でも成功で返す（本数の検査は呼び出し側）。
-/// 本数超過（`MSG_CTRUNC`）・形式違反・負値の fd は、受けた fd をすべて閉じて `InvalidData`、相手が閉じていれば `UnexpectedEof`。
+/// 本数超過（`MSG_CTRUNC`）・負値の fd は、受けた fd をすべて閉じて、形式違反は fd を閉じずに `InvalidData`、相手が閉じていれば `UnexpectedEof`。
 /// ソケットの受信期限が切れれば `WouldBlock` / `TimedOut`。
 pub(crate) fn recv_fds(sock: BorrowedFd<'_>, max_fds: usize) -> io::Result<Received> {
     imp::recv_fds(sock, max_fds)

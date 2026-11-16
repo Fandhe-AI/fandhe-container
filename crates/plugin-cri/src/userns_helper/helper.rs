@@ -10,8 +10,12 @@
 //! 5. 権限モデルを `start` と同じ解決で得て、範囲写像の rootless でなければ `NoSubordinateIds`
 //! 6. `Threads: 1` を確かめ（解決が一時スレッドを使う場合に備え、解決の後・参加の直前）、core の公開 API で user namespace へ参加
 //! 7. 参加後に non-dumpable を再確認
-//! 8. 要求 frame を読む（期限 [`REQUEST_READ_TIMEOUT`]）。要求を参加の後に読むのは、holder が呼び出し時点のメモリを複製するため、
+//! 8. 要求 frame を読む（期限 [`REQUEST_READ_TIMEOUT`]。header を検査して決まった長さだけを固定長バッファへ読む）。要求を参加の後に読むのは、holder が呼び出し時点のメモリを複製するため、
 //!    dumpable な holder が要求の bytes を持たないようにする（H2 が増やす fd・options も同じ窓に入れない）
+//!    削除モード（H3。#4800）は fd 1（親ディレクトリ）の複製を `/proc/self/fd/N` として oci の `ExtractRoot` で開き、直下の
+//!    固定名（[`RemoveTarget::child_name`]）の木を `remove_child_tree_bounded`（symlink を辿らない・マウントをまたがない・
+//!    深さの上限）で消す。パス・名前は要求で受けない。helper 自身は期限を持たず、親の期限切れの kill で止まる（削除は冪等で、
+//!    再実行が続きから消す）
 //! 9. モード実行と応答 frame の書き込み。成功は終了コード 0、応答できた失敗は 1
 //!
 //! 応答の文言は固定語彙で、パス・errno・uid を含めない（REPAIR-4）。stderr は親が null にする。
@@ -19,7 +23,7 @@
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{Read as _, Write as _};
-use std::os::fd::{AsFd as _, OwnedFd};
+use std::os::fd::{AsFd as _, AsRawFd as _, OwnedFd};
 use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
@@ -30,11 +34,13 @@ use fandhe_container_core::exec::{
     plan_rootless_subordinate,
 };
 use fandhe_container_core::rootless::{DEFAULT_HELPER_TIMEOUT, HelperPaths, IdMapWriter};
+use fandhe_container_oci::error::OciErrorCode;
+use fandhe_container_oci::layer::extract::{ExtractBudget, ExtractRoot};
 
 use super::USERNS_HELPER_ARG;
 use super::wire::{
-    HelperErrorCode, InspectReport, Mode, REQUEST_HEADER_LEN, Report, StatReport, decode_request,
-    encode_response,
+    HelperErrorCode, InspectReport, Mode, REQUEST_HEADER_LEN, RemoveTarget, Report, StatReport,
+    decode_request_header, encode_response,
 };
 use crate::sys::hardening;
 
@@ -125,7 +131,24 @@ fn run(sock: &UnixStream, target: OwnedFd, join: bool) -> Result<Report, HelperE
                 mode: meta.mode() & 0o7777,
             }))
         }
+        Mode::Remove(t) => remove_child_tree(&target, t).map(|()| Report::Removed),
     }
+}
+
+/// fd 1（親ディレクトリ）の直下の固定名の木を消す。名前空間の中の能力は写像内の所有者の inode にしか効かず、oci の削除は
+/// symlink を辿らず（リンク自体を unlink する）、マウントをまたがない（`FailedPrecondition` → `RemoveRefused`）。不在は成功（冪等）。
+fn remove_child_tree(parent: &File, target: RemoveTarget) -> Result<(), HelperErrorCode> {
+    // 複製した所有 fd の `/proc/self/fd/N` を magic link として開く（パスで探し直さず、渡された実体だけを根にする）。
+    let link = format!("/proc/self/fd/{}", parent.as_raw_fd());
+    let root = ExtractRoot::open_proc_fd_link(std::path::Path::new(&link))
+        .map_err(|_| HelperErrorCode::RemoveFailed)?;
+    root.remove_child_tree_bounded(target.child_name(), &ExtractBudget::new())
+        .map_err(|e| match e.code() {
+            OciErrorCode::FailedPrecondition | OciErrorCode::InvalidArgument => {
+                HelperErrorCode::RemoveRefused
+            }
+            _ => HelperErrorCode::RemoveFailed,
+        })
 }
 
 /// 範囲写像の user namespace へ参加する（手順 5〜7）。
@@ -167,16 +190,26 @@ fn join_user_namespace() -> Result<(), HelperErrorCode> {
     Ok(())
 }
 
-/// 要求 header を期限つきで読んで復号する（H1 のモードは payload 0。上限検査は復号の中）。
+/// 要求を期限つきで読んで復号する。header の検査（上限・tag ごとの固定長）の後に、決まった長さ（高々 4 バイト）だけを
+/// 固定長バッファへ読む（確保しない）。
 fn read_request(sock: &UnixStream) -> Result<Mode, HelperErrorCode> {
-    let mut buf = [0u8; REQUEST_HEADER_LEN];
-    (&*sock).read_exact(&mut buf).map_err(|e| match e.kind() {
-        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
-            HelperErrorCode::RequestTimeout
-        }
-        _ => HelperErrorCode::InvalidRequest,
-    })?;
-    decode_request(&buf)
+    let read = |buf: &mut [u8]| {
+        (&*sock).read_exact(buf).map_err(|e| match e.kind() {
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
+                HelperErrorCode::RequestTimeout
+            }
+            _ => HelperErrorCode::InvalidRequest,
+        })
+    };
+    let mut header = [0u8; REQUEST_HEADER_LEN];
+    read(&mut header)?;
+    let head = decode_request_header(&header)?;
+    let mut payload = [0u8; 4];
+    let dst = payload
+        .get_mut(..head.payload_len())
+        .ok_or(HelperErrorCode::InvalidRequest)?;
+    read(dst)?;
+    head.mode(payload.get(..head.payload_len()).unwrap_or(&[]))
 }
 
 fn inspect(joined: bool) -> Result<InspectReport, HelperErrorCode> {

@@ -519,9 +519,9 @@ impl CriPluginBackends {
                 Arc::clone(&self.oci_recorder),
             )),
         )
-        .with_puller(Arc::new(
+        .with_puller(Arc::new(attach_tree_remover(
             OciImagePuller::new(client, pull).with_recorder(self.oci_adapter()),
-        )))
+        ))))
     }
 
     /// 起動時に 1 回、`<state_root>/.cri/images` に残った pull のステージングとリースを回収する（OCI-7・OCI-1。#2819）。
@@ -2373,6 +2373,28 @@ pub fn bundle_provider_with(
     )
 }
 
+/// pull 側にも、範囲写像で展開した `unpack/` の削除器（再 exec helper の削除モード）を差す（#4800・SEC-5・OCI-7）。
+/// create 側（[`bundle_provider_with_options`]）と同じプロセス共有の削除器を使い、同時実行の上限を 1 つにする。
+#[cfg(unix)]
+fn attach_tree_remover<C: fandhe_container_cri::image_pull::RegistryPullClient>(
+    puller: fandhe_container_cri::image_pull::OciImagePuller<C>,
+) -> fandhe_container_cri::image_pull::OciImagePuller<C> {
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    {
+        puller.with_tree_remover(crate::userns_helper::UsernsTreeRemover::shared())
+    }
+    #[cfg(not(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )))]
+    {
+        puller
+    }
+}
+
 /// [`bundle_provider_with`] に展開設定 `options`（pull と同じ値）を足した形（SEC-5・OCI-1・#2792）。
 #[cfg(unix)]
 pub fn bundle_provider_with_options(
@@ -2394,6 +2416,15 @@ pub fn bundle_provider_with_options(
     }
     if let Some(recorder) = recorder {
         source = source.with_recorder(recorder);
+    }
+    // 範囲写像で展開した subuid 所有の木の削除は再 exec helper の削除モードへ回す（#4800・SEC-5・OCI-7）。
+    // 使うかどうかは展開設定（`ChownInUserNamespace` か）で決まり、現状の対応表（H6 まで）では通らない。
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    {
+        source = source.with_tree_remover(crate::userns_helper::UsernsTreeRemover::shared());
     }
     Ok(Arc::new(SpecBundleProvider::new(
         bundles,

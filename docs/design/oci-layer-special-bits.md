@@ -189,8 +189,9 @@ tar のコンテナ内 ID をそのまま `chown` する（namespace の中で�
   ホストでは起動ユーザー自身か subuid にしか効かず、`root` が 0700 なので他のホストユーザーは辿れない。
 - 残余・制約: 入れ子の user namespace では「親の ID ≠ 0」が「ホスト ID ≠ 0」を意味しない（契約で初期 namespace の直下に限る）。
   展開した木はホストから見ると subuid の所有になり、ホスト側の後始末（`CreatedRootfs::remove`・delete）は `EPERM` で失敗しうる。
-  削除も namespace の中で行う必要がある（`remove_extracted_tree`）。この経路は core 側で未配線（下記）で、端から端の後始末が
-  動くとは言わない。
+  削除も namespace の中で行う必要がある（`remove_extracted_tree`）。plugin-cri では再 exec helper の削除モードで消す
+  （#4800。cri の注入点 `SubordinateTreeRemover`・plugin-cri の `UsernsTreeRemover`。展開設定が `ChownInUserNamespace` のときだけ
+  通り、対応表の切り替え H6 まで本番では有効にならない）。端から端の後始末が動くとは言わない。
 
 ## 未実装（REPAIR-3）
 
@@ -216,9 +217,9 @@ tar のコンテナ内 ID をそのまま `chown` する（namespace の中で�
   `special-bits=strip` のため `FAILED_PRECONDITION`（`image rootfs cache entry was unpacked with different settings`）で
   拒否される。該当の `<cache>/rootfs/sha256/<hex>` を手動で消して pull し直す（自動移行は未実装）。
   再 exec する helper の入口（隠し引数・親側の起動部品・参加・結果の返却）は #4795 で実装済み
-  （[userns-extract-helper.md](./userns-extract-helper.md)。展開 H2・削除 H3・対応表の切り替え H6・CI H7 は未）。
+  （[userns-extract-helper.md](./userns-extract-helper.md)。削除 H3 は #4800 で実装済み。展開 H2・対応表の切り替え H6・CI H7 は未）。
   残り（後続 issue・要起票）: `ChownInUserNamespace` の展開本体・記録の符号化・
-  subuid 所有の木の削除・`image_ownership` の置き場所。
+  `image_ownership` の置き場所。
   pull と create は `ImageExtractConfig` の 1 か所から同じ値を配る（食い違うと記録の照合で `FAILED_PRECONDITION`）。配線するときの確認事項: `ChownMapped` で展開した rootfs に、
   0700 の bundle 配下から写像先の uid で到達できること（core の launcher 側。SEC-5・CRI-2）の試験を同時に足す
 - `IdMap` と core の `IdMapSet` を下位 crate へ共通化するかどうか（crate 境界の判断）

@@ -7,6 +7,8 @@
 //!
 //! - [`image_rootfs`]: 本番の [`RootfsSource`] [`ImageRootfsSource`]（pull 済みイメージを bundle の `rootfs/` へ再展開し、
 //!   イメージ config の Entrypoint・Cmd・Env・WorkingDir・User を [`ImageDefaults`] で返す。#2433）。
+//! - [`tree_remover`]: 範囲写像で展開した subuid 所有の木を再 exec helper の削除モードで消す注入点
+//!   （`SubordinateTreeRemover`・`needs_userns_removal`。#4800・SEC-5・OCI-7・CORE-6）。
 //! - [`resolv_conf`]: `dns_config` の検証と resolv.conf の内容の生成（純粋関数。#2665）。
 //!
 //! **未実装・簡易実装（REPAIR-3）**: タグ・digest 参照の解決（plugin-cri は `ImageService` をサーブしていない）、
@@ -18,6 +20,7 @@ pub mod image_rootfs;
 pub mod provider;
 pub mod resolv_conf;
 pub mod spec;
+pub mod tree_remover;
 
 pub use image_rootfs::{DEFAULT_ROOTFS_DEADLINE, ImageExtractConfig, ImageRootfsSource};
 pub use provider::{
@@ -32,3 +35,9 @@ pub use spec::{
     resolve_log_path, validate_config, validate_config_with_pod_namespaces,
     validate_config_with_pods,
 };
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub use tree_remover::SubordinateTreeRemover;
+pub use tree_remover::{RemovalTarget, needs_userns_removal};

@@ -172,6 +172,7 @@ use fandhe_container_oci::reference::{
 use fandhe_container_oci::registry::{RegistryClient, RegistryClientConfig, RegistryEndpoint};
 use tonic::Status;
 
+use crate::error::CriError;
 use crate::image_service::{ImageRecord, MAX_IMAGE_FIELD_BYTES};
 use crate::runtime::v1;
 
@@ -582,6 +583,12 @@ pub struct OciImagePuller<C: RegistryPullClient> {
     recorder: Arc<dyn OciOpRecorder>,
     /// 期限の判定に使う時計。既定は `Instant::now`（#3297）。
     clock: PullClock,
+    /// 展開設定が `ChownInUserNamespace`（unpack の木が subuid 所有になりうる）のときの削除の実装（#4800）。
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    tree_remover: Option<Arc<dyn crate::bundle::SubordinateTreeRemover>>,
 }
 
 /// pull の期限の時計（`Instant::now` の差し替え口）。`OciImagePuller` の `Debug` を保つための包み。
@@ -602,7 +609,66 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
             config,
             recorder: Arc::new(NoopOciOpRecorder),
             clock: PullClock(Arc::new(Instant::now)),
+            #[cfg(all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))]
+            tree_remover: None,
         }
+    }
+
+    /// 範囲写像で展開した subuid 所有の `unpack/` を消す実装を注入する（再 exec helper の削除モード。#4800・SEC-5・OCI-7）。
+    ///
+    /// 展開設定が `ChownInUserNamespace` のときだけ使う。それ以外は従来どおり oci の `remove_unpack_dir`。
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[must_use]
+    pub fn with_tree_remover(
+        mut self,
+        remover: Arc<dyn crate::bundle::SubordinateTreeRemover>,
+    ) -> Self {
+        self.tree_remover = Some(remover);
+        self
+    }
+
+    /// pull の `unpack/` の後始末（結果は無視する呼び出しの口。元のエラーを優先し、残骸は `abort` / 回収 GC が拾う）。
+    /// 範囲写像の展開（subuid 所有）はホスト側では消せないため helper の削除モードへ回し、remover 未注入ならホスト側へ
+    /// 縮退しない（#4800）。
+    fn cleanup_unpack_dir(&self, session: &PullSession<'_>) -> Result<(), CriError> {
+        if crate::bundle::needs_userns_removal(&self.config.extract_options) {
+            return self.cleanup_unpack_dir_in_userns(session);
+        }
+        session
+            .remove_unpack_dir()
+            .map_err(|_| CriError::internal("failed to remove the unpack directory"))
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    fn cleanup_unpack_dir_in_userns(&self, session: &PullSession<'_>) -> Result<(), CriError> {
+        let remover = self.tree_remover.as_ref().ok_or_else(|| {
+            CriError::failed_precondition("subordinate-owned tree removal is not available")
+        })?;
+        remover.remove_child_tree(
+            session.pull_dir_fd(),
+            crate::bundle::RemovalTarget::PullUnpack,
+            &crate::adapter::ReleaseBudget::new(),
+        )
+    }
+
+    /// Linux x86_64 / aarch64 以外では範囲写像の展開が成立しない（展開の前に拒否される）ためここへは届かない。
+    #[cfg(not(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )))]
+    fn cleanup_unpack_dir_in_userns(&self, _session: &PullSession<'_>) -> Result<(), CriError> {
+        Err(CriError::failed_precondition(
+            "subordinate-owned tree removal is not available",
+        ))
     }
 
     /// pull の期限（`pull_deadline`）の判定に使う時計を差し替える。既定は `Instant::now`。
@@ -1188,7 +1254,7 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
         // `abort` / `publish` / 回収 GC だけ。永続化済みのリースだけが残る孤児リースを作らないため）。
         // 検証だけの経路や失敗経路に残る展開物は 0555 等を含むため、oci の削除で消す。
         // pull ディレクトリの fd 起点で消す（差し替えられた `staging/<id>` の外を消さない。#4180）。
-        let _ = session.remove_unpack_dir();
+        let _ = self.cleanup_unpack_dir(&session);
         let composition = match prepared.and_then(|c| budget.check().map(|()| c)) {
             Ok(c) => c,
             Err(e) => {

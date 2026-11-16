@@ -428,6 +428,10 @@ pub fn child_exit_observed(_pid: std::num::NonZeroU32) -> std::io::Result<bool> 
     Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
 }
 
+/// 展開モードの blob の fd の `SCM_RIGHTS` の受け渡し（#4847。ファイルは `sys/fd_passing.rs`）。
+#[cfg(target_os = "linux")]
+pub(crate) mod fd_passing;
+
 /// userns helper（`userns_helper`。#4795・SEC-5・REPAIR-5）が使う自プロセスの硬化 syscall の薄いラッパー。
 ///
 /// 呼び出し元は `userns_helper::helper` だけ。`unsafe` はこのモジュールの中に閉じ、公開するのは安全な関数のみ

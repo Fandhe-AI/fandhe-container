@@ -11,7 +11,13 @@
 //! 6. `Threads: 1` を確かめ（解決が一時スレッドを使う場合に備え、解決の後・参加の直前）、core の公開 API で user namespace へ参加
 //! 7. 参加後に non-dumpable を再確認
 //! 8. 要求 frame を読む（期限 [`REQUEST_READ_TIMEOUT`]。header を検査して決まった長さだけを固定長バッファへ読む）。要求を参加の後に読むのは、holder が呼び出し時点のメモリを複製するため、
-//!    dumpable な holder が要求の bytes を持たないようにする（H2 が増やす fd・options も同じ窓に入れない）
+//!    dumpable な holder が要求の bytes を持たないようにする（展開モードの fd・options も同じ窓に入れない）
+//!    展開モード（#4847）は要求 frame（固定部 + レイヤーの記述）を読んだ後、blob の fd を `SCM_RIGHTS` で 1 通受ける（参加の後なので、
+//!    dumpable な holder の複製に fd・要求の bytes は入らない。受信も [`REQUEST_READ_TIMEOUT`] の期限）。fd の数・token が
+//!    要求と一致しなければ `InvalidRequest`。各 fd は `VerifiedLayerBlob::from_file`（信頼条件と digest・サイズの再検証）を通し、
+//!    fd 1 を `/proc/self/fd/N` として開いた `ExtractRoot` へ、oci の `extract_image_layers_bounded_in` で展開する。
+//!    所有者の方針は `ChownInUserNamespace` で、写像は参加に使ったもの（要求では受けない）。`--no-join`（試験専用）だけは写像が
+//!    無いので `Keep`。期限は要求を受けた時点から `work_ms`。操作記録（`OciOpRecorder`）は捨てる（観測は親の呼び出し単位）。
 //!    削除モード（H3。#4800）は fd 1（親ディレクトリ）の複製を `/proc/self/fd/N` として oci の `ExtractRoot` で開き、直下の
 //!    固定名（[`RemoveTarget::child_name`]）の木を `remove_child_tree_bounded`（symlink を辿らない・マウントをまたがない・
 //!    深さの上限）で消す。パス・名前は要求で受けない。helper 自身は期限を持たず、親の期限切れの kill で止まる（削除は冪等で、
@@ -27,22 +33,32 @@ use std::os::fd::{AsFd as _, AsRawFd as _, OwnedFd};
 use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fandhe_container_core::exec::{
     IsolationConfig, IsolationPrivilege, Namespace, NamespaceSet, isolate_rootless_subordinate,
     plan_rootless_subordinate,
 };
-use fandhe_container_core::rootless::{DEFAULT_HELPER_TIMEOUT, HelperPaths, IdMapWriter};
+use fandhe_container_core::rootless::{DEFAULT_HELPER_TIMEOUT, HelperPaths, IdMapSet, IdMapWriter};
 use fandhe_container_oci::error::OciErrorCode;
-use fandhe_container_oci::layer::extract::{ExtractBudget, ExtractRoot};
+use fandhe_container_oci::instrument::NoopOciOpRecorder;
+use fandhe_container_oci::layer::VerifiedLayerBlob;
+use fandhe_container_oci::layer::extract::{
+    ExtractBudget, ExtractOptions, ExtractRoot, ImageLayer, OwnershipPolicy, SpecialBitsPolicy,
+    extract_image_layers_bounded_in,
+};
 
 use super::USERNS_HELPER_ARG;
 use super::wire::{
-    HelperErrorCode, InspectReport, Mode, REQUEST_HEADER_LEN, RemoveTarget, Report, StatReport,
-    decode_request_header, encode_response,
+    EXTRACT_FD_TOKEN, ExtractReport, ExtractRequest, ExtractSpecialBits, HelperErrorCode,
+    InspectReport, MAX_EXTRACT_PAYLOAD_BYTES, Mode, REQUEST_HEADER_LEN, RemoveTarget, Report,
+    Request, StatReport, decode_request_header, encode_response,
 };
-use crate::sys::hardening;
+use crate::image_ownership::to_oci_map;
+use crate::sys::{fd_passing, hardening};
+
+/// 参加に使った写像（uid・gid）。`--no-join` では無い。
+type JoinedMaps = (IdMapSet, IdMapSet);
 
 /// 要求 frame の読み取り期限（参加の後に読む。親の書き込みは参加の完了を待たずに済むため短くてよい。REPAIR-5）。
 pub const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(2);
@@ -117,10 +133,19 @@ fn run(sock: &UnixStream, target: OwnedFd, join: bool) -> Result<Report, HelperE
     {
         return Err(HelperErrorCode::InvalidRequest);
     }
-    if join {
-        join_user_namespace()?;
-    }
-    let mode = read_request(sock)?;
+    let maps = if join {
+        Some(join_user_namespace()?)
+    } else {
+        None
+    };
+    let request = read_request(sock)?;
+    let received_at = Instant::now();
+    let mode = match request {
+        Request::Mode(mode) => mode,
+        Request::Extract(req) => {
+            return extract(sock, &target, &req, maps.as_ref(), received_at).map(Report::Extracted);
+        }
+    };
     match mode {
         Mode::Inspect => inspect(join).map(Report::Inspect),
         Mode::StatTarget => {
@@ -133,6 +158,87 @@ fn run(sock: &UnixStream, target: OwnedFd, join: bool) -> Result<Report, HelperE
         }
         Mode::Remove(t) => remove_child_tree(&target, t).map(|()| Report::Removed),
     }
+}
+
+/// 展開モード（#4847）。blob の fd を受け、検証して、fd 1 の `ExtractRoot` へ展開する。失敗は固定語彙の分類だけで返す。
+fn extract(
+    sock: &UnixStream,
+    target: &File,
+    req: &ExtractRequest,
+    maps: Option<&JoinedMaps>,
+    received_at: Instant,
+) -> Result<ExtractReport, HelperErrorCode> {
+    let deadline = received_at + Duration::from_millis(u64::from(req.work_ms()));
+    let want = req.layers().len();
+    // 0 件は launcher が SCM_RIGHTS を送らないため待たない（OCI-1。layers が空の正常なイメージ）。
+    let fds = if want == 0 {
+        Vec::new()
+    } else {
+        let got = fd_passing::recv_fds(sock.as_fd(), want).map_err(|e| match e.kind() {
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
+                HelperErrorCode::RequestTimeout
+            }
+            _ => HelperErrorCode::InvalidRequest,
+        })?;
+        // 本数が要求とちょうど一致しなければ拒否する（受けた fd は drop で閉じる）。
+        if got.token != EXTRACT_FD_TOKEN || got.fds.len() != want {
+            return Err(HelperErrorCode::InvalidRequest);
+        }
+        got.fds
+    };
+    // blob を置いたストアの所有者は、名前空間の中から見た自分の euid（範囲写像ではホストの利用者が 0 に見える）。
+    let status = read_bounded("/proc/self/status", MAX_STATUS_BYTES)?;
+    let owner = fandhe_container_supervisor::privilege::parse_proc_status(&status)
+        .map_err(|_| HelperErrorCode::Internal)?
+        .uid
+        .effective;
+    let fail = |e: fandhe_container_oci::error::OciError| HelperErrorCode::ExtractFailed(e.code());
+    let blobs = req
+        .layers()
+        .iter()
+        .zip(fds)
+        .map(|(l, fd)| {
+            VerifiedLayerBlob::from_file(File::from(fd), l.digest(), l.size(), owner).map_err(fail)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let layers: Vec<ImageLayer<'_>> = blobs
+        .iter()
+        .zip(req.layers())
+        .map(|(b, l)| ImageLayer::new(b, l.media_type(), l.diff_id()))
+        .collect();
+    let ownership = match maps {
+        Some((uid, gid)) => OwnershipPolicy::ChownInUserNamespace {
+            uid: to_oci_map(uid).map_err(|_| HelperErrorCode::Internal)?,
+            gid: to_oci_map(gid).map_err(|_| HelperErrorCode::Internal)?,
+        },
+        // 試験専用の `--no-join`（参加しないので写像が無い）。本番のビルドには存在しない。
+        None => OwnershipPolicy::Keep,
+    };
+    let special_bits = match req.special_bits() {
+        ExtractSpecialBits::Strip => SpecialBitsPolicy::Strip,
+        ExtractSpecialBits::PreserveIfChowned => SpecialBitsPolicy::PreserveIfChowned,
+    };
+    let options = ExtractOptions::new()
+        .with_ownership(ownership)
+        .with_special_bits(special_bits);
+    let link = format!("/proc/self/fd/{}", target.as_raw_fd());
+    let root = ExtractRoot::open_proc_fd_link(std::path::Path::new(&link)).map_err(fail)?;
+    let budget = ExtractBudget::new().with_deadline(deadline);
+    let done = extract_image_layers_bounded_in(
+        &NoopOciOpRecorder,
+        &layers,
+        &root,
+        req.max_uncompressed_bytes(),
+        req.limits(),
+        &options,
+        &budget,
+    )
+    .map_err(fail)?;
+    let entries: u64 = done.iter().map(|d| d.entries).sum();
+    Ok(ExtractReport {
+        layers: u32::try_from(done.len()).unwrap_or(u32::MAX),
+        entries: u32::try_from(entries).unwrap_or(u32::MAX),
+    })
 }
 
 /// fd 1（親ディレクトリ）の直下の固定名の木を消す。名前空間の中の能力は写像内の所有者の inode にしか効かず、oci の削除は
@@ -152,7 +258,7 @@ fn remove_child_tree(parent: &File, target: RemoveTarget) -> Result<(), HelperEr
 }
 
 /// 範囲写像の user namespace へ参加する（手順 5〜7）。
-fn join_user_namespace() -> Result<(), HelperErrorCode> {
+fn join_user_namespace() -> Result<JoinedMaps, HelperErrorCode> {
     let (privilege, source) =
         fandhe_container_supervisor::start_entry::resolve_self_launch_privilege()
             .map_err(|_| HelperErrorCode::NoSubordinateIds)?;
@@ -187,12 +293,12 @@ fn join_user_namespace() -> Result<(), HelperErrorCode> {
     if !matches!(hardening::get_dumpable(), Ok(0)) {
         return Err(HelperErrorCode::NotNonDumpable);
     }
-    Ok(())
+    Ok((maps.uid().clone(), maps.gid().clone()))
 }
 
-/// 要求を期限つきで読んで復号する。header の検査（上限・tag ごとの固定長）の後に、決まった長さ（高々 4 バイト）だけを
-/// 固定長バッファへ読む（確保しない）。
-fn read_request(sock: &UnixStream) -> Result<Mode, HelperErrorCode> {
+/// 要求を期限つきで読んで復号する。header の検査（上限・tag ごとの固定長）の後に、決まった長さ（高々
+/// [`MAX_EXTRACT_PAYLOAD_BYTES`]）だけを固定長バッファへ読む（確保しない）。
+fn read_request(sock: &UnixStream) -> Result<Request, HelperErrorCode> {
     let read = |buf: &mut [u8]| {
         (&*sock).read_exact(buf).map_err(|e| match e.kind() {
             std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
@@ -204,12 +310,12 @@ fn read_request(sock: &UnixStream) -> Result<Mode, HelperErrorCode> {
     let mut header = [0u8; REQUEST_HEADER_LEN];
     read(&mut header)?;
     let head = decode_request_header(&header)?;
-    let mut payload = [0u8; 4];
+    let mut payload = [0u8; MAX_EXTRACT_PAYLOAD_BYTES];
     let dst = payload
         .get_mut(..head.payload_len())
         .ok_or(HelperErrorCode::InvalidRequest)?;
     read(dst)?;
-    head.mode(payload.get(..head.payload_len()).unwrap_or(&[]))
+    head.request(payload.get(..head.payload_len()).unwrap_or(&[]))
 }
 
 fn inspect(joined: bool) -> Result<InspectReport, HelperErrorCode> {

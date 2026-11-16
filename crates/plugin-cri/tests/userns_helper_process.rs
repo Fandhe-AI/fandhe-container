@@ -170,13 +170,13 @@ fn sec5_4795_oversized_payload_len_is_rejected() {
     assert_eq!(finish(child), 1);
 }
 
-/// REPAIR-2・#4795: 壊れた header は `InvalidRequest`、予約済みの tag 3 は `Unimplemented`。
+/// REPAIR-2・#4795・#4847: 壊れた header は `InvalidRequest`、長さ 0 の tag 3（展開要求の固定部が無い）も `InvalidRequest`。
 #[test]
 fn sec5_4795_malformed_and_reserved_requests_get_fixed_errors() {
     for (header, want) in [
         ([9u8, 1, 0, 0, 0, 0, 0, 0], HelperErrorCode::InvalidRequest),
         ([1u8, 77, 0, 0, 0, 0, 0, 0], HelperErrorCode::InvalidRequest),
-        ([1u8, 3, 0, 0, 0, 0, 0, 0], HelperErrorCode::Unimplemented),
+        ([1u8, 3, 0, 0, 0, 0, 0, 0], HelperErrorCode::InvalidRequest),
     ] {
         let dir = Scratch::new("bad");
         let (child, mut sock) = spawn_raw(File::open(&dir.0).expect("open").into());
@@ -385,4 +385,193 @@ fn sec5_4800_remover_removes_the_tree_through_the_real_helper() {
     remover
         .remove_child_tree(dir.as_fd(), RemovalTarget::BundleRootfs, &budget)
         .expect("idempotent");
+}
+// ---- 展開モード（#4847。OCI-1・OCI-2・SEC-5・REPAIR-2・REPAIR-5）----
+
+use fandhe_container_oci::error::OciErrorCode;
+use fandhe_container_oci::layer::DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES;
+use fandhe_container_oci::layer::extract::ExtractLimits;
+use fandhe_container_oci::reference::Digest;
+use fandhe_container_plugin_cri::userns_helper::send_fds_for_test;
+use fandhe_container_plugin_cri::userns_helper::wire::{
+    EXTRACT_FD_TOKEN, ExtractLayerSpec, ExtractReport, ExtractRequest, ExtractSpecialBits,
+    encode_extract_request,
+};
+
+const TAR_MEDIA: &str = "application/vnd.oci.image.layer.v1.tar";
+
+/// 最小の ustar 1 エントリ（`container_grpc.rs` と同型）。
+fn tar_entry(name: &str, mode: u32, data: &[u8], dir: bool) -> Vec<u8> {
+    let mut h = [0u8; 512];
+    let mut put = |off: usize, bytes: &[u8]| h[off..off + bytes.len()].copy_from_slice(bytes);
+    put(0, name.as_bytes());
+    put(100, format!("{mode:07o}\0").as_bytes());
+    put(108, b"0000000\0");
+    put(116, b"0000000\0");
+    put(124, format!("{:011o}\0", data.len()).as_bytes());
+    put(136, b"00000000000\0");
+    put(148, b"        ");
+    put(156, if dir { b"5" } else { b"0" });
+    put(257, b"ustar\0");
+    put(263, b"00");
+    let sum: u32 = h.iter().map(|b| u32::from(*b)).sum();
+    h[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+    let mut out = h.to_vec();
+    out.extend_from_slice(data);
+    out.resize(512 + data.len().div_ceil(512) * 512, 0);
+    out
+}
+
+/// dir `d/` と file `d/f`（"hello"）の非圧縮 tar（終端ブロックつき）。
+fn sample_tar() -> Vec<u8> {
+    let mut t = tar_entry("d/", 0o755, b"", true);
+    t.extend(tar_entry("d/f", 0o644, b"hello", false));
+    t.extend([0u8; 1024]);
+    t
+}
+
+/// 自分が所有する 0600・nlink 1 の blob ファイル（`VerifiedLayerBlob` の信頼条件を満たす）。
+fn write_blob(dir: &std::path::Path, bytes: &[u8]) -> File {
+    let p = dir.join("blob");
+    std::fs::write(&p, bytes).expect("write blob");
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    File::open(&p).expect("open blob")
+}
+
+fn extract_request(tar: &[u8], digest: Digest) -> ExtractRequest {
+    let size = u64::try_from(tar.len()).expect("fits");
+    let layer = ExtractLayerSpec::new(TAR_MEDIA, size, digest.clone(), digest).expect("layer");
+    ExtractRequest::new(
+        ExtractSpecialBits::Strip,
+        ExtractLimits::default(),
+        DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES,
+        vec![layer],
+    )
+    .expect("request")
+}
+
+/// SEC-5・OCI-1・#4847: 展開要求が往復する。blob の fd と展開先の fd だけを渡し（パスなし）、helper が再検証して展開する。
+#[test]
+fn sec5_4847_extract_round_trips_through_the_real_helper() {
+    let t = Tree::new("extract-ok");
+    let tar = sample_tar();
+    let blob = write_blob(&t.0, &tar);
+    let dest_path = t.0.join("dest");
+    std::fs::create_dir(&dest_path).expect("mkdir");
+    let dest = open_dir(&dest_path);
+    let req = extract_request(&tar, Digest::sha256_of(&tar));
+    let r = launcher()
+        .run_extract_bounded(&req, &[blob.as_fd()], dest.as_fd(), budget(), None, None)
+        .expect("extract");
+    assert_eq!(
+        r,
+        ExtractReport {
+            layers: 1,
+            entries: 2
+        }
+    );
+    assert_eq!(
+        std::fs::read(dest_path.join("d/f")).expect("read"),
+        b"hello"
+    );
+    assert!(dest_path.join("d").is_dir());
+}
+
+/// SEC-5・OCI-1・#4847: blob の digest が要求と違うと、helper は `ExtractFailed(DataLoss)` を返し、展開先に何も書かない。
+#[test]
+fn sec5_4847_digest_mismatch_is_data_loss_and_writes_nothing() {
+    let t = Tree::new("extract-bad-digest");
+    let tar = sample_tar();
+    let blob = write_blob(&t.0, &tar);
+    let dest_path = t.0.join("dest");
+    std::fs::create_dir(&dest_path).expect("mkdir");
+    let dest = open_dir(&dest_path);
+    let req = extract_request(&tar, Digest::sha256_of(b"something else"));
+    let err = launcher()
+        .run_extract_bounded(&req, &[blob.as_fd()], dest.as_fd(), budget(), None, None)
+        .expect_err("digest mismatch");
+    assert_eq!(
+        err.helper_code(),
+        Some(HelperErrorCode::ExtractFailed(OciErrorCode::DataLoss))
+    );
+    assert_eq!(err.code(), ErrorCode::Internal);
+    assert_eq!(std::fs::read_dir(&dest_path).expect("ls").count(), 0);
+}
+
+/// SEC-5・REPAIR-5・#4847: 要求の後に fd を送らない親には、helper が期限（2 秒）で `RequestTimeout` を返して終わる。
+#[test]
+fn sec5_4847_missing_fds_get_request_timeout() {
+    let t = Tree::new("extract-nofds");
+    let tar = sample_tar();
+    let req = extract_request(&tar, Digest::sha256_of(&tar));
+    let (child, mut sock) = spawn_raw(open_dir(&t.0).into());
+    sock.write_all(encode_extract_request(&req).as_bytes())
+        .expect("write frame");
+    assert_eq!(
+        read_response(&mut sock),
+        Some(Err(HelperErrorCode::RequestTimeout))
+    );
+    assert_eq!(finish(child), 1);
+}
+
+/// SEC-5・REPAIR-5・#4847: fd の本数・token が要求と合わない通信は `InvalidRequest`（余分な fd は閉じられ、何も展開しない）。
+#[test]
+fn sec5_4847_wrong_fd_count_or_token_is_invalid() {
+    let t = Tree::new("extract-count");
+    let tar = sample_tar();
+    let blob = write_blob(&t.0, &tar);
+    let req = extract_request(&tar, Digest::sha256_of(&tar));
+    // (token, 送る本数): 2 本（要求は 1 本）・token 違い・fd なしの通常 1 バイト。
+    for (token, n) in [(EXTRACT_FD_TOKEN, 2usize), (0x01, 1), (EXTRACT_FD_TOKEN, 0)] {
+        let dest_path = t.0.join(format!("dest-{token}-{n}"));
+        std::fs::create_dir(&dest_path).expect("mkdir");
+        let (child, mut sock) = spawn_raw(open_dir(&dest_path).into());
+        sock.write_all(encode_extract_request(&req).as_bytes())
+            .expect("write frame");
+        if n == 0 {
+            sock.write_all(&[token]).expect("write token");
+        } else {
+            let fds = vec![blob.as_fd(); n];
+            send_fds_for_test(sock.as_fd(), token, &fds).expect("send fds");
+        }
+        assert_eq!(
+            read_response(&mut sock),
+            Some(Err(HelperErrorCode::InvalidRequest)),
+            "token {token:#x} n {n}"
+        );
+        assert_eq!(finish(child), 1);
+        assert_eq!(std::fs::read_dir(&dest_path).expect("ls").count(), 0);
+    }
+}
+
+/// REPAIR-2・SEC-5・#4847: 壊れた展開要求の payload（予約・未知の media・所有者の方針・制限値・work_ms）は `InvalidRequest`。
+#[test]
+fn sec5_4847_malformed_extract_payloads_get_invalid_request() {
+    let t = Tree::new("extract-malformed");
+    let tar = sample_tar();
+    let good = encode_extract_request(&extract_request(&tar, Digest::sha256_of(&tar)))
+        .as_bytes()
+        .to_vec();
+    let mutations: [(&str, usize, Vec<u8>); 8] = [
+        ("reserved", 57, vec![1]),
+        ("media 0", 56, vec![0]),
+        ("media 7", 56, vec![7]),
+        ("ownership 2", 8, vec![2]),
+        ("special 0", 9, vec![0]),
+        ("limit 0", 16, 0u64.to_be_bytes().to_vec()),
+        ("limit over default", 16, u64::MAX.to_be_bytes().to_vec()),
+        ("work 0", 12, vec![0, 0, 0, 0]),
+    ];
+    for (name, at, bytes) in mutations {
+        let mut b = good.clone();
+        b[at..at + bytes.len()].copy_from_slice(&bytes);
+        let (child, mut sock) = spawn_raw(open_dir(&t.0).into());
+        sock.write_all(&b).expect("write frame");
+        assert_eq!(
+            read_response(&mut sock),
+            Some(Err(HelperErrorCode::InvalidRequest)),
+            "{name}"
+        );
+        assert_eq!(finish(child), 1);
+    }
 }

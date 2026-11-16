@@ -217,7 +217,7 @@ tar のコンテナ内 ID をそのまま `chown` する（namespace の中で�
   `special-bits=strip` のため `FAILED_PRECONDITION`（`image rootfs cache entry was unpacked with different settings`）で
   拒否される。該当の `<cache>/rootfs/sha256/<hex>` を手動で消して pull し直す（自動移行は未実装）。
   再 exec する helper の入口（隠し引数・親側の起動部品・参加・結果の返却）は #4795 で実装済み
-  （[userns-extract-helper.md](./userns-extract-helper.md)。削除 H3 は #4800 で実装済み。展開 H2・対応表の切り替え H6・CI H7 は未）。
+  （[userns-extract-helper.md](./userns-extract-helper.md)。削除 H3 は #4800、helper の展開モードは #4847 で実装済み。cri の注入点と呼び出し・対応表の切り替え H6・CI H7 は未）。
   残り（後続 issue・要起票）: `ChownInUserNamespace` の展開本体・記録の符号化・
   `image_ownership` の置き場所。
   pull と create は `ImageExtractConfig` の 1 か所から同じ値を配る（食い違うと記録の照合で `FAILED_PRECONDITION`）。配線するときの確認事項: `ChownMapped` で展開した rootfs に、

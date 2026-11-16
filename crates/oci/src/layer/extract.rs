@@ -159,8 +159,8 @@
 //! - rootless の user namespace へ入って `ImageRootfsUnpacker::unpack` を呼ぶ core 側の配線と、subuid 所有の
 //!   rootfs の削除経路（#2315・#482。本モジュールの `ChownInUserNamespace` は展開器の側だけ）。
 //!   `PreserveIfOwnerMapped`（`chown` しない 1 行の写像）は従来どおり。
-//! - 0700 の祖先ディレクトリで閉じ込めを判定する方式。`root` が 0700 のため、複数範囲の写像でもコンテナ内の
-//!   非 root ユーザーは `/` を辿れない。
+//! - 0700 の祖先での閉じ込め（#4804）の cri・plugin-cri への結線（S2）。oci 側（`extract_image_layers_confined_in`・
+//!   `extract_layers_confined`）は実装済みだが、本番の呼び出し元はまだ祖先を渡さず、`PreserveIfOwnerMapped` を有効にしていない。
 //! - macOS・Windows・Linux の他アーキテクチャでの、展開と公開の `remove_extracted_tree` のディレクトリ fd 起点の
 //!   解決（現状はパス起点で、確認から使用までの TOCTOU と、木の中に残ったマウントの中身の削除を防げない。#2598 で
 //!   広げないと決めた。特殊ビットの保持は Linux 限定のため SEC-5 の TOCTOU は Linux 固有で、macOS・Windows の本番経路は
@@ -177,13 +177,15 @@
 //!
 //! `SpecialBitsPolicy::PreserveIfOwnerMapped` を渡した呼び出しだけが、次の条件をすべて満たすビットを tar の値のまま
 //! 適用する（それ以外は落とす。fail-closed）。条件と根拠は `docs/design/oci-layer-special-bits.md`。
-//! - ホストが Linux で、`root` が実行ユーザー所有の 0700（group / other に権限なし）であること。
+//! - ホストが Linux で、`root` が実行ユーザー所有の 0700（group / other に権限なし）であること。祖先（0700 の
+//!   ディレクトリ fd）を渡した入口では、`root` 自身の代わりに祖先が「ディレクトリ・0700・`root` と同じ所有 uid・`root` が
+//!   その配下」を満たすこと（`root` は 0755 でよい。満たさなければ `ConfinementAncestorRejected`。#4778・#4804）。
 //! - setuid: 書いたファイルの所有 uid が 0 でなく、tar の uid を写像（`IdRange`）した host uid と一致すること。
 //! - setgid: 書いたファイルの所有 uid と gid がともに 0 でなく、tar の gid を写像した host gid と一致すること
 //!   （rootful〔所有 uid 0〕は setuid / setgid を常に落とす。#2251 P2-1）。
 //! - sticky: 上記のポリシー全体の条件を満たすこと。
 //! - 判定の直前と、ビットを付けた直後に、開いた `root` の fd の `fstat` で「`root` が開始時と同じ所有者の 0700」を
-//!   確かめ直す。変わっていたら、そのファイルを含め以後のビットはすべて落とし（`SpecialBitsDecision::
+//!   確かめ直す（祖先を渡したときは祖先の `fstat`。「`root` が祖先の配下」は全レイヤー後に 1 回だけ確かめる）。変わっていたら、そのファイルを含め以後のビットはすべて落とし（`SpecialBitsDecision::
 //!   RootChangedDuringExtraction`）、保持済みのビットが 1 件でもあれば全レイヤーの展開後に `FailedPrecondition` で
 //!   展開全体を拒否する（遡って外さず fail-closed。`Err` を受けた呼び出し側が `root` ごと破棄する）。
 //! - 適用後に mode を読み戻し、ビットが残っていなければ適用したことにしない。ビットごとの件数は
@@ -329,7 +331,8 @@ pub struct ExtractedLayer {
 ///
 /// 展開の入口 `extract_layers_with_policy` / `extract_image_layers_with_policy`（と `*_with_options` の `ExtractOptions`）が受け取る。呼び出し元は、
 /// rootfs を排他的に所有し、展開から rootfs として使い終わるまで `root` を 0700 に保つこと（権限の後からの
-/// 変更〔TOCTOU〕は防げない）。コンテナ内で setuid が効くかは `process.noNewPrivileges` に依り、本ポリシーは
+/// 変更〔TOCTOU〕は防げない）。祖先を渡す入口（`extract_image_layers_confined_in`）では、代わりに祖先を排他的に
+/// 所有して 0700 に保ち、`root` 自身は 0755 でもよい（#4804）。コンテナ内で setuid が効くかは `process.noNewPrivileges` に依り、本ポリシーは
 /// ビットの保持までを扱う。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
@@ -574,6 +577,9 @@ pub enum SpecialBitsDecision {
     UnsupportedHost,
     /// `root` が group / other に開かれている、または root の確認ができず、すべて落とした。
     RootAccessibleByOthers,
+    /// 閉じ込めの祖先が条件（ディレクトリ・0700・`root` と同じ所有 uid・`root` がその配下）を満たさず、すべて落とした
+    /// （祖先を渡したときだけ。#4804・SEC-5・SEC-1）。
+    ConfinementAncestorRejected,
     /// ファイルごとの条件で判定した。
     Evaluated,
     /// 展開中に `root` の所有者または 0700 が変わったことを検出し、以後のファイルはすべて落とした（#2437）。
@@ -1035,27 +1041,101 @@ pub fn extract_image_layers_bounded_in(
     )
 }
 
+/// `extract_image_layers_bounded_in` に、特殊ビット保持の閉じ込めを判定する 0700 の祖先 `ancestor` を足した版
+/// （SEC-5・SEC-1・OCI-2・#4778・#4804）。
+///
+/// `ancestor` が `Some` で `SpecialBitsPolicy::PreserveIfOwnerMapped` のとき、`root` 自身が 0700 である条件の代わりに
+/// 祖先で判定する。祖先が「ディレクトリ・group / other に権限なし（0700）・`root` と同じ所有 uid・`root` が配下」
+/// を満たさなければ全ビットを落とす（`SpecialBitsDecision::ConfinementAncestorRejected`）。`root` 自身は 0755 でよい。
+/// 展開の開始・各判定・全レイヤー後（`chown_root` の前）に祖先を `fstat` で再確認し、保持済みのビットがあるのに崩れたら
+/// `FailedPrecondition` で拒否する。`None`・`Strip`・`PreserveIfChowned` では従来どおり `root` 自身の 0700 で判定する。
+/// 呼び出し側の契約: 祖先を排他的に所有し、`root` を rootfs として使い終わるまで 0700 に保つ。
+/// cri の本番経路への結線は S2（#4804 の後続）。
+// 既存の `_bounded_in` に祖先を足した並びを保つ（引数をまとめる型は本入口 1 つのために作らない）。
+#[allow(clippy::too_many_arguments)]
+pub fn extract_image_layers_confined_in(
+    recorder: &dyn OciOpRecorder,
+    layers: &[ImageLayer<'_>],
+    root: &ExtractRoot,
+    ancestor: Option<&ExtractRoot>,
+    max_uncompressed_bytes: u64,
+    limits: ExtractLimits,
+    options: &ExtractOptions,
+    budget: &ExtractBudget<'_>,
+) -> Result<Vec<ExtractedLayer>, OciError> {
+    let root = match ancestor {
+        Some(a) => RootRef::HandleUnder(root, a),
+        None => RootRef::Handle(root),
+    };
+    extract_image_layers_at(
+        recorder,
+        layers,
+        root,
+        max_uncompressed_bytes,
+        limits,
+        options,
+        budget,
+    )
+}
+
+/// `extract_layers_bounded` に閉じ込めの祖先を足した版（契約は [`extract_image_layers_confined_in`] と同じ。#4804）。
+pub fn extract_layers_confined<R: Read + Seek>(
+    recorder: &dyn OciOpRecorder,
+    layers: impl IntoIterator<Item = R>,
+    root: &Path,
+    ancestor: Option<&ExtractRoot>,
+    limits: ExtractLimits,
+    options: &ExtractOptions,
+    budget: &ExtractBudget<'_>,
+) -> Result<Vec<ExtractedLayer>, OciError> {
+    let root = match ancestor {
+        Some(a) => RootRef::PathUnder(root, a),
+        None => RootRef::Path(root),
+    };
+    extract_stack_bounded(
+        recorder,
+        layers.into_iter().map(Rewind::new),
+        root,
+        limits,
+        host_lstat,
+        SpecialSetup::from_options(options),
+        *budget,
+    )
+}
+
 /// 展開の根の渡され方（パス、または開いた fd。#4180）。
 #[derive(Clone, Copy)]
 enum RootRef<'a> {
     Path(&'a Path),
     Handle(&'a ExtractRoot),
+    /// `Path` に閉じ込めの祖先（0700 のディレクトリ fd）を足したもの（#4804）。
+    PathUnder(&'a Path, &'a ExtractRoot),
+    /// `Handle` に閉じ込めの祖先を足したもの（#4804）。
+    HandleUnder(&'a ExtractRoot, &'a ExtractRoot),
 }
 
 impl RootRef<'_> {
+    /// 閉じ込めの祖先（`PreserveIfOwnerMapped` の判定だけが使う）。
+    fn ancestor(&self) -> Option<&ExtractRoot> {
+        match self {
+            Self::Path(_) | Self::Handle(_) => None,
+            Self::PathUnder(_, a) | Self::HandleUnder(_, a) => Some(a),
+        }
+    }
+
     /// 変更操作の起点を作る（パスなら開く。fd ならその複製を使い開き直さない）。
     fn open_anchor(&self, hooks: AnchorHooks) -> Result<AnchoredRoot, OciError> {
         match self {
-            Self::Path(p) => AnchoredRoot::open(p, hooks),
-            Self::Handle(h) => h.open_anchor(hooks),
+            Self::Path(p) | Self::PathUnder(p, _) => AnchoredRoot::open(p, hooks),
+            Self::Handle(h) | Self::HandleUnder(h, _) => h.open_anchor(hooks),
         }
     }
 
     /// 親ディレクトリの確認（`lstat`）に使うパス。fd のときは `/proc/self/fd/<fd>`。
     fn probe_path(&self) -> Result<PathBuf, OciError> {
         match self {
-            Self::Path(p) => Ok(p.to_path_buf()),
-            Self::Handle(h) => h.probe_path(),
+            Self::Path(p) | Self::PathUnder(p, _) => Ok(p.to_path_buf()),
+            Self::Handle(h) | Self::HandleUnder(h, _) => h.probe_path(),
         }
     }
 }
@@ -1382,6 +1462,9 @@ struct Extractor<'a> {
     mode_readback: fn(&fs::File) -> u32,
     /// 特殊ビットのポリシーの評価結果（展開の開始時に 1 回決める）。
     special: SpecialCtx,
+    /// `PreserveIfOwnerMapped` の閉じ込めを判定する 0700 の祖先（`None` なら `root` 自身。#4804）。
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    ancestor: Option<&'a ExtractRoot>,
     /// 所有者の rwx が欠けるディレクトリの（物理パス, mode）。子の作成を妨げないよう全レイヤーの処理後に適用する。
     /// キーは `NameIndex` の ID。ディレクトリを削除したら、索引から外した ID の項目も必ず取り除く（`drop_ids`）。
     ///
@@ -2142,7 +2225,14 @@ impl SpecialCtx {
 }
 
 /// ポリシー全体の条件（ポリシー・ホスト OS・`root` の権限）を評価する。`check_root_empty` の後に 1 回だけ呼ぶ。
-fn eval_special_ctx(setup: &SpecialSetup, anchor: &AnchoredRoot) -> Result<SpecialCtx, OciError> {
+///
+/// `ancestor` が `Some` で `PreserveIfOwnerMapped` のときは、`root` 自身の 0700 の代わりに祖先で閉じ込めを判定する
+/// （#4804。`ancestor_confines`）。
+fn eval_special_ctx(
+    setup: &SpecialSetup,
+    anchor: &AnchoredRoot,
+    ancestor: Option<&ExtractRoot>,
+) -> Result<SpecialCtx, OciError> {
     let mut ctx = SpecialCtx::strip();
     ctx.owner_of = setup.owner_of;
     let (mapped, chowned) = match setup.policy {
@@ -2157,7 +2247,22 @@ fn eval_special_ctx(setup: &SpecialSetup, anchor: &AnchoredRoot) -> Result<Speci
         // 0700 なら祖先の権限に依らず、ほかのユーザーは root より下へ入れない。
         ctx.decision = SpecialBitsDecision::RootAccessibleByOthers;
         let m = anchor.root_meta().map_err(|e| map_fs_err(&e))?;
-        if m.is_dir() && m.permissions().mode() & 0o077 == 0 {
+        let root_uid = (setup.owner_of)(&m).0;
+        let confine_by = ancestor.filter(|_| mapped.is_some());
+        let confined = match confine_by {
+            Some(a) => {
+                ctx.decision = SpecialBitsDecision::ConfinementAncestorRejected;
+                match a.meta() {
+                    Ok(am) => {
+                        ancestor_confines(&am, root_uid, setup.owner_of)
+                            && anchor.is_beneath(a).unwrap_or(false)
+                    }
+                    Err(_) => false,
+                }
+            }
+            None => m.is_dir() && m.permissions().mode() & 0o077 == 0,
+        };
+        if confined {
             ctx.decision = SpecialBitsDecision::Evaluated;
             ctx.ranges = mapped;
             ctx.chowned_mode = chowned;
@@ -2165,14 +2270,22 @@ fn eval_special_ctx(setup: &SpecialSetup, anchor: &AnchoredRoot) -> Result<Speci
                 setup.ownership,
                 OwnershipPolicy::ChownInUserNamespace { .. }
             );
-            ctx.root_uid = (setup.owner_of)(&m).0;
+            ctx.root_uid = root_uid;
         }
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (mapped, chowned, anchor);
+        let _ = (mapped, chowned, anchor, ancestor);
     }
     Ok(ctx)
+}
+
+/// 閉じ込めの祖先のメタデータが条件（ディレクトリ・group / other に権限なし・所有 uid が `root` と同じ）を
+/// 満たすか。「`root` が祖先の配下」は別に `AnchoredRoot::is_beneath` で確かめる（#4804・SEC-5・SEC-1）。
+#[cfg(target_os = "linux")]
+fn ancestor_confines(m: &fs::Metadata, root_uid: u32, owner_of: OwnerOf) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    m.is_dir() && m.permissions().mode() & 0o077 == 0 && owner_of(m).0 == root_uid
 }
 
 /// 残してよい特殊ビットを返す（ファイル単位の条件。モジュール冒頭を参照）。副作用なし。
@@ -2942,6 +3055,12 @@ impl Extractor<'_> {
     #[cfg(target_os = "linux")]
     fn root_still_private(&self) -> bool {
         use std::os::unix::fs::PermissionsExt as _;
+        // 祖先で閉じ込めを判定しているとき（#4804）は、`root` ではなく祖先の 0700・所有者を見る（`root` は 0755 でよい）。
+        if let Some(a) = self.ancestor.filter(|_| self.special.ranges.is_some()) {
+            return a.meta().is_ok_and(|m| {
+                ancestor_confines(&m, self.special.root_uid, self.special.owner_of)
+            });
+        }
         self.anchor.root_meta().is_ok_and(|m| {
             m.is_dir()
                 && m.permissions().mode() & 0o077 == 0
@@ -2954,7 +3073,23 @@ impl Extractor<'_> {
         false
     }
 
-    /// 全レイヤーの展開後に、保持した特殊ビットの前提（`root` の所有者と 0700）が最後まで保たれたかを確かめる。
+    /// 祖先を渡したとき、`root` が今も祖先の配下か（全レイヤー後に 1 回だけ確かめる。ファイルごとには走らせない）。
+    /// 祖先なしは真。
+    #[cfg(target_os = "linux")]
+    fn root_still_beneath_ancestor(&self) -> bool {
+        match self.ancestor.filter(|_| self.special.ranges.is_some()) {
+            Some(a) => self.anchor.is_beneath(a).unwrap_or(false),
+            None => true,
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn root_still_beneath_ancestor(&self) -> bool {
+        true
+    }
+
+    /// 全レイヤーの展開後に、保持した特殊ビットの前提（`root` の所有者と 0700。祖先を渡したときは祖先の 0700・所有者と
+    /// `root` が祖先の配下であること）が最後まで保たれたかを確かめる。
     ///
     /// 保持済みのビットが 1 件以上あるのに、展開中に前提が崩れた（検出済み、または今も崩れている）なら、既に付けた
     /// ビットを遡って外す代わりに結果全体を `FailedPrecondition` で拒否する（fail-closed。呼び出し側が `root` ごと
@@ -2968,7 +3103,8 @@ impl Extractor<'_> {
             || self.preserved_bits.sticky > 0;
         if kept_any
             && (self.special.decision == SpecialBitsDecision::RootChangedDuringExtraction
-                || !self.root_still_private())
+                || !self.root_still_private()
+                || !self.root_still_beneath_ancestor())
         {
             return Err(err(
                 OciErrorCode::FailedPrecondition,
@@ -3435,7 +3571,8 @@ fn extract_stack_bounded<'a, S: LayerSource>(
                     preserved_bits: SpecialBitCounts::default(),
                     stripped_bits: SpecialBitCounts::default(),
                     mode_readback: setup.mode_readback,
-                    special: eval_special_ctx(&setup, &anchor)?,
+                    special: eval_special_ctx(&setup, &anchor, root.ancestor())?,
+                    ancestor: root.ancestor(),
                     anchor,
                     deferred_dirs: HashMap::new(),
                     own,
@@ -5885,6 +6022,7 @@ mod tests {
             stripped_bits: SpecialBitCounts::default(),
             mode_readback: special_bits_of,
             special: SpecialCtx::strip(),
+            ancestor: None,
             deferred_dirs: HashMap::new(),
             own: None,
             chowned: 0,
@@ -7964,6 +8102,223 @@ mod tests {
                 owner_of: owner,
                 ..SpecialSetup::host(policy_1000())
             }
+        }
+
+        // ---- 閉じ込めの祖先（#4804・SEC-5・SEC-1・OCI-2） ----
+
+        thread_local! {
+            /// 所有 uid を 2000 に見せる祖先の inode（0 なら無し）。
+            static ANC_INO: Cell<u64> = const { Cell::new(0) };
+        }
+
+        fn setup_anc() -> SpecialSetup {
+            fn owner(m: &fs::Metadata) -> (u32, u32) {
+                use std::os::unix::fs::MetadataExt as _;
+                if m.is_dir() && m.ino() == ANC_INO.get() {
+                    (2000, 1000)
+                } else {
+                    (1000, 1000)
+                }
+            }
+            SpecialSetup {
+                owner_of: owner,
+                ..SpecialSetup::host(policy_1000())
+            }
+        }
+
+        /// 祖先 `anc` を渡して `sb.root` へ 1 レイヤーを展開する。
+        fn run_under(
+            sb: &Sandbox,
+            anc: &Path,
+            entries: &[Vec<u8>],
+            setup: SpecialSetup,
+            lstat: Lstat,
+        ) -> Result<ExtractedLayer, OciError> {
+            let a = ExtractRoot::open_existing_dir(anc).unwrap();
+            let tar = archive(entries);
+            extract_stack_bounded(
+                &NoopOciOpRecorder,
+                [Rewind::new(Cursor::new(tar.as_slice()))],
+                RootRef::PathUnder(&sb.root, &a),
+                LIM(),
+                lstat,
+                setup,
+                ExtractBudget::new(),
+            )
+            .and_then(single)
+        }
+
+        /// SEC-5・SEC-1・OCI-2・#4804: 祖先が 0700・同 uid なら、`root` が 0755 でも特殊ビットを保持する。
+        #[test]
+        fn sec5_ancestor_0700_allows_bits_with_root_0755() {
+            let sb = Sandbox::new();
+            chmod_root(&sb, 0o755);
+            let anc = sb.base.clone();
+            fs::set_permissions(&anc, fs::Permissions::from_mode(0o700)).unwrap();
+            let l = run_under(&sb, &anc, &special_entries(), setup_anc(), host_lstat).unwrap();
+            assert_eq!(l.special_bits.decision, SpecialBitsDecision::Evaluated);
+            assert_eq!(l.special_bits.preserved_files, 4);
+            let b = l.special_bits.preserved_bits;
+            assert_eq!((b.setuid, b.setgid, b.sticky), (2, 2, 1));
+            assert_eq!(mode_of(&sb.root.join("suid")), 0o4755);
+            assert_eq!(mode_of(&sb.root.join("both")), 0o6711);
+            assert_eq!(mode_of(&sb.root.join("sticky")), 0o1644);
+        }
+
+        /// SEC-5・SEC-1・#4804: 祖先自身を `root` として渡しても条件を満たせば保持する（配下の定義に自身を含む）。
+        #[test]
+        fn sec5_ancestor_equal_to_root_is_beneath() {
+            let sb = Sandbox::new();
+            chmod_root(&sb, 0o700);
+            let root = sb.root.clone();
+            let l = run_under(&sb, &root, &special_entries(), setup_anc(), host_lstat).unwrap();
+            assert_eq!(l.special_bits.decision, SpecialBitsDecision::Evaluated);
+            assert_eq!(l.special_bits.preserved_files, 4);
+        }
+
+        fn assert_ancestor_rejected(l: &ExtractedLayer, sb: &Sandbox) {
+            assert_eq!(
+                l.special_bits.decision,
+                SpecialBitsDecision::ConfinementAncestorRejected
+            );
+            assert_eq!(l.special_bits.preserved_files, 0);
+            assert_eq!(l.files_with_stripped_special_bits, 4);
+            let b = l.special_bits.stripped_bits;
+            assert_eq!((b.setuid, b.setgid, b.sticky), (2, 2, 1));
+            assert_eq!(mode_of(&sb.root.join("suid")), 0o755);
+            assert_eq!(mode_of(&sb.root.join("both")), 0o711);
+            assert_eq!(mode_of(&sb.root.join("sticky")), 0o644);
+        }
+
+        /// SEC-5・SEC-1・#4804: 祖先が 0750（group に開く）なら全ビットを落とす。
+        #[test]
+        fn sec5_ancestor_0750_is_rejected() {
+            let sb = Sandbox::new();
+            chmod_root(&sb, 0o755);
+            let anc = sb.base.clone();
+            fs::set_permissions(&anc, fs::Permissions::from_mode(0o750)).unwrap();
+            let l = run_under(&sb, &anc, &special_entries(), setup_anc(), host_lstat).unwrap();
+            assert_ancestor_rejected(&l, &sb);
+        }
+
+        /// SEC-5・SEC-1・#4804: 祖先の所有 uid が `root` と違えば全ビットを落とす。
+        #[test]
+        fn sec5_ancestor_owner_mismatch_is_rejected() {
+            use std::os::unix::fs::MetadataExt as _;
+            let sb = Sandbox::new();
+            chmod_root(&sb, 0o755);
+            let anc = sb.base.clone();
+            fs::set_permissions(&anc, fs::Permissions::from_mode(0o700)).unwrap();
+            ANC_INO.set(fs::metadata(&anc).unwrap().ino());
+            let r = run_under(&sb, &anc, &special_entries(), setup_anc(), host_lstat);
+            ANC_INO.set(0);
+            assert_ancestor_rejected(&r.unwrap(), &sb);
+        }
+
+        /// SEC-5・SEC-1・#4804: `root` が祖先の配下でなければ（無関係な 0700 ディレクトリ）全ビットを落とす。
+        #[test]
+        fn sec5_ancestor_not_above_root_is_rejected() {
+            let sb = Sandbox::new();
+            chmod_root(&sb, 0o755);
+            let other = sb.base.join("other");
+            fs::create_dir(&other).unwrap();
+            fs::set_permissions(&other, fs::Permissions::from_mode(0o700)).unwrap();
+            let l = run_under(&sb, &other, &special_entries(), setup_anc(), host_lstat).unwrap();
+            assert_ancestor_rejected(&l, &sb);
+        }
+
+        /// SEC-5・SEC-1・#4804: 祖先がディレクトリでなければ条件を満たさない（純関数の照合）。
+        #[test]
+        fn sec5_ancestor_confines_matrix() {
+            let sb = Sandbox::new();
+            let f = sb.base.join("not-a-dir");
+            fs::write(&f, b"x").unwrap();
+            let fm = fs::metadata(&f).unwrap();
+            assert!(!ancestor_confines(&fm, 1000, owner_1000));
+            fs::set_permissions(&sb.base, fs::Permissions::from_mode(0o700)).unwrap();
+            let dm0700 = fs::metadata(&sb.base).unwrap();
+            assert!(ancestor_confines(&dm0700, 1000, owner_1000));
+            assert!(!ancestor_confines(&dm0700, 1001, owner_1000));
+        }
+
+        /// SEC-5・#4804: `Strip` は祖先を渡しても `StripPolicy`、`PreserveIfChowned` は祖先を無視して `root` の 0700 で判定する。
+        #[test]
+        fn sec5_ancestor_ignored_for_strip_and_chowned() {
+            let sb = Sandbox::new();
+            chmod_root(&sb, 0o755);
+            let anc = sb.base.clone();
+            fs::set_permissions(&anc, fs::Permissions::from_mode(0o700)).unwrap();
+            let strip = SpecialSetup::host(SpecialBitsPolicy::Strip);
+            let l = run_under(&sb, &anc, &special_entries(), strip, host_lstat).unwrap();
+            assert_eq!(l.special_bits.decision, SpecialBitsDecision::StripPolicy);
+        }
+
+        /// SEC-5・SEC-1・#4804: 保持済みのビットがある状態で祖先が 0755 になったら、終了時に `FailedPrecondition` で拒否する。
+        #[test]
+        fn sec5_ancestor_mode_change_after_preserved_file_fails_closed() {
+            fn lstat_then_open(p: &Path) -> std::io::Result<fs::Metadata> {
+                let m = fs::symlink_metadata(p);
+                if p.file_name().is_some_and(|n| n == "plain") {
+                    let anc = p.parent().unwrap().parent().unwrap();
+                    fs::set_permissions(anc, fs::Permissions::from_mode(0o755)).unwrap();
+                }
+                m
+            }
+            let sb = Sandbox::new();
+            chmod_root(&sb, 0o755);
+            let anc = sb.base.clone();
+            fs::set_permissions(&anc, fs::Permissions::from_mode(0o700)).unwrap();
+            let r = run_under(
+                &sb,
+                &anc,
+                &[
+                    file_owned("suid", 0o4755, 0, 0, b"a"),
+                    file("plain", 0o644, b"b"),
+                ],
+                setup_anc(),
+                lstat_then_open,
+            );
+            let e = r.expect_err("fail closed");
+            assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+            assert_eq!(
+                e.message(),
+                "the extraction root changed while special mode bits were preserved"
+            );
+        }
+
+        /// SEC-5・SEC-1・#4804: 保持前に祖先が 0755 になったら、以後の全ビットを落とす（`RootChangedDuringExtraction`）。
+        #[test]
+        fn sec5_ancestor_mode_change_before_special_file_strips_remaining() {
+            fn lstat_then_open(p: &Path) -> std::io::Result<fs::Metadata> {
+                let m = fs::symlink_metadata(p);
+                if p.file_name().is_some_and(|n| n == "suid") {
+                    let anc = p.parent().unwrap().parent().unwrap();
+                    fs::set_permissions(anc, fs::Permissions::from_mode(0o755)).unwrap();
+                }
+                m
+            }
+            let sb = Sandbox::new();
+            chmod_root(&sb, 0o755);
+            let anc = sb.base.clone();
+            fs::set_permissions(&anc, fs::Permissions::from_mode(0o700)).unwrap();
+            let l = run_under(
+                &sb,
+                &anc,
+                &[
+                    file_owned("suid", 0o4755, 0, 0, b"a"),
+                    file_owned("sgid", 0o2755, 0, 0, b"b"),
+                ],
+                setup_anc(),
+                lstat_then_open,
+            )
+            .unwrap();
+            assert_eq!(
+                l.special_bits.decision,
+                SpecialBitsDecision::RootChangedDuringExtraction
+            );
+            assert_eq!(l.special_bits.preserved_files, 0);
+            assert_eq!(mode_of(&sb.root.join("suid")), 0o755);
+            assert_eq!(mode_of(&sb.root.join("sgid")), 0o755);
         }
 
         /// SEC-5・#2437: 展開の途中で `root` が 0755 に変わると、以後の特殊ビットはすべて落ちる。

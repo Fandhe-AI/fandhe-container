@@ -12,6 +12,9 @@
 //! - Remove（H3。#4800）: 範囲写像の user namespace の中で作った subuid 所有の木（最上位自身も subuid 所有・0700、
 //!   0555 の子を含む）は、ホスト側の削除では消えず（陽性対照）、削除モードで消える。親ディレクトリは残る。木の作成は本試験
 //!   バイナリを `--populate <dir>` で再実行した子（単一スレッド）が行う
+//! - Extract（#4847）: tar の所有者（uid 1000・gid 1000）が、範囲写像の user namespace の中では tar の値のまま見える
+//!   （`ChownInUserNamespace`。StatTarget で `d/` の fd を名前空間の中から見る）。ホストから見ると別の（subuid の）所有者で
+//!   あることを陽性対照にする。blob の fd と展開先の fd だけを渡し、パスは渡さない。後始末は削除モード
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
@@ -152,6 +155,7 @@ mod linux {
         }
         let _ = std::fs::remove_dir(&dir);
         remove_subordinate_owned_tree(&launcher, budget);
+        extract_keeps_tar_owners_in_namespace(&launcher, budget);
         ExitCode::SUCCESS
     }
 
@@ -277,6 +281,120 @@ mod linux {
         let _ = std::fs::remove_dir_all(&base);
         println!(
             "userns_helper_real: remove subordinate-owned tree ok (rootfs absent, parent kept)"
+        );
+    }
+
+    /// 最小の ustar 1 エントリ（所有者つき）。
+    fn tar_entry(name: &str, mode: u32, owner: u32, data: &[u8], dir: bool) -> Vec<u8> {
+        let mut h = [0u8; 512];
+        let mut put = |off: usize, bytes: &[u8]| h[off..off + bytes.len()].copy_from_slice(bytes);
+        put(0, name.as_bytes());
+        put(100, format!("{mode:07o}\0").as_bytes());
+        put(108, format!("{owner:07o}\0").as_bytes());
+        put(116, format!("{owner:07o}\0").as_bytes());
+        put(124, format!("{:011o}\0", data.len()).as_bytes());
+        put(136, b"00000000000\0");
+        put(148, b"        ");
+        put(156, if dir { b"5" } else { b"0" });
+        put(257, b"ustar\0");
+        put(263, b"00");
+        let sum: u32 = h.iter().map(|b| u32::from(*b)).sum();
+        h[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+        let mut out = h.to_vec();
+        out.extend_from_slice(data);
+        out.resize(512 + data.len().div_ceil(512) * 512, 0);
+        out
+    }
+
+    /// Extract（#4847）: tar の uid / gid（1000）は、名前空間の中では tar の値のまま見え、ホストからは subuid の所有者に見える。
+    fn extract_keeps_tar_owners_in_namespace(launcher: &UsernsHelperLauncher, budget: WorkBudget) {
+        use std::os::unix::fs::DirBuilderExt as _;
+
+        use fandhe_container_oci::layer::DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES;
+        use fandhe_container_oci::layer::extract::ExtractLimits;
+        use fandhe_container_oci::reference::Digest;
+        use fandhe_container_plugin_cri::userns_helper::wire::{
+            ExtractLayerSpec, ExtractReport, ExtractRequest, ExtractSpecialBits,
+        };
+
+        let base = std::env::temp_dir().join(format!("userns-helper-ex-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let bundle = base.join("bundle");
+        let rootfs = bundle.join("rootfs");
+        for d in [&base, &bundle, &rootfs] {
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(d)
+                .unwrap_or_else(|e| fail(&format!("create {}: {e}", d.display())));
+        }
+        let mut tar = tar_entry("d/", 0o755, 1000, b"", true);
+        tar.extend(tar_entry("d/f", 0o644, 1000, b"owned by 1000", false));
+        tar.extend([0u8; 1024]);
+        let blob_path = base.join("blob");
+        std::fs::write(&blob_path, &tar).unwrap_or_else(|e| fail(&format!("write blob: {e}")));
+        std::fs::set_permissions(&blob_path, std::fs::Permissions::from_mode(0o600))
+            .unwrap_or_else(|e| fail(&format!("chmod blob: {e}")));
+        let blob = File::open(&blob_path).unwrap_or_else(|e| fail(&format!("open blob: {e}")));
+        let digest = Digest::sha256_of(&tar);
+        let layer = ExtractLayerSpec::new(
+            "application/vnd.oci.image.layer.v1.tar",
+            u64::try_from(tar.len()).unwrap_or(0),
+            digest.clone(),
+            digest,
+        )
+        .unwrap_or_else(|e| fail(&format!("layer spec: {e:?}")));
+        let request = ExtractRequest::new(
+            ExtractSpecialBits::Strip,
+            ExtractLimits::default(),
+            DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES,
+            vec![layer],
+        )
+        .unwrap_or_else(|e| fail(&format!("request: {e:?}")));
+        let dest = File::open(&rootfs).unwrap_or_else(|e| fail(&format!("open rootfs: {e}")));
+        match launcher.run_extract_bounded(
+            &request,
+            &[blob.as_fd()],
+            dest.as_fd(),
+            budget,
+            None,
+            None,
+        ) {
+            Ok(ExtractReport {
+                layers: 1,
+                entries: 2,
+            }) => {}
+            Ok(other) => fail(&format!("unexpected extract report: {other:?}")),
+            Err(e) => fail(&format!("extract: {e} (helper={:?})", e.helper_code())),
+        }
+        let d = File::open(rootfs.join("d")).unwrap_or_else(|e| fail(&format!("open d: {e}")));
+        match launcher.run(Mode::StatTarget, d.as_fd(), budget) {
+            Ok(Report::StatTarget(r)) if (r.uid, r.gid, r.mode) == (1000, 1000, 0o755) => {}
+            Ok(other) => fail(&format!("unexpected owner in the namespace: {other:?}")),
+            Err(e) => fail(&format!("stat d: {e} (helper={:?})", e.helper_code())),
+        }
+        // 陽性対照: ホストから見た所有者は tar の値（1000）でも自分（euid）でも 0 でもなく、subuid の範囲の値になる。
+        let host = std::fs::metadata(rootfs.join("d"))
+            .unwrap_or_else(|e| fail(&format!("stat d on the host: {e}")));
+        let me = std::fs::metadata("/proc/self").map_or(u32::MAX, |m| m.uid());
+        if host.uid() == 1000 || host.uid() == me || host.uid() == 0 {
+            fail(&format!(
+                "host-side owner is not subordinate: {}",
+                host.uid()
+            ));
+        }
+        let bundle_fd = File::open(&bundle).unwrap_or_else(|e| fail(&format!("open bundle: {e}")));
+        match launcher.run(
+            Mode::Remove(RemoveTarget::BundleRootfs),
+            bundle_fd.as_fd(),
+            budget,
+        ) {
+            Ok(Report::Removed) => {}
+            Ok(other) => fail(&format!("unexpected report: {other:?}")),
+            Err(e) => fail(&format!("remove: {e} (helper={:?})", e.helper_code())),
+        }
+        let _ = std::fs::remove_dir_all(&base);
+        println!(
+            "userns_helper_real: extract keeps tar owners in namespace ok (dir 1000:1000 mode 0755, host owner is subordinate)"
         );
     }
 

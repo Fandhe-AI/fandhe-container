@@ -1,8 +1,10 @@
 //! userns helper の親側の起動部品（同期のブロッキング API。Linux のみ。SEC-5・OCI-1・REPAIR-5。#4795）。
 //!
-//! 呼び出し元は将来の展開（H2。OCI-1・OCI-2）・削除（H3。OCI-7）の経路で、`spawn_blocking` 等から使う。
+//! 呼び出し元は展開（[`UsernsHelperLauncher::run_extract_bounded`]。OCI-1・OCI-2・#4847。cri の注入点と pull・create からの
+//! 呼び出しは後続の issue）・削除（`remover`。OCI-7）の経路で、`spawn_blocking` 等から使う。
 //! plugin-cri 自身（`/proc/self/exe`）を隠し引数 [`super::USERNS_HELPER_ARG`] で再 exec し、制御 socket の要求と応答の
-//! frame（[`super::wire`]）で単一スレッドの helper と対話する。`pre_exec` と SCM_RIGHTS は使わない（unsafe の面を最小に保つ）。
+//! frame（[`super::wire`]）で単一スレッドの helper と対話する。`pre_exec` は使わない（unsafe の面を最小に保つ）。`SCM_RIGHTS` は
+//! 展開要求の blob の fd だけに使い、要求 frame の後に 1 通で送る（`sys::fd_passing`。helper は参加の後に受ける）。
 //!
 //! # fd の割り当て
 //! 0 = 親との `UnixStream::pair()` の片端、1 = 対象ディレクトリの fd（パスは渡さない）、2 = null。argv は隠し引数の 1 個だけ、
@@ -13,13 +15,19 @@
 //! 全体期限は [`JOIN_BUDGET`] + 呼び出し側の [`WorkBudget`]。期限切れ・EOF・不正な応答・終了コードの不整合では子を kill して回収を試み、
 //! 回収できなかった子は [`UsernsHelperError::take_unreaped`] で呼び出し側へ返す。`PDEATHSIG` は使わない（呼び出しスレッドに
 //! 結びつき、tokio の blocking thread で壊れるため）。親が死ねば socket が EOF になり、helper は次の読み書きで終わる。
-//! 同時実行数の上限は呼び出し側（H2・H3）が持つ（1 呼び出し 1 プロセス）。
+//! 同時実行数の上限は呼び出し側が持つ（1 呼び出し 1 プロセス）。
+//!
+//! # 展開の契約（#4847）
+//! - blob の fd は親と helper が同じ open file description を共有する（読み取り位置も共有）。helper は検証で先頭へ seek するため、
+//!   展開が終わる（応答を受ける・失敗を返す）まで、親は同じ fd を読まない・seek しない
+//! - `Err` のとき展開先は途中まで書かれている。呼び出し側が展開先を破棄する（oci の契約と同じ）
+//! - 件数・長さ・形式の不備は spawn の前に拒否する（副作用なし）
 
 #[cfg(any(test, feature = "userns-helper-test-support"))]
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{Read as _, Write as _};
-use std::os::fd::{AsRawFd as _, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 #[cfg(any(test, feature = "userns-helper-test-support"))]
 use std::path::PathBuf;
@@ -31,8 +39,12 @@ use fandhe_container_core::rootless::DEFAULT_HELPER_TIMEOUT;
 use fandhe_container_core::traits::{ErrorCode, TraitError};
 
 use super::USERNS_HELPER_ARG;
-use super::wire::{HelperErrorCode, Mode, RESPONSE_LEN, Report, decode_response, encode_request};
+use super::wire::{
+    EXTRACT_FD_TOKEN, ExtractReport, ExtractRequest, HelperErrorCode, MAX_EXTRACT_LAYERS, Mode,
+    RESPONSE_LEN, Report, decode_response, encode_extract_request, encode_request,
+};
 use crate::pod_holder::kill_and_reap;
+use crate::sys::fd_passing;
 
 /// 参加（user namespace の作成・写像の書き込み・release）に見込む上限: helper の 3 段（holder・mapper・helper）の期限 +
 /// 余裕 5 秒 + slack 5 秒（`isolate_rootless_subordinate` の契約。REPAIR-5）。
@@ -186,11 +198,95 @@ impl UsernsHelperLauncher {
         self.run_bounded(mode, target, work_budget, None, None)
     }
 
+    /// 展開モードを 1 回実行する（#4847。OCI-1・OCI-2・SEC-5）。`blobs` はレイヤーの blob の fd（`request.layers()` と同じ順・
+    /// 同じ件数。通常ファイル）、`dest` は展開先ディレクトリの fd（helper の fd 1。パスは渡さない）。helper は参加の後に blob を
+    /// 再検証して展開する。絶対期限と取り消しの旗は [`Self::run_bounded`] と同じで、どちらかが尽きたら helper を kill・回収して
+    /// `Timeout` を返す。helper に渡す作業時間は `work_budget` と期限までの残りの小さい方（1 ms 以上）。
+    pub fn run_extract_bounded(
+        &self,
+        request: &ExtractRequest,
+        blobs: &[BorrowedFd<'_>],
+        dest: BorrowedFd<'_>,
+        work_budget: WorkBudget,
+        hard_deadline: Option<Instant>,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<ExtractReport, UsernsHelperError> {
+        // spawn の前の検査（副作用なし）: 件数・種別。
+        if blobs.len() > MAX_EXTRACT_LAYERS {
+            return Err(UsernsHelperError::new(
+                ErrorCode::ResourceExhausted,
+                "too many layer descriptors for the userns helper",
+            ));
+        }
+        if blobs.len() != request.layers().len() {
+            return Err(UsernsHelperError::new(
+                ErrorCode::InvalidArgument,
+                MSG_BLOBS,
+            ));
+        }
+        for b in blobs {
+            let probe = b
+                .try_clone_to_owned()
+                .map_err(|_| UsernsHelperError::new(ErrorCode::Internal, MSG_DUP))?;
+            let is_file = File::from(probe)
+                .metadata()
+                .map_err(|_| UsernsHelperError::new(ErrorCode::Internal, MSG_DUP))?
+                .is_file();
+            if !is_file {
+                return Err(UsernsHelperError::new(
+                    ErrorCode::InvalidArgument,
+                    MSG_BLOBS,
+                ));
+            }
+        }
+        let mut work = work_budget.get();
+        if let Some(h) = hard_deadline {
+            work = work.min(h.saturating_duration_since(Instant::now()));
+        }
+        let request = request
+            .clone()
+            .with_work(work)
+            .map_err(|_| UsernsHelperError::new(ErrorCode::InvalidArgument, MSG_BLOBS))?;
+        let frame = encode_extract_request(&request);
+        match self.run_frame(
+            frame.as_bytes(),
+            blobs,
+            dest,
+            work_budget,
+            hard_deadline,
+            cancel,
+        )? {
+            Report::Extracted(r) => Ok(r),
+            _ => Err(UsernsHelperError::new(ErrorCode::Internal, MSG_PROTOCOL)),
+        }
+    }
+
     /// [`Self::run`] に絶対期限と取り消しの旗を足した版。どちらかが尽きたら待ちを止め、helper を kill・回収して `Timeout`
     /// を返す（呼び出し側の `ReleaseBudget` の契約。REPAIR-5・#3142）。
     pub fn run_bounded(
         &self,
         mode: Mode,
+        target: BorrowedFd<'_>,
+        work_budget: WorkBudget,
+        hard_deadline: Option<Instant>,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Report, UsernsHelperError> {
+        let frame = encode_request(mode);
+        self.run_frame(
+            frame.as_bytes(),
+            &[],
+            target,
+            work_budget,
+            hard_deadline,
+            cancel,
+        )
+    }
+
+    /// 要求 frame と、後に添える fd（空なら添えない）で helper を 1 回起動して応答を得る共通部。
+    fn run_frame(
+        &self,
+        frame: &[u8],
+        fds: &[BorrowedFd<'_>],
         target: BorrowedFd<'_>,
         work_budget: WorkBudget,
         hard_deadline: Option<Instant>,
@@ -239,7 +335,7 @@ impl UsernsHelperLauncher {
         let child =
             spawned.map_err(|_| UsernsHelperError::new(ErrorCode::Unavailable, MSG_SPAWN))?;
 
-        converse(child, parent_end, mode, deadline, cancel)
+        converse(child, parent_end, frame, fds, deadline, cancel)
     }
 
     /// 起動する Command（と、`/proc/self/exe` の検証済み fd のガード）。
@@ -273,17 +369,24 @@ const MSG_EXE: &str = "cannot resolve the plugin executable for the userns helpe
 const MSG_TIMEOUT: &str = "userns helper did not respond in time";
 const MSG_PROTOCOL: &str = "userns helper returned an invalid response";
 const MSG_FAILED: &str = "userns helper reported a failure";
+const MSG_BLOBS: &str = "userns helper layer descriptors do not match the request";
+const MSG_DUP: &str = "failed to inspect a layer descriptor";
 
 /// 要求を書き、期限つきで応答を読み、子の終了を確かめる。失敗した経路はすべて kill・回収を試みる。
 fn converse(
     child: Child,
     mut sock: UnixStream,
-    mode: Mode,
+    frame: &[u8],
+    fds: &[BorrowedFd<'_>],
     deadline: Instant,
     cancel: Option<&AtomicBool>,
 ) -> Result<Report, UsernsHelperError> {
     let mut child = child;
-    if sock.write_all(encode_request(mode).as_bytes()).is_err() {
+    if sock.write_all(frame).is_err() {
+        return Err(fail(child, ErrorCode::Unavailable, MSG_PROTOCOL));
+    }
+    // fd は要求 frame の後に 1 通で送る（helper は参加の後に受ける）。送れなければ kill・回収する。
+    if !fds.is_empty() && fd_passing::send_fds(sock.as_fd(), EXTRACT_FD_TOKEN, fds).is_err() {
         return Err(fail(child, ErrorCode::Unavailable, MSG_PROTOCOL));
     }
     let mut buf = [0u8; RESPONSE_LEN];
@@ -353,8 +456,6 @@ fn fail(child: Child, code: ErrorCode, message: &'static str) -> UsernsHelperErr
 
 #[cfg(test)]
 mod tests {
-    use std::os::fd::AsFd as _;
-
     use super::*;
     use crate::pod_holder::POD_HOLDER_KILL_REAP_WAIT;
 
@@ -458,5 +559,117 @@ mod tests {
         let pid = child.id();
         assert!(kill_and_reap(child).is_none());
         assert!(pid_gone(pid));
+    }
+
+    fn spec(c: char) -> super::super::wire::ExtractLayerSpec {
+        let d = fandhe_container_oci::reference::Digest::parse(&format!(
+            "sha256:{}",
+            c.to_string().repeat(64)
+        ))
+        .expect("digest");
+        super::super::wire::ExtractLayerSpec::new(
+            "application/vnd.oci.image.layer.v1.tar",
+            1,
+            d.clone(),
+            d,
+        )
+        .expect("spec")
+    }
+
+    fn extract_request(n: usize) -> ExtractRequest {
+        use super::super::wire::ExtractSpecialBits;
+        ExtractRequest::new(
+            ExtractSpecialBits::Strip,
+            fandhe_container_oci::layer::extract::ExtractLimits::default(),
+            fandhe_container_oci::layer::DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES,
+            (0..n).map(|_| spec('a')).collect(),
+        )
+        .expect("request")
+    }
+
+    /// REPAIR-5・SEC-5・#4847: 応答しない helper への展開要求も期限で `Timeout`・kill・回収され、`/proc/<pid>` が残らない
+    /// （偽 helper は blob の fd を受けないが、親の送信は成功し、待ちが期限で止まる）。
+    #[test]
+    fn sec5_4847_extract_timeout_kills_and_reaps_the_helper() {
+        let dir = File::open("/").expect("open /");
+        let blob = File::open("/proc/self/exe").expect("open a regular file");
+        let launcher = UsernsHelperLauncher::with_fixed_command("/bin/sleep", vec!["60".into()])
+            .with_join_budget(Duration::ZERO);
+        let started = Instant::now();
+        let mut err = launcher
+            .run_extract_bounded(
+                &extract_request(1),
+                &[blob.as_fd()],
+                dir.as_fd(),
+                budget(),
+                None,
+                None,
+            )
+            .expect_err("must time out");
+        assert_eq!(err.code(), ErrorCode::Timeout);
+        assert!(
+            started.elapsed()
+                < Duration::from_secs(1) + POD_HOLDER_KILL_REAP_WAIT + Duration::from_secs(2)
+        );
+        assert!(err.take_unreaped().is_none(), "child must be reaped");
+    }
+
+    /// REPAIR-5・#4847: 取り消しの旗が立つと、作業予算よりずっと前に `Timeout` で止まり、子は回収される。
+    #[test]
+    fn sec5_4847_extract_cancel_flag_stops_early() {
+        let dir = File::open("/").expect("open /");
+        let blob = File::open("/proc/self/exe").expect("open a regular file");
+        let launcher = UsernsHelperLauncher::with_fixed_command("/bin/sleep", vec!["60".into()]);
+        let cancel = AtomicBool::new(false);
+        let started = Instant::now();
+        let mut err = std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(200));
+                cancel.store(true, Ordering::Release);
+            });
+            launcher
+                .run_extract_bounded(
+                    &extract_request(1),
+                    &[blob.as_fd()],
+                    dir.as_fd(),
+                    WorkBudget::new(Duration::from_secs(600)).expect("budget"),
+                    None,
+                    Some(&cancel),
+                )
+                .expect_err("cancelled")
+        });
+        assert_eq!(err.code(), ErrorCode::Timeout);
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(err.take_unreaped().is_none(), "child must be reaped");
+    }
+
+    /// SEC-5・REPAIR-5・#4847: 件数の不一致・通常ファイルでない blob・ディレクトリでない展開先は、spawn の前に拒否する
+    /// （存在しない実行ファイルでも `Unavailable` にならない）。
+    #[test]
+    fn sec5_4847_extract_inputs_are_rejected_before_spawn() {
+        let dir = File::open("/").expect("open /");
+        let file = File::open("/proc/self/exe").expect("open a regular file");
+        let launcher = UsernsHelperLauncher::with_fixed_command("/nonexistent/helper", vec![]);
+        let run = |req: &ExtractRequest, blobs: &[BorrowedFd<'_>], dest: BorrowedFd<'_>| {
+            launcher
+                .run_extract_bounded(req, blobs, dest, budget(), None, None)
+                .expect_err("rejected")
+        };
+        let e = run(&extract_request(2), &[file.as_fd()], dir.as_fd());
+        assert_eq!(
+            (e.code(), e.message()),
+            (ErrorCode::InvalidArgument, MSG_BLOBS)
+        );
+        let e = run(&extract_request(1), &[dir.as_fd()], dir.as_fd());
+        assert_eq!(
+            (e.code(), e.message()),
+            (ErrorCode::InvalidArgument, MSG_BLOBS)
+        );
+        let e = run(&extract_request(1), &[file.as_fd()], file.as_fd());
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        assert_eq!(e.message(), "userns helper target must be a directory");
+        let many = vec![file.as_fd(); MAX_EXTRACT_LAYERS + 1];
+        let e = run(&extract_request(1), &many, dir.as_fd());
+        assert_eq!(e.code(), ErrorCode::ResourceExhausted);
     }
 }

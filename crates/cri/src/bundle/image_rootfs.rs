@@ -68,7 +68,7 @@
 //!   判定する（#4805）。pull（キャッシュ）は祖先を渡さず、展開の根自身の 0700 で判定する（`image_pull` の doc）。
 //!   `ChownInUserNamespace` は記録の符号化が済み（#4796）、subuid 所有の木の削除は注入点 `SubordinateTreeRemover` 経由で
 //!   再 exec helper の削除モードへ回す（#4800。`release_bounded`・展開失敗時の後始末。未注入ならホスト側へ縮退せず
-//!   `FAILED_PRECONDITION`）。展開本体と対応表の切り替えは #4777 の H2・H6
+//!   `FAILED_PRECONDITION`）。helper の展開モードは #4847 で実装済みで、cri の注入点と呼び出しは後続の issue、対応表の切り替えは #4777 の H6（#4801）
 //!   （#2534・SEC-5。`docs/design/oci-layer-special-bits.md`）。pull と create の設定は
 //!   [`ImageExtractConfig`] で 1 か所にまとめる
 //! - 展開は `extract_image_layers_bounded_in` でエントリ単位に期限（この `prepare` の開始からの `deadline`）と取り消しの

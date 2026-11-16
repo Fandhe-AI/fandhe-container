@@ -69,8 +69,8 @@ fn subordinate_sets(
 }
 
 /// core の検証済み写像を oci の `IdMap` へ移す。oci の検証は core より厳しい（ホスト範囲が `u32::MAX` を含む写像を
-/// 拒否する）ため失敗しうる。失敗は oci の code を写し、`unwrap` しない。
-fn to_oci_map(set: &IdMapSet) -> Result<IdMap, TraitError> {
+/// 拒否する）ため失敗しうる。失敗は oci の code を写し、`unwrap` しない。userns helper の展開モードも再利用する（変換を複製しない。#4847）。
+pub(crate) fn to_oci_map(set: &IdMapSet) -> Result<IdMap, TraitError> {
     let lines = set
         .entries()
         .iter()

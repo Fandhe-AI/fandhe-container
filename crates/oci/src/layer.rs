@@ -585,6 +585,15 @@ impl VerifiedLayerBlob {
         self.size
     }
 
+    /// blob の fd を借りる（再 exec helper へ `SCM_RIGHTS` で渡す用。SEC-5・OCI-1・#4848。パスは渡さない）。
+    ///
+    /// 契約: 渡した展開が終わるまで、呼び出し側はこの fd を読まず・seek しない（読み取り位置は helper と共有される）。
+    /// 受け側は digest・サイズ・所有者を `from_file` で再検証する。
+    #[cfg(unix)]
+    pub fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        std::os::fd::AsFd::as_fd(&self.file)
+    }
+
     /// 展開側が読み取りに使うハンドル（モジュール内限定。パスは持たない）。
     pub(crate) fn file(&self) -> &File {
         &self.file
@@ -1773,6 +1782,23 @@ mod tests {
         let b = VerifiedLayerBlob::open(&p, &Digest::parse(ABC).unwrap(), 3, uid_of(&p)).unwrap();
         assert_eq!(b.digest().as_str(), ABC);
         assert_eq!(b.size(), 3);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// OCI-1・SEC-5・#4848: `as_fd` は検証済みの blob と同じファイル（同じ inode）を借りる。
+    #[cfg(unix)]
+    #[test]
+    fn sec5_4848_verified_layer_blob_as_fd_borrows_the_same_file() {
+        use std::os::unix::fs::MetadataExt as _;
+        let d = tmp_dir("vlb-fd");
+        let p = d.join("b");
+        write_0600(&p, b"abc");
+        let b = VerifiedLayerBlob::open(&p, &Digest::parse(ABC).unwrap(), 3, uid_of(&p)).unwrap();
+        let dup = File::from(b.as_fd().try_clone_to_owned().unwrap());
+        assert_eq!(
+            dup.metadata().unwrap().ino(),
+            std::fs::metadata(&p).unwrap().ino()
+        );
         std::fs::remove_dir_all(&d).unwrap();
     }
 

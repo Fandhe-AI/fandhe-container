@@ -17,7 +17,8 @@ helper を作り、参加後の処理を helper に任せる。
 | ---- | ---- | ---- |
 | H1（#4795） | 入口の振り分け・親側の起動部品・参加・結果の返却（Inspect・StatTarget） | 本書。実装済み |
 | H2（#4796） | 展開の記録の符号化 | 実装済み |
-| 展開モード（#4847） | 展開モード（Extract・tag 3）の wire・helper 内の展開・親側の期限つき入口（`run_extract_bounded`）・blob の fd の `SCM_RIGHTS` の受け渡し | 本書。実装済み（cri の注入点と pull・create からの呼び出しは後続の issue） |
+| 展開モード（#4847） | 展開モード（Extract・tag 3）の wire・helper 内の展開・親側の期限つき入口（`run_extract_bounded`）・blob の fd の `SCM_RIGHTS` の受け渡し | 本書。実装済み |
+| 展開の注入点（#4848） | cri の `SubordinateLayerExtractor`・plugin-cri の `UsernsLayerExtractor`・pull と create の呼び出し | 本書「cri の展開の注入点（#4848）」。実装済み（有効化は H6） |
 | H3（#4800） | 削除（Remove。tag 4）と plugin-cri の削除器・cri の注入点 | 本書。実装済み（有効化は H6） |
 | H4（#4798） | `image_ownership` の複製と fixture | 実装済み |
 | H5（#4799） | pull / start の subuid のずれの照合 | 実装済み |
@@ -100,7 +101,7 @@ plugin-cri（親。マルチスレッド）
 - 契約: blob の fd は親と helper が open file description を共有するため、展開が終わるまで親は読まない・seek しない。`Err` のとき
   展開先は途中まで書かれているので、呼び出し側が破棄する。同時実行数の上限は呼び出し側が持つ
 - 対象外・残余: 閉じ込めの祖先（`extract_image_layers_confined_in` の `ancestor`）は渡さない（根の 0700 化は #4801 のオーナー判断待ち。
-  必要になったら wire の予約欄で足す）。cri の注入点と pull・create からの呼び出し・対応表の切り替え（#4801）・CI への組み込み（#4802）は後続。
+  必要になったら wire の予約欄で足す）。対応表の切り替え（#4801）・CI への組み込み（#4802）は後続。
   helper の中の oci 操作記録（`OciOpRecorder`）は捨てる（観測は親の呼び出し単位）
 
 ## 削除モード（H3。#4800・SEC-5・OCI-7・CORE-6・REPAIR-4・REPAIR-5）
@@ -135,6 +136,26 @@ core の `remove_tree_in_userns` は単一スレッドの fork 前提で tokio �
 - 有効化: 対応表（`extract_options_for`）が `ChownInUserNamespace` を返すまで本番では通らない。切り替えは H6（#4801）。
   実機試験は `userns_helper_real`（CI への組み込みは H7・#4802）
 
+### cri の展開の注入点（#4848）
+
+- 注入点: `fandhe-container-cri` の `SubordinateLayerExtractor`（`bundle/layer_extractor.rs`。削除と同じく cri 側にトレイトを置く）。
+  `OciImagePuller`（pull の `unpack/entry/rootfs`）と `ImageRootfsSource`（create の bundle `rootfs/`）が、展開設定が
+  `ChownInUserNamespace` のとき（削除と共通の述語 `needs_userns_removal`）だけ注入された extractor へ回す。偽（`Keep` 等）は従来の
+  ホスト側の展開のまま。展開先は `ExtractRoot`（開いたディレクトリ fd）で渡し、パスは渡さない
+- fail-closed: extractor と remover の**両方**が注入されていなければ、展開先（`unpack/`・`rootfs/`）を作る前に `FAILED_PRECONDITION`
+  で拒否する（ホスト側の展開へ縮退しない。消せない subuid 所有の木を作らない）。create では記録の照合（#4799）の後に確かめる
+- 本番の展開器: plugin-cri の `UsernsLayerExtractor`（`userns_helper/extractor.rs`）。`VerifiedLayerBlob::as_fd`（oci）で blob の fd を
+  借りて `run_extract_bounded` へ渡す。写像は wire で送らず、helper が参加に使ったものを使う。特殊ビットは `Strip` と
+  `PreserveIfChowned` だけを受け、`PreserveIfOwnerMapped`・未知の値・対応表に無い mediaType は spawn の前に拒否する。
+  上限（4 本）と回収できなかった子の保持は `slots.rs` で削除器と共通の処理にし、インスタンスは別にして、長い展開が削除を詰まらせない。
+  helper の失敗の分類（`ExtractFailed(DataLoss)` 等）は oci の分類へ保って返し、文言は固定にする（パス・errno・uid を含めない）
+- 公開済み rootfs の根の期待所有者（`expected_root_owner_for`）は、`ChownInUserNamespace` でも写像先 `map_to_host(0)`（oci の
+  `chown_root` が名前空間の中で根を 0:0 へ `chown` するため。core の写像は「0 → 自 ID」で、本番の値は `owner` と同じ）
+- 残余: helper の中の oci 操作記録は捨てるため、userns の経路ではレイヤー単位の計装が出ない。擬似時計（`with_clock`）の期限は
+  この経路では実時計の `Instant` として launcher に渡る（本番の呼び出し元は既定の時計）。helper の写像と pull の記録の写像が
+  食い違う場合（subuid の変更）は、start と create の照合（#4799）が検出する。起動時の pull 回収 GC と `PullSession::abort` は
+  ホスト側の削除のまま
+
 要求を参加の後に読む理由: holder は exec しない fork で、呼び出し時点のメモリを複製する。dumpable な holder が要求の bytes を
 持たないようにし、展開モードの fd・options が holder の窓に入らないようにする。H1 の要求に機密は無いが、順序は展開モードのために固定する。
 
@@ -152,7 +173,7 @@ fd 0（制御 socket の片端）と fd 1（対象ディレクトリ）が残る
   呼び出し側へ返す
 - `PDEATHSIG` は使わない（呼び出しスレッドに結びつくため、tokio の blocking thread で壊れる）。親が死ねば socket が EOF になり、
   helper は次の読み書きで終わる
-- 1 呼び出し 1 プロセスで、同時実行数の上限は呼び出し側（削除は `UsernsTreeRemover`。展開は後続の issue）が持つ
+- 1 呼び出し 1 プロセスで、同時実行数の上限は呼び出し側（削除は `UsernsTreeRemover`、展開は `UsernsLayerExtractor`。どちらも 4 本で、別インスタンス）が持つ
 
 ## 試験専用の入口
 

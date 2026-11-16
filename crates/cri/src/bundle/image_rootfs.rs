@@ -68,7 +68,9 @@
 //!   判定する（#4805）。pull（キャッシュ）は祖先を渡さず、展開の根自身の 0700 で判定する（`image_pull` の doc）。
 //!   `ChownInUserNamespace` は記録の符号化が済み（#4796）、subuid 所有の木の削除は注入点 `SubordinateTreeRemover` 経由で
 //!   再 exec helper の削除モードへ回す（#4800。`release_bounded`・展開失敗時の後始末。未注入ならホスト側へ縮退せず
-//!   `FAILED_PRECONDITION`）。helper の展開モードは #4847 で実装済みで、cri の注入点と呼び出しは後続の issue、対応表の切り替えは #4777 の H6（#4801）
+//!   `FAILED_PRECONDITION`）。展開も同じ設定のとき（`needs_userns_removal`）は注入点
+//!   `SubordinateLayerExtractor` 経由で再 exec helper の展開モードへ回す（#4848。extractor と remover の両方が無ければ `rootfs/` を
+//!   作る前に `FAILED_PRECONDITION`）。対応表の切り替えは #4777 の H6（#4801）
 //!   （#2534・SEC-5。`docs/design/oci-layer-special-bits.md`）。pull と create の設定は
 //!   [`ImageExtractConfig`] で 1 か所にまとめる
 //! - 展開は `extract_image_layers_bounded_in` でエントリ単位に期限（この `prepare` の開始からの `deadline`）と取り消しの
@@ -179,6 +181,12 @@ pub struct ImageRootfsSource {
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
     tree_remover: Option<Arc<dyn super::tree_remover::SubordinateTreeRemover>>,
+    /// 同じ設定のときの展開の実装（`rootfs/` を helper の展開モードで作る。#4848）。
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    layer_extractor: Option<Arc<dyn super::layer_extractor::SubordinateLayerExtractor>>,
 }
 
 impl std::fmt::Debug for ImageRootfsSource {
@@ -201,7 +209,105 @@ impl ImageRootfsSource {
                 any(target_arch = "x86_64", target_arch = "aarch64")
             ))]
             tree_remover: None,
+            #[cfg(all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))]
+            layer_extractor: None,
         }
+    }
+
+    /// 範囲写像の展開（`ChownInUserNamespace`）を再 exec helper の展開モードで行う実装を注入する（#4848・SEC-5・OCI-1）。
+    ///
+    /// 展開設定が `ChownInUserNamespace` のときだけ使う。`with_tree_remover` と両方が無ければ、その設定の create は
+    /// `rootfs/` を作る前に `FAILED_PRECONDITION` で拒否する（ホスト側の展開・削除へ縮退しない）。
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[must_use]
+    pub fn with_layer_extractor(
+        mut self,
+        extractor: Arc<dyn super::layer_extractor::SubordinateLayerExtractor>,
+    ) -> Self {
+        self.layer_extractor = Some(extractor);
+        self
+    }
+
+    /// 範囲写像の展開の前提（extractor と remover の両方）がそろっているか。欠けていれば `rootfs/` を作らず拒否する。
+    fn check_userns_extraction_ready(&self) -> Result<(), CriError> {
+        if !needs_userns_removal(&self.config.extract_options) {
+            return Ok(());
+        }
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        if self.layer_extractor.is_some() && self.tree_remover.is_some() {
+            return Ok(());
+        }
+        Err(super::layer_extractor::missing_extractor())
+    }
+
+    /// 展開の本体。範囲写像なら注入された extractor、それ以外は oci のホスト側の展開（#4848）。
+    fn extract_layers_into(
+        &self,
+        layers: &[ImageLayer<'_>],
+        root: &ExtractRoot,
+        bundle: &BundleDir,
+        budget: &ExtractBudget<'_>,
+        release: &ReleaseBudget<'_>,
+    ) -> Result<(), fandhe_container_oci::error::OciError> {
+        let opts = &self.config.extract_options;
+        // 範囲写像の経路（Linux x86_64 / aarch64 のみ）以外では使わない。
+        #[cfg(not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )))]
+        let _ = release;
+        if needs_userns_removal(opts) {
+            #[cfg(all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))]
+            {
+                let Some(extractor) = self.layer_extractor.as_ref() else {
+                    return Err(fandhe_container_oci::error::OciError::new(
+                        OciErrorCode::FailedPrecondition,
+                        "subordinate-owned layer extraction is not available",
+                    ));
+                };
+                return extractor.extract_layers(
+                    layers,
+                    root,
+                    self.config.max_uncompressed_layer_bytes,
+                    self.config.extract_limits,
+                    opts,
+                    release,
+                );
+            }
+            #[cfg(not(all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )))]
+            return Err(fandhe_container_oci::error::OciError::new(
+                OciErrorCode::FailedPrecondition,
+                "subordinate-owned layer extraction is not available",
+            ));
+        }
+        // 祖先は常に渡す（`Strip`・`PreserveIfChowned` では oci が使わない）。根は後で 0755 になるため、
+        // `PreserveIfOwnerMapped` の閉じ込めは 0700 の bundle ディレクトリで判定させる（#4805）。
+        extract_image_layers_confined_in(
+            self.recorder.as_ref(),
+            layers,
+            root,
+            Some(bundle.as_extract_root()),
+            self.config.max_uncompressed_layer_bytes,
+            self.config.extract_limits,
+            opts,
+            budget,
+        )
+        .map(|_| ())
     }
 
     /// 範囲写像で展開した subuid 所有の木を消す実装を注入する（再 exec helper の削除モード。#4800・SEC-5・OCI-7）。
@@ -892,6 +998,7 @@ impl RootfsSource for ImageRootfsSource {
         // 呼び出し元（SpecBundleProvider）が fd で渡す bundle の直下に不在の `rootfs/` を 0700 で作って fd で開く
         // （`mkdirat` → `openat2`）。以後の展開・chmod・`proc`・passwd の読み取りはこの fd 起点で、作成後に祖先が
         // 差し替えられてもおとりへ届かない（#4283・#4321）。作れなければ他人の実体の可能性があり消さない。
+        self.check_userns_extraction_ready()?;
         let root = bundle.create_rootfs_dir().map_err(|_| {
             CriError::failed_precondition("failed to create the image rootfs staging directory")
         })?;
@@ -903,51 +1010,44 @@ impl RootfsSource for ImageRootfsSource {
         if let Some(c) = cancel {
             budget = budget.with_cancel(c);
         }
-        // 祖先は常に渡す（`Strip`・`PreserveIfChowned` では oci が使わない）。根は後で 0755 になるため、
-        // `PreserveIfOwnerMapped` の閉じ込めは 0700 の bundle ディレクトリで判定させる（#4805）。
-        let extracted = extract_image_layers_confined_in(
-            self.recorder.as_ref(),
-            &image_layers,
-            &root,
-            Some(bundle.as_extract_root()),
-            self.config.max_uncompressed_layer_bytes,
-            self.config.extract_limits,
-            opts,
-            &budget,
-        )
-        .map_err(|e| {
-            // CreateContainer から見える期限切れの文言を 1 つにそろえる（check_budget と同じ）。
-            if e.code() == OciErrorCode::Timeout {
-                CriError::timeout("image rootfs preparation exceeded its deadline")
-            } else {
-                CriError::from(PullError::from_extract(&e))
-            }
-        })
-        .and_then(|_| self.check_budget(started, cancel))
-        .and_then(|()| open_rootfs_for_search(&root))
-        .and_then(|()| ensure_mountpoints(&root))
-        .and_then(|()| {
-            // CRI の run_as_username は展開後の私有 rootfs の passwd で解決する（失敗は拒否。#2664）。
-            if let Some(name) = user.run_as_username {
-                defaults.resolved_run_as_username = Some(resolve_run_as_username(&root, name)?);
-            }
-            // 名前・uid のみの User は、展開後の私有 rootfs の passwd / group で解決する（失敗は未解決のまま返す）。
-            // run_as_username があるときは CRI 側が優先するため省略する。
-            if user.run_as_username.is_none()
-                && defaults.user_unresolved
-                && let Some(lookup) = parse_user_lookup(process.user())
-                && let Some(ids) = resolve_user(&root, &lookup)
-            {
-                defaults.user = Some(ids);
-                defaults.user_unresolved = false;
-            }
-            // 補助グループ（Merge のとき）: 実効ユーザーの所属グループを /etc/group から求める（#2667）。
-            if user.image_groups {
-                defaults.supplementary_gids =
-                    resolve_image_groups(&root, user, process.user(), &defaults)?;
-            }
-            self.check_deadline(started)
-        });
+        let mut release = ReleaseBudget::new();
+        release.deadline = started.checked_add(self.config.deadline);
+        release.cancel = cancel;
+        let extracted = self
+            .extract_layers_into(&image_layers, &root, bundle, &budget, &release)
+            .map_err(|e| {
+                // CreateContainer から見える期限切れの文言を 1 つにそろえる（check_budget と同じ）。
+                if e.code() == OciErrorCode::Timeout {
+                    CriError::timeout("image rootfs preparation exceeded its deadline")
+                } else {
+                    CriError::from(PullError::from_extract(&e))
+                }
+            })
+            .and_then(|_| self.check_budget(started, cancel))
+            .and_then(|()| open_rootfs_for_search(&root))
+            .and_then(|()| ensure_mountpoints(&root))
+            .and_then(|()| {
+                // CRI の run_as_username は展開後の私有 rootfs の passwd で解決する（失敗は拒否。#2664）。
+                if let Some(name) = user.run_as_username {
+                    defaults.resolved_run_as_username = Some(resolve_run_as_username(&root, name)?);
+                }
+                // 名前・uid のみの User は、展開後の私有 rootfs の passwd / group で解決する（失敗は未解決のまま返す）。
+                // run_as_username があるときは CRI 側が優先するため省略する。
+                if user.run_as_username.is_none()
+                    && defaults.user_unresolved
+                    && let Some(lookup) = parse_user_lookup(process.user())
+                    && let Some(ids) = resolve_user(&root, &lookup)
+                {
+                    defaults.user = Some(ids);
+                    defaults.user_unresolved = false;
+                }
+                // 補助グループ（Merge のとき）: 実効ユーザーの所属グループを /etc/group から求める（#2667）。
+                if user.image_groups {
+                    defaults.supplementary_gids =
+                        resolve_image_groups(&root, user, process.user(), &defaults)?;
+                }
+                self.check_deadline(started)
+            });
         // 最後に、根のパスが開いた根と同じ実体であることを確かめる（fd 起点の操作は作った実体にだけ届き、おとりへは
         // 書かれていない。差し替えを成功に見せない検出器。OCI-7・SEC-1・#4283）。
         let rootfs = bundle.rootfs_path();

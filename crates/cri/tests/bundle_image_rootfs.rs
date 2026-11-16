@@ -356,6 +356,18 @@ fn pulled_env_with_options(
     pull.platform = Platform::new("linux", "amd64", None);
     pull.extract_options = options.clone();
     let puller = OciImagePuller::new(FakeClient { manifest, blobs }, pull);
+    // 範囲写像の展開は偽の extractor・remover で通す（本物の helper は plugin-cri 側。#4848）。
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    let puller = if fandhe_container_cri::bundle::needs_userns_removal(&options) {
+        puller
+            .with_tree_remover(Arc::new(userns_fakes::RecordingRemover::default()))
+            .with_layer_extractor(Arc::new(userns_fakes::FakeExtractor::default()))
+    } else {
+        puller
+    };
     let pulled = puller
         .pull(&PullRequest {
             reference: "alpine:3.20".to_owned(),
@@ -426,6 +438,111 @@ fn snapshot(root: &Path) -> Vec<(String, char, u32, Vec<u8>)> {
 
 fn bundle_count(env: &Env) -> usize {
     fs::read_dir(env.bundles()).unwrap().count()
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod userns_fakes {
+    use std::os::fd::{AsRawFd as _, BorrowedFd};
+    use std::sync::Mutex;
+
+    use fandhe_container_cri::adapter::ReleaseBudget;
+    use fandhe_container_cri::bundle::{
+        RemovalTarget, SubordinateLayerExtractor, SubordinateTreeRemover,
+    };
+    use fandhe_container_oci::instrument::NoopOciOpRecorder;
+    use fandhe_container_oci::layer::extract::{
+        ExtractBudget, ExtractLimits, ExtractOptions, ExtractRoot, ImageLayer, OwnershipPolicy,
+        extract_image_layers_bounded_in,
+    };
+
+    use super::*;
+
+    /// 呼び出しを記録し、親 fd 直下の `rootfs` を（同じ uid の木としてホスト側で）消す偽の remover。
+    #[derive(Debug, Default)]
+    pub struct RecordingRemover(pub Mutex<Vec<RemovalTarget>>);
+
+    impl SubordinateTreeRemover for RecordingRemover {
+        fn remove_child_tree(
+            &self,
+            parent: BorrowedFd<'_>,
+            target: RemovalTarget,
+            _budget: &ReleaseBudget<'_>,
+        ) -> Result<(), CriError> {
+            self.0.lock().unwrap().push(target);
+            if target == RemovalTarget::BundleRootfs {
+                force_remove(Path::new(&format!(
+                    "/proc/self/fd/{}/rootfs",
+                    parent.as_raw_fd()
+                )));
+            }
+            Ok(())
+        }
+    }
+
+    /// 呼び出しのレイヤー数を記録し、oci のホスト側の展開（`Keep`）の後に根の所有者を写像先へ合わせる偽の extractor
+    /// （本物の helper が名前空間の中で行う `chown_root` の代役）。
+    #[derive(Debug, Default)]
+    pub struct FakeExtractor {
+        pub calls: Mutex<Vec<usize>>,
+    }
+
+    impl SubordinateLayerExtractor for FakeExtractor {
+        fn extract_layers(
+            &self,
+            layers: &[ImageLayer<'_>],
+            root: &ExtractRoot,
+            max_uncompressed_layer_bytes: u64,
+            limits: ExtractLimits,
+            options: &ExtractOptions,
+            _budget: &ReleaseBudget<'_>,
+        ) -> Result<(), OciError> {
+            self.calls.lock().unwrap().push(layers.len());
+            extract_image_layers_bounded_in(
+                &NoopOciOpRecorder,
+                layers,
+                root,
+                max_uncompressed_layer_bytes,
+                limits,
+                &ExtractOptions::new(),
+                &ExtractBudget::new(),
+            )?;
+            let OwnershipPolicy::ChownInUserNamespace { uid, gid } = &options.ownership else {
+                panic!("userns options expected");
+            };
+            let f = fs::File::from(root.as_fd().try_clone_to_owned().unwrap());
+            std::os::unix::fs::fchown(&f, uid.map_to_host(0), gid.map_to_host(0)).unwrap();
+            Ok(())
+        }
+    }
+
+    /// コンテナ uid 0 の写像先が試験プロセスの uid（root のときは別の ID）になる範囲写像の展開設定。
+    pub fn userns_options(owner: &Path) -> ExtractOptions {
+        use fandhe_container_oci::layer::extract::{IdMap, IdRange};
+        let me = fs::metadata(owner).expect("meta").uid();
+        let host_root = if me == 0 { 100_000 } else { me };
+        let map = || {
+            IdMap::new(vec![
+                IdRange {
+                    container_id: 0,
+                    host_id: host_root,
+                    count: 1,
+                },
+                IdRange {
+                    container_id: 1,
+                    host_id: 200_000,
+                    count: 65_536,
+                },
+            ])
+            .expect("map")
+        };
+        ExtractOptions::new().with_ownership(OwnershipPolicy::ChownInUserNamespace {
+            uid: map(),
+            gid: map(),
+        })
+    }
 }
 
 // ---- 試験 ----
@@ -948,13 +1065,24 @@ fn oci1_untrusted_cache_entries_are_rejected_without_deleting_them() {
 /// userns 展開の要件が絡むため、ここには置かない）。
 #[test]
 fn sec5_create_rejects_unpack_record_with_other_id_mapping() {
+    let probe = TempDir::new("4848-idmap");
     use fandhe_container_oci::layer::extract::{IdMap, IdRange, OwnershipPolicy};
+    // 公開済みの根の期待所有者は写像先（コンテナ uid 0 のホスト ID。#4848）。Keep で展開した根は試験の uid 所有のため、
+    // 写像の 0 行はその uid に合わせ、記録の食い違い（host_id の違う行）だけで拒否されることを見る。
+    let me = fs::metadata(&probe.0).expect("meta").uid();
     let map = |host_id| {
-        IdMap::new(vec![IdRange {
-            container_id: 0,
-            host_id,
-            count: 65_536,
-        }])
+        IdMap::new(vec![
+            IdRange {
+                container_id: 0,
+                host_id: me,
+                count: 1,
+            },
+            IdRange {
+                container_id: 1,
+                host_id,
+                count: 65_535,
+            },
+        ])
         .expect("map")
     };
     let userns = |host_id| {
@@ -988,6 +1116,53 @@ fn sec5_create_rejects_unpack_record_with_other_id_mapping() {
         assert!(env.entry().join("rootfs/world").exists());
         assert_eq!(bundle_count(&env), 0);
     }
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+/// SEC-5・OCI-1・OCI-7・CRI-3・#4848: 範囲写像の pull → create → release が注入点（偽の extractor・remover）を通して一巡する。
+/// 同じ写像の create は成功して `rootfs/` に展開物ができ（#4799 の一致側）、release は remover へ回る（#4800）。
+/// extractor が無い create は、bundle を残さず `FAILED_PRECONDITION`。別の写像の create は既存の固定文言で拒否される
+/// （`sec5_create_rejects_unpack_record_with_other_id_mapping`）。
+#[test]
+fn sec5_4848_userns_pull_create_release_round_trip() {
+    use userns_fakes::{FakeExtractor, RecordingRemover, userns_options};
+    let probe = TempDir::new("4848-owner");
+    let opts = userns_options(&probe.0);
+    let env = pulled_env_with_options("4848-rt", CONFIG_SECTION, layer1(), layer2(), opts);
+    let source = |ex: Option<Arc<FakeExtractor>>, rm: Arc<RecordingRemover>| {
+        let mut src = ImageRootfsSource::new(env.extract_config()).with_tree_remover(rm);
+        if let Some(ex) = ex {
+            src = src.with_layer_extractor(ex);
+        }
+        src
+    };
+
+    // extractor 未注入の create は、bundle を作らず（残さず）拒否する。ホスト側の展開へ縮退しない。
+    let rm = Arc::new(RecordingRemover::default());
+    let p = env.provider_with(source(None, rm.clone()));
+    let e = prepare(&p, "ctr-none", &container(&env.image_id)).unwrap_err();
+    assert_eq!(e.code(), CriErrorCode::FailedPrecondition);
+    assert_eq!(
+        e.message(),
+        "subordinate-owned layer extraction is not available"
+    );
+    assert_eq!(bundle_count(&env), 0);
+
+    let ex = Arc::new(FakeExtractor::default());
+    let p = env.provider_with(source(Some(ex.clone()), rm.clone()));
+    let dir = prepare(&p, "ctr-4848", &container(&env.image_id)).expect("prepare");
+    assert_eq!(*ex.calls.lock().unwrap(), vec![2]);
+    assert_eq!(fs::read(dir.join("rootfs/world")).unwrap(), b"world");
+    assert_eq!(fs::read(dir.join("rootfs/etc/hello")).unwrap(), b"abc");
+    p.release("ctr-4848").expect("release");
+    assert_eq!(
+        *rm.0.lock().unwrap(),
+        vec![fandhe_container_cri::bundle::RemovalTarget::BundleRootfs]
+    );
+    assert!(!dir.join("rootfs").exists());
 }
 
 /// OCI-1: config や layer の blob が改ざんされていたら（digest 不一致）DATA_LOSS、config が上限超なら RESOURCE_EXHAUSTED。

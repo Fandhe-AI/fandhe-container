@@ -575,3 +575,77 @@ fn sec5_4847_malformed_extract_payloads_get_invalid_request() {
         assert_eq!(finish(child), 1);
     }
 }
+
+/// SEC-5・OCI-1・OCI-7・REPAIR-5・#4848: 本番の展開器（`UsernsLayerExtractor`）が、cri の注入点の呼び出し（検証済み blob・
+/// 展開先の `ExtractRoot`・範囲写像の展開設定）を実バイナリの helper（`--no-join`）へ橋渡しして展開する。
+/// 写像は送らない（helper が参加に使うもの）ため、展開設定の値は `ChownInUserNamespace` であることだけが要る。
+#[test]
+fn sec5_4848_extractor_extracts_through_the_real_helper() {
+    use fandhe_container_cri::adapter::ReleaseBudget;
+    use fandhe_container_cri::bundle::SubordinateLayerExtractor as _;
+    use fandhe_container_oci::layer::VerifiedLayerBlob;
+    use fandhe_container_oci::layer::extract::{
+        ExtractOptions, ExtractRoot, IdMap, IdRange, ImageLayer, OwnershipPolicy,
+    };
+    use fandhe_container_plugin_cri::userns_helper::UsernsLayerExtractor;
+
+    let t = Tree::new("extractor-real");
+    let tar = sample_tar();
+    let _ = write_blob(&t.0, &tar);
+    let digest = Digest::sha256_of(&tar);
+    let owner = std::fs::metadata(t.0.join("blob")).expect("meta").uid();
+    let blob = VerifiedLayerBlob::from_file(
+        File::open(t.0.join("blob")).expect("open"),
+        &digest,
+        u64::try_from(tar.len()).expect("len"),
+        owner,
+    )
+    .expect("verified");
+    let root = ExtractRoot::create_private_dir(&t.0.join("root")).expect("root");
+    let map = IdMap::new(vec![IdRange {
+        container_id: 0,
+        host_id: 100_000,
+        count: 65_536,
+    }])
+    .expect("map");
+    let opts = ExtractOptions::new().with_ownership(OwnershipPolicy::ChownInUserNamespace {
+        uid: map.clone(),
+        gid: map,
+    });
+    let ex = UsernsLayerExtractor::with_launcher_and_limit(launcher(), 2);
+    let layers = [ImageLayer::new(&blob, TAR_MEDIA, &digest)];
+    ex.extract_layers(
+        &layers,
+        &root,
+        DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES,
+        ExtractLimits::default(),
+        &opts,
+        &ReleaseBudget::new(),
+    )
+    .expect("extract");
+    assert_eq!(std::fs::read(t.0.join("root/d/f")).expect("read"), b"hello");
+
+    // 要求と違う digest の diff_id でも blob の digest 検証は通るが、blob の中身が違えば helper が `DataLoss` で拒否する。
+    let other = Digest::sha256_of(b"something else");
+    let bad = VerifiedLayerBlob::from_file(
+        File::open(t.0.join("blob")).expect("open"),
+        &digest,
+        u64::try_from(tar.len()).expect("len"),
+        owner,
+    )
+    .expect("verified");
+    let root2 = ExtractRoot::create_private_dir(&t.0.join("root2")).expect("root2");
+    let layers = [ImageLayer::new(&bad, TAR_MEDIA, &other)];
+    let e = ex
+        .extract_layers(
+            &layers,
+            &root2,
+            DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES,
+            ExtractLimits::default(),
+            &opts,
+            &ReleaseBudget::new(),
+        )
+        .expect_err("diff_id mismatch");
+    assert_eq!(e.code(), OciErrorCode::DataLoss);
+    assert_eq!(std::fs::read_dir(t.0.join("root2")).expect("ls").count(), 0);
+}

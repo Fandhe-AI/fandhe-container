@@ -1,7 +1,7 @@
 //! userns helper の親側の起動部品（同期のブロッキング API。Linux のみ。SEC-5・OCI-1・REPAIR-5。#4795）。
 //!
 //! 呼び出し元は展開（[`UsernsHelperLauncher::run_extract_bounded`]。OCI-1・OCI-2・#4847。cri の注入点と pull・create からの
-//! 呼び出しは後続の issue）・削除（`remover`。OCI-7）の経路で、`spawn_blocking` 等から使う。
+//! 呼び出しは #4848 の `extractor`）・削除（`remover`。OCI-7）の経路で、`spawn_blocking` 等から使う。
 //! plugin-cri 自身（`/proc/self/exe`）を隠し引数 [`super::USERNS_HELPER_ARG`] で再 exec し、制御 socket の要求と応答の
 //! frame（[`super::wire`]）で単一スレッドの helper と対話する。`pre_exec` は使わない（unsafe の面を最小に保つ）。`SCM_RIGHTS` は
 //! 展開要求の blob の fd だけに使い、要求 frame の後に 1 通で送る（`sys::fd_passing`。helper は参加の後に受ける）。

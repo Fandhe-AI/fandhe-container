@@ -519,7 +519,7 @@ impl CriPluginBackends {
                 Arc::clone(&self.oci_recorder),
             )),
         )
-        .with_puller(Arc::new(attach_tree_remover(
+        .with_puller(Arc::new(attach_userns_helpers(
             OciImagePuller::new(client, pull).with_recorder(self.oci_adapter()),
         ))))
     }
@@ -2376,7 +2376,7 @@ pub fn bundle_provider_with(
 /// pull 側にも、範囲写像で展開した `unpack/` の削除器（再 exec helper の削除モード）を差す（#4800・SEC-5・OCI-7）。
 /// create 側（[`bundle_provider_with_options`]）と同じプロセス共有の削除器を使い、同時実行の上限を 1 つにする。
 #[cfg(unix)]
-fn attach_tree_remover<C: fandhe_container_cri::image_pull::RegistryPullClient>(
+fn attach_userns_helpers<C: fandhe_container_cri::image_pull::RegistryPullClient>(
     puller: fandhe_container_cri::image_pull::OciImagePuller<C>,
 ) -> fandhe_container_cri::image_pull::OciImagePuller<C> {
     #[cfg(all(
@@ -2384,7 +2384,9 @@ fn attach_tree_remover<C: fandhe_container_cri::image_pull::RegistryPullClient>(
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
     {
-        puller.with_tree_remover(crate::userns_helper::UsernsTreeRemover::shared())
+        puller
+            .with_tree_remover(crate::userns_helper::UsernsTreeRemover::shared())
+            .with_layer_extractor(crate::userns_helper::UsernsLayerExtractor::shared())
     }
     #[cfg(not(all(
         target_os = "linux",
@@ -2424,7 +2426,9 @@ pub fn bundle_provider_with_options(
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
     {
-        source = source.with_tree_remover(crate::userns_helper::UsernsTreeRemover::shared());
+        source = source
+            .with_tree_remover(crate::userns_helper::UsernsTreeRemover::shared())
+            .with_layer_extractor(crate::userns_helper::UsernsLayerExtractor::shared());
     }
     Ok(Arc::new(SpecBundleProvider::new(
         bundles,

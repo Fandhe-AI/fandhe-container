@@ -46,6 +46,10 @@ use super::wire::{
 use crate::pod_holder::kill_and_reap;
 use crate::sys::fd_passing;
 
+// 展開の要求が許すレイヤー数（`spawn` 前に `ResourceExhausted` で拒否する上限）は、`SCM_RIGHTS` で一度に送れる fd の上限以下で
+// なければならない。片方だけを増やすと、`spawn` の後に `send_fds` が `InvalidInput` を返して `Unavailable` に化けるため固定する（#4847）。
+const _: () = assert!(MAX_EXTRACT_LAYERS <= fd_passing::MAX_FDS);
+
 /// 参加（user namespace の作成・写像の書き込み・release）に見込む上限: helper の 3 段（holder・mapper・helper）の期限 +
 /// 余裕 5 秒 + slack 5 秒（`isolate_rootless_subordinate` の契約。REPAIR-5）。
 pub const JOIN_BUDGET: Duration = Duration::from_secs(3 * DEFAULT_HELPER_TIMEOUT.as_secs() + 5 + 5);

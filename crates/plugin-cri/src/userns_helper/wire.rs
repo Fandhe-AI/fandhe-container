@@ -11,7 +11,7 @@
 //! helper は header を検査して期待の長さが決まってから、その長さだけを固定長バッファへ読む（確保しない）。
 //!
 //! # 展開要求（tag 3。OCI-1・OCI-2・SEC-5・#4847）
-//! payload は固定部 48 バイトと、レイヤー 1〜[`MAX_EXTRACT_LAYERS`] 件の 76 バイトずつ（すべて BE）:
+//! payload は固定部 48 バイトと、レイヤー 0〜[`MAX_EXTRACT_LAYERS`] 件（0 件は layers が空の正常なイメージ。fd は送らない）の 76 バイトずつ（すべて BE）:
 //! 固定部 = `[ownership tag（1 = ChownInUserNamespace のみ）, special bits tag（1 = Strip / 2 = PreserveIfChowned）,
 //! layer_count(u16), work_ms(u32), u64 × 5（max_entries・max_total_bytes・max_input_bytes・max_tracked_paths・
 //! max_uncompressed_bytes）]`、レイヤー = `[media 添字（[`fandhe_container_oci::layer::LAYER_MEDIA_TYPES`] の 1 起点）, 0, 0, 0,
@@ -484,8 +484,7 @@ impl ExtractRequest {
         layers: Vec<ExtractLayerSpec>,
     ) -> Result<Self, HelperErrorCode> {
         let in_range = |v: u64, max: u64| (1..=max).contains(&v);
-        let ok = !layers.is_empty()
-            && layers.len() <= MAX_EXTRACT_LAYERS
+        let ok = layers.len() <= MAX_EXTRACT_LAYERS
             && (1..=WORK_MS_MAX).contains(&work_ms)
             && in_range(limits.max_entries, DEFAULT_MAX_LAYER_ENTRIES)
             && in_range(limits.max_total_bytes, DEFAULT_MAX_EXTRACTED_BYTES)
@@ -642,11 +641,11 @@ pub fn decode_extract_payload(p: &[u8]) -> Result<ExtractRequest, HelperErrorCod
     ExtractRequest::checked(special, work, ExtractLimits::new(e, t, i, tp), mu, layers)
 }
 
-/// 展開要求の payload 長からレイヤー数を得る（`48 + n × 76`、1 ≤ n ≤ 128 だけ）。
+/// 展開要求の payload 長からレイヤー数を得る（`48 + n × 76`、0 ≤ n ≤ 128 だけ）。
 fn extract_layer_count(payload_len: usize) -> Option<usize> {
     let body = payload_len.checked_sub(EXTRACT_FIXED_LEN)?;
     let n = body / EXTRACT_LAYER_LEN;
-    (body % EXTRACT_LAYER_LEN == 0 && (1..=MAX_EXTRACT_LAYERS).contains(&n)).then_some(n)
+    (body % EXTRACT_LAYER_LEN == 0 && n <= MAX_EXTRACT_LAYERS).then_some(n)
 }
 
 /// 復号した要求。
@@ -1282,7 +1281,7 @@ mod tests {
         assert_eq!(r.work_ms(), 1500);
     }
 
-    /// REPAIR-5・#4847: 件数の上限（128 は受理、129 と 0 は拒否）と、header の長さの検査。
+    /// REPAIR-5・#4847: 件数の上限（128 は受理、129 は拒否、0 は受理）と、header の長さの検査。
     #[test]
     fn sec5_4847_extract_layer_count_bounds() {
         assert_eq!(MAX_EXTRACT_PAYLOAD_BYTES, 48 + 128 * 76);
@@ -1300,16 +1299,7 @@ mod tests {
             ),
             Err(HelperErrorCode::InvalidRequest)
         );
-        assert_eq!(
-            ExtractRequest::new(
-                ExtractSpecialBits::Strip,
-                ExtractLimits::default(),
-                1,
-                vec![]
-            ),
-            Err(HelperErrorCode::InvalidRequest)
-        );
-        for len in [0u32, 48, 48 + 75, 48 + 76 - 1, 48 + 76 + 1, 48 + 129 * 76] {
+        for len in [0u32, 47, 48 + 75, 48 + 76 - 1, 48 + 76 + 1, 48 + 129 * 76] {
             assert_eq!(
                 decode_request_header(&header(1, 3, [0, 0], len)),
                 Err(HelperErrorCode::InvalidRequest),
@@ -1393,6 +1383,21 @@ mod tests {
             );
         }
         assert_eq!(decode_request(&good), Ok(Request::Extract(req(1))));
+    }
+
+    /// OCI-1・#4847: レイヤー 0 件の要求は往復する（fd なしで展開する正常なイメージ）。
+    #[test]
+    fn oci1_4847_zero_layer_request_roundtrips() {
+        let r = req(0);
+        let f = encode_extract_request(&r);
+        assert_eq!(f.as_bytes().len(), 8 + 48);
+        assert_eq!(decode_request(f.as_bytes()), Ok(Request::Extract(r)));
+        assert_eq!(
+            decode_request_header(&header(1, 3, [0, 0], 48))
+                .unwrap()
+                .payload_len(),
+            48
+        );
     }
 
     /// OCI-1・#4847: mediaType は表の 6 種すべてが添字で往復し、表に無い値は `Unimplemented`。

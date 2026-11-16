@@ -170,16 +170,22 @@ fn extract(
 ) -> Result<ExtractReport, HelperErrorCode> {
     let deadline = received_at + Duration::from_millis(u64::from(req.work_ms()));
     let want = req.layers().len();
-    let got = fd_passing::recv_fds(sock.as_fd(), want).map_err(|e| match e.kind() {
-        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
-            HelperErrorCode::RequestTimeout
+    // 0 件は launcher が SCM_RIGHTS を送らないため待たない（OCI-1。layers が空の正常なイメージ）。
+    let fds = if want == 0 {
+        Vec::new()
+    } else {
+        let got = fd_passing::recv_fds(sock.as_fd(), want).map_err(|e| match e.kind() {
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
+                HelperErrorCode::RequestTimeout
+            }
+            _ => HelperErrorCode::InvalidRequest,
+        })?;
+        // 本数が要求とちょうど一致しなければ拒否する（受けた fd は drop で閉じる）。
+        if got.token != EXTRACT_FD_TOKEN || got.fds.len() != want {
+            return Err(HelperErrorCode::InvalidRequest);
         }
-        _ => HelperErrorCode::InvalidRequest,
-    })?;
-    // 本数が要求とちょうど一致しなければ拒否する（受けた fd は drop で閉じる）。
-    if got.token != EXTRACT_FD_TOKEN || got.fds.len() != want {
-        return Err(HelperErrorCode::InvalidRequest);
-    }
+        got.fds
+    };
     // blob を置いたストアの所有者は、名前空間の中から見た自分の euid（範囲写像ではホストの利用者が 0 に見える）。
     let status = read_bounded("/proc/self/status", MAX_STATUS_BYTES)?;
     let owner = fandhe_container_supervisor::privilege::parse_proc_status(&status)
@@ -190,7 +196,7 @@ fn extract(
     let blobs = req
         .layers()
         .iter()
-        .zip(got.fds)
+        .zip(fds)
         .map(|(l, fd)| {
             VerifiedLayerBlob::from_file(File::from(fd), l.digest(), l.size(), owner).map_err(fail)
         })

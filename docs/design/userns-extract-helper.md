@@ -16,12 +16,14 @@ helper を作り、参加後の処理を helper に任せる。
 | 単位 | 内容 | 状態 |
 | ---- | ---- | ---- |
 | H1（#4795） | 入口の振り分け・親側の起動部品・参加・結果の返却（Inspect・StatTarget） | 本書。実装済み |
-| H2 | 展開の本体（Extract。tag 3） | 未 |
+| H2（#4796） | 展開の記録の符号化。実装済み。展開の本体（Extract・tag 3）は担当の issue が無く未実装（#4801 の確認でオーナーへ戻した） | 符号化のみ実装済み |
 | H3（#4800） | 削除（Remove。tag 4）と plugin-cri の削除器・cri の注入点 | 本書。実装済み（有効化は H6） |
-| H4 | `image_ownership` の複製と fixture | 未 |
-| H5 | pull / start の subuid のずれの照合 | 未 |
-| H6 | `extract_options_for` の対応表の切り替え | 未 |
-| H7 | CI への組み込み・成功行の照合・所要時間の記録 | 未 |
+| H4（#4798） | `image_ownership` の複製と fixture | 実装済み |
+| H5（#4799） | pull / start の subuid のずれの照合 | 実装済み |
+| H6（#4801） | `extract_options_for` の対応表の切り替え | 未（着手前確認で `PreserveIfChowned` と create の rootfs 0755 化が両立せず、オーナー判断待ち。[oci-layer-special-bits.md](./oci-layer-special-bits.md)「`PreserveIfChowned` と rootfs の 0755 化の両立」） |
+| H7（#4802） | CI への組み込み・成功行の照合・所要時間の記録 | 未 |
+
+H 番号の注記: 以降およびコード内コメントの「H2」は展開の本体（Extract モード）を指すことがあるが、#4796 の実体は符号化のみ。展開モードの結線は担当の issue が無い。
 
 ## 構成
 

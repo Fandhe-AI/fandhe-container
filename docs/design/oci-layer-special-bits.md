@@ -19,7 +19,7 @@ tar の値のまま適用する。満たさないものは落とす（fail-close
 `extract_layers_confined`（パス版）を追加した（#4778 の B 案・#4804・SEC-5・SEC-1・OCI-2）。祖先は開いた fd（`ExtractRoot`）で渡し、
 `root` 自身は 0755 でもよい（cri の `open_rootfs_for_search` が展開後に rootfs を 0755 にするため）。祖先を渡さない従来の入口は
 挙動を変えない。祖先は `PreserveIfOwnerMapped` のときだけ使い、`Strip` では読まず、`PreserveIfChowned` は祖先を無視して
-`root` 自身の 0700 で判定する（#4801 の担当）。
+`root` 自身の 0700 で判定する（#4801 の担当。create の 0755 化との両立は下の「`PreserveIfChowned` と rootfs の 0755 化の両立」）。
 
 `uid` / `gid` は user namespace の写像（core の `IdMapping` と同じ意味の `container_id host_id count` の 1 行）を
 `IdRange` で渡す。`host_id` は展開するプロセス自身の user namespace から見える ID（そのプロセスの `fstat` が返す
@@ -296,5 +296,30 @@ pull 時と start 時の subuid / subgid のずれ（#2539・#2528 の事後監�
 `FAILED_PRECONDITION` で拒否する（#4799。`ownership=` 行の完全一致・固定文言・旧い `keep` の記録も拒否。試験は
 `sec5_match_recorded_settings_distinguishes_id_mapping_mismatch`・`oci1_sec5_pull_rejects_*`・
 `sec5_create_rejects_unpack_record_with_other_id_mapping`）。本番の値が現状 `Keep` + `Strip` で記録の写像が空のため、
-今は食い違いが起きない。`ChownInUserNamespace` の本番配線は H6（#4801。実装済みを装わない。REPAIR-3）。
+今は食い違いが起きない。`ChownInUserNamespace` の本番配線は H6（#4801。実装済みを装わない。REPAIR-3。両立の確認結果は「`PreserveIfChowned` と rootfs の 0755 化の両立」）。
 詳細は [pull-inventory-wiring.md](pull-inventory-wiring.md)。
+
+## `PreserveIfChowned` と rootfs の 0755 化の両立（#4801 の着手前確認。SEC-5・OCI-1・OCI-2・REPAIR-3）
+
+結論: create の経路では両立しない。対応表（`extract_options_for`）の `RootlessSubordinateIds` は `Keep` + `Strip` のまま変えず、
+オーナー判断を待つ（Agent の推奨は A。未承認）。
+
+| 経路 | `root` の mode | 契約（展開から rootfs として使い終わるまで 0700）との関係 |
+| ---- | -------------- | -------------------------------------------------------- |
+| pull（`staging/<id>/unpack/entry/rootfs`） | 毎回新規に 0700・公開後も 0700 | 両立する |
+| create（`crates/cri/src/bundle/image_rootfs.rs`） | 0700 で作り、展開直後の `open_rootfs_for_search` が 0755 にする | 両立しない |
+
+- oci は `PreserveIfChowned` では閉じ込めの祖先を使わず、`root` 自身の 0700 を展開中に確かめる。展開後の 0755 化は契約違反になる
+- 0755 化は外せない。`ChownInUserNamespace` では `root` は ns 内 0:0 の所有で、コンテナ内の非 root（subuid）は 0700 の `/` を辿れない
+- bundle ディレクトリ（0700・起動ユーザー所有）が実際には他ユーザーを遮る見込みはあるが、oci の判定にも契約にも入っていない
+
+選択肢（オーナー判断待ち）:
+
+- A: 閉じ込めの祖先を `PreserveIfChowned` にも効かせる（#4804 の拡張）。祖先と `root` の所有 uid は ns の中から見た値で、`chown_root` より前に比べる。展開中の再確認を祖先へ移し、契約の文言を改める。cri 側は祖先を既に常に渡している
+- B: create でも `root` を 0700 に保つ。非 root のコンテナユーザーが動かなくなるため現実的でない
+- C: まず `ChownInUserNamespace` + `Strip` で所有者の写像だけ有効にし、特殊ビットの保持は A の決定後に回す（A を採るまでの暫定として許容できる）
+
+範囲の欠け: helper の Extract モード（tag 3）は予約のまま `unimplemented` で、pull・create は今もプロセス内で oci の展開を呼ぶ。
+`ChownInUserNamespace` は user namespace 外では `FailedPrecondition` になるため、対応表だけを切り替えると範囲写像の環境で pull と create が全て失敗する。
+切り替えの前に、helper の展開モード（複数 blob の fd の受け渡し・options と制限値の受け渡し）・cri 側の注入点・plugin-cri の本番実装・
+`image_pull.rs` の root 所有者の期待値の切り替えが要る。H6 を「展開の結線」と「対応表の切り替え」に分けることを提案する。

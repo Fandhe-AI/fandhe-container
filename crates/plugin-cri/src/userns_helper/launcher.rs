@@ -24,6 +24,7 @@ use std::os::unix::net::UnixStream;
 #[cfg(any(test, feature = "userns-helper-test-support"))]
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use fandhe_container_core::rootless::DEFAULT_HELPER_TIMEOUT;
@@ -41,6 +42,8 @@ const REQUEST_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 /// 応答を受けた後に子の終了を待つ上限。
 const EXIT_WAIT: Duration = Duration::from_secs(1);
 const POLL_STEP: Duration = Duration::from_millis(10);
+/// 応答待ちで取り消しの旗を見る間隔。
+const CANCEL_POLL: Duration = Duration::from_millis(100);
 
 /// モード実行に呼び出し側が見込む時間（1 秒〜600 秒。範囲外は作れない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,7 +183,23 @@ impl UsernsHelperLauncher {
         target: BorrowedFd<'_>,
         work_budget: WorkBudget,
     ) -> Result<Report, UsernsHelperError> {
-        let deadline = Instant::now() + self.join_budget + work_budget.get();
+        self.run_bounded(mode, target, work_budget, None, None)
+    }
+
+    /// [`Self::run`] に絶対期限と取り消しの旗を足した版。どちらかが尽きたら待ちを止め、helper を kill・回収して `Timeout`
+    /// を返す（呼び出し側の `ReleaseBudget` の契約。REPAIR-5・#3142）。
+    pub fn run_bounded(
+        &self,
+        mode: Mode,
+        target: BorrowedFd<'_>,
+        work_budget: WorkBudget,
+        hard_deadline: Option<Instant>,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Report, UsernsHelperError> {
+        let mut deadline = Instant::now() + self.join_budget + work_budget.get();
+        if let Some(h) = hard_deadline {
+            deadline = deadline.min(h);
+        }
         let internal = |m: &'static str| UsernsHelperError::new(ErrorCode::Internal, m);
 
         // 対象がディレクトリでなければ spawn の前に拒否する（副作用なし）。
@@ -220,7 +239,7 @@ impl UsernsHelperLauncher {
         let child =
             spawned.map_err(|_| UsernsHelperError::new(ErrorCode::Unavailable, MSG_SPAWN))?;
 
-        converse(child, parent_end, mode, deadline)
+        converse(child, parent_end, mode, deadline, cancel)
     }
 
     /// 起動する Command（と、`/proc/self/exe` の検証済み fd のガード）。
@@ -261,6 +280,7 @@ fn converse(
     mut sock: UnixStream,
     mode: Mode,
     deadline: Instant,
+    cancel: Option<&AtomicBool>,
 ) -> Result<Report, UsernsHelperError> {
     let mut child = child;
     if sock.write_all(encode_request(mode).as_bytes()).is_err() {
@@ -270,10 +290,10 @@ fn converse(
     let mut got = 0usize;
     while got < RESPONSE_LEN {
         let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
+        if left.is_zero() || cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
             return Err(fail(child, ErrorCode::Timeout, MSG_TIMEOUT));
         }
-        if sock.set_read_timeout(Some(left)).is_err() {
+        if sock.set_read_timeout(Some(left.min(CANCEL_POLL))).is_err() {
             return Err(fail(child, ErrorCode::Internal, MSG_PROTOCOL));
         }
         let Some(dst) = buf.get_mut(got..) else {
@@ -288,10 +308,7 @@ fn converse(
                 if matches!(
                     e.kind(),
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                return Err(fail(child, ErrorCode::Timeout, MSG_TIMEOUT));
-            }
+                ) => {}
             Err(_) => return Err(fail(child, ErrorCode::Internal, MSG_PROTOCOL)),
         }
     }

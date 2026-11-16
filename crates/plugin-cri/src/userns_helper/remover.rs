@@ -11,8 +11,8 @@
 //! # 契約
 //! - 縮退しない: 失敗・期限切れはホスト側の削除へ落とさず、固定文言の [`CriError`]（パス・errno・uid を含めない。REPAIR-4）
 //! - 期限（REPAIR-5）: [`ReleaseBudget`] の期限があれば残り時間から [`JOIN_BUDGET`] を引いて作業予算にする（1〜600 秒に丸める）。
-//!   期限が無ければ [`DEFAULT_WORK_BUDGET`]。開始前に期限切れ・取り消しなら起動しない。取り消しの旗は helper の実行中には
-//!   見られず、全体の待ちは呼び出し側の期限を最大 [`JOIN_BUDGET`] 超えうる（残余）
+//!   期限が無ければ [`DEFAULT_WORK_BUDGET`]。開始前に期限切れ・取り消しなら起動しない。実行中も絶対期限と取り消しの旗を
+//!   100 ms 刻みで見て、尽きたら helper を kill・回収して `Timeout`（作業予算の 1 秒の下限が期限を超えても絶対期限で止める）
 //! - 同時実行の上限: 稼働中 + 回収できていない子の合計が [`MAX_CONCURRENT_REMOVALS`] 以上なら待たずに `UNAVAILABLE`
 //!   （kubelet が再試行する。launcher の「上限は呼び出し側」の契約）
 //! - 回収できなかった子は保持し、次の呼び出しの先頭で `try_wait` で掃く（`Child` を落として追えない zombie を作らない）
@@ -197,7 +197,13 @@ impl SubordinateTreeRemover for UsernsTreeRemover {
         let slot = self.acquire().ok_or_else(|| {
             CriError::unavailable("too many subordinate-owned tree removals in progress")
         })?;
-        match self.launcher.run(Mode::Remove(wire), parent, work) {
+        match self.launcher.run_bounded(
+            Mode::Remove(wire),
+            parent,
+            work,
+            budget.deadline,
+            budget.cancel,
+        ) {
             Ok(Report::Removed) => Ok(()),
             Ok(_) => Err(CriError::internal(
                 "userns helper returned an unexpected report",
@@ -271,6 +277,32 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1));
         // 上限で拒否しても、取っていない枠を返さない。
         assert_eq!(rm.active.load(Ordering::Acquire), 2);
+    }
+
+    /// REPAIR-5・#3142・#4800: 実行中の helper も、取り消しの旗が立てば 100 ms 刻みで止まり kill・回収される。
+    #[test]
+    fn sec5_4800_remover_cancel_during_run_kills_the_helper() {
+        use std::sync::atomic::AtomicBool;
+        let rm = sleeper(MAX_CONCURRENT_REMOVALS);
+        let dir = File::open("/").expect("open /");
+        let cancel = AtomicBool::new(false);
+        let started = Instant::now();
+        let e = std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(300));
+                cancel.store(true, Ordering::Release);
+            });
+            rm.remove_child_tree(
+                dir.as_fd(),
+                RemovalTarget::BundleRootfs,
+                &ReleaseBudget::new().with_cancel(&cancel),
+            )
+        })
+        .expect_err("cancelled");
+        assert_eq!(e.code(), CriErrorCode::Timeout);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(rm.unreaped.lock().unwrap().len(), 0);
+        assert_eq!(rm.active.load(Ordering::Acquire), 0);
     }
 
     /// REPAIR-5・#4800: 期限切れの予算では helper を起動せず `Timeout`（副作用なし）。

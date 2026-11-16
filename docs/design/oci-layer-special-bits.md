@@ -302,7 +302,7 @@ pull 時と start 時の subuid / subgid のずれ（#2539・#2528 の事後監�
 ## `PreserveIfChowned` と rootfs の 0755 化の両立（#4801 の着手前確認。SEC-5・OCI-1・OCI-2・REPAIR-3）
 
 結論: create の経路では両立しない。対応表（`extract_options_for`）の `RootlessSubordinateIds` は `Keep` + `Strip` のまま変えず、
-オーナー判断を待つ（Agent の推奨は未承認）。
+オーナー判断を待つ（Agent の推奨は A。未承認）。
 
 | 経路 | `root` の mode | 契約（展開から rootfs として使い終わるまで 0700）との関係 |
 | ---- | -------------- | -------------------------------------------------------- |
@@ -317,7 +317,7 @@ pull 時と start 時の subuid / subgid のずれ（#2539・#2528 の事後監�
 
 - A: 閉じ込めの祖先を `PreserveIfChowned` にも効かせる（#4804 の拡張）。祖先と `root` の所有 uid は ns の中から見た値で、`chown_root` より前に比べる。展開中の再確認を祖先へ移し、契約の文言を改める。cri 側は祖先を既に常に渡している
 - B: create でも `root` を 0700 に保つ。非 root のコンテナユーザーが動かなくなるため現実的でない
-- C: まず `ChownInUserNamespace` + `Strip` で所有者の写像だけ有効にし、特殊ビットの保持は A の決定後に回す
+- C: まず `ChownInUserNamespace` + `Strip` で所有者の写像だけ有効にし、特殊ビットの保持は A の決定後に回す（A を採るまでの暫定として許容できる）
 
 範囲の欠け: helper の Extract モード（tag 3）は予約のまま `unimplemented` で、pull・create は今もプロセス内で oci の展開を呼ぶ。
 `ChownInUserNamespace` は user namespace 外では `FailedPrecondition` になるため、対応表だけを切り替えると範囲写像の環境で pull と create が全て失敗する。

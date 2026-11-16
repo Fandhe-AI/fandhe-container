@@ -246,7 +246,10 @@ mod linux {
                 .unwrap_or_else(|e| fail(&format!("create {}: {e}", d.display())));
         }
         let rootfs = parent.join("rootfs");
-        let status = std::process::Command::new(BIN)
+        // --populate は試験バイナリ自身の main が処理する（plugin-cri の bin は受けない）。
+        let self_exe =
+            std::env::current_exe().unwrap_or_else(|e| fail(&format!("current_exe: {e}")));
+        let status = std::process::Command::new(self_exe)
             .arg("--populate")
             .arg(&rootfs)
             .status()

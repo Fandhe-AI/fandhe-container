@@ -97,20 +97,26 @@ impl UsernsTreeRemover {
     }
 
     /// 回収できていなかった子のうち、終わったものを掃く。残りの数を返す。
-    fn sweep(&self) -> usize {
+    ///
+    /// 回収できていない子は取得済みの枠を保持し続ける（`active` に含める）ため、掃けた分だけ枠を返す。
+    fn sweep(&self) {
         let Ok(mut held) = self.unreaped.lock() else {
-            return self.max;
+            return;
         };
+        let before = held.len();
         held.retain_mut(|c| !matches!(c.try_wait(), Ok(Some(_)) | Err(_)));
-        held.len()
+        let freed = before - held.len();
+        if freed > 0 {
+            self.active.fetch_sub(freed, Ordering::AcqRel);
+        }
     }
 
     /// 枠を取る。稼働中 + 回収できていない子が上限に達していれば `None`（待たない）。
     fn acquire(&self) -> Option<Slot<'_>> {
-        let stuck = self.sweep();
+        self.sweep();
         let mut cur = self.active.load(Ordering::Acquire);
         loop {
-            if cur.saturating_add(stuck) >= self.max {
+            if cur >= self.max {
                 return None;
             }
             match self.active.compare_exchange_weak(
@@ -125,9 +131,11 @@ impl UsernsTreeRemover {
         }
     }
 
-    fn keep(&self, child: Child) {
+    /// 回収できなかった子を保持する。枠は返さず子の回収まで持たせる（`sweep` が返す）。
+    fn keep(&self, child: Child, slot: Slot<'_>) {
         if let Ok(mut held) = self.unreaped.lock() {
             held.push(child);
+            std::mem::forget(slot);
         }
     }
 }
@@ -186,7 +194,7 @@ impl SubordinateTreeRemover for UsernsTreeRemover {
         budget.check()?;
         let wire = wire_target(target)?;
         let work = work_budget(budget)?;
-        let _slot = self.acquire().ok_or_else(|| {
+        let slot = self.acquire().ok_or_else(|| {
             CriError::unavailable("too many subordinate-owned tree removals in progress")
         })?;
         match self.launcher.run(Mode::Remove(wire), parent, work) {
@@ -196,7 +204,7 @@ impl SubordinateTreeRemover for UsernsTreeRemover {
             )),
             Err(mut e) => {
                 if let Some(child) = e.take_unreaped() {
-                    self.keep(child);
+                    self.keep(child, slot);
                 }
                 Err(map_error(&e))
             }

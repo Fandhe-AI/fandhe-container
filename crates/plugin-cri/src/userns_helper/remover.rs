@@ -150,12 +150,14 @@ fn work_budget(budget: &ReleaseBudget<'_>) -> Result<WorkBudget, CriError> {
         .map_err(|_| CriError::internal("failed to compute the removal budget"))
 }
 
-fn wire_target(t: RemovalTarget) -> RemoveTarget {
+fn wire_target(t: RemovalTarget) -> Result<RemoveTarget, CriError> {
     match t {
-        RemovalTarget::BundleRootfs => RemoveTarget::BundleRootfs,
-        RemovalTarget::PullUnpack => RemoveTarget::PullUnpack,
-        // `RemovalTarget` は non_exhaustive。足した対象を黙って別の木へ写さない。
-        _ => RemoveTarget::BundleRootfs,
+        RemovalTarget::BundleRootfs => Ok(RemoveTarget::BundleRootfs),
+        RemovalTarget::PullUnpack => Ok(RemoveTarget::PullUnpack),
+        // `RemovalTarget` は non_exhaustive。足した対象を黙って別の木へ写さず、helper を起動せず拒否する。
+        _ => Err(CriError::failed_precondition(
+            "subordinate-owned tree removal target is not supported",
+        )),
     }
 }
 
@@ -182,14 +184,12 @@ impl SubordinateTreeRemover for UsernsTreeRemover {
     ) -> Result<(), CriError> {
         // 期限切れ・取り消しなら起動しない（副作用なし）。
         budget.check()?;
+        let wire = wire_target(target)?;
         let work = work_budget(budget)?;
         let _slot = self.acquire().ok_or_else(|| {
             CriError::unavailable("too many subordinate-owned tree removals in progress")
         })?;
-        match self
-            .launcher
-            .run(Mode::Remove(wire_target(target)), parent, work)
-        {
+        match self.launcher.run(Mode::Remove(wire), parent, work) {
             Ok(Report::Removed) => Ok(()),
             Ok(_) => Err(CriError::internal(
                 "userns helper returned an unexpected report",

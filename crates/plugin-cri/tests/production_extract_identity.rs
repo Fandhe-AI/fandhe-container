@@ -49,7 +49,10 @@ fn child_phase() {
         "shared" => {
             let backends = backends.with_extract_identity_resolver(move || {
                 c.fetch_add(1, Ordering::SeqCst);
-                Ok(ExtractIdentity::RootlessSingleId)
+                Ok(ExtractIdentity::RootlessSingleId {
+                    uid: 1000,
+                    gid: 1000,
+                })
             });
             backends.production_bundle_provider().expect("provider");
             assert_eq!(calls.load(Ordering::SeqCst), 1);

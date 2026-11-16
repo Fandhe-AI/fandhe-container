@@ -57,8 +57,7 @@
 //! コンテナと同じ写像の user namespace の中から tar のコンテナ内 ID をそのまま `chown` する（`/proc/self` で開始前に
 //! 検証する。OCI-2・SEC-5・#2382）。
 //! 未実装: ディレクトリ fd 起点の解決（TOCTOU 対策）、rootless の user namespace へ入って展開器を呼ぶ core 側の配線（#2315）、
-//! 0700 の祖先での閉じ込めの cri・plugin-cri への結線（oci 側の `extract_image_layers_confined_in` は実装済み。#4804。
-//! 結線までは `root` が 0700 で、コンテナ root だけが辿れる）、綴りの畳み込みによる名前衝突の検出（展開先 FS が区別する
+//! 0700 の祖先での閉じ込めは cri の create 経路（bundle）へ結線済み（#4804・#4805。pull は展開の根自身の 0700 で判定）、綴りの畳み込みによる名前衝突の検出（展開先 FS が区別する
 //! 別表記は衝突として扱わない。IO-5）。
 //!
 //! 未実装（スタブではなく後続 issue の担当）: キャッシュ・`image ls`/`rm`/`tag`（TASK-52〜55・TASK-183〜184）。`RegistryClient` の通信は匿名トークン取得・

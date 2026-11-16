@@ -104,9 +104,11 @@
 //!   - 所有者・特殊ビットの選択肢は [`PullConfig::extract_options`] で受ける。本番の呼び出し元（plugin-cri の
 //!     `CriPluginBackends`。#2592）は、start と同じ権限モデルの解決（supervisor の `resolve_self_launch_privilege`）から
 //!     `extract_identity::extract_options_for` の対応表で値を選び、pull と create の両方へ 1 回の解決結果を渡す（#2792。
-//!     解決の失敗は縮退せず失敗）。対応表の値は現状どの権限モデルでも既定の `Keep` + `Strip`: ホスト root は本番の start が
-//!     無く（#2241 D1:A）、SingleId は `Keep` が正しく、特殊ビットは `open_rootfs_for_search` の 0755 化が
-//!     `PreserveIfOwnerMapped` の 0700 契約と両立しない間は保持しない。範囲写像（SubordinateIds）の本来の値
+//!     解決の失敗は縮退せず失敗）。対応表の値は、SingleId が `Keep` + `PreserveIfOwnerMapped`（#4805）、他は既定の `Keep` + `Strip`
+//!     （ホスト root は本番の start が無い。#2241 D1:A）。閉じ込めの祖先は、create（bundle）では 0700 の bundle ディレクトリを
+//!     渡す。pull（キャッシュ）は祖先を渡さず、毎回新規に作る 0700 の展開の根（`unpack/entry/rootfs`。公開の `renameat` 後も
+//!     0700 のまま）自身で判定する（`unpack/` を祖先にすると公開後は祖先でなくなり、キャッシュの寿命の間 0700 を保つ契約が
+//!     成り立たない。キャッシュ root・`rootfs/sha256` の権限基準〔#2547〕にも依存しない）。範囲写像（SubordinateIds）の本来の値
 //!     `ChownInUserNamespace` は tokio のマルチスレッドのプロセス内では user namespace に入れず（core の
 //!     `MultiThreaded` 拒否）未配線。記録の符号化は済み（#4796・H2）で、残りは helper（H1）・対応表の切り替え（H6）。pull 時と start 時の subuid の
 //!     ずれの照合は `match_recorded_settings` で実装済み（#4799。`ownership=` 行の完全一致。`Keep` では所有者が

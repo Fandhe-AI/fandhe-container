@@ -8,12 +8,13 @@
 //! 同じ既定パス）を使い、pull / create と start の食い違いを構造で防ぐ。解決の失敗は既定値へ縮退させず、
 //! 固定文言の `CriError` で失敗させる（fail-closed）。
 //!
-//! 対応表（[`extract_options_for`]）は現状どの行も `Keep` + `Strip` で、unpack-record の `settings` は従来と変わらない。
-//! subuid のずれの照合は cri 側で実装済み（#4799）。残りの配線（`ChownInUserNamespace`・`PreserveIfOwnerMapped`）は後続 issue で、
+//! 対応表（[`extract_options_for`]）は `RootlessSingleId` だけ `Keep` + `PreserveIfOwnerMapped`（#4805。bundle の閉じ込めを
+//! 0700 の祖先で判定する入口が cri 側に結線済み）で、他の行は `Keep` + `Strip`。
+//! subuid のずれの照合は cri 側で実装済み（#4799）。残りの配線（`ChownInUserNamespace`）は後続 issue で、
 //! 各 variant の doc に理由を書く。実装済みを装わない（REPAIR-3）。
 
 use fandhe_container_cri::error::CriError;
-use fandhe_container_oci::layer::extract::ExtractOptions;
+use fandhe_container_oci::layer::extract::{ExtractOptions, IdRange, SpecialBitsPolicy};
 
 /// 展開設定を選ぶための、自プロセスの権限モデル（start の解決結果の写し）。将来の variant 追加に備え `non_exhaustive`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,10 +23,15 @@ pub enum ExtractIdentity {
     /// ホスト root（euid 0）で動いている。本番の start は恒久的に拒否される（#2241 D1:A）ため写像先の uid が存在せず、
     /// イメージ由来の所有者・setuid をホストへ持ち込まない `Keep` + `Strip` にする。
     HostRoot,
-    /// 非 root・範囲写像なし（1 対 1）。所有者は自 ID のままで `Keep` が正しい。特殊ビットは、展開後の bundle の
-    /// rootfs を 0755 にする `open_rootfs_for_search` が `PreserveIfOwnerMapped` の「root を 0700 に保つ」契約と
-    /// 両立しないため保持しない（後続 issue）。
-    RootlessSingleId,
+    /// 非 root・範囲写像なし（1 対 1）。所有者は自 ID のままで `Keep` が正しい。特殊ビットは tar の uid / gid 0 を
+    /// 展開プロセスの euid / egid（`uid` / `gid`）へ写す `PreserveIfOwnerMapped` で保持する。bundle の rootfs が 0755 でも、
+    /// cri が 0700 の bundle ディレクトリを閉じ込めの祖先として渡すため成り立つ（#4805・SEC-5・SEC-1・OCI-2）。
+    RootlessSingleId {
+        /// 展開プロセスの実効 uid（コンテナの 0 の写像先）。
+        uid: u32,
+        /// 展開プロセスの実効 gid。
+        gid: u32,
+    },
     /// 非 root・subuid / subgid の範囲写像あり。本来の値は `ChownInUserNamespace` だが、tokio のマルチスレッドの
     /// プロセス内では user namespace に入れない（core の `MultiThreaded` 拒否）ため暫定で `Keep` + `Strip`
     /// （後続 issue。subuid のずれの照合は cri の `match_recorded_settings` で実装済み・#4799。写像を持たせて配線するのは H6）。
@@ -39,9 +45,22 @@ pub enum ExtractIdentity {
 /// 権限モデルから展開設定を選ぶ対応表（網羅的な `match`。未知の variant を丸めない）。
 #[must_use]
 pub fn extract_options_for(identity: &ExtractIdentity) -> ExtractOptions {
-    match identity {
+    match *identity {
+        ExtractIdentity::RootlessSingleId { uid, gid } => {
+            ExtractOptions::new().with_special_bits(SpecialBitsPolicy::PreserveIfOwnerMapped {
+                uid: IdRange {
+                    container_id: 0,
+                    host_id: uid,
+                    count: 1,
+                },
+                gid: IdRange {
+                    container_id: 0,
+                    host_id: gid,
+                    count: 1,
+                },
+            })
+        }
         ExtractIdentity::HostRoot
-        | ExtractIdentity::RootlessSingleId
         | ExtractIdentity::RootlessSubordinateIds
         | ExtractIdentity::Unsupported => ExtractOptions::new(),
     }
@@ -52,17 +71,34 @@ pub fn extract_options_for(identity: &ExtractIdentity) -> ExtractOptions {
 #[cfg(target_os = "linux")]
 fn identity_from_privilege(
     privilege: fandhe_container_core::exec::IsolationPrivilege,
+    euid: u32,
+    egid: u32,
 ) -> Result<ExtractIdentity, CriError> {
     use fandhe_container_core::exec::IsolationPrivilege;
     use fandhe_container_cri::error::CriErrorCode;
     match privilege {
-        IsolationPrivilege::RootlessSingleId => Ok(ExtractIdentity::RootlessSingleId),
+        IsolationPrivilege::RootlessSingleId => Ok(ExtractIdentity::RootlessSingleId {
+            uid: euid,
+            gid: egid,
+        }),
         IsolationPrivilege::RootlessSubordinateIds => Ok(ExtractIdentity::RootlessSubordinateIds),
         _ => Err(CriError::new(
             CriErrorCode::FailedPrecondition,
             "unsupported isolation privilege for image extraction",
         )),
     }
+}
+
+/// 実効 uid / gid（`/proc/self/status`。`current_euid` と同じ上限つきの読み方）。読めなければ `Err`（縮退しない）。
+#[cfg(target_os = "linux")]
+fn current_euid_egid() -> Result<(u32, u32), ()> {
+    use std::io::Read as _;
+    let mut text = String::new();
+    std::fs::File::open("/proc/self/status")
+        .and_then(|f| f.take(64 * 1024).read_to_string(&mut text))
+        .map_err(|_| ())?;
+    let snap = fandhe_container_supervisor::privilege::parse_proc_status(&text).map_err(|_| ())?;
+    Ok((snap.uid.effective, snap.gid.effective))
 }
 
 /// 本番の解決。Linux は euid 0 なら `HostRoot`、それ以外は start と同じ解決の結果を写す。
@@ -84,7 +120,10 @@ pub fn resolve_extract_identity() -> Result<ExtractIdentity, CriError> {
                     )
                 },
             )?;
-        identity_from_privilege(privilege)
+        let (euid, egid) = current_euid_egid().map_err(|()| {
+            CriError::failed_precondition("cannot determine the plugin process credentials")
+        })?;
+        identity_from_privilege(privilege, euid, egid)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -96,17 +135,36 @@ pub fn resolve_extract_identity() -> Result<ExtractIdentity, CriError> {
 mod tests {
     use super::*;
 
-    /// SEC-5・OCI-1・#2792: 対応表は現状どの権限モデルでも既定（`Keep` + `Strip`）で、unpack-record の settings を変えない。
+    /// SEC-5・OCI-1・#2792・#4805: 対応表は `RootlessSingleId` だけ `PreserveIfOwnerMapped`（0 → euid / egid の 1 行）で、他は既定。
     #[test]
     fn sec5_oci1_2792_extract_options_table() {
         for id in [
             ExtractIdentity::HostRoot,
-            ExtractIdentity::RootlessSingleId,
             ExtractIdentity::RootlessSubordinateIds,
             ExtractIdentity::Unsupported,
         ] {
             assert_eq!(extract_options_for(&id), ExtractOptions::new(), "{id:?}");
         }
+        let want =
+            ExtractOptions::new().with_special_bits(SpecialBitsPolicy::PreserveIfOwnerMapped {
+                uid: IdRange {
+                    container_id: 0,
+                    host_id: 1000,
+                    count: 1,
+                },
+                gid: IdRange {
+                    container_id: 0,
+                    host_id: 1001,
+                    count: 1,
+                },
+            });
+        assert_eq!(
+            extract_options_for(&ExtractIdentity::RootlessSingleId {
+                uid: 1000,
+                gid: 1001
+            }),
+            want
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -115,14 +173,18 @@ mod tests {
         use fandhe_container_core::exec::IsolationPrivilege as P;
         use fandhe_container_cri::error::CriErrorCode;
         assert_eq!(
-            identity_from_privilege(P::RootlessSingleId).expect("single"),
-            ExtractIdentity::RootlessSingleId
+            identity_from_privilege(P::RootlessSingleId, 1000, 1001).expect("single"),
+            ExtractIdentity::RootlessSingleId {
+                uid: 1000,
+                gid: 1001
+            }
         );
         assert_eq!(
-            identity_from_privilege(P::RootlessSubordinateIds).expect("subordinate"),
+            identity_from_privilege(P::RootlessSubordinateIds, 1000, 1001).expect("subordinate"),
             ExtractIdentity::RootlessSubordinateIds
         );
-        let err = identity_from_privilege(P::RootfulHostRoot).expect_err("rootful is rejected");
+        let err =
+            identity_from_privilege(P::RootfulHostRoot, 0, 0).expect_err("rootful is rejected");
         assert_eq!(err.code(), CriErrorCode::FailedPrecondition);
         assert_eq!(
             err.message(),

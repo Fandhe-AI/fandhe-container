@@ -159,8 +159,8 @@
 //! - rootless の user namespace へ入って `ImageRootfsUnpacker::unpack` を呼ぶ core 側の配線と、subuid 所有の
 //!   rootfs の削除経路（#2315・#482。本モジュールの `ChownInUserNamespace` は展開器の側だけ）。
 //!   `PreserveIfOwnerMapped`（`chown` しない 1 行の写像）は従来どおり。
-//! - 0700 の祖先での閉じ込め（#4804）の cri・plugin-cri への結線（S2）。oci 側（`extract_image_layers_confined_in`・
-//!   `extract_layers_confined`）は実装済みだが、本番の呼び出し元はまだ祖先を渡さず、`PreserveIfOwnerMapped` を有効にしていない。
+//! - 0700 の祖先での閉じ込め（#4804）の cri・plugin-cri への結線は create 経路（bundle）で済み（#4805）。pull は祖先を
+//!   渡さず展開の根自身の 0700 で判定する（`docs/design/oci-layer-special-bits.md`）。
 //! - macOS・Windows・Linux の他アーキテクチャでの、展開と公開の `remove_extracted_tree` のディレクトリ fd 起点の
 //!   解決（現状はパス起点で、確認から使用までの TOCTOU と、木の中に残ったマウントの中身の削除を防げない。#2598 で
 //!   広げないと決めた。特殊ビットの保持は Linux 限定のため SEC-5 の TOCTOU は Linux 固有で、macOS・Windows の本番経路は
@@ -1050,7 +1050,7 @@ pub fn extract_image_layers_bounded_in(
 /// 展開の開始・各判定・全レイヤー後（`chown_root` の前）に祖先を `fstat` で再確認し、保持済みのビットがあるのに崩れたら
 /// `FailedPrecondition` で拒否する。`None`・`Strip`・`PreserveIfChowned` では従来どおり `root` 自身の 0700 で判定する。
 /// 呼び出し側の契約: 祖先を排他的に所有し、`root` を rootfs として使い終わるまで 0700 に保つ。
-/// cri の本番経路への結線は S2（#4804 の後続）。
+/// cri の create 経路が bundle ディレクトリを祖先として渡す（#4805）。
 // 既存の `_bounded_in` に祖先を足した並びを保つ（引数をまとめる型は本入口 1 つのために作らない）。
 #[allow(clippy::too_many_arguments)]
 pub fn extract_image_layers_confined_in(

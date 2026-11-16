@@ -1,0 +1,30 @@
+# pull 時の展開の所有者の写像の変換（cli の image_ownership と plugin-cri の image_ownership）が同じ入力から同じ行・同じ拒否を返すことの共有 fixture
+# （SEC-5・OCI-1・CORE-6・REPAIR-1・#4798。判断は #4777）。タブ区切り・LF。`#` 始まりと空行は無視。
+#
+#   single<TAB>uid<TAB>gid<TAB>期待
+#   sub<TAB>所有者名（- は無し）<TAB>uid<TAB>gid<TAB>subuid の行（| 区切り・- は空）<TAB>subgid の行（同）<TAB>期待
+#   期待: ok:<uid 行>;<gid 行>（行は container:host:count を , 区切り）または err:<ErrorCode の Debug 名>
+#
+# 期待値は実装の出力ではなく手計算で書く。読む側: crates/core/tests/support/image_ownership_cases.rs を
+# crates/cli/tests/image_ownership_fixture.rs と crates/plugin-cri/tests/image_ownership_fixture.rs が取り込む。
+# 片方の変換だけ直すと、その crate の試験が落ちる。
+
+# 単一 ID
+single	1000	1000	ok:0:1000:1;0:1000:1
+single	0	1000	err:PermissionDenied
+single	1000	0	err:PermissionDenied
+
+# 範囲写像: 単一範囲・複数範囲・数値 uid の行・他ユーザーの行の読み飛ばし・境界
+sub	alice	1000	1000	alice:100000:65536	alice:200000:65536	ok:0:1000:1,1:100000:65536;0:1000:1,1:200000:65536
+sub	alice	1000	1000	alice:100000:1000|alice:300000:2000	alice:200000:65536	ok:0:1000:1,1:100000:1000,1001:300000:2000;0:1000:1,1:200000:65536
+sub	-	1000	1000	1000:300000:1000	1000:400000:5	ok:0:1000:1,1:300000:1000;0:1000:1,1:400000:5
+sub	alice	1000	1000	bob:500000:10|alice:100000:5	bob:600000:10|alice:200000:5	ok:0:1000:1,1:100000:5;0:1000:1,1:200000:5
+sub	alice	1000	1000	alice:4294967294:1	alice:200000:1	ok:0:1000:1,1:4294967294:1;0:1000:1,1:200000:1
+
+# 写像に収まらない入力（1 対 1 へ縮退せず拒否）
+sub	alice	0	1000	alice:100000:65536	alice:200000:65536	err:PermissionDenied
+sub	alice	1000	1000	alice:0:10	alice:200000:65536	err:PermissionDenied
+sub	alice	1000	1000	alice:4294967295:1	alice:200000:65536	err:InvalidArgument
+sub	alice	1000	1000	alice:100000:65536	-	err:FailedPrecondition
+sub	alice	1000	1000	bob:100000:65536	alice:200000:65536	err:FailedPrecondition
+sub	alice	1000	1000	alice:notanumber:65536	alice:200000:65536	err:InvalidArgument

@@ -20,6 +20,10 @@
 //! 使わない。rootless の user namespace へ入る配線（#482・#2792）、rootful の start の判断（#2241）が済んでから配線する。今は両者が食い違わないことを
 //! `tests/image_ownership_parity.rs` が照合する。
 //!
+//! # plugin-cri 側の複製と一致の担保（#4798・#4777）
+//! plugin-cri は cli に依存しないため `crates/plugin-cri/src/image_ownership.rs` に同じ変換を持つ。両者は共有 fixture
+//! `crates/core/testdata/image_ownership_cases.txt` で照合し（`tests/image_ownership_fixture.rs`）、片方だけ直すと落ちる。
+//!
 //! エラー文言は固定の英語で、パス・ユーザー名・errno を含めない。
 
 use std::path::Path;

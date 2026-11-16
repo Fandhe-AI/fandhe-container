@@ -277,7 +277,8 @@ impl ImageRootfsSource {
                         "subordinate-owned layer extraction is not available",
                     ));
                 };
-                return extractor.extract_layers(
+                let started = std::time::Instant::now();
+                let result = extractor.extract_layers(
                     layers,
                     root,
                     self.config.max_uncompressed_layer_bytes,
@@ -285,6 +286,13 @@ impl ImageRootfsSource {
                     opts,
                     release,
                 );
+                super::layer_extractor::record_userns_extract(
+                    self.recorder.as_ref(),
+                    layers.len(),
+                    started,
+                    &result,
+                );
+                return result;
             }
             #[cfg(not(all(
                 target_os = "linux",

@@ -61,3 +61,82 @@ pub trait SubordinateLayerExtractor: Send + Sync + std::fmt::Debug {
 pub(crate) fn missing_extractor() -> CriError {
     CriError::failed_precondition("subordinate-owned layer extraction is not available")
 }
+
+/// 注入された extractor の展開を計測して `recorder` へ渡す（REPAIR-4・#4848）。helper 内は `NoopOciOpRecorder` のため、
+/// 親が `OciOpKind::ExtractLayer` を記録する。成功は oci のホスト側の展開と同じくレイヤーごとに 1 件（所要時間は全体を
+/// 層数で割った平均。helper は層ごとの時間を返さない）、失敗は層を特定できないため 1 件の `Failure`。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub(crate) fn record_userns_extract(
+    recorder: &dyn fandhe_container_oci::instrument::OciOpRecorder,
+    layer_count: usize,
+    started: std::time::Instant,
+    result: &Result<(), OciError>,
+) {
+    use fandhe_container_oci::instrument::{OciOpKind, OciOpOutcome, OciOpSample};
+    let elapsed = started.elapsed();
+    match result {
+        Ok(()) => {
+            let n = u32::try_from(layer_count).unwrap_or(u32::MAX).max(1);
+            for _ in 0..layer_count {
+                recorder.record_oci_op(&OciOpSample::new(
+                    OciOpKind::ExtractLayer,
+                    OciOpOutcome::Success,
+                    None,
+                    elapsed / n,
+                ));
+            }
+        }
+        Err(e) => recorder.record_oci_op(&OciOpSample::new(
+            OciOpKind::ExtractLayer,
+            OciOpOutcome::Failure,
+            Some(e.code()),
+            elapsed,
+        )),
+    }
+}
+
+#[cfg(all(
+    test,
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod tests {
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    use fandhe_container_oci::error::{OciError, OciErrorCode};
+    use fandhe_container_oci::instrument::{OciOpOutcome, OciOpRecorder, OciOpSample};
+
+    use super::record_userns_extract;
+
+    #[derive(Debug, Default)]
+    struct Collect(Mutex<Vec<OciOpSample>>);
+
+    impl OciOpRecorder for Collect {
+        fn record_oci_op(&self, s: &OciOpSample) {
+            self.0.lock().unwrap().push(*s);
+        }
+    }
+
+    /// REPAIR-4・#4848: 成功は層ごとに 1 件、失敗は分類つきの 1 件の `ExtractLayer` を記録する。
+    #[test]
+    fn repair4_4848_userns_extract_is_recorded() {
+        let rec = Collect::default();
+        record_userns_extract(&rec, 3, Instant::now(), &Ok(()));
+        {
+            let v = rec.0.lock().unwrap();
+            assert_eq!(v.len(), 3);
+            assert!(v.iter().all(|s| s.outcome() == OciOpOutcome::Success));
+        }
+        let rec = Collect::default();
+        let err = Err(OciError::new(OciErrorCode::Timeout, "x"));
+        record_userns_extract(&rec, 3, Instant::now(), &err);
+        let v = rec.0.lock().unwrap();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].outcome(), OciOpOutcome::Failure);
+        assert_eq!(v[0].error_code(), Some(OciErrorCode::Timeout));
+    }
+}

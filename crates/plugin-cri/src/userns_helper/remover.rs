@@ -10,7 +10,7 @@
 //!
 //! # 契約
 //! - 縮退しない: 失敗・期限切れはホスト側の削除へ落とさず、固定文言の [`CriError`]（パス・errno・uid を含めない。REPAIR-4）
-//! - 期限（REPAIR-5）: [`ReleaseBudget`] の期限があれば残り時間から [`JOIN_BUDGET`] を引いて作業予算にする（1〜600 秒に丸める）。
+//! - 期限（REPAIR-5）: [`ReleaseBudget`] の期限があれば残り時間から `JOIN_BUDGET` を引いて作業予算にする（1〜600 秒に丸める）。
 //!   期限が無ければ [`DEFAULT_WORK_BUDGET`]。開始前に期限切れ・取り消しなら起動しない。実行中も絶対期限と取り消しの旗を
 //!   100 ms 刻みで見て、尽きたら helper を kill・回収して `Timeout`（作業予算の 1 秒の下限が期限を超えても絶対期限で止める）
 //! - 同時実行の上限: 稼働中 + 回収できていない子の合計が [`MAX_CONCURRENT_REMOVALS`] 以上なら待たずに `UNAVAILABLE`

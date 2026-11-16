@@ -306,6 +306,39 @@ mod linux {
         out
     }
 
+    /// 本番の helper と同じ解決で得た uid / gid の写像（oci の `IdMap`）。
+    fn expected_maps() -> (
+        fandhe_container_oci::layer::extract::IdMap,
+        fandhe_container_oci::layer::extract::IdMap,
+    ) {
+        use fandhe_container_oci::layer::extract::{IdMap, IdRange};
+
+        let resolved = fandhe_container_supervisor::start_entry::resolve_self_launch_privilege()
+            .unwrap_or_else(|e| fail(&format!("resolve privilege: {e}")));
+        let (_, Some(source)) = resolved else {
+            fail("a subordinate id range is required");
+        };
+        let meta = std::fs::metadata("/proc/self")
+            .unwrap_or_else(|e| fail(&format!("stat /proc/self: {e}")));
+        let maps = source
+            .resolve_id_maps(meta.uid(), meta.gid())
+            .unwrap_or_else(|e| fail(&format!("resolve id maps: {e}")));
+        let conv = |set: &fandhe_container_core::rootless::IdMapSet| {
+            IdMap::new(
+                set.entries()
+                    .iter()
+                    .map(|e| IdRange {
+                        container_id: e.container_id,
+                        host_id: e.host_id,
+                        count: e.count,
+                    })
+                    .collect(),
+            )
+            .unwrap_or_else(|e| fail(&format!("id map: {e}")))
+        };
+        (conv(maps.uid()), conv(maps.gid()))
+    }
+
     /// Extract（#4847）: tar の uid / gid（1000）は、名前空間の中では tar の値のまま見え、ホストからは subuid の所有者に見える。
     fn extract_keeps_tar_owners_in_namespace(launcher: &UsernsHelperLauncher, budget: WorkBudget) {
         use std::os::unix::fs::DirBuilderExt as _;
@@ -343,13 +376,16 @@ mod linux {
             digest,
         )
         .unwrap_or_else(|e| fail(&format!("layer spec: {e:?}")));
+        // 期待する写像は、親が同じ解決で得たもの（helper が参加した写像と指紋で照合される。SEC-5・#4848）。
+        let (uid_map, gid_map) = expected_maps();
         let request = ExtractRequest::new(
             ExtractSpecialBits::Strip,
             ExtractLimits::default(),
             DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES,
             vec![layer],
         )
-        .unwrap_or_else(|e| fail(&format!("request: {e:?}")));
+        .unwrap_or_else(|e| fail(&format!("request: {e:?}")))
+        .with_expected_maps(&uid_map, &gid_map);
         let dest = File::open(&rootfs).unwrap_or_else(|e| fail(&format!("open rootfs: {e}")));
         match launcher.run_extract_bounded(
             &request,

@@ -682,7 +682,8 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
                         "subordinate-owned layer extraction is not available",
                     ));
                 };
-                return extractor.extract_layers(
+                let started = Instant::now();
+                let result = extractor.extract_layers(
                     layers,
                     extract_root,
                     self.config.max_uncompressed_layer_bytes,
@@ -693,6 +694,13 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
                         cancel: budget.cancel,
                     },
                 );
+                crate::bundle::layer_extractor::record_userns_extract(
+                    self.recorder.as_ref(),
+                    layers.len(),
+                    started,
+                    &result,
+                );
+                return result;
             }
             #[cfg(not(all(
                 target_os = "linux",

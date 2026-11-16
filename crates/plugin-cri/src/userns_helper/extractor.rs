@@ -143,16 +143,14 @@ impl SubordinateLayerExtractor for UsernsLayerExtractor {
                 "subordinate-owned layer extraction exceeded its deadline",
             ));
         }
-        // 写像は送らない（helper が参加に使ったものを使う）ため、範囲写像の展開設定だけを受ける。
-        if !matches!(
-            options.ownership,
-            OwnershipPolicy::ChownInUserNamespace { .. }
-        ) {
+        // 写像そのものは送らない（helper が参加に使ったものを使う）が、展開設定の写像の指紋を送り、helper が参加した写像と
+        // 照合させる（SEC-5。ずれたら書き込みの前に `FailedPrecondition`）。範囲写像の展開設定だけを受ける。
+        let OwnershipPolicy::ChownInUserNamespace { uid, gid } = &options.ownership else {
             return Err(OciError::new(
                 OciErrorCode::FailedPrecondition,
                 "ownership policy is not a subordinate-id extraction",
             ));
-        }
+        };
         let special_bits = wire_special_bits(&options.special_bits)?;
         let specs = layers
             .iter()
@@ -182,7 +180,8 @@ impl SubordinateLayerExtractor for UsernsLayerExtractor {
                         OciErrorCode::InvalidArgument,
                         "layer extraction request is out of range",
                     )
-                })?;
+                })?
+                .with_expected_maps(uid, gid);
         let work = work_budget_for(budget.deadline).ok_or_else(|| {
             OciError::new(
                 OciErrorCode::Internal,

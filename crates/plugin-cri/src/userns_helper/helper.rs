@@ -52,7 +52,7 @@ use super::USERNS_HELPER_ARG;
 use super::wire::{
     EXTRACT_FD_TOKEN, ExtractReport, ExtractRequest, ExtractSpecialBits, HelperErrorCode,
     InspectReport, MAX_EXTRACT_PAYLOAD_BYTES, Mode, REQUEST_HEADER_LEN, RemoveTarget, Report,
-    Request, StatReport, decode_request_header, encode_response,
+    Request, StatReport, decode_request_header, encode_response, id_map_fingerprint,
 };
 use crate::image_ownership::to_oci_map;
 use crate::sys::{fd_passing, hardening};
@@ -168,6 +168,16 @@ fn extract(
     maps: Option<&JoinedMaps>,
     received_at: Instant,
 ) -> Result<ExtractReport, HelperErrorCode> {
+    // 参加した写像が親の期待（展開設定の写像）と一致しなければ、書き込みの前に拒否する（SEC-5・#4848。helper は起動ごとに
+    // subuid / subgid を解決し直すため、親が記録した写像とずれうる。root は自 UID に写るので所有者の検査では見つからない）。
+    if let Some((uid, gid)) = maps {
+        let (want_uid, want_gid) = req.expected_map_fingerprints();
+        let got_uid = to_oci_map(uid).map_err(|_| HelperErrorCode::Internal)?;
+        let got_gid = to_oci_map(gid).map_err(|_| HelperErrorCode::Internal)?;
+        if id_map_fingerprint(&got_uid) != *want_uid || id_map_fingerprint(&got_gid) != *want_gid {
+            return Err(HelperErrorCode::IdMapMismatch);
+        }
+    }
     let deadline = received_at + Duration::from_millis(u64::from(req.work_ms()));
     let want = req.layers().len();
     // 0 件は launcher が SCM_RIGHTS を送らないため待たない（OCI-1。layers が空の正常なイメージ）。

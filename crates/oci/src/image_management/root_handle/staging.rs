@@ -223,6 +223,11 @@ mod imp {
             File::from(self.0.try_clone()?).metadata()
         }
 
+        /// 開いた fd の借用（再 exec helper の削除モードへ親ディレクトリとして渡す。#4800）。
+        pub(crate) fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+            self.0.as_fd()
+        }
+
         /// `@pull.lock` を 0600 で排他作成する（既存なら `AlreadyExists`。symlink は辿らない）。
         pub(crate) fn create_lock(&self, name: &str) -> io::Result<File> {
             self.create_new_file(name)

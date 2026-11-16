@@ -880,6 +880,17 @@ impl PullSession<'_> {
             })
     }
 
+    /// 開いた `staging/<id>` の fd の借用（Linux x86_64 / aarch64 のみ）。`unpack/` が他 uid（subuid）所有で
+    /// ホストの `remove_unpack_dir` が消せないとき、cri が再 exec helper の削除モードの親ディレクトリとして渡す
+    /// （パスは渡さない。SEC-5・OCI-7・#4800）。
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    pub fn pull_dir_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.pull_dir.as_fd()
+    }
+
     /// 展開先の作業領域 `unpack/` を symlink を辿らず木ごと消す（無ければ成功。0555・0000 のディレクトリも消す。#4180）。
     ///
     /// `staging/<id>` 自身は消さない（消してよいのは `abort` / `publish` / 回収 GC だけ）。pull ディレクトリの fd 起点。

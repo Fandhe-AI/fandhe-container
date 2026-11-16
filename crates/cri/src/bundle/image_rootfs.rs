@@ -65,7 +65,9 @@
 //! - **展開設定**: 所有者・特殊ビットの本番の値は plugin-cri が start と同じ権限モデルの解決から選ぶ（#2792）が、
 //!   現状はどの権限モデルでも既定の `Keep` + `Strip`。特殊ビットを保持する `PreserveIfOwnerMapped` は、展開後に
 //!   `open_rootfs_for_search` が rootfs を 0755 にするため「root を使い終わるまで 0700 に保つ」契約と両立せず保持しない。
-//!   `ChownInUserNamespace` は記録の符号化が済み（#4796）、helper の配線は #4777 の H1・H6
+//!   `ChownInUserNamespace` は記録の符号化が済み（#4796）、subuid 所有の木の削除は注入点 `SubordinateTreeRemover` 経由で
+//!   再 exec helper の削除モードへ回す（#4800。`release_bounded`・展開失敗時の後始末。未注入ならホスト側へ縮退せず
+//!   `FAILED_PRECONDITION`）。展開本体と対応表の切り替えは #4777 の H2・H6
 //!   （#2534・SEC-5。`docs/design/oci-layer-special-bits.md`）。pull と create の設定は
 //!   [`ImageExtractConfig`] で 1 か所にまとめる
 //! - 展開は `extract_image_layers_bounded_in` でエントリ単位に期限（この `prepare` の開始からの `deadline`）と取り消しの
@@ -98,6 +100,7 @@ use fandhe_container_oci::reference::Digest;
 
 use super::provider::{BundleDir, RootfsSource, UserResolveRequest};
 use super::spec::{ImageDefaults, ResolvedImage};
+use super::tree_remover::needs_userns_removal;
 use crate::adapter::ReleaseBudget;
 use crate::error::CriError;
 use crate::image_pull::{
@@ -169,6 +172,12 @@ pub struct ImageRootfsSource {
     config: ImageExtractConfig,
     store: Option<Arc<dyn ImageStore>>,
     recorder: Arc<dyn OciOpRecorder>,
+    /// 展開設定が `ChownInUserNamespace`（木が subuid 所有になりうる）のときの削除の実装（#4800）。
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    tree_remover: Option<Arc<dyn super::tree_remover::SubordinateTreeRemover>>,
 }
 
 impl std::fmt::Debug for ImageRootfsSource {
@@ -186,7 +195,30 @@ impl ImageRootfsSource {
             config,
             store: None,
             recorder: Arc::new(NoopOciOpRecorder),
+            #[cfg(all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))]
+            tree_remover: None,
         }
+    }
+
+    /// 範囲写像で展開した subuid 所有の木を消す実装を注入する（再 exec helper の削除モード。#4800・SEC-5・OCI-7）。
+    ///
+    /// 展開設定が `ChownInUserNamespace` のときだけ使い、`release` と展開失敗時の後始末をこちらへ回す。それ以外の
+    /// 展開設定（`Keep` 等）の削除は従来のホスト側の削除のまま。`ChownInUserNamespace` なのに未注入なら、ホスト側の削除へ
+    /// 縮退せず `FAILED_PRECONDITION` で拒否する。
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[must_use]
+    pub fn with_tree_remover(
+        mut self,
+        remover: Arc<dyn super::tree_remover::SubordinateTreeRemover>,
+    ) -> Self {
+        self.tree_remover = Some(remover);
+        self
     }
 
     /// タグ・digest 参照を image ID へ解決する `ImageStore` を注入する（`ImageService` と同じストアを共有したとき用）。
@@ -201,6 +233,42 @@ impl ImageRootfsSource {
     pub fn with_recorder(mut self, recorder: Arc<dyn OciOpRecorder>) -> Self {
         self.recorder = recorder;
         self
+    }
+
+    /// 範囲写像で展開した subuid 所有の `rootfs/` を、再 exec helper の削除モードで消す（#4800・SEC-5・OCI-7・CORE-6）。
+    /// 親は bundle の fd で渡し（パスは渡さない）、期限・取り消しは `budget` から換算される。remover 未注入は
+    /// ホスト側の削除へ縮退せず `FAILED_PRECONDITION`。
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    fn remove_rootfs_in_userns(
+        &self,
+        bundle: &BundleDir,
+        budget: &ReleaseBudget<'_>,
+    ) -> Result<(), CriError> {
+        let remover = self
+            .tree_remover
+            .as_ref()
+            .ok_or_else(super::tree_remover::missing_remover)?;
+        remover.remove_child_tree(
+            bundle.as_fd(),
+            super::tree_remover::RemovalTarget::BundleRootfs,
+            budget,
+        )
+    }
+
+    /// 範囲写像の展開は Linux x86_64 / aarch64 でしか成立しない（他は展開の前に拒否される）ため、ここへは届かない。
+    #[cfg(not(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )))]
+    fn remove_rootfs_in_userns(
+        &self,
+        _bundle: &BundleDir,
+        _budget: &ReleaseBudget<'_>,
+    ) -> Result<(), CriError> {
+        Err(super::tree_remover::missing_remover())
     }
 
     /// `ImageSpec` を検証し、image ID（config digest）へ解決する。キャッシュには触れない。
@@ -891,8 +959,14 @@ impl RootfsSource for ImageRootfsSource {
         if let Err(e) = extracted {
             // 差し替えを検出したときは、パスがおとりを指している可能性があるため消さない（パス起点の削除はおとりを
             // 消しうる。展開済みの実体は残る側に倒す）。それ以外は自分が作った rootfs だけを消す（0555 等も権限を戻して消す）。
+            // 範囲写像の展開（subuid 所有）はホスト側では消せないため helper の削除モードへ回す（失敗は元のエラーを優先し、
+            // 残骸は release / 回収が拾う。remover 未注入ならホスト側へ縮退しない）。
             if root.matches_path(&rootfs) {
-                let _ = bundle.remove_rootfs_tree();
+                if needs_userns_removal(opts) {
+                    let _ = self.remove_rootfs_in_userns(bundle, &ReleaseBudget::new());
+                } else {
+                    let _ = bundle.remove_rootfs_tree();
+                }
             }
             return Err(e);
         }
@@ -911,6 +985,9 @@ impl RootfsSource for ImageRootfsSource {
         // `bundle` の fd 起点で `rootfs` が本物のディレクトリか確かめてから消す。symlink・通常ファイル等は辿らず
         // 消さない（リンク先の削除を防ぐ。fail-closed）。パスで開き直さないので bundle の親の差し替えはおとりへ届かない。
         match bundle.rootfs_dir_exists() {
+            Ok(true) if needs_userns_removal(&self.config.extract_options) => {
+                self.remove_rootfs_in_userns(bundle, budget)
+            }
             Ok(true) => bundle
                 .remove_rootfs_tree_bounded(&budget.to_extract_budget())
                 .map_err(|e| {
@@ -1343,5 +1420,150 @@ mod tests {
                 .is_empty()
         );
         let _ = std::fs::remove_dir_all(&r);
+    }
+
+    /// subuid 所有の木の削除を helper へ回す分岐の試験（#4800・SEC-5・OCI-7・CORE-6・REPAIR-4）。
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    mod userns_removal {
+        use std::os::fd::BorrowedFd;
+        use std::path::Path;
+        use std::sync::Mutex;
+
+        use fandhe_container_oci::layer::extract::{IdMap, IdRange, OwnershipPolicy};
+
+        use super::*;
+        use crate::bundle::tree_remover::{RemovalTarget, SubordinateTreeRemover};
+        use crate::error::CriErrorCode;
+
+        /// 呼び出しを記録するだけの remover（何も消さない。ホスト側の削除が走ったかを rootfs の残存で見分ける）。
+        #[derive(Debug, Default)]
+        struct Recorder {
+            calls: Mutex<Vec<RemovalTarget>>,
+            fail: bool,
+        }
+
+        impl SubordinateTreeRemover for Recorder {
+            fn remove_child_tree(
+                &self,
+                _parent: BorrowedFd<'_>,
+                target: RemovalTarget,
+                _budget: &ReleaseBudget<'_>,
+            ) -> Result<(), CriError> {
+                self.calls.lock().unwrap().push(target);
+                if self.fail {
+                    Err(CriError::internal("userns helper reported a failure"))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        fn scratch(tag: &str) -> PathBuf {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static N: AtomicU32 = AtomicU32::new(0);
+            let p = std::env::temp_dir().join(format!(
+                "fc-cri-4800-{tag}-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(p.join("bundle/rootfs/etc")).unwrap();
+            std::fs::write(p.join("bundle/rootfs/etc/f"), b"x").unwrap();
+            p
+        }
+
+        fn chown_userns() -> ExtractOptions {
+            let map = || {
+                IdMap::new(vec![IdRange {
+                    container_id: 0,
+                    host_id: 100_000,
+                    count: 65_536,
+                }])
+                .unwrap()
+            };
+            ExtractOptions::new().with_ownership(OwnershipPolicy::ChownInUserNamespace {
+                uid: map(),
+                gid: map(),
+            })
+        }
+
+        fn source(
+            base: &Path,
+            opts: ExtractOptions,
+            rm: Option<Arc<Recorder>>,
+        ) -> ImageRootfsSource {
+            let mut cfg = ImageExtractConfig::new(base.join("cache")).unwrap();
+            cfg.extract_options = opts;
+            let src = ImageRootfsSource::new(cfg);
+            match rm {
+                Some(r) => src.with_tree_remover(r),
+                None => src,
+            }
+        }
+
+        /// 範囲写像でない展開設定（`Keep`）の削除は従来どおりホスト側で消え、remover は呼ばれない（受入基準 2）。
+        #[test]
+        fn sec5_4800_keep_ownership_release_stays_on_the_host_path() {
+            let base = scratch("keep");
+            let rm = Arc::new(Recorder::default());
+            let src = source(&base, ExtractOptions::default(), Some(rm.clone()));
+            let bundle = BundleDir::open(&base.join("bundle")).unwrap();
+            src.release_bounded(&bundle, &ReleaseBudget::new()).unwrap();
+            assert!(!base.join("bundle/rootfs").exists());
+            assert!(rm.calls.lock().unwrap().is_empty());
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// `ChownInUserNamespace` の release は bundle の fd を親にして `BundleRootfs` を 1 回 remover へ回し、
+        /// ホスト側の削除は走らない。
+        #[test]
+        fn sec5_4800_userns_ownership_release_goes_through_the_remover() {
+            let base = scratch("userns");
+            let rm = Arc::new(Recorder::default());
+            let src = source(&base, chown_userns(), Some(rm.clone()));
+            let bundle = BundleDir::open(&base.join("bundle")).unwrap();
+            src.release_bounded(&bundle, &ReleaseBudget::new()).unwrap();
+            assert_eq!(*rm.calls.lock().unwrap(), vec![RemovalTarget::BundleRootfs]);
+            assert!(
+                base.join("bundle/rootfs/etc/f").exists(),
+                "host path must not run"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// remover の失敗は縮退せずそのまま返り、rootfs は残る（ホスト側の削除へ落とさない。REPAIR-4）。
+        #[test]
+        fn sec5_4800_remover_failure_is_propagated_without_host_fallback() {
+            let base = scratch("fail");
+            let rm = Arc::new(Recorder {
+                fail: true,
+                ..Recorder::default()
+            });
+            let src = source(&base, chown_userns(), Some(rm.clone()));
+            let bundle = BundleDir::open(&base.join("bundle")).unwrap();
+            let e = src
+                .release_bounded(&bundle, &ReleaseBudget::new())
+                .unwrap_err();
+            assert_eq!(e.code(), CriErrorCode::Internal);
+            assert!(base.join("bundle/rootfs/etc/f").exists());
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// remover 未注入で `ChownInUserNamespace` なら `FAILED_PRECONDITION` で拒否し、rootfs は残る（縮退しない）。
+        #[test]
+        fn sec5_4800_userns_ownership_without_a_remover_is_refused() {
+            let base = scratch("none");
+            let src = source(&base, chown_userns(), None);
+            let bundle = BundleDir::open(&base.join("bundle")).unwrap();
+            let e = src
+                .release_bounded(&bundle, &ReleaseBudget::new())
+                .unwrap_err();
+            assert_eq!(e.code(), CriErrorCode::FailedPrecondition);
+            assert!(base.join("bundle/rootfs/etc/f").exists());
+            let _ = std::fs::remove_dir_all(&base);
+        }
     }
 }

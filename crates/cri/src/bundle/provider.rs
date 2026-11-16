@@ -112,6 +112,16 @@ impl BundleDir {
         })
     }
 
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    /// 保持している bundle ディレクトリの fd（再 exec helper の削除モードへ親ディレクトリとして渡す。パスは渡さない。
+    /// SEC-5・OCI-7・#4800）。
+    pub fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.dir.as_fd()
+    }
+
     /// bundle ディレクトリのパス（引き渡し・表示用。操作には使わない）。
     pub fn path(&self) -> &Path {
         &self.path

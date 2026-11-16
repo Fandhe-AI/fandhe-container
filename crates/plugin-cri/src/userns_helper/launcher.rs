@@ -263,7 +263,7 @@ fn converse(
     deadline: Instant,
 ) -> Result<Report, UsernsHelperError> {
     let mut child = child;
-    if sock.write_all(&encode_request(mode)).is_err() {
+    if sock.write_all(encode_request(mode).as_bytes()).is_err() {
         return Err(fail(child, ErrorCode::Unavailable, MSG_PROTOCOL));
     }
     let mut buf = [0u8; RESPONSE_LEN];
@@ -385,6 +385,24 @@ mod tests {
             elapsed < Duration::from_secs(1) + POD_HOLDER_KILL_REAP_WAIT + Duration::from_secs(2),
             "took {elapsed:?}"
         );
+        assert!(err.take_unreaped().is_none(), "child must be reaped");
+    }
+
+    /// REPAIR-5・SEC-5・#4800: 削除モードの期限切れでも子は kill・回収され、`/proc/<pid>` が残らない。
+    #[test]
+    fn sec5_4800_remove_mode_timeout_kills_and_reaps_the_helper() {
+        use super::super::wire::RemoveTarget;
+        let dir = File::open("/").expect("open /");
+        let launcher = UsernsHelperLauncher::with_fixed_command("/bin/sleep", vec!["60".into()])
+            .with_join_budget(Duration::ZERO);
+        let mut err = launcher
+            .run(
+                Mode::Remove(RemoveTarget::BundleRootfs),
+                dir.as_fd(),
+                budget(),
+            )
+            .expect_err("must time out");
+        assert_eq!(err.code(), ErrorCode::Timeout);
         assert!(err.take_unreaped().is_none(), "child must be reaped");
     }
 

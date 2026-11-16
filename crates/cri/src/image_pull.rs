@@ -158,8 +158,8 @@ use fandhe_container_oci::image_management::{
 };
 use fandhe_container_oci::instrument::{NoopOciOpRecorder, OciOpRecorder};
 use fandhe_container_oci::layer::extract::{
-    ExtractBudget, ExtractLimits, ExtractOptions, OwnershipPolicy, extract_image_layers_bounded_in,
-    image_layers_from,
+    ExtractBudget, ExtractLimits, ExtractOptions, ExtractRoot, ImageLayer, OwnershipPolicy,
+    extract_image_layers_bounded_in, image_layers_from,
 };
 use fandhe_container_oci::layer::{
     BlobFileFacts, BlobTrustViolation, DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES, VerifiedLayerBlob,
@@ -551,7 +551,7 @@ pub struct PullConfig {
     pub extract_limits: ExtractLimits,
     /// レイヤー展開の所有者・特殊ビットの選択肢。既定は `chown` しない（`Keep`）・特殊ビットは落とす（`Strip`）。
     /// 値は呼び出し元が決める。本番（plugin-cri）は start と同じ権限モデルの解決から選び（#2792）、現状はどの権限モデルでも
-    /// 既定のまま（`ChownInUserNamespace` の対応表への配線は後続 #4777 の H6。モジュール doc「未実装範囲」と
+    /// 既定のまま（`ChownInUserNamespace` の展開の注入点は #4848 で配線済みで、対応表の切り替えは #4777 の H6〔#4801〕。モジュール doc「未実装範囲」と
     /// `docs/design/oci-layer-special-bits.md`。#2534・SEC-5・SEC-1）。
     pub extract_options: ExtractOptions,
 }
@@ -589,6 +589,12 @@ pub struct OciImagePuller<C: RegistryPullClient> {
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
     tree_remover: Option<Arc<dyn crate::bundle::SubordinateTreeRemover>>,
+    /// 同じ設定のときの展開の実装（`unpack/entry/rootfs` を helper の展開モードで作る。#4848）。
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    layer_extractor: Option<Arc<dyn crate::bundle::SubordinateLayerExtractor>>,
 }
 
 /// pull の期限の時計（`Instant::now` の差し替え口）。`OciImagePuller` の `Debug` を保つための包み。
@@ -614,7 +620,107 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
                 any(target_arch = "x86_64", target_arch = "aarch64")
             ))]
             tree_remover: None,
+            #[cfg(all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))]
+            layer_extractor: None,
         }
+    }
+
+    /// 範囲写像の展開（`ChownInUserNamespace`）を再 exec helper の展開モードで行う実装を注入する（#4848・SEC-5・OCI-1）。
+    ///
+    /// 展開設定が `ChownInUserNamespace` のときだけ使う。`with_tree_remover` と両方が無ければ、その設定の pull は
+    /// `unpack/` を作る前に `FAILED_PRECONDITION` で拒否する（ホスト側の展開・削除へ縮退しない）。
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[must_use]
+    pub fn with_layer_extractor(
+        mut self,
+        extractor: Arc<dyn crate::bundle::SubordinateLayerExtractor>,
+    ) -> Self {
+        self.layer_extractor = Some(extractor);
+        self
+    }
+
+    /// 範囲写像の展開の前提（extractor と remover の両方）がそろっているか。欠けていれば `unpack/` を作らず拒否する。
+    fn check_userns_extraction_ready(&self) -> Result<(), PullError> {
+        if !crate::bundle::needs_userns_removal(&self.config.extract_options) {
+            return Ok(());
+        }
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        if self.layer_extractor.is_some() && self.tree_remover.is_some() {
+            return Ok(());
+        }
+        Err(PullError::new(
+            OciErrorCode::FailedPrecondition,
+            "subordinate-owned layer extraction is not available",
+        ))
+    }
+
+    /// 展開の本体。範囲写像なら注入された extractor、それ以外は oci のホスト側の展開（#4848）。
+    fn extract_layers_into(
+        &self,
+        layers: &[ImageLayer<'_>],
+        extract_root: &ExtractRoot,
+        budget: &PullBudget<'_>,
+    ) -> Result<(), OciError> {
+        if crate::bundle::needs_userns_removal(&self.config.extract_options) {
+            #[cfg(all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))]
+            {
+                let Some(extractor) = self.layer_extractor.as_ref() else {
+                    return Err(OciError::new(
+                        OciErrorCode::FailedPrecondition,
+                        "subordinate-owned layer extraction is not available",
+                    ));
+                };
+                let started = Instant::now();
+                let result = extractor.extract_layers(
+                    layers,
+                    extract_root,
+                    self.config.max_uncompressed_layer_bytes,
+                    self.config.extract_limits,
+                    &self.config.extract_options,
+                    &crate::adapter::ReleaseBudget {
+                        deadline: budget.deadline,
+                        cancel: budget.cancel,
+                    },
+                );
+                crate::bundle::layer_extractor::record_userns_extract(
+                    self.recorder.as_ref(),
+                    layers.len(),
+                    started,
+                    &result,
+                );
+                return result;
+            }
+            #[cfg(not(all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )))]
+            return Err(OciError::new(
+                OciErrorCode::FailedPrecondition,
+                "subordinate-owned layer extraction is not available",
+            ));
+        }
+        extract_image_layers_bounded_in(
+            self.recorder.as_ref(),
+            layers,
+            extract_root,
+            self.config.max_uncompressed_layer_bytes,
+            self.config.extract_limits,
+            &self.config.extract_options,
+            &budget.extract_budget(),
+        )
+        .map(|_| ())
     }
 
     /// 範囲写像で展開した subuid 所有の `unpack/` を消す実装を注入する（再 exec helper の削除モード。#4800・SEC-5・OCI-7）。
@@ -798,6 +904,7 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
         session
             .check_staging_dir_current()
             .map_err(|e| PullError::from_store(&e))?;
+        self.check_userns_extraction_ready()?;
         let unpack_dir = session
             .create_unpack_dir()
             .map_err(|e| PullError::from_store(&e))?;
@@ -810,22 +917,14 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
         let extract_root = root.extract_root().map_err(|e| PullError::from_store(&e))?;
         budget.check()?;
         // 期限は pull 全体の残り時間を同じ絶対時刻で渡し、取り消しの旗と合わせてエントリ単位で確かめる（#2967）。
-        extract_image_layers_bounded_in(
-            self.recorder.as_ref(),
-            &layers,
-            &extract_root,
-            self.config.max_uncompressed_layer_bytes,
-            self.config.extract_limits,
-            &self.config.extract_options,
-            &budget.extract_budget(),
-        )
-        .map_err(|e| {
-            if e.code() == OciErrorCode::Timeout {
-                budget.timeout_error()
-            } else {
-                PullError::from_extract(&e)
-            }
-        })?;
+        self.extract_layers_into(&layers, &extract_root, budget)
+            .map_err(|e| {
+                if e.code() == OciErrorCode::Timeout {
+                    budget.timeout_error()
+                } else {
+                    PullError::from_extract(&e)
+                }
+            })?;
         budget.check()?;
         // 展開の間に `staging/<id>` が差し替えられていたら、記録も公開もせず拒否する（fd 起点の操作は検査済みの実体にだけ
         // 届くため、おとりへは書かれていない。差し替えを成功に見せない検出器。OCI-7・SEC-1・#4180）。
@@ -1604,19 +1703,22 @@ pub(crate) fn record_settings(
 }
 
 /// 公開済み rootfs の root が持つべき所有 uid（`ChownMapped` では写像先、それ以外は `owner`）。
-/// `ChownInUserNamespace` も現状は `owner` を返す。写像先の uid を期待する扱いへの切り替えは、配線と同時に
-/// #4777 の H6 で行う（未配線の間は到達しない。配線後に root 所有者の照合が食い違うと `FAILED_PRECONDITION` になる）。
+/// `ChownInUserNamespace` も同じで、oci の `chown_root` が名前空間の中で根を 0:0 へ `chown` するため、ホストから見た
+/// 所有者は写像先の `map_to_host(0)` になる（#4848。helper の写像は core の「0 → 自 ID」で、`owner` と同じ値になる）。
 pub(crate) fn expected_root_owner_for(
     options: &ExtractOptions,
     owner: u32,
 ) -> Result<u32, PullError> {
     match &options.ownership {
-        OwnershipPolicy::ChownMapped { uid, .. } => uid.map_to_host(0).ok_or_else(|| {
-            PullError::new(
-                OciErrorCode::InvalidArgument,
-                "id mapping does not cover the container root user",
-            )
-        }),
+        OwnershipPolicy::ChownMapped { uid, .. }
+        | OwnershipPolicy::ChownInUserNamespace { uid, .. } => {
+            uid.map_to_host(0).ok_or_else(|| {
+                PullError::new(
+                    OciErrorCode::InvalidArgument,
+                    "id mapping does not cover the container root user",
+                )
+            })
+        }
         _ => Ok(owner),
     }
 }
@@ -2321,6 +2423,46 @@ mod tests {
             display_name(other.registry(), other.repository()),
             "registry.example.com:5000/team/app"
         );
+    }
+
+    /// SEC-5・OCI-7・#4848: 公開済み根の期待所有者は、`ChownMapped` と `ChownInUserNamespace` では写像先（コンテナ uid 0 の
+    /// ホスト側 ID）、`Keep` では `owner`（`IdMap` は 0 の写像を必須とするため、0 を欠く写像は作れない）。
+    #[test]
+    fn sec5_4848_expected_root_owner_for_userns_is_the_mapped_root() {
+        use fandhe_container_oci::layer::extract::{IdMap, IdRange};
+        let map = |lines: &[(u32, u32, u32)]| {
+            IdMap::new(
+                lines
+                    .iter()
+                    .map(|&(container_id, host_id, count)| IdRange {
+                        container_id,
+                        host_id,
+                        count,
+                    })
+                    .collect(),
+            )
+            .expect("map")
+        };
+        let userns = |m: IdMap| {
+            ExtractOptions::new().with_ownership(OwnershipPolicy::ChownInUserNamespace {
+                uid: m.clone(),
+                gid: m,
+            })
+        };
+        let owner = 4242;
+        let two = userns(map(&[(0, 1000, 1), (1, 100_000, 65_536)]));
+        assert_eq!(expected_root_owner_for(&two, owner).unwrap(), 1000);
+        let one = userns(map(&[(0, 100_000, 65_536)]));
+        assert_eq!(expected_root_owner_for(&one, owner).unwrap(), 100_000);
+        assert_eq!(
+            expected_root_owner_for(&ExtractOptions::new(), owner).unwrap(),
+            owner
+        );
+        let mapped = ExtractOptions::new().with_ownership(OwnershipPolicy::ChownMapped {
+            uid: map(&[(0, 300_000, 1)]),
+            gid: map(&[(0, 300_000, 1)]),
+        });
+        assert_eq!(expected_root_owner_for(&mapped, owner).unwrap(), 300_000);
     }
 
     /// OCI-1・SEC-5・#4796: `ChownInUserNamespace` + `PreserveIfChowned` は固定書式で符号化され、`ChownMapped` と別の語になる。

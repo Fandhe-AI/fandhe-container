@@ -11,11 +11,11 @@
 //! helper は header を検査して期待の長さが決まってから、その長さだけを固定長バッファへ読む（確保しない）。
 //!
 //! # 展開要求（tag 3。OCI-1・OCI-2・SEC-5・#4847）
-//! payload は固定部 48 バイトと、レイヤー 0〜[`MAX_EXTRACT_LAYERS`] 件（0 件は layers が空の正常なイメージ。fd は送らない）の 76 バイトずつ（すべて BE）:
+//! payload は固定部 112 バイトと、レイヤー 0〜[`MAX_EXTRACT_LAYERS`] 件（0 件は layers が空の正常なイメージ。fd は送らない）の 76 バイトずつ（すべて BE）:
 //! 固定部 = `[ownership tag（1 = ChownInUserNamespace のみ）, special bits tag（1 = Strip / 2 = PreserveIfChowned）,
 //! layer_count(u16), work_ms(u32), u64 × 5（max_entries・max_total_bytes・max_input_bytes・max_tracked_paths・
-//! max_uncompressed_bytes）]`、レイヤー = `[media 添字（[`fandhe_container_oci::layer::LAYER_MEDIA_TYPES`] の 1 起点）, 0, 0, 0,
-//! size(u64), digest(32 バイト), diff_id(32 バイト)]`。パス・名前・id の写像は受けない（写像は helper が参加に使ったものを使う）。
+//! max_uncompressed_bytes）, 期待する uid 写像の指紋(32), gid 写像の指紋(32)]`、レイヤー = `[media 添字（[`fandhe_container_oci::layer::LAYER_MEDIA_TYPES`] の 1 起点）, 0, 0, 0,
+//! size(u64), digest(32 バイト), diff_id(32 バイト)]`。パス・名前・id の写像そのものは受けない（写像は helper が参加に使ったものを使い、指紋が一致しなければ `IdMapMismatch`。#4848）。
 //! 長さ・件数・各値の範囲は確保・読み取りの前に検査する。blob の fd は要求 frame の後に `SCM_RIGHTS` で 1 通にまとめて送る
 //! （[`EXTRACT_FD_TOKEN`] の 1 バイトに添える。helper は参加の後に受ける）。
 //!
@@ -29,7 +29,7 @@ use fandhe_container_core::traits::ErrorCode;
 use fandhe_container_oci::error::OciErrorCode;
 use fandhe_container_oci::layer::extract::{
     DEFAULT_MAX_EXTRACTED_BYTES, DEFAULT_MAX_LAYER_ENTRIES, DEFAULT_MAX_TRACKED_PATHS,
-    ExtractLimits,
+    ExtractLimits, IdMap,
 };
 use fandhe_container_oci::layer::{DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES, LAYER_MEDIA_TYPES};
 use fandhe_container_oci::reference::Digest;
@@ -56,7 +56,7 @@ const MAX_FRAME_LEN: usize = REQUEST_HEADER_LEN + REMOVE_PAYLOAD_LEN;
 /// 1 回の展開で受け取るレイヤー（blob の fd）の上限。`SCM_MAX_FD`（253）以下で 1 通に収まり、実用上の層数（約 127）を超える。
 pub const MAX_EXTRACT_LAYERS: usize = 128;
 /// 展開要求の固定部の長さ。
-const EXTRACT_FIXED_LEN: usize = 48;
+const EXTRACT_FIXED_LEN: usize = 112;
 /// 展開要求のレイヤー 1 件の長さ。
 const EXTRACT_LAYER_LEN: usize = 76;
 /// 展開要求の payload の最大長（固定部 + 上限件数）。[`MAX_REQUEST_PAYLOAD_BYTES`] 以下。
@@ -186,6 +186,8 @@ pub enum HelperErrorCode {
     JoinFailed,
     /// non-dumpable でない。
     NotNonDumpable,
+    /// helper が参加した uid / gid の写像が、要求の期待（指紋）と一致しない（SEC-5。#4848）。
+    IdMapMismatch,
     /// 要求の受信が期限切れ。
     RequestTimeout,
     /// 削除の拒否（マウントをまたぐ・種別違い等の `FailedPrecondition`。symlink は辿らず unlink するだけで拒否ではない。#4800）。
@@ -210,6 +212,7 @@ impl HelperErrorCode {
             Self::NotNonDumpable => 7,
             Self::RequestTimeout => 8,
             Self::Internal => 9,
+            Self::IdMapMismatch => 13,
             Self::RemoveRefused => 10,
             Self::RemoveFailed => 11,
             Self::ExtractFailed(_) => TAG_ERR_EXTRACT_FAILED,
@@ -230,6 +233,7 @@ impl HelperErrorCode {
             9 => Self::Internal,
             10 => Self::RemoveRefused,
             11 => Self::RemoveFailed,
+            13 => Self::IdMapMismatch,
             _ => return None,
         })
     }
@@ -246,6 +250,7 @@ impl HelperErrorCode {
             Self::NotNonDumpable => "not_non_dumpable",
             Self::RequestTimeout => "request_timeout",
             Self::Internal => "internal",
+            Self::IdMapMismatch => "id_map_mismatch",
             Self::RemoveRefused => "remove_refused",
             Self::RemoveFailed => "remove_failed",
             Self::ExtractFailed(_) => "extract_failed",
@@ -260,6 +265,7 @@ impl HelperErrorCode {
             Self::MultiThreaded
             | Self::NoSubordinateIds
             | Self::NotNonDumpable
+            | Self::IdMapMismatch
             | Self::RemoveRefused => ErrorCode::FailedPrecondition,
             Self::RequestTimeout => ErrorCode::Timeout,
             Self::JoinFailed | Self::RemoveFailed | Self::Internal => ErrorCode::Internal,
@@ -457,6 +463,9 @@ pub struct ExtractRequest {
     limits: ExtractLimits,
     max_uncompressed_bytes: u64,
     layers: Vec<ExtractLayerSpec>,
+    /// 期待する uid / gid の写像の指紋（[`id_map_fingerprint`]）。全 0 は未指定で、参加した helper は拒否する（fail-closed）。
+    uid_map_fp: [u8; 32],
+    gid_map_fp: [u8; 32],
 }
 
 impl ExtractRequest {
@@ -473,6 +482,7 @@ impl ExtractRequest {
             limits,
             max_uncompressed_bytes,
             layers,
+            ([0; 32], [0; 32]),
         )
     }
 
@@ -482,6 +492,7 @@ impl ExtractRequest {
         limits: ExtractLimits,
         max_uncompressed_bytes: u64,
         layers: Vec<ExtractLayerSpec>,
+        fps: ([u8; 32], [u8; 32]),
     ) -> Result<Self, HelperErrorCode> {
         let in_range = |v: u64, max: u64| (1..=max).contains(&v);
         let ok = layers.len() <= MAX_EXTRACT_LAYERS
@@ -500,7 +511,22 @@ impl ExtractRequest {
             limits,
             max_uncompressed_bytes,
             layers,
+            uid_map_fp: fps.0,
+            gid_map_fp: fps.1,
         })
+    }
+
+    /// 期待する写像を指定する（親が展開設定の写像を渡す。helper は参加した写像と照合し、違えば `IdMapMismatch`。SEC-5・#4848）。
+    #[must_use]
+    pub fn with_expected_maps(mut self, uid: &IdMap, gid: &IdMap) -> Self {
+        self.uid_map_fp = id_map_fingerprint(uid);
+        self.gid_map_fp = id_map_fingerprint(gid);
+        self
+    }
+
+    /// 期待する写像の指紋（uid, gid）。
+    pub fn expected_map_fingerprints(&self) -> (&[u8; 32], &[u8; 32]) {
+        (&self.uid_map_fp, &self.gid_map_fp)
     }
 
     /// helper が展開に使ってよい時間（1 ms 以上、600 秒以下に丸める。端数は切り上げ）を設定する。
@@ -513,6 +539,7 @@ impl ExtractRequest {
             self.limits,
             self.max_uncompressed_bytes,
             self.layers,
+            (self.uid_map_fp, self.gid_map_fp),
         )
     }
 
@@ -572,6 +599,8 @@ pub fn encode_extract_request(req: &ExtractRequest) -> ExtractRequestFrame {
     ] {
         v.extend_from_slice(&n.to_be_bytes());
     }
+    v.extend_from_slice(&req.uid_map_fp);
+    v.extend_from_slice(&req.gid_map_fp);
     for l in &req.layers {
         v.extend_from_slice(&[l.media_index, 0, 0, 0]);
         v.extend_from_slice(&l.size.to_be_bytes());
@@ -638,10 +667,42 @@ pub fn decode_extract_payload(p: &[u8]) -> Result<ExtractRequest, HelperErrorCod
             digest_from_bytes(di)?,
         )?);
     }
-    ExtractRequest::checked(special, work, ExtractLimits::new(e, t, i, tp), mu, layers)
+    let fp = |at: usize| -> Result<[u8; 32], HelperErrorCode> {
+        fixed
+            .get(at..at + 32)
+            .and_then(|s| <[u8; 32]>::try_from(s).ok())
+            .ok_or(bad)
+    };
+    ExtractRequest::checked(
+        special,
+        work,
+        ExtractLimits::new(e, t, i, tp),
+        mu,
+        layers,
+        (fp(48)?, fp(80)?),
+    )
 }
 
-/// 展開要求の payload 長からレイヤー数を得る（`48 + n × 76`、0 ≤ n ≤ 128 だけ）。
+/// 写像の指紋（行を `(container_id, host_id, count)` の BE 12 バイトにして昇順に並べた sha256。順序に依らない）。
+/// 親が展開設定の写像から、helper が参加した写像から作り、固定長で突き合わせる（可変長の写像を wire に載せない）。
+pub fn id_map_fingerprint(map: &IdMap) -> [u8; 32] {
+    let mut rows: Vec<[u8; 12]> = map
+        .lines()
+        .iter()
+        .map(|r| {
+            let mut b = [0u8; 12];
+            b[..4].copy_from_slice(&r.container_id.to_be_bytes());
+            b[4..8].copy_from_slice(&r.host_id.to_be_bytes());
+            b[8..].copy_from_slice(&r.count.to_be_bytes());
+            b
+        })
+        .collect();
+    rows.sort_unstable();
+    let bytes: Vec<u8> = rows.concat();
+    digest_to_bytes(&Digest::sha256_of(&bytes)).unwrap_or_default()
+}
+
+/// 展開要求の payload 長からレイヤー数を得る（`112 + n × 76`、0 ≤ n ≤ 128 だけ）。
 fn extract_layer_count(payload_len: usize) -> Option<usize> {
     let body = payload_len.checked_sub(EXTRACT_FIXED_LEN)?;
     let n = body / EXTRACT_LAYER_LEN;
@@ -735,7 +796,7 @@ impl RequestHead {
 }
 
 /// 要求 header を検査する。`payload_len` の上限検査は tag の検査より先（確保・読み取りの前）。
-/// tag ごとの固定長（展開要求は `48 + n × 76`、1 ≤ n ≤ 128）と合わない長さは `InvalidRequest`。
+/// tag ごとの固定長（展開要求は `112 + n × 76`、1 ≤ n ≤ 128）と合わない長さは `InvalidRequest`。
 pub fn decode_request_header(
     header: &[u8; REQUEST_HEADER_LEN],
 ) -> Result<RequestHead, HelperErrorCode> {
@@ -1263,31 +1324,54 @@ mod tests {
     fn sec5_4847_extract_request_roundtrip_and_bytes() {
         let f = encode_extract_request(&req(1));
         let b = f.as_bytes();
-        assert_eq!(b.len(), 8 + 48 + 76);
-        // header: version 1・tag 3・payload 124 = 0x7c。
-        assert_eq!(&b[..8], &[1, 3, 0, 0, 0, 0, 0, 0x7c]);
+        assert_eq!(b.len(), 8 + 112 + 76);
+        // header: version 1・tag 3・payload 188 = 0xbc。
+        assert_eq!(&b[..8], &[1, 3, 0, 0, 0, 0, 0, 0xbc]);
         // 固定部: ownership 1・special 2・layers 1・work 1500 ms = 0x5dc。
         assert_eq!(&b[8..16], &[1, 2, 0, 1, 0, 0, 0x05, 0xdc]);
         // レイヤー: media 添字 1・予約 0・size 1234 = 0x4d2・digest の先頭 0xaa・diff_id の先頭 0xbb。
-        assert_eq!(&b[56..68], &[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x04, 0xd2]);
-        assert_eq!(b[68], 0xaa);
-        assert_eq!(b[100], 0xbb);
+        assert_eq!(&b[120..132], &[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x04, 0xd2]);
+        assert_eq!(b[132], 0xaa);
+        assert_eq!(b[164], 0xbb);
         assert_eq!(decode_request(b), Ok(Request::Extract(req(1))));
         let head = decode_request_header(b[..8].try_into().unwrap()).unwrap();
-        assert_eq!(head.payload_len(), 124);
+        assert_eq!(head.payload_len(), 188);
         let r = req(1);
         assert_eq!(r.layers()[0].media_type(), TAR);
         assert_eq!(r.layers()[0].size(), 1234);
         assert_eq!(r.work_ms(), 1500);
     }
 
+    /// SEC-5・#4848: 写像の指紋は行の順序に依らず、行が違えば変わる。要求に載せて往復し、未指定（全 0）は区別できる。
+    #[test]
+    fn sec5_4848_id_map_fingerprint_and_roundtrip() {
+        use fandhe_container_oci::layer::extract::IdRange;
+        let r = |c, h, n| IdRange {
+            container_id: c,
+            host_id: h,
+            count: n,
+        };
+        let a = IdMap::new(vec![r(0, 100_000, 1), r(1, 200_000, 10)]).unwrap();
+        let b = IdMap::new(vec![r(1, 200_000, 10), r(0, 100_000, 1)]).unwrap();
+        let c = IdMap::new(vec![r(0, 100_001, 1), r(1, 200_000, 10)]).unwrap();
+        assert_eq!(id_map_fingerprint(&a), id_map_fingerprint(&b));
+        assert_ne!(id_map_fingerprint(&a), id_map_fingerprint(&c));
+        let unset = req(1);
+        assert_eq!(unset.expected_map_fingerprints(), (&[0; 32], &[0; 32]));
+        let set = req(1).with_expected_maps(&a, &c);
+        assert_eq!(set.expected_map_fingerprints().0, &id_map_fingerprint(&a));
+        assert_eq!(set.expected_map_fingerprints().1, &id_map_fingerprint(&c));
+        let f = encode_extract_request(&set);
+        assert_eq!(decode_request(f.as_bytes()), Ok(Request::Extract(set)));
+    }
+
     /// REPAIR-5・#4847: 件数の上限（128 は受理、129 は拒否、0 は受理）と、header の長さの検査。
     #[test]
     fn sec5_4847_extract_layer_count_bounds() {
-        assert_eq!(MAX_EXTRACT_PAYLOAD_BYTES, 48 + 128 * 76);
-        assert_eq!(MAX_EXTRACT_PAYLOAD_BYTES, 9776);
+        assert_eq!(MAX_EXTRACT_PAYLOAD_BYTES, 112 + 128 * 76);
+        assert_eq!(MAX_EXTRACT_PAYLOAD_BYTES, 9840);
         let f = encode_extract_request(&req(128));
-        assert_eq!(f.as_bytes().len(), 8 + 9776);
+        assert_eq!(f.as_bytes().len(), 8 + 9840);
         assert_eq!(decode_request(f.as_bytes()), Ok(Request::Extract(req(128))));
         // 129 層は構築できず、長さだけ 129 層の header も InvalidRequest（上限 16 KiB 以下のため RequestTooLarge ではない）。
         assert_eq!(
@@ -1299,7 +1383,14 @@ mod tests {
             ),
             Err(HelperErrorCode::InvalidRequest)
         );
-        for len in [0u32, 47, 48 + 75, 48 + 76 - 1, 48 + 76 + 1, 48 + 129 * 76] {
+        for len in [
+            0u32,
+            111,
+            112 + 75,
+            112 + 76 - 1,
+            112 + 76 + 1,
+            112 + 129 * 76,
+        ] {
             assert_eq!(
                 decode_request_header(&header(1, 3, [0, 0], len)),
                 Err(HelperErrorCode::InvalidRequest),
@@ -1312,18 +1403,18 @@ mod tests {
             Err(HelperErrorCode::RequestTooLarge)
         );
         assert_eq!(
-            decode_request_header(&header(1, 3, [0, 0], 124))
+            decode_request_header(&header(1, 3, [0, 0], 188))
                 .unwrap()
                 .payload_len(),
-            124
+            188
         );
         // 版 2・予約バイトは tag 3 でも InvalidRequest。
         assert_eq!(
-            decode_request_header(&header(2, 3, [0, 0], 124)),
+            decode_request_header(&header(2, 3, [0, 0], 188)),
             Err(HelperErrorCode::InvalidRequest)
         );
         assert_eq!(
-            decode_request_header(&header(1, 3, [0, 1], 124)),
+            decode_request_header(&header(1, 3, [0, 1], 188)),
             Err(HelperErrorCode::InvalidRequest)
         );
     }
@@ -1372,9 +1463,9 @@ mod tests {
             48,
             &(DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES + 1).to_be_bytes(),
         );
-        mutate("media 0", 56, &[0]);
-        mutate("media 7", 56, &[7]);
-        mutate("reserved", 57, &[1]);
+        mutate("media 0", 120, &[0]);
+        mutate("media 7", 120, &[7]);
+        mutate("reserved", 121, &[1]);
         for (name, b) in &cases {
             assert_eq!(
                 decode_request(b),
@@ -1390,13 +1481,13 @@ mod tests {
     fn oci1_4847_zero_layer_request_roundtrips() {
         let r = req(0);
         let f = encode_extract_request(&r);
-        assert_eq!(f.as_bytes().len(), 8 + 48);
+        assert_eq!(f.as_bytes().len(), 8 + 112);
         assert_eq!(decode_request(f.as_bytes()), Ok(Request::Extract(r)));
         assert_eq!(
-            decode_request_header(&header(1, 3, [0, 0], 48))
+            decode_request_header(&header(1, 3, [0, 0], 112))
                 .unwrap()
                 .payload_len(),
-            48
+            112
         );
     }
 

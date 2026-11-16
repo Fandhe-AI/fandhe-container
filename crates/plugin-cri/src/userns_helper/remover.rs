@@ -10,7 +10,7 @@
 //!
 //! # 契約
 //! - 縮退しない: 失敗・期限切れはホスト側の削除へ落とさず、固定文言の [`CriError`]（パス・errno・uid を含めない。REPAIR-4）
-//! - 期限（REPAIR-5）: [`ReleaseBudget`] の期限があれば残り時間から [`JOIN_BUDGET`] を引いて作業予算にする（1〜600 秒に丸める）。
+//! - 期限（REPAIR-5）: [`ReleaseBudget`] の期限があれば残り時間から `JOIN_BUDGET` を引いて作業予算にする（1〜600 秒に丸める）。
 //!   期限が無ければ [`DEFAULT_WORK_BUDGET`]。開始前に期限切れ・取り消しなら起動しない。実行中も絶対期限と取り消しの旗を
 //!   100 ms 刻みで見て、尽きたら helper を kill・回収して `Timeout`（作業予算の 1 秒の下限が期限を超えても絶対期限で止める）
 //! - 同時実行の上限: 稼働中 + 回収できていない子の合計が [`MAX_CONCURRENT_REMOVALS`] 以上なら待たずに `UNAVAILABLE`
@@ -19,48 +19,33 @@
 //! - 冪等: 削除は不在を成功とし、途中で kill されても再実行が続きから消す
 
 use std::os::fd::BorrowedFd;
-use std::process::Child;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, OnceLock};
 
 use fandhe_container_core::traits::ErrorCode;
 use fandhe_container_cri::adapter::ReleaseBudget;
 use fandhe_container_cri::bundle::{RemovalTarget, SubordinateTreeRemover};
 use fandhe_container_cri::error::CriError;
 
-use super::launcher::{JOIN_BUDGET, UsernsHelperError, UsernsHelperLauncher, WorkBudget};
+use super::launcher::{UsernsHelperError, UsernsHelperLauncher, WorkBudget};
+use super::slots::{HelperSlots, work_budget_for};
 use super::wire::{Mode, RemoveTarget, Report};
 
 /// 同時に動かす削除の上限（稼働中の helper + 回収できていない子の合計）。
 pub const MAX_CONCURRENT_REMOVALS: usize = 4;
 /// 呼び出し側に期限が無いときの作業予算。
-pub const DEFAULT_WORK_BUDGET: Duration = Duration::from_secs(120);
+pub use super::slots::DEFAULT_WORK_BUDGET;
 
 /// 本番の削除器。プロセスで 1 つ（[`UsernsTreeRemover::shared`]）を pull 側と create 側が共有し、上限を 1 つにする。
 pub struct UsernsTreeRemover {
     launcher: UsernsHelperLauncher,
-    max: usize,
-    active: AtomicUsize,
-    /// kill したが回収できなかった子（次の呼び出しで掃く）。
-    unreaped: Mutex<Vec<Child>>,
+    slots: HelperSlots,
 }
 
 impl std::fmt::Debug for UsernsTreeRemover {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UsernsTreeRemover")
-            .field("max", &self.max)
-            .field("active", &self.active.load(Ordering::Relaxed))
+            .field("max", &self.slots.max)
             .finish_non_exhaustive()
-    }
-}
-
-/// 稼働中の枠。drop で返す。
-struct Slot<'a>(&'a AtomicUsize);
-
-impl Drop for Slot<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -90,52 +75,7 @@ impl UsernsTreeRemover {
     fn build(launcher: UsernsHelperLauncher, max: usize) -> Self {
         Self {
             launcher,
-            max,
-            active: AtomicUsize::new(0),
-            unreaped: Mutex::new(Vec::new()),
-        }
-    }
-
-    /// 回収できていなかった子のうち、終わったものを掃く。残りの数を返す。
-    ///
-    /// 回収できていない子は取得済みの枠を保持し続ける（`active` に含める）ため、掃けた分だけ枠を返す。
-    fn sweep(&self) {
-        let Ok(mut held) = self.unreaped.lock() else {
-            return;
-        };
-        let before = held.len();
-        held.retain_mut(|c| !matches!(c.try_wait(), Ok(Some(_)) | Err(_)));
-        let freed = before - held.len();
-        if freed > 0 {
-            self.active.fetch_sub(freed, Ordering::AcqRel);
-        }
-    }
-
-    /// 枠を取る。稼働中 + 回収できていない子が上限に達していれば `None`（待たない）。
-    fn acquire(&self) -> Option<Slot<'_>> {
-        self.sweep();
-        let mut cur = self.active.load(Ordering::Acquire);
-        loop {
-            if cur >= self.max {
-                return None;
-            }
-            match self.active.compare_exchange_weak(
-                cur,
-                cur + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return Some(Slot(&self.active)),
-                Err(seen) => cur = seen,
-            }
-        }
-    }
-
-    /// 回収できなかった子を保持する。枠は返さず子の回収まで持たせる（`sweep` が返す）。
-    fn keep(&self, child: Child, slot: Slot<'_>) {
-        if let Ok(mut held) = self.unreaped.lock() {
-            held.push(child);
-            std::mem::forget(slot);
+            slots: HelperSlots::new(max),
         }
     }
 }
@@ -148,14 +88,8 @@ impl Default for UsernsTreeRemover {
 
 /// 呼び出し側の期限から helper の作業予算を作る（期限が無ければ既定。1〜600 秒に丸める）。
 fn work_budget(budget: &ReleaseBudget<'_>) -> Result<WorkBudget, CriError> {
-    let want = match budget.deadline {
-        Some(dl) => dl
-            .saturating_duration_since(Instant::now())
-            .saturating_sub(JOIN_BUDGET),
-        None => DEFAULT_WORK_BUDGET,
-    };
-    WorkBudget::new(want.clamp(WorkBudget::MIN, WorkBudget::MAX))
-        .map_err(|_| CriError::internal("failed to compute the removal budget"))
+    work_budget_for(budget.deadline)
+        .ok_or_else(|| CriError::internal("failed to compute the removal budget"))
 }
 
 fn wire_target(t: RemovalTarget) -> Result<RemoveTarget, CriError> {
@@ -194,7 +128,7 @@ impl SubordinateTreeRemover for UsernsTreeRemover {
         budget.check()?;
         let wire = wire_target(target)?;
         let work = work_budget(budget)?;
-        let slot = self.acquire().ok_or_else(|| {
+        let slot = self.slots.acquire().ok_or_else(|| {
             CriError::unavailable("too many subordinate-owned tree removals in progress")
         })?;
         match self.launcher.run_bounded(
@@ -210,7 +144,7 @@ impl SubordinateTreeRemover for UsernsTreeRemover {
             )),
             Err(mut e) => {
                 if let Some(child) = e.take_unreaped() {
-                    self.keep(child, slot);
+                    self.slots.keep(child, slot);
                 }
                 Err(map_error(&e))
             }
@@ -222,9 +156,12 @@ impl SubordinateTreeRemover for UsernsTreeRemover {
 mod tests {
     use std::fs::File;
     use std::os::fd::AsFd as _;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
 
     use fandhe_container_cri::error::CriErrorCode;
 
+    use super::super::launcher::JOIN_BUDGET;
     use super::*;
 
     fn sleeper(max: usize) -> UsernsTreeRemover {
@@ -255,15 +192,19 @@ mod tests {
             "took {:?}",
             started.elapsed()
         );
-        assert_eq!(rm.unreaped.lock().unwrap().len(), 0, "child must be reaped");
-        assert_eq!(rm.active.load(Ordering::Acquire), 0);
+        assert_eq!(
+            rm.slots.unreaped.lock().unwrap().len(),
+            0,
+            "child must be reaped"
+        );
+        assert_eq!(rm.slots.active.load(Ordering::Acquire), 0);
     }
 
     /// REPAIR-5・#4800: 上限（稼働中 + 回収できていない子）に達していれば待たずに `UNAVAILABLE`。
     #[test]
     fn sec5_4800_remover_over_the_limit_is_unavailable() {
         let rm = sleeper(2);
-        rm.active.fetch_add(2, Ordering::AcqRel);
+        rm.slots.active.fetch_add(2, Ordering::AcqRel);
         let dir = File::open("/").expect("open /");
         let started = Instant::now();
         let e = rm
@@ -276,7 +217,7 @@ mod tests {
         assert_eq!(e.code(), CriErrorCode::Unavailable);
         assert!(started.elapsed() < Duration::from_secs(1));
         // 上限で拒否しても、取っていない枠を返さない。
-        assert_eq!(rm.active.load(Ordering::Acquire), 2);
+        assert_eq!(rm.slots.active.load(Ordering::Acquire), 2);
     }
 
     /// REPAIR-5・#3142・#4800: 実行中の helper も、取り消しの旗が立てば 100 ms 刻みで止まり kill・回収される。
@@ -301,8 +242,8 @@ mod tests {
         .expect_err("cancelled");
         assert_eq!(e.code(), CriErrorCode::Timeout);
         assert!(started.elapsed() < Duration::from_secs(5));
-        assert_eq!(rm.unreaped.lock().unwrap().len(), 0);
-        assert_eq!(rm.active.load(Ordering::Acquire), 0);
+        assert_eq!(rm.slots.unreaped.lock().unwrap().len(), 0);
+        assert_eq!(rm.slots.active.load(Ordering::Acquire), 0);
     }
 
     /// REPAIR-5・#4800: 期限切れの予算では helper を起動せず `Timeout`（副作用なし）。

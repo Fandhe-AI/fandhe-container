@@ -1542,7 +1542,11 @@ fn oci1_sec5_pull_rejects_rootfs_recorded_with_other_userns_mapping() {
     use fandhe_container_oci::layer::extract::{
         IdMap, IdRange, OwnershipPolicy, SpecialBitsPolicy,
     };
+    use std::os::unix::fs::MetadataExt as _;
     let dir = TempDir::new("userns-map");
+    // 公開済みの根の期待所有者は写像先（コンテナ uid 0 のホスト ID。#4848）。Keep で展開した根は試験の uid 所有のため、
+    // 写像の 0 行はその uid に合わせ、記録の食い違い（host_id の違う行）だけで拒否されることを見る。
+    let me = fs::metadata(&dir.0).expect("meta").uid();
     OciImagePuller::new(
         Arc::new(FakeClient::new(two_layer_manifest())),
         config(&dir),
@@ -1560,11 +1564,18 @@ fn oci1_sec5_pull_rejects_rootfs_recorded_with_other_userns_mapping() {
     fs::write(&record, replaced).expect("rewrite record");
     // 写像 B（host_id が違う）で pull する。
     let map = |host_id| {
-        IdMap::new(vec![IdRange {
-            container_id: 0,
-            host_id,
-            count: 65_536,
-        }])
+        IdMap::new(vec![
+            IdRange {
+                container_id: 0,
+                host_id: me,
+                count: 1,
+            },
+            IdRange {
+                container_id: 1,
+                host_id,
+                count: 65_535,
+            },
+        ])
         .expect("map")
     };
     let mut other = config(&dir);
@@ -1592,7 +1603,9 @@ fn oci1_sec5_pull_rejects_keep_recorded_rootfs_when_mapping_is_expected() {
     use fandhe_container_oci::layer::extract::{
         IdMap, IdRange, OwnershipPolicy, SpecialBitsPolicy,
     };
+    use std::os::unix::fs::MetadataExt as _;
     let dir = TempDir::new("keep-vs-map");
+    let me = fs::metadata(&dir.0).expect("meta").uid();
     OciImagePuller::new(
         Arc::new(FakeClient::new(two_layer_manifest())),
         config(&dir),
@@ -1601,11 +1614,18 @@ fn oci1_sec5_pull_rejects_keep_recorded_rootfs_when_mapping_is_expected() {
     .expect("first");
     let marker = rootfs_path(&dir, SHA_CONFIG).join("marker");
     fs::write(&marker, b"m").expect("marker");
-    let map = IdMap::new(vec![IdRange {
-        container_id: 0,
-        host_id: 100_000,
-        count: 65_536,
-    }])
+    let map = IdMap::new(vec![
+        IdRange {
+            container_id: 0,
+            host_id: me,
+            count: 1,
+        },
+        IdRange {
+            container_id: 1,
+            host_id: 100_000,
+            count: 65_535,
+        },
+    ])
     .expect("map");
     let mut mapped = config(&dir);
     mapped.extract_options = mapped
@@ -2463,11 +2483,187 @@ mod userns_unpack_removal {
     use std::os::fd::BorrowedFd;
 
     use fandhe_container_cri::adapter::ReleaseBudget;
-    use fandhe_container_cri::bundle::{RemovalTarget, SubordinateTreeRemover};
+    use fandhe_container_cri::bundle::{
+        RemovalTarget, SubordinateLayerExtractor, SubordinateTreeRemover,
+    };
     use fandhe_container_cri::error::CriError;
-    use fandhe_container_oci::layer::extract::{IdMap, IdRange, OwnershipPolicy};
+    use fandhe_container_oci::instrument::NoopOciOpRecorder;
+    use fandhe_container_oci::layer::extract::{
+        ExtractBudget, ExtractLimits, ExtractOptions, ExtractRoot, IdMap, IdRange, ImageLayer,
+        OwnershipPolicy, extract_image_layers_bounded_in,
+    };
 
     use super::*;
+
+    /// 呼び出し回数とレイヤー数を記録する偽の extractor。成功時は oci のホスト側の展開（`Keep`）で根を展開し、
+    /// 根の所有者を写像先（`map_to_host(0)`）へ合わせる（本物の helper が名前空間の中で行う `chown_root` の代役）。
+    #[derive(Debug, Default)]
+    struct FakeExtractor {
+        calls: Mutex<Vec<usize>>,
+        fail: Option<OciErrorCode>,
+    }
+
+    impl SubordinateLayerExtractor for FakeExtractor {
+        fn extract_layers(
+            &self,
+            layers: &[ImageLayer<'_>],
+            root: &ExtractRoot,
+            max_uncompressed_layer_bytes: u64,
+            limits: ExtractLimits,
+            options: &ExtractOptions,
+            _budget: &ReleaseBudget<'_>,
+        ) -> Result<(), OciError> {
+            self.calls.lock().unwrap().push(layers.len());
+            if let Some(code) = self.fail {
+                return Err(OciError::new(code, "injected"));
+            }
+            extract_image_layers_bounded_in(
+                &NoopOciOpRecorder,
+                layers,
+                root,
+                max_uncompressed_layer_bytes,
+                limits,
+                &ExtractOptions::new(),
+                &ExtractBudget::new(),
+            )?;
+            let OwnershipPolicy::ChownInUserNamespace { uid, gid } = &options.ownership else {
+                panic!("userns options expected");
+            };
+            let f = fs::File::from(root.as_fd().try_clone_to_owned().unwrap());
+            std::os::unix::fs::fchown(&f, uid.map_to_host(0), gid.map_to_host(0)).unwrap();
+            Ok(())
+        }
+    }
+
+    /// 範囲写像の展開設定。コンテナ uid 0 の写像先は試験プロセスの uid（root のときは別の ID）。
+    fn userns_config(dir: &TempDir) -> PullConfig {
+        use std::os::unix::fs::MetadataExt as _;
+        let me = fs::metadata(&dir.0).expect("meta").uid();
+        let host_root = if me == 0 { 100_000 } else { me };
+        let map = || {
+            IdMap::new(vec![
+                IdRange {
+                    container_id: 0,
+                    host_id: host_root,
+                    count: 1,
+                },
+                IdRange {
+                    container_id: 1,
+                    host_id: 200_000,
+                    count: 65_536,
+                },
+            ])
+            .expect("map")
+        };
+        let mut cfg = config(dir);
+        cfg.extract_options =
+            cfg.extract_options
+                .clone()
+                .with_ownership(OwnershipPolicy::ChownInUserNamespace {
+                    uid: map(),
+                    gid: map(),
+                });
+        cfg
+    }
+
+    /// 範囲写像でない展開設定（既定）の pull は、extractor を注入しても呼ばず、従来どおり成功する（#4848 受入基準 1）。
+    #[test]
+    fn sec5_4848_keep_pull_never_calls_the_extractor() {
+        let dir = TempDir::new("ex-keep");
+        let ex = Arc::new(FakeExtractor::default());
+        let rm = Arc::new(Recorder::default());
+        let client = Arc::new(FakeClient::new(two_layer_manifest()));
+        let puller = OciImagePuller::new(client, config(&dir))
+            .with_tree_remover(rm.clone())
+            .with_layer_extractor(ex.clone());
+        puller.pull(&req("alpine:3.20")).expect("pull");
+        assert!(ex.calls.lock().unwrap().is_empty());
+        assert!(rm.0.lock().unwrap().is_empty());
+    }
+
+    /// 範囲写像の pull は extractor を 1 回（2 レイヤー）通り、展開記録に写像が固定書式で残り、公開済みの根の所有者が
+    /// 期待値（写像先）と合う（再 pull が命中して extractor を呼ばない。#4848 受入基準 1・2）。
+    #[test]
+    fn sec5_4848_userns_pull_extracts_through_the_extractor_and_records_the_mapping() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = TempDir::new("ex-userns");
+        let cfg = userns_config(&dir);
+        let host_root = match &cfg.extract_options.ownership {
+            OwnershipPolicy::ChownInUserNamespace { uid, .. } => uid.map_to_host(0).unwrap(),
+            _ => unreachable!(),
+        };
+        let ex = Arc::new(FakeExtractor::default());
+        let rm = Arc::new(Recorder::default());
+        let client = Arc::new(FakeClient::new(two_layer_manifest()));
+        let puller = OciImagePuller::new(client, cfg)
+            .with_tree_remover(rm.clone())
+            .with_layer_extractor(ex.clone());
+        puller.pull(&req("alpine:3.20")).expect("pull");
+        assert_eq!(*ex.calls.lock().unwrap(), vec![2]);
+        // 公開後の `unpack/` の残り（空）の後始末だけが remover へ回る。
+        assert_eq!(*rm.0.lock().unwrap(), vec![RemovalTarget::PullUnpack]);
+        let entry = entry_path(&dir, SHA_CONFIG);
+        let record = fs::read_to_string(entry.join("unpack-record")).expect("record");
+        let line = format!(
+            "ownership=chown-in-userns uid=0:{host_root}:1,1:200000:65536 gid=0:{host_root}:1,1:200000:65536\nspecial-bits=strip\n"
+        );
+        assert!(record.contains(&line), "{record}");
+        assert_eq!(
+            fs::metadata(entry.join("rootfs")).expect("rootfs").uid(),
+            host_root
+        );
+        puller.pull(&req("alpine:3.20")).expect("second pull");
+        assert_eq!(
+            ex.calls.lock().unwrap().len(),
+            1,
+            "published entry is reused"
+        );
+        assert!(staging_is_empty(&dir));
+    }
+
+    /// extractor が無い範囲写像の pull は、展開先を作る前に `FAILED_PRECONDITION`。ホスト側の展開・削除へ縮退しない。
+    #[test]
+    fn sec5_4848_userns_pull_without_extractor_is_failed_precondition() {
+        let dir = TempDir::new("ex-none");
+        let rm = Arc::new(Recorder::default());
+        let client = Arc::new(FakeClient::new(two_layer_manifest()));
+        let puller = OciImagePuller::new(client, userns_config(&dir)).with_tree_remover(rm.clone());
+        let e = puller.pull(&req("alpine:3.20")).expect_err("no extractor");
+        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+        assert!(staging_is_empty(&dir));
+    }
+
+    /// remover が無ければ、extractor があっても呼ばず拒否する（消せない subuid 所有の木を作らない）。
+    #[test]
+    fn sec5_4848_userns_pull_without_remover_is_failed_precondition() {
+        let dir = TempDir::new("ex-no-rm");
+        let ex = Arc::new(FakeExtractor::default());
+        let client = Arc::new(FakeClient::new(two_layer_manifest()));
+        let puller =
+            OciImagePuller::new(client, userns_config(&dir)).with_layer_extractor(ex.clone());
+        let e = puller.pull(&req("alpine:3.20")).expect_err("no remover");
+        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+        assert!(ex.calls.lock().unwrap().is_empty());
+        assert!(staging_is_empty(&dir));
+    }
+
+    /// extractor の失敗は分類を保って返り（`DataLoss` はそのまま）、`unpack/` の後始末は remover へ回る。
+    #[test]
+    fn sec5_4848_extractor_failure_keeps_the_code_and_cleans_up_through_the_remover() {
+        let dir = TempDir::new("ex-fail");
+        let ex = Arc::new(FakeExtractor {
+            fail: Some(OciErrorCode::DataLoss),
+            ..FakeExtractor::default()
+        });
+        let rm = Arc::new(Recorder::default());
+        let client = Arc::new(FakeClient::new(two_layer_manifest()));
+        let puller = OciImagePuller::new(client, userns_config(&dir))
+            .with_tree_remover(rm.clone())
+            .with_layer_extractor(ex.clone());
+        let e = puller.pull(&req("alpine:3.20")).expect_err("injected");
+        assert_eq!(e.code(), OciErrorCode::DataLoss);
+        assert_eq!(*rm.0.lock().unwrap(), vec![RemovalTarget::PullUnpack]);
+    }
 
     /// 呼び出しを記録するだけの remover（何も消さない）。
     #[derive(Debug, Default)]
@@ -2497,7 +2693,7 @@ mod userns_unpack_removal {
         assert!(staging_is_empty(&dir));
     }
 
-    /// `ChownInUserNamespace` の pull は（user namespace の外では展開が拒否されるが）後始末の `unpack/` を
+    /// `ChownInUserNamespace` の pull は（extractor の展開が失敗したとき）後始末の `unpack/` を
     /// `PullUnpack` として remover へ回す。ホスト側の削除へは縮退しない。
     #[test]
     fn sec5_4800_userns_ownership_pull_routes_unpack_cleanup_to_the_remover() {
@@ -2519,8 +2715,14 @@ mod userns_unpack_removal {
                     uid: map(),
                     gid: map(),
                 });
+        let ex = Arc::new(FakeExtractor {
+            fail: Some(OciErrorCode::Internal),
+            ..FakeExtractor::default()
+        });
         let client = Arc::new(FakeClient::new(two_layer_manifest()));
-        let puller = OciImagePuller::new(client, cfg).with_tree_remover(rm.clone());
+        let puller = OciImagePuller::new(client, cfg)
+            .with_tree_remover(rm.clone())
+            .with_layer_extractor(ex);
         assert!(puller.pull(&req("alpine:3.20")).is_err());
         assert_eq!(*rm.0.lock().unwrap(), vec![RemovalTarget::PullUnpack]);
     }

@@ -52,7 +52,7 @@ use super::USERNS_HELPER_ARG;
 use super::wire::{
     EXTRACT_FD_TOKEN, ExtractReport, ExtractRequest, ExtractSpecialBits, HelperErrorCode,
     InspectReport, MAX_EXTRACT_PAYLOAD_BYTES, Mode, REQUEST_HEADER_LEN, RemoveTarget, Report,
-    Request, StatReport, decode_request_header, encode_response,
+    Request, StatReport, decode_request_header, encode_response, id_map_fingerprint,
 };
 use crate::image_ownership::to_oci_map;
 use crate::sys::{fd_passing, hardening};
@@ -168,6 +168,16 @@ fn extract(
     maps: Option<&JoinedMaps>,
     received_at: Instant,
 ) -> Result<ExtractReport, HelperErrorCode> {
+    // 参加した写像が親の期待（展開設定の写像）と一致しなければ、書き込みの前に拒否する（SEC-5・#4848。helper は起動ごとに
+    // subuid / subgid を解決し直すため、親が記録した写像とずれうる。root は自 UID に写るので所有者の検査では見つからない）。
+    if let Some((uid, gid)) = maps {
+        let (want_uid, want_gid) = req.expected_map_fingerprints();
+        let got_uid = to_oci_map(uid).map_err(|_| HelperErrorCode::Internal)?;
+        let got_gid = to_oci_map(gid).map_err(|_| HelperErrorCode::Internal)?;
+        if id_map_fingerprint(&got_uid) != *want_uid || id_map_fingerprint(&got_gid) != *want_gid {
+            return Err(HelperErrorCode::IdMapMismatch);
+        }
+    }
     let deadline = received_at + Duration::from_millis(u64::from(req.work_ms()));
     let want = req.layers().len();
     // 0 件は launcher が SCM_RIGHTS を送らないため待たない（OCI-1。layers が空の正常なイメージ）。
@@ -395,5 +405,80 @@ mod tests {
             parse_args(&a(&[USERNS_HELPER_ARG, "--no-join"])),
             Some(false)
         );
+    }
+
+    fn maps(uid_host: u32, gid_host: u32) -> JoinedMaps {
+        use fandhe_container_core::exec::IdMapping;
+        let m = |h| {
+            IdMapSet::new(vec![IdMapping {
+                container_id: 0,
+                host_id: h,
+                count: 1,
+            }])
+            .expect("map")
+        };
+        (m(uid_host), m(gid_host))
+    }
+
+    /// 参加した写像 `joined` に対し、指紋 `expect`（None は未指定の全 0）で展開を要求し、拒否の分類と展開先の未変更を確かめる。
+    fn assert_rejected_before_write(
+        joined: &JoinedMaps,
+        expect: Option<(&JoinedMaps, bool, bool)>,
+    ) {
+        use fandhe_container_oci::layer::extract::ExtractLimits;
+        let dir = std::env::temp_dir().join(format!(
+            "idmap-mismatch-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).expect("mkdir");
+        let target = File::open(&dir).expect("open");
+        let mut req = ExtractRequest::new(
+            ExtractSpecialBits::PreserveIfChowned,
+            ExtractLimits::default(),
+            fandhe_container_oci::layer::DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES,
+            Vec::new(),
+        )
+        .expect("req");
+        if let Some((want, use_want_uid, use_want_gid)) = expect {
+            // 片方だけ違う写像を期待に載せる（もう片方は参加した写像と同じ）。
+            let u = to_oci_map(if use_want_uid { &want.0 } else { &joined.0 }).unwrap();
+            let g = to_oci_map(if use_want_gid { &want.1 } else { &joined.1 }).unwrap();
+            req = req.with_expected_maps(&u, &g);
+        }
+        let (a, _b) = UnixStream::pair().expect("pair");
+        let err = extract(&a, &target, &req, Some(joined), Instant::now()).unwrap_err();
+        assert_eq!(err, HelperErrorCode::IdMapMismatch);
+        assert_eq!(
+            err.core_code(),
+            fandhe_container_core::traits::ErrorCode::FailedPrecondition
+        );
+        assert_eq!(std::fs::read_dir(&dir).expect("ls").count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SEC-5・REPAIR-12・#4848: uid の写像だけ期待とずれたら、展開前に `IdMapMismatch`（FailedPrecondition）で拒否し展開先を変えない。
+    #[test]
+    fn sec5_4848_uid_map_only_mismatch_is_rejected_before_write() {
+        assert_rejected_before_write(
+            &maps(100_000, 200_000),
+            Some((&maps(100_001, 200_000), true, false)),
+        );
+    }
+
+    /// SEC-5・REPAIR-12・#4848: gid の写像だけずれた場合も同様に拒否する（gid の照合漏れの検出）。
+    #[test]
+    fn sec5_4848_gid_map_only_mismatch_is_rejected_before_write() {
+        assert_rejected_before_write(
+            &maps(100_000, 200_000),
+            Some((&maps(100_000, 200_001), false, true)),
+        );
+    }
+
+    /// SEC-5・REPAIR-12・#4848: 指紋未指定（全 0）は参加した写像と一致しないので拒否する（fail-closed）。
+    #[test]
+    fn sec5_4848_unset_fingerprints_are_rejected_before_write() {
+        assert_rejected_before_write(&maps(100_000, 200_000), None);
     }
 }

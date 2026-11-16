@@ -14,12 +14,20 @@
 //! - 展開モード（#4847。OCI-1・OCI-2）: `launcher` の `run_extract_bounded` が展開要求の frame の後に blob の fd を `SCM_RIGHTS`
 //!   で送り、`helper` が参加の後に blob を再検証して oci の `extract_image_layers_bounded_in` で展開する
 //!
-//! 未配線（REPAIR-3）: cri の注入点と pull・create からの展開モードの呼び出しは後続の issue、`extract_identity` の対応表の
-//! 切り替え（H6・#4801）と CI への組み込み（H7・#4802）も未（削除は配線済みだが、対応表が `ChownInUserNamespace` を返すまで
-//! 本番では通らない）。設計は `docs/design/userns-extract-helper.md`。
+//! - 展開器（#4848）: `extractor` が cri の注入点 `SubordinateLayerExtractor` の本番実装として、blob と展開先を fd で渡して
+//!   `run_extract_bounded` を呼ぶ（枠・期限・回収は `slots` で削除器と共通の処理を別インスタンスで持つ）
+//!
+//! 未配線（REPAIR-3）: `extract_identity` の対応表の切り替え（H6・#4801）と CI への組み込み（H7・#4802）は未（削除・展開は
+//! cri の pull・create へ配線済みだが、対応表が `ChownInUserNamespace` を返すまで本番では通らない）。
+//! 設計は `docs/design/userns-extract-helper.md`。
 
 pub mod wire;
 
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub mod extractor;
 #[cfg(target_os = "linux")]
 mod helper;
 #[cfg(target_os = "linux")]
@@ -29,10 +37,20 @@ pub mod launcher;
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 pub mod remover;
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod slots;
 
 /// helper を起動する隠しの第 1 引数（固定。パスや設定を引数で受けない）。
 pub const USERNS_HELPER_ARG: &str = "__extract-in-userns";
 
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub use extractor::UsernsLayerExtractor;
 #[cfg(target_os = "linux")]
 pub use helper::run_helper_main;
 #[cfg(target_os = "linux")]

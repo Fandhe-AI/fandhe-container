@@ -94,8 +94,10 @@ core の `remove_tree_in_userns` は単一スレッドの fork 前提で tokio �
   create 側が共有する。期限は呼び出し側の `ReleaseBudget` の残りから `JOIN_BUDGET` を引いて 1〜600 秒に丸める（期限なしは 120 秒）。
   同時実行は稼働中 + 回収できていない子の合計が 4 に達したら待たずに `UNAVAILABLE`。回収できなかった子は保持し、次の呼び出しの先頭で
   `try_wait` で掃く。失敗は固定文言の `CriError`（`Timeout`・`FailedPrecondition`・`Unavailable`・`Internal`）で返す
-- 残余: 取り消しの旗は helper の実行中には見られない（開始前だけ）ため、全体の待ちは呼び出し側の期限を最大 `JOIN_BUDGET`（25 秒）
-  超えうる。`PullSession::abort` と起動時の pull 回収 GC は oci 内のホスト側の削除のままで、subuid 所有の残骸（unpack の削除に
+- 期限と取り消し: `UsernsTreeRemover` は呼び出し側の絶対期限と取り消しの旗を `run_bounded` へ渡す。launcher は絶対期限で待ちを
+  制限し、応答待ちの間も 100 ms 間隔（`CANCEL_POLL`）で旗を確認する。どちらかが尽きたら helper を kill・回収して `Timeout` を返す。
+  期限後の kill・回収に要する猶予（`JOIN_BUDGET` とは別）だけが呼び出し側の期限を超えうる。
+- 残余: `PullSession::abort` と起動時の pull 回収 GC は oci 内のホスト側の削除のままで、subuid 所有の残骸（unpack の削除に
   失敗した `staging/<id>`）は消せない（H6 で実害が出る前に別 issue。起票は承認後）。公開済み rootfs の GC は TASK-183 が未実装
 - 有効化: 対応表（`extract_options_for`）が `ChownInUserNamespace` を返すまで本番では通らない。切り替えは H6（#4801）。
   実機試験は `userns_helper_real`（CI への組み込みは H7・#4802）

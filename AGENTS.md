@@ -351,7 +351,7 @@ REPAIR-7 の 5 段階ゲートのうち、(3) タイムアウト保護された�
 
 移し先の項目（元の順序）:
 
-- `kvm_device`・`microvm`・`hvf_device`・`kernel_boot`・`kernel_boot` の aarch64・`hvf_microvm`・`hvf_kernel_boot`・実カーネル用ゲスト資産の用意・`crash_safety`・`power_loss`・`unshare_isolation`・`pod_holder`・`pod_holder_bin_real`・`pod_holder_provider_real`・`privilege_elevate`・`control_audit_delivery`
+- `kvm_device`・`microvm`・`hvf_device`・`kernel_boot`・`kernel_boot` の aarch64・`hvf_microvm`・`hvf_kernel_boot`・実カーネル用ゲスト資産の用意・`crash_safety`・`power_loss`・`unshare_isolation`・`pod_holder`・`pod_holder_bin_real`・`pod_holder_provider_real`・`userns_helper_real`（#4795。CI 未接続は H7〔#4777〕で組み込む）・`privilege_elevate`・`control_audit_delivery`
 - `shim_v2`・`shim_v2_containerd_real`（#3684。`crates/plugin-cri/tests/`）・`shim_v2_kill_all_real`（#4055）・`shim_v2_exec_real`（#4150）・`launcher_entry_real`・`supervisor_bin_real`・`start_scope_real`・`delete_cgroup_real`・`start-test-support` feature・`startup_latency.sh`・`startup_latency`・`exec_subordinate_e2e`・`exec_launch_netns_rootless`・`healthcheck_exec_real`・`stream_exec_real`・`exec_setns_join`
 - `exec_cgroup_kill`・`exec_cgroup_sweep`・`exec_identify_cgroup`・`container_options_ipc`・`pivot_root_isolation`・`namespace_isolation`・`fork_exec_isolation`・`landlock_implicit_dev`・`default_devices`・`readonly_paths`・`masked_paths`・`sysfs_mount`
 - `config_paths`・`config_paths_implicit_dev`・`sec1_core4_task32_device_cgroup_bpf_real_attach`・`cgroup_device_policy_rootful`・`device_cgroup_layers`・`cgroup_device_policy_rootless`・`tmpfs_mount`・`core1_sec1_task29_devpts_real_mount`・`sec1_2536_protected_root_on_real_overlay`・`sec1_2823_overmount_hides_child_in_real_namespace`・`inject_files`・`bind_mounts_real`

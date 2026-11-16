@@ -525,6 +525,18 @@ fn serve(
 }
 
 fn main() -> ExitCode {
+    // userns helper（再 exec された単一スレッドの子。#4795・SEC-5）は引数の解析・tokio・LineSink より前に振り分ける。
+    // 第 1 引数が固定の隠し語のときだけで、それ以外は従来どおり。
+    let mut args = std::env::args_os();
+    let _ = args.next();
+    let first = args.next();
+    if first
+        .as_deref()
+        .is_some_and(|a| a == fandhe_container_plugin_cri::userns_helper::USERNS_HELPER_ARG)
+    {
+        let rest = first.into_iter().chain(args).collect();
+        return fandhe_container_plugin_cri::userns_helper::run_helper_main(rest);
+    }
     match startup::parse_args(std::env::args_os().skip(1)) {
         Ok(Invocation::Help) => {
             print!("{}", startup::usage());

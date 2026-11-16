@@ -13,7 +13,7 @@
 use std::fs::File;
 use std::io::{Read as _, Write as _};
 use std::os::fd::{AsFd as _, OwnedFd};
-use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
+use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -21,7 +21,8 @@ use std::time::Duration;
 
 use fandhe_container_core::traits::ErrorCode;
 use fandhe_container_plugin_cri::userns_helper::wire::{
-    HelperErrorCode, MAX_REQUEST_PAYLOAD_BYTES, Mode, RESPONSE_LEN, Report, decode_response,
+    HelperErrorCode, MAX_REQUEST_PAYLOAD_BYTES, Mode, RESPONSE_LEN, RemoveTarget, Report,
+    decode_response,
 };
 use fandhe_container_plugin_cri::userns_helper::{
     USERNS_HELPER_ARG, UsernsHelperLauncher, WorkBudget,
@@ -221,4 +222,167 @@ fn sec5_4795_helper_exits_when_the_parent_closes_the_socket() {
         HelperErrorCode::RequestTimeout.core_code(),
         ErrorCode::Timeout
     );
+}
+
+/// 木ごと消せる一時ディレクトリ（0555・0000 を含む木を作るため、後始末で権限を戻す）。
+struct Tree(PathBuf);
+
+impl Tree {
+    fn new(tag: &str) -> Self {
+        let p = std::env::temp_dir().join(format!("userns-helper-rm-{tag}-{}", std::process::id()));
+        Self::wipe(&p);
+        std::fs::create_dir(&p).expect("create");
+        Self(p)
+    }
+
+    fn wipe(p: &std::path::Path) {
+        // 権限を戻してから消す（失敗しても試験の結果は変えない）。
+        if std::fs::symlink_metadata(p).is_err() {
+            return;
+        }
+        let _ = std::process::Command::new("chmod")
+            .args(["-R", "u+rwx"])
+            .arg(p)
+            .status();
+        let _ = std::fs::remove_dir_all(p);
+    }
+}
+
+impl Drop for Tree {
+    fn drop(&mut self) {
+        Self::wipe(&self.0);
+    }
+}
+
+fn open_dir(p: &std::path::Path) -> File {
+    File::open(p).expect("open dir")
+}
+
+/// SEC-5・OCI-7・#4800: Remove は fd で渡した親の直下の `rootfs` だけを木ごと消す（0555・0000 のディレクトリを含む）。
+/// 親と、兄弟（`keep`）は残る。
+#[test]
+fn sec5_4800_remove_deletes_only_the_named_child_tree() {
+    let t = Tree::new("ok");
+    let parent = t.0.join("parent");
+    let deep = parent.join("rootfs/a/b");
+    std::fs::create_dir_all(&deep).expect("mkdir");
+    std::fs::write(deep.join("f"), b"x").expect("write");
+    std::fs::create_dir(parent.join("rootfs/a/ro")).expect("mkdir");
+    std::fs::write(parent.join("rootfs/a/ro/g"), b"y").expect("write");
+    std::fs::set_permissions(
+        parent.join("rootfs/a/ro"),
+        std::fs::Permissions::from_mode(0o555),
+    )
+    .expect("chmod");
+    std::fs::create_dir(parent.join("rootfs/a/none")).expect("mkdir");
+    std::fs::set_permissions(
+        parent.join("rootfs/a/none"),
+        std::fs::Permissions::from_mode(0o000),
+    )
+    .expect("chmod");
+    std::fs::create_dir(parent.join("keep")).expect("mkdir");
+
+    let target = open_dir(&parent);
+    let r = launcher()
+        .run(
+            Mode::Remove(RemoveTarget::BundleRootfs),
+            target.as_fd(),
+            budget(),
+        )
+        .expect("remove");
+    assert_eq!(r, Report::Removed);
+    assert!(!parent.join("rootfs").exists());
+    assert!(parent.join("keep").is_dir());
+    assert!(parent.is_dir());
+}
+
+/// SEC-5・#4800: 対象の子が無くても成功する（冪等。kill 後の再実行が続きから消せる）。
+#[test]
+fn sec5_4800_remove_of_a_missing_child_is_ok() {
+    let t = Tree::new("missing");
+    let target = open_dir(&t.0);
+    let r = launcher()
+        .run(
+            Mode::Remove(RemoveTarget::PullUnpack),
+            target.as_fd(),
+            budget(),
+        )
+        .expect("remove");
+    assert_eq!(r, Report::Removed);
+}
+
+/// SEC-5・SEC-1・#4800: 対象の名前が木の外を指す symlink でも辿らない。リンク自体を unlink するだけで、リンク先は消えない
+/// （木の外を消さない）。
+#[test]
+fn sec5_4800_remove_never_follows_a_symlinked_child() {
+    let t = Tree::new("symlink");
+    let outside = t.0.join("outside");
+    std::fs::create_dir(&outside).expect("mkdir");
+    std::fs::write(outside.join("precious"), b"keep").expect("write");
+    let parent = t.0.join("parent");
+    std::fs::create_dir(&parent).expect("mkdir");
+    std::os::unix::fs::symlink(&outside, parent.join("rootfs")).expect("symlink");
+
+    let target = open_dir(&parent);
+    let r = launcher()
+        .run(
+            Mode::Remove(RemoveTarget::BundleRootfs),
+            target.as_fd(),
+            budget(),
+        )
+        .expect("remove");
+    assert_eq!(r, Report::Removed);
+    assert!(std::fs::symlink_metadata(parent.join("rootfs")).is_err());
+    assert_eq!(
+        std::fs::read(outside.join("precious")).expect("link target kept"),
+        b"keep"
+    );
+}
+
+/// REPAIR-2・SEC-5・#4800: Remove の payload の不整合（未知の対象）は `InvalidRequest` で、何も消さない。
+#[test]
+fn sec5_4800_remove_with_an_unknown_target_is_invalid_and_deletes_nothing() {
+    let t = Tree::new("unknown");
+    let parent = t.0.join("parent");
+    std::fs::create_dir_all(parent.join("rootfs")).expect("mkdir");
+    let (child, mut sock) = spawn_raw(open_dir(&parent).into());
+    sock.write_all(&[1, 4, 0, 0, 0, 0, 0, 4, 9, 0, 0, 0])
+        .expect("write");
+    assert_eq!(
+        read_response(&mut sock),
+        Some(Err(HelperErrorCode::InvalidRequest))
+    );
+    assert_eq!(finish(child), 1);
+    assert!(parent.join("rootfs").is_dir());
+}
+
+/// SEC-5・OCI-7・REPAIR-5・#4800: 本番の削除器（`UsernsTreeRemover`）が実バイナリの helper で bundle の `rootfs` を消し、
+/// cri の注入点（`SubordinateTreeRemover`）の契約どおり不在の再実行も成功する。
+#[test]
+fn sec5_4800_remover_removes_the_tree_through_the_real_helper() {
+    use fandhe_container_cri::adapter::ReleaseBudget;
+    use fandhe_container_cri::bundle::{RemovalTarget, SubordinateTreeRemover};
+    use fandhe_container_plugin_cri::userns_helper::UsernsTreeRemover;
+
+    let t = Tree::new("remover");
+    let parent = t.0.join("bundle");
+    std::fs::create_dir_all(parent.join("rootfs/usr/bin")).expect("mkdir");
+    std::fs::write(parent.join("rootfs/usr/bin/sh"), b"#!").expect("write");
+    std::fs::write(parent.join("config.json"), b"{}").expect("write");
+
+    let remover = UsernsTreeRemover::with_launcher_and_limit(launcher(), 2);
+    let budget = ReleaseBudget::new().with_deadline(
+        std::time::Instant::now()
+            + fandhe_container_plugin_cri::userns_helper::JOIN_BUDGET
+            + Duration::from_secs(30),
+    );
+    let dir = open_dir(&parent);
+    remover
+        .remove_child_tree(dir.as_fd(), RemovalTarget::BundleRootfs, &budget)
+        .expect("remove");
+    assert!(!parent.join("rootfs").exists());
+    assert!(parent.join("config.json").is_file());
+    remover
+        .remove_child_tree(dir.as_fd(), RemovalTarget::BundleRootfs, &budget)
+        .expect("idempotent");
 }

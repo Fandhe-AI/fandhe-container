@@ -2454,3 +2454,74 @@ fn oci7_sec1_pull_rejects_swapped_rootfs_dir_and_decoy_stays_empty() {
     assert_eq!(fs::read_dir(real.join("sha256")).expect("real").count(), 0);
     assert!(staging_is_empty(&dir));
 }
+/// 範囲写像で展開した木の削除を helper へ回す分岐の試験（#4800・SEC-5・OCI-7・CORE-6）。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod userns_unpack_removal {
+    use std::os::fd::BorrowedFd;
+
+    use fandhe_container_cri::adapter::ReleaseBudget;
+    use fandhe_container_cri::bundle::{RemovalTarget, SubordinateTreeRemover};
+    use fandhe_container_cri::error::CriError;
+    use fandhe_container_oci::layer::extract::{IdMap, IdRange, OwnershipPolicy};
+
+    use super::*;
+
+    /// 呼び出しを記録するだけの remover（何も消さない）。
+    #[derive(Debug, Default)]
+    struct Recorder(Mutex<Vec<RemovalTarget>>);
+
+    impl SubordinateTreeRemover for Recorder {
+        fn remove_child_tree(
+            &self,
+            _parent: BorrowedFd<'_>,
+            target: RemovalTarget,
+            _budget: &ReleaseBudget<'_>,
+        ) -> Result<(), CriError> {
+            self.0.lock().unwrap().push(target);
+            Ok(())
+        }
+    }
+
+    /// 範囲写像でない展開設定（既定）の pull は従来どおり成功し、remover は呼ばれない（受入基準 2）。
+    #[test]
+    fn sec5_4800_keep_ownership_pull_never_calls_the_remover() {
+        let dir = TempDir::new("rm-keep");
+        let rm = Arc::new(Recorder::default());
+        let client = Arc::new(FakeClient::new(two_layer_manifest()));
+        let puller = OciImagePuller::new(client, config(&dir)).with_tree_remover(rm.clone());
+        puller.pull(&req("alpine:3.20")).expect("pull");
+        assert!(rm.0.lock().unwrap().is_empty());
+        assert!(staging_is_empty(&dir));
+    }
+
+    /// `ChownInUserNamespace` の pull は（user namespace の外では展開が拒否されるが）後始末の `unpack/` を
+    /// `PullUnpack` として remover へ回す。ホスト側の削除へは縮退しない。
+    #[test]
+    fn sec5_4800_userns_ownership_pull_routes_unpack_cleanup_to_the_remover() {
+        let dir = TempDir::new("rm-userns");
+        let rm = Arc::new(Recorder::default());
+        let map = || {
+            IdMap::new(vec![IdRange {
+                container_id: 0,
+                host_id: 100_000,
+                count: 65_536,
+            }])
+            .expect("map")
+        };
+        let mut cfg = config(&dir);
+        cfg.extract_options =
+            cfg.extract_options
+                .clone()
+                .with_ownership(OwnershipPolicy::ChownInUserNamespace {
+                    uid: map(),
+                    gid: map(),
+                });
+        let client = Arc::new(FakeClient::new(two_layer_manifest()));
+        let puller = OciImagePuller::new(client, cfg).with_tree_remover(rm.clone());
+        assert!(puller.pull(&req("alpine:3.20")).is_err());
+        assert_eq!(*rm.0.lock().unwrap(), vec![RemovalTarget::PullUnpack]);
+    }
+}

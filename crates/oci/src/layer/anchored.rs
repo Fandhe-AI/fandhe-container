@@ -173,6 +173,12 @@ mod imp {
             Self { fd }
         }
 
+        /// 保持している開いたディレクトリ fd を借りる（子プロセスの fd 1 として渡す用。パスは渡さない。
+        /// 再 exec helper の削除モードへ親ディレクトリを渡す。SEC-5・OCI-7・#4800）。
+        pub fn as_fd(&self) -> BorrowedFd<'_> {
+            self.fd.as_fd()
+        }
+
         /// 親ディレクトリを信頼済みの接頭辞としてパスで 1 回だけ開き、直下に 0700 のディレクトリ `path` の最終要素を
         /// 新規に作って fd で開く（`mkdirat` → `openat2`。既存は拒否）。create 経路の bundle `rootfs/` 用（OCI-7・SEC-1・
         /// CRI-3・#4283）。以後の展開・chmod・`proc` の作成・passwd の読み取りは返した fd 起点で行い、作成の後に

@@ -274,6 +274,8 @@ struct Env {
     image_id: String,
     config_hex: String,
     layer_hexes: Vec<String>,
+    /// pull と create の両方へ渡す展開設定（既定は `Keep` + `Strip`）。
+    options: ExtractOptions,
 }
 
 impl Env {
@@ -295,6 +297,7 @@ impl Env {
     fn extract_config(&self) -> ImageExtractConfig {
         let mut pull = PullConfig::new(self.cache()).expect("config");
         pull.platform = Platform::new("linux", "amd64", None);
+        pull.extract_options = self.options.clone();
         ImageExtractConfig::from_pull_config(&pull)
     }
     fn provider_with(&self, source: ImageRootfsSource) -> SpecBundleProvider {
@@ -312,6 +315,17 @@ fn pulled_env(tag: &str, config_section: &str) -> Env {
 
 /// 下位層・上位層の tar を指定して pull する（名前つき User の解決用に passwd 等を持つ層を渡す）。
 fn pulled_env_with_layers(tag: &str, config_section: &str, l1: Vec<u8>, l2: Vec<u8>) -> Env {
+    pulled_env_with_options(tag, config_section, l1, l2, ExtractOptions::new())
+}
+
+/// 展開設定を指定して pull する（#4805。pull と create で同じ値を使う）。
+fn pulled_env_with_options(
+    tag: &str,
+    config_section: &str,
+    l1: Vec<u8>,
+    l2: Vec<u8>,
+    options: ExtractOptions,
+) -> Env {
     let tmp = TempDir::new(tag);
     let (h1, h2) = (sha256_hex(&l1), sha256_hex(&l2));
     let config = format!(
@@ -340,6 +354,7 @@ fn pulled_env_with_layers(tag: &str, config_section: &str, l1: Vec<u8>, l2: Vec<
     let blobs = HashMap::from([(hc.clone(), config), (h1.clone(), l1), (h2.clone(), l2)]);
     let mut pull = PullConfig::new(tmp.0.join("cache")).expect("config");
     pull.platform = Platform::new("linux", "amd64", None);
+    pull.extract_options = options.clone();
     let puller = OciImagePuller::new(FakeClient { manifest, blobs }, pull);
     let pulled = puller
         .pull(&PullRequest {
@@ -355,6 +370,7 @@ fn pulled_env_with_layers(tag: &str, config_section: &str, l1: Vec<u8>, l2: Vec<
         image_id: pulled.id,
         config_hex: hc,
         layer_hexes: vec![h1, h2],
+        options,
     }
 }
 
@@ -466,6 +482,185 @@ fn cri2_rootfs_root_is_searchable_by_non_root_users() {
         0o755
     );
     assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o777, 0o700);
+}
+
+/// 展開プロセス自身の euid / egid へ写す `PreserveIfOwnerMapped`（plugin-cri の `RootlessSingleId` と同じ値。#4805）。
+/// `owner` は試験が作った（= 自分の uid / gid で所有する）ディレクトリ。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn preserve_options_for(owner: &Path) -> ExtractOptions {
+    use fandhe_container_oci::layer::extract::IdRange;
+    let m = fs::metadata(owner).expect("owner metadata");
+    ExtractOptions::new().with_special_bits(SpecialBitsPolicy::PreserveIfOwnerMapped {
+        uid: IdRange {
+            container_id: 0,
+            host_id: m.uid(),
+            count: 1,
+        },
+        gid: IdRange {
+            container_id: 0,
+            host_id: m.gid(),
+            count: 1,
+        },
+    })
+}
+
+/// setuid / setgid を含む層（tar の uid / gid は 0）。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn special_layer() -> Vec<u8> {
+    tar_of(&[
+        tar_entry("bin/", 0o755, b"", true),
+        tar_entry("bin/su", 0o4755, b"su", false),
+        tar_entry("bin/sg", 0o2755, b"sg", false),
+    ])
+}
+
+/// SEC-5・SEC-1・OCI-2・#4805: 単一 ID の `PreserveIfOwnerMapped` で、根が 0755 でも bundle ディレクトリ（0700）を祖先に
+/// 閉じ込めが成り立ち、bundle とキャッシュの両方で setuid / setgid が残る。対照の `Strip` では落ちる。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[test]
+fn sec5_4805_single_id_setuid_bits_survive_in_bundle_rootfs() {
+    let probe = TempDir::new("4805-owner");
+    let opts = preserve_options_for(&probe.0);
+    let env = pulled_env_with_options("4805-keep", CONFIG_SECTION, special_layer(), layer2(), opts);
+    let dir = prepare(&env.provider(), "ctr-4805", &container(&env.image_id)).expect("prepare");
+    let mode = |p: PathBuf| fs::symlink_metadata(p).unwrap().mode() & 0o7777;
+    assert_eq!(mode(dir.join("rootfs/bin/su")), 0o4755);
+    assert_eq!(mode(dir.join("rootfs/bin/sg")), 0o2755);
+    assert_eq!(mode(dir.join("rootfs")), 0o755);
+    assert_eq!(mode(dir.clone()), 0o700);
+    assert_eq!(
+        fs::metadata(&dir).unwrap().uid(),
+        fs::metadata(&probe.0).unwrap().uid()
+    );
+    // キャッシュの公開済み根は 0700 のままで、そこでも保持される（pull は祖先を渡さず根自身で判定する）。
+    assert_eq!(mode(env.entry().join("rootfs/bin/su")), 0o4755);
+    assert_eq!(mode(env.entry().join("rootfs")), 0o700);
+
+    let strip = pulled_env_with_layers("4805-strip", CONFIG_SECTION, special_layer(), layer2());
+    let dir = prepare(&strip.provider(), "ctr-4805", &container(&strip.image_id)).expect("prepare");
+    assert_eq!(mode(dir.join("rootfs/bin/su")), 0o755);
+    assert_eq!(mode(dir.join("rootfs/bin/sg")), 0o755);
+}
+
+/// SEC-5・CRI-2・#4805: `PreserveIfOwnerMapped` でもコンテナの `/` は 0755、bundle ディレクトリは 0700 のまま。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[test]
+fn sec5_4805_rootfs_root_stays_searchable_with_preserve() {
+    let probe = TempDir::new("4805-owner2");
+    let opts = preserve_options_for(&probe.0);
+    let env = pulled_env_with_options("4805-mode", CONFIG_SECTION, layer1(), layer2(), opts);
+    let dir = prepare(&env.provider(), "ctr-mode", &container(&env.image_id)).expect("prepare");
+    assert_eq!(
+        fs::metadata(dir.join("rootfs")).unwrap().mode() & 0o777,
+        0o755
+    );
+    assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o777, 0o700);
+}
+
+/// SEC-5・SEC-1・OCI-2・#4805（実機前提・root 必須。CI では回さない。手順は docs/verification/real-machine-tests.md）:
+/// uid U1 が作った setuid ファイルへ、別の uid U2 が bundle ディレクトリ（0700）の下から到達できない（EACCES）。
+/// 親（root）が U1 / U2 の子として本ファイルの試験バイナリを再実行する。root でなければ fail-closed で失敗する。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[test]
+#[ignore = "requires root to run as two distinct unprivileged uids (SEC-5, SEC-1, OCI-2, #4805)"]
+fn sec5_4805_other_uid_cannot_reach_below_bundle_ancestor_real() {
+    use std::os::unix::process::CommandExt as _;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    const NAME: &str = "sec5_4805_other_uid_cannot_reach_below_bundle_ancestor_real";
+    const U1: u32 = 61_001;
+    const U2: u32 = 61_002;
+
+    // 子 1: 作業ディレクトリの所有者として pull + prepare し、bundle のパスを出して残す。
+    if std::env::var_os("FC_4805_CHILD").is_some() {
+        let probe = TempDir::new("4805-child-owner");
+        let opts = preserve_options_for(&probe.0);
+        let env =
+            pulled_env_with_options("4805-real", CONFIG_SECTION, special_layer(), layer2(), opts);
+        let dir = prepare(&env.provider(), "ctr-real", &container(&env.image_id)).expect("prepare");
+        assert_eq!(
+            fs::symlink_metadata(dir.join("rootfs/bin/su"))
+                .unwrap()
+                .mode()
+                & 0o7777,
+            0o4755
+        );
+        println!("BUNDLE={}", dir.display());
+        std::mem::forget(env);
+        std::mem::forget(probe);
+        return;
+    }
+    // 子 2: 別 uid からの到達（EACCES）を観測する。
+    if let Some(b) = std::env::var_os("FC_4805_PROBE") {
+        let b = PathBuf::from(b);
+        let e = fs::symlink_metadata(b.join("rootfs/bin/su")).expect_err("must be unreachable");
+        assert_eq!(e.raw_os_error(), Some(13), "{e}");
+        let e = fs::read_dir(&b).expect_err("must be unreadable");
+        assert_eq!(e.raw_os_error(), Some(13), "{e}");
+        println!("PROBE-OK");
+        return;
+    }
+
+    let me = fs::metadata("/proc/self").expect("proc").uid();
+    assert_eq!(me, 0, "PRECONDITION FAILED: this test requires root");
+    let work = TempDir::new("4805-real-work");
+    std::os::unix::fs::chown(&work.0, Some(U1), Some(U1)).expect("chown work dir");
+    let exe = std::env::current_exe().expect("exe");
+    let run = |uid: u32, key: &str, val: &str| -> String {
+        let mut child = Command::new(&exe)
+            .args([
+                "--ignored",
+                "--exact",
+                NAME,
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(key, val)
+            .env("TMPDIR", &work.0)
+            .uid(uid)
+            .gid(uid)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn");
+        // 期限つきで回収する（REPAIR-5）。出力は小さいため終了後に読んでも pipe は詰まらない。
+        let start = Instant::now();
+        while child.try_wait().expect("wait").is_none() {
+            if start.elapsed() > Duration::from_secs(120) {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("child deadline exceeded");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let mut out = String::new();
+        std::io::Read::read_to_string(&mut child.stdout.take().unwrap(), &mut out).unwrap();
+        out
+    };
+    let out = run(U1, "FC_4805_CHILD", "1");
+    let bundle = out
+        .lines()
+        .find_map(|l| l.strip_prefix("BUNDLE="))
+        .expect("bundle path")
+        .to_owned();
+    let out = run(U2, "FC_4805_PROBE", &bundle);
+    assert!(out.contains("PROBE-OK"), "other uid probe failed: {out}");
 }
 
 /// CRI-2: CRI の command・args・envs・working_dir がイメージ既定値を置き換える。

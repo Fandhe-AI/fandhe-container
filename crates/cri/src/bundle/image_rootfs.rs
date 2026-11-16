@@ -12,7 +12,7 @@
 //! （コンテナの書き込みがキャッシュと次回以降の create に届くため）。ここでは公開済みエントリを「pull が検証を完了した」
 //! 印と展開記録（`unpack-record`）の置き場としてだけ読み、**キャッシュの検証済み layer blob から bundle の `rootfs/` へ
 //! 再展開**する（コンテナごとの私有の木ができる。複製の一形態）。pull と同じ入口（`VerifiedLayerBlob::from_file` →
-//! `extract_image_layers_bounded_in`）を通すため、所有者の写像・特殊ビット・展開上限・diff_id 照合は pull と同一になる。
+//! `extract_image_layers_confined_in`）を通すため、所有者の写像・特殊ビット・展開上限・diff_id 照合は pull と同一になる。
 //!
 //! 代償: create ごとに展開のコスト（時間・ディスク）がかかる。overlay の下位層にする最適化は `mount(2)` の `unsafe` を
 //! 要し、本 crate には `sys` モジュールが無いため未実装（REPAIR-3）。
@@ -32,7 +32,7 @@
 //! 5. layer は記録の `layer=` 行から得る。件数は config の `diff_ids` と一致を要求し、各 blob は 1 回だけ開いた
 //!    ハンドルの fstat のサイズで `VerifiedLayerBlob::from_file`（信頼条件・digest・サイズ照合）してから展開する
 //! 6. 展開先の bundle `rootfs/` は、`SpecBundleProvider` が fd で保持する bundle ディレクトリ（`BundleDir`）の直下に
-//!    `mkdirat` → `openat2` で作って fd で受け（親をパスで開き直さない。#4321）、展開（`extract_image_layers_bounded_in`）・chmod・`proc` の作成・passwd / group の読み取りを
+//!    `mkdirat` → `openat2` で作って fd で受け（親をパスで開き直さない。#4321）、展開（`extract_image_layers_confined_in`。祖先は bundle ディレクトリ）・chmod・`proc` の作成・passwd / group の読み取りを
 //!    同じ fd 起点で行う。最後に根のパスが開いた根と同じ実体であることを照合し、差し替えを成功に見せない（検出時は
 //!    `FAILED_PRECONDITION`。パス起点の削除でおとりを消さない）
 //!
@@ -63,8 +63,9 @@
 //!   `INVALID_ARGUMENT`、安全に読めない場合は `FAILED_PRECONDITION`、読む手段が無い場合は `UNIMPLEMENTED`。
 //!   数字だけの名前は拒否する（数値は `run_as_user`。containerd は uid 扱いの既知の差）
 //! - **展開設定**: 所有者・特殊ビットの本番の値は plugin-cri が start と同じ権限モデルの解決から選ぶ（#2792）が、
-//!   現状はどの権限モデルでも既定の `Keep` + `Strip`。特殊ビットを保持する `PreserveIfOwnerMapped` は、展開後に
-//!   `open_rootfs_for_search` が rootfs を 0755 にするため「root を使い終わるまで 0700 に保つ」契約と両立せず保持しない。
+//!   `RootlessSingleId` は `Keep` + `PreserveIfOwnerMapped`、他は既定の `Keep` + `Strip`。展開後に
+//!   `open_rootfs_for_search` が rootfs を 0755 にするため、閉じ込めは 0700 の bundle ディレクトリを祖先として oci へ渡して
+//!   判定する（#4805）。pull（キャッシュ）は祖先を渡さず、展開の根自身の 0700 で判定する（`image_pull` の doc）。
 //!   `ChownInUserNamespace` は記録の符号化が済み（#4796）、subuid 所有の木の削除は注入点 `SubordinateTreeRemover` 経由で
 //!   再 exec helper の削除モードへ回す（#4800。`release_bounded`・展開失敗時の後始末。未注入ならホスト側へ縮退せず
 //!   `FAILED_PRECONDITION`）。展開本体と対応表の切り替えは #4777 の H2・H6
@@ -90,7 +91,7 @@ use fandhe_container_oci::image_management::{ImageStore as OciImageStore, Publis
 use fandhe_container_oci::instrument::{NoopOciOpRecorder, OciOpRecorder};
 use fandhe_container_oci::layer::extract::{
     ExtractBudget, ExtractLimits, ExtractOptions, ExtractRoot, ImageLayer,
-    extract_image_layers_bounded_in,
+    extract_image_layers_confined_in,
 };
 use fandhe_container_oci::layer::{
     BlobFileFacts, VerifiedLayerBlob, check_blob_trust, read_rootfs_file_in,
@@ -902,10 +903,13 @@ impl RootfsSource for ImageRootfsSource {
         if let Some(c) = cancel {
             budget = budget.with_cancel(c);
         }
-        let extracted = extract_image_layers_bounded_in(
+        // 祖先は常に渡す（`Strip`・`PreserveIfChowned` では oci が使わない）。根は後で 0755 になるため、
+        // `PreserveIfOwnerMapped` の閉じ込めは 0700 の bundle ディレクトリで判定させる（#4805）。
+        let extracted = extract_image_layers_confined_in(
             self.recorder.as_ref(),
             &image_layers,
             &root,
+            Some(bundle.as_extract_root()),
             self.config.max_uncompressed_layer_bytes,
             self.config.extract_limits,
             opts,

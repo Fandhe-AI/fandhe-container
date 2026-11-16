@@ -94,6 +94,10 @@ impl<'a> UserResolveRequest<'a> {
 /// 作成・解放を、パスで開き直さずこの fd 起点で行う（bundle の親を symlink へ差し替えられても、おとりの木を作らず消さない）。
 /// 子の名前は `rootfs` / `config.json` / `resolv.conf` の固定値に閉じる。[`Self::path`] は `PreparedBundle` と
 /// `config.json` の bind source に載せる表示・引き渡し用のパスで、操作には使わない。
+///
+/// 契約（#4805・SEC-5）: bundle ディレクトリは 0700 で作り、rootfs を使い終わる（`release`）まで 0700 に保つ。
+/// rootfs 自体は展開後に 0755 になるため、setuid / setgid の保持（`PreserveIfOwnerMapped`）の閉じ込めは
+/// このディレクトリを祖先として oci へ渡して判定する（`as_extract_root`）。
 #[derive(Debug)]
 pub struct BundleDir {
     dir: ExtractRoot,
@@ -110,6 +114,11 @@ impl BundleDir {
             dir: ExtractRoot::open_existing_dir(path)?,
             path: path.to_path_buf(),
         })
+    }
+
+    /// 閉じ込めの祖先として oci の展開へ渡す fd（`extract_image_layers_confined_in` の `ancestor`。#4805）。
+    pub(crate) fn as_extract_root(&self) -> &ExtractRoot {
+        &self.dir
     }
 
     #[cfg(all(

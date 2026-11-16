@@ -198,8 +198,6 @@ tar のコンテナ内 ID をそのまま `chown` する（namespace の中で�
 - rootless の user namespace へ入って `ImageRootfsUnpacker::unpack` を呼ぶ core 側の配線（子プロセス方式。tokio の
   マルチスレッドの pull 経路ではプロセス内で入れない）と、subuid 所有の rootfs の削除経路（#2315・#482）。
   `PreserveIfOwnerMapped` の rootless 経路（`chown` しない 1 行の写像）は従来どおり
-- 0700 の祖先での閉じ込め（#4804）の cri・plugin-cri への結線（S2）。oci 側の入口は実装済みで、本番の呼び出し元はまだ祖先を
-  渡さない（複数範囲の写像でコンテナ内の非 root ユーザーが `/` を辿れるようにするため。結線までは `root` が 0700 でコンテナ root だけが辿れる）
 - macOS・Windows・Linux の他アーキテクチャでの、展開と公開の `remove_extracted_tree` のディレクトリ fd 起点の解決（#2598 で
   広げないと決めた）。パス起点のままで、確認から使用までの TOCTOU と、木の中に残ったマウントの中身の削除を防げない。理由:
   特殊ビットの保持は Linux 限定で SEC-5 の TOCTOU は Linux 固有／macOS・Windows の本番経路は cli の `non_linux_failure` が先に
@@ -208,14 +206,20 @@ tar のコンテナ内 ID をそのまま `chown` する（namespace の中で�
   ゲストが共有ディレクトリへ書き込みうる設計（`macos-shared-vm.md`）になれば優先度が上がる
 - 本番の呼び出し元の配線（#2534・#2792）: plugin-cri の `extract_identity` が start と同じ権限モデルの解決から
   `ExtractOptions` を選び、pull と create へ 1 回の解決結果を渡す（失敗は縮退せず fail-closed）。対応表は現状すべて
-  `Keep` + `Strip`: ホスト root は本番の start が無く（#2241 D1:A。`ChownMapped` の本番の消費者が無い）、SingleId は `Keep` が正しく、
+  `Keep` + `Strip`（`RootlessSingleId` だけ #4805 で `Keep` + `PreserveIfOwnerMapped`（コンテナの 0 → 展開プロセスの euid / egid））:
+  ホスト root は本番の start が無く（#2241 D1:A。`ChownMapped` の本番の消費者が無い）、
   SubordinateIds の `ChownInUserNamespace` は tokio のマルチスレッドから user namespace に入れず未配線。
-  `PreserveIfOwnerMapped` は cri の `open_rootfs_for_search` が展開後に rootfs を 0755 にするため oci の「root を 0700 に保つ」
-  契約と両立せず、有効にしない（oci 側は #4804 で祖先を渡せるようにした。cri からの結線は S2）。
+  閉じ込めの祖先（#4805）: create は `<bundles>/<id>`（`SpecBundleProvider` が `create_child_private_dir` で毎回新規に 0700 で作り
+  fd で保持する `BundleDir`）を渡し、直下の `rootfs/` は展開後に 0755 になっても閉じ込めが成り立つ。bundle ディレクトリの mode を
+  変える経路は無く、oci が展開の開始・各判定・終了時に `fstat` で再確認する。pull は祖先を渡さず、毎回新規の 0700 の根
+  （`staging/<id>/unpack/entry/rootfs`。公開後も 0700）自身で判定する（`unpack/` は公開の `renameat` 後に祖先でなくなる。
+  キャッシュ root・`rootfs/sha256` の権限基準 #2547 にも依存しない）。切り替え前に SingleId で pull した既存エントリは記録が
+  `special-bits=strip` のため `FAILED_PRECONDITION`（`image rootfs cache entry was unpacked with different settings`）で
+  拒否される。該当の `<cache>/rootfs/sha256/<hex>` を手動で消して pull し直す（自動移行は未実装）。
   再 exec する helper の入口（隠し引数・親側の起動部品・参加・結果の返却）は #4795 で実装済み
   （[userns-extract-helper.md](./userns-extract-helper.md)。削除 H3 は #4800 で実装済み。展開 H2・対応表の切り替え H6・CI H7 は未）。
   残り（後続 issue・要起票）: `ChownInUserNamespace` の展開本体・記録の符号化・
-  `image_ownership` の置き場所・`PreserveIfOwnerMapped` の前提整合。
+  `image_ownership` の置き場所。
   pull と create は `ImageExtractConfig` の 1 か所から同じ値を配る（食い違うと記録の照合で `FAILED_PRECONDITION`）。配線するときの確認事項: `ChownMapped` で展開した rootfs に、
   0700 の bundle 配下から写像先の uid で到達できること（core の launcher 側。SEC-5・CRI-2）の試験を同時に足す
 - `IdMap` と core の `IdMapSet` を下位 crate へ共通化するかどうか（crate 境界の判断）
@@ -227,6 +231,10 @@ tar のコンテナ内 ID をそのまま `chown` する（namespace の中で�
 - 拒否の message の使い分け: `layer.rs` の非 unix の `Unimplemented` は固定文言 `verified blob access is not supported on non-unix hosts`（定数 `NON_UNIX_VERIFIED_BLOB_UNSUPPORTED_MESSAGE`）に揃えた。ImageStore 側の stub（`pull.rs`）は `ImageStore::open` の恒久拒否と同じ `windows_host_rejected()`（`FailedPrecondition`）を返す。
 
 ## 試験との対応
+
+cri 側（#4805）: `crates/cri/tests/bundle_image_rootfs.rs` の `sec5_4805_single_id_setuid_bits_survive_in_bundle_rootfs`・
+`sec5_4805_rootfs_root_stays_searchable_with_preserve`、実機前提（root）の `sec5_4805_other_uid_cannot_reach_below_bundle_ancestor_real`。
+plugin-cri の対応表は `extract_identity.rs` の `sec5_oci1_2792_extract_options_table`。
 
 祖先での閉じ込め（#4804）: `extract.rs` の `anchored_tests`（`sec5_ancestor_0700_allows_bits_with_root_0755`・
 `sec5_ancestor_equal_to_root_is_beneath`・`sec5_ancestor_0750_is_rejected`・`sec5_ancestor_owner_mismatch_is_rejected`・

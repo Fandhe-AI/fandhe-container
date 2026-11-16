@@ -2574,13 +2574,19 @@ mod tests {
         ));
         let backends = CriPluginBackends::new(rt, store, Arc::new(UnimplementedNetwork))
             .with_extract_identity_resolver(|| {
-                Ok(crate::extract_identity::ExtractIdentity::RootlessSingleId)
+                Ok(crate::extract_identity::ExtractIdentity::RootlessSingleId {
+                    uid: 1000,
+                    gid: 1000,
+                })
             });
         let opts = backends.extract_options().expect("resolved");
         assert_eq!(
             opts,
             crate::extract_identity::extract_options_for(
-                &crate::extract_identity::ExtractIdentity::RootlessSingleId
+                &crate::extract_identity::ExtractIdentity::RootlessSingleId {
+                    uid: 1000,
+                    gid: 1000,
+                }
             )
         );
         let pull = production_pull_config(&dir, &opts).expect("pull");
@@ -2613,7 +2619,10 @@ mod tests {
         )
         .with_extract_identity_resolver(move || {
             c.fetch_add(1, Ordering::SeqCst);
-            Ok(crate::extract_identity::ExtractIdentity::RootlessSingleId)
+            Ok(crate::extract_identity::ExtractIdentity::RootlessSingleId {
+                uid: 1000,
+                gid: 1000,
+            })
         });
         let a = ok.extract_options().expect("first");
         let b = ok.extract_options().expect("second");

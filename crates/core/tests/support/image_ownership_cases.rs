@@ -5,6 +5,7 @@
 //! 取り込み元（2 か所。grep: `image_ownership_cases`）: `crates/cli/tests/image_ownership_fixture.rs`・
 //! `crates/plugin-cri/tests/image_ownership_fixture.rs`。両者が同じ本ファイルと fixture を読むので、
 //! 変換規則を片方だけ変えるとその crate の試験が落ちる。規則を変えるときは fixture と 2 か所の変換を同じ PR で直す。
+//! 列数の不一致は行番号と行の内容つきで失敗する（REPAIR-12・#4841）。
 //! 入力は本番と同じ `SubordinateIdSource::with_id_files` → `resolve_id_maps` の経路に通す（passwd・NSS は通さない）。
 #[path = "scratch_root.rs"]
 mod scratch_root;
@@ -46,7 +47,20 @@ pub fn run(
             continue;
         }
         let f: Vec<&str> = line.split('\t').collect();
-        let (resolution, uid, gid, want) = match f[0] {
+        let kind = f[0];
+        let want_cols = match kind {
+            "single" => 4,
+            "sub" => 7,
+            k => panic!("line {}: unknown kind {k}", n + 1),
+        };
+        if f.len() != want_cols {
+            panic!(
+                "line {}: kind {kind} expects {want_cols} tab-separated columns, got {}: {line:?}",
+                n + 1,
+                f.len()
+            );
+        }
+        let (resolution, uid, gid, want) = match kind {
             "single" => {
                 singles += 1;
                 (RootlessIdResolution::SingleId, f[1], f[2], f[3])
@@ -63,7 +77,11 @@ pub fn run(
             }
             k => panic!("line {}: unknown kind {k}", n + 1),
         };
-        let (uid, gid) = (uid.parse().unwrap(), gid.parse().unwrap());
+        let parse = |what: &str, v: &str| -> u32 {
+            v.parse()
+                .unwrap_or_else(|e| panic!("line {}: invalid {what} {v:?}: {e}: {line:?}", n + 1))
+        };
+        let (uid, gid) = (parse("uid", uid), parse("gid", gid));
         for in_ns in [false, true] {
             let got = convert(&resolution, uid, gid, in_ns);
             let ctx = format!("line {} in_ns={in_ns}: {line}", n + 1);
@@ -72,7 +90,12 @@ pub fn run(
                 assert_eq!(format!("{:?}", e.code()), code, "{ctx}");
                 continue;
             }
-            let (u, g) = want.strip_prefix("ok:").unwrap().split_once(';').unwrap();
+            let (u, g) = want
+                .strip_prefix("ok:")
+                .and_then(|w| w.split_once(';'))
+                .unwrap_or_else(|| {
+                    panic!("{ctx}: expectation must be err:<code> or ok:<uid rows>;<gid rows>")
+                });
             let p = got.expect(&ctx);
             let (pu, pg) = match (&p, in_ns) {
                 (OwnershipPolicy::ChownMapped { uid, gid }, false)
@@ -93,7 +116,7 @@ pub fn run(
     }
     // 0 件・偏りで通ることを防ぐ。
     assert!(
-        singles >= 3 && subs >= 10 && oks >= 5 && errs >= 6,
+        singles >= 3 && subs >= 26 && oks >= 11 && errs >= 18,
         "{singles} {subs} {oks} {errs}"
     );
 }

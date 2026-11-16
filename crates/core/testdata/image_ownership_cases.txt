@@ -5,6 +5,7 @@
 #   sub<TAB>所有者名（- は無し）<TAB>uid<TAB>gid<TAB>subuid の行（| 区切り・- は空）<TAB>subgid の行（同）<TAB>期待
 #   期待: ok:<uid 行>;<gid 行>（行は container:host:count を , 区切り）または err:<ErrorCode の Debug 名>
 #
+# 列数は single=4・sub=7。合わない行はドライバが行番号と行の内容つきで失敗させる（REPAIR-12・#4841）。
 # 期待値は実装の出力ではなく手計算で書く。読む側: crates/core/tests/support/image_ownership_cases.rs を
 # crates/cli/tests/image_ownership_fixture.rs と crates/plugin-cri/tests/image_ownership_fixture.rs が取り込む。
 # 片方の変換だけ直すと、その crate の試験が落ちる。
@@ -28,3 +29,26 @@ sub	alice	1000	1000	alice:4294967295:1	alice:200000:65536	err:InvalidArgument
 sub	alice	1000	1000	alice:100000:65536	-	err:FailedPrecondition
 sub	alice	1000	1000	bob:100000:65536	alice:200000:65536	err:FailedPrecondition
 sub	alice	1000	1000	alice:notanumber:65536	alice:200000:65536	err:InvalidArgument
+
+# 境界: count=0（所有者の行は拒否・他人の行は読み飛ばす）
+sub	alice	1000	1000	alice:100000:0	alice:200000:65536	err:InvalidArgument
+sub	alice	1000	1000	alice:100000:65536	alice:200000:0	err:InvalidArgument
+sub	alice	1000	1000	bob:100000:0|alice:100000:5	alice:200000:5	ok:0:1000:1,1:100000:5;0:1000:1,1:200000:5
+
+# 境界: u32 の上端（host+count が 2^32 超は core、ちょうど 2^32 は oci の IdMap が拒否）
+sub	alice	1000	1000	alice:4294967290:100	alice:200000:65536	err:InvalidArgument
+sub	alice	1000	1000	alice:4294967286:10	alice:200000:1	err:InvalidArgument
+sub	alice	1000	1000	alice:4294967285:10	alice:200000:1	ok:0:1000:1,1:4294967285:10;0:1000:1,1:200000:1
+
+# 境界: subgid 側だけが上端
+sub	alice	1000	1000	alice:100000:65536	alice:4294967295:1	err:InvalidArgument
+sub	alice	1000	1000	alice:100000:65536	alice:4294967286:10	err:InvalidArgument
+
+# 境界: 重複・隣接（container 側は rootless_mapping が連番で振るため入力で表せない。隣接した連番になることと host 側の重複拒否で見る）
+sub	alice	1000	1000	alice:100000:1000|alice:101000:1000	alice:200000:5	ok:0:1000:1,1:100000:1000,1001:101000:1000;0:1000:1,1:200000:5
+sub	alice	1000	1000	alice:100000:1000|alice:100500:1000	alice:200000:5	err:InvalidArgument
+sub	alice	1000	1000	alice:100000:10|alice:100000:10	alice:200000:5	err:InvalidArgument
+sub	alice	1000	1000	alice:1001:10	alice:200000:5	ok:0:1000:1,1:1001:10;0:1000:1,1:200000:5
+sub	alice	1000	1000	alice:990:10	alice:200000:5	ok:0:1000:1,1:990:10;0:1000:1,1:200000:5
+sub	alice	1000	1000	alice:995:10	alice:200000:5	err:InvalidArgument
+sub	alice	1000	2000	alice:100000:5	alice:1995:10	err:InvalidArgument

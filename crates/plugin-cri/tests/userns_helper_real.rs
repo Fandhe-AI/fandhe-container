@@ -448,7 +448,7 @@ mod linux {
         use fandhe_container_oci::layer::DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES;
         use fandhe_container_oci::layer::VerifiedLayerBlob;
         use fandhe_container_oci::layer::extract::{
-            ExtractLimits, ExtractRoot, ImageLayer, OwnershipPolicy, SpecialBitsPolicy,
+            ExtractLimits, ExtractRoot, IdMap, ImageLayer, OwnershipPolicy, SpecialBitsPolicy,
         };
         use fandhe_container_oci::reference::Digest;
         use fandhe_container_plugin_cri::extract_identity::{
@@ -462,8 +462,8 @@ mod linux {
         let (uid_map, gid_map) = expected_maps();
         if options.ownership
             != (OwnershipPolicy::ChownInUserNamespace {
-                uid: uid_map,
-                gid: gid_map,
+                uid: uid_map.clone(),
+                gid: gid_map.clone(),
             })
             || options.special_bits != SpecialBitsPolicy::Strip
         {
@@ -529,20 +529,37 @@ mod linux {
                 other => fail(&format!("stat {rel}: {other:?}")),
             }
         };
-        for (rel, want) in [
-            ("d", (1000, 1000, 0o755)),
-            ("d/f", (1000, 1000, 0o644)),
+        // 名前空間の中から見た所有者は StatTarget で確かめる（StatTarget はディレクトリだけを受ける）。
+        let got = stat("d");
+        if got != (1000, 1000, 0o755) {
+            fail(&format!("d: got {got:?}, want (1000, 1000, 0o755)"));
+        }
+        // ファイルはホスト側で確かめる: 所有者は tar の値を写像で変換したホストの ID、mode はホストから見ても同じ値
+        // （setuid・setgid が落ちたことはここで分かる）。
+        let host_of = |map: &IdMap, id: u32| {
+            map.map_to_host(id)
+                .unwrap_or_else(|| fail(&format!("id {id} is not in the subordinate map")))
+        };
+        for (rel, owner, want_mode) in [
+            ("d/f", 1000, 0o644),
             // tar の uid 0 は名前空間の root。setuid（04755）は落ちて 0755。
-            ("d/s", (0, 0, 0o755)),
+            ("d/s", 0, 0o755),
             // setgid（02755）も落ちて 0755。
-            ("d/g", (1000, 1000, 0o755)),
+            ("d/g", 1000, 0o755),
         ] {
-            let got = stat(rel);
+            let m = std::fs::metadata(bundle.join("rootfs").join(rel))
+                .unwrap_or_else(|e| fail(&format!("stat {rel} on the host: {e}")));
+            let got = (m.uid(), m.gid(), m.mode() & 0o7777);
+            let want = (
+                host_of(&uid_map, owner),
+                host_of(&gid_map, owner),
+                want_mode,
+            );
             if got != want {
-                fail(&format!("{rel}: got {got:?}, want {want:?}"));
+                fail(&format!("{rel} on the host: got {got:?}, want {want:?}"));
             }
         }
-        // 陽性対照: ホストから見た d の所有者は subuid の範囲の値。mode はホストでも同じ（setuid が無い）。
+        // 陽性対照: ホストから見た d の所有者は subuid の範囲の値（自分の uid・0・tar の値のままではない）。
         let host = std::fs::metadata(bundle.join("rootfs/d"))
             .unwrap_or_else(|e| fail(&format!("stat d on the host: {e}")));
         if host.uid() == 1000 || host.uid() == me || host.uid() == 0 {
@@ -550,10 +567,6 @@ mod linux {
                 "host-side owner is not subordinate: {}",
                 host.uid()
             ));
-        }
-        if std::fs::metadata(bundle.join("rootfs/d/s")).map_or(true, |m| m.mode() & 0o7777 != 0o755)
-        {
-            fail("host-side mode of d/s is not 0755");
         }
         let bundle_fd = File::open(&bundle).unwrap_or_else(|e| fail(&format!("open bundle: {e}")));
         match launcher.run(

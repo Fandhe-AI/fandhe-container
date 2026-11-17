@@ -2109,7 +2109,7 @@ jobs:
             --log "${log}" --select '^(ok: [a-z_0-9]+|test staged_blob_owner [.][.][.] ok)$' --min 6 \
             --forbid 'staged_blob_owner: ignored' --forbid 'not applicable' --forbid 'FAIL:' --summary
 
-      # userns_helper_real（`crates/plugin-cri/tests/userns_helper_real.rs`。SEC-5・OCI-1・OCI-2・OCI-7・REPAIR-7・REPAIR-12・#4802）:
+      # userns_helper_real（`crates/plugin-cri/tests/userns_helper_real.rs`。SEC-5・OCI-1・OCI-2・OCI-7・REPAIR-7・#4802）:
       # plugin-cri の再 exec helper（`__extract-in-userns`）を本番の参加経路で通す実機前提テスト（harness = false。Inspect・
       # StatTarget・Remove・Extract・対応表の 5 行）。範囲写像は常に必須で opt-in の変数は読まないため
       # FANDHE_CONTAINER_TEST_ID_HELPER・USER は渡さない。AppArmor の緩和と範囲写像の前提確認に依存する。cgroup を使わないため
@@ -2128,9 +2128,12 @@ jobs:
           log="${RUNNER_TEMP}/userns_helper_real.log"
           scripts/run-with-deadline.sh --name userns_helper_real --deadline 240 --log "${log}" -- \
             cargo test -p fandhe-container-plugin-cri --test userns_helper_real -- --ignored
+          sel='^userns_helper_real: (inspect joined|stat target owner is namespace root|'
+          sel="${sel}remove subordinate-owned tree|extract keeps tar owners in namespace|"
+          sel="${sel}table row extracts with tar owners and strips special bits) ok "
           scripts/check-success-lines.sh --name userns_helper_real --src crates/plugin-cri/tests/userns_helper_real.rs \
             --log "${log}" \
-            --select '^userns_helper_real: (inspect joined|stat target owner is namespace root|remove subordinate-owned tree|extract keeps tar owners in namespace|table row extracts with tar owners and strips special bits) ok ' \
+            --select "${sel}" \
             --min 5 \
             --forbid 'userns_helper_real: ignored' --forbid 'not applicable' --forbid 'skipped' \
             --forbid 'PRECONDITION FAILED' --forbid 'WATCHDOG EXPIRED' --forbid 'root=true' --forbid 'FAILED' --summary

@@ -4,7 +4,7 @@
 //! 必要環境: 非 root・非特権 user namespace を許す環境（`kernel.apparmor_restrict_unprivileged_userns` の緩和など）・
 //! `uidmap`（`newuidmap` / `newgidmap`）・自分の subuid / subgid の行・Linux 6.9 以降（範囲写像の helper の停止手段）。
 //! `harness = false` で `-- --ignored` 指定時のみ動かす（AGENTS.md）。前提の欠落・root は終了コード 1（成功を装わない）。
-//! 全体 watchdog は 120 秒で、超えたら `WATCHDOG EXPIRED` と終了コード 124。CI への組み込みは H7（本 issue の範囲外）。
+//! 全体 watchdog は 120 秒で、超えたら `WATCHDOG EXPIRED` と終了コード 124。CI へは platform-ci の ubuntu に組み込み済み（#4802）。
 //!
 //! # シナリオ（各成功行は固定の文字列。`scripts/check-success-lines.sh` が本ファイルのリテラルから導出して照合する）
 //! - Inspect: 参加後に joined・euid 0・egid 0・threads 1・dumpable 0・写像 2 行以上

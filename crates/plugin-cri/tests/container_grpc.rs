@@ -150,6 +150,9 @@ fn spawn_server(sock: &Path, xdg: &Path) -> ChildGuard {
         .env("XDG_RUNTIME_DIR", xdg)
         // 既定の集合では本番の保持役（AppArmor の緩和と supervisor の bin が要る）を注入しない。実機前提の試験は注入する（H6・#2877）。
         .env("FANDHE_CONTAINER_TEST_POD_HOLDER", "off")
+        // userns を作れない環境でも既定の集合が通るよう、展開設定を 1 対 1（Keep + PreserveIfOwnerMapped）に固定する。
+        // 範囲写像の helper 展開は userns_helper_real と実機前提の試験が担う（#4801）。
+        .env("FANDHE_CONTAINER_TEST_EXTRACT_IDENTITY", "single-id")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -460,8 +463,21 @@ fn pull_fixture_image(cache_dir: &Path) -> String {
     };
     let hex = |d: &Digest| d.as_str().trim_start_matches("sha256:").to_owned();
     let blobs = HashMap::from([(hex(&config_digest), config), (hex(&layer_digest), layer)]);
-    let pull = PullConfig::new(cache_dir).expect("pull config");
-    let pulled = OciImagePuller::new(FakeClient { manifest, blobs }, pull)
+    // プラグイン本体（spawn_server が 1 対 1 に固定）と同じ展開設定で pull する（記録の照合が一致する。#4801）。
+    let mut pull = PullConfig::new(cache_dir).expect("pull config");
+    let (uid, gid) = {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata("/proc/self").expect("stat /proc/self");
+        (m.uid(), m.gid())
+    };
+    pull.extract_options = fandhe_container_plugin_cri::extract_identity::extract_options_for(
+        &fandhe_container_plugin_cri::extract_identity::ExtractIdentity::RootlessSingleId {
+            uid,
+            gid,
+        },
+    );
+    let puller = OciImagePuller::new(FakeClient { manifest, blobs }, pull);
+    let pulled = puller
         .pull(&PullRequest {
             reference: "busybox:1.36".to_owned(),
             credentials: None,

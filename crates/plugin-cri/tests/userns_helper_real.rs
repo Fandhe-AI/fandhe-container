@@ -15,6 +15,9 @@
 //! - Extract（#4847）: tar の所有者（uid 1000・gid 1000）が、範囲写像の user namespace の中では tar の値のまま見える
 //!   （`ChownInUserNamespace`。StatTarget で `d/` の fd を名前空間の中から見る）。ホストから見ると別の（subuid の）所有者で
 //!   あることを陽性対照にする。blob の fd と展開先の fd だけを渡し、パスは渡さない。後始末は削除モード
+//! - 対応表（#4801）: 本番の解決 `resolve_extract_identity` → `extract_options_for` が `ChownInUserNamespace`（本番の写像）+ `Strip`
+//!   を返し、その options のまま本番の注入点 `SubordinateLayerExtractor::extract_layers` で展開すると、所有者は tar の値のまま
+//!   見え、setuid / setgid は落ちる（保持は #4849）
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
@@ -156,6 +159,7 @@ mod linux {
         let _ = std::fs::remove_dir(&dir);
         remove_subordinate_owned_tree(&launcher, budget);
         extract_keeps_tar_owners_in_namespace(&launcher, budget);
+        table_row_extracts_with_tar_owners_and_strips_special_bits(&launcher);
         ExitCode::SUCCESS
     }
 
@@ -431,6 +435,151 @@ mod linux {
         let _ = std::fs::remove_dir_all(&base);
         println!(
             "userns_helper_real: extract keeps tar owners in namespace ok (dir 1000:1000 mode 0755, host owner is subordinate)"
+        );
+    }
+
+    /// 対応表（#4801）: 本番の解決が返す展開設定で、本番の注入点を通して展開する。所有者は名前空間の中で tar の値のまま、
+    /// setuid / setgid は `Strip` で落ちる。
+    fn table_row_extracts_with_tar_owners_and_strips_special_bits(launcher: &UsernsHelperLauncher) {
+        use std::os::unix::fs::DirBuilderExt as _;
+
+        use fandhe_container_cri::adapter::ReleaseBudget;
+        use fandhe_container_cri::bundle::SubordinateLayerExtractor as _;
+        use fandhe_container_oci::layer::DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES;
+        use fandhe_container_oci::layer::VerifiedLayerBlob;
+        use fandhe_container_oci::layer::extract::{
+            ExtractLimits, ExtractRoot, IdMap, ImageLayer, OwnershipPolicy, SpecialBitsPolicy,
+        };
+        use fandhe_container_oci::reference::Digest;
+        use fandhe_container_plugin_cri::extract_identity::{
+            extract_options_for, resolve_extract_identity,
+        };
+        use fandhe_container_plugin_cri::userns_helper::UsernsLayerExtractor;
+
+        let identity = resolve_extract_identity()
+            .unwrap_or_else(|e| fail(&format!("resolve identity: {}", e.message())));
+        let options = extract_options_for(&identity);
+        let (uid_map, gid_map) = expected_maps();
+        if options.ownership
+            != (OwnershipPolicy::ChownInUserNamespace {
+                uid: uid_map.clone(),
+                gid: gid_map.clone(),
+            })
+            || options.special_bits != SpecialBitsPolicy::Strip
+        {
+            fail(&format!("unexpected table row: {options:?}"));
+        }
+
+        let base = std::env::temp_dir().join(format!("userns-helper-tb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let bundle = base.join("bundle");
+        for d in [&base, &bundle] {
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(d)
+                .unwrap_or_else(|e| fail(&format!("create {}: {e}", d.display())));
+        }
+        let mut tar = tar_entry("d/", 0o755, 1000, b"", true);
+        tar.extend(tar_entry("d/f", 0o644, 1000, b"f", false));
+        tar.extend(tar_entry("d/s", 0o4755, 0, b"s", false));
+        tar.extend(tar_entry("d/g", 0o2755, 1000, b"g", false));
+        tar.extend([0u8; 1024]);
+        let blob_path = base.join("blob");
+        std::fs::write(&blob_path, &tar).unwrap_or_else(|e| fail(&format!("write blob: {e}")));
+        std::fs::set_permissions(&blob_path, std::fs::Permissions::from_mode(0o600))
+            .unwrap_or_else(|e| fail(&format!("chmod blob: {e}")));
+        let digest = Digest::sha256_of(&tar);
+        let me = std::fs::metadata("/proc/self").map_or(u32::MAX, |m| m.uid());
+        let verified = VerifiedLayerBlob::from_file(
+            File::open(&blob_path).unwrap_or_else(|e| fail(&format!("open blob: {e}"))),
+            &digest,
+            u64::try_from(tar.len()).unwrap_or(0),
+            me,
+        )
+        .unwrap_or_else(|e| fail(&format!("verified blob: {e}")));
+        let root = ExtractRoot::create_private_dir(&bundle.join("rootfs"))
+            .unwrap_or_else(|e| fail(&format!("create root: {e}")));
+        let layers = [ImageLayer::new(
+            &verified,
+            "application/vnd.oci.image.layer.v1.tar",
+            &digest,
+        )];
+        let extractor = UsernsLayerExtractor::with_launcher_and_limit(
+            UsernsHelperLauncher::with_fixed_command(BIN, vec![USERNS_HELPER_ARG.into()]),
+            1,
+        );
+        extractor
+            .extract_layers(
+                &layers,
+                &root,
+                DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES,
+                ExtractLimits::default(),
+                &options,
+                &ReleaseBudget::new(),
+            )
+            .unwrap_or_else(|e| fail(&format!("extract_layers: {e}")));
+
+        let budget =
+            WorkBudget::new(Duration::from_secs(10)).unwrap_or_else(|e| fail(&e.to_string()));
+        let stat = |rel: &str| {
+            let f = File::open(bundle.join("rootfs").join(rel))
+                .unwrap_or_else(|e| fail(&format!("open {rel}: {e}")));
+            match launcher.run(Mode::StatTarget, f.as_fd(), budget) {
+                Ok(Report::StatTarget(r)) => (r.uid, r.gid, r.mode),
+                other => fail(&format!("stat {rel}: {other:?}")),
+            }
+        };
+        // 名前空間の中から見た所有者は StatTarget で確かめる（StatTarget はディレクトリだけを受ける）。
+        let got = stat("d");
+        if got != (1000, 1000, 0o755) {
+            fail(&format!("d: got {got:?}, want (1000, 1000, 0o755)"));
+        }
+        // ファイルはホスト側で確かめる: 所有者は tar の値を写像で変換したホストの ID、mode はホストから見ても同じ値
+        // （setuid・setgid が落ちたことはここで分かる）。
+        let host_of = |map: &IdMap, id: u32| {
+            map.map_to_host(id)
+                .unwrap_or_else(|| fail(&format!("id {id} is not in the subordinate map")))
+        };
+        for (rel, owner, want_mode) in [
+            ("d/f", 1000, 0o644),
+            // tar の uid 0 は名前空間の root。setuid（04755）は落ちて 0755。
+            ("d/s", 0, 0o755),
+            // setgid（02755）も落ちて 0755。
+            ("d/g", 1000, 0o755),
+        ] {
+            let m = std::fs::metadata(bundle.join("rootfs").join(rel))
+                .unwrap_or_else(|e| fail(&format!("stat {rel} on the host: {e}")));
+            let got = (m.uid(), m.gid(), m.mode() & 0o7777);
+            let want = (
+                host_of(&uid_map, owner),
+                host_of(&gid_map, owner),
+                want_mode,
+            );
+            if got != want {
+                fail(&format!("{rel} on the host: got {got:?}, want {want:?}"));
+            }
+        }
+        // 陽性対照: ホストから見た d の所有者は subuid の範囲の値（自分の uid・0・tar の値のままではない）。
+        let host = std::fs::metadata(bundle.join("rootfs/d"))
+            .unwrap_or_else(|e| fail(&format!("stat d on the host: {e}")));
+        if host.uid() == 1000 || host.uid() == me || host.uid() == 0 {
+            fail(&format!(
+                "host-side owner is not subordinate: {}",
+                host.uid()
+            ));
+        }
+        let bundle_fd = File::open(&bundle).unwrap_or_else(|e| fail(&format!("open bundle: {e}")));
+        match launcher.run(
+            Mode::Remove(RemoveTarget::BundleRootfs),
+            bundle_fd.as_fd(),
+            budget,
+        ) {
+            Ok(Report::Removed) => {}
+            other => fail(&format!("remove: {other:?}")),
+        }
+        let _ = std::fs::remove_dir_all(&base);
+        println!(
+            "userns_helper_real: table row extracts with tar owners and strips special bits ok (dir 1000:1000 mode 0755, setuid/setgid stripped, host owner is subordinate)"
         );
     }
 

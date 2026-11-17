@@ -17,8 +17,8 @@
 //! - 展開器（#4848）: `extractor` が cri の注入点 `SubordinateLayerExtractor` の本番実装として、blob と展開先を fd で渡して
 //!   `run_extract_bounded` を呼ぶ（枠・期限・回収は `slots` で削除器と共通の処理を別インスタンスで持つ）
 //!
-//! 未配線（REPAIR-3）: `extract_identity` の対応表の切り替え（H6・#4801）と CI への組み込み（H7・#4802）は未（削除・展開は
-//! cri の pull・create へ配線済みだが、対応表が `ChownInUserNamespace` を返すまで本番では通らない）。
+//! 未配線（REPAIR-3）: CI への組み込み（H7・#4802）と特殊ビットの保持（#4849）は未。対応表の切り替えは H6（#4801）で有効化済み
+//! （範囲写像の行は `ChownInUserNamespace` + `Strip`。削除・展開は cri の pull・create へ配線済み）。
 //! 設計は `docs/design/userns-extract-helper.md`。
 
 pub mod wire;

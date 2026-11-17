@@ -109,10 +109,11 @@
 //!     渡す。pull（キャッシュ）は祖先を渡さず、毎回新規に作る 0700 の展開の根（`unpack/entry/rootfs`。公開の `renameat` 後も
 //!     0700 のまま）自身で判定する（`unpack/` を祖先にすると公開後は祖先でなくなり、キャッシュの寿命の間 0700 を保つ契約が
 //!     成り立たない。キャッシュ root・`rootfs/sha256` の権限基準〔#2547〕にも依存しない）。範囲写像（SubordinateIds）の本来の値
-//!     `ChownInUserNamespace` は tokio のマルチスレッドのプロセス内では user namespace に入れず（core の
-//!     `MultiThreaded` 拒否）未配線。記録の符号化は済み（#4796・H2）で、残りは helper（H1）・対応表の切り替え（H6）。pull 時と start 時の subuid の
+//!     `ChownInUserNamespace` は tokio のマルチスレッドのプロセス内では user namespace に入れない（core の
+//!     `MultiThreaded` 拒否）ため、再 exec helper 経由で展開する（H1〜H3・#4848）。記録の符号化は済み（#4796・H2）で、
+//!     対応表の切り替え（H6・#4801）も済み。pull 時と start 時の subuid の
 //!     ずれの照合は `match_recorded_settings` で実装済み（#4799。`ownership=` 行の完全一致。`Keep` では所有者が
-//!     subuid に依らず検出対象が無い）。本番の値の切り替えは H6。
+//!     subuid に依らず検出対象が無い）。本番の値は H6（#4801）で `ChownInUserNamespace` に切り替え済み。
 //!     所有者の写像の変換部品 `image_ownership`（#2389）は cli crate にあり、置き場所の判断は未取得（依存辺が増えない形を採用）。
 //!     pull と create は [`crate::bundle::ImageExtractConfig`] の 1 か所から同じ値を配る（食い違うと記録の照合で
 //!     `FAILED_PRECONDITION` になる）
@@ -120,7 +121,7 @@
 //!     `<cache_dir>/rootfs/sha256/<hex>` は残る
 //!   - pull 時と start 時の subuid / subgid のずれは、展開時の所有者写像の記録（`unpack-record`）で検出する方針
 //!     （`docs/design/pull-inventory-wiring.md`）。照合は `match_recorded_settings`（#4799）。
-//!     本番の値が `Keep` + `Strip` の間は写像が空で効かず、`ChownInUserNamespace` 等の配線（H6）で効く（#2592・#2377・#2241・#482）
+//!     範囲写像の行は H6（#4801）で `ChownInUserNamespace` になり、写像が記録に入って効く（#2592・#2377・#2241・#482）
 //!   - 異常終了で残ったステージング（展開途中の rootfs を含む）の回収は、blob のステージングと同じく起動時 GC の担当（#2315）
 //!   - 展開は `extract_image_layers_bounded_in` で、期限（[`PullConfig::pull_deadline`] の絶対時刻を pull 全体で共有）と
 //!     取り消しの旗をエントリ単位で確認する。期限超過・取り消しは `Timeout`（gRPC `DEADLINE_EXCEEDED`）で止まり、
@@ -550,8 +551,8 @@ pub struct PullConfig {
     /// レイヤー展開の上限（エントリ数・展開バイト数・入力バイト数・索引件数。全レイヤーで共有して累積する）。
     pub extract_limits: ExtractLimits,
     /// レイヤー展開の所有者・特殊ビットの選択肢。既定は `chown` しない（`Keep`）・特殊ビットは落とす（`Strip`）。
-    /// 値は呼び出し元が決める。本番（plugin-cri）は start と同じ権限モデルの解決から選び（#2792）、現状はどの権限モデルでも
-    /// 既定のまま（`ChownInUserNamespace` の展開の注入点は #4848 で配線済みで、対応表の切り替えは #4777 の H6〔#4801〕。モジュール doc「未実装範囲」と
+    /// 値は呼び出し元が決める。本番（plugin-cri）は start と同じ権限モデルの解決から選び（#2792）、範囲写像の行は
+    /// `ChownInUserNamespace` + `Strip`（注入点は #4848、対応表の切り替えは #4777 の H6〔#4801〕で済み。モジュール doc「未実装範囲」と
     /// `docs/design/oci-layer-special-bits.md`。#2534・SEC-5・SEC-1）。
     pub extract_options: ExtractOptions,
 }

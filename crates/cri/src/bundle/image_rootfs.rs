@@ -70,7 +70,7 @@
 //!   再 exec helper の削除モードへ回す（#4800。`release_bounded`・展開失敗時の後始末。未注入ならホスト側へ縮退せず
 //!   `FAILED_PRECONDITION`）。展開も同じ設定のとき（`needs_userns_removal`）は注入点
 //!   `SubordinateLayerExtractor` 経由で再 exec helper の展開モードへ回す（#4848。extractor と remover の両方が無ければ `rootfs/` を
-//!   作る前に `FAILED_PRECONDITION`）。対応表の切り替えは #4777 の H6（#4801）
+//!   作る前に `FAILED_PRECONDITION`）。対応表の切り替えは #4777 の H6（#4801）で済み（特殊ビットは `Strip`、保持は #4849）
 //!   （#2534・SEC-5。`docs/design/oci-layer-special-bits.md`）。pull と create の設定は
 //!   [`ImageExtractConfig`] で 1 か所にまとめる
 //! - 展開は `extract_image_layers_bounded_in` でエントリ単位に期限（この `prepare` の開始からの `deadline`）と取り消しの

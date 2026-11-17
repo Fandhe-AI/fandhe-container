@@ -62,9 +62,13 @@ pull の再利用判定（`check_unpack_record`）と create の `read_layers` �
   （#471・#2315）で `image rm` でも消えないため、再 pull では直らない。手動削除は subuid 所有の木のため user namespace の中で行う
   必要があり、手順は subuid 所有の木の削除（H3・#4800）の後に整備する
 - 残余: plugin-cri は権限モデルの解決結果をプロセス内で保持する（`extract_options()`）。稼働中に `/etc/subuid` が変わっても再起動までは
-  create の写像が変わらず、start の launcher が読む最新の写像との差は検出されない。再起動後は記録と照合される。create ごとの再解決に
-  するかは、写像を持たせる H6（#4801）で判断する
-- 本番の値が `Keep` + `Strip` の間は写像が空で食い違いは起きない。`ChownInUserNamespace` の配線（H6）で効く。
+  create の写像が変わらず、start の launcher が読む最新の写像との差は検出されない。再起動後は記録と照合される。create ごとの再解決は
+  しない（H6・#4801 の判断。展開のたびに helper が自分で写像を解決し直して指紋を照合するため、稼働中に `/etc/subuid` が変わると
+  新しい展開は `FAILED_PRECONDITION` で失敗する〔fail-closed〕。残るのは、キャッシュ済みエントリの再利用と start の写像の差が再起動まで
+  検出されない点）
+- 範囲写像の行は H6（#4801）で `ChownInUserNamespace` + `Strip` になり、写像が記録に入って効く。切り替え前に範囲写像の環境で pull した
+  キャッシュ（記録が `ownership=keep`）は id mapping の文言で拒否される。ホスト所有の木なので `<cache>/rootfs/sha256/<hex>` を手動で消して
+  pull し直す（自動移行は未実装）。
 詳細は [oci-layer-special-bits.md](oci-layer-special-bits.md) の末尾。
 
 ## 動作の変更点

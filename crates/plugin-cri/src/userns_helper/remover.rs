@@ -3,7 +3,7 @@
 //!
 //! `fandhe-container-cri` の注入点 [`SubordinateTreeRemover`] の本番実装 [`UsernsTreeRemover`]。呼び出し元は cri の
 //! `ImageRootfsSource`（`release_bounded`・展開失敗時の後始末）と `OciImagePuller`（pull の `unpack/` の後始末）で、
-//! 展開設定が `ChownInUserNamespace` のときだけ呼ばれる（対応表の切り替えは H6・#4801。それまで本番では通らない）。
+//! 展開設定が `ChownInUserNamespace` のときだけ呼ばれる（範囲写像の行で通る。対応表の切り替えは H6・#4801 で有効化済み）。
 //! CRI の worker スレッド・pull の blocking 区間から同期で呼ばれ、helper（[`UsernsHelperLauncher`]）を 1 回起動して
 //! [`Mode::Remove`] を実行させる。親ディレクトリは fd で渡し（パスは渡さない）、消す子の名前は [`RemovalTarget`] から
 //! 固定の 2 種に限る。

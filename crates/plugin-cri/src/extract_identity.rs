@@ -8,16 +8,18 @@
 //! 同じ既定パス）を使い、pull / create と start の食い違いを構造で防ぐ。解決の失敗は既定値へ縮退させず、
 //! 固定文言の `CriError` で失敗させる（fail-closed）。
 //!
-//! 対応表（[`extract_options_for`]）は `RootlessSingleId` だけ `Keep` + `PreserveIfOwnerMapped`（#4805。bundle の閉じ込めを
-//! 0700 の祖先で判定する入口が cri 側に結線済み）で、他の行は `Keep` + `Strip`。
-//! subuid のずれの照合は cri 側で実装済み（#4799）。残りの配線（`ChownInUserNamespace`）は後続 issue で、
-//! 各 variant の doc に理由を書く。実装済みを装わない（REPAIR-3）。
+//! 対応表（[`extract_options_for`]）は `RootlessSingleId` が `Keep` + `PreserveIfOwnerMapped`（#4805。bundle の閉じ込めを
+//! 0700 の祖先で判定する入口が cri 側に結線済み）、`RootlessSubordinateIds` が `ChownInUserNamespace` + `Strip`
+//! （#4801・H6。写像は start と同じ解決から作る）で、他の行は `Keep` + `Strip`。
+//! 範囲写像の行の特殊ビット保持（`PreserveIfChowned` と閉じ込めの祖先）は #4849。subuid のずれの照合は cri 側（#4799）。
 
 use fandhe_container_cri::error::CriError;
-use fandhe_container_oci::layer::extract::{ExtractOptions, IdRange, SpecialBitsPolicy};
+use fandhe_container_oci::layer::extract::{
+    ExtractOptions, IdMap, IdRange, OwnershipPolicy, SpecialBitsPolicy,
+};
 
 /// 展開設定を選ぶための、自プロセスの権限モデル（start の解決結果の写し）。将来の variant 追加に備え `non_exhaustive`。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ExtractIdentity {
     /// ホスト root（euid 0）で動いている。本番の start は恒久的に拒否される（#2241 D1:A）ため写像先の uid が存在せず、
@@ -32,12 +34,17 @@ pub enum ExtractIdentity {
         /// 展開プロセスの実効 gid。
         gid: u32,
     },
-    /// 非 root・subuid / subgid の範囲写像あり。本来の値は `ChownInUserNamespace` だが、tokio のマルチスレッドの
-    /// プロセス内では user namespace に入れない（core の `MultiThreaded` 拒否）ため暫定で `Keep` + `Strip`
-    /// （後続 issue。subuid のずれの照合は cri の `match_recorded_settings` で実装済み・#4799。写像を持たせて配線するのは H6）。
-    /// 再 exec する helper の入口は #4795、削除モードと削除器（`UsernsTreeRemover`。cri の注入点へ配線済み）は #4800、展開モード（wire・helper 内の展開・親側の期限つき入口）は #4847 で実装済み（`userns_helper`）で、cri の注入点 `SubordinateLayerExtractor` と本番の展開器（`UsernsLayerExtractor`）の pull・create への配線は #4848 で実装済みだが、対応表の切り替え（H6・#4801）は未で、
-    /// 対応表はこの行でも変えない（実装済みを装わない）。
-    RootlessSubordinateIds,
+    /// 非 root・subuid / subgid の範囲写像あり。コンテナと同じ写像の user namespace の中で `chown` する
+    /// `ChownInUserNamespace` + `Strip`（#4801・H6）。展開は再 exec した helper が行い（`userns_helper`。#4795・#4847・#4848）、
+    /// helper が参加した写像と `uid` / `gid` の指紋が違えば書き込みの前に拒否する。削除は `UsernsTreeRemover`（#4800）。
+    /// 写像は start の launcher・helper と同じ解決（`resolve_id_maps`）から作り、要求の入力からは受けない。
+    /// 特殊ビットは `Strip`（2026-11-16 のオーナー判断 C）。保持は #4849。
+    RootlessSubordinateIds {
+        /// uid の写像（コンテナ id → ホスト id）。
+        uid: IdMap,
+        /// gid の写像。
+        gid: IdMap,
+    },
     /// 権限モデルを解決できない OS（Linux 以外）。本番の経路には到達しないため `Keep` + `Strip`。
     Unsupported,
 }
@@ -45,24 +52,28 @@ pub enum ExtractIdentity {
 /// 権限モデルから展開設定を選ぶ対応表（網羅的な `match`。未知の variant を丸めない）。
 #[must_use]
 pub fn extract_options_for(identity: &ExtractIdentity) -> ExtractOptions {
-    match *identity {
+    match identity {
         ExtractIdentity::RootlessSingleId { uid, gid } => {
             ExtractOptions::new().with_special_bits(SpecialBitsPolicy::PreserveIfOwnerMapped {
                 uid: IdRange {
                     container_id: 0,
-                    host_id: uid,
+                    host_id: *uid,
                     count: 1,
                 },
                 gid: IdRange {
                     container_id: 0,
-                    host_id: gid,
+                    host_id: *gid,
                     count: 1,
                 },
             })
         }
-        ExtractIdentity::HostRoot
-        | ExtractIdentity::RootlessSubordinateIds
-        | ExtractIdentity::Unsupported => ExtractOptions::new(),
+        ExtractIdentity::RootlessSubordinateIds { uid, gid } => ExtractOptions::new()
+            .with_ownership(OwnershipPolicy::ChownInUserNamespace {
+                uid: uid.clone(),
+                gid: gid.clone(),
+            })
+            .with_special_bits(SpecialBitsPolicy::Strip),
+        ExtractIdentity::HostRoot | ExtractIdentity::Unsupported => ExtractOptions::new(),
     }
 }
 
@@ -71,6 +82,7 @@ pub fn extract_options_for(identity: &ExtractIdentity) -> ExtractOptions {
 #[cfg(target_os = "linux")]
 fn identity_from_privilege(
     privilege: fandhe_container_core::exec::IsolationPrivilege,
+    source: Option<&fandhe_container_core::oci_runtime::SubordinateIdSource>,
     euid: u32,
     egid: u32,
 ) -> Result<ExtractIdentity, CriError> {
@@ -81,7 +93,36 @@ fn identity_from_privilege(
             uid: euid,
             gid: egid,
         }),
-        IsolationPrivilege::RootlessSubordinateIds => Ok(ExtractIdentity::RootlessSubordinateIds),
+        IsolationPrivilege::RootlessSubordinateIds => {
+            use crate::image_ownership::{ExtractChownMode, extract_ownership_for};
+            use fandhe_container_supervisor::id_model::RootlessIdResolution;
+            // 入力元が無いときに 1 対 1 へ縮退しない（start も同じ前提で拒否する）。
+            let source = source.ok_or_else(|| {
+                CriError::new(
+                    CriErrorCode::FailedPrecondition,
+                    "subordinate id source is not available for image extraction",
+                )
+            })?;
+            let policy = extract_ownership_for(
+                &RootlessIdResolution::SubordinateIds(source.clone()),
+                euid,
+                egid,
+                ExtractChownMode::InUserNamespace,
+            )
+            .map_err(|e| {
+                CriError::new(
+                    CriError::from(&e).code(),
+                    "failed to resolve the id mapping for image extraction",
+                )
+            })?;
+            let OwnershipPolicy::ChownInUserNamespace { uid, gid } = policy else {
+                return Err(CriError::new(
+                    CriErrorCode::Internal,
+                    "unexpected ownership policy for image extraction",
+                ));
+            };
+            Ok(ExtractIdentity::RootlessSubordinateIds { uid, gid })
+        }
         _ => Err(CriError::new(
             CriErrorCode::FailedPrecondition,
             "unsupported isolation privilege for image extraction",
@@ -111,7 +152,7 @@ pub fn resolve_extract_identity() -> Result<ExtractIdentity, CriError> {
         if matches!(crate::pod_holder::current_euid(), Ok(0)) {
             return Ok(ExtractIdentity::HostRoot);
         }
-        let (privilege, _source) =
+        let (privilege, source) =
             fandhe_container_supervisor::start_entry::resolve_self_launch_privilege().map_err(
                 |e| {
                     CriError::new(
@@ -123,7 +164,15 @@ pub fn resolve_extract_identity() -> Result<ExtractIdentity, CriError> {
         let (euid, egid) = current_euid_egid().map_err(|()| {
             CriError::failed_precondition("cannot determine the plugin process credentials")
         })?;
-        identity_from_privilege(privilege, euid, egid)
+        // 試験専用: userns を作れない環境の既定の集合が範囲写像の helper 展開へ入らないよう 1 対 1 に固定する。
+        #[cfg(feature = "pod-holder-test-support")]
+        if std::env::var("FANDHE_CONTAINER_TEST_EXTRACT_IDENTITY").is_ok_and(|v| v == "single-id") {
+            return Ok(ExtractIdentity::RootlessSingleId {
+                uid: euid,
+                gid: egid,
+            });
+        }
+        identity_from_privilege(privilege, source.as_ref(), euid, egid)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -135,14 +184,40 @@ pub fn resolve_extract_identity() -> Result<ExtractIdentity, CriError> {
 mod tests {
     use super::*;
 
-    /// SEC-5・OCI-1・#2792・#4805: 対応表は `RootlessSingleId` だけ `PreserveIfOwnerMapped`（0 → euid / egid の 1 行）で、他は既定。
+    fn sample_map(host: u32) -> IdMap {
+        IdMap::new(vec![
+            IdRange {
+                container_id: 0,
+                host_id: host,
+                count: 1,
+            },
+            IdRange {
+                container_id: 1,
+                host_id: 100_000,
+                count: 65_536,
+            },
+        ])
+        .expect("valid map")
+    }
+
+    /// SEC-5・OCI-1・#2792・#4805・#4801: 対応表は `RootlessSingleId` が `PreserveIfOwnerMapped`（0 → euid / egid の 1 行）、
+    /// `RootlessSubordinateIds` が `ChownInUserNamespace` + `Strip`（写像そのまま）で、他は既定。
     #[test]
     fn sec5_oci1_2792_extract_options_table() {
-        for id in [
-            ExtractIdentity::HostRoot,
-            ExtractIdentity::RootlessSubordinateIds,
-            ExtractIdentity::Unsupported,
-        ] {
+        let sub = extract_options_for(&ExtractIdentity::RootlessSubordinateIds {
+            uid: sample_map(1000),
+            gid: sample_map(1001),
+        });
+        assert_eq!(
+            sub,
+            ExtractOptions::new()
+                .with_ownership(OwnershipPolicy::ChownInUserNamespace {
+                    uid: sample_map(1000),
+                    gid: sample_map(1001),
+                })
+                .with_special_bits(SpecialBitsPolicy::Strip)
+        );
+        for id in [ExtractIdentity::HostRoot, ExtractIdentity::Unsupported] {
             assert_eq!(extract_options_for(&id), ExtractOptions::new(), "{id:?}");
         }
         let want =
@@ -171,20 +246,43 @@ mod tests {
     #[test]
     fn sec5_oci1_2792_privilege_mapping_rejects_rootful_host_root() {
         use fandhe_container_core::exec::IsolationPrivilege as P;
+        use fandhe_container_core::oci_runtime::SubordinateIdSource;
         use fandhe_container_cri::error::CriErrorCode;
         assert_eq!(
-            identity_from_privilege(P::RootlessSingleId, 1000, 1001).expect("single"),
+            identity_from_privilege(P::RootlessSingleId, None, 1000, 1001).expect("single"),
             ExtractIdentity::RootlessSingleId {
                 uid: 1000,
                 gid: 1001
             }
         );
+        let dir =
+            std::env::temp_dir().join(format!("extract-identity-4801-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let (su, sg) = (dir.join("subuid"), dir.join("subgid"));
+        std::fs::write(&su, "alice:100000:65536\n").expect("subuid");
+        std::fs::write(&sg, "alice:100000:65536\n").expect("subgid");
+        let source =
+            SubordinateIdSource::with_id_files(Some("alice".to_owned()), &su, &sg).expect("source");
+        let got = identity_from_privilege(P::RootlessSubordinateIds, Some(&source), 1000, 1001)
+            .expect("subordinate");
+        let maps = source.resolve_id_maps(1000, 1001).expect("maps");
         assert_eq!(
-            identity_from_privilege(P::RootlessSubordinateIds, 1000, 1001).expect("subordinate"),
-            ExtractIdentity::RootlessSubordinateIds
+            got,
+            ExtractIdentity::RootlessSubordinateIds {
+                uid: crate::image_ownership::to_oci_map(maps.uid()).expect("uid"),
+                gid: crate::image_ownership::to_oci_map(maps.gid()).expect("gid"),
+            }
         );
-        let err =
-            identity_from_privilege(P::RootfulHostRoot, 0, 0).expect_err("rootful is rejected");
+        let _ = std::fs::remove_dir_all(&dir);
+        let none = identity_from_privilege(P::RootlessSubordinateIds, None, 1000, 1001)
+            .expect_err("no source");
+        assert_eq!(none.code(), CriErrorCode::FailedPrecondition);
+        assert_eq!(
+            none.message(),
+            "subordinate id source is not available for image extraction"
+        );
+        let err = identity_from_privilege(P::RootfulHostRoot, None, 0, 0)
+            .expect_err("rootful is rejected");
         assert_eq!(err.code(), CriErrorCode::FailedPrecondition);
         assert_eq!(
             err.message(),

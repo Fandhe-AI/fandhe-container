@@ -2109,6 +2109,35 @@ jobs:
             --log "${log}" --select '^(ok: [a-z_0-9]+|test staged_blob_owner [.][.][.] ok)$' --min 6 \
             --forbid 'staged_blob_owner: ignored' --forbid 'not applicable' --forbid 'FAIL:' --summary
 
+      # userns_helper_real（`crates/plugin-cri/tests/userns_helper_real.rs`。SEC-5・OCI-1・OCI-2・OCI-7・REPAIR-7・#4802）:
+      # plugin-cri の再 exec helper（`__extract-in-userns`）を本番の参加経路で通す実機前提テスト（harness = false。Inspect・
+      # StatTarget・Remove・Extract・対応表の 5 行）。範囲写像は常に必須で opt-in の変数は読まないため
+      # FANDHE_CONTAINER_TEST_ID_HELPER・USER は渡さない。AppArmor の緩和と範囲写像の前提確認に依存する。cgroup を使わないため
+      # 委譲スコープは使わず scope を作らない補助で期限だけ持つ（試験の watchdog 120 秒 < 補助 240 秒 < ステップ < ジョブ）。
+      # 新しい check-run・sudo・permissions は追加しない。root の分岐は CI では回さない（#1621）。
+      - name: userns_helper_real のビルド（実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: cargo test -p fandhe-container-plugin-cri --test userns_helper_real --no-run
+
+      - name: userns_helper_real の実行（実機前提テスト・--ignored。SEC-5・OCI-2・OCI-7・#4802）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/userns_helper_real.log"
+          scripts/run-with-deadline.sh --name userns_helper_real --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-plugin-cri --test userns_helper_real -- --ignored
+          sel='^userns_helper_real: (inspect joined|stat target owner is namespace root|'
+          sel="${sel}remove subordinate-owned tree|extract keeps tar owners in namespace|"
+          sel="${sel}table row extracts with tar owners and strips special bits) ok "
+          scripts/check-success-lines.sh --name userns_helper_real --src crates/plugin-cri/tests/userns_helper_real.rs \
+            --log "${log}" \
+            --select "${sel}" \
+            --min 5 \
+            --forbid 'userns_helper_real: ignored' --forbid 'not applicable' --forbid 'skipped' \
+            --forbid 'PRECONDITION FAILED' --forbid 'WATCHDOG EXPIRED' --forbid 'root=true' --forbid 'FAILED' --summary
+
       # landlock_implicit_dev（`crates/core/tests/landlock_implicit_dev.rs`。CORE-5・SEC-4・#1657・#2768）: 暗黙の /dev 系の
       # Landlock 許可（/dev/null 書き込み・/dev/shm 作成・/dev/ptmx open）と mknod・外側書き込みの拒否を非特権 user namespace で
       # 照合する実機前提テスト（harness = false）。AppArmor の緩和と Landlock ABI 6 以上の fail-closed 確認は上のステップを

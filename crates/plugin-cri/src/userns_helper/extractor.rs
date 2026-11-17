@@ -7,6 +7,7 @@
 //! CRI の worker スレッド・pull の blocking 区間から同期で呼ばれ、helper（[`UsernsHelperLauncher`]）を 1 回起動して
 //! [`UsernsHelperLauncher::run_extract_bounded`] で展開させる。blob と展開先は fd で渡し（パスは渡さない）、写像は送らず
 //! helper が参加に使ったものを使う（#4847 の契約）。
+//! 閉じ込めの祖先（create は 0700 の bundle ディレクトリ）も fd で渡し、helper が `PreserveIfChowned` の閉じ込めの判定に使う（#4849）。
 //!
 //! # 契約
 //! - 縮退しない: 失敗・期限切れはホスト側の展開へ落とさず、固定文言の [`OciError`] で返す（パス・errno・uid を含めない）
@@ -131,6 +132,7 @@ impl SubordinateLayerExtractor for UsernsLayerExtractor {
         &self,
         layers: &[ImageLayer<'_>],
         root: &ExtractRoot,
+        ancestor: Option<&ExtractRoot>,
         max_uncompressed_layer_bytes: u64,
         limits: ExtractLimits,
         options: &ExtractOptions,
@@ -199,6 +201,7 @@ impl SubordinateLayerExtractor for UsernsLayerExtractor {
             &request,
             &blobs,
             root.as_fd(),
+            ancestor.map(ExtractRoot::as_fd),
             work,
             budget.deadline,
             budget.cancel,
@@ -314,6 +317,7 @@ mod tests {
         ex.extract_layers(
             &layers,
             &f.root,
+            None,
             fandhe_container_oci::layer::DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES,
             ExtractLimits::default(),
             opts,

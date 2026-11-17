@@ -15,9 +15,11 @@
 //! - Extract（#4847）: tar の所有者（uid 1000・gid 1000）が、範囲写像の user namespace の中では tar の値のまま見える
 //!   （`ChownInUserNamespace`。StatTarget で `d/` の fd を名前空間の中から見る）。ホストから見ると別の（subuid の）所有者で
 //!   あることを陽性対照にする。blob の fd と展開先の fd だけを渡し、パスは渡さない。後始末は削除モード
-//! - 対応表（#4801）: 本番の解決 `resolve_extract_identity` → `extract_options_for` が `ChownInUserNamespace`（本番の写像）+ `Strip`
-//!   を返し、その options のまま本番の注入点 `SubordinateLayerExtractor::extract_layers` で展開すると、所有者は tar の値のまま
-//!   見え、setuid / setgid は落ちる（保持は #4849）
+//! - 対応表（#4801・#4849）: 本番の解決 `resolve_extract_identity` → `extract_options_for` が `ChownInUserNamespace`（本番の写像）+
+//!   `PreserveIfChowned` を返し、その options のまま、0700 の bundle を閉じ込めの祖先として本番の注入点
+//!   `SubordinateLayerExtractor::extract_layers` で展開すると（rootfs は create と同じく 0755）、所有者は tar の値のまま見え、
+//!   setuid / setgid / sticky が保たれる。別の uid（名前空間内の uid 1000 = ホストでは別の subuid）は bundle の下へ届かない
+//!   （`--probe-reach <path>` の子。陽性対照: 同じ uid の子は届く・bundle を 0711 にすると別 uid も届く）
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
@@ -72,6 +74,12 @@ mod linux {
     pub fn main() -> ExitCode {
         let args: Vec<String> = std::env::args().collect();
         // 子の役（単一スレッドのまま user namespace に入る。watchdog スレッドを起動する前に処理する）。
+        if let Some(i) = args.iter().position(|a| a == "--probe-reach") {
+            let path = args
+                .get(i + 1)
+                .unwrap_or_else(|| fail("path after --probe-reach"));
+            return probe_reach(path, args.get(i + 2).is_some_and(|a| a == "other"));
+        }
         if let Some(i) = args.iter().position(|a| a == "--populate") {
             let dir = args
                 .get(i + 1)
@@ -159,7 +167,7 @@ mod linux {
         let _ = std::fs::remove_dir(&dir);
         remove_subordinate_owned_tree(&launcher, budget);
         extract_keeps_tar_owners_in_namespace(&launcher, budget);
-        table_row_extracts_with_tar_owners_and_strips_special_bits(&launcher);
+        table_row_extracts_with_tar_owners_and_keeps_special_bits(&launcher);
         ExitCode::SUCCESS
     }
 
@@ -395,6 +403,7 @@ mod linux {
             &request,
             &[blob.as_fd()],
             dest.as_fd(),
+            None,
             budget,
             None,
             None,
@@ -438,9 +447,41 @@ mod linux {
         );
     }
 
-    /// 対応表（#4801）: 本番の解決が返す展開設定で、本番の注入点を通して展開する。所有者は名前空間の中で tar の値のまま、
-    /// setuid / setgid は `Strip` で落ちる。
-    fn table_row_extracts_with_tar_owners_and_strips_special_bits(launcher: &UsernsHelperLauncher) {
+    /// 子の役（#4849）: 範囲写像の user namespace に入り、`other` なら名前空間内の uid / gid 1000（ホストでは別の subuid）に
+    /// なって `path` を開く。開けたら 0、開けなければ 1。単一スレッドで処理する（watchdog の前）。
+    fn probe_reach(path: &str, other: bool) -> ExitCode {
+        use std::os::unix::process::CommandExt as _;
+        enter_userns();
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", "exec 3< \"$1\"", "sh", path])
+            .current_dir("/");
+        if other {
+            cmd.uid(1000).gid(1000);
+        }
+        match cmd.status() {
+            Ok(s) if s.success() => ExitCode::SUCCESS,
+            Ok(_) => ExitCode::from(1),
+            Err(e) => fail(&format!("probe spawn: {e}")),
+        }
+    }
+
+    /// `path` を `--probe-reach` の子で開けるか（`other` は別 uid）。
+    fn can_reach(path: &Path, other: bool) -> bool {
+        let self_exe =
+            std::env::current_exe().unwrap_or_else(|e| fail(&format!("current_exe: {e}")));
+        let mut cmd = std::process::Command::new(self_exe);
+        cmd.arg("--probe-reach").arg(path);
+        if other {
+            cmd.arg("other");
+        }
+        cmd.status()
+            .unwrap_or_else(|e| fail(&format!("spawn probe child: {e}")))
+            .success()
+    }
+
+    /// 対応表（#4801・#4849）: 本番の解決が返す展開設定で、本番の注入点を通して展開する。所有者は名前空間の中で tar の値のまま、
+    /// setuid / setgid / sticky は 0700 の bundle を祖先とする閉じ込めで保たれ、別 uid は bundle の下へ届かない。
+    fn table_row_extracts_with_tar_owners_and_keeps_special_bits(launcher: &UsernsHelperLauncher) {
         use std::os::unix::fs::DirBuilderExt as _;
 
         use fandhe_container_cri::adapter::ReleaseBudget;
@@ -465,7 +506,7 @@ mod linux {
                 uid: uid_map.clone(),
                 gid: gid_map.clone(),
             })
-            || options.special_bits != SpecialBitsPolicy::Strip
+            || options.special_bits != SpecialBitsPolicy::PreserveIfChowned
         {
             fail(&format!("unexpected table row: {options:?}"));
         }
@@ -479,6 +520,9 @@ mod linux {
                 .create(d)
                 .unwrap_or_else(|e| fail(&format!("create {}: {e}", d.display())));
         }
+        // 別 uid の到達不能を bundle だけに負わせるため、その上の base は他者が辿れるようにする。
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755))
+            .unwrap_or_else(|e| fail(&format!("chmod base: {e}")));
         let mut tar = tar_entry("d/", 0o755, 1000, b"", true);
         tar.extend(tar_entry("d/f", 0o644, 1000, b"f", false));
         tar.extend(tar_entry("d/s", 0o4755, 0, b"s", false));
@@ -499,6 +543,14 @@ mod linux {
         .unwrap_or_else(|e| fail(&format!("verified blob: {e}")));
         let root = ExtractRoot::create_private_dir(&bundle.join("rootfs"))
             .unwrap_or_else(|e| fail(&format!("create root: {e}")));
+        // create の `open_rootfs_for_search` と同じく rootfs を 0755 にし、閉じ込めは 0700 の bundle（祖先）が担う。
+        std::fs::set_permissions(
+            bundle.join("rootfs"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap_or_else(|e| fail(&format!("chmod rootfs: {e}")));
+        let ancestor = ExtractRoot::open_existing_dir(&bundle)
+            .unwrap_or_else(|e| fail(&format!("open ancestor: {e}")));
         let layers = [ImageLayer::new(
             &verified,
             "application/vnd.oci.image.layer.v1.tar",
@@ -512,6 +564,7 @@ mod linux {
             .extract_layers(
                 &layers,
                 &root,
+                Some(&ancestor),
                 DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES,
                 ExtractLimits::default(),
                 &options,
@@ -535,17 +588,17 @@ mod linux {
             fail(&format!("d: got {got:?}, want (1000, 1000, 0o755)"));
         }
         // ファイルはホスト側で確かめる: 所有者は tar の値を写像で変換したホストの ID、mode はホストから見ても同じ値
-        // （setuid・setgid が落ちたことはここで分かる）。
+        // （setuid・setgid が保たれたことはここで分かる）。
         let host_of = |map: &IdMap, id: u32| {
             map.map_to_host(id)
                 .unwrap_or_else(|| fail(&format!("id {id} is not in the subordinate map")))
         };
         for (rel, owner, want_mode) in [
             ("d/f", 1000, 0o644),
-            // tar の uid 0 は名前空間の root。setuid（04755）は落ちて 0755。
-            ("d/s", 0, 0o755),
-            // setgid（02755）も落ちて 0755。
-            ("d/g", 1000, 0o755),
+            // tar の uid 0 は名前空間の root。setuid（04755）は所有者が写像先の root のため保たれる。
+            ("d/s", 0, 0o4755),
+            // setgid（02755）は所有 gid が tar の gid の写像先と一致するため保たれる。
+            ("d/g", 1000, 0o2755),
         ] {
             let m = std::fs::metadata(bundle.join("rootfs").join(rel))
                 .unwrap_or_else(|e| fail(&format!("stat {rel} on the host: {e}")));
@@ -568,6 +621,24 @@ mod linux {
                 host.uid()
             ));
         }
+        // 別 uid（名前空間内の uid 1000）は、保たれた setuid のファイルがあっても 0700 の bundle の下へ届かない。
+        let suid = bundle.join("rootfs/d/s");
+        if can_reach(&suid, true) {
+            fail("another uid reached below the 0700 bundle");
+        }
+        // 陽性対照 1: 同じ子の役でも uid を変えなければ（名前空間の root = 起動ユーザー）届く。
+        if !can_reach(&suid, false) {
+            fail("positive control: the owner could not reach the file");
+        }
+        // 陽性対照 2: bundle を一時的に 0711 にすると別 uid も届く（到達不能が bundle の 0700 によることの確認）。
+        std::fs::set_permissions(&bundle, std::fs::Permissions::from_mode(0o711))
+            .unwrap_or_else(|e| fail(&format!("chmod bundle open: {e}")));
+        let reached = can_reach(&suid, true);
+        std::fs::set_permissions(&bundle, std::fs::Permissions::from_mode(0o700))
+            .unwrap_or_else(|e| fail(&format!("chmod bundle back: {e}")));
+        if !reached {
+            fail("positive control: another uid could not reach the file under a 0711 bundle");
+        }
         let bundle_fd = File::open(&bundle).unwrap_or_else(|e| fail(&format!("open bundle: {e}")));
         match launcher.run(
             Mode::Remove(RemoveTarget::BundleRootfs),
@@ -579,7 +650,7 @@ mod linux {
         }
         let _ = std::fs::remove_dir_all(&base);
         println!(
-            "userns_helper_real: table row extracts with tar owners and strips special bits ok (dir 1000:1000 mode 0755, setuid/setgid stripped, host owner is subordinate)"
+            "userns_helper_real: table row extracts with tar owners and keeps special bits ok (dir 1000:1000 mode 0755, setuid/setgid kept under a 0700 bundle with rootfs 0755, other uid cannot reach below the bundle, host owner is subordinate)"
         );
     }
 

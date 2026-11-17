@@ -70,7 +70,7 @@
 //!   再 exec helper の削除モードへ回す（#4800。`release_bounded`・展開失敗時の後始末。未注入ならホスト側へ縮退せず
 //!   `FAILED_PRECONDITION`）。展開も同じ設定のとき（`needs_userns_removal`）は注入点
 //!   `SubordinateLayerExtractor` 経由で再 exec helper の展開モードへ回す（#4848。extractor と remover の両方が無ければ `rootfs/` を
-//!   作る前に `FAILED_PRECONDITION`）。対応表の切り替えは #4777 の H6（#4801）で済み（特殊ビットは `Strip`、保持は #4849）
+//!   作る前に `FAILED_PRECONDITION`）。対応表の切り替えは #4777 の H6（#4801）、特殊ビットの保持は #4849 で済み（祖先は範囲写像の展開でも helper へ渡す）
 //!   （#2534・SEC-5。`docs/design/oci-layer-special-bits.md`）。pull と create の設定は
 //!   [`ImageExtractConfig`] で 1 か所にまとめる
 //! - 展開は `extract_image_layers_bounded_in` でエントリ単位に期限（この `prepare` の開始からの `deadline`）と取り消しの
@@ -281,6 +281,7 @@ impl ImageRootfsSource {
                 let result = extractor.extract_layers(
                     layers,
                     root,
+                    Some(bundle.as_extract_root()),
                     self.config.max_uncompressed_layer_bytes,
                     self.config.extract_limits,
                     opts,
@@ -303,8 +304,8 @@ impl ImageRootfsSource {
                 "subordinate-owned layer extraction is not available",
             ));
         }
-        // 祖先は常に渡す（`Strip`・`PreserveIfChowned` では oci が使わない）。根は後で 0755 になるため、
-        // `PreserveIfOwnerMapped` の閉じ込めは 0700 の bundle ディレクトリで判定させる（#4805）。
+        // 祖先は常に渡す（`Strip` では oci が使わない）。根は後で 0755 になるため、`PreserveIfOwnerMapped` /
+        // `PreserveIfChowned` の閉じ込めは 0700 の bundle ディレクトリで判定させる（#4805・#4849）。
         extract_image_layers_confined_in(
             self.recorder.as_ref(),
             layers,

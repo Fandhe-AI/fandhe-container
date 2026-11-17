@@ -9,9 +9,10 @@
 //! 固定文言の `CriError` で失敗させる（fail-closed）。
 //!
 //! 対応表（[`extract_options_for`]）は `RootlessSingleId` が `Keep` + `PreserveIfOwnerMapped`（#4805。bundle の閉じ込めを
-//! 0700 の祖先で判定する入口が cri 側に結線済み）、`RootlessSubordinateIds` が `ChownInUserNamespace` + `Strip`
-//! （#4801・H6。写像は start と同じ解決から作る）で、他の行は `Keep` + `Strip`。
-//! 範囲写像の行の特殊ビット保持（`PreserveIfChowned` と閉じ込めの祖先）は #4849。subuid のずれの照合は cri 側（#4799）。
+//! 0700 の祖先で判定する入口が cri 側に結線済み）、`RootlessSubordinateIds` が `ChownInUserNamespace` +
+//! `PreserveIfChowned`（#4801・H6、#4849。写像は start と同じ解決から作る）で、他の行は `Keep` + `Strip`。
+//! 範囲写像の行の特殊ビットは、create が 0700 の bundle を祖先として helper へ渡して保持する（pull は根自身の 0700 で判定）。
+//! subuid のずれの照合は cri 側（#4799）。
 
 use fandhe_container_cri::error::CriError;
 use fandhe_container_oci::layer::extract::{
@@ -35,10 +36,11 @@ pub enum ExtractIdentity {
         gid: u32,
     },
     /// 非 root・subuid / subgid の範囲写像あり。コンテナと同じ写像の user namespace の中で `chown` する
-    /// `ChownInUserNamespace` + `Strip`（#4801・H6）。展開は再 exec した helper が行い（`userns_helper`。#4795・#4847・#4848）、
+    /// `ChownInUserNamespace` + `PreserveIfChowned`（#4801・H6、#4849）。展開は再 exec した helper が行い（`userns_helper`。#4795・#4847・#4848）、
     /// helper が参加した写像と `uid` / `gid` の指紋が違えば書き込みの前に拒否する。削除は `UsernsTreeRemover`（#4800）。
     /// 写像は start の launcher・helper と同じ解決（`resolve_id_maps`）から作り、要求の入力からは受けない。
-    /// 特殊ビットは `Strip`（2026-11-16 のオーナー判断 C）。保持は #4849。
+    /// 特殊ビットは `PreserveIfChowned`（#4849。create は 0700 の bundle を閉じ込めの祖先として helper へ渡す。
+    /// 2026-11-16 のオーナー判断 C の `Strip` から、選択肢 A の実装で切り替えた）。
     RootlessSubordinateIds {
         /// uid の写像（コンテナ id → ホスト id）。
         uid: IdMap,
@@ -72,7 +74,7 @@ pub fn extract_options_for(identity: &ExtractIdentity) -> ExtractOptions {
                 uid: uid.clone(),
                 gid: gid.clone(),
             })
-            .with_special_bits(SpecialBitsPolicy::Strip),
+            .with_special_bits(SpecialBitsPolicy::PreserveIfChowned),
         ExtractIdentity::HostRoot | ExtractIdentity::Unsupported => ExtractOptions::new(),
     }
 }
@@ -201,7 +203,7 @@ mod tests {
     }
 
     /// SEC-5・OCI-1・#2792・#4805・#4801: 対応表は `RootlessSingleId` が `PreserveIfOwnerMapped`（0 → euid / egid の 1 行）、
-    /// `RootlessSubordinateIds` が `ChownInUserNamespace` + `Strip`（写像そのまま）で、他は既定。
+    /// `RootlessSubordinateIds` が `ChownInUserNamespace` + `PreserveIfChowned`（写像そのまま）で、他は既定。
     #[test]
     fn sec5_oci1_2792_extract_options_table() {
         let sub = extract_options_for(&ExtractIdentity::RootlessSubordinateIds {
@@ -215,7 +217,7 @@ mod tests {
                     uid: sample_map(1000),
                     gid: sample_map(1001),
                 })
-                .with_special_bits(SpecialBitsPolicy::Strip)
+                .with_special_bits(SpecialBitsPolicy::PreserveIfChowned)
         );
         for id in [ExtractIdentity::HostRoot, ExtractIdentity::Unsupported] {
             assert_eq!(extract_options_for(&id), ExtractOptions::new(), "{id:?}");

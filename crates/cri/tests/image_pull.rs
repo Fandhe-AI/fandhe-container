@@ -2500,6 +2500,8 @@ mod userns_unpack_removal {
     #[derive(Debug, Default)]
     struct FakeExtractor {
         calls: Mutex<Vec<usize>>,
+        /// 渡された祖先の有無（pull は常に `None`。#4849）。
+        ancestors: Mutex<Vec<bool>>,
         fail: Option<OciErrorCode>,
     }
 
@@ -2508,12 +2510,14 @@ mod userns_unpack_removal {
             &self,
             layers: &[ImageLayer<'_>],
             root: &ExtractRoot,
+            ancestor: Option<&ExtractRoot>,
             max_uncompressed_layer_bytes: u64,
             limits: ExtractLimits,
             options: &ExtractOptions,
             _budget: &ReleaseBudget<'_>,
         ) -> Result<(), OciError> {
             self.calls.lock().unwrap().push(layers.len());
+            self.ancestors.lock().unwrap().push(ancestor.is_some());
             if let Some(code) = self.fail {
                 return Err(OciError::new(code, "injected"));
             }
@@ -2600,6 +2604,8 @@ mod userns_unpack_removal {
             .with_layer_extractor(ex.clone());
         puller.pull(&req("alpine:3.20")).expect("pull");
         assert_eq!(*ex.calls.lock().unwrap(), vec![2]);
+        // SEC-5・#4849: pull は祖先を渡さず、展開の根自身の 0700 で判定させる。
+        assert_eq!(*ex.ancestors.lock().unwrap(), vec![false]);
         // 公開後の `unpack/` の残り（空）の後始末だけが remover へ回る。
         assert_eq!(*rm.0.lock().unwrap(), vec![RemovalTarget::PullUnpack]);
         let entry = entry_path(&dir, SHA_CONFIG);

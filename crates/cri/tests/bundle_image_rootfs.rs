@@ -487,6 +487,8 @@ mod userns_fakes {
     #[derive(Debug, Default)]
     pub struct FakeExtractor {
         pub calls: Mutex<Vec<usize>>,
+        /// 渡された祖先の inode（`None` は祖先なし。#4849）。
+        pub ancestors: Mutex<Vec<Option<u64>>>,
     }
 
     impl SubordinateLayerExtractor for FakeExtractor {
@@ -494,12 +496,20 @@ mod userns_fakes {
             &self,
             layers: &[ImageLayer<'_>],
             root: &ExtractRoot,
+            ancestor: Option<&ExtractRoot>,
             max_uncompressed_layer_bytes: u64,
             limits: ExtractLimits,
             options: &ExtractOptions,
             _budget: &ReleaseBudget<'_>,
         ) -> Result<(), OciError> {
             self.calls.lock().unwrap().push(layers.len());
+            self.ancestors.lock().unwrap().push(ancestor.map(|a| {
+                use std::os::unix::fs::MetadataExt as _;
+                fs::File::from(a.as_fd().try_clone_to_owned().unwrap())
+                    .metadata()
+                    .unwrap()
+                    .ino()
+            }));
             extract_image_layers_bounded_in(
                 &NoopOciOpRecorder,
                 layers,
@@ -1155,6 +1165,14 @@ fn sec5_4848_userns_pull_create_release_round_trip() {
     let p = env.provider_with(source(Some(ex.clone()), rm.clone()));
     let dir = prepare(&p, "ctr-4848", &container(&env.image_id)).expect("prepare");
     assert_eq!(*ex.calls.lock().unwrap(), vec![2]);
+    // SEC-5・SEC-1・#4849: create は 0700 の bundle ディレクトリを閉じ込めの祖先として extractor へ渡す。
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        assert_eq!(
+            *ex.ancestors.lock().unwrap(),
+            vec![Some(fs::metadata(&dir).unwrap().ino())]
+        );
+    }
     assert_eq!(fs::read(dir.join("rootfs/world")).unwrap(), b"world");
     assert_eq!(fs::read(dir.join("rootfs/etc/hello")).unwrap(), b"abc");
     p.release("ctr-4848").expect("release");

@@ -687,6 +687,8 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
                 let result = extractor.extract_layers(
                     layers,
                     extract_root,
+                    // pull は祖先なし。根 `unpack/entry/rootfs` 自身が 0700 のため自身で判定できる（#4849）。
+                    None,
                     self.config.max_uncompressed_layer_bytes,
                     self.config.extract_limits,
                     &self.config.extract_options,

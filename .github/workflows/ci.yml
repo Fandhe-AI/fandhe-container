@@ -2130,7 +2130,7 @@ jobs:
             cargo test -p fandhe-container-plugin-cri --test userns_helper_real -- --ignored
           sel='^userns_helper_real: (inspect joined|stat target owner is namespace root|'
           sel="${sel}remove subordinate-owned tree|extract keeps tar owners in namespace|"
-          sel="${sel}table row extracts with tar owners and strips special bits) ok "
+          sel="${sel}table row extracts with tar owners and keeps special bits) ok "
           scripts/check-success-lines.sh --name userns_helper_real --src crates/plugin-cri/tests/userns_helper_real.rs \
             --log "${log}" \
             --select "${sel}" \

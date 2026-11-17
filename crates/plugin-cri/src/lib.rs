@@ -23,7 +23,7 @@
 //! op-stats のスナップショットファイルを安全に開いて原子的に置き換える部品は [`snapshot_file`]（#4335・CRI-6・REPAIR-4・SEC-1。`telemetry::OpStatsFileSink`〔#4337〕が使う。`main.rs` へ `--op-stats-file` として結線済み〔#4340〕）。
 //! user namespace の中で展開・削除する再 exec helper の入口は [`userns_helper`]（隠し引数 `__extract-in-userns`。入口の振り分け・親側の起動部品・
 //! namespace への参加・結果の返却に加え、削除モード〔#4800〕と展開モード〔#4847。blob の fd を `SCM_RIGHTS` で受け渡す〕を持つ（cri の注入点
-//! `SubordinateLayerExtractor` と pull・create からの展開の呼び出しは #4848 で配線済み。対応表は #4801 で `ChownInUserNamespace` + `Strip` へ切り替え済み。保持は #4849）。SEC-5・OCI-1・CORE-6・REPAIR-5。#4795。設計は `docs/design/userns-extract-helper.md`）。
+//! `SubordinateLayerExtractor` と pull・create からの展開の呼び出しは #4848 で配線済み。対応表は #4801 で `ChownInUserNamespace` へ切り替え、#4849 で特殊ビットを `PreserveIfChowned` で保持）。SEC-5・OCI-1・CORE-6・REPAIR-5。#4795。設計は `docs/design/userns-extract-helper.md`）。
 //! PLUG-1 区分は plugin（crate-naming.md）。
 
 // `op-stats-test-support` は op-stats の書き出し周期を環境変数で短くする試験専用の入口を有効にする feature で、製品のバイナリに

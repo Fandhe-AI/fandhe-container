@@ -160,7 +160,8 @@
 //!   rootfs の削除経路（#2315・#482。本モジュールの `ChownInUserNamespace` は展開器の側だけ）。
 //!   `PreserveIfOwnerMapped`（`chown` しない 1 行の写像）は従来どおり。
 //! - 0700 の祖先での閉じ込め（#4804）の cri・plugin-cri への結線は create 経路（bundle）で済み（#4805）。pull は祖先を
-//!   渡さず展開の根自身の 0700 で判定する（`docs/design/oci-layer-special-bits.md`）。
+//!   渡さず展開の根自身の 0700 で判定する（`docs/design/oci-layer-special-bits.md`）。祖先は `PreserveIfChowned` にも
+//!   効く（#4849。範囲写像の create が helper へ祖先の fd を渡して特殊ビットを保持する）。
 //! - macOS・Windows・Linux の他アーキテクチャでの、展開と公開の `remove_extracted_tree` のディレクトリ fd 起点の
 //!   解決（現状はパス起点で、確認から使用までの TOCTOU と、木の中に残ったマウントの中身の削除を防げない。#2598 で
 //!   広げないと決めた。特殊ビットの保持は Linux 限定のため SEC-5 の TOCTOU は Linux 固有で、macOS・Windows の本番経路は
@@ -175,7 +176,7 @@
 //! `ExtractedLayer::files_with_stripped_special_bits` に返す（黙って落とさない）。展開物は実行ユーザー所有のため、
 //! ホスト root がほかのユーザーも辿れるステージングへ展開したときに root 所有の setuid が生じるのを防ぐ。
 //!
-//! `SpecialBitsPolicy::PreserveIfOwnerMapped` を渡した呼び出しだけが、次の条件をすべて満たすビットを tar の値のまま
+//! `SpecialBitsPolicy::PreserveIfOwnerMapped` / `PreserveIfChowned` を渡した呼び出しだけが、次の条件をすべて満たすビットを tar の値のまま
 //! 適用する（それ以外は落とす。fail-closed）。条件と根拠は `docs/design/oci-layer-special-bits.md`。
 //! - ホストが Linux で、`root` が実行ユーザー所有の 0700（group / other に権限なし）であること。祖先（0700 の
 //!   ディレクトリ fd）を渡した入口では、`root` 自身の代わりに祖先が「ディレクトリ・0700・`root` と同じ所有 uid・`root` が
@@ -332,7 +333,8 @@ pub struct ExtractedLayer {
 /// 展開の入口 `extract_layers_with_policy` / `extract_image_layers_with_policy`（と `*_with_options` の `ExtractOptions`）が受け取る。呼び出し元は、
 /// rootfs を排他的に所有し、展開から rootfs として使い終わるまで `root` を 0700 に保つこと（権限の後からの
 /// 変更〔TOCTOU〕は防げない）。祖先を渡す入口（`extract_image_layers_confined_in`）では、代わりに祖先を排他的に
-/// 所有して 0700 に保ち、`root` 自身は 0755 でもよい（#4804）。コンテナ内で setuid が効くかは `process.noNewPrivileges` に依り、本ポリシーは
+/// 所有して 0700 に保ち（`root` と同じ所有 uid・展開中に `root` を祖先の外へ動かさない）、`root` 自身は 0755 でもよい
+/// （#4804・#4849。`PreserveIfOwnerMapped` / `PreserveIfChowned` の両方）。コンテナ内で setuid が効くかは `process.noNewPrivileges` に依り、本ポリシーは
 /// ビットの保持までを扱う。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
@@ -1044,11 +1046,12 @@ pub fn extract_image_layers_bounded_in(
 /// `extract_image_layers_bounded_in` に、特殊ビット保持の閉じ込めを判定する 0700 の祖先 `ancestor` を足した版
 /// （SEC-5・SEC-1・OCI-2・#4778・#4804）。
 ///
-/// `ancestor` が `Some` で `SpecialBitsPolicy::PreserveIfOwnerMapped` のとき、`root` 自身が 0700 である条件の代わりに
+/// `ancestor` が `Some` で `SpecialBitsPolicy::PreserveIfOwnerMapped` / `PreserveIfChowned` のとき、`root` 自身が 0700 である条件の代わりに
 /// 祖先で判定する。祖先が「ディレクトリ・group / other に権限なし（0700）・`root` と同じ所有 uid・`root` が配下」
 /// を満たさなければ全ビットを落とす（`SpecialBitsDecision::ConfinementAncestorRejected`）。`root` 自身は 0755 でよい。
 /// 展開の開始・各判定・全レイヤー後（`chown_root` の前）に祖先を `fstat` で再確認し、保持済みのビットがあるのに崩れたら
-/// `FailedPrecondition` で拒否する。`None`・`Strip`・`PreserveIfChowned` では従来どおり `root` 自身の 0700 で判定する。
+/// `FailedPrecondition` で拒否する。`None`・`Strip` では従来どおり（`Strip` は常に落とす・`None` は `root` 自身の 0700 で判定）。
+/// `PreserveIfChowned` の祖先と `root` の所有 uid は展開プロセスの名前空間から見た値で、`chown_root` より前に比べる（#4849）。
 /// 呼び出し側の契約: 祖先を排他的に所有し、`root` を rootfs として使い終わるまで 0700 に保つ。
 /// cri の create 経路が bundle ディレクトリを祖先として渡す（#4805）。
 // 既存の `_bounded_in` に祖先を足した並びを保つ（引数をまとめる型は本入口 1 つのために作らない）。
@@ -1462,7 +1465,7 @@ struct Extractor<'a> {
     mode_readback: fn(&fs::File) -> u32,
     /// 特殊ビットのポリシーの評価結果（展開の開始時に 1 回決める）。
     special: SpecialCtx,
-    /// `PreserveIfOwnerMapped` の閉じ込めを判定する 0700 の祖先（`None` なら `root` 自身。#4804）。
+    /// 特殊ビット保持（`PreserveIfOwnerMapped` / `PreserveIfChowned`）の閉じ込めを判定する 0700 の祖先（`None` なら `root` 自身。#4804）。
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     ancestor: Option<&'a ExtractRoot>,
     /// 所有者の rwx が欠けるディレクトリの（物理パス, mode）。子の作成を妨げないよう全レイヤーの処理後に適用する。
@@ -2209,6 +2212,9 @@ struct SpecialCtx {
     chowned_mode: bool,
     /// `ChownInUserNamespace`（所有者の条件が `special_bits_to_keep_chowned` で変わる）か。
     in_userns: bool,
+    /// 閉じ込めを `root` 自身ではなく祖先で判定したか（#4849）。展開中の再確認が祖先の `fstat` を見る根拠。
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    by_ancestor: bool,
 }
 
 impl SpecialCtx {
@@ -2220,14 +2226,16 @@ impl SpecialCtx {
             owner_of: host_owner,
             chowned_mode: false,
             in_userns: false,
+            by_ancestor: false,
         }
     }
 }
 
 /// ポリシー全体の条件（ポリシー・ホスト OS・`root` の権限）を評価する。`check_root_empty` の後に 1 回だけ呼ぶ。
 ///
-/// `ancestor` が `Some` で `PreserveIfOwnerMapped` のときは、`root` 自身の 0700 の代わりに祖先で閉じ込めを判定する
-/// （#4804。`ancestor_confines`）。
+/// `ancestor` が `Some` で `PreserveIfOwnerMapped` / `PreserveIfChowned` のときは、`root` 自身の 0700 の代わりに
+/// 祖先で閉じ込めを判定する（#4804・#4849。`ancestor_confines`）。祖先と `root` の所有 uid は展開プロセスの
+/// 名前空間から見た値で、`chown_root` より前に比べる。
 fn eval_special_ctx(
     setup: &SpecialSetup,
     anchor: &AnchoredRoot,
@@ -2248,7 +2256,7 @@ fn eval_special_ctx(
         ctx.decision = SpecialBitsDecision::RootAccessibleByOthers;
         let m = anchor.root_meta().map_err(|e| map_fs_err(&e))?;
         let root_uid = (setup.owner_of)(&m).0;
-        let confine_by = ancestor.filter(|_| mapped.is_some());
+        let confine_by = ancestor;
         let confined = match confine_by {
             Some(a) => {
                 ctx.decision = SpecialBitsDecision::ConfinementAncestorRejected;
@@ -2271,6 +2279,7 @@ fn eval_special_ctx(
                 OwnershipPolicy::ChownInUserNamespace { .. }
             );
             ctx.root_uid = root_uid;
+            ctx.by_ancestor = confine_by.is_some();
         }
     }
     #[cfg(not(target_os = "linux"))]
@@ -3056,7 +3065,7 @@ impl Extractor<'_> {
     fn root_still_private(&self) -> bool {
         use std::os::unix::fs::PermissionsExt as _;
         // 祖先で閉じ込めを判定しているとき（#4804）は、`root` ではなく祖先の 0700・所有者を見る（`root` は 0755 でよい）。
-        if let Some(a) = self.ancestor.filter(|_| self.special.ranges.is_some()) {
+        if let Some(a) = self.ancestor.filter(|_| self.special.by_ancestor) {
             return a.meta().is_ok_and(|m| {
                 ancestor_confines(&m, self.special.root_uid, self.special.owner_of)
             });
@@ -3077,7 +3086,7 @@ impl Extractor<'_> {
     /// 祖先なしは真。
     #[cfg(target_os = "linux")]
     fn root_still_beneath_ancestor(&self) -> bool {
-        match self.ancestor.filter(|_| self.special.ranges.is_some()) {
+        match self.ancestor.filter(|_| self.special.by_ancestor) {
             Some(a) => self.anchor.is_beneath(a).unwrap_or(false),
             None => true,
         }
@@ -5341,6 +5350,7 @@ mod tests {
             owner_of: owner_1000,
             chowned_mode: false,
             in_userns: false,
+            by_ancestor: false,
         };
         let all = S_ISUID | S_ISGID | S_ISVTX;
         let k = |req, ids, owner| special_bits_to_keep(req, ids, owner, &ctx);
@@ -7331,6 +7341,7 @@ mod tests {
                 owner_of: host_owner,
                 chowned_mode: true,
                 in_userns: false,
+                by_ancestor: false,
             };
             let all = S_ISUID | S_ISGID | S_ISVTX;
             let k = |req, ids, owner| special_bits_to_keep_chowned(req, ids, owner, (&m, &m), &ctx);
@@ -7620,6 +7631,157 @@ mod tests {
             assert_eq!(mode_of(&sb2.root.join("suid")), 0o755);
         }
 
+        thread_local! {
+            /// 所有 uid を 2000 に見せる祖先の inode（0 なら無し。#4849）。
+            static CH_ANC_INO: Cell<u64> = const { Cell::new(0) };
+        }
+
+        fn ch_anc_owner(m: &fs::Metadata) -> (u32, u32) {
+            use std::os::unix::fs::MetadataExt as _;
+            if m.is_dir() && m.ino() == CH_ANC_INO.get() {
+                (2000, 0)
+            } else {
+                host_owner(m)
+            }
+        }
+
+        /// 祖先 `anc` を渡して `PreserveIfChowned`（ns 内 chown）で 1 レイヤーを展開する（#4849）。
+        fn run_chowned_under(
+            sb: &Sandbox,
+            anc: &Path,
+            entries: &[Vec<u8>],
+            lstat: Lstat,
+        ) -> Result<ExtractedLayer, OciError> {
+            let a = ExtractRoot::open_existing_dir(anc).unwrap();
+            let tar = archive(entries);
+            take_calls();
+            let setup = SpecialSetup {
+                owner_of: ch_anc_owner,
+                ..ns_setup(SpecialBitsPolicy::PreserveIfChowned, rec_fns(), probe_ok)
+            };
+            let r = extract_stack_bounded(
+                &NoopOciOpRecorder,
+                [Rewind::new(Cursor::new(tar.as_slice()))],
+                RootRef::PathUnder(&sb.root, &a),
+                LIM(),
+                lstat,
+                setup,
+                ExtractBudget::new(),
+            )
+            .and_then(single);
+            take_calls();
+            r
+        }
+
+        fn chowned_special_entries() -> Vec<Vec<u8>> {
+            vec![
+                file_owned("suid", 0o4755, 0, 0, b"a"),
+                file_owned("sgid", 0o2755, 33, 33, b"b"),
+                file_owned("sticky", 0o1644, 1000, 1000, b"c"),
+            ]
+        }
+
+        fn set_mode(p: &Path, mode: u32) {
+            fs::set_permissions(p, fs::Permissions::from_mode(mode)).unwrap();
+        }
+
+        /// SEC-5・SEC-1・OCI-2・#4849: 祖先が 0700・同 uid なら、`root` が 0755 でも `PreserveIfChowned` で保持する。
+        #[test]
+        fn sec5_4849_chowned_userns_ancestor_0700_preserves_with_root_0755() {
+            let sb = Sandbox::new();
+            chmod_root(&sb, 0o755);
+            set_mode(&sb.base, 0o700);
+            let l =
+                run_chowned_under(&sb, &sb.base, &chowned_special_entries(), host_lstat).unwrap();
+            assert_eq!(l.special_bits.decision, SpecialBitsDecision::Evaluated);
+            assert_eq!(l.special_bits.preserved_files, 3);
+            let b = l.special_bits.preserved_bits;
+            assert_eq!((b.setuid, b.setgid, b.sticky), (1, 1, 1));
+            assert_eq!(mode_of(&sb.root.join("suid")), 0o4755);
+            assert_eq!(mode_of(&sb.root.join("sgid")), 0o2755);
+            assert_eq!(mode_of(&sb.root.join("sticky")), 0o1644);
+        }
+
+        fn assert_chowned_ancestor_rejected(l: &ExtractedLayer, sb: &Sandbox) {
+            assert_eq!(
+                l.special_bits.decision,
+                SpecialBitsDecision::ConfinementAncestorRejected
+            );
+            assert_eq!(l.special_bits.preserved_files, 0);
+            let b = l.special_bits.stripped_bits;
+            assert_eq!((b.setuid, b.setgid, b.sticky), (1, 1, 1));
+            assert_eq!(mode_of(&sb.root.join("suid")), 0o755);
+            assert_eq!(mode_of(&sb.root.join("sgid")), 0o755);
+            assert_eq!(mode_of(&sb.root.join("sticky")), 0o644);
+        }
+
+        /// SEC-5・SEC-1・#4849: 祖先が 0750 なら全ビットを落とす。
+        #[test]
+        fn sec5_4849_chowned_ancestor_0750_is_rejected() {
+            let sb = Sandbox::new();
+            chmod_root(&sb, 0o755);
+            set_mode(&sb.base, 0o750);
+            let l =
+                run_chowned_under(&sb, &sb.base, &chowned_special_entries(), host_lstat).unwrap();
+            assert_chowned_ancestor_rejected(&l, &sb);
+        }
+
+        /// SEC-5・SEC-1・#4849: 祖先の所有 uid が `root` と違えば全ビットを落とす（`chown_root` より前の値で比べる）。
+        #[test]
+        fn sec5_4849_chowned_ancestor_owner_mismatch_is_rejected() {
+            use std::os::unix::fs::MetadataExt as _;
+            let sb = Sandbox::new();
+            chmod_root(&sb, 0o755);
+            set_mode(&sb.base, 0o700);
+            CH_ANC_INO.set(fs::metadata(&sb.base).unwrap().ino());
+            let r = run_chowned_under(&sb, &sb.base, &chowned_special_entries(), host_lstat);
+            CH_ANC_INO.set(0);
+            assert_chowned_ancestor_rejected(&r.unwrap(), &sb);
+        }
+
+        /// SEC-5・SEC-1・#4849: `root` が祖先の配下でなければ全ビットを落とす。
+        #[test]
+        fn sec5_4849_chowned_ancestor_not_above_root_is_rejected() {
+            let sb = Sandbox::new();
+            chmod_root(&sb, 0o755);
+            let other = sb.base.join("other");
+            fs::create_dir(&other).unwrap();
+            set_mode(&other, 0o700);
+            let l = run_chowned_under(&sb, &other, &chowned_special_entries(), host_lstat).unwrap();
+            assert_chowned_ancestor_rejected(&l, &sb);
+        }
+
+        /// SEC-5・SEC-1・#4849: 保持済みのビットがある状態で祖先が 0755 になったら、終了時に `FailedPrecondition`。
+        #[test]
+        fn sec5_4849_chowned_ancestor_mode_change_after_preserved_file_fails_closed() {
+            fn lstat_then_open(p: &Path) -> std::io::Result<fs::Metadata> {
+                let m = fs::symlink_metadata(p);
+                if p.file_name().is_some_and(|n| n == "plain") {
+                    let anc = p.parent().unwrap().parent().unwrap();
+                    fs::set_permissions(anc, fs::Permissions::from_mode(0o755)).unwrap();
+                }
+                m
+            }
+            let sb = Sandbox::new();
+            chmod_root(&sb, 0o755);
+            set_mode(&sb.base, 0o700);
+            let e = run_chowned_under(
+                &sb,
+                &sb.base,
+                &[
+                    file_owned("suid", 0o4755, 0, 0, b"a"),
+                    file_owned("plain", 0o644, 0, 0, b"b"),
+                ],
+                lstat_then_open,
+            )
+            .expect_err("fail closed");
+            assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+            assert_eq!(
+                e.message(),
+                "the extraction root changed while special mode bits were preserved"
+            );
+        }
+
         /// SEC-5: ns 内の `special_bits_to_keep_chowned` の条件（所有者 0 でも残す・tar の ID と所有者の不一致は落とす）。
         #[test]
         fn sec5_special_bits_to_keep_in_userns_matrix() {
@@ -7631,6 +7793,7 @@ mod tests {
                 owner_of: host_owner,
                 chowned_mode: true,
                 in_userns: true,
+                by_ancestor: false,
             };
             let all = S_ISUID | S_ISGID | S_ISVTX;
             let k = |req, ids, owner| special_bits_to_keep_chowned(req, ids, owner, (&m, &m), &ctx);
@@ -8241,9 +8404,9 @@ mod tests {
             assert!(!ancestor_confines(&dm0700, 1001, owner_1000));
         }
 
-        /// SEC-5・#4804: `Strip` は祖先を渡しても `StripPolicy`、`PreserveIfChowned` は祖先を無視して `root` の 0700 で判定する。
+        /// SEC-5・#4804: `Strip` は祖先を渡しても `StripPolicy`。
         #[test]
-        fn sec5_ancestor_ignored_for_strip_and_chowned() {
+        fn sec5_ancestor_ignored_for_strip() {
             let sb = Sandbox::new();
             chmod_root(&sb, 0o755);
             let anc = sb.base.clone();

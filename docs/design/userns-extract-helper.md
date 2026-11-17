@@ -7,7 +7,7 @@ plugin-cri が範囲写像（subuid / subgid）の user namespace の中でレ�
 ## 背景
 
 マルチスレッドの plugin-cri プロセスは core の `isolate_rootless_subordinate`（単一スレッド必須。`MultiThreaded` で拒否）を
-呼べないため、user namespace に入れない。このため `extract_identity` の `RootlessSubordinateIds` は暫定で `Keep` + `Strip`
+呼べないため、user namespace に入れない。このため `extract_identity` の `RootlessSubordinateIds` は（#4801 の前は）暫定で `Keep` + `Strip`
 のまま（[oci-layer-special-bits.md](./oci-layer-special-bits.md)）。plugin-cri 自身を固定の隠し引数で再 exec した単一スレッドの
 helper を作り、参加後の処理を helper に任せる。
 
@@ -22,7 +22,7 @@ helper を作り、参加後の処理を helper に任せる。
 | H3（#4800） | 削除（Remove。tag 4）と plugin-cri の削除器・cri の注入点 | 本書。実装済み（H6 で有効化済み） |
 | H4（#4798） | `image_ownership` の複製と fixture | 実装済み |
 | H5（#4799） | pull / start の subuid のずれの照合 | 実装済み |
-| H6（#4801） | `extract_options_for` の対応表の切り替え | 実装済み（2026-11-16 のオーナー判断 C: `ChownInUserNamespace` + `Strip`。特殊ビットの保持は #4849。[oci-layer-special-bits.md](./oci-layer-special-bits.md)「`PreserveIfChowned` と rootfs の 0755 化の両立」） |
+| H6（#4801） | `extract_options_for` の対応表の切り替え | 実装済み（2026-11-16 のオーナー判断 C: `ChownInUserNamespace` + `Strip`。特殊ビットの保持は #4849 で `PreserveIfChowned` にして実装済み。[oci-layer-special-bits.md](./oci-layer-special-bits.md)「`PreserveIfChowned` と rootfs の 0755 化の両立」） |
 | H7（#4802） | CI への組み込み・成功行の照合・所要時間の記録 | 未 |
 
 H 番号の注記: #4796（H2）の実体は符号化のみで、展開モード（Extract・tag 3）は #4847 で実装した。以降は展開モードを #4847 と書く。
@@ -53,8 +53,8 @@ plugin-cri（親。マルチスレッド）
 - 応答: 固定 32 バイト `[version, status, mode または error tag, flags, u32 × 7]`。未使用のスロットが 0 でなければ拒否
 - モード: Inspect（tag 1。`joined`・`threads`・`dumpable`・`euid`・`egid`・写像の行数）、StatTarget（tag 2。対象 fd の uid・gid・mode）。
   Remove（tag 4。H3）は固定 4 バイトの payload `[target tag, 0, 0, 0]`（target 1 = bundle の `rootfs`、2 = pull の `unpack`）。
-  tag 3（Extract。#4847）は固定部 48 バイト + レイヤー 1〜128 件 × 76 バイトの可変長（後述「展開モード」）。helper は header を
-  検査して期待の長さ（tag ごとに固定、Extract は `48 + n × 76`）が決まってから、その長さだけを固定長バッファへ読む（確保しない）。長さ違い・未知の target・予約バイト非 0 は
+  tag 3（Extract。#4847）は固定部 116 バイト + レイヤー 0〜128 件 × 76 バイトの可変長（後述「展開モード」）。helper は header を
+  検査して期待の長さ（tag ごとに固定、Extract は `116 + n × 76`）が決まってから、その長さだけを固定長バッファへ読む（確保しない）。長さ違い・未知の target・予約バイト非 0 は
   `invalid_request`。応答は `Removed`（mode tag 4・スロット全 0）
 - エラー語彙（固定。パス・errno・uid を含めない。REPAIR-4）: `invalid_request`・`request_too_large`・`unimplemented`・
   `multi_threaded`・`no_subordinate_ids`・`join_failed`・`not_non_dumpable`・`request_timeout`・`remove_refused`（マウント越え・種別違い等。`FailedPrecondition`）・`remove_failed`（それ以外。`Internal`）・`extract_failed`
@@ -80,15 +80,15 @@ plugin-cri（親。マルチスレッド）
 
 ## 展開モード（#4847・SEC-5・OCI-1・OCI-2・CORE-6・REPAIR-2・REPAIR-5）
 
-- 要求 payload（BE・固定長）: 固定部 48 バイト = `[ownership tag（1 = ChownInUserNamespace のみ）, special bits tag（1 = Strip・
+- 要求 payload（BE・固定長）: 固定部 116 バイト = `[ownership tag（1 = ChownInUserNamespace のみ）, special bits tag（1 = Strip・
   2 = PreserveIfChowned）, layer_count(u16), work_ms(u32, 1〜600000), u64 × 5（max_entries・max_total_bytes・max_input_bytes・
-  max_tracked_paths・max_uncompressed_bytes）]`、レイヤー 76 バイト = `[media 添字, 0, 0, 0, size(u64), digest(32 バイト), diff_id(32 バイト)]`（media 添字は `LAYER_MEDIA_TYPES` の 1 起点で、
-  文字列は送らない）。最大 48 + 128 × 76 = 9776 バイトで、16 KiB の上限に収まる。
+  max_tracked_paths・max_uncompressed_bytes）, 期待する uid / gid 写像の指紋(32 × 2), 閉じ込めの祖先の旗（4 バイト。先頭 0 / 1・残り 0。#4849）]`、レイヤー 76 バイト = `[media 添字, 0, 0, 0, size(u64), digest(32 バイト), diff_id(32 バイト)]`（media 添字は `LAYER_MEDIA_TYPES` の 1 起点で、
+  文字列は送らない）。最大 116 + 128 × 76 = 9844 バイトで、16 KiB の上限に収まる。
   長さ・件数・版・予約欄・各値の範囲は確保の前に検査する。制限値は 1 以上かつ oci の既定値以下（親が上限を広げられない。
   既定値より大きい上限が要るときは wire の変更が要る）
 - fd の割り当て: fd 0・1・2 は変えない。展開先は fd 1 を `/proc/self/fd/N` として開いた `ExtractRoot`（削除モードと同じ手法。パスは渡さない）。
   blob の fd だけを、要求 frame の後に 1 バイトの token（`0x58`）に添えて 1 通の `SCM_RIGHTS` で送る（上限 `MAX_EXTRACT_LAYERS` = 128。
-  `SCM_MAX_FD` の 253 以下）。helper は参加の後に受けるため、dumpable な holder の窓に fd・要求は入らない
+  `SCM_MAX_FD` の 253 以下）。祖先の旗が 1 のときは、blob の通の後に別の通（token `0x41`）で閉じ込めの祖先のディレクトリ fd を 1 本だけ送る（blob と同じ通にすると上限 128 を超えるため。#4849）。helper は参加の後に受けるため、dumpable な holder の窓に fd・要求は入らない
 - 所有者の写像は wire で受けない。helper が参加に使った写像（`resolve_id_maps` の結果）から `OwnershipPolicy::ChownInUserNamespace` を作る
   （親が任意の写像を注入できない。変換は `image_ownership::to_oci_map` を再利用し、複製しない）。`--no-join`（試験専用）だけは写像が
   無いので `Keep`
@@ -100,8 +100,11 @@ plugin-cri（親。マルチスレッド）
   待ちは `run_bounded` と同じ（絶対期限・取り消しの旗・kill・回収）。helper へ渡す `work_ms` は作業予算と期限までの残りの小さい方（1 ms 以上）
 - 契約: blob の fd は親と helper が open file description を共有するため、展開が終わるまで親は読まない・seek しない。`Err` のとき
   展開先は途中まで書かれているので、呼び出し側が破棄する。同時実行数の上限は呼び出し側が持つ
-- 対象外・残余: 閉じ込めの祖先（`extract_image_layers_confined_in` の `ancestor`）は渡さない（保持は #4849。
-  必要になったら wire の予約欄で足す）。対応表の切り替えは #4801 で済み、CI への組み込み（#4802）は後続。
+- 閉じ込めの祖先（#4849）: 親の `run_extract_bounded` の `ancestor`（create は 0700 の bundle ディレクトリの fd）を旗と別の通で送り、
+  helper が `/proc/self/fd/N` で開いて oci の `extract_image_layers_confined_in` へ渡す。旗と fd の食い違い・ディレクトリでない fd は
+  `InvalidRequest`（親も spawn の前に拒否する）。pull は祖先を渡さず、根自身の 0700 で判定する。祖先と `root` の所有 uid は helper の
+  名前空間から見た値で、`chown_root` より前に比べる。
+- 対象外・残余: 対応表の切り替えは #4801・#4849 で済み、CI への組み込み（#4802）は後続。
   helper の中の oci 操作記録（`OciOpRecorder`）は捨てる（観測は親の呼び出し単位）
 
 ## 削除モード（H3。#4800・SEC-5・OCI-7・CORE-6・REPAIR-4・REPAIR-5）
@@ -133,7 +136,7 @@ core の `remove_tree_in_userns` は単一スレッドの fork 前提で tokio �
   期限後の kill・回収に要する猶予（`JOIN_BUDGET` とは別）だけが呼び出し側の期限を超えうる。
 - 残余: `PullSession::abort` と起動時の pull 回収 GC は oci 内のホスト側の削除のままで、subuid 所有の残骸（unpack の削除に
   失敗した `staging/<id>`）は消せない（H6 で実害が出る前に別 issue。起票は承認後）。公開済み rootfs の GC は TASK-183 が未実装
-- 有効化: 対応表（`extract_options_for`）の範囲写像の行が `ChownInUserNamespace` + `Strip` を返す（H6・#4801 で切り替え済み）。
+- 有効化: 対応表（`extract_options_for`）の範囲写像の行が `ChownInUserNamespace` + `PreserveIfChowned` を返す（H6・#4801 で切り替え、#4849 で特殊ビットの保持）。
   実機試験は `userns_helper_real`（CI へは platform-ci の ubuntu に組み込み済み・#4802）
 
 ### cri の展開の注入点（#4848）

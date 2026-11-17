@@ -460,8 +460,32 @@ fn pull_fixture_image(cache_dir: &Path) -> String {
     };
     let hex = |d: &Digest| d.as_str().trim_start_matches("sha256:").to_owned();
     let blobs = HashMap::from([(hex(&config_digest), config), (hex(&layer_digest), layer)]);
-    let pull = PullConfig::new(cache_dir).expect("pull config");
-    let pulled = OciImagePuller::new(FakeClient { manifest, blobs }, pull)
+    // プラグイン本体と同じ展開設定で pull する（記録の照合が一致する。範囲写像の行は helper 経由の展開が要る。#4801）。
+    let mut pull = PullConfig::new(cache_dir).expect("pull config");
+    let identity = fandhe_container_plugin_cri::extract_identity::resolve_extract_identity()
+        .expect("resolve extract identity");
+    pull.extract_options =
+        fandhe_container_plugin_cri::extract_identity::extract_options_for(&identity);
+    let puller = OciImagePuller::new(FakeClient { manifest, blobs }, pull);
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    let puller = {
+        use fandhe_container_plugin_cri::userns_helper::{
+            USERNS_HELPER_ARG, UsernsHelperLauncher, UsernsLayerExtractor, UsernsTreeRemover,
+        };
+        let launcher =
+            || UsernsHelperLauncher::with_fixed_command(BIN, vec![USERNS_HELPER_ARG.into()]);
+        puller
+            .with_tree_remover(std::sync::Arc::new(
+                UsernsTreeRemover::with_launcher_and_limit(launcher(), 2),
+            ))
+            .with_layer_extractor(std::sync::Arc::new(
+                UsernsLayerExtractor::with_launcher_and_limit(launcher(), 2),
+            ))
+    };
+    let pulled = puller
         .pull(&PullRequest {
             reference: "busybox:1.36".to_owned(),
             credentials: None,

@@ -12,8 +12,8 @@
 //! cli 側と本ファイルの変換は共有 fixture `crates/core/testdata/image_ownership_cases.txt` で照合する
 //! （`tests/image_ownership_fixture.rs`。cli 側も同じ照合ドライバを取り込む）。片方だけ直すと落ちる。
 //!
-//! # 未配線（REPAIR-3）
-//! 本番の呼び出し元はまだ無い。エラー文言は固定の英語で、パス・ユーザー名・errno を含めない。
+//! # 呼び出し元
+//! `extract_identity`（#4801）。エラー文言は固定の英語で、パス・ユーザー名・errno を含めない。
 
 use fandhe_container_core::oci_runtime::SubordinateIdSource;
 use fandhe_container_core::rootless::{IdMapSet, single_id_mapping};

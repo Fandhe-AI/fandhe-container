@@ -18,11 +18,11 @@ helper を作り、参加後の処理を helper に任せる。
 | H1（#4795） | 入口の振り分け・親側の起動部品・参加・結果の返却（Inspect・StatTarget） | 本書。実装済み |
 | H2（#4796） | 展開の記録の符号化 | 実装済み |
 | 展開モード（#4847） | 展開モード（Extract・tag 3）の wire・helper 内の展開・親側の期限つき入口（`run_extract_bounded`）・blob の fd の `SCM_RIGHTS` の受け渡し | 本書。実装済み |
-| 展開の注入点（#4848） | cri の `SubordinateLayerExtractor`・plugin-cri の `UsernsLayerExtractor`・pull と create の呼び出し | 本書「cri の展開の注入点（#4848）」。実装済み（有効化は H6） |
-| H3（#4800） | 削除（Remove。tag 4）と plugin-cri の削除器・cri の注入点 | 本書。実装済み（有効化は H6） |
+| 展開の注入点（#4848） | cri の `SubordinateLayerExtractor`・plugin-cri の `UsernsLayerExtractor`・pull と create の呼び出し | 本書「cri の展開の注入点（#4848）」。実装済み（H6 で有効化済み） |
+| H3（#4800） | 削除（Remove。tag 4）と plugin-cri の削除器・cri の注入点 | 本書。実装済み（H6 で有効化済み） |
 | H4（#4798） | `image_ownership` の複製と fixture | 実装済み |
 | H5（#4799） | pull / start の subuid のずれの照合 | 実装済み |
-| H6（#4801） | `extract_options_for` の対応表の切り替え | 未（着手前確認で `PreserveIfChowned` と create の rootfs 0755 化が両立せず、オーナー判断待ち。[oci-layer-special-bits.md](./oci-layer-special-bits.md)「`PreserveIfChowned` と rootfs の 0755 化の両立」） |
+| H6（#4801） | `extract_options_for` の対応表の切り替え | 実装済み（2026-11-16 のオーナー判断 C: `ChownInUserNamespace` + `Strip`。特殊ビットの保持は #4849。[oci-layer-special-bits.md](./oci-layer-special-bits.md)「`PreserveIfChowned` と rootfs の 0755 化の両立」） |
 | H7（#4802） | CI への組み込み・成功行の照合・所要時間の記録 | 未 |
 
 H 番号の注記: #4796（H2）の実体は符号化のみで、展開モード（Extract・tag 3）は #4847 で実装した。以降は展開モードを #4847 と書く。
@@ -100,8 +100,8 @@ plugin-cri（親。マルチスレッド）
   待ちは `run_bounded` と同じ（絶対期限・取り消しの旗・kill・回収）。helper へ渡す `work_ms` は作業予算と期限までの残りの小さい方（1 ms 以上）
 - 契約: blob の fd は親と helper が open file description を共有するため、展開が終わるまで親は読まない・seek しない。`Err` のとき
   展開先は途中まで書かれているので、呼び出し側が破棄する。同時実行数の上限は呼び出し側が持つ
-- 対象外・残余: 閉じ込めの祖先（`extract_image_layers_confined_in` の `ancestor`）は渡さない（根の 0700 化は #4801 のオーナー判断待ち。
-  必要になったら wire の予約欄で足す）。対応表の切り替え（#4801）・CI への組み込み（#4802）は後続。
+- 対象外・残余: 閉じ込めの祖先（`extract_image_layers_confined_in` の `ancestor`）は渡さない（保持は #4849。
+  必要になったら wire の予約欄で足す）。対応表の切り替えは #4801 で済み、CI への組み込み（#4802）は後続。
   helper の中の oci 操作記録（`OciOpRecorder`）は捨てる（観測は親の呼び出し単位）
 
 ## 削除モード（H3。#4800・SEC-5・OCI-7・CORE-6・REPAIR-4・REPAIR-5）
@@ -133,7 +133,7 @@ core の `remove_tree_in_userns` は単一スレッドの fork 前提で tokio �
   期限後の kill・回収に要する猶予（`JOIN_BUDGET` とは別）だけが呼び出し側の期限を超えうる。
 - 残余: `PullSession::abort` と起動時の pull 回収 GC は oci 内のホスト側の削除のままで、subuid 所有の残骸（unpack の削除に
   失敗した `staging/<id>`）は消せない（H6 で実害が出る前に別 issue。起票は承認後）。公開済み rootfs の GC は TASK-183 が未実装
-- 有効化: 対応表（`extract_options_for`）が `ChownInUserNamespace` を返すまで本番では通らない。切り替えは H6（#4801）。
+- 有効化: 対応表（`extract_options_for`）の範囲写像の行が `ChownInUserNamespace` + `Strip` を返す（H6・#4801 で切り替え済み）。
   実機試験は `userns_helper_real`（CI への組み込みは H7・#4802）
 
 ### cri の展開の注入点（#4848）

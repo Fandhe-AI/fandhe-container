@@ -11,8 +11,7 @@
 //! ときは従来のホスト側の展開をそのまま通す。真なのに実装（extractor と remover の両方）が注入されていなければ、ホスト側の
 //! 展開へ縮退せず、展開先を作る前に `FAILED_PRECONDITION` で拒否する（fail-closed。消せない木を作らない）。
 //!
-//! 実装は plugin-cri の `UsernsLayerExtractor` の 1 つだけ。対応表の切り替え（`ChownInUserNamespace` を返す）は H6（#4801）で、
-//! それまで本番では通らない。
+//! 実装は plugin-cri の `UsernsLayerExtractor` の 1 つだけ。対応表の切り替え（`ChownInUserNamespace` を返す）は H6（#4801）で有効化済み。
 
 use crate::error::CriError;
 

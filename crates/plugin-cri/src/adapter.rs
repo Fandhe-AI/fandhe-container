@@ -1017,7 +1017,7 @@ pub const PLUGIN_PULL_DEADLINE: Duration = Duration::from_secs(540);
 /// 本番の `PullConfig`（キャッシュは `<state_root>/.cri/images`。pull と create の展開設定の単一の出所）。
 ///
 /// 所有者・特殊ビットは呼び出し元が `crate::extract_identity::extract_options_for` で選んだ値を渡す
-/// （start と同じ権限モデルの解決から。現状はどの行も `Keep` + `Strip`。本来の値の配線は後続 issue。SEC-5・OCI-1・#2792・REPAIR-3）。
+/// （start と同じ権限モデルの解決から。範囲写像の行は `ChownInUserNamespace` + `Strip`〔#4801〕。SEC-5・OCI-1・#2792・REPAIR-3）。
 #[cfg(unix)]
 fn production_pull_config(
     state_root: &std::path::Path,
@@ -2420,7 +2420,7 @@ pub fn bundle_provider_with_options(
         source = source.with_recorder(recorder);
     }
     // 範囲写像で展開した subuid 所有の木の削除は再 exec helper の削除モードへ回す（#4800・SEC-5・OCI-7）。
-    // 使うかどうかは展開設定（`ChownInUserNamespace` か）で決まり、現状の対応表（H6 まで）では通らない。
+    // 使うかどうかは展開設定（`ChownInUserNamespace` か）で決まり、範囲写像の行（`RootlessSubordinateIds`。#4801）で通る。
     #[cfg(all(
         target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")
@@ -2602,6 +2602,56 @@ mod tests {
                 .extract_options,
             create.extract_options
         );
+    }
+
+    /// SEC-5・OCI-1・#4801: 範囲写像の行（`ChownInUserNamespace` + `Strip`）が pull と create の設定へ同じ値で届き、
+    /// 削除器・展開器を使う条件（写像つきの所有者）を満たす。符号化・照合の本体は cri 側の試験が担う。
+    #[cfg(unix)]
+    #[test]
+    fn sec5_oci1_4801_subordinate_row_reaches_pull_and_create() {
+        use fandhe_container_oci::layer::extract::{IdMap, IdRange, OwnershipPolicy};
+        let dir = std::env::temp_dir().join(format!("fcpc-4801-row-{}", std::process::id()));
+        let map = IdMap::new(vec![
+            IdRange {
+                container_id: 0,
+                host_id: 1000,
+                count: 1,
+            },
+            IdRange {
+                container_id: 1,
+                host_id: 100_000,
+                count: 65_536,
+            },
+        ])
+        .expect("map");
+        let store: Arc<dyn StateStore> = Arc::new(OneRecord::new(record(false)));
+        let rt = Arc::new(CoreLifecycleRuntime::with_recorder(
+            Arc::clone(&store),
+            Arc::new(OpRecorder::new()),
+        ));
+        let m = map.clone();
+        let backends = CriPluginBackends::new(rt, store, Arc::new(UnimplementedNetwork))
+            .with_extract_identity_resolver(move || {
+                Ok(
+                    crate::extract_identity::ExtractIdentity::RootlessSubordinateIds {
+                        uid: m.clone(),
+                        gid: m.clone(),
+                    },
+                )
+            });
+        let opts = backends.extract_options().expect("resolved");
+        assert!(matches!(
+            &opts.ownership,
+            OwnershipPolicy::ChownInUserNamespace { uid, gid } if *uid == map && *gid == map
+        ));
+        assert_eq!(
+            opts.special_bits,
+            fandhe_container_oci::layer::extract::SpecialBitsPolicy::Strip
+        );
+        let pull = production_pull_config(&dir, &opts).expect("pull");
+        let create = production_extract_config(&dir, &opts).expect("create");
+        assert_eq!(pull.extract_options, opts);
+        assert_eq!(create.extract_options, opts);
     }
 
     /// SEC-5・OCI-1・#2792: 解決は 1 回だけで pull / create が共有し、失敗は既定値へ縮退せず毎回同じ区分で失敗する。

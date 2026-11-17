@@ -455,7 +455,7 @@ impl ExtractLayerSpec {
 /// 展開要求（展開モード。所有者の方針は `ChownInUserNamespace` 固定で、写像は helper が参加に使ったものを使う）。
 ///
 /// 制限値は 1 以上かつ oci の既定値以下に限る（親が上限を広げて helper に無制限の確保・書き込みをさせないため）。
-/// 既定値より大きい上限が要るようになったら、wire の版を上げて足す。閉じ込めの祖先（`confined_in`）は未対応（#4801 の判断待ち）。
+/// 既定値より大きい上限が要るようになったら、wire の版を上げて足す。閉じ込めの祖先（`confined_in`）は未対応（#4849）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtractRequest {
     special_bits: ExtractSpecialBits,

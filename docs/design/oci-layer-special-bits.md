@@ -19,7 +19,7 @@ tar の値のまま適用する。満たさないものは落とす（fail-close
 `extract_layers_confined`（パス版）を追加した（#4778 の B 案・#4804・SEC-5・SEC-1・OCI-2）。祖先は開いた fd（`ExtractRoot`）で渡し、
 `root` 自身は 0755 でもよい（cri の `open_rootfs_for_search` が展開後に rootfs を 0755 にするため）。祖先を渡さない従来の入口は
 挙動を変えない。祖先は `PreserveIfOwnerMapped` のときだけ使い、`Strip` では読まず、`PreserveIfChowned` は祖先を無視して
-`root` 自身の 0700 で判定する（#4801 の担当。create の 0755 化との両立は下の「`PreserveIfChowned` と rootfs の 0755 化の両立」）。
+`root` 自身の 0700 で判定する（#4849 の担当。create の 0755 化との両立は下の「`PreserveIfChowned` と rootfs の 0755 化の両立」）。
 
 `uid` / `gid` は user namespace の写像（core の `IdMapping` と同じ意味の `container_id host_id count` の 1 行）を
 `IdRange` で渡す。`host_id` は展開するプロセス自身の user namespace から見える ID（そのプロセスの `fstat` が返す
@@ -191,7 +191,7 @@ tar のコンテナ内 ID をそのまま `chown` する（namespace の中で�
   展開した木はホストから見ると subuid の所有になり、ホスト側の後始末（`CreatedRootfs::remove`・delete）は `EPERM` で失敗しうる。
   削除も namespace の中で行う必要がある（`remove_extracted_tree`）。plugin-cri では再 exec helper の削除モードで消す
   （#4800。cri の注入点 `SubordinateTreeRemover`・plugin-cri の `UsernsTreeRemover`。展開設定が `ChownInUserNamespace` のときだけ
-  通り、対応表の切り替え H6 まで本番では有効にならない）。端から端の後始末が動くとは言わない。
+  通る。H6〔#4801〕で範囲写像の行が `ChownInUserNamespace` になり有効）。端から端の後始末が動くとは言わない。
 
 ## 未実装（REPAIR-3）
 
@@ -217,7 +217,7 @@ tar のコンテナ内 ID をそのまま `chown` する（namespace の中で�
   `special-bits=strip` のため `FAILED_PRECONDITION`（`image rootfs cache entry was unpacked with different settings`）で
   拒否される。該当の `<cache>/rootfs/sha256/<hex>` を手動で消して pull し直す（自動移行は未実装）。
   再 exec する helper の入口（隠し引数・親側の起動部品・参加・結果の返却）は #4795 で実装済み
-  （[userns-extract-helper.md](./userns-extract-helper.md)。削除 H3 は #4800、helper の展開モードは #4847、cri の展開の注入点と呼び出しは #4848 で実装済み。対応表の切り替え H6・CI H7 は未）。
+  （[userns-extract-helper.md](./userns-extract-helper.md)。削除 H3 は #4800、helper の展開モードは #4847、cri の展開の注入点と呼び出しは #4848 で実装済み。対応表の切り替え H6 は #4801 で実装済み〔`ChownInUserNamespace` + `Strip`。範囲写像の行〕・CI H7 は未）。
   残り（後続 issue・要起票）: `ChownInUserNamespace` の展開本体・記録の符号化・
   `image_ownership` の置き場所。
   pull と create は `ImageExtractConfig` の 1 か所から同じ値を配る（食い違うと記録の照合で `FAILED_PRECONDITION`）。配線するときの確認事項: `ChownMapped` で展開した rootfs に、
@@ -295,14 +295,16 @@ pull 時と start 時の subuid / subgid のずれ（#2539・#2528 の事後監�
 食い違えば照合点 `match_recorded_settings`（pull の `check_unpack_record` と create の `read_layers` が共有）が
 `FAILED_PRECONDITION` で拒否する（#4799。`ownership=` 行の完全一致・固定文言・旧い `keep` の記録も拒否。試験は
 `sec5_match_recorded_settings_distinguishes_id_mapping_mismatch`・`oci1_sec5_pull_rejects_*`・
-`sec5_create_rejects_unpack_record_with_other_id_mapping`）。本番の値が現状 `Keep` + `Strip` で記録の写像が空のため、
-今は食い違いが起きない。`ChownInUserNamespace` の本番配線は H6（#4801。実装済みを装わない。REPAIR-3。両立の確認結果は「`PreserveIfChowned` と rootfs の 0755 化の両立」）。
+`sec5_create_rejects_unpack_record_with_other_id_mapping`）。範囲写像の行は H6（#4801）で `ChownInUserNamespace` + `Strip` になり、
+記録に写像が入って subuid のずれを検出する（特殊ビットの保持は #4849。両立の確認結果は「`PreserveIfChowned` と rootfs の 0755 化の両立」）。
+切り替え前に範囲写像の環境で pull したキャッシュ（記録が `ownership=keep`）は `image rootfs cache entry was unpacked with a different id mapping` で
+`FAILED_PRECONDITION` になる。ホスト所有の木なので `<cache>/rootfs/sha256/<hex>` を手動で消して pull し直す（自動移行は未実装）。
 詳細は [pull-inventory-wiring.md](pull-inventory-wiring.md)。
 
 ## `PreserveIfChowned` と rootfs の 0755 化の両立（#4801 の着手前確認。SEC-5・OCI-1・OCI-2・REPAIR-3）
 
-結論: create の経路では両立しない。対応表（`extract_options_for`）の `RootlessSubordinateIds` は `Keep` + `Strip` のまま変えず、
-オーナー判断を待つ（Agent の推奨は A。未承認）。
+結論: create の経路では両立しない。2026-11-16 のオーナー判断で C を採り、対応表（`extract_options_for`）の `RootlessSubordinateIds` は
+`ChownInUserNamespace` + `Strip` に切り替えた（#4801）。特殊ビットの保持（A。閉じ込めの祖先）は #4849 で扱う。
 
 | 経路 | `root` の mode | 契約（展開から rootfs として使い終わるまで 0700）との関係 |
 | ---- | -------------- | -------------------------------------------------------- |
@@ -317,9 +319,9 @@ pull 時と start 時の subuid / subgid のずれ（#2539・#2528 の事後監�
 
 - A: 閉じ込めの祖先を `PreserveIfChowned` にも効かせる（#4804 の拡張）。祖先と `root` の所有 uid は ns の中から見た値で、`chown_root` より前に比べる。展開中の再確認を祖先へ移し、契約の文言を改める。cri 側は祖先を既に常に渡している
 - B: create でも `root` を 0700 に保つ。非 root のコンテナユーザーが動かなくなるため現実的でない
-- C: まず `ChownInUserNamespace` + `Strip` で所有者の写像だけ有効にし、特殊ビットの保持は A の決定後に回す（A を採るまでの暫定として許容できる）
+- C（採用）: まず `ChownInUserNamespace` + `Strip` で所有者の写像だけ有効にし、特殊ビットの保持は A（#4849）に回す
 
-範囲の欠け: helper の Extract モード（tag 3）は予約のまま `unimplemented` で、pull・create は今もプロセス内で oci の展開を呼ぶ。
+範囲の欠け（着手前の記録。展開モード #4847・注入点 #4848 で解消済み）: helper の Extract モード（tag 3）は予約のまま `unimplemented` で、pull・create は今もプロセス内で oci の展開を呼ぶ。
 `ChownInUserNamespace` は user namespace 外では `FailedPrecondition` になるため、対応表だけを切り替えると範囲写像の環境で pull と create が全て失敗する。
 切り替えの前に、helper の展開モード（複数 blob の fd の受け渡し・options と制限値の受け渡し）・cri 側の注入点・plugin-cri の本番実装・
 `image_pull.rs` の root 所有者の期待値の切り替えが要る。H6 を「展開の結線」と「対応表の切り替え」に分けることを提案する。

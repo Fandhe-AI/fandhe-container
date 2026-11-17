@@ -11,7 +11,7 @@
 //! ホスト側の削除をそのまま通す。真なのに実装が注入されていなければ、ホスト側の削除へ縮退せず `FAILED_PRECONDITION`
 //! で拒否する（部分的に消して残骸を増やさない。fail-closed）。
 //!
-//! 実装は plugin-cri の `UsernsTreeRemover` の 1 つだけ。切り替え（対応表が `ChownInUserNamespace` を返す）は H6（#4801）。
+//! 実装は plugin-cri の `UsernsTreeRemover` の 1 つだけ。切り替え（対応表が `ChownInUserNamespace` を返す）は H6（#4801）で有効化済み。
 
 use fandhe_container_oci::layer::extract::{ExtractOptions, OwnershipPolicy};
 

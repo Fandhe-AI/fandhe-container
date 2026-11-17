@@ -464,14 +464,24 @@ fn pull_fixture_image(cache_dir: &Path) -> String {
     let mut pull = PullConfig::new(cache_dir).expect("pull config");
     let identity = fandhe_container_plugin_cri::extract_identity::resolve_extract_identity()
         .expect("resolve extract identity");
-    pull.extract_options =
-        fandhe_container_plugin_cri::extract_identity::extract_options_for(&identity);
+    // 範囲写像でも非特権 user namespace と newuidmap が使えない環境では従来のホスト側 Keep 展開へ縮退する
+    // （helper 経由の展開の照合は実機前提の userns_helper_real が担う。ci.md「実機前提テスト」）。
+    let use_helper = !matches!(
+        identity,
+        fandhe_container_plugin_cri::extract_identity::ExtractIdentity::RootlessSubordinateIds { .. }
+    ) || userns_usable();
+    if use_helper {
+        pull.extract_options =
+            fandhe_container_plugin_cri::extract_identity::extract_options_for(&identity);
+    }
     let puller = OciImagePuller::new(FakeClient { manifest, blobs }, pull);
     #[cfg(all(
         target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
-    let puller = {
+    let puller = if !use_helper {
+        puller
+    } else {
         use fandhe_container_plugin_cri::userns_helper::{
             USERNS_HELPER_ARG, UsernsHelperLauncher, UsernsLayerExtractor, UsernsTreeRemover,
         };
@@ -493,6 +503,21 @@ fn pull_fixture_image(cache_dir: &Path) -> String {
         .expect("pull fixture image");
     assert_eq!(pulled.id, config_digest.as_str());
     pulled.id
+}
+
+/// 非特権 user namespace を作れて newuidmap / newgidmap があるか（範囲写像の helper 展開の前提）。
+fn userns_usable() -> bool {
+    ["/usr/bin/newuidmap", "/usr/bin/newgidmap"]
+        .iter()
+        .all(|p| Path::new(p).exists())
+        && std::process::Command::new("unshare")
+            .args(["--user", "--map-root-user", "true"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
 }
 
 fn image_spec(image: &str) -> cri::ImageSpec {

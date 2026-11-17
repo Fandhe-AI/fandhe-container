@@ -464,24 +464,25 @@ fn pull_fixture_image(cache_dir: &Path) -> String {
     let mut pull = PullConfig::new(cache_dir).expect("pull config");
     let identity = fandhe_container_plugin_cri::extract_identity::resolve_extract_identity()
         .expect("resolve extract identity");
-    // 範囲写像でも非特権 user namespace と newuidmap が使えない環境では従来のホスト側 Keep 展開へ縮退する
-    // （helper 経由の展開の照合は実機前提の userns_helper_real が担う。ci.md「実機前提テスト」）。
-    let use_helper = !matches!(
+    // 範囲写像は本番 plugin も helper 経由の展開（ChownInUserNamespace）を選ぶため、前提が無ければ縮退せず fail-closed にする
+    // （Keep で pull すると CreateContainer の展開記録の照合が FAILED_PRECONDITION になる。REPAIR-12）。
+    if matches!(
         identity,
         fandhe_container_plugin_cri::extract_identity::ExtractIdentity::RootlessSubordinateIds { .. }
-    ) || userns_usable();
-    if use_helper {
-        pull.extract_options =
-            fandhe_container_plugin_cri::extract_identity::extract_options_for(&identity);
+    ) && !userns_usable()
+    {
+        panic!(
+            "PRECONDITION FAILED: subordinate-id extraction needs unprivileged user namespaces and newuidmap/newgidmap (see docs/verification/real-machine-tests.md)"
+        );
     }
+    pull.extract_options =
+        fandhe_container_plugin_cri::extract_identity::extract_options_for(&identity);
     let puller = OciImagePuller::new(FakeClient { manifest, blobs }, pull);
     #[cfg(all(
         target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
-    let puller = if !use_helper {
-        puller
-    } else {
+    let puller = {
         use fandhe_container_plugin_cri::userns_helper::{
             USERNS_HELPER_ARG, UsernsHelperLauncher, UsernsLayerExtractor, UsernsTreeRemover,
         };
@@ -510,14 +511,32 @@ fn userns_usable() -> bool {
     ["/usr/bin/newuidmap", "/usr/bin/newgidmap"]
         .iter()
         .all(|p| Path::new(p).exists())
-        && std::process::Command::new("unshare")
-            .args(["--user", "--map-root-user", "true"])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+        && {
+            // 期限つき待機（REPAIR-5）。超過時は kill して回収する。
+            let Ok(mut child) = std::process::Command::new("unshare")
+                .args(["--user", "--map-root-user", "true"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            else {
+                return false;
+            };
+            let end = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(s)) => break s.success(),
+                    Ok(None) if std::time::Instant::now() < end => {
+                        std::thread::sleep(Duration::from_millis(20))
+                    }
+                    _ => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break false;
+                    }
+                }
+            }
+        }
 }
 
 fn image_spec(image: &str) -> cri::ImageSpec {

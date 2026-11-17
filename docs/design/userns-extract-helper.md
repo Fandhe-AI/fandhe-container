@@ -134,7 +134,7 @@ core の `remove_tree_in_userns` は単一スレッドの fork 前提で tokio �
 - 残余: `PullSession::abort` と起動時の pull 回収 GC は oci 内のホスト側の削除のままで、subuid 所有の残骸（unpack の削除に
   失敗した `staging/<id>`）は消せない（H6 で実害が出る前に別 issue。起票は承認後）。公開済み rootfs の GC は TASK-183 が未実装
 - 有効化: 対応表（`extract_options_for`）の範囲写像の行が `ChownInUserNamespace` + `Strip` を返す（H6・#4801 で切り替え済み）。
-  実機試験は `userns_helper_real`（CI への組み込みは H7・#4802）
+  実機試験は `userns_helper_real`（CI へは platform-ci の ubuntu に組み込み済み・#4802）
 
 ### cri の展開の注入点（#4848）
 

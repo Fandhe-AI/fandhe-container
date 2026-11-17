@@ -164,6 +164,14 @@ pub fn resolve_extract_identity() -> Result<ExtractIdentity, CriError> {
         let (euid, egid) = current_euid_egid().map_err(|()| {
             CriError::failed_precondition("cannot determine the plugin process credentials")
         })?;
+        // 試験専用: userns を作れない環境の既定の集合が範囲写像の helper 展開へ入らないよう 1 対 1 に固定する。
+        #[cfg(feature = "pod-holder-test-support")]
+        if std::env::var("FANDHE_CONTAINER_TEST_EXTRACT_IDENTITY").is_ok_and(|v| v == "single-id") {
+            return Ok(ExtractIdentity::RootlessSingleId {
+                uid: euid,
+                gid: egid,
+            });
+        }
         identity_from_privilege(privilege, source.as_ref(), euid, egid)
     }
     #[cfg(not(target_os = "linux"))]

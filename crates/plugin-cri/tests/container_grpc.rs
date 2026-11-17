@@ -150,6 +150,9 @@ fn spawn_server(sock: &Path, xdg: &Path) -> ChildGuard {
         .env("XDG_RUNTIME_DIR", xdg)
         // 既定の集合では本番の保持役（AppArmor の緩和と supervisor の bin が要る）を注入しない。実機前提の試験は注入する（H6・#2877）。
         .env("FANDHE_CONTAINER_TEST_POD_HOLDER", "off")
+        // userns を作れない環境でも既定の集合が通るよう、展開設定を 1 対 1（Keep + PreserveIfOwnerMapped）に固定する。
+        // 範囲写像の helper 展開は userns_helper_real と実機前提の試験が担う（#4801）。
+        .env("FANDHE_CONTAINER_TEST_EXTRACT_IDENTITY", "single-id")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -460,42 +463,20 @@ fn pull_fixture_image(cache_dir: &Path) -> String {
     };
     let hex = |d: &Digest| d.as_str().trim_start_matches("sha256:").to_owned();
     let blobs = HashMap::from([(hex(&config_digest), config), (hex(&layer_digest), layer)]);
-    // プラグイン本体と同じ展開設定で pull する（記録の照合が一致する。範囲写像の行は helper 経由の展開が要る。#4801）。
+    // プラグイン本体（spawn_server が 1 対 1 に固定）と同じ展開設定で pull する（記録の照合が一致する。#4801）。
     let mut pull = PullConfig::new(cache_dir).expect("pull config");
-    let identity = fandhe_container_plugin_cri::extract_identity::resolve_extract_identity()
-        .expect("resolve extract identity");
-    // 範囲写像は本番 plugin も helper 経由の展開（ChownInUserNamespace）を選ぶため、前提が無ければ縮退せず fail-closed にする
-    // （Keep で pull すると CreateContainer の展開記録の照合が FAILED_PRECONDITION になる。REPAIR-12）。
-    if matches!(
-        identity,
-        fandhe_container_plugin_cri::extract_identity::ExtractIdentity::RootlessSubordinateIds { .. }
-    ) && !userns_usable()
-    {
-        panic!(
-            "PRECONDITION FAILED: subordinate-id extraction needs unprivileged user namespaces and newuidmap/newgidmap (see docs/verification/real-machine-tests.md)"
-        );
-    }
-    pull.extract_options =
-        fandhe_container_plugin_cri::extract_identity::extract_options_for(&identity);
-    let puller = OciImagePuller::new(FakeClient { manifest, blobs }, pull);
-    #[cfg(all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ))]
-    let puller = {
-        use fandhe_container_plugin_cri::userns_helper::{
-            USERNS_HELPER_ARG, UsernsHelperLauncher, UsernsLayerExtractor, UsernsTreeRemover,
-        };
-        let launcher =
-            || UsernsHelperLauncher::with_fixed_command(BIN, vec![USERNS_HELPER_ARG.into()]);
-        puller
-            .with_tree_remover(std::sync::Arc::new(
-                UsernsTreeRemover::with_launcher_and_limit(launcher(), 2),
-            ))
-            .with_layer_extractor(std::sync::Arc::new(
-                UsernsLayerExtractor::with_launcher_and_limit(launcher(), 2),
-            ))
+    let (uid, gid) = {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata("/proc/self").expect("stat /proc/self");
+        (m.uid(), m.gid())
     };
+    pull.extract_options = fandhe_container_plugin_cri::extract_identity::extract_options_for(
+        &fandhe_container_plugin_cri::extract_identity::ExtractIdentity::RootlessSingleId {
+            uid,
+            gid,
+        },
+    );
+    let puller = OciImagePuller::new(FakeClient { manifest, blobs }, pull);
     let pulled = puller
         .pull(&PullRequest {
             reference: "busybox:1.36".to_owned(),
@@ -504,39 +485,6 @@ fn pull_fixture_image(cache_dir: &Path) -> String {
         .expect("pull fixture image");
     assert_eq!(pulled.id, config_digest.as_str());
     pulled.id
-}
-
-/// 非特権 user namespace を作れて newuidmap / newgidmap があるか（範囲写像の helper 展開の前提）。
-fn userns_usable() -> bool {
-    ["/usr/bin/newuidmap", "/usr/bin/newgidmap"]
-        .iter()
-        .all(|p| Path::new(p).exists())
-        && {
-            // 期限つき待機（REPAIR-5）。超過時は kill して回収する。
-            let Ok(mut child) = std::process::Command::new("unshare")
-                .args(["--user", "--map-root-user", "true"])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-            else {
-                return false;
-            };
-            let end = std::time::Instant::now() + Duration::from_secs(10);
-            loop {
-                match child.try_wait() {
-                    Ok(Some(s)) => break s.success(),
-                    Ok(None) if std::time::Instant::now() < end => {
-                        std::thread::sleep(Duration::from_millis(20))
-                    }
-                    _ => {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        break false;
-                    }
-                }
-            }
-        }
 }
 
 fn image_spec(image: &str) -> cri::ImageSpec {

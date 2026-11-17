@@ -431,24 +431,6 @@ mod linux {
                 host.uid()
             ));
         }
-        // 別 uid（名前空間内の uid 1000）は、保たれた setuid のファイルがあっても 0700 の bundle の下へ届かない。
-        let suid = bundle.join("rootfs/d/s");
-        if can_reach(&suid, true) {
-            fail("another uid reached below the 0700 bundle");
-        }
-        // 陽性対照 1: 同じ子の役でも uid を変えなければ（名前空間の root = 起動ユーザー）届く。
-        if !can_reach(&suid, false) {
-            fail("positive control: the owner could not reach the file");
-        }
-        // 陽性対照 2: bundle を一時的に 0711 にすると別 uid も届く（到達不能が bundle の 0700 によることの確認）。
-        std::fs::set_permissions(&bundle, std::fs::Permissions::from_mode(0o711))
-            .unwrap_or_else(|e| fail(&format!("chmod bundle open: {e}")));
-        let reached = can_reach(&suid, true);
-        std::fs::set_permissions(&bundle, std::fs::Permissions::from_mode(0o700))
-            .unwrap_or_else(|e| fail(&format!("chmod bundle back: {e}")));
-        if !reached {
-            fail("positive control: another uid could not reach the file under a 0711 bundle");
-        }
         let bundle_fd = File::open(&bundle).unwrap_or_else(|e| fail(&format!("open bundle: {e}")));
         match launcher.run(
             Mode::Remove(RemoveTarget::BundleRootfs),
@@ -638,6 +620,24 @@ mod linux {
                 "host-side owner is not subordinate: {}",
                 host.uid()
             ));
+        }
+        // 別 uid（名前空間内の uid 1000）は、保たれた setuid のファイルがあっても 0700 の bundle の下へ届かない。
+        let suid = bundle.join("rootfs/d/s");
+        if can_reach(&suid, true) {
+            fail("another uid reached below the 0700 bundle");
+        }
+        // 陽性対照 1: 同じ子の役でも uid を変えなければ（名前空間の root = 起動ユーザー）届く。
+        if !can_reach(&suid, false) {
+            fail("positive control: the owner could not reach the file");
+        }
+        // 陽性対照 2: bundle を一時的に 0711 にすると別 uid も届く（到達不能が bundle の 0700 によることの確認）。
+        std::fs::set_permissions(&bundle, std::fs::Permissions::from_mode(0o711))
+            .unwrap_or_else(|e| fail(&format!("chmod bundle open: {e}")));
+        let reached = can_reach(&suid, true);
+        std::fs::set_permissions(&bundle, std::fs::Permissions::from_mode(0o700))
+            .unwrap_or_else(|e| fail(&format!("chmod bundle back: {e}")));
+        if !reached {
+            fail("positive control: another uid could not reach the file under a 0711 bundle");
         }
         let bundle_fd = File::open(&bundle).unwrap_or_else(|e| fail(&format!("open bundle: {e}")));
         match launcher.run(

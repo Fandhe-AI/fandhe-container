@@ -2604,7 +2604,7 @@ mod tests {
         );
     }
 
-    /// SEC-5・OCI-1・#4801: 範囲写像の行（`ChownInUserNamespace` + `Strip`）が pull と create の設定へ同じ値で届き、
+    /// SEC-5・OCI-1・#4801: 範囲写像の行（`ChownInUserNamespace` + `PreserveIfChowned`）が pull と create の設定へ同じ値で届き、
     /// 削除器・展開器を使う条件（写像つきの所有者）を満たす。符号化・照合の本体は cri 側の試験が担う。
     #[cfg(unix)]
     #[test]
@@ -2646,7 +2646,7 @@ mod tests {
         ));
         assert_eq!(
             opts.special_bits,
-            fandhe_container_oci::layer::extract::SpecialBitsPolicy::Strip
+            fandhe_container_oci::layer::extract::SpecialBitsPolicy::PreserveIfChowned
         );
         let pull = production_pull_config(&dir, &opts).expect("pull");
         let create = production_extract_config(&dir, &opts).expect("create");

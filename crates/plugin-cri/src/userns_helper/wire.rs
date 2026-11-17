@@ -1434,18 +1434,18 @@ mod tests {
             Err(HelperErrorCode::RequestTooLarge)
         );
         assert_eq!(
-            decode_request_header(&header(1, 3, [0, 0], 188))
+            decode_request_header(&header(1, 3, [0, 0], 192))
                 .unwrap()
                 .payload_len(),
-            188
+            192
         );
         // 版 2・予約バイトは tag 3 でも InvalidRequest。
         assert_eq!(
-            decode_request_header(&header(2, 3, [0, 0], 188)),
+            decode_request_header(&header(2, 3, [0, 0], 192)),
             Err(HelperErrorCode::InvalidRequest)
         );
         assert_eq!(
-            decode_request_header(&header(1, 3, [0, 1], 188)),
+            decode_request_header(&header(1, 3, [0, 1], 192)),
             Err(HelperErrorCode::InvalidRequest)
         );
     }
@@ -1494,9 +1494,9 @@ mod tests {
             48,
             &(DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES + 1).to_be_bytes(),
         );
-        mutate("media 0", 120, &[0]);
-        mutate("media 7", 120, &[7]);
-        mutate("reserved", 121, &[1]);
+        mutate("media 0", 124, &[0]);
+        mutate("media 7", 124, &[7]);
+        mutate("reserved", 125, &[1]);
         for (name, b) in &cases {
             assert_eq!(
                 decode_request(b),

@@ -2213,6 +2213,7 @@ struct SpecialCtx {
     /// `ChownInUserNamespace`（所有者の条件が `special_bits_to_keep_chowned` で変わる）か。
     in_userns: bool,
     /// 閉じ込めを `root` 自身ではなく祖先で判定したか（#4849）。展開中の再確認が祖先の `fstat` を見る根拠。
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     by_ancestor: bool,
 }
 

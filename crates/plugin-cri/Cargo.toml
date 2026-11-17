@@ -46,8 +46,10 @@ default = []
 op-stats-test-support = []
 # pod-holder-test-support: 保持役 provider の実行ファイルを差し替える入口（`ProductionPodHolder::with_fixed_program`）と、環境変数
 # `FANDHE_CONTAINER_TEST_POD_HOLDER=off` で本番の保持役の注入を止める入口を有効にする（既定の集合の試験が AppArmor の緩和・
-# supervisor の bin なしで本番バイナリを起動できるように。H6・#2877・CRI-2・REPAIR-12）。既定のビルドには含めず、
-# リリースビルドで有効にするとコンパイルが止まる（src/lib.rs の `compile_error!`）。依存は増えない。
+# supervisor の bin なしで本番バイナリを起動できるように。H6・#2877・CRI-2・REPAIR-12）。あわせて、環境変数
+# `FANDHE_CONTAINER_TEST_EXTRACT_IDENTITY=single-id` で展開設定の権限モデルを 1 対 1（`RootlessSingleId`）に固定する入口も
+# 有効にする（userns を作れない既定の集合の試験が範囲写像の helper 展開へ入らないように。`extract_identity.rs`・#4801・SEC-5）。
+# 既定のビルドには含めず、リリースビルドで有効にするとコンパイルが止まる（src/lib.rs の `compile_error!`）。依存は増えない。
 pod-holder-test-support = []
 # userns-helper-test-support: userns helper（隠し引数 `__extract-in-userns`）が試験専用の `--no-join`（参加を省いて Inspect を返す）を受ける口と、
 # 起動役の実行ファイル・参加の見込み時間の差し替え（`UsernsHelperLauncher::with_fixed_command`・`with_join_budget`）を有効にする

@@ -604,11 +604,11 @@ fn sec5_4847_malformed_extract_payloads_get_invalid_request() {
     let good = encode_extract_request(&extract_request(&tar, Digest::sha256_of(&tar)))
         .as_bytes()
         .to_vec();
-    // offset は header 8 バイトを含む frame 先頭から（固定部 112 バイトの直後にレイヤーが続く。wire.rs の単体テストと同じ表）。
+    // offset は header 8 バイトを含む frame 先頭から（固定部 116 バイトの直後にレイヤーが続く。wire.rs の単体テストと同じ表）。
     let mutations: [(&str, usize, Vec<u8>); 8] = [
-        ("reserved", 121, vec![1]),
-        ("media 0", 120, vec![0]),
-        ("media 7", 120, vec![7]),
+        ("reserved", 125, vec![1]),
+        ("media 0", 124, vec![0]),
+        ("media 7", 124, vec![7]),
         ("ownership 2", 8, vec![2]),
         ("special 0", 9, vec![0]),
         ("limit 0", 16, 0u64.to_be_bytes().to_vec()),

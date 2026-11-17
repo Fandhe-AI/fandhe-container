@@ -18,8 +18,8 @@ tar の値のまま適用する。満たさないものは落とす（fail-close
 閉じ込めを `root` 自身ではなく 0700 の祖先ディレクトリで判定する入口 `extract_image_layers_confined_in`（fd 版）・
 `extract_layers_confined`（パス版）を追加した（#4778 の B 案・#4804・SEC-5・SEC-1・OCI-2）。祖先は開いた fd（`ExtractRoot`）で渡し、
 `root` 自身は 0755 でもよい（cri の `open_rootfs_for_search` が展開後に rootfs を 0755 にするため）。祖先を渡さない従来の入口は
-挙動を変えない。祖先は `PreserveIfOwnerMapped` のときだけ使い、`Strip` では読まず、`PreserveIfChowned` は祖先を無視して
-`root` 自身の 0700 で判定する（#4849 の担当。create の 0755 化との両立は下の「`PreserveIfChowned` と rootfs の 0755 化の両立」）。
+挙動を変えない。祖先は `PreserveIfOwnerMapped` と `PreserveIfChowned` のときに使い（#4849 で `PreserveIfChowned` にも効かせた。
+create の 0755 化との両立は下の「`PreserveIfChowned` と rootfs の 0755 化の両立」）、`Strip` では読まない。
 
 `uid` / `gid` は user namespace の写像（core の `IdMapping` と同じ意味の `container_id host_id count` の 1 行）を
 `IdRange` で渡す。`host_id` は展開するプロセス自身の user namespace から見える ID（そのプロセスの `fstat` が返す
@@ -101,7 +101,9 @@ uid / gid）で渡す。入れ子の user namespace の中で展開するとき�
 ## rootful で特殊ビットを残す条件（`SpecialBitsPolicy::PreserveIfChowned`）
 
 `ChownMapped` と組み合わせたときだけ有効（`Keep` との組み合わせは開始前に `InvalidArgument`）。`chown` と読み戻しの後の
-所有者で判定する。ポリシー全体の条件は `PreserveIfOwnerMapped` と同じ（Linux・`root` が 0700）。
+所有者で判定する。ポリシー全体の条件は `PreserveIfOwnerMapped` と同じ（Linux・`root` が 0700。祖先を渡した入口では祖先が
+ディレクトリ・0700・`root` と同じ所有 uid・`root` が祖先の配下。#4849）。祖先と `root` の所有 uid は展開プロセスの名前空間から見た値
+（`fstat`）で、`chown_root` より前に比べる。
 
 | ビット | 残す条件 |
 | ------ | -------- |
@@ -205,8 +207,9 @@ tar のコンテナ内 ID をそのまま `chown` する（namespace の中で�
   消すだけ／macOS の `openat` 系・Windows のハンドル起点操作は新しい FFI 宣言・libc 照合（Windows はオーナー判断）が要る。
   ゲストが共有ディレクトリへ書き込みうる設計（`macos-shared-vm.md`）になれば優先度が上がる
 - 本番の呼び出し元の配線（#2534・#2792）: plugin-cri の `extract_identity` が start と同じ権限モデルの解決から
-  `ExtractOptions` を選び、pull と create へ 1 回の解決結果を渡す（失敗は縮退せず fail-closed）。対応表は現状すべて
-  `Keep` + `Strip`（`RootlessSingleId` だけ #4805 で `Keep` + `PreserveIfOwnerMapped`（コンテナの 0 → 展開プロセスの euid / egid））:
+  `ExtractOptions` を選び、pull と create へ 1 回の解決結果を渡す（失敗は縮退せず fail-closed）。対応表は
+  `Keep` + `Strip`（`RootlessSingleId` だけ #4805 で `Keep` + `PreserveIfOwnerMapped`（コンテナの 0 → 展開プロセスの euid / egid）、
+  `RootlessSubordinateIds` は #4801・#4849 で `ChownInUserNamespace` + `PreserveIfChowned`。create は bundle を祖先として helper へ fd で渡す）:
   ホスト root は本番の start が無く（#2241 D1:A。`ChownMapped` の本番の消費者が無い）、
   SubordinateIds の `ChownInUserNamespace` は tokio のマルチスレッドから user namespace に入れず未配線。
   閉じ込めの祖先（#4805）: create は `<bundles>/<id>`（`SpecBundleProvider` が `create_child_private_dir` で毎回新規に 0700 で作り
@@ -217,7 +220,7 @@ tar のコンテナ内 ID をそのまま `chown` する（namespace の中で�
   `special-bits=strip` のため `FAILED_PRECONDITION`（`image rootfs cache entry was unpacked with different settings`）で
   拒否される。該当の `<cache>/rootfs/sha256/<hex>` を手動で消して pull し直す（自動移行は未実装）。
   再 exec する helper の入口（隠し引数・親側の起動部品・参加・結果の返却）は #4795 で実装済み
-  （[userns-extract-helper.md](./userns-extract-helper.md)。削除 H3 は #4800、helper の展開モードは #4847、cri の展開の注入点と呼び出しは #4848 で実装済み。対応表の切り替え H6 は #4801 で実装済み〔`ChownInUserNamespace` + `Strip`。範囲写像の行〕・CI H7 は未）。
+  （[userns-extract-helper.md](./userns-extract-helper.md)。削除 H3 は #4800、helper の展開モードは #4847、cri の展開の注入点と呼び出しは #4848 で実装済み。対応表の切り替え H6 は #4801、特殊ビットの保持は #4849 で実装済み〔`ChownInUserNamespace` + `PreserveIfChowned`。範囲写像の行〕・CI H7 は未）。
   残り（後続 issue・要起票）: `ChownInUserNamespace` の展開本体・記録の符号化・
   `image_ownership` の置き場所。
   pull と create は `ImageExtractConfig` の 1 か所から同じ値を配る（食い違うと記録の照合で `FAILED_PRECONDITION`）。配線するときの確認事項: `ChownMapped` で展開した rootfs に、
@@ -238,9 +241,16 @@ plugin-cri の対応表は `extract_identity.rs` の `sec5_oci1_2792_extract_opt
 
 祖先での閉じ込め（#4804）: `extract.rs` の `anchored_tests`（`sec5_ancestor_0700_allows_bits_with_root_0755`・
 `sec5_ancestor_equal_to_root_is_beneath`・`sec5_ancestor_0750_is_rejected`・`sec5_ancestor_owner_mismatch_is_rejected`・
-`sec5_ancestor_not_above_root_is_rejected`・`sec5_ancestor_confines_matrix`・`sec5_ancestor_ignored_for_strip_and_chowned`・
+`sec5_ancestor_not_above_root_is_rejected`・`sec5_ancestor_confines_matrix`・`sec5_ancestor_ignored_for_strip`・
 `sec5_ancestor_mode_change_after_preserved_file_fails_closed`・`sec5_ancestor_mode_change_before_special_file_strips_remaining`）と、
 `tests/layer_extract.rs` の `sec5_special_bits_confined_by_ancestor_via_public_api`（実 fstat・実 uid）。
+`PreserveIfChowned` への拡張（#4849）: `chown_tests` の `sec5_4849_chowned_userns_ancestor_0700_preserves_with_root_0755`・
+`sec5_4849_chowned_ancestor_0750_is_rejected`・`sec5_4849_chowned_ancestor_owner_mismatch_is_rejected`・
+`sec5_4849_chowned_ancestor_not_above_root_is_rejected`・`sec5_4849_chowned_ancestor_mode_change_after_preserved_file_fails_closed`。
+cri の祖先の受け渡しは `sec5_4849_*`（`bundle_image_rootfs.rs`・`image_pull.rs`。create は bundle、pull は `None`）、wire は
+`sec5_4849_ancestor_flag_roundtrips_and_rejects_bad_bytes`、helper への fd の受け渡しは `userns_helper_process.rs` の
+`sec5_4849_ancestor_fd_is_received_by_the_real_helper`、実機前提は `userns_helper_real` の対応表の行（setuid / setgid が保たれ、別 uid が
+0700 の bundle の下へ届かないこと）。
 
 `extract.rs` の単体試験。`sec5_special_bits_preserved_when_owner_mapped`（条件を満たす経路で tar の値どおり）、
 `sec5_special_bits_stripped_when_root_is_accessible_by_others`・`sec5_special_bits_dropped_when_tar_owner_is_not_mapped`・
@@ -295,16 +305,22 @@ pull 時と start 時の subuid / subgid のずれ（#2539・#2528 の事後監�
 食い違えば照合点 `match_recorded_settings`（pull の `check_unpack_record` と create の `read_layers` が共有）が
 `FAILED_PRECONDITION` で拒否する（#4799。`ownership=` 行の完全一致・固定文言・旧い `keep` の記録も拒否。試験は
 `sec5_match_recorded_settings_distinguishes_id_mapping_mismatch`・`oci1_sec5_pull_rejects_*`・
-`sec5_create_rejects_unpack_record_with_other_id_mapping`）。範囲写像の行は H6（#4801）で `ChownInUserNamespace` + `Strip` になり、
-記録に写像が入って subuid のずれを検出する（特殊ビットの保持は #4849。両立の確認結果は「`PreserveIfChowned` と rootfs の 0755 化の両立」）。
+`sec5_create_rejects_unpack_record_with_other_id_mapping`）。範囲写像の行は H6（#4801）で `ChownInUserNamespace` になり、#4849 で特殊ビットを `PreserveIfChowned` で保つ。
+記録に写像が入って subuid のずれを検出する（両立の確認結果は「`PreserveIfChowned` と rootfs の 0755 化の両立」）。
+設定の切り替え（#4849）で、切り替え前（`special-bits=strip`）に範囲写像で pull したキャッシュは、記録の設定行が食い違い
+`FAILED_PRECONDITION`（`image rootfs cache entry was unpacked with different settings`）で拒否される。該当の
+`<cache>/rootfs/sha256/<hex>` は subuid 所有の木のためホスト側では消せないことがあり、範囲写像の user namespace の中で消す
+（自動移行は未実装。具体的な手順は環境の `unshare` / `newuidmap` の版に依るため、実機で確かめてから `docs/setup` に足す）。
 切り替え前に範囲写像の環境で pull したキャッシュ（記録が `ownership=keep`）は `image rootfs cache entry was unpacked with a different id mapping` で
 `FAILED_PRECONDITION` になる。ホスト所有の木なので `<cache>/rootfs/sha256/<hex>` を手動で消して pull し直す（自動移行は未実装）。
 詳細は [pull-inventory-wiring.md](pull-inventory-wiring.md)。
 
 ## `PreserveIfChowned` と rootfs の 0755 化の両立（#4801 の着手前確認。SEC-5・OCI-1・OCI-2・REPAIR-3）
 
-結論: create の経路では両立しない。2026-11-16 のオーナー判断で C を採り、対応表（`extract_options_for`）の `RootlessSubordinateIds` は
-`ChownInUserNamespace` + `Strip` に切り替えた（#4801）。特殊ビットの保持（A。閉じ込めの祖先）は #4849 で扱う。
+結論: create の経路では、`root` 自身の 0700 を前提にする限り両立しない。2026-11-16 のオーナー判断で C を採り、まず対応表
+（`extract_options_for`）の `RootlessSubordinateIds` を `ChownInUserNamespace` + `Strip` に切り替えた（#4801）。続く #4849 で A
+（閉じ込めの祖先を `PreserveIfChowned` にも効かせる）を実装し、`ChownInUserNamespace` + `PreserveIfChowned` に切り替えた。
+以下の「両立しない」「oci は祖先を使わない」は #4801 時点の記録で、#4849 で解消済み。
 
 | 経路 | `root` の mode | 契約（展開から rootfs として使い終わるまで 0700）との関係 |
 | ---- | -------------- | -------------------------------------------------------- |
@@ -319,7 +335,7 @@ pull 時と start 時の subuid / subgid のずれ（#2539・#2528 の事後監�
 
 - A: 閉じ込めの祖先を `PreserveIfChowned` にも効かせる（#4804 の拡張）。祖先と `root` の所有 uid は ns の中から見た値で、`chown_root` より前に比べる。展開中の再確認を祖先へ移し、契約の文言を改める。cri 側は祖先を既に常に渡している
 - B: create でも `root` を 0700 に保つ。非 root のコンテナユーザーが動かなくなるため現実的でない
-- C（採用）: まず `ChownInUserNamespace` + `Strip` で所有者の写像だけ有効にし、特殊ビットの保持は A（#4849）に回す
+- C（#4801 で採用）: まず `ChownInUserNamespace` + `Strip` で所有者の写像だけ有効にし、特殊ビットの保持は A（#4849）に回す。A は #4849 で実装済み
 
 範囲の欠け（着手前の記録。展開モード #4847・注入点 #4848 で解消済み）: helper の Extract モード（tag 3）は予約のまま `unimplemented` で、pull・create は今もプロセス内で oci の展開を呼ぶ。
 `ChownInUserNamespace` は user namespace 外では `FailedPrecondition` になるため、対応表だけを切り替えると範囲写像の環境で pull と create が全て失敗する。

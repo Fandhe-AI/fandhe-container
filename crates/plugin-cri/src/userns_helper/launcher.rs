@@ -40,8 +40,9 @@ use fandhe_container_core::traits::{ErrorCode, TraitError};
 
 use super::USERNS_HELPER_ARG;
 use super::wire::{
-    EXTRACT_FD_TOKEN, ExtractReport, ExtractRequest, HelperErrorCode, MAX_EXTRACT_LAYERS, Mode,
-    RESPONSE_LEN, Report, decode_response, encode_extract_request, encode_request,
+    EXTRACT_ANCESTOR_FD_TOKEN, EXTRACT_FD_TOKEN, ExtractReport, ExtractRequest, HelperErrorCode,
+    MAX_EXTRACT_LAYERS, Mode, RESPONSE_LEN, Report, decode_response, encode_extract_request,
+    encode_request,
 };
 use crate::pod_holder::kill_and_reap;
 use crate::sys::fd_passing;
@@ -206,11 +207,19 @@ impl UsernsHelperLauncher {
     /// 同じ件数。通常ファイル）、`dest` は展開先ディレクトリの fd（helper の fd 1。パスは渡さない）。helper は参加の後に blob を
     /// 再検証して展開する。絶対期限と取り消しの旗は [`Self::run_bounded`] と同じで、どちらかが尽きたら helper を kill・回収して
     /// `Timeout` を返す。helper に渡す作業時間は `work_budget` と期限までの残りの小さい方（1 ms 以上）。
+    ///
+    /// `ancestor` は特殊ビット保持の閉じ込めを判定する 0700 のディレクトリの fd（create は bundle。#4849・SEC-5・SEC-1）。
+    /// `Some` なら要求の旗を立て、blob の通の後に別の通で 1 本だけ送る（旗と fd を食い違わせない）。ディレクトリでなければ
+    /// spawn の前に `InvalidArgument` で拒否する。
+    // 展開の入力（要求・blob・展開先・祖先）と期限（予算・絶対期限・取り消し）を 1 呼び出しで渡す入口（引数をまとめる型は
+    // 本入口 1 つのために作らない）。
+    #[allow(clippy::too_many_arguments)]
     pub fn run_extract_bounded(
         &self,
         request: &ExtractRequest,
         blobs: &[BorrowedFd<'_>],
         dest: BorrowedFd<'_>,
+        ancestor: Option<BorrowedFd<'_>>,
         work_budget: WorkBudget,
         hard_deadline: Option<Instant>,
         cancel: Option<&AtomicBool>,
@@ -243,18 +252,32 @@ impl UsernsHelperLauncher {
                 ));
             }
         }
+        if let Some(a) = ancestor {
+            let is_dir = a
+                .try_clone_to_owned()
+                .ok()
+                .and_then(|o| File::from(o).metadata().ok())
+                .is_some_and(|m| m.is_dir());
+            if !is_dir {
+                return Err(UsernsHelperError::new(
+                    ErrorCode::InvalidArgument,
+                    MSG_ANCESTOR,
+                ));
+            }
+        }
         let mut work = work_budget.get();
         if let Some(h) = hard_deadline {
             work = work.min(h.saturating_duration_since(Instant::now()));
         }
         let request = request
             .clone()
+            .with_ancestor(ancestor.is_some())
             .with_work(work)
             .map_err(|_| UsernsHelperError::new(ErrorCode::InvalidArgument, MSG_BLOBS))?;
         let frame = encode_extract_request(&request);
         match self.run_frame(
             frame.as_bytes(),
-            blobs,
+            (blobs, ancestor),
             dest,
             work_budget,
             hard_deadline,
@@ -278,7 +301,7 @@ impl UsernsHelperLauncher {
         let frame = encode_request(mode);
         self.run_frame(
             frame.as_bytes(),
-            &[],
+            (&[], None),
             target,
             work_budget,
             hard_deadline,
@@ -286,11 +309,11 @@ impl UsernsHelperLauncher {
         )
     }
 
-    /// 要求 frame と、後に添える fd（空なら添えない）で helper を 1 回起動して応答を得る共通部。
+    /// 要求 frame と、後に添える fd（blob の通・閉じ込めの祖先。空・`None` なら添えない）で helper を 1 回起動して応答を得る共通部。
     fn run_frame(
         &self,
         frame: &[u8],
-        fds: &[BorrowedFd<'_>],
+        attached: (&[BorrowedFd<'_>], Option<BorrowedFd<'_>>),
         target: BorrowedFd<'_>,
         work_budget: WorkBudget,
         hard_deadline: Option<Instant>,
@@ -339,7 +362,7 @@ impl UsernsHelperLauncher {
         let child =
             spawned.map_err(|_| UsernsHelperError::new(ErrorCode::Unavailable, MSG_SPAWN))?;
 
-        converse(child, parent_end, frame, fds, deadline, cancel)
+        converse(child, parent_end, frame, attached, deadline, cancel)
     }
 
     /// 起動する Command（と、`/proc/self/exe` の検証済み fd のガード）。
@@ -374,6 +397,7 @@ const MSG_TIMEOUT: &str = "userns helper did not respond in time";
 const MSG_PROTOCOL: &str = "userns helper returned an invalid response";
 const MSG_FAILED: &str = "userns helper reported a failure";
 const MSG_BLOBS: &str = "userns helper layer descriptors do not match the request";
+const MSG_ANCESTOR: &str = "userns helper confinement ancestor must be a directory";
 const MSG_DUP: &str = "failed to inspect a layer descriptor";
 
 /// 要求を書き、期限つきで応答を読み、子の終了を確かめる。失敗した経路はすべて kill・回収を試みる。
@@ -381,7 +405,7 @@ fn converse(
     child: Child,
     mut sock: UnixStream,
     frame: &[u8],
-    fds: &[BorrowedFd<'_>],
+    (fds, ancestor): (&[BorrowedFd<'_>], Option<BorrowedFd<'_>>),
     deadline: Instant,
     cancel: Option<&AtomicBool>,
 ) -> Result<Report, UsernsHelperError> {
@@ -391,6 +415,12 @@ fn converse(
     }
     // fd は要求 frame の後に 1 通で送る（helper は参加の後に受ける）。送れなければ kill・回収する。
     if !fds.is_empty() && fd_passing::send_fds(sock.as_fd(), EXTRACT_FD_TOKEN, fds).is_err() {
+        return Err(fail(child, ErrorCode::Unavailable, MSG_PROTOCOL));
+    }
+    // 閉じ込めの祖先は blob の通とは別の通で 1 本だけ送る（要求の旗と対。#4849）。
+    if let Some(a) = ancestor
+        && fd_passing::send_fds(sock.as_fd(), EXTRACT_ANCESTOR_FD_TOKEN, &[a]).is_err()
+    {
         return Err(fail(child, ErrorCode::Unavailable, MSG_PROTOCOL));
     }
     let mut buf = [0u8; RESPONSE_LEN];
@@ -605,6 +635,7 @@ mod tests {
                 &extract_request(1),
                 &[blob.as_fd()],
                 dir.as_fd(),
+                None,
                 budget(),
                 None,
                 None,
@@ -636,6 +667,7 @@ mod tests {
                     &extract_request(1),
                     &[blob.as_fd()],
                     dir.as_fd(),
+                    None,
                     WorkBudget::new(Duration::from_secs(600)).expect("budget"),
                     None,
                     Some(&cancel),
@@ -656,7 +688,7 @@ mod tests {
         let launcher = UsernsHelperLauncher::with_fixed_command("/nonexistent/helper", vec![]);
         let run = |req: &ExtractRequest, blobs: &[BorrowedFd<'_>], dest: BorrowedFd<'_>| {
             launcher
-                .run_extract_bounded(req, blobs, dest, budget(), None, None)
+                .run_extract_bounded(req, blobs, dest, None, budget(), None, None)
                 .expect_err("rejected")
         };
         let e = run(&extract_request(2), &[file.as_fd()], dir.as_fd());
@@ -675,5 +707,19 @@ mod tests {
         let many = vec![file.as_fd(); MAX_EXTRACT_LAYERS + 1];
         let e = run(&extract_request(1), &many, dir.as_fd());
         assert_eq!(e.code(), ErrorCode::ResourceExhausted);
+        // SEC-5・SEC-1・#4849: 閉じ込めの祖先がディレクトリでなければ spawn の前に拒否する。
+        let e = launcher
+            .run_extract_bounded(
+                &extract_request(1),
+                &[file.as_fd()],
+                dir.as_fd(),
+                Some(file.as_fd()),
+                budget(),
+                None,
+                None,
+            )
+            .expect_err("ancestor must be a directory");
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        assert_eq!(e.message(), MSG_ANCESTOR);
     }
 }

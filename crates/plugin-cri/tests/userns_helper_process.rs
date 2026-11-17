@@ -461,7 +461,15 @@ fn sec5_4847_extract_round_trips_through_the_real_helper() {
     let dest = open_dir(&dest_path);
     let req = extract_request(&tar, Digest::sha256_of(&tar));
     let r = launcher()
-        .run_extract_bounded(&req, &[blob.as_fd()], dest.as_fd(), budget(), None, None)
+        .run_extract_bounded(
+            &req,
+            &[blob.as_fd()],
+            dest.as_fd(),
+            None,
+            budget(),
+            None,
+            None,
+        )
         .expect("extract");
     assert_eq!(
         r,
@@ -477,6 +485,42 @@ fn sec5_4847_extract_round_trips_through_the_real_helper() {
     assert!(dest_path.join("d").is_dir());
 }
 
+/// SEC-5・SEC-1・#4849: 閉じ込めの祖先の fd は blob の通の後に別の通で渡り、helper が受けて展開を続ける
+/// （`Strip` は祖先を使わないので、受け渡しの成立だけを見る。保持は実機前提試験 `userns_helper_real`）。
+#[test]
+fn sec5_4849_ancestor_fd_is_received_by_the_real_helper() {
+    let t = Tree::new("extract-ancestor");
+    let tar = sample_tar();
+    let blob = write_blob(&t.0, &tar);
+    let dest_path = t.0.join("dest");
+    std::fs::create_dir(&dest_path).expect("mkdir");
+    let dest = open_dir(&dest_path);
+    let ancestor = open_dir(&t.0);
+    let req = extract_request(&tar, Digest::sha256_of(&tar));
+    let r = launcher()
+        .run_extract_bounded(
+            &req,
+            &[blob.as_fd()],
+            dest.as_fd(),
+            Some(ancestor.as_fd()),
+            budget(),
+            None,
+            None,
+        )
+        .expect("extract with an ancestor");
+    assert_eq!(
+        r,
+        ExtractReport {
+            layers: 1,
+            entries: 2
+        }
+    );
+    assert_eq!(
+        std::fs::read(dest_path.join("d/f")).expect("read"),
+        b"hello"
+    );
+}
+
 /// SEC-5・OCI-1・#4847: blob の digest が要求と違うと、helper は `ExtractFailed(DataLoss)` を返し、展開先に何も書かない。
 #[test]
 fn sec5_4847_digest_mismatch_is_data_loss_and_writes_nothing() {
@@ -488,7 +532,15 @@ fn sec5_4847_digest_mismatch_is_data_loss_and_writes_nothing() {
     let dest = open_dir(&dest_path);
     let req = extract_request(&tar, Digest::sha256_of(b"something else"));
     let err = launcher()
-        .run_extract_bounded(&req, &[blob.as_fd()], dest.as_fd(), budget(), None, None)
+        .run_extract_bounded(
+            &req,
+            &[blob.as_fd()],
+            dest.as_fd(),
+            None,
+            budget(),
+            None,
+            None,
+        )
         .expect_err("digest mismatch");
     assert_eq!(
         err.helper_code(),
@@ -618,6 +670,7 @@ fn sec5_4848_extractor_extracts_through_the_real_helper() {
     ex.extract_layers(
         &layers,
         &root,
+        None,
         DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES,
         ExtractLimits::default(),
         &opts,
@@ -641,6 +694,7 @@ fn sec5_4848_extractor_extracts_through_the_real_helper() {
         .extract_layers(
             &layers,
             &root2,
+            None,
             DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES,
             ExtractLimits::default(),
             &opts,

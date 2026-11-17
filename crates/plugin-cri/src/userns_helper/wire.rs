@@ -11,13 +11,15 @@
 //! helper は header を検査して期待の長さが決まってから、その長さだけを固定長バッファへ読む（確保しない）。
 //!
 //! # 展開要求（tag 3。OCI-1・OCI-2・SEC-5・#4847）
-//! payload は固定部 112 バイトと、レイヤー 0〜[`MAX_EXTRACT_LAYERS`] 件（0 件は layers が空の正常なイメージ。fd は送らない）の 76 バイトずつ（すべて BE）:
+//! payload は固定部 116 バイトと、レイヤー 0〜[`MAX_EXTRACT_LAYERS`] 件（0 件は layers が空の正常なイメージ。fd は送らない）の 76 バイトずつ（すべて BE）:
 //! 固定部 = `[ownership tag（1 = ChownInUserNamespace のみ）, special bits tag（1 = Strip / 2 = PreserveIfChowned）,
 //! layer_count(u16), work_ms(u32), u64 × 5（max_entries・max_total_bytes・max_input_bytes・max_tracked_paths・
-//! max_uncompressed_bytes）, 期待する uid 写像の指紋(32), gid 写像の指紋(32)]`、レイヤー = `[media 添字（[`fandhe_container_oci::layer::LAYER_MEDIA_TYPES`] の 1 起点）, 0, 0, 0,
+//! max_uncompressed_bytes）, 期待する uid 写像の指紋(32), gid 写像の指紋(32), `[閉じ込めの祖先の旗（0 / 1）, 0, 0, 0]`]`、レイヤー = `[media 添字（[`fandhe_container_oci::layer::LAYER_MEDIA_TYPES`] の 1 起点）, 0, 0, 0,
 //! size(u64), digest(32 バイト), diff_id(32 バイト)]`。パス・名前・id の写像そのものは受けない（写像は helper が参加に使ったものを使い、指紋が一致しなければ `IdMapMismatch`。#4848）。
 //! 長さ・件数・各値の範囲は確保・読み取りの前に検査する。blob の fd は要求 frame の後に `SCM_RIGHTS` で 1 通にまとめて送る
-//! （[`EXTRACT_FD_TOKEN`] の 1 バイトに添える。helper は参加の後に受ける）。
+//! （[`EXTRACT_FD_TOKEN`] の 1 バイトに添える。helper は参加の後に受ける）。閉じ込めの祖先の旗が 1 のときは、blob の通の後に
+//! 祖先のディレクトリ fd を 1 本だけ別の通（[`EXTRACT_ANCESTOR_FD_TOKEN`]）で送る（blob と同じ通にすると fd の上限
+//! 〔[`MAX_EXTRACT_LAYERS`]〕を超えるため。#4849・SEC-5・SEC-1）。旗が 0 のときは送らない。旗の値 2 以上・予約バイトが 0 でない frame は拒否する。
 //!
 //! # 応答 frame（固定 [`RESPONSE_LEN`] バイト）
 //! `[version, status(0 = ok / 1 = error), mode tag（ok）または error tag（error）, flags, u32 BE × 7]`。
@@ -56,7 +58,7 @@ const MAX_FRAME_LEN: usize = REQUEST_HEADER_LEN + REMOVE_PAYLOAD_LEN;
 /// 1 回の展開で受け取るレイヤー（blob の fd）の上限。`SCM_MAX_FD`（253）以下で 1 通に収まり、実用上の層数（約 127）を超える。
 pub const MAX_EXTRACT_LAYERS: usize = 128;
 /// 展開要求の固定部の長さ。
-const EXTRACT_FIXED_LEN: usize = 112;
+const EXTRACT_FIXED_LEN: usize = 116;
 /// 展開要求のレイヤー 1 件の長さ。
 const EXTRACT_LAYER_LEN: usize = 76;
 /// 展開要求の payload の最大長（固定部 + 上限件数）。[`MAX_REQUEST_PAYLOAD_BYTES`] 以下。
@@ -65,6 +67,8 @@ pub const MAX_EXTRACT_PAYLOAD_BYTES: usize =
 const _: () = assert!(MAX_EXTRACT_PAYLOAD_BYTES <= MAX_REQUEST_PAYLOAD_BYTES);
 /// blob の fd を運ぶ 1 バイトの token（`SCM_RIGHTS` はデータ 1 バイト以上に添える）。
 pub const EXTRACT_FD_TOKEN: u8 = 0x58;
+/// 閉じ込めの祖先の fd を運ぶ 1 バイトの token（blob の通とは別の通。#4849）。
+pub const EXTRACT_ANCESTOR_FD_TOKEN: u8 = 0x41;
 /// 所有者の方針の tag（`OwnershipPolicy::ChownInUserNamespace` だけを受ける）。
 const OWNERSHIP_CHOWN_IN_USERNS: u8 = 1;
 /// 展開に見込む時間（ms）の範囲。
@@ -455,7 +459,7 @@ impl ExtractLayerSpec {
 /// 展開要求（展開モード。所有者の方針は `ChownInUserNamespace` 固定で、写像は helper が参加に使ったものを使う）。
 ///
 /// 制限値は 1 以上かつ oci の既定値以下に限る（親が上限を広げて helper に無制限の確保・書き込みをさせないため）。
-/// 既定値より大きい上限が要るようになったら、wire の版を上げて足す。閉じ込めの祖先（`confined_in`）は未対応（#4849）。
+/// 既定値より大きい上限が要るようになったら、wire の版を上げて足す。閉じ込めの祖先は旗だけを持ち、fd は別の通で送る（#4849）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtractRequest {
     special_bits: ExtractSpecialBits,
@@ -466,6 +470,8 @@ pub struct ExtractRequest {
     /// 期待する uid / gid の写像の指紋（[`id_map_fingerprint`]）。全 0 は未指定で、参加した helper は拒否する（fail-closed）。
     uid_map_fp: [u8; 32],
     gid_map_fp: [u8; 32],
+    /// 閉じ込めの祖先の fd を別の通で送るか（[`Self::with_ancestor`]。旗と fd を食い違わせないよう launcher が立てる）。
+    ancestor: bool,
 }
 
 impl ExtractRequest {
@@ -483,6 +489,7 @@ impl ExtractRequest {
             max_uncompressed_bytes,
             layers,
             ([0; 32], [0; 32]),
+            false,
         )
     }
 
@@ -493,6 +500,7 @@ impl ExtractRequest {
         max_uncompressed_bytes: u64,
         layers: Vec<ExtractLayerSpec>,
         fps: ([u8; 32], [u8; 32]),
+        ancestor: bool,
     ) -> Result<Self, HelperErrorCode> {
         let in_range = |v: u64, max: u64| (1..=max).contains(&v);
         let ok = layers.len() <= MAX_EXTRACT_LAYERS
@@ -513,6 +521,7 @@ impl ExtractRequest {
             layers,
             uid_map_fp: fps.0,
             gid_map_fp: fps.1,
+            ancestor,
         })
     }
 
@@ -540,7 +549,20 @@ impl ExtractRequest {
             self.max_uncompressed_bytes,
             self.layers,
             (self.uid_map_fp, self.gid_map_fp),
+            self.ancestor,
         )
+    }
+
+    /// 閉じ込めの祖先の fd を送る要求にする（`false` で送らない。#4849・SEC-5・SEC-1）。
+    #[must_use]
+    pub fn with_ancestor(mut self, ancestor: bool) -> Self {
+        self.ancestor = ancestor;
+        self
+    }
+
+    /// 閉じ込めの祖先の fd が別の通で続くか。
+    pub fn has_ancestor(&self) -> bool {
+        self.ancestor
     }
 
     /// 特殊ビットの方針。
@@ -601,6 +623,7 @@ pub fn encode_extract_request(req: &ExtractRequest) -> ExtractRequestFrame {
     }
     v.extend_from_slice(&req.uid_map_fp);
     v.extend_from_slice(&req.gid_map_fp);
+    v.extend_from_slice(&[u8::from(req.ancestor), 0, 0, 0]);
     for l in &req.layers {
         v.extend_from_slice(&[l.media_index, 0, 0, 0]);
         v.extend_from_slice(&l.size.to_be_bytes());
@@ -673,6 +696,11 @@ pub fn decode_extract_payload(p: &[u8]) -> Result<ExtractRequest, HelperErrorCod
             .and_then(|s| <[u8; 32]>::try_from(s).ok())
             .ok_or(bad)
     };
+    let ancestor = match fixed.get(112..116) {
+        Some([0, 0, 0, 0]) => false,
+        Some([1, 0, 0, 0]) => true,
+        _ => return Err(bad),
+    };
     ExtractRequest::checked(
         special,
         work,
@@ -680,6 +708,7 @@ pub fn decode_extract_payload(p: &[u8]) -> Result<ExtractRequest, HelperErrorCod
         mu,
         layers,
         (fp(48)?, fp(80)?),
+        ancestor,
     )
 }
 
@@ -702,7 +731,7 @@ pub fn id_map_fingerprint(map: &IdMap) -> [u8; 32] {
     digest_to_bytes(&Digest::sha256_of(&bytes)).unwrap_or_default()
 }
 
-/// 展開要求の payload 長からレイヤー数を得る（`112 + n × 76`、0 ≤ n ≤ 128 だけ）。
+/// 展開要求の payload 長からレイヤー数を得る（`116 + n × 76`、0 ≤ n ≤ 128 だけ）。
 fn extract_layer_count(payload_len: usize) -> Option<usize> {
     let body = payload_len.checked_sub(EXTRACT_FIXED_LEN)?;
     let n = body / EXTRACT_LAYER_LEN;
@@ -796,7 +825,7 @@ impl RequestHead {
 }
 
 /// 要求 header を検査する。`payload_len` の上限検査は tag の検査より先（確保・読み取りの前）。
-/// tag ごとの固定長（展開要求は `112 + n × 76`、1 ≤ n ≤ 128）と合わない長さは `InvalidRequest`。
+/// tag ごとの固定長（展開要求は `116 + n × 76`、1 ≤ n ≤ 128）と合わない長さは `InvalidRequest`。
 pub fn decode_request_header(
     header: &[u8; REQUEST_HEADER_LEN],
 ) -> Result<RequestHead, HelperErrorCode> {
@@ -1324,18 +1353,20 @@ mod tests {
     fn sec5_4847_extract_request_roundtrip_and_bytes() {
         let f = encode_extract_request(&req(1));
         let b = f.as_bytes();
-        assert_eq!(b.len(), 8 + 112 + 76);
-        // header: version 1・tag 3・payload 188 = 0xbc。
-        assert_eq!(&b[..8], &[1, 3, 0, 0, 0, 0, 0, 0xbc]);
+        assert_eq!(b.len(), 8 + 116 + 76);
+        // header: version 1・tag 3・payload 192 = 0xc0。
+        assert_eq!(&b[..8], &[1, 3, 0, 0, 0, 0, 0, 0xc0]);
         // 固定部: ownership 1・special 2・layers 1・work 1500 ms = 0x5dc。
         assert_eq!(&b[8..16], &[1, 2, 0, 1, 0, 0, 0x05, 0xdc]);
         // レイヤー: media 添字 1・予約 0・size 1234 = 0x4d2・digest の先頭 0xaa・diff_id の先頭 0xbb。
-        assert_eq!(&b[120..132], &[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x04, 0xd2]);
-        assert_eq!(b[132], 0xaa);
-        assert_eq!(b[164], 0xbb);
+        // 固定部の末尾 4 バイト（祖先の旗 0・予約 0）は b[120..124]。
+        assert_eq!(&b[120..124], &[0, 0, 0, 0]);
+        assert_eq!(&b[124..136], &[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x04, 0xd2]);
+        assert_eq!(b[136], 0xaa);
+        assert_eq!(b[168], 0xbb);
         assert_eq!(decode_request(b), Ok(Request::Extract(req(1))));
         let head = decode_request_header(b[..8].try_into().unwrap()).unwrap();
-        assert_eq!(head.payload_len(), 188);
+        assert_eq!(head.payload_len(), 192);
         let r = req(1);
         assert_eq!(r.layers()[0].media_type(), TAR);
         assert_eq!(r.layers()[0].size(), 1234);
@@ -1368,10 +1399,10 @@ mod tests {
     /// REPAIR-5・#4847: 件数の上限（128 は受理、129 は拒否、0 は受理）と、header の長さの検査。
     #[test]
     fn sec5_4847_extract_layer_count_bounds() {
-        assert_eq!(MAX_EXTRACT_PAYLOAD_BYTES, 112 + 128 * 76);
-        assert_eq!(MAX_EXTRACT_PAYLOAD_BYTES, 9840);
+        assert_eq!(MAX_EXTRACT_PAYLOAD_BYTES, 116 + 128 * 76);
+        assert_eq!(MAX_EXTRACT_PAYLOAD_BYTES, 9844);
         let f = encode_extract_request(&req(128));
-        assert_eq!(f.as_bytes().len(), 8 + 9840);
+        assert_eq!(f.as_bytes().len(), 8 + 9844);
         assert_eq!(decode_request(f.as_bytes()), Ok(Request::Extract(req(128))));
         // 129 層は構築できず、長さだけ 129 層の header も InvalidRequest（上限 16 KiB 以下のため RequestTooLarge ではない）。
         assert_eq!(
@@ -1385,11 +1416,11 @@ mod tests {
         );
         for len in [
             0u32,
-            111,
-            112 + 75,
-            112 + 76 - 1,
-            112 + 76 + 1,
-            112 + 129 * 76,
+            115,
+            116 + 75,
+            116 + 76 - 1,
+            116 + 76 + 1,
+            116 + 129 * 76,
         ] {
             assert_eq!(
                 decode_request_header(&header(1, 3, [0, 0], len)),
@@ -1476,18 +1507,39 @@ mod tests {
         assert_eq!(decode_request(&good), Ok(Request::Extract(req(1))));
     }
 
+    /// SEC-5・SEC-1・#4849: 閉じ込めの祖先の旗は往復し、2 以上の値と予約バイトが 0 でない frame は拒否する。
+    #[test]
+    fn sec5_4849_ancestor_flag_roundtrips_and_rejects_bad_bytes() {
+        let r = req(1).with_ancestor(true);
+        assert!(r.has_ancestor());
+        let f = encode_extract_request(&r);
+        let b = f.as_bytes();
+        assert_eq!(&b[120..124], &[1, 0, 0, 0]);
+        assert_eq!(decode_request(b), Ok(Request::Extract(r)));
+        assert!(!req(1).has_ancestor());
+        for bad in [[2u8, 0, 0, 0], [0, 1, 0, 0], [1, 0, 1, 0], [0, 0, 0, 1]] {
+            let mut v = b.to_vec();
+            v[120..124].copy_from_slice(&bad);
+            assert_eq!(
+                decode_request(&v),
+                Err(HelperErrorCode::InvalidRequest),
+                "{bad:?}"
+            );
+        }
+    }
+
     /// OCI-1・#4847: レイヤー 0 件の要求は往復する（fd なしで展開する正常なイメージ）。
     #[test]
     fn oci1_4847_zero_layer_request_roundtrips() {
         let r = req(0);
         let f = encode_extract_request(&r);
-        assert_eq!(f.as_bytes().len(), 8 + 112);
+        assert_eq!(f.as_bytes().len(), 8 + 116);
         assert_eq!(decode_request(f.as_bytes()), Ok(Request::Extract(r)));
         assert_eq!(
-            decode_request_header(&header(1, 3, [0, 0], 112))
+            decode_request_header(&header(1, 3, [0, 0], 116))
                 .unwrap()
                 .payload_len(),
-            112
+            116
         );
     }
 

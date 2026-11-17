@@ -12,13 +12,14 @@
 //!   （Linux x86_64 / aarch64）が cri の注入点 `SubordinateTreeRemover` の本番実装として上限・期限・回収を持つ
 //!
 //! - 展開モード（#4847。OCI-1・OCI-2）: `launcher` の `run_extract_bounded` が展開要求の frame の後に blob の fd を `SCM_RIGHTS`
-//!   で送り、`helper` が参加の後に blob を再検証して oci の `extract_image_layers_bounded_in` で展開する
+//!   で送り、`helper` が参加の後に blob を再検証して oci の `extract_image_layers_confined_in` で展開する
 //!
 //! - 展開器（#4848）: `extractor` が cri の注入点 `SubordinateLayerExtractor` の本番実装として、blob と展開先を fd で渡して
 //!   `run_extract_bounded` を呼ぶ（枠・期限・回収は `slots` で削除器と共通の処理を別インスタンスで持つ）
 //!
-//! 未配線（REPAIR-3）: CI への組み込み（H7・#4802）と特殊ビットの保持（#4849）は未。対応表の切り替えは H6（#4801）で有効化済み
-//! （範囲写像の行は `ChownInUserNamespace` + `Strip`。削除・展開は cri の pull・create へ配線済み）。
+//! 未配線（REPAIR-3）: CI への組み込み（H7・#4802）は未。対応表の切り替えは H6（#4801）、特殊ビットの保持は #4849 で有効化済み
+//! （範囲写像の行は `ChownInUserNamespace` + `PreserveIfChowned`。create は 0700 の bundle を祖先として helper へ渡す。
+//! 削除・展開は cri の pull・create へ配線済み）。
 //! 設計は `docs/design/userns-extract-helper.md`。
 
 pub mod wire;

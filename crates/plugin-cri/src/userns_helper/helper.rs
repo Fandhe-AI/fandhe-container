@@ -15,7 +15,9 @@
 //!    展開モード（#4847）は要求 frame（固定部 + レイヤーの記述）を読んだ後、blob の fd を `SCM_RIGHTS` で 1 通受ける（参加の後なので、
 //!    dumpable な holder の複製に fd・要求の bytes は入らない。受信も [`REQUEST_READ_TIMEOUT`] の期限）。fd の数・token が
 //!    要求と一致しなければ `InvalidRequest`。各 fd は `VerifiedLayerBlob::from_file`（信頼条件と digest・サイズの再検証）を通し、
-//!    fd 1 を `/proc/self/fd/N` として開いた `ExtractRoot` へ、oci の `extract_image_layers_bounded_in` で展開する。
+//!    fd 1 を `/proc/self/fd/N` として開いた `ExtractRoot` へ、oci の `extract_image_layers_confined_in` で展開する。
+//!    要求の祖先の旗が立っているときは、blob の通の後に別の通（[`EXTRACT_ANCESTOR_FD_TOKEN`]）で閉じ込めの祖先の fd を 1 本受け、
+//!    ディレクトリであることを確かめて `ExtractRoot` として oci へ渡す（`PreserveIfChowned` の閉じ込めを 0700 の祖先で判定。#4849）。
 //!    所有者の方針は `ChownInUserNamespace` で、写像は参加に使ったもの（要求では受けない）。`--no-join`（試験専用）だけは写像が
 //!    無いので `Keep`。期限は要求を受けた時点から `work_ms`。操作記録（`OciOpRecorder`）は捨てる（観測は親の呼び出し単位）。
 //!    削除モード（H3。#4800）は fd 1（親ディレクトリ）の複製を `/proc/self/fd/N` として oci の `ExtractRoot` で開き、直下の
@@ -45,14 +47,15 @@ use fandhe_container_oci::instrument::NoopOciOpRecorder;
 use fandhe_container_oci::layer::VerifiedLayerBlob;
 use fandhe_container_oci::layer::extract::{
     ExtractBudget, ExtractOptions, ExtractRoot, ImageLayer, OwnershipPolicy, SpecialBitsPolicy,
-    extract_image_layers_bounded_in,
+    extract_image_layers_confined_in,
 };
 
 use super::USERNS_HELPER_ARG;
 use super::wire::{
-    EXTRACT_FD_TOKEN, ExtractReport, ExtractRequest, ExtractSpecialBits, HelperErrorCode,
-    InspectReport, MAX_EXTRACT_PAYLOAD_BYTES, Mode, REQUEST_HEADER_LEN, RemoveTarget, Report,
-    Request, StatReport, decode_request_header, encode_response, id_map_fingerprint,
+    EXTRACT_ANCESTOR_FD_TOKEN, EXTRACT_FD_TOKEN, ExtractReport, ExtractRequest, ExtractSpecialBits,
+    HelperErrorCode, InspectReport, MAX_EXTRACT_PAYLOAD_BYTES, Mode, REQUEST_HEADER_LEN,
+    RemoveTarget, Report, Request, StatReport, decode_request_header, encode_response,
+    id_map_fingerprint,
 };
 use crate::image_ownership::to_oci_map;
 use crate::sys::{fd_passing, hardening};
@@ -196,6 +199,29 @@ fn extract(
         }
         got.fds
     };
+    // 閉じ込めの祖先（要求の旗が立っているときだけ。blob の通の後に別の通で 1 本。#4849・SEC-5・SEC-1）。token・本数が
+    // 旗と食い違えば拒否し、ディレクトリでなければ使わない。受けた fd は drop で閉じる。
+    let ancestor = if req.has_ancestor() {
+        let got = fd_passing::recv_fds(sock.as_fd(), 1).map_err(|e| match e.kind() {
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
+                HelperErrorCode::RequestTimeout
+            }
+            _ => HelperErrorCode::InvalidRequest,
+        })?;
+        let mut it = got.fds.into_iter();
+        match (got.token, it.next(), it.next()) {
+            (EXTRACT_ANCESTOR_FD_TOKEN, Some(fd), None) => {
+                let f = File::from(fd);
+                if !f.metadata().is_ok_and(|m| m.is_dir()) {
+                    return Err(HelperErrorCode::InvalidRequest);
+                }
+                Some(f)
+            }
+            _ => return Err(HelperErrorCode::InvalidRequest),
+        }
+    } else {
+        None
+    };
     // blob を置いたストアの所有者は、名前空間の中から見た自分の euid（範囲写像ではホストの利用者が 0 に見える）。
     let status = read_bounded("/proc/self/status", MAX_STATUS_BYTES)?;
     let owner = fandhe_container_supervisor::privilege::parse_proc_status(&status)
@@ -233,11 +259,19 @@ fn extract(
         .with_special_bits(special_bits);
     let link = format!("/proc/self/fd/{}", target.as_raw_fd());
     let root = ExtractRoot::open_proc_fd_link(std::path::Path::new(&link)).map_err(fail)?;
+    let ancestor_root = match &ancestor {
+        Some(f) => {
+            let link = format!("/proc/self/fd/{}", f.as_raw_fd());
+            Some(ExtractRoot::open_proc_fd_link(std::path::Path::new(&link)).map_err(fail)?)
+        }
+        None => None,
+    };
     let budget = ExtractBudget::new().with_deadline(deadline);
-    let done = extract_image_layers_bounded_in(
+    let done = extract_image_layers_confined_in(
         &NoopOciOpRecorder,
         &layers,
         &root,
+        ancestor_root.as_ref(),
         req.max_uncompressed_bytes(),
         req.limits(),
         &options,

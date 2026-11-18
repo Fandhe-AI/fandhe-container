@@ -798,7 +798,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn oci7_state_scope_is_sha256_prefix() {
-        let tmp = Tmp::new("scope");
+        let tmp = Tmp::new("scope-hash");
         let path = tmp.path().join("state");
         let bytes = path.as_os_str().as_encoded_bytes();
         assert_eq!(state_hash(bytes), sha256_hex(bytes)[..32]);

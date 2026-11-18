@@ -31,6 +31,13 @@
 //!   区別できないため、前後の正の往復と host への直接接続を括弧とする。各セッションの後に helper が残らないことも確かめる。
 //!   成功行 5 行（`port-forward ok:`）を CI が試験ソースから導出して照合する。pull は増やさない。
 //!
+//! - 段 S（#4818・CRI-2・SEC-1・SEC-5・SUP-1・REPAIR-12）: pid・ipc を `POD` にした sandbox（保持役が pod の pid ns と pod-init を持つ。
+//!   #4815〜#4817）で、pod 内 2 コンテナが同じ pid ns に入り互いの pid が見えること、兄弟コンテナと pod-init（pod の PID 1）の
+//!   `/proc/<pid>/root`・`environ`・`fd` を開けないこと（Landlock の ptrace の境界・non-dumpable）、同じ uid の signal が兄弟の init へ
+//!   届くこと（`USR1` の trap で終了コード 42）、init が終わると孤児（`/bin/sleep 613`）が止まること（kill-all。#4811）、
+//!   pod-init を SIGKILL すると sandbox が `SANDBOX_NOTREADY` になること（#4816）を具体値で照合する。成功行 5 行（`pod-pid ok:`）を
+//!   CI が試験ソースから導出して照合する。pull は増やさない。
+//!
 //! 失敗後の残骸の回収（#4142）: 本体を 2 回走らせる（1 回目は StartContainer の直後に注入した失敗、回収、2 回目は同じ metadata で通す）。
 //! 注入では plugin-cri を SIGKILL してから panic させ、外側の回収が死活を判定して起動し直して回収する（#4326。共有部品 `reclaim_restarting`）。
 //! 回収の部品は `support/cri_real_reclaim.rs`（トークンのラベルと台帳の ID だけを期限つきで Stop / Remove する）。
@@ -1254,6 +1261,278 @@ async fn pod_network_stage(
     remove_pod(c, ledger, &sb_p, &[&srv, &cli_p]).await;
     remove_pod(c, ledger, &sb_q, &[&cli_q, &srv_q]).await;
 }
+
+// ---- 段 S（#4818）: pod の pid namespace の共有 ----
+
+/// 段 S の成功行 5 行（`check-success-lines.sh` が試験ソースから導出して照合する。プレースホルダは使わない）。
+const POD_PID_OK_SHARED: &str = "production_binary_exec_real: pod-pid ok: two containers in the pod share the pid namespace and see each other";
+const POD_PID_OK_PROC: &str = "production_binary_exec_real: pod-pid ok: root, environ and fd of the sibling and the pod init are not readable";
+const POD_PID_OK_SIGNAL: &str = "production_binary_exec_real: pod-pid ok: a same-uid USR1 from the sibling ended the container init with 42";
+const POD_PID_OK_ORPHAN: &str =
+    "production_binary_exec_real: pod-pid ok: the orphan left by an exited init was stopped";
+const POD_PID_OK_NOTREADY: &str =
+    "production_binary_exec_real: pod-pid ok: killing the pod init made the sandbox NOTREADY";
+
+/// 兄弟の init の command。`USR1` で終了コード 42 になる（同じ uid の signal が届いたことの観測）。
+const POD_PID_TRAP: &str = "trap 'exit 42' USR1; while :; do /bin/sleep 1; done";
+/// init が終わった後に残る孤児を作る command（孤児は `/bin/sleep 613`。init は 3 秒後に終わる）。
+const POD_PID_ORPHAN: &str = "(/bin/sleep 613 &); /bin/sleep 3";
+
+/// pid・ipc を `POD`、network を `NODE` にした sandbox を作り、台帳へ載せる。
+async fn run_pod_pid_sandbox(
+    c: &mut RuntimeServiceClient<Channel>,
+    token: &str,
+    ledger: &reclaim::Ledger,
+) -> String {
+    let mut config = cri::PodSandboxConfig {
+        metadata: Some(cri::PodSandboxMetadata {
+            name: "pod-exec-real-pid".into(),
+            uid: reclaim::sandbox_uid("uid-exec-pid", token),
+            namespace: "default".into(),
+            attempt: 0,
+        }),
+        labels: reclaim::config_labels(TEST, token),
+        ..Default::default()
+    };
+    config
+        .linux
+        .get_or_insert_with(Default::default)
+        .security_context
+        .get_or_insert_with(Default::default)
+        .namespace_options = Some(cri::NamespaceOption {
+        network: cri::NamespaceMode::Node as i32,
+        pid: cri::NamespaceMode::Pod as i32,
+        ipc: cri::NamespaceMode::Pod as i32,
+        ..Default::default()
+    });
+    let sb = call_with_deadline(
+        c.run_pod_sandbox(cri::RunPodSandboxRequest {
+            config: Some(config),
+            ..Default::default()
+        }),
+        RPC_DEADLINE,
+    )
+    .await
+    .expect("run pod-pid sandbox")
+    .into_inner()
+    .pod_sandbox_id;
+    reclaim::record_sandbox(ledger, &sb);
+    sb
+}
+
+/// exec したシェルの stdout（成功を要求する）。
+async fn exec_sh(c: &mut RuntimeServiceClient<Channel>, id: &str, script: &str) -> String {
+    let o = exec_once(c, id, &["/bin/sh", "-c", script]).await;
+    assert_eq!(
+        status_str(&o.status, "status"),
+        "Success",
+        "{script}: stderr={:?} {:?}",
+        String::from_utf8_lossy(&o.stderr),
+        o.status
+    );
+    String::from_utf8(o.stdout)
+        .expect("utf-8")
+        .trim()
+        .to_owned()
+}
+
+/// コンテナの視点で、cmdline が正規表現 `pattern` に当たるプロセスの pid（1 件だけを要求する）。`pattern` は自分自身
+/// （このスクリプトの cmdline）に当たらない形（`sleep 61[2]` のように文字クラスを含める）で渡す。
+async fn pid_in_pod(c: &mut RuntimeServiceClient<Channel>, viewer: &str, pattern: &str) -> String {
+    let script = format!(
+        "for d in /proc/[0-9]*; do tr '\\0' ' ' < $d/cmdline 2>/dev/null | grep -q -- '{pattern}' && echo ${{d#/proc/}}; done; true"
+    );
+    let out = exec_sh(c, viewer, &script).await;
+    let pids: Vec<&str> = out.lines().filter(|l| !l.is_empty()).collect();
+    let [pid] = pids.as_slice() else {
+        panic!("exactly one process matching {pattern:?} must be visible: {pids:?}");
+    };
+    (*pid).to_owned()
+}
+
+/// コンテナの状態と終了コードを期限つきで待つ（Exited になるまで）。
+async fn wait_exited(c: &mut RuntimeServiceClient<Channel>, id: &str) -> i32 {
+    let start = Instant::now();
+    loop {
+        let st = call_with_deadline(
+            c.container_status(cri::ContainerStatusRequest {
+                container_id: id.into(),
+                verbose: false,
+            }),
+            RPC_DEADLINE,
+        )
+        .await
+        .expect("container status")
+        .into_inner()
+        .status
+        .expect("status body");
+        if st.state == cri::ContainerState::ContainerExited as i32 {
+            return st.exit_code;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "{id} did not exit within 30s: {st:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// argv の先頭が `pod-holder` を含む保持役のうち、`pid_for_children` が `want` のものの子（pod-init）の pid。
+fn pod_init_of_pid_ns(want: &str) -> u32 {
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        panic!("cannot list /proc");
+    };
+    let holders: Vec<u32> = dir
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| {
+            is_pod_holder(*pid)
+                && std::fs::read_link(format!("/proc/{pid}/ns/pid_for_children"))
+                    .is_ok_and(|l| l.to_string_lossy() == want)
+        })
+        .collect();
+    let [holder] = holders.as_slice() else {
+        panic!("exactly one pod-holder must own the pid ns {want}: {holders:?}");
+    };
+    let children = std::fs::read_to_string(format!("/proc/{holder}/task/{holder}/children"))
+        .expect("holder children");
+    let kids: Vec<u32> = children
+        .split_whitespace()
+        .filter_map(|t| t.parse().ok())
+        .collect();
+    let [init] = kids.as_slice() else {
+        panic!("the pod-holder must have exactly one child (pod init): {kids:?}");
+    };
+    *init
+}
+
+/// 段 S（#4818・CRI-2・SEC-1・SEC-5・SUP-1・REPAIR-12）。モジュール doc の 5 点を照合する。pull は増やさない。
+async fn pod_pid_stage(
+    c: &mut RuntimeServiceClient<Channel>,
+    token: &str,
+    ledger: &reclaim::Ledger,
+) {
+    let sb = run_pod_pid_sandbox(c, token, ledger).await;
+    let a = create_started(
+        c,
+        &sb,
+        "pid-a",
+        &["/bin/sh", "-c", POD_PID_TRAP],
+        token,
+        ledger,
+    )
+    .await;
+    let b = create_started(c, &sb, "pid-b", &["/bin/sleep", "612"], token, ledger).await;
+
+    // 1. 同じ pid ns で、互いの init が見える。pod の PID 1 は pod-init（コンテナの init ではない）。
+    let ns_a = exec_sh(c, &a, "readlink /proc/self/ns/pid").await;
+    let ns_b = exec_sh(c, &b, "readlink /proc/self/ns/pid").await;
+    assert_eq!(ns_a, ns_b, "pod containers must share the pid namespace");
+    assert!(ns_a.starts_with("pid:["), "{ns_a}");
+    let self_ns = std::fs::read_link("/proc/self/ns/pid")
+        .expect("own pid ns")
+        .to_string_lossy()
+        .into_owned();
+    assert_ne!(ns_a, self_ns, "the pod pid ns must differ from the node's");
+    let a_from_b = pid_in_pod(c, &b, "whil[e] :; do").await;
+    let b_from_a = pid_in_pod(c, &a, "sleep 61[2]").await;
+    assert_ne!(a_from_b, "1", "the container init is not the pod PID 1");
+    assert_ne!(b_from_a, "1", "the container init is not the pod PID 1");
+    let _ = writeln_stderr(POD_PID_OK_SHARED);
+
+    // 2. 兄弟の init と pod-init の root・environ・fd は開けない（開けたら OPEN を出す）。
+    for target in [a_from_b.as_str(), "1"] {
+        // root はディレクトリの一覧、environ は中身の読み取り、fd は fd 0 のリンクの解決で確かめる。`fd/` の一覧自体は
+        // 所有者の DAC（0500）だけで読め、ptrace の境界が掛かるのは各 fd のリンクの解決（`proc_fd_access_allowed`）のため。
+        let script = format!(
+            "ls /proc/{target}/root/ >/dev/null 2>&1 && echo OPEN root; cat /proc/{target}/environ >/dev/null 2>&1 && echo OPEN environ; readlink /proc/{target}/fd/0 >/dev/null 2>&1 && echo OPEN fd; echo done"
+        );
+        assert_eq!(
+            exec_sh(c, &b, &script).await,
+            "done",
+            "/proc/{target} must not be readable from the sibling"
+        );
+    }
+    let _ = writeln_stderr(POD_PID_OK_PROC);
+
+    // 3. 同じ uid の signal は届く: B から A の init へ USR1 を送ると、A の init が trap で 42 で終わる。
+    exec_sh(c, &b, &format!("kill -USR1 {a_from_b}")).await;
+    assert_eq!(
+        wait_exited(c, &a).await,
+        42,
+        "USR1 must reach the sibling init"
+    );
+    let _ = writeln_stderr(POD_PID_OK_SIGNAL);
+
+    // 4. init が終わると孤児が止まる（kill-all）。孤児の存在を先に確かめる（陽性対照）。
+    let orphan_argv = ["/bin/sleep", "613"];
+    let o = create_started(
+        c,
+        &sb,
+        "pid-orphan",
+        &["/bin/sh", "-c", POD_PID_ORPHAN],
+        token,
+        ledger,
+    )
+    .await;
+    let seen = Instant::now();
+    while live_pids_with_argv(&orphan_argv).is_empty() {
+        assert!(
+            seen.elapsed() < Duration::from_secs(10),
+            "the orphan never appeared"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(wait_exited(c, &o).await, 0);
+    let gone = Instant::now();
+    while !live_pids_with_argv(&orphan_argv).is_empty() {
+        assert!(
+            gone.elapsed() < Duration::from_secs(10),
+            "the orphan must be stopped after the init exited: {:?}",
+            live_pids_with_argv(&orphan_argv)
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let _ = writeln_stderr(POD_PID_OK_ORPHAN);
+
+    // 5. pod-init を SIGKILL すると sandbox が NOTREADY になる。
+    let init = pod_init_of_pid_ns(&ns_a);
+    let killed = std::process::Command::new("kill")
+        .args(["-9", &init.to_string()])
+        .status()
+        .expect("kill the pod init");
+    assert!(killed.success());
+    let start = Instant::now();
+    loop {
+        let st = call_with_deadline(
+            c.pod_sandbox_status(cri::PodSandboxStatusRequest {
+                pod_sandbox_id: sb.clone(),
+                verbose: false,
+            }),
+            RPC_DEADLINE,
+        )
+        .await
+        .expect("pod sandbox status")
+        .into_inner()
+        .status
+        .expect("status body");
+        if st.state == cri::PodSandboxState::SandboxNotready as i32 {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "the sandbox must become NOTREADY after the pod init died: {st:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let _ = writeln_stderr(POD_PID_OK_NOTREADY);
+    remove_pod(c, ledger, &sb, &[&a, &b, &o]).await;
+}
+
+fn writeln_stderr(line: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    writeln!(std::io::stderr(), "{line}")
+}
 /// 試験本体（sandbox の作成から exec の照合・後始末まで）。`inject` が真なら StartContainer と Running の確認の直後に
 /// 固定文言で panic する（失敗後の回収の自己照合。#4142）。作った ID は台帳へ登録し、Remove が成功したら外す。
 async fn scenario(
@@ -1414,6 +1693,8 @@ async fn scenario(
     // 段 P（#4405）: POD ネットワークの pod 内往復。
     let plugin_pid = lock_srv(&srv).guard.0.id();
     pod_network_stage(&mut c, &id, &token, &ledger, plugin_pid).await;
+    // 段 S（#4818）: pod の pid namespace の共有。
+    pod_pid_stage(&mut c, &token, &ledger).await;
 
     // 4. 要求元の異常終了（SUP-6・SEC-1・REPAIR-5・#4167）: 終わらない exec を開いたまま plugin-cri を SIGKILL すると、
     //    helper が 2 秒以内に終わり、exec のコマンドが残らない。helper の期限は 60 秒以上で、期限や hold_grace では説明できない。

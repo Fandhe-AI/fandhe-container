@@ -766,6 +766,17 @@ async fn round_trip_until_match(c: &mut RuntimeServiceClient<Channel>, id: &str)
     }
 }
 
+/// 保持役の本体か（argv に `pod-holder` を含み、`NSpid` が 1 段＝ホストの pid ns にだけ居る）。pid を共有する pod では
+/// 保持役が fork した pod-init も同じ argv を持つが、pod の pid ns の PID 1 なので `NSpid` が 2 段になり除かれる（#4815）。
+fn is_pod_holder(pid: u32) -> bool {
+    cmdline_args(pid).is_some_and(|a| a.iter().any(|x| x == "pod-holder"))
+        && std::fs::read_to_string(format!("/proc/{pid}/status")).is_ok_and(|st| {
+            st.lines()
+                .find_map(|l| l.strip_prefix("NSpid:"))
+                .is_some_and(|v| v.split_whitespace().count() == 1)
+        })
+}
+
 /// argv に `pod-holder` を含む保持役のうち、netns が `want`（`net:[<inode>]`）のものの数。
 fn holders_with_netns(want: &str) -> usize {
     let Ok(dir) = std::fs::read_dir("/proc") else {
@@ -776,7 +787,7 @@ fn holders_with_netns(want: &str) -> usize {
         let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
             continue;
         };
-        if cmdline_args(pid).is_some_and(|a| a.iter().any(|x| x == "pod-holder"))
+        if is_pod_holder(pid)
             && std::fs::read_link(format!("/proc/{pid}/ns/net"))
                 .is_ok_and(|l| l.to_string_lossy() == want)
         {

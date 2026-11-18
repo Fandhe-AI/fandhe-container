@@ -1076,6 +1076,172 @@ mod tests {
         0
     }
 
+    /// 実機(`--ignored`)。CRI-2・CORE-3・SEC-5・SEC-1・#4806（S0）: pod の `/dev/shm` の案 A の 3 段が、非特権の
+    /// user + mount namespace で通ることの PoC。
+    ///
+    /// 1. 保持役の代わり（`unshare --user --map-root-user --mount`）が、自分の mount ns に tmpfs
+    ///    （`size=64m,nosuid,nodev,noexec,mode=1777`）を載せる
+    /// 2. コンテナの init の代わり（保持役の userns へ参加し、`unshare(CLONE_NEWNS)` で自分の mount ns を作った子）が、
+    ///    保持役の mnt ns へ `setns` して `open_tree(OPEN_TREE_CLONE)` で複製を取る（v6.12 の `__do_loopback` は複製元が
+    ///    呼び出し側の今の mount ns にあること〔`check_mnt`〕を要るため、参加してから開く）
+    /// 3. 自分の mnt ns へ戻り、`move_mount` で載せ先へ付ける（移すものは anon ns の root）
+    ///
+    /// 載せた先の属性 `nosuid,nodev,noexec`・大きさ `size=65536k`（mountinfo）と、2 つの mnt ns の間で内容が一致すること
+    /// （保持役側で書いたファイルを init 側で読み、init 側で書いたファイルを保持役側で読む）を具体値で照合し、試験プロセスの
+    /// mount ns には付かないことも確かめる。
+    #[test]
+    #[ignore = "needs unprivileged user namespaces, unshare(1) and mount(8); run with --ignored (#4806)"]
+    fn cri2_core3_4806_shm_clone_via_holder_mnt_ns() {
+        use crate::sys::{self, MountTreeScope, NsFlag};
+        use std::ffi::CString;
+        let (_scratch, dir) = crate::test_support::scratch_child("fandhe-shm-poc", "d");
+        let (src, dst) = (dir.join("shm-src"), dir.join("shm-dst"));
+        std::fs::create_dir_all(&src).expect("mkdir src");
+        std::fs::create_dir_all(&dst).expect("mkdir dst");
+        let (src_s, dst_s) = (
+            src.to_str().expect("utf8").to_owned(),
+            dst.to_str().expect("utf8").to_owned(),
+        );
+        let script = format!(
+            "mount -t tmpfs -o size=64m,nosuid,nodev,noexec,mode=1777 tmpfs '{src_s}' && exec sleep 30"
+        );
+        let holder = FakeHolder {
+            child: std::process::Command::new("unshare")
+                .args([
+                    "--user",
+                    "--map-root-user",
+                    "--mount",
+                    "--propagation",
+                    "private",
+                ])
+                .args(["sh", "-c", &script])
+                .spawn()
+                .expect("PRECONDITION FAILED: unshare(1) is required"),
+        };
+        let hpid = holder.child.id();
+        // 保持役の mount ns に tmpfs が載るまで待つ。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mounted = || {
+            std::fs::read_to_string(format!("/proc/{hpid}/mountinfo")).is_ok_and(|info| {
+                info.lines().any(|l| {
+                    l.split_whitespace().nth(4) == Some(src_s.as_str()) && l.contains(" - tmpfs ")
+                })
+            })
+        };
+        while !mounted() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "PRECONDITION FAILED: the holder did not mount the tmpfs"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let holder_root = |name: &str| format!("/proc/{hpid}/root{src_s}/{name}");
+        std::fs::write(holder_root("from-holder"), "holder").expect("write on the holder side");
+        let user = sys::open_ns_file(&CString::new(format!("/proc/{hpid}/ns/user")).expect("c"))
+            .expect("open the holder user ns");
+        let mnt = sys::open_ns_file(&CString::new(format!("/proc/{hpid}/ns/mnt")).expect("c"))
+            .expect("open the holder mnt ns");
+        let (src_c, dst_c) = (
+            CString::new(src_s.clone()).expect("c"),
+            CString::new(dst_s.clone()).expect("c"),
+        );
+        let dst_file = |name: &str| dst.join(name);
+        let child = sys::fork_single_threaded_with(
+            || true,
+            || {
+                if sys::setns_fd(user.as_fd(), NsFlag::User).is_err() {
+                    return 10;
+                }
+                if sys::unshare_namespaces(&[NsFlag::Mount]).is_err() {
+                    return 11;
+                }
+                if sys::mount_root_private_recursive().is_err() {
+                    return 12;
+                }
+                let Ok(own) = sys::open_ns_file(c"/proc/thread-self/ns/mnt") else {
+                    return 13;
+                };
+                // 2. 保持役の mnt ns へ参加して複製を取る。
+                if sys::setns_fd(mnt.as_fd(), NsFlag::Mount).is_err() {
+                    return 14;
+                }
+                let Ok(src_fd) = sys::open_dir_path_nofollow(None, &src_c) else {
+                    return 15;
+                };
+                let Ok(verified) = sys::verify_bind_source_fd(src_fd) else {
+                    return 16;
+                };
+                let Ok(clone) = sys::open_tree_clone_bind(&verified, MountTreeScope::MountOnly)
+                else {
+                    return 17;
+                };
+                // 3. 自分の mnt ns へ戻って載せる。
+                if sys::setns_fd(own.as_fd(), NsFlag::Mount).is_err() {
+                    return 18;
+                }
+                let Ok(dst_fd) = sys::open_dir_path_nofollow(None, &dst_c) else {
+                    return 19;
+                };
+                if sys::move_mount_empty_path(clone.as_fd(), dst_fd.as_fd()).is_err() {
+                    return 20;
+                }
+                let Ok(top) = sys::open_dir_path_nofollow(None, &dst_c) else {
+                    return 21;
+                };
+                match sys::mount_flags(top.as_fd()) {
+                    Ok(f) if f.is_valid() && f.is_nosuid() && f.is_nodev() && f.is_noexec() => {}
+                    _ => return 22,
+                }
+                let Ok(info) = std::fs::read_to_string("/proc/thread-self/mountinfo") else {
+                    return 23;
+                };
+                let sized = info.lines().any(|l| {
+                    l.split_whitespace().nth(4) == Some(dst_s.as_str())
+                        && l.contains(" - tmpfs ")
+                        && l.contains("size=65536k")
+                });
+                if !sized {
+                    return 24;
+                }
+                match std::fs::read_to_string(dst_file("from-holder")) {
+                    Ok(text) if text == "holder" => {}
+                    _ => return 25,
+                }
+                if std::fs::write(dst_file("from-init"), "init").is_err() {
+                    return 26;
+                }
+                0
+            },
+            29,
+        )
+        .expect("fork");
+        assert_eq!(
+            wait_exit(child),
+            0,
+            "the three steps of option A must succeed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(holder_root("from-init")).expect("read on the holder side"),
+            "init"
+        );
+        // 試験プロセスの mount ns には付いていない（載せ先は init の mount ns だけ）。
+        let own_info = std::fs::read_to_string("/proc/self/mountinfo").expect("mountinfo");
+        assert!(
+            !own_info
+                .lines()
+                .any(|l| l.split_whitespace().nth(4) == Some(dst_s.as_str())),
+            "the clone leaked into the caller's mount namespace"
+        );
+        assert!(
+            !dst.join("from-init").exists(),
+            "the target stays empty on the host"
+        );
+        drop(holder);
+        println!(
+            "cri2_core3_4806: /dev/shm option A (setns + open_tree clone + move_mount) works unprivileged"
+        );
+    }
+
     /// 子を期限つき（20 秒）で回収して終了コードを返す（異常終了・期限切れは 255）。
     fn wait_exit(pid: u32) -> i32 {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);

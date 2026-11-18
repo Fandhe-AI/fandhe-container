@@ -29,8 +29,104 @@ fn ready_frame(pid: u32) -> String {
     format!("printf '{}'", octal(PodHolderFrame::ready(&r).as_bytes()))
 }
 
+/// 既定の試験の設定は pid が `CONTAINER`（保持役に pid ns を作らせない。偽の READY は pid ns を載せない）。
 fn config() -> fandhe_container_cri::runtime::v1::PodSandboxConfig {
-    fandhe_container_cri::runtime::v1::PodSandboxConfig::default()
+    config_with_pid(fandhe_container_cri::runtime::v1::NamespaceMode::Container)
+}
+
+fn config_with_pid(
+    mode: fandhe_container_cri::runtime::v1::NamespaceMode,
+) -> fandhe_container_cri::runtime::v1::PodSandboxConfig {
+    use fandhe_container_cri::runtime::v1::{
+        LinuxPodSandboxConfig, LinuxSandboxSecurityContext, NamespaceOption, PodSandboxConfig,
+    };
+    PodSandboxConfig {
+        linux: Some(LinuxPodSandboxConfig {
+            security_context: Some(LinuxSandboxSecurityContext {
+                namespace_options: Some(NamespaceOption {
+                    pid: mode as i32,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// 自分の pid を READY に入れ（`$$` を欄 A に出す）、`pid_ns` を載せた偽の保持役のスクリプト。
+fn ready_script_with_pid_ns(pid_ns: Option<NsId>, tail: &str) -> String {
+    let ns = |i| NsId { dev: 4, ino: i };
+    let r = PodHolderReady::new(1, ns(10), ns(11), ns(12), ns(13), pid_ns).unwrap();
+    let f = PodHolderFrame::ready(&r);
+    let b = f.as_bytes();
+    let (head, rest) = (octal(&b[..8]), octal(&b[16..]));
+    format!(
+        "printf '{head}'; p=$$; i=0; while [ $i -lt 8 ]; do printf \"\\\\$(printf '%03o' $(( (p >> (i*8)) & 255 )))\"; i=$((i+1)); done; printf '{rest}'; {tail}"
+    )
+}
+
+/// CRI-2・#4816: 保持役に `--share-pid` を渡すのは sandbox の pid が `POD`（未指定を含む）のときだけ。`CONTAINER` では
+/// 渡さない（pid ns を作らない）。
+#[test]
+fn cri2_4816_share_pid_argument_follows_sandbox_pid_mode() {
+    use fandhe_container_cri::runtime::v1::{NamespaceMode, PodSandboxConfig};
+    let cases = [
+        (
+            "pod",
+            config_with_pid(NamespaceMode::Pod),
+            "pod-holder --share-pid",
+        ),
+        (
+            "unset",
+            PodSandboxConfig::default(),
+            "pod-holder --share-pid",
+        ),
+        (
+            "container",
+            config_with_pid(NamespaceMode::Container),
+            "pod-holder",
+        ),
+        ("node", config_with_pid(NamespaceMode::Node), "pod-holder"),
+    ];
+    for (name, cfg, want) in cases {
+        let argv = scratch(&format!("argv-{name}"));
+        let p = sh(&format!("echo \"$*\" >{}; exit 3", argv.display()), 8);
+        let e = p.spawn(&req(name, &cfg, 5000)).unwrap_err();
+        assert_eq!(e.code(), CriErrorCode::FailedPrecondition, "{name}");
+        assert_eq!(
+            std::fs::read_to_string(&argv).unwrap().trim(),
+            want,
+            "{name}"
+        );
+        let _ = std::fs::remove_file(&argv);
+    }
+}
+
+/// CRI-2・SEC-5・#4816: READY の pid ns の有無は、求めた共有と一致しなければならない。求めたのに無い・求めないのにある
+/// ときは、sandbox の作成が固定の文言で失敗し、子は回収される。
+#[test]
+fn cri2_sec5_4816_ready_pid_ns_must_match_requested_sharing() {
+    use fandhe_container_cri::runtime::v1::NamespaceMode;
+    let cases = [
+        (NamespaceMode::Pod, None),
+        (NamespaceMode::Container, Some(NsId { dev: 4, ino: 14 })),
+    ];
+    for (mode, pid_ns) in cases {
+        let pidfile = scratch("pidns-mismatch");
+        let script = format!(
+            "echo $$ >{}; {}",
+            pidfile.display(),
+            ready_script_with_pid_ns(pid_ns, "exec cat >/dev/null")
+        );
+        let cfg = config_with_pid(mode);
+        let e = sh(&script, 8).spawn(&req("pidns", &cfg, 5000)).unwrap_err();
+        assert_eq!(e.code(), CriErrorCode::FailedPrecondition, "{mode:?}");
+        assert_eq!(e.message(), MSG_PID_NS_MISMATCH, "{mode:?}");
+        assert!(proc_gone(read_pid(&pidfile)), "{mode:?}");
+        let _ = std::fs::remove_file(&pidfile);
+    }
 }
 
 fn req<'a>(

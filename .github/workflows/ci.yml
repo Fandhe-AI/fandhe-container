@@ -1797,8 +1797,8 @@ jobs:
             "${PHPR_BIN}" --ignored
           scripts/check-success-lines.sh --name pod_holder_provider_real \
             --src crates/plugin-cri/tests/pod_holder_provider_real.rs --log "${log}" \
-            --select '^pod_holder_provider_real: (scenario [A-D] ok:|the production pod holder provider works)' \
-            --min 5 \
+            --select '^pod_holder_provider_real: (scenario [A-F] ok:|the production pod holder provider works)' \
+            --min 7 \
             --forbid 'pod_holder_provider_real: ignored' --forbid 'not applicable' --forbid 'PRECONDITION FAILED' \
             --forbid 'WATCHDOG EXPIRED' --forbid 'root=true' --forbid 'FAILED' --summary
 

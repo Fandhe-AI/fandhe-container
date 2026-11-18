@@ -54,8 +54,8 @@ use fandhe_container_cri::error::CriError;
 use fandhe_container_net::dns_helper::identity::read_start_time;
 use fandhe_container_net::error::NetErrorCode;
 use fandhe_container_supervisor::pod_holder::{
-    NsId, POD_HOLDER_SUBCOMMAND, PodHolderReady, READY_TIMEOUT, holder_executable_beside,
-    read_ready,
+    NsId, POD_HOLDER_SHARE_PID, POD_HOLDER_SUBCOMMAND, PodHolderReady, READY_TIMEOUT,
+    holder_executable_beside, read_ready,
 };
 
 use crate::sys::child_exit_observed;
@@ -83,6 +83,8 @@ const MSG_PID_MISMATCH: &str = "the pod holder reported an unexpected process";
 const MSG_IDENTITY_UNAVAILABLE: &str = "the pod holder identity cannot be recorded";
 const MSG_OBSERVE_FAILED: &str = "failed to observe the recorded pod holder";
 const MSG_NS_MISMATCH: &str = "the pod holder namespaces do not match the report";
+const MSG_PID_NS_MISMATCH: &str =
+    "the pod holder pid namespace does not match the requested sharing";
 const MSG_SPAWN_FAILED: &str = "failed to start the pod holder";
 const MSG_POISONED: &str = "pod holder table is unavailable";
 const MSG_RELEASE_TIMEOUT: &str = "timed out releasing the pod holder";
@@ -324,13 +326,20 @@ impl ProductionPodHolder {
     }
 
     /// 子を起動して READY を検証する。失敗時は子を SIGKILL して回収を試み、回収できなかった子を返す。
+    ///
+    /// `share_pid` が真（sandbox の pid が `POD`）なら保持役に `--share-pid` を渡し、pod の pid ns と pod-init を作らせる
+    /// （#4815・#4816）。
     fn start_child(
         &self,
         ready_timeout: Duration,
+        share_pid: bool,
     ) -> Result<StartedHolder, (TraitError, Option<Child>)> {
         let (mut cmd, exe_fd) = self.resolve_command().map_err(|e| (e, None))?;
-        cmd.arg(POD_HOLDER_SUBCOMMAND)
-            .env_clear()
+        cmd.arg(POD_HOLDER_SUBCOMMAND);
+        if share_pid {
+            cmd.arg(POD_HOLDER_SHARE_PID);
+        }
+        cmd.env_clear()
             .current_dir("/")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -359,7 +368,7 @@ impl ProductionPodHolder {
             }
         };
         drop(stdout);
-        if let Err(e) = self.verify_ready(&child, &ready) {
+        if let Err(e) = self.verify_ready(&child, &ready, share_pid) {
             drop(stdin);
             return Err((e, kill_and_reap(child)));
         }
@@ -389,14 +398,25 @@ impl ProductionPodHolder {
     }
 
     /// READY の pid が spawn した子と一致し、`/proc/<pid>/ns/{user,ipc,net,mnt}` の素性が READY と一致することを確かめる
-    /// （mnt は #4808）。
+    /// （mnt は #4808）。pid ns は、求めたとき（`share_pid`）にだけ READY にあり、`/proc/<pid>/ns/pid_for_children` と一致する
+    /// こと。求めたのに無い・求めないのにある・素性が違うときは `MSG_PID_NS_MISMATCH`（#4816）。
     /// この stat は ptrace のアクセス検査を通るため、再 exec で non-dumpable を保つ前提の直接の確認にもなる。
-    fn verify_ready(&self, child: &Child, ready: &PodHolderReady) -> Result<(), TraitError> {
+    fn verify_ready(
+        &self,
+        child: &Child,
+        ready: &PodHolderReady,
+        share_pid: bool,
+    ) -> Result<(), TraitError> {
         if ready.pid() != child.id() {
             return Err(TraitError::new(
                 ErrorCode::FailedPrecondition,
                 MSG_PID_MISMATCH,
             ));
+        }
+        let pid_ns_mismatch =
+            || TraitError::new(ErrorCode::FailedPrecondition, MSG_PID_NS_MISMATCH);
+        if ready.pid_ns().is_some() != share_pid {
+            return Err(pid_ns_mismatch());
         }
         if !self.verify_namespaces() {
             return Ok(());
@@ -419,6 +439,17 @@ impl ProductionPodHolder {
                     ErrorCode::FailedPrecondition,
                     MSG_NS_MISMATCH,
                 ));
+            }
+        }
+        if let Some(want) = ready.pid_ns() {
+            let got = std::fs::metadata(format!("/proc/{}/ns/pid_for_children", ready.pid()))
+                .map_err(|_| pid_ns_mismatch())?;
+            if (NsId {
+                dev: got.dev(),
+                ino: got.ino(),
+            }) != want
+            {
+                return Err(pid_ns_mismatch());
             }
         }
         Ok(())
@@ -451,7 +482,7 @@ impl ProductionPodHolder {
             }
             t.spawning.insert(id.clone());
         }
-        let started = self.start_child(req.ready_timeout());
+        let started = self.start_child(req.ready_timeout(), req.shares_pod_pid());
         let mut t = self.lock().map_err(|e| (e, false))?;
         t.spawning.remove(&id);
         match started {
@@ -707,14 +738,19 @@ fn holder_from_ready(
         dev: id.dev,
         ino: id.ino,
     };
-    let identity = HolderIdentity::new(
+    let unavailable = |_| TraitError::new(ErrorCode::FailedPrecondition, MSG_IDENTITY_UNAVAILABLE);
+    let mut identity = HolderIdentity::new(
         ready.pid(),
         start_time_ticks,
         ns(ready.user()),
         ns(ready.ipc()),
         ns(ready.net()),
     )
-    .map_err(|_| TraitError::new(ErrorCode::FailedPrecondition, MSG_IDENTITY_UNAVAILABLE))?;
+    .map_err(unavailable)?;
+    // pid を共有する sandbox は pod の pid ns の素性も記録に残す（再採用の照合。#2940・#4816）。
+    if let Some(pid_ns) = ready.pid_ns() {
+        identity = identity.with_pid_ns(ns(pid_ns)).map_err(unavailable)?;
+    }
     Ok(PodHolder::from_identity(identity))
 }
 

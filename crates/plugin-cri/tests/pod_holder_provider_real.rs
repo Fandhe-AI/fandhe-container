@@ -11,6 +11,9 @@
 //! - B: `release`（stdin の EOF）で保持役が終わって回収され、`/proc/<pid>` が消える
 //! - C: 外からの SIGKILL の後、`liveness` が `Exited` を返しても `/proc/<pid>` は zombie で残り（回収しない）、`release` が回収する
 //! - D: 追跡する子の上限（2）を超える 3 件目の `spawn` は `RESOURCE_EXHAUSTED`
+//! - E: sandbox の pid が `POD`（既定）なら、素性の pid ns が保持役の `/proc/<pid>/ns/pid_for_children` と一致し、保持役の
+//!   唯一の子（pod-init）を SIGKILL すると `liveness` が `Exited` になる（cri はこれで `SANDBOX_NOTREADY` にする。#4816）
+//! - F: sandbox の pid が `CONTAINER` なら、素性に pid ns が無く、保持役は子（pod-init）を持たない（#4816）
 //!
 //! 範囲外: 保持役の namespace へのコンテナの join と pod 間の通信（H5・#2876、H8・#2878、core の net join は H7・#2872）。
 
@@ -58,7 +61,10 @@ mod linux {
         PodHolderLiveness, PodHolderRequest, PodNamespaceHolderProvider, ProcessStartObservation,
     };
     use fandhe_container_cri::error::CriErrorCode;
-    use fandhe_container_cri::runtime::v1::PodSandboxConfig;
+    use fandhe_container_cri::runtime::v1::{
+        LinuxPodSandboxConfig, LinuxSandboxSecurityContext, NamespaceMode, NamespaceOption,
+        PodSandboxConfig,
+    };
     use fandhe_container_plugin_cri::pod_holder::ProductionPodHolder;
 
     const KILL: &str = "/usr/bin/kill";
@@ -259,6 +265,73 @@ mod linux {
         }
         println!(
             "pod_holder_provider_real: scenario D ok: the third spawn is RESOURCE_EXHAUSTED at the limit of 2 (root=false)"
+        );
+
+        // E: pid を共有する sandbox（既定の POD）。pod-init の死で保持役が終わる。
+        let e = provider
+            .spawn(&req("sb-e"))
+            .unwrap_or_else(|e| fail(&format!("spawn e: {e}")));
+        let e_pid = e.pid().get();
+        let Some(pid_ns) = e.identity().and_then(|i| i.pid_ns()) else {
+            fail("a POD sandbox must record the pod pid namespace");
+        };
+        if (pid_ns.dev, pid_ns.ino) != ns_id(Some(e_pid), "pid_for_children") {
+            fail("identity pid namespace differs from /proc/<holder>/ns/pid_for_children");
+        }
+        let kids = std::fs::read_to_string(format!("/proc/{e_pid}/task/{e_pid}/children"))
+            .unwrap_or_default();
+        let kids: Vec<&str> = kids.split_whitespace().collect();
+        let [pod_init] = kids.as_slice() else {
+            fail(&format!("holder e must have exactly one child: {kids:?}"));
+        };
+        let st = Command::new(KILL)
+            .args(["-KILL", pod_init])
+            .status()
+            .unwrap_or_else(|e| fail(&format!("kill: {e}")));
+        if !st.success() {
+            fail("kill -KILL of the pod init failed");
+        }
+        wait_until("liveness Exited after the pod init died", || {
+            provider.liveness("sb-e").ok() == Some(PodHolderLiveness::Exited)
+        });
+        provider
+            .release("sb-e", STEP)
+            .unwrap_or_else(|e| fail(&format!("release e: {e}")));
+        println!(
+            "pod_holder_provider_real: scenario E ok: a POD sandbox records the pod pid ns and the holder exits when the pod init dies (root=false)"
+        );
+
+        // F: pid を共有しない sandbox（CONTAINER）。
+        let cfg_container = PodSandboxConfig {
+            linux: Some(LinuxPodSandboxConfig {
+                security_context: Some(LinuxSandboxSecurityContext {
+                    namespace_options: Some(NamespaceOption {
+                        pid: NamespaceMode::Container as i32,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let f = provider
+            .spawn(&PodHolderRequest::new("sb-f", &cfg_container, STEP))
+            .unwrap_or_else(|e| fail(&format!("spawn f: {e}")));
+        let f_pid = f.pid().get();
+        if f.identity().and_then(|i| i.pid_ns()).is_some() {
+            fail("a CONTAINER sandbox must not record a pod pid namespace");
+        }
+        let kids = std::fs::read_to_string(format!("/proc/{f_pid}/task/{f_pid}/children"))
+            .unwrap_or_default();
+        if !kids.trim().is_empty() {
+            fail(&format!("holder f must not have a pod init: {kids:?}"));
+        }
+        provider
+            .release("sb-f", STEP)
+            .unwrap_or_else(|e| fail(&format!("release f: {e}")));
+        println!(
+            "pod_holder_provider_real: scenario F ok: a CONTAINER sandbox makes no pod pid ns and no pod init (root=false)"
         );
 
         println!(

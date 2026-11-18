@@ -51,7 +51,7 @@ use crate::sys;
 /// 段 2 を示す固定の第 2 引数。
 const STAGE2: &str = "--stage2";
 /// 段 1 で pod の pid ns も作ることを示す引数（#4815）。
-const SHARE_PID: &str = "--share-pid";
+const SHARE_PID: &str = super::POD_HOLDER_SHARE_PID;
 /// 停止の後に pod-init の回収を待つ上限（REPAIR-5）。
 const POD_INIT_STOP_LIMIT: Duration = Duration::from_secs(5);
 /// 再 exec の `argv[0]`（固定。パス文字列を使わない）。

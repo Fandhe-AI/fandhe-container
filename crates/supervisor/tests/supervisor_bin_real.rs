@@ -1509,8 +1509,8 @@ mod linux {
         }
     }
 
-    /// stream-exec helper（supervisor の bin の再実行。plugin-cri の Exec と同じ経路）で `/probe --pidns-is <want>` を
-    /// 実行し、`Result` の値を返す。stdio は渡さない（mask 0）。helper は期限つきで回収する（REPAIR-5・#4813）。
+    /// stream-exec helper（supervisor の bin の再実行。plugin-cri の Exec と同じ経路。委譲 scope で包む）で
+    /// `/probe --pidns-is <want>` を実行し、`Result` の値を返す。stdio は渡さない（mask 0）。helper は期限つきで回収する（REPAIR-5・#4813）。
     fn exec_pidns_probe(
         env: &Env,
         id: &str,
@@ -1534,12 +1534,21 @@ mod linux {
         )
         .expect("stream-exec args");
         let (plugin, helper_end) = UnixStream::pair().expect("socketpair");
-        let mut command = stream_exec_command(Path::new(BIN), &args);
+        // helper は exec の子 cgroup へ自分を移すため、supervisor と同じ委譲 scope の包みの中で動かす（委譲の外からでは
+        // 移動元と移動先の共通祖先の `cgroup.procs` に書けず EACCES になる。本番では plugin-cri が委譲 scope に居る）。
+        // 引数は本番の `stream_exec_command` が組んだものをそのまま使う。
+        let helper = stream_exec_command(Path::new(BIN), &args);
+        let mut command = Command::new("systemd-run");
         command
+            .args(fandhe_container_supervisor::start_contract::USER_SCOPE_WRAPPER_ARGS)
+            .arg(BIN)
+            .args(helper.get_args())
             .stdin(Stdio::from(OwnedFd::from(helper_end)))
             .stdout(Stdio::null())
             .stderr(Stdio::inherit());
-        let mut child = command.spawn().expect("spawn the stream-exec helper");
+        let mut child = command
+            .spawn()
+            .expect("spawn the stream-exec helper (is `systemd-run --user` available?)");
         // `command` が持つ子側の端は親に残さない（helper の終了で EOF になるように）。
         drop(command);
         let deadline = Instant::now() + EXEC_TIMEOUT;

@@ -1445,8 +1445,12 @@ mod linux {
             Some("1"),
             "the shared init must not be PID 1 of the pod pid namespace: NSpid={nspid}"
         );
+        let outcome = exec_pidns_probe(&env, &id, pid, &pod.pid_ns());
+        if outcome != StreamExecOutcome::Exited(0) {
+            dump_exec_diag(&env, &id);
+        }
         assert_eq!(
-            exec_pidns_probe(&env, &id, pid, &pod.pid_ns()),
+            outcome,
             StreamExecOutcome::Exited(0),
             "exec into the shared container must run in the pod pid namespace"
         );
@@ -1479,6 +1483,30 @@ mod linux {
         println!(
             "supervisor_bin_real: scenario=G ok (pid shared: exec via the launch pidfd ran in the pod pid namespace; stopping via the control channel left no orphan)"
         );
+    }
+
+    /// exec の失敗の診断として、supervisor の構造化ログと `@audit.log` の末尾を stderr へ出す（#4813）。
+    fn dump_exec_diag(env: &Env, id: &str) {
+        let logs = env
+            .root()
+            .join(fandhe_container_supervisor::supervisor_log::SUPERVISOR_LOG_DIR_NAME);
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&logs)
+            .map(|d| d.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default();
+        files.push(env.root().join("@audit.log"));
+        for f in files {
+            let text = std::fs::read_to_string(&f).unwrap_or_default();
+            let lines: Vec<&str> = text.lines().collect();
+            let tail = &lines[lines.len().saturating_sub(40)..];
+            eprintln!(
+                "supervisor_bin_real: diag {} ({id}, last {} lines)",
+                f.display(),
+                tail.len()
+            );
+            for l in tail {
+                eprintln!("supervisor_bin_real: diag | {l}");
+            }
+        }
     }
 
     /// stream-exec helper（supervisor の bin の再実行。plugin-cri の Exec と同じ経路）で `/probe --pidns-is <want>` を

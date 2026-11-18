@@ -410,6 +410,8 @@ fn converse(
     cancel: Option<&AtomicBool>,
 ) -> Result<Report, UsernsHelperError> {
     let mut child = child;
+    // 要求を書けない（helper が要求を読む前に終わって相手が閉じた等）は「helper を使えない」として `Unavailable`、
+    // 要求を受けた後に応答なしで終わる（下の EOF）は応答の不整合として `Internal` に分ける（#4877）。
     if sock.write_all(frame).is_err() {
         return Err(fail(child, ErrorCode::Unavailable, MSG_PROTOCOL));
     }
@@ -559,10 +561,17 @@ mod tests {
     }
 
     /// REPAIR-5・#4795: 応答なしで終わる helper（EOF）は `Internal`（プロトコル違反）で、子は残らない。
+    ///
+    /// 代役は要求の先頭 1 バイトを読んでから終わる（`dd`）。読まずに終わる代役（`/bin/true`）は、親の要求の書き込みより
+    /// 先に終わると書き込みが失敗して `Unavailable` になり、結果がタイミングで変わる（#4877）。書き込み失敗の側は
+    /// `sec5_4877_request_write_failure_is_unavailable_and_reaps_the_helper` が固定する。
     #[test]
     fn sec5_4795_helper_exiting_without_a_response_is_a_protocol_error() {
         let dir = File::open("/").expect("open /");
-        let launcher = UsernsHelperLauncher::with_fixed_command("/bin/true", vec![]);
+        let launcher = UsernsHelperLauncher::with_fixed_command(
+            "/bin/dd",
+            vec!["bs=1".into(), "count=1".into(), "of=/dev/null".into()],
+        );
         let mut err = launcher
             .run(Mode::Inspect, dir.as_fd(), budget())
             .expect_err("no response");
@@ -570,6 +579,40 @@ mod tests {
         assert_eq!(err.message(), MSG_PROTOCOL);
         assert!(err.helper_code().is_none());
         assert!(err.take_unreaped().is_none());
+    }
+
+    /// REPAIR-5・SEC-5・#4877: 要求を書けないとき（helper が要求を読む前に終わった場合に当たる）は `Unavailable` で、
+    /// 子は kill・回収される。書き込みの失敗は、親側の端の送信方向を閉じて決定的に起こす（相手側を閉じるだけでは、
+    /// 並行する spawn の子が fork〜exec の間に相手側の複製を持つと失敗しない。#4789）。
+    #[test]
+    fn sec5_4877_request_write_failure_is_unavailable_and_reaps_the_helper() {
+        let (parent_end, _child_end) = UnixStream::pair().expect("pair");
+        parent_end
+            .shutdown(std::net::Shutdown::Write)
+            .expect("shutdown");
+        let child = std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn");
+        let pid = child.id();
+        let frame = encode_request(Mode::Inspect);
+        let mut err = converse(
+            child,
+            parent_end,
+            frame.as_bytes(),
+            (&[], None),
+            Instant::now() + Duration::from_secs(1),
+            None,
+        )
+        .expect_err("write must fail");
+        assert_eq!(err.code(), ErrorCode::Unavailable);
+        assert_eq!(err.message(), MSG_PROTOCOL);
+        assert!(err.helper_code().is_none());
+        assert!(err.take_unreaped().is_none(), "child must be reaped");
+        assert!(pid_gone(pid), "pid {pid} must be gone");
     }
 
     /// SEC-5・#4795: 対象 fd がディレクトリでなければ spawn の前に `InvalidArgument`。

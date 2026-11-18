@@ -1752,7 +1752,7 @@ mod unix_tests {
         assert_eq!(got[0].reaped, Some(true));
     }
 
-    /// REPAIR-5・#4223: 相手が読まない stream への書き込みは `WouldBlock` で戻り（未送信が残る）、閉じた相手へは `EPIPE` で失敗する。
+    /// REPAIR-5・#4223・#4789: 相手が読まない stream への書き込みは `WouldBlock` で戻り（未送信が残る）、閉じた相手へは有限回のうちに `EPIPE` で失敗する。
     #[test]
     fn repair5_4223_write_helper_never_blocks() {
         use std::os::unix::net::UnixStream;
@@ -1765,7 +1765,22 @@ mod unix_tests {
         assert!(!rest.is_empty() && rest.len() < big.len());
         assert!(started.elapsed() < Duration::from_secs(2));
         drop(b);
-        let err = unix::write_some(&mut a, &mut rest).unwrap_err();
+        // 並行する試験が子を起動している間は、fork から exec までの子が `b` の複製を持ち、相手がまだ開いて見える
+        // （`Ok(false)`）。複製は exec（CLOEXEC）で閉じるので、有限回のうちに失敗へ変わることを照合する（#4789）。
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        let err = loop {
+            match unix::write_some(&mut a, &mut rest) {
+                Err(e) => break e,
+                Ok(done) => {
+                    assert!(!done && !rest.is_empty(), "closed peer must not accept all");
+                    assert!(
+                        std::time::Instant::now() < until,
+                        "write to a closed peer kept succeeding"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        };
         assert!(
             matches!(err.raw_os_error(), Some(e) if e == 32 /* EPIPE */)
                 || err.kind() == std::io::ErrorKind::BrokenPipe,

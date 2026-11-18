@@ -31,9 +31,10 @@
 //! 7. 状態レコードとエラーメッセージに秘密情報（レジストリ資格情報等）を含めない
 //!    （security.md）
 //! 8. [`StateRecord::cgroup`]（コンテナ用 cgroup の配置 [`CgroupPlacement`]。TASK-30.3・TASK-32・OCI-6・CORE-3）は、
-//!    スコープと instance の組を **1 コンテナにつき 1 回だけ** 記録する。記録の機会は 2 つある
+//!    **記録したものだけが正** である。スコープと instance の組を記録する機会は 2 つある
 //!    （#1314 の決定・案 3-ii）。本番の経路は start 時の追記で、supervisor が [`UpdateStateRequest::with_cgroup_scope`]
-//!    を使う。create 時の記録（[`CreateStateRequest::cgroup_scope`]）も契約として有効である。
+//!    を使う。create 時の記録（[`CreateStateRequest::cgroup_scope`]）も契約として有効である。記録し直すのは、旧い配置の
+//!    **不在を確かめたとき** だけである（#4779 の決定・案 B。下の「記録し直し」）。
 //!    - create で指定があれば、そのスコープと **この create で割り当てた revision**（instance）の組で記録する
 //!    - `update` に `cgroup_scope` の指定が **無ければ**、配置を変えずに引き継ぐ
 //!    - `update` に指定が **あり**、既存のレコードに配置が **無ければ**、そのスコープと **追記直前のレコードの
@@ -42,6 +43,16 @@
 //!    - `update` に指定があり、既存のレコードに配置が **既にあれば** `FailedPrecondition`（上書きしない。
 //!      別スコープでの delete の照合が壊れるため）。照合の順序は「不在なら `NotFound`」→「revision が合わなければ
 //!      `FailedPrecondition`」→「配置が既にあれば `FailedPrecondition`」で、失敗したときはレコードを変えない
+//!    - **記録し直し**（[`UpdateStateRequest::with_cgroup_scope_replacement`]）: 旧い配置の不在の証跡
+//!      [`CgroupPlacementAbsence`]（回復の後で空の cgroup を消した、または `AlreadyAbsent`）を添えたときだけ、
+//!      `expected_revision` での CAS で、指定のスコープと **書き込み直前のレコードの revision**（instance）の組へ
+//!      置き換える。新しい instance は旧い instance と異なる（revision は再利用されない）。照合の順序は
+//!      「不在なら `NotFound`」→「revision が合わなければ `FailedPrecondition`」→「既存の配置が証跡の配置と一致しなければ
+//!      （配置が無い場合を含む）`FailedPrecondition`」で、失敗したときはレコードを変えない。証跡は core の cgroup の経路
+//!      （`cgroups::DelegatedCgroup::resume_recorded_scope`）だけが作れ、不在を確かめられないとき（旧い配置にプロセスが
+//!      居る・回復していない）は作られず、記録し直しは起きない（呼び出し側は今と同じ `FailedPrecondition`）
+//!    - 記録し直しと削除の順序: **旧い配置の cgroup を消してから新しい配置を書く**。delete は記録し直した後の配置
+//!      （新しいスコープと instance）で照合し、旧い配置は照合にも削除にも使わない
 //!
 //!    `get` / `list` で返す。plugin 実装も同じ規則で往復させる（落とすと delete が cgroup の削除を飛ばし、
 //!    cgroup がリークする。追記を落とす実装は core の `record_scope` の事後照合が `Internal` で検出する）。
@@ -346,6 +357,44 @@ impl CgroupPlacement {
     pub fn instance(&self) -> StateRevision {
         self.instance
     }
+}
+
+/// 旧い cgroup の配置の不在の証跡（契約 8 の記録し直しの前提。CORE-2・OCI-6・SEC-1・#4814）。
+///
+/// core の cgroup の経路（`cgroups::DelegatedCgroup::resume_recorded_scope`）が、記録済みの配置のスコープを検証つきで
+/// 開き、コンテナ cgroup が無い（`AlreadyAbsent`）か、空であることを確かめて何も止めずに消した後にだけ作る
+/// （コンストラクタは crate 内に閉じる。証跡なしでは記録し直しを要求できない）。ストアは
+/// [`Self::placement`] が既存の配置と一致することを照合してから置き換える。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CgroupPlacementAbsence {
+    placement: CgroupPlacement,
+}
+
+impl CgroupPlacementAbsence {
+    /// 不在を確かめた配置から作る（core の cgroup の経路と core の試験だけが呼ぶ。cgroup は Linux だけ）。
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn confirmed(placement: CgroupPlacement) -> Self {
+        Self { placement }
+    }
+
+    /// 不在を確かめた（置き換えられる側の）配置。
+    pub fn placement(&self) -> &CgroupPlacement {
+        &self.placement
+    }
+}
+
+/// [`UpdateStateRequest`] の配置の指定（契約 8）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CgroupScopeUpdate {
+    /// 指定なし（既存の配置を引き継ぐ）。
+    Inherit,
+    /// 配置が無いときだけ追記する。
+    Append(CgroupScope),
+    /// 不在を確かめた旧い配置を置き換える。
+    Replace {
+        scope: CgroupScope,
+        absent: CgroupPlacementAbsence,
+    },
 }
 
 /// healthcheck の結果（supervisor〔TASK-157〕が使う。SUP-1・SUP-4）。
@@ -1061,7 +1110,7 @@ pub struct UpdateStateRequest {
     status: ContainerStatus,
     expected_revision: StateRevision,
     supervision: Option<SupervisionState>,
-    cgroup_scope: Option<CgroupScope>,
+    cgroup_scope: CgroupScopeUpdate,
     rlimits: Option<Rlimits>,
     launch_isolation: LaunchIsolationUpdate,
     explicit_stop: Option<ExplicitStop>,
@@ -1074,7 +1123,7 @@ impl UpdateStateRequest {
             status,
             expected_revision,
             supervision: None,
-            cgroup_scope: None,
+            cgroup_scope: CgroupScopeUpdate::Inherit,
             rlimits: None,
             launch_isolation: LaunchIsolationUpdate::Inherit,
             explicit_stop: None,
@@ -1133,15 +1182,41 @@ impl UpdateStateRequest {
     ///
     /// 既存のレコードに配置が無いときだけ、このスコープと追記直前の revision（instance）の組を記録する。
     /// 既にあれば `FailedPrecondition`。supervisor が start で `detect` の後・mkdir の前に呼ぶ（#1314・案 3-ii）。
+    /// [`Self::with_cgroup_scope_replacement`] とは排他で、後に呼んだほうが効く。
     #[must_use]
     pub fn with_cgroup_scope(mut self, scope: CgroupScope) -> Self {
-        self.cgroup_scope = Some(scope);
+        self.cgroup_scope = CgroupScopeUpdate::Append(scope);
         self
     }
 
-    /// 追記するスコープを返す（未指定なら `None`。その場合は既存の配置を引き継ぐ）。
+    /// 追記するスコープを返す（未指定・記録し直しの指定なら `None`。未指定なら既存の配置を引き継ぐ）。
     pub fn cgroup_scope(&self) -> Option<&CgroupScope> {
-        self.cgroup_scope.as_ref()
+        match &self.cgroup_scope {
+            CgroupScopeUpdate::Append(scope) => Some(scope),
+            _ => None,
+        }
+    }
+
+    /// 不在を確かめた旧い配置を、`scope` と書き込み直前の revision（instance）の組へ **記録し直す**（契約 8・#4814）。
+    ///
+    /// 既存の配置が `absent` の配置と一致しなければ（配置が無い場合を含む）`FailedPrecondition` でレコードを変えない。
+    /// [`Self::with_cgroup_scope`] とは排他で、後に呼んだほうが効く。
+    #[must_use]
+    pub fn with_cgroup_scope_replacement(
+        mut self,
+        scope: CgroupScope,
+        absent: CgroupPlacementAbsence,
+    ) -> Self {
+        self.cgroup_scope = CgroupScopeUpdate::Replace { scope, absent };
+        self
+    }
+
+    /// 記録し直しの指定（新しいスコープと、不在を確かめた旧い配置の証跡）を返す（未指定なら `None`）。
+    pub fn cgroup_scope_replacement(&self) -> Option<(&CgroupScope, &CgroupPlacementAbsence)> {
+        match &self.cgroup_scope {
+            CgroupScopeUpdate::Replace { scope, absent } => Some((scope, absent)),
+            _ => None,
+        }
     }
 
     /// 更新後の監視状態を指定する（supervisor〔TASK-157〕が使う。SUP-1。契約 9）。
@@ -1485,6 +1560,15 @@ mod tests {
                     "cgroup scope already recorded",
                 ));
             }
+            let replacement = req.cgroup_scope_replacement();
+            if let Some((_, absent)) = replacement
+                && current.cgroup() != Some(absent.placement())
+            {
+                return Err(TraitError::new(
+                    ErrorCode::FailedPrecondition,
+                    "recorded cgroup placement differs from the confirmed absent one",
+                ));
+            }
             let bundle = current.bundle().to_path_buf();
             let next_revision = self.allocate_revision()?;
             let mut updated = StateRecord::new(req.status().clone(), bundle, next_revision)?;
@@ -1493,14 +1577,19 @@ mod tests {
                 updated = updated.with_instance(i);
             }
             // 契約 8: 配置は引き継ぐ。追記の指定があれば、無いときに限り直前の revision を instance に記録する。
-            match (current.cgroup(), req.cgroup_scope()) {
-                // (Some, Some) は上で FailedPrecondition にしている。
-                (Some(cgroup), _) => updated = updated.with_cgroup(cgroup.clone()),
-                (None, Some(scope)) => {
+            // 記録し直しは照合済みの旧い配置を、新しいスコープと直前の revision の組へ置き換える（#4814）。
+            match (current.cgroup(), req.cgroup_scope(), replacement) {
+                (_, _, Some((scope, _))) => {
                     updated = updated
                         .with_cgroup(CgroupPlacement::new(scope.clone(), current.revision()));
                 }
-                (None, None) => {}
+                // (Some, Some) は上で FailedPrecondition にしている。
+                (Some(cgroup), _, None) => updated = updated.with_cgroup(cgroup.clone()),
+                (None, Some(scope), None) => {
+                    updated = updated
+                        .with_cgroup(CgroupPlacement::new(scope.clone(), current.revision()));
+                }
+                (None, None, None) => {}
             }
             // 契約 9: 監視状態は指定があれば置き換え、なければ引き継ぐ。
             updated = updated.with_supervision(req.supervision().unwrap_or(current.supervision()));

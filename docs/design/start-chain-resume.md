@@ -7,7 +7,7 @@ CORE-2・OCI-6・REPAIR-4・SEC-1。TASK-29 追補・#2245（前提: #2011・PR 
 `recover_interrupted_start` は、中断された start の予約（Running・pid なし）を、記録済みの cgroup 配置から残存プロセスの
 不在を確かめたうえで Created へ戻す。戻した後のレコードは配置が記録済みのまま残るため、次の 2 点が未解決だった。
 
-1. `DelegatedCgroup::record_scope` は記録済みを拒否し、StateStore の契約 8 も配置の上書きを禁じる。delete と再作成なしに
+1. `DelegatedCgroup::record_scope` は記録済みを拒否し、StateStore の契約 8 も配置の上書きを禁じていた（#4814 で不在を確かめた後の記録し直しを足した）。delete と再作成なしに
    同じコンテナを start し直す入口が無かった
 2. 回復結果の内訳（`RecordedCgroupOutcome`: `AlreadyAbsent`・`WasEmpty`・`Killed`）を `ProductionLauncher` が捨てており、観測に残らなかった
 
@@ -30,17 +30,38 @@ CORE-2・OCI-6・REPAIR-4・SEC-1。TASK-29 追補・#2245（前提: #2011・PR 
 
 ### 再開 API `DelegatedCgroup::resume_recorded_scope`
 
-回復後の Created（配置が記録済み）から、配置を変えずに `CgroupScopeRecorded` を返し、以後は既存の
+回復後の Created（配置が記録済み）から `CgroupScopeRecorded` を返し、以後は既存の
 `create_cgroup` → `apply_limits` → `into_join` に進める。順序（破壊的な操作の前に照合と CAS）:
 
 1. `observed` が Created・pid なし・配置が記録済み（満たさなければ `FailedPrecondition`）
-2. 検出した委譲スコープが記録済みのスコープと文字列で一致（不一致は `FailedPrecondition`。ストアにも cgroup にも触れない）
-3. `observed.revision()` での CAS で状態を書く（配置は契約 8 で引き継がれ、revision だけが進む）。配置が保たれたことを照合し、
+2. 検出した委譲スコープが記録済みのスコープと文字列で **一致する**か、一致しなければ **記録し直す**（#4814。下の「配置の記録し直し」）
+3. 一致したとき: `observed.revision()` での CAS で状態を書く（配置は契約 8 で引き継がれ、revision だけが進む）。配置が保たれたことを照合し、
    食い違えば `Internal`（この時点で mkdir していない）
-4. 残った `fc-<id>@<instance>` を既存の fd 起点の削除経路で消す。プロセスが居れば kill せず元の code を保って失敗する
+4. 一致したとき: 残った `fc-<id>@<instance>` を既存の fd 起点の削除経路で消す。プロセスが居れば kill せず元の code を保って失敗する
    （止めるのは回復の責務で、再開に破壊的な停止の経路を増やさない）
 
-契約 8 は変えない。段は新設の `CgroupStep::ResumeScope`（`resume_scope`）。
+段は新設の `CgroupStep::ResumeScope`（`resume_scope`）。
+
+### 配置の記録し直し（#4814・#4779 の決定・案 B）
+
+StateStore の契約 8 を「配置は記録したものだけが正。記録し直すのは、旧い配置の不在を確かめたときだけで、`observed.revision()`
+での CAS で行う」に改めた（`crates/core/src/traits/state_store.rs`）。拡張点トレイトの契約の変更（PLUG-1）で、別の実装（plugin）も
+同じ規則に従う。
+
+- 要求: `UpdateStateRequest::with_cgroup_scope_replacement(scope, absent)`。`absent` は不在の証跡 `CgroupPlacementAbsence` で、
+  コンストラクタは core の crate 内に閉じる（証跡なしでは要求を作れない）。追記（`with_cgroup_scope`）とは排他
+- ストア: 「不在なら `NotFound`」→「revision が合わなければ `FailedPrecondition`」→「既存の配置が証跡の配置と一致しなければ
+  （配置が無い場合を含む）`FailedPrecondition`」の順に照合し、合えば新しいスコープと書き込み直前の revision（instance）の組を書く。
+  失敗したときはレコードを変えない。新しい instance は使われたことのない revision で、旧い instance と重ならない
+- 再開の手順 2（不一致のとき）: 記録のスコープを検証つきで開き、旧い `fc-<id>@<instance>` を `cgroup.kill` を書かずに消す
+  （`recorded_scope::remove_recorded_without_kill`。無ければそのまま）→ 証跡を添えた CAS で新しい配置を書く → 書いた配置を照合する
+  （食い違えば `Internal`）。**旧い配置を消してから新しい配置を書く**。旧い配置にプロセスが居る（回復していない）ときは何も止めず、
+  ストアにも触れずに `FailedPrecondition`（`could not confirm that the recorded cgroup placement is absent; recover the container first`）
+- 消した後の CAS が負けた場合（並行する再開・古い `observed`）は、旧い配置が記録に残る。その cgroup は消えているため、delete は
+  `NotPresent` として扱う（何も止めていない）
+- delete: 記録し直した後の配置（新しいスコープと instance）でだけ照合する。旧い配置は照合にも削除にも使わない
+- spec: OCI-5（`api-oci-image.md`）は状態ファイルのパスだけを定め、契約 8 に当たる記述（配置を 1 回だけ記録する）は無い。OCI-6 の
+  「start のときに記録した委譲スコープ」は記録し直した後のスコープとも矛盾しない（spec の commit `ee3f631` を読んで確かめた）
 
 ### 残余の競合
 
@@ -53,7 +74,8 @@ CAS で直列化した後も、先行する再開の `prepare` の後・launch �
 CLI の `start` は、`systemd-run --user --scope --quiet -p Delegate=yes --` で supervisor を毎回新しい一時 scope に置く
 （unit 名の指定なし）。このため 2 回目の start の supervisor が検出する委譲スコープは、1 回目に記録されたスコープと
 原則として一致せず、本 API は不一致で `FailedPrecondition` になる（1 回目の scope はプロセスが居なくなれば消え、回復は
-通常 `AlreadyAbsent` で終わる）。CLI 経路で実際に再開できるようにする選択肢:
+通常 `AlreadyAbsent` で終わる）。CLI 経路で実際に再開できるようにする選択肢（#4779 で案 B に決まり、契約と再開 API は #4814 で
+改めた。本節の残りは #4780 で直す）:
 
 | 案 | 内容 | 影響 |
 | -- | ---- | ---- |

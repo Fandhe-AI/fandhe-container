@@ -1574,6 +1574,77 @@ mod tests {
         }
     }
 
+    /// CORE-2・OCI-6（契約 8・#4814）: 配置を記録し直した後の delete は、新しい配置（スコープ・instance）でだけ照合する。
+    /// 新しいスコープから消すと `remove` に新しい instance が渡り、旧いスコープから消すと `remove_recorded` に
+    /// 新しい配置が渡る。どちらの経路にも旧い配置は渡らない。
+    #[cfg(unix)]
+    #[test]
+    fn core2_oci6_4814_delete_after_replacement_uses_new_placement() {
+        use crate::state_store::{FileStateStore, StateRoot};
+        use crate::traits::CgroupPlacementAbsence;
+        use std::os::unix::fs::PermissionsExt as _;
+        const NEW: &str = "/user.slice/user-1000.slice/b.scope";
+        for detected in [NEW, SCOPE] {
+            let (_scratch, dir) = crate::test_support::scratch_child("fandhe-delete-4814", "state");
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+            let store =
+                FileStateStore::open(StateRoot::from_override(dir).expect("root")).expect("open");
+            let created = store
+                .create(
+                    &CreateStateRequest::new(
+                        ContainerStatus::created(cid("c1"), None),
+                        std::env::temp_dir().join("b"),
+                    )
+                    .expect("req")
+                    .with_cgroup_scope(CgroupScope::new(SCOPE).expect("scope")),
+                )
+                .expect("create");
+            let old = created.cgroup().expect("placement").clone();
+            let replaced = store
+                .update(
+                    &UpdateStateRequest::new(
+                        ContainerStatus::created(cid("c1"), None),
+                        created.revision(),
+                    )
+                    .with_cgroup_scope_replacement(
+                        CgroupScope::new(NEW).expect("scope"),
+                        CgroupPlacementAbsence::confirmed(old.clone()),
+                    ),
+                )
+                .expect("replace");
+            let new = replaced.cgroup().expect("placement").clone();
+            assert_ne!(new, old);
+            store
+                .update(&UpdateStateRequest::new(
+                    ContainerStatus::stopped(cid("c1"), Some(0)),
+                    replaced.revision(),
+                ))
+                .expect("stop");
+            let remover = RecordingRemover::removed()
+                .in_scope(CgroupScope::new(detected))
+                .with_recorded(Ok(CgroupRemoval::Removed));
+            delete(
+                &store,
+                &OpRecorder::new(),
+                &remover,
+                &DeleteRequest::new(cid("c1")),
+            )
+            .expect("delete");
+            if detected == NEW {
+                assert_eq!(remover.instances(), vec![new.instance()]);
+                assert_eq!(remover.recorded_calls(), Vec::new());
+            } else {
+                assert_eq!(remover.instances(), Vec::new());
+                assert_eq!(remover.recorded_calls(), vec![(cid("c1"), new.clone())]);
+            }
+            let gone = store
+                .get(&GetStateRequest::new(cid("c1")))
+                .expect_err("gone");
+            assert_eq!(gone.code(), ErrorCode::NotFound);
+        }
+    }
+
     /// OCI-6・SEC-1（#2096）: `remove_recorded` が失敗したらその code を返し、状態記録を残す。
     #[test]
     fn sec1_delete_recorded_path_error_keeps_record() {

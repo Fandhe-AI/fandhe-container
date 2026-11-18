@@ -104,7 +104,7 @@
 - core の join の検査: pid は user＋ipc の組に足す形でだけ受ける。`NS_GET_NSTYPE` が `CLONE_NEWPID`、所有 userns が join する user と同じ、`NS_GET_PARENT` が呼び出し側の pid ns。`setns(pid)` は中間プロセスで行い、効くのは以後に fork した init だけ
 - PID 1 の証跡: 「joined pid ns の init」の種別を足す。`getpid() != 1` を許すのは、`/proc/thread-self/ns/pid` が launch で固定した pod の pid ns の素性と一致するときだけ。初期 pid ns でないこと・単一スレッドの検査は保つ。`check_evidence` も同じ素性で照合する（#4812 で実装）
 - `Pid1Target`（exec・healthcheck）: pid を共有するコンテナでは `NSpid` の末尾が 1 でない対象を受ける。ただし launch pidfd の経路（#1461）で、記録した pod の pid ns の素性と一致するときだけ。記録 pid から開く縮退経路は拒否し、監査の語彙を足す（SEC-4）
-- 停止と終了: init が終了しても子孫は pod-init へ付け替わって残るため、init の終了時と停止時にコンテナの cgroup へ `cgroup.kill` を書く（O4）。containerd の shim が pid ns 共有時に init の終了で全プロセスを止める挙動に当たる見込みだが、containerd v2.1.0 の該当箇所は未検証
+- 停止と終了: init が終了しても子孫は pod-init へ付け替わって残るため、init の終了時と停止時にコンテナの cgroup へ `cgroup.kill` を書く（O4）。#4811 で実装した（supervisor の `pid_share`。監視ループは init の終了を観測した後・終了を記録する前、停止は起動ハンドルの回収の後に、core の `cgroups::kill_all_in_recorded` で止めて空になるのを 5 秒まで待ち、結果を `pid_shared_kill_all` の行に出す）。containerd の shim と同じ挙動であることを v2.1.0 の原文で確かめた: `cmd/containerd-shim-runc-v2/runc/util.go` の `ShouldKillAllOnExit`（31〜47 行。pid の namespace が path なしで宣言されていなければ真）と、`cmd/containerd-shim-runc-v2/task/service.go` の `handleInitExit`（696〜713 行。真なら `p.KillAll` の後に init の終了を公開する）
 - containerd との差: PID 1 はコンテナではない（rootfs・seccomp・cgroup の一式を持たない。CORE-7〜9）。兄弟コンテナの `/proc/<pid>/root`・`environ`・`fd` は Landlock の ptrace の境界で開けない（k8s では見える）。同じ uid の signal は届く。pod-init の `/proc/1/root` は空の root
 - 既定値: CRI の enum の 0 は `POD`。sandbox の pid が `POD`（未指定を含む）のときだけ保持役が pid ns を作る。食い違いは O3
 

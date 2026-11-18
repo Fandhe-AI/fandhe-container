@@ -64,6 +64,16 @@
 //! captured, seccomp denial recorded once; failed start left no process; restart relaunched on the calling thread with restart_count 1 and both launches captured and audited; SIGTERM
 //! via the control channel recorded Stopped(43) and the stopped container was deleted; ESC-03 mount denied via the
 //! SeccompNotifyHub and recorded once`。
+//! - シナリオ F〜H（pod の pid namespace を共有するコンテナの kill-all。CRI-2・SUP-1・SUP-3・SUP-9・CORE-4・#4811）: 試験が
+//!   supervisor の bin の `pod-holder` で pod の user・ipc namespace を作り、その中へ `nsenter` した `unshare --pid --fork` で pod の
+//!   pid namespace（PID 1 は `sleep`）を作る。config の `linux.namespaces` の user・ipc は保持役の、pid は `unshare` の
+//!   `pid_for_children` の `/proc/<pid>/ns/*` を path で入れる（cri の `PodNamespacePaths` と同じ形。#4815 の pod-init の代わり）。プローブは孤児になる子（`--orphan-child`）を作ってから終わる・止まる。
+//!   - F: 共有では init の自然終了の後に孤児が消え、supervisor の構造化ログ（`@supervisor-logs`）に `pid_shared_kill_all` の `killed` が 1 件出る。
+//!     対照（pid の path なし）は孤児が pid ns ごと消え、`pid_shared_kill_all` の行が出ない
+//!   - G: 共有で制御チャネルの SIGTERM による停止の後に孤児が消える
+//!   - H: 共有でコンテナ cgroup の `cgroup.kill` を書けなくすると（0444）、`--restart on-failure:3` でも再 launch せず
+//!     （`restart_count` 0・Stopped(7)）、bin が非 0 で終わり、孤児が残る（後始末で試験が止める）
+//!
 //! CI（ubuntu-latest）以外の環境・root の分岐の実行と結果の記録は人間担当（#499・#485・#491・#219 のうち該当するもの、または PR）。Linux 限定。
 
 #[cfg(not(target_os = "linux"))]
@@ -93,7 +103,13 @@ fn main() {
     // 子（コンテナ内）は同じバイナリを `--container-probe` で再実行したもの。
     let has = |flag: &str| std::env::args().any(|a| a == flag);
     if has("--container-probe") {
-        if has("--term-probe") {
+        if has("--orphan-child") {
+            linux::orphan_child();
+        } else if has("--orphan-probe") {
+            linux::orphan_probe();
+        } else if has("--orphan-term-probe") {
+            linux::orphan_term_probe();
+        } else if has("--term-probe") {
             linux::term_probe();
         } else if has("--mount-probe") {
             linux::mount_probe();
@@ -191,6 +207,70 @@ mod linux {
         let mut out = std::io::stdout();
         if let Err(e) = fandhe_container_core::exec::exit_on_sigterm_for_test() {
             let _ = writeln!(out, "TERM_HANDLER_FAILED {e}");
+            let _ = out.flush();
+            std::process::exit(9);
+        }
+        let _ = writeln!(out, "READY_TERM");
+        let _ = out.flush();
+        let deadline = Instant::now() + TERM_PROBE_LIFETIME;
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        std::process::exit(TERM_PROBE_TIMEOUT_EXIT);
+    }
+
+    /// 孤児になる子の寿命（シナリオ F〜H。親より長く生きる。REPAIR-5 のため有限）。
+    const ORPHAN_LIFETIME: Duration = Duration::from_secs(120);
+    /// 孤児を作るプローブが終わるまでの時間（シナリオ H は `cgroup.kill` を書けなくする時間に使う）。
+    const ORPHAN_PROBE_LIFETIME: Duration = Duration::from_secs(4);
+
+    /// 孤児になる子（`--orphan-child`）。親の終了後は pod の PID 1 へ付け替わる（#4811）。
+    pub fn orphan_child() {
+        std::thread::sleep(ORPHAN_LIFETIME);
+        std::process::exit(0);
+    }
+
+    /// 親が config で渡した実行ごとのトークン（`--orphan-token <値>`）。孤児の argv に載せ、親が今回の実行の孤児だけを数える。
+    fn orphan_token_arg() -> String {
+        let args: Vec<String> = std::env::args().collect();
+        args.iter()
+            .position(|a| a == "--orphan-token")
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// 孤児になる子を起動する（stdio はつながない。wait しない）。
+    fn spawn_orphan() -> bool {
+        Command::new("/probe")
+            .args(["--container-probe", "--orphan-child"])
+            .arg(orphan_token_arg())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .is_ok()
+    }
+
+    /// 孤児を作ってから `ORPHAN_PROBE_LIFETIME` 後に終了コード 7 で終わるプローブ（シナリオ F・H）。
+    pub fn orphan_probe() {
+        let mut out = std::io::stdout();
+        if !spawn_orphan() {
+            let _ = writeln!(out, "ORPHAN_SPAWN_FAILED");
+            let _ = out.flush();
+            std::process::exit(9);
+        }
+        let _ = writeln!(out, "READY");
+        let _ = out.flush();
+        std::thread::sleep(ORPHAN_PROBE_LIFETIME);
+        std::process::exit(PROBE_EXIT);
+    }
+
+    /// SIGTERM のハンドラを登録し、孤児を作ってから SIGTERM を待つプローブ（シナリオ G）。
+    pub fn orphan_term_probe() {
+        let mut out = std::io::stdout();
+        if fandhe_container_core::exec::exit_on_sigterm_for_test().is_err() || !spawn_orphan() {
+            let _ = writeln!(out, "ORPHAN_TERM_PROBE_FAILED");
             let _ = out.flush();
             std::process::exit(9);
         }
@@ -374,14 +454,40 @@ mod linux {
         Term,
         /// `mount(2)` を 1 回試行して終了コード 7 で終わる（シナリオ E。ESC-03）。
         Mount,
+        /// 孤児を作ってから終了コード 7 で終わる（シナリオ F・H。#4811）。
+        Orphan,
+        /// 孤児を作ってから SIGTERM を待つ（シナリオ G。#4811）。
+        OrphanTerm,
     }
 
     impl Env {
         fn new(tag: &str, with_proc: bool, probe: Probe) -> Self {
+            Self::with_pod(tag, with_proc, probe, None)
+        }
+
+        /// `pod` があれば config の user・ipc・pid を pod の namespace への join（path つき）にする（#4811）。
+        fn with_pod(tag: &str, with_proc: bool, probe: Probe, pod: Option<&Pod>) -> Self {
             let probe_args = match probe {
                 Probe::Exit7 => r#""/probe","--container-probe""#,
                 Probe::Term => r#""/probe","--container-probe","--term-probe""#,
                 Probe::Mount => r#""/probe","--container-probe","--mount-probe""#,
+                Probe::Orphan => {
+                    r#""/probe","--container-probe","--orphan-probe","--orphan-token","TOKEN""#
+                }
+                Probe::OrphanTerm => {
+                    r#""/probe","--container-probe","--orphan-term-probe","--orphan-token","TOKEN""#
+                }
+            }
+            .replace("TOKEN", run_token());
+            let namespaces = match pod {
+                None => r#"{"type":"pid"},{"type":"mount"},{"type":"uts"},{"type":"ipc"},{"type":"user"}"#
+                    .to_owned(),
+                Some(p) => format!(
+                    r#"{{"type":"pid","path":"{}"}},{{"type":"mount"}},{{"type":"uts"}},{{"type":"ipc","path":"{}"}},{{"type":"user","path":"{}"}}"#,
+                    p.ns("pid_for_children"),
+                    p.ns("ipc"),
+                    p.ns("user")
+                ),
             };
             let nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -408,7 +514,7 @@ mod linux {
                 r#"{{"ociVersion":"1.2.0","root":{{"path":"rootfs","readonly":false}},"hostname":"fandhe-supbin",
 "process":{{"user":{{"uid":0,"gid":0}},"args":[{probe_args}],
 "env":["PATH=/","TERM=dumb","LD_LIBRARY_PATH={ld}"],"cwd":"/"}},
-"linux":{{"namespaces":[{{"type":"pid"}},{{"type":"mount"}},{{"type":"uts"}},{{"type":"ipc"}},{{"type":"user"}}]}}}}"#
+"linux":{{"namespaces":[{namespaces}]}}}}"#
             );
             std::fs::write(bundle.join("config.json"), config).expect("write config.json");
             let root = dir.join("state");
@@ -564,6 +670,9 @@ mod linux {
         scenario_c_restart_relaunch_succeeds();
         scenario_d_sigterm_stop_delete();
         scenario_e_esc03_mount_via_hub();
+        scenario_f_pid_shared_natural_exit();
+        scenario_g_pid_shared_stop();
+        scenario_h_pid_shared_kill_all_failure();
         println!(
             "supervisor_bin_real: start reported OK, NSpid ends with 1, monitor recorded Stopped({PROBE_EXIT}), logs captured, seccomp denial recorded once; failed start left no process; restart relaunched on the calling thread with restart_count 1 and both launches captured and audited; SIGTERM via the control channel recorded Stopped({TERM_HANDLER_EXIT}) and the stopped container was deleted; ESC-03 mount denied via the SeccompNotifyHub and recorded once"
         );
@@ -1022,6 +1131,364 @@ mod linux {
         assert!(!leftover, "the container cgroup must be removed");
         println!(
             "supervisor_bin_real: scenario=D ok pid={pid} (stopped delete succeeded; second delete NOT_FOUND)"
+        );
+    }
+
+    // ---- シナリオ F〜H（pod の pid namespace の共有と kill-all。CRI-2・SUP-1・SUP-3・SUP-9・CORE-4・#4811） ----
+
+    /// 試験が作る pod の user・ipc・pid namespace（cri の保持役の代わり）。
+    ///
+    /// user・ipc は supervisor の bin の `pod-holder`（start と同じ規則で写像を決める。#2874）が作り、pid は保持役の
+    /// user・ipc へ `nsenter` した `unshare --pid --fork` が作る（pid ns の所有者が pod の userns になる。PID 1 は `sleep`）。
+    /// core は参加先の userns の写像が起動の写像と完全一致することを要求するため、写像は保持役に任せる。
+    /// drop で `unshare` を止め（`--kill-child` で PID 1 も止まる）、保持役の stdin を閉じて終わらせる。
+    struct Pod {
+        holder: Child,
+        pid_owner: Child,
+    }
+
+    impl Pod {
+        #[allow(
+            clippy::zombie_processes,
+            reason = "返した Pod の drop が kill と wait を行う"
+        )]
+        fn new() -> Self {
+            use std::os::fd::AsFd as _;
+            let mut holder = Command::new(BIN)
+                .arg("pod-holder")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .expect("spawn the pod holder");
+            let out = holder.stdout.take().expect("holder stdout");
+            let ready = fandhe_container_supervisor::pod_holder::read_ready(
+                out.as_fd(),
+                Instant::now() + Duration::from_secs(30),
+            );
+            drop(out);
+            let h = holder.id();
+            if let Err(e) = ready {
+                reap_bounded(&mut holder, Duration::ZERO);
+                panic!("the pod holder did not report READY: {e:?}");
+            }
+            let mut pid_owner = Command::new("nsenter")
+                .arg(format!("--user=/proc/{h}/ns/user"))
+                .arg(format!("--ipc=/proc/{h}/ns/ipc"))
+                .args([
+                    "unshare",
+                    "--pid",
+                    "--fork",
+                    "--kill-child",
+                    "/bin/sleep",
+                    "600",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .expect("spawn nsenter (util-linux)");
+            let pid = pid_owner.id();
+            // `unshare` へ exec して PID 1 を fork し終えるまで期限つきで待つ（REPAIR-5）。
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let forked = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
+                    .is_ok_and(|c| !c.trim().is_empty());
+                let own = ns_link("/proc/self/ns/pid");
+                let pod = ns_link(&format!("/proc/{pid}/ns/pid_for_children"));
+                if forked && !pod.is_empty() && pod != own {
+                    return Self { holder, pid_owner };
+                }
+                if Instant::now() >= deadline {
+                    reap_bounded(&mut pid_owner, Duration::ZERO);
+                    reap_bounded(&mut holder, Duration::ZERO);
+                    panic!("the pod pid namespace was not ready within 10s");
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        /// user・ipc は保持役、pid（`pid_for_children`）は `unshare` のパス。
+        fn ns(&self, kind: &str) -> String {
+            let pid = if kind == "pid_for_children" {
+                self.pid_owner.id()
+            } else {
+                self.holder.id()
+            };
+            format!("/proc/{pid}/ns/{kind}")
+        }
+
+        /// pod の pid ns の識別子（`pid:[<inode>]`）。
+        fn pid_ns(&self) -> String {
+            ns_link(&self.ns("pid_for_children"))
+        }
+    }
+
+    impl Drop for Pod {
+        fn drop(&mut self) {
+            reap_bounded(&mut self.pid_owner, Duration::ZERO);
+            // 停止の合図は stdin の EOF。期限内に終わらなければ kill する。
+            drop(self.holder.stdin.take());
+            reap_bounded(&mut self.holder, Duration::from_secs(10));
+        }
+    }
+
+    fn ns_link(path: &str) -> String {
+        std::fs::read_link(path)
+            .map(|l| l.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+
+    /// 実行ごとのトークン（pid と起動時刻）。孤児の argv に載せ、並行実行・以前の実行の残りと区別する。
+    fn run_token() -> &'static str {
+        static TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        TOKEN.get_or_init(|| {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            format!("sbr{}x{nanos}", std::process::id())
+        })
+    }
+
+    /// 今回の実行の孤児（argv が `--orphan-child <トークン>` を含む）のホストの pid（ゾンビは cmdline が空なので数えない）。
+    fn orphan_pids() -> Vec<u32> {
+        let Ok(dir) = std::fs::read_dir("/proc") else {
+            return Vec::new();
+        };
+        dir.flatten()
+            .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+            .filter(|pid| {
+                std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| {
+                    let args: Vec<&[u8]> = c.split(|b| *b == 0).collect();
+                    args.windows(2)
+                        .any(|w| w[0] == b"--orphan-child" && w[1] == run_token().as_bytes())
+                })
+            })
+            .collect()
+    }
+
+    /// 子を期限つきで回収する。`grace` の間に終わらなければ kill し、さらに 10 秒まで回収を確かめる（REPAIR-5）。
+    fn reap_bounded(child: &mut Child, grace: Duration) {
+        let wait_until = |limit: Duration, child: &mut Child| {
+            let deadline = Instant::now() + limit;
+            while Instant::now() < deadline {
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            false
+        };
+        if wait_until(grace, child) {
+            return;
+        }
+        let _ = child.kill();
+        if !wait_until(Duration::from_secs(10), child) {
+            eprintln!(
+                "supervisor_bin_real: child {} was not reaped within 10s after kill",
+                child.id()
+            );
+        }
+    }
+
+    /// 孤児の数が `want` になるまで期限つきで待ち、最後の観測を返す。
+    fn wait_orphans(want: usize, limit: Duration) -> Vec<u32> {
+        let deadline = Instant::now() + limit;
+        loop {
+            let now = orphan_pids();
+            if now.len() == want || Instant::now() >= deadline {
+                return now;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// supervisor の構造化ログ（bin の入口が `<状態ルート>/@supervisor-logs/<id>.log*` へ差し替える。#2067）のうち、
+    /// `pid_shared_kill_all` の行（1 行 1 JSON）だけを取り出す。
+    fn kill_all_lines(env: &Env, id: &str) -> Vec<String> {
+        let dir = env
+            .root()
+            .join(fandhe_container_supervisor::supervisor_log::SUPERVISOR_LOG_DIR_NAME);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!("{id}.log"))
+            })
+            .flat_map(|e| {
+                std::fs::read_to_string(e.path())
+                    .unwrap_or_default()
+                    .lines()
+                    .filter(|l| l.contains(r#""event":"pid_shared_kill_all""#))
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// pod の pid ns を共有する起動で、孤児が pod の pid ns に居ることを確かめて pid を返す。
+    fn shared_orphan(pod: &Pod) -> u32 {
+        let orphans = wait_orphans(1, Duration::from_secs(30));
+        let [orphan] = orphans.as_slice() else {
+            panic!("exactly one orphan must appear: {orphans:?}");
+        };
+        assert_eq!(
+            ns_link(&format!("/proc/{orphan}/ns/pid")),
+            pod.pid_ns(),
+            "the orphan must live in the pod pid namespace"
+        );
+        *orphan
+    }
+
+    /// シナリオ F: 共有では init の自然終了の後に kill-all が孤児を止める。対照（pid の path なし）は pid ns ごと消え、
+    /// kill-all の行が出ない（#4811）。
+    fn scenario_f_pid_shared_natural_exit() {
+        // 対照: pid を共有しない。
+        let env = Env::new("f0", true, Probe::Orphan);
+        let id = format!("sbf0{}", std::process::id());
+        env.create(&id);
+        let mut sup = spawn_supervisor(&env, &id, None);
+        assert!(matches!(sup.report(), StartReport::Started { .. }));
+        assert_eq!(wait_orphans(1, Duration::from_secs(30)).len(), 1);
+        assert_eq!(sup.exit_code(), 0, "monitor must finish cleanly");
+        assert_eq!(env.record(&id).status().exit_code(), Some(PROBE_EXIT));
+        assert_eq!(wait_orphans(0, Duration::from_secs(10)), Vec::<u32>::new());
+        assert_eq!(kill_all_lines(&env, &id), Vec::<String>::new());
+
+        // 共有: pod の pid ns へ join する。
+        let pod = Pod::new();
+        let env = Env::with_pod("f1", true, Probe::Orphan, Some(&pod));
+        let id = format!("sbf1{}", std::process::id());
+        env.create(&id);
+        let mut sup = spawn_supervisor(&env, &id, None);
+        let pid = match sup.report() {
+            StartReport::Started { pid } => pid,
+            other => panic!("expected OK, got {other:?}"),
+        };
+        assert_eq!(
+            ns_link(&format!("/proc/{pid}/ns/pid")),
+            pod.pid_ns(),
+            "the init must join the pod pid namespace"
+        );
+        shared_orphan(&pod);
+        assert_eq!(sup.exit_code(), 0, "monitor must finish cleanly");
+        let rec = env.record(&id);
+        assert_eq!(rec.status().state(), ContainerState::Stopped);
+        assert_eq!(rec.status().exit_code(), Some(PROBE_EXIT));
+        // kill-all は終了の記録の前に走るため、記録を見た時点で孤児は居ない。
+        assert_eq!(orphan_pids(), Vec::<u32>::new());
+        let lines = kill_all_lines(&env, &id);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains(r#""outcome":"killed","killed":1,"#)),
+            "kill-all must report one killed process: {lines:?}"
+        );
+        println!(
+            "supervisor_bin_real: scenario=F ok (pid shared: the orphan was killed by kill-all after the init exited; not shared: it ended with the pid namespace and no kill-all ran)"
+        );
+    }
+
+    /// シナリオ G: 共有で制御チャネルの SIGTERM による停止の後に孤児が消える（#4811）。
+    fn scenario_g_pid_shared_stop() {
+        let pod = Pod::new();
+        let env = Env::with_pod("g", true, Probe::OrphanTerm, Some(&pod));
+        let id = format!("sbg{}", std::process::id());
+        env.create(&id);
+        let mut sup = spawn_supervisor(&env, &id, None);
+        let pid = match sup.report() {
+            StartReport::Started { pid } => pid,
+            other => panic!("expected OK, got {other:?}"),
+        };
+        shared_orphan(&pod);
+        wait_sigterm_handler(pid.get());
+        let signaler: Arc<dyn ProcessSignaler> = Arc::new(ControlSignaler::for_stop(env.root()));
+        kill(
+            env.store.as_ref(),
+            &OpRecorder::new(),
+            &signaler,
+            &KillRequest::new(cid(&id), Signal::SIGTERM),
+            &KillTimeout::default(),
+        )
+        .unwrap_or_else(|e| panic!("kill(SIGTERM) via the control channel failed: {e:?}"));
+        assert_eq!(sup.exit_code(), 0, "monitor must finish cleanly");
+        let rec = env.record(&id);
+        assert_eq!(rec.status().state(), ContainerState::Stopped);
+        assert_eq!(rec.status().exit_code(), Some(TERM_HANDLER_EXIT));
+        assert_eq!(orphan_pids(), Vec::<u32>::new());
+        let lines = kill_all_lines(&env, &id);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains(r#""outcome":"killed","killed":1,"#)),
+            "kill-all must report one killed process: {lines:?}"
+        );
+        println!(
+            "supervisor_bin_real: scenario=G ok (pid shared: stopping via the control channel left no orphan)"
+        );
+    }
+
+    /// シナリオ H: 共有で `cgroup.kill` を書けなくすると kill-all が失敗し、`--restart on-failure:3` でも再 launch しない
+    /// （旧い世代の孤児が残る cgroup に新しい init を起動しない。#4811）。
+    fn scenario_h_pid_shared_kill_all_failure() {
+        let pod = Pod::new();
+        let env = Env::with_pod("h", true, Probe::Orphan, Some(&pod));
+        let id = format!("sbh{}", std::process::id());
+        env.create(&id);
+        let mut sup = spawn_supervisor(&env, &id, Some("on-failure:3"));
+        let pid = match sup.report() {
+            StartReport::Started { pid } => pid,
+            other => panic!("expected OK, got {other:?}"),
+        };
+        let orphan = shared_orphan(&pod);
+        // init のコンテナ cgroup（cgroup v2 の 1 行 `0::<path>`）の `cgroup.kill` を書けなくする。
+        let rel = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+            .expect("read the init cgroup")
+            .lines()
+            .find_map(|l| l.strip_prefix("0::").map(str::to_owned))
+            .expect("cgroup v2 path");
+        let kill_file = PathBuf::from("/sys/fs/cgroup")
+            .join(rel.trim_start_matches('/'))
+            .join("cgroup.kill");
+        std::fs::set_permissions(&kill_file, std::fs::Permissions::from_mode(0o444))
+            .expect("make cgroup.kill read-only");
+        let code = sup.exit_code();
+        let rec = env.record(&id);
+        let remaining = orphan_pids();
+        // 後始末: 書き込みを戻して試験自身が止める（照合の前に行い、失敗でも孤児を残さない）。
+        let _ = std::fs::set_permissions(&kill_file, std::fs::Permissions::from_mode(0o644));
+        let _ = std::fs::write(&kill_file, "1");
+        let after = wait_orphans(0, Duration::from_secs(10));
+        assert_ne!(code, 0, "the supervisor must report the kill-all failure");
+        assert_eq!(rec.status().state(), ContainerState::Stopped);
+        assert_eq!(rec.status().exit_code(), Some(PROBE_EXIT));
+        assert_eq!(
+            rec.restart_count(),
+            0,
+            "no relaunch after a kill-all failure"
+        );
+        assert_eq!(
+            remaining,
+            vec![orphan],
+            "the orphan remains when kill-all fails"
+        );
+        assert_eq!(after, Vec::<u32>::new(), "cleanup must stop the orphan");
+        let lines = kill_all_lines(&env, &id);
+        assert!(
+            lines.iter().any(|l| l.contains(r#""outcome":"failed""#)),
+            "kill-all must report the failure: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains(r#""outcome":"killed""#)),
+            "nothing may be killed: {lines:?}"
+        );
+        println!(
+            "supervisor_bin_real: scenario=H ok (pid shared: a kill-all failure stopped the restart loop with restart_count 0)"
         );
     }
 

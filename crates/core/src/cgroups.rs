@@ -164,8 +164,8 @@ pub(crate) use exec_kill::{
     validate_exec_child_name,
 };
 pub use recorded_scope::{
-    RecordedCgroupKill, RecordedCgroupScope, ensure_no_process_in_recorded,
-    kill_recorded_container_cgroup,
+    RecordedCgroupKill, RecordedCgroupScope, RecordedKillAll, ensure_no_process_in_recorded,
+    kill_all_in_recorded, kill_recorded_container_cgroup,
 };
 // 結果型は 3 OS 共通の `ProcessLauncher` の戻り値に使うため oci_runtime 側が定義し、既存の公開パスを保つ。
 pub use crate::oci_runtime::RecordedCgroupOutcome;

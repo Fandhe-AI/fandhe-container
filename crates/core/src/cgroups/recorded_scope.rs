@@ -51,9 +51,9 @@ use std::time::Instant;
 
 use super::exec_kill::{EVENTS_LIMIT, SweepMode, parse_populated, wait_unpopulated, write_kill};
 use super::{
-    CgroupError, CgroupName, CgroupPath, CgroupStep, MAX_PATH_DEPTH, cstring, open_cgroup_dir,
-    open_cgroup_root, open_child_with, read_iface, removal_error, remove_container_cgroup_with,
-    sys_error, validate_component, verify_delegated_scope,
+    CgroupError, CgroupName, CgroupPath, CgroupStep, MAX_PATH_DEPTH, PROCS_LIMIT, cstring,
+    open_cgroup_dir, open_cgroup_root, open_child_with, read_iface, removal_error,
+    remove_container_cgroup_with, sys_error, validate_component, verify_delegated_scope,
 };
 use crate::observability::OpRecorder;
 use crate::oci_runtime::{CgroupRemoval, RecordedCgroupOutcome};
@@ -147,9 +147,58 @@ pub(super) fn ensure_no_process_with(
     open_root: &dyn Fn() -> Result<OwnedFd, CgroupError>,
     open_dir: OpenDir<'_>,
 ) -> Result<RecordedCgroupOutcome, CgroupError> {
+    kill_all_with(id, placement, deadline, euid, open_root, open_dir).map(|r| r.outcome)
+}
+
+/// 記録された配置のコンテナ cgroup の kill-all の結果（CRI-2・SUP-1・CORE-4・REPAIR-4・#4811）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RecordedKillAll {
+    /// 止める前の状態と結果（`AlreadyAbsent`・`WasEmpty`・`Killed`）。
+    pub outcome: RecordedCgroupOutcome,
+    /// `cgroup.kill` を書く直前にコンテナ cgroup 自身の `cgroup.procs` にあったプロセスの数（止めた件数）。
+    /// 書かなかった（無い・空）なら `Some(0)`。読めなかった（上限超過など）ときは `None` で、kill はそのまま行う。
+    /// 子孫の `exec-*` の cgroup に居るプロセスは数えない（`cgroup.kill` は子孫も止める）。
+    pub killed: Option<u32>,
+}
+
+/// 記録された配置のコンテナ cgroup のプロセスを `cgroup.kill` で全部止め、`deadline` まで空になるのを待つ
+/// （CRI-2・SUP-1・CORE-4・REPAIR-5・#4811）。
+///
+/// pod の pid ns を共有するコンテナでは、init が終わっても子孫は pod の PID 1 へ付け替わって残るため、supervisor が
+/// init の終了時と停止時に呼ぶ（containerd の shim の `ShouldKillAllOnExit` と同じ扱い）。止める前に数えた件数を返す。
+/// 待ちの規則・エラーは [`ensure_no_process_in_recorded`] と同じ。
+pub fn kill_all_in_recorded(
+    id: &ContainerId,
+    placement: &CgroupPlacement,
+    deadline: Instant,
+) -> Result<RecordedKillAll, CgroupError> {
+    kill_all_with(
+        id,
+        placement,
+        deadline,
+        sys::effective_uid(),
+        &open_cgroup_root,
+        &open_cgroup_dir,
+    )
+}
+
+/// [`kill_all_in_recorded`]・[`ensure_no_process_with`] の本体。`euid`・`open_root`・`open_dir` はテストの継ぎ目。
+fn kill_all_with(
+    id: &ContainerId,
+    placement: &CgroupPlacement,
+    deadline: Instant,
+    euid: u32,
+    open_root: &dyn Fn() -> Result<OwnedFd, CgroupError>,
+    open_dir: OpenDir<'_>,
+) -> Result<RecordedKillAll, CgroupError> {
+    let none = |outcome| RecordedKillAll {
+        outcome,
+        killed: Some(0),
+    };
     let child = match probe_container(id, placement, euid, open_root, open_dir)? {
-        ContainerProbe::Absent => return Ok(RecordedCgroupOutcome::AlreadyAbsent),
-        ContainerProbe::Empty => return Ok(RecordedCgroupOutcome::WasEmpty),
+        ContainerProbe::Absent => return Ok(none(RecordedCgroupOutcome::AlreadyAbsent)),
+        ContainerProbe::Empty => return Ok(none(RecordedCgroupOutcome::WasEmpty)),
         ContainerProbe::Populated(child) => child,
     };
     if deadline.saturating_duration_since(Instant::now()).is_zero() {
@@ -159,12 +208,26 @@ pub(super) fn ensure_no_process_with(
             "deadline passed before the recorded container cgroup could be killed",
         ));
     }
+    // 数えるのは観測のためだけで、読めなくても止めることを優先する（fail-closed は kill の側）。期限の判定は読む前に
+    // 済ませ、読みに時間がかかっても `cgroup.kill` は必ず書く（読みで期限を使い切って止めずに返さない）。
+    let killed = read_iface(
+        CgroupStep::Cleanup,
+        child.fd.as_fd(),
+        "cgroup.procs",
+        PROCS_LIMIT,
+    )
+    .ok()
+    .and_then(|text| u32::try_from(text.lines().filter(|l| !l.trim().is_empty()).count()).ok());
     write_cgroup_kill(&child.fd)?;
     let left = deadline.saturating_duration_since(Instant::now());
+    let killed_all = RecordedKillAll {
+        outcome: RecordedCgroupOutcome::Killed,
+        killed,
+    };
     match wait_unpopulated(child.fd.as_fd(), left) {
-        Ok(()) => Ok(RecordedCgroupOutcome::Killed),
+        Ok(()) => Ok(killed_all),
         // 待つ間にコンテナ cgroup ごと回収された。
-        Err(e) if e.code == ErrorCode::NotFound => Ok(RecordedCgroupOutcome::Killed),
+        Err(e) if e.code == ErrorCode::NotFound => Ok(killed_all),
         Err(e) => Err(e),
     }
 }
@@ -724,6 +787,90 @@ mod tests {
         flipper.join().expect("join");
         assert_eq!(out, RecordedCgroupOutcome::Killed);
         assert_eq!(fs::read_to_string(ctr.join("cgroup.kill")).expect("r"), "1");
+    }
+
+    /// CRI-2・SUP-1・CORE-4（#4811）: 件数の読み取りに失敗しても `cgroup.kill` は書き、件数は `None` で `Killed`
+    /// （数えるのは観測のためだけで、読みの失敗・遅れで止めずに返さない）。
+    #[test]
+    fn cri2_sup1_4811_kill_all_kills_even_when_counting_fails() {
+        let (_scratch, root) = tmp("killall-nocount");
+        let ctr = make_container(&root, "populated 1\n");
+        fs::write(ctr.join("cgroup.kill"), "").expect("kill");
+        // 読めない `cgroup.procs`（ディレクトリ）で件数の読みを失敗させる。
+        fs::create_dir(ctr.join("cgroup.procs")).expect("procs dir");
+        let events = ctr.join("cgroup.events");
+        let flipper = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            let tmp = events.with_extension("tmp");
+            fs::write(&tmp, "populated 0\n").expect("flip tmp");
+            fs::rename(&tmp, &events).expect("flip rename");
+        });
+        let out = kill_all_with(
+            &cid("c1"),
+            &placement(SCOPE, 7),
+            Instant::now() + std::time::Duration::from_secs(5),
+            real_euid(),
+            &root_of(&root),
+            &open_plain,
+        )
+        .expect("killed");
+        flipper.join().expect("join");
+        assert_eq!(
+            (out.outcome, out.killed),
+            (RecordedCgroupOutcome::Killed, None)
+        );
+        assert_eq!(fs::read_to_string(ctr.join("cgroup.kill")).expect("r"), "1");
+    }
+
+    /// CRI-2・SUP-1・CORE-4（#4811）: kill-all は止める前の `cgroup.procs` の件数を返し、`cgroup.kill` に `1` を書いて
+    /// 期限内に `populated 0`・`cgroup.procs` が空になるのを確かめる。無い・空のときは書かずに 0 件。
+    #[test]
+    fn cri2_sup1_4811_kill_all_counts_and_empties_container() {
+        let (_scratch, root) = tmp("killall");
+        let run = |root: &Path| {
+            kill_all_with(
+                &cid("c1"),
+                &placement(SCOPE, 7),
+                Instant::now() + std::time::Duration::from_secs(5),
+                real_euid(),
+                &root_of(root),
+                &open_plain,
+            )
+        };
+        let absent = run(&root).expect("absent");
+        assert_eq!(
+            (absent.outcome, absent.killed),
+            (RecordedCgroupOutcome::AlreadyAbsent, Some(0))
+        );
+        let ctr = make_container(&root, "populated 1\n");
+        fs::write(ctr.join("cgroup.kill"), "").expect("kill");
+        fs::write(ctr.join("cgroup.procs"), "4242\n4243\n4244\n").expect("procs");
+        // 本物のカーネルの代わりに、kill の後でプロセスが消えた状態へ原子的に差し替える。
+        let (events, procs) = (ctr.join("cgroup.events"), ctr.join("cgroup.procs"));
+        let flipper = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            for (path, text) in [(&procs, ""), (&events, "populated 0\n")] {
+                let tmp = path.with_extension("tmp");
+                fs::write(&tmp, text).expect("flip tmp");
+                fs::rename(&tmp, path).expect("flip rename");
+            }
+        });
+        let out = run(&root).expect("killed");
+        flipper.join().expect("join");
+        assert_eq!(
+            (out.outcome, out.killed),
+            (RecordedCgroupOutcome::Killed, Some(3))
+        );
+        assert_eq!(fs::read_to_string(ctr.join("cgroup.kill")).expect("r"), "1");
+        assert_eq!(fs::read_to_string(ctr.join("cgroup.procs")).expect("r"), "");
+        // 空になった後の 2 回目は書かずに 0 件（`WasEmpty`）。
+        fs::write(ctr.join("cgroup.kill"), "").expect("reset kill");
+        let again = run(&root).expect("empty");
+        assert_eq!(
+            (again.outcome, again.killed),
+            (RecordedCgroupOutcome::WasEmpty, Some(0))
+        );
+        assert_eq!(fs::read_to_string(ctr.join("cgroup.kill")).expect("r"), "");
     }
 
     /// REPAIR-5・CORE-2（#2011）: kill 後も `populated 1` のままなら期限で `Timeout`（`Ok` にしない）。

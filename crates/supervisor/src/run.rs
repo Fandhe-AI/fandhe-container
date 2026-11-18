@@ -112,6 +112,7 @@ pub const MAX_WRITE_ATTEMPTS: u32 = 3;
 pub struct MonitorConfig {
     poll_interval: Duration,
     drain_timeout: Duration,
+    kill_all_on_init_exit: bool,
 }
 
 impl MonitorConfig {
@@ -126,7 +127,23 @@ impl MonitorConfig {
         Ok(Self {
             poll_interval,
             drain_timeout: DEFAULT_DRAIN_TIMEOUT,
+            kill_all_on_init_exit: false,
         })
+    }
+
+    /// init の終了を観測したとき、終了の記録の前にコンテナの cgroup を kill-all するか（pod の pid ns を共有するコンテナ
+    /// だけ真。CRI-2・SUP-1・CORE-4・#4811。`crate::pid_share`）。既定は偽で、従来の挙動を変えない。
+    #[must_use]
+    pub fn with_kill_all_on_init_exit(self, enabled: bool) -> Self {
+        Self {
+            kill_all_on_init_exit: enabled,
+            ..self
+        }
+    }
+
+    /// init の終了時に kill-all するか。
+    pub fn kill_all_on_init_exit(&self) -> bool {
+        self.kill_all_on_init_exit
     }
 
     /// 捕捉の終端待ちの上限を設定する（[`monitor_with_capture`] のみが使う）。
@@ -160,6 +177,7 @@ impl Default for MonitorConfig {
         Self {
             poll_interval: DEFAULT_POLL_INTERVAL,
             drain_timeout: DEFAULT_DRAIN_TIMEOUT,
+            kill_all_on_init_exit: false,
         }
     }
 }
@@ -301,6 +319,17 @@ pub enum MonitorOutcome {
         /// `supervisor_pid` 解除の失敗理由。
         release_error: TraitError,
     },
+    /// 終了を検知して `Stopped` を記録したが、pod の pid ns を共有するコンテナの残りのプロセスを kill-all で止めきれな
+    /// かった（期限切れ等。CRI-2・SUP-1・SUP-3・#4811）。cgroup に旧い世代の子孫が残り得るため、再起動ループは再 launch
+    /// せずに戻る（fail-closed）。プロセス（init）は回収済み。
+    ExitedProcessesRemain {
+        /// 起動ハンドルが回収した終了状態。
+        exit: ProcessExit,
+        /// 書き込み後のレコード（`Stopped`）。
+        record: StateRecord,
+        /// kill-all の失敗理由。
+        error: TraitError,
+    },
     /// 監視開始後の準備（ログ捕捉の開始）に失敗し、記録済みの `supervisor_pid` の解除にも失敗した
     /// （状態に自 pid が残り得る）。解除に成功した場合は `Err(start_error)` で返る。
     StartFailedUnreleased {
@@ -350,6 +379,8 @@ pub enum MonitorOperation {
     HealthStart,
     /// healthcheck の周期実行の停止と回収（期限超過は `Timeout`。スレッドは切り離す。#2953・SUP-4・REPAIR-5）。
     HealthStop,
+    /// pod の pid ns を共有するコンテナの init の終了後の kill-all（`cgroup.kill` と空になる待ち。CRI-2・SUP-1・#4811）。
+    KillAll,
 }
 
 impl MonitorOperation {
@@ -369,6 +400,7 @@ impl MonitorOperation {
             Self::RecordExplicitStop => "record_explicit_stop",
             Self::HealthStart => "health_start",
             Self::HealthStop => "health_stop",
+            Self::KillAll => "kill_all",
         }
     }
 }
@@ -606,6 +638,17 @@ fn monitor_after_claim(
                 // 終了記録より前に周期実行を止めて回収する（その後に `health` の書き込みが割り込まず、restart の
                 // 「終了記録の後に別の書き込みがあれば未記録」の判定が成り立つ。SUP-3・SUP-4）。
                 stop_health(&mut worker, obs);
+                // pid を共有するコンテナでは、子孫が pod の PID 1 へ付け替わって残るため、終了を記録する前に cgroup ごと
+                // 止める（containerd の `handleInitExit` と同じ順。失敗しても終了の記録は続け、結果はログに残す。#4811）。
+                // 失敗は終了の記録の後に `ExitedProcessesRemain` で返し、再起動を止める（旧い世代の子孫が残り得るため）。
+                let kill_all_error = if config.kill_all_on_init_exit() {
+                    observed(obs, MonitorOperation::KillAll, || {
+                        crate::pid_share::kill_remaining(state.id(), state.record().cgroup())
+                    })
+                    .err()
+                } else {
+                    None
+                };
                 let code = exit_code_of(exit);
                 let id = state.id().clone();
                 // 回収後は再 wait できないため、書き込み失敗でも終了状態を返す。
@@ -620,13 +663,18 @@ fn monitor_after_claim(
                         ))
                     })
                 });
-                return Ok(match written {
-                    Ok(record) => MonitorOutcome::Exited {
+                return Ok(match (written, kill_all_error) {
+                    (Ok(record), None) => MonitorOutcome::Exited {
                         exit,
                         record,
                         detected_at,
                     },
-                    Err(error) => MonitorOutcome::ExitedUnrecorded { exit, error },
+                    (Ok(record), Some(error)) => MonitorOutcome::ExitedProcessesRemain {
+                        exit,
+                        record,
+                        error,
+                    },
+                    (Err(error), _) => MonitorOutcome::ExitedUnrecorded { exit, error },
                 });
             }
             Err(wait_error) => {
@@ -957,13 +1005,18 @@ mod tests {
     }
 
     fn next_record(cur: &StateRecord, status: ContainerStatus, s: SupervisionState) -> StateRecord {
-        StateRecord::new(
+        let next = StateRecord::new(
             status,
             cur.bundle().to_path_buf(),
             StateRevision::from_raw(cur.revision().value() + 1),
         )
         .unwrap()
-        .with_supervision(s)
+        .with_supervision(s);
+        // 配置は引き継ぐ（StateStore の契約 8）。
+        match cur.cgroup() {
+            Some(p) => next.with_cgroup(p.clone()),
+            None => next,
+        }
     }
 
     /// メモリ上の 1 レコードストア。`conflicts` 回だけ外部更新（restart_count +1）で競合させる。
@@ -1447,6 +1500,80 @@ mod tests {
         fn observe(&self, e: &MonitorEvent) {
             self.0.lock().unwrap().push((e.operation, e.error_code));
         }
+    }
+
+    /// CRI-2・SUP-1・#4811: pid を共有するコンテナ（`with_kill_all_on_init_exit(true)`）だけ、init の終了を観測した後・
+    /// 終了の記録の前に kill-all が 1 回走る。既定では走らない。
+    #[test]
+    fn cri2_sup1_4811_kill_all_runs_before_record_exit_only_when_enabled() {
+        for enabled in [false, true] {
+            let store = running_store(0);
+            let mut s = attach(&store);
+            let p = FakeProc::exiting(1, ProcessExit::Exited(0));
+            let rec = Rec(Mutex::new(Vec::new()));
+            let config = MonitorConfig::default().with_kill_all_on_init_exit(enabled);
+            assert_eq!(config.kill_all_on_init_exit(), enabled);
+            let out = monitor_with_observer(&mut s, &p, &config, &StopToken::new(), &rec).unwrap();
+            assert!(matches!(out, MonitorOutcome::Exited { .. }));
+            let ops: Vec<_> = rec.0.lock().unwrap().iter().map(|(op, _)| *op).collect();
+            let mut want = vec![MonitorOperation::Start, MonitorOperation::Wait];
+            if enabled {
+                want.push(MonitorOperation::KillAll);
+            }
+            want.push(MonitorOperation::RecordExit);
+            assert_eq!(ops, want, "enabled={enabled}");
+        }
+        assert_eq!(MonitorOperation::KillAll.as_str(), "kill_all");
+    }
+
+    /// CRI-2・SUP-1・SUP-3・#4811: kill-all が失敗した世代は、`Stopped` を記録したうえで `ExitedProcessesRemain` を返す
+    /// （再起動ループはこれを再 launch しない）。失敗は試験の継ぎ目（`pid_share::force_failure_for_test`）で注入する。
+    #[test]
+    fn sup3_4811_kill_all_failure_is_reported_as_processes_remain() {
+        use fandhe_container_core::traits::{CgroupPlacement, CgroupScope};
+        let store = running_store(0);
+        {
+            let mut g = store.rec.lock().unwrap();
+            let placed = g.clone().with_cgroup(CgroupPlacement::new(
+                CgroupScope::new("/").unwrap(),
+                StateRevision::from_raw(1),
+            ));
+            *g = placed;
+        }
+        let mut s = attach(&store);
+        let p = FakeProc::exiting(1, ProcessExit::Exited(0));
+        let rec = Rec(Mutex::new(Vec::new()));
+        let config = MonitorConfig::default().with_kill_all_on_init_exit(true);
+        crate::pid_share::force_failure_for_test(Some(ErrorCode::Timeout));
+        let out = monitor_with_observer(&mut s, &p, &config, &StopToken::new(), &rec);
+        crate::pid_share::force_failure_for_test(None);
+        let MonitorOutcome::ExitedProcessesRemain {
+            exit,
+            record,
+            error,
+        } = out.unwrap()
+        else {
+            panic!("unexpected outcome")
+        };
+        assert_eq!(exit, ProcessExit::Exited(0));
+        assert_eq!(record.status().state(), ContainerState::Stopped);
+        assert_eq!(error.code(), ErrorCode::Timeout);
+        let ops: Vec<_> = rec
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(op, c)| (*op, c.is_some()))
+            .collect();
+        assert_eq!(
+            ops,
+            vec![
+                (MonitorOperation::Start, false),
+                (MonitorOperation::Wait, false),
+                (MonitorOperation::KillAll, true),
+                (MonitorOperation::RecordExit, false),
+            ]
+        );
     }
 
     /// REPAIR-4: 開始・wait・終了記録が通知され、開始失敗はエラーコード付きで通知される。

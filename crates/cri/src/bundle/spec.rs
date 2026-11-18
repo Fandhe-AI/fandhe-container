@@ -5,7 +5,7 @@
 //! `config.json` を書く）で、出力は core の `oci_runtime::parse_config_bytes` が読む形式である。
 //!
 //! **fail-closed**: 実行層（core の create・start）が受けない項目、または黙って落とすと要求より分離が弱くなる項目
-//! （privileged・capability の追加・seccomp / AppArmor の無効化・NODE の pid / ipc 等）は、黙って落とさず
+//! （privileged・ambient capability・seccomp / AppArmor の無効化・NODE の pid / ipc 等）は、黙って落とさず
 //! `UNIMPLEMENTED` で拒否する。値域外・形式不正は `INVALID_ARGUMENT`。エラー文言は固定文言と CRI の
 //! フィールド名だけにし、値（env の秘密値・パス）を含めない。
 //!
@@ -50,14 +50,15 @@
 //!   bundle は `<state_root>/.cri/bundles` にあり、core の start が状態ルート配下の source を拒否するため、現状は
 //!   この bind で止まる（拒否の理由はこの 1 点）。cri は受け入れて mount を
 //!   出し、start は構造化エラーで止まる（network namespace と同じ形。`docs/design/cri-config-acceptance.md`）。
-//! - `capabilities.drop_capabilities` は受け入れ、OCI 既定集合から除いた集合を `process.capabilities` の 3 集合
-//!   （bounding / effective / permitted）へ書く（core が drop だけを解釈済みにして launch・exec へ適用する。
-//!   #2666・CRI-2・SEC-1）。名前は大文字小文字を区別せず `CAP_` 接頭辞は任意、`ALL` は全 drop、既定に無いものの
+//! - `capabilities.drop_capabilities` と `add_capabilities` は受け入れ、core の `resolve_add_drop` が「既定 − drop + add」で
+//!   解いた集合を `process.capabilities` の 3 集合（bounding / effective / permitted）へ書く（core が既定の部分集合だけを
+//!   解釈済みにして launch・exec へ適用する。#2666・#4793・CRI-2・SEC-1）。add の許可リストは OCI 既定 14 個だけで
+//!   （#4762）、既定外の名前と add の `ALL` は `PERMISSION_DENIED`、add と drop の同名は `INVALID_ARGUMENT`。名前は大文字小文字を区別せず `CAP_` 接頭辞は任意、`ALL` は全 drop、既定に無いものの
 //!   drop は no-op、未知名は `INVALID_ARGUMENT`。正規化は core の `parse_drop_list` に任せ、CLI の `create --cap-drop` と同じ規則。
 //!   containerd（`v2.4.2` で照合）とは 2 点で違う: (1) containerd は接頭辞つきの名前を drop しない（`CAP_CAP_...` になる）、
 //!   (2) containerd は未知名を無視する。どちらも本実装のほうが厳しい側（drop は狭くならない）。照合の記録は
 //!   `docs/design/cri-config-acceptance.md`「外部の事実の照合」。containerd に合わせるかはオーナー判断待ち（#2812）。
-//!   `add_capabilities` / `add_ambient_capabilities` は `UNIMPLEMENTED`。
+//!   `add_ambient_capabilities` は `UNIMPLEMENTED`（ambient は常に空。#4762 の判断 (2)）。
 //! - `log_path`（コンテナ）と `log_directory`（サンドボックス）は [`resolve_log_path`] で検証して結合し、受け入れる
 //!   （CRI-2・SUP-4・#2671）。結合結果は config.json には出さず、StartContainer が supervisor へ渡す。
 //! - `supplemental_groups` は受け入れ、`process.user.additionalGids` へ写す（core が launch の fork の前に user namespace の
@@ -88,7 +89,7 @@
 //!   Landlock が落とす差がある）。sandbox 側の `readonly_rootfs` は適用先のプロセスが無いため出力しない
 //!   （CRI-2・CORE-5・SEC-1。#2767・#2827。`docs/design/cri-config-acceptance.md`）。
 //! - 本モジュールが `UNIMPLEMENTED` で拒否する CRI 項目（cgroup_parent・
-//!   devices・capabilities の add / ambient・propagation の BIDIRECTIONAL 等）の受け入れ順序と担当は
+//!   devices・capabilities の ambient・propagation の BIDIRECTIONAL 等）の受け入れ順序と担当は
 //!   `docs/design/cri-config-acceptance.md`（#2606）にまとめている。
 //! - `linux.cgroup_parent` の受け入れ方針（オーナー承認待ち。判断が出るまで `UNIMPLEMENTED`）は
 //!   `docs/design/cri-cgroup-parent.md`（#2672・CRI-2・CORE-4）にまとめている。
@@ -100,15 +101,16 @@ use std::num::NonZeroU32;
 
 use serde::Serialize;
 
-use fandhe_container_core::capabilities::{Capability, OCI_DEFAULT_CAPABILITIES, parse_drop_list};
+use fandhe_container_core::capabilities::{CapabilityResolveError, resolve_add_drop};
 use fandhe_container_core::path_masks::normalize_container_path;
 use fandhe_container_core::sysctl::{
     SYSCTL_MAX_ENTRIES, SysctlError, SysctlKey, SysctlNamespace, SysctlValue,
 };
 use fandhe_container_core::traits::ContainerLogPath;
+use fandhe_container_core::traits::ErrorCode;
 
 use super::resolv_conf;
-use crate::error::CriError;
+use crate::error::{CriError, CriErrorCode};
 use crate::runtime::v1::{
     ContainerConfig, Int64Value, LinuxContainerResources, Mount, MountPropagation, NamespaceMode,
     NamespaceOption, PodSandboxConfig, SecurityProfile, SupplementalGroupsPolicy,
@@ -402,7 +404,7 @@ struct ProcessOut {
     env: Vec<String>,
     cwd: String,
     user: UserOut,
-    /// `drop_capabilities` の指定があるときだけ書く（無ければ core が OCI 既定集合を使う）。
+    /// `drop_capabilities` か `add_capabilities` の指定があるときだけ書く（無ければ core が OCI 既定集合を使う）。
     #[serde(skip_serializing_if = "Option::is_none")]
     capabilities: Option<CapabilitiesOut>,
     /// CRI の `tty` を写す。真のときだけ出す（偽は従来の出力とバイト単位で同じ）。
@@ -420,37 +422,38 @@ struct CapabilitiesOut {
     permitted: Vec<&'static str>,
 }
 
-/// CRI の `drop_capabilities` を OCI 既定集合から除いた集合へ変換する（CRI-2・SEC-1・#2666）。
+/// CRI の `add_capabilities` / `drop_capabilities` を「既定 − drop + add」の集合へ変換する（CRI-2・SEC-1・#2666・#4793）。
 ///
-/// 名前は大文字小文字を区別せず、`CAP_` 接頭辞は任意。`ALL` は全 drop。
-/// 正規化は core の `parse_drop_list` に任せ、CLI の `create --cap-drop` と同じ規則を使う。
+/// 解決と拒否は core の `resolve_add_drop`（#4792）に任せ、CLI の `create --cap-add` / `--cap-drop` と同じ規則を使う。
+/// 名前は大文字小文字を区別せず、`CAP_` 接頭辞は任意。drop の `ALL` は全 drop。
 /// containerd とは異なり、接頭辞つきの名前も drop し（containerd は `CAP_CAP_...` になり drop されない）、
-/// 未知名は無視せず拒否する（どちらも厳しい側。挙動を合わせるかはオーナー判断待ち。#2812）。
-/// 既定集合に無い capability の drop は no-op として受理する。未知の名前・空・長すぎる名前は
-/// `INVALID_ARGUMENT`（指定された名前はエラーに載せない）。drop の指定が無ければ `None`。
-fn drop_capabilities(names: &[String]) -> Result<Option<CapabilitiesOut>, CriError> {
-    if names.is_empty() {
+/// 未知名は無視せず拒否する（どちらも厳しい側。#2812）。add と drop の同名は containerd（drop 優先）と違い
+/// 拒否する（#4762 のオーナー判断）。エラーは core の固定の英語の文言で、指定された名前を載せない。
+/// 両方とも指定が無ければ `None`。
+fn resolve_capabilities(
+    add: &[String],
+    drop: &[String],
+) -> Result<Option<CapabilitiesOut>, CriError> {
+    if add.is_empty() && drop.is_empty() {
         return Ok(None);
     }
-    // 名前の正規化は CLI の `create --cap-drop` と共有する core の部品に委ねる（CLI-1・CRI-2）。
-    let dropped = parse_drop_list(names).map_err(|_| invalid("drop_capabilities"))?;
-    let kept: Vec<&'static str> = OCI_DEFAULT_CAPABILITIES
-        .iter()
-        .copied()
-        .filter(|c| !dropped.contains(*c))
-        .map(Capability::as_str)
-        .collect();
-    // 出力順は `Capability::ALL`（番号順）にそろえる。
-    let ordered: Vec<&'static str> = Capability::ALL
-        .iter()
-        .map(|c| c.as_str())
-        .filter(|n| kept.contains(n))
-        .collect();
+    let caps = resolve_add_drop(add, drop).map_err(cap_error)?;
+    // 出力順は `Capability::ALL`（番号順。`iter` の順）にそろえる。
+    let ordered: Vec<&'static str> = caps.iter().map(|c| c.as_str()).collect();
     Ok(Some(CapabilitiesOut {
         bounding: ordered.clone(),
         effective: ordered.clone(),
         permitted: ordered,
     }))
+}
+
+/// core の解決エラーを CRI のコードへ写す（文言は core の固定の英語のまま）。
+fn cap_error(e: CapabilityResolveError) -> CriError {
+    let code = match e.code() {
+        ErrorCode::PermissionDenied => CriErrorCode::PermissionDenied,
+        _ => CriErrorCode::InvalidArgument,
+    };
+    CriError::new(code, e.to_string())
 }
 
 #[derive(Serialize)]
@@ -1527,12 +1530,12 @@ fn build_inner(
         if sc.privileged {
             return Err(unsupported("privileged"));
         }
-        // add / ambient は受けない（オーナー判断まで UNIMPLEMENTED）。drop だけ受ける（#2666）。
+        // ambient は受けない（UNIMPLEMENTED。#4762 の判断 (2)）。add / drop は core で解く（#2666・#4793）。
         if let Some(c) = &sc.capabilities {
-            if !c.add_capabilities.is_empty() || !c.add_ambient_capabilities.is_empty() {
-                return Err(unsupported("capabilities"));
+            if !c.add_ambient_capabilities.is_empty() {
+                return Err(unsupported("add_ambient_capabilities"));
             }
-            capabilities = drop_capabilities(&c.drop_capabilities)?;
+            capabilities = resolve_capabilities(&c.add_capabilities, &c.drop_capabilities)?;
         }
         // readonly_rootfs は root.readonly へ写す（下の SpecOut）。黙って落とさない（SEC-1）。
         if sc.selinux_options.is_some() {

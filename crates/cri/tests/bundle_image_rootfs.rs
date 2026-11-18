@@ -854,6 +854,47 @@ fn a5_container_writes_never_reach_the_cache() {
     assert!(!dir2.join("rootfs/new-file").exists());
 }
 
+/// CRI-2・SEC-1（#4793）: add_capabilities は bundle の config.json の 3 集合へ届き、既定外の add は
+/// PERMISSION_DENIED（gRPC も同じ）で bundle を残さない。
+#[test]
+fn cri2_sec1_4793_add_capabilities_reach_bundle_or_leave_none() {
+    use fandhe_container_cri::runtime::v1::{
+        Capability, LinuxContainerConfig, LinuxContainerSecurityContext,
+    };
+    let env = pulled_env("capadd", CONFIG_SECTION);
+    let p = env.provider();
+    let with_caps = |add: &str| {
+        let mut c = container(&env.image_id);
+        c.linux = Some(LinuxContainerConfig {
+            security_context: Some(LinuxContainerSecurityContext {
+                capabilities: Some(Capability {
+                    add_capabilities: vec![add.to_owned()],
+                    drop_capabilities: vec!["ALL".to_owned()],
+                    add_ambient_capabilities: Vec::new(),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        c
+    };
+    let e = prepare(&p, "ctr-deny", &with_caps("SYS_ADMIN")).unwrap_err();
+    assert_eq!(e.code(), CriErrorCode::PermissionDenied);
+    assert_eq!(tonic::Status::from(e).code(), tonic::Code::PermissionDenied);
+    assert_eq!(bundle_count(&env), 0, "no bundle may remain");
+
+    let dir = prepare(&p, "ctr-ok", &with_caps("net_bind_service")).expect("prepare");
+    let v: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.join("config.json")).unwrap()).unwrap();
+    for key in ["bounding", "effective", "permitted"] {
+        assert_eq!(
+            v["process"]["capabilities"][key],
+            serde_json::json!(["CAP_NET_BIND_SERVICE"]),
+            "{key}"
+        );
+    }
+}
+
 /// 参照の解決: タグは解決器が無ければ UNIMPLEMENTED、不正な ID 形は INVALID_ARGUMENT、未取得は NOT_FOUND。
 #[test]
 fn cri2_reference_resolution_codes() {

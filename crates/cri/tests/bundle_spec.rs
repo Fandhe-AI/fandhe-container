@@ -481,6 +481,101 @@ fn cri2_drop_capabilities_acceptance() {
     assert!(validate_config(&pod(), &caps(&["NET_RAW"])).is_ok());
 }
 
+/// CRI-2・SEC-1（#4793）: add_capabilities は「既定 − drop + add」で 3 集合へ書き、既定外と ALL は
+/// PERMISSION_DENIED、同名・未知名は INVALID_ARGUMENT、ambient は UNIMPLEMENTED のまま。
+#[test]
+fn cri2_sec1_4793_add_capabilities_acceptance() {
+    let caps = |add: &[&str], drop: &[&str], ambient: &[&str]| {
+        let v = |n: &[&str]| n.iter().map(|x| (*x).to_owned()).collect::<Vec<String>>();
+        let (add, drop, ambient) = (v(add), v(drop), v(ambient));
+        with_sc(move |sc| {
+            sc.capabilities = Some(Capability {
+                add_capabilities: add,
+                drop_capabilities: drop,
+                add_ambient_capabilities: ambient,
+            });
+        })
+    };
+    let json = build_runtime_config(
+        &pod(),
+        &caps(&["NET_BIND_SERVICE"], &["ALL"], &[]),
+        &ImageDefaults::default(),
+    )
+    .expect("build");
+    let v: Value = serde_json::from_slice(json.as_bytes()).unwrap();
+    for key in ["bounding", "effective", "permitted"] {
+        assert_eq!(
+            v["process"]["capabilities"][key],
+            serde_json::json!(["CAP_NET_BIND_SERVICE"]),
+            "{key}"
+        );
+    }
+    assert!(v["process"]["capabilities"].get("ambient").is_none());
+    let cfg = oci_runtime::parse_config_bytes(json.as_bytes()).expect("core parses it");
+    assert!(cfg.unapplied_fields().is_empty());
+    let core: Vec<&str> = cfg.capabilities().iter().map(|c| c.as_str()).collect();
+    assert_eq!(core, ["CAP_NET_BIND_SERVICE"]);
+
+    // 既定内の add は既定 14 個のまま（capabilities は書く）。
+    let v = build(&pod(), &caps(&["chown"], &[], &[]));
+    assert_eq!(
+        v["process"]["capabilities"]["bounding"]
+            .as_array()
+            .unwrap()
+            .len(),
+        14
+    );
+
+    for (add, drop, want, msg) in [
+        (
+            "SYS_ADMIN",
+            "",
+            CriErrorCode::PermissionDenied,
+            "adding capabilities outside the OCI default set is not allowed",
+        ),
+        (
+            "ALL",
+            "",
+            CriErrorCode::PermissionDenied,
+            "adding capabilities outside the OCI default set is not allowed",
+        ),
+        (
+            "CHOWN",
+            "cap_chown",
+            CriErrorCode::InvalidArgument,
+            "a capability is both added and dropped; remove it from one of the lists",
+        ),
+        (
+            "CAP_BOGUS",
+            "",
+            CriErrorCode::InvalidArgument,
+            "capability add or drop list is invalid",
+        ),
+    ] {
+        let drop: &[&str] = if drop.is_empty() { &[] } else { &[drop] };
+        let e = build_runtime_config(&pod(), &caps(&[add], drop, &[]), &ImageDefaults::default())
+            .expect_err("must be rejected");
+        assert_eq!(e.code(), want, "{add}");
+        assert_eq!(e.message(), msg, "{add}");
+        // 検証段（validate_config）でも同じく拒否する。
+        assert_eq!(
+            validate_config(&pod(), &caps(&[add], drop, &[]))
+                .unwrap_err()
+                .code(),
+            want
+        );
+    }
+    assert_eq!(
+        code(&pod(), &caps(&[], &[], &["NET_BIND_SERVICE"])),
+        CriErrorCode::Unimplemented
+    );
+    // add が正しくても ambient があれば UNIMPLEMENTED。
+    assert_eq!(
+        code(&pod(), &caps(&["KILL"], &["ALL"], &["KILL"])),
+        CriErrorCode::Unimplemented
+    );
+}
+
 /// CRI-2・SEC-5（#2664）: run_as_username は解決済みの (uid, gid) を採り、形式・相互排他・未解決を拒否する。
 #[test]
 fn run_as_username_acceptance() {
@@ -1418,25 +1513,6 @@ fn rejection_table_is_unimplemented() {
 
     let sc_cases: Vec<(&str, ScTweak)> = vec![
         ("privileged", Box::new(|sc| sc.privileged = true)),
-        (
-            "add caps",
-            Box::new(|sc| {
-                sc.capabilities = Some(Capability {
-                    add_capabilities: vec!["SYS_ADMIN".into()],
-                    ..Default::default()
-                });
-            }),
-        ),
-        (
-            "add caps with drop",
-            Box::new(|sc| {
-                sc.capabilities = Some(Capability {
-                    add_capabilities: vec!["SYS_ADMIN".into()],
-                    drop_capabilities: vec!["ALL".into()],
-                    ..Default::default()
-                });
-            }),
-        ),
         (
             "ambient caps",
             Box::new(|sc| {

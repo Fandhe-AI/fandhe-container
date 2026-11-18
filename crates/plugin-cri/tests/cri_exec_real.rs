@@ -34,7 +34,8 @@
 //! - 段 S（#4818・CRI-2・SEC-1・SEC-5・SUP-1・REPAIR-12）: pid・ipc を `POD` にした sandbox（保持役が pod の pid ns と pod-init を持つ。
 //!   #4815〜#4817）で、pod 内 2 コンテナが同じ pid ns に入り互いの pid が見えること、兄弟コンテナと pod-init（pod の PID 1）の
 //!   `/proc/<pid>/root`・`environ`・`fd` を開けないこと（Landlock の ptrace の境界・non-dumpable）、同じ uid の signal が兄弟の init へ
-//!   届くこと（`USR1` の trap で終了コード 42）、init が終わると孤児（`/bin/sleep 613`）が止まること（kill-all。#4811）、
+//!   届くこと（`USR1` の trap で終了コード 42）、init が終わると孤児（`/bin/sleep 613`）が止まり、
+//!   兄弟 B は pid と開始時刻を変えずに running のまま残ること（kill-all はコンテナの cgroup に限る。#4811・#4882）、
 //!   pod-init を SIGKILL すると sandbox が `SANDBOX_NOTREADY` になること（#4816）を具体値で照合する。成功行 5 行（`pod-pid ok:`）を
 //!   CI が試験ソースから導出して照合する。pull は増やさない。
 //!
@@ -1350,6 +1351,23 @@ async fn pid_in_pod(c: &mut RuntimeServiceClient<Channel>, viewer: &str, pattern
     (*pid).to_owned()
 }
 
+/// コンテナの現在の状態（`ContainerState` の値）。
+async fn container_state(c: &mut RuntimeServiceClient<Channel>, id: &str) -> i32 {
+    call_with_deadline(
+        c.container_status(cri::ContainerStatusRequest {
+            container_id: id.into(),
+            verbose: false,
+        }),
+        RPC_DEADLINE,
+    )
+    .await
+    .expect("container status")
+    .into_inner()
+    .status
+    .expect("status body")
+    .state
+}
+
 /// コンテナの状態と終了コードを期限つきで待つ（Exited になるまで）。
 async fn wait_exited(c: &mut RuntimeServiceClient<Channel>, id: &str) -> i32 {
     let start = Instant::now();
@@ -1464,7 +1482,15 @@ async fn pod_pid_stage(
     );
     let _ = writeln_stderr(POD_PID_OK_SIGNAL);
 
-    // 4. init が終わると孤児が止まる（kill-all）。孤児の存在を先に確かめる（陽性対照）。
+    // 4. init が終わると孤児が止まる（kill-all）。孤児の存在を先に確かめる（陽性対照）。止める範囲は孤児を作った
+    // コンテナの cgroup に限られ、兄弟 B は巻き込まない（#4882）。B のホスト視点の pid と開始時刻を先に控える。
+    let sibling_argv = ["/bin/sleep", "612"];
+    let sibling = live_pids_with_argv(&sibling_argv);
+    assert_eq!(
+        sibling.len(),
+        1,
+        "the sibling B must be running: {sibling:?}"
+    );
     let orphan_argv = ["/bin/sleep", "613"];
     let o = create_started(
         c,
@@ -1493,6 +1519,21 @@ async fn pod_pid_stage(
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    assert_eq!(
+        live_pids_with_argv(&sibling_argv),
+        sibling,
+        "the kill-all must not stop the sibling B"
+    );
+    assert_eq!(
+        container_state(c, &b).await,
+        cri::ContainerState::ContainerRunning as i32,
+        "the sibling B must stay running after the kill-all"
+    );
+    assert_eq!(
+        pid_in_pod(c, &b, "sleep 61[2]").await,
+        b_from_a,
+        "the sibling B must keep its pid in the pod pid namespace"
+    );
     let _ = writeln_stderr(POD_PID_OK_ORPHAN);
 
     // 5. pod-init を SIGKILL すると sandbox が NOTREADY になる。

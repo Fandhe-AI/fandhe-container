@@ -241,6 +241,7 @@ fn start_with(tag: &str, policy: &str, gated: bool) -> Rig {
         logs: None,
         seccomp: None,
         kill_all_on_init_exit: false,
+        placement: None,
     };
     let (running, handle) = install(&root, &id, running, &stop, None);
     assert!(handle.failure().is_none(), "control channel install failed");

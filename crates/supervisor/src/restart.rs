@@ -1086,8 +1086,12 @@ pub fn supervise_with_restart_health(
             }
             _ => {
                 // 回収済みの終了（ExitedUnrecorded）以外は終了未確認のためハンドルを返す。
-                let process =
-                    (!matches!(last, MonitorOutcome::ExitedUnrecorded { .. })).then_some(process);
+                let process = (!matches!(
+                    last,
+                    MonitorOutcome::ExitedUnrecorded { .. }
+                        | MonitorOutcome::ExitedProcessesRemain { .. }
+                ))
+                .then_some(process);
                 return Ok(SuperviseOutcome::MonitorFailed {
                     last,
                     process,

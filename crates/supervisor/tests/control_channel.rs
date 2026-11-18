@@ -435,6 +435,7 @@ fn running_with(fake: Fake) -> Running {
         logs: None,
         seccomp: None,
         kill_all_on_init_exit: false,
+        placement: None,
     }
 }
 

@@ -97,9 +97,9 @@ use fandhe_container_core::oci_runtime::{
     recover_interrupted_start, take_unreaped_processes,
 };
 use fandhe_container_core::traits::{
-    ContainerId, ContainerState, ContainerStatus, ErrorCode, ExitTime, ExplicitStop,
-    GetStateRequest, StartRequest, StateRecord, StateRevision, StateStore, SupervisionState,
-    TraitError, UpdateStateRequest,
+    CgroupPlacement, ContainerId, ContainerState, ContainerStatus, ErrorCode, ExitTime,
+    ExplicitStop, GetStateRequest, StartRequest, StateRecord, StateRevision, StateStore,
+    SupervisionState, TraitError, UpdateStateRequest,
 };
 
 use crate::deadline_store::{DeadlineStore, LateWrites};
@@ -255,6 +255,9 @@ pub struct Running {
     /// pod の pid namespace を共有するか（core の `StartedContainer::shares_pod_pid_namespace`）。真なら init の終了時と
     /// 停止時にコンテナの cgroup を kill-all する（CRI-2・SUP-1・CORE-4・#4811。`crate::pid_share`）。
     pub kill_all_on_init_exit: bool,
+    /// start が返したレコードの cgroup の配置（無ければ `None`）。停止の経路の kill-all が、ストアを読み直さずに
+    /// この世代の cgroup だけを止めるために使う（同じ ID の削除・再作成で別の世代を止めない。CORE-2・SEC-1・#4811）。
+    pub placement: Option<CgroupPlacement>,
 }
 
 /// spec を捕捉できなかったときの再 launch（常に失敗させる。fail-closed）。
@@ -1559,6 +1562,7 @@ fn launch_prepared(
             let kill_all_on_init_exit = started.shares_pod_pid_namespace();
             let (record, process) = started.into_parts();
             let instance = record.cgroup().map(|c| c.instance());
+            let placement = record.cgroup().cloned();
             let captured = capturing.captured_spec();
             // 入出力の振り分け（tty の master を捕捉の stdout 1 本にし、stdin・master の複製を世代の保持先へ回す）。
             // `ControlledProcess::new`（`install`）より前、捕捉の `take_output` より前に行う（#4074）。
@@ -1581,6 +1585,7 @@ fn launch_prepared(
                             logs,
                             seccomp,
                             kill_all_on_init_exit,
+                            placement,
                         },
                     };
                 }
@@ -1612,6 +1617,7 @@ fn launch_prepared(
                 logs,
                 seccomp,
                 kill_all_on_init_exit,
+                placement,
             })
         }
         // Timeout を含むすべての失敗を同じ確認に通す。呼び出し境界の期限超過なら予約（Running・pid なし）が残るので
@@ -2051,6 +2057,7 @@ pub fn run_supervised_with_health(
         logs,
         seccomp,
         kill_all_on_init_exit,
+        placement,
     } = running;
     // 捕捉ハブが無いときは読み取り側を取り出さない（取り出して捨てるとコンテナが SIGPIPE を受ける）。
     if let Some(hub) = &logs
@@ -2100,6 +2107,7 @@ pub fn run_supervised_with_health(
         Supervised {
             instance,
             kill_all_on_init_exit,
+            placement,
         },
         restart,
         timeouts,
@@ -2123,17 +2131,8 @@ struct Supervised {
     instance: Option<StateRevision>,
     /// init の終了時と停止時の kill-all（[`Running::kill_all_on_init_exit`]）。
     kill_all_on_init_exit: bool,
-}
-
-/// 記録から配置を読み直して kill-all する（停止の経路。読めなければ配置なしとして扱い、結果はログに残す。#4811）。
-fn kill_remaining_recorded(store: &Arc<dyn StateStore>, id: &ContainerId) {
-    let placement = store
-        .get(&fandhe_container_core::traits::GetStateRequest::new(
-            id.clone(),
-        ))
-        .ok()
-        .and_then(|r| r.cgroup().cloned());
-    let _ = crate::pid_share::kill_remaining(id, placement.as_ref());
+    /// start 時の cgroup の配置（[`Running::placement`]）。
+    placement: Option<CgroupPlacement>,
 }
 
 /// [`run_supervised`] の監視と回収の本体（出力の捕捉は呼び出し側が担う）。
@@ -2154,6 +2153,7 @@ fn supervise_running(
     let Supervised {
         instance,
         kill_all_on_init_exit,
+        placement,
     } = supervised;
     let mut state = match SupervisedState::attach(Arc::clone(&store), id.clone()) {
         Ok(s) => s,
@@ -2213,10 +2213,14 @@ fn supervise_running(
         }) => {
             let disposed = dispose(process, Some(&late), timeouts);
             // 停止で init を回収した後も、pid を共有するコンテナでは子孫が残るため cgroup ごと止める（#4811）。
-            if kill_all_on_init_exit {
-                kill_remaining_recorded(&store, &id);
-            }
-            finish_disposed_explicit(&store, &id, instance, disposed, 0, explicit_stop_pending)
+            // start 時の配置を使い、ストアは読み直さない。止めきれなければ失敗の終了コードにする。
+            let code = match kill_all_on_init_exit
+                .then(|| crate::pid_share::kill_remaining(&id, placement.as_ref()))
+            {
+                Some(Err(e)) => exit_code_for(e.code()).get(),
+                _ => 0,
+            };
+            finish_disposed_explicit(&store, &id, instance, disposed, code, explicit_stop_pending)
         }
         Ok(SuperviseOutcome::RelaunchFailed {
             error,

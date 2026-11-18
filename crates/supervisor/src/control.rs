@@ -655,6 +655,7 @@ mod install {
             logs,
             seccomp,
             kill_all_on_init_exit,
+            placement,
         } = running;
         let observer = Arc::new(ControlObserver::new(audit, Some(id.clone())));
         let guards = reclaimer
@@ -682,6 +683,7 @@ mod install {
                     logs,
                     seccomp,
                     kill_all_on_init_exit,
+                    placement,
                 };
                 (
                     running,
@@ -700,6 +702,7 @@ mod install {
                     logs,
                     seccomp,
                     kill_all_on_init_exit,
+                    placement,
                 };
                 stop.request_stop();
                 let mut handle = failed_handle(TraitError::new(

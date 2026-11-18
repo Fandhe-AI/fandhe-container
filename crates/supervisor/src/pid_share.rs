@@ -9,7 +9,7 @@
 //!
 //! 1. 監視ループが init の終了を観測した直後・終了を記録する前（`run::monitor_after_claim`。containerd の shim が
 //!    init の終了を公開する前に全プロセスを止めるのと同じ順）
-//! 2. 停止（`StopRequested`）で起動ハンドルを回収した後（`start_entry::run_supervised_with_health`）
+//! 2. 停止（`StopRequested`）で起動ハンドルを回収した後（`start_entry::supervise_running`）
 //!
 //! 対象かどうかは core の start の結果（`StartedContainer::shares_pod_pid_namespace`。config の pid の path）で決まり、
 //! 対象でないコンテナの停止・終了の挙動は変えない。
@@ -24,8 +24,10 @@
 //! `already_absent`・`no_cgroup`・`failed`）・`killed`（止める前に数えた件数。数えられなければ `null`）・`code`（失敗の
 //! コード。期限切れは `TIMEOUT`）を出す。パス・pid は載せない。
 //!
-//! 残余: 失敗（期限切れ等）でも終了の記録・回収は続ける（ログに残す）。restart の再 launch や delete の前に残ったプロセスは、
-//! delete の空の確認が拒否する（何も止めずに失敗する）。
+//! 失敗（期限切れ・権限不足等）の扱い: 終了の記録は続けるが、監視ループは `MonitorOutcome::ExitedProcessesRemain` を
+//! 返し、再起動ループは再 launch しない（旧い世代の子孫が残った cgroup に新しい init を起動しない。fail-closed）。停止の
+//! 経路は失敗の終了コードで終わる。停止の経路の配置は start 時に保持した値（`Running::placement`）で、ストアを読み直さない
+//! （同じ ID の削除・再作成で別の世代を止めない）。残ったプロセスは delete の空の確認が拒否する（何も止めずに失敗する）。
 
 use fandhe_container_core::traits::{CgroupPlacement, ContainerId, ErrorCode, TraitError};
 

@@ -716,12 +716,20 @@ pub enum PodNamespaceJoinOutcome {
     NetOwnerMismatch,
     /// net が pod の user namespace 所有でなくホスト側（呼び出し側）の所有（未対応。`Unimplemented`）。
     NetNotPodOwned,
+    /// user・ipc・pid の組を受理した（#4809）。
+    AcceptedUserIpcPid,
+    /// user・ipc・net・pid の組を受理した（#4809）。
+    AcceptedUserIpcNetPid,
+    /// pid を所有するのが join する user namespace でない（#4809）。
+    PidOwnerMismatch,
+    /// pid の親が呼び出し側の pid namespace でない（呼び出し側自身・孫以下・無関係。#4809）。
+    PidNotChild,
 }
 
 impl PodNamespaceJoinOutcome {
     /// 中継の閉じた表（添字がワイヤー上の値。増やすときは末尾に足す。中継は Linux 限定）。
     #[cfg(target_os = "linux")]
-    pub(crate) const ALL: [Self; 11] = [
+    pub(crate) const ALL: [Self; 15] = [
         Self::AcceptedUserIpc,
         Self::AcceptedUserIpcNet,
         Self::PathMalformed,
@@ -733,6 +741,10 @@ impl PodNamespaceJoinOutcome {
         Self::IpcOwnerMismatch,
         Self::NetOwnerMismatch,
         Self::NetNotPodOwned,
+        Self::AcceptedUserIpcPid,
+        Self::AcceptedUserIpcNetPid,
+        Self::PidOwnerMismatch,
+        Self::PidNotChild,
     ];
 
     /// 監査レコードに入る静的トークン。
@@ -749,6 +761,10 @@ impl PodNamespaceJoinOutcome {
             Self::IpcOwnerMismatch => "pod_join_ipc_owner_mismatch",
             Self::NetOwnerMismatch => "pod_join_net_owner_mismatch",
             Self::NetNotPodOwned => "pod_join_net_not_pod_owned",
+            Self::AcceptedUserIpcPid => "pod_join_accepted_user_ipc_pid",
+            Self::AcceptedUserIpcNetPid => "pod_join_accepted_user_ipc_net_pid",
+            Self::PidOwnerMismatch => "pod_join_pid_owner_mismatch",
+            Self::PidNotChild => "pod_join_pid_not_child",
         }
     }
 
@@ -1325,7 +1341,7 @@ mod tests {
         assert!(r.syscall().is_none());
     }
 
-    /// SEC-4・SEC-5・NET-3・#2872: pod_namespace_join の層トークンと 11 結果のトークン(固定値・重複なし・
+    /// SEC-4・SEC-5・NET-3・#2872・#4809: pod_namespace_join の層トークンと 15 結果のトークン(固定値・重複なし・
     /// `pod_join_` 接頭辞)、レコードのアクセサ(パスを持たない)。
     #[cfg(target_os = "linux")]
     #[test]
@@ -1349,6 +1365,10 @@ mod tests {
                 "pod_join_ipc_owner_mismatch",
                 "pod_join_net_owner_mismatch",
                 "pod_join_net_not_pod_owned",
+                "pod_join_accepted_user_ipc_pid",
+                "pod_join_accepted_user_ipc_net_pid",
+                "pod_join_pid_owner_mismatch",
+                "pod_join_pid_not_child",
             ]
         );
         let r = AuditRecord::new(

@@ -1871,7 +1871,8 @@ jobs:
 
       # net3_2872_real_holder_net_join_identity_and_ownership（`crates/core/src/oci_runtime/namespace_join.rs` の lib 内
       # `#[ignore]` 試験 1 件。CORE-3・SEC-5・NET-3・SEC-4・#2872・#2875）: 保持役の代わりの `unshare --user --map-root-user --ipc --net`
-      # の ns で `NamespaceJoin::pin` を実機照合する。上で緩和した sysctl を使い回し、ビルドは sec1_2536 のステップの lib を使い回す
+      # の ns で `NamespaceJoin::pin` を実機照合する。同じ起動で pid の join（CRI-2・CORE-3・SEC-5・#4809。`--pid --fork` の保持役の
+      # pid ns の受理・所有者違い・孫の拒否と、join の後に fork した子の pid ns の一致）も照合する。上で緩和した sysctl を使い回し、ビルドは sec1_2536 のステップの lib を使い回す
       # （新しいビルドステップは足さない）。新しいジョブ・check-run・sudo は増やさない。
       - name: net3_2872_real_holder_net_join_identity_and_ownership の実行（実機前提テスト・--ignored。NET-3・SEC-5・#2872・#2875）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
@@ -1881,7 +1882,8 @@ jobs:
           log="${RUNNER_TEMP}/net3_2872_real_holder_net_join.log"
           scripts/run-with-deadline.sh --name net3_2872_real_holder_net_join --deadline 240 --log "${log}" -- \
             cargo test -p fandhe-container-core --lib -- --ignored --exact \
-              oci_runtime::namespace_join::tests::net3_2872_real_holder_net_join_identity_and_ownership
+              oci_runtime::namespace_join::tests::net3_2872_real_holder_net_join_identity_and_ownership \
+              oci_runtime::namespace_join::tests::cri2_core3_4809_real_holder_pid_join_identity_and_ownership
           scripts/check-success-lines.sh --name net3_2872_real_holder_net_join_identity_and_ownership \
             --src crates/core/src/oci_runtime/namespace_join.rs --log "${log}" \
             --libtest-ignored --libtest-module 'oci_runtime::namespace_join::tests' \

@@ -1926,7 +1926,8 @@ pub fn plan_rootless_subordinate(
 /// 権限モデルの写像と hostname を持つ)で、join では `User`・`Ipc` を作らず参加する。
 ///
 /// 処理順: 実行 ID の再検証 → `setns(user)` → `setns(ipc)` → `setns(net)`(join に net があるとき。pod の userns が所有する
-/// netns への参加で、`lo` は触らない〔保持役の責務〕) → `/proc/self/{uid,gid}_map` を読み直し、計画の期待する
+/// netns への参加で、`lo` は触らない〔保持役の責務〕) → `setns(pid)`(join に pid があるとき。以後に fork する init だけが
+/// 入る。#4809) → `/proc/self/{uid,gid}_map` を読み直し、計画の期待する
 /// 写像と **完全一致** することを確かめる(不一致は `FailedPrecondition`。コンテナ内 root をホストの非特権 UID へ
 /// 写す SEC-5 と `process.user` の照合の前提を、参加先の userns でも保つ) → 残りの namespace(pid・mount・uts)を
 /// `unshare` → `/` を再帰 private 化 → hostname。
@@ -1989,6 +1990,15 @@ pub(crate) fn isolate_join(
     } else {
         false
     };
+    // pid は最後に参加する（#4809）。`setns(CLONE_NEWPID)` は呼び出し元自身を移さず、以後に fork する子（init）だけを
+    // 参加先へ入れる（`unshare(CLONE_NEWPID)` と同じく `pid_for_children` が変わる）。
+    let pid_joined = if let Some(pid) = join.pid_fd() {
+        sys::setns_fd(pid, NsFlag::Pid)
+            .map_err(|e| ExecError::from_sys(e, IsolationStage::SetNs, "setns(pid)"))?;
+        true
+    } else {
+        false
+    };
     verify_joined_id_maps(
         |kind| {
             let target = rootless::TargetPid::new(std::process::id())?;
@@ -2000,6 +2010,9 @@ pub(crate) fn isolate_join(
     let mut rest = namespaces.without(Namespace::User).without(Namespace::Ipc);
     if net_joined {
         rest = rest.without(Namespace::Net);
+    }
+    if pid_joined {
+        rest = rest.without(Namespace::Pid);
     }
     if !rest.is_empty() {
         unshare_and_configure(rest, hostname, None, root_propagation)?;

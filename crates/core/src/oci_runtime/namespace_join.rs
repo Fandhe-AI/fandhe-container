@@ -4,10 +4,10 @@
 //! # 役割と呼び出し元
 //!
 //! `start` が config の `linux.namespaces[]` から `NamespaceJoin::paths_of` と `pin` を呼び、`user` と `ipc` の
-//! path を **組** で受ける。network の path は user と ipc の組に **足す形でだけ** 受ける（#2872。設計 #2838 の H7）。
-//! 検証済みの fd を [`LaunchSpec`](super::LaunchSpec) に載せ、本番 launcher が中間プロセス I の分離で `setns(2)`
-//! に使う（`exec::isolate_join`。順は user → ipc → net）。pid・mount・uts・cgroup・time の path、片方だけの path、
-//! network 単独（user・ipc の組なし）の path は従来どおり `Unimplemented` で拒否する（fail-closed）。
+//! path を **組** で受ける。network と pid の path は user と ipc の組に **足す形でだけ** 受ける（net は #2872。設計 #2838 の H7。
+//! pid は #4809。設計 #2903 の P1）。検証済みの fd を [`LaunchSpec`](super::LaunchSpec) に載せ、本番 launcher が中間プロセス I
+//! の分離で `setns(2)` に使う（`exec::isolate_join`。順は user → ipc → net → pid）。mount・uts・cgroup・time の path、片方だけの
+//! path、network・pid 単独（user・ipc の組なし）の path は従来どおり `Unimplemented` で拒否する（fail-closed）。
 //!
 //! # なぜ user と ipc の組か
 //!
@@ -27,8 +27,10 @@
 //! | ipc: 所有する user namespace が join する user namespace と違う（ホストの ipc・別所有の ipc） | `PermissionDenied` |
 //! | net: 所有する user namespace が join する user namespace と違う（別 pod の userns 所有） | `PermissionDenied` |
 //! | net: 所有者が呼び出し側自身の user namespace、またはそれより外側（ホストの netns・init userns 所有） | `Unimplemented`（#2241 の判断まで受けない） |
+//! | pid: 所有する user namespace が join する user namespace と違う | `PermissionDenied` |
+//! | pid: 呼び出し側自身の pid namespace / 親（`NS_GET_PARENT`）が呼び出し側の pid namespace でない | `PermissionDenied` |
 //!
-//! 検査は user → ipc → net の順で、user の検査が先に通ること。受理と拒否は閉じた語彙
+//! 検査は user → ipc → net → pid の順で、user の検査が先に通ること。受理と拒否は閉じた語彙
 //! （[`PodNamespaceJoinOutcome`](crate::audit_log::PodNamespaceJoinOutcome)）で監査に残す（SEC-4）。
 //!
 //! パスは 1 回だけ開いて fd に固定し、検査と使用は同じ fd で行う（`/proc/<pid>/ns/*` は pid が再利用されると
@@ -64,8 +66,10 @@
 //! - init（呼び出し側）の user namespace 所有の netns（rootful・ホストの netns）への join は、この pod join では受けない
 //!   （`Unimplemented`）。rootful のユーザー定義ネットワークの init 所有 netns は、起動オプションから入る別の入口
 //!   （`pinned_net`。D12・#3069。user namespace の作成前に参加する）で受ける。`RootfulHostRoot` は #2241 で恒久拒否のまま。
-//! - pid の共有（`shareProcessNamespace`）は未対応。コンテナの init が PID 1 であることを制限適用の証跡の前提に
-//!   している（`exec::check_establish_preconditions`・`Pid1Target`）ため、既存の pid namespace への参加と両立しない。
+//! - pid の path は受けて `setns(pid)` まで行う（#4809）が、`setns(pid)` は以後に fork した子にだけ効き、その子は
+//!   参加先の PID 1 ではない。制限適用の証跡（`exec::check_establish_preconditions`・`Pid1Target`）は init が PID 1 で
+//!   あることを前提にしているため、joined pid ns の init の証跡（#4812）と縮退経路の拒否（#4813）が入るまで、pid を
+//!   共有するコンテナの launch は証跡の段で fail-closed に止まる。cri は #4817 まで pid の path を出さない。
 //! - `/dev/shm`（POSIX shm）は共有されない（core がコンテナごとの tmpfs を載せる）。SysV IPC と POSIX mqueue が
 //!   共有される。
 //! - 周辺の未完: 保持役の素性の永続化と再起動後の再採用は #2940、rootless の本番 PodNetworkProvider（pasta）は #2879。
@@ -91,12 +95,14 @@ const PATH_MAX_BYTES: usize = 4096;
 
 /// config から取り出した join の path の組（I/O なし。`paths_of` の結果）。
 ///
-/// `user` と `ipc` は常にある（組）。`net` は pod の netns も共有するときだけ（#2872）。
+/// `user` と `ipc` は常にある（組）。`net` は pod の netns も共有するときだけ（#2872）、`pid` は pod の pid ns も
+/// 共有するときだけ（#4809）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct JoinPaths<'a> {
     pub(super) user: &'a Path,
     pub(super) ipc: &'a Path,
     pub(super) net: Option<&'a Path>,
+    pub(super) pid: Option<&'a Path>,
 }
 
 /// `pin` の拒否。監査に残す結果は、素性検査による拒否のときだけ `Some`（開けない path・I/O の失敗・非 Linux は `None`）。
@@ -148,6 +154,9 @@ pub struct NamespaceJoin {
     /// pin 時に取った net の (dev, ino)。exec 直前の同期点が PID 1 の netns と照合する（D8。SEC-1）。
     #[cfg(target_os = "linux")]
     net_identity: Option<(u64, u64)>,
+    /// pod の pid namespace（#4809）。`setns` は中間プロセスで行い、以後に fork した init だけが入る。
+    #[cfg(target_os = "linux")]
+    pid: Option<Arc<OwnedFd>>,
     /// Linux 以外では構築できないことを型で表す。
     #[cfg(not(target_os = "linux"))]
     never: std::convert::Infallible,
@@ -157,12 +166,15 @@ impl PartialEq for NamespaceJoin {
     fn eq(&self, other: &Self) -> bool {
         #[cfg(target_os = "linux")]
         {
-            let same_net = match (&self.net, &other.net) {
+            let same = |a: &Option<Arc<OwnedFd>>, b: &Option<Arc<OwnedFd>>| match (a, b) {
                 (None, None) => true,
                 (Some(a), Some(b)) => Arc::ptr_eq(a, b),
                 _ => false,
             };
-            Arc::ptr_eq(&self.user, &other.user) && Arc::ptr_eq(&self.ipc, &other.ipc) && same_net
+            Arc::ptr_eq(&self.user, &other.user)
+                && Arc::ptr_eq(&self.ipc, &other.ipc)
+                && same(&self.net, &other.net)
+                && same(&self.pid, &other.pid)
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -177,7 +189,7 @@ impl Eq for NamespaceJoin {}
 fn unsupported_path() -> TraitError {
     TraitError::new(
         ErrorCode::Unimplemented,
-        "start does not support yet: linux.namespaces[].path (only a user and ipc pair, optionally with network)",
+        "start does not support yet: linux.namespaces[].path (only a user and ipc pair, optionally with network and pid)",
     )
 }
 
@@ -190,14 +202,19 @@ impl NamespaceJoin {
     /// user と ipc の片方だけの path・network 単独の path は `Unimplemented`、同じ種別の重複（path 付きと無しの混在を含む）は
     /// `InvalidArgument`。
     pub(super) fn paths_of(config: &OciConfig) -> Result<Option<JoinPaths<'_>>, TraitError> {
-        let (mut user, mut ipc, mut net): (Option<&Path>, Option<&Path>, Option<&Path>) =
-            (None, None, None);
+        let (mut user, mut ipc, mut net, mut pid): (
+            Option<&Path>,
+            Option<&Path>,
+            Option<&Path>,
+            Option<&Path>,
+        ) = (None, None, None, None);
         for ns in config.namespaces() {
             let Some(path) = ns.path() else { continue };
             let slot = match ns.kind() {
                 NamespaceKind::User => &mut user,
                 NamespaceKind::Ipc => &mut ipc,
                 NamespaceKind::Network => &mut net,
+                NamespaceKind::Pid => &mut pid,
                 _ => return Err(unsupported_path()),
             };
             if slot.replace(path).is_some() {
@@ -207,7 +224,7 @@ impl NamespaceJoin {
                 ));
             }
         }
-        let (user, ipc) = match (user, ipc, net) {
+        let (user, ipc) = match (user, ipc, net.or(pid)) {
             (None, None, None) => return Ok(None),
             (Some(user), Some(ipc), _) => (user, ipc),
             _ => return Err(unsupported_path()),
@@ -217,13 +234,19 @@ impl NamespaceJoin {
         if count(NamespaceKind::User) != 1
             || count(NamespaceKind::Ipc) != 1
             || (net.is_some() && count(NamespaceKind::Network) != 1)
+            || (pid.is_some() && count(NamespaceKind::Pid) != 1)
         {
             return Err(TraitError::new(
                 ErrorCode::InvalidArgument,
-                "linux.namespaces has a duplicate user, ipc or network entry",
+                "linux.namespaces has a duplicate user, ipc, network or pid entry",
             ));
         }
-        Ok(Some(JoinPaths { user, ipc, net }))
+        Ok(Some(JoinPaths {
+            user,
+            ipc,
+            net,
+            pid,
+        }))
     }
 
     /// user・ipc（と任意で net）namespace のパスを開き、素性を照合して fd に固定する（モジュール doc の表）。
@@ -245,6 +268,7 @@ impl NamespaceJoin {
             user: user_path,
             ipc: ipc_path,
             net: net_path,
+            pid: pid_path,
         } = paths;
         let malformed = |r: Result<(), TraitError>| {
             r.map_err(|e| PinRejection {
@@ -254,15 +278,19 @@ impl NamespaceJoin {
         };
         malformed(check_path(user_path))?;
         malformed(check_path(ipc_path))?;
-        if let Some(net_path) = net_path {
-            malformed(check_path(net_path))?;
+        for extra in [net_path, pid_path].into_iter().flatten() {
+            malformed(check_path(extra))?;
         }
         let user = open_ns(user_path)?;
         let ipc = open_ns(ipc_path)?;
         let net = net_path.map(open_ns).transpose()?;
+        let pid = pid_path.map(open_ns).transpose()?;
         let mut typed: Vec<(&OwnedFd, NsFlag)> = vec![(&user, NsFlag::User), (&ipc, NsFlag::Ipc)];
         if let Some(net) = &net {
             typed.push((net, NsFlag::Net));
+        }
+        if let Some(pid) = &pid {
+            typed.push((pid, NsFlag::Pid));
         }
         for (fd, flag) in typed {
             if sys::fs_type(fd.as_fd()).map_err(inspect)? != sys::NSFS_MAGIC {
@@ -360,10 +388,48 @@ impl NamespaceJoin {
                 Some(identity(net.as_fd())?)
             }
         };
-        let outcome = if net.is_some() {
-            O::AcceptedUserIpcNet
-        } else {
-            O::AcceptedUserIpc
+        // pid は pod の user namespace が所有し、呼び出し側の pid namespace の直下の子であるものに限る（#4809。SEC-5）。
+        // `setns(pid)` は以後に fork した子だけを入れるため、自身・孫以下・無関係の pid ns を親子で弾く。
+        if let Some(pid) = &pid {
+            let owner_mismatch = || {
+                PinRejection::new(
+                    ErrorCode::PermissionDenied,
+                    "the pod pid namespace is not owned by the pod user namespace",
+                    O::PidOwnerMismatch,
+                )
+            };
+            let owner = sys::ns_owner_userns(pid.as_fd()).map_err(|e| match e {
+                sys::SysError::Os(errno) if errno == sys::EPERM => owner_mismatch(),
+                other => inspect(other),
+            })?;
+            if identity(owner.as_fd())? != user_id {
+                return Err(owner_mismatch());
+            }
+            let not_child = || {
+                PinRejection::new(
+                    ErrorCode::PermissionDenied,
+                    "the pod pid namespace is not a direct child of the caller's",
+                    O::PidNotChild,
+                )
+            };
+            let caller_pid = open_ns(Path::new("/proc/self/ns/pid"))?;
+            let caller_pid_id = identity(caller_pid.as_fd())?;
+            if identity(pid.as_fd())? == caller_pid_id {
+                return Err(not_child());
+            }
+            let parent = sys::ns_parent(pid.as_fd()).map_err(|e| match e {
+                sys::SysError::Os(errno) if errno == sys::EPERM => not_child(),
+                other => inspect(other),
+            })?;
+            if identity(parent.as_fd())? != caller_pid_id {
+                return Err(not_child());
+            }
+        }
+        let outcome = match (net.is_some(), pid.is_some()) {
+            (false, false) => O::AcceptedUserIpc,
+            (true, false) => O::AcceptedUserIpcNet,
+            (false, true) => O::AcceptedUserIpcPid,
+            (true, true) => O::AcceptedUserIpcNetPid,
         };
         Ok((
             Self {
@@ -371,6 +437,7 @@ impl NamespaceJoin {
                 ipc: Arc::new(ipc),
                 net: net.map(Arc::new),
                 net_identity,
+                pid: pid.map(Arc::new),
             },
             outcome,
         ))
@@ -392,6 +459,7 @@ impl NamespaceJoin {
             ipc: Arc::new(ipc),
             net: None,
             net_identity: None,
+            pid: None,
         }
     }
 
@@ -404,6 +472,7 @@ impl NamespaceJoin {
             ipc: Arc::new(ipc),
             net: Some(Arc::new(net)),
             net_identity,
+            pid: None,
         }
     }
 
@@ -430,6 +499,12 @@ impl NamespaceJoin {
     pub(crate) fn net_identity(&self) -> Option<crate::exec::NetnsIdentity> {
         self.net_identity
             .map(|(dev, ino)| crate::exec::NetnsIdentity::from_parts(dev, ino))
+    }
+
+    /// 固定した pid namespace の fd（pod の pid ns も共有するときだけ。`setns` 専用。#4809）。
+    #[cfg(target_os = "linux")]
+    pub(crate) fn pid_fd(&self) -> Option<BorrowedFd<'_>> {
+        self.pid.as_ref().map(|p| p.as_fd())
     }
 
     /// net も join するか。
@@ -518,6 +593,7 @@ mod tests {
             user: Path::new(user),
             ipc: Path::new(ipc),
             net: net.map(Path::new),
+            pid: None,
         })
         .map(|(join, _)| join)
         .map_err(|r| r.error)
@@ -528,6 +604,7 @@ mod tests {
             user: Path::new(user),
             ipc: Path::new(ipc),
             net: net.map(Path::new),
+            pid: None,
         })
         .err()
         .and_then(|r| r.outcome)
@@ -549,6 +626,7 @@ mod tests {
     const U: &str = r#"{"type":"user","path":"/proc/1/ns/user"}"#;
     const I: &str = r#"{"type":"ipc","path":"/proc/1/ns/ipc"}"#;
     const N: &str = r#"{"type":"network","path":"/proc/1/ns/net"}"#;
+    const P: &str = r#"{"type":"pid","path":"/proc/1/ns/pid"}"#;
 
     fn paths_of(parts: &[&str]) -> Result<Option<JoinPaths<'static>>, TraitError> {
         // 返り値が config を借りるため、試験では config を leak して 'static にする(試験専用)。
@@ -572,7 +650,7 @@ mod tests {
             assert_eq!(err.code(), ErrorCode::Unimplemented);
             assert_eq!(
                 err.message(),
-                "start does not support yet: linux.namespaces[].path (only a user and ipc pair, optionally with network)"
+                "start does not support yet: linux.namespaces[].path (only a user and ipc pair, optionally with network and pid)"
             );
         }
         let uts = r#"{"type":"uts","path":"/proc/1/ns/uts"}"#;
@@ -639,6 +717,72 @@ mod tests {
         );
     }
 
+    /// CRI-2・CORE-3・SEC-5・#4809: pid の path は user と ipc の組に足す形でだけ受け（net の有無を問わない）、
+    /// pid 単独・片方だけとの組は `Unimplemented`、重複は `InvalidArgument`。
+    #[test]
+    fn cri2_core3_4809_paths_of_accepts_pid_only_with_the_user_ipc_pair() {
+        let with_pid = paths_of(&[U, I, P]).unwrap().expect("pid");
+        assert_eq!(with_pid.pid, Some(Path::new("/proc/1/ns/pid")));
+        assert_eq!(with_pid.net, None);
+        let all = paths_of(&[U, I, N, P]).unwrap().expect("all");
+        assert_eq!(all.net, Some(Path::new("/proc/1/ns/net")));
+        assert_eq!(all.pid, Some(Path::new("/proc/1/ns/pid")));
+        assert_eq!(paths_of(&[U, I]).unwrap().expect("pair").pid, None);
+        for parts in [&[P][..], &[U, P][..], &[I, P][..], &[N, P][..]] {
+            assert_eq!(
+                paths_of(parts).unwrap_err().code(),
+                ErrorCode::Unimplemented
+            );
+        }
+        for (parts, msg) in [
+            (
+                &[U, I, P, P][..],
+                "linux.namespaces has a duplicate entry with a path",
+            ),
+            (
+                &[U, I, P, r#"{"type":"pid"}"#][..],
+                "linux.namespaces has a duplicate user, ipc, network or pid entry",
+            ),
+        ] {
+            let err = paths_of(parts).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::InvalidArgument);
+            assert_eq!(err.message(), msg);
+        }
+    }
+
+    fn pin_pid(
+        user: &str,
+        ipc: &str,
+        pid: &str,
+    ) -> Result<(NamespaceJoin, PodNamespaceJoinOutcome), PinRejection> {
+        NamespaceJoin::pin(JoinPaths {
+            user: Path::new(user),
+            ipc: Path::new(ipc),
+            net: None,
+            pid: Some(Path::new(pid)),
+        })
+    }
+
+    /// CRI-2・SEC-5・SEC-4・#4809: pid に別種別の namespace を指すと `InvalidArgument`（監査は `NotNamespaceFile`）、
+    /// 形の不正は `PathMalformed`。種別の検査は user の自身検査より先に効く。
+    #[test]
+    fn cri2_sec5_4809_pid_path_type_and_shape_are_checked() {
+        let (u, i) = ("/proc/self/ns/user", "/proc/self/ns/ipc");
+        let e = pin_pid(u, i, "/proc/self/ns/ipc").expect_err("ipc as pid");
+        assert_eq!(e.error.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            e.error.message(),
+            "a namespace path has an unexpected namespace type"
+        );
+        assert_eq!(e.outcome, Some(PodNamespaceJoinOutcome::NotNamespaceFile));
+        let e = pin_pid(u, i, "proc/self/ns/pid").expect_err("relative");
+        assert_eq!(e.error.code(), ErrorCode::InvalidArgument);
+        assert_eq!(e.outcome, Some(PodNamespaceJoinOutcome::PathMalformed));
+        // 正しい種別でも user の自身検査が先に効く（pid の検査に届かない）。
+        let e = pin_pid(u, i, "/proc/self/ns/pid").expect_err("own");
+        assert_eq!(e.outcome, Some(PodNamespaceJoinOutcome::UserIsOwn));
+    }
+
     /// 実機: 保持役の代わりの `unshare --user --map-root-user --ipc --net sleep` を起動して、その `/proc/<pid>/ns/*` を
     /// join 先に使う(非特権 user namespace。`kernel.apparmor_restrict_unprivileged_userns` の緩和が要るホストがある)。
     /// 期限つきで回収する(REPAIR-5)。前提が欠ければ skip せず固定行で失敗する。
@@ -648,13 +792,31 @@ mod tests {
 
     impl FakeHolder {
         fn spawn() -> Self {
+            Self::spawn_with(
+                &["--user", "--map-root-user", "--ipc", "--net", "sleep", "30"],
+                "net",
+            )
+        }
+
+        /// pid namespace も作る保持役（`--pid --fork`。unshare 自身は外に残り、`pid_for_children` が新しい pid ns を指す。
+        /// `inner` が真なら、その中でさらに `unshare --pid --fork` して孫の pid ns を作る。#4809）。
+        fn spawn_pid(inner: bool) -> Self {
+            let mut args = vec!["--user", "--map-root-user", "--ipc", "--pid", "--fork"];
+            if inner {
+                args.extend(["unshare", "--pid", "--fork"]);
+            }
+            args.extend(["sleep", "30"]);
+            Self::spawn_with(&args, "pid_for_children")
+        }
+
+        fn spawn_with(args: &[&str], wait_kind: &str) -> Self {
             let mut child = std::process::Command::new("unshare")
-                .args(["--user", "--map-root-user", "--ipc", "--net", "sleep", "30"])
+                .args(args)
                 .spawn()
                 .expect("PRECONDITION FAILED: unshare(1) is required");
-            // unshare が namespace に入るまで待つ(`/proc/<pid>/ns/net` が自分と異なる素性になる)。
-            let me = std::fs::read_link("/proc/self/ns/net").expect("own netns");
-            let path = format!("/proc/{}/ns/net", child.id());
+            // unshare が namespace に入るまで待つ(`/proc/<pid>/ns/<kind>` が自分と異なる素性になる)。
+            let me = std::fs::read_link(format!("/proc/self/ns/{wait_kind}")).expect("own ns");
+            let path = format!("/proc/{}/ns/{wait_kind}", child.id());
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             loop {
                 if std::fs::read_link(&path).is_ok_and(|l| l != me) {
@@ -699,6 +861,7 @@ mod tests {
                 user,
                 ipc,
                 net: Some(Path::new(net)),
+                pid: None,
             }
         }
         let with_net = |net| with(user_p, ipc_p, net);
@@ -733,6 +896,136 @@ mod tests {
         assert_eq!(uts.error.code(), ErrorCode::InvalidArgument);
         assert_eq!(uts.outcome, Some(PodNamespaceJoinOutcome::NotNamespaceFile));
         println!("net3_2872: pod netns join identity and ownership verified");
+    }
+
+    /// `pid` の直下の子の pid を期限つきで待つ（`/proc/<pid>/task/<pid>/children`）。
+    fn first_child(pid: u32) -> u32 {
+        let path = format!("/proc/{pid}/task/{pid}/children");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(c) = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|s| s.split_whitespace().next().and_then(|t| t.parse().ok()))
+            {
+                return c;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "PRECONDITION FAILED: the holder did not fork its child"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// 実機(`--ignored`)。CRI-2・CORE-3・SEC-5・SEC-4・#4809: pod の userns 所有で呼び出し側の直下の子の pid ns は受理し
+    /// （結果は `pod_join_accepted_user_ipc_pid`）、別 userns 所有は `PidOwnerMismatch`、孫の pid ns は `PidNotChild`、
+    /// 呼び出し側自身の pid ns は所有者の検査で `PidOwnerMismatch`。受理した fd で user → ipc → pid の順に `setns` した後に
+    /// fork した子の `/proc/thread-self/ns/pid` の素性が対象の pid ns と一致する。
+    #[test]
+    #[ignore = "needs unprivileged user namespaces and unshare(1); run with --ignored (#4809)"]
+    fn cri2_core3_4809_real_holder_pid_join_identity_and_ownership() {
+        use std::os::unix::fs::MetadataExt as _;
+        let a = FakeHolder::spawn_pid(false);
+        let b = FakeHolder::spawn_pid(false);
+        let nested = FakeHolder::spawn_pid(true);
+        let (a_user, a_ipc, a_pid) = (a.ns("user"), a.ns("ipc"), a.ns("pid_for_children"));
+        let (join, outcome) = pin_pid(&a_user, &a_ipc, &a_pid).expect("accepted");
+        assert_eq!(outcome, PodNamespaceJoinOutcome::AcceptedUserIpcPid);
+        let target = std::fs::metadata(&a_pid).expect("stat");
+        let pid_fd = join.pid_fd().expect("pid fd");
+        assert_eq!(identity(pid_fd).ok(), Some((target.dev(), target.ino())));
+
+        let other = pin_pid(&a_user, &a_ipc, &b.ns("pid_for_children")).expect_err("other pod");
+        assert_eq!(other.error.code(), ErrorCode::PermissionDenied);
+        assert_eq!(
+            other.outcome,
+            Some(PodNamespaceJoinOutcome::PidOwnerMismatch)
+        );
+        let own = pin_pid(&a_user, &a_ipc, "/proc/self/ns/pid").expect_err("own pid ns");
+        assert_eq!(own.outcome, Some(PodNamespaceJoinOutcome::PidOwnerMismatch));
+        // 孫: nested の unshare の子（中段の unshare）の pid_for_children は、nested の pid ns の子。
+        let middle = first_child(nested.child.id());
+        let grandchild_ns = format!("/proc/{middle}/ns/pid_for_children");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::fs::read_link(&grandchild_ns).ok()
+            == std::fs::read_link(format!("/proc/{middle}/ns/pid")).ok()
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "PRECONDITION FAILED: no inner pid ns"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let deep =
+            pin_pid(&nested.ns("user"), &nested.ns("ipc"), &grandchild_ns).expect_err("grandchild");
+        assert_eq!(deep.error.code(), ErrorCode::PermissionDenied);
+        assert_eq!(
+            deep.error.message(),
+            "the pod pid namespace is not a direct child of the caller's"
+        );
+        assert_eq!(deep.outcome, Some(PodNamespaceJoinOutcome::PidNotChild));
+
+        // join の後に fork した子の pid ns の素性。子は確保をしない（多スレッドの試験から fork するため）。
+        let want = (target.dev(), target.ino());
+        let child = crate::sys::fork_single_threaded_with(
+            || true,
+            || {
+                use crate::sys::{self, NsFlag};
+                if sys::setns_fd(join.user_fd(), NsFlag::User).is_err() {
+                    return 10;
+                }
+                if sys::setns_fd(join.ipc_fd(), NsFlag::Ipc).is_err() {
+                    return 11;
+                }
+                if sys::setns_fd(pid_fd, NsFlag::Pid).is_err() {
+                    return 12;
+                }
+                let Ok(grand) = sys::fork_single_threaded_with(
+                    || true,
+                    || {
+                        let Ok(me) = sys::open_ns_file(c"/proc/thread-self/ns/pid") else {
+                            return 21;
+                        };
+                        match identity(me.as_fd()) {
+                            Ok(id) if id == want => 0,
+                            _ => 22,
+                        }
+                    },
+                    23,
+                ) else {
+                    return 13;
+                };
+                wait_exit(grand)
+            },
+            19,
+        )
+        .expect("fork");
+        assert_eq!(
+            wait_exit(child),
+            0,
+            "joined child must enter the target pid ns"
+        );
+        println!(
+            "cri2_core3_4809: pod pid ns join identity, ownership and the forked child verified"
+        );
+    }
+
+    /// 子を期限つき（20 秒）で回収して終了コードを返す（異常終了・期限切れは 255）。
+    fn wait_exit(pid: u32) -> i32 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            match crate::sys::wait_pid_nohang(pid) {
+                Ok(Some(status)) if status & 0x7f == 0 => return (status >> 8) & 0xff,
+                Ok(Some(_)) => return 255,
+                Ok(None) | Err(crate::sys::SysError::Os(crate::sys::EINTR)) => {}
+                Err(_) => return 255,
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = crate::sys::kill_pid(pid, crate::sys::Signal::Kill);
+                return 255;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     /// CRI-2・CORE-3・SEC-1: 呼び出し側自身の namespace への join は fork の前に `PermissionDenied`。

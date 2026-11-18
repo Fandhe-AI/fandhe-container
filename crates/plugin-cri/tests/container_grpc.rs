@@ -2391,6 +2391,10 @@ async fn restart_body(
                 .get_or_insert_with(Default::default)
                 .namespace_options = Some(cri::NamespaceOption {
                 network: cri::NamespaceMode::Node as i32,
+                // kubelet の既定と同じくコンテナごとの pid ns にする（CRI の enum の 0 は `POD`。#4817）。pod の pid ns を
+                // 共有すると、plugin-cri の SIGKILL で保持役が止まり pod-init ごとコンテナが消えるため、running のまま
+                // 再採用する本試験の前提が成り立たない。
+                pid: cri::NamespaceMode::Container as i32,
                 ..Default::default()
             });
         }

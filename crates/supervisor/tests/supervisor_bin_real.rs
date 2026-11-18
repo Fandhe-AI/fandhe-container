@@ -230,10 +230,21 @@ mod linux {
         std::process::exit(0);
     }
 
+    /// 親が config で渡した実行ごとのトークン（`--orphan-token <値>`）。孤児の argv に載せ、親が今回の実行の孤児だけを数える。
+    fn orphan_token_arg() -> String {
+        let args: Vec<String> = std::env::args().collect();
+        args.iter()
+            .position(|a| a == "--orphan-token")
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// 孤児になる子を起動する（stdio はつながない。wait しない）。
     fn spawn_orphan() -> bool {
         Command::new("/probe")
             .args(["--container-probe", "--orphan-child"])
+            .arg(orphan_token_arg())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -460,9 +471,14 @@ mod linux {
                 Probe::Exit7 => r#""/probe","--container-probe""#,
                 Probe::Term => r#""/probe","--container-probe","--term-probe""#,
                 Probe::Mount => r#""/probe","--container-probe","--mount-probe""#,
-                Probe::Orphan => r#""/probe","--container-probe","--orphan-probe""#,
-                Probe::OrphanTerm => r#""/probe","--container-probe","--orphan-term-probe""#,
-            };
+                Probe::Orphan => {
+                    r#""/probe","--container-probe","--orphan-probe","--orphan-token","TOKEN""#
+                }
+                Probe::OrphanTerm => {
+                    r#""/probe","--container-probe","--orphan-term-probe","--orphan-token","TOKEN""#
+                }
+            }
+            .replace("TOKEN", run_token());
             let namespaces = match pod {
                 None => r#"{"type":"pid"},{"type":"mount"},{"type":"uts"},{"type":"ipc"},{"type":"user"}"#
                     .to_owned(),
@@ -1153,8 +1169,7 @@ mod linux {
             drop(out);
             let h = holder.id();
             if let Err(e) = ready {
-                let _ = holder.kill();
-                let _ = holder.wait();
+                reap_bounded(&mut holder, Duration::ZERO);
                 panic!("the pod holder did not report READY: {e:?}");
             }
             let mut pid_owner = Command::new("nsenter")
@@ -1185,10 +1200,8 @@ mod linux {
                     return Self { holder, pid_owner };
                 }
                 if Instant::now() >= deadline {
-                    let _ = pid_owner.kill();
-                    let _ = pid_owner.wait();
-                    let _ = holder.kill();
-                    let _ = holder.wait();
+                    reap_bounded(&mut pid_owner, Duration::ZERO);
+                    reap_bounded(&mut holder, Duration::ZERO);
                     panic!("the pod pid namespace was not ready within 10s");
                 }
                 std::thread::sleep(Duration::from_millis(20));
@@ -1213,12 +1226,10 @@ mod linux {
 
     impl Drop for Pod {
         fn drop(&mut self) {
-            let _ = self.pid_owner.kill();
-            let _ = self.pid_owner.wait();
+            reap_bounded(&mut self.pid_owner, Duration::ZERO);
+            // 停止の合図は stdin の EOF。期限内に終わらなければ kill する。
             drop(self.holder.stdin.take());
-            if self.holder.wait().is_err() {
-                let _ = self.holder.kill();
-            }
+            reap_bounded(&mut self.holder, Duration::from_secs(10));
         }
     }
 
@@ -1228,7 +1239,19 @@ mod linux {
             .unwrap_or_default()
     }
 
-    /// 孤児になる子（`--orphan-child`）のホストの pid（ゾンビは cmdline が空なので数えない）。
+    /// 実行ごとのトークン（pid と起動時刻）。孤児の argv に載せ、並行実行・以前の実行の残りと区別する。
+    fn run_token() -> &'static str {
+        static TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        TOKEN.get_or_init(|| {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            format!("sbr{}x{nanos}", std::process::id())
+        })
+    }
+
+    /// 今回の実行の孤児（argv が `--orphan-child <トークン>` を含む）のホストの pid（ゾンビは cmdline が空なので数えない）。
     fn orphan_pids() -> Vec<u32> {
         let Ok(dir) = std::fs::read_dir("/proc") else {
             return Vec::new();
@@ -1236,10 +1259,37 @@ mod linux {
         dir.flatten()
             .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
             .filter(|pid| {
-                std::fs::read(format!("/proc/{pid}/cmdline"))
-                    .is_ok_and(|c| c.windows(14).any(|w| w == b"--orphan-child"))
+                std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| {
+                    let args: Vec<&[u8]> = c.split(|b| *b == 0).collect();
+                    args.windows(2)
+                        .any(|w| w[0] == b"--orphan-child" && w[1] == run_token().as_bytes())
+                })
             })
             .collect()
+    }
+
+    /// 子を期限つきで回収する。`grace` の間に終わらなければ kill し、さらに 10 秒まで回収を確かめる（REPAIR-5）。
+    fn reap_bounded(child: &mut Child, grace: Duration) {
+        let wait_until = |limit: Duration, child: &mut Child| {
+            let deadline = Instant::now() + limit;
+            while Instant::now() < deadline {
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            false
+        };
+        if wait_until(grace, child) {
+            return;
+        }
+        let _ = child.kill();
+        if !wait_until(Duration::from_secs(10), child) {
+            eprintln!(
+                "supervisor_bin_real: child {} was not reaped within 10s after kill",
+                child.id()
+            );
+        }
     }
 
     /// 孤児の数が `want` になるまで期限つきで待ち、最後の観測を返す。

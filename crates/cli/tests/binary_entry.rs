@@ -1167,15 +1167,27 @@ fn sec4_2480_create_rejected_destination_is_audited() {
                 &id,
             ],
         );
-        assert_eq!(out.status.code(), Some(2), "dest={dest}");
+        // 間欠失敗（#4642）の切り分け用に、落ちたときは終了状態と出力の全文を出す（照合する値は変えない）。
+        let diag = format!(
+            "dest={dest} status={:?} stdout={:?} stderr={:?}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.status.code(), Some(2), "{diag}");
         assert_eq!(
             op_and_code(&out),
             ("create".into(), "INVALID_ARGUMENT".into()),
-            "dest={dest}"
+            "{diag}"
         );
-        assert!(out.stdout.is_empty());
+        assert!(out.stdout.is_empty(), "{diag}");
     }
-    let log = std::fs::read_to_string(root.join("@audit.log")).expect("audit log");
+    let log = std::fs::read_to_string(root.join("@audit.log")).unwrap_or_else(|e| {
+        let entries: Vec<_> = std::fs::read_dir(&root)
+            .map(|d| d.flatten().map(|x| x.file_name()).collect())
+            .unwrap_or_default();
+        panic!("audit log: {e} (state root entries={entries:?})")
+    });
     let lines: Vec<&str> = log.lines().collect();
     assert_eq!(lines.len(), dests.len(), "{log}");
     for (n, line) in lines.iter().enumerate() {

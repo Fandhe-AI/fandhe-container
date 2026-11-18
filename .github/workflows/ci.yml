@@ -3227,6 +3227,12 @@ jobs:
             --src crates/plugin-cri/tests/cri_exec_real.rs --log "${log}" \
             --select '^production_binary_exec_real: port-forward ok: ' --min 5 \
             --forbid 'PRECONDITION FAILED' --forbid 'port-forward FAILED' --summary
+          # 段 S（#4818・CRI-2・SEC-1・SEC-5）: pod の pid 共有（互いの pid・兄弟と pod-init の /proc の遮断・同じ uid の signal・
+          # init の終了後の孤児の停止・pod-init の死での NOTREADY）の成功行 5 行を試験ソースから導出して照合する。pull は増やさない。
+          scripts/check-success-lines.sh --name production_binary_exec_real_pod_pid \
+            --src crates/plugin-cri/tests/cri_exec_real.rs --log "${log}" \
+            --select '^production_binary_exec_real: pod-pid ok: ' --min 5 \
+            --forbid 'PRECONDITION FAILED' --forbid 'pod-pid FAILED' --summary
 
       # production_binary_attach_real（`crates/plugin-cri/tests/cri_attach_real.rs`。libtest の `#[ignore]`。
       # CRI-6・SUP-4・SEC-1・REPAIR-12・#4079）: 本番バイナリ越しに実コンテナ（busybox）へ完全版 Attach を通し、

@@ -6,7 +6,7 @@
 //! `-- --ignored` 指定時のみ動かす（AGENTS.md）。前提が欠けていれば `PRECONDITION FAILED` で終了コード 1（成功を装わない）。
 //!
 //! # シナリオ（各成功行は固定の文字列。`scripts/check-success-lines.sh` が本ファイルのリテラルから導出して照合する）
-//! - A: READY の内容（pid・3 つの namespace の素性を親の `stat` と照合・継承 fd の整理・`uid_map`）
+//! - A: READY の内容（pid・4 つの namespace〔user・ipc・net・mnt〕の素性を親の `stat` と照合・継承 fd の整理〔stdio と空の root の 1 本。#4808〕・`uid_map`）
 //! - B: 保持役の netns に `nsenter` で入った 2 つのプロセスが `127.0.0.1` の TCP で往復できる（`lo` は H1 の API が up にする）
 //! - C: stdin の EOF で終了コード 0、SIGTERM でシグナル 15 の終了
 //! - D: PDEATHSIG を使わない（中間プロセスを SIGKILL しても保持役が残り、stdin の EOF で消える）
@@ -355,15 +355,37 @@ mod linux {
             ("user", h.ready.user()),
             ("ipc", h.ready.ipc()),
             ("net", h.ready.net()),
+            ("mnt", h.ready.mnt()),
         ] {
             assert_eq!(ns_stat(pid, which), (got.dev, got.ino), "{which} identity");
         }
+        // mount ns は保持役が pod の userns で作る（試験プロセスと共有しない。#4808）。
+        let own_mnt = std::fs::metadata("/proc/self/ns/mnt").expect("own mnt");
+        assert_ne!(
+            (own_mnt.dev(), own_mnt.ino()),
+            ns_stat(pid, "mnt"),
+            "the holder must not share the mount namespace"
+        );
         let mut fds: Vec<String> = std::fs::read_dir(format!("/proc/{pid}/fd"))
             .unwrap_or_else(|e| fail(&format!("cannot list fds: {e}")))
             .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
             .collect();
         fds.sort();
-        assert_eq!(fds, ["0", "1", "2"], "only stdio stays open");
+        // stdio と、pod-init の空の root（切り離した tmpfs。中身は 0 件。#4808）の 1 本だけ。root の fd の番号は決めない
+        // （作るときの fsopen の fd が先に番号を取るため。pod-init は fork で受け継ぐので番号に依存しない）。
+        let extra: Vec<&String> = fds
+            .iter()
+            .filter(|f| !["0", "1", "2"].contains(&f.as_str()))
+            .collect();
+        assert_eq!(
+            (fds.len(), extra.len()),
+            (4, 1),
+            "only stdio and the pod root stay open: {fds:?}"
+        );
+        let root_entries = std::fs::read_dir(format!("/proc/{pid}/fd/{}", extra[0]))
+            .unwrap_or_else(|e| fail(&format!("cannot list the pod root: {e}")))
+            .count();
+        assert_eq!(root_entries, 0, "the pod root is empty");
         let map = std::fs::read_to_string(format!("/proc/{pid}/uid_map")).expect("uid_map");
         let first: Vec<&str> = map
             .lines()

@@ -152,6 +152,8 @@ pub enum ViolationReason {
     EstablishMultiThreaded,
     /// `unshare(CLONE_NEWNS)` の前後で mount namespace が変わらなかった。
     EstablishMountNamespaceNotFresh,
+    /// pod の pid ns へ参加した init の PID namespace が、launch で固定した素性と一致しない（#4812）。
+    EstablishJoinedPidNamespaceMismatch,
     /// `mount_proc` の呼び出し元が PID 1 でない（`getpid`）。
     EvidenceCallerNotPid1,
     /// `mount_proc` 呼び出し時の `NSpid` 末尾が 1 でない。
@@ -446,7 +448,7 @@ impl ViolationReason {
     ///
     /// 手書きの理由リストを別に持たず、種別（[`Self::kind`]）で絞って使う（[`Self::from_launch_token`]）。
     /// 足し忘れは単体テスト（`ALL` の件数が `as_str` の分岐数と一致すること）が検出する。
-    pub(super) const ALL: [ViolationReason; 67] = [
+    pub(super) const ALL: [ViolationReason; 68] = [
         Self::NoNamespaces,
         Self::HostnameWithoutUts,
         Self::PidWithoutMount,
@@ -460,6 +462,7 @@ impl ViolationReason {
         Self::EstablishNotNestedPidNamespace,
         Self::EstablishMultiThreaded,
         Self::EstablishMountNamespaceNotFresh,
+        Self::EstablishJoinedPidNamespaceMismatch,
         Self::EvidenceCallerNotPid1,
         Self::EvidenceNspidNotPid1,
         Self::EvidenceMountNamespaceMismatch,
@@ -652,6 +655,7 @@ impl ViolationReason {
             Self::EstablishNotNestedPidNamespace => "establish_not_nested_pid_namespace",
             Self::EstablishMultiThreaded => "establish_multi_threaded",
             Self::EstablishMountNamespaceNotFresh => "establish_mount_namespace_not_fresh",
+            Self::EstablishJoinedPidNamespaceMismatch => "establish_joined_pid_namespace_mismatch",
             Self::EvidenceCallerNotPid1 => "evidence_caller_not_pid1",
             Self::EvidenceNspidNotPid1 => "evidence_nspid_not_pid1",
             Self::EvidenceMountNamespaceMismatch => "evidence_mount_namespace_mismatch",
@@ -726,7 +730,8 @@ impl ViolationReason {
             | Self::EstablishNspidNotPid1
             | Self::EstablishNotNestedPidNamespace
             | Self::EstablishMultiThreaded
-            | Self::EstablishMountNamespaceNotFresh => ViolationKind::EstablishPrecondition,
+            | Self::EstablishMountNamespaceNotFresh
+            | Self::EstablishJoinedPidNamespaceMismatch => ViolationKind::EstablishPrecondition,
             Self::EvidenceCallerNotPid1
             | Self::EvidenceNspidNotPid1
             | Self::EvidenceMountNamespaceMismatch
@@ -860,6 +865,7 @@ impl ViolationReason {
             | Self::EstablishNotNestedPidNamespace
             | Self::EstablishMultiThreaded
             | Self::EstablishMountNamespaceNotFresh
+            | Self::EstablishJoinedPidNamespaceMismatch
             | Self::EvidenceCallerNotPid1
             | Self::EvidenceNspidNotPid1
             | Self::EvidenceMountNamespaceMismatch
@@ -954,6 +960,9 @@ impl ViolationReason {
             }
             Self::EstablishMountNamespaceNotFresh => {
                 "unshare(CLONE_NEWNS) did not move the thread to a new mount namespace"
+            }
+            Self::EstablishJoinedPidNamespaceMismatch => {
+                "the joined PID namespace does not match the pod PID namespace pinned at launch"
             }
             Self::EvidenceCallerNotPid1 => {
                 "mount_proc must be called by PID 1 of the isolated PID namespace"

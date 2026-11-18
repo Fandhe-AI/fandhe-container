@@ -67,9 +67,10 @@
 //!   （`Unimplemented`）。rootful のユーザー定義ネットワークの init 所有 netns は、起動オプションから入る別の入口
 //!   （`pinned_net`。D12・#3069。user namespace の作成前に参加する）で受ける。`RootfulHostRoot` は #2241 で恒久拒否のまま。
 //! - pid の path は受けて `setns(pid)` まで行う（#4809）が、`setns(pid)` は以後に fork した子にだけ効き、その子は
-//!   参加先の PID 1 ではない。制限適用の証跡（`exec::check_establish_preconditions`・`Pid1Target`）は init が PID 1 で
-//!   あることを前提にしているため、joined pid ns の init の証跡（#4812）と縮退経路の拒否（#4813）が入るまで、pid を
-//!   共有するコンテナの launch は証跡の段で fail-closed に止まる。cri は #4817 まで pid の path を出さない。
+//!   参加先の PID 1 ではない。init の mount 分離の証跡は「joined pid ns の init」の種別で、pin 時に取った pid ns の
+//!   素性（`pid_identity`）との一致を PID 1 の代わりに求める（`exec::check_establish_preconditions`・#4812）。exec・
+//!   healthcheck の対象の固定（`Pid1Target`）と reapply は PID 1 を前提にしたままで、縮退経路の拒否（#4813）が入るまで
+//!   pid を共有するコンテナへの exec は fail-closed に拒否される。cri は #4817 まで pid の path を出さない。
 //! - `/dev/shm`（POSIX shm）は共有されない（core がコンテナごとの tmpfs を載せる）。SysV IPC と POSIX mqueue が
 //!   共有される。
 //! - 周辺の未完: 保持役の素性の永続化と再起動後の再採用は #2940、rootless の本番 PodNetworkProvider（pasta）は #2879。
@@ -155,8 +156,12 @@ pub struct NamespaceJoin {
     #[cfg(target_os = "linux")]
     net_identity: Option<(u64, u64)>,
     /// pod の pid namespace（#4809）。`setns` は中間プロセスで行い、以後に fork した init だけが入る。
+    /// `Some` のとき `pid_identity` も `Some`。
     #[cfg(target_os = "linux")]
     pid: Option<Arc<OwnedFd>>,
+    /// pin 時に取った pid の (dev, ino)。init の establish と証跡の再検証が、参加した init の pid ns と照合する（#4812）。
+    #[cfg(target_os = "linux")]
+    pid_identity: Option<(u64, u64)>,
     /// Linux 以外では構築できないことを型で表す。
     #[cfg(not(target_os = "linux"))]
     never: std::convert::Infallible,
@@ -425,6 +430,7 @@ impl NamespaceJoin {
                 return Err(not_child());
             }
         }
+        let pid_identity = pid.as_ref().map(|p| identity(p.as_fd())).transpose()?;
         let outcome = match (net.is_some(), pid.is_some()) {
             (false, false) => O::AcceptedUserIpc,
             (true, false) => O::AcceptedUserIpcNet,
@@ -438,6 +444,7 @@ impl NamespaceJoin {
                 net: net.map(Arc::new),
                 net_identity,
                 pid: pid.map(Arc::new),
+                pid_identity,
             },
             outcome,
         ))
@@ -460,6 +467,7 @@ impl NamespaceJoin {
             net: None,
             net_identity: None,
             pid: None,
+            pid_identity: None,
         }
     }
 
@@ -473,6 +481,7 @@ impl NamespaceJoin {
             net: Some(Arc::new(net)),
             net_identity,
             pid: None,
+            pid_identity: None,
         }
     }
 
@@ -505,6 +514,13 @@ impl NamespaceJoin {
     #[cfg(target_os = "linux")]
     pub(crate) fn pid_fd(&self) -> Option<BorrowedFd<'_>> {
         self.pid.as_ref().map(|p| p.as_fd())
+    }
+
+    /// pin 時に取った pid namespace の素性。init の establish と証跡の再検証が照合する（#4812）。
+    #[cfg(target_os = "linux")]
+    pub(crate) fn pid_identity(&self) -> Option<crate::exec::PidNsIdentity> {
+        self.pid_identity
+            .map(|(dev, ino)| crate::exec::PidNsIdentity::from_parts(dev, ino))
     }
 
     /// net も join するか。
@@ -1000,10 +1016,10 @@ mod tests {
                         let Ok(me) = sys::open_ns_file(c"/proc/thread-self/ns/pid") else {
                             return 21;
                         };
-                        match identity(me.as_fd()) {
-                            Ok(id) if id == want => 0,
-                            _ => 22,
+                        if !matches!(identity(me.as_fd()), Ok(id) if id == want) {
+                            return 22;
                         }
+                        joined_init_establish(join.pid_identity())
                     },
                     23,
                 ) else {
@@ -1017,11 +1033,47 @@ mod tests {
         assert_eq!(
             wait_exit(child),
             0,
-            "joined child must enter the target pid ns"
+            "joined child must enter the target pid ns and pass the joined init evidence"
         );
         println!(
             "cri2_core3_4809: pod pid ns join identity, ownership and the forked child verified"
         );
+        println!(
+            "cri2_core3_4812: joined pid ns init (not PID 1) established mount isolation with the pinned identity"
+        );
+    }
+
+    /// #4812: 参加した pid ns で fork した子（参加先の PID 1 ではない）が、固定した素性で `establish` を通り、証跡の
+    /// 再検証も通ること。別の素性は `unshare` の前に固定の理由で拒否される。戻り値は子の終了コード（0 が成功）。
+    ///
+    /// 使い捨ての子プロセスから呼ぶ（成功すると呼んだプロセスの mount ns が変わる）。glibc の `fork` は malloc の
+    /// ロックを子で作り直すため、子での確保（status の読み取り）は詰まらない。
+    fn joined_init_establish(pinned: Option<crate::exec::PidNsIdentity>) -> i32 {
+        use crate::exec::{IsolationStage, MountIsolation, PidNsIdentity};
+        if std::process::id() == 1 {
+            return 31;
+        }
+        let Some(pinned) = pinned else {
+            return 32;
+        };
+        match MountIsolation::establish_with(None, Some(PidNsIdentity::from_parts(0, 0))) {
+            Err(e)
+                if e.message
+                    == "the joined PID namespace does not match the pod PID namespace pinned at launch" =>
+                {}
+            _ => return 33,
+        }
+        // 従来の経路（PID 1 を求める）では拒否される。
+        if MountIsolation::establish_with(None, None).is_ok() {
+            return 34;
+        }
+        let Ok(evidence) = MountIsolation::establish_with(None, Some(pinned)) else {
+            return 35;
+        };
+        if evidence.verify_caller(IsolationStage::MountProc).is_err() {
+            return 36;
+        }
+        0
     }
 
     /// 子を期限つき（20 秒）で回収して終了コードを返す（異常終了・期限切れは 255）。

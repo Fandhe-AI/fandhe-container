@@ -1115,6 +1115,16 @@ impl StateStore for FileStateStore {
                 "cgroup scope already recorded",
             ));
         }
+        // 記録し直しは、不在を確かめた配置が既存の配置と一致するときだけ（トレイト契約 8・#4814）。
+        let replacement = req.cgroup_scope_replacement();
+        if let Some((_, absent)) = replacement
+            && existing.cgroup() != Some(absent.placement())
+        {
+            return Err(err(
+                ErrorCode::FailedPrecondition,
+                "recorded cgroup placement differs from the confirmed absent one",
+            ));
+        }
         let revision = self.allocate_revision(&mut guard, Some(&existing))?;
         let mut record = StateRecord::new(
             req.status().clone(),
@@ -1127,14 +1137,19 @@ impl StateStore for FileStateStore {
         }
         // cgroup の配置は引き継ぐ（トレイト契約 8。落とすと delete が cgroup を削除しなくなる。
         // TASK-30.3・OCI-6）。配置が無く追記の指定があれば、追記直前の revision を instance として記録する
-        // （start 時の追記。TASK-32・#1314。(Some, Some) は上で拒否済み）。
-        match (existing.cgroup(), req.cgroup_scope()) {
-            (Some(cgroup), _) => record = record.with_cgroup(cgroup.clone()),
-            (None, Some(scope)) => {
+        // （start 時の追記。TASK-32・#1314。(Some, Some) は上で拒否済み）。記録し直しは、照合済みの旧い配置を
+        // 新しいスコープと書き込み直前の revision の組へ置き換える（#4814）。
+        match (existing.cgroup(), req.cgroup_scope(), replacement) {
+            (_, _, Some((scope, _))) => {
                 record =
                     record.with_cgroup(CgroupPlacement::new(scope.clone(), existing.revision()));
             }
-            (None, None) => {}
+            (Some(cgroup), _, None) => record = record.with_cgroup(cgroup.clone()),
+            (None, Some(scope), None) => {
+                record =
+                    record.with_cgroup(CgroupPlacement::new(scope.clone(), existing.revision()));
+            }
+            (None, None, None) => {}
         }
         // 監視状態は指定があれば置き換え、なければ引き継ぐ（トレイト契約 9。CLI 側の status 更新で
         // supervisor の項目を消さないため。SUP-1・TASK-157.2）。
@@ -3535,6 +3550,91 @@ mod tests {
         assert_eq!(fs::read(&state_path).unwrap(), before);
         let next = create(&store, "next");
         assert_eq!(next.revision(), StateRevision::from_raw(3));
+    }
+
+    /// CORE-2・OCI-6・PLUG-1（契約 8・#4814）: 不在を確かめた旧い配置は、`expected_revision` での CAS で新しいスコープと
+    /// 書き込み直前の revision の組へ記録し直せる。証跡の配置が既存と違う・配置が無い・revision が古いときは
+    /// `FailedPrecondition` で `state.json` も revision も変えない。
+    #[test]
+    fn core2_oci6_4814_replace_cgroup_placement_after_confirmed_absence() {
+        use crate::traits::CgroupPlacementAbsence;
+        let t = TmpDir::new("cgreplace");
+        let store = t.open();
+        let rec = create(&store, "web");
+        let old_scope = CgroupScope::new("/user.slice/run-1.scope").unwrap();
+        let new_scope = CgroupScope::new("/user.slice/run-2.scope").unwrap();
+        let state_path = t.path().join("web").join("state.json");
+        let created = || ContainerStatus::created(cid("web"), None);
+        let appended = store
+            .update(
+                &UpdateStateRequest::new(created(), rec.revision())
+                    .with_cgroup_scope(old_scope.clone()),
+            )
+            .unwrap();
+        let old = appended.cgroup().unwrap().clone();
+        assert_eq!(old.instance(), StateRevision::from_raw(0));
+
+        // 証跡の配置が既存と違う（別の instance）・古い revision はどちらも拒否し、何も変えない。
+        let before = fs::read(&state_path).unwrap();
+        let wrong = CgroupPlacementAbsence::confirmed(CgroupPlacement::new(
+            old_scope.clone(),
+            StateRevision::from_raw(9),
+        ));
+        let mismatch = UpdateStateRequest::new(created(), appended.revision())
+            .with_cgroup_scope_replacement(new_scope.clone(), wrong);
+        let e = store.update(&mismatch).unwrap_err();
+        assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(
+            e.message(),
+            "recorded cgroup placement differs from the confirmed absent one"
+        );
+        let absent = CgroupPlacementAbsence::confirmed(old.clone());
+        let stale = UpdateStateRequest::new(created(), rec.revision())
+            .with_cgroup_scope_replacement(new_scope.clone(), absent.clone());
+        assert_eq!(code(store.update(&stale)), "FAILED_PRECONDITION");
+        assert_eq!(fs::read(&state_path).unwrap(), before);
+
+        let replaced = store
+            .update(
+                &UpdateStateRequest::new(created(), appended.revision())
+                    .with_cgroup_scope_replacement(new_scope.clone(), absent.clone()),
+            )
+            .unwrap();
+        assert_eq!(replaced.revision(), StateRevision::from_raw(2));
+        assert_eq!(
+            replaced.cgroup(),
+            Some(&CgroupPlacement::new(
+                new_scope.clone(),
+                StateRevision::from_raw(1)
+            ))
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&state_path).unwrap()).unwrap();
+        assert_eq!(
+            v["cgroupScope"],
+            serde_json::json!("/user.slice/run-2.scope")
+        );
+        assert_eq!(v["cgroupInstance"], serde_json::json!(1));
+        // 同じ証跡の再利用は、既存の配置がもう一致しないので拒否される。
+        let reuse = UpdateStateRequest::new(created(), replaced.revision())
+            .with_cgroup_scope_replacement(old_scope, absent.clone());
+        assert_eq!(code(store.update(&reuse)), "FAILED_PRECONDITION");
+
+        // 配置の無いレコードは記録し直せない（追記を使う）。
+        let plain = create(&store, "plain");
+        let none = UpdateStateRequest::new(
+            ContainerStatus::created(cid("plain"), None),
+            plain.revision(),
+        )
+        .with_cgroup_scope_replacement(new_scope, absent);
+        assert_eq!(code(store.update(&none)), "FAILED_PRECONDITION");
+        assert_eq!(
+            store
+                .get(&GetStateRequest::new(cid("plain")))
+                .unwrap()
+                .cgroup(),
+            None
+        );
     }
 
     /// TASK-30.3・OCI-6: `cgroupScope` / `cgroupInstance` を持たない既存の `state.json`（導入前の版が

@@ -48,11 +48,16 @@ use super::{
 };
 use crate::exec::IsolationPrivilege;
 use crate::observability::OpRecorder;
-use crate::oci_runtime::ContainerCgroupRemover;
+use crate::oci_runtime::{CgroupRemoval, ContainerCgroupRemover};
 use crate::traits::{
-    CgroupPlacement, ContainerId, ContainerState, ErrorCode, StateRecord, StateStore, TraitError,
-    UpdateStateRequest,
+    CgroupPlacement, CgroupPlacementAbsence, ContainerId, ContainerState, ErrorCode, StateRecord,
+    StateStore, TraitError, UpdateStateRequest,
 };
+
+/// 記録の配置のコンテナ cgroup を何も止めずに消す関数（本番は `recorded_scope::remove_recorded_without_kill`。
+/// 試験が実 `/sys/fs/cgroup` の代わりに差し替える）。
+type RemoveRecordedWithoutKill<'f> =
+    &'f dyn Fn(&ContainerId, &CgroupPlacement) -> Result<CgroupRemoval, TraitError>;
 
 /// ストアのエラーを `CgroupError` へ写す。`code` だけを保ち、メッセージは固定文言にする。
 fn store_error(e: &TraitError) -> CgroupError {
@@ -115,30 +120,53 @@ impl DelegatedCgroup {
     /// 回復後（`recover_interrupted_start` が予約を Created へ戻した後）に、記録済みの配置から連鎖を再開する
     /// （段 1 の代わり。#2245・CORE-2・OCI-6・SEC-1）。
     ///
-    /// 回復後のレコードは Created だが配置は記録済みのまま残り、[`Self::record_scope`] は記録済みを拒否し、
-    /// StateStore の契約 8 も配置の上書きを禁じる。そのため delete と再作成なしに start し直す入口として、
-    /// 配置を変えずに次の順で進める（順序は固定。破壊的な操作の前に照合と CAS を済ませる）:
+    /// 回復後のレコードは Created だが配置は記録済みのまま残り、[`Self::record_scope`] は記録済みを拒否する。
+    /// そのため delete と再作成なしに start し直す入口として、次の順で進める（順序は固定。破壊的な操作の前に
+    /// 照合と CAS を済ませる）:
     ///
     /// 1. `observed` が Created・pid なし、かつ配置が記録済みであること（満たさなければ `FailedPrecondition`）
-    /// 2. 検出した委譲スコープが記録済みのスコープと文字列で一致すること（不一致は `FailedPrecondition`。
-    ///    別スコープの cgroup を扱わない fail-closed。ストアにも cgroup にも触れない）
-    /// 3. `observed.revision()` での CAS で状態を書く（配置は契約 8 により引き継がれ、revision だけが進む）。
-    ///    並行する再開を、破壊的な手順 4 の前に直列化する。書いた後に配置が保たれていることを照合する
-    /// 4. 残った `fc-<id>@<instance>` を fd 起点の削除経路で消す（`prepare` は同名の既存 cgroup を拒否するため）。
-    ///    プロセスが居る場合は kill せず、元の code を保って失敗する（止めるのは回復の責務）
+    /// 2. 検出した委譲スコープが記録済みのスコープと **一致する**か、一致しなければ **記録し直す**（#4814。
+    ///    StateStore の契約 8 の記録し直し）。記録し直しは、記録のスコープを検証つきで開いて旧い
+    ///    `fc-<id>@<instance>` を何も止めずに消し（無ければそのまま）、不在の証跡（[`CgroupPlacementAbsence`]）を
+    ///    添えて `observed.revision()` での CAS で新しいスコープと書き込み直前の revision の組を書く（旧い配置を
+    ///    消してから新しい配置を書く）。旧い配置にプロセスが居る（回復していない）ときは何も止めず、ストアにも
+    ///    触れずに `FailedPrecondition`。書いた後に新しい配置になったことを照合する（食い違えば `Internal`）。
+    ///    新しい instance は使われたことのない revision のため残った cgroup は無く、手順 3・4 は飛ばす
+    /// 3. 一致したとき: `observed.revision()` での CAS で状態を書く（配置は契約 8 により引き継がれ、revision だけが
+    ///    進む）。並行する再開を、破壊的な手順 4 の前に直列化する。書いた後に配置が保たれていることを照合する
+    /// 4. 一致したとき: 残った `fc-<id>@<instance>` を fd 起点の削除経路で消す（`prepare` は同名の既存 cgroup を
+    ///    拒否するため）。プロセスが居る場合は kill せず、元の code を保って失敗する（止めるのは回復の責務）
     ///
-    /// 返る [`CgroupScopeRecorded`] は instance が記録済みのままで、以後は `.create_cgroup()` 以下を使う。
+    /// 記録し直しで消すのは、空であることを確かめた旧い cgroup だけである。後続の CAS が負けても（並行する再開・
+    /// 古い `observed`）、旧い配置は記録に残り、delete は `NotPresent` として扱う（何も止めていない）。
+    ///
+    /// 返る [`CgroupScopeRecorded`] の instance は、一致なら記録済みのまま、記録し直しなら新しい値で、以後は
+    /// `.create_cgroup()` 以下を使う。
     ///
     /// 残余: CAS で直列化した後も、先行する再開の `prepare` の後・launch の前に、後続の再開の手順 4 が先行の
     /// 空の cgroup を消しうる。その場合、先行の参加フックは削除済みの cgroup へ参加できず（`cgroup.procs` への
     /// 書き込みが失敗）、launch は fail-closed で失敗する（cgroup の外では起動しない）。
     ///
     /// CLI の `start` は毎回新しい一時 scope で supervisor を起動するため、実運用では検出スコープが記録済みと
-    /// 一致しないことが多い。その扱いは `docs/design/start-chain-resume.md`（オーナー判断待ち）を参照。
+    /// 一致しないことが多く、手順 2 の記録し直しを通る（`docs/design/start-chain-resume.md`。#4779 の決定・案 B）。
     pub fn resume_recorded_scope<'a>(
         &'a self,
         store: &dyn StateStore,
         observed: &StateRecord,
+    ) -> Result<CgroupScopeRecorded<'a>, CgroupError> {
+        self.resume_recorded_scope_with(
+            store,
+            observed,
+            &super::recorded_scope::remove_recorded_without_kill,
+        )
+    }
+
+    /// [`Self::resume_recorded_scope`] の本体。`remove_old` は記録し直しの前に旧い配置を消す関数（試験の継ぎ目）。
+    fn resume_recorded_scope_with<'a>(
+        &'a self,
+        store: &dyn StateStore,
+        observed: &StateRecord,
+        remove_old: RemoveRecordedWithoutKill<'_>,
     ) -> Result<CgroupScopeRecorded<'a>, CgroupError> {
         let step = CgroupStep::ResumeScope;
         let status = observed.status();
@@ -156,10 +184,29 @@ impl DelegatedCgroup {
         };
         let scope = ContainerCgroupRemover::scope(self).map_err(|e| resume_error(&e))?;
         if scope.as_str() != placement.scope().as_str() {
-            return Err(CgroupError::precondition(
-                step,
-                "recorded cgroup scope differs from the delegated scope; delete and recreate the container",
-            ));
+            // 旧い配置を消してから新しい配置を書く（契約 8 の記録し直し。#4814）。
+            remove_old(observed.id(), placement).map_err(|e| absence_error(&e))?;
+            let absent = CgroupPlacementAbsence::confirmed(placement.clone());
+            let updated = store
+                .update(
+                    &UpdateStateRequest::new(status.clone(), observed.revision())
+                        .with_cgroup_scope_replacement(scope.clone(), absent),
+                )
+                .map_err(|e| resume_error(&e))?;
+            let expected = CgroupPlacement::new(scope, observed.revision());
+            if updated.id() != observed.id() || updated.cgroup() != Some(&expected) {
+                return Err(CgroupError::new(
+                    ErrorCode::Internal,
+                    step,
+                    "state store did not record the replaced cgroup placement",
+                ));
+            }
+            return Ok(CgroupScopeRecorded {
+                delegated: self,
+                id: observed.id().clone(),
+                placement: expected,
+                record: updated,
+            });
         }
         // 配置は指定しない（契約 8 により引き継がれる）。revision の CAS だけが目的。
         let updated = store
@@ -195,6 +242,15 @@ fn resume_error(e: &TraitError) -> CgroupError {
         _ => "failed to resume the recorded cgroup scope",
     };
     CgroupError::new(e.code(), CgroupStep::ResumeScope, message)
+}
+
+/// 記録し直しの前の旧い配置の削除（不在の確認）のエラーを `CgroupError` へ写す（`code` を保ち、固定文言）。
+fn absence_error(e: &TraitError) -> CgroupError {
+    CgroupError::new(
+        e.code(),
+        CgroupStep::ResumeScope,
+        "could not confirm that the recorded cgroup placement is absent; recover the container first",
+    )
 }
 
 /// 残った cgroup の削除のエラーを `CgroupError` へ写す（`code` を保ち、パス・errno を含めない固定文言）。
@@ -775,28 +831,32 @@ mod tests {
         assert_eq!(e.step, CgroupStep::ResumeScope);
         assert_eq!(e.message, "container is not in created state");
 
-        // 別の委譲スコープ。
+        // 別の委譲スコープで、旧い配置の不在を確かめられない（プロセスが居る）。ストアは変わらない。
         let back = store
             .update(&UpdateStateRequest::new(
                 ContainerStatus::created(cid("web"), None),
                 reserved.revision(),
             ))
             .unwrap();
-        let other = DelegatedCgroup {
-            path: CgroupPath {
-                components: vec!["other.slice".to_owned(), "y.scope".to_owned()],
-            },
-            fd: OwnedFd::from(std::fs::File::open(&t.0).unwrap()),
-            controllers: ControllerSet::of(&[]),
-            companions: Vec::new(),
+        let other = other_scope(&t.0);
+        let busy = |_: &ContainerId, _: &CgroupPlacement| {
+            Err(TraitError::new(
+                ErrorCode::FailedPrecondition,
+                "container cgroup still has processes; nothing was killed",
+            ))
         };
-        let e = other.resume_recorded_scope(&store, &back).unwrap_err();
+        let e = other
+            .resume_recorded_scope_with(&store, &back, &busy)
+            .unwrap_err();
         assert_eq!(e.code, ErrorCode::FailedPrecondition);
         assert_eq!(e.step, CgroupStep::ResumeScope);
         assert_eq!(
             e.message,
-            "recorded cgroup scope differs from the delegated scope; delete and recreate the container"
+            "could not confirm that the recorded cgroup placement is absent; recover the container first"
         );
+        let stored = store.get(&GetStateRequest::new(cid("web"))).unwrap();
+        assert_eq!(stored.revision(), back.revision());
+        assert_eq!(stored.cgroup(), Some(&placement));
 
         // 古い observed（間に別の update が入った）。
         let _newer = store
@@ -812,6 +872,94 @@ mod tests {
         let stored = store.get(&GetStateRequest::new(cid("web"))).unwrap();
         assert_eq!(stored.cgroup(), Some(&placement));
         assert_eq!(stored.revision(), _newer.revision());
+    }
+
+    /// 別の委譲スコープ（`/other.slice/y.scope`）の代わりに `dir` を使う。
+    fn other_scope(dir: &Path) -> DelegatedCgroup {
+        DelegatedCgroup {
+            path: CgroupPath {
+                components: vec!["other.slice".to_owned(), "y.scope".to_owned()],
+            },
+            fd: OwnedFd::from(std::fs::File::open(dir).unwrap()),
+            controllers: ControllerSet::of(&[]),
+            companions: Vec::new(),
+        }
+    }
+
+    /// CORE-2・OCI-6・SEC-1・PLUG-1（#4814）: 検出スコープが記録と違っても、旧い配置を消して不在を確かめた後なら、
+    /// CAS で新しいスコープと書き込み直前の revision の組へ記録し直して再開する（旧い配置を消してから書く）。
+    /// 古い `observed` では消した後の CAS で負け、記録は変わらない。
+    #[test]
+    fn core2_oci6_4814_resume_replaces_placement_after_confirmed_absence() {
+        let t = TmpDir::new("resume-replace");
+        let delegated = delegated_for_test(&t.0);
+        let store = open_store(&t.0);
+        let created = create(&store, "web");
+        let recorded = delegated.record_scope(&store, &created).unwrap();
+        let old = recorded.placement().clone();
+        let back = recorded.record().clone();
+        drop(recorded);
+        let other = other_scope(&t.0);
+        let order = std::sync::Mutex::new(Vec::new());
+        let remove = |id: &ContainerId, p: &CgroupPlacement| {
+            // 消す時点では、ストアはまだ旧い配置のまま（書く前に消す）。
+            let now = store.get(&GetStateRequest::new(id.clone())).unwrap();
+            order
+                .lock()
+                .unwrap()
+                .push((p.clone(), now.cgroup().cloned()));
+            Ok(CgroupRemoval::Removed)
+        };
+
+        // 古い observed は、消した後の CAS で負ける。
+        let newer = store
+            .update(&UpdateStateRequest::new(
+                ContainerStatus::created(cid("web"), None),
+                back.revision(),
+            ))
+            .unwrap();
+        let e = other
+            .resume_recorded_scope_with(&store, &back, &remove)
+            .unwrap_err();
+        assert_eq!(e.code, ErrorCode::FailedPrecondition);
+        assert_eq!(e.message, "state revision changed");
+        let stored = store.get(&GetStateRequest::new(cid("web"))).unwrap();
+        assert_eq!(stored.cgroup(), Some(&old));
+        assert_eq!(stored.revision(), newer.revision());
+
+        let resumed = other
+            .resume_recorded_scope_with(&store, &newer, &remove)
+            .unwrap();
+        let want = CgroupPlacement::new(
+            crate::traits::CgroupScope::new("/other.slice/y.scope").unwrap(),
+            newer.revision(),
+        );
+        assert_eq!(resumed.placement(), &want);
+        assert_ne!(want.instance(), old.instance());
+        assert_eq!(resumed.record().cgroup(), Some(&want));
+        assert_eq!(resumed.record().status().state(), ContainerState::Created);
+        assert_eq!(
+            store.get(&GetStateRequest::new(cid("web"))).unwrap(),
+            *resumed.record()
+        );
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec![(old.clone(), Some(old.clone())), (old.clone(), Some(old))]
+        );
+        // 記録し直した後は、新しいスコープでの再開が「一致」の経路を通る。
+        let again = store
+            .update(&UpdateStateRequest::new(
+                ContainerStatus::created(cid("web"), None),
+                resumed.record().revision(),
+            ))
+            .unwrap();
+        drop(resumed);
+        let matched = other
+            .resume_recorded_scope_with(&store, &again, &|_: &ContainerId, _: &CgroupPlacement| {
+                panic!("matching scope must not remove the old placement")
+            })
+            .unwrap();
+        assert_eq!(matched.placement(), &want);
     }
 
     /// CORE-3・SEC-1（#2245）: 配置を落とすストアは `Internal` で検出し、cgroup に触れない。

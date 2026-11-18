@@ -360,6 +360,48 @@ pub(super) fn remove_recorded_with(
     open_root: &dyn Fn() -> Result<OwnedFd, CgroupError>,
     open_dir: OpenDir<'_>,
 ) -> Result<CgroupRemoval, TraitError> {
+    remove_recorded_mode_with(
+        id,
+        placement,
+        recorder,
+        SweepMode::KillAll,
+        euid,
+        open_root,
+        open_dir,
+    )
+}
+
+/// 記録された配置のコンテナ cgroup を、`cgroup.kill` を一切書かずに消す（回復後の配置の記録し直しの前提。
+/// CORE-2・OCI-6・SEC-1・#4814）。
+///
+/// `cgroups::DelegatedCgroup::resume_recorded_scope` が、検出スコープと記録のスコープが食い違うときに呼ぶ。
+/// スコープかコンテナ cgroup が無ければ `NotPresent`、空なら消して `Removed`。プロセスが居る（子孫の `exec-*` を
+/// 含む）ときは何も止めずに `FailedPrecondition`（止めるのは回復の責務）。
+pub(crate) fn remove_recorded_without_kill(
+    id: &ContainerId,
+    placement: &CgroupPlacement,
+) -> Result<CgroupRemoval, TraitError> {
+    remove_recorded_mode_with(
+        id,
+        placement,
+        None,
+        SweepMode::UnpopulatedOnly,
+        sys::effective_uid(),
+        &open_cgroup_root,
+        &open_cgroup_dir,
+    )
+}
+
+/// [`remove_recorded_with`]・[`remove_recorded_without_kill`] の本体（`mode` で残留 `exec-*` を止めるかを選ぶ）。
+fn remove_recorded_mode_with(
+    id: &ContainerId,
+    placement: &CgroupPlacement,
+    recorder: Option<&OpRecorder>,
+    mode: SweepMode,
+    euid: u32,
+    open_root: &dyn Fn() -> Result<OwnedFd, CgroupError>,
+    open_dir: OpenDir<'_>,
+) -> Result<CgroupRemoval, TraitError> {
     let scope =
         open_with(placement.scope().as_str(), euid, open_root, open_dir).map_err(removal_error)?;
     match scope {
@@ -369,7 +411,7 @@ pub(super) fn remove_recorded_with(
             id,
             placement.instance(),
             recorder,
-            SweepMode::KillAll,
+            mode,
             euid,
             open_dir,
         ),
@@ -570,6 +612,40 @@ mod tests {
             CgroupRemoval::NotPresent
         );
         assert!(other.is_dir());
+    }
+
+    /// CORE-2・SEC-1（#4814）: kill しない削除は、スコープが無ければ `NotPresent`、`exec-*` にプロセスが居れば
+    /// `cgroup.kill` に書かずディレクトリも残して `FailedPrecondition`。
+    #[test]
+    fn core2_4814_recorded_removal_without_kill_never_kills() {
+        let (_scratch, root) = tmp("nokill");
+        let run_no_kill = || {
+            remove_recorded_mode_with(
+                &cid("c1"),
+                &placement(SCOPE, 7),
+                None,
+                SweepMode::UnpopulatedOnly,
+                real_euid(),
+                &root_of(&root),
+                &open_plain,
+            )
+        };
+        assert_eq!(run_no_kill().expect("absent"), CgroupRemoval::NotPresent);
+        let scope = make_scope(&root, "domain");
+        let ctr = scope.join("fc-c1@7");
+        let exec = ctr.join("exec-1-2");
+        fs::create_dir_all(&exec).expect("mkdir exec");
+        fs::write(ctr.join("cgroup.procs"), "").expect("procs");
+        fs::write(exec.join("cgroup.events"), "populated 1\n").expect("events");
+        fs::write(exec.join("cgroup.procs"), "4242\n").expect("exec procs");
+        fs::write(exec.join("cgroup.kill"), "").expect("kill");
+        let err = run_no_kill().expect_err("populated exec child");
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(
+            fs::read_to_string(exec.join("cgroup.kill")).expect("read"),
+            ""
+        );
+        assert!(exec.is_dir());
     }
 
     /// OCI-6・CORE-2（#2096）: コンテナ cgroup の `cgroup.procs` が空でなければ `FailedPrecondition` で、

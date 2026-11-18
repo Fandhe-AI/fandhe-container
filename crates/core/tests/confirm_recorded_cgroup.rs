@@ -9,8 +9,9 @@
 //! - シナリオ C: 記録のスコープが既に無い → `Ok`・Created
 //! - シナリオ D: 配置の記録が無いレコード → `FailedPrecondition`・Running のまま
 //! - 回復結果の内訳（#2245・REPAIR-4）: A は `Killed`・B は `WasEmpty`・C は `AlreadyAbsent`
-//! - シナリオ C の再開: 記録のスコープと検出スコープが違うため `resume_recorded_scope` は `FailedPrecondition`
-//!   （revision 不変）
+//! - シナリオ C の再開: 記録のスコープと検出スコープが違い、記録のスコープは既に無いため、`resume_recorded_scope` が
+//!   不在を確かめて配置を記録し直す（StateStore の契約 8・#4814）。配置は検出スコープと回復後の revision の組になり、
+//!   revision が 1 つ進む
 //! - シナリオ E（最後に 1 回だけ。`prepare` は自プロセスを退避リーフへ移すため）: 記録のスコープが検出スコープ
 //!   自身のコンテナ cgroup に `sleep` が居る → `Killed` で回復 → `resume_recorded_scope` が空の cgroup を消す →
 //!   `create_cgroup` が同じ `fc-<id>@<instance>` を作り直し、空で、レコードは Created・配置は不変
@@ -250,19 +251,25 @@ mod linux {
             NoProcessEvidence::RecordedCgroup(RecordedCgroupOutcome::AlreadyAbsent)
         );
         assert_eq!(c.state(), ContainerState::Created);
-        // 記録のスコープが検出スコープと違うため、再開は拒否され revision も変わらない。
+        // 記録のスコープが検出スコープと違い、既に無いので、不在を確かめて配置を記録し直して再開する（#4814）。
         let after_c = recovered_c.into_record();
-        let e = delegated
+        let resumed_c = delegated
             .resume_recorded_scope(&c.store, &after_c)
-            .expect_err("scope mismatch");
-        assert_eq!(e.code, ErrorCode::FailedPrecondition);
+            .expect("resume C after replacing the placement");
+        let replaced = resumed_c.placement().clone();
+        assert_eq!(replaced.scope().as_str(), delegated.path());
+        assert_eq!(replaced.instance(), after_c.revision());
+        let stored_c = c
+            .store
+            .get(&GetStateRequest::new(c.id.clone()))
+            .expect("get");
+        assert_eq!(stored_c.cgroup(), Some(&replaced));
+        assert_eq!(stored_c.status().state(), ContainerState::Created);
         assert_eq!(
-            c.store
-                .get(&GetStateRequest::new(c.id.clone()))
-                .expect("get")
-                .revision(),
-            after_c.revision()
+            stored_c.revision(),
+            after_c.revision().next().expect("next revision")
         );
+        drop(resumed_c);
 
         // D: 配置の記録が無い。
         let d = Case::new("cd", None, &scope_dir);

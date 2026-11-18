@@ -91,5 +91,5 @@ supervisor の入口（手順 3 で回復した後に start を続け、配置�
 
 - 既定の集合: `start_chain.rs`（再開の成功・前提の拒否・配置を落とすストア）、`start.rs`（`Unreported`・ログ行のバイト列）、
   `launcher.rs`（3 種の内訳）、`logging/err4_cross_check.rs`（共有検査器）
-- 実機前提: `crates/core/tests/confirm_recorded_cgroup.rs`（回復結果の内訳と、シナリオ E の再開から `create_cgroup`）。
+- 実機前提: `crates/core/tests/confirm_recorded_cgroup.rs`（回復結果の内訳と、シナリオ C の記録し直しによる再開〔#4814〕、シナリオ E の再開から `create_cgroup`）。
   実行と結果の記録は #1477（人間担当）

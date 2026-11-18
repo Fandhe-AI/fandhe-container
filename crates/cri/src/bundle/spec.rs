@@ -520,6 +520,8 @@ pub struct PodNamespacePaths {
     user: String,
     ipc: String,
     net: String,
+    /// 保持役の `pid_for_children`（保持役が pod の pid ns を持つときだけ。#4817）。
+    pid: Option<String>,
 }
 
 /// `/proc/<pid>/ns/<kind>` と完全一致するパスから pid を取り出す。pid は 1 以上 `i32::MAX` 以下の正準な
@@ -566,9 +568,21 @@ impl PodNamespacePaths {
                 user: user.to_owned(),
                 ipc: ipc.to_owned(),
                 net: net.to_owned(),
+                pid: None,
             }),
             _ => Err(CriError::internal("invalid pod namespace path")),
         }
+    }
+
+    /// 保持役が pod の pid namespace を持つとき、`/proc/<pid>/ns/pid_for_children` を足す（CRI-2・CORE-3・SEC-5・#4817）。
+    ///
+    /// pid は user のパスと同じ保持役の pid から導く（#2776 の契約。CRI の値からは作らない）。呼び出し側は、記録の素性に
+    /// pid ns がある（provider が READY の pid ns を `pid_for_children` と照合した。#4816）ときだけ呼ぶ。
+    pub fn with_pid_namespace(mut self) -> Result<Self, CriError> {
+        let pid = holder_pid_of(&self.user, "user")
+            .ok_or_else(|| CriError::internal("invalid pod namespace path"))?;
+        self.pid = Some(format!("/proc/{pid}/ns/pid_for_children"));
+        Ok(self)
     }
 
     /// user namespace のパス。
@@ -585,6 +599,11 @@ impl PodNamespacePaths {
     /// `PodNetworkRequest::holder_namespaces` 経由で provider にも渡る（provider は新しい netns を作らずこれを結線する）。
     pub fn net(&self) -> &str {
         &self.net
+    }
+
+    /// pod の pid namespace のパス（`/proc/<pid>/ns/pid_for_children`。保持役が pid ns を持たなければ `None`。#4817）。
+    pub fn pid(&self) -> Option<&str> {
+        self.pid.as_deref()
     }
 }
 
@@ -926,7 +945,9 @@ fn resolve_mode(field: &'static str, v: i32) -> Result<NamespaceMode, CriError> 
 
 /// コンテナの namespace_options（無ければ sandbox の）を読み、`linux.namespaces` を決める。
 ///
-/// `pod` があり ipc が `POD` のときだけ、ipc と user を既存 namespace への join（`path` 付き）にする。
+/// `pod` があり ipc が `POD` のときだけ、ipc と user を既存 namespace への join（`path` 付き）にする。pid は加えて
+/// `pod` が pid ns のパスを持ち pid が `POD` のときだけ join する（#4817。join した config の pid の path が supervisor の
+/// kill-all〔#4811〕の対象の判定になる）。
 /// `pod_netns` は `POD` モードの network namespace へ join するパス（pod の netns を `NetworkPlugin` 経由で
 /// 作って結線したとき。#2675・CRI-2・NET-1）。`POD` 以外のモードでは使わない。
 fn namespaces<'a>(
@@ -937,27 +958,34 @@ fn namespaces<'a>(
     let default = NamespaceOption::default();
     let o = opts.unwrap_or(&default);
     let mut out = Vec::with_capacity(6);
-    // pid・ipc: POD / CONTAINER はコンテナごとの新しい namespace。ipc の POD だけは供給元があれば join。
-    // NODE は必須 namespace を外す（SEC-1）ため拒否、TARGET は join 未対応。
-    let mut join: Option<&PodNamespacePaths> = None;
-    for (kind, field, v) in [
-        ("pid", "namespace_options.pid", o.pid),
-        ("ipc", "namespace_options.ipc", o.ipc),
-    ] {
-        match resolve_mode(field, v)? {
-            NamespaceMode::Pod if kind == "ipc" && pod.is_some() => {
-                join = pod;
-                out.push(NamespaceOut {
-                    kind,
-                    path: pod.map(PodNamespacePaths::ipc),
-                });
-            }
-            NamespaceMode::Pod | NamespaceMode::Container => {
-                out.push(NamespaceOut { kind, path: None })
-            }
-            NamespaceMode::Node | NamespaceMode::Target => return Err(unsupported(field)),
-        }
+    // pid・ipc: NODE は必須 namespace を外す（SEC-1）ため拒否、TARGET は join 未対応。
+    let pid_mode = resolve_mode("namespace_options.pid", o.pid)?;
+    if matches!(pid_mode, NamespaceMode::Node | NamespaceMode::Target) {
+        return Err(unsupported("namespace_options.pid"));
     }
+    let ipc_mode = resolve_mode("namespace_options.ipc", o.ipc)?;
+    if matches!(ipc_mode, NamespaceMode::Node | NamespaceMode::Target) {
+        return Err(unsupported("namespace_options.ipc"));
+    }
+    // ipc: POD で供給元があれば join、それ以外はコンテナごとの新しい namespace。
+    let join = pod.filter(|_| ipc_mode == NamespaceMode::Pod);
+    // pid: POD で保持役が pod の pid ns を持つときだけ join する（#4817）。core は pid の join を user＋ipc の組に足す形で
+    // しか受けないため、ipc を join しない構成は cri で先に `UNIMPLEMENTED` にする（共有の要求を黙って落とさない）。
+    // sandbox が pid を共有しない（`CONTAINER`）のにコンテナが `POD`（未指定を含む）の食い違いは、コンテナごとの新しい
+    // namespace にする（O3。containerd は sandbox の pid ns に入るので差になる）。
+    let pid_path = match (pid_mode, pod.and_then(PodNamespacePaths::pid)) {
+        (NamespaceMode::Pod, Some(path)) if join.is_some() => Some(path),
+        (NamespaceMode::Pod, Some(_)) => return Err(unsupported("namespace_options.pid")),
+        _ => None,
+    };
+    out.push(NamespaceOut {
+        kind: "pid",
+        path: pid_path,
+    });
+    out.push(NamespaceOut {
+        kind: "ipc",
+        path: join.map(PodNamespacePaths::ipc),
+    });
     out.push(NamespaceOut {
         kind: "mount",
         path: None,

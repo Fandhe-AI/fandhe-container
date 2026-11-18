@@ -3269,7 +3269,20 @@ impl CriRuntimeService {
         // provider を注入したのに保持役が無い Ready の記録は、黙って新しい namespace に降格せず拒否する（fail-closed）。
         let provider_pod_namespaces = if in_flight {
             match (&sandbox.pod_holder, self.pod_holder.is_some()) {
-                (Some(h), _) => Some(crate::bundle::PodNamespacePaths::for_holder_pid(h.pid())?),
+                (Some(h), _) => {
+                    let paths = crate::bundle::PodNamespacePaths::for_holder_pid(h.pid())?;
+                    // 素性に pod の pid ns がある（provider が照合した。#4816）ときだけ pid の path を足す（#4817）。
+                    // 素性の無い保持役（検証が無効な構成・試験用の偽 provider）は pid を共有しない。
+                    Some(
+                        match h
+                            .identity()
+                            .and_then(crate::adapter::HolderIdentity::pid_ns)
+                        {
+                            Some(_) => paths.with_pid_namespace()?,
+                            None => paths,
+                        },
+                    )
+                }
                 (None, true) => {
                     return Err(CriError::failed_precondition(
                         "sandbox holder is unavailable",

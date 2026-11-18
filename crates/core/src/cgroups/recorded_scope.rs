@@ -201,7 +201,15 @@ fn kill_all_with(
         ContainerProbe::Empty => return Ok(none(RecordedCgroupOutcome::WasEmpty)),
         ContainerProbe::Populated(child) => child,
     };
-    // 数えるのは観測のためだけで、読めなくても止めることを優先する（fail-closed は kill の側）。
+    if deadline.saturating_duration_since(Instant::now()).is_zero() {
+        return Err(CgroupError::new(
+            ErrorCode::Timeout,
+            CgroupStep::Cleanup,
+            "deadline passed before the recorded container cgroup could be killed",
+        ));
+    }
+    // 数えるのは観測のためだけで、読めなくても止めることを優先する（fail-closed は kill の側）。期限の判定は読む前に
+    // 済ませ、読みに時間がかかっても `cgroup.kill` は必ず書く（読みで期限を使い切って止めずに返さない）。
     let killed = read_iface(
         CgroupStep::Cleanup,
         child.fd.as_fd(),
@@ -210,13 +218,6 @@ fn kill_all_with(
     )
     .ok()
     .and_then(|text| u32::try_from(text.lines().filter(|l| !l.trim().is_empty()).count()).ok());
-    if deadline.saturating_duration_since(Instant::now()).is_zero() {
-        return Err(CgroupError::new(
-            ErrorCode::Timeout,
-            CgroupStep::Cleanup,
-            "deadline passed before the recorded container cgroup could be killed",
-        ));
-    }
     write_cgroup_kill(&child.fd)?;
     let left = deadline.saturating_duration_since(Instant::now());
     let killed_all = RecordedKillAll {
@@ -785,6 +786,39 @@ mod tests {
         .expect("killed");
         flipper.join().expect("join");
         assert_eq!(out, RecordedCgroupOutcome::Killed);
+        assert_eq!(fs::read_to_string(ctr.join("cgroup.kill")).expect("r"), "1");
+    }
+
+    /// CRI-2・SUP-1・CORE-4（#4811）: 件数の読み取りに失敗しても `cgroup.kill` は書き、件数は `None` で `Killed`
+    /// （数えるのは観測のためだけで、読みの失敗・遅れで止めずに返さない）。
+    #[test]
+    fn cri2_sup1_4811_kill_all_kills_even_when_counting_fails() {
+        let (_scratch, root) = tmp("killall-nocount");
+        let ctr = make_container(&root, "populated 1\n");
+        fs::write(ctr.join("cgroup.kill"), "").expect("kill");
+        // 読めない `cgroup.procs`（ディレクトリ）で件数の読みを失敗させる。
+        fs::create_dir(ctr.join("cgroup.procs")).expect("procs dir");
+        let events = ctr.join("cgroup.events");
+        let flipper = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            let tmp = events.with_extension("tmp");
+            fs::write(&tmp, "populated 0\n").expect("flip tmp");
+            fs::rename(&tmp, &events).expect("flip rename");
+        });
+        let out = kill_all_with(
+            &cid("c1"),
+            &placement(SCOPE, 7),
+            Instant::now() + std::time::Duration::from_secs(5),
+            real_euid(),
+            &root_of(&root),
+            &open_plain,
+        )
+        .expect("killed");
+        flipper.join().expect("join");
+        assert_eq!(
+            (out.outcome, out.killed),
+            (RecordedCgroupOutcome::Killed, None)
+        );
         assert_eq!(fs::read_to_string(ctr.join("cgroup.kill")).expect("r"), "1");
     }
 

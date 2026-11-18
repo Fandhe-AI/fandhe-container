@@ -630,14 +630,19 @@ mod linux {
         match read_ready(out.as_fd(), deadline()) {
             Ok(ready) => Holder { child, ready },
             Err(e) => {
+                // 診断: 終了の仕方（シグナルか終了コードか）と読み手の文言も出す（ERROR フレームはコードしか運ばない）。
                 let mut err = String::new();
-                reap::reap_or_report(&mut child, reap::reap_within());
+                let status = reap::wait_within(&mut child, reap::reap_within());
+                if status.is_err() {
+                    reap::reap_or_report(&mut child, reap::reap_within());
+                }
                 if let Some(mut s) = child.stderr.take() {
                     let _ = s.read_to_string(&mut err);
                 }
                 fail(&format!(
-                    "share-pid holder did not report READY: {:?} stderr={err}",
-                    e.code()
+                    "share-pid holder did not report READY: {:?} ({}) status={status:?} stderr={err}",
+                    e.code(),
+                    e.message()
                 ))
             }
         }

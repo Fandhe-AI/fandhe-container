@@ -109,6 +109,8 @@ fn main() {
             linux::orphan_probe();
         } else if has("--orphan-term-probe") {
             linux::orphan_term_probe();
+        } else if has("--pidns-is") {
+            linux::pidns_probe();
         } else if has("--term-probe") {
             linux::term_probe();
         } else if has("--mount-probe") {
@@ -180,6 +182,11 @@ mod linux {
     use fandhe_container_supervisor::control::ControlSignaler;
     use fandhe_container_supervisor::start_contract::StartReport;
     use fandhe_container_supervisor::state::open_default_store;
+    use fandhe_container_supervisor::stream_exec::channel::{
+        HelperMessage, StdioSend, recv_from_helper, send_stdio_handover,
+    };
+    use fandhe_container_supervisor::stream_exec::helper::{StreamExecArgs, stream_exec_command};
+    use fandhe_container_supervisor::stream_exec::wire::{StdioMask, StreamExecOutcome};
 
     const BIN: &str = env!("CARGO_BIN_EXE_fandhe-container-supervisor");
     /// プローブの終了コード（状態の `Stopped` の終了コードと照合する）。
@@ -265,6 +272,28 @@ mod linux {
         std::thread::sleep(ORPHAN_PROBE_LIFETIME);
         std::process::exit(PROBE_EXIT);
     }
+
+    /// exec で動かすプローブ（シナリオ G。#4813）: 自分の `/proc/self/ns/pid` が `--pidns-is` の値と一致すれば 0、
+    /// 違えば `PIDNS_MISMATCH_EXIT`、読めなければ 9 で終わる。
+    pub fn pidns_probe() {
+        let args: Vec<String> = std::env::args().collect();
+        let want = args
+            .windows(2)
+            .find(|w| w[0] == "--pidns-is")
+            .map(|w| w[1].clone());
+        let got = std::fs::read_link("/proc/self/ns/pid").ok();
+        let code = match (want, got) {
+            (Some(w), Some(g)) if g.to_string_lossy() == w => 0,
+            (Some(_), Some(_)) => PIDNS_MISMATCH_EXIT,
+            _ => 9,
+        };
+        std::process::exit(code);
+    }
+
+    /// `pidns_probe` の不一致の終了コード。
+    const PIDNS_MISMATCH_EXIT: i32 = 3;
+    /// シナリオ G の exec 全体の期限（REPAIR-5）。
+    const EXEC_TIMEOUT: Duration = Duration::from_secs(30);
 
     /// SIGTERM のハンドラを登録し、孤児を作ってから SIGTERM を待つプローブ（シナリオ G）。
     pub fn orphan_term_probe() {
@@ -1394,7 +1423,8 @@ mod linux {
         );
     }
 
-    /// シナリオ G: 共有で制御チャネルの SIGTERM による停止の後に孤児が消える（#4811）。
+    /// シナリオ G: 共有で launch pidfd の経路の exec が pod の pid ns で動き（#4813）、制御チャネルの SIGTERM による停止の後に
+    /// 孤児が消える（#4811）。
     fn scenario_g_pid_shared_stop() {
         let pod = Pod::new();
         let env = Env::with_pod("g", true, Probe::OrphanTerm, Some(&pod));
@@ -1407,6 +1437,24 @@ mod linux {
         };
         shared_orphan(&pod);
         wait_sigterm_handler(pid.get());
+        // pod の pid ns の PID 1 ではない init へ、本番の exec の経路（CRI の Exec と同じ stream-exec helper。launch pidfd で
+        // 対象を固定する）が入り、コマンドが pod の pid ns で動く。対照は期待をホストの pid ns にした不一致（#4813）。
+        let nspid = status_field(&format!("/proc/{pid}/status"), "NSpid:").unwrap_or_default();
+        assert_ne!(
+            nspid.split_whitespace().last(),
+            Some("1"),
+            "the shared init must not be PID 1 of the pod pid namespace: NSpid={nspid}"
+        );
+        assert_eq!(
+            exec_pidns_probe(&env, &id, pid, &pod.pid_ns()),
+            StreamExecOutcome::Exited(0),
+            "exec into the shared container must run in the pod pid namespace"
+        );
+        assert_eq!(
+            exec_pidns_probe(&env, &id, pid, &ns_link("/proc/self/ns/pid")),
+            StreamExecOutcome::Exited(PIDNS_MISMATCH_EXIT as u8),
+            "the probe must tell the host pid namespace apart"
+        );
         let signaler: Arc<dyn ProcessSignaler> = Arc::new(ControlSignaler::for_stop(env.root()));
         kill(
             env.store.as_ref(),
@@ -1429,8 +1477,60 @@ mod linux {
             "kill-all must report one killed process: {lines:?}"
         );
         println!(
-            "supervisor_bin_real: scenario=G ok (pid shared: stopping via the control channel left no orphan)"
+            "supervisor_bin_real: scenario=G ok (pid shared: exec via the launch pidfd ran in the pod pid namespace; stopping via the control channel left no orphan)"
         );
+    }
+
+    /// stream-exec helper（supervisor の bin の再実行。plugin-cri の Exec と同じ経路）で `/probe --pidns-is <want>` を
+    /// 実行し、`Result` の値を返す。stdio は渡さない（mask 0）。helper は期限つきで回収する（REPAIR-5・#4813）。
+    fn exec_pidns_probe(
+        env: &Env,
+        id: &str,
+        pid: std::num::NonZeroU32,
+        want: &str,
+    ) -> StreamExecOutcome {
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+        let args = StreamExecArgs::new(
+            env.root().to_path_buf(),
+            cid(id),
+            pid,
+            EXEC_TIMEOUT,
+            StdioMask::new(0).expect("empty stdio mask"),
+            vec![
+                "/probe".into(),
+                "--container-probe".into(),
+                "--pidns-is".into(),
+                want.into(),
+            ],
+        )
+        .expect("stream-exec args");
+        let (plugin, helper_end) = UnixStream::pair().expect("socketpair");
+        let mut command = stream_exec_command(Path::new(BIN), &args);
+        command
+            .stdin(Stdio::from(OwnedFd::from(helper_end)))
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit());
+        let mut child = command.spawn().expect("spawn the stream-exec helper");
+        // `command` が持つ子側の端は親に残さない（helper の終了で EOF になるように）。
+        drop(command);
+        let deadline = Instant::now() + EXEC_TIMEOUT;
+        if let Err(e) = send_stdio_handover(&plugin, &StdioSend::default(), deadline) {
+            reap_bounded(&mut child, Duration::ZERO);
+            panic!("send the stdio handover: {e:?}");
+        }
+        let outcome = loop {
+            match recv_from_helper(&plugin, deadline) {
+                Ok(HelperMessage::Result(o)) => break o,
+                Ok(_) => {}
+                Err(e) => {
+                    reap_bounded(&mut child, Duration::ZERO);
+                    panic!("the exec channel failed before the result: {e:?}");
+                }
+            }
+        };
+        reap_bounded(&mut child, Duration::from_secs(10));
+        outcome
     }
 
     /// シナリオ H: 共有で `cgroup.kill` を書けなくすると kill-all が失敗し、`--restart on-failure:3` でも再 launch しない

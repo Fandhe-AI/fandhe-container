@@ -134,31 +134,54 @@ fn fail(f: &Fail) -> ExitCode {
 /// フレームを stdout へ書く。読み手が止まって pipe / socket が満杯でも `FRAME_WRITE_TIMEOUT` で見切る（REPAIR-5）。
 ///
 /// スレッドは作らない: pod の pid ns を作った後（`unshare(CLONE_NEWPID)` で `pid_for_children` が自分の pid ns と違う）は
-/// カーネルが `CLONE_THREAD` を `EINVAL` で拒否する（Linux v6.12 `kernel/fork.c` の `copy_process`。#4815）。書けるようになる
-/// まで `poll` で期限つきで待ってから書く。フレームと失敗行は `PIPE_BUF`（4096）より小さく、`POLLOUT` の後の 1 回の書き込みは
-/// pipe では空きのある slot に収まる。
+/// カーネルが `CLONE_THREAD` を `EINVAL` で拒否する（Linux v6.12 `kernel/fork.c` の `copy_process`。#4815）。
 fn write_stdout_bounded(bytes: &[u8]) -> Result<(), ()> {
     write_fd_bounded(std::io::stdout().as_fd(), bytes, FRAME_WRITE_TIMEOUT)
 }
 
+/// `fd` を一時的に `O_NONBLOCK` にして、`EAGAIN` の間は期限まで再試行しながら書き、元のフラグへ戻す。
+///
+/// 書き込み自体が待たないため、他の書き手と pipe を共有していて空きを先に埋められても期限で見切れる。フラグは open file
+/// description の共有の性質のため、期限までの間だけ同じ出力先の他の書き手にも効く（stdout は保持役専用の pipe / socket、
+/// stderr は失敗経路で 1 行書いて終わる直前だけ）。
+///
+/// `O_NONBLOCK` で待たないことが保証される pipe・socket にだけ書き、それ以外（通常ファイル・端末など。停止した FUSE
+/// 上のファイルでは write 自体が止まる）へは書かずに `Err` を返す（REPAIR-5）。stdout は [`check_stdio`] が pipe か socket に
+/// 限っているため、省かれうるのは stderr の失敗行だけで、失敗は終了コードで伝わる。
 fn write_fd_bounded(fd: BorrowedFd<'_>, bytes: &[u8], limit: Duration) -> Result<(), ()> {
+    if is_fifo_or_socket(fd) != Some(true) {
+        return Err(());
+    }
     let deadline = std::time::Instant::now() + limit;
-    loop {
-        match sys::poll_revents_now(fd, sys::POLL_OUT) {
-            Ok(r) if r & sys::POLL_OUT != 0 => break,
-            // 相手が閉じた（`POLLERR`・`POLLHUP`）・`fd` が不正なら書かない。
-            Ok(r) if r != 0 => return Err(()),
-            Ok(_) => {}
+    let was_nonblocking = sys::set_status_nonblocking(fd, true).map_err(|_| ())?;
+    let written = write_nonblocking_until(fd, bytes, deadline);
+    if !was_nonblocking {
+        let _ = sys::set_status_nonblocking(fd, false);
+    }
+    written
+}
+
+fn write_nonblocking_until(
+    fd: BorrowedFd<'_>,
+    mut bytes: &[u8],
+    deadline: std::time::Instant,
+) -> Result<(), ()> {
+    let mut out = File::from(fd.try_clone_to_owned().map_err(|_| ())?);
+    while !bytes.is_empty() {
+        match out.write(bytes) {
+            Ok(0) => return Err(()),
+            Ok(n) => bytes = bytes.get(n..).ok_or(())?,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(());
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
             Err(_) => return Err(()),
         }
-        if std::time::Instant::now() >= deadline {
-            return Err(());
-        }
-        std::thread::sleep(Duration::from_millis(10));
     }
-    let owned = fd.try_clone_to_owned().map_err(|_| ())?;
-    File::from(owned).write_all(bytes).map_err(|_| ())
+    Ok(())
 }
 
 /// 失敗行を stderr へ出す。読み手が止まって pipe が満杯でも終了を妨げないよう期限で見切る（失敗経路でだけ呼ぶ。
@@ -277,16 +300,19 @@ fn check_stdio() -> Result<(), Fail> {
     if !(0..=2).all(sys::fd_is_open) {
         return Err(bad());
     }
-    let kind = |fd: std::os::fd::BorrowedFd<'_>| -> Option<bool> {
-        let t = File::from(fd.try_clone_to_owned().ok()?).metadata().ok()?;
-        let ft = t.file_type();
-        Some(ft.is_fifo() || ft.is_socket())
-    };
-    if kind(std::io::stdin().as_fd()) != Some(true) || kind(std::io::stdout().as_fd()) != Some(true)
+    if is_fifo_or_socket(std::io::stdin().as_fd()) != Some(true)
+        || is_fifo_or_socket(std::io::stdout().as_fd()) != Some(true)
     {
         return Err(bad());
     }
     Ok(())
+}
+
+/// `fd` が pipe（FIFO）か socket か（`fstat` が失敗したら `None`）。
+fn is_fifo_or_socket(fd: BorrowedFd<'_>) -> Option<bool> {
+    let t = File::from(fd.try_clone_to_owned().ok()?).metadata().ok()?;
+    let ft = t.file_type();
+    Some(ft.is_fifo() || ft.is_socket())
 }
 
 fn set_non_dumpable() -> Result<(), Fail> {
@@ -567,5 +593,42 @@ mod tests {
         assert!(!is_initial_uid_map("         0       1000          1\n"));
         assert!(!is_initial_uid_map("         0          0          1\n"));
         assert!(!is_initial_uid_map(""));
+    }
+
+    /// REPAIR-5・#4815: 読み手の止まった満杯の pipe への書き込みは期限で見切り、`O_NONBLOCK` を元へ戻す。読めれば全部届く。
+    #[test]
+    fn repair5_4815_write_fd_bounded_gives_up_on_full_pipe() {
+        let (_r, w) = std::io::pipe().expect("pipe");
+        let started = std::time::Instant::now();
+        let big = vec![7u8; 1 << 20];
+        assert_eq!(
+            write_fd_bounded(w.as_fd(), &big, Duration::from_millis(200)),
+            Err(())
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(
+            sys::set_status_nonblocking(w.as_fd(), false).ok(),
+            Some(false)
+        );
+
+        let (mut r2, w2) = std::io::pipe().expect("pipe");
+        assert_eq!(
+            write_fd_bounded(w2.as_fd(), b"ready\n", Duration::from_secs(1)),
+            Ok(())
+        );
+        drop(w2);
+        let mut got = Vec::new();
+        r2.read_to_end(&mut got).expect("read");
+        assert_eq!(got, b"ready\n");
+
+        // 通常ファイルへは O_NONBLOCK が効かないため書かない。
+        let dir = std::env::temp_dir().join(format!("repair5-4815-{}", std::process::id()));
+        let file = File::create(&dir).expect("create");
+        assert_eq!(
+            write_fd_bounded(file.as_fd(), b"x", Duration::from_secs(1)),
+            Err(())
+        );
+        assert_eq!(file.metadata().expect("stat").len(), 0);
+        let _ = std::fs::remove_file(&dir);
     }
 }

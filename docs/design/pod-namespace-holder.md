@@ -129,10 +129,32 @@
 
 ### `/dev/shm` の共有（方式の比較。採否は O6）
 
-- 案 A（推奨候補）: 保持役が pod の userns で mount ns を作り tmpfs（64 MiB・`nosuid,nodev,noexec,mode=1777`）を載せる。コンテナの init は `pivot_root` の前に保持役の mnt ns の fd へ `setns` して `open_tree(OPEN_TREE_CLONE)` で複製を取り、自分の mnt ns に戻って `move_mount` で rootfs の `/dev/shm` に載せる。カーネルの条件（`may_copy_tree`・anon ns の `move_mount`・`mntns_install` の権限）の一次情報と実機の PoC が前提で、現時点は未検証
+- 案 A（推奨候補）: 保持役が pod の userns で mount ns を作り tmpfs（64 MiB・`nosuid,nodev,noexec,mode=1777`）を載せる。コンテナの init は `pivot_root` の前に保持役の mnt ns の fd へ `setns` して `open_tree(OPEN_TREE_CLONE)` で複製を取り、自分の mnt ns に戻って `move_mount` で rootfs の `/dev/shm` に載せる。カーネルの条件は Linux v6.12 の原文で確かめ、非特権の user + mount namespace の PoC も通った（#4806。下の脚注「案 A の一次情報と PoC」）
 - 案 B: plugin-cri の状態ルート下の pod ごとのディレクトリを bind する。簡単だがサイズ上限が無く、利用者のセッションの tmpfs を埋める DoS になる
 - 案 C: 共有しない（現状）。SysV IPC と mqueue は共有される
 - 採否が決まるまで、cri-config-acceptance.md の「既知の差」に現状を明記したままにする
+
+#### 脚注: 案 A の一次情報と PoC（S0・#4806）
+
+原文は Linux `v6.12`（tag の commit `06090c9b622a7e1f797e775db4c035e0d779b76e`）。行番号はこの tag のもの。
+
+| 段 | 条件 | 原文（ファイル・関数・行） |
+| -- | ---- | -------------------------- |
+| 1. 保持役が pod の userns で mount ns を作り tmpfs を載せる | `unshare(CLONE_NEWNS)` の新しい ns の所有者は呼び出し側の userns（`alloc_mnt_ns(user_ns, …)`）。userns をまたぐ複製は shared を slave にする | `kernel/nsproxy.c` `create_new_namespaces` 78 行（`copy_mnt_ns`）・`fs/namespace.c` `copy_mnt_ns` 3916・3935・3942〜3943 行 |
+| | tmpfs は userns の中でマウントできる | `mm/shmem.c` の `shmem_fs_type` の `.fs_flags = FS_USERNS_MOUNT \| FS_ALLOW_IDMAP`（4946 行） |
+| 2. init が保持役の mnt ns へ `setns` | 参加先の ns の所有 userns と、自分の userns の両方で権限が要る（`CAP_SYS_ADMIN`・`CAP_SYS_CHROOT`）。anon ns は不可。`fs_struct` を共有していないこと（`fs->users == 1`。単一スレッドの fork 子で満たす） | `fs/namespace.c` `mntns_install` 5747〜5789 行（権限 5756〜5759・anon 5761・`fs->users` 5764） |
+| 2. `open_tree(OPEN_TREE_CLONE)` で複製 | 呼び出し側の今の ns の所有 userns の `CAP_SYS_ADMIN`（`may_mount`） | `fs/namespace.c` `open_tree` 2839〜2888 行（2865 行）・`may_mount` 1974〜1977 行 |
+| | 複製元が呼び出し側の今の mount ns にあること（`check_mnt`）。参加してから開く理由。複製は `MNT_LOCKED` が外れ、呼び出し側の ns の userns が所有する anon ns に入る | `fs/namespace.c` `__do_loopback` 2728〜2750 行（`check_mnt` 2735・`MNT_LOCKED` 2747）・`check_mnt` 964〜967 行・`open_detached_copy` 2801〜2837 行 |
+| 3. 自分の mnt ns へ戻り `move_mount` で載せる | 入口で `may_mount`。載せ先は自分の ns にあること、移すものは接続されていない anon ns の root であること、`MNT_LOCKED` でないこと、ディレクトリ同士であること | `fs/namespace.c` `move_mount` 4230〜4286 行（`may_mount` 4239）・`do_move_mount` 3270〜3364 行（3296〜3316 行）・`fs/mount.h` `is_anon_ns` 143〜146 行 |
+
+補足: issue に書いた `may_copy_tree` は v6.12 には無い。v6.12 の `open_tree` は「今の ns にあるマウントだけを複製できる」（`check_mnt`）ので、保持役の mnt ns へ参加してから複製する手順が要る（案 A の手順のまま）。
+
+PoC: `crates/core/src/oci_runtime/namespace_join.rs` の実機前提試験 `cri2_core3_4806_shm_clone_via_holder_mnt_ns`（`--ignored`）。
+
+- 構成: 保持役の代わり（`unshare --user --map-root-user --mount` の中で tmpfs を載せる）と、init の代わり（その userns に参加して自分の mount ns を作った fork 子）で 3 段を通す
+- 照合: 載せ先の `nosuid,nodev,noexec`（`fstatfs`）、大きさ `size=65536k`（mountinfo）、両方向の内容の一致、試験プロセスの ns に付かないこと
+- 結果: 非特権の uid 1000・カーネル 7.2（OrbStack の Linux）で成功した。CI の platform-ci（ubuntu の AppArmor 緩和後）でも、namespace_join の実機前提のステップで回す
+- 実装単位: S1（保持役の shm の tmpfs。#4821）・S2（`setns` の往復による複製と載せる処理。#4822）・S3（受け渡し。#4823）
 
 ### オーナー確認事項（#4607）
 

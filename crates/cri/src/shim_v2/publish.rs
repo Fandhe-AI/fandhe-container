@@ -998,6 +998,13 @@ pub(crate) mod testkit {
     use super::{PublishDrain, PublishLog, TaskExecAdded, TaskExecStarted};
     use crate::shim_v2::task_api::Timestamp;
 
+    /// 子が自分で終わる（`exit_status` を照合する）場面の publish の期限。上限の 60 秒。
+    ///
+    /// 試験の待ちの上限（10〜20 秒）より長いので、負荷で子の起動が遅れても `deadline` へ分類が振れない（#4831・REPAIR-12）。
+    /// 短い期限（400 ms）では、macOS の並列実行で作りたてのスクリプトの最初の起動が期限を超えた。
+    #[cfg(unix)]
+    pub(crate) const EXIT_CASE_TIMEOUT: Duration = Duration::from_secs(60);
+
     /// 捕捉用の出力先。
     #[cfg(unix)]
     #[derive(Default)]
@@ -1504,7 +1511,7 @@ mod unix_tests {
             let dir = test_root::test_root("pub", &format!("f4156-{i}"));
             let bin = make_script(&dir, "fake", &failing_body());
             let log = Arc::new(CaptureLog::default());
-            let p = publisher(&bin, Duration::from_secs(5), log.clone());
+            let p = publisher(&bin, EXIT_CASE_TIMEOUT, log.clone());
             let topic = ev.topic();
             p.publish(ev);
             assert!(wait_until(Duration::from_secs(10), || !log
@@ -1558,7 +1565,7 @@ mod unix_tests {
         let dir = test_root::test_root("pub", "fail");
         let bin = make_script(&dir, "fake", &failing_body());
         let log = Arc::new(CaptureLog::default());
-        let p = publisher(&bin, Duration::from_secs(5), log.clone());
+        let p = publisher(&bin, EXIT_CASE_TIMEOUT, log.clone());
         p.publish(sample());
         assert!(wait_until(Duration::from_secs(10), || !log
             .0
@@ -1745,7 +1752,7 @@ mod unix_tests {
         assert_eq!(got[0].reaped, Some(true));
     }
 
-    /// REPAIR-5・#4223: 相手が読まない stream への書き込みは `WouldBlock` で戻り（未送信が残る）、閉じた相手へは `EPIPE` で失敗する。
+    /// REPAIR-5・#4223・#4789: 相手が読まない stream への書き込みは `WouldBlock` で戻り（未送信が残る）、閉じた相手へは有限回のうちに `EPIPE` で失敗する。
     #[test]
     fn repair5_4223_write_helper_never_blocks() {
         use std::os::unix::net::UnixStream;
@@ -1758,7 +1765,22 @@ mod unix_tests {
         assert!(!rest.is_empty() && rest.len() < big.len());
         assert!(started.elapsed() < Duration::from_secs(2));
         drop(b);
-        let err = unix::write_some(&mut a, &mut rest).unwrap_err();
+        // 並行する試験が子を起動している間は、fork から exec までの子が `b` の複製を持ち、相手がまだ開いて見える
+        // （`Ok(false)`）。複製は exec（CLOEXEC）で閉じるので、有限回のうちに失敗へ変わることを照合する（#4789）。
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        let err = loop {
+            match unix::write_some(&mut a, &mut rest) {
+                Err(e) => break e,
+                Ok(done) => {
+                    assert!(!done && !rest.is_empty(), "closed peer must not accept all");
+                    assert!(
+                        std::time::Instant::now() < until,
+                        "write to a closed peer kept succeeding"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        };
         assert!(
             matches!(err.raw_os_error(), Some(e) if e == 32 /* EPIPE */)
                 || err.kind() == std::io::ErrorKind::BrokenPipe,

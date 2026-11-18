@@ -998,6 +998,13 @@ pub(crate) mod testkit {
     use super::{PublishDrain, PublishLog, TaskExecAdded, TaskExecStarted};
     use crate::shim_v2::task_api::Timestamp;
 
+    /// 子が自分で終わる（`exit_status` を照合する）場面の publish の期限。上限の 60 秒。
+    ///
+    /// 試験の待ちの上限（10〜20 秒）より長いので、負荷で子の起動が遅れても `deadline` へ分類が振れない（#4831・REPAIR-12）。
+    /// 短い期限（400 ms）では、macOS の並列実行で作りたてのスクリプトの最初の起動が期限を超えた。
+    #[cfg(unix)]
+    pub(crate) const EXIT_CASE_TIMEOUT: Duration = Duration::from_secs(60);
+
     /// 捕捉用の出力先。
     #[cfg(unix)]
     #[derive(Default)]
@@ -1504,7 +1511,7 @@ mod unix_tests {
             let dir = test_root::test_root("pub", &format!("f4156-{i}"));
             let bin = make_script(&dir, "fake", &failing_body());
             let log = Arc::new(CaptureLog::default());
-            let p = publisher(&bin, Duration::from_secs(5), log.clone());
+            let p = publisher(&bin, EXIT_CASE_TIMEOUT, log.clone());
             let topic = ev.topic();
             p.publish(ev);
             assert!(wait_until(Duration::from_secs(10), || !log
@@ -1558,7 +1565,7 @@ mod unix_tests {
         let dir = test_root::test_root("pub", "fail");
         let bin = make_script(&dir, "fake", &failing_body());
         let log = Arc::new(CaptureLog::default());
-        let p = publisher(&bin, Duration::from_secs(5), log.clone());
+        let p = publisher(&bin, EXIT_CASE_TIMEOUT, log.clone());
         p.publish(sample());
         assert!(wait_until(Duration::from_secs(10), || !log
             .0

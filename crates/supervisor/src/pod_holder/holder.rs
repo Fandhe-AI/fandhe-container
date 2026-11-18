@@ -144,7 +144,14 @@ fn write_stdout_bounded(bytes: &[u8]) -> Result<(), ()> {
 /// 書き込み自体が待たないため、他の書き手と pipe を共有していて空きを先に埋められても期限で見切れる。フラグは open file
 /// description の共有の性質のため、期限までの間だけ同じ出力先の他の書き手にも効く（stdout は保持役専用の pipe / socket、
 /// stderr は失敗経路で 1 行書いて終わる直前だけ）。
+///
+/// `O_NONBLOCK` で待たないことが保証される pipe・socket にだけ書き、それ以外（通常ファイル・端末など。停止した FUSE
+/// 上のファイルでは write 自体が止まる）へは書かずに `Err` を返す（REPAIR-5）。stdout は [`check_stdio`] が pipe か socket に
+/// 限っているため、省かれうるのは stderr の失敗行だけで、失敗は終了コードで伝わる。
 fn write_fd_bounded(fd: BorrowedFd<'_>, bytes: &[u8], limit: Duration) -> Result<(), ()> {
+    if is_fifo_or_socket(fd) != Some(true) {
+        return Err(());
+    }
     let deadline = std::time::Instant::now() + limit;
     let was_nonblocking = sys::set_status_nonblocking(fd, true).map_err(|_| ())?;
     let written = write_nonblocking_until(fd, bytes, deadline);
@@ -293,16 +300,19 @@ fn check_stdio() -> Result<(), Fail> {
     if !(0..=2).all(sys::fd_is_open) {
         return Err(bad());
     }
-    let kind = |fd: std::os::fd::BorrowedFd<'_>| -> Option<bool> {
-        let t = File::from(fd.try_clone_to_owned().ok()?).metadata().ok()?;
-        let ft = t.file_type();
-        Some(ft.is_fifo() || ft.is_socket())
-    };
-    if kind(std::io::stdin().as_fd()) != Some(true) || kind(std::io::stdout().as_fd()) != Some(true)
+    if is_fifo_or_socket(std::io::stdin().as_fd()) != Some(true)
+        || is_fifo_or_socket(std::io::stdout().as_fd()) != Some(true)
     {
         return Err(bad());
     }
     Ok(())
+}
+
+/// `fd` が pipe（FIFO）か socket か（`fstat` が失敗したら `None`）。
+fn is_fifo_or_socket(fd: BorrowedFd<'_>) -> Option<bool> {
+    let t = File::from(fd.try_clone_to_owned().ok()?).metadata().ok()?;
+    let ft = t.file_type();
+    Some(ft.is_fifo() || ft.is_socket())
 }
 
 fn set_non_dumpable() -> Result<(), Fail> {
@@ -610,5 +620,15 @@ mod tests {
         let mut got = Vec::new();
         r2.read_to_end(&mut got).expect("read");
         assert_eq!(got, b"ready\n");
+
+        // 通常ファイルへは O_NONBLOCK が効かないため書かない。
+        let dir = std::env::temp_dir().join(format!("repair5-4815-{}", std::process::id()));
+        let file = File::create(&dir).expect("create");
+        assert_eq!(
+            write_fd_bounded(file.as_fd(), b"x", Duration::from_secs(1)),
+            Err(())
+        );
+        assert_eq!(file.metadata().expect("stat").len(), 0);
+        let _ = std::fs::remove_file(&dir);
     }
 }

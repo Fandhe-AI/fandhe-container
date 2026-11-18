@@ -252,6 +252,9 @@ pub struct Running {
     /// seccomp の通知への応答ハブ（`StartDeps::seccomp_hub` が `Some` のときだけ。`run_supervised` が初回の listener を
     /// 渡し、全終了経路で畳む。再起動後の listener は `relauncher` が同じハブへ渡す。SEC-4・#2025）。
     pub seccomp: Option<Arc<SeccompNotifyHub>>,
+    /// pod の pid namespace を共有するか（core の `StartedContainer::shares_pod_pid_namespace`）。真なら init の終了時と
+    /// 停止時にコンテナの cgroup を kill-all する（CRI-2・SUP-1・CORE-4・#4811。`crate::pid_share`）。
+    pub kill_all_on_init_exit: bool,
 }
 
 /// spec を捕捉できなかったときの再 launch（常に失敗させる。fail-closed）。
@@ -1553,6 +1556,7 @@ fn launch_prepared(
     // 8（予約は作業スレッドで済ませてある。ここは launcher の呼び出しと Running の記録だけ）
     match launch_claimed(&bounded, recorder, &launcher, *claimed, timeouts) {
         Ok(started) => {
+            let kill_all_on_init_exit = started.shares_pod_pid_namespace();
             let (record, process) = started.into_parts();
             let instance = record.cgroup().map(|c| c.instance());
             let captured = capturing.captured_spec();
@@ -1576,6 +1580,7 @@ fn launch_prepared(
                             instance,
                             logs,
                             seccomp,
+                            kill_all_on_init_exit,
                         },
                     };
                 }
@@ -1606,6 +1611,7 @@ fn launch_prepared(
                 instance,
                 logs,
                 seccomp,
+                kill_all_on_init_exit,
             })
         }
         // Timeout を含むすべての失敗を同じ確認に通す。呼び出し境界の期限超過なら予約（Running・pid なし）が残るので
@@ -2044,6 +2050,7 @@ pub fn run_supervised_with_health(
         instance,
         logs,
         seccomp,
+        kill_all_on_init_exit,
     } = running;
     // 捕捉ハブが無いときは読み取り側を取り出さない（取り出して捨てるとコンテナが SIGPIPE を受ける）。
     if let Some(hub) = &logs
@@ -2090,7 +2097,10 @@ pub fn run_supervised_with_health(
         id,
         process,
         relauncher,
-        instance,
+        Supervised {
+            instance,
+            kill_all_on_init_exit,
+        },
         restart,
         timeouts,
         stop,
@@ -2107,6 +2117,25 @@ pub fn run_supervised_with_health(
     code
 }
 
+/// [`supervise_running`] へ渡す、start の結果から決まる値（引数の数を増やさないための束）。
+struct Supervised {
+    /// start が返したレコードの cgroup の instance（[`Running::instance`]）。
+    instance: Option<StateRevision>,
+    /// init の終了時と停止時の kill-all（[`Running::kill_all_on_init_exit`]）。
+    kill_all_on_init_exit: bool,
+}
+
+/// 記録から配置を読み直して kill-all する（停止の経路。読めなければ配置なしとして扱い、結果はログに残す。#4811）。
+fn kill_remaining_recorded(store: &Arc<dyn StateStore>, id: &ContainerId) {
+    let placement = store
+        .get(&fandhe_container_core::traits::GetStateRequest::new(
+            id.clone(),
+        ))
+        .ok()
+        .and_then(|r| r.cgroup().cloned());
+    let _ = crate::pid_share::kill_remaining(id, placement.as_ref());
+}
+
 /// [`run_supervised`] の監視と回収の本体（出力の捕捉は呼び出し側が担う）。
 // 理由: 入口 `run_supervised` が受けた store・id・process・relauncher・instance・restart・timeouts・stop は
 // いずれも独立に所有・借用の区別が要る値で、束ねる型を作ると呼び出し側の分解コードが増えるだけのため引数のまま渡す。
@@ -2116,12 +2145,16 @@ fn supervise_running(
     id: ContainerId,
     process: Box<dyn LaunchedProcess>,
     relauncher: Arc<dyn Relauncher>,
-    instance: Option<StateRevision>,
+    supervised: Supervised,
     restart: RestartPolicy,
     timeouts: &StartTimeouts,
     stop: &StopToken,
     health: Option<&HealthWiring>,
 ) -> u8 {
+    let Supervised {
+        instance,
+        kill_all_on_init_exit,
+    } = supervised;
     let mut state = match SupervisedState::attach(Arc::clone(&store), id.clone()) {
         Ok(s) => s,
         Err(e) => {
@@ -2142,7 +2175,7 @@ fn supervise_running(
             .map(|r| (m, r))
     });
     let (monitor_config, restart_config) = match configs {
-        Ok(c) => c,
+        Ok((m, r)) => (m.with_kill_all_on_init_exit(kill_all_on_init_exit), r),
         Err(e) => {
             log_event("config_invalid", Some(e.code()));
             let disposed = dispose(Some(process), None, timeouts);
@@ -2179,6 +2212,10 @@ fn supervise_running(
             ..
         }) => {
             let disposed = dispose(process, Some(&late), timeouts);
+            // 停止で init を回収した後も、pid を共有するコンテナでは子孫が残るため cgroup ごと止める（#4811）。
+            if kill_all_on_init_exit {
+                kill_remaining_recorded(&store, &id);
+            }
             finish_disposed_explicit(&store, &id, instance, disposed, 0, explicit_stop_pending)
         }
         Ok(SuperviseOutcome::RelaunchFailed {

@@ -175,6 +175,7 @@ pub const LAUNCHER_REPLY_GRACE: Duration = Duration::from_secs(1);
 pub struct StartedContainer {
     record: StateRecord,
     process: Box<dyn LaunchedProcess>,
+    shares_pod_pid_namespace: bool,
 }
 
 impl StartedContainer {
@@ -186,6 +187,12 @@ impl StartedContainer {
     /// 起動済みプロセスのハンドル。
     pub fn process(&self) -> &dyn LaunchedProcess {
         self.process.as_ref()
+    }
+
+    /// pod の pid namespace を共有するか（[`LaunchSpec::shares_pod_pid_namespace`]）。真なら監視側は init の終了時と
+    /// 停止時にコンテナの cgroup を kill-all する（CRI-2・SUP-1・#4811）。
+    pub fn shares_pod_pid_namespace(&self) -> bool {
+        self.shares_pod_pid_namespace
     }
 
     /// 状態とハンドルに分解する（ハンドルの所有権を監視側へ移す）。
@@ -725,6 +732,7 @@ fn launch_inner(
 
     let launch_timeout = timeouts.launch();
     let terminate_timeout = timeouts.terminate();
+    let shares_pod_pid_namespace = spec.shares_pod_pid_namespace();
     let l = Arc::clone(launcher);
     // 実行スレッドが launch を終えて後始末を済ませるまで、プロセス内の予約を保持する（CORE-2）。
     let hold = Arc::clone(&reservation);
@@ -785,7 +793,11 @@ fn launch_inner(
     }
     match store.update(&running_update) {
         // ハンドルは呼び出し元（監視・回収の所有者）へ引き渡す（捨てると回収できない。CORE-1）。
-        Ok(record) => Ok(StartedContainer { record, process }),
+        Ok(record) => Ok(StartedContainer {
+            record,
+            process,
+            shares_pod_pid_namespace,
+        }),
         Err(err) => {
             // 状態を記録できないまま生きたプロセスを残さない。終了できなかった・上限を超えた場合は
             // 未記録プロセスが残り得ることを呼び出し元へ伝える（元のエラーで隠さない。予約は残す）。

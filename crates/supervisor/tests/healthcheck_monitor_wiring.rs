@@ -474,6 +474,7 @@ fn run_supervised_once(health: Option<HealthWiring>, store: &Arc<MemStore>) -> u
         instance: None,
         logs: None,
         seccomp: None,
+        kill_all_on_init_exit: false,
     };
     let dyn_store: Arc<dyn StateStore> = store.clone();
     let code = run_supervised_with_health(

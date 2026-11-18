@@ -93,6 +93,7 @@ pub mod netns_dial;
 pub mod netns_holder;
 #[cfg(target_os = "linux")]
 pub mod pasta_attach;
+mod pid_share;
 pub mod pod_holder;
 pub mod privilege;
 pub mod restart;

@@ -642,6 +642,23 @@ impl LaunchSpec {
         self.namespace_join.as_ref()
     }
 
+    /// pod の pid namespace へ参加するか（#4809 の pid の join を含む）。
+    ///
+    /// 真なら init が終わっても子孫は pod の PID 1 へ付け替わって残るため、監視側（supervisor）は init の終了時と停止時に
+    /// コンテナの cgroup を kill-all する（CRI-2・SUP-1・CORE-4・#4811。containerd の shim の `ShouldKillAllOnExit` と同じ）。
+    pub fn shares_pod_pid_namespace(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.namespace_join
+                .as_ref()
+                .is_some_and(|j| j.pid_fd().is_some())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+
     /// 検証済みの sysfs の指定を載せる（`start` だけが呼ぶ。#2020）。
     pub(super) fn with_sysfs(mut self, sysfs: Option<SysfsMountSpec>) -> Self {
         self.sysfs = sysfs;

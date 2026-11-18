@@ -1834,7 +1834,7 @@ mod tests {
         Fake::new(items).0
     }
 
-    /// REPAIR-5・SEC-4・#2632: 記録先が詰まっても、k 件目（1 始まり）の応答は `k × 応答期限` 以上かつ余裕を足した範囲内。
+    /// REPAIR-5・SEC-4・#2632: 記録先が詰まっても、k 件目（1 始まり）の応答は `k × 応答期限` 以上かつ 1 件あたりの余裕を足した範囲内。
     /// バケットは補充（20 件/秒）が処理（1 件/応答期限）を上回るため尽きず、間引き（`suppressed`）は 0。
     #[test]
     fn repair5_2632_serial_wait_with_a_stuck_sink_is_bounded_by_position_times_the_response_deadline()
@@ -1861,8 +1861,10 @@ mod tests {
             let k = u32::try_from(i + 1).unwrap();
             let took = at.duration_since(started);
             assert!(took >= d * k, "k={k} took={took:?}");
+            // 記録先の `thread::sleep` の延び（macOS の runner では 1 回あたり 100ms を超えることがある。#4876）は
+            // 件数ぶん積み上がるため、上限の余裕も 1 件あたり 500ms を k に比例させる。
             assert!(
-                took < d * k + Duration::from_millis(500),
+                took < (d + Duration::from_millis(500)) * k,
                 "k={k} took={took:?}"
             );
         }

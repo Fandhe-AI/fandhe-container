@@ -13,7 +13,7 @@ CI の構成・段階ゲート・3 OS 方針・実機前提テストの扱いは
 
 | ワークフロー | runner | 理由・備考 |
 | ------------ | ------ | ---------- |
-| `ci.yml` | `ubuntu-latest`（`platform-ci` は main への push と `workflow_dispatch` で `macos-latest`・`windows-latest` も） | macOS・Windows のネイティブ実行は OS 要件（[ci](ci.md)「3 OS CI」）。PR では使わない（macOS の同時実行枠待ちで CI が詰まったため） |
+| `ci.yml` | `ubuntu-latest`（`platform-ci` は main への push と `workflow_dispatch` で `macos-latest`・`windows-latest`・`ubuntu-24.04-arm` も） | macOS・Windows のネイティブ実行は OS 要件（[ci](ci.md)「3 OS CI」）。PR では使わない（macOS の同時実行枠待ちで CI が詰まったため）。`ubuntu-24.04-arm` は aarch64 Linux の実行時の確認（実機前提でないステップのみ。#4807）で、public リポでは標準の GitHub ホステッド runner として無料 |
 | `update-external.yml`・`release.yml` | `ubuntu-latest` | |
 | `linux-env-probe.yml` | `ubuntu-24.04`・`ubuntu-22.04`・`ubuntu-24.04-arm`（`escape-suite-probe` ジョブは `ubuntu-latest`） | ホステッド runner の KVM・sudo 可否の実測が目的（OS 要件）。`escape-suite-probe` は ESC スイートの実機ケースの実行可否の計測（#2022・SEC-2。必須チェックではない）。`id-mapping-probe` は範囲写像（production_launcher のシナリオ I）の前提〔uidmap・subuid・委譲 cgroup〕の計測（#2244・CORE-6。必須チェックではない。この実測を受けて #2376 で `platform-ci` へ組み込んだ） |
 | `ai-review.yml`（`codex / review`） | self-hosted（codex 専用ラベル。呼び出し先 reusable の既定値） | 例外。資格情報を扱うため専用 runner を使う。fork PR は reusable 側が fail-closed で拒否する。`preflight`・`post_feedback` は `ubuntu-latest` |

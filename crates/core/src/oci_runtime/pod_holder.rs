@@ -432,17 +432,52 @@ impl PodInit {
     /// pod-init へ SIGKILL を送り、`limit` まで回収を待つ（pid ns ごと止まる。REPAIR-5）。
     pub fn kill_and_reap(&self, limit: std::time::Duration) -> Result<(), TraitError> {
         let _ = sys::pidfd_send_signal(self.pidfd.as_fd(), sys::Signal::Kill);
-        let deadline = std::time::Instant::now() + limit;
-        loop {
-            match sys::wait_pid_nohang(self.pid) {
-                Ok(Some(_)) => return Ok(()),
-                Ok(None) | Err(sys::SysError::Os(sys::EINTR)) => {}
-                Err(_) => return Err(TraitError::new(ErrorCode::Internal, MSG_POD_INIT_STOP)),
-            }
-            if std::time::Instant::now() >= deadline {
-                return Err(TraitError::new(ErrorCode::Timeout, MSG_POD_INIT_STOP));
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+        reap_within(self.pid, limit)
+    }
+}
+
+/// 直接の子 `pid` の回収を `limit` まで待つ（REPAIR-5）。
+fn reap_within(pid: u32, limit: std::time::Duration) -> Result<(), TraitError> {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        match sys::wait_pid_nohang(pid) {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) | Err(sys::SysError::Os(sys::EINTR)) => {}
+            Err(_) => return Err(TraitError::new(ErrorCode::Internal, MSG_POD_INIT_STOP)),
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(TraitError::new(ErrorCode::Timeout, MSG_POD_INIT_STOP));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// pod-init の初期化の完了（ACK）を待つ上限と、失敗時に回収を待つ上限（REPAIR-5）。
+const POD_INIT_START_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// pod-init が初期化を終えたときに ACK の pipe へ書く 1 バイト。
+const POD_INIT_ACK: u8 = b'R';
+
+/// ACK の pipe の読み端から [`POD_INIT_ACK`] を `limit` まで待つ。EOF（子が初期化の途中で終わった）・期限切れ・
+/// 別の値は `false`。
+fn wait_pod_init_ack(ack: &std::io::PipeReader, limit: std::time::Duration) -> bool {
+    use std::io::Read as _;
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        let ms = i32::try_from(left.as_millis()).unwrap_or(i32::MAX);
+        match sys::poll_readable(ack.as_fd(), ms) {
+            Ok(true) => break,
+            Ok(false) if left.is_zero() => return false,
+            Ok(false) | Err(sys::SysError::Os(sys::EINTR)) => {}
+            Err(_) => return false,
+        }
+    }
+    let mut byte = [0u8; 1];
+    loop {
+        match (&*ack).read(&mut byte) {
+            Ok(1) => return byte[0] == POD_INIT_ACK,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            _ => return false,
         }
     }
 }
@@ -470,8 +505,12 @@ pub enum PodHolderWake {
 ///    `/` を再帰 private にし、空の root（[`PodRoot`]）を `/` の上に付けて `pivot_root(".", ".")` で移り、旧 root を
 ///    切り離す。自分の mount ns を作るのは、`pivot_root` が同じ root を持つプロセスの root をすべて差し替えるため
 ///    （`fs/namespace.c` の `pivot_root` の `chroot_fs_refs`。保持役の root を変えない）
-/// 4. pod-init は fd をすべて閉じ、`SIGCHLD` を無視にして孤児を自動で回収させ（`kernel/signal.c` の
-///    `do_notify_parent`）、capability をすべて落とし、non-dumpable であることを確かめてから待つだけになる
+/// 4. pod-init は `SIGCHLD` を無視にして孤児を自動で回収させ（`kernel/signal.c` の `do_notify_parent`）、
+///    capability をすべて落とし、non-dumpable であることを確かめ、fd をすべて閉じてから待つだけになる
+///
+/// 4 の後に pod-init は ACK の pipe へ 1 バイト書いてから閉じる。親は ACK を期限つきで待ち、EOF（`pod_init_main` の
+/// 失敗の終了）・期限切れなら子を SIGKILL して回収してからエラーを返す（READY より前に失敗させる。fail-closed）。
+/// `pidfd_open` の失敗でも子を止めて回収する（未回収の子の pid は再利用されないため `kill` で宛先を取り違えない）。
 ///
 /// pod-init が死ぬとその pid ns では以後 fork できない（`kernel/pid_namespace.c` の `zap_pid_ns_processes` 179 行の
 /// `disable_pid_allocation` と `kernel/pid.c` の `alloc_pid` 277 行。ns の残りのプロセスも SIGKILL で止まる）。保持役は
@@ -491,20 +530,39 @@ pub fn spawn_pod_init(root: &PodRoot) -> Result<PodInit, TraitError> {
         }
         _ => fail(ErrorCode::Internal),
     })?;
+    let (ack_r, ack_w) = std::io::pipe().map_err(|_| fail(ErrorCode::Internal))?;
     let pid = sys::fork_single_threaded(
-        || pod_init_main(parent.as_fd(), root.fd.as_fd()),
+        || pod_init_main(parent.as_fd(), root.fd.as_fd(), &ack_w),
         POD_INIT_PANIC_EXIT,
     )
     .map_err(|_| fail(ErrorCode::Internal))?;
-    let pidfd = sys::pidfd_open(pid).map_err(|_| fail(ErrorCode::Internal))?;
-    Ok(PodInit { pid, pidfd })
+    // 親の書き端を閉じ、子が ACK の前に終わったら EOF で分かるようにする。
+    drop(ack_w);
+    let pidfd = match sys::pidfd_open(pid) {
+        Ok(fd) => fd,
+        Err(_) => {
+            let _ = sys::kill_pid(pid, sys::Signal::Kill);
+            let _ = reap_within(pid, POD_INIT_START_LIMIT);
+            return Err(fail(ErrorCode::Internal));
+        }
+    };
+    let init = PodInit { pid, pidfd };
+    if !wait_pod_init_ack(&ack_r, POD_INIT_START_LIMIT) {
+        let _ = init.kill_and_reap(POD_INIT_START_LIMIT);
+        return Err(fail(ErrorCode::Internal));
+    }
+    Ok(init)
 }
 
 /// pod-init の panic 時の終了コード。
 const POD_INIT_PANIC_EXIT: i32 = 70;
 
 /// pod-init の本体（fork した子で動く。戻り値は失敗時の終了コードで、成功すれば戻らない）。
-fn pod_init_main(parent: std::os::fd::BorrowedFd<'_>, root: std::os::fd::BorrowedFd<'_>) -> i32 {
+fn pod_init_main(
+    parent: std::os::fd::BorrowedFd<'_>,
+    root: std::os::fd::BorrowedFd<'_>,
+    ack: &std::io::PipeWriter,
+) -> i32 {
     if sys::set_parent_death_sigkill().is_err() {
         return 71;
     }
@@ -533,9 +591,6 @@ fn pod_init_main(parent: std::os::fd::BorrowedFd<'_>, root: std::os::fd::Borrowe
         return 77;
     }
     drop(old_root);
-    if sys::close_fds_from(0).is_err() {
-        return 78;
-    }
     if sys::ignore_child_signal().is_err() {
         return 79;
     }
@@ -551,6 +606,19 @@ fn pod_init_main(parent: std::os::fd::BorrowedFd<'_>, root: std::os::fd::Borrowe
     }
     if !matches!(sys::is_dumpable(), Ok(false)) {
         return 81;
+    }
+    // ACK の書き端だけを残して閉じ、初期化の完了を知らせてから最後の 1 本も閉じる。
+    if sys::close_fds_from_except(0, ack.as_fd()).is_err() {
+        return 78;
+    }
+    {
+        use std::io::Write as _;
+        if (&*ack).write_all(&[POD_INIT_ACK]).is_err() {
+            return 82;
+        }
+    }
+    if sys::close_fds_from(0).is_err() {
+        return 78;
     }
     // ponytail: 待つだけ。孤児の回収はカーネルが自動で行う（SIGCHLD を無視にした）ため起きる必要が無い。
     loop {

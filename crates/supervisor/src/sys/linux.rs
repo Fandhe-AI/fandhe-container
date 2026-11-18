@@ -94,6 +94,11 @@ pub(crate) const EIO: i32 = 5;
 
 /// `fcntl(2)` の `F_GETFD`（fd が開いているかの確認に使う）。
 const F_GETFD: i32 = 1;
+/// `fcntl(2)` の `F_GETFL`・`F_SETFL` と `O_NONBLOCK`（include/uapi/asm-generic/fcntl.h。x86_64・aarch64 で共通）。
+/// pod の保持役がフレームを期限つきで書くために使う（#4815・REPAIR-5）。
+const F_GETFL: i32 = 3;
+const F_SETFL: i32 = 4;
+const O_NONBLOCK: i32 = 0o4000;
 /// capability 番号の上限（排他）。カーネルの `CAP_LAST_CAP` は 63 以下で、64 以上は ambient / bounding に渡さない。
 const CAP_NUMBER_LIMIT: u8 = 64;
 
@@ -649,6 +654,27 @@ pub(crate) fn fd_is_open(fd: i32) -> bool {
     unsafe { fcntl(fd, F_GETFD) != -1 }
 }
 
+/// `fd` の open file description の `O_NONBLOCK` を `on` にし、変更前に立っていたかを返す（`fcntl(F_GETFL / F_SETFL)`）。
+///
+/// file status flags は dup した fd・fork した先と共有されるため、呼び出し側が使い終わったら元へ戻す（#4815）。
+pub(crate) fn set_status_nonblocking(fd: BorrowedFd<'_>, on: bool) -> io::Result<bool> {
+    // SAFETY: 引数は整数のみでポインタを渡さない。読み取りだけで状態を変えない。
+    let prev = unsafe { fcntl(fd.as_raw_fd(), F_GETFL) };
+    if prev == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let next = if on {
+        prev | O_NONBLOCK
+    } else {
+        prev & !O_NONBLOCK
+    };
+    // SAFETY: 引数は整数のみ（可変長部は `int` 1 個）。変えるのは `fd` の file status flags の `O_NONBLOCK` だけ。
+    if next != prev && unsafe { fcntl(fd.as_raw_fd(), F_SETFL, next) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(prev & O_NONBLOCK != 0)
+}
+
 /// ディレクトリを symlink を辿らずに開くための `open(2)` フラグ（`O_DIRECTORY | O_NOFOLLOW`）。
 /// 対応外の arch では `Unsupported`（別 arch の値を流用しない。fail-closed）。
 pub(crate) fn open_dir_nofollow_flags() -> io::Result<i32> {
@@ -779,7 +805,6 @@ mod control_ffi {
 
     /// include/uapi/asm-generic/poll.h の値（x86_64・aarch64 で共通）。
     pub(super) const POLLIN: i16 = 0x0001;
-    pub(super) const POLLOUT: i16 = 0x0004;
     pub(super) const POLLERR: i16 = 0x0008;
     pub(super) const POLLHUP: i16 = 0x0010;
     pub(super) const POLLNVAL: i16 = 0x0020;
@@ -1243,7 +1268,6 @@ mod control_ffi {
             assert!(offset_of!(Pollfd, events) == offset_of!(libc::pollfd, events));
             assert!(offset_of!(Pollfd, revents) == offset_of!(libc::pollfd, revents));
             assert!(POLLIN == libc::POLLIN);
-            assert!(POLLOUT == libc::POLLOUT);
             assert!(POLLERR == libc::POLLERR);
             assert!(POLLHUP == libc::POLLHUP);
             assert!(POLLNVAL == libc::POLLNVAL);
@@ -1315,7 +1339,6 @@ mod control_ffi {
     }
 
     pub(super) const POLLIN: i16 = 0x0001;
-    pub(super) const POLLOUT: i16 = 0x0004;
     pub(super) const POLLERR: i16 = 0x0008;
     pub(super) const POLLHUP: i16 = 0x0010;
     pub(super) const POLLNVAL: i16 = 0x0020;
@@ -1379,9 +1402,6 @@ pub(crate) const POLL_GONE_MASK: i16 =
 
 /// `POLLIN`（読めるデータがある）。
 pub(crate) const POLL_IN: i16 = control_ffi::POLLIN;
-
-/// `POLLOUT`（書ける。pod の保持役がフレームを書く前に待つ。#4815）。
-pub(crate) const POLL_OUT: i16 = control_ffi::POLLOUT;
 
 /// `POLLRDHUP`（ストリームの相手が書き込み側を閉じた。要求しないと返らない）。
 pub(crate) const POLL_RDHUP: i16 = control_ffi::POLLRDHUP;
@@ -1522,6 +1542,9 @@ mod libc_abi {
         assert!(size_of::<libc::siginfo_t>() <= SIGINFO_BYTES);
         assert!(align_of::<libc::siginfo_t>() <= align_of::<u64>());
         assert!(F_GETFD == libc::F_GETFD);
+        assert!(F_GETFL == libc::F_GETFL);
+        assert!(F_SETFL == libc::F_SETFL);
+        assert!(O_NONBLOCK == libc::O_NONBLOCK);
         // 関数内のローカル定数・リテラルの errno / シグナル（項目として参照できないため libc の値を固定する）。
         assert!(libc::SIGKILL == 9); // kill_process_group
         assert!(libc::EINVAL == 22); // check_cap_number ほか
@@ -2154,6 +2177,7 @@ mod tests {
         assert_eq!(PR_GET_DUMPABLE, 3);
         assert_eq!(PR_SET_DUMPABLE, 4);
         assert_eq!(F_GETFD, 1);
+        assert_eq!((F_GETFL, F_SETFL, O_NONBLOCK), (3, 4, 0o4000));
     }
 
     /// SUP-6・MVM-4・#3100: `syscall` 経由の定数は LP64 の x86_64・aarch64 だけで存在する。

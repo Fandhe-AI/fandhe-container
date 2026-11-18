@@ -2548,6 +2548,11 @@ impl LaunchOps for RealOps {
             // config の `root.readonly` と `--read-only` の OR（launcher が 1 回だけ計算した実効値。外す・緩める入口ではない。
             // #2767・#2828）。
             root_readonly: input.root_readonly,
+            // pod の pid ns へ参加する init は、pin 時の素性で PID 1 の証跡の代わりに照合する（#4812）。
+            joined_pid_ns: input
+                .spec
+                .namespace_join()
+                .and_then(|join| join.pid_identity()),
         };
         let launched = spawn_container_via_intermediate(
             IntermediateSpec {

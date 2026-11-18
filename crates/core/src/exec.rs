@@ -1318,6 +1318,8 @@ pub struct MountIsolation {
     /// プロセス自身の PID namespace（`ns/pid`）を映すため、子向けの `pid_for_children`
     /// ではなくこちらを束縛する。
     pid_ns: String,
+    /// init の PID namespace の種別（自分で作った ns の PID 1 か、pod の pid ns へ参加した init か。#4812）。
+    init_pid_ns: InitPidNamespace,
     /// `rslave` の bind について、`/` の再帰 private 化の前に複製した元（`establish_with` が作り、`mount_binds` が取り出す。
     /// 無ければ空。#2669・OCI-4・CRI-2）。
     host_slave_clones: bind_mounts::HostSlaveClones,
@@ -1335,9 +1337,39 @@ const PID_NS_INIT_INO: u64 = 0xEFFF_FFFC;
 /// （`exec/bind_mounts.rs`・#1913・SEC-5）。
 const USER_NS_INIT_INO: u64 = 0xEFFF_FFFD;
 
-/// `/proc/thread-self/ns/pid` のリンク先（`pid:[inode]`）の inode 番号。書式に反すれば `None`。
-fn parse_pid_ns_inode(link: &str) -> Option<u64> {
-    link.strip_prefix("pid:[")?.strip_suffix(']')?.parse().ok()
+/// PID namespace の素性（nsfs の `(st_dev, st_ino)`。CRI-2・CORE-3・SEC-1・SEC-5・#4812）。
+///
+/// pod の pid ns への参加（#4809）では、launch が `NamespaceJoin::pin` で固定した fd から取り、init の
+/// [`MountIsolation::establish`] と証跡の再検証が `/proc/thread-self/ns/pid` の素性と照合する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PidNsIdentity {
+    dev: u64,
+    ino: u64,
+}
+
+impl PidNsIdentity {
+    /// `(st_dev, st_ino)` から作る（`NamespaceJoin` が pin 時に取った値を渡す）。
+    pub(crate) fn from_parts(dev: u64, ino: u64) -> Self {
+        Self { dev, ino }
+    }
+
+    /// 呼び出しスレッドの PID namespace の素性（`/proc/thread-self/ns/pid` を辿った nsfs の inode）。
+    /// `std::fs::metadata` はヒープを確保しないため、多スレッドの試験から fork した子でも呼べる。
+    fn of_current_thread() -> std::io::Result<Self> {
+        use std::os::unix::fs::MetadataExt as _;
+        let meta = std::fs::metadata("/proc/thread-self/ns/pid")?;
+        Ok(Self::from_parts(meta.dev(), meta.ino()))
+    }
+}
+
+/// init の PID namespace の種別（[`MountIsolation`] の証跡の一部。#4812）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InitPidNamespace {
+    /// 自分で作った新しい PID namespace の PID 1（従来の経路）。`getpid() == 1` と `NSpid` 末尾 1 を要する。
+    Own,
+    /// pod の pid ns へ参加した init（#4809）。`setns(CLONE_NEWPID)` の後に fork した子のため PID 1 とは限らない。
+    /// 値は launch で固定した pod の pid ns の素性で、`getpid() != 1` を許すのは現在の素性がこれと一致するときだけ。
+    Joined(PidNsIdentity),
 }
 
 /// `/proc/self/status` の `NSpid:` 行の末尾要素（最も内側の PID namespace での PID）。
@@ -1399,10 +1431,12 @@ impl ThreadCountSource {
 }
 
 /// [`MountIsolation::establish`] の前提（副作用の前に判定するテスト可能な純関数）。
-/// `pid` は `getpid()`、`status` は `/proc/self/status` の内容、`pid_ns_inode` は呼び出し
-/// スレッドの PID namespace の inode 番号。
+/// `pid` は `getpid()`、`status` は `/proc/self/status` の内容、`pid_ns` は呼び出し
+/// スレッドの PID namespace の素性、`kind` は init の種別。
 ///
-/// - PID が 1 で、`NSpid` の末尾要素も 1
+/// - [`InitPidNamespace::Own`]: PID が 1 で、`NSpid` の末尾要素も 1
+/// - [`InitPidNamespace::Joined`]: `pid_ns` が launch で固定した pod の pid ns の素性と一致する（PID は問わない。
+///   一致しなければ `EstablishJoinedPidNamespaceMismatch`。#4812）
 /// - PID namespace が初期 namespace でない（inode が `PID_NS_INIT_INO` でない）。`NSpid` の
 ///   要素数は参照している procfs の PID namespace を起点にした表示で、その PID namespace 内で
 ///   マウントされた procfs を見ると入れ子でも 1 段になるため、入れ子の判定には使わない
@@ -1414,15 +1448,25 @@ impl ThreadCountSource {
 fn check_establish_preconditions(
     pid: u32,
     status: &str,
-    pid_ns_inode: u64,
+    pid_ns: PidNsIdentity,
+    kind: InitPidNamespace,
 ) -> Result<(), ViolationReason> {
-    if pid != 1 {
-        return Err(ViolationReason::EstablishNotPid1);
+    match kind {
+        InitPidNamespace::Own => {
+            if pid != 1 {
+                return Err(ViolationReason::EstablishNotPid1);
+            }
+            if nspid_innermost(status) != Some(1) {
+                return Err(ViolationReason::EstablishNspidNotPid1);
+            }
+        }
+        InitPidNamespace::Joined(expected) => {
+            if pid_ns != expected {
+                return Err(ViolationReason::EstablishJoinedPidNamespaceMismatch);
+            }
+        }
     }
-    if nspid_innermost(status) != Some(1) {
-        return Err(ViolationReason::EstablishNspidNotPid1);
-    }
-    if pid_ns_inode == PID_NS_INIT_INO {
+    if pid_ns.ino == PID_NS_INIT_INO {
         return Err(ViolationReason::EstablishNotNestedPidNamespace);
     }
     if status_threads(status) != Some(1) {
@@ -1450,15 +1494,25 @@ fn check_fresh_mount_ns(before: &str, after: &str) -> Result<(), ViolationReason
 }
 
 /// [`mount_proc`] 直前の証跡の再検証（テスト可能な純関数）。`pid` は `getpid()`、
-/// `mnt_ns` / `pid_ns` は呼び出しスレッドの現在のリンク先。
+/// `mnt_ns` / `pid_ns` は呼び出しスレッドの現在のリンク先、`pid_ns_identity` は現在の PID namespace の素性。
+///
+/// 証跡が [`InitPidNamespace::Joined`] なら PID 1 を求めず、現在の素性が launch で固定した pod の pid ns と一致することを
+/// 求める（#4812）。
 fn check_evidence(
     evidence: &MountIsolation,
     pid: u32,
     mnt_ns: &str,
     pid_ns: &str,
+    pid_ns_identity: PidNsIdentity,
 ) -> Result<(), ViolationReason> {
-    if pid != 1 {
-        return Err(ViolationReason::EvidenceCallerNotPid1);
+    match evidence.init_pid_ns {
+        InitPidNamespace::Own if pid != 1 => {
+            return Err(ViolationReason::EvidenceCallerNotPid1);
+        }
+        InitPidNamespace::Joined(expected) if pid_ns_identity != expected => {
+            return Err(ViolationReason::EvidencePidNamespaceMismatch);
+        }
+        _ => {}
     }
     if mnt_ns != evidence.mnt_ns {
         return Err(ViolationReason::EvidenceMountNamespaceMismatch);
@@ -1477,7 +1531,8 @@ impl MountIsolation {
     /// 1. PID が 1（`getpid()` と `NSpid` の末尾要素の両方）で、PID namespace が初期
     ///    namespace でなく（`ns/pid` の inode で判定）、かつシングルスレッド（`Threads: 1`）。
     ///    満たさなければ副作用なしで `FailedPrecondition`
-    ///    （判定は `check_establish_preconditions`）
+    ///    （判定は `check_establish_preconditions`）。pod の pid ns へ参加した init（`establish_with` の
+    ///    `joined_pid_ns`）は PID 1 の代わりに素性の一致を求める（#4812）
     /// 2. 呼び出しスレッドを `unshare(CLONE_NEWNS)` で新しい mount namespace へ移し、`/` を
     ///    再帰 private にする（コピーされたマウントの shared peer から切り離し、以後のマウントを
     ///    外へ伝播させない）。ただし `establish_with` に `rslave` の bind があれば、private 化の前に
@@ -1503,7 +1558,7 @@ impl MountIsolation {
     /// 移るのは呼んだスレッドだけのため、前提としてシングルスレッドであることを確かめている
     /// （establish 後に作ったスレッドは新しい mount namespace を引き継ぐ）。
     pub fn establish() -> Result<Self, ExecError> {
-        Self::establish_with(None)
+        Self::establish_with(None, None)
     }
 
     /// [`Self::establish`] の本体。`binds` に `rslave` の bind があれば、`unshare(CLONE_NEWNS)` の直後・`/` の再帰 private 化の前に、
@@ -1513,8 +1568,12 @@ impl MountIsolation {
     /// （複製は匿名 namespace にあり、private 化の対象にならない）。`/` 自体は従来どおり再帰 private のままで、複製を `mount_binds` が
     /// 付け替えるまでの間も、ホストへの伝播は起きない（slave は受けるだけ）。元がホスト側で private なら、rootfs に触れる前に
     /// `FAILED_PRECONDITION` で失敗する。`binds` が `None` か `rslave` を含まなければ [`Self::establish`] と同じ。
+    ///
+    /// `joined_pid_ns` は pod の pid ns へ参加した init のときだけ `Some`（launch が `NamespaceJoin` に固定した素性。#4812）で、
+    /// そのときは PID 1 の代わりに `/proc/thread-self/ns/pid` の素性の一致を求める（初期 pid ns でないこと・単一スレッドは保つ）。
     pub(crate) fn establish_with(
         binds: Option<&crate::oci_runtime::BindMountSet>,
+        joined_pid_ns: Option<PidNsIdentity>,
     ) -> Result<Self, ExecError> {
         let fail = |msg: &str| {
             ExecError::new(
@@ -1525,18 +1584,16 @@ impl MountIsolation {
         };
         let violation = |r: ViolationReason| ExecError::from_violation(r, None);
         let pid = std::process::id();
-        if pid != 1 {
+        let kind = joined_pid_ns.map_or(InitPidNamespace::Own, InitPidNamespace::Joined);
+        if kind == InitPidNamespace::Own && pid != 1 {
             // /proc を読む前に拒否する（PID 1 でないことは getpid だけで確定する）。
             return Err(violation(ViolationReason::EstablishNotPid1));
         }
         let status = std::fs::read_to_string("/proc/self/status")
             .map_err(|_| fail("cannot read /proc/self/status to verify the PID namespace"))?;
-        let pid_ns_inode = thread_ns_link("pid")
-            .ok()
-            .as_deref()
-            .and_then(parse_pid_ns_inode)
-            .ok_or_else(|| fail("cannot read or parse /proc/thread-self/ns/pid"))?;
-        check_establish_preconditions(pid, &status, pid_ns_inode).map_err(violation)?;
+        let pid_ns_identity = PidNsIdentity::of_current_thread()
+            .map_err(|_| fail("cannot read or parse /proc/thread-self/ns/pid"))?;
+        check_establish_preconditions(pid, &status, pid_ns_identity, kind).map_err(violation)?;
         let before =
             thread_ns_link("mnt").map_err(|_| fail("cannot read /proc/thread-self/ns/mnt"))?;
         sys::unshare_namespaces(&[NsFlag::Mount])
@@ -1556,6 +1613,7 @@ impl MountIsolation {
         Ok(Self {
             mnt_ns,
             pid_ns,
+            init_pid_ns: kind,
             host_slave_clones,
             _not_send: std::marker::PhantomData,
         })
@@ -1570,14 +1628,20 @@ impl MountIsolation {
     ///
     /// `stage` は失敗を記録する段（`mount_proc` は `MountProc`、rootfs 切替は `PrepareRootfs` /
     /// `PivotRoot`）。
-    fn verify_caller(&self, stage: IsolationStage) -> Result<(), ExecError> {
+    pub(crate) fn verify_caller(&self, stage: IsolationStage) -> Result<(), ExecError> {
         let fail = |msg: &str| ExecError::new(ErrorCode::FailedPrecondition, stage, msg);
         let mnt_ns =
             thread_ns_link("mnt").map_err(|_| fail("cannot read /proc/thread-self/ns/mnt"))?;
         let pid_ns =
             thread_ns_link("pid").map_err(|_| fail("cannot read /proc/thread-self/ns/pid"))?;
-        check_evidence(self, std::process::id(), &mnt_ns, &pid_ns)
+        let pid_ns_identity = PidNsIdentity::of_current_thread()
+            .map_err(|_| fail("cannot read /proc/thread-self/ns/pid"))?;
+        check_evidence(self, std::process::id(), &mnt_ns, &pid_ns, pid_ns_identity)
             .map_err(|r| ExecError::from_violation_at(r, None, stage))?;
+        if matches!(self.init_pid_ns, InitPidNamespace::Joined(_)) {
+            // 参加した init は PID 1 でない（素性の一致は `check_evidence` が確かめた。#4812）。
+            return Ok(());
+        }
         // getpid に加え、procfs 側の NSpid 末尾も 1 であることを確かめる（procfs を再マウント
         // した後も NSpid の末尾は最も内側の namespace の PID）。
         let status = std::fs::read_to_string("/proc/self/status")
@@ -3736,18 +3800,26 @@ mod tests {
 
     const STATUS_PID1: &str = "Name:\tx\nNSpid:\t4321\t1\nThreads:\t1\n";
 
+    /// 試験用の nsfs の dev（実値の代わり）。
+    const NSFS_DEV: u64 = 4;
+
+    fn pid_ns(ino: u64) -> PidNsIdentity {
+        PidNsIdentity::from_parts(NSFS_DEV, ino)
+    }
+
     /// 再監査 P2-2・P2-3: establish の前提（PID 1・NSpid 末尾 1・入れ子・シングルスレッド）。
     #[test]
     fn establish_preconditions() {
         const NESTED: u64 = 4_026_532_001;
+        let own = InitPidNamespace::Own;
         assert_eq!(
-            check_establish_preconditions(1, STATUS_PID1, NESTED),
+            check_establish_preconditions(1, STATUS_PID1, pid_ns(NESTED), own),
             Ok(())
         );
         // PID namespace 内でマウントした procfs を見ていて NSpid が 1 段でも、初期 PID
         // namespace でなければ受け付ける（NSpid の要素数に依存しない。Codex 指摘）。
         assert_eq!(
-            check_establish_preconditions(1, "NSpid:\t1\nThreads:\t1\n", NESTED),
+            check_establish_preconditions(1, "NSpid:\t1\nThreads:\t1\n", pid_ns(NESTED), own),
             Ok(())
         );
         let cases: [(u32, &str, u64, ViolationReason); 5] = [
@@ -3780,11 +3852,54 @@ mod tests {
         ];
         for (pid, status, ino, want) in cases {
             assert_eq!(
-                check_establish_preconditions(pid, status, ino),
+                check_establish_preconditions(pid, status, pid_ns(ino), own),
                 Err(want),
                 "{status:?} {ino}"
             );
         }
+    }
+
+    /// CRI-2・CORE-3・SEC-1・SEC-5・#4812: pod の pid ns へ参加した init は PID 1 でなくても、素性が launch で固定した
+    /// ものと一致すれば通る。素性の不一致・初期 pid ns・複数スレッドはそれぞれ固定の理由で拒否する。
+    #[test]
+    fn cri2_core3_4812_joined_pid_ns_init_preconditions() {
+        const POD: u64 = 4_026_532_777;
+        let joined = InitPidNamespace::Joined(pid_ns(POD));
+        let status = "Name:\tx\nNSpid:\t4321\t7\nThreads:\t1\n";
+        assert_eq!(
+            check_establish_preconditions(7, status, pid_ns(POD), joined),
+            Ok(())
+        );
+        // 参加先が空で、fork した init が PID 1 になった場合も素性で判定する。
+        assert_eq!(
+            check_establish_preconditions(1, STATUS_PID1, pid_ns(POD), joined),
+            Ok(())
+        );
+        // 別の pid ns（同じ ino でも dev が違えば別物）。
+        for current in [
+            pid_ns(POD + 1),
+            PidNsIdentity::from_parts(NSFS_DEV + 1, POD),
+        ] {
+            assert_eq!(
+                check_establish_preconditions(7, status, current, joined),
+                Err(ViolationReason::EstablishJoinedPidNamespaceMismatch),
+                "{current:?}"
+            );
+        }
+        // 固定した素性が初期 pid ns を指していても受けない（pin が拒否する構成の多重防御）。
+        let init = pid_ns(PID_NS_INIT_INO);
+        assert_eq!(
+            check_establish_preconditions(7, status, init, InitPidNamespace::Joined(init)),
+            Err(ViolationReason::EstablishNotNestedPidNamespace)
+        );
+        assert_eq!(
+            check_establish_preconditions(7, "NSpid:\t4321\t7\nThreads:\t2\n", pid_ns(POD), joined),
+            Err(ViolationReason::EstablishMultiThreaded)
+        );
+        assert_eq!(
+            ViolationReason::EstablishJoinedPidNamespaceMismatch.message(),
+            "the joined PID namespace does not match the pod PID namespace pinned at launch"
+        );
     }
 
     /// `Threads:`・`NSpid` 末尾の解析。
@@ -3919,9 +4034,14 @@ mod tests {
     }
 
     fn evidence(mnt_ns: &str, pid_ns: &str) -> MountIsolation {
+        evidence_of(mnt_ns, pid_ns, InitPidNamespace::Own)
+    }
+
+    fn evidence_of(mnt_ns: &str, pid_ns: &str, init_pid_ns: InitPidNamespace) -> MountIsolation {
         MountIsolation {
             mnt_ns: mnt_ns.to_string(),
             pid_ns: pid_ns.to_string(),
+            init_pid_ns,
             host_slave_clones: Default::default(),
             _not_send: std::marker::PhantomData,
         }
@@ -3931,20 +4051,42 @@ mod tests {
     #[test]
     fn check_evidence_requires_pid1_and_both_namespaces() {
         let e = evidence("mnt:[10]", "pid:[20]");
-        assert_eq!(check_evidence(&e, 1, "mnt:[10]", "pid:[20]"), Ok(()));
+        let id = pid_ns(20);
+        assert_eq!(check_evidence(&e, 1, "mnt:[10]", "pid:[20]", id), Ok(()));
         // 証跡を受け取った親や PID 1 が fork した子（PID が 1 でない）。
         assert_eq!(
-            check_evidence(&e, 42, "mnt:[10]", "pid:[20]"),
+            check_evidence(&e, 42, "mnt:[10]", "pid:[20]", id),
             Err(ViolationReason::EvidenceCallerNotPid1)
         );
         // 別の mount namespace（別スレッド・親）。
         assert_eq!(
-            check_evidence(&e, 1, "mnt:[11]", "pid:[20]"),
+            check_evidence(&e, 1, "mnt:[11]", "pid:[20]", id),
             Err(ViolationReason::EvidenceMountNamespaceMismatch)
         );
         // 同じ mount namespace だが別の PID namespace（procfs が別の PID 集合を映す）。
         assert_eq!(
-            check_evidence(&e, 1, "mnt:[10]", "pid:[21]"),
+            check_evidence(&e, 1, "mnt:[10]", "pid:[21]", pid_ns(21)),
+            Err(ViolationReason::EvidencePidNamespaceMismatch)
+        );
+    }
+
+    /// CRI-2・SEC-1・#4812: 参加した init の証跡は PID 1 を求めず、現在の素性が固定した pod の pid ns と一致することと、
+    /// mount ns・PID ns のリンクの一致を求める。
+    #[test]
+    fn cri2_sec1_4812_joined_evidence_checks_pinned_identity() {
+        let pod = pid_ns(20);
+        let e = evidence_of("mnt:[10]", "pid:[20]", InitPidNamespace::Joined(pod));
+        assert_eq!(check_evidence(&e, 42, "mnt:[10]", "pid:[20]", pod), Ok(()));
+        assert_eq!(
+            check_evidence(&e, 42, "mnt:[10]", "pid:[20]", pid_ns(21)),
+            Err(ViolationReason::EvidencePidNamespaceMismatch)
+        );
+        assert_eq!(
+            check_evidence(&e, 42, "mnt:[11]", "pid:[20]", pod),
+            Err(ViolationReason::EvidenceMountNamespaceMismatch)
+        );
+        assert_eq!(
+            check_evidence(&e, 42, "mnt:[10]", "pid:[21]", pod),
             Err(ViolationReason::EvidencePidNamespaceMismatch)
         );
     }
@@ -3985,20 +4127,12 @@ mod tests {
         assert_eq!(USER_NS_INIT_INO, PID_NS_INIT_INO + 1);
     }
 
-    /// `ns/pid` の inode の解析と、初期 PID namespace の inode の具体値。
+    /// 初期 PID namespace の inode の具体値と、`ns/pid` の素性の inode がリンク先 `pid:[inode]` と一致すること。
     #[test]
-    fn pid_ns_inode_parsing() {
+    fn pid_ns_identity_of_current_thread() {
         assert_eq!(PID_NS_INIT_INO, 4_026_531_836);
-        assert_eq!(
-            parse_pid_ns_inode("pid:[4026531836]"),
-            Some(PID_NS_INIT_INO)
-        );
-        assert_eq!(parse_pid_ns_inode("pid:[4026532001]"), Some(4_026_532_001));
-        for bad in ["mnt:[4026531836]", "pid:[x]", "pid:4026531836", ""] {
-            assert_eq!(parse_pid_ns_inode(bad), None, "{bad:?}");
-        }
-        // 実プロセスのリンクも解析できる。
-        assert!(parse_pid_ns_inode(&thread_ns_link("pid").unwrap()).is_some());
+        let id = PidNsIdentity::of_current_thread().unwrap();
+        assert_eq!(thread_ns_link("pid").unwrap(), format!("pid:[{}]", id.ino));
     }
 
     const MI_SHARED: &str = "22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n";

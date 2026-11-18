@@ -102,7 +102,7 @@
 - pod の PID 1: 保持役が段 2 で `unshare(CLONE_NEWPID)` の後に 1 回だけ fork した子 pod-init。単一スレッド・capability なし・non-dumpable で孤児の回収だけを行い、root は空の tmpfs へ `pivot_root` する（mount ns は保持役が pod の userns で作る。`/dev/shm` の案 A と共用）。pod-init が死ぬとその pid ns では fork できなくなる想定のため、保持役は pod-init を監視して死んだら終了し、plugin-cri は `SANDBOX_NOTREADY` にする（fail-closed）。カーネルの挙動（`unshare` 後の最初の fork が init になること、init の死後の fork 失敗）は Linux v6.12 の一次情報で確かめる前提で、本節の時点では未検証の見込み
 - パス: 保持役の pid からだけ `/proc/<holder>/ns/pid_for_children` を作る（#2776 の契約）。READY に pid ns の素性を載せ、plugin-cri が照合する
 - core の join の検査: pid は user＋ipc の組に足す形でだけ受ける。`NS_GET_NSTYPE` が `CLONE_NEWPID`、所有 userns が join する user と同じ、`NS_GET_PARENT` が呼び出し側の pid ns。`setns(pid)` は中間プロセスで行い、効くのは以後に fork した init だけ
-- PID 1 の証跡: 「joined pid ns の init」の種別を足す。`getpid() != 1` を許すのは、`/proc/thread-self/ns/pid` が launch で固定した pod の pid ns の素性と一致するときだけ。初期 pid ns でないこと・単一スレッドの検査は保つ。`check_evidence` も同じ素性で照合する
+- PID 1 の証跡: 「joined pid ns の init」の種別を足す。`getpid() != 1` を許すのは、`/proc/thread-self/ns/pid` が launch で固定した pod の pid ns の素性と一致するときだけ。初期 pid ns でないこと・単一スレッドの検査は保つ。`check_evidence` も同じ素性で照合する（#4812 で実装）
 - `Pid1Target`（exec・healthcheck）: pid を共有するコンテナでは `NSpid` の末尾が 1 でない対象を受ける。ただし launch pidfd の経路（#1461）で、記録した pod の pid ns の素性と一致するときだけ。記録 pid から開く縮退経路は拒否し、監査の語彙を足す（SEC-4）
 - 停止と終了: init が終了しても子孫は pod-init へ付け替わって残るため、init の終了時と停止時にコンテナの cgroup へ `cgroup.kill` を書く（O4）。containerd の shim が pid ns 共有時に init の終了で全プロセスを止める挙動に当たる見込みだが、containerd v2.1.0 の該当箇所は未検証
 - containerd との差: PID 1 はコンテナではない（rootfs・seccomp・cgroup の一式を持たない。CORE-7〜9）。兄弟コンテナの `/proc/<pid>/root`・`environ`・`fd` は Landlock の ptrace の境界で開けない（k8s では見える）。同じ uid の signal は届く。pod-init の `/proc/1/root` は空の root

@@ -801,9 +801,17 @@ mod tests {
         /// pid namespace も作る保持役（`--pid --fork`。unshare 自身は外に残り、`pid_for_children` が新しい pid ns を指す。
         /// `inner` が真なら、その中でさらに `unshare --pid --fork` して孫の pid ns を作る。#4809）。
         fn spawn_pid(inner: bool) -> Self {
-            let mut args = vec!["--user", "--map-root-user", "--ipc", "--pid", "--fork"];
+            // `--kill-child`: 段の unshare が回収されたら子も SIGKILL で消える（Drop は直接の子しか待たないため）。
+            let mut args = vec![
+                "--user",
+                "--map-root-user",
+                "--ipc",
+                "--pid",
+                "--fork",
+                "--kill-child",
+            ];
             if inner {
-                args.extend(["unshare", "--pid", "--fork"]);
+                args.extend(["unshare", "--pid", "--fork", "--kill-child"]);
             }
             args.extend(["sleep", "30"]);
             Self::spawn_with(&args, "pid_for_children")
@@ -947,9 +955,15 @@ mod tests {
         let middle = first_child(nested.child.id());
         let grandchild_ns = format!("/proc/{middle}/ns/pid_for_children");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while std::fs::read_link(&grandchild_ns).ok()
-            == std::fs::read_link(format!("/proc/{middle}/ns/pid")).ok()
-        {
+        // 両方が読めて素性が異なるときだけ準備完了（unshare から fork までの間は読み取りが失敗し得る）。
+        let ready = || match (
+            std::fs::read_link(&grandchild_ns),
+            std::fs::read_link(format!("/proc/{middle}/ns/pid")),
+        ) {
+            (Ok(inner), Ok(outer)) => inner != outer,
+            _ => false,
+        };
+        while !ready() {
             assert!(
                 std::time::Instant::now() < deadline,
                 "PRECONDITION FAILED: no inner pid ns"

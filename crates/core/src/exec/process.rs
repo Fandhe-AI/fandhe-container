@@ -2808,6 +2808,9 @@ pub(crate) struct PrePivotSetup<'a> {
     /// （config の `root.readonly`。CORE-5・SEC-1・SUP-12・#2767）。値は config そのもので、外す・緩める入口ではない。
     /// 失敗は状態 pipe の段 `root_readonly` で親へ返る（fail-closed。縮退しない）。
     pub(crate) root_readonly: bool,
+    /// pod の pid ns へ参加した init のときだけ `Some`（launch が `NamespaceJoin` に固定した素性。#4812）。`establish` が
+    /// PID 1 の代わりに `/proc/thread-self/ns/pid` の素性の一致を求める。
+    pub(crate) joined_pid_ns: Option<crate::exec::PidNsIdentity>,
 }
 
 /// config の `linux.readonlyPaths` / `maskedPaths`（検証済み）。固定集合に**追加**されるだけで、外す・緩める
@@ -2838,7 +2841,12 @@ trait PrePivotOps {
     /// `mount_sysfs` の成功の証跡。`masked_paths` 段へ渡し、sysfs を供給したときだけ `/sys` 配下を覆う（#2014）。
     type Sysfs;
     /// `binds` に `rslave` があれば、`/` の private 化の前にその元を複製する（#2669）。
-    fn establish(&self, binds: Option<&BindMountSet>) -> Result<Self::Isolation, ExecError>;
+    /// `joined_pid_ns` は pod の pid ns へ参加した init のときだけ `Some`（#4812）。
+    fn establish(
+        &self,
+        binds: Option<&BindMountSet>,
+        joined_pid_ns: Option<crate::exec::PidNsIdentity>,
+    ) -> Result<Self::Isolation, ExecError>;
     fn prepare_rootfs(
         &self,
         isolation: &Self::Isolation,
@@ -3008,8 +3016,12 @@ impl PrePivotOps for RealPrePivotOps {
     type Pivoted = PivotReport;
     type Sysfs = SysfsReport;
 
-    fn establish(&self, binds: Option<&BindMountSet>) -> Result<MountIsolation, ExecError> {
-        MountIsolation::establish_with(binds)
+    fn establish(
+        &self,
+        binds: Option<&BindMountSet>,
+        joined_pid_ns: Option<crate::exec::PidNsIdentity>,
+    ) -> Result<MountIsolation, ExecError> {
+        MountIsolation::establish_with(binds, joined_pid_ns)
     }
 
     fn prepare_rootfs(
@@ -3361,7 +3373,10 @@ fn run_pre_pivot_with_console<O: PrePivotOps>(
 ) -> Result<(O::Isolation, O::Pivoted), Box<StepError>> {
     use PrePivotStep as S;
     let isolation = ops
-        .establish(setup.as_ref().and_then(|s| s.binds))
+        .establish(
+            setup.as_ref().and_then(|s| s.binds),
+            setup.as_ref().and_then(|s| s.joined_pid_ns),
+        )
         .map_err(StepError::at(S::Establish))?;
     let prepared = ops
         .prepare_rootfs(&isolation, rootfs)
@@ -3779,6 +3794,7 @@ where
                 status: None,
                 working_dir: None,
                 root_readonly: false,
+                joined_pid_ns: None,
             };
             let result = run_child_then(
                 rootfs,
@@ -3836,6 +3852,7 @@ where
                 pinned_rootfs: None,
                 config_paths: ConfigPaths::NONE,
                 status: None,
+                joined_pid_ns: None,
             };
             let result = run_child_then(
                 rootfs,
@@ -4013,6 +4030,7 @@ pub fn spawn_container_with_stages_and_devices(
                 status: None,
                 working_dir: None,
                 root_readonly: false,
+                joined_pid_ns: None,
             }),
             StdioNulling::ALL,
             None,
@@ -7512,7 +7530,11 @@ mod tests {
         type Devices = ();
         type Pivoted = ();
         type Sysfs = ();
-        fn establish(&self, _: Option<&BindMountSet>) -> Result<(), ExecError> {
+        fn establish(
+            &self,
+            _: Option<&BindMountSet>,
+            _: Option<crate::exec::PidNsIdentity>,
+        ) -> Result<(), ExecError> {
             self.step("establish")
         }
         fn prepare_rootfs(&self, _: &(), _: &Path) -> Result<(), ExecError> {
@@ -7646,6 +7668,7 @@ mod tests {
                 status: None,
                 working_dir: None,
                 root_readonly: false,
+                joined_pid_ns: None,
             }),
         )
         .unwrap();
@@ -7687,6 +7710,7 @@ mod tests {
             status: None,
             working_dir: Some(&wd),
             root_readonly: true,
+            joined_pid_ns: None,
         };
         let tail = ["pivot_root", "root_readonly", "working_dir"];
         // terminal あり: working_dir の直後に console(owner を受ける)。
@@ -7767,6 +7791,7 @@ mod tests {
                 status: None,
                 working_dir: None,
                 root_readonly: false,
+                joined_pid_ns: None,
             }),
         )
         .map(|_| ())
@@ -7817,6 +7842,7 @@ mod tests {
                     status: None,
                     working_dir: None,
                     root_readonly: false,
+                    joined_pid_ns: None,
                 }),
             )
             .unwrap();
@@ -7845,6 +7871,7 @@ mod tests {
                 status: None,
                 working_dir: None,
                 root_readonly: false,
+                joined_pid_ns: None,
             }),
         )
         .unwrap();
@@ -7887,6 +7914,7 @@ mod tests {
             status: None,
             working_dir: wd,
             root_readonly: false,
+            joined_pid_ns: None,
         };
         let app: &'static ContainerWorkingDir = Box::leak(Box::new(
             ContainerWorkingDir::parse(Path::new("/app")).unwrap(),
@@ -7948,6 +7976,7 @@ mod tests {
             status: None,
             working_dir: Some(app),
             root_readonly: ro,
+            joined_pid_ns: None,
         };
         let _ = take_calls();
         run_pre_pivot(
@@ -8026,6 +8055,7 @@ mod tests {
             status: None,
             working_dir: None,
             root_readonly: false,
+            joined_pid_ns: None,
         };
         let _ = take_calls();
         let err = run_pre_pivot(
@@ -8094,6 +8124,7 @@ mod tests {
                 status: None,
                 working_dir: None,
                 root_readonly: false,
+                joined_pid_ns: None,
             }),
         )
         .err()
@@ -8129,6 +8160,7 @@ mod tests {
                 status: None,
                 working_dir: None,
                 root_readonly: false,
+                joined_pid_ns: None,
             }),
         )
         .err()
@@ -8209,6 +8241,7 @@ mod tests {
                     status: None,
                     working_dir: None,
                     root_readonly: false,
+                    joined_pid_ns: None,
                 }),
             )
             .err()
@@ -8306,6 +8339,7 @@ mod tests {
                     status: None,
                     working_dir: Some(&wd),
                     root_readonly: false,
+                    joined_pid_ns: None,
                 }),
             )
             .err()

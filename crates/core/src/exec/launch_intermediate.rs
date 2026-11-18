@@ -1667,6 +1667,7 @@ mod tests {
             status: None,
             working_dir: None,
             root_readonly: true,
+            joined_pid_ns: None,
         };
         let out = with_status(setup, &file);
         assert!(out.sysctls.is_some());

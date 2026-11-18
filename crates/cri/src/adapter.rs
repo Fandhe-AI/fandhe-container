@@ -571,6 +571,8 @@ pub struct HolderIdentity {
     user: NamespaceIdentity,
     ipc: NamespaceIdentity,
     net: NamespaceIdentity,
+    /// pod の pid namespace（保持役の `pid_for_children`。pid を共有する sandbox だけ。#4816）。
+    pid_ns: Option<NamespaceIdentity>,
 }
 
 /// 素性の項目の整合性（supervisor の `PodHolderReady::new` と同じ不変条件）。pid は `1..=i32::MAX`、ino は非 0 で
@@ -612,7 +614,29 @@ impl HolderIdentity {
             user,
             ipc,
             net,
+            pid_ns: None,
         })
+    }
+
+    /// pod の pid namespace の素性を添える（pid を共有する sandbox。CRI-2・SEC-5・#4816）。ino が 0・他の ns と重なる・
+    /// dev が違うなら `INVALID_ARGUMENT`（固定文言）。
+    pub fn with_pid_ns(mut self, pid_ns: NamespaceIdentity) -> Result<Self, CriError> {
+        let others = [self.user, self.ipc, self.net];
+        if pid_ns.ino == 0
+            || pid_ns.dev != self.user.dev
+            || others.iter().any(|o| o.ino == pid_ns.ino)
+        {
+            return Err(CriError::invalid_argument(
+                "pod holder identity is inconsistent",
+            ));
+        }
+        self.pid_ns = Some(pid_ns);
+        Ok(self)
+    }
+
+    /// pod の pid namespace の素性（pid を共有しない sandbox は `None`）。
+    pub fn pid_ns(&self) -> Option<NamespaceIdentity> {
+        self.pid_ns
     }
 
     /// 保持役の pid。
@@ -665,6 +689,20 @@ impl<'a> PodHolderRequest<'a> {
     /// READY を待つ上限。`spawn` はこれ以内に戻る。
     pub fn ready_timeout(&self) -> Duration {
         self.ready_timeout
+    }
+
+    /// sandbox が pod の pid namespace を求めるか（`namespace_options.pid` が `POD`。未指定は CRI の既定値の `POD`。
+    /// CRI-2・#4816）。真なら provider は保持役に pid ns と pod-init を作らせる。`CONTAINER`・`NODE`・`TARGET`・未知の値は
+    /// 求めない（pid ns を作らない。受け入れの判断は `RunPodSandbox` の検証が担う）。
+    pub fn shares_pod_pid(&self) -> bool {
+        let mode = self
+            .config
+            .linux
+            .as_ref()
+            .and_then(|l| l.security_context.as_ref())
+            .and_then(|s| s.namespace_options.as_ref())
+            .map_or(crate::runtime::v1::NamespaceMode::Pod as i32, |o| o.pid);
+        mode == crate::runtime::v1::NamespaceMode::Pod as i32
     }
 }
 

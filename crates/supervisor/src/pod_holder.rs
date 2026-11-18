@@ -35,6 +35,9 @@ mod holder;
 /// bin の第 1 引数（固定。`PATH`・環境変数・引数による上書きは受けない）。
 pub const POD_HOLDER_SUBCOMMAND: &str = "pod-holder";
 
+/// 保持役に pod の pid namespace と pod-init も作らせる、第 2 引数（固定。sandbox の pid が `POD` のときだけ。#4815・#4816）。
+pub const POD_HOLDER_SHARE_PID: &str = "--share-pid";
+
 /// 受信側が READY を待つ契約上の上限。保持役の内部の最長の待ち（`getent` の期限と範囲写像の helper の期限の和）
 /// 以上にする。下の単体試験が内部の期限との関係を照合する。
 pub const READY_TIMEOUT: Duration = Duration::from_secs(60);

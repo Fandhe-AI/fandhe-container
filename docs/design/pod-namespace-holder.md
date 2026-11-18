@@ -110,7 +110,7 @@
     - capability をすべて落とし、non-dumpable を自分で確かめる
   - READY は版 3 で、保持役の `pid_for_children` の素性を載せる
   - 保持役は pod-init の終了で終了コード 1 で終わり、stdin の EOF では pod-init を止めて 0 で終わる
-- パス: 保持役の pid からだけ `/proc/<holder>/ns/pid_for_children` を作る（#2776 の契約）。READY に pid ns の素性を載せ、plugin-cri が照合する
+- パス: 保持役の pid からだけ `/proc/<holder>/ns/pid_for_children` を作る（#2776 の契約）。READY に pid ns の素性を載せ、plugin-cri が照合する（#4816 で実装。plugin-cri の provider は sandbox の pid が `POD`〔未指定を含む〕のときだけ `--share-pid` を渡し、READY の pid ns の有無が求めた共有と一致し、素性が `/proc/<holder>/ns/pid_for_children` と一致することを確かめ、素性を記録の `holder=` 行の 6 つ目の要素に残す。pod-init の死で保持役が終わり、既存の `reconcile_holders`〔#2871〕が `SANDBOX_NOTREADY` にする）
 - core の join の検査: pid は user＋ipc の組に足す形でだけ受ける。`NS_GET_NSTYPE` が `CLONE_NEWPID`、所有 userns が join する user と同じ、`NS_GET_PARENT` が呼び出し側の pid ns。`setns(pid)` は中間プロセスで行い、効くのは以後に fork した init だけ
 - PID 1 の証跡: 「joined pid ns の init」の種別を足す。`getpid() != 1` を許すのは、`/proc/thread-self/ns/pid` が launch で固定した pod の pid ns の素性と一致するときだけ。初期 pid ns でないこと・単一スレッドの検査は保つ。`check_evidence` も同じ素性で照合する（#4812 で実装）
 - `Pid1Target`（exec・healthcheck）: pid を共有するコンテナでは `NSpid` の末尾が 1 でない対象を受ける。ただし launch pidfd の経路（#1461）で、記録した pod の pid ns の素性と一致するときだけ。記録 pid から開く縮退経路は拒否し、監査の語彙を足す（SEC-4）。#4813 で実装した（素性は `LaunchIsolationRecord::pod_pid_ns` に残し、語彙は `exec_target_joined_pid_namespace_mismatch`・`exec_target_joined_pid_namespace_requires_launch_pidfd`）

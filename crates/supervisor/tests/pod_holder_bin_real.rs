@@ -13,6 +13,9 @@
 //! - E: dumpable の判別（再 exec しない陰性対照は親が `/proc/<pid>/ns/net` を開けず、案 (a) の保持役は親が開ける。pod の
 //!   user namespace の中の capability を持たないプロセスは保持役の `environ` を開けない）
 //! - F: 拒否（余分な argv は終了コード 2、SIGTERM が無視された起動は ERROR フレームと終了コード 1）
+//! - G: `--share-pid`（#4815）。READY の pid ns が保持役の `pid_for_children` で pod-init の pid ns と一致し、pod-init は
+//!   PID 1・`CapEff` 0・root が空の root。pod-init を SIGKILL すると保持役は 5 秒以内に終了コード 1、stdin の EOF では
+//!   pod-init を回収して終了コード 0
 //!
 //! 範囲外: provider の無い `POD` で pod 内の 2 コンテナが通信する試験は core の net join（H7・#2872）が要るため、
 //! H7 の後に H5（#2876）か H8（#2878）で扱う。
@@ -613,6 +616,124 @@ mod linux {
         );
     }
 
+    /// `pod-holder --share-pid` で起動して READY を読む（#4815）。
+    fn start_holder_share_pid() -> Holder {
+        let mut child = Command::new(BIN)
+            .args(["pod-holder", "--share-pid"])
+            .env_clear()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|e| fail(&format!("spawn holder: {e}")));
+        let out = child.stdout.take().expect("stdout");
+        match read_ready(out.as_fd(), deadline()) {
+            Ok(ready) => Holder { child, ready },
+            Err(e) => {
+                let mut err = String::new();
+                reap::reap_or_report(&mut child, reap::reap_within());
+                if let Some(mut s) = child.stderr.take() {
+                    let _ = s.read_to_string(&mut err);
+                }
+                fail(&format!(
+                    "share-pid holder did not report READY: {:?} stderr={err}",
+                    e.code()
+                ))
+            }
+        }
+    }
+
+    /// 保持役の唯一の子（pod-init）の pid を期限つきで待つ。
+    fn pod_init_of(holder: u32) -> u32 {
+        let path = format!("/proc/{holder}/task/{holder}/children");
+        let until = Instant::now() + STEP;
+        loop {
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            let kids: Vec<u32> = text
+                .split_whitespace()
+                .filter_map(|t| t.parse().ok())
+                .collect();
+            if let [only] = kids.as_slice() {
+                return *only;
+            }
+            if Instant::now() >= until {
+                fail(&format!(
+                    "holder must have exactly one child (pod init): {kids:?}"
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// G（#4815）: `--share-pid` の保持役が pod の pid ns を作り、pod-init を PID 1 として持つ。READY の pid ns は
+    /// 保持役の `pid_for_children` で、pod-init の pid ns と一致する。pod-init は `CapEff` 0・root が空の root。
+    /// pod-init を SIGKILL すると保持役は期限内に終了コード 1 で終わり、停止の合図（stdin の EOF）では pod-init を止めて
+    /// 0 で終わる。
+    fn scenario_g() {
+        let mut h = start_holder_share_pid();
+        let pid = h.pid();
+        let pid_ns = h
+            .ready
+            .pid_ns()
+            .unwrap_or_else(|| fail("READY must carry the pod pid ns"));
+        assert_eq!(
+            ns_stat(pid, "pid_for_children"),
+            (pid_ns.dev, pid_ns.ino),
+            "READY pid ns"
+        );
+        let init = pod_init_of(pid);
+        assert_eq!(
+            ns_stat(init, "pid"),
+            (pid_ns.dev, pid_ns.ino),
+            "pod init pid ns"
+        );
+        let status = std::fs::read_to_string(format!("/proc/{init}/status")).expect("status");
+        let field = |name: &str| {
+            status
+                .lines()
+                .find_map(|l| l.strip_prefix(name))
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_owned()
+        };
+        assert_eq!(
+            field("NSpid:").split_whitespace().last(),
+            Some("1"),
+            "pod init is PID 1"
+        );
+        assert_eq!(field("CapEff:"), "0000000000000000");
+        let root = std::fs::read_dir(format!("/proc/{init}/root"))
+            .unwrap_or_else(|e| fail(&format!("cannot list the pod init root: {e}")))
+            .count();
+        assert_eq!(root, 0, "pod init root is the empty pod root");
+        let killed = Command::new(KILL)
+            .args(["-9", &init.to_string()])
+            .status()
+            .expect("kill");
+        assert!(killed.success(), "kill the pod init");
+        let started = Instant::now();
+        assert_eq!(
+            h.wait().code(),
+            Some(1),
+            "holder exits 1 when the pod init dies"
+        );
+        assert!(
+            started.elapsed() <= Duration::from_secs(5),
+            "holder exits within 5s"
+        );
+
+        let mut h2 = start_holder_share_pid();
+        let init2 = pod_init_of(h2.pid());
+        assert_eq!(h2.stop_by_eof().code(), Some(0), "stop by EOF exits 0");
+        assert!(
+            !std::path::Path::new(&format!("/proc/{init2}")).exists(),
+            "the pod init is reaped on stop"
+        );
+        println!(
+            "pod_holder_bin_real: scenario G ok: --share-pid holds pod-init as PID 1 of the pod pid ns and exits when it dies (root=false)"
+        );
+    }
+
     fn run_all() -> ExitCode {
         if euid() == 0 {
             println!("pod_holder_bin_real: FAILED: must run as non-root (root=true)");
@@ -630,6 +751,7 @@ mod linux {
         scenario_d();
         scenario_e();
         scenario_f();
+        scenario_g();
         println!(
             "pod_holder_bin_real: the pod-holder mode works end to end in a rootless user namespace (root=false)"
         );

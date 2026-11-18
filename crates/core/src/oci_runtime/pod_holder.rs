@@ -384,6 +384,180 @@ pub fn root_entry_count(root: &PodRoot) -> Result<usize, TraitError> {
     Ok(n)
 }
 
+const MSG_POD_INIT: &str = "failed to start the pod init";
+const MSG_POD_INIT_STOP: &str = "the pod init did not stop within the limit";
+
+/// pod の PID 1（pod-init）のハンドル（CRI-2・CORE-3・SEC-5・SEC-1・#4815。O2）。
+///
+/// 保持役が [`spawn_pod_init`] で 1 回だけ作る。pidfd で同一性を固定し、終了の観測（[`Self::has_exited`]）と停止
+/// （[`Self::kill_and_reap`]）に使う。drop では止めない（保持役の終了時は pod-init の `PR_SET_PDEATHSIG` が止める）。
+#[derive(Debug)]
+pub struct PodInit {
+    pid: u32,
+    pidfd: std::os::fd::OwnedFd,
+}
+
+impl PodInit {
+    /// pod-init の pid（保持役の pid namespace から見た値）。
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// pod-init が終了したか（pidfd が読み取り可能になったか。待たない）。
+    pub fn has_exited(&self) -> Result<bool, TraitError> {
+        sys::poll_readable(self.pidfd.as_fd(), 0)
+            .map_err(|_| TraitError::new(ErrorCode::Internal, MSG_INSPECT))
+    }
+
+    /// 停止の合図（`stop` が読める。保持役では stdin の EOF か入力）か、pod-init の終了の、先に起きたほうまで待つ。
+    ///
+    /// ponytail: 2 つの fd を 1 回の poll で待つラッパーを足さず、`stop` を 1 秒の期限で待つたびに pidfd を見る。pod-init の
+    /// 終了の検出は最大 1 秒遅れる（保持役の終了と `SANDBOX_NOTREADY` の判定には十分。速さが要るなら 2 fd の poll を足す）。
+    pub fn wait_stop_or_exit(
+        &self,
+        stop: std::os::fd::BorrowedFd<'_>,
+    ) -> Result<PodHolderWake, TraitError> {
+        loop {
+            if self.has_exited()? {
+                return Ok(PodHolderWake::PodInitExited);
+            }
+            match sys::poll_readable(stop, 1000) {
+                Ok(true) => return Ok(PodHolderWake::StopReadable),
+                Ok(false) | Err(sys::SysError::Os(sys::EINTR)) => {}
+                Err(_) => return Err(TraitError::new(ErrorCode::Internal, MSG_INSPECT)),
+            }
+        }
+    }
+
+    /// pod-init へ SIGKILL を送り、`limit` まで回収を待つ（pid ns ごと止まる。REPAIR-5）。
+    pub fn kill_and_reap(&self, limit: std::time::Duration) -> Result<(), TraitError> {
+        let _ = sys::pidfd_send_signal(self.pidfd.as_fd(), sys::Signal::Kill);
+        let deadline = std::time::Instant::now() + limit;
+        loop {
+            match sys::wait_pid_nohang(self.pid) {
+                Ok(Some(_)) => return Ok(()),
+                Ok(None) | Err(sys::SysError::Os(sys::EINTR)) => {}
+                Err(_) => return Err(TraitError::new(ErrorCode::Internal, MSG_POD_INIT_STOP)),
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(TraitError::new(ErrorCode::Timeout, MSG_POD_INIT_STOP));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+}
+
+/// [`PodInit::wait_stop_or_exit`] の結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PodHolderWake {
+    /// 停止の合図の fd が読める（EOF を含む）。
+    StopReadable,
+    /// pod-init が終了した（その pid ns では以後 fork できない）。
+    PodInitExited,
+}
+
+/// 保持役が pod の pid namespace を作り、pod-init を PID 1 として fork する（CRI-2・CORE-3・SEC-5・SEC-1・#4815。O2）。
+///
+/// 呼び出し元は保持役の段 2（単一スレッド・pod の userns の capability を落とす前）。手順:
+///
+/// 1. `unshare(CLONE_NEWPID)`。呼び出し側自身は移らず、以後に fork する子が新しい pid ns に入る
+///    （`/proc/self/ns/pid_for_children` が新しい ns を指す。#2776 のパスの供給元）
+/// 2. 1 回だけ fork する。新しい pid ns の最初のプロセスが PID 1 になる（Linux v6.12 の `kernel/pid.c` の `alloc_pid`
+///    〔228〜241 行。新しい ns の最初の割り当ては 1〕と `kernel/fork.c` の `copy_process`〔2558〜2560 行。PID 1 が
+///    `child_reaper`〕）
+/// 3. 子（pod-init）は、親の死で SIGKILL が届くようにしてから親の生存を pidfd で確かめ、自分の mount ns を作って
+///    `/` を再帰 private にし、空の root（[`PodRoot`]）を `/` の上に付けて `pivot_root(".", ".")` で移り、旧 root を
+///    切り離す。自分の mount ns を作るのは、`pivot_root` が同じ root を持つプロセスの root をすべて差し替えるため
+///    （`fs/namespace.c` の `pivot_root` の `chroot_fs_refs`。保持役の root を変えない）
+/// 4. pod-init は fd をすべて閉じ、`SIGCHLD` を無視にして孤児を自動で回収させ（`kernel/signal.c` の
+///    `do_notify_parent`）、capability をすべて落とし、non-dumpable であることを確かめてから待つだけになる
+///
+/// pod-init が死ぬとその pid ns では以後 fork できない（`kernel/pid_namespace.c` の `zap_pid_ns_processes` 179 行の
+/// `disable_pid_allocation` と `kernel/pid.c` の `alloc_pid` 277 行。ns の残りのプロセスも SIGKILL で止まる）。保持役は
+/// [`PodInit::has_exited`] で監視し、死んだら自分も終わる（fail-closed）。
+pub fn spawn_pod_init(root: &PodRoot) -> Result<PodInit, TraitError> {
+    let fail = |code| TraitError::new(code, MSG_POD_INIT);
+    if !sys::self_is_single_threaded() {
+        return Err(TraitError::new(
+            ErrorCode::FailedPrecondition,
+            MSG_MULTI_THREADED,
+        ));
+    }
+    let parent = sys::pidfd_open(std::process::id()).map_err(|_| fail(ErrorCode::Internal))?;
+    sys::unshare_namespaces(&[sys::NsFlag::Pid]).map_err(|e| match e {
+        sys::SysError::Os(errno) if errno == sys::EPERM => {
+            TraitError::new(ErrorCode::PermissionDenied, MSG_DENIED)
+        }
+        _ => fail(ErrorCode::Internal),
+    })?;
+    let pid = sys::fork_single_threaded(
+        || pod_init_main(parent.as_fd(), root.fd.as_fd()),
+        POD_INIT_PANIC_EXIT,
+    )
+    .map_err(|_| fail(ErrorCode::Internal))?;
+    let pidfd = sys::pidfd_open(pid).map_err(|_| fail(ErrorCode::Internal))?;
+    Ok(PodInit { pid, pidfd })
+}
+
+/// pod-init の panic 時の終了コード。
+const POD_INIT_PANIC_EXIT: i32 = 70;
+
+/// pod-init の本体（fork した子で動く。戻り値は失敗時の終了コードで、成功すれば戻らない）。
+fn pod_init_main(parent: std::os::fd::BorrowedFd<'_>, root: std::os::fd::BorrowedFd<'_>) -> i32 {
+    if sys::set_parent_death_sigkill().is_err() {
+        return 71;
+    }
+    // 設定より前に親が死んでいたらシグナルは届かないため、ここで確かめる。
+    if !matches!(sys::poll_readable(parent, 0), Ok(false)) {
+        return 72;
+    }
+    if sys::unshare_namespaces(&[sys::NsFlag::Mount]).is_err() {
+        return 73;
+    }
+    if sys::mount_root_private_recursive().is_err() {
+        return 74;
+    }
+    let Ok(old_root) = sys::open_dir_path_nofollow(None, c"/") else {
+        return 75;
+    };
+    if sys::move_mount_empty_path(root, old_root.as_fd()).is_err() {
+        return 76;
+    }
+    if sys::change_dir_fd(root).is_err()
+        || sys::pivot_root_dot().is_err()
+        || sys::change_dir_fd(old_root.as_fd()).is_err()
+        || sys::umount_cwd_detach().is_err()
+        || std::env::set_current_dir("/").is_err()
+    {
+        return 77;
+    }
+    drop(old_root);
+    if sys::close_fds_from(0).is_err() {
+        return 78;
+    }
+    if sys::ignore_child_signal().is_err() {
+        return 79;
+    }
+    if sys::cap_ambient_clear_all().is_err()
+        || sys::cap_set_thread(sys::ThreadCaps {
+            effective: [0; 2],
+            permitted: [0; 2],
+            inheritable: [0; 2],
+        })
+        .is_err()
+    {
+        return 80;
+    }
+    if !matches!(sys::is_dumpable(), Ok(false)) {
+        return 81;
+    }
+    // ponytail: 待つだけ。孤児の回収はカーネルが自動で行う（SIGCHLD を無視にした）ため起きる必要が無い。
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
+}
+
 /// 自プロセスの namespace を開く(固定の `/proc/self/ns/*` のみ。外部入力は使わない)。
 fn open_self_ns(path: &std::ffi::CStr) -> Result<std::os::fd::OwnedFd, TraitError> {
     sys::open_ns_file(path).map_err(|_| TraitError::new(ErrorCode::Internal, MSG_INSPECT))

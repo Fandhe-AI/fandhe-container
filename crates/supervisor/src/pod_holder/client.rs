@@ -84,7 +84,7 @@ mod tests {
 
     fn ready() -> PodHolderReady {
         let ns = |i| NsId { dev: 4, ino: i };
-        PodHolderReady::new(77, ns(10), ns(11), ns(12), ns(13)).unwrap()
+        PodHolderReady::new(77, ns(10), ns(11), ns(12), ns(13), None).unwrap()
     }
 
     fn soon() -> Instant {

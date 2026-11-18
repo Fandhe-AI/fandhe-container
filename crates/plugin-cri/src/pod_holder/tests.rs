@@ -25,7 +25,7 @@ fn octal(bytes: &[u8]) -> String {
 
 fn ready_frame(pid: u32) -> String {
     let ns = |i| NsId { dev: 4, ino: i };
-    let r = PodHolderReady::new(pid, ns(10), ns(11), ns(12), ns(13)).unwrap();
+    let r = PodHolderReady::new(pid, ns(10), ns(11), ns(12), ns(13), None).unwrap();
     format!("printf '{}'", octal(PodHolderFrame::ready(&r).as_bytes()))
 }
 
@@ -70,7 +70,7 @@ fn insert_child(p: &ProductionPodHolder, id: &str, script: &str) -> u32 {
     let pid = c.id();
     let stdin = c.stdin.take();
     let ns = |i| NsId { dev: 4, ino: i };
-    let ready = PodHolderReady::new(pid, ns(10), ns(11), ns(12), ns(13)).unwrap();
+    let ready = PodHolderReady::new(pid, ns(10), ns(11), ns(12), ns(13), None).unwrap();
     p.insert_for_test(id, c, stdin, ready);
     pid
 }
@@ -419,7 +419,7 @@ impl Staged {
     /// 自分の pid を READY に入れる偽の保持役（`$$` を欄 A に出し、`tail` の後に stdin の EOF まで生きる）。
     fn script(&self, tail: &str) -> String {
         let f = PodHolderFrame::ready(
-            &PodHolderReady::new(1, self.user, self.ipc, self.net, self.mnt).unwrap(),
+            &PodHolderReady::new(1, self.user, self.ipc, self.net, self.mnt, None).unwrap(),
         );
         let b = f.as_bytes();
         let (head, rest) = (octal(&b[..8]), octal(&b[16..]));
@@ -680,7 +680,7 @@ fn plug11_4483_supervisor_beside_resolution_is_shared() {
 #[test]
 fn cri2_sec5_2940_holder_from_ready_carries_exact_identity() {
     let ns = |i| NsId { dev: 4, ino: i };
-    let ready = PodHolderReady::new(4242, ns(10), ns(11), ns(12), ns(13)).unwrap();
+    let ready = PodHolderReady::new(4242, ns(10), ns(11), ns(12), ns(13), None).unwrap();
     let holder = holder_from_ready(&ready, 123456).unwrap();
     let id = holder.identity().unwrap();
     assert_eq!(holder.pid().get(), 4242);

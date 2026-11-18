@@ -5320,6 +5320,26 @@ pub(crate) fn ignore_stop_signals() -> Result<(), SysError> {
     Ok(())
 }
 
+/// `SIGCHLD` の disposition を `SIG_IGN` にし、子（付け替わった孤児を含む）をカーネルに自動で回収させる
+/// （CRI-2・SEC-1・#4815）。
+///
+/// pod の PID 1（pod-init。`oci_runtime::pod_holder::spawn_pod_init`）が、`waitpid` のループを持たずに孤児の回収だけを行う
+/// ために呼ぶ。Linux v6.12 の `kernel/signal.c` の `do_notify_parent`（2117〜2134 行）は、親の `SIGCHLD` が `SIG_IGN` の子を
+/// 自動回収する。無視は `fork` の子と `execve` へ継承されるため、exec しない pod-init だけが呼ぶ。
+pub(crate) fn ignore_child_signal() -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: 引数は整数（`SIGCHLD` の定数と `SIG_IGN` = 1）のみでポインタを取らない。ハンドラ関数を登録しないため、
+    // シグナルハンドラの再入・非同期安全性の問題は生じない。変えるのは呼び出しプロセスの `SIGCHLD` の disposition だけ。
+    let prev = unsafe { signal(consts::SIGCHLD, SIG_IGN) };
+    if prev == SIG_ERR {
+        Err(last_error())
+    } else {
+        Ok(())
+    }
+}
+
 /// 呼び出しプロセスを新しいセッションのリーダーにし、制御端末から切り離す（`setsid(2)`。
 /// SUP-6・SEC-1・TASK-163 追補・#1456）。戻り値は新しいセッション ID（= 呼び出しプロセスの pid）。
 ///

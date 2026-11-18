@@ -14,8 +14,9 @@ name: CI
 # 適合させるため、本 workflow が pull_request で生成する check-run 14 件（ci-complete・
 # lint-docs / * 5 件・rust-ci (ubuntu-latest) / * 5 件・platform-ci (ubuntu-latest) 1 件・
 # bench-regression 1 件・cross-target-check 1 件）をすべて個別に登録する。
-# push（main）・workflow_dispatch では platform-ci が 3 OS になり 16 件
-# （platform-ci (macos-latest)・platform-ci (windows-latest) が加わる）。
+# push（main）・workflow_dispatch では platform-ci が 3 OS と arm64 の Linux になり 17 件
+# （platform-ci (macos-latest)・platform-ci (windows-latest)・platform-ci (ubuntu-24.04-arm) が加わる。
+# arm64 は #4771 の決定・#4807）。
 # 2026-10-10 に macOS ランナーの同時実行枠（1 枠程度）待ちで全 PR の CI が詰まったため、
 # オーナー承認のもとで 3 OS のジョブを 2 段階で再構成した。
 # - 1 段階目（#1724）: rust-ci は ubuntu のみ・rust-ci-default-features と integration-test は
@@ -27,7 +28,7 @@ name: CI
 #   workflow_dispatch（release 前の 3 OS 確認を含む）で行う（ci.md「3 OS CI」）
 # 差し替えの ruleset 更新は main セッションが行う（下の ci-complete ジョブのコメント参照）。
 # ruleset に登録するのは PR で生成される 14 件で、push（main）だけで生成される
-# platform-ci (macos-latest|windows-latest) は登録しない（登録すると PR が永久に待ちになる）。
+# platform-ci (macos-latest|windows-latest|ubuntu-24.04-arm) は登録しない（登録すると PR が永久に待ちになる）。
 # 件数の範囲に注意: 14 件は本 workflow 分のみで、ruleset の必須チェック全体は
 # 本 workflow 分に本 workflow の外が生成する 4 件を足した 18 件になる。外の 4 件は
 # ai-review.yml の codex / preflight・codex / review・codex / post_feedback 3 件と、
@@ -333,8 +334,15 @@ jobs:
   #   macOS・Windows 向けのコンパイル・lint の誤りは cross-target-check（Linux 上の型検査）で
   #   PR ごとに検出する
   # - push（main）・workflow_dispatch: ubuntu・macos・windows の 3 OS（従来どおり全ステップ。
-  #   macOS・Windows の `--all-features` の clippy / test を含む）。release 前の 3 OS 確認は
-  #   workflow_dispatch で本 workflow を実行して行う
+  #   macOS・Windows の `--all-features` の clippy / test を含む）と、arm64 の Linux（ubuntu-24.04-arm。
+  #   #4771 の決定・#4807）。release 前の 3 OS 確認は workflow_dispatch で本 workflow を実行して行う
+  # - arm64 の Linux の leg は、ubuntu の leg と同じ「実機前提でない」ステップ（既定 feature の lint・test・doc、
+  #   `--all-features` の clippy・test、タイムアウトつきの結合試験、スクリプトの自己テスト）を回し、aarch64 の
+  #   実行時の正しさ（syscall 番号・seccomp の arch・構造体の配置）を確かめる。実機前提の `--ignored` のステップ
+  #   （AppArmor の緩和以降）と、結果が OS・アーキテクチャに依らない依存監査（cargo-deny・cargo-about）・委譲スコープの
+  #   ハングプローブは `matrix.os == 'ubuntu-latest'` で x86_64 の ubuntu だけに残す。実機前提を arm64 へ広げるかは
+  #   後続（#4810）が dispatch で確かめる。macOS・Windows と同じく main・dispatch だけで出る check-run で、必須チェックに
+  #   登録しない
   # PR で見落とすのは macOS・Windows 固有の実行時の誤り（テストの失敗・BSD / Git Bash のツール差）で、
   # main への push 後の 3 OS 実行で検出する（rustdoc のリンクは cross-target-check が PR で検出する）。
   # main への新しい push は古い main の実行を取り消す（concurrency のコメント参照）。
@@ -485,13 +493,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # pull_request では ubuntu のみ、push（main）・workflow_dispatch では 3 OS（上記コメント参照）。
+        # pull_request では ubuntu のみ、push（main）・workflow_dispatch では 3 OS と arm64 の Linux（上記コメント参照）。
         # `&&` / `||` の三項相当は両分岐とも空でない文字列リテラルのため取り違えない。
         # github.event_name は GitHub が設定する値で、利用者の入力を含まない
         os: >-
           ${{ fromJSON(github.event_name == 'pull_request'
           && '["ubuntu-latest"]'
-          || '["ubuntu-latest", "macos-latest", "windows-latest"]') }}
+          || '["ubuntu-latest", "macos-latest", "windows-latest", "ubuntu-24.04-arm"]') }}
     runs-on: ${{ matrix.os }}
     # ハングしたジョブの無期限実行を防ぐ多層防御。ubuntu は 35 分、macOS・Windows は 60 分（#3505）。
     # ubuntu ではランナー VM ごと止まる間欠事象があり、止まるとステップの timeout-minutes が効かず
@@ -511,6 +519,8 @@ jobs:
     # workflow_dispatch 以外で null になり `null != 'none'` が真になるため、github.event_name で先に絞る。
     # 代償: ubuntu の最後の container_grpc のステップ（開始は約 21〜25 分、試験の watchdog 各 900 秒、
     # 補助の期限 1860 秒）がハングすると、watchdog・補助より先にジョブの上限で取り消される
+    # arm64 の Linux の leg（ubuntu-24.04-arm。#4807）は `matrix.os == 'ubuntu-latest'` に当たらないため 60 分になる
+    # （実機前提のステップを回さず、所要時間の実測がまだ無いため macOS・Windows と同じ上限にし、初回の実測で見直す）
     timeout-minutes: >-
       ${{ matrix.os == 'ubuntu-latest'
       && github.event_name == 'workflow_dispatch' && inputs.repeat-user-scope
@@ -614,11 +624,11 @@ jobs:
       # （`--locked` なし）。Linux は rust-ci (ubuntu-latest) が実行するため重複させない。
       # timeout-minutes は reusable の clippy / test ジョブの既定値（各 30 分）に合わせる
       - name: cargo clippy（--all-features。macOS・Windows のみ）
-        if: runner.os != 'Linux'
+        if: matrix.os != 'ubuntu-latest'
         timeout-minutes: 30
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: cargo test（--all-features。macOS・Windows のみ）
-        if: runner.os != 'Linux'
+        if: matrix.os != 'ubuntu-latest'
         timeout-minutes: 30
         run: cargo test --workspace --all-features
       # rustdoc の警告（壊れた intra-doc リンク・private 項目へのリンク等）を -D warnings で fail
@@ -785,7 +795,7 @@ jobs:
       # （scripts/targets/deny-poc-venus-jig.sh・install-cargo-about.sh）。PR は自 PR と main のキャッシュしか
       # 読めず、main の push が保存したものを使う。新ジョブではなく既存ジョブのステップ（check-run 件数は不変）
       - name: cargo-deny・cargo-about のバイナリをキャッシュ復元（ubuntu のみ）
-        if: runner.os == 'Linux'
+        if: matrix.os == 'ubuntu-latest'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -794,7 +804,7 @@ jobs:
           key: cargo-tools-${{ runner.os }}-${{ hashFiles('scripts/versions.sh') }}
 
       - name: venus 試験治具の Cargo.lock の依存監査（cargo deny。ubuntu のみ）
-        if: runner.os == 'Linux'
+        if: matrix.os == 'ubuntu-latest'
         shell: bash
         timeout-minutes: 20
         run: make deny-poc-venus-jig
@@ -802,7 +812,7 @@ jobs:
       # ライセンス判定は OS に依らず、cargo-deny の導入を 3 回払わないため ubuntu のみ。
       # 既存ジョブへのステップ追加のため check-run 名は増えない。
       - name: deny.toml のライセンス fail-closed 自己テスト（OSS-4・OSS-5・REPAIR-9・TASK-90.2。ubuntu のみ）
-        if: runner.os == 'Linux'
+        if: matrix.os == 'ubuntu-latest'
         shell: bash
         timeout-minutes: 5
         run: make deny-license-fail-closed-selftest
@@ -810,7 +820,7 @@ jobs:
       # bans の判定も OS に依らず、cargo-deny の導入を 3 回払わないため ubuntu のみ。
       # 既存ジョブへのステップ追加のため check-run 名は増えない。
       - name: deny.toml の [bans] の rust-vmm 禁止クレートの fail-closed 自己テスト（MVM-4・REPAIR-9・TASK-73.2。ubuntu のみ）
-        if: runner.os == 'Linux'
+        if: matrix.os == 'ubuntu-latest'
         shell: bash
         timeout-minutes: 5
         run: make deny-bans-fail-closed-selftest
@@ -820,7 +830,7 @@ jobs:
       # 既存の platform-ci のステップとして足すため check-run 名は増えない（ruleset の変更は不要）。
       # 自己テストはスタブのみで OS に依らない。
       - name: ライセンス表記生成スクリプトの自己テスト（OSS-5・TASK-103.1。ubuntu のみ）
-        if: runner.os == 'Linux'
+        if: matrix.os == 'ubuntu-latest'
         shell: bash
         timeout-minutes: 5
         run: make third-party-licenses-selftest
@@ -829,7 +839,7 @@ jobs:
       # 固定導入し、版の完全一致を検査してから生成する（action は追加しない）。生成物はコミットせず
       # target/ 配下に出す。run に ${{ }} は埋め込まない。
       - name: サードパーティのライセンス表記を生成（cargo about。ubuntu のみ）
-        if: runner.os == 'Linux'
+        if: matrix.os == 'ubuntu-latest'
         shell: bash
         timeout-minutes: 20
         run: |
@@ -974,7 +984,7 @@ jobs:
       # timeout-minutes が効くか・原因がどれか（fd の保持 / scope / 主プロセス）を切り分ける。helper は対策後の形が
       # 期限内に失敗することの実証。戻った場合も false-green を防ぐため exit 1。新ジョブにしない（check-run 件数は不変）
       - name: 委譲スコープ実行のハングプローブ（#3486。workflow_dispatch の scope-hang-probe 指定時のみ）
-        if: env.SCOPE_HANG_PROBE != 'none' && runner.os == 'Linux'
+        if: env.SCOPE_HANG_PROBE != 'none' && matrix.os == 'ubuntu-latest'
         timeout-minutes: 3
         run: |
           set -uo pipefail
@@ -1130,7 +1140,7 @@ jobs:
       # platform-ci のクリティカルパスだったため。本ステップは macOS・Windows（main への push と
       # workflow_dispatch）だけで実行する。ubuntu の検証範囲は変わらない
       - name: CLI 比較スクリプトの期限・回収の自己テスト（#1688・REPAIR-5・REPAIR-12。macos・windows。ubuntu は bench-regression）
-        if: env.HANG_PROBE != 'true' && runner.os != 'Linux'
+        if: env.HANG_PROBE != 'true' && matrix.os != 'ubuntu-latest'
         timeout-minutes: 5
         run: make cli-parity-native-reclaim-selftest
 
@@ -1204,7 +1214,7 @@ jobs:
       # ubuntu の実行は bench-regression ジョブ（run-parallel の並列グループ）へ移した: 待ちが大半で約 60 秒
       # クリティカルパスだったため（#4475）。macOS の /bin/bash 3.2 での確認は従来どおり本ステップで行う
       - name: scripts/lib.sh の判定の回帰テスト（macos・windows。ubuntu は bench-regression）
-        if: env.HANG_PROBE != 'true' && runner.os != 'Linux'
+        if: env.HANG_PROBE != 'true' && matrix.os != 'ubuntu-latest'
         timeout-minutes: 5
         run: make lib-selftest
 
@@ -1249,7 +1259,7 @@ jobs:
       # 既存ジョブのステップ（check-run 件数は不変）
       # ubuntu の実行は待ちが大半で約 87 秒クリティカルパスだったため bench-regression へ移した（#4475）
       - name: 試験の繰り返し実行スクリプトの自己テスト（#2538・#4475・REPAIR-12。macos・windows。ubuntu は bench-regression）
-        if: env.HANG_PROBE != 'true' && runner.os != 'Linux'
+        if: env.HANG_PROBE != 'true' && matrix.os != 'ubuntu-latest'
         timeout-minutes: 5
         run: make repeat-test-selftest
 
@@ -1287,7 +1297,7 @@ jobs:
         run: make docker-hub-ratelimit-probe-selftest
 
       - name: AppArmor の非特権 user namespace 制限を緩和（unshare_isolation 用・Linux のみ。CORE-1・SEC-5）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 2
         run: |
           set -euo pipefail
@@ -1305,11 +1315,11 @@ jobs:
           fi
 
       - name: unshare_isolation のビルド（実行タイムアウトの時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         run: cargo test -p fandhe-container-core --test unshare_isolation --no-run
 
       - name: unshare_isolation の実行（実機前提テスト・--ignored。CORE-1・SEC-5・TASK-27.2）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -1331,11 +1341,11 @@ jobs:
       # 成功行はシナリオごとに照合する: 別の user namespace の対象の拒否・pivot 済みの対象へ参加した後の `/`・
       # `setgroups` が deny の user namespace での補助グループの扱い（TASK-163 追補・#1457・#1460）。
       - name: exec_setns_join のビルド（Linux のみ。SUP-6・TASK-163.1）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         run: cargo test -p fandhe-container-supervisor --features exec-test-support --test exec_setns_join --no-run
 
       - name: exec_setns_join の実行（実機前提テスト・--ignored。SUP-6・TASK-163.1）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -1363,7 +1373,7 @@ jobs:
       # hosted runner では実行しない（sudo の用途は増やさない）ため、ここでは型検査・ビルドだけを行う。
       # 実行は AGENTS.md「実機前提テスト」の手順で実機に対して行い、結果を PR に記録する。
       - name: exec のビルド（Linux のみ。実行は実機前提。SUP-6・TASK-163.4）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         run: cargo test -p fandhe-container-supervisor --features exec-test-support --test exec --no-run
 
       # container_options_ipc（`crates/supervisor/tests/container_options_ipc.rs`。SUP-12・TASK-169.3・#528）:
@@ -1371,11 +1381,11 @@ jobs:
       # unshare_isolation と同じく Linux 限定・上で緩和した sysctl を再利用し、新しい check-run・sudo・
       # permissions は追加しない。`--ignored` が届かなくても exit 0 になるため成功行を共通スクリプトで照合する（#2825・REPAIR-12）。
       - name: container_options_ipc のビルド（実行タイムアウトの時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         run: cargo test -p fandhe-container-supervisor --test container_options_ipc --no-run
 
       - name: container_options_ipc の実行（実機前提テスト・--ignored。SUP-12・TASK-169.3）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -1395,11 +1405,11 @@ jobs:
       # permissions は追加しない（rootless 経路のみ。rootful 経路は未検証）。`--ignored` が届かなくても
       # exit 0 になるため成功行を共通スクリプトで照合する（#2825・REPAIR-12）。
       - name: tmpfs_mount のビルド（実行タイムアウトの時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         run: cargo test -p fandhe-container-core --test tmpfs_mount --no-run
 
       - name: tmpfs_mount の実行（実機前提テスト・--ignored。SUP-12・TASK-169.2）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -1419,12 +1429,12 @@ jobs:
       # ホストのマウントは変えない。`--ignored` が届かなくても exit 0 になるため、成功行を共通スクリプトで
       # 照合し、前提（util-linux の unshare・非特権の user / mount namespace）は事前に fail-closed で確認する。
       - name: exec_child_setup のビルド（実行タイムアウトの時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: cargo test -p fandhe-container-core --test exec_child_setup --no-run
 
       - name: exec_child_setup の実行（実機前提テスト・--ignored。SUP-6・SEC-1・#2885）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -1451,11 +1461,11 @@ jobs:
       # 上で緩和した sysctl を再利用し、新しい check-run・sudo・permissions は追加しない（rootless 経路のみ。
       # rootful 経路は人間担当で #1621 に記録する）。成功行を共通スクリプトで照合する（#2825・REPAIR-12）。
       - name: readonly_paths のビルド（実行タイムアウトの時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         run: cargo test -p fandhe-container-core --test readonly_paths --no-run
 
       - name: readonly_paths の実行（実機前提テスト・--ignored。SEC-2・#1850）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -1468,11 +1478,11 @@ jobs:
             --forbid 'readonly_paths: ignored' --forbid 'not applicable' --forbid 'root=true' --summary
 
       - name: config_paths_implicit_dev のビルド（実行タイムアウトの時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         run: cargo test -p fandhe-container-core --test config_paths_implicit_dev --no-run
 
       - name: config_paths_implicit_dev の実行（実機前提テスト・--ignored。SEC-2・#2015）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -1495,11 +1505,11 @@ jobs:
       # ro-clear の防御なしの errno は測定値のため assert しない（防御ありの EPERM と測定成立は試験自身が assert する）。
       # --ignored が届かないと exit 0 になるため、成功行 3 本を行頭・行末固定で照合して false-green を防ぐ。
       - name: sysfs_mount のビルド（実行タイムアウトの時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         run: cargo test -p fandhe-container-core --test sysfs_mount --no-run
 
       - name: sysfs_mount の実行（実機前提テスト・--ignored。SEC-2・SEC-1・#2305・#2533）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -1530,11 +1540,11 @@ jobs:
       # tmpfs_mount と同じく上で緩和した sysctl を再利用し、新しい check-run・sudo・permissions は
       # 追加しない（rootless 経路のみ。rootful 経路は未検証）。成功行を共通スクリプトで照合する（#2825・REPAIR-12）。
       - name: inject_files のビルド（実行タイムアウトの時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         run: cargo test -p fandhe-container-core --test inject_files --no-run
 
       - name: inject_files の実行（実機前提テスト・--ignored。SUP-12・TASK-169.4.2）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -1552,11 +1562,11 @@ jobs:
       # 新しい check-run・sudo・permissions は追加しない（rootless 経路のみ。rootful 経路は未検証）。
       # 成功行を共通スクリプトで照合する（#2825・REPAIR-12）。
       - name: etc_files_mount のビルド（実行タイムアウトの時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         run: cargo test -p fandhe-container-core --test etc_files_mount --no-run
 
       - name: etc_files_mount の実行（実機前提テスト・--ignored。NET-12・#1872）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -1575,11 +1585,11 @@ jobs:
       # 上で緩和した sysctl を再利用し、新しい check-run・sudo・permissions は追加しない（rootless 経路のみ。rootful 経路は未検証・#1621）。
       # 成功行は `(root=false)` まで固定のリテラルのため --subst は付けず、成功行を共通スクリプトで照合する（REPAIR-12）。
       - name: bind_mounts_real のビルド（実行タイムアウトの時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         run: cargo test -p fandhe-container-core --test bind_mounts_real --no-run
 
       - name: bind_mounts_real の実行（実機前提テスト・--ignored。SEC-1・SEC-5・#1916）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -1597,12 +1607,12 @@ jobs:
       # 新しい check-run・sudo・permissions は追加しない（rootless 経路のみ。rootful 経路は未検証で #319 が担う）。
       # `--ignored` が届かなくても exit 0 になるため成功行を試験ソースから導出して双方向に照合する（#2825・REPAIR-12）。
       - name: lo_self_delivery のビルド（実行タイムアウトの時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: cargo test -p fandhe-container-net --test lo_self_delivery --no-run
 
       - name: lo_self_delivery の実行（実機前提テスト・--ignored。NET-2・NET-11・#2077）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -1619,12 +1629,12 @@ jobs:
       # （harness = false）。上で緩和した sysctl を使い回し、新しい check-run・sudo・permissions は追加しない（rootless のみ）。
       # `--ignored` が届かなくても exit 0 になるため成功行を試験ソースから導出して双方向に照合する（#2825・REPAIR-12）。
       - name: netns_holder_userns のビルド（実行タイムアウトの時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: cargo test -p fandhe-container-net --test netns_holder_userns --no-run
 
       - name: netns_holder_userns の実行（実機前提テスト・--ignored。NET-9・CORE-6・#3197）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -1644,12 +1654,12 @@ jobs:
       # 場面 V6（#4572）として、IPv4 の失敗の後に [::1] でつなぎ直して [::1] だけで待ち受ける対象へ届くことも照合する。
       # 成功行 6 行を試験ソースから導出して双方向に照合し（--min 6）、件数減を fail-closed にする（#2825・REPAIR-12）。
       - name: netns_dial_userns のビルド（実行タイムアウトの時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: cargo test -p fandhe-container-net --test netns_dial_userns --no-run
 
       - name: netns_dial_userns の実行（実機前提テスト・--ignored。CRI-6・NET-3・SEC-1・#4479・#4480）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -1667,12 +1677,12 @@ jobs:
       # 上で緩和した sysctl を使い回し、新しい check-run・sudo・permissions は追加しない（rootless のみ）。
       # `--ignored` が届かなくても exit 0 になるため成功行を試験ソースから導出して双方向に照合する（#2825・REPAIR-12）。
       - name: netns_holder_launch_userns のビルド（実行タイムアウトの時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: cargo test -p fandhe-container-supervisor --test netns_holder_launch_userns --no-run
 
       - name: netns_holder_launch_userns の実行（実機前提テスト・--ignored。NET-9・CORE-1・#3198）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -1691,7 +1701,7 @@ jobs:
       # 委譲スコープで包まず、scope を作らない補助で期限だけ持つ（試験自身の期限は 1 ケース 40 秒。補助 240 秒、ステップ 5 分の順）。
       # 上で緩和した sysctl を使い回し、新しいジョブ・check-run・sudo・permissions は増やさない。root の分岐は CI で回さない。
       - name: pod_holder のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |
           set -euo pipefail
@@ -1706,7 +1716,7 @@ jobs:
           echo "PH_BIN=${bins}" >> "$GITHUB_ENV"
 
       - name: pod_holder の実行（実機前提テスト・--ignored。CRI-2・CORE-3・SEC-5・#2875）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -1725,7 +1735,7 @@ jobs:
       # 範囲写像（`FANDHE_CONTAINER_TEST_ID_HELPER=1`）を要求する。委譲スコープでは包まない。util-linux の nsenter・setpriv が要る
       # （ランナーイメージの既定）。新しいジョブ・check-run・sudo・permissions は増やさない。
       - name: pod_holder_bin_real のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |
           set -euo pipefail
@@ -1741,7 +1751,7 @@ jobs:
           echo "PHB_BIN=${bins}" >> "$GITHUB_ENV"
 
       - name: pod_holder_bin_real の実行（実機前提テスト・--ignored。CRI-2・CORE-1・SEC-5・#2875）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |
           set -euo pipefail
@@ -1761,7 +1771,7 @@ jobs:
       # 試験自身の watchdog が 240 秒のため、補助 540 秒・ステップ 10 分とし、試験の watchdog、補助、ステップ、ジョブの順を保つ。
       # 上で緩和した AppArmor の sysctl を使い回す。委譲スコープでは包まない。新しいジョブ・check-run・sudo・permissions は増やさない。
       - name: pod_holder_provider_real のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |
           set -euo pipefail
@@ -1778,7 +1788,7 @@ jobs:
           echo "PHPR_BIN=${bins}" >> "$GITHUB_ENV"
 
       - name: pod_holder_provider_real の実行（実機前提テスト・--ignored。CRI-2・CORE-1・SEC-5・#2877）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |
           set -euo pipefail
@@ -1803,12 +1813,12 @@ jobs:
       # `--test-threads=1` は、解放された namespace の inode 番号を並行して走る
       # 別の試験の新しい namespace が再利用し「参照者 0 件」の判定が誤って失敗するのを避けるため（判定は緩めない）。
       - name: runtime_service_namespaces のビルド（実行タイムアウトの時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: cargo test -p fandhe-container-cri --test runtime_service_namespaces --no-run
 
       - name: runtime_service_namespaces の実行（実機前提テスト・--ignored。CRI-2・TASK-59.2・TASK-59.3）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -1829,12 +1839,12 @@ jobs:
       # 外側の試験は `unshare` で自身を再実行し内側の子が stdout を引き継ぐため、同じ `ok` 行が 2 回出るが受理される
       # （自己テストの「libtest module duplicated nested ok line」）。外側の成否は補助 run-with-deadline.sh が子の終了コードを素通しして担う（#2959・#3505）。
       - name: sec1_2536_protected_root_on_real_overlay のビルド（実行タイムアウトの時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: cargo test -p fandhe-container-core --lib --no-run
 
       - name: sec1_2536_protected_root_on_real_overlay の実行（実機前提テスト・--ignored。SEC-1・OCI-4・SEC-5・#2536）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -1855,7 +1865,7 @@ jobs:
       # 確かめる実機前提テスト。上で緩和した sysctl を使い回す。ビルドは sec1_2536 のステップが済ませた lib を使い回す。
       # 結果行（`ok`）と内側の成功行 `ok: sec1_2823_overmount` を、check-success-lines.sh が試験ソースから導出して照合する（#2959）。
       - name: sec1_2823_overmount_hides_child_in_real_namespace の実行（実機前提テスト・--ignored。SEC-1・CORE-2・#2823）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -1875,7 +1885,7 @@ jobs:
       # pid ns の受理・所有者違い・孫の拒否と、join の後に fork した子の pid ns の一致）も照合する。上で緩和した sysctl を使い回し、ビルドは sec1_2536 のステップの lib を使い回す
       # （新しいビルドステップは足さない）。pid の試験は fork するため `--test-threads=1` で他の試験と並べない。新しいジョブ・check-run・sudo は増やさない。
       - name: net3_2872_real_holder_net_join_identity_and_ownership の実行（実機前提テスト・--ignored。NET-3・SEC-5・#2872・#2875）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -1884,6 +1894,7 @@ jobs:
             cargo test -p fandhe-container-core --lib -- --ignored --exact \
               oci_runtime::namespace_join::tests::net3_2872_real_holder_net_join_identity_and_ownership \
               oci_runtime::namespace_join::tests::cri2_core3_4809_real_holder_pid_join_identity_and_ownership \
+              oci_runtime::namespace_join::tests::cri2_core3_4806_shm_clone_via_holder_mnt_ns \
               --test-threads=1
           scripts/check-success-lines.sh --name net3_2872_real_holder_net_join_identity_and_ownership \
             --src crates/core/src/oci_runtime/namespace_join.rs --log "${log}" \
@@ -1899,7 +1910,7 @@ jobs:
       # false-red になるだけで false-green にはならない）。`2 passed` を照合するため 1 回の起動で 2 件を実行する。
       # 成功行（mod 内の試験なので module 接頭辞つき）は `--libtest-module` で試験ソースから導出して照合する。
       - name: gpu cdi hooks の namespace 試験のビルド（バイナリの特定。GPU-2・SEC-1・#2987）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |
           set -euo pipefail
@@ -1915,7 +1926,7 @@ jobs:
           echo "GPU_LIB_TEST_BIN=${bins}" >> "$GITHUB_ENV"
 
       - name: gpu cdi hooks の namespace 試験の実行（実機前提テスト・--ignored。GPU-2・SEC-1・#2987）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -1938,7 +1949,7 @@ jobs:
       # check-run・permissions は増やさない。試験はバッチを送らずホストの nftables に触れない。`--ignored` が届かなくても
       # exit 0 になるため、成功行を試験ソースから導出して照合する（`--libtest-module`）。
       - name: net の socket 世代の namespace 試験のビルド（バイナリの特定。NET-3・SEC-1・#3356）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |
           set -euo pipefail
@@ -1954,7 +1965,7 @@ jobs:
           echo "NET_LIB_TEST_BIN=${bins}" >> "$GITHUB_ENV"
 
       - name: net の socket 世代の namespace 試験の実行（実機前提テスト・--ignored。NET-3・SEC-1・#3068・#3356）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -1979,7 +1990,7 @@ jobs:
       # ubuntu-latest が新しい世代へ変わってここが落ちたら、確認を緩めず `id-mapping-probe` を回し直して判断する。
       # root で走る分岐（root=true）は CI では回さない（実機確認は #1621）。新しい check-run・permissions は追加しない。
       - name: 範囲写像と委譲 cgroup の前提確認（sudo なし。CORE-6・SEC-5・#2376）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 2
         run: |
           set -euo pipefail
@@ -2020,7 +2031,7 @@ jobs:
           github.event_name == 'workflow_dispatch' &&
           inputs.repeat-user-scope &&
           inputs.repeat-test-bin != '' &&
-          runner.os == 'Linux' && env.HANG_PROBE != 'true' &&
+          matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true' &&
           (inputs.repeat-os == 'all' || inputs.repeat-os == matrix.os)
         shell: bash
         timeout-minutes: 55
@@ -2048,12 +2059,12 @@ jobs:
       # `--ignored` が届かなくても exit 0 になるため、成功行を行単位の完全一致で照合し、`ignored` 行の出現は失敗にする。
       # root で走る分岐は CI では回さない（実機確認は #1621）。
       - name: userns_extract のビルド（実行タイムアウトの時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: cargo test -p fandhe-container-oci --test userns_extract --no-run
 
       - name: userns_extract の実行（実機前提テスト・--ignored。OCI-2・SEC-5・#2542・#2642）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -2073,12 +2084,12 @@ jobs:
       # 非特権の user / mount namespace の中の実マウントで照合する実機前提テスト（harness = false）。
       # 新しい check-run・sudo・permissions は追加しない。成功行は行単位の完全一致で照合し、`ignored` 行の出現は失敗にする。
       - name: image_store_xdev のビルド（実行タイムアウトの時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: cargo test -p fandhe-container-oci --test image_store_xdev --no-run
 
       - name: image_store_xdev の実行（実機前提テスト・--ignored。OCI-7・SEC-1・ERR-1・#2701）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -2096,12 +2107,12 @@ jobs:
       # 依存するためその後に置く。`USER` を渡す。新しい check-run・sudo・permissions は追加しない。成功行は試験ソースから導出して
       # 双方向に照合し、`ignored` 行の出現は失敗にする。root で走る分岐は CI では回さない（#1621）。
       - name: staged_blob_owner のビルド（実行タイムアウトの時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: cargo test -p fandhe-container-oci --test staged_blob_owner --no-run
 
       - name: staged_blob_owner の実行（実機前提テスト・--ignored。OCI-7・SEC-1・SEC-5・#2907）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -2119,12 +2130,12 @@ jobs:
       # 委譲スコープは使わず scope を作らない補助で期限だけ持つ（試験の watchdog 120 秒 < 補助 240 秒 < ステップ < ジョブ）。
       # 新しい check-run・sudo・permissions は追加しない。root の分岐は CI では回さない（#1621）。
       - name: userns_helper_real のビルド（実行タイムアウトの時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: cargo test -p fandhe-container-plugin-cri --test userns_helper_real --no-run
 
       - name: userns_helper_real の実行（実機前提テスト・--ignored。SEC-5・OCI-2・OCI-7・#4802）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -2146,12 +2157,12 @@ jobs:
       # 照合する実機前提テスト（harness = false）。AppArmor の緩和と Landlock ABI 6 以上の fail-closed 確認は上のステップを
       # 再利用する（複製しない）。root の分岐は CI では回さない（#1621）。sudo・permissions・check-run は追加しない。
       - name: landlock_implicit_dev のビルド（実行タイムアウトの時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: cargo test -p fandhe-container-core --test landlock_implicit_dev --no-run
 
       - name: landlock_implicit_dev の実行（実機前提テスト・--ignored。CORE-5・SEC-4・#1657・#2768）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -2168,12 +2179,12 @@ jobs:
       # ABI 6 以上の fail-closed 確認は上のステップを再利用する。`--ignored` が届かなくても exit 0 になるため成功行を試験
       # ソースから導出して照合する。root の分岐は CI では回さない（#1621）。sudo・permissions・check-run は追加しない。
       - name: fork_exec_isolation のビルド（実行タイムアウトの時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: cargo test -p fandhe-container-core --test fork_exec_isolation --no-run
 
       - name: fork_exec_isolation の実行（実機前提テスト・--ignored。CORE-1・CORE-5・#3295）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -2191,12 +2202,12 @@ jobs:
       # 上のステップを再利用する（Landlock は使わない）。`--ignored` が届かなくても exit 0 になるため成功行を試験ソースから
       # 導出して照合する。root の分岐は CI では回さない（#1621）。sudo・permissions・check-run は追加しない。
       - name: capabilities のビルド（実行タイムアウトの時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: cargo test -p fandhe-container-core --test capabilities --no-run
 
       - name: capabilities の実行（実機前提テスト・--ignored。SEC-1・CORE-5・#3422）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -2218,12 +2229,12 @@ jobs:
       # `--forbid 'not applicable'` は成功行の `not applicable []` に当たるため使わず、`verdict=not-applicable` と
       # `not applicable on this`（非 Linux・非対応アーキテクチャの行）で禁じる。sudo・permissions・check-run は追加しない。
       - name: escape_suite のビルド（実行タイムアウトの時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: cargo test -p fandhe-container-core --test escape_suite --no-run
 
       - name: escape_suite の実行（実機前提テスト・--ignored。SEC-2・SEC-4・SEC-5・CORE-5・#2016）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -2240,7 +2251,7 @@ jobs:
             --forbid 'not applicable on this' --forbid 'root=true' --forbid 'kernel_audit=true' --summary
 
       - name: production_launcher のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |
           set -euo pipefail
@@ -2258,7 +2269,7 @@ jobs:
       # 失敗するため。引数は `start_contract::USER_SCOPE_WRAPPER_ARGS` と同じ）。ヘルパー有効の 1 回で全シナリオ
       # （範囲写像 I・I-user-applied を含む）を通す。
       - name: production_launcher の実行（実機前提テスト・--ignored・委譲スコープ。CORE-6・SEC-5・#2376）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |
           set -euo pipefail
@@ -2318,7 +2329,7 @@ jobs:
       # 前提（uidmap・subuid / subgid・委譲 cgroup）は試験自身が fail-closed に確認する。
       # cargo を経由せず委譲スコープで直接実行する。
       - name: exec_subordinate_e2e のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |
           set -euo pipefail
@@ -2334,7 +2345,7 @@ jobs:
           echo "ESE_BIN=${bins}" >> "$GITHUB_ENV"
 
       - name: exec_subordinate_e2e の実行（実機前提・--ignored・委譲スコープ。SEC-5・SEC-1・SEC-4・#2835・#3291）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |
           set -euo pipefail
@@ -2353,7 +2364,7 @@ jobs:
       # 本番の spawn_netns_holder を使う Attachable）で作った netns へ参加して通ることを inode の一致で照合する。
       # pasta は使わない（#3331）。前提は試験自身が fail-closed に確認する。新しいジョブ・check-run・sudo・permissions は増やさない。
       - name: exec_launch_netns_rootless のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |
           set -euo pipefail
@@ -2369,7 +2380,7 @@ jobs:
           echo "ELNR_BIN=${bins}" >> "$GITHUB_ENV"
 
       - name: exec_launch_netns_rootless の実行（実機前提・--ignored・委譲スコープ。SUP-6・NET-9・CORE-6・#3349）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |
           set -euo pipefail
@@ -2384,12 +2395,12 @@ jobs:
             --forbid 'PRECONDITION FAILED' --forbid 'root=true' --summary
 
       - name: rootless_file_owner のビルド（実行タイムアウトの時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: cargo test -p fandhe-container-core --test rootless_file_owner --no-run
 
       - name: rootless_file_owner の実行（実機前提テスト・--ignored。CORE-6・SEC-5・TASK-40.3・#2376）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -2403,14 +2414,14 @@ jobs:
             --forbid 'helper case not requested' --forbid 'root=true' --forbid 'rootless_file_owner: ignored' --summary
 
       - name: rootless_holder_expiry のビルド（実行タイムアウトの時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: cargo test -p fandhe-container-core --test rootless_holder_expiry --no-run
 
       # holder の期限切れ後始末（別 user namespace からの SIGKILL・錨の照合・helper の終了と EOF の関係。CORE-6・SEC-5・
       # REPAIR-5・#2551）。範囲写像の前提は要らない（unshare の user namespace と setsid コマンドのみ。新しい check-run は増えない）。
       - name: rootless_holder_expiry の実行（実機前提テスト・--ignored。CORE-6・SEC-5・#2551）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -2423,7 +2434,7 @@ jobs:
             --forbid 'rootless_holder_expiry: ignored' --forbid 'not applicable'
 
       - name: rootless_holder_memory のビルド（実行タイムアウトの時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: cargo test -p fandhe-container-core --test rootless_holder_memory --no-run
 
@@ -2431,7 +2442,7 @@ jobs:
       # CORE-6・SEC-5・SUP-12・#2628）。範囲写像の前提は要らない（unshare の user namespace のみ。Yama ptrace_scope=1 は
       # 祖先が読める。新しい check-run は増えない）。
       - name: rootless_holder_memory の実行（実機前提テスト・--ignored。CORE-6・SEC-5・#2628）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -2445,14 +2456,14 @@ jobs:
             --forbid 'rootless_holder_memory: ignored' --forbid 'not applicable'
 
       - name: rootless_image_rootfs_remove のビルド（実行タイムアウトの時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: cargo test -p fandhe-container-core --test rootless_image_rootfs_remove --no-run
 
       # subuid 所有の rootfs の木の回収・削除（OCI-7・SEC-5・CORE-6・#2540）。範囲写像の前提は上の前提確認ステップと同じ
       # （sudo なし。新しい check-run・permissions は追加しない）。
       - name: rootless_image_rootfs_remove の実行（実機前提テスト・--ignored。OCI-7・SEC-5・#2540）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -2470,12 +2481,12 @@ jobs:
             --summary
 
       - name: seccomp のビルド（実行タイムアウトの時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: cargo test -p fandhe-container-core --test seccomp --no-run
 
       - name: seccomp の実行（実機前提テスト・--ignored。CORE-5・TASK-38.4・#179・#2376）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -2491,14 +2502,14 @@ jobs:
       # 非特権 user namespace で動く `--ignored` の試験（harness = false）。cargo 経由で直接実行する（委譲スコープは要らない）。helper ケース
       # （`FANDHE_CONTAINER_TEST_ID_HELPER=1`。uidmap・subuid）を有効にする。root 分岐（root=true）は CI では回さない（#1621）。
       - name: rootless_launch・rootless・rootless_uid_mapping のビルド（実行タイムアウトの時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |
           cargo test -p fandhe-container-core \
             --test rootless_launch --test rootless --test rootless_uid_mapping --no-run
 
       - name: rootless_launch の実行（実機前提テスト・--ignored。CORE-6・SEC-1・SEC-5・#2596）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -2512,7 +2523,7 @@ jobs:
             --forbid 'helper case not requested' --forbid 'root=true' --forbid 'rootless_launch: ignored' --summary
 
       - name: rootless の実行（実機前提テスト・--ignored。CORE-6・SEC-1・SEC-5・#2596）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |
           set -euo pipefail
@@ -2529,7 +2540,7 @@ jobs:
             --forbid 'helper case not requested' --forbid 'root=true' --forbid 'rootless: ignored' --summary
 
       - name: rootless_uid_mapping の実行（実機前提テスト・--ignored。CORE-6・SEC-5・ESC-09・#2596）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |
           set -euo pipefail
@@ -2557,7 +2568,7 @@ jobs:
       # 期限だけ持つ。reaper・helper は試験バイナリ自身の再実行のため supervisor の bin は要らない。範囲写像は使わない。
       # 新しいジョブ・check-run・sudo・permissions は増やさない。
       - name: healthcheck_exec_real のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |
           set -euo pipefail
@@ -2573,7 +2584,7 @@ jobs:
           echo "HER_BIN=${bins}" >> "$GITHUB_ENV"
 
       - name: healthcheck_exec_real の実行（実機前提テスト・--ignored。SUP-4・SUP-6・REPAIR-5・#2441）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |
           set -euo pipefail
@@ -2599,7 +2610,7 @@ jobs:
       # helper が 2 秒以内に終わり、exec のコマンドが残らないこと。経過 ms・カーネル版は情報行 `stream_exec_real: info` で出る。
       # #4327 で mask_mismatch・stdio_kind を追加: mask 不一致・fd 種別不正の拒否の診断行〔段名・分類・errno〕と exec が起きないこと）。
       - name: stream_exec_real のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |
           set -euo pipefail
@@ -2615,7 +2626,7 @@ jobs:
           echo "SER_BIN=${bins}" >> "$GITHUB_ENV"
 
       - name: stream_exec_real の実行（実機前提テスト・--ignored。SUP-6・SEC-1・REPAIR-5・#3760）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |
           set -euo pipefail
@@ -2632,7 +2643,7 @@ jobs:
       # supervisor_bin_real（`crates/supervisor/tests/`。SUP-1・SUP-4・CORE-2・CORE-6・OCI-6・ESC-03・#2596）:
       # 試験自身が supervisor の bin と delete の補助役を `systemd-run --user --scope` で包むため、試験バイナリは外側を包まず直接実行する。
       - name: supervisor_bin_real のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |
           set -euo pipefail
@@ -2648,7 +2659,7 @@ jobs:
           echo "SBR_BIN=${bins}" >> "$GITHUB_ENV"
 
       - name: supervisor_bin_real の実行（実機前提テスト・--ignored。SUP-1・SUP-4・CORE-6・ESC-03・#2596）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |
           set -euo pipefail
@@ -2680,7 +2691,7 @@ jobs:
       # `fandhe-container-launcher` が同じディレクトリにあると rootful のインストールとみなされるが、
       # 試験本体が専用の work/bin へ CLI と supervisor だけを置き、launcher が無いことを確かめる。
       - name: start_stop_delete_real のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |
           set -euo pipefail
@@ -2696,7 +2707,7 @@ jobs:
           echo "SSD_BIN=${bins}" >> "$GITHUB_ENV"
 
       - name: start_stop_delete_real の実行（実機前提テスト・--ignored・委譲スコープ。CLI-1・SUP-4・SEC-1・#2596・#2833・#3097）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |
           set -euo pipefail
@@ -2720,7 +2731,7 @@ jobs:
       # 委譲スコープの中で直接実行する）。host モードは runner の netns を共有するだけで、ホストのネットワーク設定を変えない。
       # 新しい check-run・sudo・permissions は追加しない。
       - name: network_modes_real のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |
           set -euo pipefail
@@ -2736,7 +2747,7 @@ jobs:
           echo "NMR_BIN=${bins}" >> "$GITHUB_ENV"
 
       - name: network_modes_real の実行（実機前提テスト・--ignored・委譲スコープ。NET-6・NET-12・CLI-1・#3345）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |
           set -euo pipefail
@@ -2759,7 +2770,7 @@ jobs:
       # 前提・実行方法は network_modes_real と同じ（supervisor の bin を先にビルドして置き、試験バイナリを委譲スコープの中で
       # 直接実行する）。新しい check-run・sudo・permissions は追加しない。
       - name: local_image_gc のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |
           set -euo pipefail
@@ -2775,7 +2786,7 @@ jobs:
           echo "LIG_BIN=${bins}" >> "$GITHUB_ENV"
 
       - name: local_image_gc の実行（実機前提テスト・--ignored・委譲スコープ。OCI-7・CLI-1・#663）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |
           set -euo pipefail
@@ -2800,7 +2811,7 @@ jobs:
       # 同じ起動で回す。上の通しシナリオの期限（540 秒）を食わないよう別ステップにする。
       # ビルドは上の `LIG_BIN` を使い回す。新しい check-run・sudo・permissions は追加しない。
       - name: local_image_gc の 50 並行の実行（実機前提テスト・--ignored --scenario concurrent・委譲スコープ。OCI-7・#868）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |
           set -euo pipefail
@@ -2824,7 +2835,7 @@ jobs:
       # コンテナ参照は CLI の実 `create --image` で付けるため委譲スコープが要る。ビルドは上の `LIG_BIN` を使い回す。
       # 新しい check-run・sudo・permissions は追加しない。
       - name: local_image_gc のクラッシュ復旧の実行（実機前提テスト・--ignored --scenario crash・委譲スコープ。OCI-7・#667）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |
           set -euo pipefail
@@ -2853,7 +2864,7 @@ jobs:
       # - start_recover_real は CLI と supervisor を試験本体が専用の bin/ へ複製し、launcher が無いことを確かめる
       #   （target/debug の launcher が隣にあると rootful とみなされるため。CI のファイル削除では回避しない）。
       - name: 委譲 cgroup の CLI 実機前提テスト 3 本のビルド（バイナリの特定。実行の時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |
           set -euo pipefail
@@ -2875,7 +2886,7 @@ jobs:
           done
 
       - name: start_scope_real の実行（実機前提テスト・--ignored・包まない。CORE-3・CORE-4・SUP-1・CLI-1・#2081・#3105）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |
           set -euo pipefail
@@ -2891,7 +2902,7 @@ jobs:
             --summary
 
       - name: delete_cgroup_real の実行（実機前提テスト・--ignored・委譲スコープ。OCI-6・CORE-3・SEC-1・#2061・#3105）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |
           set -euo pipefail
@@ -2907,7 +2918,7 @@ jobs:
             --summary
 
       - name: start_recover_real の実行（実機前提テスト・--ignored・委譲スコープ。CORE-2・SEC-1・OCI-6・#2011・#3105）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |
           set -euo pipefail
@@ -2929,7 +2940,7 @@ jobs:
       # 置き場所: pull が無く短いので container_grpc の前に置く（末尾は ubuntu のジョブ上限 35 分〔#3505〕が watchdog より先に効きうる）。
       # 代償: 後続の pull 系の開始が少し遅れる。期限は 試験の watchdog 300 秒 < 補助 540 秒 < ステップ 10 分。
       - name: shim_v2_kill_all_real のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |
           set -euo pipefail
@@ -2946,7 +2957,7 @@ jobs:
           echo "SKAR_BIN=${bins}" >> "$GITHUB_ENV"
 
       - name: shim_v2_kill_all_real の実行（実機前提テスト・--ignored・委譲スコープ。CRI-5・CORE-4・REPAIR-12・#4055）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |
           set -euo pipefail
@@ -2967,7 +2978,7 @@ jobs:
       # 置き場所: pull が無く短いので shim_v2_kill_all_real の直後・container_grpc の前に置く（末尾は ubuntu のジョブ上限 35 分
       # 〔#3505〕が watchdog より先に効きうる）。代償: 後続の pull 系の開始が少し遅れる。期限は 試験の watchdog 300 秒 < 補助 540 秒 < ステップ 10 分。
       - name: shim_v2_exec_real のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |
           set -euo pipefail
@@ -2984,7 +2995,7 @@ jobs:
           echo "SXR_BIN=${bins}" >> "$GITHUB_ENV"
 
       - name: shim_v2_exec_real の実行（実機前提テスト・--ignored・委譲スコープ。CRI-5・SEC-1・REPAIR-12・#4150）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |
           set -euo pipefail
@@ -3010,7 +3021,7 @@ jobs:
       #   sudo・permissions は追加しない。
       # - 置き場所: ジョブ末尾に近いとジョブ上限（35 分・#3505）が watchdog より先に効くため、Docker Hub の確認ステップの前に置く。
       - name: shim_v2_containerd_real のビルド（前提確認とバイナリの特定。CRI-5・TASK-62.6・#4104）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |
           set -euo pipefail
@@ -3058,7 +3069,7 @@ jobs:
           echo "SVCR_BIN=${bins}" >> "$GITHUB_ENV"
 
       - name: shim_v2_containerd_real の実行（実機前提テスト・--ignored・委譲スコープ。CRI-5・CRI-7・PLUG-1・TASK-62.6・#4104）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |
           set -euo pipefail
@@ -3104,7 +3115,7 @@ jobs:
       # - timeout: 試験の watchdog が 900 秒と 600 秒（2 試験の和）・pull の期限が 300 秒のため、実行ステップは標準の 10 分ではなく 30 分にする
       #   （watchdog より先に step timeout が切れると試験側の診断が失われる）。
       - name: Docker Hub の匿名 pull 残量の確認（production_binary_full_lifecycle_real の前提。CRI-3・#2818・#3312）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 2
         run: |
           set -euo pipefail
@@ -3113,7 +3124,7 @@ jobs:
           echo "${line}" >> "$GITHUB_STEP_SUMMARY"
 
       - name: production_binary_full_lifecycle_real のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 15
         run: |
           set -euo pipefail
@@ -3129,7 +3140,7 @@ jobs:
           echo "PCRI_TEST_BIN=${bins}" >> "$GITHUB_ENV"
 
       - name: container_grpc の実機前提試験 2 件の実行（--ignored・委譲スコープ。CRI-2・CRI-3・PLUG-1・#2818・#3225）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         # 全体期限 1860 秒 = timeout-minutes(32) × 60 - 60。2 試験の watchdog（各 900 秒）の和より後に効かせる（#3486・REPAIR-5）。
         timeout-minutes: 32
         run: |
@@ -3165,7 +3176,7 @@ jobs:
       # - 代償: このステップはジョブの最後にあり、ubuntu のジョブ上限は 35 分（#3505）。ハング時は watchdog の行が
       #   残らずジョブ上限で取り消されることがある。ジョブ上限は変えない。
       - name: production_binary_exec_real のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |
           set -euo pipefail
@@ -3181,7 +3192,7 @@ jobs:
           echo "PCRI_EXEC_TEST_BIN=${bins}" >> "$GITHUB_ENV"
 
       - name: production_binary_exec_real の実行（--ignored・委譲スコープ。CRI-6・SEC-1・REPAIR-12・#3762）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         # 全体期限 540 秒 = timeout-minutes(10) × 60 - 60。試験の watchdog（480 秒）より後に効かせる（REPAIR-5）。
         timeout-minutes: 10
         run: |
@@ -3232,7 +3243,7 @@ jobs:
       # - 期限: 試験の watchdog 480 秒 < 補助 540 秒（= timeout-minutes 10 × 60 - 60）< ステップ 10 分。
       # - 代償: このステップはジョブの最後にあり、ubuntu のジョブ上限は 35 分（#3505）。ジョブ上限は変えない。
       - name: production_binary_attach_real のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |
           set -euo pipefail
@@ -3248,7 +3259,7 @@ jobs:
           echo "PCRI_ATTACH_TEST_BIN=${bins}" >> "$GITHUB_ENV"
 
       - name: production_binary_attach_real の実行（--ignored・委譲スコープ。CRI-6・SUP-4・SEC-1・REPAIR-12・#4079）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
         # 全体期限 540 秒 = timeout-minutes(10) × 60 - 60。試験の watchdog（480 秒）より後に効かせる（REPAIR-5）。
         timeout-minutes: 10
         run: |
@@ -3402,7 +3413,8 @@ jobs:
   # check / clippy / doc のみでリンクもテスト実行もしないため、実行時の正しさ（struct のレイアウト・
   # OS の挙動差・BSD / Git Bash のツール差）は保証しない。macOS・Windows の実行時の検証は
   # push（main）・workflow_dispatch の platform-ci（3 OS ネイティブ）が担い、aarch64 Linux での
-  # 実行はネイティブ arm64 ランナーでのテスト実行が将来の課題（ci.md「3 OS CI」参照）。
+  # 実行時の検証は同じ platform-ci の arm64 の leg（ubuntu-24.04-arm。実機前提でないステップのみ。#4807）が担う
+  # （ci.md「3 OS CI」参照）。PR では本ジョブの型検査だけで、aarch64 Linux の実行時の誤りは main で検出する。
   #
   # クロスリンカ・SDK（macOS SDK・MSVC）無しで成立するのは、現在 Cargo.toml に入っている外部依存が
   # 純 Rust のクレートのみで、cargo tree -e normal,build --target all に cc・cmake・bindgen が現れ

@@ -1255,13 +1255,13 @@ mod tests {
             std::future::ready(()),
         );
         fut.await;
-        let t0 = Instant::now();
         // ドレインの期限（500ms）の手前では on_stop はまだ呼ばれず、セッションも開いたまま。
         tokio::time::sleep(Duration::from_millis(250)).await;
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert_eq!(sessions.open(), 2);
-        // 強制クローズの期限（700ms）の後。finish は呼んでいない。
-        tokio::time::sleep(Duration::from_millis(750).saturating_sub(t0.elapsed())).await;
+        // 強制クローズの期限（700ms）の後。finish は呼んでいない。固定の sleep の直後に照合すると、負荷で停止処理の
+        // 実行が遅れたときに落ちるため、on_stop の呼び出しと全セッションの終了を上限つきで待つ（#4788）。
+        wait_until(|| calls.load(Ordering::SeqCst) == 1 && sessions.open() == 0).await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(sessions.open(), 0);
         for conn in conns {

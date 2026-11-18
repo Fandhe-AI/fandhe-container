@@ -4694,7 +4694,7 @@ mod tests {
     fn repair5_4155_rpc_responses_unchanged_when_publish_fails() {
         use super::super::bootstrap::{PublishBinary, ServeContext, ShimIdentifier};
         use super::super::publish::testkit::{
-            CaptureLog, failing_body, make_script, sleeping_body,
+            CaptureLog, EXIT_CASE_TIMEOUT, failing_body, make_script, sleeping_body,
         };
         use super::super::publish::{PublishConfig, exec_publisher_for_with};
         use crate::test_root;
@@ -4722,7 +4722,16 @@ mod tests {
                 s.handle("Delete", &delete_req("c1", "")).unwrap(),
             ]
         };
-        for (name, deadline_stage) in [("fail", Stage::ExitStatus), ("sleep", Stage::Deadline)] {
+        // 期限は場面ごとに分ける（#4831）。`fail` は子が自分で終わるのを待つ場面で、期限を試験の待ちの上限（20 秒）より
+        // 長くして、子の起動が遅れても `deadline` に分類されないようにする。`sleep` は子が 30 秒眠るので必ず期限で切られる。
+        for (name, timeout, deadline_stage) in [
+            ("fail", EXIT_CASE_TIMEOUT, Stage::ExitStatus),
+            (
+                "sleep",
+                std::time::Duration::from_millis(400),
+                Stage::Deadline,
+            ),
+        ] {
             let dir = test_root::test_root("pubsvc", name);
             let body = if name == "fail" {
                 failing_body()
@@ -4737,12 +4746,9 @@ mod tests {
                     Some("/run/x.sock".into()),
                 )
                 .with_publish_binary(Some(PublishBinary::verify(&bin).unwrap()));
-            let publisher = exec_publisher_for_with(
-                &ctx,
-                PublishConfig::new(std::time::Duration::from_millis(400)).unwrap(),
-                log.clone(),
-            )
-            .unwrap();
+            let publisher =
+                exec_publisher_for_with(&ctx, PublishConfig::new(timeout).unwrap(), log.clone())
+                    .unwrap();
 
             let (with_pub, f1) = svc(TaskApiVersion::V2, Fake::default());
             let with_pub = fast_wait(with_pub, 100).with_event_publisher(publisher);
@@ -4776,7 +4782,10 @@ mod tests {
                 ],
                 "{name}"
             );
-            assert!(got.iter().all(|f| f.stage == deadline_stage), "{name}");
+            assert!(
+                got.iter().all(|f| f.stage == deadline_stage),
+                "{name}: {got:?}"
+            );
         }
     }
 
@@ -4787,7 +4796,7 @@ mod tests {
     fn repair5_4281_exec_rpc_responses_unchanged_when_publish_fails() {
         use super::super::bootstrap::{PublishBinary, ServeContext, ShimIdentifier};
         use super::super::publish::testkit::{
-            CaptureLog, failing_body, make_script, sleeping_body,
+            CaptureLog, EXIT_CASE_TIMEOUT, failing_body, make_script, sleeping_body,
         };
         use super::super::publish::{PublishConfig, exec_publisher_for_with};
         use crate::test_root;
@@ -4808,7 +4817,16 @@ mod tests {
                 .unwrap(),
             ]
         };
-        for (name, deadline_stage) in [("fail", Stage::ExitStatus), ("sleep", Stage::Deadline)] {
+        // 期限は場面ごとに分ける（#4831）。`fail` は子が自分で終わるのを待つ場面で、期限を試験の待ちの上限（20 秒）より
+        // 長くして、子の起動が遅れても `deadline` に分類されないようにする。`sleep` は子が 30 秒眠るので必ず期限で切られる。
+        for (name, timeout, deadline_stage) in [
+            ("fail", EXIT_CASE_TIMEOUT, Stage::ExitStatus),
+            (
+                "sleep",
+                std::time::Duration::from_millis(400),
+                Stage::Deadline,
+            ),
+        ] {
             let dir = test_root::test_root("pubsvc", &format!("exec-{name}"));
             let body = if name == "fail" {
                 failing_body()
@@ -4823,12 +4841,9 @@ mod tests {
                     Some("/run/x.sock".into()),
                 )
                 .with_publish_binary(Some(PublishBinary::verify(&bin).unwrap()));
-            let publisher = exec_publisher_for_with(
-                &ctx,
-                PublishConfig::new(std::time::Duration::from_millis(400)).unwrap(),
-                log.clone(),
-            )
-            .unwrap();
+            let publisher =
+                exec_publisher_for_with(&ctx, PublishConfig::new(timeout).unwrap(), log.clone())
+                    .unwrap();
 
             let (with_pub, _f1, _l1) = svc_exec(TaskApiVersion::V2);
             let with_pub = fast_wait(with_pub, 100).with_event_publisher(publisher);
@@ -4853,7 +4868,10 @@ mod tests {
                 ],
                 "{name}"
             );
-            assert!(got.iter().all(|f| f.stage == deadline_stage), "{name}");
+            assert!(
+                got.iter().all(|f| f.stage == deadline_stage),
+                "{name}: {got:?}"
+            );
             for f in &got {
                 let line = f.to_json_line();
                 assert!(!line.contains("c1") && !line.contains("e1"), "{line}");

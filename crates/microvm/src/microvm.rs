@@ -4655,7 +4655,7 @@ mod assemble_tests {
                 Ok(())
             }
         }
-        let slots = plan_layout(1, 64 << 20, 0, 0).unwrap();
+        let slots = layout_slots(0, 0).unwrap();
         let rec = Arc::new(Rec::default());
         let mut b = DeviceBus::<MemoryBlockBackend, MemoryNetBackend, CountLine>::new(
             &slots,

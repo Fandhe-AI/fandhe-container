@@ -34,7 +34,7 @@
 use std::ffi::{CString, OsString};
 use std::fs::File;
 use std::io::{Read as _, Write as _};
-use std::os::fd::{AsFd as _, AsRawFd as _};
+use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
 use std::process::ExitCode;
@@ -131,40 +131,45 @@ fn fail(f: &Fail) -> ExitCode {
     ExitCode::from(1)
 }
 
-/// フレームを stdout へ書く。読み手が止まって pipe / socket が満杯でも `FRAME_WRITE_TIMEOUT` で見切る
-/// （別スレッドで書き、期限切れならスレッドを残したまま `Err` を返す。呼び出し側はその後プロセスを終える。REPAIR-5）。
-/// `CLONE_NEWUSER` の後に呼ばれるが、書き込みスレッドは完了するか期限切れで終了へ向かうため、待ちの間の単一スレッド前提は壊れない。
+/// フレームを stdout へ書く。読み手が止まって pipe / socket が満杯でも `FRAME_WRITE_TIMEOUT` で見切る（REPAIR-5）。
+///
+/// スレッドは作らない: pod の pid ns を作った後（`unshare(CLONE_NEWPID)` で `pid_for_children` が自分の pid ns と違う）は
+/// カーネルが `CLONE_THREAD` を `EINVAL` で拒否する（Linux v6.12 `kernel/fork.c` の `copy_process`。#4815）。書けるようになる
+/// まで `poll` で期限つきで待ってから書く。フレームと失敗行は `PIPE_BUF`（4096）より小さく、`POLLOUT` の後の 1 回の書き込みは
+/// pipe では空きのある slot に収まる。
 fn write_stdout_bounded(bytes: &[u8]) -> Result<(), ()> {
-    let owned = std::io::stdout()
-        .as_fd()
-        .try_clone_to_owned()
-        .map_err(|_| ())?;
-    let data = bytes.to_vec();
-    let (tx, rx) = std::sync::mpsc::channel::<bool>();
-    std::thread::Builder::new()
-        .spawn(move || {
-            let ok = File::from(owned).write_all(&data).is_ok();
-            let _ = tx.send(ok);
-        })
-        .map_err(|_| ())?;
-    match rx.recv_timeout(FRAME_WRITE_TIMEOUT) {
-        Ok(true) => Ok(()),
-        _ => Err(()),
-    }
+    write_fd_bounded(std::io::stdout().as_fd(), bytes, FRAME_WRITE_TIMEOUT)
 }
 
-/// 失敗行を stderr へ出す。読み手が止まって pipe が満杯でも終了を妨げないよう別スレッドで書き、期限で見切る
-/// （失敗経路でだけ呼ぶ。`CLONE_NEWUSER` の後なので単一スレッド前提を壊さない）。
+fn write_fd_bounded(fd: BorrowedFd<'_>, bytes: &[u8], limit: Duration) -> Result<(), ()> {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        match sys::poll_revents_now(fd, sys::POLL_OUT) {
+            Ok(r) if r & sys::POLL_OUT != 0 => break,
+            // 相手が閉じた（`POLLERR`・`POLLHUP`）・`fd` が不正なら書かない。
+            Ok(r) if r != 0 => return Err(()),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return Err(()),
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let owned = fd.try_clone_to_owned().map_err(|_| ())?;
+    File::from(owned).write_all(bytes).map_err(|_| ())
+}
+
+/// 失敗行を stderr へ出す。読み手が止まって pipe が満杯でも終了を妨げないよう期限で見切る（失敗経路でだけ呼ぶ。
+/// スレッドを作らない理由は [`write_stdout_bounded`] と同じ）。
 fn stderr_line(code: ErrorCode, message: &str) {
     let line = format!("error code={} message={message}\n", code.as_str());
-    let (tx, rx) = std::sync::mpsc::channel::<()>();
-    let spawned = std::thread::Builder::new().spawn(move || {
-        let _ = std::io::stderr().write_all(line.as_bytes());
-        let _ = tx.send(());
-    });
-    if spawned.is_ok() {
-        let _ = rx.recv_timeout(FAIL_LINE_TIMEOUT);
-    }
+    let _ = write_fd_bounded(
+        std::io::stderr().as_fd(),
+        line.as_bytes(),
+        FAIL_LINE_TIMEOUT,
+    );
 }
 
 // ---- 純関数（ユニット試験の対象） ----

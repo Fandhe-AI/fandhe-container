@@ -779,6 +779,7 @@ mod control_ffi {
 
     /// include/uapi/asm-generic/poll.h の値（x86_64・aarch64 で共通）。
     pub(super) const POLLIN: i16 = 0x0001;
+    pub(super) const POLLOUT: i16 = 0x0004;
     pub(super) const POLLERR: i16 = 0x0008;
     pub(super) const POLLHUP: i16 = 0x0010;
     pub(super) const POLLNVAL: i16 = 0x0020;
@@ -1242,6 +1243,7 @@ mod control_ffi {
             assert!(offset_of!(Pollfd, events) == offset_of!(libc::pollfd, events));
             assert!(offset_of!(Pollfd, revents) == offset_of!(libc::pollfd, revents));
             assert!(POLLIN == libc::POLLIN);
+            assert!(POLLOUT == libc::POLLOUT);
             assert!(POLLERR == libc::POLLERR);
             assert!(POLLHUP == libc::POLLHUP);
             assert!(POLLNVAL == libc::POLLNVAL);
@@ -1313,6 +1315,7 @@ mod control_ffi {
     }
 
     pub(super) const POLLIN: i16 = 0x0001;
+    pub(super) const POLLOUT: i16 = 0x0004;
     pub(super) const POLLERR: i16 = 0x0008;
     pub(super) const POLLHUP: i16 = 0x0010;
     pub(super) const POLLNVAL: i16 = 0x0020;
@@ -1376,6 +1379,9 @@ pub(crate) const POLL_GONE_MASK: i16 =
 
 /// `POLLIN`（読めるデータがある）。
 pub(crate) const POLL_IN: i16 = control_ffi::POLLIN;
+
+/// `POLLOUT`（書ける。pod の保持役がフレームを書く前に待つ。#4815）。
+pub(crate) const POLL_OUT: i16 = control_ffi::POLLOUT;
 
 /// `POLLRDHUP`（ストリームの相手が書き込み側を閉じた。要求しないと返らない）。
 pub(crate) const POLL_RDHUP: i16 = control_ffi::POLLRDHUP;

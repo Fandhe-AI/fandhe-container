@@ -1084,14 +1084,34 @@ pub fn supervise_with_restart_health(
                     explicit_stop_pending: false,
                 });
             }
+            MonitorOutcome::ExitedProcessesRemain { .. } => {
+                // kill-all が失敗した世代は再 launch しない（旧い世代の子孫が残り得る。#4811）。受付を閉じ、受理済みの
+                // 明示 stop は世代を照合して記録してから失敗で返す（記録しないと `UnlessStopped` の再開判定が再起動を
+                // 許す。SUP-9・契約 14・#2440）。記録の成否は `RecordExplicitStop` の観測に出し、結果は失敗のまま。
+                let requested = explicit_requested(stop);
+                let at_close = stop.close_explicit_stop();
+                if requested
+                    || (at_close == crate::run::ExplicitStopState::Requested
+                        && !stop.is_stop_requested())
+                {
+                    let started = Instant::now();
+                    let written = state.write_explicit_stop().map(drop);
+                    obs.observe(&MonitorEvent {
+                        operation: MonitorOperation::RecordExplicitStop,
+                        error_code: written.as_ref().err().map(TraitError::code),
+                        elapsed: started.elapsed(),
+                    });
+                }
+                return Ok(SuperviseOutcome::MonitorFailed {
+                    last,
+                    process: None,
+                    restarts,
+                });
+            }
             _ => {
                 // 回収済みの終了（ExitedUnrecorded）以外は終了未確認のためハンドルを返す。
-                let process = (!matches!(
-                    last,
-                    MonitorOutcome::ExitedUnrecorded { .. }
-                        | MonitorOutcome::ExitedProcessesRemain { .. }
-                ))
-                .then_some(process);
+                let process =
+                    (!matches!(last, MonitorOutcome::ExitedUnrecorded { .. })).then_some(process);
                 return Ok(SuperviseOutcome::MonitorFailed {
                     last,
                     process,
@@ -2811,6 +2831,73 @@ mod tests {
         assert_eq!(g.status().exit_code(), Some(143));
         assert_eq!(g.explicit_stop(), ExplicitStop::Recorded);
         assert_eq!(g.restart_count(), 0);
+    }
+
+    /// SUP-9・SUP-3・CRI-2・#4811: pid を共有するコンテナで kill-all が失敗した世代は、`always` でも再 launch せず
+    /// `MonitorFailed` で返る。受理済みの明示 stop はその経路でも「明示 stop 済み」を記録し、受付を閉じる。
+    #[test]
+    fn sup9_sup3_4811_kill_all_failure_records_explicit_stop_without_relaunch() {
+        use fandhe_container_core::traits::{CgroupPlacement, CgroupScope};
+        for explicit in [false, true] {
+            let st = store(0, 42);
+            {
+                let mut g = st.rec.lock().unwrap();
+                let placed = g.clone().with_cgroup(CgroupPlacement::new(
+                    CgroupScope::new("/").unwrap(),
+                    StateRevision::from_raw(1),
+                ));
+                *g = placed;
+            }
+            let q = Arc::new(Queue::new(&[(43, FAIL)]));
+            let obs = Events::default();
+            let stop = StopToken::new();
+            if explicit {
+                stop.mark_explicit_stop();
+            }
+            let mut s = attach(&st);
+            crate::pid_share::force_failure_for_test(Some(ErrorCode::Timeout));
+            let out = supervise_with_restart(
+                &mut s,
+                first(ProcessExit::Signaled(15)),
+                &rl(&q),
+                &MonitorConfig::default().with_kill_all_on_init_exit(true),
+                &cfg("always"),
+                &stop,
+                &obs,
+            )
+            .unwrap();
+            crate::pid_share::force_failure_for_test(None);
+            let SuperviseOutcome::MonitorFailed {
+                last: MonitorOutcome::ExitedProcessesRemain { .. },
+                process: None,
+                restarts: 0,
+            } = out
+            else {
+                panic!("unexpected outcome (explicit={explicit}): {out:?}")
+            };
+            assert_eq!(obs.count(MonitorOperation::Restart), 0, "{explicit}");
+            assert_eq!(
+                obs.count(MonitorOperation::RecordExplicitStop),
+                usize::from(explicit),
+                "{explicit}"
+            );
+            // 受付は閉じている（受理済みなら既存の意図のまま、未受理なら以後の取消は `Closed`）。
+            let want_mark = if explicit {
+                crate::run::ExplicitStopRecord::AlreadyRecorded
+            } else {
+                crate::run::ExplicitStopRecord::Closed
+            };
+            assert_eq!(stop.mark_explicit_stop(), want_mark, "{explicit}");
+            let g = st.rec.lock().unwrap();
+            assert_eq!(g.status().state(), ContainerState::Stopped);
+            assert_eq!(g.restart_count(), 0);
+            let want = if explicit {
+                ExplicitStop::Recorded
+            } else {
+                ExplicitStop::NotRecorded
+            };
+            assert_eq!(g.explicit_stop(), want, "{explicit}");
+        }
     }
 
     /// SUP-9・#2440: 明示 stop でない終了（クラッシュ・ポリシー `no`）では「明示 stop 済み」を残さない。

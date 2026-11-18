@@ -68,7 +68,7 @@
 //!   supervisor の bin の `pod-holder` で pod の user・ipc namespace を作り、その中へ `nsenter` した `unshare --pid --fork` で pod の
 //!   pid namespace（PID 1 は `sleep`）を作る。config の `linux.namespaces` の user・ipc は保持役の、pid は `unshare` の
 //!   `pid_for_children` の `/proc/<pid>/ns/*` を path で入れる（cri の `PodNamespacePaths` と同じ形。#4815 の pod-init の代わり）。プローブは孤児になる子（`--orphan-child`）を作ってから終わる・止まる。
-//!   - F: 共有では init の自然終了の後に孤児が消え、supervisor の stderr に `pid_shared_kill_all` の `killed` が 1 件出る。
+//!   - F: 共有では init の自然終了の後に孤児が消え、supervisor の構造化ログ（`@supervisor-logs`）に `pid_shared_kill_all` の `killed` が 1 件出る。
 //!     対照（pid の path なし）は孤児が pid ns ごと消え、`pid_shared_kill_all` の行が出ない
 //!   - G: 共有で制御チャネルの SIGTERM による停止の後に孤児が消える
 //!   - H: 共有でコンテナ cgroup の `cgroup.kill` を書けなくすると（0444）、`--restart on-failure:3` でも再 launch せず
@@ -543,16 +543,6 @@ mod linux {
 
     /// bin を非特権ユーザーに委譲された新しい cgroup スコープで起動する（CLI の契約と同じ argv・stdout は pipe）。
     fn spawn_supervisor(env: &Env, id: &str, restart: Option<&str>) -> Supervisor {
-        spawn_supervisor_to(env, id, restart, Stdio::inherit())
-    }
-
-    /// [`spawn_supervisor`] の stderr の行き先を選べる版（シナリオ F〜H は構造化ログをファイルへ残して照合する）。
-    fn spawn_supervisor_to(
-        env: &Env,
-        id: &str,
-        restart: Option<&str>,
-        stderr: Stdio,
-    ) -> Supervisor {
         let mut cmd = Command::new("systemd-run");
         cmd.args(fandhe_container_supervisor::start_contract::USER_SCOPE_WRAPPER_ARGS)
             .arg(BIN)
@@ -566,7 +556,7 @@ mod linux {
             .arg(id)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(stderr)
+            .stderr(Stdio::inherit())
             .spawn()
             .expect("spawn systemd-run (is `systemd-run --user` available?)");
         let stdout = child.stdout.take().expect("piped stdout");
@@ -1264,20 +1254,30 @@ mod linux {
         }
     }
 
-    /// supervisor の stderr を受けるファイル（構造化ログの照合用）。
-    fn stderr_file(env: &Env, id: &str) -> (PathBuf, Stdio) {
-        let path = env.dir.join(format!("{id}.stderr"));
-        let file = std::fs::File::create(&path).expect("create the supervisor stderr file");
-        (path, Stdio::from(file))
-    }
-
+    /// supervisor の構造化ログ（bin の入口が `<状態ルート>/@supervisor-logs/<id>.log*` へ差し替える。#2067）のうち、
     /// `pid_shared_kill_all` の行（1 行 1 JSON）だけを取り出す。
-    fn kill_all_lines(path: &Path) -> Vec<String> {
-        std::fs::read_to_string(path)
-            .unwrap_or_default()
-            .lines()
-            .filter(|l| l.contains(r#""event":"pid_shared_kill_all""#))
-            .map(str::to_owned)
+    fn kill_all_lines(env: &Env, id: &str) -> Vec<String> {
+        let dir = env
+            .root()
+            .join(fandhe_container_supervisor::supervisor_log::SUPERVISOR_LOG_DIR_NAME);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!("{id}.log"))
+            })
+            .flat_map(|e| {
+                std::fs::read_to_string(e.path())
+                    .unwrap_or_default()
+                    .lines()
+                    .filter(|l| l.contains(r#""event":"pid_shared_kill_all""#))
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
             .collect()
     }
 
@@ -1302,22 +1302,20 @@ mod linux {
         let env = Env::new("f0", true, Probe::Orphan);
         let id = format!("sbf0{}", std::process::id());
         env.create(&id);
-        let (log, stderr) = stderr_file(&env, &id);
-        let mut sup = spawn_supervisor_to(&env, &id, None, stderr);
+        let mut sup = spawn_supervisor(&env, &id, None);
         assert!(matches!(sup.report(), StartReport::Started { .. }));
         assert_eq!(wait_orphans(1, Duration::from_secs(30)).len(), 1);
         assert_eq!(sup.exit_code(), 0, "monitor must finish cleanly");
         assert_eq!(env.record(&id).status().exit_code(), Some(PROBE_EXIT));
         assert_eq!(wait_orphans(0, Duration::from_secs(10)), Vec::<u32>::new());
-        assert_eq!(kill_all_lines(&log), Vec::<String>::new());
+        assert_eq!(kill_all_lines(&env, &id), Vec::<String>::new());
 
         // 共有: pod の pid ns へ join する。
         let pod = Pod::new();
         let env = Env::with_pod("f1", true, Probe::Orphan, Some(&pod));
         let id = format!("sbf1{}", std::process::id());
         env.create(&id);
-        let (log, stderr) = stderr_file(&env, &id);
-        let mut sup = spawn_supervisor_to(&env, &id, None, stderr);
+        let mut sup = spawn_supervisor(&env, &id, None);
         let pid = match sup.report() {
             StartReport::Started { pid } => pid,
             other => panic!("expected OK, got {other:?}"),
@@ -1334,7 +1332,7 @@ mod linux {
         assert_eq!(rec.status().exit_code(), Some(PROBE_EXIT));
         // kill-all は終了の記録の前に走るため、記録を見た時点で孤児は居ない。
         assert_eq!(orphan_pids(), Vec::<u32>::new());
-        let lines = kill_all_lines(&log);
+        let lines = kill_all_lines(&env, &id);
         assert!(
             lines
                 .iter()
@@ -1352,8 +1350,7 @@ mod linux {
         let env = Env::with_pod("g", true, Probe::OrphanTerm, Some(&pod));
         let id = format!("sbg{}", std::process::id());
         env.create(&id);
-        let (log, stderr) = stderr_file(&env, &id);
-        let mut sup = spawn_supervisor_to(&env, &id, None, stderr);
+        let mut sup = spawn_supervisor(&env, &id, None);
         let pid = match sup.report() {
             StartReport::Started { pid } => pid,
             other => panic!("expected OK, got {other:?}"),
@@ -1374,7 +1371,7 @@ mod linux {
         assert_eq!(rec.status().state(), ContainerState::Stopped);
         assert_eq!(rec.status().exit_code(), Some(TERM_HANDLER_EXIT));
         assert_eq!(orphan_pids(), Vec::<u32>::new());
-        let lines = kill_all_lines(&log);
+        let lines = kill_all_lines(&env, &id);
         assert!(
             lines
                 .iter()
@@ -1393,8 +1390,7 @@ mod linux {
         let env = Env::with_pod("h", true, Probe::Orphan, Some(&pod));
         let id = format!("sbh{}", std::process::id());
         env.create(&id);
-        let (log, stderr) = stderr_file(&env, &id);
-        let mut sup = spawn_supervisor_to(&env, &id, Some("on-failure:3"), stderr);
+        let mut sup = spawn_supervisor(&env, &id, Some("on-failure:3"));
         let pid = match sup.report() {
             StartReport::Started { pid } => pid,
             other => panic!("expected OK, got {other:?}"),
@@ -1432,7 +1428,7 @@ mod linux {
             "the orphan remains when kill-all fails"
         );
         assert_eq!(after, Vec::<u32>::new(), "cleanup must stop the orphan");
-        let lines = kill_all_lines(&log);
+        let lines = kill_all_lines(&env, &id);
         assert!(
             lines.iter().any(|l| l.contains(r#""outcome":"failed""#)),
             "kill-all must report the failure: {lines:?}"

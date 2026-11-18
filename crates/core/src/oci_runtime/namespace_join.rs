@@ -1039,7 +1039,7 @@ mod tests {
     /// mount ns には付かないことも確かめる。
     #[test]
     #[ignore = "needs unprivileged user namespaces, unshare(1) and mount(8); run with --ignored (#4806)"]
-    fn cri2_core3_4806_shm_clone_via_holder_mnt_ns_is_permitted_unprivileged() {
+    fn cri2_core3_4806_shm_clone_via_holder_mnt_ns() {
         use crate::sys::{self, MountTreeScope, NsFlag};
         use std::ffi::CString;
         let (_scratch, dir) = crate::test_support::scratch_child("fandhe-shm-poc", "d");

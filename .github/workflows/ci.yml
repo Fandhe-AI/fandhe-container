@@ -1884,7 +1884,7 @@ jobs:
             cargo test -p fandhe-container-core --lib -- --ignored --exact \
               oci_runtime::namespace_join::tests::net3_2872_real_holder_net_join_identity_and_ownership \
               oci_runtime::namespace_join::tests::cri2_core3_4809_real_holder_pid_join_identity_and_ownership \
-              oci_runtime::namespace_join::tests::cri2_core3_4806_shm_clone_via_holder_mnt_ns_is_permitted_unprivileged \
+              oci_runtime::namespace_join::tests::cri2_core3_4806_shm_clone_via_holder_mnt_ns \
               --test-threads=1
           scripts/check-success-lines.sh --name net3_2872_real_holder_net_join_identity_and_ownership \
             --src crates/core/src/oci_runtime/namespace_join.rs --log "${log}" \

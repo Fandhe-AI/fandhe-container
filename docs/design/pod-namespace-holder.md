@@ -135,7 +135,7 @@
 
 補足: issue に書いた `may_copy_tree` は v6.12 には無い。v6.12 の `open_tree` は「今の ns にあるマウントだけを複製できる」（`check_mnt`）ので、保持役の mnt ns へ参加してから複製する手順が要る（案 A の手順のまま）。
 
-PoC: `crates/core/src/oci_runtime/namespace_join.rs` の実機前提試験 `cri2_core3_4806_shm_clone_via_holder_mnt_ns_is_permitted_unprivileged`（`--ignored`）。
+PoC: `crates/core/src/oci_runtime/namespace_join.rs` の実機前提試験 `cri2_core3_4806_shm_clone_via_holder_mnt_ns`（`--ignored`）。
 
 - 構成: 保持役の代わり（`unshare --user --map-root-user --mount` の中で tmpfs を載せる）と、init の代わり（その userns に参加して自分の mount ns を作った fork 子）で 3 段を通す
 - 照合: 載せ先の `nosuid,nodev,noexec`（`fstatfs`）、大きさ `size=65536k`（mountinfo）、両方向の内容の一致、試験プロセスの ns に付かないこと

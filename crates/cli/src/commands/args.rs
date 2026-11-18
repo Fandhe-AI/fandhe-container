@@ -46,7 +46,7 @@ pub(super) struct CreateArgs {
     pub(super) id: String,
     /// `--image-root` と `--image` の組（どちらも指定したときだけ `Some`。OCI-7・#2315）。
     pub(super) image: Option<CreateImageArgs>,
-    /// `--ulimit`・`--env`・`--env-file`・`--label`・`--ipc`・`--shm-size`・`--tmpfs`・`--cap-drop`・`--read-only`(未検証の文字列。意味検証は `create_options`)と、`--network`・`--add-host`・`--dns`(`options.network`。意味検証は `create_network`。NET-12・#1871)。
+    /// `--ulimit`・`--env`・`--env-file`・`--label`・`--ipc`・`--shm-size`・`--tmpfs`・`--cap-drop`・`--cap-add`・`--read-only`(未検証の文字列。意味検証は `create_options`)と、`--network`・`--add-host`・`--dns`(`options.network`。意味検証は `create_network`。NET-12・#1871)。
     /// SUP-12・CLI-1・#2713)。
     pub(super) options: CreateOptionArgs,
 }
@@ -71,6 +71,8 @@ pub(super) struct CreateOptionArgs {
     pub(super) tmpfs: Vec<String>,
     /// `--cap-drop <CAP>`(最大 core の `MAX_DROP_NAMES` 件。`ALL` を含む。CLI-1・SEC-1・#2775)。
     pub(super) cap_drop: Vec<String>,
+    /// `--cap-add <CAP>`(最大 core の `MAX_DROP_NAMES` 件。OCI 既定 14 個の範囲で drop の後に戻す。CLI-1・SEC-1・#4794)。
+    pub(super) cap_add: Vec<String>,
     /// `--read-only`(値を取らないフラグ。1 回まで。`root.readonly` と OR で効く。CLI-1・SUP-12・#2828)。
     pub(super) read_only: bool,
     /// `--network`・`--add-host`・`--dns`(未検証の文字列。意味検証は `create_network`。NET-12・CLI-1・#1871)。
@@ -452,6 +454,7 @@ enum RepeatableOption {
     Label,
     Tmpfs,
     CapDrop,
+    CapAdd,
     AddHost,
     Dns,
     Publish,
@@ -470,6 +473,8 @@ fn repeatable_option(a: &OsString) -> Option<RepeatableOption> {
         Some(RepeatableOption::Tmpfs)
     } else if a == "--cap-drop" {
         Some(RepeatableOption::CapDrop)
+    } else if a == "--cap-add" {
+        Some(RepeatableOption::CapAdd)
     } else if a == "--add-host" {
         Some(RepeatableOption::AddHost)
     } else if a == "--dns" {
@@ -531,6 +536,12 @@ fn push_option(
                 return Err(UsageError);
             }
             options.cap_drop.push(text(value)?);
+        }
+        RepeatableOption::CapAdd => {
+            if options.cap_add.len() >= MAX_DROP_NAMES {
+                return Err(UsageError);
+            }
+            options.cap_add.push(text(value)?);
         }
         RepeatableOption::AddHost => {
             use fandhe_container_net::add_host_dns::{MAX_ADD_HOST_ENTRIES, MAX_ADD_HOST_LEN};
@@ -1404,6 +1415,7 @@ mod tests {
                 shm_size: Some("128m".into()),
                 tmpfs: vec!["/run:rw".into()],
                 cap_drop: Vec::new(),
+                cap_add: Vec::new(),
                 read_only: false,
                 network: CreateNetworkArgs::default(),
             }
@@ -1766,6 +1778,38 @@ mod tests {
         let mut many = vec!["--bundle", "/b"];
         for _ in 0..=fandhe_container_core::capabilities::MAX_DROP_NAMES {
             many.extend(["--cap-drop", "chown"]);
+        }
+        many.push("c1");
+        assert_eq!(parse_create(v(&many)), Err(UsageError));
+    }
+
+    /// CLI-1・SEC-1・#4794: `create --cap-add` は繰り返し指定でき、値の欠落と件数超過は使い方エラー。値の意味は見ない。
+    #[test]
+    fn cli1_sec1_4794_parse_create_cap_add() {
+        let a = parse_create(v(&[
+            "--bundle",
+            "/b",
+            "--cap-drop",
+            "ALL",
+            "--cap-add",
+            "NET_BIND_SERVICE",
+            "--cap-add",
+            "kill",
+            "c1",
+        ]))
+        .expect("parse");
+        assert_eq!(
+            a.options.cap_add,
+            vec!["NET_BIND_SERVICE".to_string(), "kill".into()]
+        );
+        assert_eq!(a.options.cap_drop, vec!["ALL".to_string()]);
+        assert_eq!(
+            parse_create(v(&["--bundle", "/b", "c1", "--cap-add"])),
+            Err(UsageError)
+        );
+        let mut many = vec!["--bundle", "/b"];
+        for _ in 0..=fandhe_container_core::capabilities::MAX_DROP_NAMES {
+            many.extend(["--cap-add", "kill"]);
         }
         many.push("c1");
         assert_eq!(parse_create(v(&many)), Err(UsageError));

@@ -8,6 +8,8 @@
 //! [`CapabilitySet::oci_default`] を許可集合として使う。組み込みのステージ（`StagePipeline::run_then`）から呼ばれる（#173・TASK-37.2）。
 //! `config.json` の `process.capabilities` の drop は [`ContainerCapabilities`]（OCI 既定の部分集合だけを表す型）で
 //! 受ける（#2666）。add・`inheritable`・`ambient` は `UnappliedField::ProcessCapabilities` として拒否する。
+//! CRI の `add_capabilities`・CLI の `--cap-add` は、名前の並びを [`resolve_add_drop`] で
+//! 「既定 − drop + add」に解く（#4792・#4762 の決定。add の許可リストは OCI 既定 14 個だけ）。
 //!
 //! # 契約
 //!
@@ -16,6 +18,8 @@
 //!   （新しいカーネルの capability）は `contains_index` が常に `false` を返し、
 //!   適用側が fail-closed に drop 対象として扱える
 //! - `CAP_SYS_ADMIN`・`CAP_SYS_MODULE`・`CAP_SYS_PTRACE` 等は既定集合に含めない（SEC-1）
+
+use crate::traits::ErrorCode;
 
 /// Linux capability（`include/uapi/linux/capability.h` の 0〜40）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -327,7 +331,6 @@ impl CapabilitySet {
 
     /// 積集合。
     #[must_use]
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn intersect(self, other: Self) -> Self {
         Self(self.0 & other.0)
     }
@@ -452,8 +455,8 @@ impl std::error::Error for CapabilityNotAllowed {}
 /// コンテナへ許可する capability 集合（SEC-1・CRI-2・#2666）。
 ///
 /// 作る経路を [`ContainerCapabilities::oci_default`] と、OCI 既定集合の部分集合だけを受ける
-/// [`ContainerCapabilities::restrict`] に限る。これで「OCI 既定より広い許可集合」を型の上で
-/// 表現できず、設定から capability を足す経路が無い（drop だけを受ける）ことを保証する。
+/// [`ContainerCapabilities::restrict`]・[`resolve_add_drop`] に限る。これで「OCI 既定より広い許可集合」を
+/// 型の上で表現できない（add は drop で外した既定の要素を戻すだけ。#4792）。
 /// `config.json` の解釈（`oci_runtime/config.rs`）が作り、launch の `CapabilityDrop` 段と
 /// launch 時の分離の記録（exec の再適用）が使う。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -495,10 +498,99 @@ impl ContainerCapabilities {
         Self(self.0.without(drop))
     }
 
+    /// `add` を戻した許可集合を返す（CLI-1・SEC-1・#4794）。`add` は `base`（drop の前の許可集合）の部分集合で
+    /// なければならず、超える要素があればそれを保持した [`CapabilityNotAllowed`] を返す。`base` も既定の部分集合なので、
+    /// 結果は既定の部分集合のまま（許可集合を `base` より広げない）。
+    pub fn readd_within(
+        self,
+        add: CapabilitySet,
+        base: Self,
+    ) -> Result<Self, CapabilityNotAllowed> {
+        if add.is_subset_of(base.0) {
+            Ok(Self(CapabilitySet(self.0.0 | add.0)))
+        } else {
+            Err(CapabilityNotAllowed {
+                rejected: add.iter().filter(|c| !base.0.contains(*c)).collect(),
+            })
+        }
+    }
+
     /// OCI 既定集合と等しいか。
     pub fn is_default(self) -> bool {
         self.0 == CapabilitySet::oci_default()
     }
+}
+
+/// capability の add / drop の組を解けなかったことを表すエラー（SEC-1・CORE-5・#4792）。
+///
+/// 文言は固定の英語で、指定された名前を載せない。呼び出し元（CRI の `add_capabilities`・
+/// CLI の `--cap-add`）は [`CapabilityResolveError::code`] を自分のエラーコードへ写す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapabilityResolveError {
+    /// 名前が不正（空・長すぎる・非 ASCII・未知名）か、件数が [`MAX_DROP_NAMES`] を超える。
+    InvalidName,
+    /// 同じ capability を add と drop の両方に書いた（drop の `ALL` は数えない）。
+    Conflict,
+    /// add に OCI 既定集合の外の capability か `ALL` を書いた（#2241 の D2 A に合わせる）。
+    NotAllowed,
+}
+
+impl CapabilityResolveError {
+    /// ERR-1 のコード。`NotAllowed` だけが `PERMISSION_DENIED`、他は `INVALID_ARGUMENT`。
+    pub fn code(self) -> ErrorCode {
+        match self {
+            Self::InvalidName | Self::Conflict => ErrorCode::InvalidArgument,
+            Self::NotAllowed => ErrorCode::PermissionDenied,
+        }
+    }
+}
+
+impl std::fmt::Display for CapabilityResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::InvalidName => "capability add or drop list is invalid",
+            Self::Conflict => {
+                "a capability is both added and dropped; remove it from one of the lists"
+            }
+            Self::NotAllowed => "adding capabilities outside the OCI default set is not allowed",
+        })
+    }
+}
+
+impl std::error::Error for CapabilityResolveError {}
+
+/// add と drop の名前の並びから、実行時の許可集合を「既定 − drop + add」で解く（SEC-1・CORE-5・#4792）。
+///
+/// #4762 の決定（範囲 (b)）: add の許可リストは OCI 既定 14 個だけで、結果は常に既定の部分集合になる。
+/// 順序は (1) 既定から drop を引く（`ALL` は全部）(2) add を足す。名前の正規化・件数と長さの上限は
+/// drop と同じ（[`parse_drop_name`]・[`MAX_DROP_NAMES`]・[`MAX_DROP_NAME_BYTES`]）。
+/// 検査の順は 名前の形式（`InvalidName`）→ 既定外と add の `ALL`（`NotAllowed`）→ 同名（`Conflict`）。
+/// rootless と特権ランチャー経由とで区別せず、ambient は扱わない（常に空。判断 (2)・(3)）。
+pub fn resolve_add_drop<A: AsRef<str>, D: AsRef<str>>(
+    add: &[A],
+    drop: &[D],
+) -> Result<ContainerCapabilities, CapabilityResolveError> {
+    let dropped = parse_drop_list(drop).map_err(|_| CapabilityResolveError::InvalidName)?;
+    // 件数・各名前の形式は parse_drop_list が drop と同じ規則で検査する（add の `ALL` は全集合になり、
+    // 既定の部分集合でないので下の NotAllowed に落ちる）。
+    let added = parse_drop_list(add).map_err(|_| CapabilityResolveError::InvalidName)?;
+    let default = CapabilitySet::oci_default();
+    if !added.is_subset_of(default) {
+        return Err(CapabilityResolveError::NotAllowed);
+    }
+    let named_drop = drop
+        .iter()
+        .filter(|n| !n.as_ref().eq_ignore_ascii_case("ALL"))
+        .try_fold(CapabilitySet::empty(), |set, n| {
+            parse_drop_name(n.as_ref()).map(|one| CapabilitySet(set.0 | one.0))
+        })
+        .map_err(|_| CapabilityResolveError::InvalidName)?;
+    if !added.intersect(named_drop).is_empty() {
+        return Err(CapabilityResolveError::Conflict);
+    }
+    Ok(ContainerCapabilities(CapabilitySet(
+        default.without(dropped).0 | added.0,
+    )))
 }
 
 #[cfg(test)]
@@ -601,6 +693,154 @@ mod tests {
         assert!(!less.bounding().contains(Capability::Chown));
         let none = d.without(parse_drop_list(&["ALL"]).unwrap());
         assert!(none.bounding().is_empty());
+    }
+
+    /// SEC-1・CLI-1（#4794）: `readd_within` は base の中でだけ戻し、超える要素は拒否する。
+    #[test]
+    fn sec1_cli1_4794_readd_within_base_only() {
+        let base = ContainerCapabilities::oci_default()
+            .without(parse_drop_list(&["CHOWN", "KILL"]).unwrap());
+        let none = base.without(CapabilitySet::all_known());
+        let kill = CapabilitySet::empty().with(Capability::Kill);
+        let raw = CapabilitySet::empty().with(Capability::NetRaw);
+        assert_eq!(
+            names(none.readd_within(raw, base).unwrap()),
+            vec!["CAP_NET_RAW"]
+        );
+        let e = none
+            .readd_within(raw.with(Capability::Kill), base)
+            .unwrap_err();
+        assert_eq!(e.rejected(), &[Capability::Kill]);
+        let def = ContainerCapabilities::oci_default();
+        assert_eq!(
+            names(none.readd_within(kill, def).unwrap()),
+            vec!["CAP_KILL"]
+        );
+    }
+
+    fn names(c: ContainerCapabilities) -> Vec<&'static str> {
+        c.iter().map(Capability::as_str).collect()
+    }
+
+    /// SEC-1・CORE-5（#4792）: 「既定 − drop + add」の具体値。
+    #[test]
+    fn sec1_core5_4792_resolve_add_drop_values() {
+        let r = resolve_add_drop(&["NET_BIND_SERVICE"], &["ALL"]).unwrap();
+        assert_eq!(names(r), vec!["CAP_NET_BIND_SERVICE"]);
+
+        let r = resolve_add_drop(&["chown", "CAP_KILL"], &[] as &[&str]).unwrap();
+        assert!(r.is_default());
+        assert_eq!(r.iter().count(), 14);
+
+        let r = resolve_add_drop(&[] as &[&str], &["NET_RAW"]).unwrap();
+        assert_eq!(r.iter().count(), 13);
+        assert!(!r.bounding().contains(Capability::NetRaw));
+
+        let r = resolve_add_drop(&["kill", "Setuid"], &["all"]).unwrap();
+        assert_eq!(names(r), vec!["CAP_KILL", "CAP_SETUID"]);
+
+        assert!(
+            resolve_add_drop::<&str, &str>(&[], &[])
+                .unwrap()
+                .is_default()
+        );
+    }
+
+    /// SEC-1・CORE-5（#4792）: 既定外の add と add の `ALL` は PERMISSION_DENIED（固定の文言）。
+    #[test]
+    fn sec1_core5_4792_resolve_rejects_outside_default() {
+        for add in [
+            "SYS_ADMIN",
+            "CAP_SYS_MODULE",
+            "sys_ptrace",
+            "NET_ADMIN",
+            "ALL",
+            "all",
+        ] {
+            let e = resolve_add_drop(&[add], &[] as &[&str]).unwrap_err();
+            assert_eq!(e, CapabilityResolveError::NotAllowed, "{add}");
+            assert_eq!(e.code(), ErrorCode::PermissionDenied);
+            assert_eq!(
+                e.to_string(),
+                "adding capabilities outside the OCI default set is not allowed"
+            );
+        }
+        // drop に ALL があっても既定外の add は通らない。
+        assert_eq!(
+            resolve_add_drop(&["SYS_ADMIN"], &["ALL"]).unwrap_err(),
+            CapabilityResolveError::NotAllowed
+        );
+    }
+
+    /// SEC-1・CORE-5（#4792）: 名前の不正・件数超過・同名は INVALID_ARGUMENT。
+    #[test]
+    fn sec1_core5_4792_resolve_rejects_invalid_and_conflict() {
+        let too_many = vec!["chown"; MAX_DROP_NAMES + 1];
+        let long = "A".repeat(MAX_DROP_NAME_BYTES + 1);
+        for add in [
+            vec!["CAP_BOGUS"],
+            vec![""],
+            vec![long.as_str()],
+            too_many.clone(),
+        ] {
+            let e = resolve_add_drop(&add, &[] as &[&str]).unwrap_err();
+            assert_eq!(e, CapabilityResolveError::InvalidName);
+            assert_eq!(e.code(), ErrorCode::InvalidArgument);
+            assert_eq!(e.to_string(), "capability add or drop list is invalid");
+        }
+        assert_eq!(
+            resolve_add_drop(&[] as &[&str], &too_many).unwrap_err(),
+            CapabilityResolveError::InvalidName
+        );
+        // 形式の不正は既定外より先に検査する。
+        assert_eq!(
+            resolve_add_drop(&["SYS_ADMIN", "CAP_BOGUS"], &[] as &[&str]).unwrap_err(),
+            CapabilityResolveError::InvalidName
+        );
+        let e = resolve_add_drop(&["CHOWN"], &["cap_chown"]).unwrap_err();
+        assert_eq!(e, CapabilityResolveError::Conflict);
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            e.to_string(),
+            "a capability is both added and dropped; remove it from one of the lists"
+        );
+        // drop の ALL は同名に数えない。
+        assert!(resolve_add_drop(&["CHOWN"], &["ALL", "KILL"]).is_ok());
+    }
+
+    /// SEC-1・CORE-5（#4792）: 既定 14 個の部分集合 2^14 通りすべてを add・drop に置いた組で、結果は
+    /// 既定の部分集合で「既定 − drop + add」に一致する（add と drop が交わる組は Conflict のため除く）。
+    #[test]
+    fn sec1_core5_4792_resolve_is_always_default_subset() {
+        let default = CapabilitySet::oci_default();
+        let pick = |mask: u32, bit: bool| -> (Vec<&'static str>, CapabilitySet) {
+            let mut names = Vec::new();
+            let mut set = CapabilitySet::empty();
+            for (i, cap) in OCI_DEFAULT_CAPABILITIES.iter().enumerate() {
+                if (mask >> i & 1 == 1) == bit {
+                    names.push(cap.as_str());
+                    set = set.with(*cap);
+                }
+            }
+            (names, set)
+        };
+        let none: &[&str] = &[];
+        for mask in 0..1u32 << 14 {
+            let (on, on_set) = pick(mask, true);
+            let (off, off_set) = pick(mask, false);
+            let cases = [
+                (on.as_slice(), off.as_slice(), on_set),
+                (on.as_slice(), none, default),
+                (on.as_slice(), &["ALL"][..], on_set),
+                (none, on.as_slice(), default.without(on_set)),
+                (none, off.as_slice(), default.without(off_set)),
+            ];
+            for (add, drop, want) in cases {
+                let got = resolve_add_drop(add, drop).unwrap().bounding();
+                assert!(got.is_subset_of(default), "{add:?} {drop:?}");
+                assert_eq!(got, want, "{add:?} {drop:?}");
+            }
+        }
     }
 
     /// SEC-1: 既定集合は Docker の root コンテナの `CapEff`（`a80425fb`）と一致する。

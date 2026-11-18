@@ -1068,6 +1068,73 @@ fn cli1_create_start_flow_on_linux() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// CLI-1・SEC-1（#4794）: 実バイナリの `create --cap-add` は、既定外と `ALL` を PERMISSION_DENIED（6）、未知名を
+/// INVALID_ARGUMENT（2）で拒否し、コンテナを作らない。`--cap-drop ALL --cap-add NET_BIND_SERVICE` は作れる。
+#[cfg(target_os = "linux")]
+#[test]
+fn cli1_sec1_4794_create_cap_add_codes() {
+    let tmp = TmpDir::new("capadd");
+    let dir = isolated_cli_dir("capadd");
+    let cli = dir.join("fandhe-container");
+    let (root, root_s) = prepare_c1(&tmp, &cli);
+    let bundle = tmp.0.join("bundle");
+    let bundle_s = bundle.to_str().expect("utf8");
+    let deny = "adding capabilities outside the OCI default set is not allowed";
+    for (id, add, exit, code, message) in [
+        ("c2", "SYS_ADMIN", 6, "PERMISSION_DENIED", deny),
+        ("c3", "ALL", 6, "PERMISSION_DENIED", deny),
+        (
+            "c4",
+            "CAP_BOGUS",
+            2,
+            "INVALID_ARGUMENT",
+            "capability add or drop list is invalid",
+        ),
+    ] {
+        let out = run_isolated(
+            &cli,
+            &[
+                "--root",
+                &root_s,
+                "create",
+                "--cap-add",
+                add,
+                "--bundle",
+                bundle_s,
+                id,
+            ],
+        );
+        assert_eq!(out.status.code(), Some(exit), "{add}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            code_json("create", code, message),
+            "{add}"
+        );
+        assert!(
+            !root.join(id).exists(),
+            "{add}: no container may be created"
+        );
+    }
+    let out = run_isolated(
+        &cli,
+        &[
+            "--root",
+            &root_s,
+            "create",
+            "--cap-drop",
+            "ALL",
+            "--cap-add",
+            "NET_BIND_SERVICE",
+            "--bundle",
+            bundle_s,
+            "c5",
+        ],
+    );
+    assert_failure_free(&out);
+    assert!(root.join("c5").join("state.json").exists());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// SEC-4・OCI-4・CLI-1（#2480）: 実バイナリの create が `mounts[].destination`（遡り・rootfs 全体・相対 `..`）を
 /// INVALID_ARGUMENT（2）で拒否し、状態ルートの `@audit.log` に mount 層の記録が 1 件ずつ残る。
 /// 正常な create は `@audit.log` を作らない。

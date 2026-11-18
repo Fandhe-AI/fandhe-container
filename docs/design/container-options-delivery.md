@@ -42,7 +42,7 @@ FCOPT1\n
 <kind> <len>\n<len バイトの UTF-8>\n     （繰り返し）
 ```
 
-- `kind` は閉じた語彙 `ulimit`・`env`・`ipc`・`shm-size`・`tmpfs`・`cap-drop`・`read-only`・`network`・`add-host`・`dns`・`pasta`・`publish`・`health-cmd`・`health-interval`・`health-timeout`・`health-start-period`・`health-retries`(+ 作成世代の `gen`)。`len` は 10 進（先頭 0 と `+` は不可、7 桁まで）
+- `kind` は閉じた語彙 `ulimit`・`env`・`ipc`・`shm-size`・`tmpfs`・`cap-drop`・`cap-add`・`read-only`・`network`・`add-host`・`dns`・`pasta`・`publish`・`health-cmd`・`health-interval`・`health-timeout`・`health-start-period`・`health-retries`(+ 作成世代の `gen`)。`len` は 10 進（先頭 0 と `+` は不可、7 桁まで）
 - 値の改行を許すため行区切りではなく長さ接頭辞にする
 - 中身は Docker 構文の生の文字列で、復号のたびに既存のパーサ（`Ulimit::parse` 等）へ通し直す（未信頼の入力として検証）
 - 上限は確保の前に検証する: 全体 `ENV_MAX_TOTAL_BYTES + 256 KiB`、件数（ulimit 16・env `ENV_MAX_ENTRIES`・tmpfs
@@ -56,7 +56,8 @@ FCOPT1\n
 | `--ulimit` | 文書 → `LaunchOptions::with_rlimits` → launcher が 16 種へ補完して `Rlimits` 段へ渡し、同じ集合を Running の状態記録（`state.json` の `rlimits`）にも書く。exec の再適用が launch と同じ制限を載せる |
 | `--env` / `--env-file` | CLI が `--env-file` を利用者の権限で読み、`-e` が後勝ちで統合した `KEY=VALUE` を文書へ → `LaunchOptions::with_env` → `process.env` へ位置を保って重ねる（新しいキーは末尾）。PATH 解決もマージ後の env で行う |
 | `--ipc` / `--shm-size` / `--tmpfs` | 文書 → 既存の `ContainerOptions::launch_options`（#2625） |
-| `--cap-drop` | 文書の `cap-drop` kind（名前の生の文字列。1 件 32 バイト・最大 `MAX_DROP_NAMES` 件）→ 復号のたびに core の `parse_drop_list` で再検証（CRI の `drop_capabilities` と同じ正規化）→ `LaunchOptions::with_capability_drop` → launcher が config.json 由来の許可集合から除き、**狭めた同じ値**を launch の段と分離の記録（`launchIsolation.capabilities`。exec の再適用・inspect が見る）へ渡す。狭める方向のみで add の経路は無い（SEC-1・#2775） |
+| `--cap-drop` | 文書の `cap-drop` kind（名前の生の文字列。1 件 32 バイト・最大 `MAX_DROP_NAMES` 件）→ 復号のたびに core の `parse_drop_list` で再検証（CRI の `drop_capabilities` と同じ正規化）→ `LaunchOptions::with_capability_drop` → launcher が config.json 由来の許可集合から除き、**狭めた同じ値**を launch の段と分離の記録（`launchIsolation.capabilities`。exec の再適用・inspect が見る）へ渡す。狭める方向のみ（SEC-1・#2775） |
+| `--cap-add` | 文書の `cap-add` kind（`cap-drop` と同じ上限）→ 復号のたびに `cap-drop` と組で core の `resolve_add_drop` で再検証（既定外・`ALL` は `PERMISSION_DENIED`、同名・未知名は `INVALID_ARGUMENT`。CRI の `add_capabilities` と同じ規則）→ `LaunchOptions::with_capability_add` → launcher が drop の後に config.json 由来の許可集合の中でだけ戻し、その同じ値を launch の段と分離の記録へ渡す。config.json の集合を超える add は start が `PERMISSION_DENIED` で拒否する（許可集合を config.json より広げない。CLI-1・SEC-1・#4794） |
 | `--label` | 文書を通さず、create 時に `CreateRequest::with_annotations` → `CreateStateRequest::with_annotations` で `state.json` の `annotations` へ |
 | `--read-only` | 文書の `read-only` kind（本体は固定値 `true` だけ。`false`・空・重複は固定文言で拒否）→ `LaunchOptions::with_root_readonly(true)` → launcher が config の `root.readonly` と **OR** で実効値を 1 回だけ計算し、pivot 後の mount の `MOUNT_ATTR_RDONLY`・Landlock の root 規則・分離の記録（`launchIsolation.root_readonly`。inspect の `rootReadonly`）へ**同じ値**を渡す。指定が無ければ外部 bundle の値に従う。狭める方向のみで、`readonly:true` の bundle を書き込み可能に戻す経路は無い（`--read-only=false` は使い方エラー）。CLI は外部 bundle の `config.json` を書き換えない（CLI-1・SUP-12・CORE-5・SEC-1・#2828） |
 | `-p` / `--publish` | 文書の `publish` kind（1 件 64 バイト以下・`MAX_PORT_PUBLISHES` 件以下。`[<ipv4>:]<host>:<container>[/tcp\|udp]` の生の文字列）→ 復号のたびに net の `PastaPortForwards::parse_all` で再検証。ユーザー定義名の `network` と組でない文書は拒否する。検証済みの型で保持するだけで、pasta への反映は #1940 で実装済み（`pasta_attach` が引数へ連結）。CLI が文書へ書く処理は #3329 で実装済み（NET-9・NET-3・SUP-12・#3200） |
@@ -64,7 +65,7 @@ FCOPT1\n
 | healthcheck の定義（`--health-cmd` 等。**CLI の書き手は未実装**） | 文書の `health-cmd`（argv を 1 要素ずつ。`MAX_COMMAND_ARGS` 件以下・合計 `MAX_COMMAND_BYTES` 以下）・`health-interval`・`health-timeout`・`health-start-period`（64 バイト以下の時間文字列）・`health-retries`（20 バイト以下の整数文字列）kind（各 1 件まで。`health-cmd` が無く他だけの文書は拒否）→ 復号のたびに `HealthcheckDefinition::parse` と `HealthcheckSchedule::from_definition`（timeout 60 秒以下）で再検証 → `ContainerOptions::healthcheck` → start の入口が `HealthWiring`（Linux の本番は `ExecHealthProbeFactory`）を組み、monitor が世代ごとに周期実行する。定義が無ければ何も起動せず `health` も書かない。見出し行の上限は 32 バイトに上げた（`health-start-period` + 7 桁が 27 バイトのため）（SUP-4・TASK-161・healthcheck-exec-helper.md 12 章・#2953） |
 | `--pasta-path <絶対パス>` / `--pasta-path-search`（グローバル） | 文書の `pasta`（1 レコード・4096 バイト以下・重複は拒否）。作成時に net の `verify_pasta_binary` / `search_pasta_in_path` で解決・検証した実体の正規パス・識別（dev・ino・size・mtime・ctime・uid・mode）・版の日付を net の `PastaRecord` の本文で書く → 復号は本文の形だけを検証し（副作用なし）、起動の直前に `reverify_recorded_pasta` がバイナリを辿り直して記録と照合する（不一致は `FailedPrecondition`）。`network` がユーザー定義名のときだけ置ける（違えば `InvalidArgument`）。CLI が書く処理は rootless のユーザー定義名の解除（#3329）で有効、start 経路への結線は #1940、SEC-4 の監査の記録は #3330（NET-9・CLI-1・PLUG-11・SUP-12・rootless-network.md 12.4・#3199） |
 
-`cap-drop`・`read-only`・`network`・`add-host`・`dns`・`publish`・`pasta`・`health-*` の追加では版（`FCOPT1`）を上げない。CLI と supervisor は同じディレクトリから配布され、未知の kind は旧 supervisor が拒否する（fail-closed）ため、版を上げる利点が無い（#2775）。
+`cap-drop`・`cap-add`・`read-only`・`network`・`add-host`・`dns`・`publish`・`pasta`・`health-*` の追加では版（`FCOPT1`）を上げない。CLI と supervisor は同じディレクトリから配布され、未知の kind は旧 supervisor が拒否する（fail-closed）ため、版を上げる利点が無い（#2775）。
 
 core は supervisor の検証を信用せず `LaunchOptions::with_env` で件数・長さ・形式を再検証する。
 

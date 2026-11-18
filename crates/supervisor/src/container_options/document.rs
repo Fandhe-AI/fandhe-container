@@ -18,13 +18,16 @@
 //! <kind> <len>\n<len バイトの UTF-8>\n     (繰り返し)
 //! ```
 //!
-//! `kind` は閉じた語彙 `ulimit`・`env`・`ipc`・`shm-size`・`tmpfs`・`cap-drop`・`read-only`・`network`・`add-host`・`dns`・`pasta`・`publish`・`health-cmd`・`health-interval`・`health-timeout`・`health-start-period`・`health-retries`(+ 作成世代の `gen`)。`len` は 10 進(先頭 0 と `+` は不可)。
+//! `kind` は閉じた語彙 `ulimit`・`env`・`ipc`・`shm-size`・`tmpfs`・`cap-drop`・`cap-add`・`read-only`・`network`・`add-host`・`dns`・`pasta`・`publish`・`health-cmd`・`health-interval`・`health-timeout`・`health-start-period`・`health-retries`(+ 作成世代の `gen`)。`len` は 10 進(先頭 0 と `+` は不可)。
 //! 中身は Docker 構文の生の文字列で、復号のたびに既存のパーサ([`Ulimit::parse`] 等)へ通し直す(未信頼の入力として
 //! 検証する。値の改行を許すため、行区切りではなく長さ接頭辞にする)。符号化と復号を同じ型に置き、壊れた文書を
 //! 作れないようにする(REPAIR-2)。
 //!
 //! `cap-drop` は #2775(CLI-1・SEC-1)で足した kind で、版(`FCOPT1`)は上げない。CLI と supervisor は同じディレクトリから
 //! 配布され、未知の kind は旧 supervisor が拒否する(fail-closed)ため、版を上げる利点が無い。
+//! `cap-add` も #4794(CLI-1・SEC-1)で足した kind で、版は同じ理由で上げない。名前の上限は `cap-drop` と同じで、
+//! 復号のたびに `cap-drop` と組で core の `resolve_add_drop` に通し直す(既定外・`ALL` は `PermissionDenied`、
+//! 同名・未知名は `InvalidArgument`)。
 //! `read-only` も #2828(CLI-1・SUP-12)で足した kind で、本体は固定値 `true` だけを受ける(`false` や空は拒否。
 //! `--read-only` は狭める方向だけで、書き込み可能へ戻す表現を持たない)。重複は拒否する。版は同じ理由で上げない。
 //!
@@ -55,7 +58,9 @@
 //! ファイル全体・レコード数・1 レコードの長さを、確保の前に上限と照合する。エラーは固定の英語文言で、値を含めない。
 //! `Debug` は env の値を伏せる(秘密情報を含み得る)。
 
-use fandhe_container_core::capabilities::{MAX_DROP_NAME_BYTES, MAX_DROP_NAMES, parse_drop_list};
+use fandhe_container_core::capabilities::{
+    MAX_DROP_NAME_BYTES, MAX_DROP_NAMES, parse_drop_list, resolve_add_drop,
+};
 use fandhe_container_core::tmpfs::TMPFS_MAX_MOUNTS;
 use fandhe_container_core::traits::types::{ErrorCode, TraitError};
 
@@ -127,6 +132,8 @@ pub struct ContainerOptionsDocument {
     tmpfs: Vec<String>,
     /// `--cap-drop` の生の名前(構築時に core の `parse_drop_list` で検証済み。#2775)。
     cap_drop: Vec<String>,
+    /// `--cap-add` の生の名前(構築時に `cap_drop` と組で core の `resolve_add_drop` で検証済み。#4794)。
+    cap_add: Vec<String>,
     /// `--read-only`(true のとき `root.readonly` を実効的に true にする。#2828)。
     read_only: bool,
     /// `--network` の生の文字列(構築時に net のパーサで検証済み。NET-6・#3065)。
@@ -168,6 +175,7 @@ impl std::fmt::Debug for ContainerOptionsDocument {
             .field("shm_size", &self.shm_size)
             .field("tmpfs", &self.tmpfs)
             .field("cap_drop", &self.cap_drop)
+            .field("cap_add", &self.cap_add)
             .field("read_only", &self.read_only)
             .field("network", &self.network)
             .field("add_hosts", &self.add_hosts)
@@ -210,6 +218,7 @@ impl ContainerOptionsDocument {
             shm_size,
             tmpfs,
             cap_drop: Vec::new(),
+            cap_add: Vec::new(),
             read_only: false,
             network: None,
             add_hosts: Vec::new(),
@@ -261,10 +270,39 @@ impl ContainerOptionsDocument {
         }
         parse_drop_list(&cap_drop).map_err(|_| invalid("a cap-drop record is invalid"))?;
         self.cap_drop = cap_drop;
+        self.check_cap_add()?;
         if self.encode().len() + GENERATION_RECORD_RESERVE > OPTIONS_DOC_MAX_BYTES {
             return Err(invalid("options document is too large"));
         }
         Ok(self)
+    }
+
+    /// `--cap-add` の名前を持たせる(CLI-1・SEC-1・#4794)。件数・1 件の長さは `cap-drop` と同じ上限で、
+    /// `cap_drop` との組を core の `resolve_add_drop` で検証する(エラーのコードと固定の文言は core のまま)。
+    /// 文書全体の上限も再検査する。
+    pub fn with_cap_add(mut self, cap_add: Vec<String>) -> Result<Self, TraitError> {
+        if cap_add.len() > MAX_DROP_NAMES {
+            return Err(invalid("too many cap-add records"));
+        }
+        if cap_add.iter().any(|s| s.len() > CAP_DROP_RECORD_MAX) {
+            return Err(invalid("an options record is too long"));
+        }
+        self.cap_add = cap_add;
+        self.check_cap_add()?;
+        if self.encode().len() + GENERATION_RECORD_RESERVE > OPTIONS_DOC_MAX_BYTES {
+            return Err(invalid("options document is too large"));
+        }
+        Ok(self)
+    }
+
+    /// `cap_add` が空でなければ `cap_drop` との組を解いて検証する(`with_cap_drop` / `with_cap_add` の順に依らない)。
+    fn check_cap_add(&self) -> Result<(), TraitError> {
+        if self.cap_add.is_empty() {
+            return Ok(());
+        }
+        resolve_add_drop(&self.cap_add, &self.cap_drop)
+            .map(|_| ())
+            .map_err(|e| TraitError::new(e.code(), e.to_string()))
     }
 
     /// `--read-only` を持たせる(CLI-1・SUP-12・#2828)。false は「指定なし」で、config の値に従う。
@@ -443,6 +481,11 @@ impl ContainerOptionsDocument {
         &self.cap_drop
     }
 
+    /// `--cap-add` の生の名前。
+    pub fn cap_add(&self) -> &[String] {
+        &self.cap_add
+    }
+
     /// 作成世代の識別子を持たせる(英数字・`-`・`_` のみ、1〜[`GENERATION_MAX`] バイト。#2713)。
     ///
     /// CLI の create が、同じ値を状態記録の annotations(`store::GENERATION_ANNOTATION`)にも書く。supervisor は両者が
@@ -473,6 +516,7 @@ impl ContainerOptionsDocument {
             && self.shm_size.is_none()
             && self.tmpfs.is_empty()
             && self.cap_drop.is_empty()
+            && self.cap_add.is_empty()
             && !self.read_only
             && self.network.is_none()
             && self.add_hosts.is_empty()
@@ -516,6 +560,10 @@ impl ContainerOptionsDocument {
         }
         let cap_drop =
             parse_drop_list(&self.cap_drop).map_err(|_| invalid("a cap-drop record is invalid"))?;
+        // add は drop との組を core で解き直してから、戻す集合だけを渡す(未信頼の入力。#4794)。
+        self.check_cap_add()?;
+        let cap_add =
+            parse_drop_list(&self.cap_add).map_err(|_| invalid("a cap-add record is invalid"))?;
         // network 系は復号のたびに net のパーサで再検証する(未信頼の入力。NET-6・NET-12・#3065)。
         let network = NetworkOptions::parse(
             self.network.as_deref(),
@@ -525,6 +573,7 @@ impl ContainerOptionsDocument {
         )?;
         options = options
             .with_cap_drop(cap_drop)
+            .with_cap_add(cap_add)
             .with_read_only(self.read_only)
             .with_network(network);
         self.check_pasta_network()?;
@@ -574,6 +623,9 @@ impl ContainerOptionsDocument {
         }
         for s in &self.cap_drop {
             put("cap-drop", s);
+        }
+        for s in &self.cap_add {
+            put("cap-add", s);
         }
         if self.read_only {
             put("read-only", "true");
@@ -625,6 +677,7 @@ impl ContainerOptionsDocument {
             .ok_or_else(|| invalid("options document has an unknown header"))?;
         let (mut ulimits, mut env, mut tmpfs) = (Vec::new(), Vec::new(), Vec::new());
         let mut cap_drop: Vec<String> = Vec::new();
+        let mut cap_add: Vec<String> = Vec::new();
         let mut read_only = false;
         let mut network: Option<String> = None;
         let (mut add_hosts, mut dns): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
@@ -664,7 +717,7 @@ impl ContainerOptionsDocument {
                 "ipc" => IPC_RECORD_MAX,
                 "shm-size" => SHM_RECORD_MAX,
                 "tmpfs" => TMPFS_RECORD_MAX,
-                "cap-drop" => CAP_DROP_RECORD_MAX,
+                "cap-drop" | "cap-add" => CAP_DROP_RECORD_MAX,
                 "read-only" => READ_ONLY_RECORD_MAX,
                 "network" => NETWORK_RECORD_MAX,
                 "add-host" => ADD_HOST_RECORD_MAX,
@@ -690,6 +743,7 @@ impl ContainerOptionsDocument {
                 "env" => env.push(text),
                 "tmpfs" => tmpfs.push(text),
                 "cap-drop" => cap_drop.push(text),
+                "cap-add" => cap_add.push(text),
                 "read-only" => {
                     if text != "true" {
                         return Err(invalid("a read-only record is invalid"));
@@ -751,6 +805,7 @@ impl ContainerOptionsDocument {
                 || env.len() > ENV_MAX_ENTRIES
                 || tmpfs.len() > TMPFS_MAX_MOUNTS
                 || cap_drop.len() > MAX_DROP_NAMES
+                || cap_add.len() > MAX_DROP_NAMES
                 || add_hosts.len() > MAX_ADD_HOST_ENTRIES
                 || dns.len() > MAX_DNS_SERVERS
                 || publish.len() > MAX_PORT_PUBLISHES
@@ -764,6 +819,7 @@ impl ContainerOptionsDocument {
         NetworkOptions::parse(network.as_deref(), &add_hosts, &dns, &publish)?;
         let doc = Self::new(ulimits, env, ipc, shm_size, tmpfs)?
             .with_cap_drop(cap_drop)?
+            .with_cap_add(cap_add)?
             .with_read_only(read_only)?
             .with_network(network, add_hosts, dns)?
             .with_pasta(pasta)?
@@ -992,6 +1048,103 @@ tmpfs 14\n/run:rw,noexec\n";
             ContainerOptionsDocument::default()
                 .with_cap_drop(many)
                 .is_err()
+        );
+    }
+
+    /// CLI-1・SEC-1(#4794): `cap-add` は符号化の具体値・往復・変換後の集合が一致し、drop と組で解いた結果が
+    /// launch へ届く。
+    #[test]
+    fn cli1_sec1_4794_cap_add_record_round_trips_and_converts() {
+        use fandhe_container_core::capabilities::{Capability, CapabilitySet};
+        let d = ContainerOptionsDocument::default()
+            .with_cap_drop(vec!["ALL".into()])
+            .and_then(|d| d.with_cap_add(vec!["net_bind_service".into()]))
+            .expect("cap-add");
+        assert!(!d.is_empty());
+        let bytes = d.encode();
+        assert_eq!(
+            bytes,
+            b"FCOPT1\ncap-drop 3\nALL\ncap-add 16\nnet_bind_service\n".to_vec()
+        );
+        let back = ContainerOptionsDocument::decode(&bytes).expect("decode");
+        assert_eq!(back, d);
+        assert_eq!(back.cap_add(), ["net_bind_service"]);
+        let opts = back.to_container_options().expect("opts");
+        let want = CapabilitySet::empty().with(Capability::NetBindService);
+        assert_eq!(opts.cap_add(), want);
+        let launch = opts.launch_options().expect("launch");
+        assert_eq!(launch.capability_add(), want);
+        assert_eq!(launch.capability_drop(), CapabilitySet::all_known());
+        // 旧形式(cap-add なし)は空。
+        let old = ContainerOptionsDocument::decode(b"FCOPT1\nipc 7\nprivate\n").expect("old");
+        assert!(old.cap_add().is_empty());
+        assert_eq!(
+            old.to_container_options().expect("opts").cap_add(),
+            CapabilitySet::empty()
+        );
+    }
+
+    /// CLI-1・SEC-1(#4794): 既定外・`ALL` の add は `PermissionDenied`、未知名・同名・上限超えは `InvalidArgument`。
+    /// 復号(未信頼の入力)でも構築と同じく拒否し、`with_cap_drop` / `with_cap_add` の順に依らない。
+    #[test]
+    fn cli1_sec1_4794_cap_add_record_rejects_invalid() {
+        let deny = "adding capabilities outside the OCI default set is not allowed";
+        for (doc, code, msg) in [
+            (
+                &b"FCOPT1\ncap-add 9\nSYS_ADMIN\n"[..],
+                ErrorCode::PermissionDenied,
+                deny,
+            ),
+            (
+                &b"FCOPT1\ncap-add 3\nALL\n"[..],
+                ErrorCode::PermissionDenied,
+                deny,
+            ),
+            (
+                &b"FCOPT1\ncap-add 9\nCAP_BOGUS\n"[..],
+                ErrorCode::InvalidArgument,
+                "capability add or drop list is invalid",
+            ),
+            (
+                &b"FCOPT1\ncap-drop 5\nchown\ncap-add 9\nCAP_CHOWN\n"[..],
+                ErrorCode::InvalidArgument,
+                "a capability is both added and dropped; remove it from one of the lists",
+            ),
+        ] {
+            let e = ContainerOptionsDocument::decode(doc).expect_err("rejected");
+            assert_eq!((e.code(), e.message()), (code, msg));
+        }
+        // add を先に持たせても、後から足した drop との同名を拒否する。
+        let e = ContainerOptionsDocument::default()
+            .with_cap_add(vec!["KILL".into()])
+            .and_then(|d| d.with_cap_drop(vec!["kill".into()]))
+            .expect_err("conflict");
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        let long = "A".repeat(33);
+        assert_eq!(
+            ContainerOptionsDocument::default()
+                .with_cap_add(vec![long])
+                .expect_err("long")
+                .message(),
+            "an options record is too long"
+        );
+        let many = vec!["chown".to_owned(); MAX_DROP_NAMES + 1];
+        assert_eq!(
+            ContainerOptionsDocument::default()
+                .with_cap_add(many)
+                .expect_err("many")
+                .message(),
+            "too many cap-add records"
+        );
+        let mut doc = b"FCOPT1\n".to_vec();
+        for _ in 0..=MAX_DROP_NAMES {
+            doc.extend_from_slice(b"cap-add 4\nkill\n");
+        }
+        assert_eq!(
+            ContainerOptionsDocument::decode(&doc)
+                .expect_err("many records")
+                .message(),
+            "too many options records"
         );
     }
 

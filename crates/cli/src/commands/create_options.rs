@@ -1,4 +1,4 @@
-//! `create` の起動オプション(`--ulimit`・`--env`・`--env-file`・`--label`・`--ipc`・`--shm-size`・`--tmpfs`・`--cap-drop`・`--read-only`)の
+//! `create` の起動オプション(`--ulimit`・`--env`・`--env-file`・`--label`・`--ipc`・`--shm-size`・`--tmpfs`・`--cap-drop`・`--cap-add`・`--read-only`)の
 //! 意味検証と、supervisor へ渡す文書・状態記録へ書く label の組み立て(SUP-12・CLI-1・SEC-1・#2713)。
 //!
 //! # 役割と呼び出し文脈
@@ -8,7 +8,8 @@
 //! 唯一の判定とし、CLI は二重実装しない。
 //!
 //! - [`document_of`]: ulimit・env・ipc・shm-size・tmpfs・cap-drop(名前は core の `parse_drop_list` で検証。CRI と共有。
-//!   CLI-1・SEC-1・#2775)を [`ContainerOptionsDocument`] にする。`--env-file` は
+//!   CLI-1・SEC-1・#2775)・cap-add(drop と組で core の `resolve_add_drop` で検証。既定外・`ALL` は `PERMISSION_DENIED`。
+//!   CLI-1・SEC-1・#4794)を [`ContainerOptionsDocument`] にする。`--env-file` は
 //!   **CLI が利用者の権限で**読み(非ブロッキング・上限つき。FIFO で止まらない)、`-e` との優先順位(`-e` が後勝ち)で
 //!   統合した `KEY=VALUE` 列を文書の `env` にする。特権の supervisor に利用者指定のホストのパスを読ませない
 //!   (confused deputy の回避。SEC-1)。
@@ -55,6 +56,7 @@ pub(super) fn document_of(
         options.tmpfs.clone(),
     )?
     .with_cap_drop(options.cap_drop.clone())
+    .and_then(|doc| doc.with_cap_add(options.cap_add.clone()))
     .and_then(|doc| doc.with_read_only(options.read_only))
     .and_then(|doc| match pasta {
         // Linux は常に `network` を書く。`--network` の省略は `none`(SEC-1 の「既定で閉じる」。D4・#1873)。
@@ -314,6 +316,45 @@ mod tests {
         let e = document_of(&a, None).expect_err("unknown");
         assert_eq!(e.code(), ErrorCode::InvalidArgument);
         assert_eq!(e.message(), "a cap-drop record is invalid");
+    }
+
+    /// CLI-1・SEC-1(#4794): `--cap-add` は文書の cap-add になり、既定外・`ALL` は `PermissionDenied`、未知名・
+    /// drop との同名は `InvalidArgument`。どれも core の固定の文言で、名前を載せない。
+    #[test]
+    fn cli1_sec1_4794_create_options_cap_add() {
+        let mut a = args();
+        a.cap_drop = vec!["ALL".into()];
+        a.cap_add = vec!["NET_BIND_SERVICE".into()];
+        let doc = document_of(&a, None).expect("doc");
+        assert_eq!(doc.cap_add(), ["NET_BIND_SERVICE"]);
+        assert_eq!(doc.cap_drop(), ["ALL"]);
+        let deny = "adding capabilities outside the OCI default set is not allowed";
+        for (drop, add, code, msg) in [
+            ("", "SYS_ADMIN", ErrorCode::PermissionDenied, deny),
+            ("", "ALL", ErrorCode::PermissionDenied, deny),
+            (
+                "",
+                "CAP_BOGUS",
+                ErrorCode::InvalidArgument,
+                "capability add or drop list is invalid",
+            ),
+            (
+                "chown",
+                "CAP_CHOWN",
+                ErrorCode::InvalidArgument,
+                "a capability is both added and dropped; remove it from one of the lists",
+            ),
+        ] {
+            let mut a = args();
+            a.cap_drop = if drop.is_empty() {
+                Vec::new()
+            } else {
+                vec![drop.into()]
+            };
+            a.cap_add = vec![add.into()];
+            let e = document_of(&a, None).expect_err("rejected");
+            assert_eq!((e.code(), e.message()), (code, msg), "{add}");
+        }
     }
 
     /// SUP-12・SEC-1: 不正な値・矛盾は固定文言の `InvalidArgument` で拒否する(値を出さない)。

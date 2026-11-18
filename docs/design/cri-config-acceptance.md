@@ -9,7 +9,7 @@
 | 1 | イメージ User の名前解決 | cri＋oci の fd 起点の読み取り（本変更で実装済み） | cri・oci | #2606 |
 | 2 | run_as_username | cri（`RootfsSource::prepare` へ解決要求 `UserResolveRequest` を渡す口の変更。順 1 の読み口を再利用。本変更で実装済み） | cri | #2664 |
 | 3 | dns_config | cri（bundle に resolv.conf を生成して `/etc/resolv.conf` へ ro で bind。変換の段は本変更で実装済み。start は core の制約〔状態ルート配下の source の拒否〕で現状は拒否される。`ro` の bind 自体は #1917 で受理済み。下記「dns_config の受け入れ方式」） | cri（end-to-end は core の解消待ち） | #2665 |
-| 4 | capabilities（drop を先行。add / ambient はオーナー判断。SEC-1） | core の `process.capabilities`（UnappliedField）の適用 → cri。drop は本変更で実装済み。add / ambient は `UNIMPLEMENTED` のまま | core → cri | #2666 |
+| 4 | capabilities（drop を先行。add は既定 14 個の範囲で受理。ambient はオーナー判断。SEC-1） | core の `process.capabilities`（UnappliedField）の適用 → cri。drop は #2666、add は #4793 で実装済み。ambient は `UNIMPLEMENTED` のまま | core → cri | #2666・#4793 |
 | 5 | supplemental_groups（とイメージ User の補助グループ） | core の `additionalGids`（launcher が gid 写像と照合して `setgroups` で適用） → cri。本変更で実装済み。`ContainerStatus.user` の報告と機能フラグは #2771 で追加 | core → cri | #2667・#2771 |
 | 6 | stop_signal | core の `StopRequest` に `signal` を足し（PLUG-1 の境界変更）、cri が受け入れる。本変更で実装済み。イメージ config の `StopSignal` と ContainerStatus の報告は #2771 で追加 | core → cri | #2668・#2771 |
 | 7 | mount の propagation（HostToContainer は受け入れ済み。Bidirectional はオーナー判断待ち） | core が `rslave` の bind をホストの slave として載せる（本変更で実装済み）→ cri が HostToContainer を `rslave` へ変換（実装済み）。`rshared`（Bidirectional）は user namespace の中でコンテナからホストへ伝播できないため受けず `UNIMPLEMENTED` のまま。`linux.rootfsPropagation` は使わない。理由と緩和点は `docs/design/mount-propagation.md` | core → cri | #2669 |
@@ -202,14 +202,14 @@ containerd の `containerMounts` は sandbox のファイル（`/etc/hostname`�
 
 - `ContainerStatus.stop_signal` は実際に stop で使う解決済みの値を返す（`ContainerRecord.stop_signal`。`RUNTIME_DEFAULT` は入れない）。`RUNTIME_DEFAULT` の config は SIGTERM（23）と報告され、別名の明示値（例: 15 = SIGPOLL）はそのまま返る（CRI の明示値の話。イメージ由来の値は上表のとおり正規名に寄る）。StopContainer・StopPodSandbox も同じ値を使う。置き場所と寿命は `applied_user` と同じ
 
-## capabilities の受け入れ方式（CRI-2・SEC-1。#2666）
+## capabilities の受け入れ方式（CRI-2・SEC-1。#2666・#4793）
 
-CRI の `LinuxContainerSecurityContext.capabilities` のうち `drop_capabilities` だけを受け入れる。`add_capabilities` / `add_ambient_capabilities` が空でなければ従来どおり `UNIMPLEMENTED`（オーナー判断まで）。
+CRI の `LinuxContainerSecurityContext.capabilities` のうち `drop_capabilities` と `add_capabilities` を受け入れる。add の許可リストは OCI 既定 14 個だけで（#4762 の決定）、実行時の集合は core の `resolve_add_drop`（#4792）が「既定 − drop + add」で解く。結果は常に既定の部分集合。`add_ambient_capabilities` が空でなければ従来どおり `UNIMPLEMENTED`。
 
 - core は `config.json` の `process.capabilities` を解釈する。bounding / effective / permitted の 3 集合が互いに等しく、かつ OCI 既定 14 個の部分集合（drop だけ）のときに限り解釈済みとし、launch の `CapabilityDrop` 段へ渡す。型 `ContainerCapabilities` は OCI 既定集合の部分集合しか作れないため、設定から capability を足す経路は無い
 - `inheritable` / `ambient` が空でない指定、集合ごとに違う指定、既定外を含む指定（add）は `UnappliedField::ProcessCapabilities` として create / start が `UNIMPLEMENTED` で拒否する。未知名・`CAP_` 接頭辞なし・小文字は `INVALID_ARGUMENT`
 - exec は launch 時の分離の記録（`state.json` の `launchIsolation.capabilities`）の集合で再適用し、launch より広い集合を与えない。記録のキーが無い旧記録は、導入前の launch が必ず OCI 既定集合で起動したため OCI 既定集合として扱う。読み込み時は `restrict` で組み直し、未知名・既定外・件数超過は破損（`Internal`）
-- cri は drop の指定があるときだけ「OCI 既定 − drop」を 3 集合へ書く。指定が無ければ `process.capabilities` を書かない
+- cri は add か drop の指定があるときだけ「OCI 既定 − drop + add」を 3 集合へ書く。どちらも無ければ `process.capabilities` を書かない
 
 | CRI の要求 | 結果 |
 | ---------- | ---- |
@@ -218,7 +218,11 @@ CRI の `LinuxContainerSecurityContext.capabilities` のうち `drop_capabilitie
 | drop `ALL` | 空集合 |
 | drop `SYS_ADMIN`（既定に無い） | 既定 14 個のまま（no-op） |
 | 未知名・空・33 バイト以上・非 ASCII | `INVALID_ARGUMENT`（固定文言。名前は載せない） |
-| add / ambient | `UNIMPLEMENTED` |
+| drop `ALL`・add `NET_BIND_SERVICE` | `CAP_NET_BIND_SERVICE` 1 個 |
+| add `chown`（既定内） | 既定 14 個のまま |
+| add `SYS_ADMIN` などの既定外・add `ALL` | `PERMISSION_DENIED`（固定文言） |
+| add と drop に同じ名前（drop の `ALL` は除く） | `INVALID_ARGUMENT`（containerd は drop 優先、moby は add 優先で割れるため拒否する。#4762 のオーナー判断） |
+| ambient | `UNIMPLEMENTED` |
 
 既知の差:
 

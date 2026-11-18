@@ -15,6 +15,7 @@
 //! | `rlimits` | `--ulimit` の指定値。launcher が 16 種へ補完して `Rlimits` 段へ渡し、`state.json` にも記録する(#2713) |
 //! | `env` | `--env` の上書き。`process.env` へ `KEY` 単位で重ねて entrypoint へ渡す(#2713) |
 //! | `capability_drop` | `create --cap-drop`。config.json 由来の許可集合から除く(狭める方向のみ。launch の段と分離の記録へ同じ値を渡す。CLI-1・SEC-1・#2775) |
+//! | `capability_add` | `create --cap-add`。drop の後に config.json 由来の許可集合の中でだけ戻す(config.json の集合を超える add は launch が `PERMISSION_DENIED` で拒否。CLI-1・SEC-1・#4794) |
 //! | `network` | start が予約前に config の network エントリと突き合わせ(D7。`network_mode.rs`)、launcher が spec と照合する。`Loopback` と `Attachable` は新しい netns と `lo` の up を伴う(#3064。NET-6・SEC-1・#3058)。`Attachable` は rootless の pasta 構成向けで、`ProductionLauncherBuilder::netns_attach_hook` と対(#1939) |
 //! | `netns_join` | `JoinPinned` と対。init user namespace 所有の pin 済み netns の置き場・パス・(dev, ino)。start が 1 回だけ開いて fd に固定し、user namespace の作成前に参加する(rootful のユーザー定義ネットワーク。D12・NET-1・SEC-1・CORE-3・#3069) |
 //! | `etc_files` | pivot 前段の `mount_etc_files`(管理ルートに生成済みの `/etc/hosts`・`/etc/resolv.conf` を bind。空なら載せない。NET-12・#1872) |
@@ -90,6 +91,8 @@ pub struct LaunchOptions {
     env: Vec<String>,
     /// `--cap-drop` の集合(config.json 由来の許可集合から除く。空なら何もしない)。
     capability_drop: CapabilitySet,
+    /// `--cap-add` の集合(drop の後に戻す。core の `resolve_add_drop` で既定の部分集合と検証済み。#4794)。
+    capability_add: CapabilitySet,
     /// `--read-only`(true なら config の値によらず root を読み取り専用にする。false なら config に従う)。
     root_readonly: bool,
     /// network namespace の扱い(既定 `FromConfig`。NET-6・SEC-1・#3058)。
@@ -113,6 +116,7 @@ impl std::fmt::Debug for LaunchOptions {
             .field("rlimits", &self.rlimits)
             .field("env_count", &self.env.len())
             .field("capability_drop", &self.capability_drop)
+            .field("capability_add", &self.capability_add)
             .field("root_readonly", &self.root_readonly)
             .field("network", &self.network)
             .field("netns_join", &self.netns_join)
@@ -169,6 +173,7 @@ impl LaunchOptions {
             rlimits: Rlimits::default(),
             env: Vec::new(),
             capability_drop: CapabilitySet::empty(),
+            capability_add: CapabilitySet::empty(),
             root_readonly: false,
             network: LaunchNetworkMode::FromConfig,
             netns_join: None,
@@ -197,6 +202,14 @@ impl LaunchOptions {
     #[must_use]
     pub fn with_capability_drop(mut self, drop: CapabilitySet) -> Self {
         self.capability_drop = drop;
+        self
+    }
+
+    /// `--cap-add` の集合を持たせる(CLI-1・SEC-1・#4794)。launcher は drop の後に config.json 由来の許可集合の
+    /// 中でだけ戻し、その集合を超える要素があれば launch を拒否する(許可集合を広げる経路にはならない)。
+    #[must_use]
+    pub fn with_capability_add(mut self, add: CapabilitySet) -> Self {
+        self.capability_add = add;
         self
     }
 
@@ -322,6 +335,11 @@ impl LaunchOptions {
     /// `--cap-drop` で除く capability の集合。
     pub fn capability_drop(&self) -> CapabilitySet {
         self.capability_drop
+    }
+
+    /// `--cap-add` で戻す capability の集合。
+    pub fn capability_add(&self) -> CapabilitySet {
+        self.capability_add
     }
 
     /// `process.env`(`base`)へ上書きを重ねた env。既存のキーはその位置で値を置き換え、新しいキーは末尾へ足す

@@ -2,14 +2,19 @@
 //! 設計は `docs/design/pod-namespace-holder.md`）。
 //!
 //! bin の main が第 1 引数 `pod-holder` で [`run`] へ振り分ける。core の
-//! `establish_pod_namespaces`（H1・#2870）で user（写像つき）・ipc・net を作り、READY を返した後は待つだけ。
+//! `establish_pod_namespaces`（H1・#2870）で user（写像つき）・ipc・net・mount を作り、READY を返した後は待つだけ。
 //!
 //! # 手順（案 (a): `unshare(USER)` の後に自身を再 exec して non-dumpable を保つ）
 //! **段 1**（argv は `pod-holder` のみ）: fd 3 以上を閉じる → stdio と SIGTERM の検査 → `PR_SET_DUMPABLE 0` →
 //! 権限モデルを `start` と同じ規則で決める → `/proc/self/exe` を開く → namespace を確立 → 素性を引数に載せて
-//! 開いた fd を `execveat` で再 exec。**段 2**（`pod-holder --stage2 <6 個の 10 進>`）: 直ちに `PR_SET_DUMPABLE 0` →
-//! fd を再度閉じる → 引数・dumpable・素性・`uid_map`・子の不在を照合 → capability を全て落とす → READY を書く →
-//! stdin を待つ（EOF で 0、予期しない入力で 1。SIGTERM は既定の動作で終わる）。PDEATHSIG は使わない（#2376 と同じ理由）。
+//! 開いた fd を `execveat` で再 exec。**段 2**（`pod-holder --stage2 <8 個の 10 進>`）: 直ちに `PR_SET_DUMPABLE 0` →
+//! fd を再度閉じる → 引数・dumpable・素性・`uid_map`・子の不在を照合 → pod-init の空の root を作る（#4808。
+//! `create_pod_root`。mount ns の `CAP_SYS_ADMIN` が要るので capability を落とす前）→ capability を全て落とす →
+//! READY を書く → stdin を待つ（EOF で 0、予期しない入力で 1。SIGTERM は既定の動作で終わる）。PDEATHSIG は使わない
+//! （#2376 と同じ理由）。
+//!
+//! 待ちの間に開いている fd は 0〜2 と空の root の fd 1 本（close-on-exec。pod-init〔P5〕が fork で受け継ぐ）。空の root は
+//! どこにも接続しない tmpfs のため、保持役自身の root（段 1 で作った mount ns の private な複製）は変わらない。
 //!
 //! # なぜ再 exec か
 //! `/proc/<pid>/ns/*` の open は `ptrace_may_access` を通り、non-dumpable のプロセスには `mm->user_ns` での
@@ -31,7 +36,7 @@ use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use fandhe_container_core::oci_runtime::establish_pod_namespaces;
+use fandhe_container_core::oci_runtime::{create_pod_root, establish_pod_namespaces};
 use fandhe_container_core::traits::types::{ErrorCode, TraitError};
 
 use super::frame::{NsId, PodHolderFrame, PodHolderReady};
@@ -176,11 +181,11 @@ pub(super) fn sigterm_is_default(status: &str) -> Result<bool, &'static str> {
 }
 
 /// 段 2 の引数（6 個の 10 進 u64: user・ipc・net の dev, ino）を解析する。個数・形式が不正なら `None`。
-pub(super) fn parse_stage2_args(args: &[OsString]) -> Option<[u64; 6]> {
-    if args.len() != 6 {
+pub(super) fn parse_stage2_args(args: &[OsString]) -> Option<[u64; 8]> {
+    if args.len() != 8 {
         return None;
     }
-    let mut out = [0u64; 6];
+    let mut out = [0u64; 8];
     for (slot, a) in out.iter_mut().zip(args) {
         let s = std::str::from_utf8(a.as_bytes()).ok()?;
         if s.is_empty() || s.len() > 20 || !s.bytes().all(|b| b.is_ascii_digit()) {
@@ -302,7 +307,7 @@ fn stage1() -> Result<(), StageEnd> {
     })?;
     let ns = establish_pod_namespaces(privilege, source)
         .map_err(|e| from_trait(&e, "failed to establish the pod namespaces"))?;
-    let (u, i, n) = (ns.user(), ns.ipc(), ns.net());
+    let (u, i, n, m) = (ns.user(), ns.ipc(), ns.net(), ns.mnt());
     let cstr = |s: String| {
         CString::new(s).map_err(|_| Fail::new(ErrorCode::Internal, "failed to build arguments"))
     };
@@ -316,6 +321,8 @@ fn stage1() -> Result<(), StageEnd> {
         cstr(i.ino().to_string())?,
         cstr(n.dev().to_string())?,
         cstr(n.ino().to_string())?,
+        cstr(m.dev().to_string())?,
+        cstr(m.ino().to_string())?,
     ];
     // 成功すれば戻らない。環境変数は渡さない。
     sys::execveat_fd(exe.as_raw_fd(), &argv, &[])
@@ -347,6 +354,22 @@ fn stage2(args: &[OsString]) -> Result<(), StageEnd> {
     dumpable_reset?;
     check_stdio()?;
     require_non_dumpable(sys::get_dumpable())?;
+    let user = ns_identity("/proc/self/ns/user")?;
+    let ipc = ns_identity("/proc/self/ns/ipc")?;
+    let net = ns_identity("/proc/self/ns/net")?;
+    let mnt = ns_identity("/proc/self/ns/mnt")?;
+    let want = |d, i| NsId { dev: d, ino: i };
+    let [ud, ui, id, ii, nd, ni, md, mi] = expected;
+    if user != want(ud, ui) || ipc != want(id, ii) || net != want(nd, ni) || mnt != want(md, mi) {
+        return Err(Fail::new(
+            ErrorCode::FailedPrecondition,
+            "namespace identities do not match",
+        )
+        .into());
+    }
+    // pod-init の空の root は、段 1 で作った mount ns の中で capability を落とす前に作る(#4808)。待ちの間ずっと持つ。
+    let _pod_root =
+        create_pod_root().map_err(|e| from_trait(&e, "failed to create the pod root"))?;
     // 待つだけのプロセスに pod の user namespace の capability を残さない(SEC-1)。
     sys::cap_ambient_clear_all()
         .map_err(|_| Fail::new(ErrorCode::Internal, "failed to drop capabilities"))?;
@@ -357,18 +380,6 @@ fn stage2(args: &[OsString]) -> Result<(), StageEnd> {
     })
     .map_err(|_| Fail::new(ErrorCode::Internal, "failed to drop capabilities"))?;
 
-    let user = ns_identity("/proc/self/ns/user")?;
-    let ipc = ns_identity("/proc/self/ns/ipc")?;
-    let net = ns_identity("/proc/self/ns/net")?;
-    let want = |d, i| NsId { dev: d, ino: i };
-    let [ud, ui, id, ii, nd, ni] = expected;
-    if user != want(ud, ui) || ipc != want(id, ii) || net != want(nd, ni) {
-        return Err(Fail::new(
-            ErrorCode::FailedPrecondition,
-            "namespace identities do not match",
-        )
-        .into());
-    }
     let uid_map = read_limited("/proc/self/uid_map")?;
     if is_initial_uid_map(&uid_map) {
         return Err(Fail::new(
@@ -387,7 +398,7 @@ fn stage2(args: &[OsString]) -> Result<(), StageEnd> {
     }
     check_sigterm()?;
 
-    let ready = PodHolderReady::new(std::process::id(), user, ipc, net)
+    let ready = PodHolderReady::new(std::process::id(), user, ipc, net, mnt)
         .map_err(|e| from_trait(&e, "failed to build the READY frame"))?;
     write_stdout_bounded(PodHolderFrame::ready(&ready).as_bytes())
         .map_err(|_| Fail::new(ErrorCode::Unavailable, "failed to write READY"))?;
@@ -446,31 +457,29 @@ mod tests {
         assert!(sigterm_is_default("").is_err());
     }
 
-    /// 段 2 の引数は 6 個の 10 進だけを受ける。
+    /// 段 2 の引数は 8 個の 10 進だけを受ける（user・ipc・net・mnt の dev / ino。#4808）。
     #[test]
     fn cri2_stage2_args_parser() {
+        let with_last = |last: &str| {
+            let mut v = vec!["1", "2", "3", "4", "5", "6", "7"];
+            v.push(last);
+            parse_stage2_args(&os(&v))
+        };
         assert_eq!(
-            parse_stage2_args(&os(&["4", "1", "4", "2", "4", "3"])),
-            Some([4, 1, 4, 2, 4, 3])
+            parse_stage2_args(&os(&["4", "1", "4", "2", "4", "3", "4", "5"])),
+            Some([4, 1, 4, 2, 4, 3, 4, 5])
         );
-        assert_eq!(parse_stage2_args(&os(&["1", "2", "3", "4", "5"])), None);
         assert_eq!(
-            parse_stage2_args(&os(&["1", "2", "3", "4", "5", "6", "7"])),
+            parse_stage2_args(&os(&["1", "2", "3", "4", "5", "6"])),
             None
         );
         assert_eq!(
-            parse_stage2_args(&os(&["1", "2", "3", "4", "5", "-6"])),
+            parse_stage2_args(&os(&["1", "2", "3", "4", "5", "6", "7", "8", "9"])),
             None
         );
-        assert_eq!(parse_stage2_args(&os(&["1", "2", "3", "4", "5", ""])), None);
-        assert_eq!(
-            parse_stage2_args(&os(&["1", "2", "3", "4", "5", "0x6"])),
-            None
-        );
-        assert_eq!(
-            parse_stage2_args(&os(&["1", "2", "3", "4", "5", "18446744073709551616"])),
-            None
-        );
+        for bad in ["-8", "", "0x8", "18446744073709551616"] {
+            assert_eq!(with_last(bad), None, "{bad:?}");
+        }
     }
 
     /// 初期 user namespace の恒等写像だけを拒否する。

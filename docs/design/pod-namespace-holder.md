@@ -22,7 +22,7 @@
 
 - 起動: plugin-cri が `supervised.rs` と同じ規則（実体と同じディレクトリの固定名。`PATH`・環境変数・引数による上書きなし。PLUG-11 の方針）で解決して exec する
 - namespace の確立: 新設の core の公開 API（`oci_runtime::pod_holder`・仮称）が担う。権限モデルの写像で user を作成 → ipc → net の `unshare`。範囲写像の経路は既存の holder / mapper を再利用する
-- 起動後: fd 3 以上を閉じてから固定長の READY（pid と各 ns の dev・inode）を返し、以後は待機だけをする
+- 起動後: fd 3 以上を閉じてから固定長の READY（pid と各 ns の dev・inode）を返し、以後は待機だけをする。#4808 で mount ns（pod の userns が所有・`/` は再帰 private）を足し、段 2 が capability を落とす前に pod-init の空の root（どこにも接続しない tmpfs。`nosuid,nodev,noexec`）を作って fd で持つ（READY は版 2・80 バイトで mnt の素性を載せる）
 
 | 却下案 | 理由 |
 | ------ | ---- |

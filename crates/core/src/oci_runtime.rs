@@ -146,7 +146,10 @@ pub use namespace_join::{NamespaceJoin, NetnsJoinTarget, PinnedNetnsJoin};
 pub use netns_attach::{AttachableNamespaces, NetnsAttachHook};
 pub use network_mode::{EffectiveNetwork, LaunchNetworkMode};
 #[cfg(target_os = "linux")]
-pub use pod_holder::{NamespaceIdentity, PodHolderNamespaces, establish_pod_namespaces};
+pub use pod_holder::{
+    NamespaceIdentity, PodHolderNamespaces, PodRoot, PodRootAttrs, create_pod_root,
+    establish_pod_namespaces, root_entry_count,
+};
 pub use resources::{ByteLimit, CgroupsPath, IoThrottle, LinuxResourceLimits};
 #[cfg(feature = "exec-test-support")]
 #[doc(hidden)]

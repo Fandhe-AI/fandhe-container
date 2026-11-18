@@ -2905,9 +2905,58 @@ pub(crate) fn mount_dev_tmpfs_on(
     mount_tmpfs_impl(target_dir, &TmpfsParams::from(create))
 }
 
+/// pod の保持役の空の root（`nosuid,nodev,noexec`・mode 0o755・64 KiB。CRI-2・CORE-3・SEC-5・#4808）。
+///
+/// どこにも接続しない切り離したマウント（[`new_detached_tmpfs`]）として作り、保持役が fd で持つ。pod-init（P5）がこの
+/// マウントへ移って `pivot_root` する前提で、中身は空のまま（`/dev/shm` の載せ先は S1 が足す）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PodRootTmpfsCreate {
+    _private: (),
+}
+
+impl PodRootTmpfsCreate {
+    const MODE: u32 = 0o755;
+    const SIZE_BYTES: u64 = 64 * 1024;
+    const ATTR_BITS: u32 =
+        consts::MOUNT_ATTR_NOSUID | consts::MOUNT_ATTR_NODEV | consts::MOUNT_ATTR_NOEXEC;
+
+    /// 固定値の作成パラメータを返す。
+    pub(crate) const fn new() -> Self {
+        Self { _private: () }
+    }
+}
+
+impl From<PodRootTmpfsCreate> for TmpfsParams {
+    fn from(_: PodRootTmpfsCreate) -> Self {
+        Self {
+            mode: PodRootTmpfsCreate::MODE,
+            size: Some(PodRootTmpfsCreate::SIZE_BYTES),
+            read_only: false,
+            attr: PodRootTmpfsCreate::ATTR_BITS,
+        }
+    }
+}
+
+/// どこにも接続しない tmpfs のマウントを作り、そのルートを指す fd（close-on-exec）を返す（#4808）。
+///
+/// [`mount_tmpfs_on`] と同じ `fsopen` → `fsconfig` → `fsmount` で、最後の `move_mount` だけを行わない。呼び出し
+/// プロセスのマウントの木は変わらず、fd を閉じればカーネルが破棄する。作るには呼び出しスレッドの mount namespace を
+/// 所有する user namespace の `CAP_SYS_ADMIN` が要る。`ENOSYS` は [`SysError::Unsupported`]。
+pub(crate) fn new_detached_tmpfs(create: PodRootTmpfsCreate) -> Result<OwnedFd, SysError> {
+    create_tmpfs_mount(&TmpfsParams::from(create))
+}
+
 /// [`mount_tmpfs_on`] と [`mount_dev_tmpfs_on`] の共通手順。`params` は型付きの入口からしか作られない。
 #[cfg_attr(test, allow(dead_code))]
 fn mount_tmpfs_impl(target_dir: BorrowedFd<'_>, params: &TmpfsParams) -> Result<OwnedFd, SysError> {
+    let mnt_fd = create_tmpfs_mount(params)?;
+    move_mount_empty_path(std::os::fd::AsFd::as_fd(&mnt_fd), target_dir)?;
+    Ok(mnt_fd)
+}
+
+/// tmpfs の切り離したマウントを作る本体（[`mount_tmpfs_impl`]・[`new_detached_tmpfs`] が共有する）。
+#[cfg_attr(test, allow(dead_code))]
+fn create_tmpfs_mount(params: &TmpfsParams) -> Result<OwnedFd, SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
     }
@@ -2964,7 +3013,7 @@ fn mount_tmpfs_impl(target_dir: BorrowedFd<'_>, params: &TmpfsParams) -> Result<
             0i64,
         )
     })?;
-    // SAFETY: `fs_fd` は生存中の fd。flags は定数、attr は `TmpfsParams::attr`（`TmpfsMountFlags::attr_bits` か `DevTmpfsCreate::attr_bits` だけから作られる名前つき定数の和）のみ。
+    // SAFETY: `fs_fd` は生存中の fd。flags は定数、attr は `TmpfsParams::attr`（`TmpfsMountFlags::attr_bits`・`DevTmpfsCreate::ATTR_BITS`・`PodRootTmpfsCreate::ATTR_BITS` だけから作られる名前つき定数の和）のみ。
     // 成功時の戻り値は新規 fd で、直後に `new_mount_api_fd` が唯一の所有者にする。副作用は未接続の
     // マウントの作成に限る（fd を閉じればカーネルが破棄する）。
     let mnt_fd = new_mount_api_fd(unsafe {
@@ -2975,7 +3024,6 @@ fn mount_tmpfs_impl(target_dir: BorrowedFd<'_>, params: &TmpfsParams) -> Result<
             i64::from(params.attr),
         )
     })?;
-    move_mount_empty_path(std::os::fd::AsFd::as_fd(&mnt_fd), target_dir)?;
     Ok(mnt_fd)
 }
 

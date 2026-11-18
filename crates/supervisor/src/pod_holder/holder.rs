@@ -5,13 +5,17 @@
 //! `establish_pod_namespaces`（H1・#2870）で user（写像つき）・ipc・net・mount を作り、READY を返した後は待つだけ。
 //!
 //! # 手順（案 (a): `unshare(USER)` の後に自身を再 exec して non-dumpable を保つ）
-//! **段 1**（argv は `pod-holder` のみ）: fd 3 以上を閉じる → stdio と SIGTERM の検査 → `PR_SET_DUMPABLE 0` →
+//! **段 1**（argv は `pod-holder`、pod の pid ns も作るときは `pod-holder --share-pid`。#4815）: fd 3 以上を閉じる → stdio と SIGTERM の検査 → `PR_SET_DUMPABLE 0` →
 //! 権限モデルを `start` と同じ規則で決める → `/proc/self/exe` を開く → namespace を確立 → 素性を引数に載せて
-//! 開いた fd を `execveat` で再 exec。**段 2**（`pod-holder --stage2 <8 個の 10 進>`）: 直ちに `PR_SET_DUMPABLE 0` →
+//! 開いた fd を `execveat` で再 exec。**段 2**（`pod-holder --stage2 <8 個の 10 進> <0|1>`。最後は pid の共有）: 直ちに `PR_SET_DUMPABLE 0` →
 //! fd を再度閉じる → 引数・dumpable・素性・`uid_map`・子の不在を照合 → pod-init の空の root を作る（#4808。
-//! `create_pod_root`。mount ns の `CAP_SYS_ADMIN` が要るので capability を落とす前）→ capability を全て落とす →
+//! `create_pod_root`。mount ns の `CAP_SYS_ADMIN` が要るので capability を落とす前）→ pid を共有するときは pod の
+//! pid ns を作って pod-init を PID 1 として fork する（#4815。core の `spawn_pod_init`）→ capability を全て落とす →
 //! READY を書く → stdin を待つ（EOF で 0、予期しない入力で 1。SIGTERM は既定の動作で終わる）。PDEATHSIG は使わない
 //! （#2376 と同じ理由）。
+//!
+//! pid を共有するときの待ちは、stdin の停止の合図と pod-init の終了の先に起きたほうまでで、pod-init が死んだら終了コード 1 で
+//! 終わる（その pid ns では以後 fork できないため。fail-closed）。停止の合図では pod-init を SIGKILL して回収してから終わる。
 //!
 //! 待ちの間に開いている fd は 0〜2 と空の root の fd 1 本（close-on-exec。pod-init〔P5〕が fork で受け継ぐ）。空の root は
 //! どこにも接続しない tmpfs のため、保持役自身の root（段 1 で作った mount ns の private な複製）は変わらない。
@@ -30,13 +34,15 @@
 use std::ffi::{CString, OsString};
 use std::fs::File;
 use std::io::{Read as _, Write as _};
-use std::os::fd::{AsFd as _, AsRawFd as _};
+use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use fandhe_container_core::oci_runtime::{create_pod_root, establish_pod_namespaces};
+use fandhe_container_core::oci_runtime::{
+    PodHolderWake, PodInit, create_pod_root, establish_pod_namespaces, spawn_pod_init,
+};
 use fandhe_container_core::traits::types::{ErrorCode, TraitError};
 
 use super::frame::{NsId, PodHolderFrame, PodHolderReady};
@@ -44,6 +50,10 @@ use crate::sys;
 
 /// 段 2 を示す固定の第 2 引数。
 const STAGE2: &str = "--stage2";
+/// 段 1 で pod の pid ns も作ることを示す引数（#4815）。
+const SHARE_PID: &str = "--share-pid";
+/// 停止の後に pod-init の回収を待つ上限（REPAIR-5）。
+const POD_INIT_STOP_LIMIT: Duration = Duration::from_secs(5);
 /// 再 exec の `argv[0]`（固定。パス文字列を使わない）。
 const HOLDER_ARG0: &str = "fandhe-container-supervisor";
 /// `/proc/self/status` を読む上限（バイト）。
@@ -77,12 +87,11 @@ fn from_trait(e: &TraitError, fallback: &'static str) -> Fail {
 /// 保持役の入口。`args` は `pod-holder` の後ろの引数。
 pub(super) fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
     let args: Vec<OsString> = args.collect();
-    let result = match args.first() {
-        None => stage1(),
-        Some(first) if first.as_bytes() == STAGE2.as_bytes() => {
-            stage2(args.get(1..).unwrap_or(&[]))
-        }
-        Some(_) => return usage_error("pod-holder takes no arguments"),
+    let result = match args.as_slice() {
+        [] => stage1(false),
+        [only] if only.as_bytes() == SHARE_PID.as_bytes() => stage1(true),
+        [first, rest @ ..] if first.as_bytes() == STAGE2.as_bytes() => stage2(rest),
+        _ => return usage_error("pod-holder takes no arguments other than --share-pid"),
     };
     match result {
         // 成功は戻らない（段 1 は exec、段 2 は待ちの後に `Ok` を返す）。
@@ -122,40 +131,68 @@ fn fail(f: &Fail) -> ExitCode {
     ExitCode::from(1)
 }
 
-/// フレームを stdout へ書く。読み手が止まって pipe / socket が満杯でも `FRAME_WRITE_TIMEOUT` で見切る
-/// （別スレッドで書き、期限切れならスレッドを残したまま `Err` を返す。呼び出し側はその後プロセスを終える。REPAIR-5）。
-/// `CLONE_NEWUSER` の後に呼ばれるが、書き込みスレッドは完了するか期限切れで終了へ向かうため、待ちの間の単一スレッド前提は壊れない。
+/// フレームを stdout へ書く。読み手が止まって pipe / socket が満杯でも `FRAME_WRITE_TIMEOUT` で見切る（REPAIR-5）。
+///
+/// スレッドは作らない: pod の pid ns を作った後（`unshare(CLONE_NEWPID)` で `pid_for_children` が自分の pid ns と違う）は
+/// カーネルが `CLONE_THREAD` を `EINVAL` で拒否する（Linux v6.12 `kernel/fork.c` の `copy_process`。#4815）。
 fn write_stdout_bounded(bytes: &[u8]) -> Result<(), ()> {
-    let owned = std::io::stdout()
-        .as_fd()
-        .try_clone_to_owned()
-        .map_err(|_| ())?;
-    let data = bytes.to_vec();
-    let (tx, rx) = std::sync::mpsc::channel::<bool>();
-    std::thread::Builder::new()
-        .spawn(move || {
-            let ok = File::from(owned).write_all(&data).is_ok();
-            let _ = tx.send(ok);
-        })
-        .map_err(|_| ())?;
-    match rx.recv_timeout(FRAME_WRITE_TIMEOUT) {
-        Ok(true) => Ok(()),
-        _ => Err(()),
-    }
+    write_fd_bounded(std::io::stdout().as_fd(), bytes, FRAME_WRITE_TIMEOUT)
 }
 
-/// 失敗行を stderr へ出す。読み手が止まって pipe が満杯でも終了を妨げないよう別スレッドで書き、期限で見切る
-/// （失敗経路でだけ呼ぶ。`CLONE_NEWUSER` の後なので単一スレッド前提を壊さない）。
+/// `fd` を一時的に `O_NONBLOCK` にして、`EAGAIN` の間は期限まで再試行しながら書き、元のフラグへ戻す。
+///
+/// 書き込み自体が待たないため、他の書き手と pipe を共有していて空きを先に埋められても期限で見切れる。フラグは open file
+/// description の共有の性質のため、期限までの間だけ同じ出力先の他の書き手にも効く（stdout は保持役専用の pipe / socket、
+/// stderr は失敗経路で 1 行書いて終わる直前だけ）。
+///
+/// `O_NONBLOCK` で待たないことが保証される pipe・socket にだけ書き、それ以外（通常ファイル・端末など。停止した FUSE
+/// 上のファイルでは write 自体が止まる）へは書かずに `Err` を返す（REPAIR-5）。stdout は [`check_stdio`] が pipe か socket に
+/// 限っているため、省かれうるのは stderr の失敗行だけで、失敗は終了コードで伝わる。
+fn write_fd_bounded(fd: BorrowedFd<'_>, bytes: &[u8], limit: Duration) -> Result<(), ()> {
+    if is_fifo_or_socket(fd) != Some(true) {
+        return Err(());
+    }
+    let deadline = std::time::Instant::now() + limit;
+    let was_nonblocking = sys::set_status_nonblocking(fd, true).map_err(|_| ())?;
+    let written = write_nonblocking_until(fd, bytes, deadline);
+    if !was_nonblocking {
+        let _ = sys::set_status_nonblocking(fd, false);
+    }
+    written
+}
+
+fn write_nonblocking_until(
+    fd: BorrowedFd<'_>,
+    mut bytes: &[u8],
+    deadline: std::time::Instant,
+) -> Result<(), ()> {
+    let mut out = File::from(fd.try_clone_to_owned().map_err(|_| ())?);
+    while !bytes.is_empty() {
+        match out.write(bytes) {
+            Ok(0) => return Err(()),
+            Ok(n) => bytes = bytes.get(n..).ok_or(())?,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(());
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => return Err(()),
+        }
+    }
+    Ok(())
+}
+
+/// 失敗行を stderr へ出す。読み手が止まって pipe が満杯でも終了を妨げないよう期限で見切る（失敗経路でだけ呼ぶ。
+/// スレッドを作らない理由は [`write_stdout_bounded`] と同じ）。
 fn stderr_line(code: ErrorCode, message: &str) {
     let line = format!("error code={} message={message}\n", code.as_str());
-    let (tx, rx) = std::sync::mpsc::channel::<()>();
-    let spawned = std::thread::Builder::new().spawn(move || {
-        let _ = std::io::stderr().write_all(line.as_bytes());
-        let _ = tx.send(());
-    });
-    if spawned.is_ok() {
-        let _ = rx.recv_timeout(FAIL_LINE_TIMEOUT);
-    }
+    let _ = write_fd_bounded(
+        std::io::stderr().as_fd(),
+        line.as_bytes(),
+        FAIL_LINE_TIMEOUT,
+    );
 }
 
 // ---- 純関数（ユニット試験の対象） ----
@@ -181,19 +218,27 @@ pub(super) fn sigterm_is_default(status: &str) -> Result<bool, &'static str> {
 }
 
 /// 段 2 の引数（6 個の 10 進 u64: user・ipc・net の dev, ino）を解析する。個数・形式が不正なら `None`。
-pub(super) fn parse_stage2_args(args: &[OsString]) -> Option<[u64; 8]> {
-    if args.len() != 8 {
+pub(super) fn parse_stage2_args(args: &[OsString]) -> Option<([u64; 8], bool)> {
+    let [ids @ .., share] = args else {
+        return None;
+    };
+    if ids.len() != 8 {
         return None;
     }
+    let share_pid = match share.as_bytes() {
+        b"0" => false,
+        b"1" => true,
+        _ => return None,
+    };
     let mut out = [0u64; 8];
-    for (slot, a) in out.iter_mut().zip(args) {
+    for (slot, a) in out.iter_mut().zip(ids) {
         let s = std::str::from_utf8(a.as_bytes()).ok()?;
         if s.is_empty() || s.len() > 20 || !s.bytes().all(|b| b.is_ascii_digit()) {
             return None;
         }
         *slot = s.parse().ok()?;
     }
-    Some(out)
+    Some((out, share_pid))
 }
 
 /// `uid_map` が初期 user namespace の恒等写像（1 行目が `0 0 4294967295`）か。
@@ -255,16 +300,19 @@ fn check_stdio() -> Result<(), Fail> {
     if !(0..=2).all(sys::fd_is_open) {
         return Err(bad());
     }
-    let kind = |fd: std::os::fd::BorrowedFd<'_>| -> Option<bool> {
-        let t = File::from(fd.try_clone_to_owned().ok()?).metadata().ok()?;
-        let ft = t.file_type();
-        Some(ft.is_fifo() || ft.is_socket())
-    };
-    if kind(std::io::stdin().as_fd()) != Some(true) || kind(std::io::stdout().as_fd()) != Some(true)
+    if is_fifo_or_socket(std::io::stdin().as_fd()) != Some(true)
+        || is_fifo_or_socket(std::io::stdout().as_fd()) != Some(true)
     {
         return Err(bad());
     }
     Ok(())
+}
+
+/// `fd` が pipe（FIFO）か socket か（`fstat` が失敗したら `None`）。
+fn is_fifo_or_socket(fd: BorrowedFd<'_>) -> Option<bool> {
+    let t = File::from(fd.try_clone_to_owned().ok()?).metadata().ok()?;
+    let ft = t.file_type();
+    Some(ft.is_fifo() || ft.is_socket())
 }
 
 fn set_non_dumpable() -> Result<(), Fail> {
@@ -291,7 +339,7 @@ fn ns_identity(path: &str) -> Result<NsId, Fail> {
 
 // ---- 段 1 ----
 
-fn stage1() -> Result<(), StageEnd> {
+fn stage1(share_pid: bool) -> Result<(), StageEnd> {
     close_inherited_fds()?;
     check_stdio()?;
     check_sigterm()?;
@@ -323,6 +371,7 @@ fn stage1() -> Result<(), StageEnd> {
         cstr(n.ino().to_string())?,
         cstr(m.dev().to_string())?,
         cstr(m.ino().to_string())?,
+        cstr(if share_pid { "1" } else { "0" }.to_owned())?,
     ];
     // 成功すれば戻らない。環境変数は渡さない。
     sys::execveat_fd(exe.as_raw_fd(), &argv, &[])
@@ -348,7 +397,7 @@ fn stage2(args: &[OsString]) -> Result<(), StageEnd> {
     // exec で dumpable は 1 に戻るため最初に落とす(この窓の間、プロセスは秘密を持たない)。
     let dumpable_reset = set_non_dumpable();
     close_inherited_fds()?;
-    let Some(expected) = parse_stage2_args(args) else {
+    let Some((expected, share_pid)) = parse_stage2_args(args) else {
         return Err(StageEnd::Usage("invalid stage 2 arguments"));
     };
     dumpable_reset?;
@@ -367,9 +416,32 @@ fn stage2(args: &[OsString]) -> Result<(), StageEnd> {
         )
         .into());
     }
+    // 子の不在は pod-init を作る前に確かめる（pod-init は唯一の子になる）。
+    match sys::has_any_child() {
+        Ok(false) => {}
+        _ => {
+            return Err(
+                Fail::new(ErrorCode::FailedPrecondition, "unexpected child processes").into(),
+            );
+        }
+    }
     // pod-init の空の root は、段 1 で作った mount ns の中で capability を落とす前に作る(#4808)。待ちの間ずっと持つ。
-    let _pod_root =
+    let pod_root =
         create_pod_root().map_err(|e| from_trait(&e, "failed to create the pod root"))?;
+    // pod の pid ns と pod-init も capability を落とす前に作る（`unshare(CLONE_NEWPID)` と pod-init の mount の操作に
+    // pod の userns の capability が要る。#4815）。
+    let pod_init = if share_pid {
+        Some(
+            spawn_pod_init(&pod_root)
+                .map_err(|e| from_trait(&e, "failed to start the pod init"))?,
+        )
+    } else {
+        None
+    };
+    let pid_ns = match &pod_init {
+        Some(_) => Some(ns_identity("/proc/self/ns/pid_for_children")?),
+        None => None,
+    };
     // 待つだけのプロセスに pod の user namespace の capability を残さない(SEC-1)。
     sys::cap_ambient_clear_all()
         .map_err(|_| Fail::new(ErrorCode::Internal, "failed to drop capabilities"))?;
@@ -388,21 +460,47 @@ fn stage2(args: &[OsString]) -> Result<(), StageEnd> {
         )
         .into());
     }
-    match sys::has_any_child() {
-        Ok(false) => {}
-        _ => {
-            return Err(
-                Fail::new(ErrorCode::FailedPrecondition, "unexpected child processes").into(),
-            );
-        }
-    }
     check_sigterm()?;
 
-    let ready = PodHolderReady::new(std::process::id(), user, ipc, net, mnt)
+    let ready = PodHolderReady::new(std::process::id(), user, ipc, net, mnt, pid_ns)
         .map_err(|e| from_trait(&e, "failed to build the READY frame"))?;
     write_stdout_bounded(PodHolderFrame::ready(&ready).as_bytes())
         .map_err(|_| Fail::new(ErrorCode::Unavailable, "failed to write READY"))?;
-    wait_for_stdin_close()
+    match &pod_init {
+        None => wait_for_stdin_close(),
+        Some(init) => wait_with_pod_init(init),
+    }
+}
+
+/// pid を共有する保持役の待ち（#4815）。stdin の停止の合図か pod-init の終了の先に起きたほうで終わる。
+///
+/// pod-init が死んだら、その pid ns では以後 fork できないため終了コード 1 で終わる（受信側は保持役の終了を
+/// `SANDBOX_NOTREADY` にする。P6）。停止の合図（EOF）では pod-init を SIGKILL して回収してから 0 で終わる。
+fn wait_with_pod_init(init: &PodInit) -> Result<(), StageEnd> {
+    let stdin = std::io::stdin();
+    loop {
+        match init.wait_stop_or_exit(stdin.as_fd()) {
+            Ok(PodHolderWake::PodInitExited) => {
+                return Err(StageEnd::Unexpected("the pod init exited"));
+            }
+            Ok(PodHolderWake::StopReadable) => {}
+            Ok(_) | Err(_) => {
+                let _ = init.kill_and_reap(POD_INIT_STOP_LIMIT);
+                return Err(StageEnd::Unexpected("failed to wait for the stop signal"));
+            }
+        }
+        let mut byte = [0u8; 1];
+        let end = match stdin.lock().read(&mut byte) {
+            Ok(0) => Ok(()),
+            Ok(_) => Err(StageEnd::Unexpected("unexpected input on the stop channel")),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => Err(StageEnd::Unexpected("failed to wait for the stop signal")),
+        };
+        return match (init.kill_and_reap(POD_INIT_STOP_LIMIT), end) {
+            (Ok(()), end) => end,
+            (Err(_), _) => Err(StageEnd::Unexpected("the pod init did not stop")),
+        };
+    }
 }
 
 /// stdin の EOF まで待つ。1 バイトでも来たら予期しない入力として失敗する(net の holder の `wait_for_stop` に合わせる)。
@@ -457,28 +555,34 @@ mod tests {
         assert!(sigterm_is_default("").is_err());
     }
 
-    /// 段 2 の引数は 8 個の 10 進だけを受ける（user・ipc・net・mnt の dev / ino。#4808）。
+    /// 段 2 の引数は 8 個の 10 進（user・ipc・net・mnt の dev / ino。#4808）と、pid の共有の `0` か `1`（#4815）だけを受ける。
     #[test]
     fn cri2_stage2_args_parser() {
-        let with_last = |last: &str| {
+        let ids = ["4", "1", "4", "2", "4", "3", "4", "5"];
+        let with = |last_id: &str, share: &str| {
             let mut v = vec!["1", "2", "3", "4", "5", "6", "7"];
-            v.push(last);
+            v.push(last_id);
+            v.push(share);
             parse_stage2_args(&os(&v))
         };
+        for (share, want) in [("0", false), ("1", true)] {
+            let mut v = ids.to_vec();
+            v.push(share);
+            assert_eq!(
+                parse_stage2_args(&os(&v)),
+                Some(([4, 1, 4, 2, 4, 3, 4, 5], want))
+            );
+        }
+        assert_eq!(parse_stage2_args(&os(&ids)), None);
         assert_eq!(
-            parse_stage2_args(&os(&["4", "1", "4", "2", "4", "3", "4", "5"])),
-            Some([4, 1, 4, 2, 4, 3, 4, 5])
-        );
-        assert_eq!(
-            parse_stage2_args(&os(&["1", "2", "3", "4", "5", "6"])),
-            None
-        );
-        assert_eq!(
-            parse_stage2_args(&os(&["1", "2", "3", "4", "5", "6", "7", "8", "9"])),
+            parse_stage2_args(&os(&["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"])),
             None
         );
         for bad in ["-8", "", "0x8", "18446744073709551616"] {
-            assert_eq!(with_last(bad), None, "{bad:?}");
+            assert_eq!(with(bad, "0"), None, "{bad:?}");
+        }
+        for bad in ["2", "", "true", "01"] {
+            assert_eq!(with("8", bad), None, "{bad:?}");
         }
     }
 
@@ -489,5 +593,42 @@ mod tests {
         assert!(!is_initial_uid_map("         0       1000          1\n"));
         assert!(!is_initial_uid_map("         0          0          1\n"));
         assert!(!is_initial_uid_map(""));
+    }
+
+    /// REPAIR-5・#4815: 読み手の止まった満杯の pipe への書き込みは期限で見切り、`O_NONBLOCK` を元へ戻す。読めれば全部届く。
+    #[test]
+    fn repair5_4815_write_fd_bounded_gives_up_on_full_pipe() {
+        let (_r, w) = std::io::pipe().expect("pipe");
+        let started = std::time::Instant::now();
+        let big = vec![7u8; 1 << 20];
+        assert_eq!(
+            write_fd_bounded(w.as_fd(), &big, Duration::from_millis(200)),
+            Err(())
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(
+            sys::set_status_nonblocking(w.as_fd(), false).ok(),
+            Some(false)
+        );
+
+        let (mut r2, w2) = std::io::pipe().expect("pipe");
+        assert_eq!(
+            write_fd_bounded(w2.as_fd(), b"ready\n", Duration::from_secs(1)),
+            Ok(())
+        );
+        drop(w2);
+        let mut got = Vec::new();
+        r2.read_to_end(&mut got).expect("read");
+        assert_eq!(got, b"ready\n");
+
+        // 通常ファイルへは O_NONBLOCK が効かないため書かない。
+        let dir = std::env::temp_dir().join(format!("repair5-4815-{}", std::process::id()));
+        let file = File::create(&dir).expect("create");
+        assert_eq!(
+            write_fd_bounded(file.as_fd(), b"x", Duration::from_secs(1)),
+            Err(())
+        );
+        assert_eq!(file.metadata().expect("stat").len(), 0);
+        let _ = std::fs::remove_file(&dir);
     }
 }

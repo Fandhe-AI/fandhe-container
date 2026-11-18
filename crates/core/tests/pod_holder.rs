@@ -13,6 +13,8 @@
 //!   （mnt は #4808。所有者が pod の userns であることは確立が `NS_GET_USERNS` で照合済みで、成功値はその証跡）
 //! - mount namespace の `/` が shared でない（`/proc/self/mountinfo` の `/` の行に `shared:` が無い。#4808）
 //! - pod-init の空の root（`create_pod_root`）が `nosuid,nodev,noexec` で、エントリが 0 件であること（#4808）
+//! - pod-init（`spawn_pod_init`。#4815）が pod の pid ns の PID 1（`NSpid` の末尾 1）で、`CapEff`・`CapPrm` が 0、自己検査
+//!   （non-dumpable）を通って生き続けること。SIGKILL で回収できる（root と pid ns の素性は `pod_holder_bin_real` のシナリオ G）
 //! - `lo` が up であること(自己宛ての UDP 送受信が通る。down なら `ENETUNREACH`)
 //! - 子プロセスが残っていないこと
 //! - root で実行した場合は確立を拒否すること(`single` の euid 0 は HostRootIdentityMapping)
@@ -59,6 +61,7 @@ mod linux {
     };
     use fandhe_container_core::oci_runtime::{
         SubordinateIdSource, create_pod_root, establish_pod_namespaces, root_entry_count,
+        spawn_pod_init,
     };
     use fandhe_container_core::traits::ErrorCode;
 
@@ -194,6 +197,37 @@ mod linux {
         assert_eq!((n, buf[0]), (1, b'p'));
     }
 
+    /// pod-init が pid ns の PID 1 で、capability を持たず、自己検査（non-dumpable）を通って生き続けていること（#4815）。
+    fn assert_pod_init(pid: u32) {
+        // 自己検査に失敗すると数 ms で終わるため、少し待ってから見る。
+        std::thread::sleep(Duration::from_millis(300));
+        let status =
+            std::fs::read_to_string(format!("/proc/{pid}/status")).expect("pod init status");
+        let field = |name: &str| {
+            status
+                .lines()
+                .find_map(|l| l.strip_prefix(name))
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_owned()
+        };
+        assert_eq!(
+            field("NSpid:").split_whitespace().last(),
+            Some("1"),
+            "pod init is PID 1"
+        );
+        assert_eq!(field("CapEff:"), "0000000000000000");
+        assert_eq!(field("CapPrm:"), "0000000000000000");
+        assert_eq!(
+            field("State:").chars().next(),
+            Some('S'),
+            "pod init is alive"
+        );
+        // root と pid ns の素性は `/proc/<pid>/{root,ns}` の ptrace の検査を通らない（この子は exec の後に userns を作ったため
+        // mm の userns が初期 userns のままで、non-dumpable の pod-init を開けない）。再 exec する保持役の実機試験
+        // `pod_holder_bin_real` のシナリオ G で照合する。
+    }
+
     /// `/` のマウントが shared でない（確立で再帰 private にした。#4808）。
     fn assert_root_not_shared() {
         let info = std::fs::read_to_string("/proc/self/mountinfo").expect("mountinfo");
@@ -305,6 +339,16 @@ mod linux {
             (true, true, true)
         );
         assert_eq!(root_entry_count(&root).expect("entries"), 0);
+        // pod の PID 1（pod-init。#4815）。確立と同じ単一スレッドの子から作る。pod-init は non-dumpable を自分で確かめる
+        // ため、作る前に non-dumpable にする（single は確立の前にはできない。上のコメント）。
+        if !preset_non_dumpable {
+            set_non_dumpable_for_test().expect("set non-dumpable");
+        }
+        let init = spawn_pod_init(&root).expect("spawn the pod init");
+        assert_pod_init(init.pid());
+        assert!(!init.has_exited().expect("poll the pod init"));
+        init.kill_and_reap(Duration::from_secs(5))
+            .expect("stop the pod init");
         drop(root);
         assert_eq!(got.privilege(), privilege);
         assert!(got.loopback_up());

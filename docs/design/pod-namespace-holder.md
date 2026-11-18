@@ -99,7 +99,17 @@
 
 現状は pid が `POD`／`CONTAINER` のどちらでもコンテナごとの新しい pid namespace で、`NODE` は `UNIMPLEMENTED`。core は pid の path を `Unimplemented` にしている。理由は、init が PID 1 である証跡（`check_establish_preconditions`・`Pid1Target`・`reapply` の pid ns 照合）と、「init の終了で pid ns ごと回収される」という前提が共有と両立しないため。
 
-- pod の PID 1: 保持役が段 2 で `unshare(CLONE_NEWPID)` の後に 1 回だけ fork した子 pod-init。単一スレッド・capability なし・non-dumpable で孤児の回収だけを行い、root は空の tmpfs へ `pivot_root` する（mount ns は保持役が pod の userns で作る。`/dev/shm` の案 A と共用）。pod-init が死ぬとその pid ns では fork できなくなる想定のため、保持役は pod-init を監視して死んだら終了し、plugin-cri は `SANDBOX_NOTREADY` にする（fail-closed）。カーネルの挙動（`unshare` 後の最初の fork が init になること、init の死後の fork 失敗）は Linux v6.12 の一次情報で確かめる前提で、本節の時点では未検証の見込み
+- pod の PID 1: 保持役が段 2 で `unshare(CLONE_NEWPID)` の後に 1 回だけ fork した子 pod-init。単一スレッド・capability なし・non-dumpable で孤児の回収だけを行い、root は空の tmpfs へ `pivot_root` する（mount ns は保持役が pod の userns で作る。`/dev/shm` の案 A と共用）。pod-init が死ぬとその pid ns では fork できなくなる想定のため、保持役は pod-init を監視して死んだら終了し、plugin-cri は `SANDBOX_NOTREADY` にする（fail-closed）。カーネルの挙動は Linux v6.12（tag の commit `06090c9b622a7e1f797e775db4c035e0d779b76e`）の原文で確かめた（#4815）。
+  - `unshare` 後の最初の fork が init になる: `kernel/pid.c` の `alloc_pid`（228〜241 行。新しい ns の最初の割り当ては `pid_min = 1`）と、`kernel/fork.c` の `copy_process`（2558〜2560 行。PID 1 が `child_reaper` になり `SIGNAL_UNKILLABLE`）
+  - init の死後はその ns で fork が失敗する: `kernel/exit.c` の `find_child_reaper`（587 行〜。612 行で `zap_pid_ns_processes`）と、`kernel/pid_namespace.c` の `zap_pid_ns_processes`（170 行〜。179 行で `disable_pid_allocation`。ns の残りのプロセスも SIGKILL で止まる）、`kernel/pid.c` の `alloc_pid`（277 行。`PIDNS_ADDING` が無ければ `-ENOMEM`）
+  - 実装: 保持役は `pod-holder --share-pid` のときだけ、段 2 で capability を落とす前に core の `spawn_pod_init` で pod-init を作る
+  - pod-init の手順
+    - 自分の mount ns を作り、空の root を `/` の上に付けて `pivot_root(".", ".")` で移る
+    - 自分の ns を作るのは、`fs/namespace.c` の `pivot_root` の `chroot_fs_refs` が同じ root を持つプロセスすべての root を差し替え、保持役の root まで変えてしまうため
+    - fd を閉じ、`SIGCHLD` を無視にして孤児を自動回収させる（`kernel/signal.c` の `do_notify_parent` 2117〜2134 行）
+    - capability をすべて落とし、non-dumpable を自分で確かめる
+  - READY は版 3 で、保持役の `pid_for_children` の素性を載せる
+  - 保持役は pod-init の終了で終了コード 1 で終わり、stdin の EOF では pod-init を止めて 0 で終わる
 - パス: 保持役の pid からだけ `/proc/<holder>/ns/pid_for_children` を作る（#2776 の契約）。READY に pid ns の素性を載せ、plugin-cri が照合する
 - core の join の検査: pid は user＋ipc の組に足す形でだけ受ける。`NS_GET_NSTYPE` が `CLONE_NEWPID`、所有 userns が join する user と同じ、`NS_GET_PARENT` が呼び出し側の pid ns。`setns(pid)` は中間プロセスで行い、効くのは以後に fork した init だけ
 - PID 1 の証跡: 「joined pid ns の init」の種別を足す。`getpid() != 1` を許すのは、`/proc/thread-self/ns/pid` が launch で固定した pod の pid ns の素性と一致するときだけ。初期 pid ns でないこと・単一スレッドの検査は保つ。`check_evidence` も同じ素性で照合する（#4812 で実装）

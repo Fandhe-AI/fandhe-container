@@ -1730,7 +1730,7 @@ jobs:
             --forbid 'PRECONDITION FAILED' --forbid 'WATCHDOG EXPIRED' --forbid 'root=true' --forbid 'FAILED' --summary
 
       # pod_holder_bin_real（`crates/supervisor/tests/pod_holder_bin_real.rs`。CRI-2・CORE-1・SEC-5・REPAIR-5・REPAIR-12・#2874・#2875）:
-      # supervisor の bin の `pod-holder` モードを本物のバイナリで通す実機前提テスト（harness = false。シナリオ A〜F と最終行の 7 行）。
+      # supervisor の bin の `pod-holder` モードを本物のバイナリで通す実機前提テスト（harness = false。シナリオ A〜G と最終行の 8 行。G は #4815 の pod-init）。
       # 試験自身の watchdog が 240 秒のため、補助 540 秒・ステップ 10 分とし、試験の watchdog、補助、ステップ、ジョブの順を保つ。
       # 範囲写像（`FANDHE_CONTAINER_TEST_ID_HELPER=1`）を要求する。委譲スコープでは包まない。util-linux の nsenter・setpriv が要る
       # （ランナーイメージの既定）。新しいジョブ・check-run・sudo・permissions は増やさない。
@@ -1761,7 +1761,7 @@ jobs:
             "${PHB_BIN}" --ignored
           scripts/check-success-lines.sh --name pod_holder_bin_real \
             --src crates/supervisor/tests/pod_holder_bin_real.rs --log "${log}" \
-            --select '^pod_holder_bin_real: (scenario [A-F] ok:|the pod-holder mode works)' --min 7 \
+            --select '^pod_holder_bin_real: (scenario [A-G] ok:|the pod-holder mode works)' --min 8 \
             --forbid 'pod_holder_bin_real: ignored' --forbid 'not applicable' --forbid 'PRECONDITION FAILED' \
             --forbid 'WATCHDOG EXPIRED' --forbid 'root=true' --forbid 'FAILED' --summary
 

@@ -147,8 +147,8 @@ pub use netns_attach::{AttachableNamespaces, NetnsAttachHook};
 pub use network_mode::{EffectiveNetwork, LaunchNetworkMode};
 #[cfg(target_os = "linux")]
 pub use pod_holder::{
-    NamespaceIdentity, PodHolderNamespaces, PodRoot, PodRootAttrs, create_pod_root,
-    establish_pod_namespaces, root_entry_count,
+    NamespaceIdentity, PodHolderNamespaces, PodHolderWake, PodInit, PodRoot, PodRootAttrs,
+    create_pod_root, establish_pod_namespaces, root_entry_count, spawn_pod_init,
 };
 pub use resources::{ByteLimit, CgroupsPath, IoThrottle, LinuxResourceLimits};
 #[cfg(feature = "exec-test-support")]

@@ -1288,6 +1288,9 @@ async fn scenario(
         .get_or_insert_with(Default::default)
         .namespace_options = Some(cri::NamespaceOption {
         network: cri::NamespaceMode::Node as i32,
+        // kubelet の既定（shareProcessNamespace なし）と同じくコンテナごとの pid ns にする。CRI の enum の 0 は `POD` で、
+        // 未指定だと pod の pid ns を共有し `/proc/1` が pod-init になる（#4817）。共有は段 S（#4818）が照合する。
+        pid: cri::NamespaceMode::Container as i32,
         ..Default::default()
     });
     let sb = call_with_deadline(c.run_pod_sandbox(run), RPC_DEADLINE)

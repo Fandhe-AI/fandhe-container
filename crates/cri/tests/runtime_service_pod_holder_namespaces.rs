@@ -16,8 +16,8 @@ use fandhe_container_core::traits::{
     KillRequest, StartRequest, StateRequest, StopRequest, TraitError,
 };
 use fandhe_container_cri::adapter::{
-    BundleProvider, BundleRequest, PodHolder, PodHolderLiveness, PodHolderRequest,
-    PodNamespaceHolderProvider, PreparedBundle, RuntimeAdapter,
+    BundleProvider, BundleRequest, HolderIdentity, NamespaceIdentity, PodHolder, PodHolderLiveness,
+    PodHolderRequest, PodNamespaceHolderProvider, PreparedBundle, RuntimeAdapter,
 };
 use fandhe_container_cri::bundle::{ImageDefaults, build_runtime_config_with_pod_namespaces};
 use fandhe_container_cri::error::CriError;
@@ -34,6 +34,8 @@ struct PerSandboxHolder {
     pids: Mutex<HashMap<String, u32>>,
     exited: Mutex<bool>,
     force_pid: Mutex<Option<u32>>,
+    /// 真なら pod の pid ns の素性つきの保持役を返す（pid を共有する sandbox。#4817）。
+    share_pid: Mutex<bool>,
 }
 
 impl PerSandboxHolder {
@@ -43,6 +45,7 @@ impl PerSandboxHolder {
             pids: Mutex::new(HashMap::new()),
             exited: Mutex::new(false),
             force_pid: Mutex::new(None),
+            share_pid: Mutex::new(false),
         })
     }
     fn pid_of(&self, sandbox_id: &str) -> u32 {
@@ -60,7 +63,14 @@ impl PodNamespaceHolderProvider for PerSandboxHolder {
             .lock()
             .unwrap()
             .insert(req.sandbox_id.to_owned(), pid);
-        Ok(PodHolder::new(pid.try_into().unwrap()))
+        if !*self.share_pid.lock().unwrap() {
+            return Ok(PodHolder::new(pid.try_into().unwrap()));
+        }
+        let ns = |ino| NamespaceIdentity { dev: 4, ino };
+        let identity = HolderIdentity::new(pid, 1, ns(11), ns(12), ns(13))
+            .and_then(|i| i.with_pid_ns(ns(14)))
+            .unwrap();
+        Ok(PodHolder::from_identity(identity))
     }
     fn release(&self, _sandbox_id: &str, _timeout: Duration) -> Result<(), CriError> {
         Ok(())
@@ -84,6 +94,8 @@ struct Seen {
     /// 供給された保持役の net と、生成した config の network の path（#2878・NET-3）。
     supplied_net: Option<String>,
     net_path: Option<String>,
+    /// 生成した config の pid の path（#4817）。
+    pid_path: Option<String>,
 }
 
 #[derive(Default)]
@@ -122,6 +134,7 @@ impl BundleProvider for RecordingBundles {
             ipc_path: ns_path(&value, "ipc"),
             supplied_net: req.pod_namespaces.map(|p| p.net().to_owned()),
             net_path: ns_path(&value, "network"),
+            pid_path: ns_path(&value, "pid"),
         });
         // bundle のパスは絶対パスで返す（Windows はドライブ接頭辞を要する。CLI-1）。
         let root = if cfg!(windows) {
@@ -386,4 +399,32 @@ async fn net3_pod_network_joins_only_own_holder_net() {
             Some(format!("/proc/{other}/ns/net").as_str())
         );
     }
+}
+
+/// CRI-2・CORE-3・SEC-5・#4817: 素性に pod の pid ns がある保持役の sandbox では、コンテナの config の pid が自分の
+/// 保持役の `pid_for_children` へ join する。素性の無い保持役（pid を共有しない）では path なしのまま。
+#[tokio::test]
+async fn cri2_4817_pid_is_joined_only_when_the_holder_has_a_pid_namespace() {
+    let holder = PerSandboxHolder::new();
+    let bundles = Arc::new(RecordingBundles::default());
+    let svc = service(&holder, &bundles, true);
+    let plain = run(&svc, "plain").await;
+    *holder.share_pid.lock().unwrap() = true;
+    let shared = run(&svc, "shared").await;
+    create(&svc, &plain, "c-plain", BTreeMap::new())
+        .await
+        .unwrap();
+    create(&svc, &shared, "c-shared", BTreeMap::new())
+        .await
+        .unwrap();
+    let seen = bundles.seen();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0].sandbox_id, plain);
+    assert_eq!(seen[0].pid_path, None);
+    assert_eq!(seen[1].sandbox_id, shared);
+    assert_eq!(
+        seen[1].pid_path.as_deref(),
+        Some(format!("/proc/{}/ns/pid_for_children", holder.pid_of(&shared)).as_str())
+    );
+    assert_eq!(seen[1].ipc_path, Some(paths(holder.pid_of(&shared)).1));
 }

@@ -117,6 +117,10 @@
 - 停止と終了: init が終了しても子孫は pod-init へ付け替わって残るため、init の終了時と停止時にコンテナの cgroup へ `cgroup.kill` を書く（O4）。#4811 で実装した（supervisor の `pid_share`。監視ループは init の終了を観測した後・終了を記録する前、停止は起動ハンドルの回収の後に、core の `cgroups::kill_all_in_recorded` で止めて空になるのを 5 秒まで待ち、結果を `pid_shared_kill_all` の行に出す）。containerd の shim と同じ挙動であることを v2.1.0 の原文で確かめた: `cmd/containerd-shim-runc-v2/runc/util.go` の `ShouldKillAllOnExit`（31〜47 行。pid の namespace が path なしで宣言されていなければ真）と、`cmd/containerd-shim-runc-v2/task/service.go` の `handleInitExit`（696〜713 行。真なら `p.KillAll` の後に init の終了を公開する）
 - containerd との差: PID 1 はコンテナではない（rootfs・seccomp・cgroup の一式を持たない。CORE-7〜9）。兄弟コンテナの `/proc/<pid>/root`・`environ`・`fd` は Landlock の ptrace の境界で開けない（k8s では見える）。同じ uid の signal は届く。pod-init の `/proc/1/root` は空の root
 - 既定値: CRI の enum の 0 は `POD`。sandbox の pid が `POD`（未指定を含む）のときだけ保持役が pid ns を作る。食い違いは O3
+- cri の bundle（#4817 で実装）: 記録の保持役の素性に pid ns があり、コンテナの pid が `POD`（未指定を含む）なら、config の pid に保持役の pid から作った `/proc/<holder>/ns/pid_for_children` を path として出す（user＋ipc の組に足す形）。この path が supervisor の kill-all（#4811）の対象の判定になる
+  - sandbox が `CONTAINER`（保持役が pid ns を持たない）でコンテナが `POD` の食い違いは、コンテナごとの新しい pid ns にする（O3。containerd は sandbox の pid ns に入るので差になる）
+  - 保持役が pid ns を持つのにコンテナの ipc が `POD` でない構成は、共有の要求を黙って落とさず `UNIMPLEMENTED`（core は pid の join を user＋ipc の組に足す形でしか受けない）。pid の `NODE`・`TARGET` は `UNIMPLEMENTED` のまま
+  - 素性の無い保持役（検証が無効な構成・試験用の偽 provider）は pid を共有しない
 
 ### `NamespaceMode::TARGET`
 

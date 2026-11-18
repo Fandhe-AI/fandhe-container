@@ -1271,6 +1271,58 @@ fn container_ipc_and_pid_never_join() {
     );
 }
 
+/// CRI-2・CORE-3・SEC-5・#4817: sandbox とコンテナの pid の組ごとの pid の path とエラー。sandbox の pid は保持役が
+/// pod の pid ns を持つか（`with_pid_namespace`）で表す（provider は sandbox が `POD` のときだけ pid ns を作る。#4816）。
+#[test]
+fn cri2_4817_pid_path_per_sandbox_and_container_mode() {
+    use NamespaceMode::{Container, Node, Pod};
+    let shared = pod_paths().with_pid_namespace().expect("pid");
+    assert_eq!(shared.pid(), Some("/proc/4242/ns/pid_for_children"));
+    assert_eq!(pod_paths().pid(), None);
+    let pid_entry = |paths: &PodNamespacePaths, pid: NamespaceMode| {
+        let c = with_sc(|sc| sc.namespace_options = Some(ns(Pod, pid, Pod)));
+        build_with_pod(&c, paths)["linux"]["namespaces"][0].clone()
+    };
+    let joined = serde_json::json!({"type": "pid", "path": "/proc/4242/ns/pid_for_children"});
+    let fresh = serde_json::json!({"type": "pid"});
+    // POD/POD: 保持役の pid ns へ join。
+    assert_eq!(pid_entry(&shared, Pod), joined);
+    // POD/CONTAINER: コンテナごとの新しい pid ns。
+    assert_eq!(pid_entry(&shared, Container), fresh);
+    // CONTAINER/POD（O3 の食い違い）・CONTAINER/CONTAINER: 新しい pid ns。
+    assert_eq!(pid_entry(&pod_paths(), Pod), fresh);
+    assert_eq!(pid_entry(&pod_paths(), Container), fresh);
+    // 未指定のコンテナ（既定値 POD）も POD と同じ。
+    assert_eq!(
+        build_with_pod(&ctr(), &shared)["linux"]["namespaces"][0],
+        joined
+    );
+    // NODE は保持役の pid ns の有無によらず UNIMPLEMENTED。
+    for paths in [&shared, &pod_paths()] {
+        let c = with_sc(|sc| sc.namespace_options = Some(ns(Pod, Node, Pod)));
+        let err = build_runtime_config_with_pod_namespaces(
+            &pod(),
+            &c,
+            &ImageDefaults::default(),
+            Some(paths),
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), CriErrorCode::Unimplemented);
+        assert_eq!(err.message(), "namespace_options.pid is not supported");
+    }
+    // pid を共有するのに ipc を join しない構成は、共有を黙って落とさず UNIMPLEMENTED（core は user＋ipc の組に足す形だけ）。
+    let c = with_sc(|sc| sc.namespace_options = Some(ns(Container, Pod, Container)));
+    let err = build_runtime_config_with_pod_namespaces(
+        &pod(),
+        &c,
+        &ImageDefaults::default(),
+        Some(&shared),
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), CriErrorCode::Unimplemented);
+    assert_eq!(err.message(), "namespace_options.pid is not supported");
+}
+
 #[test]
 fn without_supplier_output_is_unchanged() {
     let plain = build(&pod(), &ctr());

@@ -65,9 +65,9 @@
 //! via the control channel recorded Stopped(43) and the stopped container was deleted; ESC-03 mount denied via the
 //! SeccompNotifyHub and recorded once`。
 //! - シナリオ F〜H（pod の pid namespace を共有するコンテナの kill-all。CRI-2・SUP-1・SUP-3・SUP-9・CORE-4・#4811）: 試験が
-//!   `unshare --user --map-root-user --ipc --pid --fork` で pod の user・ipc・pid namespace（PID 1 は `sleep`）を作り、config の
-//!   `linux.namespaces` の user・ipc・pid に `/proc/<unshare>/ns/{user,ipc,pid_for_children}` を path で入れる（cri の
-//!   `PodNamespacePaths` と同じ形。保持役の代わり）。プローブは孤児になる子（`--orphan-child`）を作ってから終わる・止まる。
+//!   supervisor の bin の `pod-holder` で pod の user・ipc namespace を作り、その中へ `nsenter` した `unshare --pid --fork` で pod の
+//!   pid namespace（PID 1 は `sleep`）を作る。config の `linux.namespaces` の user・ipc は保持役の、pid は `unshare` の
+//!   `pid_for_children` の `/proc/<pid>/ns/*` を path で入れる（cri の `PodNamespacePaths` と同じ形。#4815 の pod-init の代わり）。プローブは孤児になる子（`--orphan-child`）を作ってから終わる・止まる。
 //!   - F: 共有では init の自然終了の後に孤児が消え、supervisor の stderr に `pid_shared_kill_all` の `killed` が 1 件出る。
 //!     対照（pid の path なし）は孤児が pid ns ごと消え、`pid_shared_kill_all` の行が出ない
 //!   - G: 共有で制御チャネルの SIGTERM による停止の後に孤児が消える
@@ -1130,10 +1130,15 @@ mod linux {
 
     // ---- シナリオ F〜H（pod の pid namespace の共有と kill-all。CRI-2・SUP-1・SUP-3・SUP-9・CORE-4・#4811） ----
 
-    /// 試験が作る pod の user・ipc・pid namespace（保持役の代わり）。`unshare` は新しい pid ns の PID 1（`sleep`）の親で、
-    /// `pid_for_children` が pod の pid ns を指す。drop で `unshare` を止める（`--kill-child` で PID 1 も止まる）。
+    /// 試験が作る pod の user・ipc・pid namespace（cri の保持役の代わり）。
+    ///
+    /// user・ipc は supervisor の bin の `pod-holder`（start と同じ規則で写像を決める。#2874）が作り、pid は保持役の
+    /// user・ipc へ `nsenter` した `unshare --pid --fork` が作る（pid ns の所有者が pod の userns になる。PID 1 は `sleep`）。
+    /// core は参加先の userns の写像が起動の写像と完全一致することを要求するため、写像は保持役に任せる。
+    /// drop で `unshare` を止め（`--kill-child` で PID 1 も止まる）、保持役の stdin を閉じて終わらせる。
     struct Pod {
-        child: Child,
+        holder: Child,
+        pid_owner: Child,
     }
 
     impl Pod {
@@ -1142,11 +1147,31 @@ mod linux {
             reason = "返した Pod の drop が kill と wait を行う"
         )]
         fn new() -> Self {
-            let mut child = Command::new("unshare")
+            use std::os::fd::AsFd as _;
+            let mut holder = Command::new(BIN)
+                .arg("pod-holder")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .expect("spawn the pod holder");
+            let out = holder.stdout.take().expect("holder stdout");
+            let ready = fandhe_container_supervisor::pod_holder::read_ready(
+                out.as_fd(),
+                Instant::now() + Duration::from_secs(30),
+            );
+            drop(out);
+            let h = holder.id();
+            if let Err(e) = ready {
+                let _ = holder.kill();
+                let _ = holder.wait();
+                panic!("the pod holder did not report READY: {e:?}");
+            }
+            let mut pid_owner = Command::new("nsenter")
+                .arg(format!("--user=/proc/{h}/ns/user"))
+                .arg(format!("--ipc=/proc/{h}/ns/ipc"))
                 .args([
-                    "--user",
-                    "--map-root-user",
-                    "--ipc",
+                    "unshare",
                     "--pid",
                     "--fork",
                     "--kill-child",
@@ -1157,29 +1182,37 @@ mod linux {
                 .stdout(Stdio::null())
                 .stderr(Stdio::inherit())
                 .spawn()
-                .expect("spawn unshare (util-linux)");
-            let pid = child.id();
-            // 写像の書き込みと PID 1 の fork が済むまで期限つきで待つ（REPAIR-5）。
+                .expect("spawn nsenter (util-linux)");
+            let pid = pid_owner.id();
+            // `unshare` へ exec して PID 1 を fork し終えるまで期限つきで待つ（REPAIR-5）。
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {
-                let mapped = std::fs::read_to_string(format!("/proc/{pid}/uid_map"))
-                    .is_ok_and(|m| m.split_whitespace().next() == Some("0"));
                 let forked = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
                     .is_ok_and(|c| !c.trim().is_empty());
-                if mapped && forked {
-                    return Self { child };
+                let own = ns_link("/proc/self/ns/pid");
+                let pod = ns_link(&format!("/proc/{pid}/ns/pid_for_children"));
+                if forked && !pod.is_empty() && pod != own {
+                    return Self { holder, pid_owner };
                 }
                 if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    panic!("the pod namespaces were not ready within 10s");
+                    let _ = pid_owner.kill();
+                    let _ = pid_owner.wait();
+                    let _ = holder.kill();
+                    let _ = holder.wait();
+                    panic!("the pod pid namespace was not ready within 10s");
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
         }
 
+        /// user・ipc は保持役、pid（`pid_for_children`）は `unshare` のパス。
         fn ns(&self, kind: &str) -> String {
-            format!("/proc/{}/ns/{kind}", self.child.id())
+            let pid = if kind == "pid_for_children" {
+                self.pid_owner.id()
+            } else {
+                self.holder.id()
+            };
+            format!("/proc/{pid}/ns/{kind}")
         }
 
         /// pod の pid ns の識別子（`pid:[<inode>]`）。
@@ -1190,8 +1223,12 @@ mod linux {
 
     impl Drop for Pod {
         fn drop(&mut self) {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+            let _ = self.pid_owner.kill();
+            let _ = self.pid_owner.wait();
+            drop(self.holder.stdin.take());
+            if self.holder.wait().is_err() {
+                let _ = self.holder.kill();
+            }
         }
     }
 

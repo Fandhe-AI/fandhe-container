@@ -1834,8 +1834,33 @@ mod tests {
         Fake::new(items).0
     }
 
+    /// [`StuckUntilDeadline`] に、呼び出しごとの（入った時刻・渡された期限・戻った時刻）の記録を足した記録先。
+    /// `thread::sleep` の延び（macOS の runner では 1 回 100ms を超えることがある。#4876）を、応答者の所要時間から分けて測る。
+    #[derive(Default)]
+    struct StuckRecording {
+        spans: Mutex<Vec<(Instant, Instant, Instant)>>,
+    }
+
+    impl AuditSink for StuckRecording {
+        fn record(&self, _record: &AuditRecord) -> Result<(), TraitError> {
+            Err(TraitError::new(ErrorCode::Internal, "must not be called"))
+        }
+        fn record_until(&self, _record: &AuditRecord, deadline: Instant) -> Result<(), TraitError> {
+            let entered = Instant::now();
+            std::thread::sleep(deadline.saturating_duration_since(entered));
+            self.spans
+                .lock()
+                .unwrap()
+                .push((entered, deadline, Instant::now()));
+            Err(TraitError::new(ErrorCode::Timeout, "stuck"))
+        }
+    }
+
     /// REPAIR-5・SEC-4・#2632: 記録先が詰まっても、k 件目（1 始まり）の応答は `k × 応答期限` 以上かつ余裕を足した範囲内。
     /// バケットは補充（20 件/秒）が処理（1 件/応答期限）を上回るため尽きず、間引き（`suppressed`）は 0。
+    ///
+    /// 上限は sleep の精度に頼らない 2 つの照合に分ける（#4876）: 記録先へ渡る期限は呼び出しの時点から応答期限以内（余裕なし）、
+    /// k 件目までの所要時間から記録先の中にいた時間を除いた残り（応答者自身の時間）は 500ms 未満。
     #[test]
     fn repair5_2632_serial_wait_with_a_stuck_sink_is_bounded_by_position_times_the_response_deadline()
      {
@@ -1847,23 +1872,31 @@ mod tests {
             inner: fake,
             times: Arc::clone(&times),
         };
+        let sink = StuckRecording::default();
         let id = ContainerId::new("web-1").unwrap();
         let started = Instant::now();
-        let report = ExecResponder::new(&StuckUntilDeadline, Some(&id), config).serve_with(
+        let report = ExecResponder::new(&sink, Some(&id), config).serve_with(
             &wrapped,
             &Some,
             far(),
             &mut || false,
         );
         let times = times.lock().unwrap().clone();
+        let spans = sink.spans.lock().unwrap().clone();
         assert_eq!(times.len(), 4);
-        for (i, at) in times.iter().enumerate() {
+        assert_eq!(spans.len(), 4);
+        let mut in_sink = Duration::ZERO;
+        for (i, (at, (entered, deadline, left))) in times.iter().zip(&spans).enumerate() {
             let k = u32::try_from(i + 1).unwrap();
             let took = at.duration_since(started);
             assert!(took >= d * k, "k={k} took={took:?}");
+            let budget = deadline.saturating_duration_since(*entered);
+            assert!(budget <= d, "k={k} budget={budget:?}");
+            in_sink += left.duration_since(*entered);
+            let outside = took.saturating_sub(in_sink);
             assert!(
-                took < d * k + Duration::from_millis(500),
-                "k={k} took={took:?}"
+                outside < Duration::from_millis(500),
+                "k={k} took={took:?} in_sink={in_sink:?}"
             );
         }
         assert_eq!(

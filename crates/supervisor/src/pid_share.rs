@@ -9,7 +9,8 @@
 //!
 //! 1. 監視ループが init の終了を観測した直後・終了を記録する前（`run::monitor_after_claim`。containerd の shim が
 //!    init の終了を公開する前に全プロセスを止めるのと同じ順）
-//! 2. 停止（`StopRequested`）で起動ハンドルを回収した後（`start_entry::supervise_running`）
+//! 2. 起動後に起動ハンドルを回収したすべての経路（停止・監視の失敗・出力の捕捉や seccomp の受け渡しの失敗・再起動の
+//!    失敗。`start_entry::kill_after_dispose`）
 //!
 //! 対象かどうかは core の start の結果（`StartedContainer::shares_pod_pid_namespace`。config の pid の path）で決まり、
 //! 対象でないコンテナの停止・終了の挙動は変えない。
@@ -42,6 +43,11 @@ pub(crate) fn kill_remaining(
     id: &ContainerId,
     placement: Option<&CgroupPlacement>,
 ) -> Result<(), TraitError> {
+    #[cfg(test)]
+    if let Some(code) = FORCED_FAILURE.get() {
+        emit(&kill_all_line("failed", None, Some(code)));
+        return Err(TraitError::new(code, "forced kill-all failure for a test"));
+    }
     let Some(placement) = placement else {
         emit(&kill_all_line("no_cgroup", Some(0), None));
         return Ok(());
@@ -89,6 +95,18 @@ fn kill_all(
         ErrorCode::Unimplemented,
         "cgroup kill-all is only available on Linux",
     ))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// 試験の継ぎ目: `Some` なら [`kill_remaining`] が cgroup に触れずにこのコードで失敗する（呼び出したスレッドだけ）。
+    static FORCED_FAILURE: std::cell::Cell<Option<ErrorCode>> = const { std::cell::Cell::new(None) };
+}
+
+/// 試験の継ぎ目: 呼び出したスレッドの [`kill_remaining`] を `code` で失敗させる（`None` で戻す）。
+#[cfg(test)]
+pub(crate) fn force_failure_for_test(code: Option<ErrorCode>) {
+    FORCED_FAILURE.set(code);
 }
 
 /// 結果の 1 行（末尾改行つき）。値は固定語彙と数値だけ。

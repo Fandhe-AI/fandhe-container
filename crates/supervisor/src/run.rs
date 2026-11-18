@@ -1527,23 +1527,10 @@ mod tests {
     }
 
     /// CRI-2・SUP-1・SUP-3・#4811: kill-all が失敗した世代は、`Stopped` を記録したうえで `ExitedProcessesRemain` を返す
-    /// （再起動ループはこれを再 launch しない）。非 root ではルート cgroup の記録を開けず（`PermissionDenied`）、Linux 以外では
-    /// kill-all 自体が `Unimplemented` になるため、どちらでも失敗の場面になる。
+    /// （再起動ループはこれを再 launch しない）。失敗は試験の継ぎ目（`pid_share::force_failure_for_test`）で注入する。
     #[test]
     fn sup3_4811_kill_all_failure_is_reported_as_processes_remain() {
         use fandhe_container_core::traits::{CgroupPlacement, CgroupScope};
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::unix::fs::MetadataExt as _;
-            // root はルート cgroup の記録を開けるため、この場面を作れない（CI は非 root）。
-            if std::fs::metadata("/proc/self")
-                .map(|m| m.uid())
-                .unwrap_or(0)
-                == 0
-            {
-                return;
-            }
-        }
         let store = running_store(0);
         {
             let mut g = store.rec.lock().unwrap();
@@ -1557,25 +1544,20 @@ mod tests {
         let p = FakeProc::exiting(1, ProcessExit::Exited(0));
         let rec = Rec(Mutex::new(Vec::new()));
         let config = MonitorConfig::default().with_kill_all_on_init_exit(true);
-        let out = monitor_with_observer(&mut s, &p, &config, &StopToken::new(), &rec).unwrap();
+        crate::pid_share::force_failure_for_test(Some(ErrorCode::Timeout));
+        let out = monitor_with_observer(&mut s, &p, &config, &StopToken::new(), &rec);
+        crate::pid_share::force_failure_for_test(None);
         let MonitorOutcome::ExitedProcessesRemain {
             exit,
             record,
             error,
-        } = out
+        } = out.unwrap()
         else {
-            panic!("unexpected outcome {out:?}")
+            panic!("unexpected outcome")
         };
         assert_eq!(exit, ProcessExit::Exited(0));
         assert_eq!(record.status().state(), ContainerState::Stopped);
-        assert!(
-            matches!(
-                error.code(),
-                ErrorCode::PermissionDenied | ErrorCode::Unimplemented
-            ),
-            "{:?}",
-            error.code()
-        );
+        assert_eq!(error.code(), ErrorCode::Timeout);
         let ops: Vec<_> = rec
             .0
             .lock()

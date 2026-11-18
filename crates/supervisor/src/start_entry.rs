@@ -2065,7 +2065,12 @@ pub fn run_supervised_with_health(
         && let Err(e) = hub.attach(output)
     {
         log_event("log_capture_failed", Some(e.code()));
-        let disposed = dispose(Some(process), None, timeouts);
+        let disposed = kill_after_dispose(
+            dispose(Some(process), None, timeouts),
+            kill_all_on_init_exit,
+            &id,
+            placement.as_ref(),
+        );
         return finish_disposed(
             &store,
             &id,
@@ -2089,7 +2094,12 @@ pub fn run_supervised_with_health(
         };
         if let Err(e) = attached {
             log_event("seccomp_notify_failed", Some(e.code()));
-            let disposed = dispose(Some(process), None, timeouts);
+            let disposed = kill_after_dispose(
+                dispose(Some(process), None, timeouts),
+                kill_all_on_init_exit,
+                &id,
+                placement.as_ref(),
+            );
             return finish_disposed(
                 &store,
                 &id,
@@ -2123,6 +2133,25 @@ pub fn run_supervised_with_health(
         let _ = hub.finish(timeouts.terminate());
     }
     code
+}
+
+/// 起動ハンドルを回収した後の kill-all（pod の pid ns を共有するコンテナだけ。CRI-2・SUP-1・CORE-4・#4811）。
+///
+/// init を回収しても子孫は pod の PID 1 へ付け替わって残るため、起動後のすべての回収の経路（停止・監視の失敗・
+/// 捕捉の失敗等）で [`dispose`] の後に通す。配置は start 時に保持した値で、ストアを読み直さない（同じ ID の削除・再作成で
+/// 別の世代を止めない）。止めきれなければ後始末の失敗として扱う（`finish_disposed` が INTERNAL で終わる）。
+fn kill_after_dispose(
+    disposed: (bool, Vec<NonZeroU32>),
+    enabled: bool,
+    id: &ContainerId,
+    placement: Option<&CgroupPlacement>,
+) -> (bool, Vec<NonZeroU32>) {
+    let (ok, reaped) = disposed;
+    if !enabled {
+        return (ok, reaped);
+    }
+    let killed = crate::pid_share::kill_remaining(id, placement).is_ok();
+    (ok && killed, reaped)
 }
 
 /// [`supervise_running`] へ渡す、start の結果から決まる値（引数の数を増やさないための束）。
@@ -2159,7 +2188,12 @@ fn supervise_running(
         Ok(s) => s,
         Err(e) => {
             log_event("attach_failed", Some(e.code()));
-            let disposed = dispose(Some(process), None, timeouts);
+            let disposed = kill_after_dispose(
+                dispose(Some(process), None, timeouts),
+                kill_all_on_init_exit,
+                &id,
+                placement.as_ref(),
+            );
             return finish_disposed(
                 &store,
                 &id,
@@ -2178,7 +2212,12 @@ fn supervise_running(
         Ok((m, r)) => (m.with_kill_all_on_init_exit(kill_all_on_init_exit), r),
         Err(e) => {
             log_event("config_invalid", Some(e.code()));
-            let disposed = dispose(Some(process), None, timeouts);
+            let disposed = kill_after_dispose(
+                dispose(Some(process), None, timeouts),
+                kill_all_on_init_exit,
+                &id,
+                placement.as_ref(),
+            );
             return finish_disposed(
                 &store,
                 &id,
@@ -2211,16 +2250,13 @@ fn supervise_running(
             explicit_stop_pending,
             ..
         }) => {
-            let disposed = dispose(process, Some(&late), timeouts);
-            // 停止で init を回収した後も、pid を共有するコンテナでは子孫が残るため cgroup ごと止める（#4811）。
-            // start 時の配置を使い、ストアは読み直さない。止めきれなければ失敗の終了コードにする。
-            let code = match kill_all_on_init_exit
-                .then(|| crate::pid_share::kill_remaining(&id, placement.as_ref()))
-            {
-                Some(Err(e)) => exit_code_for(e.code()).get(),
-                _ => 0,
-            };
-            finish_disposed_explicit(&store, &id, instance, disposed, code, explicit_stop_pending)
+            let disposed = kill_after_dispose(
+                dispose(process, Some(&late), timeouts),
+                kill_all_on_init_exit,
+                &id,
+                placement.as_ref(),
+            );
+            finish_disposed_explicit(&store, &id, instance, disposed, 0, explicit_stop_pending)
         }
         Ok(SuperviseOutcome::RelaunchFailed {
             error,
@@ -2229,7 +2265,12 @@ fn supervise_running(
             ..
         }) => {
             log_event("restart_failed", Some(error.code()));
-            let disposed = dispose(None, Some(&late), timeouts);
+            let disposed = kill_after_dispose(
+                dispose(None, Some(&late), timeouts),
+                kill_all_on_init_exit,
+                &id,
+                placement.as_ref(),
+            );
             finish_disposed_explicit(
                 &store,
                 &id,
@@ -2248,7 +2289,12 @@ fn supervise_running(
             log_event("restart_failed", Some(error.code()));
             // supervise_with_restart の中で終了を確認できた新プロセスも、記録が Running のまま残り得るので
             // 照合つきの Stopped 記録の対象に含める（SUP-1・CORE-2）。
-            let (ok, mut pids) = dispose(None, Some(&late), timeouts);
+            let (ok, mut pids) = kill_after_dispose(
+                dispose(None, Some(&late), timeouts),
+                kill_all_on_init_exit,
+                &id,
+                placement.as_ref(),
+            );
             pids.extend(reaped);
             finish_disposed(
                 &store,
@@ -2265,7 +2311,12 @@ fn supervise_running(
         }
         Ok(SuperviseOutcome::MonitorFailed { process, .. }) => {
             log_event("monitor_failed", None);
-            let disposed = dispose(process, None, timeouts);
+            let disposed = kill_after_dispose(
+                dispose(process, None, timeouts),
+                kill_all_on_init_exit,
+                &id,
+                placement.as_ref(),
+            );
             finish_disposed(
                 &store,
                 &id,
@@ -2276,7 +2327,12 @@ fn supervise_running(
         }
         Ok(SuperviseOutcome::MonitorError { error, process, .. }) => {
             log_event("monitor_error", Some(error.code()));
-            let disposed = dispose(Some(process), None, timeouts);
+            let disposed = kill_after_dispose(
+                dispose(Some(process), None, timeouts),
+                kill_all_on_init_exit,
+                &id,
+                placement.as_ref(),
+            );
             finish_disposed(
                 &store,
                 &id,
@@ -5669,6 +5725,28 @@ mod tests {
             std::thread::sleep(self.1);
             Ok(())
         }
+    }
+
+    /// CRI-2・SUP-1・CORE-4・#4811: 回収の後の kill-all は、pid を共有しないコンテナでは何もせず結果を変えず、共有する
+    /// コンテナで止めきれなければ後始末の失敗（`ok = false`）にする。回収した pid は保つ。
+    #[test]
+    fn sup1_4811_kill_after_dispose_fails_cleanup_when_kill_all_fails() {
+        let id = ContainerId::new("c1").unwrap();
+        let pid = NonZeroU32::new(42).unwrap();
+        let disposed = || (true, vec![pid]);
+        assert_eq!(kill_after_dispose(disposed(), false, &id, None), disposed());
+        // 共有するが配置が無い（cgroup を作っていない）: 止めるものが無く成功。
+        assert_eq!(kill_after_dispose(disposed(), true, &id, None), disposed());
+        crate::pid_share::force_failure_for_test(Some(ErrorCode::Timeout));
+        let failed = kill_after_dispose(disposed(), true, &id, None);
+        let skipped = kill_after_dispose(disposed(), false, &id, None);
+        crate::pid_share::force_failure_for_test(None);
+        assert_eq!(failed, (false, vec![pid]));
+        assert_eq!(skipped, disposed());
+        assert_eq!(
+            kill_after_dispose((false, vec![]), true, &id, None),
+            (false, vec![])
+        );
     }
 
     /// SUP-1・CORE-2・REPAIR-5: 待ちの期限を過ぎてから terminate が成功しても、もう 1 回分の期限内なら回収済みの pid

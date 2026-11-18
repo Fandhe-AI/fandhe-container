@@ -1353,6 +1353,11 @@ impl PidNsIdentity {
         Self { dev, ino }
     }
 
+    /// `(st_dev, st_ino)`（launch の記録に残す値。#4813）。
+    pub(crate) fn parts(self) -> (u64, u64) {
+        (self.dev, self.ino)
+    }
+
     /// 呼び出しスレッドの PID namespace の素性（`/proc/thread-self/ns/pid` を辿った nsfs の inode）。
     /// `std::fs::metadata` はヒープを確保しないため、多スレッドの試験から fork した子でも呼べる。
     fn of_current_thread() -> std::io::Result<Self> {

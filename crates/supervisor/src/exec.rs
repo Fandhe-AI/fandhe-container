@@ -259,7 +259,7 @@
 //!   同じ理由が生じたときの記録も配線済み（#2624。core の `launch_intermediate` が状態 pipe の exec 前の 2 行目〔`R`/`E`〕を
 //!   読み、`exec::audit_entrypoint_violation` で記録して起動失敗にする。supervisor ではなく launcher の呼び出し元の
 //!   `audit_sink` に書く）。`R` の後の `execveat` 自体の errno 由来の失敗は違反ではないため記録しない。
-//!   status 無しの経路（`spawn_container` 系）の子は何も報告しない。worker の経路の違反（種別 `exec_target` の 10 理由と種別 `rootfs_pivot` の
+//!   status 無しの経路（`spawn_container` 系）の子は何も報告しない。worker の経路の違反（種別 `exec_target` の 12 理由と種別 `rootfs_pivot` の
 //!   `rootfs_is_host_root`、bundle の rootfs の固定の種別 `mount_target` の `path_symlink_or_not_directory`・`path_missing`）と
 //!   exec の子の違反（種別 `entrypoint` の 8 理由）は、いずれもこの入口で記録する（「監査記録」）。
 //!   この入口の記録の対象外: 種別 `mount_target` の `target_moved` は launch の `pivot_root` 前だけで生じ、種別
@@ -433,7 +433,8 @@ fn identify_pid1_staged(record: &StateRecord) -> Result<ExecTarget, WorkerError>
     let rlimits = require_recorded_rlimits(record)?;
     let launch_isolation = require_recorded_launch_isolation(record)?;
     let id = record.status().id();
-    let pid1 = Pid1Target::open(pid, id, placement).map_err(from_exec_error_staged)?;
+    let pid1 = Pid1Target::open(pid, id, placement, launch_isolation.pod_pid_ns())
+        .map_err(from_exec_error_staged)?;
     Ok(ExecTarget {
         id: id.clone(),
         pid1,
@@ -482,8 +483,14 @@ fn identify_pid1_with_pidfd_staged(
         )
     })?;
     let id = record.status().id();
-    let pid1 = Pid1Target::open_with_launch_pidfd(owned, pid, id, placement)
-        .map_err(from_exec_error_staged)?;
+    let pid1 = Pid1Target::open_with_launch_pidfd(
+        owned,
+        pid,
+        id,
+        placement,
+        launch_isolation.pod_pid_ns(),
+    )
+    .map_err(from_exec_error_staged)?;
     Ok(ExecTarget {
         id: id.clone(),
         pid1,
@@ -1636,7 +1643,7 @@ fn attach_sweep(
 /// worker の失敗。拒否のエラーと、worker の経路の違反だった場合のその理由（監査記録の入力。SEC-4・#1465）。
 ///
 /// `violation` は worker の結果行の `<種別>/<理由>` を core の許可リスト（`ViolationReason::EXEC_WORKER_REASONS`。
-/// 種別 `exec_target` の 10 理由、種別 `rootfs_pivot` の `rootfs_is_host_root`、bundle の rootfs の固定の
+/// 種別 `exec_target` の 12 理由、種別 `rootfs_pivot` の `rootfs_is_host_root`、bundle の rootfs の固定の
 /// 種別 `mount_target` の 2 理由〔#1702〕）で引き直した値だけを持つ。
 /// 未知・一覧外の文字列は結果行の不正として `Internal`（fail-closed）になりここへ来ない。
 #[derive(Debug)]
@@ -2796,7 +2803,7 @@ const VIOLATION_MARKER: &str = " (violation: ";
 /// `err` が worker の経路の違反による拒否なら、その理由を返す（SEC-4・SUP-6・SEC-1・#1465）。
 ///
 /// [`from_exec_error`] の末尾の `<種別>/<理由コード>` を core の許可リスト（`ViolationReason::EXEC_WORKER_REASONS`。
-/// 種別 `exec_target` の 10 理由と種別 `rootfs_pivot` の `rootfs_is_host_root`）で引き直す。一覧外の種別・理由
+/// 種別 `exec_target` の 12 理由と種別 `rootfs_pivot` の `rootfs_is_host_root`）で引き直す。一覧外の種別・理由
 /// （worker の経路では生じない。core の `exec/violation_scan.rs` の単体テストが固定する）は `None`。メッセージは
 /// core の静的トークンだけから組み立てられ、外部入力は載らない。
 fn exec_worker_reason_of(err: &TraitError) -> Option<ViolationReason> {
@@ -4636,13 +4643,13 @@ mod tests {
     /// 違反の subject に持たせるホスト側パス（結果行・記録に現れてはならない）。
     const HOST_SUBJECT: &str = "/srv/fandhe/bundles/c1/rootfs";
 
-    /// SEC-4・SUP-6・SEC-1・TASK-163 追補（#1465）・#1614 の事後監査: worker の経路の 16 理由すべてが結果行へ
+    /// SEC-4・SUP-6・SEC-1・TASK-163 追補（#1465）・#1614 の事後監査: worker の経路の 18 理由すべてが結果行へ
     /// `<種別>/<理由>` として載り、往復で同じ理由に戻る。期待 cgroup パス・rootfs のパスはメッセージにも結果行にも載らない。
     #[test]
     fn sec4_sup6_task163_worker_line_carries_worker_violation_reason() {
-        assert_eq!(ViolationReason::EXEC_WORKER_REASONS.len(), 16);
+        assert_eq!(ViolationReason::EXEC_WORKER_REASONS.len(), 18);
         for reason in ViolationReason::EXEC_WORKER_REASONS {
-            // 手組みの `TraitError` だけ（段なし）と、実経路の写像（段つき。16 理由すべてで `ExecError::stage` を運ぶ）。
+            // 手組みの `TraitError` だけ（段なし）と、実経路の写像（段つき。18 理由すべてで `ExecError::stage` を運ぶ）。
             for (staged, has_stage) in [
                 (WorkerError::from(exec_target_failure(reason)), false),
                 (worker_violation_failure(reason), true),
@@ -4712,7 +4719,7 @@ mod tests {
         );
     }
 
-    /// SEC-4・SUP-6・SEC-1・TASK-163 追補（#1465）・#1614 の事後監査: 親側の記録は worker の経路の 16 理由それぞれ
+    /// SEC-4・SUP-6・SEC-1・TASK-163 追補（#1465）・#1614 の事後監査: 親側の記録は worker の経路の 18 理由それぞれ
     /// 1 件・パスなし・自 PID。種別 `exec_target` は層 `exec_target` と理由コード、`rootfs_is_host_root` は層 `mount`
     /// （理由コード `rootfs_is_host_root` つき）。違反なしの失敗は 0 件で `NotApplicable`、失敗する sink でも拒否は元のまま。
     #[test]

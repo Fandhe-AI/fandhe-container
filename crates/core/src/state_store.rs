@@ -1949,6 +1949,14 @@ struct LaunchIsolationDto {
         deserialize_with = "root_readonly_bool"
     )]
     root_readonly: Option<bool>,
+    /// pod の pid ns へ参加して起動したときの pod の pid ns の素性（CRI-2・SEC-1・#4813）。キー欠落だけを
+    /// 「参加なし」（旧記録を含む）と読み、`null` や数値の組以外は破損として拒否する（fail-closed）。
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "pod_pid_ns_object"
+    )]
+    pod_pid_ns: Option<RootDto>,
 }
 
 /// ID 写像の記録。`model` は `single` / `subordinate`。
@@ -2199,6 +2207,7 @@ impl LaunchIsolationDto {
                 .capabilities()
                 .map(|c| c.iter().map(|c| c.as_str().to_owned()).collect()),
             root_readonly: record.root_readonly(),
+            pod_pid_ns: record.pod_pid_ns().map(|(dev, ino)| RootDto { dev, ino }),
         }
     }
 
@@ -2255,11 +2264,24 @@ impl LaunchIsolationDto {
             Some(names) => record.with_capabilities(capabilities_from_names(&names)?),
             None => record,
         };
-        Ok(match self.root_readonly {
+        let record = match self.root_readonly {
             Some(ro) => record.with_root_readonly(ro),
+            None => record,
+        };
+        Ok(match self.pod_pid_ns {
+            Some(RootDto { dev, ino }) => record.with_pod_pid_ns(dev, ino),
             None => record,
         })
     }
+}
+
+/// `pod_pid_ns` のキーが在るとき `{dev, ino}` の数値の組だけを受ける（`null` は拒否。`default` がキー欠落を `None` に
+/// する。#4813）。
+fn pod_pid_ns_object<'de, D>(d: D) -> Result<Option<RootDto>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    RootDto::deserialize(d).map(Some)
 }
 
 /// `root_readonly` のキーが在るとき bool だけを受ける（`null` は拒否。`default` がキー欠落を `None` にする）。
@@ -4300,6 +4322,36 @@ mod tests {
         ] {
             let mut v = serde_json::to_value(LaunchIsolationDto::from_record(&iso(100))).unwrap();
             v["root_readonly"] = bad;
+            assert!(serde_json::from_value::<LaunchIsolationDto>(v).is_err());
+        }
+    }
+
+    /// CRI-2・SEC-1・#4813: pod の pid ns の素性が `{dev, ino}` で往復し、キーの無い旧記録は `None`、`null`・数値・欠けた
+    /// 組は破損として拒否される。
+    #[test]
+    fn cri2_4813_state_pod_pid_ns_roundtrip_and_rejects_corruption() {
+        let rec = iso(100).with_pod_pid_ns(4, 4_026_532_777);
+        let v = serde_json::to_value(LaunchIsolationDto::from_record(&rec)).unwrap();
+        assert_eq!(
+            v["pod_pid_ns"],
+            serde_json::json!({"dev": 4, "ino": 4_026_532_777u64})
+        );
+        let back: LaunchIsolationDto = serde_json::from_value(v).unwrap();
+        assert_eq!(
+            back.into_record().unwrap().pod_pid_ns(),
+            Some((4, 4_026_532_777))
+        );
+        let legacy = serde_json::to_value(LaunchIsolationDto::from_record(&iso(100))).unwrap();
+        assert!(legacy.get("pod_pid_ns").is_none());
+        let back: LaunchIsolationDto = serde_json::from_value(legacy).unwrap();
+        assert_eq!(back.into_record().unwrap().pod_pid_ns(), None);
+        for bad in [
+            serde_json::Value::Null,
+            serde_json::json!(1),
+            serde_json::json!({"dev": 4}),
+        ] {
+            let mut v = serde_json::to_value(LaunchIsolationDto::from_record(&iso(100))).unwrap();
+            v["pod_pid_ns"] = bad;
             assert!(serde_json::from_value::<LaunchIsolationDto>(v).is_err());
         }
     }

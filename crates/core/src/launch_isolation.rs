@@ -659,6 +659,7 @@ pub struct LaunchIsolationRecord {
     id_mapping: Option<RecordedIdMapping>,
     capabilities: Option<ContainerCapabilities>,
     root_readonly: Option<bool>,
+    pod_pid_ns: Option<(u64, u64)>,
 }
 
 impl LaunchIsolationRecord {
@@ -672,7 +673,23 @@ impl LaunchIsolationRecord {
             id_mapping: None,
             capabilities: None,
             root_readonly: None,
+            pod_pid_ns: None,
         }
+    }
+
+    /// pod の pid namespace へ参加して起動したとき、launch で固定した pod の pid ns の素性 `(st_dev, st_ino)` を添える
+    /// （CRI-2・CORE-3・SEC-1・#4812・#4813）。exec・healthcheck の対象の固定（`exec::Pid1Target`）は、添えられていれば
+    /// launch pidfd の経路でだけ、対象の pid ns がこの素性と一致することを PID 1 の代わりに求め、記録 pid から開く縮退経路を
+    /// 拒否する。添えなければ `None`（自分の pid ns の PID 1。旧記録も同じ扱い）。
+    #[must_use]
+    pub fn with_pod_pid_ns(mut self, dev: u64, ino: u64) -> Self {
+        self.pod_pid_ns = Some((dev, ino));
+        self
+    }
+
+    /// 添えられた pod の pid ns の素性（無ければ `None`）。
+    pub fn pod_pid_ns(&self) -> Option<(u64, u64)> {
+        self.pod_pid_ns
     }
 
     /// launch が実際に適用した `root.readonly` の実効値(config と `--read-only` の OR。mount の RDONLY・Landlock の

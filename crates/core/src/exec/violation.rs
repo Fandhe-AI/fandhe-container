@@ -15,7 +15,7 @@
 //! 監査イベントへの写像は [`IsolationViolation::exec_audit_event`]（SUP-6・TASK-163 追補・#1465）で実装済み。
 //! エントリポイント検証の拒否（種別 `entrypoint` の 8 理由。launch と exec の子が共有する）から `Entrypoint`
 //! 監査イベントへの写像は [`IsolationViolation::entrypoint_audit_event`]（SEC-4・SUP-6・SEC-1・TASK-163 追補・#1595）。
-//! supervisor の exec の worker が返し得る違反（[`ViolationReason::EXEC_WORKER_REASONS`]。種別 `exec_target` の 10 理由、
+//! supervisor の exec の worker が返し得る違反（[`ViolationReason::EXEC_WORKER_REASONS`]。種別 `exec_target` の 12 理由、
 //! 種別 `rootfs_pivot` の `rootfs_is_host_root`、bundle の rootfs の固定が運ぶ種別 `mount_target` の
 //! `path_symlink_or_not_directory`・`path_missing`）から監査イベントへの写像は [`ViolationReason::exec_worker_audit_event`]
 //! （`exec_target` は `ExecTarget`、他の 3 理由は `mount_audit_event` と同じ `Mount` のパスなし・理由コードつき。#1614 の事後監査・#1702）。
@@ -290,6 +290,12 @@ pub enum ViolationReason {
     /// 起動時から保持する pidfd の指すプロセスが、記録した pid と一致しない（pidfd の取り違え・記録の
     /// 古さ。cgroup の所属に依らない同一性の照合。SUP-6・SEC-1・TASK-163 追補・#1461）。
     ExecTargetPidfdMismatch,
+    /// pod の pid ns を共有するコンテナの exec の対象の PID namespace が、launch で記録した pod の pid ns の素性と
+    /// 一致しない（CRI-2・SEC-1・SEC-4・#4813）。
+    ExecTargetJoinedPidNamespaceMismatch,
+    /// pod の pid ns を共有するコンテナへの exec を、記録 pid から開く縮退経路で求めた（launch pidfd の経路だけを
+    /// 受ける。O5・CRI-2・SEC-1・SEC-4・#4813）。
+    ExecTargetJoinedPidNamespaceRequiresLaunchPidfd,
     /// 読み取り専用にするパス（固定集合または `config.json` 由来）の保護を載せる操作・事後検証が失敗した
     /// （SEC-2・SEC-4・TASK-41 追補・#2013）。対象の検査（symlink・shared・移動）の拒否は含まない。
     ReadonlyPathApplyFailed,
@@ -322,7 +328,7 @@ impl ViolationReason {
     /// 種別 [`ViolationKind::ExecTarget`] の理由の全一覧（exec の対象の拒否。SUP-6・SEC-1）。
     ///
     /// supervisor の worker が返す理由コードを許可リストとして引き直すための SSOT（#1465）。
-    pub const EXEC_TARGET_REASONS: [ViolationReason; 10] = [
+    pub const EXEC_TARGET_REASONS: [ViolationReason; 12] = [
         Self::ExecTargetNotNestedPid1,
         Self::ExecTargetCgroupMismatch,
         Self::ExecTargetSharesPidNamespace,
@@ -333,6 +339,8 @@ impl ViolationReason {
         Self::ExecJoinedPidNamespaceMismatch,
         Self::ExecJoinedCgroupMismatch,
         Self::ExecTargetPidfdMismatch,
+        Self::ExecTargetJoinedPidNamespaceMismatch,
+        Self::ExecTargetJoinedPidNamespaceRequiresLaunchPidfd,
     ];
 
     /// 種別 [`ViolationKind::Entrypoint`] の理由の全一覧（エントリポイント検証の拒否。SEC-4・SUP-6・SEC-1）。
@@ -385,7 +393,7 @@ impl ViolationReason {
     /// fork までを行うプロセス）が `ExecError::violation` として返し得る理由の全一覧（SEC-4・SUP-6・SEC-1）。
     ///
     /// supervisor の親プロセスが worker の結果行（`err` 行）の `<種別>/<理由>` を引き直す許可リストの SSOT。
-    /// [`Self::EXEC_TARGET_REASONS`] の 10 理由と、`prepare_exec_restrictions` の `reject_own_root` が返す
+    /// [`Self::EXEC_TARGET_REASONS`] の 12 理由と、`prepare_exec_restrictions` の `reject_own_root` が返す
     /// 種別 `rootfs_pivot` の `rootfs_is_host_root`（worker 自身の `/` が bundle の rootfs と同じディレクトリ）、
     /// bundle の rootfs の固定（`oci_runtime::RootfsDir::pin`）が検証後の差し替えで拒否する種別 `mount_target` の
     /// `path_symlink_or_not_directory`・`path_missing`（`RootfsPinError` が運ぶ。#1702）、Landlock の再適用が
@@ -395,7 +403,7 @@ impl ViolationReason {
     /// 入れ替わったマウント。SEC-1・SEC-4・#3201）から成る。
     /// 一覧と worker の経路のソースが作る理由の一致は `exec/violation_scan.rs` の単体テストが固定する。
     /// exec の子が `execve` 前に報告する違反（種別 `entrypoint`）は `ok` 行の `SetupFailed` で運ばれるためここに含めない。
-    pub const EXEC_WORKER_REASONS: [ViolationReason; 16] = [
+    pub const EXEC_WORKER_REASONS: [ViolationReason; 18] = [
         Self::ExecTargetNotNestedPid1,
         Self::ExecTargetCgroupMismatch,
         Self::ExecTargetSharesPidNamespace,
@@ -406,6 +414,8 @@ impl ViolationReason {
         Self::ExecJoinedPidNamespaceMismatch,
         Self::ExecJoinedCgroupMismatch,
         Self::ExecTargetPidfdMismatch,
+        Self::ExecTargetJoinedPidNamespaceMismatch,
+        Self::ExecTargetJoinedPidNamespaceRequiresLaunchPidfd,
         Self::RootfsIsHostRoot,
         Self::PathSymlinkOrNotDirectory,
         Self::PathMissing,
@@ -448,7 +458,7 @@ impl ViolationReason {
     ///
     /// 手書きの理由リストを別に持たず、種別（[`Self::kind`]）で絞って使う（[`Self::from_launch_token`]）。
     /// 足し忘れは単体テスト（`ALL` の件数が `as_str` の分岐数と一致すること）が検出する。
-    pub(super) const ALL: [ViolationReason; 68] = [
+    pub(super) const ALL: [ViolationReason; 70] = [
         Self::NoNamespaces,
         Self::HostnameWithoutUts,
         Self::PidWithoutMount,
@@ -512,6 +522,8 @@ impl ViolationReason {
         Self::ExecJoinedPidNamespaceMismatch,
         Self::ExecJoinedCgroupMismatch,
         Self::ExecTargetPidfdMismatch,
+        Self::ExecTargetJoinedPidNamespaceMismatch,
+        Self::ExecTargetJoinedPidNamespaceRequiresLaunchPidfd,
         Self::ReadonlyPathApplyFailed,
         Self::MaskedPathApplyFailed,
         Self::SysfsApplyFailed,
@@ -707,6 +719,12 @@ impl ViolationReason {
             Self::ExecJoinedPidNamespaceMismatch => "exec_joined_pid_namespace_mismatch",
             Self::ExecJoinedCgroupMismatch => "exec_joined_cgroup_mismatch",
             Self::ExecTargetPidfdMismatch => "exec_target_pidfd_mismatch",
+            Self::ExecTargetJoinedPidNamespaceMismatch => {
+                "exec_target_joined_pid_namespace_mismatch"
+            }
+            Self::ExecTargetJoinedPidNamespaceRequiresLaunchPidfd => {
+                "exec_target_joined_pid_namespace_requires_launch_pidfd"
+            }
             Self::ReadonlyPathApplyFailed => "readonly_path_apply_failed",
             Self::MaskedPathApplyFailed => "masked_path_apply_failed",
             Self::SysfsApplyFailed => "sysfs_apply_failed",
@@ -781,7 +799,9 @@ impl ViolationReason {
             | Self::ExecJoinedNamespaceMismatch
             | Self::ExecJoinedPidNamespaceMismatch
             | Self::ExecJoinedCgroupMismatch
-            | Self::ExecTargetPidfdMismatch => ViolationKind::ExecTarget,
+            | Self::ExecTargetPidfdMismatch
+            | Self::ExecTargetJoinedPidNamespaceMismatch
+            | Self::ExecTargetJoinedPidNamespaceRequiresLaunchPidfd => ViolationKind::ExecTarget,
             Self::ReadonlyPathApplyFailed
             | Self::MaskedPathApplyFailed
             | Self::SysfsApplyFailed => ViolationKind::ProtectedPathApply,
@@ -826,7 +846,9 @@ impl ViolationReason {
             | Self::ExecTargetSharesPidNamespace
             | Self::ExecTargetSharesMountNamespace
             | Self::ExecTargetInOtherUserNamespace
-            | Self::ExecTargetPidfdMismatch => "SUP-6",
+            | Self::ExecTargetPidfdMismatch
+            | Self::ExecTargetJoinedPidNamespaceMismatch
+            | Self::ExecTargetJoinedPidNamespaceRequiresLaunchPidfd => "SUP-6",
             _ => "CORE-1",
         }
     }
@@ -890,6 +912,8 @@ impl ViolationReason {
             | Self::ExecJoinedPidNamespaceMismatch
             | Self::ExecJoinedCgroupMismatch
             | Self::ExecTargetPidfdMismatch
+            | Self::ExecTargetJoinedPidNamespaceMismatch
+            | Self::ExecTargetJoinedPidNamespaceRequiresLaunchPidfd
             | Self::ExecDevNotDirectory
             | Self::ExecProcNotProcfs
             | Self::EntrypointCopySealUnverified
@@ -1084,6 +1108,12 @@ impl ViolationReason {
             }
             Self::ExecTargetPidfdMismatch => {
                 "the process held by the launch pidfd is not the recorded exec target"
+            }
+            Self::ExecTargetJoinedPidNamespaceMismatch => {
+                "the PID namespace of the exec target is not the pod PID namespace recorded at launch"
+            }
+            Self::ExecTargetJoinedPidNamespaceRequiresLaunchPidfd => {
+                "exec into a container sharing the pod PID namespace requires the launch pidfd"
             }
             Self::ReadonlyPathApplyFailed => "failed to apply a read-only path protection",
             Self::MaskedPathApplyFailed => "failed to apply a masked path protection",
@@ -1680,6 +1710,18 @@ mod tests {
                 "SUP-6",
                 "the process held by the launch pidfd is not the recorded exec target",
             ),
+            (
+                ViolationReason::ExecTargetJoinedPidNamespaceMismatch,
+                "exec_target_joined_pid_namespace_mismatch",
+                "SUP-6",
+                "the PID namespace of the exec target is not the pod PID namespace recorded at launch",
+            ),
+            (
+                ViolationReason::ExecTargetJoinedPidNamespaceRequiresLaunchPidfd,
+                "exec_target_joined_pid_namespace_requires_launch_pidfd",
+                "SUP-6",
+                "exec into a container sharing the pod PID namespace requires the launch pidfd",
+            ),
         ];
         for (r, code, behavior, message) in cases {
             assert_eq!(r.as_str(), code);
@@ -1863,10 +1905,10 @@ mod tests {
         assert_eq!(v.exec_audit_event(), None);
     }
 
-    /// SEC-4・SUP-6・TASK-163 追補: exec 対象の 10 理由は許可リスト往復でき、対象外・未知は引けない。
+    /// SEC-4・SUP-6・TASK-163 追補: exec 対象の 12 理由は許可リスト往復でき、対象外・未知は引けない。
     #[test]
     fn sec4_sup6_task163_exec_target_token_allowlist() {
-        assert_eq!(ViolationReason::EXEC_TARGET_REASONS.len(), 10);
+        assert_eq!(ViolationReason::EXEC_TARGET_REASONS.len(), 12);
         for r in ViolationReason::EXEC_TARGET_REASONS {
             assert_eq!(r.kind(), ViolationKind::ExecTarget);
             assert_eq!(ViolationReason::from_exec_target_token(r.as_str()), Some(r));
@@ -1886,11 +1928,11 @@ mod tests {
         );
     }
 
-    /// SEC-4・SUP-6・SEC-1: worker の経路の 16 理由は `<種別>/<理由>` で往復でき、層は exec_target か mount の
+    /// SEC-4・SUP-6・SEC-1: worker の経路の 18 理由は `<種別>/<理由>` で往復でき、層は exec_target か mount の
     /// どちらか 1 つだけ（パスなし）。一覧外・種別の食い違い・未知は引けず、監査イベントも作らない。
     #[test]
     fn sec4_sup6_exec_worker_token_allowlist_maps_each_reason_to_one_layer() {
-        assert_eq!(ViolationReason::EXEC_WORKER_REASONS.len(), 16);
+        assert_eq!(ViolationReason::EXEC_WORKER_REASONS.len(), 18);
         for r in ViolationReason::EXEC_TARGET_REASONS {
             assert!(ViolationReason::EXEC_WORKER_REASONS.contains(&r), "{r:?}");
         }
@@ -2042,7 +2084,7 @@ mod tests {
         }
     }
 
-    /// SEC-4・SUP-6・SEC-1: worker の経路の 16 理由はそれぞれ 1 件だけ記録される（exec 対象は層 exec_target と理由
+    /// SEC-4・SUP-6・SEC-1: worker の経路の 18 理由はそれぞれ 1 件だけ記録される（exec 対象は層 exec_target と理由
     /// コード、`rootfs_is_host_root` と rootfs の固定の 2 理由〔#1702〕は層 mount で理由コードつき。どちらもパスなし）。一覧外は 0 件、失敗でも error は不変。
     #[test]
     fn sec4_sup6_record_exec_worker_rejection_records_once_per_reason() {
@@ -2087,7 +2129,7 @@ mod tests {
         }
     }
 
-    /// SEC-4・ERR-4・SUP-6・#3294: 段つきの版は worker の 16 理由すべてで記録の `stage` に段を載せ、`None` では載せない。
+    /// SEC-4・ERR-4・SUP-6・#3294: 段つきの版は worker の 18 理由すべてで記録の `stage` に段を載せ、`None` では載せない。
     /// 一覧外の理由は段があっても 0 件。記録の JSON 行の末尾は `"container_id":...,"stage":"set_ns"}` になる。
     #[test]
     fn sec4_err4_record_exec_worker_rejection_at_carries_stage() {

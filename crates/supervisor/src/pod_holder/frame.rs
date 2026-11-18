@@ -1,19 +1,22 @@
-//! pod 保持役の READY / ERROR フレーム（固定 64 バイト。OS 非依存の純関数。CRI-2・SEC-5・REPAIR-2・REPAIR-5・#2874）。
+//! pod 保持役の READY / ERROR フレーム（固定 80 バイト。OS 非依存の純関数。CRI-2・SEC-5・REPAIR-2・REPAIR-5・#2874・#4808）。
 //!
 //! 保持役（`holder`）が stdout へ 1 回だけ書き、受信側（plugin-cri の起動処理〔H6・#2877〕と実機試験）が
 //! [`PodHolderFrame::decode`] で解釈する。生の `Vec<u8>` を手で組まず、全欄を検証した型だけを通す。
 //! 受信側は長さを [`FRAME_LEN`] に固定し、期限つきで読む（`client::read_ready`）ので、無制限確保も無期限待ちも無い。
 //!
-//! 形式（整数は LE）: magic 4・version 1・kind 1・reserved 2（0）・欄 A 8・user dev/ino 16・ipc dev/ino 16・net dev/ino 16。
-//! READY の欄 A は pid、ERROR の欄 A はエラーコードのワイヤー値で、使わない欄は 0 にする。
+//! 形式（整数は LE）: magic 4・version 1・kind 1・reserved 2（0）・欄 A 8・user dev/ino 16・ipc dev/ino 16・net dev/ino 16・
+//! mnt dev/ino 16。READY の欄 A は pid、ERROR の欄 A はエラーコードのワイヤー値で、使わない欄は 0 にする。
+//!
+//! version 2（#4808）で pod の mount namespace（pod-init の空の root を作る ns）の素性を足した。version 1（64 バイト）は
+//! 受けない（保持役と受信側は同じ配布物に入るため、旧い版との往復は起きない）。
 
 use fandhe_container_core::traits::types::{ErrorCode, TraitError};
 
 /// フレームの長さ（バイト）。
-pub const FRAME_LEN: usize = 64;
+pub const FRAME_LEN: usize = 80;
 
 const MAGIC: [u8; 4] = *b"FCPH";
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 const KIND_READY: u8 = 1;
 const KIND_ERROR: u8 = 2;
 
@@ -38,20 +41,22 @@ pub struct PodHolderReady {
     ipc: NsId,
     /// pod の net namespace（`lo` は up）。
     net: NsId,
+    /// pod の mount namespace（所有者は pod の user namespace。#4808）。
+    mnt: NsId,
 }
 
 impl PodHolderReady {
-    /// 検証つきで作る。pid は `1..=i32::MAX`、ino は非 0 で互いに異なり、dev は 3 つで一致すること（nsfs は 1 つの
+    /// 検証つきで作る。pid は `1..=i32::MAX`、ino は非 0 で互いに異なり、dev は 4 つで一致すること（nsfs は 1 つの
     /// superblock）。満たさなければ `FailedPrecondition`。
-    pub fn new(pid: u32, user: NsId, ipc: NsId, net: NsId) -> Result<Self, TraitError> {
+    pub fn new(pid: u32, user: NsId, ipc: NsId, net: NsId, mnt: NsId) -> Result<Self, TraitError> {
         let pid_ok = (1..=i32::MAX as u32).contains(&pid);
-        let ino_ok = user.ino != 0
-            && ipc.ino != 0
-            && net.ino != 0
-            && user.ino != ipc.ino
-            && user.ino != net.ino
-            && ipc.ino != net.ino;
-        let dev_ok = user.dev == ipc.dev && user.dev == net.dev;
+        let all = [user, ipc, net, mnt];
+        let ino_ok = all.iter().all(|n| n.ino != 0)
+            && all
+                .iter()
+                .enumerate()
+                .all(|(i, a)| all.iter().skip(i + 1).all(|b| a.ino != b.ino));
+        let dev_ok = all.iter().all(|n| n.dev == user.dev);
         if !(pid_ok && ino_ok && dev_ok) {
             return Err(bad("pod holder READY contents are inconsistent"));
         }
@@ -60,6 +65,7 @@ impl PodHolderReady {
             user,
             ipc,
             net,
+            mnt,
         })
     }
 
@@ -81,6 +87,11 @@ impl PodHolderReady {
     /// pod の net namespace。
     pub fn net(&self) -> NsId {
         self.net
+    }
+
+    /// pod の mount namespace（#4808）。
+    pub fn mnt(&self) -> NsId {
+        self.mnt
     }
 }
 
@@ -156,6 +167,8 @@ impl PodHolderFrame {
         put(&mut f.0, 40, r.ipc.ino);
         put(&mut f.0, 48, r.net.dev);
         put(&mut f.0, 56, r.net.ino);
+        put(&mut f.0, 64, r.mnt.dev);
+        put(&mut f.0, 72, r.mnt.ino);
         f
     }
 
@@ -213,10 +226,11 @@ impl PodHolderFrame {
                     ns(16)?,
                     ns(32)?,
                     ns(48)?,
+                    ns(64)?,
                 )?))
             }
             Some(KIND_ERROR) => {
-                for at in [16, 24, 32, 40, 48, 56] {
+                for at in [16, 24, 32, 40, 48, 56, 64, 72] {
                     if word(at)? != 0 {
                         return Err(bad("pod holder ERROR frame has non-zero unused fields"));
                     }
@@ -242,7 +256,7 @@ mod tests {
     }
 
     fn sample() -> PodHolderReady {
-        PodHolderReady::new(4242, ns(1), ns(2), ns(3)).unwrap()
+        PodHolderReady::new(4242, ns(1), ns(2), ns(3), ns(4)).unwrap()
     }
 
     /// CRI-2・SEC-5・#2874: READY の往復とワイヤーのレイアウト（具体値）。
@@ -251,12 +265,19 @@ mod tests {
         let f = PodHolderFrame::ready(&sample());
         let b = f.as_bytes();
         assert_eq!(&b[0..4], b"FCPH");
-        assert_eq!((b[4], b[5], b[6], b[7]), (1, 1, 0, 0));
+        assert_eq!(b.len(), 80);
+        assert_eq!((b[4], b[5], b[6], b[7]), (2, 1, 0, 0));
         assert_eq!(u64::from_le_bytes(b[8..16].try_into().unwrap()), 4242);
         assert_eq!(
             u64::from_le_bytes(b[24..32].try_into().unwrap()),
             0xF000_0001
         );
+        assert_eq!(u64::from_le_bytes(b[64..72].try_into().unwrap()), 4);
+        assert_eq!(
+            u64::from_le_bytes(b[72..80].try_into().unwrap()),
+            0xF000_0004
+        );
+        assert_eq!(sample().mnt(), ns(4));
         assert_eq!(
             PodHolderFrame::decode(b).unwrap(),
             PodHolderMessage::Ready(sample())
@@ -286,7 +307,8 @@ mod tests {
     #[test]
     fn cri2_pod_holder_decode_rejects_malformed_frames() {
         let good = *PodHolderFrame::ready(&sample()).as_bytes();
-        assert!(PodHolderFrame::decode(&good[..63]).is_err());
+        assert!(PodHolderFrame::decode(&good[..79]).is_err());
+        assert!(PodHolderFrame::decode(&good[..64]).is_err());
         let mut long = good.to_vec();
         long.push(0);
         assert!(PodHolderFrame::decode(&long).is_err());
@@ -295,7 +317,7 @@ mod tests {
             b[at] = v;
             PodHolderFrame::decode(&b)
         };
-        for (at, v) in [(0, b'X'), (4, 2), (5, 9), (6, 1), (7, 1)] {
+        for (at, v) in [(0, b'X'), (4, 1), (4, 3), (5, 9), (6, 1), (7, 1)] {
             let e = mutate(at, v).unwrap_err();
             assert_eq!(e.code(), ErrorCode::FailedPrecondition, "at {at}");
         }
@@ -311,10 +333,16 @@ mod tests {
         assert!(set(24, 0).is_err());
         assert!(set(40, 0xF000_0001).is_err());
         assert!(set(32, 5).is_err());
+        // mnt の ino 0・他と重複・dev 不一致。
+        assert!(set(72, 0).is_err());
+        assert!(set(72, 0xF000_0003).is_err());
+        assert!(set(64, 5).is_err());
         // ERROR: 使わない欄が非 0、未知コード。
-        let mut e = *PodHolderFrame::error(ErrorCode::Timeout).as_bytes();
-        e[16] = 1;
-        assert!(PodHolderFrame::decode(&e).is_err());
+        for at in [16, 72] {
+            let mut e = *PodHolderFrame::error(ErrorCode::Timeout).as_bytes();
+            e[at] = 1;
+            assert!(PodHolderFrame::decode(&e).is_err(), "at {at}");
+        }
         let mut e = *PodHolderFrame::error(ErrorCode::Timeout).as_bytes();
         e[8..16].copy_from_slice(&99u64.to_le_bytes());
         assert!(PodHolderFrame::decode(&e).is_err());

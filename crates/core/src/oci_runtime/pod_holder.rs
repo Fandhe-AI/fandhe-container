@@ -1,5 +1,5 @@
-//! pod の保持役が、pod で共有する user・ipc・net namespace を確立する公開 API(Linux 限定。
-//! CRI-2・CORE-3・SEC-5・NET-2。#2870。設計は #2838 と `docs/design/pod-namespace-holder.md`)。
+//! pod の保持役が、pod で共有する user・ipc・net・mount namespace を確立する公開 API(Linux 限定。
+//! CRI-2・CORE-3・SEC-5・NET-2。#2870・#4808。設計は #2838 と `docs/design/pod-namespace-holder.md`)。
 //!
 //! # 役割と呼び出し元
 //!
@@ -13,11 +13,19 @@
 //! # 手順(権限モデルの解決は launch と同じ `resolve_privilege` を使う)
 //!
 //! 1. 入口の検査(すべて副作用の前): 単一スレッド・`RootfulHostRoot` の拒否・入力元の整合
-//! 2. user(写像つき)→ ipc → net の順に作る。`RootlessSingleId` は `exec::isolate` の `unshare(2)` 1 回、
+//! 2. user(写像つき)→ ipc → net → mount の順に作る(mount は pod の userns が所有し、`/` は再帰 private。#4808)。`RootlessSingleId` は `exec::isolate` の `unshare(2)` 1 回、
 //!    `RootlessSubordinateIds` は `exec::isolate_rootless_subordinate`(holder・mapper 経由。呼び出しプロセスは
 //!    dumpable にならない。#2374)
 //! 3. `/proc/self/{uid,gid}_map` を読み戻し、計画と **完全一致** することを照合する(不一致は成功値を返さない)
-//! 4. ipc・net の所有者が新しい user namespace であることを fd で照合し、各 namespace の素性を報告する
+//! 4. ipc・net・mount の所有者が新しい user namespace であることを fd で照合し(`NS_GET_USERNS`)、各 namespace の
+//!    素性を報告する
+//!
+//! # pod-init の空の root(#4808。O2)
+//!
+//! [`create_pod_root`] は、呼び出しプロセスの mount namespace に接続しない tmpfs(`nosuid,nodev,noexec`・空)を作り、
+//! fd で返す([`PodRoot`])。保持役は段 1 で確立した後に自分を再 exec して継承した fd を閉じるため、段 2 で
+//! capability を落とす前に呼んで持ち続ける。pod-init(P5)はこのマウントへ移って `pivot_root` する前提で、保持役
+//! 自身の root は変わらない(マウントを木に付けないため。mount namespace は確立時の private な複製のまま)。
 //!
 //! # 契約(呼び出し側の義務)
 //!
@@ -90,6 +98,7 @@ pub struct PodHolderNamespaces {
     user: NamespaceIdentity,
     ipc: NamespaceIdentity,
     net: NamespaceIdentity,
+    mnt: NamespaceIdentity,
 }
 
 impl PodHolderNamespaces {
@@ -121,6 +130,11 @@ impl PodHolderNamespaces {
     /// 新しい net namespace の素性(所有者は [`Self::user`])。
     pub fn net(&self) -> NamespaceIdentity {
         self.net
+    }
+
+    /// 新しい mount namespace の素性(所有者は [`Self::user`]。`/` は再帰 private。#4808)。
+    pub fn mnt(&self) -> NamespaceIdentity {
+        self.mnt
     }
 
     /// `lo` が up か。作成直後に up にできなければ確立自体が失敗するため、成功値では常に `true`(NET-2)。
@@ -222,7 +236,8 @@ pub fn establish_pod_namespaces(
         namespaces: NamespaceSet::empty()
             .with(Namespace::User)
             .with(Namespace::Ipc)
-            .with(Namespace::Net),
+            .with(Namespace::Net)
+            .with(Namespace::Mount),
         hostname: None,
     };
     let (expected_uid, expected_gid) = expected_id_maps(euid, egid, subordinate.as_ref());
@@ -261,11 +276,12 @@ pub fn establish_pod_namespaces(
     let user = open_self_ns(c"/proc/self/ns/user")?;
     let ipc = open_self_ns(c"/proc/self/ns/ipc")?;
     let net = open_self_ns(c"/proc/self/ns/net")?;
+    let mnt = open_self_ns(c"/proc/self/ns/mnt")?;
     let user_id = identity(user.as_fd())?;
     if user_id == before_user {
         return Err(TraitError::new(ErrorCode::PermissionDenied, MSG_NOT_NEW));
     }
-    for fd in [&ipc, &net] {
+    for fd in [&ipc, &net, &mnt] {
         let owner = sys::ns_owner_userns(fd.as_fd()).map_err(|e| match e {
             sys::SysError::Os(errno) if errno == sys::EPERM => {
                 TraitError::new(ErrorCode::PermissionDenied, MSG_NOT_OWNED)
@@ -284,7 +300,88 @@ pub fn establish_pod_namespaces(
         user: ident(user_id),
         ipc: ident(identity(ipc.as_fd())?),
         net: ident(identity(net.as_fd())?),
+        mnt: ident(identity(mnt.as_fd())?),
     })
+}
+
+const MSG_ROOT_CREATE: &str = "failed to create the pod root";
+const MSG_ROOT_ATTRS: &str = "the pod root does not have the expected mount attributes";
+const MSG_ROOT_NOT_EMPTY: &str = "the pod root is not empty";
+
+/// pod-init が動く空の root(切り離した tmpfs のマウントの fd。#4808)。drop で閉じるとカーネルがマウントを破棄する。
+#[derive(Debug)]
+pub struct PodRoot {
+    fd: std::os::fd::OwnedFd,
+}
+
+/// [`PodRoot`] のマウントの属性(`fstatfs` の `f_flags` を読み直した値)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PodRootAttrs {
+    /// `nosuid`。
+    pub nosuid: bool,
+    /// `nodev`。
+    pub nodev: bool,
+    /// `noexec`。
+    pub noexec: bool,
+}
+
+impl PodRoot {
+    /// マウントのルートを指す fd(close-on-exec)。
+    pub fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+
+    /// マウントの属性を読み直す。
+    pub fn attrs(&self) -> Result<PodRootAttrs, TraitError> {
+        let flags = sys::mount_flags(self.fd.as_fd())
+            .map_err(|_| TraitError::new(ErrorCode::Internal, MSG_INSPECT))?;
+        if !flags.is_valid() {
+            return Err(TraitError::new(ErrorCode::Internal, MSG_INSPECT));
+        }
+        Ok(PodRootAttrs {
+            nosuid: flags.is_nosuid(),
+            nodev: flags.is_nodev(),
+            noexec: flags.is_noexec(),
+        })
+    }
+}
+
+/// pod-init の空の root を作る(`nosuid,nodev,noexec`・mode 0o755・64 KiB の tmpfs。どこにも接続しない。#4808)。
+///
+/// 呼び出しスレッドの mount namespace を所有する user namespace の `CAP_SYS_ADMIN` が要る(保持役は確立の後、
+/// capability を落とす前に呼ぶ)。作った直後に属性(3 つとも付く)と中身(0 件)を確かめ、合わなければ返さない
+/// (fail-closed)。
+pub fn create_pod_root() -> Result<PodRoot, TraitError> {
+    let fd = sys::new_detached_tmpfs(sys::PodRootTmpfsCreate::new()).map_err(|e| match e {
+        sys::SysError::Os(errno) if errno == sys::EPERM => {
+            TraitError::new(ErrorCode::PermissionDenied, MSG_DENIED)
+        }
+        sys::SysError::Unsupported => TraitError::new(ErrorCode::Unimplemented, MSG_ROOT_CREATE),
+        _ => TraitError::new(ErrorCode::Internal, MSG_ROOT_CREATE),
+    })?;
+    let root = PodRoot { fd };
+    let attrs = root.attrs()?;
+    if !(attrs.nosuid && attrs.nodev && attrs.noexec) {
+        return Err(TraitError::new(ErrorCode::Internal, MSG_ROOT_ATTRS));
+    }
+    if root_entry_count(&root)? != 0 {
+        return Err(TraitError::new(ErrorCode::Internal, MSG_ROOT_NOT_EMPTY));
+    }
+    Ok(root)
+}
+
+/// root の直下のエントリ数(`.`・`..` を除く)。fd の magic link から開く(パスの再解決をしない)。
+pub fn root_entry_count(root: &PodRoot) -> Result<usize, TraitError> {
+    use std::os::fd::AsRawFd as _;
+    let dir = std::fs::read_dir(format!("/proc/self/fd/{}", root.fd.as_raw_fd()))
+        .map_err(|_| TraitError::new(ErrorCode::Internal, MSG_INSPECT))?;
+    let mut n = 0usize;
+    for entry in dir {
+        entry.map_err(|_| TraitError::new(ErrorCode::Internal, MSG_INSPECT))?;
+        n = n.saturating_add(1);
+    }
+    Ok(n)
 }
 
 /// 自プロセスの namespace を開く(固定の `/proc/self/ns/*` のみ。外部入力は使わない)。

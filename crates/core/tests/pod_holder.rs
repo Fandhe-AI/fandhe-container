@@ -9,7 +9,10 @@
 //! - (`subordinate` のみ)呼び出し前に `PR_SET_DUMPABLE=0` にし、呼び出し後も non-dumpable であること
 //!   (`single` は自プロセスの `/proc/self` へ写像を書くため事前に non-dumpable にしない。#2875)
 //! - 返った写像・実際の `/proc/self/{uid,gid}_map`・計画(`single` は `0 <euid> 1`)の 3 者が完全一致すること
-//! - user / ipc / net の素性が呼び出し前と異なり、報告の `(dev, ino)` が `/proc/self/ns/*` と一致すること
+//! - user / ipc / net / mnt の素性が呼び出し前と異なり、報告の `(dev, ino)` が `/proc/self/ns/*` と一致すること
+//!   （mnt は #4808。所有者が pod の userns であることは確立が `NS_GET_USERNS` で照合済みで、成功値はその証跡）
+//! - mount namespace の `/` が shared でない（`/proc/self/mountinfo` の `/` の行に `shared:` が無い。#4808）
+//! - pod-init の空の root（`create_pod_root`）が `nosuid,nodev,noexec` で、エントリが 0 件であること（#4808）
 //! - `lo` が up であること(自己宛ての UDP 送受信が通る。down なら `ENETUNREACH`)
 //! - 子プロセスが残っていないこと
 //! - root で実行した場合は確立を拒否すること(`single` の euid 0 は HostRootIdentityMapping)
@@ -54,7 +57,9 @@ mod linux {
     use fandhe_container_core::exec::{
         IdMapping, IsolationPrivilege, is_non_dumpable_for_test, set_non_dumpable_for_test,
     };
-    use fandhe_container_core::oci_runtime::{SubordinateIdSource, establish_pod_namespaces};
+    use fandhe_container_core::oci_runtime::{
+        SubordinateIdSource, create_pod_root, establish_pod_namespaces, root_entry_count,
+    };
     use fandhe_container_core::traits::ErrorCode;
 
     fn timeout() -> Duration {
@@ -189,6 +194,16 @@ mod linux {
         assert_eq!((n, buf[0]), (1, b'p'));
     }
 
+    /// `/` のマウントが shared でない（確立で再帰 private にした。#4808）。
+    fn assert_root_not_shared() {
+        let info = std::fs::read_to_string("/proc/self/mountinfo").expect("mountinfo");
+        let root = info
+            .lines()
+            .find(|l| l.split_whitespace().nth(4) == Some("/"))
+            .expect("root mount line");
+        assert!(!root.contains("shared:"), "root mount is shared: {root}");
+    }
+
     pub fn child() {
         let case = std::env::args()
             .skip_while(|a| a != "--child")
@@ -231,7 +246,8 @@ mod linux {
             return;
         }
 
-        let before = [ns_identity("user"), ns_identity("ipc"), ns_identity("net")];
+        let names = ["user", "ipc", "net", "mnt"];
+        let before = names.map(ns_identity);
         // single は自プロセスの /proc/self/{setgroups,uid_map,gid_map} へ書く。non-dumpable のプロセスの /proc/self は
         // root（init user namespace の kuid 0）所有になり、unshare 後の namespace では写像が無く書き込みが拒否される
         // ため、single では事前に non-dumpable にしない（実機の CI で PermissionDenied になった。#2875）。範囲写像は
@@ -269,7 +285,7 @@ mod linux {
         }
 
         // 素性: 呼び出し前と異なり、報告が実際の /proc/self/ns/* と一致する。
-        let after = [ns_identity("user"), ns_identity("ipc"), ns_identity("net")];
+        let after = names.map(ns_identity);
         for (b, a) in before.iter().zip(after.iter()) {
             assert_ne!(b, a, "a namespace was not created");
         }
@@ -278,6 +294,18 @@ mod linux {
         assert_eq!(reported(got.user()), after[0]);
         assert_eq!(reported(got.ipc()), after[1]);
         assert_eq!(reported(got.net()), after[2]);
+        assert_eq!(reported(got.mnt()), after[3]);
+        assert_root_not_shared();
+
+        // pod-init の空の root（#4808）。属性は 3 つとも付き、中身は 0 件。
+        let root = create_pod_root().expect("create the pod root");
+        let attrs = root.attrs().expect("pod root attrs");
+        assert_eq!(
+            (attrs.nosuid, attrs.nodev, attrs.noexec),
+            (true, true, true)
+        );
+        assert_eq!(root_entry_count(&root).expect("entries"), 0);
+        drop(root);
         assert_eq!(got.privilege(), privilege);
         assert!(got.loopback_up());
 

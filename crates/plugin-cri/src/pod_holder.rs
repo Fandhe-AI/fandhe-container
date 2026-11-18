@@ -388,7 +388,8 @@ impl ProductionPodHolder {
         holder_from_ready(ready, start)
     }
 
-    /// READY の pid が spawn した子と一致し、`/proc/<pid>/ns/{user,ipc,net}` の素性が READY と一致することを確かめる。
+    /// READY の pid が spawn した子と一致し、`/proc/<pid>/ns/{user,ipc,net,mnt}` の素性が READY と一致することを確かめる
+    /// （mnt は #4808）。
     /// この stat は ptrace のアクセス検査を通るため、再 exec で non-dumpable を保つ前提の直接の確認にもなる。
     fn verify_ready(&self, child: &Child, ready: &PodHolderReady) -> Result<(), TraitError> {
         if ready.pid() != child.id() {
@@ -404,6 +405,7 @@ impl ProductionPodHolder {
             ("user", ready.user()),
             ("ipc", ready.ipc()),
             ("net", ready.net()),
+            ("mnt", ready.mnt()),
         ] {
             let path = format!("/proc/{}/ns/{name}", ready.pid());
             let got = std::fs::metadata(path)

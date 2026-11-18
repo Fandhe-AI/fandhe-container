@@ -153,7 +153,8 @@ mod linux {
             .spawn(&req("sb-a"))
             .unwrap_or_else(|e| fail(&format!("spawn a: {e}")));
         let a_pid = a.pid().get();
-        for name in ["user", "ipc", "net"] {
+        // mnt は #4808 で保持役が pod の userns の中で作るようになった。
+        for name in ["user", "ipc", "net", "mnt"] {
             if ns_id(Some(a_pid), name) == ns_id(None, name) {
                 fail(&format!(
                     "holder shares the {name} namespace with the plugin"

@@ -69,8 +69,9 @@
 //! - pid の path は受けて `setns(pid)` まで行う（#4809）が、`setns(pid)` は以後に fork した子にだけ効き、その子は
 //!   参加先の PID 1 ではない。init の mount 分離の証跡は「joined pid ns の init」の種別で、pin 時に取った pid ns の
 //!   素性（`pid_identity`）との一致を PID 1 の代わりに求める（`exec::check_establish_preconditions`・#4812）。exec・
-//!   healthcheck の対象の固定（`Pid1Target`）と reapply は PID 1 を前提にしたままで、縮退経路の拒否（#4813）が入るまで
-//!   pid を共有するコンテナへの exec は fail-closed に拒否される。cri は #4817 まで pid の path を出さない。
+//!   healthcheck の対象の固定（`Pid1Target`）は、launch の記録に残した同じ素性（`LaunchIsolationRecord::pod_pid_ns`）で
+//!   launch pidfd の経路でだけ対象を受け、記録 pid から開く縮退経路を拒否する（#4813）。reapply の pid ns の照合も記録した
+//!   素性で行う。cri は #4817 まで pid の path を出さない。
 //! - `/dev/shm`（POSIX shm）は共有されない（core がコンテナごとの tmpfs を載せる）。SysV IPC と POSIX mqueue が
 //!   共有される。
 //! - 周辺の未完: 保持役の素性の永続化と再起動後の再採用は #2940、rootless の本番 PodNetworkProvider（pasta）は #2879。

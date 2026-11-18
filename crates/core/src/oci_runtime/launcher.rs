@@ -1733,9 +1733,18 @@ impl Inner {
                     "cap-add exceeds the capabilities granted by config.json",
                 )
             })?;
-        let isolation_record = isolation_record
+        let mut isolation_record = isolation_record
             .with_capabilities(capabilities)
             .with_root_readonly(effective_root_readonly);
+        // pod の pid ns へ参加する起動は、その素性を記録に残す（exec の対象の固定が launch pidfd の経路でだけ照合する。
+        // #4813）。
+        if let Some((dev, ino)) = spec
+            .namespace_join()
+            .and_then(|join| join.pid_identity())
+            .map(|id| id.parts())
+        {
+            isolation_record = isolation_record.with_pod_pid_ns(dev, ino);
+        }
         let (uid, gid) = spec.user();
         // 補助グループの正規化(確保・整列・重複除去)は fork の前に済ませる(#2770)。
         let additional_gids =

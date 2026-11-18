@@ -377,6 +377,8 @@ pub struct Pid1Target {
     expected_cgroup_path: String,
     /// `open` で判定した user namespace の関係。[`join_namespaces`] が参加の直前に再照合し、参加する集合を決める。
     user_ns: UserNsRelation,
+    /// pod の pid ns を共有するコンテナのとき、launch で記録した pod の pid ns の素性（照合済み。#4813）。
+    pod_pid_ns: Option<NsIdentity>,
 }
 
 impl Pid1Target {
@@ -431,7 +433,14 @@ impl Pid1Target {
 
     /// 対象の PID namespace の識別子（nsfs の `st_dev`・`st_ino`）。参加後に子が入る PID namespace
     /// （`ns/pid_for_children`）との照合に使う（SUP-6・SEC-1・TASK-163.4）。読み取りの後に pidfd の未終了を確認する。
+    ///
+    /// pod の pid ns を共有するコンテナでは、launch で記録した素性（`open_with_launch_pidfd` が対象の実値と照合済み）を
+    /// 返す（#4813）。reapply の照合は記録した素性で行う。
     pub(super) fn pid_ns_identity(&self) -> Result<NsIdentity, ExecError> {
+        if let Some(recorded) = self.pod_pid_ns {
+            ensure_not_exited(self, "refusing to bind restrictions to it")?;
+            return Ok(recorded);
+        }
         let id = ns_identity(&format!("/proc/{}/ns/pid", self.pid))
             .map_err(|e| target_proc_error(&e, "read target PID namespace"))?;
         ensure_not_exited(self, "refusing to bind restrictions to it")?;
@@ -444,6 +453,10 @@ impl Pid1Target {
     /// ここで組み立てる（呼び出し側から文字列では受け取らない）。対象の所属 cgroup がこれと完全一致
     /// しなければ、pid が別コンテナに再利用されたものとして拒否する（SEC-1）。
     ///
+    /// `pod_pid_ns` は launch の記録（`LaunchIsolationRecord::pod_pid_ns`）。`Some`（pod の pid ns を共有するコンテナ）なら、
+    /// この縮退経路は副作用の前に `FailedPrecondition`（違反記録 `ExecTargetJoinedPidNamespaceRequiresLaunchPidfd`）で
+    /// 拒否する（O5。pid を共有すると PID 1 の検査で同一性を示せないため、launch pidfd の経路だけを受ける。#4813）。
+    ///
     /// 手順は順序固定: pidfd で固定 → `NSpid` が直接入れ子の PID 1 → 期待 cgroup に属する →
     /// 自分と同じ pid / mnt namespace でない → user namespace の関係を記録（別なら参加する対象にする）→ pidfd が未終了。対象が前提を満たさなければ
     /// `FailedPrecondition`（違反記録つき）、存在しない pid・検証中に消えた対象は `NotFound`、cgroup 名を
@@ -452,7 +465,14 @@ impl Pid1Target {
         pid: NonZeroU32,
         id: &ContainerId,
         placement: &CgroupPlacement,
+        pod_pid_ns: Option<(u64, u64)>,
     ) -> Result<Self, ExecError> {
+        if pod_pid_ns.is_some() {
+            return Err(ExecError::from_violation(
+                ViolationReason::ExecTargetJoinedPidNamespaceRequiresLaunchPidfd,
+                None,
+            ));
+        }
         let name = CgroupName::for_instance(id, placement.instance()).map_err(|_| {
             ExecError::new(
                 ErrorCode::InvalidArgument,
@@ -488,7 +508,7 @@ impl Pid1Target {
         }
         verify_procfs_pid_ns()?;
         let pidfd = sys::pidfd_open(pid.get()).map_err(|e| setns_error(e, "pidfd_open"))?;
-        Self::verify_pinned(pid, pidfd, expected_cgroup_path)
+        Self::verify_pinned(pid, pidfd, expected_cgroup_path, None)
     }
 
     /// supervisor が起動時（fork 直後・回収前）から保持する pidfd で対象を固定して検証する（SUP-6・SEC-1・
@@ -503,11 +523,16 @@ impl Pid1Target {
     /// 同じ順序で行い、期待 cgroup の照合は同一性の根拠ではなく多層防御として残す。
     ///
     /// `pidfd` の所有権を受け取る（呼び出し側が保持する pidfd は複製して渡す）。
+    ///
+    /// `pod_pid_ns` は launch の記録（`LaunchIsolationRecord::pod_pid_ns`）。`Some` なら pod の pid ns を共有するコンテナ
+    /// として、`NSpid` が直接入れ子の PID 1 であることの代わりに、対象の `/proc/<pid>/ns/pid` の素性がこの値と一致する
+    /// ことを求める（不一致は違反記録 `ExecTargetJoinedPidNamespaceMismatch`。CRI-2・SEC-1・SEC-4・#4813）。
     pub fn open_with_launch_pidfd(
         pidfd: OwnedFd,
         recorded_pid: NonZeroU32,
         id: &ContainerId,
         placement: &CgroupPlacement,
+        pod_pid_ns: Option<(u64, u64)>,
     ) -> Result<Self, ExecError> {
         let name = CgroupName::for_instance(id, placement.instance()).map_err(|_| {
             ExecError::new(
@@ -571,7 +596,7 @@ impl Pid1Target {
                 "the process held by the launch pidfd has already exited",
             ));
         }
-        Self::verify_pinned(recorded_pid, pidfd, expected_cgroup_path)
+        Self::verify_pinned(recorded_pid, pidfd, expected_cgroup_path, pod_pid_ns)
     }
 
     /// pidfd で固定済みの `pid` を検証して対象にする共通の後段（[`Self::open`]・
@@ -580,15 +605,31 @@ impl Pid1Target {
         pid: NonZeroU32,
         pidfd: OwnedFd,
         expected_cgroup_path: String,
+        pod_pid_ns: Option<NsIdentity>,
     ) -> Result<Self, ExecError> {
         let stage = IsolationStage::SetNs;
-        let status = read_bounded(&format!("/proc/{pid}/status"))
-            .map_err(|e| target_proc_error(&e, "read target status"))?;
-        if !nspid_is_nested_pid1(&status) {
-            return Err(ExecError::from_violation(
-                ViolationReason::ExecTargetNotNestedPid1,
-                None,
-            ));
+        match pod_pid_ns {
+            // pod の pid ns を共有するコンテナの init は PID 1 でない。launch で記録した素性で同一性を示す（#4813）。
+            Some(recorded) => {
+                let actual = ns_identity(&format!("/proc/{pid}/ns/pid"))
+                    .map_err(|e| target_proc_error(&e, "read target PID namespace"))?;
+                if actual != recorded {
+                    return Err(ExecError::from_violation(
+                        ViolationReason::ExecTargetJoinedPidNamespaceMismatch,
+                        None,
+                    ));
+                }
+            }
+            None => {
+                let status = read_bounded(&format!("/proc/{pid}/status"))
+                    .map_err(|e| target_proc_error(&e, "read target status"))?;
+                if !nspid_is_nested_pid1(&status) {
+                    return Err(ExecError::from_violation(
+                        ViolationReason::ExecTargetNotNestedPid1,
+                        None,
+                    ));
+                }
+            }
         }
         verify_cgroup_membership(pid, &expected_cgroup_path)?;
         let mut identities = Vec::with_capacity(CALLER_DISTINCT.len());
@@ -608,6 +649,7 @@ impl Pid1Target {
             pidfd,
             expected_cgroup_path,
             user_ns,
+            pod_pid_ns,
         };
         // 終了後は pid が再利用され得るため、`/proc` の検証結果が pidfd の指すプロセスのものである
         // ことを、未終了の確認で保証する。
@@ -1326,7 +1368,7 @@ mod tests {
     #[test]
     fn sup6_open_rejects_self_with_violation() {
         let id = ContainerId::new("x").unwrap();
-        let err = Pid1Target::open(me(), &id, &placement("/", 1)).unwrap_err();
+        let err = Pid1Target::open(me(), &id, &placement("/", 1), None).unwrap_err();
         assert_eq!(err.code, ErrorCode::FailedPrecondition);
         assert_eq!(err.stage, IsolationStage::SetNs);
         assert_eq!(
@@ -1379,8 +1421,8 @@ mod tests {
             .expect("pidfd_open は Linux 5.3 以降が前提（pidfd 非対応環境では失敗させる）");
         let id = ContainerId::new("x").unwrap();
         let other = NonZeroU32::new(child.id() + 1).unwrap();
-        let err =
-            Pid1Target::open_with_launch_pidfd(pidfd, other, &id, &placement("/", 1)).unwrap_err();
+        let err = Pid1Target::open_with_launch_pidfd(pidfd, other, &id, &placement("/", 1), None)
+            .unwrap_err();
         let _ = child.kill();
         let _ = child.wait();
         assert_eq!(err.code, ErrorCode::FailedPrecondition);
@@ -1399,8 +1441,8 @@ mod tests {
             .expect("pidfd_open は Linux 5.3 以降が前提（pidfd 非対応環境では失敗させる）");
         let id = ContainerId::new("x").unwrap();
         let pid = NonZeroU32::new(child.id()).unwrap();
-        let err =
-            Pid1Target::open_with_launch_pidfd(pidfd, pid, &id, &placement("/", 1)).unwrap_err();
+        let err = Pid1Target::open_with_launch_pidfd(pidfd, pid, &id, &placement("/", 1), None)
+            .unwrap_err();
         let _ = child.kill();
         let _ = child.wait();
         let v = err.violation.expect("violation");
@@ -1408,14 +1450,101 @@ mod tests {
         assert_eq!(v.reason.as_str(), "exec_target_not_nested_pid1");
     }
 
+    /// CRI-2・SEC-1・SEC-4・#4813: pod の pid ns を共有するコンテナ（記録に素性がある）は、記録 pid から開く縮退経路を
+    /// 副作用の前に固定の違反で拒否する（pidfd を開かないので、存在しない pid でも同じ結果）。
+    #[test]
+    fn cri2_4813_degraded_open_is_refused_for_joined_pid_ns() {
+        let id = ContainerId::new("x").unwrap();
+        for pid in [me(), NonZeroU32::new(i32::MAX as u32).unwrap()] {
+            let err = Pid1Target::open(pid, &id, &placement("/", 1), Some((4, 4_026_532_777)))
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::FailedPrecondition);
+            assert_eq!(
+                err.message,
+                "exec into a container sharing the pod PID namespace requires the launch pidfd"
+            );
+            let v = err.violation.expect("violation");
+            assert_eq!(v.kind, ViolationKind::ExecTarget);
+            assert_eq!(
+                v.reason,
+                ViolationReason::ExecTargetJoinedPidNamespaceRequiresLaunchPidfd
+            );
+            assert_eq!(
+                v.reason.as_str(),
+                "exec_target_joined_pid_namespace_requires_launch_pidfd"
+            );
+        }
+    }
+
+    /// CRI-2・SEC-1・SEC-4・#4813: launch pidfd の経路では、PID 1 の検査の代わりに対象の pid ns が記録の素性と一致する
+    /// ことを求める。不一致は `exec_target_joined_pid_namespace_mismatch`。一致すれば次段（cgroup の所属）へ進む。
+    #[test]
+    fn cri2_4813_launch_pidfd_checks_recorded_pod_pid_ns() {
+        use std::os::unix::fs::MetadataExt as _;
+        let id = ContainerId::new("x").unwrap();
+        let mut child = spawn_sleeper();
+        let pid = NonZeroU32::new(child.id()).unwrap();
+        let actual = std::fs::metadata(format!("/proc/{pid}/ns/pid")).unwrap();
+        let open = |recorded| {
+            let pidfd = sys::pidfd_open(pid.get())
+                .expect("pidfd_open は Linux 5.3 以降が前提（pidfd 非対応環境では失敗させる）");
+            Pid1Target::open_with_launch_pidfd(pidfd, pid, &id, &placement("/", 1), Some(recorded))
+                .unwrap_err()
+        };
+        let mismatch = open((actual.dev(), actual.ino() + 1));
+        let matched = open((actual.dev(), actual.ino()));
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(mismatch.code, ErrorCode::FailedPrecondition);
+        let v = mismatch.violation.expect("violation");
+        assert_eq!(
+            v.reason,
+            ViolationReason::ExecTargetJoinedPidNamespaceMismatch
+        );
+        assert_eq!(
+            v.reason.as_str(),
+            "exec_target_joined_pid_namespace_mismatch"
+        );
+        assert_eq!(
+            v.reason.message(),
+            "the PID namespace of the exec target is not the pod PID namespace recorded at launch"
+        );
+        // 素性が一致すると PID 1 の検査（`exec_target_not_nested_pid1`）を通らず、cgroup の所属の検査で止まる。
+        let reason = matched.violation.map(|v| v.reason);
+        assert_ne!(reason, Some(ViolationReason::ExecTargetNotNestedPid1));
+        assert_ne!(
+            reason,
+            Some(ViolationReason::ExecTargetJoinedPidNamespaceMismatch)
+        );
+        assert_eq!(reason, Some(ViolationReason::ExecTargetCgroupMismatch));
+    }
+
+    /// CRI-2・SEC-1・#4813: 記録の素性を持つ対象の pid ns の識別子は、記録の値（reapply の照合に使う）。
+    #[test]
+    fn cri2_4813_pid_ns_identity_uses_recorded_value() {
+        let target = Pid1Target {
+            pid: me(),
+            pidfd: sys::pidfd_open(me().get()).expect("pidfd_open"),
+            expected_cgroup_path: "/x".to_owned(),
+            pod_pid_ns: Some((4, 4_026_532_777)),
+            user_ns: own_shared(),
+        };
+        assert_eq!(target.pid_ns_identity().unwrap(), (4, 4_026_532_777));
+    }
+
     /// SUP-6（#1461）: pidfd でない fd は `InvalidArgument`（違反記録なし）。
     #[test]
     fn sup6_launch_pidfd_rejects_non_pidfd() {
         let file = std::fs::File::open("/proc/self/status").unwrap();
         let id = ContainerId::new("x").unwrap();
-        let err =
-            Pid1Target::open_with_launch_pidfd(OwnedFd::from(file), me(), &id, &placement("/", 1))
-                .unwrap_err();
+        let err = Pid1Target::open_with_launch_pidfd(
+            OwnedFd::from(file),
+            me(),
+            &id,
+            &placement("/", 1),
+            None,
+        )
+        .unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidArgument);
         assert_eq!(err.message, "the given descriptor is not a pidfd");
         assert!(err.violation.is_none());
@@ -1431,8 +1560,8 @@ mod tests {
         child.kill().unwrap();
         child.wait().unwrap();
         let id = ContainerId::new("x").unwrap();
-        let err =
-            Pid1Target::open_with_launch_pidfd(pidfd, pid, &id, &placement("/", 1)).unwrap_err();
+        let err = Pid1Target::open_with_launch_pidfd(pidfd, pid, &id, &placement("/", 1), None)
+            .unwrap_err();
         assert_eq!(err.code, ErrorCode::FailedPrecondition);
         assert_eq!(
             err.message,
@@ -1445,8 +1574,13 @@ mod tests {
     #[test]
     fn sup6_open_missing_pid_is_not_found() {
         let id = ContainerId::new("x").unwrap();
-        let err = Pid1Target::open(NonZeroU32::new(4_194_305).unwrap(), &id, &placement("/", 1))
-            .unwrap_err();
+        let err = Pid1Target::open(
+            NonZeroU32::new(4_194_305).unwrap(),
+            &id,
+            &placement("/", 1),
+            None,
+        )
+        .unwrap_err();
         assert_eq!(err.code, ErrorCode::NotFound);
         assert_eq!(err.stage, IsolationStage::SetNs);
         assert_eq!(err.violation, None);
@@ -1581,6 +1715,7 @@ mod tests {
             pid: me(),
             pidfd: sys::pidfd_open(me().get()).unwrap(),
             expected_cgroup_path: "/fc-x@1".to_owned(),
+            pod_pid_ns: None,
             user_ns: own_shared(),
         };
         match target.user_id_maps() {
@@ -1760,6 +1895,7 @@ mod tests {
             pid: me(),
             pidfd: sys::pidfd_open(me().get()).unwrap(),
             expected_cgroup_path: "/fc-x@1".to_owned(),
+            pod_pid_ns: None,
             user_ns: own_shared(),
         };
         recheck_user_namespace(&target).expect("recheck passes for the caller's own namespace");
@@ -1768,6 +1904,7 @@ mod tests {
             pid: me(),
             pidfd: sys::pidfd_open(me().get()).unwrap(),
             expected_cgroup_path: "/fc-x@1".to_owned(),
+            pod_pid_ns: None,
             user_ns: UserNsRelation::Distinct {
                 target: (1, 1),
                 own,
@@ -1789,6 +1926,7 @@ mod tests {
             pid: me(),
             pidfd: sys::pidfd_open(me().get()).unwrap(),
             expected_cgroup_path: "/fc-x@1".to_owned(),
+            pod_pid_ns: None,
             user_ns: own_shared(),
         };
         // 別スレッドを生かしたまま呼び、Threads が 2 以上になる状態を作る。
@@ -1818,6 +1956,7 @@ mod tests {
             pid: me(),
             pidfd: sys::pidfd_open(me().get()).unwrap(),
             expected_cgroup_path: path.to_owned(),
+            pod_pid_ns: None,
             user_ns: own_shared(),
         };
         assert_eq!(
@@ -1873,6 +2012,7 @@ mod tests {
             pid: NonZeroU32::new(pid).unwrap(),
             pidfd,
             expected_cgroup_path: "/fc-x@1".to_owned(),
+            pod_pid_ns: None,
             user_ns: own_shared(),
         };
         let err = join_namespaces(&target).unwrap_err();

@@ -546,7 +546,7 @@ mod tests {
             crate::traits::StateRevision::from_raw(1),
         );
         let me = NonZeroU32::new(std::process::id()).unwrap();
-        let err = Pid1Target::open(me, &id, &placement).unwrap_err();
+        let err = Pid1Target::open(me, &id, &placement, None).unwrap_err();
         assert_eq!(err.stage, IsolationStage::SetNs);
     }
 

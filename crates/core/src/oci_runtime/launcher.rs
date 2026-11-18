@@ -1722,10 +1722,17 @@ impl Inner {
         // `process.capabilities` の drop を解釈した許可集合（OCI 既定の部分集合）。launch の削減段へ渡し、同じ値を
         // 分離の記録へ添えて exec の再適用が launch より広い集合を与えないようにする(SEC-1・CRI-2・#2666)。
         // 起動オプションの `--cap-drop` はここで重ねる(CLI-1・#2775)。狭めた同じ値を段と記録の両方へ渡す。
-        let capabilities = spec
-            .config()
-            .capabilities()
-            .without(options.capability_drop());
+        // `--cap-add` は drop の後に config.json 由来の集合の中でだけ戻す(超える要素は拒否。CLI-1・SEC-1・#4794)。
+        let base = spec.config().capabilities();
+        let capabilities = base
+            .without(options.capability_drop())
+            .readd_within(options.capability_add(), base)
+            .map_err(|_| {
+                TraitError::new(
+                    ErrorCode::PermissionDenied,
+                    "cap-add exceeds the capabilities granted by config.json",
+                )
+            })?;
         let isolation_record = isolation_record
             .with_capabilities(capabilities)
             .with_root_readonly(effective_root_readonly);
@@ -4882,6 +4889,31 @@ mod tests {
         assert!(!caps.bounding().contains(Capability::Chown));
         assert!(!caps.bounding().contains(Capability::NetRaw));
         assert!(caps.bounding().contains(Capability::Kill));
+        p.terminate(Duration::from_secs(5)).expect("terminate");
+    }
+
+    /// CLI-1・SEC-1(#4794): `--cap-drop ALL --cap-add NET_BIND_SERVICE` は分離の記録に 1 個だけを残す。
+    #[test]
+    fn cli1_sec1_4794_cap_add_readds_after_drop_in_the_record() {
+        use crate::capabilities::{Capability, parse_drop_list};
+        let spec = spec_for("opts-capadd", serde_json::json!({}));
+        let ops = FakeOps::new(&events());
+        let mut l = launcher(ops, rootless(), None);
+        let base = options_with(&[], true, &[], LaunchIpcMode::Private);
+        l.inner.launch_options = Some(
+            base.with_capability_drop(parse_drop_list(&["ALL"]).expect("drop"))
+                .with_capability_add(parse_drop_list(&["NET_BIND_SERVICE"]).expect("add")),
+        );
+        let p = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+        let caps = p
+            .launch_isolation()
+            .expect("record")
+            .capabilities()
+            .expect("capabilities recorded");
+        assert_eq!(
+            caps.iter().collect::<Vec<_>>(),
+            vec![Capability::NetBindService]
+        );
         p.terminate(Duration::from_secs(5)).expect("terminate");
     }
 

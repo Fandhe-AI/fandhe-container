@@ -48,6 +48,8 @@
 //! `CapPrm`・`CapEff`・`CapBnd` が OCI 既定から NET_RAW（bit 13）だけ落ちた `00000000a80405fb`、`CapInh`・`CapAmb` が 0 であることを照合し、
 //! `inspect` の `capabilities.bounding` が NET_RAW を除いた 13 個であることも照合する（コンテナ内とホストの 2 つの視点）。
 //! 2 つ目のコンテナは `--cap-drop ALL` で短い一連（create → start → 観測 → stop → delete）を通し、5 集合すべてが 0・`bounding` が `[]` であることを照合する。
+//! 同じ一連を `--cap-drop ALL --cap-add NET_BIND_SERVICE` でも通し、`CapPrm`・`CapEff`・`CapBnd` が NET_BIND_SERVICE（bit 10）だけ・
+//! `bounding` が `["CAP_NET_BIND_SERVICE"]` だけであることを照合する（CLI-1・SEC-1・#4794）。
 //! `production_launcher` のシナリオ T は config の `process.capabilities` を直接書く経路で、本節は CLI の `create --cap-drop` → `start` 経路の担当（分担）。
 //!
 //! # create の `--read-only` の観測（#2828・CLI-1・SUP-12・CORE-5）
@@ -187,6 +189,13 @@ mod linux {
     const NET_RAW_DROPPED_INSPECT: &str = "\"capabilities\":{\"bounding\":[\"CAP_CHOWN\",\"CAP_DAC_OVERRIDE\",\"CAP_FOWNER\",\"CAP_FSETID\",\"CAP_KILL\",\"CAP_SETGID\",\"CAP_SETUID\",\"CAP_SETPCAP\",\"CAP_NET_BIND_SERVICE\",\"CAP_SYS_CHROOT\",\"CAP_MKNOD\",\"CAP_AUDIT_WRITE\",\"CAP_SETFCAP\"]}";
     /// `--cap-drop ALL` のときの `inspect` の `capabilities` の観測。
     const ALL_DROPPED_INSPECT: &str = "\"capabilities\":{\"bounding\":[]}";
+    /// `--cap-drop ALL` の後に戻す capability（#4794・SEC-1・CLI-1）。
+    const OPT_CAP_ADD: &str = "NET_BIND_SERVICE";
+    /// NET_BIND_SERVICE（bit 10）だけのマスク。
+    const NET_BIND_SERVICE_MASK: u64 = 1 << 10;
+    /// `--cap-drop ALL --cap-add NET_BIND_SERVICE` のときの `inspect` の `capabilities` の観測。
+    const NET_BIND_SERVICE_ONLY_INSPECT: &str =
+        "\"capabilities\":{\"bounding\":[\"CAP_NET_BIND_SERVICE\"]}";
     /// `create --read-only` のコンテナ内で、rootfs 直下への新規作成が返すべき errno(`EROFS` = 30。#2828)。
     /// mount の RDONLY が Landlock の拒否(`EACCES` = 13)より先に効くため 30 になる。13 や 0 は失敗として扱う。
     const OPT_ROOT_RO_LINE: &str = "stdout OPT_ROOT_RO 30";
@@ -301,6 +310,9 @@ mod linux {
                 );
                 println!(
                     "start_stop_delete_real: create --cap-drop ALL observed in the container: CapPrm=CapEff=CapBnd=CapInh=CapAmb=0000000000000000; inspect bounding is empty; stop recorded Stopped(43); delete left no state dir"
+                );
+                println!(
+                    "start_stop_delete_real: create --cap-drop ALL --cap-add NET_BIND_SERVICE observed in the container: CapPrm=CapEff=CapBnd=0000000000000400 CapInh=CapAmb=0000000000000000; inspect bounding lists only CAP_NET_BIND_SERVICE; stop recorded Stopped(43); delete left no state dir"
                 );
                 println!(
                     "start_stop_delete_real: state printed one-line OCI state JSON: created without pid, running with the list pid, stopped without pid after stop"
@@ -991,88 +1003,101 @@ mod linux {
             ));
         }
 
-        // 13. create --cap-drop ALL の短い一連（#2833・SEC-1・CLI-1）。guard は 1 つのまま id を差し替える。
-        let all_id_s = format!("ssd{}all", std::process::id());
-        cleanup.id = all_id_s.clone();
-        let out = run_cli(
-            &cli,
-            &[
-                "--root",
-                &root_s,
-                "create",
-                "--cap-drop",
-                "ALL",
-                "--bundle",
-                bundle_s,
-                &all_id_s,
-            ],
-            CLI_TIMEOUT,
-        )?;
-        expect_ok(&out, "create --cap-drop ALL")?;
-        cleanup.armed = true;
-        let out = run_cli(
-            &cli,
-            &["--root", &root_s, "start", &all_id_s],
-            START_TIMEOUT,
-        )?;
-        expect_ok(&out, "start (cap-drop ALL)")?;
-        let out = run_cli(&cli, &["--root", &root_s, "list"], CLI_TIMEOUT)?;
-        let all_pid = parse_running_list(&out, &all_id_s)?;
-        wait_sigterm_handler(all_pid, "SIGTERM handler registration (ALL)")?;
-        let mut last_logs = String::new();
-        wait_until(
-            STATE_TIMEOUT,
-            "logs to contain READY_TERM and zero OPT_CAP lines (ALL)",
-            || match run_cli(&cli, &["--root", &root_s, "logs", &all_id_s], CLI_TIMEOUT) {
-                Ok(o) if o.code == Some(0) => {
-                    let found = o.stdout.lines().any(|l| l == "stdout READY_TERM")
-                        && has_cap_lines(&o.stdout, 0);
-                    last_logs = o.stdout;
-                    found
-                }
-                Ok(o) => {
-                    last_logs = format!("exit {:?} stderr={:?}", o.code, o.stderr);
-                    false
-                }
-                Err(e) => {
-                    last_logs = e;
-                    false
-                }
-            },
-        )
-        .map_err(|e| format!("{e}; last logs: {last_logs:?}"))?;
-        check_host_caps(all_pid, 0)?;
-        check_inspect_caps(&cli, &root_s, &all_id_s, ALL_DROPPED_INSPECT)?;
-        let out = run_cli(&cli, &["--root", &root_s, "stop", &all_id_s], CLI_TIMEOUT)?;
-        expect_ok(&out, "stop (cap-drop ALL)")?;
-        let want = format!("ID\tSTATUS\tPID\n{all_id_s}\tstopped\t-\n");
-        wait_until(STATE_TIMEOUT, "list to report stopped (ALL)", || {
-            run_cli(&cli, &["--root", &root_s, "list"], CLI_TIMEOUT)
-                .is_ok_and(|o| o.code == Some(0) && o.stdout == want)
-        })?;
-        let all_cid = ContainerId::new(all_id_s.clone()).map_err(|e| format!("id (ALL): {e:?}"))?;
-        let store = open_store(&root)?;
-        let rec = get_record(&store, &all_cid)?;
-        if rec.status().exit_code() != Some(SIGTERM_HANDLER_EXIT_CODE_FOR_TEST) {
-            return Err(format!(
-                "exit code after stop (ALL): want {SIGTERM_HANDLER_EXIT_CODE_FOR_TEST}, got {:?}",
-                rec.status().exit_code()
-            ));
+        // 13. create --cap-drop ALL の短い一連（#2833・SEC-1・CLI-1）と、`--cap-add NET_BIND_SERVICE` で 1 個だけ戻す
+        // 一連（#4794・CLI-1・SEC-1）。guard は 1 つのまま id を差し替える。
+        let cap_cases: [(&str, &[&str], u64, &str); 2] = [
+            ("ALL", &["--cap-drop", "ALL"], 0, ALL_DROPPED_INSPECT),
+            (
+                "ADD",
+                &["--cap-drop", "ALL", "--cap-add", OPT_CAP_ADD],
+                NET_BIND_SERVICE_MASK,
+                NET_BIND_SERVICE_ONLY_INSPECT,
+            ),
+        ];
+        for (tag, cap_args, mask, inspect_want) in cap_cases {
+            let all_id_s = format!("ssd{}{}", std::process::id(), tag.to_ascii_lowercase());
+            cleanup.id = all_id_s.clone();
+            let mut create_args = vec!["--root", root_s.as_str(), "create"];
+            create_args.extend_from_slice(cap_args);
+            create_args.extend_from_slice(&["--bundle", bundle_s, all_id_s.as_str()]);
+            let out = run_cli(&cli, &create_args, CLI_TIMEOUT)?;
+            expect_ok(&out, &format!("create ({tag})"))?;
+            cleanup.armed = true;
+            let out = run_cli(
+                &cli,
+                &["--root", &root_s, "start", &all_id_s],
+                START_TIMEOUT,
+            )?;
+            expect_ok(&out, &format!("start ({tag})"))?;
+            let out = run_cli(&cli, &["--root", &root_s, "list"], CLI_TIMEOUT)?;
+            let all_pid = parse_running_list(&out, &all_id_s)?;
+            wait_sigterm_handler(all_pid, &format!("SIGTERM handler registration ({tag})"))?;
+            let mut last_logs = String::new();
+            wait_until(
+                STATE_TIMEOUT,
+                &format!("logs to contain READY_TERM and OPT_CAP lines ({tag})"),
+                || match run_cli(&cli, &["--root", &root_s, "logs", &all_id_s], CLI_TIMEOUT) {
+                    Ok(o) if o.code == Some(0) => {
+                        let found = o.stdout.lines().any(|l| l == "stdout READY_TERM")
+                            && has_cap_lines(&o.stdout, mask);
+                        last_logs = o.stdout;
+                        found
+                    }
+                    Ok(o) => {
+                        last_logs = format!("exit {:?} stderr={:?}", o.code, o.stderr);
+                        false
+                    }
+                    Err(e) => {
+                        last_logs = e;
+                        false
+                    }
+                },
+            )
+            .map_err(|e| format!("{e}; last logs: {last_logs:?}"))?;
+            check_host_caps(all_pid, mask)?;
+            check_inspect_caps(&cli, &root_s, &all_id_s, inspect_want)?;
+            let out = run_cli(&cli, &["--root", &root_s, "stop", &all_id_s], CLI_TIMEOUT)?;
+            expect_ok(&out, &format!("stop ({tag})"))?;
+            let want = format!("ID\tSTATUS\tPID\n{all_id_s}\tstopped\t-\n");
+            wait_until(
+                STATE_TIMEOUT,
+                &format!("list to report stopped ({tag})"),
+                || {
+                    run_cli(&cli, &["--root", &root_s, "list"], CLI_TIMEOUT)
+                        .is_ok_and(|o| o.code == Some(0) && o.stdout == want)
+                },
+            )?;
+            let all_cid =
+                ContainerId::new(all_id_s.clone()).map_err(|e| format!("id ({tag}): {e:?}"))?;
+            let store = open_store(&root)?;
+            let rec = get_record(&store, &all_cid)?;
+            if rec.status().exit_code() != Some(SIGTERM_HANDLER_EXIT_CODE_FOR_TEST) {
+                return Err(format!(
+                    "exit code after stop ({tag}): want {SIGTERM_HANDLER_EXIT_CODE_FOR_TEST}, got {:?}",
+                    rec.status().exit_code()
+                ));
+            }
+            drop(store);
+            wait_until(
+                REAP_TIMEOUT,
+                &format!("the {tag} container process to vanish"),
+                || !Path::new(&format!("/proc/{all_pid}")).exists(),
+            )?;
+            // delete の supervisor ログ削除は 1 回だけ試す（待たない）ため、supervisor が sink のロックを手放す
+            // （プロセス終了）まで待つ。待たないと `FAILED_PRECONDITION` の警告が出る（1 つ目の一連の手順 8 と同じ）。
+            wait_supervisor_exit(
+                &sup_needle,
+                &root_needle,
+                &format!("the {tag} supervisor to exit"),
+            )?;
+            let out = run_cli(&cli, &["--root", &root_s, "delete", &all_id_s], CLI_TIMEOUT)?;
+            expect_ok(&out, &format!("delete ({tag})"))?;
+            expect(
+                !root.join(&all_id_s).exists(),
+                &format!("state dir remains after delete ({tag})"),
+            )?;
+            cleanup.armed = false;
         }
-        drop(store);
-        wait_until(REAP_TIMEOUT, "the ALL container process to vanish", || {
-            !Path::new(&format!("/proc/{all_pid}")).exists()
-        })?;
-        // delete の supervisor ログ削除は 1 回だけ試す（待たない）ため、supervisor が sink のロックを手放す
-        // （プロセス終了）まで待つ。待たないと `FAILED_PRECONDITION` の警告が出る（1 つ目の一連の手順 8 と同じ）。
-        wait_supervisor_exit(&sup_needle, &root_needle, "the ALL supervisor to exit")?;
-        let out = run_cli(&cli, &["--root", &root_s, "delete", &all_id_s], CLI_TIMEOUT)?;
-        expect_ok(&out, "delete (cap-drop ALL)")?;
-        expect(
-            !root.join(&all_id_s).exists(),
-            "state dir remains after delete (ALL)",
-        )?;
-        cleanup.armed = false;
 
         // 14. kill TERM の一連（#3097・CLI-1・SUP-11・SUP-4）。オプション無しでも Linux の create は既定の `network none` を書くため、annotations は作成世代の 1 件（#1873）。
         // start は `--restart` を渡さず restart 方針は既定の `no`。意図を立てない kill の現状に結果が左右されない。

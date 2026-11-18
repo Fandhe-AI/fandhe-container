@@ -498,6 +498,23 @@ impl ContainerCapabilities {
         Self(self.0.without(drop))
     }
 
+    /// `add` を戻した許可集合を返す（CLI-1・SEC-1・#4794）。`add` は `base`（drop の前の許可集合）の部分集合で
+    /// なければならず、超える要素があればそれを保持した [`CapabilityNotAllowed`] を返す。`base` も既定の部分集合なので、
+    /// 結果は既定の部分集合のまま（許可集合を `base` より広げない）。
+    pub fn readd_within(
+        self,
+        add: CapabilitySet,
+        base: Self,
+    ) -> Result<Self, CapabilityNotAllowed> {
+        if add.is_subset_of(base.0) {
+            Ok(Self(CapabilitySet(self.0.0 | add.0)))
+        } else {
+            Err(CapabilityNotAllowed {
+                rejected: add.iter().filter(|c| !base.0.contains(*c)).collect(),
+            })
+        }
+    }
+
     /// OCI 既定集合と等しいか。
     pub fn is_default(self) -> bool {
         self.0 == CapabilitySet::oci_default()
@@ -676,6 +693,29 @@ mod tests {
         assert!(!less.bounding().contains(Capability::Chown));
         let none = d.without(parse_drop_list(&["ALL"]).unwrap());
         assert!(none.bounding().is_empty());
+    }
+
+    /// SEC-1・CLI-1（#4794）: `readd_within` は base の中でだけ戻し、超える要素は拒否する。
+    #[test]
+    fn sec1_cli1_4794_readd_within_base_only() {
+        let base = ContainerCapabilities::oci_default()
+            .without(parse_drop_list(&["CHOWN", "KILL"]).unwrap());
+        let none = base.without(CapabilitySet::all_known());
+        let kill = CapabilitySet::empty().with(Capability::Kill);
+        let raw = CapabilitySet::empty().with(Capability::NetRaw);
+        assert_eq!(
+            names(none.readd_within(raw, base).unwrap()),
+            vec!["CAP_NET_RAW"]
+        );
+        let e = none
+            .readd_within(raw.with(Capability::Kill), base)
+            .unwrap_err();
+        assert_eq!(e.rejected(), &[Capability::Kill]);
+        let def = ContainerCapabilities::oci_default();
+        assert_eq!(
+            names(none.readd_within(kill, def).unwrap()),
+            vec!["CAP_KILL"]
+        );
     }
 
     fn names(c: ContainerCapabilities) -> Vec<&'static str> {

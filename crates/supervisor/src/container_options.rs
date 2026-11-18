@@ -17,6 +17,8 @@
 //!
 //! | #2775（CLI-1・SEC-1） | `--cap-drop`（[`ContainerOptions::with_cap_drop`]。core の `parse_drop_list` で検証済みの集合） | core の `LaunchOptions::with_capability_drop`（launch の段と分離の記録へ同じ狭めた集合） |
 //!
+//! | #4794（CLI-1・SEC-1） | `--cap-add`（[`ContainerOptions::with_cap_add`]。core の `resolve_add_drop` で drop と組で検証済みの集合） | core の `LaunchOptions::with_capability_add`（drop の後に config.json 由来の集合の中でだけ戻す） |
+//!
 //! | #3065（NET-6・NET-12・SUP-12） | `--network` / `--add-host` / `--dns`（[`network`]。net で再検証。`network` は core の `LaunchNetworkMode` へ。add-host / dns は start の手順 4b で生成し `with_etc_files` で bind） | core の `LaunchOptions::with_network` |
 //!
 //! | #2953（SUP-4・TASK-161） | healthcheck の定義（[`ContainerOptions::with_healthcheck`]。文書の kind `health-*`。CLI の書き手は後続） | supervisor の入口が `HealthWiring` を組み、monitor が周期実行を起動 |
@@ -26,7 +28,7 @@
 //! secrets / configs の指定モデルと core 側の注入、および本番 launcher への結線（[`ContainerOptions::launch_options`] →
 //! `ProductionStartDeps::with_container_options` → core の `ProductionLauncherBuilder::launch_options`。`--ipc`・
 //! `--shm-size`・`--tmpfs`・secrets / configs・ulimit・env。#2625・#2713）は実装済み。CLI の `create` は
-//! `--ulimit`・`--env`・`--env-file`・`--ipc`・`--shm-size`・`--tmpfs`・`--cap-drop`・`--read-only` を [`document`] の形で
+//! `--ulimit`・`--env`・`--env-file`・`--ipc`・`--shm-size`・`--tmpfs`・`--cap-drop`・`--cap-add`・`--read-only` を [`document`] の形で
 //! 状態ルート配下の 0600 のファイル（[`store`]）へ書き、supervisor の `start` が読む（#2713）。
 //! label は create 時に core の状態記録（`CreateRequest::with_annotations`）へ直接書く。
 //!
@@ -140,6 +142,8 @@ pub struct ContainerOptions {
     injected: InjectedFileOptions,
     /// `--cap-drop` で除く capability(狭める方向のみ。CLI-1・SEC-1・#2775)。
     cap_drop: CapabilitySet,
+    /// `--cap-add` で戻す capability(既定の部分集合。drop の後に config.json の集合の中でだけ戻す。#4794)。
+    cap_add: CapabilitySet,
     /// `--read-only`(true なら `root.readonly` を実効的に true にする。狭める方向のみ。CLI-1・SUP-12・#2828)。
     read_only: bool,
     /// `--network`・`--add-host`・`--dns`(net で再検証済み。NET-6・NET-12・#3065)。
@@ -167,6 +171,14 @@ impl ContainerOptions {
     #[must_use]
     pub fn with_cap_drop(mut self, drop: CapabilitySet) -> Self {
         self.cap_drop = drop;
+        self
+    }
+
+    /// `--cap-add` の集合を設定する(CLI-1・SEC-1・#4794)。drop との組の検証は core の `resolve_add_drop` が
+    /// 済ませた集合を受ける(文書の復号が行う)。
+    #[must_use]
+    pub fn with_cap_add(mut self, add: CapabilitySet) -> Self {
+        self.cap_add = add;
         self
     }
 
@@ -222,6 +234,11 @@ impl ContainerOptions {
     /// `--cap-drop` の集合。
     pub fn cap_drop(&self) -> CapabilitySet {
         self.cap_drop
+    }
+
+    /// `--cap-add` の集合。
+    pub fn cap_add(&self) -> CapabilitySet {
+        self.cap_add
     }
 
     /// `--ipc` の指定を設定する（SUP-12・TASK-169.3。未指定は `Private`）。
@@ -334,6 +351,7 @@ impl ContainerOptions {
             .with_rlimits(self.rlimits.clone())
             .with_env(self.env.to_env_strings())?
             .with_capability_drop(self.cap_drop)
+            .with_capability_add(self.cap_add)
             .with_root_readonly(self.read_only)
             .with_network(network_mode)
             .with_etc_files(self.network.etc_file_selection())

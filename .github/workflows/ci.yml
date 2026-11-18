@@ -2701,12 +2701,12 @@ jobs:
           USER="$(id -un)" \
             scripts/run-in-user-scope.sh --name start_stop_delete_real --deadline 540 --log "${log}" -- \
               "${SSD_BIN}" --ignored
-          # create の起動オプション・--cap-drop・state の 3 時点と kill TERM（#2761・#2833・#3097）・最終行を、ソースから導出して照合する
+          # create の起動オプション・--cap-drop・--cap-add・state の 3 時点と kill TERM（#2761・#2833・#4794・#3097）・最終行を、ソースから導出して照合する
           # 失敗の 1 行目は前提欠如が `PRECONDITION FAILED`、それ以外が `start_stop_delete_real: FAILED`。両方を禁止（#2957）
           scripts/check-success-lines.sh --name start_stop_delete_real \
             --src crates/cli/tests/start_stop_delete_real.rs \
             --log "${log}" --select '^start_stop_delete_real: (create |state |kill |scenario ok |cli start )' \
-            --subst-re scope_present='(true|false)' --min 7 \
+            --subst-re scope_present='(true|false)' --min 8 \
             --forbid 'start_stop_delete_real: skipped' --forbid 'start_stop_delete_real: FAILED' \
             --forbid 'PRECONDITION FAILED' --forbid 'not applicable' --summary
 

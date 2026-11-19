@@ -29,8 +29,8 @@ use std::time::Duration;
 
 use fandhe_container_core::traits::{
     Annotations, CleanupOutcome, ContainerId, ContainerLogPath, ContainerRuntime, ContainerState,
-    ContainerStatus, CreateRequest, DeleteRequest, DeleteResponse, KillRequest, Signal,
-    StartRequest, StateRequest, StdinMode, StopRequest, TerminationReason, TraitError,
+    ContainerStatus, CreateRequest, DeleteRequest, DeleteResponse, KillRequest, PodShmSource,
+    Signal, StartRequest, StateRequest, StdinMode, StopRequest, TerminationReason, TraitError,
     WaitExitRequest,
 };
 use tonic::Status;
@@ -573,6 +573,8 @@ pub struct HolderIdentity {
     net: NamespaceIdentity,
     /// pod の pid namespace（保持役の `pid_for_children`。pid を共有する sandbox だけ。#4816）。
     pid_ns: Option<NamespaceIdentity>,
+    /// 保持役の mount ns の `/dev/shm` に載せた pod の tmpfs のルート（READY の shm。nsfs ではない。#4823）。
+    shm: NamespaceIdentity,
 }
 
 /// 素性の項目の整合性（supervisor の `PodHolderReady::new` と同じ不変条件）。pid は `1..=i32::MAX`、ino は非 0 で
@@ -602,9 +604,15 @@ impl HolderIdentity {
         user: NamespaceIdentity,
         ipc: NamespaceIdentity,
         net: NamespaceIdentity,
+        shm: NamespaceIdentity,
     ) -> Result<Self, CriError> {
         let bad = || CriError::invalid_argument("pod holder identity is inconsistent");
-        if !holder_fields_consistent(pid, user, ipc, net) {
+        // shm は tmpfs のルート。dev・ino は非 0 で、dev は nsfs と違う（supervisor の `PodHolderReady::new` と同じ。#4823）。
+        if !holder_fields_consistent(pid, user, ipc, net)
+            || shm.dev == 0
+            || shm.ino == 0
+            || shm.dev == user.dev
+        {
             return Err(bad());
         }
         let pid = std::num::NonZeroU32::new(pid).ok_or_else(bad)?;
@@ -615,6 +623,7 @@ impl HolderIdentity {
             ipc,
             net,
             pid_ns: None,
+            shm,
         })
     }
 
@@ -632,6 +641,11 @@ impl HolderIdentity {
         }
         self.pid_ns = Some(pid_ns);
         Ok(self)
+    }
+
+    /// pod の `/dev/shm` の tmpfs のルートの素性（READY の値。`--pod-shm` の照合に使う。CRI-2・CORE-3・SEC-1・#4823）。
+    pub fn shm(&self) -> NamespaceIdentity {
+        self.shm
     }
 
     /// pod の pid namespace の素性（pid を共有しない sandbox は `None`）。
@@ -991,9 +1005,26 @@ impl RuntimeAdapter {
         log_path: Option<ContainerLogPath>,
         stdin: StdinMode,
     ) -> Result<RuntimeContainerStatus, CriError> {
+        self.start_with_pod_shm(id, log_path, stdin, None)
+    }
+
+    /// [`Self::start_with_options`] に pod の `/dev/shm` の指定元を足して開始する（CRI-2・CORE-3・SEC-1・#4823）。
+    ///
+    /// `pod_shm` は `CriRuntimeService` が保持役の READY の値から作ったもので、`StartRequest::with_pod_shm` で実行層へ
+    /// 運ぶ。`None` は [`Self::start_with_options`] と同じ。
+    pub fn start_with_pod_shm(
+        &self,
+        id: &str,
+        log_path: Option<ContainerLogPath>,
+        stdin: StdinMode,
+        pod_shm: Option<PodShmSource>,
+    ) -> Result<RuntimeContainerStatus, CriError> {
         let mut req = StartRequest::new(Self::id(id)?).with_stdin(stdin);
         if let Some(log_path) = log_path {
             req = req.with_log_path(log_path);
+        }
+        if let Some(pod_shm) = pod_shm {
+            req = req.with_pod_shm(pod_shm);
         }
         Self::finish(id, self.runtime.start(&req))
     }
@@ -1116,6 +1147,51 @@ mod tests {
 
     fn cid(s: &str) -> ContainerId {
         ContainerId::new(s).unwrap()
+    }
+
+    /// start の要求を記録するだけの実行層（#4823 の `start_with_pod_shm` の試験用）。
+    struct StartSpy(std::sync::Mutex<Vec<Option<(u64, u64)>>>);
+
+    impl ContainerRuntime for StartSpy {
+        fn create(&self, _: &CreateRequest) -> Result<ContainerStatus, TraitError> {
+            Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+        }
+        fn start(&self, r: &StartRequest) -> Result<ContainerStatus, TraitError> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(r.pod_shm().map(PodShmSource::identity));
+            Ok(ContainerStatus::running(r.id().clone(), None))
+        }
+        fn kill(&self, _: &KillRequest) -> Result<ContainerStatus, TraitError> {
+            Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+        }
+        fn stop(&self, _: &StopRequest) -> Result<ContainerStatus, TraitError> {
+            Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+        }
+        fn delete(&self, _: &DeleteRequest) -> Result<DeleteResponse, TraitError> {
+            Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+        }
+        fn state(&self, _: &StateRequest) -> Result<ContainerStatus, TraitError> {
+            Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+        }
+    }
+
+    /// CRI-2・CORE-3・SEC-1・#4823: `start_with_pod_shm` は指定元を `StartRequest::pod_shm()` に載せ、
+    /// `start_with_options`（と `start`）は載せない。
+    #[test]
+    fn cri2_4823_start_with_pod_shm_reaches_the_request() {
+        let spy = Arc::new(StartSpy(std::sync::Mutex::new(Vec::new())));
+        let adapter = RuntimeAdapter::new(spy.clone());
+        let src = PodShmSource::new(std::path::PathBuf::from("/proc/4242/ns/mnt"), 48, 2).unwrap();
+        adapter
+            .start_with_pod_shm("a", None, StdinMode::Closed, Some(src))
+            .unwrap();
+        adapter
+            .start_with_options("a", None, StdinMode::Closed)
+            .unwrap();
+        adapter.start("a").unwrap();
+        assert_eq!(*spy.0.lock().unwrap(), vec![Some((48, 2)), None, None]);
     }
 
     /// CRI-5・SEC-1・CORE-1（#4220）: インスタンス識別子を写し、報告が無ければ `None`。

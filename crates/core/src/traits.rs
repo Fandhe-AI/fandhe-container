@@ -28,8 +28,8 @@ pub mod volume_provider;
 pub use container_runtime::{
     CONTAINER_LOG_PATH_MAX_BYTES, CleanupOutcome, CleanupTarget, ContainerInstance,
     ContainerLogPath, ContainerRuntime, ContainerState, ContainerStatus, CreateRequest,
-    DeleteRequest, DeleteResponse, ExitTime, KillRequest, KillTarget, Signal, StartRequest,
-    StateRequest, StdinMode, StopRequest, TerminationReason, WaitExitRequest,
+    DeleteRequest, DeleteResponse, ExitTime, KillRequest, KillTarget, PodShmSource, Signal,
+    StartRequest, StateRequest, StdinMode, StopRequest, TerminationReason, WaitExitRequest,
 };
 pub use network_plugin::{
     AttachRequest, AttachResponse, CreateNetnsRequest, CreateNetworkRequest, DeleteNetworkRequest,

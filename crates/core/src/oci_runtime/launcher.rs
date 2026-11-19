@@ -142,7 +142,7 @@
 //!   常に全暗黙マウントで判定するため、`WithoutShm` でも `/dev/shm` 上の保護パス指定を拒否する(厳しい側。fail-closed)。
 //!   範囲写像の holder が継承するメモリから secret を外す方式(封印 memfd。#2628)は `InjectedContent` の doc を参照。
 //!   CLI から supervisor への受け渡しは未結線。`LaunchOptions::stdin` が `Pipe` のときだけ spawn が stdin の pipe を作り、読み取り側を init の fd 0、書き込み側を `LaunchedProcess::take_stdin` で返す(既定の `Null` は `/dev/null`。SUP-7・CRI-6・SEC-1・#4069)
-//! - pod で共有する `/dev/shm`(`LaunchOptions::with_pod_shm`。CRI-2・CORE-3・SEC-1・SEC-5・#4822)は、start が固定した `LaunchSpec::pinned_pod_shm` と自身の起動オプションの有無が食い違えば fork の前に `FailedPrecondition` で拒否し(ラッパーの転送漏れで共有が黙って外れない)、あれば子へ渡す tmpfs 集合から既定の `/dev/shm` の件だけを除く(init が保持役の tmpfs の複製を載せる。`exec::pod_shm`)。Landlock の暗黙規則・bind との重なりの検査は元の集合のまま。本番の指定元は S3(#4823)で未配線。
+//! - pod で共有する `/dev/shm`(`LaunchOptions::with_pod_shm`。CRI-2・CORE-3・SEC-1・SEC-5・#4822)は、start が固定した `LaunchSpec::pinned_pod_shm` と自身の起動オプションの有無が食い違えば fork の前に `FailedPrecondition` で拒否し(ラッパーの転送漏れで共有が黙って外れない)、あれば子へ渡す tmpfs 集合から既定の `/dev/shm` の件だけを除く(init が保持役の tmpfs の複製を載せる。`exec::pod_shm`)。Landlock の暗黙規則・bind との重なりの検査は元の集合のまま。本番の指定元は S3(#4823)の cri・plugin-cri の配線。
 //! - bind・`/sys` の sysfs 以外の `mounts[]` の種類と config.json の `mounts[]` の tmpfs は `start` が拒否済みで、ここでは載せない
 
 #[cfg(target_os = "linux")]

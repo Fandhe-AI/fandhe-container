@@ -693,6 +693,19 @@ async fn create_started(
     token: &str,
     ledger: &reclaim::Ledger,
 ) -> String {
+    create_started_with_mounts(c, sb, name, command, Vec::new(), token, ledger).await
+}
+
+/// [`create_started`] に CRI の `mounts` を足したもの（段 M の `/dev/shm` の bind。#4823）。
+async fn create_started_with_mounts(
+    c: &mut RuntimeServiceClient<Channel>,
+    sb: &str,
+    name: &str,
+    command: &[&str],
+    mounts: Vec<cri::Mount>,
+    token: &str,
+    ledger: &reclaim::Ledger,
+) -> String {
     let long = Duration::from_secs(120);
     let id = call_with_deadline(
         c.create_container(cri::CreateContainerRequest {
@@ -705,6 +718,7 @@ async fn create_started(
                 image: Some(image_spec(IMAGE)),
                 command: command.iter().map(|s| s.to_string()).collect(),
                 labels: reclaim::config_labels(TEST, token),
+                mounts,
                 ..Default::default()
             }),
             sandbox_config: None,
@@ -785,12 +799,12 @@ fn is_pod_holder(pid: u32) -> bool {
         })
 }
 
-/// argv に `pod-holder` を含む保持役のうち、netns が `want`（`net:[<inode>]`）のものの数。
-fn holders_with_netns(want: &str) -> usize {
+/// argv に `pod-holder` を含む保持役のうち、netns が `want`（`net:[<inode>]`）のものの pid。
+fn holder_pids_with_netns(want: &str) -> Vec<u32> {
     let Ok(dir) = std::fs::read_dir("/proc") else {
-        return 0;
+        return Vec::new();
     };
-    let mut n = 0;
+    let mut pids = Vec::new();
     for e in dir.flatten() {
         let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
             continue;
@@ -799,10 +813,199 @@ fn holders_with_netns(want: &str) -> usize {
             && std::fs::read_link(format!("/proc/{pid}/ns/net"))
                 .is_ok_and(|l| l.to_string_lossy() == want)
         {
-            n += 1;
+            pids.push(pid);
         }
     }
-    n
+    pids
+}
+
+/// [`holder_pids_with_netns`] の件数。
+fn holders_with_netns(want: &str) -> usize {
+    holder_pids_with_netns(want).len()
+}
+
+// ---- 段 M（#4823）: pod の /dev/shm の共有 ----
+
+/// 段 M で pod の `/dev/shm` に書くファイルと内容（固定リテラル）。
+const POD_SHM_FILE_A: &str = "/dev/shm/fandhe-pod-shm-4823-a";
+const POD_SHM_FILE_B: &str = "/dev/shm/fandhe-pod-shm-4823-b";
+const POD_SHM_PAYLOAD_A: &str = "fandhe-pod-shm-4823-a";
+const POD_SHM_PAYLOAD_B: &str = "fandhe-pod-shm-4823-b";
+/// 段 M の成功行 3 行（`check-success-lines.sh` が試験ソースから導出して照合する。プレースホルダは使わない）。
+const POD_SHM_OK_SHARED: &str = "production_binary_exec_real: pod-shm ok: a file written to /dev/shm by one container was read by its sibling";
+const POD_SHM_OK_TMPFS: &str = "production_binary_exec_real: pod-shm ok: the pod /dev/shm is the holder tmpfs, not the node's or another pod's";
+const POD_SHM_OK_MOUNT: &str = "production_binary_exec_real: pod-shm ok: a container with a /dev/shm mount did not get the pod /dev/shm";
+/// termination-log の成功行と、書き込むメッセージ（#4888 の申し送り・#4823）。
+const TERMINATION_LOG_OK: &str = "production_binary_exec_real: termination-log ok: exec wrote the message through the /dev/termination-log mount";
+const TERMINATION_LOG_MESSAGE: &str = "fandhe-termination-log-4823";
+
+/// 書き込みの command（固定の内容をリダイレクトで書く）。
+fn pod_shm_write_script(path: &str, payload: &str) -> String {
+    format!("printf %s '{payload}' > {path}")
+}
+
+/// `/dev/shm` の `<st_dev>:<st_ino>`（busybox の `stat -c %d:%i`）。
+async fn shm_identity(c: &mut RuntimeServiceClient<Channel>, id: &str) -> String {
+    exec_sh(c, id, "stat -c %d:%i /dev/shm").await
+}
+
+/// `path` があれば `present`、無ければ `absent`。
+async fn shm_presence(c: &mut RuntimeServiceClient<Channel>, id: &str, path: &str) -> String {
+    exec_sh(
+        c,
+        id,
+        &format!("if [ -e {path} ]; then echo present; else echo absent; fi"),
+    )
+    .await
+}
+
+/// 段 M（#4823・CRI-2・CORE-3・SEC-1・SEC-5）。段 P の pod P（`srv`・`cli_p`）と pod Q（`cli_q`）を使い回し、
+/// P にだけ `/dev/shm` の bind を持つ 3 個目のコンテナを足す。pod の後始末の前に呼ぶ。
+async fn pod_shm_stage(
+    c: &mut RuntimeServiceClient<Channel>,
+    sb_p: &str,
+    ids: (&str, &str, &str),
+    ns_p: &str,
+    token: &str,
+    ledger: &reclaim::Ledger,
+) -> (String, TempDir) {
+    use std::os::unix::fs::MetadataExt as _;
+    let (srv, cli_p, cli_q) = ids;
+
+    // 1. 兄弟どうしで書いた内容が読める（双方向）。
+    exec_sh(
+        c,
+        srv,
+        &pod_shm_write_script(POD_SHM_FILE_A, POD_SHM_PAYLOAD_A),
+    )
+    .await;
+    assert_eq!(
+        exec_sh(c, cli_p, &format!("cat {POD_SHM_FILE_A}")).await,
+        POD_SHM_PAYLOAD_A
+    );
+    exec_sh(
+        c,
+        cli_p,
+        &pod_shm_write_script(POD_SHM_FILE_B, POD_SHM_PAYLOAD_B),
+    )
+    .await;
+    assert_eq!(
+        exec_sh(c, srv, &format!("cat {POD_SHM_FILE_B}")).await,
+        POD_SHM_PAYLOAD_B
+    );
+    {
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), "{POD_SHM_OK_SHARED}");
+    }
+
+    // 2. 素性: P の 2 個は同じで保持役の `/dev/shm` と一致し、Q・ノードとは違う。Q からは 1 のファイルが見えない
+    //    （否定は P での読み取りを前後に置いて括る）。
+    let (id_srv, id_cli) = (shm_identity(c, srv).await, shm_identity(c, cli_p).await);
+    assert_eq!(
+        id_srv, id_cli,
+        "same-pod containers must share the /dev/shm tmpfs"
+    );
+    let holders = holder_pids_with_netns(ns_p);
+    assert_eq!(
+        holders.len(),
+        1,
+        "exactly one pod-holder for {ns_p}: {holders:?}"
+    );
+    let md = std::fs::metadata(format!("/proc/{}/root/dev/shm", holders[0]))
+        .expect("stat the holder /dev/shm");
+    assert_eq!(
+        id_srv,
+        format!("{}:{}", md.dev(), md.ino()),
+        "the container /dev/shm must be the holder tmpfs"
+    );
+    let node = std::fs::metadata("/dev/shm").expect("stat the node /dev/shm");
+    assert_ne!(
+        id_srv,
+        format!("{}:{}", node.dev(), node.ino()),
+        "the pod /dev/shm must not be the node's"
+    );
+    assert_ne!(
+        id_srv,
+        shm_identity(c, cli_q).await,
+        "another pod must not share the /dev/shm"
+    );
+    assert_eq!(shm_presence(c, cli_p, POD_SHM_FILE_A).await, "present");
+    assert_eq!(shm_presence(c, cli_q, POD_SHM_FILE_A).await, "absent");
+    assert_eq!(shm_presence(c, cli_p, POD_SHM_FILE_A).await, "present");
+    // 属性: tmpfs・nosuid,nodev,noexec・size=65536k・mode 1777。
+    let info = exec_sh(c, cli_p, "cat /proc/self/mountinfo").await;
+    let line = info
+        .lines()
+        .rfind(|l| l.split_whitespace().nth(4) == Some("/dev/shm"))
+        .expect("the container has a /dev/shm mount");
+    let (head, tail) = line.split_once(" - ").expect("mountinfo separator");
+    let opts: Vec<&str> = head
+        .split_whitespace()
+        .nth(5)
+        .unwrap_or("")
+        .split(',')
+        .collect();
+    for want in ["rw", "nosuid", "nodev", "noexec"] {
+        assert!(opts.contains(&want), "missing {want}: {line}");
+    }
+    let mut fs = tail.split_whitespace();
+    assert_eq!(fs.next(), Some("tmpfs"), "{line}");
+    assert!(
+        fs.nth(1)
+            .unwrap_or("")
+            .split(',')
+            .any(|o| o == "size=65536k"),
+        "{line}"
+    );
+    assert_eq!(exec_sh(c, cli_p, "stat -c %a /dev/shm").await, "1777");
+    {
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), "{POD_SHM_OK_TMPFS}");
+    }
+
+    // 3. CRI mounts に `/dev/shm` がある 3 個目は pod の `/dev/shm` を持たず、書いたファイルがホストの元に現れる。
+    let src = TempDir::new("shm-src");
+    let mount = cri::Mount {
+        container_path: "/dev/shm".into(),
+        host_path: src.0.to_string_lossy().into_owned(),
+        ..Default::default()
+    };
+    let third = create_started_with_mounts(
+        c,
+        sb_p,
+        "shm-mount",
+        &["/bin/sleep", "300"],
+        vec![mount],
+        token,
+        ledger,
+    )
+    .await;
+    assert_eq!(shm_presence(c, &third, POD_SHM_FILE_A).await, "absent");
+    assert_ne!(
+        shm_identity(c, &third).await,
+        id_srv,
+        "a /dev/shm mount must not get the pod tmpfs"
+    );
+    exec_sh(
+        c,
+        &third,
+        &pod_shm_write_script("/dev/shm/from-mount", POD_SHM_PAYLOAD_A),
+    )
+    .await;
+    assert_eq!(
+        std::fs::read_to_string(src.0.join("from-mount")).expect("read the host side file"),
+        POD_SHM_PAYLOAD_A
+    );
+    assert_eq!(
+        shm_presence(c, cli_p, "/dev/shm/from-mount").await,
+        "absent"
+    );
+    {
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), "{POD_SHM_OK_MOUNT}");
+    }
+    // bind 元は 3 個目の remove 後に消すため呼び出し側へ返す（先に消すとコンテナが元を失う）。
+    (third, src)
 }
 
 /// 段 P の後始末。成功したら台帳から外す（失敗したら panic し、外側の回収がラベルと台帳で片付ける）。
@@ -1259,7 +1462,13 @@ async fn pod_network_stage(
     }
     // 段 F（#4487）: pod の後始末と段 4 の plugin-cri の SIGKILL の前に置く。
     pod_forward_stage(c, &sb_p, &sb_q, plugin_pid).await;
-    remove_pod(c, ledger, &sb_p, &[&srv, &cli_p]).await;
+    // 段 M（#4823）: pod の `/dev/shm` の共有。pod の後始末の前に置く。
+    let (third, shm_src) =
+        pod_shm_stage(c, &sb_p, (&srv, &cli_p, &cli_q), &ns_p, token, ledger).await;
+    remove_pod(c, ledger, &sb_p, &[&srv, &cli_p, &third]).await;
+    // コンテナ（範囲写像の uid）が作ったファイルをホスト uid が消せない場合、`TempDir` の Drop は失敗を無視して残骸を残す
+    // （他段の一時ディレクトリと同じ扱い。0700 の `temp_dir()` 配下で実行ごとに名前が違い、次の実行を塞がない）。
+    drop(shm_src);
     remove_pod(c, ledger, &sb_q, &[&cli_q, &srv_q]).await;
 }
 
@@ -1620,6 +1829,11 @@ async fn scenario(
         .pod_sandbox_id;
     reclaim::record_sandbox(&ledger, &sb);
 
+    // termination-log（#4823・#4888 の申し送り）: ホストの一時ファイルを `/dev/termination-log` へ bind する。本体は 2 回走るため
+    // 実行ごとに作る（`temp_dir()` 配下・symlink なし・状態ルートと重ならない）。
+    let tl_dir = TempDir::new("termlog");
+    let tl_file = tl_dir.0.join("termination-log");
+    std::fs::write(&tl_file, b"").expect("create the termination-log source");
     let long = Duration::from_secs(120);
     let id = call_with_deadline(
         c.create_container(cri::CreateContainerRequest {
@@ -1632,6 +1846,11 @@ async fn scenario(
                 image: Some(image_spec(IMAGE)),
                 command: vec!["/bin/sleep".into(), "300".into()],
                 labels: reclaim::config_labels(TEST, &token),
+                mounts: vec![cri::Mount {
+                    container_path: "/dev/termination-log".into(),
+                    host_path: tl_file.to_string_lossy().into_owned(),
+                    ..Default::default()
+                }],
                 ..Default::default()
             }),
             sandbox_config: None,
@@ -1723,6 +1942,51 @@ async fn scenario(
     assert_eq!(exec_st.get("Seccomp").map(String::as_str), Some("2"));
     assert_eq!(hex_field(&exec_st, "CapInh"), 0);
     assert_eq!(hex_field(&exec_st, "CapAmb"), 0);
+
+    // 本体 c（ipc 未指定 = POD）が pod の `/dev/shm` に入っていること（#4823）。本体の network は NODE のため、ipc namespace が
+    // c と同じ保持役を引き、その `/dev/shm` の `dev:ino` と c の `/dev/shm` を照合する。
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let c_ipc = exec_sh(&mut c, &id, "readlink /proc/self/ns/ipc").await;
+        let holders: Vec<u32> = std::fs::read_dir("/proc")
+            .expect("read /proc")
+            .flatten()
+            .filter_map(|e| e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()))
+            .filter(|p| {
+                is_pod_holder(*p)
+                    && std::fs::read_link(format!("/proc/{p}/ns/ipc"))
+                        .is_ok_and(|l| l.to_string_lossy() == c_ipc)
+            })
+            .collect();
+        assert_eq!(
+            holders.len(),
+            1,
+            "the main container must share the ipc namespace of exactly one pod-holder: {c_ipc} {holders:?}"
+        );
+        let md = std::fs::metadata(format!("/proc/{}/root/dev/shm", holders[0]))
+            .expect("stat the holder /dev/shm");
+        assert_eq!(
+            shm_identity(&mut c, &id).await,
+            format!("{}:{}", md.dev(), md.ino()),
+            "the main container /dev/shm is not the pod holder tmpfs (pod shm was not shared)"
+        );
+    }
+    // termination-log: exec が `/dev/termination-log` へ書いた内容がホストのファイルに現れる（pod shm と termination-log の
+    // 両方を持つコンテナへの exec の再適用を通す。#3201）。
+    exec_sh(
+        &mut c,
+        &id,
+        &format!("printf %s '{TERMINATION_LOG_MESSAGE}' > /dev/termination-log"),
+    )
+    .await;
+    assert_eq!(
+        std::fs::read_to_string(&tl_file).expect("read the termination-log source"),
+        TERMINATION_LOG_MESSAGE
+    );
+    {
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), "{TERMINATION_LOG_OK}");
+    }
 
     // 段 T（#4417）: tty の往復と resize。段 4 は plugin-cri を殺すため、その前に置く。
     tty_stage(&mut c, &id).await;
@@ -2156,4 +2420,32 @@ fn cri6_4487_pf_error_text_matches_cri_format() {
     let fmt = |port: u16| format!("error forwarding port {port}: connection failed");
     assert_eq!(PF_ERR_PORT_A, fmt(POD_NET_PORT));
     assert_eq!(PF_ERR_PORT_B, fmt(POD_FORWARD_PORT_B));
+}
+
+/// 段 M・termination-log の command・成功行が固定リテラルで、実行時の値（`{}`）を含まないことを具体値で固定する
+/// （#4823・REPAIR-12）。
+#[test]
+fn repair12_4823_pod_shm_literals_are_fixed() {
+    assert_eq!(
+        pod_shm_write_script(POD_SHM_FILE_A, POD_SHM_PAYLOAD_A),
+        "printf %s 'fandhe-pod-shm-4823-a' > /dev/shm/fandhe-pod-shm-4823-a"
+    );
+    assert_eq!(
+        pod_shm_write_script(POD_SHM_FILE_B, POD_SHM_PAYLOAD_B),
+        "printf %s 'fandhe-pod-shm-4823-b' > /dev/shm/fandhe-pod-shm-4823-b"
+    );
+    assert_eq!(TERMINATION_LOG_MESSAGE, "fandhe-termination-log-4823");
+    for line in [POD_SHM_OK_SHARED, POD_SHM_OK_TMPFS, POD_SHM_OK_MOUNT] {
+        // 接頭辞の文字列リテラルは CI の導出が期待行として拾うため、先頭 3 つの語で照合する（#4487 と同じ形）。
+        assert!(
+            line.starts_with(&["production_binary_exec_real:", "pod-shm", "ok:"].join(" ")),
+            "{line}"
+        );
+        assert!(!line.contains('{') && !line.contains('}'), "{line}");
+    }
+    assert!(
+        TERMINATION_LOG_OK
+            .starts_with(&["production_binary_exec_real:", "termination-log", "ok:"].join(" "))
+    );
+    assert!(!TERMINATION_LOG_OK.contains('{') && !TERMINATION_LOG_OK.contains('}'));
 }

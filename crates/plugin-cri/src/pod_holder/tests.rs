@@ -788,6 +788,20 @@ fn cri2_sec5_2940_holder_from_ready_carries_exact_identity() {
     assert_eq!((id.user().dev, id.user().ino), (4, 10));
     assert_eq!((id.ipc().dev, id.ipc().ino), (4, 11));
     assert_eq!((id.net().dev, id.net().ino), (4, 12));
+    // #4823: READY の shm（tmpfs のルート）がそのまま素性に載る。
+    assert_eq!((id.shm().dev, id.shm().ino), (48, 2));
+}
+
+/// CRI-2・SEC-1・#4823: READY の shm の dev が自分の `/dev/shm` と同じなら拒否し、stat できないときも拒否する。
+#[test]
+fn cri2_sec1_4823_ready_shm_must_not_be_the_host_tmpfs() {
+    let shm = NsId { dev: 48, ino: 2 };
+    check_shm_is_private(shm, Some(49)).unwrap();
+    for own in [Some(48), None] {
+        let e = check_shm_is_private(shm, own).unwrap_err();
+        assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(e.message(), MSG_SHM_IS_HOST);
+    }
 }
 
 /// ns の照合が無効な試験用の構成は素性を持たない（記録では `holder=-`）。

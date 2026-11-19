@@ -85,6 +85,7 @@ const MSG_OBSERVE_FAILED: &str = "failed to observe the recorded pod holder";
 const MSG_NS_MISMATCH: &str = "the pod holder namespaces do not match the report";
 const MSG_PID_NS_MISMATCH: &str =
     "the pod holder pid namespace does not match the requested sharing";
+const MSG_SHM_IS_HOST: &str = "the pod holder shm is not a private tmpfs";
 const MSG_SPAWN_FAILED: &str = "failed to start the pod holder";
 const MSG_POISONED: &str = "pod holder table is unavailable";
 const MSG_RELEASE_TIMEOUT: &str = "timed out releasing the pod holder";
@@ -452,7 +453,13 @@ impl ProductionPodHolder {
                 return Err(pid_ns_mismatch());
             }
         }
-        Ok(())
+        // 保持役の mnt ns は自分の mnt ns の複製なので、自分の `/dev/shm` が「ホストの tmpfs」の比較対象になる。
+        // READY の shm がそれと同じ superblock（dev）なら pod の tmpfs ではない（#4823。init の照合は素性の一致までで、
+        // READY の値自体がホストの tmpfs を指す場合を弾けない）。
+        check_shm_is_private(
+            ready.shm(),
+            std::fs::metadata("/dev/shm").ok().map(|m| m.dev()),
+        )
     }
 
     /// `Err` の第 2 要素は、SIGKILL の後も回収を確認できない子が `orphans` に残った（資源が残りうる）こと。
@@ -729,6 +736,18 @@ impl PodNamespaceHolderProvider for ProductionPodHolder {
     }
 }
 
+/// READY の shm が plugin-cri 自身の `/dev/shm` と同じ dev なら拒否する純関数（`own_dev` が `None`＝stat できないときも
+/// 拒否。fail-closed）。CRI-2・SEC-1・#4823。
+fn check_shm_is_private(shm: NsId, own_dev: Option<u64>) -> Result<(), TraitError> {
+    match own_dev {
+        Some(dev) if dev != shm.dev => Ok(()),
+        _ => Err(TraitError::new(
+            ErrorCode::FailedPrecondition,
+            MSG_SHM_IS_HOST,
+        )),
+    }
+}
+
 /// READY と starttime から素性つきの [`PodHolder`] を作る（`HolderIdentity::new` が不変条件を再検証する）。
 fn holder_from_ready(
     ready: &PodHolderReady,
@@ -745,9 +764,10 @@ fn holder_from_ready(
         ns(ready.user()),
         ns(ready.ipc()),
         ns(ready.net()),
+        ns(ready.shm()),
     )
     .map_err(unavailable)?;
-    // READY の mnt と shm（pod の `/dev/shm` の tmpfs。#4821）はまだ記録に載せない（受け渡しと照合は S3・#4823。REPAIR-3）。
+    // READY の shm（pod の `/dev/shm` の tmpfs。#4821）は素性に載せ、Start が `--pod-shm` の指定元にする（#4823）。
     // pid を共有する sandbox は pod の pid ns の素性も記録に残す（再採用の照合。#2940・#4816）。
     if let Some(pid_ns) = ready.pid_ns() {
         identity = identity.with_pid_ns(ns(pid_ns)).map_err(unavailable)?;

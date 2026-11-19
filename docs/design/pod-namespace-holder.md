@@ -77,7 +77,7 @@
 
 ## 範囲外
 
-- pid の共有（`shareProcessNamespace`）・`/dev/shm` の共有・uts の共有・`NamespaceMode::TARGET`: 下の「pid・uts・/dev/shm の共有と TARGET（#2903）」で設計した。uts は実装単位 U1〜U5 を起票済み。pid・`TARGET`・`/dev/shm` はオーナー判断待ち（#4607）で、判断が出るまで `UNIMPLEMENTED`（`/dev/shm` は共有しない現状のまま。`mounts[]` のホストの `/dev/shm` の bind〔#4888〕は pod の共有とは別の経路で、本節の対象ではない）
+- pid の共有（`shareProcessNamespace`）・`/dev/shm` の共有・uts の共有・`NamespaceMode::TARGET`: 下の「pid・uts・/dev/shm の共有と TARGET（#2903）」で設計した。uts は実装単位 U1〜U5 を起票済み。pid の共有は #4816・#4817 で実装済み（下の節）。`TARGET` は `UNIMPLEMENTED` のまま。`/dev/shm` は #4823（S3）で共有する（下の S3 の節。`mounts[]` のホストの `/dev/shm` の bind〔#4888〕は pod の共有とは別の経路で、本節の対象ではない）
 - rootful の pod netns（#2241）
 - 再起動をまたぐ sandbox の再採用（TASK-59。設計は [cri-record-readoption.md](cri-record-readoption.md)・#2902）
 
@@ -135,7 +135,7 @@
 - 案 A（推奨候補）: 保持役が pod の userns で mount ns を作り tmpfs（64 MiB・`nosuid,nodev,noexec,mode=1777`）を載せる。コンテナの init は `pivot_root` の前に保持役の mnt ns の fd へ `setns` して `open_tree(OPEN_TREE_CLONE)` で複製を取り、自分の mnt ns に戻って `move_mount` で rootfs の `/dev/shm` に載せる。カーネルの条件は Linux v6.12 の原文で確かめ、非特権の user + mount namespace の PoC も通った（#4806。下の脚注「案 A の一次情報と PoC」）
 - 案 B: plugin-cri の状態ルート下の pod ごとのディレクトリを bind する。簡単だがサイズ上限が無く、利用者のセッションの tmpfs を埋める DoS になる
 - 案 C: 共有しない（現状）。SysV IPC と mqueue は共有される
-- 採否が決まるまで、cri-config-acceptance.md の「既知の差」に現状を明記したままにする
+- 実装: 案 A を S1〜S3（#4821・#4822・#4823）で実装した。S3 の受け渡しは下の「実装: S3（#4823）」の節。`#4607` の O6（方式と既定サイズ）の正式な判断の記録は、本書では扱わない（#4607 で扱う）。共有の条件と差は cri-config-acceptance.md の「pod の ipc 共有の受け入れ方式」
 
 #### 脚注: 案 A の一次情報と PoC（S0・#4806）
 
@@ -165,7 +165,7 @@ PoC: `crates/core/src/oci_runtime/namespace_join.rs` の実機前提試験 `cri2
   - 載せる場所を保持役の mount ns の `/dev/shm` にしたのは Agent の判断（issue は場所を決めていない）。v6.12 の `open_tree` は呼び出し側の今の mount ns に付いたマウントしか複製できない（`check_mnt`）ため、どこにも接続しない tmpfs を fd で持つ方式（pod-init の空の root と同じ形）は S2 で複製できない。付ける先は保持役の ns に既にあるディレクトリが要り、ホストの `/dev/shm` のディレクトリは Linux の標準の構成にあり、保持役自身は使わない。ns は private な複製のため、上に載せてもホストの `/dev/shm` は変わらない
   - S2 の注意: pod の tmpfs が載っていない（保持役が別物・途中で外れた）と、同じパスはホストの `/dev/shm` の tmpfs に解決する。S2 は開いた `/dev/shm` の `(dev, ino)` を READY の値と照合することを必須にする（無いとホストの `/dev/shm` を複製しうる）
 
-- S2（#4822 で実装。core と supervisor の受け口まで。本番の指定元の配線は S3・#4823）: コンテナの init が pivot 前に保持役の mnt ns の `/dev/shm` を複製して rootfs の `dev/shm` へ載せる
+- S2（#4822 で実装。core と supervisor の受け口まで。本番の指定元の配線は S3・#4823。S3 で実装済み）: コンテナの init が pivot 前に保持役の mnt ns の `/dev/shm` を複製して rootfs の `dev/shm` へ載せる
   - **受け渡しは supervisor の argv → `LaunchOptions`（オーナー決定 2026-11-19）**: `--pod-shm <dev>:<ino>:<絶対パス>`（例 `48:2:/proc/1234/ns/mnt`。`dev`・`ino` は保持役の `/dev/shm`〔tmpfs のルート〕の素性で READY の値、パスは `/proc/<正の整数>/ns/mnt`）を supervisor の入口が `LaunchOptions::with_pod_shm` へ渡す。config.json は純 OCI のまま（`mounts[]` に独自の type を足さず、annotations も使わない）。argv の要素数の上限は 12 から 14 へ（T1 の `--pid-target` で後に 16）。特権ランチャー経由（ambient capability あり）では `Unimplemented` で拒否する。`StartRequest` への欄の追加と cri・plugin-cri の配線は S3 で、S2 の時点では本番の呼び出し元が無い（REPAIR-3。`supervisor::StartOptions::with_pod_shm` が S3 の入口）
   - **pin（fork の前）**: core の `start` が user・ipc の join の固定の直後に、`/proc/<pid>/ns/mnt` を 1 回だけ開いて fd に固定する（`namespace_join/pod_shm.rs`）。検査は、同じ config に user と ipc の join があること（無ければ `Unimplemented`）、パスの pid が user の join の path の pid と同じ（字句。違えば `InvalidArgument`）、nsfs で `NS_GET_NSTYPE` が mount（違えば `InvalidArgument`）、所有する user namespace が固定済みの user の join と同じ（違う・取れない〔呼び出し側自身・外側の mnt ns もここで落ちる〕は `PermissionDenied`）。拒否は閉じた語彙 `PodNamespaceJoinOutcome` で監査し、所有者の不一致用に末尾へ `PodShmOwnerMismatch`（`pod_join_shm_owner_mismatch`。中継の表の添字は途中に挿入しない）だけを足した。受理の記録は join の 1 件で足りるため出さない
   - **複製して載せる手順（`exec/pod_shm.rs`。`create_default_devices` の後・`mount_tmpfs` の前。新しい `PrePivotStep`・`IsolationStage` は足さず、失敗は段 `mount_tmpfs` で返る）**: 自分の mnt ns の fd・`/`・`.` を控える → `setns(保持役の mnt ns)` → `/dev/shm` を開く → **同じ fd で** `(st_dev, st_ino)` が launch の固定時の期待値と一致・tmpfs・`nosuid,nodev,noexec` を確かめる → `open_tree(OPEN_TREE_CLONE)` で複製 → `setns(自分の mnt ns)`（失敗したらパス操作を一切せず固定文言で終える）→ `/` の素性（`st_dev`・`st_ino`・mount ID）が往復前と同じことを確かめて cwd を戻す → rootfs の `dev/shm` を fd 起点で開き、shared でないことと移動していないことを確かめて `move_mount` → 載せた後に開き直して素性・属性・shared でないことを再照合。新しい `unsafe` は無い（既存の sys のラッパーだけ）
@@ -176,7 +176,60 @@ PoC: `crates/core/src/oci_runtime/namespace_join.rs` の実機前提試験 `cri2
   - 範囲外・残余: 保持役が READY で報告した素性を launch の記録の `/dev/shm` の規則と親側でも照合する案は入れていない（init が複製の前後に同じ素性を照合済みのため。必要なら S3 の統合後に再評価）
   - **拒否の監査**: 素性・tmpfs 種別・属性 3 つの不一致（複製の前後と載せた後の再照合）は理由語 `pod_shm_identity_mismatch`（種別 `pod_shm_identity`・ビヘイビア CRI-2・`ErrorCode` は `PermissionDenied`）で返り、段 `mount_tmpfs` の許可リスト経由で親へ届いて層 `mount` の監査に 1 件残る（パスなし）。往復の失敗（`setns`・`/` の素性の変化）と権限不足は違反ではなく `NotApplicable`。launcher は fork の前に、spec が固定した期待の素性と自身の起動オプションの指定の素性の一致も確かめる（多重防御）。init は pod shm の指定があるのに tmpfs の集合に `/dev/shm`（配下を含む）が残っていれば、載せる前に `FailedPrecondition` で拒否する
   - **S3 への申し送り**: `(dev, ino)` は時間をまたいで一意ではない（tmpfs の匿名 dev は解放後に再利用される）。pin より前の窓の安全は保持役が生きていることに依存するため、S3 は READY の値をそのまま渡し、plugin-cri 側で `/dev/shm` を再 stat して値を作り直さない。chroot した環境では往復の後の `/` の照合が必ず食い違い `Internal` になるため使えない（fail-closed。縮退しない）
-  - **S3 と #4888 の関係**: CRI の `mounts[]` に `/dev/shm` の bind（許可リストの宛先。[cri-config-acceptance](cri-config-acceptance.md)）があれば、S3 は pod の共有 `/dev/shm` を渡さない（S3 の受け入れ条件。cri は未実装）。core は bind と pod の共有 `/dev/shm` の併用を `OverlapsTmpfs`（監査つき）で拒否するため、S3 より前でも両方が載ることはない（#4888）
+  - **S3 と #4888 の関係**: CRI の `mounts[]` に `/dev/shm` の bind（許可リストの宛先。[cri-config-acceptance](cri-config-acceptance.md)）があれば、S3 は pod の共有 `/dev/shm` を渡さない（S3 の受け入れ条件。cri は S3 で実装済み）。core は bind と pod の共有 `/dev/shm` の併用を `OverlapsTmpfs`（監査つき）で拒否するため、両方が載ることはない（#4888）
+
+#### 実装: S3（#4823）の受け渡し
+
+- 対象: pod の共有 `/dev/shm` を、CRI の `CreateContainer`・`StartContainer` の経路で保持役の素性つきで渡し、S2 の入口（supervisor の `--pod-shm`）へ届ける。S1・S2 の init 側の複製と supervisor の入口（`--pod-shm`）は変えない。core は `StartRequest` の欄と食い違いの検査だけを足す
+- 流れ（cri → plugin-cri → supervisor → core）: 保持役の READY v4 の shm の `(dev, ino)` を `HolderIdentity` の素性として記録し（メモリ上の `SandboxRecord.pod_holder` だけ）、`start_inputs` が Start のロック区間で条件を判定して `StartRequest` の欄へ載せる。plugin-cri は `StartOptions::with_pod_shm` で `--pod-shm <dev>:<ino>:/proc/<保持役の pid>/ns/mnt` に写す。以降は S2 の経路（supervisor の入口 → `LaunchOptions::with_pod_shm` → core の pin と複製）
+- 受け渡しの運び役は `StartRequest` の欄: cri の `StartOptions` だけでは足りない（cri から plugin-cri への唯一の経路が `ContainerRuntime::start(&StartRequest)` のため）。型は S2 の `PodShmSource` を `core::traits` から再 export する（cri の adapter は `core::traits` だけを参照する契約〔CRI-7〕のため）
+- 検査の二重化: core の `start` は `StartRequest` の欄が `Some` で launcher の指定と食い違えば、予約・fork の前に `FailedPrecondition` で拒否する。core を直接使う経路で欄を黙って無視して共有を落とさないため。欄が `None` なら従来どおり通す（supervisor は argv から launcher にだけ載せ、`StartRequest` には載せないため）
+
+##### 共有の条件と一次情報
+
+オーナー決定（2026-11-19。Q1 A）: 共有は「実効の ipc が `POD` で、保持役（user＋ipc を join する）があり、CRI mounts に `/dev/shm` が無いとき」。
+
+| 記録の保持役 | 条件（mounts に `/dev/shm` 無し・ipc `POD`） | 結果 |
+| ------------ | -------------------------------------------- | ---- |
+| あり・素性あり | 真 | `PodShmSource::new("/proc/<pid>/ns/mnt", dev, ino)`（pid と素性は同じ `PodHolder` から 1 式で取る） |
+| あり・素性なし（`PodHolder::new`。照合が無効な試験用の構成） | 真 | `None`（共有しない。オーナー決定） |
+| 無し・provider 注入済み | 真 | `FAILED_PRECONDITION`（`sandbox holder is unavailable`。Stop との競合を縮退させない） |
+| sandbox の記録が無い（`begin_start` が先に拒否するため通常は到達しない） | 問わない | `FAILED_PRECONDITION`（`sandbox record is unavailable`。条件に当たらない場合の `None` と区別する） |
+| 無し・provider なし（rootful 等。join しない） | 真 | `None` |
+| 問わない | 偽 | `None` |
+
+- containerd `v2.4.2`（commit `b7a25261`）: `internal/cri/server/container_create.go` の 1151 行 `if !isInCRIMounts(devShm, config.GetMounts()) {` で、CRI mounts に無いときだけ sandbox の shm を足す。ipc のモードでは分けず、1153〜1154 行でコンテナの ipc が `NODE` のときだけ元をホストの `/dev/shm` に変える。`isInCRIMounts` は `internal/cri/server/helpers.go` 221〜228 行で `filepath.Clean` してから比べる。sandbox の ipc は常に共有される（`internal/cri/opts/spec_opts.go` 348〜371 行の `WithPodNamespaces`）。sandbox の shm は `podsandbox/sandbox_run_linux.go` 306〜318 行で `mode=1777,size=64MiB`・`nosuid,nodev,noexec`
+- containerd `v2.1.0`（commit `061792f0`）も同じ分岐を 1145〜1149 行に持つ
+- kubernetes `v1.37.1`（commit `f78e7223`）: `pkg/kubelet/kuberuntime/util/util.go` 74〜79 行で ipc は `HostIPC` なら `NODE`、それ以外は `POD`。`CONTAINER` は送らない
+- 読み: `POD` の範囲で本リポの条件と containerd は一致する。`CONTAINER`・`NODE`・保持役が無い構成・素性なしの保持役は、既存の差に従属するか、本 issue で埋めない（cri-config-acceptance.md の表）
+
+##### 記録に書かない判断（Agent の判断。オーナー了承 2026-11-19）
+
+- 記録ファイル（sandbox 記録 v2）に shm を書かない。`holder=` 行も変えない。再採用した sandbox は常に `NotReady` で、`pod_holder` が `None` のため、記録の shm を読む場面が無い（`begin_start` が `sandbox is not ready` で拒否する）。旧記録（v1・shm を知らない v2）も同じ拒否で fail-closed し、共有なしへの縮退経路は無い
+- 受け渡しは `StartRequest` → argv。bundle（config.json）は純 OCI のまま。issue 本文の「bundle へ渡し」は S2 のオーナー決定（argv）に従う
+- 再起動をまたいで保持役を生かす方式（(a)）を採るときは、記録の版を上げて shm も書く（再評価条件）
+- 稼働中のコンテナは起動時に載せた複製のマウントを持つ。保持役が消えても tmpfs の superblock は生きるため、稼働中の兄弟どうしの共有は続く（新しいコンテナは足せない）
+
+##### `verify_ready` の判断（Agent の判断）
+
+- 照合が有効な構成の `verify_ready` に、READY の shm の `dev` が plugin-cri 自身の `/dev/shm` の `dev` と同じなら拒否する（固定文言の `FAILED_PRECONDITION`。stat できないときも拒否する）
+- 理由: S2 の init の照合は「保持役の mnt ns で開いた `/dev/shm` が READY と同じ」までしか確かめない。READY の値自体がホストの tmpfs を指す（保持役に pod の tmpfs が無い）場合は弾けない。保持役の ns は plugin-cri の ns の複製なので、plugin-cri 自身の `/dev/shm` が比較対象になる
+- `/proc/<pid>/root/dev/shm` と READY の照合は足さない。同じ照合を init が使用時点で行うため、plugin-cri で先に行っても検査と使用の時点がずれるだけで強度は上がらない。実機試験 `pod_holder_bin_real`（`assert_pod_shm`）が同じ照合を持つ
+- 値は READY のまま渡し、plugin-cri で `/dev/shm` を再 stat して作り直さない（S2 の申し送り。`(dev, ino)` は時間をまたいで一意ではないため、保持役が生きている間の READY の値を使う）
+
+##### core の食い違い検査（Agent の判断）
+
+- `oci_runtime::start` は、`StartRequest` の欄と launcher の `pod_shm_source()` の食い違いを、予約と fork の前に `FailedPrecondition` で拒否する（supervisor は argv → launcher の経路のまま。`req` へは載せない）
+
+##### 残余
+
+- 64 MiB は pod の合計。兄弟が埋められる（containerd と同じ。pod 単位の cgroup は未対応）
+- 特権ランチャー経由の構成（supervisor が ambient capability つき）は、supervisor が `--pod-shm` を `Unimplemented` で拒否するため、ipc `POD` の CRI コンテナの Start が通らない（オーナー決定 2026-11-19。受け入れて明記。縮退させない）。log_path を省く利用は S3 で新たに落ちる（読みだけ。実機未確認）
+- ipc `NODE` のホスト `/dev/shm` は埋めない（オーナー決定 2026-11-19。cri が ipc `NODE` を `UNIMPLEMENTED` にしている）
+- 素性なしの保持役（`PodHolder::new`。照合が無効な試験用の構成・外部の provider）は共有しない
+- `CONTAINER`（kubelet は送らない）は共有しない（ipc を共有しない既存の差に従属。オーナー決定 2026-11-19）
+- kubelet の実機（emptyDir のホスト側 0750 への到達性・SELinux）は未確認のまま（#4895 ほか）
+- 実機の確認は PR の `production_binary_exec_real`（段 M・termination-log。成功行は試験ソースから導出して照合）で取る。手元に Linux が無いため、本書の時点では未実行（Windows のスロットの実測も PR 本文で行う）
 
 ### オーナー確認事項（#4607）
 
@@ -280,7 +333,7 @@ plugin-cri の `ProductionPodHolder`（`crates/plugin-cri/src/pod_holder.rs`）�
 
 あわせて readopt の不具合を直した（H4 の残り）: 保持役の注入下では起動の前に `pending=1`（`network_pending=0`）を書くため、クラッシュ後の再採用が `network_owned=true` に倒すと、pod network provider を差さない本番で Stop・Remove が回収待ちから抜けられなくなる。`network_owned` は `network_pending` だけから導く（`pending_unresolved` には従来どおり数える）。R11（#2940）は #2877 に依存しており循環するため、ここで直した。
 
-未実装（REPAIR-3）: 保持役の pid から `PodNamespacePaths` を作って bundle へ渡す配線（H5・#2876）は配線済みで、POD のコンテナは user・ipc に join する。保持役の netns の bundle への受け渡しも H8（#2878）で実装済み。素性（pid・starttime・ns の dev:ino）の記録と再採用時の終了済みの確認は R11（#2940）で実装済み（再採用した pid からパスやシグナルは作らない。再起動後の保持役の再採用は未採用）。未実装は、pod ネットワークの本番 provider（H10・#2879）・pid の共有・`TARGET`・`/dev/shm` の共有（設計は下の #2903 の節、判断待ちは #4607。`mounts[]` の `/dev/shm` の bind は #4888 で別に受けるため含めない）と uts の共有（U1〜U5。#4608〜#4612）。
+未実装（REPAIR-3）: 保持役の pid から `PodNamespacePaths` を作って bundle へ渡す配線（H5・#2876）は配線済みで、POD のコンテナは user・ipc に join する。保持役の netns の bundle への受け渡しも H8（#2878）で実装済み。素性（pid・starttime・ns の dev:ino）の記録と再採用時の終了済みの確認は R11（#2940）で実装済み（再採用した pid からパスやシグナルは作らない。再起動後の保持役の再採用は未採用）。`/dev/shm` の共有は S3（#4823）で実装済み（下の「実装: S3（#4823）の受け渡し」）。未実装は、pod ネットワークの本番 provider（H10・#2879）・`TARGET`（設計は下の #2903 の節。`mounts[]` の `/dev/shm` の bind は #4888 で別に受けるため含めない）と uts の共有（U1〜U5。#4608〜#4612）。
 
 ## 実装単位
 
@@ -315,4 +368,4 @@ uts は #4334 の配下に起票済み。pid・`TARGET`・`/dev/shm` はオー�
 | U5 | #4612 | cri: uts の path と hostname の抑止・実機試験の段 | oci-cri-builder | U3・U4 |
 | 判断 | #4607 | pid・`TARGET`・`/dev/shm` の受け入れ判断（O1〜O6。人間担当、#816 の配下） | 人間 | なし |
 
-判断後に起票する単位（未起票）: P1 core: join の pid の検査／P2 core: joined pid ns の init の証跡／P3 core: `Pid1Target`・reapply／P4 supervisor: init 終了時の `cgroup.kill`／M1 core＋supervisor: 保持役の mount ns と空の root／P5 core＋supervisor: pod-init と pid ns／P6 plugin-cri: pid の素性の照合と NOTREADY／P7 cri: bundle の pid の path と既定値／P8 ci: 実機試験／T1 core: target の pid ns の解決／T2 cri: `target_id` の検証／S0: 案 A の一次情報と PoC／S1: 保持役の shm の tmpfs／S2 core: `setns` の往復による clone と載せる処理／S3 cri: 受け渡し。
+判断後に起票する単位（未起票）: P1 core: join の pid の検査／P2 core: joined pid ns の init の証跡／P3 core: `Pid1Target`・reapply／P4 supervisor: init 終了時の `cgroup.kill`／M1 core＋supervisor: 保持役の mount ns と空の root／P5 core＋supervisor: pod-init と pid ns／P6 plugin-cri: pid の素性の照合と NOTREADY／P7 cri: bundle の pid の path と既定値／P8 ci: 実機試験／T1 core: target の pid ns の解決／T2 cri: `target_id` の検証／S0: 案 A の一次情報と PoC／S1: 保持役の shm の tmpfs／S2 core: `setns` の往復による clone と載せる処理／S3 cri: 受け渡し（#4823 で実装済み）。

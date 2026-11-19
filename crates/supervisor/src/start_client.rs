@@ -274,7 +274,7 @@ impl<'a> StartOptions<'a> {
         self
     }
 
-    /// pod で共有する `/dev/shm` の元を設定する（`None` は argv に載せない。CRI-2・#4822。本番の呼び出し元は S3〔#4823〕で未配線）。
+    /// pod で共有する `/dev/shm` の元を設定する（`None` は argv に載せない。CRI-2・#4822。本番の呼び出し元は S3〔#4823〕の plugin-cri）。
     pub fn with_pod_shm(mut self, source: Option<&'a PodShmSource>) -> Self {
         self.pod_shm = source;
         self

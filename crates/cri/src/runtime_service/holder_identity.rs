@@ -247,12 +247,13 @@ mod tests {
             ns(4, 4026531837),
             ns(4, 4026531839),
             ns(4, 4026531840),
+            ns(48, 2),
         )
         .unwrap()
         .with_pid_ns(ns(4, 4026531841))
         .unwrap();
         assert_eq!(RecordedHolderIdentity::from(&id), with);
-        let base = HolderIdentity::new(4242, 1, ns(4, 1), ns(4, 2), ns(4, 3)).unwrap();
+        let base = HolderIdentity::new(4242, 1, ns(4, 1), ns(4, 2), ns(4, 3), ns(48, 2)).unwrap();
         for bad in [ns(4, 0), ns(4, 2), ns(5, 4)] {
             assert!(base.with_pid_ns(bad).is_err(), "{bad:?}");
         }
@@ -290,16 +291,31 @@ mod tests {
     #[test]
     fn cri2_sec5_2940_holder_identity_invariants() {
         let same = ns(4, 7);
-        assert!(HolderIdentity::new(4242, 1, same, same, same).is_err());
-        assert!(HolderIdentity::new(0, 1, ns(4, 1), ns(4, 2), ns(4, 3)).is_err());
+        assert!(HolderIdentity::new(4242, 1, same, same, same, ns(48, 2)).is_err());
+        assert!(HolderIdentity::new(0, 1, ns(4, 1), ns(4, 2), ns(4, 3), ns(48, 2)).is_err());
         let id = HolderIdentity::new(
             4242,
             123456,
             ns(4, 4026531837),
             ns(4, 4026531839),
             ns(4, 4026531840),
+            ns(48, 2),
         )
         .unwrap();
         assert_eq!(RecordedHolderIdentity::from(&id), sample());
+        // #4823: shm は dev・ino が非 0 で、dev が nsfs と違うときだけ受ける。
+        let (u, i, n) = (ns(4, 1), ns(4, 2), ns(4, 3));
+        for bad in [ns(0, 2), ns(48, 0), ns(4, 9)] {
+            assert!(
+                HolderIdentity::new(4242, 1, u, i, n, bad).is_err(),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            HolderIdentity::new(4242, 1, u, i, n, ns(48, 2))
+                .unwrap()
+                .shm(),
+            ns(48, 2)
+        );
     }
 }

@@ -28,7 +28,7 @@
 //!
 //! # 未実装・残余（REPAIR-3）
 //!
-//! - 本番の呼び出し元（plugin-cri が保持役の pid と READY の素性から指定を組んで supervisor の argv へ渡す配線）は S3（#4823）。
+//! - 本番の指定元は S3（#4823）の経路（cri が `StartRequest::with_pod_shm` へ載せ、plugin-cri が supervisor の argv へ写す）。core の `start` は指定が launcher と食い違えば fork の前に `FailedPrecondition` で拒否する。
 //! - 非 Linux では固定できず `Unimplemented`（fail-closed）。
 
 use std::path::{Path, PathBuf};

@@ -675,6 +675,16 @@ fn claim_inner_with_swap(
     req: &StartRequest,
     pin_swap: Option<&mut dyn FnMut()>,
 ) -> Result<ClaimedStart, TraitError> {
+    // 要求の pod shm と launcher 側の指定が食い違えば、予約・fork の前に拒否する(欄を黙って無視しない。
+    // CRI-2・CORE-3・SEC-1・#4823)。`None` は従来どおり通す。
+    if let Some(want) = req.pod_shm()
+        && launcher.pod_shm_source() != Some(want)
+    {
+        return Err(TraitError::new(
+            ErrorCode::FailedPrecondition,
+            "the requested pod shm does not match the launcher's pod shm",
+        ));
+    }
     let reservation = Arc::new(StartReservation::acquire(req.id())?);
     let record = store.get(&GetStateRequest::new(req.id().clone()))?;
     if record.status().state() != ContainerState::Created {
@@ -1845,6 +1855,8 @@ mod tests {
         terminal_support: AtomicBool,
         /// `netns_join_target` が返す参加先(未設定なら `None`。NET-1・#3069)。
         netns_target: std::sync::OnceLock<super::super::NetnsJoinTarget>,
+        /// `pod_shm_source` が返す指定(未設定なら `None`。#4823)。
+        pod_shm: std::sync::OnceLock<super::super::PodShmSource>,
     }
 
     impl RecordingLauncher {
@@ -1869,6 +1881,7 @@ mod tests {
                 network_mode: Mutex::new(super::super::network_mode::LaunchNetworkMode::FromConfig),
                 terminal_support: AtomicBool::new(false),
                 netns_target: std::sync::OnceLock::new(),
+                pod_shm: std::sync::OnceLock::new(),
             })
         }
 
@@ -1952,6 +1965,10 @@ mod tests {
 
         fn netns_join_target(&self) -> Option<&super::super::NetnsJoinTarget> {
             self.netns_target.get()
+        }
+
+        fn pod_shm_source(&self) -> Option<&super::super::PodShmSource> {
+            self.pod_shm.get()
         }
 
         fn rejection_audit_sink(&self) -> Option<&dyn crate::audit_log::AuditSink> {
@@ -2143,6 +2160,44 @@ mod tests {
                 {"type": "ipc"}
             ]}
         })
+    }
+
+    /// CRI-2・CORE-3・SEC-1(#4823): 要求の pod shm が launcher の指定と食い違えば、予約・launch の前に
+    /// `FailedPrecondition` で拒否し、状態は Created のまま残る。
+    #[test]
+    fn cri2_4823_start_rejects_pod_shm_mismatch_before_launch() {
+        let want = super::super::PodShmSource::new(PathBuf::from("/proc/1234/ns/mnt"), 48, 2)
+            .expect("source");
+        let other = super::super::PodShmSource::new(PathBuf::from("/proc/1234/ns/mnt"), 48, 3)
+            .expect("source");
+        for (name, launcher_side) in [("pshm-none", None), ("pshm-other", Some(other))] {
+            let (_b, store) = created(name);
+            let launcher = RecordingLauncher::new(false);
+            if let Some(o) = launcher_side {
+                assert!(launcher.pod_shm.set(o).is_ok());
+            }
+            let req = sid(name).with_pod_shm(want.clone());
+            let err = match start(
+                &store,
+                &OpRecorder::new(),
+                &dynl(&launcher),
+                &req,
+                &StartTimeouts::default(),
+            ) {
+                Ok(_) => panic!("must fail"),
+                Err(e) => e,
+            };
+            assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+            assert_eq!(
+                err.message(),
+                "the requested pod shm does not match the launcher's pod shm"
+            );
+            assert_eq!(launcher.calls(), 0);
+            let got = store
+                .get(&GetStateRequest::new(ContainerId::new(name).expect("id")))
+                .expect("stored");
+            assert_eq!(got.status().state(), ContainerState::Created);
+        }
     }
 
     /// 拒否ケース名と config 変更関数の組。

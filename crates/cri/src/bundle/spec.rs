@@ -22,7 +22,9 @@
 //!   `linux.namespaces[].path` で join する（core が user＋ipc の組と、それに net を足す形を受ける〔#2872〕。CRI-2・CORE-3。#2674）。
 //!   [`PodNamespacePaths`] は保持役の pid から `/proc/<pid>/ns/{user,ipc,net}` だけを組み立てる（#2776・#2878）。
 //!   `CriRuntimeService` は保持役の provider を注入したときだけ自 sandbox の記録の pid から作った値を渡す（#2876）。
-//!   本番（plugin-cri）は Linux・非 root で provider を注入済み（H6・#2877）のため共有される。rootful など注入しない構成では新しい namespace になる。`/dev/shm` は共有しない（core がコンテナごとの tmpfs を載せる）。`/proc/<pid>` を
+//!   本番（plugin-cri）は Linux・非 root で provider を注入済み（H6・#2877）のため共有される。rootful など注入しない構成では新しい namespace になる。
+//!   `/dev/shm` は ipc を join し CRI mounts に `/dev/shm` が無いときだけ pod の tmpfs を共有する（条件は `shares_pod_shm`。
+//!   config.json には出さず、Start が `StartRequest` の pod shm として渡す。CRI-2・CORE-3・SEC-1・#4823）。それ以外は core がコンテナごとの tmpfs を載せる。`/proc/<pid>` を
 //!   Create の時点で書く方式は pid の再利用で別 pod の namespace へ入り得る（SEC-1）ため採らない。
 //! - network namespace: `POD` / `CONTAINER` は `{"type":"network"}` を出す。`POD` で pod の netns のパスを受けたとき
 //!   （[`build_runtime_config_with_pod_netns`]。`NetworkPlugin` 経由で作って結線した netns。#2675・NET-1）は
@@ -942,6 +944,42 @@ fn resolve_mode(field: &'static str, v: i32) -> Result<NamespaceMode, CriError> 
     NamespaceMode::try_from(v).map_err(|_| invalid(field))
 }
 
+/// 実効の namespace_options の ipc が `POD` か（未指定は CRI の既定値の `POD`）。`namespaces` の join の判定と同じ解釈で、
+/// 未知の値は偽（Create が `INVALID_ARGUMENT` にするため Start には届かない）。
+fn ipc_is_pod(opts: Option<&NamespaceOption>) -> bool {
+    let default = NamespaceOption::default();
+    let o = opts.unwrap_or(&default);
+    matches!(
+        resolve_mode("namespace_options.ipc", o.ipc),
+        Ok(NamespaceMode::Pod)
+    )
+}
+
+/// コンテナが pod の `/dev/shm`（保持役の tmpfs）を共有する条件のうち、config から決まる部分（ipc が `POD` で、CRI mounts に
+/// `/dev/shm` が無い）。保持役の有無は呼び出し側（`CriRuntimeService` の Start）が見る。コンテナの namespace_options が
+/// 無ければ sandbox のものを使う（`build_inner` と同じ選び方）。config.json は変えない（CRI-2・CORE-3・SEC-1・#4823）。
+///
+/// `/dev/shm` の完全一致で足りるのは、Create が `check_canonical_path` で非正規形を `INVALID_ARGUMENT` にするため。
+pub(crate) fn shares_pod_shm(sandbox: &PodSandboxConfig, container: &ContainerConfig) -> bool {
+    let opts = container
+        .linux
+        .as_ref()
+        .and_then(|l| l.security_context.as_ref())
+        .and_then(|s| s.namespace_options.as_ref())
+        .or_else(|| {
+            sandbox
+                .linux
+                .as_ref()
+                .and_then(|l| l.security_context.as_ref())
+                .and_then(|s| s.namespace_options.as_ref())
+        });
+    ipc_is_pod(opts)
+        && !container
+            .mounts
+            .iter()
+            .any(|m| m.container_path == "/dev/shm")
+}
+
 /// コンテナの namespace_options（無ければ sandbox の）を読み、`linux.namespaces` を決める。
 ///
 /// `pod` があり ipc が `POD` のときだけ、ipc と user を既存 namespace への join（`path` 付き）にする。pid は加えて
@@ -966,7 +1004,7 @@ fn namespaces<'a>(
     if matches!(ipc_mode, NamespaceMode::Node | NamespaceMode::Target) {
         return Err(unsupported("namespace_options.ipc"));
     }
-    // ipc: POD で供給元があれば join、それ以外はコンテナごとの新しい namespace。
+    // ipc: POD で供給元があれば join、それ以外はコンテナごとの新しい namespace（`ipc_is_pod` と同じ判定。#4823）。
     let join = pod.filter(|_| ipc_mode == NamespaceMode::Pod);
     // pid: POD で保持役が pod の pid ns を持つときだけ join する（#4817）。core は pid の join を user＋ipc の組に足す形で
     // しか受けないため、ipc を join しない構成は cri で先に `UNIMPLEMENTED` にする（共有の要求を黙って落とさない）。
@@ -1915,6 +1953,106 @@ mod tests {
             let e = PodNamespacePaths::for_holder_pid(NonZeroU32::new(over).expect("nz"))
                 .expect_err("over");
             assert_eq!(e.code(), CriErrorCode::Internal);
+        }
+    }
+
+    /// CRI-2・CORE-3・SEC-1・#4823: `shares_pod_shm` の真理値表。各行で、同じ入力から作った config.json の
+    /// 「ipc と user に path がある かつ 宛先 `/dev/shm` の bind が無い」と一致する（条件の二重化のずれの検出）。
+    #[test]
+    fn cri2_4823_shares_pod_shm_truth_table_matches_config_json() {
+        use crate::runtime::v1::{
+            LinuxContainerConfig, LinuxContainerSecurityContext, LinuxPodSandboxConfig,
+            LinuxSandboxSecurityContext,
+        };
+        use NamespaceMode::{Container, Pod};
+        let opts = |ipc: Option<NamespaceMode>| {
+            ipc.map(|m| NamespaceOption {
+                ipc: m as i32,
+                // ipc を join しない行で network `POD` が `UNIMPLEMENTED` にならないよう、network は pod にしない。
+                network: if m == Pod { Pod } else { Container } as i32,
+                ..Default::default()
+            })
+        };
+        let sandbox = |ipc: Option<NamespaceMode>| PodSandboxConfig {
+            linux: Some(LinuxPodSandboxConfig {
+                security_context: Some(LinuxSandboxSecurityContext {
+                    namespace_options: opts(ipc),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let container = |ipc: Option<NamespaceMode>, mounts: &[&str]| ContainerConfig {
+            command: vec!["/bin/sleep".to_owned(), "30".to_owned()],
+            linux: Some(LinuxContainerConfig {
+                security_context: Some(LinuxContainerSecurityContext {
+                    namespace_options: opts(ipc),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            mounts: mounts
+                .iter()
+                .map(|d| Mount {
+                    container_path: (*d).to_owned(),
+                    host_path: "/var/lib/fc-4823".to_owned(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        // (sandbox の ipc, container の ipc, mounts, 期待)。container が None なら sandbox へフォールバック。
+        type Row<'a> = (
+            Option<NamespaceMode>,
+            Option<NamespaceMode>,
+            &'a [&'a str],
+            bool,
+        );
+        let rows: &[Row<'_>] = &[
+            (None, None, &[], true),
+            (Some(Pod), None, &[], true),
+            (Some(Container), None, &[], false),
+            (None, Some(Pod), &[], true),
+            (None, Some(Container), &[], false),
+            (Some(Container), Some(Pod), &[], true),
+            (Some(Pod), Some(Container), &[], false),
+            (None, None, &["/dev/termination-log"], true),
+            (None, None, &["/dev/shm"], false),
+            (None, None, &["/dev/termination-log", "/dev/shm"], false),
+            (Some(Container), None, &["/dev/shm"], false),
+        ];
+        let pod =
+            PodNamespacePaths::for_holder_pid(NonZeroU32::new(4242).expect("nz")).expect("paths");
+        for (sb_ipc, c_ipc, mounts, want) in rows {
+            let (sb, c) = (sandbox(*sb_ipc), container(*c_ipc, mounts));
+            assert_eq!(
+                shares_pod_shm(&sb, &c),
+                *want,
+                "{sb_ipc:?} {c_ipc:?} {mounts:?}"
+            );
+            let json = build_runtime_config_with_pod_namespaces(
+                &sb,
+                &c,
+                &ImageDefaults::default(),
+                Some(&pod),
+            )
+            .expect("config");
+            let v: serde_json::Value = serde_json::from_slice(json.as_bytes()).expect("json");
+            let ns_has_path = |kind: &str| {
+                v["linux"]["namespaces"]
+                    .as_array()
+                    .and_then(|a| a.iter().find(|n| n["type"] == kind))
+                    .is_some_and(|n| n["path"].is_string())
+            };
+            let shm_bind = v["mounts"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|m| m["destination"] == "/dev/shm"));
+            assert_eq!(
+                ns_has_path("ipc") && ns_has_path("user") && !shm_bind,
+                *want,
+                "config.json disagrees: {sb_ipc:?} {c_ipc:?} {mounts:?}"
+            );
         }
     }
 }

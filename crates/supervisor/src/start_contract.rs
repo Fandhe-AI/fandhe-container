@@ -22,6 +22,9 @@
 //!   core の `LaunchOptions::with_pod_shm` へ渡す（CRI-2・CORE-3・SEC-1・SEC-5・#4822。plugin-cri 専用で CLI は渡さない。
 //!   `dev`・`ino` は正準な 10 進・非 0、パスは [`PodShmSource::new`] が字句検査する。**特権ランチャー経由〔ambient capability あり〕では
 //!   `Unimplemented` で拒否する**。本番の指定元は S3〔#4823〕の cri が `StartRequest` へ載せ plugin-cri が写す）。
+//!   `--pid-target <コンテナ ID>` は任意で、pid namespace の TARGET（別コンテナの pid ns の init の直下の子として参加する。
+//!   CRI-2・CORE-3・SEC-1・SEC-5・#4819。plugin-cri 専用で CLI は渡さない）。対象の launch pidfd は対象の supervisor の制御チャネル
+//!   から受け取る（記録 pid からの `pidfd_open` へは縮退しない）。**特権ランチャー経由では `Unimplemented` で拒否する**。
 //!   各オプションは 1 回まで・順不同で、`<container-id>` は末尾の位置引数 1 個。
 //! - 契約の fd は 0〜2 のみ。supervisor は入口（`start_entry`）で fd [`FIRST_INHERITED_FD`] 以降を閉じる
 //!   （特権ランチャーと同じ処理。#2070・SEC-1）。呼び出し側が追加の fd を渡しても使われない。exec から入口までの
@@ -95,8 +98,8 @@ pub const REPORT_MAGIC: &str = "FCSUP1";
 pub const MAX_REPORT_LEN: usize = 640;
 /// 報告に載せる `message` の最大バイト数。
 pub const MAX_REPORT_MESSAGE_LEN: usize = 512;
-/// argv の最大要素数（プログラム名を除く）。`start` + 6 オプション（各 2 要素）+ `<container-id>` で 14。
-pub const MAX_ARGS: usize = 14;
+/// argv の最大要素数（プログラム名を除く）。`start` + 7 オプション（各 2 要素）+ `<container-id>` で 16。
+pub const MAX_ARGS: usize = 16;
 /// argv の 1 要素の最大バイト数。
 pub const MAX_ARG_LEN: usize = 4096;
 /// cgroup の準備（mkdir・退避・制限の設定）に見込む時間。
@@ -309,6 +312,9 @@ pub struct StartArgs {
     /// pod で共有する `/dev/shm` の元（`--pod-shm`。字句検査済み。CRI-2・CORE-3・SEC-1・SEC-5・#4822）。未指定は従来どおり
     /// コンテナごとの `/dev/shm`。入口が `LaunchOptions::with_pod_shm` へ渡す（特権ランチャー経由では拒否する）。
     pub pod_shm: Option<PodShmSource>,
+    /// pid namespace の TARGET（`--pid-target`。対象コンテナの ID。CRI-2・CORE-3・SEC-1・SEC-5・#4819）。未指定は従来どおり。
+    /// 入口が対象の launch pidfd を状態ストアと制御チャネルから解決して pid ns を固定する（特権ランチャー経由では拒否する）。
+    pub pid_target: Option<ContainerId>,
     /// 起動するコンテナの ID。
     pub id: ContainerId,
 }
@@ -367,11 +373,12 @@ impl StartArgs {
         let mut cri_log_path: Option<String> = None;
         let mut stdin: Option<String> = None;
         let mut pod_shm: Option<String> = None;
+        let mut pid_target: Option<String> = None;
         let mut id: Option<String> = None;
         while let Some(tok) = it.next() {
             match tok.as_str() {
                 "--root" | "--restart" | "--audit-policy" | "--cri-log-path" | "--stdin"
-                | "--pod-shm" => {
+                | "--pod-shm" | "--pid-target" => {
                     let value = it
                         .next()
                         .ok_or_else(|| invalid("option value is missing"))?;
@@ -381,6 +388,7 @@ impl StartArgs {
                         "--cri-log-path" => &mut cri_log_path,
                         "--stdin" => &mut stdin,
                         "--pod-shm" => &mut pod_shm,
+                        "--pid-target" => &mut pid_target,
                         _ => &mut audit_policy,
                     };
                     if slot.replace(value).is_some() {
@@ -411,6 +419,11 @@ impl StartArgs {
         let cri_log_path = cri_log_path.map(ContainerLogPath::new).transpose()?;
         let stdin = stdin.map(|v| v.parse::<StdinOption>()).transpose()?;
         let pod_shm = pod_shm.as_deref().map(parse_pod_shm_arg).transpose()?;
+        let pid_target = pid_target
+            .map(|v| {
+                ContainerId::new(v).map_err(|_| invalid("--pid-target must be a container id"))
+            })
+            .transpose()?;
         let id =
             ContainerId::new(id.ok_or_else(|| invalid("exactly one container id is required"))?)?;
         Ok(Self {
@@ -420,6 +433,7 @@ impl StartArgs {
             cri_log_path,
             stdin,
             pod_shm,
+            pid_target,
             id,
         })
     }
@@ -802,6 +816,67 @@ mod tests {
         assert_eq!(all.stdin, Some(StdinOption::Once));
     }
 
+    /// CRI-2・CORE-3・SEC-1・SEC-5・#4819: `--pid-target <コンテナ ID>` の受理（具体値）・不正値・重複・値の欠落、
+    /// 全オプション同時の 16 要素（上限ちょうど）の受理と 17 要素の拒否。
+    #[test]
+    fn cri2_4819_parse_pid_target() {
+        let none = StartArgs::parse(os(&["start", "--root", ROOT, "c1"])).unwrap();
+        assert_eq!(none.pid_target, None);
+        let one =
+            StartArgs::parse(os(&["start", "--pid-target", "t1", "--root", ROOT, "c1"])).unwrap();
+        assert_eq!(one.pid_target.as_ref().map(ContainerId::as_str), Some("t1"));
+        let all = StartArgs::parse(os(&[
+            "start",
+            "--root",
+            ROOT,
+            "--restart",
+            "always",
+            "--audit-policy",
+            "strict",
+            "--cri-log-path",
+            "/l/c/0.log",
+            "--stdin",
+            "once",
+            "--pod-shm",
+            "48:2:/proc/1234/ns/mnt",
+            "--pid-target",
+            "t1",
+            "c1",
+        ]))
+        .unwrap();
+        assert_eq!(all.pid_target.as_ref().map(ContainerId::as_str), Some("t1"));
+        assert_eq!(MAX_ARGS, 16);
+        for bad in [
+            vec!["start", "--root", ROOT, "--pid-target", "c1"],
+            vec!["start", "--root", ROOT, "c1", "--pid-target"],
+            vec!["start", "--root", ROOT, "--pid-target", "bad/id", "c1"],
+            vec!["start", "--root", ROOT, "--pid-target", "", "c1"],
+            vec![
+                "start",
+                "--root",
+                ROOT,
+                "--pid-target",
+                "t1",
+                "--pid-target",
+                "t2",
+                "c1",
+            ],
+        ] {
+            let e = StartArgs::parse(os(&bad)).expect_err("must be rejected");
+            assert_eq!(e.code(), ErrorCode::InvalidArgument, "input: {bad:?}");
+        }
+        let e = StartArgs::parse(os(&[
+            "start",
+            "--root",
+            ROOT,
+            "--pid-target",
+            "bad/id",
+            "c1",
+        ]))
+        .expect_err("bad id");
+        assert_eq!(e.message(), "--pid-target must be a container id");
+    }
+
     /// CRI-2・CORE-3・SEC-1・#4822: `--pod-shm <dev>:<ino>:<パス>` の受理（具体値）と、全オプション同時の 14 要素の受理。
     #[test]
     fn cri2_4822_parse_pod_shm() {
@@ -820,7 +895,7 @@ mod tests {
         assert_eq!(source.path(), std::path::Path::new("/proc/1234/ns/mnt"));
         assert_eq!(source.identity(), (48, 2));
         assert_eq!(source.pid(), 1234);
-        // 全オプション同時: `start` + 6 オプション（12 要素）+ id で 14 要素ちょうど（上限）。
+        // 全オプション同時: `start` + 6 オプション（12 要素）+ id で 14 要素（上限 16 の内側）。
         let all = StartArgs::parse(os(&[
             "start",
             "--root",

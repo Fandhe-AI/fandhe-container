@@ -1470,6 +1470,13 @@ impl ProcessLauncher for SpecCapturingLauncher {
         self.inner.pod_shm_source()
     }
 
+    /// 内側の launcher の pid namespace の TARGET を転送する(転送しないと既定の `None` になり、start が参加先を固定せず、本番
+    /// launcher が自身の起動オプションとの食い違いを `FailedPrecondition` で拒否する。黙って自分の pid ns へ縮退して起動しない。
+    /// CRI-2・SEC-1・#4819)。
+    fn pid_target(&self) -> Option<&fandhe_container_core::oci_runtime::PinnedPidTarget> {
+        self.inner.pid_target()
+    }
+
     /// 内側の launcher の監査 sink を転送する(転送しないと既定の `None` になり、start の設定検証での拒否が
     /// 本番で監査に記録されず黙って落ちる。SEC-4・#1915)。
     fn rejection_audit_sink(&self) -> Option<&dyn fandhe_container_core::audit_log::AuditSink> {
@@ -2101,6 +2108,40 @@ mod tests {
         let want: &dyn fandhe_container_core::audit_log::AuditSink = &FAKE_SINK;
         assert!(std::ptr::addr_eq(got, want));
     }
+    /// pid namespace の TARGET を答える launcher(転送の照合用。CRI-2・#4819)。
+    #[cfg(target_os = "linux")]
+    struct PidTargetFake(fandhe_container_core::oci_runtime::PinnedPidTarget);
+
+    #[cfg(target_os = "linux")]
+    impl ProcessLauncher for PidTargetFake {
+        fn launch(
+            &self,
+            _spec: &LaunchSpec,
+            _timeout: Duration,
+        ) -> Result<Box<dyn LaunchedProcess>, TraitError> {
+            Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+        }
+
+        fn pid_target(&self) -> Option<&fandhe_container_core::oci_runtime::PinnedPidTarget> {
+            Some(&self.0)
+        }
+    }
+
+    /// CRI-2・SEC-1・#4819: `SpecCapturingLauncher` は内側の pid namespace の TARGET を転送する(転送しないと既定の `None` になり、
+    /// start が固定せず、本番 launcher が食い違いで起動を拒否する)。内側が持たなければ `None` のまま。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cri2_4819_spec_capturing_launcher_forwards_pid_target() {
+        let pidfd = std::fs::File::open("/dev/null").expect("open").into();
+        let ns = std::fs::File::open("/dev/null").expect("open").into();
+        let target =
+            fandhe_container_core::oci_runtime::PinnedPidTarget::for_test(pidfd, ns, (1, 2));
+        let wrapped = SpecCapturingLauncher::new(Arc::new(PidTargetFake(target.clone())));
+        assert_eq!(wrapped.pid_target(), Some(&target));
+        let plain = SpecCapturingLauncher::new(Arc::new(SelfBoundedFake));
+        assert_eq!(plain.pid_target(), None);
+    }
+
     /// pod の共有 `/dev/shm` の元を答える launcher(転送の照合用。CRI-2・#4822)。
     struct PodShmFake(fandhe_container_core::oci_runtime::PodShmSource);
 

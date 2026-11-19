@@ -1344,6 +1344,12 @@ impl ProcessLauncher for PastaAttachingLauncher {
         self.inner.pod_shm_source()
     }
 
+    /// pid namespace の TARGET を内側へ転送する（転送しないと既定の `None` へ縮退し、start が参加先を固定せず、本番 launcher が
+    /// 食い違いを `FailedPrecondition` で拒否して起動しない。CRI-2・SEC-1・#4819）。
+    fn pid_target(&self) -> Option<&fandhe_container_core::oci_runtime::PinnedPidTarget> {
+        self.inner.pid_target()
+    }
+
     /// 端末つき起動の opt-in を内側へ転送する（転送しないと `false` へ縮退し、端末つきの起動が拒否される。
     /// CRI-6・SEC-1・#4070）。supervisor 自身の opt-in と master の保持は #4074。
     fn supports_terminal(&self) -> bool {

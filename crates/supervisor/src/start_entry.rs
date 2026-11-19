@@ -2534,6 +2534,10 @@ mod linux {
         /// argv の `--pod-shm`（`with_pod_shm`。CRI-2・CORE-3・SEC-1・SEC-5・#4822）。`build_launcher` が core の
         /// `LaunchOptions::with_pod_shm` へ渡す（[`apply_pod_shm`]）。特権ランチャー経由（ambient capability あり）では拒否する。
         pod_shm: Option<fandhe_container_core::oci_runtime::PodShmSource>,
+        /// argv の `--pid-target`（`with_pid_target`。CRI-2・CORE-3・SEC-1・SEC-5・#4819）。`build_launcher` が対象の状態記録と
+        /// 対象の supervisor の launch pidfd から pid ns を解決・固定して core の `LaunchOptions::with_pid_target` へ渡す
+        /// （[`resolve_pid_target`]）。特権ランチャー経由（ambient capability あり）では拒否する。
+        pid_target: Option<ContainerId>,
         /// 起動オプション文書の読み込みの失敗(`with_container_options_error`)。手順 4 が返して cgroup にも launch にも触れずに
         /// 止める(壊れた文書を既定値で黙って読み替えない。fail-closed。SUP-12・SEC-1・#2713)。
         container_options_error: Option<TraitError>,
@@ -2684,6 +2688,7 @@ mod linux {
                 cri_log_path: None,
                 stdin: None,
                 pod_shm: None,
+                pid_target: None,
                 container_options_error: None,
                 options_generation: None,
                 pasta_target: None,
@@ -2760,6 +2765,18 @@ mod linux {
             source: Option<fandhe_container_core::oci_runtime::PodShmSource>,
         ) -> Self {
             self.pod_shm = source;
+            self
+        }
+
+        /// argv の `--pid-target` を設定する（CRI-2・CORE-3・SEC-1・SEC-5・#4819）。
+        ///
+        /// 指定があれば `build_launcher` が対象の pid ns を fork の前に解決して固定し、launcher の起動オプションへ足す（restart の
+        /// 再 launch も同じ launcher を使い、再解決はしない。対象の終了は launch の前に拒否される）。特権ランチャー経由
+        /// （effective / permitted の capability あり）では `Unimplemented` で拒否する（`deny_pid_target_with_elevated_capabilities`）。
+        /// 本番の指定元（plugin-cri）は #4820。
+        #[must_use]
+        pub fn with_pid_target(mut self, target: Option<ContainerId>) -> Self {
+            self.pid_target = target;
             self
         }
 
@@ -2985,6 +3002,38 @@ mod linux {
         })
     }
 
+    /// 対象の launch pidfd の受け取りに使う時間の上限（接続・Hello・要求・応答。`start` の結果期限の準備枠に収まる値。#4819）。
+    const PID_TARGET_OBTAIN_BUDGET: Duration = Duration::from_secs(2);
+
+    /// `--pid-target` を、effective / permitted の capability を持つ supervisor（特権ランチャー経由）では `Unimplemented` で拒否する
+    /// （純関数。`/proc/self/status` の内容を受ける。読めない・壊れている場合も fail-closed。CRI-2・SEC-1・SUP-14・#4819）。
+    fn deny_pid_target_with_elevated_capabilities(status: &str) -> Result<(), TraitError> {
+        crate::logs::cri::deny_elevated_capabilities(status).map_err(|e| {
+            TraitError::new(
+                e.code(),
+                "a pid namespace target is not supported with elevated capabilities",
+            )
+        })
+    }
+
+    /// 対象コンテナの pid namespace を解決して固定する（状態ストアの記録と、対象の supervisor の制御チャネルの launch pidfd。
+    /// 記録の pid から `pidfd_open` へは縮退しない。CRI-2・CORE-3・SEC-1・SEC-5・#4819）。
+    ///
+    /// 受け取った接続は pidfd の複製を取ってすぐ閉じる（exec 子 cgroup の通知はしない。対象の supervisor の ExecGuard の枠を
+    /// 長く占有しない）。失敗の文言は core の固定の語彙（ID・パス・pid を含めない）。
+    fn resolve_pid_target(
+        store: &dyn StateStore,
+        source: &dyn crate::control::ExecPidfdSource,
+        target: &ContainerId,
+    ) -> Result<fandhe_container_core::oci_runtime::PinnedPidTarget, TraitError> {
+        fandhe_container_core::oci_runtime::PinnedPidTarget::resolve(store, target, |pid| {
+            let handover = source.obtain(target, pid, Instant::now() + PID_TARGET_OBTAIN_BUDGET)?;
+            handover.pidfd().try_clone_to_owned().map_err(|_| {
+                TraitError::new(ErrorCode::Internal, "failed to duplicate the launch pidfd")
+            })
+        })
+    }
+
     impl StartDeps for ProductionStartDeps {
         fn seccomp_hub(&self) -> Option<Arc<SeccompNotifyHub>> {
             self.seccomp.clone()
@@ -3020,6 +3069,10 @@ mod linux {
             // へ入る経路を作らないため、副作用（cgroup の連鎖）の前に拒否する（fail-closed。CRI-2・SEC-1・SUP-14・#4822）。
             if self.pod_shm.is_some() {
                 deny_pod_shm_with_elevated_capabilities(&read_self_status()?)?;
+            }
+            // pid の TARGET（`--pid-target`）も同じ理由で、cgroup の連鎖の前に拒否する（#4819）。
+            if self.pid_target.is_some() {
+                deny_pid_target_with_elevated_capabilities(&read_self_status()?)?;
             }
             // pasta 構成の前提は cgroup の連鎖の前に確かめる(再検証済みのバイナリが無いまま、またはユーザー定義名の
             // 無いまま pasta を走らせない。固定文言。NET-9・12.4・#1940)。
@@ -3189,6 +3242,21 @@ mod linux {
                 deny_pod_shm_with_elevated_capabilities(&read_self_status()?)?;
             }
             let launch_options = apply_pod_shm(launch_options, self.pod_shm.clone())?;
+            // pid の TARGET: 対象の状態記録と launch pidfd から pid ns を fork の前に解決して固定する。失敗は手順 5〜7 の他の失敗と
+            // 同じ経路（cgroup の後始末）で処理される（#4819）。restart の再 launch は同じ launcher・同じ固定を使い、再解決しない。
+            let launch_options = match &self.pid_target {
+                Some(target) => {
+                    deny_pid_target_with_elevated_capabilities(&read_self_status()?)?;
+                    let store = crate::state::open_default_store(Some(self.root.clone()))?;
+                    let source = crate::control::production_exec_pidfd_source(store.as_ref());
+                    launch_options.with_pid_target(resolve_pid_target(
+                        store.as_ref(),
+                        source.as_ref(),
+                        target,
+                    )?)
+                }
+                None => launch_options,
+            };
             // rootless のユーザー定義名(Attachable)のときだけ、exec 前の同期点で holder と pasta を結線する(#1940)。
             let wiring = self.pasta_wiring()?;
             // 手順 4b / 後始末(`prepare_network` / `release_network`)が同じ結線を使えるよう控える。
@@ -3945,7 +4013,8 @@ mod linux {
             .with_audit_policy(args.audit_policy)
             .with_cri_log_path(args.cri_log_path.clone())
             .with_stdin_option(args.stdin)
-            .with_pod_shm(args.pod_shm.clone());
+            .with_pod_shm(args.pod_shm.clone())
+            .with_pid_target(args.pid_target.clone());
         // pasta 構成の結線先(コンテナ ID と、ストアの検査済みの状態ルート)。ユーザー定義名のときだけ使われる(#1940)。
         let deps = deps.with_pasta_target(
             args.id.clone(),
@@ -4264,6 +4333,95 @@ mod linux {
                     "pod shm is not supported with elevated capabilities"
                 );
             }
+        }
+
+        /// CRI-2・SEC-1・SUP-14・#4819: 特権ランチャー経由の `--pid-target` は `Unimplemented`（固定文言）で拒否する。
+        #[test]
+        fn cri2_4819_pid_target_is_refused_with_elevated_capabilities() {
+            assert!(
+                deny_pid_target_with_elevated_capabilities(
+                    "Name:\tx\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\n"
+                )
+                .is_ok()
+            );
+            for bad in [
+                "CapPrm:\t0000000000000000\nCapEff:\t0000000000000002\n",
+                "CapPrm:\t0000000000000002\nCapEff:\t0000000000000000\n",
+                "CapPrm:\t0000000000000000\n",
+                "",
+            ] {
+                let e = deny_pid_target_with_elevated_capabilities(bad).expect_err(bad);
+                assert_eq!(e.code(), ErrorCode::Unimplemented, "{bad:?}");
+                assert_eq!(
+                    e.message(),
+                    "a pid namespace target is not supported with elevated capabilities"
+                );
+            }
+        }
+
+        /// 稼働中（pid・cgroup の配置・launch の分離の記録つき）の 1 件だけを返す `get` 専用のストア。
+        struct RunningOnly(StateRecord);
+        impl StateStore for RunningOnly {
+            fn create(&self, _: &CreateStateRequest) -> Result<StateRecord, TraitError> {
+                Err(TraitError::new(ErrorCode::Internal, "unused"))
+            }
+            fn update(&self, _: &UpdateStateRequest) -> Result<StateRecord, TraitError> {
+                Err(TraitError::new(ErrorCode::Internal, "unused"))
+            }
+            fn get(&self, _: &GetStateRequest) -> Result<StateRecord, TraitError> {
+                Ok(self.0.clone())
+            }
+            fn list(&self, _: &ListStateRequest) -> Result<StateList, TraitError> {
+                Err(TraitError::new(ErrorCode::Internal, "unused"))
+            }
+            fn delete(&self, _: &DeleteStateRequest) -> Result<DeleteStateResponse, TraitError> {
+                Err(TraitError::new(ErrorCode::Internal, "unused"))
+            }
+        }
+
+        /// CRI-2・CORE-3・SEC-1・REPAIR-5・#4819: 対象の supervisor が居ない（`supervisor.sock` が無い）と、本番の
+        /// `ControlExecHandover` の失敗はすべて `Unavailable`・固定文言になる（記録の pid からの `pidfd_open` へ縮退しない。
+        /// pid・ID・パスを含めない）。
+        #[test]
+        fn cri2_4819_resolve_pid_target_without_supervisor_is_unavailable() {
+            use fandhe_container_core::launch_isolation::{
+                LaunchIsolationRecord, RecordedLandlock, RecordedRule, RecordedTarget, RootIdentity,
+            };
+            use fandhe_container_core::traits::{CgroupPlacement, CgroupScope};
+            let mut child = std::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .expect("spawn");
+            let id = ContainerId::new("target1").expect("id");
+            let record = StateRecord::new(
+                ContainerStatus::running(id.clone(), std::num::NonZeroU32::new(child.id())),
+                std::env::temp_dir().join("b"),
+                StateRevision::from_raw(1),
+            )
+            .expect("record")
+            .with_cgroup(CgroupPlacement::new(
+                CgroupScope::new("/fc").expect("scope"),
+                StateRevision::from_raw(1),
+            ))
+            .with_launch_isolation(LaunchIsolationRecord::from_parts(
+                RootIdentity::new(44, 1),
+                RecordedLandlock::new(0xFFFF, vec![RecordedRule::new(RecordedTarget::Root, 0x7)])
+                    .expect("landlock"),
+            ));
+            let scratch = crate::scratch_root::ScratchDir::new(
+                "fc-4819-nosup",
+                std::time::Duration::from_secs(10),
+            );
+            let source = crate::control::ControlExecHandover::new(scratch.path().to_path_buf());
+            let e =
+                resolve_pid_target(&RunningOnly(record), &source, &id).expect_err("no supervisor");
+            assert_eq!(e.code(), ErrorCode::Unavailable);
+            assert_eq!(
+                e.message(),
+                "the launch pidfd of the pid namespace target is unavailable"
+            );
+            let _ = child.kill();
+            let _ = child.wait();
         }
 
         /// 2c の期限超過を作る: `work` が合図まで戻らない状態で `until` を短く取って呼ぶ。

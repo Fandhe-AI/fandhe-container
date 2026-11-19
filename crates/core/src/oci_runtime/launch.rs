@@ -38,7 +38,7 @@ use super::bind_mounts::BindMountSet;
 use super::cgroup_requirement::CgroupRequirement;
 use super::config::{NamespaceKind, OciConfig};
 use super::namespace_join::{
-    NamespaceJoin, NetnsJoinTarget, PinnedNetnsJoin, PinnedPodShm, PodShmSource,
+    NamespaceJoin, NetnsJoinTarget, PinnedNetnsJoin, PinnedPidTarget, PinnedPodShm, PodShmSource,
 };
 use super::network_mode::{EffectiveNetwork, LaunchNetworkMode};
 use super::sysfs_mount::SysfsMountSpec;
@@ -1453,6 +1453,15 @@ pub trait ProcessLauncher: Send + Sync {
     /// 既定は `None`。ラッパー実装は必ず内側へ転送すること(転送しないと start が固定せず、本番 launcher は自身の起動
     /// オプションと spec の食い違いを `FailedPrecondition` で拒否する。拒否側へ倒れるので安全だが、起動できない)。
     fn pod_shm_source(&self) -> Option<&PodShmSource> {
+        None
+    }
+
+    /// 起動オプションの pid namespace の TARGET(固定済みの対象の pid ns と launch pidfd。CRI-2・CORE-3・SEC-1・SEC-5・#4819)。
+    /// start が pid の参加先として使う。
+    ///
+    /// 既定は `None`。ラッパー実装は必ず内側へ転送すること(転送しないと start が参加先を固定せず、本番 launcher は自身の
+    /// 起動オプションと spec の食い違いを `FailedPrecondition` で拒否する。拒否側へ倒れるので安全だが、起動できない)。
+    fn pid_target(&self) -> Option<&PinnedPidTarget> {
         None
     }
 

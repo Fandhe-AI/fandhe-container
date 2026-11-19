@@ -25,7 +25,9 @@
 //!   supervisor の `start` が構築済みの中継経由で期限つきに配送する pasta バイナリの再検証の拒否。理由は閉じた表
 //!   `PASTA_VERIFY_REJECTIONS` の 2 理由）・[`AuditEvent::PodNamespaceJoin`]（#2872。start の作業スレッドが出す
 //!   pod の namespace join の受理と拒否。結果は閉じた表 `PodNamespaceJoinOutcome::ALL` で、パスは持たない）・
-//!   [`AuditEvent::NetnsJoin`]（#3069。init 所有の netns への参加指定の受理と拒否。結果は閉じた表 `NetnsJoinOutcome::ALL`）の記録だけ（他の層と、表に無い理由の `Mount`・`PastaVerify` は
+//!   [`AuditEvent::NetnsJoin`]（#3069。init 所有の netns への参加指定の受理と拒否。結果は閉じた表 `NetnsJoinOutcome::ALL`）・
+//!   [`AuditEvent::ExecTarget`]（#4819。start の作業スレッドが出す pid の TARGET の解決の拒否。理由は閉じた表
+//!   `ViolationReason::EXEC_TARGET_REASONS`）の記録だけ（他の層と、表に無い理由の `Mount`・`PastaVerify`・`ExecTarget` は
 //!   `InvalidArgument`。理由トークンは静的文字列の開いた語彙で、復号側が閉じた表へ戻せるものだけを運ぶ。それ以外の
 //!   理由つきの記録は単一スレッドの launch が `FileAuditSink` へ直接出す）。時刻・PID・
 //!   コンテナ ID・理由トークン（seccomp は種別トークンと syscall 番号・arch）を固定の枠で送り、helper が [`AuditRecord`] を
@@ -143,6 +145,12 @@ const TAG_NETNS_JOIN: u8 = 0x88;
 /// netns_join の枠だけが持つ追加部の長さ（結果の添字 1）。
 const NETNS_JOIN_EXTRA_LEN: usize = 1;
 
+/// exec の対象の拒否（`AuditEvent::ExecTarget`。SEC-4・SUP-6・CRI-2・SEC-1・#4819）の記録を示す先頭バイト。コンテナ ID の後に
+/// 理由の添字（`ViolationReason::EXEC_TARGET_REASONS` の位置 1）が付く。start の作業スレッドが出す pid の TARGET の解決の拒否。
+const TAG_EXEC_TARGET: u8 = 0x89;
+/// exec_target の枠だけが持つ追加部の長さ（理由の添字 1）。
+const EXEC_TARGET_EXTRA_LEN: usize = 1;
+
 /// 先頭バイトから、コンテナ ID の後ろに続く追加部の長さを返す（`serve` の読み取り量を 1 か所で決める）。
 const fn extra_len(tag: u8) -> usize {
     match tag {
@@ -154,6 +162,7 @@ const fn extra_len(tag: u8) -> usize {
         TAG_PASTA_VERIFY => PASTA_VERIFY_EXTRA_LEN,
         TAG_POD_NAMESPACE_JOIN => POD_NAMESPACE_JOIN_EXTRA_LEN,
         TAG_NETNS_JOIN => NETNS_JOIN_EXTRA_LEN,
+        TAG_EXEC_TARGET => EXEC_TARGET_EXTRA_LEN,
         _ => 0,
     }
 }
@@ -245,6 +254,22 @@ fn encode(record: &AuditRecord) -> Result<Vec<u8>, TraitError> {
             frame.push(index);
             return Ok(frame);
         }
+        AuditEvent::ExecTarget { reason } => {
+            let Some(index) = crate::exec::ViolationReason::EXEC_TARGET_REASONS
+                .iter()
+                .position(|r| r.as_str() == reason.as_str())
+                .and_then(|i| u8::try_from(i).ok())
+            else {
+                return Err(err(
+                    ErrorCode::InvalidArgument,
+                    "the audit relay does not know this exec target reason",
+                ));
+            };
+            let mut frame = Vec::with_capacity(FIXED_LEN + 1 + EXEC_TARGET_EXTRA_LEN);
+            push_head(&mut frame, TAG_EXEC_TARGET, record)?;
+            frame.push(index);
+            return Ok(frame);
+        }
         AuditEvent::Seccomp { syscall, arch } => {
             (TAG_SECCOMP, Some((syscall.get(), arch.get())), None)
         }
@@ -256,7 +281,7 @@ fn encode(record: &AuditRecord) -> Result<Vec<u8>, TraitError> {
         _ => {
             return Err(err(
                 ErrorCode::InvalidArgument,
-                "the audit relay only carries control channel, plugin peer, pasta verify, seccomp, exit signal and mount records",
+                "the audit relay only carries control channel, plugin peer, pasta verify, seccomp, exit signal, mount, pod namespace join, netns join and exec target records",
             ));
         }
     };
@@ -530,6 +555,14 @@ fn decode(frame: &[u8]) -> Option<AuditRecord> {
         let (id, extra) = rest.split_at(id_len);
         let outcome = super::NetnsJoinOutcome::ALL.get(usize::from(*extra.first()?))?;
         (id, outcome.audit_event())
+    } else if tag == TAG_EXEC_TARGET {
+        if rest.len() != id_len.checked_add(EXEC_TARGET_EXTRA_LEN)? {
+            return None;
+        }
+        let (id, extra) = rest.split_at(id_len);
+        let reason =
+            crate::exec::ViolationReason::EXEC_TARGET_REASONS.get(usize::from(*extra.first()?))?;
+        (id, reason.exec_target_audit_event()?)
     } else if tag == TAG_SECCOMP {
         // 長さは厳密に一致させる（余りも不足も壊れた枠）。
         if rest.len() != id_len.checked_add(SECCOMP_EXTRA_LEN)? {
@@ -1366,6 +1399,55 @@ mod tests {
             AuditPid::new(1).unwrap(),
             AuditEvent::PodNamespaceJoin {
                 reason: super::super::AuditReason::new("pod_join_unknown"),
+            },
+        );
+        assert_eq!(
+            encode(&unknown).unwrap_err().code(),
+            ErrorCode::InvalidArgument
+        );
+    }
+
+    /// SEC-4・SUP-6・CRI-2・#4819: exec_target の枠は 12 理由すべてで理由・コンテナ ID・PID・時刻が往復で一致し、
+    /// 壊れた枠（不足・余り・表外の添字）は記録にならず、表に無い理由は符号化を拒否する。
+    #[test]
+    fn sec4_4819_exec_target_frame_round_trips() {
+        use crate::exec::ViolationReason;
+        for reason in ViolationReason::EXEC_TARGET_REASONS {
+            let rec = AuditRecord::new(
+                AuditTimestamp::from_unix_duration(Duration::new(1_700_000_000, 7)),
+                AuditPid::new(77).unwrap(),
+                reason.exec_target_audit_event().unwrap(),
+            )
+            .with_container_id(ContainerId::new("tgt-a").unwrap());
+            let frame = encode(&rec).unwrap();
+            assert_eq!(frame[0], TAG_EXEC_TARGET);
+            assert_eq!(frame.len(), FIXED_LEN + 5 + EXEC_TARGET_EXTRA_LEN);
+            assert_eq!(extra_len(frame[0]), EXEC_TARGET_EXTRA_LEN);
+            let back = decode(&frame).unwrap();
+            assert_eq!(back.layer(), super::super::AuditLayer::ExecTarget);
+            assert_eq!(
+                back.reason().map(super::super::AuditReason::as_str),
+                Some(reason.as_str())
+            );
+            assert_eq!(back.pid(), rec.pid());
+            assert_eq!(back.timestamp(), rec.timestamp());
+            assert_eq!(back.container_id(), rec.container_id());
+            assert!(decode(&frame[..frame.len() - 1]).is_none());
+            let mut longer = frame.clone();
+            longer.push(0);
+            assert!(decode(&longer).is_none());
+            let mut bad = frame.clone();
+            *bad.last_mut().unwrap() =
+                u8::try_from(ViolationReason::EXEC_TARGET_REASONS.len()).unwrap();
+            assert!(decode(&bad).is_none());
+        }
+        let pidfd = ViolationReason::ExecTargetPidfdMismatch;
+        assert_eq!(pidfd.as_str(), "exec_target_pidfd_mismatch");
+        let unknown = AuditRecord::new(
+            AuditTimestamp::from_unix_duration(Duration::new(1, 0)),
+            AuditPid::new(1).unwrap(),
+            AuditEvent::ExecTarget {
+                reason: super::super::AuditReason::new("exec_target_unknown"),
             },
         );
         assert_eq!(

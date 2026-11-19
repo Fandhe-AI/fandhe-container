@@ -347,6 +347,7 @@ mod imp {
         {
             control_relay_persists_from_a_multi_threaded_process();
             control_relay_keeps_exit_signal_records_from_many_threads();
+            control_relay_persists_exec_target_from_a_multi_threaded_process();
             control_relay_exit_signal_times_out_then_is_unavailable();
             control_relay_stop_signal_disposition_of_the_helper();
         }
@@ -627,6 +628,47 @@ mod imp {
         let (first, second) = worker.join().unwrap();
         first.unwrap();
         second.unwrap();
+        drop(relay);
+        wait_single_threaded();
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    /// SEC-4・SUP-6・CRI-2・#4819: 複数スレッドのプロセス（start の作業スレッド）から出した `exec_target` の記録（pid の
+    /// TARGET の拒否）は、中継 helper の主経路へ層・理由・コンテナ ID つきで届く。表に無い理由の拒否は control_relay の単体試験が固定する。
+    #[cfg(target_os = "linux")]
+    fn control_relay_persists_exec_target_from_a_multi_threaded_process() {
+        use fandhe_container_core::exec::ViolationReason;
+        use fandhe_container_core::traits::ContainerId;
+        let marker = tmp_marker("relay-exec-target");
+        let primary: Primary = Arc::new(|path, rec| {
+            let line = format!(
+                "layer={} reason={} id={}\n",
+                rec.layer().as_str(),
+                rec.reason().map_or("", |r| r.as_str()),
+                rec.container_id().map_or("", |c| c.as_str()),
+            );
+            std::fs::write(path, line).map_err(|_| unreachable_err())
+        });
+        let (sink, _seen) = sink(primary, false, Notify::Discard, marker.clone());
+        let relay = Arc::new(ControlAuditRelay::spawn(sink).unwrap());
+        let r = Arc::clone(&relay);
+        std::thread::spawn(move || {
+            let rec = AuditRecord::new(
+                AuditTimestamp::from_unix_duration(Duration::new(1_700_000_000, 5)),
+                AuditPid::new(4242).unwrap(),
+                ViolationReason::ExecTargetPidfdMismatch
+                    .exec_target_audit_event()
+                    .unwrap(),
+            )
+            .with_container_id(ContainerId::new("tgt-4819").unwrap());
+            r.record(&rec).unwrap();
+        })
+        .join()
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            "layer=exec_target reason=exec_target_pidfd_mismatch id=tgt-4819\n"
+        );
         drop(relay);
         wait_single_threaded();
         let _ = std::fs::remove_file(&marker);

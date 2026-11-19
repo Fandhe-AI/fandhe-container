@@ -1614,3 +1614,32 @@ fn net9_sec4_3431_timeout_line_is_fixed() {
         ]
     );
 }
+
+/// CRI-2・SEC-1(#4819): pid namespace の TARGET も内側へ転送する(転送しないと既定の `None` へ縮退し、start が参加先を固定せず、
+/// 本番 launcher が食い違いを `FailedPrecondition` で拒否して起動しない)。
+#[cfg(target_os = "linux")]
+#[test]
+fn cri2_4819_launcher_forwards_pid_target_to_inner() {
+    struct Inner(fandhe_container_core::oci_runtime::PinnedPidTarget);
+    impl ProcessLauncher for Inner {
+        fn pid_target(&self) -> Option<&fandhe_container_core::oci_runtime::PinnedPidTarget> {
+            Some(&self.0)
+        }
+        fn launch(
+            &self,
+            _s: &LaunchSpec,
+            _t: Duration,
+        ) -> Result<Box<dyn LaunchedProcess>, TraitError> {
+            Err(TraitError::new(ErrorCode::Internal, "unused"))
+        }
+    }
+    let ev: Events = Arc::default();
+    let backend = FakeBackend::new(&ev);
+    let (w, _b) = wiring(&backend);
+    let null =
+        || -> std::os::fd::OwnedFd { std::fs::File::open("/dev/null").expect("open").into() };
+    let target =
+        fandhe_container_core::oci_runtime::PinnedPidTarget::for_test(null(), null(), (1, 2));
+    let wrapped = w.wrap(Arc::new(Inner(target.clone())));
+    assert_eq!(wrapped.pid_target(), Some(&target));
+}

@@ -1127,6 +1127,13 @@ fn pin_namespace_join_audited(
     launcher: &dyn ProcessLauncher,
 ) -> Result<Option<NamespaceJoin>, TraitError> {
     let Some(paths) = paths else {
+        // pid の TARGET（#4819）は pod の user・ipc の join に足す形でだけ受ける。組が無ければ黙って捨てずに拒否する。
+        if launcher.pid_target().is_some() {
+            return Err(TraitError::new(
+                ErrorCode::Unimplemented,
+                "a pid namespace target requires a pod user and ipc namespace join",
+            ));
+        }
         return Ok(None);
     };
     let record = |outcome: crate::audit_log::PodNamespaceJoinOutcome| {
@@ -1134,7 +1141,7 @@ fn pin_namespace_join_audited(
             let _ = crate::audit_log::mount::deliver(outcome.audit_event(), Some(id), sink);
         }
     };
-    match NamespaceJoin::pin(paths) {
+    match NamespaceJoin::pin(paths, launcher.pid_target()) {
         Ok((join, outcome)) => {
             record(outcome);
             Ok(Some(join))
@@ -1857,6 +1864,8 @@ mod tests {
         netns_target: std::sync::OnceLock<super::super::NetnsJoinTarget>,
         /// `pod_shm_source` が返す指定(未設定なら `None`。#4823)。
         pod_shm: std::sync::OnceLock<super::super::PodShmSource>,
+        /// `pid_target` が返す参加先(未設定なら `None`。#4819)。
+        pid_target: std::sync::OnceLock<super::super::PinnedPidTarget>,
     }
 
     impl RecordingLauncher {
@@ -1882,6 +1891,7 @@ mod tests {
                 terminal_support: AtomicBool::new(false),
                 netns_target: std::sync::OnceLock::new(),
                 pod_shm: std::sync::OnceLock::new(),
+                pid_target: std::sync::OnceLock::new(),
             })
         }
 
@@ -1969,6 +1979,10 @@ mod tests {
 
         fn pod_shm_source(&self) -> Option<&super::super::PodShmSource> {
             self.pod_shm.get()
+        }
+
+        fn pid_target(&self) -> Option<&super::super::PinnedPidTarget> {
+            self.pid_target.get()
         }
 
         fn rejection_audit_sink(&self) -> Option<&dyn crate::audit_log::AuditSink> {
@@ -2198,6 +2212,58 @@ mod tests {
                 .expect("stored");
             assert_eq!(got.status().state(), ContainerState::Created);
         }
+    }
+
+    /// CRI-2・CORE-3・SEC-1・SEC-5(#4819): pid の TARGET が launcher にあるのに config に pod の user・ipc の path の組が無ければ、
+    /// 予約・launch の前に `Unimplemented` の固定文言で拒否し、状態は Created のまま残る(黙って捨てない)。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cri2_4819_start_rejects_pid_target_without_user_ipc_join() {
+        let (mut child, pidfd) = {
+            let child = std::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .expect("spawn");
+            let fd = crate::sys::pidfd_open(child.id()).expect("pidfd");
+            (child, fd)
+        };
+        let null =
+            || -> std::os::fd::OwnedFd { std::fs::File::open("/dev/null").expect("open").into() };
+        let name = "ptarget-nojoin";
+        let (_b, store) = created(name);
+        let launcher = RecordingLauncher::new(false);
+        assert!(
+            launcher
+                .pid_target
+                .set(super::super::PinnedPidTarget::for_test(
+                    pidfd,
+                    null(),
+                    (1, 2)
+                ))
+                .is_ok()
+        );
+        let err = match start(
+            &store,
+            &OpRecorder::new(),
+            &dynl(&launcher),
+            &sid(name),
+            &StartTimeouts::default(),
+        ) {
+            Ok(_) => panic!("must fail"),
+            Err(e) => e,
+        };
+        assert_eq!(err.code(), ErrorCode::Unimplemented);
+        assert_eq!(
+            err.message(),
+            "a pid namespace target requires a pod user and ipc namespace join"
+        );
+        assert_eq!(launcher.calls(), 0);
+        let got = store
+            .get(&GetStateRequest::new(ContainerId::new(name).expect("id")))
+            .expect("stored");
+        assert_eq!(got.status().state(), ContainerState::Created);
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     /// 拒否ケース名と config 変更関数の組。

@@ -74,6 +74,14 @@
 //!   - H: 共有でコンテナ cgroup の `cgroup.kill` を書けなくすると（0444）、`--restart on-failure:3` でも再 launch せず
 //!     （`restart_count` 0・Stopped(7)）、bin が非 0 で終わり、孤児が残る（後始末で試験が止める）
 //!
+//! - シナリオ I（pid namespace の TARGET。CRI-2・CORE-3・SEC-1・SEC-5・#4819）: 同じ pod の user・ipc（保持役の path）に join し pid は
+//!   path なしの 2 コンテナを同じ状態ルートに作り、対象 T を起動した後、N を `--pid-target <T>` で起動する（対象の launch pidfd は T の
+//!   supervisor の制御チャネルから受け取る）。N の init が T の pid ns に居て PID 1 でなく、N の記録の `pod_pid_ns` が T の pid ns の
+//!   素性（dev, ino）と一致し、T 自身の記録は `None` のままであることを具体値で照合する。対照として、存在しない対象は `NOT_FOUND`
+//!   （`the pid namespace target does not exist`）、稼働中でない（Created の）対象は `FAILED_PRECONDITION`
+//!   （`the pid namespace target is not running`）の固定文言で報告され、状態は Created のまま pid を持たない。最後に N・T の順に SIGTERM を
+//!   送り、どちらもハンドラの終了コードで Stopped になる。成功行: `supervisor_bin_real: scenario=I ok (pid target: ...)`
+//!
 //! CI（ubuntu-latest）以外の環境・root の分岐の実行と結果の記録は人間担当（#499・#485・#491・#219 のうち該当するもの、または PR）。Linux 限定。
 
 #[cfg(not(target_os = "linux"))]
@@ -496,28 +504,36 @@ mod linux {
 
         /// `pod` があれば config の user・ipc・pid を pod の namespace への join（path つき）にする（#4811）。
         fn with_pod(tag: &str, with_proc: bool, probe: Probe, pod: Option<&Pod>) -> Self {
-            let probe_args = match probe {
-                Probe::Exit7 => r#""/probe","--container-probe""#,
-                Probe::Term => r#""/probe","--container-probe","--term-probe""#,
-                Probe::Mount => r#""/probe","--container-probe","--mount-probe""#,
-                Probe::Orphan => {
-                    r#""/probe","--container-probe","--orphan-probe","--orphan-token","TOKEN""#
-                }
-                Probe::OrphanTerm => {
-                    r#""/probe","--container-probe","--orphan-term-probe","--orphan-token","TOKEN""#
-                }
-            }
-            .replace("TOKEN", run_token());
-            let namespaces = match pod {
-                None => r#"{"type":"pid"},{"type":"mount"},{"type":"uts"},{"type":"ipc"},{"type":"user"}"#
-                    .to_owned(),
-                Some(p) => format!(
-                    r#"{{"type":"pid","path":"{}"}},{{"type":"mount"}},{{"type":"uts"}},{{"type":"ipc","path":"{}"}},{{"type":"user","path":"{}"}}"#,
-                    p.ns("pid_for_children"),
-                    p.ns("ipc"),
-                    p.ns("user")
-                ),
-            };
+            Self::build(tag, with_proc, probe, pod, true)
+        }
+
+        /// pod の user・ipc だけを path つきで join し、pid は path なし（自分の新しい pid ns。#4819 の TARGET の対象と、
+        /// TARGET で参加する側の config）にする。
+        fn with_pod_user_ipc(tag: &str, probe: Probe, pod: &Pod) -> Self {
+            Self::build(tag, true, probe, Some(pod), false)
+        }
+
+        /// `with_pod` の本体。`pid_path` が偽なら pid の entry に path を付けない。
+        fn build(
+            tag: &str,
+            with_proc: bool,
+            probe: Probe,
+            pod: Option<&Pod>,
+            pid_path: bool,
+        ) -> Self {
+            let dir = Self::scratch_dir(tag);
+            let bundle = dir.join("bundle");
+            Self::write_bundle(&bundle, with_proc, probe, pod, pid_path);
+            let root = dir.join("state");
+            std::fs::create_dir(&root).expect("create state root");
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+                .expect("chmod state root");
+            let store = open_default_store(Some(root)).expect("open the state store");
+            Self { dir, store }
+        }
+
+        /// 一時ディレクトリ（`fandhe-supbinreal-<tag>-<pid>-<ns>`）を排他的に作る。
+        fn scratch_dir(tag: &str) -> PathBuf {
             let nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.subsec_nanos())
@@ -531,8 +547,57 @@ mod linux {
             std::fs::create_dir(&dir).expect("exclusively create the work dir");
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
                 .expect("chmod work dir");
-            let bundle = dir.join("bundle");
-            std::fs::create_dir(&bundle).expect("create bundle");
+            dir
+        }
+
+        /// 同じ状態ルートに 2 つ目以降の bundle（`<dir>/<name>`）を足す（#4819。TARGET の対象と参加する側は同じ状態ルートを使う）。
+        fn add_bundle(&self, name: &str, probe: Probe, pod: &Pod) {
+            Self::write_bundle(&self.dir.join(name), true, probe, Some(pod), false);
+        }
+
+        /// `<dir>/<bundle_name>` の bundle で create する。
+        fn create_in(&self, id: &str, bundle_name: &str) {
+            let req =
+                CreateRequest::new(cid(id), self.dir.join(bundle_name)).expect("create request");
+            create(self.store.as_ref(), &OpRecorder::new(), &req).expect("create");
+        }
+
+        /// rootfs と config.json を持つ bundle を作る。
+        fn write_bundle(
+            bundle: &Path,
+            with_proc: bool,
+            probe: Probe,
+            pod: Option<&Pod>,
+            pid_path: bool,
+        ) {
+            let probe_args = match probe {
+                Probe::Exit7 => r#""/probe","--container-probe""#,
+                Probe::Term => r#""/probe","--container-probe","--term-probe""#,
+                Probe::Mount => r#""/probe","--container-probe","--mount-probe""#,
+                Probe::Orphan => {
+                    r#""/probe","--container-probe","--orphan-probe","--orphan-token","TOKEN""#
+                }
+                Probe::OrphanTerm => {
+                    r#""/probe","--container-probe","--orphan-term-probe","--orphan-token","TOKEN""#
+                }
+            }
+            .replace("TOKEN", run_token());
+            let pid_entry = match (pod, pid_path) {
+                (Some(p), true) => {
+                    format!(r#"{{"type":"pid","path":"{}"}}"#, p.ns("pid_for_children"))
+                }
+                _ => r#"{"type":"pid"}"#.to_owned(),
+            };
+            let namespaces = match pod {
+                None => r#"{"type":"pid"},{"type":"mount"},{"type":"uts"},{"type":"ipc"},{"type":"user"}"#
+                    .to_owned(),
+                Some(p) => format!(
+                    r#"{pid_entry},{{"type":"mount"}},{{"type":"uts"}},{{"type":"ipc","path":"{}"}},{{"type":"user","path":"{}"}}"#,
+                    p.ns("ipc"),
+                    p.ns("user")
+                ),
+            };
+            std::fs::create_dir(bundle).expect("create bundle");
             let proc_dir = if with_proc {
                 super::rootfs::ProcDir::Create
             } else {
@@ -546,12 +611,6 @@ mod linux {
 "linux":{{"namespaces":[{namespaces}]}}}}"#
             );
             std::fs::write(bundle.join("config.json"), config).expect("write config.json");
-            let root = dir.join("state");
-            std::fs::create_dir(&root).expect("create state root");
-            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
-                .expect("chmod state root");
-            let store = open_default_store(Some(root)).expect("open the state store");
-            Self { dir, store }
         }
 
         fn root(&self) -> PathBuf {
@@ -588,6 +647,16 @@ mod linux {
 
     /// bin を非特権ユーザーに委譲された新しい cgroup スコープで起動する（CLI の契約と同じ argv・stdout は pipe）。
     fn spawn_supervisor(env: &Env, id: &str, restart: Option<&str>) -> Supervisor {
+        spawn_supervisor_with(env, id, restart, &[])
+    }
+
+    /// [`spawn_supervisor`] に追加の argv（`<id>` の前に置くオプション。例: `--pid-target <ID>`）を足す版。
+    fn spawn_supervisor_with(
+        env: &Env,
+        id: &str,
+        restart: Option<&str>,
+        extra: &[&str],
+    ) -> Supervisor {
         let mut cmd = Command::new("systemd-run");
         cmd.args(fandhe_container_supervisor::start_contract::USER_SCOPE_WRAPPER_ARGS)
             .arg(BIN)
@@ -597,6 +666,7 @@ mod linux {
         if let Some(policy) = restart {
             cmd.args(["--restart", policy]);
         }
+        cmd.args(extra);
         let mut child = cmd
             .arg(id)
             .stdin(Stdio::null())
@@ -702,6 +772,7 @@ mod linux {
         scenario_f_pid_shared_natural_exit();
         scenario_g_pid_shared_stop();
         scenario_h_pid_shared_kill_all_failure();
+        scenario_i_pid_target();
         println!(
             "supervisor_bin_real: start reported OK, NSpid ends with 1, monitor recorded Stopped({PROBE_EXIT}), logs captured, seccomp denial recorded once; failed start left no process; restart relaunched on the calling thread with restart_count 1 and both launches captured and audited; SIGTERM via the control channel recorded Stopped({TERM_HANDLER_EXIT}) and the stopped container was deleted; ESC-03 mount denied via the SeccompNotifyHub and recorded once"
         );
@@ -1482,6 +1553,145 @@ mod linux {
         );
         println!(
             "supervisor_bin_real: scenario=G ok (pid shared: exec via the launch pidfd ran in the pod pid namespace; stopping via the control channel left no orphan)"
+        );
+    }
+
+    /// 起動に失敗する `--pid-target` の対照: 報告が `Failed`（`code`・固定文言の完全一致）で、bin が非 0 で終わり、状態は Created のまま
+    /// pid を持たない（#4819。固定文言に ID・pid・パスを含めない）。
+    fn assert_pid_target_refused(
+        env: &Env,
+        id: &str,
+        target: &str,
+        want_code: ErrorCode,
+        want_message: &str,
+    ) {
+        let mut sup = spawn_supervisor_with(env, id, None, &["--pid-target", target]);
+        match sup.report() {
+            StartReport::Failed {
+                code,
+                exit_code,
+                message,
+            } => {
+                assert_eq!(code, want_code, "{target}");
+                assert_eq!(message.as_str(), want_message, "{target}");
+                assert_eq!(sup.exit_code(), i32::from(exit_code.get()));
+            }
+            other => panic!("expected ERR for target {target}, got {other:?}"),
+        }
+        let rec = env.record(id);
+        assert_eq!(rec.status().state(), ContainerState::Created);
+        assert!(rec.status().pid().is_none());
+    }
+
+    /// シナリオ I: pid namespace の TARGET（`--pid-target <ID>`）で、対象コンテナの pid ns へ参加して起動する
+    /// （CRI-2・CORE-3・SEC-1・SEC-5・#4819）。
+    ///
+    /// 同じ pod の user・ipc（保持役の path）に join し pid は path なしの 2 コンテナを同じ状態ルートで作る。対象 T は自分の新しい
+    /// pid ns の PID 1、N は `--pid-target T` で T の pid ns へ参加する（対象の launch pidfd は T の supervisor の制御チャネルから受け取る）。
+    /// 照合: N の init が T の pid ns に居て PID 1 でない・N の記録の `pod_pid_ns` が T の pid ns の素性と一致する（exec・kill-all の
+    /// 下流は #4813・#4811 の経路）。対照: 存在しない対象と、稼働中でない（Created の）対象は固定文言で拒否される。
+    fn scenario_i_pid_target() {
+        use std::os::unix::fs::MetadataExt as _;
+        let pod = Pod::new();
+        let env = Env::with_pod_user_ipc("i", Probe::Term, &pod);
+        env.add_bundle("bundle-n", Probe::Term, &pod);
+        let pid = std::process::id();
+        let (target_id, joiner_id) = (format!("sbit{pid}"), format!("sbin{pid}"));
+        env.create(&target_id);
+        env.create_in(&joiner_id, "bundle-n");
+        let mut target_sup = spawn_supervisor(&env, &target_id, None);
+        let t_pid = match target_sup.report() {
+            StartReport::Started { pid } => pid.get(),
+            other => panic!("expected OK for the target, got {other:?}"),
+        };
+        wait_sigterm_handler(t_pid);
+        let t_ns = ns_link(&format!("/proc/{t_pid}/ns/pid"));
+        assert_ne!(t_ns, ns_link("/proc/self/ns/pid"));
+        assert_ne!(t_ns, pod.pid_ns(), "the target owns a new pid namespace");
+        let t_nspid = status_field(&format!("/proc/{t_pid}/status"), "NSpid:").unwrap_or_default();
+        assert_eq!(
+            t_nspid.split_whitespace().last(),
+            Some("1"),
+            "NSpid={t_nspid}"
+        );
+
+        // 参加する側（N）。
+        let mut joiner_sup =
+            spawn_supervisor_with(&env, &joiner_id, None, &["--pid-target", &target_id]);
+        let n_pid = match joiner_sup.report() {
+            StartReport::Started { pid } => pid.get(),
+            other => panic!("expected OK for the joiner, got {other:?}"),
+        };
+        wait_sigterm_handler(n_pid);
+        assert_eq!(
+            ns_link(&format!("/proc/{n_pid}/ns/pid")),
+            t_ns,
+            "the joiner init must live in the target pid namespace"
+        );
+        let n_nspid = status_field(&format!("/proc/{n_pid}/status"), "NSpid:").unwrap_or_default();
+        assert_ne!(
+            n_nspid.split_whitespace().last(),
+            Some("1"),
+            "the joiner init must not be PID 1 of the target pid namespace: NSpid={n_nspid}"
+        );
+        let meta =
+            std::fs::metadata(format!("/proc/{t_pid}/ns/pid")).expect("stat the target pid ns");
+        let rec = env.record(&joiner_id);
+        assert_eq!(
+            rec.launch_isolation().and_then(|i| i.pod_pid_ns()),
+            Some((meta.dev(), meta.ino())),
+            "the launch record must hold the target pid namespace identity"
+        );
+        assert_eq!(
+            env.record(&target_id)
+                .launch_isolation()
+                .and_then(|i| i.pod_pid_ns()),
+            None,
+            "the target keeps its own pid namespace"
+        );
+
+        // 対照: 存在しない対象・稼働中でない対象は、固定文言で拒否される。
+        let missing = format!("sbim{pid}");
+        let refused_a = format!("sbia{pid}");
+        let refused_b = format!("sbib{pid}");
+        env.add_bundle("bundle-a", Probe::Term, &pod);
+        env.add_bundle("bundle-b", Probe::Term, &pod);
+        env.create_in(&refused_a, "bundle-a");
+        env.create_in(&refused_b, "bundle-b");
+        assert_pid_target_refused(
+            &env,
+            &refused_a,
+            &missing,
+            ErrorCode::NotFound,
+            "the pid namespace target does not exist",
+        );
+        // `refused_b` は Created のまま。`refused_a`（Created に戻った）を稼働中でない対象として指す。
+        assert_pid_target_refused(
+            &env,
+            &refused_b,
+            &refused_a,
+            ErrorCode::FailedPrecondition,
+            "the pid namespace target is not running",
+        );
+
+        // 停止: 参加した側 → 対象の順に SIGTERM を送り、どちらもハンドラの終了コードで Stopped になる。
+        let signaler: Arc<dyn ProcessSignaler> = Arc::new(ControlSignaler::for_stop(env.root()));
+        for (id, sup) in [(&joiner_id, &mut joiner_sup), (&target_id, &mut target_sup)] {
+            kill(
+                env.store.as_ref(),
+                &OpRecorder::new(),
+                &signaler,
+                &KillRequest::new(cid(id), Signal::SIGTERM),
+                &KillTimeout::default(),
+            )
+            .unwrap_or_else(|e| panic!("kill(SIGTERM) via the control channel failed: {e:?}"));
+            assert_eq!(sup.exit_code(), 0, "monitor must finish cleanly");
+            let rec = env.record(id);
+            assert_eq!(rec.status().state(), ContainerState::Stopped);
+            assert_eq!(rec.status().exit_code(), Some(TERM_HANDLER_EXIT));
+        }
+        println!(
+            "supervisor_bin_real: scenario=I ok (pid target: the joiner init lived in the target pid namespace as a non-PID-1 process and recorded its identity; a missing target and a not-running target were refused with fixed messages)"
         );
     }
 

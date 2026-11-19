@@ -143,7 +143,7 @@ pub use launcher::{ProductionLauncher, ProductionLauncherBuilder};
 pub use launcher::{SubordinateIdMaps, SubordinateIdSource};
 pub use mount_destination::{MountDestination, audit_mount_config_error};
 pub use namespace_join::{
-    NamespaceJoin, NetnsJoinTarget, PinnedNetnsJoin, PinnedPodShm, PodShmSource,
+    NamespaceJoin, NetnsJoinTarget, PinnedNetnsJoin, PinnedPidTarget, PinnedPodShm, PodShmSource,
 };
 #[cfg(target_os = "linux")]
 pub use netns_attach::{AttachableNamespaces, NetnsAttachHook};

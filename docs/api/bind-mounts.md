@@ -89,7 +89,7 @@ Docker / runc との差: 本実装は方式を事前に決め、縮退しない�
 - `source` は絶対パスのみ（bundle 相対は不可）
 - 疑似 FS（procfs・sysfs・cgroup など）上の `source` は拒否する（runc は受ける）
 - ホストの `/dev`（devtmpfs）配下の `source` は拒否する（runc は受ける。SEC-1・#2129）
-- `/dev/shm` の bind は `noexec` を付けず、サイズの上限も設けない（containerd と同じ。kubelet の既定の形）
+- `/dev/shm` の bind は `noexec` を付けず、サイズの上限も設けない（containerd と同じ。kubelet の既定の形）。`nosuid`・`nodev` は常に付くため、emptyDir の `/dev/shm` で suid・dev を効かせる containerd とは違う（差。[cri-config-acceptance](../design/cri-config-acceptance.md)「kubelet 既定の mounts の受け入れ方式」）
 - `source` に symlink が含まれるときは拒否する（辿らない）。存在しない `source` は作らずに拒否する
 - `destination` の経路に symlink があるときは拒否する。`destination` のディレクトリは rootfs の中に作る
 - rootless（user namespace を使う）の起動経路だけが対象。rootful では受けない

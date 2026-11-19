@@ -74,6 +74,7 @@ plugin-cri は rootless（非 root）で `RunPodSandbox` のたびに、supervis
 - uid 0 の plugin-cri には保持役を注入せず、従来どおり（start は `UNIMPLEMENTED`）
 
 POD のコンテナは保持役の user・ipc namespace に join する（H5・#2876 は配線済み）。保持役の netns を pod ネットワークへ渡す配線は未実装（H8・#2878）。
+pod の `/dev/shm` は、ipc が `POD` で CRI mounts に `/dev/shm` が無いコンテナが共有する（#4823・S3。条件は [cri-config-acceptance](../design/cri-config-acceptance.md)「pod の ipc 共有の受け入れ方式」）。特権ランチャー経由の構成（supervisor が ambient capability つき）では `--pod-shm` を `Unimplemented` で拒否するため、ipc `POD` の CRI コンテナは Start できない（オーナー決定 2026-11-19。縮退させずに受け入れる）。
 
 ## containerd の shim（rootless のみ。#3684）
 

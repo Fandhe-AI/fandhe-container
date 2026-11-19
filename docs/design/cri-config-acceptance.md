@@ -22,7 +22,7 @@
 | 14 | port_mappings | plugin-cri `netsetup` の `publish_port`（本変更で実装済み。provider を注入した構成の `POD` だけ。本番は順 13 と同じく未注入のため `UNIMPLEMENTED`。下記「port_mappings の受け入れ方式」） | net・plugin-cri・cri | #2676 |
 | 15 | userns の uids / gids の写像 | オーナー判断待ち | core → cri | #2240 |
 | 16 | readonly_rootfs | core の `root.readonly`（#2767 で実装済み）→ cri が写す（実装済み。下記「readonly_rootfs の受け入れ方式」） | core → cri | #2827 |
-| 17 | kubelet 既定の mounts（`/dev/termination-log`・`/dev/shm` の bind） | core の許可リスト（`dev_bind_allowlist_kind`。#4888 で実装済み）を cri の `check_mount_set` も使う。`/dev/shm` の bind があるときの pod の共有 `/dev/shm` の抑止（S3）は未実装。下記「kubelet 既定の mounts の受け入れ方式」 | core・cri | #4888・#4823 |
+| 17 | kubelet 既定の mounts（`/dev/termination-log`・`/dev/shm` の bind） | core の許可リスト（`dev_bind_allowlist_kind`。#4888 で実装済み）を cri の `check_mount_set` も使う。`/dev/shm` の bind があるときは pod の共有 `/dev/shm` を渡さない（S3・#4823 で実装済み。判定は下記「pod の ipc 共有の受け入れ方式」）。下記「kubelet 既定の mounts の受け入れ方式」 | core・cri | #4888・#4823 |
 
 受け入れない項目（順 7 の Bidirectional を含む）の `UNIMPLEMENTED` の照合は `crates/cri/tests/bundle_spec.rs` に残し、受け入れた HostToContainer は同じ試験で `config.json` の `mounts[].options`（`rslave`）を具体値で照合する（#2669・CRI-2・OCI-4）。
 
@@ -122,14 +122,14 @@ sandbox 側（`LinuxSandboxSecurityContext.readonly_rootfs`）は出力しない
 | 利用者の `mounts[]` | `Mount.readonly` に従う。`ro` の bind は root が書き込み可能でも core が受理する（#1917。start が検証した集合と一致するものに限る） |
 | `/proc` | Landlock が書き込みを落とす（`EACCES`） |
 
-### 既知の差（containerd との比較。未検証）
+### 既知の差（containerd との比較）
 
-containerd の `containerMounts` は sandbox のファイル（`/etc/hostname`・`/etc/hosts`・`/etc/resolv.conf`）の bind を readonly_rootfs に従わせ、`/dev/shm` は rw と記憶しているが、本変更では一次情報（commit 指定）を再確認していない。以下は未検証の見込みとして扱う。
+containerd `v2.4.2`（commit `b7a25261`）の確認（#4823・2026-11-19）: `internal/cri/server/container_create.go` の 1109・1125・1143 行で `/etc/hostname`・`/etc/hosts`・`/etc/resolv.conf` の bind は `Readonly: securityContext.GetReadonlyRootfs()` に従い、1162 行の `/dev/shm` は `Readonly: false`。以前の記憶どおり。
 
-- `/etc/resolv.conf` は readonly_rootfs=false でも本実装は常に ro（containerd は rw の見込み）。既存の差
-- `/proc` は readonly root で本実装は書き込めない（containerd は readonlyPaths を除き書ける見込み）。追跡 issue は [#2859](https://github.com/Fandhe-AI/fandhe-container/issues/2859)
-- `/etc/hosts`・`/etc/hostname` の供給を足すときは readonly_rootfs に従わせる
-- `process.cwd` が rootfs に無いとき、runc は作るが core は作らず失敗する（readonly とは独立した既存の差）
+- `/etc/resolv.conf` は readonly_rootfs=false のとき、containerd は rw、本実装は常に ro。既存の差
+- `/proc` は readonly root で本実装は書き込めない（containerd は readonlyPaths を除き書ける見込みで、未検証）。追跡 issue は [#2859](https://github.com/Fandhe-AI/fandhe-container/issues/2859)
+- `/etc/hosts`・`/etc/hostname` の供給を足すときは readonly_rootfs に従わせる（containerd と同じ）
+- `process.cwd` が rootfs に無いとき、runc は作るが core は作らず失敗する（runc との比較。readonly とは独立した既存の差。未検証）
 
 照合は `crates/cri/tests/bundle_spec.rs` の `cri2_core5_readonly_rootfs_maps_to_root_readonly`・`cri2_readonly_rootfs_false_keeps_output_unchanged`。
 
@@ -160,14 +160,18 @@ kubelet が既定で付ける `mounts[]` のうち、コンテナの `/dev` 配�
 
 - 試験: cri の bundle の往復（kubelet の既定形。`crates/cri/tests/bundle_spec.rs`）と、core の単体試験（許可リストの表、種別違い、tmpfs との重なり）。実機前提の試験（`production_launcher` のシナリオ DV）の結果は本書では未記録
 - 受け入れ条件の「通る」は、config の生成（cri の `bundle_spec.rs`）と start（core の `production_launcher` のシナリオ DV。cri が出す options と同じ形）を別々の試験で確かめた範囲。CRI の RPC を通した CreateContainer〜StartContainer と、kubelet が作るホスト側ディレクトリ（0750）へのコンテナ側からの到達性は未確認
-- S3（#4823）との関係: `/dev/shm` の bind があれば、CRI は pod の共有 `/dev/shm` を渡さない（S3 の受け入れ条件。cri は未実装）。core は bind と pod の共有 `/dev/shm` の併用を `OverlapsTmpfs`（監査つき）で拒否するため、S3 より前でも両方が載ることはない
+- S3（#4823）との関係: `/dev/shm` の bind があれば、CRI は pod の共有 `/dev/shm` を渡さない（実装済み。`bundle/spec.rs` の `shares_pod_shm` が mounts の `/dev/shm` の有無を見る）。core は bind と pod の共有 `/dev/shm` の併用を `OverlapsTmpfs`（監査つき）で拒否するため、両方が載ることはない（cri の判定が外れた場合の歯止め）
 
 既知の差（containerd・kubelet との比較）:
 
 - SELinux 有効ノードでは、kubelet が `mounts` に `selinux_relabel=true` を付け、本実装は `mounts.selinux_relabel` を `UNIMPLEMENTED` にするため、既定の config が通らない。`/dev/termination-log` に限らず `/etc/hosts`・volume にも付く。termination-log の出典は kubernetes `v1.37.1` の `pkg/kubelet/kuberuntime/kuberuntime_container.go` 533〜537 行（533 行 `selinuxRelabel := selinux.GetEnabled()`・537 行 `SelinuxRelabel: selinuxRelabel`）。受け入れ方式の判断は #4895 で扱う
 - `mountPath: /dev/shm/` のように末尾の `/` つきで渡すと、本実装だけ `INVALID_ARGUMENT` になる。containerd は既定の `/dev/shm` を足すかの判定で `filepath.Clean` を通して比べ（`internal/cri/server/helpers.go` 221〜223 行）、末尾の `/` つきでも受ける（spec の `destination` には渡された文字列のまま入る。`internal/cri/opts/spec_linux_opts.go` 132 行）
 - `terminationMessagePath` を `/dev` 配下（`/dev/termination-log` 以外）・`/proc`・`/sys` 配下に置くと `INVALID_ARGUMENT` のまま。それ以外のパスは通常の bind として通る
-- `/dev/shm` の bind は `noexec` が付かず、サイズの上限も無い（containerd と同じ。CRI mounts の bind に付くのは `rbind`・propagation・`ro` / `rw` だけ。`internal/cri/opts/spec_linux_opts.go` の `WithMounts`）
+- `/dev/shm` の bind は `noexec` が付かず、サイズの上限も無い（containerd と同じ）
+- 差（#4823 で一次情報を確認。containerd `v2.4.2`〔commit `b7a25261`〕）
+  - 本リポは CRI mounts の bind に `nosuid`・`nodev` を常に付ける（`crates/cri/src/bundle/spec.rs` の `mount_out`。[bind-mounts](../api/bind-mounts.md)「`nosuid` と `nodev` を常に付ける。外せない」）。containerd が CRI mounts の bind に付けるのは `rbind`・伝播・`ro` / `rw` だけで、元のマウントの属性を継ぐ（`internal/cri/opts/spec_linux_opts.go` 154〜201 行）
+  - kubelet の emptyDir（Memory）の tmpfs は `size=`・`noswap` だけで載る（`pkg/volume/emptydir/empty_dir.go` 356〜359・601〜612 行）。そのため emptyDir を `/dev/shm` に bind すると、containerd では suid・dev が効き、本リポでは効かない。**emptyDir の `/dev/shm` も containerd との差**。本書では差として記録し、属性を変えるかは別の判断とする
+  - 元が無いとき containerd は `MkdirAll(0755)` で作り（commit `b7a25261` の `internal/cri/opts/spec_linux_opts.go` 137〜143 行）、symlink を解決する（同 147 行）。本リポは作らず、辿らず拒否する（bind 全般の差。`/dev/shm` にも当たる）
 
 ## dns_config の受け入れ方式（CRI-2・NET-5。#2665）
 
@@ -318,7 +322,7 @@ path は 1 回だけ開いて fd に固定する（pid の再利用で別 pod �
 
 | 要求 | 供給元 | 出力 |
 | ---- | ------ | ---- |
-| ipc `POD` | あり | ipc と user を `path` つき（join） |
+| ipc `POD` | あり | ipc と user を `path` つき（join）。`/dev/shm` は pod の tmpfs を共有する（CRI mounts に `/dev/shm` が無いとき。#4823・S3。判定は `shares_pod_shm`） |
 | ipc `POD` | 無し | 新しい namespace |
 | ipc `CONTAINER` | 問わない | 新しい namespace |
 | ipc `POD` ＋ userns `CONTAINER` | あり | `UNIMPLEMENTED` |
@@ -328,8 +332,15 @@ path は 1 回だけ開いて fd に固定する（pid の再利用で別 pod �
 
 ### 既知の差と残り
 
-- `/dev/shm`（POSIX shm）は共有されない（コンテナごとの tmpfs）。SysV IPC と POSIX mqueue は共有される。userns が pod 単位になり、共有者は同じ userns の root になる（capability は既定の 14 個、seccomp が `setns`・`unshare` を禁じ、pid namespace は別）。
-- 残り（後続 issue）: pod の保持役（#2675 の netns と共有する設計。[pod-namespace-holder.md](pod-namespace-holder.md)・#2838。実装は #2870・#2871・#2874・#2876・#2877）と cri へのパスの供給、pid の共有（PID 1 の証跡・`Pid1Target` の見直しが要る）、pod 内の `/dev/shm` の共有、pid の `NamespaceMode::TARGET` は設計済みでオーナー判断待ち（#4607。それまで `UNIMPLEMENTED`／共有しない）。uts の共有は #4608〜#4612 で起票済み。ipc・network・userns の `TARGET` は `UNIMPLEMENTED` のまま（kubelet が送らない・userns は proto 上 `POD` と `NODE` だけ・network と ipc は core が単独の join を受けない。設計は [pod-namespace-holder.md](pod-namespace-holder.md) の #2903 の節）。
+- `/dev/shm`（POSIX shm）は、実効の ipc が `POD`（保持役あり）で CRI mounts に `/dev/shm` が無いときだけ pod の tmpfs を共有する（#4823・S3。`POD` の範囲で containerd `v2.4.2` と一致。共有の条件はオーナー決定 2026-11-19）。次は共有しない（既存の差）。
+  - ipc `CONTAINER`（kubelet は送らない。ipc を共有しない既存の差に従属する）
+  - 保持役が無い構成（rootful 等。join しない）と、素性なしの保持役（`PodHolder::new`。照合が無効な試験用の構成）
+  - CRI mounts に `/dev/shm` があるとき（bind だけを載せ、pod の tmpfs は渡さない。containerd と同じ）
+  - ipc `NODE` は containerd がホストの `/dev/shm` を bind する。cri が ipc `NODE` を `UNIMPLEMENTED`（`crates/cri/src/bundle/spec.rs` の `namespaces`）にしているため到達しない。ホストの `/dev/shm` は埋めない（オーナー決定 2026-11-19。`NODE` を受けるときに一緒に決める）
+- 共有の副作用: 64 MiB（既定サイズ）は pod の合計。1 コンテナが埋めると兄弟も書けない（containerd と同じ。pod 単位の cgroup は未対応）
+- 特権ランチャー経由の構成（supervisor が ambient capability つき）では、supervisor が `--pod-shm` を `Unimplemented` で拒否するため、ipc `POD` の CRI コンテナの Start が通らない（オーナー決定 2026-11-19。縮退させずに受け入れる）。`--cri-log-path` も同じ拒否のため kubelet 由来は今も通らず、log_path を省く利用（crictl 等）は S3 で新たに落ちる（読みだけ。実機では未確認）
+- SysV IPC と POSIX mqueue は共有される。userns が pod 単位になり、共有者は同じ userns の root になる（capability は既定の 14 個、seccomp が `setns`・`unshare` を禁じ、pid namespace は別）。
+- 残り（後続 issue）: pid の共有（PID 1 の証跡・`Pid1Target` の見直しが要る）、pid の `NamespaceMode::TARGET` は設計済みでオーナー判断待ち（#4607。それまで `UNIMPLEMENTED`／共有しない）。uts の共有は #4608〜#4612 で起票済み。ipc・network・userns の `TARGET` は `UNIMPLEMENTED` のまま（kubelet が送らない・userns は proto 上 `POD` と `NODE` だけ・network と ipc は core が単独の join を受けない。設計は [pod-namespace-holder.md](pod-namespace-holder.md) の #2903 の節）。保持役の実装は #2870・#2871・#2874・#2876・#2877、`/dev/shm` の受け渡しは #4823（S3）で実装済み（[pod-namespace-holder.md](pod-namespace-holder.md) の S3 の節）。
 
 ## pod netns の作成・結線（CRI-2・NET-1・PLUG-1。#2675）
 

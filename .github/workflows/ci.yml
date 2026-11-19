@@ -340,7 +340,8 @@ jobs:
   #   `--all-features` の clippy・test、タイムアウトつきの結合試験、スクリプトの自己テスト、AppArmor の緩和以降の
   #   実機前提の `--ignored` のステップ。条件は `runner.os == 'Linux'`。#4892）を回し、aarch64 の
   #   実行時の正しさ（syscall 番号・seccomp の arch・構造体の配置）を確かめる。結果がアーキテクチャに依らない依存監査
-  #   （cargo-deny・cargo-about）・繰り返し入力の整合確認・ハングプローブ・委譲スコープでの試験の繰り返しは
+  #   （cargo-deny・cargo-about）・繰り返し入力の整合確認・委譲スコープのハングプローブ（`scope-hang-probe`）・
+  #   委譲スコープでの試験の繰り返しは
   #   `matrix.os == 'ubuntu-latest'` で x86_64 の ubuntu だけに残す。macOS・Windows と同じく main・dispatch だけで出る
   #   check-run で、必須チェックに登録しない
   # PR で見落とすのは macOS・Windows 固有の実行時の誤り（テストの失敗・BSD / Git Bash のツール差）で、
@@ -1987,7 +1988,8 @@ jobs:
       # （CORE-6・SUP-4・REPAIR-7・#2596。前提は同じ。Landlock ABI 6 以上と user manager の
       # private ソケットは前提確認ステップで fail-closed にする）: `--ignored` の実機前提テスト（harness = false）を非 root で実行する。
       # 範囲写像（`FANDHE_CONTAINER_TEST_ID_HELPER=1`。uidmap・subuid）と委譲 cgroup の前提は、`linux-env-probe.yml` の
-      # `id-mapping-probe`（run 39295761418・2026-10-19・#2244）で ubuntu-latest が既定で満たすと実測済み。
+      # `id-mapping-probe`（run 39295761418・2026-10-19・#2244）で ubuntu-latest が既定で満たすと実測済み（arm64 は #4810 の
+      # dispatch run 44467915141。docs/verification/arm64-real-machine-steps.md）。
       # 準備ステップは sudo を使わず確認だけを行い、欠けていれば fail-closed にする（sudo の用途は増やさない）。
       # ubuntu-latest が新しい世代へ変わってここが落ちたら、確認を緩めず `id-mapping-probe` を回し直して判断する。
       # root で走る分岐（root=true）は CI では回さない（実機確認は #1621）。新しい check-run・permissions は追加しない。

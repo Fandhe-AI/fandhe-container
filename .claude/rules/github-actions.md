@@ -54,7 +54,7 @@ CI の構成・段階ゲート・3 OS 方針・実機前提テストの扱いは
 6. action は **SHA 固定＋バージョンコメント**（`uses: owner/repo@<40 桁 SHA> # vX.Y.Z`）。`@latest` が許されるのは `Fandhe-AI/actions` のみ。新しい action は信頼できる配布元（GitHub 公式・組織内）に限り、既存と同じ版を使う。action の版の更新は本規約の範囲外
 7. `timeout-minutes` を必ず付ける（ハング時の多層防御。NFR-10）。reusable workflow を呼ぶジョブには付けられないので上流の契約に任せる
 8. 変更後は `actionlint .github/workflows/*.yml`（無ければ YAML の構文確認）と `yamllint` を通す。PR 上で CI を走らせ、変更前後の所要時間とジョブ数を PR 本文に書く
-9. `platform-ci` に実機前提のステップを足すときの条件は Linux の両 leg の形（`runner.os == 'Linux' && env.HANG_PROBE != 'true'`）にする。x86_64 だけに残すもの（依存監査・ハングプローブ等）は [ci](ci.md)「arm64 の Linux の leg」に理由を載せる（#4892）
+9. `platform-ci` に実機前提のステップを足すときの条件は Linux の両 leg の形（`runner.os == 'Linux' && env.HANG_PROBE != 'true'`）にする。x86_64 だけに残すもの（依存監査・委譲スコープのハングプローブ `scope-hang-probe` 等）は [ci](ci.md)「arm64 の Linux の leg」に理由を載せる（#4892）
 10. 所要時間の目安（2026-10-11 実測の PR 中央値）を超えて遅くしない: 下表
 
 ## 計測方法と実測値

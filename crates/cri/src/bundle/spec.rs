@@ -23,7 +23,7 @@
 //!   [`PodNamespacePaths`] は保持役の pid から `/proc/<pid>/ns/{user,ipc,net}` だけを組み立てる（#2776・#2878）。
 //!   `CriRuntimeService` は保持役の provider を注入したときだけ自 sandbox の記録の pid から作った値を渡す（#2876）。
 //!   本番（plugin-cri）は Linux・非 root で provider を注入済み（H6・#2877）のため共有される。rootful など注入しない構成では新しい namespace になる。
-//!   `/dev/shm` は ipc を join し CRI mounts に `/dev/shm` が無いときだけ pod の tmpfs を共有する（条件は [`shares_pod_shm`]。
+//!   `/dev/shm` は ipc を join し CRI mounts に `/dev/shm` が無いときだけ pod の tmpfs を共有する（条件は `shares_pod_shm`。
 //!   config.json には出さず、Start が `StartRequest` の pod shm として渡す。CRI-2・CORE-3・SEC-1・#4823）。それ以外は core がコンテナごとの tmpfs を載せる。`/proc/<pid>` を
 //!   Create の時点で書く方式は pid の再利用で別 pod の namespace へ入り得る（SEC-1）ため採らない。
 //! - network namespace: `POD` / `CONTAINER` は `{"type":"network"}` を出す。`POD` で pod の netns のパスを受けたとき

@@ -5744,6 +5744,7 @@ mod tests {
         let private = svc.reserve_container(private_req, false).unwrap();
         let err = svc.start_inputs(&shared.container_id).unwrap_err();
         assert_eq!(err.code(), CriErrorCode::FailedPrecondition);
+        assert_eq!(err.message(), "sandbox holder is unavailable");
         assert!(svc.start_inputs(&private.container_id).unwrap().2.is_none());
 
         let ns = |dev, ino| crate::adapter::NamespaceIdentity { dev, ino };

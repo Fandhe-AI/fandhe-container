@@ -114,7 +114,7 @@
 //!   現行の CORE-5 フィルタは `unshare`・`ptrace`・`kexec_load` を `SECCOMP_RET_KILL_PROCESS` で拒否する
 //!   （`DeniedSyscall::deny_action`。#1834）ため、子は SIGSYS で終了する。戻って終了コード 0 になれば失敗（fail-closed）。
 //! - ESC-06 の監査（SEC-4）は `AuditExpectation::Deferred`（#2237 の D1 A・D2 A で確定。2026-11-13）とし、合否に使わない。
-//!   理由: `KILL_PROCESS` の 3 件は `USER_NOTIF` に載らず（ERRNO 側の 40 件だけが載る）、子が SIGSYS で終了すると
+//!   理由: `KILL_PROCESS` の 3 件は `USER_NOTIF` に載らず（ERRNO 側の 43 件だけが載る）、子が SIGSYS で終了すると
 //!   子からは記録を書けない。本番の記録は、本番 launcher の回収点が出す補助の `exit_signal`（この試験の入口
 //!   `spawn_container_probe` では作られない）と、カーネルの `AUDIT_SECCOMP`（fandhe は自前の読み手を持たず、
 //!   読み手を置かない決定〔D1 A〕。正の記録は auditd 等の外部の読み手に任せる）である。補助の `exit_signal` も

@@ -226,6 +226,8 @@ pub struct SeccompEnforcementObservation {
     pub vsock_high_bits_after: Option<i32>,
     /// 適用後の `socket(AF_UNIX, SOCK_STREAM, 0)`（陽性対照。成功して `None`）。
     pub unix_socket_after: Option<i32>,
+    /// 適用後の `io_uring_setup(0, NULL)` の errno（`ERRNO(EPERM)`。フィルタが無ければ `EINVAL`。CORE-5・SEC-1・MAC-4・#4803）。
+    pub io_uring_setup_after: Option<i32>,
 }
 
 /// 本番の適用経路（[`apply_default_seccomp`]）を呼び出しスレッドへ適用し、禁止 syscall の遮断を観測する
@@ -268,6 +270,7 @@ pub fn observe_default_seccomp_enforcement() -> Result<SeccompEnforcementObserva
         vsock_after: errno(sys::vsock_socket_probe()),
         vsock_high_bits_after: errno(sys::vsock_socket_high_bits_probe()),
         unix_socket_after: errno(sys::unix_socket_probe()),
+        io_uring_setup_after: errno(sys::io_uring_setup_probe()),
     })
 }
 

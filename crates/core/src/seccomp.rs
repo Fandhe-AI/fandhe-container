@@ -49,12 +49,12 @@
 //! 許可リスト方式への発展（TASK-128・GPU-3）は扱わない。
 //! 監査ログ連携のうち拒否報告からレコードを作るフックは `audit_log`（TASK-41.2・SEC-4）にある。
 //! ただし `ERRNO(EPERM)` も `KILL_PROCESS` もユーザー空間へ報告しないため、既定（ERRNO 版）では ERRNO 側の記録は残らない。
-//! ERRNO 側 40 件（と条件付きの `socket(AF_VSOCK)`）を `SECCOMP_RET_USER_NOTIF` で返すフィルタは、crate 内の `build_deny_filter_with` /
+//! ERRNO 側 43 件（と条件付きの `socket(AF_VSOCK)`）を `SECCOMP_RET_USER_NOTIF` で返すフィルタは、crate 内の `build_deny_filter_with` /
 //! `build_filter_for_target_arch_with`（[`ErrnoDelivery::UserNotif`]）で構築する（#2023・SEC-4。
 //! 方式は `docs/design/audit-delivery.md` 4 章・#2018）。外部からは `ProductionLauncherBuilder::seccomp_errno_delivery` の
 //! opt-in だけが選べる（誤って応答者のいない構成にしないため構築関数は公開しない。#2025）。supervisor の start 経路が
 //! opt-in し、listener fd の取得・受け渡し（#2024）と listener ループ・`-EPERM` 応答（#2025）が揃っている。
-//! listener 無しで USER_NOTIF 版を載せると 40 件は `EPERM` ではなく `ENOSYS` になり
+//! listener 無しで USER_NOTIF 版を載せると 43 件は `EPERM` ではなく `ENOSYS` になり
 //! （syscall は実行されず拒否は維持される）、ESC-03 の期待と食い違うため、応答者のいない構成には載せない。
 //! 応答側は `SECCOMP_USER_NOTIF_FLAG_CONTINUE` を使ってはならない（許可に化けるため。#2025 への契約）。
 //! `KILL_PROCESS` 側の正の記録はカーネルの `AUDIT_SECCOMP` が出す（`actions_logged` に `kill_process` が
@@ -75,8 +75,8 @@ use std::fmt;
 //   （プロセス単位。Linux 4.14 以降。arch 不一致・x32 拒否で既に使用中）。`SECCOMP_RET_TRAP` は
 //   SIGSYS を送るだけで捕捉・無視できるため強制終了の手段にならず、`KILL_THREAD` はスレッド単位で
 //   他スレッドが残るため使わない
-// - `ERRNO(EPERM)`: 残りの 40 件（`mount`・`pivot_root`・`umount2` を含む）。ESC-03 は `mount` を
-//   EPERM で拒否と定める。他の 39 件は spec が動作を定めておらず、moby 既定プロファイル
+// - `ERRNO(EPERM)`: 残りの 43 件（`mount`・`pivot_root`・`umount2` を含む）。ESC-03 は `mount` を
+//   EPERM で拒否と定める。他の 42 件は spec が動作を定めておらず、moby 既定プロファイル
 //   （`defaultAction` は ERRNO、KILL 系は使わない）に揃えて現状維持とする
 // - 条件付き `ERRNO(EPERM)`: `socket(2)` の family が `AF_VSOCK` のときだけ（`DeniedSocketFamily`。MAC-4・SEC-1・#2277）
 //
@@ -225,11 +225,17 @@ pub enum DeniedSyscall {
     Iopl,
     /// `ioperm`: I/O ポートアクセス許可（x86 固有。aarch64 には存在しない）。
     Ioperm,
+    /// `io_uring_setup`: io_uring の作成。`IORING_OP_SOCKET` が `socket(2)` の引数ルールを迂回するため拒否（CORE-5・SEC-1・MAC-4・#4803）。
+    IoUringSetup,
+    /// `io_uring_enter`: io_uring への投入（#4803）。
+    IoUringEnter,
+    /// `io_uring_register`: io_uring の資源登録（#4803）。
+    IoUringRegister,
 }
 
 impl DeniedSyscall {
     /// 全 variant（テーブルの網羅性検査と #838 の走査に使う）。
-    pub const ALL: [DeniedSyscall; 43] = [
+    pub const ALL: [DeniedSyscall; 46] = [
         DeniedSyscall::Unshare,
         DeniedSyscall::Setns,
         DeniedSyscall::Mount,
@@ -273,6 +279,9 @@ impl DeniedSyscall {
         DeniedSyscall::OpenByHandleAt,
         DeniedSyscall::Iopl,
         DeniedSyscall::Ioperm,
+        DeniedSyscall::IoUringSetup,
+        DeniedSyscall::IoUringEnter,
+        DeniedSyscall::IoUringRegister,
     ];
 
     /// 拒否時の動作。ワイルドカードを置かない網羅 match で、variant を足すと動作の決定を強制する。
@@ -323,7 +332,10 @@ impl DeniedSyscall {
             | DeniedSyscall::Keyctl
             | DeniedSyscall::OpenByHandleAt
             | DeniedSyscall::Iopl
-            | DeniedSyscall::Ioperm => DenyAction::Errno,
+            | DeniedSyscall::Ioperm
+            | DeniedSyscall::IoUringSetup
+            | DeniedSyscall::IoUringEnter
+            | DeniedSyscall::IoUringRegister => DenyAction::Errno,
         }
     }
 
@@ -384,6 +396,9 @@ impl DeniedSyscall {
             DeniedSyscall::OpenByHandleAt => "open_by_handle_at",
             DeniedSyscall::Iopl => "iopl",
             DeniedSyscall::Ioperm => "ioperm",
+            DeniedSyscall::IoUringSetup => "io_uring_setup",
+            DeniedSyscall::IoUringEnter => "io_uring_enter",
+            DeniedSyscall::IoUringRegister => "io_uring_register",
         }
     }
 }
@@ -397,9 +412,10 @@ impl DeniedSyscall {
 /// `socket(AF_VSOCK, ...)` を使うと、VM のゲスト内の制御用受け口（macOS の guest-init 等）へ届きうる。
 /// 受け口側の接続元確認とは独立に効く多層防御で、moby の既定プロファイルと同じ挙動（`EPERM`）。
 ///
-/// 残余（黙って「完全に拒否」とは言わない）: `io_uring` の `IORING_OP_SOCKET`（Linux 5.19 以降）は
-/// `socket(2)` を通らず、seccomp の引数ルールでは止められない。`io_uring_*` の拒否は既定の挙動を変えるため
-/// オーナー判断待ちで、本ルールの範囲外。`socketpair(AF_VSOCK)` は vsock が非対応（`EOPNOTSUPP`）のため対象にしない。
+/// `io_uring` の `IORING_OP_SOCKET`（Linux 5.19 以降）は `socket(2)` を通らず引数ルールでは止められないため、
+/// `io_uring_setup`・`io_uring_enter`・`io_uring_register` を [`DeniedSyscall`] で丸ごと `ERRNO(EPERM)` にして
+/// この抜け道を閉じる（#4751 のオーナー判断 2026-11-13・#4803。`docs/design/macos-shared-vm.md`）。
+/// `socketpair(AF_VSOCK)` は vsock が非対応（`EOPNOTSUPP`）のため対象にしない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeniedSocketFamily {
     /// `AF_VSOCK`（40）。
@@ -868,7 +884,7 @@ mod nr {
 
     const AUDIT_ARCH: AuditArch = AuditArch::new(0xC000_003E);
 
-    static ENTRIES: [(D, N); 43] = [
+    static ENTRIES: [(D, N); 46] = [
         (D::Unshare, N::new(272)),
         (D::Setns, N::new(308)),
         (D::Mount, N::new(165)),
@@ -912,6 +928,9 @@ mod nr {
         (D::OpenByHandleAt, N::new(304)),
         (D::Iopl, N::new(172)),
         (D::Ioperm, N::new(173)),
+        (D::IoUringSetup, N::new(425)),
+        (D::IoUringEnter, N::new(426)),
+        (D::IoUringRegister, N::new(427)),
     ];
 
     static ABSENT: [D; 0] = [];
@@ -933,7 +952,7 @@ mod nr {
 
     const AUDIT_ARCH: AuditArch = AuditArch::new(0xC000_00B7);
 
-    static ENTRIES: [(D, N); 41] = [
+    static ENTRIES: [(D, N); 44] = [
         (D::Unshare, N::new(97)),
         (D::Setns, N::new(268)),
         (D::Mount, N::new(40)),
@@ -975,6 +994,9 @@ mod nr {
         (D::RequestKey, N::new(218)),
         (D::Keyctl, N::new(219)),
         (D::OpenByHandleAt, N::new(265)),
+        (D::IoUringSetup, N::new(425)),
+        (D::IoUringEnter, N::new(426)),
+        (D::IoUringRegister, N::new(427)),
     ];
 
     static ABSENT: [D; 2] = [D::Iopl, D::Ioperm];
@@ -1058,6 +1080,9 @@ mod tests {
         (DeniedSyscall::OpenByHandleAt, 304),
         (DeniedSyscall::Iopl, 172),
         (DeniedSyscall::Ioperm, 173),
+        (DeniedSyscall::IoUringSetup, 425),
+        (DeniedSyscall::IoUringEnter, 426),
+        (DeniedSyscall::IoUringRegister, 427),
     ];
 
     #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
@@ -1103,6 +1128,9 @@ mod tests {
         (DeniedSyscall::RequestKey, 218),
         (DeniedSyscall::Keyctl, 219),
         (DeniedSyscall::OpenByHandleAt, 265),
+        (DeniedSyscall::IoUringSetup, 425),
+        (DeniedSyscall::IoUringEnter, 426),
+        (DeniedSyscall::IoUringRegister, 427),
     ];
 
     /// CORE-5・TASK-38.1.1: 全エントリの番号と AUDIT_ARCH を具体値で照合する。
@@ -1233,7 +1261,7 @@ mod tests {
         assert_eq!(DeniedSyscall::KexecLoad.name(), "kexec_load");
         assert_eq!(DeniedSyscall::Unshare.name(), "unshare");
         assert_eq!(DeniedSyscall::OpenByHandleAt.name(), "open_by_handle_at");
-        assert_eq!(DeniedSyscall::ALL.len(), 43);
+        assert_eq!(DeniedSyscall::ALL.len(), 46);
         assert_eq!(
             SeccompTableError::UnsupportedArch.to_string(),
             "seccomp syscall table is not available for this architecture"
@@ -1246,15 +1274,15 @@ mod tests {
 mod bpf_tests {
     use super::*;
 
-    const X86_NRS: [u32; 43] = [
+    const X86_NRS: [u32; 46] = [
         272, 308, 165, 166, 155, 428, 429, 430, 431, 432, 433, 442, 101, 310, 311, 312, 246, 320,
         175, 313, 176, 169, 167, 168, 163, 179, 443, 153, 164, 227, 305, 159, 103, 212, 321, 298,
-        323, 248, 249, 250, 304, 172, 173,
+        323, 248, 249, 250, 304, 172, 173, 425, 426, 427,
     ];
-    const AARCH_NRS: [u32; 41] = [
+    const AARCH_NRS: [u32; 44] = [
         97, 268, 40, 39, 41, 428, 429, 430, 431, 432, 433, 442, 117, 270, 271, 272, 104, 294, 105,
         273, 106, 142, 224, 225, 89, 60, 443, 58, 170, 112, 266, 171, 116, 18, 280, 241, 282, 217,
-        218, 219, 265,
+        218, 219, 265, 425, 426, 427,
     ];
     /// ランタイム自身が使う 11 syscall（x86_64）。
     const X86_RUNTIME: [u32; 11] = [59, 322, 157, 125, 126, 436, 60, 231, 434, 424, 15];
@@ -1336,7 +1364,7 @@ mod bpf_tests {
     #[test]
     fn core5_task38_1_2_x86_64_shape() {
         let p = build_deny_filter(x86()).unwrap();
-        assert_eq!(p.len(), 97);
+        assert_eq!(p.len(), 103);
         assert!(!p.is_empty());
         let i = p.instructions();
         let t = |x: &BpfInstruction| (x.code(), x.jt(), x.jf(), x.k());
@@ -1352,17 +1380,17 @@ mod bpf_tests {
         assert_eq!(t(&i[8]), (0x15, 0, 1, 308));
         assert_eq!(t(&i[9]), (0x06, 0, 0, ERRNO_EPERM));
         // socket の引数ルール 4 命令（#2277）の後に末尾の ALLOW。
-        assert_eq!(t(&i[92]), (0x15, 0, 3, 41));
-        assert_eq!(t(&i[93]), (0x20, 0, 0, 16));
-        assert_eq!(t(&i[94]), (0x15, 0, 1, 40));
-        assert_eq!(t(&i[95]), (0x06, 0, 0, ERRNO_EPERM));
-        assert_eq!(t(&i[96]), (0x06, 0, 0, 0x7fff_0000));
+        assert_eq!(t(&i[98]), (0x15, 0, 3, 41));
+        assert_eq!(t(&i[99]), (0x20, 0, 0, 16));
+        assert_eq!(t(&i[100]), (0x15, 0, 1, 40));
+        assert_eq!(t(&i[101]), (0x06, 0, 0, ERRNO_EPERM));
+        assert_eq!(t(&i[102]), (0x06, 0, 0, 0x7fff_0000));
     }
 
     #[test]
     fn core5_task38_1_2_aarch64_shape() {
         let p = build_deny_filter(aarch()).unwrap();
-        assert_eq!(p.len(), 91);
+        assert_eq!(p.len(), 97);
         assert!(p.instructions().iter().all(|i| i.code() != 0x45));
         assert!(
             !p.instructions()
@@ -1371,10 +1399,10 @@ mod bpf_tests {
         );
         let i = p.instructions();
         let t = |x: &BpfInstruction| (x.code(), x.jt(), x.jf(), x.k());
-        assert_eq!(t(&i[86]), (0x15, 0, 3, 198));
-        assert_eq!(t(&i[87]), (0x20, 0, 0, 16));
-        assert_eq!(t(&i[88]), (0x15, 0, 1, 40));
-        assert_eq!(t(&i[89]), (0x06, 0, 0, ERRNO_EPERM));
+        assert_eq!(t(&i[92]), (0x15, 0, 3, 198));
+        assert_eq!(t(&i[93]), (0x20, 0, 0, 16));
+        assert_eq!(t(&i[94]), (0x15, 0, 1, 40));
+        assert_eq!(t(&i[95]), (0x06, 0, 0, ERRNO_EPERM));
         let last = p.instructions().last().unwrap();
         assert_eq!((last.code(), last.k()), (0x06, 0x7fff_0000));
     }
@@ -1436,14 +1464,31 @@ mod bpf_tests {
         assert_eq!(DenyAction::KillProcess.ret_value(), 0x8000_0000);
     }
 
-    /// SEC-4: 43 件のうち 40 件が USER_NOTIF、3 件が KILL_PROCESS。`Errno` 指定は方針と一致。
+    /// CORE-5・SEC-1・MAC-4・#4803: io_uring の 3 件は `KILL_PROCESS` にせず ERRNO 側（USER_NOTIF の opt-in でも同じ側）。
+    #[test]
+    fn core5_4803_io_uring_is_errno_side() {
+        for d in [
+            DeniedSyscall::IoUringSetup,
+            DeniedSyscall::IoUringEnter,
+            DeniedSyscall::IoUringRegister,
+        ] {
+            assert_eq!(d.deny_action(), DenyAction::Errno);
+            assert_eq!(d.filter_action(ErrnoDelivery::Errno), DenyAction::Errno);
+            assert_eq!(
+                d.filter_action(ErrnoDelivery::UserNotif),
+                DenyAction::UserNotif
+            );
+        }
+    }
+
+    /// SEC-4: 46 件のうち 43 件が USER_NOTIF、3 件が KILL_PROCESS。`Errno` 指定は方針と一致。
     #[test]
     fn sec4_filter_action_table() {
         let un = DeniedSyscall::ALL
             .iter()
             .filter(|d| d.filter_action(ErrnoDelivery::UserNotif) == DenyAction::UserNotif)
             .count();
-        assert_eq!(un, 40);
+        assert_eq!(un, 43);
         let kills: Vec<&str> = DeniedSyscall::ALL
             .iter()
             .filter(|d| d.filter_action(ErrnoDelivery::UserNotif) == DenyAction::KillProcess)
@@ -1470,7 +1515,7 @@ mod bpf_tests {
     #[test]
     fn sec4_user_notif_x86_64_shape() {
         let p = build_deny_filter_with(x86(), ErrnoDelivery::UserNotif).unwrap();
-        assert_eq!(p.len(), 97);
+        assert_eq!(p.len(), 103);
         let i = p.instructions();
         let t = |x: &BpfInstruction| (x.code(), x.jt(), x.jf(), x.k());
         assert_eq!(t(&i[0]), (0x20, 0, 0, 4));
@@ -1483,14 +1528,14 @@ mod bpf_tests {
         assert_eq!(t(&i[7]), (0x06, 0, 0, KILL));
         assert_eq!(t(&i[8]), (0x15, 0, 1, 308));
         assert_eq!(t(&i[9]), (0x06, 0, 0, USER_NOTIF));
-        assert_eq!(t(&i[96]), (0x06, 0, 0, ALLOW));
+        assert_eq!(t(&i[102]), (0x06, 0, 0, ALLOW));
     }
 
     /// SEC-4: aarch64 の USER_NOTIF 版の形（命令数は 91 のまま）。
     #[test]
     fn sec4_user_notif_aarch64_shape() {
         let p = build_deny_filter_with(aarch(), ErrnoDelivery::UserNotif).unwrap();
-        assert_eq!(p.len(), 91);
+        assert_eq!(p.len(), 97);
         assert!(p.instructions().iter().all(|i| i.code() != 0x45));
         let last = p.instructions().last().unwrap();
         assert_eq!((last.code(), last.k()), (0x06, ALLOW));
@@ -1499,8 +1544,8 @@ mod bpf_tests {
     /// SEC-4: Errno 版との差は ERRNO(EPERM) の RET が USER_NOTIF になる位置だけ。
     #[test]
     fn sec4_user_notif_differs_only_in_errno_returns() {
-        // 差は表の ERRNO 40 / 38 件に vsock の引数ルール 1 件（#2277）を足した数。
-        for (t, want) in [(x86(), 41usize), (aarch(), 39usize)] {
+        // 差は表の ERRNO 43 / 41 件に vsock の引数ルール 1 件（#2277）を足した数。
+        for (t, want) in [(x86(), 44usize), (aarch(), 42usize)] {
             let e = build_deny_filter_with(t, ErrnoDelivery::Errno).unwrap();
             let u = build_deny_filter_with(t, ErrnoDelivery::UserNotif).unwrap();
             assert_eq!(e.len(), u.len());
@@ -1589,9 +1634,9 @@ mod bpf_tests {
     fn sec4_native_user_notif_len() {
         let r = build_filter_for_target_arch_with(ErrnoDelivery::UserNotif);
         #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
-        assert_eq!(r.unwrap().len(), 97);
+        assert_eq!(r.unwrap().len(), 103);
         #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
-        assert_eq!(r.unwrap().len(), 91);
+        assert_eq!(r.unwrap().len(), 97);
         #[cfg(not(all(
             any(target_arch = "x86_64", target_arch = "aarch64"),
             target_pointer_width = "64"
@@ -1602,7 +1647,7 @@ mod bpf_tests {
     /// CORE-5・SEC-2・ESC-06・ESC-03: 拒否時の動作の表。強制終了は 3 件だけで `mount` 系は ERRNO。
     #[test]
     fn core5_sec2_deny_action_table() {
-        assert_eq!(DeniedSyscall::ALL.len(), 43);
+        assert_eq!(DeniedSyscall::ALL.len(), 46);
         let kills: Vec<&str> = DeniedSyscall::ALL
             .iter()
             .filter(|d| d.deny_action() == DenyAction::KillProcess)
@@ -1613,7 +1658,7 @@ mod bpf_tests {
             .iter()
             .filter(|d| d.deny_action() == DenyAction::Errno)
             .count();
-        assert_eq!(errnos, 40);
+        assert_eq!(errnos, 43);
         for d in [
             DeniedSyscall::Mount,
             DeniedSyscall::PivotRoot,
@@ -1683,7 +1728,7 @@ mod bpf_tests {
     #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
     #[test]
     fn core5_task38_1_2_native_aarch64() {
-        assert_eq!(build_filter_for_target_arch().unwrap().len(), 91);
+        assert_eq!(build_filter_for_target_arch().unwrap().len(), 97);
     }
 
     #[cfg(not(all(

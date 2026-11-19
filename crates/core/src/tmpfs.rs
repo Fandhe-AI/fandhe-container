@@ -261,6 +261,11 @@ impl TmpfsMountSet {
     /// 黙って共有の定義を差し替えない（fail-closed）: `/dev/shm` が無い（`--ipc=host`）・既定と違う（`--shm-size`・
     /// `--tmpfs /dev/shm`）・`/dev/shm` の配下に tmpfs がある場合は `InvalidArgument`。pod の共有の tmpfs は保持役が決めた
     /// 64 MiB・`nosuid,nodev,noexec` で、コンテナごとの指定では変えられない。
+    ///
+    /// 既定かどうかは定義の同値で判定する（集合は由来〔[`DevShmOrigin`]〕を持たない）。そのため既定と同じ定義の明示指定
+    /// （`--shm-size 64m` 等）は既定と区別できず、pod の共有に置き換わる。大きさ・属性は同じで、違いは pod 内で共有される
+    /// ことだけ。`--pod-shm` を渡すのは CRI の経路（S3・#4823）で、kubelet はコンテナごとの `/dev/shm` の大きさを送らない。
+    /// 由来の区別が要る呼び出し元ができたら、集合に由来を持たせる。
     pub fn without_default_dev_shm(&self) -> Result<Self, TraitError> {
         let default = TmpfsMountSpec::default_dev_shm()?;
         let under_shm = |m: &TmpfsMountSpec| {

@@ -1090,12 +1090,15 @@ mod tests {
 
     /// [`spawn_shm_holder`] の tmpfs のマウントオプションを指定する版（属性の拒否の試験で `noexec` を外す）。
     fn spawn_shm_holder_with(mount_shm: bool, shm_opts: &str) -> FakeHolder {
+        use std::io::BufRead as _;
+        // 準備完了は mount の成功の後に子が出す 1 行で知る。ホストの `/dev/shm` も多くは tmpfs のため、mountinfo の
+        // 「tmpfs がある」では mount の前の継承したマウントでも成立してしまう（REPAIR-12）。
         let script = if mount_shm {
-            format!("mount -t tmpfs -o {shm_opts} tmpfs /dev/shm && exec sleep 30")
+            format!("mount -t tmpfs -o {shm_opts} tmpfs /dev/shm && echo ready && exec sleep 30")
         } else {
-            "exec sleep 30".to_owned()
+            "echo ready && exec sleep 30".to_owned()
         };
-        let holder = FakeHolder {
+        let mut holder = FakeHolder {
             child: std::process::Command::new("unshare")
                 .args([
                     "--user",
@@ -1105,31 +1108,24 @@ mod tests {
                     "private",
                 ])
                 .args(["sh", "-c", &script])
+                .stdout(std::process::Stdio::piped())
                 .spawn()
                 .expect("PRECONDITION FAILED: unshare(1) is required"),
         };
-        // 保持役の mount ns に（載せる構成なら tmpfs が）できるまで待つ。
-        let hpid = holder.child.id();
-        let own = std::fs::read_link("/proc/self/ns/mnt").expect("own mnt ns");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let ready = || {
-            let entered =
-                std::fs::read_link(format!("/proc/{hpid}/ns/mnt")).is_ok_and(|l| l != own);
-            let mounted = !mount_shm
-                || std::fs::read_to_string(format!("/proc/{hpid}/mountinfo")).is_ok_and(|info| {
-                    info.lines().any(|l| {
-                        l.split_whitespace().nth(4) == Some("/dev/shm") && l.contains(" - tmpfs ")
-                    })
-                });
-            entered && mounted
-        };
-        while !ready() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "PRECONDITION FAILED: the holder did not set up its mount namespace"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
+        let stdout = holder.child.stdout.take().expect("holder stdout");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let _ = std::io::BufReader::new(stdout).read_line(&mut line);
+            let _ = tx.send(line);
+        });
+        let line = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("PRECONDITION FAILED: the holder did not set up its mount namespace");
+        assert_eq!(
+            line, "ready\n",
+            "PRECONDITION FAILED: the holder did not set up its mount namespace"
+        );
         holder
     }
 

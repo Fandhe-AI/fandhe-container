@@ -349,9 +349,46 @@ path は 1 回だけ開いて fd に固定する（pid の再利用で別 pod �
 | ipc `POD` | 無し | 新しい namespace |
 | ipc `CONTAINER` | 問わない | 新しい namespace |
 | ipc `POD` ＋ userns `CONTAINER` | あり | `UNIMPLEMENTED` |
-| pid（全モード） | 問わない | 新しい namespace（`NODE` / `TARGET` は `UNIMPLEMENTED`。pod での共有と pid の `TARGET` は #2903 の設計・判断待ち #4607。pid の `TARGET` の core・supervisor の受け口は #4819 で実装済み、cri の受け入れは #4820） |
+| pid（全モード） | 問わない | 新しい namespace（`NODE` は `UNIMPLEMENTED`。pid の `TARGET` は条件つきで受ける。下記「pid の TARGET の受け入れ」。pod での共有は #2903 の設計・判断待ち #4607） |
 
 `/proc/<pid>` を Create の時点で書く方式は pid の再利用で別 pod の namespace に入り得るため採らない。
+
+### pid の TARGET の受け入れ（CRI-2・CORE-3・SEC-1・SEC-5。#4820）
+
+`namespace_options.pid = TARGET` は `target_id` の対象コンテナの pid namespace へ入る（kubelet の ephemeral container が使う形）。pid が `TARGET` でないのに `target_id` があるときは無視する（containerd と同じ）。
+
+判定は `crates/cri/src/runtime_service.rs` の `check_pid_target` が Create と Start の両方でロック下に行い、次の順で見る。
+
+1. 対象の記録がある（無ければ NotFound）
+2. 同じ pod sandbox にある（違えば FailedPrecondition）
+3. 対象の実効の pid が `CONTAINER`（自身の pid namespace を持つ）
+4. 対象の実効の ipc が `POD`（pod の user namespace の中。core の `PidOwnerMismatch` を Create で前倒しする）
+
+bundle（`crates/cri/src/bundle/spec.rs` の `namespaces`）は、保持役の user・ipc への join があるときだけ pid の `TARGET` を受ける。config.json の pid は path なしの新しい pid namespace にし、対象への参加は supervisor の `--pid-target` が行う（[pod-namespace-holder.md](pod-namespace-holder.md) の「実装（T2・#4820）」）。join が無ければ `UNIMPLEMENTED`。ipc・network・userns の `TARGET` は従来どおり `UNIMPLEMENTED`。
+
+固定エラー（cri 側。CriError の code と message は下表のとおり）:
+
+| 場合 | 時点 | code | message |
+| ---- | ---- | ---- | ------- |
+| 対象の記録なし（Start 前に消えた場合を含む） | Create・Start | NotFound | `the pid namespace target does not exist` |
+| 対象が別の pod sandbox | Create・Start | FailedPrecondition | `the pid namespace target is not in the same pod sandbox` |
+| 対象の実効の pid が `CONTAINER` でない | Create・Start | FailedPrecondition | `the pid namespace target does not own its pid namespace` |
+| 対象の実効の ipc が `POD` でない | Create・Start | FailedPrecondition | `the pid namespace target is not in the pod user namespace` |
+| 対象 ID が不正 | Create・Start | Internal | `the pid namespace target id is invalid` |
+| pid が `TARGET`・ipc が `POD` でない、または保持役が無い | Create（bundle） | UNIMPLEMENTED | `namespace_options.pid is not supported` |
+| ipc・network・userns の `TARGET` | Create（bundle） | UNIMPLEMENTED | 既存の `<field> is not supported` |
+| 要求に対象があるのに launcher に無い | Start（core） | FailedPrecondition | `the requested pid namespace target does not match the launcher's pid namespace target` |
+
+Running の検査は cri では行わない。対象が Running でないときは Start で core が `the pid namespace target is not running` で拒否する。containerd との差は次のとおり。
+
+| 項目 | containerd v2.1.0 | 本実装 | kubelet v1.34.0 |
+| ---- | ----------------- | ------ | --------------- |
+| 対象の Running の要求 | Create で `validateTargetContainer` が要求する（`internal/cri/server/container_create.go`） | Start で core が検査する（Create では見ない） | 対象を名前で探すだけで Running を見ない（`pkg/kubelet/kuberuntime/kuberuntime_container.go` の `getTargetID`） |
+| pid の TARGET の送り方 | 未確認（本表の対象外） | `--pid-target` で対象の supervisor の launch pidfd を固定して参加 | pid が `CONTAINER` のときだけ pid を `TARGET`・`TargetId` を入れる（`pkg/kubelet/kuberuntime/kuberuntime_container_linux.go` 91〜93 行付近） |
+
+対象の init が終了すると pid namespace ごと止まる（カーネルが ns 内を SIGKILL する。k8s と同じ）。対象の再起動には追従しない。
+
+※ 版と行番号の出典: kubelet v1.34.0・containerd v2.1.0 は T2 の実装計画の記録による。containerd の行番号は v2.4.2 で取り直していないため関数名だけを記す。kubelet の `getTargetID` は 127〜138 行付近、いずれも再確認は未実施。
 
 ### 既知の差と残り
 
@@ -363,7 +400,7 @@ path は 1 回だけ開いて fd に固定する（pid の再利用で別 pod �
 - 共有の副作用: 64 MiB（既定サイズ）は pod の合計。1 コンテナが埋めると兄弟も書けない（containerd と同じ。pod 単位の cgroup は未対応）
 - 特権ランチャー経由の構成（supervisor が ambient capability つき）では、supervisor が `--pod-shm` を `Unimplemented` で拒否するため、ipc `POD` の CRI コンテナの Start が通らない（オーナー決定 2026-11-19。縮退させずに受け入れる）。`--cri-log-path` も同じ拒否のため kubelet 由来は今も通らず、log_path を省く利用（crictl 等）は S3 で新たに落ちる（読みだけ。実機では未確認）
 - SysV IPC と POSIX mqueue は共有される。userns が pod 単位になり、共有者は同じ userns の root になる（capability は既定の 14 個、seccomp が `setns`・`unshare` を禁じ、pid namespace は別）。
-- 残り（後続 issue）: pid の共有は #4816・#4817 で実装済み。pid の `NamespaceMode::TARGET` は cri では `UNIMPLEMENTED`（共有しない）のまま。core・supervisor の受け口は #4819（T1）で実装済みで、cri の受け入れ（同じ pod・対象の pid が `CONTAINER`・対象の存在の検証）と plugin-cri の argv の書き出しは #4820（T2）。uts の共有は #4608〜#4612 で起票済み。ipc・network・userns の `TARGET` は `UNIMPLEMENTED` のまま（kubelet が送らない・userns は proto 上 `POD` と `NODE` だけ・network と ipc は core が単独の join を受けない。設計は [pod-namespace-holder.md](pod-namespace-holder.md) の #2903 の節）。保持役の実装は #2870・#2871・#2874・#2876・#2877、`/dev/shm` の受け渡しは #4823（S3）で実装済み（[pod-namespace-holder.md](pod-namespace-holder.md) の S3 の節）。
+- 残り（後続 issue）: pid の共有は #4816・#4817 で実装済み。pid の `NamespaceMode::TARGET` は条件つきで受ける（上の「pid の TARGET の受け入れ」）。core・supervisor の受け口は #4819（T1）、cri の受け入れと plugin-cri の argv の書き出しは #4820（T2）で実装済み。uts の共有は #4608〜#4612 で起票済み。ipc・network・userns の `TARGET` は `UNIMPLEMENTED` のまま（kubelet が送らない・userns は proto 上 `POD` と `NODE` だけ・network と ipc は core が単独の join を受けない。設計は [pod-namespace-holder.md](pod-namespace-holder.md) の #2903 の節）。保持役の実装は #2870・#2871・#2874・#2876・#2877、`/dev/shm` の受け渡しは #4823（S3）で実装済み（[pod-namespace-holder.md](pod-namespace-holder.md) の S3 の節）。
 
 ## pod netns の作成・結線（CRI-2・NET-1・PLUG-1。#2675）
 

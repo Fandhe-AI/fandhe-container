@@ -350,6 +350,7 @@ pub struct StartRequest {
     log_path: Option<ContainerLogPath>,
     stdin: StdinMode,
     pod_shm: Option<PodShmSource>,
+    pid_target: Option<ContainerId>,
 }
 
 impl StartRequest {
@@ -360,6 +361,7 @@ impl StartRequest {
             log_path: None,
             stdin: StdinMode::Closed,
             pod_shm: None,
+            pid_target: None,
         }
     }
 
@@ -394,6 +396,16 @@ impl StartRequest {
         self
     }
 
+    /// 参加する pid namespace の TARGET（対象コンテナの ID）を付ける（CRI-2・CORE-3・SEC-1・SEC-5・#4820）。
+    /// plugin-cri が supervisor の `--pid-target` へ写す。core の `start` は launcher 側に固定済みの対象が無ければ
+    /// fork の前に `FailedPrecondition` で拒否する（欄を黙って無視しない）。対象の init が終了すると pid ns ごと
+    /// 止まる（カーネルが ns 内を SIGKILL する。k8s と同じ）。対象の再起動には追従しない。
+    #[must_use]
+    pub fn with_pid_target(mut self, target: ContainerId) -> Self {
+        self.pid_target = Some(target);
+        self
+    }
+
     /// 対象コンテナの ID を返す。
     pub fn id(&self) -> &ContainerId {
         &self.id
@@ -402,6 +414,11 @@ impl StartRequest {
     /// CRI ログの書き先を返す。`None` は CRI ログなし（従来どおり）。
     pub fn log_path(&self) -> Option<&ContainerLogPath> {
         self.log_path.as_ref()
+    }
+
+    /// pid namespace の TARGET を返す。`None` は参加なし（従来どおり）。
+    pub fn pid_target(&self) -> Option<&ContainerId> {
+        self.pid_target.as_ref()
     }
 
     /// pod で共有する `/dev/shm` の元を返す。`None` は共有なし（従来どおり）。
@@ -1242,6 +1259,15 @@ mod tests {
         let src = PodShmSource::new(PathBuf::from("/proc/1234/ns/mnt"), 48, 2).expect("source");
         let req = StartRequest::new(sample_id()).with_pod_shm(src.clone());
         assert_eq!(req.pod_shm(), Some(&src));
+    }
+
+    /// CRI-2・CORE-3（#4820）: `StartRequest` の pid_target は既定で `None`、`with_pid_target` で往復する。
+    #[test]
+    fn cri2_4820_start_request_pid_target_default_none_and_roundtrip() {
+        assert!(StartRequest::new(sample_id()).pid_target().is_none());
+        let t = ContainerId::new("target1").expect("id");
+        let req = StartRequest::new(sample_id()).with_pid_target(t.clone());
+        assert_eq!(req.pid_target(), Some(&t));
     }
 
     #[test]

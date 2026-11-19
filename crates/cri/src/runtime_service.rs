@@ -146,7 +146,7 @@ use tonic::{Request, Response, Status};
 
 use crate::bundle::{AppliedUser, ResolvedImage, resolve_log_path};
 use crate::error::{CriError, CriErrorCode};
-use fandhe_container_core::traits::{ContainerLogPath, PodShmSource, StdinMode};
+use fandhe_container_core::traits::{ContainerId, ContainerLogPath, PodShmSource, StdinMode};
 
 use crate::adapter::{
     BundleProvider, BundleRequest, PodHolder, PodNamespaceHolderProvider, PodNetns,
@@ -408,6 +408,59 @@ pub fn version_response() -> v1::VersionResponse {
         runtime_api_version: RUNTIME_API_VERSION.to_string(),
     }
 }
+
+/// pid namespace の TARGET（`namespace_options.pid = TARGET` の `target_id`）を検証し、対象の ID を返す
+/// （TARGET でなければ `None`。CRI-2・CORE-3・SEC-1・SEC-5・#4820）。
+///
+/// 同じ pod の対象コンテナの記録があり、対象が自身の pid ns（実効の pid が `CONTAINER`）を持ち、pod の user namespace の
+/// 中（実効の ipc が `POD`。core の `PidOwnerMismatch` を Create で前倒しする）にあるときだけ通す。Create と Start の両方で
+/// ロック下で呼ぶ。対象が Running かは見ない（Start で core が `the pid namespace target is not running` と拒否する。
+/// containerd は Create で Running を要求する差）。対象の init が終了すると pid ns ごと止まる（カーネルが ns 内を
+/// SIGKILL する。k8s と同じ）。対象の再起動には追従しない。kubelet は対象を名前で探すだけで Running を見ない。
+///
+/// 拒否は監査（SEC-4）しない。CRI ソケットは peer credential で同じ UID に限られ、拒否は資源を作る前の入力検証のため。
+/// 改ざんを示す違反は core の pin（`PidOwnerMismatch`）と `PinnedPidTarget::resolve`（exec_target）が監査に残す。
+fn check_pid_target(
+    registry: &SandboxRegistry,
+    pod_sandbox_id: &str,
+    sandbox_cfg: &PodSandboxConfig,
+    cfg: &v1::ContainerConfig,
+) -> Result<Option<ContainerId>, CriError> {
+    use crate::bundle::spec::{effective_ipc_is_pod, pid_is_container, pid_target_id};
+    let Some(target_id) = pid_target_id(sandbox_cfg, cfg) else {
+        return Ok(None);
+    };
+    let target = registry
+        .containers
+        .get(target_id)
+        .ok_or_else(|| CriError::not_found("the pid namespace target does not exist"))?;
+    if target.pod_sandbox_id != pod_sandbox_id {
+        return Err(CriError::failed_precondition(
+            "the pid namespace target is not in the same pod sandbox",
+        ));
+    }
+    if !pid_is_container(sandbox_cfg, &target.config) {
+        return Err(CriError::failed_precondition(
+            "the pid namespace target does not own its pid namespace",
+        ));
+    }
+    if !effective_ipc_is_pod(sandbox_cfg, &target.config) {
+        return Err(CriError::failed_precondition(
+            "the pid namespace target is not in the pod user namespace",
+        ));
+    }
+    ContainerId::new(target_id)
+        .map(Some)
+        .map_err(|_| CriError::internal("the pid namespace target id is invalid"))
+}
+
+/// `start_inputs` の戻り値（CRI ログの書き先・stdin の扱い・pod の `/dev/shm`・pid の TARGET）。
+type StartInputs = (
+    Option<ContainerLogPath>,
+    StdinMode,
+    Option<PodShmSource>,
+    Option<ContainerId>,
+);
 
 /// 実行層への接続（アダプタと bundle の供給元。CRI-2・CRI-7）。
 #[derive(Clone)]
@@ -3219,6 +3272,13 @@ impl CriRuntimeService {
         if sandbox.record_write > 0 {
             return Err(CriError::failed_precondition(SANDBOX_RECORD_BUSY));
         }
+        // pid の TARGET は資源を作る前に検証する（stub 経路でも通る。#4820）。
+        check_pid_target(
+            &registry,
+            pod_sandbox_id.as_str(),
+            &sandbox.config,
+            config.config(),
+        )?;
         // CRI ログの書き先は実行層接続時だけ結合して保持する（検証は bundle の供給元と同じ関数。#2671）。
         let resolved_log_path = if in_flight {
             resolve_log_path(&sandbox.config, config.config())?
@@ -3536,16 +3596,13 @@ impl CriRuntimeService {
     /// 保持役の pid と素性（READY の shm）を同じ `PodHolder` から 1 式で取って作る（別 sandbox の取り違えを作らない。
     /// #2776）。provider を注入済みで保持役が無ければ `FAILED_PRECONDITION`（Create と同じ規則。Start と Stop の競合で
     /// 共有なしへ縮退させない）。素性なしの保持役・provider なしの構成は共有しない（`None`）。CRI-2・CORE-3・SEC-1・#4823。
-    fn start_inputs(
-        &self,
-        id: &str,
-    ) -> Result<(Option<ContainerLogPath>, StdinMode, Option<PodShmSource>), CriError> {
+    fn start_inputs(&self, id: &str) -> Result<StartInputs, CriError> {
         let registry = self
             .registry
             .lock()
             .map_err(|_| CriError::internal("sandbox registry is unavailable"))?;
         let Some(r) = registry.containers.get(id) else {
-            return Ok((None, StdinMode::Closed, None));
+            return Ok((None, StdinMode::Closed, None, None));
         };
         let pod_shm = match registry.records.get(&r.pod_sandbox_id) {
             Some(sandbox) if crate::bundle::spec::shares_pod_shm(&sandbox.config, &r.config) => {
@@ -3581,7 +3638,19 @@ impl CriRuntimeService {
             // 共有の条件に当たらない（ipc が POD でない・`/dev/shm` の mount あり）。
             Some(_) => None,
         };
-        Ok((r.resolved_log_path.clone(), r.start_stdin_mode(), pod_shm))
+        // pid の TARGET は Create 後に対象が消えた場合も拒否する（Create と同じ検査。guard が Created へ戻す。#4820）。
+        let sandbox = registry
+            .records
+            .get(&r.pod_sandbox_id)
+            .ok_or_else(|| CriError::failed_precondition("sandbox record is unavailable"))?;
+        let pid_target =
+            check_pid_target(&registry, &r.pod_sandbox_id, &sandbox.config, &r.config)?;
+        Ok((
+            r.resolved_log_path.clone(),
+            r.start_stdin_mode(),
+            pod_shm,
+            pid_target,
+        ))
     }
 
     /// 実行層接続時の `StartContainer`（TASK-59.2・CRI-2）。
@@ -3599,7 +3668,7 @@ impl CriRuntimeService {
         let mut guard =
             InFlightGuard::new(Arc::clone(&self.registry), id.clone(), InFlightKind::Start);
         // 書き先の取得に失敗しても、実行層を呼ぶ前なので guard の破棄で created へ戻る。
-        let (log_path, stdin, pod_shm) = self.start_inputs(&id)?;
+        let (log_path, stdin, pod_shm, pid_target) = self.start_inputs(&id)?;
         let adapter = binding.adapter.clone();
         let timeout = self.runtime_timeout;
         let record_store = self.record_store.clone();
@@ -3609,17 +3678,18 @@ impl CriRuntimeService {
             guard.arm_record_store(record_store);
             // 専用スレッドの起動に失敗した場合は未送信なので、送信の直前に結果不明へ倒す。
             guard.mark_dispatched();
-            let status = match adapter.start_with_pod_shm(&id, log_path, stdin, pod_shm) {
-                Ok(status) => status,
-                Err(status) => {
-                    // 確定失敗のコードに限り created へ戻す。タイムアウト・Unavailable・Internal 等は
-                    // 実行層が起動済みの可能性があるため、unknown のまま破棄して exited にする（fail-closed）。
-                    if start_failure_is_definite(&adapter, &id, status.code(), timeout) {
-                        guard.mark_definitely_failed();
+            let status =
+                match adapter.start_with_pid_target(&id, log_path, stdin, pod_shm, pid_target) {
+                    Ok(status) => status,
+                    Err(status) => {
+                        // 確定失敗のコードに限り created へ戻す。タイムアウト・Unavailable・Internal 等は
+                        // 実行層が起動済みの可能性があるため、unknown のまま破棄して exited にする（fail-closed）。
+                        if start_failure_is_definite(&adapter, &id, status.code(), timeout) {
+                            guard.mark_definitely_failed();
+                        }
+                        return Err(status);
                     }
-                    return Err(status);
-                }
-            };
+                };
             match status.state {
                 CriContainerState::ContainerRunning => guard.commit(),
                 // Creating は未起動と確定できない（結果不明のまま exited へ倒す）。

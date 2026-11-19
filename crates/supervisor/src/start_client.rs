@@ -248,6 +248,8 @@ pub struct StartOptions<'a> {
     /// pod で共有する `/dev/shm` の元（`--pod-shm <dev>:<ino>:<パス>`。plugin-cri だけが指定する。supervisor は特権ランチャー経由
     /// では拒否する。CRI-2・CORE-3・SEC-1・SEC-5・#4822）。`None` は argv に載せない。
     pub pod_shm: Option<&'a PodShmSource>,
+    /// pid namespace の TARGET（`--pid-target <コンテナ ID>`。plugin-cri だけが指定する。CRI-2・CORE-3・SEC-1・SEC-5・#4820）。`None` は argv に載せない。
+    pub pid_target: Option<&'a ContainerId>,
 }
 
 impl<'a> StartOptions<'a> {
@@ -279,6 +281,12 @@ impl<'a> StartOptions<'a> {
         self.pod_shm = source;
         self
     }
+
+    /// pid namespace の TARGET を設定する（`None` は argv に載せない。CRI-2・#4820）。
+    pub fn with_pid_target(mut self, target: Option<&'a ContainerId>) -> Self {
+        self.pid_target = target;
+        self
+    }
 }
 
 /// 契約どおりの argv・stdio・環境・cwd を `cmd` に設定する（シェルも文字列連結も使わない）。
@@ -301,6 +309,10 @@ fn configure_common(cmd: &mut Command, root: &Path, opts: &StartOptions<'_>, id:
     if let Some(source) = opts.pod_shm {
         cmd.arg("--pod-shm")
             .arg(crate::start_contract::pod_shm_arg(source));
+    }
+    // pid の TARGET は検証済みの ID を 1 要素で渡す（CRI-2・#4820）。
+    if let Some(target) = opts.pid_target {
+        cmd.arg("--pid-target").arg(target.as_str());
     }
     cmd.arg(id.as_str())
         .stdin(Stdio::null())
@@ -1300,6 +1312,61 @@ mod tests {
             assert_eq!(parsed.pod_shm, Some(source.clone()));
             let none = args_of(&StartOptions::new().with_pod_shm(None));
             assert!(!none.iter().any(|x| x == "--pod-shm"));
+        }
+    }
+
+    /// CRI-2・CORE-3・#4820: `--pid-target <id>` は `--pod-shm` の後・ID の前に載り、`StartArgs::parse` で往復し、
+    /// 全オプションでも MAX_ARGS に収まる。未指定は載らない。
+    #[test]
+    fn cri2_4820_scoped_command_carries_pid_target() {
+        use crate::start_contract::{MAX_ARGS, StartArgs};
+        let id = ContainerId::new("c1").expect("id");
+        let target = ContainerId::new("t1").expect("id");
+        let lp = ContainerLogPath::new("/l/c/0.log").expect("log path");
+        let source = PodShmSource::new(PathBuf::from("/proc/1234/ns/mnt"), 48, 2).expect("source");
+        for launcher in [None, Some(Path::new("/opt/x/fandhe-container-launcher"))] {
+            let args_of = |opts: &StartOptions<'_>| -> Vec<String> {
+                scoped_command(
+                    Path::new("/usr/bin/systemd-run"),
+                    launcher,
+                    Path::new("/opt/x/fandhe-container-supervisor"),
+                    Path::new("/r"),
+                    opts,
+                    &id,
+                    OsStr::new("/run/user/1000"),
+                )
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+            };
+            let a = args_of(&StartOptions::new().with_pid_target(Some(&target)));
+            assert_eq!(
+                a[7..],
+                ["start", "--root", "/r", "--pid-target", "t1", "c1"]
+            );
+            let parsed =
+                StartArgs::parse(a[7..].iter().map(std::ffi::OsString::from)).expect("contract");
+            assert_eq!(parsed.pid_target, Some(target.clone()));
+            let all = StartOptions::new()
+                .with_audit_policy(Some(AuditCoveragePolicy::Strict))
+                .with_cri_log_path(Some(&lp))
+                .with_stdin(Some(StdinOption::Once))
+                .with_pod_shm(Some(&source))
+                .with_pid_target(Some(&target));
+            let a = args_of(&all);
+            assert_eq!(a[7..].len(), 14);
+            assert!(a[7..].len() <= MAX_ARGS);
+            let pos = |s: &str| a.iter().position(|x| x == s).expect(s);
+            assert_eq!(pos("--pid-target"), pos("--pod-shm") + 2);
+            assert_eq!(pos("--pid-target") + 2, a.len() - 1);
+            let parsed =
+                StartArgs::parse(a[7..].iter().map(std::ffi::OsString::from)).expect("contract");
+            assert_eq!(parsed.pid_target, Some(target.clone()));
+            assert!(
+                !args_of(&StartOptions::new())
+                    .iter()
+                    .any(|x| x == "--pid-target")
+            );
         }
     }
 

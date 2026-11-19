@@ -1019,12 +1019,29 @@ impl RuntimeAdapter {
         stdin: StdinMode,
         pod_shm: Option<PodShmSource>,
     ) -> Result<RuntimeContainerStatus, CriError> {
+        self.start_with_pid_target(id, log_path, stdin, pod_shm, None)
+    }
+
+    /// [`Self::start_with_pod_shm`] に pid namespace の TARGET（対象コンテナの ID）を足して開始する
+    /// （CRI-2・CORE-3・SEC-1・SEC-5・#4820）。検証は `CriRuntimeService` が済ませた値で、`StartRequest::with_pid_target`
+    /// で実行層へ運ぶ。`None` は [`Self::start_with_pod_shm`] と同じ。
+    pub fn start_with_pid_target(
+        &self,
+        id: &str,
+        log_path: Option<ContainerLogPath>,
+        stdin: StdinMode,
+        pod_shm: Option<PodShmSource>,
+        pid_target: Option<ContainerId>,
+    ) -> Result<RuntimeContainerStatus, CriError> {
         let mut req = StartRequest::new(Self::id(id)?).with_stdin(stdin);
         if let Some(log_path) = log_path {
             req = req.with_log_path(log_path);
         }
         if let Some(pod_shm) = pod_shm {
             req = req.with_pod_shm(pod_shm);
+        }
+        if let Some(target) = pid_target {
+            req = req.with_pid_target(target);
         }
         Self::finish(id, self.runtime.start(&req))
     }
@@ -1150,7 +1167,10 @@ mod tests {
     }
 
     /// start の要求を記録するだけの実行層（#4823 の `start_with_pod_shm` の試験用）。
-    struct StartSpy(std::sync::Mutex<Vec<Option<(u64, u64)>>>);
+    struct StartSpy(
+        std::sync::Mutex<Vec<Option<(u64, u64)>>>,
+        std::sync::Mutex<Vec<Option<String>>>,
+    );
 
     impl ContainerRuntime for StartSpy {
         fn create(&self, _: &CreateRequest) -> Result<ContainerStatus, TraitError> {
@@ -1161,6 +1181,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(r.pod_shm().map(PodShmSource::identity));
+            self.1
+                .lock()
+                .unwrap()
+                .push(r.pid_target().map(|t| t.as_str().to_string()));
             Ok(ContainerStatus::running(r.id().clone(), None))
         }
         fn kill(&self, _: &KillRequest) -> Result<ContainerStatus, TraitError> {
@@ -1181,7 +1205,7 @@ mod tests {
     /// `start_with_options`（と `start`）は載せない。
     #[test]
     fn cri2_4823_start_with_pod_shm_reaches_the_request() {
-        let spy = Arc::new(StartSpy(std::sync::Mutex::new(Vec::new())));
+        let spy = Arc::new(StartSpy(Default::default(), Default::default()));
         let adapter = RuntimeAdapter::new(spy.clone());
         let src = PodShmSource::new(std::path::PathBuf::from("/proc/4242/ns/mnt"), 48, 2).unwrap();
         adapter
@@ -1192,6 +1216,21 @@ mod tests {
             .unwrap();
         adapter.start("a").unwrap();
         assert_eq!(*spy.0.lock().unwrap(), vec![Some((48, 2)), None, None]);
+    }
+
+    /// CRI-2・CORE-3・SEC-1・#4820: `start_with_pid_target` は対象の ID を `StartRequest::pid_target()` に載せ、
+    /// `start_with_pod_shm` は載せない。
+    #[test]
+    fn cri2_4820_start_with_pid_target_reaches_the_request() {
+        let spy = Arc::new(StartSpy(Default::default(), Default::default()));
+        let adapter = RuntimeAdapter::new(spy.clone());
+        adapter
+            .start_with_pid_target("a", None, StdinMode::Closed, None, Some(cid("t1")))
+            .unwrap();
+        adapter
+            .start_with_pod_shm("a", None, StdinMode::Closed, None)
+            .unwrap();
+        assert_eq!(*spy.1.lock().unwrap(), vec![Some("t1".to_string()), None]);
     }
 
     /// CRI-5・SEC-1・CORE-1（#4220）: インスタンス識別子を写し、報告が無ければ `None`。

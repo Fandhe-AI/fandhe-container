@@ -437,12 +437,27 @@ impl SupervisedLifecycle {
         stdin: StdinMode,
         pod_shm: Option<&PodShmSource>,
     ) -> Result<ContainerStatus, TraitError> {
+        self.start_with_pid_target(store, id, log_path, stdin, pod_shm, None)
+    }
+
+    /// [`Self::start_with_pod_shm`] に pid namespace の TARGET（`StartRequest::pid_target`）を足して起動する。supervisor へ
+    /// `--pid-target` で渡し、supervisor が対象の pid ns へ参加する（CRI-2・CORE-3・SEC-1・SEC-5・#4820）。`None` は従来どおり。
+    pub fn start_with_pid_target(
+        &self,
+        store: &dyn StateStore,
+        id: &ContainerId,
+        log_path: Option<&ContainerLogPath>,
+        stdin: StdinMode,
+        pod_shm: Option<&PodShmSource>,
+        pid_target: Option<&ContainerId>,
+    ) -> Result<ContainerStatus, TraitError> {
         // 追跡枠の予約より前に対応づける。失敗したら何も起動しない。
         let stdin = stdin_option(stdin)?;
         let opts = StartOptions::new()
             .with_cri_log_path(log_path)
             .with_stdin(stdin)
-            .with_pod_shm(pod_shm);
+            .with_pod_shm(pod_shm)
+            .with_pid_target(pid_target);
         self.reap();
         let Some(root) = store.host_state_root() else {
             return Err(TraitError::new(

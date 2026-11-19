@@ -85,6 +85,7 @@ CLI の `exec` コマンドが `run_command_with_pidfd` を呼ぶために必要
 ### 3.6 利用者: pid namespace の TARGET の解決（#4819）
 
 - 利用者は supervisor の `resolve_pid_target`（`crates/supervisor/src/start_entry.rs`）。新コンテナの supervisor が、対象コンテナの supervisor へ kind 6 を送って launch pidfd を受け取り、対象の pid ns の素性を固定する（CRI-2・CORE-3・SEC-1）
+- 呼び出し元は plugin-cri の Start（`--pid-target <ID>` を付けた supervisor の start。#4820）。CRI の debug コンテナ（pid `TARGET`）がこの経路を通る。
 - 予算は 2 秒（`PID_TARGET_OBTAIN_BUDGET`）。受け取った後は接続をすぐ閉じる。3.5 の作成通知（exec 子 cgroup の通知）は行わない
 - 対象の supervisor がいない・pidfd を得られないときは `Unavailable` で拒否する（記録から pid を開く縮退経路は作らない。SEC-1）。固定エラーの語彙は [pod-namespace-holder.md](pod-namespace-holder.md) の「実装（T1・#4819）」
 

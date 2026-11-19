@@ -349,7 +349,7 @@ path は 1 回だけ開いて fd に固定する（pid の再利用で別 pod �
 | ipc `POD` | 無し | 新しい namespace |
 | ipc `CONTAINER` | 問わない | 新しい namespace |
 | ipc `POD` ＋ userns `CONTAINER` | あり | `UNIMPLEMENTED` |
-| pid（全モード） | 問わない | 新しい namespace（`NODE` / `TARGET` は `UNIMPLEMENTED`。pod での共有と pid の `TARGET` は #2903 の設計・判断待ち #4607） |
+| pid（全モード） | 問わない | 新しい namespace（`NODE` / `TARGET` は `UNIMPLEMENTED`。pod での共有と pid の `TARGET` は #2903 の設計・判断待ち #4607。pid の `TARGET` の core・supervisor の受け口は #4819 で実装済み、cri の受け入れは #4820） |
 
 `/proc/<pid>` を Create の時点で書く方式は pid の再利用で別 pod の namespace に入り得るため採らない。
 
@@ -363,7 +363,7 @@ path は 1 回だけ開いて fd に固定する（pid の再利用で別 pod �
 - 共有の副作用: 64 MiB（既定サイズ）は pod の合計。1 コンテナが埋めると兄弟も書けない（containerd と同じ。pod 単位の cgroup は未対応）
 - 特権ランチャー経由の構成（supervisor が ambient capability つき）では、supervisor が `--pod-shm` を `Unimplemented` で拒否するため、ipc `POD` の CRI コンテナの Start が通らない（オーナー決定 2026-11-19。縮退させずに受け入れる）。`--cri-log-path` も同じ拒否のため kubelet 由来は今も通らず、log_path を省く利用（crictl 等）は S3 で新たに落ちる（読みだけ。実機では未確認）
 - SysV IPC と POSIX mqueue は共有される。userns が pod 単位になり、共有者は同じ userns の root になる（capability は既定の 14 個、seccomp が `setns`・`unshare` を禁じ、pid namespace は別）。
-- 残り（後続 issue）: pid の共有は #4816・#4817 で実装済み。pid の `NamespaceMode::TARGET` は `UNIMPLEMENTED`（共有しない）のまま。uts の共有は #4608〜#4612 で起票済み。ipc・network・userns の `TARGET` は `UNIMPLEMENTED` のまま（kubelet が送らない・userns は proto 上 `POD` と `NODE` だけ・network と ipc は core が単独の join を受けない。設計は [pod-namespace-holder.md](pod-namespace-holder.md) の #2903 の節）。保持役の実装は #2870・#2871・#2874・#2876・#2877、`/dev/shm` の受け渡しは #4823（S3）で実装済み（[pod-namespace-holder.md](pod-namespace-holder.md) の S3 の節）。
+- 残り（後続 issue）: pid の共有は #4816・#4817 で実装済み。pid の `NamespaceMode::TARGET` は cri では `UNIMPLEMENTED`（共有しない）のまま。core・supervisor の受け口は #4819（T1）で実装済みで、cri の受け入れ（同じ pod・対象の pid が `CONTAINER`・対象の存在の検証）と plugin-cri の argv の書き出しは #4820（T2）。uts の共有は #4608〜#4612 で起票済み。ipc・network・userns の `TARGET` は `UNIMPLEMENTED` のまま（kubelet が送らない・userns は proto 上 `POD` と `NODE` だけ・network と ipc は core が単独の join を受けない。設計は [pod-namespace-holder.md](pod-namespace-holder.md) の #2903 の節）。保持役の実装は #2870・#2871・#2874・#2876・#2877、`/dev/shm` の受け渡しは #4823（S3）で実装済み（[pod-namespace-holder.md](pod-namespace-holder.md) の S3 の節）。
 
 ## pod netns の作成・結線（CRI-2・NET-1・PLUG-1。#2675）
 

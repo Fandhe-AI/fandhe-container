@@ -82,6 +82,12 @@ CLI の `exec` コマンドが `run_command_with_pidfd` を呼ぶために必要
 
 **却下案**: `PR_SET_PDEATHSIG` を `SIGTERM` に替えて内側の CLI が捕捉し子孫を止める案は、内側の CLI 自身が SIGKILL されると救えず、codex の要求（CLI 消滅時の回収）を満たさないため採らない。CLI が systemd のスコープを使って子孫ごと止める案は、子孫が既にコンテナ側の cgroup へ移っているため回収できない。supervisor が定期的に `exec-*` を走査して持ち主の無い cgroup を止める案は、持ち主の判定（pid の再利用）が曖昧で、走査間隔の分だけ `--timeout` を超えるため採らない。
 
+### 3.6 利用者: pid namespace の TARGET の解決（#4819）
+
+- 利用者は supervisor の `resolve_pid_target`（`crates/supervisor/src/start_entry.rs`）。新コンテナの supervisor が、対象コンテナの supervisor へ kind 6 を送って launch pidfd を受け取り、対象の pid ns の素性を固定する（CRI-2・CORE-3・SEC-1）
+- 予算は 2 秒（`PID_TARGET_OBTAIN_BUDGET`）。受け取った後は接続をすぐ閉じる。3.5 の作成通知（exec 子 cgroup の通知）は行わない
+- 対象の supervisor がいない・pidfd を得られないときは `Unavailable` で拒否する（記録から pid を開く縮退経路は作らない。SEC-1）。固定エラーの語彙は [pod-namespace-holder.md](pod-namespace-holder.md) の「実装（T1・#4819）」
+
 ## 4. 信頼境界の評価
 
 - 渡す相手は、コンテナごとの 0700 のディレクトリの 0600 のソケットに、`SO_PEERCRED` の uid が supervisor の実効 uid と一致する接続だけ（サーバ側の既存の uid ゲートの後。クライアントも listen 側の uid を照合する）。

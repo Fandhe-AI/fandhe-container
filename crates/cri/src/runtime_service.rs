@@ -417,6 +417,9 @@ pub fn version_response() -> v1::VersionResponse {
 /// ロック下で呼ぶ。対象が Running かは見ない（Start で core が `the pid namespace target is not running` と拒否する。
 /// containerd は Create で Running を要求する差）。対象の init が終了すると pid ns ごと止まる（カーネルが ns 内を
 /// SIGKILL する。k8s と同じ）。対象の再起動には追従しない。kubelet は対象を名前で探すだけで Running を見ない。
+///
+/// 拒否は監査（SEC-4）しない。CRI ソケットは peer credential で同じ UID に限られ、拒否は資源を作る前の入力検証のため。
+/// 改ざんを示す違反は core の pin（`PidOwnerMismatch`）と `PinnedPidTarget::resolve`（exec_target）が監査に残す。
 fn check_pid_target(
     registry: &SandboxRegistry,
     pod_sandbox_id: &str,
@@ -3636,12 +3639,12 @@ impl CriRuntimeService {
             Some(_) => None,
         };
         // pid の TARGET は Create 後に対象が消えた場合も拒否する（Create と同じ検査。guard が Created へ戻す。#4820）。
-        let pid_target = match registry.records.get(&r.pod_sandbox_id) {
-            Some(sandbox) => {
-                check_pid_target(&registry, &r.pod_sandbox_id, &sandbox.config, &r.config)?
-            }
-            None => None,
-        };
+        let sandbox = registry
+            .records
+            .get(&r.pod_sandbox_id)
+            .ok_or_else(|| CriError::failed_precondition("sandbox record is unavailable"))?;
+        let pid_target =
+            check_pid_target(&registry, &r.pod_sandbox_id, &sandbox.config, &r.config)?;
         Ok((
             r.resolved_log_path.clone(),
             r.start_stdin_mode(),

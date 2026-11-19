@@ -686,6 +686,8 @@ fn claim_inner_with_swap(
         ));
     }
     // pid の TARGET も同様（launcher に固定済みの対象が無ければ拒否。逆は pod_shm と同じく通す。CRI-2・#4820）。
+    // `PinnedPidTarget` は ID を持たないため有無だけを見る。対象の同一性は supervisor の resolve が状態記録と
+    // launch pidfd で固定する（#4819）。
     if req.pid_target().is_some() && launcher.pid_target().is_none() {
         return Err(TraitError::new(
             ErrorCode::FailedPrecondition,

@@ -1024,6 +1024,8 @@ pub(crate) fn effective_ipc_is_pod(
 /// `pod` があり ipc が `POD` のときだけ、ipc と user を既存 namespace への join（`path` 付き）にする。pid は加えて
 /// `pod` が pid ns のパスを持ち pid が `POD` のときだけ join する（#4817。join した config の pid の path が supervisor の
 /// kill-all〔#4811〕の対象の判定になる）。
+/// pid の `TARGET` は保持役の user・ipc に join する構成でだけ path なしで受け（参加は supervisor の `--pid-target`。#4820）、
+/// pid・ipc の `NODE` と ipc の `TARGET` は拒否する。
 /// `pod_netns` は `POD` モードの network namespace へ join するパス（pod の netns を `NetworkPlugin` 経由で
 /// 作って結線したとき。#2675・CRI-2・NET-1）。`POD` 以外のモードでは使わない。
 fn namespaces<'a>(
@@ -1034,7 +1036,8 @@ fn namespaces<'a>(
     let default = NamespaceOption::default();
     let o = opts.unwrap_or(&default);
     let mut out = Vec::with_capacity(6);
-    // pid・ipc: NODE は必須 namespace を外す（SEC-1）ため拒否、TARGET は join 未対応。
+    // pid は NODE を拒否し、TARGET は保持役の user・ipc に join する構成でだけ path なしで受ける（参加は supervisor の
+    // `--pid-target`。#4820）。ipc の NODE・TARGET は拒否（必須 namespace を外す SEC-1）。
     let pid_mode = resolve_mode("namespace_options.pid", o.pid)?;
     if pid_mode == NamespaceMode::Node {
         return Err(unsupported("namespace_options.pid"));

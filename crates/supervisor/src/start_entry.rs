@@ -2450,7 +2450,8 @@ mod linux {
 
     /// start の検証の拒否の記録先を包み、記録できなかったことを固定語彙の構造化ログへ残す（SEC-4・REPAIR-4・#2481）。
     ///
-    /// 呼び出し元は core の `claim_start`（bind・sysfs・rootfs の固定の違反〔#2623〕の拒否。結果は `let _ =` で捨てられる）。運べない種類や helper の
+    /// 呼び出し元は core の `claim_start`（bind・sysfs・rootfs の固定の違反〔#2623〕の拒否）と、`build_launcher` の pid の TARGET の
+    /// 解決の拒否（exec_target 層。#4819）。どちらも結果は `let _ =` で捨てられる。運べない種類や helper の
     /// 失敗は内側が `Err` で返すので、ここで 1 行出してから同じ `Err` を返す（拒否の結果は変えない）。`log_event` は
     /// `stderr_sink` の常駐スレッドを作るが、拒否の記録は必ず start の失敗の直前で起き launch に進まないため、
     /// 「手順 8 の前の成功経路では `log_event` を呼ばない」規則に触れない。
@@ -2512,7 +2513,8 @@ mod linux {
         /// （`with_exit_audit_sink`。入口が単一スレッドの間に作った `ControlAuditRelay`。SEC-4・ESC-06・#2236）。
         /// 無ければ `audit`（`FileAuditSink`）を使う。
         exit_audit: Option<Arc<dyn AuditSink>>,
-        /// start の検証（`claim_start` の bind・sysfs・rootfs の固定の違反の拒否）が出す mount 層の拒否だけの記録先
+        /// start の作業スレッドが出す拒否の記録先（`claim_start` の bind・sysfs・rootfs の固定の違反の mount 層と、
+        /// `build_launcher` の pid の TARGET の解決の exec_target 層〔#4819〕）
         /// （`with_rejection_audit_sink`。`ObservedRejectionSink` で包んだ `ControlAuditRelay`。SEC-4・#2481）。
         /// 無ければ `audit`（`FileAuditSink`）を使う。
         rejection_audit: Option<Arc<dyn AuditSink>>,
@@ -4854,7 +4856,11 @@ mod linux {
                 .expect("build_launcher resolves the pid target");
             let before = &production[build..call];
             assert!(before.contains("self.rejection_audit.as_ref()"));
-            assert!(production[call..].contains("audit.as_ref(),"));
+            let end = production[call..]
+                .find(")?)")
+                .map(|p| p + call)
+                .expect("call end");
+            assert!(production[call..end].contains("audit.as_ref(),"));
         }
 
         /// SEC-4・#2027: 確実な層の記録先を作れなければ `FailedPrecondition` の固定文言で起動を拒否し、作れていれば

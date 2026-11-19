@@ -281,7 +281,7 @@ fn encode(record: &AuditRecord) -> Result<Vec<u8>, TraitError> {
         _ => {
             return Err(err(
                 ErrorCode::InvalidArgument,
-                "the audit relay only carries control channel, plugin peer, pasta verify, seccomp, exit signal and mount records",
+                "the audit relay only carries control channel, plugin peer, pasta verify, seccomp, exit signal, mount, pod namespace join, netns join and exec target records",
             ));
         }
     };

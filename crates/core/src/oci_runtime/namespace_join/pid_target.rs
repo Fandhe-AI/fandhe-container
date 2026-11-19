@@ -21,8 +21,13 @@
 //! | 2 | 状態が Running で pid があり、cgroup の配置と launch の分離の記録がある | `FailedPrecondition` |
 //! | 3 | 対象が pod の pid ns を共有していない（自分の pid ns の init であること） | `FailedPrecondition` |
 //! | 4 | 呼び出し側の注入口（制御チャネル）から launch pidfd を 1 回だけ受け取る | `Unavailable` |
-//! | 5 | `Pid1Target::open_with_launch_pidfd`（pidfd の `Pid:` と記録 pid の照合・未終了・直接入れ子の PID 1・cgroup の所属） | 下の写像 |
+//! | 5 | `Pid1Target::open_with_launch_pidfd`（pidfd の `Pid:` と記録 pid の照合・未終了・直接入れ子の PID 1・cgroup の所属） | 下の写像（違反は監査へ） |
 //! | 6 | `Pid1Target::open_pid_namespace`（pidfd で固定した後に開き、開いた後に未終了を再確認） | 下の写像 |
+//!
+//! 分離違反（`ExecError::violation` が `Some`。pidfd の不一致・cgroup 所属の不一致・直接入れ子の PID 1 でない等）は、固定文言へ
+//! 写す前に `resolve` の `audit` へ層 `exec_target` の記録として 1 件届ける（`record_exec_target_rejection`。exec の対象の拒否と
+//! 同じ形。コンテナ ID は対象。SEC-4）。違反を伴わない失敗（対象の不在・終了・supervisor 不在・obtain 失敗）は記録しない。
+//! 記録の失敗は返すエラーを覆さない（fail-closed。失敗の診断は `audit` の実装が担う）。
 //!
 //! 記録の pid から `pidfd_open` や `/proc` を開く縮退経路は持たない（pid の再利用。SEC-1）。pid ns の所有 user namespace が
 //! 参加する pod の user namespace と同じこと・親が呼び出し側の pid ns であることは、固定済みの fd に対して
@@ -46,7 +51,9 @@ use std::num::NonZeroU32;
 use std::os::fd::{AsFd as _, OwnedFd};
 
 #[cfg(target_os = "linux")]
-use crate::exec::{ExecError, Pid1Target, ViolationReason};
+use crate::audit_log::AuditSink;
+#[cfg(target_os = "linux")]
+use crate::exec::{ExecError, Pid1Target, ViolationReason, record_exec_target_rejection};
 #[cfg(target_os = "linux")]
 use crate::traits::{ContainerId, ContainerState, GetStateRequest, StateStore};
 
@@ -140,11 +147,12 @@ impl PinnedPidTarget {
     /// 対象の記録と launch pidfd から pid namespace を解決して固定する（モジュール doc の手順）。
     ///
     /// `obtain` は対象の記録の pid を受け、launch pidfd の複製を返す（本番は対象の supervisor の制御チャネル。ちょうど 1 回だけ
-    /// 呼ぶ。失敗はすべて `Unavailable` に写す）。
+    /// 呼ぶ。失敗はすべて `Unavailable` に写す）。`audit` は分離違反（モジュール doc）の記録先。
     #[cfg(target_os = "linux")]
     pub fn resolve(
         store: &dyn StateStore,
         target: &ContainerId,
+        audit: &dyn AuditSink,
         obtain: impl FnOnce(NonZeroU32) -> Result<OwnedFd, TraitError>,
     ) -> Result<Self, TraitError> {
         let fail = |code, message| TraitError::new(code, message);
@@ -172,10 +180,10 @@ impl PinnedPidTarget {
         }
         let pidfd = obtain(pid).map_err(|_| fail(ErrorCode::Unavailable, MSG_UNAVAILABLE))?;
         let pinned = Pid1Target::open_with_launch_pidfd(pidfd, pid, status.id(), placement, None)
-            .map_err(|e| map_exec_error(&e))?;
+            .map_err(|e| map_exec_error(&e, target, audit))?;
         let ns = pinned
             .open_pid_namespace()
-            .map_err(|e| map_exec_error(&e))?;
+            .map_err(|e| map_exec_error(&e, target, audit))?;
         let identity = super::identity_plain(ns.as_fd())
             .map_err(|_| fail(ErrorCode::FailedPrecondition, MSG_UNVERIFIED))?;
         Ok(Self {
@@ -199,9 +207,13 @@ impl PinnedPidTarget {
 }
 
 /// `Pid1Target` の失敗を固定の語彙へ写す（pid を含む文言をそのまま返さない。表に無いものは「検証できない」）。
+/// 違反つきの失敗は写す前に `audit` へ 1 件記録する（記録の成否で結果は変わらない。SEC-4）。
 #[cfg(target_os = "linux")]
-fn map_exec_error(e: &ExecError) -> TraitError {
+fn map_exec_error(e: &ExecError, target: &ContainerId, audit: &dyn AuditSink) -> TraitError {
     let reason = e.violation.as_ref().map(|v| v.reason);
+    if let Some(r) = reason {
+        let _ = record_exec_target_rejection((), r, Some(target), audit);
+    }
     let (code, message) = match (reason, e.code) {
         (Some(ViolationReason::ExecTargetPidfdMismatch), _) => {
             (ErrorCode::FailedPrecondition, MSG_MISMATCH)
@@ -313,15 +325,35 @@ mod tests {
         crate::sys::pidfd_open(child.id()).expect("pidfd_open")
     }
 
+    /// 届いた監査記録を数える sink。
+    #[derive(Default)]
+    struct Audit(std::sync::Mutex<Vec<crate::audit_log::AuditRecord>>);
+
+    impl AuditSink for Audit {
+        fn record(&self, r: &crate::audit_log::AuditRecord) -> Result<(), TraitError> {
+            self.0.lock().expect("lock").push(r.clone());
+            Ok(())
+        }
+    }
+
+    fn resolve_audited(
+        store: &Store,
+        calls: &Cell<u32>,
+        audit: &Audit,
+        pidfd: impl FnOnce() -> Result<OwnedFd, TraitError>,
+    ) -> Result<PinnedPidTarget, TraitError> {
+        PinnedPidTarget::resolve(store, &cid("t1"), audit, |_pid| {
+            calls.set(calls.get() + 1);
+            pidfd()
+        })
+    }
+
     fn resolve_with(
         store: &Store,
         calls: &Cell<u32>,
         pidfd: impl FnOnce() -> Result<OwnedFd, TraitError>,
     ) -> Result<PinnedPidTarget, TraitError> {
-        PinnedPidTarget::resolve(store, &cid("t1"), |_pid| {
-            calls.set(calls.get() + 1);
-            pidfd()
-        })
+        resolve_audited(store, calls, &Audit::default(), pidfd)
     }
 
     fn expect_err(r: Result<PinnedPidTarget, TraitError>, code: ErrorCode, message: &str) {
@@ -480,5 +512,36 @@ mod tests {
         );
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    /// SEC-4・CRI-2・#4819: 別プロセスの pidfd は監査に 1 件（層 `exec_target`・理由 `exec_target_pidfd_mismatch`・対象の ID）届き、
+    /// 返すエラーは固定文言のまま。違反の無い失敗（記録なし・終了済み・obtain 失敗）は何も届かない。
+    #[test]
+    fn sec4_4819_violation_is_audited_and_plain_failures_are_not() {
+        let mut other = sleeper();
+        let mut recorded = sleeper();
+        let store = Store(Some(running(recorded.id(), false, true)));
+        let audit = Audit::default();
+        let r = resolve_audited(&store, &Cell::new(0), &audit, || Ok(pidfd_of(&other)));
+        expect_err(
+            r,
+            ErrorCode::FailedPrecondition,
+            "the launch pidfd does not match the pid namespace target",
+        );
+        {
+            let recs = audit.0.lock().expect("lock");
+            assert_eq!(recs.len(), 1);
+            let json = format!("{:?}", recs[0]);
+            assert!(json.contains("exec_target_pidfd_mismatch"), "{json}");
+            assert!(json.contains("t1"), "{json}");
+        }
+        let quiet = Audit::default();
+        let _ = resolve_audited(&Store(None), &Cell::new(0), &quiet, || Err(unused()));
+        let _ = resolve_audited(&store, &Cell::new(0), &quiet, || Err(unused()));
+        assert!(quiet.0.lock().expect("lock").is_empty());
+        for c in [&mut other, &mut recorded] {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
     }
 }

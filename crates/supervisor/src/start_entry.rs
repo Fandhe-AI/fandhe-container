@@ -3021,12 +3021,16 @@ mod linux {
     ///
     /// 受け取った接続は pidfd の複製を取ってすぐ閉じる（exec 子 cgroup の通知はしない。対象の supervisor の ExecGuard の枠を
     /// 長く占有しない）。失敗の文言は core の固定の語彙（ID・パス・pid を含めない）。
+    ///
+    /// 分離違反（pidfd の不一致・cgroup 所属の不一致等）は `audit` へ層 `exec_target` で 1 件記録してから固定文言で拒否する
+    /// （違反を伴わない失敗は記録しない。SEC-4）。
     fn resolve_pid_target(
         store: &dyn StateStore,
         source: &dyn crate::control::ExecPidfdSource,
+        audit: &dyn AuditSink,
         target: &ContainerId,
     ) -> Result<fandhe_container_core::oci_runtime::PinnedPidTarget, TraitError> {
-        fandhe_container_core::oci_runtime::PinnedPidTarget::resolve(store, target, |pid| {
+        fandhe_container_core::oci_runtime::PinnedPidTarget::resolve(store, target, audit, |pid| {
             let handover = source.obtain(target, pid, Instant::now() + PID_TARGET_OBTAIN_BUDGET)?;
             handover.pidfd().try_clone_to_owned().map_err(|_| {
                 TraitError::new(ErrorCode::Internal, "failed to duplicate the launch pidfd")
@@ -3249,9 +3253,14 @@ mod linux {
                     deny_pid_target_with_elevated_capabilities(&read_self_status()?)?;
                     let store = crate::state::open_default_store(Some(self.root.clone()))?;
                     let source = crate::control::production_exec_pidfd_source(store.as_ref());
+                    // 記録の失敗は fork 前の単一スレッドでも固定語彙のログに残る（`ObservedRejectionSink`）。拒否は変わらない。
+                    let audit = ObservedRejectionSink {
+                        inner: Arc::clone(audit),
+                    };
                     launch_options.with_pid_target(resolve_pid_target(
                         store.as_ref(),
                         source.as_ref(),
+                        &audit,
                         target,
                     )?)
                 }
@@ -4413,8 +4422,15 @@ mod linux {
                 std::time::Duration::from_secs(10),
             );
             let source = crate::control::ControlExecHandover::new(scratch.path().to_path_buf());
-            let e =
-                resolve_pid_target(&RunningOnly(record), &source, &id).expect_err("no supervisor");
+            struct Null;
+            impl AuditSink for Null {
+                fn record(&self, _: &AuditRecord) -> Result<(), TraitError> {
+                    Ok(())
+                }
+            }
+            let audit = Null;
+            let e = resolve_pid_target(&RunningOnly(record), &source, &audit, &id)
+                .expect_err("no supervisor");
             assert_eq!(e.code(), ErrorCode::Unavailable);
             assert_eq!(
                 e.message(),

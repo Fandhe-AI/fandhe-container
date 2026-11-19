@@ -685,6 +685,13 @@ fn claim_inner_with_swap(
             "the requested pod shm does not match the launcher's pod shm",
         ));
     }
+    // pid の TARGET も同様（launcher に固定済みの対象が無ければ拒否。逆は pod_shm と同じく通す。CRI-2・#4820）。
+    if req.pid_target().is_some() && launcher.pid_target().is_none() {
+        return Err(TraitError::new(
+            ErrorCode::FailedPrecondition,
+            "the requested pid namespace target does not match the launcher's pid namespace target",
+        ));
+    }
     let reservation = Arc::new(StartReservation::acquire(req.id())?);
     let record = store.get(&GetStateRequest::new(req.id().clone()))?;
     if record.status().state() != ContainerState::Created {
@@ -2174,6 +2181,35 @@ mod tests {
                 {"type": "ipc"}
             ]}
         })
+    }
+
+    /// CRI-2・CORE-3・SEC-1(#4820): 要求に pid の TARGET があり launcher に無ければ、予約・launch の前に拒否する。
+    #[test]
+    fn cri2_4820_start_rejects_pid_target_without_launcher_target() {
+        let name = "ptgt-none";
+        let (_b, store) = created(name);
+        let launcher = RecordingLauncher::new(false);
+        let req = sid(name).with_pid_target(ContainerId::new("target1").expect("id"));
+        let err = match start(
+            &store,
+            &OpRecorder::new(),
+            &dynl(&launcher),
+            &req,
+            &StartTimeouts::default(),
+        ) {
+            Ok(_) => panic!("must fail"),
+            Err(e) => e,
+        };
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "the requested pid namespace target does not match the launcher's pid namespace target"
+        );
+        assert_eq!(launcher.calls(), 0);
+        let got = store
+            .get(&GetStateRequest::new(ContainerId::new(name).expect("id")))
+            .expect("stored");
+        assert_eq!(got.status().state(), ContainerState::Created);
     }
 
     /// CRI-2・CORE-3・SEC-1(#4823): 要求の pod shm が launcher の指定と食い違えば、予約・launch の前に

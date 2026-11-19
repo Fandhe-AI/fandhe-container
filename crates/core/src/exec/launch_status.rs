@@ -220,6 +220,9 @@ fn launch_violation(step: PrePivotStep, token: &str) -> Option<ViolationReason> 
                 .into_iter()
                 .find(|r| r.as_str() == token && r.stage() == step.stage())
         }
+        // pod の `/dev/shm` の素性不一致は段 `mount_tmpfs` だけが運ぶ（CRI-2・SEC-4・#4822）。
+        PrePivotStep::MountTmpfs => (token == ViolationReason::PodShmIdentityMismatch.as_str())
+            .then_some(ViolationReason::PodShmIdentityMismatch),
         _ => None,
     }
 }
@@ -1575,6 +1578,30 @@ mod tests {
         let e = ExecError::from_violation(ViolationReason::PathMissing, None);
         let f = PrePivotFailure::from_exec_error(PrePivotStep::PrepareRootfs, &e);
         assert_eq!(f.violation, Some(ViolationReason::PathMissing));
+    }
+
+    /// CRI-2・SEC-4・#4822: pod shm の素性不一致は段 mount_tmpfs でだけ子で残り、往復して親が層 mount の
+    /// 理由コードつきで 1 件記録する。他の段では落ちる。
+    #[test]
+    fn cri2_4822_pod_shm_identity_mismatch_reaches_parent_and_is_audited() {
+        let reason = ViolationReason::PodShmIdentityMismatch;
+        let e = ExecError::from_violation_at(reason, None, IsolationStage::MountTmpfs);
+        let f = PrePivotFailure::from_exec_error(PrePivotStep::MountTmpfs, &e);
+        assert_eq!(f.violation, Some(reason));
+        assert_eq!(f.code, ErrorCode::PermissionDenied);
+        let line = b"F mount_tmpfs PERMISSION_DENIED pod_shm_identity_mismatch\n";
+        assert_eq!(PrePivotStatus::Failed(f).encode().as_bytes(), line);
+        assert_eq!(PrePivotStatus::decode(line), Ok(PrePivotStatus::Failed(f)));
+        let other = PrePivotFailure::from_exec_error(PrePivotStep::MountBinds, &e);
+        assert_eq!(other.violation, None);
+        let sink = VecSink::new(false);
+        let r = resolve_pre_pivot_status(Ok(PrePivotStatus::Failed(f)), audit(&sink, None))
+            .unwrap_err();
+        assert_eq!(r.error.stage, IsolationStage::MountTmpfs);
+        let recs = sink.snapshot();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].layer(), AuditLayer::Mount);
+        assert!(format!("{:?}", recs[0]).contains("pod_shm_identity_mismatch"));
     }
 
     /// #2072: 段 mount_binds の user namespace 由来の 2 理由は子で残り、符号化・復号で往復する。

@@ -1464,6 +1464,12 @@ impl ProcessLauncher for SpecCapturingLauncher {
         self.inner.network_mode()
     }
 
+    /// 内側の launcher の pod の共有 `/dev/shm` の元を転送する(転送しないと既定の `None` になり、start が固定せず、本番 launcher が
+    /// 自身の起動オプションとの食い違いを `FailedPrecondition` で拒否する。黙って共有が外れて起動しない。CRI-2・SEC-1・#4822)。
+    fn pod_shm_source(&self) -> Option<&fandhe_container_core::oci_runtime::PodShmSource> {
+        self.inner.pod_shm_source()
+    }
+
     /// 内側の launcher の監査 sink を転送する(転送しないと既定の `None` になり、start の設定検証での拒否が
     /// 本番で監査に記録されず黙って落ちる。SEC-4・#1915)。
     fn rejection_audit_sink(&self) -> Option<&dyn fandhe_container_core::audit_log::AuditSink> {
@@ -2095,6 +2101,39 @@ mod tests {
         let want: &dyn fandhe_container_core::audit_log::AuditSink = &FAKE_SINK;
         assert!(std::ptr::addr_eq(got, want));
     }
+    /// pod の共有 `/dev/shm` の元を答える launcher(転送の照合用。CRI-2・#4822)。
+    struct PodShmFake(fandhe_container_core::oci_runtime::PodShmSource);
+
+    impl ProcessLauncher for PodShmFake {
+        fn launch(
+            &self,
+            _spec: &LaunchSpec,
+            _timeout: Duration,
+        ) -> Result<Box<dyn LaunchedProcess>, TraitError> {
+            Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+        }
+
+        fn pod_shm_source(&self) -> Option<&fandhe_container_core::oci_runtime::PodShmSource> {
+            Some(&self.0)
+        }
+    }
+
+    /// CRI-2・SEC-1・#4822: `SpecCapturingLauncher` は内側の pod の共有 `/dev/shm` の元を転送する(転送しないと既定の `None` に
+    /// なり、start が固定せず、本番 launcher が食い違いで起動を拒否する)。内側が持たなければ `None` のまま。
+    #[test]
+    fn cri2_4822_spec_capturing_launcher_forwards_pod_shm_source() {
+        let source = fandhe_container_core::oci_runtime::PodShmSource::new(
+            std::path::PathBuf::from("/proc/1234/ns/mnt"),
+            48,
+            2,
+        )
+        .expect("source");
+        let wrapped = SpecCapturingLauncher::new(Arc::new(PodShmFake(source.clone())));
+        assert_eq!(wrapped.pod_shm_source(), Some(&source));
+        let plain = SpecCapturingLauncher::new(Arc::new(SelfBoundedFake));
+        assert_eq!(plain.pod_shm_source(), None);
+    }
+
     use fandhe_container_core::traits::ContainerState;
 
     fn sig(n: u8) -> ExitClass {

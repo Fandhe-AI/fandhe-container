@@ -20,6 +20,7 @@
 //! | `netns_join` | `JoinPinned` と対。init user namespace 所有の pin 済み netns の置き場・パス・(dev, ino)。start が 1 回だけ開いて fd に固定し、user namespace の作成前に参加する(rootful のユーザー定義ネットワーク。D12・NET-1・SEC-1・CORE-3・#3069) |
 //! | `etc_files` | pivot 前段の `mount_etc_files`(管理ルートに生成済みの `/etc/hosts`・`/etc/resolv.conf` を bind。空なら載せない。NET-12・#1872) |
 //! | `stdin` | `Pipe` のときだけ launcher の spawn が stdin 用の pipe を作り、読み取り側を init の fd 0、書き込み側を `LaunchedProcess::take_stdin` で返す。既定 `Null` は従来どおり `/dev/null`(attach の stdin 用。SUP-7・CRI-6・SEC-1・#4069) |
+//! | `pod_shm` | pod で共有する `/dev/shm` の元(保持役の mount namespace のパスと tmpfs の素性)。start が fork 前に fd へ固定して検証し(`PinnedPodShm`)、init が pivot 前に複製して載せる。既定の `/dev/shm` の tmpfs の代わりになる(CRI-2・CORE-3・SEC-1・SEC-5・#4822。本番の指定元は S3・#4823 で未実装) |
 //! | `root_readonly` | `create --read-only`。config の `root.readonly` と OR(狭める方向のみ)。mount の RDONLY・Landlock の root 規則・分離の記録へ同じ実効値を渡す(CLI-1・SUP-12・CORE-5・SEC-1・#2828) |
 //!
 //! # 契約
@@ -46,7 +47,7 @@ use crate::dev_mounts::ImplicitDevMounts;
 use crate::etc_files::{EtcFileSelection, check_etc_overlaps};
 use crate::injected_files::{InjectedFileSet, overlaps};
 use crate::oci_runtime::config::{CONFIG_MAX_ENV, CONFIG_MAX_STRING_BYTES};
-use crate::oci_runtime::namespace_join::NetnsJoinTarget;
+use crate::oci_runtime::namespace_join::{NetnsJoinTarget, PodShmSource};
 use crate::oci_runtime::network_mode::LaunchNetworkMode;
 use crate::rlimits::Rlimits;
 use crate::tmpfs::{DEV_SHM_PATH, TmpfsMountSet};
@@ -104,6 +105,9 @@ pub struct LaunchOptions {
     etc_files: EtcFileSelection,
     /// init の stdin の扱い(既定 `Null`。SUP-7・CRI-6・#4069)。
     stdin: LaunchStdinMode,
+    /// pod で共有する `/dev/shm` の元(あれば既定の `/dev/shm` の tmpfs の代わりに複製して載せる。既定 `None`。CRI-2・#4822)。
+    /// `with_pod_shm` が既定の `/dev/shm` との整合を検証済み。fd は持たない(開いて固定するのは start)。
+    pod_shm: Option<PodShmSource>,
 }
 
 /// `env` の値(秘密を含みうる)を出さず、件数だけを出す(SEC-1)。
@@ -122,6 +126,7 @@ impl std::fmt::Debug for LaunchOptions {
             .field("netns_join", &self.netns_join)
             .field("etc_files", &self.etc_files)
             .field("stdin", &self.stdin)
+            .field("pod_shm", &self.pod_shm)
             .finish()
     }
 }
@@ -179,7 +184,24 @@ impl LaunchOptions {
             netns_join: None,
             etc_files: EtcFileSelection::default(),
             stdin: LaunchStdinMode::Null,
+            pod_shm: None,
         })
+    }
+
+    /// pod で共有する `/dev/shm` の元を持たせる(CRI-2・CORE-3・SEC-1・SEC-5・#4822)。
+    ///
+    /// 既定の `/dev/shm` の tmpfs の代わりになるため、`Private` の IPC で `/dev/shm` が既定の定義のままであることを要し
+    /// (`--ipc=host`・`--shm-size`・`--tmpfs /dev/shm`・`/dev/shm` 配下の tmpfs は `InvalidArgument`。注入ディレクトリの重なりは `new` が拒否済み。黙って共有の定義を
+    /// 差し替えない)、launcher は launch のたびに同じ検査をやり直す。パスの検証と fd への固定は start が行う。
+    pub fn with_pod_shm(mut self, source: PodShmSource) -> Result<Self, TraitError> {
+        if self.ipc != LaunchIpcMode::Private {
+            return Err(invalid(
+                "a pod shared /dev/shm cannot be combined with --ipc=host",
+            ));
+        }
+        self.tmpfs.without_default_dev_shm()?;
+        self.pod_shm = Some(source);
+        Ok(self)
     }
 
     /// init の stdin の扱いを持たせる(SUP-7・CRI-6・SEC-1・#4069)。`Pipe` は launch のたび(restart の再 launch を
@@ -317,6 +339,11 @@ impl LaunchOptions {
         self.stdin
     }
 
+    /// pod で共有する `/dev/shm` の元(無ければ `None`。#4822)。
+    pub fn pod_shm(&self) -> Option<&PodShmSource> {
+        self.pod_shm.as_ref()
+    }
+
     /// network namespace の扱い。
     pub fn network(&self) -> LaunchNetworkMode {
         self.network
@@ -411,6 +438,72 @@ mod tests {
         let opts = opts.with_network(LaunchNetworkMode::Host);
         assert_eq!(opts.network(), LaunchNetworkMode::Host);
         assert_eq!(opts.netns_join(), None);
+    }
+
+    fn pod_shm_source() -> PodShmSource {
+        PodShmSource::new("/proc/1234/ns/mnt".into(), 48, 2).expect("source")
+    }
+
+    /// CRI-2・CORE-3(#4822): pod の共有 `/dev/shm` の既定は `None`、`with_pod_shm` で往復し、`Debug` に出る。
+    /// 暗黙の `/dev/shm` の規則（Landlock）は元の tmpfs 集合から導くため `All` のまま。
+    #[test]
+    fn cri2_4822_pod_shm_defaults_to_none_and_round_trips() {
+        let opts = LaunchOptions::try_default().expect("default");
+        assert_eq!(opts.pod_shm(), None);
+        let opts = opts.with_pod_shm(pod_shm_source()).expect("pod shm");
+        assert_eq!(opts.pod_shm(), Some(&pod_shm_source()));
+        assert_eq!(
+            opts.implicit_dev_mounts(),
+            crate::dev_mounts::ImplicitDevMounts::All
+        );
+        assert!(format!("{opts:?}").contains("pod_shm: Some("));
+    }
+
+    /// CRI-2・SEC-1(#4822): pod の共有 `/dev/shm` は既定の定義のまま、`Private` の IPC でだけ受ける。`--ipc=host`・
+    /// `--shm-size`・`--tmpfs /dev/shm` 相当・配下の tmpfs は、固定文言の `InvalidArgument`。
+    #[test]
+    fn cri2_4822_pod_shm_rejects_conflicting_options() {
+        let host = LaunchOptions::new(
+            TmpfsMountSet::new(),
+            InjectedFileSet::new(),
+            LaunchIpcMode::Host,
+        )
+        .expect("host");
+        let sized = {
+            let mut t = TmpfsMountSet::new();
+            t.push(
+                TmpfsMountSpec::dev_shm(TmpfsSize::from_bytes(1 << 20).expect("size"))
+                    .expect("shm"),
+            )
+            .expect("push");
+            LaunchOptions::new(t, InjectedFileSet::new(), LaunchIpcMode::Private).expect("sized")
+        };
+        let nested = {
+            let mut t = TmpfsMountSet::new();
+            t.ensure_default_dev_shm().expect("default");
+            t.push(TmpfsMountSpec::new("/dev/shm/sub", None).expect("sub"))
+                .expect("push");
+            LaunchOptions::new(t, InjectedFileSet::new(), LaunchIpcMode::Private).expect("nested")
+        };
+        let cases = [
+            (
+                host,
+                "a pod shared /dev/shm cannot be combined with --ipc=host",
+            ),
+            (
+                sized,
+                "a pod shared /dev/shm cannot be combined with --shm-size or --tmpfs /dev/shm",
+            ),
+            (
+                nested,
+                "a tmpfs under /dev/shm cannot be combined with a pod shared /dev/shm",
+            ),
+        ];
+        for (opts, message) in cases {
+            let e = opts.with_pod_shm(pod_shm_source()).expect_err(message);
+            assert_eq!(e.code(), ErrorCode::InvalidArgument);
+            assert_eq!(e.message(), message);
+        }
     }
 
     /// SUP-7・CRI-6(#4069): stdin の既定は `Null`、`with_stdin` で往復し、`Debug` に出る。

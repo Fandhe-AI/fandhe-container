@@ -220,6 +220,8 @@ struct FakeLauncher {
     slaves: Mutex<Vec<PtySlave>>,
     /// 持たせた stdin の読み取り側（#4074）。
     stdin_readers: Mutex<Vec<std::io::PipeReader>>,
+    /// `pod_shm_source` の答え（pod の共有 `/dev/shm` の元。#4822）。
+    pod_shm: Option<fandhe_container_core::oci_runtime::PodShmSource>,
 }
 
 impl FakeLauncher {
@@ -245,6 +247,7 @@ impl FakeLauncher {
             give_pty_launches: 0,
             slaves: Mutex::new(Vec::new()),
             stdin_readers: Mutex::new(Vec::new()),
+            pod_shm: None,
         }
     }
 
@@ -268,6 +271,10 @@ impl ProcessLauncher for FakeLauncher {
 
     fn supports_terminal(&self) -> bool {
         self.terminal_support
+    }
+
+    fn pod_shm_source(&self) -> Option<&fandhe_container_core::oci_runtime::PodShmSource> {
+        self.pod_shm.as_ref()
     }
 
     fn launch(
@@ -2076,6 +2083,43 @@ fn drain(mut r: std::io::PipeReader) -> Vec<u8> {
     let mut v = Vec::new();
     r.read_to_end(&mut v).unwrap();
     v
+}
+
+/// CRI-2・CORE-3・SEC-1・#4822: 入口が包む `SpecCapturingLauncher` は内側の launcher の pod の共有 `/dev/shm` の元を転送する。
+/// 転送されれば core の `start` が固定を試み、config に pod の user・ipc の join が無いので fork の前に `Unimplemented`
+/// （固定文言）で拒否して launch に至らない。転送が外れると start が固定を飛ばして launch に進み、このテストが落ちる
+/// （本番 launcher は食い違いを拒否するが、黙って共有が外れる縮退の入口を試験で塞ぐ）。
+#[test]
+fn cri2_4822_pod_shm_source_is_forwarded_through_the_capturing_wrapper() {
+    let env = Env::new("pod-shm-forward");
+    env.create(&env.id);
+    let calls = new_calls();
+    let mut launcher = FakeLauncher::new(&calls);
+    launcher.pod_shm = Some(
+        fandhe_container_core::oci_runtime::PodShmSource::new(
+            PathBuf::from("/proc/1234/ns/mnt"),
+            48,
+            2,
+        )
+        .expect("source"),
+    );
+    let (d, l) = deps(&calls, launcher);
+    let mut out = Vec::new();
+    let code = start_with(&env, d, &env.id, &short_timeouts(), &mut out)
+        .err()
+        .expect("must be refused");
+    assert_eq!(code, exit_code_for(ErrorCode::Unimplemented));
+    match report_of(&out) {
+        StartReport::Failed { code, message, .. } => {
+            assert_eq!(code, ErrorCode::Unimplemented);
+            assert_eq!(
+                message.as_str(),
+                "a pod shm requires a pod user and ipc namespace join"
+            );
+        }
+        other => panic!("unexpected report: {other:?}"),
+    }
+    assert_eq!(l.launches(), 0, "the pod shm must be refused before launch");
 }
 
 /// SUP-7・SUP-3・CRI-6・#4074: `--stdin` を受けた起動は init の stdin の書き込み端を取り出せ（1 回だけ）、

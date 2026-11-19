@@ -1338,6 +1338,12 @@ impl ProcessLauncher for PastaAttachingLauncher {
         self.inner.network_mode()
     }
 
+    /// pod の共有 `/dev/shm` の元を内側へ転送する（転送しないと既定の `None` へ縮退し、start が固定せず、本番 launcher が
+    /// 食い違いを `FailedPrecondition` で拒否して起動しない。CRI-2・SEC-1・#4822）。
+    fn pod_shm_source(&self) -> Option<&fandhe_container_core::oci_runtime::PodShmSource> {
+        self.inner.pod_shm_source()
+    }
+
     /// 端末つき起動の opt-in を内側へ転送する（転送しないと `false` へ縮退し、端末つきの起動が拒否される。
     /// CRI-6・SEC-1・#4070）。supervisor 自身の opt-in と master の保持は #4074。
     fn supports_terminal(&self) -> bool {

@@ -101,6 +101,9 @@ pub enum ViolationKind {
     /// モードの期待と食い違う、または受け渡しの形式が壊れている（NET-6・SEC-1・SEC-4・#3206。
     /// `docs/design/network-wiring.md` D8）。
     NetnsIdentity,
+    /// pod の共有 `/dev/shm` の複製・載せ込みで、保持役の mount namespace の `/dev/shm` が launch の固定時の素性（READY の
+    /// `(dev, ino)`）・tmpfs・`nosuid,nodev,noexec` と食い違った（別物を pod の共有として載せない。CRI-2・CORE-3・SEC-1・SEC-4・#4822）。
+    PodShmIdentity,
 }
 
 impl ViolationKind {
@@ -117,6 +120,7 @@ impl ViolationKind {
             Self::ExecTarget => "exec_target",
             Self::ProtectedPathApply => "protected_path_apply",
             Self::NetnsIdentity => "netns_identity",
+            Self::PodShmIdentity => "pod_shm_identity",
         }
     }
 }
@@ -312,6 +316,9 @@ pub enum ViolationReason {
     /// 子の netns の受け渡しが形式違反(fd の本数・切り詰め・送信元 pid・close-on-exec・nsfs でない・netns でない・
     /// 本文。NET-6・SEC-1・SEC-4・#3206)。
     NetnsHandoffInvalid,
+    /// pod の `/dev/shm` の素性・tmpfs 種別・属性が固定時と食い違う（段 `mount_tmpfs` の pod shm の複製と載せた後の再照合。
+    /// 末尾に足す。CRI-2・CORE-3・SEC-1・SEC-4・#4822）。
+    PodShmIdentityMismatch,
 }
 
 impl ViolationReason {
@@ -458,7 +465,7 @@ impl ViolationReason {
     ///
     /// 手書きの理由リストを別に持たず、種別（[`Self::kind`]）で絞って使う（[`Self::from_launch_token`]）。
     /// 足し忘れは単体テスト（`ALL` の件数が `as_str` の分岐数と一致すること）が検出する。
-    pub(super) const ALL: [ViolationReason; 70] = [
+    pub(super) const ALL: [ViolationReason; 71] = [
         Self::NoNamespaces,
         Self::HostnameWithoutUts,
         Self::PidWithoutMount,
@@ -529,6 +536,7 @@ impl ViolationReason {
         Self::SysfsApplyFailed,
         Self::NetnsIdentityMismatch,
         Self::NetnsHandoffInvalid,
+        Self::PodShmIdentityMismatch,
     ];
 
     /// pivot 前段の子が状態 pipe で運んだ理由コード `token` から理由を引き直す（許可リスト照合。SEC-4・#1815）。
@@ -565,6 +573,7 @@ impl ViolationReason {
         }
         if Self::MOUNT_BINDS_USER_NAMESPACE_REASONS.contains(&self)
             || self.kind() == ViolationKind::NetnsIdentity
+            || self.kind() == ViolationKind::PodShmIdentity
         {
             return Some(AuditEvent::Mount {
                 path: None,
@@ -628,7 +637,8 @@ impl ViolationReason {
             | ViolationKind::EvidenceMismatch
             | ViolationKind::Entrypoint
             | ViolationKind::ExecTarget
-            | ViolationKind::NetnsIdentity => None,
+            | ViolationKind::NetnsIdentity
+            | ViolationKind::PodShmIdentity => None,
         }
     }
 
@@ -730,6 +740,7 @@ impl ViolationReason {
             Self::SysfsApplyFailed => "sysfs_apply_failed",
             Self::NetnsIdentityMismatch => "netns_identity_mismatch",
             Self::NetnsHandoffInvalid => "netns_handoff_invalid",
+            Self::PodShmIdentityMismatch => "pod_shm_identity_mismatch",
         }
     }
 
@@ -806,6 +817,7 @@ impl ViolationReason {
             | Self::MaskedPathApplyFailed
             | Self::SysfsApplyFailed => ViolationKind::ProtectedPathApply,
             Self::NetnsIdentityMismatch | Self::NetnsHandoffInvalid => ViolationKind::NetnsIdentity,
+            Self::PodShmIdentityMismatch => ViolationKind::PodShmIdentity,
         }
     }
 
@@ -842,6 +854,7 @@ impl ViolationReason {
             | Self::MaskedPathApplyFailed
             | Self::SysfsApplyFailed => "SEC-2",
             Self::NetnsIdentityMismatch | Self::NetnsHandoffInvalid => "NET-6",
+            Self::PodShmIdentityMismatch => "CRI-2",
             Self::ExecTargetNotNestedPid1
             | Self::ExecTargetSharesPidNamespace
             | Self::ExecTargetSharesMountNamespace
@@ -922,6 +935,7 @@ impl ViolationReason {
             | Self::SysfsApplyFailed
             | Self::NetnsIdentityMismatch
             | Self::NetnsHandoffInvalid => ErrorCode::FailedPrecondition,
+            Self::PodShmIdentityMismatch => ErrorCode::PermissionDenied,
             Self::EntrypointIsRuntimeBinary
             | Self::StdioNullNotNullDevice
             | Self::EntrypointInterpreterIsRuntimeBinary
@@ -941,6 +955,7 @@ impl ViolationReason {
             ViolationKind::Entrypoint => IsolationStage::Exec,
             ViolationKind::ExecTarget => IsolationStage::SetNs,
             ViolationKind::NetnsIdentity => IsolationStage::NetnsVerify,
+            ViolationKind::PodShmIdentity => IsolationStage::MountTmpfs,
             ViolationKind::ProtectedPathApply => match self {
                 Self::MaskedPathApplyFailed => IsolationStage::MountMaskedPaths,
                 Self::SysfsApplyFailed => IsolationStage::MountSysfs,
@@ -1123,6 +1138,9 @@ impl ViolationReason {
             }
             Self::NetnsHandoffInvalid => {
                 "the network namespace handoff from the container init was malformed"
+            }
+            Self::PodShmIdentityMismatch => {
+                "the pod /dev/shm does not match the tmpfs recorded when the pod was prepared"
             }
         }
     }
@@ -1370,6 +1388,27 @@ mod tests {
         }
     }
 
+    /// CRI-2・SEC-4・#4822: pod shm の素性不一致は固定値で、`from_launch_token` は通さず（段 `mount_tmpfs` の許可リストだけ）、
+    /// `Mount` 監査イベントに写る。
+    #[test]
+    fn cri2_4822_pod_shm_identity_mismatch_has_fixed_values() {
+        let r = ViolationReason::PodShmIdentityMismatch;
+        assert_eq!(r.as_str(), "pod_shm_identity_mismatch");
+        assert_eq!(r.kind().as_str(), "pod_shm_identity");
+        assert_eq!(r.behavior_id(), "CRI-2");
+        assert_eq!(r.error_code(), ErrorCode::PermissionDenied);
+        assert_eq!(r.stage(), IsolationStage::MountTmpfs);
+        assert_eq!(ViolationReason::from_launch_token(r.as_str()), None);
+        assert_eq!(
+            r.launch_mount_audit_event(),
+            Some(AuditEvent::Mount {
+                path: None,
+                reason: Some(AuditReason::new("pod_shm_identity_mismatch")),
+            })
+        );
+        assert_eq!(r.exec_worker_audit_event(), None);
+    }
+
     /// 引き直しは pivot 前段の 5 種別だけを受け付ける（SEC-4・#1815）。
     #[test]
     fn sec4_1815_launch_token_accepts_only_prepivot_kinds() {
@@ -1384,7 +1423,8 @@ mod tests {
                 | ViolationKind::Entrypoint
                 | ViolationKind::ExecTarget
                 | ViolationKind::ProtectedPathApply
-                | ViolationKind::NetnsIdentity => false,
+                | ViolationKind::NetnsIdentity
+                | ViolationKind::PodShmIdentity => false,
             };
             let expected = accepted.then_some(r);
             assert_eq!(ViolationReason::from_launch_token(r.as_str()), expected);

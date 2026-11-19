@@ -17,7 +17,12 @@
 //!   init の stdin を core の pipe（`LaunchStdinMode::Pipe`）で開き、supervisor が世代ごとに書き込み端を保持する
 //!   （完全版 Attach の stdin。SUP-7・SUP-3・CRI-6・#4074。plugin-cri 専用で CLI は渡さない）。**tty（`process.terminal: true`）の
 //!   コンテナには渡さない**: core が `Pipe` と tty の併用を launch の fork 前に `InvalidArgument` で拒否し（#4069）、tty の入力は
-//!   pty の master が担う。各オプションは 1 回まで・順不同で、`<container-id>` は末尾の位置引数 1 個。
+//!   pty の master が担う。`--pod-shm <dev>:<ino>:<絶対パス>` は任意で、pod で共有する `/dev/shm` の元（保持役の mount namespace の
+//!   パス `/proc/<pid>/ns/mnt` と、その保持役の `/dev/shm`〔tmpfs のルート〕の `st_dev`・`st_ino`。例 `48:2:/proc/1234/ns/mnt`）を
+//!   core の `LaunchOptions::with_pod_shm` へ渡す（CRI-2・CORE-3・SEC-1・SEC-5・#4822。plugin-cri 専用で CLI は渡さない。
+//!   `dev`・`ino` は正準な 10 進・非 0、パスは [`PodShmSource::new`] が字句検査する。**特権ランチャー経由〔ambient capability あり〕では
+//!   `Unimplemented` で拒否する**。本番の指定元は S3〔#4823〕で未配線）。
+//!   各オプションは 1 回まで・順不同で、`<container-id>` は末尾の位置引数 1 個。
 //! - 契約の fd は 0〜2 のみ。supervisor は入口（`start_entry`）で fd [`FIRST_INHERITED_FD`] 以降を閉じる
 //!   （特権ランチャーと同じ処理。#2070・SEC-1）。呼び出し側が追加の fd を渡しても使われない。exec から入口までの
 //!   短い窓は残る（CLI は CLOEXEC の無い fd を自分では閉じない）。
@@ -66,7 +71,7 @@ use std::time::Duration;
 
 use fandhe_container_core::audit_log::RECORD_WAIT_LIMIT;
 use fandhe_container_core::oci_runtime::{
-    LAUNCHER_REPLY_GRACE, OciRuntimeError, StartTimeouts, exit_code_for,
+    LAUNCHER_REPLY_GRACE, OciRuntimeError, PodShmSource, StartTimeouts, exit_code_for,
 };
 use fandhe_container_core::traits::{ContainerId, ContainerLogPath, ErrorCode, TraitError};
 
@@ -90,8 +95,8 @@ pub const REPORT_MAGIC: &str = "FCSUP1";
 pub const MAX_REPORT_LEN: usize = 640;
 /// 報告に載せる `message` の最大バイト数。
 pub const MAX_REPORT_MESSAGE_LEN: usize = 512;
-/// argv の最大要素数（プログラム名を除く）。`start` + 5 オプション（各 2 要素）+ `<container-id>` で 12。
-pub const MAX_ARGS: usize = 12;
+/// argv の最大要素数（プログラム名を除く）。`start` + 6 オプション（各 2 要素）+ `<container-id>` で 14。
+pub const MAX_ARGS: usize = 14;
 /// argv の 1 要素の最大バイト数。
 pub const MAX_ARG_LEN: usize = 4096;
 /// cgroup の準備（mkdir・退避・制限の設定）に見込む時間。
@@ -301,8 +306,37 @@ pub struct StartArgs {
     /// init の stdin の扱い（`--stdin`。SUP-7・SUP-3・CRI-6・#4074）。未指定は従来どおり `/dev/null`。tty のコンテナには
     /// 指定しない（core が拒否する。モジュール doc）。
     pub stdin: Option<StdinOption>,
+    /// pod で共有する `/dev/shm` の元（`--pod-shm`。字句検査済み。CRI-2・CORE-3・SEC-1・SEC-5・#4822）。未指定は従来どおり
+    /// コンテナごとの `/dev/shm`。入口が `LaunchOptions::with_pod_shm` へ渡す（特権ランチャー経由では拒否する）。
+    pub pod_shm: Option<PodShmSource>,
     /// 起動するコンテナの ID。
     pub id: ContainerId,
+}
+
+/// `--pod-shm` の値 `<dev>:<ino>:<パス>` を解析する（`dev`・`ino` は正準な 10 進・非 0。パスは字句検査。
+/// 不正は `InvalidArgument`。文言に入力値を埋め込まない。CRI-2・SEC-1・#4822）。
+pub fn parse_pod_shm_arg(value: &str) -> Result<PodShmSource, TraitError> {
+    let bad = || invalid("--pod-shm must be <dev>:<ino>:/proc/<pid>/ns/mnt");
+    let mut parts = value.splitn(3, ':');
+    let (Some(dev), Some(ino), Some(path)) = (parts.next(), parts.next(), parts.next()) else {
+        return Err(bad());
+    };
+    // 正準な 10 進（先頭 0・`+`・空を許さない）だけを受ける。
+    let number = |s: &str| -> Result<u64, TraitError> {
+        let n: u64 = s.parse().map_err(|_| bad())?;
+        if n.to_string() == s {
+            Ok(n)
+        } else {
+            Err(bad())
+        }
+    };
+    PodShmSource::new(PathBuf::from(path), number(dev)?, number(ino)?)
+}
+
+/// [`parse_pod_shm_arg`] の逆（`--pod-shm` の値。CLI 側〔plugin-cri〕が argv へ載せる形。往復する）。
+pub fn pod_shm_arg(source: &PodShmSource) -> String {
+    let (dev, ino) = source.identity();
+    format!("{dev}:{ino}:{}", source.path().display())
 }
 
 impl StartArgs {
@@ -332,10 +366,12 @@ impl StartArgs {
         let mut audit_policy: Option<String> = None;
         let mut cri_log_path: Option<String> = None;
         let mut stdin: Option<String> = None;
+        let mut pod_shm: Option<String> = None;
         let mut id: Option<String> = None;
         while let Some(tok) = it.next() {
             match tok.as_str() {
-                "--root" | "--restart" | "--audit-policy" | "--cri-log-path" | "--stdin" => {
+                "--root" | "--restart" | "--audit-policy" | "--cri-log-path" | "--stdin"
+                | "--pod-shm" => {
                     let value = it
                         .next()
                         .ok_or_else(|| invalid("option value is missing"))?;
@@ -344,6 +380,7 @@ impl StartArgs {
                         "--restart" => &mut restart,
                         "--cri-log-path" => &mut cri_log_path,
                         "--stdin" => &mut stdin,
+                        "--pod-shm" => &mut pod_shm,
                         _ => &mut audit_policy,
                     };
                     if slot.replace(value).is_some() {
@@ -373,6 +410,7 @@ impl StartArgs {
         // 外部入力（argv）なので cri 側で検証済みでもここで再検証する（SEC-1）。
         let cri_log_path = cri_log_path.map(ContainerLogPath::new).transpose()?;
         let stdin = stdin.map(|v| v.parse::<StdinOption>()).transpose()?;
+        let pod_shm = pod_shm.as_deref().map(parse_pod_shm_arg).transpose()?;
         let id =
             ContainerId::new(id.ok_or_else(|| invalid("exactly one container id is required"))?)?;
         Ok(Self {
@@ -381,6 +419,7 @@ impl StartArgs {
             audit_policy,
             cri_log_path,
             stdin,
+            pod_shm,
             id,
         })
     }
@@ -763,6 +802,104 @@ mod tests {
         assert_eq!(all.stdin, Some(StdinOption::Once));
     }
 
+    /// CRI-2・CORE-3・SEC-1・#4822: `--pod-shm <dev>:<ino>:<パス>` の受理（具体値）と、全オプション同時の 14 要素の受理。
+    #[test]
+    fn cri2_4822_parse_pod_shm() {
+        let none = StartArgs::parse(os(&["start", "--root", ROOT, "c1"])).unwrap();
+        assert_eq!(none.pod_shm, None);
+        let one = StartArgs::parse(os(&[
+            "start",
+            "c1",
+            "--pod-shm",
+            "48:2:/proc/1234/ns/mnt",
+            "--root",
+            ROOT,
+        ]))
+        .unwrap();
+        let source = one.pod_shm.expect("pod shm");
+        assert_eq!(source.path(), std::path::Path::new("/proc/1234/ns/mnt"));
+        assert_eq!(source.identity(), (48, 2));
+        assert_eq!(source.pid(), 1234);
+        // 全オプション同時: `start` + 6 オプション（12 要素）+ id で 14 要素ちょうど（上限）。
+        let all = StartArgs::parse(os(&[
+            "start",
+            "--root",
+            ROOT,
+            "--restart",
+            "always",
+            "--audit-policy",
+            "strict",
+            "--cri-log-path",
+            "/l/c/0.log",
+            "--stdin",
+            "once",
+            "--pod-shm",
+            "48:2:/proc/1234/ns/mnt",
+            "c1",
+        ]))
+        .unwrap();
+        assert_eq!(all.pod_shm.as_ref().map(PodShmSource::pid), Some(1234));
+        assert_eq!(all.stdin, Some(StdinOption::Once));
+    }
+
+    /// CRI-2・SEC-1・#4822: `--pod-shm` の不正（形・数字の正準形・0・パスの字句・重複・値の欠落）は `InvalidArgument` で、
+    /// 文言に入力値を含めない。往復（`pod_shm_arg` → `parse_pod_shm_arg`）は一致する。
+    #[test]
+    fn cri2_4822_pod_shm_rejects_malformed() {
+        for bad in [
+            "",
+            "48",
+            "48:2",
+            "48:2:",
+            ":2:/proc/1/ns/mnt",
+            "48::/proc/1/ns/mnt",
+            "048:2:/proc/1/ns/mnt",
+            "48:02:/proc/1/ns/mnt",
+            "+48:2:/proc/1/ns/mnt",
+            "-1:2:/proc/1/ns/mnt",
+            "0:2:/proc/1/ns/mnt",
+            "48:0:/proc/1/ns/mnt",
+            "18446744073709551616:2:/proc/1/ns/mnt",
+            "48:2:/proc/self/ns/mnt",
+            "48:2:/proc/1/ns/user",
+            "48:2:proc/1/ns/mnt",
+            "48:2:/proc/0/ns/mnt",
+            "48:2:/proc/1/ns/mnt:x",
+        ] {
+            let e = parse_pod_shm_arg(bad).expect_err(bad);
+            assert_eq!(e.code(), ErrorCode::InvalidArgument, "input: {bad}");
+            assert!(
+                bad.is_empty() || !e.message().contains(bad),
+                "{}",
+                e.message()
+            );
+        }
+        for bad in [
+            vec!["start", "--root", ROOT, "--pod-shm", "c1"],
+            vec!["start", "--root", ROOT, "c1", "--pod-shm"],
+            vec![
+                "start",
+                "--root",
+                ROOT,
+                "--pod-shm",
+                "48:2:/proc/1/ns/mnt",
+                "--pod-shm",
+                "48:2:/proc/1/ns/mnt",
+                "c1",
+            ],
+        ] {
+            let e = StartArgs::parse(os(&bad)).expect_err("must be rejected");
+            assert_eq!(e.code(), ErrorCode::InvalidArgument, "input: {bad:?}");
+        }
+        let source = parse_pod_shm_arg("18446744073709551615:7:/proc/4294967295/ns/mnt").unwrap();
+        assert_eq!(source.identity(), (u64::MAX, 7));
+        assert_eq!(
+            pod_shm_arg(&source),
+            "18446744073709551615:7:/proc/4294967295/ns/mnt"
+        );
+        assert_eq!(parse_pod_shm_arg(&pod_shm_arg(&source)).unwrap(), source);
+    }
+
     /// SUP-7・CRI-6・#4074: `StdinOption` の文字列表現は往復し、未知の値は `InvalidArgument`。
     #[test]
     fn sup7_cri6_4074_stdin_option_roundtrip() {
@@ -779,7 +916,7 @@ mod tests {
     #[test]
     fn sup1_args_parse_rejects_invalid() {
         let long = "a".repeat(MAX_ARG_LEN + 1);
-        let thirteen: Vec<&str> = vec!["start"; 13];
+        let fifteen: Vec<&str> = vec!["start"; MAX_ARGS + 1];
         let cases: Vec<Vec<&str>> = vec![
             vec![],
             vec!["run", "--root", ROOT, "c1"],
@@ -802,7 +939,7 @@ mod tests {
             vec!["start", "--root", ROOT, "--restart", "sometimes", "c1"],
             vec!["start", "c1"],
             vec!["start", "--root", ROOT, "bad/id"],
-            thirteen,
+            fifteen,
             vec![
                 "start", "--root", ROOT, "--stdin", "open", "--stdin", "once", "c1",
             ],

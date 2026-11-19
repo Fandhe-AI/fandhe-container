@@ -1668,6 +1668,7 @@ mod tests {
             working_dir: None,
             root_readonly: true,
             joined_pid_ns: None,
+            pod_shm: None,
         };
         let out = with_status(setup, &file);
         assert!(out.sysctls.is_some());

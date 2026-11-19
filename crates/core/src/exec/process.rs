@@ -2775,6 +2775,9 @@ pub(crate) struct PrePivotSetup<'a> {
     pub(crate) devices: DevptsGidSource<'a>,
     /// `/dev` の後に載せる tmpfs（無ければ載せない）。
     pub(crate) tmpfs: Option<&'a TmpfsMountSet>,
+    /// pod で共有する `/dev/shm`（保持役の mount namespace の tmpfs の複製。あれば `create_default_devices` の後・`tmpfs` の前に
+    /// 載せる。無ければ載せない。この件の `/dev/shm` は `tmpfs` の集合へ入れない。CRI-2・CORE-3・SEC-1・SEC-5・#4822）。
+    pub(crate) pod_shm: Option<crate::exec::PodShmSetup<'a>>,
     /// tmpfs の後に注入するファイル（無ければ注入しない）。
     pub(crate) inject: Option<&'a InjectedFileSet>,
     /// 注入の後・bind mount の前に載せる、管理ルートの `/etc/hosts`・`/etc/resolv.conf`(無ければ載せない。NET-12・#1872)。
@@ -2883,6 +2886,14 @@ trait PrePivotOps {
         prepared: &Self::Prepared,
         devices: &Self::Devices,
         set: &TmpfsMountSet,
+    ) -> Result<(), ExecError>;
+    /// pod の共有 `/dev/shm` の複製と載せ込み（#4822）。`create_default_devices` の後・`mount_tmpfs` の前。
+    fn mount_pod_shm(
+        &self,
+        isolation: &Self::Isolation,
+        prepared: &Self::Prepared,
+        devices: &Self::Devices,
+        setup: crate::exec::PodShmSetup<'_>,
     ) -> Result<(), ExecError>;
     fn inject_files(
         &self,
@@ -3108,6 +3119,25 @@ impl PrePivotOps for RealPrePivotOps {
         Ok(())
     }
 
+    fn mount_pod_shm(
+        &self,
+        isolation: &MountIsolation,
+        prepared: &PreparedRootfs,
+        devices: &DeviceSet,
+        setup: crate::exec::PodShmSetup<'_>,
+    ) -> Result<(), ExecError> {
+        super::pod_shm::mount_pod_shm(isolation, prepared, &devices.report, setup)?;
+        // 既定の tmpfs の `/dev/shm` と同じ識別子（`Tmpfs`・`/dev/shm`）で記録する。Landlock の暗黙の `/dev/shm` の規則と
+        // exec の再適用（#3201）がこの組で引くため、`mounted.rs` の形は変えない。載せたのは保持役の tmpfs の複製。
+        self.record(
+            prepared,
+            MountedBy::Tmpfs,
+            crate::tmpfs::DEV_SHM_PATH,
+            false,
+            IsolationStage::MountTmpfs,
+        )
+    }
+
     fn inject_files(
         &self,
         isolation: &MountIsolation,
@@ -3287,6 +3317,24 @@ fn check_etc_overlaps_exec(
         .map_err(|e| ExecError::new(e.code(), IsolationStage::MountEtcFiles, e.message()))
 }
 
+/// pod の共有 `/dev/shm` を載せるとき、`/dev/shm` とその配下に tmpfs の指定が残っていないことを確かめる（CRI-2・SEC-1・#4822）。
+fn check_no_tmpfs_under_dev_shm(tmpfs: Option<&TmpfsMountSet>) -> Result<(), ExecError> {
+    let clash = tmpfs.is_some_and(|set| {
+        set.mounts().iter().any(|m| {
+            let d = m.destination.as_str();
+            d == "/dev/shm" || d.starts_with("/dev/shm/")
+        })
+    });
+    if clash {
+        return Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            IsolationStage::MountTmpfs,
+            "a tmpfs at or under /dev/shm cannot be combined with a pod shared /dev/shm",
+        ));
+    }
+    Ok(())
+}
+
 /// 端末つき起動の init の console の要求(`process.terminal: true`)。`owner` は `process.user` の uid(0/0 以外のときだけ)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ConsoleRequest {
@@ -3402,6 +3450,15 @@ fn run_pre_pivot_with_console<O: PrePivotOps>(
         let created = ops
             .create_default_devices(&isolation, &prepared, setup.devices)
             .map_err(StepError::at(S::CreateDefaultDevices))?;
+        // pod の共有 `/dev/shm` は `/dev` の tmpfs の上に載せるため `create_default_devices` の後。tmpfs の集合には
+        // この `/dev/shm` が入っていない（launcher が除く）ので、`mount_tmpfs` の前でも後でも重ならない（#4822）。
+        if let Some(shm) = setup.pod_shm {
+            // 多重防御: launcher が除いているはずの `/dev/shm`（配下を含む）の tmpfs が残っていれば、副作用の前に拒否する
+            // （pod の共有の定義を黙って差し替える・載せた共有の上に別のマウントを重ねるのを防ぐ。#4822）。
+            check_no_tmpfs_under_dev_shm(setup.tmpfs).map_err(StepError::at(S::MountTmpfs))?;
+            ops.mount_pod_shm(&isolation, &prepared, &created, shm)
+                .map_err(StepError::at(S::MountTmpfs))?;
+        }
         if let Some(set) = setup.tmpfs {
             ops.mount_tmpfs(&isolation, &prepared, &created, set)
                 .map_err(StepError::at(S::MountTmpfs))?;
@@ -3795,6 +3852,7 @@ where
                 working_dir: None,
                 root_readonly: false,
                 joined_pid_ns: None,
+                pod_shm: None,
             };
             let result = run_child_then(
                 rootfs,
@@ -3853,6 +3911,7 @@ where
                 config_paths: ConfigPaths::NONE,
                 status: None,
                 joined_pid_ns: None,
+                pod_shm: None,
             };
             let result = run_child_then(
                 rootfs,
@@ -4031,6 +4090,7 @@ pub fn spawn_container_with_stages_and_devices(
                 working_dir: None,
                 root_readonly: false,
                 joined_pid_ns: None,
+                pod_shm: None,
             }),
             StdioNulling::ALL,
             None,
@@ -7456,6 +7516,11 @@ mod tests {
                 IsolationStage::MountTmpfs,
                 "injected failure",
             ),
+            "mount_pod_shm" => ExecError::new(
+                ErrorCode::PermissionDenied,
+                IsolationStage::MountTmpfs,
+                "injected failure",
+            ),
             "mount_sysfs" => ExecError::new(
                 ErrorCode::FailedPrecondition,
                 IsolationStage::MountSysfs,
@@ -7559,6 +7624,15 @@ mod tests {
         }
         fn mount_tmpfs(&self, _: &(), _: &(), _: &(), _: &TmpfsMountSet) -> Result<(), ExecError> {
             self.step("mount_tmpfs")
+        }
+        fn mount_pod_shm(
+            &self,
+            _: &(),
+            _: &(),
+            _: &(),
+            _: crate::exec::PodShmSetup<'_>,
+        ) -> Result<(), ExecError> {
+            self.step("mount_pod_shm")
         }
         fn inject_files(&self, _: &(), _: &(), _: &InjectedFileSet) -> Result<(), ExecError> {
             self.step("inject_files")
@@ -7669,6 +7743,7 @@ mod tests {
                 working_dir: None,
                 root_readonly: false,
                 joined_pid_ns: None,
+                pod_shm: None,
             }),
         )
         .unwrap();
@@ -7692,6 +7767,117 @@ mod tests {
         );
     }
 
+    /// CRI-2・CORE-3・SEC-1(#4822): pod の共有 `/dev/shm` の段は `create_default_devices` の後・`mount_tmpfs` の前に 1 回だけ呼ばれ、
+    /// 指定なしでは呼ばれない。失敗は既存の段 `mount_tmpfs` で返り（新しい段を足さない）、後続の段は呼ばれない。
+    #[test]
+    fn cri2_4822_pod_shm_step_runs_between_devices_and_tmpfs() {
+        let tmpfs = TmpfsMountSet::new();
+        let ns = std::fs::File::open("/").unwrap();
+        let setup = |with_shm: bool| PrePivotSetup {
+            sysctls: None,
+            devices: DevptsGidSource::Rootful,
+            tmpfs: Some(&tmpfs),
+            pod_shm: with_shm.then(|| crate::exec::PodShmSetup::new(ns.as_fd(), (48, 2))),
+            inject: None,
+            etc_files: None,
+            binds: None,
+            sysfs: None,
+            pinned_rootfs: None,
+            config_paths: ConfigPaths::NONE,
+            status: None,
+            working_dir: None,
+            root_readonly: false,
+            joined_pid_ns: None,
+        };
+        let _ = take_calls();
+        run_pre_pivot(
+            &RecordingOps { fail_at: None },
+            Path::new("/rootfs"),
+            Some(setup(true)),
+        )
+        .unwrap();
+        assert_eq!(
+            take_calls(),
+            [
+                "establish",
+                "prepare_rootfs",
+                "create_default_devices",
+                "mount_pod_shm",
+                "mount_tmpfs",
+                "readonly_paths",
+                "masked_paths",
+                "pivot_root",
+            ]
+        );
+        run_pre_pivot(
+            &RecordingOps { fail_at: None },
+            Path::new("/rootfs"),
+            Some(setup(false)),
+        )
+        .unwrap();
+        assert!(!take_calls().iter().any(|c| c == "mount_pod_shm"));
+        let failed = run_pre_pivot(
+            &RecordingOps {
+                fail_at: Some("mount_pod_shm"),
+            },
+            Path::new("/rootfs"),
+            Some(setup(true)),
+        )
+        .map(|_| ())
+        .expect_err("injected");
+        assert_eq!(failed.step, PrePivotStep::MountTmpfs);
+        assert_eq!(failed.error.code, ErrorCode::PermissionDenied);
+        assert_eq!(
+            take_calls(),
+            [
+                "establish",
+                "prepare_rootfs",
+                "create_default_devices",
+                "mount_pod_shm",
+            ]
+        );
+    }
+
+    /// CRI-2・SEC-1(#4822): pod の共有 `/dev/shm` の指定があるのに tmpfs の集合に `/dev/shm`（配下を含む）が残っていれば、
+    /// 副作用（`mount_pod_shm`）の前に段 `mount_tmpfs` の `FailedPrecondition` で拒否する。
+    #[test]
+    fn cri2_4822_pod_shm_refuses_leftover_dev_shm_tmpfs() {
+        let ns = std::fs::File::open("/").unwrap();
+        for dest in ["/dev/shm", "/dev/shm/sub"] {
+            let mut tmpfs = TmpfsMountSet::new();
+            tmpfs
+                .push(crate::tmpfs::TmpfsMountSpec::new(dest, None).unwrap())
+                .unwrap();
+            let setup = PrePivotSetup {
+                sysctls: None,
+                devices: DevptsGidSource::Rootful,
+                tmpfs: Some(&tmpfs),
+                pod_shm: Some(crate::exec::PodShmSetup::new(ns.as_fd(), (48, 2))),
+                inject: None,
+                etc_files: None,
+                binds: None,
+                sysfs: None,
+                pinned_rootfs: None,
+                config_paths: ConfigPaths::NONE,
+                status: None,
+                working_dir: None,
+                root_readonly: false,
+                joined_pid_ns: None,
+            };
+            let _ = take_calls();
+            let failed = run_pre_pivot(
+                &RecordingOps { fail_at: None },
+                Path::new("/rootfs"),
+                Some(setup),
+            )
+            .map(|_| ())
+            .expect_err(dest);
+            assert_eq!(failed.step, PrePivotStep::MountTmpfs, "{dest}");
+            assert_eq!(failed.error.code, ErrorCode::FailedPrecondition, "{dest}");
+            assert!(!take_calls().iter().any(|c| c == "mount_pod_shm"), "{dest}");
+        }
+    }
+
     /// CRI-6・OCI-4・CORE-2・SEC-1(#4071): 端末つき起動の console の段は `working_dir` の後(ステージ列の前)に 1 回だけ呼ばれ、
     /// `process.user` の uid(補正の対象)を受け取る。terminal 無効では呼ばれない(`/dev/console` を作らない)。
     #[test]
@@ -7711,6 +7897,7 @@ mod tests {
             working_dir: Some(&wd),
             root_readonly: true,
             joined_pid_ns: None,
+            pod_shm: None,
         };
         let tail = ["pivot_root", "root_readonly", "working_dir"];
         // terminal あり: working_dir の直後に console(owner を受ける)。
@@ -7792,6 +7979,7 @@ mod tests {
                 working_dir: None,
                 root_readonly: false,
                 joined_pid_ns: None,
+                pod_shm: None,
             }),
         )
         .map(|_| ())
@@ -7843,6 +8031,7 @@ mod tests {
                     working_dir: None,
                     root_readonly: false,
                     joined_pid_ns: None,
+                    pod_shm: None,
                 }),
             )
             .unwrap();
@@ -7872,6 +8061,7 @@ mod tests {
                 working_dir: None,
                 root_readonly: false,
                 joined_pid_ns: None,
+                pod_shm: None,
             }),
         )
         .unwrap();
@@ -7915,6 +8105,7 @@ mod tests {
             working_dir: wd,
             root_readonly: false,
             joined_pid_ns: None,
+            pod_shm: None,
         };
         let app: &'static ContainerWorkingDir = Box::leak(Box::new(
             ContainerWorkingDir::parse(Path::new("/app")).unwrap(),
@@ -7977,6 +8168,7 @@ mod tests {
             working_dir: Some(app),
             root_readonly: ro,
             joined_pid_ns: None,
+            pod_shm: None,
         };
         let _ = take_calls();
         run_pre_pivot(
@@ -8056,6 +8248,7 @@ mod tests {
             working_dir: None,
             root_readonly: false,
             joined_pid_ns: None,
+            pod_shm: None,
         };
         let _ = take_calls();
         let err = run_pre_pivot(
@@ -8125,6 +8318,7 @@ mod tests {
                 working_dir: None,
                 root_readonly: false,
                 joined_pid_ns: None,
+                pod_shm: None,
             }),
         )
         .err()
@@ -8161,6 +8355,7 @@ mod tests {
                 working_dir: None,
                 root_readonly: false,
                 joined_pid_ns: None,
+                pod_shm: None,
             }),
         )
         .err()
@@ -8242,6 +8437,7 @@ mod tests {
                     working_dir: None,
                     root_readonly: false,
                     joined_pid_ns: None,
+                    pod_shm: None,
                 }),
             )
             .err()
@@ -8340,6 +8536,7 @@ mod tests {
                     working_dir: Some(&wd),
                     root_readonly: false,
                     joined_pid_ns: None,
+                    pod_shm: None,
                 }),
             )
             .err()

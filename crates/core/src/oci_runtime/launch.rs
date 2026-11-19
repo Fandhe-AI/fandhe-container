@@ -37,7 +37,9 @@ use std::time::Duration;
 use super::bind_mounts::BindMountSet;
 use super::cgroup_requirement::CgroupRequirement;
 use super::config::{NamespaceKind, OciConfig};
-use super::namespace_join::{NamespaceJoin, NetnsJoinTarget, PinnedNetnsJoin};
+use super::namespace_join::{
+    NamespaceJoin, NetnsJoinTarget, PinnedNetnsJoin, PinnedPodShm, PodShmSource,
+};
 use super::network_mode::{EffectiveNetwork, LaunchNetworkMode};
 use super::sysfs_mount::SysfsMountSpec;
 use super::working_dir::ContainerWorkingDir;
@@ -501,6 +503,10 @@ pub struct LaunchSpec {
     /// 起動オプションのパスを 1 回だけ開いて fd に固定し検証済み。無ければ `None`。本番 launcher が中間プロセスで
     /// user namespace の作成前に `setns` に使う(D12。NET-1・SEC-1・CORE-3・#3069)。
     pinned_netns: Option<PinnedNetnsJoin>,
+    /// pod で共有する `/dev/shm` の元(保持役の mount namespace)の固定。start が起動オプションのパスを 1 回だけ開いて
+    /// fd に固定し検証済み。無ければ `None`。本番 launcher が init の pivot 前段へ渡し、launcher 自身の起動オプションの
+    /// 有無と照合する(転送漏れによる黙った縮退を拒否する。CRI-2・CORE-3・SEC-1・SEC-5・#4822)。
+    pinned_pod_shm: Option<PinnedPodShm>,
     /// start が起動オプションと config を突き合わせた network の実効の扱い(NET-6・SEC-1・#3058)。
     network: EffectiveNetwork,
     /// 突き合わせに使ったモード(launcher が自身のモードと照合し、転送漏れによる縮退を拒否する)。
@@ -549,6 +555,7 @@ impl LaunchSpec {
             additional_gids: Vec::new(),
             namespace_join: None,
             pinned_netns: None,
+            pinned_pod_shm: None,
             network: EffectiveNetwork::HostShared,
             network_mode: LaunchNetworkMode::FromConfig,
             state_root: None,
@@ -626,6 +633,18 @@ impl LaunchSpec {
     pub(super) fn with_pinned_netns(mut self, pinned: Option<PinnedNetnsJoin>) -> Self {
         self.pinned_netns = pinned;
         self
+    }
+
+    /// 検証済みの pod の共有 `/dev/shm` の元を載せる（`start` と launcher の試験が呼ぶ。#4822）。
+    pub(super) fn with_pinned_pod_shm(mut self, pinned: Option<PinnedPodShm>) -> Self {
+        self.pinned_pod_shm = pinned;
+        self
+    }
+
+    /// pod で共有する `/dev/shm` の元（無ければ `None`。起動オプションの `PodShmSource` と対。CRI-2・#4822）。
+    /// restart の再 launch でも同じ fd を使う。
+    pub fn pinned_pod_shm(&self) -> Option<&PinnedPodShm> {
+        self.pinned_pod_shm.as_ref()
     }
 
     /// init user namespace 所有の pin 済み netns への参加先（無ければ `None`。`EffectiveNetwork::PinnedJoined` と対。
@@ -1425,6 +1444,15 @@ pub trait ProcessLauncher: Send + Sync {
     /// 既定は `None`。ラッパー実装は必ず内側へ転送すること(転送しないと `JoinPinned` の起動が start で拒否される。
     /// 拒否側へ倒れるので安全だが、参加が効かない)。
     fn netns_join_target(&self) -> Option<&NetnsJoinTarget> {
+        None
+    }
+
+    /// 起動オプションの pod の共有 `/dev/shm` の元(CRI-2・CORE-3・SEC-1・SEC-5・#4822)。start が fork より前に開いて fd に
+    /// 固定し、検証する。
+    ///
+    /// 既定は `None`。ラッパー実装は必ず内側へ転送すること(転送しないと start が固定せず、本番 launcher は自身の起動
+    /// オプションと spec の食い違いを `FailedPrecondition` で拒否する。拒否側へ倒れるので安全だが、起動できない)。
+    fn pod_shm_source(&self) -> Option<&PodShmSource> {
         None
     }
 

@@ -228,7 +228,7 @@ PoC: `crates/core/src/oci_runtime/namespace_join.rs` の実機前提試験 `cri2
 - ipc `NODE` のホスト `/dev/shm` は埋めない（オーナー決定 2026-11-19。cri が ipc `NODE` を `UNIMPLEMENTED` にしている）
 - 素性なしの保持役（`PodHolder::new`。照合が無効な試験用の構成・外部の provider）は共有しない
 - `CONTAINER`（kubelet は送らない）は共有しない（ipc を共有しない既存の差に従属。オーナー決定 2026-11-19）
-- kubelet の実機（emptyDir のホスト側 0750 への到達性・SELinux）は未確認のまま（#4895 ほか）
+- kubelet の実機（emptyDir のホスト側 0750 への到達性）は未確認のまま。SELinux 有効ノードは非対応（#4895）
 - 実機の確認は PR の `production_binary_exec_real`（段 M・termination-log。成功行は試験ソースから導出して照合）で取る。手元に Linux が無いため、本書の時点では未実行（Windows のスロットの実測も PR 本文で行う）
 
 ### オーナー確認事項（#4607）

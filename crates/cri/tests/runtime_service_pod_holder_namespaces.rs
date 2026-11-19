@@ -613,3 +613,81 @@ async fn cri2_4823_start_passes_no_pod_shm_outside_the_condition() {
     }
     assert_eq!(rt.starts.lock().unwrap().len(), 2);
 }
+
+/// CRI-2・SEC-1（#4895・案 a）: `selinux_relabel` つきの `/dev/termination-log` の mount は、CreateContainer が
+/// gRPC `Unimplemented`（固定の文言）で拒否し、実行層（create）を呼ばず記録も残さない。
+/// sandbox の `selinux_options` は RunPodSandbox では受け、CreateContainer の bundle 生成で同じ拒否になる。
+#[tokio::test]
+async fn cri2_sec1_4895_selinux_relabel_mount_rejected_without_runtime_call_or_record() {
+    let (holder, bundles) = (
+        PerSandboxHolder::new(),
+        Arc::new(RecordingBundles::default()),
+    );
+    let runtime = Arc::new(StubRuntime::default());
+    let svc = service_with(&holder, &bundles, false, runtime.clone());
+    let sb = run(&svc, "a").await;
+    let req = |relabel: bool| v1::CreateContainerRequest {
+        pod_sandbox_id: sb.clone(),
+        config: Some(ContainerConfig {
+            metadata: Some(ContainerMetadata {
+                name: "c".into(),
+                attempt: 0,
+            }),
+            image: Some(ImageSpec {
+                image: "busybox:1.36".into(),
+                ..Default::default()
+            }),
+            command: vec!["/bin/sleep".into(), "30".into()],
+            mounts: vec![v1::Mount {
+                container_path: "/dev/termination-log".into(),
+                host_path: "/var/lib/kubelet/pods/p/containers/c/1".into(),
+                selinux_relabel: relabel,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+        sandbox_config: None,
+    };
+    let st = RuntimeService::create_container(&svc, Request::new(req(true)))
+        .await
+        .expect_err("rejected");
+    assert_eq!(st.code(), Code::Unimplemented);
+    assert_eq!(st.message(), "mounts.selinux_relabel is not supported");
+    assert!(runtime.created.lock().unwrap().is_empty());
+    assert!(list_container_ids(&svc).await.is_empty());
+    // 対照: relabel なしなら同じ mount で通る。
+    RuntimeService::create_container(&svc, Request::new(req(false)))
+        .await
+        .expect("control");
+
+    // sandbox の selinux_options: RunPodSandbox は受け、CreateContainer で拒否する。RunPodSandbox で受けるのは残余の
+    // 現状の固定で要件ではない。拒否を RunPodSandbox へ早めてよく、そのときはこの段を RunPodSandbox の拒否の照合へ
+    // 置き換える（docs/design/cri-config-acceptance.md「SELinux の受け入れ方式」の残余）。
+    let mut cfg = sandbox_config("b");
+    cfg.linux = Some(v1::LinuxPodSandboxConfig {
+        security_context: Some(v1::LinuxSandboxSecurityContext {
+            selinux_options: Some(Default::default()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    let sb2 = RuntimeService::run_pod_sandbox(
+        &svc,
+        Request::new(v1::RunPodSandboxRequest {
+            config: Some(cfg),
+            runtime_handler: String::new(),
+        }),
+    )
+    .await
+    .expect("RunPodSandbox accepts selinux_options")
+    .into_inner()
+    .pod_sandbox_id;
+    let mut r = req(false);
+    r.pod_sandbox_id = sb2;
+    let st = RuntimeService::create_container(&svc, Request::new(r))
+        .await
+        .expect_err("rejected");
+    assert_eq!(st.code(), Code::Unimplemented);
+    assert_eq!(st.message(), "selinux_options is not supported");
+    assert_eq!(runtime.created.lock().unwrap().len(), 1);
+}

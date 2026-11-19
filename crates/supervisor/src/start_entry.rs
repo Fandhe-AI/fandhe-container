@@ -2531,6 +2531,9 @@ mod linux {
         /// argv の `--stdin`（`with_stdin_option`。SUP-7・CRI-6・#4074）。`build_launcher` が core の
         /// `LaunchStdinMode::Pipe` へ変換する（[`apply_stdin_option`]）。
         stdin: Option<crate::start_contract::StdinOption>,
+        /// argv の `--pod-shm`（`with_pod_shm`。CRI-2・CORE-3・SEC-1・SEC-5・#4822）。`build_launcher` が core の
+        /// `LaunchOptions::with_pod_shm` へ渡す（[`apply_pod_shm`]）。特権ランチャー経由（ambient capability あり）では拒否する。
+        pod_shm: Option<fandhe_container_core::oci_runtime::PodShmSource>,
         /// 起動オプション文書の読み込みの失敗(`with_container_options_error`)。手順 4 が返して cgroup にも launch にも触れずに
         /// 止める(壊れた文書を既定値で黙って読み替えない。fail-closed。SUP-12・SEC-1・#2713)。
         container_options_error: Option<TraitError>,
@@ -2680,6 +2683,7 @@ mod linux {
                 container_options: ContainerOptions::default(),
                 cri_log_path: None,
                 stdin: None,
+                pod_shm: None,
                 container_options_error: None,
                 options_generation: None,
                 pasta_target: None,
@@ -2741,6 +2745,21 @@ mod linux {
             option: Option<crate::start_contract::StdinOption>,
         ) -> Self {
             self.stdin = option;
+            self
+        }
+
+        /// argv の `--pod-shm` を設定する（CRI-2・CORE-3・SEC-1・SEC-5・#4822）。
+        ///
+        /// 指定があれば `build_launcher` が launcher の起動オプションへ `with_pod_shm` を足す（restart の再 launch も同じ launcher を
+        /// 使うので毎回同じ指定が効く）。特権ランチャー経由（effective / permitted の capability あり）では `Unimplemented` で拒否する
+        /// （`deny_pod_shm_with_elevated_capabilities`。`CAP_SYS_ADMIN` 等を持つ supervisor が argv の指す mount namespace へ
+        /// 入る経路を作らない）。本番の指定元（plugin-cri）は S3（#4823）で未配線。
+        #[must_use]
+        pub fn with_pod_shm(
+            mut self,
+            source: Option<fandhe_container_core::oci_runtime::PodShmSource>,
+        ) -> Self {
+            self.pod_shm = source;
             self
         }
 
@@ -2943,6 +2962,29 @@ mod linux {
         }
     }
 
+    /// `--pod-shm` を起動オプションへ反映する（指定が無ければそのまま。純関数）。core の `with_pod_shm` が既定の `/dev/shm` の
+    /// 定義との整合（`--ipc=host`・`--shm-size`・`--tmpfs /dev/shm` との併用の拒否）を再検証する（CRI-2・SEC-1・#4822）。
+    fn apply_pod_shm(
+        options: fandhe_container_core::oci_runtime::LaunchOptions,
+        pod_shm: Option<fandhe_container_core::oci_runtime::PodShmSource>,
+    ) -> Result<fandhe_container_core::oci_runtime::LaunchOptions, TraitError> {
+        match pod_shm {
+            Some(source) => options.with_pod_shm(source),
+            None => Ok(options),
+        }
+    }
+
+    /// `--pod-shm` を、effective / permitted の capability を持つ supervisor（特権ランチャー経由）では `Unimplemented` で拒否する
+    /// （純関数。`/proc/self/status` の内容を受ける。読めない・壊れている場合も fail-closed。CRI-2・SEC-1・SUP-14・#4822）。
+    fn deny_pod_shm_with_elevated_capabilities(status: &str) -> Result<(), TraitError> {
+        crate::logs::cri::deny_elevated_capabilities(status).map_err(|e| {
+            TraitError::new(
+                e.code(),
+                "pod shm is not supported with elevated capabilities",
+            )
+        })
+    }
+
     impl StartDeps for ProductionStartDeps {
         fn seccomp_hub(&self) -> Option<Arc<SeccompNotifyHub>> {
             self.seccomp.clone()
@@ -2974,6 +3016,11 @@ mod linux {
                 return Err(e.clone());
             }
             self.privilege.clone()?;
+            // pod の共有 `/dev/shm`（`--pod-shm`）は、ambient capability つき（特権ランチャー経由）で argv の指す mount namespace
+            // へ入る経路を作らないため、副作用（cgroup の連鎖）の前に拒否する（fail-closed。CRI-2・SEC-1・SUP-14・#4822）。
+            if self.pod_shm.is_some() {
+                deny_pod_shm_with_elevated_capabilities(&read_self_status()?)?;
+            }
             // pasta 構成の前提は cgroup の連鎖の前に確かめる(再検証済みのバイナリが無いまま、またはユーザー定義名の
             // 無いまま pasta を走らせない。固定文言。NET-9・12.4・#1940)。
             self.check_pasta_wiring()?;
@@ -3136,6 +3183,8 @@ mod linux {
             // 手順 5〜7 の他の失敗と同じ経路で後始末される（SUP-12・#2625）。
             let launch_options =
                 apply_stdin_option(self.container_options.launch_options()?, self.stdin);
+            // pod の共有 `/dev/shm`（`--pod-shm`）の権限の確認は `check_launcher_available`（cgroup の連鎖の前）で済んでいる。
+            let launch_options = apply_pod_shm(launch_options, self.pod_shm.clone())?;
             // rootless のユーザー定義名(Attachable)のときだけ、exec 前の同期点で holder と pasta を結線する(#1940)。
             let wiring = self.pasta_wiring()?;
             // 手順 4b / 後始末(`prepare_network` / `release_network`)が同じ結線を使えるよう控える。
@@ -3891,7 +3940,8 @@ mod linux {
             .with_companions(companions)
             .with_audit_policy(args.audit_policy)
             .with_cri_log_path(args.cri_log_path.clone())
-            .with_stdin_option(args.stdin);
+            .with_stdin_option(args.stdin)
+            .with_pod_shm(args.pod_shm.clone());
         // pasta 構成の結線先(コンテナ ID と、ストアの検査済みの状態ルート)。ユーザー定義名のときだけ使われる(#1940)。
         let deps = deps.with_pasta_target(
             args.id.clone(),
@@ -4155,6 +4205,59 @@ mod linux {
                 assert_eq!(
                     apply_stdin_option(base.clone(), Some(option)).stdin(),
                     LaunchStdinMode::Pipe
+                );
+            }
+        }
+
+        /// CRI-2・CORE-3・SEC-1・#4822: `--pod-shm` は起動オプションへ反映され（未指定は変わらない）、既定の `/dev/shm` と矛盾する
+        /// 起動オプション（`--ipc=host`）との併用は core の検査で固定文言の `InvalidArgument` になる。
+        #[test]
+        fn cri2_4822_apply_pod_shm_maps_to_launch_options() {
+            use fandhe_container_core::injected_files::InjectedFileSet;
+            use fandhe_container_core::oci_runtime::{LaunchIpcMode, LaunchOptions, PodShmSource};
+            use fandhe_container_core::tmpfs::TmpfsMountSet;
+            let source =
+                PodShmSource::new(PathBuf::from("/proc/1234/ns/mnt"), 48, 2).expect("source");
+            let base = LaunchOptions::try_default().expect("default options");
+            assert_eq!(base.pod_shm(), None);
+            assert_eq!(apply_pod_shm(base.clone(), None).expect("none"), base);
+            let with = apply_pod_shm(base, Some(source.clone())).expect("pod shm");
+            assert_eq!(with.pod_shm(), Some(&source));
+            let host = LaunchOptions::new(
+                TmpfsMountSet::new(),
+                InjectedFileSet::new(),
+                LaunchIpcMode::Host,
+            )
+            .expect("host ipc");
+            let e = apply_pod_shm(host, Some(source)).expect_err("conflict");
+            assert_eq!(e.code(), ErrorCode::InvalidArgument);
+            assert_eq!(
+                e.message(),
+                "a pod shared /dev/shm cannot be combined with --ipc=host"
+            );
+        }
+
+        /// CRI-2・SEC-1・SUP-14・#4822: 特権ランチャー経由（effective / permitted の capability あり）の `--pod-shm` は
+        /// `Unimplemented`（固定文言）で拒否し、読めない・壊れた status も拒否する。capability が空なら通す。
+        #[test]
+        fn cri2_4822_pod_shm_is_refused_with_elevated_capabilities() {
+            assert!(
+                deny_pod_shm_with_elevated_capabilities(
+                    "Name:\tx\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\n"
+                )
+                .is_ok()
+            );
+            for bad in [
+                "CapPrm:\t0000000000000000\nCapEff:\t0000000000000002\n",
+                "CapPrm:\t0000000000000002\nCapEff:\t0000000000000000\n",
+                "CapPrm:\t0000000000000000\n",
+                "",
+            ] {
+                let e = deny_pod_shm_with_elevated_capabilities(bad).expect_err(bad);
+                assert_eq!(e.code(), ErrorCode::Unimplemented, "{bad:?}");
+                assert_eq!(
+                    e.message(),
+                    "pod shm is not supported with elevated capabilities"
                 );
             }
         }

@@ -72,11 +72,14 @@
 //!   healthcheck の対象の固定（`Pid1Target`）は、launch の記録に残した同じ素性（`LaunchIsolationRecord::pod_pid_ns`）で
 //!   launch pidfd の経路でだけ対象を受け、記録 pid から開く縮退経路を拒否する（#4813）。reapply の pid ns の照合も記録した
 //!   素性で行う。cri は #4817 まで pid の path を出さない。
-//! - `/dev/shm`（POSIX shm）は共有されない（core がコンテナごとの tmpfs を載せる）。SysV IPC と POSIX mqueue が
-//!   共有される。
+//! - `/dev/shm`（POSIX shm）は、起動オプションの `PodShmSource`（supervisor の argv `--pod-shm`。`pod_shm` モジュール。
+//!   #4822・S2）を受けたときだけ pod で共有する（init が保持役の mount namespace の tmpfs を複製して載せる。`exec::pod_shm`）。
+//!   指定が無ければ共有されず、core がコンテナごとの tmpfs を載せる。本番の指定元（plugin-cri が保持役の pid と READY の
+//!   素性から組む配線）は S3（#4823）で未実装。SysV IPC と POSIX mqueue は ipc の join で共有される。
 //! - 周辺の未完: 保持役の素性の永続化と再起動後の再採用は #2940、rootless の本番 PodNetworkProvider（pasta）は #2879。
 
 mod pinned_net;
+mod pod_shm;
 
 use std::path::Path;
 #[cfg(target_os = "linux")]
@@ -87,6 +90,7 @@ use crate::audit_log::PodNamespaceJoinOutcome;
 use crate::traits::{ErrorCode, TraitError};
 
 pub use pinned_net::{NetnsJoinTarget, PinnedNetnsJoin};
+pub use pod_shm::{PinnedPodShm, PodShmSource};
 
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
@@ -1077,35 +1081,20 @@ mod tests {
         0
     }
 
-    /// 実機(`--ignored`)。CRI-2・CORE-3・SEC-5・SEC-1・#4806（S0）: pod の `/dev/shm` の案 A の 3 段が、非特権の
-    /// user + mount namespace で通ることの PoC。
-    ///
-    /// 1. 保持役の代わり（`unshare --user --map-root-user --mount`）が、自分の mount ns に tmpfs
-    ///    （`size=64m,nosuid,nodev,noexec,mode=1777`）を載せる
-    /// 2. コンテナの init の代わり（保持役の userns へ参加し、`unshare(CLONE_NEWNS)` で自分の mount ns を作った子）が、
-    ///    保持役の mnt ns へ `setns` して `open_tree(OPEN_TREE_CLONE)` で複製を取る（v6.12 の `__do_loopback` は複製元が
-    ///    呼び出し側の今の mount ns にあること〔`check_mnt`〕を要るため、参加してから開く）
-    /// 3. 自分の mnt ns へ戻り、`move_mount` で載せ先へ付ける（移すものは anon ns の root）
-    ///
-    /// 載せた先の属性 `nosuid,nodev,noexec`・大きさ `size=65536k`（mountinfo）と、2 つの mnt ns の間で内容が一致すること
-    /// （保持役側で書いたファイルを init 側で読み、init 側で書いたファイルを保持役側で読む）を具体値で照合し、試験プロセスの
-    /// mount ns には付かないことも確かめる。
-    #[test]
-    #[ignore = "needs unprivileged user namespaces, unshare(1) and mount(8); run with --ignored (#4806)"]
-    fn cri2_core3_4806_shm_clone_via_holder_mnt_ns() {
-        use crate::sys::{self, MountTreeScope, NsFlag};
-        use std::ffi::CString;
-        let (_scratch, dir) = crate::test_support::scratch_child("fandhe-shm-poc", "d");
-        let (src, dst) = (dir.join("shm-src"), dir.join("shm-dst"));
-        std::fs::create_dir_all(&src).expect("mkdir src");
-        std::fs::create_dir_all(&dst).expect("mkdir dst");
-        let (src_s, dst_s) = (
-            src.to_str().expect("utf8").to_owned(),
-            dst.to_str().expect("utf8").to_owned(),
-        );
-        let script = format!(
-            "mount -t tmpfs -o size=64m,nosuid,nodev,noexec,mode=1777 tmpfs '{src_s}' && exec sleep 30"
-        );
+    /// 保持役の代わり（`unshare --user --map-root-user --mount`）。`mount_shm` が真なら自分の mount ns の `/dev/shm` に
+    /// pod の共有と同じ定義（`size=64m,nosuid,nodev,noexec,mode=1777`）の tmpfs を載せて待つ。偽なら何も載せない
+    /// （ホストの `/dev/shm` がそのまま見える保持役。素性の照合が効くことの確認用）。
+    fn spawn_shm_holder(mount_shm: bool) -> FakeHolder {
+        spawn_shm_holder_with(mount_shm, "size=64m,nosuid,nodev,noexec,mode=1777")
+    }
+
+    /// [`spawn_shm_holder`] の tmpfs のマウントオプションを指定する版（属性の拒否の試験で `noexec` を外す）。
+    fn spawn_shm_holder_with(mount_shm: bool, shm_opts: &str) -> FakeHolder {
+        let script = if mount_shm {
+            format!("mount -t tmpfs -o {shm_opts} tmpfs /dev/shm && exec sleep 30")
+        } else {
+            "exec sleep 30".to_owned()
+        };
         let holder = FakeHolder {
             child: std::process::Command::new("unshare")
                 .args([
@@ -1119,34 +1108,68 @@ mod tests {
                 .spawn()
                 .expect("PRECONDITION FAILED: unshare(1) is required"),
         };
+        // 保持役の mount ns に（載せる構成なら tmpfs が）できるまで待つ。
         let hpid = holder.child.id();
-        // 保持役の mount ns に tmpfs が載るまで待つ。
+        let own = std::fs::read_link("/proc/self/ns/mnt").expect("own mnt ns");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let mounted = || {
-            std::fs::read_to_string(format!("/proc/{hpid}/mountinfo")).is_ok_and(|info| {
-                info.lines().any(|l| {
-                    l.split_whitespace().nth(4) == Some(src_s.as_str()) && l.contains(" - tmpfs ")
-                })
-            })
+        let ready = || {
+            let entered =
+                std::fs::read_link(format!("/proc/{hpid}/ns/mnt")).is_ok_and(|l| l != own);
+            let mounted = !mount_shm
+                || std::fs::read_to_string(format!("/proc/{hpid}/mountinfo")).is_ok_and(|info| {
+                    info.lines().any(|l| {
+                        l.split_whitespace().nth(4) == Some("/dev/shm") && l.contains(" - tmpfs ")
+                    })
+                });
+            entered && mounted
         };
-        while !mounted() {
+        while !ready() {
             assert!(
                 std::time::Instant::now() < deadline,
-                "PRECONDITION FAILED: the holder did not mount the tmpfs"
+                "PRECONDITION FAILED: the holder did not set up its mount namespace"
             );
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        let holder_root = |name: &str| format!("/proc/{hpid}/root{src_s}/{name}");
-        std::fs::write(holder_root("from-holder"), "holder").expect("write on the holder side");
-        let user = sys::open_ns_file(&CString::new(format!("/proc/{hpid}/ns/user")).expect("c"))
-            .expect("open the holder user ns");
-        let mnt = sys::open_ns_file(&CString::new(format!("/proc/{hpid}/ns/mnt")).expect("c"))
-            .expect("open the holder mnt ns");
-        let (src_c, dst_c) = (
-            CString::new(src_s.clone()).expect("c"),
-            CString::new(dst_s.clone()).expect("c"),
-        );
-        let dst_file = |name: &str| dst.join(name);
+        holder
+    }
+
+    /// 実機(`--ignored`)。CRI-2・CORE-3・SEC-5・SEC-1・CORE-5・#4806・#4822（S2）: 本番の複製の関数
+    /// （`exec::pod_shm::clone_from_holder`。init の pivot 前段が呼ぶ）が、非特権の user + mount namespace で通ること。
+    ///
+    /// 保持役の代わりが自分の mount ns の `/dev/shm` に tmpfs（`size=64m,nosuid,nodev,noexec,mode=1777`）を載せる。
+    /// コンテナの init の代わり（保持役の userns へ参加し、`unshare(CLONE_NEWNS)` で自分の mount ns を作った fork 子）が、
+    /// 保持役の mnt ns の fd と READY 相当の素性（保持役の `/dev/shm` の `(st_dev, st_ino)`）を渡して複製を取り、自分の
+    /// mnt ns へ戻って `move_mount` で載せ先へ付ける。具体値で照合するもの: 往復の後に mnt ns・cwd が元のまま、載せた先の
+    /// `nosuid,nodev,noexec`（`fstatfs`）・mountinfo の `size=65536k`・両方向の内容の一致（`holder` / `init`）。素性が違う
+    /// 期待値は `PermissionDenied` で拒否して何も載せず、保持役が tmpfs を載せていない（ホストの `/dev/shm` に解決する）場合も
+    /// 同じ固定文言で拒否する。いずれも試験プロセスの mount ns には何も付かない。
+    #[test]
+    #[ignore = "needs unprivileged user namespaces, unshare(1) and mount(8); run with --ignored (#4806, #4822)"]
+    fn cri2_core3_4806_shm_clone_via_holder_mnt_ns() {
+        use crate::sys::{self, NsFlag};
+        use std::ffi::CString;
+        use std::os::unix::fs::MetadataExt as _;
+        let (_scratch, dir) = crate::test_support::scratch_child("fandhe-shm-poc", "d");
+        let dir = dir.canonicalize().expect("canonical scratch");
+        let dst = dir.join("shm-dst");
+        std::fs::create_dir_all(&dst).expect("mkdir dst");
+        let dst_s = dst.to_str().expect("utf8").to_owned();
+        let denied_message =
+            "the pod /dev/shm in the holder mount namespace is not the expected tmpfs";
+
+        let holder = spawn_shm_holder(true);
+        let hpid = holder.child.id();
+        // READY 相当の素性（保持役の `/dev/shm` の tmpfs のルート）。保持役の root 越しに fd なしで読む。
+        let meta = std::fs::metadata(format!("/proc/{hpid}/root/dev/shm")).expect("holder shm");
+        let expected = (meta.dev(), meta.ino());
+        std::fs::write(format!("/proc/{hpid}/root/dev/shm/from-holder"), "holder")
+            .expect("write on the holder side");
+        let open_ns = |pid: u32, kind: &str| {
+            sys::open_ns_file(&CString::new(format!("/proc/{pid}/ns/{kind}")).expect("c"))
+                .unwrap_or_else(|e| panic!("open the holder {kind} ns: {e:?}"))
+        };
+        let (user, mnt) = (open_ns(hpid, "user"), open_ns(hpid, "mnt"));
+        let dst_c = CString::new(dst_s.clone()).expect("c");
         let child = sys::fork_single_threaded_with(
             || true,
             || {
@@ -1159,27 +1182,21 @@ mod tests {
                 if sys::mount_root_private_recursive().is_err() {
                     return 12;
                 }
-                let Ok(own) = sys::open_ns_file(c"/proc/thread-self/ns/mnt") else {
+                if std::env::set_current_dir(&dir).is_err() {
                     return 13;
-                };
-                // 2. 保持役の mnt ns へ参加して複製を取る。
-                if sys::setns_fd(mnt.as_fd(), NsFlag::Mount).is_err() {
+                }
+                let own_ns = std::fs::read_link("/proc/thread-self/ns/mnt").ok();
+                // 本番の複製（保持役の mnt ns へ入って複製し、戻る）。
+                let Ok(clone) = crate::exec::clone_from_holder(mnt.as_fd(), expected) else {
                     return 14;
-                }
-                let Ok(src_fd) = sys::open_dir_path_nofollow(None, &src_c) else {
+                };
+                if std::fs::read_link("/proc/thread-self/ns/mnt").ok() != own_ns {
                     return 15;
-                };
-                let Ok(verified) = sys::verify_bind_source_fd(src_fd) else {
-                    return 16;
-                };
-                let Ok(clone) = sys::open_tree_clone_bind(&verified, MountTreeScope::MountOnly)
-                else {
-                    return 17;
-                };
-                // 3. 自分の mnt ns へ戻って載せる。
-                if sys::setns_fd(own.as_fd(), NsFlag::Mount).is_err() {
-                    return 18;
                 }
+                if std::env::current_dir().ok().as_deref() != Some(dir.as_path()) {
+                    return 16;
+                }
+                // 自分の mnt ns で載せる。
                 let Ok(dst_fd) = sys::open_dir_path_nofollow(None, &dst_c) else {
                     return 19;
                 };
@@ -1204,12 +1221,24 @@ mod tests {
                 if !sized {
                     return 24;
                 }
-                match std::fs::read_to_string(dst_file("from-holder")) {
+                match std::fs::read_to_string(dst.join("from-holder")) {
                     Ok(text) if text == "holder" => {}
                     _ => return 25,
                 }
-                if std::fs::write(dst_file("from-init"), "init").is_err() {
+                if std::fs::write(dst.join("from-init"), "init").is_err() {
                     return 26;
+                }
+                // 素性の違う期待値は固定文言で拒否され、往復の後も mnt ns は元のまま。
+                match crate::exec::clone_from_holder(mnt.as_fd(), (expected.0, expected.1 + 1)) {
+                    Err(e)
+                        if e.code == ErrorCode::PermissionDenied
+                            && e.message == denied_message
+                            && e.violation.as_ref().map(|v| v.reason)
+                                == Some(crate::exec::ViolationReason::PodShmIdentityMismatch) => {}
+                    _ => return 30,
+                }
+                if std::fs::read_link("/proc/thread-self/ns/mnt").ok() != own_ns {
+                    return 31;
                 }
                 0
             },
@@ -1219,12 +1248,85 @@ mod tests {
         assert_eq!(
             wait_exit(child),
             0,
-            "the three steps of option A must succeed"
+            "the round trip, attributes, contents and the identity refusal must hold"
         );
         assert_eq!(
-            std::fs::read_to_string(holder_root("from-init")).expect("read on the holder side"),
+            std::fs::read_to_string(format!("/proc/{hpid}/root/dev/shm/from-init"))
+                .expect("read on the holder side"),
             "init"
         );
+
+        // 保持役が tmpfs を載せていない（`/dev/shm` がホストのものに解決する）と、同じ固定文言で拒否される。
+        let bare = spawn_shm_holder(false);
+        let bpid = bare.child.id();
+        let (buser, bmnt) = (open_ns(bpid, "user"), open_ns(bpid, "mnt"));
+        let child = sys::fork_single_threaded_with(
+            || true,
+            || {
+                if sys::setns_fd(buser.as_fd(), NsFlag::User).is_err() {
+                    return 10;
+                }
+                if sys::unshare_namespaces(&[NsFlag::Mount]).is_err() {
+                    return 11;
+                }
+                if sys::mount_root_private_recursive().is_err() {
+                    return 12;
+                }
+                let own_ns = std::fs::read_link("/proc/thread-self/ns/mnt").ok();
+                match crate::exec::clone_from_holder(bmnt.as_fd(), expected) {
+                    Err(e)
+                        if e.code == ErrorCode::PermissionDenied && e.message == denied_message => {
+                    }
+                    _ => return 40,
+                }
+                if std::fs::read_link("/proc/thread-self/ns/mnt").ok() != own_ns {
+                    return 41;
+                }
+                0
+            },
+            29,
+        )
+        .expect("fork");
+        assert_eq!(
+            wait_exit(child),
+            0,
+            "a holder without its own tmpfs must be refused, not cloned"
+        );
+
+        // pin（start が fork の前に呼ぶ検証）も実 namespace で照合する。join の user namespace を所有者とする mnt ns は受理し、
+        // 別の保持役（別の user namespace）の mnt ns は `PermissionDenied` と専用の監査の結果で拒否する。
+        {
+            use super::pod_shm::{PinnedPodShm, PodShmSource};
+            let (user_path, ipc_path) = (
+                format!("/proc/{bpid}/ns/user"),
+                format!("/proc/{bpid}/ns/ipc"),
+            );
+            let paths = JoinPaths {
+                user: Path::new(&user_path),
+                ipc: Path::new(&ipc_path),
+                net: None,
+                pid: None,
+            };
+            let own_ipc = || open_ns(std::process::id(), "ipc");
+            let source = PodShmSource::new(
+                std::path::PathBuf::from(format!("/proc/{bpid}/ns/mnt")),
+                1,
+                1,
+            )
+            .expect("source");
+            let same_holder = NamespaceJoin::for_test(open_ns(bpid, "user"), own_ipc());
+            PinnedPodShm::pin(&source, Some(&same_holder), Some(&paths))
+                .expect("the holder's own mount namespace is accepted");
+            let other_holder = NamespaceJoin::for_test(open_ns(hpid, "user"), own_ipc());
+            let e = PinnedPodShm::pin(&source, Some(&other_holder), Some(&paths))
+                .expect_err("a mount namespace of another user namespace");
+            assert_eq!(e.error.code(), ErrorCode::PermissionDenied);
+            assert_eq!(
+                e.outcome,
+                Some(PodNamespaceJoinOutcome::PodShmOwnerMismatch)
+            );
+        }
+
         // 試験プロセスの mount ns には付いていない（載せ先は init の mount ns だけ）。
         let own_info = std::fs::read_to_string("/proc/self/mountinfo").expect("mountinfo");
         assert!(
@@ -1237,9 +1339,68 @@ mod tests {
             !dst.join("from-init").exists(),
             "the target stays empty on the host"
         );
+        drop(bare);
         drop(holder);
         println!(
-            "cri2_core3_4806: /dev/shm option A (setns + open_tree clone + move_mount) works unprivileged"
+            "cri2_core3_4806: the production pod /dev/shm clone (setns + open_tree + move_mount) works unprivileged"
+        );
+    }
+
+    /// 実機(`--ignored`)。CRI-2・SEC-1・SEC-4・#4822: 素性は一致するが `noexec` の無い tmpfs を保持役が載せている場合、
+    /// 複製は属性の拒否の固定文言と理由語 `pod_shm_identity_mismatch` で失敗し、mnt ns は往復後も元のまま。
+    #[test]
+    #[ignore = "needs unprivileged user namespaces, unshare(1) and mount(8); run with --ignored (#4822)"]
+    fn cri2_sec1_4822_shm_clone_refuses_tmpfs_without_noexec() {
+        use crate::sys::{self, NsFlag};
+        use std::ffi::CString;
+        use std::os::unix::fs::MetadataExt as _;
+        let holder = spawn_shm_holder_with(true, "size=64m,nosuid,nodev,mode=1777");
+        let hpid = holder.child.id();
+        let meta = std::fs::metadata(format!("/proc/{hpid}/root/dev/shm")).expect("holder shm");
+        let expected = (meta.dev(), meta.ino());
+        let open_ns = |kind: &str| {
+            sys::open_ns_file(&CString::new(format!("/proc/{hpid}/ns/{kind}")).expect("c"))
+                .unwrap_or_else(|e| panic!("open the holder {kind} ns: {e:?}"))
+        };
+        let (user, mnt) = (open_ns("user"), open_ns("mnt"));
+        let child = sys::fork_single_threaded_with(
+            || true,
+            || {
+                if sys::setns_fd(user.as_fd(), NsFlag::User).is_err() {
+                    return 10;
+                }
+                if sys::unshare_namespaces(&[NsFlag::Mount]).is_err() {
+                    return 11;
+                }
+                if sys::mount_root_private_recursive().is_err() {
+                    return 12;
+                }
+                let own_ns = std::fs::read_link("/proc/thread-self/ns/mnt").ok();
+                match crate::exec::clone_from_holder(mnt.as_fd(), expected) {
+                    Err(e)
+                        if e.code == ErrorCode::PermissionDenied
+                            && e.message
+                                == "the pod /dev/shm is not a tmpfs with nosuid, nodev and noexec"
+                            && e.violation.as_ref().map(|v| v.reason)
+                                == Some(crate::exec::ViolationReason::PodShmIdentityMismatch) => {}
+                    _ => return 40,
+                }
+                if std::fs::read_link("/proc/thread-self/ns/mnt").ok() != own_ns {
+                    return 41;
+                }
+                0
+            },
+            29,
+        )
+        .expect("fork");
+        assert_eq!(
+            wait_exit(child),
+            0,
+            "a tmpfs without noexec must be refused with the attribute message and the audit reason"
+        );
+        drop(holder);
+        println!(
+            "cri2_sec1_4822: a pod /dev/shm tmpfs without noexec is refused with pod_shm_identity_mismatch"
         );
     }
 

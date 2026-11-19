@@ -255,6 +255,46 @@ impl TmpfsMountSet {
         Ok(DevShmOrigin::Default)
     }
 
+    /// pod の共有 `/dev/shm`（保持役の tmpfs の複製。CRI-2・CORE-3・#4822）を載せる起動のために、既定の `/dev/shm` の件
+    /// （[`TmpfsMountSpec::default_dev_shm`] と同じ定義）だけを除いた集合を返す。
+    ///
+    /// 黙って共有の定義を差し替えない（fail-closed）: `/dev/shm` が無い（`--ipc=host`）・既定と違う（`--shm-size`・
+    /// `--tmpfs /dev/shm`）・`/dev/shm` の配下に tmpfs がある場合は `InvalidArgument`。pod の共有の tmpfs は保持役が決めた
+    /// 64 MiB・`nosuid,nodev,noexec` で、コンテナごとの指定では変えられない。
+    pub fn without_default_dev_shm(&self) -> Result<Self, TraitError> {
+        let default = TmpfsMountSpec::default_dev_shm()?;
+        let under_shm = |m: &TmpfsMountSpec| {
+            m.destination
+                .as_str()
+                .strip_prefix(DEV_SHM_PATH)
+                .is_some_and(|rest| rest.starts_with('/'))
+        };
+        if self.mounts.iter().any(under_shm) {
+            return Err(invalid(
+                "a tmpfs under /dev/shm cannot be combined with a pod shared /dev/shm",
+            ));
+        }
+        let mut out = Self::new();
+        let mut found = false;
+        for m in &self.mounts {
+            if m.destination.as_str() != DEV_SHM_PATH {
+                out.mounts.push(m.clone());
+            } else if *m == default {
+                found = true;
+            } else {
+                return Err(invalid(
+                    "a pod shared /dev/shm cannot be combined with --shm-size or --tmpfs /dev/shm",
+                ));
+            }
+        }
+        if !found {
+            return Err(invalid(
+                "a pod shared /dev/shm requires the default /dev/shm mount (not --ipc=host)",
+            ));
+        }
+        Ok(out)
+    }
+
     /// 指定順のマウント一覧。
     pub fn mounts(&self) -> &[TmpfsMountSpec] {
         &self.mounts
@@ -269,6 +309,65 @@ impl TmpfsMountSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CRI-2・CORE-3（#4822）: 既定の `/dev/shm` だけを除き、他の件の順序は保つ。`--shm-size`・`--tmpfs /dev/shm`・
+    /// `/dev/shm` が無い・配下の tmpfs は固定文言の `InvalidArgument`。
+    #[test]
+    fn cri2_4822_without_default_dev_shm() {
+        let mut set = TmpfsMountSet::new();
+        set.ensure_default_dev_shm().expect("default");
+        set.push(TmpfsMountSpec::new("/run", None).expect("run"))
+            .expect("push");
+        let trimmed = set.without_default_dev_shm().expect("trim");
+        let dests: Vec<&str> = trimmed
+            .mounts()
+            .iter()
+            .map(|m| m.destination.as_str())
+            .collect();
+        assert_eq!(dests, ["/run"]);
+        assert_eq!(set.mounts().len(), 2, "the source set is unchanged");
+        let only_shm = {
+            let mut s = TmpfsMountSet::new();
+            s.ensure_default_dev_shm().expect("default");
+            s
+        };
+        assert!(only_shm.without_default_dev_shm().expect("trim").is_empty());
+
+        let sized = {
+            let mut s = TmpfsMountSet::new();
+            s.push(
+                TmpfsMountSpec::dev_shm(TmpfsSize::from_bytes(1 << 20).expect("size"))
+                    .expect("shm"),
+            )
+            .expect("push");
+            s
+        };
+        let nested = {
+            let mut s = TmpfsMountSet::new();
+            s.ensure_default_dev_shm().expect("default");
+            s.push(TmpfsMountSpec::new("/dev/shm/sub", None).expect("sub"))
+                .expect("push");
+            s
+        };
+        let cases = [
+            (
+                TmpfsMountSet::new(),
+                "a pod shared /dev/shm requires the default /dev/shm mount (not --ipc=host)",
+            ),
+            (
+                sized,
+                "a pod shared /dev/shm cannot be combined with --shm-size or --tmpfs /dev/shm",
+            ),
+            (
+                nested,
+                "a tmpfs under /dev/shm cannot be combined with a pod shared /dev/shm",
+            ),
+        ];
+        for (set, message) in cases {
+            let (code, got) = err_of(set.without_default_dev_shm());
+            assert_eq!((code, got.as_str()), (ErrorCode::InvalidArgument, message));
+        }
+    }
 
     /// 失敗の `(code, message)`。
     fn err_of<T: std::fmt::Debug>(r: Result<T, TraitError>) -> (ErrorCode, String) {

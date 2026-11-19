@@ -32,7 +32,7 @@
 //!   作成時（CLI の create）の `PermissionDenied` は D2 と両立しないため記録しない
 //! - pod の namespace への join（`linux.namespaces[].path`。層 `pod_namespace_join`。SEC-4・SEC-5・CORE-3・NET-3・#2872）は、
 //!   start の素性検査の受理と拒否を [`AuditEvent::PodNamespaceJoin`] として 1 件ずつ配送する（閉じた語彙の
-//!   [`PodNamespaceJoinOutcome`] 11 種。パス・pid・inode は持たない〔型で保証〕。作業スレッドからは `ControlAuditRelay` が運ぶ）
+//!   [`PodNamespaceJoinOutcome`] 16 種。パス・pid・inode は持たない〔型で保証〕。作業スレッドからは `ControlAuditRelay` が運ぶ）
 //! - supervisor の制御チャネルの接続元の拒否（層 `control_channel`。SEC-4・SEC-1・SUP-1・#2058）は、制御チャネルのサーバー
 //!   （`fandhe-container-supervisor` の `control/server.rs`）が `ControlObserver::record_peer_rejection`
 //!   （`control/observe.rs`）経由で [`AuditEvent::ControlPeer`] として記録する。理由は [`ControlPeerRejection`] の 2 種
@@ -724,12 +724,15 @@ pub enum PodNamespaceJoinOutcome {
     PidOwnerMismatch,
     /// pid の親が呼び出し側の pid namespace でない（呼び出し側自身・孫以下・無関係。#4809）。
     PidNotChild,
+    /// pod の `/dev/shm` の元（保持役の mount namespace）を所有するのが join する user namespace でない
+    /// （呼び出し側自身・ホスト・別 pod の mount namespace。CRI-2・SEC-5・#4822）。
+    PodShmOwnerMismatch,
 }
 
 impl PodNamespaceJoinOutcome {
     /// 中継の閉じた表（添字がワイヤー上の値。増やすときは末尾に足す。中継は Linux 限定）。
     #[cfg(target_os = "linux")]
-    pub(crate) const ALL: [Self; 15] = [
+    pub(crate) const ALL: [Self; 16] = [
         Self::AcceptedUserIpc,
         Self::AcceptedUserIpcNet,
         Self::PathMalformed,
@@ -745,6 +748,7 @@ impl PodNamespaceJoinOutcome {
         Self::AcceptedUserIpcNetPid,
         Self::PidOwnerMismatch,
         Self::PidNotChild,
+        Self::PodShmOwnerMismatch,
     ];
 
     /// 監査レコードに入る静的トークン。
@@ -765,6 +769,7 @@ impl PodNamespaceJoinOutcome {
             Self::AcceptedUserIpcNetPid => "pod_join_accepted_user_ipc_net_pid",
             Self::PidOwnerMismatch => "pod_join_pid_owner_mismatch",
             Self::PidNotChild => "pod_join_pid_not_child",
+            Self::PodShmOwnerMismatch => "pod_join_shm_owner_mismatch",
         }
     }
 
@@ -1341,7 +1346,7 @@ mod tests {
         assert!(r.syscall().is_none());
     }
 
-    /// SEC-4・SEC-5・NET-3・#2872・#4809: pod_namespace_join の層トークンと 15 結果のトークン(固定値・重複なし・
+    /// SEC-4・SEC-5・NET-3・#2872・#4809: pod_namespace_join の層トークンと 16 結果のトークン(固定値・重複なし・
     /// `pod_join_` 接頭辞)、レコードのアクセサ(パスを持たない)。
     #[cfg(target_os = "linux")]
     #[test]
@@ -1369,6 +1374,7 @@ mod tests {
                 "pod_join_accepted_user_ipc_net_pid",
                 "pod_join_pid_owner_mismatch",
                 "pod_join_pid_not_child",
+                "pod_join_shm_owner_mismatch",
             ]
         );
         let r = AuditRecord::new(

@@ -31,7 +31,7 @@
 //!
 //! [`mount_pod_shm`] は、確立した mount namespace の `/dev/shm` に pod で共有する tmpfs(コンテナの既定と同じ 64 MiB・
 //! `nosuid,nodev,noexec`・mode 1777)を載せ、tmpfs のルートの素性を返す。保持役は段 2 で capability を落とす前に呼び、
-//! 素性を READY に載せる。コンテナの init はこの mount namespace へ入って複製を取る(S2・#4822)。
+//! 素性を READY に載せる。コンテナの init はこの mount namespace へ入って複製を取る(S2・#4822。`exec::pod_shm`)。
 //!
 //! # 契約(呼び出し側の義務)
 //!
@@ -398,7 +398,7 @@ const MSG_SHM_MOUNT: &str = "failed to mount the pod /dev/shm";
 const MSG_SHM_VERIFY: &str = "the pod /dev/shm does not have the expected attributes";
 
 /// 保持役の mount ns で pod の `/dev/shm` を載せる場所（保持役自身の mount ns の中の固定パス。外部入力ではない）。
-const POD_SHM_PATH: &std::ffi::CStr = c"/dev/shm";
+pub(crate) const POD_SHM_PATH: &std::ffi::CStr = c"/dev/shm";
 
 /// 保持役の mount ns に載せた pod の `/dev/shm`（tmpfs のルート）の素性（`st_dev`・`st_ino`。CRI-2・CORE-3・SEC-5・#4821）。
 ///

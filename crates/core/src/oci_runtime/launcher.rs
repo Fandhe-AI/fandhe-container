@@ -142,6 +142,7 @@
 //!   常に全暗黙マウントで判定するため、`WithoutShm` でも `/dev/shm` 上の保護パス指定を拒否する(厳しい側。fail-closed)。
 //!   範囲写像の holder が継承するメモリから secret を外す方式(封印 memfd。#2628)は `InjectedContent` の doc を参照。
 //!   CLI から supervisor への受け渡しは未結線。`LaunchOptions::stdin` が `Pipe` のときだけ spawn が stdin の pipe を作り、読み取り側を init の fd 0、書き込み側を `LaunchedProcess::take_stdin` で返す(既定の `Null` は `/dev/null`。SUP-7・CRI-6・SEC-1・#4069)
+//! - pod で共有する `/dev/shm`(`LaunchOptions::with_pod_shm`。CRI-2・CORE-3・SEC-1・SEC-5・#4822)は、start が固定した `LaunchSpec::pinned_pod_shm` と自身の起動オプションの有無が食い違えば fork の前に `FailedPrecondition` で拒否し(ラッパーの転送漏れで共有が黙って外れない)、あれば子へ渡す tmpfs 集合から既定の `/dev/shm` の件だけを除く(init が保持役の tmpfs の複製を載せる。`exec::pod_shm`)。Landlock の暗黙規則・bind との重なりの検査は元の集合のまま。本番の指定元は S3(#4823)で未配線。
 //! - bind・`/sys` の sysfs 以外の `mounts[]` の種類と config.json の `mounts[]` の tmpfs は `start` が拒否済みで、ここでは載せない
 
 #[cfg(target_os = "linux")]
@@ -1015,6 +1016,22 @@ impl ProcessLauncher for ProductionLauncher {
         }
     }
 
+    /// 起動オプションの pod の共有 `/dev/shm` の元(start が開いて fd に固定する。CRI-2・CORE-3・SEC-1・SEC-5・#4822)。
+    /// `network_mode` と同じ `launch_options` から取る。
+    fn pod_shm_source(&self) -> Option<&super::PodShmSource> {
+        #[cfg(target_os = "linux")]
+        {
+            self.inner
+                .launch_options
+                .as_ref()
+                .and_then(LaunchOptions::pod_shm)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            match self.never {}
+        }
+    }
+
     /// start が設定の検証で拒否したときの記録先を貸す(SEC-4・#1915)。`rejection_audit_sink` の指定があればそれ、
     /// 無ければ launcher の監査 sink(#2481)。
     fn rejection_audit_sink(&self) -> Option<&dyn AuditSink> {
@@ -1659,6 +1676,24 @@ impl Inner {
                 "the launch spec was reconciled with a different network mode",
             ));
         }
+        // pod の共有 `/dev/shm`: spec の固定と自身の起動オプションは対でしか成り立たない。ラッパーが `pod_shm_source` を転送
+        // しないと start が固定せず、pod の共有が既定のコンテナごとの tmpfs へ黙って縮退する(fail-closed。CRI-2・SEC-1・#4822)。
+        if spec.pinned_pod_shm().is_some() != options.pod_shm().is_some() {
+            return Err(TraitError::new(
+                ErrorCode::FailedPrecondition,
+                "the launch spec was reconciled with a different pod shm source",
+            ));
+        }
+        // 有無だけでなく素性も照合する: start が固定した期待 `(dev, ino)` と自身の起動オプションの指定が違えば、
+        // 別の保持役の指定で固定された spec を使い回している（多重防御。CRI-2・SEC-1・#4822）。
+        if let (Some(pinned), Some(source)) = (spec.pinned_pod_shm(), options.pod_shm())
+            && pinned.expected() != source.identity()
+        {
+            return Err(TraitError::new(
+                ErrorCode::FailedPrecondition,
+                "the launch spec was pinned with a different pod shm identity",
+            ));
+        }
         // 端末つき起動と stdin Pipe の併用は拒否する。pty 割り当て後に fd 0 が slave へ置き換わるため、取り出した書き込み端は
         // 接続先のない pipe になり EPIPE で init に届かない。fork の前(副作用なし)に断る(CRI-6・SUP-7・SEC-1・#4069・#4070)。
         // tty の入力は pty の master 側(`take_pty_master`)へ書く。
@@ -1789,6 +1824,16 @@ impl Inner {
         // tmpfs と注入を fork 前に確定し、bind の宛先との重なりをここで検査する(三者の集合が揃う場所。
         // 子の `run_pre_pivot` の検査は多重防御として残す。CORE-5・SUP-12・#1654・#1915・#2625)。
         let tmpfs = options.tmpfs();
+        // pod の共有 `/dev/shm` を載せる起動は、既定の `/dev/shm` の tmpfs の件だけを子の集合から除く(init が複製を載せる)。
+        // 重なりの検査・Landlock の暗黙規則・利用者 tmpfs は元の集合のまま(暗黙の `/dev/shm` の規則は `All` のまま)。
+        // 既定と違う定義・`--ipc=host`・配下の tmpfs は `without_default_dev_shm` が `InvalidArgument` で拒否する。
+        let child_tmpfs_owned;
+        let child_tmpfs = if spec.pinned_pod_shm().is_some() {
+            child_tmpfs_owned = tmpfs.without_default_dev_shm()?;
+            &child_tmpfs_owned
+        } else {
+            tmpfs
+        };
         let inject = (!options.inject().is_empty()).then(|| options.inject());
         let binds = (!spec.bind_mounts().is_empty()).then(|| spec.bind_mounts());
         check_tmpfs_against_readonly_paths(spec.config().readonly_paths(), tmpfs, inject)?;
@@ -1884,7 +1929,7 @@ impl Inner {
                 stages,
                 audit,
                 timeout,
-                tmpfs,
+                tmpfs: child_tmpfs,
                 inject,
                 etc_files: etc_mounts.as_ref(),
                 binds,
@@ -2542,6 +2587,11 @@ impl LaunchOps for RealOps {
         let setup = PrePivotSetup {
             devices: crate::exec::DevptsGidSource::Rootless(gid_map),
             tmpfs: Some(input.tmpfs),
+            // pod の共有 `/dev/shm`(固定済みの保持役の mount namespace の fd と期待する tmpfs の素性。CRI-2・#4822)。
+            pod_shm: input
+                .spec
+                .pinned_pod_shm()
+                .map(|p| crate::exec::PodShmSetup::new(p.mnt_ns_fd(), p.expected())),
             inject: input.inject,
             etc_files: input.etc_files,
             binds: input.binds,
@@ -5466,6 +5516,109 @@ mod tests {
         assert_eq!(
             err.message(),
             "the launch spec was reconciled with a different network mode"
+        );
+        assert!(!ev.lock().unwrap().iter().any(|e| e.starts_with("spawn")));
+    }
+
+    /// pod の共有 `/dev/shm` の元（試験用。`/proc/1234/ns/mnt` で素性 48:2）。
+    fn pod_shm_source() -> super::super::PodShmSource {
+        super::super::PodShmSource::new(std::path::PathBuf::from("/proc/1234/ns/mnt"), 48, 2)
+            .expect("source")
+    }
+
+    /// 検証を通さずに固定した体の pod の共有 `/dev/shm`（実 fd は `/dev/null`。素性は 48:2）。
+    fn pinned_pod_shm() -> super::super::PinnedPodShm {
+        let fd = std::os::fd::OwnedFd::from(std::fs::File::open("/dev/null").expect("open"));
+        super::super::PinnedPodShm::for_test(fd, (48, 2))
+    }
+
+    /// CRI-2・CORE-3・SEC-1（#4822）: pod の共有 `/dev/shm` ありの launch は、子へ渡す tmpfs 集合から既定の `/dev/shm` だけを
+    /// 除く（他の件は残る）。Landlock の暗黙規則は元の集合から導いたまま（`/dev/shm` を含む `All`）。なしは従来どおり
+    /// `["/dev/shm"]`（`oci4_launch_passes_no_binds_when_mounts_are_empty`）。restart 相当の 2 回目も同じ。
+    #[test]
+    fn cri2_4822_pod_shm_removes_only_the_default_dev_shm_from_the_child_tmpfs() {
+        let options = options_with(&["/run"], true, &[], LaunchIpcMode::Private)
+            .with_pod_shm(pod_shm_source())
+            .expect("options");
+        assert_eq!(
+            options.implicit_dev_mounts(),
+            crate::dev_mounts::ImplicitDevMounts::All
+        );
+        let spec = spec_for("pod-shm-trim", serde_json::json!({}))
+            .with_pinned_pod_shm(Some(pinned_pod_shm()));
+        let ev = events();
+        let ops = FakeOps::new(&ev);
+        let seen = Arc::clone(&ops.seen);
+        let mut l = launcher(ops, rootless(), None);
+        l.inner.launch_options = Some(options);
+        for _ in 0..2 {
+            let p = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+            p.terminate(Duration::from_secs(5)).expect("terminate");
+        }
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec![(None, vec!["/run".to_owned()]); 2]
+        );
+    }
+
+    /// CRI-2・SEC-1（#4822）: spec の固定と起動オプションの pod shm は対でしか成り立たない。ラッパーの転送漏れ（options あり・
+    /// spec なし）も、逆（options なし・spec あり）も、spawn の前に `FailedPrecondition`。
+    #[test]
+    fn cri2_4822_pod_shm_pairing_mismatch_is_refused_before_spawn() {
+        let with_options = options_with(&[], true, &[], LaunchIpcMode::Private)
+            .with_pod_shm(pod_shm_source())
+            .expect("options");
+        let without_options = options_with(&[], true, &[], LaunchIpcMode::Private);
+        let cases = [
+            (
+                "pod-shm-lost",
+                spec_for("pod-shm-lost", serde_json::json!({})),
+                with_options,
+            ),
+            (
+                "pod-shm-extra",
+                spec_for("pod-shm-extra", serde_json::json!({}))
+                    .with_pinned_pod_shm(Some(pinned_pod_shm())),
+                without_options,
+            ),
+        ];
+        for (name, spec, options) in cases {
+            let ev = events();
+            let mut l = launcher(FakeOps::new(&ev), rootless(), None);
+            l.inner.launch_options = Some(options);
+            let err = l.launch(&spec, Duration::from_secs(1)).err().expect(name);
+            assert_eq!(err.code(), ErrorCode::FailedPrecondition, "{name}");
+            assert_eq!(
+                err.message(),
+                "the launch spec was reconciled with a different pod shm source",
+                "{name}"
+            );
+            assert!(!ev.lock().unwrap().iter().any(|e| e.starts_with("spawn")));
+        }
+    }
+
+    /// CRI-2・SEC-1（#4822）: 固定した期待の素性と起動オプションの pod shm の素性が違えば、spawn の前に `FailedPrecondition`。
+    #[test]
+    fn cri2_4822_pod_shm_identity_mismatch_is_refused_before_spawn() {
+        // 起動オプション側は 48:2、固定側は 48:3。
+        let options = options_with(&[], true, &[], LaunchIpcMode::Private)
+            .with_pod_shm(pod_shm_source())
+            .expect("options");
+        let fd = std::os::fd::OwnedFd::from(std::fs::File::open("/dev/null").expect("open"));
+        let pinned = super::super::PinnedPodShm::for_test(fd, (48, 3));
+        let spec =
+            spec_for("pod-shm-identity", serde_json::json!({})).with_pinned_pod_shm(Some(pinned));
+        let ev = events();
+        let mut l = launcher(FakeOps::new(&ev), rootless(), None);
+        l.inner.launch_options = Some(options);
+        let err = l
+            .launch(&spec, Duration::from_secs(1))
+            .err()
+            .expect("refused");
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "the launch spec was pinned with a different pod shm identity"
         );
         assert!(!ev.lock().unwrap().iter().any(|e| e.starts_with("spawn")));
     }

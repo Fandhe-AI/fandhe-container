@@ -50,7 +50,7 @@ mod namespace_join;
 mod netns_attach;
 mod network_mode;
 #[cfg(target_os = "linux")]
-mod pod_holder;
+pub(crate) mod pod_holder;
 mod resources;
 mod start;
 mod sysfs_mount;
@@ -141,7 +141,9 @@ pub use launcher::{ProductionLauncher, ProductionLauncherBuilder};
 #[cfg(target_os = "linux")]
 pub use launcher::{SubordinateIdMaps, SubordinateIdSource};
 pub use mount_destination::{MountDestination, audit_mount_config_error};
-pub use namespace_join::{NamespaceJoin, NetnsJoinTarget, PinnedNetnsJoin};
+pub use namespace_join::{
+    NamespaceJoin, NetnsJoinTarget, PinnedNetnsJoin, PinnedPodShm, PodShmSource,
+};
 #[cfg(target_os = "linux")]
 pub use netns_attach::{AttachableNamespaces, NetnsAttachHook};
 pub use network_mode::{EffectiveNetwork, LaunchNetworkMode};

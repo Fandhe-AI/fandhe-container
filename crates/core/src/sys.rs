@@ -2312,10 +2312,13 @@ pub(crate) fn setns_pidfd(pidfd: BorrowedFd<'_>, flags: &[NsFlag]) -> Result<(),
 }
 
 /// 開いた namespace の fd へ `setns(2)` で参加する（`flag` は fd の種別と一致していること。不一致はカーネルが
-/// `EINVAL`）。pod の user・ipc namespace の join 専用（CRI-2・CORE-3・SEC-1・SEC-5。#2674）。
+/// `EINVAL`）。pod の user・ipc namespace の join（CRI-2・CORE-3・SEC-1・SEC-5。#2674）と、pod の共有 `/dev/shm` の
+/// 複製のための mount namespace の往復（`crate::exec::pod_shm`。#4822）が使う。
 ///
-/// 呼び出しは `crate::exec` の join 分離のみで、`Threads: 1` の中間プロセス（fork 子）から呼ぶ。
+/// 呼び出しは `crate::exec` の join 分離と pod shm の複製のみ。join は `Threads: 1` の中間プロセス（fork 子）から呼ぶ。
 /// `NsFlag::User` は単一スレッドで `fs_struct` を共有しないことを要する（満たさなければ `EINVAL`）。
+/// `NsFlag::Mount` の `setns` は呼び出しスレッドの root と cwd を対象 ns の root へ置き換える副作用がある。呼び出し側は
+/// 往復の後に `/` の素性を往復前と照合し、cwd を戻す（`exec::pod_shm::clone_from_holder`）。
 pub(crate) fn setns_fd(fd: BorrowedFd<'_>, flag: NsFlag) -> Result<(), SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
@@ -3448,7 +3451,8 @@ const fn open_tree_bind_flags(scope: MountTreeScope) -> u32 {
 }
 
 /// `src`（[`verify_bind_source_fd`] が確かめた bind mount 元）を、切り離したマウントとして複製する
-/// （`open_tree(2)` + `OPEN_TREE_CLONE`。利用者指定の bind mount〔`mounts[]`〕用。CORE-1・SEC-1・REPAIR-2・
+/// （`open_tree(2)` + `OPEN_TREE_CLONE`。利用者指定の bind mount〔`mounts[]`〕と、pod の共有 `/dev/shm` の複製
+/// 〔`exec::pod_shm`。保持役の mount namespace へ入った状態で呼ぶ。CRI-2・#4822〕用。CORE-1・SEC-1・REPAIR-2・
 /// TASK-29 追補・#1912。呼び出し元は適用の段〔#1913〕）。
 ///
 /// 戻り値は未接続のマウントを指す close-on-exec の fd で、途中で失敗して drop すればカーネルが破棄する。

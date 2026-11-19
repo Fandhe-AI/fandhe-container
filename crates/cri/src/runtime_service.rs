@@ -146,7 +146,7 @@ use tonic::{Request, Response, Status};
 
 use crate::bundle::{AppliedUser, ResolvedImage, resolve_log_path};
 use crate::error::{CriError, CriErrorCode};
-use fandhe_container_core::traits::{ContainerLogPath, StdinMode};
+use fandhe_container_core::traits::{ContainerLogPath, PodShmSource, StdinMode};
 
 use crate::adapter::{
     BundleProvider, BundleRequest, PodHolder, PodNamespaceHolderProvider, PodNetns,
@@ -3527,19 +3527,61 @@ impl CriRuntimeService {
         Ok(())
     }
 
-    /// 記録から StartContainer の入力（CRI ログの書き先と stdin の扱い）を 1 回のロックで取り出す。
+    /// 記録から StartContainer の入力（CRI ログの書き先・stdin の扱い・pod の `/dev/shm`）を 1 回のロックで取り出す。
     ///
     /// 書き先は保持時に検証済み（無ければ `None`）。stdin の扱いは config の `tty`・`stdin`・`stdin_once` から導く
-    /// （tty なら `Closed`。CRI-6・#4076）。記録が無い場合は `(None, Closed)`。
-    fn start_inputs(&self, id: &str) -> Result<(Option<ContainerLogPath>, StdinMode), CriError> {
+    /// （tty なら `Closed`。CRI-6・#4076）。記録が無い場合は `(None, Closed, None)`。
+    ///
+    /// pod shm は、実効の ipc が `POD` で CRI mounts に `/dev/shm` が無いとき（`shares_pod_shm`）だけ、自 sandbox の
+    /// 保持役の pid と素性（READY の shm）を同じ `PodHolder` から 1 式で取って作る（別 sandbox の取り違えを作らない。
+    /// #2776）。provider を注入済みで保持役が無ければ `FAILED_PRECONDITION`（Create と同じ規則。Start と Stop の競合で
+    /// 共有なしへ縮退させない）。素性なしの保持役・provider なしの構成は共有しない（`None`）。CRI-2・CORE-3・SEC-1・#4823。
+    fn start_inputs(
+        &self,
+        id: &str,
+    ) -> Result<(Option<ContainerLogPath>, StdinMode, Option<PodShmSource>), CriError> {
         let registry = self
             .registry
             .lock()
             .map_err(|_| CriError::internal("sandbox registry is unavailable"))?;
-        Ok(registry.containers.get(id).map_or_else(
-            || (None, StdinMode::Closed),
-            |r| (r.resolved_log_path.clone(), r.start_stdin_mode()),
-        ))
+        let Some(r) = registry.containers.get(id) else {
+            return Ok((None, StdinMode::Closed, None));
+        };
+        let pod_shm = match registry.records.get(&r.pod_sandbox_id) {
+            Some(sandbox) if crate::bundle::spec::shares_pod_shm(&sandbox.config, &r.config) => {
+                match (&sandbox.pod_holder, self.pod_holder.is_some()) {
+                    (Some(h), _) => match h.identity() {
+                        Some(identity) => {
+                            let shm = identity.shm();
+                            let path = std::path::PathBuf::from(format!(
+                                "/proc/{}/ns/mnt",
+                                identity.pid().get()
+                            ));
+                            Some(PodShmSource::new(path, shm.dev, shm.ino).map_err(|_| {
+                                CriError::failed_precondition("sandbox holder is unavailable")
+                            })?)
+                        }
+                        None => None,
+                    },
+                    (None, true) => {
+                        return Err(CriError::failed_precondition(
+                            "sandbox holder is unavailable",
+                        ));
+                    }
+                    (None, false) => None,
+                }
+            }
+            // sandbox の記録が無い場合。`begin_start` が同じ記録の存在を先に確かめる（無ければ `INTERNAL`）ため通常は届かない。
+            // 届いたら「共有の条件に当たらない」と区別し、黙って共有なしへ縮退せず拒否する（#4823）。
+            None => {
+                return Err(CriError::failed_precondition(
+                    "sandbox record is unavailable",
+                ));
+            }
+            // 共有の条件に当たらない（ipc が POD でない・`/dev/shm` の mount あり）。
+            Some(_) => None,
+        };
+        Ok((r.resolved_log_path.clone(), r.start_stdin_mode(), pod_shm))
     }
 
     /// 実行層接続時の `StartContainer`（TASK-59.2・CRI-2）。
@@ -3557,7 +3599,7 @@ impl CriRuntimeService {
         let mut guard =
             InFlightGuard::new(Arc::clone(&self.registry), id.clone(), InFlightKind::Start);
         // 書き先の取得に失敗しても、実行層を呼ぶ前なので guard の破棄で created へ戻る。
-        let (log_path, stdin) = self.start_inputs(&id)?;
+        let (log_path, stdin, pod_shm) = self.start_inputs(&id)?;
         let adapter = binding.adapter.clone();
         let timeout = self.runtime_timeout;
         let record_store = self.record_store.clone();
@@ -3567,7 +3609,7 @@ impl CriRuntimeService {
             guard.arm_record_store(record_store);
             // 専用スレッドの起動に失敗した場合は未送信なので、送信の直前に結果不明へ倒す。
             guard.mark_dispatched();
-            let status = match adapter.start_with_options(&id, log_path, stdin) {
+            let status = match adapter.start_with_pod_shm(&id, log_path, stdin, pod_shm) {
                 Ok(status) => status,
                 Err(status) => {
                     // 確定失敗のコードに限り created へ戻す。タイムアウト・Unavailable・Internal 等は
@@ -5670,6 +5712,61 @@ mod tests {
         assert_eq!(err.code(), CriErrorCode::FailedPrecondition);
         assert_eq!(svc.container_count(), 0);
         assert_eq!(svc.container_retained_bytes(), bytes_before);
+    }
+
+    /// CRI-2・CORE-3・SEC-1・#4823: provider を注入済みで sandbox の記録に保持役が無いと、`/dev/shm` を共有する条件の
+    /// コンテナの Start の入力は `FAILED_PRECONDITION`（共有なしへ縮退しない）。素性つきなら READY の値で作り、
+    /// 共有の条件に当たらないコンテナ（ipc `CONTAINER`）は保持役が無くても `None`。
+    #[test]
+    fn cri2_4823_start_inputs_pod_shm_follows_the_sandbox_holder() {
+        let mut svc = CriRuntimeService::new();
+        let a = run(&svc, Some(config("a")), "")
+            .unwrap()
+            .into_inner()
+            .pod_sandbox_id;
+        svc.pod_holder = Some(Arc::new(AliveHolder));
+        let shared = svc
+            .reserve_container(create_req_for(&a, "c"), false)
+            .unwrap();
+        let mut private_req = create_req_for(&a, "p");
+        if let Some(cfg) = private_req.config.as_mut() {
+            cfg.linux = Some(v1::LinuxContainerConfig {
+                security_context: Some(v1::LinuxContainerSecurityContext {
+                    namespace_options: Some(v1::NamespaceOption {
+                        ipc: v1::NamespaceMode::Container as i32,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        }
+        let private = svc.reserve_container(private_req, false).unwrap();
+        let err = svc.start_inputs(&shared.container_id).unwrap_err();
+        assert_eq!(err.code(), CriErrorCode::FailedPrecondition);
+        assert!(svc.start_inputs(&private.container_id).unwrap().2.is_none());
+
+        let ns = |dev, ino| crate::adapter::NamespaceIdentity { dev, ino };
+        let identity = crate::adapter::HolderIdentity::new(
+            4242,
+            1,
+            ns(4, 11),
+            ns(4, 12),
+            ns(4, 13),
+            ns(48, 2),
+        )
+        .unwrap();
+        svc.registry
+            .lock()
+            .unwrap()
+            .records
+            .get_mut(&a)
+            .unwrap()
+            .pod_holder = Some(PodHolder::from_identity(identity));
+        let src = svc.start_inputs(&shared.container_id).unwrap().2.unwrap();
+        assert_eq!(src.path(), std::path::Path::new("/proc/4242/ns/mnt"));
+        assert_eq!(src.identity(), (48, 2));
+        assert!(svc.start_inputs(&private.container_id).unwrap().2.is_none());
     }
 
     fn run(

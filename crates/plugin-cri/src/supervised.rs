@@ -67,7 +67,7 @@ use fandhe_container_core::state_store::STATE_LOCK_TIMEOUT;
 use fandhe_container_core::traits::WaitExitRequest;
 use fandhe_container_core::traits::{
     ContainerId, ContainerLogPath, ContainerState, ContainerStatus, ErrorCode, GetStateRequest,
-    KillRequest, Signal, StateStore, StdinMode, StopRequest, TraitError,
+    KillRequest, PodShmSource, Signal, StateStore, StdinMode, StopRequest, TraitError,
 };
 use fandhe_container_supervisor::control::protocol::MAX_EXIT_WATCH_HOLD;
 use fandhe_container_supervisor::control::{
@@ -423,11 +423,26 @@ impl SupervisedLifecycle {
         log_path: Option<&ContainerLogPath>,
         stdin: StdinMode,
     ) -> Result<ContainerStatus, TraitError> {
+        self.start_with_pod_shm(store, id, log_path, stdin, None)
+    }
+
+    /// [`Self::start`] に pod の `/dev/shm` の指定元（`StartRequest::pod_shm`）を足して起動する。supervisor へ `--pod-shm` で
+    /// 渡し、supervisor が launcher の指定として core の start へ運ぶ（特権ランチャー経由では supervisor が拒否する。
+    /// CRI-2・CORE-3・SEC-1・#4823）。`None` は [`Self::start`] と同じ。
+    pub fn start_with_pod_shm(
+        &self,
+        store: &dyn StateStore,
+        id: &ContainerId,
+        log_path: Option<&ContainerLogPath>,
+        stdin: StdinMode,
+        pod_shm: Option<&PodShmSource>,
+    ) -> Result<ContainerStatus, TraitError> {
         // 追跡枠の予約より前に対応づける。失敗したら何も起動しない。
         let stdin = stdin_option(stdin)?;
         let opts = StartOptions::new()
             .with_cri_log_path(log_path)
-            .with_stdin(stdin);
+            .with_stdin(stdin)
+            .with_pod_shm(pod_shm);
         self.reap();
         let Some(root) = store.host_state_root() else {
             return Err(TraitError::new(

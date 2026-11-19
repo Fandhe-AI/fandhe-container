@@ -67,7 +67,7 @@ impl PodNamespaceHolderProvider for PerSandboxHolder {
             return Ok(PodHolder::new(pid.try_into().unwrap()));
         }
         let ns = |ino| NamespaceIdentity { dev: 4, ino };
-        let identity = HolderIdentity::new(pid, 1, ns(11), ns(12), ns(13))
+        let identity = HolderIdentity::new(pid, 1, ns(11), ns(12), ns(13), shm_id())
             .and_then(|i| i.with_pid_ns(ns(14)))
             .unwrap();
         Ok(PodHolder::from_identity(identity))
@@ -149,18 +149,38 @@ impl BundleProvider for RecordingBundles {
     }
 }
 
+/// pod の `/dev/shm` の tmpfs の素性（READY の shm。dev は nsfs〔4〕と違う）。
+fn shm_id() -> NamespaceIdentity {
+    NamespaceIdentity { dev: 48, ino: 2 }
+}
+
+/// `start` が受けた pod_shm の `(パス, dev, ino)`。
+type SeenShm = Option<(String, u64, u64)>;
+
 #[derive(Default)]
-struct StubRuntime(Mutex<HashMap<String, ()>>);
+struct StubRuntime {
+    created: Mutex<HashMap<String, ()>>,
+    /// `start` が受けた要求の `(コンテナ ID, pod_shm の (パス, dev, ino))`（#4823）。
+    starts: Mutex<Vec<(String, SeenShm)>>,
+}
 
 impl ContainerRuntime for StubRuntime {
     fn create(&self, r: &CreateRequest) -> Result<ContainerStatus, TraitError> {
-        self.0
+        self.created
             .lock()
             .unwrap()
             .insert(r.id().as_str().to_owned(), ());
         Ok(ContainerStatus::created(r.id().clone(), None))
     }
-    fn start(&self, _: &StartRequest) -> Result<ContainerStatus, TraitError> {
+    fn start(&self, r: &StartRequest) -> Result<ContainerStatus, TraitError> {
+        self.starts.lock().unwrap().push((
+            r.id().as_str().to_owned(),
+            r.pod_shm().map(|p| {
+                let (dev, ino) = p.identity();
+                (p.path().to_string_lossy().into_owned(), dev, ino)
+            }),
+        ));
+        // 起動した結果は使わない（受けた要求だけを見る）。
         Err(TraitError::new(ErrorCode::Unimplemented, "not used"))
     }
     fn kill(&self, _: &KillRequest) -> Result<ContainerStatus, TraitError> {
@@ -170,11 +190,11 @@ impl ContainerRuntime for StubRuntime {
         Ok(ContainerStatus::stopped(r.id().clone(), Some(0)))
     }
     fn delete(&self, r: &DeleteRequest) -> Result<DeleteResponse, TraitError> {
-        self.0.lock().unwrap().remove(r.id().as_str());
+        self.created.lock().unwrap().remove(r.id().as_str());
         Ok(DeleteResponse::new())
     }
     fn state(&self, r: &StateRequest) -> Result<ContainerStatus, TraitError> {
-        if self.0.lock().unwrap().contains_key(r.id().as_str()) {
+        if self.created.lock().unwrap().contains_key(r.id().as_str()) {
             Ok(ContainerStatus::created(r.id().clone(), None))
         } else {
             Err(TraitError::new(ErrorCode::NotFound, "no such container"))
@@ -255,17 +275,28 @@ fn service(
     bundles: &Arc<RecordingBundles>,
     with_holder: bool,
 ) -> CriRuntimeService {
+    service_with(
+        holder,
+        bundles,
+        with_holder,
+        Arc::new(StubRuntime::default()),
+    )
+}
+
+fn service_with(
+    holder: &Arc<PerSandboxHolder>,
+    bundles: &Arc<RecordingBundles>,
+    with_holder: bool,
+    runtime: Arc<StubRuntime>,
+) -> CriRuntimeService {
     let svc = CriRuntimeService::new();
     let svc = if with_holder {
         svc.with_pod_holder(holder.clone())
     } else {
         svc
     };
-    svc.with_runtime(
-        RuntimeAdapter::new(Arc::new(StubRuntime::default())),
-        bundles.clone(),
-    )
-    .with_runtime_timeout(Duration::from_secs(5))
+    svc.with_runtime(RuntimeAdapter::new(runtime), bundles.clone())
+        .with_runtime_timeout(Duration::from_secs(5))
 }
 
 fn paths(pid: u32) -> (String, String) {
@@ -427,4 +458,158 @@ async fn cri2_4817_pid_is_joined_only_when_the_holder_has_a_pid_namespace() {
         Some(format!("/proc/{}/ns/pid_for_children", holder.pid_of(&shared)).as_str())
     );
     assert_eq!(seen[1].ipc_path, Some(paths(holder.pid_of(&shared)).1));
+}
+
+/// コンテナの ipc と mounts を指定して作る（#4823）。
+async fn create_shm_case(
+    svc: &CriRuntimeService,
+    sandbox: &str,
+    name: &str,
+    ipc: Option<v1::NamespaceMode>,
+    shm_mount: bool,
+) -> String {
+    let linux = ipc.map(|mode| v1::LinuxContainerConfig {
+        security_context: Some(v1::LinuxContainerSecurityContext {
+            namespace_options: Some(v1::NamespaceOption {
+                ipc: mode as i32,
+                // ipc を join しない構成では pid・network の `POD` は `UNIMPLEMENTED` になるため、合わせて pod にしない。
+                pid: v1::NamespaceMode::Container as i32,
+                network: v1::NamespaceMode::Container as i32,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    let mounts = if shm_mount {
+        let host = std::env::temp_dir().join("fc-4823-shm-src");
+        vec![v1::Mount {
+            container_path: "/dev/shm".into(),
+            host_path: host.to_string_lossy().into_owned(),
+            ..Default::default()
+        }]
+    } else {
+        Vec::new()
+    };
+    RuntimeService::create_container(
+        svc,
+        Request::new(v1::CreateContainerRequest {
+            pod_sandbox_id: sandbox.into(),
+            config: Some(ContainerConfig {
+                metadata: Some(ContainerMetadata {
+                    name: name.into(),
+                    attempt: 0,
+                }),
+                image: Some(ImageSpec {
+                    image: "busybox:1.36".into(),
+                    ..Default::default()
+                }),
+                command: vec!["/bin/sleep".into(), "30".into()],
+                linux,
+                mounts,
+                ..Default::default()
+            }),
+            sandbox_config: None,
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner()
+    .container_id
+}
+
+async fn start(svc: &CriRuntimeService, id: &str) -> Result<(), tonic::Status> {
+    RuntimeService::start_container(
+        svc,
+        Request::new(v1::StartContainerRequest {
+            container_id: id.into(),
+        }),
+    )
+    .await
+    .map(|_| ())
+}
+
+/// CRI-2・CORE-3・SEC-1・#4823: ipc `POD`（既定）で `/dev/shm` の mount が無いコンテナの Start は、自 sandbox の保持役の
+/// pid の mnt namespace と READY の shm の素性を渡す（config の user の path の pid と一致）。別 sandbox の値は出ない。
+#[tokio::test]
+async fn cri2_4823_start_passes_own_holder_pod_shm_only() {
+    let holder = PerSandboxHolder::new();
+    *holder.share_pid.lock().unwrap() = true;
+    let bundles = Arc::new(RecordingBundles::default());
+    let rt = Arc::new(StubRuntime::default());
+    let svc = service_with(&holder, &bundles, true, rt.clone());
+    let a = run(&svc, "a").await;
+    let b = run(&svc, "b").await;
+    let (pid_a, pid_b) = (holder.pid_of(&a), holder.pid_of(&b));
+    assert_ne!(pid_a, pid_b);
+    let ca = create_shm_case(&svc, &a, "ca", None, false).await;
+    let cb = create_shm_case(&svc, &b, "cb", None, false).await;
+    for id in [&ca, &cb] {
+        let _ = start(&svc, id).await;
+    }
+    let starts = rt.starts.lock().unwrap().clone();
+    assert_eq!(starts.len(), 2);
+    for (id, pid) in [(&ca, pid_a), (&cb, pid_b)] {
+        let got = starts.iter().find(|(i, _)| i == id).unwrap();
+        assert_eq!(
+            got.1,
+            Some((format!("/proc/{pid}/ns/mnt"), 48, 2)),
+            "container {id}"
+        );
+    }
+    // config の user の path の pid と同じ保持役から作られている。
+    for s in bundles.seen() {
+        let own = if s.sandbox_id == a { pid_a } else { pid_b };
+        assert_eq!(s.user_path, Some(format!("/proc/{own}/ns/user")));
+    }
+}
+
+/// CRI-2・SEC-1・#4823: 共有の条件に当たらないコンテナには pod shm を渡さない。`/dev/shm` の mount あり・ipc
+/// `CONTAINER`・provider なし・素性なしの保持役（pid を共有しない構成の `PodHolder::new`）。
+#[tokio::test]
+async fn cri2_4823_start_passes_no_pod_shm_outside_the_condition() {
+    // 素性つきの保持役・provider あり: mount あり・ipc CONTAINER。
+    let holder = PerSandboxHolder::new();
+    *holder.share_pid.lock().unwrap() = true;
+    let bundles = Arc::new(RecordingBundles::default());
+    let rt = Arc::new(StubRuntime::default());
+    let svc = service_with(&holder, &bundles, true, rt.clone());
+    let a = run(&svc, "a").await;
+    let with_mount = create_shm_case(&svc, &a, "m", None, true).await;
+    let container_ipc =
+        create_shm_case(&svc, &a, "c", Some(v1::NamespaceMode::Container), false).await;
+    for id in [&with_mount, &container_ipc] {
+        let _ = start(&svc, id).await;
+    }
+    // provider なし。
+    let holder2 = PerSandboxHolder::new();
+    let rt2 = Arc::new(StubRuntime::default());
+    let svc2 = service_with(
+        &holder2,
+        &Arc::new(RecordingBundles::default()),
+        false,
+        rt2.clone(),
+    );
+    let b = run(&svc2, "b").await;
+    let no_provider = create_shm_case(&svc2, &b, "n", None, false).await;
+    let _ = start(&svc2, &no_provider).await;
+    // 素性なしの保持役（share_pid 偽）。
+    let holder3 = PerSandboxHolder::new();
+    let rt3 = Arc::new(StubRuntime::default());
+    let svc3 = service_with(
+        &holder3,
+        &Arc::new(RecordingBundles::default()),
+        true,
+        rt3.clone(),
+    );
+    let c = run(&svc3, "c").await;
+    let no_identity = create_shm_case(&svc3, &c, "i", None, false).await;
+    let _ = start(&svc3, &no_identity).await;
+
+    for rt in [&rt, &rt2, &rt3] {
+        let starts = rt.starts.lock().unwrap().clone();
+        assert!(!starts.is_empty());
+        assert!(starts.iter().all(|(_, shm)| shm.is_none()), "{starts:?}");
+    }
+    assert_eq!(rt.starts.lock().unwrap().len(), 2);
 }

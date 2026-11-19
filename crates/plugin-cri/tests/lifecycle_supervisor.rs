@@ -65,6 +65,11 @@ if [ "$4" = "--stdin" ]; then
   printf '%s\n' "$*" > "$R/stdin-arg"
   printf 'FCSUP1 OK 4242\n'; exec sleep 3
 fi
+if [ "$4" = "--pod-shm" ]; then
+  shift 4
+  printf '%s\n' "$*" > "$R/pod-shm-arg"
+  printf 'FCSUP1 OK 4242\n'; exec sleep 3
+fi
 case "$4" in
   c-ok) printf 'FCSUP1 OK 4242\n'; exec sleep 3;;
   c-err) printf 'FCSUP1 ERR FAILED_PRECONDITION 5 container is not created\n'; exit 0;;
@@ -404,6 +409,27 @@ fn cri6_start_passes_stdin_to_supervisor_argv() {
     let req = StartRequest::new(cid("c-ok")).with_stdin(StdinMode::Closed);
     h.rt.start(&req).expect("start");
     assert!(!root.join("stdin-arg").exists());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// CRI-2・CORE-3・SEC-1・#4823: `StartRequest::pod_shm` は supervisor の argv `--pod-shm <dev>:<ino>:<パス> <id>` として渡り、
+/// 無ければ `--pod-shm` を載せない。
+#[test]
+fn cri2_4823_start_passes_pod_shm_to_supervisor_argv() {
+    use fandhe_container_core::traits::PodShmSource;
+    let root = temp_root("podshm");
+    let h = harness(Sim::running_in(root.clone(), "c-shm", 4242), LONG);
+    let src = PodShmSource::new(PathBuf::from("/proc/4242/ns/mnt"), 48, 2).expect("source");
+    let req = StartRequest::new(cid("c-shm")).with_pod_shm(src);
+    h.rt.start(&req).expect("start");
+    let seen = std::fs::read_to_string(root.join("pod-shm-arg")).expect("fake supervisor argv");
+    assert_eq!(seen, "48:2:/proc/4242/ns/mnt c-shm\n");
+    let _ = std::fs::remove_dir_all(&root);
+
+    let root = temp_root("podshmnone");
+    let h = harness(Sim::running_in(root.clone(), "c-ok", 4242), LONG);
+    h.rt.start(&StartRequest::new(cid("c-ok"))).expect("start");
+    assert!(!root.join("pod-shm-arg").exists());
     let _ = std::fs::remove_dir_all(&root);
 }
 

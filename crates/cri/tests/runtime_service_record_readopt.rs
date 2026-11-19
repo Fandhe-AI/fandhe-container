@@ -472,8 +472,14 @@ impl PodNamespaceHolderProvider for IdentityHolder {
     fn spawn(&self, _req: &PodHolderRequest<'_>) -> Result<PodHolder, CriError> {
         *self.spawns.lock().unwrap() += 1;
         if self.with_identity {
-            let id =
-                HolderIdentity::new(4242, 123456, ns(4026531837), ns(4026531839), ns(4026531840))?;
+            let id = HolderIdentity::new(
+                4242,
+                123456,
+                ns(4026531837),
+                ns(4026531839),
+                ns(4026531840),
+                NamespaceIdentity { dev: 48, ino: 2 },
+            )?;
             Ok(PodHolder::from_identity(id))
         } else {
             Ok(PodHolder::new(4242.try_into().unwrap()))

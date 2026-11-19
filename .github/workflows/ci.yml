@@ -3242,6 +3242,13 @@ jobs:
             --src crates/plugin-cri/tests/cri_exec_real.rs --log "${log}" \
             --select '^production_binary_exec_real: pod-pid ok: ' --min 5 \
             --forbid 'PRECONDITION FAILED' --forbid 'pod-pid FAILED' --summary
+          # 段 M（#4823・CRI-2・CORE-3・SEC-1・SEC-5）: pod の /dev/shm の共有（兄弟間の往復・保持役の tmpfs との一致と
+          # ノード・別 pod との不一致・/dev/shm の mount を持つコンテナの非共有）の 3 行と、termination-log の bind への
+          # exec の書き込みの 1 行を試験ソースから導出して照合する。pull・ステップ数・期限は変えない。
+          scripts/check-success-lines.sh --name production_binary_exec_real_pod_shm \
+            --src crates/plugin-cri/tests/cri_exec_real.rs --log "${log}" \
+            --select '^production_binary_exec_real: (pod-shm|termination-log) ok: ' --min 4 \
+            --forbid 'PRECONDITION FAILED' --forbid 'pod-shm FAILED' --summary
 
       # production_binary_attach_real（`crates/plugin-cri/tests/cri_attach_real.rs`。libtest の `#[ignore]`。
       # CRI-6・SUP-4・SEC-1・REPAIR-12・#4079）: 本番バイナリ越しに実コンテナ（busybox）へ完全版 Attach を通し、

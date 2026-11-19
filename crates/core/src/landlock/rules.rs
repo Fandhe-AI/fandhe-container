@@ -913,7 +913,8 @@ mod tests {
     }
 
     /// CORE-5・#1911: bind mount の `ro`/`rw`・`noexec`/`exec` の解釈が `BindMountSet` と一致する。
-    /// `/dev` 配下の宛先は bind が拒否するため `IOCTL_DEV` 分岐は食い違わない。
+    /// `/dev` 配下の宛先は許可リストの 2 つだけ（#4888）でここの対象外。`IOCTL_DEV` 分岐は `/dev` 配下の bind の試験
+    /// （`cri2_4888_dev_binds_add_mount_rules_without_narrowing`）が別に照合する。
     #[test]
     fn core5_landlock_bind_interpretation_matches() {
         use crate::oci_runtime::BindMountSet;
@@ -1362,6 +1363,77 @@ mod tests {
         let s = evaluate_abi(6).expect("abi6");
         let binds = BindMountSet::from_mounts(c.mounts()).expect("bind accepted");
         build_path_rules_with_user_tmpfs(&s, c.root(), c.mounts(), &[], implicit, &binds)
+    }
+
+    /// CRI-2・OCI-4・SEC-1・CORE-5（#4888）: `/dev/shm`（ディレクトリ）と `/dev/termination-log`（ファイル）の bind は
+    /// `WithoutShm` の下で `Mount{index}` の規則を足す。Landlock は `/dev` 配下の bind を狭めない（祖先の `/dev` の規則が
+    /// 既に読み書きと `IOCTL_DEV` を持つ）。options に `nodev` が無い手書き bundle では bind の規則にも `IOCTL_DEV` が入るが
+    /// 祖先と同じで広がらず、SEC-1 は VFS の `nosuid`・`nodev` と識別子の照合が担う。暗黙の `/dev/shm`（`All`）との併用は
+    /// `ImplicitMountConflict`。`ro` の bind は `ReadOnlyBind` として記録して受ける。
+    #[test]
+    fn cri2_4888_dev_binds_add_mount_rules_without_narrowing() {
+        let mounts = json!([
+            {"destination": "/dev/shm", "type": "bind", "source": "/srv/shm", "options": ["rbind"]},
+            {"destination": "/dev/termination-log", "type": "bind", "source": "/srv/t", "options": ["bind"]},
+        ]);
+        let rw = AccessFs::READ
+            .union(AccessFs::WRITE)
+            .union(AccessFs::IOCTL_DEV);
+        for readonly_root in [false, true] {
+            let c = cfg(readonly_root, mounts.clone());
+            let rs = build_verified(&c, ImplicitDevMounts::WithoutShm).expect("rules");
+            let got: Vec<(&str, RuleOrigin)> = rs
+                .rules()
+                .iter()
+                .map(|r| (r.path.as_str(), r.origin))
+                .collect();
+            assert_eq!(
+                got,
+                vec![
+                    ("/", RuleOrigin::Root),
+                    (
+                        "/dev",
+                        RuleOrigin::Implicit {
+                            mount: ImplicitDevMount::Dev
+                        }
+                    ),
+                    (
+                        "/dev/pts",
+                        RuleOrigin::Implicit {
+                            mount: ImplicitDevMount::DevPts
+                        }
+                    ),
+                    ("/dev/shm", RuleOrigin::Mount { index: 0 }),
+                    ("/dev/termination-log", RuleOrigin::Mount { index: 1 }),
+                ],
+                "readonly_root={readonly_root}"
+            );
+            for p in ["/dev/shm", "/dev/termination-log"] {
+                let allowed = rule(&rs, p).allowed;
+                assert!(allowed.contains(AccessFs::WRITE), "{p}");
+                assert!(allowed.contains(AccessFs::IOCTL_DEV), "{p}");
+                assert!(allowed.is_subset_of(rw.union(AccessFs::EXECUTE)), "{p}");
+            }
+        }
+        let c = cfg(false, mounts);
+        let e = build_verified(&c, ImplicitDevMounts::All).expect_err("implicit conflict");
+        assert_eq!(
+            e.kind,
+            LandlockRuleErrorKind::ImplicitMountConflict { index: 0 }
+        );
+        let ro = cfg(
+            false,
+            json!([{"destination": "/dev/shm", "type": "bind", "source": "/srv/shm", "options": ["rbind", "ro"]}]),
+        );
+        let rs = build_verified(&ro, ImplicitDevMounts::WithoutShm).expect("ro bind");
+        assert!(
+            rs.shadowed()
+                .iter()
+                .any(|s| s.backing == ShadowBacking::ReadOnlyBind { index: 0 }
+                    && s.path.as_str() == "/dev/shm"),
+            "{:?}",
+            rs.shadowed()
+        );
     }
 
     fn ro_bind(opts: Value) -> Value {

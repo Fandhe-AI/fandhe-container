@@ -102,6 +102,7 @@ use std::num::NonZeroU32;
 use serde::Serialize;
 
 use fandhe_container_core::capabilities::{CapabilityResolveError, resolve_add_drop};
+use fandhe_container_core::oci_runtime::is_reserved_bind_destination;
 use fandhe_container_core::path_masks::normalize_container_path;
 use fandhe_container_core::sysctl::{
     SYSCTL_MAX_ENTRIES, SysctlError, SysctlKey, SysctlNamespace, SysctlValue,
@@ -800,19 +801,17 @@ fn overlaps(a: &str, b: &str) -> bool {
 }
 
 /// bind mount 間・保護パスとの関係を core の `BindMountSet` と同じ条件で検証する
-/// （予約先 `/proc`・`/sys`・`/dev` 配下、重複・入れ子、保護パスとの重なりを拒否。OCI-4・SEC-1）。
+/// （予約先 `/proc`・`/sys`・`/dev` 配下の判定は core の `is_reserved_bind_destination` に委ね、
+/// 許可リスト `/dev/termination-log`・`/dev/shm` の完全一致だけ通す。重複・入れ子、保護パスとの重なりを拒否。
+/// kubelet 既定の mount を受ける。CRI-2・OCI-4・SEC-1・#4888）。
 fn check_mount_set(
     mounts: &[MountOut<'_>],
     masked: &[&str],
     readonly: &[&str],
 ) -> Result<(), CriError> {
-    const RESERVED: [&str; 3] = ["/proc", "/sys", "/dev"];
     for (i, m) in mounts.iter().enumerate() {
         let d = m.destination;
-        if RESERVED
-            .iter()
-            .any(|r| overlaps(d, r) && d.len() >= r.len())
-        {
+        if is_reserved_bind_destination(d) {
             return Err(invalid("mounts.container_path"));
         }
         if mounts

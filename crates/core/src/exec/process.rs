@@ -2908,12 +2908,13 @@ trait PrePivotOps {
         prepared: &Self::Prepared,
         mounts: &EtcFileMounts,
     ) -> Result<(), ExecError>;
-    /// 検証済みの bind mount の適用。`/dev` とその配下は宛先にできない（`RESERVED_DESTINATIONS`）ため、
-    /// `mount_tmpfs` と違い `/dev` の作成順の証跡（`Devices`）は受けない（#1914）。
+    /// 検証済みの bind mount の適用。`/dev` 自身は宛先にできないが、許可リストの `/dev/termination-log`・`/dev/shm`（#4888）は
+    /// 受けるため、`mount_tmpfs` と同じく `/dev` の作成順の証跡（`Devices`）を受ける（`/dev/` 配下の宛先があるときだけ照合する）。
     fn mount_binds(
         &self,
         isolation: &Self::Isolation,
         prepared: &Self::Prepared,
+        devices: &Self::Devices,
         set: &BindMountSet,
     ) -> Result<(), ExecError>;
     fn apply_readonly_paths(
@@ -3180,9 +3181,10 @@ impl PrePivotOps for RealPrePivotOps {
         &self,
         isolation: &MountIsolation,
         prepared: &PreparedRootfs,
+        devices: &DeviceSet,
         set: &BindMountSet,
     ) -> Result<(), ExecError> {
-        let report = super::mount_binds(isolation, prepared, set)?;
+        let report = super::mount_binds(isolation, prepared, Some(&devices.report), set)?;
         for outcome in &report.mounts {
             self.record(
                 prepared,
@@ -3335,6 +3337,24 @@ fn check_no_tmpfs_under_dev_shm(tmpfs: Option<&TmpfsMountSet>) -> Result<(), Exe
     Ok(())
 }
 
+/// pod の共有 `/dev/shm` を載せる起動で、宛先が `/dev/shm` の bind が残っていれば拒否する（多重防御。launcher が先に拒否する。
+/// pod の共有の定義を bind で黙って差し替えない。CRI-2・OCI-4・SEC-1・#4888）。
+fn check_no_bind_at_dev_shm(binds: Option<&BindMountSet>) -> Result<(), ExecError> {
+    let clash = binds.is_some_and(|set| {
+        set.mounts()
+            .iter()
+            .any(|m| m.destination().as_str() == "/dev/shm")
+    });
+    if clash {
+        return Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            IsolationStage::MountBinds,
+            "a bind mount at /dev/shm cannot be combined with a pod shared /dev/shm",
+        ));
+    }
+    Ok(())
+}
+
 /// 端末つき起動の init の console の要求(`process.terminal: true`)。`owner` は `process.user` の uid(0/0 以外のときだけ)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ConsoleRequest {
@@ -3361,13 +3381,14 @@ fn run_pre_pivot<O: PrePivotOps>(
 ///
 /// `inject_files` の直後・`readonly_paths` の前に置く。理由:
 ///
-/// 1. 重なりは型と検査で除外済み。宛先は `/`・`/proc`・`/sys`・`/dev` とその配下になれず（`BindMountSet`）、
+/// 1. 重なりは型と検査で除外済み。宛先は `/`・`/proc`・`/sys`・`/dev` とその配下になれず（許可リストの `/dev/termination-log`・`/dev/shm` を除く。`BindMountSet`）、
 ///    tmpfs・注入・config の保護パスとの同一・祖先・子孫も拒否する（段の先頭の [`check_bind_overlaps`]）。
 ///    よって tmpfs と bind mount の入れ子は、どちら向きも受けない。
 /// 2. rootfs へ作成を伴う段（tmpfs のマウント先・注入の親ディレクトリ）は bind mount より前に置く。逆順で検査漏れが
 ///    あると、利用者の bind mount の中へホスト側のディレクトリ・ファイルを作ってしまう。この順なら失敗は「隠れる」側に倒れる。
 /// 3. 常に効く保護（`readonly_paths`・`masked_paths`）を最後に置き、上流の検査漏れがあっても固定の保護が最後に載る。
-/// 4. `/dev` 系は宛先になれないため、`mount_tmpfs` のような `/dev` の作成順の証跡（`DeviceReport`）は要らない。
+/// 4. `/dev/` 配下は許可リストの `/dev/termination-log`・`/dev/shm` だけが宛先になれる（#4888）。`mount_tmpfs` と同じく `/dev` の作成順の証跡
+///    （`DeviceReport`）を渡し、`create_default_devices` の後であることを段が照合する。
 /// 5. OCI の「`mounts` は列挙順に適用」は、bind 以外を拒否し `mount_binds` が指定順に適用することで守る。他の段とは
 ///    重ならないため、順序を入れ替えても木は同じになる。
 ///
@@ -3456,6 +3477,7 @@ fn run_pre_pivot_with_console<O: PrePivotOps>(
             // 多重防御: launcher が除いているはずの `/dev/shm`（配下を含む）の tmpfs が残っていれば、副作用の前に拒否する
             // （pod の共有の定義を黙って差し替える・載せた共有の上に別のマウントを重ねるのを防ぐ。#4822）。
             check_no_tmpfs_under_dev_shm(setup.tmpfs).map_err(StepError::at(S::MountTmpfs))?;
+            check_no_bind_at_dev_shm(setup.binds).map_err(StepError::at(S::MountBinds))?;
             ops.mount_pod_shm(&isolation, &prepared, &created, shm)
                 .map_err(StepError::at(S::MountTmpfs))?;
         }
@@ -3477,7 +3499,7 @@ fn run_pre_pivot_with_console<O: PrePivotOps>(
         if let Some(set) = setup.binds {
             check_bind_overlaps(set, setup.tmpfs, setup.inject, setup.config_paths)
                 .map_err(StepError::at(S::MountBinds))?;
-            ops.mount_binds(&isolation, &prepared, set)
+            ops.mount_binds(&isolation, &prepared, &created, set)
                 .map_err(StepError::at(S::MountBinds))?;
         }
         devices = Some(created);
@@ -7640,7 +7662,7 @@ mod tests {
         fn mount_etc_files(&self, _: &(), _: &(), _: &EtcFileMounts) -> Result<(), ExecError> {
             self.step("etc_files")
         }
-        fn mount_binds(&self, _: &(), _: &(), _: &BindMountSet) -> Result<(), ExecError> {
+        fn mount_binds(&self, _: &(), _: &(), _: &(), _: &BindMountSet) -> Result<(), ExecError> {
             self.step("mount_binds")
         }
         fn apply_readonly_paths(
@@ -7875,6 +7897,54 @@ mod tests {
             assert_eq!(failed.step, PrePivotStep::MountTmpfs, "{dest}");
             assert_eq!(failed.error.code, ErrorCode::FailedPrecondition, "{dest}");
             assert!(!take_calls().iter().any(|c| c == "mount_pod_shm"), "{dest}");
+        }
+    }
+
+    /// CRI-2・OCI-4・SEC-1(#4888): pod の共有 `/dev/shm` の指定があるのに宛先 `/dev/shm` の bind が残っていれば、
+    /// 副作用（`mount_pod_shm`）の前に段 `mount_binds` の `FailedPrecondition` で拒否する。別の宛先の bind は通る。
+    #[test]
+    fn cri2_4888_pod_shm_refuses_leftover_dev_shm_bind() {
+        let ns = std::fs::File::open("/").unwrap();
+        let tmpfs = TmpfsMountSet::new();
+        for (dest, refused) in [("/dev/shm", true), ("/dev/termination-log", false)] {
+            let binds = test_binds(dest);
+            let setup = PrePivotSetup {
+                sysctls: None,
+                devices: DevptsGidSource::Rootful,
+                tmpfs: Some(&tmpfs),
+                pod_shm: Some(crate::exec::PodShmSetup::new(ns.as_fd(), (48, 2))),
+                inject: None,
+                etc_files: None,
+                binds: Some(&binds),
+                sysfs: None,
+                pinned_rootfs: None,
+                config_paths: ConfigPaths::NONE,
+                status: None,
+                working_dir: None,
+                root_readonly: false,
+                joined_pid_ns: None,
+            };
+            let _ = take_calls();
+            let r = run_pre_pivot(
+                &RecordingOps { fail_at: None },
+                Path::new("/rootfs"),
+                Some(setup),
+            );
+            let calls = take_calls();
+            if refused {
+                let failed = r.map(|_| ()).expect_err(dest);
+                assert_eq!(failed.step, PrePivotStep::MountBinds);
+                assert_eq!(failed.error.code, ErrorCode::FailedPrecondition);
+                assert_eq!(failed.error.stage, IsolationStage::MountBinds);
+                assert_eq!(
+                    failed.error.message,
+                    "a bind mount at /dev/shm cannot be combined with a pod shared /dev/shm"
+                );
+                assert!(!calls.iter().any(|c| c == "mount_pod_shm"));
+            } else {
+                r.map(|_| ()).expect(dest);
+                assert!(calls.iter().any(|c| c == "mount_pod_shm"));
+            }
         }
     }
 

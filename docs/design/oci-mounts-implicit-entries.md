@@ -10,7 +10,7 @@ OCI `config.json` の `mounts[]` のうち、bind と `/sys` の sysfs 以外の
 ## 現状
 
 - 種類の分類は `crates/core/src/oci_runtime/sysfs_mount.rs` の `OciMountKind::of`（Bind / Sysfs / Other）。bind 側・sysfs 側・Landlock 側が共有する
-- `BindMountSet::from_mounts`（`bind_mounts.rs`）は sysfs を読み飛ばし、それ以外の非 bind を `Unimplemented`（message: `mount type is not supported (only bind mounts)`）で拒否する。bind の宛先 `/proc`・`/sys`・`/dev` とその配下は `RESERVED_DESTINATIONS` で拒否する
+- `BindMountSet::from_mounts`（`bind_mounts.rs`）は sysfs を読み飛ばし、それ以外の非 bind を `Unimplemented`（message: `mount type is not supported (only bind mounts)`）で拒否する。bind の宛先 `/proc`・`/sys`・`/dev` とその配下は `RESERVED_DESTINATIONS` で拒否する。例外は `/dev/termination-log`（ファイル）と `/dev/shm`（ディレクトリ）の完全一致の 2 つだけで、許可リストの判定（`dev_bind_allowlist_kind`）が受ける（#4888）
 - `start.rs` は `validate_bind_mounts` → `SysfsMountSpec::from_mounts` の順に fork 前で検証する。拒否は launcher の監査 sink に記録される（SEC-4）
 - 暗黙に供給しているもの（`crates/core/src/dev_mounts.rs`・`tmpfs.rs`・`exec.rs` の `mount_proc`）:
 
@@ -19,7 +19,7 @@ OCI `config.json` の `mounts[]` のうち、bind と `/sys` の sysfs 以外の
 | `/proc` | `mount_proc` が常に載せる | 別実装（`mounts[]` 非依存） |
 | `/dev` | 暗黙の固定集合 | tmpfs・`nosuid`（`strictatime`） |
 | `/dev/pts` | 暗黙の固定集合 | devpts・`nosuid,noexec` |
-| `/dev/shm` | 暗黙の固定集合（`--ipc=host` では載せない） | tmpfs・`nosuid,nodev,noexec`・既定 64 MiB・`mode=1777` |
+| `/dev/shm` | 暗黙の固定集合（`--ipc=host`・`mounts[]` に `/dev/shm` の bind がある起動では載せない。#4888） | tmpfs・`nosuid,nodev,noexec`・既定 64 MiB・`mode=1777` |
 | `/sys` | `mounts[]` の sysfs を受けて供給（#2020） | sysfs |
 
 - **`/dev/mqueue` と `/sys/fs/cgroup` は供給していない**。暗黙の固定集合に `/dev/mqueue` は入っていない
@@ -35,7 +35,7 @@ OCI `config.json` の `mounts[]` のうち、bind と `/sys` の sysfs 以外の
 | `/proc` | proc / なし | `mount_proc` | 拒否 | 受けて読み飛ばす |
 | `/dev` | tmpfs / `nosuid,strictatime,mode=755,size=65536k` | tmpfs・`nosuid` | 拒否 | A-1 は `size` の差で外れうる。A-2 で判断 |
 | `/dev/pts` | devpts / `nosuid,noexec,newinstance,ptmxmode=0666,mode=0620,gid=5` | devpts・`nosuid,noexec` | 拒否 | 同上 |
-| `/dev/shm` | tmpfs / `nosuid,noexec,nodev,mode=1777,size=65536k` | 一致（既定 64 MiB） | 拒否 | 受ける。`--ipc=host` では拒否を推奨 |
+| `/dev/shm` | tmpfs / `nosuid,noexec,nodev,mode=1777,size=65536k` | 一致（既定 64 MiB） | 拒否（tmpfs の項目。bind は #4888 で受ける） | tmpfs の項目は判断待ち。bind の `/dev/shm` は #4888 のオーナー決定（2026-11-19）で受ける（`--ipc=host` でも。本書の推奨とは異なる） |
 | `/dev/mqueue` | mqueue / `nosuid,noexec,nodev` | 供給なし | 拒否 | 拒否のまま（新規供給は別 issue） |
 | `/sys` | sysfs / `nosuid,noexec,nodev,ro` | sysfs（#2020） | 受ける | 変わらない |
 | `/sys/fs/cgroup` | cgroup / `nosuid,noexec,nodev,relatime,ro` | 供給なし | 拒否 | 拒否のまま（cgroup namespace と `ro` の設計が要る） |
@@ -52,7 +52,7 @@ OCI `config.json` の `mounts[]` のうち、bind と `/sys` の sysfs 以外の
 - **A-1 厳格一致**: type・宛先・options が完全一致。`mode=`・`size=` の差で標準の既定 config でも外れやすい
 - **A-2 緩い一致**: type と宛先が一致し、options が供給済みの属性を緩めない集合に収まる。`nosuid`・`nodev`・`noexec`・`ro` は供給側より緩めない方向だけ受ける。`mode=`・`size=`・`gid=`・`ptmxmode=`・`newinstance`・`strictatime` は値を照合するか無視するかを決める。供給済みの属性より強い制限（例: `/dev` に `noexec`）を求める指定は、黙って満たさない起動をせず拒否する（SEC-1）
 - `/dev/mqueue`・`/sys/fs/cgroup` は供給していないため A でも拒否のまま。供給するなら別 issue
-- `--ipc=host`（`/dev/shm` を載せない構成）で `mounts[]` に `/dev/shm` があれば、載らないものを受けたことになるため拒否を推奨する
+- `--ipc=host`（`/dev/shm` を載せない構成）で `mounts[]` に `/dev/shm` があれば、載らないものを受けたことになるため拒否を推奨する。ただし #4888 のオーナー決定（2026-11-19）で、`/dev/shm` の bind は `--ipc=host` でも受ける。bind は載らないものを受けるのではなく、その宛先を供給する（tmpfs の項目は従来どおり拒否を推奨）
 - 触る箇所: `OciMountKind::of` に「暗黙に供給済み」の分類を足す／`BindMountSet::from_mounts` が sysfs と同様に読み飛ばすか、`SysfsMountSpec` と同じ形の専用検証型で照合・監査する／`landlock/rules.rs` の重複拒否を分類で除外する／`MountDestination` の正規化を共有する／`/proc` は `mount_proc` の属性と照合する
 
 ### B. A に加えて任意宛先の tmpfs を受ける
@@ -74,3 +74,4 @@ OCI `config.json` の `mounts[]` のうち、bind と `/sys` の sysfs 以外の
 - 済み: コード・doc の「見送り」の参照先を本書と #2347 に統一した（挙動は変えていない）
 - 残り: オーナーが A〜C を決めて #2347 にコメントで記録する。A・B なら #54 配下に実装 issue を起票する。C ならコードの変更と利用者 doc の更新
 - 受けない指定の拒否は今と同じく launcher の監査 sink に記録される（SEC-4）
+- #4713〜#4715（暗黙の `/dev/shm` を供給済みとして受ける作業。OPEN）への申し送り: `type=tmpfs` の `/dev/shm` と `type=bind` の `/dev/shm` が同じ config にあれば拒否する（#4888 の bind の受け入れと同居させない）

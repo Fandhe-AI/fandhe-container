@@ -195,16 +195,31 @@ pub(super) fn check_dev_order(
     if !under_dev {
         return Ok(());
     }
-    let order_error = |msg: &str| ExecError::new(ErrorCode::FailedPrecondition, STAGE, msg);
+    check_dev_evidence(
+        root,
+        devices,
+        STAGE,
+        "tmpfs mounts under /dev require create_default_devices to run first on the same rootfs",
+    )
+}
+
+/// `/dev` 配下へ載せる段の順序の証跡の検査の本体（[`check_dev_order`] と bind の段〔`exec::mount_binds`。#4888〕が共有）。
+///
+/// `devices` が無ければ `missing` を、別の rootfs の結果・`dev` の差し替え／重ね覆いは固定文言で `FailedPrecondition` にする。
+pub(super) fn check_dev_evidence(
+    root: BorrowedFd<'_>,
+    devices: Option<&DeviceReport>,
+    stage: IsolationStage,
+    missing: &str,
+) -> Result<(), ExecError> {
+    let order_error = |msg: &str| ExecError::new(ErrorCode::FailedPrecondition, stage, msg);
     let Some(devices) = devices else {
-        return Err(order_error(
-            "tmpfs mounts under /dev require create_default_devices to run first on the same rootfs",
-        ));
+        return Err(order_error(missing));
     };
     let dev = sys::open_dir_path_nofollow(Some(root), c"dev").map_err(|_| {
         order_error("the rootfs /dev is not the tmpfs mounted by create_default_devices")
     })?;
-    if DevMountIdentity::of(&dev, STAGE)? != devices.dev_mount {
+    if DevMountIdentity::of(&dev, stage)? != devices.dev_mount {
         return Err(order_error(
             "the rootfs /dev is not the tmpfs mounted by create_default_devices",
         ));

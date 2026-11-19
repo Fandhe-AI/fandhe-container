@@ -300,6 +300,25 @@ impl TmpfsMountSet {
         Ok(out)
     }
 
+    /// `/dev/shm` を bind mount で受ける起動（許可リストの宛先。#4888・CRI-2・OCI-4）のために、既定の `/dev/shm` の件
+    /// （[`TmpfsMountSpec::default_dev_shm`] と同じ定義）を 1 件だけ除いた実効の集合を返す（containerd v2.4.2 と同じく、bind が
+    /// あれば暗黙の tmpfs を載せない）。
+    ///
+    /// [`Self::without_default_dev_shm`] と違い拒否しない: 既定と違う定義（`--shm-size`・`--tmpfs /dev/shm`）と `/dev/shm` 配下の
+    /// tmpfs はそのまま残す。残った件は呼び出し側の `BindMountSet::check_against_tmpfs` が `OverlapsTmpfs` で拒否する
+    /// （新しい固定文言の拒否を作らない）。`/dev/shm` が無い（`--ipc=host`）集合はそのまま返る。
+    pub fn without_default_dev_shm_lenient(&self) -> Result<Self, TraitError> {
+        let default = TmpfsMountSpec::default_dev_shm()?;
+        let mut out = Self::new();
+        for m in &self.mounts {
+            if m.destination.as_str() == DEV_SHM_PATH && *m == default {
+                continue;
+            }
+            out.mounts.push(m.clone());
+        }
+        Ok(out)
+    }
+
     /// 指定順のマウント一覧。
     pub fn mounts(&self) -> &[TmpfsMountSpec] {
         &self.mounts
@@ -314,6 +333,49 @@ impl TmpfsMountSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CRI-2・OCI-4・SEC-1（#4888）: bind の `/dev/shm` のための実効集合。既定の `/dev/shm` だけを除き、既定と違う定義・配下の
+    /// tmpfs・他の件はそのまま残す（拒否は `check_against_tmpfs` が担う）。`/dev/shm` が無ければ変わらない。
+    #[test]
+    fn cri2_4888_without_default_dev_shm_lenient() {
+        let dests = |s: &TmpfsMountSet| -> Vec<String> {
+            s.mounts()
+                .iter()
+                .map(|m| m.destination.as_str().to_owned())
+                .collect()
+        };
+        let mut set = TmpfsMountSet::new();
+        set.ensure_default_dev_shm().expect("default");
+        set.push(TmpfsMountSpec::new("/run", None).expect("run"))
+            .expect("push");
+        let eff = set.without_default_dev_shm_lenient().expect("lenient");
+        assert_eq!(dests(&eff), ["/run"]);
+        assert!(
+            TmpfsMountSet::new()
+                .without_default_dev_shm_lenient()
+                .expect("empty")
+                .is_empty()
+        );
+        let mut sized = TmpfsMountSet::new();
+        sized
+            .push(
+                TmpfsMountSpec::dev_shm(TmpfsSize::from_bytes(1 << 20).expect("size"))
+                    .expect("shm"),
+            )
+            .expect("push");
+        assert_eq!(
+            dests(&sized.without_default_dev_shm_lenient().expect("lenient")),
+            ["/dev/shm"]
+        );
+        let mut sub = TmpfsMountSet::new();
+        sub.ensure_default_dev_shm().expect("default");
+        sub.push(TmpfsMountSpec::new("/dev/shm/sub", None).expect("sub"))
+            .expect("push");
+        assert_eq!(
+            dests(&sub.without_default_dev_shm_lenient().expect("lenient")),
+            ["/dev/shm/sub"]
+        );
+    }
 
     /// CRI-2・CORE-3（#4822）: 既定の `/dev/shm` だけを除き、他の件の順序は保つ。`--shm-size`・`--tmpfs /dev/shm`・
     /// `/dev/shm` が無い・配下の tmpfs は固定文言の `InvalidArgument`。

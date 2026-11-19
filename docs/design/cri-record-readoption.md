@@ -1,6 +1,6 @@
 # plugin-cri の再起動をまたぐ sandbox・コンテナ記録の再採用の設計と実装単位（CRI-1・CRI-2・OCI-7・CORE-1・REPAIR-3）
 
-設計記録（#2902）。コードは本変更で変えない。実装は「実装単位」の各 issue で行う。オーナー確認が要る点は「要確認事項」に分け、オーナー判断は未取得である。
+設計記録（#2902）。コードは本変更で変えない。実装は「実装単位」の各 issue で行う。オーナー確認が要る点は「要確認事項」に分けた（1 は 2026-11-19 にオーナーが判断済み。3 は #2931 で実装済み。2 は未取得）。
 
 ## 背景
 
@@ -28,7 +28,7 @@
 | ---- | ---- |
 | sandbox 記録（config・状態・作成時刻・ネットワークのフラグ） | 決定し実装単位へ |
 | コンテナ記録（CRI 層の項目一式・`image_ref`・`image_id`） | 決定し実装単位へ |
-| 保持役の pid と素性 | 記録の形を決定。再採用の可否は要確認事項 1（(a) は未採用）。#2871 は pid を sandbox 記録のメモリにだけ持つ。素性の記録は R11（#2940）で sandbox 記録 v2 の `holder=` 行として実装済み。再採用した記録の `pod_holder` は常に無い（素性は診断と終了済みの確認だけ） |
+| 保持役の pid と素性 | 記録の形を決定。再採用の可否は要確認事項 1（(b) で確定。(a) は採らない）。#2871 は pid を sandbox 記録のメモリにだけ持つ。素性の記録は R11（#2940）で sandbox 記録 v2 の `holder=` 行として実装済み。再採用した記録の `pod_holder` は常に無い（素性は診断と終了済みの確認だけ） |
 | ネットワーク資源（`network_owned`・`pod_netns`） | フラグの永続は決定。再起動後の `tear_down` は #1870 の後。`pod_netns` に載る報告済み IP（`PodSandboxStatus.network`・#2873）も永続しないため、再採用後の network は空 |
 | plugin-cri の在庫の永続化 | #4176 で配線済み（`PersistentImageStore`）。RemoveImage と再起動後の一貫性は #4177 で実装済み、取り消しの窓が #4178。記録の `image_ref`・`image_id` は create 時のスナップショットとして独立に永続化するため依存しない |
 
@@ -43,7 +43,7 @@
 
 ## 形式
 
-- serde を使わない。固定のヘッダ行（LF・ASCII。版の行 `fandhe-cri-sandbox-record v1` / `fandhe-cri-container-record v2`（コンテナは #4322 で v2。v1 も復号で受ける）、キー順固定のスカラー項目）と、`config=<長さ>` の行に続く長さちょうどの prost 符号化した `PodSandboxConfig` / `ContainerConfig`。prost は既存依存で、新規依存は足さない
+- serde を使わない。固定のヘッダ行（LF・ASCII。版の行 `fandhe-cri-sandbox-record v2` / `fandhe-cri-container-record v2`（sandbox は #2940、コンテナは #4322 で v2。どちらも v1 を復号で受ける）、キー順固定のスカラー項目）と、`config=<長さ>` の行に続く長さちょうどの prost 符号化した `PodSandboxConfig` / `ContainerConfig`。prost は既存依存で、新規依存は足さない
 - 復号は厳密にする。版の完全一致・キー順固定・重複/未知キー/余分な行/CRLF なし・ID とファイル名の一致・長さの上限（config は `MAX_CONFIG_ENCODED_BYTES`、記録全体の上限を先に確認）。復号後に `config_limits` と同じ上限検証を通し、RunPodSandbox/CreateContainer と同じ上限を再採用時にも効かせる。違反は `InvalidArgument`（入力値をメッセージに載せない。REPAIR-4）
 - 秘密の最小化: `ContainerConfig.envs` は記録に書かない（Status/List は返さず、bundle 作成後は不要）。`command`・`args` も応答に出ないため書かない案があるが、推奨は envs だけを除く（要確認事項 2）
 - 保持量（`retained_bytes`）は読み込み時に再計算し、記録に書かない
@@ -187,11 +187,11 @@ CORE-10 への当てはめ（CORE-10 の目標 0.136 秒、Linux の Docker 0.29
 - 再採用した記録の pid からは決して namespace のパスを作らず、シグナルも送らない。plugin-cri はもう親でなく、zombie による pid 固定が効かないため（SEC-5 の P0・SEC-1）。用途は診断と、終了済みであることの確認だけ
 - R11 の実装（#2940。CRI-2・SEC-5・SEC-1。`crates/cri/src/runtime_service/holder_identity.rs`・`record.rs`・`readopt.rs`、`crates/plugin-cri/src/pod_holder.rs`）:
   - 素性の収集: plugin-cri の `ProductionPodHolder` が READY の検証（pid 一致・`/proc/<pid>/ns/{user,ipc,net}` の dev:ino 照合）の直後、子を回収する前に `/proc/<pid>/stat` の starttime を読み、`HolderIdentity`（cri の公開型。pid・starttime・3 つの ns の dev:ino。supervisor の `PodHolderReady::new` と同じ不変条件を検証する）を `PodHolder::from_identity` で返す。starttime を読めなければ子を kill して回収し、固定文言で失敗する（fail-closed）。ns の照合が無効な試験用の構成は素性なし
-  - 記録: sandbox 記録は v2。`network_pending=` の直後に `holder=<pid>,<starttime>,<user_dev>:<user_ino>,<ipc_dev>:<ipc_ino>,<net_dev>:<net_ino>` または `holder=-` を持つ。1 行で全部か無しかで、部分的な欠けは表現できない。符号化は常に v2、復号は v1（`holder=` なし。素性は `None`）と v2 を受け、版と行の組の不一致・未知の版・正準形でない整数・pid の範囲外・ino の 0 や重複・dev の不一致・要素数の過不足は固定文言の `INVALID_ARGUMENT`。ダウングレードで旧バイナリが v2 を読むと `malformed` に数えられ、記録は消されず残る（コンテナ記録 v2 の #4322 と同じ）
+  - 記録: sandbox 記録は v2。`network_pending=` の直後に `holder=<pid>,<starttime>,<user_dev>:<user_ino>,<ipc_dev>:<ipc_ino>,<net_dev>:<net_ino>` または `holder=-` を持つ。1 行で全部か無しかで、部分的な欠けは表現できない。符号化は常に v2、復号は v1（`holder=` なし。素性は `None`）と v2 を受け、版と行の組の不一致・未知の版・正準形でない整数・pid の範囲外・ino の 0 や重複・dev の不一致・要素数の過不足は固定文言の `INVALID_ARGUMENT`。ダウングレードで旧バイナリが v2 を読むと `malformed` に数えられ、記録は消されず残る（コンテナ記録 v2 の #4322 と同じ）。#4816 が足した 6 つ目の要素（pid ns の dev:ino。pid を共有する sandbox だけ）も、それより前のバイナリでは同じく `malformed` になる。戻し手順は配布の開始時に版の上げ下げの手順としてまとめて書く（2026-11-19 のオーナー判断）
   - 型での分離: 記録上の素性は cri 内部の `RecordedHolderIdentity` で、`PodHolder`・`PodNamespacePaths`・pidfd・シグナルへ変換する口を持たない。再採用は素性を `SandboxRecord::recorded_holder` へ戻すだけで、`pod_holder`・`holder_owned`・`holder_pending` は従来どおり `None`・偽・偽、状態は `NotReady`。bundle への namespace のパスは起動中の `pod_holder` からだけ作る
   - 観測: `PodNamespaceHolderProvider::observe_process_start`（既定実装は `UNIMPLEMENTED`）が `/proc/<pid>/stat` の starttime を読むだけで、`/proc/<pid>/ns/*` の stat・pidfd・シグナル・回収をしない。`readopt_sandboxes` が素性を持つ記録 1 件につき 1 回、registry のロックの外で呼ぶ。分類は純粋関数 `classify_recorded_holder`: 不在は `holder_gone`、starttime の不一致は `holder_pid_reused`（どちらも記録の保持役は終了済み）、一致は `holder_start_time_match`（終了を確認できない）、観測の失敗・provider 未注入は `holder_unobserved`。どの分類でも登録する値は変えない。要約行の sandbox の段の末尾に `holder_recorded`・`holder_gone`・`holder_pid_reused`・`holder_start_time_match`・`holder_unobserved` の件数を足した（件数のみ。ID・pid を含めない）
   - 残余: boot id を記録しないため、`holder_start_time_match` は再起動をまたぐ偶然の一致を否定できず、Ready・パス・シグナルの根拠にしない。(a)（保持役を再起動後も生かし pidfd で照合して再採用する）は採らない。`pending=1` の記録は spawn の前に書かれるため素性を持たず、素性と `pod_netns` による pending の分岐（R6 の表の分岐 1〜3）の精緻化と、spawn の後の素性つき pending の書き込み（fsync が 1 回増える）は R12（#2941）と合わせて扱う。R6 の表（`pending` 単独は回収待ちにしない）は変えない。手動の見分け方は `docs/setup/cri-record-recovery.md`
-- 要確認事項 1 で (a) を採る場合だけ、pidfd で開いて starttime と ns の素性を照合した上で再採用する。(a) が選ばれた場合の追加単位（保持役の切り離し起動と pidfd 照合）は、判断の後に起票する（本 issue では起票しない）
+- 要確認事項 1 は (b) で確定したため、pidfd で開いて starttime と ns の素性を照合した上で再採用する (a) の追加単位（保持役の切り離し起動と pidfd 照合）は起票しない
 
 ## ネットワーク資源
 
@@ -219,17 +219,17 @@ CORE-10 への当てはめ（CORE-10 の目標 0.136 秒、Linux の Docker 0.29
 | ---- | ---------- | ------ |
 | メタデータ | 中央デーモンのメタデータストアと、コンテナごとの status checkpoint（`status.go`） | 常駐の中央なし。core の `state.json` と CRI 記録ファイル |
 | 前提 | plugin の停止中、ファイルと checkpoint に触れず、コンテナが追加されない（`restart.go` の前提コメント） | 前提にできない（CLI と状態ルートを共有）。所有の証明（CRI 記録）と core の照合で置き換える |
-| sandbox | task の状態を引き、取れなければ Unknown→NotReady。running なら Ready（`podsandbox/recover.go`） | 保持役が再起動をまたがないため常に NotReady（(a) 採用時は素性の照合つきで Ready） |
+| sandbox | task の状態を引き、取れなければ Unknown→NotReady。running なら Ready（`podsandbox/recover.go`） | 保持役が再起動をまたがないため常に NotReady（要確認事項 1 は (b) で確定） |
 | コンテナ | 10 秒/件で読み、失敗すれば `Unknown`（checkpoint の他の項目は残す） | core を正に写し、不明は `CONTAINER_UNKNOWN`。期限つき |
 | 孤児ディレクトリ | `cleanupOrphanedIDDirs` で削除 | CRI 記録なしかつ core が Absent の bundle だけ回収 |
 | 自動停止 | しない | しない（kubelet の Stop/Remove に委ねる） |
 
-## 要確認事項（オーナー判断は未取得。既定は安全側）
+## 要確認事項（1 はオーナー判断済み・3 は #2931 で実装済み。2 は未取得で、既定は安全側）
 
-1. 保持役を再起動をまたいで生かすか
+1. 保持役を再起動をまたいで生かすか（2026-11-19 にオーナーが (b) で確定）
    - (a) supervisor と同じ `systemd-run --user --scope` で切り離して起動し、pidfd・starttime・ns の素性照合で再採用する。#2838 の「直接の子・zombie で pid 固定」と H2（#2874）の修正が要る。#2874 は open なので、採るなら H2 の前に設計を改める
    - (b) #2838 のまま。再起動後は NotReady で、kubelet が pod を作り直す
-   - 既定は (b)
+   - (b) で確定した。pid を共有する pod（[pod-namespace-holder.md](pod-namespace-holder.md)「pid の共有」）は、plugin-cri の停止で pod-init ごと即座に止まることも受け入れた
 2. `ContainerConfig` の `command`・`args` も記録から除くか（推奨は envs だけ除く）
 3. インスタンスロックの導入（推奨）
 

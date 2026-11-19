@@ -164,7 +164,7 @@ kubelet が既定で付ける `mounts[]` のうち、コンテナの `/dev` 配�
 
 既知の差（containerd・kubelet との比較）:
 
-- SELinux 有効ノードでは、kubelet が `mounts` に `selinux_relabel=true` を付け、本実装は `mounts.selinux_relabel` を `UNIMPLEMENTED` にするため、既定の config が通らない。`/dev/termination-log` に限らず `/etc/hosts`・volume にも付く。termination-log の出典は kubernetes `v1.37.1` の `pkg/kubelet/kuberuntime/kuberuntime_container.go` 533〜537 行（533 行 `selinuxRelabel := selinux.GetEnabled()`・537 行 `SelinuxRelabel: selinuxRelabel`）。受け入れ方式の判断は #4895 で扱う
+- SELinux 有効ノードでは、kubelet が `mounts` に `selinux_relabel=true` を付け、本実装は `mounts.selinux_relabel` を `UNIMPLEMENTED` にするため、既定の config が通らない。`/dev/termination-log` に限らず `/etc/hosts`・volume にも付く。termination-log の出典は kubernetes `v1.37.1` の `pkg/kubelet/kuberuntime/kuberuntime_container.go` 533〜537 行（533 行 `selinuxRelabel := selinux.GetEnabled()`・537 行 `SelinuxRelabel: selinuxRelabel`）。SELinux 有効ノードは非対応（オーナー決定 2026-11-19・#4895。下の「SELinux の受け入れ方式」）
 - `mountPath: /dev/shm/` のように末尾の `/` つきで渡すと、本実装だけ `INVALID_ARGUMENT` になる。containerd は既定の `/dev/shm` を足すかの判定で `filepath.Clean` を通して比べ（`internal/cri/server/helpers.go` 221〜223 行）、末尾の `/` つきでも受ける（spec の `destination` には渡された文字列のまま入る。`internal/cri/opts/spec_linux_opts.go` 132 行）
 - `terminationMessagePath` を `/dev` 配下（`/dev/termination-log` 以外）・`/proc`・`/sys` 配下に置くと `INVALID_ARGUMENT` のまま。それ以外のパスは通常の bind として通る
 - `/dev/shm` の bind は `noexec` が付かず、サイズの上限も無い（containerd と同じ）
@@ -172,6 +172,29 @@ kubelet が既定で付ける `mounts[]` のうち、コンテナの `/dev` 配�
   - 本リポは CRI mounts の bind に `nosuid`・`nodev` を常に付ける（`crates/cri/src/bundle/spec.rs` の `mount_out`。[bind-mounts](../api/bind-mounts.md)「`nosuid` と `nodev` を常に付ける。外せない」）。containerd が CRI mounts の bind に付けるのは `rbind`・伝播・`ro` / `rw` だけで、元のマウントの属性を継ぐ（`internal/cri/opts/spec_linux_opts.go` 154〜201 行）
   - kubelet の emptyDir（Memory）の tmpfs は `size=`・`noswap` だけで載る（`pkg/volume/emptydir/empty_dir.go` 356〜359・601〜612 行）。そのため emptyDir を `/dev/shm` に bind すると、containerd では suid・dev が効き、本リポでは効かない。**emptyDir の `/dev/shm` も containerd との差**。本書では差として記録し、属性を変えるかは別の判断とする
   - 元が無いとき containerd は `MkdirAll(0755)` で作り（commit `b7a25261` の `internal/cri/opts/spec_linux_opts.go` 137〜143 行）、symlink を解決する（同 147 行）。本リポは作らず、辿らず拒否する（bind 全般の差。`/dev/shm` にも当たる）
+
+## SELinux の受け入れ方式（非対応。CRI-2・SEC-1。#4895）
+
+SELinux 有効ノードは非対応とする（オーナー決定 2026-11-19。#4895 の案 a）。relabel も process・mount の label も実装せず、指定は黙って落とさずに `UNIMPLEMENTED` で拒否する。
+
+却下した案:
+
+- (b) `selinux_relabel` を無視して受ける: ラベルを付けないため enforcing のノードではコンテナからの読み書きが拒否されうる。指定を黙って落とすことにもなる
+- (c) relabel と label を実装する: rootless での setxattr の可否、Landlock・seccomp との関係、`selinux_options` の扱いの設計が要り、SELinux 有効の実機での確認も要る。需要が出たときに改めて判断する
+
+拒否の位置と文言（`crates/cri/src/bundle/spec.rs`。CreateContainer の bundle 生成で拒否し、実行層の create は呼ばない）:
+
+| 指定 | 拒否 |
+| ---- | ---- |
+| `mounts[].selinux_relabel = true`（`mount_out`。`/dev/termination-log`・`/etc/hosts`・volume のどれでも） | `UNIMPLEMENTED`・`mounts.selinux_relabel is not supported` |
+| コンテナの `linux.security_context.selinux_options` | `UNIMPLEMENTED`・`selinux_options is not supported` |
+| sandbox の `linux.security_context.selinux_options` | RunPodSandbox は受ける（sandbox にはコンテナのプロセスが無く、値は読まない）。その sandbox への CreateContainer が `UNIMPLEMENTED`・`selinux_options is not supported` |
+
+kubelet の一次情報（kubernetes `v1.37.1`・`f78e722310e50bcaca9276be22276d9e91d91308` の `pkg/kubelet/kuberuntime/kuberuntime_container.go`）: volume・`/etc/hosts` は 490 行 `selinuxRelabel := v.SELinuxRelabel && selinux.GetEnabled()`、termination-log は 533 行 `selinuxRelabel := selinux.GetEnabled()`。ノードの SELinux が有効なら、kubelet の既定の config の CreateContainer はすべて拒否される。
+
+試験: `crates/cri/tests/bundle_spec.rs` の `cri2_sec1_4895_selinux_is_rejected_with_fixed_message`（3 種の指定のコードと文言の完全一致。`selinux_relabel = false` の対照）、`crates/cri/tests/runtime_service_pod_holder_namespaces.rs` の `cri2_sec1_4895_selinux_relabel_mount_rejected_without_runtime_call_or_record`（RPC を通した拒否で実行層の create が呼ばれず記録が残らないこと、sandbox の `selinux_options` つきの RunPodSandbox は通り CreateContainer で拒否されること）。
+
+残余: sandbox の `selinux_options` は RunPodSandbox で拒否しないため、pod は Ready になってからコンテナの作成で止まる。拒否を RunPodSandbox へ早めるかは、需要が出たときに判断する。SELinux 有効の実機での確認手順は、非対応のため置かない。
 
 ## dns_config の受け入れ方式（CRI-2・NET-5。#2665）
 

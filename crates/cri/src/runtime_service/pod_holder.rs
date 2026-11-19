@@ -210,7 +210,9 @@ impl CriRuntimeService {
                 if let Ok(holder) = &result {
                     record.pod_holder = Some(*holder);
                     // 記録ファイルへ残す素性は `pod_holder` と同じロック区間で設定する（R11・#2940）。`release` では消さない。
-                    record.recorded_holder = holder.identity().map(RecordedHolderIdentity::from);
+                    record.recorded_holder = holder
+                        .identity()
+                        .map(|id| Box::new(RecordedHolderIdentity::from(id)));
                     record.holder_owned = true;
                 } else if let Err(e) = &result
                     && e.resource_retained()

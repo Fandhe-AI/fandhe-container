@@ -387,7 +387,7 @@ impl SandboxRecordData {
             pending,
             network_owned: record.network_owned,
             network_pending: record.network_pending,
-            holder: record.recorded_holder,
+            holder: record.recorded_holder.as_deref().copied(),
         }
     }
 

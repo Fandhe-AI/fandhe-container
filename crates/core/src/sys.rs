@@ -889,6 +889,8 @@ mod consts {
     pub const KEXEC_SEGMENT_MAX: i64 = 16;
     // `kcmp`（x86_64 は syscall_64.tbl の 312）と `KCMP_VM`（include/uapi/linux/kcmp.h）。
     pub const SYS_KCMP: ArchSysNo = ArchSysNo::new(312);
+    // `io_uring_setup`（syscall_64.tbl の 425）。seccomp の io_uring 拒否の観測用（#4803）。
+    pub const SYS_IO_URING_SETUP: ArchSysNo = ArchSysNo::new(425);
     // `socket`（x86_64 は syscall_64.tbl の 41）。seccomp の AF_VSOCK 拒否の観測用（#2277）。
     pub const SYS_SOCKET: ArchSysNo = ArchSysNo::new(41);
     pub const KCMP_VM: i64 = 1;
@@ -986,6 +988,7 @@ mod consts {
             assert!(nr(super::SYS_PTRACE) == libc::SYS_ptrace);
             assert!(nr(super::SYS_KEXEC_LOAD) == libc::SYS_kexec_load);
             assert!(nr(super::SYS_KCMP) == libc::SYS_kcmp);
+            assert!(nr(super::SYS_IO_URING_SETUP) == libc::SYS_io_uring_setup);
             assert!(nr(super::SYS_SOCKET) == libc::SYS_socket);
         };
 
@@ -1323,6 +1326,8 @@ mod consts {
     pub const KEXEC_SEGMENT_MAX: i64 = 16;
     // `kcmp`（aarch64 は asm-generic/unistd.h の 272）と `KCMP_VM`（include/uapi/linux/kcmp.h）。
     pub const SYS_KCMP: ArchSysNo = ArchSysNo::new(272);
+    // `io_uring_setup`（asm-generic/unistd.h の 425）。seccomp の io_uring 拒否の観測用（#4803）。
+    pub const SYS_IO_URING_SETUP: ArchSysNo = ArchSysNo::new(425);
     // `socket`（arm64 は include/uapi/asm-generic/unistd.h の 198）。seccomp の AF_VSOCK 拒否の観測用（#2277）。
     pub const SYS_SOCKET: ArchSysNo = ArchSysNo::new(198);
     pub const KCMP_VM: i64 = 1;
@@ -1420,6 +1425,7 @@ mod consts {
             assert!(nr(super::SYS_PTRACE) == libc::SYS_ptrace);
             assert!(nr(super::SYS_KEXEC_LOAD) == libc::SYS_kexec_load);
             assert!(nr(super::SYS_KCMP) == libc::SYS_kcmp);
+            assert!(nr(super::SYS_IO_URING_SETUP) == libc::SYS_io_uring_setup);
             assert!(nr(super::SYS_SOCKET) == libc::SYS_socket);
         };
 
@@ -1653,6 +1659,7 @@ mod consts {
     pub const PTRACE_CONT: i64 = 0;
     pub const KEXEC_SEGMENT_MAX: i64 = 0;
     pub const SYS_KCMP: ArchSysNo = ArchSysNo::UNSUPPORTED;
+    pub const SYS_IO_URING_SETUP: ArchSysNo = ArchSysNo::UNSUPPORTED;
     pub const SYS_SOCKET: ArchSysNo = ArchSysNo::UNSUPPORTED;
     pub const KCMP_VM: i64 = 0;
     // include/uapi/linux/capability.h の `_LINUX_CAPABILITY_VERSION_3`（2 語・64 bit 形式）。
@@ -6941,6 +6948,23 @@ pub(crate) fn kcmp_self_probe() -> Result<(), SysError> {
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
+/// `io_uring_setup(0, NULL)` を発行する結合試験用プローブ（CORE-5・SEC-1・MAC-4・#4803）。
+///
+/// entries が 0 のため、フィルタが無くてもカーネルは `EINVAL` で拒否し、リングは作られない。
+/// フィルタが効いていれば `EPERM` になり、`EINVAL` と区別できる。
+// 結合試験専用。テストビルドの単体テストは呼ばないため dead_code を許可する。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn io_uring_setup_probe() -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let nr = consts::SYS_IO_URING_SETUP.get()?;
+    // SAFETY: entries = 0・params = NULL（整数 0）で、カーネルは params を読む前に `EINVAL` で拒否する。
+    // 成功しないため fd は作られない。
+    let rc = unsafe { ffi_syscall!(nr, 0_i64, 0_i64) };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
 /// `socket(family, SOCK_STREAM|SOCK_CLOEXEC, 0)` を生の syscall で 1 回発行し、成功した fd は直ちに閉じる。
 ///
 /// 生の syscall にする理由は、libc の `socket` が family を `int` に切り詰めてから渡すため、上位 32 bit に
@@ -7293,6 +7317,10 @@ mod tests {
         );
         assert_eq!(consts::PTRACE_CONT, 7);
         assert_eq!(consts::SYS_KCMP.get().map(SyscallNumber::raw), Ok(312));
+        assert_eq!(
+            consts::SYS_IO_URING_SETUP.get().map(SyscallNumber::raw),
+            Ok(425)
+        );
         assert_eq!(consts::SYS_SOCKET.get().map(SyscallNumber::raw), Ok(41));
         assert_eq!(consts::AF_VSOCK, 40);
         assert_eq!(consts::SOCK_STREAM, 1);
@@ -7311,6 +7339,10 @@ mod tests {
         );
         assert_eq!(consts::PTRACE_CONT, 7);
         assert_eq!(consts::SYS_KCMP.get().map(SyscallNumber::raw), Ok(272));
+        assert_eq!(
+            consts::SYS_IO_URING_SETUP.get().map(SyscallNumber::raw),
+            Ok(425)
+        );
         assert_eq!(consts::SYS_SOCKET.get().map(SyscallNumber::raw), Ok(198));
         assert_eq!(consts::AF_VSOCK, 40);
         assert_eq!(consts::SOCK_STREAM, 1);

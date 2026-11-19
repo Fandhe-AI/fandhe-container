@@ -212,6 +212,12 @@ fn main() {
             "socket(AF_VSOCK | 1<<32) blocked"
         );
         assert_eq!(o.unix_socket_after, None, "socket(AF_UNIX) allowed");
+        // io_uring の拒否（CORE-5・SEC-1・MAC-4・#4803）。無拒否なら entries = 0 で EINVAL（22）になる。
+        assert_eq!(
+            o.io_uring_setup_after,
+            Some(EPERM),
+            "io_uring_setup blocked"
+        );
         println!("seccomp_enforcement child: ok");
         return;
     }

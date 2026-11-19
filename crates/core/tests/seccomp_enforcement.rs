@@ -182,6 +182,23 @@ fn main() {
             ChildOutcome::Failed
         );
         assert_eq!(classify_child(None, &marker(1, "2")), ChildOutcome::Failed);
+        // io_uring の適用前の対照（#4803）: marker があれば前提欠如、seccomp_before が無ければ失敗。
+        assert_eq!(
+            classify_child(
+                Some(PRECONDITION_EXIT),
+                &format!("{MARKER}io_uring_before_errno=1 seccomp_before=0\n")
+            ),
+            ChildOutcome::IoUringPrecondition {
+                seccomp_before: "0".into()
+            }
+        );
+        assert_eq!(
+            classify_child(
+                Some(PRECONDITION_EXIT),
+                &format!("{MARKER}io_uring_before_errno=1\n")
+            ),
+            ChildOutcome::Failed
+        );
     }
     if let Some(i) = args.iter().position(|a| a == "--child-kill") {
         let name = args.get(i + 1).expect("syscall name after --child-kill");

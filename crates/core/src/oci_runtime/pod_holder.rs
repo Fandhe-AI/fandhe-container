@@ -27,6 +27,12 @@
 //! capability を落とす前に呼んで持ち続ける。pod-init(P5)はこのマウントへ移って `pivot_root` する前提で、保持役
 //! 自身の root は変わらない(マウントを木に付けないため。mount namespace は確立時の private な複製のまま)。
 //!
+//! # pod の `/dev/shm`(#4821。O6 の案 A の S1)
+//!
+//! [`mount_pod_shm`] は、確立した mount namespace の `/dev/shm` に pod で共有する tmpfs(コンテナの既定と同じ 64 MiB・
+//! `nosuid,nodev,noexec`・mode 1777)を載せ、tmpfs のルートの素性を返す。保持役は段 2 で capability を落とす前に呼び、
+//! 素性を READY に載せる。コンテナの init はこの mount namespace へ入って複製を取る(S2・#4822)。
+//!
 //! # 契約(呼び出し側の義務)
 //!
 //! - **単一スレッドから呼ぶ**(`CLONE_NEWUSER` の条件。満たさなければ副作用なしで `FailedPrecondition`)
@@ -34,6 +40,9 @@
 //!   まで dumpable である(#2546)。保持役は秘密を持たないこと
 //! - **失敗したプロセスは破棄する**(写像は write-once で戻せない)
 //! - 範囲写像の経路は Linux 6.9 以降が要る(`exec::isolate_rootless_subordinate` の helper の停止手段。緩めない)
+//! - **[`mount_pod_shm`] は確立済みの mount namespace の中でだけ呼ぶ**: `/` が再帰 private な、pod の userns 所有の
+//!   mount namespace でなければ、載せたマウントが他の namespace へ伝播しうる。検証に通らなかったときもマウントは
+//!   残るので、そのプロセスは破棄する（保持役は失敗で終了し、mount namespace ごと消える）
 //! - **`lo` は本 API が up にする**: netns の作成直後に `lo` を up にし、up にできなければエラー(fail-closed)。
 //!   保持役(H2)が重複して up にしたり、up でない前提で組んだりしない
 //!
@@ -382,6 +391,87 @@ pub fn root_entry_count(root: &PodRoot) -> Result<usize, TraitError> {
         n = n.saturating_add(1);
     }
     Ok(n)
+}
+
+const MSG_SHM_TARGET: &str = "the pod /dev/shm mount point is not usable";
+const MSG_SHM_MOUNT: &str = "failed to mount the pod /dev/shm";
+const MSG_SHM_VERIFY: &str = "the pod /dev/shm does not have the expected attributes";
+
+/// 保持役の mount ns で pod の `/dev/shm` を載せる場所（保持役自身の mount ns の中の固定パス。外部入力ではない）。
+const POD_SHM_PATH: &std::ffi::CStr = c"/dev/shm";
+
+/// 保持役の mount ns に載せた pod の `/dev/shm`（tmpfs のルート）の素性（`st_dev`・`st_ino`。CRI-2・CORE-3・SEC-5・#4821）。
+///
+/// `st_dev` は tmpfs の superblock ごとに一意なので、コンテナの init が保持役の mnt ns へ入って開いた `/dev/shm` が
+/// この tmpfs かを照合できる（S2・#4822）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PodShm {
+    dev: u64,
+    ino: u64,
+}
+
+impl PodShm {
+    /// tmpfs のルートの `st_dev`。
+    pub fn dev(&self) -> u64 {
+        self.dev
+    }
+
+    /// tmpfs のルートの `st_ino`。
+    pub fn ino(&self) -> u64 {
+        self.ino
+    }
+}
+
+/// 保持役の mount ns の `/dev/shm` に、pod で共有する tmpfs を載せる（CRI-2・CORE-3・SEC-5・#4821。S1）。
+///
+/// 中身はコンテナの既定の `/dev/shm`（[`crate::tmpfs::TmpfsMountSpec::default_dev_shm`]。64 MiB・`nosuid,nodev,noexec`・
+/// mode 1777。#1654）と同じ定義から作る。呼び出し元は保持役の段 2 で、[`establish_pod_namespaces`] で作った mount ns
+/// （`/` は再帰 private のため、載せたマウントはホストへ伝播しない）の中から、pod の userns の capability を落とす前に呼ぶ。
+///
+/// 載せ先は `O_NOFOLLOW` で開いたディレクトリの fd のまま `move_mount` へ渡す。載せた後に同じパスを開き直し、載せた
+/// マウントのルートと同じ素性であること・属性 3 つ・mode 1777 を確かめ、合わなければ返さない（fail-closed）。
+/// ホストに `/dev/shm` のディレクトリが無い構成は `FailedPrecondition`。マウントの fd は返さない（マウントは mount ns に
+/// 残り、保持役が開いたままにする fd を増やさない）。
+pub fn mount_pod_shm() -> Result<PodShm, TraitError> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let spec = crate::tmpfs::TmpfsMountSpec::default_dev_shm()?;
+    let create = sys::TmpfsCreate {
+        mode: spec.mode.bits(),
+        size: spec.size.map(|s| s.bytes()),
+        flags: sys::TmpfsMountFlags {
+            read_only: spec.read_only,
+            exec: spec.exec,
+        },
+    };
+    let target = sys::open_dir_path_nofollow(None, POD_SHM_PATH)
+        .map_err(|_| TraitError::new(ErrorCode::FailedPrecondition, MSG_SHM_TARGET))?;
+    let mounted = sys::mount_tmpfs_on(target.as_fd(), create).map_err(|e| match e {
+        sys::SysError::Os(errno) if errno == sys::EPERM => {
+            TraitError::new(ErrorCode::PermissionDenied, MSG_DENIED)
+        }
+        sys::SysError::Unsupported => TraitError::new(ErrorCode::Unimplemented, MSG_SHM_MOUNT),
+        _ => TraitError::new(ErrorCode::Internal, MSG_SHM_MOUNT),
+    })?;
+    let verify = || TraitError::new(ErrorCode::Internal, MSG_SHM_VERIFY);
+    let meta = |fd: std::os::fd::BorrowedFd<'_>| {
+        let file = std::fs::File::from(fd.try_clone_to_owned().map_err(|_| verify())?);
+        file.metadata().map_err(|_| verify())
+    };
+    let ours = meta(mounted.as_fd())?;
+    let top = sys::open_dir_path_nofollow(None, POD_SHM_PATH).map_err(|_| verify())?;
+    let seen = meta(top.as_fd())?;
+    let flags = sys::mount_flags(top.as_fd()).map_err(|_| verify())?;
+    let attrs_ok = flags.is_valid() && flags.is_nosuid() && flags.is_nodev() && flags.is_noexec();
+    if (seen.dev(), seen.ino()) != (ours.dev(), ours.ino())
+        || !attrs_ok
+        || seen.permissions().mode() & 0o7777 != spec.mode.bits()
+    {
+        return Err(verify());
+    }
+    Ok(PodShm {
+        dev: ours.dev(),
+        ino: ours.ino(),
+    })
 }
 
 const MSG_POD_INIT: &str = "failed to start the pod init";

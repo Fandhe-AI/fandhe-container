@@ -1,28 +1,29 @@
-//! pod 保持役の READY / ERROR フレーム（固定 96 バイト。OS 非依存の純関数。CRI-2・SEC-5・REPAIR-2・REPAIR-5・#2874・#4808・#4815）。
+//! pod 保持役の READY / ERROR フレーム（固定 112 バイト。OS 非依存の純関数。CRI-2・SEC-5・REPAIR-2・REPAIR-5・#2874・#4808・#4815・#4821）。
 //!
 //! 保持役（`holder`）が stdout へ 1 回だけ書き、受信側（plugin-cri の起動処理〔H6・#2877〕と実機試験）が
 //! [`PodHolderFrame::decode`] で解釈する。生の `Vec<u8>` を手で組まず、全欄を検証した型だけを通す。
 //! 受信側は長さを [`FRAME_LEN`] に固定し、期限つきで読む（`client::read_ready`）ので、無制限確保も無期限待ちも無い。
 //!
 //! 形式（整数は LE）: magic 4・version 1・kind 1・reserved 2（0）・欄 A 8・user dev/ino 16・ipc dev/ino 16・net dev/ino 16・
-//! mnt dev/ino 16・pid ns dev/ino 16。READY の欄 A は pid、ERROR の欄 A はエラーコードのワイヤー値で、使わない欄は 0 にする。
-//! pid ns の欄は pod の pid ns を作ったとき（`--share-pid`。#4815）だけ値を持ち、作らないときは 0 にする。
+//! mnt dev/ino 16・pid ns dev/ino 16・shm dev/ino 16。READY の欄 A は pid、ERROR の欄 A はエラーコードのワイヤー値で、使わない欄は
+//! 0 にする。pid ns の欄は pod の pid ns を作ったとき（`--share-pid`。#4815）だけ値を持ち、作らないときは 0 にする。shm の欄は
+//! 保持役の mount ns の `/dev/shm` に載せた tmpfs のルートの `st_dev`・`st_ino`（#4821。nsfs ではない）で、READY では常に値を持つ。
 //!
 //! version 2（#4808）で pod の mount namespace（pod-init の空の root を作る ns）の素性を、version 3（#4815）で pod の
-//! pid namespace（`pid_for_children`）の素性を足した。旧い版（64・80 バイト）は受けない（保持役と受信側は同じ配布物に
+//! pid namespace（`pid_for_children`）の素性を、version 4（#4821）で pod の `/dev/shm` の tmpfs の素性を足した。旧い版（64・80・96 バイト）は受けない（保持役と受信側は同じ配布物に
 //! 入るため、旧い版との往復は起きない）。
 
 use fandhe_container_core::traits::types::{ErrorCode, TraitError};
 
 /// フレームの長さ（バイト）。
-pub const FRAME_LEN: usize = 96;
+pub const FRAME_LEN: usize = 112;
 
 const MAGIC: [u8; 4] = *b"FCPH";
-const VERSION: u8 = 3;
+const VERSION: u8 = 4;
 const KIND_READY: u8 = 1;
 const KIND_ERROR: u8 = 2;
 
-/// nsfs 上の namespace の素性（`st_dev`・`st_ino`）。
+/// ファイルの素性（`st_dev`・`st_ino`）。namespace の欄は nsfs、shm の欄は tmpfs のルート。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NsId {
     /// `st_dev`。
@@ -47,11 +48,14 @@ pub struct PodHolderReady {
     mnt: NsId,
     /// pod の pid namespace（保持役の `pid_for_children`。PID 1 は pod-init。#4815）。作らないときは `None`。
     pid_ns: Option<NsId>,
+    /// 保持役の mount ns の `/dev/shm` に載せた pod の tmpfs のルート（#4821）。
+    shm: NsId,
 }
 
 impl PodHolderReady {
     /// 検証つきで作る。pid は `1..=i32::MAX`、ino は非 0 で互いに異なり、dev はすべてで一致すること（nsfs は 1 つの
-    /// superblock）。`pid_ns` も持つなら同じ検査に含める。満たさなければ `FailedPrecondition`。
+    /// superblock）。`pid_ns` も持つなら同じ検査に含める。`shm` は tmpfs のため dev・ino が非 0 で、dev が nsfs と異なる
+    /// こと。満たさなければ `FailedPrecondition`。
     pub fn new(
         pid: u32,
         user: NsId,
@@ -59,6 +63,7 @@ impl PodHolderReady {
         net: NsId,
         mnt: NsId,
         pid_ns: Option<NsId>,
+        shm: NsId,
     ) -> Result<Self, TraitError> {
         let pid_ok = (1..=i32::MAX as u32).contains(&pid);
         let mut all = vec![user, ipc, net, mnt];
@@ -69,7 +74,8 @@ impl PodHolderReady {
                 .enumerate()
                 .all(|(i, a)| all.iter().skip(i + 1).all(|b| a.ino != b.ino));
         let dev_ok = all.iter().all(|n| n.dev == user.dev);
-        if !(pid_ok && ino_ok && dev_ok) {
+        let shm_ok = shm.dev != 0 && shm.ino != 0 && shm.dev != user.dev;
+        if !(pid_ok && ino_ok && dev_ok && shm_ok) {
             return Err(bad("pod holder READY contents are inconsistent"));
         }
         Ok(Self {
@@ -79,6 +85,7 @@ impl PodHolderReady {
             net,
             mnt,
             pid_ns,
+            shm,
         })
     }
 
@@ -110,6 +117,11 @@ impl PodHolderReady {
     /// pod の pid namespace（作ったときだけ。#4815）。
     pub fn pid_ns(&self) -> Option<NsId> {
         self.pid_ns
+    }
+
+    /// pod の `/dev/shm` の tmpfs のルート（#4821）。
+    pub fn shm(&self) -> NsId {
+        self.shm
     }
 }
 
@@ -191,6 +203,8 @@ impl PodHolderFrame {
             put(&mut f.0, 80, p.dev);
             put(&mut f.0, 88, p.ino);
         }
+        put(&mut f.0, 96, r.shm.dev);
+        put(&mut f.0, 104, r.shm.ino);
         f
     }
 
@@ -253,10 +267,11 @@ impl PodHolderFrame {
                         (0, 0) => None,
                         (dev, ino) => Some(NsId { dev, ino }),
                     },
+                    ns(96)?,
                 )?))
             }
             Some(KIND_ERROR) => {
-                for at in [16, 24, 32, 40, 48, 56, 64, 72, 80, 88] {
+                for at in [16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104] {
                     if word(at)? != 0 {
                         return Err(bad("pod holder ERROR frame has non-zero unused fields"));
                     }
@@ -281,8 +296,13 @@ mod tests {
         }
     }
 
+    /// tmpfs のルート（nsfs と別の dev）。
+    fn shm() -> NsId {
+        NsId { dev: 48, ino: 2 }
+    }
+
     fn sample() -> PodHolderReady {
-        PodHolderReady::new(4242, ns(1), ns(2), ns(3), ns(4), Some(ns(5))).unwrap()
+        PodHolderReady::new(4242, ns(1), ns(2), ns(3), ns(4), Some(ns(5)), shm()).unwrap()
     }
 
     /// CRI-2・SEC-5・#2874: READY の往復とワイヤーのレイアウト（具体値）。
@@ -291,8 +311,8 @@ mod tests {
         let f = PodHolderFrame::ready(&sample());
         let b = f.as_bytes();
         assert_eq!(&b[0..4], b"FCPH");
-        assert_eq!(b.len(), 96);
-        assert_eq!((b[4], b[5], b[6], b[7]), (3, 1, 0, 0));
+        assert_eq!(b.len(), 112);
+        assert_eq!((b[4], b[5], b[6], b[7]), (4, 1, 0, 0));
         assert_eq!(u64::from_le_bytes(b[8..16].try_into().unwrap()), 4242);
         assert_eq!(
             u64::from_le_bytes(b[24..32].try_into().unwrap()),
@@ -309,8 +329,11 @@ mod tests {
             0xF000_0005
         );
         assert_eq!(sample().pid_ns(), Some(ns(5)));
+        assert_eq!(u64::from_le_bytes(b[96..104].try_into().unwrap()), 48);
+        assert_eq!(u64::from_le_bytes(b[104..112].try_into().unwrap()), 2);
+        assert_eq!(sample().shm(), shm());
         // pid ns を作らない保持役は欄を 0 にし、復号で `None` に戻る。
-        let no_pid = PodHolderReady::new(4242, ns(1), ns(2), ns(3), ns(4), None).unwrap();
+        let no_pid = PodHolderReady::new(4242, ns(1), ns(2), ns(3), ns(4), None, shm()).unwrap();
         let nb = *PodHolderFrame::ready(&no_pid).as_bytes();
         assert_eq!(&nb[80..96], &[0u8; 16]);
         assert_eq!(
@@ -346,7 +369,8 @@ mod tests {
     #[test]
     fn cri2_pod_holder_decode_rejects_malformed_frames() {
         let good = *PodHolderFrame::ready(&sample()).as_bytes();
-        assert!(PodHolderFrame::decode(&good[..95]).is_err());
+        assert!(PodHolderFrame::decode(&good[..111]).is_err());
+        assert!(PodHolderFrame::decode(&good[..96]).is_err());
         assert!(PodHolderFrame::decode(&good[..80]).is_err());
         assert!(PodHolderFrame::decode(&good[..64]).is_err());
         let mut long = good.to_vec();
@@ -357,7 +381,16 @@ mod tests {
             b[at] = v;
             PodHolderFrame::decode(&b)
         };
-        for (at, v) in [(0, b'X'), (4, 1), (4, 2), (4, 4), (5, 9), (6, 1), (7, 1)] {
+        for (at, v) in [
+            (0, b'X'),
+            (4, 1),
+            (4, 2),
+            (4, 3),
+            (4, 5),
+            (5, 9),
+            (6, 1),
+            (7, 1),
+        ] {
             let e = mutate(at, v).unwrap_err();
             assert_eq!(e.code(), ErrorCode::FailedPrecondition, "at {at}");
         }
@@ -381,8 +414,12 @@ mod tests {
         assert!(set(88, 0).is_err());
         assert!(set(88, 0xF000_0004).is_err());
         assert!(set(80, 5).is_err());
+        // shm の dev 0・ino 0・nsfs と同じ dev。
+        assert!(set(96, 0).is_err());
+        assert!(set(104, 0).is_err());
+        assert!(set(96, 4).is_err());
         // ERROR: 使わない欄が非 0、未知コード。
-        for at in [16, 72, 88] {
+        for at in [16, 72, 88, 96, 104] {
             let mut e = *PodHolderFrame::error(ErrorCode::Timeout).as_bytes();
             e[at] = 1;
             assert!(PodHolderFrame::decode(&e).is_err(), "at {at}");

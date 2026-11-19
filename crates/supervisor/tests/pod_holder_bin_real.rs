@@ -73,7 +73,9 @@ mod linux {
     use std::process::{Child, Command, ExitCode, Stdio};
     use std::time::{Duration, Instant};
 
-    use fandhe_container_supervisor::pod_holder::{PodHolderReady, READY_TIMEOUT, read_ready};
+    use fandhe_container_supervisor::pod_holder::{
+        NsId, PodHolderReady, READY_TIMEOUT, read_ready,
+    };
 
     use super::reap;
 
@@ -335,6 +337,41 @@ mod linux {
         (md.dev(), md.ino())
     }
 
+    /// 保持役の mount ns の `/dev/shm`（#4821）が READY の素性の tmpfs で、64 MiB・mode 1777・`nosuid,nodev,noexec` であること。
+    fn assert_pod_shm(pid: u32, shm: NsId) {
+        let md = std::fs::metadata(format!("/proc/{pid}/root/dev/shm"))
+            .unwrap_or_else(|e| fail(&format!("cannot stat the holder /dev/shm: {e}")));
+        assert_eq!(
+            (md.dev(), md.ino()),
+            (shm.dev, shm.ino),
+            "READY shm identity"
+        );
+        assert_eq!(md.mode() & 0o7777, 0o1777, "holder /dev/shm mode");
+        let info = std::fs::read_to_string(format!("/proc/{pid}/mountinfo")).expect("mountinfo");
+        let line = info
+            .lines()
+            .rfind(|l| l.split_whitespace().nth(4) == Some("/dev/shm"))
+            .unwrap_or_else(|| fail("the holder has no /dev/shm mount"));
+        let (head, tail) = line.split_once(" - ").expect("mountinfo separator");
+        let opts: Vec<&str> = head
+            .split_whitespace()
+            .nth(5)
+            .unwrap_or("")
+            .split(',')
+            .collect();
+        for want in ["rw", "nosuid", "nodev", "noexec"] {
+            assert!(opts.contains(&want), "missing {want}: {line}");
+        }
+        let mut fs = tail.split_whitespace();
+        assert_eq!(fs.next(), Some("tmpfs"), "{line}");
+        let sb: Vec<&str> = fs.nth(1).unwrap_or("").split(',').collect();
+        // mode は既定の 1777 のとき mountinfo に出ない（`mm/shmem.c` の `shmem_show_options`）ため、上の `st_mode` で照合する。
+        assert!(
+            sb.contains(&"size=65536k") && !sb.iter().any(|o| o.starts_with("mode=")),
+            "{line}"
+        );
+    }
+
     fn nsenter_cmd(pid: u32) -> Command {
         let mut c = Command::new(NSENTER);
         c.arg("--preserve-credentials")
@@ -350,6 +387,15 @@ mod linux {
     // ---- シナリオ ----
 
     fn scenario_a() {
+        // 保持役の `/dev/shm` のマウントが試験プロセスの mount ns へ伝播しないこと（#4821）の比較の基準。
+        let own_shm_lines = || {
+            std::fs::read_to_string("/proc/self/mountinfo")
+                .expect("own mountinfo")
+                .lines()
+                .filter(|l| l.split_whitespace().nth(4) == Some("/dev/shm"))
+                .count()
+        };
+        let shm_lines_before = own_shm_lines();
         // 継承 fd(9)が閉じられることも同時に確かめる。
         let mut h = start_holder(Some("exec 9</dev/null;"));
         let pid = h.pid();
@@ -389,6 +435,18 @@ mod linux {
             .unwrap_or_else(|e| fail(&format!("cannot list the pod root: {e}")))
             .count();
         assert_eq!(root_entries, 0, "the pod root is empty");
+        assert_pod_shm(pid, h.ready.shm());
+        assert_eq!(
+            own_shm_lines(),
+            shm_lines_before,
+            "the holder /dev/shm must not propagate to our mount namespace"
+        );
+        let own_shm = std::fs::metadata("/dev/shm").expect("own /dev/shm");
+        assert_ne!(
+            own_shm.dev(),
+            h.ready.shm().dev,
+            "our /dev/shm is not the pod tmpfs"
+        );
         let map = std::fs::read_to_string(format!("/proc/{pid}/uid_map")).expect("uid_map");
         let first: Vec<&str> = map
             .lines()
@@ -402,7 +460,7 @@ mod linux {
         }
         assert_eq!(h.stop_by_eof().code(), Some(0));
         println!(
-            "pod_holder_bin_real: scenario A ok: READY carries the pid and the namespace identities (root=false)"
+            "pod_holder_bin_real: scenario A ok: READY carries the pid, the namespace identities and the pod /dev/shm tmpfs (root=false)"
         );
     }
 

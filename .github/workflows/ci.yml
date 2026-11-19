@@ -3249,7 +3249,7 @@ jobs:
             --src crates/plugin-cri/tests/cri_exec_real.rs --log "${log}" \
             --select '^production_binary_exec_real: (pod-shm|termination-log) ok: ' --min 4 \
             --forbid 'PRECONDITION FAILED' --forbid 'pod-shm FAILED' --summary
-          # 段 T（#4820・CRI-2・CORE-3・SEC-1・SEC-5）: pid namespace の TARGET（debug コンテナが対象の init を PID 1 として見ること、
+          # 段 G（#4820・CRI-2・CORE-3・SEC-1・SEC-5）: pid namespace の TARGET（debug コンテナが対象の init を PID 1 として見ること、
           # 対象の停止で debug が止まること）の成功行 2 行を試験ソースから導出して照合する。pull・ステップ数・期限は変えない。
           scripts/check-success-lines.sh --name production_binary_exec_real_pid_target \
             --src crates/plugin-cri/tests/cri_exec_real.rs --log "${log}" \

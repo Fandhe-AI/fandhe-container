@@ -1,6 +1,6 @@
 # plugin-cri の再起動をまたぐ sandbox・コンテナ記録の再採用の設計と実装単位（CRI-1・CRI-2・OCI-7・CORE-1・REPAIR-3）
 
-設計記録（#2902）。コードは本変更で変えない。実装は「実装単位」の各 issue で行う。オーナー確認が要る点は「要確認事項」に分け、オーナー判断は未取得である。
+設計記録（#2902）。コードは本変更で変えない。実装は「実装単位」の各 issue で行う。オーナー確認が要る点は「要確認事項」に分けた（1 は 2026-11-19 にオーナーが判断済み。3 は #2931 で実装済み。2 は未取得）。
 
 ## 背景
 
@@ -43,7 +43,7 @@
 
 ## 形式
 
-- serde を使わない。固定のヘッダ行（LF・ASCII。版の行 `fandhe-cri-sandbox-record v1` / `fandhe-cri-container-record v2`（コンテナは #4322 で v2。v1 も復号で受ける）、キー順固定のスカラー項目）と、`config=<長さ>` の行に続く長さちょうどの prost 符号化した `PodSandboxConfig` / `ContainerConfig`。prost は既存依存で、新規依存は足さない
+- serde を使わない。固定のヘッダ行（LF・ASCII。版の行 `fandhe-cri-sandbox-record v2` / `fandhe-cri-container-record v2`（sandbox は #2940、コンテナは #4322 で v2。どちらも v1 を復号で受ける）、キー順固定のスカラー項目）と、`config=<長さ>` の行に続く長さちょうどの prost 符号化した `PodSandboxConfig` / `ContainerConfig`。prost は既存依存で、新規依存は足さない
 - 復号は厳密にする。版の完全一致・キー順固定・重複/未知キー/余分な行/CRLF なし・ID とファイル名の一致・長さの上限（config は `MAX_CONFIG_ENCODED_BYTES`、記録全体の上限を先に確認）。復号後に `config_limits` と同じ上限検証を通し、RunPodSandbox/CreateContainer と同じ上限を再採用時にも効かせる。違反は `InvalidArgument`（入力値をメッセージに載せない。REPAIR-4）
 - 秘密の最小化: `ContainerConfig.envs` は記録に書かない（Status/List は返さず、bundle 作成後は不要）。`command`・`args` も応答に出ないため書かない案があるが、推奨は envs だけを除く（要確認事項 2）
 - 保持量（`retained_bytes`）は読み込み時に再計算し、記録に書かない
@@ -219,12 +219,12 @@ CORE-10 への当てはめ（CORE-10 の目標 0.136 秒、Linux の Docker 0.29
 | ---- | ---------- | ------ |
 | メタデータ | 中央デーモンのメタデータストアと、コンテナごとの status checkpoint（`status.go`） | 常駐の中央なし。core の `state.json` と CRI 記録ファイル |
 | 前提 | plugin の停止中、ファイルと checkpoint に触れず、コンテナが追加されない（`restart.go` の前提コメント） | 前提にできない（CLI と状態ルートを共有）。所有の証明（CRI 記録）と core の照合で置き換える |
-| sandbox | task の状態を引き、取れなければ Unknown→NotReady。running なら Ready（`podsandbox/recover.go`） | 保持役が再起動をまたがないため常に NotReady（(a) 採用時は素性の照合つきで Ready） |
+| sandbox | task の状態を引き、取れなければ Unknown→NotReady。running なら Ready（`podsandbox/recover.go`） | 保持役が再起動をまたがないため常に NotReady（要確認事項 1 は (b) で確定） |
 | コンテナ | 10 秒/件で読み、失敗すれば `Unknown`（checkpoint の他の項目は残す） | core を正に写し、不明は `CONTAINER_UNKNOWN`。期限つき |
 | 孤児ディレクトリ | `cleanupOrphanedIDDirs` で削除 | CRI 記録なしかつ core が Absent の bundle だけ回収 |
 | 自動停止 | しない | しない（kubelet の Stop/Remove に委ねる） |
 
-## 要確認事項（1 はオーナー判断済み。2・3 は未取得で、既定は安全側）
+## 要確認事項（1 はオーナー判断済み・3 は #2931 で実装済み。2 は未取得で、既定は安全側）
 
 1. 保持役を再起動をまたいで生かすか（2026-11-19 にオーナーが (b) で確定）
    - (a) supervisor と同じ `systemd-run --user --scope` で切り離して起動し、pidfd・starttime・ns の素性照合で再採用する。#2838 の「直接の子・zombie で pid 固定」と H2（#2874）の修正が要る。#2874 は open なので、採るなら H2 の前に設計を改める

@@ -77,7 +77,7 @@
 
 ## 範囲外
 
-- pid の共有（`shareProcessNamespace`）・`/dev/shm` の共有・uts の共有・`NamespaceMode::TARGET`: 下の「pid・uts・/dev/shm の共有と TARGET（#2903）」で設計した。uts は実装単位 U1〜U5 を起票済み。pid・`TARGET`・`/dev/shm` はオーナー判断待ち（#4607）で、判断が出るまで `UNIMPLEMENTED`（`/dev/shm` は共有しない現状のまま）
+- pid の共有（`shareProcessNamespace`）・`/dev/shm` の共有・uts の共有・`NamespaceMode::TARGET`: 下の「pid・uts・/dev/shm の共有と TARGET（#2903）」で設計した。uts は実装単位 U1〜U5 を起票済み。pid・`TARGET`・`/dev/shm` はオーナー判断待ち（#4607）で、判断が出るまで `UNIMPLEMENTED`（`/dev/shm` は共有しない現状のまま。`mounts[]` のホストの `/dev/shm` の bind〔#4888〕は pod の共有とは別の経路で、本節の対象ではない）
 - rootful の pod netns（#2241）
 - 再起動をまたぐ sandbox の再採用（TASK-59。設計は [cri-record-readoption.md](cri-record-readoption.md)・#2902）
 
@@ -176,6 +176,7 @@ PoC: `crates/core/src/oci_runtime/namespace_join.rs` の実機前提試験 `cri2
   - 範囲外・残余: 保持役が READY で報告した素性を launch の記録の `/dev/shm` の規則と親側でも照合する案は入れていない（init が複製の前後に同じ素性を照合済みのため。必要なら S3 の統合後に再評価）
   - **拒否の監査**: 素性・tmpfs 種別・属性 3 つの不一致（複製の前後と載せた後の再照合）は理由語 `pod_shm_identity_mismatch`（種別 `pod_shm_identity`・ビヘイビア CRI-2・`ErrorCode` は `PermissionDenied`）で返り、段 `mount_tmpfs` の許可リスト経由で親へ届いて層 `mount` の監査に 1 件残る（パスなし）。往復の失敗（`setns`・`/` の素性の変化）と権限不足は違反ではなく `NotApplicable`。launcher は fork の前に、spec が固定した期待の素性と自身の起動オプションの指定の素性の一致も確かめる（多重防御）。init は pod shm の指定があるのに tmpfs の集合に `/dev/shm`（配下を含む）が残っていれば、載せる前に `FailedPrecondition` で拒否する
   - **S3 への申し送り**: `(dev, ino)` は時間をまたいで一意ではない（tmpfs の匿名 dev は解放後に再利用される）。pin より前の窓の安全は保持役が生きていることに依存するため、S3 は READY の値をそのまま渡し、plugin-cri 側で `/dev/shm` を再 stat して値を作り直さない。chroot した環境では往復の後の `/` の照合が必ず食い違い `Internal` になるため使えない（fail-closed。縮退しない）
+  - **S3 と #4888 の関係**: CRI の `mounts[]` に `/dev/shm` の bind（許可リストの宛先。[cri-config-acceptance](cri-config-acceptance.md)）があれば、S3 は pod の共有 `/dev/shm` を渡さない（S3 の受け入れ条件。cri は未実装）。core は bind と pod の共有 `/dev/shm` の併用を `OverlapsTmpfs`（監査つき）で拒否するため、S3 より前でも両方が載ることはない（#4888）
 
 ### オーナー確認事項（#4607）
 
@@ -279,7 +280,7 @@ plugin-cri の `ProductionPodHolder`（`crates/plugin-cri/src/pod_holder.rs`）�
 
 あわせて readopt の不具合を直した（H4 の残り）: 保持役の注入下では起動の前に `pending=1`（`network_pending=0`）を書くため、クラッシュ後の再採用が `network_owned=true` に倒すと、pod network provider を差さない本番で Stop・Remove が回収待ちから抜けられなくなる。`network_owned` は `network_pending` だけから導く（`pending_unresolved` には従来どおり数える）。R11（#2940）は #2877 に依存しており循環するため、ここで直した。
 
-未実装（REPAIR-3）: 保持役の pid から `PodNamespacePaths` を作って bundle へ渡す配線（H5・#2876）は配線済みで、POD のコンテナは user・ipc に join する。保持役の netns の bundle への受け渡しも H8（#2878）で実装済み。素性（pid・starttime・ns の dev:ino）の記録と再採用時の終了済みの確認は R11（#2940）で実装済み（再採用した pid からパスやシグナルは作らない。再起動後の保持役の再採用は未採用）。未実装は、pod ネットワークの本番 provider（H10・#2879）・pid の共有・`TARGET`・`/dev/shm` の共有（設計は下の #2903 の節、判断待ちは #4607）と uts の共有（U1〜U5。#4608〜#4612）。
+未実装（REPAIR-3）: 保持役の pid から `PodNamespacePaths` を作って bundle へ渡す配線（H5・#2876）は配線済みで、POD のコンテナは user・ipc に join する。保持役の netns の bundle への受け渡しも H8（#2878）で実装済み。素性（pid・starttime・ns の dev:ino）の記録と再採用時の終了済みの確認は R11（#2940）で実装済み（再採用した pid からパスやシグナルは作らない。再起動後の保持役の再採用は未採用）。未実装は、pod ネットワークの本番 provider（H10・#2879）・pid の共有・`TARGET`・`/dev/shm` の共有（設計は下の #2903 の節、判断待ちは #4607。`mounts[]` の `/dev/shm` の bind は #4888 で別に受けるため含めない）と uts の共有（U1〜U5。#4608〜#4612）。
 
 ## 実装単位
 

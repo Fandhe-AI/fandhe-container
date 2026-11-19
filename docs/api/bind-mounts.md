@@ -27,6 +27,22 @@ Linux の fandhe-container は、OCI `config.json` の `mounts[]` に書いた b
 
 `rslave` は、ホストの peer group から受けるだけの slave で付ける（ホストで後からその元の下にマウントされた内容がコンテナ内に見える。コンテナからホストへは伝播しない）。元が属するホスト側のマウントが shared か slave である必要があり、private なら `start` は rootfs に触れる前に `FAILED_PRECONDITION` で失敗する（黙って private で載せない）。`private`・`rprivate` との併記は `INVALID_ARGUMENT`。CRI の HostToContainer はこの指定へ変換される（#2669・CRI-2・OCI-4）。
 
+## `/dev` 配下の bind（許可リスト。#4888）
+
+`/dev` 配下の宛先は原則として拒否するが、kubelet が既定で付ける次の 2 つだけを正規化後の完全一致で受ける（CRI-2・OCI-4・SEC-1・CORE-5）。CLI・stack の手書き `config.json` からも同じ判定を通る。
+
+| 宛先 | マウント元の種類 | 受けたときの扱い |
+| ---- | ---------------- | ---------------- |
+| `/dev/termination-log` | 通常ファイル | コンテナの `/dev` に空ファイル（0644）を作ってから bind する |
+| `/dev/shm` | ディレクトリ | 暗黙の `/dev/shm`（既定 64 MiB）と pod の共有 `/dev/shm` を載せない（containerd と同じ） |
+
+- 元の種類が違えば（ファイルに `/dev/shm`、ディレクトリに `/dev/termination-log`、FIFO・symlink を含む）、何も作らず `BindTargetKindMismatch` で拒否する。SEC-1 の監査に 1 件残る（パスは載せない）
+- `/dev/shm` の bind と、`--shm-size`・`--tmpfs /dev/shm`・`/dev/shm` 配下の tmpfs・pod の共有 `/dev/shm` との併用は、`INVALID_ARGUMENT`（`bind mount destination overlaps a tmpfs mount`）で拒否する。監査に 1 件残る
+- 既定と同値の `--shm-size 64m` の明示は暗黙の件と同じ扱いになり、bind が黙って勝つ（拒否しない）
+- `--ipc=host`（`/dev/shm` の件が無い構成）と `/dev/shm` の bind は併用できる
+- 上の 2 つ以外の `/dev` 配下（`/dev/shm/x`・`/dev/termination-log/x`・`/dev/shmx`・`/dev/console`・`/dev/pts`・`/dev/null` など）と、`/proc`・`/sys` 配下は従来どおり拒否する。宛先は正規化してから照合する（`/dev//shm/` は受ける。CRI の入口の扱いは [cri-config-acceptance](../design/cri-config-acceptance.md) を参照）
+- `/dev` 配下の bind では Landlock の権利を狭めない。分離は VFS の `nosuid`・`nodev`（指定時は `ro`・`noexec`）と、起動の記録の識別子の照合が担う
+
 ## 拒否するもの
 
 | 指定 | 理由 |
@@ -40,7 +56,7 @@ Linux の fandhe-container は、OCI `config.json` の `mounts[]` に書いた b
 | bundle の rootfs・bundle ディレクトリと同一、またはその祖先の `source` | コンテナが自身の rootfs を書き換える経路を作らない |
 | 状態ルート（状態の保存先）と同一・祖先・子孫の `source` | `state.json` 等の改変を防ぐ。rootfs・bundle の配下の `source` は受ける（#2063・SEC-1・OCI-4） |
 | procfs・sysfs・cgroup などの疑似 FS 上の `source`（`rbind` の配下に疑似 FS のマウントがある場合を含む） | ホストのプロセス・カーネルの情報の露出と、`linux.maskedPaths` / `readonlyPaths` の迂回を防ぐ。適用の段が固定した元の `fstatfs` の `f_type` と、付け替えた木の mountinfo の fstype で判定する（SEC-1・#2098・#2065） |
-| `/proc`・`/sys`・`/dev` とその配下の `destination` | 暗黙のマウントと固定の保護パスがあるため |
+| `/proc`・`/sys`・`/dev` とその配下の `destination`（`/dev/termination-log`・`/dev/shm` の 2 つだけ例外。上節） | 暗黙のマウントと固定の保護パスがあるため |
 | bind 同士で同一・入れ子の `destination` | 子の宛先がホストのディレクトリになるのを防ぐ |
 | `linux.readonlyPaths` / `maskedPaths` と重なる `destination` | 保護パスを覆えないようにする |
 | bind 以外の種類（`proc`・`tmpfs` など。`/sys` の sysfs を除く） | 未対応（`UNIMPLEMENTED`。受けるかは [#2347](https://github.com/Fandhe-AI/fandhe-container/issues/2347) で判断待ち。[判断記録](../design/oci-mounts-implicit-entries.md)） |
@@ -72,6 +88,7 @@ Docker / runc との差: 本実装は方式を事前に決め、縮退しない�
 - `source` は絶対パスのみ（bundle 相対は不可）
 - 疑似 FS（procfs・sysfs・cgroup など）上の `source` は拒否する（runc は受ける）
 - ホストの `/dev`（devtmpfs）配下の `source` は拒否する（runc は受ける。SEC-1・#2129）
+- `/dev/shm` の bind は `noexec` を付けず、サイズの上限も設けない（containerd と同じ。kubelet の既定の形）
 - `source` に symlink が含まれるときは拒否する（辿らない）。存在しない `source` は作らずに拒否する
 - `destination` の経路に symlink があるときは拒否する。`destination` のディレクトリは rootfs の中に作る
 - rootless（user namespace を使う）の起動経路だけが対象。rootful では受けない

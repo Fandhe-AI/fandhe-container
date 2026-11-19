@@ -22,6 +22,7 @@
 | 14 | port_mappings | plugin-cri `netsetup` の `publish_port`（本変更で実装済み。provider を注入した構成の `POD` だけ。本番は順 13 と同じく未注入のため `UNIMPLEMENTED`。下記「port_mappings の受け入れ方式」） | net・plugin-cri・cri | #2676 |
 | 15 | userns の uids / gids の写像 | オーナー判断待ち | core → cri | #2240 |
 | 16 | readonly_rootfs | core の `root.readonly`（#2767 で実装済み）→ cri が写す（実装済み。下記「readonly_rootfs の受け入れ方式」） | core → cri | #2827 |
+| 17 | kubelet 既定の mounts（`/dev/termination-log`・`/dev/shm` の bind） | core の許可リスト（`dev_bind_allowlist_kind`。#4888 で実装済み）を cri の `check_mount_set` も使う。`/dev/shm` の bind があるときの pod の共有 `/dev/shm` の抑止（S3）は未実装。下記「kubelet 既定の mounts の受け入れ方式」 | core・cri | #4888・#4823 |
 
 受け入れない項目（順 7 の Bidirectional を含む）の `UNIMPLEMENTED` の照合は `crates/cri/tests/bundle_spec.rs` に残し、受け入れた HostToContainer は同じ試験で `config.json` の `mounts[].options`（`rslave`）を具体値で照合する（#2669・CRI-2・OCI-4）。
 
@@ -144,6 +145,29 @@ containerd の `containerMounts` は sandbox のファイル（`/etc/hostname`�
 | Landlock の登録フック | [`security/landlock/fs.c` L1660-L1675](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/security/landlock/fs.c#L1660-L1675)（`path_mkdir`・`path_mknod`・`file_open` 等。`inode_permission` 相当のフックは無い） | 一致。Landlock は上の 3 操作の `security_*` の位置でだけ拒否し、それらは `EROFS` の判定より後ろ |
 
 結論: シナリオ Y の「`EACCES`（13）なら Landlock だけが止めていて VFS の読み取り専用化が効いていない」という判別は、v6.12 のソースの順序に裏付けられた（食い違いなし）。`production_launcher.rs` のドキュメントコメントが挙げる `lookup_open`・`filename_create`・`do_dentry_open` の順序とも一致する。範囲: 上の 3 操作に限る。`truncate`・`unlink`・`rename` など他の書き込み系の操作の順序は確かめていない。カーネル版は 6.12 のみで、他の版での順序の変化は確かめていない。
+
+## kubelet 既定の mounts の受け入れ方式（termination-log・/dev/shm。CRI-2・OCI-4・SEC-1・CORE-5。#4888）
+
+kubelet が既定で付ける `mounts[]` のうち、コンテナの `/dev` 配下の 2 つを受ける。判定は core の許可リスト（`crates/core/src/oci_runtime/bind_mounts.rs` の `dev_bind_allowlist_kind`）に従い、cri の `check_mount_set` も同じ関数を呼ぶ。`/dev` 配下のそれ以外の宛先は従来どおり `INVALID_ARGUMENT`（`mounts.container_path`）で拒否する。
+
+| CRI の要求 | 結果 |
+| ---------- | ---- |
+| `container_path` が `/dev/termination-log`、`host_path` が通常ファイル | bind（rw）。コンテナの `/dev` に空ファイル（0644）を作って載せる |
+| `container_path` が `/dev/shm`、`host_path` がディレクトリ（emptyDir の Memory 等） | bind。暗黙の `/dev/shm`（既定 64 MiB）は載せない（containerd `v2.4.2` と同じ扱い。`internal/cri/server/container_create.go` 1151 行の `isInCRIMounts(devShm, ...)` が偽のときだけ sandbox の shm を足す。sandbox の shm は `podsandbox/sandbox_run_linux.go` 315〜316 行の `noexec,nosuid,nodev`・`podsandbox/helpers_linux.go` 50 行の 64 MiB の tmpfs） |
+| 元の種類が違う（`/dev/termination-log` にディレクトリ、`/dev/shm` にファイル） | start で拒否（`BindTargetKindMismatch`。SEC-1 の記録に 1 件残る） |
+| `/dev/shm/x`・`/dev/termination-log/x`・`/dev/shmx`・`/dev/console` など | `INVALID_ARGUMENT`（従来どおり） |
+| 末尾の `/` つきの `/dev/shm/` など非正規形 | `INVALID_ARGUMENT`（cri が入口で拒否する。core は正規化後の宛先で照合する） |
+
+- 試験: cri の bundle の往復（kubelet の既定形。`crates/cri/tests/bundle_spec.rs`）と、core の単体試験（許可リストの表、種別違い、tmpfs との重なり）。実機前提の試験（`production_launcher` のシナリオ DV）の結果は本書では未記録
+- 受け入れ条件の「通る」は CreateContainer〜StartContainer の範囲で確かめた。kubelet が作るホスト側ディレクトリ（0750）へのコンテナ側からの到達性は未確認
+- S3（#4823）との関係: `/dev/shm` の bind があれば、CRI は pod の共有 `/dev/shm` を渡さない（S3 の受け入れ条件。cri は未実装）。core は bind と pod の共有 `/dev/shm` の併用を `OverlapsTmpfs`（監査つき）で拒否するため、S3 より前でも両方が載ることはない
+
+既知の差（containerd・kubelet との比較）:
+
+- SELinux 有効ノードでは、kubelet が `mounts` に `selinux_relabel=true` を付け、本実装は `mounts.selinux_relabel` を `UNIMPLEMENTED` にするため、既定の config が通らない。`/dev/termination-log` に限らず `/etc/hosts`・volume にも付く。termination-log の出典は kubernetes `v1.37.1` の `pkg/kubelet/kuberuntime/kuberuntime_container.go` 533〜537 行（`SelinuxRelabel: selinux.GetEnabled()`）。範囲外として別 issue に切り出すことを推奨（オーナー判断待ち）
+- `mountPath: /dev/shm/` のように末尾の `/` つきで渡すと、本実装だけ `INVALID_ARGUMENT` になる。containerd は既定の `/dev/shm` を足すかの判定で `filepath.Clean` を通して比べ（`internal/cri/server/helpers.go` 221〜223 行）、末尾の `/` つきでも受ける（spec の `destination` には渡された文字列のまま入る。`internal/cri/opts/spec_linux_opts.go` 132 行）
+- 既定以外の `terminationMessagePath` は `INVALID_ARGUMENT` のまま
+- `/dev/shm` の bind は `noexec` が付かず、サイズの上限も無い（containerd と同じ。CRI mounts の bind に付くのは `rbind`・propagation・`ro` / `rw` だけ。`internal/cri/opts/spec_linux_opts.go` の `WithMounts`）
 
 ## dns_config の受け入れ方式（CRI-2・NET-5。#2665）
 

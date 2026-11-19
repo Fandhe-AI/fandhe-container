@@ -34,6 +34,7 @@
 //!   食い違いは launch の前に拒否する（再解決しない）。
 //! - 非 Linux では固定できない（型は作れない）。
 
+#[cfg(target_os = "linux")]
 use std::sync::Arc;
 
 #[cfg(target_os = "linux")]
@@ -75,7 +76,7 @@ const MSG_UNVERIFIED: &str = "the pid namespace target could not be verified";
 ///
 /// `LaunchOptions` に載り、`start` が参加先の fd として使う。launch pidfd（`Pid1Target`）も保持し、restart の再 launch の前に
 /// 対象の生存を確かめる。clone は fd を共有し、同一性は fd の同一性。
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PinnedPidTarget {
     #[cfg(target_os = "linux")]
     target: Arc<Pid1Target>,
@@ -105,9 +106,15 @@ impl PartialEq for PinnedPidTarget {
 
 impl Eq for PinnedPidTarget {}
 
-// 非 Linux の `Arc` の未使用警告を避ける（型は Linux の欄でだけ使う）。
-#[cfg(not(target_os = "linux"))]
-const _: Option<Arc<()>> = None;
+/// 固定した pid ns の素性だけを出す（`Pid1Target` の pid・cgroup のパス〔コンテナ ID を含む〕をログへ出さない。SEC-1）。
+impl std::fmt::Debug for PinnedPidTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("PinnedPidTarget");
+        #[cfg(target_os = "linux")]
+        d.field("identity", &self.identity);
+        d.finish_non_exhaustive()
+    }
+}
 
 impl PinnedPidTarget {
     /// 固定した pid namespace の素性 `(st_dev, st_ino)`。

@@ -133,14 +133,14 @@
 #### 実装（T1・#4819）: core・supervisor の受け口
 
 - 入力: 対象は supervisor の起動オプション `--pid-target <コンテナ ID>` で受ける。config.json の pid は path なしの entry 1 件（保持役の user・ipc は path つき）で、config は純 OCI のまま。`--pid-target` を書き出すのは plugin-cri の T2（#4820）。
-- 固定: supervisor の `resolve_pid_target(store, source, target)` が、`check_launcher_available` と `build_launcher` で fork の前に呼ぶ。手順は次のとおり（CRI-2・CORE-3・SEC-1）。
+- 固定: supervisor の `resolve_pid_target(store, source, target)` が、`build_launcher` で fork の前に呼ぶ（特権ランチャー経由の拒否は `check_launcher_available` と `build_launcher` の両方）。手順は次のとおり（CRI-2・CORE-3・SEC-1）。
   1. 状態ストアの対象の記録を読む。稼働中で pid・cgroup・起動素性があり、pod 共有の pid ns の init でないことを確かめる
   2. 対象の supervisor の制御チャネル（kind 6。[exec-pidfd-handover.md](exec-pidfd-handover.md)）から launch pidfd を受け取る。待ちの予算は 2 秒（`PID_TARGET_OBTAIN_BUDGET`）。受け取ったら接続はすぐ閉じる
   3. launch pidfd の経路（`Pid1Target`）で、未終了・NSpid の直接の入れ子の PID 1・cgroup の所属を確かめる
   4. pidfd で未終了を確かめてから `/proc/<pid>/ns/pid` を開いて素性を固定し、開いた後にもう一度確かめる
   - 記録の pid からの `pidfd_open` や `/proc` 経由の参加は行わない（SEC-1）。
 - 合流: 固定した pid ns の fd は既存の `NamespaceJoin` の pid 欄へ入る。以降の検査（nsfs・所有 userns・親の pid ns・素性）と監査は pid の path の場合と同じ（既存の `PodNamespaceJoinOutcome` を使い、新しい語彙は足さない）。
-- 非 Linux: `PinnedPidTarget` は作れない（型だけ）。`Unimplemented`（`a pid namespace target requires Linux`）で拒否する。
+- 非 Linux: `PinnedPidTarget` は作れない（型だけ）。supervisor 自体が Linux 限定で、`the supervisor requires Linux` で拒否する。
 - 受ける構成と拒否:
 
 | 構成 | 判定 |
@@ -167,7 +167,6 @@
 | user・ipc の join なし | Unimplemented | `a pid namespace target requires a pod user and ipc namespace join` |
 | pid の path と併用 | InvalidArgument | `a pid namespace target cannot be combined with a pid namespace path` |
 | spec と launcher の食い違い（restart の再 launch を含む） | FailedPrecondition | `the launch spec was reconciled with a different pid namespace target` |
-| 非 Linux | Unimplemented | `a pid namespace target requires Linux` |
 
 - 残り（T2・#4820）: cri の受け入れ（同じ pod・対象の pid が `CONTAINER`・対象の存在の検証）と plugin-cri の argv の書き出し。それまで CRI の pid の `TARGET` は `UNIMPLEMENTED` のまま（[cri-config-acceptance.md](cri-config-acceptance.md)）。
 

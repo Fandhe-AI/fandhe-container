@@ -817,7 +817,7 @@ mod tests {
     }
 
     /// CRI-2・CORE-3・SEC-1・SEC-5・#4819: `--pid-target <コンテナ ID>` の受理（具体値）・不正値・重複・値の欠落、
-    /// 全オプション同時の 16 要素（上限ちょうど）の受理と 17 要素の拒否。
+    /// 全オプション同時の 16 要素（上限ちょうど）の受理（17 要素の拒否は `sup1_args_parse_rejects_invalid`）。
     #[test]
     fn cri2_4819_parse_pid_target() {
         let none = StartArgs::parse(os(&["start", "--root", ROOT, "c1"])).unwrap();
@@ -991,7 +991,7 @@ mod tests {
     #[test]
     fn sup1_args_parse_rejects_invalid() {
         let long = "a".repeat(MAX_ARG_LEN + 1);
-        let fifteen: Vec<&str> = vec!["start"; MAX_ARGS + 1];
+        let too_many: Vec<&str> = vec!["start"; MAX_ARGS + 1];
         let cases: Vec<Vec<&str>> = vec![
             vec![],
             vec!["run", "--root", ROOT, "c1"],
@@ -1014,7 +1014,7 @@ mod tests {
             vec!["start", "--root", ROOT, "--restart", "sometimes", "c1"],
             vec!["start", "c1"],
             vec!["start", "--root", ROOT, "bad/id"],
-            fifteen,
+            too_many,
             vec![
                 "start", "--root", ROOT, "--stdin", "open", "--stdin", "once", "c1",
             ],

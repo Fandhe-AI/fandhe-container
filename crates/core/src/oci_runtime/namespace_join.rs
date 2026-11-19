@@ -72,6 +72,8 @@
 //!   healthcheck の対象の固定（`Pid1Target`）は、launch の記録に残した同じ素性（`LaunchIsolationRecord::pod_pid_ns`）で
 //!   launch pidfd の経路でだけ対象を受け、記録 pid から開く縮退経路を拒否する（#4813）。reapply の pid ns の照合も記録した
 //!   素性で行う。cri は #4817 まで pid の path を出さない。
+//! - pid の参加先は path の代わりに起動オプションの `PinnedPidTarget`（pid の TARGET。`pid_target` モジュール。#4819）でも
+//!   受ける。対象の launch pidfd で固定した fd を pid 欄へ入れ、検査は path と同じ。path との併用は `InvalidArgument`。
 //! - `/dev/shm`（POSIX shm）は、起動オプションの `PodShmSource`（supervisor の argv `--pod-shm`。`pod_shm` モジュール。
 //!   #4822・S2）を受けたときだけ pod で共有する（init が保持役の mount namespace の tmpfs を複製して載せる。`exec::pod_shm`）。
 //!   指定が無ければ共有されず、core がコンテナごとの tmpfs を載せる。本番の指定元（plugin-cri が保持役の pid と READY の
@@ -262,6 +264,9 @@ impl NamespaceJoin {
     }
 
     /// user・ipc（と任意で net）namespace のパスを開き、素性を照合して fd に固定する（モジュール doc の表）。
+    ///
+    /// `pid_target`（pid の TARGET。#4819）は pid の path と排他で、固定済みの fd を `Arc` で共有して pid 欄に入れる。以降の検査
+    /// （nsfs・種別・所有 userns・親の pid ns）と素性の取得は path の場合と同じ。
     ///
     /// 拒否は [`PinRejection`] で、素性検査による拒否には監査に残す結果が付く。
     #[cfg(target_os = "linux")]

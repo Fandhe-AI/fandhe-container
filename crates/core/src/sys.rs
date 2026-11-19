@@ -942,7 +942,7 @@ mod consts {
     ///
     /// 値の読み出しは既存の `ArchSysNo::get` と試験専用の `SyscallNumber::raw` だけを使い、
     /// 型の保証（対応外 arch では番号を取り出せない）は変えない。名前は小文字化で `libc` の
-    /// `SYS_<name>` と 1 対 1 に対応する（名前違いなし。28 件すべて照合）。
+    /// `SYS_<name>` と 1 対 1 に対応する（名前違いなし。29 件すべて照合）。
     /// 対象外: 対応外 arch の `consts` と `seccomp_notify` の対応外側は `ArchSysNo::UNSUPPORTED` で
     /// 番号を持たず、照合する値が無い（#1619）。x32・ILP32 は `target_pointer_width = "64"` の cfg で
     /// 対応外（`libc` の x32 の番号は `__X32_SYSCALL_BIT` 付きで別物）。
@@ -1379,7 +1379,7 @@ mod consts {
     ///
     /// 値の読み出しは既存の `ArchSysNo::get` と試験専用の `SyscallNumber::raw` だけを使い、
     /// 型の保証（対応外 arch では番号を取り出せない）は変えない。名前は小文字化で `libc` の
-    /// `SYS_<name>` と 1 対 1 に対応する（名前違いなし。28 件すべて照合）。
+    /// `SYS_<name>` と 1 対 1 に対応する（名前違いなし。29 件すべて照合）。
     /// 対象外: 対応外 arch の `consts` と `seccomp_notify` の対応外側は `ArchSysNo::UNSUPPORTED` で
     /// 番号を持たず、照合する値が無い（#1619）。x32・ILP32 は `target_pointer_width = "64"` の cfg で
     /// 対応外（`libc` の x32 の番号は `__X32_SYSCALL_BIT` 付きで別物）。
@@ -6961,7 +6961,7 @@ pub(crate) fn io_uring_setup_probe() -> Result<(), SysError> {
         return Err(SysError::Unsupported);
     }
     let nr = consts::SYS_IO_URING_SETUP.get()?;
-    // SAFETY: entries = 0・params = NULL（整数 0）でポインタは参照されない。カーネルは params の
+    // SAFETY: entries = 0・params = NULL（整数 0）で、Rust 側はポインタの実体を渡さない。カーネルは params の
     // `copy_from_user` に失敗して `EFAULT`（設定によっては先に `EPERM`）で返り、リング・fd の作成も
     // ユーザーメモリへの書き込みも生じない。
     let rc = unsafe { ffi_syscall!(nr, 0_i64, 0_i64) };

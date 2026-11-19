@@ -5866,13 +5866,15 @@ mod tests {
     }
 
     /// TASK-57.1: 1 件あたりの固定の上乗せ（4096 バイト）は、レジストリのスロット（伸長分を見込んで
-    /// 3 倍）と ID の文字列（64 バイト）を収める。構造体が大きくなって収まらなくなったら検出する。
+    /// 3 倍）と、`Box` でヒープに置く保持役の素性（記録 1 件につき 1 個なので 1 倍）と、ID の文字列
+    /// （64 バイト）を収める。構造体が大きくなって収まらなくなったら検出する。
     #[test]
     fn task_57_1_record_overhead_covers_registry_slot() {
         let slot = std::mem::size_of::<(String, SandboxRecord)>();
+        let boxed = std::mem::size_of::<holder_identity::RecordedHolderIdentity>();
         assert!(
-            3 * slot + 64 <= RETAINED_BYTES_PER_RECORD,
-            "registry slot is {slot} bytes"
+            3 * slot + boxed + 64 <= RETAINED_BYTES_PER_RECORD,
+            "registry slot is {slot} bytes, boxed holder identity is {boxed} bytes"
         );
     }
 

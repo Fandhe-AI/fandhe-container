@@ -117,9 +117,12 @@
 - 停止と終了: init が終了しても子孫は pod-init へ付け替わって残るため、init の終了時と停止時にコンテナの cgroup へ `cgroup.kill` を書く（O4）。#4811 で実装した（supervisor の `pid_share`。監視ループは init の終了を観測した後・終了を記録する前、停止は起動ハンドルの回収の後に、core の `cgroups::kill_all_in_recorded` で止めて空になるのを 5 秒まで待ち、結果を `pid_shared_kill_all` の行に出す）。containerd の shim と同じ挙動であることを v2.1.0 の原文で確かめた: `cmd/containerd-shim-runc-v2/runc/util.go` の `ShouldKillAllOnExit`（31〜47 行。pid の namespace が path なしで宣言されていなければ真）と、`cmd/containerd-shim-runc-v2/task/service.go` の `handleInitExit`（696〜713 行。真なら `p.KillAll` の後に init の終了を公開する）
 - containerd との差: PID 1 はコンテナではない（rootfs・seccomp・cgroup の一式を持たない。CORE-7〜9）。兄弟コンテナの `/proc/<pid>/root`・`environ`・`fd` は Landlock の ptrace の境界で開けない（k8s では見える）。同じ uid の signal は届く。pod-init の `/proc/1/root` は空の root
 - 既定値: CRI の enum の 0 は `POD`。sandbox の pid が `POD`（未指定を含む）のときだけ保持役が pid ns を作る。食い違いは O3
+  - 2026-11-19 にオーナーが確定した。CRI の proto（`crates/cri/proto/api.proto`）が既定を `POD` と明記し、containerd v2.1.0 も未指定を共有にする（`internal/cri/opts/spec_opts.go` 330 行）。kubelet は `shareProcessNamespace` が既定（false）のとき pid に `CONTAINER` を明示する（kubernetes v1.34.0 `pkg/kubelet/kuberuntime/util/util.go` の `PidNamespaceForPod`）ので、Kubernetes 経由で共有になるのは `shareProcessNamespace: true` の pod だけ。crictl などで設定を手書きして pid を省くと共有になる
+- plugin-cri の停止: 保持役は plugin-cri の停止（SIGKILL・SIGTERM・更新）で stdin の EOF を受けて pod-init を止めるため、pid を共有する pod はカーネルの決まりで中のプロセスがすべて即座に止まる（preStop・猶予期間は効かない）。共有しない pod は plugin-cri が止まっている間も動き続け、再起動後の sandbox が `SANDBOX_NOTREADY` になった後に kubelet が猶予つきで止める（restartPolicy が Never でなければ作り直す）。containerd は pause コンテナが containerd と別に生きるため、containerd の再起動では pod が止まらない。この差は [cri-record-readoption.md](cri-record-readoption.md) の要確認事項 1 を (b) で確定したときに受け入れた（2026-11-19 のオーナー判断）
 - cri の bundle（#4817 で実装）: 記録の保持役の素性に pid ns があり、コンテナの pid が `POD`（未指定を含む）なら、config の pid に保持役の pid から作った `/proc/<holder>/ns/pid_for_children` を path として出す（user＋ipc の組に足す形）。この path が supervisor の kill-all（#4811）の対象の判定になる
   - sandbox が `CONTAINER`（保持役が pid ns を持たない）でコンテナが `POD` の食い違いは、コンテナごとの新しい pid ns にする（O3。containerd は sandbox の pid ns に入るので差になる）
-  - 保持役が pid ns を持つのにコンテナの ipc が `POD` でない構成は、共有の要求を黙って落とさず `UNIMPLEMENTED`（core は pid の join を user＋ipc の組に足す形でしか受けない）。pid の `NODE`・`TARGET` は `UNIMPLEMENTED` のまま
+  - 保持役が pid ns を持ち、コンテナの pid が `POD`（未指定を含む）なのに ipc が `POD` でない構成は、共有の要求を黙って落とさず `UNIMPLEMENTED`（core は pid の join を user＋ipc の組に足す形でしか受けない）。pid の `NODE`・`TARGET` は `UNIMPLEMENTED` のまま
+    - 2026-11-19 にオーナーが確定した。kubelet はコンテナの ipc を `POD` か `NODE`（もともと `UNIMPLEMENTED`）でしか送らないため、Kubernetes からこの構成は来ない。containerd v2.1.0 はコンテナの ipc の指定に関係なく sandbox の ipc へ入る（`spec_opts.go` 325〜327 行）ので、断る本リポのほうが fail-closed
   - 素性の無い保持役（検証が無効な構成・試験用の偽 provider）は pid を共有しない
 
 ### `NamespaceMode::TARGET`

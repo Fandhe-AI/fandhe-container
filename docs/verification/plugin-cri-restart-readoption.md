@@ -25,6 +25,8 @@ supervisor 経由の本番の start で running にしたコンテナを残し�
 
 pod は network を NODE（enum の数値 `2`）にする。core の start は pod の network namespace への join をまだ受けず（[crictl-smoke.md](crictl-smoke.md) と同じ）、pod network を使わないので再起動後の `tear_down`（#2941 で未完）の経路にも入らない。NODE はホストの network namespace を使い分離を弱める。この確認専用の設定で、本番の既定ではない。
 
+pid は `CONTAINER`（enum の数値 `1`）と明示する。CRI の既定（未指定）は pod で pid を共有し、共有する pod は plugin-cri の kill で pod-init ごとコンテナが止まるため、手順 3 の確認が成り立たない（[pod-namespace-holder.md](../design/pod-namespace-holder.md)「pid の共有」）。kubelet も `shareProcessNamespace` が既定のとき同じく `CONTAINER` を明示する。
+
 `<work>/pod.json`:
 
 ```json
@@ -37,7 +39,7 @@ pod は network を NODE（enum の数値 `2`）にする。core の start は p
   },
   "linux": {
     "security_context": {
-      "namespace_options": { "network": 2 }
+      "namespace_options": { "network": 2, "pid": 1 }
     }
   }
 }

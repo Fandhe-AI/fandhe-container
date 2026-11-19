@@ -660,7 +660,9 @@ async fn cri2_sec1_4895_selinux_relabel_mount_rejected_without_runtime_call_or_r
         .await
         .expect("control");
 
-    // sandbox の selinux_options: RunPodSandbox は受け、CreateContainer で拒否する。
+    // sandbox の selinux_options: RunPodSandbox は受け、CreateContainer で拒否する。RunPodSandbox で受けるのは残余の
+    // 現状の固定で要件ではない。拒否を RunPodSandbox へ早めてよく、そのときはこの段を RunPodSandbox の拒否の照合へ
+    // 置き換える（docs/design/cri-config-acceptance.md「SELinux の受け入れ方式」の残余）。
     let mut cfg = sandbox_config("b");
     cfg.linux = Some(v1::LinuxPodSandboxConfig {
         security_context: Some(v1::LinuxSandboxSecurityContext {

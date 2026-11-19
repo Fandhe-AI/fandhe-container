@@ -174,7 +174,7 @@
 - bundle: 保持役の user・ipc への join があるときだけ pid の `TARGET` を受け、config.json の pid は path なし（`crates/cri/src/bundle/spec.rs` の `namespaces`）。join が無ければ `UNIMPLEMENTED`。
 - 配線: `start_inputs` が対象の ID を返し、`CriAdapter::start_with_pid_target` → `StartRequest::with_pid_target`（core）→ plugin-cri の `Supervised::start_with_pid_target` を通り、supervisor の argv に `--pid-target <ID>` が `--pod-shm` の後・ID の前に載る（`crates/supervisor/src/start_client.rs` の `with_pid_target`）。`None` のときは載らない。
 - 要求と launcher の食い違い（core の `start.rs`）: 要求に対象があるのに launcher に無いときは `FailedPrecondition` で拒否する。逆（launcher にだけある）は `pod_shm` と同じく通す。
-- 段 T（pid-target。#4820）: `crates/plugin-cri/tests/cri_exec_real.rs` の本番の実機前提試験で通す（[real-machine-tests.md](../verification/real-machine-tests.md)）。
+- 段 G（pid-target。#4820）: `crates/plugin-cri/tests/cri_exec_real.rs` の本番の実機前提試験で通す（[real-machine-tests.md](../verification/real-machine-tests.md)）。
 - 残り: 対象の Running を Create で要求しない（containerd v2.1.0 と差。Start で拒否する）。対象の再起動には追従しない。ipc・network・userns の `TARGET` は `UNIMPLEMENTED` のまま。
 
 ### `/dev/shm` の共有（方式の比較。採否は O6）

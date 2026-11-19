@@ -77,7 +77,7 @@
 
 ## 範囲外
 
-- pid の共有（`shareProcessNamespace`）・`/dev/shm` の共有・uts の共有・`NamespaceMode::TARGET`: 下の「pid・uts・/dev/shm の共有と TARGET（#2903）」で設計した。uts は実装単位 U1〜U5 を起票済み。pid の共有は #4816・#4817 で実装済み（下の節）。`TARGET` は core・supervisor の受け口を #4819（T1）で実装し、cri の受け入れと argv の書き出しは #4820（T2）まで `UNIMPLEMENTED` のまま（CRI-2・CORE-3・SEC-1・SEC-5）。`/dev/shm` は #4823（S3）で共有する（下の S3 の節。`mounts[]` のホストの `/dev/shm` の bind〔#4888〕は pod の共有とは別の経路で、本節の対象ではない）
+- pid の共有（`shareProcessNamespace`）・`/dev/shm` の共有・uts の共有・`NamespaceMode::TARGET`: 下の「pid・uts・/dev/shm の共有と TARGET（#2903）」で設計した。uts は実装単位 U1〜U5 を起票済み。pid の共有は #4816・#4817 で実装済み（下の節）。`TARGET` は core・supervisor の受け口を #4819（T1）で、cri の受け入れと argv の書き出しを #4820（T2）で実装し、同じ pod・対象の pid が `CONTAINER`・対象の ipc が `POD` のときだけ受ける（CRI-2・CORE-3・SEC-1・SEC-5）。`/dev/shm` は #4823（S3）で共有する（下の S3 の節。`mounts[]` のホストの `/dev/shm` の bind〔#4888〕は pod の共有とは別の経路で、本節の対象ではない）
 - rootful の pod netns（#2241）
 - 再起動をまたぐ sandbox の再採用（TASK-59。設計は [cri-record-readoption.md](cri-record-readoption.md)・#2902）
 
@@ -127,12 +127,12 @@
 
 ### `NamespaceMode::TARGET`
 
-- pid の `TARGET`（方式を設計。受けるかは O5。core・supervisor は T1〔#4819〕で実装済みで、下の「実装（T1・#4819）」）: 対象コンテナの init の pid ns へ入る。保持役の「回収しないことで pid を固定する」保証は対象に及ばないため、core が状態ストアから `target_id` を解決し、supervisor の launch pidfd（#2626 の制御チャネル kind 6・`SCM_RIGHTS`）で対象を固定して未終了を確かめ、ns の fd を固定する。CRI の文字列からパスを作らない。証跡は「joined pid ns の init」を流用する。cri は同じ pod であること・対象の pid が `CONTAINER` であること・対象が存在することを検証する。対象の init が終了すると pid ns ごと止まる（k8s と同じ）
+- pid の `TARGET`（方式を設計。受けるかは O5。core・supervisor は T1〔#4819〕で実装済みで、下の「実装（T1・#4819）」）: 対象コンテナの init の pid ns へ入る。保持役の「回収しないことで pid を固定する」保証は対象に及ばないため、core が状態ストアから `target_id` を解決し、supervisor の launch pidfd（#2626 の制御チャネル kind 6・`SCM_RIGHTS`）で対象を固定して未終了を確かめ、ns の fd を固定する。CRI の文字列からパスを作らない。証跡は「joined pid ns の init」を流用する。cri は同じ pod であること・対象の pid が `CONTAINER` であること・対象が存在することを検証する（T2・#4820 で実装済み。上の「`NamespaceMode::TARGET`」の判定は [cri-config-acceptance.md](cri-config-acceptance.md)）。対象の init が終了すると pid ns ごと止まる（k8s と同じ）
 - ipc・network・userns の `TARGET` は `UNIMPLEMENTED` のまま: kubelet が送らない（proto の注記は pid だけ `TARGET` を送る）、userns は proto 上 `POD` と `NODE` だけ、network と ipc は core が単独の join を受けない
 
 #### 実装（T1・#4819）: core・supervisor の受け口
 
-- 入力: 対象は supervisor の起動オプション `--pid-target <コンテナ ID>` で受ける。config.json の pid は path なしの entry 1 件（保持役の user・ipc は path つき）で、config は純 OCI のまま。`--pid-target` を書き出すのは plugin-cri の T2（#4820）。
+- 入力: 対象は supervisor の起動オプション `--pid-target <コンテナ ID>` で受ける。config.json の pid は path なしの entry 1 件（保持役の user・ipc は path つき）で、config は純 OCI のまま。`--pid-target` は plugin-cri が T2（#4820）で書き出す。
 - 固定: supervisor の `resolve_pid_target(store, source, target)` が、`build_launcher` で fork の前に呼ぶ（特権ランチャー経由の拒否は `check_launcher_available` と `build_launcher` の両方）。手順は次のとおり（CRI-2・CORE-3・SEC-1）。
   1. 状態ストアの対象の記録を読む。稼働中で pid・cgroup・起動素性があり、pod 共有の pid ns の init でないことを確かめる
   2. 対象の supervisor の制御チャネル（kind 6。[exec-pidfd-handover.md](exec-pidfd-handover.md)）から launch pidfd を受け取る。待ちの予算は 2 秒（`PID_TARGET_OBTAIN_BUDGET`）。受け取ったら接続はすぐ閉じる
@@ -168,7 +168,14 @@
 | pid の path と併用 | InvalidArgument | `a pid namespace target cannot be combined with a pid namespace path` |
 | spec と launcher の食い違い（restart の再 launch を含む） | FailedPrecondition | `the launch spec was reconciled with a different pid namespace target` |
 
-- 残り（T2・#4820）: cri の受け入れ（同じ pod・対象の pid が `CONTAINER`・対象の存在の検証）と plugin-cri の argv の書き出し。それまで CRI の pid の `TARGET` は `UNIMPLEMENTED` のまま（[cri-config-acceptance.md](cri-config-acceptance.md)）。
+#### 実装（T2・#4820）: cri・plugin-cri
+
+- 検証（cri。Create と Start の両方）: 対象の記録の存在・同じ pod sandbox・対象の実効の pid が `CONTAINER`・対象の実効の ipc が `POD`（pod の userns の中）。`crates/cri/src/runtime_service.rs` の `check_pid_target`。Running は見ない（Start で core が拒否する）。固定エラーの表は [cri-config-acceptance.md](cri-config-acceptance.md) の「pid の TARGET の受け入れ」。
+- bundle: 保持役の user・ipc への join があるときだけ pid の `TARGET` を受け、config.json の pid は path なし（`crates/cri/src/bundle/spec.rs` の `namespaces`）。join が無ければ `UNIMPLEMENTED`。
+- 配線: `start_inputs` が対象の ID を返し、`CriAdapter::start_with_pid_target` → `StartRequest::with_pid_target`（core）→ plugin-cri の `Supervised::start_with_pid_target` を通り、supervisor の argv に `--pid-target <ID>` が `--pod-shm` の後・ID の前に載る（`crates/supervisor/src/start_client.rs` の `with_pid_target`）。`None` のときは載らない。
+- 要求と launcher の食い違い（core の `start.rs`）: 要求に対象があるのに launcher に無いときは `FailedPrecondition` で拒否する。逆（launcher にだけある）は `pod_shm` と同じく通す。
+- 段 T（pid-target。#4820）: `crates/plugin-cri/tests/cri_exec_real.rs` の本番の実機前提試験で通す（[real-machine-tests.md](../verification/real-machine-tests.md)）。
+- 残り: 対象の Running を Create で要求しない（containerd v2.1.0 と差。Start で拒否する）。対象の再起動には追従しない。ipc・network・userns の `TARGET` は `UNIMPLEMENTED` のまま。
 
 ### `/dev/shm` の共有（方式の比較。採否は O6）
 
@@ -373,7 +380,7 @@ plugin-cri の `ProductionPodHolder`（`crates/plugin-cri/src/pod_holder.rs`）�
 
 あわせて readopt の不具合を直した（H4 の残り）: 保持役の注入下では起動の前に `pending=1`（`network_pending=0`）を書くため、クラッシュ後の再採用が `network_owned=true` に倒すと、pod network provider を差さない本番で Stop・Remove が回収待ちから抜けられなくなる。`network_owned` は `network_pending` だけから導く（`pending_unresolved` には従来どおり数える）。R11（#2940）は #2877 に依存しており循環するため、ここで直した。
 
-未実装（REPAIR-3）: 保持役の pid から `PodNamespacePaths` を作って bundle へ渡す配線（H5・#2876）は配線済みで、POD のコンテナは user・ipc に join する。保持役の netns の bundle への受け渡しも H8（#2878）で実装済み。素性（pid・starttime・ns の dev:ino）の記録と再採用時の終了済みの確認は R11（#2940）で実装済み（再採用した pid からパスやシグナルは作らない。再起動後の保持役の再採用は未採用）。`/dev/shm` の共有は S3（#4823）で実装済み（下の「実装: S3（#4823）の受け渡し」）。未実装は、pod ネットワークの本番 provider（H10・#2879）・pid の `TARGET` の cri の受け入れと argv の書き出し（T2・#4820。core・supervisor の受け口は T1・#4819 で実装済み。`mounts[]` の `/dev/shm` の bind は #4888 で別に受けるため含めない）と uts の共有（U1〜U5。#4608〜#4612）。
+未実装（REPAIR-3）: 保持役の pid から `PodNamespacePaths` を作って bundle へ渡す配線（H5・#2876）は配線済みで、POD のコンテナは user・ipc に join する。保持役の netns の bundle への受け渡しも H8（#2878）で実装済み。素性（pid・starttime・ns の dev:ino）の記録と再採用時の終了済みの確認は R11（#2940）で実装済み（再採用した pid からパスやシグナルは作らない。再起動後の保持役の再採用は未採用）。`/dev/shm` の共有は S3（#4823）で実装済み（下の「実装: S3（#4823）の受け渡し」）。未実装は、pod ネットワークの本番 provider（H10・#2879）と uts の共有（U1〜U5。#4608〜#4612）。
 
 ## 実装単位
 
@@ -397,7 +404,7 @@ rootful の netns は #2241 のオーナー判断に紐づけ、新規起票し�
 
 ### 共有拡張の単位（#2903）
 
-uts は #4334 の配下に起票済み。pid の `TARGET` は T1（#4819）と T2（#4820）として起票済みで、T1 は実装済み。pid の共有（P 系）・`/dev/shm` はオーナー判断（#4607）で形が変わりうるため未起票のままで、判断後に #4334 の配下へ起票する。
+uts は #4334 の配下に起票済み。pid の `TARGET` は T1（#4819）と T2（#4820）として起票済みで、両方実装済み。pid の共有（P 系）・`/dev/shm` はオーナー判断（#4607）で形が変わりうるため未起票のままで、判断後に #4334 の配下へ起票する。
 
 | 記号 | issue | 内容 | 担当 | 依存 |
 | ---- | ----- | ---- | ---- | ---- |
@@ -407,7 +414,7 @@ uts は #4334 の配下に起票済み。pid の `TARGET` は T1（#4819）と T
 | U4 | #4609 | core: `NamespaceJoin` の uts | runtime-builder | なし |
 | U5 | #4612 | cri: uts の path と hostname の抑止・実機試験の段 | oci-cri-builder | U3・U4 |
 | T1 | #4819 | core・supervisor: pid の `TARGET` の解決と固定（実装済み。上の「実装（T1・#4819）」） | runtime-builder | なし |
-| T2 | #4820 | cri・plugin-cri: `target_id` の検証と `--pid-target` の書き出し | oci-cri-builder | T1 |
+| T2 | #4820 | cri・plugin-cri: `target_id` の検証と `--pid-target` の書き出し（実装済み。上の「実装（T2・#4820）」） | oci-cri-builder | T1 |
 | 判断 | #4607 | pid・`TARGET`・`/dev/shm` の受け入れ判断（O1〜O6。人間担当、#816 の配下） | 人間 | なし |
 
 判断後に起票する単位（未起票）: P1 core: join の pid の検査／P2 core: joined pid ns の init の証跡／P3 core: `Pid1Target`・reapply／P4 supervisor: init 終了時の `cgroup.kill`／M1 core＋supervisor: 保持役の mount ns と空の root／P5 core＋supervisor: pod-init と pid ns／P6 plugin-cri: pid の素性の照合と NOTREADY／P7 cri: bundle の pid の path と既定値／P8 ci: 実機試験／S0: 案 A の一次情報と PoC／S1: 保持役の shm の tmpfs／S2 core: `setns` の往復による clone と載せる処理／S3 cri: 受け渡し（#4823 で実装済み）。

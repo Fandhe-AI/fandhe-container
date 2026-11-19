@@ -2,6 +2,7 @@
 
 `AGENTS.md` の「実機前提テスト」節から移した、試験ごとの必要環境・実行コマンド・成功の基準・照合する行の一覧（#3980・REPAIR-10）。`AGENTS.md` が大きくなり AI PR レビューの読み込みが切り詰められるのを防ぐための移設で、本文は元の順序のまま（相互参照の「上の〜項」はこのファイル内の前方を指す）。
 
+- CI では main の push と `workflow_dispatch` で x86_64（`ubuntu-latest`）と arm64（`ubuntu-24.04-arm`）の両 leg で実行する（#4892。記録は `docs/verification/arm64-real-machine-steps.md`）
 - 分離の方針・レビュー観点は `AGENTS.md`「実機前提テスト」と `.claude/rules/ci.md`「実機前提テスト」が正
 - 新しい実機前提テストを足すときは、このファイルへ項目を追記し、`AGENTS.md` の対応一覧にも試験名を足す
 

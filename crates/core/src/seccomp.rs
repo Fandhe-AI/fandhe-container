@@ -1210,6 +1210,30 @@ mod tests {
         }
     }
 
+    /// io_uring 3 件の番号を libc と照合する（CORE-5・SEC-1・MAC-4・#4803。libc は dev-dependency。Linux の gnu のみ）。
+    #[cfg(all(
+        target_os = "linux",
+        target_env = "gnu",
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn core5_4803_io_uring_numbers_match_libc() {
+        let t = native();
+        for (d, want) in [
+            (DeniedSyscall::IoUringSetup, libc::SYS_io_uring_setup),
+            (DeniedSyscall::IoUringEnter, libc::SYS_io_uring_enter),
+            (DeniedSyscall::IoUringRegister, libc::SYS_io_uring_register),
+        ] {
+            assert_eq!(
+                t.number_of(d),
+                SyscallLookup::Present(SyscallNr::new(u32::try_from(want).unwrap())),
+                "{}",
+                d.name()
+            );
+        }
+    }
+
     /// iopl / ioperm は x86_64 にのみ存在する。
     #[cfg(all(
         target_pointer_width = "64",
@@ -1511,7 +1535,7 @@ mod bpf_tests {
         }
     }
 
-    /// SEC-4: x86_64 の USER_NOTIF 版の形（命令数は 97 のまま）。
+    /// SEC-4: x86_64 の USER_NOTIF 版の形（命令数は 103 のまま）。
     #[test]
     fn sec4_user_notif_x86_64_shape() {
         let p = build_deny_filter_with(x86(), ErrnoDelivery::UserNotif).unwrap();
@@ -1531,7 +1555,7 @@ mod bpf_tests {
         assert_eq!(t(&i[102]), (0x06, 0, 0, ALLOW));
     }
 
-    /// SEC-4: aarch64 の USER_NOTIF 版の形（命令数は 91 のまま）。
+    /// SEC-4: aarch64 の USER_NOTIF 版の形（命令数は 97 のまま）。
     #[test]
     fn sec4_user_notif_aarch64_shape() {
         let p = build_deny_filter_with(aarch(), ErrnoDelivery::UserNotif).unwrap();
@@ -1722,7 +1746,7 @@ mod bpf_tests {
     #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
     #[test]
     fn core5_task38_1_2_native_x86_64() {
-        assert_eq!(build_filter_for_target_arch().unwrap().len(), 97);
+        assert_eq!(build_filter_for_target_arch().unwrap().len(), 103);
     }
 
     #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]

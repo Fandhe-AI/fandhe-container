@@ -3785,7 +3785,7 @@ mod linux {
         )
     }
 
-    /// 確実な層（seccomp の ERRNO 側 40 件を USER_NOTIF で記録する経路）の記録先が作れたかを判定する（純関数）。
+    /// 確実な層（seccomp の ERRNO 側 43 件を USER_NOTIF で記録する経路）の記録先が作れたかを判定する（純関数）。
     /// 作れなければ `FailedPrecondition` で起動を拒否する（fail-closed。記録先なしで続行しない。SEC-4・#2027）。
     pub(crate) fn require_seccomp_audit_sink(
         sink: Result<Arc<dyn AuditSink>, ErrorCode>,

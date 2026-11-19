@@ -942,7 +942,7 @@ mod consts {
     ///
     /// 値の読み出しは既存の `ArchSysNo::get` と試験専用の `SyscallNumber::raw` だけを使い、
     /// 型の保証（対応外 arch では番号を取り出せない）は変えない。名前は小文字化で `libc` の
-    /// `SYS_<name>` と 1 対 1 に対応する（名前違いなし。27 件すべて照合）。
+    /// `SYS_<name>` と 1 対 1 に対応する（名前違いなし。28 件すべて照合）。
     /// 対象外: 対応外 arch の `consts` と `seccomp_notify` の対応外側は `ArchSysNo::UNSUPPORTED` で
     /// 番号を持たず、照合する値が無い（#1619）。x32・ILP32 は `target_pointer_width = "64"` の cfg で
     /// 対応外（`libc` の x32 の番号は `__X32_SYSCALL_BIT` 付きで別物）。
@@ -1379,7 +1379,7 @@ mod consts {
     ///
     /// 値の読み出しは既存の `ArchSysNo::get` と試験専用の `SyscallNumber::raw` だけを使い、
     /// 型の保証（対応外 arch では番号を取り出せない）は変えない。名前は小文字化で `libc` の
-    /// `SYS_<name>` と 1 対 1 に対応する（名前違いなし。27 件すべて照合）。
+    /// `SYS_<name>` と 1 対 1 に対応する（名前違いなし。28 件すべて照合）。
     /// 対象外: 対応外 arch の `consts` と `seccomp_notify` の対応外側は `ArchSysNo::UNSUPPORTED` で
     /// 番号を持たず、照合する値が無い（#1619）。x32・ILP32 は `target_pointer_width = "64"` の cfg で
     /// 対応外（`libc` の x32 の番号は `__X32_SYSCALL_BIT` 付きで別物）。
@@ -6950,8 +6950,10 @@ pub(crate) fn kcmp_self_probe() -> Result<(), SysError> {
 
 /// `io_uring_setup(0, NULL)` を発行する結合試験用プローブ（CORE-5・SEC-1・MAC-4・#4803）。
 ///
-/// entries が 0 のため、フィルタが無くてもカーネルは `EINVAL` で拒否し、リングは作られない。
-/// フィルタが効いていれば `EPERM` になり、`EINVAL` と区別できる。
+/// params が NULL のため、フィルタが無ければカーネルは先に `copy_from_user` で失敗して `EFAULT` を返す
+/// （`kernel.io_uring_disabled` の設定によっては先に `EPERM`。Linux 6.6 以降）。リングも fd も作られない。
+/// フィルタが効いていれば `EPERM` になる。`io_uring` が無効な環境では適用前の対照が `EPERM` になり、
+/// 呼び出し側（結合試験）が前提欠如として扱う。
 // 結合試験専用。テストビルドの単体テストは呼ばないため dead_code を許可する。
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) fn io_uring_setup_probe() -> Result<(), SysError> {
@@ -6959,8 +6961,9 @@ pub(crate) fn io_uring_setup_probe() -> Result<(), SysError> {
         return Err(SysError::Unsupported);
     }
     let nr = consts::SYS_IO_URING_SETUP.get()?;
-    // SAFETY: entries = 0・params = NULL（整数 0）で、カーネルは params を読む前に `EINVAL` で拒否する。
-    // 成功しないため fd は作られない。
+    // SAFETY: entries = 0・params = NULL（整数 0）でポインタは参照されない。カーネルは params の
+    // `copy_from_user` に失敗して `EFAULT`（設定によっては先に `EPERM`）で返り、リング・fd の作成も
+    // ユーザーメモリへの書き込みも生じない。
     let rc = unsafe { ffi_syscall!(nr, 0_i64, 0_i64) };
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }

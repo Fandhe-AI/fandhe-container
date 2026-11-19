@@ -108,7 +108,7 @@
     - 自分の ns を作るのは、`fs/namespace.c` の `pivot_root` の `chroot_fs_refs` が同じ root を持つプロセスすべての root を差し替え、保持役の root まで変えてしまうため
     - fd を閉じ、`SIGCHLD` を無視にして孤児を自動回収させる（`kernel/signal.c` の `do_notify_parent` 2117〜2134 行）
     - capability をすべて落とし、non-dumpable を自分で確かめる
-  - READY は版 3 で、保持役の `pid_for_children` の素性を載せる
+  - READY に保持役の `pid_for_children` の素性を載せる（版 3 で足した）
   - 保持役は pod-init の終了で終了コード 1 で終わり、stdin の EOF では pod-init を止めて 0 で終わる
 - パス: 保持役の pid からだけ `/proc/<holder>/ns/pid_for_children` を作る（#2776 の契約）。READY に pid ns の素性を載せ、plugin-cri が照合する（#4816 で実装。plugin-cri の provider は sandbox の pid が `POD`〔未指定を含む〕のときだけ `--share-pid` を渡し、READY の pid ns の有無が求めた共有と一致し、素性が `/proc/<holder>/ns/pid_for_children` と一致することを確かめ、素性を記録の `holder=` 行の 6 つ目の要素に残す。pod-init の死で保持役が終わり、既存の `reconcile_holders`〔#2871〕が `SANDBOX_NOTREADY` にする）
 - core の join の検査: pid は user＋ipc の組に足す形でだけ受ける。`NS_GET_NSTYPE` が `CLONE_NEWPID`、所有 userns が join する user と同じ、`NS_GET_PARENT` が呼び出し側の pid ns。`setns(pid)` は中間プロセスで行い、効くのは以後に fork した init だけ
@@ -158,6 +158,12 @@ PoC: `crates/core/src/oci_runtime/namespace_join.rs` の実機前提試験 `cri2
 - 照合: 載せ先の `nosuid,nodev,noexec`（`fstatfs`）、大きさ `size=65536k`（mountinfo）、両方向の内容の一致、試験プロセスの ns に付かないこと
 - 結果: 非特権の uid 1000・カーネル 7.2（OrbStack の Linux）で成功した。CI の platform-ci（ubuntu の AppArmor 緩和後）でも、namespace_join の実機前提のステップで回す
 - 実装単位: S1（保持役の shm の tmpfs。#4821）・S2（`setns` の往復による複製と載せる処理。#4822）・S3（受け渡し。#4823）
+- S1（#4821 で実装）: 保持役は段 2 で、pod-init の空の root を作った後・capability を落とす前に、core の `mount_pod_shm` で自分の mount ns の `/dev/shm` に tmpfs を載せる
+  - 中身はコンテナの既定の `/dev/shm`（`TmpfsMountSpec::default_dev_shm`。#1654）と同じ定義で、64 MiB・`nosuid,nodev,noexec`・mode 1777
+  - 載せ先は `O_NOFOLLOW` で開いた fd のまま `move_mount` へ渡す。載せた後に開き直して、自分のマウントと同じ素性・属性 3 つ・mode を確かめる（fail-closed）。ホストに `/dev/shm` のディレクトリが無い構成では保持役が `FAILED_PRECONDITION` で起動しない
+  - マウントの fd は持たない。READY は版 4（112 バイト）で、tmpfs のルートの `st_dev`・`st_ino` を常に載せる（S2 が保持役の mnt ns へ入って開いた `/dev/shm` を照合する材料）
+  - 載せる場所を保持役の mount ns の `/dev/shm` にしたのは Agent の判断（issue は場所を決めていない）。v6.12 の `open_tree` は呼び出し側の今の mount ns に付いたマウントしか複製できない（`check_mnt`）ため、どこにも接続しない tmpfs を fd で持つ方式（pod-init の空の root と同じ形）は S2 で複製できない。付ける先は保持役の ns に既にあるディレクトリが要り、ホストの `/dev/shm` のディレクトリは Linux の標準の構成にあり、保持役自身は使わない。ns は private な複製のため、上に載せてもホストの `/dev/shm` は変わらない
+  - S2 の注意: pod の tmpfs が載っていない（保持役が別物・途中で外れた）と、同じパスはホストの `/dev/shm` の tmpfs に解決する。S2 は開いた `/dev/shm` の `(dev, ino)` を READY の値と照合することを必須にする（無いとホストの `/dev/shm` を複製しうる）
 
 ### オーナー確認事項（#4607）
 

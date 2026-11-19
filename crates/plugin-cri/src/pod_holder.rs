@@ -747,6 +747,7 @@ fn holder_from_ready(
         ns(ready.net()),
     )
     .map_err(unavailable)?;
+    // READY の mnt と shm（pod の `/dev/shm` の tmpfs。#4821）はまだ記録に載せない（受け渡しと照合は S3・#4823。REPAIR-3）。
     // pid を共有する sandbox は pod の pid ns の素性も記録に残す（再採用の照合。#2940・#4816）。
     if let Some(pid_ns) = ready.pid_ns() {
         identity = identity.with_pid_ns(ns(pid_ns)).map_err(unavailable)?;

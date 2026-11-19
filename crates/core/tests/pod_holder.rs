@@ -13,6 +13,8 @@
 //!   （mnt は #4808。所有者が pod の userns であることは確立が `NS_GET_USERNS` で照合済みで、成功値はその証跡）
 //! - mount namespace の `/` が shared でない（`/proc/self/mountinfo` の `/` の行に `shared:` が無い。#4808）
 //! - pod-init の空の root（`create_pod_root`）が `nosuid,nodev,noexec` で、エントリが 0 件であること（#4808）
+//! - pod の `/dev/shm`（`mount_pod_shm`。#4821）が tmpfs で、mountinfo の `size=65536k`・`nosuid,nodev,noexec`、
+//!   `st_mode` の 1777、報告の素性と `/dev/shm` の `stat` が一致すること
 //! - pod-init（`spawn_pod_init`。#4815）が pod の pid ns の PID 1（`NSpid` の末尾 1）で、`CapEff`・`CapPrm` が 0、自己検査
 //!   （non-dumpable）を通って生き続けること。SIGKILL で回収できる（root と pid ns の素性は `pod_holder_bin_real` のシナリオ G）
 //! - `lo` が up であること(自己宛ての UDP 送受信が通る。down なら `ENETUNREACH`)
@@ -60,8 +62,8 @@ mod linux {
         IdMapping, IsolationPrivilege, is_non_dumpable_for_test, set_non_dumpable_for_test,
     };
     use fandhe_container_core::oci_runtime::{
-        SubordinateIdSource, create_pod_root, establish_pod_namespaces, root_entry_count,
-        spawn_pod_init,
+        SubordinateIdSource, create_pod_root, establish_pod_namespaces, mount_pod_shm,
+        root_entry_count, spawn_pod_init,
     };
     use fandhe_container_core::traits::ErrorCode;
 
@@ -228,6 +230,39 @@ mod linux {
         // `pod_holder_bin_real` のシナリオ G で照合する。
     }
 
+    /// pod の `/dev/shm`（#4821）が 64 MiB・mode 1777・`nosuid,nodev,noexec` の tmpfs で、報告の素性と一致すること。
+    fn assert_pod_shm(dev: u64, ino: u64) {
+        let md = std::fs::metadata("/dev/shm").expect("stat /dev/shm");
+        assert_eq!(
+            (md.dev(), md.ino()),
+            (dev, ino),
+            "reported /dev/shm identity"
+        );
+        assert_eq!(md.mode() & 0o7777, 0o1777, "/dev/shm mode");
+        let info = std::fs::read_to_string("/proc/self/mountinfo").expect("mountinfo");
+        // 同じ場所に重ねたマウントは後の行が上（ホストの `/dev/shm` の上に載せた）。
+        let line = info
+            .lines()
+            .rfind(|l| l.split_whitespace().nth(4) == Some("/dev/shm"))
+            .expect("/dev/shm mount line");
+        let (head, tail) = line.split_once(" - ").expect("mountinfo separator");
+        let opts: Vec<&str> = head
+            .split_whitespace()
+            .nth(5)
+            .expect("mount options")
+            .split(',')
+            .collect();
+        for want in ["rw", "nosuid", "nodev", "noexec"] {
+            assert!(opts.contains(&want), "missing {want}: {line}");
+        }
+        let mut fs = tail.split_whitespace();
+        assert_eq!(fs.next(), Some("tmpfs"), "{line}");
+        let sb: Vec<&str> = fs.nth(1).expect("super options").split(',').collect();
+        assert!(sb.contains(&"size=65536k"), "{line}");
+        // mode は既定の 1777 のとき mountinfo に出ない（`mm/shmem.c` の `shmem_show_options`）ため、上の `st_mode` で照合する。
+        assert!(!sb.iter().any(|o| o.starts_with("mode=")), "{line}");
+    }
+
     /// `/` のマウントが shared でない（確立で再帰 private にした。#4808）。
     fn assert_root_not_shared() {
         let info = std::fs::read_to_string("/proc/self/mountinfo").expect("mountinfo");
@@ -339,6 +374,9 @@ mod linux {
             (true, true, true)
         );
         assert_eq!(root_entry_count(&root).expect("entries"), 0);
+        // pod の `/dev/shm`（#4821）。確立した mount ns の `/dev/shm` に載せる。
+        let shm = mount_pod_shm().expect("mount the pod /dev/shm");
+        assert_pod_shm(shm.dev(), shm.ino());
         // pod の PID 1（pod-init。#4815）。確立と同じ単一スレッドの子から作る。pod-init は non-dumpable を自分で確かめる
         // ため、作る前に non-dumpable にする（single は確立の前にはできない。上のコメント）。
         if !preset_non_dumpable {

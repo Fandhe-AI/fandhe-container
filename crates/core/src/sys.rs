@@ -2882,8 +2882,7 @@ impl DevTmpfsCreate {
 ///
 /// 必要なカーネルは Linux 5.2 以降。未対応（`ENOSYS`）は [`SysError::Unsupported`] で返し、`mount(2)` へは
 /// 縮退しない（fail-closed）。途中で失敗した場合、未接続の中間 fd は drop で閉じ、マウントは破棄される。
-// テストビルドでは `crate::exec` の dry-run 差し込み点が本関数を呼ばないため dead_code を許可する。
-#[cfg_attr(test, allow(dead_code))]
+/// pod の保持役の `/dev/shm`（`crate::oci_runtime::mount_pod_shm`。#4821）も呼ぶ。
 pub(crate) fn mount_tmpfs_on(
     target_dir: BorrowedFd<'_>,
     create: TmpfsCreate,
@@ -2908,7 +2907,7 @@ pub(crate) fn mount_dev_tmpfs_on(
 /// pod の保持役の空の root（`nosuid,nodev,noexec`・mode 0o755・64 KiB。CRI-2・CORE-3・SEC-5・#4808）。
 ///
 /// どこにも接続しない切り離したマウント（[`new_detached_tmpfs`]）として作り、保持役が fd で持つ。pod-init（P5）がこの
-/// マウントへ移って `pivot_root` する前提で、中身は空のまま（`/dev/shm` の載せ先は S1 が足す）。
+/// マウントへ移って `pivot_root` する前提で、中身は空のまま（pod の `/dev/shm` は保持役の mount ns の `/dev/shm` に載せる。#4821）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PodRootTmpfsCreate {
     _private: (),

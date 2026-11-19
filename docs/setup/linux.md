@@ -70,6 +70,7 @@ plugin-cri は rootless（非 root）で `RunPodSandbox` のたびに、supervis
 
 - supervisor の bin が plugin-cri の実体と同じディレクトリにあり、利用者（か root）所有・group / other 書き込み不可・利用者に読めること（0755 など）。満たさないと `RunPodSandbox` は `FAILED_PRECONDITION`（`supervisor executable is not trusted or not readable`）で失敗する
 - 非特権 user namespace を作れること（Ubuntu 24.04 以降の `kernel.apparmor_restrict_unprivileged_userns=1` では `PermissionDenied` で失敗するため緩和が要る。subuid / subgid の範囲写像は次節）
+- ホストに `/dev/shm` のディレクトリ（symlink でないもの）があること。保持役は自分の mount ns の `/dev/shm` に pod で共有する tmpfs（64 MiB）を載せるため、無ければ `RunPodSandbox` は保持役の起動で失敗する（#4821）。保持役の ns は private な複製で、ホストの `/dev/shm` は変わらない
 - uid 0 の plugin-cri には保持役を注入せず、従来どおり（start は `UNIMPLEMENTED`）
 
 POD のコンテナは保持役の user・ipc namespace に join する（H5・#2876 は配線済み）。保持役の netns を pod ネットワークへ渡す配線は未実装（H8・#2878）。

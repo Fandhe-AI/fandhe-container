@@ -9,7 +9,8 @@
 //! 権限モデルを `start` と同じ規則で決める → `/proc/self/exe` を開く → namespace を確立 → 素性を引数に載せて
 //! 開いた fd を `execveat` で再 exec。**段 2**（`pod-holder --stage2 <8 個の 10 進> <0|1>`。最後は pid の共有）: 直ちに `PR_SET_DUMPABLE 0` →
 //! fd を再度閉じる → 引数・dumpable・素性・`uid_map`・子の不在を照合 → pod-init の空の root を作る（#4808。
-//! `create_pod_root`。mount ns の `CAP_SYS_ADMIN` が要るので capability を落とす前）→ pid を共有するときは pod の
+//! `create_pod_root`。mount ns の `CAP_SYS_ADMIN` が要るので capability を落とす前）→ 自分の mount ns の `/dev/shm` に
+//! pod で共有する tmpfs（64 MiB・`nosuid,nodev,noexec`・mode 1777）を載せる（#4821。`mount_pod_shm`）→ pid を共有するときは pod の
 //! pid ns を作って pod-init を PID 1 として fork する（#4815。core の `spawn_pod_init`）→ capability を全て落とす →
 //! READY を書く → stdin を待つ（EOF で 0、予期しない入力で 1。SIGTERM は既定の動作で終わる）。PDEATHSIG は使わない
 //! （#2376 と同じ理由）。
@@ -41,7 +42,8 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use fandhe_container_core::oci_runtime::{
-    PodHolderWake, PodInit, create_pod_root, establish_pod_namespaces, spawn_pod_init,
+    PodHolderWake, PodInit, create_pod_root, establish_pod_namespaces, mount_pod_shm,
+    spawn_pod_init,
 };
 use fandhe_container_core::traits::types::{ErrorCode, TraitError};
 
@@ -428,6 +430,13 @@ fn stage2(args: &[OsString]) -> Result<(), StageEnd> {
     // pod-init の空の root は、段 1 で作った mount ns の中で capability を落とす前に作る(#4808)。待ちの間ずっと持つ。
     let pod_root =
         create_pod_root().map_err(|e| from_trait(&e, "failed to create the pod root"))?;
+    // pod の `/dev/shm`（#4821）。保持役自身の mount ns に載せ、コンテナの init が参加して複製する（S2・#4822）。
+    // マウントの fd は持たない（待ちの間に開いている fd を増やさない）。
+    let shm = mount_pod_shm().map_err(|e| from_trait(&e, "failed to mount the pod /dev/shm"))?;
+    let shm = NsId {
+        dev: shm.dev(),
+        ino: shm.ino(),
+    };
     // pod の pid ns と pod-init も capability を落とす前に作る（`unshare(CLONE_NEWPID)` と pod-init の mount の操作に
     // pod の userns の capability が要る。#4815）。
     let pod_init = if share_pid {
@@ -462,7 +471,7 @@ fn stage2(args: &[OsString]) -> Result<(), StageEnd> {
     }
     check_sigterm()?;
 
-    let ready = PodHolderReady::new(std::process::id(), user, ipc, net, mnt, pid_ns)
+    let ready = PodHolderReady::new(std::process::id(), user, ipc, net, mnt, pid_ns, shm)
         .map_err(|e| from_trait(&e, "failed to build the READY frame"))?;
     write_stdout_bounded(PodHolderFrame::ready(&ready).as_bytes())
         .map_err(|_| Fail::new(ErrorCode::Unavailable, "failed to write READY"))?;

@@ -2182,12 +2182,13 @@ impl ContainerRuntime for CoreLifecycleRuntime {
 
     #[cfg(target_os = "linux")]
     fn start(&self, req: &StartRequest) -> Result<ContainerStatus, TraitError> {
-        self.supervised.start_with_pod_shm(
+        self.supervised.start_with_pid_target(
             &*self.store,
             req.id(),
             req.log_path(),
             req.stdin(),
             req.pod_shm(),
+            req.pid_target(),
         )
     }
 

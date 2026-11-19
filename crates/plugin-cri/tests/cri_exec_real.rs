@@ -38,6 +38,9 @@
 //!   兄弟 B は pid と開始時刻を変えずに running のまま残ること（kill-all はコンテナの cgroup に限る。#4811・#4882）、
 //!   pod-init を SIGKILL すると sandbox が `SANDBOX_NOTREADY` になること（#4816）を具体値で照合する。成功行 5 行（`pod-pid ok:`）を
 //!   CI が試験ソースから導出して照合する。pull は増やさない。
+//! - 段 T（#4820・CRI-2・CORE-3・SEC-1・SEC-5。上の tty の段 T とは別）: pid `CONTAINER` の対象と pid `TARGET` の debug コンテナで、
+//!   debug の exec が対象の init を PID 1（`/bin/sleep 614`）として読むこと、対象を止めると pid ns ごと止まり debug が Exited になる
+//!   ことを照合する。成功行 2 行（`pid-target ok:`）を CI が試験ソースから導出して照合する。pull は増やさない。
 //!
 //! 失敗後の残骸の回収（#4142）: 本体を 2 回走らせる（1 回目は StartContainer の直後に注入した失敗、回収、2 回目は同じ metadata で通す）。
 //! 注入では plugin-cri を SIGKILL してから panic させ、外側の回収が死活を判定して起動し直して回収する（#4326。共有部品 `reclaim_restarting`）。
@@ -696,6 +699,19 @@ async fn create_started(
     create_started_with_mounts(c, sb, name, command, Vec::new(), token, ledger).await
 }
 
+/// [`create_started`] に namespace_options を足したもの（段 T の pid `CONTAINER` / `TARGET`。#4820）。
+async fn create_started_ns(
+    c: &mut RuntimeServiceClient<Channel>,
+    sb: &str,
+    name: &str,
+    command: &[&str],
+    ns: cri::NamespaceOption,
+    token: &str,
+    ledger: &reclaim::Ledger,
+) -> String {
+    create_started_full(c, sb, name, command, Vec::new(), Some(ns), token, ledger).await
+}
+
 /// [`create_started`] に CRI の `mounts` を足したもの（段 M の `/dev/shm` の bind。#4823）。
 async fn create_started_with_mounts(
     c: &mut RuntimeServiceClient<Channel>,
@@ -703,6 +719,20 @@ async fn create_started_with_mounts(
     name: &str,
     command: &[&str],
     mounts: Vec<cri::Mount>,
+    token: &str,
+    ledger: &reclaim::Ledger,
+) -> String {
+    create_started_full(c, sb, name, command, mounts, None, token, ledger).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn create_started_full(
+    c: &mut RuntimeServiceClient<Channel>,
+    sb: &str,
+    name: &str,
+    command: &[&str],
+    mounts: Vec<cri::Mount>,
+    ns: Option<cri::NamespaceOption>,
     token: &str,
     ledger: &reclaim::Ledger,
 ) -> String {
@@ -719,6 +749,13 @@ async fn create_started_with_mounts(
                 command: command.iter().map(|s| s.to_string()).collect(),
                 labels: reclaim::config_labels(TEST, token),
                 mounts,
+                linux: ns.map(|o| cri::LinuxContainerConfig {
+                    security_context: Some(cri::LinuxContainerSecurityContext {
+                        namespace_options: Some(o),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
                 ..Default::default()
             }),
             sandbox_config: None,
@@ -1779,6 +1816,122 @@ async fn pod_pid_stage(
     remove_pod(c, ledger, &sb, &[&a, &b, &o]).await;
 }
 
+/// 段 T（#4820）の成功行 2 行（`check-success-lines.sh` が試験ソースから導出して照合する）。
+const PID_TARGET_OK_VIEW: &str =
+    "production_binary_exec_real: pid-target ok: the debug container saw the target init as PID 1";
+const PID_TARGET_OK_STOP: &str =
+    "production_binary_exec_real: pid-target ok: stopping the target stopped the debug container";
+
+/// 段 T（#4820・CRI-2・CORE-3・SEC-1・SEC-5・REPAIR-12）。kubelet の ephemeral container と同じ形（debug コンテナの pid を
+/// `TARGET`・`target_id` に対象の ID）で、本番の plugin-cri → supervisor `--pid-target` → 対象の pid namespace への参加を通す。
+/// sandbox は pid `CONTAINER`・ipc `POD`（保持役の user ns に入る）。pull は増やさない（既存のイメージを使い回す）。
+///
+/// 1. 対象の init（`/bin/sleep 614`）は自身の pid ns の PID 1。debug の exec が `/proc/1/cmdline` で同じ cmdline を読む。
+/// 2. 対象を SIGKILL で止めると pid ns ごと止まり（カーネルが ns 内を SIGKILL する。k8s と同じ）、debug は期限内に Exited になり、
+///    ホストの `/bin/sleep 615` も残らない（対象の再起動には追従しない）。
+async fn pid_target_stage(
+    c: &mut RuntimeServiceClient<Channel>,
+    token: &str,
+    ledger: &reclaim::Ledger,
+) {
+    // network は core が受けられる NODE（段 S と同じ）。ipc `POD` が TARGET の前提（core の PidOwnerMismatch）。
+    let node_net = |pid: i32, target_id: &str| cri::NamespaceOption {
+        network: cri::NamespaceMode::Node as i32,
+        pid,
+        ipc: cri::NamespaceMode::Pod as i32,
+        target_id: target_id.into(),
+        ..Default::default()
+    };
+    let mut config = cri::PodSandboxConfig {
+        metadata: Some(cri::PodSandboxMetadata {
+            name: "pod-exec-real-pid-target".into(),
+            uid: reclaim::sandbox_uid("uid-exec-pid-target", token),
+            namespace: "default".into(),
+            attempt: 0,
+        }),
+        labels: reclaim::config_labels(TEST, token),
+        ..Default::default()
+    };
+    config
+        .linux
+        .get_or_insert_with(Default::default)
+        .security_context
+        .get_or_insert_with(Default::default)
+        .namespace_options = Some(node_net(cri::NamespaceMode::Container as i32, ""));
+    let sb = call_with_deadline(
+        c.run_pod_sandbox(cri::RunPodSandboxRequest {
+            config: Some(config),
+            ..Default::default()
+        }),
+        RPC_DEADLINE,
+    )
+    .await
+    .expect("run pid-target sandbox")
+    .into_inner()
+    .pod_sandbox_id;
+    reclaim::record_sandbox(ledger, &sb);
+
+    let target = create_started_ns(
+        c,
+        &sb,
+        "pid-target",
+        &["/bin/sleep", "614"],
+        node_net(cri::NamespaceMode::Container as i32, ""),
+        token,
+        ledger,
+    )
+    .await;
+    let dbg = create_started_ns(
+        c,
+        &sb,
+        "pid-debug",
+        &["/bin/sleep", "615"],
+        node_net(cri::NamespaceMode::Target as i32, &target),
+        token,
+        ledger,
+    )
+    .await;
+
+    // 1. debug から見て PID 1 が対象の init。debug 自身の init は PID 1 ではない。
+    let ns_t = exec_sh(c, &target, "readlink /proc/self/ns/pid").await;
+    let ns_d = exec_sh(c, &dbg, "readlink /proc/self/ns/pid").await;
+    assert_eq!(ns_t, ns_d, "debug must be in the target's pid namespace");
+    assert_eq!(
+        exec_sh(c, &dbg, "tr '\\0' ' ' < /proc/1/cmdline").await,
+        "/bin/sleep 614"
+    );
+    assert_ne!(
+        pid_in_pod(c, &dbg, "sleep 61[5]").await,
+        "1",
+        "the debug init is not PID 1"
+    );
+    let _ = writeln_stderr(PID_TARGET_OK_VIEW);
+
+    // 2. 対象を止める（SIGKILL）と、debug が期限内に Exited になり、ホストに `/bin/sleep 615` が残らない。
+    call_with_deadline(
+        c.stop_container(cri::StopContainerRequest {
+            container_id: target.clone(),
+            timeout: 0,
+        }),
+        Duration::from_secs(120),
+    )
+    .await
+    .expect("stop the pid target");
+    let _ = wait_exited(c, &dbg).await;
+    let debug_argv = ["/bin/sleep", "615"];
+    let gone = Instant::now();
+    while !live_pids_with_argv(&debug_argv).is_empty() {
+        assert!(
+            gone.elapsed() < Duration::from_secs(10),
+            "the debug init must be gone after the target stopped: {:?}",
+            live_pids_with_argv(&debug_argv)
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let _ = writeln_stderr(PID_TARGET_OK_STOP);
+    remove_pod(c, ledger, &sb, &[&dbg, &target]).await;
+}
+
 fn writeln_stderr(line: &str) -> std::io::Result<()> {
     use std::io::Write as _;
     writeln!(std::io::stderr(), "{line}")
@@ -2000,6 +2153,8 @@ async fn scenario(
     pod_network_stage(&mut c, &id, &token, &ledger, plugin_pid).await;
     // 段 S（#4818）: pod の pid namespace の共有。
     pod_pid_stage(&mut c, &token, &ledger).await;
+    // 段 T（#4820）: pid namespace の TARGET（debug コンテナ）。
+    pid_target_stage(&mut c, &token, &ledger).await;
 
     // 4. 要求元の異常終了（SUP-6・SEC-1・REPAIR-5・#4167）: 終わらない exec を開いたまま plugin-cri を SIGKILL すると、
     //    helper が 2 秒以内に終わり、exec のコマンドが残らない。helper の期限は 60 秒以上で、期限や hold_grace では説明できない。

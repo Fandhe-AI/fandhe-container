@@ -162,6 +162,8 @@ struct StubRuntime {
     created: Mutex<HashMap<String, ()>>,
     /// `start` が受けた要求の `(コンテナ ID, pod_shm の (パス, dev, ino))`（#4823）。
     starts: Mutex<Vec<(String, SeenShm)>>,
+    /// `start` が受けた要求の `(コンテナ ID, pid_target)`（#4820）。
+    pid_targets: Mutex<Vec<(String, Option<String>)>>,
 }
 
 impl ContainerRuntime for StubRuntime {
@@ -179,6 +181,10 @@ impl ContainerRuntime for StubRuntime {
                 let (dev, ino) = p.identity();
                 (p.path().to_string_lossy().into_owned(), dev, ino)
             }),
+        ));
+        self.pid_targets.lock().unwrap().push((
+            r.id().as_str().to_owned(),
+            r.pid_target().map(|t| t.as_str().to_owned()),
         ));
         // 起動した結果は使わない（受けた要求だけを見る）。
         Err(TraitError::new(ErrorCode::Unimplemented, "not used"))
@@ -691,4 +697,168 @@ async fn cri2_sec1_4895_selinux_relabel_mount_rejected_without_runtime_call_or_r
     assert_eq!(st.code(), Code::Unimplemented);
     assert_eq!(st.message(), "selinux_options is not supported");
     assert_eq!(runtime.created.lock().unwrap().len(), 1);
+}
+
+/// namespace_options を指定して作る（#4820）。`None` は未指定（pid・ipc・network は CRI の既定の `POD`）。
+async fn create_ns_case(
+    svc: &CriRuntimeService,
+    sandbox: &str,
+    name: &str,
+    opts: Option<v1::NamespaceOption>,
+) -> Result<String, tonic::Status> {
+    let linux = opts.map(|o| v1::LinuxContainerConfig {
+        security_context: Some(v1::LinuxContainerSecurityContext {
+            namespace_options: Some(o),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    RuntimeService::create_container(
+        svc,
+        Request::new(v1::CreateContainerRequest {
+            pod_sandbox_id: sandbox.into(),
+            config: Some(ContainerConfig {
+                metadata: Some(ContainerMetadata {
+                    name: name.into(),
+                    attempt: 0,
+                }),
+                image: Some(ImageSpec {
+                    image: "busybox:1.36".into(),
+                    ..Default::default()
+                }),
+                command: vec!["/bin/sleep".into(), "30".into()],
+                linux,
+                ..Default::default()
+            }),
+            sandbox_config: None,
+        }),
+    )
+    .await
+    .map(|r| r.into_inner().container_id)
+}
+
+fn own_pid_ns() -> v1::NamespaceOption {
+    v1::NamespaceOption {
+        pid: v1::NamespaceMode::Container as i32,
+        ..Default::default()
+    }
+}
+
+fn target_ns(target_id: &str) -> v1::NamespaceOption {
+    v1::NamespaceOption {
+        pid: v1::NamespaceMode::Target as i32,
+        target_id: target_id.into(),
+        ..Default::default()
+    }
+}
+
+/// CRI-2・CORE-3・SEC-1・SEC-5・#4820: 同じ pod の `CONTAINER` の対象なら Start が対象の ID を渡し、対象が無い要求・
+/// TARGET でない要求は `None`。拒否は固定の文言で、Create は実行層（starts）を増やさない。
+#[tokio::test]
+async fn cri2_4820_start_passes_the_pid_target_and_rejects_bad_targets() {
+    let holder = PerSandboxHolder::new();
+    let bundles = Arc::new(RecordingBundles::default());
+    let rt = Arc::new(StubRuntime::default());
+    let svc = service_with(&holder, &bundles, true, rt.clone());
+    let a = run(&svc, "a").await;
+    let b = run(&svc, "b").await;
+    let target = create_ns_case(&svc, &a, "t", Some(own_pid_ns()))
+        .await
+        .unwrap();
+
+    // (a) 同じ pod の CONTAINER の対象。config.json の pid は path なし。
+    let dbg = create_ns_case(&svc, &a, "dbg", Some(target_ns(&target)))
+        .await
+        .unwrap();
+    assert_eq!(bundles.seen().last().unwrap().pid_path, None);
+    let _ = start(&svc, &dbg).await;
+    assert_eq!(
+        *rt.pid_targets.lock().unwrap(),
+        vec![(dbg.clone(), Some(target.clone()))]
+    );
+    // pid が TARGET でなければ target_id は無視する。
+    let plain = create_ns_case(
+        &svc,
+        &a,
+        "plain",
+        Some(v1::NamespaceOption {
+            pid: v1::NamespaceMode::Container as i32,
+            target_id: target.clone(),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let _ = start(&svc, &plain).await;
+    assert_eq!(rt.pid_targets.lock().unwrap()[1], (plain, None));
+
+    let rejected = |r: Result<String, tonic::Status>, code: tonic::Code, msg: &str| {
+        let e = r.expect_err("must be rejected");
+        assert_eq!((e.code(), e.message()), (code, msg));
+    };
+    // (b) 別 pod の対象。
+    rejected(
+        create_ns_case(&svc, &b, "x", Some(target_ns(&target))).await,
+        tonic::Code::FailedPrecondition,
+        "the pid namespace target is not in the same pod sandbox",
+    );
+    // (c) 対象の pid が POD（未指定）。
+    let pod_pid = create_ns_case(&svc, &a, "podpid", None).await.unwrap();
+    rejected(
+        create_ns_case(&svc, &a, "x", Some(target_ns(&pod_pid))).await,
+        tonic::Code::FailedPrecondition,
+        "the pid namespace target does not own its pid namespace",
+    );
+    // (c2) 対象の ipc が POD でない。
+    let ipc_ctr = create_ns_case(
+        &svc,
+        &a,
+        "ipcctr",
+        Some(v1::NamespaceOption {
+            pid: v1::NamespaceMode::Container as i32,
+            ipc: v1::NamespaceMode::Container as i32,
+            network: v1::NamespaceMode::Container as i32,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    rejected(
+        create_ns_case(&svc, &a, "x", Some(target_ns(&ipc_ctr))).await,
+        tonic::Code::FailedPrecondition,
+        "the pid namespace target is not in the pod user namespace",
+    );
+    // (d) 存在しない ID。
+    let before = list_container_ids(&svc).await.len();
+    rejected(
+        create_ns_case(&svc, &a, "x", Some(target_ns("nope"))).await,
+        tonic::Code::NotFound,
+        "the pid namespace target does not exist",
+    );
+    assert_eq!(list_container_ids(&svc).await.len(), before);
+    assert_eq!(rt.pid_targets.lock().unwrap().len(), 2);
+
+    // (e) Create 後に対象を Remove すると Start は NotFound で、記録は Created に戻る（再 Start も同じ拒否）。
+    let dbg2 = create_ns_case(&svc, &a, "dbg2", Some(target_ns(&target)))
+        .await
+        .unwrap();
+    RuntimeService::remove_container(
+        &svc,
+        Request::new(v1::RemoveContainerRequest {
+            container_id: target.clone(),
+        }),
+    )
+    .await
+    .unwrap();
+    for _ in 0..2 {
+        let e = start(&svc, &dbg2).await.expect_err("target is gone");
+        assert_eq!(
+            (e.code(), e.message()),
+            (
+                tonic::Code::NotFound,
+                "the pid namespace target does not exist"
+            )
+        );
+    }
+    assert_eq!(rt.pid_targets.lock().unwrap().len(), 2);
 }

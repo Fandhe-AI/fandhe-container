@@ -70,6 +70,11 @@ if [ "$4" = "--pod-shm" ]; then
   printf '%s\n' "$*" > "$R/pod-shm-arg"
   printf 'FCSUP1 OK 4242\n'; exec sleep 3
 fi
+if [ "$4" = "--pid-target" ]; then
+  shift 4
+  printf '%s\n' "$*" > "$R/pid-target-arg"
+  printf 'FCSUP1 OK 4242\n'; exec sleep 3
+fi
 case "$4" in
   c-ok) printf 'FCSUP1 OK 4242\n'; exec sleep 3;;
   c-err) printf 'FCSUP1 ERR FAILED_PRECONDITION 5 container is not created\n'; exit 0;;
@@ -430,6 +435,25 @@ fn cri2_4823_start_passes_pod_shm_to_supervisor_argv() {
     let h = harness(Sim::running_in(root.clone(), "c-ok", 4242), LONG);
     h.rt.start(&StartRequest::new(cid("c-ok"))).expect("start");
     assert!(!root.join("pod-shm-arg").exists());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// CRI-2・CORE-3・SEC-1・SEC-5・#4820: `StartRequest::pid_target` は supervisor の argv `--pid-target <対象の ID> <id>` として渡り、
+/// 無ければ `--pid-target` を載せない。
+#[test]
+fn cri2_4820_start_passes_pid_target_to_supervisor_argv() {
+    let root = temp_root("pidtarget");
+    let h = harness(Sim::running_in(root.clone(), "c-dbg", 4242), LONG);
+    let req = StartRequest::new(cid("c-dbg")).with_pid_target(cid("c-tgt"));
+    h.rt.start(&req).expect("start");
+    let seen = std::fs::read_to_string(root.join("pid-target-arg")).expect("fake supervisor argv");
+    assert_eq!(seen, "c-tgt c-dbg\n");
+    let _ = std::fs::remove_dir_all(&root);
+
+    let root = temp_root("pidtargetnone");
+    let h = harness(Sim::running_in(root.clone(), "c-ok", 4242), LONG);
+    h.rt.start(&StartRequest::new(cid("c-ok"))).expect("start");
+    assert!(!root.join("pid-target-arg").exists());
     let _ = std::fs::remove_dir_all(&root);
 }
 

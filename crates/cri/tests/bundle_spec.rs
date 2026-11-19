@@ -2366,3 +2366,71 @@ fn cri2_net3_4406_net_sysctl_rejections_keep_codes() {
     let e = build_pods_json(&sb, &c(node, pod_m), Some(&paths), None).expect_err("node wins");
     assert_eq!(e.code(), inv);
 }
+
+/// CRI-2・CORE-3・SEC-1・#4820: pid の TARGET は、保持役の user＋ipc を join する構成では pid が path なし（新しい pid ns。
+/// 参加は supervisor の `--pid-target`）で通り、join しない構成は固定の拒否。ipc・network・userns の TARGET は拒否のまま。
+#[test]
+fn cri2_4820_pid_target_joins_only_with_holder_and_others_stay_unimplemented() {
+    let paths = pod_paths();
+    let (pod_m, target) = (NamespaceMode::Pod, NamespaceMode::Target);
+    let c = |net, pid, ipc| with_sc(|sc| sc.namespace_options = Some(ns(net, pid, ipc)));
+    let v = build_with_pod(&c(pod_m, target, pod_m), &paths);
+    let entry = |kind: &str| {
+        v["linux"]["namespaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["type"] == kind)
+            .cloned()
+            .unwrap()
+    };
+    assert_eq!(entry("pid"), serde_json::json!({"type": "pid"}));
+    assert_eq!(
+        entry("user"),
+        serde_json::json!({"type": "user", "path": "/proc/4242/ns/user"})
+    );
+    assert_eq!(
+        entry("ipc"),
+        serde_json::json!({"type": "ipc", "path": "/proc/4242/ns/ipc"})
+    );
+    // join なし（保持役なし）は拒否。
+    let e = build_runtime_config(&pod(), &c(pod_m, target, pod_m), &ImageDefaults::default())
+        .expect_err("no holder");
+    assert_eq!(e.code(), CriErrorCode::Unimplemented);
+    assert_eq!(e.message(), "namespace_options.pid is not supported");
+    // ipc を join しない（CONTAINER）構成の pid TARGET も拒否。
+    let e = build_runtime_config_with_pod_namespaces(
+        &pod(),
+        &c(NamespaceMode::Container, target, NamespaceMode::Container),
+        &ImageDefaults::default(),
+        Some(&paths),
+    )
+    .expect_err("no ipc join");
+    assert_eq!(e.code(), CriErrorCode::Unimplemented);
+    // ipc・network の TARGET は不変。
+    for bad in [c(pod_m, pod_m, target), c(target, pod_m, pod_m)] {
+        let e = build_runtime_config_with_pod_namespaces(
+            &pod(),
+            &bad,
+            &ImageDefaults::default(),
+            Some(&paths),
+        )
+        .expect_err("target");
+        assert_eq!(e.code(), CriErrorCode::Unimplemented);
+    }
+    // userns の TARGET も不変。
+    let mut o = ns(pod_m, pod_m, pod_m);
+    o.userns_options = Some(UserNamespace {
+        mode: target as i32,
+        ..Default::default()
+    });
+    let bad = with_sc(|sc| sc.namespace_options = Some(o));
+    let e = build_runtime_config_with_pod_namespaces(
+        &pod(),
+        &bad,
+        &ImageDefaults::default(),
+        Some(&paths),
+    )
+    .expect_err("userns target");
+    assert_eq!(e.code(), CriErrorCode::Unimplemented);
+}

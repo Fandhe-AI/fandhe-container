@@ -961,7 +961,19 @@ fn ipc_is_pod(opts: Option<&NamespaceOption>) -> bool {
 ///
 /// `/dev/shm` の完全一致で足りるのは、Create が `check_canonical_path` で非正規形を `INVALID_ARGUMENT` にするため。
 pub(crate) fn shares_pod_shm(sandbox: &PodSandboxConfig, container: &ContainerConfig) -> bool {
-    let opts = container
+    ipc_is_pod(effective_ns_options(sandbox, container))
+        && !container
+            .mounts
+            .iter()
+            .any(|m| m.container_path == "/dev/shm")
+}
+
+/// コンテナの namespace_options（無ければ sandbox の）。`build_inner` と同じ選び方。
+fn effective_ns_options<'a>(
+    sandbox: &'a PodSandboxConfig,
+    container: &'a ContainerConfig,
+) -> Option<&'a NamespaceOption> {
+    container
         .linux
         .as_ref()
         .and_then(|l| l.security_context.as_ref())
@@ -972,12 +984,39 @@ pub(crate) fn shares_pod_shm(sandbox: &PodSandboxConfig, container: &ContainerCo
                 .as_ref()
                 .and_then(|l| l.security_context.as_ref())
                 .and_then(|s| s.namespace_options.as_ref())
-        });
-    ipc_is_pod(opts)
-        && !container
-            .mounts
-            .iter()
-            .any(|m| m.container_path == "/dev/shm")
+        })
+}
+
+/// 実効の pid が `TARGET` のときだけ `target_id` を返す（`TARGET` でなければ `target_id` は無視する。containerd と同じ。
+/// CRI-2・CORE-3・#4820）。
+pub(crate) fn pid_target_id<'a>(
+    sandbox: &'a PodSandboxConfig,
+    container: &'a ContainerConfig,
+) -> Option<&'a str> {
+    let o = effective_ns_options(sandbox, container)?;
+    matches!(
+        resolve_mode("namespace_options.pid", o.pid),
+        Ok(NamespaceMode::Target)
+    )
+    .then_some(o.target_id.as_str())
+}
+
+/// 実効の pid が `CONTAINER`（コンテナ自身の pid ns を持つ）か。未指定は `POD` のため偽（#4820）。
+pub(crate) fn pid_is_container(sandbox: &PodSandboxConfig, container: &ContainerConfig) -> bool {
+    let default = NamespaceOption::default();
+    let o = effective_ns_options(sandbox, container).unwrap_or(&default);
+    matches!(
+        resolve_mode("namespace_options.pid", o.pid),
+        Ok(NamespaceMode::Container)
+    )
+}
+
+/// 実効の ipc が `POD` か（対象の pid ns が pod の user namespace の中にあるかの判定。#4820）。
+pub(crate) fn effective_ipc_is_pod(
+    sandbox: &PodSandboxConfig,
+    container: &ContainerConfig,
+) -> bool {
+    ipc_is_pod(effective_ns_options(sandbox, container))
 }
 
 /// コンテナの namespace_options（無ければ sandbox の）を読み、`linux.namespaces` を決める。
@@ -997,7 +1036,7 @@ fn namespaces<'a>(
     let mut out = Vec::with_capacity(6);
     // pid・ipc: NODE は必須 namespace を外す（SEC-1）ため拒否、TARGET は join 未対応。
     let pid_mode = resolve_mode("namespace_options.pid", o.pid)?;
-    if matches!(pid_mode, NamespaceMode::Node | NamespaceMode::Target) {
+    if pid_mode == NamespaceMode::Node {
         return Err(unsupported("namespace_options.pid"));
     }
     let ipc_mode = resolve_mode("namespace_options.ipc", o.ipc)?;
@@ -1013,6 +1052,11 @@ fn namespaces<'a>(
     let pid_path = match (pid_mode, pod.and_then(PodNamespacePaths::pid)) {
         (NamespaceMode::Pod, Some(path)) if join.is_some() => Some(path),
         (NamespaceMode::Pod, Some(_)) => return Err(unsupported("namespace_options.pid")),
+        // TARGET: 対象の pid ns への参加は supervisor の `--pid-target` が行い、config.json は path なしで新規の pid ns
+        // にする。保持役の user＋ipc の組へ足す形でしか core が受けないため、ipc を join しない構成は拒否する
+        // （CRI-2・CORE-3・#4820）。対象の検証は `CriRuntimeService`（Create・Start）が行う。
+        (NamespaceMode::Target, _) if join.is_some() => None,
+        (NamespaceMode::Target, _) => return Err(unsupported("namespace_options.pid")),
         _ => None,
     };
     out.push(NamespaceOut {

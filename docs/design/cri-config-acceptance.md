@@ -180,7 +180,7 @@ SELinux 有効ノードは非対応とする（オーナー決定 2026-11-19。#
 却下した案:
 
 - (b) `selinux_relabel` を無視して受ける: ラベルを付けないため enforcing のノードではコンテナからの読み書きが拒否されうる。指定を黙って落とすことにもなる
-- (c) relabel と label を実装する: rootless での setxattr の可否、Landlock・seccomp との関係、`selinux_options` の扱いの設計が要り、SELinux 有効の実機での確認も要る。需要が出たときに改めて判断する
+- (c) relabel と label を実装する: rootless での setxattr の可否、Landlock・seccomp との関係、`selinux_options` の扱いの設計が要り、SELinux 有効の実機での確認も要る。需要が出たときに改めて判断する（再評価の条件は Agent の記録した判断）
 
 拒否の位置と文言（`crates/cri/src/bundle/spec.rs`。CreateContainer の bundle 生成で拒否し、実行層の create は呼ばない）:
 
@@ -190,11 +190,11 @@ SELinux 有効ノードは非対応とする（オーナー決定 2026-11-19。#
 | コンテナの `linux.security_context.selinux_options` | `UNIMPLEMENTED`・`selinux_options is not supported` |
 | sandbox の `linux.security_context.selinux_options` | RunPodSandbox は受ける（sandbox にはコンテナのプロセスが無く、値は読まない）。その sandbox への CreateContainer が `UNIMPLEMENTED`・`selinux_options is not supported` |
 
-kubelet の一次情報（kubernetes `v1.37.1`・`f78e722310e50bcaca9276be22276d9e91d91308` の `pkg/kubelet/kuberuntime/kuberuntime_container.go`）: volume・`/etc/hosts` は 490 行 `selinuxRelabel := v.SELinuxRelabel && selinux.GetEnabled()`、termination-log は 533 行 `selinuxRelabel := selinux.GetEnabled()`。ノードの SELinux が有効なら、kubelet の既定の config の CreateContainer はすべて拒否される。
+kubelet の一次情報（kubernetes `v1.37.1`・`f78e722310e50bcaca9276be22276d9e91d91308` の `pkg/kubelet/kuberuntime/kuberuntime_container.go`）: volume・`/etc/hosts` は 491 行 `selinuxRelabel := v.SELinuxRelabel && selinux.GetEnabled()`、termination-log は 533 行 `selinuxRelabel := selinux.GetEnabled()`。ノードの SELinux が有効なら、kubelet の既定の config の CreateContainer はすべて拒否される。
 
 試験: `crates/cri/tests/bundle_spec.rs` の `cri2_sec1_4895_selinux_is_rejected_with_fixed_message`（3 種の指定のコードと文言の完全一致。`selinux_relabel = false` の対照）、`crates/cri/tests/runtime_service_pod_holder_namespaces.rs` の `cri2_sec1_4895_selinux_relabel_mount_rejected_without_runtime_call_or_record`（RPC を通した拒否で実行層の create が呼ばれず記録が残らないこと、sandbox の `selinux_options` つきの RunPodSandbox は通り CreateContainer で拒否されること）。
 
-残余: sandbox の `selinux_options` は RunPodSandbox で拒否しないため、pod は Ready になってからコンテナの作成で止まる。拒否を RunPodSandbox へ早めるかは、需要が出たときに判断する。SELinux 有効の実機での確認手順は、非対応のため置かない。
+残余: sandbox の `selinux_options` は RunPodSandbox で拒否しないため、pod は Ready になってからコンテナの作成で止まる。拒否を RunPodSandbox へ早めるかは、需要が出たときに判断する（Agent の記録した判断。試験はこの現状を固定しているが要件ではなく、早める変更では RunPodSandbox の拒否の照合へ置き換える）。SELinux 有効の実機での確認手順は、非対応のため置かない。
 
 ## dns_config の受け入れ方式（CRI-2・NET-5。#2665）
 

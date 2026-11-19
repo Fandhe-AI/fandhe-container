@@ -21,7 +21,7 @@
 //!   パス `/proc/<pid>/ns/mnt` と、その保持役の `/dev/shm`〔tmpfs のルート〕の `st_dev`・`st_ino`。例 `48:2:/proc/1234/ns/mnt`）を
 //!   core の `LaunchOptions::with_pod_shm` へ渡す（CRI-2・CORE-3・SEC-1・SEC-5・#4822。plugin-cri 専用で CLI は渡さない。
 //!   `dev`・`ino` は正準な 10 進・非 0、パスは [`PodShmSource::new`] が字句検査する。**特権ランチャー経由〔ambient capability あり〕では
-//!   `Unimplemented` で拒否する**。本番の指定元は S3〔#4823〕で未配線）。
+//!   `Unimplemented` で拒否する**。本番の指定元は S3〔#4823〕の cri が `StartRequest` へ載せ plugin-cri が写す）。
 //!   各オプションは 1 回まで・順不同で、`<container-id>` は末尾の位置引数 1 個。
 //! - 契約の fd は 0〜2 のみ。supervisor は入口（`start_entry`）で fd [`FIRST_INHERITED_FD`] 以降を閉じる
 //!   （特権ランチャーと同じ処理。#2070・SEC-1）。呼び出し側が追加の fd を渡しても使われない。exec から入口までの

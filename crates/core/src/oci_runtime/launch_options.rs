@@ -20,7 +20,7 @@
 //! | `netns_join` | `JoinPinned` と対。init user namespace 所有の pin 済み netns の置き場・パス・(dev, ino)。start が 1 回だけ開いて fd に固定し、user namespace の作成前に参加する(rootful のユーザー定義ネットワーク。D12・NET-1・SEC-1・CORE-3・#3069) |
 //! | `etc_files` | pivot 前段の `mount_etc_files`(管理ルートに生成済みの `/etc/hosts`・`/etc/resolv.conf` を bind。空なら載せない。NET-12・#1872) |
 //! | `stdin` | `Pipe` のときだけ launcher の spawn が stdin 用の pipe を作り、読み取り側を init の fd 0、書き込み側を `LaunchedProcess::take_stdin` で返す。既定 `Null` は従来どおり `/dev/null`(attach の stdin 用。SUP-7・CRI-6・SEC-1・#4069) |
-//! | `pod_shm` | pod で共有する `/dev/shm` の元(保持役の mount namespace のパスと tmpfs の素性)。start が fork 前に fd へ固定して検証し(`PinnedPodShm`)、init が pivot 前に複製して載せる。既定の `/dev/shm` の tmpfs の代わりになる(CRI-2・CORE-3・SEC-1・SEC-5・#4822。本番の指定元は S3・#4823 で未実装) |
+//! | `pod_shm` | pod で共有する `/dev/shm` の元(保持役の mount namespace のパスと tmpfs の素性)。start が fork 前に fd へ固定して検証し(`PinnedPodShm`)、init が pivot 前に複製して載せる。既定の `/dev/shm` の tmpfs の代わりになる(CRI-2・CORE-3・SEC-1・SEC-5・#4822。本番の指定元は cri が `StartRequest::with_pod_shm` へ載せ plugin-cri が supervisor の `--pod-shm` へ写す。S3・#4823) |
 //! | `root_readonly` | `create --read-only`。config の `root.readonly` と OR(狭める方向のみ)。mount の RDONLY・Landlock の root 規則・分離の記録へ同じ実効値を渡す(CLI-1・SUP-12・CORE-5・SEC-1・#2828) |
 //!
 //! # 契約

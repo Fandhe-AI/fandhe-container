@@ -2753,7 +2753,7 @@ mod linux {
         /// 指定があれば `build_launcher` が launcher の起動オプションへ `with_pod_shm` を足す（restart の再 launch も同じ launcher を
         /// 使うので毎回同じ指定が効く）。特権ランチャー経由（effective / permitted の capability あり）では `Unimplemented` で拒否する
         /// （`deny_pod_shm_with_elevated_capabilities`。`CAP_SYS_ADMIN` 等を持つ supervisor が argv の指す mount namespace へ
-        /// 入る経路を作らない）。本番の指定元（plugin-cri）は S3（#4823）で未配線。
+        /// 入る経路を作らない）。本番の指定元（plugin-cri）は S3（#4823）。
         #[must_use]
         pub fn with_pod_shm(
             mut self,

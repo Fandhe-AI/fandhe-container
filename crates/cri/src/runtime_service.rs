@@ -311,10 +311,12 @@ struct SandboxRecord {
     /// 保持役（`PodNamespaceHolderProvider::spawn` の結果。#2871・CRI-2）。メモリ上のみ。再採用した記録は
     /// 常に `None`（保持役は再起動をまたがない）。bundle への namespace のパスはこの値からだけ作る。
     pod_holder: Option<PodHolder>,
+    /// `Box` で持つのは `SandboxRecord` のスロットを `RETAINED_BYTES_PER_RECORD` の見積もりに収めるため
+    /// （素性が pid ns の分だけ大きくなった。#4816。`task_57_1_record_overhead_covers_registry_slot` が検出する）。
     /// 記録ファイルに残す保持役の素性（診断用。R11・#2940・CRI-2・SEC-5）。spawn 成功時に `pod_holder` と同じ
     /// ロック区間で設定し、`release` では消さない（最後の保持役の診断として Remove まで残す）。再採用した記録では
     /// 記録ファイルから設定する。**この値から `PodHolder`・namespace のパス・シグナルを作らない**（型が変換口を持たない）。
-    recorded_holder: Option<holder_identity::RecordedHolderIdentity>,
+    recorded_holder: Option<Box<holder_identity::RecordedHolderIdentity>>,
     /// 保持役を `spawn` している最中。真の間は配下の作成と Stop・Remove を拒否する（`network_pending` と同じ）。
     holder_pending: bool,
     /// 保持役が残りうる（spawn の成功、または結果不明）。Stop・Remove が `release` で解放し、成功したら偽に戻す。
@@ -5864,13 +5866,15 @@ mod tests {
     }
 
     /// TASK-57.1: 1 件あたりの固定の上乗せ（4096 バイト）は、レジストリのスロット（伸長分を見込んで
-    /// 3 倍）と ID の文字列（64 バイト）を収める。構造体が大きくなって収まらなくなったら検出する。
+    /// 3 倍）と、`Box` でヒープに置く保持役の素性（記録 1 件につき 1 個なので 1 倍）と、ID の文字列
+    /// （64 バイト）を収める。構造体が大きくなって収まらなくなったら検出する。
     #[test]
     fn task_57_1_record_overhead_covers_registry_slot() {
         let slot = std::mem::size_of::<(String, SandboxRecord)>();
+        let boxed = std::mem::size_of::<holder_identity::RecordedHolderIdentity>();
         assert!(
-            3 * slot + 64 <= RETAINED_BYTES_PER_RECORD,
-            "registry slot is {slot} bytes"
+            3 * slot + boxed + 64 <= RETAINED_BYTES_PER_RECORD,
+            "registry slot is {slot} bytes, boxed holder identity is {boxed} bytes"
         );
     }
 

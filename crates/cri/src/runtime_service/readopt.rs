@@ -460,7 +460,7 @@ impl CriRuntimeService {
                 // 保持役は plugin-cri と同じ寿命で、再起動をまたがない（#2871）。素性は診断用に戻すだけで、
                 // `pod_holder`（パスの根拠）は作らない（R11・#2940・SEC-5）。
                 pod_holder: None,
-                recorded_holder: data.holder,
+                recorded_holder: data.holder.map(Box::new),
                 holder_pending: false,
                 holder_owned: false,
                 holder_release: false,
@@ -474,7 +474,7 @@ impl CriRuntimeService {
             if unresolved {
                 result.pending_unresolved += 1;
             }
-            if let Some(recorded) = record.recorded_holder {
+            if let Some(recorded) = record.recorded_holder.as_deref().copied() {
                 // registry のロックを持たずに、読み取り専用の観測を 1 件 1 回だけ行う（R11・#2940）。
                 self.count_recorded_holder(&mut result, &recorded);
             }
@@ -1329,7 +1329,10 @@ mod tests {
             assert!(!rec.holder_owned);
             assert!(!rec.holder_pending);
             assert_eq!(rec.state, SandboxState::NotReady);
-            assert_eq!(rec.recorded_holder.map(|h| h.pid()), Some(live_pid));
+            assert_eq!(
+                rec.recorded_holder.as_deref().map(|h| h.pid()),
+                Some(live_pid)
+            );
             // 状態を強制的に Ready にしても、記録の pid からパスは作られない。
             rec.state = SandboxState::Ready;
         }
@@ -1420,7 +1423,10 @@ mod tests {
             .with_pod_holder(Arc::new(ObsHolder::default()));
         let r = s.readopt_sandboxes(ListBudget::default()).unwrap();
         assert_eq!((r.holder_recorded, r.holder_unobserved), (1, 1));
-        let got = s.registry.lock().unwrap().records[&id('a')].recorded_holder;
+        let got = s.registry.lock().unwrap().records[&id('a')]
+            .recorded_holder
+            .as_deref()
+            .copied();
         assert_eq!(
             RecordedHolderIdentity::encode_value(got.as_ref()),
             HOLDER_VALUE

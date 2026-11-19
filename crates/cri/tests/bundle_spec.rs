@@ -930,6 +930,39 @@ fn mounts_map_to_bind_with_ro_rw_options() {
     assert_eq!(cfg.mounts().len(), 2);
 }
 
+/// CRI-2・OCI-4・SEC-1（#4888）: kubelet の既定形（`/dev/termination-log` の rw ファイル bind・
+/// emptyDir（Memory）の `/dev/shm` ディレクトリ bind）が bind として往復し、core も受ける。
+#[test]
+fn kubelet_dev_mounts_round_trip_as_bind() {
+    let mut c = ctr();
+    let mut tl = mount(
+        "/var/lib/kubelet/pods/p/containers/c/1",
+        "/dev/termination-log",
+        false,
+    );
+    tl.propagation = MountPropagation::PropagationPrivate as i32;
+    c.mounts = vec![
+        tl,
+        mount("/var/lib/kubelet/pods/p/volumes/shm", "/dev/shm", false),
+    ];
+    let v = build(&pod(), &c);
+    assert_eq!(
+        v["mounts"],
+        serde_json::json!([
+            {"destination": "/dev/termination-log", "type": "bind",
+             "source": "/var/lib/kubelet/pods/p/containers/c/1",
+             "options": ["rbind", "rprivate", "nosuid", "nodev", "rw"]},
+            {"destination": "/dev/shm", "type": "bind",
+             "source": "/var/lib/kubelet/pods/p/volumes/shm",
+             "options": ["rbind", "rprivate", "nosuid", "nodev", "rw"]},
+        ])
+    );
+    let json = build_runtime_config(&pod(), &c, &ImageDefaults::default()).unwrap();
+    let cfg = oci_runtime::parse_config_bytes(json.as_bytes()).unwrap();
+    let set = oci_runtime::BindMountSet::from_mounts(cfg.mounts()).expect("core accepts allowlist");
+    assert_eq!(set.len(), 2);
+}
+
 /// CRI-2・OCI-4（#2669）: HOST_TO_CONTAINER は `rslave` で書く。`rootfsPropagation` は出さず、core が受ける。
 #[test]
 fn mount_host_to_container_maps_to_rslave() {
@@ -979,9 +1012,22 @@ fn mount_rejections() {
         ("/a/./h", "/d"),
         ("/h//x", "/d"),
         ("/h\\x", "/d"),
-        ("/h", "/dev/shm"),
         ("/h", "/proc/x"),
         ("/h", "/sys"),
+        // 許可リスト（/dev/termination-log・/dev/shm の完全一致）の否定表（#4888・SEC-1）。
+        ("/h", "/dev/shm/x"),
+        ("/h", "/dev/termination-log/x"),
+        ("/h", "/dev/shmx"),
+        ("/h", "/dev/console"),
+        ("/h", "/dev/pts"),
+        ("/h", "/dev/null"),
+        ("/h", "/dev/fd"),
+        ("/h", "/dev/mqueue"),
+        ("/h", "/dev"),
+        ("/h", "/dev/shm/"),
+        ("/h", "/dev//shm"),
+        ("/h", "/proc"),
+        ("/h", "/sys/fs/cgroup"),
     ];
     for (h, d) in bad_paths {
         let mut c = ctr();

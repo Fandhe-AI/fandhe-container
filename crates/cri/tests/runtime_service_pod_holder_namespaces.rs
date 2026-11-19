@@ -482,10 +482,11 @@ async fn create_shm_case(
         ..Default::default()
     });
     let mounts = if shm_mount {
-        let host = std::env::temp_dir().join("fc-4823-shm-src");
+        // host_path は字句の検査だけを通る（偽 runtime のため実体は不要）。temp_dir() は Windows で `C:\` から始まり
+        // 絶対パスの検査で INVALID_ARGUMENT になるため、OS に依らない固定の POSIX パスを使う。
         vec![v1::Mount {
             container_path: "/dev/shm".into(),
-            host_path: host.to_string_lossy().into_owned(),
+            host_path: "/var/lib/fc-4823-shm-src".into(),
             ..Default::default()
         }]
     } else {

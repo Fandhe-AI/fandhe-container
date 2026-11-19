@@ -19,8 +19,10 @@
 //!
 //! # `/dev/shm` を載せない構成（#1672 事後監査 P2）
 //!
-//! `--ipc=host` では `/dev/shm` の tmpfs を載せない（ホストの `/dev/shm` の bind は未実装。
-//! `docs/design/dev-default-mounts.md` 3.4）。その構成で `/dev/shm` のルールを入れると、適用時にパスが無く
+//! `--ipc=host` では `/dev/shm` の tmpfs を載せない（ホストの `/dev/shm` は、`mounts[]` の bind
+//! `/dev/shm` で利用者が明示したときだけ載る。許可リストの宛先で、手書き bundle〔CLI・stack〕からも通る。#4888・
+//! `docs/design/dev-default-mounts.md` 3.4）。`/dev/shm` を bind で受ける起動も、暗黙の tmpfs を載せないため同じ
+//! `WithoutShm` になる（launcher が実効の tmpfs 集合から選ぶ）。その構成で `/dev/shm` のルールを入れると、適用時にパスが無く
 //! 起動を拒否する。そのため [`ImplicitDevMounts::WithoutShm`] を用意し、実際に載せる tmpfs の集合から
 //! [`ImplicitDevMounts::for_tmpfs_set`] で選ぶ（supervisor の `ContainerOptions::implicit_dev_mounts`）。
 //! どの variant でも、適用時に各パスが期待する fs の独立したマウントであることを `crate::landlock` が確かめる

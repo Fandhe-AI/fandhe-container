@@ -87,7 +87,8 @@ pub const LIFECYCLE_OP_NAMES: &[&str] = &[
 pub(crate) use bind_mounts::ProtectedFsRoot;
 pub use bind_mounts::{
     BindMountError, BindMountErrorKind, BindMountSet, BindMountSpec, BindPropagation,
-    audit_bind_mount_error,
+    DevBindSourceKind, audit_bind_mount_error, dev_bind_allowlist_kind,
+    is_reserved_bind_destination,
 };
 pub use cgroup_requirement::{
     CgroupJoinMeans, CgroupRequirement, launch_after_cgroup_check, require_cgroup_join,

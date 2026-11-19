@@ -20,6 +20,10 @@
 //! - シナリオ D（bind mount。#1915）: `mounts[]` に `/data` の bind（`rw`）を指定して start し、コンテナ内プローブが
 //!   `/data` へ固定の内容を書く。親はホスト側の元ディレクトリに同じ内容のファイルが現れることを完全一致で、
 //!   mountinfo 上の `/data` のオプションに `rw`・`nosuid`・`nodev` が含まれることを照合する
+//! - シナリオ DV（`/dev` 配下の bind の許可リスト。#4888・CRI-2・OCI-4・SEC-1・CORE-5）: `mounts[]` の `/dev/shm`（ディレクトリ）と
+//!   `/dev/termination-log`（ファイル）の bind を start し、コンテナ内の mountinfo の `/dev/shm` が 1 枚（bind。暗黙の tmpfs なし）で
+//!   `nosuid`・`nodev`、読み書きがホスト側の元と完全一致で現れ、分離の記録に `Mount` の規則 2 件があり暗黙の `DevShm` が無いことを照合する。
+//!   `ro` の `/dev/shm` の構成では書き込みが EROFS（30）になる
 //! - シナリオ E（状態ルートの bind 拒否。#2066・SEC-1）: 状態ルート自身とその symlink 別名を bind の元にした start が
 //!   `InvalidArgument` で拒否され、状態が Created のまま子が残らないことを照合する
 //! - シナリオ F（保護パスと重なる bind 先の拒否。SEC-1・SEC-2・OCI-4・#2015）: `mounts[]` の bind 先を `linux.readonlyPaths` にも
@@ -308,6 +312,11 @@ mod linux {
     /// シナリオ D の bind 先のコンテナ内パスと、書くファイル名。
     const BIND_DEST: &str = "/data";
     const BIND_FILE: &str = "from-container";
+    /// シナリオ DV（`/dev` 配下の bind の許可リスト。#4888）: ホスト側の元に置く初期の内容と、コンテナ内が書く内容。
+    const DEV_TERM_SEED: &str = "host-termination-seed\n";
+    const DEV_TERM_WRITTEN: &str = "container-wrote-termination\n";
+    const DEV_SHM_SEED: &str = "host-shm-seed\n";
+    const DEV_SHM_WRITTEN: &str = "container-wrote-shm\n";
     /// シナリオ S（起動オプション。SUP-12・CORE-5・SEC-1・#2625）の注入ファイルのコンテナ内パス・内容（ダミー値）・モード。
     const LO_SECRET_PATH: &str = "/secrets/token";
     const LO_SECRET_CONTENT: &str = "dummy-secret-for-launch-options-test";
@@ -662,6 +671,71 @@ mod linux {
                 },
             );
             emit(format!("BIND_OPTS {opts}"));
+        }
+        // シナリオ DV（`/dev` 配下の bind の許可リスト。#4888）: `/dev/termination-log`・`/dev/shm` の bind を読み書きし、
+        // mountinfo 上の `/dev/shm` のマウント数と各オプションを出す。`--with-dev-binds-ro` は `/dev/shm` が `ro` の bind の構成で、
+        // 書き込みの errno（EROFS=30）だけを出す。
+        let dev_rw = std::env::args().any(|a| a == "--with-dev-binds");
+        let dev_ro = std::env::args().any(|a| a == "--with-dev-binds-ro");
+        if dev_rw || dev_ro {
+            let info = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+            let rows = |dest: &str| -> Vec<String> {
+                info.lines()
+                    .filter_map(|l| {
+                        let f: Vec<&str> = l.split_whitespace().collect();
+                        (f.get(4).copied() == Some(dest))
+                            .then(|| f.get(5).copied().unwrap_or("").to_string())
+                    })
+                    .collect()
+            };
+            let shm = rows("/dev/shm");
+            emit(format!("DEV_SHM_COUNT {}", shm.len()));
+            emit(format!(
+                "DEV_SHM_OPTS {}",
+                shm.last().map_or("none", String::as_str)
+            ));
+            if dev_rw {
+                let term = rows("/dev/termination-log");
+                emit(format!("DEV_TERM_COUNT {}", term.len()));
+                emit(format!(
+                    "DEV_TERM_OPTS {}",
+                    term.last().map_or("none", String::as_str)
+                ));
+                emit(format!(
+                    "DEV_TERM_READ {}",
+                    std::fs::read_to_string("/dev/termination-log").map_or_else(
+                        |e| format!("error:{:?}", e.kind()),
+                        |s| s.trim().to_string()
+                    )
+                ));
+                emit(format!(
+                    "DEV_TERM_WRITE {}",
+                    std::fs::write("/dev/termination-log", DEV_TERM_WRITTEN)
+                        .map_or_else(|e| format!("error:{:?}", e.kind()), |()| "ok".to_string())
+                ));
+                emit(format!(
+                    "DEV_SHM_READ {}",
+                    std::fs::read_to_string("/dev/shm/seed").map_or_else(
+                        |e| format!("error:{:?}", e.kind()),
+                        |s| s.trim().to_string()
+                    )
+                ));
+                emit(format!(
+                    "DEV_SHM_WRITE {}",
+                    std::fs::write("/dev/shm/from-container", DEV_SHM_WRITTEN)
+                        .map_or_else(|e| format!("error:{:?}", e.kind()), |()| "ok".to_string())
+                ));
+            } else {
+                emit(format!(
+                    "DEV_SHM_WRITE {}",
+                    std::fs::write("/dev/shm/denied", "x").map_or_else(
+                        |e| e
+                            .raw_os_error()
+                            .map_or("none".to_string(), |n| n.to_string()),
+                        |()| "ok".to_string()
+                    )
+                ));
+            }
         }
         // シナリオ U（`rslave` の bind。#2669）: bind 先のマウントの optional fields（`master:N` など）を出す。
         if std::env::args().any(|a| a == "--with-rslave") {
@@ -1340,6 +1414,8 @@ mod linux {
         scenario_dropped_handle_confirmed(&env, tag);
         scenario_d_bind_mount(&env, tag);
         scenario_u_rslave_bind(&env, tag);
+        scenario_dev_binds(&env, tag, false);
+        scenario_dev_binds(&env, tag, true);
         scenario_e_state_root_bind_refused(&env, tag);
         scenario_f_bind_over_protected_path_refused(&env, tag);
         scenario_g_devtmpfs_bind_refused(&env, tag);
@@ -1697,6 +1773,161 @@ mod linux {
             println!(
                 "production_launcher: scenario=bind-mount pid={pid} dest={BIND_DEST} visible on host, nosuid+nodev"
             );
+        }));
+        let (_record, process) = started.into_parts();
+        let terminated = process.terminate(timeout());
+        if let Err(p) = verified {
+            if let Err(e) = &terminated {
+                eprintln!(
+                    "production_launcher: terminate after failed verification also failed: {e:?}"
+                );
+            }
+            std::panic::resume_unwind(p);
+        }
+        terminated.expect("terminate");
+        let (rx, reader) = reader_slot.take().expect("reader slot");
+        assert!(
+            eventually(|| !Path::new(&format!("/proc/{pid}")).exists()),
+            "/proc/{pid} must disappear after terminate"
+        );
+        reader.join().expect("join reader");
+        drop(rx);
+        assert!(
+            children_of_self().is_empty(),
+            "no child may remain after terminate"
+        );
+    }
+
+    /// シナリオ DV: `mounts[]` の `/dev/shm`（ディレクトリ）・`/dev/termination-log`（ファイル）の bind が start と本番 launcher を通って
+    /// 適用される（許可リストの宛先。#4888・CRI-2・OCI-4・SEC-1・CORE-5）。暗黙の `/dev/shm` の tmpfs は載らず、コンテナ内の mountinfo の
+    /// `/dev/shm` は 1 枚（bind）で `nosuid`・`nodev`。コンテナ内の読み書きはホスト側の元と完全一致で現れる。分離の記録には
+    /// `Mount` の規則が 2 件（index 0・1）あり、暗黙の `DevShm` の規則は無い。`ro` の構成は `/dev/shm` への書き込みが EROFS（30）になる。
+    fn scenario_dev_binds(env: &Env, tag: u32, read_only: bool) {
+        use fandhe_container_core::launch_isolation::RecordedTarget;
+        let shm_src = Bundle::new(if read_only { "dvr-shm" } else { "dv-shm" });
+        let term_src = Bundle::new(if read_only { "dvr-term" } else { "dv-term" });
+        let term_file = term_src.dir.join("termination-log");
+        std::fs::write(shm_src.dir.join("seed"), DEV_SHM_SEED).expect("seed shm");
+        std::fs::write(&term_file, DEV_TERM_SEED).expect("seed termination-log");
+        let bundle = Bundle::new(if read_only { "dvr" } else { "dv" });
+        let ld = make_rootfs(&bundle.rootfs(), true);
+        let shm_opts: &[&str] = if read_only {
+            &["rbind", "ro"]
+        } else {
+            &["rbind", "rw"]
+        };
+        let mut list = vec![json!({
+            "destination": "/dev/shm",
+            "type": "bind",
+            "source": shm_src.dir.to_str().expect("utf8 source path"),
+            "options": shm_opts
+        })];
+        if !read_only {
+            list.push(json!({
+                "destination": "/dev/termination-log",
+                "type": "bind",
+                "source": term_file.to_str().expect("utf8 source path"),
+                "options": ["bind", "rw"]
+            }));
+        }
+        let probe_flag = if read_only {
+            "--with-dev-binds-ro"
+        } else {
+            "--with-dev-binds"
+        };
+        write_config(&bundle, &ld, &[probe_flag], json!(list));
+        let id = ContainerId::new(format!("pldv{}{tag}", u8::from(read_only))).expect("id");
+        do_create(env, &bundle, &id);
+
+        wait_single_thread();
+        let started = start(
+            &env.store,
+            &env.recorder,
+            &env.launcher,
+            &StartRequest::new(id.clone()),
+            &timeouts(),
+        )
+        .unwrap_or_else(|e| {
+            panic!(
+                "start with /dev binds failed: {:?} {}",
+                e.code(),
+                e.message()
+            )
+        });
+        let pid = started.process().pid();
+        let mut reader_slot: Option<(mpsc::Receiver<String>, std::thread::JoinHandle<()>)> = None;
+        let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_eq!(started.record().status().state(), ContainerState::Running);
+            // 分離の記録: Mount の規則は bind の件数ぶん（index 順）、暗黙の `/dev/shm` の規則は無い。
+            let record = env
+                .store
+                .get(&GetStateRequest::new(id.clone()))
+                .expect("get state");
+            let iso = record
+                .launch_isolation()
+                .expect("launch_isolation recorded");
+            let rules = iso.landlock().rules();
+            let mounts: Vec<(String, usize)> = rules
+                .iter()
+                .filter_map(|r| match r.target() {
+                    RecordedTarget::Mount { destination, index } => {
+                        Some((destination.as_str().to_owned(), *index))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let mut want = vec![("/dev/shm".to_owned(), 0)];
+            if !read_only {
+                want.push(("/dev/termination-log".to_owned(), 1));
+            }
+            assert_eq!(mounts, want);
+            assert!(
+                !rules
+                    .iter()
+                    .any(|r| matches!(r.target(), RecordedTarget::Implicit(m)
+                        if m.destination() == "/dev/shm")),
+                "no implicit /dev/shm rule when /dev/shm is a bind"
+            );
+            let output = started.process().take_output().expect("container output");
+            let stdout = output.stdout.expect("container stdout");
+            reader_slot = Some(spawn_reader(stdout));
+            let lines = collect_probe(&reader_slot.as_ref().expect("reader slot").0);
+            assert_eq!(value_of(&lines, "DEV_SHM_COUNT"), "1");
+            let shm_o = value_of(&lines, "DEV_SHM_OPTS");
+            let shm_o: Vec<&str> = shm_o.split(',').collect();
+            assert!(shm_o.contains(&"nosuid"), "{shm_o:?}");
+            assert!(shm_o.contains(&"nodev"), "{shm_o:?}");
+            if read_only {
+                assert!(shm_o.contains(&"ro"), "{shm_o:?}");
+                assert_eq!(value_of(&lines, "DEV_SHM_WRITE"), "30");
+                assert!(!shm_src.dir.join("denied").exists());
+                println!(
+                    "production_launcher: dev binds read-only /dev/shm bind rejects writes with EROFS"
+                );
+            } else {
+                assert!(shm_o.contains(&"rw"), "{shm_o:?}");
+                assert_eq!(value_of(&lines, "DEV_TERM_COUNT"), "1");
+                let term_o = value_of(&lines, "DEV_TERM_OPTS");
+                let term_o: Vec<&str> = term_o.split(',').collect();
+                assert!(term_o.contains(&"nosuid"), "{term_o:?}");
+                assert!(term_o.contains(&"nodev"), "{term_o:?}");
+                assert_eq!(value_of(&lines, "DEV_TERM_READ"), DEV_TERM_SEED.trim_end());
+                assert_eq!(value_of(&lines, "DEV_TERM_WRITE"), "ok");
+                assert_eq!(value_of(&lines, "DEV_SHM_READ"), DEV_SHM_SEED.trim_end());
+                assert_eq!(value_of(&lines, "DEV_SHM_WRITE"), "ok");
+                assert_eq!(
+                    std::fs::read_to_string(&term_file).expect("host termination-log"),
+                    DEV_TERM_WRITTEN
+                );
+                assert_eq!(
+                    std::fs::read_to_string(shm_src.dir.join("from-container"))
+                        .expect("host shm file"),
+                    DEV_SHM_WRITTEN
+                );
+                println!(
+                    "production_launcher: dev binds /dev/termination-log and /dev/shm are visible on host with one /dev/shm mount (nosuid, nodev)"
+                );
+            }
         }));
         let (_record, process) = started.into_parts();
         let terminated = process.terminate(timeout());

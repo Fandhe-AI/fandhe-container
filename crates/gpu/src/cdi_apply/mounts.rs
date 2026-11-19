@@ -236,6 +236,9 @@ pub fn cdi_bind_mount(m: &Mount) -> Result<CdiBindMount, CdiSpecError> {
     }
     check_path(&m.host_path, "hostPath")?;
     check_path(&m.container_path, "containerPath")?;
+    // core の `BindMountSet` は #4888 で `/dev/termination-log`・`/dev/shm` の 2 宛先だけを許可リストで受けるが、CDI の
+    // containerPath にはその例外を適用しない（GPU のデバイス供給は `/dev` 配下の bind を要さず、厳しい側のまま残す。
+    // 予約先の写しであり、core の許可リストとは意図して一致させない。#4888・GPU-2・SEC-1）。
     if is_pseudo_fs_path(&m.container_path) {
         return Err(err(
             CdiSpecErrorCode::InvalidArgument,

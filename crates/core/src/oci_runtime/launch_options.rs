@@ -402,7 +402,10 @@ impl LaunchOptions {
         out
     }
 
-    /// Landlock の暗黙マウント(実際に載せる tmpfs の集合から導く。CORE-5)。
+    /// Landlock の暗黙マウント(起動オプションの tmpfs の集合から導く。CORE-5)。
+    ///
+    /// `mounts[]` の bind `/dev/shm`(#4888)を伴う起動は、本番の launcher が暗黙の `/dev/shm` を除いた実効の集合から
+    /// 導き直す(本メソッドは bind を知らない)。
     pub fn implicit_dev_mounts(&self) -> ImplicitDevMounts {
         ImplicitDevMounts::for_tmpfs_set(&self.tmpfs)
     }

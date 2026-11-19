@@ -26,7 +26,7 @@
 //! - マウント元: 字句検証（絶対・`..`/`.`/空要素/NUL/`\` なし・`/` 不可）。rootfs・bundle の同一・祖先は
 //!   [`BindMountSet::check_against_host_paths`]（子孫は受ける）、状態ルートの同一・祖先・子孫は
 //!   [`BindMountSet::check_against_protected_trees`]
-//! - マウント先: `/proc`・`/sys`・`/dev` とその配下を拒否。先行 bind との同一・入れ子を拒否。tmpfs・注入・
+//! - マウント先: `/proc`・`/sys`・`/dev` とその配下を拒否する。例外は `/dev/termination-log`（ファイル）と `/dev/shm`（ディレクトリ）の完全一致だけ（[`dev_bind_allowlist_kind`]。#4888）。先行 bind との同一・入れ子を拒否。tmpfs・注入・
 //!   保護パスとの重なりは各 `check_against_*`
 //!
 //! # OCI Runtime Spec との差
@@ -43,7 +43,7 @@
 //! | 伝播系・`unbindable` | 受ける | `rslave` のみ受ける（ホスト側が shared / slave の元に限る）。他は拒否 |
 //! | `defaults` | no-op | 拒否（許可集合外） |
 //! | 再帰版 `rro` 等・`idmap` | 受ける | 拒否 |
-//! | 宛先 `/proc`・`/sys`・`/dev` 配下 | 制限なし | 拒否 |
+//! | 宛先 `/proc`・`/sys`・`/dev` 配下 | 制限なし | 拒否（`/dev/termination-log`・`/dev/shm` の 2 つだけ受ける。#4888） |
 //! | bind 同士の入れ子 | Linux は列挙順に適用 | 拒否 |
 //!
 //! # 決定（#2063・2026-10-16 のオーナー決定。SEC-1・OCI-4）
@@ -92,8 +92,43 @@ use crate::tmpfs::TmpfsMountSet;
 use crate::traits::{ContainerId, ErrorCode};
 
 /// 暗黙・固定のマウントがある、bind を置けないコンテナ内の最上位（`/dev` 系は `crate::dev_mounts` の暗黙分と
-/// `crate::path_masks` の固定集合をすべて覆う）。
+/// `crate::path_masks` の固定集合をすべて覆う）。例外は [`dev_bind_allowlist_kind`] の 2 宛先だけ（#4888）。
 const RESERVED_DESTINATIONS: [&str; 3] = ["/proc", "/sys", "/dev"];
+
+/// 予約先（`/dev` 配下）のうち bind を許可リストで受ける宛先が要求する、マウント元の種別（#4888・CRI-2・OCI-4・SEC-1・CORE-5）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DevBindSourceKind {
+    /// 通常ファイル（`/dev/termination-log`）。
+    RegularFile,
+    /// ディレクトリ（`/dev/shm`）。
+    Directory,
+}
+
+/// 予約先の配下でも bind を受ける宛先の許可リスト（#4888 のオーナー決定 2026-11-19。kubelet が送る 2 つだけ）。
+///
+/// `normalized_destination` は正規化済み（[`MountDestination::as_str`] 形式）の宛先で、完全一致だけを通す
+/// （`/dev/shm/x`・`/dev/termination-log/x`・`/dev/shmx`・`/dev/console`・`/dev/pts`・`/dev/null` 等は `None`）。
+/// 戻り値は要求するマウント元の種別で、適用の段（`exec::mount_binds`）が元の種別と照合し、違えば何も作らず拒否する。
+/// `/dev/shm` は暗黙の tmpfs と pod の共有を載せない代わりに受ける（containerd v2.4.2 と同じ。launcher が実効集合を決める）。
+/// CRI の `check_mount_set`（cri crate）も本関数を呼び、手書き bundle（CLI・stack）と同じ 2 宛先だけを通す。
+pub fn dev_bind_allowlist_kind(normalized_destination: &str) -> Option<DevBindSourceKind> {
+    match normalized_destination {
+        "/dev/termination-log" => Some(DevBindSourceKind::RegularFile),
+        "/dev/shm" => Some(DevBindSourceKind::Directory),
+        _ => None,
+    }
+}
+
+/// 正規化済みの宛先が、bind を置けない予約先（`/proc`・`/sys`・`/dev` とその配下。許可リストの 2 宛先を除く）か。
+///
+/// `from_mounts` と cri の `check_mount_set` が同じ判定を使うための公開関数（#4888・OCI-4・SEC-1）。
+pub fn is_reserved_bind_destination(normalized_destination: &str) -> bool {
+    dev_bind_allowlist_kind(normalized_destination).is_none()
+        && RESERVED_DESTINATIONS
+            .iter()
+            .any(|r| overlaps(normalized_destination, r) && normalized_destination.len() >= r.len())
+}
 
 /// 検証済みの bind mount 1 件（フィールドは非公開。REPAIR-2）。
 ///
@@ -490,10 +525,7 @@ impl BindMountSet {
             let opts = parse_options(index, m)?;
             let source = validate_source(index, m)?;
             let dest = m.mount_destination();
-            if RESERVED_DESTINATIONS
-                .iter()
-                .any(|r| overlaps(dest.as_str(), r) && dest.as_str().len() >= r.len())
-            {
+            if is_reserved_bind_destination(dest.as_str()) {
                 return Err(BindMountError::at(
                     index,
                     BindMountErrorKind::ReservedDestination,
@@ -1088,7 +1120,7 @@ mod tests {
         assert_eq!(k, BindMountErrorKind::MissingSource);
     }
 
-    /// CORE-2・SEC-1: /proc・/sys・/dev とその配下は拒否する。
+    /// CORE-2・SEC-1: /proc・/sys・/dev とその配下は拒否する（許可リストの 2 宛先を除く。#4888）。
     #[test]
     fn core2_bind_rejects_reserved_destinations() {
         for d in [
@@ -1097,12 +1129,19 @@ mod tests {
             "/sys",
             "/sys/fs",
             "/dev",
-            "/dev/shm",
             "/dev/pts",
             "/dev/x",
+            "/dev/shm/x",
+            "/dev/shmx",
+            "/dev/termination-log/x",
+            "/dev/console",
+            "/dev/null",
+            "/dev/fd",
+            "/dev/mqueue",
         ] {
             let (k, _, _) = kind_of(json!([one(Some("bind"), d, Some("/data"), &[])]));
             assert_eq!(k, BindMountErrorKind::ReservedDestination, "dest={d}");
+            assert!(is_reserved_bind_destination(d), "{d}");
         }
         for d in ["/devx", "/procfs", "/system"] {
             assert!(
@@ -1110,7 +1149,7 @@ mod tests {
                 "{d}"
             );
         }
-        for m in ImplicitDevMount::ALL {
+        for m in [ImplicitDevMount::Dev, ImplicitDevMount::DevPts] {
             let (k, _, _) = kind_of(json!([one(
                 Some("bind"),
                 m.destination(),
@@ -1119,6 +1158,49 @@ mod tests {
             )]));
             assert_eq!(k, BindMountErrorKind::ReservedDestination);
         }
+    }
+
+    /// CRI-2・OCI-4・SEC-1・CORE-5（#4888）: 許可リストは 2 宛先の完全一致だけで、要求する元の種別を返す。
+    /// 正規化（`/dev//shm/`）は core が行い、許可リストの関数は正規化済みの文字列だけを見る。
+    #[test]
+    fn cri2_4888_dev_bind_allowlist_is_exact() {
+        assert_eq!(
+            dev_bind_allowlist_kind("/dev/termination-log"),
+            Some(DevBindSourceKind::RegularFile)
+        );
+        assert_eq!(
+            dev_bind_allowlist_kind("/dev/shm"),
+            Some(DevBindSourceKind::Directory)
+        );
+        for d in [
+            "/dev/shm/",
+            "/dev//shm",
+            "/dev/shm/x",
+            "/dev/shmx",
+            "/dev/termination-log/x",
+            "/dev/console",
+            "/dev/pts",
+            "/dev/null",
+            "/dev/fd",
+            "/dev/mqueue",
+            "/dev",
+            "/",
+        ] {
+            assert_eq!(dev_bind_allowlist_kind(d), None, "{d}");
+        }
+        assert!(!is_reserved_bind_destination("/dev/shm"));
+        assert!(!is_reserved_bind_destination("/dev/termination-log"));
+        let ok = set(json!([
+            one(Some("bind"), "/dev//shm/", Some("/data"), &[]),
+            one(Some("bind"), "/dev/termination-log", Some("/f"), &[]),
+        ]))
+        .expect("allowlisted destinations");
+        let dests: Vec<&str> = ok
+            .mounts()
+            .iter()
+            .map(|m| m.destination().as_str())
+            .collect();
+        assert_eq!(dests, ["/dev/shm", "/dev/termination-log"]);
     }
 
     /// CORE-2: 同一宛先・入れ子は拒否し、相手の位置を返す（#2063 の決定 (c)）。

@@ -10,15 +10,20 @@
 //! 失敗時は自分が作ったものだけを戻す。`MountDestination::resolve_in` の文字列結合や `mount(2)` へのパス渡しは使わない。
 //!
 //! ```text
-//! prepare_rootfs（と create_default_devices -> mount_tmpfs -> inject_files）-> mount_binds(&isolation, &prepared, &set)
+//! prepare_rootfs（と create_default_devices -> mount_tmpfs -> inject_files）-> mount_binds(&isolation, &prepared, Some(&devices), &set)
 //!   -> readonly_paths -> masked_paths -> pivot_root
 //!                                                  ^ 同じスレッド・seccomp の適用前
 //! ```
 //!
 //! 入口は検証済みの型（[`MountIsolation`]・[`PreparedRootfs`]・`BindMountSet`）だけを受け、生の `OciMount` や
 //! パス文字列を受ける入口は持たない。`run_pre_pivot` へは組み込み済み（#1914。`inject_files` の後・`readonly_paths` の前に固定）。
-//! `start` と本番 launcher への結線・`check_against_*` の呼び出しは #1915 で済み（`start` が host_paths・保護パス、launcher が tmpfs を検査する）。`/dev` の tmpfs を覆い隠す宛先は
-//! `BindMountSet` が `/proc`・`/sys`・`/dev` とその配下を拒否するため型の上で作れず、`DeviceReport` の証跡は受けない。
+//! `start` と本番 launcher への結線・`check_against_*` の呼び出しは #1915 で済み（`start` が host_paths・保護パス、launcher が tmpfs を検査する）。`/dev` の tmpfs を覆い隠す宛先
+//! （`/dev` 自身）は `BindMountSet` が拒否するため型の上で作れない。`/dev/` 配下は許可リストの 2 宛先（`/dev/termination-log` はファイル、
+//! `/dev/shm` はディレクトリ。#4888）だけ受け、`mount_tmpfs` と同じく `Option<&DeviceReport>`（`create_default_devices` の後であることの証跡）を
+//! 要求する。許可リストの宛先は元の種別が違えば宛先に何も作る前に `bind_target_kind_mismatch` で拒否する。
+//! `/dev` 配下の bind では Landlock は何も狭めない: 祖先の `/dev` の規則が既に読み書きと `IOCTL_DEV` を持つ。bind の規則の権利は
+//! config の options の文字列だけから導かれるため、手書き bundle で `nodev` が無ければ `IOCTL_DEV` が入るが、祖先と同じで広がらない。
+//! SEC-1 は VFS の `nosuid`・`nodev`（指定時 `ro`・`noexec`。常に付ける）と、識別子（`MountedBy::Bind`）の照合が担う。
 //!
 //! # マウント元をどのプロセスがどの権限で開くか
 //!
@@ -209,7 +214,9 @@ use crate::oci_runtime::mountinfo_identity::{
     exposed_devs, fs_identity, mounts_under, parse_mountinfo, path_mount_id, source_contains,
     source_reaches,
 };
-use crate::oci_runtime::{BindMountSet, BindMountSpec, BindPropagation};
+use crate::oci_runtime::{
+    BindMountSet, BindMountSpec, BindPropagation, DevBindSourceKind, dev_bind_allowlist_kind,
+};
 use crate::rootless::parse_id_map;
 use crate::sys::{
     self, BindMountAttrs, BindSourceError, BindSourceKind, MountFlags, MountTreeScope, SysError,
@@ -218,11 +225,11 @@ use crate::sys::{
 use crate::traits::types::ErrorCode;
 
 use super::overlay_layers::overlay_layer_paths;
-use super::tmpfs::{DIR_MODE, display_destination, open_chain, root_display};
+use super::tmpfs::{DIR_MODE, check_dev_evidence, display_destination, open_chain, root_display};
 use super::{
-    ExecError, IdMapping, IsolationStage, MountIsolation, PreparedRootfs, USER_NS_INIT_INO,
-    ViolationReason, fd_mount_id, fd_still_at, mount_is_shared, read_thread_mountinfo,
-    thread_ns_link,
+    DeviceReport, ExecError, IdMapping, IsolationStage, MountIsolation, PreparedRootfs,
+    USER_NS_INIT_INO, ViolationReason, fd_mount_id, fd_still_at, mount_is_shared,
+    read_thread_mountinfo, thread_ns_link,
 };
 
 /// 結合試験専用の入口 [`mount_binds_with_attach_hook`] が、検査後・付け替え前に呼ぶ処理の型。
@@ -291,12 +298,17 @@ pub struct BindMountReport {
 ///
 /// [`MountIsolation`] の証跡が現在の状態と一致しなければ副作用なしに拒否する（fail-closed）。空の集合は何もしない。
 /// user namespace なしの経路では適用しない。詳細な契約はモジュール doc を参照。
+///
+/// `devices` は同じ rootfs に対する [`create_default_devices`](super::create_default_devices) の結果で、`set` に `/dev/` 配下の宛先
+/// （許可リストの `/dev/termination-log`・`/dev/shm`。#4888）があるときは必須になる（`mount_tmpfs` と同じ順序の証跡。
+/// 無い・別の rootfs の結果・`dev` の差し替えは副作用なしに `FailedPrecondition`）。`/dev/` 配下の宛先が無い集合では見ない。
 pub fn mount_binds(
     isolation: &MountIsolation,
     prepared: &PreparedRootfs,
+    devices: Option<&DeviceReport>,
     set: &BindMountSet,
 ) -> Result<BindMountReport, ExecError> {
-    mount_binds_checked(isolation, prepared, set, &|| {})
+    mount_binds_checked(isolation, prepared, devices, set, &|| {})
 }
 
 /// 結合試験専用: [`mount_binds`] と同じ検査・マウントを行い、各件の「移動検査の後・付け替えの直前」で `hook` を呼ぶ
@@ -307,20 +319,23 @@ pub fn mount_binds(
 pub fn mount_binds_with_attach_hook(
     isolation: &MountIsolation,
     prepared: &PreparedRootfs,
+    devices: Option<&DeviceReport>,
     set: &BindMountSet,
     hook: AttachHook<'_>,
 ) -> Result<BindMountReport, ExecError> {
-    mount_binds_checked(isolation, prepared, set, hook)
+    mount_binds_checked(isolation, prepared, devices, set, hook)
 }
 
 /// [`mount_binds`] の証跡検証・user namespace の確認と、本番の差し込み点の組み立て。
 fn mount_binds_checked(
     isolation: &MountIsolation,
     prepared: &PreparedRootfs,
+    devices: Option<&DeviceReport>,
     set: &BindMountSet,
     before_attach: &dyn Fn(),
 ) -> Result<BindMountReport, ExecError> {
     isolation.verify_caller(STAGE)?;
+    check_bind_dev_order(prepared.new_root(), set, devices)?;
     if set.is_empty() {
         return Ok(BindMountReport { mounts: Vec::new() });
     }
@@ -343,6 +358,29 @@ fn mount_binds_checked(
         before_attach,
     };
     mount_binds_at(prepared.new_root(), set, &deps)
+}
+
+/// `/dev/` 配下の宛先（許可リストの 2 つ。#4888）を載せる順序の検査（`check_dev_order` の bind 版。副作用は持たない）。
+///
+/// `create_default_devices` が `/dev` に専用の tmpfs を載せる前に `/dev/shm` 等を作ると、ホスト側の rootfs に空のディレクトリが
+/// 残り `/dev` の tmpfs に覆い隠される。`set` に `/dev/` 配下の宛先があるときだけ `devices` の証跡を要求する（fail-closed）。
+fn check_bind_dev_order(
+    root: BorrowedFd<'_>,
+    set: &BindMountSet,
+    devices: Option<&DeviceReport>,
+) -> Result<(), ExecError> {
+    if !set
+        .mounts()
+        .iter()
+        .any(|m| m.destination().as_str().starts_with("/dev/"))
+    {
+        return Ok(());
+    }
+    check_dev_evidence(
+        root,
+        devices,
+        "bind mounts under /dev require create_default_devices to run first on the same rootfs",
+    )
 }
 
 /// 副作用・観測の差し込み点（本番は実 syscall、単体テストは記録つきの dry-run。tmpfs の `mount_tmpfs_at` と同形）。
@@ -856,6 +894,20 @@ fn apply_one(
         check_source_not_protected(ctx, spec, &src, &info, &layers)?;
     }
     let kind = src.kind();
+    // 許可リストの `/dev` 配下の宛先（#4888）は元の種別を固定する。違えば宛先に何も作る前に拒否する
+    // （`/dev/termination-log` にディレクトリ、`/dev/shm` にファイルを載せない。FIFO・symlink は元の固定で拒否済み）。
+    // 理由は既存の `BindTargetKindMismatch` を流用する。意味は「宛先が要求する種別と元が合わない」で、分離の突破の試みではなく
+    // 設定の誤りだが、宛先の種別違いと同じ SEC-1 の記録に載る（#4888 の反対側レビューで確認。新しい理由は足さない）。
+    if let Some(required) = dev_bind_allowlist_kind(spec.destination().as_str()) {
+        let ok = matches!(
+            (required, kind),
+            (DevBindSourceKind::Directory, BindSourceKind::Directory)
+                | (DevBindSourceKind::RegularFile, BindSourceKind::RegularFile)
+        );
+        if !ok {
+            return Err(violation(spec, ViolationReason::BindTargetKindMismatch));
+        }
+    }
     let dest = pin_target(ctx, spec, kind, state)?;
     if (deps.is_shared)(&dest)? {
         return Err(violation(spec, ViolationReason::TargetOnSharedMount));
@@ -3496,6 +3548,111 @@ mod tests {
             b"keep"
         );
         assert!(fx.rootfs.join("adir").is_dir());
+    }
+
+    /// CRI-2・OCI-4・SEC-1（#4888）: 許可リストの宛先は元の種別を固定する。`/dev/termination-log` にディレクトリ、
+    /// `/dev/shm` にファイルを渡すと、宛先に何も作る前（`/dev` も作らない・呼び出し記録なし）に
+    /// `bind_target_kind_mismatch`（`InvalidArgument`）で拒否する。FIFO・symlink の元は元の固定で拒否し、同じく何も作らない。
+    #[test]
+    fn cri2_4888_allowlisted_destination_requires_the_matching_source_kind() {
+        let fx = fx();
+        for (dest, source) in [
+            ("/dev/termination-log", fx.src("dir")),
+            ("/dev/shm", fx.src("file")),
+        ] {
+            let set = one(dest, &source, &[]);
+            let (r, log) = run(&fx, &set, &Knobs::default());
+            let err = r.expect_err("must be rejected");
+            assert_eq!(
+                reason_of(&err),
+                Some(ViolationReason::BindTargetKindMismatch),
+                "{dest}"
+            );
+            assert_eq!(err.code, ErrorCode::InvalidArgument, "{dest}");
+            assert_eq!(log, Vec::<String>::new(), "{dest}");
+            assert!(!fx.rootfs.join("dev").exists(), "{dest}");
+        }
+        std::os::unix::fs::symlink(fx.src("file"), fx.src("link")).expect("symlink");
+        let status = std::process::Command::new("mkfifo")
+            .arg(fx.src("fifo"))
+            .status()
+            .expect("mkfifo");
+        assert!(status.success());
+        for (dest, source, reason) in [
+            (
+                "/dev/termination-log",
+                fx.src("link"),
+                ViolationReason::BindSourceSymlink,
+            ),
+            (
+                "/dev/termination-log",
+                fx.src("fifo"),
+                ViolationReason::BindSourceUnsupportedType,
+            ),
+        ] {
+            let set = one(dest, &source, &[]);
+            let (r, log) = run(&fx, &set, &Knobs::default());
+            let err = r.expect_err("must be rejected");
+            assert_eq!(reason_of(&err), Some(reason), "{source}");
+            assert_eq!(log, Vec::<String>::new(), "{source}");
+            assert!(!fx.rootfs.join("dev").exists(), "{source}");
+        }
+    }
+
+    /// CRI-2・OCI-4・SEC-1（#4888）: 種別が合えば `/dev/termination-log` は空ファイル、`/dev/shm` はディレクトリを宛先に作って載せる
+    /// （本番では `/dev` の tmpfs の上。`ro` の bind も同じ経路）。
+    #[test]
+    fn cri2_4888_allowlisted_destinations_are_applied() {
+        let fx = fx();
+        let set = set_of(vec![
+            m("/dev/termination-log", &fx.src("file"), &[]),
+            m("/dev/shm", &fx.src("dir"), &["ro"]),
+        ]);
+        let report = ok(&fx, &set);
+        let got: Vec<(&str, BindSourceType, bool, bool)> = report
+            .mounts
+            .iter()
+            .map(|o| {
+                (
+                    o.destination.as_str(),
+                    o.source_kind,
+                    o.read_only,
+                    o.created_target,
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (
+                    "/dev/termination-log",
+                    BindSourceType::RegularFile,
+                    false,
+                    true
+                ),
+                ("/dev/shm", BindSourceType::Directory, true, true),
+            ]
+        );
+        assert!(fx.rootfs.join("dev/termination-log").is_file());
+        assert!(fx.rootfs.join("dev/shm").is_dir());
+    }
+
+    /// CRI-2・OCI-4・SEC-1（#4888）: `/dev/` 配下の宛先の bind は `create_default_devices` の証跡を要求する。証跡なしは副作用なしに
+    /// `FailedPrecondition`（固定文言）。`/dev/` 配下の宛先が無い集合は証跡を見ない。
+    #[test]
+    fn cri2_4888_dev_destination_requires_the_devices_evidence() {
+        let fx = fx();
+        let root = fx.rootfs_fd();
+        let set = one("/dev/shm", &fx.src("dir"), &[]);
+        let err = check_bind_dev_order(root.as_fd(), &set, None).expect_err("no evidence");
+        assert_eq!(err.code, ErrorCode::FailedPrecondition);
+        assert_eq!(
+            err.message,
+            "bind mounts under /dev require create_default_devices to run first on the same rootfs"
+        );
+        assert!(!fx.rootfs.join("dev").exists());
+        let plain = one("/mnt/d", &fx.src("dir"), &[]);
+        check_bind_dev_order(root.as_fd(), &plain, None).expect("not under /dev");
     }
 
     /// SEC-1・CORE-1: shared の宛先には載せない（複製に進まず、作った要素は消える）。

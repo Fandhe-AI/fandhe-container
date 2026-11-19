@@ -19,7 +19,7 @@
 //!   core が `linux.namespaces[].path` を未実装としていることに依存する。
 //! - `--ipc=container:<id>`・`--ipc=none` は受理しない。
 //! - `Host` と `--shm-size` の併用は拒否する（TASK-169.5.2・#856。`ContainerOptions::tmpfs_set` が消費時点で検証）。
-//! - `Host` では既定の `/dev/shm`（64 MiB）も載せない。ホストの `/dev/shm` の bind は未実装（#1654）。
+//! - `Host` では既定の `/dev/shm`（64 MiB）も載せない。ホストの `/dev/shm` が要るときは、`mounts[]` の bind `/dev/shm`（許可リストの宛先。手書き bundle からも通る）で利用者が明示する（#1654・#4888）。
 //! - 本番の start 経路は `ContainerOptions::launch_options` が core の `LaunchIpcMode` へ写して反映する（#2625。`apply_to` は使わない）。CLI からの受け渡しは未実装。
 
 use fandhe_container_core::traits::types::{ErrorCode, TraitError};

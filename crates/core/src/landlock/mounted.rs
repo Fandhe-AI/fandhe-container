@@ -275,6 +275,31 @@ mod tests {
         assert_eq!(m.targets().len(), 7);
     }
 
+    /// CRI-2・CORE-5・SEC-1（#4888）: `/dev/shm` を bind で受けた起動の記録は `Bind{index}` が `/dev/shm` を引き、tmpfs の段の
+    /// `/dev/shm`（暗黙分）は無い。暗黙の `DevShm` の規則は `WithoutShm` で作らないため、引きは `None` のまま（照合は規則の
+    /// 由来が `Mount` のものだけ）。
+    #[test]
+    fn cri2_4888_bind_dev_shm_is_found_by_index_not_by_the_implicit_shm() {
+        let mut m = MountedTargets::new();
+        m.push(target(MountedBy::Bind { index: 0 }, "/dev/shm", 20))
+            .expect("capacity");
+        m.push(target(
+            MountedBy::Bind { index: 1 },
+            "/dev/termination-log",
+            21,
+        ))
+        .expect("capacity");
+        let id = |o: RuleOrigin| m.expected_for(&o, "").map(|i| i.mnt_id);
+        assert_eq!(id(RuleOrigin::Mount { index: 0 }), Some(20));
+        assert_eq!(id(RuleOrigin::Mount { index: 1 }), Some(21));
+        assert_eq!(
+            id(RuleOrigin::Implicit {
+                mount: ImplicitDevMount::DevShm
+            }),
+            None
+        );
+    }
+
     /// CORE-5・#2071: 上限を超える件数は記録しない。
     #[test]
     fn core5_2071_mounted_targets_rejects_over_capacity() {

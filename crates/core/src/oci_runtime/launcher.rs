@@ -1705,12 +1705,51 @@ impl Inner {
         }
         // 範囲写像の holder は fork でメモリを継承し dumpable になるため、呼び出し元のメモリにある注入内容は拒否する(#2628)。
         refuse_inject_with_subordinate(self.privilege, options)?;
+        // 実効の tmpfs 集合を 1 回だけ確定する(Landlock の暗黙規則・利用者 tmpfs・bind との重なりの検査・子へ渡す集合は、
+        // すべてこの集合から導く。#4888・CRI-2・OCI-4・SEC-1・CORE-5)。`/dev/shm` を bind mount で受ける起動(許可リストの宛先。
+        // containerd v2.4.2 と同じ)は、暗黙の `/dev/shm` の tmpfs を載せない: 既定と同値の件を 1 つだけ除く。既定と違う定義
+        // (`--shm-size`・`--tmpfs /dev/shm`)と配下の tmpfs は残し、下の重なりの検査が `OverlapsTmpfs` で(監査つきで)拒否する。
+        // pod の共有 `/dev/shm` との併用は、既定の件を残すことで同じ `OverlapsTmpfs` になる(新しい拒否文言は作らない)。
+        // `--ipc=host`(`/dev/shm` の件が無い)はそのまま。この検査は Landlock の ruleset 生成より前に行う(ruleset 側の
+        // `ImplicitMountConflict` は監査に載らないため、先にこちらで落とす)。
+        let bind_shm_effective_owned;
+        let tmpfs: &crate::tmpfs::TmpfsMountSet = if spec.pinned_pod_shm().is_none()
+            && spec
+                .bind_mounts()
+                .mounts()
+                .iter()
+                .any(|b| b.destination().as_str() == crate::tmpfs::DEV_SHM_PATH)
+        {
+            bind_shm_effective_owned = options.tmpfs().without_default_dev_shm_lenient()?;
+            &bind_shm_effective_owned
+        } else {
+            options.tmpfs()
+        };
+        // tmpfs と注入を fork 前に確定し、bind の宛先との重なりをここで検査する(三者の集合が揃う場所。#1654・#1915・#2625)。
+        let inject = (!options.inject().is_empty()).then(|| options.inject());
+        let binds = (!spec.bind_mounts().is_empty()).then(|| spec.bind_mounts());
+        if let Some(binds) = binds
+            && let Err(err) = binds
+                .check_against_tmpfs(tmpfs)
+                .and_then(|()| match inject {
+                    Some(inject) => binds.check_against_injected(inject),
+                    None => Ok(()),
+                })
+        {
+            let (code, message) = (err.code(), err.message());
+            let _ = audit_bind_mount_error(
+                err,
+                spec.config().mounts(),
+                Some(id),
+                self.audit_sink.as_ref(),
+            );
+            return Err(TraitError::new(code, message));
+        }
         // Landlock は必須。ABI 不足・生成失敗は起動を拒否し、Landlock 無しで続けない(CORE-5・#1314)。
         // 利用者指定の tmpfs(暗黙の `/dev/shm` を除く)は `mounts[]` とは別枠で Landlock のルールにも載せる。載せないと
         // 読み取り専用 root 配下の `--tmpfs /run` が EACCES になる。`ro` の tmpfs はルール生成側が除外する
         // (SUP-12・#2625)。
-        let user_tmpfs: Vec<super::config::OciMount> = options
-            .tmpfs()
+        let user_tmpfs: Vec<super::config::OciMount> = tmpfs
             .mounts()
             .iter()
             .filter(|m| m.destination.as_str() != crate::tmpfs::DEV_SHM_PATH)
@@ -1731,7 +1770,7 @@ impl Inner {
             .landlock_ruleset(
                 &landlock_config,
                 &user_tmpfs,
-                options.implicit_dev_mounts(),
+                crate::dev_mounts::ImplicitDevMounts::for_tmpfs_set(tmpfs),
                 // `--read-only` で config を複製しても `mounts()` は同じなので、bind の `index` はずれない。
                 spec.bind_mounts(),
             )
@@ -1821,9 +1860,8 @@ impl Inner {
                     "linux.sysctl requires a namespace the container does not have",
                 )
             })?;
-        // tmpfs と注入を fork 前に確定し、bind の宛先との重なりをここで検査する(三者の集合が揃う場所。
-        // 子の `run_pre_pivot` の検査は多重防御として残す。CORE-5・SUP-12・#1654・#1915・#2625)。
-        let tmpfs = options.tmpfs();
+        // tmpfs と注入は上で確定済み(bind の宛先との重なりも検査済み)。ここでは tmpfs の config の保護パスとの重なりだけを見る。
+        // 子の `run_pre_pivot` の検査は多重防御として残す。CORE-5・SUP-12・#1654・#1915・#2625。
         // pod の共有 `/dev/shm` を載せる起動は、既定の `/dev/shm` の tmpfs の件だけを子の集合から除く(init が複製を載せる)。
         // 重なりの検査・Landlock の暗黙規則・利用者 tmpfs は元の集合のまま(暗黙の `/dev/shm` の規則は `All` のまま)。
         // 既定と違う定義・`--ipc=host`・配下の tmpfs は `without_default_dev_shm` が `InvalidArgument` で拒否する。
@@ -1834,26 +1872,7 @@ impl Inner {
         } else {
             tmpfs
         };
-        let inject = (!options.inject().is_empty()).then(|| options.inject());
-        let binds = (!spec.bind_mounts().is_empty()).then(|| spec.bind_mounts());
         check_tmpfs_against_readonly_paths(spec.config().readonly_paths(), tmpfs, inject)?;
-        if let Some(binds) = binds
-            && let Err(err) = binds
-                .check_against_tmpfs(tmpfs)
-                .and_then(|()| match inject {
-                    Some(inject) => binds.check_against_injected(inject),
-                    None => Ok(()),
-                })
-        {
-            let (code, message) = (err.code(), err.message());
-            let _ = audit_bind_mount_error(
-                err,
-                spec.config().mounts(),
-                Some(id),
-                self.audit_sink.as_ref(),
-            );
-            return Err(TraitError::new(code, message));
-        }
         // 管理ルートの `/etc/hosts`・`/etc/resolv.conf`(指定時のみ)。宛先の重なりを検査し(bind との重なりは他の bind の
         // 拒否と同じく監査 sink へ記録する)、元を fork 前に fd で検証する。restart の再 launch でも毎回やり直す
         // (NET-12・SEC-1・REPAIR-5・#1872)。
@@ -5621,6 +5640,166 @@ mod tests {
             "the launch spec was pinned with a different pod shm identity"
         );
         assert!(!ev.lock().unwrap().iter().any(|e| e.starts_with("spawn")));
+    }
+
+    /// `mounts[]` に `/dev/shm`（ディレクトリ）と `/dev/termination-log`（ファイル）の bind を持つ spec 用の JSON（#4888）。
+    fn dev_bind_json(dests: &[&str]) -> serde_json::Value {
+        serde_json::Value::Array(
+            dests
+                .iter()
+                .map(|d| {
+                    serde_json::json!({
+                        "destination": d, "type": "bind", "source": "/srv/host-dev", "options": ["rbind"]
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    /// CRI-2・OCI-4・SEC-1・CORE-5（#4888）: `/dev/shm` の bind は暗黙の `/dev/shm` の tmpfs を載せない。子へ渡す tmpfs は空で、
+    /// Landlock の暗黙規則は `WithoutShm`（`/dev/shm` の規則は bind 側の `Mount{index}` が担う）。restart 相当の 2 回目も同じ。
+    #[test]
+    fn cri2_4888_bind_dev_shm_drops_the_implicit_tmpfs_and_uses_without_shm() {
+        let spec = spec_with_mounts(
+            "bind-shm",
+            serde_json::json!({}),
+            dev_bind_json(&["/dev/shm"]),
+        );
+        let ops = FakeOps::new(&events());
+        let (seen, implicit) = (Arc::clone(&ops.seen), Arc::clone(&ops.seen_implicit));
+        let l = launcher(ops, rootless(), None);
+        for _ in 0..2 {
+            let p = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+            p.terminate(Duration::from_secs(5)).expect("terminate");
+        }
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec![(Some(vec!["/dev/shm".to_owned()]), Vec::<String>::new()); 2]
+        );
+        assert_eq!(
+            implicit.lock().unwrap().clone(),
+            vec![ImplicitDevMounts::WithoutShm; 2]
+        );
+    }
+
+    /// CRI-2・OCI-4・SEC-1（#4888）: `/dev/termination-log` だけの bind は暗黙の `/dev/shm` を保つ（tmpfs は `["/dev/shm"]`・`All`）。
+    #[test]
+    fn cri2_4888_bind_termination_log_keeps_the_implicit_dev_shm() {
+        let spec = spec_with_mounts(
+            "bind-term",
+            serde_json::json!({}),
+            dev_bind_json(&["/dev/termination-log"]),
+        );
+        let ops = FakeOps::new(&events());
+        let (seen, implicit) = (Arc::clone(&ops.seen), Arc::clone(&ops.seen_implicit));
+        let l = launcher(ops, rootless(), None);
+        let p = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+        p.terminate(Duration::from_secs(5)).expect("terminate");
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec![(
+                Some(vec!["/dev/termination-log".to_owned()]),
+                vec!["/dev/shm".to_owned()]
+            )]
+        );
+        assert_eq!(
+            implicit.lock().unwrap().clone(),
+            vec![ImplicitDevMounts::All]
+        );
+    }
+
+    /// CRI-2・OCI-4・SEC-1（#4888）: `--ipc=host` と `/dev/shm` の bind の併用は通る（tmpfs なし・`WithoutShm`）。
+    #[test]
+    fn cri2_4888_host_ipc_with_bind_dev_shm_is_accepted() {
+        let spec = spec_with_mounts(
+            "bind-shm-host",
+            serde_json::json!({}),
+            dev_bind_json(&["/dev/shm"]),
+        );
+        let ops = FakeOps::new(&events());
+        let (seen, implicit) = (Arc::clone(&ops.seen), Arc::clone(&ops.seen_implicit));
+        let mut l = launcher(ops, rootless(), None);
+        l.inner.launch_options = Some(options_with(&[], false, &[], LaunchIpcMode::Host));
+        let p = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+        p.terminate(Duration::from_secs(5)).expect("terminate");
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec![(Some(vec!["/dev/shm".to_owned()]), Vec::<String>::new())]
+        );
+        assert_eq!(
+            implicit.lock().unwrap().clone(),
+            vec![ImplicitDevMounts::WithoutShm]
+        );
+    }
+
+    /// CRI-2・OCI-4・SEC-1・SEC-4（#4888）: `/dev/shm` の bind と、既定と違う `/dev/shm` の tmpfs（`--shm-size`）・配下の tmpfs・
+    /// pod の共有 `/dev/shm` の併用は、`OverlapsTmpfs` の固定文言で `InvalidArgument`。Landlock の ruleset 生成・spawn より前
+    /// （`landlock`・`spawn` のイベントなし）に、監査の `Mount` 記録が宛先つきで 1 件残る。
+    #[test]
+    fn cri2_4888_bind_dev_shm_conflicts_are_refused_with_an_audit_record_before_landlock() {
+        use crate::tmpfs::{TmpfsMountSpec, TmpfsSize};
+        let sized = {
+            let mut t = TmpfsMountSet::new();
+            t.push(
+                TmpfsMountSpec::dev_shm(TmpfsSize::from_bytes(1 << 20).expect("size"))
+                    .expect("shm"),
+            )
+            .expect("push");
+            LaunchOptions::new(t, InjectedFileSet::new(), LaunchIpcMode::Private).expect("options")
+        };
+        let sub = options_with(&["/dev/shm/sub"], true, &[], LaunchIpcMode::Private);
+        let pod = options_with(&[], true, &[], LaunchIpcMode::Private)
+            .with_pod_shm(pod_shm_source())
+            .expect("options");
+        let cases = [
+            ("shm-size", sized, false),
+            ("under-shm", sub, false),
+            ("pod-shm", pod, true),
+        ];
+        for (name, options, pinned) in cases {
+            let mut spec = spec_with_mounts(
+                &format!("bind-shm-{name}"),
+                serde_json::json!({}),
+                dev_bind_json(&["/dev/shm"]),
+            );
+            if pinned {
+                spec = spec.with_pinned_pod_shm(Some(pinned_pod_shm()));
+            }
+            let ev = events();
+            let sink = Arc::new(CollectSink {
+                records: std::sync::Mutex::new(Vec::new()),
+                fail: false,
+            });
+            let mut l = ProductionLauncher {
+                inner: Inner::new(
+                    Box::new(FakeOps::new(&ev)),
+                    rootless(),
+                    None,
+                    Arc::clone(&sink) as Arc<dyn AuditSink>,
+                    None,
+                ),
+            };
+            l.inner.launch_options = Some(options);
+            let err = l.launch(&spec, Duration::from_secs(1)).err().expect(name);
+            assert_eq!(err.code(), ErrorCode::InvalidArgument, "{name}");
+            assert_eq!(
+                err.message(),
+                "mounts[0]: bind mount destination overlaps a tmpfs mount",
+                "{name}"
+            );
+            let events = ev.lock().unwrap().clone();
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| e == "landlock" || e.starts_with("spawn")),
+                "{name}: {events:?}"
+            );
+            let records = sink.records.lock().unwrap();
+            assert_eq!(records.len(), 1, "{name}");
+            let line = format!("{:?}", records[0]);
+            assert!(line.contains("/dev/shm"), "{name}: {line}");
+            assert!(!line.contains("host-dev"), "{name}: {line}");
+        }
     }
 
     /// 端末つき config の spec（`start` が `with_terminal(true)` を載せたもの相当）。

@@ -764,7 +764,7 @@ mod linux {
             code: ErrorCode,
         ) -> ExecError {
             let before = thread_points();
-            let err = mount_binds(self.isolation, self.prepared, set)
+            let err = mount_binds(self.isolation, self.prepared, None, set)
                 .expect_err(&format!("{what} must be rejected"));
             assert_eq!(err.stage, IsolationStage::MountBinds, "{what}");
             assert_eq!(err.code, code, "{what}: {}", err.message);
@@ -786,7 +786,7 @@ mod linux {
         /// 違反ではない前提不成立（FAILED_PRECONDITION）の照合。`needle` は固定文言の一部。
         fn expect_precondition(&self, what: &str, set: &BindMountSet, needle: &str) -> ExecError {
             let before = thread_points();
-            let err = mount_binds(self.isolation, self.prepared, set)
+            let err = mount_binds(self.isolation, self.prepared, None, set)
                 .expect_err(&format!("{what} must be rejected"));
             assert_eq!(err.stage, IsolationStage::MountBinds, "{what}");
             assert_eq!(
@@ -949,7 +949,7 @@ mod linux {
     fn swap_scenario(ctx: &Ctx<'_>) {
         let set = bind_set(&[(&ctx.src("src/data"), "/swap", &["bind"])]);
         let (from, to) = (ctx.rootfs("swap"), ctx.rootfs("swapped"));
-        let err = mount_binds_with_attach_hook(ctx.isolation, ctx.prepared, &set, &|| {
+        let err = mount_binds_with_attach_hook(ctx.isolation, ctx.prepared, None, &set, &|| {
             std::fs::rename(&from, &to).expect("rename swap");
             std::fs::create_dir(&from).expect("recreate swap");
         })
@@ -1043,7 +1043,7 @@ mod linux {
             (&srcdir, "/rb", &["rbind", "ro", "noexec"]),
             (&srcdir, "/nr", &["bind"]),
         ]);
-        let report = mount_binds(ctx.isolation, ctx.prepared, &set).expect("mount binds");
+        let report = mount_binds(ctx.isolation, ctx.prepared, None, &set).expect("mount binds");
         let applied: Vec<(&str, BindSourceType, bool, bool, bool, bool)> = report
             .mounts
             .iter()
@@ -1167,7 +1167,7 @@ mod linux {
         // lowerdir を元にした結果は assert しない（実装は付け替えた木が overlay のときだけ拒否すると読めるため）。
         // 観測値だけ出し、PR でオーナーの判断を仰ぐ。
         let set = bind_set(&[(&ctx.src("ovl/lower"), "/ovl_lower", &["bind"])]);
-        match mount_binds(ctx.isolation, ctx.prepared, &set) {
+        match mount_binds(ctx.isolation, ctx.prepared, None, &set) {
             Ok(report) => println!(
                 "bind_mounts_real: observed lowerdir bind accepted ({} mount)",
                 report.mounts.len()

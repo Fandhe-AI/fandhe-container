@@ -27,7 +27,9 @@
 //! 分離違反（`ExecError::violation` が `Some`。pidfd の不一致・cgroup 所属の不一致・直接入れ子の PID 1 でない等）は、固定文言へ
 //! 写す前に `resolve` の `audit` へ層 `exec_target` の記録として 1 件届ける（`record_exec_target_rejection`。exec の対象の拒否と
 //! 同じ形。コンテナ ID は対象。SEC-4）。違反を伴わない失敗（対象の不在・終了・supervisor 不在・obtain 失敗）は記録しない。
-//! 記録の失敗は返すエラーを覆さない（fail-closed。失敗の診断は `audit` の実装が担う）。
+//! 記録の失敗は返すエラーを覆さない（fail-closed。失敗の診断は `audit` の実装が担う）。supervisor の `build_launcher` は start の作業スレッド
+//! （複数スレッド）で呼ぶため、`audit` には `FileAuditSink` ではなく単一スレッドの時点で構築した中継（`ControlAuditRelay`。
+//! 枠は `ExecTarget` を運べる）を渡す。
 //!
 //! 記録の pid から `pidfd_open` や `/proc` を開く縮退経路は持たない（pid の再利用。SEC-1）。pid ns の所有 user namespace が
 //! 参加する pod の user namespace と同じこと・親が呼び出し側の pid ns であることは、固定済みの fd に対して

@@ -139,7 +139,7 @@
   3. launch pidfd の経路（`Pid1Target`）で、未終了・NSpid の直接の入れ子の PID 1・cgroup の所属を確かめる
   4. pidfd で未終了を確かめてから `/proc/<pid>/ns/pid` を開いて素性を固定し、開いた後にもう一度確かめる
   - 記録の pid からの `pidfd_open` や `/proc` 経由の参加は行わない（SEC-1）。
-- 合流: 固定した pid ns の fd は既存の `NamespaceJoin` の pid 欄へ入る。以降の検査（nsfs・所有 userns・親の pid ns・素性）と監査は pid の path の場合と同じ（既存の `PodNamespaceJoinOutcome` を使い、新しい語彙は足さない）。固定の段（`resolve`）で出る分離違反（pidfd の不一致・cgroup 所属の不一致・直接入れ子の PID 1 でない）は、固定文言へ写す前に exec の対象の拒否と同じ層 `exec_target` の記録（コンテナ ID は対象）として supervisor の監査 sink へ 1 件届ける（SEC-4。#4899 のレビュー指摘）。対象の不在・終了・supervisor 不在など違反を伴わない失敗は記録しない。記録の失敗は拒否を覆さない（fail-closed）。
+- 合流: 固定した pid ns の fd は既存の `NamespaceJoin` の pid 欄へ入る。以降の検査（nsfs・所有 userns・親の pid ns・素性）と監査は pid の path の場合と同じ（既存の `PodNamespaceJoinOutcome` を使い、新しい語彙は足さない）。固定の段（`resolve`）で出る分離違反（pidfd の不一致・cgroup 所属の不一致・直接入れ子の PID 1 でない）は、固定文言へ写す前に exec の対象の拒否と同じ層 `exec_target` の記録（コンテナ ID は対象）として 1 件届ける。`build_launcher` は start の作業スレッド（複数スレッド）で走り `FileAuditSink` の直接書きは `isolation_unavailable` で落ちるため、pod の join・pasta の再検証と同じく単一スレッドの時点で構築した中継（`rejection_audit`・`ControlAuditRelay`）経由で配送する（中継の枠に `ExecTarget` を足し、理由は閉じた表 `ViolationReason::EXEC_TARGET_REASONS`。表に無い理由は `InvalidArgument`。SEC-4。#4899 のレビュー指摘）。対象の不在・終了・supervisor 不在など違反を伴わない失敗は記録しない。記録の失敗は拒否を覆さない（fail-closed）。
 - 非 Linux: `PinnedPidTarget` は作れない（型だけ）。supervisor 自体が Linux 限定で、`the supervisor requires Linux` で拒否する。
 - 受ける構成と拒否:
 

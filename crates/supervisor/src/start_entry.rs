@@ -3253,14 +3253,18 @@ mod linux {
                     deny_pid_target_with_elevated_capabilities(&read_self_status()?)?;
                     let store = crate::state::open_default_store(Some(self.root.clone()))?;
                     let source = crate::control::production_exec_pidfd_source(store.as_ref());
-                    // 記録の失敗は fork 前の単一スレッドでも固定語彙のログに残る（`ObservedRejectionSink`）。拒否は変わらない。
-                    let audit = ObservedRejectionSink {
+                    // この手順は start の作業スレッド（複数スレッド）で走るため、`FileAuditSink` の直接書きは
+                    // `isolation_unavailable` で落ちる。pod の join・pasta の再検証と同じく、単一スレッドの時点で構築した
+                    // 中継（`rejection_audit`。`ObservedRejectionSink` 包み済み）経由で届ける。中継が無い構成（試験）では
+                    // 従来の sink へ縮退し、記録の失敗でも拒否は変わらない（fail-closed。SEC-4・#4819）。
+                    let fallback: Arc<dyn AuditSink> = Arc::new(ObservedRejectionSink {
                         inner: Arc::clone(audit),
-                    };
+                    });
+                    let audit = self.rejection_audit.as_ref().unwrap_or(&fallback);
                     launch_options.with_pid_target(resolve_pid_target(
                         store.as_ref(),
                         source.as_ref(),
-                        &audit,
+                        audit.as_ref(),
                         target,
                     )?)
                 }
@@ -4833,6 +4837,24 @@ mod linux {
                 .expect("prepare_cgroup reloads the limits through the audited helper");
             assert!(production[call..].contains("self.rejection_audit.as_ref()"));
             assert!(!production[prepare..].contains("load_resource_limits(observed"));
+        }
+
+        /// SEC-4・#4819: pid の TARGET の解決は作業スレッドで走るため、監査は中継（`rejection_audit`）を渡す。
+        #[test]
+        fn sec4_4819_build_launcher_passes_rejection_audit_to_pid_target_resolve() {
+            let src = include_str!("start_entry.rs");
+            let production = src.split("#[cfg(test)]").next().unwrap_or(src);
+            // 先頭の `fn build_launcher(` は trait の宣言のため、本体（`-> ... {`）で引く。
+            let build = production
+                .find("fn build_launcher(&mut self) -> Result<Arc<dyn ProcessLauncher>, TraitError> {")
+                .expect("build_launcher");
+            let call = production[build..]
+                .find("resolve_pid_target(")
+                .map(|p| p + build)
+                .expect("build_launcher resolves the pid target");
+            let before = &production[build..call];
+            assert!(before.contains("self.rejection_audit.as_ref()"));
+            assert!(production[call..].contains("audit.as_ref(),"));
         }
 
         /// SEC-4・#2027: 確実な層の記録先を作れなければ `FailedPrecondition` の固定文言で起動を拒否し、作れていれば

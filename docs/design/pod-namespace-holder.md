@@ -77,7 +77,7 @@
 
 ## 範囲外
 
-- pid の共有（`shareProcessNamespace`）・`/dev/shm` の共有・uts の共有・`NamespaceMode::TARGET`: 下の「pid・uts・/dev/shm の共有と TARGET（#2903）」で設計した。uts は実装単位 U1〜U5 を起票済み。pid・`TARGET` はオーナー判断待ち（#4607）で、判断が出るまで `UNIMPLEMENTED`。`/dev/shm` は #4823（S3）で共有する（下の S3 の節。`mounts[]` のホストの `/dev/shm` の bind〔#4888〕は pod の共有とは別の経路で、本節の対象ではない）
+- pid の共有（`shareProcessNamespace`）・`/dev/shm` の共有・uts の共有・`NamespaceMode::TARGET`: 下の「pid・uts・/dev/shm の共有と TARGET（#2903）」で設計した。uts は実装単位 U1〜U5 を起票済み。pid の共有は #4816・#4817 で実装済み（下の節）。`TARGET` は `UNIMPLEMENTED` のまま。`/dev/shm` は #4823（S3）で共有する（下の S3 の節。`mounts[]` のホストの `/dev/shm` の bind〔#4888〕は pod の共有とは別の経路で、本節の対象ではない）
 - rootful の pod netns（#2241）
 - 再起動をまたぐ sandbox の再採用（TASK-59。設計は [cri-record-readoption.md](cri-record-readoption.md)・#2902）
 
@@ -180,7 +180,7 @@ PoC: `crates/core/src/oci_runtime/namespace_join.rs` の実機前提試験 `cri2
 
 #### 実装: S3（#4823）の受け渡し
 
-- 対象: pod の共有 `/dev/shm` を、CRI の `CreateContainer`・`StartContainer` の経路で保持役の素性つきで渡し、S2 の入口（supervisor の `--pod-shm`）へ届ける。S1・S2 の core と supervisor は変えない
+- 対象: pod の共有 `/dev/shm` を、CRI の `CreateContainer`・`StartContainer` の経路で保持役の素性つきで渡し、S2 の入口（supervisor の `--pod-shm`）へ届ける。S1・S2 の init 側の複製と supervisor の入口（`--pod-shm`）は変えない。core は `StartRequest` の欄と食い違いの検査だけを足す
 - 流れ（cri → plugin-cri → supervisor → core）: 保持役の READY v4 の shm の `(dev, ino)` を `HolderIdentity` の素性として記録し（メモリ上の `SandboxRecord.pod_holder` だけ）、`start_inputs` が Start のロック区間で条件を判定して `StartRequest` の欄へ載せる。plugin-cri は `StartOptions::with_pod_shm` で `--pod-shm <dev>:<ino>:/proc/<保持役の pid>/ns/mnt` に写す。以降は S2 の経路（supervisor の入口 → `LaunchOptions::with_pod_shm` → core の pin と複製）
 - 受け渡しの運び役は `StartRequest` の欄: cri の `StartOptions` だけでは足りない（cri から plugin-cri への唯一の経路が `ContainerRuntime::start(&StartRequest)` のため）。型は S2 の `PodShmSource` を `core::traits` から再 export する（cri の adapter は `core::traits` だけを参照する契約〔CRI-7〕のため）
 - 検査の二重化: core の `start` は `StartRequest` の欄が `Some` で launcher の指定と食い違えば、予約・fork の前に `FailedPrecondition` で拒否する。core を直接使う経路で欄を黙って無視して共有を落とさないため。欄が `None` なら従来どおり通す（supervisor は argv から launcher にだけ載せ、`StartRequest` には載せないため）
@@ -194,6 +194,7 @@ PoC: `crates/core/src/oci_runtime/namespace_join.rs` の実機前提試験 `cri2
 | あり・素性あり | 真 | `PodShmSource::new("/proc/<pid>/ns/mnt", dev, ino)`（pid と素性は同じ `PodHolder` から 1 式で取る） |
 | あり・素性なし（`PodHolder::new`。照合が無効な試験用の構成） | 真 | `None`（共有しない。オーナー決定） |
 | 無し・provider 注入済み | 真 | `FAILED_PRECONDITION`（`sandbox holder is unavailable`。Stop との競合を縮退させない） |
+| sandbox の記録が無い（`begin_start` が先に拒否するため通常は到達しない） | 問わない | `FAILED_PRECONDITION`（`sandbox record is unavailable`。条件に当たらない場合の `None` と区別する） |
 | 無し・provider なし（rootful 等。join しない） | 真 | `None` |
 | 問わない | 偽 | `None` |
 
@@ -332,7 +333,7 @@ plugin-cri の `ProductionPodHolder`（`crates/plugin-cri/src/pod_holder.rs`）�
 
 あわせて readopt の不具合を直した（H4 の残り）: 保持役の注入下では起動の前に `pending=1`（`network_pending=0`）を書くため、クラッシュ後の再採用が `network_owned=true` に倒すと、pod network provider を差さない本番で Stop・Remove が回収待ちから抜けられなくなる。`network_owned` は `network_pending` だけから導く（`pending_unresolved` には従来どおり数える）。R11（#2940）は #2877 に依存しており循環するため、ここで直した。
 
-未実装（REPAIR-3）: 保持役の pid から `PodNamespacePaths` を作って bundle へ渡す配線（H5・#2876）は配線済みで、POD のコンテナは user・ipc に join する。保持役の netns の bundle への受け渡しも H8（#2878）で実装済み。素性（pid・starttime・ns の dev:ino）の記録と再採用時の終了済みの確認は R11（#2940）で実装済み（再採用した pid からパスやシグナルは作らない。再起動後の保持役の再採用は未採用）。`/dev/shm` の共有は S3（#4823）で実装済み（下の「実装: S3（#4823）の受け渡し」）。未実装は、pod ネットワークの本番 provider（H10・#2879）・pid の共有・`TARGET`（設計は下の #2903 の節、判断待ちは #4607。`mounts[]` の `/dev/shm` の bind は #4888 で別に受けるため含めない）と uts の共有（U1〜U5。#4608〜#4612）。
+未実装（REPAIR-3）: 保持役の pid から `PodNamespacePaths` を作って bundle へ渡す配線（H5・#2876）は配線済みで、POD のコンテナは user・ipc に join する。保持役の netns の bundle への受け渡しも H8（#2878）で実装済み。素性（pid・starttime・ns の dev:ino）の記録と再採用時の終了済みの確認は R11（#2940）で実装済み（再採用した pid からパスやシグナルは作らない。再起動後の保持役の再採用は未採用）。`/dev/shm` の共有は S3（#4823）で実装済み（下の「実装: S3（#4823）の受け渡し」）。未実装は、pod ネットワークの本番 provider（H10・#2879）・`TARGET`（設計は下の #2903 の節。`mounts[]` の `/dev/shm` の bind は #4888 で別に受けるため含めない）と uts の共有（U1〜U5。#4608〜#4612）。
 
 ## 実装単位
 

@@ -1882,7 +1882,9 @@ jobs:
       # net3_2872_real_holder_net_join_identity_and_ownership（`crates/core/src/oci_runtime/namespace_join.rs` の lib 内
       # `#[ignore]` 試験 1 件。CORE-3・SEC-5・NET-3・SEC-4・#2872・#2875）: 保持役の代わりの `unshare --user --map-root-user --ipc --net`
       # の ns で `NamespaceJoin::pin` を実機照合する。同じ起動で pid の join（CRI-2・CORE-3・SEC-5・#4809。`--pid --fork` の保持役の
-      # pid ns の受理・所有者違い・孫の拒否と、join の後に fork した子の pid ns の一致）も照合する。上で緩和した sysctl を使い回し、ビルドは sec1_2536 のステップの lib を使い回す
+      # pid ns の受理・所有者違い・孫の拒否と、join の後に fork した子の pid ns の一致）と、pod の共有 `/dev/shm` の本番の複製の関数
+      # （CRI-2・CORE-3・SEC-1・#4806・#4822。保持役の mnt ns の tmpfs の複製と素性違い・tmpfs 無しの保持役の拒否、
+      # pin の所有者違いの拒否）も照合する。上で緩和した sysctl を使い回し、ビルドは sec1_2536 のステップの lib を使い回す
       # （新しいビルドステップは足さない）。pid の試験は fork するため `--test-threads=1` で他の試験と並べない。新しいジョブ・check-run・sudo は増やさない。
       - name: net3_2872_real_holder_net_join_identity_and_ownership の実行（実機前提テスト・--ignored。NET-3・SEC-5・#2872・#2875）
         if: matrix.os == 'ubuntu-latest' && env.HANG_PROBE != 'true'
@@ -1895,6 +1897,7 @@ jobs:
               oci_runtime::namespace_join::tests::net3_2872_real_holder_net_join_identity_and_ownership \
               oci_runtime::namespace_join::tests::cri2_core3_4809_real_holder_pid_join_identity_and_ownership \
               oci_runtime::namespace_join::tests::cri2_core3_4806_shm_clone_via_holder_mnt_ns \
+              oci_runtime::namespace_join::tests::cri2_sec1_4822_shm_clone_refuses_tmpfs_without_noexec \
               --test-threads=1
           scripts/check-success-lines.sh --name net3_2872_real_holder_net_join_identity_and_ownership \
             --src crates/core/src/oci_runtime/namespace_join.rs --log "${log}" \
@@ -2286,14 +2289,16 @@ jobs:
           }
           code='[A-Z][A-Za-z]+'
           # 二者択一（rslave-bind・p2/r3/r4 の start refused）と root 専用の行は select に入れない。
-          # --min は導出件数の見込み（A 25〔W-net を #2875 で追加。実測は CI の --summary で確認〕・B 9・C 2・D 2・E 1）で、select の書き損じによる取りこぼしを防ぐ。
+          # --min は導出件数の見込み（A 27〔W-net を #2875、W-shm を #4822 で追加。実測は CI の --summary で確認〕・
+          # B 9・C 2・D 2・E 1）で、select の書き損じによる取りこぼしを防ぐ。
           # 定数の出典は production_launcher.rs の const（HOSTNAME・BIND_DEST・LO_TMPFS_DEST・WANT・EXIT_CODE）と scenario_k の配列。
           # A: 位置プレースホルダの無い行（最終行・正常系・説明行）。rslave-bind は到達だけを --require で照合する
           sel_a='^production_launcher: (pid1, default |scenario=(ok|bind-mount|multithreaded-refused|j|k'
           sel_a+='|working-dir|dropped-handle-confirmed'
           sel_a+='|bare-name|cwd-relative|user-applied|groups-applied) |launch options |readonly rootfs '
           sel_a+='|injected secret '
-          sel_a+='|capabilities drop |sysctls applied |pod ipc |pod network |entrypoint violation |exit_signal '
+          sel_a+='|capabilities drop |sysctls applied |pod ipc |pod network |pod shared '
+          sel_a+='|entrypoint violation |exit_signal '
           sel_a+='|network loopback |init pty )'
           check --select "${sel_a}" \
             --subst-re pid='[1-9][0-9]*' --subst-re nspid='"[1-9][0-9]*\\t1"' \
@@ -2301,7 +2306,7 @@ jobs:
             --subst WANT=4194304 --subst-re host_before='[0-9]+' --subst EXIT_CODE=7 \
             --subst name=unshare,ptrace,kexec_load \
             --subst-re host_uid='[0-9]+' --subst-re host_gids='[0-9]+,[0-9]+' \
-            --require 'production_launcher: scenario=rslave-bind host=' --min 26 --summary
+            --require 'production_launcher: scenario=rslave-bind host=' --min 27 --summary
           # B: code={:?} が 1 つの拒否系。exec-failure の case/code/phase の組は --require で値まで照合する
           ef='production_launcher: scenario=exec-failure'
           ef_tail='state=created audit=0 children=0'

@@ -130,6 +130,7 @@ mod no_new_privs;
 mod overlay_layers;
 mod path_lookup;
 mod path_masks;
+mod pod_shm;
 mod process;
 mod pty;
 mod reapply;
@@ -230,6 +231,10 @@ pub use launch_status::relay_landlock_failure_for_test;
 pub use launch_status::relay_mount_binds_failure_for_test;
 /// netns の素性の照合（#3206・NET-6・SEC-1）。launcher と `launch_intermediate` が使う crate 内の再公開。
 pub(crate) use netns_sync::{NetnsExpectation, NetnsHandover, NetnsIdentity, NetnsSyncRequest};
+pub(crate) use pod_shm::PodShmSetup;
+/// 試験専用の再公開（`oci_runtime::namespace_join` の実機前提試験が本番の複製の関数を直接呼ぶ。#4822）。
+#[cfg(test)]
+pub(crate) use pod_shm::clone_from_holder;
 /// 結合試験 `tests/fork_exec_isolation.rs` 専用の再公開（CORE-5・SEC-1・REPAIR-12・#1714。通常の利用者は呼ばない。詳細は定義側）。
 #[cfg(feature = "exec-test-support")]
 #[doc(hidden)]

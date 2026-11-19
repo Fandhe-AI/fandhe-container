@@ -109,6 +109,14 @@
 //!   ホストの netns（HostShared のコンテナの `ns/net`）を組にした B は fork の前に `Unimplemented`（`pod_join_net_not_pod_owned`）、
 //!   別の `Loopback` コンテナの netns を組にした B は `PermissionDenied`（`pod_join_net_owner_mismatch`）で、状態は Created
 //!   のまま子が残らない。成功行 `production_launcher: pod network namespace joined (scenario=W-net ...)`
+//! - シナリオ W-shm（pod で共有する `/dev/shm`。#4822・CRI-2・CORE-3・SEC-1・SEC-5・CORE-5）: コンテナ A（既定の `/dev/shm`）を
+//!   保持役の代わりにし、A の `/dev/shm` の素性を期待値にした `LaunchOptions::with_pod_shm` の launcher で B（A の user・ipc に
+//!   join）を start する。B の init が pivot 前に A の mnt ns へ `setns` して `/dev/shm` を複製して載せる。B のプローブが
+//!   A の書いたファイルを読め（`PODSHM_READ from-a`）・自分の書き込みが通り（`PODSHM_WRITE ok`。Landlock の暗黙規則との整合）、
+//!   マウントが tmpfs の `nosuid,nodev,noexec`・`size=65536k` で、B から見た `/dev/shm` の素性が A と同じで B の書き込みが A に見える。
+//!   否定: 素性が違う期待値は init が `PermissionDenied` で拒否して起動せず、user の join と pid が違う pod shm は start が
+//!   `InvalidArgument`（`pod_join_path_malformed` 1 件）で拒否し、状態は Created のまま子が残らない。成功行
+//!   `production_launcher: pod shared /dev/shm mounted (scenario=W-shm ...)`
 //! - root で実行された場合: 主経路は非 root（SEC-5）。launch が拒否され、状態が Created に戻り、子が残らないことだけを
 //!   照合する（コンテナ内 root をホスト root へ写す起動は試さない）
 //!
@@ -275,8 +283,8 @@ mod linux {
     use fandhe_container_core::observability::OpRecorder;
     use fandhe_container_core::oci_runtime::{
         AttachableNamespaces, LaunchIpcMode, LaunchNetworkMode, LaunchOptions, LaunchStdinMode,
-        NetnsAttachHook, ProcessExit, ProcessLauncher, ProductionLauncher, StartTimeouts,
-        SubordinateIdSource, create, start,
+        NetnsAttachHook, PodShmSource, ProcessExit, ProcessLauncher, ProductionLauncher,
+        StartTimeouts, SubordinateIdSource, create, start,
     };
     use fandhe_container_core::state_store::{FileStateStore, StateRoot};
     use fandhe_container_core::tmpfs::{TmpfsMountSet, TmpfsMountSpec};
@@ -780,6 +788,40 @@ mod linux {
                 |m| format!("{:o}", m.permissions().mode() & 0o777),
             );
             emit(format!("LO_SECRET_MODE {mode}"));
+        }
+        // シナリオ W-shm（pod で共有する `/dev/shm`。#4822）: A が書いた内容が見えること・自分の書き込みが通ること（Landlock の
+        // 暗黙規則と載せたマウントの整合）・`/dev/shm` のマウントの種別と属性。
+        if std::env::args().any(|a| a == "--with-pod-shm") {
+            let content = std::fs::read_to_string("/dev/shm/from-a")
+                .unwrap_or_else(|e| format!("error:{:?}", e.kind()));
+            emit(format!("PODSHM_READ {content}"));
+            let wrote = std::fs::write("/dev/shm/from-b", "from-b").map_or_else(
+                |e| {
+                    e.raw_os_error()
+                        .map_or("none".to_string(), |n| n.to_string())
+                },
+                |()| "ok".to_string(),
+            );
+            emit(format!("PODSHM_WRITE {wrote}"));
+            let info = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+            // 5 番目がマウント先、6 番目がマウントごとのオプション、`-` の次が fs 種別、その次の次が superblock のオプション。
+            let row = info
+                .lines()
+                .filter_map(|l| {
+                    let f: Vec<&str> = l.split_whitespace().collect();
+                    let dash = f.iter().position(|x| *x == "-")?;
+                    (f.get(4).copied() == Some("/dev/shm")).then(|| {
+                        format!(
+                            "{} {} {}",
+                            f.get(5).copied().unwrap_or(""),
+                            f.get(dash + 1).copied().unwrap_or(""),
+                            f.get(dash + 3).copied().unwrap_or("")
+                        )
+                    })
+                })
+                .next_back()
+                .unwrap_or_else(|| "not-mounted".to_string());
+            emit(format!("PODSHM_MOUNT {row}"));
         }
         emit(PROBE_READY.to_string());
         // シナリオ P（名前だけの args[0]。#2314）: READY の後に指定の終了コードで終わる。
@@ -1325,6 +1367,7 @@ mod linux {
         scenario_stdin_pipe(&env, tag);
         scenario_w_pod_ipc_join(&env, tag);
         scenario_w_net_pod_network_join(&env, tag);
+        scenario_w_shm_pod_dev_shm(&env, tag);
         scenario_pinned_netns_join(&env, tag);
         scenario_l_working_dir(&env, tag);
         scenario_m_n_working_dir_refused(&env, tag);
@@ -3807,6 +3850,13 @@ mod linux {
     /// リーダースレッドは `READY` を送った時点で終了し、ここで join する。スレッドを残すと次の launch の前提
     /// （`wait_single_thread` の `Threads: 1`）に戻れないため（REPAIR-12）。`READY` の後のプローブは出力せず待つだけ。
     fn wait_probe_ready(started: &fandhe_container_core::oci_runtime::StartedContainer) {
+        let _ = wait_probe_lines(started);
+    }
+
+    /// `READY` までのプローブ出力の行を返す版（シナリオ W-shm。`wait_probe_ready` と同じく読み手を READY で畳む）。
+    fn wait_probe_lines(
+        started: &fandhe_container_core::oci_runtime::StartedContainer,
+    ) -> Vec<String> {
         let output = started.process().take_output().expect("container output");
         let stdout = output.stdout.expect("container stdout");
         let (tx, rx) = mpsc::channel();
@@ -3826,8 +3876,9 @@ mod linux {
                 }
             }
         });
-        let _ = collect_probe(&rx);
+        let lines = collect_probe(&rx);
         handle.join().expect("join reader");
+        lines
     }
 
     /// 名前空間の識別子（`/proc/<pid>/ns/<name>` のリンク先。例 `ipc:[4026531839]`）。
@@ -4112,6 +4163,166 @@ mod linux {
             finish_started(c, c_verified);
             println!(
                 "production_launcher: pod network namespace joined (scenario=W-net user, ipc and net shared, pid/mnt/uts separate, host and foreign netns refused)"
+            );
+        }));
+        finish_started(a, verified);
+        assert!(
+            eventually(|| children_of_self().is_empty()),
+            "no child may remain after terminate"
+        );
+    }
+
+    /// シナリオ W-shm: pod で共有する `/dev/shm`（#4822・CRI-2・CORE-3・SEC-1・SEC-5・CORE-5。モジュール doc）。
+    ///
+    /// 保持役の代わりのコンテナ A（既定の `/dev/shm`〔64 MiB の tmpfs〕を持つ）の mnt ns を元に、B の launcher へ
+    /// `LaunchOptions::with_pod_shm`（A の `/dev/shm` の素性を期待値）を渡して B を start する。B の init が pivot 前に A の
+    /// mnt ns へ `setns` して A の `/dev/shm` を複製し、B の rootfs へ載せる（Landlock の暗黙規則と同じ識別子で記録される）。
+    fn scenario_w_shm_pod_dev_shm(env: &Env, tag: u32) {
+        use std::os::unix::fs::MetadataExt as _;
+        // A・B の bundle は、プロセスの終了まで残す（drop すると rootfs が消え、他の mount ns から見える `/dev` などの
+        // マウントが外れて、`/proc/<pid>/root` 越しの観測ができなくなる）。
+        let a_bundle = Bundle::new("ws-a");
+        let ld = make_rootfs(&a_bundle.rootfs(), true);
+        write_config(&a_bundle, &ld, &[], json!([]));
+        let a_id = ContainerId::new(format!("plwsa{tag}")).expect("id");
+        do_create(env, &a_bundle, &a_id);
+        wait_single_thread();
+        let a = start(
+            &env.store,
+            &env.recorder,
+            &env.launcher,
+            &StartRequest::new(a_id.clone()),
+            &timeouts(),
+        )
+        .unwrap_or_else(|e| panic!("start A failed: {:?} {}", e.code(), e.message()));
+        wait_probe_ready(&a);
+        let a_pid = a.process().pid();
+        let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let a_shm = format!("/proc/{a_pid}/root/dev/shm");
+            let meta = std::fs::metadata(&a_shm).expect("A's /dev/shm");
+            let (dev, ino) = (meta.dev(), meta.ino());
+            std::fs::write(format!("{a_shm}/from-a"), "from-a").expect("write on A's side");
+            let member = |source: PodShmSource| -> (Arc<dyn ProcessLauncher>, Arc<MemSink>) {
+                let sink = Arc::new(MemSink(std::sync::Mutex::new(Vec::new())));
+                let sink_dyn: Arc<dyn AuditSink> = sink.clone();
+                let options = LaunchOptions::try_default()
+                    .expect("default options")
+                    .with_pod_shm(source)
+                    .expect("pod shm options");
+                let launcher: Arc<dyn ProcessLauncher> = Arc::new(
+                    ProductionLauncher::builder()
+                        .privilege(IsolationPrivilege::RootlessSingleId)
+                        .audit_sink(sink_dyn)
+                        .launch_options(options)
+                        .build()
+                        .expect("build launcher for the pod member"),
+                );
+                (launcher, sink)
+            };
+            let source = |pid: u32, dev: u64, ino: u64| {
+                PodShmSource::new(PathBuf::from(format!("/proc/{pid}/ns/mnt")), dev, ino)
+                    .expect("pod shm source")
+            };
+            let try_start_b =
+                |launcher: &Arc<dyn ProcessLauncher>, label: &str, id: &ContainerId| {
+                    let bundle = Bundle::new(label);
+                    let ld = make_rootfs(&bundle.rootfs(), true);
+                    write_config(&bundle, &ld, &["--with-pod-shm"], json!([]));
+                    patch_namespaces(
+                        &bundle,
+                        json!([
+                            {"type": "pid"}, {"type": "mount"}, {"type": "uts"},
+                            {"type": "ipc", "path": format!("/proc/{a_pid}/ns/ipc")},
+                            {"type": "user", "path": format!("/proc/{a_pid}/ns/user")}
+                        ]),
+                    );
+                    do_create(env, &bundle, id);
+                    wait_single_thread();
+                    let result = start(
+                        &env.store,
+                        &env.recorder,
+                        launcher,
+                        &StartRequest::new(id.clone()),
+                        &timeouts(),
+                    );
+                    (bundle, result)
+                };
+
+            // 正常: B は A の user・ipc に join し、A の `/dev/shm` を複製して載せる。
+            let (launcher, sink) = member(source(a_pid.get(), dev, ino));
+            let b_id = ContainerId::new(format!("plwsb{tag}")).expect("id");
+            let (_b_bundle, b) = try_start_b(&launcher, "ws-b", &b_id);
+            let b = b.unwrap_or_else(|e| panic!("start B failed: {:?} {}", e.code(), e.message()));
+            let b_pid = b.process().pid();
+            let b_verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let lines = wait_probe_lines(&b);
+                // B の中から A の内容が見え、B の書き込みが通る。
+                assert_eq!(value_of(&lines, "PODSHM_READ"), "from-a");
+                assert_eq!(value_of(&lines, "PODSHM_WRITE"), "ok");
+                // 載ったのは A の tmpfs の複製（nosuid,nodev,noexec・size=65536k）で、`/dev/shm` の素性は A と同じ。
+                let mount = value_of(&lines, "PODSHM_MOUNT");
+                let f: Vec<&str> = mount.split_whitespace().collect();
+                assert_eq!(f.get(1).copied(), Some("tmpfs"), "{mount}");
+                for opt in ["nosuid", "nodev", "noexec"] {
+                    assert!(
+                        f.first().is_some_and(|o| o.split(',').any(|x| x == opt)),
+                        "{opt} missing in {mount}"
+                    );
+                }
+                assert!(
+                    f.get(2)
+                        .is_some_and(|o| o.split(',').any(|x| x == "size=65536k")),
+                    "size=65536k missing in {mount}"
+                );
+                let b_meta =
+                    std::fs::metadata(format!("/proc/{b_pid}/root/dev/shm")).expect("B's /dev/shm");
+                assert_eq!((b_meta.dev(), b_meta.ino()), (dev, ino));
+                // B の書き込みは A にも見える（同じ tmpfs）。
+                assert_eq!(
+                    std::fs::read_to_string(format!("{a_shm}/from-b")).expect("A sees B's write"),
+                    "from-b"
+                );
+                // join は user・ipc を共有し、pid・mnt は別（共有したのは `/dev/shm` だけ）。
+                for shared in ["user", "ipc"] {
+                    assert_eq!(ns_link(b_pid, shared), ns_link(a_pid, shared));
+                }
+                for own in ["pid", "mnt"] {
+                    assert_ne!(ns_link(b_pid, own), ns_link(a_pid, own));
+                }
+                assert_eq!(count_records(&sink, "pod_join_accepted_user_ipc"), 1);
+                assert_eq!(count_records(&sink, "pod_join_shm_owner_mismatch"), 0);
+            }));
+            finish_started(b, b_verified);
+
+            // 否定 1: 素性が違う期待値（保持役の tmpfs ではない）は init が固定文言で拒否し、起動しない。
+            let (launcher, sink) = member(source(a_pid.get(), dev, ino + 1));
+            let id = ContainerId::new(format!("plwsr1{tag}")).expect("id");
+            let (_r1_bundle, r1) = try_start_b(&launcher, "ws-r1", &id);
+            let Err(err) = r1 else {
+                panic!("a mismatched pod shm identity must be refused");
+            };
+            assert_eq!(err.code(), ErrorCode::PermissionDenied, "{}", err.message());
+            // 拒否は監査に理由語つきで 1 件残る（SEC-4・#4822）。
+            assert_eq!(count_records(&sink, "pod_shm_identity_mismatch"), 1);
+            assert_eq!(state_of(&env.store, &id), ContainerState::Created);
+            assert!(
+                eventually(|| children_of_self().len() == 1),
+                "only A may remain: {:?}",
+                children_of_self()
+            );
+
+            // 否定 2: user の join の path と pid が違う pod shm（試験プロセス自身の mnt ns）は start が fork の前に拒否する。
+            let (launcher, sink) = member(source(std::process::id(), dev, ino));
+            let id = ContainerId::new(format!("plwsr2{tag}")).expect("id");
+            let (_r2_bundle, r2) = try_start_b(&launcher, "ws-r2", &id);
+            let Err(err) = r2 else {
+                panic!("a pod shm of another holder must be refused");
+            };
+            assert_eq!(err.code(), ErrorCode::InvalidArgument, "{}", err.message());
+            assert_eq!(state_of(&env.store, &id), ContainerState::Created);
+            assert_eq!(count_records(&sink, "pod_join_path_malformed"), 1);
+            println!(
+                "production_launcher: pod shared /dev/shm mounted (scenario=W-shm content shared both ways, nosuid nodev noexec size=65536k, foreign identity and holder refused)"
             );
         }));
         finish_started(a, verified);

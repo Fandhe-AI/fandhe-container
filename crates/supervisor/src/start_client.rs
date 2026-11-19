@@ -11,9 +11,9 @@
 //! 報告の復号は契約の型（`StartReport::decode`）に任せ、ここで書式を組まない・割らない（REPAIR-2）。
 //!
 //! # 契約の要点（呼び出し側の責務。詳細は `start_contract` の module doc）
-//! - argv: `start --root <状態ルートの絶対パス> [--audit-policy <best-effort|strict>] [--cri-log-path <絶対パス>] [--stdin <open|once>] <id>`（`--restart` は渡さず既定の `no`。
+//! - argv: `start --root <状態ルートの絶対パス> [--audit-policy <best-effort|strict>] [--cri-log-path <絶対パス>] [--stdin <open|once>] [--pod-shm <dev>:<ino>:<パス>] <id>`（`--restart` は渡さず既定の `no`。
 //!   `--audit-policy` は CLI の `start --audit-policy` が指定したときだけ載せ、未指定なら supervisor の既定 best-effort が効く。
-//!   `--cri-log-path` と `--stdin` は plugin-cri だけが使い、`--stdin` は tty のコンテナには渡さない。SEC-4・#2761・CRI-6・#4076）。`env_clear` の後に渡す環境は
+//!   `--cri-log-path` と `--stdin` と `--pod-shm`（`<dev>:<ino>:<パス>`。#4822）は plugin-cri だけが使い、`--stdin` は tty のコンテナには渡さない。SEC-4・#2761・CRI-6・#4076）。`env_clear` の後に渡す環境は
 //!   許可リストの 2 つだけ: 固定の `PATH` と、`XDG_RUNTIME_DIR`（systemd-run が user マネージャへ接続するため。絶対パスを検証する）。
 //!   `DBUS_SESSION_BUS_ADDRESS` は渡さない（sd-bus のアドレスは `unixexec:` 等で任意プログラムの起動や接続先の付け替えができ、
 //!   user マネージャの直結ソケット `$XDG_RUNTIME_DIR/systemd/private` だけで足りる。`man sd_bus_default` と systemd の
@@ -109,7 +109,9 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use fandhe_container_core::audit_log::AuditCoveragePolicy;
-use fandhe_container_core::oci_runtime::{LifecycleOp, OciRuntimeError, StartTimeouts};
+use fandhe_container_core::oci_runtime::{
+    LifecycleOp, OciRuntimeError, PodShmSource, StartTimeouts,
+};
 use fandhe_container_core::plugin_trust::{PluginTrustErrorKind, check_owner_and_mode};
 use fandhe_container_core::traits::{ContainerId, ContainerLogPath, ErrorCode};
 
@@ -243,6 +245,9 @@ pub struct StartOptions<'a> {
     /// init の stdin の扱い（`--stdin <open|once>`。plugin-cri だけが指定し、tty のコンテナには指定しない。
     /// SUP-7・SUP-3・CRI-6・#4076）。`None` は argv に載せず、従来どおり `/dev/null`。
     pub stdin: Option<StdinOption>,
+    /// pod で共有する `/dev/shm` の元（`--pod-shm <dev>:<ino>:<パス>`。plugin-cri だけが指定する。supervisor は特権ランチャー経由
+    /// では拒否する。CRI-2・CORE-3・SEC-1・SEC-5・#4822）。`None` は argv に載せない。
+    pub pod_shm: Option<&'a PodShmSource>,
 }
 
 impl<'a> StartOptions<'a> {
@@ -268,6 +273,12 @@ impl<'a> StartOptions<'a> {
         self.stdin = stdin;
         self
     }
+
+    /// pod で共有する `/dev/shm` の元を設定する（`None` は argv に載せない。CRI-2・#4822。本番の呼び出し元は S3〔#4823〕で未配線）。
+    pub fn with_pod_shm(mut self, source: Option<&'a PodShmSource>) -> Self {
+        self.pod_shm = source;
+        self
+    }
 }
 
 /// 契約どおりの argv・stdio・環境・cwd を `cmd` に設定する（シェルも文字列連結も使わない）。
@@ -285,6 +296,11 @@ fn configure_common(cmd: &mut Command, root: &Path, opts: &StartOptions<'_>, id:
     // init の stdin は固定語彙（`open` / `once`）の 1 要素で渡す。tty のコンテナには呼び出し側（cri）が指定しない（D3・CRI-6・#4076）。
     if let Some(stdin) = opts.stdin {
         cmd.arg("--stdin").arg(stdin.as_str());
+    }
+    // pod の共有 `/dev/shm` の元は検証済みの型を `<dev>:<ino>:<パス>` の 1 要素にして渡す（CRI-2・#4822）。
+    if let Some(source) = opts.pod_shm {
+        cmd.arg("--pod-shm")
+            .arg(crate::start_contract::pod_shm_arg(source));
     }
     cmd.arg(id.as_str())
         .stdin(Stdio::null())
@@ -1237,6 +1253,53 @@ mod tests {
             assert_eq!(parsed.stdin, Some(StdinOption::Once));
             let none = args_of(&StartOptions::new().with_stdin(None));
             assert!(!none.iter().any(|x| x == "--stdin"));
+        }
+    }
+
+    /// CRI-2・CORE-3・#4822: `--pod-shm <dev>:<ino>:<パス>` は `--stdin` の後・ID の前に載り、契約の `StartArgs::parse` で
+    /// 同じ値に戻る。未指定は載らない。
+    #[test]
+    fn cri2_4822_scoped_command_carries_pod_shm() {
+        use crate::start_contract::StartArgs;
+        let id = ContainerId::new("c1").expect("id");
+        let source = PodShmSource::new(PathBuf::from("/proc/1234/ns/mnt"), 48, 2).expect("source");
+        for launcher in [None, Some(Path::new("/opt/x/fandhe-container-launcher"))] {
+            let args_of = |opts: &StartOptions<'_>| -> Vec<String> {
+                scoped_command(
+                    Path::new("/usr/bin/systemd-run"),
+                    launcher,
+                    Path::new("/opt/x/fandhe-container-supervisor"),
+                    Path::new("/r"),
+                    opts,
+                    &id,
+                    OsStr::new("/run/user/1000"),
+                )
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+            };
+            let with = StartOptions::new()
+                .with_stdin(Some(StdinOption::Once))
+                .with_pod_shm(Some(&source));
+            let a = args_of(&with);
+            assert_eq!(
+                a[7..],
+                [
+                    "start",
+                    "--root",
+                    "/r",
+                    "--stdin",
+                    "once",
+                    "--pod-shm",
+                    "48:2:/proc/1234/ns/mnt",
+                    "c1"
+                ]
+            );
+            let parsed =
+                StartArgs::parse(a[7..].iter().map(std::ffi::OsString::from)).expect("contract");
+            assert_eq!(parsed.pod_shm, Some(source.clone()));
+            let none = args_of(&StartOptions::new().with_pod_shm(None));
+            assert!(!none.iter().any(|x| x == "--pod-shm"));
         }
     }
 

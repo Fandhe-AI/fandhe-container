@@ -597,13 +597,16 @@ fn cri6_4074_guarded_process_forwards_take_stdin() {
 /// 内側の launcher への転送(転送漏れは降格・監査の欠落になる)。
 #[test]
 fn net9_launcher_forwards_mode_methods_to_inner() {
-    struct Inner;
+    struct Inner(fandhe_container_core::oci_runtime::PodShmSource);
     impl ProcessLauncher for Inner {
         fn launch_mode(&self) -> fandhe_container_core::oci_runtime::LaunchMode {
             fandhe_container_core::oci_runtime::LaunchMode::SelfBounded
         }
         fn network_mode(&self) -> fandhe_container_core::oci_runtime::LaunchNetworkMode {
             fandhe_container_core::oci_runtime::LaunchNetworkMode::Attachable
+        }
+        fn pod_shm_source(&self) -> Option<&fandhe_container_core::oci_runtime::PodShmSource> {
+            Some(&self.0)
         }
         fn last_launch_may_have_left_process(&self) -> bool {
             true
@@ -619,7 +622,15 @@ fn net9_launcher_forwards_mode_methods_to_inner() {
     let ev: Events = Arc::default();
     let backend = FakeBackend::new(&ev);
     let (w, _b) = wiring(&backend);
-    let wrapped = w.wrap(Arc::new(Inner));
+    let source = fandhe_container_core::oci_runtime::PodShmSource::new(
+        std::path::PathBuf::from("/proc/1234/ns/mnt"),
+        48,
+        2,
+    )
+    .expect("source");
+    let wrapped = w.wrap(Arc::new(Inner(source.clone())));
+    // 転送しないと既定の `None` へ縮退し、pod の共有 `/dev/shm` が外れて本番 launcher が起動を拒否する(CRI-2・#4822)。
+    assert_eq!(wrapped.pod_shm_source(), Some(&source));
     assert_eq!(
         wrapped.launch_mode(),
         fandhe_container_core::oci_runtime::LaunchMode::SelfBounded

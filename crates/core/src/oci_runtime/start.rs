@@ -1068,6 +1068,15 @@ fn build_spec_with_swap(
     // pod の user・ipc namespace への join（`linux.namespaces[].path`）。path を 1 回だけ開いて fd へ固定し、
     // 所有者・種別・親子関係を fork の前に検証する（失敗してもプロセスのいない Running を残さない。#2674）。
     let namespace_join = pin_namespace_join_audited(join_paths, id, launcher)?;
+    // pod で共有する `/dev/shm` の元(保持役の mount namespace)。join の固定の直後に、同じ join の user namespace が所有する
+    // ものに限って 1 回だけ開いて固定する(CRI-2・CORE-3・SEC-1・SEC-5・#4822)。
+    let pinned_pod_shm = pin_pod_shm_audited(
+        launcher.pod_shm_source(),
+        namespace_join.as_ref(),
+        join_paths.as_ref(),
+        id,
+        launcher,
+    )?;
     // init user namespace 所有の pin 済み netns(`JoinPinned`)。置き場の fd 起点で 1 回だけ開いて固定し、素性・所有者を
     // fork の前に検証する(D12。NET-1・SEC-1・CORE-3・#3069)。
     let pinned_netns = pin_netns_join_audited(netns_target, id, launcher)?;
@@ -1088,6 +1097,7 @@ fn build_spec_with_swap(
     .with_sysfs(sysfs)
     .with_additional_gids(additional_gids)
     .with_namespace_join(namespace_join)
+    .with_pinned_pod_shm(pinned_pod_shm)
     .with_pinned_netns(pinned_netns)
     .with_network(network, network_mode)
     .with_state_root(state_root.map(Path::to_path_buf))
@@ -1122,6 +1132,35 @@ fn pin_namespace_join_audited(
         Err(rejection) => {
             if let Some(outcome) = rejection.outcome {
                 record(outcome);
+            }
+            Err(rejection.error)
+        }
+    }
+}
+
+/// pod で共有する `/dev/shm` の元(保持役の mount namespace)を固定し、素性検査の拒否を launcher の拒否の記録先へ記録する
+/// (SEC-4・SEC-1・SEC-5・CORE-3・CRI-2・#4822)。
+///
+/// 記録は層 `pod_namespace_join` の閉じた語彙([`PodNamespaceJoinOutcome`](crate::audit_log::PodNamespaceJoinOutcome))で、
+/// パス・pid・inode は載せない。受理の記録は同じ config の user・ipc の join が出した 1 件で足りるため出さない。
+/// 記録の成否で判定は覆さない。指定が無ければ何もしない。
+fn pin_pod_shm_audited(
+    source: Option<&super::namespace_join::PodShmSource>,
+    join: Option<&NamespaceJoin>,
+    join_paths: Option<&super::namespace_join::JoinPaths<'_>>,
+    id: &ContainerId,
+    launcher: &dyn ProcessLauncher,
+) -> Result<Option<super::namespace_join::PinnedPodShm>, TraitError> {
+    let Some(source) = source else {
+        return Ok(None);
+    };
+    match super::namespace_join::PinnedPodShm::pin(source, join, join_paths) {
+        Ok(pinned) => Ok(Some(pinned)),
+        Err(rejection) => {
+            if let (Some(outcome), Some(sink)) =
+                (rejection.outcome, launcher.rejection_audit_sink())
+            {
+                let _ = crate::audit_log::mount::deliver(outcome.audit_event(), Some(id), sink);
             }
             Err(rejection.error)
         }

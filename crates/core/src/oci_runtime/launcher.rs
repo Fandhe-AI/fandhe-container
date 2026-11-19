@@ -1865,6 +1865,7 @@ impl Inner {
         // pod の共有 `/dev/shm` を載せる起動は、既定の `/dev/shm` の tmpfs の件だけを子の集合から除く(init が複製を載せる)。
         // 重なりの検査・Landlock の暗黙規則・利用者 tmpfs は元の集合のまま(暗黙の `/dev/shm` の規則は `All` のまま)。
         // 既定と違う定義・`--ipc=host`・配下の tmpfs は `without_default_dev_shm` が `InvalidArgument` で拒否する。
+        // 宛先 `/dev/shm` の bind との併用は上で `OverlapsTmpfs` で拒否済みで、子の `check_no_bind_at_dev_shm` が多重防御として再検査する(#4888)。
         let child_tmpfs_owned;
         let child_tmpfs = if spec.pinned_pod_shm().is_some() {
             child_tmpfs_owned = tmpfs.without_default_dev_shm()?;

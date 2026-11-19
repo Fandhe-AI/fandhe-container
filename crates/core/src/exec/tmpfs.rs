@@ -198,6 +198,7 @@ pub(super) fn check_dev_order(
     check_dev_evidence(
         root,
         devices,
+        STAGE,
         "tmpfs mounts under /dev require create_default_devices to run first on the same rootfs",
     )
 }
@@ -208,16 +209,17 @@ pub(super) fn check_dev_order(
 pub(super) fn check_dev_evidence(
     root: BorrowedFd<'_>,
     devices: Option<&DeviceReport>,
+    stage: IsolationStage,
     missing: &str,
 ) -> Result<(), ExecError> {
-    let order_error = |msg: &str| ExecError::new(ErrorCode::FailedPrecondition, STAGE, msg);
+    let order_error = |msg: &str| ExecError::new(ErrorCode::FailedPrecondition, stage, msg);
     let Some(devices) = devices else {
         return Err(order_error(missing));
     };
     let dev = sys::open_dir_path_nofollow(Some(root), c"dev").map_err(|_| {
         order_error("the rootfs /dev is not the tmpfs mounted by create_default_devices")
     })?;
-    if DevMountIdentity::of(&dev, STAGE)? != devices.dev_mount {
+    if DevMountIdentity::of(&dev, stage)? != devices.dev_mount {
         return Err(order_error(
             "the rootfs /dev is not the tmpfs mounted by create_default_devices",
         ));

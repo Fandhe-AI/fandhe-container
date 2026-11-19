@@ -159,14 +159,14 @@ kubelet が既定で付ける `mounts[]` のうち、コンテナの `/dev` 配�
 | 末尾の `/` つきの `/dev/shm/` など非正規形 | `INVALID_ARGUMENT`（cri が入口で拒否する。core は正規化後の宛先で照合する） |
 
 - 試験: cri の bundle の往復（kubelet の既定形。`crates/cri/tests/bundle_spec.rs`）と、core の単体試験（許可リストの表、種別違い、tmpfs との重なり）。実機前提の試験（`production_launcher` のシナリオ DV）の結果は本書では未記録
-- 受け入れ条件の「通る」は CreateContainer〜StartContainer の範囲で確かめた。kubelet が作るホスト側ディレクトリ（0750）へのコンテナ側からの到達性は未確認
+- 受け入れ条件の「通る」は、config の生成（cri の `bundle_spec.rs`）と start（core の `production_launcher` のシナリオ DV。cri が出す options と同じ形）を別々の試験で確かめた範囲。CRI の RPC を通した CreateContainer〜StartContainer と、kubelet が作るホスト側ディレクトリ（0750）へのコンテナ側からの到達性は未確認
 - S3（#4823）との関係: `/dev/shm` の bind があれば、CRI は pod の共有 `/dev/shm` を渡さない（S3 の受け入れ条件。cri は未実装）。core は bind と pod の共有 `/dev/shm` の併用を `OverlapsTmpfs`（監査つき）で拒否するため、S3 より前でも両方が載ることはない
 
 既知の差（containerd・kubelet との比較）:
 
-- SELinux 有効ノードでは、kubelet が `mounts` に `selinux_relabel=true` を付け、本実装は `mounts.selinux_relabel` を `UNIMPLEMENTED` にするため、既定の config が通らない。`/dev/termination-log` に限らず `/etc/hosts`・volume にも付く。termination-log の出典は kubernetes `v1.37.1` の `pkg/kubelet/kuberuntime/kuberuntime_container.go` 533〜537 行（`SelinuxRelabel: selinux.GetEnabled()`）。範囲外として別 issue に切り出すことを推奨（オーナー判断待ち）
+- SELinux 有効ノードでは、kubelet が `mounts` に `selinux_relabel=true` を付け、本実装は `mounts.selinux_relabel` を `UNIMPLEMENTED` にするため、既定の config が通らない。`/dev/termination-log` に限らず `/etc/hosts`・volume にも付く。termination-log の出典は kubernetes `v1.37.1` の `pkg/kubelet/kuberuntime/kuberuntime_container.go` 533〜537 行（533 行 `selinuxRelabel := selinux.GetEnabled()`・537 行 `SelinuxRelabel: selinuxRelabel`）。受け入れ方式の判断は #4895 で扱う
 - `mountPath: /dev/shm/` のように末尾の `/` つきで渡すと、本実装だけ `INVALID_ARGUMENT` になる。containerd は既定の `/dev/shm` を足すかの判定で `filepath.Clean` を通して比べ（`internal/cri/server/helpers.go` 221〜223 行）、末尾の `/` つきでも受ける（spec の `destination` には渡された文字列のまま入る。`internal/cri/opts/spec_linux_opts.go` 132 行）
-- 既定以外の `terminationMessagePath` は `INVALID_ARGUMENT` のまま
+- `terminationMessagePath` を `/dev` 配下（`/dev/termination-log` 以外）・`/proc`・`/sys` 配下に置くと `INVALID_ARGUMENT` のまま。それ以外のパスは通常の bind として通る
 - `/dev/shm` の bind は `noexec` が付かず、サイズの上限も無い（containerd と同じ。CRI mounts の bind に付くのは `rbind`・propagation・`ro` / `rw` だけ。`internal/cri/opts/spec_linux_opts.go` の `WithMounts`）
 
 ## dns_config の受け入れ方式（CRI-2・NET-5。#2665）

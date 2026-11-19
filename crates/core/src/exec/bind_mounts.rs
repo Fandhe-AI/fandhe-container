@@ -379,6 +379,7 @@ fn check_bind_dev_order(
     check_dev_evidence(
         root,
         devices,
+        STAGE,
         "bind mounts under /dev require create_default_devices to run first on the same rootfs",
     )
 }
@@ -3646,6 +3647,7 @@ mod tests {
         let set = one("/dev/shm", &fx.src("dir"), &[]);
         let err = check_bind_dev_order(root.as_fd(), &set, None).expect_err("no evidence");
         assert_eq!(err.code, ErrorCode::FailedPrecondition);
+        assert_eq!(err.stage, IsolationStage::MountBinds);
         assert_eq!(
             err.message,
             "bind mounts under /dev require create_default_devices to run first on the same rootfs"
@@ -3974,6 +3976,25 @@ mod tests {
     fn oci4_rslave_bind_uses_pre_cloned_source_and_accepts_master() {
         let fx = fx();
         let set = one("/d", &fx.src("dir"), &["rbind", "rslave"]);
+        let knobs = Knobs {
+            pre_cloned: true,
+            mountinfo: Some("200 1 0:1 / /x rw,nosuid,nodev master:3 - tmpfs none rw\n".to_owned()),
+            ..Knobs::default()
+        };
+        let (r, log) = run(&fx, &set, &knobs);
+        let report = r.unwrap_or_else(|e| panic!("unexpected error: {e}; log: {log:?}"));
+        assert_eq!(log.first().map(String::as_str), Some("pre_cloned(0)"));
+        assert!(!log.iter().any(|l| l.starts_with("open_tree(")), "{log:?}");
+        assert_eq!(report.mounts.len(), 1);
+        assert!(report.mounts[0].recursive);
+    }
+
+    /// CRI-2・OCI-4・SEC-1（#4888）: kubelet の `mountPropagation: HostToContainer`（`rslave`）の bind は宛先が `/dev/shm` でも
+    /// 受理され、事前の複製の経路に乗る（`open_tree` は呼ばない）。
+    #[test]
+    fn cri2_4888_rslave_bind_at_dev_shm_uses_pre_cloned_source() {
+        let fx = fx();
+        let set = one("/dev/shm", &fx.src("dir"), &["rbind", "rslave"]);
         let knobs = Knobs {
             pre_cloned: true,
             mountinfo: Some("200 1 0:1 / /x rw,nosuid,nodev master:3 - tmpfs none rw\n".to_owned()),

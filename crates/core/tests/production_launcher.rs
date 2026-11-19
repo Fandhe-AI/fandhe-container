@@ -1814,7 +1814,7 @@ mod linux {
         let shm_opts: &[&str] = if read_only {
             &["rbind", "ro"]
         } else {
-            &["rbind", "rw"]
+            &["rbind", "rprivate", "nosuid", "nodev", "rw"]
         };
         let mut list = vec![json!({
             "destination": "/dev/shm",
@@ -1827,7 +1827,7 @@ mod linux {
                 "destination": "/dev/termination-log",
                 "type": "bind",
                 "source": term_file.to_str().expect("utf8 source path"),
-                "options": ["bind", "rw"]
+                "options": ["rbind", "rprivate", "nosuid", "nodev", "rw"]
             }));
         }
         let probe_flag = if read_only {

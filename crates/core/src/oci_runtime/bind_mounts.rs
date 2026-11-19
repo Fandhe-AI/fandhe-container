@@ -110,7 +110,8 @@ pub enum DevBindSourceKind {
 /// `normalized_destination` は正規化済み（[`MountDestination::as_str`] 形式）の宛先で、完全一致だけを通す
 /// （`/dev/shm/x`・`/dev/termination-log/x`・`/dev/shmx`・`/dev/console`・`/dev/pts`・`/dev/null` 等は `None`）。
 /// 戻り値は要求するマウント元の種別で、適用の段（`exec::mount_binds`）が元の種別と照合し、違えば何も作らず拒否する。
-/// `/dev/shm` は暗黙の tmpfs と pod の共有を載せない代わりに受ける（containerd v2.4.2 と同じ。launcher が実効集合を決める）。
+/// `/dev/shm` は暗黙の tmpfs を載せない代わりに受ける（containerd v2.4.2 と同じ。launcher が実効集合を決める）。
+/// pod の共有 `/dev/shm` との併用は launcher が `OverlapsTmpfs` で拒否する。
 /// CRI の `check_mount_set`（cri crate）も本関数を呼び、手書き bundle（CLI・stack）と同じ 2 宛先だけを通す。
 pub fn dev_bind_allowlist_kind(normalized_destination: &str) -> Option<DevBindSourceKind> {
     match normalized_destination {

@@ -34,9 +34,10 @@ Linux の fandhe-container は、OCI `config.json` の `mounts[]` に書いた b
 | 宛先 | マウント元の種類 | 受けたときの扱い |
 | ---- | ---------------- | ---------------- |
 | `/dev/termination-log` | 通常ファイル | コンテナの `/dev` に空ファイル（0644）を作ってから bind する |
-| `/dev/shm` | ディレクトリ | 暗黙の `/dev/shm`（既定 64 MiB）と pod の共有 `/dev/shm` を載せない（containerd と同じ） |
+| `/dev/shm` | ディレクトリ | 暗黙の `/dev/shm`（既定 64 MiB）を載せない（containerd と同じ）。pod の共有 `/dev/shm` との併用は拒否（下記） |
 
-- 元の種類が違えば（ファイルに `/dev/shm`、ディレクトリに `/dev/termination-log`、FIFO・symlink を含む）、何も作らず `BindTargetKindMismatch` で拒否する。SEC-1 の監査に 1 件残る（パスは載せない）
+- 通常ファイルとディレクトリの取り違え（ファイルを `/dev/shm` へ、ディレクトリを `/dev/termination-log` へ）は、何も作らず `BindTargetKindMismatch` で拒否する。SEC-1 の監査に 1 件残る（パスは載せない）
+- 元が FIFO・symlink のときは、元を固定する段でそれぞれ `BindSourceUnsupportedType`・`BindSourceSymlink` で拒否する（他の宛先の bind と同じ。`/dev` には何も作らない）
 - `/dev/shm` の bind と、`--shm-size`・`--tmpfs /dev/shm`・`/dev/shm` 配下の tmpfs・pod の共有 `/dev/shm` との併用は、`INVALID_ARGUMENT`（`bind mount destination overlaps a tmpfs mount`）で拒否する。監査に 1 件残る
 - 既定と同値の `--shm-size 64m` の明示は暗黙の件と同じ扱いになり、bind が黙って勝つ（拒否しない）
 - `--ipc=host`（`/dev/shm` の件が無い構成）と `/dev/shm` の bind は併用できる

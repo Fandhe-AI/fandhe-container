@@ -963,6 +963,57 @@ fn kubelet_dev_mounts_round_trip_as_bind() {
     assert_eq!(set.len(), 2);
 }
 
+/// CRI-2・OCI-4・SEC-1（#4895・案 a）: SELinux 有効ノードは非対応。`selinux_relabel` と `selinux_options` は
+/// 固定の code と文言で `UNIMPLEMENTED` にする（黙って落とさない）。
+#[test]
+fn cri2_sec1_4895_selinux_is_rejected_with_fixed_message() {
+    let err = |p: &PodSandboxConfig, c: &ContainerConfig| {
+        let e = build_runtime_config(p, c, &ImageDefaults::default()).expect_err("rejected");
+        (e.code(), e.message().to_owned())
+    };
+    let want = |m: &str| (CriErrorCode::Unimplemented, m.to_owned());
+    let relabel = "mounts.selinux_relabel is not supported";
+    let options = "selinux_options is not supported";
+
+    // kubelet 既定形の /dev/termination-log（readonly false）。false は通り、true だけ拒否される。
+    let tl = |relabel: bool| {
+        let mut m = mount(
+            "/var/lib/kubelet/pods/p/containers/c/1",
+            "/dev/termination-log",
+            false,
+        );
+        m.propagation = MountPropagation::PropagationPrivate as i32;
+        m.selinux_relabel = relabel;
+        let mut c = ctr();
+        c.mounts = vec![m];
+        c
+    };
+    build_runtime_config(&pod(), &tl(false), &ImageDefaults::default()).expect("control");
+    assert_eq!(err(&pod(), &tl(true)), want(relabel));
+
+    // 通常の volume の bind。
+    let mut m = mount("/srv/a", "/data", false);
+    m.selinux_relabel = true;
+    let mut c = ctr();
+    c.mounts = vec![m];
+    assert_eq!(err(&pod(), &c), want(relabel));
+
+    // コンテナの security_context。
+    let c = with_sc(|sc| sc.selinux_options = Some(Default::default()));
+    assert_eq!(err(&pod(), &c), want(options));
+
+    // sandbox の security_context（CreateContainer の bundle 生成で拒否する現状の挙動）。
+    let mut p = pod();
+    p.linux = Some(LinuxPodSandboxConfig {
+        security_context: Some(LinuxSandboxSecurityContext {
+            selinux_options: Some(Default::default()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    assert_eq!(err(&p, &ctr()), want(options));
+}
+
 /// CRI-2・OCI-4（#2669）: HOST_TO_CONTAINER は `rslave` で書く。`rootfsPropagation` は出さず、core が受ける。
 #[test]
 fn mount_host_to_container_maps_to_rslave() {

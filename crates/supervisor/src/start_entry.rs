@@ -3183,7 +3183,11 @@ mod linux {
             // 手順 5〜7 の他の失敗と同じ経路で後始末される（SUP-12・#2625）。
             let launch_options =
                 apply_stdin_option(self.container_options.launch_options()?, self.stdin);
-            // pod の共有 `/dev/shm`（`--pod-shm`）の権限の確認は `check_launcher_available`（cgroup の連鎖の前）で済んでいる。
+            // pod の共有 `/dev/shm`（`--pod-shm`）の権限は `check_launcher_available`（cgroup の連鎖の前）で確かめ済みだが、
+            // 将来 build_launcher だけを呼ぶ経路ができても通らないよう、ここでも同じ検査を行う（多重防御。#4822）。
+            if self.pod_shm.is_some() {
+                deny_pod_shm_with_elevated_capabilities(&read_self_status()?)?;
+            }
             let launch_options = apply_pod_shm(launch_options, self.pod_shm.clone())?;
             // rootless のユーザー定義名(Attachable)のときだけ、exec 前の同期点で holder と pasta を結線する(#1940)。
             let wiring = self.pasta_wiring()?;

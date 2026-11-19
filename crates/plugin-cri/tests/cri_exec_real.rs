@@ -725,6 +725,8 @@ async fn create_started_with_mounts(
     create_started_full(c, sb, name, command, mounts, None, token, ledger).await
 }
 
+// 引数は CRI の作成要求の欄（mounts・namespace_options）と回収の台帳をそのまま並べたもので、段ごとの薄い包み
+// （`create_started_*`）から 1 か所で組み立てるため構造体にまとめない（試験専用の補助）。
 #[allow(clippy::too_many_arguments)]
 async fn create_started_full(
     c: &mut RuntimeServiceClient<Channel>,

@@ -78,6 +78,7 @@
 //!   素性から組む配線）は S3（#4823）で未実装。SysV IPC と POSIX mqueue は ipc の join で共有される。
 //! - 周辺の未完: 保持役の素性の永続化と再起動後の再採用は #2940、rootless の本番 PodNetworkProvider（pasta）は #2879。
 
+mod pid_target;
 mod pinned_net;
 mod pod_shm;
 
@@ -89,6 +90,7 @@ use super::config::{NamespaceKind, OciConfig};
 use crate::audit_log::PodNamespaceJoinOutcome;
 use crate::traits::{ErrorCode, TraitError};
 
+pub use pid_target::PinnedPidTarget;
 pub use pinned_net::{NetnsJoinTarget, PinnedNetnsJoin};
 pub use pod_shm::{PinnedPodShm, PodShmSource};
 
@@ -265,6 +267,7 @@ impl NamespaceJoin {
     #[cfg(target_os = "linux")]
     pub(super) fn pin(
         paths: JoinPaths<'_>,
+        pid_target: Option<&PinnedPidTarget>,
     ) -> Result<(Self, PodNamespaceJoinOutcome), PinRejection> {
         use crate::sys::{self, NsFlag};
         use PodNamespaceJoinOutcome as O;
@@ -294,13 +297,24 @@ impl NamespaceJoin {
         let user = open_ns(user_path)?;
         let ipc = open_ns(ipc_path)?;
         let net = net_path.map(open_ns).transpose()?;
-        let pid = pid_path.map(open_ns).transpose()?;
+        // pid の参加先は path か、起動オプションの TARGET（固定済みの fd。#4819）のどちらか一方だけ。
+        let pid: Option<Arc<OwnedFd>> = match (pid_path, pid_target) {
+            (Some(path), None) => Some(Arc::new(open_ns(path)?)),
+            (None, Some(target)) => Some(Arc::clone(target.ns())),
+            (None, None) => None,
+            (Some(_), Some(_)) => {
+                return Err(PinRejection::from(TraitError::new(
+                    ErrorCode::InvalidArgument,
+                    "a pid namespace target cannot be combined with a pid namespace path",
+                )));
+            }
+        };
         let mut typed: Vec<(&OwnedFd, NsFlag)> = vec![(&user, NsFlag::User), (&ipc, NsFlag::Ipc)];
         if let Some(net) = &net {
             typed.push((net, NsFlag::Net));
         }
         if let Some(pid) = &pid {
-            typed.push((pid, NsFlag::Pid));
+            typed.push((pid.as_ref(), NsFlag::Pid));
         }
         for (fd, flag) in typed {
             if sys::fs_type(fd.as_fd()).map_err(inspect)? != sys::NSFS_MAGIC {
@@ -448,7 +462,7 @@ impl NamespaceJoin {
                 ipc: Arc::new(ipc),
                 net: net.map(Arc::new),
                 net_identity,
-                pid: pid.map(Arc::new),
+                pid,
                 pid_identity,
             },
             outcome,
@@ -459,6 +473,7 @@ impl NamespaceJoin {
     #[cfg(not(target_os = "linux"))]
     pub(super) fn pin(
         _paths: JoinPaths<'_>,
+        _pid_target: Option<&PinnedPidTarget>,
     ) -> Result<(Self, PodNamespaceJoinOutcome), PinRejection> {
         Err(PinRejection::from(unsupported_path()))
     }
@@ -487,6 +502,20 @@ impl NamespaceJoin {
             net_identity,
             pid: None,
             pid_identity: None,
+        }
+    }
+
+    /// 試験専用: pid の fd つき(素性は fd から取る。#4819)。
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn for_test_with_pid(user: OwnedFd, ipc: OwnedFd, pid: OwnedFd) -> Self {
+        let pid_identity = identity(pid.as_fd()).ok();
+        Self {
+            user: Arc::new(user),
+            ipc: Arc::new(ipc),
+            net: None,
+            net_identity: None,
+            pid: Some(Arc::new(pid)),
+            pid_identity,
         }
     }
 
@@ -610,23 +639,29 @@ mod tests {
     }
 
     fn pin_net(user: &str, ipc: &str, net: Option<&str>) -> Result<NamespaceJoin, TraitError> {
-        NamespaceJoin::pin(JoinPaths {
-            user: Path::new(user),
-            ipc: Path::new(ipc),
-            net: net.map(Path::new),
-            pid: None,
-        })
+        NamespaceJoin::pin(
+            JoinPaths {
+                user: Path::new(user),
+                ipc: Path::new(ipc),
+                net: net.map(Path::new),
+                pid: None,
+            },
+            None,
+        )
         .map(|(join, _)| join)
         .map_err(|r| r.error)
     }
 
     fn outcome_of(user: &str, ipc: &str, net: Option<&str>) -> Option<PodNamespaceJoinOutcome> {
-        NamespaceJoin::pin(JoinPaths {
-            user: Path::new(user),
-            ipc: Path::new(ipc),
-            net: net.map(Path::new),
-            pid: None,
-        })
+        NamespaceJoin::pin(
+            JoinPaths {
+                user: Path::new(user),
+                ipc: Path::new(ipc),
+                net: net.map(Path::new),
+                pid: None,
+            },
+            None,
+        )
         .err()
         .and_then(|r| r.outcome)
     }
@@ -776,12 +811,45 @@ mod tests {
         ipc: &str,
         pid: &str,
     ) -> Result<(NamespaceJoin, PodNamespaceJoinOutcome), PinRejection> {
-        NamespaceJoin::pin(JoinPaths {
-            user: Path::new(user),
-            ipc: Path::new(ipc),
-            net: None,
-            pid: Some(Path::new(pid)),
-        })
+        NamespaceJoin::pin(
+            JoinPaths {
+                user: Path::new(user),
+                ipc: Path::new(ipc),
+                net: None,
+                pid: Some(Path::new(pid)),
+            },
+            None,
+        )
+    }
+
+    /// CRI-2・CORE-3・SEC-5・#4819: pid の path と TARGET の併用は、固定文言の `InvalidArgument`（監査は出さない）。
+    #[test]
+    fn cri2_4819_pid_path_with_target_is_rejected() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn");
+        let pidfd = crate::sys::pidfd_open(child.id()).expect("pidfd");
+        let null = || -> OwnedFd { std::fs::File::open("/dev/null").expect("open").into() };
+        let target = PinnedPidTarget::for_test(pidfd, null(), (1, 2));
+        let e = NamespaceJoin::pin(
+            JoinPaths {
+                user: Path::new("/proc/self/ns/user"),
+                ipc: Path::new("/proc/self/ns/ipc"),
+                net: None,
+                pid: Some(Path::new("/proc/self/ns/pid")),
+            },
+            Some(&target),
+        )
+        .expect_err("must be rejected");
+        assert_eq!(e.error.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            e.error.message(),
+            "a pid namespace target cannot be combined with a pid namespace path"
+        );
+        assert_eq!(e.outcome, None);
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     /// CRI-2・SEC-5・SEC-4・#4809: pid に別種別の namespace を指すと `InvalidArgument`（監査は `NotNamespaceFile`）、
@@ -894,7 +962,7 @@ mod tests {
             }
         }
         let with_net = |net| with(user_p, ipc_p, net);
-        let (join, outcome) = NamespaceJoin::pin(with_net(&a_net)).expect("accepted");
+        let (join, outcome) = NamespaceJoin::pin(with_net(&a_net), None).expect("accepted");
         assert_eq!(outcome, PodNamespaceJoinOutcome::AcceptedUserIpcNet);
         assert!(join.net_fd().is_some());
         let meta = std::fs::metadata(&a_net).expect("stat");
@@ -903,25 +971,28 @@ mod tests {
             (meta.dev(), meta.ino())
         );
         // user・ipc だけなら net は持たない。
-        let (pair, outcome) = NamespaceJoin::pin(JoinPaths {
-            net: None,
-            ..with_net(&a_net)
-        })
+        let (pair, outcome) = NamespaceJoin::pin(
+            JoinPaths {
+                net: None,
+                ..with_net(&a_net)
+            },
+            None,
+        )
         .expect("pair");
         assert_eq!(outcome, PodNamespaceJoinOutcome::AcceptedUserIpc);
         assert!(pair.net_fd().is_none());
         // 呼び出し側自身の userns 所有の netns は受けない。
-        let own = NamespaceJoin::pin(with_net("/proc/self/ns/net")).expect_err("host netns");
+        let own = NamespaceJoin::pin(with_net("/proc/self/ns/net"), None).expect_err("host netns");
         assert_eq!(own.error.code(), ErrorCode::Unimplemented);
         assert_eq!(own.outcome, Some(PodNamespaceJoinOutcome::NetNotPodOwned));
         // 別 pod(別 userns)の netns は取り違えとして拒否する。
-        let other = NamespaceJoin::pin(with_net(&b_net)).expect_err("other pod netns");
+        let other = NamespaceJoin::pin(with_net(&b_net), None).expect_err("other pod netns");
         assert_eq!(other.error.code(), ErrorCode::PermissionDenied);
         assert_eq!(
             other.outcome,
             Some(PodNamespaceJoinOutcome::NetOwnerMismatch)
         );
-        let uts = NamespaceJoin::pin(with_net(&a_uts)).expect_err("uts as net");
+        let uts = NamespaceJoin::pin(with_net(&a_uts), None).expect_err("uts as net");
         assert_eq!(uts.error.code(), ErrorCode::InvalidArgument);
         assert_eq!(uts.outcome, Some(PodNamespaceJoinOutcome::NotNamespaceFile));
         println!("net3_2872: pod netns join identity and ownership verified");

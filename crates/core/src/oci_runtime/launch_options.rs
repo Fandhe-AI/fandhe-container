@@ -21,6 +21,7 @@
 //! | `etc_files` | pivot 前段の `mount_etc_files`(管理ルートに生成済みの `/etc/hosts`・`/etc/resolv.conf` を bind。空なら載せない。NET-12・#1872) |
 //! | `stdin` | `Pipe` のときだけ launcher の spawn が stdin 用の pipe を作り、読み取り側を init の fd 0、書き込み側を `LaunchedProcess::take_stdin` で返す。既定 `Null` は従来どおり `/dev/null`(attach の stdin 用。SUP-7・CRI-6・SEC-1・#4069) |
 //! | `pod_shm` | pod で共有する `/dev/shm` の元(保持役の mount namespace のパスと tmpfs の素性)。start が fork 前に fd へ固定して検証し(`PinnedPodShm`)、init が pivot 前に複製して載せる。既定の `/dev/shm` の tmpfs の代わりになる(CRI-2・CORE-3・SEC-1・SEC-5・#4822。本番の指定元は cri が `StartRequest::with_pod_shm` へ載せ plugin-cri が supervisor の `--pod-shm` へ写す。S3・#4823) |
+//! | `pid_target` | pid namespace の TARGET(対象コンテナの pid ns の fd と launch pidfd。supervisor が対象の状態記録と制御チャネルの launch pidfd から fork 前に解決して固定する `PinnedPidTarget`)。start が config の path なしの pid の参加先として使い(pod の user・ipc の join が前提)、launcher は launch のたびに spec の固定と素性の一致・対象の生存を確かめる(CRI-2・CORE-3・SEC-1・SEC-5・#4819。供給元の cri は #4820) |
 //! | `root_readonly` | `create --read-only`。config の `root.readonly` と OR(狭める方向のみ)。mount の RDONLY・Landlock の root 規則・分離の記録へ同じ実効値を渡す(CLI-1・SUP-12・CORE-5・SEC-1・#2828) |
 //!
 //! # 契約
@@ -47,7 +48,7 @@ use crate::dev_mounts::ImplicitDevMounts;
 use crate::etc_files::{EtcFileSelection, check_etc_overlaps};
 use crate::injected_files::{InjectedFileSet, overlaps};
 use crate::oci_runtime::config::{CONFIG_MAX_ENV, CONFIG_MAX_STRING_BYTES};
-use crate::oci_runtime::namespace_join::{NetnsJoinTarget, PodShmSource};
+use crate::oci_runtime::namespace_join::{NetnsJoinTarget, PinnedPidTarget, PodShmSource};
 use crate::oci_runtime::network_mode::LaunchNetworkMode;
 use crate::rlimits::Rlimits;
 use crate::tmpfs::{DEV_SHM_PATH, TmpfsMountSet};
@@ -108,6 +109,9 @@ pub struct LaunchOptions {
     /// pod で共有する `/dev/shm` の元(あれば既定の `/dev/shm` の tmpfs の代わりに複製して載せる。既定 `None`。CRI-2・#4822)。
     /// `with_pod_shm` が既定の `/dev/shm` との整合を検証済み。fd は持たない(開いて固定するのは start)。
     pod_shm: Option<PodShmSource>,
+    /// pid namespace の TARGET(対象コンテナの pid ns の fd と launch pidfd。supervisor が fork の前に解決して固定する。既定 `None`。
+    /// CRI-2・CORE-3・SEC-1・SEC-5・#4819)。`start` が config の path なしの pid の参加先として使う。
+    pid_target: Option<PinnedPidTarget>,
 }
 
 /// `env` の値(秘密を含みうる)を出さず、件数だけを出す(SEC-1)。
@@ -127,6 +131,7 @@ impl std::fmt::Debug for LaunchOptions {
             .field("etc_files", &self.etc_files)
             .field("stdin", &self.stdin)
             .field("pod_shm", &self.pod_shm)
+            .field("pid_target", &self.pid_target)
             .finish()
     }
 }
@@ -185,6 +190,7 @@ impl LaunchOptions {
             etc_files: EtcFileSelection::default(),
             stdin: LaunchStdinMode::Null,
             pod_shm: None,
+            pid_target: None,
         })
     }
 
@@ -202,6 +208,17 @@ impl LaunchOptions {
         self.tmpfs.without_default_dev_shm()?;
         self.pod_shm = Some(source);
         Ok(self)
+    }
+
+    /// pid namespace の TARGET(解決・固定済み)を持たせる(CRI-2・CORE-3・SEC-1・SEC-5・#4819)。
+    ///
+    /// 解決(`PinnedPidTarget::resolve`)は supervisor の `build_launcher` が fork の前に行う。`start` が config の path なしの
+    /// pid の参加先として使い(pod の user・ipc の join が前提。無ければ `Unimplemented`)、launcher は launch のたびに
+    /// spec の固定と素性の一致・対象の生存を確かめる(対象の再起動には追従せず拒否する)。
+    #[must_use]
+    pub fn with_pid_target(mut self, target: PinnedPidTarget) -> Self {
+        self.pid_target = Some(target);
+        self
     }
 
     /// init の stdin の扱いを持たせる(SUP-7・CRI-6・SEC-1・#4069)。`Pipe` は launch のたび(restart の再 launch を
@@ -344,6 +361,11 @@ impl LaunchOptions {
         self.pod_shm.as_ref()
     }
 
+    /// pid namespace の TARGET(無ければ `None`。#4819)。
+    pub fn pid_target(&self) -> Option<&PinnedPidTarget> {
+        self.pid_target.as_ref()
+    }
+
     /// network namespace の扱い。
     pub fn network(&self) -> LaunchNetworkMode {
         self.network
@@ -460,6 +482,15 @@ mod tests {
             crate::dev_mounts::ImplicitDevMounts::All
         );
         assert!(format!("{opts:?}").contains("pod_shm: Some("));
+    }
+
+    /// CRI-2・CORE-3(#4819): pid namespace の TARGET の既定は `None`(`Debug` にも `pid_target: None` と出る)。
+    /// 設定の往復は `PinnedPidTarget` を作れる実機前提の試験(supervisor_bin_real のシナリオ I)が担う。
+    #[test]
+    fn cri2_4819_pid_target_defaults_to_none() {
+        let opts = LaunchOptions::try_default().expect("default");
+        assert!(opts.pid_target().is_none());
+        assert!(format!("{opts:?}").contains("pid_target: None"));
     }
 
     /// CRI-2・SEC-1(#4822): pod の共有 `/dev/shm` は既定の定義のまま、`Private` の IPC でだけ受ける。`--ipc=host`・

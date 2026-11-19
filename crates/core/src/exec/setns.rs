@@ -447,6 +447,43 @@ impl Pid1Target {
         Ok(id)
     }
 
+    /// 対象の pid namespace を fd として開いて固定する（別コンテナの pid ns への参加先の解決。CRI-2・CORE-3・SEC-1・SEC-5・#4819）。
+    ///
+    /// launch pidfd で固定済みの対象から `/proc/<pid>/ns/pid` を 1 回だけ開き（magic link を辿る）、開いた後に pidfd の
+    /// 未終了を確認する。読んだ fd が pidfd の指すプロセスのものであることの保証（pid の再利用で別のプロセスを開いていない）。
+    /// 記録 pid から `pidfd_open` や `/proc` を開き直す縮退経路ではない（`self` は launch pidfd 経由でしか作れない）。
+    /// 種別（nsfs・pid）と所有・親子の検査は参加の固定（`NamespaceJoin::pin`）が同じ fd で行う。
+    pub(crate) fn open_pid_namespace(&self) -> Result<OwnedFd, ExecError> {
+        let path = std::ffi::CString::new(format!("/proc/{}/ns/pid", self.pid)).map_err(|_| {
+            ExecError::new(
+                ErrorCode::Internal,
+                IsolationStage::SetNs,
+                "target PID namespace path is not representable",
+            )
+        })?;
+        let fd =
+            sys::open_ns_file(&path).map_err(|e| setns_error(e, "open target PID namespace"))?;
+        ensure_not_exited(self, "refusing to use its PID namespace")?;
+        Ok(fd)
+    }
+
+    /// 試験専用: 検証を通さずに pidfd だけから作る（`oci_runtime` の launch の対の検査を実プロセスの生死だけで確かめる。#4819）。
+    #[cfg(any(test, feature = "exec-test-support"))]
+    pub(crate) fn for_test(pidfd: OwnedFd) -> Self {
+        Self {
+            pid: NonZeroU32::MIN,
+            pidfd,
+            expected_cgroup_path: "/fc".to_owned(),
+            user_ns: UserNsRelation::Shared { identity: (0, 0) },
+            pod_pid_ns: None,
+        }
+    }
+
+    /// 対象が終了していないことを確かめる（pidfd の poll。終了済みなら `FailedPrecondition`）。再 launch の前の再確認用（#4819）。
+    pub(crate) fn ensure_alive(&self) -> Result<(), ExecError> {
+        ensure_not_exited(self, "refusing to join its PID namespace")
+    }
+
     /// `pid` を候補として pid1 を特定し、検証を通ったものだけを対象にする。
     ///
     /// 期待 cgroup パスは、記録のコンテナ ID と cgroup 配置から `<scope>/fc-<id>@<instance>` として

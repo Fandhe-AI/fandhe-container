@@ -1032,6 +1032,22 @@ impl ProcessLauncher for ProductionLauncher {
         }
     }
 
+    /// 起動オプションの pid namespace の TARGET(start が参加先の fd として使う。CRI-2・CORE-3・SEC-1・SEC-5・#4819)。
+    /// `network_mode` と同じ `launch_options` から取る。
+    fn pid_target(&self) -> Option<&super::PinnedPidTarget> {
+        #[cfg(target_os = "linux")]
+        {
+            self.inner
+                .launch_options
+                .as_ref()
+                .and_then(LaunchOptions::pid_target)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            match self.never {}
+        }
+    }
+
     /// start が設定の検証で拒否したときの記録先を貸す(SEC-4・#1915)。`rejection_audit_sink` の指定があればそれ、
     /// 無ければ launcher の監査 sink(#2481)。
     fn rejection_audit_sink(&self) -> Option<&dyn AuditSink> {
@@ -1693,6 +1709,23 @@ impl Inner {
                 ErrorCode::FailedPrecondition,
                 "the launch spec was pinned with a different pod shm identity",
             ));
+        }
+        // pid namespace の TARGET: start が固定した参加先の素性と自身の起動オプションの対象は同じでなければならない(ラッパーが
+        // `pid_target` を転送しないと start が固定せず、TARGET が自分の新しい pid ns へ黙って縮退する。fail-closed)。restart の
+        // 再 launch のたびに、対象が終了済みなら fork の前に拒否する(対象の再起動には追従しない。再解決しない。#4819)。
+        #[cfg(target_os = "linux")]
+        if let Some(target) = options.pid_target() {
+            let pinned = spec
+                .namespace_join()
+                .and_then(|join| join.pid_identity())
+                .map(|id| id.parts());
+            if pinned != Some(target.identity()) {
+                return Err(TraitError::new(
+                    ErrorCode::FailedPrecondition,
+                    "the launch spec was reconciled with a different pid namespace target",
+                ));
+            }
+            target.ensure_alive()?;
         }
         // 端末つき起動と stdin Pipe の併用は拒否する。pty 割り当て後に fd 0 が slave へ置き換わるため、取り出した書き込み端は
         // 接続先のない pipe になり EPIPE で init に届かない。fork の前(副作用なし)に断る(CRI-6・SUP-7・SEC-1・#4069・#4070)。
@@ -5641,6 +5674,80 @@ mod tests {
             "the launch spec was pinned with a different pod shm identity"
         );
         assert!(!ev.lock().unwrap().iter().any(|e| e.starts_with("spawn")));
+    }
+
+    /// 対象の代わりの実プロセス（pidfd の生死だけを使う。#4819）。
+    fn pid_target_child(wait: bool) -> (std::process::Child, std::os::fd::OwnedFd) {
+        let mut child = std::process::Command::new(if wait { "true" } else { "sleep" })
+            .args(if wait { vec![] } else { vec!["60"] })
+            .spawn()
+            .expect("spawn");
+        let pidfd = crate::sys::pidfd_open(child.id()).expect("pidfd");
+        if wait {
+            child.wait().expect("wait");
+        }
+        (child, pidfd)
+    }
+
+    /// `/dev/null` の複製（素性は (dev, ino) が `/dev/null` のもの）。
+    fn null_fd() -> std::os::fd::OwnedFd {
+        std::fs::File::open("/dev/null").expect("open").into()
+    }
+
+    /// `/dev/null` の (dev, ino)。
+    fn null_identity() -> (u64, u64) {
+        use std::os::unix::fs::MetadataExt as _;
+        let m = std::fs::metadata("/dev/null").expect("stat");
+        (m.dev(), m.ino())
+    }
+
+    /// CRI-2・CORE-3・SEC-1・SEC-5（#4819）: pid の TARGET の launch の対の検査。spec が固定していない（ラッパーの転送漏れ）・
+    /// 素性が違う場合は `FailedPrecondition` の固定文言、対象が終了済みなら "has exited"。いずれも spawn の前。
+    #[test]
+    fn cri2_4819_pid_target_pairing_and_liveness_are_refused_before_spawn() {
+        let identity = null_identity();
+        let (mut live, live_fd) = pid_target_child(false);
+        let (_gone, gone_fd) = pid_target_child(true);
+        let target = |fd, id| super::super::PinnedPidTarget::for_test(fd, null_fd(), id);
+        let join =
+            || super::super::NamespaceJoin::for_test_with_pid(null_fd(), null_fd(), null_fd());
+        let cases = [
+            (
+                "lost",
+                spec_for("pid-target-lost", serde_json::json!({})),
+                target(live_fd.try_clone().expect("dup"), identity),
+                "the launch spec was reconciled with a different pid namespace target",
+            ),
+            (
+                "identity",
+                spec_for("pid-target-identity", serde_json::json!({}))
+                    .with_namespace_join(Some(join())),
+                target(
+                    live_fd.try_clone().expect("dup"),
+                    (identity.0, identity.1 + 1),
+                ),
+                "the launch spec was reconciled with a different pid namespace target",
+            ),
+            (
+                "exited",
+                spec_for("pid-target-exited", serde_json::json!({}))
+                    .with_namespace_join(Some(join())),
+                target(gone_fd, identity),
+                "the pid namespace target has exited",
+            ),
+        ];
+        for (name, spec, target, message) in cases {
+            let ev = events();
+            let mut l = launcher(FakeOps::new(&ev), rootless(), None);
+            l.inner.launch_options =
+                Some(options_with(&[], true, &[], LaunchIpcMode::Private).with_pid_target(target));
+            let err = l.launch(&spec, Duration::from_secs(1)).err().expect(name);
+            assert_eq!(err.code(), ErrorCode::FailedPrecondition, "{name}");
+            assert_eq!(err.message(), message, "{name}");
+            assert!(!ev.lock().unwrap().iter().any(|e| e.starts_with("spawn")));
+        }
+        let _ = live.kill();
+        let _ = live.wait();
     }
 
     /// `mounts[]` に `/dev/shm`（ディレクトリ）と `/dev/termination-log`（ファイル）の bind を持つ spec 用の JSON（#4888）。

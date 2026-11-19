@@ -515,7 +515,7 @@ mod tests {
     }
 
     /// SEC-4・CRI-2・#4819: 別プロセスの pidfd は監査に 1 件（層 `exec_target`・理由 `exec_target_pidfd_mismatch`・対象の ID）届き、
-    /// 返すエラーは固定文言のまま。違反の無い失敗（記録なし・終了済み・obtain 失敗）は何も届かない。
+    /// 返すエラーは固定文言のまま。違反の無い失敗（記録なし・obtain 失敗・`map_exec_error` を通る回収済みの対象）は何も届かない。
     #[test]
     fn sec4_4819_violation_is_audited_and_plain_failures_are_not() {
         let mut other = sleeper();
@@ -531,13 +531,26 @@ mod tests {
         {
             let recs = audit.0.lock().expect("lock");
             assert_eq!(recs.len(), 1);
-            let json = format!("{:?}", recs[0]);
-            assert!(json.contains("exec_target_pidfd_mismatch"), "{json}");
-            assert!(json.contains("t1"), "{json}");
+            assert_eq!(recs[0].layer(), crate::audit_log::AuditLayer::ExecTarget);
+            assert_eq!(
+                recs[0].reason().map(crate::audit_log::AuditReason::as_str),
+                Some("exec_target_pidfd_mismatch")
+            );
+            assert_eq!(recs[0].container_id(), Some(&cid("t1")));
         }
         let quiet = Audit::default();
         let _ = resolve_audited(&Store(None), &Cell::new(0), &quiet, || Err(unused()));
         let _ = resolve_audited(&store, &Cell::new(0), &quiet, || Err(unused()));
+        // `map_exec_error` を通るが違反を伴わない失敗（回収済みの対象の pidfd）も記録しない。
+        let mut exited = Command::new("true").spawn().expect("spawn true");
+        let exited_fd = pidfd_of(&exited);
+        exited.wait().expect("wait");
+        let exited_store = Store(Some(running(exited.id(), false, true)));
+        expect_err(
+            resolve_audited(&exited_store, &Cell::new(0), &quiet, || Ok(exited_fd)),
+            ErrorCode::FailedPrecondition,
+            "the pid namespace target has exited",
+        );
         assert!(quiet.0.lock().expect("lock").is_empty());
         for c in [&mut other, &mut recorded] {
             let _ = c.kill();

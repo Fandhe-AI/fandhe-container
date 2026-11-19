@@ -2,7 +2,7 @@
 
 `platform-ci` の実機前提のステップ（AppArmor の緩和以降の `--ignored` のステップ）を、`ubuntu-24.04-arm` の leg でも回せるかを `workflow_dispatch` で 1 回確かめた記録（#4810・REPAIR-7・REPAIR-5）。arm64 の leg そのものは #4807 で足した（実機前提でないステップだけ。`.claude/rules/ci.md`「arm64 の Linux の leg」）。
 
-広げること自体（`ci.yml` の変更）は本記録の範囲に入れない。広げる案は #4810 のコメントでオーナーの判断を求めた。
+広げること自体（`ci.yml` の変更）は本記録の範囲に入れず、#4810 のコメントで利用者の判断を求めた。決定: 案 A（2026-11-19・#4892）で、main の push と `workflow_dispatch` の arm64 の leg でも実機前提のステップを回す（条件は `runner.os == 'Linux' && env.HANG_PROBE != 'true'`。x86_64 だけに残すものと理由は `.claude/rules/ci.md`「arm64 の Linux の leg」）。定着の条件と結果は #4892 に記録する。
 
 ## 実行の条件
 

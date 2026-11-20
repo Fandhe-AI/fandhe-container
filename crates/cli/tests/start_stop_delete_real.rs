@@ -1559,7 +1559,7 @@ mod linux {
             &["proc", "dev", "tmp", "etc"],
         )?;
         // uidMappings / gidMappings は書かない（非空は start が INVALID_ARGUMENT で拒否する。手順 15 が照合）。
-        // cgroupsPath も書かない（非空は `check_cgroups_path` が UNIMPLEMENTED で拒否する）。
+        // cgroupsPath も書かない（空文字列を含め、指定があれば `check_cgroups_path` が UNIMPLEMENTED で拒否する）。
         let config = format!(
             r#"{{"ociVersion":"1.2.0","root":{{"path":"rootfs","readonly":false}},"hostname":"fandhe-ssd",
 "process":{{"user":{{"uid":0,"gid":0}},"args":["/probe","--container-probe"],

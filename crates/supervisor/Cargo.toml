@@ -106,6 +106,9 @@ fandhe-container-plugin = { workspace = true, optional = true }
 exec-test-support = ["fandhe-container-core/exec-test-support"]
 # macOS の VM 保持役（src/vm_keeper.rs）。core の `plugin` feature は有効にしない（#2278・MAC-4・PLUG-3）。
 vm-keeper = ["dep:fandhe-container-plugin"]
+# start-status-test-support: `SupervisorLaunch::resolve_beside_with_status`（`/proc/self/status` の読み取りだけを差し替える入口）を有効にする。
+# plugin-cri の feature `rootful-test-support` 経由でのみ有効にし、製品のビルドには含めない（SEC-5・#4709・REPAIR-12）。依存は増えない。
+start-status-test-support = []
 
 # 自己参照の dev-dependency（core の escape-probe と同じ仕組み。外部クレートの追加ではない）: supervisor 自身の
 # テストでは `exec-test-support` を常に有効にし、試験専用の入口を使う結合試験（exec_timeout・exec_setns_join・exec）が

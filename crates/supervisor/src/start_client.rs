@@ -507,9 +507,7 @@ pub fn production_deadline() -> Duration {
 
 /// rootful 判定と euid の取得（SEC-5）。real / effective / saved / fs の uid のどれかが 0 なら
 /// supervisor の `privilege_for_status` と同じ文で `PERMISSION_DENIED`、読めない・壊れた入力は `FAILED_PRECONDITION`。
-///
-/// `pub` なのは plugin-cri の結合試験が `/proc/self/status` 相当の文字列を注入して拒否の経路を非 root で通すため（本番の呼び出しは [`SupervisorLaunch::resolve_beside_with`] だけ）。
-pub fn privilege_gate(status_text: Option<&str>) -> Result<u32, OciRuntimeError> {
+fn privilege_gate(status_text: Option<&str>) -> Result<u32, OciRuntimeError> {
     match status_text.map(identity_from_status) {
         Some(Identity::Rootless { euid }) => Ok(euid),
         Some(Identity::Rootful) => Err(start_error(
@@ -641,6 +639,24 @@ impl SupervisorLaunch {
         exe: &Path,
         locate: impl FnOnce(u32) -> Result<PathBuf, OciRuntimeError>,
     ) -> Result<Self, OciRuntimeError> {
+        Self::resolve_with_status(exe, locate, read_self_status)
+    }
+
+    /// [`Self::resolve_beside`] の `/proc/self/status` の読み取りだけを差し替えられる版（試験専用 feature `start-status-test-support`。
+    /// rootful 拒否（SEC-5・#4709）の経路を非 root で通すため。systemd-run の解決は本番と同じ）。
+    #[cfg(feature = "start-status-test-support")]
+    pub fn resolve_beside_with_status(
+        exe: &Path,
+        read_status: impl FnOnce() -> Option<String>,
+    ) -> Result<Self, OciRuntimeError> {
+        Self::resolve_with_status(exe, locate_systemd_run, read_status)
+    }
+
+    fn resolve_with_status(
+        exe: &Path,
+        locate: impl FnOnce(u32) -> Result<PathBuf, OciRuntimeError>,
+        read_status: impl FnOnce() -> Option<String>,
+    ) -> Result<Self, OciRuntimeError> {
         let program = supervisor_path_beside(exe)?;
         if !std::fs::metadata(&program).is_ok_and(|m| m.is_file()) {
             return Err(start_error(
@@ -648,7 +664,7 @@ impl SupervisorLaunch {
                 "supervisor executable is not installed",
             ));
         }
-        let euid = privilege_gate(read_self_status().as_deref())?;
+        let euid = privilege_gate(read_status().as_deref())?;
         // rootful のインストールは CLI の隣にランチャーがあること（#2442）。在るのに信頼できなければ直接経路へ落とさず止める。
         let launcher = match classify_launcher_beside(exe, euid)? {
             LauncherPresence::Absent => None,

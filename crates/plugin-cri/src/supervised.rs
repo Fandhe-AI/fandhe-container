@@ -197,6 +197,34 @@ fn start_checked(
     run(&launch)
 }
 
+/// 本番の [`ProductionStarter`] と同じ解決・検査（`start_checked`・`SupervisorLaunch` の解決）を通し、`/proc/self/status` の内容だけを
+/// 注入する試験専用の起動（feature `rootful-test-support`。uid 0 の恒久拒否 SEC-5・#4709 を非 root で通す）。`exe` は supervisor の隣置き先。
+#[cfg(feature = "rootful-test-support")]
+#[derive(Debug, Clone)]
+pub struct StatusInjectedStarter {
+    /// 隣に supervisor の bin を置いた実行ファイルのパス。
+    pub exe: std::path::PathBuf,
+    /// `/proc/self/status` 相当の本文。
+    pub status: String,
+}
+
+#[cfg(feature = "rootful-test-support")]
+impl SupervisorStarter for StatusInjectedStarter {
+    fn start(
+        &self,
+        root: &Path,
+        opts: &StartOptions<'_>,
+        id: &ContainerId,
+    ) -> (Result<NonZeroU32, OciRuntimeError>, Option<Child>) {
+        start_checked(
+            &self.exe,
+            current_euid,
+            |exe| SupervisorLaunch::resolve_beside_with_status(exe, || Some(self.status.clone())),
+            |launch| start_with_options(launch, root, opts, id, production_deadline()),
+        )
+    }
+}
+
 /// 解決済みの起動依存と受信期限を固定した起動（結合試験が偽の systemd-run・supervisor を注入する口。D11）。
 ///
 /// 環境変数・引数・RPC から構築する経路は作らない。製品コードは [`ProductionStarter`] だけを使う。

@@ -1,43 +1,24 @@
-//! plugin-cri の本番の start 経路（`SupervisedLifecycle::start` → starter → 共有クライアントの `privilege_gate`）で、
-//! uid 0 を表す `/proc/self/status` 相当を与えたときの拒否が `PermissionDenied` と固定文言のまま `TraitError` へ届くことの
+//! plugin-cri の本番の start 経路（`SupervisedLifecycle::start` → `start_checked` → `SupervisorLaunch` の解決 → `privilege_gate`。
+//! `StatusInjectedStarter` は `/proc/self/status` の読み取りだけを差し替える）で、uid 0 を表す `/proc/self/status` 相当を与えたときの拒否が `PermissionDenied` と固定文言のまま `TraitError` へ届くことの
 //! 結合試験（SEC-5・CRI-2・CRI-5・REPAIR-12・#4709・PR #4904）。この `TraitError` が gRPC / ttrpc の境界でコード 7 になることは
 //! `crates/cri/tests/err3_backend_error_mapping.rs`・`shim_v2_create_start.rs` が照合する。Linux 限定（`supervised` と `start_client` が Linux のみ）・非 root。
 
-#![cfg(target_os = "linux")]
+#![cfg(all(target_os = "linux", feature = "rootful-test-support"))]
 
-use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
-use std::process::Child;
 use std::sync::Arc;
 
-use fandhe_container_core::oci_runtime::{OciRuntimeError, ProcessSignaler};
+use fandhe_container_core::oci_runtime::ProcessSignaler;
 use fandhe_container_core::traits::{
     ContainerId, CreateStateRequest, DeleteStateRequest, DeleteStateResponse, ErrorCode,
     GetStateRequest, ListStateRequest, StateList, StateRecord, StateStore, StdinMode, TraitError,
     UpdateStateRequest,
 };
 use fandhe_container_plugin_cri::supervised::{
-    SignalerSource, SupervisedLifecycle, SupervisorStarter,
+    SignalerSource, StatusInjectedStarter, SupervisedLifecycle,
 };
 use fandhe_container_supervisor::control::UnavailableSignaler;
-use fandhe_container_supervisor::start_client::{StartOptions, privilege_gate};
-
-/// 本番の starter と同じ門（`privilege_gate`）へ、注入した status を渡すだけの starter。
-struct GateStarter(&'static str);
-
-impl SupervisorStarter for GateStarter {
-    fn start(
-        &self,
-        _root: &Path,
-        _opts: &StartOptions<'_>,
-        _id: &ContainerId,
-    ) -> (Result<NonZeroU32, OciRuntimeError>, Option<Child>) {
-        match privilege_gate(Some(self.0)) {
-            Ok(_) => panic!("rootless input must not reach this test"),
-            Err(e) => (Err(e), None),
-        }
-    }
-}
+use fandhe_container_supervisor::launcher::SUPERVISOR_FILE_NAME;
 
 struct NoSignalers;
 
@@ -78,13 +59,19 @@ impl StateStore for RootOnly {
     }
 }
 
-fn status(uid: &str) -> &'static str {
-    Box::leak(format!("Name:\tx\nUid:\t{uid}\nGid:\t1000\t1000\t1000\t1000\nGroups:\t\nNoNewPrivs:\t0\nCapInh:\t0000000000000000\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\nCapBnd:\t000001ffffffffff\nCapAmb:\t0000000000000000\n").into_boxed_str())
+fn status(uid: &str) -> String {
+    format!(
+        "Name:\tx\nUid:\t{uid}\nGid:\t1000\t1000\t1000\t1000\nGroups:\t\nNoNewPrivs:\t0\nCapInh:\t0000000000000000\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\nCapBnd:\t000001ffffffffff\nCapAmb:\t0000000000000000\n"
+    )
 }
 
 /// SEC-5: uid のどの位置が 0 でも `start` は `PermissionDenied` と固定文言で失敗し、供給側（plugin-cri）で別コードへ潰れない。
 #[test]
 fn sec5_supervised_start_rootful_is_permission_denied() {
+    // 検査（supervisor の実在）が権限検査より前にあるため、偽の supervisor（空ファイル）を隣に置く。
+    let dir = std::env::temp_dir().join(format!("fandhe-cri-4709-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(dir.join(SUPERVISOR_FILE_NAME), b"").expect("fake supervisor");
     let store = RootOnly(PathBuf::from("/nonexistent/root"));
     let id = ContainerId::new("c1").expect("id");
     for uid in [
@@ -93,8 +80,13 @@ fn sec5_supervised_start_rootful_is_permission_denied() {
         "1000\t1000\t0\t1000",
         "1000\t1000\t1000\t0",
     ] {
-        let lifecycle =
-            SupervisedLifecycle::new(Arc::new(GateStarter(status(uid))), Arc::new(NoSignalers));
+        let lifecycle = SupervisedLifecycle::new(
+            Arc::new(StatusInjectedStarter {
+                exe: dir.join("fandhe-container-plugin-cri"),
+                status: status(uid),
+            }),
+            Arc::new(NoSignalers),
+        );
         let err = lifecycle
             .start(&store, &id, None, StdinMode::Closed)
             .expect_err(uid);
@@ -105,4 +97,5 @@ fn sec5_supervised_start_rootful_is_permission_denied() {
             "{uid}"
         );
     }
+    let _ = std::fs::remove_dir_all(&dir);
 }

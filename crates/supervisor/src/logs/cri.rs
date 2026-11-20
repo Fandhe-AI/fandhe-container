@@ -629,8 +629,9 @@ impl TeeLogSink {
                 Ok(()) => alive += 1,
                 Err(e) => {
                     let mut g = self.failed.lock().unwrap_or_else(PoisonError::into_inner);
-                    // 世代が進んでいたら、開き直し前の状態に対する失敗なので記録しない（開き直した副を止めない）。
-                    let first = g.1 == generation
+                    // 副（CRI ログ。添字 1）だけ、世代が進んでいたら開き直し前の状態に対する失敗なので記録しない
+                    // （開き直した副を止めない）。主は開き直さないので世代に依らず記録する。
+                    let first = (i != 1 || g.1 == generation)
                         && g.0.get_mut(i).is_some_and(|slot| {
                             let first = slot.is_none();
                             slot.get_or_insert(e.code());

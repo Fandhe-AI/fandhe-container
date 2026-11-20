@@ -30,7 +30,7 @@ CRI-5・CRI-7・PLUG-1・PLUG-4・REPAIR-3・TASK-62.6 の判断記録。配布�
 
 ### D4 前提
 
-- rootless のみ。uid 0 の shim の `start` は plugin-cri の `supervised` と同じく `PERMISSION_DENIED` で恒久拒否する（#2442・#2241 の決定 D1 A・#4709）。新しい拒否は足していない
+- rootless のみ。uid 0 の shim の `start` は plugin-cri の `supervised` と同じく `PERMISSION_DENIED` で恒久拒否する（権限検査に到達した場合。それより前に、plugin の実体の隣に supervisor が無ければ `FAILED_PRECONDITION` が返る）（#2442・#2241 の決定 D1 A・#4709）。新しい拒否は足していない
 - supervisor は shim の実体（`current_exe()`）と同じディレクトリの固定名から解決する。特権ランチャーは置かない（置くと rootful と判定される）。手順は `docs/setup/linux.md`
 - 動く構成は、非 root で直接起動した containerd 2.x を委譲 scope の中で動かす構成
 

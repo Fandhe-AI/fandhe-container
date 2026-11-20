@@ -41,5 +41,6 @@ OCI config の `linux.uidMappings` / `gidMappings` を受けるか拒むかの�
 ## 本書の時点で済ませたこと・決定後に残る作業
 
 - 済み: 拒否を専用関数に切り出し、code と message の完全一致をテストで固定。コード中の「確認待ち」の参照先を #2240 と本書へ統一
-- 残り: A なら `InvalidArgument` への変更と doc。B なら上記の設計の実装（後続の実装 issue）
+- 決定（A）の後に #4711 で済ませたこと: `InvalidArgument` と固定文言への変更、利用者向けの [id-mappings.md](../api/id-mappings.md)
+- 残り: CRI の `userns_options.uids` / `gids` は `UNIMPLEMENTED` のまま拒否している（`crates/cri/src/bundle/spec.rs`）。決定（A）を CRI の写像にも及ぼして code を揃えるかは別に扱う
 - 監査（SEC-4）には記録しない。config の誤りであり、脱出の試行ではないため

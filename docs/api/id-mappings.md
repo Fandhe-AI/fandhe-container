@@ -4,7 +4,7 @@ OCI `config.json` の `linux.uidMappings` / `linux.gidMappings` は受けない�
 
 ## 挙動
 
-- どちらかの配列が非空なら `start` は終了コード非 0 の `INVALID_ARGUMENT` で拒否する。message は次の固定文言（config の値は含めない）。`linux.uidMappings / linux.gidMappings are not accepted: ID mappings are derived from the runtime privilege model (SEC-5)`
+- どちらかの配列が非空なら `start` は `INVALID_ARGUMENT`（終了コード 2）で拒否する。message は次の固定文言（config の値は含めない）。`linux.uidMappings / linux.gidMappings are not accepted: ID mappings are derived from the runtime privilege model (SEC-5)`
 - 空配列・省略は受ける
 - 拒否はプロセス起動・状態の予約より前で行い、プロセスも状態も残さない。監査ログには記録しない（config の誤りで、脱出の試行ではないため）
 
@@ -14,4 +14,4 @@ user namespace の ID 写像は、権限モデルから導く。rootless の単�
 
 ## Docker / runc との差
 
-runc は config の写像をそのままカーネルへ書き込む。本ランタイムは config の写像を受けず、権限モデルから導く。user namespace を使うときは `linux.namespaces` に `user` だけを書き、写像の配列は省略する（または空配列）。
+runc は config の写像をそのままカーネルへ書き込む。本ランタイムは config の写像を受けず、権限モデルから導く。`linux.namespaces` の `user` は必須（無ければ `PERMISSION_DENIED`）で、写像の配列は省略するか空配列にする。

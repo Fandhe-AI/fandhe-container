@@ -838,6 +838,8 @@ impl LogSink for CriFileSink {
 /// 場合だけ。主（`@container-logs`）は最初の失敗の後に呼ばず、その失敗を構造化ログ 1 行で stderr へ通知する（REPAIR-4）。
 /// 副（CRI ログ）は常に委譲する: 失敗状態の保持・最初の失敗の通知・`reopen` での解除は副の sink 自身が同じ `Mutex` の下で
 /// 行う（書き込みの失敗の記録と開き直しの差し替えを同じ境界にするため。#4652）。観測は [`Self::failed_codes`]。
+/// 契約: 副に渡す sink は自分で失敗状態を持ち、最初の失敗を自分で通知すること（本番の副は [`CriFileSink`] だけ）。
+/// そうでない sink を副に置くと、Tee は失敗を固定も通知もしない。
 pub struct TeeLogSink {
     primary: Arc<dyn LogSink>,
     secondary: Arc<dyn LogSink>,

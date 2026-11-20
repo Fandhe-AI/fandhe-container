@@ -43,6 +43,6 @@
 ## 残余
 
 - 解放が 1 秒を超えて遅れると、create は `TIMEOUT` で失敗する（監査を落とさない側に倒す）。
-- fork の `EAGAIN` を `isolation_unavailable` に畳む扱いは別経路で、本件では変えていない。
+- fork の `EAGAIN` は #4702 で `isolation_unavailable` から分け、`isolation_fork_again` にした（本件の修正では変えていない）。
 
 関連: #2626・#2688・#2868・#2894。

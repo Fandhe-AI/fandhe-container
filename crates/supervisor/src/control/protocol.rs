@@ -1,6 +1,6 @@
 //! 制御チャネルのワイヤー形式（固定長・big-endian。REPAIR-2・SUP-1・SUP-9・SEC-1・#2058・#2162・#2440）。
 //!
-//! CLI（クライアント。[`super::client`]）と supervisor（サーバ。`control::server`）が UDS 上で交わす 9 種類の
+//! CLI（クライアント。[`super::client`]）と supervisor（サーバ。`control::server`）が UDS 上で交わす 10 種類の
 //! frame を、壊れた値を表現できない型で組み立てる。生の `Vec<u8>` を手で組まず、encode は固定長の配列を返し、
 //! decode は `get`・`from_be_bytes`・配列パターンだけで読む（添字アクセスをしない。外部入力の経路）。
 //!
@@ -19,6 +19,13 @@
 //! | ExecCgroupNotify | クライアント → サーバ | 7 | hold_ns `u64`・exec 子 cgroup の名前（1〜56 バイト。Linux のみ） | 17〜72 |
 //! | ExitWatchRequest | クライアント → サーバ | 8 | pid `u32`・hold_ns `u64`（相対の保持期限） | 20 |
 //! | AttachRequest | クライアント → サーバ | 9 | pid `u32`・mask `u8`・tty `u8`・deadline_ns `u64` | 22 |
+//! | ReopenLogRequest | クライアント → サーバ | 10 | deadline_ns `u64` | 16 |
+//!
+//! ReopenLogRequest は plugin-cri の `ReopenContainerLog` が、稼働中コンテナの CRI ログファイルを同じパスで開き直させる
+//! 要求である（CRI-2・SUP-7・REPAIR-4・REPAIR-5・#4652）。supervisor は、スロットが `Active`（稼働中）のときだけ sink の
+//! `reopen` を呼び、`Response(Ok)` を返す。稼働中でなければ（`NoHandle`・`ContainerExited`）何も開かず断る（ファイルを作らない）。
+//! CRI ログのパスが無い構成は `NoCriLog`、開き直しの失敗は `LogReopenRefused`（開けない・別の書き手がいる）または
+//! `LogReopenFailed`（それ以外）で、いずれも既存の書き込み先は変わらない。
 //!
 //! AttachRequest は plugin-cri の Attach が、稼働中コンテナの init の stdin（tty では pty master の複製）と出力の tap を
 //! 受け取るための要求である（SUP-4・SUP-7・REPAIR-2・SEC-1・CRI-6・#4075。設計は `docs/design/cri-streaming-server.md`
@@ -75,7 +82,8 @@
 //! kind 8（#3683）も同じ方針で、古い supervisor は `Malformed` として拒否し、クライアントは「通知なし」として状態の
 //! 照会へ退避する（遅延が既定に戻るだけで、正しさは落ちない）。kind 9（#4075）は、古い supervisor が `Malformed` で
 //! 断る。クライアントはそれを「届かない」（`Unavailable`）として扱い、fd を受け取らず別の手段へも切り替えない
-//! （fail-closed。stdin の所有を別経路で奪わない）。
+//! （fail-closed。stdin の所有を別経路で奪わない）。kind 10（#4652）も同じ方針で、古い supervisor は `Malformed` で断り、
+//! クライアントは「届かない」（`Unavailable`）として扱う（開き直さず、別の手段へも切り替えない）。
 
 use std::num::NonZeroU32;
 use std::time::Duration;
@@ -125,6 +133,10 @@ pub const ATTACH_REQUEST_LEN: usize = HEADER_LEN + ATTACH_PAYLOAD_LEN;
 pub const ATTACH_ROUND_TRIP_BUDGET: Duration = Duration::from_secs(5);
 /// 応答に添える fd の最大本数（入力・stdout の tap・stderr の tap）。
 pub const ATTACH_MAX_FDS: usize = 3;
+/// ReopenLogRequest の payload 長（deadline_ns のみ）。
+pub const REOPEN_LOG_PAYLOAD_LEN: usize = 8;
+/// ReopenLogRequest の全長。
+pub const REOPEN_LOG_REQUEST_LEN: usize = HEADER_LEN + REOPEN_LOG_PAYLOAD_LEN;
 /// Response の payload 長。
 pub const RESPONSE_PAYLOAD_LEN: usize = 1;
 /// Response の全長。
@@ -141,6 +153,7 @@ const KIND_EXEC_HANDOVER_REQUEST: u8 = 6;
 const KIND_EXEC_CGROUP_NOTIFY: u8 = 7;
 const KIND_EXIT_WATCH_REQUEST: u8 = 8;
 const KIND_ATTACH_REQUEST: u8 = 9;
+const KIND_REOPEN_LOG_REQUEST: u8 = 10;
 
 /// 要求の種類。payload は共通で、supervisor が stop の意図を記録するかどうかだけが違う（SUP-9）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,6 +215,12 @@ pub enum ControlReason {
     TtyMismatch = 16,
     /// `stdin_once` の stdin が先の Attach に渡され済みで、もう渡せない（#4075）。
     StdinClosed = 17,
+    /// コンテナに CRI ログのパスが無い（開き直す対象が無い。#4652）。
+    NoCriLog = 18,
+    /// CRI ログを開き直せない（親の検査・symlink・別の書き手のロックなど。既存の書き込み先は変わらない。#4652）。
+    LogReopenRefused = 19,
+    /// CRI ログの開き直しが上の理由以外で失敗した（#4652）。
+    LogReopenFailed = 20,
 }
 
 impl ControlReason {
@@ -226,6 +245,9 @@ impl ControlReason {
             15 => Self::StdinNotOpen,
             16 => Self::TtyMismatch,
             17 => Self::StdinClosed,
+            18 => Self::NoCriLog,
+            19 => Self::LogReopenRefused,
+            20 => Self::LogReopenFailed,
             _ => return None,
         })
     }
@@ -251,6 +273,9 @@ impl ControlReason {
             Self::StdinNotOpen => "stdin_not_open",
             Self::TtyMismatch => "tty_mismatch",
             Self::StdinClosed => "stdin_closed",
+            Self::NoCriLog => "no_cri_log",
+            Self::LogReopenRefused => "log_reopen_refused",
+            Self::LogReopenFailed => "log_reopen_failed",
         }
     }
 
@@ -315,6 +340,15 @@ impl ControlReason {
                 ErrorCode::FailedPrecondition,
                 "the container stdin was already consumed by an attach",
             ),
+            Self::NoCriLog => (
+                ErrorCode::FailedPrecondition,
+                "the container has no CRI log path",
+            ),
+            Self::LogReopenRefused => (
+                ErrorCode::FailedPrecondition,
+                "the cri log file cannot be reopened",
+            ),
+            Self::LogReopenFailed => (ErrorCode::Internal, "the cri log reopen failed"),
             Self::SignalFailed | Self::Internal => (
                 ErrorCode::Internal,
                 "the supervisor failed to deliver the signal",
@@ -446,6 +480,10 @@ impl FrameHeader {
             self.expect(KIND_ATTACH_REQUEST, ATTACH_PAYLOAD_LEN)?;
             return Ok(RequestHeader::Attach);
         }
+        if self.kind == KIND_REOPEN_LOG_REQUEST {
+            self.expect(KIND_REOPEN_LOG_REQUEST, REOPEN_LOG_PAYLOAD_LEN)?;
+            return Ok(RequestHeader::ReopenLog);
+        }
         self.expect_request().map(RequestHeader::Signal)
     }
 
@@ -485,6 +523,8 @@ pub enum RequestHeader {
     ExitWatch,
     /// AttachRequest（payload 14 バイト。#4075）。
     Attach,
+    /// ReopenLogRequest（payload 8 バイト。#4652）。
+    ReopenLog,
 }
 
 /// Hello frame（payload なし）を encode する。
@@ -582,6 +622,31 @@ impl CancelRestartRequestFrame {
     pub fn decode_payload(
         payload: &[u8; CANCEL_RESTART_PAYLOAD_LEN],
     ) -> Result<Self, ControlReason> {
+        let deadline = SignalDeadline::from_nanos(u64::from_be_bytes(*payload))?;
+        Ok(Self { deadline })
+    }
+}
+
+/// ReopenLogRequest frame（kind 10。CRI-2・SUP-7・#4652）。期限の値域は型が保証する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReopenLogRequestFrame {
+    /// 開き直しを完了する期限（`CLOCK_MONOTONIC` の絶対時刻）。
+    pub deadline: SignalDeadline,
+}
+
+impl ReopenLogRequestFrame {
+    /// 16 バイトに encode する。
+    pub fn encode(&self) -> [u8; REOPEN_LOG_REQUEST_LEN] {
+        let [h0, h1, h2, h3, h4, h5, h6, h7] =
+            FrameHeader::encode(KIND_REOPEN_LOG_REQUEST, REOPEN_LOG_PAYLOAD_LEN as u16);
+        let [b0, b1, b2, b3, b4, b5, b6, b7] = self.deadline.as_nanos().to_be_bytes();
+        [
+            h0, h1, h2, h3, h4, h5, h6, h7, b0, b1, b2, b3, b4, b5, b6, b7,
+        ]
+    }
+
+    /// 検証済みヘッダ（[`RequestHeader::ReopenLog`]）の後ろの payload 8 バイトを読む。deadline 0 は `Malformed`。
+    pub fn decode_payload(payload: &[u8; REOPEN_LOG_PAYLOAD_LEN]) -> Result<Self, ControlReason> {
         let deadline = SignalDeadline::from_nanos(u64::from_be_bytes(*payload))?;
         Ok(Self { deadline })
     }
@@ -1512,6 +1577,66 @@ mod tests {
         assert_eq!(h(8, 12).expect_request(), Err(ControlReason::Malformed));
     }
 
+    /// CRI-2・SUP-7・#4652: ReopenLogRequest は kind 10・payload 8 バイトで、具体バイトで往復し、他の長さを拒否する。
+    #[test]
+    fn cri2_4652_reopen_log_frame_roundtrips_exact_bytes() {
+        let frame = ReopenLogRequestFrame {
+            deadline: SignalDeadline::from_nanos(0x0102_0304_0506_0708).unwrap(),
+        };
+        let bytes = frame.encode();
+        assert_eq!(
+            bytes,
+            [b'F', b'C', b'S', b'C', 1, 10, 0, 8, 1, 2, 3, 4, 5, 6, 7, 8]
+        );
+        assert_eq!(REOPEN_LOG_REQUEST_LEN, 16);
+        let header = FrameHeader::decode(bytes[..HEADER_LEN].try_into().unwrap()).unwrap();
+        assert_eq!(header.expect_any_request(), Ok(RequestHeader::ReopenLog));
+        let payload: [u8; REOPEN_LOG_PAYLOAD_LEN] = bytes[HEADER_LEN..].try_into().unwrap();
+        assert_eq!(ReopenLogRequestFrame::decode_payload(&payload), Ok(frame));
+        assert_eq!(
+            ReopenLogRequestFrame::decode_payload(&[0; REOPEN_LOG_PAYLOAD_LEN]),
+            Err(ControlReason::Malformed)
+        );
+        for len in [0u8, 7, 9, 12] {
+            let h = FrameHeader::decode(&[b'F', b'C', b'S', b'C', 1, 10, 0, len]).unwrap();
+            assert_eq!(
+                h.expect_any_request(),
+                Err(ControlReason::Malformed),
+                "len {len}"
+            );
+        }
+    }
+
+    /// #4652: 新しい理由コードのワイヤー値・固定文言・エラー code。
+    #[test]
+    fn cri2_4652_reopen_reasons_map_to_fixed_errors() {
+        for (wire, reason, code, msg) in [
+            (
+                18u8,
+                ControlReason::NoCriLog,
+                ErrorCode::FailedPrecondition,
+                "the container has no CRI log path",
+            ),
+            (
+                19,
+                ControlReason::LogReopenRefused,
+                ErrorCode::FailedPrecondition,
+                "the cri log file cannot be reopened",
+            ),
+            (
+                20,
+                ControlReason::LogReopenFailed,
+                ErrorCode::Internal,
+                "the cri log reopen failed",
+            ),
+        ] {
+            assert_eq!(ControlReason::from_u8(wire), Some(reason));
+            assert_eq!(reason as u8, wire);
+            let e = reason.to_error().unwrap();
+            assert_eq!((e.code(), e.message()), (code, msg));
+        }
+    }
+
     fn attach_frame(mask: u8, tty: bool) -> AttachRequestFrame {
         AttachRequestFrame::new(
             NonZeroU32::new(4242).unwrap(),
@@ -1674,6 +1799,6 @@ mod tests {
             assert_eq!(e.code(), ErrorCode::FailedPrecondition);
             assert_eq!(e.message(), msg);
         }
-        assert_eq!(ControlReason::from_u8(18), None);
+        assert_eq!(ControlReason::from_u8(21), None);
     }
 }

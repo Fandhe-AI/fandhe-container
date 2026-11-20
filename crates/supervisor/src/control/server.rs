@@ -53,8 +53,9 @@ use super::protocol::{
     ATTACH_MAX_FDS, ATTACH_PAYLOAD_LEN, ATTACH_ROUND_TRIP_BUDGET, AttachRequestFrame,
     CANCEL_RESTART_PAYLOAD_LEN, CancelRestartRequestFrame, ControlReason,
     EXEC_HANDOVER_PAYLOAD_LEN, EXIT_WATCH_PAYLOAD_LEN, ExecHandoverRequestFrame,
-    ExitWatchRequestFrame, FrameHeader, HEADER_LEN, MAX_SIGNAL_BUDGET, RequestHeader,
-    ResponseFrame, SIGNAL_REQUEST_PAYLOAD_LEN, SignalDeadline, SignalRequestFrame, encode_hello,
+    ExitWatchRequestFrame, FrameHeader, HEADER_LEN, MAX_SIGNAL_BUDGET, REOPEN_LOG_PAYLOAD_LEN,
+    ReopenLogRequestFrame, RequestHeader, ResponseFrame, SIGNAL_REQUEST_PAYLOAD_LEN,
+    SignalDeadline, SignalRequestFrame, encode_hello,
 };
 use super::target::{ExitWatchHandle, SignalSlot, TakenInput, wait_reply};
 use crate::logs::TapStreams;
@@ -70,6 +71,8 @@ enum RequestOp {
     ExitWatch,
     /// Attach の fd の受け渡し（kind 9）。
     Attach,
+    /// CRI ログの開き直し（kind 10。#4652）。
+    ReopenLog,
 }
 
 /// 終了購読の接続を、整理（[`SignalSlot::prune_exit_watchers`]）が non-blocking の 1 バイト読み取りで調べられる形にする。
@@ -204,6 +207,7 @@ pub fn serve_connection_with_guards(
     match op {
         RequestOp::ExitWatch => observer.record_exit_watch(ok, started.elapsed()),
         RequestOp::Attach => observer.record_attach(ok, started.elapsed()),
+        RequestOp::ReopenLog => observer.record_reopen_log(ok, started.elapsed()),
         RequestOp::Exec => observer.record_exec(ok, started.elapsed()),
         RequestOp::Signal => observer.record_request(ok, started.elapsed()),
     }
@@ -260,6 +264,12 @@ fn handle_request(
             return (
                 handle_attach(stream, slot, read_deadline),
                 RequestOp::Attach,
+            );
+        }
+        Ok(RequestHeader::ReopenLog) => {
+            return (
+                handle_reopen_log(stream, slot, read_deadline),
+                RequestOp::ReopenLog,
             );
         }
         Err(reason) => return (respond(&mut stream, reason), RequestOp::Signal),
@@ -397,6 +407,55 @@ fn handle_exec_handover(
         guard.start(stream, peer_pid);
     }
     reason
+}
+
+/// ReopenLogRequest（kind 10）の payload を読んで、稼働中のコンテナの CRI ログを開き直させる（CRI-2・SUP-7・REPAIR-5・#4652）。
+///
+/// 稼働中でなければ（`NoHandle`・`ContainerExited`）sink に触れず断る（新しいファイルを作らない。cri-api の MUST NOT）。
+/// 期限を過ぎていれば開き直さない。sink の失敗は理由コードへ写し（文言は反射しない）、既存の書き込み先は変わらない。
+fn handle_reopen_log(
+    mut stream: UnixStream,
+    slot: &SignalSlot,
+    read_deadline: Instant,
+) -> ControlReason {
+    let mut payload = [0u8; REOPEN_LOG_PAYLOAD_LEN];
+    if read_exact_until(&mut stream, &mut payload, read_deadline).is_err() {
+        return respond(&mut stream, ControlReason::Malformed);
+    }
+    let request = match ReopenLogRequestFrame::decode_payload(&payload) {
+        Ok(r) => r,
+        Err(reason) => return respond(&mut stream, reason),
+    };
+    let deadline = match absolute_deadline(request.deadline) {
+        Ok(d) => d,
+        Err(reason) => return respond(&mut stream, reason),
+    };
+    if let Err(reason) = slot.check_running() {
+        return respond(&mut stream, reason);
+    }
+    let Some(hub) = slot.output_capture() else {
+        return respond(&mut stream, ControlReason::NoCriLog);
+    };
+    if Instant::now() >= deadline {
+        return respond(&mut stream, ControlReason::Timeout);
+    }
+    let reason = match hub.reopen_log() {
+        Ok(()) => ControlReason::Ok,
+        Err(e) => reopen_failure(e.code()),
+    };
+    respond(&mut stream, reason)
+}
+
+/// sink の開き直しの失敗を理由コードへ写す。`Unimplemented` は CRI ログが無い構成（`LogSink::reopen` の既定）。
+fn reopen_failure(code: fandhe_container_core::traits::ErrorCode) -> ControlReason {
+    use fandhe_container_core::traits::ErrorCode;
+    match code {
+        ErrorCode::Unimplemented => ControlReason::NoCriLog,
+        ErrorCode::FailedPrecondition | ErrorCode::InvalidArgument => {
+            ControlReason::LogReopenRefused
+        }
+        _ => ControlReason::LogReopenFailed,
+    }
 }
 
 /// tap の購読の失敗を理由コードへ写す（理由の文言は反射しない）。

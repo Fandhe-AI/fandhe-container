@@ -376,6 +376,17 @@ impl SignalSlot {
         }
     }
 
+    /// スロットが稼働中（`Active`）か確かめる（ReopenLogRequest。CRI-2・#4652）。ハンドル無しは `NoHandle`、終了済みは
+    /// `ContainerExited`。稼働中でなければ呼び出し側はファイルを開かない。何も取り出さず、I/O もしない。
+    #[cfg(target_os = "linux")]
+    pub(crate) fn check_running(&self) -> Result<(), ControlReason> {
+        match &self.lock().state {
+            SlotState::Empty => Err(ControlReason::NoHandle),
+            SlotState::Exited { .. } => Err(ControlReason::ContainerExited),
+            SlotState::Active { .. } => Ok(()),
+        }
+    }
+
     /// Attach の事前の照合（何も取り出さない）。[`Self::take_attach_input`] と同じ判定を `commit = false` で行う。
     #[cfg(target_os = "linux")]
     pub(crate) fn check_attach(

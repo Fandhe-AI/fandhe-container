@@ -779,6 +779,18 @@ pub trait LogSink: Send + Sync {
     fn flush(&self) -> Result<(), TraitError> {
         Ok(())
     }
+
+    /// CRI ログのファイルを同じパスで開き直す（`ReopenContainerLog`。CRI-2・SUP-7・#4652）。
+    ///
+    /// 既定は `Unimplemented`（CRI ログのファイルを持たない sink。制御チャネルは「CRI ログのパスが無い」として拒否する）。
+    /// CRI ログの sink は、先に新しいファイルを開けてから差し替え、失敗したら状態を変えずに `Err` を返す。
+    /// 書き込み（`append` 等）と直列化され、有限時間で戻ること。
+    fn reopen(&self) -> Result<(), TraitError> {
+        Err(TraitError::new(
+            fandhe_container_core::traits::ErrorCode::Unimplemented,
+            "the log sink has no cri log file",
+        ))
+    }
 }
 
 /// 行を記録せず捨てる [`LogSink`]（SUP-7・SUP-1・REPAIR-5）。

@@ -28,6 +28,9 @@ const EXIT_WATCH_OP_NAME: &str = "control_exit_watch";
 /// Attach 要求（ExecHandover 同様 fd を返す 1 往復）の計測に使う操作名（#4075・REPAIR-4）。
 const ATTACH_OP_NAME: &str = "control_attach";
 
+/// CRI ログの開き直し（ReopenLogRequest。kind 10）の計測に使う操作名（#4652・REPAIR-4）。
+const REOPEN_LOG_OP_NAME: &str = "control_reopen_log";
+
 /// exec 用 pidfd の受け渡し（ExecHandoverRequest。kind 6）の計測に使う操作名。signal 配送の集計と分ける
 /// （#4573・#4116 項目 3・SUP-6・REPAIR-4）。
 const EXEC_OP_NAME: &str = "control_exec";
@@ -111,6 +114,11 @@ impl ControlObserver {
     /// Attach 要求（kind 9）1 件の結果とレイテンシを集計する（#4075・REPAIR-4）。
     pub fn record_attach(&self, success: bool, elapsed: Duration) {
         self.record_op(ATTACH_OP_NAME, success, elapsed);
+    }
+
+    /// CRI ログの開き直し（kind 10）1 件の結果とレイテンシを集計する（#4652・REPAIR-4）。
+    pub fn record_reopen_log(&self, success: bool, elapsed: Duration) {
+        self.record_op(REOPEN_LOG_OP_NAME, success, elapsed);
     }
 
     /// exec 用 pidfd の受け渡し（kind 6）1 件の結果とレイテンシを集計する（SUP-6・REPAIR-4・#4116 項目 3・#4573）。

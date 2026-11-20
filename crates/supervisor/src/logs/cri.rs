@@ -28,7 +28,7 @@
 //! - 特権ランチャー経由（ambient capability あり）では開かない（[`deny_elevated_capabilities`]）。`CAP_DAC_OVERRIDE` を持ったまま
 //!   利用者の指定したパスを開くと DAC を越えて任意のファイルへ追記できてしまうため。
 //! - エラー文言は固定の英語で、パス・errno・行の内容を含めない（ERR-1）。
-//! - 自前のローテーションはしない（kubelet が rename して `ReopenContainerLog` を呼ぶ方式。未実装は後続 issue）。代わりに CRI ログ 1 本の
+//! - 自前のローテーションはしない（kubelet が rename して `ReopenContainerLog` を呼ぶ方式。開き直しは [`LogSink::reopen`]・制御チャネルの kind 10。#4652）。代わりに CRI ログ 1 本の
 //!   総量に上限を設ける（[`CRI_LOG_MAX_BYTES`]。既存サイズも数える）。超えると書き出しを止め（`ResourceExhausted`）、[`TeeLogSink`] が
 //!   構造化ログで通知する。`@container-logs` は `RotatingFileSink` の上限どおり続く。
 //! - 上限を書き手ごとに数えるため、書き手は 1 ファイルにつき 1 つに限る。開いたファイルに排他ロック（`flock(2)`）を
@@ -60,8 +60,8 @@ pub const CRI_TIMESTAMP_LEN: usize = 30;
 const WRITE_BUFFER_BYTES: usize = 8 * 1024;
 
 /// CRI ログファイル 1 本の総量の上限（50 MiB。kubelet の `containerLogMaxSize` 10 MiB × `containerLogMaxFiles` 5 に合わせる）。
-/// `ReopenContainerLog` による回転が未実装のため、超えた時点で CRI ログへの書き出しを止める
-/// （`ResourceExhausted`。`@container-logs` 側の `RotatingFileSink` は影響を受けない）。再起動をまたぐ追記も既存のサイズから数える。
+/// 超えた時点で CRI ログへの書き出しを止める（`ResourceExhausted`。`@container-logs` 側の `RotatingFileSink` は影響を受けない）。
+/// `ReopenContainerLog`（[`LogSink::reopen`]）で新しいファイルを開き直すと、大きさを数え直して再開する（#4652）。再起動をまたぐ追記も既存のサイズから数える。
 pub const CRI_LOG_MAX_BYTES: u64 = 50 * 1024 * 1024;
 
 /// 9999-12-31T23:59:59 のエポック秒（4 桁の年に収めるための上限）。
@@ -239,6 +239,12 @@ pub fn deny_elevated_capabilities(status: &str) -> Result<(), TraitError> {
 /// `flush` で書き出す。書き込みに失敗したら失敗状態に固定し、以後の `append` は `Err` を返す（再書き込みで重複を作らない）。
 pub struct CriFileSink {
     inner: Mutex<Inner>,
+    /// 開いたパス（`reopen` が同じパスを開き直す。`ReopenContainerLog`。CRI-2・#4652）。
+    #[cfg_attr(not(unix), allow(dead_code))]
+    path: std::path::PathBuf,
+    /// 総量の上限（`reopen` が新しいファイルの残りを数え直す）。
+    #[cfg_attr(not(unix), allow(dead_code))]
+    max_bytes: u64,
 }
 
 enum Inner {
@@ -313,6 +319,87 @@ const LOCK_GRACE: Duration = Duration::from_millis(250);
 #[cfg(unix)]
 const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(5);
 
+/// CRI ログのファイルを、親の検査・`O_NOFOLLOW` つきで追記で開く（ロックは取らない）。`create_parent` が真のときだけ
+/// 親ディレクトリを検査済みの祖先の直下に作る（`open`）。`reopen` は親を作らない（kubelet が rename した後の再 open で、
+/// 親が消えていれば新しいパスを勝手に作らず失敗させる。CRI-2・#4652）。開けなければ `FailedPrecondition`。
+#[cfg(unix)]
+fn open_log_file(path: &std::path::Path, create_parent: bool) -> Result<std::fs::File, TraitError> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let unopenable = || {
+        TraitError::new(
+            ErrorCode::FailedPrecondition,
+            "cri log file cannot be opened",
+        )
+    };
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(invalid("cri log path has no file name"));
+    };
+    let dir = if create_parent {
+        ensure_parent_dir(parent, unopenable)?
+    } else {
+        super::rotating::check_dir(parent).map_err(|_| unopenable())?
+    };
+    std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(0o640)
+        .custom_flags(
+            super::rotating::O_NOFOLLOW
+                | crate::container_options::env::O_NONBLOCK
+                | crate::container_options::env::O_NOCTTY,
+        )
+        .open(dir.join(name))
+        .map_err(|_| unopenable())
+}
+
+/// 開いたファイルの排他ロックを取り、通常ファイルであることを確かめて大きさを返す。書き手は 1 ファイルにつき 1 つ
+/// （総量の上限を書き手ごとに数えるため。別の supervisor が同じパスを開いていれば上限が書き手の数だけ増える）。
+/// サイズは排他ロックを取ってから読む（先に読むと、解放直後の相手の書き込みを数え損ねる）。
+#[cfg(unix)]
+fn lock_and_size(file: &std::fs::File) -> Result<u64, TraitError> {
+    let unopenable = || {
+        TraitError::new(
+            ErrorCode::FailedPrecondition,
+            "cri log file cannot be opened",
+        )
+    };
+    match try_lock_with_grace(file) {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            return Err(TraitError::new(
+                ErrorCode::FailedPrecondition,
+                "cri log file is already in use by another writer",
+            ));
+        }
+        Err(std::fs::TryLockError::Error(_)) => return Err(unopenable()),
+    }
+    let Ok(meta) = file.metadata() else {
+        return Err(unopenable());
+    };
+    if !meta.is_file() {
+        return Err(unopenable());
+    }
+    Ok(meta.len())
+}
+
+/// 2 つのファイルが同じ inode か（`reopen` が rename されていないパスの再 open を見分ける）。
+#[cfg(unix)]
+fn same_inode(a: &std::fs::File, b: &std::fs::File) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    match (a.metadata(), b.metadata()) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
+/// `reopen` で旧 writer の flush が失敗したことの構造化 1 行を出す（黙って消さない。REPAIR-4。パスは含めない）。
+#[cfg(unix)]
+fn report_reopen_flush_failure() {
+    let line = "{\"component\":\"supervisor.logs\",\"operation\":\"cri_reopen\",\"result\":\"old_flush_failed\"}\n";
+    let _ = crate::stderr_sink::stderr().emit(line.as_bytes().to_vec());
+}
+
 impl CriFileSink {
     /// `path`（cri が結合・検証した絶対パス）を追記で開く。親ディレクトリが安全でない・最終要素が symlink / 通常ファイル
     /// 以外のときは開かない。親ディレクトリが無ければ検査済みの祖先の直下に 1 階層だけ作る（`ensure_parent_dir`）。開けない場合と、別の書き手が排他ロックを
@@ -330,54 +417,16 @@ impl CriFileSink {
         path: &fandhe_container_core::traits::ContainerLogPath,
         max_bytes: u64,
     ) -> Result<Self, TraitError> {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        use std::path::Path;
-
-        let unopenable = || {
-            TraitError::new(
-                ErrorCode::FailedPrecondition,
-                "cri log file cannot be opened",
-            )
-        };
-        let path = Path::new(path.as_str());
-        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
-            return Err(invalid("cri log path has no file name"));
-        };
-        let dir = ensure_parent_dir(parent, unopenable)?;
-        let file = std::fs::OpenOptions::new()
-            .append(true)
-            .create(true)
-            .mode(0o640)
-            .custom_flags(
-                super::rotating::O_NOFOLLOW
-                    | crate::container_options::env::O_NONBLOCK
-                    | crate::container_options::env::O_NOCTTY,
-            )
-            .open(dir.join(name))
-            .map_err(|_| unopenable())?;
-        // 書き手は 1 ファイルにつき 1 つ（総量の上限を書き手ごとに数えるため。別の supervisor が同じパスを開いていれば
-        // 上限が書き手の数だけ増える）。サイズは排他ロックを取ってから読む（先に読むと、解放直後の相手の書き込みを数え損ねる）。
-        match try_lock_with_grace(&file) {
-            Ok(()) => {}
-            Err(std::fs::TryLockError::WouldBlock) => {
-                return Err(TraitError::new(
-                    ErrorCode::FailedPrecondition,
-                    "cri log file is already in use by another writer",
-                ));
-            }
-            Err(std::fs::TryLockError::Error(_)) => return Err(unopenable()),
-        }
-        let Ok(meta) = file.metadata() else {
-            return Err(unopenable());
-        };
-        if !meta.is_file() {
-            return Err(unopenable());
-        }
+        let path = std::path::PathBuf::from(path.as_str());
+        let file = open_log_file(&path, true)?;
+        let len = lock_and_size(&file)?;
         Ok(Self {
             inner: Mutex::new(Inner::Active {
                 writer: std::io::BufWriter::with_capacity(WRITE_BUFFER_BYTES, file),
-                remaining: max_bytes.saturating_sub(meta.len()),
+                remaining: max_bytes.saturating_sub(len),
             }),
+            path,
+            max_bytes,
         })
     }
 
@@ -474,6 +523,57 @@ impl LogSink for CriFileSink {
                 Ok(())
             }
             Inner::Failed => Err(internal("cri log sink is in failed state")),
+        }
+    }
+
+    /// 同じパスを開き直す（kubelet のログ回転後の `ReopenContainerLog`。CRI-2・SUP-7・REPAIR-4・REPAIR-5・#4652）。
+    ///
+    /// 先に新しいファイルを開き（親の検査・`O_NOFOLLOW`・排他ロック・通常ファイル）、失敗したら状態（`Active` / `Failed`）を
+    /// 変えずに `Err` を返す。親ディレクトリは作らない。`create` で開くため、開く段階を通った後に失敗する場合
+    /// （ロック・`fstat`）は新しい空のファイルが残りうるが、そこで失敗するのは別の書き手が同じパスを持つか `fstat` が
+    /// 失敗する場合に限る。成功したら旧 writer を flush（失敗は構造化ログに残すだけ）して差し替え、総量の上限は新しい
+    /// ファイルの大きさから数え直す。上限到達で止まった状態（`Failed`）からもここで再開する。
+    ///
+    /// rename 済み（別 inode）なら旧 fd を最後に閉じて旧ロックを外す。rename されていない（同じ inode）なら同一プロセスの
+    /// 別 open file description のロックは衝突するため、旧 writer を残して flush し、大きさだけ数え直す。
+    /// 書き込みと同じ `Mutex` で直列化され、行の途中（部分行 `P` の続き）でも呼べる。その場合は新ファイルが
+    /// 続きの断片から始まる（containerd も保証しない）。ロック待ちは最大 250ms（`LOCK_GRACE`）。
+    fn reopen(&self) -> Result<(), TraitError> {
+        #[cfg(unix)]
+        {
+            let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+            let file = open_log_file(&self.path, false)?;
+            if let Inner::Active { writer, remaining } = &mut *guard
+                && same_inode(writer.get_ref(), &file)
+            {
+                if writer.flush().is_err() {
+                    report_reopen_flush_failure();
+                }
+                if let Ok(meta) = file.metadata() {
+                    *remaining = self.max_bytes.saturating_sub(meta.len());
+                }
+                return Ok(());
+            }
+            let len = lock_and_size(&file)?;
+            let new_state = Inner::Active {
+                writer: std::io::BufWriter::with_capacity(WRITE_BUFFER_BYTES, file),
+                remaining: self.max_bytes.saturating_sub(len),
+            };
+            if let Inner::Active { writer, .. } = &mut *guard
+                && writer.flush().is_err()
+            {
+                report_reopen_flush_failure();
+            }
+            // 旧 writer は代入で drop され、旧 fd の flock が外れる。
+            *guard = new_state;
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            Err(TraitError::new(
+                ErrorCode::Unimplemented,
+                "cri log file is not supported on this platform",
+            ))
         }
     }
 }
@@ -587,6 +687,29 @@ impl LogSink for TeeLogSink {
 
     fn flush(&self) -> Result<(), TraitError> {
         self.each(|s| s.flush())
+    }
+
+    /// CRI ログ（副）だけを開き直す（`@container-logs` は従来どおり。CRI-2・#4652）。副が `Unimplemented`（CRI ログが無い）や
+    /// 失敗のときはそのまま返し、失敗の記録は変えない。成功したら副の失敗の記録を解除する（上限到達などで止まった CRI ログの再開）。
+    /// 解除は開き直しの前に行う: 副の mutex が開き直しと書き込みを直列化するため、窓の間の書き込みを取りこぼさない。
+    /// 失敗したときは副が失敗状態のままなら次の書き込みで再び記録される（通知がもう 1 行出る）。
+    fn reopen(&self) -> Result<(), TraitError> {
+        let previous = {
+            let mut g = self.failed.lock().unwrap_or_else(PoisonError::into_inner);
+            g.get_mut(1).and_then(Option::take)
+        };
+        let result = self.secondary.reopen();
+        if result
+            .as_ref()
+            .is_err_and(|e| e.code() == ErrorCode::Unimplemented)
+        {
+            // CRI ログが無い構成では何も変えない。
+            let mut g = self.failed.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(slot) = g.get_mut(1) {
+                *slot = previous;
+            }
+        }
+        result
     }
 }
 
@@ -802,6 +925,184 @@ mod tests {
             let sink = CriFileSink::open_with_limit(&path, 84).expect("reopen");
             let e = sink.append(StreamKind::Stdout, b"w").expect_err("full");
             assert_eq!(e.code(), ErrorCode::ResourceExhausted);
+        }
+
+        /// CRI-2・SUP-7・#4652: 上限到達で止まった CRI ログは、rename の後の `reopen` で新しいファイルへ再開する。
+        /// 旧ファイルの内容は変わらず、残りは新しいファイルの大きさから数え直す（既存 42 バイトなら 84 - 42 = 42 で 1 行）。
+        #[test]
+        fn cri2_4652_reopen_after_limit_resumes_on_new_file() {
+            let t = Tmp::new("reopen-limit");
+            let path = t.log("0.log");
+            let rotated = t.0.join("0.log.1");
+            let sink = CriFileSink::open_with_limit(&path, 84).expect("open");
+            sink.append(StreamKind::Stdout, b"x").expect("1");
+            sink.append(StreamKind::Stdout, b"y").expect("2");
+            let e = sink.append(StreamKind::Stdout, b"z").expect_err("limit");
+            assert_eq!(e.code(), ErrorCode::ResourceExhausted);
+            let before = read(Path::new(path.as_str()));
+            std::fs::rename(path.as_str(), &rotated).expect("rename");
+            // 新ファイルに 42 バイトの既存内容がある場合（別の経路で先に作られた）も、残りはサイズから数える。
+            std::fs::write(path.as_str(), vec![b'.'; 42]).expect("seed");
+            sink.reopen().expect("reopen");
+            sink.append(StreamKind::Stdout, b"n")
+                .expect("one line fits");
+            let e = sink
+                .append(StreamKind::Stdout, b"m")
+                .expect_err("remaining is 42");
+            assert_eq!(e.code(), ErrorCode::ResourceExhausted);
+            drop(sink);
+            assert_eq!(read(&rotated), before);
+            let new = read(Path::new(path.as_str()));
+            assert_eq!(new.len(), 84);
+            assert!(new.ends_with(" stdout F n\n"), "{new}");
+        }
+
+        /// CRI-2・SUP-7・#4652: rename 済み（別 inode）で `Active` の `reopen` は旧ファイルのバッファを flush してから
+        /// 新ファイルへ切り替える。切り替え後に旧ファイルへは書かず、旧ロックは外れる。
+        #[test]
+        fn cri2_4652_reopen_after_rename_flushes_old_and_switches() {
+            let t = Tmp::new("reopen-rename");
+            let path = t.log("0.log");
+            let rotated = t.0.join("0.log.1");
+            let sink = CriFileSink::open(&path).expect("open");
+            sink.append(StreamKind::Stdout, b"old").expect("append");
+            std::fs::rename(path.as_str(), &rotated).expect("rename");
+            sink.reopen().expect("reopen");
+            sink.append(StreamKind::Stderr, b"new").expect("append");
+            sink.flush().expect("flush");
+            let old_text = read(&rotated);
+            let old: Vec<&str> = old_text.lines().collect();
+            assert_eq!(old.len(), 1);
+            assert!(old[0].ends_with(" stdout F old"), "{}", old[0]);
+            let new = read(Path::new(path.as_str()));
+            assert_eq!(new.lines().count(), 1);
+            assert!(new.ends_with(" stderr F new\n"), "{new}");
+            // 旧ファイルの flock は外れている（別の書き手が開ける）。
+            drop(
+                CriFileSink::open(
+                    &ContainerLogPath::new(rotated.display().to_string()).expect("p"),
+                )
+                .expect("old lock released"),
+            );
+        }
+
+        /// CRI-2・#4652: rename されていない（同じ inode）`reopen` も成功し、同じ writer のまま追記が続く
+        /// （同一プロセスの別 open file description の flock と衝突しない）。残りはファイルの大きさから数え直す。
+        #[test]
+        fn cri2_4652_reopen_same_inode_keeps_appending() {
+            let t = Tmp::new("reopen-same");
+            let path = t.log("0.log");
+            let sink = CriFileSink::open_with_limit(&path, 84).expect("open");
+            sink.append(StreamKind::Stdout, b"a").expect("append");
+            sink.reopen().expect("reopen same inode");
+            sink.append(StreamKind::Stdout, b"b").expect("append");
+            let e = sink.append(StreamKind::Stdout, b"c").expect_err("limit 84");
+            assert_eq!(e.code(), ErrorCode::ResourceExhausted);
+            drop(sink);
+            let text = read(Path::new(path.as_str()));
+            assert_eq!(text.lines().count(), 2);
+            assert!(text.lines().next().expect("l").ends_with(" stdout F a"));
+        }
+
+        /// CRI-2・#4652: `Failed` からの再開は、同じ inode でも（失敗時に旧 writer が閉じられ旧ロックが外れているため）成功する。
+        #[test]
+        fn cri2_4652_reopen_from_failed_same_inode_resumes() {
+            let t = Tmp::new("reopen-failed");
+            let path = t.log("0.log");
+            let sink = CriFileSink::open_with_limit(&path, 42).expect("open");
+            sink.append(StreamKind::Stdout, b"x").expect("1");
+            assert!(sink.append(StreamKind::Stdout, b"y").is_err());
+            assert!(sink.flush().is_err(), "failed state");
+            sink.reopen().expect("reopen");
+            // 既存 42 バイトで上限 42: 残り 0 のため書けないが、失敗状態ではなく上限の判定に戻る。
+            let e = sink.append(StreamKind::Stdout, b"z").expect_err("full");
+            assert_eq!(e.code(), ErrorCode::ResourceExhausted);
+            assert_eq!(read(Path::new(path.as_str())).lines().count(), 1);
+        }
+
+        /// SEC-1・CRI-2・#4652: 開き直せない（親が消えた・最終要素が symlink・別の書き手がロック）ときは状態を変えず `Err`。
+        /// 親ディレクトリも新しいファイルも作らない。
+        #[test]
+        fn cri2_4652_failed_reopen_changes_nothing_and_creates_nothing() {
+            let t = Tmp::new("reopen-fail");
+            let path = t.log("sub/0.log");
+            let sink = CriFileSink::open(&path).expect("open");
+            sink.append(StreamKind::Stdout, b"one").expect("append");
+            let sub = t.0.join("sub");
+            let moved = t.0.join("moved");
+            std::fs::rename(&sub, &moved).expect("rename dir");
+            let e = sink.reopen().expect_err("parent gone");
+            assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+            assert!(!sub.exists(), "the parent must not be recreated");
+            // 旧 writer は生きている。
+            sink.append(StreamKind::Stdout, b"two")
+                .expect("still active");
+            sink.flush().expect("flush");
+            assert_eq!(read(&moved.join("0.log")).lines().count(), 2);
+
+            // 最終要素が symlink に差し替えられた。
+            std::fs::create_dir(&sub).expect("mkdir");
+            std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o750)).expect("chmod");
+            let target = t.0.join("target.txt");
+            std::fs::write(&target, b"keep").expect("write");
+            symlink(&target, sub.join("0.log")).expect("symlink");
+            let e = sink.reopen().expect_err("symlink");
+            assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+            assert_eq!(read(&target), "keep");
+            sink.append(StreamKind::Stdout, b"three")
+                .expect("still active");
+
+            // 別の書き手がロックしているファイル。
+            std::fs::remove_file(sub.join("0.log")).expect("rm");
+            let other = std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(sub.join("0.log"))
+                .expect("create");
+            other.lock().expect("lock");
+            let e = sink.reopen().expect_err("locked by another");
+            assert_eq!(
+                e.message(),
+                "cri log file is already in use by another writer"
+            );
+            sink.append(StreamKind::Stdout, b"four")
+                .expect("still active");
+            drop(other);
+        }
+
+        /// CRI-2・SUP-7・#4652: `TeeLogSink::reopen` は CRI 側の失敗の記録を解除し、上限で止まった CRI ログだけが再開する。
+        /// CRI ログを持たない sink を副にすると `Unimplemented`（記録は変えない）。
+        #[test]
+        fn cri2_4652_tee_reopen_clears_cri_failure_flag() {
+            let t = Tmp::new("tee-reopen");
+            let path = t.log("0.log");
+            let rotated = t.0.join("0.log.1");
+            let primary = Arc::new(Recorder(Mutex::new(Vec::new()), false));
+            let tee = TeeLogSink::new(
+                primary.clone(),
+                Arc::new(CriFileSink::open_with_limit(&path, 42).expect("open")),
+            );
+            tee.append(StreamKind::Stdout, b"x").expect("1");
+            tee.append(StreamKind::Stdout, b"y")
+                .expect("primary keeps going");
+            assert_eq!(
+                tee.failed_codes(),
+                [None, Some(ErrorCode::ResourceExhausted)]
+            );
+            std::fs::rename(path.as_str(), &rotated).expect("rename");
+            tee.reopen().expect("reopen");
+            assert_eq!(tee.failed_codes(), [None, None]);
+            tee.append(StreamKind::Stdout, b"z").expect("resumed");
+            tee.flush().expect("flush");
+            assert!(read(Path::new(path.as_str())).ends_with(" stdout F z\n"));
+            assert_eq!(primary.0.lock().expect("lock").len(), 3);
+
+            let none = TeeLogSink::new(
+                Arc::new(Recorder(Mutex::new(Vec::new()), false)),
+                Arc::new(Recorder(Mutex::new(Vec::new()), false)),
+            );
+            let e = none.reopen().expect_err("no cri file");
+            assert_eq!(e.code(), ErrorCode::Unimplemented);
         }
 
         /// CRI-2・SUP-4: 同じファイルの 2 つ目の書き手は `FailedPrecondition` で拒否し（上限を書き手の数だけ増やさない）、

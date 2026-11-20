@@ -94,7 +94,9 @@ pub(crate) mod os_errno;
 #[cfg(target_os = "linux")]
 pub mod server;
 
-pub use client::{CancelOutcome, ControlExitWatcher, ControlRestartCanceller, ControlSignaler};
+pub use client::{
+    CancelOutcome, ControlExitWatcher, ControlReopenLog, ControlRestartCanceller, ControlSignaler,
+};
 #[cfg(target_os = "linux")]
 pub use client::{ControlAttach, ControlExecHandover};
 #[cfg(target_os = "linux")]

@@ -114,6 +114,43 @@ impl super::ExitNotifier for ControlExitWatcher {
     }
 }
 
+/// supervisor の制御チャネルへ、稼働中コンテナの CRI ログファイルの開き直しを依頼する（plugin-cri の
+/// `ReopenContainerLog` 用。CRI-2・SUP-7・REPAIR-5・#4652）。非 Linux は常に `Unimplemented`。
+#[derive(Debug, Clone)]
+pub struct ControlReopenLog {
+    state_root: PathBuf,
+}
+
+impl ControlReopenLog {
+    /// 状態ルート（`<state_root>/<id>/supervisor.sock` の `<state_root>`）から作る。
+    pub fn new(state_root: PathBuf) -> Self {
+        Self { state_root }
+    }
+
+    /// `id` のコンテナの supervisor に CRI ログを開き直させ、`deadline` までに結果を返す。
+    ///
+    /// エラー（`code`: 文言）: 稼働中でない（スロットが空・終了済み）は `FailedPrecondition`: `container is not running`
+    /// （新しいファイルは作られない）、CRI ログのパスが無い構成は `FailedPrecondition`: `the container has no CRI log path`、
+    /// supervisor 不在・古い supervisor（kind 10 を知らず拒否）は `Unavailable`: `the supervisor control channel is
+    /// unavailable`、開き直せない（親の検査・別の書き手など。既存の書き込み先は変わらない）は `FailedPrecondition`:
+    /// `the cri log file cannot be reopened`、それ以外の失敗は `Internal`: `the cri log reopen failed`、期限切れは
+    /// `Timeout`、別 uid のソケットは `PermissionDenied`。
+    pub fn reopen(&self, id: &ContainerId, deadline: Instant) -> Result<(), TraitError> {
+        #[cfg(target_os = "linux")]
+        {
+            linux::reopen_log(&self.state_root, id, deadline)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (&self.state_root, id, deadline);
+            Err(TraitError::new(
+                fandhe_container_core::traits::ErrorCode::Unimplemented,
+                "the supervisor control channel requires Linux",
+            ))
+        }
+    }
+}
+
 /// supervisor の制御チャネルから、稼働中コンテナの起動時 pidfd の複製を受け取る [`super::ExecPidfdSource`]
 /// （CLI の `exec` 用。SUP-6・SEC-1・CLI-1・#2626）。Linux のみ（pidfd と `SCM_RIGHTS` は Linux の機能）。
 #[cfg(target_os = "linux")]
@@ -275,8 +312,8 @@ mod linux {
         AttachMask, AttachRequestFrame, CancelRestartRequestFrame, ControlReason,
         ExecCgroupNotifyFrame, ExecHandoverRequestFrame, ExitWatchRequestFrame, FrameHeader,
         HEADER_LEN, HoldDeadline, MAX_EXEC_HOLD_SECS, MAX_EXIT_WATCH_HOLD, MAX_SIGNAL_BUDGET,
-        RESPONSE_LEN, RESPONSE_PAYLOAD_LEN, RequestKind, ResponseFrame, SignalDeadline,
-        SignalRequestFrame,
+        RESPONSE_LEN, RESPONSE_PAYLOAD_LEN, ReopenLogRequestFrame, RequestKind, ResponseFrame,
+        SignalDeadline, SignalRequestFrame,
     };
     use crate::control::server::{peer_allowed, read_exact_until};
     use crate::control::{
@@ -292,6 +329,8 @@ mod linux {
             signal: Signal,
         },
         CancelRestart,
+        /// CRI ログの開き直し（kind 10。#4652）。
+        ReopenLog,
         /// exec 用 pidfd の受け渡し（#2626）。応答に fd が添えられる。
         ExecHandover {
             pid: NonZeroU32,
@@ -411,6 +450,38 @@ mod linux {
             Err(e) => return Err(e),
         };
         cancel_outcome(reason)
+    }
+
+    /// CRI ログの開き直しを依頼する（CRI-2・SUP-7・#4652）。結果の写し方は [`super::ControlReopenLog::reopen`] の doc。
+    /// 古い supervisor は kind 10 を `Malformed` で断る。それは「届かない」（`Unavailable`）として扱い、別の手段へは切り替えない。
+    pub(super) fn reopen_log(
+        state_root: &Path,
+        id: &ContainerId,
+        deadline: Instant,
+    ) -> Result<(), TraitError> {
+        let usable = deadline.saturating_duration_since(Instant::now());
+        if usable <= DEADLINE_MARGIN {
+            return Err(timeout());
+        }
+        let reason = exchange(state_root, Request::ReopenLog, id, deadline)?;
+        reopen_log_result(reason)
+    }
+
+    /// 開き直しの応答の理由コードを結果へ写す（純関数。固定文言）。
+    pub(super) fn reopen_log_result(reason: ControlReason) -> Result<(), TraitError> {
+        match reason {
+            ControlReason::Ok => Ok(()),
+            ControlReason::NoHandle
+            | ControlReason::ContainerExited
+            | ControlReason::PidMismatch => Err(TraitError::new(
+                ErrorCode::FailedPrecondition,
+                "container is not running",
+            )),
+            ControlReason::Malformed
+            | ControlReason::TooLarge
+            | ControlReason::UnsupportedVersion => Err(unavailable()),
+            other => Err(other.to_error().unwrap_or_else(unavailable)),
+        }
     }
 
     fn connect_until(path: &Path, deadline: Instant) -> Result<UnixStream, TraitError> {
@@ -545,6 +616,12 @@ mod linux {
             ),
             Request::CancelRestart => stream.write_all(
                 &CancelRestartRequestFrame {
+                    deadline: deadline_frame,
+                }
+                .encode(),
+            ),
+            Request::ReopenLog => stream.write_all(
+                &ReopenLogRequestFrame {
                     deadline: deadline_frame,
                 }
                 .encode(),

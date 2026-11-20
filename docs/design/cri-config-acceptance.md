@@ -14,7 +14,7 @@
 | 6 | stop_signal | core の `StopRequest` に `signal` を足し（PLUG-1 の境界変更）、cri が受け入れる。本変更で実装済み。イメージ config の `StopSignal` と ContainerStatus の報告は #2771 で追加 | core → cri | #2668・#2771 |
 | 7 | mount の propagation（HostToContainer は受け入れ済み。Bidirectional はオーナー判断待ち） | core が `rslave` の bind をホストの slave として載せる（本変更で実装済み）→ cri が HostToContainer を `rslave` へ変換（実装済み）。`rshared`（Bidirectional）は user namespace の中でコンテナからホストへ伝播できないため受けず `UNIMPLEMENTED` のまま。`linux.rootfsPropagation` は使わない。理由と緩和点は `docs/design/mount-propagation.md` | core → cri | #2669 |
 | 8 | sysctls（namespaced のみ） | core の `linux.sysctl` の適用 → cri。IPC 系は本変更で実装済み。`net.*` は保持役があり ipc・network が `POD` の構成（保持役の netns へ join）だけ受け入れる。NODE は `INVALID_ARGUMENT`、保持役なし・ipc の join なし等は `UNIMPLEMENTED` | core → cri | #2670・#4406 |
-| 9 | log_path / log_directory | core / supervisor の CRI ログ形式の書き出し | core・supervisor → cri | #2671（実装済み。下の節。ランチャー経由と ReopenContainerLog は未対応。総量は上限つき） |
+| 9 | log_path / log_directory | core / supervisor の CRI ログ形式の書き出し | core・supervisor → cri | #2671・#4652（実装済み。下の節。ReopenContainerLog は #4652 で受け入れ済み（CRI-2・SUP-7）。ランチャー経由の CRI ログは未対応。総量は上限つき） |
 | 10 | cgroup_parent | core の `linux.cgroupsPath`（#2010 の方針で拒否。再判断が要る。判断材料は [cri-cgroup-parent.md](cri-cgroup-parent.md)。オーナー承認待ちで、それまで `UNIMPLEMENTED`） | core → cri | #2672 |
 | 11 | devices・CDI | core の `linux.devices`（UnappliedField）・gpu の CDI 適用（判断材料は [cri-devices-cdi.md](cri-devices-cdi.md)。gpu の TASK-127・128・129 の完了とオーナー判断まで `UNIMPLEMENTED`。一般デバイスは GPU-9 が検討中） | gpu・core → cri | #2673 |
 | 12 | pod の pid / ipc の共有（join） | core は user＋ipc の path の組だけ受理済み（#2674）。cri は変換と、保持役の pid から `for_holder_pid` で作ったパスを `CreateContainer` が bundle へ渡す配線まで実装済み（#2876。provider を注入した構成で ipc が `POD` のコンテナは保持役の user＋ipc へ join する）。本番（plugin-cri）は Linux・非 root で `ProductionPodHolder` を注入済み（H6・#2877）で、ipc が `POD` のコンテナは保持役へ join する（rootful は注入せず `UNIMPLEMENTED`）。netns のパスは #2878（H8）で実装済み（`PodNamespacePaths::net`）。構築口は #2776 で保持役の pid からの `PodNamespacePaths::for_holder_pid`（`/proc/<pid>/ns/{user,ipc,net}`）に限った。保持役の設計は [pod-namespace-holder.md](pod-namespace-holder.md)（#2838）で、実装は #2870〜#2880（保持役の配線は #2871・#2876・#2877）。pid の共有は未対応（設計は pod-namespace-holder.md の #2903 の節。判断待ちは #4607。uts の共有は #4608〜#4612） | core → cri | #2674・#2776・#2838・#2876 |
@@ -315,14 +315,20 @@ CRI の `log_path`（コンテナ）と `log_directory`（サンドボックス�
 | 両方 | `log_directory` は絶対パス、`log_path` は相対パス。どちらも `.`・`..`・空要素・制御文字を含まない。結合後 4096 バイト以下。`..` を禁じるので結合結果は必ず `log_directory` の配下 |
 
 - `ContainerStatus.log_path` は結合済みの絶対パスを返す（containerd と同じ。kubelet の GetContainerLogs と crictl logs が直接開く）。実行層未接続（スタブ）の経路は従来どおり指定値を無改変で返す
-- 形式は `<RFC3339Nano UTC 固定 9 桁> <stdout|stderr> <F|P> <内容>\n`。1 行は 16 KiB（containerd の `max_container_log_line_size` の既定）ごとに分け、最後を `F`、それ以前を `P` にする。空行は `<ts> stdout F \n`。捕捉側の断片は containerd と同じ規則で書く（64 KiB を超える行も `P` / `F` で残る。LF の無い EOF の末尾は `P`、読み取りエラーの末尾は書かない。総量の上限に達すると `F` の無い `P` で終わりうる。方式は [cri-log-partial-lines.md](cri-log-partial-lines.md)・実装は #4580・#4582）。`@container-logs` は従来どおり 64 KiB で切り詰める（#4581 の判断待ち）
+- 形式は `<RFC3339Nano UTC 固定 9 桁> <stdout|stderr> <F|P> <内容>\n`。1 行は 16 KiB（containerd の `max_container_log_line_size` の既定）ごとに分け、最後を `F`、それ以前を `P` にする。空行は `<ts> stdout F \n`。捕捉側の断片は containerd と同じ規則で書く（64 KiB を超える行も `P` / `F` で残る。LF の無い EOF の末尾は `P`、読み取りエラーの末尾は書かない。総量の上限に達すると `F` の無い `P` で終わりうる。方式は [cri-log-partial-lines.md](cri-log-partial-lines.md)・実装は #4580・#4582）。`@container-logs`（`fandhe logs`）は従来どおり 64 KiB で切り詰める（#4581 の判断: (a) 現状維持。2026-11-13。CRI 経由では kubelet のログで行全体を見られる）
 - `@container-logs`（`fandhe logs`・delete のログ削除の対象）にも従来どおり書く（二重書き）。出力先ごとに失敗状態を持ち、片方（CRI ログ等）が失敗しても正常な側への書き込みは続ける（`Err` を返すのは両方失敗のときだけ）。CRI ログは kubelet の所有物で、`RemoveContainer`・delete は消さない
 - 開き方: 追記・`O_NOFOLLOW`・通常ファイルのみ。`log_directory` は作らない（kubelet が作る）が、標準の `<containerName>/<N>.log` の `containerName/` は、検査済みの祖先の直下に限り 1 階層だけ 0o750 で作る（kubelet は `log_directory` しか作らず、containerd・CRI-O は親を作るため。2 階層以上欠けていれば拒否）。親は絶対パス・`..` なし・root 以外が所有する祖先の symlink なし・group / other 書き込み不可。検査と open の間の差し替え（TOCTOU）は残る既知の制限（`@container-logs` の sink と同じ）
 - 特権ランチャー経由（ambient capability あり）は `UNIMPLEMENTED` で拒否する。`CAP_DAC_OVERRIDE` のまま利用者指定のパスを開くと任意のファイルへ追記できてしまうため（`CapEff` / `CapPrm` が 0 でなければ拒否）。cri は `UNIMPLEMENTED` を確定失敗として created へ戻す
 - 既知の制約: rootless の supervisor は root 所有 0755 の `/var/log/pods` に書けず、標準配置の kubelet では start が失敗する。動くのは rootless の kubelet や、利用者が所有する `log_directory` の場合。`log_directory` に `/tmp`（1777）は使えない（group / other 書き込み可のため拒否）
 - 総量の上限: CRI ログ1本は 50 MiB（`CRI_LOG_MAX_BYTES`。既存サイズも数える）。超えると CRI ログへの書き出しを止め（`RESOURCE_EXHAUSTED`）、`@container-logs` は続ける。出力先ごとの最初の失敗は構造化ログ 1 行（`component=supervisor.logs`・`result=destination_failed`・`destination`・`code`。パス・行の内容は含めない。REPAIR-4）で stderr に出す
 - 書き手は 1 ファイルにつき 1 つ: 上限を書き手ごとに数えるため、開いたファイルに排他ロック（`flock(2)`）を supervisor の生存中保持し、同じ書き先を別の supervisor が開こうとすると start を `FAILED_PRECONDITION` で拒否する（kubelet は `<containerName>/<restartCount>.log` を使い回さない。ロックは協調的で、ロックを取らない別プロセスの追記は防げない）
-- 未対応（後続 issue）: `ReopenContainerLog`（kubelet のログ回転。未実装のため上限到達後は CRI ログが止まる）、ランチャー経由での CRI ログ（open の間だけ DAC 系 capability を落とす等）
+- `ReopenContainerLog`（CRI-2・SUP-7・REPAIR-3・REPAIR-5。#4652）: kubelet が rename した後の呼び出しで、同じパスを開き直す。契約は次のとおり。
+  - 順序: 注入口なし → `UNIMPLEMENTED`、空 ID → `INVALID_ARGUMENT`、記録なし → `NOT_FOUND`、running でない → `FAILED_PRECONDITION`（`container is not running`。新しいログを作らない。cri-api の MUST NOT）、log_path なし → `FAILED_PRECONDITION`。supervisor への期限は 5 秒（REPAIR-5）
+  - 別 inode（rename 済み）なら、旧 writer を flush して新しいファイルへ切り替える。同じ inode なら旧 writer を保つ。新しいファイルは先に開いて検査し、失敗なら既存の書き込み先を変えずエラーにする（親ディレクトリは作らない）
+  - 総量の上限（`CRI_LOG_MAX_BYTES`）の残りは、新しいファイルのサイズから数え直す。上限で止まった CRI ログも開き直しで再開する
+  - 古い supervisor は制御チャネルの kind 10 を拒否するため `UNAVAILABLE`（既存コンテナは作り直すまで reopen できない）
+  - 根拠の一次情報: cri-api v0.37.1 の `api.proto`、kubelet v1.37.1 `container_log_manager.go`、containerd v2.1.0 `container_log_reopen.go`（詳細は [cri-log-partial-lines.md](cri-log-partial-lines.md)「ReopenContainerLog」）
+- 未対応（後続 issue）: ランチャー経由での CRI ログ（open の間だけ DAC 系 capability を落とす等）
 
 ## pod の ipc 共有の受け入れ方式（CRI-2・CORE-3。#2674）
 

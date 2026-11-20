@@ -1,6 +1,6 @@
 # CRI ログの部分行 `P` の方式（CRI-2・SUP-7・REPAIR-3）
 
-issue #4116 の項目 8（2026-11-12 にオーナーが「追跡する: 方式の設計から」と判断）を受けた設計記録（#4574）。実装は #4580・#4582（どちらも実装済み）、`fandhe logs` の扱いの判断は #4581（下の「実装 issue」）。
+issue #4116 の項目 8（2026-11-12 にオーナーが「追跡する: 方式の設計から」と判断）を受けた設計記録（#4574）。実装は #4580・#4582（どちらも実装済み）。`fandhe logs` の扱いは #4581 でオーナーが (a) 現状維持と判断（2026-11-13。下の「実装 issue」）。
 
 ## 目的
 
@@ -50,7 +50,7 @@ kubelet・crictl が読む CRI ログ（`--cri-log-path`）に、次の差があ
 | A1 | 現状維持（切り詰め） | 却下。大きな行がこの実装でだけ失われる |
 | A2 | `MAX_LINE_BYTES` を上げる | 却下。切り詰めは残り、リーダーごとのメモリが増え、`@container-logs` の検証値と `MIN_LOG_FILE_BYTES` にも波及する |
 | **A3** | **捕捉側が「行の断片」を sink へ渡し、断片の扱いは sink ごとに決める** | **採る** |
-| A4 | `@container-logs` にも部分行の印（新しいタグ）を入れる | 却下（この issue の範囲では）。`Scanner`・raw 出力・`--follow`（完全な行だけ出す）・`--tail` の数え方が変わり、旧 CLI は新しいファイルを `Malformed` で読めなくなる。採るかは #4581 の判断に回す |
+| A4 | `@container-logs` にも部分行の印（新しいタグ）を入れる | 却下。`Scanner`・raw 出力・`--follow`（完全な行だけ出す）・`--tail` の数え方が変わり、旧 CLI は新しいファイルを `Malformed` で読めなくなる。#4581 の判断（(a) 現状維持。2026-11-13）で採らない |
 
 A3 の設計:
 
@@ -91,10 +91,12 @@ A3 の設計:
 | LF のない出力が CRI ログに出る閾値 | 64 KiB（`MAX_LINE_BYTES`）に達するまで滞留 | `max_container_log_line_size`（既定 16 KiB）超で `P` を書く（差） |
 | EOF の末尾のタグ | `P` | `P`（同じ） |
 | 読み取りエラーの末尾 | 捨てる（`discard_partial`） | `P` で書く（差） |
-| 総量の上限 | 50 MiB で書き出しを止める（`ReopenContainerLog` が未実装のため）。長い行の途中で達すると `F` の無い `P` で終わる（kubelet は LF なしで表示） | 上限なし（kubelet の回転に任せる） |
+| 総量の上限 | 50 MiB で書き出しを止める。開き直し（`ReopenContainerLog`・#4652）で新しいファイルのサイズから数え直して再開する。長い行の途中で達すると `F` の無い `P` で終わる（kubelet は LF なしで表示） | 上限なし（kubelet の回転に任せる） |
+| 開き直しの途中の部分行 | `P` の途中で開き直すと、新しいファイルは続きの断片から始まる（区切りを保証しない） | 保証しない（同じ） |
+| `ReopenContainerLog` の対象外 | running でないコンテナは `FAILED_PRECONDITION`。新しいファイルを作らない（cri-api の MUST NOT） | 同じ（containerd は not running をエラーにする） |
 | タイムスタンプ | 1 断片に 1 時刻（断片内の複数チャンクは同じ時刻） | レコードごと |
 | `\r\n` | `\r` を残す（現行） | `\r` を落とす（`readLine`） |
-| `fandhe logs`（`@container-logs`） | 64 KiB で切り詰めたまま（#4581 で判断） | 対象外 |
+| `fandhe logs`（`@container-logs`） | 64 KiB で切り詰めたまま（#4581 の判断: (a) 現状維持。2026-11-13）。CRI 経由で行全体を見るには kubelet のログ（`crictl logs` を含む）を使う | 対象外 |
 
 ## セキュリティ・資源の観点（OWASP / SEC）
 
@@ -110,13 +112,22 @@ A3 の設計:
 | ----- | ---- | ---- |
 | #4580（実装済み） | `LogSink::append_part` と `LinePart` を足し、`LineSplitter` が断片を渡す（既定は現行の切り詰め） | なし |
 | #4582（実装済み） | `CriFileSink`・`TeeLogSink` が断片を `P` / `F` で書く。kubelet と同じ規則で連結する解析の試験。関連文書の状況欄を直す | #4580 |
-| #4581 | `fandhe logs` でも 64 KiB 超の行を残すかの判断（オーナー判断・人間担当。(a) 現状維持を推奨） | なし（#4580・#4582 は待たない） |
+| #4581 | `fandhe logs` でも 64 KiB 超の行を残すかの判断。**決定済み: (a) 現状維持（2026-11-13・オーナー判断）**。(b) は採らない | 完了 |
 
 親は #4474（#4581 は #816）。
 
+## ReopenContainerLog との関係（CRI-2・SUP-7・REPAIR-3・REPAIR-5。#4652）
+
+- kubelet がログを回転するとき、rename の後に `ReopenContainerLog` を呼ぶ。supervisor は同じパスを開き直す（制御チャネルの kind 10。`CriFileSink::reopen`）
+- 別 inode（rename 済み）のときだけ切り替える。新しいファイルは先に開いて検査し、失敗なら既存の書き込み先を変えずエラーにする。親ディレクトリは作らない
+- 総量の上限は開き直しのたびに新しいファイルのサイズから数え直す。上限で止まった CRI ログも再開する
+- 部分行 `P` の途中で開き直すと、新しいファイルは続きの断片から始まる（上の「containerd との差・残る差」の表）
+- 古い supervisor は kind 10 を拒否し、plugin-cri は `UNAVAILABLE` を返す（既存コンテナは作り直すまで開き直せない）
+- cri 側の順序と `FAILED_PRECONDITION` の扱いは [cri-config-acceptance.md](cri-config-acceptance.md)「log_path / log_directory の受け入れ方式」
+
 ## 再評価条件
 
-- #4581 で (b)（`@container-logs` にも部分行の印）を採ったとき
+- `fandhe logs` の 64 KiB 切り詰めを見直すとき（#4581 の判断の再評価。(b) の検討を含む）
 - containerd の `redirectLogs` が期限での書き出しや EOF の扱いを変えたとき
-- `ReopenContainerLog` を実装して総量の上限を外すとき
+- 総量の上限（`CRI_LOG_MAX_BYTES`）を外すか、上限の値を変えるとき
 - CRI のコンテナで同じ書き先への再 launch が起きるようになったとき（論点 D）

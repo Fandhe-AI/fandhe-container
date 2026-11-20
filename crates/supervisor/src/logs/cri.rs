@@ -249,6 +249,7 @@ pub struct CriFileSink {
     #[cfg_attr(not(all(test, unix)), allow(dead_code))]
     notices: std::sync::atomic::AtomicU64,
     #[cfg(test)]
+    #[cfg_attr(not(unix), allow(dead_code))]
     faults: Faults,
 }
 
@@ -259,6 +260,7 @@ type Hook = Mutex<Option<Box<dyn Fn(&std::path::Path) + Send>>>;
 /// 試験用の故障注入（`cfg(test)` のみ）。
 #[cfg(test)]
 #[derive(Default)]
+#[cfg_attr(not(unix), allow(dead_code))]
 struct Faults {
     /// 真なら次の書き込みを失敗させる。
     write: std::sync::atomic::AtomicBool,

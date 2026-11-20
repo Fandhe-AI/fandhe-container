@@ -211,7 +211,7 @@ pub enum AuditWriteErrorKind {
     /// [`Self::IsolationForkAgain`]）。
     /// 期限を保証できないため主経路は試行せず、代替経路へ進む（fail-closed。`FileAuditSink`）。
     IsolationUnavailable,
-    /// 主経路を隔離する子の fork が `EAGAIN`（プロセス数・スレッド数等の資源上限）で失敗した。
+    /// 主経路を隔離する子の fork が `EAGAIN`（多くは資源上限だが、原因は errno からは断定しない）で失敗した。
     /// 代替経路へ進む。それ以外の fork 失敗を含む `IsolationUnavailable` と見分ける（#4702・SEC-4）。
     IsolationForkAgain,
     /// 主経路を隔離した子プロセスが、継承した fd（3 以上）を閉じられなかった（`close_range(2)` が無い Linux 5.11
@@ -332,7 +332,7 @@ impl AuditWriteError {
                 "audit log write could not be isolated in a bounded child process"
             }
             AuditWriteErrorKind::IsolationForkAgain => {
-                "could not fork the isolation child: process limit reached (EAGAIN)"
+                "could not fork the isolation child; the kernel refused the fork as temporarily unavailable"
             }
             AuditWriteErrorKind::IsolationFdsNotClosed => {
                 "isolated audit log writer could not close inherited file descriptors"

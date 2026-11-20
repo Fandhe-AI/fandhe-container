@@ -55,7 +55,7 @@
 //!   返した子（回収済み）へは送らない（pid 再利用対策。CORE-1）
 //! - 子は `fork_single_threaded` で作る。呼び出しプロセスが複数スレッドだと fork できないため、その場合は
 //!   主経路を試行せず `isolation_unavailable` で代替経路へ進む（期限を保証できない I/O を呼び出しスレッドで
-//!   実行しない。fail-closed）。fork が `EAGAIN`（資源上限）で失敗した場合だけ `isolation_fork_again`、
+//!   実行しない。fail-closed）。fork が `EAGAIN`（多くは資源上限）で失敗した場合だけ `isolation_fork_again`、
 //!   それ以外の fork 失敗は `isolation_unavailable`（#4702）。supervisor の exec は単一スレッドのプロセスから呼ぶ契約
 //! - 1 回の `record` の待ち時間の上限は [`RECORD_WAIT_LIMIT`]（主経路・代替経路・失敗通知の上限の合算。
 //!   定期 exec〔healthcheck。TASK-161〕へ配線するときは、この値を呼び出し側の期限の積み上げに含める）
@@ -192,7 +192,7 @@ enum IsolatedOutcome {
     TimedOut,
     /// 呼び出しプロセスが複数スレッドで fork できない。
     MultiThreaded,
-    /// fork が `EAGAIN`（資源上限）で失敗した（#4702。`isolation_fork_again`）。
+    /// fork が `EAGAIN`（多くは資源上限）で失敗した（#4702。`isolation_fork_again`）。
     ForkAgain,
     /// fork・待機に失敗した、子がシグナルで死んだ・結果を残さず自動回収された（非対応 OS を含む）。
     Failed,
@@ -558,7 +558,7 @@ fn run_isolated_until(
     settle(&rx, IsolatedOutcome::TimedOut)
 }
 
-/// fork の失敗を結果へ写す。`EAGAIN`（資源上限）だけ [`IsolatedOutcome::ForkAgain`]、他は `Failed`
+/// fork の失敗を結果へ写す。`EAGAIN`（多くは資源上限）だけ [`IsolatedOutcome::ForkAgain`]、他は `Failed`
 /// （#4702・SEC-4。どちらも代替経路へ進む）。
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn fork_error_outcome(e: &sys::SysError) -> IsolatedOutcome {

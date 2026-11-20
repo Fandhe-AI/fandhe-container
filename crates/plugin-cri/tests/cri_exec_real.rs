@@ -1947,7 +1947,7 @@ async fn pid_target_stage(
 
 /// 段 L（#4652）の成功行 3 行（`check-success-lines.sh` が試験ソースから導出して照合する）。
 const LOG_REOPEN_OK_SWITCH: &str = "production_binary_exec_real: log-reopen ok: after ReopenContainerLog the renamed file stopped growing and the original path got a new file";
-const LOG_REOPEN_OK_CONTINUES: &str = "production_binary_exec_real: log-reopen ok: the new file holds CRI lines whose numbers continue after the renamed file";
+const LOG_REOPEN_OK_CONTINUES: &str = "production_binary_exec_real: log-reopen ok: the new file holds CRI lines whose numbers continue right after the renamed file";
 const LOG_REOPEN_OK_STOPPED: &str = "production_binary_exec_real: log-reopen ok: ReopenContainerLog on a stopped container is FAILED_PRECONDITION and creates no file";
 
 /// 段 L の出力コマンド。番号つきの固定行を 0.2 秒おきに出し続ける。
@@ -2095,9 +2095,12 @@ async fn log_reopen_stage(
     );
     let _ = writeln_stderr(LOG_REOPEN_OK_SWITCH);
     let last_old = *old_nums.last().expect("old lines");
-    assert!(
-        new_nums[0] > last_old,
-        "new file must continue after the renamed file: old_last={last_old} new={new_nums:?}"
+    // 切り替えの境界でも欠落・重複が無いこと（SUP-7・TASK-164 の「ローテーション下で欠落・重複 0 行」）。同じ捕捉
+    // スレッドが順に書くため、新しいファイルの先頭は旧ファイルの末尾のちょうど次の番号になる。
+    assert_eq!(
+        new_nums[0],
+        last_old + 1,
+        "new file must start right after the renamed file: old_last={last_old} new={new_nums:?}"
     );
     assert!(
         new_nums.windows(2).all(|w| w[1] == w[0] + 1),

@@ -68,7 +68,7 @@ use crate::sys;
 use crate::traits::{ErrorCode, TraitError};
 
 const MSG_MULTI_THREADED: &str = "the pod holder must be called from a single-threaded process";
-const MSG_ROOTFUL: &str = "the rootful privilege model is permanently refused by policy (SEC-5)";
+const MSG_ROOTFUL: &str = super::ROOTFUL_REFUSED_MESSAGE;
 const MSG_MAP_MISMATCH: &str = "the pod holder id mapping does not match the expected mapping";
 const MSG_NOT_OWNED: &str = "the pod holder namespaces are not owned by the pod user namespace";
 const MSG_NOT_NEW: &str = "the pod holder user namespace was not created";

@@ -2593,7 +2593,7 @@ mod linux {
         if [uid.real, uid.effective, uid.saved, uid.fs].contains(&0) {
             return Err(TraitError::new(
                 ErrorCode::PermissionDenied,
-                "the rootful privilege model is permanently refused by policy (SEC-5)",
+                fandhe_container_core::oci_runtime::ROOTFUL_REFUSED_MESSAGE,
             ));
         }
         Ok(IsolationPrivilege::RootlessSingleId)

@@ -512,7 +512,7 @@ fn privilege_gate(status_text: Option<&str>) -> Result<u32, OciRuntimeError> {
         Some(Identity::Rootless { euid }) => Ok(euid),
         Some(Identity::Rootful) => Err(start_error(
             ErrorCode::PermissionDenied,
-            "the rootful privilege model is permanently refused by policy (SEC-5)",
+            fandhe_container_core::oci_runtime::ROOTFUL_REFUSED_MESSAGE,
         )),
         Some(Identity::Unreadable) | None => Err(start_error(
             ErrorCode::FailedPrecondition,

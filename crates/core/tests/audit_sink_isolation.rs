@@ -18,6 +18,8 @@
 //!   書き込みを始めた後に詰まった子は出し直さない（上の「通知先も止まる」）
 //! - 通知の子が行の途中で書き込みに失敗すると、出し直しは改行を 1 つ付けてから 1 行を出す（断片と連結しない）
 //! - 複数スレッドのプロセス: fork できないため主経路は試行せず `isolation_unavailable` で代替経路へ進む
+//! - 主経路の fork が `EAGAIN`（`prlimit --nproc=1` で自分自身を再起動して実 fork を失敗させる。Linux・非 root のみ）:
+//!   代替経路へ進み、その主経路の失敗種別が `isolation_fork_again`（`UNAVAILABLE`）になる（#4702）
 //! - `SIGCHLD` が `SIG_IGN`（子が自動回収され `waitpid` が `ECHILD`）: 主経路の成功を失敗と取り違えず代替経路へ
 //!   二重に記録しない。失敗種別・時間切れ・通知も同じく届く（最後に実行し、終わったら `SIG_DFL` に戻す）
 //!
@@ -52,6 +54,10 @@ fn main() {
 ))]
 #[path = "support/scratch_root.rs"]
 mod scratch_root;
+
+#[cfg(all(target_os = "linux", feature = "exec-test-support"))]
+#[path = "support/reap.rs"]
+mod reap;
 
 #[cfg(all(
     any(target_os = "linux", target_os = "macos"),
@@ -325,7 +331,16 @@ mod imp {
             .join(tag)
     }
 
+    /// `prlimit` 配下で再起動された子の入口の引数（`fork_again_is_reported_as_isolation_fork_again` が渡す）。
+    #[cfg(target_os = "linux")]
+    const FORK_AGAIN_CHILD_ARG: &str = "--fork-again-child";
+
     pub(super) fn run() {
+        #[cfg(target_os = "linux")]
+        if std::env::args().nth(1).as_deref() == Some(FORK_AGAIN_CHILD_ARG) {
+            fork_again_child();
+            return;
+        }
         assert_eq!(threads(), 1, "the test binary must start single-threaded");
         let scratch =
             super::scratch_root::ScratchDir::new("fandhe-audit-isolation", Duration::from_secs(10));
@@ -345,6 +360,7 @@ mod imp {
         multi_threaded_process_skips_the_primary();
         #[cfg(target_os = "linux")]
         {
+            fork_again_is_reported_as_isolation_fork_again();
             control_relay_persists_from_a_multi_threaded_process();
             control_relay_keeps_exit_signal_records_from_many_threads();
             control_relay_persists_exec_target_from_a_multi_threaded_process();
@@ -534,6 +550,84 @@ mod imp {
             assert_eq!(threads(), 1, "round {round}");
             assert_eq!(seen.lock().unwrap().len(), round);
         }
+    }
+
+    /// 実 uid（`/proc/self/status` の `Uid:` 行の先頭）。
+    #[cfg(target_os = "linux")]
+    fn real_uid() -> u32 {
+        std::fs::read_to_string("/proc/self/status")
+            .unwrap()
+            .lines()
+            .find_map(|l| l.strip_prefix("Uid:"))
+            .and_then(|v| v.split_whitespace().next()?.parse().ok())
+            .unwrap()
+    }
+
+    /// SEC-4・REPAIR-12・#4702: 実 fork が `EAGAIN` で失敗したとき、`FileAuditSink` は主経路の失敗種別を
+    /// `isolation_fork_again` として代替経路へ渡す（汎用の `isolation_unavailable` へ畳まない）。
+    /// `RLIMIT_NPROC` を `prlimit --nproc=1` で下げた自分自身を子として起動する（試験コードに unsafe を持ち込まない）。
+    /// 上限は同じ uid の全プロセス数で数えるため、親（本プロセス）が居る限り子の fork は `EAGAIN` になる。
+    /// root・`CAP_SYS_RESOURCE` 持ちには効かないため、root では適用外を明示して飛ばす（CI は非 root）。
+    #[cfg(target_os = "linux")]
+    fn fork_again_is_reported_as_isolation_fork_again() {
+        if real_uid() == 0 {
+            println!(
+                "audit_sink_isolation: fork_again not applicable as root (RLIMIT_NPROC is not enforced)"
+            );
+            return;
+        }
+        let prlimit = Path::new("/usr/bin/prlimit");
+        assert!(
+            prlimit.exists(),
+            "/usr/bin/prlimit is required (util-linux)"
+        );
+        // 出力は 1 行で pipe を満たさないため、期限つきの `wait_within` の後に読む（`output_within` の
+        // プロセスグループ kill は、空のグループへの `kill` の失敗が間欠的に Err になるため使わない）。
+        let mut child = std::process::Command::new(prlimit)
+            .arg("--nproc=1")
+            .arg(std::env::current_exe().unwrap())
+            .arg(FORK_AGAIN_CHILD_ARG)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let status = match super::reap::wait_within(&mut child, Duration::from_secs(30)) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = super::reap::reap(&mut child, super::reap::reap_within());
+                panic!("fork_again child did not finish: {e}");
+            }
+        };
+        let (mut stdout, mut stderr) = (String::new(), String::new());
+        std::io::Read::read_to_string(&mut child.stdout.take().unwrap(), &mut stdout).unwrap();
+        std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
+        assert!(
+            status.success(),
+            "child failed: {status:?}, stdout={stdout}, stderr={stderr}"
+        );
+        assert_eq!(
+            stdout.trim_end(),
+            "fork_again child: primary=[IsolationForkAgain] code=Internal"
+        );
+        println!("audit_sink_isolation: fork_again reaches the fallback as isolation_fork_again");
+    }
+
+    /// `prlimit --nproc=1` 配下の子の本体。fork が `EAGAIN` になる状況で両経路を失敗させ、代替経路が見た
+    /// 主経路の失敗種別を 1 行で標準出力へ出す（親が照合する）。通知の子・スレッドも作れず通知 1 行は出ない。
+    #[cfg(target_os = "linux")]
+    fn fork_again_child() {
+        let primary: Primary = Arc::new(|path, _| {
+            std::fs::write(path, b"must-not-run").map_err(|_| unreachable_err())
+        });
+        let marker = std::env::temp_dir().join(format!("fandhe-fork-again-{}", std::process::id()));
+        let (sink, seen) = sink(primary, false, Notify::Discard, marker.clone());
+        let e = sink.record(&record()).unwrap_err();
+        assert!(!marker.exists(), "the primary must not run");
+        println!(
+            "fork_again child: primary={:?} code={:?}",
+            *seen.lock().unwrap(),
+            e.code()
+        );
     }
 
     /// REPAIR-5・TASK-163: 複数スレッドのプロセスでは fork できず、主経路を試行せず代替経路へ進む。

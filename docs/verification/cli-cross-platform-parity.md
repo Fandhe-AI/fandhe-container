@@ -161,7 +161,7 @@ B 層は上から順に実行し、状態遷移を直後の `list` で観測す�
 | B27 | `kill c1`（B26 の直後。created で pid なし。シグナル省略） | 5 / `FAILED_PRECONDITION` / `-`（pid の記録が無い） | | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`。値は Linux と同じだが、pid が無い判定ではなくバックエンド解決の失敗で、parity の合格を意味しない。#1904 で追加 |
 | B28 | `kill c1 KILL`（B27 の直後。シグナル指定） | 5 / `FAILED_PRECONDITION` / `-`（pid の記録が無い） | | 前提未達 | 前提未達 | | B27 と同じ（偶然の一致で、合格を意味しない）。kill は失敗するため状態は変わらず、B04 以降は従来どおり。#1904 で追加 |
 | B04 | `create`（c1 重複） | 4 / `ALREADY_EXISTS` / `-` | 4 / `ALREADY_EXISTS` / `-` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
-| B05 | `start c1` | 5 / `FAILED_PRECONDITION` / `-`（supervisor が CLI の隣に無い場合。uid 0 は 8 / `UNIMPLEMENTED`。c1 の rootfs は空のため supervisor があっても起動に失敗する。環境で変わる参考値） | 8 / `UNIMPLEMENTED` / `-`（#2048 より前の実測。参考期待値は #2891 で更新） | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
+| B05 | `start c1` | 5 / `FAILED_PRECONDITION` / `-`（supervisor が CLI の隣に無い場合。uid 0 は 6 / `PERMISSION_DENIED`（#4709）。c1 の rootfs は空のため supervisor があっても起動に失敗する。環境で変わる参考値） | 8 / `UNIMPLEMENTED` / `-`（#2048 より前の実測。参考期待値は #2891 で更新） | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
 | B06 | `list`（start 後） | 0 / `-` / `list:H;c1,created,-` | 0 / `-` / `list:H;c1,created,-` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
 | B07 | `logs c1` | 0 / `-` / `-`（ログ無しは成功。#1543） | 0 / `-` / `-` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
 | B08 | `stop c1` | 5 / `FAILED_PRECONDITION` / `-`（未起動） | 5 / `FAILED_PRECONDITION` / `-` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない）。値は Linux と同じだが、未起動の判定ではなくバックエンド解決の失敗 |
@@ -177,7 +177,7 @@ B 層は上から順に実行し、状態遷移を直後の `list` で観測す�
 | B30 | `kill nonexist` | 3 / `NOT_FOUND` / `-` | | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない）。#1904 で追加 |
 | B18 | `create --read-only --cap-drop NET_RAW --bundle <起動用 bundle> c2` | 0 / `-` / `-` | | 前提未達 | 前提未達 | | 起動用 bundle は長寿命の `sleep` を動かす config を持つ（#2891） |
 | B19 | `inspect c2`（create 直後） | 0 / `-` / `inspect:c2,created,pid=-,exit=-,rev=<実装の値>,cg=-,sup=-,health=-,rst=0,audit=-,idmap=-,stop=not_recorded,caps=-,ro=-,exited=-` | | 前提未達 | 前提未達 | | capabilities・rootReadonly は launcher が適用した値の記録で、create だけでは `caps=-`・`ro=-`（start 前は null）であることを固定する |
-| B20 | `start c2` | 0 / `-` / `-`（前提が揃った場合。揃わなければ 5 / `FAILED_PRECONDITION`、uid 0 は 8 / `UNIMPLEMENTED`） | | 前提未達 | 前提未達 | | 環境で変わる値。B21・B23 の前提 |
+| B20 | `start c2` | 0 / `-` / `-`（前提が揃った場合。揃わなければ 5 / `FAILED_PRECONDITION`、uid 0 は 6 / `PERMISSION_DENIED`（#4709）） | | 前提未達 | 前提未達 | | 環境で変わる値。B21・B23 の前提 |
 | B21 | `inspect c2`（start 後。種別 `s`） | 0 / `-` / `started:c2,running,pid=<pid>,sup=<pid>,cg=<set>,health=-,audit=<set>,idmap=<set>,stop=not_recorded,caps=13,ro=true,exited=-` | | 前提未達 | 前提未達 | | start が成功しなかったときは `<start-failed>`（compare は `NOT_STARTED`）。`caps=13` は OCI 既定 14 件から NET_RAW を引いた件数 |
 | B31 | `state c2`（B21 の直後。running。種別 `p`） | 0 / `-` / `state:c2,running,ver=1.3.0,keys=ociVersion+id+status+pid+bundle+annotations,ann=-` | | 前提未達 | 前提未達 | | start が成功しなかったときは `<start-failed>`（compare は `NOT_STARTED`）。#3098 で追加 |
 | B32 | `kill c2 TERM`（実行中への送出） | 0 / `-` / `-` | | 前提未達 | 前提未達 | | start が失敗した環境では 5 / `FAILED_PRECONDITION`。非 Linux の 5 は plugin 解決の失敗で、合格を意味しない。#3098 で追加 |

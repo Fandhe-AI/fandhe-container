@@ -2809,6 +2809,8 @@ mod tests {
             cfg["linux"]["gidMappings"] = gid;
             let err = start_rejected_after_rewrite(&format!("idmap-{name}"), &cfg);
             assert_eq!(err.code(), ErrorCode::InvalidArgument, "case {name}");
+            // 終了コードは InvalidArgument の値 2（ERR-2。旧 Unimplemented は 8）。
+            assert_eq!(err.exit_code().get(), 2, "case {name}");
             assert_eq!(
                 err.message(),
                 "linux.uidMappings / linux.gidMappings are not accepted: ID mappings are derived from the runtime privilege model (SEC-5)",

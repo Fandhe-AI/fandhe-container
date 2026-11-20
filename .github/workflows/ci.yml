@@ -2729,7 +2729,7 @@ jobs:
           scripts/check-success-lines.sh --name start_stop_delete_real \
             --src crates/cli/tests/start_stop_delete_real.rs \
             --log "${log}" --select '^start_stop_delete_real: (create |state |kill |scenario ok |cli start )' \
-            --subst-re scope_present='(true|false)' --min 8 \
+            --subst-re scope_present='(true|false)' --min 9 \
             --forbid 'start_stop_delete_real: skipped' --forbid 'start_stop_delete_real: FAILED' \
             --forbid 'PRECONDITION FAILED' --forbid 'not applicable' --summary
 

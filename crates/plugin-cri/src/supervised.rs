@@ -219,7 +219,13 @@ impl SupervisorStarter for StatusInjectedStarter {
         start_checked(
             &self.exe,
             current_euid,
-            |exe| SupervisorLaunch::resolve_beside_with_status(exe, || Some(self.status.clone())),
+            |exe| {
+                SupervisorLaunch::resolve_beside_with_status(
+                    exe,
+                    fandhe_container_supervisor::start_client::locate_systemd_run,
+                    || Some(self.status.clone()),
+                )
+            },
             |launch| start_with_options(launch, root, opts, id, production_deadline()),
         )
     }

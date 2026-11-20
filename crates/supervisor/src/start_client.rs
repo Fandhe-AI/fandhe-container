@@ -643,13 +643,15 @@ impl SupervisorLaunch {
     }
 
     /// [`Self::resolve_beside`] の `/proc/self/status` の読み取りだけを差し替えられる版（試験専用 feature `start-status-test-support`。
-    /// rootful 拒否（SEC-5・#4709）の経路を非 root で通すため。systemd-run の解決は本番と同じ）。
+    /// rootful 拒否（SEC-5・#4709）の経路を非 root で通すため。systemd-run の解決も差し替えられる
+    /// （CLI の試験専用 feature `start-test-support` と同じ入口を渡す）。
     #[cfg(feature = "start-status-test-support")]
     pub fn resolve_beside_with_status(
         exe: &Path,
+        locate: impl FnOnce(u32) -> Result<PathBuf, OciRuntimeError>,
         read_status: impl FnOnce() -> Option<String>,
     ) -> Result<Self, OciRuntimeError> {
-        Self::resolve_with_status(exe, locate_systemd_run, read_status)
+        Self::resolve_with_status(exe, locate, read_status)
     }
 
     fn resolve_with_status(

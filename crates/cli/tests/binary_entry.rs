@@ -1340,14 +1340,57 @@ fn sec5_4709_start_rootful_status_is_permission_denied_with_exit_6() {
         assert_eq!(facts[0].str_of("code"), Some("PERMISSION_DENIED"), "{uid}");
     }
 
-    // 対照: uid が全部非 0 なら拒否の段を通り過ぎ、別の段で失敗する（systemd-run の解決は本番と同じで環境次第のため code だけ見る）。
-    write_status("1000\t1000\t1000\t1000");
-    let out = scope.run(&cli, &args, &env);
-    assert_ne!(out.status.code(), Some(6), "{:?}", out.stderr);
+    // 注入ファイルが上限超過・通常ファイルでない（ディレクトリ）なら、読めない扱いで FAILED_PRECONDITION（5）の固定文言になる。
+    let dir_input = tmp.0.join("status-dir");
+    std::fs::create_dir(&dir_input).expect("mkdir");
+    for bad in [&dir_input, &status_file] {
+        if bad == &status_file {
+            std::fs::write(bad, vec![b'x'; 64 * 1024 + 1]).expect("write oversize");
+        }
+        let out = scope.run(
+            &cli,
+            &args,
+            &[("FANDHE_CONTAINER_TEST_PROC_STATUS_FILE", bad.as_os_str())],
+        );
+        assert_eq!(out.status.code(), Some(5), "{bad:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            code_json(
+                "start",
+                "FAILED_PRECONDITION",
+                "process status is unreadable"
+            ),
+            "{bad:?}"
+        );
+    }
+
+    // 対照: 注入の uid を試験プロセス自身の実 uid（偽 user マネージャのソケットの実の所有者と一致。非 0）にすると、
+    // 拒否の段を通り過ぎて偽 systemd-run 経由で偽 supervisor の起動まで届き、終了コード 0・stderr 空で成功する。
+    let own = std::fs::read_to_string("/proc/self/status").expect("read own status");
+    let own_uid = own
+        .lines()
+        .find_map(|l| l.strip_prefix("Uid:\t"))
+        .expect("Uid line")
+        .to_owned();
     assert!(
-        !String::from_utf8_lossy(&out.stderr).contains("permanently refused"),
+        !own_uid.split('\t').any(|u| u == "0"),
+        "run as non-root: {own_uid}"
+    );
+    write_status(&own_uid);
+    let out = scope.run(&cli, &args, &env);
+    assert_eq!(out.status.code(), Some(0), "{:?}", out.stderr);
+    assert!(out.stdout.is_empty());
+    assert!(
+        out.stderr.is_empty(),
         "{:?}",
         String::from_utf8_lossy(&out.stderr)
+    );
+    // 偽 systemd-run が呼ばれ、包んだ先が隣の偽 supervisor だった（起動まで届いた証跡）。
+    let argv = std::fs::read_to_string(dir.join("wrapper.argv")).expect("wrapper.argv recorded");
+    assert!(
+        argv.lines()
+            .any(|l| l.ends_with("fandhe-container-supervisor")),
+        "{argv}"
     );
     let _ = std::fs::remove_dir_all(dir);
 }

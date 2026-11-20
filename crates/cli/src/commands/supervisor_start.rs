@@ -83,9 +83,100 @@ const TEST_PROC_STATUS_FILE_ENV: &str = "FANDHE_CONTAINER_TEST_PROC_STATUS_FILE"
 fn resolve_launch(cli_exe: &Path) -> Result<SupervisorLaunch, OciRuntimeError> {
     #[cfg(feature = "start-status-test-support")]
     if let Some(p) = std::env::var_os(TEST_PROC_STATUS_FILE_ENV) {
-        return SupervisorLaunch::resolve_beside_with_status(cli_exe, || {
-            std::fs::read_to_string(p).ok()
+        return SupervisorLaunch::resolve_beside_with_status(cli_exe, locate, || {
+            status_with_injection(Path::new(&p))
         });
     }
     SupervisorLaunch::resolve_beside_with(cli_exe, locate)
+}
+
+/// 試験専用: 権限検査へ渡す status の本文を決める（SEC-5・#4709）。
+///
+/// 先に実プロセスの `/proc/self/status` を見る。実際の uid に 0 が含まれる・読めない・壊れているときは、その実の本文を
+/// そのまま返し、通常経路と同じ拒否（PERMISSION_DENIED / FAILED_PRECONDITION）になる。実の uid が全部非 0 のときだけ
+/// 注入ファイルの内容を返す（注入は拒否を足すだけで、実の拒否を外せない）。注入ファイルは通常ファイルだけを
+/// `O_NOFOLLOW|O_NONBLOCK` で開き、実の読み取りと同じ上限（`MAX_STATUS_BYTES`）を超えたら読めない扱い（`None`）にする。
+#[cfg(feature = "start-status-test-support")]
+fn status_with_injection(injected: &Path) -> Option<String> {
+    prefer_real_status(crate::user_scope::read_self_status(), || {
+        read_injected_status(injected)
+    })
+}
+
+/// 実の status を先に見る（SEC-5・#4709）。実の uid に 0 がある・読めない・壊れているときは実の本文（または `None`）を
+/// そのまま返し、注入は読まない（通常経路と同じ拒否・失敗になる）。実が rootless のときだけ注入の内容を返す。
+/// 注入は拒否を足す用途に限り、実の拒否を外せない。
+#[cfg(feature = "start-status-test-support")]
+fn prefer_real_status(
+    real: Option<String>,
+    injected: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    let real_ok = matches!(
+        real.as_deref().map(crate::user_scope::identity_from_status),
+        Some(crate::user_scope::Identity::Rootless { .. })
+    );
+    if !real_ok {
+        return real;
+    }
+    injected()
+}
+
+/// 注入ファイルを通常ファイルに限って上限つきで読む（O_NOFOLLOW|O_NONBLOCK・`MAX_STATUS_BYTES`）。
+#[cfg(feature = "start-status-test-support")]
+fn read_injected_status(injected: &Path) -> Option<String> {
+    use fandhe_container_supervisor::privilege::MAX_STATUS_BYTES;
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let flags = fandhe_container_core::open_flags::NofollowOpenFlags::current()?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(flags.file_nofollow_nonblock())
+        .open(injected)
+        .ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut text = String::new();
+    file.take(MAX_STATUS_BYTES as u64 + 1)
+        .read_to_string(&mut text)
+        .ok()?;
+    (text.len() <= MAX_STATUS_BYTES).then_some(text)
+}
+
+#[cfg(all(test, feature = "start-status-test-support"))]
+mod status_injection_tests {
+    use super::prefer_real_status;
+
+    fn status(uid: &str) -> String {
+        format!(
+            "Name:\tx\nUid:\t{uid}\nGid:\t1000\t1000\t1000\t1000\nGroups:\t\nNoNewPrivs:\t0\nCapInh:\t0000000000000000\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\nCapBnd:\t000001ffffffffff\nCapAmb:\t0000000000000000\n"
+        )
+    }
+
+    /// SEC-5・REPAIR-12・#4709: 実の uid に 0 がある・読めないときは注入を読まず実の本文（`None`）を返す。
+    /// 実が rootless のときだけ注入の内容を使う（注入で実の rootful の拒否を外せない）。
+    #[test]
+    fn sec5_4709_real_rootful_or_unreadable_status_wins_over_injection() {
+        for real_uid in [
+            "0\t0\t0\t0",
+            "0\t1000\t1000\t1000",
+            "1000\t0\t1000\t1000",
+            "1000\t1000\t0\t1000",
+            "1000\t1000\t1000\t0",
+        ] {
+            let real = status(real_uid);
+            let got = prefer_real_status(Some(real.clone()), || {
+                panic!("the injection must not be read when the real uid {real_uid} has 0")
+            });
+            assert_eq!(got.as_deref(), Some(real.as_str()));
+        }
+        let got = prefer_real_status(None, || panic!("must not read the injection"));
+        assert_eq!(got, None);
+        let injected = status("0\t0\t0\t0");
+        let got = prefer_real_status(Some(status("1000\t1000\t1000\t1000")), || {
+            Some(injected.clone())
+        });
+        assert_eq!(got.as_deref(), Some(injected.as_str()));
+    }
 }

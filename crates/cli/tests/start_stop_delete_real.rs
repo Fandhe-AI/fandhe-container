@@ -129,6 +129,16 @@ mod minimal_rootfs;
         any(target_arch = "x86_64", target_arch = "aarch64")
     )
 ))]
+#[path = "../../plugin/tests/support/json_lines_contract.rs"]
+mod json_lines_contract;
+
+#[cfg(all(
+    target_os = "linux",
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 #[path = "support/precondition.rs"]
 mod precondition;
 
@@ -1406,39 +1416,31 @@ mod linux {
         Ok(())
     }
 
-    /// 構造化エラー 1 行の `message` を取り出す（エスケープを含む値は試験側で再実装せず失敗にする）。
+    /// stderr がちょうど 1 行で、その全体が JSON オブジェクトとして読めることを共有検査器で確かめ、
+    /// トップレベルの `op`・`code`・`message` を返す（入れ子・壊れた JSON・複数行は拒否。ERR-1・ERR-4・REPAIR-12）。
+    fn error_fields(stderr: &str) -> Result<(String, String, String), String> {
+        let facts = super::json_lines_contract::check_stream(
+            stderr.as_bytes(),
+            super::json_lines_contract::SHARED_MAX_LOG_LINE_BYTES,
+        )
+        .map_err(|v| format!("stderr is not one JSON object line ({v:?}): {stderr:?}"))?;
+        let [f] = facts.as_slice() else {
+            return Err(format!("stderr is not exactly one line: {stderr:?}"));
+        };
+        let get = |k: &str| {
+            f.str_of(k)
+                .map(str::to_string)
+                .ok_or_else(|| format!("no top-level string {k} in {stderr:?}"))
+        };
+        Ok((get("op")?, get("code")?, get("message")?))
+    }
+
     fn error_message(stderr: &str) -> Result<String, String> {
-        let pat = "\"message\":\"";
-        let start = stderr
-            .find(pat)
-            .ok_or_else(|| format!("no message in {stderr:?}"))?
-            + pat.len();
-        let rest = stderr.get(start..).ok_or("bad offset")?;
-        let len = rest
-            .find('"')
-            .ok_or_else(|| format!("unterminated message in {stderr:?}"))?;
-        let m = rest.get(..len).ok_or("bad slice")?;
-        expect(!m.contains('\\'), "message contains an escape")?;
-        Ok(m.to_string())
+        error_fields(stderr).map(|(_, _, m)| m)
     }
 
     fn op_and_code(stderr: &str) -> Result<(String, String), String> {
-        if !stderr.ends_with('\n') || stderr.matches('\n').count() != 1 {
-            return Err(format!("stderr is not exactly one line: {stderr:?}"));
-        }
-        let field = |key: &str| -> Result<String, String> {
-            let pat = format!("\"{key}\":\"");
-            let start = stderr
-                .find(&pat)
-                .ok_or_else(|| format!("no {key} in {stderr:?}"))?
-                + pat.len();
-            let rest = stderr.get(start..).ok_or("bad offset")?;
-            let len = rest
-                .find('"')
-                .ok_or_else(|| format!("unterminated {key} in {stderr:?}"))?;
-            Ok(rest.get(..len).ok_or("bad slice")?.to_string())
-        };
-        Ok((field("op")?, field("code")?))
+        error_fields(stderr).map(|(o, c, _)| (o, c))
     }
 
     /// 実効 UID を `/proc/self/status` から読む（`unsafe` の syscall を使わないため）。

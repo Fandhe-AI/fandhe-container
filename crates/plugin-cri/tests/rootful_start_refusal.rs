@@ -5,6 +5,9 @@
 
 #![cfg(all(target_os = "linux", feature = "rootful-test-support"))]
 
+#[path = "../../net/tests/support/exclusive_dir.rs"]
+mod exclusive_dir;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -69,8 +72,8 @@ fn status(uid: &str) -> String {
 #[test]
 fn sec5_supervised_start_rootful_is_permission_denied() {
     // 検査（supervisor の実在）が権限検査より前にあるため、偽の supervisor（空ファイル）を隣に置く。
-    let dir = std::env::temp_dir().join(format!("fandhe-cri-4709-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("mkdir");
+    let dir =
+        exclusive_dir::create_in(&std::env::temp_dir(), "fc-cri-rootful-4709").expect("tmp dir");
     std::fs::write(dir.join(SUPERVISOR_FILE_NAME), b"").expect("fake supervisor");
     let store = RootOnly(PathBuf::from("/nonexistent/root"));
     let id = ContainerId::new("c1").expect("id");

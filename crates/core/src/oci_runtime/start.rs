@@ -1573,7 +1573,7 @@ fn is_same_or_ancestor(candidate: &str, target: &str) -> bool {
 /// `start` の fork・予約より前に呼ばれる。ID 写像は launcher が権限モデルから導く（`RootlessSingleId` は
 /// 呼び出し側の euid / egid の単一写像、`RootlessSubordinateIds` は `/etc/subuid`・`/etc/subgid` の範囲写像）ため、
 /// config 指定を受けると SEC-5（コンテナ内 root をホストの非特権 UID へ写す）の契約を迂回しうる。
-/// 拒否の維持は #2240 で決定済み（2026-11-13・案 A。SEC-5・CORE-6・TASK-40。
+/// 拒否の維持は #2240 で決定済み（2026-11-13・案 A。SEC-5・CORE-6・TASK-40・MS-2。
 /// `docs/design/config-id-mappings.md`）。config の誤りであり脱出の試行ではないため監査には記録しない。
 fn reject_config_id_mappings(config: &OciConfig) -> Result<(), TraitError> {
     if !config.uid_mappings().is_empty() || !config.gid_mappings().is_empty() {

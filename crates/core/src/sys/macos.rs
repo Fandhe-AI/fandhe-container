@@ -53,8 +53,9 @@ pub(crate) enum SysError {
 #[cfg(feature = "exec-test-support")]
 pub(crate) use process::set_child_signal_ignored_for_test;
 pub(crate) use process::{
-    ECHILD, EINTR, Signal, child_signal_auto_reaps, close_fds_from_except, current_thread_count,
-    dup_fd_at_least, fork_single_threaded_no_flush, kill_pid, poll_readable, wait_pid_nohang,
+    EAGAIN, ECHILD, EINTR, Signal, child_signal_auto_reaps, close_fds_from_except,
+    current_thread_count, dup_fd_at_least, fork_single_threaded_no_flush, kill_pid, poll_readable,
+    wait_pid_nohang,
 };
 
 /// 直前の失敗の errno（取れなければ `EINVAL` に写し、成功側へは倒さない）。
@@ -1050,6 +1051,8 @@ pub(crate) mod process {
     use std::ffi::{c_int, c_short, c_uint, c_void};
     use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 
+    /// `EAGAIN`（`sys/errno.h`。35。Linux の 11 と異なる）。fork の資源上限の判別に使う（#4702）。
+    pub(crate) const EAGAIN: i32 = 35;
     /// `EINTR`（`sys/errno.h`）。
     pub(crate) const EINTR: i32 = 4;
     /// `ECHILD`（`sys/errno.h`）。
@@ -1485,6 +1488,7 @@ pub(crate) mod process {
         use libc::c_int;
 
         const _: () = {
+            libc_const_eq!(EAGAIN, i32, c_int);
             libc_const_eq!(EINTR, i32, c_int);
             libc_const_eq!(ECHILD, i32, c_int);
             libc_const_eq!(EMFILE, i32, c_int);

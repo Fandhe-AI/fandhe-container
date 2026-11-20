@@ -48,14 +48,15 @@
 //!   終わり、主経路は `isolation_fds_not_closed` で代替経路へ、通知はスレッドでの出し直しへ進む。**限界
 //!   （REPAIR-3）**: Linux 5.11 未満では主経路は常に使われない（代替経路が成功すると通知も出ないため、ファイルは
 //!   黙って使われないままになる。両経路が失敗したときの通知の `primary` が `isolation_fds_not_closed` になり、
-//!   fork 不能の `isolation_unavailable` と見分けられる）
+//!   fork 不能の `isolation_unavailable`・`isolation_fork_again` と見分けられる）
 //! - 子の結果は終了 status ではなく子が書く結果 pipe の印で受ける（`SIGCHLD` が `SIG_IGN`・`SA_NOCLDWAIT` の
 //!   プロセス（macOS は `SIG_DFL` 以外の独自ハンドラも）では子が回収され status が失われるため）。印は「開始」（通知の子が出力先へ書き込む直前に書く）と
 //!   「結果」（終了コード）の 2 種類。シグナルは fork 直後に開いた pidfd 経由で送り、`waitpid` が `ECHILD` を
 //!   返した子（回収済み）へは送らない（pid 再利用対策。CORE-1）
 //! - 子は `fork_single_threaded` で作る。呼び出しプロセスが複数スレッドだと fork できないため、その場合は
 //!   主経路を試行せず `isolation_unavailable` で代替経路へ進む（期限を保証できない I/O を呼び出しスレッドで
-//!   実行しない。fail-closed）。supervisor の exec は単一スレッドのプロセスから呼ぶ契約
+//!   実行しない。fail-closed）。fork が `EAGAIN`（資源上限）で失敗した場合だけ `isolation_fork_again`、
+//!   それ以外の fork 失敗は `isolation_unavailable`（#4702）。supervisor の exec は単一スレッドのプロセスから呼ぶ契約
 //! - 1 回の `record` の待ち時間の上限は [`RECORD_WAIT_LIMIT`]（主経路・代替経路・失敗通知の上限の合算。
 //!   定期 exec〔healthcheck。TASK-161〕へ配線するときは、この値を呼び出し側の期限の積み上げに含める）
 //! - 呼び出し側（supervisor）の記録点は worker を回収した後の親プロセスで、sink が詰まっても worker・
@@ -191,6 +192,8 @@ enum IsolatedOutcome {
     TimedOut,
     /// 呼び出しプロセスが複数スレッドで fork できない。
     MultiThreaded,
+    /// fork が `EAGAIN`（資源上限）で失敗した（#4702。`isolation_fork_again`）。
+    ForkAgain,
     /// fork・待機に失敗した、子がシグナルで死んだ・結果を残さず自動回収された（非対応 OS を含む）。
     Failed,
     /// 子が継承した fd（3 以上）を閉じられず、`child` を実行せずに終わった（`close_range(2)` が無い Linux 5.11
@@ -504,7 +507,7 @@ fn run_isolated_until(
         Err(sys::SysError::MultiThreaded) => {
             return Isolated::not_run(IsolatedOutcome::MultiThreaded);
         }
-        Err(_) => return Isolated::not_run(IsolatedOutcome::Failed),
+        Err(e) => return Isolated::not_run(fork_error_outcome(&e)),
     };
     // 回収前に開くので、以後 pid が回収・再利用されても元の子を指す。開けなければ `None`（kill(2) へ退避）。
     let handle = open_child_handle(pid);
@@ -553,6 +556,16 @@ fn run_isolated_until(
     // SIGKILL でも回収できない子（D 状態等）。追跡して後続の呼び出しで回収する。
     pending::track(pid, handle);
     settle(&rx, IsolatedOutcome::TimedOut)
+}
+
+/// fork の失敗を結果へ写す。`EAGAIN`（資源上限）だけ [`IsolatedOutcome::ForkAgain`]、他は `Failed`
+/// （#4702・SEC-4。どちらも代替経路へ進む）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn fork_error_outcome(e: &sys::SysError) -> IsolatedOutcome {
+    match e {
+        sys::SysError::Os(errno) if *errno == sys::EAGAIN => IsolatedOutcome::ForkAgain,
+        _ => IsolatedOutcome::Failed,
+    }
 }
 
 /// Windows では子プロセス隔離を提供しない（`crate::sys` は Linux・macOS 専用。CLI-1）。常に `Failed` を返し、
@@ -624,6 +637,7 @@ fn primary_result(outcome: IsolatedOutcome) -> Result<(), AuditWriteError> {
         IsolatedOutcome::Exited(code) => exit_to_kind(code),
         IsolatedOutcome::TimedOut => AuditWriteErrorKind::IsolationTimeout,
         IsolatedOutcome::FdsNotClosed => AuditWriteErrorKind::IsolationFdsNotClosed,
+        IsolatedOutcome::ForkAgain => AuditWriteErrorKind::IsolationForkAgain,
         IsolatedOutcome::MultiThreaded
         | IsolatedOutcome::Failed
         | IsolatedOutcome::TooManyUnreaped => AuditWriteErrorKind::IsolationUnavailable,
@@ -679,6 +693,7 @@ fn notify_retry(run: Isolated) -> NotifyRetry {
         IsolatedOutcome::Exited(_)
         | IsolatedOutcome::MultiThreaded
         | IsolatedOutcome::Failed
+        | IsolatedOutcome::ForkAgain
         | IsolatedOutcome::FdsNotClosed
         | IsolatedOutcome::TooManyUnreaped => {
             if run.started {
@@ -1458,6 +1473,7 @@ mod tests {
             (O::MultiThreaded, false, R::Line),
             (O::Failed, false, R::Line),
             (O::Failed, true, R::AfterNewline),
+            (O::ForkAgain, false, R::Line),
             (O::FdsNotClosed, false, R::Line),
             (O::TooManyUnreaped, false, R::Line),
         ];
@@ -1501,6 +1517,7 @@ mod tests {
             AuditWriteErrorKind::IsolationUnavailable
         );
         assert_eq!(kind(O::Failed), AuditWriteErrorKind::IsolationUnavailable);
+        assert_eq!(kind(O::ForkAgain), AuditWriteErrorKind::IsolationForkAgain);
         assert_eq!(
             kind(O::TooManyUnreaped),
             AuditWriteErrorKind::IsolationUnavailable

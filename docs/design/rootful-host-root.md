@@ -16,7 +16,7 @@
 | `crates/supervisor/src/start_entry.rs` | real / effective / saved / fs のいずれかの uid が 0 なら `PermissionDenied` で拒否する（手順 4） |
 | `crates/supervisor/src/start_client.rs` | 共有クライアントの `privilege_gate`。supervisor と同じ規則で uid 0 を `PermissionDenied` にする。読めない・壊れた入力は `FailedPrecondition`。CLI の `start` と plugin-cri の supervised の start が使う |
 | `crates/cli/src/commands/supervisor_start.rs` | 権限の規則は共有クライアント側にある（上の行）。CLI の `start` は uid 0 で、権限モデルの検査に到達すれば終了コード 6（`PERMISSION_DENIED`。8 の `UNIMPLEMENTED` ではない）。それより先に返る前提エラー（対象 ID が無ければ `NOT_FOUND`、supervisor が未配置なら終了コード 5）は従来どおり |
-| `crates/plugin-cri/src/pod_holder.rs` | `rootful_guard`: 実効 uid 0 の provider は `PermissionDenied` で拒否する。注入は uid 0 では行わない（`should_inject_pod_holder`） |
+| `crates/plugin-cri/src/pod_holder.rs` | `rootful_guard`: 実 uid か実効 uid が 0 の provider は `PermissionDenied` で拒否する。注入は実 uid か実効 uid が 0 なら行わない（`should_inject_pod_holder`） |
 | `crates/cli/src/doctor/user_scope_check.rs` | 拒否ではない。root で実行すると user scope の検査を飛ばし、notice（「rootful start is not supported」を含む）で案内する |
 | `crates/core/src/exec.rs` | `plan_rootful_host_root` / `isolate_rootful_host_root` が下位 API として存在する（D3 A-1）。本番経路は呼ばない。利用者は結合試験と CORE-7・CORE-9 の rootful 計測の構成 |
 | `crates/core/src/cgroups/device_policy.rs` | `RootfulHostRoot` を `DevicePolicyMode::Rootful` へ写す（下位 API の計測用） |

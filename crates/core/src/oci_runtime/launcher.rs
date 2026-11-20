@@ -302,8 +302,9 @@ impl ProductionLauncher {
 
 #[cfg(target_os = "linux")]
 impl ProductionLauncherBuilder {
-    /// 分離の権限モデル。`RootlessSingleId` と `RootlessSubordinateIds`(要 [`Self::subordinate_ids`])を扱い、
-    /// `RootfulHostRoot` は launch が `PermissionDenied` で意図して拒否する(モジュール doc。#2241 で決定済み)。
+    /// 分離の権限モデル。`RootlessSingleId` と `RootlessSubordinateIds`(要 [`Self::subordinate_ids`])を扱う。
+    /// `RootfulHostRoot` は Linux の [`Self::build`] が `PermissionDenied` で意図して拒否し、launcher は得られない
+    /// (権限モデルと監査 sink の欠落の検査の後、ペアリング検査より前。モジュール doc。#2241 で決定済み)。
     #[must_use]
     pub fn privilege(mut self, privilege: IsolationPrivilege) -> Self {
         self.privilege = Some(privilege);
@@ -447,7 +448,9 @@ impl ProductionLauncherBuilder {
     /// launcher を作る。呼び出しプロセスを child subreaper にし(失敗なら `Err`)、その証跡を保持する
     /// (再親付けされた PID 1 を pid 指定で回収するため。CORE-1・#1813)。
     ///
-    /// Linux 以外は常に `Unimplemented`。Linux では必須値の欠落が `InvalidArgument`。
+    /// Linux 以外は常に `Unimplemented`。Linux の検査順: 必須値(権限モデル → 監査 sink)の欠落が `InvalidArgument`、
+    /// 次に `RootfulHostRoot` が `PermissionDenied`(恒久拒否。#2241・SEC-5)、その後に注入・ペアリング・写像の検査。
+    /// いずれも subreaper 化より前で、拒否は副作用を残さない。
     pub fn build(self) -> Result<ProductionLauncher, TraitError> {
         #[cfg(target_os = "linux")]
         {

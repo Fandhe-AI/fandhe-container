@@ -870,8 +870,8 @@ pub(crate) fn current_euid() -> Result<u32, ()> {
     Ok(snap.uid.effective)
 }
 
-/// 保持役 provider を注入するか（Linux の本番構成）。実効 uid が 0 と確定したときだけ注入しない（従来の rootful の挙動を
-/// 保つ）。読めない場合は注入し、provider の `spawn` の検査が fail-closed で落とす。
+/// 保持役 provider を注入するか（Linux の本番構成）。`current_euid` が 0（実 uid か実効 uid が 0）と確定したときだけ
+/// 注入しない（rootful は恒久拒否。#4709）。読めない場合は注入し、provider の `spawn` の検査が fail-closed で落とす。
 pub fn should_inject_pod_holder<E>(euid: Result<u32, E>) -> bool {
     !matches!(euid, Ok(0))
 }

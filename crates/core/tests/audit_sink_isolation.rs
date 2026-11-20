@@ -18,7 +18,8 @@
 //!   書き込みを始めた後に詰まった子は出し直さない（上の「通知先も止まる」）
 //! - 通知の子が行の途中で書き込みに失敗すると、出し直しは改行を 1 つ付けてから 1 行を出す（断片と連結しない）
 //! - 複数スレッドのプロセス: fork できないため主経路は試行せず `isolation_unavailable` で代替経路へ進む
-//! - 主経路の fork が `EAGAIN`（`prlimit --nproc=1` で自分自身を再起動して実 fork を失敗させる。Linux・非 root のみ）:
+//! - 主経路の fork が `EAGAIN`（`current_exe()` で自分自身を再起動し、子が `FileAuditSink::limit_processes_for_test(1)` で
+//!   `RLIMIT_NPROC` を下げて実 fork を失敗させる。Linux・非 root のみ）:
 //!   代替経路へ進み、その主経路の失敗種別が `isolation_fork_again`（`UNAVAILABLE`）になる（#4702）
 //! - `SIGCHLD` が `SIG_IGN`（子が自動回収され `waitpid` が `ECHILD`）: 主経路の成功を失敗と取り違えず代替経路へ
 //!   二重に記録しない。失敗種別・時間切れ・通知も同じく届く（最後に実行し、終わったら `SIG_DFL` に戻す）
@@ -335,7 +336,15 @@ mod imp {
     #[cfg(target_os = "linux")]
     const FORK_AGAIN_CHILD_ARG: &str = "--fork-again-child";
 
+    /// 上限が効かないときに子が起動する、即座に終わるプローブの入口の引数（PATH に依存しない）。
+    #[cfg(target_os = "linux")]
+    const FORK_AGAIN_PROBE_ARG: &str = "--fork-again-probe";
+
     pub(super) fn run() {
+        #[cfg(target_os = "linux")]
+        if std::env::args().nth(1).as_deref() == Some(FORK_AGAIN_PROBE_ARG) {
+            return;
+        }
         #[cfg(target_os = "linux")]
         if std::env::args().nth(1).as_deref() == Some(FORK_AGAIN_CHILD_ARG) {
             let dir = std::env::args_os()
@@ -577,20 +586,50 @@ mod imp {
             .unwrap()
     }
 
-    /// 子の出力ファイルの読み取り上限。ディスクへの書き込み自体は止められないため（`File` を直接渡す方式の代償）、
-    /// 読む側で先頭だけに絞り、上限超過は失敗にする（無制限のメモリ確保を避ける。REPAIR-5）。
+    /// 子の出力ファイルの保存量の上限。待ちの間に `wait_capped` が大きさを見て、超えたら失敗にする（REPAIR-5）。
     #[cfg(target_os = "linux")]
     const FORK_AGAIN_OUTPUT_CAP: u64 = 64 * 1024;
+
+    /// 再起動した子の期限（REPAIR-5・REPAIR-10 の応答待ちの既定 5〜10 秒）。
+    #[cfg(target_os = "linux")]
+    const FORK_AGAIN_CHILD_WITHIN: Duration = Duration::from_secs(10);
+
+    /// 子の終了を期限まで待ちつつ、出力ファイルが上限を超えたら `Err`（呼び出し側が子を回収する）。
+    /// `reap::output_within_capped` は終了後に空のグループへ `kill` を送り、環境により usage エラーで
+    /// 失敗する（Docker の aarch64 で 12 回中複数回）ため使わず、待ちループに大きさの監視だけ足す。
+    #[cfg(target_os = "linux")]
+    fn wait_capped(
+        child: &mut std::process::Child,
+        files: &[&Path],
+    ) -> Result<std::process::ExitStatus, String> {
+        let until = std::time::Instant::now() + FORK_AGAIN_CHILD_WITHIN;
+        loop {
+            for f in files {
+                let len = std::fs::metadata(f).map_err(|e| e.to_string())?.len();
+                if len > FORK_AGAIN_OUTPUT_CAP {
+                    return Err(format!(
+                        "child output {} is {len} bytes (cap {FORK_AGAIN_OUTPUT_CAP})",
+                        f.display()
+                    ));
+                }
+            }
+            match child.try_wait() {
+                Ok(Some(st)) => return Ok(st),
+                Ok(None) => {}
+                Err(e) => return Err(format!("try_wait failed: {e}")),
+            }
+            if std::time::Instant::now() >= until {
+                return Err(format!(
+                    "child did not exit within {FORK_AGAIN_CHILD_WITHIN:?}"
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 
     #[cfg(target_os = "linux")]
     fn read_capped(path: &Path) -> String {
         use std::io::Read;
-        let len = std::fs::metadata(path).unwrap().len();
-        assert!(
-            len <= FORK_AGAIN_OUTPUT_CAP,
-            "child output {} is {len} bytes (cap {FORK_AGAIN_OUTPUT_CAP})",
-            path.display()
-        );
         let mut buf = String::new();
         std::fs::File::open(path)
             .unwrap()
@@ -623,22 +662,22 @@ mod imp {
         let dir = tmp_marker("fork-again");
         std::fs::create_dir(&dir).unwrap();
         let (out_path, err_path) = (dir.join("stdout"), dir.join("stderr"));
-        let spawned = std::process::Command::new(std::env::current_exe().unwrap())
+        let mut child = match std::process::Command::new(std::env::current_exe().unwrap())
             .arg(FORK_AGAIN_CHILD_ARG)
             .arg(&dir)
             .stdin(std::process::Stdio::null())
             .stdout(std::fs::File::create(&out_path).unwrap())
             .stderr(std::fs::File::create(&err_path).unwrap())
-            .spawn();
-        let mut child = match spawned {
+            .spawn()
+        {
             Ok(c) => c,
             Err(e) => panic!("cannot re-launch the test binary: {e}"),
         };
-        let status = match super::reap::wait_within(&mut child, Duration::from_secs(30)) {
+        let status = match wait_capped(&mut child, &[&out_path, &err_path]) {
             Ok(s) => s,
             Err(e) => {
                 let _ = super::reap::reap(&mut child, super::reap::reap_within());
-                panic!("fork_again child did not finish: {e}");
+                panic!("fork_again child did not finish cleanly: {e}");
             }
         };
         let stdout = read_capped(&out_path);
@@ -676,11 +715,16 @@ mod imp {
             FileAuditSink::limit_processes_for_test(1),
             "lowering RLIMIT_NPROC must succeed"
         );
-        // 上限が効かず `true` が起動した場合に待ち続けないよう、spawn と期限つきの待ちに分ける。
-        match std::process::Command::new("true").spawn() {
+        // 上限が効かず起動できた場合に待ち続けないよう、spawn と期限つきの待ちに分ける。プローブは自分自身の
+        // 即終了の入口で、PATH に依存しない。待ち・回収に失敗したら適用外の印は出さず失敗にする。
+        match std::process::Command::new(std::env::current_exe().unwrap())
+            .arg(FORK_AGAIN_PROBE_ARG)
+            .spawn()
+        {
             Ok(mut c) => {
-                if super::reap::wait_within(&mut c, Duration::from_secs(10)).is_err() {
+                if let Err(e) = super::reap::wait_within(&mut c, Duration::from_secs(5)) {
                     let _ = super::reap::reap(&mut c, super::reap::reap_within());
+                    panic!("the probe did not exit in time: {e}");
                 }
                 println!("{FORK_AGAIN_NOT_ENFORCED}");
                 return;

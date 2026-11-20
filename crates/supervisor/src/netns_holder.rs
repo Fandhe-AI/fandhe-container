@@ -263,8 +263,8 @@ fn drain_stderr(stderr: &mut Option<ChildStderr>) -> String {
 fn drain_capped(r: &mut (impl std::io::Read + std::os::fd::AsFd), timeout: Duration) -> String {
     use crate::deadline_read::{ReadStop, read_capped_until};
     let raw = match read_capped_until(r, STDERR_CAP as u64, Instant::now() + timeout, false) {
-        Ok(b) | Err(ReadStop::TimedOut(b)) => b,
-        Err(ReadStop::Io(_)) => Vec::new(),
+        // I/O エラーでも、それまでに読めた分は診断に使う（従来の `read_to_end` と同じ）。
+        Ok(b) | Err(ReadStop::TimedOut(b) | ReadStop::Io(_, b)) => b,
     };
     escape_capped(&raw, STDERR_CAP)
 }

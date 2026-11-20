@@ -19,8 +19,8 @@ const POLL_STEP: Duration = Duration::from_millis(5);
 pub(crate) enum ReadStop {
     /// 期限切れ。それまでに読めた分を保持する。
     TimedOut(Vec<u8>),
-    /// 読み取りまたは `poll` の失敗（`EINTR` は内部で再試行する）。
-    Io(io::Error),
+    /// 読み取りまたは `poll` の失敗（`EINTR` は内部で再試行する）。それまでに読めた分も保持する（診断に使う）。
+    Io(io::Error, Vec<u8>),
 }
 
 /// `until` まで、EOF・上限 `max` バイト・（`stop_at_newline` なら）`\n` のいずれかで止まるまで読む。
@@ -34,18 +34,19 @@ pub(crate) fn read_capped_until(
     let mut out = Vec::new();
     let mut buf = [0u8; 512];
     while (out.len() as u64) < max {
+        // 期限はループの先頭で毎回確かめる（読める間・`EINTR` の再試行の間も期限を越えて続けない。REPAIR-5）。
+        let now = Instant::now();
+        if now >= until {
+            return Err(ReadStop::TimedOut(out));
+        }
         match poll_revents_now(r.as_fd(), POLL_IN | POLL_RDHUP) {
             Ok(rev) if rev & (POLL_IN | POLL_GONE_MASK) != 0 => {}
             Ok(_) => {
-                let now = Instant::now();
-                if now >= until {
-                    return Err(ReadStop::TimedOut(out));
-                }
                 std::thread::sleep(POLL_STEP.min(until - now));
                 continue;
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(ReadStop::Io(e)),
+            Err(e) => return Err(ReadStop::Io(e, out)),
         }
         let room = (max - out.len() as u64).min(buf.len() as u64) as usize;
         let want = if stop_at_newline { 1 } else { room };
@@ -58,7 +59,7 @@ pub(crate) fn read_capped_until(
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(ReadStop::Io(e)),
+            Err(e) => return Err(ReadStop::Io(e, out)),
         }
     }
     Ok(out)
@@ -113,6 +114,23 @@ mod tests {
         assert!(
             matches!(&rest, Err(ReadStop::TimedOut(b)) if b == b"next"),
             "{rest:?}"
+        );
+    }
+
+    /// REPAIR-5: 期限を過ぎていれば、読めるデータがあっても読まずに期限切れを返す（期限を越えて読み続けない）。
+    #[test]
+    fn repair5_4733_expired_deadline_stops_even_when_readable() {
+        let (mut r, mut w) = std::io::pipe().unwrap();
+        w.write_all(b"ready\n").unwrap();
+        let got = read_capped_until(
+            &mut r,
+            4096,
+            Instant::now() - Duration::from_millis(1),
+            true,
+        );
+        assert!(
+            matches!(&got, Err(ReadStop::TimedOut(b)) if b.is_empty()),
+            "{got:?}"
         );
     }
 

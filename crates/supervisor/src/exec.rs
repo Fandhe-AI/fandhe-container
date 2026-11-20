@@ -2275,7 +2275,7 @@ fn read_worker_result_line(
                 ErrorCode::Internal,
                 "exec stage Spawn: the worker result was not received in time",
             ),
-            ReadStop::Io(e) => TraitError::new(
+            ReadStop::Io(e, _) => TraitError::new(
                 ErrorCode::Internal,
                 format!(
                     "exec stage Spawn: reading the worker result failed: {}",

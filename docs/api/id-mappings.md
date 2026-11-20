@@ -8,7 +8,7 @@ OCI `config.json` の `linux.uidMappings` / `linux.gidMappings` は受けない�
 - 変更前（#4711 より前）は同じ入力が `UNIMPLEMENTED`（終了コード 8。message `start does not support yet: linux.uidMappings / linux.gidMappings`）だった。終了コードや code で分岐している呼び出し元は、2 / `INVALID_ARGUMENT` へ移す
 - 空配列・省略は受ける
 - 拒否はプロセス起動・状態の予約より前で行い、新たな起動予約やプロセスは残らず、create 済みの状態レコードは `Created` のまま。監査ログには記録しない（config の誤りで、脱出の試行ではないため）
-- CLI の `start`（supervisor 経由）では、委譲 cgroup の準備（`prepare`）が先に走り、状態レコードに cgroup の配置を記録してから写像を拒否する。cgroup の削除は拒否の応答の後に supervisor が試みるもので、CLI が `INVALID_ARGUMENT` を返した時点で済んでいるとは限らない（削除に失敗することもある）。配置の記録は残る。そのため config を直して同じ ID で `start` し直すと `FAILED_PRECONDITION`（`cgroup scope is already recorded`）になる。直すときは `delete` してから作り直す
+- CLI の `start`（supervisor 経由）では、委譲 cgroup の準備（`prepare`）が先に走り、状態レコードに cgroup の配置を記録してから写像を拒否する。cgroup の削除は拒否の応答の後に supervisor が試みるもので、CLI が `INVALID_ARGUMENT` を返した時点で済んでいるとは限らない（削除に失敗することもある）。配置の記録は残る。そのため config を直して同じ ID で `start` し直すと `FAILED_PRECONDITION`（message `cgroup scope is already recorded; delete and recreate the container`）になる。直すときは `delete` してから作り直す
 
 ## 受けない理由
 

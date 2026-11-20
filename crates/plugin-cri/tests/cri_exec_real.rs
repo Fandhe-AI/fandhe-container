@@ -41,6 +41,10 @@
 //! - 段 G（#4820・CRI-2・CORE-3・SEC-1・SEC-5）: pid `CONTAINER` の対象と pid `TARGET` の debug コンテナで、
 //!   debug の exec が対象の init を PID 1（`/bin/sleep 614`）として読むこと、対象を止めると pid ns ごと止まり debug が Exited になる
 //!   ことを照合する。成功行 2 行（`pid-target ok:`）を CI が試験ソースから導出して照合する。pull は増やさない。
+//! - 段 L（#4652・CRI-2・SUP-7）: log_path つきのコンテナで、kubelet と同じく CRI ログを `<log>.1` へ rename して `ReopenContainerLog`
+//!   を呼び、旧ファイルが増えなくなり元のパスに CRI 形式の新しいファイルが現れて番号が続くこと、停止後の呼び出しが
+//!   `FAILED_PRECONDITION` で新しいファイルを作らないことを具体値で照合する。成功行 3 行（`log-reopen ok:`）を CI が
+//!   試験ソースから導出して照合する。pull は増やさない。
 //!
 //! 失敗後の残骸の回収（#4142）: 本体を 2 回走らせる（1 回目は StartContainer の直後に注入した失敗、回収、2 回目は同じ metadata で通す）。
 //! 注入では plugin-cri を SIGKILL してから panic させ、外側の回収が死活を判定して起動し直して回収する（#4326。共有部品 `reclaim_restarting`）。
@@ -1941,6 +1945,189 @@ async fn pid_target_stage(
     remove_pod(c, ledger, &sb, &[&dbg, &target]).await;
 }
 
+/// 段 L（#4652）の成功行 3 行（`check-success-lines.sh` が試験ソースから導出して照合する）。
+const LOG_REOPEN_OK_SWITCH: &str = "production_binary_exec_real: log-reopen ok: after ReopenContainerLog the renamed file stopped growing and the original path got a new file";
+const LOG_REOPEN_OK_CONTINUES: &str = "production_binary_exec_real: log-reopen ok: the new file holds CRI lines whose numbers continue after the renamed file";
+const LOG_REOPEN_OK_STOPPED: &str = "production_binary_exec_real: log-reopen ok: ReopenContainerLog on a stopped container is FAILED_PRECONDITION and creates no file";
+
+/// 段 L の出力コマンド。番号つきの固定行を 0.2 秒おきに出し続ける。
+const LOG_REOPEN_SCRIPT: &str = "i=0; while :; do echo line-$i; i=$((i+1)); sleep 0.2; done";
+
+/// CRI ログ（`<RFC3339Nano> stdout F line-N`）を解析して番号の列を返す。完結した行（`\n` で終わる）だけを見て、
+/// 形式に合わない行があれば panic する（具体値の照合。末尾の書きかけは無視する）。
+fn parse_cri_log_numbers(text: &str) -> Vec<u64> {
+    let complete = text.rfind('\n').map_or("", |i| &text[..=i]);
+    complete
+        .lines()
+        .map(|l| {
+            let f: Vec<&str> = l.split(' ').collect();
+            let [ts, stream, tag, body] = f.as_slice() else {
+                panic!("not a CRI log line: {l:?}");
+            };
+            assert!(ts.contains('T') && ts.len() >= 20, "bad timestamp: {l:?}");
+            assert_eq!((*stream, *tag), ("stdout", "F"), "bad stream/tag: {l:?}");
+            body.strip_prefix("line-")
+                .and_then(|n| n.parse::<u64>().ok())
+                .unwrap_or_else(|| panic!("bad body: {l:?}"))
+        })
+        .collect()
+}
+
+/// `path` に完結した CRI 行が `want` 行以上現れるまで期限つきで待ち、その番号列を返す。
+async fn wait_cri_numbers(path: &Path, want: usize) -> Vec<u64> {
+    let start = Instant::now();
+    loop {
+        let nums = std::fs::read_to_string(path)
+            .map(|t| parse_cri_log_numbers(&t))
+            .unwrap_or_default();
+        if nums.len() >= want {
+            return nums;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "{} did not reach {want} CRI lines within 30s: {nums:?}",
+            path.display()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// `ReopenContainerLog` を期限つきで呼ぶ（段 L）。
+async fn reopen_log(
+    c: &mut RuntimeServiceClient<Channel>,
+    id: &str,
+) -> Result<tonic::Response<cri::ReopenContainerLogResponse>, fandhe_container_plugin::PluginError>
+{
+    call_with_deadline(
+        c.reopen_container_log(cri::ReopenContainerLogRequest {
+            container_id: id.into(),
+        }),
+        RPC_DEADLINE,
+    )
+    .await
+}
+
+/// 段 L（#4652・CRI-2・SUP-7・REPAIR-5・REPAIR-12）。kubelet の手順（ログを `<log>.1` へ rename → `ReopenContainerLog`）を本番の
+/// plugin-cri → supervisor（kind 10）で通す。pull は増やさない。
+///
+/// 1. 稼働中: rename 後に reopen が成功し、旧ファイルは増えなくなり、元のパスに新しいファイルが現れて、番号が旧ファイルの最後より大きく連続する。
+/// 2. 停止後: rename して空にした状態で reopen は `FAILED_PRECONDITION` で、元のパスにファイルが作られない。
+async fn log_reopen_stage(
+    c: &mut RuntimeServiceClient<Channel>,
+    token: &str,
+    ledger: &reclaim::Ledger,
+) {
+    let dir = TempDir::new("logreopen");
+    let log = dir.0.join("0.log");
+    let old = dir.0.join("0.log.1");
+    let long = Duration::from_secs(120);
+    let sb = call_with_deadline(
+        c.run_pod_sandbox(cri::RunPodSandboxRequest {
+            config: Some(cri::PodSandboxConfig {
+                metadata: Some(cri::PodSandboxMetadata {
+                    name: "pod-exec-real-log-reopen".into(),
+                    uid: reclaim::sandbox_uid("uid-exec-log-reopen", token),
+                    namespace: "default".into(),
+                    attempt: 0,
+                }),
+                log_directory: dir.0.to_string_lossy().into_owned(),
+                labels: reclaim::config_labels(TEST, token),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        RPC_DEADLINE,
+    )
+    .await
+    .expect("run log-reopen sandbox")
+    .into_inner()
+    .pod_sandbox_id;
+    reclaim::record_sandbox(ledger, &sb);
+    let id = call_with_deadline(
+        c.create_container(cri::CreateContainerRequest {
+            pod_sandbox_id: sb.clone(),
+            config: Some(cri::ContainerConfig {
+                metadata: Some(cri::ContainerMetadata {
+                    name: "log-reopen".into(),
+                    attempt: 0,
+                }),
+                image: Some(image_spec(IMAGE)),
+                command: vec!["/bin/sh".into(), "-c".into(), LOG_REOPEN_SCRIPT.into()],
+                log_path: "0.log".into(),
+                labels: reclaim::config_labels(TEST, token),
+                ..Default::default()
+            }),
+            sandbox_config: None,
+        }),
+        long,
+    )
+    .await
+    .expect("create log-reopen container")
+    .into_inner()
+    .container_id;
+    reclaim::record_container(ledger, &id);
+    call_with_deadline(
+        c.start_container(cri::StartContainerRequest {
+            container_id: id.clone(),
+        }),
+        long,
+    )
+    .await
+    .expect("start log-reopen container");
+
+    // 1. kubelet と同じ順序: rename → reopen。
+    let before = wait_cri_numbers(&log, 3).await;
+    std::fs::rename(&log, &old).expect("rename the CRI log");
+    reopen_log(c, &id).await.expect("reopen the CRI log");
+    // 戻った後は旧ファイルへ書かれない（rename から reopen までの増分は旧ファイルに入りうる）。
+    let old_text = std::fs::read_to_string(&old).expect("read the renamed log");
+    let old_nums = parse_cri_log_numbers(&old_text);
+    assert!(
+        old_nums.starts_with(&before),
+        "the renamed file must keep what was written before the rename: {before:?} vs {old_nums:?}"
+    );
+    let new_nums = wait_cri_numbers(&log, 2).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        std::fs::read_to_string(&old).expect("re-read the renamed log"),
+        old_text,
+        "the renamed file must not grow after ReopenContainerLog"
+    );
+    let _ = writeln_stderr(LOG_REOPEN_OK_SWITCH);
+    let last_old = *old_nums.last().expect("old lines");
+    assert!(
+        new_nums[0] > last_old,
+        "new file must continue after the renamed file: old_last={last_old} new={new_nums:?}"
+    );
+    assert!(
+        new_nums.windows(2).all(|w| w[1] == w[0] + 1),
+        "new file numbers must be consecutive: {new_nums:?}"
+    );
+    let _ = writeln_stderr(LOG_REOPEN_OK_CONTINUES);
+
+    // 2. 停止後: 空にした（rename 済みの）状態で reopen しても新しいファイルは作られない。
+    call_with_deadline(
+        c.stop_container(cri::StopContainerRequest {
+            container_id: id.clone(),
+            timeout: 1,
+        }),
+        long,
+    )
+    .await
+    .expect("stop the log-reopen container");
+    std::fs::rename(&log, dir.0.join("0.log.2")).expect("rename the CRI log again");
+    let err = reopen_log(c, &id)
+        .await
+        .expect_err("reopen on a stopped container");
+    assert_eq!(err.code(), PluginErrorCode::FailedPrecondition, "{err:?}");
+    assert!(
+        !log.exists(),
+        "a stopped container must not get a new CRI log"
+    );
+    let _ = writeln_stderr(LOG_REOPEN_OK_STOPPED);
+    remove_pod(c, ledger, &sb, &[&id]).await;
+}
+
 fn writeln_stderr(line: &str) -> std::io::Result<()> {
     use std::io::Write as _;
     writeln!(std::io::stderr(), "{line}")
@@ -2164,6 +2351,8 @@ async fn scenario(
     pod_pid_stage(&mut c, &token, &ledger).await;
     // 段 G（#4820）: pid namespace の TARGET（debug コンテナ）。
     pid_target_stage(&mut c, &token, &ledger).await;
+    // 段 L（#4652）: ログの再オープン（ReopenContainerLog）。
+    log_reopen_stage(&mut c, &token, &ledger).await;
 
     // 4. 要求元の異常終了（SUP-6・SEC-1・REPAIR-5・#4167）: 終わらない exec を開いたまま plugin-cri を SIGKILL すると、
     //    helper が 2 秒以内に終わり、exec のコマンドが残らない。helper の期限は 60 秒以上で、期限や hold_grace では説明できない。
@@ -2612,4 +2801,12 @@ fn repair12_4823_pod_shm_literals_are_fixed() {
             .starts_with(&["production_binary_exec_real:", "termination-log", "ok:"].join(" "))
     );
     assert!(!TERMINATION_LOG_OK.contains('{') && !TERMINATION_LOG_OK.contains('}'));
+}
+
+/// 段 L（#4652）の CRI ログ解析が、完結した行だけを読み、書きかけの末尾を無視することを具体値で固定する。
+#[test]
+fn cri2_4652_parse_cri_log_numbers() {
+    let t = "2026-11-20T01:02:03.123456789Z stdout F line-4\n2026-11-20T01:02:03.323456789Z stdout F line-5\n2026-11-20T01:02:03.5";
+    assert_eq!(parse_cri_log_numbers(t), vec![4, 5]);
+    assert_eq!(parse_cri_log_numbers(""), Vec::<u64>::new());
 }

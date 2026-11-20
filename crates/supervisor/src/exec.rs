@@ -281,7 +281,7 @@
 //!   `(st_dev, st_ino)` の記録と照合（launch の子から親への状態 pipe が要る）も未実装（REPAIR-3）
 //! - 実機前提の通し試験 `tests/exec.rs` の実行結果の記録（root を要し、CI ではビルドのみで実行していない）
 
-use std::io::{BufRead as _, Read as _, Write as _};
+use std::io::Write as _;
 use std::num::{NonZeroU8, NonZeroU32};
 use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
@@ -1687,6 +1687,10 @@ impl From<TraitError> for WorkerError {
 /// 回収待ち上限 5 秒）より長くし、通常は worker 自身の `Timeout` が先に返るようにする（REPAIR-5）。
 const WORKER_GRACE: Duration = Duration::from_secs(7);
 
+/// worker 回収後に結果 1 行を pipe から読む期限（#4733・REPAIR-5）。worker は結果を書いてから終了し回収済みなので
+/// 行は pipe に残っているはずで、短くてよい。書き込み端の複製を持つ並行 spawn の子が残っても待ち続けない。
+const WORKER_RESULT_READ_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// worker の結果 1 行の上限バイト数（pipe から読む量の上限。無制限確保の防止）。
 const WORKER_RESULT_MAX: u64 = 4096;
 
@@ -2253,19 +2257,33 @@ fn collect_worker_result(
         )
         .into());
     }
-    let mut line = Vec::new();
-    std::io::BufReader::new(reader.take(WORKER_RESULT_MAX))
-        .read_until(b'\n', &mut line)
-        .map_err(|e| {
-            TraitError::new(
+    let line = read_worker_result_line(reader, WORKER_RESULT_READ_TIMEOUT)?;
+    decode_worker_result(&line)
+}
+
+/// 回収済み worker の結果 1 行を `timeout` まで読む（#4733・REPAIR-5）。期限切れは `ErrorCode::Internal`・
+/// 固定文言 `exec stage Spawn: the worker result was not received in time`（コマンド自体の期限切れの
+/// `Timeout` とは区別する。worker は終了済みなので「結果が届かなかった」内部異常）。読み取り失敗も `Internal`。
+fn read_worker_result_line(
+    reader: &mut std::io::PipeReader,
+    timeout: Duration,
+) -> Result<Vec<u8>, TraitError> {
+    use crate::deadline_read::{ReadStop, read_capped_until};
+    read_capped_until(reader, WORKER_RESULT_MAX, Instant::now() + timeout, true).map_err(
+        |e| match e {
+            ReadStop::TimedOut(_) => TraitError::new(
+                ErrorCode::Internal,
+                "exec stage Spawn: the worker result was not received in time",
+            ),
+            ReadStop::Io(e) => TraitError::new(
                 ErrorCode::Internal,
                 format!(
                     "exec stage Spawn: reading the worker result failed: {}",
                     e.kind()
                 ),
-            )
-        })?;
-    decode_worker_result(&line)
+            ),
+        },
+    )
 }
 
 /// exec 用の子 cgroup を呼び出しプロセスで作り、作成できた場合だけ所有者として後始末する（#1466）。
@@ -3309,6 +3327,26 @@ fn from_exec_error_staged(err: ExecError) -> WorkerError {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read as _;
+
+    /// REPAIR-5・#4733: 結果行が無く書き込み端も閉じない場合、`read_worker_result_line` は期限で `Internal` を返す。
+    #[test]
+    fn repair5_4733_worker_result_read_times_out_as_internal() {
+        let (mut r, _w) = std::io::pipe().unwrap();
+        let t0 = Instant::now();
+        let err = read_worker_result_line(&mut r, Duration::from_millis(200)).unwrap_err();
+        let el = t0.elapsed();
+        assert_eq!(err.code(), ErrorCode::Internal);
+        assert_eq!(
+            err.message(),
+            "exec stage Spawn: the worker result was not received in time"
+        );
+        assert!(
+            el >= Duration::from_millis(200) && el < Duration::from_secs(2),
+            "{el:?}"
+        );
+    }
+
     #[test]
     fn sec4_3805_exec_request_debug_redacts_env_values() {
         let req = ExecRequest::new("/bin/echo", ["echo", "hi"])

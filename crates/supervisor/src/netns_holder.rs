@@ -33,7 +33,6 @@
 //!   （`tests/netns_holder_launch_userns.rs` で照合する）
 
 use std::ffi::OsStr;
-use std::io::Read as _;
 use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 use std::process::{Child, ChildStderr, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
@@ -248,13 +247,25 @@ fn escape_capped(raw: &[u8], cap: usize) -> String {
     out
 }
 
-/// 回収済み holder の stderr を読む（書き込み端は holder の終了で閉じる。holder は fork しないので EOF で止まる）。
+/// 回収済み holder の stderr を読む期限（#4733・REPAIR-5。plugin の `PLUGIN_STDERR_DRAIN_TIMEOUT` に揃える）。
+const STDERR_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// 回収済み holder の stderr を読む（書き込み端は holder の終了で閉じる。holder は fork しないので通常は EOF で止まる）。
+/// 書き込み端の複製を持つ子が残る場合は [`STDERR_DRAIN_TIMEOUT`] で打ち切り、読めた分だけを返す
+/// （期限切れ・読み取り失敗はエラーにしない。HolderExit の材料を優先する。#4733・REPAIR-5）。
 fn drain_stderr(stderr: &mut Option<ChildStderr>) -> String {
     let Some(mut s) = stderr.take() else {
         return String::new();
     };
-    let mut raw = Vec::new();
-    let _ = (&mut s).take(STDERR_CAP as u64).read_to_end(&mut raw);
+    drain_capped(&mut s, STDERR_DRAIN_TIMEOUT)
+}
+
+fn drain_capped(r: &mut (impl std::io::Read + std::os::fd::AsFd), timeout: Duration) -> String {
+    use crate::deadline_read::{ReadStop, read_capped_until};
+    let raw = match read_capped_until(r, STDERR_CAP as u64, Instant::now() + timeout, false) {
+        Ok(b) | Err(ReadStop::TimedOut(b)) => b,
+        Err(ReadStop::Io(_)) => Vec::new(),
+    };
     escape_capped(&raw, STDERR_CAP)
 }
 
@@ -491,6 +502,22 @@ pub fn spawn_netns_holder_unready_for_test(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// REPAIR-5・#4733: 書き込み端を閉じない子を模しても `drain_capped` は期限で戻り、読めた分を返す。
+    #[test]
+    fn repair5_4733_drain_capped_returns_at_deadline_with_partial() {
+        use std::io::Write as _;
+        let (mut r, mut w) = std::io::pipe().unwrap();
+        w.write_all(b"boom").unwrap();
+        let t0 = Instant::now();
+        let got = drain_capped(&mut r, Duration::from_millis(200));
+        let el = t0.elapsed();
+        assert_eq!(got, "boom");
+        assert!(
+            el >= Duration::from_millis(200) && el < Duration::from_secs(2),
+            "{el:?}"
+        );
+    }
 
     /// NET-9・ERR-1: 全コードの写像を具体値で固定する（`Timeout` が `Internal` に潰れない）。
     #[test]

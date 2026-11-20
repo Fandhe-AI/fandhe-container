@@ -36,6 +36,13 @@ compile_error!(
     "the `logs-test-support` feature lets the logs --follow deadline be overridden by an environment variable and must not be enabled in release builds"
 );
 
+// `start-status-test-support` は start の `/proc/self/status` の読み取りを環境変数のファイルで差し替える試験専用の入口を有効にする
+// feature で、製品のバイナリに含める理由がない。最適化ビルドで有効になっていたらコンパイルを止める（SEC-5・#4709・REPAIR-3）。
+#[cfg(all(feature = "start-status-test-support", not(debug_assertions)))]
+compile_error!(
+    "the `start-status-test-support` feature lets the process status read be replaced by a file named in an environment variable and must not be enabled in release builds"
+);
+
 pub mod commands;
 pub mod doctor;
 pub mod error;

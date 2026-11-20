@@ -20,6 +20,8 @@
 //! - 試験専用 feature `start-test-support` のときだけ、環境変数 `FANDHE_CONTAINER_TEST_SYSTEMD_RUN`（絶対パス）で
 //!   systemd-run の解決を差し替えられる（所有者の検証だけを飛ばす。他の検査は飛ばさない）。本番のビルドにはこの環境変数を
 //!   読むコードが存在せず、最適化ビルドで feature を有効にするとコンパイルが止まる（`lib.rs`）。
+//! - 試験専用 feature `start-status-test-support` のときだけ、環境変数 `FANDHE_CONTAINER_TEST_PROC_STATUS_FILE`（ファイルのパス）の
+//!   内容を `/proc/self/status` の代わりに使える（uid 0 の恒久拒否 SEC-5・#4709 の試験用。systemd-run の解決は本番と同じ）。
 
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
@@ -64,10 +66,26 @@ pub(super) fn start_via_supervisor(
             "cannot resolve the cli executable path",
         )
     })?;
-    let launch = SupervisorLaunch::resolve_beside_with(&cli_exe, locate)?;
+    let launch = resolve_launch(&cli_exe)?;
     let opts = StartOptions::new().with_audit_policy(audit_policy);
     let (result, child) = start_with_options(&launch, root, &opts, id, production_deadline());
     // supervisor は CLI より長く生きる。wait も kill もせずに手放す。
     drop(child);
     result
+}
+
+/// 試験専用: `/proc/self/status` の代わりに内容を読むファイルを指す環境変数（feature `start-status-test-support` のときだけ読む。
+/// SEC-5・#4709: uid 0 の拒否を非 root の CI で実バイナリ越しに通す）。
+#[cfg(feature = "start-status-test-support")]
+const TEST_PROC_STATUS_FILE_ENV: &str = "FANDHE_CONTAINER_TEST_PROC_STATUS_FILE";
+
+/// supervisor の解決。本番は `locate` による解決だけで、試験専用 feature のときだけ status の読み取りを差し替えられる。
+fn resolve_launch(cli_exe: &Path) -> Result<SupervisorLaunch, OciRuntimeError> {
+    #[cfg(feature = "start-status-test-support")]
+    if let Some(p) = std::env::var_os(TEST_PROC_STATUS_FILE_ENV) {
+        return SupervisorLaunch::resolve_beside_with_status(cli_exe, || {
+            std::fs::read_to_string(p).ok()
+        });
+    }
+    SupervisorLaunch::resolve_beside_with(cli_exe, locate)
 }

@@ -1286,6 +1286,72 @@ fn sec4_2716_start_exec_stage_failure_is_shown_with_code_and_fixed_message() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// SEC-5・CLI-1・ERR-1・REPAIR-12（#4709・PR #4904）: 実バイナリの `start` は、uid の 4 位置（実・実効・保存・fs）のどれか 1 つが
+/// 0 の `/proc/self/status`（試験専用 feature `start-status-test-support` の環境変数で与える。本物の root は使わない）で、
+/// 対象と supervisor が在り権限検査に到達する条件のとき、終了コード 6・stdout 空・stderr の構造化エラー
+/// （`op` = start・`code` = PERMISSION_DENIED・固定文言の完全一致）で恒久拒否する。対照として uid が全部非 0 なら拒否されない。
+#[cfg(target_os = "linux")]
+#[test]
+fn sec5_4709_start_rootful_status_is_permission_denied_with_exit_6() {
+    let tmp = TmpDir::new("sec5-4709");
+    let dir = isolated_cli_dir("sec5-4709");
+    let cli = dir.join("fandhe-container");
+    let (_root, root_s) = prepare_c1(&tmp, &cli);
+    // 権限検査より前に supervisor の実在を見るため、隣に偽の supervisor を置く。
+    install_fake_supervisor(&dir, "printf 'FCSUP1 OK 4242\\n'");
+    let scope = FakeScope::new(&dir, &tmp);
+    let status_file = tmp.0.join("proc-status");
+    let write_status = |uid: &str| {
+        std::fs::write(
+            &status_file,
+            format!(
+                "Name:\tx\nUid:\t{uid}\nGid:\t1000\t1000\t1000\t1000\nGroups:\t\nNoNewPrivs:\t0\nCapInh:\t0000000000000000\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\nCapBnd:\t000001ffffffffff\nCapAmb:\t0000000000000000\n"
+            ),
+        )
+        .expect("write status");
+    };
+    let args = ["--root", root_s.as_str(), "start", "c1"];
+    let env = [(
+        "FANDHE_CONTAINER_TEST_PROC_STATUS_FILE",
+        status_file.as_os_str(),
+    )];
+
+    for uid in [
+        "0\t1000\t1000\t1000",
+        "1000\t0\t1000\t1000",
+        "1000\t1000\t0\t1000",
+        "1000\t1000\t1000\t0",
+    ] {
+        write_status(uid);
+        let out = scope.run(&cli, &args, &env);
+        assert_eq!(out.status.code(), Some(6), "{uid}");
+        assert!(out.stdout.is_empty(), "{uid}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            code_json(
+                "start",
+                "PERMISSION_DENIED",
+                "the rootful privilege model is permanently refused by policy (SEC-5)"
+            ),
+            "{uid}"
+        );
+        let facts = json_lines_contract::check_stream(&out.stderr, 4096).expect("one json line");
+        assert_eq!(facts.len(), 1, "{uid}");
+        assert_eq!(facts[0].str_of("code"), Some("PERMISSION_DENIED"), "{uid}");
+    }
+
+    // 対照: uid が全部非 0 なら拒否の段を通り過ぎ、別の段で失敗する（systemd-run の解決は本番と同じで環境次第のため code だけ見る）。
+    write_status("1000\t1000\t1000\t1000");
+    let out = scope.run(&cli, &args, &env);
+    assert_ne!(out.status.code(), Some(6), "{:?}", out.stderr);
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("permanently refused"),
+        "{:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// `PATH` 上の symlink（例: `/usr/local/bin/fandhe-container` -> 配置先の CLI）を作る。
 /// symlink の置き場所 `bin_dir` は呼び出し側が用意する。
 #[cfg(target_os = "linux")]

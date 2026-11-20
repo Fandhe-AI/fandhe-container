@@ -3255,6 +3255,13 @@ jobs:
             --src crates/plugin-cri/tests/cri_exec_real.rs --log "${log}" \
             --select '^production_binary_exec_real: pid-target ok: ' --min 2 \
             --forbid 'PRECONDITION FAILED' --forbid 'pid-target FAILED' --summary
+          # 段 L（#4652・CRI-2・SUP-7）: ReopenContainerLog（rename → reopen で旧ファイルが増えなくなり元のパスに新しい CRI ログが
+          # 現れて番号が続くこと、停止後は FAILED_PRECONDITION で新しいファイルを作らないこと）の成功行 3 行を試験ソースから導出して
+          # 照合する。pull・ステップ数・期限は変えない。
+          scripts/check-success-lines.sh --name production_binary_exec_real_log_reopen \
+            --src crates/plugin-cri/tests/cri_exec_real.rs --log "${log}" \
+            --select '^production_binary_exec_real: log-reopen ok: ' --min 3 \
+            --forbid 'PRECONDITION FAILED' --forbid 'log-reopen FAILED' --summary
 
       # production_binary_attach_real（`crates/plugin-cri/tests/cri_attach_real.rs`。libtest の `#[ignore]`。
       # CRI-6・SUP-4・SEC-1・REPAIR-12・#4079）: 本番バイナリ越しに実コンテナ（busybox）へ完全版 Attach を通し、

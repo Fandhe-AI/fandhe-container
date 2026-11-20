@@ -180,7 +180,7 @@ pub fn serve_connection(
     expected_uid: u32,
     slot: &SignalSlot,
     config: &ServeConfig,
-    observer: &ControlObserver,
+    observer: &Arc<ControlObserver>,
 ) {
     serve_connection_with_guards(stream, peer, expected_uid, slot, config, observer, None);
 }
@@ -193,7 +193,7 @@ pub fn serve_connection_with_guards(
     expected_uid: u32,
     slot: &SignalSlot,
     config: &ServeConfig,
-    observer: &ControlObserver,
+    observer: &Arc<ControlObserver>,
     guards: Option<&Arc<ExecGuardPool>>,
 ) {
     if !peer_allowed(peer.uid, expected_uid) {
@@ -202,7 +202,12 @@ pub fn serve_connection_with_guards(
         return;
     }
     let started = Instant::now();
-    let (reason, op) = handle_request(stream, peer.pid, slot, config, guards);
+    // CRI ログの開き直しは専用スレッドが応答と計測まで行う（`None`。accept ループを止めない。#4652）。
+    let Some((reason, op)) =
+        handle_request(stream, peer.pid, slot, config, guards, observer, started)
+    else {
+        return;
+    };
     let ok = reason == ControlReason::Ok;
     match op {
         RequestOp::ExitWatch => observer.record_exit_watch(ok, started.elapsed()),
@@ -215,69 +220,70 @@ pub fn serve_connection_with_guards(
 
 /// 検証済みの接続の 1 要求を処理し、最終的な理由と要求の種類を返す
 /// （`Ok` が成功。応答を書けなかった場合も処理結果を返す。種類は計測の操作名を分けるため）。
+/// CRI ログの開き直し（kind 10）が受理されたときは専用スレッドへ接続ごと渡し、応答と計測はそのスレッドが行うので `None`。
 fn handle_request(
     mut stream: UnixStream,
     peer_pid: u32,
     slot: &SignalSlot,
     config: &ServeConfig,
     guards: Option<&Arc<ExecGuardPool>>,
-) -> (ControlReason, RequestOp) {
+    observer: &Arc<ControlObserver>,
+    started: Instant,
+) -> Option<(ControlReason, RequestOp)> {
     if stream
         .set_write_timeout(Some(config.write_timeout))
         .is_err()
     {
-        return (ControlReason::Internal, RequestOp::Signal);
+        return Some((ControlReason::Internal, RequestOp::Signal));
     }
     if stream.write_all(&encode_hello()).is_err() {
-        return (ControlReason::Internal, RequestOp::Signal);
+        return Some((ControlReason::Internal, RequestOp::Signal));
     }
     let read_deadline = Instant::now() + config.read_deadline;
 
     let mut header = [0u8; HEADER_LEN];
     if read_exact_until(&mut stream, &mut header, read_deadline).is_err() {
-        return (
+        return Some((
             respond(&mut stream, ControlReason::Malformed),
             RequestOp::Signal,
-        );
+        ));
     }
     let kind = match FrameHeader::decode(&header).and_then(FrameHeader::expect_any_request) {
         Ok(RequestHeader::Signal(kind)) => kind,
         Ok(RequestHeader::CancelRestart) => {
-            return (
+            return Some((
                 handle_cancel_restart(stream, slot, read_deadline),
                 RequestOp::Signal,
-            );
+            ));
         }
         Ok(RequestHeader::ExecHandover) => {
-            return (
+            return Some((
                 handle_exec_handover(stream, peer_pid, slot, read_deadline, guards),
                 RequestOp::Exec,
-            );
+            ));
         }
         Ok(RequestHeader::ExitWatch) => {
-            return (
+            return Some((
                 handle_exit_watch(stream, slot, read_deadline),
                 RequestOp::ExitWatch,
-            );
+            ));
         }
         Ok(RequestHeader::Attach) => {
-            return (
+            return Some((
                 handle_attach(stream, slot, read_deadline),
                 RequestOp::Attach,
-            );
+            ));
         }
         Ok(RequestHeader::ReopenLog) => {
-            return (
-                handle_reopen_log(stream, slot, read_deadline),
-                RequestOp::ReopenLog,
-            );
+            return handle_reopen_log(stream, slot, read_deadline, observer, started)
+                .map(|reason| (reason, RequestOp::ReopenLog));
         }
-        Err(reason) => return (respond(&mut stream, reason), RequestOp::Signal),
+        Err(reason) => return Some((respond(&mut stream, reason), RequestOp::Signal)),
     };
-    (
+    Some((
         handle_signal(stream, slot, config, read_deadline, kind),
         RequestOp::Signal,
-    )
+    ))
 }
 
 /// SignalRequest・StopRequest の payload を読んで、監視スレッドへ送信を依頼し、結果を返す。
@@ -411,41 +417,65 @@ fn handle_exec_handover(
 
 /// ReopenLogRequest（kind 10）の payload を読んで、稼働中のコンテナの CRI ログを開き直させる（CRI-2・SUP-7・REPAIR-5・#4652）。
 ///
-/// 稼働中でなければ（`NoHandle`・`ContainerExited`）sink に触れず断る。
-/// cri-api の契約は「稼働中でなければ、新しいファイルを作って nil を返すか、エラーを返す（エラーを返すときだけ作ってはならない）」。
-/// `check_running` と `reopen_log` の間にコンテナが終了した場合は新しいファイルができて `Ok` になりうるが、契約には反しない。
-/// 期限を過ぎていれば開き直さない。sink の失敗は理由コードへ写し（文言は反射しない）、既存の書き込み先は変わらない。
+/// 稼働中でなければ（`NoHandle`・`ContainerExited`）sink に触れず断る。枠は同時に 1 件（使用中は `Busy`）。
+/// 受理したら接続ごと専用スレッドへ渡して `None` を返す（accept ループはログのファイルシステムの停止に巻き込まれない。
+/// スレッドは応答と計測まで行い、枠を空けて終わる。止まったファイルシステムの上の `open` は中断できないため、スレッドは
+/// 復旧まで残りうるが、枠が 1 つなので増えない）。cri-api の契約は「稼働中でなければ、新しいファイルを作って nil を返すか、
+/// エラーを返す（エラーを返すときだけ作ってはならない）」。ファイルを公開する直前に、期限と世代がまだ稼働中であることを
+/// sink が再確認し（[`crate::logs::LogSink::reopen`]）、終了遷移は実行中の開き直しを有限時間待つ（[`SignalSlot::begin_reopen`]）。
+/// 期限を過ぎた要求は何も作らず何も差し替えない。sink の失敗は理由コードへ写し（文言は反射しない）、既存の書き込み先は変わらない。
 fn handle_reopen_log(
     mut stream: UnixStream,
     slot: &SignalSlot,
     read_deadline: Instant,
-) -> ControlReason {
+    observer: &Arc<ControlObserver>,
+    started: Instant,
+) -> Option<ControlReason> {
     let mut payload = [0u8; REOPEN_LOG_PAYLOAD_LEN];
     if read_exact_until(&mut stream, &mut payload, read_deadline).is_err() {
-        return respond(&mut stream, ControlReason::Malformed);
+        return Some(respond(&mut stream, ControlReason::Malformed));
     }
     let request = match ReopenLogRequestFrame::decode_payload(&payload) {
         Ok(r) => r,
-        Err(reason) => return respond(&mut stream, reason),
+        Err(reason) => return Some(respond(&mut stream, reason)),
     };
     let deadline = match absolute_deadline(request.deadline) {
         Ok(d) => d,
-        Err(reason) => return respond(&mut stream, reason),
+        Err(reason) => return Some(respond(&mut stream, reason)),
     };
-    if let Err(reason) = slot.check_running() {
-        return respond(&mut stream, reason);
-    }
+    let permit = match slot.begin_reopen() {
+        Ok(p) => p,
+        Err(reason) => return Some(respond(&mut stream, reason)),
+    };
     let Some(hub) = slot.output_capture() else {
-        return respond(&mut stream, ControlReason::NoCriLog);
+        return Some(respond(&mut stream, ControlReason::NoCriLog));
     };
     if Instant::now() >= deadline {
-        return respond(&mut stream, ControlReason::Timeout);
+        return Some(respond(&mut stream, ControlReason::Timeout));
     }
-    let reason = match hub.reopen_log() {
-        Ok(()) => ControlReason::Ok,
-        Err(e) => reopen_failure(e.code()),
-    };
-    respond(&mut stream, reason)
+    let observer = Arc::clone(observer);
+    // スレッドの生成に失敗したら、クロージャごと stream が落ちるため、応答は返せない（クライアントは期限で Timeout）。
+    let spawned = std::thread::Builder::new()
+        .name("control-reopen-log".to_owned())
+        .spawn(move || {
+            let result = hub.reopen_log(deadline, &|| permit.still_allowed());
+            let reason = match result {
+                Ok(()) => ControlReason::Ok,
+                // 終了後に枠を持ったまま拒否されたときは、ファイルを作っておらず「稼働中でない」と答える。
+                Err(_) if !permit.still_allowed() => ControlReason::ContainerExited,
+                Err(e) => reopen_failure(e.code()),
+            };
+            drop(permit);
+            respond(&mut stream, reason);
+            observer.record_reopen_log(reason == ControlReason::Ok, started.elapsed());
+        });
+    match spawned {
+        Ok(_) => None,
+        Err(_) => {
+            log_control_event("control_reopen_log_spawn_failed", None);
+            Some(ControlReason::Internal)
+        }
+    }
 }
 
 /// sink の開き直しの失敗を理由コードへ写す。`Unimplemented` は CRI ログが無い構成（`LogSink::reopen` の既定）。
@@ -453,6 +483,7 @@ fn reopen_failure(code: fandhe_container_core::traits::ErrorCode) -> ControlReas
     use fandhe_container_core::traits::ErrorCode;
     match code {
         ErrorCode::Unimplemented => ControlReason::NoCriLog,
+        ErrorCode::Timeout => ControlReason::Timeout,
         ErrorCode::FailedPrecondition | ErrorCode::InvalidArgument => {
             ControlReason::LogReopenRefused
         }
@@ -902,7 +933,7 @@ fn accept_loop(
     expected_uid: u32,
     config: &ServeConfig,
     stop: &AtomicBool,
-    observer: &ControlObserver,
+    observer: &Arc<ControlObserver>,
     guards: Option<&Arc<ExecGuardPool>>,
 ) {
     while !stop.load(Ordering::SeqCst) {

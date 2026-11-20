@@ -269,7 +269,7 @@ fn sec1_peer_with_other_uid_is_disconnected_without_a_byte() {
             euid,
             &slot,
             &ServeConfig::default(),
-            &ControlObserver::new(None, None),
+            &Arc::new(ControlObserver::new(None, None)),
         );
     });
     client
@@ -295,10 +295,10 @@ impl AuditSink for CollectSink {
 fn sec4_peer_uid_mismatch_is_recorded_to_the_audit_sink() {
     let euid = effective_uid().unwrap();
     let sink = Arc::new(CollectSink(Mutex::new(Vec::new())));
-    let observer = ControlObserver::new(
+    let observer = Arc::new(ControlObserver::new(
         Some(Arc::clone(&sink) as Arc<dyn AuditSink>),
         Some(ContainerId::new("audited").unwrap()),
-    );
+    ));
     let (_client, server_side) = UnixStream::pair().unwrap();
     serve_connection(
         server_side,
@@ -324,7 +324,7 @@ fn sec4_peer_uid_mismatch_is_recorded_to_the_audit_sink() {
 #[test]
 fn repair4_requests_are_counted_with_latency() {
     let euid = effective_uid().unwrap();
-    let observer = ControlObserver::new(None, None);
+    let observer = Arc::new(ControlObserver::new(None, None));
     // 不正な要求（EOF）は失敗として数える。
     let (client, server_side) = UnixStream::pair().unwrap();
     drop(client);

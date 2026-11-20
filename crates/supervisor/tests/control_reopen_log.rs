@@ -20,8 +20,8 @@ use fandhe_container_supervisor::control::ControlReopenLog;
 use fandhe_container_supervisor::control::listener::{ControlListener, effective_uid};
 use fandhe_container_supervisor::control::observe::ControlObserver;
 use fandhe_container_supervisor::control::protocol::{
-    ControlReason, HEADER_LEN, REOPEN_LOG_REQUEST_LEN, RESPONSE_LEN, ReopenLogRequestFrame,
-    ResponseFrame, SignalDeadline, encode_hello,
+    CancelRestartRequestFrame, ControlReason, HEADER_LEN, REOPEN_LOG_REQUEST_LEN, RESPONSE_LEN,
+    ReopenLogRequestFrame, ResponseFrame, SignalDeadline, encode_hello,
 };
 use fandhe_container_supervisor::control::server::{ControlServer, ServeConfig};
 use fandhe_container_supervisor::control::target::{ControlledProcess, SignalSlot};
@@ -89,6 +89,11 @@ struct Rig {
 impl Rig {
     /// `cri`: CRI ログ付き（Tee）か。`running`: 稼働中のハンドルを持たせるか。
     fn start(tag: &str, cri: bool, running: bool) -> Self {
+        Self::start_with(tag, cri, running, None)
+    }
+
+    /// `custom`: 指定すると CRI ログの代わりにこの sink を使う（止まる sink の注入用）。
+    fn start_with(tag: &str, cri: bool, running: bool, custom: Option<Arc<dyn LogSink>>) -> Self {
         use std::os::unix::fs::DirBuilderExt as _;
         let root = TempRoot::new(tag);
         let state = root.0.join("state");
@@ -108,7 +113,9 @@ impl Rig {
             .unwrap();
         let log = logs.join("0.log");
         let rotated = logs.join("0.log.1");
-        let sink: Arc<dyn LogSink> = if cri {
+        let sink: Arc<dyn LogSink> = if let Some(c) = custom {
+            c
+        } else if cri {
             let path = ContainerLogPath::new(log.to_str().unwrap().to_owned()).unwrap();
             Arc::new(TeeLogSink::new(
                 Arc::new(MemoryLogSink::default()),
@@ -323,4 +330,88 @@ fn repair5_4652_raw_request_reason_codes() {
     }
     .encode();
     assert_eq!(exchange(&far), ControlReason::Malformed);
+}
+
+/// 生の接続で 1 要求を送り、理由コードを読む（応答が来ること自体が「受け付けられた」ことの照合）。
+fn exchange_raw(path: &Path, frame: &[u8]) -> ControlReason {
+    let mut s = UnixStream::connect(path).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    let mut hello = [0u8; HEADER_LEN];
+    s.read_exact(&mut hello).unwrap();
+    s.write_all(frame).unwrap();
+    let mut resp = [0u8; RESPONSE_LEN];
+    s.read_exact(&mut resp).unwrap();
+    ControlReason::from_u8(*resp.last().unwrap()).unwrap()
+}
+
+/// 開き直しの途中で止まる sink（ログのファイルシステムが応答しない場面）。解放後に、sink が見る期限と許可を記録する。
+struct StalledSink {
+    entered: std::sync::Mutex<std::sync::mpsc::Sender<()>>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    /// 解放後の `(期限は過ぎている, 続行の許可)`。
+    seen: Arc<std::sync::Mutex<Option<(bool, bool)>>>,
+}
+
+impl LogSink for StalledSink {
+    fn append(&self, _: StreamKind, _: &[u8]) -> Result<(), TraitError> {
+        Ok(())
+    }
+    fn reopen(&self, deadline: Instant, proceed: &dyn Fn() -> bool) -> Result<(), TraitError> {
+        self.entered.lock().unwrap().send(()).unwrap();
+        self.release.lock().unwrap().recv().unwrap();
+        *self.seen.lock().unwrap() = Some((Instant::now() >= deadline, proceed()));
+        Ok(())
+    }
+}
+
+/// REPAIR-5・CRI-2・SUP-7・#4652（A・B）: ログの開き直しが止まっても accept ループは他の要求を有限時間で処理し
+/// （別の開き直しは `Busy`、他の kind は通常どおり応答）、クライアントが期限切れで返った後に解放された sink は
+/// 期限切れを見る（公開・差し替えをしない根拠。実ファイルの側の拒否は sink の単体試験）。
+#[test]
+fn repair5_4652_stalled_reopen_does_not_block_other_requests() {
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let stalled = Arc::new(StalledSink {
+        entered: std::sync::Mutex::new(entered_tx),
+        release: std::sync::Mutex::new(release_rx),
+        seen: Arc::clone(&seen),
+    });
+    let rig = Rig::start_with("stall", false, true, Some(stalled));
+    let sock = rig.state().join(rig.id.as_str()).join("supervisor.sock");
+    let state = rig.state();
+    let id = rig.id.clone();
+    let client = std::thread::spawn(move || {
+        ControlReopenLog::new(state).reopen(&id, Instant::now() + Duration::from_millis(600))
+    });
+    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    // 止まっている間も、別の開き直しは Busy で、他の kind の要求も有限時間で応答する。
+    let started = Instant::now();
+    let reopen = ReopenLogRequestFrame {
+        deadline: SignalDeadline::from_now(Duration::from_secs(3)).unwrap(),
+    }
+    .encode();
+    assert_eq!(exchange_raw(&sock, &reopen), ControlReason::Busy);
+    let cancel = CancelRestartRequestFrame {
+        deadline: SignalDeadline::from_now(Duration::from_secs(3)).unwrap(),
+    }
+    .encode();
+    // 取り消す再起動は無いので理由は何でもよいが、応答が返ること自体が目的（Timeout・Internal は不可）。
+    let reason = exchange_raw(&sock, &cancel);
+    assert!(
+        !matches!(reason, ControlReason::Timeout | ControlReason::Internal),
+        "{reason:?}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+
+    // クライアントは期限で返る。その後に解放された sink は、期限切れを見る。
+    let e = client.join().unwrap().unwrap_err();
+    assert_eq!(e.code(), ErrorCode::Timeout);
+    release_tx.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while seen.lock().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(*seen.lock().unwrap(), Some((true, true)));
 }

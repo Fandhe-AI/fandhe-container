@@ -780,16 +780,28 @@ pub trait LogSink: Send + Sync {
         Ok(())
     }
 
-    /// CRI ログのファイルを同じパスで開き直す（`ReopenContainerLog`。CRI-2・SUP-7・#4652）。
+    /// CRI ログのファイルを同じパスで開き直す（`ReopenContainerLog`。CRI-2・SUP-7・REPAIR-5・#4652）。
     ///
     /// 既定は `Unimplemented`（CRI ログのファイルを持たない sink。制御チャネルは「CRI ログのパスが無い」として拒否する）。
-    /// CRI ログの sink は、先に新しいファイルを開けてから差し替え、失敗したら状態を変えずに `Err` を返す。
-    /// 書き込み（`append` 等）と直列化され、有限時間で戻ること。
-    fn reopen(&self) -> Result<(), TraitError> {
+    /// CRI ログの sink は、先に新しいファイルを用意してから差し替え、失敗したら状態を変えずに `Err` を返す。
+    /// `deadline`（絶対期限）まで待ってよいのは書き込みとの直列化（ロック）だけで、超えたら `Timeout` で返す。
+    /// 新しいファイルが公開される直前と差し替えの直前に、期限と `proceed`（呼び出し元が「まだ続けてよいか」を
+    /// 判定する。コンテナの終了後は偽）を再確認し、どちらかが満たされなければ何も作らず何も変えない。
+    fn reopen(
+        &self,
+        _deadline: std::time::Instant,
+        _proceed: &dyn Fn() -> bool,
+    ) -> Result<(), TraitError> {
         Err(TraitError::new(
             fandhe_container_core::traits::ErrorCode::Unimplemented,
             "the log sink has no cri log file",
         ))
+    }
+
+    /// この sink が自分で失敗状態に固定されているときの最初のエラーコード（CRI ログの [`cri::CriFileSink`] が返す。
+    /// 開き直しで解除される。観測用。既定は `None`）。
+    fn failure_code(&self) -> Option<fandhe_container_core::traits::ErrorCode> {
+        None
     }
 }
 

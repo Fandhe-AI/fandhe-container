@@ -287,7 +287,51 @@ fn attach_locked(
 
 /// サーバと監視スレッドが共有する、起動ハンドルの有無・世代の状態。
 #[derive(Clone)]
-pub struct SignalSlot(Arc<Mutex<SlotInner>>);
+pub struct SignalSlot(Arc<Mutex<SlotInner>>, Arc<ReopenGate>);
+
+/// CRI ログの開き直し（kind 10。#4652）の実行枠と、終了遷移との調停（REPAIR-5・CRI-2）。
+///
+/// 枠は同時に 1 件（`busy`）。開き直しの実体は専用スレッドで動き、止まったログファイルシステムが accept ループや他の要求を
+/// 止めない。終了遷移（[`SignalSlot::mark_exited`]）は実行中の開き直しの完了を有限時間（[`REOPEN_EXIT_WAIT`]）待ってから
+/// `Exited` にし、「稼働中の確認の後・ファイルの公開の前に終了が割り込む」窓を閉じる。
+struct ReopenGate {
+    busy: Mutex<bool>,
+    idle: std::sync::Condvar,
+}
+
+/// 終了遷移が実行中の開き直しを待つ上限。超えたら待たずに `Exited` へ進む（残りは公開の直前の `still_allowed` が防ぐ）。
+const REOPEN_EXIT_WAIT: Duration = Duration::from_millis(500);
+
+/// 開き直しの実行枠の保持。`Drop` で枠を空け、待っている終了遷移を起こす。
+#[cfg(target_os = "linux")]
+pub(crate) struct ReopenPermit {
+    slot: SignalSlot,
+    generation: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl ReopenPermit {
+    /// 枠を取った世代がまだ稼働中（`Active`）か。ファイルの公開・差し替えの直前に sink から呼ばれる（ロックは短時間のみ）。
+    pub(crate) fn still_allowed(&self) -> bool {
+        matches!(
+            &self.slot.lock().state,
+            SlotState::Active { generation, .. } if *generation == self.generation
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ReopenPermit {
+    fn drop(&mut self) {
+        *self
+            .slot
+            .1
+            .busy
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = false;
+        self.slot.1.idle.notify_all();
+    }
+}
 
 impl Default for SignalSlot {
     fn default() -> Self {
@@ -307,14 +351,20 @@ impl SignalSlot {
     }
 
     fn build(stop_intent: Option<StopToken>) -> Self {
-        Self(Arc::new(Mutex::new(SlotInner {
-            next_generation: 1,
-            state: SlotState::Empty,
-            stop_intent,
-            exit_watchers: Vec::new(),
-            stdin_option: None,
-            output: None,
-        })))
+        Self(
+            Arc::new(Mutex::new(SlotInner {
+                next_generation: 1,
+                state: SlotState::Empty,
+                stop_intent,
+                exit_watchers: Vec::new(),
+                stdin_option: None,
+                output: None,
+            })),
+            Arc::new(ReopenGate {
+                busy: Mutex::new(false),
+                idle: std::sync::Condvar::new(),
+            }),
+        )
     }
 
     /// コンテナ単位の `--stdin` の指定を設定する（本番の入口が `install` で設定する。SUP-7・CRI-6・#4074）。
@@ -376,15 +426,28 @@ impl SignalSlot {
         }
     }
 
-    /// スロットが稼働中（`Active`）か確かめる（ReopenLogRequest。CRI-2・#4652）。ハンドル無しは `NoHandle`、終了済みは
-    /// `ContainerExited`。稼働中でなければ呼び出し側はファイルを開かない。何も取り出さず、I/O もしない。
+    /// 開き直しの実行枠を取る（ReopenLogRequest。CRI-2・REPAIR-5・#4652）。稼働中（`Active`）でなければ断る（ハンドル無しは
+    /// `NoHandle`、終了済みは `ContainerExited`）。枠は同時に 1 件で、使用中は `Busy`。何も取り出さず、I/O もしない。
+    /// 返した [`ReopenPermit`] を持つ間、終了遷移は有限時間だけ開き直しの完了を待つ。
     #[cfg(target_os = "linux")]
-    pub(crate) fn check_running(&self) -> Result<(), ControlReason> {
-        match &self.lock().state {
-            SlotState::Empty => Err(ControlReason::NoHandle),
-            SlotState::Exited { .. } => Err(ControlReason::ContainerExited),
-            SlotState::Active { .. } => Ok(()),
+    pub(crate) fn begin_reopen(&self) -> Result<ReopenPermit, ControlReason> {
+        let inner = self.lock();
+        let generation = match &inner.state {
+            SlotState::Empty => return Err(ControlReason::NoHandle),
+            SlotState::Exited { .. } => return Err(ControlReason::ContainerExited),
+            SlotState::Active { generation, .. } => *generation,
+        };
+        let mut busy = self.1.busy.lock().unwrap_or_else(PoisonError::into_inner);
+        if *busy {
+            return Err(ControlReason::Busy);
         }
+        *busy = true;
+        drop(busy);
+        drop(inner);
+        Ok(ReopenPermit {
+            slot: self.clone(),
+            generation,
+        })
     }
 
     /// Attach の事前の照合（何も取り出さない）。[`Self::take_attach_input`] と同じ判定を `commit = false` で行う。
@@ -495,6 +558,15 @@ impl SignalSlot {
 
     /// `generation` の `Active` を `Exited` にする（別世代なら何もしない）。
     fn mark_exited(&self, generation: u64) {
+        // 実行中の開き直しが終わるまで（有限時間）待ってから遷移する。スロットのロックは持たずに待つ
+        // （開き直しは公開の直前に `still_allowed` でこのロックを取るため）。
+        {
+            let busy = self.1.busy.lock().unwrap_or_else(PoisonError::into_inner);
+            let _ = self
+                .1
+                .idle
+                .wait_timeout_while(busy, REOPEN_EXIT_WAIT, |b| *b);
+        }
         let mut inner = self.lock();
         if let SlotState::Active {
             generation: g, pid, ..
@@ -2210,5 +2282,37 @@ mod tests {
         let (g2, _r2, _) = gen_fake(200);
         let _cp2 = ControlledProcess::new(Box::new(g2), slot.clone());
         slot.check_attach(pid(200), false, true).unwrap();
+    }
+
+    /// CRI-2・REPAIR-5・#4652: 開き直しの枠は同時に 1 件で、枠を持つ間の終了遷移は完了まで（有限時間）待ち、
+    /// 終了後は枠を取れない。枠を空けた世代交代後の許可は偽になる。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cri2_4652_reopen_permit_serializes_exit_transition() {
+        let slot = SignalSlot::new();
+        assert_eq!(slot.begin_reopen().err(), Some(ControlReason::NoHandle));
+        let (fake, _s, _e) = Fake::new(100);
+        let cp = ControlledProcess::new(Box::new(fake), slot.clone());
+        let permit = slot.begin_reopen().unwrap();
+        assert!(permit.still_allowed());
+        // 枠は 1 件だけ。
+        assert_eq!(slot.begin_reopen().err(), Some(ControlReason::Busy));
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let (s2, generation) = (slot.clone(), cp.generation);
+        let h = std::thread::spawn(move || {
+            s2.mark_exited(generation);
+            done_tx.send(()).unwrap();
+        });
+        // 枠を持つ間、終了遷移は完了しない（まだ稼働中として扱われ、公開の直前の確認を通る）。
+        assert!(done_rx.recv_timeout(Duration::from_millis(150)).is_err());
+        assert!(permit.still_allowed());
+        drop(permit);
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        h.join().unwrap();
+        assert_eq!(
+            slot.begin_reopen().err(),
+            Some(ControlReason::ContainerExited)
+        );
     }
 }

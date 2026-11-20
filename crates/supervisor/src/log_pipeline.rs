@@ -125,8 +125,12 @@ impl CaptureHub {
     /// CRI ログのファイルを同じパスで開き直す（制御チャネルの kind 10。CRI-2・SUP-7・#4652）。sink の
     /// [`LogSink::reopen`] へ渡すだけで、捕捉スレッドの書き込みとは sink の内部で直列化される。CRI ログが無い構成は
     /// `Unimplemented`、開けないときは状態を変えず `FailedPrecondition` などで返る。
-    pub fn reopen_log(&self) -> Result<(), TraitError> {
-        self.sink.reopen()
+    pub fn reopen_log(
+        &self,
+        deadline: std::time::Instant,
+        proceed: &dyn Fn() -> bool,
+    ) -> Result<(), TraitError> {
+        self.sink.reopen(deadline, proceed)
     }
 
     /// 今の捕捉の tap の計数。捕捉が無ければ `None`。

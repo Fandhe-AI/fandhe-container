@@ -62,6 +62,7 @@ fandhe-container/
 │   │   ├── io-barrier.md          # I/O 共有層の ACK と永続化保証の契約（TASK-17・IO-2）
 │   │   ├── network.md             # `create` の `--network`（none / host）・`--add-host`・`--dns` の書き方・既定が none であること・host の扱い・ユーザー定義名・`-p` の受理条件〔rootless のみ・定義の照合〕と未結線の指定〔`container:`・rootful〕の `UNIMPLEMENTED`（#1873・NET-6・NET-12・SEC-1・CLI-1）
 │   │   ├── port-publish.md        # `create` の `-p` / `--publish`（rootless の pasta のみ）の書き方・rootful の `PortPublish` との差・現状の `UNIMPLEMENTED`（#3200・NET-9・NET-3・CLI-1）
+│   │   ├── id-mappings.md         # config の `linux.uidMappings` / `gidMappings` を受けない（`INVALID_ARGUMENT`・固定文言・空配列は受ける）理由と Docker / runc との差（#4711・#2240・SEC-5・CORE-6）
 │   │   └── bind-mounts.md         # `config.json` の `mounts[]` の bind mount の書き方・受けるオプション・Docker / runc との差（TASK-29 追補・#1915・OCI-4）
 │   ├── design/                    # 設計決定・拡張点・リソース効率目標
 │   │   ├── orchestration-scope.md # オーケストレーション スコープ（TASK-5・CRI-8）
@@ -133,7 +134,7 @@ fandhe-container/
 │   │   ├── cdi-non-gpu-generalization.md  # 非 GPU デバイスの CDI spec 一般化の机上検証・GPU 固有前提の洗い出し・#571 向け PoC 手順（TASK-132・GPU-9〔検討中〕。判断は #571）
 │   │   ├── cri-devices-cdi.md     # CRI の devices・CDI の受け入れ方針の判断記録（#2673・CRI-2・GPU-1・SEC-1。オーナー判断待ち。判断が出るまで `UNIMPLEMENTED`）
 │   │   ├── cdi-rootless-device-nodes.md  # rootless での CDI deviceNodes をホストのノードの bind で供給する方式の設計・判断シート（#2986・GPU-2・GPU-4・CORE-6・SEC-5。オーナー承認待ち）
-│   │   ├── config-id-mappings.md  # config の linux.uidMappings / gidMappings を受けるかの判断記録（#2240・SEC-5・CORE-6。オーナー承認待ち）
+│   │   ├── config-id-mappings.md  # config の linux.uidMappings / gidMappings を受けるかの判断記録（#2240・SEC-5・CORE-6。拒否の維持で決定済み〔2026-11-13・案 A〕）
 │   │   ├── windows-state-store-acl.md  # Windows の FileStateStore の所有者 SID 照合・保護 DACL の実装方式（windows-sys / 自前宣言 / 恒久拒否）の判断記録（#2428・#4332・OCI-5・SEC-4。案 C〔Windows ホストは恒久拒否〕で決定）
 │   │   ├── oci-mounts-implicit-entries.md  # mounts[] の bind・sysfs 以外（暗黙に供給済みの /proc・/dev 系・tmpfs 等）を受けるかの判断記録（#2347・TASK-29 追補・OCI-4・SEC-1。オーナー承認待ち）
 │   │   ├── network-reclaim-persistence.md  # 作成失敗の回収待ちの記録（請求書）と attach の取り残しの記録を plugin の再起動をまたいで残す設計（置き場所・形式・排他・書く/消す時点・起動時の読み込み・再起動後に回収できる範囲・write-ahead を採らない判断。IPAM 等は #1870 の後続。#2604・#2681・NET-1・NET-6・REPAIR-3・REPAIR-4・REPAIR-5）

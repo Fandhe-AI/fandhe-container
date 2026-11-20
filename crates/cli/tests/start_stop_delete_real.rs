@@ -1253,7 +1253,7 @@ mod linux {
             || !out.stdout.is_empty()
             || op != "start"
             || code != "INVALID_ARGUMENT"
-            || !out.stderr.contains(ID_MAPPINGS_MESSAGE)
+            || error_message(&out.stderr)? != ID_MAPPINGS_MESSAGE
         {
             return Err(format!(
                 "start with id mappings: want exit 2 op=start code=INVALID_ARGUMENT message {ID_MAPPINGS_MESSAGE:?}, got {:?} stdout={:?} stderr={:?}",
@@ -1280,11 +1280,20 @@ mod linux {
                 &[(GENERATION_ANNOTATION, map_generation.as_str())],
             ),
         )?;
+        // supervisor は報告後もログのフラッシュと後始末を続けるため、終了を待ってから走査・delete に進む。
+        wait_supervisor_exit(
+            &sup_needle,
+            &root_needle,
+            "the id-mapping supervisor to exit",
+        )?;
+        // コンテナ ID を含む cmdline に加え、当該 bundle の rootfs を root とするプローブ（ID を引数に持たない）も無いこと。
+        let rootfs = bundle.join("rootfs");
         expect(
             count_processes(|p| {
                 fs::read_to_string(p.join("cmdline")).is_ok_and(|c| c.contains(&map_id_s))
+                    || fs::read_link(p.join("root")).is_ok_and(|r| r == rootfs)
             }) == 0,
-            "a process mentioning the id-mapping container remains after the rejected start",
+            "a process of the id-mapping container remains after the rejected start",
         )?;
         let out = run_cli(&cli, &["--root", &root_s, "delete", &map_id_s], CLI_TIMEOUT)?;
         expect_ok(&out, "delete (id mappings)")?;
@@ -1395,6 +1404,22 @@ mod linux {
             ));
         }
         Ok(())
+    }
+
+    /// 構造化エラー 1 行の `message` を取り出す（エスケープを含む値は試験側で再実装せず失敗にする）。
+    fn error_message(stderr: &str) -> Result<String, String> {
+        let pat = "\"message\":\"";
+        let start = stderr
+            .find(pat)
+            .ok_or_else(|| format!("no message in {stderr:?}"))?
+            + pat.len();
+        let rest = stderr.get(start..).ok_or("bad offset")?;
+        let len = rest
+            .find('"')
+            .ok_or_else(|| format!("unterminated message in {stderr:?}"))?;
+        let m = rest.get(..len).ok_or("bad slice")?;
+        expect(!m.contains('\\'), "message contains an escape")?;
+        Ok(m.to_string())
     }
 
     fn op_and_code(stderr: &str) -> Result<(String, String), String> {

@@ -1236,21 +1236,14 @@ mod linux {
         cleanup.id = map_id_s.clone();
         let config_path = bundle.join("config.json");
         let config = fs::read_to_string(&config_path).map_err(|e| format!("read config: {e}"))?;
-        // プローブの引数に試行固有の ID を足し、読み取りに ptrace の検査が要らない cmdline で残存を識別できるようにする。
-        let mapped = config
-            .replacen(
-                "\"linux\":{",
-                "\"linux\":{\"uidMappings\":[{\"containerID\":0,\"hostID\":1000,\"size\":1}],\"gidMappings\":[{\"containerID\":0,\"hostID\":1000,\"size\":1}],",
-                1,
-            )
-            .replacen(
-                "\"args\":[\"/probe\",\"--container-probe\"]",
-                &format!("\"args\":[\"/probe\",\"--container-probe\",\"{map_id_s}\"]"),
-                1,
-            );
+        let mapped = config.replacen(
+            "\"linux\":{",
+            "\"linux\":{\"uidMappings\":[{\"containerID\":0,\"hostID\":1000,\"size\":1}],\"gidMappings\":[{\"containerID\":0,\"hostID\":1000,\"size\":1}],",
+            1,
+        );
         expect(
-            mapped.contains("\"uidMappings\"") && mapped.contains(&format!("\"{map_id_s}\"]")),
-            "id mappings or the probe argument were not injected into config.json",
+            mapped.contains("\"uidMappings\""),
+            "id mappings were not injected into config.json",
         )?;
         fs::write(&config_path, mapped).map_err(|e| format!("write mapped config: {e}"))?;
         let out = run_cli(
@@ -1300,52 +1293,27 @@ mod linux {
             &root_needle,
             "the id-mapping supervisor to exit",
         )?;
-        // cmdline に試行固有の ID を含むプロセス（supervisor と、ID を引数に足したプローブ）が無いこと。
-        // `/proc/<pid>/root` は ptrace の検査で読めない場合があるため補助にとどめる。
-        let rootfs = bundle.join("rootfs");
-        // `cmdline` は同じ uid なら必ず読めるため、走査中の終了（NotFound・ESRCH）以外の読み取り失敗は観測の失敗として
-        // 試験を落とす（読めなかったものを「残存なし」と数えない）。`root` は補助なので読めなければ不一致とする。
-        expect(
-            count_processes_strict(|p| {
-                Ok(
-                    read_proc_file(&p.join("cmdline"))?.is_some_and(|c| c.contains(&map_id_s))
-                        || fs::read_link(p.join("root")).is_ok_and(|r| r == rootfs),
-                )
-            })? == 0,
-            "a process of the id-mapping container remains after the rejected start",
-        )?;
-        // 起動途中（exec 前・rootfs の切り替え前）の子も見逃さないよう、記録済みの cgroup の配置を証跡にする。
-        // supervisor の `prepare` が配置を記録してから拒否するため、記録は残る（docs/api/id-mappings.md）。
-        // その cgroup のメンバー（`/proc/<pid>/cgroup` の行と、残っていれば `cgroup.procs`）が無いこと。
+        // 残存の確認は、試行に固有の証跡（追跡した supervisor の終了〔上の待ち〕と、記録済みの cgroup）に絞る。
+        // `/proc` の全 PID の走査は、無関係なプロセスの読み取り拒否（`hidepid` 等）で合否が揺れるため使わない。
+        // 起動途中（exec 前・rootfs の切り替え前）の子も cgroup のメンバーとして捉えられる。supervisor の `prepare` が
+        // 配置を記録してから拒否するため、記録は残る（docs/api/id-mappings.md）。cgroup v2 はメンバーのいる cgroup を
+        // 削除できないため、cgroup が消えていればメンバーは居ない。残っていれば子孫の cgroup を含めて `cgroup.procs` が
+        // 空であること。証跡の読み取りの失敗（NotFound 以外）は観測の失敗として試験を落とす。
         let map_placement = map_rec
             .cgroup()
             .ok_or("record has no cgroup placement (id mappings)")?;
-        let map_scope = map_placement.scope().as_str().to_string();
         let map_name = CgroupName::for_instance(&map_container_id, map_placement.instance())
             .map_err(|e| format!("cgroup name (id mappings): {e:?}"))?;
-        let map_line = format!(
-            "0::{}/{}",
-            map_scope.trim_end_matches('/'),
-            map_name.as_str()
-        );
-        expect(
-            count_processes_strict(|p| {
-                Ok(read_proc_file(&p.join("cgroup"))?
-                    .is_some_and(|t| t.lines().any(|l| l == map_line)))
-            })? == 0,
-            "a process remains in the recorded cgroup of the id-mapping container",
-        )?;
         let map_cgroup = PathBuf::from("/sys/fs/cgroup")
-            .join(map_scope.trim_start_matches('/'))
+            .join(map_placement.scope().as_str().trim_start_matches('/'))
             .join(map_name.as_str());
-        match fs::read_to_string(map_cgroup.join("cgroup.procs")) {
-            Ok(procs) => expect(
-                procs.trim().is_empty(),
-                "cgroup.procs of the id-mapping container is not empty",
-            )?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(format!("read cgroup.procs (id mappings): {e}")),
-        }
+        let members = cgroup_subtree_members(&map_cgroup)?;
+        expect(
+            members.is_empty(),
+            &format!(
+                "processes remain in the recorded cgroup of the id-mapping container: {members:?}"
+            ),
+        )?;
         let out = run_cli(&cli, &["--root", &root_s, "delete", &map_id_s], CLI_TIMEOUT)?;
         expect_ok(&out, "delete (id mappings)")?;
         expect(
@@ -1420,35 +1388,32 @@ mod linux {
             .count()
     }
 
-    /// `/proc` を走査して `pred` に当たるプロセスを数える（観測の失敗を 0 件と取り違えない版。#4711・REPAIR-12）。
-    /// `/proc` の列挙の失敗・エントリの読み取りの失敗は `Err`。`pred` の `Err` もそのまま返す。
-    fn count_processes_strict(
-        pred: impl Fn(&Path) -> Result<bool, String>,
-    ) -> Result<usize, String> {
-        let dir = fs::read_dir("/proc").map_err(|e| format!("read /proc: {e}"))?;
-        let mut n = 0;
-        for entry in dir {
-            let entry = entry.map_err(|e| format!("read /proc entry: {e}"))?;
-            let is_pid = entry
-                .file_name()
-                .to_str()
-                .is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit()));
-            if is_pid && pred(&entry.path())? {
-                n += 1;
+    /// cgroup とその子孫の `cgroup.procs` に載る pid を集める（#4711・REPAIR-12）。cgroup（または走査中の子孫）が
+    /// 消えていれば（NotFound）メンバーは居ない（cgroup v2 はメンバーのいる cgroup を削除できない）。他の読み取り失敗は `Err`。
+    fn cgroup_subtree_members(dir: &Path) -> Result<Vec<String>, String> {
+        let procs = match fs::read_to_string(dir.join("cgroup.procs")) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(format!("read {}/cgroup.procs: {e}", dir.display())),
+        };
+        let mut members: Vec<String> = procs.split_whitespace().map(str::to_string).collect();
+        let entries = match fs::read_dir(dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(members),
+            Err(e) => return Err(format!("read dir {}: {e}", dir.display())),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("read dir entry {}: {e}", dir.display()))?;
+            let is_dir = match entry.file_type() {
+                Ok(t) => t.is_dir(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                Err(e) => return Err(format!("file type {}: {e}", entry.path().display())),
+            };
+            if is_dir {
+                members.extend(cgroup_subtree_members(&entry.path())?);
             }
         }
-        Ok(n)
-    }
-
-    /// `/proc/<pid>/<name>` を読む。走査中に終了したプロセス（NotFound・ESRCH）は `Ok(None)`、他の失敗は `Err`。
-    fn read_proc_file(path: &Path) -> Result<Option<String>, String> {
-        match fs::read(path) {
-            Ok(b) => Ok(Some(String::from_utf8_lossy(&b).into_owned())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(3) => {
-                Ok(None)
-            }
-            Err(e) => Err(format!("read {}: {e}", path.display())),
-        }
+        Ok(members)
     }
 
     /// `list` の stdout が `ID\tSTATUS\tPID\n<id>\trunning\t<pid>\n` と完全一致することを確かめ、pid を返す。

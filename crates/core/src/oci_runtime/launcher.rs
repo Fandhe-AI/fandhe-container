@@ -98,8 +98,8 @@
 //!   `build` が `JoinPinned`・参加先・権限モデル(rootless の 2 種。ambient に `CAP_SYS_ADMIN` を持つ非 root を含む)の組を
 //!   fork の前に検査する。pod の join との併用は拒否する。供給側(`NetworkPlugin::create_netns` の結果の配線)は #3074・#4724
 //! - **範囲写像の入力元**: `/etc/subuid`・`/etc/subgid` と `newuidmap` / `newgidmap`(`SubordinateIdSource`)
-//!   だけ。config の `linux.uidMappings` / `gidMappings` は `start` が引き続き拒否する(受理は SEC-5 に関わる
-//!   オーナー判断事項で、#2240 で判断待ち。`docs/design/config-id-mappings.md`)。supervisor が `RootlessSubordinateIds` を選ぶ経路は結線済み(#2243。subuid / subgid の設定の有無で選ぶ)
+//!   だけ。config の `linux.uidMappings` / `gidMappings` は `start` が引き続き拒否する(受けないことは #2240 で
+//!   決定済み（2026-11-13・案 A）。`docs/design/config-id-mappings.md`)。supervisor が `RootlessSubordinateIds` を選ぶ経路は結線済み(#2243。subuid / subgid の設定の有無で選ぶ)
 //! - **mapper と helper の回収**: mapper は I が fork 前に設定した `LaunchTag` を継承するため、I が期限で殺されて
 //!   C へ再親付けされても `rescan` の探索対象になる。I は範囲写像の失敗時に mapper を kill せず `R` を報告し、C が
 //!   I の回収後に同じ探索で回収する。mapper が起動する `newuidmap` / `newgidmap`(helper)は exec で `comm` が

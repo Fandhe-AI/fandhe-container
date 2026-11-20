@@ -1416,7 +1416,7 @@ mod linux {
             "probe",
             &["proc", "dev", "tmp", "etc"],
         )?;
-        // uidMappings / gidMappings・cgroupsPath は書かない（それぞれ UNIMPLEMENTED で拒否される）。
+        // uidMappings / gidMappings・cgroupsPath は書かない（非空だと INVALID_ARGUMENT で拒否される）。
         let config = format!(
             r#"{{"ociVersion":"1.2.0","root":{{"path":"rootfs","readonly":false}},"hostname":"fandhe-ssd",
 "process":{{"user":{{"uid":0,"gid":0}},"args":["/probe","--container-probe"],

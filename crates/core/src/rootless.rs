@@ -56,7 +56,7 @@
 //!   `/etc/passwd` を先に読み、無いときだけ `getent` を期限つきで実行して行う（#2390・SEC-5・CORE-6。
 //!   `docs/design/subid-owner-resolution.md`）。core は [`SubIdOwner`] に数値 uid と検証済みユーザー名を
 //!   受け取るだけで、ライブラリコードは `$USER` を読まない
-//! - `oci_runtime` の `linux.uidMappings` / `gidMappings` の受理（start.rs は現状拒否のまま。受けるかは SEC-5 に関わるオーナー判断待ち。#2240・`docs/design/config-id-mappings.md`）
+//! - `oci_runtime` の `linux.uidMappings` / `gidMappings` の受理（start.rs は拒否のまま。#2240 で受けないと決定済み・案 A。`docs/design/config-id-mappings.md`）
 //!
 //! ファイル所有者の写像（SEC-5。ns 内 0 → ホスト非特権 UID）の照合は `tests/rootless_file_owner.rs`
 //! （TASK-40.3・#189）が担う。

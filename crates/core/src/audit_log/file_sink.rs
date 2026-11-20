@@ -981,6 +981,14 @@ impl FileAuditSink {
         sys::set_child_signal_ignored_for_test(ignored).is_ok()
     }
 
+    /// 結合試験専用: 自プロセスの `RLIMIT_NPROC`（soft・hard とも）を `max` に下げる（実 fork の `EAGAIN` の再現用。
+    /// `prlimit` コマンドに頼らない。#4702・SEC-4）。成功なら `true`。戻せないため再起動した子でだけ呼ぶ。
+    #[cfg(all(target_os = "linux", feature = "exec-test-support"))]
+    #[doc(hidden)]
+    pub fn limit_processes_for_test(max: u64) -> bool {
+        sys::set_rlimit_self(crate::rlimits::RlimitKind::Nproc, max, max).is_ok()
+    }
+
     /// 結合試験専用: 自プロセスのスレッド数（macOS の `tests/audit_sink_isolation.rs` が `/proc` の代わりに使う。
     /// `proc_pidinfo` の `pti_threadnum`）。数えられなければ `None`。
     #[cfg(all(target_os = "macos", feature = "exec-test-support"))]

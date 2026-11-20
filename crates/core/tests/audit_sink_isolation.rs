@@ -331,7 +331,7 @@ mod imp {
             .join(tag)
     }
 
-    /// `prlimit` 配下で再起動された子の入口の引数（`fork_again_is_reported_as_isolation_fork_again` が渡す）。
+    /// 自分で `RLIMIT_NPROC` を下げる再起動された子の入口の引数（`fork_again_is_reported_as_isolation_fork_again` が渡す）。
     #[cfg(target_os = "linux")]
     const FORK_AGAIN_CHILD_ARG: &str = "--fork-again-child";
 
@@ -577,13 +577,36 @@ mod imp {
             .unwrap()
     }
 
+    /// 子の出力ファイルの読み取り上限。ディスクへの書き込み自体は止められないため（`File` を直接渡す方式の代償）、
+    /// 読む側で先頭だけに絞り、上限超過は失敗にする（無制限のメモリ確保を避ける。REPAIR-5）。
+    #[cfg(target_os = "linux")]
+    const FORK_AGAIN_OUTPUT_CAP: u64 = 64 * 1024;
+
+    #[cfg(target_os = "linux")]
+    fn read_capped(path: &Path) -> String {
+        use std::io::Read;
+        let len = std::fs::metadata(path).unwrap().len();
+        assert!(
+            len <= FORK_AGAIN_OUTPUT_CAP,
+            "child output {} is {len} bytes (cap {FORK_AGAIN_OUTPUT_CAP})",
+            path.display()
+        );
+        let mut buf = String::new();
+        std::fs::File::open(path)
+            .unwrap()
+            .take(FORK_AGAIN_OUTPUT_CAP)
+            .read_to_string(&mut buf)
+            .unwrap();
+        buf
+    }
+
     /// 子が `RLIMIT_NPROC` の効かないことを親へ知らせる 1 行（子の事前確認で spawn が成功した場合）。
     #[cfg(target_os = "linux")]
     const FORK_AGAIN_NOT_ENFORCED: &str = "fork_again child: RLIMIT_NPROC is not enforced";
 
     /// SEC-4・REPAIR-12・#4702: 実 fork が `EAGAIN` で失敗したとき、`FileAuditSink` は主経路の失敗種別を
     /// `isolation_fork_again` として代替経路へ渡す（汎用の `isolation_unavailable` へ畳まない）。
-    /// `RLIMIT_NPROC` を `prlimit --nproc=1`（util-linux。`PATH` から解決）で下げた自分自身を子として起動する
+    /// 自分自身を子として再起動し、子が `FileAuditSink::limit_processes_for_test(1)` で `RLIMIT_NPROC` を下げる
     /// （試験コードに unsafe を持ち込まない）。上限は同じ uid の全プロセス数で数えるため、親（本プロセス）が居る限り
     /// 子の fork は `EAGAIN` になる。子は本題の前に spawn を 1 回試して上限が効くことを確かめる。root と
     /// `CAP_SYS_ADMIN`・`CAP_SYS_RESOURCE` を持つ場合は上限が効かないため適用外を明示して飛ばし、それ以外で
@@ -600,9 +623,7 @@ mod imp {
         let dir = tmp_marker("fork-again");
         std::fs::create_dir(&dir).unwrap();
         let (out_path, err_path) = (dir.join("stdout"), dir.join("stderr"));
-        let spawned = std::process::Command::new("prlimit")
-            .arg("--nproc=1")
-            .arg(std::env::current_exe().unwrap())
+        let spawned = std::process::Command::new(std::env::current_exe().unwrap())
             .arg(FORK_AGAIN_CHILD_ARG)
             .arg(&dir)
             .stdin(std::process::Stdio::null())
@@ -611,7 +632,7 @@ mod imp {
             .spawn();
         let mut child = match spawned {
             Ok(c) => c,
-            Err(e) => panic!("prlimit (util-linux) is required on PATH: {e}"),
+            Err(e) => panic!("cannot re-launch the test binary: {e}"),
         };
         let status = match super::reap::wait_within(&mut child, Duration::from_secs(30)) {
             Ok(s) => s,
@@ -620,8 +641,8 @@ mod imp {
                 panic!("fork_again child did not finish: {e}");
             }
         };
-        let stdout = std::fs::read_to_string(&out_path).unwrap();
-        let stderr = std::fs::read_to_string(&err_path).unwrap();
+        let stdout = read_capped(&out_path);
+        let stderr = read_capped(&err_path);
         assert!(
             status.success(),
             "child failed: {status:?}, stdout={stdout}, stderr={stderr}"
@@ -645,14 +666,22 @@ mod imp {
         println!("audit_sink_isolation: fork_again reaches the fallback as isolation_fork_again");
     }
 
-    /// `prlimit` 配下の子の本体。`dir` は親が `ScratchDir` 配下に作った実行ごとのディレクトリ。spawn を 1 回試して
+    /// 再起動された子の本体。最初に自分の `RLIMIT_NPROC` を 1 に下げる。`dir` は親が `ScratchDir` 配下に作った実行ごとのディレクトリ。spawn を 1 回試して
     /// `EAGAIN` になる（上限が効く）ことを確かめ、効かなければその旨の 1 行だけを出して終わる。効けば両経路を
     /// 失敗させ、代替経路が見た主経路の失敗種別を 1 行で標準出力へ出す（親が照合する）。通知の子・スレッドも
     /// 作れず通知 1 行は出ない。
     #[cfg(target_os = "linux")]
     fn fork_again_child(dir: &Path) {
-        match std::process::Command::new("true").status() {
-            Ok(_) => {
+        assert!(
+            FileAuditSink::limit_processes_for_test(1),
+            "lowering RLIMIT_NPROC must succeed"
+        );
+        // 上限が効かず `true` が起動した場合に待ち続けないよう、spawn と期限つきの待ちに分ける。
+        match std::process::Command::new("true").spawn() {
+            Ok(mut c) => {
+                if super::reap::wait_within(&mut c, Duration::from_secs(10)).is_err() {
+                    let _ = super::reap::reap(&mut c, super::reap::reap_within());
+                }
                 println!("{FORK_AGAIN_NOT_ENFORCED}");
                 return;
             }

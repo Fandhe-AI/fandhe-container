@@ -4,7 +4,7 @@
 //! `create` / `start` は core の `oci_runtime::create` / `start` を直接呼ぶ（TASK-79.2.1・#866。`create_start` module）。
 //! ただし `start` は core を呼ばず、CLI と同じディレクトリの supervisor の bin を起動して結果の 1 行を期限付きで受け取る
 //! （#1718・`supervisor_start` module）。supervisor は core の本番 launcher（#1715・#1819）でコンテナのプロセスを起動する（rootless のみ。
-//! rootful は `UNIMPLEMENTED`（8）。実機での通し確認は #2062）。同じディレクトリに supervisor が無ければ `FAILED_PRECONDITION`（5）で失敗する（REPAIR-3）。
+//! rootful（uid 0）は `PERMISSION_DENIED`（6。方針による恒久拒否・#2241）。実機での通し確認は #2062）。同じディレクトリに supervisor が無ければ `FAILED_PRECONDITION`（5）で失敗する（REPAIR-3）。
 //! `kill <id> [<signal>]`（#1902）は同じ core の `kill` を意図なしの `production_signaler` で呼び、シグナルを 1 回送るだけ（`stop_delete` module）。
 //! `stop` / `delete` は core の `oci_runtime::kill`（既定 SIGTERM。`--signal` で上書き。#2775）/ `delete` を直接呼ぶ（TASK-79.2.2・#867。`stop_delete` module）。
 //! `stop` の本番 `ProcessSignaler` は supervisor の制御チャネル経由（`stop_delete::production_signaler`。#2059・SEC-1）で、
@@ -34,7 +34,7 @@
 //! - 分離の単体テストは `setup::tests::cli2_daily_commands_do_not_request_os_setup`（TASK-80.3）。
 //!
 //! 将来仕様（本実装の範囲外）:
-//! - start: uid 0 の起動（`RootfulHostRoot`。現状は `UNIMPLEMENTED`。#2241 のオーナー判断待ち）。
+//! - start: uid 0 の起動（`RootfulHostRoot`。方針による恒久拒否で `PERMISSION_DENIED`。#2241 で決定済み）。
 //! - stop の猶予 → SIGKILL（#1545）。stop の意図の伝達（SUP-9）は `stop_delete` で結線済み（#2162・#2440）。
 //! - list の JSON 出力: serde 系の配線か core の公開ライタが前提（`list_logs` module の doc 参照。TASK-95・TASK-98）。
 //! - macOS / Windows は plugin 発見機構経由（TASK-79.4・#641・PLUG-4。`plugin_backend` module）。発見 → 登録 → 信頼性検証までを

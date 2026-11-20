@@ -261,7 +261,7 @@ const DEVPTS_GID: u32 = sys::DevptsGid::TTY_GID;
 /// `Rootful` は基本デバイスを `mknodat(2)` で作り、`Rootless` はホストのノードを bind で供給する
 /// （`DeviceSupply`。#1660）。`mknod` の `EPERM` を見て経路を切り替える方式にはせず、この申告で明示的に決める。
 ///
-/// 呼び出し元（本番 launcher〔`oci_runtime::launcher`〕。rootless は検証済みの写像から `Rootless(gid_map)` を渡す。`Rootful` を本番で使うかは #2241 の判断待ちで、launcher は `RootfulHostRoot` を `Unimplemented` で拒否する）が、すでに検証済みの写像を渡す。子（PID 1）側で
+/// 呼び出し元（本番 launcher〔`oci_runtime::launcher`〕。rootless は検証済みの写像から `Rootless(gid_map)` を渡す。`Rootful` は本番では使わず（#2241 の決定）、launcher は `RootfulHostRoot` を `PermissionDenied` で拒否する）が、すでに検証済みの写像を渡す。子（PID 1）側で
 /// `/proc/self/gid_map` を独自に解析し直さない。申告が実態とずれた場合も緩む方向には働かない:
 /// rootless で `Rootful` を渡すと `gid=5` が写像されずカーネルが `EINVAL` で拒否し（fail-closed）、
 /// rootful で `Rootless` を渡すと `gid=` が付かないだけで権限は広がらない。

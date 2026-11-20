@@ -2580,9 +2580,9 @@ mod linux {
     /// `/proc/self/status` の内容から launcher の権限モデルを決める（純関数。#1819・SEC-5・CORE-6）。
     ///
     /// real / effective / saved / fs のいずれかの uid が 0 なら rootful で、core の本番 launcher が
-    /// `RootfulHostRoot` を `Unimplemented` で拒否するのと揃えて、同じコードで拒否する（コンテナ内 root を
+    /// `RootfulHostRoot` を `PermissionDenied` で拒否するのと揃えて、同じコードで拒否する（コンテナ内 root を
     /// ホスト root に写す起動を作らない）。それ以外は `RootlessSingleId`（特権ランチャーの ambient capability 経由でも
-    /// uid は非 root）。rootful を許すかは #2241 で判断待ち（`docs/design/rootful-host-root.md`）。読めない・壊れた入力は fail-closed に `FailedPrecondition`。
+    /// uid は非 root）。rootful の恒久拒否は #2241 の決定（D1 A・D2 A。`docs/design/rootful-host-root.md`）で、権限昇格は特権ランチャー（SUP-14）で行う。監査（SEC-4）には記録しない（構成の選択であり脱出の試行ではない）。読めない・壊れた入力は fail-closed に `FailedPrecondition`。
     ///
     /// ここでは rootful の拒否と 1 対 1 写像の既定だけを決める。範囲写像（`RootlessSubordinateIds`）への切り替えは
     /// `resolve_launch_privilege` が subuid / subgid の設定で行う（選択規則は `crate::id_model` の module doc。#2243）。
@@ -2592,8 +2592,8 @@ mod linux {
         let uid = snapshot.uid;
         if [uid.real, uid.effective, uid.saved, uid.fs].contains(&0) {
             return Err(TraitError::new(
-                ErrorCode::Unimplemented,
-                "rootful start is not supported by the production launcher",
+                ErrorCode::PermissionDenied,
+                "rootful start is permanently refused by the privilege model policy",
             ));
         }
         Ok(IsolationPrivilege::RootlessSingleId)
@@ -5273,13 +5273,13 @@ mod linux {
             );
         }
 
-        /// SEC-5: rootful は従来どおり UNIMPLEMENTED（設定ファイルに依らない）。
+        /// SEC-5: rootful はPERMISSION_DENIED（#4709）（設定ファイルに依らない）。
         #[test]
         fn sec5_rootful_still_rejected_before_any_file_is_read() {
             let e = resolve_with("root", Some(ALICE), None, None, "0\t0\t0\t0")
                 .err()
                 .unwrap();
-            assert_eq!(e.code(), ErrorCode::Unimplemented);
+            assert_eq!(e.code(), ErrorCode::PermissionDenied);
         }
 
         /// REPAIR-1・SUP-3: launcher の構築器は 1 か所（start と restart の再 launch が同じ設定を使う）。
@@ -5564,9 +5564,9 @@ mod linux {
         }
 
         /// SEC-5・#1819: real / effective / saved / fs のどれかが 0 なら rootful として、core の launcher と同じ
-        /// `Unimplemented`（固定文言）で副作用の前に拒否する。
+        /// `PermissionDenied`（固定文言）で副作用の前に拒否する。
         #[test]
-        fn sec5_any_root_uid_is_rejected_as_unimplemented() {
+        fn sec5_any_root_uid_is_rejected_as_permission_denied() {
             for uid in [
                 "0\t1000\t1000\t1000",
                 "1000\t0\t1000\t1000",
@@ -5576,10 +5576,10 @@ mod linux {
             ] {
                 let e = privilege_for_status(&status(uid, "1000\t1000\t1000\t1000"))
                     .expect_err("rootful must be rejected");
-                assert_eq!(e.code(), ErrorCode::Unimplemented, "uid: {uid}");
+                assert_eq!(e.code(), ErrorCode::PermissionDenied, "uid: {uid}");
                 assert_eq!(
                     e.message(),
-                    "rootful start is not supported by the production launcher"
+                    "rootful start is permanently refused by the privilege model policy"
                 );
             }
         }

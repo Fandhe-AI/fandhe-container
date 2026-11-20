@@ -175,8 +175,8 @@ fn expected_check_failure() -> Option<(ErrorCode, &'static str)> {
     let euid_is_root = std::fs::metadata("/proc/self").is_ok_and(|m| m.uid() == 0);
     if euid_is_root {
         return Some((
-            ErrorCode::Unimplemented,
-            "rootful start is not supported by the production launcher",
+            ErrorCode::PermissionDenied,
+            "rootful start is permanently refused by the privilege model policy",
         ));
     }
     fandhe_container_core::landlock::detect_landlock_abi()

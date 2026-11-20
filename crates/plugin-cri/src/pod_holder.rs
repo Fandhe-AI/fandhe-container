@@ -285,7 +285,7 @@ impl ProductionPodHolder {
             return Ok(());
         }
         match current_euid() {
-            Ok(0) => Err(TraitError::new(ErrorCode::Unimplemented, MSG_ROOTFUL)),
+            Ok(0) => Err(TraitError::new(ErrorCode::PermissionDenied, MSG_ROOTFUL)),
             Ok(_) => Ok(()),
             Err(()) => Err(TraitError::new(
                 ErrorCode::FailedPrecondition,

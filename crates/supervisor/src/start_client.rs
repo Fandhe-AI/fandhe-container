@@ -80,8 +80,8 @@
 //!   があれば rootful のインストールとみなし、`systemd-run ... -- <launcher> start --root <root> <id>` で起動する
 //!   （`process_group(0)` は付けない。ランチャーの `setsid` が `EPERM` になるため。stdio に pty は渡さない）。無ければ従来の
 //!   直接経路。在るが通常ファイル・実行可能・所有者 root か euid・g/o 書き込み不可でなければ `FAILED_PRECONDITION` で止め、
-//!   直接経路へ黙って落とさない。uid 0 の起動はランチャーの前提（呼び出し元は非 root）に反し、`RootfulHostRoot` の判断
-//!   （#2241）待ちのため今のまま `UNIMPLEMENTED`。実機での通し確認は未実施（#538・#539）。
+//!   直接経路へ黙って落とさない。uid 0 の起動はランチャーの前提（呼び出し元は非 root）に反し、`RootfulHostRoot` は #2241 の決定どおり
+//!   spawn 前に意図して `PERMISSION_DENIED` で拒否する。実機での通し確認は未実施（#538・#539）。
 //! - supervisor の fd 2 へ直接書かれるもの（core の診断・panic のメッセージ等）は保存されない（stderr が null のため捨てられる。
 //!   範囲は `supervisor_log` の「未実装・残余」。`legacy_tiocsti` の警告は supervisor のログへ残る。#2008）。
 //! - 親から継承した CLOEXEC の無い fd は CLI では閉じない。supervisor の bin の入口が fd 3 以降を閉じる
@@ -506,13 +506,13 @@ pub fn production_deadline() -> Duration {
 }
 
 /// rootful 判定と euid の取得（SEC-5）。real / effective / saved / fs の uid のどれかが 0 なら
-/// supervisor の `privilege_for_status` と同じ文で `UNIMPLEMENTED`、読めない・壊れた入力は `FAILED_PRECONDITION`。
+/// supervisor の `privilege_for_status` と同じ文で `PERMISSION_DENIED`、読めない・壊れた入力は `FAILED_PRECONDITION`。
 fn privilege_gate(status_text: Option<&str>) -> Result<u32, OciRuntimeError> {
     match status_text.map(identity_from_status) {
         Some(Identity::Rootless { euid }) => Ok(euid),
         Some(Identity::Rootful) => Err(start_error(
-            ErrorCode::Unimplemented,
-            "rootful start is not supported by the production launcher",
+            ErrorCode::PermissionDenied,
+            "rootful start is permanently refused by the privilege model policy",
         )),
         Some(Identity::Unreadable) | None => Err(start_error(
             ErrorCode::FailedPrecondition,
@@ -1032,7 +1032,7 @@ mod tests {
 
     /// SEC-5・CLI-1: rootful（どの位置の uid が 0 でも）は UNIMPLEMENTED で拒否し、壊れた入力は FAILED_PRECONDITION。
     #[test]
-    fn sec5_cli_rootful_is_unimplemented() {
+    fn sec5_cli_rootful_is_permission_denied() {
         assert_eq!(
             privilege_gate(Some(&status_with_uid("1000\t1000\t1000\t1000"))).expect("rootless"),
             1000
@@ -1044,11 +1044,11 @@ mod tests {
             "1000\t1000\t1000\t0",
         ] {
             let e = privilege_gate(Some(&status_with_uid(uid))).expect_err(uid);
-            assert_eq!(e.code(), ErrorCode::Unimplemented, "{uid}");
-            assert_eq!(e.exit_code().get(), 8, "{uid}");
+            assert_eq!(e.code(), ErrorCode::PermissionDenied, "{uid}");
+            assert_eq!(e.exit_code().get(), 6, "{uid}");
             assert_eq!(
                 e.message(),
-                "rootful start is not supported by the production launcher"
+                "rootful start is permanently refused by the privilege model policy"
             );
         }
         for bad in [Some(""), Some("garbage"), None] {

@@ -12,7 +12,7 @@
 //!
 //! # 起動の順序(固定。いずれの拒否も fork より前で、副作用は無い)
 //!
-//! 1. 権限モデルの検査(`RootfulHostRoot` は `Unimplemented`。許すかはオーナー判断待ちで #2241・`docs/design/rootful-host-root.md`。`RootlessSubordinateIds` の写像の解決は構築時に済み、
+//! 1. 権限モデルの検査(`RootfulHostRoot` は方針による意図した恒久拒否で `PermissionDenied`。#2241（D1 A・D2 A）・`docs/design/rootful-host-root.md`。`RootlessSubordinateIds` の写像の解決は構築時に済み、
 //!    ホスト ID 0 を含む・helper が無い構成は構築が拒否する。CORE-6・SEC-5・#2009)
 //! 2. cgroup 要件の検査(`launch_after_cgroup_check`。要件ありで参加の源が無ければ `FailedPrecondition`。CORE-3)
 //! 3. 呼び出しプロセスが単一スレッドであることの確認(`FailedPrecondition`。CORE-1)
@@ -84,8 +84,10 @@
 //!   (`check_additional_gids_mapped`。単一 ID 写像では指定を拒否)、同じ削減段が `setgroups(list)` で適用して読み戻す(#2667)。
 //!   名前形式の `User` の解決は未対応(exec 経路の非 root は #2770 で対応済み)
 //! - **権限モデル**: `RootlessSingleId` と `RootlessSubordinateIds`(#2009)を扱う。`RootfulHostRoot`
-//!   (SEC-5・CORE-7・CORE-9。start が user namespace を必須とするため、start を通る構成では到達しない。
-//!   許すかはオーナー判断待ちで #2241・`docs/design/rootful-host-root.md`)は、決まるまで `Unimplemented` で拒否する
+//!   (SEC-5・CORE-7・CORE-9。start が user namespace を必須とするため、start を通る構成では到達しない)は、
+//!   #2241（D1 A・D2 A。`docs/design/rootful-host-root.md`）の決定どおり意図して恒久的に `PermissionDenied` で拒否する
+//!   （未実装ではない。権限昇格は特権ランチャー〔SUP-14〕で足りる）。exec の `plan_rootful_host_root`・`isolate_rootful_host_root` は
+//!   結合試験・計測用の下位 API（D3 A-1）として残り、この launcher からは呼ばれない。監査（SEC-4）には記録しない
 //! - **network のモード(NET-6・NET-9・CORE-6・#1939)**: `Host`・`Loopback`・`Attachable` は exec 直前の同期点を通す
 //!   (`exec::netns_sync`)。`Attachable`(rootless の pasta 構成)は netns と user namespace の fd を子が C へこの順で渡し、
 //!   `ProductionLauncherBuilder::netns_attach_hook` のフックが成功したときだけ C が合図を送る。フックの失敗・期限切れでは
@@ -301,7 +303,7 @@ impl ProductionLauncher {
 #[cfg(target_os = "linux")]
 impl ProductionLauncherBuilder {
     /// 分離の権限モデル。`RootlessSingleId` と `RootlessSubordinateIds`(要 [`Self::subordinate_ids`])を扱い、
-    /// `RootfulHostRoot` は launch が `Unimplemented` で拒否する(モジュール doc。許すかは #2241 で判断待ち)。
+    /// `RootfulHostRoot` は launch が `PermissionDenied` で意図して拒否する(モジュール doc。#2241 で決定済み)。
     #[must_use]
     pub fn privilege(mut self, privilege: IsolationPrivilege) -> Self {
         self.privilege = Some(privilege);
@@ -555,7 +557,7 @@ fn check_attach_hook_pairing(
 /// - `JoinPinned` で参加先が無い: `InvalidArgument`
 /// - 参加先があるのに `JoinPinned` でない: `InvalidArgument`(取り違えを黙って無視しない)
 /// - `JoinPinned` が rootless の 2 種(特権ランチャー経由で ambient に `CAP_SYS_ADMIN` を持つ非 root を含む)以外の権限モデル:
-///   `Unimplemented`(`RootfulHostRoot` は #2241 で恒久拒否のまま。挙動を変えない)
+///   `Unimplemented`(`RootfulHostRoot` は `check_privilege` が先に `PermissionDenied` で拒否する〔#2241〕ため、実際には到達しない多重防御)
 #[cfg(target_os = "linux")]
 fn check_netns_join_pairing(
     privilege: IsolationPrivilege,
@@ -1644,8 +1646,8 @@ impl Inner {
             // 写像は構築時に解決済み。無ければ構築の不整合として拒否する(fail-closed)。
             IsolationPrivilege::RootlessSubordinateIds if self.subordinate.is_some() => Ok(()),
             IsolationPrivilege::RootfulHostRoot => Err(TraitError::new(
-                ErrorCode::Unimplemented,
-                "the rootful privilege model is not supported by the launcher",
+                ErrorCode::PermissionDenied,
+                "rootful start is permanently refused by the privilege model policy",
             )),
             IsolationPrivilege::RootlessSubordinateIds => Err(TraitError::new(
                 ErrorCode::InvalidArgument,
@@ -3873,9 +3875,9 @@ mod tests {
         assert_eq!(ev.lock().unwrap().as_slice(), ["threads"]);
     }
 
-    /// SEC-5: 未実装の権限モデル(`RootfulHostRoot`)は `Unimplemented` で、何も呼ばずに拒否する。
+    /// SEC-5・CORE-6(#4709): `RootfulHostRoot` は方針による恒久拒否で `PermissionDenied`。何も呼ばずに拒否する。
     #[test]
-    fn sec5_unimplemented_privilege_models_are_refused_before_fork() {
+    fn sec5_rootful_privilege_model_is_refused_before_fork() {
         let spec = spec_for("priv", serde_json::json!({}));
         let ev = events();
         let l = launcher(FakeOps::new(&ev), IsolationPrivilege::RootfulHostRoot, None);
@@ -3883,15 +3885,15 @@ mod tests {
             .launch(&spec, Duration::from_secs(1))
             .err()
             .expect("refused");
-        assert_eq!(err.code(), ErrorCode::Unimplemented);
+        assert_eq!(err.code(), ErrorCode::PermissionDenied);
         assert_eq!(
             err.message(),
-            "the rootful privilege model is not supported by the launcher"
+            "rootful start is permanently refused by the privilege model policy"
         );
         assert!(ev.lock().unwrap().is_empty());
     }
 
-    /// SEC-5・CORE-6(#2397): `RootfulHostRoot` の拒否(`Unimplemented`)は `process.user` の照合より先に返る。
+    /// SEC-5・CORE-6(#2397): `RootfulHostRoot` の拒否(`PermissionDenied`)は `process.user` の照合より先に返る。
     /// `RootfulHostRoot` は uid/gid が (0, 0) なら照合を通るため、写像の外の (1000, 1000) で順序を区別する。
     /// 対照として `RootlessSingleId` は同じ spec を user 照合で拒否する(選んだ uid が実際に照合で落ちる証拠)。
     #[test]
@@ -3904,10 +3906,10 @@ mod tests {
             .launch(&spec, Duration::from_secs(1))
             .err()
             .expect("refused");
-        assert_eq!(err.code(), ErrorCode::Unimplemented);
+        assert_eq!(err.code(), ErrorCode::PermissionDenied);
         assert_eq!(
             err.message(),
-            "the rootful privilege model is not supported by the launcher"
+            "rootful start is permanently refused by the privilege model policy"
         );
         assert_ne!(
             err.message(),

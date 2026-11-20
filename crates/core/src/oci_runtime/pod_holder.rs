@@ -50,7 +50,7 @@
 //!
 //! - 保持役のプロセス(`pod-holder` モード。READY フレーム・終了条件・fd の整理)は #2874
 //! - `NamespaceJoin` の net 対応(user + ipc + net の join)は #2872
-//! - `RootfulHostRoot` は #2241 のオーナー判断まで `Unimplemented`
+//! - `RootfulHostRoot` は #2241 の決定（D1 A）で恒久拒否し `PermissionDenied`
 //!
 //! エラーは `TraitError` で返し、文言は固定の英語でパス・pid・errno・写像の値を含めない(REPAIR-4)。
 
@@ -68,7 +68,7 @@ use crate::sys;
 use crate::traits::{ErrorCode, TraitError};
 
 const MSG_MULTI_THREADED: &str = "the pod holder must be called from a single-threaded process";
-const MSG_ROOTFUL: &str = "the rootful privilege model is not supported for the pod holder";
+const MSG_ROOTFUL: &str = "rootful start is permanently refused by the privilege model policy";
 const MSG_MAP_MISMATCH: &str = "the pod holder id mapping does not match the expected mapping";
 const MSG_NOT_OWNED: &str = "the pod holder namespaces are not owned by the pod user namespace";
 const MSG_NOT_NEW: &str = "the pod holder user namespace was not created";
@@ -152,11 +152,11 @@ impl PodHolderNamespaces {
     }
 }
 
-/// 副作用の前の権限モデルの検査(純関数)。`RootfulHostRoot` は #2241 の判断まで `Unimplemented`。
+/// 副作用の前の権限モデルの検査(純関数)。`RootfulHostRoot` は #2241 の決定（D1 A）で恒久拒否し `PermissionDenied`。
 fn check_request(privilege: IsolationPrivilege) -> Result<(), TraitError> {
     match privilege {
         IsolationPrivilege::RootfulHostRoot => {
-            Err(TraitError::new(ErrorCode::Unimplemented, MSG_ROOTFUL))
+            Err(TraitError::new(ErrorCode::PermissionDenied, MSG_ROOTFUL))
         }
         _ => Ok(()),
     }
@@ -809,11 +809,11 @@ mod tests {
         assert_eq!(err.message(), MSG_MULTI_THREADED);
     }
 
-    /// rootful は #2241 の判断まで `Unimplemented`。
+    /// rootful は #2241 の決定で恒久拒否（`PermissionDenied`）。
     #[test]
-    fn sec5_2870_rootful_is_unimplemented() {
+    fn sec5_2870_rootful_is_permission_denied() {
         let err = check_request(IsolationPrivilege::RootfulHostRoot).expect_err("rootful");
-        assert_eq!(err.code(), ErrorCode::Unimplemented);
+        assert_eq!(err.code(), ErrorCode::PermissionDenied);
         assert_eq!(err.message(), MSG_ROOTFUL);
         assert_eq!(check_request(IsolationPrivilege::RootlessSingleId), Ok(()));
     }

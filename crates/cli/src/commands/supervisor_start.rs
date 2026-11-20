@@ -8,7 +8,7 @@
 //!
 //! 権限モデルの選択（#2442・SUP-14）: 非 root で実体の隣に信頼できる `fandhe-container-launcher` があれば rootful のインストールと
 //! みなしてランチャー経由で起動する（`process_group(0)` なし・pty なし）。無ければ従来の直接経路（rootless）。uid 0 はランチャーの
-//! 前提（呼び出し元は非 root）に反し、`RootfulHostRoot`（#2241）の判断待ちのため `UNIMPLEMENTED` のまま。規則は共有クライアント側にある。
+//! 前提（呼び出し元は非 root）に反し、`RootfulHostRoot` は #2241 の決定どおり `PERMISSION_DENIED` で恒久拒否。規則は共有クライアント側にある。
 //!
 //! `--audit-policy`(SEC-4・#2761): CLI の `start --audit-policy <best-effort|strict>` を検証した値を、指定されたときだけ
 //! supervisor の argv へ渡す(未指定は supervisor の既定 best-effort)。restart の再 launch は supervisor が start で受けた値を使う。

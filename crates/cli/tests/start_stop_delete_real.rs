@@ -179,6 +179,8 @@ mod linux {
     const OPT_ENV_LINE: &str = "stdout OPT_ENV observed-2761";
     /// create に渡す `--cap-drop`（Docker 互換の接頭辞なし表記。正規化は core の `parse_drop_list` が担う。#2833・SEC-1・CLI-1）。
     const OPT_CAP_DROP: &str = "NET_RAW";
+    /// config の ID 写像の拒否の固定文言（core の `reject_config_id_mappings`。#4711・SEC-5・CORE-6）。
+    const ID_MAPPINGS_MESSAGE: &str = "linux.uidMappings / linux.gidMappings are not accepted: ID mappings are derived from the runtime privilege model (SEC-5)";
     /// OCI 既定 14 個のビットマスク（`CapBnd` 等。bit 番号は Linux の capability 番号。#2833・SEC-1）。
     const OCI_DEFAULT_MASK: u64 = 0x0000_0000_a804_25fb;
     /// OCI 既定から NET_RAW（bit 13）だけを落としたマスク。`production_launcher` のシナリオ T（0xa00405fb）とは別の値。
@@ -319,6 +321,9 @@ mod linux {
                 );
                 println!(
                     "start_stop_delete_real: kill TERM ended the running container under restart policy no: state stopped without pid; recorded Stopped(43) without an explicit stop intent; second kill refused with FAILED_PRECONDITION; delete left no state dir"
+                );
+                println!(
+                    "start_stop_delete_real: cli start rejected config id mappings with exit 2 INVALID_ARGUMENT and the fixed message; state stayed created without pid; no process remained; delete left no state dir"
                 );
                 println!(
                     "start_stop_delete_real: scenario ok scope_present_before_delete={scope_present}"
@@ -1214,6 +1219,80 @@ mod linux {
             "state dir remains after delete (kill)",
         )?;
         cleanup.armed = false;
+
+        // 15. config の ID 写像の拒否（#4711・SEC-5・CLI-1）。create は通り、start が supervisor 経由で
+        // `INVALID_ARGUMENT`・終了コード 2・固定文言を返し、記録は `created` のまま・プロセスも残らない。
+        let map_id_s = format!("ssd{}map", std::process::id());
+        cleanup.id = map_id_s.clone();
+        let config_path = bundle.join("config.json");
+        let config = fs::read_to_string(&config_path).map_err(|e| format!("read config: {e}"))?;
+        let mapped = config.replacen(
+            "\"linux\":{",
+            "\"linux\":{\"uidMappings\":[{\"containerID\":0,\"hostID\":1000,\"size\":1}],\"gidMappings\":[{\"containerID\":0,\"hostID\":1000,\"size\":1}],",
+            1,
+        );
+        expect(
+            mapped != config,
+            "id mappings were not injected into config.json",
+        )?;
+        fs::write(&config_path, mapped).map_err(|e| format!("write mapped config: {e}"))?;
+        let out = run_cli(
+            &cli,
+            &["--root", &root_s, "create", "--bundle", bundle_s, &map_id_s],
+            CLI_TIMEOUT,
+        )?;
+        expect_ok(&out, "create (id mappings)")?;
+        cleanup.armed = true;
+        let out = run_cli(
+            &cli,
+            &["--root", &root_s, "start", &map_id_s],
+            START_TIMEOUT,
+        )?;
+        let (op, code) = op_and_code(&out.stderr)?;
+        if out.code != Some(2)
+            || !out.stdout.is_empty()
+            || op != "start"
+            || code != "INVALID_ARGUMENT"
+            || !out.stderr.contains(ID_MAPPINGS_MESSAGE)
+        {
+            return Err(format!(
+                "start with id mappings: want exit 2 op=start code=INVALID_ARGUMENT message {ID_MAPPINGS_MESSAGE:?}, got {:?} stdout={:?} stderr={:?}",
+                out.code, out.stdout, out.stderr
+            ));
+        }
+        let map_generation = {
+            let store = open_store(&root)?;
+            options_generation(&get_record(
+                &store,
+                &ContainerId::new(map_id_s.clone()).map_err(|e| format!("id (map): {e:?}"))?,
+            )?)?
+        };
+        check_json_plain(&map_generation, "generation (map)")?;
+        expect_state(
+            &cli,
+            &root_s,
+            &map_id_s,
+            &oci_state_line(
+                &map_id_s,
+                "created",
+                None,
+                bundle_s,
+                &[(GENERATION_ANNOTATION, map_generation.as_str())],
+            ),
+        )?;
+        expect(
+            count_processes(|p| {
+                fs::read_to_string(p.join("cmdline")).is_ok_and(|c| c.contains(&map_id_s))
+            }) == 0,
+            "a process mentioning the id-mapping container remains after the rejected start",
+        )?;
+        let out = run_cli(&cli, &["--root", &root_s, "delete", &map_id_s], CLI_TIMEOUT)?;
+        expect_ok(&out, "delete (id mappings)")?;
+        expect(
+            !root.join(&map_id_s).exists(),
+            "state dir remains after delete (id mappings)",
+        )?;
+        cleanup.armed = false;
         Ok(scope_present)
     }
 
@@ -1416,7 +1495,8 @@ mod linux {
             "probe",
             &["proc", "dev", "tmp", "etc"],
         )?;
-        // uidMappings / gidMappings・cgroupsPath は書かない（非空だと INVALID_ARGUMENT で拒否される）。
+        // uidMappings / gidMappings は書かない（非空は start が INVALID_ARGUMENT で拒否する。手順 15 が照合）。
+        // cgroupsPath も書かない（非空は `check_cgroups_path` が UNIMPLEMENTED で拒否する）。
         let config = format!(
             r#"{{"ociVersion":"1.2.0","root":{{"path":"rootfs","readonly":false}},"hostname":"fandhe-ssd",
 "process":{{"user":{{"uid":0,"gid":0}},"args":["/probe","--container-probe"],

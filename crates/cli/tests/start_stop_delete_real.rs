@@ -1277,13 +1277,10 @@ mod linux {
                 out.code, out.stdout, out.stderr
             ));
         }
-        let map_generation = {
-            let store = open_store(&root)?;
-            options_generation(&get_record(
-                &store,
-                &ContainerId::new(map_id_s.clone()).map_err(|e| format!("id (map): {e:?}"))?,
-            )?)?
-        };
+        let map_container_id =
+            ContainerId::new(map_id_s.clone()).map_err(|e| format!("id (map): {e:?}"))?;
+        let map_rec = get_record(&open_store(&root)?, &map_container_id)?;
+        let map_generation = options_generation(&map_rec)?;
         check_json_plain(&map_generation, "generation (map)")?;
         expect_state(
             &cli,
@@ -1313,6 +1310,37 @@ mod linux {
             }) == 0,
             "a process of the id-mapping container remains after the rejected start",
         )?;
+        // 起動途中（exec 前・rootfs の切り替え前）の子も見逃さないよう、記録済みの cgroup の配置を証跡にする。
+        // supervisor の `prepare` が配置を記録してから拒否するため、記録は残る（docs/api/id-mappings.md）。
+        // その cgroup のメンバー（`/proc/<pid>/cgroup` の行と、残っていれば `cgroup.procs`）が無いこと。
+        let map_placement = map_rec
+            .cgroup()
+            .ok_or("record has no cgroup placement (id mappings)")?;
+        let map_scope = map_placement.scope().as_str().to_string();
+        let map_name = CgroupName::for_instance(&map_container_id, map_placement.instance())
+            .map_err(|e| format!("cgroup name (id mappings): {e:?}"))?;
+        let map_line = format!(
+            "0::{}/{}",
+            map_scope.trim_end_matches('/'),
+            map_name.as_str()
+        );
+        expect(
+            count_processes(|p| {
+                fs::read_to_string(p.join("cgroup")).is_ok_and(|t| t.lines().any(|l| l == map_line))
+            }) == 0,
+            "a process remains in the recorded cgroup of the id-mapping container",
+        )?;
+        let map_cgroup = PathBuf::from("/sys/fs/cgroup")
+            .join(map_scope.trim_start_matches('/'))
+            .join(map_name.as_str());
+        match fs::read_to_string(map_cgroup.join("cgroup.procs")) {
+            Ok(procs) => expect(
+                procs.trim().is_empty(),
+                "cgroup.procs of the id-mapping container is not empty",
+            )?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("read cgroup.procs (id mappings): {e}")),
+        }
         let out = run_cli(&cli, &["--root", &root_s, "delete", &map_id_s], CLI_TIMEOUT)?;
         expect_ok(&out, "delete (id mappings)")?;
         expect(

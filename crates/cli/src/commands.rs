@@ -4,7 +4,7 @@
 //! `create` / `start` は core の `oci_runtime::create` / `start` を直接呼ぶ（TASK-79.2.1・#866。`create_start` module）。
 //! ただし `start` は core を呼ばず、CLI と同じディレクトリの supervisor の bin を起動して結果の 1 行を期限付きで受け取る
 //! （#1718・`supervisor_start` module）。supervisor は core の本番 launcher（#1715・#1819）でコンテナのプロセスを起動する（rootless のみ。
-//! rootful（uid 0）は `PERMISSION_DENIED`（6。方針による恒久拒否・#2241）。実機での通し確認は #2062）。同じディレクトリに supervisor が無ければ `FAILED_PRECONDITION`（5）で失敗する（REPAIR-3）。
+//! rootful（uid 0）で対象 ID が存在し権限検査に到達した start は `PERMISSION_DENIED`（6。方針による恒久拒否・#2241）。実機での通し確認は #2062）。対象 ID が無ければ `NOT_FOUND`（3）、同じディレクトリに supervisor が無ければ `FAILED_PRECONDITION`（5）で失敗する（REPAIR-3）。
 //! `kill <id> [<signal>]`（#1902）は同じ core の `kill` を意図なしの `production_signaler` で呼び、シグナルを 1 回送るだけ（`stop_delete` module）。
 //! `stop` / `delete` は core の `oci_runtime::kill`（既定 SIGTERM。`--signal` で上書き。#2775）/ `delete` を直接呼ぶ（TASK-79.2.2・#867。`stop_delete` module）。
 //! `stop` の本番 `ProcessSignaler` は supervisor の制御チャネル経由（`stop_delete::production_signaler`。#2059・SEC-1）で、

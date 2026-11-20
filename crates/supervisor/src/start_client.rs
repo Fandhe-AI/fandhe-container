@@ -507,7 +507,9 @@ pub fn production_deadline() -> Duration {
 
 /// rootful 判定と euid の取得（SEC-5）。real / effective / saved / fs の uid のどれかが 0 なら
 /// supervisor の `privilege_for_status` と同じ文で `PERMISSION_DENIED`、読めない・壊れた入力は `FAILED_PRECONDITION`。
-fn privilege_gate(status_text: Option<&str>) -> Result<u32, OciRuntimeError> {
+///
+/// `pub` なのは plugin-cri の結合試験が `/proc/self/status` 相当の文字列を注入して拒否の経路を非 root で通すため（本番の呼び出しは [`SupervisorLaunch::resolve_beside_with`] だけ）。
+pub fn privilege_gate(status_text: Option<&str>) -> Result<u32, OciRuntimeError> {
     match status_text.map(identity_from_status) {
         Some(Identity::Rootless { euid }) => Ok(euid),
         Some(Identity::Rootful) => Err(start_error(

@@ -6,7 +6,7 @@ fandhe-container の実行ファイル（CLI・supervisor・特権ランチャ�
 - タスク: TASK-171 追補（#1721）・#2068。`start` の解決規則は TASK-79 追補（#1718）、`fandhe-container setup` はステップ `privileged-launcher-install` として rootful の手順を表示する（実行はしない。#1722）
 - 設計: [privilege-separation.md](../design/privilege-separation.md) の「インストールスクリプト」
 
-> 未検証の注記（REPAIR-3）: rootful の手順は `scripts/install-privileged-launcher.sh` の自己テスト（スタブのみ・root 不要）で確かめたもので、root での実機実行と検証は未実施である（#538・#539）。rootless の手順は CLI の結合試験（symlink 経由の `start`）に基づくが、実機での手順全体の通し確認は未実施である。rootless の範囲写像（subuid / subgid）の実機確認も未実施である（#1621）。rootless の `start` は supervisor が core の本番 launcher で起動するが（#1819）、委譲 cgroup の準備を含む実機での確認は未実施である（#2062）。rootful の `start` は CLI の実体の隣にある `fandhe-container-launcher` を選んで起動するが（#2442）、ランチャー経由の本物の systemd-run・file capability・`setsid` を通す実機での確認は未実施である（#538・#539）。root（uid 0）での `start` は `UNIMPLEMENTED`（終了コード 8）で終わる（#2241 の判断待ち）。LDAP / sssd の環境での所有者名の解決と、ambient capability つきの構成で `getent` の子に capability が渡らないことも実機では未確認である（手順書は [subid-nss-ambient-getent.md](../verification/subid-nss-ambient-getent.md)・#2637）。
+> 未検証の注記（REPAIR-3）: rootful の手順は `scripts/install-privileged-launcher.sh` の自己テスト（スタブのみ・root 不要）で確かめたもので、root での実機実行と検証は未実施である（#538・#539）。rootless の手順は CLI の結合試験（symlink 経由の `start`）に基づくが、実機での手順全体の通し確認は未実施である。rootless の範囲写像（subuid / subgid）の実機確認も未実施である（#1621）。rootless の `start` は supervisor が core の本番 launcher で起動するが（#1819）、委譲 cgroup の準備を含む実機での確認は未実施である（#2062）。rootful の `start` は CLI の実体の隣にある `fandhe-container-launcher` を選んで起動するが（#2442）、ランチャー経由の本物の systemd-run・file capability・`setsid` を通す実機での確認は未実施である（#538・#539）。root（uid 0）での `start` は権限モデルの検査で `PERMISSION_DENIED`（終了コード 6）の恒久拒否で終わる（#2241 の決定 D1 A・#4709）。LDAP / sssd の環境での所有者名の解決と、ambient capability つきの構成で `getent` の子に capability が渡らないことも実機では未確認である（手順書は [subid-nss-ambient-getent.md](../verification/subid-nss-ambient-getent.md)・#2637）。
 
 ## 配置の規則
 
@@ -140,7 +140,7 @@ CRI plugin の `start`・`kill`・`stop`・`delete` は CLI と同じ経路で s
 - 前項の bin は、`RunPodSandbox` の保持役・CRI の Exec の helper・`start`（ランチャーを使わない直接経路）が同じ基準で検査する（利用者か root の所有・group / other 書き込み不可・祖先も他の利用者が書けない・利用者に読める通常ファイル）。満たさないと `FAILED_PRECONDITION`（`supervisor executable is not trusted or not readable`）で失敗する。`start` の直接経路は `systemd-run` がパスで exec するため、検査から exec までに差し替えの窓が残る（同じ uid か root のみ。CRI-6・SEC-1・PLUG-11・#4499）
 - plugin のプロセスの環境に `XDG_RUNTIME_DIR` が必要（user マネージャへの到達に使う）。上の「起動の前提」を同じく満たすこと
 - cgroup の配置を記録したコンテナの `delete` は、plugin プロセス自身の cgroup が委譲されている必要がある（CLI の `delete` と同じ検出で、検出に失敗すると記録を残したまま失敗する）。plugin を委譲されたスコープの中（例: `systemd-run --user --scope -p Delegate=yes -- fandhe-container-plugin-cri ...`）で動かす
-- `start` の権限モデルは CLI と同じ規則（plugin の実体の隣に信頼できるランチャーがあればランチャー経由。uid 0 は `PERMISSION_DENIED`（終了コード 6）で恒久拒否。#2442・#2241 の決定 D1 A・#4709）。インストールスクリプトは plugin を置かない。実機での通しは未確認（#850・#2062）
+- `start` の権限モデルは CLI と同じ規則（plugin の実体の隣に信頼できるランチャーがあればランチャー経由。uid 0 の `StartContainer` は gRPC のステータス `PERMISSION_DENIED` で恒久拒否。CLI の終了コード 6 は `fandhe-container start` の契約で、CRI の RPC には当たらない。#2442・#2241 の決定 D1 A・#4709）。インストールスクリプトは plugin を置かない。実機での通しは未確認（#850・#2062）
 
 ```bash
 systemd-run --user --scope -p Delegate=yes -- fandhe-container delete <id>

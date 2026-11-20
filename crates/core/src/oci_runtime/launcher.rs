@@ -523,10 +523,7 @@ impl ProductionLauncherBuilder {
 /// ペアリング検査の rootful 分岐が同じ code・固定文言(値を含まない)で返す。監査(SEC-4)には記録しない。
 #[cfg(target_os = "linux")]
 fn rootful_refused() -> TraitError {
-    TraitError::new(
-        ErrorCode::PermissionDenied,
-        "the rootful privilege model is permanently refused by policy (SEC-5)",
-    )
+    TraitError::new(ErrorCode::PermissionDenied, super::ROOTFUL_REFUSED_MESSAGE)
 }
 
 /// `Attachable` の起動オプションと、`NetnsAttachHook` と、権限モデルの組を `build` で検査する(fork の前・副作用なし。
@@ -5378,11 +5375,19 @@ mod tests {
         )
         .expect("target");
         let joined = options_with(&[], true, &[], LaunchIpcMode::Private).with_netns_join(target);
+        // ペアリング検査が先なら `InvalidArgument` になる組（フックの無い `Attachable`・参加先の無い `JoinPinned`）も
+        // 含め、rootful の検査がペアリング検査より前にあることを code の違いで区別する（REPAIR-12）。
+        let attachable_without_hook = options_with(&[], true, &[], LaunchIpcMode::Private)
+            .with_network(LaunchNetworkMode::Attachable);
+        let join_without_target = options_with(&[], true, &[], LaunchIpcMode::Private)
+            .with_network(LaunchNetworkMode::JoinPinned);
         let builders = [
             ProductionLauncher::builder()
                 .launch_options(attachable)
                 .netns_attach_hook(Arc::new(NoopAttachHook)),
             ProductionLauncher::builder().launch_options(joined),
+            ProductionLauncher::builder().launch_options(attachable_without_hook),
+            ProductionLauncher::builder().launch_options(join_without_target),
         ];
         for b in builders {
             let e = b

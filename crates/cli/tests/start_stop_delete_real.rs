@@ -1236,14 +1236,21 @@ mod linux {
         cleanup.id = map_id_s.clone();
         let config_path = bundle.join("config.json");
         let config = fs::read_to_string(&config_path).map_err(|e| format!("read config: {e}"))?;
-        let mapped = config.replacen(
-            "\"linux\":{",
-            "\"linux\":{\"uidMappings\":[{\"containerID\":0,\"hostID\":1000,\"size\":1}],\"gidMappings\":[{\"containerID\":0,\"hostID\":1000,\"size\":1}],",
-            1,
-        );
+        // プローブの引数に試行固有の ID を足し、読み取りに ptrace の検査が要らない cmdline で残存を識別できるようにする。
+        let mapped = config
+            .replacen(
+                "\"linux\":{",
+                "\"linux\":{\"uidMappings\":[{\"containerID\":0,\"hostID\":1000,\"size\":1}],\"gidMappings\":[{\"containerID\":0,\"hostID\":1000,\"size\":1}],",
+                1,
+            )
+            .replacen(
+                "\"args\":[\"/probe\",\"--container-probe\"]",
+                &format!("\"args\":[\"/probe\",\"--container-probe\",\"{map_id_s}\"]"),
+                1,
+            );
         expect(
-            mapped != config,
-            "id mappings were not injected into config.json",
+            mapped.contains("\"uidMappings\"") && mapped.contains(&format!("\"{map_id_s}\"]")),
+            "id mappings or the probe argument were not injected into config.json",
         )?;
         fs::write(&config_path, mapped).map_err(|e| format!("write mapped config: {e}"))?;
         let out = run_cli(
@@ -1296,7 +1303,8 @@ mod linux {
             &root_needle,
             "the id-mapping supervisor to exit",
         )?;
-        // コンテナ ID を含む cmdline に加え、当該 bundle の rootfs を root とするプローブ（ID を引数に持たない）も無いこと。
+        // cmdline に試行固有の ID を含むプロセス（supervisor と、ID を引数に足したプローブ）が無いこと。
+        // `/proc/<pid>/root` は ptrace の検査で読めない場合があるため補助にとどめる。
         let rootfs = bundle.join("rootfs");
         expect(
             count_processes(|p| {

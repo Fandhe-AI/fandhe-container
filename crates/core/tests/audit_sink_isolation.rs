@@ -338,7 +338,10 @@ mod imp {
     pub(super) fn run() {
         #[cfg(target_os = "linux")]
         if std::env::args().nth(1).as_deref() == Some(FORK_AGAIN_CHILD_ARG) {
-            fork_again_child();
+            let dir = std::env::args_os()
+                .nth(2)
+                .expect("the scratch dir argument");
+            fork_again_child(Path::new(&dir));
             return;
         }
         assert_eq!(threads(), 1, "the test binary must start single-threaded");
@@ -563,11 +566,29 @@ mod imp {
             .unwrap()
     }
 
+    /// 実効 capability（`/proc/self/status` の `CapEff:`）。
+    #[cfg(target_os = "linux")]
+    fn cap_eff() -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .unwrap()
+            .lines()
+            .find_map(|l| l.strip_prefix("CapEff:"))
+            .and_then(|v| u64::from_str_radix(v.trim(), 16).ok())
+            .unwrap()
+    }
+
+    /// 子が `RLIMIT_NPROC` の効かないことを親へ知らせる 1 行（子の事前確認で spawn が成功した場合）。
+    #[cfg(target_os = "linux")]
+    const FORK_AGAIN_NOT_ENFORCED: &str = "fork_again child: RLIMIT_NPROC is not enforced";
+
     /// SEC-4・REPAIR-12・#4702: 実 fork が `EAGAIN` で失敗したとき、`FileAuditSink` は主経路の失敗種別を
     /// `isolation_fork_again` として代替経路へ渡す（汎用の `isolation_unavailable` へ畳まない）。
-    /// `RLIMIT_NPROC` を `prlimit --nproc=1` で下げた自分自身を子として起動する（試験コードに unsafe を持ち込まない）。
-    /// 上限は同じ uid の全プロセス数で数えるため、親（本プロセス）が居る限り子の fork は `EAGAIN` になる。
-    /// root・`CAP_SYS_RESOURCE` 持ちには効かないため、root では適用外を明示して飛ばす（CI は非 root）。
+    /// `RLIMIT_NPROC` を `prlimit --nproc=1`（util-linux。`PATH` から解決）で下げた自分自身を子として起動する
+    /// （試験コードに unsafe を持ち込まない）。上限は同じ uid の全プロセス数で数えるため、親（本プロセス）が居る限り
+    /// 子の fork は `EAGAIN` になる。子は本題の前に spawn を 1 回試して上限が効くことを確かめる。root と
+    /// `CAP_SYS_ADMIN`・`CAP_SYS_RESOURCE` を持つ場合は上限が効かないため適用外を明示して飛ばし、それ以外で
+    /// 効かなければ失敗にする（CI は非 root・capability なし）。子の出力は `ScratchDir` 配下のファイルへ直接書かせ、
+    /// pipe の EOF を待たない（孫が書き込み端を持ち続けても期限内に戻る。REPAIR-5）。
     #[cfg(target_os = "linux")]
     fn fork_again_is_reported_as_isolation_fork_again() {
         if real_uid() == 0 {
@@ -576,21 +597,22 @@ mod imp {
             );
             return;
         }
-        let prlimit = Path::new("/usr/bin/prlimit");
-        assert!(
-            prlimit.exists(),
-            "/usr/bin/prlimit is required (util-linux)"
-        );
-        // 出力は 1 行で pipe を満たさないため、期限つきの `wait_within` の後に読む（`output_within` の
-        // プロセスグループ kill は、空のグループへの `kill` の失敗が間欠的に Err になるため使わない）。
-        let mut child = std::process::Command::new(prlimit)
+        let dir = tmp_marker("fork-again");
+        std::fs::create_dir(&dir).unwrap();
+        let (out_path, err_path) = (dir.join("stdout"), dir.join("stderr"));
+        let spawned = std::process::Command::new("prlimit")
             .arg("--nproc=1")
             .arg(std::env::current_exe().unwrap())
             .arg(FORK_AGAIN_CHILD_ARG)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
+            .arg(&dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::fs::File::create(&out_path).unwrap())
+            .stderr(std::fs::File::create(&err_path).unwrap())
+            .spawn();
+        let mut child = match spawned {
+            Ok(c) => c,
+            Err(e) => panic!("prlimit (util-linux) is required on PATH: {e}"),
+        };
         let status = match super::reap::wait_within(&mut child, Duration::from_secs(30)) {
             Ok(s) => s,
             Err(e) => {
@@ -598,13 +620,24 @@ mod imp {
                 panic!("fork_again child did not finish: {e}");
             }
         };
-        let (mut stdout, mut stderr) = (String::new(), String::new());
-        std::io::Read::read_to_string(&mut child.stdout.take().unwrap(), &mut stdout).unwrap();
-        std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
+        let stdout = std::fs::read_to_string(&out_path).unwrap();
+        let stderr = std::fs::read_to_string(&err_path).unwrap();
         assert!(
             status.success(),
             "child failed: {status:?}, stdout={stdout}, stderr={stderr}"
         );
+        if stdout.trim_end() == FORK_AGAIN_NOT_ENFORCED {
+            // CAP_SYS_ADMIN（21）・CAP_SYS_RESOURCE（24）を持てば上限は免除される。それ以外で効かないのは前提の崩れ。
+            const EXEMPT: u64 = (1 << 21) | (1 << 24);
+            assert!(
+                cap_eff() & EXEMPT != 0,
+                "RLIMIT_NPROC was not enforced although CAP_SYS_ADMIN and CAP_SYS_RESOURCE are absent"
+            );
+            println!(
+                "audit_sink_isolation: fork_again not applicable (CAP_SYS_ADMIN or CAP_SYS_RESOURCE exempts RLIMIT_NPROC)"
+            );
+            return;
+        }
         assert_eq!(
             stdout.trim_end(),
             "fork_again child: primary=[IsolationForkAgain] code=Internal"
@@ -612,14 +645,27 @@ mod imp {
         println!("audit_sink_isolation: fork_again reaches the fallback as isolation_fork_again");
     }
 
-    /// `prlimit --nproc=1` 配下の子の本体。fork が `EAGAIN` になる状況で両経路を失敗させ、代替経路が見た
-    /// 主経路の失敗種別を 1 行で標準出力へ出す（親が照合する）。通知の子・スレッドも作れず通知 1 行は出ない。
+    /// `prlimit` 配下の子の本体。`dir` は親が `ScratchDir` 配下に作った実行ごとのディレクトリ。spawn を 1 回試して
+    /// `EAGAIN` になる（上限が効く）ことを確かめ、効かなければその旨の 1 行だけを出して終わる。効けば両経路を
+    /// 失敗させ、代替経路が見た主経路の失敗種別を 1 行で標準出力へ出す（親が照合する）。通知の子・スレッドも
+    /// 作れず通知 1 行は出ない。
     #[cfg(target_os = "linux")]
-    fn fork_again_child() {
+    fn fork_again_child(dir: &Path) {
+        match std::process::Command::new("true").status() {
+            Ok(_) => {
+                println!("{FORK_AGAIN_NOT_ENFORCED}");
+                return;
+            }
+            Err(e) => assert_eq!(
+                e.raw_os_error(),
+                Some(11),
+                "the probe spawn must fail with EAGAIN: {e}"
+            ),
+        }
         let primary: Primary = Arc::new(|path, _| {
             std::fs::write(path, b"must-not-run").map_err(|_| unreachable_err())
         });
-        let marker = std::env::temp_dir().join(format!("fandhe-fork-again-{}", std::process::id()));
+        let marker = dir.join("marker");
         let (sink, seen) = sink(primary, false, Notify::Discard, marker.clone());
         let e = sink.record(&record()).unwrap_err();
         assert!(!marker.exists(), "the primary must not run");

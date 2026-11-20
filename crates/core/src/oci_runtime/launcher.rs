@@ -5359,6 +5359,39 @@ mod tests {
         );
     }
 
+    /// SEC-5・CORE-6(#4709): `build` は rootful を、`Attachable`+フックと `JoinPinned`+参加先のどちらの組でも、
+    /// ペアリング検査(`Unimplemented` 等の別の拒否)より先に `PermissionDenied`・固定文言で拒否する。
+    /// 拒否は subreaper 化より前なので、プロセス属性を変えずに単体で確かめられる。
+    #[test]
+    fn sec5_4709_build_refuses_rootful_before_pairing_checks() {
+        const MSG: &str = "the rootful privilege model is permanently refused by policy (SEC-5)";
+        let attachable = options_with(&[], true, &[], LaunchIpcMode::Private)
+            .with_network(LaunchNetworkMode::Attachable);
+        let target = super::super::NetnsJoinTarget::new(
+            "/run/n".into(),
+            "/run/n/web".into(),
+            5,
+            4_026_532_008,
+        )
+        .expect("target");
+        let joined = options_with(&[], true, &[], LaunchIpcMode::Private).with_netns_join(target);
+        let builders = [
+            ProductionLauncher::builder()
+                .launch_options(attachable)
+                .netns_attach_hook(Arc::new(NoopAttachHook)),
+            ProductionLauncher::builder().launch_options(joined),
+        ];
+        for b in builders {
+            let e = b
+                .privilege(IsolationPrivilege::RootfulHostRoot)
+                .audit_sink(Arc::new(NullSink))
+                .build()
+                .expect_err("rootful must be refused");
+            assert_eq!(e.code(), ErrorCode::PermissionDenied);
+            assert_eq!(e.message(), MSG);
+        }
+    }
+
     /// CRI-2・CORE-3・SEC-1(#2674): pod の namespace への join と `--ipc=host` は併用できず、spawn の前に
     /// `InvalidArgument` で拒否する(join を黙って捨てて弱い分離で起動しない)。
     #[test]

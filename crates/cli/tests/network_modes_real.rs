@@ -419,7 +419,7 @@ mod linux {
     fn check_prerequisites() -> Result<(), super::precondition::Failure> {
         if effective_uid()? == 0 {
             return Err(
-                "must run as a non-root user: rootful network is UNIMPLEMENTED (#2241)".into(),
+                "must run as a non-root user: rootful network is UNIMPLEMENTED (D13)".into(),
             );
         }
         if !Path::new("/sys/fs/cgroup/cgroup.controllers").is_file() {

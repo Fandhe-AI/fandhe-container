@@ -281,10 +281,15 @@ impl ProductionPodHolder {
     }
 
     fn rootful_guard(&self) -> Result<(), TraitError> {
+        self.rootful_guard_with(current_euid)
+    }
+
+    /// [`Self::rootful_guard`] の本体。euid の取得を注入できる（試験で 0・非 0・取得失敗を固定値で通す。SEC-5・#4709）。
+    fn rootful_guard_with(&self, euid: impl FnOnce() -> Result<u32, ()>) -> Result<(), TraitError> {
         if !matches!(self.exe, ExeSource::Beside) {
             return Ok(());
         }
-        match current_euid() {
+        match euid() {
             Ok(0) => Err(TraitError::new(ErrorCode::PermissionDenied, MSG_ROOTFUL)),
             Ok(_) => Ok(()),
             Err(()) => Err(TraitError::new(

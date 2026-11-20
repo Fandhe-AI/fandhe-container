@@ -848,21 +848,23 @@ fn cri2_sec5_2940_observe_process_start_reports_starttime_then_absent() {
     );
 }
 
-/// SEC-5・CRI-2・#2241(#4709): 本番の provider は uid 0 を `PermissionDenied`・固定文言で恒久拒否し、非 root は通す。
-/// 固定の program の provider（試験用）は euid に依らず検査しない。euid は注入できないため、期待値は実行ユーザーから導く。
+/// SEC-5・CRI-2・#2241(#4709): 本番の provider は uid 0 を `PermissionDenied`・固定文言で恒久拒否し、非 root は通し、
+/// 取得失敗は `FailedPrecondition`。euid を注入して 3 通りを固定値で通す。固定 program の provider は euid に依らず検査しない。
 #[test]
 fn sec5_4709_rootful_guard_refuses_uid_zero_with_permission_denied() {
-    let r = ProductionPodHolder::production().rootful_guard();
-    match current_euid().unwrap() {
-        0 => {
-            let e = r.expect_err("uid 0 must be refused");
-            assert_eq!(e.code(), ErrorCode::PermissionDenied);
-            assert_eq!(
-                e.message(),
-                "the pod namespace holder requires a non-root plugin process"
-            );
-        }
-        _ => assert_eq!(r, Ok(())),
-    }
-    assert_eq!(sh("true", 1).rootful_guard(), Ok(()));
+    let p = ProductionPodHolder::production();
+    let e = p.rootful_guard_with(|| Ok(0)).expect_err("uid 0");
+    assert_eq!(e.code(), ErrorCode::PermissionDenied);
+    assert_eq!(
+        e.message(),
+        "the pod namespace holder requires a non-root plugin process"
+    );
+    assert_eq!(p.rootful_guard_with(|| Ok(1000)), Ok(()));
+    let e = p.rootful_guard_with(|| Err(())).expect_err("unreadable");
+    assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+    assert_eq!(
+        e.message(),
+        "cannot determine the plugin process credentials"
+    );
+    assert_eq!(sh("true", 1).rootful_guard_with(|| Ok(0)), Ok(()));
 }

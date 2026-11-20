@@ -47,7 +47,7 @@
 //!   `systemd-run` 越しに引き継ぐ方式は、安全な fd 継承の API が std に無く（`pre_exec` は事前承認の範囲外の `unsafe`）、
 //!   supervisor crate の `SupervisorLaunch` の変更も要るため採らなかった。ランチャー経由はランチャーが検証する（#1719）。
 //! - 権限モデルは CLI と同じ共有クライアントの規則: 実体の隣に信頼できるランチャーがあればランチャー経由、無ければ直接経路。
-//!   uid 0 は spawn の前に `UNIMPLEMENTED`（#2442・#2241）。
+//!   uid 0 は spawn の前に `PERMISSION_DENIED`（#2241 の決定・#4709）。
 //! - `XDG_RUNTIME_DIR` が plugin の環境に必要（将来の plugin proxy が環境を空にすると `FAILED_PRECONDITION`。#1869）。
 //! - 実機での通し（委譲 scope 内での plugin-cri → supervisor → delete）は未実施（#850・#2062）。
 

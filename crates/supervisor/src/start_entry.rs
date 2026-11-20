@@ -5273,7 +5273,7 @@ mod linux {
             );
         }
 
-        /// SEC-5: rootful は PERMISSION_DENIED（#4709）で、設定ファイルに依らない）。
+        /// SEC-5: rootful は PERMISSION_DENIED（#4709）で、設定ファイルに依らない。
         #[test]
         fn sec5_rootful_still_rejected_before_any_file_is_read() {
             let e = resolve_with("root", Some(ALICE), None, None, "0\t0\t0\t0")

@@ -207,7 +207,8 @@ pub enum AuditWriteErrorKind {
     /// 主経路のファイル書き込みを隔離した子プロセスが期限内に終わらなかった（ストレージ停止等。
     /// 子は SIGKILL で止め、代替経路へ進む。REPAIR-5・`FileAuditSink`）。
     IsolationTimeout,
-    /// 主経路を隔離するプロセスを作れなかった（呼び出しプロセスが複数スレッドで fork できない等）。
+    /// 主経路を隔離するプロセスを作れなかった（呼び出しプロセスが複数スレッドで fork できない等。fork の `EAGAIN` は
+    /// [`Self::IsolationForkAgain`]）。
     /// 期限を保証できないため主経路は試行せず、代替経路へ進む（fail-closed。`FileAuditSink`）。
     IsolationUnavailable,
     /// 主経路を隔離する子の fork が `EAGAIN`（プロセス数・スレッド数等の資源上限）で失敗した。

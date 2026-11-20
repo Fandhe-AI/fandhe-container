@@ -1532,6 +1532,28 @@ mod tests {
         );
     }
 
+    /// SEC-4・REPAIR-12・#4702: fork の失敗は `EAGAIN` だけが `isolation_fork_again` になり、他の errno・非対応は
+    /// 従来どおり `isolation_unavailable`（`UNAVAILABLE`）に写る。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn sec4_4702_fork_error_outcome_splits_eagain() {
+        use crate::sys::{EAGAIN, ECHILD, EINTR, SysError};
+        let kind = |e: SysError| primary_result(fork_error_outcome(&e)).unwrap_err();
+        let again = kind(SysError::Os(EAGAIN));
+        assert_eq!(again.kind(), AuditWriteErrorKind::IsolationForkAgain);
+        assert_eq!(again.kind().as_str(), "isolation_fork_again");
+        assert_eq!(again.error_code(), ErrorCode::Unavailable);
+        for other in [
+            SysError::Os(ECHILD),
+            SysError::Os(EINTR),
+            SysError::Unsupported,
+        ] {
+            let err = kind(other);
+            assert_eq!(err.kind().as_str(), "isolation_unavailable", "{err:?}");
+            assert_eq!(err.error_code(), ErrorCode::Unavailable);
+        }
+    }
+
     /// REPAIR-5・#1616: 1 回の `record` の待ち時間の上限は、各経路の上限の合算（11.45 秒）。
     #[test]
     fn repair5_1616_record_wait_limit_is_the_sum_of_each_limit() {

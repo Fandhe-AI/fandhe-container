@@ -68,7 +68,7 @@ fn status(uid: &str) -> String {
     )
 }
 
-/// SEC-5: uid のどの位置が 0 でも `start` は `PermissionDenied` と固定文言で失敗し、供給側（plugin-cri）で別コードへ潰れない。
+/// SEC-5: uid のどの位置（実・実効・保存・fs）が単独で 0 でも `start` は `PermissionDenied` と固定文言で失敗し、供給側（plugin-cri）で別コードへ潰れない。
 #[test]
 fn sec5_supervised_start_rootful_is_permission_denied() {
     // 検査（supervisor の実在）が権限検査より前にあるため、偽の supervisor（空ファイル）を隣に置く。
@@ -79,6 +79,7 @@ fn sec5_supervised_start_rootful_is_permission_denied() {
     let id = ContainerId::new("c1").expect("id");
     for uid in [
         "0\t0\t0\t0",
+        "0\t1000\t1000\t1000",
         "1000\t0\t1000\t1000",
         "1000\t1000\t0\t1000",
         "1000\t1000\t1000\t0",

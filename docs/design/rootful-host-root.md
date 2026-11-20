@@ -6,7 +6,7 @@
 
 ## 現状
 
-決定後の挙動（#4709）。どの段も fork より前に拒否し、コンテナのプロセスも起動の予約も新たに作らない。ただし supervisor の bin を直接起動した場合は（CLI・plugin-cri の共有クライアントは起動前の `privilege_gate` で拒否するため当たらない）、対象のレコードがあると手順 2b（`crates/supervisor/src/start_entry.rs`）が手順 4 の権限の拒否より前に、状態ルート配下の supervisor のログの保存先を作りうる。
+決定後の挙動（#4709）。どの段も fork より前に拒否し、コンテナのプロセスを新たに作らない（plugin-cri の supervised の start は、共有クライアントの権限検査を呼ぶ前に起動数の枠を一時的に予約し、拒否の後に解放する。その間は並行する start の上限の計算に数えられる）。ただし supervisor の bin を直接起動した場合は（CLI・plugin-cri の共有クライアントは起動前の `privilege_gate` で拒否するため当たらない）、対象のレコードがあると手順 2b（`crates/supervisor/src/start_entry.rs`）が手順 4 の権限の拒否より前に、状態ルート配下の supervisor のログの保存先を作りうる。
 
 | 箇所 | 挙動 |
 | ---- | ---- |

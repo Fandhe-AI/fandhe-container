@@ -1303,11 +1303,15 @@ mod linux {
         // cmdline に試行固有の ID を含むプロセス（supervisor と、ID を引数に足したプローブ）が無いこと。
         // `/proc/<pid>/root` は ptrace の検査で読めない場合があるため補助にとどめる。
         let rootfs = bundle.join("rootfs");
+        // `cmdline` は同じ uid なら必ず読めるため、走査中の終了（NotFound・ESRCH）以外の読み取り失敗は観測の失敗として
+        // 試験を落とす（読めなかったものを「残存なし」と数えない）。`root` は補助なので読めなければ不一致とする。
         expect(
-            count_processes(|p| {
-                fs::read_to_string(p.join("cmdline")).is_ok_and(|c| c.contains(&map_id_s))
-                    || fs::read_link(p.join("root")).is_ok_and(|r| r == rootfs)
-            }) == 0,
+            count_processes_strict(|p| {
+                Ok(
+                    read_proc_file(&p.join("cmdline"))?.is_some_and(|c| c.contains(&map_id_s))
+                        || fs::read_link(p.join("root")).is_ok_and(|r| r == rootfs),
+                )
+            })? == 0,
             "a process of the id-mapping container remains after the rejected start",
         )?;
         // 起動途中（exec 前・rootfs の切り替え前）の子も見逃さないよう、記録済みの cgroup の配置を証跡にする。
@@ -1325,9 +1329,10 @@ mod linux {
             map_name.as_str()
         );
         expect(
-            count_processes(|p| {
-                fs::read_to_string(p.join("cgroup")).is_ok_and(|t| t.lines().any(|l| l == map_line))
-            }) == 0,
+            count_processes_strict(|p| {
+                Ok(read_proc_file(&p.join("cgroup"))?
+                    .is_some_and(|t| t.lines().any(|l| l == map_line)))
+            })? == 0,
             "a process remains in the recorded cgroup of the id-mapping container",
         )?;
         let map_cgroup = PathBuf::from("/sys/fs/cgroup")
@@ -1413,6 +1418,37 @@ mod linux {
                     && pred(&e.path())
             })
             .count()
+    }
+
+    /// `/proc` を走査して `pred` に当たるプロセスを数える（観測の失敗を 0 件と取り違えない版。#4711・REPAIR-12）。
+    /// `/proc` の列挙の失敗・エントリの読み取りの失敗は `Err`。`pred` の `Err` もそのまま返す。
+    fn count_processes_strict(
+        pred: impl Fn(&Path) -> Result<bool, String>,
+    ) -> Result<usize, String> {
+        let dir = fs::read_dir("/proc").map_err(|e| format!("read /proc: {e}"))?;
+        let mut n = 0;
+        for entry in dir {
+            let entry = entry.map_err(|e| format!("read /proc entry: {e}"))?;
+            let is_pid = entry
+                .file_name()
+                .to_str()
+                .is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit()));
+            if is_pid && pred(&entry.path())? {
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
+    /// `/proc/<pid>/<name>` を読む。走査中に終了したプロセス（NotFound・ESRCH）は `Ok(None)`、他の失敗は `Err`。
+    fn read_proc_file(path: &Path) -> Result<Option<String>, String> {
+        match fs::read(path) {
+            Ok(b) => Ok(Some(String::from_utf8_lossy(&b).into_owned())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(3) => {
+                Ok(None)
+            }
+            Err(e) => Err(format!("read {}: {e}", path.display())),
+        }
     }
 
     /// `list` の stdout が `ID\tSTATUS\tPID\n<id>\trunning\t<pid>\n` と完全一致することを確かめ、pid を返す。

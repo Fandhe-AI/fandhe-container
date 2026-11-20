@@ -35,8 +35,8 @@
 | supervisor `logs.rs`・`run.rs` の drain（`DEFAULT_DRAIN_TIMEOUT`） | 結果は保たれる（`sup1_task157_7_drain_timeout_keeps_outcome`）（T） | 孫 | 無害 |
 | supervisor `user_db.rs` `run_getent` | 全体期限で `Timeout`（B） | 子孫 | 無害 |
 | supervisor `start_client.rs`・`control/client.rs`・`attach_io.rs`・`stream_exec/*`・`log_pipeline.rs` | 1 行または期限で判定し、EOF を即時に要求しない | - | 無害 |
-| supervisor `exec.rs` `collect_worker_result`（worker 終了後の `read_until(b'\n')`） | worker が結果を書いてから終了するので通常は行がある。行が無いと EOF まで待つ（U） | 並行 spawn の子 | 無害（別観点 A） |
-| supervisor `netns_holder.rs` `drain_stderr`（回収後の `read_to_end`） | EOF まで待つ（U）。holder は fork しない前提 | 並行 spawn の子 | 無害（別観点 A） |
+| supervisor `exec.rs` `collect_worker_result`（worker 終了後の `read_until(b'\n')`） | 期限つき（B。`WORKER_RESULT_READ_TIMEOUT` 1 秒・期限切れは `Internal`。#4733 で修正済み） | 並行 spawn の子 | 無害 |
+| supervisor `netns_holder.rs` `drain_stderr`（回収後の `read_to_end`） | 期限つき（B。`STDERR_DRAIN_TIMEOUT` 500ms・期限切れは読めた分で打ち切り。#4733 で修正済み） | 並行 spawn の子 | 無害 |
 | net `dns_helper.rs`・`dns_helper/detach/os.rs`（`read_line_deadline` の期限 0 は次の行の有無の確認）・`netns.rs`・`netns_helper.rs`・`netns_dial/*`・`sys/holder.rs` | 行と期限で判定（B）。失敗経路の `REAP_TIMEOUT_DEFAULT` は回収の期限で EOF 判定ではない | - | 無害 |
 | net `pasta/binary.rs` `collect` | 期限つきで EOF を待つ（B） | - | 無害 |
 | net `pasta/process.rs` の `drain(..., Duration::ZERO)` | stderr 抜粋の切り詰め（T） | 子孫 | 無害 |
@@ -51,11 +51,9 @@
 - `exec_command.rs` の `sup6_task163_concurrent_waiters_share_one_exec_status`: 判定不能の回を許す assert（全員が同じ判定で揃うことを具体値で照合）
 - `sup6_task163_unreadable_exec_status_is_not_reinterpreted`・`core2_start_gate_requires_release_and_fails_on_eof`: 書き込み端を自分で保持／EOF と `Err` の両方が失敗として等価で、複製の有無に結果が依存しない
 
-## 別観点（本 issue の範囲外）
+## 別観点（解消済み）
 
-期限の無い読み取り（A）: `supervisor/exec.rs` `collect_worker_result` の結果行なしの場合と `netns_holder.rs` `drain_stderr` は、並行 spawn の子が書き込み端の複製を持つ窓のあいだだけ待つ。複製は exec で閉じるため有界だが、読み取り自体に期限は無い（REPAIR-5）。誤検出ではなく待ちの型なので本 issue では直さない。
-
-追跡 Issue: #4733（`collect_worker_result` の結果行なしの `read_until` と `drain_stderr` の `read_to_end` の両方に期限を付ける。REPAIR-5）。
+期限の無い読み取り（A）: `supervisor/exec.rs` `collect_worker_result` の結果行なしの場合と `netns_holder.rs` `drain_stderr` は、期限つき読み取りに置き換えた（#4733・REPAIR-5。`crates/supervisor/src/deadline_read.rs`）。
 
 ## 結論
 

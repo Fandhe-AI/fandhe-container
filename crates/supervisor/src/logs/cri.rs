@@ -588,9 +588,13 @@ impl LogSink for CriFileSink {
 pub struct TeeLogSink {
     primary: Arc<dyn LogSink>,
     secondary: Arc<dyn LogSink>,
-    /// 出力先ごと（主・副）の最初のエラーコード。`Some` の出力先は以後呼ばない。
-    failed: Mutex<[Option<ErrorCode>; 2]>,
+    /// 出力先ごと（主・副）の最初のエラーコードと、副の世代（`reopen` 成功ごとに +1）。`Some` の出力先は以後呼ばない。
+    /// 失敗の記録は「`append` 開始時に読んだ世代が今も同じ」ときだけ同じ mutex の下で行う（#4652 の取りこぼし防止）。
+    failed: Mutex<FailState>,
 }
+
+/// [`TeeLogSink`] の失敗記録（出力先ごとのコード）と世代。
+type FailState = ([Option<ErrorCode>; 2], u64);
 
 impl TeeLogSink {
     /// 主（`@container-logs`）と副（CRI ログ）から作る。
@@ -598,13 +602,13 @@ impl TeeLogSink {
         Self {
             primary,
             secondary,
-            failed: Mutex::new([None, None]),
+            failed: Mutex::new(([None, None], 0)),
         }
     }
 
     /// 出力先ごと（主・副の順）の最初の失敗のエラーコード。失敗していなければ `None`。
     pub fn failed_codes(&self) -> [Option<ErrorCode>; 2] {
-        *self.failed.lock().unwrap_or_else(PoisonError::into_inner)
+        self.failed.lock().unwrap_or_else(PoisonError::into_inner).0
     }
 
     /// 失敗していない出力先へ `op` を適用する。両方が（以前から、または今回）失敗したときだけ `Err`。
@@ -613,13 +617,10 @@ impl TeeLogSink {
         let mut last_err = None;
         let mut alive = 0usize;
         for (i, sink) in sinks.into_iter().enumerate() {
-            let already = self
-                .failed
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .get(i)
-                .copied()
-                .flatten();
+            let (already, generation) = {
+                let g = self.failed.lock().unwrap_or_else(PoisonError::into_inner);
+                (g.0.get(i).copied().flatten(), g.1)
+            };
             if let Some(code) = already {
                 last_err = Some(TraitError::new(code, "log destination is in failed state"));
                 continue;
@@ -628,11 +629,13 @@ impl TeeLogSink {
                 Ok(()) => alive += 1,
                 Err(e) => {
                     let mut g = self.failed.lock().unwrap_or_else(PoisonError::into_inner);
-                    let first = g.get_mut(i).is_some_and(|slot| {
-                        let first = slot.is_none();
-                        slot.get_or_insert(e.code());
-                        first
-                    });
+                    // 世代が進んでいたら、開き直し前の状態に対する失敗なので記録しない（開き直した副を止めない）。
+                    let first = g.1 == generation
+                        && g.0.get_mut(i).is_some_and(|slot| {
+                            let first = slot.is_none();
+                            slot.get_or_insert(e.code());
+                            first
+                        });
                     drop(g);
                     if first {
                         report_destination_failure(i, e.code());
@@ -690,26 +693,16 @@ impl LogSink for TeeLogSink {
     }
 
     /// CRI ログ（副）だけを開き直す（`@container-logs` は従来どおり。CRI-2・#4652）。副が `Unimplemented`（CRI ログが無い）や
-    /// 失敗のときはそのまま返し、失敗の記録は変えない。成功したら副の失敗の記録を解除する（上限到達などで止まった CRI ログの再開）。
-    /// 解除は開き直しの前に行う: 副の mutex が開き直しと書き込みを直列化するため、窓の間の書き込みを取りこぼさない。
-    /// 失敗したときは副が失敗状態のままなら次の書き込みで再び記録される（通知がもう 1 行出る）。
+    /// 失敗のときはそのまま返し、失敗の記録・世代は変えない。成功したら同じ mutex の下で副の失敗の記録を解除し世代を進める。
+    /// 開き直し前の状態に対して始まった `append` の失敗は、世代が違うため後から記録されず、開き直した副を止めない。
     fn reopen(&self) -> Result<(), TraitError> {
-        let previous = {
-            let mut g = self.failed.lock().unwrap_or_else(PoisonError::into_inner);
-            g.get_mut(1).and_then(Option::take)
-        };
-        let result = self.secondary.reopen();
-        if result
-            .as_ref()
-            .is_err_and(|e| e.code() == ErrorCode::Unimplemented)
-        {
-            // CRI ログが無い構成では何も変えない。
-            let mut g = self.failed.lock().unwrap_or_else(PoisonError::into_inner);
-            if let Some(slot) = g.get_mut(1) {
-                *slot = previous;
-            }
+        self.secondary.reopen()?;
+        let mut g = self.failed.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(slot) = g.0.get_mut(1) {
+            *slot = None;
         }
-        result
+        g.1 = g.1.wrapping_add(1);
+        Ok(())
     }
 }
 
@@ -868,6 +861,55 @@ mod tests {
         let tee = TeeLogSink::new(b1, b2);
         assert!(tee.append(StreamKind::Stdout, b"r").is_err());
         assert!(tee.append(StreamKind::Stdout, b"s").is_err());
+    }
+
+    /// CRI-2・SUP-7・#4652: 開き直し前に始まった副の `append` の失敗が、開き直しの後に記録されても副は止まらない（交錯の再現）。
+    #[test]
+    fn cri2_tee_reopen_ignores_failure_from_append_started_before_reopen() {
+        use std::sync::mpsc::{Receiver, Sender, channel};
+
+        struct Gate {
+            entered: Mutex<Sender<()>>,
+            release: Mutex<Receiver<()>>,
+            fail_next: Mutex<bool>,
+            got: Mutex<Vec<Vec<u8>>>,
+        }
+        impl LogSink for Gate {
+            fn append(&self, _s: StreamKind, line: &[u8]) -> Result<(), TraitError> {
+                let fail = std::mem::replace(&mut *self.fail_next.lock().expect("lock"), false);
+                if fail {
+                    self.entered.lock().expect("lock").send(()).expect("send");
+                    self.release.lock().expect("lock").recv().expect("recv");
+                    return Err(internal("old state"));
+                }
+                self.got.lock().expect("lock").push(line.to_vec());
+                Ok(())
+            }
+            fn reopen(&self) -> Result<(), TraitError> {
+                Ok(())
+            }
+        }
+
+        let (entered_tx, entered_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        let gate = Arc::new(Gate {
+            entered: Mutex::new(entered_tx),
+            release: Mutex::new(release_rx),
+            fail_next: Mutex::new(true),
+            got: Mutex::new(Vec::new()),
+        });
+        let primary = Arc::new(Recorder(Mutex::new(Vec::new()), false));
+        let tee = Arc::new(TeeLogSink::new(primary, gate.clone()));
+        let t = tee.clone();
+        let h = std::thread::spawn(move || t.append(StreamKind::Stdout, b"old"));
+        entered_rx.recv().expect("append reached secondary");
+        // 古い状態への append が副の中で止まっている間に開き直しが成功する。
+        tee.reopen().expect("reopen");
+        release_tx.send(()).expect("release");
+        h.join().expect("join").expect("primary keeps ok");
+        assert_eq!(tee.failed_codes(), [None, None]);
+        tee.append(StreamKind::Stdout, b"new").expect("append");
+        assert_eq!(gate.got.lock().expect("lock").clone(), [b"new".to_vec()]);
     }
 
     #[cfg(unix)]

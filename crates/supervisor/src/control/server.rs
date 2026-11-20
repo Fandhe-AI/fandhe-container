@@ -411,7 +411,9 @@ fn handle_exec_handover(
 
 /// ReopenLogRequest（kind 10）の payload を読んで、稼働中のコンテナの CRI ログを開き直させる（CRI-2・SUP-7・REPAIR-5・#4652）。
 ///
-/// 稼働中でなければ（`NoHandle`・`ContainerExited`）sink に触れず断る（新しいファイルを作らない。cri-api の MUST NOT）。
+/// 稼働中でなければ（`NoHandle`・`ContainerExited`）sink に触れず断る。
+/// cri-api の契約は「稼働中でなければ、新しいファイルを作って nil を返すか、エラーを返す（エラーを返すときだけ作ってはならない）」。
+/// `check_running` と `reopen_log` の間にコンテナが終了した場合は新しいファイルができて `Ok` になりうるが、契約には反しない。
 /// 期限を過ぎていれば開き直さない。sink の失敗は理由コードへ写し（文言は反射しない）、既存の書き込み先は変わらない。
 fn handle_reopen_log(
     mut stream: UnixStream,

@@ -34,7 +34,7 @@
 //! 素性（pid・starttime・user / ipc / net の dev:ino）は READY の検証後に集めて `PodHolder::from_identity` で返し（R11・#2940。
 //! starttime を読めなければ fail-closed で子を回収して失敗）、記録ファイルへの書き込みは cri が行う。再起動後に再採用した記録の
 //! 保持役は `observe_process_start`（`/proc/<pid>/stat` の読み取りだけ）で終了済みを確かめるに留め、再採用はしない（要確認事項 1 の
-//! (a) は未採用）。rootful（uid 0）は `UNIMPLEMENTED`（#2241・#2442 の判断まで）。
+//! (a) は未採用）。rootful（uid 0）は #2241 の決定どおり `PERMISSION_DENIED` で恒久的に拒否する。
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;

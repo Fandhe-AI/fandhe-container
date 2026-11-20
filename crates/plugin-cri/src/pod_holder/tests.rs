@@ -847,3 +847,22 @@ fn cri2_sec5_2940_observe_process_start_reports_starttime_then_absent() {
         ProcessStartObservation::Absent
     );
 }
+
+/// SEC-5・CRI-2・#2241(#4709): 本番の provider は uid 0 を `PermissionDenied`・固定文言で恒久拒否し、非 root は通す。
+/// 固定の program の provider（試験用）は euid に依らず検査しない。euid は注入できないため、期待値は実行ユーザーから導く。
+#[test]
+fn sec5_4709_rootful_guard_refuses_uid_zero_with_permission_denied() {
+    let r = ProductionPodHolder::production().rootful_guard();
+    match current_euid().unwrap() {
+        0 => {
+            let e = r.expect_err("uid 0 must be refused");
+            assert_eq!(e.code(), ErrorCode::PermissionDenied);
+            assert_eq!(
+                e.message(),
+                "the pod namespace holder requires a non-root plugin process"
+            );
+        }
+        _ => assert_eq!(r, Ok(())),
+    }
+    assert_eq!(sh("true", 1).rootful_guard(), Ok(()));
+}

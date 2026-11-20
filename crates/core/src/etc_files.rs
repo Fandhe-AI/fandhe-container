@@ -38,8 +38,8 @@
 //!
 //! - supervisor の start からの呼び出しと start 失敗時の巻き戻しは supervisor の `container_options::etc_files`
 //!   （start の手順 4b。#1873・#3065・D14 で実装済み）。本モジュールは API のみ
-//! - 実際の bind mount は `crate::exec::etc_mounts`。本番の起動経路は `RootfulHostRoot` を launcher が `UNIMPLEMENTED` で
-//!   拒否している（#2241・SEC-5）ため、動くのは rootless の 2 モデル（`RootlessSingleId`・`RootlessSubordinateIds`）だけ
+//! - 実際の bind mount は `crate::exec::etc_mounts`。本番の起動経路は `RootfulHostRoot` を launcher が `PERMISSION_DENIED` で
+//!   意図して恒久拒否している（#2241・SEC-5）ため、動くのは rootless の 2 モデル（`RootlessSingleId`・`RootlessSubordinateIds`）だけ
 //! - 非 Linux は `UNIMPLEMENTED`（macOS・Windows の管理ルートの扱いは MAC・WIN 系で別に決める）
 
 use std::path::{Path, PathBuf};

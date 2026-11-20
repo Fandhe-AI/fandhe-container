@@ -458,6 +458,10 @@ impl ProductionLauncherBuilder {
             let audit_sink = self
                 .audit_sink
                 .ok_or_else(|| missing("the launcher requires an audit sink"))?;
+            // rootful の恒久拒否は、ペアリング検査(Attachable / JoinPinned との組)より前に、同じ code・文言で返す(#2241)。
+            if privilege == IsolationPrivilege::RootfulHostRoot {
+                return Err(rootful_refused());
+            }
             // 写像の解決と検証・注入との併用の拒否は subreaper 化(プロセス属性の変更)より前に行い、
             // 拒否で副作用を残さない(失敗した build の後に孤児を回収し続けない)。
             if let Some(options) = &self.launch_options {
@@ -512,12 +516,22 @@ impl ProductionLauncherBuilder {
     }
 }
 
+/// `RootfulHostRoot` の恒久拒否(#2241 の決定 D1 A・D2 A。SEC-5)。`build` の先頭と `launch` の先頭、
+/// ペアリング検査の rootful 分岐が同じ code・固定文言(値を含まない)で返す。監査(SEC-4)には記録しない。
+#[cfg(target_os = "linux")]
+fn rootful_refused() -> TraitError {
+    TraitError::new(
+        ErrorCode::PermissionDenied,
+        "the rootful privilege model is permanently refused by policy (SEC-5)",
+    )
+}
+
 /// `Attachable` の起動オプションと、`NetnsAttachHook` と、権限モデルの組を `build` で検査する(fork の前・副作用なし。
 /// NET-9・CORE-6・SEC-1・#1939)。
 ///
 /// - `Attachable` でフックが無い: `InvalidArgument`
 /// - フックがあるのに `Attachable` でない: `InvalidArgument`(取り違えを黙って無視しない)
-/// - `Attachable` が rootless 以外の権限モデル: `Unimplemented`(rootful の経路は D12〔#3069〕で別に扱う。挙動を変えない)
+/// - `Attachable` が rootful: `PermissionDenied`(`build` の先頭で拒否済みのためここには到達しない多重防御。#2241)
 #[cfg(target_os = "linux")]
 fn check_attach_hook_pairing(
     privilege: IsolationPrivilege,
@@ -543,10 +557,7 @@ fn check_attach_hook_pairing(
             IsolationPrivilege::RootlessSingleId | IsolationPrivilege::RootlessSubordinateIds
         )
     {
-        return Err(TraitError::new(
-            ErrorCode::Unimplemented,
-            "the attachable network mode requires a rootless privilege model",
-        ));
+        return Err(rootful_refused());
     }
     Ok(())
 }
@@ -557,7 +568,7 @@ fn check_attach_hook_pairing(
 /// - `JoinPinned` で参加先が無い: `InvalidArgument`
 /// - 参加先があるのに `JoinPinned` でない: `InvalidArgument`(取り違えを黙って無視しない)
 /// - `JoinPinned` が rootless の 2 種(特権ランチャー経由で ambient に `CAP_SYS_ADMIN` を持つ非 root を含む)以外の権限モデル:
-///   `Unimplemented`(`RootfulHostRoot` は `check_privilege` が先に `PermissionDenied` で拒否する〔#2241〕ため、実際には到達しない多重防御)
+///   `PermissionDenied`(rootful は `build` の先頭で拒否済みのため、ここには到達しない多重防御。#2241)
 #[cfg(target_os = "linux")]
 fn check_netns_join_pairing(
     privilege: IsolationPrivilege,
@@ -583,10 +594,7 @@ fn check_netns_join_pairing(
             IsolationPrivilege::RootlessSingleId | IsolationPrivilege::RootlessSubordinateIds
         )
     {
-        return Err(TraitError::new(
-            ErrorCode::Unimplemented,
-            "the pinned network join mode requires a rootless privilege model",
-        ));
+        return Err(rootful_refused());
     }
     Ok(())
 }
@@ -1645,10 +1653,7 @@ impl Inner {
             IsolationPrivilege::RootlessSingleId => Ok(()),
             // 写像は構築時に解決済み。無ければ構築の不整合として拒否する(fail-closed)。
             IsolationPrivilege::RootlessSubordinateIds if self.subordinate.is_some() => Ok(()),
-            IsolationPrivilege::RootfulHostRoot => Err(TraitError::new(
-                ErrorCode::PermissionDenied,
-                "rootful start is permanently refused by the privilege model policy",
-            )),
+            IsolationPrivilege::RootfulHostRoot => Err(rootful_refused()),
             IsolationPrivilege::RootlessSubordinateIds => Err(TraitError::new(
                 ErrorCode::InvalidArgument,
                 "the subordinate id privilege model requires a subordinate id source",
@@ -3888,7 +3893,7 @@ mod tests {
         assert_eq!(err.code(), ErrorCode::PermissionDenied);
         assert_eq!(
             err.message(),
-            "rootful start is permanently refused by the privilege model policy"
+            "the rootful privilege model is permanently refused by policy (SEC-5)"
         );
         assert!(ev.lock().unwrap().is_empty());
     }
@@ -3909,7 +3914,7 @@ mod tests {
         assert_eq!(err.code(), ErrorCode::PermissionDenied);
         assert_eq!(
             err.message(),
-            "rootful start is permanently refused by the privilege model policy"
+            "the rootful privilege model is permanently refused by policy (SEC-5)"
         );
         assert_ne!(
             err.message(),
@@ -5344,10 +5349,10 @@ mod tests {
         }
         let e = check_netns_join_pairing(IsolationPrivilege::RootfulHostRoot, Some(&joined))
             .unwrap_err();
-        assert_eq!(e.code(), ErrorCode::Unimplemented);
+        assert_eq!(e.code(), ErrorCode::PermissionDenied);
         assert_eq!(
             e.message(),
-            "the pinned network join mode requires a rootless privilege model"
+            "the rootful privilege model is permanently refused by policy (SEC-5)"
         );
         assert!(
             check_netns_join_pairing(IsolationPrivilege::RootfulHostRoot, Some(&plain)).is_ok()
@@ -5489,10 +5494,10 @@ mod tests {
         let e =
             check_attach_hook_pairing(IsolationPrivilege::RootfulHostRoot, Some(&attachable), true)
                 .unwrap_err();
-        assert_eq!(e.code(), ErrorCode::Unimplemented);
+        assert_eq!(e.code(), ErrorCode::PermissionDenied);
         assert_eq!(
             e.message(),
-            "the attachable network mode requires a rootless privilege model"
+            "the rootful privilege model is permanently refused by policy (SEC-5)"
         );
         // rootful の Attachable 以外の挙動は変えない(この検査は通す)。
         assert!(

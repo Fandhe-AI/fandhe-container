@@ -161,7 +161,7 @@ impl SupervisorStarter for ProductionStarter {
 
 /// [`ProductionStarter::start`] の本体（試験で解決・euid・起動を注入する）。
 ///
-/// 順序: (1) `resolve`（`not installed`・rootful の `UNIMPLEMENTED`・ランチャーの信頼の順位と文言は従来どおり）→
+/// 順序: (1) `resolve`（`not installed`・rootful の `PERMISSION_DENIED`（#2241）・ランチャーの信頼の順位と文言は従来どおり）→
 /// (2) 直接経路（ランチャーを使わない）のときだけ、spawn の前に共通口 `pod_holder::open_supervisor_beside_at` と同じ基準で
 /// 実体の隣の bin を検査する → (3) `run`。経路の判定は `resolve` が実際に選んだ結果（`uses_launcher`）に拠る。事前に別途
 /// 分類すると、分類と resolve の間でランチャーが出入りしたときに検査を飛ばす窓ができるため。ランチャー経由は

@@ -35,7 +35,7 @@
 //! したがって spawn した `Child` の pid・`process_group(0)`・stdio・渡した環境はそのまま supervisor のものになり、
 //! 呼び出し側は scope に居残らない。scope の取得時間も受信期限（58.9 秒）に含まれる。
 //! fail-closed（案 B の「呼び出し側の cgroup の下に子 cgroup を作る」へは落とさない）の判定はすべて spawn の前に行う。
-//! - rootful（`/proc/self/status` の uid のどれかが 0）: `UNIMPLEMENTED`（supervisor の判定と同じ文）。
+//! - rootful（`/proc/self/status` の uid のどれかが 0）: `PERMISSION_DENIED`（supervisor の判定と同じ文。#2241 の決定による恒久拒否）。
 //! - `systemd-run` が固定候補（`/usr/sbin`・`/usr/bin`・`/sbin`・`/bin`・NixOS の `/run/current-system/sw/bin`。`PATH` 探索は
 //!   しない）に無い、または実体が root か実効 UID 所有の通常ファイルで group / other 書き込み不可（祖先ディレクトリも同様。
 //!   PLUG-11 と同じ判定関数）でない: `FAILED_PRECONDITION`。探索と信頼の基準の詳細・NixOS の既知の限界は `crate::systemd_run`
@@ -512,7 +512,7 @@ fn privilege_gate(status_text: Option<&str>) -> Result<u32, OciRuntimeError> {
         Some(Identity::Rootless { euid }) => Ok(euid),
         Some(Identity::Rootful) => Err(start_error(
             ErrorCode::PermissionDenied,
-            "rootful start is permanently refused by the privilege model policy",
+            "the rootful privilege model is permanently refused by policy (SEC-5)",
         )),
         Some(Identity::Unreadable) | None => Err(start_error(
             ErrorCode::FailedPrecondition,
@@ -1030,7 +1030,7 @@ mod tests {
         )
     }
 
-    /// SEC-5・CLI-1: rootful（どの位置の uid が 0 でも）は UNIMPLEMENTED で拒否し、壊れた入力は FAILED_PRECONDITION。
+    /// SEC-5・CLI-1: rootful（どの位置の uid が 0 でも）は PERMISSION_DENIED で拒否し、壊れた入力は FAILED_PRECONDITION。
     #[test]
     fn sec5_cli_rootful_is_permission_denied() {
         assert_eq!(
@@ -1048,7 +1048,7 @@ mod tests {
             assert_eq!(e.exit_code().get(), 6, "{uid}");
             assert_eq!(
                 e.message(),
-                "rootful start is permanently refused by the privilege model policy"
+                "the rootful privilege model is permanently refused by policy (SEC-5)"
             );
         }
         for bad in [Some(""), Some("garbage"), None] {

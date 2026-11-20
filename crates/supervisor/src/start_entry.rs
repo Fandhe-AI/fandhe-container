@@ -2593,7 +2593,7 @@ mod linux {
         if [uid.real, uid.effective, uid.saved, uid.fs].contains(&0) {
             return Err(TraitError::new(
                 ErrorCode::PermissionDenied,
-                "rootful start is permanently refused by the privilege model policy",
+                "the rootful privilege model is permanently refused by policy (SEC-5)",
             ));
         }
         Ok(IsolationPrivilege::RootlessSingleId)
@@ -5273,7 +5273,7 @@ mod linux {
             );
         }
 
-        /// SEC-5: rootful はPERMISSION_DENIED（#4709）（設定ファイルに依らない）。
+        /// SEC-5: rootful は PERMISSION_DENIED（#4709）で、設定ファイルに依らない）。
         #[test]
         fn sec5_rootful_still_rejected_before_any_file_is_read() {
             let e = resolve_with("root", Some(ALICE), None, None, "0\t0\t0\t0")
@@ -5579,7 +5579,7 @@ mod linux {
                 assert_eq!(e.code(), ErrorCode::PermissionDenied, "uid: {uid}");
                 assert_eq!(
                     e.message(),
-                    "rootful start is permanently refused by the privilege model policy"
+                    "the rootful privilege model is permanently refused by policy (SEC-5)"
                 );
             }
         }

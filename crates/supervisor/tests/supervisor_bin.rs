@@ -176,7 +176,7 @@ fn expected_check_failure() -> Option<(ErrorCode, &'static str)> {
     if euid_is_root {
         return Some((
             ErrorCode::PermissionDenied,
-            "rootful start is permanently refused by the privilege model policy",
+            "the rootful privilege model is permanently refused by policy (SEC-5)",
         ));
     }
     fandhe_container_core::landlock::detect_landlock_abi()

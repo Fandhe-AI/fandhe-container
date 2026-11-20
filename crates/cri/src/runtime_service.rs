@@ -101,7 +101,8 @@
 //! ここでは作らない。`config` のパス類は保持するだけで検証していない（実際にファイルへ触れる TASK-58 / TASK-59 で検証する）。
 //! 例外として `log_directory` と `log_path` は実行層接続時の CreateContainer で結合・検証して保持し、
 //! StartContainer が `StartRequest` で supervisor へ渡す（`resolve_log_path`。CRI-2・SUP-4・#2671）。
-//! `ReopenContainerLog` は `UNIMPLEMENTED` のまま（kubelet のログ回転は後続 issue）。
+//! `ReopenContainerLog` は [`ContainerLogReopener`] を `with_log_reopener` で差したときだけ実装し（running のみ・
+//! 失敗時は新しいログを作らない。CRI-2・SUP-7・#4652）、未注入は `UNIMPLEMENTED`。
 //!
 //! **保持量の上限**: レジストリは件数（[`MAX_SANDBOXES`]）と、保持する `config` の量
 //! （1 件の符号化長 [`MAX_CONFIG_ENCODED_BYTES`]・可変長要素の件数と長さ・合計の見積もり
@@ -146,7 +147,9 @@ use tonic::{Request, Response, Status};
 
 use crate::bundle::{AppliedUser, ResolvedImage, resolve_log_path};
 use crate::error::{CriError, CriErrorCode};
-use fandhe_container_core::traits::{ContainerId, ContainerLogPath, PodShmSource, StdinMode};
+use fandhe_container_core::traits::{
+    ContainerId, ContainerLogPath, PodShmSource, StdinMode, TraitError,
+};
 
 use crate::adapter::{
     BundleProvider, BundleRequest, PodHolder, PodNamespaceHolderProvider, PodNetns,
@@ -365,6 +368,8 @@ pub struct CriRuntimeService {
     recorder: Arc<dyn CriOpRecorder>,
     /// 実行層への接続（TASK-59.2）。`None` のときは記録上の遷移だけのスタブ動作。
     runtime: Option<RuntimeBinding>,
+    /// `ReopenContainerLog` の注入口。`None` は `UNIMPLEMENTED`（REPAIR-3）。
+    log_reopener: Option<Arc<dyn ContainerLogReopener>>,
     /// 実行層の応答待ちの上限（REPAIR-5）。
     runtime_timeout: Duration,
     /// `ContainerStatus` の観測で実行層の状態を 1 回読む待ちの上限（#4174。既定は [`CONTAINER_EXIT_OBSERVE_TIMEOUT`]）。
@@ -468,6 +473,22 @@ struct RuntimeBinding {
     adapter: RuntimeAdapter,
     bundles: Arc<dyn BundleProvider>,
 }
+
+/// running のコンテナの CRI ログを同じパスで開き直す注入口（`ReopenContainerLog`。CRI-2・SUP-7・PLUG-1）。
+///
+/// core の `ContainerRuntime` には足さない（PLUG-1・PLUG-4）。plugin-cri が supervisor の制御チャネル
+/// （`ControlReopenLog`）を包んで [`CriRuntimeService::with_log_reopener`] で差す。`deadline` までに戻すこと
+/// （blocking 呼び出し。cri が専用スレッドで呼び、`CONTAINER_LOG_REOPEN_TIMEOUT` で打ち切る）。
+/// エラーの区分はそのまま gRPC の code に写る。失敗時は新しいログファイルを作らない契約（cri-api の
+/// `ReopenContainerLog` の規定）。文言にパスを含めないこと。
+pub trait ContainerLogReopener: Send + Sync {
+    /// `id` のコンテナの CRI ログを開き直す。
+    fn reopen(&self, id: &ContainerId, deadline: Instant) -> Result<(), TraitError>;
+}
+
+/// `ReopenContainerLog` が開き直しを待つ上限（kubelet の呼び出しに期限が無いため、有限で戻す。REPAIR-5）。
+/// supervisor の制御チャネルの上限（10 秒）より短く、kubelet のログ回転の周期に比べて十分短い。
+const CONTAINER_LOG_REOPEN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 実行層（bundle 供給元・`ContainerRuntime`）の応答待ちの既定の上限（REPAIR-5）。
 ///
@@ -1988,6 +2009,7 @@ impl CriRuntimeService {
             container_limits: ContainerLimits::default(),
             recorder,
             runtime: None,
+            log_reopener: None,
             runtime_timeout: DEFAULT_RUNTIME_TIMEOUT,
             exit_observe_timeout: CONTAINER_EXIT_OBSERVE_TIMEOUT,
             list_exit_observe_busy: Arc::new(AtomicBool::new(false)),
@@ -2087,6 +2109,59 @@ impl CriRuntimeService {
     ) -> Self {
         self.runtime = Some(RuntimeBinding { adapter, bundles });
         self
+    }
+
+    /// `ReopenContainerLog` の注入口を差す（CRI-2・SUP-7・PLUG-1）。呼ばなければ `UNIMPLEMENTED`。
+    pub fn with_log_reopener(mut self, reopener: Arc<dyn ContainerLogReopener>) -> Self {
+        self.log_reopener = Some(reopener);
+        self
+    }
+
+    /// `ReopenContainerLog` の本体（CRI-2・SUP-7・REPAIR-4・REPAIR-5）。
+    ///
+    /// 順序: 注入口の有無 → container_id の検証 → 記録の検索（`NOT_FOUND`）→ running でなければ
+    /// `FAILED_PRECONDITION`（新しいログは作らない。containerd と同じ）→ log_path が無ければ `FAILED_PRECONDITION`
+    /// → 注入口を専用スレッドで期限つきに呼ぶ。registry のロックは呼び出しの前に外す。
+    async fn reopen_container_log_impl(
+        &self,
+        req: v1::ReopenContainerLogRequest,
+    ) -> Result<v1::ReopenContainerLogResponse, CriError> {
+        let Some(reopener) = &self.log_reopener else {
+            return Err(CriError::unimplemented("reopen_container_log"));
+        };
+        if req.container_id.is_empty() {
+            return Err(CriError::invalid_argument("container_id is required"));
+        }
+        let id = ContainerId::new(req.container_id.clone())
+            .map_err(|_| CriError::invalid_argument("container_id is invalid"))?;
+        {
+            let registry = self
+                .registry
+                .lock()
+                .map_err(|_| CriError::internal("sandbox registry is unavailable"))?;
+            let record = registry
+                .containers
+                .get(&req.container_id)
+                .ok_or_else(|| CriError::not_found("container not found"))?;
+            if record.state != ContainerState::Running {
+                return Err(CriError::failed_precondition("container is not running"));
+            }
+            if record.resolved_log_path.is_none() {
+                return Err(CriError::failed_precondition(
+                    "the container has no CRI log path",
+                ));
+            }
+        }
+        let reopener = Arc::clone(reopener);
+        let deadline = Instant::now() + CONTAINER_LOG_REOPEN_TIMEOUT;
+        // 注入口自身も deadline を守る。外側の待ちは数百 ms の余裕を足して、内側の `Timeout` を優先して返す。
+        run_bounded(
+            CONTAINER_LOG_REOPEN_TIMEOUT + Duration::from_millis(500),
+            move || reopener.reopen(&id, deadline),
+        )
+        .await?
+        .map_err(|e| CriError::from(&e))?;
+        Ok(v1::ReopenContainerLogResponse {})
     }
 
     /// `Status` の応答を組み立てる（CRI-1・CRI-2・REPAIR-3・REPAIR-5・#2830）。
@@ -5086,13 +5161,19 @@ impl RuntimeService for CriRuntimeService {
     ) -> Result<Response<v1::UpdateContainerResourcesResponse>, Status> {
         Err(CriError::unimplemented("update_container_resources").into())
     }
-    /// 未実装（kubelet のログ回転に要る。CRI-2・SUP-7。#2671 の後続 issue）。CRI ログの書き出し自体は実装済みで、
-    /// 回転が無い間は総量に上限が無い（`docs/design/cri-config-acceptance.md`）。
+    /// running のコンテナの CRI ログを同じパスで開き直す（kubelet のログ回転。CRI-2・SUP-7）。
+    /// `with_log_reopener` 未注入は `UNIMPLEMENTED`。
     async fn reopen_container_log(
         &self,
-        _request: Request<v1::ReopenContainerLogRequest>,
+        request: Request<v1::ReopenContainerLogRequest>,
     ) -> Result<Response<v1::ReopenContainerLogResponse>, Status> {
-        Err(CriError::unimplemented("reopen_container_log").into())
+        let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::ReopenContainerLog);
+        let result = self
+            .reopen_container_log_impl(request.into_inner())
+            .await
+            .map_err(Status::from);
+        timer.finish_with(&result);
+        result.map(Response::new)
     }
     /// 未実装。実装するときは Exec と同じく、要求の受理時にインスタンスを記録し、起動時に
     /// `instance_matches` で照合すること（#4286・CRI-5・SEC-1・CORE-1）。

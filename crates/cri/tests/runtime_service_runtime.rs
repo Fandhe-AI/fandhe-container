@@ -9,11 +9,12 @@ use fandhe_container_oci::reference::Digest;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fandhe_container_core::traits::{
-    ContainerRuntime, ContainerStatus, CreateRequest, DeleteRequest, DeleteResponse, ErrorCode,
-    ExitTime, KillRequest, StartRequest, StateRequest, StopRequest, TerminationReason, TraitError,
+    ContainerId, ContainerRuntime, ContainerStatus, CreateRequest, DeleteRequest, DeleteResponse,
+    ErrorCode, ExitTime, KillRequest, StartRequest, StateRequest, StopRequest, TerminationReason,
+    TraitError,
 };
 use fandhe_container_cri::adapter::{
     BundleProvider, BundleRequest, PreparedBundle, ReleaseBudget, RuntimeAdapter,
@@ -24,7 +25,7 @@ use fandhe_container_cri::runtime::v1::{
     self, ContainerConfig, ContainerMetadata, ContainerState as S, ImageSpec, PodSandboxConfig,
     PodSandboxMetadata, runtime_service_server::RuntimeService,
 };
-use fandhe_container_cri::runtime_service::CriRuntimeService;
+use fandhe_container_cri::runtime_service::{ContainerLogReopener, CriRuntimeService};
 use tonic::{Code, Request, Status};
 
 /// フェイクの実行層。呼び出しを記録し、失敗・返す状態・start の保留を注入できる。
@@ -3398,4 +3399,157 @@ async fn repair5_4286_exec_state_read_is_bounded() {
     x.h.runtime.hold_state.store(false, Ordering::SeqCst);
     assert_eq!(e.code(), Code::DeadlineExceeded);
     assert!(x.handler.0.lock().unwrap().is_empty());
+}
+
+/// 偽のリオープナー。渡された ID を記録し、`fail` があればそのエラーを返す。
+#[derive(Default)]
+struct FakeReopener {
+    calls: Mutex<Vec<String>>,
+    fail: Mutex<Option<ErrorCode>>,
+}
+
+impl ContainerLogReopener for FakeReopener {
+    fn reopen(&self, id: &ContainerId, _deadline: Instant) -> Result<(), TraitError> {
+        self.calls.lock().unwrap().push(id.as_str().to_owned());
+        match *self.fail.lock().unwrap() {
+            Some(code) => Err(TraitError::new(code, "reopen failed")),
+            None => Ok(()),
+        }
+    }
+}
+
+async fn reopen(service: &CriRuntimeService, id: &str) -> Result<(), Status> {
+    RuntimeService::reopen_container_log(
+        service,
+        Request::new(v1::ReopenContainerLogRequest {
+            container_id: id.into(),
+        }),
+    )
+    .await
+    .map(|_| ())
+}
+
+/// log_path つきで作る（sandbox の log_directory も付ける）。
+async fn create_with_log(service: &CriRuntimeService, name: &str) -> String {
+    let sb = RuntimeService::run_pod_sandbox(
+        service,
+        Request::new(v1::RunPodSandboxRequest {
+            config: Some(PodSandboxConfig {
+                metadata: Some(PodSandboxMetadata {
+                    name: "pod".into(),
+                    uid: "uid-1".into(),
+                    namespace: "ns".into(),
+                    attempt: 0,
+                }),
+                log_directory: "/var/log/pods/ns_pod_uid-1".into(),
+                ..Default::default()
+            }),
+            runtime_handler: String::new(),
+        }),
+    )
+    .await
+    .expect("run sandbox")
+    .into_inner()
+    .pod_sandbox_id;
+    let mut cfg = container(name);
+    cfg.log_path = "c/0.log".into();
+    RuntimeService::create_container(
+        service,
+        Request::new(v1::CreateContainerRequest {
+            pod_sandbox_id: sb,
+            config: Some(cfg),
+            sandbox_config: None,
+        }),
+    )
+    .await
+    .expect("create")
+    .into_inner()
+    .container_id
+}
+
+/// CRI-2・SUP-7・REPAIR-12（#4652）: running で成功し、リオープナーへ同じ ID が渡る。
+#[tokio::test]
+async fn cri_2_reopen_container_log_running_reaches_reopener() {
+    let h = harness();
+    let fake = Arc::new(FakeReopener::default());
+    let service = h.service.with_log_reopener(fake.clone());
+    let id = create_with_log(&service, "c").await;
+    start(&service, &id).await.expect("start");
+    reopen(&service, &id).await.expect("reopen");
+    assert_eq!(fake.calls.lock().unwrap().clone(), vec![id]);
+}
+
+/// CRI-2・SUP-7（#4652）: running でない（created・exited）は `FAILED_PRECONDITION` で、リオープナーを呼ばない。
+#[tokio::test]
+async fn cri_2_reopen_container_log_not_running_is_rejected() {
+    let h = harness();
+    let fake = Arc::new(FakeReopener::default());
+    let service = h.service.with_log_reopener(fake.clone());
+    let id = create_with_log(&service, "c").await;
+    let err = reopen(&service, &id).await.expect_err("created");
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    assert_eq!(err.message(), "container is not running");
+    start(&service, &id).await.expect("start");
+    stop_c(&service, &id).await.expect("stop");
+    let err = reopen(&service, &id).await.expect_err("exited");
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    assert_eq!(err.message(), "container is not running");
+    assert!(fake.calls.lock().unwrap().is_empty());
+}
+
+/// CRI-2（#4652）: 未知の ID は `NOT_FOUND`、空の ID は `INVALID_ARGUMENT`。
+#[tokio::test]
+async fn cri_2_reopen_container_log_unknown_id() {
+    let h = harness();
+    let fake = Arc::new(FakeReopener::default());
+    let service = h.service.with_log_reopener(fake.clone());
+    let err = reopen(&service, "nope").await.expect_err("unknown");
+    assert_eq!(err.code(), Code::NotFound);
+    let err = reopen(&service, "").await.expect_err("empty");
+    assert_eq!(err.code(), Code::InvalidArgument);
+    assert!(fake.calls.lock().unwrap().is_empty());
+}
+
+/// CRI-2・SUP-7（#4652）: log_path の無いコンテナは `FAILED_PRECONDITION`。
+#[tokio::test]
+async fn cri_2_reopen_container_log_without_log_path_is_rejected() {
+    let h = harness();
+    let fake = Arc::new(FakeReopener::default());
+    let service = h.service.with_log_reopener(fake.clone());
+    let sb = run_sandbox(&service).await;
+    let id = create(&service, &sb, "c").await.expect("create");
+    start(&service, &id).await.expect("start");
+    let err = reopen(&service, &id).await.expect_err("no log path");
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    assert_eq!(err.message(), "the container has no CRI log path");
+    assert!(fake.calls.lock().unwrap().is_empty());
+}
+
+/// CRI-2・SUP-7（#4652）: リオープナーのエラーは code のまま返る。
+#[tokio::test]
+async fn cri_2_reopen_container_log_reopener_error_keeps_code() {
+    let h = harness();
+    let fake = Arc::new(FakeReopener::default());
+    let service = h.service.with_log_reopener(fake.clone());
+    let id = create_with_log(&service, "c").await;
+    start(&service, &id).await.expect("start");
+    for (code, want) in [
+        (ErrorCode::Unavailable, Code::Unavailable),
+        (ErrorCode::FailedPrecondition, Code::FailedPrecondition),
+        (ErrorCode::PermissionDenied, Code::PermissionDenied),
+    ] {
+        *fake.fail.lock().unwrap() = Some(code);
+        let err = reopen(&service, &id).await.expect_err("fails");
+        assert_eq!(err.code(), want);
+    }
+}
+
+/// CRI-2・REPAIR-3（#4652）: リオープナー未注入は `UNIMPLEMENTED`。
+#[tokio::test]
+async fn cri_2_reopen_container_log_without_reopener_is_unimplemented() {
+    let h = harness();
+    let id = create_with_log(&h.service, "c").await;
+    start(&h.service, &id).await.expect("start");
+    let err = reopen(&h.service, &id).await.expect_err("unimplemented");
+    assert_eq!(err.code(), Code::Unimplemented);
 }

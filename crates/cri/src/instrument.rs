@@ -121,13 +121,15 @@ pub enum CriOpKind {
     ExecConnRead,
     /// Exec の通信路（クライアント接続）への書き込み（セッション内の成功 / 失敗。CRI-6・TASK-63.2・REPAIR-4）。
     ExecConnWrite,
+    /// `RuntimeService.ReopenContainerLog` 1 回（running のコンテナの CRI ログの開き直し。CRI-2・SUP-7・REPAIR-4）。
+    ReopenContainerLog,
 }
 
 impl CriOpKind {
     /// 全種別を宣言順に並べたもの（plugin-cri が共有記録器へ届く操作名の最悪数を数える試験の列挙元。
     /// CRI-6・REPAIR-4・#4380）。種別を足したら本配列と、試験の通し番号の `match`
     /// （`repair4_4380_cri_op_kind_all_is_exhaustive`）を直す。直さないと cri の試験が失敗する。
-    pub const ALL: [CriOpKind; 40] = [
+    pub const ALL: [CriOpKind; 41] = [
         CriOpKind::RunPodSandbox,
         CriOpKind::StopPodSandbox,
         CriOpKind::RemovePodSandbox,
@@ -168,6 +170,7 @@ impl CriOpKind {
         CriOpKind::ExecStreamWrite,
         CriOpKind::ExecConnRead,
         CriOpKind::ExecConnWrite,
+        CriOpKind::ReopenContainerLog,
     ];
 
     /// core の `OpName` へ渡す安定した操作名。
@@ -213,6 +216,7 @@ impl CriOpKind {
             CriOpKind::ExecStreamWrite => "cri.exec.stream_write",
             CriOpKind::ExecConnRead => "cri.exec.conn_read",
             CriOpKind::ExecConnWrite => "cri.exec.conn_write",
+            CriOpKind::ReopenContainerLog => "cri.reopen_container_log",
         }
     }
 }
@@ -575,19 +579,20 @@ mod tests {
             CriOpKind::ExecStreamWrite => 37,
             CriOpKind::ExecConnRead => 38,
             CriOpKind::ExecConnWrite => 39,
+            CriOpKind::ReopenContainerLog => 40,
         }
     }
 
     /// REPAIR-4・CRI-6（#4380）: `ALL` は全種別を宣言順に過不足なく持ち、`as_str` が重複しない。
     #[test]
     fn repair4_4380_cri_op_kind_all_is_exhaustive() {
-        assert_eq!(CriOpKind::ALL.len(), 40);
+        assert_eq!(CriOpKind::ALL.len(), 41);
         for (i, kind) in CriOpKind::ALL.iter().enumerate() {
             assert_eq!(ordinal(*kind), i, "{kind:?} is out of place in ALL");
         }
         let names: std::collections::BTreeSet<&str> =
             CriOpKind::ALL.iter().map(|k| k.as_str()).collect();
-        assert_eq!(names.len(), 40);
+        assert_eq!(names.len(), 41);
     }
 
     /// REPAIR-4・CRI-3（#2966）: HTTP 状態から区分への写像（境界値）と語彙の健全性。

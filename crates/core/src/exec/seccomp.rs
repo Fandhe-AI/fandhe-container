@@ -202,6 +202,10 @@ fn build_default_program_with(
 pub struct SeccompEnforcementObservation {
     /// 適用前の `kcmp(自 pid, 自 pid, KCMP_VM)`（対照。通常は成功し `None`。外側の seccomp が `kcmp` を拒否する環境では `EPERM` になり対照として働かないため、試験は前提欠如として失敗させる。ESC-06・#2006）。
     pub kcmp_before: Option<i32>,
+    /// 適用前の `io_uring_setup(0, NULL)` の errno（対照。フィルタが無ければ `EFAULT`、io_uring 未対応なら `ENOSYS`。
+    /// `kernel.io_uring_disabled` 等で `EPERM` の環境では適用後の `EPERM` と区別できないため、試験は前提欠如として
+    /// 失敗させる。CORE-5・SEC-1・MAC-4・#4803）。
+    pub io_uring_setup_before: Option<i32>,
     /// 適用した BPF 命令数。
     pub instructions: usize,
     /// 適用後の `/proc/thread-self/status` の `Seccomp:` 値（filter モードは `2`）。
@@ -226,6 +230,8 @@ pub struct SeccompEnforcementObservation {
     pub vsock_high_bits_after: Option<i32>,
     /// 適用後の `socket(AF_UNIX, SOCK_STREAM, 0)`（陽性対照。成功して `None`）。
     pub unix_socket_after: Option<i32>,
+    /// 適用後の `io_uring_setup(0, NULL)` の errno（`ERRNO(EPERM)`。フィルタが無ければ `EINVAL`。CORE-5・SEC-1・MAC-4・#4803）。
+    pub io_uring_setup_after: Option<i32>,
 }
 
 /// 本番の適用経路（[`apply_default_seccomp`]）を呼び出しスレッドへ適用し、禁止 syscall の遮断を観測する
@@ -249,6 +255,7 @@ pub fn observe_default_seccomp_enforcement() -> Result<SeccompEnforcementObserva
         |m: &str| ExecError::new(ErrorCode::Internal, IsolationStage::Seccomp, m.to_string());
     sys::set_no_new_privs().map_err(|_| fail("failed to set no_new_privs"))?;
     let kcmp_before = errno(sys::kcmp_self_probe());
+    let io_uring_setup_before = errno(sys::io_uring_setup_probe());
     let report = apply_default_seccomp()?;
     let status = std::fs::read_to_string("/proc/thread-self/status")
         .map_err(|_| fail("failed to read thread status"))?;
@@ -259,6 +266,7 @@ pub fn observe_default_seccomp_enforcement() -> Result<SeccompEnforcementObserva
         .ok_or_else(|| fail("Seccomp field missing"))?;
     Ok(SeccompEnforcementObservation {
         kcmp_before,
+        io_uring_setup_before,
         instructions: report.instructions,
         seccomp_mode,
         kcmp_after: errno(sys::kcmp_self_probe()),
@@ -268,6 +276,7 @@ pub fn observe_default_seccomp_enforcement() -> Result<SeccompEnforcementObserva
         vsock_after: errno(sys::vsock_socket_probe()),
         vsock_high_bits_after: errno(sys::vsock_socket_high_bits_probe()),
         unix_socket_after: errno(sys::unix_socket_probe()),
+        io_uring_setup_after: errno(sys::io_uring_setup_probe()),
     })
 }
 

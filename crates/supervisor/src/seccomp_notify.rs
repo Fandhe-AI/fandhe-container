@@ -3,7 +3,7 @@
 //!
 //! # 役割と呼び出し文脈
 //!
-//! 本番 launcher は supervisor の start 経路の opt-in で ERRNO 側の 40 件の syscall を `SECCOMP_RET_USER_NOTIF` にし、
+//! 本番 launcher は supervisor の start 経路の opt-in で ERRNO 側の 43 件の syscall を `SECCOMP_RET_USER_NOTIF` にし、
 //! PID 1 が `NEW_LISTENER` 付きで載せた listener fd を supervisor へ渡す（core の `exec::seccomp_listener`。#2024）。
 //! 本モジュールの [`SeccompNotifyHub`] は、その listener を監視の間保持し、専用スレッドで通知を読んで
 //! 「PID を対象自身の PID namespace の値へ変換 → cookie 検証 → 記録 → `-EPERM` 応答」を行う。

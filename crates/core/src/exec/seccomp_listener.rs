@@ -14,7 +14,7 @@
 //! 保持するだけならコンテナの挙動は変わらない。exec の経路（SUP-6・#2385）では worker が同じ手順で渡し、起動側 C は worker を fork した
 //! exec 専用の親（[`ExecListenerReceiver`]）になる。exec の親は worker の終了を待つ前に受信し（相互待ちを避ける）、届け方は親が fork 前に決める
 //! （exec の本番経路は `USER_NOTIF`、応答者は supervisor の `exec::run_in_worker_with`。9.4・#2544）。`ProductionLauncherBuilder::seccomp_errno_delivery(UserNotif)` で opt-in した
-//! launcher（supervisor の start 経路だけ）では ERRNO 側の 40 件が通知になり、応答者がいる前提になる
+//! launcher（supervisor の start 経路だけ）では ERRNO 側の 43 件が通知になり、応答者がいる前提になる
 //! （`audit-delivery.md` 9 章の案 3）。通知の引数・命令ポインタは公開せず、応答は `-EPERM` の 1 種類だけ（TOCTOU の余地を
 //! 型で無くす）。
 //!

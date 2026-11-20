@@ -76,6 +76,10 @@ fn main() {
             kcmp_errno: i32,
             seccomp_before: String,
         },
+        /// 適用前の `io_uring_setup` が `EPERM`（`kernel.io_uring_disabled` 等）で、適用後の `EPERM` と区別できない。
+        IoUringPrecondition {
+            seccomp_before: String,
+        },
         Failed,
     }
 
@@ -92,12 +96,21 @@ fn main() {
         };
         let mut errno = None;
         let mut mode = None;
+        let mut io_uring = false;
         for kv in rest.split_whitespace() {
-            if let Some(v) = kv.strip_prefix("kcmp_before_errno=") {
+            if kv == "io_uring_before_errno=1" {
+                io_uring = true;
+            } else if let Some(v) = kv.strip_prefix("kcmp_before_errno=") {
                 errno = v.parse::<i32>().ok();
             } else if let Some(v) = kv.strip_prefix("seccomp_before=") {
                 mode = Some(v.to_string());
             }
+        }
+        if io_uring {
+            return match mode {
+                Some(seccomp_before) => ChildOutcome::IoUringPrecondition { seccomp_before },
+                None => ChildOutcome::Failed,
+            };
         }
         match (errno, mode) {
             (Some(kcmp_errno), Some(seccomp_before)) => ChildOutcome::PreconditionFailed {
@@ -169,6 +182,23 @@ fn main() {
             ChildOutcome::Failed
         );
         assert_eq!(classify_child(None, &marker(1, "2")), ChildOutcome::Failed);
+        // io_uring の適用前の対照（#4803）: marker があれば前提欠如、seccomp_before が無ければ失敗。
+        assert_eq!(
+            classify_child(
+                Some(PRECONDITION_EXIT),
+                &format!("{MARKER}io_uring_before_errno=1 seccomp_before=0\n")
+            ),
+            ChildOutcome::IoUringPrecondition {
+                seccomp_before: "0".into()
+            }
+        );
+        assert_eq!(
+            classify_child(
+                Some(PRECONDITION_EXIT),
+                &format!("{MARKER}io_uring_before_errno=1\n")
+            ),
+            ChildOutcome::Failed
+        );
     }
     if let Some(i) = args.iter().position(|a| a == "--child-kill") {
         let name = args.get(i + 1).expect("syscall name after --child-kill");
@@ -198,6 +228,16 @@ fn main() {
             println!("{MARKER}kcmp_before_errno={errno} seccomp_before={seccomp_before}");
             std::process::exit(PRECONDITION_EXIT);
         }
+        if o.io_uring_setup_before == Some(EPERM) {
+            // 適用前から io_uring_setup が EPERM（io_uring_disabled 等）: 適用後の EPERM を識別できない。
+            println!("{MARKER}io_uring_before_errno=1 seccomp_before={seccomp_before}");
+            std::process::exit(PRECONDITION_EXIT);
+        }
+        assert!(
+            matches!(o.io_uring_setup_before, Some(14 | 38)),
+            "io_uring_setup control before apply must be EFAULT(14) or ENOSYS(38): {:?}",
+            o.io_uring_setup_before
+        );
         assert!(o.instructions > 0, "filter has instructions");
         assert_eq!(o.seccomp_mode, "2", "SECCOMP_MODE_FILTER");
         assert_eq!(o.kcmp_after, Some(EPERM), "kcmp blocked");
@@ -212,6 +252,13 @@ fn main() {
             "socket(AF_VSOCK | 1<<32) blocked"
         );
         assert_eq!(o.unix_socket_after, None, "socket(AF_UNIX) allowed");
+        // io_uring の拒否（CORE-5・SEC-1・MAC-4・#4803）。適用前の対照は EFAULT（params = NULL）か ENOSYS で、
+        // 適用後だけ EPERM になることでフィルタの効果を識別する。
+        assert_eq!(
+            o.io_uring_setup_after,
+            Some(EPERM),
+            "io_uring_setup blocked"
+        );
         println!("seccomp_enforcement child: ok");
         return;
     }
@@ -252,6 +299,11 @@ fn main() {
             kcmp_errno,
             seccomp_before,
         } => panic!("{}", precondition_message(kcmp_errno, &seccomp_before)),
+        ChildOutcome::IoUringPrecondition { seccomp_before } => panic!(
+            "seccomp_enforcement: PRECONDITION FAILED (test environment, not a seccomp filter regression): \
+             io_uring_setup was denied with EPERM before the runtime's filter was applied \
+             (Seccomp: {seccomp_before} before apply); check kernel.io_uring_disabled or an outer seccomp profile."
+        ),
         ChildOutcome::Failed => panic!(
             "child failed ({status}): {}\n{}",
             String::from_utf8_lossy(&out.stdout),

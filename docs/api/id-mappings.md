@@ -6,7 +6,7 @@ OCI `config.json` の `linux.uidMappings` / `linux.gidMappings` は受けない�
 
 - どちらかの配列が非空なら `start` は `INVALID_ARGUMENT`（終了コード 2）で拒否する。message は次の固定文言（config の値は含めない）。`linux.uidMappings / linux.gidMappings are not accepted: ID mappings are derived from the runtime privilege model (SEC-5)`
 - 空配列・省略は受ける
-- 拒否はプロセス起動・状態の予約より前で行い、プロセスも状態も残さない。監査ログには記録しない（config の誤りで、脱出の試行ではないため）
+- 拒否はプロセス起動・状態の予約より前で行い、新たな起動予約やプロセスは残らず、create 済みの状態レコードは `Created` のまま。監査ログには記録しない（config の誤りで、脱出の試行ではないため）
 
 ## 受けない理由
 

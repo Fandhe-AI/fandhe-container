@@ -9,7 +9,7 @@ OCI config の `linux.uidMappings` / `gidMappings` を受けるか拒むかの�
 
 ## 現状
 
-- `crates/core/src/oci_runtime/start.rs` の `reject_config_id_mappings` が、どちらかの配列が非空なら `InvalidArgument`（message: `linux.uidMappings / linux.gidMappings are not accepted: ID mappings are derived from the runtime privilege model (SEC-5)`。#4711 で旧 `Unimplemented` から変更）で拒否する。空配列は受ける。fork・予約より前で、プロセスも状態も残さない
+- `crates/core/src/oci_runtime/start.rs` の `reject_config_id_mappings` が、どちらかの配列が非空なら `InvalidArgument`（message: `linux.uidMappings / linux.gidMappings are not accepted: ID mappings are derived from the runtime privilege model (SEC-5)`。#4711 で旧 `Unimplemented` から変更）で拒否する。空配列は受ける。fork・予約より前で、新たな起動予約やプロセスは残らず、create 済みの状態レコードは `Created` のまま
 - パース段階（`config.rs`）で件数の上限（340。カーネルの上限）・`size` が 1 以上・`containerID + size` の桁あふれは検証済み
 - 写像は launcher が権限モデルから導く。`RootlessSingleId` は呼び出し側の euid / egid への単一写像、`RootlessSubordinateIds` は `/etc/subuid`・`/etc/subgid` 由来の範囲写像
 

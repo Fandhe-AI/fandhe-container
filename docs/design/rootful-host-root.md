@@ -57,7 +57,7 @@ D1 A・D2 A・D3 A-1 に伴う変更。「済」は #4709 で完了したもの�
 
 本変更（#4709）の対象外で `Unimplemented` のまま（変えない）:
 
-- uid 0 の `create`（終了コード 8）
+- uid 0 の `create` でユーザー定義ネットワーク・`-p` を指定した場合（終了コード 8。D13）
 - rootful の network（user-defined network・`-p`・`up` の rootful）は D13（#3207）の判断待ちで `UNIMPLEMENTED`
 - rootful の POD の PortForward は #4708 の持ち越しで、恒久的な拒否ではない（[cri-streaming-server.md](cri-streaming-server.md)）
 

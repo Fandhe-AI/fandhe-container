@@ -25,6 +25,10 @@ pub(crate) enum ReadStop {
 
 /// `until` まで、EOF・上限 `max` バイト・（`stop_at_newline` なら）`\n` のいずれかで止まるまで読む。
 /// `\n` は結果に含み、それ以降は読み越さない（1 バイトずつ読む）。`stop_at_newline = false` では塊で読む。
+///
+/// 契約: `r` の `Read` は、`poll` する fd（`AsFd`）そのものを読む単独の読み手であること。読み端を複製して別に
+/// 読む者がいる・並行に読む者がいる・`Read` が `poll` した fd 以外の入力を待つ実装だと、`poll` が読めると
+/// 報告した直後でも `read` がブロックし得て、期限を守れない。
 pub(crate) fn read_capped_until(
     r: &mut (impl Read + AsFd),
     max: u64,

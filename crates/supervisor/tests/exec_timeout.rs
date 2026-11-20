@@ -36,6 +36,7 @@ mod linux {
         failing_step_error_is_returned_as_is();
         panicking_worker_is_reported_as_internal();
         child_cgroup_cleanup_runs_once_on_every_path();
+        worker_result_read_is_bounded_when_write_end_is_held();
         println!("exec_timeout: all scenarios passed");
     }
 
@@ -222,6 +223,69 @@ mod linux {
     }
 
     /// SUP-6・REPAIR-5・TASK-163 追補（#1466）: worker を fork した後は、期限切れ・エラー返却・異常終了（panic）の
+    /// REPAIR-5・REPAIR-12・REPAIR-10 (d)・SUP-6・#4733: worker が結果行を残さず 0 で終わり、別プロセスが結果 pipe の
+    /// 書き込み端を持ち続けても、本番の回収経路（`collect_worker_result`）は EOF を待たず、約 1 秒で固定文言の
+    /// `Internal` を返す。worker の中で `/proc/self/fd` の pipe を書き込みで開き直して `sleep 20` に持たせ、
+    /// 結果を書かずに `exit(0)` する。孫は最後に必ず kill する（回収は init 側）。
+    fn worker_result_read_is_bounded_when_write_end_is_held() {
+        let pid_file =
+            std::env::temp_dir().join(format!("fandhe-exec-timeout-holder-{}", std::process::id()));
+        let worker_pid_file = pid_file.clone();
+        let t0 = Instant::now();
+        let err = run_in_worker_for_test(
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+            || Ok(()),
+            move || -> Result<ExecOutcome, TraitError> {
+                use std::os::unix::ffi::OsStrExt as _;
+                let mut held = false;
+                for e in std::fs::read_dir("/proc/self/fd").unwrap().flatten() {
+                    let fd: u32 = e.file_name().to_string_lossy().parse().unwrap_or(0);
+                    let Ok(link) = std::fs::read_link(e.path()) else {
+                        continue;
+                    };
+                    if fd > 2 && link.as_os_str().as_bytes().starts_with(b"pipe:") {
+                        let w = std::fs::OpenOptions::new()
+                            .write(true)
+                            .open(format!("/proc/self/fd/{fd}"))
+                            .unwrap();
+                        // 回収しないのは意図的（worker の終了で init へ付け替わり、試験が最後に kill する）。
+                        #[allow(clippy::zombie_processes)]
+                        let c = std::process::Command::new("sleep")
+                            .arg("20")
+                            .stdin(std::process::Stdio::null())
+                            .stdout(w)
+                            .stderr(std::process::Stdio::null())
+                            .spawn()
+                            .unwrap();
+                        std::fs::write(&worker_pid_file, c.id().to_string()).unwrap();
+                        held = true;
+                        break;
+                    }
+                }
+                assert!(held, "no pipe fd to hold");
+                std::process::exit(0)
+            },
+        )
+        .unwrap_err();
+        let elapsed = t0.elapsed();
+        if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", pid.trim()])
+                .status();
+        }
+        let _ = std::fs::remove_file(&pid_file);
+        assert_eq!(err.code(), ErrorCode::Internal);
+        assert_eq!(
+            err.message(),
+            "exec stage Spawn: the worker result was not received in time"
+        );
+        assert!(
+            elapsed >= Duration::from_secs(1) && elapsed < Duration::from_secs(5),
+            "elapsed {elapsed:?}"
+        );
+    }
+
     /// どの経路でも、呼び出し側の exec 用子 cgroup の後始末がちょうど 1 回実行される。後始末の失敗は元のエラーへ
     /// 併記される。
     fn child_cgroup_cleanup_runs_once_on_every_path() {

@@ -547,50 +547,61 @@ mod tests {
         );
     }
 
-    /// 試験の後始末（REPAIR-5）: drop で holder 役を SIGKILL・回収する（準備・照合の失敗の panic でも）。続けて `_hold`
-    /// （孫の stdin の書き込み端）が閉じ、孫の `read` が EOF で自分で終わる（pid・pgid の番号では kill しない）。
-    /// 孫は holder 役の子なので、holder 役の回収で init（または subreaper）へ付け替わって回収される。
+    /// 試験の後始末（REPAIR-5）: drop で holder 役を SIGKILL・回収し（準備・照合の失敗の panic でも）、続けて `_hold`
+    /// （補助の stdin の書き込み端）を閉じ、補助が EOF で自分で終わるのを期限つきで待って回収する（pid・pgid の番号では
+    /// kill しない）。補助は試験の直接の子なので、孤児を回収しない PID 1 の下でも zombie を残さない。
     struct HolderGuard {
         child: Child,
-        _hold: std::io::PipeWriter,
+        helper: Child,
+        hold: Option<std::io::PipeWriter>,
     }
     impl Drop for HolderGuard {
         fn drop(&mut self) {
             // 回収済みなら std は何も送らない（子は自分で回収した Child のみ）。
             let _ = self.child.kill();
             let _ = wait_until(&mut self.child, REAP_TIMEOUT);
+            drop(self.hold.take());
+            if !matches!(wait_until(&mut self.helper, REAP_TIMEOUT), Ok(Some(_))) {
+                // 期限内に終わらなければ直接の子として止めて回収する（試験自身の子なので pid は再利用されない）。
+                let _ = self.helper.kill();
+                let _ = wait_until(&mut self.helper, REAP_TIMEOUT);
+            }
         }
     }
 
     /// REPAIR-5・REPAIR-12・REPAIR-10 (d)・#4733: 別プロセスが stderr の書き込み端を持ち続けても、停止経路
     /// `kill_and_reap` は EOF を待たず、終了状態と読めた stderr を期限内（`STDERR_DRAIN_TIMEOUT` 前後）に返す。
-    /// holder 役の `sh`（プロセスグループは試験と同じ）は、試験が持つ pipe の読み端を fd 3 へ複製して孫に stdin として
-    /// 渡し、stderr を継承させる。孫は `timeout -s KILL 8 sh -c 'read _'`（`timeout` とその子の 2 プロセス）で、
-    /// stderr の書き込み端を持ったまま stdin の EOF か 8 秒の経過で自分で終わる（8 秒は読み取りが回帰して EOF 待ちに
-    /// 戻ったときの独立の期限で、そのとき経過時間の assert が失敗を報告する）。holder 役は診断行を stderr へ書き、
-    /// stdout へ `ready` を出して `exec sleep 100` に置き換わる。`ready` の受信で確かめられるのは診断行の書き込みまでで、
-    /// SIGKILL は holder 役（`sleep 100` に置き換わる前でも後でも同じ pid）へ送る。`HolderGuard` の drop で書き込み端が
-    /// 閉じ、孫は EOF で終わる。
+    /// 試験は自分で pipe を作り、書き込み端を holder 役（`sh`）の stderr と、試験の直接の子の補助
+    /// （`timeout -s KILL 8 sh -c 'read _'`。`timeout` とその子の 2 プロセス）の stderr の両方に渡す。補助は stdin の EOF か
+    /// 8 秒の経過で自分で終わる（8 秒は読み取りが回帰して EOF 待ちに戻ったときの独立の期限で、そのとき経過時間の assert が
+    /// 失敗を報告する）。holder 役は診断行を stderr へ書き、stdout へ `ready` を出して `exec sleep 100` に置き換わる。
+    /// `ready` の受信で確かめられるのは診断行の書き込みまでで、SIGKILL は holder 役（置き換わる前でも後でも同じ pid）へ送る。
     #[test]
     fn repair5_4733_kill_and_reap_returns_without_eof_when_writer_is_held() {
+        use std::os::fd::OwnedFd;
         let (hold_r, hold_w) = std::io::pipe().unwrap();
-        let child = Command::new("sh")
-            .args([
-                "-c",
-                // 非同期コマンドの stdin は /dev/null になるため、fd 3 へ複製してから孫へ渡す。
-                "exec 3<&0; timeout -s KILL 8 sh -c 'read _' <&3 & echo diag-line >&2; echo ready; exec sleep 100",
-            ])
+        let (err_r, err_w) = std::io::pipe().unwrap();
+        let helper = Command::new("timeout")
+            .args(["-s", "KILL", "8", "sh", "-c", "read _"])
             .stdin(Stdio::from(hold_r))
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(err_w.try_clone().unwrap()))
+            .spawn()
+            .unwrap();
+        let child = Command::new("sh")
+            .args(["-c", "echo diag-line >&2; echo ready; exec sleep 100"])
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::from(err_w))
             .spawn()
             .unwrap();
         let mut guard = HolderGuard {
             child,
-            _hold: hold_w,
+            helper,
+            hold: Some(hold_w),
         };
+        let mut stderr = Some(ChildStderr::from(OwnedFd::from(err_r)));
         let mut stdout = guard.child.stdout.take().unwrap();
-        let mut stderr = guard.child.stderr.take();
         // `ready`（= 診断行も書き終えた）を期限つきで待つ。
         let ready = read_capped_until(
             &mut stdout,

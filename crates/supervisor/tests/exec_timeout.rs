@@ -227,10 +227,38 @@ mod linux {
     /// `Internal` を返す。worker は `result_write_fd_for_test()` が示す結果 pipe の書き込み端を開き直して孫
     /// （`timeout -s KILL 8 sh -c 'read _'`）の stdout に持たせ、`skip_result_write_for_test()` で結果行を省いて 0 で戻る（fork ラッパーの
     /// `_exit` 経路で終わる）。孫の stdin は試験が持つ pipe の読み端で、試験が書き込み端（`_hold`）を閉じると EOF で
-    /// 自分で終わる（pid・pgid の番号では kill しない。失敗の panic を含め `_hold` の drop で必ず終わる）。孫は worker の
-    /// 子なので、worker の終了で init（または subreaper）へ付け替わって回収される（試験は回収しない）。
+    /// 自分で終わる（pid・pgid の番号では kill しない。失敗の panic を含め `_hold` の drop で必ず終わる）。試験は自身を
+    /// child subreaper にしてから worker を起動し、worker は孫の pid を試験の pipe へ書く。worker の終了で孫は試験の子へ
+    /// 付け替わり、試験が `HelperGuard` の drop（成功・assert の失敗の両方）で書き込み端を閉じてから期限つきで回収する
+    /// （孤児を回収しない PID 1 の下でも zombie を残さない。REPAIR-5）。subreaper はプロセス全体の属性のため、
+    /// この場面を `run` の最後に置く。
     fn worker_result_read_is_bounded_when_write_end_is_held() {
-        let (hold_r, _hold) = std::io::pipe().unwrap();
+        use fandhe_container_core::exec::{ChildSubreaper, ContainerChild};
+        use std::io::Read as _;
+
+        /// 孫（`timeout`）を、書き込み端を閉じてから期限つきで回収する。
+        struct HelperGuard {
+            hold: Option<std::io::PipeWriter>,
+            helper: Option<ContainerChild>,
+        }
+        impl Drop for HelperGuard {
+            fn drop(&mut self) {
+                drop(self.hold.take());
+                if let Some(h) = self.helper.take()
+                    && let Err(e) = h.wait_timeout(Duration::from_secs(10))
+                {
+                    eprintln!("exec_timeout: helper was not reaped: {e:?}");
+                }
+            }
+        }
+
+        let proof = ChildSubreaper::enable().expect("child subreaper");
+        let (hold_r, hold) = std::io::pipe().unwrap();
+        let mut guard = HelperGuard {
+            hold: Some(hold),
+            helper: None,
+        };
+        let (mut pid_r, mut pid_w) = std::io::pipe().unwrap();
         let t0 = Instant::now();
         let res = run_in_worker_for_test(
             Duration::from_secs(10),
@@ -242,7 +270,7 @@ mod linux {
                     .write(true)
                     .open(format!("/proc/self/fd/{fd}"))
                     .unwrap();
-                // 回収しないのは意図的（worker の終了で init へ付け替わり、stdin の EOF で自分で終わる）。
+                // ここでは回収しない（worker の終了で subreaper の試験へ付け替わり、試験が回収する）。
                 #[allow(clippy::zombie_processes)]
                 // `timeout` は読み取りが回帰して EOF 待ちに戻ったときの独立の期限（8 秒で書き込み端の持ち主が
                 // 自分で終わり、呼び出しが戻って経過時間の assert が失敗を報告する。この試験は fork のため単一
@@ -254,12 +282,20 @@ mod linux {
                     .stderr(std::process::Stdio::null())
                     .spawn()
                     .unwrap();
+                use std::io::Write as _;
+                write!(pid_w, "{}", _c.id()).unwrap();
+                drop(pid_w);
                 fandhe_container_supervisor::exec::skip_result_write_for_test();
                 // 結果行は省かれるので値は読まれない。
                 Err(TraitError::new(ErrorCode::Internal, "unused"))
             },
         );
         let elapsed = t0.elapsed();
+        // worker は終わっているので、pid の pipe の書き込み端は閉じている（EOF で戻る）。
+        let mut pid = String::new();
+        pid_r.read_to_string(&mut pid).unwrap();
+        let pid = std::num::NonZeroU32::new(pid.trim().parse().unwrap()).unwrap();
+        guard.helper = Some(ContainerChild::adopt_reparented(pid, &proof));
         let err = res.unwrap_err();
         assert_eq!(err.code(), ErrorCode::Internal);
         assert_eq!(
@@ -270,6 +306,7 @@ mod linux {
             elapsed >= Duration::from_secs(1) && elapsed < Duration::from_secs(5),
             "elapsed {elapsed:?}"
         );
+        drop(guard);
     }
 
     /// SUP-6・REPAIR-5・TASK-163 追補（#1466）: worker を fork した後は、期限切れ・エラー返却・異常終了（panic）の

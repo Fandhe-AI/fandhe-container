@@ -280,7 +280,9 @@ mod linux {
             hold: Some(hold),
             helper: None,
         };
-        let (mut pid_r, mut pid_w) = std::io::pipe().unwrap();
+        // 孫の pid は改行で区切って送る。worker の停止・回収に失敗して worker が書き込み端を持ったままでも止まらないよう、
+        // 受け側は EOF を待たず、改行までを読み取り期限（10 秒）つきで読む（REPAIR-5）。
+        let (pid_r, mut pid_w) = std::os::unix::net::UnixStream::pair().unwrap();
         let t0 = Instant::now();
         let res = run_in_worker_for_test(
             Duration::from_secs(10),
@@ -304,7 +306,7 @@ mod linux {
                     .spawn()
                     .unwrap();
                 use std::io::Write as _;
-                write!(pid_w, "{}", _c.id()).unwrap();
+                writeln!(pid_w, "{}", _c.id()).unwrap();
                 drop(pid_w);
                 fandhe_container_supervisor::exec::skip_result_write_for_test();
                 // 結果行は省かれるので値は読まれない。
@@ -312,9 +314,12 @@ mod linux {
             },
         );
         let elapsed = t0.elapsed();
-        // worker は終わっているので、pid の pipe の書き込み端は閉じている（EOF で戻る）。
+        pid_r
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
         let mut pid = String::new();
-        pid_r.read_to_string(&mut pid).unwrap();
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(pid_r.take(32)), &mut pid)
+            .expect("the grandchild pid within the deadline");
         let pid = std::num::NonZeroU32::new(pid.trim().parse().unwrap()).unwrap();
         guard.helper = Some(ContainerChild::adopt_reparented(pid, &proof));
         let err = res.unwrap_err();

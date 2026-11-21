@@ -633,9 +633,9 @@ mod imp {
             let reaped = super::reap::wait_within(child, super::reap::reap_within());
             match (killed, reaped) {
                 (Ok(()), Ok(st)) => Ok(st),
-                (Err(k), Ok(_)) => Err(k),
+                (Err(k), Ok(_)) => Err(format!("kill process group {pid} failed: {k}")),
                 (Ok(()), Err(w)) => Err(w),
-                (Err(k), Err(w)) => Err(format!("{k}; {w}")),
+                (Err(k), Err(w)) => Err(format!("kill process group {pid} failed: {k}; {w}")),
             }
         };
         let fail = |child: &mut std::process::Child, e: String| match stop_and_reap(child) {
@@ -703,6 +703,13 @@ mod imp {
         std::fs::create_dir(&dir).unwrap();
         let (out_path, err_path) = (dir.join("stdout"), dir.join("stderr"));
         // 子とその子孫（プローブ）を専用のプロセスグループに置き、失敗の経路ではグループごと止める（REPAIR-5）。
+        // `wait_capped` は終了した子が回収されるまで pid（＝グループ ID）を保持する前提で、グループへ送る。`SIGCHLD` が
+        // `SIG_IGN`（起動元から継承・他の場面が設定）だと子は自動回収され、解放された番号へ送りうるため、spawn の前に
+        // 既定の扱いへ戻し、この試験の間は変えない（REPAIR-5）。
+        assert!(
+            FileAuditSink::set_child_signal_ignored_for_test(false),
+            "restoring the default SIGCHLD disposition must succeed"
+        );
         use std::os::unix::process::CommandExt as _;
         let mut child = match std::process::Command::new(std::env::current_exe().unwrap())
             .process_group(0)
@@ -741,7 +748,7 @@ mod imp {
         }
         assert_eq!(
             stdout.trim_end(),
-            "fork_again child: primary=[IsolationForkAgain] code=Internal message=audit record could not be persisted by primary or fallback path (primary: isolation_fork_again) detail=IsolationForkAgain"
+            "fork_again child: primary=[IsolationForkAgain] code=Internal message=audit record could not be persisted by primary or fallback path (primary: isolation_fork_again) detail=IsolationForkAgain until=Internal:audit record could not be persisted by primary or fallback path (primary: isolation_fork_again)"
         );
         println!("audit_sink_isolation: fork_again reaches the fallback as isolation_fork_again");
     }
@@ -752,10 +759,12 @@ mod imp {
     /// 作れず通知 1 行は出ない。
     #[cfg(target_os = "linux")]
     fn fork_again_child(dir: &Path) {
-        assert!(
-            FileAuditSink::limit_processes_for_test(1),
-            "lowering RLIMIT_NPROC must succeed"
-        );
+        if let Err(e) = FileAuditSink::limit_processes_for_test(1) {
+            panic!(
+                "lowering RLIMIT_NPROC must succeed: {e} (errno {:?})",
+                e.raw_os_error()
+            );
+        }
         // 上限が効かず起動できた場合に待ち続けないよう、spawn と期限つきの待ちに分ける。プローブは自分自身の
         // 即終了の入口で、PATH に依存しない。待ち・回収に失敗したら適用外の印は出さず失敗にする。
         match std::process::Command::new(std::env::current_exe().unwrap())
@@ -790,12 +799,21 @@ mod imp {
         let seen_once = seen.lock().unwrap().clone();
         // 構造化した戻り値でも主経路の種別を読める（文言を解析しない。REPAIR-2）。
         let detailed = sink.record_detailed(&record()).unwrap_err();
+        // supervisor が使う期限つきの経路でも、集約コードと種別つきの文言が同じであること（REPAIR-12）。
+        let until = sink
+            .record_until(
+                &record(),
+                std::time::Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap_err();
         println!(
-            "fork_again child: primary={:?} code={:?} message={} detail={:?}",
+            "fork_again child: primary={:?} code={:?} message={} detail={:?} until={:?}:{}",
             seen_once,
             e.code(),
             e.message(),
-            detailed.primary().kind()
+            detailed.primary().kind(),
+            until.code(),
+            until.message()
         );
     }
 

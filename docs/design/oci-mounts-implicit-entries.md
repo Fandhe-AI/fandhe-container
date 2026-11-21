@@ -28,7 +28,7 @@ OCI `config.json` の `mounts[]` のうち、bind と `/sys` の sysfs 以外の
 
 ## 標準の既定 config との突き合わせ
 
-出典: opencontainers/runc `libcontainer/specconv/example.go` の `Example()`（commit a75076b4a413f628c4b6aa4c5568b159aa128a56 で確認）。`ToRootless()` は `/sys` を rbind の bind へ置き換える（同ファイル 194 行付近。options の詳細は未確認）。runc は Apache-2.0 で NOTICE を持つ。下表は mounts の type と options を要約したもので、写した量は少ないが NOTICE への追記の要否はユーザー判断に回す（[licensing](../../.claude/rules/licensing.md)）。
+出典: opencontainers/runc `libcontainer/specconv/example.go` の `Example()`（commit a75076b4a413f628c4b6aa4c5568b159aa128a56 で確認）。`ToRootless()` は `/sys` を rbind の bind へ置き換える（options は下の「一次資料の確認」の表）。runc は Apache-2.0 で NOTICE を持つ。帰属の扱いは下の「一次資料の確認」節（ライセンスと NOTICE）に記録した（2026-11-22 の利用者判断でルートの `NOTICE` に追記済み）。
 
 | 宛先 | 既定 config（type / options） | 本ランタイムが載せるもの | 今の扱い | A での扱い |
 | ---- | ----------------------------- | ------------------------ | -------- | ---------- |
@@ -42,6 +42,48 @@ OCI `config.json` の `mounts[]` のうち、bind と `/sys` の sysfs 以外の
 | `/sys`（rootless 版） | bind（rbind） | — | `RESERVED_DESTINATIONS` で拒否 | A の範囲外 |
 
 要点: A を字義どおり採っても、標準の既定 config は `/dev/mqueue` と `/sys/fs/cgroup` の 2 項目で拒否され続ける。互換性を目的にするなら、この 2 項目の扱いも同時に決める必要がある。
+
+## 一次資料の確認（#4712）
+
+後続の許可表（#4713〜#4718。宛先ごとの許可 options と値の範囲）の入力として、3 つの一次資料の既定を commit を固定して確かめた（2026-11-21。OCI-4・SEC-1・TASK-29 追補・MS-2）。値は各ファイルの記述をそのまま書き、本ランタイムの判断は加えていない。
+
+出典:
+
+| 略号 | リポジトリ・ファイル・箇所 | commit |
+| ---- | -------------------------- | ------ |
+| runc | opencontainers/runc `libcontainer/specconv/example.go` の `Example()` と `ToRootless()` | a75076b4a413f628c4b6aa4c5568b159aa128a56 |
+| moby | moby/moby `daemon/pkg/oci/defaults.go` の `DefaultLinuxSpec()`（旧 `oci/defaults.go` から移動している） | 8b0c45e42959ea5322cfb33bfb97a40ed64d4a07 |
+| spec | opencontainers/runtime-spec `config-linux.md` の Default Filesystems | 20f948a4a944629335518533250dd719fedd73f2 |
+
+宛先ごとの type と options（`—` はその資料に項目が無い）:
+
+| 宛先 | runc `Example()` | runc `ToRootless()` の変更 | moby `DefaultLinuxSpec()` | spec（SHOULD） |
+| ---- | ---------------- | -------------------------- | ------------------------- | -------------- |
+| `/proc` | proc / なし | 変更なし | proc / `nosuid,noexec,nodev` | proc |
+| `/dev` | tmpfs / `nosuid,strictatime,mode=755,size=65536k` | 変更なし | tmpfs / `nosuid,strictatime,mode=755,size=65536k` | — |
+| `/dev/pts` | devpts / `nosuid,noexec,newinstance,ptmxmode=0666,mode=0620,gid=5` | `gid=` を除く（`nosuid,noexec,newinstance,ptmxmode=0666,mode=0620`） | devpts / `nosuid,noexec,newinstance,ptmxmode=0666,mode=0620,gid=5` | devpts |
+| `/dev/shm` | tmpfs / `nosuid,noexec,nodev,mode=1777,size=65536k` | 変更なし | tmpfs（source `shm`）/ `nosuid,noexec,nodev,mode=1777`（`size=` なし） | tmpfs |
+| `/dev/mqueue` | mqueue / `nosuid,noexec,nodev` | 変更なし | mqueue / `nosuid,noexec,nodev` | — |
+| `/sys` | sysfs / `nosuid,noexec,nodev,ro` | none（source `/sys`）/ `rbind,nosuid,noexec,nodev,ro` に置き換える | sysfs / `nosuid,noexec,nodev,ro` | sysfs |
+| `/sys/fs/cgroup` | cgroup / `nosuid,noexec,nodev,relatime,ro` | 変更なし | cgroup / `ro,nosuid,noexec,nodev` | — |
+
+読み取れること（許可表の入力）:
+
+- `ToRootless()` は `/sys` の置き換えのほか、全項目の options から `gid=`・`uid=` で始まるものを除く（`/dev/pts` の `gid=5` が消える）。rootless の config では `/dev/pts` の `gid=` が無いことがありうる
+- `/proc` は runc が options なし、moby が `nosuid,noexec,nodev`。本ランタイムの `mount_proc`（core の `sys::mount_proc_at`）は常に `MS_NOSUID | MS_NODEV | MS_NOEXEC` で載せる。そのため runc の options なしは制限を緩めず（供給側が 3 つの制限を保つ）、moby の 3 つの制限は供給側で満たせる。許可表では、緩める方向の指定を受けないことに加え、供給側で満たせない制限（例: `/proc` の `ro`）を要求された場合は黙って載せずに拒否する（A-2 の方針。SEC-1）
+- `/dev/shm` は moby の既定 spec に `size=` が無い。moby がコンテナの作成時に `/dev/shm` をどう置き換えるか（`size=` の付与・ipc モードごとの bind）は、本書の時点で未確認（`defaults.go` の外の処理）。`size=` が無い `/dev/shm` を受けるかは #4715 で決める
+- `/sys/fs/cgroup` の options は runc に `relatime` があり moby に無い（どちらも拒否のまま。本書の「標準の既定 config との突き合わせ」の表と A の方針）
+- runtime-spec は type だけを SHOULD として挙げ、options は規定しない。`/dev`・`/dev/mqueue`・`/sys/fs/cgroup` は表に無い
+
+ライセンスと NOTICE（同じ commit で確かめた事実だけ。判断は書かない）:
+
+| リポジトリ | LICENSE | NOTICE |
+| ---------- | ------- | ------ |
+| opencontainers/runc（a75076b4） | Apache License 2.0 | あり（`runc` / `Copyright 2012-2015 Docker, Inc.` ほか。本リポの `NOTICE` には別の commit 4ca628d1 で sysctl の件の帰属行がある） |
+| moby/moby（8b0c45e4） | Apache License 2.0 | あり（`Docker` / `Copyright 2012-2017 Docker, Inc.` ほか。本リポの `NOTICE` には readonlyPaths・maskedPaths の件の帰属行がある） |
+| opencontainers/runtime-spec（20f948a4） | Apache License 2.0 | 無い（ルートに `NOTICE` が無い） |
+
+本節は mounts の type と options の値を表にまとめたもので、コードは写していない。利用者の判断（2026-11-22）で、runc（a75076b4）と moby（8b0c45e4）の帰属行を、出典と本書への対応つきでルートの `NOTICE` に追記した（[licensing](../../.claude/rules/licensing.md)）。runtime-spec は NOTICE を持たないため、出典は本節の表に書くだけにした。
 
 ## 選択肢
 

@@ -102,11 +102,34 @@ The attribution lines of the moby NOTICE file at that commit:
     This product includes software developed at Docker, Inc.
     (https://www.docker.com).
 
-Other notices in the moby NOTICE file (third-party libraries unrelated
-to the derived values, and an export-control note) do not relate to any
-part of this product and are omitted under Section 4(d) of the Apache
-License 2.0, as for the moby entry above. The full text is in the
-NOTICE file at the commit above.
+The remainder of the moby NOTICE file at that commit is retained verbatim
+below (decision of the repository owner, 2026-11-22):
+
+    This product contains software (https://github.com/creack/pty) developed
+    by Keith Rarick, licensed under the MIT License.
+
+    This product contains software derived from RackSec/srslog
+    (https://github.com/RackSec/srslog), developed by Rackspace and derived
+    from the Go standard library's log/syslog package, licensed under the
+    BSD 3-Clause License.
+
+    This product contains software derived from golang/gddo
+    (https://github.com/golang/gddo), developed by The Go Authors and licensed
+    under the BSD 3-Clause License.
+
+    The following is courtesy of our legal counsel:
+
+
+    Use and transfer of Docker may be subject to certain restrictions by the
+    United States and other governments.
+    It is your responsibility to ensure that your use and/or transfer does not
+    violate applicable laws.
+
+    For more information, please see https://www.bis.doc.gov
+
+    See also https://www.apache.org/dev/crypto.html and/or seek legal counsel.
+
+The full text is in the NOTICE file at the commit above.
 
 --------------------------------------------------------------------
 Third-party attribution: opencontainers/runc (Apache License 2.0;
@@ -134,10 +157,22 @@ The attribution lines of the runc NOTICE file at that commit:
     This product includes software developed at Docker, Inc.
     (http://www.docker.com).
 
-The remainder of the runc NOTICE file at that commit (the export-control
-note) is the same text as in the runc entry above and is retained there
-until the repository owner decides whether it may be omitted. The full
-text is in the NOTICE file at the commit above.
+The remainder of the runc NOTICE file at that commit is retained verbatim
+below (decision of the repository owner, 2026-11-22):
+
+    The following is courtesy of our legal counsel:
+
+
+    Use and transfer of Docker may be subject to certain restrictions by the
+    United States and other governments.
+    It is your responsibility to ensure that your use and/or transfer does not
+    violate applicable laws.
+
+    For more information, please see http://www.bis.doc.gov
+
+    See also http://www.apache.org/dev/crypto.html and/or seek legal counsel.
+
+The full text is in the NOTICE file at the commit above.
 
 --------------------------------------------------------------------
 Third-party attribution: moby/spdystream (Apache License 2.0; spdy/

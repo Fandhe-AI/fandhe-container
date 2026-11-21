@@ -263,6 +263,9 @@ pub(crate) fn link_fd_at(
     let name = single_component(name)?;
     let source = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd()))
         .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // 前提: `/proc` は supervisor 自身の procfs である（supervisor の mount namespace は信頼境界の内側）。`/proc` が procfs で
+    // なければ別のファイルを指しうるが、その場合も呼び出し側の名前の照合（inode の一致）で不一致になり確定しない。
+    // supervisor が `CLONE_FILES` を unshare するなら `/proc/thread-self/fd` に替える。
     // SAFETY: `source`・`name` は NUL 終端で呼び出しの間生きる。`source` は自分の fd を指す procfs のパスで、`name` は上で
     // 1 要素と検証済み（`dir` の直下の 1 エントリだけが作られる）。`file`・`dir` は呼び出しの間有効な fd。flags は
     // `AT_SYMLINK_FOLLOW` だけで、既存の名前を置き換えない（`EEXIST`）。ポインタは保持されない。

@@ -266,7 +266,7 @@ struct Faults {
     write: std::sync::atomic::AtomicBool,
     /// 真なら同じ inode の開き直しの flush を失敗させる。
     flush: std::sync::atomic::AtomicBool,
-    /// 開けなかった後・`O_EXCL` で作る直前に呼ぶ（引数は対象のパス）。
+    /// 開けなかった後・新しいファイルを作る直前（`O_TMPFILE` か `O_EXCL`）に呼ぶ（引数は対象のパス）。
     before_create: Hook,
     /// ファイルを作った直後（ロックの前）に呼ぶ。
     after_create: Hook,
@@ -1032,10 +1032,14 @@ impl LogSink for CriFileSink {
     /// 親ディレクトリを検査して fd で開き（`open_verified_dir`）、以後はその fd の直下だけを扱う（パスの再解決をしない）。
     /// 先に新しいファイルを用意し（`openat` の `O_NOFOLLOW`・排他ロック・通常ファイル）、失敗したら状態（`Active` / `Failed`）を
     /// 変えずに `Err` を返す。親ディレクトリは作らない。まず作らずに開き（既にあれば検証してそのまま使う）、無ければ
-    /// `O_CREAT | O_EXCL` で作る（他者が先に作っていれば `EEXIST` で既存として開き直す）。検証・ロックした fd がそのまま
-    /// 新しい writer になり、名前の引き直しも一時ファイルも使わない。待ちうる処理（開く・作る・ロック・メタデータ・旧 writer の
+    /// `O_TMPFILE` で名前の無いファイルを作り、ロックと旧 writer の flush を名前の無いまま済ませてから、確定の直前に `linkat` で
+    /// 公開する（`publish_tmpfile`。公開の前の失敗では何も作らない。他者が先に同じ名前を作っていれば既存として開き直す）。
+    /// `O_TMPFILE` に対応しない FS では `O_CREAT | O_EXCL` で作ってから準備する（`publish_new`）。検証・ロックした fd がそのまま
+    /// 新しい writer になり、名前の引き直しはしない。待ちうる処理（開く・作る・ロック・メタデータ・旧 writer の
     /// flush）はすべて確定の前に済ませ、確定は `gate` の下で期限と世代を再確認してメモリ上で差し替えるだけにする
-    /// （`commit_switch`）。確定できなければ自分で作ったファイルを元の名前から外す（`discard_created`）。旧 writer の flush が
+    /// （`commit_switch`）。公開した後に確定できなければ自分で作ったファイルを元の名前から外す（`discard_created`）。
+    /// 既知の制約: `O_TMPFILE` も `RENAME_NOREPLACE` も持たない FS（NFS など）では `O_EXCL` の経路に戻り、失敗時に作った
+    /// ファイルが元の名前に残りうる（`cri_reopen_discard` の `left_in_place`）。旧 writer の flush が
     /// 失敗したら切り替えず `Err`（旧 writer と未書き込みの行を残し、再試行できる）。総量の上限は新しいファイルの大きさから
     /// 数え直す。上限到達で止まった状態（`Failed`）からもここで再開し、失敗の記録は差し替えと同じ `Mutex` の下で解除される。
     ///
@@ -1043,7 +1047,7 @@ impl LogSink for CriFileSink {
     /// 別 open file description のロックは衝突するため、旧 writer を残して flush し、大きさだけ数え直す。書き込みと同じ
     /// `Mutex` で直列化され、行の途中（部分行 `P` の続き）でも呼べる。`Mutex` の待ちは `deadline` まで、ファイルのロックの待ちは
     /// 最大 250ms（`LOCK_GRACE`）。ファイルの `open` 自体は期限で中断できない（呼び出し元は専用スレッドで実行すること）。
-    /// Linux のみ（`openat`・`renameat2`・`unlinkat` を使う。他の OS は `Unimplemented`）。
+    /// Linux のみ（`openat`・`linkat`・`renameat2`・`unlinkat` を使う。他の OS は `Unimplemented`）。
     fn reopen(&self, deadline: Instant, gate: ReopenGate<'_>) -> Result<RetiredWriter, TraitError> {
         #[cfg(target_os = "linux")]
         {

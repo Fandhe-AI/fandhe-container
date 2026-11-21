@@ -19,7 +19,8 @@
 //! - 通知の子が行の途中で書き込みに失敗すると、出し直しは改行を 1 つ付けてから 1 行を出す（断片と連結しない）
 //! - 複数スレッドのプロセス: fork できないため主経路は試行せず `isolation_unavailable` で代替経路へ進む
 //! - 主経路の fork が `EAGAIN`（`current_exe()` で自分自身を再起動し、子が `FileAuditSink::limit_processes_for_test(1)` で
-//!   `RLIMIT_NPROC` を下げて実 fork を失敗させる。Linux・非 root のみ）:
+//!   `RLIMIT_NPROC` を下げて実 fork を失敗させる。Linux で `RLIMIT_NPROC` が効く環境のみ。子のプローブで上限が効かないと
+//!   確かめた場合〔init の user namespace の root・`CAP_SYS_ADMIN`・`CAP_SYS_RESOURCE`〕だけ適用外）:
 //!   代替経路へ進み、その主経路の失敗種別が `isolation_fork_again`（`UNAVAILABLE`）になる（#4702）
 //! - `SIGCHLD` が `SIG_IGN`（子が自動回収され `waitpid` が `ECHILD`）: 主経路の成功を失敗と取り違えず代替経路へ
 //!   二重に記録しない。失敗種別・時間切れ・通知も同じく届く（最後に実行し、終わったら `SIG_DFL` に戻す）
@@ -671,6 +672,55 @@ mod imp {
         }
     }
 
+    /// `Command::spawn` に期限を付ける（REPAIR-5）。Linux の spawn は子の exec の成否が確定するまで親を待たせるため、
+    /// exec が止まると後の期限（`wait_capped`）に届かない。見張りのスレッドが `within` を過ぎたら、spawn の前に居なかった
+    /// 自分の子（`/proc` の ppid で数える）のプロセスグループへ SIGKILL を送り、`WATCHDOG EXPIRED` の行と終了コード 124 で
+    /// 試験プロセスごと終わる（spawn の途中の子は pid が手元に無いため、回収は init に任せる）。見張りは spawn が戻ったら
+    /// 終わり、join してから返す。この場面の後の場面は複数スレッドを前提にするため、一時的なスレッドを置いてよい。
+    #[cfg(target_os = "linux")]
+    fn spawn_within(
+        cmd: &mut std::process::Command,
+        within: Duration,
+    ) -> std::io::Result<std::process::Child> {
+        let me = std::process::id();
+        let before = children_of(me);
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let watchdog = std::thread::spawn(move || {
+            if rx.recv_timeout(within) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
+                for pid in children_of(me).difference(&before) {
+                    let _ = FileAuditSink::kill_process_group_for_test(*pid);
+                }
+                eprintln!(
+                    "audit_sink_isolation: WATCHDOG EXPIRED: spawning the fork_again child did not return within {within:?}"
+                );
+                std::process::exit(124);
+            }
+        });
+        let spawned = cmd.spawn();
+        let _ = tx.send(());
+        let _ = watchdog.join();
+        spawned
+    }
+
+    /// `ppid` を親に持つプロセスの pid（`/proc/<pid>/stat` の 4 番目の欄。読めないものは飛ばす）。
+    #[cfg(target_os = "linux")]
+    fn children_of(ppid: u32) -> std::collections::BTreeSet<u32> {
+        let Ok(dir) = std::fs::read_dir("/proc") else {
+            return std::collections::BTreeSet::new();
+        };
+        dir.filter_map(|e| e.ok()?.file_name().to_str()?.parse::<u32>().ok())
+            .filter(|pid| {
+                std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .ok()
+                    .and_then(|st| {
+                        let (_, rest) = st.rsplit_once(") ")?;
+                        rest.split(' ').nth(1)?.parse::<u32>().ok()
+                    })
+                    == Some(ppid)
+            })
+            .collect()
+    }
+
     #[cfg(target_os = "linux")]
     fn read_capped(path: &Path) -> String {
         use std::io::Read;
@@ -711,15 +761,14 @@ mod imp {
             "restoring the default SIGCHLD disposition must succeed"
         );
         use std::os::unix::process::CommandExt as _;
-        let mut child = match std::process::Command::new(std::env::current_exe().unwrap())
-            .process_group(0)
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.process_group(0)
             .arg(FORK_AGAIN_CHILD_ARG)
             .arg(&dir)
             .stdin(std::process::Stdio::null())
             .stdout(std::fs::File::create(&out_path).unwrap())
-            .stderr(std::fs::File::create(&err_path).unwrap())
-            .spawn()
-        {
+            .stderr(std::fs::File::create(&err_path).unwrap());
+        let mut child = match spawn_within(&mut cmd, FORK_AGAIN_CHILD_WITHIN) {
             Ok(c) => c,
             Err(e) => panic!("cannot re-launch the test binary: {e}"),
         };

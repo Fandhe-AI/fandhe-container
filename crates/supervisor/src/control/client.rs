@@ -495,11 +495,7 @@ mod linux {
         }
     }
 
-    fn connect_until(path: &Path, deadline: Instant) -> Result<UnixStream, TraitError> {
-        connect_with_retry_window(path, deadline, CONNECT_RETRY_WINDOW, &|| false)
-    }
-
-    /// [`connect_until`] の再試行窓を引数にした版。終了の購読は窓を 0 にする（状態が `Running` と分かっていて、
+    /// 期限と取り消しつきの接続。再試行窓は通常 [`CONNECT_RETRY_WINDOW`]。終了の購読は窓を 0 にする（状態が `Running` と分かっていて、
     /// 再試行の待ちがそのまま起床の遅れになるため。#3683）。
     fn connect_with_retry_window(
         path: &Path,
@@ -604,7 +600,9 @@ mod linux {
 
     /// [`exchange`] と同じだが、応答に添えられた fd と接続も受け取る（ExecHandoverRequest だけが fd つきの応答を受ける。
     /// 他の要求では `fds` は常に空で、通常の `read` 経路のまま）。受け取った fd は呼び出し側が検証し、想定外なら drop で閉じる。
-    /// `cancel` があれば、応答の待ちの間に旗を見て、立ったら接続を閉じて `Cancelled` 相当（`Unavailable`）で戻る。
+    /// `cancel` があれば、接続・Hello の待ち・送信の直前・応答の待ちで旗を見て、立ったら要求を送らずに（送った後なら接続を
+    /// 閉じて）`Cancelled` 相当（`Unavailable`）で戻る。取り消し済みの要求を supervisor へ届けない（届くと、kubelet が失敗として
+    /// 回転済みのログを戻した後に supervisor が切り替えを確定しうる。CRI-2・#4652）。
     fn exchange_with_fds(
         state_root: &Path,
         request: Request,
@@ -615,7 +613,9 @@ mod linux {
         let euid = effective_uid()?;
         let dir = open_state_dir(state_root, id, euid)?;
         let path = path_via_fd(&dir, CONTROL_SOCKET_NAME);
-        let mut stream = connect_until(&path, deadline)?;
+        let cancelled = || cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire));
+        let mut stream =
+            connect_with_retry_window(&path, deadline, CONNECT_RETRY_WINDOW, &cancelled)?;
 
         // listen 側の資格情報を確かめる（別 uid が同名のソケットを置いていても送らない）。
         let cred = crate::sys::peer_credentials(stream.as_fd()).map_err(|e| {
@@ -637,7 +637,11 @@ mod linux {
 
         // Hello（サーバが接続元の検証を通した合図）。
         let mut head = [0u8; HEADER_LEN];
-        read_exact_until(&mut stream, &mut head, deadline).map_err(|e| io_error(&e))?;
+        match cancel {
+            Some(cancel) => read_exact_until_cancelled(&mut stream, &mut head, deadline, cancel),
+            None => read_exact_until(&mut stream, &mut head, deadline),
+        }
+        .map_err(|e| io_error(&e))?;
         FrameHeader::decode(&head)
             .and_then(FrameHeader::expect_hello)
             .map_err(|r| r.to_error().unwrap_or_else(unavailable))?;
@@ -658,6 +662,10 @@ mod linux {
             .and_then(|n| now_ns.checked_add(n))
             .ok_or_else(unavailable)?;
         let deadline_frame = SignalDeadline::from_nanos(abs_ns).map_err(|_| unavailable())?;
+        // 送信の直前にもう一度見る（Hello の後に取り消されていれば送らない）。
+        if cancelled() {
+            return Err(unavailable());
+        }
         let sent = match request {
             Request::Signal { kind, pid, signal } => stream.write_all(
                 &SignalRequestFrame {
@@ -1316,6 +1324,82 @@ mod linux {
             assert_eq!(e.message(), CANCEL_MSG);
             assert!(elapsed >= Duration::from_millis(400), "{elapsed:?}");
             assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+        }
+
+        /// CRI-2・REPAIR-5・#4652: 取り消し済みの開き直しは supervisor へ送らない。接続前に取り消されていれば接続せず、
+        /// Hello の待ちの間に取り消されたら、遅れて Hello が届いても要求を書かずに `Unavailable` で戻る（模擬サーバが受け取る
+        /// バイト数が 0）。
+        #[test]
+        fn cri2_4652_cancelled_reopen_is_never_sent() {
+            use crate::control::protocol::encode_hello;
+            use std::io::Read as _;
+            use std::os::unix::net::UnixListener;
+            use std::sync::atomic::{AtomicBool, Ordering};
+            let id = ContainerId::new("c").unwrap();
+
+            // 接続前に取り消し済み。
+            let root = state_root("reopen-precancel");
+            let listener = UnixListener::bind(root.join("c").join("supervisor.sock")).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let e = reopen_log(
+                &root,
+                &id,
+                Instant::now() + Duration::from_secs(2),
+                &AtomicBool::new(true),
+            )
+            .unwrap_err();
+            assert_eq!(e.code(), ErrorCode::Unavailable);
+            assert!(listener.accept().is_err(), "no connection is made");
+
+            // Hello の待ちの間に取り消す。模擬サーバの待ちはすべて期限つき（REPAIR-5）。
+            let root = state_root("reopen-hellocancel");
+            let listener = UnixListener::bind(root.join("c").join("supervisor.sock")).unwrap();
+            let server = std::thread::spawn(move || -> Option<usize> {
+                listener.set_nonblocking(true).unwrap();
+                let accept_deadline = Instant::now() + Duration::from_secs(10);
+                let mut s = loop {
+                    match listener.accept() {
+                        Ok((s, _)) => break s,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            if Instant::now() >= accept_deadline {
+                                return None;
+                            }
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(e) => panic!("accept failed: {e}"),
+                    }
+                };
+                s.set_nonblocking(false).unwrap();
+                std::thread::sleep(Duration::from_millis(300));
+                s.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+                s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                // クライアントが先に閉じていれば書き込みは失敗しうる（受け取ったバイト数だけを見る）。
+                let _ = s.write_all(&encode_hello());
+                let mut buf = [0u8; 64];
+                let mut total = 0usize;
+                loop {
+                    match s.read(&mut buf) {
+                        Ok(0) => return Some(total),
+                        Ok(n) => total += n,
+                        Err(_) => return Some(total),
+                    }
+                }
+            });
+            let cancel = std::sync::Arc::new(AtomicBool::new(false));
+            let c = cancel.clone();
+            let setter = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                c.store(true, Ordering::Release);
+            });
+            let e = reopen_log(&root, &id, Instant::now() + Duration::from_secs(5), &cancel)
+                .unwrap_err();
+            setter.join().unwrap();
+            assert_eq!(e.code(), ErrorCode::Unavailable);
+            assert_eq!(
+                server.join().unwrap(),
+                Some(0),
+                "the request must not be sent"
+            );
         }
 
         /// SUP-3・SUP-9: 応答の対応表。サーバの `Timeout` は取り消し専用の文言になる。

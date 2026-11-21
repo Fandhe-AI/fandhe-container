@@ -2190,6 +2190,9 @@ impl CriRuntimeService {
         }
         let id = ContainerId::new(req.container_id.clone())
             .map_err(|_| CriError::invalid_argument("container_id is invalid"))?;
+        // 自然終了を先に取り込む（`ContainerStatus` と同じ）。終了した supervisor の制御ソケットへ接続して
+        // `UNAVAILABLE` になる代わりに、running でないことを `FAILED_PRECONDITION` で返す（#4652）。
+        self.observe_container_exit(&req.container_id).await?;
         {
             let registry = self
                 .registry

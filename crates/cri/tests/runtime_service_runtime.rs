@@ -3502,6 +3502,25 @@ async fn cri_2_reopen_container_log_not_running_is_rejected() {
     assert!(fake.calls.lock().unwrap().is_empty());
 }
 
+/// CRI-2・CRI-1（#4652・#4174）: 実行層が自然終了を報告した後の開き直しは、自然終了を先に取り込み、終了した supervisor へ
+/// 接続して `UNAVAILABLE` になる代わりに `FAILED_PRECONDITION` で返す。リオープナーは呼ばない。
+#[tokio::test]
+async fn cri_2_reopen_container_log_after_natural_exit_is_rejected() {
+    let h = harness();
+    let fake = Arc::new(FakeReopener::default());
+    let service = h.service.with_log_reopener(fake.clone());
+    let id = create_with_log(&service, "c").await;
+    start(&service, &id).await.expect("start");
+    h.runtime.state_exit_code.store(0, Ordering::SeqCst);
+    h.runtime
+        .state_returns_stopped
+        .store(true, Ordering::SeqCst);
+    let err = reopen(&service, &id).await.expect_err("exited naturally");
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    assert_eq!(err.message(), "container is not running");
+    assert!(fake.calls.lock().unwrap().is_empty());
+}
+
 /// CRI-2（#4652）: 未知の ID は `NOT_FOUND`、空の ID は `INVALID_ARGUMENT`。
 #[tokio::test]
 async fn cri_2_reopen_container_log_unknown_id() {

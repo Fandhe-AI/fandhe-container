@@ -1091,7 +1091,7 @@ impl AuditSink for FileAuditSink {
             Err(fb) => AuditWriteFailure::new(primary, fb),
         };
         (self.notify)(&failure, None);
-        Err(TraitError::new(failure.error_code(), failure.message()))
+        Err(both_failed_error(&failure))
     }
 
     /// 全段階(主経路の子の待ちと kill 後の回収待ち・代替経路の ACK 待ち・失敗通知)に同じ絶対期限を通す
@@ -1127,8 +1127,22 @@ impl AuditSink for FileAuditSink {
         if Instant::now() >= deadline {
             return Err(timed_out());
         }
-        Err(TraitError::new(failure.error_code(), failure.message()))
+        Err(both_failed_error(&failure))
     }
+}
+
+/// 両経路失敗の戻り値。通知 1 行が出せない場合（`RLIMIT_NPROC` の到達で通知の子もスレッドも作れない等）でも
+/// 呼び出し元が主経路の失敗種別（例 `isolation_fork_again`）を判別できるよう、固定の語彙の種別名を文言に含める
+/// （値・パスは含めない。#4702・SEC-4・REPAIR-4）。
+fn both_failed_error(failure: &AuditWriteFailure) -> TraitError {
+    TraitError::new(
+        failure.error_code(),
+        format!(
+            "{} (primary: {})",
+            failure.message(),
+            failure.primary().kind().as_str()
+        ),
+    )
 }
 #[cfg(test)]
 mod tests {
@@ -1250,15 +1264,17 @@ mod tests {
         let (sink, _calls, notes) = sink_with(missing_path(), false);
         let e = sink.record(&sample()).unwrap_err();
         assert_eq!(e.code(), ErrorCode::Internal);
-        assert_eq!(
-            e.message(),
-            "audit record could not be persisted by primary or fallback path"
-        );
         let (p, pc) = if cfg!(any(target_os = "linux", target_os = "macos")) {
             ("open", "INTERNAL")
         } else {
             ("unsupported", "UNIMPLEMENTED")
         };
+        assert_eq!(
+            e.message(),
+            format!(
+                "audit record could not be persisted by primary or fallback path (primary: {p})"
+            )
+        );
         let expect = format!(
             "{{\"event\":\"audit_write_failure\",\"code\":\"INTERNAL\",\"primary\":\"{p}\",\"primary_code\":\"{pc}\",\"fallback\":\"fallback_unavailable\",\"fallback_code\":\"UNIMPLEMENTED\"}}\n"
         );

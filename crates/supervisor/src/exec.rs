@@ -1890,6 +1890,12 @@ fn run_in_worker_with_pty(
         let _ = (&writer).write_all(&line);
         0
     };
+    // 試験専用: fork 前に結果 pipe の書き込み端の fd 番号を控える（worker が継承した同番号の fd を特定するため）。
+    #[cfg(feature = "exec-test-support")]
+    {
+        use std::os::fd::AsRawFd as _;
+        RESULT_WRITE_FD.store(writer.as_raw_fd(), std::sync::atomic::Ordering::SeqCst);
+    }
     // `None` は試験専用なので、無効の単独ビルドでは分岐ごと消す（match が `_` だけになる lint を避ける。#2640）。
     #[cfg(feature = "exec-test-support")]
     let (child, receiver, pty_receiver) = match (&listener, pty.is_some()) {
@@ -2408,6 +2414,18 @@ fn remove_child_cgroup(
 
 /// 子 cgroup の後始末で、`cgroup.kill` の後に空になるまで待つ上限（REPAIR-5）。
 const CHILD_CGROUP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 試験専用: 直近の `run_in_worker_*` が fork 前に作った結果 pipe の書き込み端の fd 番号（worker はこの番号で継承する）。
+#[cfg(feature = "exec-test-support")]
+static RESULT_WRITE_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// 試験専用: worker の `work` の中で呼ぶと、その worker の結果 pipe の書き込み端の fd 番号を返す（#4733。書き込み端を
+/// 別プロセスに持たせたときの回収の期限を試験で再現するため。`run_in_worker_for_test` を使う単一スレッドの試験が前提）。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub fn result_write_fd_for_test() -> i32 {
+    RESULT_WRITE_FD.load(std::sync::atomic::Ordering::SeqCst)
+}
 
 #[cfg(feature = "exec-test-support")]
 #[doc(hidden)]

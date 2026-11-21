@@ -502,6 +502,7 @@ pub fn spawn_netns_holder_unready_for_test(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::deadline_read::read_capped_until;
 
     /// REPAIR-5・#4733: 書き込み端を閉じない子を模しても `drain_capped` は期限で戻り、読めた分を返す。
     #[test]
@@ -519,41 +520,54 @@ mod tests {
         );
     }
 
+    /// 試験の後始末（REPAIR-5）: drop で holder 役を SIGKILL・回収し、holder のプロセスグループ（孫の `sleep` を含む）
+    /// を丸ごと SIGKILL する。準備・照合の失敗（panic）でも残さない。
+    struct HolderGuard {
+        child: Child,
+    }
+    impl Drop for HolderGuard {
+        fn drop(&mut self) {
+            let pgid = self.child.id();
+            // 回収済みでも std は何も送らない。グループは孫が生きている間は pgid が再利用されない。
+            let _ = self.child.kill();
+            let _ = wait_until(&mut self.child, REAP_TIMEOUT);
+            let _ = crate::sys::kill_process_group(pgid);
+        }
+    }
+
     /// REPAIR-5・REPAIR-12・REPAIR-10 (d)・#4733: 別プロセスが stderr の書き込み端を持ち続けても、停止経路
     /// `kill_and_reap` は EOF を待たず、終了状態と読めた stderr を期限内（`STDERR_DRAIN_TIMEOUT` 前後）に返す。
-    /// holder 役の `sh` が孫（`sleep 20`）に stderr を継承させて診断行を書き、`exec sleep 100` に置き換わった後に
-    /// SIGKILL で回収される。孫は試験の最後に必ず kill して回収する。
+    /// holder 役の `sh`（自分のプロセスグループ）が孫（`sleep 20`）に stderr を継承させて診断行を書き、stdout へ
+    /// `ready` を出して `exec sleep 100` に置き換わった後に SIGKILL で回収される。孫は `HolderGuard` がグループごと
+    /// kill する（PID ファイルは使わない）。
     #[test]
     fn repair5_4733_kill_and_reap_returns_without_eof_when_writer_is_held() {
-        let dir = std::env::temp_dir().join(format!("fandhe-4733-holder-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let pid_file = dir.join("grandchild.pid");
-        let script = format!(
-            "sleep 20 & echo diag-line >&2; echo $! > '{p}.tmp'; mv '{p}.tmp' '{p}'; exec sleep 100",
-            p = pid_file.display()
-        );
-        let mut child = Command::new("sh")
-            .args(["-c", &script])
+        let child = Command::new("sh")
+            .args([
+                "-c",
+                "sleep 20 >/dev/null & echo diag-line >&2; echo ready; exec sleep 100",
+            ])
+            .process_group(0)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let mut stderr = child.stderr.take();
-        // 孫の pid が書かれた（= 診断行も書き終えた）ことを期限つきで待つ。
-        let wait_end = Instant::now() + Duration::from_secs(10);
-        let grandchild = loop {
-            if let Ok(t) = std::fs::read_to_string(&pid_file) {
-                break t.trim().to_owned();
-            }
-            assert!(Instant::now() < wait_end, "grandchild pid was not recorded");
-            std::thread::sleep(Duration::from_millis(10));
-        };
+        let mut guard = HolderGuard { child };
+        let mut stdout = guard.child.stdout.take().unwrap();
+        let mut stderr = guard.child.stderr.take();
+        // `ready`（= 診断行も書き終えた）を期限つきで待つ。
+        let ready = read_capped_until(
+            &mut stdout,
+            16,
+            Instant::now() + Duration::from_secs(10),
+            true,
+        )
+        .ok();
+        assert_eq!(ready.as_deref(), Some(&b"ready\n"[..]));
         let t0 = Instant::now();
-        let exit = kill_and_reap(&mut child, &mut stderr);
+        let exit = kill_and_reap(&mut guard.child, &mut stderr);
         let el = t0.elapsed();
-        let _ = Command::new("kill").args(["-9", &grandchild]).status();
-        let _ = std::fs::remove_dir_all(&dir);
         let exit = exit.expect("holder must be reaped");
         assert_eq!(exit.code, None);
         assert_eq!(exit.signal, Some(9));

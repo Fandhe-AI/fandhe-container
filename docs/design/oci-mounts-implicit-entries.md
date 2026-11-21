@@ -83,7 +83,7 @@ OCI `config.json` の `mounts[]` のうち、bind と `/sys` の sysfs 以外の
 | moby/moby（8b0c45e4） | Apache License 2.0 | あり（`Docker` / `Copyright 2012-2017 Docker, Inc.` ほか。本リポの `NOTICE` には readonlyPaths・maskedPaths の件の帰属行がある） |
 | opencontainers/runtime-spec（20f948a4） | Apache License 2.0 | 無い（ルートに `NOTICE` が無い） |
 
-本節は mounts の type と options の値を表にまとめたもので、コードは写していない。`NOTICE` への追記の要否はユーザーの判断に回す（[licensing](../../.claude/rules/licensing.md)）。
+本節は mounts の type と options の値を表にまとめたもので、コードは写していない。利用者の判断（2026-11-22）で、runc（a75076b4）と moby（8b0c45e4）の帰属行を、出典と本書への対応つきでルートの `NOTICE` に追記した（[licensing](../../.claude/rules/licensing.md)）。runtime-spec は NOTICE を持たないため、出典は本節の表に書くだけにした。
 
 ## 選択肢
 

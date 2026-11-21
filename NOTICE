@@ -80,6 +80,66 @@ below until the repository owner decides whether it may be omitted:
 The full text is in the NOTICE file at the commit above.
 
 --------------------------------------------------------------------
+Third-party attribution: moby/moby (Apache License 2.0; default mounts)
+--------------------------------------------------------------------
+
+Source:  https://github.com/moby/moby
+File:    daemon/pkg/oci/defaults.go (func DefaultLinuxSpec, Mounts)
+Commit:  8b0c45e42959ea5322cfb33bfb97a40ed64d4a07
+
+What was derived: only the destination, type and option strings of the
+default mounts (/proc, /dev, /dev/pts, /dev/shm, /dev/mqueue, /sys and
+/sys/fs/cgroup), summarized in a table as input to the allowlist of
+implicitly supplied mounts (issue #4712). No logic was copied. The
+corresponding file in this repository is
+docs/design/oci-mounts-implicit-entries.md.
+
+The attribution lines of the moby NOTICE file at that commit:
+
+    Docker
+    Copyright 2012-2017 Docker, Inc.
+
+    This product includes software developed at Docker, Inc.
+    (https://www.docker.com).
+
+Other notices in the moby NOTICE file (third-party libraries unrelated
+to the derived values, and an export-control note) do not relate to any
+part of this product and are omitted under Section 4(d) of the Apache
+License 2.0, as for the moby entry above. The full text is in the
+NOTICE file at the commit above.
+
+--------------------------------------------------------------------
+Third-party attribution: opencontainers/runc (Apache License 2.0;
+default mounts)
+--------------------------------------------------------------------
+
+Source:  https://github.com/opencontainers/runc
+File:    libcontainer/specconv/example.go (func Example, func ToRootless)
+Commit:  a75076b4a413f628c4b6aa4c5568b159aa128a56
+
+What was derived: only the destination, type and option strings of the
+example spec's mounts (/proc, /dev, /dev/pts, /dev/shm, /dev/mqueue,
+/sys and /sys/fs/cgroup) and the description of how ToRootless rewrites
+them (the /sys rbind and the removal of gid= and uid= options),
+summarized in a table as input to the allowlist of implicitly supplied
+mounts (issue #4712). No logic was copied. The corresponding file in
+this repository is docs/design/oci-mounts-implicit-entries.md.
+
+The attribution lines of the runc NOTICE file at that commit:
+
+    runc
+
+    Copyright 2012-2015 Docker, Inc.
+
+    This product includes software developed at Docker, Inc.
+    (http://www.docker.com).
+
+The remainder of the runc NOTICE file at that commit (the export-control
+note) is the same text as in the runc entry above and is retained there
+until the repository owner decides whether it may be omitted. The full
+text is in the NOTICE file at the commit above.
+
+--------------------------------------------------------------------
 Third-party attribution: moby/spdystream (Apache License 2.0; spdy/
 derived from the Go project, BSD 3-Clause License)
 --------------------------------------------------------------------

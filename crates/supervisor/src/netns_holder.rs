@@ -550,14 +550,19 @@ mod tests {
     /// 試験の後始末（REPAIR-5）: drop で holder 役と補助を SIGKILL・回収する（準備・照合の失敗の panic でも）。どちらも
     /// 試験の直接の子で子を作らない 1 プロセスなので（未回収の `Child` への kill は pid の再利用を撃たない）、孤児を回収しない
     /// PID 1 の下でも zombie を残さない。
+    /// 補助は起動の直後に登録し、holder 役は起動に成功してから登録する（holder 役の起動の失敗の panic でも補助を回収する）。
     struct HolderGuard {
-        child: Child,
         helper: Child,
+        child: Option<Child>,
     }
     impl Drop for HolderGuard {
         fn drop(&mut self) {
             // 回収済みなら std は何も送らない（子は自分で回収した Child のみ）。
-            for c in [&mut self.child, &mut self.helper] {
+            for c in self
+                .child
+                .iter_mut()
+                .chain(std::iter::once(&mut self.helper))
+            {
                 let _ = c.kill();
                 let _ = wait_until(c, REAP_TIMEOUT);
             }
@@ -582,6 +587,10 @@ mod tests {
             .stderr(Stdio::from(err_w.try_clone().unwrap()))
             .spawn()
             .unwrap();
+        let mut guard = HolderGuard {
+            helper,
+            child: None,
+        };
         let child = Command::new("sh")
             .args(["-c", "echo diag-line >&2; echo ready; exec sleep 100"])
             .stdin(Stdio::null())
@@ -589,9 +598,9 @@ mod tests {
             .stderr(Stdio::from(err_w))
             .spawn()
             .unwrap();
-        let mut guard = HolderGuard { child, helper };
+        let child = guard.child.insert(child);
         let mut stderr = Some(ChildStderr::from(OwnedFd::from(err_r)));
-        let mut stdout = guard.child.stdout.take().unwrap();
+        let mut stdout = child.stdout.take().unwrap();
         // `ready`（= 診断行も書き終えた）を期限つきで待つ。
         let ready = read_capped_until(
             &mut stdout,
@@ -602,7 +611,7 @@ mod tests {
         .ok();
         assert_eq!(ready.as_deref(), Some(&b"ready\n"[..]));
         let t0 = Instant::now();
-        let exit = kill_and_reap(&mut guard.child, &mut stderr);
+        let exit = kill_and_reap(child, &mut stderr);
         let el = t0.elapsed();
         let exit = exit.expect("holder must be reaped");
         assert_eq!(exit.code, None);

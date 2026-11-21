@@ -28,7 +28,7 @@ OCI `config.json` の `mounts[]` のうち、bind と `/sys` の sysfs 以外の
 
 ## 標準の既定 config との突き合わせ
 
-出典: opencontainers/runc `libcontainer/specconv/example.go` の `Example()`（commit a75076b4a413f628c4b6aa4c5568b159aa128a56 で確認）。`ToRootless()` は `/sys` を rbind の bind へ置き換える（options は下の「一次資料の確認」の表）。runc は Apache-2.0 で NOTICE を持つ。下表は mounts の type と options を要約したもので、写した量は少ないが NOTICE への追記の要否はユーザー判断に回す（[licensing](../../.claude/rules/licensing.md)）。
+出典: opencontainers/runc `libcontainer/specconv/example.go` の `Example()`（commit a75076b4a413f628c4b6aa4c5568b159aa128a56 で確認）。`ToRootless()` は `/sys` を rbind の bind へ置き換える（options は下の「一次資料の確認」の表）。runc は Apache-2.0 で NOTICE を持つ。帰属の扱いは下の「一次資料の確認」節（ライセンスと NOTICE）に記録した（2026-11-22 の利用者判断でルートの `NOTICE` に追記済み）。
 
 | 宛先 | 既定 config（type / options） | 本ランタイムが載せるもの | 今の扱い | A での扱い |
 | ---- | ----------------------------- | ------------------------ | -------- | ---------- |
@@ -70,7 +70,7 @@ OCI `config.json` の `mounts[]` のうち、bind と `/sys` の sysfs 以外の
 読み取れること（許可表の入力）:
 
 - `ToRootless()` は `/sys` の置き換えのほか、全項目の options から `gid=`・`uid=` で始まるものを除く（`/dev/pts` の `gid=5` が消える）。rootless の config では `/dev/pts` の `gid=` が無いことがありうる
-- `/proc` は runc が options なし、moby が `nosuid,noexec,nodev`。`mount_proc` の属性との照合では、どちらも緩める方向でないことを確かめる必要がある
+- `/proc` は runc が options なし、moby が `nosuid,noexec,nodev`。本ランタイムの `mount_proc`（core の `sys::mount_proc_at`）は常に `MS_NOSUID | MS_NODEV | MS_NOEXEC` で載せる。そのため runc の options なしは制限を緩めず（供給側が 3 つの制限を保つ）、moby の 3 つの制限は供給側で満たせる。許可表では、緩める方向の指定を受けないことに加え、供給側で満たせない制限（例: `/proc` の `ro`）を要求された場合は黙って載せずに拒否する（A-2 の方針。SEC-1）
 - `/dev/shm` は moby の既定 spec に `size=` が無い。moby がコンテナの作成時に `/dev/shm` をどう置き換えるか（`size=` の付与・ipc モードごとの bind）は、本書の時点で未確認（`defaults.go` の外の処理）。`size=` が無い `/dev/shm` を受けるかは #4715 で決める
 - `/sys/fs/cgroup` の options は runc に `relatime` があり moby に無い（どちらも拒否のまま。本書の「標準の既定 config との突き合わせ」の表と A の方針）
 - runtime-spec は type だけを SHOULD として挙げ、options は規定しない。`/dev`・`/dev/mqueue`・`/sys/fs/cgroup` は表に無い

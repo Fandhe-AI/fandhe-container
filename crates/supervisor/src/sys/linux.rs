@@ -212,6 +212,15 @@ pub(crate) fn open_path_at(
     openat_file(dir, name, O_PATH | nofollow | O_CLOEXEC, 0)
 }
 
+/// `dir` の直下のディレクトリを、辿らず（`O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`）開く。パスを 1 要素ずつ
+/// fd 相対で辿り、祖先の差し替えを受けない用途（CRI-2・SEC-1・#4652）。新しい `unsafe` は足さない（[`openat_file`]）。
+pub(crate) fn open_dir_at(
+    dir: BorrowedFd<'_>,
+    name: &std::ffi::OsStr,
+) -> io::Result<std::fs::File> {
+    openat_file(dir, name, open_dir_nofollow_flags()? | O_CLOEXEC, 0)
+}
+
 /// `dir` の直下の名前を消す（`unlinkat(2)`。ディレクトリは消さない）。
 pub(crate) fn unlink_at(dir: BorrowedFd<'_>, name: &std::ffi::OsStr) -> io::Result<()> {
     let name = single_component(name)?;

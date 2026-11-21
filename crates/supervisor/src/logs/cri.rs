@@ -385,33 +385,57 @@ fn open_log_file(path: &std::path::Path) -> Result<std::fs::File, TraitError> {
 }
 
 /// `reopen` 用に、親ディレクトリを検査して fd で開く（以後の open・作成・削除はこの fd の直下だけで行い、パスを再解決しない。
-/// CRI-2・SEC-1・#4652）。パスの検査（[`super::rotating::check_dir`]。絶対・`..` なし・祖先の symlink なし）の後に
-/// `O_DIRECTORY | O_NOFOLLOW` で開き、開いた fd 自体を `fstat` で確かめる（ディレクトリである・group / other 書き込み不可・
-/// open の **前** に `lstat` したパスと同じ dev / ino。`lstat` から open までの間の差し替えを拒否する）。
-/// 残る窓: `check_dir` の祖先の検査から `lstat` までの間に祖先を差し替えられると、`lstat` と open の両方が差し替え後を
-/// 指して一致する（祖先に書き込める主体に限る。docs/design/cri-log-partial-lines.md「ReopenContainerLog との関係」）。
+/// CRI-2・SEC-1・#4652）。パスの検査（[`super::rotating::check_dir`]。絶対・`..` なし・祖先の symlink なし）で得た実体パスを、
+/// `/` から 1 要素ずつ `openat(O_DIRECTORY | O_NOFOLLOW)` で辿り、開いた各祖先の fd を `fstat` で確かめる（所有者が root か
+/// 自分で、group / other が書き込めないか sticky）。最後の fd はディレクトリで group / other が書き込めないこと。祖先を
+/// 名前で引き直さないため、検査と open の間に祖先を差し替えられても、差し替えた祖先は検査を通らない。
 #[cfg(target_os = "linux")]
 fn open_verified_dir(parent: &std::path::Path) -> Result<std::fs::File, TraitError> {
+    use std::os::fd::AsFd as _;
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 
+    const STICKY: u32 = 0o1000;
     let canonical = super::rotating::check_dir(parent).map_err(|_| unopenable())?;
+    let euid = crate::control::listener::effective_uid().map_err(|_| unopenable())?;
     let flags = crate::sys::open_dir_nofollow_flags().map_err(|_| unopenable())?;
-    // 比べる側は open の前に取る（open の後に引き直すと、差し替え後どうしで一致してしまう）。
-    let checked = std::fs::symlink_metadata(&canonical).map_err(|_| unopenable())?;
-    let dir = std::fs::OpenOptions::new()
+    let mut dir = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(flags)
-        .open(&canonical)
+        .open("/")
         .map_err(|_| unopenable())?;
+    for comp in canonical.components() {
+        let std::path::Component::Normal(name) = comp else {
+            continue;
+        };
+        let anc = dir.metadata().map_err(|_| unopenable())?;
+        let owner_ok = anc.uid() == 0 || anc.uid() == euid;
+        if !owner_ok || (anc.mode() & 0o022 != 0 && anc.mode() & STICKY == 0) {
+            return Err(unopenable());
+        }
+        dir = crate::sys::open_dir_at(dir.as_fd(), name).map_err(|_| unopenable())?;
+    }
     let opened = dir.metadata().map_err(|_| unopenable())?;
-    if !opened.is_dir()
-        || opened.mode() & 0o022 != 0
-        || opened.dev() != checked.dev()
-        || opened.ino() != checked.ino()
-    {
+    if !opened.is_dir() || opened.mode() & 0o022 != 0 {
         return Err(unopenable());
     }
     Ok(dir)
+}
+
+/// 確定の直前に、`dir` の直下の `name` が今も `file` と同じ inode を指すことを確かめる（違えば `FailedPrecondition`。
+/// 関門の外で行い、関門の中で I/O をしない）。既知の制約: 照合から確定までと確定の後に名前を移されると、書き込み先と
+/// 元のパスは分かれうる。Linux にはディレクトリのエントリを固定する手段が無く（名前単位の lease・lock は無く、`flock` も
+/// `fcntl` も inode に掛かる）閉じられない。照合で窓をマイクロ秒に狭める（CRI-2・#4652）。
+#[cfg(target_os = "linux")]
+fn name_still_points_to(
+    dir: &std::fs::File,
+    name: &std::ffi::OsStr,
+    file: &std::fs::File,
+) -> Result<(), TraitError> {
+    use std::os::fd::AsFd as _;
+    match crate::sys::open_path_at(dir.as_fd(), name) {
+        Ok(at) if same_inode(&at, file) => Ok(()),
+        _ => Err(unopenable()),
+    }
 }
 
 /// 自分で作った `file` が、`dir` の直下の `name` に今もあるときだけ消す（同じ dev / ino を `O_PATH | O_NOFOLLOW` で確かめてから
@@ -614,7 +638,7 @@ impl CriFileSink {
         gate: ReopenGate<'_>,
     ) -> Result<RetiredWriter, TraitError> {
         let mut slot = Some(file);
-        let result = self.prepare_and_commit_new(&mut slot, deadline, gate);
+        let result = self.prepare_and_commit_new(dir, name, &mut slot, deadline, gate);
         // 確定していれば `slot` は空。残っていれば作ったまま公開された状態なので消す。
         if result.is_err()
             && let Some(file) = slot.as_ref()
@@ -627,6 +651,8 @@ impl CriFileSink {
     #[cfg(target_os = "linux")]
     fn prepare_and_commit_new(
         &self,
+        dir: &std::fs::File,
+        name: &std::ffi::OsStr,
         slot: &mut Option<std::fs::File>,
         deadline: Instant,
         gate: ReopenGate<'_>,
@@ -644,6 +670,7 @@ impl CriFileSink {
         self.flush_old(&mut guard)?;
         #[cfg(test)]
         self.run_hook(&self.faults.before_commit);
+        name_still_points_to(dir, name, file)?;
         self.commit_switch(&mut guard, slot, len, deadline, gate)
     }
 
@@ -652,6 +679,8 @@ impl CriFileSink {
     #[cfg(target_os = "linux")]
     fn switch_existing(
         &self,
+        dir: &std::fs::File,
+        name: &std::ffi::OsStr,
         file: std::fs::File,
         deadline: Instant,
         gate: ReopenGate<'_>,
@@ -671,6 +700,7 @@ impl CriFileSink {
             };
             #[cfg(test)]
             self.run_hook(&self.faults.before_commit);
+            name_still_points_to(dir, name, &file)?;
             // 同じ inode: writer は残し、残りだけを数え直す（`slot` は空）。
             return self.commit_switch(&mut guard, &mut None, meta.len(), deadline, gate);
         }
@@ -683,6 +713,7 @@ impl CriFileSink {
         self.flush_old(&mut guard)?;
         #[cfg(test)]
         self.run_hook(&self.faults.before_commit);
+        name_still_points_to(dir, name, &file)?;
         self.commit_switch(&mut guard, &mut Some(file), len, deadline, gate)
     }
 
@@ -857,7 +888,7 @@ impl LogSink for CriFileSink {
             // 作る瞬間に他者が先に作る競合は、既存として 1 回だけやり直す。
             for _ in 0..2 {
                 match crate::sys::open_log_at(dir.as_fd(), name, false) {
-                    Ok(file) => return self.switch_existing(file, deadline, gate),
+                    Ok(file) => return self.switch_existing(&dir, name, file, deadline, gate),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                     Err(_) => return Err(unopenable()),
                 }
@@ -1769,6 +1800,57 @@ mod tests {
             drop(CriFileSink::open(&old_path).expect("old lock released"));
         }
 
+        /// CRI-2・#4652: 確定の直前に元の名前が別の inode へ移されていたら（rename を注入）、切り替えずに
+        /// `FailedPrecondition` で返す。旧 writer は残り、移された先のファイルは消さない。
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn cri2_4652_reopen_rejects_name_moved_before_commit() {
+            let (t, path, rotated, sink) = rotated_sink("reopen-moved");
+            let moved = t.0.join("moved");
+            let m = moved.clone();
+            *sink.faults.before_commit.lock().expect("lock") = Some(Box::new(move |p| {
+                std::fs::rename(p, &m).expect("move");
+            }));
+            let e = sink.reopen(in_secs(5), &allow).expect_err("moved");
+            assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+            assert_eq!(e.message(), "cri log file cannot be opened");
+            assert_eq!(names(&t.0), ["0.log.1", "moved"]);
+            assert!(!Path::new(path.as_str()).exists());
+            sink.append(StreamKind::Stdout, b"still")
+                .expect("old writer");
+            sink.flush().expect("flush");
+            assert_eq!(read(&rotated).lines().count(), 1);
+        }
+
+        /// SEC-1・CRI-2・#4652: 祖先が group / other に書き込めて sticky でなければ（祖先を差し替えられる）、開き直しは
+        /// 親を開かずに `FailedPrecondition` で拒否する（祖先は fd 相対で 1 要素ずつ辿って確かめる）。
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn sec1_4652_reopen_rejects_group_writable_non_sticky_ancestor() {
+            use std::os::unix::fs::PermissionsExt as _;
+            let t = Tmp::new("reopen-ancestor");
+            let gw = t.0.join("gw");
+            let logs = gw.join("logs");
+            std::fs::create_dir_all(&logs).expect("mkdir");
+            std::fs::set_permissions(&logs, std::fs::Permissions::from_mode(0o750))
+                .expect("chmod logs");
+            let path = t.log("gw/logs/0.log");
+            let sink = CriFileSink::open(&path).expect("open");
+            std::fs::rename(path.as_str(), logs.join("0.log.1")).expect("rename");
+            std::fs::set_permissions(&gw, std::fs::Permissions::from_mode(0o777))
+                .expect("chmod gw");
+            let e = sink.reopen(in_secs(5), &allow).expect_err("ancestor");
+            assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+            assert_eq!(names(&logs), ["0.log.1"]);
+            // sticky なら受ける（/tmp と同じ扱い）。
+            std::fs::set_permissions(&gw, std::fs::Permissions::from_mode(0o1777))
+                .expect("chmod sticky");
+            reopen_now(&sink).expect("sticky ancestor is accepted");
+            assert_eq!(names(&logs), ["0.log", "0.log.1"]);
+            std::fs::set_permissions(&gw, std::fs::Permissions::from_mode(0o750))
+                .expect("chmod back");
+        }
+
         /// CRI-2・SUP-7・#4652（C）: 確定点（関門）で稼働中でなくなっていたら（終了の割り込みを注入）、新しいファイルを
         /// 残さず、旧 writer を変えない。確定の関数は呼ばれない。
         #[cfg(target_os = "linux")]
@@ -1799,8 +1881,8 @@ mod tests {
             assert_eq!(read(&rotated).lines().count(), 1);
         }
 
-        /// CRI-2・SEC-1・#4652（P0）: 確定を拒否されたときの後始末は、自分が作った inode のときだけ消す。名前が他者のファイルに
-        /// 差し替わっていたら、それには触れない。
+        /// CRI-2・SEC-1・#4652（P0）: 確定しなかったときの後始末は、自分が作った inode のときだけ消す。名前が他者のファイルに
+        /// 差し替わっていたら、それには触れない（差し替えは確定の直前の名前の照合が先に拒否する）。
         #[cfg(target_os = "linux")]
         #[test]
         fn cri2_4652_cleanup_does_not_remove_someone_elses_file() {
@@ -1823,7 +1905,8 @@ mod tests {
                 ok
             };
             let e = sink.reopen(in_secs(5), &gate).expect_err("refused");
-            assert_eq!(e.message(), "cri log reopen is no longer permitted");
+            assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+            assert_eq!(e.message(), "cri log file cannot be opened");
             assert_eq!(names(&t.0), ["0.log", "0.log.1", "0.ours"]);
             assert_eq!(read(Path::new(path.as_str())), "theirs");
             sink.append(StreamKind::Stdout, b"old").expect("old writer");

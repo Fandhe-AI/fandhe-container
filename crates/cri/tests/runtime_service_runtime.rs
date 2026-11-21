@@ -3666,6 +3666,91 @@ async fn cri2_4652_dropped_rpc_cancels_reopener_and_grpc_timeout_bounds_deadline
     assert!((1500..=2000).contains(&budget), "{budget}");
 }
 
+/// REPAIR-5・#4652: `ReopenContainerLog` が先に行う状態照会（自然終了の取り込み）も同時実行の枠の内側で走る。実行層の
+/// `state` が止まると、照会の待ちは期限で戻って開き直しは成功するが、止まった照会の処理スレッドは枠を持ち続ける。
+/// 別々のコンテナで 4 件止まると 5 件目は `UNAVAILABLE` で断られ、照会が終わると枠が返る。
+#[tokio::test]
+async fn repair5_4652_reopen_state_queries_are_bounded() {
+    use fandhe_container_cri::runtime_service::MAX_CONTAINER_LOG_REOPENS;
+    let h = harness();
+    let fake = Arc::new(FakeReopener::default());
+    let service = h
+        .service
+        .with_log_reopener(fake.clone())
+        .with_exit_observe_timeout(std::time::Duration::from_millis(100));
+    let sb = RuntimeService::run_pod_sandbox(
+        &service,
+        Request::new(v1::RunPodSandboxRequest {
+            config: Some(PodSandboxConfig {
+                metadata: Some(PodSandboxMetadata {
+                    name: "pod".into(),
+                    uid: "uid-1".into(),
+                    namespace: "ns".into(),
+                    attempt: 0,
+                }),
+                log_directory: "/var/log/pods/ns_pod_uid-1".into(),
+                ..Default::default()
+            }),
+            runtime_handler: String::new(),
+        }),
+    )
+    .await
+    .expect("run sandbox")
+    .into_inner()
+    .pod_sandbox_id;
+    let mut ids = Vec::new();
+    for n in 0..=MAX_CONTAINER_LOG_REOPENS {
+        let name = format!("c{n}");
+        let mut cfg = container(&name);
+        cfg.log_path = format!("{name}/0.log");
+        let id = RuntimeService::create_container(
+            &service,
+            Request::new(v1::CreateContainerRequest {
+                pod_sandbox_id: sb.clone(),
+                config: Some(cfg),
+                sandbox_config: None,
+            }),
+        )
+        .await
+        .expect("create")
+        .into_inner()
+        .container_id;
+        start(&service, &id).await.expect("start");
+        ids.push(id);
+    }
+    h.runtime.hold_state.store(true, Ordering::SeqCst);
+    for id in ids.iter().take(MAX_CONTAINER_LOG_REOPENS) {
+        reopen(&service, id)
+            .await
+            .expect("the observe times out and the reopen succeeds");
+    }
+    let last = ids.last().expect("one more container");
+    let err = reopen(&service, last)
+        .await
+        .expect_err("the slots are held by the stuck state queries");
+    assert_eq!(err.code(), Code::Unavailable);
+    assert_eq!(
+        err.message(),
+        "too many container log reopens are in progress"
+    );
+    h.runtime.hold_state.store(false, Ordering::SeqCst);
+    let until = Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match reopen(&service, last).await {
+            Ok(()) => break,
+            Err(e) => {
+                assert_eq!(e.code(), Code::Unavailable);
+                assert!(Instant::now() < until, "the slots were not released");
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+    }
+    assert_eq!(
+        fake.calls.lock().unwrap().len(),
+        MAX_CONTAINER_LOG_REOPENS + 1
+    );
+}
+
 /// REPAIR-5・#4652: 同時に走る `ReopenContainerLog` の処理スレッドは `MAX_CONTAINER_LOG_REOPENS` 件まで。超えた要求は
 /// リオープナーを呼ばずに `UNAVAILABLE` で断り、枠は処理スレッドが終わると返る。
 #[tokio::test]

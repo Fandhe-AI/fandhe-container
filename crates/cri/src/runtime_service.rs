@@ -2192,9 +2192,17 @@ impl CriRuntimeService {
             .map_err(|_| CriError::invalid_argument("container_id is invalid"))?;
         // 期限は受付の時点から数える（自然終了の取り込みの待ちで延びない。クライアントの期限切れの後に確定しない）。
         let received = Instant::now();
+        // 同時実行の枠は、先行する状態照会の前に取る。照会の処理スレッドと開き直しの処理スレッドの両方が枠を持ち、
+        // どちらも実際に終わるまで返さない（期限で RPC が戻っても、止まったスレッドが上限の外で増えない。REPAIR-5）。
+        let slot = Arc::new(
+            ReopenSlot::acquire(&self.log_reopens_inflight).ok_or_else(|| {
+                CriError::unavailable("too many container log reopens are in progress")
+            })?,
+        );
         // 自然終了を先に取り込む（`ContainerStatus` と同じ）。終了した supervisor の制御ソケットへ接続して
         // `UNAVAILABLE` になる代わりに、running でないことを `FAILED_PRECONDITION` で返す（#4652）。
-        self.observe_container_exit(&req.container_id).await?;
+        self.observe_container_exit_holding(&req.container_id, Arc::clone(&slot))
+            .await?;
         {
             let registry = self
                 .registry
@@ -2215,9 +2223,6 @@ impl CriRuntimeService {
         }
         let reopener = Arc::clone(reopener);
         // 枠は処理スレッドへ移し、スレッドが終わるまで保持する（RPC が期限で戻っても返さない）。
-        let slot = ReopenSlot::acquire(&self.log_reopens_inflight).ok_or_else(|| {
-            CriError::unavailable("too many container log reopens are in progress")
-        })?;
         // クライアントの `grpc-timeout` が短ければそれに合わせる（期限切れの後に確定しない。#4652）。
         let budget = client_timeout.map_or(CONTAINER_LOG_REOPEN_TIMEOUT, |t| {
             t.min(CONTAINER_LOG_REOPEN_TIMEOUT)
@@ -4396,6 +4401,17 @@ impl CriRuntimeService {
     /// ID・パス・実行層の文言は記録しない（REPAIR-4）。候補の判定は [`exit_observe_candidate`] を `ListContainers`
     /// （E2・#4175）と共有する。
     async fn observe_container_exit(&self, container_id: &str) -> Result<(), CriError> {
+        self.observe_container_exit_holding(container_id, ()).await
+    }
+
+    /// [`Self::observe_container_exit`] と同じだが、`hold` を状態照会の処理スレッドへ移し、照会が実際に終わるまで保持する
+    /// （`ReopenContainerLog` が同時実行の枠を照会の間も持つため。期限で待ちが戻っても、止まったスレッドが枠の外で増えない。
+    /// REPAIR-5・#4652）。照会しない場合（候補でない・実行層が無い）は、戻る時点で `hold` を手放す。
+    async fn observe_container_exit_holding<H: Send + 'static>(
+        &self,
+        container_id: &str,
+        hold: H,
+    ) -> Result<(), CriError> {
         let mark = {
             let mut registry = self
                 .registry
@@ -4422,6 +4438,7 @@ impl CriRuntimeService {
         let id = container_id.to_owned();
         let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::ContainerExitObserve);
         let outcome = run_bounded(self.exit_observe_timeout, move || {
+            let _hold = hold;
             let result = adapter.state(&id);
             let brief = result.as_ref().map(|_| ()).map_err(Clone::clone);
             mark.finish(&result);

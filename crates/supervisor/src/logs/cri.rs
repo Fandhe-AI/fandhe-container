@@ -379,22 +379,31 @@ fn open_log_file(path: &std::path::Path) -> Result<std::fs::File, TraitError> {
         return Err(invalid("cri log path has no file name"));
     };
     let dir = ensure_parent_dir(parent, unopenable)?;
+    // 祖先に symlink（`check_dir` が通す root 所有のものを含む）があるパスは、開き直し（`open_verified_dir` は symlink を
+    // 辿らない）で必ず失敗するため、最初の open でも拒否して挙動を揃える（実体パスが要素から組み直したパスと一致すること）。
+    #[cfg(target_os = "linux")]
+    if dir != parent.components().collect::<std::path::PathBuf>() {
+        return Err(unopenable());
+    }
     log_open_options(true)
         .open(dir.join(name))
         .map_err(|_| unopenable())
 }
 
 /// `reopen` 用に、親ディレクトリを検査して fd で開く（以後の open・作成・削除はこの fd の直下だけで行い、パスを再解決しない。
-/// CRI-2・SEC-1・#4652）。パスの検査（[`super::rotating::check_dir`]。絶対・`..` なし・祖先の symlink なし）で得た実体パスを、
+/// CRI-2・SEC-1・#4652）。パスの検査（[`super::rotating::check_dir`]。絶対・`..` なし）を通した元のパスを要素から組み直し、
 /// `/` から 1 要素ずつ `openat(O_DIRECTORY | O_NOFOLLOW)` で辿り、開いた各祖先の fd を `fstat` で確かめる（[`ancestor_ok`]。
 /// 所有者が root か自分で、other が書き込めるなら sticky、group 書き込み可は root 所有か sticky）。最後の fd はディレクトリで、所有者が root か自分で、group / other が
-/// 書き込めないこと。祖先を名前で引き直さないため、検査と open の間に祖先を差し替えられても、差し替えた祖先は検査を通らない。
+/// 書き込めないこと。`check_dir` の実体パス（`canonicalize` の結果）は辿らない: 検査と `canonicalize` の間に祖先を symlink へ
+/// 差し替えられると、実体パスには差し替えた要素が現れず、fd の走査で検出できないため。元のパスの要素を `O_NOFOLLOW` で
+/// 辿るので、symlink の要素（root 所有のものも）は `ELOOP`・`ENOTDIR` で拒否する（最初の open も同じパスを拒否する。
+/// [`open_log_file`]）。祖先を名前で引き直さないため、検査と open の間に祖先を差し替えられても、差し替えた祖先は検査を通らない。
 #[cfg(target_os = "linux")]
 fn open_verified_dir(parent: &std::path::Path) -> Result<std::fs::File, TraitError> {
     use std::os::fd::AsFd as _;
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 
-    let canonical = super::rotating::check_dir(parent).map_err(|_| unopenable())?;
+    super::rotating::check_dir(parent).map_err(|_| unopenable())?;
     let euid = crate::control::listener::effective_uid().map_err(|_| unopenable())?;
     let flags = crate::sys::open_dir_nofollow_flags().map_err(|_| unopenable())?;
     let mut dir = std::fs::OpenOptions::new()
@@ -402,7 +411,7 @@ fn open_verified_dir(parent: &std::path::Path) -> Result<std::fs::File, TraitErr
         .custom_flags(flags)
         .open("/")
         .map_err(|_| unopenable())?;
-    for comp in canonical.components() {
+    for comp in parent.components() {
         let std::path::Component::Normal(name) = comp else {
             continue;
         };
@@ -451,21 +460,62 @@ fn name_still_points_to(
     }
 }
 
-/// 自分で作った `file` が、`dir` の直下の `name` に今もあるときだけ消す（同じ dev / ino を `O_PATH | O_NOFOLLOW` で確かめてから
-/// `unlinkat`。他者が差し替えた名前・別の inode には触れない。パスを再解決しない。失敗は握りつぶす: 後始末の失敗で本来の
-/// エラーを隠さない）。
-/// 既知の制約: 照合と `unlinkat` の間（数 µs）に他者が同じ名前へ別の inode を rename すると、それを消しうる。Linux の
-/// `unlinkat(2)` には「同じ inode のときだけ消す」条件が無く（FreeBSD の `funlinkat` 相当が無い）、この窓は閉じられない
-/// （docs/design/cri-log-partial-lines.md「ReopenContainerLog との関係」）。
+/// 確定できなかった開き直しで自分が作った `file` を、`dir` の直下の `name` から外す（CRI-2・SEC-1・REPAIR-4・#4652）。
+///
+/// 名前のまま照合して `unlinkat` すると、照合と削除の間に kubelet が回転済みのログを元の名前へ rename で戻したとき、そのログを
+/// 消してしまう（Linux の `unlinkat(2)` に「同じ inode のときだけ」の条件が無い）。そこで、まず `RENAME_NOREPLACE` で
+/// 一意の退避名（[`discard_stash_name`]。kubelet の回転済みファイルの glob `<name>.*` に当たらない `.` 始まり）へ移し、
+/// 退避名の inode が `file` と同じときだけ消す。違う・確かめられないとき（kubelet が戻したログを移した）は
+/// `RENAME_NOREPLACE` で元の名前へ戻す。退避から戻すまでの間（マイクロ秒）、元の名前は一瞬無い。
+/// 元の名前が既に無ければ（`ENOENT`）何もしない。退避できない（`RENAME_NOREPLACE` を持たない FS など）・戻せないときは、
+/// 消さずに残して構造化 1 行を出す（データを失う方へ倒さない。戻せなかったログは退避名のまま残る）。
 #[cfg(target_os = "linux")]
-fn remove_if_same(dir: &std::fs::File, name: &std::ffi::OsStr, file: &std::fs::File) {
+fn discard_created(dir: &std::fs::File, name: &std::ffi::OsStr, file: &std::fs::File) {
     use std::os::fd::AsFd as _;
-    let Ok(at_name) = crate::sys::open_path_at(dir.as_fd(), name) else {
-        return;
-    };
-    if same_inode(&at_name, file) {
-        let _ = crate::sys::unlink_at(dir.as_fd(), name);
+    let stash = discard_stash_name();
+    match crate::sys::rename_noreplace_at(dir.as_fd(), name, &stash) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(_) => {
+            report_reopen_discard("left_in_place");
+            return;
+        }
     }
+    match crate::sys::open_path_at(dir.as_fd(), &stash) {
+        Ok(at) if same_inode(&at, file) => {
+            if crate::sys::unlink_at(dir.as_fd(), &stash).is_err() {
+                report_reopen_discard("stash_not_removed");
+            }
+        }
+        _ => {
+            if crate::sys::rename_noreplace_at(dir.as_fd(), &stash, name).is_err() {
+                report_reopen_discard("stash_not_restored");
+            }
+        }
+    }
+}
+
+/// [`discard_created`] の退避名（プロセス内で一意。pid と連番。`.` で始め、kubelet の回転済みファイルの glob に当たらない）。
+#[cfg(target_os = "linux")]
+fn discard_stash_name() -> std::ffi::OsString {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!(".fandhe-reopen-discard-{}-{n}", std::process::id()).into()
+}
+
+/// [`discard_created`] で消せなかった・戻せなかったときの構造化 1 行（固定の語彙。パス・errno を含めない。REPAIR-4）。
+#[cfg(target_os = "linux")]
+fn report_reopen_discard(result: &'static str) {
+    let line = format!(
+        "{{\"component\":\"supervisor.logs\",\"operation\":\"cri_reopen_discard\",\"result\":\"{result}\"}}\n"
+    );
+    let _ = crate::stderr_sink::stderr().emit(line.into_bytes());
+}
+
+/// 今の writer が `file` と同じ inode へ書いているか（`Failed` なら偽）。
+#[cfg(target_os = "linux")]
+fn writes_to(inner: &Inner, file: &std::fs::File) -> bool {
+    matches!(inner, Inner::Active { writer, .. } if same_inode(writer.get_ref(), file))
 }
 
 /// 期限内にロックを取る（`Mutex` に待ち時間の指定が無いため `try_lock` を短い間隔で繰り返す）。取れなければ `None`。
@@ -640,7 +690,8 @@ impl CriFileSink {
 
     /// 新規に作ったファイル（`dir` の直下の `name` を `O_EXCL` で作った fd）への開き直し。待ちうる処理（ロック・メタデータ・
     /// 旧 writer の flush）を確定の前にすべて済ませ、確定は [`Self::commit_switch`] の関門だけで行う。どこで失敗しても
-    /// （期限・世代・ロック・flush）、作ったファイルを消す（[`remove_if_same`]。同じ inode のときだけ）。
+    /// （期限・世代・ロック・flush・名前の照合）、作ったファイルを元の名前から外す（[`discard_created`]。cri-api の
+    /// `ReopenContainerLog` は「エラーを返したら新しいログファイルを作ってはならない」と定める）。
     #[cfg(target_os = "linux")]
     fn publish_new(
         &self,
@@ -652,11 +703,11 @@ impl CriFileSink {
     ) -> Result<RetiredWriter, TraitError> {
         let mut slot = Some(file);
         let result = self.prepare_and_commit_new(dir, name, &mut slot, deadline, gate);
-        // 確定していれば `slot` は空。残っていれば作ったまま公開された状態なので消す。
+        // 確定していれば `slot` は空。残っていれば作ったまま公開された状態なので外す。
         if result.is_err()
             && let Some(file) = slot.as_ref()
         {
-            remove_if_same(dir, name, file);
+            discard_created(dir, name, file);
         }
         result
     }
@@ -688,7 +739,10 @@ impl CriFileSink {
     }
 
     /// 既にあるファイルへの開き直し: 同じ inode なら writer を残して flush と数え直しだけ（E）、別 inode ならロックを取って
-    /// 旧 writer を flush してから差し替える。待ちうる処理はすべて確定の前に済ませる。
+    /// 旧 writer を flush してから差し替える。待ちうる処理はすべて確定の前に済ませる。別 inode のときのリンク数の確認と
+    /// ファイルのロック（最大 [`LOCK_GRACE`] の待ち）は sink の内部ロックの外で行い、捕捉の書き込みを止めない（新規作成の
+    /// 経路と同じ）。書き手が今の writer と同じ inode かどうかは短く内部ロックを取って確かめる（開き直しはコンテナごとに
+    /// 直列化され、その間に writer が別のファイルへ替わるのは `Failed` への遷移だけなので、取り直した後にもう一度確かめる）。
     #[cfg(target_os = "linux")]
     fn switch_existing(
         &self,
@@ -701,28 +755,50 @@ impl CriFileSink {
         let Some(mut guard) = lock_until(&self.inner, deadline) else {
             return Err(timeout_error());
         };
-        check_budget(deadline, gate)?;
-        if let Inner::Active { writer, .. } = &*guard
-            && same_inode(writer.get_ref(), &file)
-        {
-            // 書き出せなかった分が BufWriter に残るため、成功として残りを数え直すと上限を超えうる。
-            // 失敗は成功にせず、残りも変えない（E）。
-            self.flush_old(&mut guard)?;
-            let Ok(meta) = file.metadata() else {
-                return Err(unopenable());
-            };
-            #[cfg(test)]
-            self.run_hook(&self.faults.before_commit);
-            name_still_points_to(dir, name, &file)?;
-            // 同じ inode: writer は残し、残りだけを数え直す（`slot` は空）。
-            return self.commit_switch(&mut guard, &mut None, meta.len(), deadline, gate);
+        if !writes_to(&guard, &file) {
+            drop(guard);
+            return self.switch_to_other(dir, name, file, deadline, gate);
         }
+        check_budget(deadline, gate)?;
+        // 書き出せなかった分が BufWriter に残るため、成功として残りを数え直すと上限を超えうる。
+        // 失敗は成功にせず、残りも変えない（E）。
+        self.flush_old(&mut guard)?;
+        let Ok(meta) = file.metadata() else {
+            return Err(unopenable());
+        };
+        #[cfg(test)]
+        self.run_hook(&self.faults.before_commit);
+        name_still_points_to(dir, name, &file)?;
+        // 同じ inode: writer は残し、残りだけを数え直す（`slot` は空）。
+        self.commit_switch(&mut guard, &mut None, meta.len(), deadline, gate)
+    }
+
+    /// [`Self::switch_existing`] の別 inode の場合。待ちうる処理（リンク数・ファイルのロック）を内部ロックの外で済ませてから
+    /// 内部ロックを取り、旧 writer を flush して差し替える。
+    #[cfg(target_os = "linux")]
+    fn switch_to_other(
+        &self,
+        dir: &std::fs::File,
+        name: &std::ffi::OsStr,
+        file: std::fs::File,
+        deadline: Instant,
+        gate: ReopenGate<'_>,
+    ) -> Result<RetiredWriter, TraitError> {
+        check_budget(deadline, gate)?;
         // 別 inode の既存ファイルはリンクが 1 本のものだけ受ける（ログディレクトリの外の inode へのハードリンクへ
         // 書き込み先を移さない。ロックの前に見て、リンク先の正規の書き手の flock を一時的にも塞がない。SEC-1）。
         if !matches!(file.metadata(), Ok(m) if std::os::unix::fs::MetadataExt::nlink(&m) == 1) {
             return Err(unopenable());
         }
         let len = lock_and_size(&file)?;
+        let Some(mut guard) = lock_until(&self.inner, deadline) else {
+            return Err(timeout_error());
+        };
+        // 内部ロックを外していた間に writer が `file` へ替わることは無い（開き直しは直列化されている）が、取り直した後にも
+        // 確かめ、同じなら切り替えない。
+        if writes_to(&guard, &file) {
+            return Err(unopenable());
+        }
         self.flush_old(&mut guard)?;
         #[cfg(test)]
         self.run_hook(&self.faults.before_commit);
@@ -753,7 +829,7 @@ impl CriFileSink {
 
     /// 確定点。`gate`（呼び出し元のロックの下の世代確認）の中で、期限を再確認して `slot` の新しい writer へメモリ上で
     /// 差し替える（`slot` が空なら writer は残して残りだけを `len` から数え直す）。I/O をしない（旧 writer は flush 済みで、
-    /// 取り外した旧 writer の close は関門の外）。期限切れ・世代の終了なら何も変えず `Err`（`slot` のファイルは呼び出し側が消す）。
+    /// 取り外した旧 writer の close は関門の外）。期限切れ・世代の終了なら何も変えず `Err`（`slot` のファイルは呼び出し側が外す）。
     /// ロック順は sink の内部ロック（`guard`）→ 呼び出し元のロック（`gate` の中）で、逆向きに取る経路は無い。
     #[cfg(target_os = "linux")]
     fn commit_switch(
@@ -879,7 +955,7 @@ impl LogSink for CriFileSink {
     /// `O_CREAT | O_EXCL` で作る（他者が先に作っていれば `EEXIST` で既存として開き直す）。検証・ロックした fd がそのまま
     /// 新しい writer になり、名前の引き直しも一時ファイルも使わない。待ちうる処理（開く・作る・ロック・メタデータ・旧 writer の
     /// flush）はすべて確定の前に済ませ、確定は `gate` の下で期限と世代を再確認してメモリ上で差し替えるだけにする
-    /// （`commit_switch`）。確定できなければ自分で作ったファイルを消す（同じ inode のときだけ）。旧 writer の flush が
+    /// （`commit_switch`）。確定できなければ自分で作ったファイルを元の名前から外す（[`discard_created`]）。旧 writer の flush が
     /// 失敗したら切り替えず `Err`（旧 writer と未書き込みの行を残し、再試行できる）。総量の上限は新しいファイルの大きさから
     /// 数え直す。上限到達で止まった状態（`Failed`）からもここで再開し、失敗の記録は差し替えと同じ `Mutex` の下で解除される。
     ///
@@ -887,7 +963,7 @@ impl LogSink for CriFileSink {
     /// 別 open file description のロックは衝突するため、旧 writer を残して flush し、大きさだけ数え直す。書き込みと同じ
     /// `Mutex` で直列化され、行の途中（部分行 `P` の続き）でも呼べる。`Mutex` の待ちは `deadline` まで、ファイルのロックの待ちは
     /// 最大 250ms（`LOCK_GRACE`）。ファイルの `open` 自体は期限で中断できない（呼び出し元は専用スレッドで実行すること）。
-    /// Linux のみ（`openat`・`unlinkat` を使う。他の OS は `Unimplemented`）。
+    /// Linux のみ（`openat`・`renameat2`・`unlinkat` を使う。他の OS は `Unimplemented`）。
     fn reopen(&self, deadline: Instant, gate: ReopenGate<'_>) -> Result<RetiredWriter, TraitError> {
         #[cfg(target_os = "linux")]
         {
@@ -1721,8 +1797,18 @@ mod tests {
             assert_eq!(read(&rotated), "");
         }
 
+        /// CRI-2・SEC-1・#4652: 親の検査は `check_dir` の実体パスではなく元のパスを `O_NOFOLLOW` で辿る。root 所有の
+        /// symlink の祖先（`/proc/self`）を含むパスは拒否し、同じディレクトリを実体パス（`/proc/<pid>`）で渡せば通る。
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn cri2_4652_verified_dir_does_not_follow_root_owned_symlink_ancestor() {
+            assert!(open_verified_dir(Path::new("/proc/self/fd")).is_err());
+            let real = std::path::PathBuf::from(format!("/proc/{}/fd", std::process::id()));
+            assert!(open_verified_dir(&real).is_ok());
+        }
+
         /// CRI-2・SUP-7・#4652（D）: ファイルを作った後にロックが取れず失敗しても、元のパスにファイルが残らない
-        /// （別の書き手が作ったファイルのロックを持つ場面を注入）。旧 writer は生きている。
+        /// （別の書き手が作ったファイルのロックを持つ場面を注入）。退避名も残らない。旧 writer は生きている。
         #[cfg(target_os = "linux")]
         #[test]
         fn cri2_4652_reopen_lock_failure_leaves_no_file() {
@@ -1880,12 +1966,13 @@ mod tests {
                 .expect("chmod back");
         }
 
-        /// CRI-2・SUP-7・#4652（C）: 確定点（関門）で稼働中でなくなっていたら（終了の割り込みを注入）、新しいファイルを
-        /// 残さず、旧 writer を変えない。確定の関数は呼ばれない。
+        /// CRI-2・SUP-7・#4652（C）: 確定点（関門）で稼働中でなくなっていたら（終了の割り込みを注入）、新しいファイルを残さず、
+        /// 旧 writer を変えない。確定の関数は呼ばれない。kubelet が失敗の後に回転済みのログを元の名前へ rename で戻すと、
+        /// 回転済みのログは 1 行も欠けず元の名前に残り、旧 writer の追記もそこへ続く。
         #[cfg(target_os = "linux")]
         #[test]
-        fn cri2_4652_reopen_refused_at_commit_leaves_no_file_and_does_not_switch() {
-            let (t, _path, rotated, sink) = rotated_sink("reopen-exit");
+        fn cri2_4652_reopen_refused_at_commit_keeps_rotated_log_and_does_not_switch() {
+            let (t, path, rotated, sink) = rotated_sink("reopen-exit");
             let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
             let r = running.clone();
             *sink.faults.before_commit.lock().expect("lock") = Some(Box::new(move |_| {
@@ -1908,6 +1995,13 @@ mod tests {
             sink.append(StreamKind::Stdout, b"old").expect("old writer");
             sink.flush().expect("flush");
             assert_eq!(read(&rotated).lines().count(), 1);
+            // kubelet の後始末: 回転済みのログを元の名前へ戻す。
+            std::fs::rename(&rotated, path.as_str()).expect("rename back");
+            sink.append(StreamKind::Stdout, b"after")
+                .expect("old writer");
+            sink.flush().expect("flush");
+            assert_eq!(names(&t.0), ["0.log"]);
+            assert_eq!(read(Path::new(path.as_str())).lines().count(), 2);
         }
 
         /// CRI-2・SEC-1・#4652（P0）: 確定しなかったときの後始末は、自分が作った inode のときだけ消す。名前が他者のファイルに
@@ -1941,6 +2035,40 @@ mod tests {
             sink.append(StreamKind::Stdout, b"old").expect("old writer");
             sink.flush().expect("flush");
             assert_eq!(read(&rotated).lines().count(), 1);
+        }
+
+        /// CRI-2・SUP-7・REPAIR-4・#4652: 確定できなかった後始末の前に、kubelet が回転済みのログを元の名前へ rename で戻して
+        /// いた（作った空のファイルを置き換えた）場面。後始末は退避名へ移して inode を照合し、自分のものでないので元の名前へ
+        /// 戻す（戻されたログを消さない）。退避名は残らず、回転済みのログは 1 行も欠けない。
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn cri2_4652_discard_keeps_log_restored_by_kubelet_before_cleanup() {
+            let (t, path, rotated, sink) = rotated_sink("reopen-restored");
+            sink.append(StreamKind::Stdout, b"kept").expect("append");
+            sink.flush().expect("flush");
+            let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let r = running.clone();
+            let back = rotated.clone();
+            *sink.faults.before_commit.lock().expect("lock") = Some(Box::new(move |target| {
+                std::fs::rename(&back, target).expect("kubelet restores the rotated log");
+                r.store(false, Ordering::SeqCst);
+            }));
+            let gate = |f: &mut dyn FnMut()| {
+                let ok = running.load(Ordering::SeqCst);
+                if ok {
+                    f();
+                }
+                ok
+            };
+            let e = sink.reopen(in_secs(5), &gate).expect_err("refused");
+            assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+            assert_eq!(names(&t.0), ["0.log"]);
+            sink.append(StreamKind::Stdout, b"after")
+                .expect("old writer");
+            sink.flush().expect("flush");
+            let restored = read(Path::new(path.as_str()));
+            assert_eq!(restored.lines().count(), 2, "{restored}");
+            assert!(restored.ends_with(" stdout F after\n"), "{restored}");
         }
 
         /// REPAIR-5・CRI-2・#4652（B）: 待ちうる処理の後の確定点で期限が切れていたら、何も差し替えず作ったファイルも残さない。
@@ -1982,7 +2110,7 @@ mod tests {
         }
 
         /// REPAIR-5・CRI-2・#4652（B）: 期限を過ぎた要求は何も作らず何も差し替えない。書き込みがロックを持つ間は期限で
-        /// 戻り（有限時間）、そのロックが空いた後も新しいファイルは作られない。
+        /// 戻り（有限時間）、そのロックが空いた後も新しいファイルは残らない。
         #[cfg(target_os = "linux")]
         #[test]
         fn repair5_4652_reopen_after_deadline_creates_nothing_and_switches_nothing() {

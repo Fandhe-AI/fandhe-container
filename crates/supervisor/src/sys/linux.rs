@@ -143,8 +143,18 @@ unsafe extern "C" {
     // （`open_log_at`・`open_path_at`。#4652）。`libc` との照合は `libc_abi`（#1840）。
     fn openat(dirfd: i32, pathname: *const std::ffi::c_char, flags: i32, ...) -> i32;
     // SAFETY（宣言そのものの妥当性）: `int unlinkat(int dirfd, const char *pathname, int flags)`。整数とポインタ引数のみ。
-    // 同上（`unlink_at`）。
+    // CRI ログの開き直しの後始末が、退避名へ移した自分のファイルを消すためだけに使う（`unlink_at`。#4652）。
     fn unlinkat(dirfd: i32, pathname: *const std::ffi::c_char, flags: i32) -> i32;
+    // SAFETY（宣言そのものの妥当性）: `int renameat2(int olddirfd, const char *oldpath, int newdirfd,
+    // const char *newpath, unsigned int flags)`（glibc 2.28 以降・musl 1.2.6 以降。core の `rename_noreplace_at` と同じ前提で、
+    // supervisor は core を通じて既にこのシンボルを要する）。CRI ログの開き直しの後始末だけが使う（`rename_noreplace_at`。#4652）。
+    fn renameat2(
+        olddirfd: i32,
+        oldpath: *const std::ffi::c_char,
+        newdirfd: i32,
+        newpath: *const std::ffi::c_char,
+        flags: u32,
+    ) -> i32;
 }
 
 /// `openat(2)` のフラグ（include/uapi/asm-generic/fcntl.h。x86_64・aarch64 で共通。arch で値が違う `O_NOFOLLOW`・`O_DIRECTORY` は
@@ -224,8 +234,36 @@ pub(crate) fn open_dir_at(
 /// `dir` の直下の名前を消す（`unlinkat(2)`。ディレクトリは消さない）。
 pub(crate) fn unlink_at(dir: BorrowedFd<'_>, name: &std::ffi::OsStr) -> io::Result<()> {
     let name = single_component(name)?;
-    // SAFETY: `dir` は呼び出しの間有効な fd、`name` は NUL 終端で呼び出しの間生きる。影響は `dir` 直下の 1 エントリの削除だけ。
+    // SAFETY: `dir` は呼び出しの間有効な fd、`name` は NUL 終端で呼び出しの間生き、上で 1 要素と検証済み。影響は `dir` 直下の
+    // 1 エントリの削除だけで、ポインタは保持されない。
     let rc = unsafe { unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) };
+    check(i64::from(rc)).map(|_| ())
+}
+
+/// include/uapi/linux/fs.h の `RENAME_NOREPLACE`（全アーキテクチャ共通）。`libc_abi`（#1840）が `libc` と照合する。
+const RENAME_NOREPLACE: u32 = 1;
+
+/// `dir` の直下の `old` を同じ `dir` の直下の `new` へ改名する（`renameat2(2)` の `RENAME_NOREPLACE`。`new` が既にあれば
+/// `AlreadyExists` で置き換えない）。名前は 1 要素だけ受ける（CRI-2・SEC-1・#4652）。
+pub(crate) fn rename_noreplace_at(
+    dir: BorrowedFd<'_>,
+    old: &std::ffi::OsStr,
+    new: &std::ffi::OsStr,
+) -> io::Result<()> {
+    let old = single_component(old)?;
+    let new = single_component(new)?;
+    // SAFETY: `dir` は呼び出しの間有効な fd、`old`・`new` は NUL 終端で呼び出しの間生き、上で 1 要素と検証済み（`dir` 直下の
+    // エントリだけが対象で、中間要素の symlink は辿られない）。flags は `RENAME_NOREPLACE` だけで改名先を置き換えない。副作用は
+    // 1 エントリの改名だけで、ポインタは保持されない。
+    let rc = unsafe {
+        renameat2(
+            dir.as_raw_fd(),
+            old.as_ptr(),
+            dir.as_raw_fd(),
+            new.as_ptr(),
+            RENAME_NOREPLACE,
+        )
+    };
     check(i64::from(rc)).map(|_| ())
 }
 
@@ -1721,12 +1759,27 @@ mod libc_abi {
         libc::c_int,
         ...
     ) -> libc::c_int = libc::openat;
-    const _: unsafe extern "C" fn(libc::c_int, *const libc::c_char, libc::c_int) -> libc::c_int =
-        unlinkat;
     // `openat` の可変長部へ渡す mode（`u32`）が `mode_t` と同じ型であること（fn 型の照合には現れない）。
     const _: libc::mode_t = super::LOG_CREATE_MODE;
     const _: unsafe extern "C" fn(libc::c_int, *const libc::c_char, libc::c_int) -> libc::c_int =
+        unlinkat;
+    const _: unsafe extern "C" fn(libc::c_int, *const libc::c_char, libc::c_int) -> libc::c_int =
         libc::unlinkat;
+    const _: unsafe extern "C" fn(
+        libc::c_int,
+        *const libc::c_char,
+        libc::c_int,
+        *const libc::c_char,
+        libc::c_uint,
+    ) -> libc::c_int = renameat2;
+    const _: unsafe extern "C" fn(
+        libc::c_int,
+        *const libc::c_char,
+        libc::c_int,
+        *const libc::c_char,
+        libc::c_uint,
+    ) -> libc::c_int = libc::renameat2;
+    const _: () = assert!(super::RENAME_NOREPLACE == libc::RENAME_NOREPLACE);
     // 試験 repair5_connect_unix_nonblocking_returns_wouldblock_when_backlog_is_full の関数内宣言 `listen` は
     // 項目として参照できないため、試験に書いた型 `unsafe extern "C" fn(i32, i32) -> i32` へ libc を代入して照合する。
     const _: unsafe extern "C" fn(i32, i32) -> i32 = libc::listen;

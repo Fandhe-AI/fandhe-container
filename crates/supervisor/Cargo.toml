@@ -115,7 +115,7 @@ start-status-test-support = []
 # `cargo test --workspace`・`make test-integration` の既定のテスト集合から外れないようにする（TASK-163 追補・#1460）。
 # 通常のビルド（`cargo build`・リリース成果物）は dev-dependency を解決しないため、feature は無効のまま。
 [dev-dependencies]
-fandhe-container-supervisor = { path = ".", features = ["exec-test-support", "vm-keeper"] }
+fandhe-container-supervisor = { path = ".", features = ["exec-test-support", "vm-keeper", "start-status-test-support"] }
 
 # 自前 FFI 宣言と libc のコンパイル時照合（`src/sys/linux.rs` の `libc_abi`。#1840・#1318・MVM-4・REPAIR-12。
 # 方式は docs/design/ffi-libc-check.md）。dev-dependencies のみで製品コードの依存には入れない。sys は Linux 限定。

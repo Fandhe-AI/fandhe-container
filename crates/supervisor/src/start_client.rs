@@ -433,6 +433,21 @@ fn classify_launcher(path: &Path, euid: u32) -> LauncherPresence {
 }
 
 /// CLI の実体パスと同じディレクトリの固定名から supervisor の実行ファイルを決める（`PATH` 探索をしない。純関数）。
+/// 試験用の注入は拒否を足すだけにする（SEC-5・PLUG-11・#4709）。注入の本文が `privilege_gate` で拒否・失敗になるなら
+/// その本文を返して同じ拒否にする。通るなら実の status（`real`）を返し、ランチャー・user マネージャのソケットの
+/// 所有者検査に使う実効 uid を実プロセスから取る（注入で信頼の基準を変えない）。
+#[cfg(feature = "start-status-test-support")]
+fn injected_or_real_status(
+    injected: Option<String>,
+    real: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    if privilege_gate(injected.as_deref()).is_err() {
+        injected
+    } else {
+        real()
+    }
+}
+
 fn supervisor_path_beside(cli_exe: &Path) -> Result<PathBuf, OciRuntimeError> {
     match cli_exe.parent() {
         Some(dir) if dir.is_absolute() => Ok(dir.join(SUPERVISOR_FILE_NAME)),
@@ -651,7 +666,9 @@ impl SupervisorLaunch {
         locate: impl FnOnce(u32) -> Result<PathBuf, OciRuntimeError>,
         read_status: impl FnOnce() -> Option<String>,
     ) -> Result<Self, OciRuntimeError> {
-        Self::resolve_with_status(exe, locate, read_status)
+        Self::resolve_with_status(exe, locate, || {
+            injected_or_real_status(read_status(), read_self_status)
+        })
     }
 
     fn resolve_with_status(
@@ -756,6 +773,35 @@ mod tests {
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
+
+    /// SEC-5・PLUG-11・#4709: 注入が拒否・失敗なら注入の本文で拒否し、通るなら実の status を使う（所有者検査の基準の
+    /// 実効 uid を注入で変えない）。
+    #[cfg(feature = "start-status-test-support")]
+    #[test]
+    fn sec5_4709_injected_status_only_adds_rejection() {
+        let st = |uid: &str| {
+            format!(
+                "Name:\tx\nUid:\t{uid}\nGid:\t1000\t1000\t1000\t1000\nGroups:\t\nNoNewPrivs:\t0\nCapInh:\t0000000000000000\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\nCapBnd:\t000001ffffffffff\nCapAmb:\t0000000000000000\n"
+            )
+        };
+        let real = st("1000\t1000\t1000\t1000");
+        for uid in ["0\t0\t0\t0", "1000\t0\t1000\t1000", "1000\t1000\t1000\t0"] {
+            let injected = st(uid);
+            let got = injected_or_real_status(Some(injected.clone()), || {
+                panic!("the real status must not be needed when the injection is refused")
+            });
+            assert_eq!(got.as_deref(), Some(injected.as_str()), "{uid}");
+        }
+        assert_eq!(
+            injected_or_real_status(None, || panic!("an unreadable injection is refused")),
+            None
+        );
+        // 実効 uid の違う非 root を注入しても、使うのは実の本文（所有者検査の基準は実プロセスの euid）。
+        let got =
+            injected_or_real_status(Some(st("4242\t4242\t4242\t4242")), || Some(real.clone()));
+        assert_eq!(got.as_deref(), Some(real.as_str()));
+        assert_eq!(privilege_gate(got.as_deref()).ok(), Some(1000));
+    }
 
     /// テスト用の一意な一時ディレクトリ（Drop で削除）。
     struct TmpDir(

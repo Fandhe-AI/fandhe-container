@@ -154,8 +154,11 @@ impl Rig {
     }
 
     fn reopen(&self) -> Result<(), TraitError> {
-        ControlReopenLog::new(self.state())
-            .reopen(&self.id, Instant::now() + Duration::from_secs(5))
+        ControlReopenLog::new(self.state()).reopen(
+            &self.id,
+            Instant::now() + Duration::from_secs(5),
+            &NOT_CANCELLED,
+        )
     }
 }
 
@@ -277,7 +280,7 @@ fn sup7_4652_old_supervisor_malformed_is_unavailable() {
             s.write_all(&ResponseFrame { reason }.encode()).unwrap();
         });
         let e = ControlReopenLog::new(state)
-            .reopen(&id, Instant::now() + Duration::from_secs(5))
+            .reopen(&id, Instant::now() + Duration::from_secs(5), &NOT_CANCELLED)
             .unwrap_err();
         assert_eq!(e.code(), ErrorCode::Unavailable, "{reason:?}");
         assert_eq!(e.message(), "the supervisor control channel is unavailable");
@@ -301,7 +304,7 @@ fn sup7_4652_no_supervisor_is_unavailable() {
         .unwrap();
     let id = ContainerId::new("nosup").unwrap();
     let e = ControlReopenLog::new(state)
-        .reopen(&id, Instant::now() + Duration::from_secs(2))
+        .reopen(&id, Instant::now() + Duration::from_secs(2), &NOT_CANCELLED)
         .unwrap_err();
     assert_eq!(e.code(), ErrorCode::Unavailable);
 }
@@ -346,6 +349,9 @@ fn exchange_raw(path: &Path, frame: &[u8]) -> ControlReason {
     ControlReason::from_u8(*resp.last().unwrap()).unwrap()
 }
 
+/// 取り消さない呼び出しの旗。
+static NOT_CANCELLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// 開き直しの途中で止まる sink（ログのファイルシステムが応答しない場面）。解放後に、sink が見る期限と許可を記録する。
 struct StalledSink {
     entered: std::sync::Mutex<std::sync::mpsc::Sender<()>>,
@@ -388,7 +394,11 @@ fn repair5_4652_stalled_reopen_does_not_block_other_requests() {
     let state = rig.state();
     let id = rig.id.clone();
     let client = std::thread::spawn(move || {
-        ControlReopenLog::new(state).reopen(&id, Instant::now() + Duration::from_millis(600))
+        ControlReopenLog::new(state).reopen(
+            &id,
+            Instant::now() + Duration::from_millis(600),
+            &NOT_CANCELLED,
+        )
     });
     entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
 
@@ -411,7 +421,7 @@ fn repair5_4652_stalled_reopen_does_not_block_other_requests() {
     );
     assert!(started.elapsed() < Duration::from_secs(2));
 
-    // クライアントは期限で返る。その後に解放された sink は、期限切れを見る。
+    // クライアントは期限で返る（接続を閉じる）。その後に解放された sink は、期限切れを見て、関門も要求元の切断で拒否する。
     let e = client.join().unwrap().unwrap_err();
     assert_eq!(e.code(), ErrorCode::Timeout);
     release_tx.send(()).unwrap();
@@ -419,5 +429,43 @@ fn repair5_4652_stalled_reopen_does_not_block_other_requests() {
     while seen.lock().unwrap().is_none() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(5));
     }
-    assert_eq!(*seen.lock().unwrap(), Some((true, true)));
+    assert_eq!(*seen.lock().unwrap(), Some((true, false)));
+}
+
+/// CRI-2・REPAIR-5・#4652: 要求元が取り消しの旗を立てると、クライアントは期限を待たずに接続を閉じて戻り、解放された
+/// sink の確定の関門は（期限内でも）要求元の切断を見て拒否する（RPC の取り消し後に切り替えを確定しない）。
+#[test]
+fn cri2_4652_cancelled_reopen_closes_and_gate_refuses() {
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let stalled = Arc::new(StalledSink {
+        entered: std::sync::Mutex::new(entered_tx),
+        release: std::sync::Mutex::new(release_rx),
+        seen: Arc::clone(&seen),
+    });
+    let rig = Rig::start_with("cancel", false, true, Some(stalled));
+    let state = rig.state();
+    let id = rig.id.clone();
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let c = Arc::clone(&cancel);
+    let client = std::thread::spawn(move || {
+        ControlReopenLog::new(state).reopen(&id, Instant::now() + Duration::from_secs(5), &c)
+    });
+    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let started = Instant::now();
+    cancel.store(true, std::sync::atomic::Ordering::Release);
+    let e = client.join().unwrap().unwrap_err();
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(e.code(), ErrorCode::Unavailable);
+    release_tx.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while seen.lock().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(*seen.lock().unwrap(), Some((false, false)));
 }

@@ -458,7 +458,10 @@ fn handle_reopen_log(
     let spawned = std::thread::Builder::new()
         .name("control-reopen-log".to_owned())
         .spawn(move || {
-            let result = hub.reopen_log(deadline, &|f| permit.commit(f));
+            // 確定の直前に要求元の切断を見る（RPC の取り消しで要求元が接続を閉じていたら確定しない。待ちの無い poll 1 回で、
+            // 関門の中で待たない。#4652）。確定点を通った後の取り消しは閉じられない（docs の「ReopenContainerLog との関係」）。
+            let result =
+                hub.reopen_log(deadline, &|f| !requester_gone(&stream) && permit.commit(f));
             // 退役した旧 writer は応答の後に閉じる（close(2) を応答の経路に載せない。#4652）。
             let mut retired = None;
             let reason = match result {
@@ -483,6 +486,15 @@ fn handle_reopen_log(
             log_control_event("control_reopen_log_spawn_failed", None);
             Some(ControlReason::Internal)
         }
+    }
+}
+
+/// 要求元が接続を閉じた（`POLLRDHUP` / `POLLHUP` / `POLLERR`）か。poll の失敗も切断として扱う（確定しない側へ倒す）。
+fn requester_gone(stream: &UnixStream) -> bool {
+    use std::os::fd::AsFd as _;
+    match crate::sys::poll_revents_now(stream.as_fd(), crate::sys::POLL_RDHUP) {
+        Ok(rev) => rev & (crate::sys::POLL_RDHUP | crate::sys::POLL_GONE_MASK) != 0,
+        Err(_) => true,
     }
 }
 

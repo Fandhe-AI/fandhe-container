@@ -135,14 +135,23 @@ impl ControlReopenLog {
     /// unavailable`、開き直せない（親の検査・別の書き手など。既存の書き込み先は変わらない）は `FailedPrecondition`:
     /// `the cri log file cannot be reopened`、それ以外の失敗は `Internal`: `the cri log reopen failed`、期限切れは
     /// `Timeout`、別 uid のソケットは `PermissionDenied`。
-    pub fn reopen(&self, id: &ContainerId, deadline: Instant) -> Result<(), TraitError> {
+    ///
+    /// `cancel` が立ったら（要求元の RPC が取り消された・期限切れで破棄された）、応答を待たずに接続を閉じて戻る。
+    /// supervisor は確定の直前に接続の切断を確かめ、切れていれば確定しない（確定点を通った後の取り消しは閉じられない。
+    /// docs/design/cri-log-partial-lines.md「ReopenContainerLog との関係」）。
+    pub fn reopen(
+        &self,
+        id: &ContainerId,
+        deadline: Instant,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), TraitError> {
         #[cfg(target_os = "linux")]
         {
-            linux::reopen_log(&self.state_root, id, deadline)
+            linux::reopen_log(&self.state_root, id, deadline, cancel)
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = (&self.state_root, id, deadline);
+            let _ = (&self.state_root, id, deadline, cancel);
             Err(TraitError::new(
                 fandhe_container_core::traits::ErrorCode::Unimplemented,
                 "the supervisor control channel requires Linux",
@@ -458,12 +467,14 @@ mod linux {
         state_root: &Path,
         id: &ContainerId,
         deadline: Instant,
+        cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<(), TraitError> {
         let usable = deadline.saturating_duration_since(Instant::now());
         if usable <= DEADLINE_MARGIN {
             return Err(timeout());
         }
-        let reason = exchange(state_root, Request::ReopenLog, id, deadline)?;
+        let reason = exchange_with_fds(state_root, Request::ReopenLog, id, deadline, Some(cancel))
+            .map(|(reason, _fds, _stream)| reason)?;
         reopen_log_result(reason)
     }
 
@@ -531,6 +542,46 @@ mod linux {
         }
     }
 
+    /// 応答の待ちを取り消せる [`read_exact_until`]（CRI-2・REPAIR-5・#4652）。読み取りの期限を
+    /// [`CANCEL_POLL`] ごとに切って `cancel` を見て、立っていれば `Interrupted` で戻る（呼び出し元が接続を drop して閉じ、
+    /// supervisor は切断を確定の直前に見る）。
+    fn read_exact_until_cancelled(
+        stream: &mut UnixStream,
+        buf: &mut [u8],
+        deadline: Instant,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> io::Result<()> {
+        use std::io::Read as _;
+        let mut filled = 0usize;
+        while filled < buf.len() {
+            if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            stream.set_read_timeout(Some(remaining.min(CANCEL_POLL)))?;
+            let Some(rest) = buf.get_mut(filled..) else {
+                return Err(io::ErrorKind::InvalidInput.into());
+            };
+            match stream.read(rest) {
+                Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+                Ok(n) => filled = filled.saturating_add(n),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                    ) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    /// 取り消しの旗を見る間隔（応答の待ちを切る粒度）。
+    const CANCEL_POLL: Duration = Duration::from_millis(50);
+
     fn io_error(e: &io::Error) -> TraitError {
         crate::control::os_errno::record(e);
         if e.kind() == io::ErrorKind::TimedOut {
@@ -547,16 +598,19 @@ mod linux {
         id: &ContainerId,
         deadline: Instant,
     ) -> Result<ControlReason, TraitError> {
-        exchange_with_fds(state_root, request, id, deadline).map(|(reason, _fds, _stream)| reason)
+        exchange_with_fds(state_root, request, id, deadline, None)
+            .map(|(reason, _fds, _stream)| reason)
     }
 
     /// [`exchange`] と同じだが、応答に添えられた fd と接続も受け取る（ExecHandoverRequest だけが fd つきの応答を受ける。
     /// 他の要求では `fds` は常に空で、通常の `read` 経路のまま）。受け取った fd は呼び出し側が検証し、想定外なら drop で閉じる。
+    /// `cancel` があれば、応答の待ちの間に旗を見て、立ったら接続を閉じて `Cancelled` 相当（`Unavailable`）で戻る。
     fn exchange_with_fds(
         state_root: &Path,
         request: Request,
         id: &ContainerId,
         deadline: Instant,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<(ControlReason, Vec<OwnedFd>, UnixStream), TraitError> {
         let euid = effective_uid()?;
         let dir = open_state_dir(state_root, id, euid)?;
@@ -651,7 +705,11 @@ mod linux {
             let (reason, fds) = read_response_with_fds(&mut stream, deadline)?;
             return Ok((reason, fds, stream));
         }
-        read_exact_until(&mut stream, &mut head, deadline).map_err(|e| io_error(&e))?;
+        match cancel {
+            Some(cancel) => read_exact_until_cancelled(&mut stream, &mut head, deadline, cancel),
+            None => read_exact_until(&mut stream, &mut head, deadline),
+        }
+        .map_err(|e| io_error(&e))?;
         FrameHeader::decode(&head)
             .and_then(FrameHeader::expect_response)
             .map_err(|r| r.to_error().unwrap_or_else(unavailable))?;
@@ -777,8 +835,13 @@ mod linux {
         if usable <= DEADLINE_MARGIN {
             return Err(timeout());
         }
-        let (reason, fds, stream) =
-            exchange_with_fds(state_root, Request::ExecHandover { pid }, id, deadline)?;
+        let (reason, fds, stream) = exchange_with_fds(
+            state_root,
+            Request::ExecHandover { pid },
+            id,
+            deadline,
+            None,
+        )?;
         if let Some(e) = reason.to_error() {
             return Err(e);
         }
@@ -831,6 +894,7 @@ mod linux {
             },
             id,
             deadline,
+            None,
         )?;
         match reason {
             ControlReason::Ok => {}

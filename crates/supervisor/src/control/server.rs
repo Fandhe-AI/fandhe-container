@@ -471,10 +471,11 @@ fn handle_reopen_log(
                 Err(_) if !permit.commit(&mut || {}) => ControlReason::ContainerExited,
                 Err(e) => reopen_failure(e.code()),
             };
-            drop(permit);
             respond(&mut stream, reason);
             observer.record_reopen_log(reason == ControlReason::Ok, started.elapsed());
+            // 枠は旧 fd を閉じ終えてから外す（close(2) が止まっても止まるスレッドは 1 本に限られ、次の開き直しは `Busy`）。
             drop(retired);
+            drop(permit);
         });
     match spawned {
         Ok(_) => None,

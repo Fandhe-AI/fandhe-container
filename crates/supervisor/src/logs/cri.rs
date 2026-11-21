@@ -674,12 +674,12 @@ impl CriFileSink {
             // 同じ inode: writer は残し、残りだけを数え直す（`slot` は空）。
             return self.commit_switch(&mut guard, &mut None, meta.len(), deadline, gate);
         }
-        let len = lock_and_size(&file)?;
         // 別 inode の既存ファイルはリンクが 1 本のものだけ受ける（ログディレクトリの外の inode へのハードリンクへ
-        // 書き込み先を移さない。SEC-1）。
+        // 書き込み先を移さない。ロックの前に見て、リンク先の正規の書き手の flock を一時的にも塞がない。SEC-1）。
         if !matches!(file.metadata(), Ok(m) if std::os::unix::fs::MetadataExt::nlink(&m) == 1) {
             return Err(unopenable());
         }
+        let len = lock_and_size(&file)?;
         self.flush_old(&mut guard)?;
         #[cfg(test)]
         self.run_hook(&self.faults.before_commit);

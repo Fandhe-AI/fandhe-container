@@ -510,6 +510,8 @@ mod tests {
         use std::io::Write as _;
         let (mut r, mut w) = std::io::pipe().unwrap();
         w.write_all(b"boom").unwrap();
+        // 回帰して EOF 待ちに戻っても書き込み端を独立に閉じ、経過時間の assert で失敗させる（REPAIR-5）。
+        let _w = crate::deadline_read::close_after(w, Duration::from_secs(5));
         let t0 = Instant::now();
         let got = drain_capped(&mut r, Duration::from_millis(200));
         let el = t0.elapsed();
@@ -537,9 +539,13 @@ mod tests {
 
     /// REPAIR-5・REPAIR-12・REPAIR-10 (d)・#4733: 別プロセスが stderr の書き込み端を持ち続けても、停止経路
     /// `kill_and_reap` は EOF を待たず、終了状態と読めた stderr を期限内（`STDERR_DRAIN_TIMEOUT` 前後）に返す。
-    /// holder 役の `sh`（自分のプロセスグループ）が孫（`sleep 20`）に stderr を継承させて診断行を書き、stdout へ
-    /// `ready` を出して `exec sleep 100` に置き換わった後に SIGKILL で回収される。孫（`read _`）は試験が持つ pipe を
-    /// stdin（holder 役が fd 3 へ複製して継承）にし、`HolderGuard` が書き込み端を閉じると EOF で自分で終わる。
+    /// holder 役の `sh`（プロセスグループは試験と同じ）は、試験が持つ pipe の読み端を fd 3 へ複製して孫に stdin として
+    /// 渡し、stderr を継承させる。孫は `timeout -s KILL 8 sh -c 'read _'`（`timeout` とその子の 2 プロセス）で、
+    /// stderr の書き込み端を持ったまま stdin の EOF か 8 秒の経過で自分で終わる（8 秒は読み取りが回帰して EOF 待ちに
+    /// 戻ったときの独立の期限で、そのとき経過時間の assert が失敗を報告する）。holder 役は診断行を stderr へ書き、
+    /// stdout へ `ready` を出して `exec sleep 100` に置き換わる。`ready` の受信で確かめられるのは診断行の書き込みまでで、
+    /// SIGKILL は holder 役（`sleep 100` に置き換わる前でも後でも同じ pid）へ送る。`HolderGuard` の drop で書き込み端が
+    /// 閉じ、孫は EOF で終わる。
     #[test]
     fn repair5_4733_kill_and_reap_returns_without_eof_when_writer_is_held() {
         let (hold_r, hold_w) = std::io::pipe().unwrap();
@@ -547,7 +553,7 @@ mod tests {
             .args([
                 "-c",
                 // 非同期コマンドの stdin は /dev/null になるため、fd 3 へ複製してから孫へ渡す。
-                "exec 3<&0; read _ <&3 & echo diag-line >&2; echo ready; exec sleep 100",
+                "exec 3<&0; timeout -s KILL 8 sh -c 'read _' <&3 & echo diag-line >&2; echo ready; exec sleep 100",
             ])
             .stdin(Stdio::from(hold_r))
             .stdout(Stdio::piped())

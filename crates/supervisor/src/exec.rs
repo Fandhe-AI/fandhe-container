@@ -3368,7 +3368,9 @@ mod tests {
     /// REPAIR-5・#4733: 結果行が無く書き込み端も閉じない場合、`read_worker_result_line` は期限で `Internal` を返す。
     #[test]
     fn repair5_4733_worker_result_read_times_out_as_internal() {
-        let (mut r, _w) = std::io::pipe().unwrap();
+        let (mut r, w) = std::io::pipe().unwrap();
+        // 回帰して EOF 待ちに戻っても書き込み端を独立に閉じ、経過時間の assert で失敗させる（REPAIR-5）。
+        let _w = crate::deadline_read::close_after(w, Duration::from_secs(5));
         let t0 = Instant::now();
         let err = read_worker_result_line(&mut r, Duration::from_millis(200)).unwrap_err();
         let el = t0.elapsed();

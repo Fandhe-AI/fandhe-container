@@ -83,18 +83,51 @@ pub(crate) fn read_capped_until(
     Ok(out)
 }
 
+/// 試験用: `w`（pipe の書き込み端など）を、`after` の経過か戻り値の drop の早い方で閉じる。読み取りが回帰して
+/// EOF 待ちに戻っても書き込み端が独立に閉じて呼び出しが戻り、各試験が経過時間の assert で失敗を報告できる
+/// （試験バイナリ全体の監視に頼らない。REPAIR-5）。
+#[cfg(test)]
+pub(crate) fn close_after<W: Send + 'static>(w: W, after: Duration) -> CloseAfter {
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let handle = std::thread::spawn(move || {
+        let _ = rx.recv_timeout(after);
+        drop(w);
+    });
+    CloseAfter(Some(tx), Some(handle))
+}
+
+/// [`close_after`] の戻り値。drop で即座に閉じさせ、閉じ終わるまで待つ。
+#[cfg(test)]
+pub(crate) struct CloseAfter(
+    Option<std::sync::mpsc::Sender<()>>,
+    Option<std::thread::JoinHandle<()>>,
+);
+
+#[cfg(test)]
+impl Drop for CloseAfter {
+    fn drop(&mut self) {
+        drop(self.0.take());
+        if let Some(h) = self.1.take() {
+            let _ = h.join();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write as _;
 
     const T: Duration = Duration::from_millis(200);
+    /// 書き込み端を独立に閉じるまでの時間（期待する読み取りの期限より十分後）。
+    const GUARD: Duration = Duration::from_secs(5);
 
     /// REPAIR-5・REPAIR-12: 書き込み端を閉じない子を模す。行が途中なら期限で戻り、読めた分を保持する。
     #[test]
     fn repair5_4733_partial_line_times_out_with_bytes_kept() {
         let (mut r, mut w) = std::io::pipe().unwrap();
         w.write_all(b"abc").unwrap();
+        let _w = close_after(w, GUARD);
         let t0 = Instant::now();
         let got = read_capped_until(&mut r, 4096, t0 + T, true);
         let el = t0.elapsed();
@@ -108,7 +141,8 @@ mod tests {
     /// REPAIR-5: 何も書かれず writer が残る場合も期限で戻る。
     #[test]
     fn repair5_4733_silent_writer_times_out_empty() {
-        let (mut r, _w) = std::io::pipe().unwrap();
+        let (mut r, w) = std::io::pipe().unwrap();
+        let _w = close_after(w, GUARD);
         let t0 = Instant::now();
         let got = read_capped_until(&mut r, 4096, t0 + T, false);
         let el = t0.elapsed();
@@ -124,6 +158,7 @@ mod tests {
     fn repair5_4733_newline_returns_immediately_and_discards_rest() {
         let (mut r, mut w) = std::io::pipe().unwrap();
         w.write_all(b"ok\nnext").unwrap();
+        let _w = close_after(w, GUARD);
         let t0 = Instant::now();
         let got = read_capped_until(&mut r, 4096, t0 + Duration::from_secs(5), true).unwrap();
         assert_eq!(got, b"ok\n");
@@ -140,6 +175,7 @@ mod tests {
     fn repair5_4733_expired_deadline_still_returns_readable_line() {
         let (mut r, mut w) = std::io::pipe().unwrap();
         w.write_all(b"ready\n").unwrap();
+        let _w = close_after(w, GUARD);
         let past = Instant::now() - Duration::from_millis(1);
         let got = read_capped_until(&mut r, 4096, past, true).unwrap();
         assert_eq!(got, b"ready\n");
@@ -150,6 +186,7 @@ mod tests {
     fn repair5_4733_expired_deadline_does_not_wait_when_nothing_readable() {
         let (mut r, mut w) = std::io::pipe().unwrap();
         w.write_all(b"abc").unwrap();
+        let _w = close_after(w, GUARD);
         let t0 = Instant::now();
         let got = read_capped_until(&mut r, 4096, t0 - Duration::from_millis(1), true);
         assert!(
@@ -176,6 +213,7 @@ mod tests {
     fn repair5_4733_cap_stops_reading() {
         let (mut r, mut w) = std::io::pipe().unwrap();
         w.write_all(&[b'a'; 100]).unwrap();
+        let _w = close_after(w, GUARD);
         let got =
             read_capped_until(&mut r, 10, Instant::now() + Duration::from_secs(5), false).unwrap();
         assert_eq!(got, [b'a'; 10]);

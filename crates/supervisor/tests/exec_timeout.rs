@@ -225,7 +225,7 @@ mod linux {
     /// REPAIR-5・REPAIR-12・REPAIR-10 (d)・SUP-6・#4733: worker が結果行を残さず 0 で終わり、別プロセスが結果 pipe の
     /// 書き込み端を持ち続けても、本番の回収経路（`collect_worker_result`）は EOF を待たず、約 1 秒で固定文言の
     /// `Internal` を返す。worker は `result_write_fd_for_test()` が示す結果 pipe の書き込み端を開き直して孫
-    /// （`sh -c 'read _'`）の stdout に持たせ、`skip_result_write_for_test()` で結果行を省いて 0 で戻る（fork ラッパーの
+    /// （`timeout -s KILL 8 sh -c 'read _'`）の stdout に持たせ、`skip_result_write_for_test()` で結果行を省いて 0 で戻る（fork ラッパーの
     /// `_exit` 経路で終わる）。孫の stdin は試験が持つ pipe の読み端で、試験が書き込み端（`_hold`）を閉じると EOF で
     /// 自分で終わる（pid・pgid の番号では kill しない。失敗の panic を含め `_hold` の drop で必ず終わる）。孫は worker の
     /// 子なので、worker の終了で init（または subreaper）へ付け替わって回収される（試験は回収しない）。
@@ -244,8 +244,11 @@ mod linux {
                     .unwrap();
                 // 回収しないのは意図的（worker の終了で init へ付け替わり、stdin の EOF で自分で終わる）。
                 #[allow(clippy::zombie_processes)]
-                let _c = std::process::Command::new("sh")
-                    .args(["-c", "read _"])
+                // `timeout` は読み取りが回帰して EOF 待ちに戻ったときの独立の期限（8 秒で書き込み端の持ち主が
+                // 自分で終わり、呼び出しが戻って経過時間の assert が失敗を報告する。この試験は fork のため単一
+                // スレッドで、期限のスレッドを立てられない。REPAIR-5）。
+                let _c = std::process::Command::new("timeout")
+                    .args(["-s", "KILL", "8", "sh", "-c", "read _"])
                     .stdin(hold_r)
                     .stdout(w)
                     .stderr(std::process::Stdio::null())

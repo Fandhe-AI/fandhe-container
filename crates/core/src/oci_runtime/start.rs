@@ -94,8 +94,8 @@
 //! cgroup・time も作成が未実装で、指定が無ければ OCI の規定どおりランタイムの namespace を引き継ぐ
 //! （cgroup の分離・制限は TASK-32・CORE-3 の範囲。REPAIR-3: 未実装であることを明示する）。
 //! - `linux.uidMappings` / `gidMappings` が非空（`reject_config_id_mappings`。SEC-5・CORE-6・TASK-40。
-//!   写像は launcher が権限モデルから導く。受けるかはオーナー判断待ちで #2240 と
-//!   `docs/design/config-id-mappings.md` に判断材料があり、決まるまで拒否のまま）
+//!   写像は launcher が権限モデルから導く。#2240 で拒否を維持と決定済み〔2026-11-13・案 A〕。
+//!   `InvalidArgument`・固定文言。`docs/design/config-id-mappings.md`）
 //! - `linux.readonlyPaths` / `maskedPaths` が暗黙の `/dev`・`/dev/pts`・`/dev/shm` と同じか祖先を指す
 //!   （`InvalidArgument`。fork・予約より前。SEC-2・CORE-5・#2015。子孫は受ける）
 //!
@@ -1568,18 +1568,19 @@ fn is_same_or_ancestor(candidate: &str, target: &str) -> bool {
         .is_some_and(|rest| rest.starts_with('/'))
 }
 
-/// config の `linux.uidMappings` / `gidMappings` が非空なら `Unimplemented` で拒否する（空配列は受ける）。
+/// config の `linux.uidMappings` / `gidMappings` が非空なら `InvalidArgument` で拒否する（空配列は受ける）。
 ///
 /// `start` の fork・予約より前に呼ばれる。ID 写像は launcher が権限モデルから導く（`RootlessSingleId` は
 /// 呼び出し側の euid / egid の単一写像、`RootlessSubordinateIds` は `/etc/subuid`・`/etc/subgid` の範囲写像）ため、
 /// config 指定を受けると SEC-5（コンテナ内 root をホストの非特権 UID へ写す）の契約を迂回しうる。
-/// 受けるか拒むかはオーナー判断待ち（#2240。SEC-5・CORE-6・TASK-40。判断材料は
-/// `docs/design/config-id-mappings.md`）。未決定のため code は `Unimplemented` のままで、
-/// 「拒むと決まった」場合は `InvalidArgument` へ替える案がある（REPAIR-3）。config の誤りであり
-/// 脱出の試行ではないため監査には記録しない。
+/// 拒否の維持は #2240 で決定済み（2026-11-13・案 A。SEC-5・CORE-6・TASK-40・MS-2。
+/// `docs/design/config-id-mappings.md`）。config の誤りであり脱出の試行ではないため監査には記録しない。
 fn reject_config_id_mappings(config: &OciConfig) -> Result<(), TraitError> {
     if !config.uid_mappings().is_empty() || !config.gid_mappings().is_empty() {
-        return Err(unsupported("linux.uidMappings / linux.gidMappings"));
+        return Err(TraitError::new(
+            ErrorCode::InvalidArgument,
+            "linux.uidMappings / linux.gidMappings are not accepted: ID mappings are derived from the runtime privilege model (SEC-5)",
+        ));
     }
     Ok(())
 }
@@ -2758,13 +2759,6 @@ mod tests {
                 "netns",
                 Box::new(|c| c["linux"]["namespaces"] = json!([{"type": "network"}])),
             ),
-            (
-                "uidmap",
-                Box::new(|c| {
-                    c["linux"]["uidMappings"] =
-                        json!([{"containerID": 0, "hostID": 1000, "size": 1}])
-                }),
-            ),
         ];
         for (name, mutate) in cases {
             let mut cfg = valid_config();
@@ -2800,7 +2794,7 @@ mod tests {
     }
 
     /// SEC-5・CORE-6・TASK-40（#2240）: config 指定の ID 写像は uid のみ・gid のみ・両方のどれでも
-    /// `Unimplemented` と固定文言で拒否し（launcher 呼び出し 0 回・状態は Created のまま）、空配列は受ける。
+    /// `InvalidArgument` と固定文言で拒否し（launcher 呼び出し 0 回・状態は Created のまま）、空配列は受ける。
     #[test]
     fn sec5_core6_start_rejects_config_id_mappings() {
         let map = json!([{"containerID": 0, "hostID": 1000, "size": 1}]);
@@ -2814,10 +2808,12 @@ mod tests {
             cfg["linux"]["uidMappings"] = uid;
             cfg["linux"]["gidMappings"] = gid;
             let err = start_rejected_after_rewrite(&format!("idmap-{name}"), &cfg);
-            assert_eq!(err.code(), ErrorCode::Unimplemented, "case {name}");
+            assert_eq!(err.code(), ErrorCode::InvalidArgument, "case {name}");
+            // 終了コードは InvalidArgument の値 2（ERR-2。旧 Unimplemented は 8）。
+            assert_eq!(err.exit_code().get(), 2, "case {name}");
             assert_eq!(
                 err.message(),
-                "start does not support yet: linux.uidMappings / linux.gidMappings",
+                "linux.uidMappings / linux.gidMappings are not accepted: ID mappings are derived from the runtime privilege model (SEC-5)",
                 "case {name}"
             );
         }

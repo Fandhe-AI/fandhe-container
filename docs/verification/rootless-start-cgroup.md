@@ -42,7 +42,7 @@ CLI と supervisor は同じディレクトリに置く（[linux.md](../setup/li
 
 [supervisor-measurement-runbook.md](supervisor-measurement-runbook.md#bundle-の用意) に従う。要点は次のとおり。
 
-- `config.json` の `linux.namespaces` に user namespace を指定する。`linux.uidMappings` / `linux.gidMappings` は省略するか空配列にする。非空にすると core の `reject_config_id_mappings` が `UNIMPLEMENTED` で拒否し、`prepare` に到達できない（config-id-mappings.md、SEC-5・CORE-6）。写像は launcher が権限モデルから導出する。runbook の「UID マッピングを入れる」は user namespace の指定の意味で読み、写像の配列は書かない
+- `config.json` の `linux.namespaces` に user namespace を指定する。`linux.uidMappings` / `linux.gidMappings` は省略するか空配列にする。非空にすると core の `reject_config_id_mappings` が `INVALID_ARGUMENT` で拒否する。拒否は supervisor の `prepare`（cgroup の配置の記録）の後の `claim_start` で起きるため、配置の記録が残り、同じ ID での再 `start` は `FAILED_PRECONDITION` になる。直すときは `delete` して作り直す（[id-mappings.md](../api/id-mappings.md)、SEC-5・CORE-6）。写像は launcher が権限モデルから導出する。runbook の「UID マッピングを入れる」は user namespace の指定の意味で読み、写像の配列は書かない
 - `process.args` は長時間動く静的リンクのプロセスにする
 - `linux.cgroupsPath` は書かない（`UNIMPLEMENTED` で拒否される。cgroups.md）
 - 資格情報を含めない

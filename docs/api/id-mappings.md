@@ -1,0 +1,20 @@
+# config の uidMappings・gidMappings の扱い
+
+OCI `config.json` の `linux.uidMappings` / `linux.gidMappings` は受けない（SEC-5・CORE-6・TASK-40・MS-2。判断は [#2240](https://github.com/Fandhe-AI/fandhe-container/issues/2240)、設計は [config-id-mappings.md](../design/config-id-mappings.md)）。
+
+## 挙動
+
+- `start` の検証が写像の検査に到達し（先に当たる検査は下の「検証の順序」）、config のパース時の検証（`size` が 0 の写像などはここで先に拒否される）を通った写像で、どちらかの配列が非空なら `INVALID_ARGUMENT`（終了コード 2）で拒否する。message は次の固定文言（config の値は含めない）。`linux.uidMappings / linux.gidMappings are not accepted: ID mappings are derived from the runtime privilege model (SEC-5)`
+- 変更前（#4711 より前）は同じ入力が `UNIMPLEMENTED`（終了コード 8。message `start does not support yet: linux.uidMappings / linux.gidMappings`）だった。終了コードや code で分岐している呼び出し元は、2 / `INVALID_ARGUMENT` へ移す
+- 検証の順序: start は config を順に検査し、最初に当たった誤りだけを返す。写像の検査（`reject_config_id_mappings`）より前に、エントリポイントの上限・`process.terminal`（launcher が対応しない場合 `UNIMPLEMENTED`）・ネットワーク構成の突き合わせなどの検査がある。それらに当たる config では、写像が非空でも先にそのエラーが返る。写像の検査と user namespace の必須の検査（`PERMISSION_DENIED`。下の「Docker / runc との差」）の相対順序は、写像の検査が先である。そのため写像の検査に到達した config では、写像が非空で user namespace も無い場合 `INVALID_ARGUMENT` になる。順序の正は `crates/core/src/oci_runtime/start.rs` の `build_spec_with_swap`
+- 空配列・省略は受ける
+- 拒否はプロセス起動・状態の予約より前で行い、新たな起動予約やプロセスは残らず、create 済みの状態レコードは `Created` のまま。監査ログには記録しない（config の誤りで、脱出の試行ではないため）
+- CLI の `start`（supervisor 経由）では、委譲 cgroup の準備（`prepare`）が先に走り、状態レコードに cgroup の配置を記録してから写像を拒否する。cgroup の削除は拒否の応答の後に supervisor が試みるもので、CLI が `INVALID_ARGUMENT` を返した時点で済んでいるとは限らない（削除に失敗することもある）。配置の記録は残る。そのため config を直して同じ ID で `start` し直すと `FAILED_PRECONDITION`（message `cgroup scope is already recorded; delete and recreate the container`）になる。直すときは `delete` してから作り直す
+
+## 受けない理由
+
+（SEC-5・CORE-6・TASK-40・MS-2）user namespace の ID 写像は、権限モデルから導く。rootless の単一写像は呼び出し側の euid / egid、範囲写像は `/etc/subuid`・`/etc/subgid` に従う。config で指定できると、コンテナ内 root をホストの非特権 UID へ写す SEC-5 の契約を迂回できるため。
+
+## Docker / runc との差
+
+runc は config の写像をそのままカーネルへ書き込む。本ランタイムは config の写像を受けず、権限モデルから導く。`linux.namespaces` の `user` は必須（無ければ `PERMISSION_DENIED`。ただし検証が写像の検査に到達し写像が非空なら、写像の検査が user namespace の検査より先のため `INVALID_ARGUMENT` が返る）で、写像の配列は省略するか空配列にする。

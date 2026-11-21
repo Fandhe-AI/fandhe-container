@@ -2,24 +2,24 @@
 
 OCI config の `linux.uidMappings` / `gidMappings` を受けるか拒むかの判断材料を整理する（SEC-5・CORE-6）。
 
-> **位置づけ**: 状態は **オーナー承認待ち**（[#2240](https://github.com/Fandhe-AI/fandhe-container/issues/2240)）。本書は決定ではなく判断材料である。決まるまで `start` は拒否のままにする（分離を緩めない）。
+> **位置づけ**: **決定済み（2026-11-13、案 A）**（[#2240](https://github.com/Fandhe-AI/fandhe-container/issues/2240)）。拒否を維持し、code は `InvalidArgument`・固定文言で確定する（実装は #4711）。利用者向けの説明は [docs/api/id-mappings.md](../api/id-mappings.md)。以下の選択肢は判断の経緯として残す。
 
 - 対象ビヘイビア: SEC-5（コンテナ内 root をホストの非特権 UID へ写す）・CORE-6（rootless）
 - タスク: TASK-40。関連: #2009・PR #2209（launcher 経由の subuid / subgid 範囲写像 `RootlessSubordinateIds`）
 
 ## 現状
 
-- `crates/core/src/oci_runtime/start.rs` の `reject_config_id_mappings` が、どちらかの配列が非空なら `Unimplemented`（message: `start does not support yet: linux.uidMappings / linux.gidMappings`）で拒否する。空配列は受ける。fork・予約より前で、プロセスも状態も残さない
+- `crates/core/src/oci_runtime/start.rs` の `reject_config_id_mappings` が、どちらかの配列が非空なら `InvalidArgument`（message: `linux.uidMappings / linux.gidMappings are not accepted: ID mappings are derived from the runtime privilege model (SEC-5)`。#4711 で旧 `Unimplemented` から変更）で拒否する。空配列は受ける。fork・予約より前で、新たな起動予約やプロセスは残らず、create 済みの状態レコードは `Created` のまま
 - パース段階（`config.rs`）で件数の上限（340。カーネルの上限）・`size` が 1 以上・`containerID + size` の桁あふれは検証済み
 - 写像は launcher が権限モデルから導く。`RootlessSingleId` は呼び出し側の euid / egid への単一写像、`RootlessSubordinateIds` は `/etc/subuid`・`/etc/subgid` 由来の範囲写像
 
 ## 選択肢
 
-### A. 拒否を維持して確定する（推奨）
+### A. 拒否を維持して確定する（採用・2026-11-13）
 
 写像は権限モデルから導く。config で指定させると launcher の SEC-5 の契約を迂回できてしまうため。
 
-- 決定後の変更案: code を `InvalidArgument` に替え、固定文言を `linux.uidMappings / linux.gidMappings are not accepted: ID mappings are derived from the runtime privilege model (SEC-5)` とする（config の値を含めない静的な文言）。空配列は従来どおり受ける
+- 決定後の変更（#4711 で実装済み）: code を `InvalidArgument` に替え、固定文言を `linux.uidMappings / linux.gidMappings are not accepted: ID mappings are derived from the runtime privilege model (SEC-5)` とする（config の値を含めない静的な文言）。空配列は従来どおり受ける
 - Docker / runc との差: runc は config の写像をそのまま書き込むが、本ランタイムは受けない。利用者向けの doc に書く
 
 ### B. 受ける
@@ -41,5 +41,6 @@ OCI config の `linux.uidMappings` / `gidMappings` を受けるか拒むかの�
 ## 本書の時点で済ませたこと・決定後に残る作業
 
 - 済み: 拒否を専用関数に切り出し、code と message の完全一致をテストで固定。コード中の「確認待ち」の参照先を #2240 と本書へ統一
-- 残り: A なら `InvalidArgument` への変更と doc。B なら上記の設計の実装（後続の実装 issue）
+- 決定（A）の後に #4711 で済ませたこと: `InvalidArgument` と固定文言への変更、利用者向けの [id-mappings.md](../api/id-mappings.md)
+- 残り: CRI の `userns_options.uids` / `gids` は `UNIMPLEMENTED` のまま拒否している（`crates/cri/src/bundle/spec.rs`）。決定（A）を CRI の写像にも及ぼして code を揃えるかは別に扱う
 - 監査（SEC-4）には記録しない。config の誤りであり、脱出の試行ではないため

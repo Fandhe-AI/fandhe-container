@@ -129,6 +129,16 @@ mod minimal_rootfs;
         any(target_arch = "x86_64", target_arch = "aarch64")
     )
 ))]
+#[path = "../../plugin/tests/support/json_lines_contract.rs"]
+mod json_lines_contract;
+
+#[cfg(all(
+    target_os = "linux",
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 #[path = "support/precondition.rs"]
 mod precondition;
 
@@ -179,6 +189,8 @@ mod linux {
     const OPT_ENV_LINE: &str = "stdout OPT_ENV observed-2761";
     /// create に渡す `--cap-drop`（Docker 互換の接頭辞なし表記。正規化は core の `parse_drop_list` が担う。#2833・SEC-1・CLI-1）。
     const OPT_CAP_DROP: &str = "NET_RAW";
+    /// config の ID 写像の拒否の固定文言（core の `reject_config_id_mappings`。#4711・SEC-5・CORE-6）。
+    const ID_MAPPINGS_MESSAGE: &str = "linux.uidMappings / linux.gidMappings are not accepted: ID mappings are derived from the runtime privilege model (SEC-5)";
     /// OCI 既定 14 個のビットマスク（`CapBnd` 等。bit 番号は Linux の capability 番号。#2833・SEC-1）。
     const OCI_DEFAULT_MASK: u64 = 0x0000_0000_a804_25fb;
     /// OCI 既定から NET_RAW（bit 13）だけを落としたマスク。`production_launcher` のシナリオ T（0xa00405fb）とは別の値。
@@ -319,6 +331,9 @@ mod linux {
                 );
                 println!(
                     "start_stop_delete_real: kill TERM ended the running container under restart policy no: state stopped without pid; recorded Stopped(43) without an explicit stop intent; second kill refused with FAILED_PRECONDITION; delete left no state dir"
+                );
+                println!(
+                    "start_stop_delete_real: cli start rejected config id mappings with exit 2 INVALID_ARGUMENT and the fixed message; state stayed created without pid; no process remained; delete left no state dir"
                 );
                 println!(
                     "start_stop_delete_real: scenario ok scope_present_before_delete={scope_present}"
@@ -1214,6 +1229,103 @@ mod linux {
             "state dir remains after delete (kill)",
         )?;
         cleanup.armed = false;
+
+        // 15. config の ID 写像の拒否（#4711・SEC-5・CLI-1）。create は通り、start が supervisor 経由で
+        // `INVALID_ARGUMENT`・終了コード 2・固定文言を返し、記録は `created` のまま・プロセスも残らない。
+        let map_id_s = format!("ssd{}map", std::process::id());
+        cleanup.id = map_id_s.clone();
+        let config_path = bundle.join("config.json");
+        let config = fs::read_to_string(&config_path).map_err(|e| format!("read config: {e}"))?;
+        let mapped = config.replacen(
+            "\"linux\":{",
+            "\"linux\":{\"uidMappings\":[{\"containerID\":0,\"hostID\":1000,\"size\":1}],\"gidMappings\":[{\"containerID\":0,\"hostID\":1000,\"size\":1}],",
+            1,
+        );
+        expect(
+            mapped.contains("\"uidMappings\""),
+            "id mappings were not injected into config.json",
+        )?;
+        fs::write(&config_path, mapped).map_err(|e| format!("write mapped config: {e}"))?;
+        let out = run_cli(
+            &cli,
+            &["--root", &root_s, "create", "--bundle", bundle_s, &map_id_s],
+            CLI_TIMEOUT,
+        )?;
+        expect_ok(&out, "create (id mappings)")?;
+        cleanup.armed = true;
+        let out = run_cli(
+            &cli,
+            &["--root", &root_s, "start", &map_id_s],
+            START_TIMEOUT,
+        )?;
+        let (op, code) = op_and_code(&out.stderr)?;
+        if out.code != Some(2)
+            || !out.stdout.is_empty()
+            || op != "start"
+            || code != "INVALID_ARGUMENT"
+            || error_message(&out.stderr)? != ID_MAPPINGS_MESSAGE
+        {
+            return Err(format!(
+                "start with id mappings: want exit 2 op=start code=INVALID_ARGUMENT message {ID_MAPPINGS_MESSAGE:?}, got {:?} stdout={:?} stderr={:?}",
+                out.code, out.stdout, out.stderr
+            ));
+        }
+        let map_container_id =
+            ContainerId::new(map_id_s.clone()).map_err(|e| format!("id (map): {e:?}"))?;
+        let map_rec = get_record(&open_store(&root)?, &map_container_id)?;
+        let map_generation = options_generation(&map_rec)?;
+        check_json_plain(&map_generation, "generation (map)")?;
+        expect_state(
+            &cli,
+            &root_s,
+            &map_id_s,
+            &oci_state_line(
+                &map_id_s,
+                "created",
+                None,
+                bundle_s,
+                &[(GENERATION_ANNOTATION, map_generation.as_str())],
+            ),
+        )?;
+        // supervisor は報告後もログのフラッシュと後始末を続けるため、終了を待ってから走査・delete に進む。
+        wait_supervisor_exit(
+            &sup_needle,
+            &root_needle,
+            "the id-mapping supervisor to exit",
+        )?;
+        // 残存の確認は、試行に固有の証跡（追跡した supervisor の終了〔上の待ち〕と、記録済みの cgroup）に絞る。
+        // `/proc` の全 PID の走査は、無関係なプロセスの読み取り拒否（`hidepid` 等）で合否が揺れるため使わない。
+        // 起動途中（exec 前・rootfs の切り替え前）の子も cgroup のメンバーとして捉えられる。supervisor の `prepare` が
+        // 配置を記録してから拒否するため、記録は残る（docs/api/id-mappings.md）。cgroup v2 はメンバーのいる cgroup を
+        // 削除できないため、cgroup が消えていればメンバーは居ない。残っていれば子孫の cgroup を含めて `cgroup.procs` が
+        // 空であること。証跡の読み取りの失敗（NotFound 以外）は観測の失敗として試験を落とす。
+        let map_placement = map_rec
+            .cgroup()
+            .ok_or("record has no cgroup placement (id mappings)")?;
+        let map_name = CgroupName::for_instance(&map_container_id, map_placement.instance())
+            .map_err(|e| format!("cgroup name (id mappings): {e:?}"))?;
+        let map_cgroup = PathBuf::from("/sys/fs/cgroup")
+            .join(map_placement.scope().as_str().trim_start_matches('/'))
+            .join(map_name.as_str());
+        // 起動で fork された子は `CgroupJoin` に達するまで親（この起動専用の委譲スコープ）に残るため、スコープ自体も
+        // 消えたか、`cgroup.events` が子孫を含めて `populated 0` になったことを期限つきで確かめる。
+        let map_scope_dir = PathBuf::from("/sys/fs/cgroup")
+            .join(map_placement.scope().as_str().trim_start_matches('/'));
+        wait_scope_unpopulated(&map_scope_dir, REAP_TIMEOUT)?;
+        let members = cgroup_subtree_members(&map_cgroup)?;
+        expect(
+            members.is_empty(),
+            &format!(
+                "processes remain in the recorded cgroup of the id-mapping container: {members:?}"
+            ),
+        )?;
+        let out = run_cli(&cli, &["--root", &root_s, "delete", &map_id_s], CLI_TIMEOUT)?;
+        expect_ok(&out, "delete (id mappings)")?;
+        expect(
+            !root.join(&map_id_s).exists(),
+            "state dir remains after delete (id mappings)",
+        )?;
+        cleanup.armed = false;
         Ok(scope_present)
     }
 
@@ -1281,6 +1393,57 @@ mod linux {
             .count()
     }
 
+    /// 委譲スコープ `dir` が消えるか、`cgroup.events` が `populated 0`（子孫を含めてメンバーなし）になるまで `limit` だけ
+    /// 待つ（#4711・REPAIR-5・REPAIR-12）。NotFound 以外の読み取りの失敗と期限切れは `Err`。
+    fn wait_scope_unpopulated(dir: &Path, limit: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + limit;
+        loop {
+            let events = match fs::read_to_string(dir.join("cgroup.events")) {
+                Ok(t) => t,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => return Err(format!("read {}/cgroup.events: {e}", dir.display())),
+            };
+            if events.lines().any(|l| l == "populated 0") {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "the delegated scope {} is still populated after {limit:?}: {events:?}",
+                    dir.display()
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// cgroup とその子孫の `cgroup.procs` に載る pid を集める（#4711・REPAIR-12）。cgroup（または走査中の子孫）が
+    /// 消えていれば（NotFound）メンバーは居ない（cgroup v2 はメンバーのいる cgroup を削除できない）。他の読み取り失敗は `Err`。
+    fn cgroup_subtree_members(dir: &Path) -> Result<Vec<String>, String> {
+        let procs = match fs::read_to_string(dir.join("cgroup.procs")) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(format!("read {}/cgroup.procs: {e}", dir.display())),
+        };
+        let mut members: Vec<String> = procs.split_whitespace().map(str::to_string).collect();
+        let entries = match fs::read_dir(dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(members),
+            Err(e) => return Err(format!("read dir {}: {e}", dir.display())),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("read dir entry {}: {e}", dir.display()))?;
+            let is_dir = match entry.file_type() {
+                Ok(t) => t.is_dir(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                Err(e) => return Err(format!("file type {}: {e}", entry.path().display())),
+            };
+            if is_dir {
+                members.extend(cgroup_subtree_members(&entry.path())?);
+            }
+        }
+        Ok(members)
+    }
+
     /// `list` の stdout が `ID\tSTATUS\tPID\n<id>\trunning\t<pid>\n` と完全一致することを確かめ、pid を返す。
     fn parse_running_list(out: &RunOut, id: &str) -> Result<u32, String> {
         expect_ok_code(out, "list")?;
@@ -1318,23 +1481,31 @@ mod linux {
         Ok(())
     }
 
-    fn op_and_code(stderr: &str) -> Result<(String, String), String> {
-        if !stderr.ends_with('\n') || stderr.matches('\n').count() != 1 {
+    /// stderr がちょうど 1 行で、その全体が JSON オブジェクトとして読めることを共有検査器で確かめ、
+    /// トップレベルの `op`・`code`・`message` を返す（入れ子・壊れた JSON・複数行は拒否。ERR-1・ERR-4・REPAIR-12）。
+    fn error_fields(stderr: &str) -> Result<(String, String, String), String> {
+        let facts = super::json_lines_contract::check_stream(
+            stderr.as_bytes(),
+            super::json_lines_contract::SHARED_MAX_LOG_LINE_BYTES,
+        )
+        .map_err(|v| format!("stderr is not one JSON object line ({v:?}): {stderr:?}"))?;
+        let [f] = facts.as_slice() else {
             return Err(format!("stderr is not exactly one line: {stderr:?}"));
-        }
-        let field = |key: &str| -> Result<String, String> {
-            let pat = format!("\"{key}\":\"");
-            let start = stderr
-                .find(&pat)
-                .ok_or_else(|| format!("no {key} in {stderr:?}"))?
-                + pat.len();
-            let rest = stderr.get(start..).ok_or("bad offset")?;
-            let len = rest
-                .find('"')
-                .ok_or_else(|| format!("unterminated {key} in {stderr:?}"))?;
-            Ok(rest.get(..len).ok_or("bad slice")?.to_string())
         };
-        Ok((field("op")?, field("code")?))
+        let get = |k: &str| {
+            f.str_of(k)
+                .map(str::to_string)
+                .ok_or_else(|| format!("no top-level string {k} in {stderr:?}"))
+        };
+        Ok((get("op")?, get("code")?, get("message")?))
+    }
+
+    fn error_message(stderr: &str) -> Result<String, String> {
+        error_fields(stderr).map(|(_, _, m)| m)
+    }
+
+    fn op_and_code(stderr: &str) -> Result<(String, String), String> {
+        error_fields(stderr).map(|(o, c, _)| (o, c))
     }
 
     /// 実効 UID を `/proc/self/status` から読む（`unsafe` の syscall を使わないため）。
@@ -1416,7 +1587,8 @@ mod linux {
             "probe",
             &["proc", "dev", "tmp", "etc"],
         )?;
-        // uidMappings / gidMappings・cgroupsPath は書かない（それぞれ UNIMPLEMENTED で拒否される）。
+        // uidMappings / gidMappings は書かない（非空は start が INVALID_ARGUMENT で拒否する。手順 15 が照合）。
+        // cgroupsPath も書かない（空文字列を含め、指定があれば `check_cgroups_path` が UNIMPLEMENTED で拒否する）。
         let config = format!(
             r#"{{"ociVersion":"1.2.0","root":{{"path":"rootfs","readonly":false}},"hostname":"fandhe-ssd",
 "process":{{"user":{{"uid":0,"gid":0}},"args":["/probe","--container-probe"],

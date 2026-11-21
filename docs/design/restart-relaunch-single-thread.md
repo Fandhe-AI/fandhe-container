@@ -36,7 +36,7 @@ core の本番 launcher（`ProductionLauncher`、`LaunchMode::SelfBounded`）は
   | `supervisor-stderr` | `StderrSink::quiesce` / `resume`。止めている間の行は上限つき（`QUEUE_CAPACITY`）のバッファへ溜め、再開後に順に書く |
   | `fandhe-terminate`（`LateOrphans`） | 失敗・停止経路だけ。変更なし |
   | `healthcheck-*` | 参加者に足さない（#2953 で結線済み）。周期実行のスレッド `healthcheck-periodic`（と probe の一時スレッド `healthcheck-probe`）は monitor の 1 回の呼び出しの間だけ回り、monitor が戻る前に期限（3 秒）つきで止めて join する。再 launch は monitor が戻った後なので居ない。期限内に止まらず残ったスレッドは `thread_settle` が検出して `RelaunchFailed`（fail-closed）。setns を伴う exec 自体は別プロセスの exec 専用 helper（`healthcheck-exec-helper.md`） |
-  | `control-reopen-log` | 参加者に足さない（#4652）。CRI の `ReopenContainerLog` の開き直しを行う一時スレッド（同時に 1 本。使用中は `Busy`）。開き直しの枠はコンテナが `Active` のときだけ取れ、`mark_exited` は進行中の枠の解放を最大 500 ms 待つため、終了から再 launch までに新しく生まれない。ログの FS が止まり `open`・`hard_link` の中で残ったスレッドは `thread_settle` が検出して `RelaunchFailed`（fail-closed。修正前に accept スレッドが同じ止まり方で pause に失敗していたのと同じ結果）。`PausableServer::pause` の停止対象には入れていない |
+  | `control-reopen-log` | 参加者に足さない（#4652）。CRI の `ReopenContainerLog` の開き直しを行う一時スレッド（同時に 1 本。使用中は `Busy`）。開き直しの枠はコンテナが `Active` のときだけ取れ、`mark_exited` は進行中の枠の解放を最大 500 ms 待つため、終了から再 launch までに新しく生まれない。ログの FS が止まり `openat` などの中で残ったスレッドは `thread_settle` が検出して `RelaunchFailed`（fail-closed。修正前に accept スレッドが同じ止まり方で pause に失敗していたのと同じ結果）。`PausableServer::pause` の停止対象には入れていない |
 
 - 順序: 制御チャネルの停止（外側の `ControlledRelauncher`）→ 捕捉・seccomp の quiesce → stderr の quiesce（最後。上の quiesce の報告が
   stderr へ出るため）→ スレッド数が 1 に落ち着くまでの有界の待ち（`thread_settle`、上限 1 秒）→ `launcher.launch(残り時間)` →

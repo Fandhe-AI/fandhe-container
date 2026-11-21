@@ -324,7 +324,7 @@ CRI の `log_path`（コンテナ）と `log_directory`（サンドボックス�
 - 書き手は 1 ファイルにつき 1 つ: 上限を書き手ごとに数えるため、開いたファイルに排他ロック（`flock(2)`）を supervisor の生存中保持し、同じ書き先を別の supervisor が開こうとすると start を `FAILED_PRECONDITION` で拒否する（kubelet は `<containerName>/<restartCount>.log` を使い回さない。ロックは協調的で、ロックを取らない別プロセスの追記は防げない）
 - `ReopenContainerLog`（CRI-2・SUP-7・REPAIR-3・REPAIR-5・TASK-59・TASK-164・MS-4・MS-9。#4652）: kubelet が rename した後の呼び出しで、同じパスを開き直す。契約は次のとおり。
   - 順序: 注入口なし → `UNIMPLEMENTED`、空 ID → `INVALID_ARGUMENT`、記録なし → `NOT_FOUND`、running でない → `FAILED_PRECONDITION`（`container is not running`。新しいログを作らない。cri-api の MUST NOT）、log_path なし → `FAILED_PRECONDITION`。supervisor への期限は 5 秒（REPAIR-5）
-  - 別 inode（rename 済み）なら、旧 writer を flush して新しいファイルへ切り替える。同じ inode なら旧 writer を保つ。新しいファイルは先に開いて検査し、失敗なら既存の書き込み先を変えずエラーにする（親ディレクトリは作らない。元のパスが空いていれば一時ファイルを検査してから `hard_link` で公開し、失敗時に元のパスへファイルを残さない。期限・稼働の確認・終了との調停は [cri-log-partial-lines.md](cri-log-partial-lines.md)「ReopenContainerLog との関係」）
+  - 別 inode（rename 済み）なら、旧 writer を flush して新しいファイルへ切り替える。同じ inode なら旧 writer を保つ。新しいファイルは先に開いて検査し、失敗なら既存の書き込み先を変えずエラーにする（親ディレクトリは作らない。検証済みの親ディレクトリの fd からの `openat`（無ければ `O_EXCL` で作成）で開き、失敗・拒否のときは今回作った inode だけを消す。期限・稼働の確認・終了との調停は [cri-log-partial-lines.md](cri-log-partial-lines.md)「ReopenContainerLog との関係」）
   - 総量の上限（`CRI_LOG_MAX_BYTES`）の残りは、新しいファイルのサイズから数え直す。上限で止まった CRI ログも開き直しで再開する
   - 古い supervisor は制御チャネルの kind 10 を拒否するため `UNAVAILABLE`（既存コンテナは作り直すまで reopen できない）
   - 根拠の一次情報: cri-api v0.37.1 の `api.proto`、kubelet v1.37.1 `container_log_manager.go`、containerd v2.1.0 `container_log_reopen.go`（詳細は [cri-log-partial-lines.md](cri-log-partial-lines.md)「ReopenContainerLog」）

@@ -697,12 +697,8 @@ mod imp {
     /// pipe の EOF を待たない（孫が書き込み端を持ち続けても期限内に戻る。REPAIR-5）。
     #[cfg(target_os = "linux")]
     fn fork_again_is_reported_as_isolation_fork_again() {
-        if real_uid() == 0 {
-            println!(
-                "audit_sink_isolation: fork_again not applicable as root (RLIMIT_NPROC is not enforced)"
-            );
-            return;
-        }
+        // uid 0 でも早く抜けない（user namespace の中の uid 0 は上限を免除されないことがある）。適用外にするのは、
+        // 子のプローブで上限が効かないと確かめられた場合だけ（REPAIR-12）。
         let dir = tmp_marker("fork-again");
         std::fs::create_dir(&dir).unwrap();
         let (out_path, err_path) = (dir.join("stdout"), dir.join("stderr"));
@@ -733,12 +729,13 @@ mod imp {
         if stdout.trim_end() == FORK_AGAIN_NOT_ENFORCED {
             // CAP_SYS_ADMIN（21）・CAP_SYS_RESOURCE（24）を持てば上限は免除される。それ以外で効かないのは前提の崩れ。
             const EXEMPT: u64 = (1 << 21) | (1 << 24);
+            // init の user namespace の root（INIT_USER）と CAP_SYS_ADMIN・CAP_SYS_RESOURCE は上限を免除される。
             assert!(
-                cap_eff() & EXEMPT != 0,
-                "RLIMIT_NPROC was not enforced although CAP_SYS_ADMIN and CAP_SYS_RESOURCE are absent"
+                cap_eff() & EXEMPT != 0 || real_uid() == 0,
+                "RLIMIT_NPROC was not enforced although uid is not 0 and CAP_SYS_ADMIN and CAP_SYS_RESOURCE are absent"
             );
             println!(
-                "audit_sink_isolation: fork_again not applicable (CAP_SYS_ADMIN or CAP_SYS_RESOURCE exempts RLIMIT_NPROC)"
+                "audit_sink_isolation: fork_again not applicable (root or CAP_SYS_ADMIN / CAP_SYS_RESOURCE exempts RLIMIT_NPROC)"
             );
             return;
         }

@@ -272,6 +272,10 @@ struct Faults {
     after_create: Hook,
     /// 確定の直前（待ちうる処理の後・関門の前。内部ロックを持つ）に呼ぶ。
     before_commit: Hook,
+    /// `O_TMPFILE` の経路で、名前を付ける直前（ロック・旧 writer の flush の後。内部ロックを持つ）に呼ぶ。
+    before_publish: Hook,
+    /// 真なら `O_TMPFILE` を使わず `O_EXCL` の経路で作る（`O_TMPFILE` に対応しない FS の経路の試験用）。
+    force_excl: std::sync::atomic::AtomicBool,
 }
 
 enum Inner {
@@ -527,6 +531,20 @@ fn report_reopen_discard(result: &'static str) {
     let _ = crate::stderr_sink::stderr().emit(line.into_bytes());
 }
 
+/// `O_TMPFILE` に対応しない（FS が `EOPNOTSUPP`、3.11 より前のカーネルが `EISDIR` を返す）とき真。そのときだけ `O_EXCL` の
+/// 経路へ戻る（ほかの失敗は戻らずに拒否する）。
+#[cfg(target_os = "linux")]
+fn tmpfile_unsupported(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(crate::sys::EOPNOTSUPP) | Some(EISDIR)
+    )
+}
+
+/// include/uapi/asm-generic/errno-base.h の `EISDIR`（x86_64・aarch64 で共通）。
+#[cfg(target_os = "linux")]
+const EISDIR: i32 = 21;
+
 /// 今の writer が `file` と同じ inode へ書いているか（`Failed` なら偽）。
 #[cfg(target_os = "linux")]
 fn writes_to(inner: &Inner, file: &std::fs::File) -> bool {
@@ -703,7 +721,54 @@ impl CriFileSink {
         }
     }
 
-    /// 新規に作ったファイル（`dir` の直下の `name` を `O_EXCL` で作った fd）への開き直し。待ちうる処理（ロック・メタデータ・
+    /// 名前の無いファイル（`O_TMPFILE`）への開き直し。待ちうる処理（ロック・旧 writer の flush）を名前の無いまま済ませ、
+    /// 確定の直前に `linkat` で `name` として公開してから、名前の照合と確定（[`Self::commit_switch`]）へ進む。公開の前の
+    /// 失敗（期限・ロック・flush）では何も作らない。公開の後に残る失敗は、確定点の関門（期限・世代）と名前の照合だけで、
+    /// そのときは [`discard_created`] で元の名前から外す（cri-api の「エラーを返したら新しいログを作らない」。#4652）。
+    /// 名前が既にあれば（準備の間に他者が作った）`Ok(None)` を返し、呼び出し側が既存のファイルとして開き直す。
+    #[cfg(target_os = "linux")]
+    fn publish_tmpfile(
+        &self,
+        dir: &std::fs::File,
+        name: &std::ffi::OsStr,
+        file: std::fs::File,
+        deadline: Instant,
+        gate: ReopenGate<'_>,
+    ) -> Result<Option<RetiredWriter>, TraitError> {
+        use std::os::fd::AsFd as _;
+        let len = lock_and_size(&file)?;
+        let Some(mut guard) = lock_until(&self.inner, deadline) else {
+            return Err(timeout_error());
+        };
+        self.flush_old(&mut guard)?;
+        check_budget(deadline, gate)?;
+        #[cfg(test)]
+        self.run_hook(&self.faults.before_publish);
+        match crate::sys::link_fd_at(file.as_fd(), dir.as_fd(), name) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(None),
+            Err(_) => return Err(unopenable()),
+        }
+        let mut slot = Some(file);
+        let result = (|| {
+            #[cfg(test)]
+            self.run_hook(&self.faults.before_commit);
+            let Some(file) = slot.as_ref() else {
+                return Err(unopenable());
+            };
+            name_still_points_to(dir, name, file)?;
+            self.commit_switch(&mut guard, &mut slot, len, deadline, gate)
+        })();
+        // 確定していれば `slot` は空。残っていれば公開したまま確定しなかったので外す。
+        if result.is_err()
+            && let Some(file) = slot.as_ref()
+        {
+            discard_created(dir, name, file);
+        }
+        result.map(Some)
+    }
+
+    /// 新規に作ったファイル（`dir` の直下の `name` を `O_EXCL` で作った fd）への開き直し（`O_TMPFILE` に対応しない FS の経路）。待ちうる処理（ロック・メタデータ・
     /// 旧 writer の flush）を確定の前にすべて済ませ、確定は [`Self::commit_switch`] の関門だけで行う。どこで失敗しても
     /// （期限・世代・ロック・flush・名前の照合）、作ったファイルを元の名前から外す（[`discard_created`]。cri-api の
     /// `ReopenContainerLog` は「エラーを返したら新しいログファイルを作ってはならない」と定める）。
@@ -999,6 +1064,26 @@ impl LogSink for CriFileSink {
                 check_budget(deadline, gate)?;
                 #[cfg(test)]
                 self.run_hook(&self.faults.before_create);
+                // 名前の無いファイルで準備し、確定の直前まで公開しない（`publish_tmpfile`）。`O_TMPFILE` に対応しない FS では
+                // 従来の `O_EXCL` の経路（作ってから準備し、失敗したら退避と照合で外す）へ戻る。
+                #[cfg(test)]
+                let tmpfile = !self
+                    .faults
+                    .force_excl
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                #[cfg(not(test))]
+                let tmpfile = true;
+                if tmpfile {
+                    match crate::sys::open_log_tmpfile_at(dir.as_fd()) {
+                        Ok(file) => match self.publish_tmpfile(&dir, name, file, deadline, gate)? {
+                            Some(retired) => return Ok(retired),
+                            // 準備の間に他者が同じ名前を作った（kubelet が回転済みのログを戻した等）: 既存として開き直す。
+                            None => continue,
+                        },
+                        Err(e) if tmpfile_unsupported(&e) => {}
+                        Err(_) => return Err(unopenable()),
+                    }
+                }
                 match crate::sys::open_log_at(dir.as_fd(), name, true) {
                     Ok(file) => return self.publish_new(&dir, name, file, deadline, gate),
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -1822,12 +1907,60 @@ mod tests {
             assert!(open_verified_dir(&real).is_ok());
         }
 
+        /// CRI-2・SUP-7・#4652（G1 の B）: 新しいファイルは名前の無いまま（`O_TMPFILE`）ロックと旧 writer の flush を済ませ、
+        /// 名前を付ける直前まで元の名前に現れない。公開の前に失敗すれば（旧 writer の flush の失敗）何も作らない。
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn cri2_4652_tmpfile_is_not_visible_until_publish() {
+            let (t, path, rotated, sink) = rotated_sink("reopen-tmpfile");
+            let target = PathBuf::from(path.as_str());
+            let seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let s2 = seen.clone();
+            *sink.faults.before_publish.lock().expect("lock") = Some(Box::new(move |p| {
+                assert_eq!(p, target);
+                assert!(
+                    !p.exists(),
+                    "the new log must not be visible before publish"
+                );
+                s2.store(true, Ordering::SeqCst);
+            }));
+            sink.append(StreamKind::Stdout, b"a").expect("buffered");
+            sink.faults.flush.store(true, Ordering::SeqCst);
+            let e = sink.reopen(in_secs(5), &allow).expect_err("flush failed");
+            assert_eq!(e.message(), "cri log flush failed");
+            assert!(!seen.load(Ordering::SeqCst), "failed before publish");
+            assert_eq!(names(&t.0), ["0.log.1"]);
+            reopen_now(&sink).expect("reopen");
+            assert!(seen.load(Ordering::SeqCst));
+            assert_eq!(names(&t.0), ["0.log", "0.log.1"]);
+            sink.append(StreamKind::Stdout, b"b").expect("new writer");
+            sink.flush().expect("flush");
+            assert!(read(&rotated).ends_with(" stdout F a\n"));
+            assert!(read(Path::new(path.as_str())).ends_with(" stdout F b\n"));
+        }
+
+        /// CRI-2・SUP-7・#4652: `O_TMPFILE` に対応しない FS の経路（`O_EXCL` で作ってから準備する）でも、開き直しは成功する。
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn cri2_4652_excl_fallback_reopens() {
+            let (t, path, rotated, sink) = rotated_sink("reopen-excl");
+            sink.faults.force_excl.store(true, Ordering::SeqCst);
+            reopen_now(&sink).expect("reopen");
+            assert_eq!(names(&t.0), ["0.log", "0.log.1"]);
+            sink.append(StreamKind::Stdout, b"x").expect("new writer");
+            sink.flush().expect("flush");
+            assert!(read(Path::new(path.as_str())).ends_with(" stdout F x\n"));
+            assert_eq!(read(&rotated), "");
+        }
+
         /// CRI-2・SUP-7・#4652（D）: ファイルを作った後にロックが取れず失敗しても、元のパスにファイルが残らない
         /// （別の書き手が作ったファイルのロックを持つ場面を注入）。退避名も残らない。旧 writer は生きている。
         #[cfg(target_os = "linux")]
         #[test]
         fn cri2_4652_reopen_lock_failure_leaves_no_file() {
             let (t, _path, rotated, sink) = rotated_sink("reopen-lockfail");
+            // 名前の無いファイルは他者が開けないため、`O_EXCL` の経路（`O_TMPFILE` に対応しない FS）で確かめる。
+            sink.faults.force_excl.store(true, Ordering::SeqCst);
             let holder: Arc<Mutex<Option<std::fs::File>>> = Arc::new(Mutex::new(None));
             let h = holder.clone();
             *sink.faults.after_create.lock().expect("lock") = Some(Box::new(move |target| {

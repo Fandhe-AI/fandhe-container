@@ -68,8 +68,6 @@ const FIXED_LEN: usize = 1 + 8 + 4 + 4 + 1;
 const ACK_OK: u8 = 1;
 /// helper の応答: 主経路・代替経路とも失敗した。
 const ACK_FAIL: u8 = 0;
-/// helper の応答: 主経路が fork の `EAGAIN`(`isolation_fork_again`)で失敗し、代替経路も失敗した(SEC-4・#4702)。
-const ACK_FAIL_FORK_AGAIN: u8 = 2;
 /// helper が fd 3 以上を閉じられなかったときの終了コード。
 const CLOSE_FDS_FAILED_EXIT: i32 = 3;
 /// helper が停止シグナル（SIGTERM・SIGINT）を無視にできなかったときの終了コード（親の `probe` が失敗として検出する）。
@@ -643,16 +641,15 @@ fn serve(mut stream: UnixStream, sink: &FileAuditSink) -> i32 {
                 return 1;
             }
         }
-        let ack = if head.first() == Some(&TAG_PROBE) {
-            if id_len == 0 && sink.probe_primary().is_ok() {
-                ACK_OK
-            } else {
-                ACK_FAIL
-            }
+        let ok = if head.first() == Some(&TAG_PROBE) {
+            id_len == 0 && sink.probe_primary().is_ok()
         } else {
-            decode(&frame).map_or(ACK_FAIL, |r| ack_for(&sink.record_detailed(&r)))
+            decode(&frame).is_some_and(|r| sink.record(&r).is_ok())
         };
-        if stream.write_all(&[ack]).is_err() {
+        if stream
+            .write_all(&[if ok { ACK_OK } else { ACK_FAIL }])
+            .is_err()
+        {
             return 1;
         }
     }
@@ -876,33 +873,15 @@ impl ControlAuditRelay {
                 "the audit relay did not answer in time",
             ));
         }
-        ack_result(ack)
-    }
-}
-
-/// helper 側: 記録の結果を応答の 1 バイトへ写す。主経路の fork の `EAGAIN` だけ別の値で返す(SEC-4・#4702)。
-fn ack_for(result: &Result<(), super::AuditWriteFailure>) -> u8 {
-    match result {
-        Ok(()) => ACK_OK,
-        Err(f) if f.primary().kind() == super::AuditWriteErrorKind::IsolationForkAgain => {
-            ACK_FAIL_FORK_AGAIN
+        if ack == [ACK_OK] {
+            Ok(())
+        } else {
+            Err(err(
+                ErrorCode::Internal,
+                "the audit record was not persisted",
+            ))
         }
-        Err(_) => ACK_FAIL,
     }
-}
-
-/// 親側: 応答の 1 バイトを結果へ写す。fork の `EAGAIN` は message に種別を残す(未知の値は失敗)。
-fn ack_result(ack: [u8; 1]) -> Result<(), TraitError> {
-    let primary = match ack {
-        [ACK_OK] => return Ok(()),
-        [ACK_FAIL_FORK_AGAIN] => Some(super::AuditWriteErrorKind::IsolationForkAgain),
-        _ => None,
-    };
-    Err(super::file_sink::with_primary_kind(
-        ErrorCode::Internal,
-        "the audit record was not persisted",
-        primary,
-    ))
 }
 
 impl AuditSink for ControlAuditRelay {
@@ -939,37 +918,6 @@ impl Drop for ControlAuditRelay {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// SEC-4・REPAIR-4・#4702: 主経路の fork の `EAGAIN` は helper の応答の別の値で往復し、親の失敗の message に
-    /// 種別が残る。他の失敗・未知の値は従来の message のまま、成功は成功のまま。
-    #[test]
-    fn sec4_4702_fork_again_survives_relay_ack() {
-        use super::super::{AuditWriteError, AuditWriteErrorKind as K, AuditWriteFailure};
-        let fail = |primary| {
-            Err(AuditWriteFailure::new(
-                AuditWriteError::new(primary),
-                AuditWriteError::new(K::Write),
-            ))
-        };
-        let msg = |ack| ack_result([ack]).map_err(|e| format!("{:?}:{}", e.code(), e.message()));
-        assert_eq!(ack_for(&Ok(())), ACK_OK);
-        assert_eq!(msg(ack_for(&Ok(()))), Ok(()));
-        assert_eq!(ack_for(&fail(K::IsolationForkAgain)), ACK_FAIL_FORK_AGAIN);
-        assert_eq!(
-            msg(ack_for(&fail(K::IsolationForkAgain))),
-            Err(
-                "Internal:the audit record was not persisted (primary: isolation_fork_again)"
-                    .into()
-            )
-        );
-        assert_eq!(ack_for(&fail(K::IsolationUnavailable)), ACK_FAIL);
-        for ack in [ACK_FAIL, 7] {
-            assert_eq!(
-                msg(ack),
-                Err("Internal:the audit record was not persisted".into())
-            );
-        }
-    }
 
     /// REPAIR-5・SEC-4: 別の記録がロックを保持している間に短い絶対期限で呼んでも、期限 + 許容差以内に
     /// `Timeout` で戻り、helper へは何も送らない(取得後の再計算と、ロック取得自体の期限打ち切り)。

@@ -1169,8 +1169,8 @@ fn both_failed_error(failure: &AuditWriteFailure) -> TraitError {
 }
 
 /// 主経路の失敗種別が `isolation_fork_again` のときだけ `message` の末尾に `(primary: isolation_fork_again)` を
-/// 足す(SEC-4・REPAIR-4・#4702)。期限切れの `Timeout` と監査リレーの失敗応答(`control_relay`)も通る。
-pub(crate) fn with_primary_kind(
+/// 足す(SEC-4・REPAIR-4・#4702)。期限切れの `Timeout` も通る。
+fn with_primary_kind(
     code: crate::traits::ErrorCode,
     message: &str,
     primary: Option<AuditWriteErrorKind>,

@@ -40,7 +40,7 @@ PID 1・exec worker・コマンドの子は supervisor を fork しただけな�
 
 - **rootless（CORE-6 の既定）**: コンテナの uid 0 は起動ユーザーの uid に写る。`docs/setup/linux.md` の手順では supervisor を利用者所有のディレクトリに 0755 で置くため、コンテナ root とバイナリの所有者が同じ uid になり、**DAC では書き込みを止められない**。止めているのは non-dumpable・A・Landlock だけ。B が多層防御として効くのは主にここ
 - **特権ランチャーの構成（SUP-14）**: uid は非 root のまま `RootlessSingleId` に入り、supervisor は root 所有でインストールされる（`install-privileged-launcher.sh`）。DAC でも書き込みを止められる
-- **`RootfulHostRoot`**: 現在は本番経路で拒否している（#2241 は判断待ち）。許すことになればコンテナ root がホスト root になり DAC が効かない
+- **`RootfulHostRoot`**: 本番経路では意図した恒久拒否（`PermissionDenied`。#2241 の決定 D1 A・#4709）。許すことになればコンテナ root がホスト root になり DAC が効かない
 
 ## 選択肢
 

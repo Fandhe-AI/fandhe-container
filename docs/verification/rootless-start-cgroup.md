@@ -17,7 +17,7 @@
 
 - Linux 6.12 以上（Landlock ABI 6）: `uname -r`
 - cgroup v2: `stat -fc %T /sys/fs/cgroup` が `cgroup2fs`
-- 非 root で実行する（rootful は `UNIMPLEMENTED`・終了コード 8）
+- 非 root で実行する（uid 0 で権限検査に到達した start は `PERMISSION_DENIED`・終了コード 6。#4709）
 - 非特権 user namespace を許可している（例: `kernel.apparmor_restrict_unprivileged_userns=0`）。設定の変更は人間が判断する。本書は sudo を呼ばない
 - user マネージャに届く: `test -S "$XDG_RUNTIME_DIR/systemd/private"` と `systemctl --user is-system-running`
 - `systemd-run` が固定候補（`/usr/sbin`・`/usr/bin`・`/sbin`・`/bin`・`/run/current-system/sw/bin`）にあり、root 所有で group / other に書き込み権が無い。PATH 探索や `DBUS_SESSION_BUS_ADDRESS` による回避は行わない。NixOS の既知の限界は #2133
@@ -66,7 +66,8 @@ CLI と supervisor は同じディレクトリに置く（[linux.md](../setup/li
    | 0 | なし | 成功 |
    | 5 | `FAILED_PRECONDITION` | 前提不備。`prepare` の拒否でも、本番 supervisor の `prepare_cgroup`（`crates/supervisor/src/start_entry.rs`）が detect・scope 記録・cgroup 作成のエラーを固定文言に変換するため、message は `failed to prepare the container cgroup` になる（同居による拒否の内部メッセージ `delegated cgroup contains other processes; refusing to move them` は stderr に出ない）。同居が原因かどうかは、stderr だけでは判別できず、親 scope の `cgroup.procs` に自分以外の PID がいるかを追加で観察して特定する（結果記録の「親 scope の `cgroup.procs`」と同じ） |
    | 7 | `TIMEOUT` | 結果不明（受信期限 58.9 秒）。`state`・`list` で確かめる |
-   | 8 | `UNIMPLEMENTED` | rootful で実行した等 |
+   | 6 | `PERMISSION_DENIED` | rootful（uid 0）で、対象 ID が存在し権限検査に到達した start。方針による恒久拒否（#4709）。対象 ID が無ければ 3、supervisor が隣に無ければ 5 |
+   | 8 | `UNIMPLEMENTED` | 未実装の経路（uid 0 の create でユーザー定義ネットワーク・`-p` を指定した場合〔D13〕等。uid 0 で権限検査に到達した start は 6） |
    | 1 | `INTERNAL` | その他 |
 
 4. 成功時の観察:

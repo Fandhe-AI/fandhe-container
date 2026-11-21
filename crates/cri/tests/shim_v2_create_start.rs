@@ -23,6 +23,9 @@ use fandhe_container_cri::shim_v2::{
 };
 use prost::Message;
 
+/// rootful の恒久拒否の固定文言（supervisor の `privilege_gate` と同じ。SEC-5）。
+const REFUSAL: &str = "the rootful privilege model is permanently refused by policy (SEC-5)";
+
 /// 作成済み ID を覚えるだけの偽ランタイム。
 struct Fake(Mutex<HashSet<String>>);
 
@@ -34,6 +37,9 @@ impl ContainerRuntime for Fake {
         Ok(ContainerStatus::created(r.id().clone(), None))
     }
     fn start(&self, r: &RtStart) -> Result<ContainerStatus, TraitError> {
+        if r.id().as_str() == "refused" {
+            return Err(TraitError::new(ErrorCode::PermissionDenied, REFUSAL));
+        }
         Ok(ContainerStatus::running(
             r.id().clone(),
             NonZeroU32::new(777),
@@ -110,6 +116,43 @@ fn cri5_create_start_over_uds() {
 
     let r = call(&mut s, 5, "Create", create);
     assert_eq!(r.status.unwrap().code, 6);
+
+    drop(s);
+    drop(handle);
+}
+
+/// SEC-5・CRI-5・ERR-3（#4709・PR #4904）: rootful の恒久拒否（`PermissionDenied` と固定文言）が
+/// 実ソケット越しの Start で ttrpc の status code 7（PERMISSION_DENIED）と同じ文言で届く。
+#[test]
+fn sec5_start_rootful_refusal_is_ttrpc_permission_denied() {
+    let root = test_root::test_root("ttrpc", "start-refused");
+    let path = root.join("s.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let mut reg = ServiceRegistry::new();
+    let adapter = RuntimeAdapter::from_runtime(Fake(Mutex::new(HashSet::new())));
+    reg.register(Arc::new(TaskService::new(TaskApiVersion::V2, adapter)))
+        .unwrap();
+    let handle = TtrpcServer::new(reg, ServerConfig::default())
+        .serve(listener)
+        .unwrap();
+    let mut s = UnixStream::connect(&path).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    let create = CreateTaskRequest {
+        id: "refused".into(),
+        bundle: "/run/bundle".into(),
+        ..Default::default()
+    }
+    .encode_to_vec();
+    assert!(call(&mut s, 1, "Create", create).status.is_none());
+    let start = StartRequest {
+        id: "refused".into(),
+        exec_id: String::new(),
+    }
+    .encode_to_vec();
+    let status = call(&mut s, 3, "Start", start).status.expect("status");
+    assert_eq!(status.code, 7);
+    assert_eq!(status.message, REFUSAL);
 
     drop(s);
     drop(handle);

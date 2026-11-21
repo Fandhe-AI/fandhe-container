@@ -4,9 +4,9 @@
 
 ## 背景
 
-- cri は pod の ipc 共有を bundle へ変換できる（#2674）。パスは `PodNamespacePaths::for_holder_pid`（`/proc/<pid>/ns/{user,ipc,net}` だけ。#2776・#2878）でしか作れない。`CriRuntimeService` の配線は #2876（H5）で実装済みで、保持役の provider を注入したときだけ `with_pod_namespaces` を渡す。本番（plugin-cri）は Linux・非 root で `ProductionPodHolder` を注入済み（H6・#2877）で、ipc が `POD` のコンテナは保持役の user＋ipc（network も `POD` なら net）へ join する。rootful（uid 0）は注入せず `UNIMPLEMENTED`（#2241・#2442）
+- cri は pod の ipc 共有を bundle へ変換できる（#2674）。パスは `PodNamespacePaths::for_holder_pid`（`/proc/<pid>/ns/{user,ipc,net}` だけ。#2776・#2878）でしか作れない。`CriRuntimeService` の配線は #2876（H5）で実装済みで、保持役の provider を注入したときだけ `with_pod_namespaces` を渡す。本番（plugin-cri）は Linux・非 root で `ProductionPodHolder` を注入済み（H6・#2877）で、ipc が `POD` のコンテナは保持役の user＋ipc（network も `POD` なら net）へ join する。rootful（uid 0）は注入せず、注入された provider も uid 0 を `PERMISSION_DENIED` で恒久拒否する（#2241 の決定 D1 A・#4709）
 - pod の netns は `PodNetworkProvider`（cri）と plugin-cri の `NetsetupPodNetwork`（bridge・veth。rootful 前提）まで実装済み（#2675・#2676）。ただし本番へは未注入で、core の `NamespaceJoin` は user＋ipc の組に net を足す形を受理済み（H7・#2872）だが、本番の rootless では `NetsetupPodNetwork`（rootful 前提）を使えず rootless の provider は H10（#2879）で未実装のため、`PodSandboxStatus.network` は provider の報告だけを返す経路が実装済み（#2873）だが、provider 未注入（本番は rootless・H10 待ち）のため実際には空
-- plugin-cri の本番は rootless（uid 0 は `UNIMPLEMENTED`。#2442・#2241）。bridge・veth は作れず、rootless の netns は pasta 構成（NET-9。#1935・#341）の領域
+- plugin-cri の本番は rootless（uid 0 は `PERMISSION_DENIED` で恒久拒否。#2442・#2241 の決定 D1 A・#4709）。bridge・veth は作れず、rootless の netns は pasta 構成（NET-9。#1935・#341）の領域
 - 受け入れ方式の現状は [cri-config-acceptance.md](cri-config-acceptance.md) の順 12〜14
 
 ## 前提と制約
@@ -53,7 +53,7 @@
 - core の `NamespaceJoin` を拡張し、user＋ipc に加えて任意で net を受ける。net の所有 userns（`NS_GET_USERNS`）が join する user と同じであることを照合し、`setns` は user → ipc → net → 残りの `unshare` の順にする。net 単独の path・user が無い path は従来どおり `Unimplemented`
 - 実装済み（H7・#2872）: `paths_of` は user＋ipc の組に net を足す形だけを受け、`pin` は net の所有 userns を照合する（呼び出し側自身または外側の所有は `Unimplemented`〔`pod_join_net_not_pod_owned`〕、別の userns 所有は `PermissionDenied`〔`pod_join_net_owner_mismatch`〕）。`EffectiveNetwork::PodJoined` を足し、exec 直前の netns 素性の同期点（D8）にも通す（pin 時に固定した netns の素性との一致を期待する。`FromConfig` の CRI の経路のうち join する起動だけ）。受理と拒否は層 `pod_namespace_join` の監査に残す（SEC-4）
 - 現行の注記（netns を userns より先に `setns` する順序）は、userns が所有する netns では問題にならない。user の後に net へ入れる
-- rootful の init userns 所有の netns（bridge・veth の `NetsetupPodNetwork`）は、#2241 の判断まで `Unimplemented` のまま
+- rootful の init userns 所有の netns（bridge・veth の `NetsetupPodNetwork`）は、#2241 の決定 D1 A（恒久拒否。#4709）により本番の経路では扱わない
 - cri: `PodNamespacePaths` に net（同じ pid の `/proc/<pid>/ns/net`）を足す。構築口は `for_holder_pid` のまま。`namespace_options.network` が `POD` で保持役があれば bundle の network に保持役の path を出す
 - `PodNetworkRequest`（`#[non_exhaustive]`）に保持役の netns を渡す欄を足す。provider は自前で netns を作らず、その netns を結線する（rootless では pasta が保持役の user / net へ attach）。`lo` の up は provider の責務にせず、保持役が netns 作成直後に行う（次節の「`lo` の up」）
 
@@ -309,7 +309,7 @@ PoC: `crates/core/src/oci_runtime/namespace_join.rs` の実機前提試験 `cri2
 - DoS: 子の一覧は上限つき。READY の受信・解放の待ちはすべて期限つきで、超過したら SIGKILL して回収する（REPAIR-5）
 - 後始末: Run の途中で失敗したら保持役・ネットワークの資源を逆順に戻し、戻せなければ記録を残して Stop・Remove で再試行する
 - エラー文言は固定文言にし、パス・pid・config の値を含めない（REPAIR-4）
-- rootful（uid 0）は #2241 の判断まで `UNIMPLEMENTED`。init userns 所有の netns への join は受けない（保持役を使うかの決定は下の「rootful の扱い」・#4708）
+- rootful（uid 0）は #2241 の決定 D1 A により `PERMISSION_DENIED` で恒久拒否（#4709）。init userns 所有の netns への join は受けない（保持役を使うかの決定は下の「rootful の扱い」・#4708）
 - 依存は追加しない。追加が必要と分かったら承認事項として報告する
 
 ## オーナー判断（2026-11-09）
@@ -357,7 +357,7 @@ PoC: `crates/core/src/oci_runtime/namespace_join.rs` の実機前提試験 `cri2
 - (a) 注入は real / effective のどちらかの uid が 0 と確定しないときだけ（plugin-cri の `adapter.rs` の `pod_holder_injection_enabled`、`pod_holder.rs` の `should_inject_pod_holder`・`current_euid`）。特権ランチャー経由の非 root の plugin-cri では今も注入される。決定文の「実効 uid」より判定は広く、real uid が 0 でも注入しない（決定の趣旨とは矛盾しない。Agent が読みで補った記述でオーナー承認の文言ではない）
 - (b) その構成では pod の user namespace の owner と netns-dial helper の euid が同じになり、参加後に dumpable が戻る条件に当たらない見込み（推論。コードでは直接確認できない）
 - (c) ambient capability を持つ supervisor は CRI ログの書き込みを `UNIMPLEMENTED` で拒否する（`crates/supervisor/src/logs/cri.rs` の `deny_elevated_capabilities`、[cri-config-acceptance.md](cri-config-acceptance.md)）。`log_path` を渡す通常の kubelet ではコンテナが起動しない
-- (d) uid のどれかが 0 の start は `privilege_gate`（`crates/supervisor/src/start_client.rs`）が `UNIMPLEMENTED` で拒否し、provider（`pod_holder.rs` の `rootful_guard`）も uid 0 を `Unimplemented` で拒否する
+- (d) uid のどれかが 0 の start は `privilege_gate`（`crates/supervisor/src/start_client.rs`）が `PERMISSION_DENIED` で拒否し、provider（`pod_holder.rs` の `rootful_guard`）も uid 0 を `PermissionDenied` で拒否する（#4709）
 
 ### 持ち越し: F3 と root 専用 `#[ignore]` 試験
 
@@ -373,7 +373,7 @@ plugin-cri の `ProductionPodHolder`（`crates/plugin-cri/src/pod_holder.rs`）�
 
 1. **bin の事前検査は行う（fail-closed）**: spawn の前に、実体の隣の固定名（`holder_executable_beside`。`PATH`・環境変数・引数の上書きなし）について、通常ファイル・所有者が root か実効 uid・group / other 書き込み不可・読み取り専用の `open` 成功を確かめる。保持役は段 1 で `/proc/self/exe` を開き直し、non-dumpable 下では `would_dump` の読み取り許可が要るため、読めない bin では成り立たない。読み取り専用の `open` がその代理になる。失敗は固定文言の `FAILED_PRECONDITION`。
 2. **READY の後の検証（fail-closed）**: READY の pid が spawn した子の pid と一致し、`/proc/<pid>/ns/{user,ipc,net}` の `(dev, ino)` が READY と一致することを確かめる。この stat は ptrace のアクセス検査を通るため、案 (a)（再 exec で non-dumpable を保つ）が実際に成り立つことの直接の確認にもなる。不一致は SIGKILL して回収し `FAILED_PRECONDITION`。
-3. **注入の条件**: `production()`／`production_with_audit_sink()` の構成で、実効 uid が 0 と確定しないときだけ注入する（読めない場合は注入し、spawn の検査が落とす）。provider 自身も uid 0 では `UNIMPLEMENTED`（rootful は #2241・#2442 の判断まで従来どおり）。`new`／`with_recorder` の構成には注入せず、`with_pod_holder_provider` で差す。
+3. **注入の条件**: `production()`／`production_with_audit_sink()` の構成で、実 uid か実効 uid が 0 と確定しないときだけ注入する（`current_euid`）（読めない場合は注入し、spawn の検査が落とす）。provider 自身も uid 0 では `PermissionDenied` で恒久拒否する（rootful は #2241 の決定 D1 A・#4709）。`new`／`with_recorder` の構成には注入せず、`with_pod_holder_provider` で差す。
 4. **上限**: 追跡する子は `MAX_TRACKED_POD_HOLDERS`（1024。`MAX_TRACKED_SUPERVISORS` に倣う）まで。起動途中と回収できなかった子（orphan）も数え、超えたら `RESOURCE_EXHAUSTED`。1 件あたり stdin のパイプ 1 本の fd を保つ。
 5. **生存は回収しない**: sandbox の記録が残る間は子を `wait` しない（pid を zombie のままでも保って再利用を防ぐ。SEC-5・#2776）。生存は `waitid(P_PID, WEXITED | WNOHANG | WNOWAIT)` で判定する（pidfd だと 1 件ごとに fd がもう 1 本要るため採らない）。ラッパー `sys::child_exit_observed` は plugin-cri の `sys` の事前承認範囲。回収は `release` が終了を確かめた後だけ。解放は stdin を閉じる → 期限の手前まで待つ → SIGKILL → 回収。
 6. **試験の opt-out**: 既定の集合の試験は本番バイナリで `RunPodSandbox` を呼ぶが、rust-ci は AppArmor を緩和せず supervisor の bin も隣に無い。試験用 feature `pod-holder-test-support`（release で有効にすると `compile_error!`）のビルドに限り、環境変数 `FANDHE_CONTAINER_TEST_POD_HOLDER=off` で注入を止める。実機前提の試験は注入する。注入の配線は `pod_sandbox_grpc` の `cri2_h6_injected_pod_holder_fails_closed_without_supervisor_bin` が固定する。

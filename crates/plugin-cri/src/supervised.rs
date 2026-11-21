@@ -47,7 +47,7 @@
 //!   `systemd-run` 越しに引き継ぐ方式は、安全な fd 継承の API が std に無く（`pre_exec` は事前承認の範囲外の `unsafe`）、
 //!   supervisor crate の `SupervisorLaunch` の変更も要るため採らなかった。ランチャー経由はランチャーが検証する（#1719）。
 //! - 権限モデルは CLI と同じ共有クライアントの規則: 実体の隣に信頼できるランチャーがあればランチャー経由、無ければ直接経路。
-//!   uid 0 は spawn の前に `UNIMPLEMENTED`（#2442・#2241）。
+//!   uid 0 は spawn の前に `PERMISSION_DENIED`（#2241 の決定・#4709）。
 //! - `XDG_RUNTIME_DIR` が plugin の環境に必要（将来の plugin proxy が環境を空にすると `FAILED_PRECONDITION`。#1869）。
 //! - 実機での通し（委譲 scope 内での plugin-cri → supervisor → delete）は未実施（#850・#2062）。
 
@@ -161,7 +161,7 @@ impl SupervisorStarter for ProductionStarter {
 
 /// [`ProductionStarter::start`] の本体（試験で解決・euid・起動を注入する）。
 ///
-/// 順序: (1) `resolve`（`not installed`・rootful の `UNIMPLEMENTED`・ランチャーの信頼の順位と文言は従来どおり）→
+/// 順序: (1) `resolve`（`not installed`・rootful の `PERMISSION_DENIED`（#2241）・ランチャーの信頼の順位と文言は従来どおり）→
 /// (2) 直接経路（ランチャーを使わない）のときだけ、spawn の前に共通口 `pod_holder::open_supervisor_beside_at` と同じ基準で
 /// 実体の隣の bin を検査する → (3) `run`。経路の判定は `resolve` が実際に選んだ結果（`uses_launcher`）に拠る。事前に別途
 /// 分類すると、分類と resolve の間でランチャーが出入りしたときに検査を飛ばす窓ができるため。ランチャー経由は
@@ -195,6 +195,40 @@ fn start_checked(
         }
     }
     run(&launch)
+}
+
+/// 本番の [`ProductionStarter`] と同じ解決・検査（`start_checked`・`SupervisorLaunch` の解決）を通し、`/proc/self/status` の内容だけを
+/// 注入する試験専用の起動（feature `rootful-test-support`。uid 0 の恒久拒否 SEC-5・#4709 を非 root で通す）。`exe` は supervisor の隣置き先。
+#[cfg(feature = "rootful-test-support")]
+#[derive(Debug, Clone)]
+pub struct StatusInjectedStarter {
+    /// 隣に supervisor の bin を置いた実行ファイルのパス。
+    pub exe: std::path::PathBuf,
+    /// `/proc/self/status` 相当の本文。
+    pub status: String,
+}
+
+#[cfg(feature = "rootful-test-support")]
+impl SupervisorStarter for StatusInjectedStarter {
+    fn start(
+        &self,
+        root: &Path,
+        opts: &StartOptions<'_>,
+        id: &ContainerId,
+    ) -> (Result<NonZeroU32, OciRuntimeError>, Option<Child>) {
+        start_checked(
+            &self.exe,
+            current_euid,
+            |exe| {
+                SupervisorLaunch::resolve_beside_with_status(
+                    exe,
+                    fandhe_container_supervisor::start_client::locate_systemd_run,
+                    || Some(self.status.clone()),
+                )
+            },
+            |launch| start_with_options(launch, root, opts, id, production_deadline()),
+        )
+    }
 }
 
 /// 解決済みの起動依存と受信期限を固定した起動（結合試験が偽の systemd-run・supervisor を注入する口。D11）。

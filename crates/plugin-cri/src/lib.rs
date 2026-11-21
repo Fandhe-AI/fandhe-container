@@ -49,6 +49,13 @@ compile_error!(
     "the `userns-helper-test-support` feature lets the userns helper skip joining and its executable be overridden and must not be enabled in release builds"
 );
 
+// `rootful-test-support` は本番の start 経路へ `/proc/self/status` を注入する試験専用の入口を有効にする feature で、製品のバイナリに
+// 含める理由がない。最適化ビルドで有効になっていたらコンパイルを止める（SEC-5・#4709・REPAIR-3。`userns-helper-test-support` と同じ方式）。
+#[cfg(all(feature = "rootful-test-support", not(debug_assertions)))]
+compile_error!(
+    "the `rootful-test-support` feature lets the process status be injected into the start path and must not be enabled in release builds"
+);
+
 pub mod adapter;
 #[cfg(target_os = "linux")]
 pub mod audit_relay;

@@ -43,7 +43,7 @@
 //!
 //! # 未実装・残余（REPAIR-3）
 //!
-//! - 本番の起動経路は `RootfulHostRoot` を launcher が `UNIMPLEMENTED` で拒否している（#2241・SEC-5）ため、動くのは rootless の
+//! - 本番の起動経路は `RootfulHostRoot` を launcher が `PermissionDenied` で意図して恒久拒否している（#2241・SEC-5）ため、動くのは rootless の
 //!   2 モデルだけ。rootful 固有の分岐は持たない
 //! - 範囲写像でコンテナの uid 0 が実効 uid に写らない構成では、元の辿り直しが `EACCES` になり `FailedPrecondition` で拒否する
 //! - 先が symlink の場合は解決せず拒否する（D9 の決定・#3210。再検討の条件は D9 の「残余・見直し条件」）。違反記録は付けて

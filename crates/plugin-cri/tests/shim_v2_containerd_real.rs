@@ -28,7 +28,7 @@
 //! 事前に `cargo build -p fandhe-container-supervisor -p fandhe-container-plugin-cri` を行う。shim と supervisor は作業ディレクトリの
 //! `bin/` へ 0755 でコピーして使い、特権ランチャーは置かない（置くと rootful のインストールとみなされる）。
 //! 前提が欠けたら skip ではなく 1 行目 `PRECONDITION FAILED` で失敗する。rootful の containerd では Create は通るが Start が
-//! `UNIMPLEMENTED`（#2442・#2241）になるため対象外。
+//! `PERMISSION_DENIED`（#2442・#2241 の決定）になるため対象外。
 //!
 //! # 実機前提テストとしての分離
 //! `-- --ignored` 指定時のみ実行する（ci.md「実機前提テスト」）。未指定は案内を出して成功する。CI では `platform-ci` の ubuntu が委譲スコープで実行する（#4104。containerd は
@@ -431,7 +431,7 @@ mod linux {
             .map(|m| m.gid())
             .unwrap_or(0);
         if uid == 0 {
-            precondition_failed("must run as a non-root user (rootful start is UNIMPLEMENTED)");
+            precondition_failed("must run as a non-root user (rootful start is refused by policy)");
         }
         if !Path::new("/sys/fs/cgroup/cgroup.controllers").is_file() {
             precondition_failed("cgroup v2 is required");

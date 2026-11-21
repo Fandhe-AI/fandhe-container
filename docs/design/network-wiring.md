@@ -21,7 +21,7 @@
 ## 現状（main `cd1eab83`）
 
 - `crates/net` には `--add-host`・`--dns` の検証と反映、host / none モード、bridge ネットワーク（作成・接続・公開・削除）、DNS ヘルパーが実装済み。製品コードから呼んでいるのは plugin-cri の `netsetup` だけで、本番には注入されていない。CLI と supervisor の起動経路からは届かない
-- 本番の CLI 経路は rootless（`RootlessSingleId` / `RootlessSubordinateIds`）。uid 0 は `UNIMPLEMENTED`（#2241）
+- 本番の CLI 経路は rootless（`RootlessSingleId` / `RootlessSubordinateIds`）。uid 0 の `start` は `PERMISSION_DENIED` で恒久拒否（#2241 の D1 A・#4709）。uid 0 の network 系の `create` は D13 の判断待ちのため `UNIMPLEMENTED` のまま（#4709 の対象外）
 - 特権ランチャー（SUP-14）を CLI の隣に置いた rootful のインストールでは、supervisor が `CAP_NET_ADMIN`・`CAP_SYS_ADMIN` を ambient で持つ。コンテナは引き続き user namespace の中で動く
 - core の start は config の network namespace を `Unimplemented` で拒否し、指定が無ければホストの netns を共有する。CRI の bundle は `POD` / `CONTAINER` で `{"type":"network"}` を出し、`NODE` では出さない
 - そのため人間担当の実機実測 #349（TASK-186・NET-12）と #319（TASK-140・NET-2〜NET-4）を製品の経路で確かめられない

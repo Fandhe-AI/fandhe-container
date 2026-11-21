@@ -73,7 +73,7 @@
 //!
 //! - 分離は検証済みの計画を型で受け取る。既定は [`plan`] → [`isolate`]（user namespace 必須・
 //!   非 root 起動。SEC-5）。ホスト root のまま動く rootful 分離は [`plan_rootful_host_root`] →
-//!   [`isolate_rootful_host_root`] という別経路で、計画の型（[`IsolationPlan`] /
+//!   [`isolate_rootful_host_root`] という別経路で（本番経路は呼ばない。結合試験・計測用。#2241）、計画の型（[`IsolationPlan`] /
 //!   [`RootfulHostRootPlan`]）が異なるため既定経路が rootful へ暗黙に落ちることはない
 //! - シングルスレッドのプロセスから呼ぶこと（マルチスレッドからの `CLONE_NEWUSER` は
 //!   `EINVAL` になり、`FailedPrecondition` で返す）
@@ -1708,8 +1708,8 @@ const fn root_propagation_of(host_slave: bool) -> sys::RootPropagation {
 /// 保ったまま**分離する。コンテナ内 root はホスト root そのものであり、SEC-5（非 root 起動時に
 /// コンテナ内 root をホストの非特権 UID へ写す）の保護は受けない。
 ///
-/// 本番の launcher と supervisor はこの権限モデルを拒否する（許すかは #2241 で判断待ち。
-/// `docs/design/rootful-host-root.md`）。この経路は分離の下位 API で、結合試験の構成が使う。
+/// 本番の launcher と supervisor はこの権限モデルを意図して恒久的に `PermissionDenied` で拒否する（#2241 の決定 D1 A・D2 A。
+/// `docs/design/rootful-host-root.md`）。この経路は本番経路から呼ばれず、結合試験・計測（CORE-7・CORE-9）用の下位 API として残す（D3 A-1）。
 ///
 /// **用途**: CORE-7・CORE-9 の rootful 分離（spec 上、dev-box02 の PoC-14・15・17 で実機実証済みの
 /// 構成）。root 起動でもコンテナ内 root を非特権 UID へ写す構成は未実装（TASK-40.2 の

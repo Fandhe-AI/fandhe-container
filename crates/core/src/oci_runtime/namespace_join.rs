@@ -387,7 +387,7 @@ impl NamespaceJoin {
             ));
         }
         // net は pod の user namespace が所有するものに限る(SEC-5)。呼び出し側自身(または外側)の user namespace 所有の
-        // netns(rootless 本番ではホストの netns)は、rootful の扱い(#2241)が決まるまで受けない(`Unimplemented`)。
+        // netns(rootless 本番ではホストの netns)は、受けない(`Unimplemented`。rootful 本体は #2241 の決定で別途恒久拒否済みで、これは netns の参加の未対応)。
         // それ以外(別 pod の userns の所有など)は取り違えで `PermissionDenied`。
         let net_identity = match &net {
             None => None,

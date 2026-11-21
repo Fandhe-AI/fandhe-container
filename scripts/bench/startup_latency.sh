@@ -23,7 +23,7 @@
 #     利用者の既定の状態ルートに計測のコンテナを残さない。/tmp に固定するのは制御ソケット
 #     （<root>/<id>/supervisor.sock.tmp-<pid>）を sun_path の 108 バイトに収めるため。後始末で
 #     残存があれば消さずに残し、パスを stderr に出す。
-#   - start は rootless のみ（rootful は UNIMPLEMENTED）。delete は委譲スコープの外から実行すると
+#   - start は rootless のみ（rootful は #2241 の決定で PERMISSION_DENIED）。delete は委譲スコープの外から実行すると
 #     cgroup を消せず exit 4 になるため、`systemd-run --user --scope -p Delegate=yes` の中で
 #     本スクリプトを実行する（手順の全文は AGENTS.md「実機前提テスト」の `startup_latency.sh`
 #     の項目。要点は下記「実機での実行手順」）。delete は状態を消した後にログのロックを最大でおよそ

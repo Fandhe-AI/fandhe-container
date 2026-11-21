@@ -66,6 +66,13 @@ compile_error!(
     "the `exec-test-support` feature exposes test-only exec entry points and must not be enabled in release builds"
 );
 
+// `start-status-test-support` は `/proc/self/status` の読み取りだけを差し替える試験専用の入口（rootful 拒否の経路を非 root で通す）を
+// 有効にする feature で、製品のバイナリに含める理由がない。最適化ビルドで有効になっていたらコンパイルを止める（SEC-5・#4709・REPAIR-3）。
+#[cfg(all(feature = "start-status-test-support", not(debug_assertions)))]
+compile_error!(
+    "the `start-status-test-support` feature lets the process status read be replaced in the start path and must not be enabled in release builds"
+);
+
 #[cfg(target_os = "linux")]
 pub mod attach_io;
 #[cfg(target_os = "linux")]

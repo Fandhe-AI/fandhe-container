@@ -594,14 +594,15 @@ mod imp {
     #[cfg(target_os = "linux")]
     const FORK_AGAIN_CHILD_WITHIN: Duration = Duration::from_secs(10);
 
-    /// 子の終了を期限まで待ちつつ、出力ファイルが上限を超えたら `Err`（呼び出し側が子を回収する）。
+    /// 子の終了を期限まで待ちつつ、出力ファイルが上限を超えたら `Err`。`Err` の 2 つ目は子を回収済みか
+    /// （回収済みなら pid が再利用されうるため、呼び出し側は数値の pgid で止めない）。
     /// `reap::output_within_capped` は終了後に空のグループへ `kill` を送り、環境により usage エラーで
     /// 失敗する（Docker の aarch64 で 12 回中複数回）ため使わず、待ちループに大きさの監視だけ足す。
     #[cfg(target_os = "linux")]
     fn wait_capped(
         child: &mut std::process::Child,
         files: &[&Path],
-    ) -> Result<std::process::ExitStatus, String> {
+    ) -> Result<std::process::ExitStatus, (String, bool)> {
         let until = std::time::Instant::now() + FORK_AGAIN_CHILD_WITHIN;
         let over_cap = || -> Result<(), String> {
             for f in files {
@@ -616,16 +617,17 @@ mod imp {
             Ok(())
         };
         loop {
-            over_cap()?;
+            over_cap().map_err(|e| (e, false))?;
             match child.try_wait() {
                 // 終了の直前に上限を超えて書いた分も見落とさないよう、終了を確かめた後にもう一度大きさを見る。
-                Ok(Some(st)) => return over_cap().map(|()| st),
+                Ok(Some(st)) => return over_cap().map(|()| st).map_err(|e| (e, true)),
                 Ok(None) => {}
-                Err(e) => return Err(format!("try_wait failed: {e}")),
+                Err(e) => return Err((format!("try_wait failed: {e}"), false)),
             }
             if std::time::Instant::now() >= until {
-                return Err(format!(
-                    "child did not exit within {FORK_AGAIN_CHILD_WITHIN:?}"
+                return Err((
+                    format!("child did not exit within {FORK_AGAIN_CHILD_WITHIN:?}"),
+                    false,
                 ));
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -683,9 +685,12 @@ mod imp {
         };
         let status = match wait_capped(&mut child, &[&out_path, &err_path]) {
             Ok(s) => s,
-            Err(e) => {
-                super::reap::kill_group_or_report(child.id());
-                let _ = super::reap::reap(&mut child, super::reap::reap_within());
+            Err((e, reaped)) => {
+                // 回収前だけプロセスグループごと止める（回収後の番号は再利用されうる）。
+                if !reaped {
+                    super::reap::kill_group_or_report(child.id());
+                    let _ = super::reap::reap(&mut child, super::reap::reap_within());
+                }
                 panic!("fork_again child did not finish cleanly: {e}");
             }
         };
@@ -709,7 +714,7 @@ mod imp {
         }
         assert_eq!(
             stdout.trim_end(),
-            "fork_again child: primary=[IsolationForkAgain] code=Internal"
+            "fork_again child: primary=[IsolationForkAgain] code=Internal message=audit record could not be persisted by primary or fallback path (primary: isolation_fork_again)"
         );
         println!("audit_sink_isolation: fork_again reaches the fallback as isolation_fork_again");
     }
@@ -731,9 +736,13 @@ mod imp {
             .spawn()
         {
             Ok(mut c) => {
-                if let Err(e) = super::reap::wait_within(&mut c, Duration::from_secs(5)) {
-                    let _ = super::reap::reap(&mut c, super::reap::reap_within());
-                    panic!("the probe did not exit in time: {e}");
+                match super::reap::wait_within(&mut c, Duration::from_secs(5)) {
+                    // 正常終了した場合だけ「上限が効かない」の印を出す（異常終了を適用外の成功にしない）。
+                    Ok(st) => assert!(st.success(), "the probe exited abnormally: {st:?}"),
+                    Err(e) => {
+                        let _ = super::reap::reap(&mut c, super::reap::reap_within());
+                        panic!("the probe did not exit in time: {e}");
+                    }
                 }
                 println!("{FORK_AGAIN_NOT_ENFORCED}");
                 return;
@@ -752,9 +761,10 @@ mod imp {
         let e = sink.record(&record()).unwrap_err();
         assert!(!marker.exists(), "the primary must not run");
         println!(
-            "fork_again child: primary={:?} code={:?}",
+            "fork_again child: primary={:?} code={:?} message={}",
             *seen.lock().unwrap(),
-            e.code()
+            e.code(),
+            e.message()
         );
     }
 

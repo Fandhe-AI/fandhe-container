@@ -62,12 +62,24 @@ pub(crate) fn read_capped_until(
             Err(e) => return Err(ReadStop::Io(e, out)),
         }
         let room = (max - out.len() as u64).min(buf.len() as u64) as usize;
-        match r.read(&mut buf[..room]) {
+        let Some(dst) = buf.get_mut(..room) else {
+            return Err(ReadStop::Io(
+                io::Error::other("read buffer out of range"),
+                out,
+            ));
+        };
+        match r.read(dst) {
             Ok(0) => break,
             Ok(n) => {
-                let chunk = &buf[..n];
+                // `Read` の実装が渡した長さを超える値を返しても、読んでいないバイトを結果に含めず panic もしない。
+                let Some(chunk) = dst.get(..n) else {
+                    return Err(ReadStop::Io(
+                        io::Error::other("read returned more bytes than requested"),
+                        out,
+                    ));
+                };
                 if stop_at_newline && let Some(i) = chunk.iter().position(|&b| b == b'\n') {
-                    out.extend_from_slice(&chunk[..=i]);
+                    out.extend_from_slice(chunk.get(..=i).unwrap_or(chunk));
                     break;
                 }
                 out.extend_from_slice(chunk);
@@ -206,6 +218,33 @@ mod tests {
         let got = read_capped_until(&mut r, 4096, t0 + Duration::from_secs(5), true).unwrap();
         assert_eq!(got, b"xy");
         assert!(t0.elapsed() < Duration::from_secs(2));
+    }
+
+    /// REPAIR-5: `Read` が渡した長さを超える値を返したら、読めた分を保持した `Io` で返す（panic しない）。
+    #[test]
+    fn repair5_4733_overlong_read_count_is_io_error() {
+        struct Liar(std::io::PipeReader);
+        impl Read for Liar {
+            fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+                Ok(b.len() + 1)
+            }
+        }
+        impl AsFd for Liar {
+            fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+                self.0.as_fd()
+            }
+        }
+        let (r, mut w) = std::io::pipe().unwrap();
+        w.write_all(b"x").unwrap();
+        let _w = close_after(w, GUARD);
+        let got = read_capped_until(&mut Liar(r), 4096, Instant::now() + T, false);
+        match got {
+            Err(ReadStop::Io(e, b)) => {
+                assert_eq!(e.to_string(), "read returned more bytes than requested");
+                assert!(b.is_empty());
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     /// 上限を超えて溜めない。

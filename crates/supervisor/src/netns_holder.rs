@@ -550,6 +550,12 @@ mod tests {
         );
     }
 
+    /// stderr の書き込み端を持つ補助（`sleep`）の寿命（秒）。試験の検証区間（`ready` と終了の観測の待ちは各 10 秒まで）を
+    /// 覆う長さにし、検証が終わるまで書き込み端を確実に持たせる。補助はガードの drop で kill するので、通常はこの長さを待たない。
+    /// 読み取りが EOF 待ちへ回帰したときは、この長さで EOF が届いて呼び出しが戻り、経過時間の assert が失敗を報告する
+    /// （ハングの独立の期限。REPAIR-5・REPAIR-12）。
+    const HELPER_HOLD_SECS: &str = "30";
+
     /// 試験の後始末（REPAIR-5）: drop で holder 役と補助を SIGKILL・回収する（準備・照合の失敗の panic でも）。どちらも
     /// 試験の直接の子で子を作らない 1 プロセスなので（未回収の `Child` への kill は pid の再利用を撃たない）、孤児を回収しない
     /// PID 1 の下でも zombie を残さない。
@@ -574,9 +580,9 @@ mod tests {
 
     /// REPAIR-5・REPAIR-12・REPAIR-10 (d)・#4733: 別プロセスが stderr の書き込み端を持ち続けても、停止経路
     /// `kill_and_reap` は EOF を待たず、終了状態と読めた stderr を期限内（`STDERR_DRAIN_TIMEOUT` 前後）に返す。
-    /// 試験は自分で pipe を作り、書き込み端を holder 役（`sh`）の stderr と、試験の直接の子の補助（`sleep 8`。子を作らない
-    /// 1 プロセス）の stderr の両方に渡す。補助は 8 秒の経過で自分で終わる（読み取りが回帰して EOF 待ちに戻ったときの独立の
-    /// 期限で、そのとき経過時間の assert が失敗を報告する。`timeout` + `sh` の 2 段だと、期限の SIGKILL で `timeout` が `sh` を
+    /// 試験は自分で pipe を作り、書き込み端を holder 役（`sh`）の stderr と、試験の直接の子の補助（`sleep`。[`HELPER_HOLD_SECS`] 秒。子を作らない
+    /// 1 プロセス）の stderr の両方に渡す。補助は検証が終わるまで書き込み端を持ち、ガードの drop で止める（読み取りが回帰して EOF
+    /// 待ちに戻ったときは [`HELPER_HOLD_SECS`] 秒で自分で終わり、経過時間の assert が失敗を報告する。`timeout` + `sh` の 2 段だと、期限の SIGKILL で `timeout` が `sh` を
     /// 回収する前に終わり、`sh` が未回収で残る）。holder 役は診断行を stderr へ書き、stdout へ `ready` を出して `exec sleep 100` に置き換わる。
     /// `ready` の受信で確かめられるのは診断行の書き込みまでで、SIGKILL は holder 役（置き換わる前でも後でも同じ pid）へ送る。
     #[test]
@@ -584,7 +590,7 @@ mod tests {
         use std::os::fd::OwnedFd;
         let (err_r, err_w) = std::io::pipe().unwrap();
         let helper = Command::new("sleep")
-            .arg("8")
+            .arg(HELPER_HOLD_SECS)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(err_w.try_clone().unwrap()))
@@ -628,14 +634,14 @@ mod tests {
 
     /// REPAIR-5・REPAIR-12・REPAIR-10 (d)・#4733: 公開の `try_exit` は、holder の終了後も別プロセスが stderr の書き込み端を
     /// 持ち続けていても、EOF を待たずに終了状態と即時に読める診断を返す（`HolderAdapter::is_alive` からも呼ばれる待たない契約）。
-    /// holder 役（`sh`）は診断行を書いて終了コード 3 で終わり、書き込み端は補助（`sleep 8`。子を作らない 1 プロセス）も持つ。
+    /// holder 役（`sh`）は診断行を書いて終了コード 3 で終わり、書き込み端は補助（`sleep`。[`HELPER_HOLD_SECS`] 秒。子を作らない 1 プロセス）も持つ。
     /// `try_exit` が誤って [`STDERR_DRAIN_TIMEOUT`] を渡すと、終了を観測した呼び出しが 500 ms かかり失敗する。
     #[test]
     fn repair5_4733_try_exit_does_not_wait_for_eof_when_writer_is_held() {
         use std::os::fd::OwnedFd;
         let (err_r, err_w) = std::io::pipe().unwrap();
         let helper = Command::new("sleep")
-            .arg("8")
+            .arg(HELPER_HOLD_SECS)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(err_w.try_clone().unwrap()))

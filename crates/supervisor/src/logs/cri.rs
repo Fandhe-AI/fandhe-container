@@ -386,15 +386,14 @@ fn open_log_file(path: &std::path::Path) -> Result<std::fs::File, TraitError> {
 
 /// `reopen` 用に、親ディレクトリを検査して fd で開く（以後の open・作成・削除はこの fd の直下だけで行い、パスを再解決しない。
 /// CRI-2・SEC-1・#4652）。パスの検査（[`super::rotating::check_dir`]。絶対・`..` なし・祖先の symlink なし）で得た実体パスを、
-/// `/` から 1 要素ずつ `openat(O_DIRECTORY | O_NOFOLLOW)` で辿り、開いた各祖先の fd を `fstat` で確かめる（所有者が root か
-/// 自分で、group / other が書き込めないか sticky）。最後の fd はディレクトリで、所有者が root か自分で、group / other が
+/// `/` から 1 要素ずつ `openat(O_DIRECTORY | O_NOFOLLOW)` で辿り、開いた各祖先の fd を `fstat` で確かめる（[`ancestor_ok`]。
+/// 所有者が root か自分で、other が書き込めるなら sticky、group 書き込み可は root 所有か sticky）。最後の fd はディレクトリで、所有者が root か自分で、group / other が
 /// 書き込めないこと。祖先を名前で引き直さないため、検査と open の間に祖先を差し替えられても、差し替えた祖先は検査を通らない。
 #[cfg(target_os = "linux")]
 fn open_verified_dir(parent: &std::path::Path) -> Result<std::fs::File, TraitError> {
     use std::os::fd::AsFd as _;
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 
-    const STICKY: u32 = 0o1000;
     let canonical = super::rotating::check_dir(parent).map_err(|_| unopenable())?;
     let euid = crate::control::listener::effective_uid().map_err(|_| unopenable())?;
     let flags = crate::sys::open_dir_nofollow_flags().map_err(|_| unopenable())?;
@@ -408,8 +407,7 @@ fn open_verified_dir(parent: &std::path::Path) -> Result<std::fs::File, TraitErr
             continue;
         };
         let anc = dir.metadata().map_err(|_| unopenable())?;
-        let owner_ok = anc.uid() == 0 || anc.uid() == euid;
-        if !owner_ok || (anc.mode() & 0o022 != 0 && anc.mode() & STICKY == 0) {
+        if !ancestor_ok(anc.uid(), anc.mode(), euid) {
             return Err(unopenable());
         }
         dir = crate::sys::open_dir_at(dir.as_fd(), name).map_err(|_| unopenable())?;
@@ -422,6 +420,18 @@ fn open_verified_dir(parent: &std::path::Path) -> Result<std::fs::File, TraitErr
         return Err(unopenable());
     }
     Ok(dir)
+}
+
+/// 親を辿るときの祖先の許可（純関数）。所有者は root か `euid`。other が書き込めるなら sticky が要る。group が書き込める
+/// のは root 所有のときだけ許す（Ubuntu の `/var/log` は `root:syslog 0775` で、管理用のグループに委ねた配置。kubelet の
+/// `/var/log/pods` の祖先になる）。自分所有の group 書き込み可は sticky でなければ拒否する。
+#[cfg(target_os = "linux")]
+fn ancestor_ok(uid: u32, mode: u32, euid: u32) -> bool {
+    const STICKY: u32 = 0o1000;
+    let sticky = mode & STICKY != 0;
+    (uid == 0 || uid == euid)
+        && (mode & 0o002 == 0 || sticky)
+        && (mode & 0o020 == 0 || uid == 0 || sticky)
 }
 
 /// 確定の直前に、`dir` の直下の `name` が今も `file` と同じ inode を指すことを確かめる（違えば `FailedPrecondition`。
@@ -1823,6 +1833,22 @@ mod tests {
                 .expect("old writer");
             sink.flush().expect("flush");
             assert_eq!(read(&rotated).lines().count(), 1);
+        }
+
+        /// SEC-1・CRI-2・#4652: 祖先の許可の表（root:syslog 0775 の `/var/log` は通し、他人所有・other 書き込み可で
+        /// sticky なし・自分所有の group 書き込み可で sticky なしは拒否する）。
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn sec1_4652_ancestor_permission_table() {
+            let me = 1000;
+            assert!(ancestor_ok(0, 0o40755, me));
+            assert!(ancestor_ok(0, 0o40775, me), "/var/log root:syslog 0775");
+            assert!(ancestor_ok(0, 0o41777, me), "/tmp");
+            assert!(ancestor_ok(me, 0o40750, me));
+            assert!(!ancestor_ok(0, 0o40777, me));
+            assert!(!ancestor_ok(me, 0o40770, me));
+            assert!(ancestor_ok(me, 0o41770, me));
+            assert!(!ancestor_ok(2000, 0o40755, me));
         }
 
         /// SEC-1・CRI-2・#4652: 祖先が group / other に書き込めて sticky でなければ（祖先を差し替えられる）、開き直しは

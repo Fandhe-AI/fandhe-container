@@ -477,9 +477,12 @@ impl NetnsHolderProcess {
 impl Drop for NetnsHolderProcess {
     fn drop(&mut self) {
         // 端を閉じて EOF を伝え、SIGKILL と回収を試みる。回収できなければ zombie のまま残す（モジュール doc）。
+        // 戻り値の診断は使わないため、stderr の読み取り端は先に閉じる（並行 spawn の子が書き込み端を持っていても、
+        // 使わない診断の EOF を待たない。#4916・REPAIR-5）。
         self.chan = None;
+        self.stderr = None;
         if let Some(mut child) = self.child.take() {
-            let _ = kill_and_reap(&mut child, &mut self.stderr);
+            let _ = kill_and_reap(&mut child, &mut None);
         }
     }
 }

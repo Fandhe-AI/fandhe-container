@@ -251,13 +251,14 @@ fn escape_capped(raw: &[u8], cap: usize) -> String {
 const STDERR_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// 回収済み holder の stderr を読む（書き込み端は holder の終了で閉じる。holder は fork しないので通常は EOF で止まる）。
-/// 書き込み端の複製を持つ子が残る場合は [`STDERR_DRAIN_TIMEOUT`] で打ち切り、読めた分だけを返す
-/// （期限切れ・読み取り失敗はエラーにしない。HolderExit の材料を優先する。#4733・REPAIR-5）。
-fn drain_stderr(stderr: &mut Option<ChildStderr>) -> String {
+/// 書き込み端の複製を持つ子が残る場合は `timeout` で打ち切り、読めた分だけを返す（期限切れ・読み取り失敗はエラーに
+/// しない。HolderExit の材料を優先する。#4733・REPAIR-5）。停止・起動失敗の後始末は [`STDERR_DRAIN_TIMEOUT`]、
+/// 待たない契約の生存確認（[`NetnsHolderProcess::try_exit`]）は `Duration::ZERO`（即時に読める分だけ）を渡す。
+fn drain_stderr(stderr: &mut Option<ChildStderr>, timeout: Duration) -> String {
     let Some(mut s) = stderr.take() else {
         return String::new();
     };
-    drain_capped(&mut s, STDERR_DRAIN_TIMEOUT)
+    drain_capped(&mut s, timeout)
 }
 
 fn drain_capped(r: &mut (impl std::io::Read + std::os::fd::AsFd), timeout: Duration) -> String {
@@ -297,7 +298,7 @@ fn kill_and_reap(child: &mut Child, stderr: &mut Option<ChildStderr>) -> Option<
     // 既に回収済みなら std は何も送らない（回収後の pid へシグナルを送らない。#2545）。
     let _ = child.kill();
     match wait_until(child, REAP_TIMEOUT) {
-        Ok(Some(st)) => Some(exit_of(st, drain_stderr(stderr))),
+        Ok(Some(st)) => Some(exit_of(st, drain_stderr(stderr, STDERR_DRAIN_TIMEOUT))),
         _ => None,
     }
 }
@@ -416,7 +417,11 @@ impl NetnsHolderProcess {
             Ok(Some(st)) => {
                 self.child = None;
                 self.chan = None;
-                Ok(Some(exit_of(st, drain_stderr(&mut self.stderr))))
+                // 待たない契約のため EOF を待たず、即時に読める診断だけを回収する。
+                Ok(Some(exit_of(
+                    st,
+                    drain_stderr(&mut self.stderr, Duration::ZERO),
+                )))
             }
             Err(_) => Err(TraitError::new(
                 ErrorCode::Internal,
@@ -444,7 +449,10 @@ impl NetnsHolderProcess {
         if let Ok(Some(st)) = wait_until(&mut child, STOP_GRACE) {
             return HolderStopOutcome {
                 path: StopPath::Stopped,
-                exit: Some(exit_of(st, drain_stderr(&mut self.stderr))),
+                exit: Some(exit_of(
+                    st,
+                    drain_stderr(&mut self.stderr, STDERR_DRAIN_TIMEOUT),
+                )),
                 elapsed: started.elapsed(),
                 unreaped: None,
             };
@@ -519,6 +527,23 @@ mod tests {
         assert!(
             el >= Duration::from_millis(200) && el < Duration::from_secs(2),
             "{el:?}"
+        );
+    }
+
+    /// REPAIR-5・#4733: 期限 0（`try_exit` の生存確認）は、書き込み端が残っていても待たず、即時に読める分だけを返す。
+    #[test]
+    fn repair5_4733_drain_capped_with_zero_timeout_does_not_wait() {
+        use std::io::Write as _;
+        let (mut r, mut w) = std::io::pipe().unwrap();
+        w.write_all(b"diag").unwrap();
+        let _w = crate::deadline_read::close_after(w, Duration::from_secs(5));
+        let t0 = Instant::now();
+        let got = drain_capped(&mut r, Duration::ZERO);
+        assert_eq!(got, "diag");
+        assert!(
+            t0.elapsed() < Duration::from_millis(100),
+            "{:?}",
+            t0.elapsed()
         );
     }
 

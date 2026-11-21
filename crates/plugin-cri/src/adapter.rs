@@ -156,7 +156,7 @@ pub struct CriPluginBackends {
     state: Arc<dyn StateStore>,
     network: Arc<dyn NetworkPlugin>,
     /// CRI 側の記録器（`cri.*`。`CriOpKind` の全種・記録ストア 3 種・ストリーミングの接続観測 4 種・
-    /// `image_pull_recovery`。名前は最悪 48 種で、`MAX_TRACKED_OPS` に 8 の余裕を残すことを試験で固定する。
+    /// `image_pull_recovery`。名前は最悪 49 種で、`MAX_TRACKED_OPS` に 8 の余裕を残すことを試験で固定する。
     /// REPAIR-4・CRI-6・#4380）。注入（`with_recorder`）では実行層もここへ書く。
     recorder: Arc<OpRecorder>,
     /// 本番（`production()`）だけが持つライフサイクル記録器（core の `oci_runtime`・コンテナログ・net の bridge / netsetup の
@@ -640,10 +640,44 @@ impl CriPluginBackends {
         )))
         .with_runtime_timeout(PLUGIN_RUNTIME_TIMEOUT)
         .with_runtime(RuntimeAdapter::new(Arc::clone(&self.runtime)), bundles);
-        match &self.pod_holder {
+        let service = match &self.pod_holder {
             Some(p) => service.with_pod_holder(Arc::clone(p)),
             None => service,
+        };
+        self.with_production_log_reopener(service)
+    }
+
+    /// `ReopenContainerLog` の本番の注入（Linux のみ。状態ルートが分かる構成だけ。CRI-2・SUP-7・#4652）。
+    /// 注入で組んだ構成・非 Linux は差さず、RPC は `UNIMPLEMENTED` のまま（REPAIR-3）。
+    #[cfg(target_os = "linux")]
+    fn with_production_log_reopener(&self, service: CriRuntimeService) -> CriRuntimeService {
+        match &self.state_root {
+            Some(root) => service.with_log_reopener(Arc::new(ProductionLogReopener(
+                fandhe_container_supervisor::control::ControlReopenLog::new(root.clone()),
+            ))),
+            None => service,
         }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn with_production_log_reopener(&self, service: CriRuntimeService) -> CriRuntimeService {
+        service
+    }
+}
+
+/// supervisor の制御チャネル（kind 10）で CRI ログを開き直す本番の注入口。
+#[cfg(target_os = "linux")]
+struct ProductionLogReopener(fandhe_container_supervisor::control::ControlReopenLog);
+
+#[cfg(target_os = "linux")]
+impl fandhe_container_cri::runtime_service::ContainerLogReopener for ProductionLogReopener {
+    fn reopen(
+        &self,
+        id: &fandhe_container_core::traits::ContainerId,
+        deadline: std::time::Instant,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), fandhe_container_core::traits::TraitError> {
+        self.0.reopen(id, deadline, cancel)
     }
 }
 
@@ -3269,7 +3303,7 @@ mod tests {
     #[cfg(unix)]
     const NAME_HEADROOM: usize = 8;
 
-    /// REPAIR-4・CRI-6（#4380）: CRI 記録器（本番の `recorder`）へ届きうる操作名の最悪数は 48 種で、
+    /// REPAIR-4・CRI-6（#4380）: CRI 記録器（本番の `recorder`）へ届きうる操作名の最悪数は 49 種で、
     /// `MAX_TRACKED_OPS - 8` 以下。`CriOpKind` の全種（`CriOpKind::ALL`）を数えるので、種別を足すと本試験が落ちて列挙の見直しを求める。
     #[cfg(unix)]
     #[test]
@@ -3302,7 +3336,7 @@ mod tests {
         }
         assert_eq!(rec.dropped_records(), 0);
         let total = rec.snapshot().len();
-        assert_eq!(total, 40 + 8, "CriOpKind::ALL.len() = 40 + 8 fixed names");
+        assert_eq!(total, 41 + 8, "CriOpKind::ALL.len() = 41 + 8 fixed names");
         assert!(
             total <= fandhe_container_core::observability::MAX_TRACKED_OPS - NAME_HEADROOM,
             "{total} names leave less than {NAME_HEADROOM} of headroom"
@@ -4065,6 +4099,36 @@ mod tests {
         let backends = backends.with_pod_holder_provider(fixed_holder());
         assert!(backends.pod_namespace_source().is_none());
         assert!(backends.pod_holder.is_some());
+    }
+
+    /// CRI-2・SUP-7・PLUG-1（#4652）: 状態ルートのある本番相当の構成は `ReopenContainerLog` の注入口を差し（未知の ID は
+    /// `NOT_FOUND`）、注入で組んだ構成は差さない（`UNIMPLEMENTED`）。
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn cri2_4652_log_reopener_is_injected_only_with_state_root() {
+        use fandhe_container_cri::runtime::v1::{
+            self, runtime_service_server::RuntimeService as _,
+        };
+        let call = |svc: CriRuntimeService| async move {
+            svc.reopen_container_log(tonic::Request::new(v1::ReopenContainerLogRequest {
+                container_id: "unknown".into(),
+            }))
+            .await
+            .expect_err("unknown id")
+            .code()
+        };
+        let bundles: Arc<dyn BundleProvider> = Arc::new(UnimplementedBundleProvider);
+        let injected = backends_for_pod_holder();
+        assert_eq!(
+            call(injected.runtime_service(Arc::clone(&bundles))).await,
+            tonic::Code::Unimplemented
+        );
+        let mut production = backends_for_pod_holder();
+        production.state_root = Some(PathBuf::from("/nonexistent-state-root"));
+        assert_eq!(
+            call(production.runtime_service(bundles)).await,
+            tonic::Code::NotFound
+        );
     }
 
     /// 保持役を差さない状態の backends（注入の試験用）。

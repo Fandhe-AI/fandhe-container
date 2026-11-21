@@ -138,6 +138,217 @@ unsafe extern "C" {
         value: *mut std::ffi::c_void,
         size: usize,
     ) -> isize;
+    // SAFETY（宣言そのものの妥当性）: `int openat(int dirfd, const char *pathname, int flags, ...)`。可変長部は
+    // `mode_t`（u32）1 個だけを渡す。CRI ログの開き直しが、検証済みの親ディレクトリ fd の直下を開くためだけに使う
+    // （`open_log_at`・`open_path_at`。#4652）。`libc` との照合は `libc_abi`（#1840）。
+    fn openat(dirfd: i32, pathname: *const std::ffi::c_char, flags: i32, ...) -> i32;
+    // SAFETY（宣言そのものの妥当性）: `int unlinkat(int dirfd, const char *pathname, int flags)`。整数とポインタ引数のみ。
+    // CRI ログの開き直しの後始末が、退避名へ移した自分のファイルを消すためだけに使う（`unlink_at`。#4652）。
+    fn unlinkat(dirfd: i32, pathname: *const std::ffi::c_char, flags: i32) -> i32;
+    // SAFETY（宣言そのものの妥当性）: `int renameat2(int olddirfd, const char *oldpath, int newdirfd,
+    // const char *newpath, unsigned int flags)`（glibc 2.28 以降・musl 1.2.6 以降。core の `rename_noreplace_at` と同じ前提で、
+    // supervisor は core を通じて既にこのシンボルを要する）。CRI ログの開き直しの後始末だけが使う（`rename_noreplace_at`。#4652）。
+    fn renameat2(
+        olddirfd: i32,
+        oldpath: *const std::ffi::c_char,
+        newdirfd: i32,
+        newpath: *const std::ffi::c_char,
+        flags: u32,
+    ) -> i32;
+    // SAFETY（宣言そのものの妥当性）: `int linkat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath,
+    // int flags)`。整数とポインタ引数のみ。CRI ログの開き直しが、`O_TMPFILE` で作った無名のファイルを確定の直前に公開する
+    // ためだけに使う（`link_fd_at`。#4652）。
+    fn linkat(
+        olddirfd: i32,
+        oldpath: *const std::ffi::c_char,
+        newdirfd: i32,
+        newpath: *const std::ffi::c_char,
+        flags: i32,
+    ) -> i32;
+}
+
+/// `openat(2)` のフラグ（include/uapi/asm-generic/fcntl.h。x86_64・aarch64 で共通。arch で値が違う `O_NOFOLLOW`・`O_DIRECTORY` は
+/// `arch`）。`libc_abi`（#1840）が `libc` と照合する。
+const O_WRONLY: i32 = 0o1;
+const O_CREAT: i32 = 0o100;
+const O_EXCL: i32 = 0o200;
+const O_NOCTTY: i32 = 0o400;
+const O_APPEND: i32 = 0o2000;
+const O_CLOEXEC: i32 = 0o2000000;
+const O_PATH: i32 = 0o10000000;
+/// CRI ログを新規に作るときの権限（umask で更に落ちる）。
+const LOG_CREATE_MODE: u32 = 0o640;
+
+/// `dir` の直下の 1 要素の名前を NUL 終端へ直す（`/`・NUL・`.`・`..`・空は `InvalidInput`。親の再解決を許さない）。
+fn single_component(name: &std::ffi::OsStr) -> io::Result<CString> {
+    let b = name.as_bytes();
+    if b.is_empty() || b == b"." || b == b".." || b.contains(&b'/') {
+        return Err(io::Error::from(io::ErrorKind::InvalidInput));
+    }
+    CString::new(b).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
+}
+
+/// `openat` の結果を `File` にする。
+fn openat_file(
+    dir: BorrowedFd<'_>,
+    name: &std::ffi::OsStr,
+    flags: i32,
+    mode: u32,
+) -> io::Result<std::fs::File> {
+    let name = single_component(name)?;
+    openat_cstr(dir, &name, flags, mode)
+}
+
+/// [`openat_file`] の本体（名前は検証済みの 1 要素か、`O_TMPFILE` の起点の `.` だけを受ける）。
+fn openat_cstr(
+    dir: BorrowedFd<'_>,
+    name: &std::ffi::CStr,
+    flags: i32,
+    mode: u32,
+) -> io::Result<std::fs::File> {
+    use std::os::fd::{FromRawFd as _, OwnedFd};
+    // SAFETY: `dir` は呼び出しの間有効な fd、`name` は NUL 終端で呼び出しの間生きる（呼び出し側が 1 要素か `.` に限る）。
+    // 可変長部は u32 1 個。失敗（-1）のときは fd を作らず `last_os_error` を返す。
+    let fd = unsafe { openat(dir.as_raw_fd(), name.as_ptr(), flags, mode) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `openat` が成功して返した、他に所有者のいない新しい fd。ここで唯一の所有者になる。
+    Ok(std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
+}
+
+/// 検証済みの親ディレクトリ `dir` の直下の CRI ログを追記で開く（`O_WRONLY | O_APPEND | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY |
+/// O_CLOEXEC`）。`create_excl` が真なら `O_CREAT | O_EXCL`（0o640）で新規に作る（既にあれば `AlreadyExists`。他者のファイルを開かない）。
+/// パスを再解決しない（CRI-2・SEC-1・#4652）。対応外の arch では `Unsupported`。
+pub(crate) fn open_log_at(
+    dir: BorrowedFd<'_>,
+    name: &std::ffi::OsStr,
+    create_excl: bool,
+) -> io::Result<std::fs::File> {
+    let nofollow = arch::O_NOFOLLOW.ok_or_else(unsupported)?;
+    let mut flags = O_WRONLY | O_APPEND | nofollow | O_NONBLOCK | O_NOCTTY | O_CLOEXEC;
+    if create_excl {
+        flags |= O_CREAT | O_EXCL;
+    }
+    openat_file(dir, name, flags, LOG_CREATE_MODE)
+}
+
+/// include/uapi/asm-generic/fcntl.h の `__O_TMPFILE`（x86_64・aarch64 で共通）。`O_TMPFILE` は arch の `O_DIRECTORY` との和。
+const O_TMPFILE_BASE: i32 = 0o20000000;
+
+/// 検証済みの親ディレクトリ `dir` の中に、名前の無い CRI ログを作る（`O_TMPFILE | O_WRONLY | O_APPEND | O_NONBLOCK |
+/// O_NOCTTY | O_CLOEXEC`・0o640）。どこからも見えず、[`link_fd_at`] で名前を付けるまで公開されない（CRI-2・#4652）。
+/// ファイルシステムが `O_TMPFILE` に対応しないときは `EOPNOTSUPP`（古いカーネルでは `EISDIR`）。対応外の arch では
+/// `Unsupported`。
+pub(crate) fn open_log_tmpfile_at(dir: BorrowedFd<'_>) -> io::Result<std::fs::File> {
+    let directory = arch::O_DIRECTORY.ok_or_else(unsupported)?;
+    let flags =
+        O_WRONLY | O_APPEND | O_NONBLOCK | O_NOCTTY | O_CLOEXEC | O_TMPFILE_BASE | directory;
+    openat_cstr(dir, c".", flags, LOG_CREATE_MODE)
+}
+
+/// include/uapi/linux/fcntl.h の `AT_FDCWD`（-100）と `AT_SYMLINK_FOLLOW`（0x400）。`libc_abi`（#1840）が照合する。
+const AT_FDCWD: i32 = -100;
+const AT_SYMLINK_FOLLOW: i32 = 0x400;
+
+/// `file`（[`open_log_tmpfile_at`] で作った名前の無いファイル）に、`dir` の直下の `name` として名前を付ける（`linkat(2)`）。
+/// 名前が既にあれば `AlreadyExists` で置き換えない。`AT_EMPTY_PATH` は `CAP_DAC_READ_SEARCH` が要るため使わず、
+/// 自分の `/proc/self/fd/<fd>` を `AT_SYMLINK_FOLLOW` で辿る（open(2) の O_TMPFILE の項の方法。自分の fd への参照は
+/// non-dumpable でも許される）。名前は 1 要素だけ受ける（CRI-2・SEC-1・#4652）。
+pub(crate) fn link_fd_at(
+    file: BorrowedFd<'_>,
+    dir: BorrowedFd<'_>,
+    name: &std::ffi::OsStr,
+) -> io::Result<()> {
+    let name = single_component(name)?;
+    let source = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd()))
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // 前提: `/proc` は supervisor 自身の procfs である（supervisor の mount namespace は信頼境界の内側）。`/proc` が procfs で
+    // なければ別のファイルを指しうるが、その場合も呼び出し側の名前の照合（inode の一致）で不一致になり確定しない。
+    // supervisor が `CLONE_FILES` を unshare するなら `/proc/thread-self/fd` に替える。
+    // SAFETY: `source`・`name` は NUL 終端で呼び出しの間生きる。`source` は自分の fd を指す procfs のパスで、`name` は上で
+    // 1 要素と検証済み（`dir` の直下の 1 エントリだけが作られる）。`file`・`dir` は呼び出しの間有効な fd。flags は
+    // `AT_SYMLINK_FOLLOW` だけで、既存の名前を置き換えない（`EEXIST`）。ポインタは保持されない。
+    let rc = unsafe {
+        linkat(
+            AT_FDCWD,
+            source.as_ptr(),
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            AT_SYMLINK_FOLLOW,
+        )
+    };
+    check(i64::from(rc)).map(|_| ())
+}
+
+/// `dir` の直下の名前を、辿らず（`O_PATH | O_NOFOLLOW`）同一性の照合だけのために開く（読み書きはできない。`fstat` は使える）。
+pub(crate) fn open_path_at(
+    dir: BorrowedFd<'_>,
+    name: &std::ffi::OsStr,
+) -> io::Result<std::fs::File> {
+    let nofollow = arch::O_NOFOLLOW.ok_or_else(unsupported)?;
+    openat_file(dir, name, O_PATH | nofollow | O_CLOEXEC, 0)
+}
+
+/// `dir` の直下のディレクトリを、辿らず（`O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`）開く。パスを 1 要素ずつ
+/// fd 相対で辿り、祖先の差し替えを受けない用途（CRI-2・SEC-1・#4652）。`O_PATH` なので祖先に読み取り権限は要らず、
+/// 検索権限（`x`）だけの祖先（`0711` など）も辿れる。得た fd は `fstat` と `*at` の起点（`openat`・`renameat2`・`unlinkat`）
+/// にだけ使い、読み書きはしない。新しい `unsafe` は足さない（[`openat_file`]）。
+pub(crate) fn open_dir_at(
+    dir: BorrowedFd<'_>,
+    name: &std::ffi::OsStr,
+) -> io::Result<std::fs::File> {
+    openat_file(
+        dir,
+        name,
+        open_dir_nofollow_flags()? | O_PATH | O_CLOEXEC,
+        0,
+    )
+}
+
+/// [`open_dir_at`] の走査の起点の `/` を同じフラグ（`O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`）で開く（CRI-2・#4652）。
+pub(crate) fn open_root_dir_path() -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(open_dir_nofollow_flags()? | O_PATH)
+        .open("/")
+}
+
+/// `dir` の直下の名前を消す（`unlinkat(2)`。ディレクトリは消さない）。
+pub(crate) fn unlink_at(dir: BorrowedFd<'_>, name: &std::ffi::OsStr) -> io::Result<()> {
+    let name = single_component(name)?;
+    // SAFETY: `dir` は呼び出しの間有効な fd、`name` は NUL 終端で呼び出しの間生き、上で 1 要素と検証済み。影響は `dir` 直下の
+    // 1 エントリの削除だけで、ポインタは保持されない。
+    let rc = unsafe { unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) };
+    check(i64::from(rc)).map(|_| ())
+}
+
+/// include/uapi/linux/fs.h の `RENAME_NOREPLACE`（全アーキテクチャ共通）。`libc_abi`（#1840）が `libc` と照合する。
+const RENAME_NOREPLACE: u32 = 1;
+
+/// `dir` の直下の `old` を同じ `dir` の直下の `new` へ改名する（`renameat2(2)` の `RENAME_NOREPLACE`。`new` が既にあれば
+/// `AlreadyExists` で置き換えない）。名前は 1 要素だけ受ける（CRI-2・SEC-1・#4652）。
+pub(crate) fn rename_noreplace_at(
+    dir: BorrowedFd<'_>,
+    old: &std::ffi::OsStr,
+    new: &std::ffi::OsStr,
+) -> io::Result<()> {
+    let old = single_component(old)?;
+    let new = single_component(new)?;
+    // SAFETY: `dir` は呼び出しの間有効な fd、`old`・`new` は NUL 終端で呼び出しの間生き、上で 1 要素と検証済み（`dir` 直下の
+    // エントリだけが対象で、中間要素の symlink は辿られない）。flags は `RENAME_NOREPLACE` だけで改名先を置き換えない。副作用は
+    // 1 エントリの改名だけで、ポインタは保持されない。
+    let rc = unsafe {
+        renameat2(
+            dir.as_raw_fd(),
+            old.as_ptr(),
+            dir.as_raw_fd(),
+            new.as_ptr(),
+            RENAME_NOREPLACE,
+        )
+    };
+    check(i64::from(rc)).map(|_| ())
 }
 
 /// `struct ucred`（`SO_PEERCRED` の結果。include/uapi/asm-generic/socket.h・`<sys/socket.h>`）。
@@ -1545,6 +1756,14 @@ mod libc_abi {
         assert!(F_GETFL == libc::F_GETFL);
         assert!(F_SETFL == libc::F_SETFL);
         assert!(O_NONBLOCK == libc::O_NONBLOCK);
+        // openat（open_log_at・open_path_at）。
+        assert!(O_WRONLY == libc::O_WRONLY);
+        assert!(O_CREAT == libc::O_CREAT);
+        assert!(O_EXCL == libc::O_EXCL);
+        assert!(O_NOCTTY == libc::O_NOCTTY);
+        assert!(O_APPEND == libc::O_APPEND);
+        assert!(O_CLOEXEC == libc::O_CLOEXEC);
+        assert!(O_PATH == libc::O_PATH);
         // 関数内のローカル定数・リテラルの errno / シグナル（項目として参照できないため libc の値を固定する）。
         assert!(libc::SIGKILL == 9); // kill_process_group
         assert!(libc::EINVAL == 22); // check_cap_number ほか
@@ -1612,6 +1831,63 @@ mod libc_abi {
         *mut libc::c_void,
         libc::size_t,
     ) -> libc::ssize_t = libc::lgetxattr;
+    const _: unsafe extern "C" fn(
+        libc::c_int,
+        *const libc::c_char,
+        libc::c_int,
+        ...
+    ) -> libc::c_int = openat;
+    const _: unsafe extern "C" fn(
+        libc::c_int,
+        *const libc::c_char,
+        libc::c_int,
+        ...
+    ) -> libc::c_int = libc::openat;
+    // `openat` の可変長部へ渡す mode（`u32`）が `mode_t` と同じ型であること（fn 型の照合には現れない）。
+    const _: libc::mode_t = super::LOG_CREATE_MODE;
+    const _: unsafe extern "C" fn(libc::c_int, *const libc::c_char, libc::c_int) -> libc::c_int =
+        unlinkat;
+    const _: unsafe extern "C" fn(libc::c_int, *const libc::c_char, libc::c_int) -> libc::c_int =
+        libc::unlinkat;
+    const _: unsafe extern "C" fn(
+        libc::c_int,
+        *const libc::c_char,
+        libc::c_int,
+        *const libc::c_char,
+        libc::c_uint,
+    ) -> libc::c_int = renameat2;
+    const _: unsafe extern "C" fn(
+        libc::c_int,
+        *const libc::c_char,
+        libc::c_int,
+        *const libc::c_char,
+        libc::c_uint,
+    ) -> libc::c_int = libc::renameat2;
+    const _: () = assert!(super::RENAME_NOREPLACE == libc::RENAME_NOREPLACE);
+    const _: unsafe extern "C" fn(
+        libc::c_int,
+        *const libc::c_char,
+        libc::c_int,
+        *const libc::c_char,
+        libc::c_int,
+    ) -> libc::c_int = linkat;
+    const _: unsafe extern "C" fn(
+        libc::c_int,
+        *const libc::c_char,
+        libc::c_int,
+        *const libc::c_char,
+        libc::c_int,
+    ) -> libc::c_int = libc::linkat;
+    const _: () = assert!(super::AT_FDCWD == libc::AT_FDCWD);
+    const _: () = assert!(super::AT_SYMLINK_FOLLOW == libc::AT_SYMLINK_FOLLOW);
+    const _: () = assert!(
+        super::O_TMPFILE_BASE | {
+            match super::arch::O_DIRECTORY {
+                Some(d) => d,
+                None => 0,
+            }
+        } == libc::O_TMPFILE
+    );
     // 試験 repair5_connect_unix_nonblocking_returns_wouldblock_when_backlog_is_full の関数内宣言 `listen` は
     // 項目として参照できないため、試験に書いた型 `unsafe extern "C" fn(i32, i32) -> i32` へ libc を代入して照合する。
     const _: unsafe extern "C" fn(i32, i32) -> i32 = libc::listen;

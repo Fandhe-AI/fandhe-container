@@ -9,11 +9,12 @@ use fandhe_container_oci::reference::Digest;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fandhe_container_core::traits::{
-    ContainerRuntime, ContainerStatus, CreateRequest, DeleteRequest, DeleteResponse, ErrorCode,
-    ExitTime, KillRequest, StartRequest, StateRequest, StopRequest, TerminationReason, TraitError,
+    ContainerId, ContainerRuntime, ContainerStatus, CreateRequest, DeleteRequest, DeleteResponse,
+    ErrorCode, ExitTime, KillRequest, StartRequest, StateRequest, StopRequest, TerminationReason,
+    TraitError,
 };
 use fandhe_container_cri::adapter::{
     BundleProvider, BundleRequest, PreparedBundle, ReleaseBudget, RuntimeAdapter,
@@ -24,7 +25,7 @@ use fandhe_container_cri::runtime::v1::{
     self, ContainerConfig, ContainerMetadata, ContainerState as S, ImageSpec, PodSandboxConfig,
     PodSandboxMetadata, runtime_service_server::RuntimeService,
 };
-use fandhe_container_cri::runtime_service::CriRuntimeService;
+use fandhe_container_cri::runtime_service::{ContainerLogReopener, CriRuntimeService};
 use tonic::{Code, Request, Status};
 
 /// フェイクの実行層。呼び出しを記録し、失敗・返す状態・start の保留を注入できる。
@@ -3398,4 +3399,436 @@ async fn repair5_4286_exec_state_read_is_bounded() {
     x.h.runtime.hold_state.store(false, Ordering::SeqCst);
     assert_eq!(e.code(), Code::DeadlineExceeded);
     assert!(x.handler.0.lock().unwrap().is_empty());
+}
+
+/// 偽のリオープナー。渡された ID を記録し、`fail` があればそのエラーを返す。
+#[derive(Default)]
+struct FakeReopener {
+    calls: Mutex<Vec<String>>,
+    fail: Mutex<Option<ErrorCode>>,
+}
+
+impl ContainerLogReopener for FakeReopener {
+    fn reopen(
+        &self,
+        id: &ContainerId,
+        _deadline: Instant,
+        _cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), TraitError> {
+        self.calls.lock().unwrap().push(id.as_str().to_owned());
+        match *self.fail.lock().unwrap() {
+            Some(code) => Err(TraitError::new(code, "reopen failed")),
+            None => Ok(()),
+        }
+    }
+}
+
+async fn reopen(service: &CriRuntimeService, id: &str) -> Result<(), Status> {
+    RuntimeService::reopen_container_log(
+        service,
+        Request::new(v1::ReopenContainerLogRequest {
+            container_id: id.into(),
+        }),
+    )
+    .await
+    .map(|_| ())
+}
+
+/// log_path つきで作る（sandbox の log_directory も付ける）。
+async fn create_with_log(service: &CriRuntimeService, name: &str) -> String {
+    let sb = RuntimeService::run_pod_sandbox(
+        service,
+        Request::new(v1::RunPodSandboxRequest {
+            config: Some(PodSandboxConfig {
+                metadata: Some(PodSandboxMetadata {
+                    name: "pod".into(),
+                    uid: "uid-1".into(),
+                    namespace: "ns".into(),
+                    attempt: 0,
+                }),
+                log_directory: "/var/log/pods/ns_pod_uid-1".into(),
+                ..Default::default()
+            }),
+            runtime_handler: String::new(),
+        }),
+    )
+    .await
+    .expect("run sandbox")
+    .into_inner()
+    .pod_sandbox_id;
+    let mut cfg = container(name);
+    cfg.log_path = "c/0.log".into();
+    RuntimeService::create_container(
+        service,
+        Request::new(v1::CreateContainerRequest {
+            pod_sandbox_id: sb,
+            config: Some(cfg),
+            sandbox_config: None,
+        }),
+    )
+    .await
+    .expect("create")
+    .into_inner()
+    .container_id
+}
+
+/// CRI-2・SUP-7・REPAIR-12（#4652）: running で成功し、リオープナーへ同じ ID が渡る。
+#[tokio::test]
+async fn cri_2_reopen_container_log_running_reaches_reopener() {
+    let h = harness();
+    let fake = Arc::new(FakeReopener::default());
+    let service = h.service.with_log_reopener(fake.clone());
+    let id = create_with_log(&service, "c").await;
+    start(&service, &id).await.expect("start");
+    reopen(&service, &id).await.expect("reopen");
+    assert_eq!(fake.calls.lock().unwrap().clone(), vec![id]);
+}
+
+/// CRI-2・SUP-7（#4652）: running でない（created・exited）は `FAILED_PRECONDITION` で、リオープナーを呼ばない。
+#[tokio::test]
+async fn cri_2_reopen_container_log_not_running_is_rejected() {
+    let h = harness();
+    let fake = Arc::new(FakeReopener::default());
+    let service = h.service.with_log_reopener(fake.clone());
+    let id = create_with_log(&service, "c").await;
+    let err = reopen(&service, &id).await.expect_err("created");
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    assert_eq!(err.message(), "container is not running");
+    start(&service, &id).await.expect("start");
+    stop_c(&service, &id).await.expect("stop");
+    let err = reopen(&service, &id).await.expect_err("exited");
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    assert_eq!(err.message(), "container is not running");
+    assert!(fake.calls.lock().unwrap().is_empty());
+}
+
+/// CRI-2・CRI-1（#4652・#4174）: 実行層が自然終了を報告した後の開き直しは、自然終了を先に取り込み、終了した supervisor へ
+/// 接続して `UNAVAILABLE` になる代わりに `FAILED_PRECONDITION` で返す。リオープナーは呼ばない。
+#[tokio::test]
+async fn cri_2_reopen_container_log_after_natural_exit_is_rejected() {
+    let h = harness();
+    let fake = Arc::new(FakeReopener::default());
+    let service = h.service.with_log_reopener(fake.clone());
+    let id = create_with_log(&service, "c").await;
+    start(&service, &id).await.expect("start");
+    h.runtime.state_exit_code.store(0, Ordering::SeqCst);
+    h.runtime
+        .state_returns_stopped
+        .store(true, Ordering::SeqCst);
+    let err = reopen(&service, &id).await.expect_err("exited naturally");
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    assert_eq!(err.message(), "container is not running");
+    assert!(fake.calls.lock().unwrap().is_empty());
+}
+
+/// CRI-2（#4652）: 未知の ID は `NOT_FOUND`、空の ID は `INVALID_ARGUMENT`。
+#[tokio::test]
+async fn cri_2_reopen_container_log_unknown_id() {
+    let h = harness();
+    let fake = Arc::new(FakeReopener::default());
+    let service = h.service.with_log_reopener(fake.clone());
+    let err = reopen(&service, "nope").await.expect_err("unknown");
+    assert_eq!(err.code(), Code::NotFound);
+    let err = reopen(&service, "").await.expect_err("empty");
+    assert_eq!(err.code(), Code::InvalidArgument);
+    assert!(fake.calls.lock().unwrap().is_empty());
+}
+
+/// CRI-2・SUP-7（#4652）: log_path の無いコンテナは `FAILED_PRECONDITION`。
+#[tokio::test]
+async fn cri_2_reopen_container_log_without_log_path_is_rejected() {
+    let h = harness();
+    let fake = Arc::new(FakeReopener::default());
+    let service = h.service.with_log_reopener(fake.clone());
+    let sb = run_sandbox(&service).await;
+    let id = create(&service, &sb, "c").await.expect("create");
+    start(&service, &id).await.expect("start");
+    let err = reopen(&service, &id).await.expect_err("no log path");
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    assert_eq!(err.message(), "the container has no CRI log path");
+    assert!(fake.calls.lock().unwrap().is_empty());
+}
+
+/// CRI-2・SUP-7（#4652）: リオープナーのエラーは code のまま返る。
+#[tokio::test]
+async fn cri_2_reopen_container_log_reopener_error_keeps_code() {
+    let h = harness();
+    let fake = Arc::new(FakeReopener::default());
+    let service = h.service.with_log_reopener(fake.clone());
+    let id = create_with_log(&service, "c").await;
+    start(&service, &id).await.expect("start");
+    for (code, want) in [
+        (ErrorCode::Unavailable, Code::Unavailable),
+        (ErrorCode::FailedPrecondition, Code::FailedPrecondition),
+        (ErrorCode::PermissionDenied, Code::PermissionDenied),
+    ] {
+        *fake.fail.lock().unwrap() = Some(code);
+        let err = reopen(&service, &id).await.expect_err("fails");
+        assert_eq!(err.code(), want);
+    }
+}
+
+/// CRI-2・REPAIR-3（#4652）: リオープナー未注入は `UNIMPLEMENTED`。
+#[tokio::test]
+async fn cri_2_reopen_container_log_without_reopener_is_unimplemented() {
+    let h = harness();
+    let id = create_with_log(&h.service, "c").await;
+    start(&h.service, &id).await.expect("start");
+    let err = reopen(&h.service, &id).await.expect_err("unimplemented");
+    assert_eq!(err.code(), Code::Unimplemented);
+}
+
+/// 解放されるまで止まるリオープナー（処理スレッドの枠の試験用）。
+#[derive(Default)]
+struct BlockingReopener {
+    entered: Mutex<usize>,
+    released: Mutex<bool>,
+    cv: std::sync::Condvar,
+}
+
+impl ContainerLogReopener for BlockingReopener {
+    fn reopen(
+        &self,
+        _id: &ContainerId,
+        deadline: Instant,
+        _cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), TraitError> {
+        *self.entered.lock().unwrap() += 1;
+        let mut released = self.released.lock().unwrap();
+        while !*released {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(TraitError::new(ErrorCode::Timeout, "not released"));
+            }
+            released = self.cv.wait_timeout(released, left).unwrap().0;
+        }
+        Ok(())
+    }
+}
+
+/// 取り消しの旗が立つまで（または期限まで）待ち、旗を見たか・受けた期限の残りを記録するリオープナー（#4652）。
+#[derive(Default)]
+struct CancelAwareReopener {
+    saw_cancel: std::sync::atomic::AtomicBool,
+    budget_ms: Mutex<Option<u128>>,
+}
+
+impl ContainerLogReopener for CancelAwareReopener {
+    fn reopen(
+        &self,
+        _id: &ContainerId,
+        deadline: Instant,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), TraitError> {
+        *self.budget_ms.lock().unwrap() = Some(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis(),
+        );
+        while Instant::now() < deadline {
+            if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                self.saw_cancel
+                    .store(true, std::sync::atomic::Ordering::Release);
+                return Err(TraitError::new(ErrorCode::Unavailable, "cancelled"));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        Err(TraitError::new(ErrorCode::Timeout, "not cancelled"))
+    }
+}
+
+/// REPAIR-5・#4652: 状態照会と開き直しの待ちは受付の時点で決めた 1 つの絶対期限を共有する。実行層の `state` が止まり、
+/// 照会が `grpc-timeout`（300 ms）を使い切ったら、開き直しの処理スレッドを起動せずに `DEADLINE_EXCEEDED` を返す
+/// （照会の上限 1 秒と開き直しの 5 秒を足して待たない）。
+#[tokio::test]
+async fn repair5_4652_reopen_shares_one_deadline_with_state_query() {
+    let h = harness();
+    let fake = Arc::new(FakeReopener::default());
+    let service = h.service.with_log_reopener(fake.clone());
+    let id = create_with_log(&service, "c").await;
+    start(&service, &id).await.expect("start");
+    h.runtime.hold_state.store(true, Ordering::SeqCst);
+    let mut req = Request::new(v1::ReopenContainerLogRequest {
+        container_id: id.clone(),
+    });
+    req.metadata_mut()
+        .insert("grpc-timeout", "300m".parse().unwrap());
+    let started = Instant::now();
+    let err = RuntimeService::reopen_container_log(&service, req)
+        .await
+        .expect_err("the state query used up the deadline");
+    let elapsed = started.elapsed();
+    h.runtime.hold_state.store(false, Ordering::SeqCst);
+    assert_eq!(err.code(), Code::DeadlineExceeded);
+    assert_eq!(
+        err.message(),
+        "the container log reopen did not complete within the deadline"
+    );
+    assert!(fake.calls.lock().unwrap().is_empty());
+    assert!(
+        elapsed < std::time::Duration::from_millis(900),
+        "{elapsed:?}"
+    );
+}
+
+/// CRI-2・REPAIR-5・#4652: RPC の future が破棄されたら（期限切れ・取り消し）リオープナーに取り消しの旗が届き、
+/// `grpc-timeout` が既定（5 秒）より短ければリオープナーの期限もそれに合わせる。
+#[tokio::test]
+async fn cri2_4652_dropped_rpc_cancels_reopener_and_grpc_timeout_bounds_deadline() {
+    let h = harness();
+    let fake = Arc::new(CancelAwareReopener::default());
+    let service = h.service.with_log_reopener(fake.clone());
+    let id = create_with_log(&service, "c").await;
+    start(&service, &id).await.expect("start");
+    let mut req = Request::new(v1::ReopenContainerLogRequest {
+        container_id: id.clone(),
+    });
+    req.metadata_mut()
+        .insert("grpc-timeout", "2S".parse().unwrap());
+    let rpc = RuntimeService::reopen_container_log(&service, req);
+    let dropped = tokio::time::timeout(std::time::Duration::from_millis(200), rpc).await;
+    assert!(dropped.is_err(), "the rpc must still be waiting");
+    let until = Instant::now() + std::time::Duration::from_secs(2);
+    while !fake.saw_cancel.load(std::sync::atomic::Ordering::Acquire) {
+        assert!(
+            Instant::now() < until,
+            "the reopener did not see the cancel"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let budget = fake.budget_ms.lock().unwrap().expect("called");
+    assert!((1500..=2000).contains(&budget), "{budget}");
+}
+
+/// REPAIR-5・#4652: `ReopenContainerLog` が先に行う状態照会（自然終了の取り込み）も同時実行の枠の内側で走る。実行層の
+/// `state` が止まると、照会の待ちは期限で戻って開き直しは成功するが、止まった照会の処理スレッドは枠を持ち続ける。
+/// 別々のコンテナで 4 件止まると 5 件目は `UNAVAILABLE` で断られ、照会が終わると枠が返る。
+#[tokio::test]
+async fn repair5_4652_reopen_state_queries_are_bounded() {
+    use fandhe_container_cri::runtime_service::MAX_CONTAINER_LOG_REOPENS;
+    let h = harness();
+    let fake = Arc::new(FakeReopener::default());
+    let service = h
+        .service
+        .with_log_reopener(fake.clone())
+        .with_exit_observe_timeout(std::time::Duration::from_millis(100));
+    let sb = RuntimeService::run_pod_sandbox(
+        &service,
+        Request::new(v1::RunPodSandboxRequest {
+            config: Some(PodSandboxConfig {
+                metadata: Some(PodSandboxMetadata {
+                    name: "pod".into(),
+                    uid: "uid-1".into(),
+                    namespace: "ns".into(),
+                    attempt: 0,
+                }),
+                log_directory: "/var/log/pods/ns_pod_uid-1".into(),
+                ..Default::default()
+            }),
+            runtime_handler: String::new(),
+        }),
+    )
+    .await
+    .expect("run sandbox")
+    .into_inner()
+    .pod_sandbox_id;
+    let mut ids = Vec::new();
+    for n in 0..=MAX_CONTAINER_LOG_REOPENS {
+        let name = format!("c{n}");
+        let mut cfg = container(&name);
+        cfg.log_path = format!("{name}/0.log");
+        let id = RuntimeService::create_container(
+            &service,
+            Request::new(v1::CreateContainerRequest {
+                pod_sandbox_id: sb.clone(),
+                config: Some(cfg),
+                sandbox_config: None,
+            }),
+        )
+        .await
+        .expect("create")
+        .into_inner()
+        .container_id;
+        start(&service, &id).await.expect("start");
+        ids.push(id);
+    }
+    h.runtime.hold_state.store(true, Ordering::SeqCst);
+    for id in ids.iter().take(MAX_CONTAINER_LOG_REOPENS) {
+        reopen(&service, id)
+            .await
+            .expect("the observe times out and the reopen succeeds");
+    }
+    let last = ids.last().expect("one more container");
+    let err = reopen(&service, last)
+        .await
+        .expect_err("the slots are held by the stuck state queries");
+    assert_eq!(err.code(), Code::Unavailable);
+    assert_eq!(
+        err.message(),
+        "too many container log reopens are in progress"
+    );
+    h.runtime.hold_state.store(false, Ordering::SeqCst);
+    let until = Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match reopen(&service, last).await {
+            Ok(()) => break,
+            Err(e) => {
+                assert_eq!(e.code(), Code::Unavailable);
+                assert!(Instant::now() < until, "the slots were not released");
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+    }
+    assert_eq!(
+        fake.calls.lock().unwrap().len(),
+        MAX_CONTAINER_LOG_REOPENS + 1
+    );
+}
+
+/// REPAIR-5・#4652: 同時に走る `ReopenContainerLog` の処理スレッドは `MAX_CONTAINER_LOG_REOPENS` 件まで。超えた要求は
+/// リオープナーを呼ばずに `UNAVAILABLE` で断り、枠は処理スレッドが終わると返る。
+#[tokio::test]
+async fn repair5_4652_reopen_workers_are_bounded() {
+    use fandhe_container_cri::runtime_service::MAX_CONTAINER_LOG_REOPENS;
+    assert_eq!(MAX_CONTAINER_LOG_REOPENS, 4);
+    let h = harness();
+    let fake = Arc::new(BlockingReopener::default());
+    let service = h.service.with_log_reopener(fake.clone());
+    let id = create_with_log(&service, "c").await;
+    start(&service, &id).await.expect("start");
+    let over = async {
+        let until = Instant::now() + std::time::Duration::from_secs(5);
+        while *fake.entered.lock().unwrap() < MAX_CONTAINER_LOG_REOPENS {
+            assert!(
+                Instant::now() < until,
+                "the 4 reopens did not reach the reopener"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let err = reopen(&service, &id).await.expect_err("over the limit");
+        let entered = *fake.entered.lock().unwrap();
+        *fake.released.lock().unwrap() = true;
+        fake.cv.notify_all();
+        (err, entered)
+    };
+    let (a, b, c, d, (err, entered)) = tokio::join!(
+        reopen(&service, &id),
+        reopen(&service, &id),
+        reopen(&service, &id),
+        reopen(&service, &id),
+        over
+    );
+    assert_eq!(err.code(), Code::Unavailable);
+    assert_eq!(
+        err.message(),
+        "too many container log reopens are in progress"
+    );
+    assert_eq!(entered, MAX_CONTAINER_LOG_REOPENS);
+    for r in [a, b, c, d] {
+        r.expect("bounded reopen");
+    }
+    // 枠が返った後は再び受ける。
+    reopen(&service, &id)
+        .await
+        .expect("reopen after the slots are released");
 }

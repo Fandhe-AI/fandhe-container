@@ -101,7 +101,8 @@
 //! ここでは作らない。`config` のパス類は保持するだけで検証していない（実際にファイルへ触れる TASK-58 / TASK-59 で検証する）。
 //! 例外として `log_directory` と `log_path` は実行層接続時の CreateContainer で結合・検証して保持し、
 //! StartContainer が `StartRequest` で supervisor へ渡す（`resolve_log_path`。CRI-2・SUP-4・#2671）。
-//! `ReopenContainerLog` は `UNIMPLEMENTED` のまま（kubelet のログ回転は後続 issue）。
+//! `ReopenContainerLog` は [`ContainerLogReopener`] を `with_log_reopener` で差したときだけ実装し（running のみ・
+//! 失敗時は新しいログを作らない。CRI-2・SUP-7・#4652）、未注入は `UNIMPLEMENTED`。
 //!
 //! **保持量の上限**: レジストリは件数（[`MAX_SANDBOXES`]）と、保持する `config` の量
 //! （1 件の符号化長 [`MAX_CONFIG_ENCODED_BYTES`]・可変長要素の件数と長さ・合計の見積もり
@@ -146,7 +147,9 @@ use tonic::{Request, Response, Status};
 
 use crate::bundle::{AppliedUser, ResolvedImage, resolve_log_path};
 use crate::error::{CriError, CriErrorCode};
-use fandhe_container_core::traits::{ContainerId, ContainerLogPath, PodShmSource, StdinMode};
+use fandhe_container_core::traits::{
+    ContainerId, ContainerLogPath, PodShmSource, StdinMode, TraitError,
+};
 
 use crate::adapter::{
     BundleProvider, BundleRequest, PodHolder, PodNamespaceHolderProvider, PodNetns,
@@ -365,6 +368,11 @@ pub struct CriRuntimeService {
     recorder: Arc<dyn CriOpRecorder>,
     /// 実行層への接続（TASK-59.2）。`None` のときは記録上の遷移だけのスタブ動作。
     runtime: Option<RuntimeBinding>,
+    /// `ReopenContainerLog` の注入口。`None` は `UNIMPLEMENTED`（REPAIR-3）。
+    log_reopener: Option<Arc<dyn ContainerLogReopener>>,
+    /// 実行中の `ReopenContainerLog` の処理スレッド数（[`MAX_CONTAINER_LOG_REOPENS`] まで。処理スレッドが実際に終わるまで
+    /// 数える。REPAIR-5）。
+    log_reopens_inflight: Arc<std::sync::atomic::AtomicUsize>,
     /// 実行層の応答待ちの上限（REPAIR-5）。
     runtime_timeout: Duration,
     /// `ContainerStatus` の観測で実行層の状態を 1 回読む待ちの上限（#4174。既定は [`CONTAINER_EXIT_OBSERVE_TIMEOUT`]）。
@@ -467,6 +475,73 @@ type StartInputs = (
 struct RuntimeBinding {
     adapter: RuntimeAdapter,
     bundles: Arc<dyn BundleProvider>,
+}
+
+/// running のコンテナの CRI ログを同じパスで開き直す注入口（`ReopenContainerLog`。CRI-2・SUP-7・PLUG-1）。
+///
+/// core の `ContainerRuntime` には足さない（PLUG-1・PLUG-4）。plugin-cri が supervisor の制御チャネル
+/// （`ControlReopenLog`）を包んで [`CriRuntimeService::with_log_reopener`] で差す。`deadline` までに戻すこと
+/// （blocking 呼び出し。cri が専用スレッドで呼び、`CONTAINER_LOG_REOPEN_TIMEOUT` で打ち切る）。
+/// エラーの区分はそのまま gRPC の code に写る。失敗時は新しいログファイルを作らない契約（cri-api の
+/// `ReopenContainerLog` の規定）。文言にパスを含めないこと。
+pub trait ContainerLogReopener: Send + Sync {
+    /// `id` のコンテナの CRI ログを開き直す。`cancel` は RPC が取り消された（future が破棄された・期限切れ）ときに立つ。
+    /// 立ったら応答を待たずに戻り、相手（supervisor）が確定しないよう要求を取り下げること（#4652）。
+    fn reopen(
+        &self,
+        id: &ContainerId,
+        deadline: Instant,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), TraitError>;
+}
+
+/// gRPC の `grpc-timeout`（`<1〜8 桁の数><単位 H|M|S|m|u|n>`）を読む。無い・形式違いは `None`（期限は既定のまま）。
+fn grpc_timeout(meta: &tonic::metadata::MetadataMap) -> Option<Duration> {
+    let v = meta.get("grpc-timeout")?.to_str().ok()?;
+    let (num, unit) = v.split_at(v.len().checked_sub(1)?);
+    if num.is_empty() || num.len() > 8 || !num.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let n: u64 = num.parse().ok()?;
+    Some(match unit {
+        "H" => Duration::from_secs(n.checked_mul(3600)?),
+        "M" => Duration::from_secs(n.checked_mul(60)?),
+        "S" => Duration::from_secs(n),
+        "m" => Duration::from_millis(n),
+        "u" => Duration::from_micros(n),
+        "n" => Duration::from_nanos(n),
+        _ => return None,
+    })
+}
+
+/// `ReopenContainerLog` が開き直しを待つ上限（kubelet の呼び出しに期限が無いため、有限で戻す。REPAIR-5）。
+/// supervisor の制御チャネルの上限（10 秒）より短く、kubelet のログ回転の周期に比べて十分短い。
+const CONTAINER_LOG_REOPEN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 同時に走らせる `ReopenContainerLog` の処理スレッドの上限（REPAIR-5・#4652）。状態ディレクトリの FS が止まると
+/// RPC が期限で戻っても処理スレッドは残るため、枠は処理スレッドが実際に終わるまで保持し、超えた要求は
+/// `UNAVAILABLE` で断る（スレッドを積み上げない）。supervisor 側の枠は 1 コンテナにつき 1 件。
+pub const MAX_CONTAINER_LOG_REOPENS: usize = 4;
+
+/// `ReopenContainerLog` の処理スレッドの枠（Drop で返す）。
+struct ReopenSlot(Arc<std::sync::atomic::AtomicUsize>);
+
+impl ReopenSlot {
+    fn acquire(counter: &Arc<std::sync::atomic::AtomicUsize>) -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        counter
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < MAX_CONTAINER_LOG_REOPENS).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| Self(Arc::clone(counter)))
+    }
+}
+
+impl Drop for ReopenSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 
 /// 実行層（bundle 供給元・`ContainerRuntime`）の応答待ちの既定の上限（REPAIR-5）。
@@ -1988,6 +2063,8 @@ impl CriRuntimeService {
             container_limits: ContainerLimits::default(),
             recorder,
             runtime: None,
+            log_reopener: None,
+            log_reopens_inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             runtime_timeout: DEFAULT_RUNTIME_TIMEOUT,
             exit_observe_timeout: CONTAINER_EXIT_OBSERVE_TIMEOUT,
             list_exit_observe_busy: Arc::new(AtomicBool::new(false)),
@@ -2087,6 +2164,102 @@ impl CriRuntimeService {
     ) -> Self {
         self.runtime = Some(RuntimeBinding { adapter, bundles });
         self
+    }
+
+    /// `ReopenContainerLog` の注入口を差す（CRI-2・SUP-7・PLUG-1）。呼ばなければ `UNIMPLEMENTED`。
+    pub fn with_log_reopener(mut self, reopener: Arc<dyn ContainerLogReopener>) -> Self {
+        self.log_reopener = Some(reopener);
+        self
+    }
+
+    /// `ReopenContainerLog` の本体（CRI-2・SUP-7・REPAIR-4・REPAIR-5）。
+    ///
+    /// 順序: 注入口の有無 → container_id の検証 → 記録の検索（`NOT_FOUND`）→ running でなければ
+    /// `FAILED_PRECONDITION`（新しいログは作らない。containerd と同じ）→ log_path が無ければ `FAILED_PRECONDITION`
+    /// → 注入口を専用スレッドで期限つきに呼ぶ。registry のロックは呼び出しの前に外す。
+    /// `ReopenContainerLog` の受け入れの判定（ロックだけで済む。記録なし → `NOT_FOUND`、running でない・CRI ログのパスが
+    /// 無い → `FAILED_PRECONDITION`。#4652）。
+    fn check_log_reopenable(&self, container_id: &str) -> Result<(), CriError> {
+        let registry = self
+            .registry
+            .lock()
+            .map_err(|_| CriError::internal("sandbox registry is unavailable"))?;
+        let record = registry
+            .containers
+            .get(container_id)
+            .ok_or_else(|| CriError::not_found("container not found"))?;
+        if record.state != ContainerState::Running {
+            return Err(CriError::failed_precondition("container is not running"));
+        }
+        if record.resolved_log_path.is_none() {
+            return Err(CriError::failed_precondition(
+                "the container has no CRI log path",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn reopen_container_log_impl(
+        &self,
+        req: v1::ReopenContainerLogRequest,
+        client_timeout: Option<Duration>,
+    ) -> Result<v1::ReopenContainerLogResponse, CriError> {
+        let Some(reopener) = &self.log_reopener else {
+            return Err(CriError::unimplemented("reopen_container_log"));
+        };
+        if req.container_id.is_empty() {
+            return Err(CriError::invalid_argument("container_id is required"));
+        }
+        let id = ContainerId::new(req.container_id.clone())
+            .map_err(|_| CriError::invalid_argument("container_id is invalid"))?;
+        // 絶対期限は受付の時点で 1 つ決め、状態照会・開き直しの待ちには残り時間だけを渡す（クライアントの `grpc-timeout` が
+        // 短ければそれに合わせる。待ちを合計しても期限を超えない。期限切れの後に確定しない。REPAIR-5・#4652）。
+        let budget = client_timeout.map_or(CONTAINER_LOG_REOPEN_TIMEOUT, |t| {
+            t.min(CONTAINER_LOG_REOPEN_TIMEOUT)
+        });
+        let deadline = Instant::now() + budget;
+        // 記録の検索と状態の判定を、枠を取る前に 1 回行う（枠が埋まっていても NOT_FOUND・FAILED_PRECONDITION の順序を保つ）。
+        // 自然終了の取り込みの後にもう一度判定する。
+        self.check_log_reopenable(&req.container_id)?;
+        // 同時実行の枠は、先行する状態照会の前に取る。照会の処理スレッドと開き直しの処理スレッドの両方が枠を持ち、
+        // どちらも実際に終わるまで返さない（期限で RPC が戻っても、止まりうるスレッドは枠 1 件あたり最大 2 本で有界。REPAIR-5）。
+        let slot = Arc::new(
+            ReopenSlot::acquire(&self.log_reopens_inflight).ok_or_else(|| {
+                CriError::unavailable("too many container log reopens are in progress")
+            })?,
+        );
+        // 自然終了を先に取り込む（`ContainerStatus` と同じ）。終了した supervisor の制御ソケットへ接続して
+        // `UNAVAILABLE` になる代わりに、running でないことを `FAILED_PRECONDITION` で返す（#4652）。
+        let observe_timeout = self
+            .exit_observe_timeout
+            .min(deadline.saturating_duration_since(Instant::now()));
+        self.observe_container_exit_holding(&req.container_id, Arc::clone(&slot), observe_timeout)
+            .await?;
+        self.check_log_reopenable(&req.container_id)?;
+        // 照会で期限を使い切ったら、開き直しの処理スレッドを起動せずに `Timeout` を返す。
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(CriError::timeout(
+                "the container log reopen did not complete within the deadline",
+            ));
+        }
+        let reopener = Arc::clone(reopener);
+        // 枠は処理スレッドへ移し、スレッドが終わるまで保持する（RPC が期限で戻っても返さない）。
+        // RPC の future が破棄されたら（期限切れ・取り消し）、切り離された worker へ旗で知らせる。
+        // `run_bounded` は破棄された future の worker を切り離して動かし続けるため、旗で worker に知らせる（完了後に立っても無害）。
+        let cancel = Arc::new(AtomicBool::new(false));
+        let _cancel_on_drop = CancelOnDrop {
+            cancel: Arc::clone(&cancel),
+            armed: true,
+        };
+        // 注入口自身も deadline を守る。外側の待ちは残り時間に数百 ms の余裕を足して、内側の `Timeout` を優先して返す。
+        run_bounded(remaining + Duration::from_millis(500), move || {
+            let _slot = slot;
+            reopener.reopen(&id, deadline, &cancel)
+        })
+        .await?
+        .map_err(|e| CriError::from(&e))?;
+        Ok(v1::ReopenContainerLogResponse {})
     }
 
     /// `Status` の応答を組み立てる（CRI-1・CRI-2・REPAIR-3・REPAIR-5・#2830）。
@@ -4245,6 +4418,20 @@ impl CriRuntimeService {
     /// ID・パス・実行層の文言は記録しない（REPAIR-4）。候補の判定は [`exit_observe_candidate`] を `ListContainers`
     /// （E2・#4175）と共有する。
     async fn observe_container_exit(&self, container_id: &str) -> Result<(), CriError> {
+        self.observe_container_exit_holding(container_id, (), self.exit_observe_timeout)
+            .await
+    }
+
+    /// [`Self::observe_container_exit`] と同じだが、`hold` を状態照会の処理スレッドへ移し、照会が実際に終わるまで保持する
+    /// （`ReopenContainerLog` が同時実行の枠を照会の間も持つため。期限で待ちが戻っても、止まったスレッドが枠の外で増えない。
+    /// REPAIR-5・#4652）。照会しない場合（候補でない・実行層が無い）は、戻る時点で `hold` を手放す。待ちの上限は `timeout`
+    /// （呼び出し元の残り時間に合わせて渡す）。
+    async fn observe_container_exit_holding<H: Send + 'static>(
+        &self,
+        container_id: &str,
+        hold: H,
+        timeout: Duration,
+    ) -> Result<(), CriError> {
         let mark = {
             let mut registry = self
                 .registry
@@ -4270,7 +4457,8 @@ impl CriRuntimeService {
         let adapter = binding.adapter.clone();
         let id = container_id.to_owned();
         let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::ContainerExitObserve);
-        let outcome = run_bounded(self.exit_observe_timeout, move || {
+        let outcome = run_bounded(timeout, move || {
+            let _hold = hold;
             let result = adapter.state(&id);
             let brief = result.as_ref().map(|_| ()).map_err(Clone::clone);
             mark.finish(&result);
@@ -5086,13 +5274,20 @@ impl RuntimeService for CriRuntimeService {
     ) -> Result<Response<v1::UpdateContainerResourcesResponse>, Status> {
         Err(CriError::unimplemented("update_container_resources").into())
     }
-    /// 未実装（kubelet のログ回転に要る。CRI-2・SUP-7。#2671 の後続 issue）。CRI ログの書き出し自体は実装済みで、
-    /// 回転が無い間は総量に上限が無い（`docs/design/cri-config-acceptance.md`）。
+    /// running のコンテナの CRI ログを同じパスで開き直す（kubelet のログ回転。CRI-2・SUP-7）。
+    /// `with_log_reopener` 未注入は `UNIMPLEMENTED`。
     async fn reopen_container_log(
         &self,
-        _request: Request<v1::ReopenContainerLogRequest>,
+        request: Request<v1::ReopenContainerLogRequest>,
     ) -> Result<Response<v1::ReopenContainerLogResponse>, Status> {
-        Err(CriError::unimplemented("reopen_container_log").into())
+        let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::ReopenContainerLog);
+        let client_timeout = grpc_timeout(request.metadata());
+        let result = self
+            .reopen_container_log_impl(request.into_inner(), client_timeout)
+            .await
+            .map_err(Status::from);
+        timer.finish_with(&result);
+        result.map(Response::new)
     }
     /// 未実装。実装するときは Exec と同じく、要求の受理時にインスタンスを記録し、起動時に
     /// `instance_matches` で照合すること（#4286・CRI-5・SEC-1・CORE-1）。

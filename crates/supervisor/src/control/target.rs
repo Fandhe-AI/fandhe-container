@@ -287,7 +287,69 @@ fn attach_locked(
 
 /// サーバと監視スレッドが共有する、起動ハンドルの有無・世代の状態。
 #[derive(Clone)]
-pub struct SignalSlot(Arc<Mutex<SlotInner>>);
+pub struct SignalSlot(Arc<Mutex<SlotInner>>, Arc<ReopenState>);
+
+/// CRI ログの開き直し（kind 10。#4652）の実行枠と、終了遷移との調停（REPAIR-5・CRI-2）。
+///
+/// 枠は同時に 1 件（`busy`）。開き直しの実体は専用スレッドで動き、止まったログファイルシステムが accept ループや他の要求を
+/// 止めない。終了遷移（[`SignalSlot::mark_exited`]）は、始めに同じスロットのロックの下で新規の受付を閉じ（`closing`）、
+/// 実行中の開き直しの完了を有限時間（[`REOPEN_EXIT_WAIT`]）待ってから `Exited` にする。待ちを超えて遅れた開き直しは、
+/// 確定の関門（[`ReopenPermit::commit`]）がスロットのロックの下で世代の稼働中を確かめるため、必ず拒否される。
+///
+/// ロック順: sink の内部ロック → スロットのロック → `state`（`ReopenState::st`）。逆向きに取る経路は無い
+/// （`begin_reopen`・`mark_exited` はスロット → `st`。sink には触れない）。
+struct ReopenState {
+    st: Mutex<ReopenFlags>,
+    idle: std::sync::Condvar,
+}
+
+struct ReopenFlags {
+    /// 開き直しが実行中か。
+    busy: bool,
+    /// 終了遷移を始めた世代（新規の開き直しを断る。世代が変われば自然に無効になる）。
+    closing: Option<u64>,
+}
+
+/// 終了遷移が実行中の開き直しを待つ上限。超えたら待たずに `Exited` へ進む（残りは確定の関門が拒否する）。
+const REOPEN_EXIT_WAIT: Duration = Duration::from_millis(500);
+
+/// 開き直しの実行枠の保持。`Drop` で枠を空け、待っている終了遷移を起こす。
+#[cfg(target_os = "linux")]
+pub(crate) struct ReopenPermit {
+    slot: SignalSlot,
+    generation: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl ReopenPermit {
+    /// 確定の関門（[`crate::logs::ReopenGate`]）。枠を取った世代がまだ稼働中（`Active`）なら、スロットのロックを持ったまま
+    /// `f`（メモリ上の差し替えだけ。I/O をしない）を呼んで `true`。終了済み・世代交代後は `f` を呼ばず `false`。
+    pub(crate) fn commit(&self, f: &mut dyn FnMut()) -> bool {
+        let inner = self.slot.lock();
+        if matches!(
+            &inner.state,
+            SlotState::Active { generation, .. } if *generation == self.generation
+        ) {
+            f();
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ReopenPermit {
+    fn drop(&mut self) {
+        self.slot
+            .1
+            .st
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .busy = false;
+        self.slot.1.idle.notify_all();
+    }
+}
 
 impl Default for SignalSlot {
     fn default() -> Self {
@@ -307,14 +369,23 @@ impl SignalSlot {
     }
 
     fn build(stop_intent: Option<StopToken>) -> Self {
-        Self(Arc::new(Mutex::new(SlotInner {
-            next_generation: 1,
-            state: SlotState::Empty,
-            stop_intent,
-            exit_watchers: Vec::new(),
-            stdin_option: None,
-            output: None,
-        })))
+        Self(
+            Arc::new(Mutex::new(SlotInner {
+                next_generation: 1,
+                state: SlotState::Empty,
+                stop_intent,
+                exit_watchers: Vec::new(),
+                stdin_option: None,
+                output: None,
+            })),
+            Arc::new(ReopenState {
+                st: Mutex::new(ReopenFlags {
+                    busy: false,
+                    closing: None,
+                }),
+                idle: std::sync::Condvar::new(),
+            }),
+        )
     }
 
     /// コンテナ単位の `--stdin` の指定を設定する（本番の入口が `install` で設定する。SUP-7・CRI-6・#4074）。
@@ -374,6 +445,34 @@ impl SignalSlot {
                 Ok(f(io))
             }
         }
+    }
+
+    /// 開き直しの実行枠を取る（ReopenLogRequest。CRI-2・REPAIR-5・#4652）。稼働中（`Active`）でなければ断る（ハンドル無しは
+    /// `NoHandle`、終了済みは `ContainerExited`）。枠は同時に 1 件で、使用中は `Busy`。何も取り出さず、I/O もしない。
+    /// 返した [`ReopenPermit`] を持つ間、終了遷移は有限時間だけ開き直しの完了を待つ。
+    #[cfg(target_os = "linux")]
+    pub(crate) fn begin_reopen(&self) -> Result<ReopenPermit, ControlReason> {
+        let inner = self.lock();
+        let generation = match &inner.state {
+            SlotState::Empty => return Err(ControlReason::NoHandle),
+            SlotState::Exited { .. } => return Err(ControlReason::ContainerExited),
+            SlotState::Active { generation, .. } => *generation,
+        };
+        let mut st = self.1.st.lock().unwrap_or_else(PoisonError::into_inner);
+        // 終了遷移が始まった世代へは新規に受けない（スロットのロックの下で判定する）。
+        if st.closing == Some(generation) {
+            return Err(ControlReason::ContainerExited);
+        }
+        if st.busy {
+            return Err(ControlReason::Busy);
+        }
+        st.busy = true;
+        drop(st);
+        drop(inner);
+        Ok(ReopenPermit {
+            slot: self.clone(),
+            generation,
+        })
     }
 
     /// Attach の事前の照合（何も取り出さない）。[`Self::take_attach_input`] と同じ判定を `commit = false` で行う。
@@ -484,6 +583,29 @@ impl SignalSlot {
 
     /// `generation` の `Active` を `Exited` にする（別世代なら何もしない）。
     fn mark_exited(&self, generation: u64) {
+        // 先に同じスロットのロックの下で新規の開き直しの受付を閉じ（`begin_reopen` との調停）、実行中のものが終わるまで
+        // （有限時間）待ってから遷移する。スロットのロックは持たずに待つ（確定の関門がこのロックを取るため）。
+        // 待ちを超えて残った開き直しは、遷移の後に確定の関門で拒否される。
+        {
+            let inner = self.lock();
+            if matches!(
+                &inner.state,
+                SlotState::Active { generation: g, .. } if *g == generation
+            ) {
+                self.1
+                    .st
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .closing = Some(generation);
+            }
+        }
+        {
+            let st = self.1.st.lock().unwrap_or_else(PoisonError::into_inner);
+            let _ = self
+                .1
+                .idle
+                .wait_timeout_while(st, REOPEN_EXIT_WAIT, |s| s.busy);
+        }
         let mut inner = self.lock();
         if let SlotState::Active {
             generation: g, pid, ..
@@ -2199,5 +2321,66 @@ mod tests {
         let (g2, _r2, _) = gen_fake(200);
         let _cp2 = ControlledProcess::new(Box::new(g2), slot.clone());
         slot.check_attach(pid(200), false, true).unwrap();
+    }
+
+    /// CRI-2・REPAIR-5・#4652: 開き直しの枠は同時に 1 件。終了遷移は始めに新規の受付を閉じ（待っている間の新規は
+    /// `Busy` ではなく `ContainerExited`）、枠を持つ間は完了まで（有限時間）待つ。終了後は枠を取れない。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cri2_4652_reopen_permit_serializes_exit_transition() {
+        let slot = SignalSlot::new();
+        assert_eq!(slot.begin_reopen().err(), Some(ControlReason::NoHandle));
+        let (fake, _s, _e) = Fake::new(100);
+        let cp = ControlledProcess::new(Box::new(fake), slot.clone());
+        let permit = slot.begin_reopen().unwrap();
+        let mut committed = 0;
+        assert!(permit.commit(&mut || committed += 1));
+        assert_eq!(committed, 1);
+        // 枠は 1 件だけ。
+        assert_eq!(slot.begin_reopen().err(), Some(ControlReason::Busy));
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let (s2, generation) = (slot.clone(), cp.generation);
+        let h = std::thread::spawn(move || {
+            s2.mark_exited(generation);
+            done_tx.send(()).unwrap();
+        });
+        // 終了遷移が受付を閉じるまで待つ（閉じた後の新規は Busy ではなく ContainerExited）。
+        let until = Instant::now() + Duration::from_secs(5);
+        while slot.begin_reopen().err() != Some(ControlReason::ContainerExited) {
+            assert!(
+                Instant::now() < until,
+                "sync point not reached: exit transition did not close new reopens"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // 枠を持つ間、終了遷移は完了しない（まだ稼働中として扱われ、確定の関門を通る）。
+        assert!(done_rx.recv_timeout(Duration::from_millis(150)).is_err());
+        assert!(permit.commit(&mut || {}));
+        drop(permit);
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("sync point not reached: exit transition after the permit was dropped");
+        h.join().unwrap();
+        assert_eq!(
+            slot.begin_reopen().err(),
+            Some(ControlReason::ContainerExited)
+        );
+    }
+
+    /// CRI-2・REPAIR-5・#4652（P1）: 待ちの上限（500 ms）を超えて遅れた開き直しは、終了遷移の後は確定の関門が拒否し、
+    /// 確定の関数を呼ばない。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cri2_4652_late_permit_is_refused_at_commit_after_exit() {
+        let slot = SignalSlot::new();
+        let (fake, _s, _e) = Fake::new(100);
+        let cp = ControlledProcess::new(Box::new(fake), slot.clone());
+        let permit = slot.begin_reopen().unwrap();
+        // 枠を持ったまま終了遷移（待ちは上限で打ち切られる）。
+        slot.mark_exited(cp.generation);
+        let mut committed = 0;
+        assert!(!permit.commit(&mut || committed += 1));
+        assert_eq!(committed, 0, "the commit function must not run after exit");
     }
 }

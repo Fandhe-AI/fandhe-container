@@ -114,6 +114,52 @@ impl super::ExitNotifier for ControlExitWatcher {
     }
 }
 
+/// supervisor の制御チャネルへ、稼働中コンテナの CRI ログファイルの開き直しを依頼する（plugin-cri の
+/// `ReopenContainerLog` 用。CRI-2・SUP-7・REPAIR-5・#4652）。非 Linux は常に `Unimplemented`。
+#[derive(Debug, Clone)]
+pub struct ControlReopenLog {
+    state_root: PathBuf,
+}
+
+impl ControlReopenLog {
+    /// 状態ルート（`<state_root>/<id>/supervisor.sock` の `<state_root>`）から作る。
+    pub fn new(state_root: PathBuf) -> Self {
+        Self { state_root }
+    }
+
+    /// `id` のコンテナの supervisor に CRI ログを開き直させ、`deadline` までに結果を返す。
+    ///
+    /// エラー（`code`: 文言）: 稼働中でない（スロットが空・終了済み）は `FailedPrecondition`: `container is not running`
+    /// （新しいファイルは作られない）、CRI ログのパスが無い構成は `FailedPrecondition`: `the container has no CRI log path`、
+    /// supervisor 不在・古い supervisor（kind 10 を知らず拒否）は `Unavailable`: `the supervisor control channel is
+    /// unavailable`、開き直せない（親の検査・別の書き手など。既存の書き込み先は変わらない）は `FailedPrecondition`:
+    /// `the cri log file cannot be reopened`、それ以外の失敗は `Internal`: `the cri log reopen failed`、期限切れは
+    /// `Timeout`、別 uid のソケットは `PermissionDenied`。
+    ///
+    /// `cancel` が立ったら（要求元の RPC が取り消された・期限切れで破棄された）、応答を待たずに接続を閉じて戻る。
+    /// supervisor は確定の直前に接続の切断を確かめ、切れていれば確定しない（確定点を通った後の取り消しは閉じられない。
+    /// docs/design/cri-log-partial-lines.md「ReopenContainerLog との関係」）。
+    pub fn reopen(
+        &self,
+        id: &ContainerId,
+        deadline: Instant,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), TraitError> {
+        #[cfg(target_os = "linux")]
+        {
+            linux::reopen_log(&self.state_root, id, deadline, cancel)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (&self.state_root, id, deadline, cancel);
+            Err(TraitError::new(
+                fandhe_container_core::traits::ErrorCode::Unimplemented,
+                "the supervisor control channel requires Linux",
+            ))
+        }
+    }
+}
+
 /// supervisor の制御チャネルから、稼働中コンテナの起動時 pidfd の複製を受け取る [`super::ExecPidfdSource`]
 /// （CLI の `exec` 用。SUP-6・SEC-1・CLI-1・#2626）。Linux のみ（pidfd と `SCM_RIGHTS` は Linux の機能）。
 #[cfg(target_os = "linux")]
@@ -275,8 +321,8 @@ mod linux {
         AttachMask, AttachRequestFrame, CancelRestartRequestFrame, ControlReason,
         ExecCgroupNotifyFrame, ExecHandoverRequestFrame, ExitWatchRequestFrame, FrameHeader,
         HEADER_LEN, HoldDeadline, MAX_EXEC_HOLD_SECS, MAX_EXIT_WATCH_HOLD, MAX_SIGNAL_BUDGET,
-        RESPONSE_LEN, RESPONSE_PAYLOAD_LEN, RequestKind, ResponseFrame, SignalDeadline,
-        SignalRequestFrame,
+        RESPONSE_LEN, RESPONSE_PAYLOAD_LEN, ReopenLogRequestFrame, RequestKind, ResponseFrame,
+        SignalDeadline, SignalRequestFrame,
     };
     use crate::control::server::{peer_allowed, read_exact_until};
     use crate::control::{
@@ -292,6 +338,8 @@ mod linux {
             signal: Signal,
         },
         CancelRestart,
+        /// CRI ログの開き直し（kind 10。#4652）。
+        ReopenLog,
         /// exec 用 pidfd の受け渡し（#2626）。応答に fd が添えられる。
         ExecHandover {
             pid: NonZeroU32,
@@ -413,11 +461,41 @@ mod linux {
         cancel_outcome(reason)
     }
 
-    fn connect_until(path: &Path, deadline: Instant) -> Result<UnixStream, TraitError> {
-        connect_with_retry_window(path, deadline, CONNECT_RETRY_WINDOW, &|| false)
+    /// CRI ログの開き直しを依頼する（CRI-2・SUP-7・#4652）。結果の写し方は [`super::ControlReopenLog::reopen`] の doc。
+    /// 古い supervisor は kind 10 を `Malformed` で断る。それは「届かない」（`Unavailable`）として扱い、別の手段へは切り替えない。
+    pub(super) fn reopen_log(
+        state_root: &Path,
+        id: &ContainerId,
+        deadline: Instant,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), TraitError> {
+        let usable = deadline.saturating_duration_since(Instant::now());
+        if usable <= DEADLINE_MARGIN {
+            return Err(timeout());
+        }
+        let reason = exchange_with_fds(state_root, Request::ReopenLog, id, deadline, Some(cancel))
+            .map(|(reason, _fds, _stream)| reason)?;
+        reopen_log_result(reason)
     }
 
-    /// [`connect_until`] の再試行窓を引数にした版。終了の購読は窓を 0 にする（状態が `Running` と分かっていて、
+    /// 開き直しの応答の理由コードを結果へ写す（純関数。固定文言）。
+    pub(super) fn reopen_log_result(reason: ControlReason) -> Result<(), TraitError> {
+        match reason {
+            ControlReason::Ok => Ok(()),
+            ControlReason::NoHandle
+            | ControlReason::ContainerExited
+            | ControlReason::PidMismatch => Err(TraitError::new(
+                ErrorCode::FailedPrecondition,
+                "container is not running",
+            )),
+            ControlReason::Malformed
+            | ControlReason::TooLarge
+            | ControlReason::UnsupportedVersion => Err(unavailable()),
+            other => Err(other.to_error().unwrap_or_else(unavailable)),
+        }
+    }
+
+    /// 期限と取り消しつきの接続。再試行窓は通常 [`CONNECT_RETRY_WINDOW`]。終了の購読は窓を 0 にする（状態が `Running` と分かっていて、
     /// 再試行の待ちがそのまま起床の遅れになるため。#3683）。
     fn connect_with_retry_window(
         path: &Path,
@@ -460,6 +538,46 @@ mod linux {
         }
     }
 
+    /// 応答の待ちを取り消せる [`read_exact_until`]（CRI-2・REPAIR-5・#4652）。読み取りの期限を
+    /// [`CANCEL_POLL`] ごとに切って `cancel` を見て、立っていれば `Interrupted` で戻る（呼び出し元が接続を drop して閉じ、
+    /// supervisor は切断を確定の直前に見る）。
+    fn read_exact_until_cancelled(
+        stream: &mut UnixStream,
+        buf: &mut [u8],
+        deadline: Instant,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> io::Result<()> {
+        use std::io::Read as _;
+        let mut filled = 0usize;
+        while filled < buf.len() {
+            if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            stream.set_read_timeout(Some(remaining.min(CANCEL_POLL)))?;
+            let Some(rest) = buf.get_mut(filled..) else {
+                return Err(io::ErrorKind::InvalidInput.into());
+            };
+            match stream.read(rest) {
+                Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+                Ok(n) => filled = filled.saturating_add(n),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                    ) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    /// 取り消しの旗を見る間隔（応答の待ちを切る粒度）。
+    const CANCEL_POLL: Duration = Duration::from_millis(50);
+
     fn io_error(e: &io::Error) -> TraitError {
         crate::control::os_errno::record(e);
         if e.kind() == io::ErrorKind::TimedOut {
@@ -476,21 +594,28 @@ mod linux {
         id: &ContainerId,
         deadline: Instant,
     ) -> Result<ControlReason, TraitError> {
-        exchange_with_fds(state_root, request, id, deadline).map(|(reason, _fds, _stream)| reason)
+        exchange_with_fds(state_root, request, id, deadline, None)
+            .map(|(reason, _fds, _stream)| reason)
     }
 
     /// [`exchange`] と同じだが、応答に添えられた fd と接続も受け取る（ExecHandoverRequest だけが fd つきの応答を受ける。
     /// 他の要求では `fds` は常に空で、通常の `read` 経路のまま）。受け取った fd は呼び出し側が検証し、想定外なら drop で閉じる。
+    /// `cancel` があれば、接続・Hello の待ち・送信の直前・応答の待ちで旗を見て、立ったら要求を送らずに（送った後なら接続を
+    /// 閉じて）`Cancelled` 相当（`Unavailable`）で戻る。取り消し済みの要求を supervisor へ届けない（届くと、kubelet が失敗として
+    /// 回転済みのログを戻した後に supervisor が切り替えを確定しうる。CRI-2・#4652）。
     fn exchange_with_fds(
         state_root: &Path,
         request: Request,
         id: &ContainerId,
         deadline: Instant,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<(ControlReason, Vec<OwnedFd>, UnixStream), TraitError> {
         let euid = effective_uid()?;
         let dir = open_state_dir(state_root, id, euid)?;
         let path = path_via_fd(&dir, CONTROL_SOCKET_NAME);
-        let mut stream = connect_until(&path, deadline)?;
+        let cancelled = || cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire));
+        let mut stream =
+            connect_with_retry_window(&path, deadline, CONNECT_RETRY_WINDOW, &cancelled)?;
 
         // listen 側の資格情報を確かめる（別 uid が同名のソケットを置いていても送らない）。
         let cred = crate::sys::peer_credentials(stream.as_fd()).map_err(|e| {
@@ -512,7 +637,11 @@ mod linux {
 
         // Hello（サーバが接続元の検証を通した合図）。
         let mut head = [0u8; HEADER_LEN];
-        read_exact_until(&mut stream, &mut head, deadline).map_err(|e| io_error(&e))?;
+        match cancel {
+            Some(cancel) => read_exact_until_cancelled(&mut stream, &mut head, deadline, cancel),
+            None => read_exact_until(&mut stream, &mut head, deadline),
+        }
+        .map_err(|e| io_error(&e))?;
         FrameHeader::decode(&head)
             .and_then(FrameHeader::expect_hello)
             .map_err(|r| r.to_error().unwrap_or_else(unavailable))?;
@@ -533,6 +662,10 @@ mod linux {
             .and_then(|n| now_ns.checked_add(n))
             .ok_or_else(unavailable)?;
         let deadline_frame = SignalDeadline::from_nanos(abs_ns).map_err(|_| unavailable())?;
+        // 送信の直前にもう一度見る（Hello の後に取り消されていれば送らない）。
+        if cancelled() {
+            return Err(unavailable());
+        }
         let sent = match request {
             Request::Signal { kind, pid, signal } => stream.write_all(
                 &SignalRequestFrame {
@@ -545,6 +678,12 @@ mod linux {
             ),
             Request::CancelRestart => stream.write_all(
                 &CancelRestartRequestFrame {
+                    deadline: deadline_frame,
+                }
+                .encode(),
+            ),
+            Request::ReopenLog => stream.write_all(
+                &ReopenLogRequestFrame {
                     deadline: deadline_frame,
                 }
                 .encode(),
@@ -574,7 +713,11 @@ mod linux {
             let (reason, fds) = read_response_with_fds(&mut stream, deadline)?;
             return Ok((reason, fds, stream));
         }
-        read_exact_until(&mut stream, &mut head, deadline).map_err(|e| io_error(&e))?;
+        match cancel {
+            Some(cancel) => read_exact_until_cancelled(&mut stream, &mut head, deadline, cancel),
+            None => read_exact_until(&mut stream, &mut head, deadline),
+        }
+        .map_err(|e| io_error(&e))?;
         FrameHeader::decode(&head)
             .and_then(FrameHeader::expect_response)
             .map_err(|r| r.to_error().unwrap_or_else(unavailable))?;
@@ -700,8 +843,13 @@ mod linux {
         if usable <= DEADLINE_MARGIN {
             return Err(timeout());
         }
-        let (reason, fds, stream) =
-            exchange_with_fds(state_root, Request::ExecHandover { pid }, id, deadline)?;
+        let (reason, fds, stream) = exchange_with_fds(
+            state_root,
+            Request::ExecHandover { pid },
+            id,
+            deadline,
+            None,
+        )?;
         if let Some(e) = reason.to_error() {
             return Err(e);
         }
@@ -754,6 +902,7 @@ mod linux {
             },
             id,
             deadline,
+            None,
         )?;
         match reason {
             ControlReason::Ok => {}
@@ -1175,6 +1324,82 @@ mod linux {
             assert_eq!(e.message(), CANCEL_MSG);
             assert!(elapsed >= Duration::from_millis(400), "{elapsed:?}");
             assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+        }
+
+        /// CRI-2・REPAIR-5・#4652: 取り消し済みの開き直しは supervisor へ送らない。接続前に取り消されていれば接続せず、
+        /// Hello の待ちの間に取り消されたら、遅れて Hello が届いても要求を書かずに `Unavailable` で戻る（模擬サーバが受け取る
+        /// バイト数が 0）。
+        #[test]
+        fn cri2_4652_cancelled_reopen_is_never_sent() {
+            use crate::control::protocol::encode_hello;
+            use std::io::Read as _;
+            use std::os::unix::net::UnixListener;
+            use std::sync::atomic::{AtomicBool, Ordering};
+            let id = ContainerId::new("c").unwrap();
+
+            // 接続前に取り消し済み。
+            let root = state_root("reopen-precancel");
+            let listener = UnixListener::bind(root.join("c").join("supervisor.sock")).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let e = reopen_log(
+                &root,
+                &id,
+                Instant::now() + Duration::from_secs(2),
+                &AtomicBool::new(true),
+            )
+            .unwrap_err();
+            assert_eq!(e.code(), ErrorCode::Unavailable);
+            assert!(listener.accept().is_err(), "no connection is made");
+
+            // Hello の待ちの間に取り消す。模擬サーバの待ちはすべて期限つき（REPAIR-5）。
+            let root = state_root("reopen-hellocancel");
+            let listener = UnixListener::bind(root.join("c").join("supervisor.sock")).unwrap();
+            let server = std::thread::spawn(move || -> Option<usize> {
+                listener.set_nonblocking(true).unwrap();
+                let accept_deadline = Instant::now() + Duration::from_secs(10);
+                let mut s = loop {
+                    match listener.accept() {
+                        Ok((s, _)) => break s,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            if Instant::now() >= accept_deadline {
+                                return None;
+                            }
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(e) => panic!("accept failed: {e}"),
+                    }
+                };
+                s.set_nonblocking(false).unwrap();
+                std::thread::sleep(Duration::from_millis(300));
+                s.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+                s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                // クライアントが先に閉じていれば書き込みは失敗しうる（受け取ったバイト数だけを見る）。
+                let _ = s.write_all(&encode_hello());
+                let mut buf = [0u8; 64];
+                let mut total = 0usize;
+                loop {
+                    match s.read(&mut buf) {
+                        Ok(0) => return Some(total),
+                        Ok(n) => total += n,
+                        Err(_) => return Some(total),
+                    }
+                }
+            });
+            let cancel = std::sync::Arc::new(AtomicBool::new(false));
+            let c = cancel.clone();
+            let setter = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                c.store(true, Ordering::Release);
+            });
+            let e = reopen_log(&root, &id, Instant::now() + Duration::from_secs(5), &cancel)
+                .unwrap_err();
+            setter.join().unwrap();
+            assert_eq!(e.code(), ErrorCode::Unavailable);
+            assert_eq!(
+                server.join().unwrap(),
+                Some(0),
+                "the request must not be sent"
+            );
         }
 
         /// SUP-3・SUP-9: 応答の対応表。サーバの `Timeout` は取り消し専用の文言になる。

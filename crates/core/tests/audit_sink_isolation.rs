@@ -594,15 +594,15 @@ mod imp {
     #[cfg(target_os = "linux")]
     const FORK_AGAIN_CHILD_WITHIN: Duration = Duration::from_secs(10);
 
-    /// 子の終了を期限まで待ちつつ、出力ファイルが上限を超えたら `Err`。`Err` の 2 つ目は子を回収済みか
-    /// （回収済みなら pid が再利用されうるため、呼び出し側は数値の pgid で止めない）。
+    /// 子の終了を期限まで待ちつつ、出力ファイルが上限を超えたら `Err`。どの経路でも、子のプロセスグループを
+    /// 止めてから子を回収して戻る（呼び出し側は後始末をしない）。
     /// `reap::output_within_capped` は終了後に空のグループへ `kill` を送り、環境により usage エラーで
     /// 失敗する（Docker の aarch64 で 12 回中複数回）ため使わず、待ちループに大きさの監視だけ足す。
     #[cfg(target_os = "linux")]
     fn wait_capped(
         child: &mut std::process::Child,
         files: &[&Path],
-    ) -> Result<std::process::ExitStatus, (String, bool)> {
+    ) -> Result<std::process::ExitStatus, String> {
         let until = std::time::Instant::now() + FORK_AGAIN_CHILD_WITHIN;
         let over_cap = || -> Result<(), String> {
             for f in files {
@@ -616,19 +616,42 @@ mod imp {
             }
             Ok(())
         };
+        // 終了は回収（`try_wait`）せずに `/proc/<pid>/stat` の状態 `Z` で観測する。未回収の子が pid（＝グループ ID）を
+        // 保持している間にグループ全体を止めてから回収するため、異常終了でもプローブを残さず、再利用された番号へも
+        // 送らない（REPAIR-5）。期限切れ・上限超過・読み取りの失敗でも同じ順で止めてから回収する。
+        let pid = child.id();
+        let stop_and_reap = |child: &mut std::process::Child| {
+            super::reap::kill_group_or_report(pid);
+            child.wait().map_err(|e| format!("wait failed: {e}"))
+        };
+        let fail = |child: &mut std::process::Child, e: String| {
+            let _ = stop_and_reap(child);
+            Err(e)
+        };
         loop {
-            over_cap().map_err(|e| (e, false))?;
-            match child.try_wait() {
-                // 終了の直前に上限を超えて書いた分も見落とさないよう、終了を確かめた後にもう一度大きさを見る。
-                Ok(Some(st)) => return over_cap().map(|()| st).map_err(|e| (e, true)),
-                Ok(None) => {}
-                Err(e) => return Err((format!("try_wait failed: {e}"), false)),
+            if let Err(e) = over_cap() {
+                return fail(child, e);
+            }
+            let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Ok(s) => s,
+                Err(e) => return fail(child, format!("cannot read /proc/{pid}/stat: {e}")),
+            };
+            // comm に `)` が入りうるため最後の `)` の後ろの状態文字を見る。
+            if stat
+                .rsplit_once(") ")
+                .and_then(|(_, rest)| rest.chars().next())
+                == Some('Z')
+            {
+                let st = stop_and_reap(child)?;
+                // 終了の直前に上限を超えて書いた分も見落とさないよう、回収後にもう一度大きさを見る。
+                over_cap()?;
+                return Ok(st);
             }
             if std::time::Instant::now() >= until {
-                return Err((
+                return fail(
+                    child,
                     format!("child did not exit within {FORK_AGAIN_CHILD_WITHIN:?}"),
-                    false,
-                ));
+                );
             }
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -685,14 +708,7 @@ mod imp {
         };
         let status = match wait_capped(&mut child, &[&out_path, &err_path]) {
             Ok(s) => s,
-            Err((e, reaped)) => {
-                // 回収前だけプロセスグループごと止める（回収後の番号は再利用されうる）。
-                if !reaped {
-                    super::reap::kill_group_or_report(child.id());
-                    let _ = super::reap::reap(&mut child, super::reap::reap_within());
-                }
-                panic!("fork_again child did not finish cleanly: {e}");
-            }
+            Err(e) => panic!("fork_again child did not finish cleanly: {e}"),
         };
         let stdout = read_capped(&out_path);
         let stderr = read_capped(&err_path);

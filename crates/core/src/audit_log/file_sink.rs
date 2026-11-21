@@ -1141,18 +1141,22 @@ impl AuditSink for FileAuditSink {
     }
 }
 
-/// 両経路失敗の戻り値。通知 1 行が出せない場合（`RLIMIT_NPROC` の到達で通知の子もスレッドも作れない等）でも
-/// 主経路の失敗種別（例 `isolation_fork_again`）が残るよう、固定の語彙の種別名を文言にも含める（値・パスは含めない。
-/// #4702・SEC-4・REPAIR-4）。機械で判別する呼び出し元は [`FileAuditSink::record_detailed`] の構造化した値を使う。
+/// 両経路失敗の戻り値。主経路が `isolation_fork_again` のときだけ、通知 1 行が出せない場合（`RLIMIT_NPROC` の到達で
+/// 通知の子もスレッドも作れない等）でも種別が残るよう固定の語彙の種別名を文言に足す。それ以外の種別では従来の文言の
+/// まま変えない（文言に依存する呼び出し元との互換。#4702・SEC-4・REPAIR-4）。機械で判別する呼び出し元は
+/// [`FileAuditSink::record_detailed`] の構造化した値を使う。
 fn both_failed_error(failure: &AuditWriteFailure) -> TraitError {
-    TraitError::new(
-        failure.error_code(),
-        format!(
-            "{} (primary: {})",
-            failure.message(),
-            failure.primary().kind().as_str()
-        ),
-    )
+    if failure.primary().kind() == AuditWriteErrorKind::IsolationForkAgain {
+        return TraitError::new(
+            failure.error_code(),
+            format!(
+                "{} (primary: {})",
+                failure.message(),
+                AuditWriteErrorKind::IsolationForkAgain.as_str()
+            ),
+        );
+    }
+    TraitError::new(failure.error_code(), failure.message())
 }
 #[cfg(test)]
 mod tests {
@@ -1279,11 +1283,10 @@ mod tests {
         } else {
             ("unsupported", "UNIMPLEMENTED")
         };
+        // fork の EAGAIN 以外の種別では、従来の文言のまま種別を足さない（#4702）。
         assert_eq!(
             e.message(),
-            format!(
-                "audit record could not be persisted by primary or fallback path (primary: {p})"
-            )
+            "audit record could not be persisted by primary or fallback path"
         );
         let expect = format!(
             "{{\"event\":\"audit_write_failure\",\"code\":\"INTERNAL\",\"primary\":\"{p}\",\"primary_code\":\"{pc}\",\"fallback\":\"fallback_unavailable\",\"fallback_code\":\"UNIMPLEMENTED\"}}\n"

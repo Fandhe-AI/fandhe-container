@@ -1078,8 +1078,11 @@ impl fmt::Debug for FileAuditSink {
     }
 }
 
-impl AuditSink for FileAuditSink {
-    fn record(&self, record: &AuditRecord) -> Result<(), TraitError> {
+impl FileAuditSink {
+    /// [`AuditSink::record`] と同じ処理で、両経路の失敗を構造化したまま返す（REPAIR-2・SEC-4・#4702）。
+    /// 主経路・代替経路の失敗種別は `failure.primary().kind()`・`failure.fallback().kind()` で読める（文言を解析しない）。
+    /// `AuditSink::record` はこれを集約コードの `TraitError` へ写すだけ。
+    pub fn record_detailed(&self, record: &AuditRecord) -> Result<(), AuditWriteFailure> {
         let primary = match self.write_primary(record) {
             Ok(()) => return Ok(()),
             Err(primary) => primary,
@@ -1091,7 +1094,14 @@ impl AuditSink for FileAuditSink {
             Err(fb) => AuditWriteFailure::new(primary, fb),
         };
         (self.notify)(&failure, None);
-        Err(both_failed_error(&failure))
+        Err(failure)
+    }
+}
+
+impl AuditSink for FileAuditSink {
+    fn record(&self, record: &AuditRecord) -> Result<(), TraitError> {
+        self.record_detailed(record)
+            .map_err(|failure| both_failed_error(&failure))
     }
 
     /// 全段階(主経路の子の待ちと kill 後の回収待ち・代替経路の ACK 待ち・失敗通知)に同じ絶対期限を通す
@@ -1132,8 +1142,8 @@ impl AuditSink for FileAuditSink {
 }
 
 /// 両経路失敗の戻り値。通知 1 行が出せない場合（`RLIMIT_NPROC` の到達で通知の子もスレッドも作れない等）でも
-/// 呼び出し元が主経路の失敗種別（例 `isolation_fork_again`）を判別できるよう、固定の語彙の種別名を文言に含める
-/// （値・パスは含めない。#4702・SEC-4・REPAIR-4）。
+/// 主経路の失敗種別（例 `isolation_fork_again`）が残るよう、固定の語彙の種別名を文言にも含める（値・パスは含めない。
+/// #4702・SEC-4・REPAIR-4）。機械で判別する呼び出し元は [`FileAuditSink::record_detailed`] の構造化した値を使う。
 fn both_failed_error(failure: &AuditWriteFailure) -> TraitError {
     TraitError::new(
         failure.error_code(),

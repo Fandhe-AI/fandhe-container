@@ -981,26 +981,16 @@ impl FileAuditSink {
         sys::set_child_signal_ignored_for_test(ignored).is_ok()
     }
 
-    /// 結合試験専用: 自プロセスの `RLIMIT_NPROC`（soft・hard とも）を `max` に下げる（実 fork の `EAGAIN` の再現用。
-    /// `prlimit` コマンドに頼らない。#4702・SEC-4）。戻せないため再起動した子でだけ呼ぶ。失敗の原因は errno か
+    /// 結合試験専用: 自プロセスの `RLIMIT_NPROC` の soft だけを `soft` にし、前の soft を返す（実 fork の `EAGAIN` の
+    /// 再現用。#4702・SEC-4）。hard は変えないため、前の値を渡して呼び直せば非特権でも戻せる。失敗の原因は errno か
     /// `Unsupported` の [`std::io::Error`] で返す（文字列に畳まない。REPAIR-2）。
     #[cfg(all(target_os = "linux", feature = "exec-test-support"))]
     #[doc(hidden)]
-    pub fn limit_processes_for_test(max: u64) -> std::io::Result<()> {
-        sys::set_rlimit_self(crate::rlimits::RlimitKind::Nproc, max, max).map_err(sys_io_error)
-    }
-
-    /// 結合試験専用: 未回収の自分の子 `pgid`（グループのリーダー）のプロセスグループへ SIGKILL を送る。外部の `kill` を
-    /// 起動しないため、プロセス枠が尽きていても送れる（`tests/audit_sink_isolation.rs` の後始末。#4702・REPAIR-5）。
-    /// 呼び出し側は `pgid` が未回収の自分の子であることを保証する（回収後は番号が再利用されうる）。誰も居なければ `Ok`。
-    #[cfg(all(target_os = "linux", feature = "exec-test-support"))]
-    #[doc(hidden)]
-    /// 失敗の原因は errno か `Unsupported` の [`std::io::Error`] で返す（文字列に畳まない。REPAIR-2）。
-    pub fn kill_process_group_for_test(pgid: u32) -> std::io::Result<()> {
-        match sys::kill_process_group(pgid, sys::Signal::Kill) {
-            Ok(()) | Err(sys::SysError::Os(sys::ESRCH)) => Ok(()),
-            Err(e) => Err(sys_io_error(e)),
-        }
+    pub fn set_process_soft_limit_for_test(soft: u64) -> std::io::Result<u64> {
+        let kind = crate::rlimits::RlimitKind::Nproc;
+        let (old, hard) = sys::get_rlimit_self(kind).map_err(sys_io_error)?;
+        sys::set_rlimit_self(kind, soft, hard).map_err(sys_io_error)?;
+        Ok(old)
     }
 
     /// 結合試験専用: 自プロセスのスレッド数（macOS の `tests/audit_sink_isolation.rs` が `/proc` の代わりに使う。

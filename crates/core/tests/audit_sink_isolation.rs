@@ -18,9 +18,8 @@
 //!   書き込みを始めた後に詰まった子は出し直さない（上の「通知先も止まる」）
 //! - 通知の子が行の途中で書き込みに失敗すると、出し直しは改行を 1 つ付けてから 1 行を出す（断片と連結しない）
 //! - 複数スレッドのプロセス: fork できないため主経路は試行せず `isolation_unavailable` で代替経路へ進む
-//! - 主経路の fork が `EAGAIN`（`current_exe()` で自分自身を再起動し、子が `FileAuditSink::limit_processes_for_test(1)` で
-//!   `RLIMIT_NPROC` を下げて実 fork を失敗させる。Linux で `RLIMIT_NPROC` が効く環境のみ。子のプローブで上限が効かないと
-//!   確かめた場合〔init の user namespace の root・`CAP_SYS_ADMIN`・`CAP_SYS_RESOURCE`〕だけ適用外）:
+//! - 主経路の fork が `EAGAIN`（自プロセスの `RLIMIT_NPROC` の soft を記録の間だけ 1 に下げて実 fork を失敗させる。
+//!   Linux のみ。上限を免除される場合〔init の user namespace の root・`CAP_SYS_ADMIN`・`CAP_SYS_RESOURCE`〕だけ適用外）:
 //!   代替経路へ進み、その主経路の失敗種別が `isolation_fork_again`（`UNAVAILABLE`）になる（#4702）
 //! - `SIGCHLD` が `SIG_IGN`（子が自動回収され `waitpid` が `ECHILD`）: 主経路の成功を失敗と取り違えず代替経路へ
 //!   二重に記録しない。失敗種別・時間切れ・通知も同じく届く（最後に実行し、終わったら `SIG_DFL` に戻す）
@@ -56,10 +55,6 @@ fn main() {
 ))]
 #[path = "support/scratch_root.rs"]
 mod scratch_root;
-
-#[cfg(all(target_os = "linux", feature = "exec-test-support"))]
-#[path = "support/reap.rs"]
-mod reap;
 
 #[cfg(all(
     any(target_os = "linux", target_os = "macos"),
@@ -333,27 +328,7 @@ mod imp {
             .join(tag)
     }
 
-    /// 自分で `RLIMIT_NPROC` を下げる再起動された子の入口の引数（`fork_again_is_reported_as_isolation_fork_again` が渡す）。
-    #[cfg(target_os = "linux")]
-    const FORK_AGAIN_CHILD_ARG: &str = "--fork-again-child";
-
-    /// 上限が効かないときに子が起動する、即座に終わるプローブの入口の引数（PATH に依存しない）。
-    #[cfg(target_os = "linux")]
-    const FORK_AGAIN_PROBE_ARG: &str = "--fork-again-probe";
-
     pub(super) fn run() {
-        #[cfg(target_os = "linux")]
-        if std::env::args().nth(1).as_deref() == Some(FORK_AGAIN_PROBE_ARG) {
-            return;
-        }
-        #[cfg(target_os = "linux")]
-        if std::env::args().nth(1).as_deref() == Some(FORK_AGAIN_CHILD_ARG) {
-            let dir = std::env::args_os()
-                .nth(2)
-                .expect("the scratch dir argument");
-            fork_again_child(Path::new(&dir));
-            return;
-        }
         assert_eq!(threads(), 1, "the test binary must start single-threaded");
         let scratch =
             super::scratch_root::ScratchDir::new("fandhe-audit-isolation", Duration::from_secs(10));
@@ -374,7 +349,6 @@ mod imp {
         #[cfg(target_os = "linux")]
         {
             fork_again_is_reported_as_isolation_fork_again();
-            wait_single_threaded();
             control_relay_persists_from_a_multi_threaded_process();
             control_relay_keeps_exit_signal_records_from_many_threads();
             control_relay_persists_exec_target_from_a_multi_threaded_process();
@@ -588,289 +562,66 @@ mod imp {
             .unwrap()
     }
 
-    /// 子の出力ファイルの保存量の上限。待ちの間に `wait_capped` が大きさを見て、超えたら失敗にする（REPAIR-5）。
-    #[cfg(target_os = "linux")]
-    const FORK_AGAIN_OUTPUT_CAP: u64 = 64 * 1024;
-
-    /// 再起動した子の期限（REPAIR-5・REPAIR-10 の応答待ちの既定 5〜10 秒）。
-    #[cfg(target_os = "linux")]
-    const FORK_AGAIN_CHILD_WITHIN: Duration = Duration::from_secs(10);
-
-    /// 子の終了を期限まで待ちつつ、出力ファイルが上限を超えたら `Err`。どの経路でも、子のプロセスグループを
-    /// 止めてから子を回収して戻る（呼び出し側は後始末をしない）。
-    /// `reap::output_within_capped` は終了後に空のグループへ `kill` を送り、環境により usage エラーで
-    /// 失敗する（Docker の aarch64 で 12 回中複数回）ため使わず、待ちループに大きさの監視だけ足す。
-    #[cfg(target_os = "linux")]
-    fn wait_capped(
-        child: &mut std::process::Child,
-        files: &[&Path],
-    ) -> Result<std::process::ExitStatus, String> {
-        let until = std::time::Instant::now() + FORK_AGAIN_CHILD_WITHIN;
-        let over_cap = || -> Result<(), String> {
-            for f in files {
-                let len = std::fs::metadata(f).map_err(|e| e.to_string())?.len();
-                if len > FORK_AGAIN_OUTPUT_CAP {
-                    return Err(format!(
-                        "child output {} is {len} bytes (cap {FORK_AGAIN_OUTPUT_CAP})",
-                        f.display()
-                    ));
-                }
-            }
-            Ok(())
-        };
-        // 終了は回収（`try_wait`）せずに `/proc/<pid>/stat` の状態 `Z` で観測する。未回収の子が pid（＝グループ ID）を
-        // 保持している間にグループ全体を止めてから回収するため、異常終了でもプローブを残さず、再利用された番号へも
-        // 送らない（REPAIR-5）。期限切れ・上限超過・読み取りの失敗でも同じ順で止めてから回収する。
-        let pid = child.id();
-        // 回収にも期限を設ける（SIGKILL が届かない D 状態などで止まらない。REPAIR-5）。グループの停止に失敗しても
-        // 直接の子の回収は試み、停止の失敗は `Err` で返す（プローブが残りうるのに成功にしない）。
-        let stop_and_reap = |child: &mut std::process::Child| {
-            // 未回収（子が pid を保持している）としてグループを止める。外部の `kill` を起動せず `kill(2)` で直接送るため、
-            // 親側でもプロセス枠が尽きていても、`kill` が未導入でも止められる。送信に失敗したときは `Child::kill` で
-            // 直接の子だけは止める。
-            let killed = FileAuditSink::kill_process_group_for_test(pid);
-            if killed.is_err() {
-                let _ = child.kill();
-            }
-            let reaped = super::reap::wait_within(child, super::reap::reap_within());
-            match (killed, reaped) {
-                (Ok(()), Ok(st)) => Ok(st),
-                (Err(k), Ok(_)) => Err(format!("kill process group {pid} failed: {k}")),
-                (Ok(()), Err(w)) => Err(w),
-                (Err(k), Err(w)) => Err(format!("kill process group {pid} failed: {k}; {w}")),
-            }
-        };
-        let fail = |child: &mut std::process::Child, e: String| match stop_and_reap(child) {
-            Ok(_) => Err(e),
-            Err(r) => Err(format!("{e}; cleanup: {r}")),
-        };
-        loop {
-            if let Err(e) = over_cap() {
-                return fail(child, e);
-            }
-            let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-                Ok(s) => s,
-                Err(e) => return fail(child, format!("cannot read /proc/{pid}/stat: {e}")),
-            };
-            // comm に `)` が入りうるため最後の `)` の後ろの状態文字を見る。
-            if stat
-                .rsplit_once(") ")
-                .and_then(|(_, rest)| rest.chars().next())
-                == Some('Z')
-            {
-                let st = stop_and_reap(child)?;
-                // 終了の直前に上限を超えて書いた分も見落とさないよう、回収後にもう一度大きさを見る。
-                over_cap()?;
-                return Ok(st);
-            }
-            if std::time::Instant::now() >= until {
-                return fail(
-                    child,
-                    format!("child did not exit within {FORK_AGAIN_CHILD_WITHIN:?}"),
-                );
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-
-    /// `Command::spawn` に期限を付ける（REPAIR-5）。Linux の spawn は子の exec の成否が確定するまで親を待たせるため、
-    /// exec が止まると後の期限（`wait_capped`）に届かない。見張りのスレッドが `within` を過ぎたら、spawn の前に居なかった
-    /// 自分の子（`/proc` の ppid で数える）のプロセスグループへ SIGKILL を送り、`WATCHDOG EXPIRED` の行と終了コード 124 で
-    /// 試験プロセスごと終わる（spawn の途中の子は pid が手元に無いため、回収は init に任せる）。見張りは spawn が戻ったら
-    /// 終わり、join してから返す。join の後も `Threads:` の減算が遅れうるため、単一スレッドを前提にする後の場面の前に
-    /// 呼び出し元（`run`）が `wait_single_threaded` で待つ。診断の行は切り離したスレッドで書き、stderr が書けなくても
-    /// 終了コード 124 で終わる。既知の限界: 列挙から kill までの間に spawn が exec の失敗で子を回収し、その pid が再利用されて
-    /// グループの先頭になると、無関係なグループへ SIGKILL が 1 回届きうる（pidfd でグループへ送る入口が要る。#4920）。
-    #[cfg(target_os = "linux")]
-    fn spawn_within(
-        cmd: &mut std::process::Command,
-        within: Duration,
-    ) -> std::io::Result<std::process::Child> {
-        let me = std::process::id();
-        let before = children_of(me);
-        let (tx, rx) = std::sync::mpsc::channel::<()>();
-        let watchdog = std::thread::spawn(move || {
-            if rx.recv_timeout(within) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
-                for pid in children_of(me).difference(&before) {
-                    let _ = FileAuditSink::kill_process_group_for_test(*pid);
-                }
-                let _ = std::thread::Builder::new().spawn(move || {
-                    eprintln!(
-                        "audit_sink_isolation: WATCHDOG EXPIRED: spawning the fork_again child did not return within {within:?}"
-                    );
-                });
-                std::thread::sleep(Duration::from_millis(200));
-                std::process::exit(124);
-            }
-        });
-        let spawned = cmd.spawn();
-        let _ = tx.send(());
-        let _ = watchdog.join();
-        spawned
-    }
-
-    /// `ppid` を親に持つプロセスの pid（`/proc/<pid>/stat` の 4 番目の欄。読めないものは飛ばす）。
-    #[cfg(target_os = "linux")]
-    fn children_of(ppid: u32) -> std::collections::BTreeSet<u32> {
-        let Ok(dir) = std::fs::read_dir("/proc") else {
-            return std::collections::BTreeSet::new();
-        };
-        dir.filter_map(|e| e.ok()?.file_name().to_str()?.parse::<u32>().ok())
-            .filter(|pid| {
-                std::fs::read_to_string(format!("/proc/{pid}/stat"))
-                    .ok()
-                    .and_then(|st| {
-                        let (_, rest) = st.rsplit_once(") ")?;
-                        rest.split(' ').nth(1)?.parse::<u32>().ok()
-                    })
-                    == Some(ppid)
-            })
-            .collect()
-    }
-
-    #[cfg(target_os = "linux")]
-    fn read_capped(path: &Path) -> String {
-        use std::io::Read;
-        let mut buf = String::new();
-        std::fs::File::open(path)
-            .unwrap()
-            .take(FORK_AGAIN_OUTPUT_CAP)
-            .read_to_string(&mut buf)
-            .unwrap();
-        buf
-    }
-
-    /// 子が `RLIMIT_NPROC` の効かないことを親へ知らせる 1 行（子の事前確認で spawn が成功した場合）。
-    #[cfg(target_os = "linux")]
-    const FORK_AGAIN_NOT_ENFORCED: &str = "fork_again child: RLIMIT_NPROC is not enforced";
-
     /// SEC-4・REPAIR-12・#4702: 実 fork が `EAGAIN` で失敗したとき、`FileAuditSink` は主経路の失敗種別を
     /// `isolation_fork_again` として代替経路へ渡す（汎用の `isolation_unavailable` へ畳まない）。
-    /// 自分自身を子として再起動し、子が `FileAuditSink::limit_processes_for_test(1)` で `RLIMIT_NPROC` を下げる
-    /// （試験コードに unsafe を持ち込まない）。上限は同じ uid の全プロセス数で数えるため、親（本プロセス）が居る限り
-    /// 子の fork は `EAGAIN` になる。子は本題の前に spawn を 1 回試して上限が効くことを確かめる。root と
-    /// `CAP_SYS_ADMIN`・`CAP_SYS_RESOURCE` を持つ場合は上限が効かないため適用外を明示して飛ばし、それ以外で
-    /// 効かなければ失敗にする（CI は非 root・capability なし）。子の出力は `ScratchDir` 配下のファイルへ直接書かせ、
-    /// pipe の EOF を待たない（孫が書き込み端を持ち続けても期限内に戻る。REPAIR-5）。
+    /// 子プロセスは起動せず、自プロセスの `RLIMIT_NPROC` の soft だけを 1 に下げる。上限は fork するプロセス自身の値で
+    /// 同じ uid のプロセス数と比べるため、本プロセスが居る限り次の fork とスレッドの作成は `EAGAIN` になる（他の
+    /// プロセスには効かない）。記録の直後に元の soft へ戻す（hard は変えないため非特権で戻せる）。上限の間は通知の子も
+    /// スレッドも作れず通知 1 行は出ない（通知行は単体試験で見る）。主経路が成功したら上限が効いていない。
+    /// root・`CAP_SYS_ADMIN`・`CAP_SYS_RESOURCE` による免除なら適用外を明示し、それ以外は失敗にする（CI は非 root・
+    /// capability なし）。
     #[cfg(target_os = "linux")]
     fn fork_again_is_reported_as_isolation_fork_again() {
-        // uid 0 でも早く抜けない（user namespace の中の uid 0 は上限を免除されないことがある）。適用外にするのは、
-        // 子のプローブで上限が効かないと確かめられた場合だけ（REPAIR-12）。
-        let dir = tmp_marker("fork-again");
-        std::fs::create_dir(&dir).unwrap();
-        let (out_path, err_path) = (dir.join("stdout"), dir.join("stderr"));
-        // 子とその子孫（プローブ）を専用のプロセスグループに置き、失敗の経路ではグループごと止める（REPAIR-5）。
-        // `wait_capped` は終了した子が回収されるまで pid（＝グループ ID）を保持する前提で、グループへ送る。`SIGCHLD` が
-        // `SIG_IGN`（起動元から継承・他の場面が設定）だと子は自動回収され、解放された番号へ送りうるため、spawn の前に
-        // 既定の扱いへ戻し、この試験の間は変えない（REPAIR-5）。
-        assert!(
-            FileAuditSink::set_child_signal_ignored_for_test(false),
-            "restoring the default SIGCHLD disposition must succeed"
-        );
-        use std::os::unix::process::CommandExt as _;
-        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
-        cmd.process_group(0)
-            .arg(FORK_AGAIN_CHILD_ARG)
-            .arg(&dir)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::fs::File::create(&out_path).unwrap())
-            .stderr(std::fs::File::create(&err_path).unwrap());
-        let mut child = match spawn_within(&mut cmd, FORK_AGAIN_CHILD_WITHIN) {
-            Ok(c) => c,
-            Err(e) => panic!("cannot re-launch the test binary: {e}"),
-        };
-        let status = match wait_capped(&mut child, &[&out_path, &err_path]) {
-            Ok(s) => s,
-            Err(e) => panic!("fork_again child did not finish cleanly: {e}"),
-        };
-        let stdout = read_capped(&out_path);
-        let stderr = read_capped(&err_path);
-        assert!(
-            status.success(),
-            "child failed: {status:?}, stdout={stdout}, stderr={stderr}"
-        );
-        if stdout.trim_end() == FORK_AGAIN_NOT_ENFORCED {
-            // CAP_SYS_ADMIN（21）・CAP_SYS_RESOURCE（24）を持てば上限は免除される。それ以外で効かないのは前提の崩れ。
-            const EXEMPT: u64 = (1 << 21) | (1 << 24);
-            // init の user namespace の root（INIT_USER）と CAP_SYS_ADMIN・CAP_SYS_RESOURCE は上限を免除される。
-            assert!(
-                cap_eff() & EXEMPT != 0 || real_uid() == 0,
-                "RLIMIT_NPROC was not enforced although uid is not 0 and CAP_SYS_ADMIN and CAP_SYS_RESOURCE are absent"
-            );
-            println!(
-                "audit_sink_isolation: fork_again not applicable (root or CAP_SYS_ADMIN / CAP_SYS_RESOURCE exempts RLIMIT_NPROC)"
-            );
-            return;
-        }
-        assert_eq!(
-            stdout.trim_end(),
-            "fork_again child: primary=[IsolationForkAgain] code=Internal message=audit record could not be persisted by primary or fallback path (primary: isolation_fork_again) detail=IsolationForkAgain until=Internal:audit record could not be persisted by primary or fallback path (primary: isolation_fork_again)"
-        );
-        println!("audit_sink_isolation: fork_again reaches the fallback as isolation_fork_again");
-    }
-
-    /// 再起動された子の本体。最初に自分の `RLIMIT_NPROC` を 1 に下げる。`dir` は親が `ScratchDir` 配下に作った実行ごとのディレクトリ。spawn を 1 回試して
-    /// `EAGAIN` になる（上限が効く）ことを確かめ、効かなければその旨の 1 行だけを出して終わる。効けば両経路を
-    /// 失敗させ、代替経路が見た主経路の失敗種別を 1 行で標準出力へ出す（親が照合する）。通知の子・スレッドも
-    /// 作れず通知 1 行は出ない。
-    #[cfg(target_os = "linux")]
-    fn fork_again_child(dir: &Path) {
-        if let Err(e) = FileAuditSink::limit_processes_for_test(1) {
-            panic!(
-                "lowering RLIMIT_NPROC must succeed: {e} (errno {:?})",
-                e.raw_os_error()
-            );
-        }
-        // 上限が効かず起動できた場合に待ち続けないよう、spawn と期限つきの待ちに分ける。プローブは自分自身の
-        // 即終了の入口で、PATH に依存しない。待ち・回収に失敗したら適用外の印は出さず失敗にする。
-        match std::process::Command::new(std::env::current_exe().unwrap())
-            .arg(FORK_AGAIN_PROBE_ARG)
-            .spawn()
-        {
-            Ok(mut c) => {
-                match super::reap::wait_within(&mut c, Duration::from_secs(5)) {
-                    // 正常終了した場合だけ「上限が効かない」の印を出す（異常終了を適用外の成功にしない）。
-                    Ok(st) => assert!(st.success(), "the probe exited abnormally: {st:?}"),
-                    Err(e) => {
-                        let _ = super::reap::reap(&mut c, super::reap::reap_within());
-                        panic!("the probe did not exit in time: {e}");
-                    }
-                }
-                println!("{FORK_AGAIN_NOT_ENFORCED}");
-                return;
-            }
-            Err(e) => assert_eq!(
-                e.raw_os_error(),
-                Some(11),
-                "the probe spawn must fail with EAGAIN: {e}"
-            ),
-        }
-        let primary: Primary = Arc::new(|path, _| {
-            std::fs::write(path, b"must-not-run").map_err(|_| unreachable_err())
-        });
-        let marker = dir.join("marker");
+        // 主経路は単一スレッドのときだけ fork する（複数スレッドだと `isolation_unavailable` になり照合で落ちる）。
+        wait_single_threaded();
+        let primary: Primary =
+            Arc::new(|path, _| std::fs::write(path, b"primary-ran").map_err(|_| unreachable_err()));
+        let marker = tmp_marker("fork-again");
         let (sink, seen) = sink(primary, false, Notify::Discard, marker.clone());
-        let e = sink.record(&record()).unwrap_err();
-        assert!(!marker.exists(), "the primary must not run");
+        let old = match FileAuditSink::set_process_soft_limit_for_test(1) {
+            Ok(old) => old,
+            Err(e) => panic!("lowering RLIMIT_NPROC must succeed: {e}"),
+        };
+        let e = sink.record(&record());
         let seen_once = seen.lock().unwrap().clone();
         // 構造化した戻り値でも主経路の種別を読める（文言を解析しない。REPAIR-2）。
-        let detailed = sink.record_detailed(&record()).unwrap_err();
+        let detailed = sink.record_detailed(&record());
         // supervisor が使う期限つきの経路でも、集約コードと種別つきの文言が同じであること（REPAIR-12）。
-        let until = sink
-            .record_until(
-                &record(),
-                std::time::Instant::now() + Duration::from_secs(5),
-            )
-            .unwrap_err();
-        println!(
-            "fork_again child: primary={:?} code={:?} message={} detail={:?} until={:?}:{}",
-            seen_once,
-            e.code(),
-            e.message(),
-            detailed.primary().kind(),
-            until.code(),
-            until.message()
+        let until = sink.record_until(&record(), Instant::now() + Duration::from_secs(5));
+        if let Err(e) = FileAuditSink::set_process_soft_limit_for_test(old) {
+            panic!("restoring RLIMIT_NPROC must succeed: {e}");
+        }
+        let e = match e {
+            Ok(()) => {
+                // CAP_SYS_ADMIN（21）・CAP_SYS_RESOURCE（24）と init の user namespace の root は上限を免除される。
+                const EXEMPT: u64 = (1 << 21) | (1 << 24);
+                assert!(
+                    cap_eff() & EXEMPT != 0 || real_uid() == 0,
+                    "RLIMIT_NPROC was not enforced although uid is not 0 and CAP_SYS_ADMIN and CAP_SYS_RESOURCE are absent"
+                );
+                println!(
+                    "audit_sink_isolation: fork_again not applicable (root or CAP_SYS_ADMIN / CAP_SYS_RESOURCE exempts RLIMIT_NPROC)"
+                );
+                return;
+            }
+            Err(e) => e,
+        };
+        assert!(!marker.exists(), "the primary must not run");
+        let detailed = detailed.unwrap_err();
+        let until = until.unwrap_err();
+        assert_eq!(
+            format!(
+                "primary={:?} code={:?} message={} detail={:?} until={:?}:{}",
+                seen_once,
+                e.code(),
+                e.message(),
+                detailed.primary().kind(),
+                until.code(),
+                until.message()
+            ),
+            "primary=[IsolationForkAgain] code=Internal message=audit record could not be persisted by primary or fallback path (primary: isolation_fork_again) detail=IsolationForkAgain until=Internal:audit record could not be persisted by primary or fallback path (primary: isolation_fork_again)"
         );
+        println!("audit_sink_isolation: fork_again reaches the fallback as isolation_fork_again");
     }
 
     /// REPAIR-5・TASK-163: 複数スレッドのプロセスでは fork できず、主経路を試行せず代替経路へ進む。

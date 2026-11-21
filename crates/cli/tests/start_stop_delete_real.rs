@@ -1307,6 +1307,11 @@ mod linux {
         let map_cgroup = PathBuf::from("/sys/fs/cgroup")
             .join(map_placement.scope().as_str().trim_start_matches('/'))
             .join(map_name.as_str());
+        // 起動で fork された子は `CgroupJoin` に達するまで親（この起動専用の委譲スコープ）に残るため、スコープ自体も
+        // 消えたか、`cgroup.events` が子孫を含めて `populated 0` になったことを期限つきで確かめる。
+        let map_scope_dir = PathBuf::from("/sys/fs/cgroup")
+            .join(map_placement.scope().as_str().trim_start_matches('/'));
+        wait_scope_unpopulated(&map_scope_dir, REAP_TIMEOUT)?;
         let members = cgroup_subtree_members(&map_cgroup)?;
         expect(
             members.is_empty(),
@@ -1386,6 +1391,29 @@ mod linux {
                     && pred(&e.path())
             })
             .count()
+    }
+
+    /// 委譲スコープ `dir` が消えるか、`cgroup.events` が `populated 0`（子孫を含めてメンバーなし）になるまで `limit` だけ
+    /// 待つ（#4711・REPAIR-5・REPAIR-12）。NotFound 以外の読み取りの失敗と期限切れは `Err`。
+    fn wait_scope_unpopulated(dir: &Path, limit: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + limit;
+        loop {
+            let events = match fs::read_to_string(dir.join("cgroup.events")) {
+                Ok(t) => t,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => return Err(format!("read {}/cgroup.events: {e}", dir.display())),
+            };
+            if events.lines().any(|l| l == "populated 0") {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "the delegated scope {} is still populated after {limit:?}: {events:?}",
+                    dir.display()
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// cgroup とその子孫の `cgroup.procs` に載る pid を集める（#4711・REPAIR-12）。cgroup（または走査中の子孫）が

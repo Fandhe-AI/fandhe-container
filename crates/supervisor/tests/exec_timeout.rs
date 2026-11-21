@@ -224,13 +224,13 @@ mod linux {
 
     /// REPAIR-5・REPAIR-12・REPAIR-10 (d)・SUP-6・#4733: worker が結果行を残さず 0 で終わり、別プロセスが結果 pipe の
     /// 書き込み端を持ち続けても、本番の回収経路（`collect_worker_result`）は EOF を待たず、約 1 秒で固定文言の
-    /// `Internal` を返す。worker は `result_write_fd_for_test()` が示す結果 pipe の書き込み端を開き直して `sleep 20` に
-    /// 持たせ、結果を書かずに `exit(0)` する。孫の pid は試験が作った私有の pipe で worker から受け、`SleeperGuard` が
-    /// 終了経路（失敗の panic を含む）で必ず SIGKILL する（共有の一時領域は使わない）。
+    /// `Internal` を返す。worker は `result_write_fd_for_test()` が示す結果 pipe の書き込み端を開き直して孫
+    /// （`sh -c 'read _'`）の stdout に持たせ、`skip_result_write_for_test()` で結果行を省いて 0 で戻る（fork ラッパーの
+    /// `_exit` 経路で終わる）。孫の stdin は試験が持つ pipe の読み端で、試験が書き込み端（`_hold`）を閉じると EOF で
+    /// 自分で終わる（pid・pgid の番号では kill しない。失敗の panic を含め `_hold` の drop で必ず終わる）。孫は worker の
+    /// 子なので、worker の終了で init（または subreaper）へ付け替わって回収される（試験は回収しない）。
     fn worker_result_read_is_bounded_when_write_end_is_held() {
-        use std::io::Write as _;
-        let (mut pid_r, mut pid_w) = std::io::pipe().unwrap();
-        let _guard = SleeperGuard(&mut pid_r);
+        let (hold_r, _hold) = std::io::pipe().unwrap();
         let t0 = Instant::now();
         let res = run_in_worker_for_test(
             Duration::from_secs(10),
@@ -242,17 +242,18 @@ mod linux {
                     .write(true)
                     .open(format!("/proc/self/fd/{fd}"))
                     .unwrap();
-                // 回収しないのは意図的（worker の終了で init へ付け替わり、試験が最後に kill する）。
+                // 回収しないのは意図的（worker の終了で init へ付け替わり、stdin の EOF で自分で終わる）。
                 #[allow(clippy::zombie_processes)]
-                let c = std::process::Command::new("sleep")
-                    .arg("20")
-                    .stdin(std::process::Stdio::null())
+                let _c = std::process::Command::new("sh")
+                    .args(["-c", "read _"])
+                    .stdin(hold_r)
                     .stdout(w)
                     .stderr(std::process::Stdio::null())
                     .spawn()
                     .unwrap();
-                pid_w.write_all(c.id().to_string().as_bytes()).unwrap();
-                std::process::exit(0)
+                fandhe_container_supervisor::exec::skip_result_write_for_test();
+                // 結果行は省かれるので値は読まれない。
+                Err(TraitError::new(ErrorCode::Internal, "unused"))
             },
         );
         let elapsed = t0.elapsed();
@@ -266,22 +267,6 @@ mod linux {
             elapsed >= Duration::from_secs(1) && elapsed < Duration::from_secs(5),
             "elapsed {elapsed:?}"
         );
-    }
-
-    /// worker が作った孫（`sleep`）を、worker から pipe で受けた pid で kill する後始末（drop で実行）。
-    /// pipe は試験が排他的に作った私有のもので、書き手は worker だけ（worker の回収後は EOF で読み切れる）。
-    struct SleeperGuard<'a>(&'a mut std::io::PipeReader);
-    impl Drop for SleeperGuard<'_> {
-        fn drop(&mut self) {
-            use std::io::Read as _;
-            let mut s = String::new();
-            let _ = self.0.read_to_string(&mut s);
-            if let Ok(pid) = s.trim().parse::<u32>() {
-                let _ = std::process::Command::new("kill")
-                    .args(["-9", &pid.to_string()])
-                    .status();
-            }
-        }
     }
 
     /// SUP-6・REPAIR-5・TASK-163 追補（#1466）: worker を fork した後は、期限切れ・エラー返却・異常終了（panic）の

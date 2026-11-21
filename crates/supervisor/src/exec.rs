@@ -1886,6 +1886,11 @@ fn run_in_worker_with_pty(
                 sender: Option<ExecListenerSender>,
                 pty_sender: Option<ExecPtySender>| {
         let line = encode_worker_result(&work(&proof, sender, pty_sender));
+        // 試験専用: 結果行を書かずに 0 で戻る（fork ラッパーの `_exit` 経路で終わらせるため。#4733）。
+        #[cfg(feature = "exec-test-support")]
+        if SKIP_RESULT_WRITE.load(std::sync::atomic::Ordering::SeqCst) {
+            return 0;
+        }
         // 書けなければ親は「結果なし」として失敗扱いにする（fail-closed）。
         let _ = (&writer).write_all(&line);
         0
@@ -2267,7 +2272,8 @@ fn collect_worker_result(
     decode_worker_result(&line)
 }
 
-/// 回収済み worker の結果 1 行を `timeout` まで読む（#4733・REPAIR-5）。期限切れは `ErrorCode::Internal`・
+/// 回収済み worker の結果 1 行を読む（#4733・REPAIR-5）。`timeout` は待ちの上限で、pipe にすでにある分（完全な行を含む）は
+/// 期限後でも捨てずに回収して返す（SEC-4 の違反の理由を失わない）。完全な行が無いまま期限切れは `ErrorCode::Internal`・
 /// 固定文言 `exec stage Spawn: the worker result was not received in time`（コマンド自体の期限切れの
 /// `Timeout` とは区別する。worker は終了済みなので「結果が届かなかった」内部異常）。読み取り失敗も `Internal`。
 fn read_worker_result_line(
@@ -2414,6 +2420,18 @@ fn remove_child_cgroup(
 
 /// 子 cgroup の後始末で、`cgroup.kill` の後に空になるまで待つ上限（REPAIR-5）。
 const CHILD_CGROUP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 試験専用: 結果行の書き込みを省く印（worker 内でだけ立てる）。
+#[cfg(feature = "exec-test-support")]
+static SKIP_RESULT_WRITE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 試験専用: worker の `work` の中で呼ぶと、その worker は結果行を書かずに 0 で戻る（fork した worker 内の値なので
+/// 親・他の試験には影響しない。#4733）。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub fn skip_result_write_for_test() {
+    SKIP_RESULT_WRITE.store(true, std::sync::atomic::Ordering::SeqCst);
+}
 
 /// 試験専用: 直近の `run_in_worker_*` が fork 前に作った結果 pipe の書き込み端の fd 番号（worker はこの番号で継承する）。
 #[cfg(feature = "exec-test-support")]

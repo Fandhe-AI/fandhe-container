@@ -23,8 +23,13 @@ pub(crate) enum ReadStop {
     Io(io::Error, Vec<u8>),
 }
 
-/// `until` まで、EOF・上限 `max` バイト・（`stop_at_newline` なら）`\n` のいずれかで止まるまで読む。
-/// `\n` は結果に含み、それ以降は読み越さない（1 バイトずつ読む）。`stop_at_newline = false` では塊で読む。
+/// EOF・上限 `max` バイト・（`stop_at_newline` なら）`\n` のいずれかで止まるまで読む。
+///
+/// 契約: `until` は **待ちの上限** である。`poll` が読めると報告するデータ（HUP 系を含む）は、期限を過ぎていても
+/// `max` まで直ちに回収する（`max` で頭打ち・`read` は `poll` の後でブロックしないので有限時間で終わる）。読めるものが
+/// 無いときだけ `until` まで待ち、過ぎたら `TimedOut`（それまでに読めた分を保持）を返す。`EINTR` の再試行も期限で打ち切る。
+/// `stop_at_newline = true` は塊（最大 512 バイト）で読み、`\n` までを（`\n` を含めて）返す。塊の `\n` より後ろは
+/// 読み越して **捨てる**（回収済みの worker の pipe を 1 回だけ読む用途のため無害）。`false` は塊で読み、`\n` を特別扱いしない。
 ///
 /// 契約: `r` の `Read` は、`poll` する fd（`AsFd`）そのものを読む単独の読み手であること。読み端を複製して別に
 /// 読む者がいる・並行に読む者がいる・`Read` が `poll` した fd 以外の入力を待つ実装だと、`poll` が読めると
@@ -38,31 +43,40 @@ pub(crate) fn read_capped_until(
     let mut out = Vec::new();
     let mut buf = [0u8; 512];
     while (out.len() as u64) < max {
-        // 期限はループの先頭で毎回確かめる（読める間・`EINTR` の再試行の間も期限を越えて続けない。REPAIR-5）。
         let now = Instant::now();
-        if now >= until {
-            return Err(ReadStop::TimedOut(out));
-        }
         match poll_revents_now(r.as_fd(), POLL_IN | POLL_RDHUP) {
             Ok(rev) if rev & (POLL_IN | POLL_GONE_MASK) != 0 => {}
             Ok(_) => {
+                if now >= until {
+                    return Err(ReadStop::TimedOut(out));
+                }
                 std::thread::sleep(POLL_STEP.min(until - now));
                 continue;
             }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                if now >= until {
+                    return Err(ReadStop::TimedOut(out));
+                }
+                continue;
+            }
             Err(e) => return Err(ReadStop::Io(e, out)),
         }
         let room = (max - out.len() as u64).min(buf.len() as u64) as usize;
-        let want = if stop_at_newline { 1 } else { room };
-        match r.read(&mut buf[..want]) {
+        match r.read(&mut buf[..room]) {
             Ok(0) => break,
             Ok(n) => {
-                out.extend_from_slice(&buf[..n]);
-                if stop_at_newline && buf[0] == b'\n' {
+                let chunk = &buf[..n];
+                if stop_at_newline && let Some(i) = chunk.iter().position(|&b| b == b'\n') {
+                    out.extend_from_slice(&chunk[..=i]);
                     break;
                 }
+                out.extend_from_slice(chunk);
             }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                if now >= until {
+                    return Err(ReadStop::TimedOut(out));
+                }
+            }
             Err(e) => return Err(ReadStop::Io(e, out)),
         }
     }
@@ -105,9 +119,9 @@ mod tests {
         assert!(el >= T && el < Duration::from_secs(2), "{el:?}");
     }
 
-    /// 改行まで書けば writer が残っていても即座に返り、改行以降は読み越さない。
+    /// 改行まで書けば writer が残っていても即座に返り、改行より後ろは読み越して捨てる（契約）。
     #[test]
-    fn repair5_4733_newline_returns_immediately_without_overread() {
+    fn repair5_4733_newline_returns_immediately_and_discards_rest() {
         let (mut r, mut w) = std::io::pipe().unwrap();
         w.write_all(b"ok\nnext").unwrap();
         let t0 = Instant::now();
@@ -116,26 +130,33 @@ mod tests {
         assert!(t0.elapsed() < Duration::from_secs(2));
         let rest = read_capped_until(&mut r, 4096, Instant::now() + T, false);
         assert!(
-            matches!(&rest, Err(ReadStop::TimedOut(b)) if b == b"next"),
+            matches!(&rest, Err(ReadStop::TimedOut(b)) if b.is_empty()),
             "{rest:?}"
         );
     }
 
-    /// REPAIR-5: 期限を過ぎていれば、読めるデータがあっても読まずに期限切れを返す（期限を越えて読み続けない）。
+    /// REPAIR-5・SEC-4: 期限が過ぎていても、すでに読める完全な行は捨てずに返す（待ちだけを期限で切る）。
     #[test]
-    fn repair5_4733_expired_deadline_stops_even_when_readable() {
+    fn repair5_4733_expired_deadline_still_returns_readable_line() {
         let (mut r, mut w) = std::io::pipe().unwrap();
         w.write_all(b"ready\n").unwrap();
-        let got = read_capped_until(
-            &mut r,
-            4096,
-            Instant::now() - Duration::from_millis(1),
-            true,
-        );
+        let past = Instant::now() - Duration::from_millis(1);
+        let got = read_capped_until(&mut r, 4096, past, true).unwrap();
+        assert_eq!(got, b"ready\n");
+    }
+
+    /// 期限切れで、読めるものが無ければ待たずに即座に `TimedOut` で戻る（読めた分は保持）。
+    #[test]
+    fn repair5_4733_expired_deadline_does_not_wait_when_nothing_readable() {
+        let (mut r, mut w) = std::io::pipe().unwrap();
+        w.write_all(b"abc").unwrap();
+        let t0 = Instant::now();
+        let got = read_capped_until(&mut r, 4096, t0 - Duration::from_millis(1), true);
         assert!(
-            matches!(&got, Err(ReadStop::TimedOut(b)) if b.is_empty()),
+            matches!(&got, Err(ReadStop::TimedOut(b)) if b == b"abc"),
             "{got:?}"
         );
+        assert!(t0.elapsed() < Duration::from_millis(100));
     }
 
     /// writer を閉じれば EOF で期限を待たずに返る。

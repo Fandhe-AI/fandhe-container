@@ -520,40 +520,44 @@ mod tests {
         );
     }
 
-    /// 試験の後始末（REPAIR-5）: drop で holder 役を SIGKILL・回収し、holder のプロセスグループ（孫の `sleep` を含む）
-    /// を丸ごと SIGKILL する。準備・照合の失敗（panic）でも残さない。
+    /// 試験の後始末（REPAIR-5）: drop で holder 役を SIGKILL・回収する（準備・照合の失敗の panic でも）。続けて `_hold`
+    /// （孫の stdin の書き込み端）が閉じ、孫の `read` が EOF で自分で終わる（pid・pgid の番号では kill しない）。
+    /// 孫は holder 役の子なので、holder 役の回収で init（または subreaper）へ付け替わって回収される。
     struct HolderGuard {
         child: Child,
+        _hold: std::io::PipeWriter,
     }
     impl Drop for HolderGuard {
         fn drop(&mut self) {
-            let pgid = self.child.id();
-            // 回収済みでも std は何も送らない。グループは孫が生きている間は pgid が再利用されない。
+            // 回収済みなら std は何も送らない（子は自分で回収した Child のみ）。
             let _ = self.child.kill();
             let _ = wait_until(&mut self.child, REAP_TIMEOUT);
-            let _ = crate::sys::kill_process_group(pgid);
         }
     }
 
     /// REPAIR-5・REPAIR-12・REPAIR-10 (d)・#4733: 別プロセスが stderr の書き込み端を持ち続けても、停止経路
     /// `kill_and_reap` は EOF を待たず、終了状態と読めた stderr を期限内（`STDERR_DRAIN_TIMEOUT` 前後）に返す。
     /// holder 役の `sh`（自分のプロセスグループ）が孫（`sleep 20`）に stderr を継承させて診断行を書き、stdout へ
-    /// `ready` を出して `exec sleep 100` に置き換わった後に SIGKILL で回収される。孫は `HolderGuard` がグループごと
-    /// kill する（PID ファイルは使わない）。
+    /// `ready` を出して `exec sleep 100` に置き換わった後に SIGKILL で回収される。孫（`read _`）は試験が持つ pipe を
+    /// stdin（holder 役が fd 3 へ複製して継承）にし、`HolderGuard` が書き込み端を閉じると EOF で自分で終わる。
     #[test]
     fn repair5_4733_kill_and_reap_returns_without_eof_when_writer_is_held() {
+        let (hold_r, hold_w) = std::io::pipe().unwrap();
         let child = Command::new("sh")
             .args([
                 "-c",
-                "sleep 20 >/dev/null & echo diag-line >&2; echo ready; exec sleep 100",
+                // 非同期コマンドの stdin は /dev/null になるため、fd 3 へ複製してから孫へ渡す。
+                "exec 3<&0; read _ <&3 & echo diag-line >&2; echo ready; exec sleep 100",
             ])
-            .process_group(0)
-            .stdin(Stdio::null())
+            .stdin(Stdio::from(hold_r))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let mut guard = HolderGuard { child };
+        let mut guard = HolderGuard {
+            child,
+            _hold: hold_w,
+        };
         let mut stdout = guard.child.stdout.take().unwrap();
         let mut stderr = guard.child.stderr.take();
         // `ready`（= 診断行も書き終えた）を期限つきで待つ。

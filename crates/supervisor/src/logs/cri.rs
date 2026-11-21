@@ -387,8 +387,8 @@ fn open_log_file(path: &std::path::Path) -> Result<std::fs::File, TraitError> {
 /// `reopen` 用に、親ディレクトリを検査して fd で開く（以後の open・作成・削除はこの fd の直下だけで行い、パスを再解決しない。
 /// CRI-2・SEC-1・#4652）。パスの検査（[`super::rotating::check_dir`]。絶対・`..` なし・祖先の symlink なし）で得た実体パスを、
 /// `/` から 1 要素ずつ `openat(O_DIRECTORY | O_NOFOLLOW)` で辿り、開いた各祖先の fd を `fstat` で確かめる（所有者が root か
-/// 自分で、group / other が書き込めないか sticky）。最後の fd はディレクトリで group / other が書き込めないこと。祖先を
-/// 名前で引き直さないため、検査と open の間に祖先を差し替えられても、差し替えた祖先は検査を通らない。
+/// 自分で、group / other が書き込めないか sticky）。最後の fd はディレクトリで、所有者が root か自分で、group / other が
+/// 書き込めないこと。祖先を名前で引き直さないため、検査と open の間に祖先を差し替えられても、差し替えた祖先は検査を通らない。
 #[cfg(target_os = "linux")]
 fn open_verified_dir(parent: &std::path::Path) -> Result<std::fs::File, TraitError> {
     use std::os::fd::AsFd as _;
@@ -414,8 +414,11 @@ fn open_verified_dir(parent: &std::path::Path) -> Result<std::fs::File, TraitErr
         }
         dir = crate::sys::open_dir_at(dir.as_fd(), name).map_err(|_| unopenable())?;
     }
+    // 最後のディレクトリにも所有者を要求する（sticky の祖先の直下には他人もディレクトリを作れ、その所有者は中の名前を
+    // 置き換えられる）。
     let opened = dir.metadata().map_err(|_| unopenable())?;
-    if !opened.is_dir() || opened.mode() & 0o022 != 0 {
+    let owner_ok = opened.uid() == 0 || opened.uid() == euid;
+    if !opened.is_dir() || !owner_ok || opened.mode() & 0o022 != 0 {
         return Err(unopenable());
     }
     Ok(dir)

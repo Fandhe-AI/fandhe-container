@@ -489,7 +489,8 @@ fn handle_reopen_log(
     }
 }
 
-/// 要求元が接続を閉じた（`POLLRDHUP` / `POLLHUP` / `POLLERR`）か。poll の失敗も切断として扱う（確定しない側へ倒す）。
+/// 要求元が接続を閉じた（`POLLRDHUP` / `POLLHUP` / `POLLERR`）か。poll の失敗も切断として扱う（確定しない側へ倒す。
+/// `poll_revents_now` の doc の「失敗したら取り消さない側」とは逆向きで、ここでは確定しないことが fail-closed）。
 fn requester_gone(stream: &UnixStream) -> bool {
     use std::os::fd::AsFd as _;
     match crate::sys::poll_revents_now(stream.as_fd(), crate::sys::POLL_RDHUP) {

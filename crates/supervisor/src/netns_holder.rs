@@ -626,6 +626,66 @@ mod tests {
         );
     }
 
+    /// REPAIR-5・REPAIR-12・REPAIR-10 (d)・#4733: 公開の `try_exit` は、holder の終了後も別プロセスが stderr の書き込み端を
+    /// 持ち続けていても、EOF を待たずに終了状態と即時に読める診断を返す（`HolderAdapter::is_alive` からも呼ばれる待たない契約）。
+    /// holder 役（`sh`）は診断行を書いて終了コード 3 で終わり、書き込み端は補助（`sleep 8`。子を作らない 1 プロセス）も持つ。
+    /// `try_exit` が誤って [`STDERR_DRAIN_TIMEOUT`] を渡すと、終了を観測した呼び出しが 500 ms かかり失敗する。
+    #[test]
+    fn repair5_4733_try_exit_does_not_wait_for_eof_when_writer_is_held() {
+        use std::os::fd::OwnedFd;
+        let (err_r, err_w) = std::io::pipe().unwrap();
+        let helper = Command::new("sleep")
+            .arg("8")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(err_w.try_clone().unwrap()))
+            .spawn()
+            .unwrap();
+        let _guard = HolderGuard {
+            helper,
+            child: None,
+        };
+        let child = Command::new("sh")
+            .args(["-c", "echo diag-line >&2; exit 3"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(err_w))
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let mut holder = NetnsHolderProcess {
+            child: Some(child),
+            chan: None,
+            stderr: Some(ChildStderr::from(OwnedFd::from(err_r))),
+            pid,
+            ready: HolderReady {
+                identity: fandhe_container_net::netns_holder::NsIdentity {
+                    dev: 0,
+                    net_ino: 0,
+                    user_ino: 0,
+                },
+                elapsed: Duration::ZERO,
+            },
+        };
+        let until = Instant::now() + Duration::from_secs(10);
+        let (exit, took) = loop {
+            let t0 = Instant::now();
+            let got = holder.try_exit().expect("poll");
+            let took = t0.elapsed();
+            if let Some(exit) = got {
+                break (exit, took);
+            }
+            assert!(Instant::now() < until, "the holder did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(exit.code, Some(3));
+        assert_eq!(exit.signal, None);
+        assert_eq!(exit.stderr, "diag-line\\n");
+        assert!(took < Duration::from_millis(100), "{took:?}");
+        // 回収済みなので以後は `None`（二度目の回収はしない）。
+        assert!(holder.try_exit().expect("poll").is_none());
+    }
+
     /// NET-9・ERR-1: 全コードの写像を具体値で固定する（`Timeout` が `Internal` に潰れない）。
     #[test]
     fn trait_code_maps_every_net_code() {

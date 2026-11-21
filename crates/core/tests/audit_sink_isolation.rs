@@ -620,13 +620,14 @@ mod imp {
         // 保持している間にグループ全体を止めてから回収するため、異常終了でもプローブを残さず、再利用された番号へも
         // 送らない（REPAIR-5）。期限切れ・上限超過・読み取りの失敗でも同じ順で止めてから回収する。
         let pid = child.id();
+        // 回収にも期限を設ける（SIGKILL が届かない D 状態などで止まらない。REPAIR-5）。
         let stop_and_reap = |child: &mut std::process::Child| {
             super::reap::kill_group_or_report(pid);
-            child.wait().map_err(|e| format!("wait failed: {e}"))
+            super::reap::wait_within(child, super::reap::reap_within())
         };
-        let fail = |child: &mut std::process::Child, e: String| {
-            let _ = stop_and_reap(child);
-            Err(e)
+        let fail = |child: &mut std::process::Child, e: String| match stop_and_reap(child) {
+            Ok(_) => Err(e),
+            Err(r) => Err(format!("{e}; cleanup: {r}")),
         };
         loop {
             if let Err(e) = over_cap() {

@@ -191,7 +191,7 @@ pub(crate) fn kill_group_with(
 /// それ以外は全試行の実行ファイル・引数・終了ステータス・stderr を連ねた `Err`。`pgid` が 0 や 1 のときは
 /// 自分のグループや全体を撃たないよう何もしない。Unix 以外では何もしない（REPAIR-5）。
 #[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
-fn kill_group(pgid: u32, child_reaped: bool) -> Result<(), String> {
+pub(crate) fn kill_group(pgid: u32, child_reaped: bool) -> Result<(), String> {
     #[cfg(unix)]
     {
         if pgid <= 1 {

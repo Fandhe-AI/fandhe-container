@@ -181,7 +181,7 @@
 //!   restart の再 launch は Running(新 pid) の更新で識別子を置き換える（契約 12）が、本番 launcher の再 launch は #2043 で
 //!   成立する（supervisor が単一スレッドにして呼ぶ）。記録を持たない偽の launcher の再 launch は前の記録を消し（#2238）、exec は記録が無く拒否される（fail-closed）
 //! - 同じ user namespace（`Shared`。rootful 相当で本番では到達しない）での root 以外の `process.user` と
-//!   `additionalGids`（`Unimplemented` で拒否。`RootfulHostRoot` の判断待ち。#2241）。別の user namespace
+//!   `additionalGids`（`Unimplemented` で拒否。本番の rootful は #2241 の決定で別途恒久拒否しており、この拒否は Shared 経路の未対応）。別の user namespace
 //!   （既定の rootless）では写像と照合して適用する（#2770）
 //! - ルールパスの解決の起点とプロセスの `/` が食い違う状況での照合専用の試験（上記 4）
 //! - launch 時の分離の記録は、本番 launcher が適用する ruleset そのものから作り、start の Running 更新と restart の
@@ -736,7 +736,7 @@ struct ExecUser {
 ///   （単一 ID 写像）なら `FailedPrecondition`（黙って落とさない）。通れば ids と正規化した補助グループを返す
 ///   （launch と同じ順序 setgroups → setgid → setuid で適用される）。メッセージは固定文言で値を含めない（ERR-1）
 /// - `Shared`（同じ user namespace。rootful 相当。本番では到達しない）: root（0/0・追加グループなし）だけを従来
-///   どおり受け、それ以外は `Unimplemented`（`RootfulHostRoot` の判断待ち。#2241）
+///   どおり受け、それ以外は `Unimplemented`（Shared 経路の未対応。本番の rootful は #2241 の決定で別途恒久拒否）
 ///
 /// `process` が無い config は `InvalidArgument`。launch 側の写像外は `FailedPrecondition` のままで、exec は
 /// 要求の誤りとして `InvalidArgument` にする（#2770）。

@@ -638,3 +638,40 @@ async fn err3_pull_image_429_is_distinguishable_from_other_unavailable() {
         assert!(listed.images.is_empty(), "{http:?}");
     }
 }
+
+/// SEC-5・ERR-3・CRI-2（#4709・PR #4904）: rootful の恒久拒否の固定文言つき `PermissionDenied` が
+/// `StartContainer` の公開境界で gRPC コード 7 とその文言のまま届く。
+#[tokio::test]
+async fn sec5_start_container_rootful_refusal_reaches_grpc_permission_denied() {
+    const MSG: &str = "the rootful privilege model is permanently refused by policy (SEC-5)";
+    struct Refuse;
+    impl ContainerRuntime for Refuse {
+        fn create(&self, r: &CreateRequest) -> Result<ContainerStatus, TraitError> {
+            Ok(ContainerStatus::created(r.id().clone(), None))
+        }
+        fn start(&self, _: &StartRequest) -> Result<ContainerStatus, TraitError> {
+            Err(TraitError::new(ErrorCode::PermissionDenied, MSG))
+        }
+        fn kill(&self, _: &KillRequest) -> Result<ContainerStatus, TraitError> {
+            Err(TraitError::new(ErrorCode::Unimplemented, "not used"))
+        }
+        fn stop(&self, r: &StopRequest) -> Result<ContainerStatus, TraitError> {
+            Ok(ContainerStatus::stopped(r.id().clone(), Some(0)))
+        }
+        fn delete(&self, _: &DeleteRequest) -> Result<DeleteResponse, TraitError> {
+            Ok(DeleteResponse::new())
+        }
+        fn state(&self, r: &StateRequest) -> Result<ContainerStatus, TraitError> {
+            Ok(ContainerStatus::created(r.id().clone(), None))
+        }
+    }
+    let service = CriRuntimeService::with_recorder(Arc::new(Collect::default())).with_runtime(
+        RuntimeAdapter::new(Arc::new(Refuse)),
+        Arc::new(FakeBundles::default()),
+    );
+    let sb = run_sandbox(&service).await;
+    let id = create(&service, &sb).await.expect("create");
+    let err = start(&service, &id).await.expect_err("start must fail");
+    assert_eq!(pair(&err), (Code::PermissionDenied, MSG.to_string()));
+    assert_eq!(err.code() as i32, 7);
+}

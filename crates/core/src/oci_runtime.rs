@@ -56,6 +56,12 @@ mod start;
 mod sysfs_mount;
 mod working_dir;
 
+/// `RootfulHostRoot`（uid 0）の恒久拒否の固定文言（#2241 の決定 D1 A・D2 A・SEC-5・#4709）。code は
+/// `PermissionDenied`。launcher・保持役・supervisor の `privilege_for_status`・共有クライアントの `privilege_gate` が
+/// 同じ文言を返すよう、この定義だけを使う（値を含めない）。
+pub const ROOTFUL_REFUSED_MESSAGE: &str =
+    "the rootful privilege model is permanently refused by policy (SEC-5)";
+
 /// ライフサイクル操作（create・start・kill・delete と派生の `create_with_image`・`delete_releasing_image_ref` 等）が、
 /// 注入された `OpRecorder` へ書く固定の操作名の全部（REPAIR-4・CRI-6）。
 /// 記録箇所の定数から組むため二重管理にならない。記録器の名前の上限 `observability::MAX_TRACKED_OPS` の余裕を

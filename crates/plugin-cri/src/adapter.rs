@@ -347,7 +347,7 @@ impl CriPluginBackends {
         }
         backends.state_root = Some(state_root);
         backends._instance_lock = Some(instance_lock);
-        // 保持役は Linux・非 root の本番構成だけで差す（rootful は従来どおり差さず、start は `UNIMPLEMENTED`。#2241・#2442）。
+        // 保持役は Linux・非 root の本番構成だけで差す（rootful は従来どおり差さず、start は #2241 の決定で `PERMISSION_DENIED`。#2442）。
         // 試験ビルドでは環境変数で止められる（既定の集合の試験が AppArmor の緩和・supervisor の bin なしで動くように）。
         #[cfg(target_os = "linux")]
         if pod_holder_injection_enabled() {

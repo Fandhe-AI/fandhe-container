@@ -34,7 +34,7 @@
 //! 素性（pid・starttime・user / ipc / net の dev:ino）は READY の検証後に集めて `PodHolder::from_identity` で返し（R11・#2940。
 //! starttime を読めなければ fail-closed で子を回収して失敗）、記録ファイルへの書き込みは cri が行う。再起動後に再採用した記録の
 //! 保持役は `observe_process_start`（`/proc/<pid>/stat` の読み取りだけ）で終了済みを確かめるに留め、再採用はしない（要確認事項 1 の
-//! (a) は未採用）。rootful（uid 0）は `UNIMPLEMENTED`（#2241・#2442 の判断まで）。
+//! (a) は未採用）。rootful（uid 0）は #2241 の決定どおり `PERMISSION_DENIED` で恒久的に拒否する。
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -281,11 +281,16 @@ impl ProductionPodHolder {
     }
 
     fn rootful_guard(&self) -> Result<(), TraitError> {
+        self.rootful_guard_with(current_euid)
+    }
+
+    /// [`Self::rootful_guard`] の本体。euid の取得を注入できる（試験で 0・非 0・取得失敗を固定値で通す。SEC-5・#4709）。
+    fn rootful_guard_with(&self, euid: impl FnOnce() -> Result<u32, ()>) -> Result<(), TraitError> {
         if !matches!(self.exe, ExeSource::Beside) {
             return Ok(());
         }
-        match current_euid() {
-            Ok(0) => Err(TraitError::new(ErrorCode::Unimplemented, MSG_ROOTFUL)),
+        match euid() {
+            Ok(0) => Err(TraitError::new(ErrorCode::PermissionDenied, MSG_ROOTFUL)),
             Ok(_) => Ok(()),
             Err(()) => Err(TraitError::new(
                 ErrorCode::FailedPrecondition,
@@ -865,8 +870,8 @@ pub(crate) fn current_euid() -> Result<u32, ()> {
     Ok(snap.uid.effective)
 }
 
-/// 保持役 provider を注入するか（Linux の本番構成）。実効 uid が 0 と確定したときだけ注入しない（従来の rootful の挙動を
-/// 保つ）。読めない場合は注入し、provider の `spawn` の検査が fail-closed で落とす。
+/// 保持役 provider を注入するか（Linux の本番構成）。`current_euid` が 0（実 uid か実効 uid が 0）と確定したときだけ
+/// 注入しない（rootful は恒久拒否。#4709）。読めない場合は注入し、provider の `spawn` の検査が fail-closed で落とす。
 pub fn should_inject_pod_holder<E>(euid: Result<u32, E>) -> bool {
     !matches!(euid, Ok(0))
 }

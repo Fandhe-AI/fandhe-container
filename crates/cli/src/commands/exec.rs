@@ -57,7 +57,7 @@
 //!
 //! - コマンドの標準入出力は `/dev/null` に固定（`exec.rs` のモジュール doc「未実装」）。cwd・ユーザーの指定も無い。
 //! - supervisor 不在（孤児化・supervisor の再起動後）の exec は拒否される（起動時 pidfd を失うため。担当は #2688）。
-//! - rootful の起動（`start` が `UNIMPLEMENTED`）は対象外。healthcheck の配線は #2441。
+//! - rootful の起動（`start` が `PERMISSION_DENIED`）は対象外。healthcheck の配線は #2441。
 //! - 非 Linux は plugin 経由（#1869 の設計・TASK-125）。現状は他のコマンドと同じく fail-closed で失敗する。
 //! - 2 の起動オプション文書の読み取りは期限つきの作業スレッドで包まない（5 の単一スレッドの前提を保つため。healthcheck の exec 専用
 //!   helper と同じ残余。REPAIR-5）。全体の期限は委譲スコープの親が `--timeout` と猶予（`PARENT_GRACE`）で縛る（前提と残余は呼び出し箇所のコメント）。

@@ -51,7 +51,7 @@
 //!   mapper は外側の user namespace に残り、helper で写像を書いて読み戻し、応答後に中間プロセスが PID 1 を fork する。
 //!   責務境界は、`rootless` が写像の検証・書き込み・読み戻し、`exec` が計画・unshare・mapper の fork と失敗時の回収、
 //!   launcher が権限モデルの検査と構築時の解決。supervisor が `RootlessSubordinateIds` を選ぶ経路は未結線（#2243）、
-//!   `RootfulHostRoot` は未実装（`Unimplemented`。#2241）。詳細は `oci_runtime` の launcher と `rootless` のモジュール doc を参照。
+//!   `RootfulHostRoot` は意図した恒久拒否（`PermissionDenied`。#2241 の決定）。詳細は `oci_runtime` の launcher と `rootless` のモジュール doc を参照。
 //!   config 指定の `linux.uidMappings` は start が `InvalidArgument` で拒否（#2240 で決定済み・案 A。`docs/design/config-id-mappings.md`）、ファイル所有者検証（TASK-40.3）は未実装
 //! - `seccomp`: 禁止 syscall の一覧 `DeniedSyscall` と x86_64 / aarch64 別の番号テーブル（CORE-5・
 //!   TASK-38.1.1・#837。OS 非依存で syscall を持たない）。テーブルと BPF 構築

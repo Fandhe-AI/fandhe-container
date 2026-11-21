@@ -30,7 +30,7 @@ CRI-5・CRI-7・PLUG-1・PLUG-4・REPAIR-3・TASK-62.6 の判断記録。配布�
 
 ### D4 前提
 
-- rootless のみ。uid 0 の shim の `start` は plugin-cri の `supervised` と同じく `UNIMPLEMENTED`（#2442・#2241）。新しい拒否は足していない
+- rootless のみ。uid 0 の shim の `start` は plugin-cri の `supervised` と同じく `PERMISSION_DENIED` で恒久拒否する（権限検査に到達した場合。それより前に、plugin の実体の隣に supervisor が無ければ `FAILED_PRECONDITION` が返る）（#2442・#2241 の決定 D1 A・#4709）。新しい拒否は足していない
 - supervisor は shim の実体（`current_exe()`）と同じディレクトリの固定名から解決する。特権ランチャーは置かない（置くと rootful と判定される）。手順は `docs/setup/linux.md`
 - 動く構成は、非 root で直接起動した containerd 2.x を委譲 scope の中で動かす構成
 
@@ -428,7 +428,7 @@ TaskService は期限を足さず、実装側が持つ（トレイトの契約�
 ## 残り（REPAIR-3）
 
 - containerd が shim の死後に呼ぶ `delete` action の停止・回収・応答は実装済みで、bin 経由の試験も済み（D5・D6。#4151・#4152・#4153）。回収しない場合（Creating の記録・supervisor が居ない Running の記録。fail-closed）は D6 の「残余」、実 containerd での確認は #3685
-- rootful での shim 対応（#2442・#2241 の判断待ち）
+- rootful での shim 対応（#2442・#2241 の D1 A により恒久拒否のため対象外。#4709）
 - containerd 実機シナリオの CI への組み込み（ランナーの containerd の版に依存する）
 
 ## 再評価条件

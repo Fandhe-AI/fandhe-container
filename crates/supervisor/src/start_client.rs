@@ -35,7 +35,7 @@
 //! したがって spawn した `Child` の pid・`process_group(0)`・stdio・渡した環境はそのまま supervisor のものになり、
 //! 呼び出し側は scope に居残らない。scope の取得時間も受信期限（58.9 秒）に含まれる。
 //! fail-closed（案 B の「呼び出し側の cgroup の下に子 cgroup を作る」へは落とさない）の判定はすべて spawn の前に行う。
-//! - rootful（`/proc/self/status` の uid のどれかが 0）: `UNIMPLEMENTED`（supervisor の判定と同じ文）。
+//! - rootful（`/proc/self/status` の uid のどれかが 0）: `PERMISSION_DENIED`（supervisor の判定と同じ文。#2241 の決定による恒久拒否）。
 //! - `systemd-run` が固定候補（`/usr/sbin`・`/usr/bin`・`/sbin`・`/bin`・NixOS の `/run/current-system/sw/bin`。`PATH` 探索は
 //!   しない）に無い、または実体が root か実効 UID 所有の通常ファイルで group / other 書き込み不可（祖先ディレクトリも同様。
 //!   PLUG-11 と同じ判定関数）でない: `FAILED_PRECONDITION`。探索と信頼の基準の詳細・NixOS の既知の限界は `crate::systemd_run`
@@ -80,13 +80,13 @@
 //!   があれば rootful のインストールとみなし、`systemd-run ... -- <launcher> start --root <root> <id>` で起動する
 //!   （`process_group(0)` は付けない。ランチャーの `setsid` が `EPERM` になるため。stdio に pty は渡さない）。無ければ従来の
 //!   直接経路。在るが通常ファイル・実行可能・所有者 root か euid・g/o 書き込み不可でなければ `FAILED_PRECONDITION` で止め、
-//!   直接経路へ黙って落とさない。uid 0 の起動はランチャーの前提（呼び出し元は非 root）に反し、`RootfulHostRoot` の判断
-//!   （#2241）待ちのため今のまま `UNIMPLEMENTED`。実機での通し確認は未実施（#538・#539）。
+//!   直接経路へ黙って落とさない。uid 0 の起動はランチャーの前提（呼び出し元は非 root）に反し、`RootfulHostRoot` は #2241 の決定どおり
+//!   spawn 前に意図して `PERMISSION_DENIED` で拒否する。実機での通し確認は未実施（#538・#539）。
 //! - supervisor の fd 2 へ直接書かれるもの（core の診断・panic のメッセージ等）は保存されない（stderr が null のため捨てられる。
 //!   範囲は `supervisor_log` の「未実装・残余」。`legacy_tiocsti` の警告は supervisor のログへ残る。#2008）。
 //! - 親から継承した CLOEXEC の無い fd は CLI では閉じない。supervisor の bin の入口が fd 3 以降を閉じる
 //!   （ランチャー経由と同じ処理。#2070・SEC-1）。exec から入口までの短い窓は残る。
-//! - supervisor は core の本番 launcher（#1715・#1819 で結線済み）で起動する。uid 0 は spawn の前に `UNIMPLEMENTED`（上記）。restart の再 launch は #2043 で成立（常駐スレッドを止めて監視スレッドで直接 launch）。実機での通し確認
+//! - supervisor は core の本番 launcher（#1715・#1819 で結線済み）で起動する。uid 0 は spawn の前に `PERMISSION_DENIED`（上記。#4709）。restart の再 launch は #2043 で成立（常駐スレッドを止めて監視スレッドで直接 launch）。実機での通し確認
 //!   （委譲 cgroup の準備で拒否されないか）は未実施（#2062。`tests/supervisor_bin_real.rs` は実機前提）。
 //! - 1 行も無いまま EOF のとき、supervisor の異常終了と systemd-run の失敗（D-Bus 接続の失敗等）を区別できない
 //!   （stderr を pipe にすると supervisor の構造化ログが混ざり、CLI の終了後に EPIPE になるため採らない。制御チャネル #2058 の後の課題）。
@@ -433,6 +433,21 @@ fn classify_launcher(path: &Path, euid: u32) -> LauncherPresence {
 }
 
 /// CLI の実体パスと同じディレクトリの固定名から supervisor の実行ファイルを決める（`PATH` 探索をしない。純関数）。
+/// 試験用の注入は拒否を足すだけにする（SEC-5・PLUG-11・#4709）。注入の本文が `privilege_gate` で拒否・失敗になるなら
+/// その本文を返して同じ拒否にする。通るなら実の status（`real`）を返し、ランチャー・user マネージャのソケットの
+/// 所有者検査に使う実効 uid を実プロセスから取る（注入で信頼の基準を変えない）。
+#[cfg(feature = "start-status-test-support")]
+fn injected_or_real_status(
+    injected: Option<String>,
+    real: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    if privilege_gate(injected.as_deref()).is_err() {
+        injected
+    } else {
+        real()
+    }
+}
+
 fn supervisor_path_beside(cli_exe: &Path) -> Result<PathBuf, OciRuntimeError> {
     match cli_exe.parent() {
         Some(dir) if dir.is_absolute() => Ok(dir.join(SUPERVISOR_FILE_NAME)),
@@ -506,13 +521,13 @@ pub fn production_deadline() -> Duration {
 }
 
 /// rootful 判定と euid の取得（SEC-5）。real / effective / saved / fs の uid のどれかが 0 なら
-/// supervisor の `privilege_for_status` と同じ文で `UNIMPLEMENTED`、読めない・壊れた入力は `FAILED_PRECONDITION`。
+/// supervisor の `privilege_for_status` と同じ文で `PERMISSION_DENIED`、読めない・壊れた入力は `FAILED_PRECONDITION`。
 fn privilege_gate(status_text: Option<&str>) -> Result<u32, OciRuntimeError> {
     match status_text.map(identity_from_status) {
         Some(Identity::Rootless { euid }) => Ok(euid),
         Some(Identity::Rootful) => Err(start_error(
-            ErrorCode::Unimplemented,
-            "rootful start is not supported by the production launcher",
+            ErrorCode::PermissionDenied,
+            fandhe_container_core::oci_runtime::ROOTFUL_REFUSED_MESSAGE,
         )),
         Some(Identity::Unreadable) | None => Err(start_error(
             ErrorCode::FailedPrecondition,
@@ -639,6 +654,28 @@ impl SupervisorLaunch {
         exe: &Path,
         locate: impl FnOnce(u32) -> Result<PathBuf, OciRuntimeError>,
     ) -> Result<Self, OciRuntimeError> {
+        Self::resolve_with_status(exe, locate, read_self_status)
+    }
+
+    /// [`Self::resolve_beside`] の `/proc/self/status` の読み取りだけを差し替えられる版（試験専用 feature `start-status-test-support`。
+    /// rootful 拒否（SEC-5・#4709）の経路を非 root で通すため。systemd-run の解決も差し替えられる
+    /// （CLI の試験専用 feature `start-test-support` と同じ入口を渡す）。
+    #[cfg(feature = "start-status-test-support")]
+    pub fn resolve_beside_with_status(
+        exe: &Path,
+        locate: impl FnOnce(u32) -> Result<PathBuf, OciRuntimeError>,
+        read_status: impl FnOnce() -> Option<String>,
+    ) -> Result<Self, OciRuntimeError> {
+        Self::resolve_with_status(exe, locate, || {
+            injected_or_real_status(read_status(), read_self_status)
+        })
+    }
+
+    fn resolve_with_status(
+        exe: &Path,
+        locate: impl FnOnce(u32) -> Result<PathBuf, OciRuntimeError>,
+        read_status: impl FnOnce() -> Option<String>,
+    ) -> Result<Self, OciRuntimeError> {
         let program = supervisor_path_beside(exe)?;
         if !std::fs::metadata(&program).is_ok_and(|m| m.is_file()) {
             return Err(start_error(
@@ -646,7 +683,7 @@ impl SupervisorLaunch {
                 "supervisor executable is not installed",
             ));
         }
-        let euid = privilege_gate(read_self_status().as_deref())?;
+        let euid = privilege_gate(read_status().as_deref())?;
         // rootful のインストールは CLI の隣にランチャーがあること（#2442）。在るのに信頼できなければ直接経路へ落とさず止める。
         let launcher = match classify_launcher_beside(exe, euid)? {
             LauncherPresence::Absent => None,
@@ -736,6 +773,35 @@ mod tests {
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
+
+    /// SEC-5・PLUG-11・#4709: 注入が拒否・失敗なら注入の本文で拒否し、通るなら実の status を使う（所有者検査の基準の
+    /// 実効 uid を注入で変えない）。
+    #[cfg(feature = "start-status-test-support")]
+    #[test]
+    fn sec5_4709_injected_status_only_adds_rejection() {
+        let st = |uid: &str| {
+            format!(
+                "Name:\tx\nUid:\t{uid}\nGid:\t1000\t1000\t1000\t1000\nGroups:\t\nNoNewPrivs:\t0\nCapInh:\t0000000000000000\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\nCapBnd:\t000001ffffffffff\nCapAmb:\t0000000000000000\n"
+            )
+        };
+        let real = st("1000\t1000\t1000\t1000");
+        for uid in ["0\t0\t0\t0", "1000\t0\t1000\t1000", "1000\t1000\t1000\t0"] {
+            let injected = st(uid);
+            let got = injected_or_real_status(Some(injected.clone()), || {
+                panic!("the real status must not be needed when the injection is refused")
+            });
+            assert_eq!(got.as_deref(), Some(injected.as_str()), "{uid}");
+        }
+        assert_eq!(
+            injected_or_real_status(None, || panic!("an unreadable injection is refused")),
+            None
+        );
+        // 実効 uid の違う非 root を注入しても、使うのは実の本文（所有者検査の基準は実プロセスの euid）。
+        let got =
+            injected_or_real_status(Some(st("4242\t4242\t4242\t4242")), || Some(real.clone()));
+        assert_eq!(got.as_deref(), Some(real.as_str()));
+        assert_eq!(privilege_gate(got.as_deref()).ok(), Some(1000));
+    }
 
     /// テスト用の一意な一時ディレクトリ（Drop で削除）。
     struct TmpDir(
@@ -1030,9 +1096,9 @@ mod tests {
         )
     }
 
-    /// SEC-5・CLI-1: rootful（どの位置の uid が 0 でも）は UNIMPLEMENTED で拒否し、壊れた入力は FAILED_PRECONDITION。
+    /// SEC-5・CLI-1: rootful（どの位置の uid が 0 でも）は PERMISSION_DENIED で拒否し、壊れた入力は FAILED_PRECONDITION。
     #[test]
-    fn sec5_cli_rootful_is_unimplemented() {
+    fn sec5_cli_rootful_is_permission_denied() {
         assert_eq!(
             privilege_gate(Some(&status_with_uid("1000\t1000\t1000\t1000"))).expect("rootless"),
             1000
@@ -1044,11 +1110,11 @@ mod tests {
             "1000\t1000\t1000\t0",
         ] {
             let e = privilege_gate(Some(&status_with_uid(uid))).expect_err(uid);
-            assert_eq!(e.code(), ErrorCode::Unimplemented, "{uid}");
-            assert_eq!(e.exit_code().get(), 8, "{uid}");
+            assert_eq!(e.code(), ErrorCode::PermissionDenied, "{uid}");
+            assert_eq!(e.exit_code().get(), 6, "{uid}");
             assert_eq!(
                 e.message(),
-                "rootful start is not supported by the production launcher"
+                "the rootful privilege model is permanently refused by policy (SEC-5)"
             );
         }
         for bad in [Some(""), Some("garbage"), None] {

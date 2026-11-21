@@ -804,7 +804,7 @@ mod linux {
             .map(|m| m.uid())
             .unwrap_or(0);
         if uid == 0 {
-            precondition_failed("must run as a non-root user (rootful start is UNIMPLEMENTED)");
+            precondition_failed("must run as a non-root user (rootful start is refused by policy)");
         }
         if !Path::new("/sys/fs/cgroup/cgroup.controllers").is_file() {
             precondition_failed("cgroup v2 is required");

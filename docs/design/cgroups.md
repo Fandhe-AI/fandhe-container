@@ -132,7 +132,7 @@ supervisor の `DelegatedCgroup::prepare` は、委譲された親 cgroup に自
 
 | 条件 | code |
 | ---- | ---- |
-| rootful（uid のどれかが 0。SEC-5） | `UNIMPLEMENTED` |
+| rootful（uid のどれかが 0。SEC-5。#2241 の決定 D1 A により恒久拒否。#4709） | `PERMISSION_DENIED`（6） |
 | `/proc/self/status` が読めない | `FAILED_PRECONDITION` |
 | systemd-run が無い、または信頼できる実行ファイルでない | `FAILED_PRECONDITION` |
 | `XDG_RUNTIME_DIR` が絶対パスでない、または user マネージャの直結ソケットが euid 所有のソケットでない | `FAILED_PRECONDITION` |

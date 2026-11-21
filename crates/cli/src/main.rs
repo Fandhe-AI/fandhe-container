@@ -1,8 +1,8 @@
 //! バイナリ `fandhe-container` の入口（薄いラッパー。ロジックは lib 側の `fandhe_container_cli::commands`。TASK-79.1・TASK-79.2.1・CLI-1・MS-6）。
 //!
 //! 終了コードは core の ERR-2 表に従う: 0 は成功（出力なし。`list` と `image ls` / `system df` / `image rm` / `image tag` のみ stdout へ表を出す）、2 は使い方エラー・不正引数、
-//! 3 は対象なし、8 は未実装など。
-//! `setup`（CLI-2）は OS 固有設定の要求ステップを stdout へ出す（Linux は rootful のときだけ要る特権ランチャーのインストール手順を 1 行表示して 0。表示のみで実行しない。#1454・#1722）。`start` は同じディレクトリの supervisor を起動して結果を受け取る（#1718）。supervisor は core の本番 launcher で起動する（実体の隣に `fandhe-container-launcher` があれば rootful のインストールとしてランチャー経由〔#2442〕。uid 0 の起動は `UNIMPLEMENTED`（8））。
+//! 3 は対象なし、6 は権限による拒否、8 は未実装など。
+//! `setup`（CLI-2）は OS 固有設定の要求ステップを stdout へ出す（Linux は rootful のときだけ要る特権ランチャーのインストール手順を 1 行表示して 0。表示のみで実行しない。#1454・#1722）。`start` は同じディレクトリの supervisor を起動して結果を受け取る（#1718）。supervisor は core の本番 launcher で起動する（実体の隣に `fandhe-container-launcher` があれば rootful のインストールとしてランチャー経由〔#2442〕。uid 0 の起動は権限検査に到達すれば `PERMISSION_DENIED`（6）の恒久拒否。#2241 の決定・#4709）。
 //! unix では起動時に SIGINT・SIGTERM・SIGHUP のハンドラを登録し、起動中の plugin へ転送してから終了する（#1513・PLUG-7）。
 //! 失敗時のエラー行は stderr の最終行の英語 1 行 JSON（ERR-1 の `code` / `message`。core 由来は `op` も）。
 //! `--plugin-path-search` で opt-in したときは、その前に PATH 候補ごとの警告行（共通ログ型。`level`・`event` つき。

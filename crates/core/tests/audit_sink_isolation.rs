@@ -374,6 +374,7 @@ mod imp {
         #[cfg(target_os = "linux")]
         {
             fork_again_is_reported_as_isolation_fork_again();
+            wait_single_threaded();
             control_relay_persists_from_a_multi_threaded_process();
             control_relay_keeps_exit_signal_records_from_many_threads();
             control_relay_persists_exec_target_from_a_multi_threaded_process();
@@ -676,7 +677,10 @@ mod imp {
     /// exec が止まると後の期限（`wait_capped`）に届かない。見張りのスレッドが `within` を過ぎたら、spawn の前に居なかった
     /// 自分の子（`/proc` の ppid で数える）のプロセスグループへ SIGKILL を送り、`WATCHDOG EXPIRED` の行と終了コード 124 で
     /// 試験プロセスごと終わる（spawn の途中の子は pid が手元に無いため、回収は init に任せる）。見張りは spawn が戻ったら
-    /// 終わり、join してから返す。この場面の後の場面は複数スレッドを前提にするため、一時的なスレッドを置いてよい。
+    /// 終わり、join してから返す。join の後も `Threads:` の減算が遅れうるため、単一スレッドを前提にする後の場面の前に
+    /// 呼び出し元（`run`）が `wait_single_threaded` で待つ。診断の行は切り離したスレッドで書き、stderr が書けなくても
+    /// 終了コード 124 で終わる。既知の限界: 列挙から kill までの間に spawn が exec の失敗で子を回収し、その pid が再利用されて
+    /// グループの先頭になると、無関係なグループへ SIGKILL が 1 回届きうる（pidfd でグループへ送る入口が要る。#4920）。
     #[cfg(target_os = "linux")]
     fn spawn_within(
         cmd: &mut std::process::Command,
@@ -690,9 +694,12 @@ mod imp {
                 for pid in children_of(me).difference(&before) {
                     let _ = FileAuditSink::kill_process_group_for_test(*pid);
                 }
-                eprintln!(
-                    "audit_sink_isolation: WATCHDOG EXPIRED: spawning the fork_again child did not return within {within:?}"
-                );
+                let _ = std::thread::Builder::new().spawn(move || {
+                    eprintln!(
+                        "audit_sink_isolation: WATCHDOG EXPIRED: spawning the fork_again child did not return within {within:?}"
+                    );
+                });
+                std::thread::sleep(Duration::from_millis(200));
                 std::process::exit(124);
             }
         });

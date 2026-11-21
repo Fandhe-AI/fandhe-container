@@ -2190,6 +2190,8 @@ impl CriRuntimeService {
         }
         let id = ContainerId::new(req.container_id.clone())
             .map_err(|_| CriError::invalid_argument("container_id is invalid"))?;
+        // 期限は受付の時点から数える（自然終了の取り込みの待ちで延びない。クライアントの期限切れの後に確定しない）。
+        let received = Instant::now();
         // 自然終了を先に取り込む（`ContainerStatus` と同じ）。終了した supervisor の制御ソケットへ接続して
         // `UNAVAILABLE` になる代わりに、running でないことを `FAILED_PRECONDITION` で返す（#4652）。
         self.observe_container_exit(&req.container_id).await?;
@@ -2220,7 +2222,7 @@ impl CriRuntimeService {
         let budget = client_timeout.map_or(CONTAINER_LOG_REOPEN_TIMEOUT, |t| {
             t.min(CONTAINER_LOG_REOPEN_TIMEOUT)
         });
-        let deadline = Instant::now() + budget;
+        let deadline = received + budget;
         // RPC の future が破棄されたら（期限切れ・取り消し）、切り離された worker へ旗で知らせる。
         // `run_bounded` は破棄された future の worker を切り離して動かし続けるため、旗で worker に知らせる（完了後に立っても無害）。
         let cancel = Arc::new(AtomicBool::new(false));

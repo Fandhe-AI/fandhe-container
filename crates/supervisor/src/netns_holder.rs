@@ -33,7 +33,6 @@
 //!   （`tests/netns_holder_launch_userns.rs` で照合する）
 
 use std::ffi::OsStr;
-use std::io::Read as _;
 use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 use std::process::{Child, ChildStderr, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
@@ -248,13 +247,26 @@ fn escape_capped(raw: &[u8], cap: usize) -> String {
     out
 }
 
-/// 回収済み holder の stderr を読む（書き込み端は holder の終了で閉じる。holder は fork しないので EOF で止まる）。
-fn drain_stderr(stderr: &mut Option<ChildStderr>) -> String {
+/// 回収済み holder の stderr を読む期限（#4733・REPAIR-5。plugin の `PLUGIN_STDERR_DRAIN_TIMEOUT` に揃える）。
+const STDERR_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// 回収済み holder の stderr を読む（書き込み端は holder の終了で閉じる。holder は fork しないので通常は EOF で止まる）。
+/// 書き込み端の複製を持つ子が残る場合は `timeout` で打ち切り、読めた分だけを返す（期限切れ・読み取り失敗はエラーに
+/// しない。HolderExit の材料を優先する。#4733・REPAIR-5）。停止・起動失敗の後始末は [`STDERR_DRAIN_TIMEOUT`]、
+/// 待たない契約の生存確認（[`NetnsHolderProcess::try_exit`]）は `Duration::ZERO`（即時に読める分だけ）を渡す。
+fn drain_stderr(stderr: &mut Option<ChildStderr>, timeout: Duration) -> String {
     let Some(mut s) = stderr.take() else {
         return String::new();
     };
-    let mut raw = Vec::new();
-    let _ = (&mut s).take(STDERR_CAP as u64).read_to_end(&mut raw);
+    drain_capped(&mut s, timeout)
+}
+
+fn drain_capped(r: &mut (impl std::io::Read + std::os::fd::AsFd), timeout: Duration) -> String {
+    use crate::deadline_read::{ReadStop, read_capped_until};
+    let raw = match read_capped_until(r, STDERR_CAP as u64, Instant::now() + timeout, false) {
+        // I/O エラーでも、それまでに読めた分は診断に使う（従来の `read_to_end` と同じ）。
+        Ok(b) | Err(ReadStop::TimedOut(b) | ReadStop::Io(_, b)) => b,
+    };
     escape_capped(&raw, STDERR_CAP)
 }
 
@@ -286,7 +298,7 @@ fn kill_and_reap(child: &mut Child, stderr: &mut Option<ChildStderr>) -> Option<
     // 既に回収済みなら std は何も送らない（回収後の pid へシグナルを送らない。#2545）。
     let _ = child.kill();
     match wait_until(child, REAP_TIMEOUT) {
-        Ok(Some(st)) => Some(exit_of(st, drain_stderr(stderr))),
+        Ok(Some(st)) => Some(exit_of(st, drain_stderr(stderr, STDERR_DRAIN_TIMEOUT))),
         _ => None,
     }
 }
@@ -405,7 +417,11 @@ impl NetnsHolderProcess {
             Ok(Some(st)) => {
                 self.child = None;
                 self.chan = None;
-                Ok(Some(exit_of(st, drain_stderr(&mut self.stderr))))
+                // 待たない契約のため EOF を待たず、即時に読める診断だけを回収する。
+                Ok(Some(exit_of(
+                    st,
+                    drain_stderr(&mut self.stderr, Duration::ZERO),
+                )))
             }
             Err(_) => Err(TraitError::new(
                 ErrorCode::Internal,
@@ -433,7 +449,10 @@ impl NetnsHolderProcess {
         if let Ok(Some(st)) = wait_until(&mut child, STOP_GRACE) {
             return HolderStopOutcome {
                 path: StopPath::Stopped,
-                exit: Some(exit_of(st, drain_stderr(&mut self.stderr))),
+                exit: Some(exit_of(
+                    st,
+                    drain_stderr(&mut self.stderr, STDERR_DRAIN_TIMEOUT),
+                )),
                 elapsed: started.elapsed(),
                 unreaped: None,
             };
@@ -458,9 +477,12 @@ impl NetnsHolderProcess {
 impl Drop for NetnsHolderProcess {
     fn drop(&mut self) {
         // 端を閉じて EOF を伝え、SIGKILL と回収を試みる。回収できなければ zombie のまま残す（モジュール doc）。
+        // 戻り値の診断は使わないため、stderr の読み取り端は先に閉じる（並行 spawn の子が書き込み端を持っていても、
+        // 使わない診断の EOF を待たない。#4916・REPAIR-5）。
         self.chan = None;
+        self.stderr = None;
         if let Some(mut child) = self.child.take() {
-            let _ = kill_and_reap(&mut child, &mut self.stderr);
+            let _ = kill_and_reap(&mut child, &mut None);
         }
     }
 }
@@ -491,6 +513,184 @@ pub fn spawn_netns_holder_unready_for_test(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::deadline_read::read_capped_until;
+
+    /// REPAIR-5・#4733: 書き込み端を閉じない子を模しても `drain_capped` は期限で戻り、読めた分を返す。
+    #[test]
+    fn repair5_4733_drain_capped_returns_at_deadline_with_partial() {
+        use std::io::Write as _;
+        let (mut r, mut w) = std::io::pipe().unwrap();
+        w.write_all(b"boom").unwrap();
+        // 回帰して EOF 待ちに戻っても書き込み端を独立に閉じ、経過時間の assert で失敗させる（REPAIR-5）。
+        let _w = crate::deadline_read::close_after(w, Duration::from_secs(5));
+        let t0 = Instant::now();
+        let got = drain_capped(&mut r, Duration::from_millis(200));
+        let el = t0.elapsed();
+        assert_eq!(got, "boom");
+        assert!(
+            el >= Duration::from_millis(200) && el < Duration::from_secs(2),
+            "{el:?}"
+        );
+    }
+
+    /// REPAIR-5・#4733: 期限 0（`try_exit` の生存確認）は、書き込み端が残っていても待たず、即時に読める分だけを返す。
+    #[test]
+    fn repair5_4733_drain_capped_with_zero_timeout_does_not_wait() {
+        use std::io::Write as _;
+        let (mut r, mut w) = std::io::pipe().unwrap();
+        w.write_all(b"diag").unwrap();
+        let _w = crate::deadline_read::close_after(w, Duration::from_secs(5));
+        let t0 = Instant::now();
+        let got = drain_capped(&mut r, Duration::ZERO);
+        assert_eq!(got, "diag");
+        assert!(
+            t0.elapsed() < Duration::from_millis(100),
+            "{:?}",
+            t0.elapsed()
+        );
+    }
+
+    /// stderr の書き込み端を持つ補助（`sleep`）の寿命（秒）。試験の検証区間（`ready` と終了の観測の待ちは各 10 秒まで）を
+    /// 覆う長さにし、検証が終わるまで書き込み端を確実に持たせる。補助はガードの drop で kill するので、通常はこの長さを待たない。
+    /// 読み取りが EOF 待ちへ回帰したときは、この長さで EOF が届いて呼び出しが戻り、経過時間の assert が失敗を報告する
+    /// （ハングの独立の期限。REPAIR-5・REPAIR-12）。
+    const HELPER_HOLD_SECS: &str = "30";
+
+    /// 試験の後始末（REPAIR-5）: drop で holder 役と補助を SIGKILL・回収する（準備・照合の失敗の panic でも）。どちらも
+    /// 試験の直接の子で子を作らない 1 プロセスなので（未回収の `Child` への kill は pid の再利用を撃たない）、孤児を回収しない
+    /// PID 1 の下でも zombie を残さない。
+    /// 補助は起動の直後に登録し、holder 役は起動に成功してから登録する（holder 役の起動の失敗の panic でも補助を回収する）。
+    struct HolderGuard {
+        helper: Child,
+        child: Option<Child>,
+    }
+    impl Drop for HolderGuard {
+        fn drop(&mut self) {
+            // 回収済みなら std は何も送らない（子は自分で回収した Child のみ）。
+            for c in self
+                .child
+                .iter_mut()
+                .chain(std::iter::once(&mut self.helper))
+            {
+                let _ = c.kill();
+                let _ = wait_until(c, REAP_TIMEOUT);
+            }
+        }
+    }
+
+    /// REPAIR-5・REPAIR-12・REPAIR-10 (d)・#4733: 別プロセスが stderr の書き込み端を持ち続けても、停止経路
+    /// `kill_and_reap` は EOF を待たず、終了状態と読めた stderr を期限内（`STDERR_DRAIN_TIMEOUT` 前後）に返す。
+    /// 試験は自分で pipe を作り、書き込み端を holder 役（`sh`）の stderr と、試験の直接の子の補助（`sleep`。[`HELPER_HOLD_SECS`] 秒。子を作らない
+    /// 1 プロセス）の stderr の両方に渡す。補助は検証が終わるまで書き込み端を持ち、ガードの drop で止める（読み取りが回帰して EOF
+    /// 待ちに戻ったときは [`HELPER_HOLD_SECS`] 秒で自分で終わり、経過時間の assert が失敗を報告する。`timeout` + `sh` の 2 段だと、期限の SIGKILL で `timeout` が `sh` を
+    /// 回収する前に終わり、`sh` が未回収で残る）。holder 役は診断行を stderr へ書き、stdout へ `ready` を出して `exec sleep 100` に置き換わる。
+    /// `ready` の受信で確かめられるのは診断行の書き込みまでで、SIGKILL は holder 役（置き換わる前でも後でも同じ pid）へ送る。
+    #[test]
+    fn repair5_4733_kill_and_reap_returns_without_eof_when_writer_is_held() {
+        use std::os::fd::OwnedFd;
+        let (err_r, err_w) = std::io::pipe().unwrap();
+        let helper = Command::new("sleep")
+            .arg(HELPER_HOLD_SECS)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(err_w.try_clone().unwrap()))
+            .spawn()
+            .unwrap();
+        let mut guard = HolderGuard {
+            helper,
+            child: None,
+        };
+        let child = Command::new("sh")
+            .args(["-c", "echo diag-line >&2; echo ready; exec sleep 100"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::from(err_w))
+            .spawn()
+            .unwrap();
+        let child = guard.child.insert(child);
+        let mut stderr = Some(ChildStderr::from(OwnedFd::from(err_r)));
+        let mut stdout = child.stdout.take().unwrap();
+        // `ready`（= 診断行も書き終えた）を期限つきで待つ。
+        let ready = read_capped_until(
+            &mut stdout,
+            16,
+            Instant::now() + Duration::from_secs(10),
+            true,
+        )
+        .ok();
+        assert_eq!(ready.as_deref(), Some(&b"ready\n"[..]));
+        let t0 = Instant::now();
+        let exit = kill_and_reap(child, &mut stderr);
+        let el = t0.elapsed();
+        let exit = exit.expect("holder must be reaped");
+        assert_eq!(exit.code, None);
+        assert_eq!(exit.signal, Some(9));
+        assert_eq!(exit.stderr, "diag-line\\n");
+        assert!(
+            el >= STDERR_DRAIN_TIMEOUT && el < Duration::from_secs(5),
+            "{el:?}"
+        );
+    }
+
+    /// REPAIR-5・REPAIR-12・REPAIR-10 (d)・#4733: 公開の `try_exit` は、holder の終了後も別プロセスが stderr の書き込み端を
+    /// 持ち続けていても、EOF を待たずに終了状態と即時に読める診断を返す（`HolderAdapter::is_alive` からも呼ばれる待たない契約）。
+    /// holder 役（`sh`）は診断行を書いて終了コード 3 で終わり、書き込み端は補助（`sleep`。[`HELPER_HOLD_SECS`] 秒。子を作らない 1 プロセス）も持つ。
+    /// `try_exit` が誤って [`STDERR_DRAIN_TIMEOUT`] を渡すと、終了を観測した呼び出しが 500 ms かかり失敗する。
+    #[test]
+    fn repair5_4733_try_exit_does_not_wait_for_eof_when_writer_is_held() {
+        use std::os::fd::OwnedFd;
+        let (err_r, err_w) = std::io::pipe().unwrap();
+        let helper = Command::new("sleep")
+            .arg(HELPER_HOLD_SECS)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(err_w.try_clone().unwrap()))
+            .spawn()
+            .unwrap();
+        let _guard = HolderGuard {
+            helper,
+            child: None,
+        };
+        let child = Command::new("sh")
+            .args(["-c", "echo diag-line >&2; exit 3"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(err_w))
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let mut holder = NetnsHolderProcess {
+            child: Some(child),
+            chan: None,
+            stderr: Some(ChildStderr::from(OwnedFd::from(err_r))),
+            pid,
+            ready: HolderReady {
+                identity: fandhe_container_net::netns_holder::NsIdentity {
+                    dev: 0,
+                    net_ino: 0,
+                    user_ino: 0,
+                },
+                elapsed: Duration::ZERO,
+            },
+        };
+        let until = Instant::now() + Duration::from_secs(10);
+        let (exit, took) = loop {
+            let t0 = Instant::now();
+            let got = holder.try_exit().expect("poll");
+            let took = t0.elapsed();
+            if let Some(exit) = got {
+                break (exit, took);
+            }
+            assert!(Instant::now() < until, "the holder did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(exit.code, Some(3));
+        assert_eq!(exit.signal, None);
+        assert_eq!(exit.stderr, "diag-line\\n");
+        assert!(took < Duration::from_millis(100), "{took:?}");
+        // 回収済みなので以後は `None`（二度目の回収はしない）。
+        assert!(holder.try_exit().expect("poll").is_none());
+    }
 
     /// NET-9・ERR-1: 全コードの写像を具体値で固定する（`Timeout` が `Internal` に潰れない）。
     #[test]

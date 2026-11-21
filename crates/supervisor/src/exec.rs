@@ -281,7 +281,7 @@
 //!   `(st_dev, st_ino)` の記録と照合（launch の子から親への状態 pipe が要る）も未実装（REPAIR-3）
 //! - 実機前提の通し試験 `tests/exec.rs` の実行結果の記録（root を要し、CI ではビルドのみで実行していない）
 
-use std::io::{BufRead as _, Read as _, Write as _};
+use std::io::Write as _;
 use std::num::{NonZeroU8, NonZeroU32};
 use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
@@ -1687,6 +1687,10 @@ impl From<TraitError> for WorkerError {
 /// 回収待ち上限 5 秒）より長くし、通常は worker 自身の `Timeout` が先に返るようにする（REPAIR-5）。
 const WORKER_GRACE: Duration = Duration::from_secs(7);
 
+/// worker 回収後に結果 1 行を pipe から読む期限（#4733・REPAIR-5）。worker は結果を書いてから終了し回収済みなので
+/// 行は pipe に残っているはずで、短くてよい。書き込み端の複製を持つ並行 spawn の子が残っても待ち続けない。
+const WORKER_RESULT_READ_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// worker の結果 1 行の上限バイト数（pipe から読む量の上限。無制限確保の防止）。
 const WORKER_RESULT_MAX: u64 = 4096;
 
@@ -1882,10 +1886,21 @@ fn run_in_worker_with_pty(
                 sender: Option<ExecListenerSender>,
                 pty_sender: Option<ExecPtySender>| {
         let line = encode_worker_result(&work(&proof, sender, pty_sender));
+        // 試験専用: 結果行を書かずに 0 で戻る（fork ラッパーの `_exit` 経路で終わらせるため。#4733）。
+        #[cfg(feature = "exec-test-support")]
+        if SKIP_RESULT_WRITE.load(std::sync::atomic::Ordering::SeqCst) {
+            return 0;
+        }
         // 書けなければ親は「結果なし」として失敗扱いにする（fail-closed）。
         let _ = (&writer).write_all(&line);
         0
     };
+    // 試験専用: fork 前に結果 pipe の書き込み端の fd 番号を控える（worker が継承した同番号の fd を特定するため）。
+    #[cfg(feature = "exec-test-support")]
+    {
+        use std::os::fd::AsRawFd as _;
+        RESULT_WRITE_FD.store(writer.as_raw_fd(), std::sync::atomic::Ordering::SeqCst);
+    }
     // `None` は試験専用なので、無効の単独ビルドでは分岐ごと消す（match が `_` だけになる lint を避ける。#2640）。
     #[cfg(feature = "exec-test-support")]
     let (child, receiver, pty_receiver) = match (&listener, pty.is_some()) {
@@ -2253,19 +2268,34 @@ fn collect_worker_result(
         )
         .into());
     }
-    let mut line = Vec::new();
-    std::io::BufReader::new(reader.take(WORKER_RESULT_MAX))
-        .read_until(b'\n', &mut line)
-        .map_err(|e| {
-            TraitError::new(
+    let line = read_worker_result_line(reader, WORKER_RESULT_READ_TIMEOUT)?;
+    decode_worker_result(&line)
+}
+
+/// 回収済み worker の結果 1 行を読む（#4733・REPAIR-5）。`timeout` は待ちの上限で、pipe にすでにある分（完全な行を含む）は
+/// 期限後でも捨てずに回収して返す（SEC-4 の違反の理由を失わない）。完全な行が無いまま期限切れは `ErrorCode::Internal`・
+/// 固定文言 `exec stage Spawn: the worker result was not received in time`（コマンド自体の期限切れの
+/// `Timeout` とは区別する。worker は終了済みなので「結果が届かなかった」内部異常）。読み取り失敗も `Internal`。
+fn read_worker_result_line(
+    reader: &mut std::io::PipeReader,
+    timeout: Duration,
+) -> Result<Vec<u8>, TraitError> {
+    use crate::deadline_read::{ReadStop, read_capped_until};
+    read_capped_until(reader, WORKER_RESULT_MAX, Instant::now() + timeout, true).map_err(
+        |e| match e {
+            ReadStop::TimedOut(_) => TraitError::new(
+                ErrorCode::Internal,
+                "exec stage Spawn: the worker result was not received in time",
+            ),
+            ReadStop::Io(e, _) => TraitError::new(
                 ErrorCode::Internal,
                 format!(
                     "exec stage Spawn: reading the worker result failed: {}",
                     e.kind()
                 ),
-            )
-        })?;
-    decode_worker_result(&line)
+            ),
+        },
+    )
 }
 
 /// exec 用の子 cgroup を呼び出しプロセスで作り、作成できた場合だけ所有者として後始末する（#1466）。
@@ -2390,6 +2420,30 @@ fn remove_child_cgroup(
 
 /// 子 cgroup の後始末で、`cgroup.kill` の後に空になるまで待つ上限（REPAIR-5）。
 const CHILD_CGROUP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 試験専用: 結果行の書き込みを省く印（worker 内でだけ立てる）。
+#[cfg(feature = "exec-test-support")]
+static SKIP_RESULT_WRITE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 試験専用: worker の `work` の中で呼ぶと、その worker は結果行を書かずに 0 で戻る（fork した worker 内の値なので
+/// 親・他の試験には影響しない。#4733）。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub fn skip_result_write_for_test() {
+    SKIP_RESULT_WRITE.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// 試験専用: 直近の `run_in_worker_*` が fork 前に作った結果 pipe の書き込み端の fd 番号（worker はこの番号で継承する）。
+#[cfg(feature = "exec-test-support")]
+static RESULT_WRITE_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// 試験専用: worker の `work` の中で呼ぶと、その worker の結果 pipe の書き込み端の fd 番号を返す（#4733。書き込み端を
+/// 別プロセスに持たせたときの回収の期限を試験で再現するため。`run_in_worker_for_test` を使う単一スレッドの試験が前提）。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub fn result_write_fd_for_test() -> i32 {
+    RESULT_WRITE_FD.load(std::sync::atomic::Ordering::SeqCst)
+}
 
 #[cfg(feature = "exec-test-support")]
 #[doc(hidden)]
@@ -3309,6 +3363,28 @@ fn from_exec_error_staged(err: ExecError) -> WorkerError {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read as _;
+
+    /// REPAIR-5・#4733: 結果行が無く書き込み端も閉じない場合、`read_worker_result_line` は期限で `Internal` を返す。
+    #[test]
+    fn repair5_4733_worker_result_read_times_out_as_internal() {
+        let (mut r, w) = std::io::pipe().unwrap();
+        // 回帰して EOF 待ちに戻っても書き込み端を独立に閉じ、経過時間の assert で失敗させる（REPAIR-5）。
+        let _w = crate::deadline_read::close_after(w, Duration::from_secs(5));
+        let t0 = Instant::now();
+        let err = read_worker_result_line(&mut r, Duration::from_millis(200)).unwrap_err();
+        let el = t0.elapsed();
+        assert_eq!(err.code(), ErrorCode::Internal);
+        assert_eq!(
+            err.message(),
+            "exec stage Spawn: the worker result was not received in time"
+        );
+        assert!(
+            el >= Duration::from_millis(200) && el < Duration::from_secs(2),
+            "{el:?}"
+        );
+    }
+
     #[test]
     fn sec4_3805_exec_request_debug_redacts_env_values() {
         let req = ExecRequest::new("/bin/echo", ["echo", "hi"])

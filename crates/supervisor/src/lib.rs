@@ -80,6 +80,8 @@ pub mod audit_relay;
 pub mod cgroup_remover;
 pub mod container_options;
 pub mod control;
+#[cfg(target_os = "linux")]
+mod deadline_read;
 mod deadline_store;
 #[cfg(target_os = "linux")]
 pub mod exec;

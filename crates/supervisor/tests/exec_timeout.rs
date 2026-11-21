@@ -19,6 +19,9 @@ fn main() {
 
 #[cfg(target_os = "linux")]
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some(linux::HOLD_ARG) {
+        linux::hold_until_eof();
+    }
     linux::run();
 }
 
@@ -29,6 +32,24 @@ mod linux {
     use fandhe_container_core::traits::{ErrorCode, TraitError};
     use fandhe_container_supervisor::exec::{ExecOutcome, run_in_worker_for_test};
 
+    /// 書き込み端の保持役（自分自身の再入口）の引数。
+    pub const HOLD_ARG: &str = "--hold-until-eof";
+
+    /// 保持役の本体: stdin の EOF まで読み、終わったら 0 で抜ける。読み取りが回帰して EOF 待ちに戻ったときのため、
+    /// 8 秒の独立の期限で自分から抜ける（期限のスレッドは保持役のプロセスの中だけ。試験の本体は単一スレッドのまま）。
+    /// 1 プロセスだけで、子を作らない（`timeout` + `sh` の 2 段だと、期限の SIGKILL で `timeout` が `sh` を回収する前に
+    /// 終わり、`sh` が subreaper の試験へ付け替わって未回収になる。REPAIR-5）。
+    pub fn hold_until_eof() -> ! {
+        use std::io::Read as _;
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_secs(8));
+            std::process::exit(0);
+        });
+        let mut sink = [0u8; 64];
+        while matches!(std::io::stdin().read(&mut sink), Ok(n) if n > 0) {}
+        std::process::exit(0);
+    }
+
     pub fn run() {
         worker_is_non_dumpable_before_work_runs();
         hung_step_times_out_within_deadline();
@@ -36,6 +57,7 @@ mod linux {
         failing_step_error_is_returned_as_is();
         panicking_worker_is_reported_as_internal();
         child_cgroup_cleanup_runs_once_on_every_path();
+        worker_result_read_is_bounded_when_write_end_is_held();
         println!("exec_timeout: all scenarios passed");
     }
 
@@ -219,6 +241,105 @@ mod linux {
             "{}",
             err.message()
         );
+    }
+
+    /// REPAIR-5・REPAIR-12・REPAIR-10 (d)・SUP-6・#4733: worker が結果行を残さず 0 で終わり、別プロセスが結果 pipe の
+    /// 書き込み端を持ち続けても、本番の回収経路（`collect_worker_result`）は EOF を待たず、約 1 秒で固定文言の
+    /// `Internal` を返す。worker は `result_write_fd_for_test()` が示す結果 pipe の書き込み端を開き直して孫
+    /// （試験バイナリ自身の再入口 [`HOLD_ARG`]。子を作らない 1 プロセス）の stdout に持たせ、`skip_result_write_for_test()` で結果行を省いて 0 で戻る（fork ラッパーの
+    /// `_exit` 経路で終わる）。孫の stdin は試験が持つ pipe の読み端で、試験が書き込み端（`_hold`）を閉じると EOF で
+    /// 自分で終わる（pid・pgid の番号では kill しない。失敗の panic を含め `_hold` の drop で必ず終わる）。試験は自身を
+    /// child subreaper にしてから worker を起動し、worker は孫の pid を試験の pipe へ書く。worker の終了で孫は試験の子へ
+    /// 付け替わり、試験が `HelperGuard` の drop（成功・assert の失敗の両方）で書き込み端を閉じてから期限つきで回収する
+    /// （孤児を回収しない PID 1 の下でも zombie を残さない。REPAIR-5）。subreaper はプロセス全体の属性のため、
+    /// この場面を `run` の最後に置く。
+    fn worker_result_read_is_bounded_when_write_end_is_held() {
+        use fandhe_container_core::exec::{ChildSubreaper, ContainerChild};
+        use std::io::Read as _;
+
+        /// 孫（保持役）を、書き込み端を閉じてから期限つきで回収する。
+        struct HelperGuard {
+            hold: Option<std::io::PipeWriter>,
+            helper: Option<ContainerChild>,
+        }
+        impl Drop for HelperGuard {
+            fn drop(&mut self) {
+                drop(self.hold.take());
+                if let Some(h) = self.helper.take()
+                    && let Err(e) = h.wait_timeout(Duration::from_secs(10))
+                {
+                    eprintln!("exec_timeout: helper was not reaped: {e:?}");
+                }
+            }
+        }
+
+        let exe = std::env::current_exe().expect("current exe");
+        let proof = ChildSubreaper::enable().expect("child subreaper");
+        let (hold_r, hold) = std::io::pipe().unwrap();
+        let mut guard = HelperGuard {
+            hold: Some(hold),
+            helper: None,
+        };
+        // 孫の pid は改行で区切って送る。worker の停止・回収に失敗して worker が書き込み端を持ったままでも止まらないよう、
+        // 受け側は EOF を待たず、改行までを読み取り期限（10 秒）つきで読む（REPAIR-5）。
+        let (pid_r, mut pid_w) = std::os::unix::net::UnixStream::pair().unwrap();
+        let t0 = Instant::now();
+        let res = run_in_worker_for_test(
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+            || Ok(()),
+            move || -> Result<ExecOutcome, TraitError> {
+                let fd = fandhe_container_supervisor::exec::result_write_fd_for_test();
+                let w = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(format!("/proc/self/fd/{fd}"))
+                    .unwrap();
+                // ここでは回収しない（worker の終了で subreaper の試験へ付け替わり、試験が回収する）。
+                #[allow(clippy::zombie_processes)]
+                // 保持役は読み取りが回帰して EOF 待ちに戻ったときの独立の期限を持つ（8 秒で自分で終わり、
+                // 呼び出しが戻って経過時間の assert が失敗を報告する。REPAIR-5）。
+                let _c = std::process::Command::new(&exe)
+                    .arg(HOLD_ARG)
+                    .stdin(hold_r)
+                    .stdout(w)
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap();
+                use std::io::Write as _;
+                writeln!(pid_w, "{}", _c.id()).unwrap();
+                drop(pid_w);
+                fandhe_container_supervisor::exec::skip_result_write_for_test();
+                // 結果行は省かれるので値は読まれない。
+                Err(TraitError::new(ErrorCode::Internal, "unused"))
+            },
+        );
+        let elapsed = t0.elapsed();
+        pid_r
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut pid = String::new();
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(pid_r.take(32)), &mut pid)
+            .expect("the grandchild pid within the deadline");
+        let pid = std::num::NonZeroU32::new(pid.trim().parse().unwrap()).unwrap();
+        guard.helper = Some(ContainerChild::adopt_reparented(pid, &proof));
+        let err = res.unwrap_err();
+        assert_eq!(err.code(), ErrorCode::Internal);
+        assert_eq!(
+            err.message(),
+            "exec stage Spawn: the worker result was not received in time"
+        );
+        assert!(
+            elapsed >= Duration::from_secs(1) && elapsed < Duration::from_secs(5),
+            "elapsed {elapsed:?}"
+        );
+        // 正常経路では補助を明示的に回収し、終了状態を照合する（`Drop` は途中で失敗したときの後始末。REPAIR-12）。
+        // 書き込み端を閉じれば保持役は EOF で 0 で終わる。
+        drop(guard.hold.take());
+        let helper = guard.helper.take().expect("helper adopted");
+        let exit = helper
+            .wait_timeout(Duration::from_secs(10))
+            .expect("the helper must be reaped");
+        assert_eq!(exit, fandhe_container_core::exec::ChildExit::Exited(0));
     }
 
     /// SUP-6・REPAIR-5・TASK-163 追補（#1466）: worker を fork した後は、期限切れ・エラー返却・異常終了（panic）の

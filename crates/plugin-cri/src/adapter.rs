@@ -675,8 +675,9 @@ impl fandhe_container_cri::runtime_service::ContainerLogReopener for ProductionL
         &self,
         id: &fandhe_container_core::traits::ContainerId,
         deadline: std::time::Instant,
+        cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<(), fandhe_container_core::traits::TraitError> {
-        self.0.reopen(id, deadline)
+        self.0.reopen(id, deadline, cancel)
     }
 }
 

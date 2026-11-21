@@ -3409,7 +3409,12 @@ struct FakeReopener {
 }
 
 impl ContainerLogReopener for FakeReopener {
-    fn reopen(&self, id: &ContainerId, _deadline: Instant) -> Result<(), TraitError> {
+    fn reopen(
+        &self,
+        id: &ContainerId,
+        _deadline: Instant,
+        _cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), TraitError> {
         self.calls.lock().unwrap().push(id.as_str().to_owned());
         match *self.fail.lock().unwrap() {
             Some(code) => Err(TraitError::new(code, "reopen failed")),
@@ -3563,7 +3568,12 @@ struct BlockingReopener {
 }
 
 impl ContainerLogReopener for BlockingReopener {
-    fn reopen(&self, _id: &ContainerId, deadline: Instant) -> Result<(), TraitError> {
+    fn reopen(
+        &self,
+        _id: &ContainerId,
+        deadline: Instant,
+        _cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), TraitError> {
         *self.entered.lock().unwrap() += 1;
         let mut released = self.released.lock().unwrap();
         while !*released {
@@ -3575,6 +3585,66 @@ impl ContainerLogReopener for BlockingReopener {
         }
         Ok(())
     }
+}
+
+/// 取り消しの旗が立つまで（または期限まで）待ち、旗を見たか・受けた期限の残りを記録するリオープナー（#4652）。
+#[derive(Default)]
+struct CancelAwareReopener {
+    saw_cancel: std::sync::atomic::AtomicBool,
+    budget_ms: Mutex<Option<u128>>,
+}
+
+impl ContainerLogReopener for CancelAwareReopener {
+    fn reopen(
+        &self,
+        _id: &ContainerId,
+        deadline: Instant,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), TraitError> {
+        *self.budget_ms.lock().unwrap() = Some(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis(),
+        );
+        while Instant::now() < deadline {
+            if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                self.saw_cancel
+                    .store(true, std::sync::atomic::Ordering::Release);
+                return Err(TraitError::new(ErrorCode::Unavailable, "cancelled"));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        Err(TraitError::new(ErrorCode::Timeout, "not cancelled"))
+    }
+}
+
+/// CRI-2・REPAIR-5・#4652: RPC の future が破棄されたら（期限切れ・取り消し）リオープナーに取り消しの旗が届き、
+/// `grpc-timeout` が既定（5 秒）より短ければリオープナーの期限もそれに合わせる。
+#[tokio::test]
+async fn cri2_4652_dropped_rpc_cancels_reopener_and_grpc_timeout_bounds_deadline() {
+    let h = harness();
+    let fake = Arc::new(CancelAwareReopener::default());
+    let service = h.service.with_log_reopener(fake.clone());
+    let id = create_with_log(&service, "c").await;
+    start(&service, &id).await.expect("start");
+    let mut req = Request::new(v1::ReopenContainerLogRequest {
+        container_id: id.clone(),
+    });
+    req.metadata_mut()
+        .insert("grpc-timeout", "2S".parse().unwrap());
+    let rpc = RuntimeService::reopen_container_log(&service, req);
+    let dropped = tokio::time::timeout(std::time::Duration::from_millis(200), rpc).await;
+    assert!(dropped.is_err(), "the rpc must still be waiting");
+    let until = Instant::now() + std::time::Duration::from_secs(2);
+    while !fake.saw_cancel.load(std::sync::atomic::Ordering::Acquire) {
+        assert!(
+            Instant::now() < until,
+            "the reopener did not see the cancel"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let budget = fake.budget_ms.lock().unwrap().expect("called");
+    assert!((1500..=2000).contains(&budget), "{budget}");
 }
 
 /// REPAIR-5・#4652: 同時に走る `ReopenContainerLog` の処理スレッドは `MAX_CONTAINER_LOG_REOPENS` 件まで。超えた要求は

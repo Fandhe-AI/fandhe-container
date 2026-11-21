@@ -485,8 +485,33 @@ struct RuntimeBinding {
 /// エラーの区分はそのまま gRPC の code に写る。失敗時は新しいログファイルを作らない契約（cri-api の
 /// `ReopenContainerLog` の規定）。文言にパスを含めないこと。
 pub trait ContainerLogReopener: Send + Sync {
-    /// `id` のコンテナの CRI ログを開き直す。
-    fn reopen(&self, id: &ContainerId, deadline: Instant) -> Result<(), TraitError>;
+    /// `id` のコンテナの CRI ログを開き直す。`cancel` は RPC が取り消された（future が破棄された・期限切れ）ときに立つ。
+    /// 立ったら応答を待たずに戻り、相手（supervisor）が確定しないよう要求を取り下げること（#4652）。
+    fn reopen(
+        &self,
+        id: &ContainerId,
+        deadline: Instant,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), TraitError>;
+}
+
+/// gRPC の `grpc-timeout`（`<1〜8 桁の数><単位 H|M|S|m|u|n>`）を読む。無い・形式違いは `None`（期限は既定のまま）。
+fn grpc_timeout(meta: &tonic::metadata::MetadataMap) -> Option<Duration> {
+    let v = meta.get("grpc-timeout")?.to_str().ok()?;
+    let (num, unit) = v.split_at(v.len().checked_sub(1)?);
+    if num.is_empty() || num.len() > 8 || !num.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let n: u64 = num.parse().ok()?;
+    Some(match unit {
+        "H" => Duration::from_secs(n.checked_mul(3600)?),
+        "M" => Duration::from_secs(n.checked_mul(60)?),
+        "S" => Duration::from_secs(n),
+        "m" => Duration::from_millis(n),
+        "u" => Duration::from_micros(n),
+        "n" => Duration::from_nanos(n),
+        _ => return None,
+    })
 }
 
 /// `ReopenContainerLog` が開き直しを待つ上限（kubelet の呼び出しに期限が無いため、有限で戻す。REPAIR-5）。
@@ -2155,6 +2180,7 @@ impl CriRuntimeService {
     async fn reopen_container_log_impl(
         &self,
         req: v1::ReopenContainerLogRequest,
+        client_timeout: Option<Duration>,
     ) -> Result<v1::ReopenContainerLogResponse, CriError> {
         let Some(reopener) = &self.log_reopener else {
             return Err(CriError::unimplemented("reopen_container_log"));
@@ -2187,15 +2213,23 @@ impl CriRuntimeService {
         let slot = ReopenSlot::acquire(&self.log_reopens_inflight).ok_or_else(|| {
             CriError::unavailable("too many container log reopens are in progress")
         })?;
-        let deadline = Instant::now() + CONTAINER_LOG_REOPEN_TIMEOUT;
+        // クライアントの `grpc-timeout` が短ければそれに合わせる（期限切れの後に確定しない。#4652）。
+        let budget = client_timeout.map_or(CONTAINER_LOG_REOPEN_TIMEOUT, |t| {
+            t.min(CONTAINER_LOG_REOPEN_TIMEOUT)
+        });
+        let deadline = Instant::now() + budget;
+        // RPC の future が破棄されたら（期限切れ・取り消し）、切り離された worker へ旗で知らせる。
+        // `run_bounded` は破棄された future の worker を切り離して動かし続けるため、旗で worker に知らせる（完了後に立っても無害）。
+        let cancel = Arc::new(AtomicBool::new(false));
+        let _cancel_on_drop = CancelOnDrop {
+            cancel: Arc::clone(&cancel),
+            armed: true,
+        };
         // 注入口自身も deadline を守る。外側の待ちは数百 ms の余裕を足して、内側の `Timeout` を優先して返す。
-        run_bounded(
-            CONTAINER_LOG_REOPEN_TIMEOUT + Duration::from_millis(500),
-            move || {
-                let _slot = slot;
-                reopener.reopen(&id, deadline)
-            },
-        )
+        run_bounded(budget + Duration::from_millis(500), move || {
+            let _slot = slot;
+            reopener.reopen(&id, deadline, &cancel)
+        })
         .await?
         .map_err(|e| CriError::from(&e))?;
         Ok(v1::ReopenContainerLogResponse {})
@@ -5205,8 +5239,9 @@ impl RuntimeService for CriRuntimeService {
         request: Request<v1::ReopenContainerLogRequest>,
     ) -> Result<Response<v1::ReopenContainerLogResponse>, Status> {
         let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::ReopenContainerLog);
+        let client_timeout = grpc_timeout(request.metadata());
         let result = self
-            .reopen_container_log_impl(request.into_inner())
+            .reopen_container_log_impl(request.into_inner(), client_timeout)
             .await
             .map_err(Status::from);
         timer.finish_with(&result);

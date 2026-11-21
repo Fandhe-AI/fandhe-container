@@ -19,6 +19,9 @@ fn main() {
 
 #[cfg(target_os = "linux")]
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some(linux::HOLD_ARG) {
+        linux::hold_until_eof();
+    }
     linux::run();
 }
 
@@ -28,6 +31,24 @@ mod linux {
 
     use fandhe_container_core::traits::{ErrorCode, TraitError};
     use fandhe_container_supervisor::exec::{ExecOutcome, run_in_worker_for_test};
+
+    /// 書き込み端の保持役（自分自身の再入口）の引数。
+    pub const HOLD_ARG: &str = "--hold-until-eof";
+
+    /// 保持役の本体: stdin の EOF まで読み、終わったら 0 で抜ける。読み取りが回帰して EOF 待ちに戻ったときのため、
+    /// 8 秒の独立の期限で自分から抜ける（期限のスレッドは保持役のプロセスの中だけ。試験の本体は単一スレッドのまま）。
+    /// 1 プロセスだけで、子を作らない（`timeout` + `sh` の 2 段だと、期限の SIGKILL で `timeout` が `sh` を回収する前に
+    /// 終わり、`sh` が subreaper の試験へ付け替わって未回収になる。REPAIR-5）。
+    pub fn hold_until_eof() -> ! {
+        use std::io::Read as _;
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_secs(8));
+            std::process::exit(0);
+        });
+        let mut sink = [0u8; 64];
+        while matches!(std::io::stdin().read(&mut sink), Ok(n) if n > 0) {}
+        std::process::exit(0);
+    }
 
     pub fn run() {
         worker_is_non_dumpable_before_work_runs();
@@ -225,7 +246,7 @@ mod linux {
     /// REPAIR-5・REPAIR-12・REPAIR-10 (d)・SUP-6・#4733: worker が結果行を残さず 0 で終わり、別プロセスが結果 pipe の
     /// 書き込み端を持ち続けても、本番の回収経路（`collect_worker_result`）は EOF を待たず、約 1 秒で固定文言の
     /// `Internal` を返す。worker は `result_write_fd_for_test()` が示す結果 pipe の書き込み端を開き直して孫
-    /// （`timeout -s KILL 8 sh -c 'read _'`）の stdout に持たせ、`skip_result_write_for_test()` で結果行を省いて 0 で戻る（fork ラッパーの
+    /// （試験バイナリ自身の再入口 [`HOLD_ARG`]。子を作らない 1 プロセス）の stdout に持たせ、`skip_result_write_for_test()` で結果行を省いて 0 で戻る（fork ラッパーの
     /// `_exit` 経路で終わる）。孫の stdin は試験が持つ pipe の読み端で、試験が書き込み端（`_hold`）を閉じると EOF で
     /// 自分で終わる（pid・pgid の番号では kill しない。失敗の panic を含め `_hold` の drop で必ず終わる）。試験は自身を
     /// child subreaper にしてから worker を起動し、worker は孫の pid を試験の pipe へ書く。worker の終了で孫は試験の子へ
@@ -236,7 +257,7 @@ mod linux {
         use fandhe_container_core::exec::{ChildSubreaper, ContainerChild};
         use std::io::Read as _;
 
-        /// 孫（`timeout`）を、書き込み端を閉じてから期限つきで回収する。
+        /// 孫（保持役）を、書き込み端を閉じてから期限つきで回収する。
         struct HelperGuard {
             hold: Option<std::io::PipeWriter>,
             helper: Option<ContainerChild>,
@@ -252,6 +273,7 @@ mod linux {
             }
         }
 
+        let exe = std::env::current_exe().expect("current exe");
         let proof = ChildSubreaper::enable().expect("child subreaper");
         let (hold_r, hold) = std::io::pipe().unwrap();
         let mut guard = HelperGuard {
@@ -272,11 +294,10 @@ mod linux {
                     .unwrap();
                 // ここでは回収しない（worker の終了で subreaper の試験へ付け替わり、試験が回収する）。
                 #[allow(clippy::zombie_processes)]
-                // `timeout` は読み取りが回帰して EOF 待ちに戻ったときの独立の期限（8 秒で書き込み端の持ち主が
-                // 自分で終わり、呼び出しが戻って経過時間の assert が失敗を報告する。この試験は fork のため単一
-                // スレッドで、期限のスレッドを立てられない。REPAIR-5）。
-                let _c = std::process::Command::new("timeout")
-                    .args(["-s", "KILL", "8", "sh", "-c", "read _"])
+                // 保持役は読み取りが回帰して EOF 待ちに戻ったときの独立の期限を持つ（8 秒で自分で終わり、
+                // 呼び出しが戻って経過時間の assert が失敗を報告する。REPAIR-5）。
+                let _c = std::process::Command::new(&exe)
+                    .arg(HOLD_ARG)
                     .stdin(hold_r)
                     .stdout(w)
                     .stderr(std::process::Stdio::null())

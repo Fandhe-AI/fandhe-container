@@ -2177,6 +2177,28 @@ impl CriRuntimeService {
     /// 順序: 注入口の有無 → container_id の検証 → 記録の検索（`NOT_FOUND`）→ running でなければ
     /// `FAILED_PRECONDITION`（新しいログは作らない。containerd と同じ）→ log_path が無ければ `FAILED_PRECONDITION`
     /// → 注入口を専用スレッドで期限つきに呼ぶ。registry のロックは呼び出しの前に外す。
+    /// `ReopenContainerLog` の受け入れの判定（ロックだけで済む。記録なし → `NOT_FOUND`、running でない・CRI ログのパスが
+    /// 無い → `FAILED_PRECONDITION`。#4652）。
+    fn check_log_reopenable(&self, container_id: &str) -> Result<(), CriError> {
+        let registry = self
+            .registry
+            .lock()
+            .map_err(|_| CriError::internal("sandbox registry is unavailable"))?;
+        let record = registry
+            .containers
+            .get(container_id)
+            .ok_or_else(|| CriError::not_found("container not found"))?;
+        if record.state != ContainerState::Running {
+            return Err(CriError::failed_precondition("container is not running"));
+        }
+        if record.resolved_log_path.is_none() {
+            return Err(CriError::failed_precondition(
+                "the container has no CRI log path",
+            ));
+        }
+        Ok(())
+    }
+
     async fn reopen_container_log_impl(
         &self,
         req: v1::ReopenContainerLogRequest,
@@ -2192,8 +2214,11 @@ impl CriRuntimeService {
             .map_err(|_| CriError::invalid_argument("container_id is invalid"))?;
         // 期限は受付の時点から数える（自然終了の取り込みの待ちで延びない。クライアントの期限切れの後に確定しない）。
         let received = Instant::now();
+        // 記録の検索と状態の判定を、枠を取る前に 1 回行う（枠が埋まっていても NOT_FOUND・FAILED_PRECONDITION の順序を保つ）。
+        // 自然終了の取り込みの後にもう一度判定する。
+        self.check_log_reopenable(&req.container_id)?;
         // 同時実行の枠は、先行する状態照会の前に取る。照会の処理スレッドと開き直しの処理スレッドの両方が枠を持ち、
-        // どちらも実際に終わるまで返さない（期限で RPC が戻っても、止まったスレッドが上限の外で増えない。REPAIR-5）。
+        // どちらも実際に終わるまで返さない（期限で RPC が戻っても、止まりうるスレッドは枠 1 件あたり最大 2 本で有界。REPAIR-5）。
         let slot = Arc::new(
             ReopenSlot::acquire(&self.log_reopens_inflight).ok_or_else(|| {
                 CriError::unavailable("too many container log reopens are in progress")
@@ -2203,24 +2228,7 @@ impl CriRuntimeService {
         // `UNAVAILABLE` になる代わりに、running でないことを `FAILED_PRECONDITION` で返す（#4652）。
         self.observe_container_exit_holding(&req.container_id, Arc::clone(&slot))
             .await?;
-        {
-            let registry = self
-                .registry
-                .lock()
-                .map_err(|_| CriError::internal("sandbox registry is unavailable"))?;
-            let record = registry
-                .containers
-                .get(&req.container_id)
-                .ok_or_else(|| CriError::not_found("container not found"))?;
-            if record.state != ContainerState::Running {
-                return Err(CriError::failed_precondition("container is not running"));
-            }
-            if record.resolved_log_path.is_none() {
-                return Err(CriError::failed_precondition(
-                    "the container has no CRI log path",
-                ));
-            }
-        }
+        self.check_log_reopenable(&req.container_id)?;
         let reopener = Arc::clone(reopener);
         // 枠は処理スレッドへ移し、スレッドが終わるまで保持する（RPC が期限で戻っても返さない）。
         // クライアントの `grpc-timeout` が短ければそれに合わせる（期限切れの後に確定しない。#4652）。

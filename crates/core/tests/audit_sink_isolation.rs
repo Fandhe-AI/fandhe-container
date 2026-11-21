@@ -18,6 +18,9 @@
 //!   書き込みを始めた後に詰まった子は出し直さない（上の「通知先も止まる」）
 //! - 通知の子が行の途中で書き込みに失敗すると、出し直しは改行を 1 つ付けてから 1 行を出す（断片と連結しない）
 //! - 複数スレッドのプロセス: fork できないため主経路は試行せず `isolation_unavailable` で代替経路へ進む
+//! - 主経路の fork が `EAGAIN`（自プロセスの `RLIMIT_NPROC` の soft を記録の間だけ 1 に下げて実 fork を失敗させる。
+//!   Linux のみ。上限を免除される場合〔init の user namespace の root・`CAP_SYS_ADMIN`・`CAP_SYS_RESOURCE`〕だけ適用外）:
+//!   代替経路へ進み、その主経路の失敗種別が `isolation_fork_again`（`UNAVAILABLE`）になる（#4702）
 //! - `SIGCHLD` が `SIG_IGN`（子が自動回収され `waitpid` が `ECHILD`）: 主経路の成功を失敗と取り違えず代替経路へ
 //!   二重に記録しない。失敗種別・時間切れ・通知も同じく届く（最後に実行し、終わったら `SIG_DFL` に戻す）
 //!
@@ -345,6 +348,7 @@ mod imp {
         multi_threaded_process_skips_the_primary();
         #[cfg(target_os = "linux")]
         {
+            fork_again_is_reported_as_isolation_fork_again();
             control_relay_persists_from_a_multi_threaded_process();
             control_relay_keeps_exit_signal_records_from_many_threads();
             control_relay_persists_exec_target_from_a_multi_threaded_process();
@@ -534,6 +538,90 @@ mod imp {
             assert_eq!(threads(), 1, "round {round}");
             assert_eq!(seen.lock().unwrap().len(), round);
         }
+    }
+
+    /// 実 uid（`/proc/self/status` の `Uid:` 行の先頭）。
+    #[cfg(target_os = "linux")]
+    fn real_uid() -> u32 {
+        std::fs::read_to_string("/proc/self/status")
+            .unwrap()
+            .lines()
+            .find_map(|l| l.strip_prefix("Uid:"))
+            .and_then(|v| v.split_whitespace().next()?.parse().ok())
+            .unwrap()
+    }
+
+    /// 実効 capability（`/proc/self/status` の `CapEff:`）。
+    #[cfg(target_os = "linux")]
+    fn cap_eff() -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .unwrap()
+            .lines()
+            .find_map(|l| l.strip_prefix("CapEff:"))
+            .and_then(|v| u64::from_str_radix(v.trim(), 16).ok())
+            .unwrap()
+    }
+
+    /// SEC-4・REPAIR-12・#4702: 実 fork が `EAGAIN` で失敗したとき、`FileAuditSink` は主経路の失敗種別を
+    /// `isolation_fork_again` として代替経路へ渡す（汎用の `isolation_unavailable` へ畳まない）。
+    /// 子プロセスは起動せず、自プロセスの `RLIMIT_NPROC` の soft だけを 1 に下げる。上限は fork するプロセス自身の値で
+    /// 同じ uid のプロセス数と比べるため、本プロセスが居る限り次の fork とスレッドの作成は `EAGAIN` になる（他の
+    /// プロセスには効かない）。記録の直後に元の soft へ戻す（hard は変えないため非特権で戻せる）。上限の間は通知の子も
+    /// スレッドも作れず通知 1 行は出ない（通知行は単体試験で見る）。主経路が成功したら上限が効いていない。
+    /// root・`CAP_SYS_ADMIN`・`CAP_SYS_RESOURCE` による免除なら適用外を明示し、それ以外は失敗にする（CI は非 root・
+    /// capability なし）。
+    #[cfg(target_os = "linux")]
+    fn fork_again_is_reported_as_isolation_fork_again() {
+        // 主経路は単一スレッドのときだけ fork する（複数スレッドだと `isolation_unavailable` になり照合で落ちる）。
+        wait_single_threaded();
+        let primary: Primary =
+            Arc::new(|path, _| std::fs::write(path, b"primary-ran").map_err(|_| unreachable_err()));
+        let marker = tmp_marker("fork-again");
+        let (sink, seen) = sink(primary, false, Notify::Discard, marker.clone());
+        let old = match FileAuditSink::set_process_soft_limit_for_test(1) {
+            Ok(old) => old,
+            Err(e) => panic!("lowering RLIMIT_NPROC must succeed: {e}"),
+        };
+        let e = sink.record(&record());
+        let seen_once = seen.lock().unwrap().clone();
+        // 構造化した戻り値でも主経路の種別を読める（文言を解析しない。REPAIR-2）。
+        let detailed = sink.record_detailed(&record());
+        // supervisor が使う期限つきの経路でも、集約コードと種別つきの文言が同じであること（REPAIR-12）。
+        let until = sink.record_until(&record(), Instant::now() + Duration::from_secs(5));
+        if let Err(e) = FileAuditSink::set_process_soft_limit_for_test(old) {
+            panic!("restoring RLIMIT_NPROC must succeed: {e}");
+        }
+        let e = match e {
+            Ok(()) => {
+                // CAP_SYS_ADMIN（21）・CAP_SYS_RESOURCE（24）と init の user namespace の root は上限を免除される。
+                const EXEMPT: u64 = (1 << 21) | (1 << 24);
+                assert!(
+                    cap_eff() & EXEMPT != 0 || real_uid() == 0,
+                    "RLIMIT_NPROC was not enforced although uid is not 0 and CAP_SYS_ADMIN and CAP_SYS_RESOURCE are absent"
+                );
+                println!(
+                    "audit_sink_isolation: fork_again not applicable (root or CAP_SYS_ADMIN / CAP_SYS_RESOURCE exempts RLIMIT_NPROC)"
+                );
+                return;
+            }
+            Err(e) => e,
+        };
+        assert!(!marker.exists(), "the primary must not run");
+        let detailed = detailed.unwrap_err();
+        let until = until.unwrap_err();
+        assert_eq!(
+            format!(
+                "primary={:?} code={:?} message={} detail={:?} until={:?}:{}",
+                seen_once,
+                e.code(),
+                e.message(),
+                detailed.primary().kind(),
+                until.code(),
+                until.message()
+            ),
+            "primary=[IsolationForkAgain] code=Internal message=audit record could not be persisted by primary or fallback path (primary: isolation_fork_again) detail=IsolationForkAgain until=Internal:audit record could not be persisted by primary or fallback path (primary: isolation_fork_again)"
+        );
+        println!("audit_sink_isolation: fork_again reaches the fallback as isolation_fork_again");
     }
 
     /// REPAIR-5・TASK-163: 複数スレッドのプロセスでは fork できず、主経路を試行せず代替経路へ進む。

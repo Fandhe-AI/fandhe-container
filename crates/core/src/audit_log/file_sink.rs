@@ -48,14 +48,15 @@
 //!   終わり、主経路は `isolation_fds_not_closed` で代替経路へ、通知はスレッドでの出し直しへ進む。**限界
 //!   （REPAIR-3）**: Linux 5.11 未満では主経路は常に使われない（代替経路が成功すると通知も出ないため、ファイルは
 //!   黙って使われないままになる。両経路が失敗したときの通知の `primary` が `isolation_fds_not_closed` になり、
-//!   fork 不能の `isolation_unavailable` と見分けられる）
+//!   fork 不能の `isolation_unavailable`・`isolation_fork_again` と見分けられる）
 //! - 子の結果は終了 status ではなく子が書く結果 pipe の印で受ける（`SIGCHLD` が `SIG_IGN`・`SA_NOCLDWAIT` の
 //!   プロセス（macOS は `SIG_DFL` 以外の独自ハンドラも）では子が回収され status が失われるため）。印は「開始」（通知の子が出力先へ書き込む直前に書く）と
 //!   「結果」（終了コード）の 2 種類。シグナルは fork 直後に開いた pidfd 経由で送り、`waitpid` が `ECHILD` を
 //!   返した子（回収済み）へは送らない（pid 再利用対策。CORE-1）
 //! - 子は `fork_single_threaded` で作る。呼び出しプロセスが複数スレッドだと fork できないため、その場合は
 //!   主経路を試行せず `isolation_unavailable` で代替経路へ進む（期限を保証できない I/O を呼び出しスレッドで
-//!   実行しない。fail-closed）。supervisor の exec は単一スレッドのプロセスから呼ぶ契約
+//!   実行しない。fail-closed）。fork が `EAGAIN`（多くは資源上限）で失敗した場合だけ `isolation_fork_again`、
+//!   それ以外の fork 失敗は `isolation_unavailable`（#4702）。supervisor の exec は単一スレッドのプロセスから呼ぶ契約
 //! - 1 回の `record` の待ち時間の上限は [`RECORD_WAIT_LIMIT`]（主経路・代替経路・失敗通知の上限の合算。
 //!   定期 exec〔healthcheck。TASK-161〕へ配線するときは、この値を呼び出し側の期限の積み上げに含める）
 //! - 呼び出し側（supervisor）の記録点は worker を回収した後の親プロセスで、sink が詰まっても worker・
@@ -191,6 +192,8 @@ enum IsolatedOutcome {
     TimedOut,
     /// 呼び出しプロセスが複数スレッドで fork できない。
     MultiThreaded,
+    /// fork が `EAGAIN`（多くは資源上限）で失敗した（#4702。`isolation_fork_again`）。
+    ForkAgain,
     /// fork・待機に失敗した、子がシグナルで死んだ・結果を残さず自動回収された（非対応 OS を含む）。
     Failed,
     /// 子が継承した fd（3 以上）を閉じられず、`child` を実行せずに終わった（`close_range(2)` が無い Linux 5.11
@@ -504,7 +507,7 @@ fn run_isolated_until(
         Err(sys::SysError::MultiThreaded) => {
             return Isolated::not_run(IsolatedOutcome::MultiThreaded);
         }
-        Err(_) => return Isolated::not_run(IsolatedOutcome::Failed),
+        Err(e) => return Isolated::not_run(fork_error_outcome(&e)),
     };
     // 回収前に開くので、以後 pid が回収・再利用されても元の子を指す。開けなければ `None`（kill(2) へ退避）。
     let handle = open_child_handle(pid);
@@ -553,6 +556,16 @@ fn run_isolated_until(
     // SIGKILL でも回収できない子（D 状態等）。追跡して後続の呼び出しで回収する。
     pending::track(pid, handle);
     settle(&rx, IsolatedOutcome::TimedOut)
+}
+
+/// fork の失敗を結果へ写す。`EAGAIN`（多くは資源上限）だけ [`IsolatedOutcome::ForkAgain`]、他は `Failed`
+/// （#4702・SEC-4。どちらも代替経路へ進む）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn fork_error_outcome(e: &sys::SysError) -> IsolatedOutcome {
+    match e {
+        sys::SysError::Os(errno) if *errno == sys::EAGAIN => IsolatedOutcome::ForkAgain,
+        _ => IsolatedOutcome::Failed,
+    }
 }
 
 /// Windows では子プロセス隔離を提供しない（`crate::sys` は Linux・macOS 専用。CLI-1）。常に `Failed` を返し、
@@ -624,6 +637,7 @@ fn primary_result(outcome: IsolatedOutcome) -> Result<(), AuditWriteError> {
         IsolatedOutcome::Exited(code) => exit_to_kind(code),
         IsolatedOutcome::TimedOut => AuditWriteErrorKind::IsolationTimeout,
         IsolatedOutcome::FdsNotClosed => AuditWriteErrorKind::IsolationFdsNotClosed,
+        IsolatedOutcome::ForkAgain => AuditWriteErrorKind::IsolationForkAgain,
         IsolatedOutcome::MultiThreaded
         | IsolatedOutcome::Failed
         | IsolatedOutcome::TooManyUnreaped => AuditWriteErrorKind::IsolationUnavailable,
@@ -679,6 +693,7 @@ fn notify_retry(run: Isolated) -> NotifyRetry {
         IsolatedOutcome::Exited(_)
         | IsolatedOutcome::MultiThreaded
         | IsolatedOutcome::Failed
+        | IsolatedOutcome::ForkAgain
         | IsolatedOutcome::FdsNotClosed
         | IsolatedOutcome::TooManyUnreaped => {
             if run.started {
@@ -966,6 +981,18 @@ impl FileAuditSink {
         sys::set_child_signal_ignored_for_test(ignored).is_ok()
     }
 
+    /// 結合試験専用: 自プロセスの `RLIMIT_NPROC` の soft だけを `soft` にし、前の soft を返す（実 fork の `EAGAIN` の
+    /// 再現用。#4702・SEC-4）。hard は変えないため、前の値を渡して呼び直せば非特権でも戻せる。失敗の原因は errno か
+    /// `Unsupported` の [`std::io::Error`] で返す（文字列に畳まない。REPAIR-2）。
+    #[cfg(all(target_os = "linux", feature = "exec-test-support"))]
+    #[doc(hidden)]
+    pub fn set_process_soft_limit_for_test(soft: u64) -> std::io::Result<u64> {
+        let kind = crate::rlimits::RlimitKind::Nproc;
+        let (old, hard) = sys::get_rlimit_self(kind).map_err(sys_io_error)?;
+        sys::set_rlimit_self(kind, soft, hard).map_err(sys_io_error)?;
+        Ok(old)
+    }
+
     /// 結合試験専用: 自プロセスのスレッド数（macOS の `tests/audit_sink_isolation.rs` が `/proc` の代わりに使う。
     /// `proc_pidinfo` の `pti_threadnum`）。数えられなければ `None`。
     #[cfg(all(target_os = "macos", feature = "exec-test-support"))]
@@ -1055,8 +1082,11 @@ impl fmt::Debug for FileAuditSink {
     }
 }
 
-impl AuditSink for FileAuditSink {
-    fn record(&self, record: &AuditRecord) -> Result<(), TraitError> {
+impl FileAuditSink {
+    /// [`AuditSink::record`] と同じ処理で、両経路の失敗を構造化したまま返す（REPAIR-2・SEC-4・#4702）。
+    /// 主経路・代替経路の失敗種別は `failure.primary().kind()`・`failure.fallback().kind()` で読める（文言を解析しない）。
+    /// `AuditSink::record` はこれを集約コードの `TraitError` へ写すだけ。
+    pub fn record_detailed(&self, record: &AuditRecord) -> Result<(), AuditWriteFailure> {
         let primary = match self.write_primary(record) {
             Ok(()) => return Ok(()),
             Err(primary) => primary,
@@ -1068,7 +1098,14 @@ impl AuditSink for FileAuditSink {
             Err(fb) => AuditWriteFailure::new(primary, fb),
         };
         (self.notify)(&failure, None);
-        Err(TraitError::new(failure.error_code(), failure.message()))
+        Err(failure)
+    }
+}
+
+impl AuditSink for FileAuditSink {
+    fn record(&self, record: &AuditRecord) -> Result<(), TraitError> {
+        self.record_detailed(record)
+            .map_err(|failure| both_failed_error(&failure))
     }
 
     /// 全段階(主経路の子の待ちと kill 後の回収待ち・代替経路の ACK 待ち・失敗通知)に同じ絶対期限を通す
@@ -1077,22 +1114,24 @@ impl AuditSink for FileAuditSink {
     /// 回収待ちが期限を超える子は待たずに追跡へ回す(未回収として数え、後続の呼び出しで回収する)。
     /// 戻りは期限 + ポーリング間隔・スケジューリングの端数以内(代替経路の送信 `send` は非ブロッキング前提)。
     fn record_until(&self, record: &AuditRecord, deadline: Instant) -> Result<(), TraitError> {
-        let timed_out = || {
-            TraitError::new(
+        // 主経路の失敗が判明した後の期限切れでも、種別は `Timeout` の message に残す(SEC-4・REPAIR-4)。
+        let timed_out = |primary: Option<AuditWriteErrorKind>| {
+            with_primary_kind(
                 crate::traits::ErrorCode::Timeout,
                 "the audit record was not delivered within the deadline",
+                primary,
             )
         };
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(timed_out());
+            return Err(timed_out(None));
         }
         let primary = match self.write_primary_capped(record, Some(remaining), Some(deadline)) {
             Ok(()) => return Ok(()),
             Err(primary) => primary,
         };
         if Instant::now() >= deadline {
-            return Err(timed_out());
+            return Err(timed_out(Some(primary.kind())));
         }
         let mut fallback = (self.fallback)();
         let failure = match fallback.record_fallback_until(record, &primary, deadline) {
@@ -1102,9 +1141,45 @@ impl AuditSink for FileAuditSink {
         // 代替経路の待ちで期限が尽きていれば、通知は開始せず Timeout を返す(通知は欠ける)。
         (self.notify)(&failure, Some(deadline));
         if Instant::now() >= deadline {
-            return Err(timed_out());
+            return Err(timed_out(Some(failure.primary().kind())));
         }
-        Err(TraitError::new(failure.error_code(), failure.message()))
+        Err(both_failed_error(&failure))
+    }
+}
+
+/// 試験用の入口の `SysError` を型つきの [`std::io::Error`] へ写す（errno はそのまま、それ以外は `Unsupported`）。
+#[cfg(all(target_os = "linux", feature = "exec-test-support"))]
+fn sys_io_error(e: sys::SysError) -> std::io::Error {
+    match e {
+        sys::SysError::Os(errno) => std::io::Error::from_raw_os_error(errno),
+        _ => std::io::Error::from(std::io::ErrorKind::Unsupported),
+    }
+}
+
+/// 両経路失敗の戻り値。主経路が `isolation_fork_again` のときだけ、通知 1 行が出せない場合（`RLIMIT_NPROC` の到達で
+/// 通知の子もスレッドも作れない等）でも種別が残るよう固定の語彙の種別名を文言に足す。それ以外の種別では従来の文言の
+/// まま変えない（文言に依存する呼び出し元との互換。#4702・SEC-4・REPAIR-4）。機械で判別する呼び出し元は
+/// [`FileAuditSink::record_detailed`] の構造化した値を使う。
+fn both_failed_error(failure: &AuditWriteFailure) -> TraitError {
+    with_primary_kind(
+        failure.error_code(),
+        failure.message(),
+        Some(failure.primary().kind()),
+    )
+}
+
+/// 主経路の失敗種別が `isolation_fork_again` のときだけ `message` の末尾に `(primary: isolation_fork_again)` を
+/// 足す(SEC-4・REPAIR-4・#4702)。期限切れの `Timeout` も通る。
+fn with_primary_kind(
+    code: crate::traits::ErrorCode,
+    message: &str,
+    primary: Option<AuditWriteErrorKind>,
+) -> TraitError {
+    match primary {
+        Some(kind @ AuditWriteErrorKind::IsolationForkAgain) => {
+            TraitError::new(code, format!("{message} (primary: {})", kind.as_str()))
+        }
+        _ => TraitError::new(code, message),
     }
 }
 #[cfg(test)]
@@ -1227,15 +1302,16 @@ mod tests {
         let (sink, _calls, notes) = sink_with(missing_path(), false);
         let e = sink.record(&sample()).unwrap_err();
         assert_eq!(e.code(), ErrorCode::Internal);
-        assert_eq!(
-            e.message(),
-            "audit record could not be persisted by primary or fallback path"
-        );
         let (p, pc) = if cfg!(any(target_os = "linux", target_os = "macos")) {
             ("open", "INTERNAL")
         } else {
             ("unsupported", "UNIMPLEMENTED")
         };
+        // fork の EAGAIN 以外の種別では、従来の文言のまま種別を足さない（#4702）。
+        assert_eq!(
+            e.message(),
+            "audit record could not be persisted by primary or fallback path"
+        );
         let expect = format!(
             "{{\"event\":\"audit_write_failure\",\"code\":\"INTERNAL\",\"primary\":\"{p}\",\"primary_code\":\"{pc}\",\"fallback\":\"fallback_unavailable\",\"fallback_code\":\"UNIMPLEMENTED\"}}\n"
         );
@@ -1412,6 +1488,26 @@ mod tests {
         drop(hold_tx);
     }
 
+    /// SEC-4・REPAIR-4・#4702: 期限切れの `Timeout` も、主経路が fork の `EAGAIN` なら message に種別を残す。
+    /// 主経路の失敗前(`None`)と他の種別は従来の message のまま。
+    #[test]
+    fn sec4_4702_timeout_keeps_fork_again_kind() {
+        let m = "the audit record was not delivered within the deadline";
+        let got = |kind| {
+            let e = with_primary_kind(ErrorCode::Timeout, m, kind);
+            format!("{:?}:{}", e.code(), e.message())
+        };
+        assert_eq!(
+            got(Some(AuditWriteErrorKind::IsolationForkAgain)),
+            format!("Timeout:{m} (primary: isolation_fork_again)")
+        );
+        assert_eq!(
+            got(Some(AuditWriteErrorKind::IsolationUnavailable)),
+            format!("Timeout:{m}")
+        );
+        assert_eq!(got(None), format!("Timeout:{m}"));
+    }
+
     /// 期限を見ずに待つ代替経路(既定の `record_fallback_until` は委譲のみ)を、期限切れ後は呼ばない。
     #[test]
     fn repair5_sec4_record_until_skips_fallback_and_notify_after_deadline() {
@@ -1458,6 +1554,7 @@ mod tests {
             (O::MultiThreaded, false, R::Line),
             (O::Failed, false, R::Line),
             (O::Failed, true, R::AfterNewline),
+            (O::ForkAgain, false, R::Line),
             (O::FdsNotClosed, false, R::Line),
             (O::TooManyUnreaped, false, R::Line),
         ];
@@ -1501,6 +1598,7 @@ mod tests {
             AuditWriteErrorKind::IsolationUnavailable
         );
         assert_eq!(kind(O::Failed), AuditWriteErrorKind::IsolationUnavailable);
+        assert_eq!(kind(O::ForkAgain), AuditWriteErrorKind::IsolationForkAgain);
         assert_eq!(
             kind(O::TooManyUnreaped),
             AuditWriteErrorKind::IsolationUnavailable
@@ -1513,6 +1611,28 @@ mod tests {
             fds.message(),
             "isolated audit log writer could not close inherited file descriptors"
         );
+    }
+
+    /// SEC-4・REPAIR-12・#4702: fork の失敗は `EAGAIN` だけが `isolation_fork_again` になり、他の errno・非対応は
+    /// 従来どおり `isolation_unavailable`（`UNAVAILABLE`）に写る。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn sec4_4702_fork_error_outcome_splits_eagain() {
+        use crate::sys::{EAGAIN, ECHILD, EINTR, SysError};
+        let kind = |e: SysError| primary_result(fork_error_outcome(&e)).unwrap_err();
+        let again = kind(SysError::Os(EAGAIN));
+        assert_eq!(again.kind(), AuditWriteErrorKind::IsolationForkAgain);
+        assert_eq!(again.kind().as_str(), "isolation_fork_again");
+        assert_eq!(again.error_code(), ErrorCode::Unavailable);
+        for other in [
+            SysError::Os(ECHILD),
+            SysError::Os(EINTR),
+            SysError::Unsupported,
+        ] {
+            let err = kind(other);
+            assert_eq!(err.kind().as_str(), "isolation_unavailable", "{err:?}");
+            assert_eq!(err.error_code(), ErrorCode::Unavailable);
+        }
     }
 
     /// REPAIR-5・#1616: 1 回の `record` の待ち時間の上限は、各経路の上限の合算（11.45 秒）。

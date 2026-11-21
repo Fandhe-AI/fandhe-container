@@ -207,9 +207,13 @@ pub enum AuditWriteErrorKind {
     /// 主経路のファイル書き込みを隔離した子プロセスが期限内に終わらなかった（ストレージ停止等。
     /// 子は SIGKILL で止め、代替経路へ進む。REPAIR-5・`FileAuditSink`）。
     IsolationTimeout,
-    /// 主経路を隔離するプロセスを作れなかった（呼び出しプロセスが複数スレッドで fork できない等）。
+    /// 主経路を隔離するプロセスを作れなかった（呼び出しプロセスが複数スレッドで fork できない等。fork の `EAGAIN` は
+    /// [`Self::IsolationForkAgain`]）。
     /// 期限を保証できないため主経路は試行せず、代替経路へ進む（fail-closed。`FileAuditSink`）。
     IsolationUnavailable,
+    /// 主経路を隔離する子の fork が `EAGAIN`（多くは資源上限だが、原因は errno からは断定しない）で失敗した。
+    /// 代替経路へ進む。それ以外の fork 失敗を含む `IsolationUnavailable` と見分ける（#4702・SEC-4）。
+    IsolationForkAgain,
     /// 主経路を隔離した子プロセスが、継承した fd（3 以上）を閉じられなかった（`close_range(2)` が無い Linux 5.11
     /// 未満のカーネル等）。子は I/O せずに終わり、代替経路へ進む（fail-closed。`FileAuditSink`。fork 不能の
     /// `IsolationUnavailable` と運用で見分けるための別種別）。
@@ -241,6 +245,7 @@ impl AuditWriteErrorKind {
             Self::KernelAuditIo => "kernel_audit_io",
             Self::IsolationTimeout => "isolation_timeout",
             Self::IsolationUnavailable => "isolation_unavailable",
+            Self::IsolationForkAgain => "isolation_fork_again",
             Self::IsolationFdsNotClosed => "isolation_fds_not_closed",
             Self::SizeLimit => "size_limit_exceeded",
         }
@@ -283,6 +288,7 @@ impl AuditWriteError {
             | AuditWriteErrorKind::KernelAuditTimeout
             | AuditWriteErrorKind::IsolationTimeout => ErrorCode::Timeout,
             AuditWriteErrorKind::IsolationUnavailable
+            | AuditWriteErrorKind::IsolationForkAgain
             | AuditWriteErrorKind::IsolationFdsNotClosed => ErrorCode::Unavailable,
             // 環境上カーネル監査へ到達できない状態（未実装ではない）。`Unimplemented` と区別する。
             AuditWriteErrorKind::KernelAuditUnavailable => ErrorCode::Unavailable,
@@ -324,6 +330,9 @@ impl AuditWriteError {
             }
             AuditWriteErrorKind::IsolationUnavailable => {
                 "audit log write could not be isolated in a bounded child process"
+            }
+            AuditWriteErrorKind::IsolationForkAgain => {
+                "could not fork the isolation child; the kernel refused the fork as temporarily unavailable"
             }
             AuditWriteErrorKind::IsolationFdsNotClosed => {
                 "isolated audit log writer could not close inherited file descriptors"
@@ -2192,6 +2201,7 @@ mod tests {
             K::KernelAuditIo,
             K::IsolationTimeout,
             K::IsolationUnavailable,
+            K::IsolationForkAgain,
             K::IsolationFdsNotClosed,
         ];
         for p in kinds {
@@ -2242,6 +2252,22 @@ mod tests {
         let obj = v.as_object().unwrap();
         assert!(!obj.contains_key("event"));
         assert!(!obj.contains_key("level"));
+    }
+
+    /// SEC-4・#4702: 主経路が `isolation_fork_again` の通知行の完全一致。
+    #[test]
+    fn sec4_4702_fork_again_notice_line_exact() {
+        use AuditWriteErrorKind as K;
+        let failure = AuditWriteFailure::new(
+            AuditWriteError::new(K::IsolationForkAgain),
+            AuditWriteError::new(K::FallbackUnavailable),
+        );
+        let mut out = Vec::new();
+        failure.write_json_line(&mut out).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "{\"event\":\"audit_write_failure\",\"code\":\"INTERNAL\",\"primary\":\"isolation_fork_again\",\"primary_code\":\"UNAVAILABLE\",\"fallback\":\"fallback_unavailable\",\"fallback_code\":\"UNIMPLEMENTED\"}\n"
+        );
     }
 
     /// ERR-4・SEC-4・#3115: ControlPeer の行全体（移行前の出力の写し）。

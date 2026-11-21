@@ -456,6 +456,10 @@ fn not_permitted_error() -> TraitError {
     )
 }
 
+/// 確定点で期限までに残しておく余裕（応答をクライアントへ届ける分）。
+#[cfg(target_os = "linux")]
+const COMMIT_MARGIN: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// 待ちうる処理に入る前の事前確認（期限と、呼び出し元がまだ稼働中の世代か）。何も確定しない。確定は
 /// [`CriFileSink::commit_switch`] の関門の中で改めて確認する。
 #[cfg(target_os = "linux")]
@@ -710,7 +714,9 @@ impl CriFileSink {
         let mut old = None;
         let mut expired = false;
         let permitted = gate(&mut || {
-            if Instant::now() >= deadline {
+            // 期限の直前の確定は、応答がクライアントの期限に間に合わず kubelet が rename を戻しうるため、余裕を残して
+            // 拒否する（確定したのにクライアントは期限切れを受け取る食い違いを避ける。REPAIR-5）。
+            if Instant::now() + COMMIT_MARGIN >= deadline {
                 expired = true;
                 return;
             }

@@ -1714,6 +1714,8 @@ mod libc_abi {
     ) -> libc::c_int = libc::openat;
     const _: unsafe extern "C" fn(libc::c_int, *const libc::c_char, libc::c_int) -> libc::c_int =
         unlinkat;
+    // `openat` の可変長部へ渡す mode（`u32`）が `mode_t` と同じ型であること（fn 型の照合には現れない）。
+    const _: libc::mode_t = super::LOG_CREATE_MODE;
     const _: unsafe extern "C" fn(libc::c_int, *const libc::c_char, libc::c_int) -> libc::c_int =
         libc::unlinkat;
     // 試験 repair5_connect_unix_nonblocking_returns_wouldblock_when_backlog_is_full の関数内宣言 `listen` は

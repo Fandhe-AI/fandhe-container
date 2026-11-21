@@ -46,6 +46,7 @@ use std::fmt;
 
 use super::config::OciMount;
 use crate::audit_log::{AuditSink, AuditedRejection, record_mount_rejection};
+use crate::dev_mounts::ImplicitDevMount;
 use crate::traits::{ContainerId, ErrorCode};
 
 /// sysfs を置ける唯一の宛先。
@@ -58,21 +59,36 @@ pub(crate) enum OciMountKind {
     Bind,
     /// sysfs（bind ではなく `type == "sysfs"`）。
     Sysfs,
-    /// 暗黙に供給済みの項目と type・宛先が一致するもの（[`IMPLICIT_SUPPLIED`]。bind でも sysfs でもない）。
-    /// 受理の可否は後続の許可表（#4714）で決め、今は [`Self::Other`] と同じく拒否される（#4713）。
+    /// 暗黙に供給する既定のマウントの候補と type・宛先が一致するもの（[`implicit_supplied`]。bind でも sysfs でもない）。
+    /// 個々の項目だけを見た分類で、その起動で実際に供給されるかは表さない（`--ipc=host` や `/dev/shm` の bind の指定が
+    /// あると既定の `/dev/shm` の tmpfs は載らない）。後続の受理の処理は、この分類だけで読み飛ばさず、起動時の供給の条件を
+    /// 別に確かめる（#4716）。受理の可否は後続の許可表（#4714）で決め、今は [`Self::Other`] と同じく拒否される
+    /// （#4713・#2347 の A-2・OCI-4・TASK-29 追補・MS-2）。
     ImplicitSupplied,
     /// 上記以外（実行層は未対応）。
     Other,
 }
 
-/// 暗黙に供給済みの宛先（正規化後）と、その宛先で一致とみなす type（`crates/core/src/dev_mounts.rs`・`tmpfs.rs`・
-/// `exec::mount_proc` が載せるもの。#2347 の A-2・#4713・OCI-4）。`/dev/mqueue`・`/sys/fs/cgroup` は供給していないため含めない。
-const IMPLICIT_SUPPLIED: [(&str, &str); 4] = [
-    ("/proc", "proc"),
-    ("/dev", "tmpfs"),
-    ("/dev/pts", "devpts"),
-    ("/dev/shm", "tmpfs"),
-];
+/// 暗黙に供給する既定のマウントの候補か（正規化した宛先と type の組。#2347 の A-2・#4713・OCI-4・TASK-29 追補・MS-2）。
+/// `/dev` 系の宛先は供給側の定義（[`ImplicitDevMount::destination`]）をそのまま使い、二重に持たない。`/proc` は
+/// `exec::mount_proc` が載せる。`/dev/mqueue`・`/sys/fs/cgroup` は供給していないため含めない。
+fn implicit_supplied(destination: &str, fs_type: &str) -> bool {
+    if destination == "/proc" {
+        return fs_type == "proc";
+    }
+    ImplicitDevMount::ALL
+        .iter()
+        .any(|m| m.destination() == destination && implicit_dev_fs_type(*m) == fs_type)
+}
+
+/// 暗黙の `/dev` 系のマウントの OCI の type（`dev_mounts.rs` の供給の方式と対応する）。同じ crate の中の網羅的な
+/// `match` なので、供給側に項目が増えるとここがコンパイルで止まり、type の決め忘れを防ぐ。
+fn implicit_dev_fs_type(m: ImplicitDevMount) -> &'static str {
+    match m {
+        ImplicitDevMount::Dev | ImplicitDevMount::DevShm => "tmpfs",
+        ImplicitDevMount::DevPts => "devpts",
+    }
+}
 
 impl OciMountKind {
     /// 1 件の種類を判定する。bind の判定を優先する。
@@ -82,12 +98,10 @@ impl OciMountKind {
             Self::Bind
         } else if m.fs_type() == Some("sysfs") {
             Self::Sysfs
-        } else if m.fs_type().is_some_and(|t| {
-            let dest = m.mount_destination();
-            IMPLICIT_SUPPLIED
-                .iter()
-                .any(|(d, ty)| *ty == t && dest.as_str() == *d)
-        }) {
+        } else if m
+            .fs_type()
+            .is_some_and(|t| !t.is_empty() && implicit_supplied(m.mount_destination().as_str(), t))
+        {
             Self::ImplicitSupplied
         } else {
             Self::Other

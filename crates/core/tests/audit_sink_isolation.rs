@@ -603,7 +603,7 @@ mod imp {
         files: &[&Path],
     ) -> Result<std::process::ExitStatus, String> {
         let until = std::time::Instant::now() + FORK_AGAIN_CHILD_WITHIN;
-        loop {
+        let over_cap = || -> Result<(), String> {
             for f in files {
                 let len = std::fs::metadata(f).map_err(|e| e.to_string())?.len();
                 if len > FORK_AGAIN_OUTPUT_CAP {
@@ -613,8 +613,13 @@ mod imp {
                     ));
                 }
             }
+            Ok(())
+        };
+        loop {
+            over_cap()?;
             match child.try_wait() {
-                Ok(Some(st)) => return Ok(st),
+                // 終了の直前に上限を超えて書いた分も見落とさないよう、終了を確かめた後にもう一度大きさを見る。
+                Ok(Some(st)) => return over_cap().map(|()| st),
                 Ok(None) => {}
                 Err(e) => return Err(format!("try_wait failed: {e}")),
             }
@@ -662,7 +667,10 @@ mod imp {
         let dir = tmp_marker("fork-again");
         std::fs::create_dir(&dir).unwrap();
         let (out_path, err_path) = (dir.join("stdout"), dir.join("stderr"));
+        // 子とその子孫（プローブ）を専用のプロセスグループに置き、失敗の経路ではグループごと止める（REPAIR-5）。
+        use std::os::unix::process::CommandExt as _;
         let mut child = match std::process::Command::new(std::env::current_exe().unwrap())
+            .process_group(0)
             .arg(FORK_AGAIN_CHILD_ARG)
             .arg(&dir)
             .stdin(std::process::Stdio::null())
@@ -676,6 +684,7 @@ mod imp {
         let status = match wait_capped(&mut child, &[&out_path, &err_path]) {
             Ok(s) => s,
             Err(e) => {
+                super::reap::kill_group_or_report(child.id());
                 let _ = super::reap::reap(&mut child, super::reap::reap_within());
                 panic!("fork_again child did not finish cleanly: {e}");
             }

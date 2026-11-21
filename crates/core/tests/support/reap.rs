@@ -766,7 +766,8 @@ pub(crate) fn spawn_captured_mode(
 }
 
 /// `kill_group` の失敗を stderr に出す（後始末の経路用）。
-fn kill_group_or_report(pgid: u32) {
+#[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
+pub(crate) fn kill_group_or_report(pgid: u32) {
     if let Err(e) = kill_group(pgid, true) {
         eprintln!("{e}");
     }

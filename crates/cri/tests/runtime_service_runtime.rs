@@ -3553,3 +3553,74 @@ async fn cri_2_reopen_container_log_without_reopener_is_unimplemented() {
     let err = reopen(&h.service, &id).await.expect_err("unimplemented");
     assert_eq!(err.code(), Code::Unimplemented);
 }
+
+/// 解放されるまで止まるリオープナー（処理スレッドの枠の試験用）。
+#[derive(Default)]
+struct BlockingReopener {
+    entered: Mutex<usize>,
+    released: Mutex<bool>,
+    cv: std::sync::Condvar,
+}
+
+impl ContainerLogReopener for BlockingReopener {
+    fn reopen(&self, _id: &ContainerId, deadline: Instant) -> Result<(), TraitError> {
+        *self.entered.lock().unwrap() += 1;
+        let mut released = self.released.lock().unwrap();
+        while !*released {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(TraitError::new(ErrorCode::Timeout, "not released"));
+            }
+            released = self.cv.wait_timeout(released, left).unwrap().0;
+        }
+        Ok(())
+    }
+}
+
+/// REPAIR-5・#4652: 同時に走る `ReopenContainerLog` の処理スレッドは `MAX_CONTAINER_LOG_REOPENS` 件まで。超えた要求は
+/// リオープナーを呼ばずに `UNAVAILABLE` で断り、枠は処理スレッドが終わると返る。
+#[tokio::test]
+async fn repair5_4652_reopen_workers_are_bounded() {
+    use fandhe_container_cri::runtime_service::MAX_CONTAINER_LOG_REOPENS;
+    assert_eq!(MAX_CONTAINER_LOG_REOPENS, 4);
+    let h = harness();
+    let fake = Arc::new(BlockingReopener::default());
+    let service = h.service.with_log_reopener(fake.clone());
+    let id = create_with_log(&service, "c").await;
+    start(&service, &id).await.expect("start");
+    let over = async {
+        let until = Instant::now() + std::time::Duration::from_secs(5);
+        while *fake.entered.lock().unwrap() < MAX_CONTAINER_LOG_REOPENS {
+            assert!(
+                Instant::now() < until,
+                "the 4 reopens did not reach the reopener"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let err = reopen(&service, &id).await.expect_err("over the limit");
+        let entered = *fake.entered.lock().unwrap();
+        *fake.released.lock().unwrap() = true;
+        fake.cv.notify_all();
+        (err, entered)
+    };
+    let (a, b, c, d, (err, entered)) = tokio::join!(
+        reopen(&service, &id),
+        reopen(&service, &id),
+        reopen(&service, &id),
+        reopen(&service, &id),
+        over
+    );
+    assert_eq!(err.code(), Code::Unavailable);
+    assert_eq!(
+        err.message(),
+        "too many container log reopens are in progress"
+    );
+    assert_eq!(entered, MAX_CONTAINER_LOG_REOPENS);
+    for r in [a, b, c, d] {
+        r.expect("bounded reopen");
+    }
+    // 枠が返った後は再び受ける。
+    reopen(&service, &id)
+        .await
+        .expect("reopen after the slots are released");
+}

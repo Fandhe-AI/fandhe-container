@@ -370,6 +370,9 @@ pub struct CriRuntimeService {
     runtime: Option<RuntimeBinding>,
     /// `ReopenContainerLog` の注入口。`None` は `UNIMPLEMENTED`（REPAIR-3）。
     log_reopener: Option<Arc<dyn ContainerLogReopener>>,
+    /// 実行中の `ReopenContainerLog` の処理スレッド数（[`MAX_CONTAINER_LOG_REOPENS`] まで。処理スレッドが実際に終わるまで
+    /// 数える。REPAIR-5）。
+    log_reopens_inflight: Arc<std::sync::atomic::AtomicUsize>,
     /// 実行層の応答待ちの上限（REPAIR-5）。
     runtime_timeout: Duration,
     /// `ContainerStatus` の観測で実行層の状態を 1 回読む待ちの上限（#4174。既定は [`CONTAINER_EXIT_OBSERVE_TIMEOUT`]）。
@@ -489,6 +492,32 @@ pub trait ContainerLogReopener: Send + Sync {
 /// `ReopenContainerLog` が開き直しを待つ上限（kubelet の呼び出しに期限が無いため、有限で戻す。REPAIR-5）。
 /// supervisor の制御チャネルの上限（10 秒）より短く、kubelet のログ回転の周期に比べて十分短い。
 const CONTAINER_LOG_REOPEN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 同時に走らせる `ReopenContainerLog` の処理スレッドの上限（REPAIR-5・#4652）。状態ディレクトリの FS が止まると
+/// RPC が期限で戻っても処理スレッドは残るため、枠は処理スレッドが実際に終わるまで保持し、超えた要求は
+/// `UNAVAILABLE` で断る（スレッドを積み上げない）。supervisor 側の枠は 1 コンテナにつき 1 件。
+pub const MAX_CONTAINER_LOG_REOPENS: usize = 4;
+
+/// `ReopenContainerLog` の処理スレッドの枠（Drop で返す）。
+struct ReopenSlot(Arc<std::sync::atomic::AtomicUsize>);
+
+impl ReopenSlot {
+    fn acquire(counter: &Arc<std::sync::atomic::AtomicUsize>) -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        counter
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < MAX_CONTAINER_LOG_REOPENS).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| Self(Arc::clone(counter)))
+    }
+}
+
+impl Drop for ReopenSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
 
 /// 実行層（bundle 供給元・`ContainerRuntime`）の応答待ちの既定の上限（REPAIR-5）。
 ///
@@ -2010,6 +2039,7 @@ impl CriRuntimeService {
             recorder,
             runtime: None,
             log_reopener: None,
+            log_reopens_inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             runtime_timeout: DEFAULT_RUNTIME_TIMEOUT,
             exit_observe_timeout: CONTAINER_EXIT_OBSERVE_TIMEOUT,
             list_exit_observe_busy: Arc::new(AtomicBool::new(false)),
@@ -2153,11 +2183,18 @@ impl CriRuntimeService {
             }
         }
         let reopener = Arc::clone(reopener);
+        // 枠は処理スレッドへ移し、スレッドが終わるまで保持する（RPC が期限で戻っても返さない）。
+        let slot = ReopenSlot::acquire(&self.log_reopens_inflight).ok_or_else(|| {
+            CriError::unavailable("too many container log reopens are in progress")
+        })?;
         let deadline = Instant::now() + CONTAINER_LOG_REOPEN_TIMEOUT;
         // 注入口自身も deadline を守る。外側の待ちは数百 ms の余裕を足して、内側の `Timeout` を優先して返す。
         run_bounded(
             CONTAINER_LOG_REOPEN_TIMEOUT + Duration::from_millis(500),
-            move || reopener.reopen(&id, deadline),
+            move || {
+                let _slot = slot;
+                reopener.reopen(&id, deadline)
+            },
         )
         .await?
         .map_err(|e| CriError::from(&e))?;

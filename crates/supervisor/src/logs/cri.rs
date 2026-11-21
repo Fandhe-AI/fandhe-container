@@ -356,8 +356,8 @@ fn unopenable() -> TraitError {
     )
 }
 
-/// CRI ログを開く共通のオプション（追記・0o640・`O_NOFOLLOW`・`O_NONBLOCK`・`O_NOCTTY`）。
-#[cfg(unix)]
+/// CRI ログを開く共通のオプション（追記・0o640・`O_NOFOLLOW`・`O_NONBLOCK`・`O_NOCTTY`）。Linux は `sys::open_log_at` を使う。
+#[cfg(all(unix, not(target_os = "linux")))]
 fn log_open_options(create: bool) -> std::fs::OpenOptions {
     use std::os::unix::fs::OpenOptionsExt as _;
 
@@ -373,18 +373,38 @@ fn log_open_options(create: bool) -> std::fs::OpenOptions {
 /// CRI ログのファイルを、親の検査・`O_NOFOLLOW` つきで追記で開く（無ければ作る。ロックは取らない）。
 /// 親ディレクトリは検査済みの祖先の直下に作る（`open` 専用。`reopen` はこの関数を使わない。CRI-2・#4652）。
 /// 開けなければ `FailedPrecondition`。
+///
+/// Linux では、親を作った後に開き直しと同じ検査（[`open_verified_dir`]。元のパスを `O_NOFOLLOW` で辿り、祖先の所有者と
+/// 書き込み権を見る）を通し、その fd の直下でファイルを開く（名前を再解決しない）。開き直しで必ず拒否されるパス（祖先に
+/// symlink がある・祖先を他者が書き換えられる）を最初の open でも拒否し、起動はできるのに回転だけが常に失敗する構成を
+/// 作らない（#4652 の破壊的変更。docs/design/cri-config-acceptance.md）。
 #[cfg(unix)]
 fn open_log_file(path: &std::path::Path) -> Result<std::fs::File, TraitError> {
     let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
         return Err(invalid("cri log path has no file name"));
     };
     let dir = ensure_parent_dir(parent, unopenable)?;
-    // 祖先に symlink（`check_dir` が通す root 所有のものを含む）があるパスは、開き直し（`open_verified_dir` は symlink を
-    // 辿らない）で必ず失敗するため、最初の open でも拒否して挙動を揃える（実体パスが要素から組み直したパスと一致すること）。
     #[cfg(target_os = "linux")]
-    if dir != parent.components().collect::<std::path::PathBuf>() {
-        return Err(unopenable());
+    {
+        use std::os::fd::AsFd as _;
+        let _ = dir;
+        let dir = open_verified_dir(parent)?;
+        // 作る瞬間に他者が先に作る競合は、既存として 1 回だけやり直す（開き直しと同じ）。
+        for _ in 0..2 {
+            match crate::sys::open_log_at(dir.as_fd(), name, false) {
+                Ok(file) => return Ok(file),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err(unopenable()),
+            }
+            match crate::sys::open_log_at(dir.as_fd(), name, true) {
+                Ok(file) => return Ok(file),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(_) => return Err(unopenable()),
+            }
+        }
+        Err(unopenable())
     }
+    #[cfg(not(target_os = "linux"))]
     log_open_options(true)
         .open(dir.join(name))
         .map_err(|_| unopenable())
@@ -396,21 +416,16 @@ fn open_log_file(path: &std::path::Path) -> Result<std::fs::File, TraitError> {
 /// 所有者が root か自分で、other が書き込めるなら sticky、group 書き込み可は root 所有か sticky）。最後の fd はディレクトリで、所有者が root か自分で、group / other が
 /// 書き込めないこと。`check_dir` の実体パス（`canonicalize` の結果）は辿らない: 検査と `canonicalize` の間に祖先を symlink へ
 /// 差し替えられると、実体パスには差し替えた要素が現れず、fd の走査で検出できないため。元のパスの要素を `O_NOFOLLOW` で
-/// 辿るので、symlink の要素（root 所有のものも）は `ELOOP`・`ENOTDIR` で拒否する（最初の open も同じパスを拒否する。
-/// [`open_log_file`]）。祖先を名前で引き直さないため、検査と open の間に祖先を差し替えられても、差し替えた祖先は検査を通らない。
+/// 辿るので、symlink の要素（root 所有のものも）は `ELOOP`・`ENOTDIR` で拒否する（最初の open も同じ検査を通す。
+/// [`open_log_file`]）。走査の fd は `O_PATH` で開くため、祖先に読み取り権限は要らない（検索権限だけの `0711` の祖先も辿れる）。祖先を名前で引き直さないため、検査と open の間に祖先を差し替えられても、差し替えた祖先は検査を通らない。
 #[cfg(target_os = "linux")]
 fn open_verified_dir(parent: &std::path::Path) -> Result<std::fs::File, TraitError> {
     use std::os::fd::AsFd as _;
-    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use std::os::unix::fs::MetadataExt as _;
 
     super::rotating::check_dir(parent).map_err(|_| unopenable())?;
     let euid = crate::control::listener::effective_uid().map_err(|_| unopenable())?;
-    let flags = crate::sys::open_dir_nofollow_flags().map_err(|_| unopenable())?;
-    let mut dir = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(flags)
-        .open("/")
-        .map_err(|_| unopenable())?;
+    let mut dir = crate::sys::open_root_dir_path().map_err(|_| unopenable())?;
     for comp in parent.components() {
         let std::path::Component::Normal(name) = comp else {
             continue;
@@ -1935,6 +1950,59 @@ mod tests {
             assert!(!ancestor_ok(me, 0o40770, me));
             assert!(ancestor_ok(me, 0o41770, me));
             assert!(!ancestor_ok(2000, 0o40755, me));
+        }
+
+        /// CRI-2・#4652: 祖先の走査は `O_PATH` で開くので、読み取り権限の無い検索だけの祖先（ここでは所有者に `r` が無い
+        /// `0311`）でも、最初の open と開き直しの両方が通る（`O_RDONLY` で開くと `EACCES` で回転だけが失敗していた）。
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn cri2_4652_search_only_ancestor_allows_open_and_reopen() {
+            use std::os::unix::fs::PermissionsExt as _;
+            let t = Tmp::new("search-only");
+            let gate = t.0.join("gate");
+            let logs = gate.join("logs");
+            std::fs::create_dir_all(&logs).expect("mkdir");
+            std::fs::set_permissions(&logs, std::fs::Permissions::from_mode(0o750))
+                .expect("chmod logs");
+            std::fs::set_permissions(&gate, std::fs::Permissions::from_mode(0o311))
+                .expect("chmod gate");
+            let path = t.log("gate/logs/0.log");
+            let sink = CriFileSink::open(&path).expect("open through a search-only ancestor");
+            std::fs::rename(path.as_str(), logs.join("0.log.1")).expect("rename");
+            reopen_now(&sink).expect("reopen through a search-only ancestor");
+            sink.append(StreamKind::Stdout, b"new").expect("append");
+            sink.flush().expect("flush");
+            assert!(read(Path::new(path.as_str())).ends_with(" stdout F new\n"));
+            // 後始末のため戻す（Tmp の削除は読み取り権限が要る）。
+            std::fs::set_permissions(&gate, std::fs::Permissions::from_mode(0o750))
+                .expect("chmod back");
+        }
+
+        /// SEC-1・CRI-2・#4652（破壊的変更）: 最初の open も開き直しと同じ祖先の検査を通す。祖先が group / other に書き込めて
+        /// sticky でなければ `FailedPrecondition` で拒否し、ファイルを作らない。sticky なら受ける（開き直しと同じ扱い）。
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn sec1_4652_open_rejects_group_writable_non_sticky_ancestor() {
+            use std::os::unix::fs::PermissionsExt as _;
+            let t = Tmp::new("open-ancestor");
+            let gw = t.0.join("gw");
+            let logs = gw.join("logs");
+            std::fs::create_dir_all(&logs).expect("mkdir");
+            std::fs::set_permissions(&logs, std::fs::Permissions::from_mode(0o750))
+                .expect("chmod logs");
+            std::fs::set_permissions(&gw, std::fs::Permissions::from_mode(0o770))
+                .expect("chmod gw");
+            let path = t.log("gw/logs/0.log");
+            let Err(e) = CriFileSink::open(&path) else {
+                panic!("a group-writable non-sticky ancestor must be rejected");
+            };
+            assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+            assert_eq!(e.message(), "cri log file cannot be opened");
+            assert!(names(&logs).is_empty());
+            std::fs::set_permissions(&gw, std::fs::Permissions::from_mode(0o1770))
+                .expect("chmod sticky");
+            CriFileSink::open(&path).expect("sticky ancestor is accepted");
+            assert_eq!(names(&logs), ["0.log"]);
         }
 
         /// SEC-1・CRI-2・#4652: 祖先が group / other に書き込めて sticky でなければ（祖先を差し替えられる）、開き直しは

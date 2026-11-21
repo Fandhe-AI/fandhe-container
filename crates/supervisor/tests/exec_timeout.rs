@@ -332,7 +332,14 @@ mod linux {
             elapsed >= Duration::from_secs(1) && elapsed < Duration::from_secs(5),
             "elapsed {elapsed:?}"
         );
-        drop(guard);
+        // 正常経路では補助を明示的に回収し、終了状態を照合する（`Drop` は途中で失敗したときの後始末。REPAIR-12）。
+        // 書き込み端を閉じれば保持役は EOF で 0 で終わる。
+        drop(guard.hold.take());
+        let helper = guard.helper.take().expect("helper adopted");
+        let exit = helper
+            .wait_timeout(Duration::from_secs(10))
+            .expect("the helper must be reaped");
+        assert_eq!(exit, fandhe_container_core::exec::ChildExit::Exited(0));
     }
 
     /// SUP-6・REPAIR-5・TASK-163 追補（#1466）: worker を fork した後は、期限切れ・エラー返却・異常終了（panic）の

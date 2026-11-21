@@ -791,7 +791,7 @@ pub trait LogSink: Send + Sync {
         &self,
         _deadline: std::time::Instant,
         _gate: ReopenGate<'_>,
-    ) -> Result<(), TraitError> {
+    ) -> Result<RetiredWriter, TraitError> {
         Err(TraitError::new(
             fandhe_container_core::traits::ErrorCode::Unimplemented,
             "the log sink has no cri log file",
@@ -820,6 +820,28 @@ pub trait LogSink: Send + Sync {
 /// 差し替えだけで I/O をしないこと。何も確定せず判定だけ知りたいとき（待ちうる処理の前の事前確認）は `gate(&mut || {})`。
 /// ロック順は「sink の内部ロック → 呼び出し元のロック」の一方向（呼び出し元は gate の中から sink を呼ばない）。
 pub type ReopenGate<'a> = &'a dyn Fn(&mut dyn FnMut()) -> bool;
+
+/// [`LogSink::reopen`] で退役した旧 writer（CRI-2・REPAIR-5・#4652）。drop で旧 fd を閉じて旧ロックを外す。
+/// 呼び出し元（制御チャネルの `control-reopen-log` スレッド）は応答を書いた **後** に drop し、旧 fd の `close(2)` を
+/// 応答の経路から外す（確定点の後に I/O を残さない）。退役したものが無いとき（同じ inode・既定の実装）は空。
+#[derive(Default)]
+pub struct RetiredWriter(Option<Box<dyn Send>>);
+
+impl RetiredWriter {
+    /// 旧 writer を包む（drop まで閉じない）。
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn new(old: Box<dyn Send>) -> Self {
+        Self(Some(old))
+    }
+}
+
+impl std::fmt::Debug for RetiredWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("RetiredWriter")
+            .field(&self.0.is_some())
+            .finish()
+    }
+}
 
 /// 行を記録せず捨てる [`LogSink`]（SUP-7・SUP-1・REPAIR-5）。
 ///

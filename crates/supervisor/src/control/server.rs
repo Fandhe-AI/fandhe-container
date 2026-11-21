@@ -459,8 +459,13 @@ fn handle_reopen_log(
         .name("control-reopen-log".to_owned())
         .spawn(move || {
             let result = hub.reopen_log(deadline, &|f| permit.commit(f));
+            // 退役した旧 writer は応答の後に閉じる（close(2) を応答の経路に載せない。#4652）。
+            let mut retired = None;
             let reason = match result {
-                Ok(()) => ControlReason::Ok,
+                Ok(old) => {
+                    retired = Some(old);
+                    ControlReason::Ok
+                }
                 // 終了後に枠を持ったまま拒否されたときは、ファイルを残さず「稼働中でない」と答える
                 // （確定の関門が拒否した世代は戻らない。確定した場合は上の `Ok`）。
                 Err(_) if !permit.commit(&mut || {}) => ControlReason::ContainerExited,
@@ -469,6 +474,7 @@ fn handle_reopen_log(
             drop(permit);
             respond(&mut stream, reason);
             observer.record_reopen_log(reason == ControlReason::Ok, started.elapsed());
+            drop(retired);
         });
     match spawned {
         Ok(_) => None,

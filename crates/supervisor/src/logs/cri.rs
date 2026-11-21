@@ -43,7 +43,7 @@ use std::time::{Duration, Instant};
 
 use fandhe_container_core::traits::{ErrorCode, TraitError};
 
-use super::{LinePart, LogSink, MAX_LINE_BYTES, PartEnd, ReopenGate, StreamKind};
+use super::{LinePart, LogSink, MAX_LINE_BYTES, PartEnd, ReopenGate, RetiredWriter, StreamKind};
 
 /// 1 レコードに載せる内容の最大バイト数（containerd の `max_container_log_line_size` の既定値）。
 pub const CRI_LOG_CHUNK_BYTES: usize = 16 * 1024;
@@ -387,21 +387,23 @@ fn open_log_file(path: &std::path::Path) -> Result<std::fs::File, TraitError> {
 /// `reopen` 用に、親ディレクトリを検査して fd で開く（以後の open・作成・削除はこの fd の直下だけで行い、パスを再解決しない。
 /// CRI-2・SEC-1・#4652）。パスの検査（[`super::rotating::check_dir`]。絶対・`..` なし・祖先の symlink なし）の後に
 /// `O_DIRECTORY | O_NOFOLLOW` で開き、開いた fd 自体を `fstat` で確かめる（ディレクトリである・group / other 書き込み不可・
-/// 検査したパスと同じ dev / ino。検査と open の間の差し替えを拒否する）。
+/// open の **前** に `lstat` したパスと同じ dev / ino。`lstat` から open までの間の差し替えを拒否する）。
+/// 残る窓: `check_dir` の祖先の検査から `lstat` までの間に祖先を差し替えられると、`lstat` と open の両方が差し替え後を
+/// 指して一致する（祖先に書き込める主体に限る。docs/design/cri-log-partial-lines.md「ReopenContainerLog との関係」）。
 #[cfg(target_os = "linux")]
 fn open_verified_dir(parent: &std::path::Path) -> Result<std::fs::File, TraitError> {
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 
     let canonical = super::rotating::check_dir(parent).map_err(|_| unopenable())?;
     let flags = crate::sys::open_dir_nofollow_flags().map_err(|_| unopenable())?;
+    // 比べる側は open の前に取る（open の後に引き直すと、差し替え後どうしで一致してしまう）。
+    let checked = std::fs::symlink_metadata(&canonical).map_err(|_| unopenable())?;
     let dir = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(flags)
         .open(&canonical)
         .map_err(|_| unopenable())?;
-    let (Ok(opened), Ok(checked)) = (dir.metadata(), std::fs::symlink_metadata(&canonical)) else {
-        return Err(unopenable());
-    };
+    let opened = dir.metadata().map_err(|_| unopenable())?;
     if !opened.is_dir()
         || opened.mode() & 0o022 != 0
         || opened.dev() != checked.dev()
@@ -415,6 +417,9 @@ fn open_verified_dir(parent: &std::path::Path) -> Result<std::fs::File, TraitErr
 /// 自分で作った `file` が、`dir` の直下の `name` に今もあるときだけ消す（同じ dev / ino を `O_PATH | O_NOFOLLOW` で確かめてから
 /// `unlinkat`。他者が差し替えた名前・別の inode には触れない。パスを再解決しない。失敗は握りつぶす: 後始末の失敗で本来の
 /// エラーを隠さない）。
+/// 既知の制約: 照合と `unlinkat` の間（数 µs）に他者が同じ名前へ別の inode を rename すると、それを消しうる。Linux の
+/// `unlinkat(2)` には「同じ inode のときだけ消す」条件が無く（FreeBSD の `funlinkat` 相当が無い）、この窓は閉じられない
+/// （docs/design/cri-log-partial-lines.md「ReopenContainerLog との関係」）。
 #[cfg(target_os = "linux")]
 fn remove_if_same(dir: &std::fs::File, name: &std::ffi::OsStr, file: &std::fs::File) {
     use std::os::fd::AsFd as _;
@@ -607,7 +612,7 @@ impl CriFileSink {
         file: std::fs::File,
         deadline: Instant,
         gate: ReopenGate<'_>,
-    ) -> Result<(), TraitError> {
+    ) -> Result<RetiredWriter, TraitError> {
         let mut slot = Some(file);
         let result = self.prepare_and_commit_new(&mut slot, deadline, gate);
         // 確定していれば `slot` は空。残っていれば作ったまま公開された状態なので消す。
@@ -625,7 +630,7 @@ impl CriFileSink {
         slot: &mut Option<std::fs::File>,
         deadline: Instant,
         gate: ReopenGate<'_>,
-    ) -> Result<(), TraitError> {
+    ) -> Result<RetiredWriter, TraitError> {
         let Some(file) = slot.as_ref() else {
             return Err(unopenable());
         };
@@ -650,7 +655,7 @@ impl CriFileSink {
         file: std::fs::File,
         deadline: Instant,
         gate: ReopenGate<'_>,
-    ) -> Result<(), TraitError> {
+    ) -> Result<RetiredWriter, TraitError> {
         let Some(mut guard) = lock_until(&self.inner, deadline) else {
             return Err(timeout_error());
         };
@@ -670,6 +675,11 @@ impl CriFileSink {
             return self.commit_switch(&mut guard, &mut None, meta.len(), deadline, gate);
         }
         let len = lock_and_size(&file)?;
+        // 別 inode の既存ファイルはリンクが 1 本のものだけ受ける（ログディレクトリの外の inode へのハードリンクへ
+        // 書き込み先を移さない。SEC-1）。
+        if !matches!(file.metadata(), Ok(m) if std::os::unix::fs::MetadataExt::nlink(&m) == 1) {
+            return Err(unopenable());
+        }
         self.flush_old(&mut guard)?;
         #[cfg(test)]
         self.run_hook(&self.faults.before_commit);
@@ -709,7 +719,7 @@ impl CriFileSink {
         len: u64,
         deadline: Instant,
         gate: ReopenGate<'_>,
-    ) -> Result<(), TraitError> {
+    ) -> Result<RetiredWriter, TraitError> {
         let remaining = self.max_bytes.saturating_sub(len);
         let mut old = None;
         let mut expired = false;
@@ -735,10 +745,11 @@ impl CriFileSink {
                 }
             }
         });
-        // 旧 writer はここで drop され、旧 fd の flock が外れる（flush 済みで書き込みは起きない）。
-        drop(old);
+        // 旧 writer は呼び出し元が応答の後に drop し、そこで旧 fd の flock が外れる（flush 済みで書き込みは起きない）。
         match (permitted, expired) {
-            (true, false) => Ok(()),
+            (true, false) => {
+                Ok(old.map_or_else(RetiredWriter::default, |o| RetiredWriter::new(Box::new(o))))
+            }
             (true, true) => Err(timeout_error()),
             (false, _) => Err(not_permitted_error()),
         }
@@ -833,7 +844,7 @@ impl LogSink for CriFileSink {
     /// `Mutex` で直列化され、行の途中（部分行 `P` の続き）でも呼べる。`Mutex` の待ちは `deadline` まで、ファイルのロックの待ちは
     /// 最大 250ms（`LOCK_GRACE`）。ファイルの `open` 自体は期限で中断できない（呼び出し元は専用スレッドで実行すること）。
     /// Linux のみ（`openat`・`unlinkat` を使う。他の OS は `Unimplemented`）。
-    fn reopen(&self, deadline: Instant, gate: ReopenGate<'_>) -> Result<(), TraitError> {
+    fn reopen(&self, deadline: Instant, gate: ReopenGate<'_>) -> Result<RetiredWriter, TraitError> {
         #[cfg(target_os = "linux")]
         {
             use std::os::fd::AsFd as _;
@@ -1048,7 +1059,7 @@ impl LogSink for TeeLogSink {
 
     /// CRI ログ（副）だけを開き直す（`@container-logs` は従来どおり。CRI-2・#4652）。副が `Unimplemented`（CRI ログが無い）や
     /// 失敗のときはそのまま返す。失敗状態の解除は副の sink が差し替えと同じ `Mutex` の下で行う。
-    fn reopen(&self, deadline: Instant, gate: ReopenGate<'_>) -> Result<(), TraitError> {
+    fn reopen(&self, deadline: Instant, gate: ReopenGate<'_>) -> Result<RetiredWriter, TraitError> {
         self.secondary.reopen(deadline, gate)
     }
 }
@@ -1159,6 +1170,7 @@ mod tests {
     /// 5 秒の期限・常に許可で開き直す（試験の既定。期限・許可の個別の試験は直接 `reopen` を呼ぶ）。
     fn reopen_now(sink: &dyn LogSink) -> Result<(), TraitError> {
         sink.reopen(Instant::now() + Duration::from_secs(5), &allow)
+            .map(drop)
     }
 
     /// 試験の同期点の待ち上限（到達しなければ、どの点か示して失敗する。REPAIR-5）。
@@ -1251,8 +1263,8 @@ mod tests {
                 self.got.lock().expect("lock").push(line.to_vec());
                 Ok(())
             }
-            fn reopen(&self, _: Instant, _: ReopenGate<'_>) -> Result<(), TraitError> {
-                Ok(())
+            fn reopen(&self, _: Instant, _: ReopenGate<'_>) -> Result<RetiredWriter, TraitError> {
+                Ok(RetiredWriter::default())
             }
             // CRI ログの sink と同じく自分で失敗状態を持つ副（Tee は失敗を固定しない）。
             fn owns_failure_state(&self) -> bool {
@@ -1720,6 +1732,41 @@ mod tests {
             let text = read(Path::new(path.as_str()));
             assert_eq!(text.len(), 84);
             assert!(text.starts_with(&".".repeat(42)), "{text}");
+        }
+
+        /// SEC-1・CRI-2・#4652: 公開先が別の inode へのハードリンク（リンク 2 本）なら、それへ書き込み先を移さず
+        /// `FailedPrecondition` で拒否する。旧 writer は残り、リンク先の内容は変わらない。
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn sec1_4652_reopen_rejects_hard_linked_existing_file() {
+            let (t, path, rotated, sink) = rotated_sink("reopen-hardlink");
+            let outside = t.0.join("outside");
+            std::fs::write(&outside, b"keep").expect("seed");
+            std::fs::hard_link(&outside, path.as_str()).expect("link");
+            let e = sink.reopen(in_secs(5), &allow).expect_err("hard link");
+            assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+            assert_eq!(e.message(), "cri log file cannot be opened");
+            sink.append(StreamKind::Stdout, b"still")
+                .expect("old writer");
+            sink.flush().expect("flush");
+            assert_eq!(read(&rotated).lines().count(), 1);
+            assert_eq!(read(&outside), "keep");
+        }
+
+        /// CRI-2・REPAIR-5・#4652: 別 inode への切り替えの成功は、旧 writer を `RetiredWriter` として返し、呼び出し元が
+        /// drop するまで旧 fd（と flock）を閉じない（close(2) を応答の経路から外す）。drop の後は旧ファイルを開ける。
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn cri2_4652_retired_writer_keeps_old_fd_until_dropped() {
+            let (_t, _path, rotated, sink) = rotated_sink("reopen-retired");
+            let retired = sink.reopen(in_secs(5), &allow).expect("reopen");
+            let old_path = ContainerLogPath::new(rotated.display().to_string()).expect("p");
+            let Err(e) = CriFileSink::open(&old_path) else {
+                panic!("old lock must still be held");
+            };
+            assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+            drop(retired);
+            drop(CriFileSink::open(&old_path).expect("old lock released"));
         }
 
         /// CRI-2・SUP-7・#4652（C）: 確定点（関門）で稼働中でなくなっていたら（終了の割り込みを注入）、新しいファイルを

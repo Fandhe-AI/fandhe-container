@@ -129,7 +129,7 @@ impl CaptureHub {
         &self,
         deadline: std::time::Instant,
         gate: crate::logs::ReopenGate<'_>,
-    ) -> Result<(), TraitError> {
+    ) -> Result<crate::logs::RetiredWriter, TraitError> {
         self.sink.reopen(deadline, gate)
     }
 

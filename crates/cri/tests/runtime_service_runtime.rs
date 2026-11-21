@@ -3637,6 +3637,40 @@ impl ContainerLogReopener for CancelAwareReopener {
     }
 }
 
+/// REPAIR-5・#4652: 状態照会と開き直しの待ちは受付の時点で決めた 1 つの絶対期限を共有する。実行層の `state` が止まり、
+/// 照会が `grpc-timeout`（300 ms）を使い切ったら、開き直しの処理スレッドを起動せずに `DEADLINE_EXCEEDED` を返す
+/// （照会の上限 1 秒と開き直しの 5 秒を足して待たない）。
+#[tokio::test]
+async fn repair5_4652_reopen_shares_one_deadline_with_state_query() {
+    let h = harness();
+    let fake = Arc::new(FakeReopener::default());
+    let service = h.service.with_log_reopener(fake.clone());
+    let id = create_with_log(&service, "c").await;
+    start(&service, &id).await.expect("start");
+    h.runtime.hold_state.store(true, Ordering::SeqCst);
+    let mut req = Request::new(v1::ReopenContainerLogRequest {
+        container_id: id.clone(),
+    });
+    req.metadata_mut()
+        .insert("grpc-timeout", "300m".parse().unwrap());
+    let started = Instant::now();
+    let err = RuntimeService::reopen_container_log(&service, req)
+        .await
+        .expect_err("the state query used up the deadline");
+    let elapsed = started.elapsed();
+    h.runtime.hold_state.store(false, Ordering::SeqCst);
+    assert_eq!(err.code(), Code::DeadlineExceeded);
+    assert_eq!(
+        err.message(),
+        "the container log reopen did not complete within the deadline"
+    );
+    assert!(fake.calls.lock().unwrap().is_empty());
+    assert!(
+        elapsed < std::time::Duration::from_millis(900),
+        "{elapsed:?}"
+    );
+}
+
 /// CRI-2・REPAIR-5・#4652: RPC の future が破棄されたら（期限切れ・取り消し）リオープナーに取り消しの旗が届き、
 /// `grpc-timeout` が既定（5 秒）より短ければリオープナーの期限もそれに合わせる。
 #[tokio::test]

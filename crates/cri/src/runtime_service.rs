@@ -2212,8 +2212,12 @@ impl CriRuntimeService {
         }
         let id = ContainerId::new(req.container_id.clone())
             .map_err(|_| CriError::invalid_argument("container_id is invalid"))?;
-        // 期限は受付の時点から数える（自然終了の取り込みの待ちで延びない。クライアントの期限切れの後に確定しない）。
-        let received = Instant::now();
+        // 絶対期限は受付の時点で 1 つ決め、状態照会・開き直しの待ちには残り時間だけを渡す（クライアントの `grpc-timeout` が
+        // 短ければそれに合わせる。待ちを合計しても期限を超えない。期限切れの後に確定しない。REPAIR-5・#4652）。
+        let budget = client_timeout.map_or(CONTAINER_LOG_REOPEN_TIMEOUT, |t| {
+            t.min(CONTAINER_LOG_REOPEN_TIMEOUT)
+        });
+        let deadline = Instant::now() + budget;
         // 記録の検索と状態の判定を、枠を取る前に 1 回行う（枠が埋まっていても NOT_FOUND・FAILED_PRECONDITION の順序を保つ）。
         // 自然終了の取り込みの後にもう一度判定する。
         self.check_log_reopenable(&req.container_id)?;
@@ -2226,16 +2230,21 @@ impl CriRuntimeService {
         );
         // 自然終了を先に取り込む（`ContainerStatus` と同じ）。終了した supervisor の制御ソケットへ接続して
         // `UNAVAILABLE` になる代わりに、running でないことを `FAILED_PRECONDITION` で返す（#4652）。
-        self.observe_container_exit_holding(&req.container_id, Arc::clone(&slot))
+        let observe_timeout = self
+            .exit_observe_timeout
+            .min(deadline.saturating_duration_since(Instant::now()));
+        self.observe_container_exit_holding(&req.container_id, Arc::clone(&slot), observe_timeout)
             .await?;
         self.check_log_reopenable(&req.container_id)?;
+        // 照会で期限を使い切ったら、開き直しの処理スレッドを起動せずに `Timeout` を返す。
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(CriError::timeout(
+                "the container log reopen did not complete within the deadline",
+            ));
+        }
         let reopener = Arc::clone(reopener);
         // 枠は処理スレッドへ移し、スレッドが終わるまで保持する（RPC が期限で戻っても返さない）。
-        // クライアントの `grpc-timeout` が短ければそれに合わせる（期限切れの後に確定しない。#4652）。
-        let budget = client_timeout.map_or(CONTAINER_LOG_REOPEN_TIMEOUT, |t| {
-            t.min(CONTAINER_LOG_REOPEN_TIMEOUT)
-        });
-        let deadline = received + budget;
         // RPC の future が破棄されたら（期限切れ・取り消し）、切り離された worker へ旗で知らせる。
         // `run_bounded` は破棄された future の worker を切り離して動かし続けるため、旗で worker に知らせる（完了後に立っても無害）。
         let cancel = Arc::new(AtomicBool::new(false));
@@ -2243,8 +2252,8 @@ impl CriRuntimeService {
             cancel: Arc::clone(&cancel),
             armed: true,
         };
-        // 注入口自身も deadline を守る。外側の待ちは数百 ms の余裕を足して、内側の `Timeout` を優先して返す。
-        run_bounded(budget + Duration::from_millis(500), move || {
+        // 注入口自身も deadline を守る。外側の待ちは残り時間に数百 ms の余裕を足して、内側の `Timeout` を優先して返す。
+        run_bounded(remaining + Duration::from_millis(500), move || {
             let _slot = slot;
             reopener.reopen(&id, deadline, &cancel)
         })
@@ -4409,16 +4418,19 @@ impl CriRuntimeService {
     /// ID・パス・実行層の文言は記録しない（REPAIR-4）。候補の判定は [`exit_observe_candidate`] を `ListContainers`
     /// （E2・#4175）と共有する。
     async fn observe_container_exit(&self, container_id: &str) -> Result<(), CriError> {
-        self.observe_container_exit_holding(container_id, ()).await
+        self.observe_container_exit_holding(container_id, (), self.exit_observe_timeout)
+            .await
     }
 
     /// [`Self::observe_container_exit`] と同じだが、`hold` を状態照会の処理スレッドへ移し、照会が実際に終わるまで保持する
     /// （`ReopenContainerLog` が同時実行の枠を照会の間も持つため。期限で待ちが戻っても、止まったスレッドが枠の外で増えない。
-    /// REPAIR-5・#4652）。照会しない場合（候補でない・実行層が無い）は、戻る時点で `hold` を手放す。
+    /// REPAIR-5・#4652）。照会しない場合（候補でない・実行層が無い）は、戻る時点で `hold` を手放す。待ちの上限は `timeout`
+    /// （呼び出し元の残り時間に合わせて渡す）。
     async fn observe_container_exit_holding<H: Send + 'static>(
         &self,
         container_id: &str,
         hold: H,
+        timeout: Duration,
     ) -> Result<(), CriError> {
         let mark = {
             let mut registry = self
@@ -4445,7 +4457,7 @@ impl CriRuntimeService {
         let adapter = binding.adapter.clone();
         let id = container_id.to_owned();
         let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::ContainerExitObserve);
-        let outcome = run_bounded(self.exit_observe_timeout, move || {
+        let outcome = run_bounded(timeout, move || {
             let _hold = hold;
             let result = adapter.state(&id);
             let brief = result.as_ref().map(|_| ()).map_err(Clone::clone);

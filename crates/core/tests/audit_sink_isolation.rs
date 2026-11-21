@@ -623,7 +623,12 @@ mod imp {
         // 回収にも期限を設ける（SIGKILL が届かない D 状態などで止まらない。REPAIR-5）。グループの停止に失敗しても
         // 直接の子の回収は試み、停止の失敗は `Err` で返す（プローブが残りうるのに成功にしない）。
         let stop_and_reap = |child: &mut std::process::Child| {
-            let killed = super::reap::kill_group(pid, true);
+            // 未回収（子が pid を保持している）としてグループを止める。外部の `kill` を起動できない（親側でも
+            // プロセス枠が尽きた等）ときは、追加のプロセスが要らない `Child::kill` で直接の子だけは止める。
+            let killed = super::reap::kill_group(pid, false);
+            if killed.is_err() {
+                let _ = child.kill();
+            }
             let reaped = super::reap::wait_within(child, super::reap::reap_within());
             match (killed, reaped) {
                 (Ok(()), Ok(st)) => Ok(st),
@@ -738,7 +743,7 @@ mod imp {
         }
         assert_eq!(
             stdout.trim_end(),
-            "fork_again child: primary=[IsolationForkAgain] code=Internal message=audit record could not be persisted by primary or fallback path (primary: isolation_fork_again)"
+            "fork_again child: primary=[IsolationForkAgain] code=Internal message=audit record could not be persisted by primary or fallback path (primary: isolation_fork_again) detail=IsolationForkAgain"
         );
         println!("audit_sink_isolation: fork_again reaches the fallback as isolation_fork_again");
     }
@@ -784,11 +789,15 @@ mod imp {
         let (sink, seen) = sink(primary, false, Notify::Discard, marker.clone());
         let e = sink.record(&record()).unwrap_err();
         assert!(!marker.exists(), "the primary must not run");
+        let seen_once = seen.lock().unwrap().clone();
+        // 構造化した戻り値でも主経路の種別を読める（文言を解析しない。REPAIR-2）。
+        let detailed = sink.record_detailed(&record()).unwrap_err();
         println!(
-            "fork_again child: primary={:?} code={:?} message={}",
-            *seen.lock().unwrap(),
+            "fork_again child: primary={:?} code={:?} message={} detail={:?}",
+            seen_once,
             e.code(),
-            e.message()
+            e.message(),
+            detailed.primary().kind()
         );
     }
 

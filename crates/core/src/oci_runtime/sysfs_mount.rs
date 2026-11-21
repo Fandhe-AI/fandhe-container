@@ -12,8 +12,11 @@
 //!
 //! # 種類の判定の共有
 //!
-//! `OciMountKind::of` が `mounts[]` の 1 件を bind／sysfs／その他に分類する。bind の判定（`type == "bind"`、
-//! または options に `bind` / `rbind`）を優先し、それ以外で `type == "sysfs"` のものを sysfs とする。
+//! `OciMountKind::of` が `mounts[]` の 1 件を bind／sysfs／暗黙の供給済み／その他に分類する。bind の判定（`type == "bind"`、
+//! または options に `bind` / `rbind`）を優先し、それ以外で `type == "sysfs"` のものを sysfs とする。type と宛先が暗黙の
+//! 固定集合（`/proc` の proc・`/dev` の tmpfs・`/dev/pts` の devpts・`/dev/shm` の tmpfs）に一致するものを暗黙の供給済みとする
+//! （#2347 の A-2・#4713。`/dev/mqueue`・`/sys/fs/cgroup` は供給していないため入れない）。暗黙の供給済みの受理・読み飛ばしは
+//! 後続（#4714〜#4717）で、今は分類だけで挙動は変えない（その他と同じく拒否される）。
 //! `BindMountSet` は sysfs を飛ばし（位置は保つ）、Landlock のルール生成も同じ分類で `/sys` の sysfs を
 //! 扱う。分類を変えるときは両者と照合試験を更新する。
 //!
@@ -43,6 +46,7 @@ use std::fmt;
 
 use super::config::OciMount;
 use crate::audit_log::{AuditSink, AuditedRejection, record_mount_rejection};
+use crate::dev_mounts::ImplicitDevMount;
 use crate::traits::{ContainerId, ErrorCode};
 
 /// sysfs を置ける唯一の宛先。
@@ -55,8 +59,35 @@ pub(crate) enum OciMountKind {
     Bind,
     /// sysfs（bind ではなく `type == "sysfs"`）。
     Sysfs,
+    /// 暗黙に供給する既定のマウントの候補と type・宛先が一致するもの（[`implicit_supplied`]。bind でも sysfs でもない）。
+    /// 個々の項目だけを見た分類で、その起動で実際に供給されるかは表さない（`--ipc=host` や `/dev/shm` の bind の指定が
+    /// あると既定の `/dev/shm` の tmpfs は載らない）。後続の受理の処理は、この分類だけで読み飛ばさず、起動時の供給の条件を
+    /// 別に確かめる（#4716）。受理の可否は後続の許可表（#4714）で決め、今は [`Self::Other`] と同じく拒否される
+    /// （#4713・#2347 の A-2・OCI-4・TASK-29 追補・MS-2）。
+    ImplicitSupplied,
     /// 上記以外（実行層は未対応）。
     Other,
+}
+
+/// 暗黙に供給する既定のマウントの候補か（正規化した宛先と type の組。#2347 の A-2・#4713・OCI-4・TASK-29 追補・MS-2）。
+/// `/dev` 系の宛先は供給側の定義（[`ImplicitDevMount::destination`]）をそのまま使い、二重に持たない。`/proc` は
+/// `exec::mount_proc` が載せる。`/dev/mqueue`・`/sys/fs/cgroup` は供給していないため含めない。
+fn implicit_supplied(destination: &str, fs_type: &str) -> bool {
+    if destination == "/proc" {
+        return fs_type == "proc";
+    }
+    ImplicitDevMount::ALL
+        .iter()
+        .any(|m| m.destination() == destination && implicit_dev_fs_type(*m) == fs_type)
+}
+
+/// 暗黙の `/dev` 系のマウントの OCI の type（`dev_mounts.rs` の供給の方式と対応する）。同じ crate の中の網羅的な
+/// `match` なので、供給側に項目が増えるとここがコンパイルで止まり、type の決め忘れを防ぐ。
+fn implicit_dev_fs_type(m: ImplicitDevMount) -> &'static str {
+    match m {
+        ImplicitDevMount::Dev | ImplicitDevMount::DevShm => "tmpfs",
+        ImplicitDevMount::DevPts => "devpts",
+    }
 }
 
 impl OciMountKind {
@@ -67,6 +98,11 @@ impl OciMountKind {
             Self::Bind
         } else if m.fs_type() == Some("sysfs") {
             Self::Sysfs
+        } else if m
+            .fs_type()
+            .is_some_and(|t| !t.is_empty() && implicit_supplied(m.mount_destination().as_str(), t))
+        {
+            Self::ImplicitSupplied
         } else {
             Self::Other
         }
@@ -388,6 +424,30 @@ mod tests {
                 .map(|s| s.index()),
             Some(0)
         );
+    }
+
+    /// OCI-4・#4713: type と宛先が暗黙の固定集合に一致する項目は暗黙の供給済み。宛先は正規化してから比べる（末尾の `/`・
+    /// `.` の要素）。`/dev/mqueue`・`/sys/fs/cgroup`・宛先違いの tmpfs・type 違い・type なしはその他。bind が優先される。
+    #[test]
+    fn oci4_4713_implicit_supplied_kind() {
+        let c = cfg(json!([
+            {"destination": "/proc", "type": "proc", "source": "proc"},
+            {"destination": "/dev", "type": "tmpfs", "source": "tmpfs"},
+            {"destination": "/dev/pts", "type": "devpts", "source": "devpts"},
+            {"destination": "/dev/shm", "type": "tmpfs", "source": "shm"},
+            {"destination": "/dev/shm/", "type": "tmpfs"},
+            {"destination": "/dev/./pts", "type": "devpts"},
+            {"destination": "/dev/mqueue", "type": "mqueue", "source": "mqueue"},
+            {"destination": "/sys/fs/cgroup", "type": "cgroup", "source": "cgroup"},
+            {"destination": "/tmp", "type": "tmpfs"},
+            {"destination": "/dev/shm", "type": "devpts"},
+            {"destination": "/proc"},
+            {"destination": "/dev/shm", "type": "tmpfs", "options": ["bind"], "source": "/d"},
+        ]));
+        let kinds: Vec<_> = c.mounts().iter().map(OciMountKind::of).collect();
+        let i = OciMountKind::ImplicitSupplied;
+        let o = OciMountKind::Other;
+        assert_eq!(kinds, [i, i, i, i, i, i, o, o, o, o, o, OciMountKind::Bind]);
     }
 
     /// ERR-1: メッセージは位置と固定英文のみで、入力値を含まない。

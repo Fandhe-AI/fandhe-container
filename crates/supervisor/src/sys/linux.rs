@@ -222,13 +222,29 @@ pub(crate) fn open_path_at(
     openat_file(dir, name, O_PATH | nofollow | O_CLOEXEC, 0)
 }
 
-/// `dir` の直下のディレクトリを、辿らず（`O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`）開く。パスを 1 要素ずつ
-/// fd 相対で辿り、祖先の差し替えを受けない用途（CRI-2・SEC-1・#4652）。新しい `unsafe` は足さない（[`openat_file`]）。
+/// `dir` の直下のディレクトリを、辿らず（`O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`）開く。パスを 1 要素ずつ
+/// fd 相対で辿り、祖先の差し替えを受けない用途（CRI-2・SEC-1・#4652）。`O_PATH` なので祖先に読み取り権限は要らず、
+/// 検索権限（`x`）だけの祖先（`0711` など）も辿れる。得た fd は `fstat` と `*at` の起点（`openat`・`renameat2`・`unlinkat`）
+/// にだけ使い、読み書きはしない。新しい `unsafe` は足さない（[`openat_file`]）。
 pub(crate) fn open_dir_at(
     dir: BorrowedFd<'_>,
     name: &std::ffi::OsStr,
 ) -> io::Result<std::fs::File> {
-    openat_file(dir, name, open_dir_nofollow_flags()? | O_CLOEXEC, 0)
+    openat_file(
+        dir,
+        name,
+        open_dir_nofollow_flags()? | O_PATH | O_CLOEXEC,
+        0,
+    )
+}
+
+/// [`open_dir_at`] の走査の起点の `/` を同じフラグ（`O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`）で開く（CRI-2・#4652）。
+pub(crate) fn open_root_dir_path() -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(open_dir_nofollow_flags()? | O_PATH)
+        .open("/")
 }
 
 /// `dir` の直下の名前を消す（`unlinkat(2)`。ディレクトリは消さない）。

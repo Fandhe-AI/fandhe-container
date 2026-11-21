@@ -72,7 +72,7 @@ OCI `config.json` の `mounts[]` のうち、bind と `/sys` の sysfs 以外の
 - `ToRootless()` は `/sys` の置き換えのほか、全項目の options から `gid=`・`uid=` で始まるものを除く（`/dev/pts` の `gid=5` が消える）。rootless の config では `/dev/pts` の `gid=` が無いことがありうる
 - `/proc` は runc が options なし、moby が `nosuid,noexec,nodev`。`mount_proc` の属性との照合では、どちらも緩める方向でないことを確かめる必要がある
 - `/dev/shm` は moby の既定 spec に `size=` が無い。moby がコンテナの作成時に `/dev/shm` をどう置き換えるか（`size=` の付与・ipc モードごとの bind）は、本書の時点で未確認（`defaults.go` の外の処理）。`size=` が無い `/dev/shm` を受けるかは #4715 で決める
-- `/sys/fs/cgroup` の options は runc に `relatime` があり moby に無い（どちらも拒否のまま。#4713）
+- `/sys/fs/cgroup` の options は runc に `relatime` があり moby に無い（どちらも拒否のまま。本書の「標準の既定 config との突き合わせ」の表と A の方針）
 - runtime-spec は type だけを SHOULD として挙げ、options は規定しない。`/dev`・`/dev/mqueue`・`/sys/fs/cgroup` は表に無い
 
 ライセンスと NOTICE（同じ commit で確かめた事実だけ。判断は書かない）:

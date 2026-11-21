@@ -1114,22 +1114,24 @@ impl AuditSink for FileAuditSink {
     /// 回収待ちが期限を超える子は待たずに追跡へ回す(未回収として数え、後続の呼び出しで回収する)。
     /// 戻りは期限 + ポーリング間隔・スケジューリングの端数以内(代替経路の送信 `send` は非ブロッキング前提)。
     fn record_until(&self, record: &AuditRecord, deadline: Instant) -> Result<(), TraitError> {
-        let timed_out = || {
-            TraitError::new(
+        // 主経路の失敗が判明した後の期限切れでも、種別は `Timeout` の message に残す(SEC-4・REPAIR-4)。
+        let timed_out = |primary: Option<AuditWriteErrorKind>| {
+            with_primary_kind(
                 crate::traits::ErrorCode::Timeout,
                 "the audit record was not delivered within the deadline",
+                primary,
             )
         };
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(timed_out());
+            return Err(timed_out(None));
         }
         let primary = match self.write_primary_capped(record, Some(remaining), Some(deadline)) {
             Ok(()) => return Ok(()),
             Err(primary) => primary,
         };
         if Instant::now() >= deadline {
-            return Err(timed_out());
+            return Err(timed_out(Some(primary.kind())));
         }
         let mut fallback = (self.fallback)();
         let failure = match fallback.record_fallback_until(record, &primary, deadline) {
@@ -1139,7 +1141,7 @@ impl AuditSink for FileAuditSink {
         // 代替経路の待ちで期限が尽きていれば、通知は開始せず Timeout を返す(通知は欠ける)。
         (self.notify)(&failure, Some(deadline));
         if Instant::now() >= deadline {
-            return Err(timed_out());
+            return Err(timed_out(Some(failure.primary().kind())));
         }
         Err(both_failed_error(&failure))
     }
@@ -1159,17 +1161,26 @@ fn sys_io_error(e: sys::SysError) -> std::io::Error {
 /// まま変えない（文言に依存する呼び出し元との互換。#4702・SEC-4・REPAIR-4）。機械で判別する呼び出し元は
 /// [`FileAuditSink::record_detailed`] の構造化した値を使う。
 fn both_failed_error(failure: &AuditWriteFailure) -> TraitError {
-    if failure.primary().kind() == AuditWriteErrorKind::IsolationForkAgain {
-        return TraitError::new(
-            failure.error_code(),
-            format!(
-                "{} (primary: {})",
-                failure.message(),
-                AuditWriteErrorKind::IsolationForkAgain.as_str()
-            ),
-        );
+    with_primary_kind(
+        failure.error_code(),
+        failure.message(),
+        Some(failure.primary().kind()),
+    )
+}
+
+/// 主経路の失敗種別が `isolation_fork_again` のときだけ `message` の末尾に `(primary: isolation_fork_again)` を
+/// 足す(SEC-4・REPAIR-4・#4702)。期限切れの `Timeout` と監査リレーの失敗応答(`control_relay`)も通る。
+pub(crate) fn with_primary_kind(
+    code: crate::traits::ErrorCode,
+    message: &str,
+    primary: Option<AuditWriteErrorKind>,
+) -> TraitError {
+    match primary {
+        Some(kind @ AuditWriteErrorKind::IsolationForkAgain) => {
+            TraitError::new(code, format!("{message} (primary: {})", kind.as_str()))
+        }
+        _ => TraitError::new(code, message),
     }
-    TraitError::new(failure.error_code(), failure.message())
 }
 #[cfg(test)]
 mod tests {
@@ -1475,6 +1486,26 @@ mod tests {
             took.saturating_sub(budget)
         );
         drop(hold_tx);
+    }
+
+    /// SEC-4・REPAIR-4・#4702: 期限切れの `Timeout` も、主経路が fork の `EAGAIN` なら message に種別を残す。
+    /// 主経路の失敗前(`None`)と他の種別は従来の message のまま。
+    #[test]
+    fn sec4_4702_timeout_keeps_fork_again_kind() {
+        let m = "the audit record was not delivered within the deadline";
+        let got = |kind| {
+            let e = with_primary_kind(ErrorCode::Timeout, m, kind);
+            format!("{:?}:{}", e.code(), e.message())
+        };
+        assert_eq!(
+            got(Some(AuditWriteErrorKind::IsolationForkAgain)),
+            format!("Timeout:{m} (primary: isolation_fork_again)")
+        );
+        assert_eq!(
+            got(Some(AuditWriteErrorKind::IsolationUnavailable)),
+            format!("Timeout:{m}")
+        );
+        assert_eq!(got(None), format!("Timeout:{m}"));
     }
 
     /// 期限を見ずに待つ代替経路(既定の `record_fallback_until` は委譲のみ)を、期限切れ後は呼ばない。

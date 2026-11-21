@@ -982,11 +982,12 @@ impl FileAuditSink {
     }
 
     /// 結合試験専用: 自プロセスの `RLIMIT_NPROC`（soft・hard とも）を `max` に下げる（実 fork の `EAGAIN` の再現用。
-    /// `prlimit` コマンドに頼らない。#4702・SEC-4）。成功なら `true`。戻せないため再起動した子でだけ呼ぶ。
+    /// `prlimit` コマンドに頼らない。#4702・SEC-4）。戻せないため再起動した子でだけ呼ぶ。失敗の原因は errno か
+    /// `Unsupported` の [`std::io::Error`] で返す（文字列に畳まない。REPAIR-2）。
     #[cfg(all(target_os = "linux", feature = "exec-test-support"))]
     #[doc(hidden)]
-    pub fn limit_processes_for_test(max: u64) -> bool {
-        sys::set_rlimit_self(crate::rlimits::RlimitKind::Nproc, max, max).is_ok()
+    pub fn limit_processes_for_test(max: u64) -> std::io::Result<()> {
+        sys::set_rlimit_self(crate::rlimits::RlimitKind::Nproc, max, max).map_err(sys_io_error)
     }
 
     /// 結合試験専用: 未回収の自分の子 `pgid`（グループのリーダー）のプロセスグループへ SIGKILL を送る。外部の `kill` を
@@ -994,10 +995,11 @@ impl FileAuditSink {
     /// 呼び出し側は `pgid` が未回収の自分の子であることを保証する（回収後は番号が再利用されうる）。誰も居なければ `Ok`。
     #[cfg(all(target_os = "linux", feature = "exec-test-support"))]
     #[doc(hidden)]
-    pub fn kill_process_group_for_test(pgid: u32) -> Result<(), String> {
+    /// 失敗の原因は errno か `Unsupported` の [`std::io::Error`] で返す（文字列に畳まない。REPAIR-2）。
+    pub fn kill_process_group_for_test(pgid: u32) -> std::io::Result<()> {
         match sys::kill_process_group(pgid, sys::Signal::Kill) {
             Ok(()) | Err(sys::SysError::Os(sys::ESRCH)) => Ok(()),
-            Err(e) => Err(format!("kill process group {pgid} failed: {e:?}")),
+            Err(e) => Err(sys_io_error(e)),
         }
     }
 
@@ -1150,6 +1152,15 @@ impl AuditSink for FileAuditSink {
             return Err(timed_out());
         }
         Err(both_failed_error(&failure))
+    }
+}
+
+/// 試験用の入口の `SysError` を型つきの [`std::io::Error`] へ写す（errno はそのまま、それ以外は `Unsupported`）。
+#[cfg(all(target_os = "linux", feature = "exec-test-support"))]
+fn sys_io_error(e: sys::SysError) -> std::io::Error {
+    match e {
+        sys::SysError::Os(errno) => std::io::Error::from_raw_os_error(errno),
+        _ => std::io::Error::from(std::io::ErrorKind::Unsupported),
     }
 }
 

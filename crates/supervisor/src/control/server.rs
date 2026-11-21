@@ -421,7 +421,7 @@ fn handle_exec_handover(
 /// 受理したら接続ごと専用スレッドへ渡して `None` を返す（accept ループはログのファイルシステムの停止に巻き込まれない。
 /// スレッドは応答と計測まで行い、枠を空けて終わる。止まったファイルシステムの上の `open` は中断できないため、スレッドは
 /// 復旧まで残りうるが、枠が 1 つなので増えない）。cri-api の契約は「稼働中でなければ、新しいファイルを作って nil を返すか、
-/// エラーを返す（エラーを返すときだけ作ってはならない）」。ファイルを公開する直前に、期限と世代がまだ稼働中であることを
+/// エラーを返す（エラーを返すときだけ作ってはならない）」。ファイルを確定する時点（スロットのロックの下）で、期限と世代がまだ稼働中であることを
 /// sink が再確認し（[`crate::logs::LogSink::reopen`]）、終了遷移は実行中の開き直しを有限時間待つ（[`SignalSlot::begin_reopen`]）。
 /// 期限を過ぎた要求は何も作らず何も差し替えない。sink の失敗は理由コードへ写し（文言は反射しない）、既存の書き込み先は変わらない。
 fn handle_reopen_log(
@@ -458,11 +458,12 @@ fn handle_reopen_log(
     let spawned = std::thread::Builder::new()
         .name("control-reopen-log".to_owned())
         .spawn(move || {
-            let result = hub.reopen_log(deadline, &|| permit.still_allowed());
+            let result = hub.reopen_log(deadline, &|f| permit.commit(f));
             let reason = match result {
                 Ok(()) => ControlReason::Ok,
-                // 終了後に枠を持ったまま拒否されたときは、ファイルを作っておらず「稼働中でない」と答える。
-                Err(_) if !permit.still_allowed() => ControlReason::ContainerExited,
+                // 終了後に枠を持ったまま拒否されたときは、ファイルを残さず「稼働中でない」と答える
+                // （確定の関門が拒否した世代は戻らない。確定した場合は上の `Ok`）。
+                Err(_) if !permit.commit(&mut || {}) => ControlReason::ContainerExited,
                 Err(e) => reopen_failure(e.code()),
             };
             drop(permit);

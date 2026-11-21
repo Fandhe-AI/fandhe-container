@@ -250,7 +250,7 @@ fn cri2_4582_size_limit_unchanged_for_parts() {
     assert_eq!(primary_lines(&r.mem), vec![body(K), b"next".to_vec()]);
 }
 
-/// 副が行の途中で失敗しても主は記録を続ける（副は常に委譲される。失敗状態の保持は副の sink 自身の責務）。
+/// 副が行の途中で失敗しても主は記録を続け、副は以後呼ばれない。
 #[test]
 fn cri2_4582_tee_cri_failure_mid_line_keeps_primary() {
     #[derive(Default)]
@@ -270,7 +270,7 @@ fn cri2_4582_tee_cri_failure_mid_line_keeps_primary() {
     let mut input = with_lf(body(K + 1));
     input.extend_from_slice(b"next\n");
     run(input, &tee);
-    assert_eq!(*fail.0.lock().unwrap(), 3);
+    assert_eq!(*fail.0.lock().unwrap(), 1);
     assert_eq!(primary_lines(&mem), vec![body(K), b"next".to_vec()]);
 }
 

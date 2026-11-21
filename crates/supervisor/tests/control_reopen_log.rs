@@ -27,7 +27,7 @@ use fandhe_container_supervisor::control::server::{ControlServer, ServeConfig};
 use fandhe_container_supervisor::control::target::{ControlledProcess, SignalSlot};
 use fandhe_container_supervisor::log_pipeline::CaptureHub;
 use fandhe_container_supervisor::logs::cri::{CriFileSink, TeeLogSink};
-use fandhe_container_supervisor::logs::{LogSink, MemoryLogSink, StreamKind};
+use fandhe_container_supervisor::logs::{LogSink, MemoryLogSink, ReopenGate, StreamKind};
 
 struct Fake;
 
@@ -356,10 +356,14 @@ impl LogSink for StalledSink {
     fn append(&self, _: StreamKind, _: &[u8]) -> Result<(), TraitError> {
         Ok(())
     }
-    fn reopen(&self, deadline: Instant, proceed: &dyn Fn() -> bool) -> Result<(), TraitError> {
+    fn reopen(&self, deadline: Instant, gate: ReopenGate<'_>) -> Result<(), TraitError> {
         self.entered.lock().unwrap().send(()).unwrap();
-        self.release.lock().unwrap().recv().unwrap();
-        *self.seen.lock().unwrap() = Some((Instant::now() >= deadline, proceed()));
+        self.release
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .expect("sync point not reached: release signal for the stalled reopen");
+        *self.seen.lock().unwrap() = Some((Instant::now() >= deadline, gate(&mut || {})));
         Ok(())
     }
 }

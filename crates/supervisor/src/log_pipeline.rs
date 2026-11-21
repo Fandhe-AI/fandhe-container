@@ -128,9 +128,9 @@ impl CaptureHub {
     pub fn reopen_log(
         &self,
         deadline: std::time::Instant,
-        proceed: &dyn Fn() -> bool,
+        gate: crate::logs::ReopenGate<'_>,
     ) -> Result<(), TraitError> {
-        self.sink.reopen(deadline, proceed)
+        self.sink.reopen(deadline, gate)
     }
 
     /// 今の捕捉の tap の計数。捕捉が無ければ `None`。

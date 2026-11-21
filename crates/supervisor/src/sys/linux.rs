@@ -138,6 +138,86 @@ unsafe extern "C" {
         value: *mut std::ffi::c_void,
         size: usize,
     ) -> isize;
+    // SAFETY（宣言そのものの妥当性）: `int openat(int dirfd, const char *pathname, int flags, ...)`。可変長部は
+    // `mode_t`（u32）1 個だけを渡す。CRI ログの開き直しが、検証済みの親ディレクトリ fd の直下を開くためだけに使う
+    // （`open_log_at`・`open_path_at`。#4652）。`libc` との照合は `libc_abi`（#1840）。
+    fn openat(dirfd: i32, pathname: *const std::ffi::c_char, flags: i32, ...) -> i32;
+    // SAFETY（宣言そのものの妥当性）: `int unlinkat(int dirfd, const char *pathname, int flags)`。整数とポインタ引数のみ。
+    // 同上（`unlink_at`）。
+    fn unlinkat(dirfd: i32, pathname: *const std::ffi::c_char, flags: i32) -> i32;
+}
+
+/// `openat(2)` のフラグ（include/uapi/asm-generic/fcntl.h。x86_64・aarch64 で共通。arch で値が違う `O_NOFOLLOW`・`O_DIRECTORY` は
+/// `arch`）。`libc_abi`（#1840）が `libc` と照合する。
+const O_WRONLY: i32 = 0o1;
+const O_CREAT: i32 = 0o100;
+const O_EXCL: i32 = 0o200;
+const O_NOCTTY: i32 = 0o400;
+const O_APPEND: i32 = 0o2000;
+const O_CLOEXEC: i32 = 0o2000000;
+const O_PATH: i32 = 0o10000000;
+/// CRI ログを新規に作るときの権限（umask で更に落ちる）。
+const LOG_CREATE_MODE: u32 = 0o640;
+
+/// `dir` の直下の 1 要素の名前を NUL 終端へ直す（`/`・NUL・`.`・`..`・空は `InvalidInput`。親の再解決を許さない）。
+fn single_component(name: &std::ffi::OsStr) -> io::Result<CString> {
+    let b = name.as_bytes();
+    if b.is_empty() || b == b"." || b == b".." || b.contains(&b'/') {
+        return Err(io::Error::from(io::ErrorKind::InvalidInput));
+    }
+    CString::new(b).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
+}
+
+/// `openat` の結果を `File` にする。
+fn openat_file(
+    dir: BorrowedFd<'_>,
+    name: &std::ffi::OsStr,
+    flags: i32,
+    mode: u32,
+) -> io::Result<std::fs::File> {
+    use std::os::fd::{FromRawFd as _, OwnedFd};
+    let name = single_component(name)?;
+    // SAFETY: `dir` は呼び出しの間有効な fd、`name` は NUL 終端で呼び出しの間生きる。可変長部は u32 1 個。
+    // 失敗（-1）のときは fd を作らず `last_os_error` を返す。
+    let fd = unsafe { openat(dir.as_raw_fd(), name.as_ptr(), flags, mode) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `openat` が成功して返した、他に所有者のいない新しい fd。ここで唯一の所有者になる。
+    Ok(std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
+}
+
+/// 検証済みの親ディレクトリ `dir` の直下の CRI ログを追記で開く（`O_WRONLY | O_APPEND | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY |
+/// O_CLOEXEC`）。`create_excl` が真なら `O_CREAT | O_EXCL`（0o640）で新規に作る（既にあれば `AlreadyExists`。他者のファイルを開かない）。
+/// パスを再解決しない（CRI-2・SEC-1・#4652）。対応外の arch では `Unsupported`。
+pub(crate) fn open_log_at(
+    dir: BorrowedFd<'_>,
+    name: &std::ffi::OsStr,
+    create_excl: bool,
+) -> io::Result<std::fs::File> {
+    let nofollow = arch::O_NOFOLLOW.ok_or_else(unsupported)?;
+    let mut flags = O_WRONLY | O_APPEND | nofollow | O_NONBLOCK | O_NOCTTY | O_CLOEXEC;
+    if create_excl {
+        flags |= O_CREAT | O_EXCL;
+    }
+    openat_file(dir, name, flags, LOG_CREATE_MODE)
+}
+
+/// `dir` の直下の名前を、辿らず（`O_PATH | O_NOFOLLOW`）同一性の照合だけのために開く（読み書きはできない。`fstat` は使える）。
+pub(crate) fn open_path_at(
+    dir: BorrowedFd<'_>,
+    name: &std::ffi::OsStr,
+) -> io::Result<std::fs::File> {
+    let nofollow = arch::O_NOFOLLOW.ok_or_else(unsupported)?;
+    openat_file(dir, name, O_PATH | nofollow | O_CLOEXEC, 0)
+}
+
+/// `dir` の直下の名前を消す（`unlinkat(2)`。ディレクトリは消さない）。
+pub(crate) fn unlink_at(dir: BorrowedFd<'_>, name: &std::ffi::OsStr) -> io::Result<()> {
+    let name = single_component(name)?;
+    // SAFETY: `dir` は呼び出しの間有効な fd、`name` は NUL 終端で呼び出しの間生きる。影響は `dir` 直下の 1 エントリの削除だけ。
+    let rc = unsafe { unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) };
+    check(i64::from(rc)).map(|_| ())
 }
 
 /// `struct ucred`（`SO_PEERCRED` の結果。include/uapi/asm-generic/socket.h・`<sys/socket.h>`）。
@@ -1545,6 +1625,14 @@ mod libc_abi {
         assert!(F_GETFL == libc::F_GETFL);
         assert!(F_SETFL == libc::F_SETFL);
         assert!(O_NONBLOCK == libc::O_NONBLOCK);
+        // openat（open_log_at・open_path_at）。
+        assert!(O_WRONLY == libc::O_WRONLY);
+        assert!(O_CREAT == libc::O_CREAT);
+        assert!(O_EXCL == libc::O_EXCL);
+        assert!(O_NOCTTY == libc::O_NOCTTY);
+        assert!(O_APPEND == libc::O_APPEND);
+        assert!(O_CLOEXEC == libc::O_CLOEXEC);
+        assert!(O_PATH == libc::O_PATH);
         // 関数内のローカル定数・リテラルの errno / シグナル（項目として参照できないため libc の値を固定する）。
         assert!(libc::SIGKILL == 9); // kill_process_group
         assert!(libc::EINVAL == 22); // check_cap_number ほか
@@ -1612,6 +1700,22 @@ mod libc_abi {
         *mut libc::c_void,
         libc::size_t,
     ) -> libc::ssize_t = libc::lgetxattr;
+    const _: unsafe extern "C" fn(
+        libc::c_int,
+        *const libc::c_char,
+        libc::c_int,
+        ...
+    ) -> libc::c_int = openat;
+    const _: unsafe extern "C" fn(
+        libc::c_int,
+        *const libc::c_char,
+        libc::c_int,
+        ...
+    ) -> libc::c_int = libc::openat;
+    const _: unsafe extern "C" fn(libc::c_int, *const libc::c_char, libc::c_int) -> libc::c_int =
+        unlinkat;
+    const _: unsafe extern "C" fn(libc::c_int, *const libc::c_char, libc::c_int) -> libc::c_int =
+        libc::unlinkat;
     // 試験 repair5_connect_unix_nonblocking_returns_wouldblock_when_backlog_is_full の関数内宣言 `listen` は
     // 項目として参照できないため、試験に書いた型 `unsafe extern "C" fn(i32, i32) -> i32` へ libc を代入して照合する。
     const _: unsafe extern "C" fn(i32, i32) -> i32 = libc::listen;

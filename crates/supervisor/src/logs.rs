@@ -783,19 +783,27 @@ pub trait LogSink: Send + Sync {
     /// CRI ログのファイルを同じパスで開き直す（`ReopenContainerLog`。CRI-2・SUP-7・REPAIR-5・#4652）。
     ///
     /// 既定は `Unimplemented`（CRI ログのファイルを持たない sink。制御チャネルは「CRI ログのパスが無い」として拒否する）。
-    /// CRI ログの sink は、先に新しいファイルを用意してから差し替え、失敗したら状態を変えずに `Err` を返す。
-    /// `deadline`（絶対期限）まで待ってよいのは書き込みとの直列化（ロック）だけで、超えたら `Timeout` で返す。
-    /// 新しいファイルが公開される直前と差し替えの直前に、期限と `proceed`（呼び出し元が「まだ続けてよいか」を
-    /// 判定する。コンテナの終了後は偽）を再確認し、どちらかが満たされなければ何も作らず何も変えない。
+    /// CRI ログの sink は、待ちうる処理（開く・作る・ロック・メタデータ・旧 writer の flush）をすべて確定の前に済ませ、
+    /// 確定は `gate` の下で期限を再確認して書き込み先をメモリ上で差し替えるだけにする。失敗したら状態を変えず（旧 writer と
+    /// 未書き込みの行を残し）自分で作ったファイルも消して `Err` を返す。`deadline`（絶対期限）まで待ってよいのは書き込みとの
+    /// 直列化（ロック）だけで、超えたら `Timeout` で返す。
     fn reopen(
         &self,
         _deadline: std::time::Instant,
-        _proceed: &dyn Fn() -> bool,
+        _gate: ReopenGate<'_>,
     ) -> Result<(), TraitError> {
         Err(TraitError::new(
             fandhe_container_core::traits::ErrorCode::Unimplemented,
             "the log sink has no cri log file",
         ))
+    }
+
+    /// この sink が自分で失敗状態を持ち、最初の失敗の通知と開き直しでの解除も自分で行うか（CRI ログの
+    /// [`cri::CriFileSink`] だけが真。既定は偽）。[`cri::TeeLogSink`] は、偽の副 sink は従来どおり最初の失敗を記録・通知して
+    /// 以後呼ばず、真の副 sink には状態管理を任せて呼び続ける（開き直しの後に捕捉が再開できるよう、副が失敗していても
+    /// Tee は `Err` を返さない）。
+    fn owns_failure_state(&self) -> bool {
+        false
     }
 
     /// この sink が自分で失敗状態に固定されているときの最初のエラーコード（CRI ログの [`cri::CriFileSink`] が返す。
@@ -804,6 +812,14 @@ pub trait LogSink: Send + Sync {
         None
     }
 }
+
+/// [`LogSink::reopen`] の確定の関門（呼び出し元が持つ「まだ続けてよいか」の判定を、書き込み先の差し替えと同じ臨界区間にする）。
+///
+/// `gate(commit)` は、呼び出し元の状態（コンテナがまだ稼働中の世代か）を自分のロックの下で確かめ、続けてよければそのロックを
+/// 持ったまま `commit` を 1 回呼んで `true` を返す。続けてはならなければ `commit` を呼ばず `false`。`commit` はメモリ上の
+/// 差し替えだけで I/O をしないこと。何も確定せず判定だけ知りたいとき（待ちうる処理の前の事前確認）は `gate(&mut || {})`。
+/// ロック順は「sink の内部ロック → 呼び出し元のロック」の一方向（呼び出し元は gate の中から sink を呼ばない）。
+pub type ReopenGate<'a> = &'a dyn Fn(&mut dyn FnMut()) -> bool;
 
 /// 行を記録せず捨てる [`LogSink`]（SUP-7・SUP-1・REPAIR-5）。
 ///

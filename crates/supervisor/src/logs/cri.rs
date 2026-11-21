@@ -1978,11 +1978,12 @@ mod tests {
                 .expect("chmod back");
         }
 
-        /// SEC-1・CRI-2・#4652（破壊的変更）: 最初の open も開き直しと同じ祖先の検査を通す。祖先が group / other に書き込めて
+        /// SEC-1・CRI-2・#4652（破壊的変更）: 最初の open も開き直しと同じ祖先の検査を通す。祖先が other に書き込めて
         /// sticky でなければ `FailedPrecondition` で拒否し、ファイルを作らない。sticky なら受ける（開き直しと同じ扱い）。
+        /// other 書き込み可を使うのは、root で回しても（祖先が root 所有になっても）拒否が成り立つようにするため。
         #[cfg(target_os = "linux")]
         #[test]
-        fn sec1_4652_open_rejects_group_writable_non_sticky_ancestor() {
+        fn sec1_4652_open_rejects_writable_non_sticky_ancestor() {
             use std::os::unix::fs::PermissionsExt as _;
             let t = Tmp::new("open-ancestor");
             let gw = t.0.join("gw");
@@ -1990,16 +1991,16 @@ mod tests {
             std::fs::create_dir_all(&logs).expect("mkdir");
             std::fs::set_permissions(&logs, std::fs::Permissions::from_mode(0o750))
                 .expect("chmod logs");
-            std::fs::set_permissions(&gw, std::fs::Permissions::from_mode(0o770))
+            std::fs::set_permissions(&gw, std::fs::Permissions::from_mode(0o777))
                 .expect("chmod gw");
             let path = t.log("gw/logs/0.log");
             let Err(e) = CriFileSink::open(&path) else {
-                panic!("a group-writable non-sticky ancestor must be rejected");
+                panic!("an other-writable non-sticky ancestor must be rejected");
             };
             assert_eq!(e.code(), ErrorCode::FailedPrecondition);
             assert_eq!(e.message(), "cri log file cannot be opened");
             assert!(names(&logs).is_empty());
-            std::fs::set_permissions(&gw, std::fs::Permissions::from_mode(0o1770))
+            std::fs::set_permissions(&gw, std::fs::Permissions::from_mode(0o1777))
                 .expect("chmod sticky");
             CriFileSink::open(&path).expect("sticky ancestor is accepted");
             assert_eq!(names(&logs), ["0.log"]);

@@ -623,9 +623,10 @@ mod imp {
         // 回収にも期限を設ける（SIGKILL が届かない D 状態などで止まらない。REPAIR-5）。グループの停止に失敗しても
         // 直接の子の回収は試み、停止の失敗は `Err` で返す（プローブが残りうるのに成功にしない）。
         let stop_and_reap = |child: &mut std::process::Child| {
-            // 未回収（子が pid を保持している）としてグループを止める。外部の `kill` を起動できない（親側でも
-            // プロセス枠が尽きた等）ときは、追加のプロセスが要らない `Child::kill` で直接の子だけは止める。
-            let killed = super::reap::kill_group(pid, false);
+            // 未回収（子が pid を保持している）としてグループを止める。外部の `kill` を起動せず `kill(2)` で直接送るため、
+            // 親側でもプロセス枠が尽きていても、`kill` が未導入でも止められる。送信に失敗したときは `Child::kill` で
+            // 直接の子だけは止める。
+            let killed = FileAuditSink::kill_process_group_for_test(pid);
             if killed.is_err() {
                 let _ = child.kill();
             }

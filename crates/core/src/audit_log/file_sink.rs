@@ -989,6 +989,18 @@ impl FileAuditSink {
         sys::set_rlimit_self(crate::rlimits::RlimitKind::Nproc, max, max).is_ok()
     }
 
+    /// 結合試験専用: 未回収の自分の子 `pgid`（グループのリーダー）のプロセスグループへ SIGKILL を送る。外部の `kill` を
+    /// 起動しないため、プロセス枠が尽きていても送れる（`tests/audit_sink_isolation.rs` の後始末。#4702・REPAIR-5）。
+    /// 呼び出し側は `pgid` が未回収の自分の子であることを保証する（回収後は番号が再利用されうる）。誰も居なければ `Ok`。
+    #[cfg(all(target_os = "linux", feature = "exec-test-support"))]
+    #[doc(hidden)]
+    pub fn kill_process_group_for_test(pgid: u32) -> Result<(), String> {
+        match sys::kill_process_group(pgid, sys::Signal::Kill) {
+            Ok(()) | Err(sys::SysError::Os(sys::ESRCH)) => Ok(()),
+            Err(e) => Err(format!("kill process group {pgid} failed: {e:?}")),
+        }
+    }
+
     /// 結合試験専用: 自プロセスのスレッド数（macOS の `tests/audit_sink_isolation.rs` が `/proc` の代わりに使う。
     /// `proc_pidinfo` の `pti_threadnum`）。数えられなければ `None`。
     #[cfg(all(target_os = "macos", feature = "exec-test-support"))]
